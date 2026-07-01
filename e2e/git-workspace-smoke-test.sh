@@ -314,7 +314,7 @@ dump_mount_log() {
   fi
   # Also dump any other mount logs under RUN_ROOT that weren't the last one.
   if [ -n "${RUN_ROOT:-}" ] && [ -d "$RUN_ROOT" ]; then
-    find "$RUN_ROOT" -name '*.log' -type f 2>/dev/null | while read -r logf; do
+    find "$RUN_ROOT" -xdev -name '*.log' -type f 2>/dev/null | while read -r logf; do
       [ "$logf" = "${MOUNT_LOG:-}" ] && continue
       echo "=== drive9 mount log: $logf ==="
       cat "$logf"
@@ -667,7 +667,7 @@ cleanup() {
       [ -z "$mp" ] && continue
       MOUNT_POINT="$mp"
       stop_mount
-    done < <(find "$RUN_ROOT" -maxdepth 3 -name mount -type d 2>/dev/null | while read -r d; do
+    done < <(find "$RUN_ROOT" -maxdepth 2 -name mount -type d -prune 2>/dev/null | while read -r d; do
       if is_mounted "$d" 2>/dev/null; then
         printf '%s\n' "$d"
       fi
