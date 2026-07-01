@@ -62,6 +62,8 @@ func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targe
 		Status:         "active",
 		ExpiresAt:      time.Now().Add(24 * time.Hour),
 	}
+	// Hold mutationMu across the pending-delta check and atomic reserve so
+	// same-backend post-commit quota mutations cannot slip between them.
 	b.mutationMu.Lock()
 	defer b.mutationMu.Unlock()
 	if err := b.ensureUploadReserveFitsPendingQuota(ctx, totalSize, fileCountDelta); err != nil {
