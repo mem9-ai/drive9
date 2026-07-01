@@ -358,6 +358,9 @@ func (m *semanticWorkerManager) queueNextPendingKick() {
 	for {
 		m.mu.Lock()
 		tenantID := ""
+		// The pending set is bounded by tenant count. Re-scanning after each
+		// successful enqueue keeps the common path simple and preserves fairness
+		// well enough for the small delayed-kick backlog this queue is meant for.
 		for id := range m.kickPending {
 			if _, queued := m.kickQueued[id]; queued {
 				continue
@@ -375,6 +378,12 @@ func (m *semanticWorkerManager) queueNextPendingKick() {
 func (m *semanticWorkerManager) clearKickPending(tenantID string) {
 	m.mu.Lock()
 	delete(m.kickPending, tenantID)
+	delete(m.kickQueued, tenantID)
+	m.mu.Unlock()
+}
+
+func (m *semanticWorkerManager) markKickDequeued(tenantID string) {
+	m.mu.Lock()
 	delete(m.kickQueued, tenantID)
 	m.mu.Unlock()
 }
@@ -432,10 +441,10 @@ func (m *semanticWorkerManager) workerLoop(ctx context.Context, workerID int) {
 	defer ticker.Stop()
 	for {
 		processed := m.processNext(ctx)
-		// Multi-tenant periodic polling waits for the warm-tenant cadence after
-		// each claim so the poll loop itself does not keep user DB pools warm.
-		// New writes still drain promptly through Kick/processKicked.
-		if processed && !m.isMultiTenant() {
+		// If a task was processed, immediately look for more work. Multi-tenant
+		// scans are warm-cache only, so this drains real backlog without opening
+		// dormant tenant DBs.
+		if processed {
 			continue
 		}
 		select {
@@ -490,9 +499,6 @@ func (m *semanticWorkerManager) effectiveRecoverInterval() time.Duration {
 	if interval <= 0 {
 		interval = defaultSemanticRecoverInterval
 	}
-	if m.isMultiTenant() && interval < m.opts.WarmTenantPollInterval {
-		return m.opts.WarmTenantPollInterval
-	}
 	return interval
 }
 
@@ -512,17 +518,16 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 // processKicked attempts to claim tasks for one kicked tenant immediately.
 func (m *semanticWorkerManager) processKicked(ctx context.Context, tenantID string) {
 	defer m.queueNextPendingKick()
-	// Clear the pending mark before claiming: a task committed after this
-	// point triggers a fresh kick, and a task committed before it is already
-	// visible to the claim below, so no enqueue can slip through unnoticed.
-	m.clearKickPending(tenantID)
+	m.markKickDequeued(tenantID)
 	ref, ok := m.kickRef(ctx, tenantID)
 	if !ok {
+		m.clearKickPending(tenantID)
 		return
 	}
 	if !m.tryClaimTenantSlot(ref.id) {
 		// Another worker already holds this tenant's slot and its claim will
 		// observe any task committed before the kick was sent.
+		m.clearKickPending(tenantID)
 		return
 	}
 	target, err := m.targetForRef(ctx, ref)
@@ -533,6 +538,15 @@ func (m *semanticWorkerManager) processKicked(ctx context.Context, tenantID stri
 		m.releaseTenantSlot(ref.id)
 		return
 	}
+	if target == nil {
+		m.releaseTenantSlot(ref.id)
+		return
+	}
+	// Clear the pending mark only after the backend is acquired: a task
+	// committed after this point triggers a fresh kick, and a task committed
+	// before it is already visible to the claim below. If acquire failed above,
+	// the pending mark is left in place and queueNextPendingKick retries it.
+	m.clearKickPending(tenantID)
 	target.release = chainReleases(target.release, func() { m.releaseTenantSlot(ref.id) })
 	defer target.release()
 	if len(target.allowedTaskTypes) == 0 {
@@ -778,6 +792,9 @@ func (m *semanticWorkerManager) recoverExpiredRefs(ctx context.Context, refs []s
 				zap.Error(err))
 			continue
 		}
+		if target == nil {
+			continue
+		}
 		func() {
 			defer target.release()
 			start := time.Now()
@@ -820,6 +837,10 @@ func (m *semanticWorkerManager) nextTarget(ctx context.Context) (*semanticTarget
 			logger.Warn(ctx, "semantic_worker_open_store_failed",
 				zap.String("tenant_id", ref.id),
 				zap.Error(err))
+			m.releaseTenantSlot(ref.id)
+			continue
+		}
+		if target == nil {
 			m.releaseTenantSlot(ref.id)
 			continue
 		}
@@ -1008,13 +1029,13 @@ func (m *semanticWorkerManager) targetForRef(ctx context.Context, ref semanticTe
 	if ref.cached {
 		b, release, ok := m.pool.AcquireCached(ref.id)
 		if !ok {
-			return nil, fmt.Errorf("cached backend missing for %s", ref.id)
+			return nil, nil
 		}
 		// WarmTenantIDs is only a snapshot; the pool can go cold before this
 		// cached acquire pins the backend, so re-check without opening a conn.
 		if b.Store().DB().Stats().OpenConnections == 0 {
 			release()
-			return nil, fmt.Errorf("cached backend cold for %s", ref.id)
+			return nil, nil
 		}
 		return &semanticTarget{
 			tenantID:         ref.id,
@@ -1503,6 +1524,9 @@ func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time
 			logger.Warn(ctx, "semantic_worker_open_store_for_observation_failed",
 				zap.String("tenant_id", ref.id),
 				zap.Error(err))
+			continue
+		}
+		if target == nil {
 			continue
 		}
 		func() {

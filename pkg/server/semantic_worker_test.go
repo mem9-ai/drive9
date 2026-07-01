@@ -126,6 +126,46 @@ func warmTestTenantBackend(t *testing.T, pool *tenant.Pool, tenantMeta *meta.Ten
 	return b
 }
 
+func newWarmableTenantMeta(t *testing.T, pool *tenant.Pool, dsn, id, provider string) *meta.Tenant {
+	t.Helper()
+	parsed, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port := "127.0.0.1", 3306
+	if parsed.Addr != "" {
+		h, p, _ := strings.Cut(parsed.Addr, ":")
+		if h != "" {
+			host = h
+		}
+		if p != "" {
+			_, _ = fmt.Sscanf(p, "%d", &port)
+		}
+	}
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id == "" {
+		id = token.NewID()
+	}
+	now := time.Now().UTC()
+	return &meta.Tenant{
+		ID:               id,
+		Status:           meta.TenantActive,
+		DBHost:           host,
+		DBPort:           port,
+		DBUser:           parsed.User,
+		DBPasswordCipher: passCipher,
+		DBName:           parsed.DBName,
+		DBTLS:            false,
+		Provider:         provider,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+}
+
 func waitForTenantDBOpenConnections(t *testing.T, db *sql.DB, want int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -485,41 +525,18 @@ func TestSemanticWorkerKeepsBorrowedTenantBackendAliveDuringInvalidate(t *testin
 	defer func() { _ = metaStore.Close() }()
 	testmysql.ResetMetaDB(t, metaStore.DB())
 
+	appStore, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testmysql.ResetDB(t, appStore.DB())
+	if err := appStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
 	pool := newTestTenantPool(t)
-	parsed, err := mysql.ParseDSN(testDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	host, port := "127.0.0.1", 3306
-	if parsed.Addr != "" {
-		h, p, _ := strings.Cut(parsed.Addr, ":")
-		if h != "" {
-			host = h
-		}
-		if p != "" {
-			_, _ = fmt.Sscanf(p, "%d", &port)
-		}
-	}
-	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC()
 	tenantID := token.NewID()
-	tenantMeta := &meta.Tenant{
-		ID:               tenantID,
-		Status:           meta.TenantActive,
-		DBHost:           host,
-		DBPort:           port,
-		DBUser:           parsed.User,
-		DBPasswordCipher: passCipher,
-		DBName:           parsed.DBName,
-		DBTLS:            false,
-		Provider:         tenant.ProviderDB9,
-		SchemaVersion:    1,
-		CreatedAt:        now,
-		UpdatedAt:        now,
-	}
+	tenantMeta := newWarmableTenantMeta(t, pool, testDSN, tenantID, tenant.ProviderDB9)
 	if err := metaStore.InsertTenant(context.Background(), tenantMeta); err != nil {
 		t.Fatal(err)
 	}
@@ -535,11 +552,10 @@ func TestSemanticWorkerKeepsBorrowedTenantBackendAliveDuringInvalidate(t *testin
 	}
 
 	s := NewWithConfig(Config{Meta: metaStore, Pool: pool, SemanticEmbedder: embedder, SemanticWorkers: SemanticWorkerOptions{
-		Workers:                1,
-		PollInterval:           10 * time.Millisecond,
-		WarmTenantPollInterval: 10 * time.Millisecond,
-		RecoverInterval:        50 * time.Millisecond,
-		LeaseDuration:          200 * time.Millisecond,
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
 	}})
 	t.Cleanup(func() { s.Close() })
 
@@ -1717,6 +1733,7 @@ func TestSemanticWorkerHTTPMultiTenantImageOnlySkipsAppTenantEmbedTasks(t *testi
 }
 
 func TestSemanticWorkerListTenantRefsDoesNotUseFallbackImageCapabilityForPoolTenants(t *testing.T) {
+	initServerTenantSchema(t, testDSN)
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -1725,28 +1742,11 @@ func TestSemanticWorkerListTenantRefsDoesNotUseFallbackImageCapabilityForPoolTen
 	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPool(t)
-	passCipher, err := pool.Encrypt(context.Background(), []byte("pw"))
-	if err != nil {
+	tenantMeta := newWarmableTenantMeta(t, pool, testDSN, token.NewID(), tenant.ProviderDB9)
+	if err := metaStore.InsertTenant(context.Background(), tenantMeta); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UTC()
-	autoTenantID := token.NewID()
-	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
-		ID:               autoTenantID,
-		Status:           meta.TenantActive,
-		DBHost:           "127.0.0.1",
-		DBPort:           4000,
-		DBUser:           "root",
-		DBPasswordCipher: passCipher,
-		DBName:           "app",
-		DBTLS:            false,
-		Provider:         tenant.ProviderTiDBZero,
-		SchemaVersion:    1,
-		CreatedAt:        now,
-		UpdatedAt:        now,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	warmTestTenantBackend(t, pool, tenantMeta)
 	fallback := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
 		DatabaseAutoEmbedding: true,
 		AsyncImageExtract: backend.AsyncImageExtractOptions{
@@ -1757,17 +1757,8 @@ func TestSemanticWorkerListTenantRefsDoesNotUseFallbackImageCapabilityForPoolTen
 		},
 	})
 
-	orig := semanticWorkerUsesTiDBAutoEmbedding
-	semanticWorkerUsesTiDBAutoEmbedding = func(provider string) bool {
-		return provider == tenant.ProviderTiDBZero
-	}
-	defer func() {
-		semanticWorkerUsesTiDBAutoEmbedding = orig
-	}()
-
-	// Pool has no async image extract, so TiDB-auto tenants get no task types from
-	// the pool; embedder is only to satisfy worker viability (multi-tenant path does
-	// not count fallback-only fbAuto — see newSemanticWorkerManager).
+	// Pool has no async image extract, so fallback-only image capability must not
+	// leak into pool tenants; embedder is only to satisfy worker viability.
 	m := newSemanticWorkerManager(fallback, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
 	if m == nil {
 		t.Fatal("expected semantic worker manager")
@@ -1776,8 +1767,22 @@ func TestSemanticWorkerListTenantRefsDoesNotUseFallbackImageCapabilityForPoolTen
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(refs) != 0 {
-		t.Fatalf("tenant ref count=%d, want 0", len(refs))
+	if len(refs) != 1 {
+		t.Fatalf("tenant ref count=%d, want warm pool tenant", len(refs))
+	}
+	target, err := m.targetForRef(context.Background(), refs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target == nil {
+		t.Fatal("target is nil, want warm pool target")
+	}
+	defer target.release()
+	if slices.Contains(target.allowedTaskTypes, semantic.TaskTypeImgExtractText) {
+		t.Fatalf("allowed task types=%v, want no fallback image extract type for pool tenant", target.allowedTaskTypes)
+	}
+	if !slices.Contains(target.allowedTaskTypes, semantic.TaskTypeEmbed) {
+		t.Fatalf("allowed task types=%v, want app-managed embed type", target.allowedTaskTypes)
 	}
 }
 
@@ -1965,7 +1970,7 @@ func TestSemanticWorkerNormalizeRetryMaxDelayAtLeastBase(t *testing.T) {
 	}
 }
 
-func TestSemanticWorkerMultiTenantEffectiveIntervalsUseWarmTenantMinimum(t *testing.T) {
+func TestSemanticWorkerMultiTenantEffectiveIntervalsKeepRecoverIndependent(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -1973,9 +1978,10 @@ func TestSemanticWorkerMultiTenantEffectiveIntervalsUseWarmTenantMinimum(t *test
 	defer func() { _ = metaStore.Close() }()
 	pool := newTestTenantPool(t)
 	warmInterval := 90 * time.Second
+	recoverInterval := 5 * time.Second
 	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{
 		PollInterval:           200 * time.Millisecond,
-		RecoverInterval:        5 * time.Second,
+		RecoverInterval:        recoverInterval,
 		WarmTenantPollInterval: warmInterval,
 	})
 	if m == nil {
@@ -1984,8 +1990,8 @@ func TestSemanticWorkerMultiTenantEffectiveIntervalsUseWarmTenantMinimum(t *test
 	if got := m.effectivePollInterval(); got != warmInterval {
 		t.Fatalf("effective poll interval=%v, want %v", got, warmInterval)
 	}
-	if got := m.effectiveRecoverInterval(); got != warmInterval {
-		t.Fatalf("effective recover interval=%v, want %v", got, warmInterval)
+	if got := m.effectiveRecoverInterval(); got != recoverInterval {
+		t.Fatalf("effective recover interval=%v, want %v", got, recoverInterval)
 	}
 }
 
@@ -2419,6 +2425,23 @@ func TestSemanticWorkerNextTargetUsesWarmCachedBackendOnly(t *testing.T) {
 	}
 }
 
+func TestSemanticWorkerTargetForCachedRefMissingSkipsSilently(t *testing.T) {
+	pool := newTestTenantPool(t)
+	m := &semanticWorkerManager{pool: pool}
+	var opts SemanticWorkerOptions
+	opts.normalize()
+	m.opts = opts
+
+	target, err := m.targetForRef(context.Background(), semanticTenantRef{id: "tenant-cold", cached: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != nil {
+		target.release()
+		t.Fatalf("target=%+v, want nil for missing cached backend", target)
+	}
+}
+
 func TestSemanticWorkerKickDedupAndOverflow(t *testing.T) {
 	m := newSemanticWorkerManager(newTestBackendForSemanticWorker(t), nil, nil, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
 	if m == nil {
@@ -2469,6 +2492,61 @@ func TestSemanticWorkerKickDedupAndOverflow(t *testing.T) {
 	m.mu.Unlock()
 	if !pending || !queued {
 		t.Fatalf("tenant %s pending=%v queued=%v, want delayed kick requeued", delayedID, pending, queued)
+	}
+}
+
+func TestSemanticWorkerKickedAcquireFailureKeepsKickPending(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	pool := newTestTenantPool(t)
+	passCipher, err := pool.Encrypt(context.Background(), []byte("pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID := token.NewID()
+	now := time.Now().UTC()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           1,
+		DBUser:           "root",
+		DBPasswordCipher: passCipher,
+		DBName:           "drive9_missing",
+		DBTLS:            false,
+		Provider:         tenant.ProviderDB9,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	m.Kick(tenantID)
+	got := <-m.kicks
+	if got != tenantID {
+		t.Fatalf("queued kick=%q, want %q", got, tenantID)
+	}
+	m.processKicked(context.Background(), got)
+
+	m.mu.Lock()
+	_, pending := m.kickPending[tenantID]
+	_, queued := m.kickQueued[tenantID]
+	m.mu.Unlock()
+	if !pending || !queued {
+		t.Fatalf("tenant %s pending=%v queued=%v, want acquire failure to keep kick retryable", tenantID, pending, queued)
+	}
+	if len(m.kicks) != 1 {
+		t.Fatalf("kicks=%d, want requeued failed kick", len(m.kicks))
 	}
 }
 

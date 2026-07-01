@@ -159,18 +159,27 @@ func (p *Pool) WarmTenantIDs() []string {
 	if p == nil {
 		return nil
 	}
+	type warmCandidate struct {
+		tenantID string
+		db       *sql.DB
+	}
 	p.mu.Lock()
-	out := make([]string, 0, len(p.items))
+	candidates := make([]warmCandidate, 0, len(p.items))
 	for _, e := range p.items {
 		if e.backend == nil || e.store == nil || e.retired {
 			continue
 		}
-		if e.store.DB().Stats().OpenConnections == 0 {
-			continue
-		}
-		out = append(out, e.tenantID)
+		candidates = append(candidates, warmCandidate{tenantID: e.tenantID, db: e.store.DB()})
 	}
 	p.mu.Unlock()
+
+	out := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		if c.db.Stats().OpenConnections == 0 {
+			continue
+		}
+		out = append(out, c.tenantID)
+	}
 	return out
 }
 
