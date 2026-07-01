@@ -71,15 +71,17 @@ is optimistic and may temporarily over-admit until replay converges.
 
 - `DRIVE9_QUOTA_SOURCE` is retired. Central quota is active when a meta quota
   store is wired into the backend.
-- The tenant `quota_outbox` worker is no longer started by `SetMetaQuotaStore`.
-- Runtime create/overwrite/upload paths no longer enqueue tenant `quota_outbox`
-  rows.
+- The tenant `quota_outbox` worker and datastore helpers have been removed from
+  the runtime.
+- Runtime create/overwrite/upload paths do not enqueue tenant `quota_outbox`
+  rows, and new tenant schemas no longer create `quota_outbox` or
+  `quota_admission_locks`.
 - Runtime admission no longer calls `PendingQuotaOutboxDeltas` or any tenant
   `quota_outbox` pending read.
 
-Legacy `quota_outbox` schema and datastore code remain for old rows,
-backfill/drain tooling, and historical tests. They are not part of the runtime
-quota path after this cutover.
+Existing tenant databases may still contain historical `quota_outbox` rows from
+pre-cutover deployments. They are not drained by runtime code. Run quota
+backfill to reconcile central counters before deleting those historical rows.
 
 ## Operational Guardrails
 

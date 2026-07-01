@@ -144,9 +144,9 @@ func (b *Dat9Backend) ensureFileSizeQuota(ctx context.Context, size int64) error
 //
 // The check includes central confirmed/reserved usage plus this process's
 // in-memory pending central mutations. It intentionally does not read the tenant
-// DB or lock quota_admission_locks; multi-pod small writes may briefly
-// over-admit until meta mutation replay converges. Multipart uploads use the
-// meta-DB reserve-first path in upload_reservation.go.
+// DB; multi-pod small writes may briefly over-admit until meta mutation replay
+// converges. Multipart uploads use the meta-DB reserve-first path in
+// upload_reservation.go.
 func (b *Dat9Backend) ensureStorageQuotaServer(ctx context.Context, tx *sql.Tx, deltaBytes int64) error {
 	result, ok := b.checkStorageQuotaServerTx(ctx, tx, deltaBytes)
 	if !ok {
@@ -221,20 +221,6 @@ func (b *Dat9Backend) checkStorageQuotaServerTx(ctx context.Context, tx *sql.Tx,
 	result.pendingBytes = pendingStorageDelta
 	result.projected = usage.StorageBytes + usage.ReservedBytes + pendingStorageDelta + deltaBytes
 	return result, true
-}
-
-func (b *Dat9Backend) lockQuotaAdmissionTx(ctx context.Context, tx *sql.Tx) error {
-	if !b.UseServerQuota() || b.store == nil || tx == nil {
-		return nil
-	}
-	if err := b.store.LockQuotaAdmissionTx(tx); err != nil {
-		logger.Warn(ctx, "server_quota_admission_lock_failed",
-			zap.String("tenant_id", b.tenantID), zap.Error(err))
-		metrics.RecordTenantOperation(b.tenantID, "server_quota", "admission_lock", "error", 0)
-		return fmt.Errorf("lock quota admission: %w", err)
-	}
-	metrics.RecordTenantOperation(b.tenantID, "server_quota", "admission_lock", "ok", 0)
-	return nil
 }
 
 // cachedQuotaConfig returns low-churn quota config from the per-tenant cache,

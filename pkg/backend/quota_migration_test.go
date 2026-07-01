@@ -584,6 +584,15 @@ func drainCentralQuotaMutations(t *testing.T, b *Dat9Backend) {
 
 func assertNoTenantQuotaOutboxRows(t *testing.T, b *Dat9Backend) {
 	t.Helper()
+	var tableExists int
+	if err := b.Store().DB().QueryRowContext(context.Background(), `SELECT COUNT(*)
+		FROM information_schema.tables
+		WHERE table_schema = DATABASE() AND table_name = 'quota_outbox'`).Scan(&tableExists); err != nil {
+		t.Fatalf("check tenant quota_outbox table: %v", err)
+	}
+	if tableExists == 0 {
+		return
+	}
 	var count int
 	if err := b.Store().DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM quota_outbox`).Scan(&count); err != nil {
 		t.Fatalf("count tenant quota_outbox rows: %v", err)

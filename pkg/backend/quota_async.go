@@ -14,8 +14,7 @@ const (
 	// within a single backend instance. In multi-pod deployments, cross-pod
 	// ordering is not guaranteed (see logAndEnqueueMutation comment). The
 	// durable quota_mutation_log plus MutationReplayWorker provides the
-	// convergence backstop. Legacy tenant quota_outbox code remains only for
-	// old rows and tests, not for the runtime write path.
+	// convergence backstop.
 	mutationQueueSize = 256
 )
 

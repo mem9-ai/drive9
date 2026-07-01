@@ -19,8 +19,7 @@ import (
 // upload using only the meta DB. AtomicReserveAndInsertUpload claims
 // reserved_bytes and inserts the reservation row atomically in the meta DB.
 // Either both rows are written or neither is; there is no compensating path that
-// can leak reserved_bytes. This intentionally does not take the legacy tenant DB
-// quota_admission_locks row.
+// can leak reserved_bytes.
 //
 // Return semantics:
 //   - (true, nil):  reservation successfully claimed on the server DB.
