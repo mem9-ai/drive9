@@ -1553,7 +1553,7 @@ func (s *Store) ConfirmedFileSizeByPathTx(db execer, path string) (int64, error)
 	return size.Int64, nil
 }
 
-// ConfirmedFileSummary holds the minimal per-file info needed for quota backfill.
+// ConfirmedFileSummary holds the minimal per-file info needed for quota reconciliation.
 type ConfirmedFileSummary struct {
 	FileID      string
 	SizeBytes   int64

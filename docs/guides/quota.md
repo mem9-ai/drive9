@@ -197,6 +197,7 @@ The quota API returns JSON errors through the standard server error shape.
 - Small-write storage and file-count quota admission include this process's
   pending central mutation deltas to reduce stale-central-usage undercounting,
   but concurrent writes on multiple servers may briefly over-admit. Durable
-  mutation replay and backfill restore convergence.
+  mutation replay restores convergence for logged mutations; rare post-commit
+  gaps require operational reconciliation from tenant file metadata.
 - Multipart uploads use a stricter reserve-first path before writing tenant
   upload state.

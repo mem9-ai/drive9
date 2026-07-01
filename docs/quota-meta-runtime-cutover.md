@@ -80,19 +80,17 @@ is optimistic and may temporarily over-admit until replay converges.
   `quota_outbox` pending read.
 
 Existing tenant databases may still contain historical `quota_outbox` rows from
-pre-cutover deployments. They are not drained by runtime code. Run quota
-backfill to reconcile central counters before deleting those historical rows.
-Use this order for cleanup:
+pre-cutover deployments. They are not drained by runtime code. The one-time
+central quota reconciliation has already been completed, so the
+`drive9-server backfill-quota` command has been removed. Use this order for any
+remaining historical table cleanup:
 
 1. Deploy the meta-quota runtime everywhere and confirm old pods are gone.
-2. Run `drive9-server backfill-quota --dry-run` and check tenant counts.
-3. Run `drive9-server backfill-quota` to rebuild central `tenant_file_meta` and
-   aggregate counters from tenant file metadata.
-4. Confirm central quota usage matches expected tenant usage and
+2. Confirm central quota usage matches expected tenant usage and
    `quota_mutation_log` backlog is drained.
-5. Delete historical tenant `quota_outbox` rows or drop the old tables. Do not
-   delete them before backfill and verification; after deletion they are no
-   longer available for diagnosing pre-cutover handoff gaps.
+3. Delete historical tenant `quota_outbox` rows or drop the old tables. Do not
+   delete them before verification; after deletion they are no longer available
+   for diagnosing pre-cutover handoff gaps.
 
 ## Operational Guardrails
 
@@ -110,8 +108,9 @@ Watch the meta pipeline instead of tenant outbox health:
   runtime code path. This is an operational DB check, not a runtime metric,
   because the runtime intentionally no longer queries tenant `quota_outbox`.
 
-For permanent gaps caused by the residual crash window, run quota backfill to
-reconcile central counters from tenant file metadata.
+For permanent gaps caused by the residual crash window, reconcile central
+counters from tenant file metadata with an operational repair job. Runtime code
+does not read tenant quota state.
 
 ## Verification
 

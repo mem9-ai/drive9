@@ -74,9 +74,6 @@ func main() {
 			die(schema.ConfigureTiDBAutoEmbeddingFromEnv())
 			die(runSchemaCommand(os.Args[2:]))
 			return
-		case "backfill-quota":
-			die(runBackfillQuota(os.Args[2:]))
-			return
 		}
 	}
 	if len(os.Args) > 2 {
