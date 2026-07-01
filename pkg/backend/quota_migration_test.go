@@ -287,14 +287,13 @@ func (f *fakeMetaQuotaStore) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantI
 	return f.UpdateUploadReservationStatus(context.Background(), tenantID, uploadID, status)
 }
 
-// SettleActiveReservationTx models the atomic "active → status" transition
-// and reports whether an active row was actually settled. Mirrors the real
-// Store contract used by Round A / fix 4.
+// SettleActiveReservationTx models the atomic "active/completing → status"
+// transition and reports whether a releasable row was actually settled.
 func (f *fakeMetaQuotaStore) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (bool, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, ok := f.reservations[metaKey(tenantID, uploadID)]
-	if !ok || r.Status != "active" {
+	if !ok || (r.Status != "active" && r.Status != "completing") {
 		return false, 0, nil
 	}
 	r.Status = status
@@ -514,12 +513,38 @@ func newCentralQuotaBackend(t *testing.T) (*Dat9Backend, *fakeMetaQuotaStore) {
 	return b, fake
 }
 
+func drainCentralQuotaMutations(t *testing.T, b *Dat9Backend) {
+	t.Helper()
+	done := make(chan struct{})
+	b.enqueueMutation(func() {
+		close(done)
+	})
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for central quota mutations")
+	}
+}
+
+func assertNoTenantQuotaOutboxRows(t *testing.T, b *Dat9Backend) {
+	t.Helper()
+	var count int
+	if err := b.Store().DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM quota_outbox`).Scan(&count); err != nil {
+		t.Fatalf("count tenant quota_outbox rows: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("tenant quota_outbox rows = %d, want 0", count)
+	}
+}
+
 func TestCentralQuotaFileMutationLifecycle(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
 
 	if _, err := b.Write("/img.png", []byte("png-data"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatalf("create image: %v", err)
 	}
+	drainCentralQuotaMutations(t, b)
+	assertNoTenantQuotaOutboxRows(t, b)
 	nf, err := b.Store().Stat(context.Background(), "/img.png")
 	if err != nil {
 		t.Fatalf("stat create: %v", err)
@@ -539,6 +564,8 @@ func TestCentralQuotaFileMutationLifecycle(t *testing.T) {
 	if _, err := b.Write("/img.png", []byte("much-longer-png-data"), 0, filesystem.WriteFlagTruncate); err != nil {
 		t.Fatalf("overwrite image: %v", err)
 	}
+	drainCentralQuotaMutations(t, b)
+	assertNoTenantQuotaOutboxRows(t, b)
 	usage, _ = fake.GetQuotaUsage(context.Background(), "tenant-a")
 	if usage.StorageBytes != int64(len("much-longer-png-data")) || usage.FileCount != 1 || usage.MediaFileCount != 1 {
 		t.Fatalf("usage after overwrite = %+v", usage)
@@ -603,6 +630,8 @@ func TestCentralQuotaUploadCompleteUpdatesShadowState(t *testing.T) {
 	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
 		t.Fatalf("confirm upload: %v", err)
 	}
+	drainCentralQuotaMutations(t, b)
+	assertNoTenantQuotaOutboxRows(t, b)
 
 	nf, err := b.Store().Stat(ctx, "/clip.wav")
 	if err != nil {
@@ -632,9 +661,21 @@ func TestCentralQuotaUploadCompleteUpdatesShadowState(t *testing.T) {
 	}
 }
 
+func TestCentralQuotaMutationLogInsertFailureSurfaces(t *testing.T) {
+	b, fake := newCentralQuotaBackend(t)
+	fake.insertMutationErr = errors.New("meta log unavailable")
+
+	if _, err := b.Write("/lost.png", []byte("png-data"), 0, filesystem.WriteFlagCreate); err == nil {
+		t.Fatal("create error = nil, want central quota mutation log error")
+	}
+	assertNoTenantQuotaOutboxRows(t, b)
+	if len(fake.mutations) != 0 {
+		t.Fatalf("mutation log rows = %d, want 0", len(fake.mutations))
+	}
+}
+
 func TestMonthlyLLMCostExceededUsesCentralCounter(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
-	b.quotaSource = QuotaSourceServer // enable server-side cost check
 	b.maxMonthlyLLMCostMillicents = 100
 	fake.config["tenant-a"].MaxMonthlyCostMC = 100
 	fake.monthly["tenant-a"] = 101
@@ -647,7 +688,7 @@ func TestMonthlyLLMCostExceededUsesCentralCounter(t *testing.T) {
 	}
 }
 
-func TestRecordImageExtractUsageWritesCentralLedgerAndLegacyStore(t *testing.T) {
+func TestRecordImageExtractUsageWritesCentralLedgerOnlyWhenServerQuotaActive(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
 	b.visionCostPerKTokenMillicents = 1000
 
@@ -655,13 +696,14 @@ func TestRecordImageExtractUsageWritesCentralLedgerAndLegacyStore(t *testing.T) 
 		PromptTokens:     120,
 		CompletionTokens: 80,
 	})
+	drainCentralQuotaMutations(t, b)
 
 	total, err := b.store.MonthlyLLMCostMillicents()
 	if err != nil {
 		t.Fatalf("tenant monthly llm cost: %v", err)
 	}
-	if total != 200 {
-		t.Fatalf("tenant monthly llm cost = %d, want 200", total)
+	if total != 0 {
+		t.Fatalf("tenant monthly llm cost = %d, want 0 when server quota is active", total)
 	}
 	if fake.monthly["tenant-a"] != 200 {
 		t.Fatalf("central monthly llm cost = %d, want 200", fake.monthly["tenant-a"])

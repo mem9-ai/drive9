@@ -244,8 +244,7 @@ func main() {
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_local_backend")
 
 	// Wire central quota store when DRIVE9_LOCAL_META_DSN is set.
-	// This enables server-mode quota enforcement (DRIVE9_QUOTA_SOURCE=server)
-	// in the local single-tenant entrypoint for E2E validation.
+	// The runtime quota accounting path uses the meta DB when it is present.
 	metaDSN := strings.TrimSpace(os.Getenv("DRIVE9_LOCAL_META_DSN"))
 	if metaDSN != "" {
 		stepStart = time.Now()
@@ -635,15 +634,6 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	opts.TextExtractMaxBytes = envInt64("DRIVE9_TEXT_EXTRACT_MAX_BYTES", backend.DefaultTextExtractMaxBytes)
 	if opts.TextExtractMaxBytes <= 0 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_TEXT_EXTRACT_MAX_BYTES must be a positive integer")
-	}
-
-	// Quota enforcement source: "tenant" (default) or "server" (central server DB).
-	switch qs := strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE"))); qs {
-	case "", "tenant":
-	case "server":
-		opts.QuotaSource = backend.QuotaSourceServer
-	default:
-		die(fmt.Errorf("DRIVE9_QUOTA_SOURCE must be one of tenant or server, got %q", qs))
 	}
 
 	queryBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_BASE"))

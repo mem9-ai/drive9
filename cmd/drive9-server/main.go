@@ -536,9 +536,8 @@ environment:
   DRIVE9_DEFAULT_STORAGE_QUOTA_BYTES fallback per-tenant total storage limit when no explicit quota is configured (default: %d)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
-  DRIVE9_QUOTA_SOURCE tenant|server quota enforcement source (default: tenant)
   DRIVE9_QUOTA_USAGE_CACHE_TTL soft small-write central usage cache TTL, e.g. 250ms or 1s
-  DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL soft small-write tenant pending-outbox aggregate cache TTL, e.g. 250ms or 1s
+  DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL soft small-write in-process pending mutation cache TTL, e.g. 250ms or 1s
   DRIVE9_DISABLE_AUTO_EMBEDDING true|false disable TiDB database-managed auto-embedding (default: false)
                                 set to true when the TiDB Cloud cluster has no supported embedding provider
   DRIVE9_TIDB_AUTO_EMBEDDING_MODEL TiDB EMBED_TEXT model for auto-embedding generated columns
@@ -709,15 +708,6 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	opts.TextExtractMaxBytes = envInt64("DRIVE9_TEXT_EXTRACT_MAX_BYTES", backend.DefaultTextExtractMaxBytes)
 	if opts.TextExtractMaxBytes <= 0 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_TEXT_EXTRACT_MAX_BYTES must be a positive integer")
-	}
-
-	// Quota enforcement source: "tenant" (default, per-tenant DB) or "server" (central server DB).
-	switch qs := strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE"))); qs {
-	case "", "tenant":
-	case "server":
-		opts.QuotaSource = backend.QuotaSourceServer
-	default:
-		return backend.Options{}, fmt.Errorf("DRIVE9_QUOTA_SOURCE must be one of tenant or server, got %q", qs)
 	}
 
 	queryBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_BASE"))

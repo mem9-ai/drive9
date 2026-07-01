@@ -98,13 +98,13 @@ type Dat9Backend struct {
 	tenantID           string
 	storageNamespaceID string
 	metaStore          MetaQuotaStore // nil when central quota is not wired (tests, fallback)
-	quotaSource        QuotaSource    // "tenant" (default) or "server"
 	quotaConfigCache   *quotaConfigCache
 	quotaUsageCache    *quotaUsageCache
 	quotaPendingCache  *quotaPendingDeltasCache
 
-	// mutationQueue decouples central quota mutations (syncCentralFileCreate,
-	// syncCentralFileOverwrite) from the fsync critical path. Mutations are
+	// mutationQueue decouples central quota mutations
+	// (recordCentralFileCreateMutation, recordCentralFileOverwriteMutation) from
+	// the fsync critical path. Mutations are
 	// enqueued here and drained by a background worker. The mutation log
 	// provides crash recovery via the existing MutationReplayWorker.
 	//
@@ -117,8 +117,6 @@ type Dat9Backend struct {
 	mutationStop  context.CancelFunc
 
 	quotaOutboxNotify chan struct{}
-	quotaOutboxWG     sync.WaitGroup
-	quotaOutboxStop   context.CancelFunc
 	claimQuotaOutbox  quotaOutboxBatchClaimer
 
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
@@ -278,7 +276,6 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		}
 	}
 
-	var quotaOutboxEnqueued bool
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
 			return err
@@ -302,11 +299,6 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		}); err != nil {
 			return err
 		}
-		created, err := b.enqueueQuotaFileCreateOutboxTx(tx, fileID, 0, "")
-		if err != nil {
-			return err
-		}
-		quotaOutboxEnqueued = created
 		return nil
 	})
 	if err != nil {
@@ -315,11 +307,8 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		}
 		return err
 	}
-	if quotaOutboxEnqueued {
-		b.addLocalQuotaPendingDeltas(0, 1, 0)
-		b.notifyQuotaOutbox(true)
-	} else {
-		b.syncCentralFileCreate(ctx, fileID, 0, "")
+	if err := b.recordCentralFileCreateMutation(ctx, fileID, 0, ""); err != nil {
+		return fmt.Errorf("record central quota file create: %w", err)
 	}
 	return nil
 }
@@ -352,7 +341,6 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 	now := time.Now()
 	checksum := sha256sum(data)
 
-	var quotaOutboxEnqueued bool
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		if err := b.ensureStorageQuota(ctx, tx, linkPath, int64(len(data))); err != nil {
 			return err
@@ -386,25 +374,13 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 		}); err != nil {
 			return err
 		}
-		created, err := b.enqueueQuotaFileCreateOutboxTx(tx, fileID, int64(len(data)), symlinkContentType)
-		if err != nil {
-			return err
-		}
-		quotaOutboxEnqueued = created
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	if quotaOutboxEnqueued {
-		mediaDelta := int64(0)
-		if isQuotaMediaContentType(symlinkContentType) {
-			mediaDelta = 1
-		}
-		b.addLocalQuotaPendingDeltas(int64(len(data)), 1, mediaDelta)
-		b.notifyQuotaOutbox(true)
-	} else {
-		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), symlinkContentType)
+	if err := b.recordCentralFileCreateMutation(ctx, fileID, int64(len(data)), symlinkContentType); err != nil {
+		return fmt.Errorf("record central quota file create: %w", err)
 	}
 	return nil
 }
@@ -843,7 +819,6 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	var insertNodeDuration time.Duration
 	var tagUpdateDuration time.Duration
 	var semanticEnqueueDuration time.Duration
-	var quotaOutboxEnqueueDuration time.Duration
 	defer func() {
 		if !timingEnabled {
 			return
@@ -866,7 +841,6 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			zap.Float64("insert_node_ms", backendDurationMs(insertNodeDuration)),
 			zap.Float64("tag_update_ms", backendDurationMs(tagUpdateDuration)),
 			zap.Float64("semantic_enqueue_ms", backendDurationMs(semanticEnqueueDuration)),
-			zap.Float64("quota_outbox_enqueue_ms", backendDurationMs(quotaOutboxEnqueueDuration)),
 			zap.Float64("image_enqueue_ms", backendDurationMs(imageEnqueueDuration)),
 			zap.Float64("total_ms", backendDurationMs(time.Since(start))),
 		}
@@ -927,14 +901,12 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	}
 
 	var semanticTaskEnqueued bool
-	var quotaOutboxEnqueued bool
 	txStart := time.Time{}
 	if timingEnabled {
 		txStart = time.Now()
 	}
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
-		quotaOutboxEnqueued = false
 
 		done := backendTimingStep(timingEnabled, &quotaStorageCheckDuration)
 		err := b.ensureCreateStorageQuota(ctx, tx, int64(len(data)))
@@ -1030,13 +1002,6 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			imageEnqueueDuration = semanticEnqueueDuration
 		}
 
-		done = backendTimingStep(timingEnabled, &quotaOutboxEnqueueDuration)
-		created, err := b.enqueueQuotaFileCreateOutboxTx(tx, fileID, int64(len(data)), contentType)
-		done()
-		if err != nil {
-			return err
-		}
-		quotaOutboxEnqueued = created
 		return nil
 	}); err != nil {
 		if timingEnabled {
@@ -1055,15 +1020,11 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	if timingEnabled {
 		centralQuotaStart = time.Now()
 	}
-	if quotaOutboxEnqueued {
-		mediaDelta := int64(0)
-		if isQuotaMediaContentType(contentType) {
-			mediaDelta = 1
+	if err := b.recordCentralFileCreateMutation(ctx, fileID, int64(len(data)), contentType); err != nil {
+		if timingEnabled {
+			centralQuotaDuration = time.Since(centralQuotaStart)
 		}
-		b.addLocalQuotaPendingDeltas(int64(len(data)), 1, mediaDelta)
-		b.notifyQuotaOutbox(true)
-	} else {
-		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
+		return 0, fmt.Errorf("record central quota file create: %w", err)
 	}
 	if timingEnabled {
 		centralQuotaDuration = time.Since(centralQuotaStart)
@@ -1215,14 +1176,12 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	}
 
 	var semanticTaskEnqueued bool
-	var quotaOutboxEnqueued bool
 	txStart := time.Time{}
 	if timingEnabled {
 		txStart = time.Now()
 	}
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
-		quotaOutboxEnqueued = false
 		var oldSizeBytes int64
 		var oldContentTypeForQuota string
 		currentMeta, err := b.store.GetFileStorageMetaForUpdateTx(tx, nf.File.FileID)
@@ -1234,13 +1193,7 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		if expectedRevision > 0 && currentMeta.Revision != expectedRevision {
 			return datastore.ErrRevisionConflict
 		}
-		if b.UseServerQuota() {
-			if deltaBytes := int64(len(finalData)) - currentMeta.SizeBytes; deltaBytes > 0 {
-				if err := b.ensureStorageQuotaServer(ctx, tx, deltaBytes); err != nil {
-					return err
-				}
-			}
-		} else if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
+		if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
 			return err
 		}
 		var txErr error
@@ -1305,11 +1258,6 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 				semanticTaskEnqueued = extractCreated
 			}
 		}
-		created, err := b.enqueueQuotaFileOverwriteOutboxTx(tx, nf.File.FileID, oldSizeBytes, oldContentTypeForQuota, int64(len(finalData)), contentType)
-		if err != nil {
-			return err
-		}
-		quotaOutboxEnqueued = created
 		nf.File.StorageType = currentMeta.StorageType
 		nf.File.StorageRef = currentMeta.StorageRef
 		nf.File.SizeBytes = oldSizeBytes
@@ -1330,15 +1278,11 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	if timingEnabled {
 		centralQuotaStart = time.Now()
 	}
-	if quotaOutboxEnqueued {
-		b.addLocalQuotaPendingDeltas(
-			int64(len(finalData))-nf.File.SizeBytes,
-			0,
-			quotaMediaDelta(isQuotaMediaContentType(nf.File.ContentType), isQuotaMediaContentType(contentType)),
-		)
-		b.notifyQuotaOutbox(true)
-	} else {
-		b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
+	if err := b.recordCentralFileOverwriteMutation(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType); err != nil {
+		if timingEnabled {
+			centralQuotaDuration = time.Since(centralQuotaStart)
+		}
+		return 0, 0, fmt.Errorf("record central quota file overwrite: %w", err)
 	}
 	if timingEnabled {
 		centralQuotaDuration = time.Since(centralQuotaStart)

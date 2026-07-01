@@ -129,7 +129,6 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 	nf, statErr := b.store.Stat(ctx, canonical)
 	if errorsIsNotFound(statErr) {
 		fileID := b.genID()
-		var quotaOutboxEnqueued bool
 		err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 			if err := b.ensureStorageQuota(ctx, tx, canonical, entry.SizeBytes); err != nil {
 				return err
@@ -166,25 +165,13 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 			}); err != nil {
 				return err
 			}
-			created, err := b.enqueueQuotaFileCreateOutboxTx(tx, fileID, entry.SizeBytes, contentType)
-			if err != nil {
-				return err
-			}
-			quotaOutboxEnqueued = created
 			return nil
 		})
 		if err != nil {
 			return 0, err
 		}
-		if quotaOutboxEnqueued {
-			mediaDelta := int64(0)
-			if isQuotaMediaContentType(contentType) {
-				mediaDelta = 1
-			}
-			b.addLocalQuotaPendingDeltas(entry.SizeBytes, 1, mediaDelta)
-			b.notifyQuotaOutbox(true)
-		} else {
-			b.syncCentralFileCreate(ctx, fileID, entry.SizeBytes, contentType)
+		if err := b.recordCentralFileCreateMutation(ctx, fileID, entry.SizeBytes, contentType); err != nil {
+			return 0, fmt.Errorf("record central quota file create: %w", err)
 		}
 		return 1, nil
 	}
@@ -203,7 +190,6 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 	oldSize := nf.File.SizeBytes
 	oldContentType := nf.File.ContentType
 	var newRev int64
-	var quotaOutboxEnqueued bool
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		currentMeta, err := b.store.GetFileStorageMetaForUpdateTx(tx, nf.File.FileID)
 		if err != nil {
@@ -216,13 +202,7 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 		if entry.BaseRevision > 0 && currentMeta.Revision != entry.BaseRevision {
 			return datastore.ErrRevisionConflict
 		}
-		if b.UseServerQuota() {
-			if deltaBytes := entry.SizeBytes - currentMeta.SizeBytes; deltaBytes > 0 {
-				if err := b.ensureStorageQuotaServer(ctx, tx, deltaBytes); err != nil {
-					return err
-				}
-			}
-		} else if err := b.ensureStorageQuota(ctx, tx, canonical, entry.SizeBytes); err != nil {
+		if err := b.ensureStorageQuota(ctx, tx, canonical, entry.SizeBytes); err != nil {
 			return err
 		}
 		var txErr error
@@ -245,25 +225,13 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 		if err := b.store.UpdateFileStorageEncryptionTx(tx, nf.File.FileID, storageEncryptionMode, storageEncryptionKeyID); err != nil {
 			return err
 		}
-		created, err := b.enqueueQuotaFileOverwriteOutboxTx(tx, nf.File.FileID, oldSize, oldContentType, entry.SizeBytes, contentType)
-		if err != nil {
-			return err
-		}
-		quotaOutboxEnqueued = created
 		return nil
 	})
 	if err != nil {
 		return 0, err
 	}
-	if quotaOutboxEnqueued {
-		b.addLocalQuotaPendingDeltas(
-			entry.SizeBytes-oldSize,
-			0,
-			quotaMediaDelta(isQuotaMediaContentType(oldContentType), isQuotaMediaContentType(contentType)),
-		)
-		b.notifyQuotaOutbox(true)
-	} else {
-		b.syncCentralFileOverwrite(ctx, nf.File.FileID, oldSize, oldContentType, entry.SizeBytes, contentType)
+	if err := b.recordCentralFileOverwriteMutation(ctx, nf.File.FileID, oldSize, oldContentType, entry.SizeBytes, contentType); err != nil {
+		return 0, fmt.Errorf("record central quota file overwrite: %w", err)
 	}
 	b.deleteBlobIfS3Ctx(ctx, oldStorageType, oldStorageRef, entry.StorageRef)
 	return newRev, nil

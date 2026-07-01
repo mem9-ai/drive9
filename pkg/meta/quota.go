@@ -672,7 +672,7 @@ func (s *Store) UpdateUploadReservationStatus(ctx context.Context, tenantID, upl
 	defer observeMeta(ctx, "update_upload_reservation_status", start, &err)
 
 	_, err = s.db.ExecContext(ctx,
-		`UPDATE tenant_upload_reservations SET status = ? WHERE tenant_id = ? AND upload_id = ? AND status = 'active'`,
+		`UPDATE tenant_upload_reservations SET status = ? WHERE tenant_id = ? AND upload_id = ? AND status IN ('active', 'completing')`,
 		status, tenantID, uploadID)
 	return err
 }
@@ -680,7 +680,7 @@ func (s *Store) UpdateUploadReservationStatus(ctx context.Context, tenantID, upl
 // UpdateUploadReservationStatusTx updates a reservation's status inside a transaction.
 func (s *Store) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantID, uploadID, status string) error {
 	_, err := tx.Exec(
-		`UPDATE tenant_upload_reservations SET status = ? WHERE tenant_id = ? AND upload_id = ? AND status = 'active'`,
+		`UPDATE tenant_upload_reservations SET status = ? WHERE tenant_id = ? AND upload_id = ? AND status IN ('active', 'completing')`,
 		status, tenantID, uploadID)
 	return err
 }
@@ -709,7 +709,7 @@ func (s *Store) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status
 	var delta sql.NullInt64
 	if err := tx.QueryRow(
 		`SELECT file_count_delta FROM tenant_upload_reservations
-		 WHERE tenant_id = ? AND upload_id = ? AND status = 'active' FOR UPDATE`,
+		 WHERE tenant_id = ? AND upload_id = ? AND status IN ('active', 'completing') FOR UPDATE`,
 		tenantID, uploadID).Scan(&delta); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, 0, nil
@@ -717,7 +717,7 @@ func (s *Store) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status
 		return false, 0, err
 	}
 	res, err := tx.Exec(
-		`UPDATE tenant_upload_reservations SET status = ? WHERE tenant_id = ? AND upload_id = ? AND status = 'active'`,
+		`UPDATE tenant_upload_reservations SET status = ? WHERE tenant_id = ? AND upload_id = ? AND status IN ('active', 'completing')`,
 		status, tenantID, uploadID)
 	if err != nil {
 		return false, 0, err

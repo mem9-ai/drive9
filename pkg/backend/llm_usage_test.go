@@ -97,7 +97,6 @@ func TestMonthlyLLMCostExceeded_ServerQuota(t *testing.T) {
 	b := &Dat9Backend{
 		metaStore:                   mock,
 		tenantID:                    "tenant-1",
-		quotaSource:                 QuotaSourceServer,
 		maxMonthlyLLMCostMillicents: 4000,
 	}
 	if !b.monthlyLLMCostExceeded() {
@@ -110,7 +109,6 @@ func TestMonthlyLLMCostExceeded_ServerQuota_NotExceeded(t *testing.T) {
 	b := &Dat9Backend{
 		metaStore:                   mock,
 		tenantID:                    "tenant-1",
-		quotaSource:                 QuotaSourceServer,
 		maxMonthlyLLMCostMillicents: 4000,
 	}
 	if b.monthlyLLMCostExceeded() {
@@ -129,7 +127,6 @@ func TestMonthlyLLMCostExceeded_ServerQuotaZeroUsesDefault(t *testing.T) {
 	b := &Dat9Backend{
 		metaStore:                   mock,
 		tenantID:                    "tenant-1",
-		quotaSource:                 QuotaSourceServer,
 		maxMonthlyLLMCostMillicents: 4000,
 	}
 	if !b.monthlyLLMCostExceeded() {
@@ -142,7 +139,6 @@ func TestMonthlyLLMCostExceeded_ServerQuota_FailOpen(t *testing.T) {
 	b := &Dat9Backend{
 		metaStore:                   mock,
 		tenantID:                    "tenant-1",
-		quotaSource:                 QuotaSourceServer,
 		maxMonthlyLLMCostMillicents: 4000,
 	}
 	if b.monthlyLLMCostExceeded() {

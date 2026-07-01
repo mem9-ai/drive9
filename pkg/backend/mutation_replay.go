@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,11 +15,31 @@ import (
 )
 
 const (
-	replayPollInterval = 30 * time.Second
-	replayMinAge       = 5 * time.Second // only replay mutations older than 5s (avoid racing with inline apply)
-	replayBatchLimit   = 100
-	replayMaxRetries   = 5
+	defaultReplayPollInterval = time.Second
+	defaultReplayMinAge       = time.Second // only replay older mutations to avoid racing inline apply
+	replayBatchLimit          = 100
+	replayMaxRetries          = 5
 )
+
+func replayPollInterval() time.Duration {
+	return envDurationMS("DRIVE9_QUOTA_REPLAY_POLL_MS", defaultReplayPollInterval)
+}
+
+func replayMinAge() time.Duration {
+	return envDurationMS("DRIVE9_QUOTA_REPLAY_MIN_AGE_MS", defaultReplayMinAge)
+}
+
+func envDurationMS(name string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms < 0 {
+		return def
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 // MutationReplayWorker reads pending mutations from the quota_mutation_log
 // and applies them idempotently. It runs as a background goroutine.
@@ -56,7 +78,7 @@ func (w *MutationReplayWorker) run(ctx context.Context) {
 	defer close(w.done)
 
 	logger.Info(ctx, "mutation_replay_worker_started")
-	ticker := time.NewTicker(replayPollInterval)
+	ticker := time.NewTicker(replayPollInterval())
 	defer ticker.Stop()
 
 	for {
@@ -78,7 +100,7 @@ func (w *MutationReplayWorker) run(ctx context.Context) {
 // fatal error occurred (e.g. database closed) and the loop should stop.
 func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 	start := time.Now()
-	entries, err := w.store.ListPendingMutations(ctx, replayMinAge, replayBatchLimit)
+	entries, err := w.store.ListPendingMutations(ctx, replayMinAge(), replayBatchLimit)
 	if err != nil {
 		if strings.Contains(err.Error(), "database is closed") || strings.Contains(err.Error(), "connection refused") {
 			logger.Info(ctx, "mutation_replay_worker_db_closed")

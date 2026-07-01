@@ -3,7 +3,6 @@ package backend
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -34,24 +33,9 @@ const (
 
 type quotaOutboxBatchClaimer func(context.Context, time.Time, time.Duration, int) (datastore.QuotaOutboxBatchClaimResult, error)
 
-func (b *Dat9Backend) startQuotaOutboxWorker() {
-	if b.quotaOutboxNotify != nil {
-		return
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	b.quotaOutboxStop = cancel
-	b.quotaOutboxNotify = make(chan struct{}, quotaOutboxNotifySize)
-	b.quotaOutboxWG.Add(1)
-	go b.runQuotaOutboxWorker(ctx)
-}
-
 func (b *Dat9Backend) stopQuotaOutboxWorker() {
-	if b.quotaOutboxStop != nil {
-		b.quotaOutboxStop()
-		b.quotaOutboxWG.Wait()
-		b.quotaOutboxStop = nil
-		b.quotaOutboxNotify = nil
-	}
+	// Runtime quota accounting no longer starts the tenant quota_outbox worker.
+	// Keep this cleanup hook for legacy tests that explicitly disable it.
 }
 
 func (b *Dat9Backend) notifyQuotaOutbox(enqueued bool) {
@@ -61,28 +45,6 @@ func (b *Dat9Backend) notifyQuotaOutbox(enqueued bool) {
 	select {
 	case b.quotaOutboxNotify <- struct{}{}:
 	default:
-	}
-}
-
-func (b *Dat9Backend) runQuotaOutboxWorker(ctx context.Context) {
-	defer b.quotaOutboxWG.Done()
-
-	ticker := time.NewTicker(quotaOutboxPollInterval)
-	defer ticker.Stop()
-
-	b.processQuotaOutboxAvailable(ctx)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-b.quotaOutboxNotify:
-			if !b.waitQuotaOutboxNotifyQuiet(ctx) {
-				return
-			}
-			b.processQuotaOutboxAvailable(ctx)
-		case <-ticker.C:
-			b.processQuotaOutboxAvailable(ctx)
-		}
 	}
 }
 
@@ -371,7 +333,7 @@ func (b *Dat9Backend) recordAppliedQuotaOutboxEntries(entries []datastore.QuotaO
 		b.quotaUsageCache.invalidate()
 	}
 	for _, entry := range entries {
-		b.addLocalQuotaPendingDeltas(-entry.StorageDelta, -entry.FileDelta, -entry.MediaDelta)
+		b.addPendingCentralMutationDeltas(-entry.StorageDelta, -entry.FileDelta, -entry.MediaDelta)
 		metrics.RecordTenantOperationCount(b.tenantID, "quota_outbox", entry.MutationType, "ok")
 	}
 }
@@ -438,96 +400,4 @@ func quotaOutboxRetryDelay(attempt int, base, max time.Duration) time.Duration {
 		return max
 	}
 	return delay
-}
-
-func (b *Dat9Backend) enqueueQuotaFileCreateOutboxTx(tx *sql.Tx, fileID string, sizeBytes int64, contentType string) (bool, error) {
-	if !b.UseServerQuota() {
-		return false, nil
-	}
-	isMedia := isQuotaMediaContentType(contentType)
-	data := fileCreateMutationData{
-		FileID:    fileID,
-		SizeBytes: sizeBytes,
-		IsMedia:   isMedia,
-	}
-	raw, err := json.Marshal(data)
-	if err != nil {
-		return false, err
-	}
-	mediaDelta := int64(0)
-	if isMedia {
-		mediaDelta = 1
-	}
-	_, err = b.store.EnqueueQuotaOutboxTx(tx, &datastore.QuotaOutboxEntry{
-		FileID:       fileID,
-		MutationType: quotaMutationTypeFileCreate,
-		MutationData: raw,
-		StorageDelta: sizeBytes,
-		FileDelta:    1,
-		MediaDelta:   mediaDelta,
-	})
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (b *Dat9Backend) enqueueQuotaUploadCompleteOutboxTx(tx *sql.Tx, uploadID string, reservedBytes int64, fileID string, oldSizeBytes int64, oldIsMedia bool, newSizeBytes int64, newIsMedia bool) (bool, error) {
-	if !b.UseServerQuota() {
-		return false, nil
-	}
-	data := uploadCompleteMutationData{
-		UploadID:      uploadID,
-		FileID:        fileID,
-		ReservedBytes: reservedBytes,
-		OldSizeBytes:  oldSizeBytes,
-		OldIsMedia:    oldIsMedia,
-		NewSizeBytes:  newSizeBytes,
-		NewIsMedia:    newIsMedia,
-	}
-	raw, err := json.Marshal(data)
-	if err != nil {
-		return false, err
-	}
-	_, err = b.store.EnqueueQuotaOutboxTx(tx, &datastore.QuotaOutboxEntry{
-		FileID:       fileID,
-		MutationType: quotaMutationTypeUploadComplete,
-		MutationData: raw,
-	})
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (b *Dat9Backend) enqueueQuotaFileOverwriteOutboxTx(tx *sql.Tx, fileID string, oldSize int64, oldContentType string, newSize int64, newContentType string) (bool, error) {
-	if !b.UseServerQuota() {
-		return false, nil
-	}
-	oldIsMedia := isQuotaMediaContentType(oldContentType)
-	newIsMedia := isQuotaMediaContentType(newContentType)
-	data := fileOverwriteMutationData{
-		FileID:       fileID,
-		OldSizeBytes: oldSize,
-		OldIsMedia:   oldIsMedia,
-		NewSizeBytes: newSize,
-		NewIsMedia:   newIsMedia,
-	}
-	raw, err := json.Marshal(data)
-	if err != nil {
-		return false, err
-	}
-	mediaDelta := quotaMediaDelta(oldIsMedia, newIsMedia)
-	_, err = b.store.EnqueueQuotaOutboxTx(tx, &datastore.QuotaOutboxEntry{
-		FileID:       fileID,
-		MutationType: quotaMutationTypeOverwrite,
-		MutationData: raw,
-		StorageDelta: newSize - oldSize,
-		FileDelta:    0,
-		MediaDelta:   mediaDelta,
-	})
-	if err != nil {
-		return false, err
-	}
-	return true, nil
 }

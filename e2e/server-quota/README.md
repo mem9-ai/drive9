@@ -1,7 +1,7 @@
 # Server-Mode Quota E2E Test
 
-This directory contains an end-to-end test suite for drive9's **server-mode quota**
-(central quota enforcement via `DRIVE9_QUOTA_SOURCE=server`).
+This directory contains an end-to-end test suite for drive9's central quota
+runtime path. Central quota is enabled by wiring `DRIVE9_LOCAL_META_DSN`.
 
 ## Architecture
 
@@ -23,7 +23,6 @@ This directory contains an end-to-end test suite for drive9's **server-mode quot
             ▼
 ┌─────────────────────────────────────────┐
 │  bin/drive9-server-local                │
-│  - DRIVE9_QUOTA_SOURCE=server           │
 │  - DRIVE9_LOCAL_META_DSN set            │
 │  - MutationReplayWorker running         │
 │  - ExpirySweepWorker running            │
@@ -55,7 +54,7 @@ bash e2e/server-quota/quota-server-e2e.sh
 The script will:
 1. Start two Docker containers
 2. Build `drive9-server-local` with the `DRIVE9_LOCAL_META_DSN` patch
-3. Start the server in **server quota mode**
+3. Start the server with central quota wired through the meta DB
 4. Run 10 test cases
 5. Tear down containers (unless `KEEP_CONTAINERS=1`)
 
@@ -93,7 +92,6 @@ the full server-mode quota stack without requiring the multi-tenant
 
 | Variable | Value in test | Meaning |
 |----------|---------------|---------|
-| `DRIVE9_QUOTA_SOURCE` | `server` | Read quota state from central DB |
 | `DRIVE9_LOCAL_META_DSN` | `root:root@tcp(127.0.0.1:13306)/drive9_meta?parseTime=true` | Control-plane DB (host-published port) |
 | `DRIVE9_LOCAL_DSN` | `root@tcp(127.0.0.1:14000)/drive9_local?parseTime=true` | Tenant DB — TiDB (host-published port) |
 | `DRIVE9_MAX_TENANT_STORAGE_BYTES` | `1048576` (1 MiB) | Small limit for fast boundary testing |

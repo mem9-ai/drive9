@@ -137,14 +137,11 @@ func (b *Dat9Backend) SetMetaQuotaStore(ctx context.Context, tenantID string, mq
 				zap.Error(err))
 		}
 	}
-	if mqs != nil && b.quotaSource == QuotaSourceServer {
+	if mqs != nil {
 		b.quotaConfigCache = newQuotaConfigCache(tenantID, mqs)
 		b.quotaUsageCache = newQuotaUsageCache(tenantID, mqs, quotaUsageCacheTTL)
-		if b.store != nil {
-			b.quotaPendingCache = newQuotaPendingDeltasCache(b.tenantID, b.store.PendingQuotaOutboxDeltas, quotaPendingDeltasCacheTTL)
-		}
+		b.quotaPendingCache = newQuotaPendingDeltasCache(b.tenantID, nil, quotaPendingDeltasCacheTTL)
 		b.startMutationWorker()
-		b.startQuotaOutboxWorker()
 	}
 }
 

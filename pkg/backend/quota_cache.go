@@ -303,9 +303,9 @@ type quotaPendingDeltasSnapshot struct {
 
 type quotaPendingDeltasLoader func(context.Context) (storageDelta, fileDelta, mediaDelta int64, err error)
 
-// quotaPendingDeltasCache avoids SUM(quota_outbox) on every small write. It is
-// only used by soft admission checks; strict upload reservation still reads the
-// tenant DB directly.
+// quotaPendingDeltasCache tracks this process's central quota mutations that
+// have been logged but not yet applied. It deliberately has no tenant-DB
+// fallback: runtime quota admission must not SUM quota_outbox from the user DB.
 type quotaPendingDeltasCache struct {
 	tenantID string
 	load     quotaPendingDeltasLoader
@@ -314,6 +314,7 @@ type quotaPendingDeltasCache struct {
 	mu                  sync.RWMutex
 	snapshot            *quotaPendingDeltasSnapshot
 	generation          uint64
+	localDeltas         quotaPendingDeltas
 	localPositiveDeltas quotaPendingDeltas
 	loadMu              sync.Mutex
 }
@@ -326,8 +327,13 @@ func newQuotaPendingDeltasCache(tenantID string, load quotaPendingDeltasLoader, 
 }
 
 func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, bool) {
-	if c == nil || c.load == nil {
+	if c == nil {
 		return quotaPendingDeltas{}, false
+	}
+	if c.load == nil {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		return c.localDeltas, true
 	}
 	now := time.Now()
 	if deltas, ok := c.cached(now); ok {
@@ -367,11 +373,9 @@ func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, 
 			expiresAt: expiresAt,
 		}
 		c.mu.Unlock()
-		// A local enqueue or ack raced this DB load. The SELECT may or may not
-		// have observed those rows. Merge only positive local deltas from the
-		// race window: that may double-count this process's newest writes for
-		// one short TTL, but it avoids undercounting quota and keeps small-write
-		// admission off the expensive in-transaction SUM(quota_outbox) path.
+		// A local mutation raced this DB load. This legacy loader path is kept
+		// only for tests; runtime central quota uses in-memory deltas with no
+		// tenant DB read.
 		metrics.RecordTenantOperation(c.tenantID, "server_quota", "pending_delta_cache", "raced_local_delta", time.Since(start))
 		return deltas, true
 	}
@@ -400,16 +404,19 @@ func (c *quotaPendingDeltasCache) add(storageDelta, fileDelta, mediaDelta int64)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.generation++
+	c.localDeltas.add(quotaPendingDeltas{
+		storageDelta: storageDelta,
+		fileDelta:    fileDelta,
+		mediaDelta:   mediaDelta,
+	})
 	c.localPositiveDeltas.add(quotaPendingDeltas{
 		storageDelta: maxInt64(storageDelta, 0),
 		fileDelta:    maxInt64(fileDelta, 0),
 		mediaDelta:   maxInt64(mediaDelta, 0),
 	})
-	// If the snapshot is missing or expired, leave it cold. A concurrent loader
-	// publishes a conservative snapshot by merging positive local deltas from
-	// the race window; otherwise the next soft admission check reloads from
-	// quota_outbox and sees this backend's queued row along with rows from
-	// other servers.
+	// If the snapshot is missing or expired, leave it cold. The no-loader
+	// runtime path reads localDeltas directly; the legacy loader path refreshes
+	// snapshots on demand.
 	if c.snapshot == nil || time.Now().After(c.snapshot.expiresAt) {
 		return
 	}
