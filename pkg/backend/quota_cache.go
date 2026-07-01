@@ -433,11 +433,7 @@ func (c *quotaPendingDeltasCache) addPending(storageDelta, fileDelta, mediaDelta
 	c.expireLocalDeltasLocked(now)
 	c.generation++
 	c.localDeltas.add(deltas)
-	c.localPositiveDeltas.add(quotaPendingDeltas{
-		storageDelta: maxInt64(storageDelta, 0),
-		fileDelta:    maxInt64(fileDelta, 0),
-		mediaDelta:   maxInt64(mediaDelta, 0),
-	})
+	c.localPositiveDeltas.add(deltas.positivePart())
 	if !deltas.zero() {
 		c.localEntries = append(c.localEntries, quotaPendingDeltaEntry{
 			deltas:    deltas,
@@ -477,6 +473,7 @@ func (c *quotaPendingDeltasCache) clearPending(storageDelta, fileDelta, mediaDel
 		fileDelta:    -fileDelta,
 		mediaDelta:   -mediaDelta,
 	})
+	c.localPositiveDeltas.add(deltas.positivePart().negate())
 	if c.snapshot == nil || now.After(c.snapshot.expiresAt) {
 		return
 	}
@@ -500,6 +497,7 @@ func (c *quotaPendingDeltasCache) expireLocalDeltasLocked(now time.Time) {
 			fileDelta:    -entry.deltas.fileDelta,
 			mediaDelta:   -entry.deltas.mediaDelta,
 		})
+		c.localPositiveDeltas.add(entry.deltas.positivePart().negate())
 		if c.snapshot != nil && now.Before(c.snapshot.expiresAt) {
 			c.snapshot.deltas.storageDelta -= entry.deltas.storageDelta
 			c.snapshot.deltas.fileDelta -= entry.deltas.fileDelta
@@ -538,6 +536,22 @@ func (d quotaPendingDeltas) sub(other quotaPendingDeltas) quotaPendingDeltas {
 
 func (d quotaPendingDeltas) zero() bool {
 	return d.storageDelta == 0 && d.fileDelta == 0 && d.mediaDelta == 0
+}
+
+func (d quotaPendingDeltas) positivePart() quotaPendingDeltas {
+	return quotaPendingDeltas{
+		storageDelta: maxInt64(d.storageDelta, 0),
+		fileDelta:    maxInt64(d.fileDelta, 0),
+		mediaDelta:   maxInt64(d.mediaDelta, 0),
+	}
+}
+
+func (d quotaPendingDeltas) negate() quotaPendingDeltas {
+	return quotaPendingDeltas{
+		storageDelta: -d.storageDelta,
+		fileDelta:    -d.fileDelta,
+		mediaDelta:   -d.mediaDelta,
+	}
 }
 
 func maxInt64(a, b int64) int64 {

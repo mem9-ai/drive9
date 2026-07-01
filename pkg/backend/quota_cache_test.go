@@ -475,6 +475,26 @@ func TestQuotaPendingDeltasCacheClearAfterExpiryDoesNotGoNegative(t *testing.T) 
 	}
 }
 
+func TestQuotaPendingDeltasCacheRemovesPositiveRaceDeltasOnClearAndExpire(t *testing.T) {
+	c := newQuotaPendingDeltasCache("test-tenant", nil, time.Hour)
+	c.pendingTTL = 10 * time.Millisecond
+
+	c.addPending(8, 1, -1)
+	c.clearPending(8, 1, -1)
+	if got := c.localPositiveDeltas; got.storageDelta != 0 || got.fileDelta != 0 || got.mediaDelta != 0 {
+		t.Fatalf("positive deltas after clear = %+v, want zero", got)
+	}
+
+	c.addPending(5, 2, 1)
+	time.Sleep(20 * time.Millisecond)
+	if _, ok := c.get(context.Background()); !ok {
+		t.Fatal("expired get failed")
+	}
+	if got := c.localPositiveDeltas; got.storageDelta != 0 || got.fileDelta != 0 || got.mediaDelta != 0 {
+		t.Fatalf("positive deltas after expire = %+v, want zero", got)
+	}
+}
+
 func TestQuotaConfigCacheStop(t *testing.T) {
 	store := newCacheTestStore()
 	c := newQuotaConfigCache("t1", store)
