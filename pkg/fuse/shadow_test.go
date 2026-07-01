@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestShadowStoreWriteExtentsReadAt(t *testing.T) {
@@ -697,4 +699,560 @@ func TestNewShadowStoreSweepsRetiredFiles(t *testing.T) {
 	if !ss2.Has("/live.txt") {
 		t.Error("live shadow was swept")
 	}
+}
+
+// --- Write-back disk protection tests (Issue #651) ---
+
+func TestCheckWriteBackQuotaByteQuotaAllowed(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 1024) // 1KB quota, no free ratio
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Writing 500 bytes with 0 pending should succeed.
+	if err := ss.CheckWriteBackQuota(500); err != nil {
+		t.Fatalf("expected write to be allowed, got %v", err)
+	}
+}
+
+func TestCheckWriteBackQuotaByteQuotaExceeded(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 1024) // 1KB quota, no free ratio
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write an 800-byte shadow file to accumulate pending bytes internally.
+	if err := ss.WriteFull("/big.txt", make([]byte, 800), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Writing 300 more bytes (total 1100 > 1024) should be rejected.
+	err = ss.CheckWriteBackQuota(300)
+	if err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC, got %v", err)
+	}
+}
+
+func TestCheckWriteBackQuotaByteQuotaDisabled(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0) // both disabled
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write a large shadow file; with quota disabled, any further write should pass.
+	if err := ss.WriteFull("/big.txt", make([]byte, 10000), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.CheckWriteBackQuota(999999999); err != nil {
+		t.Fatalf("expected write to be allowed with quota disabled, got %v", err)
+	}
+}
+
+func TestCheckWriteBackQuotaFreeRatioAllowed(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0.10, 0) // 10% free ratio, no byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// A small write should succeed (test machine has > 10% free space).
+	if err := ss.CheckWriteBackQuota(1); err != nil {
+		t.Fatalf("expected small write to be allowed, got %v", err)
+	}
+}
+
+func TestCheckWriteBackQuotaFreeRatioExceeded(t *testing.T) {
+	dir := t.TempDir()
+	// Use a free ratio of 0.9999 so any write triggers rejection
+	// (the test machine would need 99.99% free space after the write).
+	ss, err := NewShadowStoreWithQuota(dir, 0.9999, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// A large write should fail because it can't keep 99.99% free.
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(dir, &stat); err != nil {
+		t.Skip("cannot statfs temp dir")
+	}
+	totalBytes := int64(stat.Blocks) * int64(stat.Bsize)
+	err = ss.CheckWriteBackQuota(totalBytes / 2)
+	if err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC for large write with 99.99%% free ratio, got %v", err)
+	}
+}
+
+func TestCheckWriteBackQuotaFreeRatioDisabled(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0) // both disabled
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// With free ratio disabled, write should pass.
+	if err := ss.CheckWriteBackQuota(1 << 30); err != nil {
+		t.Fatalf("expected write allowed with free ratio disabled, got %v", err)
+	}
+}
+
+func TestPendingBytesWriteFullAndRemove(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Initial pending should be 0.
+	if p := ss.PendingBytes(); p != 0 {
+		t.Fatalf("expected initial pending 0, got %d", p)
+	}
+
+	// WriteFull should increase pending bytes.
+	if err := ss.WriteFull("/a.txt", make([]byte, 1000), 1); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 1000 {
+		t.Fatalf("expected pending 1000 after write, got %d", p)
+	}
+
+	// Overwriting with a smaller file should decrease pending.
+	if err := ss.WriteFull("/a.txt", make([]byte, 600), 2); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 600 {
+		t.Fatalf("expected pending 600 after overwrite, got %d", p)
+	}
+
+	// Remove should bring it back to 0.
+	ss.Remove("/a.txt")
+	if p := ss.PendingBytes(); p != 0 {
+		t.Fatalf("expected pending 0 after remove, got %d", p)
+	}
+}
+
+func TestRecoverPendingBytesFromDisk(t *testing.T) {
+	dir := t.TempDir()
+
+	// Manually create shadow files on disk to simulate a crash scenario
+	// where the in-memory ShadowStore state is lost.
+	if err := os.WriteFile(filepath.Join(dir, "aaa.shadow"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bbb.shadow"), []byte("world!!"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a new store and recover pending bytes.
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	ss.RecoverPendingBytes()
+	// Should recover 5 + 7 = 12 bytes.
+	if p := ss.PendingBytes(); p != 12 {
+		t.Fatalf("expected recovered pending 12, got %d", p)
+	}
+}
+
+func TestByteQuotaRecoveryAfterCommitCleanup(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Stage an 80-byte shadow file.
+	if err := ss.WriteFull("/file.txt", make([]byte, 80), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.CheckWriteBackQuota(30); err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC when 80+30>100, got %v", err)
+	}
+
+	// Simulate commit cleanup: Remove releases pending bytes.
+	ss.Remove("/file.txt")
+
+	// Now writing 30 should succeed again.
+	if err := ss.CheckWriteBackQuota(30); err != nil {
+		t.Fatalf("expected write to succeed after cleanup, got %v", err)
+	}
+}
+
+func TestPendingBytesNoDoubleCount(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write a 500-byte shadow file.
+	if err := ss.WriteFull("/f.txt", make([]byte, 500), 1); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 500 {
+		t.Fatalf("expected pending 500, got %d", p)
+	}
+
+	// Overwrite the same path with 500 bytes again — pending must stay 500, not 1000.
+	if err := ss.WriteFull("/f.txt", make([]byte, 500), 2); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 500 {
+		t.Fatalf("expected pending 500 after re-stage, got %d (double-count bug)", p)
+	}
+
+	// A third stage that grows the file to 700 should bring pending to 700.
+	if err := ss.WriteFull("/f.txt", make([]byte, 700), 3); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 700 {
+		t.Fatalf("expected pending 700 after grow, got %d", p)
+	}
+
+	// Shrink back to 200.
+	if err := ss.WriteFull("/f.txt", make([]byte, 200), 4); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 200 {
+		t.Fatalf("expected pending 200 after shrink, got %d", p)
+	}
+}
+
+func TestReStageNoFalseENOSPC(t *testing.T) {
+	dir := t.TempDir()
+	// Quota is 1000 bytes.
+	ss, err := NewShadowStoreWithQuota(dir, 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write 800 bytes — within quota.
+	if err := ss.WriteFull("/f.txt", make([]byte, 800), 1); err != nil {
+		t.Fatalf("first write should succeed: %v", err)
+	}
+
+	// Re-stage same path with same 800 bytes — delta is 0, should NOT reject.
+	if err := ss.WriteFull("/f.txt", make([]byte, 800), 2); err != nil {
+		t.Fatalf("re-stage same size should succeed (delta=0): %v", err)
+	}
+
+	// Re-stage with 900 bytes — delta is 100, total 900 < 1000, should succeed.
+	if err := ss.WriteFull("/f.txt", make([]byte, 900), 3); err != nil {
+		t.Fatalf("re-stage with 100 byte growth should succeed: %v", err)
+	}
+
+	// Re-stage with 1100 bytes — delta is 200, total 1100 > 1000, should ENOSPC.
+	err = ss.WriteFull("/f.txt", make([]byte, 1100), 4)
+	if err != syscall.ENOSPC {
+		t.Fatalf("re-stage exceeding quota should ENOSPC, got %v", err)
+	}
+
+	// Pending should still be 900 (last successful write).
+	if p := ss.PendingBytes(); p != 900 {
+		t.Fatalf("expected pending 900 after rejected write, got %d", p)
+	}
+}
+
+func TestWriteStreamQuotaEnforcement(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// WriteStream within quota should succeed.
+	origData := bytes.Repeat([]byte("A"), 50)
+	n, err := ss.WriteStream("/f.txt", bytes.NewReader(origData), 1)
+	if err != nil {
+		t.Fatalf("WriteStream within quota should succeed: %v", err)
+	}
+	if n != 50 {
+		t.Fatalf("expected 50 bytes written, got %d", n)
+	}
+	if p := ss.PendingBytes(); p != 50 {
+		t.Fatalf("expected pending 50, got %d", p)
+	}
+
+	// WriteStream exceeding quota should ENOSPC and preserve original shadow.
+	_, err = ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 200)), 2)
+	if err != syscall.ENOSPC {
+		t.Fatalf("WriteStream exceeding quota should ENOSPC, got %v", err)
+	}
+	// Pending should still be 50 (original shadow untouched).
+	if p := ss.PendingBytes(); p != 50 {
+		t.Fatalf("expected pending 50 after failed stream, got %d", p)
+	}
+	// Original content must be preserved.
+	data, err := ss.ReadAll("/f.txt")
+	if err != nil {
+		t.Fatalf("ReadAll after failed stream: %v", err)
+	}
+	if !bytes.Equal(data, origData) {
+		t.Fatalf("shadow content corrupted: got %d bytes of %q, want 50 bytes of 'A'", len(data), data[:1])
+	}
+}
+
+func TestWriteStreamPeakDiskBounded(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Attempt to stream 200 bytes which exceeds the 100-byte quota.
+	// The incremental quota check should abort mid-stream so the temp
+	// file never reaches 200 bytes.
+	_, err = ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 200)), 1)
+	if err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC, got %v", err)
+	}
+
+	// Verify no temp file residue.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".tmp" {
+			t.Fatalf("temp file residue found: %s", e.Name())
+		}
+	}
+
+	// pendingBytes should be 0 (nothing was committed).
+	if p := ss.PendingBytes(); p != 0 {
+		t.Fatalf("expected pending 0, got %d", p)
+	}
+}
+
+func TestWriteStreamReplacementPeakBounded(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write an initial 50-byte shadow.
+	origData := bytes.Repeat([]byte("A"), 50)
+	if _, err := ss.WriteStream("/f.txt", bytes.NewReader(origData), 1); err != nil {
+		t.Fatalf("initial WriteStream: %v", err)
+	}
+	if p := ss.PendingBytes(); p != 50 {
+		t.Fatalf("expected pending 50, got %d", p)
+	}
+
+	// Replace with 100 bytes. Final pending would be 100 (within quota),
+	// but peak disk is old(50) + tmp(100) = 150 which exceeds quota=100.
+	// The quota check uses the full temp size, so this must ENOSPC.
+	_, err = ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 100)), 2)
+	if err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC for replacement peak exceeding quota, got %v", err)
+	}
+
+	// Original shadow must be preserved.
+	if p := ss.PendingBytes(); p != 50 {
+		t.Fatalf("expected pending 50 after rejected replacement, got %d", p)
+	}
+	data, err := ss.ReadAll("/f.txt")
+	if err != nil {
+		t.Fatalf("ReadAll after rejected replacement: %v", err)
+	}
+	if !bytes.Equal(data, origData) {
+		t.Fatalf("shadow content corrupted after rejected replacement")
+	}
+}
+
+func TestFreeRatioThrottledReEvaluatesCachedCapacity(t *testing.T) {
+	dir := t.TempDir()
+	// free-ratio=0.50 (50% must remain free); no byte quota.
+	ss, err := NewShadowStoreWithQuota(dir, 0.50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Directly prime the cached Statfs values to simulate a known disk geometry.
+	// Simulated: 1000 bytes total, 600 bytes free (60% free).
+	ss.cachedFreeBytes.Store(600)
+	ss.cachedTotalBytes.Store(1000)
+	// Set lastDiskCheck to now so throttled path uses cached values.
+	ss.lastDiskCheck.Store(time.Now().UnixNano())
+
+	// Small requiredBytes=100: freeAfter=500, ratio=0.50 → pass (barely).
+	if err := ss.checkFreeRatioThrottled(100); err != nil {
+		t.Fatalf("small requiredBytes should pass: %v", err)
+	}
+
+	// Large requiredBytes=200: freeAfter=400, ratio=0.40 < 0.50 → ENOSPC.
+	// This verifies that cached capacity is re-evaluated with the new
+	// requiredBytes, not just returning the cached bool from the first check.
+	err = ss.checkFreeRatioThrottled(200)
+	if err != syscall.ENOSPC {
+		t.Fatalf("large requiredBytes should ENOSPC with cached capacity, got %v", err)
+	}
+}
+
+func TestEnsureQuotaEnforcement(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Ensure within quota should succeed and track pendingBytes.
+	if err := ss.Ensure("/f.txt", 80, 1); err != nil {
+		t.Fatalf("Ensure within quota should succeed: %v", err)
+	}
+	if p := ss.PendingBytes(); p != 80 {
+		t.Fatalf("expected pending 80 after Ensure, got %d", p)
+	}
+
+	// Ensure exceeding quota should ENOSPC.
+	err = ss.Ensure("/f.txt", 200, 2)
+	if err != syscall.ENOSPC {
+		t.Fatalf("Ensure exceeding quota should ENOSPC, got %v", err)
+	}
+	// Pending should still be 80.
+	if p := ss.PendingBytes(); p != 80 {
+		t.Fatalf("expected pending 80 after rejected Ensure, got %d", p)
+	}
+
+	// WriteAt within the Ensured range should not bypass quota.
+	// (delta=0 since WriteAt doesn't grow beyond Ensured size)
+	_, err = ss.WriteAt("/f.txt", 0, make([]byte, 80), 1)
+	if err != nil {
+		t.Fatalf("WriteAt within Ensured size should succeed: %v", err)
+	}
+	if p := ss.PendingBytes(); p != 80 {
+		t.Fatalf("expected pending 80 after WriteAt, got %d", p)
+	}
+}
+
+func TestCheckWriteBackQuotaThrottled(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0.10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// First call should run the real check.
+	err1 := ss.CheckWriteBackQuotaThrottled(1)
+
+	// Second call within interval should return cached result.
+	err2 := ss.CheckWriteBackQuotaThrottled(1)
+	if (err1 == nil) != (err2 == nil) {
+		t.Fatalf("throttled results differ: %v vs %v", err1, err2)
+	}
+}
+
+// TestRenamePendingBytesReplacesTarget verifies that Rename subtracts the
+// replaced target's size from pendingBytes.
+func TestRenamePendingBytesReplacesTarget(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write src=5B, dst=3B.
+	if err := ss.WriteFull("/src", []byte("hello"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.WriteFull("/dst", []byte("bye"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if pb := ss.PendingBytes(); pb != 8 {
+		t.Fatalf("before rename: pendingBytes=%d, want 8", pb)
+	}
+
+	// Rename /src → /dst replaces the 3B dst shadow.
+	if !ss.Rename("/src", "/dst") {
+		t.Fatal("Rename returned false")
+	}
+	if pb := ss.PendingBytes(); pb != 5 {
+		t.Fatalf("after rename: pendingBytes=%d, want 5", pb)
+	}
+}
+
+// TestWriteStreamConcurrentReadAt verifies no data race between WriteStream
+// and ReadAt on the same path. Run with -race to detect.
+func TestWriteStreamConcurrentReadAt(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Seed initial shadow.
+	if err := ss.WriteFull("/f", []byte("initial"), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	// Concurrent reader.
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64)
+		for i := 0; i < 200; i++ {
+			_, _ = ss.ReadAt("/f", 0, buf)
+		}
+	}()
+	// Concurrent writer.
+	for i := 0; i < 50; i++ {
+		data := bytes.Repeat([]byte("x"), i+1)
+		_, _ = ss.WriteStream("/f", bytes.NewReader(data), int64(i+2))
+	}
+	<-done
+}
+
+// TestWriteStreamConcurrentReadAtGen verifies no data race between WriteStream
+// and ReadAtGen on a pinned active generation. Run with -race to detect.
+func TestWriteStreamConcurrentReadAtGen(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Seed initial shadow and pin it.
+	if err := ss.WriteFull("/f", []byte("initial"), 1); err != nil {
+		t.Fatal(err)
+	}
+	gen := ss.Pin("/f")
+	defer ss.Unpin(gen)
+
+	done := make(chan struct{})
+	// Concurrent reader via pinned generation.
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64)
+		for i := 0; i < 200; i++ {
+			_, _ = ss.ReadAtGen(gen, 0, buf)
+		}
+	}()
+	// Concurrent writer.
+	for i := 0; i < 50; i++ {
+		data := bytes.Repeat([]byte("x"), i+1)
+		_, _ = ss.WriteStream("/f", bytes.NewReader(data), int64(i+2))
+	}
+	<-done
 }
