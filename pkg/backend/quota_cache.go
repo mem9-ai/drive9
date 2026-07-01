@@ -301,21 +301,28 @@ type quotaPendingDeltasSnapshot struct {
 	expiresAt time.Time
 }
 
+type quotaPendingDeltaEntry struct {
+	deltas    quotaPendingDeltas
+	expiresAt time.Time
+}
+
 type quotaPendingDeltasLoader func(context.Context) (storageDelta, fileDelta, mediaDelta int64, err error)
 
 // quotaPendingDeltasCache tracks this process's central quota mutations that
 // have been logged but not yet applied. It deliberately has no tenant-DB
 // fallback: runtime quota admission must not SUM quota_outbox from the user DB.
 type quotaPendingDeltasCache struct {
-	tenantID string
-	load     quotaPendingDeltasLoader
-	ttl      time.Duration
+	tenantID   string
+	load       quotaPendingDeltasLoader
+	ttl        time.Duration
+	pendingTTL time.Duration
 
 	mu                  sync.RWMutex
 	snapshot            *quotaPendingDeltasSnapshot
 	generation          uint64
 	localDeltas         quotaPendingDeltas
 	localPositiveDeltas quotaPendingDeltas
+	localEntries        []quotaPendingDeltaEntry
 	loadMu              sync.Mutex
 }
 
@@ -323,7 +330,15 @@ func newQuotaPendingDeltasCache(tenantID string, load quotaPendingDeltasLoader, 
 	if ttl <= 0 {
 		ttl = quotaPendingDeltasCacheTTL
 	}
-	return &quotaPendingDeltasCache{tenantID: tenantID, load: load, ttl: ttl}
+	return &quotaPendingDeltasCache{tenantID: tenantID, load: load, ttl: ttl, pendingTTL: localPendingMutationTTL()}
+}
+
+func localPendingMutationTTL() time.Duration {
+	ttl := replayMinAge() + replayPollInterval() + quotaPendingDeltasCacheTTL
+	if ttl <= 0 {
+		return defaultReplayMinAge + defaultReplayPollInterval + defaultQuotaPendingDeltasCacheTTL
+	}
+	return ttl
 }
 
 func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, bool) {
@@ -331,11 +346,15 @@ func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, 
 		return quotaPendingDeltas{}, false
 	}
 	if c.load == nil {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.expireLocalDeltasLocked(time.Now())
 		return c.localDeltas, true
 	}
 	now := time.Now()
+	c.mu.Lock()
+	c.expireLocalDeltasLocked(now)
+	c.mu.Unlock()
 	if deltas, ok := c.cached(now); ok {
 		return deltas, true
 	}
@@ -397,32 +416,106 @@ func (c *quotaPendingDeltasCache) cached(now time.Time) (quotaPendingDeltas, boo
 	return quotaPendingDeltas{}, false
 }
 
-func (c *quotaPendingDeltasCache) add(storageDelta, fileDelta, mediaDelta int64) {
+func (c *quotaPendingDeltasCache) addPending(storageDelta, fileDelta, mediaDelta int64) {
 	if c == nil {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.generation++
-	c.localDeltas.add(quotaPendingDeltas{
+	deltas := quotaPendingDeltas{
 		storageDelta: storageDelta,
 		fileDelta:    fileDelta,
 		mediaDelta:   mediaDelta,
-	})
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	c.expireLocalDeltasLocked(now)
+	c.generation++
+	c.localDeltas.add(deltas)
 	c.localPositiveDeltas.add(quotaPendingDeltas{
 		storageDelta: maxInt64(storageDelta, 0),
 		fileDelta:    maxInt64(fileDelta, 0),
 		mediaDelta:   maxInt64(mediaDelta, 0),
 	})
+	if !deltas.zero() {
+		c.localEntries = append(c.localEntries, quotaPendingDeltaEntry{
+			deltas:    deltas,
+			expiresAt: now.Add(c.pendingTTL),
+		})
+	}
 	// If the snapshot is missing or expired, leave it cold. The no-loader
 	// runtime path reads localDeltas directly; the legacy loader path refreshes
 	// snapshots on demand.
-	if c.snapshot == nil || time.Now().After(c.snapshot.expiresAt) {
+	if c.snapshot == nil || now.After(c.snapshot.expiresAt) {
 		return
 	}
 	c.snapshot.deltas.storageDelta += storageDelta
 	c.snapshot.deltas.fileDelta += fileDelta
 	c.snapshot.deltas.mediaDelta += mediaDelta
+}
+
+func (c *quotaPendingDeltasCache) clearPending(storageDelta, fileDelta, mediaDelta int64) {
+	if c == nil {
+		return
+	}
+	deltas := quotaPendingDeltas{
+		storageDelta: storageDelta,
+		fileDelta:    fileDelta,
+		mediaDelta:   mediaDelta,
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	c.expireLocalDeltasLocked(now)
+	c.generation++
+	if !c.removeLocalEntryLocked(deltas) {
+		return
+	}
+	c.localDeltas.add(quotaPendingDeltas{
+		storageDelta: -storageDelta,
+		fileDelta:    -fileDelta,
+		mediaDelta:   -mediaDelta,
+	})
+	if c.snapshot == nil || now.After(c.snapshot.expiresAt) {
+		return
+	}
+	c.snapshot.deltas.storageDelta -= storageDelta
+	c.snapshot.deltas.fileDelta -= fileDelta
+	c.snapshot.deltas.mediaDelta -= mediaDelta
+}
+
+func (c *quotaPendingDeltasCache) expireLocalDeltasLocked(now time.Time) {
+	if len(c.localEntries) == 0 {
+		return
+	}
+	kept := c.localEntries[:0]
+	for _, entry := range c.localEntries {
+		if now.Before(entry.expiresAt) {
+			kept = append(kept, entry)
+			continue
+		}
+		c.localDeltas.add(quotaPendingDeltas{
+			storageDelta: -entry.deltas.storageDelta,
+			fileDelta:    -entry.deltas.fileDelta,
+			mediaDelta:   -entry.deltas.mediaDelta,
+		})
+		if c.snapshot != nil && now.Before(c.snapshot.expiresAt) {
+			c.snapshot.deltas.storageDelta -= entry.deltas.storageDelta
+			c.snapshot.deltas.fileDelta -= entry.deltas.fileDelta
+			c.snapshot.deltas.mediaDelta -= entry.deltas.mediaDelta
+		}
+	}
+	c.localEntries = kept
+}
+
+func (c *quotaPendingDeltasCache) removeLocalEntryLocked(deltas quotaPendingDeltas) bool {
+	for i, entry := range c.localEntries {
+		if entry.deltas == deltas {
+			copy(c.localEntries[i:], c.localEntries[i+1:])
+			c.localEntries = c.localEntries[:len(c.localEntries)-1]
+			return true
+		}
+	}
+	return false
 }
 
 func (d *quotaPendingDeltas) add(other quotaPendingDeltas) {
@@ -437,6 +530,10 @@ func (d quotaPendingDeltas) sub(other quotaPendingDeltas) quotaPendingDeltas {
 		fileDelta:    d.fileDelta - other.fileDelta,
 		mediaDelta:   d.mediaDelta - other.mediaDelta,
 	}
+}
+
+func (d quotaPendingDeltas) zero() bool {
+	return d.storageDelta == 0 && d.fileDelta == 0 && d.mediaDelta == 0
 }
 
 func maxInt64(a, b int64) int64 {

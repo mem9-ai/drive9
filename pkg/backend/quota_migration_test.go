@@ -690,9 +690,10 @@ func TestCentralQuotaMutationLogInsertFailureSurfaces(t *testing.T) {
 	}
 }
 
-func TestCentralQuotaPendingDeltaRetainedAfterInlineApplyFailure(t *testing.T) {
+func TestCentralQuotaPendingDeltaRetainedThenExpiresAfterInlineApplyFailure(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
 	applyErr := errors.New("meta apply unavailable")
+	b.quotaPendingCache.pendingTTL = 10 * time.Millisecond
 
 	if err := b.logAndEnqueueMutation(context.Background(), "file_create", fileCreateMutationData{
 		FileID:    "file-pending",
@@ -714,6 +715,12 @@ func TestCentralQuotaPendingDeltaRetainedAfterInlineApplyFailure(t *testing.T) {
 	}
 	if got := fake.mutations[len(fake.mutations)-1].status; got != "pending" {
 		t.Fatalf("mutation status = %q, want pending for replay", got)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	storageDelta, fileDelta, mediaDelta = b.pendingCentralMutationDeltas(context.Background())
+	if storageDelta != 0 || fileDelta != 0 || mediaDelta != 0 {
+		t.Fatalf("expired pending deltas = (%d,%d,%d), want zero after local TTL", storageDelta, fileDelta, mediaDelta)
 	}
 }
 

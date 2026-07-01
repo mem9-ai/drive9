@@ -333,7 +333,7 @@ func (b *Dat9Backend) recordAppliedQuotaOutboxEntries(entries []datastore.QuotaO
 		b.quotaUsageCache.invalidate()
 	}
 	for _, entry := range entries {
-		b.addPendingCentralMutationDeltas(-entry.StorageDelta, -entry.FileDelta, -entry.MediaDelta)
+		b.clearPendingCentralMutationDeltas(entry.StorageDelta, entry.FileDelta, entry.MediaDelta)
 		metrics.RecordTenantOperationCount(b.tenantID, "quota_outbox", entry.MutationType, "ok")
 	}
 }

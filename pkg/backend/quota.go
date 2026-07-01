@@ -347,7 +347,13 @@ func (b *Dat9Backend) pendingCentralMutationDeltas(ctx context.Context) (storage
 
 func (b *Dat9Backend) addPendingCentralMutationDeltas(storageDelta, fileDelta, mediaDelta int64) {
 	if b.quotaPendingCache != nil {
-		b.quotaPendingCache.add(storageDelta, fileDelta, mediaDelta)
+		b.quotaPendingCache.addPending(storageDelta, fileDelta, mediaDelta)
+	}
+}
+
+func (b *Dat9Backend) clearPendingCentralMutationDeltas(storageDelta, fileDelta, mediaDelta int64) {
+	if b.quotaPendingCache != nil {
+		b.quotaPendingCache.clearPending(storageDelta, fileDelta, mediaDelta)
 	}
 }
 

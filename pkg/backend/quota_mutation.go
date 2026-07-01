@@ -130,7 +130,7 @@ func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType strin
 	if b.quotaUsageCache != nil {
 		b.quotaUsageCache.invalidate()
 	}
-	b.addPendingCentralMutationDeltas(-pending.storageDelta, -pending.fileDelta, -pending.mediaDelta)
+	b.clearPendingCentralMutationDeltas(pending.storageDelta, pending.fileDelta, pending.mediaDelta)
 	metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "ok", time.Duration(0))
 }
 
