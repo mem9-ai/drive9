@@ -2501,6 +2501,27 @@ func TestSemanticWorkerKickDedupAndOverflow(t *testing.T) {
 	}
 }
 
+func TestSemanticWorkerProcessQueuedKickDrainsBeforePoll(t *testing.T) {
+	m := newSemanticWorkerManager(newTestBackendForSemanticWorker(t), nil, nil, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	m.Kick(semanticLocalTenantID)
+	if !m.processQueuedKick(context.Background()) {
+		t.Fatal("processQueuedKick=false, want queued kick drained")
+	}
+	if len(m.kicks) != 0 {
+		t.Fatalf("kicks=%d, want drained queue", len(m.kicks))
+	}
+	m.mu.Lock()
+	_, pending := m.kickPending[semanticLocalTenantID]
+	_, queued := m.kickQueued[semanticLocalTenantID]
+	m.mu.Unlock()
+	if pending || queued {
+		t.Fatalf("local kick pending=%v queued=%v, want cleared after processing", pending, queued)
+	}
+}
+
 func TestSemanticWorkerKickedAcquireFailureKeepsKickPending(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -2533,7 +2554,11 @@ func TestSemanticWorkerKickedAcquireFailureKeepsKickPending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+	retryDelay := 50 * time.Millisecond
+	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{
+		RetryBaseDelay: retryDelay,
+		RetryMaxDelay:  retryDelay,
+	})
 	if m == nil {
 		t.Fatal("expected semantic worker manager")
 	}
@@ -2548,11 +2573,19 @@ func TestSemanticWorkerKickedAcquireFailureKeepsKickPending(t *testing.T) {
 	_, pending := m.kickPending[tenantID]
 	_, queued := m.kickQueued[tenantID]
 	m.mu.Unlock()
-	if !pending || !queued {
-		t.Fatalf("tenant %s pending=%v queued=%v, want acquire failure to keep kick retryable", tenantID, pending, queued)
+	if !pending || queued {
+		t.Fatalf("tenant %s pending=%v queued=%v, want delayed retryable kick", tenantID, pending, queued)
 	}
-	if len(m.kicks) != 1 {
-		t.Fatalf("kicks=%d, want requeued failed kick", len(m.kicks))
+	if len(m.kicks) != 0 {
+		t.Fatalf("kicks=%d, want no immediate requeue after acquire failure", len(m.kicks))
+	}
+	select {
+	case got := <-m.kicks:
+		if got != tenantID {
+			t.Fatalf("delayed queued kick=%q, want %q", got, tenantID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for delayed kick retry")
 	}
 }
 
@@ -2564,7 +2597,11 @@ func TestSemanticWorkerKickedLookupFailureKeepsKickPending(t *testing.T) {
 	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPool(t)
-	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+	retryDelay := 50 * time.Millisecond
+	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{
+		RetryBaseDelay: retryDelay,
+		RetryMaxDelay:  retryDelay,
+	})
 	if m == nil {
 		t.Fatal("expected semantic worker manager")
 	}
@@ -2583,11 +2620,19 @@ func TestSemanticWorkerKickedLookupFailureKeepsKickPending(t *testing.T) {
 	_, pending := m.kickPending[tenantID]
 	_, queued := m.kickQueued[tenantID]
 	m.mu.Unlock()
-	if !pending || !queued {
-		t.Fatalf("tenant %s pending=%v queued=%v, want lookup failure to keep kick retryable", tenantID, pending, queued)
+	if !pending || queued {
+		t.Fatalf("tenant %s pending=%v queued=%v, want delayed retryable kick", tenantID, pending, queued)
 	}
-	if len(m.kicks) != 1 {
-		t.Fatalf("kicks=%d, want requeued failed kick", len(m.kicks))
+	if len(m.kicks) != 0 {
+		t.Fatalf("kicks=%d, want no immediate requeue after lookup failure", len(m.kicks))
+	}
+	select {
+	case got := <-m.kicks:
+		if got != tenantID {
+			t.Fatalf("delayed queued kick=%q, want %q", got, tenantID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for delayed kick retry")
 	}
 }
 

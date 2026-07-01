@@ -168,6 +168,7 @@ type semanticWorkerManager struct {
 	processing  int
 	kickPending map[string]struct{}
 	kickQueued  map[string]struct{}
+	kickRetryAt map[string]time.Time
 
 	kicks chan string
 
@@ -305,6 +306,7 @@ func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Sto
 	m.inflight = make(map[string]int)
 	m.kickPending = make(map[string]struct{})
 	m.kickQueued = make(map[string]struct{})
+	m.kickRetryAt = make(map[string]time.Time)
 	m.kicks = make(chan string, semanticKickQueueCapacity)
 	return m
 }
@@ -338,6 +340,11 @@ func (m *semanticWorkerManager) queuePendingKick(tenantID string) bool {
 		m.mu.Unlock()
 		return true
 	}
+	if retryAt, delayed := m.kickRetryAt[tenantID]; delayed && time.Now().Before(retryAt) {
+		m.mu.Unlock()
+		return true
+	}
+	delete(m.kickRetryAt, tenantID)
 	m.kickQueued[tenantID] = struct{}{}
 	m.mu.Unlock()
 
@@ -365,6 +372,9 @@ func (m *semanticWorkerManager) queueNextPendingKick() {
 			if _, queued := m.kickQueued[id]; queued {
 				continue
 			}
+			if retryAt, delayed := m.kickRetryAt[id]; delayed && time.Now().Before(retryAt) {
+				continue
+			}
 			tenantID = id
 			break
 		}
@@ -379,6 +389,7 @@ func (m *semanticWorkerManager) clearKickPending(tenantID string) {
 	m.mu.Lock()
 	delete(m.kickPending, tenantID)
 	delete(m.kickQueued, tenantID)
+	delete(m.kickRetryAt, tenantID)
 	m.mu.Unlock()
 }
 
@@ -386,6 +397,49 @@ func (m *semanticWorkerManager) markKickDequeued(tenantID string) {
 	m.mu.Lock()
 	delete(m.kickQueued, tenantID)
 	m.mu.Unlock()
+}
+
+func (m *semanticWorkerManager) delayPendingKick(ctx context.Context, tenantID string) {
+	delay := m.opts.RetryBaseDelay
+	if delay <= 0 {
+		delay = defaultSemanticRetryBaseDelay
+	}
+	retryAt := time.Now().Add(delay)
+	m.mu.Lock()
+	if _, pending := m.kickPending[tenantID]; !pending {
+		m.mu.Unlock()
+		return
+	}
+	if existing, delayed := m.kickRetryAt[tenantID]; delayed && time.Now().Before(existing) {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.kickQueued, tenantID)
+	m.kickRetryAt[tenantID] = retryAt
+	m.mu.Unlock()
+	metrics.RecordTenantOperation(tenantID, "semantic_worker", "kick", "retry_delayed", 0)
+
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		m.mu.Lock()
+		if _, pending := m.kickPending[tenantID]; !pending {
+			m.mu.Unlock()
+			return
+		}
+		if current, delayed := m.kickRetryAt[tenantID]; delayed && time.Now().Before(current) {
+			m.mu.Unlock()
+			return
+		}
+		delete(m.kickRetryAt, tenantID)
+		m.mu.Unlock()
+		m.queuePendingKick(tenantID)
+	}()
 }
 
 func (m *semanticWorkerManager) Start(ctx context.Context) {
@@ -440,6 +494,15 @@ func (m *semanticWorkerManager) workerLoop(ctx context.Context, workerID int) {
 	ticker := time.NewTicker(m.effectivePollInterval())
 	defer ticker.Stop()
 	for {
+		select {
+		case <-ctx.Done():
+			logger.Info(ctx, "semantic_worker_stopped", zap.Int("worker_id", workerID))
+			return
+		default:
+		}
+		if m.processQueuedKick(ctx) {
+			continue
+		}
 		processed := m.processNext(ctx)
 		// If a task was processed, immediately look for more work. Multi-tenant
 		// scans are warm-cache only, so this drains real backlog without opening
@@ -455,6 +518,16 @@ func (m *semanticWorkerManager) workerLoop(ctx context.Context, workerID int) {
 			m.processKicked(ctx, tenantID)
 		case <-ticker.C:
 		}
+	}
+}
+
+func (m *semanticWorkerManager) processQueuedKick(ctx context.Context) bool {
+	select {
+	case tenantID := <-m.kicks:
+		m.processKicked(ctx, tenantID)
+		return true
+	default:
+		return false
 	}
 }
 
@@ -521,6 +594,7 @@ func (m *semanticWorkerManager) processKicked(ctx context.Context, tenantID stri
 	m.markKickDequeued(tenantID)
 	ref, ok, err := m.kickRef(ctx, tenantID)
 	if err != nil {
+		m.delayPendingKick(ctx, tenantID)
 		return
 	}
 	if !ok {
@@ -539,10 +613,12 @@ func (m *semanticWorkerManager) processKicked(ctx context.Context, tenantID stri
 			zap.String("tenant_id", ref.id),
 			zap.Error(err))
 		m.releaseTenantSlot(ref.id)
+		m.delayPendingKick(ctx, tenantID)
 		return
 	}
 	if target == nil {
 		m.releaseTenantSlot(ref.id)
+		m.delayPendingKick(ctx, tenantID)
 		return
 	}
 	// Clear the pending mark only after the backend is acquired: a task
