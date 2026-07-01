@@ -88,6 +88,9 @@ Watch the meta pipeline instead of tenant outbox health:
 - `quota_mutation_log` pending backlog.
 - oldest pending mutation age.
 - `central_quota_mutation_log_insert_failed` log/metric.
+- `central_quota/upload_reset_active` errors or
+  `central_quota_upload_reset_active_failed`, which indicate a retryable upload
+  complete failure could not reset the reservation back to active.
 - any new tenant `quota_outbox` row after cutover, which indicates a missed
   runtime code path.
 

@@ -277,7 +277,7 @@ func (f *fakeMetaQuotaStore) InsertUploadReservation(ctx context.Context, r *Upl
 func (f *fakeMetaQuotaStore) UpdateUploadReservationStatus(ctx context.Context, tenantID, uploadID, status string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if r, ok := f.reservations[metaKey(tenantID, uploadID)]; ok {
+	if r, ok := f.reservations[metaKey(tenantID, uploadID)]; ok && (r.Status == "active" || r.Status == "completing") {
 		r.Status = status
 	}
 	return nil
