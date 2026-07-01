@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"go.uber.org/zap"
@@ -103,11 +104,19 @@ func (p *tenantOutboxPoller) initCursor(ctx context.Context) {
 				zap.Uint64("cursor", p.lastID))
 			return
 		}
-		// ErrNotFound means first launch — fall through to MAX(id).
-		if err != nil && err != meta.ErrNotFound {
+		if errors.Is(err, meta.ErrNotFound) {
+			// First launch — no prior cursor. Fall through to MAX(id) below.
+		} else if err != nil {
+			// Non-ErrNotFound error: do NOT fall through to MAX(id), which would
+			// skip historical rows. Start from 0 instead so all unpruned rows are
+			// re-read; duplicate kicks are harmless (work is idempotent/deduped).
 			logger.Warn(ctx, "tenant_outbox_poller_cursor_read_failed",
 				zap.String("pod_id", p.podID),
 				zap.Error(err))
+			p.lastID = 0
+			logger.Info(ctx, "tenant_outbox_poller_cursor_initialized",
+				zap.Uint64("cursor", p.lastID))
+			return
 		}
 	}
 	maxID, err := p.metaStore.MaxTenantNotifyID(ctx)

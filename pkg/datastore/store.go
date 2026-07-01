@@ -3059,10 +3059,17 @@ func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error
 			result = "canceled"
 		case errors.Is(*errp, context.DeadlineExceeded):
 			result = "deadline_exceeded"
+		case errors.Is(*errp, sql.ErrConnDone):
+			// Connection closed during shutdown — not an unexpected failure.
+			result = "conn_closed"
 		default:
-			result = "error"
+			if strings.Contains((*errp).Error(), "database is closed") {
+				result = "conn_closed"
+			} else {
+				result = "error"
+			}
 		}
-		if result != "canceled" && result != "deadline_exceeded" {
+		if result != "canceled" && result != "deadline_exceeded" && result != "conn_closed" {
 			logger.Error(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
 		}
 	}

@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,9 +30,10 @@ const (
 	defaultTenantRetryMaxDelay         = 30 * time.Second
 	defaultTenantPerTenantConcurrency = 1
 	tenantLocalID                     = "local"
-	// tenantKickQueueCapacity bounds buffered kicks; overflow kicks are dropped
-	// because the safety-net scan remains the durable fallback for claiming
-	// queued tasks.
+	// tenantKickQueueCapacity bounds buffered kicks; overflow kicks are left
+	// pending in kickPending and re-enqueued by flushDelayedKicks on the next
+	// workerLoop ticker tick. The safety-net scan remains the durable fallback
+	// for claiming queued tasks.
 	tenantKickQueueCapacity = 256
 	// tenantKickDrainLimit caps tasks drained per kick so one busy tenant
 	// cannot monopolize a worker; the tenant is re-kicked to continue after
@@ -186,34 +190,15 @@ func newTenantWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store
 	if maintenanceInterval > 0 {
 		opts.MaintenanceInterval = maintenanceInterval
 	}
-	app := m.appManagedTaskTypes()
-	var poolAuto []semantic.TaskType
-	if pool != nil {
-		poolAuto = pool.AutoSemanticTaskTypes()
-	}
-	var fbAuto []semantic.TaskType
-	if fallback != nil {
-		fbAuto = fallback.AutoSemanticTaskTypes()
-	}
-	viable := hasAnyTaskTypes(app) || hasAnyTaskTypes(poolAuto)
-	if !hasMultiTenant {
-		viable = viable || hasAnyTaskTypes(fbAuto)
-		if fallback != nil && !viable {
-			viable = fallback.SupportsAsyncImageExtract() || fallback.SupportsAsyncAudioExtract()
-		}
-	}
+	// The unified tenant worker handles semantic, file_gc, and quota work.
+	// It is viable whenever there is a multi-tenant pool or a fallback backend.
+	viable := hasMultiTenant || fallback != nil
 	if !viable {
 		return nil
 	}
-	if fallback != nil && !hasMultiTenant {
-		if fallback.UsesDatabaseAutoEmbedding() {
-			if !hasAnyTaskTypes(fallback.AutoSemanticTaskTypes()) {
-				return nil
-			}
-		} else if !hasAnyTaskTypes(app) && !fallback.SupportsAsyncImageExtract() && !fallback.SupportsAsyncAudioExtract() {
-			return nil
-		}
-	}
+	// In single-tenant (fallback-only) mode, semantic work requires an
+	// embedder or async-extract support; file_gc and quota remain viable
+	// regardless, so we do not return nil for file_gc/quota-only deployments.
 	opts.normalize()
 	m.opts = opts
 	m.inflight = make(map[string]int)
@@ -226,8 +211,9 @@ func newTenantWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store
 // Kick prompts a worker to process work for tenantID. The workMask is
 // OR-accumulated with any pending kick for the same tenant so a burst of
 // different work types coalesces into one kick. Best-effort: duplicates
-// collapse while one is pending, and the kick is dropped when the buffer is
-// full — the safety-net scan remains the durable path.
+// collapse while one is pending, and the kick is left pending (delayed) when
+// the buffer is full — flushDelayedKicks re-enqueues it on the next ticker
+// tick, and the safety-net scan remains the durable fallback path.
 func (m *tenantWorkerManager) Kick(tenantID string, workMask int) {
 	if m == nil || tenantID == "" || workMask == 0 {
 		return
@@ -245,8 +231,10 @@ func (m *tenantWorkerManager) Kick(tenantID string, workMask int) {
 	case m.kicks <- kickMsg{tenantID: tenantID, workMask: workMask}:
 		metrics.RecordTenantOperation(tenantID, "tenant_worker", "kick", "queued", 0)
 	default:
-		m.clearKickPending(tenantID)
-		metrics.RecordTenantOperation(tenantID, "tenant_worker", "kick", "dropped", 0)
+		// Channel full: leave kickPending so flushDelayedKicks (ticked from
+		// workerLoop) re-enqueues when the channel has space. The work mask is
+		// already recorded in kickPending above; do NOT clear it.
+		metrics.RecordTenantOperation(tenantID, "tenant_worker", "kick", "delayed", 0)
 	}
 }
 
@@ -265,6 +253,36 @@ func (m *tenantWorkerManager) takePendingWorkMask(tenantID string) int {
 	delete(m.kickPending, tenantID)
 	m.mu.Unlock()
 	return mask
+}
+
+// flushDelayedKicks re-enqueues kicks that were left pending when the kicks
+// channel was full. Called on each workerLoop ticker tick so delayed work is
+// delivered once the channel drains. Entries still pending after a successful
+// send are consumed by the receiving worker via takePendingWorkMask.
+func (m *tenantWorkerManager) flushDelayedKicks() {
+	// Snapshot pending entries under the lock, then attempt non-blocking sends
+	// outside the lock to avoid holding it during channel ops.
+	m.mu.Lock()
+	if len(m.kickPending) == 0 {
+		m.mu.Unlock()
+		return
+	}
+	pending := make(map[string]int, len(m.kickPending))
+	for tenantID, mask := range m.kickPending {
+		pending[tenantID] = mask
+	}
+	m.mu.Unlock()
+	for tenantID, mask := range pending {
+		select {
+		case m.kicks <- kickMsg{tenantID: tenantID, workMask: mask}:
+			// Successfully (re-)queued. Leave the kickPending entry in place:
+			// the worker merges it via takePendingWorkMask after claiming the
+			// slot, so any further coalesced kicks are not lost.
+			metrics.RecordTenantOperation(tenantID, "tenant_worker", "kick", "flushed", 0)
+		default:
+			// Still full; leave pending for the next tick.
+		}
+	}
 }
 
 func (m *tenantWorkerManager) Start(ctx context.Context) {
@@ -328,6 +346,8 @@ func (m *tenantWorkerManager) workerLoop(ctx context.Context, workerID int) {
 		case msg := <-m.kicks:
 			m.processKicked(ctx, msg.tenantID, msg.workMask)
 		case <-ticker.C:
+			// Re-enqueue delayed kicks now that the channel may have space.
+			m.flushDelayedKicks()
 		}
 	}
 }
@@ -337,6 +357,9 @@ func (m *tenantWorkerManager) workerLoop(ctx context.Context, workerID int) {
 // loop immediately), false if all queues are empty.
 func (m *tenantWorkerManager) pollFallbackOnce(ctx context.Context) bool {
 	if m.fallback == nil {
+		return false
+	}
+	if ctx.Err() != nil {
 		return false
 	}
 	target := &tenantTarget{
@@ -377,18 +400,19 @@ func (m *tenantWorkerManager) shouldPollFallback() bool {
 // recovers expired leases and runs piggyback maintenance (throttled). The
 // tenant is re-kicked if more work remains.
 func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID string, workMask int) {
-	// Clear the pending mark before claiming: a task committed after this
-	// point triggers a fresh kick.
-	m.clearKickPending(tenantID)
+	// Do NOT clear kickPending here — a kick coalesced while this message was
+	// in the channel must be consumed after acquiring the tenant slot.
 	ref, ok := m.kickRef(ctx, tenantID)
 	if !ok {
+		m.clearKickPending(tenantID)
 		return
 	}
 	if !m.tryClaimTenantSlot(ref.id) {
-		// Another worker already holds this tenant's slot and its drain will
-		// observe any task committed before the kick was sent.
+		// Another worker holds the slot; leave kickPending for that worker to consume.
 		return
 	}
+	// Merge any work mask that coalesced while this kick was queued.
+	workMask |= m.takePendingWorkMask(tenantID)
 	target, err := m.targetForRef(ctx, ref)
 	if err != nil {
 		logger.Warn(ctx, "tenant_worker_kick_open_store_failed",
@@ -401,8 +425,10 @@ func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID string
 	defer target.release()
 
 	// Drain semantic tasks (if selected and allowed).
+	var reKickMask int
 	semanticMask := workMask & WorkSemantic
 	if semanticMask != 0 && len(target.allowedTaskTypes) > 0 {
+		semanticDrained := 0
 		for range tenantKickDrainLimit {
 			if ctx.Err() != nil {
 				return
@@ -410,17 +436,25 @@ func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID string
 			if !m.claimAndProcessOne(ctx, target) {
 				break
 			}
+			semanticDrained++
+		}
+		if semanticDrained >= tenantKickDrainLimit {
+			reKickMask |= WorkSemantic
 		}
 	}
 
 	// Drain file_gc tasks (if selected).
 	if workMask&WorkFileGC != 0 {
-		m.drainFileGC(ctx, target)
+		if m.drainFileGC(ctx, target) {
+			reKickMask |= WorkFileGC
+		}
 	}
 
 	// Drain quota outbox (if selected).
 	if workMask&WorkQuota != 0 {
-		m.drainQuotaOutbox(ctx, target)
+		if m.drainQuotaOutbox(ctx, target) {
+			reKickMask |= WorkQuota
+		}
 	}
 
 	// Recover expired leases for all work types (cheap, runs on every kick).
@@ -430,21 +464,24 @@ func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID string
 	// per tenant by MaintenanceInterval.
 	m.piggybackMaintenance(ctx, target)
 
-	// Re-kick if there's pending work accumulated during processing.
+	// Re-kick if there's pending work accumulated during processing, or if a
+	// drain hit its cap (more work likely remains for that type).
 	pending := m.takePendingWorkMask(tenantID)
-	if pending != 0 {
-		m.Kick(tenantID, pending)
+	reKick := pending | reKickMask
+	if reKick != 0 {
+		m.Kick(tenantID, reKick)
 	}
 }
 
 // drainFileGC recovers expired file_gc leases and drains available tasks.
-func (m *tenantWorkerManager) drainFileGC(ctx context.Context, target *tenantTarget) {
+// Returns true if the drain hit its batch cap (more work likely remains).
+func (m *tenantWorkerManager) drainFileGC(ctx context.Context, target *tenantTarget) (hitCap bool) {
 	if ctx.Err() != nil {
-		return
+		return false
 	}
 	b := target.backend
 	if b == nil {
-		return
+		return false
 	}
 	now := time.Now().UTC()
 	if _, err := target.store.RecoverExpiredFileGCTasks(ctx, now, fileGCRecoverLimit); err != nil {
@@ -455,7 +492,7 @@ func (m *tenantWorkerManager) drainFileGC(ctx context.Context, target *tenantTar
 	}
 	for i := 0; i < fileGCDrainBatchSize; i++ {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 		processed, err := b.ProcessOneFileGCTask(ctx)
 		if err != nil {
@@ -465,19 +502,21 @@ func (m *tenantWorkerManager) drainFileGC(ctx context.Context, target *tenantTar
 			}
 		}
 		if !processed {
-			return
+			return false
 		}
 	}
+	return true // drained the full batch — likely more remains
 }
 
 // drainQuotaOutbox recovers expired quota outbox leases and drains available rows.
-func (m *tenantWorkerManager) drainQuotaOutbox(ctx context.Context, target *tenantTarget) {
+// Returns true if the drain hit its batch cap (more work likely remains).
+func (m *tenantWorkerManager) drainQuotaOutbox(ctx context.Context, target *tenantTarget) (hitCap bool) {
 	if ctx.Err() != nil {
-		return
+		return false
 	}
 	b := target.backend
 	if b == nil {
-		return
+		return false
 	}
 	now := time.Now().UTC()
 	if _, err := target.store.RecoverExpiredQuotaOutbox(ctx, now, quotaOutboxRecoverLimit); err != nil {
@@ -488,7 +527,7 @@ func (m *tenantWorkerManager) drainQuotaOutbox(ctx context.Context, target *tena
 	}
 	for total := 0; total < quotaOutboxDrainBatchSize; {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 		processed, err := b.ProcessQuotaOutboxBatch(ctx, quotaOutboxDrainBatchSize-total)
 		if err != nil {
@@ -497,14 +536,15 @@ func (m *tenantWorkerManager) drainQuotaOutbox(ctx context.Context, target *tena
 					zap.String("tenant_id", target.tenantID), zap.Error(err))
 			}
 			if processed == 0 {
-				return
+				return false
 			}
 		}
 		if processed == 0 {
-			return
+			return false
 		}
 		total += processed
 	}
+	return true // drained the full batch — likely more remains
 }
 
 // recoverExpired recovers expired semantic task leases for the tenant.
@@ -817,7 +857,19 @@ func (m *tenantWorkerManager) taskTypesForTarget(b *backend.Dat9Backend) []seman
 }
 
 func isContextDoneErr(err error) bool {
-	return err == context.Canceled || err == context.DeadlineExceeded
+	if err == context.Canceled || err == context.DeadlineExceeded {
+		return true
+	}
+	if errors.Is(err, sql.ErrConnDone) {
+		return true
+	}
+	// "database is closed" arises from go-sql-driver/mysql when the underlying
+	// connection is torn down during shutdown; treat it as a context-done signal
+	// so it is not logged as an unexpected error.
+	if strings.Contains(err.Error(), "database is closed") {
+		return true
+	}
+	return false
 }
 
 // failpoint injection hook used by semantic task processing (preserved from

@@ -430,6 +430,10 @@ func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release fu
 	if p == nil || t == nil {
 		return nil, nil, false
 	}
+	if t.Status != meta.TenantActive {
+		p.Invalidate(t.ID)
+		return nil, nil, false
+	}
 	s3EncryptionPolicy := t.S3EncryptionPolicy()
 	p.mu.Lock()
 	e, exists := p.items[t.ID]

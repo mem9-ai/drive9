@@ -535,7 +535,7 @@ func semanticTaskLogFields(task *semantic.Task) []zap.Field {
 		zap.String("task_type", string(task.TaskType)),
 		zap.String("resource_id", task.ResourceID),
 		zap.Int64("resource_version", task.ResourceVersion),
-		zap.String("receipt", task.Receipt),
+		zap.Bool("has_receipt", task.Receipt != ""),
 		zap.Int("attempt_count", task.AttemptCount),
 	}
 	if task.LeaseUntil != nil {

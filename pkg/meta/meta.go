@@ -3099,12 +3099,23 @@ func observeMeta(ctx context.Context, op string, start time.Time, errp *error) {
 			result = "not_found"
 		case errors.Is(*errp, ErrDuplicate):
 			result = "duplicate"
+		case errors.Is(*errp, sql.ErrConnDone):
+			// Connection closed during shutdown — not an unexpected failure.
+			result = "conn_closed"
 		default:
-			result = "error"
+			if strings.Contains((*errp).Error(), "database is closed") {
+				result = "conn_closed"
+			} else {
+				result = "error"
+			}
 		}
-		if result == "not_found" || result == "duplicate" {
+		switch result {
+		case "conn_closed":
+			// Connection closed during shutdown — suppress the noisy log and
+			// only record the metric below.
+		case "not_found", "duplicate":
 			logger.Warn(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
-		} else {
+		case "error":
 			logger.Error(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
 		}
 	}
@@ -3599,11 +3610,20 @@ func (s *Store) MaxTenantNotifyID(ctx context.Context) (out uint64, err error) {
 }
 
 // DeleteTenantNotifyBefore prunes outbox rows older than the given threshold.
-// Leader-gated; retention is relative to DB insert time (created_at).
+// Leader-gated; retention is relative to DB insert time (created_at). Rows are
+// only pruned up to the minimum last_id across all pods' cursors so a lagging
+// pod that has not yet processed a row does not lose its work signal. When no
+// cursors exist (e.g. before any pod has registered), falls back to age-only
+// pruning.
 func (s *Store) DeleteTenantNotifyBefore(ctx context.Context, before time.Time) (n int64, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "delete_tenant_notify_before", start, &err)
-	res, err := s.db.ExecContext(ctx, `DELETE FROM tenant_notify_outbox WHERE created_at < ?`, before)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM tenant_notify_outbox
+WHERE created_at < ?
+AND (
+  NOT EXISTS (SELECT 1 FROM tenant_outbox_cursor)
+  OR id <= (SELECT MIN(last_id) FROM tenant_outbox_cursor)
+)`, before)
 	if err != nil {
 		return 0, err
 	}

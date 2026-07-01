@@ -55,7 +55,9 @@ func newTestServerWithLogger(t *testing.T, log *zap.Logger) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewWithConfig(Config{Backend: b, Logger: log})
+	s := NewWithConfig(Config{Backend: b, Logger: log})
+	t.Cleanup(func() { s.Close() })
+	return s
 }
 
 func insertTestS3File(t *testing.T, s *Server, p string, size int64) {
