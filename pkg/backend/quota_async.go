@@ -10,13 +10,12 @@ const (
 	// worker drains the channel to preserve per-tenant FIFO ordering
 	// (UpsertFileMetaTx is not commutative across create/overwrite).
 	//
-	// DEPRECATED: The in-process mutation queue provides per-tenant FIFO ordering
-	// only within a single backend instance. In multi-pod deployments, cross-pod
-	// ordering is not guaranteed (see logAndEnqueueMutation comment). The newer
-	// quota_outbox_worker.go uses FOR UPDATE SKIP LOCKED + lease for multi-pod
-	// safe claim-based processing. The mutation replay worker (leader-gated since
-	// PR #601) provides a convergence backstop for the durable mutation log.
-	// This queue remains as the primary in-process apply path for same-pod writes.
+	// The in-process mutation queue provides per-tenant FIFO ordering only
+	// within a single backend instance. In multi-pod deployments, cross-pod
+	// ordering is not guaranteed (see logAndEnqueueMutation comment). The
+	// durable quota_mutation_log plus MutationReplayWorker provides the
+	// convergence backstop. Legacy tenant quota_outbox code remains only for
+	// old rows and tests, not for the runtime write path.
 	mutationQueueSize = 256
 )
 
@@ -33,7 +32,7 @@ func (b *Dat9Backend) startMutationWorker() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	b.mutationStop = cancel
-	b.mutationQueue = make(chan func(), mutationQueueSize)
+	b.mutationQueue = make(chan func(context.Context), mutationQueueSize)
 	b.mutationWG.Add(1)
 	go b.drainMutations(ctx)
 }
@@ -47,13 +46,13 @@ func (b *Dat9Backend) drainMutations(ctx context.Context) {
 			for {
 				select {
 				case fn := <-b.mutationQueue:
-					fn()
+					fn(ctx)
 				default:
 					return
 				}
 			}
 		case fn := <-b.mutationQueue:
-			fn()
+			fn(ctx)
 		}
 	}
 }
@@ -66,10 +65,10 @@ func (b *Dat9Backend) drainMutations(ctx context.Context) {
 // If the queue is not wired (tests), the function runs inline.
 // The channel send blocks if the buffer is full, preserving FIFO ordering;
 // the 256-slot buffer makes blocking extremely unlikely in practice.
-func (b *Dat9Backend) enqueueMutation(fn func()) {
+func (b *Dat9Backend) enqueueMutation(ctx context.Context, fn func(context.Context)) {
 	if b.mutationQueue == nil {
 		// No async queue — run inline (test/fallback path).
-		fn()
+		fn(ctx)
 		return
 	}
 	b.mutationQueue <- fn

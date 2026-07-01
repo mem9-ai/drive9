@@ -301,7 +301,7 @@ func TestQuotaPendingDeltasCacheUsesTTLAndLocalAdjustments(t *testing.T) {
 
 	storage = 99
 	file = 9
-	c.add(5, 2, 1)
+	c.addPending(5, 2, 1)
 	second, ok := c.get(context.Background())
 	if !ok {
 		t.Fatal("second get failed")
@@ -337,7 +337,7 @@ func TestQuotaPendingDeltasCachePublishesConservativeSnapshotWhenLocalDeltaRaces
 	}()
 
 	<-started
-	c.add(5, 1, 0)
+	c.addPending(5, 1, 0)
 	close(release)
 
 	got := <-done
@@ -382,7 +382,7 @@ func TestQuotaPendingDeltasCacheIgnoresNegativeRaceDeltasWhenPublishing(t *testi
 	}()
 
 	<-started
-	c.add(-5, -1, -1)
+	c.addPending(-5, -1, -1)
 	close(release)
 
 	got := <-done
@@ -401,6 +401,97 @@ func TestQuotaPendingDeltasCacheIgnoresNegativeRaceDeltasWhenPublishing(t *testi
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("loader calls = %d, want 1", got)
+	}
+}
+
+func TestQuotaPendingDeltasCacheExpiresNoLoaderPending(t *testing.T) {
+	c := newQuotaPendingDeltasCache("test-tenant", nil, time.Hour)
+	c.pendingTTL = 10 * time.Millisecond
+
+	c.addPending(8, 1, -1)
+	first, ok := c.get(context.Background())
+	if !ok {
+		t.Fatal("first get failed")
+	}
+	if first.storageDelta != 8 || first.fileDelta != 1 || first.mediaDelta != -1 {
+		t.Fatalf("first deltas = %+v, want 8/1/-1", first)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	expired, ok := c.get(context.Background())
+	if !ok {
+		t.Fatal("expired get failed")
+	}
+	if expired.storageDelta != 0 || expired.fileDelta != 0 || expired.mediaDelta != 0 {
+		t.Fatalf("expired deltas = %+v, want zero", expired)
+	}
+}
+
+func TestQuotaPendingDeltasCacheClearPreventsExpiryDoubleSubtract(t *testing.T) {
+	c := newQuotaPendingDeltasCache("test-tenant", nil, time.Hour)
+	c.pendingTTL = 10 * time.Millisecond
+
+	c.addPending(8, 1, 0)
+	c.clearPending(8, 1, 0)
+	cleared, ok := c.get(context.Background())
+	if !ok {
+		t.Fatal("cleared get failed")
+	}
+	if cleared.storageDelta != 0 || cleared.fileDelta != 0 || cleared.mediaDelta != 0 {
+		t.Fatalf("cleared deltas = %+v, want zero", cleared)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	expired, ok := c.get(context.Background())
+	if !ok {
+		t.Fatal("expired get failed")
+	}
+	if expired.storageDelta != 0 || expired.fileDelta != 0 || expired.mediaDelta != 0 {
+		t.Fatalf("expired deltas = %+v, want zero", expired)
+	}
+}
+
+func TestQuotaPendingDeltasCacheClearAfterExpiryDoesNotGoNegative(t *testing.T) {
+	c := newQuotaPendingDeltasCache("test-tenant", nil, time.Hour)
+	c.pendingTTL = 10 * time.Millisecond
+
+	c.addPending(8, 1, 0)
+	time.Sleep(20 * time.Millisecond)
+	expired, ok := c.get(context.Background())
+	if !ok {
+		t.Fatal("expired get failed")
+	}
+	if expired.storageDelta != 0 || expired.fileDelta != 0 || expired.mediaDelta != 0 {
+		t.Fatalf("expired deltas = %+v, want zero", expired)
+	}
+
+	c.clearPending(8, 1, 0)
+	cleared, ok := c.get(context.Background())
+	if !ok {
+		t.Fatal("cleared get failed")
+	}
+	if cleared.storageDelta != 0 || cleared.fileDelta != 0 || cleared.mediaDelta != 0 {
+		t.Fatalf("cleared deltas = %+v, want zero after late clear", cleared)
+	}
+}
+
+func TestQuotaPendingDeltasCacheRemovesPositiveRaceDeltasOnClearAndExpire(t *testing.T) {
+	c := newQuotaPendingDeltasCache("test-tenant", nil, time.Hour)
+	c.pendingTTL = 10 * time.Millisecond
+
+	c.addPending(8, 1, -1)
+	c.clearPending(8, 1, -1)
+	if got := c.localPositiveDeltas; got.storageDelta != 0 || got.fileDelta != 0 || got.mediaDelta != 0 {
+		t.Fatalf("positive deltas after clear = %+v, want zero", got)
+	}
+
+	c.addPending(5, 2, 1)
+	time.Sleep(20 * time.Millisecond)
+	if _, ok := c.get(context.Background()); !ok {
+		t.Fatal("expired get failed")
+	}
+	if got := c.localPositiveDeltas; got.storageDelta != 0 || got.fileDelta != 0 || got.mediaDelta != 0 {
+		t.Fatalf("positive deltas after expire = %+v, want zero", got)
 	}
 }
 

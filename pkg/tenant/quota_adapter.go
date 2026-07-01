@@ -198,12 +198,16 @@ func (a *metaQuotaAdapter) UpdateUploadReservationStatus(ctx context.Context, te
 	return a.s.UpdateUploadReservationStatus(ctx, tenantID, uploadID, status)
 }
 
-func (a *metaQuotaAdapter) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantID, uploadID, status string) error {
-	return a.s.UpdateUploadReservationStatusTx(tx, tenantID, uploadID, status)
+func (a *metaQuotaAdapter) UpdateUploadReservationStatusTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID, status string) error {
+	return a.s.UpdateUploadReservationStatusTx(ctx, tx, tenantID, uploadID, status)
 }
 
-func (a *metaQuotaAdapter) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (bool, int64, error) {
-	return a.s.SettleActiveReservationTx(tx, tenantID, uploadID, status)
+func (a *metaQuotaAdapter) AbortActiveReservationTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID string) (bool, int64, int64, error) {
+	return a.s.AbortActiveReservationTx(ctx, tx, tenantID, uploadID)
+}
+
+func (a *metaQuotaAdapter) SettleActiveReservationTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID, status string) (bool, int64, error) {
+	return a.s.SettleActiveReservationTx(ctx, tx, tenantID, uploadID, status)
 }
 
 func (a *metaQuotaAdapter) GetUploadReservation(ctx context.Context, tenantID, uploadID string) (*backend.UploadReservationView, error) {

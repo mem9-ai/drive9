@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -44,19 +45,45 @@ type llmCostMutationData struct {
 	RawUnitType    string `json:"raw_unit_type"`
 }
 
+const postCommitQuotaMutationTimeout = 30 * time.Second
+
+// PostCommitQuotaMutationError reports that the user-visible file mutation has
+// already committed, but the central quota handoff failed afterward.
+type PostCommitQuotaMutationError struct {
+	Op  string
+	Err error
+}
+
+func (e *PostCommitQuotaMutationError) Error() string {
+	return fmt.Sprintf("%s after commit: %v", e.Op, e.Err)
+}
+
+func (e *PostCommitQuotaMutationError) Unwrap() error { return e.Err }
+
+func postCommitQuotaMutationContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(backgroundWithTrace(), postCommitQuotaMutationTimeout)
+}
+
+func postCommitQuotaMutationError(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &PostCommitQuotaMutationError{Op: op, Err: err}
+}
+
 func isQuotaMediaContentType(contentType string) bool {
 	return strings.HasPrefix(contentType, "image/") || strings.HasPrefix(contentType, "audio/")
 }
 
 // logQuotaMutation durably records a mutation in the central quota_mutation_log.
-// Returns the log ID and true on success, or (0, false) if the mutation could
-// not be logged (caller should treat as fail-open). This is the synchronous
-// half of the split mutation path — it MUST complete before the write/fsync
-// returns success so that MutationReplayWorker can recover the mutation after
-// a crash.
-func (b *Dat9Backend) logQuotaMutation(ctx context.Context, mutationType string, payload any) (int64, bool) {
+// This is the only runtime quota accounting handoff after tenant quota_outbox
+// removal. Callers must surface an error instead of silently dropping the
+// mutation. The current write paths still call this after the tenant DB commit,
+// so a process crash between tenant commit and this insert remains a known
+// reconciliation/backfill window.
+func (b *Dat9Backend) logQuotaMutation(ctx context.Context, mutationType string, payload any) (int64, error) {
 	if b.metaStore == nil || b.tenantID == "" {
-		return 0, false
+		return 0, nil
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -64,7 +91,7 @@ func (b *Dat9Backend) logQuotaMutation(ctx context.Context, mutationType string,
 			zap.String("tenant_id", b.tenantID),
 			zap.String("mutation_type", mutationType),
 			zap.Error(err))
-		return 0, false
+		return 0, err
 	}
 	logID, err := b.metaStore.InsertMutationLog(ctx, &MutationLogView{
 		TenantID:     b.tenantID,
@@ -76,18 +103,18 @@ func (b *Dat9Backend) logQuotaMutation(ctx context.Context, mutationType string,
 			zap.String("tenant_id", b.tenantID),
 			zap.String("mutation_type", mutationType),
 			zap.Error(err))
-		metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "fail_open", time.Duration(0))
-		return 0, false
+		metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "log_error", time.Duration(0))
+		return 0, err
 	}
-	return logID, true
+	return logID, nil
 }
 
 // applyQuotaMutation applies a previously-logged mutation and marks it as
 // applied. This is the async-safe half of the split mutation path — if it
 // fails or never runs, MutationReplayWorker picks up the pending log entry.
-func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType string, logID int64, apply func(tx *sql.Tx) error) {
+func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType string, logID int64, pending quotaPendingDeltas, apply func(context.Context, *sql.Tx) error) {
 	if err := b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
-		if err := apply(tx); err != nil {
+		if err := apply(ctx, tx); err != nil {
 			return err
 		}
 		return b.metaStore.MarkMutationAppliedTx(tx, logID)
@@ -100,6 +127,10 @@ func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType strin
 		metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "pending", time.Duration(0))
 		return
 	}
+	if b.quotaUsageCache != nil {
+		b.quotaUsageCache.invalidate()
+	}
+	b.clearPendingCentralMutationDeltas(pending.storageDelta, pending.fileDelta, pending.mediaDelta)
 	metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "ok", time.Duration(0))
 }
 
@@ -118,17 +149,21 @@ func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType strin
 // pending (unapplied) entries in (tenant_id, id) order, which handles
 // crash recovery. For cross-pod last-writer divergence on file_meta,
 // the backfill-quota tool can be run manually to reconcile.
-func (b *Dat9Backend) logAndEnqueueMutation(ctx context.Context, mutationType string, payload any, apply func(tx *sql.Tx) error) {
+func (b *Dat9Backend) logAndEnqueueMutation(ctx context.Context, mutationType string, payload any, pending quotaPendingDeltas, apply func(context.Context, *sql.Tx) error) error {
+	if b.metaStore == nil || b.tenantID == "" {
+		return nil
+	}
 	start := time.Now()
 
 	b.mutationMu.Lock()
-	logID, ok := b.logQuotaMutation(ctx, mutationType, payload)
-	if !ok {
+	logID, err := b.logQuotaMutation(ctx, mutationType, payload)
+	if err != nil {
 		b.mutationMu.Unlock()
-		return
+		return err
 	}
-	b.enqueueMutation(func() {
-		b.applyQuotaMutation(context.Background(), mutationType, logID, apply)
+	b.addPendingCentralMutationDeltas(pending.storageDelta, pending.fileDelta, pending.mediaDelta)
+	b.enqueueMutation(ctx, func(applyCtx context.Context) {
+		b.applyQuotaMutation(applyCtx, mutationType, logID, pending, apply)
 	})
 	b.mutationMu.Unlock()
 
@@ -137,6 +172,7 @@ func (b *Dat9Backend) logAndEnqueueMutation(ctx context.Context, mutationType st
 		zap.String("mutation_type", mutationType),
 		zap.Int64("log_id", logID),
 		zap.Float64("total_ms", backendDurationMs(time.Since(start))))
+	return nil
 }
 
 func applyCentralFileStateTx(store MetaQuotaStore, tx *sql.Tx, tenantID, fileID string, sizeBytes int64, isMedia bool) error {
@@ -189,19 +225,27 @@ func applyCentralFileOverwriteTx(store MetaQuotaStore, tx *sql.Tx, tenantID stri
 	return applyCentralFileStateTx(store, tx, tenantID, data.FileID, data.NewSizeBytes, data.NewIsMedia)
 }
 
-func (b *Dat9Backend) syncCentralFileCreate(ctx context.Context, fileID string, sizeBytes int64, contentType string) {
+func (b *Dat9Backend) recordCentralFileCreateMutation(ctx context.Context, fileID string, sizeBytes int64, contentType string) error {
 	isMedia := isQuotaMediaContentType(contentType)
 	data := fileCreateMutationData{
 		FileID:    fileID,
 		SizeBytes: sizeBytes,
 		IsMedia:   isMedia,
 	}
-	b.logAndEnqueueMutation(ctx, "file_create", data, func(tx *sql.Tx) error {
+	mediaDelta := int64(0)
+	if isMedia {
+		mediaDelta = 1
+	}
+	return b.logAndEnqueueMutation(ctx, "file_create", data, quotaPendingDeltas{
+		storageDelta: sizeBytes,
+		fileDelta:    1,
+		mediaDelta:   mediaDelta,
+	}, func(applyCtx context.Context, tx *sql.Tx) error {
 		return applyCentralFileCreateTx(b.metaStore, tx, b.tenantID, data)
 	})
 }
 
-func (b *Dat9Backend) syncCentralFileOverwrite(ctx context.Context, fileID string, oldSize int64, oldContentType string, newSize int64, newContentType string) {
+func (b *Dat9Backend) recordCentralFileOverwriteMutation(ctx context.Context, fileID string, oldSize int64, oldContentType string, newSize int64, newContentType string) error {
 	oldIsMedia := isQuotaMediaContentType(oldContentType)
 	newIsMedia := isQuotaMediaContentType(newContentType)
 	data := fileOverwriteMutationData{
@@ -211,19 +255,22 @@ func (b *Dat9Backend) syncCentralFileOverwrite(ctx context.Context, fileID strin
 		NewSizeBytes: newSize,
 		NewIsMedia:   newIsMedia,
 	}
-	b.logAndEnqueueMutation(ctx, "file_overwrite", data, func(tx *sql.Tx) error {
+	return b.logAndEnqueueMutation(ctx, "file_overwrite", data, quotaPendingDeltas{
+		storageDelta: newSize - oldSize,
+		mediaDelta:   quotaMediaDelta(oldIsMedia, newIsMedia),
+	}, func(applyCtx context.Context, tx *sql.Tx) error {
 		return applyCentralFileOverwriteTx(b.metaStore, tx, b.tenantID, data)
 	})
 }
 
-func (b *Dat9Backend) syncCentralLLMCostRecord(ctx context.Context, taskType, taskID string, costMillicents, rawUnits int64, rawUnitType string) {
-	b.logAndEnqueueMutation(ctx, "llm_cost_record", llmCostMutationData{
+func (b *Dat9Backend) syncCentralLLMCostRecord(ctx context.Context, taskType, taskID string, costMillicents, rawUnits int64, rawUnitType string) error {
+	return b.logAndEnqueueMutation(ctx, "llm_cost_record", llmCostMutationData{
 		TaskType:       taskType,
 		TaskID:         taskID,
 		CostMillicents: costMillicents,
 		RawUnits:       rawUnits,
 		RawUnitType:    rawUnitType,
-	}, func(tx *sql.Tx) error {
+	}, quotaPendingDeltas{}, func(applyCtx context.Context, tx *sql.Tx) error {
 		if err := b.metaStore.InsertCentralLLMUsageTx(tx, &LLMUsageView{
 			TenantID:       b.tenantID,
 			TaskType:       taskType,

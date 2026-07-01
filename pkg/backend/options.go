@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	defaultImageExtractMaxSize   = int64(8 << 20) // 8 MiB
-	defaultImageExtractTimeout   = 20 * time.Second
+	defaultImageExtractMaxSize = int64(8 << 20) // 8 MiB
+	defaultImageExtractTimeout = 20 * time.Second
 	// DefaultImageExtractMaxTextBytes is the default stored semantic text cap
 	// for image extraction. The image writeback path also enforces an
 	// estimated-token cap before this byte cap is applied.
@@ -35,20 +35,6 @@ const (
 	// negative MaxMonthlyMillicents in Options.LLMCostBudget. Per-tenant
 	// overrides via meta.QuotaConfig.MaxMonthlyCostMC continue to win.
 	defaultMaxMonthlyLLMCostMillicents = int64(1_000_000) // $10.00
-)
-
-// QuotaSource controls where quota checks read authoritative state from.
-// During migration from per-tenant DB to server DB, this flag selects the
-// active source.
-type QuotaSource string
-
-const (
-	// QuotaSourceTenant reads quota state from the per-tenant TiDB cluster
-	// (current/legacy behavior). This is the default.
-	QuotaSourceTenant QuotaSource = "tenant"
-	// QuotaSourceServer reads quota state from the drive9 server DB (meta).
-	// Requires that central quota tables are populated (backfill complete).
-	QuotaSourceServer QuotaSource = "server"
 )
 
 // Options configures Dat9Backend behavior.
@@ -81,9 +67,6 @@ type Options struct {
 	MaxMediaLLMFiles int64
 	// LLMCostBudget configures the monthly LLM cost budget for this tenant.
 	LLMCostBudget LLMCostBudgetOptions
-	// QuotaSource selects where quota enforcement reads authoritative state.
-	// "tenant" (default) uses per-tenant DB; "server" uses the central server DB.
-	QuotaSource QuotaSource
 	// TenantID is used for per-write S3 encryption context and audit metadata.
 	TenantID string
 	// StorageNamespaceID is the control-plane namespace for S3 object lifecycle.
@@ -191,11 +174,6 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 		if err == nil {
 			b.s3EncryptionPolicy = resolved
 		}
-	}
-	if opts.QuotaSource == QuotaSourceServer {
-		b.quotaSource = QuotaSourceServer
-	} else {
-		b.quotaSource = QuotaSourceTenant
 	}
 	if opts.MaxUploadBytes > 0 {
 		b.maxUploadBytes = opts.MaxUploadBytes
@@ -310,7 +288,6 @@ func (b *Dat9Backend) Close() {
 		b.audioExtractEnabled = false
 	}
 	b.stopMutationWorker()
-	b.stopQuotaOutboxWorker()
 	if b.quotaConfigCache != nil {
 		b.quotaConfigCache.stop()
 		b.quotaConfigCache = nil

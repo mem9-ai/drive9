@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,11 +15,39 @@ import (
 )
 
 const (
-	replayPollInterval = 30 * time.Second
-	replayMinAge       = 5 * time.Second // only replay mutations older than 5s (avoid racing with inline apply)
-	replayBatchLimit   = 100
-	replayMaxRetries   = 5
+	defaultReplayPollInterval = time.Second
+	defaultReplayMinAge       = time.Second // only replay older mutations to avoid racing inline apply
+	replayBatchLimit          = 100
+	replayMaxRetries          = 5
 )
+
+func replayPollInterval() time.Duration {
+	d := envDurationMS("DRIVE9_QUOTA_REPLAY_POLL_MS", defaultReplayPollInterval)
+	if d <= 0 {
+		return defaultReplayPollInterval
+	}
+	return d
+}
+
+func replayMinAge() time.Duration {
+	d := envDurationMS("DRIVE9_QUOTA_REPLAY_MIN_AGE_MS", defaultReplayMinAge)
+	if d <= 0 {
+		return defaultReplayMinAge
+	}
+	return d
+}
+
+func envDurationMS(name string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms < 0 {
+		return def
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 // MutationReplayWorker reads pending mutations from the quota_mutation_log
 // and applies them idempotently. It runs as a background goroutine.
@@ -56,7 +86,7 @@ func (w *MutationReplayWorker) run(ctx context.Context) {
 	defer close(w.done)
 
 	logger.Info(ctx, "mutation_replay_worker_started")
-	ticker := time.NewTicker(replayPollInterval)
+	ticker := time.NewTicker(replayPollInterval())
 	defer ticker.Stop()
 
 	for {
@@ -78,7 +108,7 @@ func (w *MutationReplayWorker) run(ctx context.Context) {
 // fatal error occurred (e.g. database closed) and the loop should stop.
 func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 	start := time.Now()
-	entries, err := w.store.ListPendingMutations(ctx, replayMinAge, replayBatchLimit)
+	entries, err := w.store.ListPendingMutations(ctx, replayMinAge(), replayBatchLimit)
 	if err != nil {
 		if strings.Contains(err.Error(), "database is closed") || strings.Contains(err.Error(), "connection refused") {
 			logger.Info(ctx, "mutation_replay_worker_db_closed")
@@ -144,18 +174,18 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 
 func (w *MutationReplayWorker) replayOne(ctx context.Context, entry MutationLogView) error {
 	return w.store.InTx(ctx, func(tx *sql.Tx) error {
-		if err := w.applyMutation(tx, entry); err != nil {
+		if err := w.applyMutation(ctx, tx, entry); err != nil {
 			return err
 		}
 		return w.store.MarkMutationAppliedTx(tx, entry.ID)
 	})
 }
 
-func (w *MutationReplayWorker) applyMutation(tx *sql.Tx, entry MutationLogView) error {
-	return applyCentralQuotaMutationTx(w.store, tx, entry.TenantID, entry.MutationType, entry.MutationData, entry.ID)
+func (w *MutationReplayWorker) applyMutation(ctx context.Context, tx *sql.Tx, entry MutationLogView) error {
+	return applyCentralQuotaMutationTx(ctx, w.store, tx, entry.TenantID, entry.MutationType, entry.MutationData, entry.ID)
 }
 
-func applyCentralQuotaMutationTx(store MetaQuotaStore, tx *sql.Tx, tenantID, mutationType string, mutationData json.RawMessage, logID int64) error {
+func applyCentralQuotaMutationTx(ctx context.Context, store MetaQuotaStore, tx *sql.Tx, tenantID, mutationType string, mutationData json.RawMessage, logID int64) error {
 	switch mutationType {
 	case "file_create":
 		var data fileCreateMutationData
@@ -208,7 +238,7 @@ func applyCentralQuotaMutationTx(store MetaQuotaStore, tx *sql.Tx, tenantID, mut
 		// caller (replayOne wraps applyMutation + MarkMutationAppliedTx in
 		// the same InTx), so this delegation is safe w.r.t. the Fix 2
 		// status='pending' guard.
-		return applyUploadCompleteTx(store, tx, tenantID, data)
+		return applyUploadCompleteTx(ctx, store, tx, tenantID, data)
 
 	case "llm_cost_record":
 		var data llmCostMutationData

@@ -43,7 +43,14 @@ func (b *Dat9Backend) recordImageExtractUsage(taskID string, usage ImageExtractU
 			metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "usage_insert", "error", 0)
 		}
 	}
-	b.syncCentralLLMCostRecord(backgroundWithTrace(), "img_extract_text", taskID, cost, totalTokens, "tokens")
+	if err := b.syncCentralLLMCostRecord(backgroundWithTrace(), "img_extract_text", taskID, cost, totalTokens, "tokens"); err != nil {
+		logger.Warn(backgroundWithTrace(), "central_quota_llm_cost_record_failed",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("task_type", "img_extract_text"),
+			zap.String("task_id", taskID),
+			zap.Error(err))
+		metrics.RecordTenantOperation(b.tenantID, "central_quota", "llm_cost_record", "log_error", 0)
+	}
 }
 
 func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractUsage) {
@@ -78,7 +85,14 @@ func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractU
 			metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "usage_insert", "error", 0)
 		}
 	}
-	b.syncCentralLLMCostRecord(backgroundWithTrace(), "audio_extract_text", taskID, cost, rawUnits, rawUnitType)
+	if err := b.syncCentralLLMCostRecord(backgroundWithTrace(), "audio_extract_text", taskID, cost, rawUnits, rawUnitType); err != nil {
+		logger.Warn(backgroundWithTrace(), "central_quota_llm_cost_record_failed",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("task_type", "audio_extract_text"),
+			zap.String("task_id", taskID),
+			zap.Error(err))
+		metrics.RecordTenantOperation(b.tenantID, "central_quota", "llm_cost_record", "log_error", 0)
+	}
 }
 
 func (b *Dat9Backend) imageTokenCostMillicents(totalTokens int64) int64 {

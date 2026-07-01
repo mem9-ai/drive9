@@ -7,7 +7,7 @@
 #   - curl, jq
 #
 # This script starts two local DB containers (meta: MySQL, tenant: TiDB), spins up
-# drive9-server-local with DRIVE9_QUOTA_SOURCE=server, and validates the
+# drive9-server-local with DRIVE9_LOCAL_META_DSN, and validates the
 # central quota enforcement end-to-end.
 #
 # Usage:
@@ -228,7 +228,6 @@ export DRIVE9_LOCAL_META_DSN="${META_DSN}"
 export DRIVE9_LOCAL_INIT_SCHEMA="true"
 export DRIVE9_LOCAL_API_KEY="${API_KEY}"
 export DRIVE9_S3_DIR="${S3_DIR}"
-export DRIVE9_QUOTA_SOURCE="server"
 export DRIVE9_MAX_TENANT_STORAGE_BYTES="${MAX_STORAGE_BYTES}"
 export DRIVE9_MAX_UPLOAD_BYTES="${MAX_UPLOAD_BYTES}"
 export DRIVE9_MAX_MEDIA_LLM_FILES="${MAX_MEDIA_LLM_FILES}"
