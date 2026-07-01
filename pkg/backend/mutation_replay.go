@@ -17,6 +17,7 @@ import (
 const (
 	defaultReplayPollInterval = time.Second
 	defaultReplayMinAge       = time.Second // only replay older mutations to avoid racing inline apply
+	defaultReplayObserveEvery = 10 * time.Second
 	replayBatchLimit          = 100
 	replayMaxRetries          = 5
 )
@@ -56,6 +57,7 @@ type MutationReplayWorker struct {
 	cancel                 context.CancelFunc
 	done                   chan struct{}
 	observedBacklogTenants map[string]struct{}
+	lastBacklogObservation time.Time
 }
 
 // StartMutationReplayWorker starts the background replay loop.
@@ -85,7 +87,10 @@ func (w *MutationReplayWorker) Stop() {
 }
 
 func (w *MutationReplayWorker) run(ctx context.Context) {
-	defer close(w.done)
+	defer func() {
+		w.clearPendingBacklogGauges()
+		close(w.done)
+	}()
 
 	logger.Info(ctx, "mutation_replay_worker_started")
 	ticker := time.NewTicker(replayPollInterval())
@@ -121,7 +126,7 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 		return false
 	}
 	if len(entries) == 0 {
-		w.recordPendingBacklog(ctx)
+		w.recordPendingBacklogIfDue(ctx)
 		return
 	}
 
@@ -166,7 +171,7 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 	metrics.RecordGauge("mutation_replay", "batch_applied", float64(applied))
 	metrics.RecordGauge("mutation_replay", "batch_failed", float64(failed))
 	metrics.RecordGauge("mutation_replay", "batch_skipped", float64(skipped))
-	w.recordPendingBacklog(ctx)
+	w.recordPendingBacklogIfDue(ctx)
 	logger.Info(ctx, "mutation_replay_batch_complete",
 		zap.Int("total", len(entries)),
 		zap.Int("applied", applied),
@@ -176,10 +181,18 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 	return false
 }
 
+func (w *MutationReplayWorker) recordPendingBacklogIfDue(ctx context.Context) {
+	if !w.lastBacklogObservation.IsZero() && time.Since(w.lastBacklogObservation) < defaultReplayObserveEvery {
+		return
+	}
+	w.recordPendingBacklog(ctx)
+}
+
 func (w *MutationReplayWorker) recordPendingBacklog(ctx context.Context) {
 	if w.observedBacklogTenants == nil {
 		w.observedBacklogTenants = make(map[string]struct{})
 	}
+	w.lastBacklogObservation = time.Now()
 	start := time.Now()
 	observations, err := w.store.ObservePendingMutations(ctx)
 	if err != nil {
@@ -203,6 +216,14 @@ func (w *MutationReplayWorker) recordPendingBacklog(ctx context.Context) {
 		delete(w.observedBacklogTenants, tenantID)
 	}
 	metrics.RecordOperation("mutation_replay", "observe_pending", "ok", time.Since(start))
+}
+
+func (w *MutationReplayWorker) clearPendingBacklogGauges() {
+	for tenantID := range w.observedBacklogTenants {
+		metrics.RecordTenantGauge(tenantID, "mutation_replay", "pending_mutations", 0)
+		metrics.RecordTenantGauge(tenantID, "mutation_replay", "oldest_pending_age_seconds", 0)
+		delete(w.observedBacklogTenants, tenantID)
+	}
 }
 
 func (w *MutationReplayWorker) replayOne(ctx context.Context, entry MutationLogView) error {

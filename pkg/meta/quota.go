@@ -1018,7 +1018,7 @@ func (s *Store) ObservePendingMutations(ctx context.Context) ([]MutationBacklogO
 
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT tenant_id, COUNT(*), MIN(created_at)
-		 FROM quota_mutation_log
+		 FROM quota_mutation_log FORCE INDEX (idx_pending_tenant_age)
 		 WHERE status = 'pending'
 		 GROUP BY tenant_id
 		 ORDER BY tenant_id`)
@@ -1032,7 +1032,7 @@ func (s *Store) ObservePendingMutations(ctx context.Context) ([]MutationBacklogO
 	for rows.Next() {
 		var obs MutationBacklogObservation
 		var oldest time.Time
-		if err := rows.Scan(&obs.TenantID, &obs.PendingCount, &oldest); err != nil {
+		if err = rows.Scan(&obs.TenantID, &obs.PendingCount, &oldest); err != nil {
 			return out, err
 		}
 		age := now.Sub(oldest.UTC()).Seconds()
@@ -1042,7 +1042,8 @@ func (s *Store) ObservePendingMutations(ctx context.Context) ([]MutationBacklogO
 		obs.OldestPendingAgeSeconds = age
 		out = append(out, obs)
 	}
-	return out, rows.Err()
+	err = rows.Err()
+	return out, err
 }
 
 // HasPendingFileMutation reports whether an unapplied create/overwrite
