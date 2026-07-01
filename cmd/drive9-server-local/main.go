@@ -622,6 +622,9 @@ func localEmbeddingModeLabel(mode schema.TiDBEmbeddingMode, explicit bool) strin
 
 func buildBackendOptionsFromEnv() (backend.Options, error) {
 	var opts backend.Options
+	if strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE")) != "" {
+		return backend.Options{}, fmt.Errorf("DRIVE9_QUOTA_SOURCE has been removed; remove this setting and wire central quota through the meta store")
+	}
 	opts.MaxTenantStorageBytes = envInt64("DRIVE9_MAX_TENANT_STORAGE_BYTES", 50*(1<<30))
 	if opts.MaxTenantStorageBytes <= 0 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_MAX_TENANT_STORAGE_BYTES must be a positive integer")

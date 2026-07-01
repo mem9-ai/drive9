@@ -72,7 +72,13 @@ func (m *mockQuotaStore) InsertUploadReservation(_ context.Context, _ *UploadRes
 func (m *mockQuotaStore) UpdateUploadReservationStatus(_ context.Context, _, _, _ string) error {
 	return nil
 }
-func (m *mockQuotaStore) SettleActiveReservationTx(_ *sql.Tx, _, _, _ string) (bool, int64, error) {
+func (m *mockQuotaStore) UpdateUploadReservationStatusTx(_ context.Context, _ *sql.Tx, _, _, _ string) error {
+	return nil
+}
+func (m *mockQuotaStore) AbortActiveReservationTx(_ context.Context, _ *sql.Tx, _, _ string) (bool, int64, int64, error) {
+	return false, 0, 0, nil
+}
+func (m *mockQuotaStore) SettleActiveReservationTx(_ context.Context, _ *sql.Tx, _, _, _ string) (bool, int64, error) {
 	return false, 0, nil
 }
 func (m *mockQuotaStore) GetUploadReservation(_ context.Context, _, _ string) (*UploadReservationView, error) {

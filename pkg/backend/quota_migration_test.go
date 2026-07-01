@@ -283,13 +283,24 @@ func (f *fakeMetaQuotaStore) UpdateUploadReservationStatus(ctx context.Context, 
 	return nil
 }
 
-func (f *fakeMetaQuotaStore) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantID, uploadID, status string) error {
-	return f.UpdateUploadReservationStatus(context.Background(), tenantID, uploadID, status)
+func (f *fakeMetaQuotaStore) UpdateUploadReservationStatusTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID, status string) error {
+	return f.UpdateUploadReservationStatus(ctx, tenantID, uploadID, status)
+}
+
+func (f *fakeMetaQuotaStore) AbortActiveReservationTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID string) (bool, int64, int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.reservations[metaKey(tenantID, uploadID)]
+	if !ok || (r.Status != "active" && r.Status != "completing") {
+		return false, 0, 0, nil
+	}
+	r.Status = "aborted"
+	return true, r.ReservedBytes, r.FileCountDelta, nil
 }
 
 // SettleActiveReservationTx models the atomic "active/completing → status"
 // transition and reports whether a releasable row was actually settled.
-func (f *fakeMetaQuotaStore) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (bool, int64, error) {
+func (f *fakeMetaQuotaStore) SettleActiveReservationTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID, status string) (bool, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, ok := f.reservations[metaKey(tenantID, uploadID)]
@@ -485,7 +496,7 @@ func (f *fakeMetaQuotaStore) ExpireActiveReservations(ctx context.Context) (int6
 	now := time.Now()
 	var released int64
 	for _, r := range f.reservations {
-		if r.Status != "active" || !r.ExpiresAt.Before(now) {
+		if (r.Status != "active" && r.Status != "completing") || !r.ExpiresAt.Before(now) {
 			continue
 		}
 		r.Status = "aborted"
@@ -516,7 +527,7 @@ func newCentralQuotaBackend(t *testing.T) (*Dat9Backend, *fakeMetaQuotaStore) {
 func drainCentralQuotaMutations(t *testing.T, b *Dat9Backend) {
 	t.Helper()
 	done := make(chan struct{})
-	b.enqueueMutation(func() {
+	b.enqueueMutation(func(context.Context) {
 		close(done)
 	})
 	select {
@@ -671,6 +682,72 @@ func TestCentralQuotaMutationLogInsertFailureSurfaces(t *testing.T) {
 	assertNoTenantQuotaOutboxRows(t, b)
 	if len(fake.mutations) != 0 {
 		t.Fatalf("mutation log rows = %d, want 0", len(fake.mutations))
+	}
+}
+
+func TestCentralQuotaPendingDeltaClearsAfterInlineApplyFailure(t *testing.T) {
+	b, fake := newCentralQuotaBackend(t)
+	applyErr := errors.New("meta apply unavailable")
+
+	if err := b.logAndEnqueueMutation(context.Background(), "file_create", fileCreateMutationData{
+		FileID:    "file-pending",
+		SizeBytes: 128,
+		IsMedia:   false,
+	}, quotaPendingDeltas{
+		storageDelta: 128,
+		fileDelta:    1,
+	}, func(context.Context, *sql.Tx) error {
+		return applyErr
+	}); err != nil {
+		t.Fatalf("log and enqueue mutation: %v", err)
+	}
+	drainCentralQuotaMutations(t, b)
+
+	storageDelta, fileDelta, mediaDelta := b.pendingCentralMutationDeltas(context.Background())
+	if storageDelta != 0 || fileDelta != 0 || mediaDelta != 0 {
+		t.Fatalf("pending deltas = (%d,%d,%d), want zero after apply attempt", storageDelta, fileDelta, mediaDelta)
+	}
+	if got := fake.mutations[len(fake.mutations)-1].status; got != "pending" {
+		t.Fatalf("mutation status = %q, want pending for replay", got)
+	}
+}
+
+func TestCentralQuotaExpireReclaimsCompletingReservations(t *testing.T) {
+	_, fake := newCentralQuotaBackend(t)
+	ctx := context.Background()
+	reservation := &UploadReservationView{
+		TenantID:       "tenant-a",
+		UploadID:       "upload-completing",
+		ReservedBytes:  512,
+		FileCountDelta: 1,
+		TargetPath:     "/upload.bin",
+		Status:         "active",
+		ExpiresAt:      time.Now().Add(-time.Minute),
+	}
+	if err := fake.AtomicReserveAndInsertUpload(ctx, reservation); err != nil {
+		t.Fatalf("reserve upload: %v", err)
+	}
+	if err := fake.UpdateUploadReservationStatus(ctx, "tenant-a", "upload-completing", "completing"); err != nil {
+		t.Fatalf("mark completing: %v", err)
+	}
+
+	released, err := fake.ExpireActiveReservations(ctx)
+	if err != nil {
+		t.Fatalf("expire reservations: %v", err)
+	}
+	if released != 512 {
+		t.Fatalf("released bytes = %d, want 512", released)
+	}
+	usage := fake.usage["tenant-a"]
+	if usage.ReservedBytes != 0 || usage.FileCount != 0 {
+		t.Fatalf("usage after expiry = %+v, want reserved/file count released", usage)
+	}
+	r, err := fake.GetUploadReservation(ctx, "tenant-a", "upload-completing")
+	if err != nil {
+		t.Fatalf("get reservation: %v", err)
+	}
+	if r.Status != "aborted" {
+		t.Fatalf("reservation status = %q, want aborted", r.Status)
 	}
 }
 

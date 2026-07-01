@@ -112,7 +112,7 @@ type Dat9Backend struct {
 	// durable log_id order and channel enqueue order cannot diverge under
 	// concurrent same-tenant writes.
 	mutationMu    sync.Mutex
-	mutationQueue chan func()
+	mutationQueue chan func(context.Context)
 	mutationWG    sync.WaitGroup
 	mutationStop  context.CancelFunc
 
@@ -307,8 +307,10 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		}
 		return err
 	}
-	if err := b.recordCentralFileCreateMutation(ctx, fileID, 0, ""); err != nil {
-		return fmt.Errorf("record central quota file create: %w", err)
+	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
+	defer cancelQuota()
+	if err := b.recordCentralFileCreateMutation(quotaCtx, fileID, 0, ""); err != nil {
+		return postCommitQuotaMutationError("record central quota file create", err)
 	}
 	return nil
 }
@@ -379,8 +381,10 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 	if err != nil {
 		return err
 	}
-	if err := b.recordCentralFileCreateMutation(ctx, fileID, int64(len(data)), symlinkContentType); err != nil {
-		return fmt.Errorf("record central quota file create: %w", err)
+	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
+	defer cancelQuota()
+	if err := b.recordCentralFileCreateMutation(quotaCtx, fileID, int64(len(data)), symlinkContentType); err != nil {
+		return postCommitQuotaMutationError("record central quota file create", err)
 	}
 	return nil
 }
@@ -1020,11 +1024,13 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	if timingEnabled {
 		centralQuotaStart = time.Now()
 	}
-	if err := b.recordCentralFileCreateMutation(ctx, fileID, int64(len(data)), contentType); err != nil {
+	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
+	defer cancelQuota()
+	if err := b.recordCentralFileCreateMutation(quotaCtx, fileID, int64(len(data)), contentType); err != nil {
 		if timingEnabled {
 			centralQuotaDuration = time.Since(centralQuotaStart)
 		}
-		return 0, fmt.Errorf("record central quota file create: %w", err)
+		return 0, postCommitQuotaMutationError("record central quota file create", err)
 	}
 	if timingEnabled {
 		centralQuotaDuration = time.Since(centralQuotaStart)
@@ -1278,11 +1284,13 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	if timingEnabled {
 		centralQuotaStart = time.Now()
 	}
-	if err := b.recordCentralFileOverwriteMutation(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType); err != nil {
+	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
+	defer cancelQuota()
+	if err := b.recordCentralFileOverwriteMutation(quotaCtx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType); err != nil {
 		if timingEnabled {
 			centralQuotaDuration = time.Since(centralQuotaStart)
 		}
-		return 0, 0, fmt.Errorf("record central quota file overwrite: %w", err)
+		return 0, 0, postCommitQuotaMutationError("record central quota file overwrite", err)
 	}
 	if timingEnabled {
 		centralQuotaDuration = time.Since(centralQuotaStart)

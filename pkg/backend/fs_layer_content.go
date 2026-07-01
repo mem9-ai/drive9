@@ -170,8 +170,10 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 		if err != nil {
 			return 0, err
 		}
-		if err := b.recordCentralFileCreateMutation(ctx, fileID, entry.SizeBytes, contentType); err != nil {
-			return 0, fmt.Errorf("record central quota file create: %w", err)
+		quotaCtx, cancelQuota := postCommitQuotaMutationContext()
+		defer cancelQuota()
+		if err := b.recordCentralFileCreateMutation(quotaCtx, fileID, entry.SizeBytes, contentType); err != nil {
+			return 0, postCommitQuotaMutationError("record central quota file create", err)
 		}
 		return 1, nil
 	}
@@ -230,8 +232,10 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 	if err != nil {
 		return 0, err
 	}
-	if err := b.recordCentralFileOverwriteMutation(ctx, nf.File.FileID, oldSize, oldContentType, entry.SizeBytes, contentType); err != nil {
-		return 0, fmt.Errorf("record central quota file overwrite: %w", err)
+	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
+	defer cancelQuota()
+	if err := b.recordCentralFileOverwriteMutation(quotaCtx, nf.File.FileID, oldSize, oldContentType, entry.SizeBytes, contentType); err != nil {
+		return 0, postCommitQuotaMutationError("record central quota file overwrite", err)
 	}
 	b.deleteBlobIfS3Ctx(ctx, oldStorageType, oldStorageRef, entry.StorageRef)
 	return newRev, nil

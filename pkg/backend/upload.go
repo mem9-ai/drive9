@@ -992,7 +992,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 				zap.String("upload_id", uploadID),
 				zap.Error(err))
 			metrics.RecordTenantOperation(b.tenantID, "central_quota", "upload_mark_completing", "error", time.Since(start))
-			return err
+			return fmt.Errorf("mark central quota upload completing: %w", err)
 		}
 		metrics.RecordTenantOperation(b.tenantID, "central_quota", "upload_mark_completing", "ok", 0)
 	}
@@ -1000,7 +1000,6 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	completeMultipartStart := time.Now()
 	if err := b.s3.CompleteMultipartUpload(ctx, upload.S3Key, upload.S3UploadID, parts); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_complete_multipart_failed", zap.String("upload_id", uploadID), zap.Error(err))
-		b.abortUploadReservation(ctx, uploadID, upload.TotalSize)
 		metrics.RecordTenantOperation(b.tenantID, "backend", "finalize_upload", "error", time.Since(start))
 		return fmt.Errorf("complete multipart: %w", err)
 	}
@@ -1208,15 +1207,19 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		logger.Error(ctx, "backend_finalize_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
 		b.cleanupFailedFinalizeUpload(ctx, upload)
 		// Abort the server-side reservation since the tenant DB tx failed.
-		b.abortUploadReservation(ctx, uploadID, upload.TotalSize)
+		cleanupCtx, cancelCleanup := postCommitQuotaMutationContext()
+		b.abortUploadReservation(cleanupCtx, uploadID, upload.TotalSize)
+		cancelCleanup()
 		metrics.RecordTenantOperation(b.tenantID, "backend", "finalize_upload", "error", time.Since(start))
 		return err
 	}
 	txDurationMs := uploadPhaseMs(txStart)
 	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
-	if err := b.completeUploadReservation(ctx, uploadID, upload.TotalSize, confirmedFileID, oldSizeBytes, oldIsMedia, upload.TotalSize, newIsMedia); err != nil {
+	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
+	defer cancelQuota()
+	if err := b.completeUploadReservation(quotaCtx, uploadID, upload.TotalSize, confirmedFileID, oldSizeBytes, oldIsMedia, upload.TotalSize, newIsMedia); err != nil {
 		metrics.RecordTenantOperation(b.tenantID, "backend", "finalize_upload", "error", time.Since(start))
-		return fmt.Errorf("record central quota upload complete: %w", err)
+		return postCommitQuotaMutationError("record central quota upload complete", err)
 	}
 
 	if isOverwrite {

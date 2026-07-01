@@ -941,7 +941,7 @@ func TestApplyCentralFileMutationIsIdempotent(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		if err := fake.InTx(context.Background(), func(tx *sql.Tx) error {
-			return applyCentralQuotaMutationTx(fake, tx, "tenant-a", quotaMutationTypeFileCreate, raw, int64(i+1))
+			return applyCentralQuotaMutationTx(context.Background(), fake, tx, "tenant-a", quotaMutationTypeFileCreate, raw, int64(i+1))
 		}); err != nil {
 			t.Fatalf("apply central mutation %d: %v", i+1, err)
 		}

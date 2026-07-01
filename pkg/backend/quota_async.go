@@ -32,7 +32,7 @@ func (b *Dat9Backend) startMutationWorker() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	b.mutationStop = cancel
-	b.mutationQueue = make(chan func(), mutationQueueSize)
+	b.mutationQueue = make(chan func(context.Context), mutationQueueSize)
 	b.mutationWG.Add(1)
 	go b.drainMutations(ctx)
 }
@@ -46,13 +46,13 @@ func (b *Dat9Backend) drainMutations(ctx context.Context) {
 			for {
 				select {
 				case fn := <-b.mutationQueue:
-					fn()
+					fn(ctx)
 				default:
 					return
 				}
 			}
 		case fn := <-b.mutationQueue:
-			fn()
+			fn(ctx)
 		}
 	}
 }
@@ -65,10 +65,10 @@ func (b *Dat9Backend) drainMutations(ctx context.Context) {
 // If the queue is not wired (tests), the function runs inline.
 // The channel send blocks if the buffer is full, preserving FIFO ordering;
 // the 256-slot buffer makes blocking extremely unlikely in practice.
-func (b *Dat9Backend) enqueueMutation(fn func()) {
+func (b *Dat9Backend) enqueueMutation(fn func(context.Context)) {
 	if b.mutationQueue == nil {
 		// No async queue — run inline (test/fallback path).
-		fn()
+		fn(context.Background())
 		return
 	}
 	b.mutationQueue <- fn

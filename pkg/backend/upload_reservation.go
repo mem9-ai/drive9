@@ -3,7 +3,6 @@ package backend
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -63,6 +62,8 @@ func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targe
 		Status:         "active",
 		ExpiresAt:      time.Now().Add(24 * time.Hour),
 	}
+	b.mutationMu.Lock()
+	defer b.mutationMu.Unlock()
 	if err := b.ensureUploadReserveFitsPendingQuota(ctx, totalSize, fileCountDelta); err != nil {
 		metrics.RecordTenantOperation(b.tenantID, "central_quota", "reserve_upload", "quota_exceeded", time.Since(start))
 		return false, err
@@ -141,45 +142,35 @@ func (b *Dat9Backend) abortUploadReservation(ctx context.Context, uploadID strin
 	}
 	start := time.Now()
 
-	// Check if a reservation row actually exists and can still be released.
-	r, err := b.metaStore.GetUploadReservation(ctx, b.tenantID, uploadID)
-	if errors.Is(err, ErrReservationNotFound) {
-		// No reservation row — initiate was a fail-open no-op; nothing to release.
-		metrics.RecordTenantOperation(b.tenantID, "central_quota", "abort_reservation", "skip_no_reservation", time.Since(start))
-		return
-	}
-	if err != nil {
-		// Transient DB error — don't touch counters to avoid corruption.
-		logger.Warn(ctx, "central_quota_abort_lookup_failed",
-			zap.String("tenant_id", b.tenantID),
-			zap.String("upload_id", uploadID),
-			zap.Error(err))
-		metrics.RecordTenantOperation(b.tenantID, "central_quota", "abort_reservation", "lookup_error", time.Since(start))
-		return
-	}
-	if r.Status != "active" && r.Status != "completing" {
-		// Already completed or aborted — nothing to release.
-		metrics.RecordTenantOperation(b.tenantID, "central_quota", "abort_reservation", "skip_no_reservation", time.Since(start))
-		return
-	}
-
-	// Atomically release reserved bytes and mark reservation aborted.
+	aborted := false
 	if err := b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
-		if err := b.metaStore.IncrReservedBytesTx(tx, b.tenantID, -r.ReservedBytes); err != nil {
+		ok, reservedBytes, fileCountDelta, err := b.metaStore.AbortActiveReservationTx(ctx, tx, b.tenantID, uploadID)
+		if err != nil {
 			return err
 		}
-		if r.FileCountDelta > 0 {
-			if err := b.metaStore.IncrFileCountTx(tx, b.tenantID, -r.FileCountDelta); err != nil {
+		if !ok {
+			return nil
+		}
+		aborted = true
+		if err := b.metaStore.IncrReservedBytesTx(tx, b.tenantID, -reservedBytes); err != nil {
+			return err
+		}
+		if fileCountDelta > 0 {
+			if err := b.metaStore.IncrFileCountTx(tx, b.tenantID, -fileCountDelta); err != nil {
 				return err
 			}
 		}
-		return b.metaStore.UpdateUploadReservationStatusTx(tx, b.tenantID, uploadID, "aborted")
+		return nil
 	}); err != nil {
 		logger.Warn(ctx, "central_quota_abort_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("upload_id", uploadID),
 			zap.Error(err))
 		metrics.RecordTenantOperation(b.tenantID, "central_quota", "abort_reservation", "error", time.Since(start))
+		return
+	}
+	if !aborted {
+		metrics.RecordTenantOperation(b.tenantID, "central_quota", "abort_reservation", "skip_no_reservation", time.Since(start))
 		return
 	}
 
@@ -198,15 +189,16 @@ type uploadCompleteMutationData struct {
 	NewIsMedia    bool   `json:"new_is_media"`
 }
 
-// completeUploadReservation applies the upload-complete saga in mutation-first
-// style. The reservation-state decision ("is this reservation still active?
-// should reserved_bytes be transferred?") is made INSIDE the apply/replay
-// transaction via SettleActiveReservationTx, not by a pre-check outside the
-// tx. This guarantees the durable-outbox contract: the mutation log entry is
-// always written (unless InsertMutationLog itself fails), so storage_bytes,
-// file_meta, and media_count deltas cannot be silently dropped by a transient
-// lookup error. Any transient failure during the initial apply attempt leaves
-// the mutation in 'pending' status for the replay worker.
+// completeUploadReservation logs and enqueues the upload-complete saga through
+// the same ordered mutation queue as create/overwrite. The reservation-state
+// decision ("is this reservation still active? should reserved_bytes be
+// transferred?") is made INSIDE the apply/replay transaction via
+// SettleActiveReservationTx, not by a pre-check outside the tx. This guarantees
+// the durable-outbox contract: the mutation log entry is always written (unless
+// InsertMutationLog itself fails), so storage_bytes, file_meta, and media_count
+// deltas cannot be silently dropped by a transient lookup error. Any transient
+// failure during async apply leaves the mutation in 'pending' status for the
+// replay worker.
 //
 // reservedBytes is the bytes that were claimed at initiate time; the apply tx
 // will transfer them reserved→storage only when an active reservation row is
@@ -217,9 +209,7 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 	if b.metaStore == nil {
 		return nil
 	}
-	start := time.Now()
-
-	data, err := json.Marshal(uploadCompleteMutationData{
+	data := uploadCompleteMutationData{
 		UploadID:      uploadID,
 		FileID:        fileID,
 		ReservedBytes: reservedBytes,
@@ -227,60 +217,17 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 		OldIsMedia:    oldIsMedia,
 		NewSizeBytes:  newSizeBytes,
 		NewIsMedia:    newIsMedia,
+	}
+	return b.logAndEnqueueMutation(ctx, "upload_complete", data, quotaPendingDeltas{}, func(applyCtx context.Context, tx *sql.Tx) error {
+		return applyUploadCompleteTx(applyCtx, b.metaStore, tx, b.tenantID, data)
 	})
-	if err != nil {
-		logger.Warn(ctx, "central_quota_upload_complete_marshal_failed",
-			zap.String("tenant_id", b.tenantID),
-			zap.String("upload_id", uploadID),
-			zap.Error(err))
-		return err
-	}
-	logID, err := b.metaStore.InsertMutationLog(ctx, &MutationLogView{
-		TenantID:     b.tenantID,
-		MutationType: "upload_complete",
-		MutationData: data,
-	})
-	if err != nil {
-		logger.Warn(ctx, "central_quota_mutation_log_insert_failed",
-			zap.String("tenant_id", b.tenantID),
-			zap.String("upload_id", uploadID),
-			zap.Error(err))
-		metrics.RecordTenantOperation(b.tenantID, "central_quota", "upload_complete", "log_error", time.Since(start))
-		return err
-	}
-	if err := b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
-		if err := applyUploadCompleteTx(b.metaStore, tx, b.tenantID, uploadCompleteMutationData{
-			UploadID:      uploadID,
-			FileID:        fileID,
-			ReservedBytes: reservedBytes,
-			OldSizeBytes:  oldSizeBytes,
-			OldIsMedia:    oldIsMedia,
-			NewSizeBytes:  newSizeBytes,
-			NewIsMedia:    newIsMedia,
-		}); err != nil {
-			return err
-		}
-		return b.metaStore.MarkMutationAppliedTx(tx, logID)
-	}); err != nil {
-		logger.Warn(ctx, "central_quota_upload_complete_apply_failed",
-			zap.String("tenant_id", b.tenantID),
-			zap.String("upload_id", uploadID),
-			zap.Int64("log_id", logID),
-			zap.Error(err))
-		metrics.RecordTenantOperation(b.tenantID, "central_quota", "upload_complete", "pending", time.Since(start))
-		// Leave entry in 'pending' — replay worker will retry inside
-		// applyUploadCompleteTx with the same reservation-state decision.
-		return nil
-	}
-	metrics.RecordTenantOperation(b.tenantID, "central_quota", "upload_complete", "ok", time.Since(start))
-	return nil
 }
 
-// applyUploadCompleteTx is the single tx-scoped apply body shared by both
-// the inline fast path (completeUploadReservation) and the replay worker
-// (mutation_replay.go upload_complete case). The reservation-state branch
-// lives here (inside the tx) so that transient lookup failures outside
-// never cause silent data loss of the paired shadow-state mutation.
+// applyUploadCompleteTx is the single tx-scoped apply body shared by both the
+// backend mutation worker and the replay worker (mutation_replay.go
+// upload_complete case). The reservation-state branch lives here (inside the
+// tx) so that transient lookup failures outside never cause silent data loss of
+// the paired shadow-state mutation.
 //
 // The settled flag from SettleActiveReservationTx partitions the
 // reservation-state space into exactly two branches:
@@ -315,7 +262,7 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 // replay path calls it inside replayOne. Keeping the mark-applied call out
 // of this helper prevents a double-mark rollback trap if any future caller
 // also marks applied in the outer tx.
-func applyUploadCompleteTx(store MetaQuotaStore, tx *sql.Tx, tenantID string, data uploadCompleteMutationData) error {
+func applyUploadCompleteTx(ctx context.Context, store MetaQuotaStore, tx *sql.Tx, tenantID string, data uploadCompleteMutationData) error {
 	mediaDelta := int64(0)
 	switch {
 	case !data.OldIsMedia && data.NewIsMedia:
@@ -333,7 +280,7 @@ func applyUploadCompleteTx(store MetaQuotaStore, tx *sql.Tx, tenantID string, da
 		oldExists = true
 		oldMeta = old
 	}
-	settled, reservedFileCountDelta, err := store.SettleActiveReservationTx(tx, tenantID, data.UploadID, "completed")
+	settled, reservedFileCountDelta, err := store.SettleActiveReservationTx(ctx, tx, tenantID, data.UploadID, "completed")
 	if err != nil {
 		return err
 	}

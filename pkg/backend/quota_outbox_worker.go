@@ -376,7 +376,7 @@ func (b *Dat9Backend) applyQuotaOutboxEntryTx(tx *sql.Tx, entry *datastore.Quota
 	}
 	// Reuse the central mutation dispatcher; upload_complete is handled there
 	// by applyUploadCompleteTx, the same body used by mutation replay.
-	return applyCentralQuotaMutationTx(b.metaStore, tx, b.tenantID, entry.MutationType, entry.MutationData, entry.ID)
+	return applyCentralQuotaMutationTx(context.Background(), b.metaStore, tx, b.tenantID, entry.MutationType, entry.MutationData, entry.ID)
 }
 
 func quotaOutboxRetryDelay(attempt int, base, max time.Duration) time.Duration {

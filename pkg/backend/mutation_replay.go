@@ -22,7 +22,11 @@ const (
 )
 
 func replayPollInterval() time.Duration {
-	return envDurationMS("DRIVE9_QUOTA_REPLAY_POLL_MS", defaultReplayPollInterval)
+	d := envDurationMS("DRIVE9_QUOTA_REPLAY_POLL_MS", defaultReplayPollInterval)
+	if d <= 0 {
+		return defaultReplayPollInterval
+	}
+	return d
 }
 
 func replayMinAge() time.Duration {
@@ -166,18 +170,18 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 
 func (w *MutationReplayWorker) replayOne(ctx context.Context, entry MutationLogView) error {
 	return w.store.InTx(ctx, func(tx *sql.Tx) error {
-		if err := w.applyMutation(tx, entry); err != nil {
+		if err := w.applyMutation(ctx, tx, entry); err != nil {
 			return err
 		}
 		return w.store.MarkMutationAppliedTx(tx, entry.ID)
 	})
 }
 
-func (w *MutationReplayWorker) applyMutation(tx *sql.Tx, entry MutationLogView) error {
-	return applyCentralQuotaMutationTx(w.store, tx, entry.TenantID, entry.MutationType, entry.MutationData, entry.ID)
+func (w *MutationReplayWorker) applyMutation(ctx context.Context, tx *sql.Tx, entry MutationLogView) error {
+	return applyCentralQuotaMutationTx(ctx, w.store, tx, entry.TenantID, entry.MutationType, entry.MutationData, entry.ID)
 }
 
-func applyCentralQuotaMutationTx(store MetaQuotaStore, tx *sql.Tx, tenantID, mutationType string, mutationData json.RawMessage, logID int64) error {
+func applyCentralQuotaMutationTx(ctx context.Context, store MetaQuotaStore, tx *sql.Tx, tenantID, mutationType string, mutationData json.RawMessage, logID int64) error {
 	switch mutationType {
 	case "file_create":
 		var data fileCreateMutationData
@@ -230,7 +234,7 @@ func applyCentralQuotaMutationTx(store MetaQuotaStore, tx *sql.Tx, tenantID, mut
 		// caller (replayOne wraps applyMutation + MarkMutationAppliedTx in
 		// the same InTx), so this delegation is safe w.r.t. the Fix 2
 		// status='pending' guard.
-		return applyUploadCompleteTx(store, tx, tenantID, data)
+		return applyUploadCompleteTx(ctx, store, tx, tenantID, data)
 
 	case "llm_cost_record":
 		var data llmCostMutationData

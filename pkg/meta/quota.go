@@ -678,11 +678,39 @@ func (s *Store) UpdateUploadReservationStatus(ctx context.Context, tenantID, upl
 }
 
 // UpdateUploadReservationStatusTx updates a reservation's status inside a transaction.
-func (s *Store) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantID, uploadID, status string) error {
-	_, err := tx.Exec(
+func (s *Store) UpdateUploadReservationStatusTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID, status string) error {
+	_, err := tx.ExecContext(ctx,
 		`UPDATE tenant_upload_reservations SET status = ? WHERE tenant_id = ? AND upload_id = ? AND status IN ('active', 'completing')`,
 		status, tenantID, uploadID)
 	return err
+}
+
+// AbortActiveReservationTx atomically claims an active/completing reservation
+// for abort and reports the counters that must be released by the caller in the
+// same transaction.
+func (s *Store) AbortActiveReservationTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID string) (aborted bool, reservedBytes, fileCountDelta int64, err error) {
+	var bytes, files sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT reserved_bytes, file_count_delta FROM tenant_upload_reservations
+		 WHERE tenant_id = ? AND upload_id = ? AND status IN ('active', 'completing') FOR UPDATE`,
+		tenantID, uploadID).Scan(&bytes, &files); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, 0, 0, nil
+		}
+		return false, 0, 0, err
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE tenant_upload_reservations SET status = 'aborted'
+		 WHERE tenant_id = ? AND upload_id = ? AND status IN ('active', 'completing')`,
+		tenantID, uploadID)
+	if err != nil {
+		return false, 0, 0, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return false, 0, 0, nil
+	}
+	return true, bytes.Int64, files.Int64, nil
 }
 
 // SettleActiveReservationTx transitions a reservation from 'active' to the
@@ -705,9 +733,9 @@ func (s *Store) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantID, uploadID, 
 //   - Transient error: we cannot tell whether a reservation exists, so we
 //     would otherwise have to bail out and silently drop the paired mutation.
 //   - TOCTOU: between lookup and apply another worker could settle the row.
-func (s *Store) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (settled bool, fileCountDelta int64, err error) {
+func (s *Store) SettleActiveReservationTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID, status string) (settled bool, fileCountDelta int64, err error) {
 	var delta sql.NullInt64
-	if err := tx.QueryRow(
+	if err := tx.QueryRowContext(ctx,
 		`SELECT file_count_delta FROM tenant_upload_reservations
 		 WHERE tenant_id = ? AND upload_id = ? AND status IN ('active', 'completing') FOR UPDATE`,
 		tenantID, uploadID).Scan(&delta); err != nil {
@@ -716,7 +744,7 @@ func (s *Store) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status
 		}
 		return false, 0, err
 	}
-	res, err := tx.Exec(
+	res, err := tx.ExecContext(ctx,
 		`UPDATE tenant_upload_reservations SET status = ? WHERE tenant_id = ? AND upload_id = ? AND status IN ('active', 'completing')`,
 		status, tenantID, uploadID)
 	if err != nil {
@@ -760,7 +788,7 @@ func (s *Store) HasActiveUploadReservations(ctx context.Context, tenantID string
 	err = s.db.QueryRowContext(ctx,
 		`SELECT 1
 		 FROM tenant_upload_reservations
-		 WHERE tenant_id = ? AND status = 'active' AND expires_at > ?
+		 WHERE tenant_id = ? AND status IN ('active', 'completing') AND expires_at > ?
 		 LIMIT 1`, tenantID, time.Now().UTC()).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -780,7 +808,7 @@ func (s *Store) AbortActiveUploadReservations(ctx context.Context, tenantID stri
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COALESCE(SUM(reserved_bytes), 0), COALESCE(SUM(file_count_delta), 0)
 			 FROM tenant_upload_reservations
-			 WHERE tenant_id = ? AND status = 'active'`, tenantID).Scan(&totalBytes, &totalFiles); err != nil {
+			 WHERE tenant_id = ? AND status IN ('active', 'completing')`, tenantID).Scan(&totalBytes, &totalFiles); err != nil {
 			return err
 		}
 		if totalBytes.Int64 != 0 || totalFiles.Int64 != 0 {
@@ -798,16 +826,18 @@ func (s *Store) AbortActiveUploadReservations(ctx context.Context, tenantID stri
 		}
 		_, err := tx.ExecContext(ctx,
 			`UPDATE tenant_upload_reservations SET status = 'aborted'
-			 WHERE tenant_id = ? AND status = 'active'`, tenantID)
+			 WHERE tenant_id = ? AND status IN ('active', 'completing')`, tenantID)
 		return err
 	})
 	return err
 }
 
-// ExpireActiveReservations marks expired active reservations as aborted and
-// returns the total bytes released. This is called by the expiry sweep worker.
-// All changes are applied in a single transaction to prevent double-release
-// if the process crashes mid-sweep.
+// ExpireActiveReservations marks expired active/completing reservations as
+// aborted and returns the total bytes released. This is called by the expiry
+// sweep worker. All changes are applied in a single transaction to prevent
+// double-release if the process crashes mid-sweep. Completing reservations are
+// included so a crash after mark-completing but before finalize settle does not
+// leak reserved_bytes forever.
 func (s *Store) ExpireActiveReservations(ctx context.Context) (int64, error) {
 	start := time.Now()
 	var err error
@@ -821,7 +851,7 @@ func (s *Store) ExpireActiveReservations(ctx context.Context) (int64, error) {
 		rows, err := tx.QueryContext(ctx,
 			`SELECT tenant_id, SUM(reserved_bytes), SUM(file_count_delta)
 			 FROM tenant_upload_reservations
-			 WHERE status = 'active' AND expires_at < ?
+			 WHERE status IN ('active', 'completing') AND expires_at < ?
 			 GROUP BY tenant_id`, now)
 		if err != nil {
 			return err
@@ -863,7 +893,7 @@ func (s *Store) ExpireActiveReservations(ctx context.Context) (int64, error) {
 
 		_, err = tx.ExecContext(ctx,
 			`UPDATE tenant_upload_reservations SET status = 'aborted'
-			 WHERE status = 'active' AND expires_at < ?`, now)
+			 WHERE status IN ('active', 'completing') AND expires_at < ?`, now)
 		return err
 	})
 	return totalReleased, err

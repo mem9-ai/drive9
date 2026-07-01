@@ -400,6 +400,7 @@ func TestRoundA_Fix4_CompleteUpload_WritesMutationEvenOnTransientPath(t *testing
 		/*newSize*/ 50 /*newMedia*/, true); err != nil {
 		t.Fatalf("complete upload reservation: %v", err)
 	}
+	drainCentralQuotaMutations(t, b)
 
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
@@ -434,6 +435,7 @@ func TestRoundA_Fix4_CompleteUpload_FailOpenInitiateStillAppliesStorage(t *testi
 		/*newSize*/ 40 /*newMedia*/, false); err != nil {
 		t.Fatalf("complete upload reservation: %v", err)
 	}
+	drainCentralQuotaMutations(t, b)
 
 	u, _ := fake.GetQuotaUsage(context.Background(), "tenant-a")
 	if u.StorageBytes != 40 {
@@ -491,6 +493,7 @@ func TestRoundA_Fix4_CompleteUpload_ApplyAfterReservationSwept(t *testing.T) {
 		/*newSize*/ 50 /*newMedia*/, true); err != nil {
 		t.Fatalf("complete upload reservation: %v", err)
 	}
+	drainCentralQuotaMutations(t, b)
 
 	after, _ := fake.GetQuotaUsage(ctx, "tenant-a")
 	if after.ReservedBytes != 0 {
@@ -545,6 +548,7 @@ func TestRoundA_Fix4_CompleteUpload_MarkAppliedCalledExactlyOnce(t *testing.T) {
 			/*newSize*/ 40 /*newMedia*/, false); err != nil {
 			t.Fatalf("complete upload reservation: %v", err)
 		}
+		drainCentralQuotaMutations(t, b)
 		if fake.markAppliedCalls != 1 {
 			t.Fatalf("inline path markAppliedCalls = %d, want exactly 1", fake.markAppliedCalls)
 		}
@@ -613,7 +617,7 @@ func TestRoundA_Fix4_CompleteUpload_MarkAppliedCalledExactlyOnce(t *testing.T) {
 		if err != nil {
 			t.Fatalf("insert: %v", err)
 		}
-		if err := applyUploadCompleteTx(fake, nil, "tenant-a", uploadCompleteMutationData{
+		if err := applyUploadCompleteTx(context.Background(), fake, nil, "tenant-a", uploadCompleteMutationData{
 			UploadID:     "u1",
 			FileID:       "file-1",
 			NewSizeBytes: 40,
