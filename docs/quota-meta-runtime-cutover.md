@@ -85,8 +85,10 @@ quota path after this cutover.
 
 Watch the meta pipeline instead of tenant outbox health:
 
-- `quota_mutation_log` pending backlog.
-- oldest pending mutation age.
+- `drive9_service_gauge{component="mutation_replay",name="pending_mutations"}`
+  for `quota_mutation_log` pending backlog by tenant.
+- `drive9_service_gauge{component="mutation_replay",name="oldest_pending_age_seconds"}`
+  for oldest pending mutation age by tenant.
 - `central_quota_mutation_log_insert_failed` log/metric.
 - `central_quota/upload_reset_active` errors or
   `central_quota_upload_reset_active_failed`, which indicate a retryable upload

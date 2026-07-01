@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ type fakeMutationRecord struct {
 	status     string
 	retryCount int
 	data       []byte
+	createdAt  time.Time
 }
 
 type fakeMetaQuotaStore struct {
@@ -373,11 +375,12 @@ func (f *fakeMetaQuotaStore) InsertMutationLog(ctx context.Context, entry *Mutat
 	id := f.nextID
 	f.nextID++
 	f.mutations = append(f.mutations, fakeMutationRecord{
-		tenantID: entry.TenantID,
-		id:       id,
-		typ:      entry.MutationType,
-		status:   "pending",
-		data:     append([]byte(nil), entry.MutationData...),
+		tenantID:  entry.TenantID,
+		id:        id,
+		typ:       entry.MutationType,
+		status:    "pending",
+		data:      append([]byte(nil), entry.MutationData...),
+		createdAt: time.Now().UTC(),
 	})
 	return id, nil
 }
@@ -404,6 +407,43 @@ func (f *fakeMetaQuotaStore) ListPendingMutations(ctx context.Context, minAge ti
 			break
 		}
 	}
+	return out, nil
+}
+
+func (f *fakeMetaQuotaStore) ObservePendingMutations(ctx context.Context) ([]MutationBacklogView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := time.Now().UTC()
+	byTenant := make(map[string]*MutationBacklogView)
+	oldest := make(map[string]time.Time)
+	for _, m := range f.mutations {
+		if m.status != "pending" {
+			continue
+		}
+		obs := byTenant[m.tenantID]
+		if obs == nil {
+			obs = &MutationBacklogView{TenantID: m.tenantID}
+			byTenant[m.tenantID] = obs
+		}
+		obs.PendingCount++
+		createdAt := m.createdAt
+		if createdAt.IsZero() {
+			createdAt = now
+		}
+		if oldest[m.tenantID].IsZero() || createdAt.Before(oldest[m.tenantID]) {
+			oldest[m.tenantID] = createdAt
+		}
+	}
+	out := make([]MutationBacklogView, 0, len(byTenant))
+	for tenantID, obs := range byTenant {
+		age := now.Sub(oldest[tenantID].UTC()).Seconds()
+		if age < 0 {
+			age = 0
+		}
+		obs.OldestPendingAgeSeconds = age
+		out = append(out, *obs)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].TenantID < out[j].TenantID })
 	return out, nil
 }
 

@@ -52,9 +52,10 @@ func envDurationMS(name string, def time.Duration) time.Duration {
 // MutationReplayWorker reads pending mutations from the quota_mutation_log
 // and applies them idempotently. It runs as a background goroutine.
 type MutationReplayWorker struct {
-	store  MetaQuotaStore
-	cancel context.CancelFunc
-	done   chan struct{}
+	store                  MetaQuotaStore
+	cancel                 context.CancelFunc
+	done                   chan struct{}
+	observedBacklogTenants map[string]struct{}
 }
 
 // StartMutationReplayWorker starts the background replay loop.
@@ -65,9 +66,10 @@ func StartMutationReplayWorker(store MetaQuotaStore) *MutationReplayWorker {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &MutationReplayWorker{
-		store:  store,
-		cancel: cancel,
-		done:   make(chan struct{}),
+		store:                  store,
+		cancel:                 cancel,
+		done:                   make(chan struct{}),
+		observedBacklogTenants: make(map[string]struct{}),
 	}
 	go w.run(ctx)
 	return w
@@ -119,6 +121,7 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 		return false
 	}
 	if len(entries) == 0 {
+		w.recordPendingBacklog(ctx)
 		return
 	}
 
@@ -163,6 +166,7 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 	metrics.RecordGauge("mutation_replay", "batch_applied", float64(applied))
 	metrics.RecordGauge("mutation_replay", "batch_failed", float64(failed))
 	metrics.RecordGauge("mutation_replay", "batch_skipped", float64(skipped))
+	w.recordPendingBacklog(ctx)
 	logger.Info(ctx, "mutation_replay_batch_complete",
 		zap.Int("total", len(entries)),
 		zap.Int("applied", applied),
@@ -170,6 +174,35 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 		zap.Int("skipped_after_barrier", skipped),
 		zap.Float64("duration_ms", float64(time.Since(start).Milliseconds())))
 	return false
+}
+
+func (w *MutationReplayWorker) recordPendingBacklog(ctx context.Context) {
+	if w.observedBacklogTenants == nil {
+		w.observedBacklogTenants = make(map[string]struct{})
+	}
+	start := time.Now()
+	observations, err := w.store.ObservePendingMutations(ctx)
+	if err != nil {
+		logger.Warn(ctx, "mutation_replay_observe_pending_failed", zap.Error(err))
+		metrics.RecordOperation("mutation_replay", "observe_pending", metrics.ResultForError(err), time.Since(start))
+		return
+	}
+	current := make(map[string]struct{}, len(observations))
+	for _, obs := range observations {
+		current[obs.TenantID] = struct{}{}
+		w.observedBacklogTenants[obs.TenantID] = struct{}{}
+		metrics.RecordTenantGauge(obs.TenantID, "mutation_replay", "pending_mutations", float64(obs.PendingCount))
+		metrics.RecordTenantGauge(obs.TenantID, "mutation_replay", "oldest_pending_age_seconds", obs.OldestPendingAgeSeconds)
+	}
+	for tenantID := range w.observedBacklogTenants {
+		if _, ok := current[tenantID]; ok {
+			continue
+		}
+		metrics.RecordTenantGauge(tenantID, "mutation_replay", "pending_mutations", 0)
+		metrics.RecordTenantGauge(tenantID, "mutation_replay", "oldest_pending_age_seconds", 0)
+		delete(w.observedBacklogTenants, tenantID)
+	}
+	metrics.RecordOperation("mutation_replay", "observe_pending", "ok", time.Since(start))
 }
 
 func (w *MutationReplayWorker) replayOne(ctx context.Context, entry MutationLogView) error {
