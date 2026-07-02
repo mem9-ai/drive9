@@ -580,6 +580,38 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 		// own WaitGroup and stopped via reg.Stop() in stopNotifyInfrastructure.
 		reg.Start(notifyCtx)
 	}
+
+	// Start the unified tenant worker on every pod (not leader-gated). Each
+	// pod only processes tenants assigned to its shard via jump consistent
+	// hashing. This must run on every pod because the shard resolver may
+	// assign tenants to non-leader pods — if the worker only ran on the
+	// leader, ~(N-1)/N of sharded work (semantic, file_gc) would be silently
+	// dropped. In single-tenant mode (no meta/pool) the worker polls the
+	// fallback backend directly.
+	if s.tenantWorker != nil {
+		s.tenantWorker.Start(notifyCtx)
+	}
+
+	// Safety-net scan runs on every pod (not leader-gated) so each pod
+	// recovers expired leases for its own shard's warm tenants. This
+	// complements the per-pod tenant worker — if a kick is lost, the
+	// safety-net catches it within 5min for any warm tenant owned by this pod.
+	if s.meta != nil && s.pool != nil {
+		s.notifyWG.Add(1)
+		go func() {
+			defer s.notifyWG.Done()
+			ticker := time.NewTicker(s.safetyNetScanInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-notifyCtx.Done():
+					return
+				case <-ticker.C:
+					s.safetyNetScan(notifyCtx)
+				}
+			}
+		}()
+	}
 }
 
 // stopNotifyInfrastructure stops the shard resolver, notify poller, and pod
@@ -599,6 +631,12 @@ func (s *Server) stopNotifyInfrastructure() {
 	if s.podRegistry != nil {
 		s.podRegistry.Stop()
 		s.podRegistry = nil
+	}
+	// Stop the tenant worker (started in startNotifyInfrastructure on every
+	// pod, not leader-gated). Stop after notifyCancel so the worker's context
+	// is already cancelled, then wait for goroutines to exit.
+	if s.tenantWorker != nil {
+		s.tenantWorker.Stop()
 	}
 	s.notifyCancel = nil
 }
@@ -714,31 +752,19 @@ func (s *Server) startLeaderWorkers() {
 	}
 	// Per-tenant FileGC and quota outbox workers are no longer per-backend
 	// goroutines — they are driven by kicks through the unified tenant worker.
-	// The tenantWorker starts here (leader-gated) so sharded work is processed
-	// only on the leader pod. In single-tenant mode it was started in
-	// startNotifyInfrastructure or runs via the workerLoop fallback ticker.
-	if s.tenantWorker != nil {
+	// In multi-tenant mode the tenantWorker is started in
+	// startNotifyInfrastructure (every pod, not leader-gated). In single-tenant
+	// mode (s.meta == nil) startNotifyInfrastructure is never called, so start
+	// the worker here instead.
+	if s.tenantWorker != nil && s.meta == nil {
 		s.tenantWorker.Start(backgroundWithTrace(leaderCtx))
 	}
 	if s.objectGCWorker != nil {
 		s.objectGCWorker.Start(backgroundWithTrace(leaderCtx))
 	}
-	// Safety-net scan (leader-only). Recovers expired leases for warm tenants
-	// whose kick may have been lost. Runs on the SafetyNetScanInterval ticker.
-	if s.meta != nil && s.pool != nil {
-		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			ticker := time.NewTicker(s.safetyNetScanInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-workerCtx.Done():
-					return
-				case <-ticker.C:
-					s.safetyNetScan(workerCtx)
-				}
-			}
-		})
-	}
+	// Safety-net scan and outbox cleanup are started in
+	// startNotifyInfrastructure (every pod) and startLeaderWorkers
+	// (leader-only outbox pruning) respectively. See those functions.
 	// Periodic tenant notify outbox cleanup (leader-only). Prunes old
 	// tenant_notify_outbox rows so the central table doesn't grow unbounded.
 	// Only runs in multi-tenant mode (Meta != nil).
@@ -852,10 +878,10 @@ func (s *Server) stopLeaderWorkers() {
 	if expirySweepWorker != nil {
 		expirySweepWorker.Stop()
 	}
-	// Per-tenant FileGC and quota outbox workers are no longer per-backend
-	// goroutines — they are driven by the unified tenant worker, which is
-	// stopped below. No separate StopAllFileGC call is needed.
-	if s.tenantWorker != nil {
+	// In multi-tenant mode the tenant worker is started/stopped in
+	// startNotifyInfrastructure. In single-tenant mode (s.meta == nil) it is
+	// started here in startLeaderWorkers and must be stopped here too.
+	if s.tenantWorker != nil && s.meta == nil {
 		s.tenantWorker.Stop()
 	}
 	if s.objectGCWorker != nil {

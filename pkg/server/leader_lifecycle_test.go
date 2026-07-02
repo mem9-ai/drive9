@@ -153,8 +153,10 @@ func TestLeaderGatedWorkersStartAndStop(t *testing.T) {
 
 	// NewWithConfig already called leader.Start(), which (disabled) fired
 	// onLead synchronously, so all leader-gated workers should be running.
+	// The tenant worker is started in startNotifyInfrastructure (every pod,
+	// not leader-gated), so it should already be running.
 	if srv.tenantWorker == nil || srv.tenantWorker.cancel == nil {
-		t.Fatal("tenant worker should be started on leadership gain")
+		t.Fatal("tenant worker should be started (every pod, not leader-gated)")
 	}
 	if srv.objectGCWorker == nil || !objectGCWorkerRunning(srv.objectGCWorker) {
 		t.Fatal("object GC worker should be started on leadership gain")
@@ -181,8 +183,11 @@ func TestLeaderGatedWorkersStartAndStop(t *testing.T) {
 	if srv.expirySweepWorker != nil {
 		t.Fatal("expiry sweep worker should be nil after onLose")
 	}
-	if srv.tenantWorker != nil && srv.tenantWorker.cancel != nil {
-		t.Fatal("tenant worker should be stopped after onLose")
+	// The tenant worker is NOT leader-gated — it runs on every pod via
+	// startNotifyInfrastructure and is only stopped on Close. It should
+	// still be running after onLose.
+	if srv.tenantWorker == nil || srv.tenantWorker.cancel == nil {
+		t.Fatal("tenant worker should still be running after onLose (not leader-gated)")
 	}
 }
 
