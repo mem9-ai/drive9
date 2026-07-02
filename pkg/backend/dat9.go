@@ -486,6 +486,9 @@ func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 		return b.store.DeleteEmptyDir(ctx, path)
 	}
 	_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+	if err == nil {
+		b.notifyWorkEnqueued(BackendWorkFileGC)
+	}
 	return err
 }
 
@@ -501,6 +504,9 @@ func (b *Dat9Backend) RemoveFileCtx(ctx context.Context, path string) (err error
 		return err
 	}
 	_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+	if err == nil {
+		b.notifyWorkEnqueued(BackendWorkFileGC)
+	}
 	return err
 }
 
@@ -535,9 +541,15 @@ func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error)
 	}
 	if !node.IsDirectory {
 		_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+		if err == nil {
+			b.notifyWorkEnqueued(BackendWorkFileGC)
+		}
 		return err
 	}
 	_, err = b.store.DeleteDirRecursive(ctx, path)
+	if err == nil {
+		b.notifyWorkEnqueued(BackendWorkFileGC)
+	}
 	return err
 }
 
@@ -1289,6 +1301,9 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		}
 		return 0, 0, err
 	}
+	// Notify semantic worker if new content was enqueued for embedding.
+	// Note: overwrite uses object GC (deleteBlobIfS3Ctx) for the old blob, not
+	// file_gc_tasks, so no BackendWorkFileGC is needed here.
 	if semanticTaskEnqueued {
 		b.notifyWorkEnqueued(BackendWorkSemantic)
 	}
@@ -1706,6 +1721,11 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 		return err
 	}
 	_, err = b.store.RenameFileReplacingTarget(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
+	if err == nil {
+		// RenameFileReplacingTarget may enqueue a file_gc task for the replaced
+		// target file's old blob.
+		b.notifyWorkEnqueued(BackendWorkFileGC)
+	}
 	return err
 }
 
