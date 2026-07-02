@@ -244,8 +244,7 @@ func main() {
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_local_backend")
 
 	// Wire central quota store when DRIVE9_LOCAL_META_DSN is set.
-	// This enables server-mode quota enforcement (DRIVE9_QUOTA_SOURCE=server)
-	// in the local single-tenant entrypoint for E2E validation.
+	// The runtime quota accounting path uses the meta DB when it is present.
 	metaDSN := strings.TrimSpace(os.Getenv("DRIVE9_LOCAL_META_DSN"))
 	if metaDSN != "" {
 		stepStart = time.Now()
@@ -375,7 +374,7 @@ environment:
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_USAGE_CACHE_TTL soft small-write central usage cache TTL, e.g. 250ms or 1s
-  DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL soft small-write tenant pending-outbox aggregate cache TTL, e.g. 250ms or 1s
+  DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL soft small-write in-process pending mutation cache TTL, e.g. 250ms or 1s
 
   S3 storage:
   Set DRIVE9_S3_BUCKET to enable AWS S3 mode.
@@ -631,6 +630,9 @@ func localEmbeddingModeLabel(mode schema.TiDBEmbeddingMode, explicit bool) strin
 
 func buildBackendOptionsFromEnv() (backend.Options, error) {
 	var opts backend.Options
+	if strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE")) != "" {
+		return backend.Options{}, fmt.Errorf("DRIVE9_QUOTA_SOURCE has been removed; remove this setting and wire central quota through the meta store")
+	}
 	opts.MaxTenantStorageBytes = envInt64("DRIVE9_MAX_TENANT_STORAGE_BYTES", 50*(1<<30))
 	if opts.MaxTenantStorageBytes <= 0 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
@@ -643,15 +645,6 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	opts.TextExtractMaxBytes = envInt64("DRIVE9_TEXT_EXTRACT_MAX_BYTES", backend.DefaultTextExtractMaxBytes)
 	if opts.TextExtractMaxBytes <= 0 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_TEXT_EXTRACT_MAX_BYTES must be a positive integer")
-	}
-
-	// Quota enforcement source: "tenant" (default) or "server" (central server DB).
-	switch qs := strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE"))); qs {
-	case "", "tenant":
-	case "server":
-		opts.QuotaSource = backend.QuotaSourceServer
-	default:
-		die(fmt.Errorf("DRIVE9_QUOTA_SOURCE must be one of tenant or server, got %q", qs))
 	}
 
 	queryBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_BASE"))

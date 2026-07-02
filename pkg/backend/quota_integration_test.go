@@ -15,7 +15,6 @@ import (
 
 func newServerQuotaBackend(t *testing.T, opts Options) (*Dat9Backend, *fakeMetaQuotaStore) {
 	t.Helper()
-	opts.QuotaSource = QuotaSourceServer
 	b := newTestBackendWithOptions(t, opts)
 	fake := newFakeMetaQuotaStore()
 	fake.config["tenant-a"] = &QuotaConfigView{
@@ -51,7 +50,6 @@ func waitForFakeCentralLLMUsage(t *testing.T, fake *fakeMetaQuotaStore, tenantID
 
 func TestServerQuotaFeatureFlagRejectsOverLimitWrite(t *testing.T) {
 	opts := Options{}
-	opts.QuotaSource = QuotaSourceServer
 	b := newTestBackendWithOptions(t, opts)
 	fake := newFakeMetaQuotaStore()
 	fake.config["tenant-a"] = &QuotaConfigView{
@@ -85,7 +83,6 @@ func TestServerQuotaFeatureFlagRejectsOverLimitWrite(t *testing.T) {
 
 func TestCreateIfAbsentExistingPathReturnsConflictBeforeStorageQuota(t *testing.T) {
 	opts := Options{}
-	opts.QuotaSource = QuotaSourceServer
 	b := newTestBackendWithOptions(t, opts)
 	fake := newFakeMetaQuotaStore()
 	fake.config["tenant-a"] = &QuotaConfigView{
@@ -152,6 +149,7 @@ func TestCreateIfAbsentExistingPathReturnsConflictBeforeFileSizeQuota(t *testing
 }
 
 func TestServerQuotaPendingOutboxFileDeltaRejectsOverFileCount(t *testing.T) {
+	t.Skip("runtime quota admission no longer reads tenant quota_outbox pending deltas")
 	b, fake := newServerQuotaBackend(t, Options{})
 	ctx := context.Background()
 

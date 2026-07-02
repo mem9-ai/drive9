@@ -18,6 +18,7 @@ import (
 )
 
 func TestServerQuotaSmallWriteUsesTenantOutbox(t *testing.T) {
+	t.Skip("runtime quota accounting now uses meta quota_mutation_log, not tenant quota_outbox")
 	b, fake := newServerQuotaBackend(t, Options{})
 	ctx := context.Background()
 
@@ -68,6 +69,7 @@ func TestServerQuotaSmallWriteUsesTenantOutbox(t *testing.T) {
 }
 
 func TestServerQuotaOutboxBatchProcessesDifferentFiles(t *testing.T) {
+	t.Skip("runtime quota accounting now uses meta quota_mutation_log, not tenant quota_outbox")
 	b, fake := newServerQuotaBackend(t, Options{})
 	ctx := context.Background()
 
@@ -311,6 +313,7 @@ func TestServerQuotaSmallWriteDoesNotWaitForAdmissionLock(t *testing.T) {
 }
 
 func TestQuotaOutboxWorkerHoldsAdmissionLockAcrossApplyAndAck(t *testing.T) {
+	t.Skip("runtime quota accounting no longer runs tenant quota_outbox worker")
 	b, fake := newServerQuotaBackend(t, Options{})
 	ctx := context.Background()
 
@@ -397,6 +400,7 @@ func TestQuotaOutboxWorkerCommitsRetryAfterApplyError(t *testing.T) {
 }
 
 func TestDrainQuotaOutboxForFileErrorsWhenPendingRowIsNotClaimable(t *testing.T) {
+	t.Skip("legacy tenant quota_outbox path is no longer used by runtime quota accounting")
 	b, _ := newServerQuotaBackend(t, Options{})
 	ctx := context.Background()
 
@@ -424,7 +428,8 @@ func TestDrainQuotaOutboxForFileErrorsWhenPendingRowIsNotClaimable(t *testing.T)
 }
 
 func TestUploadOverwriteQueuesCompleteBehindPendingFileMutation(t *testing.T) {
-	b := newTestBackendWithS3AndOptions(t, Options{QuotaSource: QuotaSourceServer})
+	t.Skip("legacy tenant quota_outbox path is no longer used by runtime quota accounting")
+	b := newTestBackendWithS3AndOptions(t, Options{})
 	fake := newFakeMetaQuotaStore()
 	fake.config["tenant-a"] = &QuotaConfigView{
 		TenantID:         "tenant-a",
@@ -645,6 +650,7 @@ func TestDrainQuotaOutboxForFileContinuesAfterUnrelatedBatchError(t *testing.T) 
 }
 
 func TestServerQuotaPendingOutboxDeltaRejectsOverLimitWrite(t *testing.T) {
+	t.Skip("runtime quota admission no longer reads tenant quota_outbox pending deltas")
 	b, fake := newServerQuotaBackend(t, Options{})
 	ctx := context.Background()
 
@@ -678,6 +684,7 @@ func TestServerQuotaPendingOutboxDeltaRejectsOverLimitWrite(t *testing.T) {
 }
 
 func TestServerQuotaPendingOutboxDeltaRejectsUploadReserve(t *testing.T) {
+	t.Skip("runtime quota admission no longer reads tenant quota_outbox pending deltas")
 	b, fake := newServerQuotaBackend(t, Options{})
 	ctx := context.Background()
 
@@ -714,6 +721,7 @@ func TestServerQuotaPendingOutboxDeltaRejectsUploadReserve(t *testing.T) {
 }
 
 func TestServerQuotaUploadReserveUsesLivePendingOutboxDeltas(t *testing.T) {
+	t.Skip("runtime quota admission no longer reads tenant quota_outbox pending deltas")
 	b, fake := newServerQuotaBackend(t, Options{})
 	ctx := context.Background()
 
@@ -792,6 +800,7 @@ func TestServerQuotaReserveUploadRetrySkipsPendingPrecheck(t *testing.T) {
 }
 
 func TestServerQuotaOverwriteOutboxUsesLockedCurrentMeta(t *testing.T) {
+	t.Skip("legacy tenant quota_outbox path is no longer used by runtime quota accounting")
 	b, _ := newServerQuotaBackend(t, Options{})
 	ctx := context.Background()
 
@@ -863,7 +872,7 @@ func TestApplyCentralFileMutationIsIdempotent(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		if err := fake.InTx(context.Background(), func(tx *sql.Tx) error {
-			return applyCentralQuotaMutationTx(fake, tx, "tenant-a", quotaMutationTypeFileCreate, raw, int64(i+1))
+			return applyCentralQuotaMutationTx(context.Background(), fake, tx, "tenant-a", quotaMutationTypeFileCreate, raw, int64(i+1))
 		}); err != nil {
 			t.Fatalf("apply central mutation %d: %v", i+1, err)
 		}

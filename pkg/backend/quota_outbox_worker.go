@@ -3,7 +3,6 @@ package backend
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -14,6 +13,10 @@ import (
 )
 
 const (
+	quotaOutboxNotifySize               = 1
+	quotaOutboxNotifyDelay              = 50 * time.Millisecond
+	quotaOutboxNotifyMaxDelay           = 200 * time.Millisecond
+	quotaOutboxPollInterval             = 1 * time.Second
 	quotaOutboxLeaseDuration            = 5 * time.Minute
 	quotaOutboxBatchSize                = 100
 	quotaOutboxRecoverLimit             = 100
@@ -30,10 +33,16 @@ const (
 
 type quotaOutboxBatchClaimer func(context.Context, time.Time, time.Duration, int) (datastore.QuotaOutboxBatchClaimResult, error)
 
-// processQuotaOutboxAvailable drains pending quota outbox rows for this
-// backend's tenant. Called by the unified tenant worker on kick, and by tests.
-// Not called by any per-backend goroutine — the old ticker-based
-// runQuotaOutboxWorker was removed in favor of the kick-driven model.
+func (b *Dat9Backend) notifyQuotaOutbox(enqueued bool) {
+	if !enqueued || b.quotaOutboxNotify == nil {
+		return
+	}
+	select {
+	case b.quotaOutboxNotify <- struct{}{}:
+	default:
+	}
+}
+
 func (b *Dat9Backend) processQuotaOutboxAvailable(ctx context.Context) {
 	if ctx.Err() != nil || b.store == nil || b.metaStore == nil || b.tenantID == "" {
 		return
@@ -67,6 +76,7 @@ func (b *Dat9Backend) processQuotaOutboxAvailable(ctx context.Context) {
 		}
 		processedTotal += processed
 	}
+	b.notifyQuotaOutbox(true)
 }
 
 func (b *Dat9Backend) drainQuotaOutboxForFile(ctx context.Context, fileID string, limit int) error {
@@ -288,7 +298,7 @@ func (b *Dat9Backend) recordAppliedQuotaOutboxEntries(entries []datastore.QuotaO
 		b.quotaUsageCache.invalidate()
 	}
 	for _, entry := range entries {
-		b.addLocalQuotaPendingDeltas(-entry.StorageDelta, -entry.FileDelta, -entry.MediaDelta)
+		b.clearPendingCentralMutationDeltas(entry.StorageDelta, entry.FileDelta, entry.MediaDelta)
 		metrics.RecordTenantOperationCount(b.tenantID, "quota_outbox", entry.MutationType, "ok")
 	}
 }
@@ -331,7 +341,7 @@ func (b *Dat9Backend) applyQuotaOutboxEntryTx(tx *sql.Tx, entry *datastore.Quota
 	}
 	// Reuse the central mutation dispatcher; upload_complete is handled there
 	// by applyUploadCompleteTx, the same body used by mutation replay.
-	return applyCentralQuotaMutationTx(b.metaStore, tx, b.tenantID, entry.MutationType, entry.MutationData, entry.ID)
+	return applyCentralQuotaMutationTx(context.Background(), b.metaStore, tx, b.tenantID, entry.MutationType, entry.MutationData, entry.ID)
 }
 
 func quotaOutboxRetryDelay(attempt int, base, max time.Duration) time.Duration {
@@ -355,96 +365,4 @@ func quotaOutboxRetryDelay(attempt int, base, max time.Duration) time.Duration {
 		return max
 	}
 	return delay
-}
-
-func (b *Dat9Backend) enqueueQuotaFileCreateOutboxTx(tx *sql.Tx, fileID string, sizeBytes int64, contentType string) (bool, error) {
-	if !b.UseServerQuota() {
-		return false, nil
-	}
-	isMedia := isQuotaMediaContentType(contentType)
-	data := fileCreateMutationData{
-		FileID:    fileID,
-		SizeBytes: sizeBytes,
-		IsMedia:   isMedia,
-	}
-	raw, err := json.Marshal(data)
-	if err != nil {
-		return false, err
-	}
-	mediaDelta := int64(0)
-	if isMedia {
-		mediaDelta = 1
-	}
-	_, err = b.store.EnqueueQuotaOutboxTx(tx, &datastore.QuotaOutboxEntry{
-		FileID:       fileID,
-		MutationType: quotaMutationTypeFileCreate,
-		MutationData: raw,
-		StorageDelta: sizeBytes,
-		FileDelta:    1,
-		MediaDelta:   mediaDelta,
-	})
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (b *Dat9Backend) enqueueQuotaUploadCompleteOutboxTx(tx *sql.Tx, uploadID string, reservedBytes int64, fileID string, oldSizeBytes int64, oldIsMedia bool, newSizeBytes int64, newIsMedia bool) (bool, error) {
-	if !b.UseServerQuota() {
-		return false, nil
-	}
-	data := uploadCompleteMutationData{
-		UploadID:      uploadID,
-		FileID:        fileID,
-		ReservedBytes: reservedBytes,
-		OldSizeBytes:  oldSizeBytes,
-		OldIsMedia:    oldIsMedia,
-		NewSizeBytes:  newSizeBytes,
-		NewIsMedia:    newIsMedia,
-	}
-	raw, err := json.Marshal(data)
-	if err != nil {
-		return false, err
-	}
-	_, err = b.store.EnqueueQuotaOutboxTx(tx, &datastore.QuotaOutboxEntry{
-		FileID:       fileID,
-		MutationType: quotaMutationTypeUploadComplete,
-		MutationData: raw,
-	})
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (b *Dat9Backend) enqueueQuotaFileOverwriteOutboxTx(tx *sql.Tx, fileID string, oldSize int64, oldContentType string, newSize int64, newContentType string) (bool, error) {
-	if !b.UseServerQuota() {
-		return false, nil
-	}
-	oldIsMedia := isQuotaMediaContentType(oldContentType)
-	newIsMedia := isQuotaMediaContentType(newContentType)
-	data := fileOverwriteMutationData{
-		FileID:       fileID,
-		OldSizeBytes: oldSize,
-		OldIsMedia:   oldIsMedia,
-		NewSizeBytes: newSize,
-		NewIsMedia:   newIsMedia,
-	}
-	raw, err := json.Marshal(data)
-	if err != nil {
-		return false, err
-	}
-	mediaDelta := quotaMediaDelta(oldIsMedia, newIsMedia)
-	_, err = b.store.EnqueueQuotaOutboxTx(tx, &datastore.QuotaOutboxEntry{
-		FileID:       fileID,
-		MutationType: quotaMutationTypeOverwrite,
-		MutationData: raw,
-		StorageDelta: newSize - oldSize,
-		FileDelta:    0,
-		MediaDelta:   mediaDelta,
-	})
-	if err != nil {
-		return false, err
-	}
-	return true, nil
 }

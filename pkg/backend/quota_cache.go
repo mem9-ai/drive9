@@ -301,20 +301,28 @@ type quotaPendingDeltasSnapshot struct {
 	expiresAt time.Time
 }
 
+type quotaPendingDeltaEntry struct {
+	deltas    quotaPendingDeltas
+	expiresAt time.Time
+}
+
 type quotaPendingDeltasLoader func(context.Context) (storageDelta, fileDelta, mediaDelta int64, err error)
 
-// quotaPendingDeltasCache avoids SUM(quota_outbox) on every small write. It is
-// only used by soft admission checks; strict upload reservation still reads the
-// tenant DB directly.
+// quotaPendingDeltasCache tracks this process's central quota mutations that
+// have been logged but not yet applied. It deliberately has no tenant-DB
+// fallback: runtime quota admission must not SUM quota_outbox from the user DB.
 type quotaPendingDeltasCache struct {
-	tenantID string
-	load     quotaPendingDeltasLoader
-	ttl      time.Duration
+	tenantID   string
+	load       quotaPendingDeltasLoader
+	ttl        time.Duration
+	pendingTTL time.Duration
 
 	mu                  sync.RWMutex
 	snapshot            *quotaPendingDeltasSnapshot
 	generation          uint64
+	localDeltas         quotaPendingDeltas
 	localPositiveDeltas quotaPendingDeltas
+	localEntries        []quotaPendingDeltaEntry
 	loadMu              sync.Mutex
 }
 
@@ -322,14 +330,33 @@ func newQuotaPendingDeltasCache(tenantID string, load quotaPendingDeltasLoader, 
 	if ttl <= 0 {
 		ttl = quotaPendingDeltasCacheTTL
 	}
-	return &quotaPendingDeltasCache{tenantID: tenantID, load: load, ttl: ttl}
+	return &quotaPendingDeltasCache{tenantID: tenantID, load: load, ttl: ttl, pendingTTL: localPendingMutationTTL()}
+}
+
+func localPendingMutationTTL() time.Duration {
+	ttl := replayMinAge() + replayPollInterval() + quotaPendingDeltasCacheTTL
+	if ttl <= 0 {
+		return defaultReplayMinAge + defaultReplayPollInterval + defaultQuotaPendingDeltasCacheTTL
+	}
+	return ttl
 }
 
 func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, bool) {
-	if c == nil || c.load == nil {
+	if c == nil {
 		return quotaPendingDeltas{}, false
 	}
+	if c.load == nil {
+		// Expiry mutates localDeltas/localEntries, so the hot no-loader path
+		// needs the write lock even though callers are logically reading.
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.expireLocalDeltasLocked(time.Now())
+		return c.localDeltas, true
+	}
 	now := time.Now()
+	c.mu.Lock()
+	c.expireLocalDeltasLocked(now)
+	c.mu.Unlock()
 	if deltas, ok := c.cached(now); ok {
 		return deltas, true
 	}
@@ -367,11 +394,9 @@ func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, 
 			expiresAt: expiresAt,
 		}
 		c.mu.Unlock()
-		// A local enqueue or ack raced this DB load. The SELECT may or may not
-		// have observed those rows. Merge only positive local deltas from the
-		// race window: that may double-count this process's newest writes for
-		// one short TTL, but it avoids undercounting quota and keeps small-write
-		// admission off the expensive in-transaction SUM(quota_outbox) path.
+		// A local mutation raced this DB load. This legacy loader path is kept
+		// only for tests; runtime central quota uses in-memory deltas with no
+		// tenant DB read.
 		metrics.RecordTenantOperation(c.tenantID, "server_quota", "pending_delta_cache", "raced_local_delta", time.Since(start))
 		return deltas, true
 	}
@@ -393,29 +418,106 @@ func (c *quotaPendingDeltasCache) cached(now time.Time) (quotaPendingDeltas, boo
 	return quotaPendingDeltas{}, false
 }
 
-func (c *quotaPendingDeltasCache) add(storageDelta, fileDelta, mediaDelta int64) {
+func (c *quotaPendingDeltasCache) addPending(storageDelta, fileDelta, mediaDelta int64) {
 	if c == nil {
 		return
 	}
+	deltas := quotaPendingDeltas{
+		storageDelta: storageDelta,
+		fileDelta:    fileDelta,
+		mediaDelta:   mediaDelta,
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := time.Now()
+	c.expireLocalDeltasLocked(now)
 	c.generation++
-	c.localPositiveDeltas.add(quotaPendingDeltas{
-		storageDelta: maxInt64(storageDelta, 0),
-		fileDelta:    maxInt64(fileDelta, 0),
-		mediaDelta:   maxInt64(mediaDelta, 0),
-	})
-	// If the snapshot is missing or expired, leave it cold. A concurrent loader
-	// publishes a conservative snapshot by merging positive local deltas from
-	// the race window; otherwise the next soft admission check reloads from
-	// quota_outbox and sees this backend's queued row along with rows from
-	// other servers.
-	if c.snapshot == nil || time.Now().After(c.snapshot.expiresAt) {
+	c.localDeltas.add(deltas)
+	c.localPositiveDeltas.add(deltas.positivePart())
+	if !deltas.zero() {
+		c.localEntries = append(c.localEntries, quotaPendingDeltaEntry{
+			deltas:    deltas,
+			expiresAt: now.Add(c.pendingTTL),
+		})
+	}
+	// If the snapshot is missing or expired, leave it cold. The no-loader
+	// runtime path reads localDeltas directly; the legacy loader path refreshes
+	// snapshots on demand.
+	if c.snapshot == nil || now.After(c.snapshot.expiresAt) {
 		return
 	}
 	c.snapshot.deltas.storageDelta += storageDelta
 	c.snapshot.deltas.fileDelta += fileDelta
 	c.snapshot.deltas.mediaDelta += mediaDelta
+}
+
+func (c *quotaPendingDeltasCache) clearPending(storageDelta, fileDelta, mediaDelta int64) {
+	if c == nil {
+		return
+	}
+	deltas := quotaPendingDeltas{
+		storageDelta: storageDelta,
+		fileDelta:    fileDelta,
+		mediaDelta:   mediaDelta,
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	c.expireLocalDeltasLocked(now)
+	c.generation++
+	if !c.removeLocalEntryLocked(deltas) {
+		return
+	}
+	c.localDeltas.add(quotaPendingDeltas{
+		storageDelta: -storageDelta,
+		fileDelta:    -fileDelta,
+		mediaDelta:   -mediaDelta,
+	})
+	c.localPositiveDeltas.add(deltas.positivePart().negate())
+	if c.snapshot == nil || now.After(c.snapshot.expiresAt) {
+		return
+	}
+	c.snapshot.deltas.storageDelta -= storageDelta
+	c.snapshot.deltas.fileDelta -= fileDelta
+	c.snapshot.deltas.mediaDelta -= mediaDelta
+}
+
+func (c *quotaPendingDeltasCache) expireLocalDeltasLocked(now time.Time) {
+	if len(c.localEntries) == 0 {
+		return
+	}
+	kept := c.localEntries[:0]
+	for _, entry := range c.localEntries {
+		if now.Before(entry.expiresAt) {
+			kept = append(kept, entry)
+			continue
+		}
+		c.localDeltas.add(quotaPendingDeltas{
+			storageDelta: -entry.deltas.storageDelta,
+			fileDelta:    -entry.deltas.fileDelta,
+			mediaDelta:   -entry.deltas.mediaDelta,
+		})
+		c.localPositiveDeltas.add(entry.deltas.positivePart().negate())
+		if c.snapshot != nil && now.Before(c.snapshot.expiresAt) {
+			c.snapshot.deltas.storageDelta -= entry.deltas.storageDelta
+			c.snapshot.deltas.fileDelta -= entry.deltas.fileDelta
+			c.snapshot.deltas.mediaDelta -= entry.deltas.mediaDelta
+		}
+	}
+	c.localEntries = kept
+}
+
+func (c *quotaPendingDeltasCache) removeLocalEntryLocked(deltas quotaPendingDeltas) bool {
+	// Match by aggregate delta rather than log ID: admission only reads the
+	// aggregate total, so same-delta pending entries are interchangeable.
+	for i, entry := range c.localEntries {
+		if entry.deltas == deltas {
+			copy(c.localEntries[i:], c.localEntries[i+1:])
+			c.localEntries = c.localEntries[:len(c.localEntries)-1]
+			return true
+		}
+	}
+	return false
 }
 
 func (d *quotaPendingDeltas) add(other quotaPendingDeltas) {
@@ -429,6 +531,26 @@ func (d quotaPendingDeltas) sub(other quotaPendingDeltas) quotaPendingDeltas {
 		storageDelta: d.storageDelta - other.storageDelta,
 		fileDelta:    d.fileDelta - other.fileDelta,
 		mediaDelta:   d.mediaDelta - other.mediaDelta,
+	}
+}
+
+func (d quotaPendingDeltas) zero() bool {
+	return d.storageDelta == 0 && d.fileDelta == 0 && d.mediaDelta == 0
+}
+
+func (d quotaPendingDeltas) positivePart() quotaPendingDeltas {
+	return quotaPendingDeltas{
+		storageDelta: maxInt64(d.storageDelta, 0),
+		fileDelta:    maxInt64(d.fileDelta, 0),
+		mediaDelta:   maxInt64(d.mediaDelta, 0),
+	}
+}
+
+func (d quotaPendingDeltas) negate() quotaPendingDeltas {
+	return quotaPendingDeltas{
+		storageDelta: -d.storageDelta,
+		fileDelta:    -d.fileDelta,
+		mediaDelta:   -d.mediaDelta,
 	}
 }
 

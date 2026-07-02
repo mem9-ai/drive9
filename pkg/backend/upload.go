@@ -985,10 +985,34 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		return err
 	}
 	expectedRevision := uploadExpectedRevision(upload)
+	if b.UseServerQuota() {
+		if err := b.metaStore.UpdateUploadReservationStatus(ctx, b.tenantID, uploadID, "completing"); err != nil {
+			logger.Warn(ctx, "central_quota_upload_mark_completing_failed",
+				zap.String("tenant_id", b.tenantID),
+				zap.String("upload_id", uploadID),
+				zap.Error(err))
+			metrics.RecordTenantOperation(b.tenantID, "central_quota", "upload_mark_completing", "error", time.Since(start))
+			return fmt.Errorf("mark central quota upload completing: %w", err)
+		}
+		metrics.RecordTenantOperation(b.tenantID, "central_quota", "upload_mark_completing", "ok", 0)
+	}
 
 	completeMultipartStart := time.Now()
 	if err := b.s3.CompleteMultipartUpload(ctx, upload.S3Key, upload.S3UploadID, parts); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_complete_multipart_failed", zap.String("upload_id", uploadID), zap.Error(err))
+		if b.UseServerQuota() {
+			cleanupCtx, cancelCleanup := postCommitQuotaMutationContext()
+			if resetErr := b.metaStore.UpdateUploadReservationStatus(cleanupCtx, b.tenantID, uploadID, "active"); resetErr != nil {
+				logger.Warn(cleanupCtx, "central_quota_upload_reset_active_failed",
+					zap.String("tenant_id", b.tenantID),
+					zap.String("upload_id", uploadID),
+					zap.Error(resetErr))
+				metrics.RecordTenantOperation(b.tenantID, "central_quota", "upload_reset_active", "error", time.Since(start))
+			} else {
+				metrics.RecordTenantOperation(b.tenantID, "central_quota", "upload_reset_active", "ok", time.Since(start))
+			}
+			cancelCleanup()
+		}
 		metrics.RecordTenantOperation(b.tenantID, "backend", "finalize_upload", "error", time.Since(start))
 		return fmt.Errorf("complete multipart: %w", err)
 	}
@@ -1015,19 +1039,6 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	var insertNodeDurationMs float64
 	var semanticEnqueueDurationMs float64
 	var semanticTaskEnqueued bool
-	var quotaOutboxEnqueued bool
-	// upload.TotalSize is immutable from the upload row. The old* fields and
-	// confirmedFileID are refreshed inside each InTx attempt after locking the
-	// target node/file, then consumed by this same transaction's outbox enqueue.
-	enqueueUploadCompleteOutbox := func(tx *sql.Tx) error {
-		created, err := b.enqueueQuotaUploadCompleteOutboxTx(tx,
-			uploadID, upload.TotalSize, confirmedFileID, oldSizeBytes, oldIsMedia, upload.TotalSize, newIsMedia)
-		if err != nil {
-			return err
-		}
-		quotaOutboxEnqueued = created
-		return nil
-	}
 	enqueueUploadSemanticTasks := func(tx *sql.Tx, mediaDelta int64) error {
 		stepStart := time.Now()
 		if b.UsesDatabaseAutoEmbedding() {
@@ -1055,7 +1066,6 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	}
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
-		quotaOutboxEnqueued = false
 		oldStorageRef = ""
 		oldStorageType = ""
 		oldContentType = ""
@@ -1205,12 +1215,14 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 				return err
 			}
 		}
-		return enqueueUploadCompleteOutbox(tx)
+		return nil
 	}); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
 		b.cleanupFailedFinalizeUpload(ctx, upload)
 		// Abort the server-side reservation since the tenant DB tx failed.
-		b.abortUploadReservation(ctx, uploadID, upload.TotalSize)
+		cleanupCtx, cancelCleanup := postCommitQuotaMutationContext()
+		b.abortUploadReservation(cleanupCtx, uploadID, upload.TotalSize)
+		cancelCleanup()
 		metrics.RecordTenantOperation(b.tenantID, "backend", "finalize_upload", "error", time.Since(start))
 		return err
 	}
@@ -1218,21 +1230,11 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	if semanticTaskEnqueued {
 		b.notifyWorkEnqueued(BackendWorkSemantic)
 	}
-	if quotaOutboxEnqueued {
-		b.notifyWorkEnqueued(BackendWorkQuota)
-	}
-
-	if !quotaOutboxEnqueued {
-		if b.UseServerQuota() {
-			logger.Error(ctx, "upload_complete_quota_accounting_skipped",
-				zap.String("tenant_id", b.tenantID),
-				zap.String("upload_id", uploadID),
-				zap.String("file_id", confirmedFileID))
-		}
-		// Preserve the non-outbox path when central quota is wired without
-		// server-quota mode; server quota uses the tenant-local outbox so
-		// upload completion is ordered with prior mutations for the same file.
-		b.completeUploadReservation(ctx, uploadID, upload.TotalSize, confirmedFileID, oldSizeBytes, oldIsMedia, upload.TotalSize, newIsMedia)
+	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
+	defer cancelQuota()
+	if err := b.completeUploadReservation(quotaCtx, uploadID, upload.TotalSize, confirmedFileID, oldSizeBytes, oldIsMedia, upload.TotalSize, newIsMedia); err != nil {
+		metrics.RecordTenantOperation(b.tenantID, "backend", "finalize_upload", "error", time.Since(start))
+		return postCommitQuotaMutationError("record central quota upload complete", err)
 	}
 
 	if isOverwrite {

@@ -47,8 +47,9 @@ type MetaQuotaStore interface {
 	InsertUploadReservation(ctx context.Context, r *UploadReservationView) error
 	UpdateUploadReservationStatus(ctx context.Context, tenantID, uploadID, status string) error
 	GetUploadReservation(ctx context.Context, tenantID, uploadID string) (*UploadReservationView, error)
-	UpdateUploadReservationStatusTx(tx *sql.Tx, tenantID, uploadID, status string) error
-	SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (settled bool, fileCountDelta int64, err error)
+	UpdateUploadReservationStatusTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID, status string) error
+	AbortActiveReservationTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID string) (aborted bool, reservedBytes, fileCountDelta int64, err error)
+	SettleActiveReservationTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID, status string) (settled bool, fileCountDelta int64, err error)
 
 	// LLM cost
 	InsertCentralLLMUsage(ctx context.Context, r *LLMUsageView) error
@@ -137,14 +138,11 @@ func (b *Dat9Backend) SetMetaQuotaStore(ctx context.Context, tenantID string, mq
 				zap.Error(err))
 		}
 	}
-	if mqs != nil && b.quotaSource == QuotaSourceServer {
+	if mqs != nil {
 		b.quotaConfigCache = newQuotaConfigCache(tenantID, mqs)
 		b.quotaUsageCache = newQuotaUsageCache(tenantID, mqs, quotaUsageCacheTTL)
-		if b.store != nil {
-			b.quotaPendingCache = newQuotaPendingDeltasCache(b.tenantID, b.store.PendingQuotaOutboxDeltas, quotaPendingDeltasCacheTTL)
-		}
+		b.quotaPendingCache = newQuotaPendingDeltasCache(b.tenantID, nil, quotaPendingDeltasCacheTTL)
 		b.startMutationWorker()
-		_ = b.metaStore // quota outbox is kick-driven
 	}
 }
 
