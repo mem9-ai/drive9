@@ -73,6 +73,10 @@ func ExampleClient_filesystemCRUDAndMetadata() {
 
 	_, _ = c.List("/workspace/")
 	_, _ = c.ListCtx(ctx, "/workspace/")
+	page, err := c.ListPage("/workspace/", 100, "")
+	if err == nil && page.NextCursor != "" {
+		_, _ = c.ListPageCtx(ctx, "/workspace/", 100, page.NextCursor)
+	}
 	_, _ = c.BatchStatCtx(ctx, []string{"/workspace/a.txt", "/workspace/b.txt"})
 	_, _ = c.BatchReadSmallCtx(ctx, []string{"/workspace/a.txt"}, 1<<20)
 
@@ -497,6 +501,8 @@ var coveredClientMethods = map[string]bool{
 	"IssueVaultToken":                      true,
 	"List":                                 true,
 	"ListCtx":                              true,
+	"ListPage":                             true,
+	"ListPageCtx":                          true,
 	"ListFSLayerEvents":                    true,
 	"ListFSLayers":                         true,
 	"ListGitObjectPacks":                   true,
