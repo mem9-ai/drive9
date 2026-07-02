@@ -199,7 +199,7 @@ func (p *tenantOutboxPoller) dispatch(ctx context.Context, row meta.TenantNotify
 			bus.Publish()
 		}
 	}
-	shardedMask := row.WorkMask & (WorkSemantic | WorkFileGC | WorkQuota)
+	shardedMask := row.WorkMask & (WorkSemantic | WorkFileGC)
 	if shardedMask != 0 && p.worker != nil {
 		// Sharded work: only the shard owner processes it. Other pods skip;
 		// the safety-net scan recovers any work whose kick was lost.

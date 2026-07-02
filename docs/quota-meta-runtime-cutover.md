@@ -71,31 +71,50 @@ is optimistic and may temporarily over-admit until replay converges.
 
 - `DRIVE9_QUOTA_SOURCE` is retired. Central quota is active when a meta quota
   store is wired into the backend.
-- The tenant `quota_outbox` worker is no longer started by `SetMetaQuotaStore`.
-- Runtime create/overwrite/upload paths no longer enqueue tenant `quota_outbox`
-  rows.
+- The tenant `quota_outbox` worker and datastore helpers have been removed from
+  the runtime.
+- Runtime create/overwrite/upload paths do not enqueue tenant `quota_outbox`
+  rows, and new tenant schemas no longer create `quota_outbox` or
+  `quota_admission_locks`.
 - Runtime admission no longer calls `PendingQuotaOutboxDeltas` or any tenant
   `quota_outbox` pending read.
 
-Legacy `quota_outbox` schema and datastore code remain for old rows,
-backfill/drain tooling, and historical tests. They are not part of the runtime
-quota path after this cutover.
+Existing tenant databases may still contain historical `quota_outbox` rows from
+pre-cutover deployments. They are not drained by runtime code. The one-time
+central quota reconciliation has already been completed, so the
+`drive9-server backfill-quota` command has been removed. Use this order for any
+remaining historical table cleanup:
+
+1. Deploy the meta-quota runtime everywhere and confirm old pods are gone.
+2. Confirm central quota usage matches expected tenant usage and
+   `quota_mutation_log` backlog is drained.
+3. Delete historical tenant `quota_outbox` rows or drop the old tables. Do not
+   delete them before verification; after deletion they are no longer available
+   for diagnosing pre-cutover handoff gaps.
 
 ## Operational Guardrails
 
 Watch the meta pipeline instead of tenant outbox health:
 
-- `quota_mutation_log` pending backlog.
-- oldest pending mutation age.
+- `drive9_service_gauge{component="mutation_replay",name="pending_mutations"}`
+  for `quota_mutation_log` pending backlog by tenant.
+- `drive9_service_gauge{component="mutation_replay",name="oldest_pending_age_seconds"}`
+  for oldest pending mutation age by tenant.
+- The replay backlog gauges reflect the last observation from a live
+  `mutation_replay` worker. A fatal worker exit intentionally leaves the last
+  non-zero values in place instead of clearing them, so pair these gauges with
+  `mutation_replay` worker error/bad-connection alerts.
 - `central_quota_mutation_log_insert_failed` log/metric.
 - `central_quota/upload_reset_active` errors or
   `central_quota_upload_reset_active_failed`, which indicate a retryable upload
   complete failure could not reset the reservation back to active.
 - any new tenant `quota_outbox` row after cutover, which indicates a missed
-  runtime code path.
+  runtime code path. This is an operational DB check, not a runtime metric,
+  because the runtime intentionally no longer queries tenant `quota_outbox`.
 
-For permanent gaps caused by the residual crash window, run quota backfill to
-reconcile central counters from tenant file metadata.
+For permanent gaps caused by the residual crash window, reconcile central
+counters from tenant file metadata with an operational repair job. Runtime code
+does not read tenant quota state.
 
 ## Verification
 

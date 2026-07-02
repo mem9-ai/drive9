@@ -74,10 +74,6 @@ func (b *Dat9Backend) processOneFileGCTask(ctx context.Context, opts FileGCWorke
 	return true, err
 }
 
-func isContextDone(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
-
 func (b *Dat9Backend) processFileGCTask(ctx context.Context, task *datastore.FileGCTask) error {
 	if task == nil {
 		return fmt.Errorf("file gc task is required")
@@ -133,15 +129,6 @@ func (b *Dat9Backend) deleteCentralFileMetaForGCTask(ctx context.Context, task *
 }
 
 func (b *Dat9Backend) checkNoPendingCentralFileMutation(ctx context.Context, fileID string) error {
-	if b.UseServerQuota() {
-		pending, err := b.store.HasPendingQuotaOutboxFileMutation(ctx, fileID)
-		if err != nil {
-			return err
-		}
-		if pending {
-			return fmt.Errorf("tenant quota outbox pending for file %s", fileID)
-		}
-	}
 	pending, err := b.metaStore.HasPendingFileMutation(ctx, b.tenantID, fileID)
 	if err != nil {
 		return err

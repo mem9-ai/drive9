@@ -82,10 +82,10 @@ func TestTenantWorkerTakePendingWorkMask(t *testing.T) {
 		kickPending: make(map[string]int),
 		kicks:       make(chan kickMsg, tenantKickQueueCapacity),
 	}
-	m.kickPending["t1"] = WorkSemantic | WorkQuota
+	m.kickPending["t1"] = WorkSemantic | WorkFileGC
 	mask := m.takePendingWorkMask("t1")
-	if mask != WorkSemantic|WorkQuota {
-		t.Fatalf("expected mask %d, got %d", WorkSemantic|WorkQuota, mask)
+	if mask != WorkSemantic|WorkFileGC {
+		t.Fatalf("expected mask %d, got %d", WorkSemantic|WorkFileGC, mask)
 	}
 	// Second take should return 0 (cleared).
 	mask2 := m.takePendingWorkMask("t1")

@@ -670,6 +670,7 @@ func metaInitSchemaStatements() []string {
 			created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			applied_at     DATETIME(3) NULL,
 			INDEX idx_pending (status, created_at),
+			INDEX idx_pending_tenant_age (status, tenant_id, created_at),
 			INDEX idx_tenant_order (tenant_id, id)
 		)`,
 		// sse_notify_outbox is the legacy central notification pointer table for

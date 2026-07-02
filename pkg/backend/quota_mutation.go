@@ -80,7 +80,7 @@ func isQuotaMediaContentType(contentType string) bool {
 // removal. Callers must surface an error instead of silently dropping the
 // mutation. The current write paths still call this after the tenant DB commit,
 // so a process crash between tenant commit and this insert remains a known
-// reconciliation/backfill window.
+// reconciliation window.
 func (b *Dat9Backend) logQuotaMutation(ctx context.Context, mutationType string, payload any) (int64, error) {
 	if b.metaStore == nil || b.tenantID == "" {
 		return 0, nil
@@ -147,8 +147,8 @@ func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType strin
 // the old synchronous log+apply path also had no cross-pod ordering.
 // UpsertFileMetaTx is last-writer-wins; MutationReplayWorker replays
 // pending (unapplied) entries in (tenant_id, id) order, which handles
-// crash recovery. For cross-pod last-writer divergence on file_meta,
-// the backfill-quota tool can be run manually to reconcile.
+// crash recovery. Cross-pod last-writer divergence on file_meta requires
+// operational reconciliation from tenant file metadata.
 func (b *Dat9Backend) logAndEnqueueMutation(ctx context.Context, mutationType string, payload any, pending quotaPendingDeltas, apply func(context.Context, *sql.Tx) error) error {
 	if b.metaStore == nil || b.tenantID == "" {
 		return nil

@@ -148,31 +148,6 @@ func TestCreateIfAbsentExistingPathReturnsConflictBeforeFileSizeQuota(t *testing
 	}
 }
 
-func TestServerQuotaPendingOutboxFileDeltaRejectsOverFileCount(t *testing.T) {
-	t.Skip("runtime quota admission no longer reads tenant quota_outbox pending deltas")
-	b, fake := newServerQuotaBackend(t, Options{})
-	ctx := context.Background()
-
-	fake.mu.Lock()
-	fake.config["tenant-a"].MaxFileCount = 1
-	fake.mu.Unlock()
-	b.quotaConfigCache.refresh(ctx)
-
-	if _, err := b.WriteCtx(ctx, "/first.txt", []byte("a"), 0, filesystem.WriteFlagCreate); err != nil {
-		t.Fatalf("first write: %v", err)
-	}
-	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if usage.FileCount != 0 {
-		t.Fatalf("central file count before outbox drain = %d, want 0", usage.FileCount)
-	}
-	if _, err := b.WriteCtx(ctx, "/second.txt", []byte("b"), 0, filesystem.WriteFlagCreate); !errors.Is(err, ErrFileCountQuotaExceeded) {
-		t.Fatalf("second write error = %v, want ErrFileCountQuotaExceeded", err)
-	}
-}
-
 func TestServerModeBudgetGateWritesCentralOnly(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{
 		LLMCostBudget: LLMCostBudgetOptions{
@@ -225,7 +200,7 @@ func TestServerQuotaUploadOverwriteDeltaIntegration(t *testing.T) {
 	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
 		t.Fatalf("confirm overwrite upload: %v", err)
 	}
-	b.processQuotaOutboxAvailable(ctx)
+	drainCentralQuotaMutations(t, b)
 
 	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
 	if err != nil {

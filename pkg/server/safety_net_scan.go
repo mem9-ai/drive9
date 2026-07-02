@@ -92,13 +92,6 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 							zap.String("tenant_id", t.ID), zap.Error(err))
 					}
 				}
-				// Recover expired quota outbox leases.
-				if _, err := store.RecoverExpiredQuotaOutbox(ctx, now, safetyNetRecoverLimit); err != nil {
-					if ctx.Err() == nil {
-						logger.Warn(ctx, "safety_net_scan_quota_recover_failed",
-							zap.String("tenant_id", t.ID), zap.Error(err))
-					}
-				}
 			}()
 		}
 		// Advance keyset cursor.

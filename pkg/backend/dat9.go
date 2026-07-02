@@ -77,7 +77,6 @@ const (
 	BackendWorkSSE      = 1  // wake local SSE bus
 	BackendWorkSemantic  = 2  // kick semantic worker
 	BackendWorkFileGC    = 4  // kick file GC worker
-	BackendWorkQuota     = 8  // kick quota outbox worker
 )
 
 // Dat9Backend implements filesystem.FileSystem with the inode model.
@@ -126,9 +125,6 @@ type Dat9Backend struct {
 	mutationQueue chan func(context.Context)
 	mutationWG    sync.WaitGroup
 	mutationStop  context.CancelFunc
-
-	quotaOutboxNotify chan struct{}
-	claimQuotaOutbox  quotaOutboxBatchClaimer
 
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
 

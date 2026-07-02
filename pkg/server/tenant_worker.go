@@ -43,10 +43,6 @@ const (
 	fileGCRecoverLimit = 100
 	// fileGCDrainBatchSize caps file_gc tasks drained per kick.
 	fileGCDrainBatchSize = 100
-	// quotaOutboxRecoverLimit bounds expired quota outbox lease recovery per kick.
-	quotaOutboxRecoverLimit = 100
-	// quotaOutboxDrainBatchSize caps quota outbox rows drained per kick.
-	quotaOutboxDrainBatchSize = 100
 	// semanticRecoverLimit bounds expired semantic task lease recovery per kick.
 	semanticRecoverLimit = 64
 	// defaultTenantMaintenanceInterval is the throttle interval for piggybacked
@@ -380,10 +376,6 @@ func (m *tenantWorkerManager) pollFallbackOnce(ctx context.Context) bool {
 	if did, err := m.fallback.ProcessOneFileGCTask(ctx); err == nil && did {
 		processed = true
 	}
-	// Drain one quota outbox batch.
-	if n, err := m.fallback.ProcessQuotaOutboxBatch(ctx, 1); err == nil && n > 0 {
-		processed = true
-	}
 	return processed
 }
 
@@ -451,13 +443,6 @@ func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID string
 		}
 	}
 
-	// Drain quota outbox (if selected).
-	if workMask&WorkQuota != 0 {
-		if m.drainQuotaOutbox(ctx, target) {
-			reKickMask |= WorkQuota
-		}
-	}
-
 	// Recover expired leases for all work types (cheap, runs on every kick).
 	m.recoverExpired(ctx, target)
 
@@ -505,45 +490,6 @@ func (m *tenantWorkerManager) drainFileGC(ctx context.Context, target *tenantTar
 		if !processed {
 			return false
 		}
-	}
-	return true // drained the full batch — likely more remains
-}
-
-// drainQuotaOutbox recovers expired quota outbox leases and drains available rows.
-// Returns true if the drain hit its batch cap (more work likely remains).
-func (m *tenantWorkerManager) drainQuotaOutbox(ctx context.Context, target *tenantTarget) (hitCap bool) {
-	if ctx.Err() != nil {
-		return false
-	}
-	b := target.backend
-	if b == nil {
-		return false
-	}
-	now := time.Now().UTC()
-	if _, err := target.store.RecoverExpiredQuotaOutbox(ctx, now, quotaOutboxRecoverLimit); err != nil {
-		if !isContextDoneErr(err) {
-			logger.Warn(ctx, "tenant_worker_quota_recover_failed",
-				zap.String("tenant_id", target.tenantID), zap.Error(err))
-		}
-	}
-	for total := 0; total < quotaOutboxDrainBatchSize; {
-		if ctx.Err() != nil {
-			return false
-		}
-		processed, err := b.ProcessQuotaOutboxBatch(ctx, quotaOutboxDrainBatchSize-total)
-		if err != nil {
-			if !isContextDoneErr(err) {
-				logger.Warn(ctx, "tenant_worker_quota_process_failed",
-					zap.String("tenant_id", target.tenantID), zap.Error(err))
-			}
-			if processed == 0 {
-				return false
-			}
-		}
-		if processed == 0 {
-			return false
-		}
-		total += processed
 	}
 	return true // drained the full batch — likely more remains
 }

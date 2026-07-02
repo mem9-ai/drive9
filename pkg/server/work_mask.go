@@ -20,9 +20,6 @@ const (
 	// WorkFileGC (bit 2) kicks the unified worker to drain file_gc tasks.
 	// Sharded: only the shard-owner pod processes it.
 	WorkFileGC = 4
-	// WorkQuota (bit 3) kicks the unified worker to drain the quota outbox.
-	// Sharded: only the shard-owner pod processes it.
-	WorkQuota = 8
 )
 
 // Compile-time assertions that the server-side work mask constants match the
@@ -32,5 +29,4 @@ var (
 	_ = [1]byte{}[backend.BackendWorkSSE^WorkSSE]
 	_ = [1]byte{}[backend.BackendWorkSemantic^WorkSemantic]
 	_ = [1]byte{}[backend.BackendWorkFileGC^WorkFileGC]
-	_ = [1]byte{}[backend.BackendWorkQuota^WorkQuota]
 )
