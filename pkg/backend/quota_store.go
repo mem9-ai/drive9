@@ -61,6 +61,7 @@ type MetaQuotaStore interface {
 	// Mutation log
 	InsertMutationLog(ctx context.Context, entry *MutationLogView) (int64, error)
 	ListPendingMutations(ctx context.Context, minAge time.Duration, limit int) ([]MutationLogView, error)
+	ObservePendingMutations(ctx context.Context) ([]MutationBacklogView, error)
 	HasPendingFileMutation(ctx context.Context, tenantID, fileID string) (bool, error)
 	MarkMutationAppliedTx(tx *sql.Tx, id int64) error
 	IncrMutationRetry(ctx context.Context, id int64, maxRetries int) error
@@ -124,6 +125,14 @@ type MutationLogView struct {
 	MutationType string
 	MutationData json.RawMessage
 	RetryCount   int // populated only when read from ListPendingMutations
+}
+
+// MutationBacklogView is a tenant-level observation of pending quota mutation
+// replay work. It is used only for runtime metrics and alerting.
+type MutationBacklogView struct {
+	TenantID                string
+	PendingCount            int64
+	OldestPendingAgeSeconds float64
 }
 
 // SetMetaQuotaStore sets the central quota store on the backend.

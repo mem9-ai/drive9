@@ -412,7 +412,7 @@ BACKFILL_MEDIA=$(mysql -h127.0.0.1 -P14000 -uroot drive9_local -N -s -e \
 
 info "tenant DB: storage=${BACKFILL_STORAGE:-?} media=${BACKFILL_MEDIA:-?}"
 
-# Insert backfilled counters (simulates what a backfill-quota CLI would do)
+# Insert reconciled counters from tenant DB aggregates.
 mysql -h127.0.0.1 -P13306 -uroot -proot drive9_meta -e \
   "INSERT INTO tenant_quota_usage (tenant_id, storage_bytes, media_file_count) VALUES ('local-tenant', ${BACKFILL_STORAGE:-0}, ${BACKFILL_MEDIA:-0}) ON DUPLICATE KEY UPDATE storage_bytes=${BACKFILL_STORAGE:-0}, media_file_count=${BACKFILL_MEDIA:-0};" 2>/dev/null
 

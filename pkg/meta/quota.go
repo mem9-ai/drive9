@@ -89,6 +89,14 @@ type MutationLogEntry struct {
 	AppliedAt    *time.Time
 }
 
+// MutationBacklogObservation is a tenant-level view of pending quota mutation
+// replay work for metrics and alerts.
+type MutationBacklogObservation struct {
+	TenantID                string
+	PendingCount            int64
+	OldestPendingAgeSeconds float64
+}
+
 // --- QuotaConfig operations ---
 
 // GetQuotaConfig returns the per-tenant quota configuration.
@@ -1000,6 +1008,42 @@ func (s *Store) ListPendingMutations(ctx context.Context, minAge time.Duration, 
 		entries = append(entries, e)
 	}
 	return entries, rows.Err()
+}
+
+// ObservePendingMutations returns per-tenant pending mutation backlog and age.
+func (s *Store) ObservePendingMutations(ctx context.Context) ([]MutationBacklogObservation, error) {
+	start := time.Now()
+	var err error
+	defer observeMeta(ctx, "observe_pending_mutations", start, &err)
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT tenant_id, COUNT(*), MIN(created_at)
+		 FROM quota_mutation_log FORCE INDEX (idx_pending_tenant_age)
+		 WHERE status = 'pending'
+		 GROUP BY tenant_id
+		 ORDER BY tenant_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	now := time.Now().UTC()
+	var out []MutationBacklogObservation
+	for rows.Next() {
+		var obs MutationBacklogObservation
+		var oldest time.Time
+		if err = rows.Scan(&obs.TenantID, &obs.PendingCount, &oldest); err != nil {
+			return out, err
+		}
+		age := now.Sub(oldest.UTC()).Seconds()
+		if age < 0 {
+			age = 0
+		}
+		obs.OldestPendingAgeSeconds = age
+		out = append(out, obs)
+	}
+	err = rows.Err()
+	return out, err
 }
 
 // HasPendingFileMutation reports whether an unapplied create/overwrite

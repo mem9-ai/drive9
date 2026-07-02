@@ -371,6 +371,9 @@ environment:
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_USAGE_CACHE_TTL soft small-write central usage cache TTL, e.g. 250ms or 1s
   DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL soft small-write in-process pending mutation cache TTL, e.g. 250ms or 1s
+  DRIVE9_QUOTA_REPLAY_POLL_MS central quota mutation replay poll interval in milliseconds (default: 1000)
+  DRIVE9_QUOTA_REPLAY_MIN_AGE_MS minimum pending mutation age before replay in milliseconds (default: 1000)
+  DRIVE9_QUOTA_REPLAY_OBSERVE_MS replay backlog observation interval in milliseconds (default: 10000)
 
   S3 storage:
   Set DRIVE9_S3_BUCKET to enable AWS S3 mode.

@@ -28,8 +28,8 @@ func TestSchemaDumpInitSQLByProvider(t *testing.T) {
 			if !strings.Contains(out, "CREATE INDEX idx_task_claim_type ON semantic_tasks") {
 				t.Fatalf("dump missing semantic_tasks index: %q", out)
 			}
-			if !strings.Contains(out, "CREATE INDEX idx_quota_outbox_file_order ON quota_outbox") {
-				t.Fatalf("dump missing quota_outbox file-order index: %q", out)
+			if strings.Contains(out, "quota_outbox") || strings.Contains(out, "quota_admission_locks") {
+				t.Fatalf("dump contains legacy tenant quota tables: %q", out)
 			}
 			if !strings.Contains(out, ";\n") {
 				t.Fatalf("dump missing SQL statement terminators: %q", out)

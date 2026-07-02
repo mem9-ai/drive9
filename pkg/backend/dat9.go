@@ -116,9 +116,6 @@ type Dat9Backend struct {
 	mutationWG    sync.WaitGroup
 	mutationStop  context.CancelFunc
 
-	quotaOutboxNotify chan struct{}
-	claimQuotaOutbox  quotaOutboxBatchClaimer
-
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
 
 	// Async image -> text extraction runtime (durable semantic_tasks delivery;

@@ -289,6 +289,22 @@ func (a *metaQuotaAdapter) ListPendingMutations(ctx context.Context, minAge time
 	return views, nil
 }
 
+func (a *metaQuotaAdapter) ObservePendingMutations(ctx context.Context) ([]backend.MutationBacklogView, error) {
+	entries, err := a.s.ObservePendingMutations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	views := make([]backend.MutationBacklogView, len(entries))
+	for i, e := range entries {
+		views[i] = backend.MutationBacklogView{
+			TenantID:                e.TenantID,
+			PendingCount:            e.PendingCount,
+			OldestPendingAgeSeconds: e.OldestPendingAgeSeconds,
+		}
+	}
+	return views, nil
+}
+
 func (a *metaQuotaAdapter) HasPendingFileMutation(ctx context.Context, tenantID, fileID string) (bool, error) {
 	return a.s.HasPendingFileMutation(ctx, tenantID, fileID)
 }

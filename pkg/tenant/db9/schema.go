@@ -171,7 +171,6 @@ func InitSchemaStatements() []string {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_usage(created_at)`,
 	}
-	core = append(core, schema.QuotaOutboxDB9SchemaStatements()...)
 	core = append(core, schema.GitWorkspaceDB9SchemaStatements()...)
 	core = append(core, schema.FSLayerDB9SchemaStatements()...)
 	core = append(core, schema.JournalDB9SchemaStatements()...)

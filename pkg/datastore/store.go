@@ -1553,7 +1553,7 @@ func (s *Store) ConfirmedFileSizeByPathTx(db execer, path string) (int64, error)
 	return size.Int64, nil
 }
 
-// ConfirmedFileSummary holds the minimal per-file info needed for quota backfill.
+// ConfirmedFileSummary holds the minimal per-file info needed for quota reconciliation.
 type ConfirmedFileSummary struct {
 	FileID      string
 	SizeBytes   int64
@@ -1689,8 +1689,6 @@ func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
 		}
 		for _, stmt := range []string{
 			`DELETE FROM uploads`,
-			`DELETE FROM quota_outbox`,
-			`DELETE FROM quota_admission_locks`,
 			`DELETE FROM file_gc_tasks`,
 			`DELETE FROM semantic_tasks`,
 			`DELETE FROM llm_usage`,
