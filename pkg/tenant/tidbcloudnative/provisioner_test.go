@@ -1497,6 +1497,7 @@ func TestSystemUserStatements(t *testing.T) {
 	want := []string{
 		"CREATE DATABASE IF NOT EXISTS `tidbcloud_fs`",
 		"CREATE ROLE IF NOT EXISTS 'tdc_fs_admin'",
+		"GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO 'tdc_fs_admin'",
 		"GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON `tidbcloud_fs`.* TO 'tdc_fs_admin'",
 		"CREATE USER IF NOT EXISTS '22ipQWBXXq2wN2S.tdc_fs_sys' IDENTIFIED BY 'pass123'",
 		"ALTER USER '22ipQWBXXq2wN2S.tdc_fs_sys' IDENTIFIED BY 'pass123'",
