@@ -7638,16 +7638,16 @@ func TestCommitQueueMaxPendingResolution(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Zero maxPending → NewCommitQueue uses internal default (maxCommitQueuePending=100).
+	// Zero maxPending → NewCommitQueue uses internal default (maxCommitQueuePending=500).
 	cq0 := NewCommitQueue(nil, shadow, pending, nil, 1, 0)
 	if cq0.maxPending != maxCommitQueuePending {
 		t.Fatalf("NewCommitQueue(maxPending=0).maxPending = %d, want %d", cq0.maxPending, maxCommitQueuePending)
 	}
 
 	// Explicit positive value is honored.
-	cq500 := NewCommitQueue(nil, shadow, pending, nil, 1, 500)
-	if cq500.maxPending != 500 {
-		t.Fatalf("NewCommitQueue(maxPending=500).maxPending = %d, want 500", cq500.maxPending)
+	cq200 := NewCommitQueue(nil, shadow, pending, nil, 1, 200)
+	if cq200.maxPending != 200 {
+		t.Fatalf("NewCommitQueue(maxPending=200).maxPending = %d, want 200", cq200.maxPending)
 	}
 }
 
