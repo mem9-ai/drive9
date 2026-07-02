@@ -91,7 +91,7 @@ func (rt *objectGCTestRuntime) insertTenant(t *testing.T, id string, status meta
 		DBPasswordCipher:   passCipher,
 		DBName:             rt.dbName,
 		DBTLS:              false,
-		Provider:           tenant.ProviderTiDBCloudStarter,
+		Provider:           tenant.ProviderTiDBCloudNative,
 		ClusterID:          "cluster-a",
 		BranchID:           "branch-a",
 		SchemaVersion:      1,

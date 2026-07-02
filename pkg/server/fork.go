@@ -220,7 +220,10 @@ func (s *Server) resolveForkCredentialRequest(provider string, req *tenant.Crede
 		return nil, nil
 	}
 	if req == nil {
-		return nil, tenant.ErrCredentialsRequired
+		req = resolveDefaultCredentials(s.provisioner)
+		if req == nil {
+			return nil, tenant.ErrCredentialsRequired
+		}
 	}
 	if validator, ok := s.provisioner.(credentialProvisionRequestValidator); ok {
 		if err := validator.ValidateCredentialProvisionRequest(*req); err != nil {
@@ -733,7 +736,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 		return "", err
 	}
 	if cluster == nil || cluster.ClusterID == "" || cluster.BranchID == "" {
-		return "", forkErr(http.StatusBadGateway, "starter branch response missing required metadata")
+		return "", forkErr(http.StatusBadGateway, "database branch response missing required metadata")
 	}
 	if err := s.meta.UpdateTenantConnection(ctx, forkTenant.ID, &meta.Tenant{
 		DBHost:           cluster.Host,
@@ -817,7 +820,7 @@ func clusterInfoFromTenant(t *meta.Tenant) *tenant.ClusterInfo {
 }
 
 func forkProviderSupported(provider string) bool {
-	return provider == tenant.ProviderTiDBCloudStarter || provider == tenant.ProviderTiDBCloudNative
+	return provider == tenant.ProviderTiDBCloudNative
 }
 
 func (s *Server) sourceHasActiveUploadReservations(ctx context.Context, tenantID string) (bool, error) {
@@ -983,8 +986,12 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 		}
 		return nil
 	}
-	if t.Provider == tenant.ProviderTiDBCloudNative && credentialReq == nil {
-		return tenant.ErrCredentialsRequired
+	if t.Provider == tenant.ProviderTiDBCloudNative {
+		var err error
+		credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
+		if err != nil {
+			return err
+		}
 	}
 	if t.Status != meta.TenantDeleting {
 		return s.cleanupFailedForkBranch(ctx, t, credentialReq)

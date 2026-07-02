@@ -34,7 +34,6 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/db9"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
-	"github.com/mem9-ai/drive9/pkg/tenant/starter"
 	"github.com/mem9-ai/drive9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/drive9/pkg/tenant/tidbzero"
 )
@@ -212,8 +211,6 @@ func main() {
 	switch providerType {
 	case tenant.ProviderTiDBZero:
 		provisioner, provisionerErr = tidbzero.NewProvisionerFromEnv()
-	case tenant.ProviderTiDBCloudStarter:
-		provisioner, provisionerErr = starter.NewProvisionerFromEnv()
 	case tenant.ProviderTiDBCloudNative:
 		provisioner, provisionerErr = tidbcloudnative.NewProvisionerFromEnv()
 	case tenant.ProviderDB9:
@@ -322,7 +319,7 @@ func main() {
 
 		// TODO: Run ValidateDurableAsyncExtractRequiresSemanticWorker only when this process
 		// can serve tenants that enqueue durable audio_extract_text / img_extract_text
-		// (database auto-embedding: tidb_zero, tidb_cloud_starter). pool != nil is too broad
+		// (database auto-embedding: tidb_zero, tidb_cloud_native). pool != nil is too broad
 		// for db9-only pools, which never hit that path but still get forced to configure
 		// DRIVE9_EMBED_* when async extract is wired on the template (PR #159 review).
 		if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
@@ -505,7 +502,7 @@ func usage(out io.Writer, exitCode int) {
 	_, _ = fmt.Fprintf(out, `usage:
   drive9-server [listen-addr]
   drive9-server version
-  drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_starter|tidb_cloud_native>
+  drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_native>
 
 environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
@@ -550,8 +547,8 @@ environment:
                                     required by openai, cohere, jina_ai, gemini, huggingface, nvidia_nim, nvidia
   DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE provider base endpoint for models that require it
                                      optional for openai models; set it for Azure OpenAI endpoints
-  DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter|tidb_cloud_native (default for provisioning)
-  DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default TiDB Cloud Cluster spendingLimit.monthly; optional for Starter, native defaults to 1000 when unset
+  DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_native (default for provisioning)
+  DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default TiDB Cloud Cluster spendingLimit.monthly; native defaults to 1000 when unset
   DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Cluster API base URL for tidb_cloud_native
   DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER cloud provider for tidb_cloud_native cluster creation, e.g. aws
   DRIVE9_TIDBCLOUD_NATIVE_REGION region for tidb_cloud_native cluster creation, e.g. us-east-1
@@ -633,7 +630,7 @@ environment:
 
   Audio extraction (async audio -> text for search; MVP durable path is TiDB auto-embedding only):
   Durable audio_extract_text tasks enqueue only for tenants with database auto-embedding
-  (tidb_zero / tidb_cloud_starter). For db9-only or other app-managed tenants these vars do
+  (tidb_zero / tidb_cloud_native). For db9-only or other app-managed tenants these vars do
   not enable that semantic_tasks pipeline. When enabled, explicit provider wiring is required:
   DRIVE9_AUDIO_EXTRACT_ENABLED true|false (default: false)
   DRIVE9_AUDIO_EXTRACT_MODE     openai|qwen-asr (default: openai)
@@ -647,7 +644,7 @@ environment:
 
 schema tooling:
   dump-init-sql writes the exact init schema SQL to stdout so external systems
-  such as tidb_cloud_starter can stay in sync with drive9's schema source of truth.
+  can stay in sync with drive9's schema source of truth.
 `, server.DefaultMaxUploadBytes, meta.DefaultMaxStorageBytes(), server.DefaultTenantPoolMaxSize)
 	os.Exit(exitCode)
 }

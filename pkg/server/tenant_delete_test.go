@@ -93,7 +93,12 @@ func newTenantDeleteRuntime(t *testing.T, provider string, scopeKind meta.APIKey
 	}); err != nil {
 		t.Fatal(err)
 	}
-	prov := &fakeProvisioner{provider: provider, cluster: &tenant.ClusterInfo{}}
+	prov := &fakeProvisioner{
+		provider:          provider,
+		cluster:           &tenant.ClusterInfo{},
+		defaultPublicKey:  "default-public",
+		defaultPrivateKey: "default-private",
+	}
 	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: prov, TokenSecret: tokenSecret})
 	t.Cleanup(server.Close)
 	return &tenantDeleteRuntime{
@@ -257,8 +262,8 @@ func TestTenantDeleteNativeSucceedsWithCredentials(t *testing.T) {
 	assertTenantDeletedAndKeysRevoked(t, rt)
 }
 
-func TestTenantDeleteStarterUsesServerCredentials(t *testing.T) {
-	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudStarter, meta.APIKeyScopeKindOwner)
+func TestTenantDeleteNativeUsesServerDefaultCredentials(t *testing.T) {
+	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudNative, meta.APIKeyScopeKindOwner)
 	resp := rt.deleteTenant(t, nil)
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusAccepted {
@@ -267,14 +272,14 @@ func TestTenantDeleteStarterUsesServerCredentials(t *testing.T) {
 	if got := rt.prov.deprovisionCalls.Load(); got != 1 {
 		t.Fatalf("deprovision calls = %d, want 1", got)
 	}
-	if rt.prov.lastCredentialReq.PublicKey != "" || rt.prov.lastCredentialReq.PrivateKey != "" {
-		t.Fatalf("starter delete should not use customer credentials: %+v", rt.prov.lastCredentialReq)
+	if rt.prov.lastCredentialReq.PublicKey != "default-public" || rt.prov.lastCredentialReq.PrivateKey != "default-private" {
+		t.Fatalf("native delete should use server default credentials: %+v", rt.prov.lastCredentialReq)
 	}
 	assertTenantDeletedAndKeysRevoked(t, rt)
 }
 
 func TestTenantDeleteWaitsForBorrowedBackendBeforeClusterDelete(t *testing.T) {
-	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudStarter, meta.APIKeyScopeKindOwner)
+	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudNative, meta.APIKeyScopeKindOwner)
 	ctx := context.Background()
 	tenantMeta, err := rt.meta.GetTenant(ctx, rt.tenantID)
 	if err != nil {
@@ -316,7 +321,7 @@ func TestTenantDeleteWaitsForBorrowedBackendBeforeClusterDelete(t *testing.T) {
 }
 
 func TestTenantDeleteRejectsNonDeletedFork(t *testing.T) {
-	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudStarter, meta.APIKeyScopeKindOwner)
+	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudNative, meta.APIKeyScopeKindOwner)
 	ctx := context.Background()
 	tenantMeta, err := rt.meta.GetTenant(ctx, rt.tenantID)
 	if err != nil {
@@ -372,7 +377,7 @@ func TestTenantDeleteRejectsNonDeletedFork(t *testing.T) {
 }
 
 func TestTenantDeleteRemovesS3PrefixAsyncAfterClusterDelete(t *testing.T) {
-	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudStarter, meta.APIKeyScopeKindOwner)
+	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudNative, meta.APIKeyScopeKindOwner)
 	ctx := context.Background()
 	payload := deterministicObjectGCPayload(8*1024*1024, 0x72)
 
@@ -416,7 +421,7 @@ func TestTenantDeleteRemovesS3PrefixAsyncAfterClusterDelete(t *testing.T) {
 }
 
 func TestTenantDeleteAsyncCleanupAbortsActiveMultipartUploads(t *testing.T) {
-	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudStarter, meta.APIKeyScopeKindOwner)
+	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudNative, meta.APIKeyScopeKindOwner)
 	ctx := context.Background()
 	payload := deterministicObjectGCPayload(8*1024*1024, 0x29)
 

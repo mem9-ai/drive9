@@ -11,7 +11,7 @@ import (
 )
 
 func TestSchemaDumpInitSQLByProvider(t *testing.T) {
-	for _, provider := range []string{"tidb_zero", "tidb_cloud_starter", "tidb_cloud_native"} {
+	for _, provider := range []string{"tidb_zero", "tidb_cloud_native"} {
 		t.Run(provider, func(t *testing.T) {
 			out := captureSchemaStdout(t, func() {
 				if err := runSchemaCommand([]string{"dump-init-sql", "--provider", provider}); err != nil {
@@ -39,7 +39,7 @@ func TestSchemaDumpInitSQLByProvider(t *testing.T) {
 }
 
 func TestSchemaDumpInitSQLByProviderIncludesVault(t *testing.T) {
-	for _, provider := range []string{"tidb_zero", "tidb_cloud_starter", "tidb_cloud_native"} {
+	for _, provider := range []string{"tidb_zero", "tidb_cloud_native"} {
 		t.Run(provider, func(t *testing.T) {
 			out := captureSchemaStdout(t, func() {
 				if err := runSchemaCommand([]string{"dump-init-sql", "--provider", provider}); err != nil {
@@ -110,7 +110,7 @@ func TestSchemaDumpInitSQLUsesTiDBAutoEmbeddingEnv(t *testing.T) {
 			}
 
 			out := captureSchemaStdout(t, func() {
-				if err := runSchemaCommand([]string{"dump-init-sql", "--provider", "tidb_cloud_starter"}); err != nil {
+				if err := runSchemaCommand([]string{"dump-init-sql", "--provider", "tidb_cloud_native"}); err != nil {
 					t.Fatalf("dump provider schema: %v", err)
 				}
 			})

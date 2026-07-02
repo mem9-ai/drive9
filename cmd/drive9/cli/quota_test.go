@@ -228,7 +228,7 @@ func TestQuotaSetRegionCodeSelectsTiDBCloudServer(t *testing.T) {
 	clearProvisionEnv(t)
 
 	var nativeHits int32
-	var starterHits int32
+	var anonymousHits int32
 	var gotBody map[string]any
 	native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&nativeHits, 1)
@@ -241,16 +241,16 @@ func TestQuotaSetRegionCodeSelectsTiDBCloudServer(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(quotaTestResponse("tenant-1"))
 	}))
 	defer native.Close()
-	starter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&starterHits, 1)
-		http.Error(w, "starter server should not be used", http.StatusInternalServerError)
+	anonymous := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&anonymousHits, 1)
+		http.Error(w, "anonymous server should not be used", http.StatusInternalServerError)
 	}))
-	defer starter.Close()
+	defer anonymous.Close()
 	manifest := newRegionManifestTestServer(t, []RegionManifestEntry{
 		{
 			RegionCode: "aws-us-east-1",
-			Mode:       RegionModeTiDBCloudStarter,
-			ServerURL:  starter.URL,
+			Mode:       RegionModeAnonymous,
+			ServerURL:  anonymous.URL,
 		},
 		{
 			RegionCode: "aws-us-east-1",
@@ -278,8 +278,8 @@ func TestQuotaSetRegionCodeSelectsTiDBCloudServer(t *testing.T) {
 	if atomic.LoadInt32(&nativeHits) != 1 {
 		t.Fatalf("native hits = %d, want 1", nativeHits)
 	}
-	if atomic.LoadInt32(&starterHits) != 0 {
-		t.Fatalf("starter hits = %d, want 0", starterHits)
+	if atomic.LoadInt32(&anonymousHits) != 0 {
+		t.Fatalf("anonymous hits = %d, want 0", anonymousHits)
 	}
 	if gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
 		t.Fatalf("body credentials = %#v", gotBody)

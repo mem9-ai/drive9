@@ -50,7 +50,7 @@ type PoolConfig struct {
 
 	// DisableDatabaseAutoEmbedding forces runtime DatabaseAutoEmbedding=false
 	// for all tenants, even when the provider normally enables it (tidb_zero,
-	// tidb_cloud_starter). It suppresses writes that would trigger DB-side
+	// tidb_cloud_native). It suppresses writes that would trigger DB-side
 	// EMBED_TEXT, but TiDB tenants still use the normal auto schema repair.
 	DisableDatabaseAutoEmbedding bool
 

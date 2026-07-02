@@ -1,12 +1,12 @@
-# Drive9 Tenant Provisioning Design (DB9 / TiDB Zero / TiDB Starter)
+# Drive9 Tenant Provisioning Design (DB9 / TiDB Zero / TiDB Cloud Native)
 
 ## 1. Goal and Scope
 
 This design defines how drive9 provisions a database for a new tenant, initializes the required schema, and stores connection credentials securely.
 
-- Support three provider options: `db9`, `tidb_zero`, `tidb_cloud_starter`
-- `db9` and `zero/starter` are peer options, selected by config
-- Provider selection is explicit only: `db9` / `tidb_zero` / `tidb_cloud_starter`
+- Support three provider options: `db9`, `tidb_zero`, `tidb_cloud_native`
+- `db9`, `tidb_zero`, and `tidb_cloud_native` are peer options, selected by config
+- Provider selection is explicit only: `db9` / `tidb_zero` / `tidb_cloud_native`
 - Tenant DB password must be encrypted with KMS before persistence
 
 ---
@@ -26,7 +26,7 @@ This design defines how drive9 provisions a database for a new tenant, initializ
 ### 3.1 Provisioning Flow
 
 1. API receives `CreateTenant`
-2. `TenantService` selects a provisioner (`db9` / `zero` / `starter`)
+2. `TenantService` selects a provisioner (`db9` / `zero` / `native`)
 3. Provisioner returns connection info (`host/port/user/password/dbname/cluster_id`)
 4. `SchemaInitializer` initializes drive9 schema (including FTS + Vector)
 5. `Encryptor(kms)` encrypts DB password
@@ -39,13 +39,13 @@ This design defines how drive9 provisions a database for a new tenant, initializ
 No automatic fallback. Provider is selected strictly by config:
 
 ```text
-DRIVE9_TENANT_PROVIDER=db9 | tidb_zero | tidb_cloud_starter
+DRIVE9_TENANT_PROVIDER=db9 | tidb_zero | tidb_cloud_native
 ```
 
 Behavior:
 - `db9`: use `DB9Provisioner` (if DB9 create API is unavailable, return error)
 - `tidb_zero`: use `TiDBZeroProvisioner`
-- `tidb_cloud_starter`: use `TiDBStarterProvisioner`
+- `tidb_cloud_native`: use `TiDBCloudNativeProvisioner`
 
 ---
 
@@ -87,7 +87,7 @@ DRIVE9_ENCRYPT_KEY=alias/drive9-<env>-db-password
 ```go
 type Provisioner interface {
     Provision(ctx context.Context, req ProvisionRequest) (*ClusterInfo, error)
-    ProviderType() string // db9 | tidb_zero | tidb_cloud_starter
+    ProviderType() string // db9 | tidb_zero | tidb_cloud_native
 }
 
 type ClusterInfo struct {
@@ -303,7 +303,7 @@ CREATE TABLE IF NOT EXISTS tenants (
   db_tls           TINYINT(1)    NOT NULL DEFAULT 1,
 
   -- Provision metadata
-  provider         VARCHAR(50)   NOT NULL,  -- db9|tidb_zero|tidb_cloud_starter
+  provider         VARCHAR(50)   NOT NULL,  -- db9|tidb_zero|tidb_cloud_native
   cluster_id       VARCHAR(255)  NULL,
   claim_url        TEXT          NULL,
   claim_expires_at TIMESTAMP     NULL,
@@ -359,7 +359,7 @@ Read/write rules:
 
 ```bash
 # provider selection
-DRIVE9_TENANT_PROVIDER=db9|tidb_zero|tidb_cloud_starter
+DRIVE9_TENANT_PROVIDER=db9|tidb_zero|tidb_cloud_native
 
 # encryption
 DRIVE9_ENCRYPT_TYPE=kms
@@ -372,11 +372,12 @@ DRIVE9_DB9_API_KEY=<token>
 # tidb zero
 DRIVE9_ZERO_API_URL=https://<zero-api>
 
-# tidb starter
-DRIVE9_TIDBCLOUD_API_URL=https://<tidb-cloud-api>
-DRIVE9_TIDBCLOUD_API_KEY=<key>
-DRIVE9_TIDBCLOUD_API_SECRET=<secret>
-DRIVE9_TIDBCLOUD_POOL_ID=<pool-id>
+# tidb cloud native
+DRIVE9_TIDBCLOUD_NATIVE_API_URL=https://<tidb-cloud-api>
+DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY=<public-key>
+DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY=<private-key>
+DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER=<cloud-provider>
+DRIVE9_TIDBCLOUD_NATIVE_REGION=<region>
 DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT=<non-negative-integer-usd-cents>
 # Example: 500 means $5.00. Negative and non-integer values are rejected.
 

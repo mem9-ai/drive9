@@ -147,7 +147,7 @@ func Create(args []string) error {
 		return err
 	}
 
-	if mode == RegionModeTiDBCloudStarter {
+	if mode == RegionModeAnonymous {
 		fmt.Fprintf(os.Stderr, "Note: Anonymous mode in drive9 transfers data management rights to PingCAP.\n")
 	}
 
@@ -231,8 +231,8 @@ func Create(args []string) error {
 }
 
 const (
-	RegionModeTiDBCloudNative  = "tidb_cloud_native"
-	RegionModeTiDBCloudStarter = "tidb_cloud_starter"
+	RegionModeAnonymous       = "anonymous"
+	RegionModeTiDBCloudNative = "tidb_cloud_native"
 
 	ModeLabelAnonymous = "Anonymous"
 	ModeLabelTiDBCloud = "TiDBCloud"
@@ -296,7 +296,7 @@ func provisionModeForCredentials(publicKey, privateKey string) string {
 	if strings.TrimSpace(publicKey) != "" || strings.TrimSpace(privateKey) != "" {
 		return RegionModeTiDBCloudNative
 	}
-	return RegionModeTiDBCloudStarter
+	return RegionModeAnonymous
 }
 
 func provisionRequestBody(publicKey, privateKey string, tidbCloudSpendingLimit *int64) (io.Reader, error) {

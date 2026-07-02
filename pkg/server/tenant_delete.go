@@ -61,7 +61,7 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusConflict, "tidb_zero tenants expire automatically and do not support delete")
 		return
 	}
-	if t.Provider != tenant.ProviderTiDBCloudStarter && t.Provider != tenant.ProviderTiDBCloudNative {
+	if t.Provider != tenant.ProviderTiDBCloudNative {
 		errJSON(w, http.StatusConflict, "tenant delete is not supported for provider")
 		return
 	}
@@ -190,12 +190,6 @@ func (s *Server) deprovisionTenantCluster(ctx context.Context, t *meta.Tenant, r
 			return fmt.Errorf("provisioner does not support credential deprovision")
 		}
 		return deprovisioner.DeprovisionWithCredentials(ctx, cluster, req)
-	case tenant.ProviderTiDBCloudStarter:
-		deprovisioner, ok := s.provisioner.(tenant.Deprovisioner)
-		if !ok {
-			return fmt.Errorf("provisioner does not support deprovision")
-		}
-		return deprovisioner.Deprovision(ctx, cluster)
 	default:
 		return fmt.Errorf("delete is not supported for provider %s", t.Provider)
 	}

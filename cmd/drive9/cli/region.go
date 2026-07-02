@@ -26,12 +26,12 @@ var fallbackRegionManifest = RegionManifest{
 	Service: "drive9",
 	Default: &RegionManifestDefault{
 		RegionCode: "aws-ap-southeast-1",
-		Mode:       RegionModeTiDBCloudStarter,
+		Mode:       RegionModeAnonymous,
 	},
 	Regions: []RegionManifestEntry{
 		{
 			RegionCode:    "aws-ap-southeast-1",
-			Mode:          RegionModeTiDBCloudStarter,
+			Mode:          RegionModeAnonymous,
 			ServerURL:     defaultServerURL,
 			CloudProvider: "aws",
 			TiDBRegion:    "ap-southeast-1",
@@ -255,7 +255,7 @@ func sortRegionManifestEntries(entries []RegionManifestEntry) {
 
 func regionModeLabel(mode string) string {
 	switch strings.TrimSpace(mode) {
-	case RegionModeTiDBCloudStarter:
+	case RegionModeAnonymous:
 		return ModeLabelAnonymous
 	case RegionModeTiDBCloudNative:
 		return ModeLabelTiDBCloud
@@ -266,7 +266,7 @@ func regionModeLabel(mode string) string {
 
 func quotaExceededMessage(mode string) string {
 	switch strings.TrimSpace(mode) {
-	case "", ModeLabelAnonymous, RegionModeTiDBCloudStarter:
+	case "", ModeLabelAnonymous, RegionModeAnonymous:
 		return "tenant usage quota exceeded. Switch to TiDBCloud Mode with drive9 create --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>. Use drive9 region list to see available regions"
 	case ModeLabelTiDBCloud, RegionModeTiDBCloudNative:
 		return "tenant usage quota exceeded. Go to your TiDB Cloud cluster settings page and set a monthly Spending Limit"

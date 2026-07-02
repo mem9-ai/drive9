@@ -296,5 +296,5 @@ The reduced proposal leaves no open question that blocks the launch boundary. It
 - `drive9-2/pkg/datastore/search.go`
 - `drive9-2/pkg/datastore/file_tx.go`
 - `drive9-2/pkg/server/semantic_worker.go`
-- `drive9-2/pkg/tenant/schema_zero.go`
-- `drive9-2/pkg/tenant/starter.go`
+- `drive9-2/pkg/tenant/schema/tidb_auto.go`
+- `drive9-2/pkg/tenant/tidbcloudnative/provisioner.go`
