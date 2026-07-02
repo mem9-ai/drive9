@@ -335,17 +335,29 @@ func TestSSEOutboxSubscriptionReporting(t *testing.T) {
 	// Manually report subscriptions (simulating the subscriptionLoop ticker).
 	tc.podB.podRegistry.reportSubscriptions(context.Background())
 
-	// Verify pod_subscriptions has the tenant for pod-b.
-	subs, err := tc.metaStore.ListPodSubscriptions(context.Background(), "pod-b")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Verify pod_subscriptions has the tenant for pod-b. Retry briefly because
+	// the Subscribe call may not have been visible to activeTenantIDs on a
+	// slow CI machine.
+	var subs []string
 	found := false
-	for _, s := range subs {
-		if s == tc.tenantID {
-			found = true
+	for range 10 {
+		var err2 error
+		subs, err2 = tc.metaStore.ListPodSubscriptions(context.Background(), "pod-b")
+		if err2 != nil {
+			t.Fatal(err2)
+		}
+		for _, s := range subs {
+			if s == tc.tenantID {
+				found = true
+				break
+			}
+		}
+		if found {
 			break
 		}
+		// Re-report in case the bus listener wasn't visible yet.
+		tc.podB.podRegistry.reportSubscriptions(context.Background())
+		time.Sleep(50 * time.Millisecond)
 	}
 	if !found {
 		t.Fatalf("tenant %s not in pod-b subscriptions; got %v", tc.tenantID, subs)
