@@ -210,4 +210,24 @@ func (pr *podRegistry) SweepStalePods(ctx context.Context) {
 		logger.Info(ctx, "pod_registry_deleted_stale_subscriptions",
 			zap.Int64("deleted_rows", deleted))
 	}
+	// Clean up outbox cursor rows for stale pods. Without this, a dead pod's
+	// stale cursor holds back outbox pruning (DeleteTenantNotifyBefore uses
+	// MIN(last_id) across all cursors). Best-effort: errors are logged and
+	// retried next sweep.
+	stalePods, err := pr.metaStore.ListStalePods(ctx)
+	if err != nil {
+		logger.Warn(ctx, "pod_registry_list_stale_pods_failed", zap.Error(err))
+		return
+	}
+	for _, podID := range stalePods {
+		if err := pr.metaStore.DeleteTenantOutboxCursor(ctx, podID); err != nil {
+			logger.Warn(ctx, "pod_registry_delete_stale_cursor_failed",
+				zap.String("pod_id", podID), zap.Error(err))
+			continue
+		}
+	}
+	if len(stalePods) > 0 {
+		logger.Info(ctx, "pod_registry_deleted_stale_cursors",
+			zap.Int("count", len(stalePods)))
+	}
 }
