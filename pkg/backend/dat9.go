@@ -1310,6 +1310,17 @@ func (b *Dat9Backend) ReadDir(path string) ([]filesystem.FileInfo, error) {
 }
 
 func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []filesystem.FileInfo, err error) {
+	return b.readDirCtx(ctx, path, "", 0)
+}
+
+func (b *Dat9Backend) ReadDirPageCtx(ctx context.Context, path, afterName string, limit int) (infos []filesystem.FileInfo, err error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("read dir page limit must be positive")
+	}
+	return b.readDirCtx(ctx, path, afterName, limit)
+}
+
+func (b *Dat9Backend) readDirCtx(ctx context.Context, path, afterName string, limit int) (infos []filesystem.FileInfo, err error) {
 	start := time.Now()
 	var canonicalPath string
 	var listDuration time.Duration
@@ -1318,6 +1329,8 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 		fields := []zap.Field{
 			zap.String("path", path),
 			zap.String("canonical_path", canonicalPath),
+			zap.String("after_name", afterName),
+			zap.Int("limit", limit),
 			zap.Int("entries", len(infos)),
 			zap.Float64("list_dir_ms", float64(listDuration.Microseconds())/1000.0),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0),
@@ -1337,7 +1350,12 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 		zap.String("path", path),
 		zap.String("canonical_path", dirPath))
 	listStart := time.Now()
-	entries, err := b.store.ListDir(ctx, dirPath)
+	var entries []*datastore.NodeWithFile
+	if limit > 0 {
+		entries, err = b.store.ListDirPage(ctx, dirPath, afterName, limit)
+	} else {
+		entries, err = b.store.ListDir(ctx, dirPath)
+	}
 	listDuration = time.Since(listStart)
 	if err != nil {
 		return nil, err

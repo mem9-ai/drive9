@@ -297,6 +297,130 @@ func TestListDir(t *testing.T) {
 	requireEmbeddingRevision(t, entries[0].File.EmbeddingRevision, 13)
 }
 
+func TestListDirPageKeyset(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	empty, err := s.ListDirPage(context.Background(), "/empty/", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty page len = %d, want 0", len(empty))
+	}
+
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "single-dir", Path: "/single/", ParentPath: "/", Name: "single", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{
+		NodeID:      "single-only",
+		Path:        "/single/only/",
+		ParentPath:  "/single/",
+		Name:        "only",
+		IsDirectory: true,
+		CreatedAt:   now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	single, err := s.ListDirPage(context.Background(), "/single/", "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nodeNames(single); !reflect.DeepEqual(got, []string{"only"}) {
+		t.Fatalf("single page names = %v", got)
+	}
+
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "page-dir", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"c", "a", "d", "b"} {
+		if err := s.InsertNode(context.Background(), &FileNode{
+			NodeID:      "page-" + name,
+			Path:        "/data/" + name + "/",
+			ParentPath:  "/data/",
+			Name:        name,
+			IsDirectory: true,
+			CreatedAt:   now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	all, err := s.ListDir(context.Background(), "/data/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nodeNames(all); !reflect.DeepEqual(got, []string{"a", "b", "c", "d"}) {
+		t.Fatalf("ListDir names = %v", got)
+	}
+
+	page, err := s.ListDirPage(context.Background(), "/data/", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nodeNames(page); !reflect.DeepEqual(got, []string{"a", "b"}) {
+		t.Fatalf("first page names = %v", got)
+	}
+
+	page, err = s.ListDirPage(context.Background(), "/data/", "b", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nodeNames(page); !reflect.DeepEqual(got, []string{"c", "d"}) {
+		t.Fatalf("second page names = %v", got)
+	}
+
+	page, err = s.ListDirPage(context.Background(), "/data/", "d", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 0 {
+		t.Fatalf("after last page len = %d, want 0", len(page))
+	}
+
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "special-dir", Path: "/special/", ParentPath: "/", Name: "special", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	specialNames := []string{"01 space name", "02 hash#name", "03 percent%name", "04 中文"}
+	for _, name := range specialNames {
+		if err := s.InsertNode(context.Background(), &FileNode{
+			NodeID:      "special-" + name,
+			Path:        "/special/" + name + "/",
+			ParentPath:  "/special/",
+			Name:        name,
+			IsDirectory: true,
+			CreatedAt:   now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	special, err := s.ListDirPage(context.Background(), "/special/", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nodeNames(special); !reflect.DeepEqual(got, specialNames[:2]) {
+		t.Fatalf("special first page names = %v", got)
+	}
+	special, err = s.ListDirPage(context.Background(), "/special/", specialNames[1], 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nodeNames(special); !reflect.DeepEqual(got, specialNames[2:]) {
+		t.Fatalf("special second page names = %v", got)
+	}
+
+	if _, err := s.ListDirPage(context.Background(), "/data/", "", 0); err == nil {
+		t.Fatal("ListDirPage limit=0 succeeded, want error")
+	}
+}
+
+func nodeNames(entries []*NodeWithFile) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Node.Name)
+	}
+	return names
+}
+
 func TestInsertNodeRejectsRootDentry(t *testing.T) {
 	s := newTestStore(t)
 	for _, name := range []string{"/", "root-alias"} {

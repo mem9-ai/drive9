@@ -260,6 +260,35 @@ func TestBatchReadSmallCtxRejectsPathMismatch(t *testing.T) {
 	}
 }
 
+func TestListPageSendsExplicitPagination(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/v1/fs/data/" {
+			t.Errorf("path = %s, want /v1/fs/data/", r.URL.Path)
+		}
+		q := r.URL.Query()
+		if q.Get("list") != "1" || q.Get("limit") != "2" || q.Get("cursor") != "cursor-1" {
+			t.Errorf("query = %q", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"entries":[{"name":"a.txt","size":1}],"next_cursor":"cursor-2"}`)
+	}))
+	defer ts.Close()
+
+	result, err := New(ts.URL, "key").ListPage("/data/", 2, "cursor-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.NextCursor != "cursor-2" {
+		t.Fatalf("next cursor = %q", result.NextCursor)
+	}
+	if len(result.Entries) != 1 || result.Entries[0].Name != "a.txt" || result.Entries[0].Size != 1 {
+		t.Fatalf("entries = %+v", result.Entries)
+	}
+}
+
 func TestStat(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()

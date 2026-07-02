@@ -155,6 +155,8 @@ func TestIsScopedBusinessRequestAllowed(t *testing.T) {
 		}{
 			{http.MethodGet, "/v1/fs/main.txt", ""},
 			{http.MethodGet, "/v1/fs/dir/", "list=1"},
+			{http.MethodGet, "/v1/fs/dir/", "list=1&limit=100"},
+			{http.MethodGet, "/v1/fs/dir/", "list=1&limit=100&cursor=opaque"},
 			{http.MethodGet, "/v1/fs/dir/file.txt", "stat=1"},
 			{http.MethodGet, "/v1/fs/dir/", "grep=hello"},
 			// Regression for @adversary-1 msg 00efe734: grep + limit must
