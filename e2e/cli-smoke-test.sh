@@ -460,27 +460,29 @@ printf "top-%s" "$TS" > "$recursive_local_root/top.txt"
 printf "nested-%s" "$TS" > "$recursive_local_root/sub/nested.txt"
 printf "leaf-%s" "$TS" > "$recursive_local_root/sub/deep/leaf.txt"
 
-# Upload local tree → remote via cp -r (local→remote).
+# Upload local tree → remote via cp -r (local→remote). The remote dir
+# receives the source's CONTENTS, so $RECURSIVE_REMOTE/top.txt etc.
 drive9_retry fs cp -r "$recursive_local_root" ":$RECURSIVE_REMOTE" >/dev/null
 
-# Download remote tree → local via cp -r (remote→local).
+# Download remote tree → local via cp -r (remote→local). The local dir
+# receives the source's CONTENTS, so files land at $RECURSIVE_DOWNLOADED/
+# (not $RECURSIVE_DOWNLOADED/recursive-root/).
 drive9_retry fs cp -r ":$RECURSIVE_REMOTE" "$RECURSIVE_DOWNLOADED" >/dev/null
 
 # Verify every leaf file round-tripped byte-identically.
-recursive_dl_root="$RECURSIVE_DOWNLOADED/recursive-root"
 check_eq "cp -r round-trip top.txt content" \
-  "$(cat "$recursive_dl_root/top.txt")" "top-${TS}"
+  "$(cat "$RECURSIVE_DOWNLOADED/top.txt")" "top-${TS}"
 check_eq "cp -r round-trip nested.txt content" \
-  "$(cat "$recursive_dl_root/sub/nested.txt")" "nested-${TS}"
+  "$(cat "$RECURSIVE_DOWNLOADED/sub/nested.txt")" "nested-${TS}"
 check_eq "cp -r round-trip leaf.txt content" \
-  "$(cat "$recursive_dl_root/sub/deep/leaf.txt")" "leaf-${TS}"
+  "$(cat "$RECURSIVE_DOWNLOADED/sub/deep/leaf.txt")" "leaf-${TS}"
 
 # Verify the empty directory was preserved.
-check_cmd "cp -r preserves empty dir" test -d "$recursive_dl_root/empty"
+check_cmd "cp -r preserves empty dir" test -d "$RECURSIVE_DOWNLOADED/empty"
 
 # Verify nested dir structure matches.
-check_cmd "cp -r preserves nested sub dir" test -d "$recursive_dl_root/sub"
-check_cmd "cp -r preserves nested deep dir" test -d "$recursive_dl_root/sub/deep"
+check_cmd "cp -r preserves nested sub dir" test -d "$RECURSIVE_DOWNLOADED/sub"
+check_cmd "cp -r preserves nested deep dir" test -d "$RECURSIVE_DOWNLOADED/sub/deep"
 
 # Also verify the remote tree is listable.
 recursive_remote_ls="$(drive9_retry fs ls "$RECURSIVE_REMOTE/")"
