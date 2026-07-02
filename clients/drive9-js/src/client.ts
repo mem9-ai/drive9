@@ -100,6 +100,7 @@ import {
   writeStreamImpl,
   writeStreamWithSummaryImpl,
 } from "./transfer.js";
+import { Semaphore } from "./utils.js";
 import {
   createVaultSecret,
   deleteVaultSecret,
@@ -120,6 +121,7 @@ import { watchEvents, watchEventsWithLifecycle } from "./events.js";
 
 const DEFAULT_SMALL_FILE_THRESHOLD = 50_000;
 const DEFAULT_SERVER = "https://api.drive9.ai";
+const DOWNLOAD_DIR_CONCURRENCY = 16;
 
 interface Drive9Config {
   server?: string;
@@ -620,6 +622,108 @@ export class Client {
     });
   }
 
+  /**
+   * Download an entire remote directory tree to a local directory.
+   *
+   * The local directory is created if it does not exist; if it exists it
+   * must be a directory. Any pre-existing descendant path is treated as
+   * a conflict and aborts the download before any file is written, so
+   * downloadDir never overwrites or truncates existing local files.
+   * Symlinks in the remote tree are rejected.
+   *
+   * Mirrors the Go SDK's Client.DownloadDirCtx and the CLI's
+   * `drive9 fs cp -r` remote→local path.
+   */
+  async downloadDir(remotePath: string, localPath: string): Promise<void> {
+    // Source must exist and be a directory.
+    const info = await this.stat(remotePath);
+    if (!info.isDir) {
+      throw new Drive9Error(`downloadDir requires a directory source; ${remotePath} is a file`);
+    }
+
+    // Walk the remote tree via list() BFS, collecting relative dirs and
+    // files BEFORE touching the local filesystem so a malformed listing
+    // or transport error can't leave a partial dst dir.
+    const dirs: string[] = []; // relative (slash-separated) dir paths
+    const files: { remote: string; rel: string }[] = []; // relative file paths
+    const queue: string[] = [""]; // relative paths to expand; "" = root
+    while (queue.length > 0) {
+      const rel = queue.shift()!;
+      const absDir = rel === "" ? remotePath : `${remotePath}/${rel}`;
+      const entries = await this.list(absDir);
+      for (const e of entries) {
+        const childRel = rel === "" ? e.name : `${rel}/${e.name}`;
+        // Reject entry names that could escape localPath.
+        joinLocalSafe(localPath, childRel);
+        if (e.isDir) {
+          dirs.push(childRel);
+          queue.push(childRel);
+        } else {
+          files.push({ remote: `${remotePath}/${childRel}`, rel: childRel });
+        }
+      }
+    }
+
+    // Pre-resolve every local destination path using joinLocalSafe so
+    // a malicious/malformed remote name (e.g. "../escape.txt") cannot
+    // escape localPath.
+    const dstFiles = files.map((f) => ({
+      remote: f.remote,
+      local: joinLocalSafe(localPath, f.rel),
+    }));
+    const dstDirs = dirs.map((d) => joinLocalSafe(localPath, d));
+
+    // Destination root preflight.
+    let dstExists = false;
+    try {
+      const dstInfo = fs.statSync(localPath);
+      dstExists = true;
+      if (!dstInfo.isDirectory()) {
+        throw new Drive9Error(`local destination ${localPath} exists and is not a directory`);
+      }
+    } catch (err: unknown) {
+      if (!isNodeError(err, "ENOENT")) throw err;
+    }
+
+    // Descendant preflight: any pre-existing dir/file under localPath
+    // is a conflict. Uses lstatSync (not statSync) so a pre-existing
+    // symlink also counts as a conflict — we don't want to follow a
+    // symlink into someone else's directory.
+    preflightLocalDestinations([...dstDirs, ...dstFiles.map((f) => f.local)]);
+
+    // Create dst root if needed.
+    if (!dstExists) {
+      fs.mkdirSync(localPath, { recursive: true });
+    }
+
+    // Create descendant dirs in parent-before-child order (sorted by
+    // path length). Empty dirs are preserved.
+    dstDirs.sort((a, b) => a.length - b.length);
+    for (const d of dstDirs) {
+      fs.mkdirSync(d, { recursive: true });
+    }
+
+    // Bounded-parallel download. Sibling failures are collected; the
+    // first error is re-thrown after all in-flight downloads settle.
+    const sem = new Semaphore(DOWNLOAD_DIR_CONCURRENCY);
+    const errors: unknown[] = [];
+    await Promise.all(
+      dstFiles.map(async (f) => {
+        await sem.acquire();
+        try {
+          await this.downloadToFile(f.remote, f.local);
+        } catch (err) {
+          errors.push(err);
+        } finally {
+          sem.release();
+        }
+      })
+    );
+    if (errors.length > 0) {
+      throw errors[0];
+    }
+  }
+
   async resumeUpload(path: string, data: Uint8Array): Promise<void> {
     return resumeUploadImpl(this, path, data);
   }
@@ -859,4 +963,52 @@ export class Client {
   async verifyJournal(journalId: string): Promise<JournalVerifyResult> {
     return verifyJournal(this, journalId);
   }
+}
+
+// joinLocalSafe joins a local base with a slash-separated relative
+// segment, rejecting anything that would escape the base (`..`,
+// absolute segments). This is needed because `rel` originates from
+// server-supplied directory listings: a misbehaving or compromised
+// server could return entry names like "../etc/passwd" and a naive
+// path.join would write outside localPath.
+function joinLocalSafe(base: string, rel: string): string {
+  if (rel === "" || rel === ".") return base;
+  if (rel.startsWith("/")) {
+    throw new Drive9Error(`relative segment must not start with /: ${rel}`);
+  }
+  for (const seg of rel.split("/")) {
+    if (seg === "..") {
+      throw new Drive9Error(`relative segment must not contain ..: ${rel}`);
+    }
+  }
+  const joined = path.join(base, rel);
+  const cleanBase = path.resolve(base);
+  if (cleanBase !== "" && !joined.startsWith(cleanBase + path.sep) && joined !== cleanBase) {
+    throw new Drive9Error(`computed path ${joined} escapes base ${base}`);
+  }
+  return joined;
+}
+
+// preflightLocalDestinations checks every local destination path with
+// lstatSync. Any path that exists aborts the download before any
+// mkdir/download.
+function preflightLocalDestinations(paths: string[]): void {
+  const seen = new Set<string>();
+  for (const p of paths) {
+    if (seen.has(p)) continue;
+    seen.add(p);
+    try {
+      fs.lstatSync(p);
+      throw new Drive9Error(`local destination ${p} already exists; downloadDir refuses to overwrite`);
+    } catch (err: unknown) {
+      if (!isNodeError(err, "ENOENT")) throw err;
+    }
+  }
+}
+
+// isNodeError reports whether `err` is a Node.js filesystem error with
+// the given code (e.g. "ENOENT"). Used to distinguish "path does not
+// exist" from other stat/lstat failures.
+function isNodeError(err: unknown, code: string): boolean {
+  return err instanceof Error && (err as NodeJS.ErrnoException).code === code;
 }

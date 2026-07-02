@@ -1,4 +1,7 @@
 import { Client, StreamWriter } from "../src/index.js";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 
 export const coveredClientMethods = new Set([
   "appendJournalEntries",
@@ -23,6 +26,7 @@ export const coveredClientMethods = new Set([
   "deleteGitWorkspace",
   "deleteVaultSecret",
   "diffFSLayer",
+  "downloadDir",
   "downloadToFile",
   "find",
   "fsUrl",
@@ -121,6 +125,8 @@ export async function filesystemCookbook(client: Client): Promise<void> {
   await client.batchReadSmall(["/sdk-ts/hello.txt"], 64 * 1024);
   await client.grep("hello", "/sdk-ts/", 10);
   await client.find("/sdk-ts/", { type: "file" });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "drive9-cookbook-"));
+  await client.downloadDir("/sdk-ts/", tmpDir);
   await client.removeAll("/sdk-ts/");
 }
 
