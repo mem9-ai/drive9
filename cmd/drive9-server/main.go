@@ -34,6 +34,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/db9"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
+	"github.com/mem9-ai/drive9/pkg/tenant/starter"
 	"github.com/mem9-ai/drive9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/drive9/pkg/tenant/tidbzero"
 )
@@ -230,6 +231,16 @@ func main() {
 		logger.Info(context.Background(), "provisioner_configured", zap.String("provider", providerType))
 	}
 
+	var legacyStarterProvisioner tenant.Provisioner
+	if legacy, err := starter.NewLegacyProvisionerFromEnv(); err != nil {
+		if starter.LegacyEnvPresent() {
+			logger.Warn(context.Background(), "legacy_starter_provisioner_not_configured", zap.Error(err))
+		}
+	} else {
+		legacyStarterProvisioner = legacy
+		logger.Info(context.Background(), "legacy_starter_provisioner_configured")
+	}
+
 	var vaultMasterKey []byte
 	if vaultMKHex != "" {
 		vaultMasterKey, err = hex.DecodeString(vaultMKHex)
@@ -326,6 +337,7 @@ func main() {
 			Meta:                         store,
 			Pool:                         pool,
 			Provisioner:                  provisioner,
+			LegacyStarterProvisioner:     legacyStarterProvisioner,
 			TokenSecret:                  tokenSecret,
 			VaultMasterKey:               vaultMasterKey,
 			S3Dir:                        s3cfg.Dir,
@@ -390,6 +402,7 @@ func main() {
 		Meta:                         store,
 		Pool:                         pool,
 		Provisioner:                  provisioner,
+		LegacyStarterProvisioner:     legacyStarterProvisioner,
 		TokenSecret:                  tokenSecret,
 		VaultMasterKey:               vaultMasterKey,
 		VaultIssuerURL:               vaultIssuerURL(addr),

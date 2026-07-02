@@ -15,14 +15,16 @@ func TestNormalizeProvider(t *testing.T) {
 	if _, err := NormalizeProvider("bad-provider"); err == nil {
 		t.Fatal("expected error for invalid provider")
 	}
+	if _, err := NormalizeProvider(ProviderTiDBCloudStarterLegacy); err == nil {
+		t.Fatal("legacy starter provider should not be accepted for new provisioning")
+	}
 }
 
 func TestSmallInDB(t *testing.T) {
-	if !SmallInDB(ProviderTiDBZero) {
-		t.Fatal("tidb_zero should store small files in db")
-	}
-	if !SmallInDB(ProviderTiDBCloudNative) {
-		t.Fatal("tidb_cloud_native should store small files in db")
+	for _, provider := range []string{ProviderTiDBZero, ProviderTiDBCloudNative, ProviderTiDBCloudStarterLegacy} {
+		if !SmallInDB(provider) {
+			t.Fatalf("%s should store small files in db", provider)
+		}
 	}
 	if SmallInDB(ProviderDB9) {
 		t.Fatal("db9 should not store small files in db")
@@ -30,12 +32,25 @@ func TestSmallInDB(t *testing.T) {
 }
 
 func TestUsesTiDBAutoEmbedding(t *testing.T) {
-	for _, provider := range []string{ProviderTiDBZero, ProviderTiDBCloudNative} {
+	for _, provider := range []string{ProviderTiDBZero, ProviderTiDBCloudNative, ProviderTiDBCloudStarterLegacy} {
 		if !UsesTiDBAutoEmbedding(provider) {
 			t.Fatalf("provider %s should use TiDB auto-embedding mode", provider)
 		}
 	}
 	if UsesTiDBAutoEmbedding(ProviderDB9) {
 		t.Fatal("db9 should remain on app-managed embedding")
+	}
+}
+
+func TestSupportsClusterDelete(t *testing.T) {
+	for _, provider := range []string{ProviderTiDBCloudNative, ProviderTiDBCloudStarterLegacy} {
+		if !SupportsClusterDelete(provider) {
+			t.Fatalf("%s should support cluster delete", provider)
+		}
+	}
+	for _, provider := range []string{ProviderDB9, ProviderTiDBZero} {
+		if SupportsClusterDelete(provider) {
+			t.Fatalf("%s should not support cluster delete", provider)
+		}
 	}
 }

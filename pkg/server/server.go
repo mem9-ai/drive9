@@ -42,18 +42,22 @@ import (
 )
 
 type Config struct {
-	Meta              *meta.Store
-	Pool              *tenant.Pool
-	Provisioner       tenant.Provisioner
-	TokenSecret       []byte
-	LocalTenantAPIKey string
-	VaultMasterKey    []byte // 32-byte AES key for vault DEK wrapping; nil disables vault
-	VaultIssuerURL    string // canonical server URL placed in grant `iss` claim; empty = server hostname unknown, grants disabled
-	PublicURL         string // externally reachable base URL for client responses (e.g., slock callback server_url)
-	Backend           *backend.Dat9Backend
-	LocalS3           *s3client.LocalS3Client
-	S3Dir             string
-	MaxUploadBytes    int64
+	Meta        *meta.Store
+	Pool        *tenant.Pool
+	Provisioner tenant.Provisioner
+	// LegacyStarterProvisioner is only used for delete/fork compatibility on
+	// persisted tidb_cloud_starter tenants. New starter provisioning remains
+	// disabled and NormalizeProvider does not accept tidb_cloud_starter.
+	LegacyStarterProvisioner tenant.Provisioner
+	TokenSecret              []byte
+	LocalTenantAPIKey        string
+	VaultMasterKey           []byte // 32-byte AES key for vault DEK wrapping; nil disables vault
+	VaultIssuerURL           string // canonical server URL placed in grant `iss` claim; empty = server hostname unknown, grants disabled
+	PublicURL                string // externally reachable base URL for client responses (e.g., slock callback server_url)
+	Backend                  *backend.Dat9Backend
+	LocalS3                  *s3client.LocalS3Client
+	S3Dir                    string
+	MaxUploadBytes           int64
 	// TenantPoolMaxSize caps admin tenant pool create/update target size. Values
 	// <= 0 are normalized to DefaultTenantPoolMaxSize; the pool is never
 	// intentionally uncapped.
@@ -100,10 +104,10 @@ type Config struct {
 	// authentication. When set, the pod-to-pod push path is enabled; when nil,
 	// only the 200ms poller fallback is used (no push).
 	SSENotifyPollInterval time.Duration
-	SSENotifyRetention     time.Duration
-	PodID                  string
-	PodAddr                string
-	PodNotifySecret        []byte
+	SSENotifyRetention    time.Duration
+	PodID                 string
+	PodAddr               string
+	PodNotifySecret       []byte
 }
 
 type SlockOAuthClient interface {
@@ -140,39 +144,51 @@ type nativeSystemUserProvisioner interface {
 	EnsureSystemUser(ctx context.Context, dsn, tenantID string) (username, password string, err error)
 }
 
+func (s *Server) provisionerForTenantProvider(provider string) tenant.Provisioner {
+	switch provider {
+	case tenant.ProviderTiDBCloudStarterLegacy:
+		return s.legacyStarterProvisioner
+	case tenant.ProviderTiDBCloudNative:
+		return s.provisioner
+	default:
+		return s.provisioner
+	}
+}
+
 type Server struct {
-	fallback              *backend.Dat9Backend
-	meta                  *meta.Store
-	pool                  *tenant.Pool
-	provisioner           tenant.Provisioner
-	tokenSecret           []byte
-	localTenantAPIKey     string
-	vaultMK               *vault.MasterKey
-	vaultIssuerURL        string
-	publicURL             string
-	maxUploadBytes        int64
-	tenantPoolMaxSize     int
-	inlineThreshold       int64
-	metrics               *serverMetrics
-	logger                *zap.Logger
-	mux                   *http.ServeMux
-	events                *eventBuses
-	semanticWorker        *semanticWorkerManager
-	journalCursorSecret   []byte
-	objectGCWorker        *objectGCWorker
-	slockOAuth            SlockOAuthClient
-	tidbAutoEmbedding     tenantAutoEmbeddingDefault
-	disableDBAutoEmbed    bool
-	forkWorkerCtx         context.Context
-	forkWorkerCancel      context.CancelFunc
-	forkWorkerWG          sync.WaitGroup
-	forkWorkerMu          sync.Mutex
-	forkWorkerClosed      bool
-	tenantPoolLocks       sync.Map
-	tenantPoolCreateLocks sync.Map
-	tenantPoolResumeJobs  sync.Map
-	schemaInitErrors      sync.Map
-	leader                *leader.Manager
+	fallback                 *backend.Dat9Backend
+	meta                     *meta.Store
+	pool                     *tenant.Pool
+	provisioner              tenant.Provisioner
+	legacyStarterProvisioner tenant.Provisioner
+	tokenSecret              []byte
+	localTenantAPIKey        string
+	vaultMK                  *vault.MasterKey
+	vaultIssuerURL           string
+	publicURL                string
+	maxUploadBytes           int64
+	tenantPoolMaxSize        int
+	inlineThreshold          int64
+	metrics                  *serverMetrics
+	logger                   *zap.Logger
+	mux                      *http.ServeMux
+	events                   *eventBuses
+	semanticWorker           *semanticWorkerManager
+	journalCursorSecret      []byte
+	objectGCWorker           *objectGCWorker
+	slockOAuth               SlockOAuthClient
+	tidbAutoEmbedding        tenantAutoEmbeddingDefault
+	disableDBAutoEmbed       bool
+	forkWorkerCtx            context.Context
+	forkWorkerCancel         context.CancelFunc
+	forkWorkerWG             sync.WaitGroup
+	forkWorkerMu             sync.Mutex
+	forkWorkerClosed         bool
+	tenantPoolLocks          sync.Map
+	tenantPoolCreateLocks    sync.Map
+	tenantPoolResumeJobs     sync.Map
+	schemaInitErrors         sync.Map
+	leader                   *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
 	// changes, this context is cancelled and recreated. Workers that use it
 	// (pending tenant reconciler, tenant delete cleanup, one-time resume tasks)
@@ -291,22 +307,23 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
-		fallback:          cfg.Backend,
-		meta:              cfg.Meta,
-		pool:              cfg.Pool,
-		tokenSecret:       cfg.TokenSecret,
-		localTenantAPIKey: strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:           vaultMK,
-		vaultIssuerURL:    strings.TrimSpace(cfg.VaultIssuerURL),
-		publicURL:         strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
-		provisioner:       cfg.Provisioner,
-		maxUploadBytes:    maxUpload,
-		tenantPoolMaxSize: tenantPoolMaxSize,
-		inlineThreshold:   inlineThreshold,
-		metrics:           newServerMetrics(),
-		logger:            logger,
-		events:            newEventBuses(),
-		slockOAuth:        cfg.SlockOAuth,
+		fallback:                 cfg.Backend,
+		meta:                     cfg.Meta,
+		pool:                     cfg.Pool,
+		tokenSecret:              cfg.TokenSecret,
+		localTenantAPIKey:        strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:                  vaultMK,
+		vaultIssuerURL:           strings.TrimSpace(cfg.VaultIssuerURL),
+		publicURL:                strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
+		provisioner:              cfg.Provisioner,
+		legacyStarterProvisioner: cfg.LegacyStarterProvisioner,
+		maxUploadBytes:           maxUpload,
+		tenantPoolMaxSize:        tenantPoolMaxSize,
+		inlineThreshold:          inlineThreshold,
+		metrics:                  newServerMetrics(),
+		logger:                   logger,
+		events:                   newEventBuses(),
+		slockOAuth:               cfg.SlockOAuth,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
 			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
@@ -319,7 +336,7 @@ func NewWithConfig(cfg Config) *Server {
 		leader:              cfg.Leader,
 		podNotifySecret:     cfg.PodNotifySecret,
 		sseNotifyRetention:  cfg.SSENotifyRetention,
-		}
+	}
 	// Default SSE notify retention.
 	if s.sseNotifyRetention <= 0 {
 		s.sseNotifyRetention = defaultSSENotifyRetention
@@ -4558,12 +4575,16 @@ func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(co
 	if !tenant.UsesTiDBAutoEmbedding(provider) {
 		return fallback
 	}
-	profileAware, ok := s.provisioner.(autoEmbeddingSchemaProvisioner)
+	provisioner := s.provisionerForTenantProvider(provider)
+	if provisioner == nil {
+		return fallback
+	}
+	profileAware, ok := provisioner.(autoEmbeddingSchemaProvisioner)
 	if !ok {
 		return fallback
 	}
 	return func(ctx context.Context, dsn string) error {
-		if ensurer, ok := s.provisioner.(tenantDatabaseEnsurer); ok {
+		if ensurer, ok := provisioner.(tenantDatabaseEnsurer); ok {
 			if err := ensurer.EnsureDatabase(ctx, dsn); err != nil {
 				return fmt.Errorf("ensure tenant database: %w", err)
 			}
