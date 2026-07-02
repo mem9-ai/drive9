@@ -196,6 +196,11 @@ type FileInfo struct {
 	Nlink      uint32 `json:"nlink,omitempty"`
 }
 
+type ListPageResult struct {
+	Entries    []FileInfo `json:"entries"`
+	NextCursor string     `json:"next_cursor,omitempty"`
+}
+
 // StatResult represents file metadata from HEAD.
 type StatResult struct {
 	Size       int64
@@ -681,6 +686,38 @@ func (c *Client) ListCtx(ctx context.Context, path string) ([]FileInfo, error) {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 	return result.Entries, nil
+}
+
+// ListPage returns a single explicit page of directory entries.
+func (c *Client) ListPage(path string, limit int, cursor string) (*ListPageResult, error) {
+	return c.ListPageCtx(context.Background(), path, limit, cursor)
+}
+
+// ListPageCtx returns a single explicit page of directory entries with context support.
+func (c *Client) ListPageCtx(ctx context.Context, path string, limit int, cursor string) (*ListPageResult, error) {
+	q := url.Values{}
+	q.Set("list", "1")
+	q.Set("limit", strconv.Itoa(limit))
+	if cursor != "" {
+		q.Set("cursor", cursor)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path)+"?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var result ListPageResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return &result, nil
 }
 
 // BatchStatCtx returns lightweight metadata for up to MaxBatchStatPaths paths.

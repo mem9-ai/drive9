@@ -1832,8 +1832,19 @@ func (s *Store) StatPathFallbackForRead(ctx context.Context, primaryPath, fallba
 }
 
 func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWithFile, err error) {
+	return s.listDir(ctx, parentPath, "", 0, "list_dir")
+}
+
+func (s *Store) ListDirPage(ctx context.Context, parentPath, afterName string, limit int) (out []*NodeWithFile, err error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("list dir page limit must be positive")
+	}
+	return s.listDir(ctx, parentPath, afterName, limit, "list_dir_page")
+}
+
+func (s *Store) listDir(ctx context.Context, parentPath, afterName string, limit int, op string) (out []*NodeWithFile, err error) {
 	start := time.Now()
-	defer observeStoreOp(ctx, "list_dir", start, &err)
+	defer observeStoreOp(ctx, op, start, &err)
 
 	// TODO(#110): ReadDir only needs lightweight file metadata. Split this into a
 	// metadata-only listing path so directory scans do not fetch or copy content_blob.
@@ -1843,9 +1854,18 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
 		LEFT JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE fn.parent_path_hash = ? AND fn.parent_path = ?
-		ORDER BY fn.name`
-	rows, err := s.db.QueryContext(ctx, q, fileNodePathHash(parentPath), parentPath)
+		WHERE fn.parent_path_hash = ? AND fn.parent_path = ?`
+	args := []any{fileNodePathHash(parentPath), parentPath}
+	if afterName != "" {
+		q += ` AND fn.name > ?`
+		args = append(args, afterName)
+	}
+	q += ` ORDER BY fn.name`
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
@@ -100,10 +102,10 @@ type Config struct {
 	// authentication. When set, the pod-to-pod push path is enabled; when nil,
 	// only the 200ms poller fallback is used (no push).
 	SSENotifyPollInterval time.Duration
-	SSENotifyRetention     time.Duration
-	PodID                  string
-	PodAddr                string
-	PodNotifySecret        []byte
+	SSENotifyRetention    time.Duration
+	PodID                 string
+	PodAddr               string
+	PodNotifySecret       []byte
 }
 
 type SlockOAuthClient interface {
@@ -319,7 +321,7 @@ func NewWithConfig(cfg Config) *Server {
 		leader:              cfg.Leader,
 		podNotifySecret:     cfg.PodNotifySecret,
 		sseNotifyRetention:  cfg.SSENotifyRetention,
-		}
+	}
 	// Default SSE notify retention.
 	if s.sseNotifyRetention <= 0 {
 		s.sseNotifyRetention = defaultSSENotifyRetention
@@ -1540,8 +1542,8 @@ func isScopedFSGetQueryAllowed(q url.Values) bool {
 			"minsize", "maxsize", "limit", "layer",
 		})
 	case q.Has("list"):
-		// handleList reads only ?list. (No filter params today.)
-		return queryKeysSubsetOf(q, []string{"list"})
+		// handleList reads ?list plus optional explicit pagination params.
+		return queryKeysSubsetOf(q, []string{"list", "limit", "cursor"})
 	default:
 		// No action selector → handleRead, which does not consume query
 		// params. Any unknown key on a read request is rejected to prevent
@@ -1729,6 +1731,140 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+const (
+	fsListCursorVersion     = 1
+	fsListMaxLimit          = 10000
+	fsListCursorFallbackKey = "drive9-fs-list-cursor-v1"
+)
+
+type fsListCursor struct {
+	Version   int    `json:"v"`
+	Dir       string `json:"dir"`
+	AfterName string `json:"after_name"`
+	Sig       string `json:"sig"`
+}
+
+type fsListPageParams struct {
+	Enabled      bool
+	Limit        int
+	AfterName    string
+	CanonicalDir string
+}
+
+func (s *Server) parseFSListPageParams(q url.Values, path string) (fsListPageParams, error) {
+	limitRaw, hasLimit, err := singleQueryValue(q, "limit")
+	if err != nil {
+		return fsListPageParams{}, err
+	}
+	cursorRaw, hasCursor, err := singleQueryValue(q, "cursor")
+	if err != nil {
+		return fsListPageParams{}, err
+	}
+	if !hasLimit {
+		if hasCursor {
+			return fsListPageParams{}, errors.New("cursor requires limit")
+		}
+		return fsListPageParams{}, nil
+	}
+	limit, err := strconv.Atoi(limitRaw)
+	if err != nil || limit < 1 || limit > fsListMaxLimit {
+		return fsListPageParams{}, fmt.Errorf("limit must be between 1 and %d", fsListMaxLimit)
+	}
+	canonicalDir, err := pathutil.CanonicalizeDir(path)
+	if err != nil {
+		return fsListPageParams{}, fmt.Errorf("invalid list path: %w", err)
+	}
+	params := fsListPageParams{
+		Enabled:      true,
+		Limit:        limit,
+		CanonicalDir: canonicalDir,
+	}
+	if hasCursor {
+		afterName, err := s.decodeFSListCursor(cursorRaw, canonicalDir)
+		if err != nil {
+			return fsListPageParams{}, err
+		}
+		params.AfterName = afterName
+	}
+	return params, nil
+}
+
+func singleQueryValue(q url.Values, key string) (string, bool, error) {
+	values, ok := q[key]
+	if !ok {
+		return "", false, nil
+	}
+	if len(values) != 1 {
+		return "", false, fmt.Errorf("%s must be provided once", key)
+	}
+	return values[0], true, nil
+}
+
+func (s *Server) encodeFSListCursor(dir, afterName string) (string, error) {
+	cursor := fsListCursor{
+		Version:   fsListCursorVersion,
+		Dir:       dir,
+		AfterName: afterName,
+	}
+	cursor.Sig = s.signFSListCursor(cursor)
+	payload, err := json.Marshal(cursor)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(payload), nil
+}
+
+func (s *Server) decodeFSListCursor(raw, dir string) (string, error) {
+	payload, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return "", errors.New("invalid cursor")
+	}
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
+	var cursor fsListCursor
+	if err := dec.Decode(&cursor); err != nil {
+		return "", errors.New("invalid cursor")
+	}
+	var extra struct{}
+	if err := dec.Decode(&extra); err != io.EOF {
+		return "", errors.New("invalid cursor")
+	}
+	if cursor.Version != fsListCursorVersion || cursor.Dir != dir || !validFSListCursorName(cursor.AfterName) {
+		return "", errors.New("invalid cursor")
+	}
+	expected := s.signFSListCursor(fsListCursor{
+		Version:   cursor.Version,
+		Dir:       cursor.Dir,
+		AfterName: cursor.AfterName,
+	})
+	if subtle.ConstantTimeCompare([]byte(cursor.Sig), []byte(expected)) != 1 {
+		return "", errors.New("invalid cursor")
+	}
+	return cursor.AfterName, nil
+}
+
+func (s *Server) signFSListCursor(cursor fsListCursor) string {
+	key := s.tokenSecret
+	if len(key) == 0 {
+		key = []byte(fsListCursorFallbackKey)
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = fmt.Fprintf(mac, "%d\x00%s\x00%s", cursor.Version, cursor.Dir, cursor.AfterName)
+	return fmt.Sprintf("%x", mac.Sum(nil))
+}
+
+func validFSListCursorName(name string) bool {
+	if name == "" || name == "." || name == ".." || !utf8.ValidString(name) {
+		return false
+	}
+	for _, r := range name {
+		if r == '/' || r == '\\' || r == 0 || r < 0x20 {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/v1/fs")
 	if path == "" {
@@ -1865,9 +2001,20 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
+	page, err := s.parseFSListPageParams(r.URL.Query(), path)
+	if err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "list_bad_pagination", "path", path, "error", err)...)
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	logger.InfoBenchTiming(r.Context(), "server_list_start", zap.String("path", path))
 	readDirStart := time.Now()
-	entries, err := b.ReadDirCtx(r.Context(), path)
+	var entries []filesystem.FileInfo
+	if page.Enabled {
+		entries, err = b.ReadDirPageCtx(r.Context(), path, page.AfterName, page.Limit+1)
+	} else {
+		entries, err = b.ReadDirCtx(r.Context(), path)
+	}
 	readDirDuration := time.Since(readDirStart)
 	if err != nil {
 		logger.InfoBenchTiming(r.Context(), "server_list_timing",
@@ -1884,6 +2031,16 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		metricEvent(r.Context(), "userdb_query", "api", "list", "result", "error")
 		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
+	}
+	nextCursor := ""
+	if page.Enabled && len(entries) > page.Limit {
+		entries = entries[:page.Limit]
+		nextCursor, err = s.encodeFSListCursor(page.CanonicalDir, entries[len(entries)-1].Name)
+		if err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "list_cursor_encode_failed", "path", path, "error", err)...)
+			errJSON(w, http.StatusInternalServerError, "encode cursor")
+			return
+		}
 	}
 	metricEvent(r.Context(), "userdb_query", "api", "list", "result", "ok")
 	logger.InfoBenchTiming(r.Context(), "server_list_timing",
@@ -1935,7 +2092,11 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})
+	resp := map[string]any{"entries": out}
+	if nextCursor != "" {
+		resp["next_cursor"] = nextCursor
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path string) {

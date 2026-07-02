@@ -3,12 +3,15 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -439,6 +442,186 @@ func TestListDir(t *testing.T) {
 	if result.Entries[0].Revision <= 0 {
 		t.Fatalf("list entry revision = %d, want > 0", result.Entries[0].Revision)
 	}
+}
+
+func TestListDirPagination(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	empty := getListPage(t, ts.URL+"/v1/fs/empty/?list=1&limit=10")
+	if len(empty.Entries) != 0 {
+		t.Fatalf("empty directory entries = %v, want empty", listEntryNames(empty.Entries))
+	}
+	if empty.NextCursor != "" {
+		t.Fatalf("empty directory next_cursor = %q, want empty", empty.NextCursor)
+	}
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/single/only.txt", strings.NewReader("only"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		t.Fatalf("write single entry status = %d", resp.StatusCode)
+	}
+
+	single := getListPage(t, ts.URL+"/v1/fs/single/?list=1&limit=1")
+	if got := listEntryNames(single.Entries); !reflect.DeepEqual(got, []string{"only.txt"}) {
+		t.Fatalf("single entry names = %v", got)
+	}
+	if single.NextCursor != "" {
+		t.Fatalf("single entry next_cursor = %q, want empty", single.NextCursor)
+	}
+
+	for _, name := range []string{"c.txt", "a.txt", "b.txt"} {
+		req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/"+name, strings.NewReader(name))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			t.Fatalf("write %s status = %d", name, resp.StatusCode)
+		}
+	}
+
+	full := getListPage(t, ts.URL+"/v1/fs/data/?list=1")
+	if got := listEntryNames(full.Entries); !reflect.DeepEqual(got, []string{"a.txt", "b.txt", "c.txt"}) {
+		t.Fatalf("compat list names = %v", got)
+	}
+	if full.NextCursor != "" {
+		t.Fatalf("compat list next_cursor = %q, want empty", full.NextCursor)
+	}
+
+	first := getListPage(t, ts.URL+"/v1/fs/data/?list=1&limit=2")
+	if got := listEntryNames(first.Entries); !reflect.DeepEqual(got, []string{"a.txt", "b.txt"}) {
+		t.Fatalf("first page names = %v", got)
+	}
+	if first.NextCursor == "" {
+		t.Fatal("first page next_cursor is empty")
+	}
+
+	second := getListPage(t, ts.URL+"/v1/fs/data/?list=1&limit=2&cursor="+url.QueryEscape(first.NextCursor))
+	if got := listEntryNames(second.Entries); !reflect.DeepEqual(got, []string{"c.txt"}) {
+		t.Fatalf("second page names = %v", got)
+	}
+	if second.NextCursor != "" {
+		t.Fatalf("last page next_cursor = %q, want empty", second.NextCursor)
+	}
+
+	exact := getListPage(t, ts.URL+"/v1/fs/data/?list=1&limit=3")
+	if got := listEntryNames(exact.Entries); !reflect.DeepEqual(got, []string{"a.txt", "b.txt", "c.txt"}) {
+		t.Fatalf("exact page names = %v", got)
+	}
+	if exact.NextCursor != "" {
+		t.Fatalf("exact page next_cursor = %q, want empty", exact.NextCursor)
+	}
+
+	specialNames := []string{"01 space name.txt", "02 hash#name.txt", "03 percent%name.txt", "04 中文.txt"}
+	for _, name := range specialNames {
+		req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/special/"+url.PathEscape(name), strings.NewReader(name))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			t.Fatalf("write special entry %q status = %d", name, resp.StatusCode)
+		}
+	}
+
+	firstSpecial := getListPage(t, ts.URL+"/v1/fs/special/?list=1&limit=2")
+	if got := listEntryNames(firstSpecial.Entries); !reflect.DeepEqual(got, specialNames[:2]) {
+		t.Fatalf("first special page names = %v", got)
+	}
+	if firstSpecial.NextCursor == "" {
+		t.Fatal("first special page next_cursor is empty")
+	}
+	secondSpecial := getListPage(t, ts.URL+"/v1/fs/special/?list=1&limit=2&cursor="+url.QueryEscape(firstSpecial.NextCursor))
+	if got := listEntryNames(secondSpecial.Entries); !reflect.DeepEqual(got, specialNames[2:]) {
+		t.Fatalf("second special page names = %v", got)
+	}
+	if secondSpecial.NextCursor != "" {
+		t.Fatalf("second special page next_cursor = %q, want empty", secondSpecial.NextCursor)
+	}
+
+	for _, rawQuery := range []string{
+		"list=1&cursor=" + url.QueryEscape(first.NextCursor),
+		"list=1&limit=0",
+		"list=1&limit=10001",
+		"list=1&limit=abc",
+		"list=1&limit=1&limit=2",
+		"list=1&limit=1&cursor=not-base64",
+		"list=1&limit=1&cursor=" + url.QueryEscape(tamperedFSListCursor(t, "/data/", "b.txt")),
+	} {
+		resp, err := http.Get(ts.URL + "/v1/fs/data/?" + rawQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("GET ?%s status = %d, want 400", rawQuery, resp.StatusCode)
+		}
+	}
+
+	resp, err = http.Get(ts.URL + "/v1/fs/other/?list=1&limit=1&cursor=" + url.QueryEscape(first.NextCursor))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("cross-dir cursor status = %d, want 400", resp.StatusCode)
+	}
+}
+
+type listPageResponse struct {
+	Entries []struct {
+		Name string `json:"name"`
+	} `json:"entries"`
+	NextCursor string `json:"next_cursor"`
+}
+
+func getListPage(t *testing.T, rawURL string) listPageResponse {
+	t.Helper()
+	resp, err := http.Get(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s status = %d", rawURL, resp.StatusCode)
+	}
+	var result listPageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func listEntryNames(entries []struct {
+	Name string `json:"name"`
+}) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name)
+	}
+	return names
+}
+
+func tamperedFSListCursor(t *testing.T, dir, afterName string) string {
+	t.Helper()
+	payload, err := json.Marshal(fsListCursor{
+		Version:   fsListCursorVersion,
+		Dir:       dir,
+		AfterName: afterName,
+		Sig:       "bad",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
 }
 
 func TestStat(t *testing.T) {
