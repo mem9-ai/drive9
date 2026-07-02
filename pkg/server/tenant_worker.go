@@ -375,8 +375,9 @@ func (m *tenantWorkerManager) pollFallbackOnce(ctx context.Context) bool {
 			processed = true
 		}
 	}
-	// Drain one file_gc task.
-	if _, err := m.fallback.ProcessOneFileGCTask(ctx); err == nil {
+	// Drain one file_gc task. ProcessOneFileGCTask returns (false, nil) when
+	// the queue is empty — only set processed=true when it actually processed.
+	if did, err := m.fallback.ProcessOneFileGCTask(ctx); err == nil && did {
 		processed = true
 	}
 	// Drain one quota outbox batch.

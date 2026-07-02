@@ -144,7 +144,15 @@ func (p *tenantOutboxPoller) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			p.flushCursor(ctx)
+			// Flush cursor on shutdown using a fresh non-cancelled context so
+			// the final cursor position is persisted. Using the already-cancelled
+			// ctx would cause UpsertTenantOutboxCursor to fail with
+			// context.Canceled and the cursor would be lost — a pod that shuts
+			// down before its first periodic flush would restart at MAX(id),
+			// skipping unprocessed rows.
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			p.flushCursor(shutdownCtx)
+			shutdownCancel()
 			return
 		case <-ticker.C:
 			p.pollOnce(ctx)
