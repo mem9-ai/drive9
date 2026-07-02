@@ -436,7 +436,10 @@ Currently `FTSSearch` only searches `content_text`. To include description in fu
 - [ ] `pkg/tenant/schema/tidb_app.go` — add `description`, `description_embedding`, `description_embedding_revision` to `files`; add `description` to `uploads`.
 - [ ] `pkg/tenant/schema/tidb_auto.go` — same as above, but `description_embedding` is a generated column.
 - [ ] `pkg/tenant/schema/db9/schema.go` — same as above, plus `hnsw` index; add separate FULLTEXT indexes on `content_text` and `description`.
-- [ ] Run `drive9-server schema dump-init-sql --provider tidb_cloud_native` and update externally managed schema.
+- [ ] Run `drive9-server schema dump-init-sql --provider tidb_zero`
+- [ ] Run `drive9-server schema dump-init-sql --provider tidb_cloud_native`
+- [ ] Run `drive9-server schema dump-init-sql --provider db9`
+- [ ] Update externally managed schema snapshots with the exported SQL.
 
 ### Datastore
 - [ ] `pkg/datastore/store.go` — add fields to `File` struct; update `InsertFile` / `GetFile` / scan methods.

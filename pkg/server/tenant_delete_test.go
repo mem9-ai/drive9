@@ -99,7 +99,12 @@ func newTenantDeleteRuntime(t *testing.T, provider string, scopeKind meta.APIKey
 		defaultPublicKey:  "default-public",
 		defaultPrivateKey: "default-private",
 	}
-	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: prov, TokenSecret: tokenSecret})
+	cfg := Config{Meta: db.Meta, Pool: db.Pool, Provisioner: prov, TokenSecret: tokenSecret}
+	if provider == tenant.ProviderTiDBCloudStarterLegacy {
+		cfg.Provisioner = nil
+		cfg.LegacyStarterProvisioner = prov
+	}
+	server := NewWithConfig(cfg)
 	t.Cleanup(server.Close)
 	return &tenantDeleteRuntime{
 		meta:        db.Meta,
@@ -274,6 +279,28 @@ func TestTenantDeleteNativeUsesServerDefaultCredentials(t *testing.T) {
 	}
 	if rt.prov.lastCredentialReq.PublicKey != "default-public" || rt.prov.lastCredentialReq.PrivateKey != "default-private" {
 		t.Fatalf("native delete should use server default credentials: %+v", rt.prov.lastCredentialReq)
+	}
+	assertTenantDeletedAndKeysRevoked(t, rt)
+}
+
+func TestTenantDeleteLegacyStarterUsesLegacyProvisioner(t *testing.T) {
+	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudStarterLegacy, meta.APIKeyScopeKindOwner)
+	resp := rt.deleteTenant(t, nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
+	}
+	if got := rt.prov.deprovisionCalls.Load(); got != 1 {
+		t.Fatalf("deprovision calls = %d, want 1", got)
+	}
+	if rt.prov.lastCredentialReq.PublicKey != "" || rt.prov.lastCredentialReq.PrivateKey != "" {
+		t.Fatalf("legacy starter delete should not use credential request: %+v", rt.prov.lastCredentialReq)
+	}
+	if rt.prov.lastDeprovision == nil || rt.prov.lastDeprovision.ClusterID != "cluster-delete-1" {
+		t.Fatalf("deprovision cluster = %+v", rt.prov.lastDeprovision)
+	}
+	if rt.prov.lastDeprovision.Provider != tenant.ProviderTiDBCloudStarterLegacy {
+		t.Fatalf("deprovision provider = %q, want %q", rt.prov.lastDeprovision.Provider, tenant.ProviderTiDBCloudStarterLegacy)
 	}
 	assertTenantDeletedAndKeysRevoked(t, rt)
 }

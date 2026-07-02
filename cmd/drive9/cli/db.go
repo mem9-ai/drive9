@@ -232,6 +232,7 @@ func Create(args []string) error {
 
 const (
 	RegionModeAnonymous       = "anonymous"
+	RegionModeStarterLegacy   = "tidb_cloud_starter"
 	RegionModeTiDBCloudNative = "tidb_cloud_native"
 
 	ModeLabelAnonymous = "Anonymous"
@@ -351,10 +352,10 @@ func resolveProvisionServer(serverFlag, regionCode, mode, fallbackServer string)
 
 func selectRegionServer(entries []RegionManifestEntry, regionCode, mode string) (*RegionManifestEntry, error) {
 	regionCode = strings.TrimSpace(regionCode)
-	mode = strings.TrimSpace(mode)
+	mode = canonicalRegionMode(mode)
 	var matches []RegionManifestEntry
 	for _, entry := range entries {
-		if strings.TrimSpace(entry.RegionCode) == regionCode && strings.TrimSpace(entry.Mode) == mode {
+		if strings.TrimSpace(entry.RegionCode) == regionCode && canonicalRegionMode(entry.Mode) == mode {
 			matches = append(matches, entry)
 		}
 	}

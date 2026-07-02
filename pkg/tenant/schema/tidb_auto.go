@@ -712,6 +712,7 @@ func (e *tidbSchemaDiffError) Error() string {
 // you change columns, indexes, generated expressions, or
 // constraints here, rerun:
 //
+//	drive9-server schema dump-init-sql --provider tidb_zero
 //	drive9-server schema dump-init-sql --provider tidb_cloud_native
 //
 // and update external schema definitions with the exported SQL.

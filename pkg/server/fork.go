@@ -841,10 +841,8 @@ func clusterInfoFromTenant(t *meta.Tenant) *tenant.ClusterInfo {
 
 func (s *Server) forkProviderSupported(provider string) bool {
 	switch provider {
-	case tenant.ProviderTiDBCloudNative:
-		return s.provisioner != nil
-	case tenant.ProviderTiDBCloudStarterLegacy:
-		return s.legacyStarterProvisioner != nil
+	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBCloudStarterLegacy:
+		return s.provisionerForTenantProvider(provider) != nil
 	default:
 		return false
 	}

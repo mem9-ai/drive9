@@ -80,6 +80,7 @@ func TestRegionModeLabel(t *testing.T) {
 		want string
 	}{
 		{mode: RegionModeAnonymous, want: "Anonymous"},
+		{mode: RegionModeStarterLegacy, want: "Anonymous"},
 		{mode: RegionModeTiDBCloudNative, want: "TiDBCloud"},
 		{mode: "custom", want: "custom"},
 	}
@@ -148,6 +149,23 @@ func TestValidateRegionManifestAllowsSameRegionDifferentModes(t *testing.T) {
 	}
 }
 
+func TestValidateRegionManifestAcceptsLegacyAnonymousDefault(t *testing.T) {
+	err := validateRegionManifest(&RegionManifest{
+		Service: "drive9",
+		Default: &RegionManifestDefault{
+			RegionCode: "aws-us-east-1",
+			Mode:       RegionModeStarterLegacy,
+		},
+		Regions: []RegionManifestEntry{
+			{RegionCode: "aws-us-east-1", Mode: RegionModeStarterLegacy, ServerURL: "https://anonymous.example"},
+			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, ServerURL: "https://native.example"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("validateRegionManifest: %v", err)
+	}
+}
+
 func TestValidateRegionManifestRejectsMissingDefaultEntry(t *testing.T) {
 	err := validateRegionManifest(&RegionManifest{
 		Service: "drive9",
@@ -183,6 +201,22 @@ func TestValidateRegionManifestRejectsDuplicateRegionMode(t *testing.T) {
 	}
 }
 
+func TestValidateRegionManifestRejectsDuplicateLegacyAnonymousMode(t *testing.T) {
+	err := validateRegionManifest(&RegionManifest{
+		Service: "drive9",
+		Regions: []RegionManifestEntry{
+			{RegionCode: "aws-us-east-1", Mode: RegionModeAnonymous, ServerURL: "https://anonymous-a.example"},
+			{RegionCode: "aws-us-east-1", Mode: RegionModeStarterLegacy, ServerURL: "https://anonymous-b.example"},
+		},
+	})
+	if err == nil {
+		t.Fatal("validateRegionManifest error = nil, want duplicate key error")
+	}
+	if !strings.Contains(err.Error(), "duplicate region_code") {
+		t.Fatalf("validateRegionManifest error = %q", err)
+	}
+}
+
 func TestSelectRegionServerMatchesRegionAndExactMode(t *testing.T) {
 	entry, err := selectRegionServer([]RegionManifestEntry{
 		{RegionCode: "aws-us-east-1", Mode: RegionModeAnonymous, ServerURL: "https://anonymous.example"},
@@ -193,6 +227,19 @@ func TestSelectRegionServerMatchesRegionAndExactMode(t *testing.T) {
 	}
 	if entry.ServerURL != "https://anonymous.example" {
 		t.Fatalf("server = %q, want anonymous", entry.ServerURL)
+	}
+}
+
+func TestSelectRegionServerAcceptsLegacyAnonymousMode(t *testing.T) {
+	entry, err := selectRegionServer([]RegionManifestEntry{
+		{RegionCode: "aws-us-east-1", Mode: RegionModeStarterLegacy, ServerURL: "https://legacy-anonymous.example"},
+		{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, ServerURL: "https://native.example"},
+	}, "aws-us-east-1", RegionModeAnonymous)
+	if err != nil {
+		t.Fatalf("selectRegionServer: %v", err)
+	}
+	if entry.ServerURL != "https://legacy-anonymous.example" {
+		t.Fatalf("server = %q, want legacy anonymous", entry.ServerURL)
 	}
 }
 

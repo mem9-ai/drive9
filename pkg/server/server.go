@@ -148,10 +148,10 @@ func (s *Server) provisionerForTenantProvider(provider string) tenant.Provisione
 	switch provider {
 	case tenant.ProviderTiDBCloudStarterLegacy:
 		return s.legacyStarterProvisioner
-	case tenant.ProviderTiDBCloudNative:
+	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBZero, tenant.ProviderDB9:
 		return s.provisioner
 	default:
-		return s.provisioner
+		return nil
 	}
 }
 

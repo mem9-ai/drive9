@@ -218,7 +218,7 @@ func validateRegionManifest(manifest *RegionManifest) error {
 		if entry.ServerURL == "" {
 			return fmt.Errorf("region manifest entry %d missing server_url", i)
 		}
-		key := entry.RegionCode + "\x00" + entry.Mode
+		key := entry.RegionCode + "\x00" + canonicalRegionMode(entry.Mode)
 		if first, ok := seen[key]; ok {
 			return fmt.Errorf("region manifest entries %d and %d duplicate region_code %q mode %q", first, i, entry.RegionCode, entry.Mode)
 		}
@@ -233,7 +233,7 @@ func validateRegionManifest(manifest *RegionManifest) error {
 		if manifest.Default.Mode == "" {
 			return fmt.Errorf("region manifest default missing mode")
 		}
-		defaultKey := manifest.Default.RegionCode + "\x00" + manifest.Default.Mode
+		defaultKey := manifest.Default.RegionCode + "\x00" + canonicalRegionMode(manifest.Default.Mode)
 		if _, ok := seen[defaultKey]; !ok {
 			return fmt.Errorf("region manifest default %q/%q not found in regions", manifest.Default.RegionCode, manifest.Default.Mode)
 		}
@@ -254,7 +254,7 @@ func sortRegionManifestEntries(entries []RegionManifestEntry) {
 }
 
 func regionModeLabel(mode string) string {
-	switch strings.TrimSpace(mode) {
+	switch canonicalRegionMode(mode) {
 	case RegionModeAnonymous:
 		return ModeLabelAnonymous
 	case RegionModeTiDBCloudNative:
@@ -265,13 +265,23 @@ func regionModeLabel(mode string) string {
 }
 
 func quotaExceededMessage(mode string) string {
-	switch strings.TrimSpace(mode) {
+	switch canonicalRegionMode(mode) {
 	case "", ModeLabelAnonymous, RegionModeAnonymous:
 		return "tenant usage quota exceeded. Switch to TiDBCloud Mode with drive9 create --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>. Use drive9 region list to see available regions"
 	case ModeLabelTiDBCloud, RegionModeTiDBCloudNative:
 		return "tenant usage quota exceeded. Go to your TiDB Cloud cluster settings page and set a monthly Spending Limit"
 	default:
 		return ""
+	}
+}
+
+func canonicalRegionMode(mode string) string {
+	mode = strings.TrimSpace(mode)
+	switch mode {
+	case RegionModeStarterLegacy:
+		return RegionModeAnonymous
+	default:
+		return mode
 	}
 }
 
