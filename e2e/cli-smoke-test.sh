@@ -318,6 +318,10 @@ SMALL_HARDLINK="/cli-${TS}-small-hardlink.txt"
 CP_DIR_REMOTE="/cli-${TS}-cpdir"
 CP_DIR_REMOTE_COPY="/cli-${TS}-cpdir-copy"
 CP_DIR_LOCAL="/tmp/drive9-cli-cpdir-${TS}"
+RECURSIVE_LOCAL_ROOT="/tmp/drive9-cli-recursive-${TS}"
+RECURSIVE_REMOTE="/cli-${TS}-recursive-tree"
+RECURSIVE_REMOTE_COPY="/cli-${TS}-recursive-tree-copy"
+RECURSIVE_DOWNLOADED="/tmp/drive9-cli-recursive-downloaded-${TS}"
 HARDLINK_LOCAL="/tmp/drive9-cli-hardlink-${TS}.txt"
 TAG_LOCAL="/tmp/drive9-cli-tag-${TS}.txt"
 TAG_REMOTE="/cli-${TS}-tagged.txt"
@@ -439,6 +443,74 @@ check_eq "cp remote->local dir keeps source name" "$cp_dir_local_body" "cli-smok
 drive9_retry fs cp ":$cp_dir_remote_path" ":$CP_DIR_REMOTE_COPY" >/dev/null
 cp_dir_remote_copy_body="$(drive9_retry_read fs cat "$cp_dir_remote_copy_path")"
 check_eq "cp remote->remote dir keeps source name" "$cp_dir_remote_copy_body" "cli-smoke-${TS}"
+
+echo "[4.1.1] cp -r recursive tree round-trip"
+# Build a local tree with nested dirs, multiple files, and an empty dir:
+#   recursive-root/
+#     top.txt          "top-${TS}"
+#     sub/
+#       nested.txt     "nested-${TS}"
+#       deep/
+#         leaf.txt     "leaf-${TS}"
+#     empty/
+recursive_local_root="$RECURSIVE_LOCAL_ROOT/recursive-root"
+mkdir -p "$recursive_local_root/sub/deep"
+mkdir -p "$recursive_local_root/empty"
+printf "top-%s" "$TS" > "$recursive_local_root/top.txt"
+printf "nested-%s" "$TS" > "$recursive_local_root/sub/nested.txt"
+printf "leaf-%s" "$TS" > "$recursive_local_root/sub/deep/leaf.txt"
+
+# Upload local tree → remote via cp -r (local→remote).
+drive9_retry fs cp -r "$recursive_local_root" ":$RECURSIVE_REMOTE" >/dev/null
+
+# Download remote tree → local via cp -r (remote→local).
+drive9_retry fs cp -r ":$RECURSIVE_REMOTE" "$RECURSIVE_DOWNLOADED" >/dev/null
+
+# Verify every leaf file round-tripped byte-identically.
+recursive_dl_root="$RECURSIVE_DOWNLOADED/recursive-root"
+check_eq "cp -r round-trip top.txt content" \
+  "$(cat "$recursive_dl_root/top.txt")" "top-${TS}"
+check_eq "cp -r round-trip nested.txt content" \
+  "$(cat "$recursive_dl_root/sub/nested.txt")" "nested-${TS}"
+check_eq "cp -r round-trip leaf.txt content" \
+  "$(cat "$recursive_dl_root/sub/deep/leaf.txt")" "leaf-${TS}"
+
+# Verify the empty directory was preserved.
+check_cmd "cp -r preserves empty dir" test -d "$recursive_dl_root/empty"
+
+# Verify nested dir structure matches.
+check_cmd "cp -r preserves nested sub dir" test -d "$recursive_dl_root/sub"
+check_cmd "cp -r preserves nested deep dir" test -d "$recursive_dl_root/sub/deep"
+
+# Also verify the remote tree is listable.
+recursive_remote_ls="$(drive9_retry fs ls "$RECURSIVE_REMOTE/")"
+recursive_top_present=$(python3 - "$recursive_remote_ls" "top.txt" <<'PY'
+import sys
+out=sys.argv[1].splitlines()
+name=sys.argv[2]
+print("true" if any(line.strip()==name for line in out) else "false")
+PY
+)
+check_eq "cp -r uploaded top.txt appears in remote ls" "$recursive_top_present" "true"
+
+recursive_sub_ls="$(drive9_retry fs ls "$RECURSIVE_REMOTE/sub/")"
+recursive_nested_present=$(python3 - "$recursive_sub_ls" "nested.txt" <<'PY'
+import sys
+out=sys.argv[1].splitlines()
+name=sys.argv[2]
+print("true" if any(line.strip()==name for line in out) else "false")
+PY
+)
+check_eq "cp -r uploaded nested.txt appears in sub ls" "$recursive_nested_present" "true"
+
+# Remote→remote tree copy via cp -r.
+drive9_retry fs cp -r ":$RECURSIVE_REMOTE" ":$RECURSIVE_REMOTE_COPY" >/dev/null
+recursive_r2r_body="$(drive9_retry_read fs cat "$RECURSIVE_REMOTE_COPY/top.txt")"
+check_eq "cp -r remote->remote tree copy content" "$recursive_r2r_body" "top-${TS}"
+recursive_r2r_nested="$(drive9_retry_read fs cat "$RECURSIVE_REMOTE_COPY/sub/nested.txt")"
+check_eq "cp -r remote->remote nested file content" "$recursive_r2r_nested" "nested-${TS}"
+recursive_r2r_leaf="$(drive9_retry_read fs cat "$RECURSIVE_REMOTE_COPY/sub/deep/leaf.txt")"
+check_eq "cp -r remote->remote deep leaf content" "$recursive_r2r_leaf" "leaf-${TS}"
 
 drive9_retry fs mv "$SMALL_REMOTE" "$SMALL_RENAMED" >/dev/null
 renamed_out="$(drive9_retry fs ls /)"
@@ -704,6 +776,8 @@ drive9_retry fs rm "$cp_dir_remote_path" >/dev/null
 drive9_retry fs rm "$cp_dir_remote_copy_path" >/dev/null
 drive9_retry fs rm -r "$CP_DIR_REMOTE" >/dev/null
 drive9_retry fs rm -r "$CP_DIR_REMOTE_COPY" >/dev/null
+drive9_retry fs rm -r "$RECURSIVE_REMOTE" >/dev/null
+drive9_retry fs rm -r "$RECURSIVE_REMOTE_COPY" >/dev/null
 for i in $(seq 1 "$CLI_BATCH_SMALL_FILE_COUNT"); do
   drive9_retry fs rm "$BATCH_REMOTE_DIR/file-${i}.txt" >/dev/null
 done
