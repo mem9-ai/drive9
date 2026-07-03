@@ -352,18 +352,19 @@ func resolveProvisionServer(serverFlag, regionCode, mode, fallbackServer string)
 
 func selectRegionServer(entries []RegionManifestEntry, regionCode, mode string) (*RegionManifestEntry, error) {
 	regionCode = strings.TrimSpace(regionCode)
-	mode = canonicalRegionMode(mode)
+	requestedMode := strings.TrimSpace(mode)
+	canonicalMode := canonicalRegionMode(mode)
 	var matches []RegionManifestEntry
 	for _, entry := range entries {
-		if strings.TrimSpace(entry.RegionCode) == regionCode && canonicalRegionMode(entry.Mode) == mode {
+		if strings.TrimSpace(entry.RegionCode) == regionCode && canonicalRegionMode(entry.Mode) == canonicalMode {
 			matches = append(matches, entry)
 		}
 	}
 	if len(matches) == 0 {
-		return nil, fmt.Errorf("region %q does not support mode %q; run `drive9 region list`", regionCode, mode)
+		return nil, fmt.Errorf("region %q does not support mode %q; run `drive9 region list`", regionCode, requestedMode)
 	}
 	if len(matches) > 1 {
-		return nil, fmt.Errorf("region %q mode %q matches multiple servers; pass --server explicitly", regionCode, mode)
+		return nil, fmt.Errorf("region %q mode %q matches multiple servers; pass --server explicitly", regionCode, requestedMode)
 	}
 	return &matches[0], nil
 }

@@ -243,6 +243,21 @@ func TestSelectRegionServerAcceptsLegacyAnonymousMode(t *testing.T) {
 	}
 }
 
+func TestSelectRegionServerPreservesRequestedModeInError(t *testing.T) {
+	_, err := selectRegionServer([]RegionManifestEntry{
+		{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, ServerURL: "https://native.example"},
+	}, "aws-us-east-1", RegionModeStarterLegacy)
+	if err == nil {
+		t.Fatal("selectRegionServer error = nil, want unsupported mode error")
+	}
+	if !strings.Contains(err.Error(), `mode "tidb_cloud_starter"`) {
+		t.Fatalf("selectRegionServer error = %q", err)
+	}
+	if strings.Contains(err.Error(), `mode "anonymous"`) {
+		t.Fatalf("selectRegionServer error = %q, should preserve requested mode", err)
+	}
+}
+
 func TestSelectRegionServerDoesNotAcceptLegacyNativeMode(t *testing.T) {
 	legacyNativeMode := strings.Replace(RegionModeTiDBCloudNative, "tidb_cloud", "tidbcloud", 1)
 	_, err := selectRegionServer([]RegionManifestEntry{

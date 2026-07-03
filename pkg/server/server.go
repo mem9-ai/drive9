@@ -1054,13 +1054,21 @@ func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallba
 
 func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant) {
 	s.startServerWorker(ctx, func(workerCtx context.Context) {
+		schemaProvisioner := s.provisionerForTenantProvider(t.Provider)
+		if schemaProvisioner == nil {
+			logger.Warn(workerCtx, "resume_schema_init_skipped",
+				zap.String("tenant_id", t.ID),
+				zap.String("provider", t.Provider),
+				zap.String("reason", "provisioner_not_configured"))
+			return
+		}
 		plain, err := s.pool.Decrypt(workerCtx, t.DBPasswordCipher)
 		if err != nil {
 			logger.Warn(workerCtx, "resume_schema_init_skipped", zap.String("tenant_id", t.ID), zap.Error(err))
 			return
 		}
 		dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS, t.Provider)
-		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.schemaInitForTenant(t.ID, t.Provider, s.provisioner.InitSchema))
+		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.schemaInitForTenant(t.ID, t.Provider, schemaProvisioner.InitSchema))
 	})
 }
 

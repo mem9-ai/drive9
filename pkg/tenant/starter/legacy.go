@@ -22,6 +22,7 @@ import (
 
 const (
 	EnvTiDBCloudNativeAPIURL    = "DRIVE9_TIDBCLOUD_NATIVE_API_URL"
+	EnvTiDBCloudLegacyAPIURL    = "DRIVE9_TIDBCLOUD_API_URL"
 	EnvTiDBCloudAPIKey          = "DRIVE9_TIDBCLOUD_API_KEY"
 	EnvTiDBCloudDAT9APISecret   = "DRIVE9_DAT9_TIDBCLOUD_API_SECRET"
 	EnvTiDBCloudLegacyAPISecret = "DRIVE9_TIDBCLOUD_API_SECRET"
@@ -38,18 +39,21 @@ type LegacyProvisioner struct {
 
 func NewLegacyProvisionerFromEnv() (*LegacyProvisioner, error) {
 	apiURL := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeAPIURL))
+	if apiURL == "" {
+		apiURL = strings.TrimSpace(os.Getenv(EnvTiDBCloudLegacyAPIURL))
+	}
 	apiKey := strings.TrimSpace(os.Getenv(EnvTiDBCloudAPIKey))
 	apiSecret := strings.TrimSpace(os.Getenv(EnvTiDBCloudDAT9APISecret))
 	if apiSecret == "" {
 		apiSecret = strings.TrimSpace(os.Getenv(EnvTiDBCloudLegacyAPISecret))
 	}
 	if apiURL == "" || apiKey == "" || apiSecret == "" {
-		return nil, fmt.Errorf("%s, %s and %s are required for legacy starter operations",
-			EnvTiDBCloudNativeAPIURL, EnvTiDBCloudAPIKey, EnvTiDBCloudDAT9APISecret)
+		return nil, fmt.Errorf("%s or %s, %s and %s are required for legacy starter operations",
+			EnvTiDBCloudNativeAPIURL, EnvTiDBCloudLegacyAPIURL, EnvTiDBCloudAPIKey, EnvTiDBCloudDAT9APISecret)
 	}
 	parsed, err := url.Parse(apiURL)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-		return nil, fmt.Errorf("%s must be a valid https URL", EnvTiDBCloudNativeAPIURL)
+		return nil, fmt.Errorf("%s or %s must be a valid https URL", EnvTiDBCloudNativeAPIURL, EnvTiDBCloudLegacyAPIURL)
 	}
 	return &LegacyProvisioner{
 		apiURL:    strings.TrimRight(apiURL, "/"),

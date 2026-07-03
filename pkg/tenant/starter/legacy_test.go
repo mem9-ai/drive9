@@ -43,6 +43,22 @@ func TestNewLegacyProvisionerFromEnvFallsBackToHistoricalSecret(t *testing.T) {
 	}
 }
 
+func TestNewLegacyProvisionerFromEnvFallsBackToHistoricalURL(t *testing.T) {
+	t.Setenv(EnvTiDBCloudNativeAPIURL, "")
+	t.Setenv(EnvTiDBCloudLegacyAPIURL, "https://starter.tidbapi.com/")
+	t.Setenv(EnvTiDBCloudAPIKey, "key-1")
+	t.Setenv(EnvTiDBCloudDAT9APISecret, "secret-1")
+	t.Setenv(EnvTiDBCloudLegacyAPISecret, "")
+
+	p, err := NewLegacyProvisionerFromEnv()
+	if err != nil {
+		t.Fatalf("NewLegacyProvisionerFromEnv: %v", err)
+	}
+	if p.apiURL != "https://starter.tidbapi.com" {
+		t.Fatalf("apiURL = %q", p.apiURL)
+	}
+}
+
 func TestNewLegacyProvisionerFromEnvRequiresOldCredentials(t *testing.T) {
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudAPIKey, "")
