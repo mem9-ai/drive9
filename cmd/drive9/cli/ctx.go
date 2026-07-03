@@ -390,7 +390,7 @@ func ctxAddCmd(args []string) error {
 	if (cloudProvider != "" || region != "") && mode == "" {
 		return fmt.Errorf("--cloud-provider and --region require --mode TiDBCloud")
 	}
-	if mode == regionModeLabel(RegionModeTiDBCloudStarter) && (cloudProvider != "" || region != "") {
+	if mode == regionModeLabel(RegionModeAnonymous) && (cloudProvider != "" || region != "") {
 		return fmt.Errorf("anonymous contexts do not use --cloud-provider or --region")
 	}
 
@@ -930,7 +930,7 @@ func isKnownPrincipalType(value string) bool {
 
 func isKnownContextMode(value string) bool {
 	switch strings.TrimSpace(value) {
-	case regionModeLabel(RegionModeTiDBCloudStarter), regionModeLabel(RegionModeTiDBCloudNative):
+	case regionModeLabel(RegionModeAnonymous), regionModeLabel(RegionModeTiDBCloudNative):
 		return true
 	default:
 		return false

@@ -15,16 +15,16 @@ To control blast radius, Phase A intentionally keeps the principle of "capabilit
 
 At the moment, embedding-related infrastructure in `drive9-2` is spread across three layers:
 
-1. `pkg/tenant/schema_zero.go`, `pkg/tenant/schema_starter.go`, and `pkg/tenant/schema_db9.go` all define `files.embedding` as `GENERATED ALWAYS AS (EMBED_TEXT(...))`.
+1. `pkg/tenant/schema/tidb_auto.go` defines `files.embedding` as `GENERATED ALWAYS AS (EMBED_TEXT(...))`.
 2. The `File` struct and scan helpers in `pkg/datastore/store.go` only cover fields such as `content_text`, `revision`, and `status`; there is no representation of `embedding_revision` or task state yet.
 3. The repository still has no durable task substrate. The only existing async capability is the in-memory worker in `pkg/backend/image_extract.go`, which performs revision-gated writeback through `UpdateFileSearchText(ctx, fileID, revision, text)`, but has no claim / ack / recover semantics.
 
 The directly relevant code boundaries for Phase A are:
 
-- tenant initial schema: `pkg/tenant/schema_zero.go`, `pkg/tenant/schema_starter.go`, `pkg/tenant/schema_db9.go`
+- tenant initial schema: `pkg/tenant/schema/tidb_auto.go`, `pkg/tenant/schema/tidb_app.go`, `pkg/tenant/db9/schema.go`
 - datastore core model and query projections: `pkg/datastore/store.go`
 - datastore/schema helper tests: `pkg/datastore/schema_test_helper_test.go`, `pkg/server/schema_test_helper.go`, `pkg/client/schema_test_helper.go`, `pkg/backend/schema_test_helper.go`
-- provider initialization entry points: `pkg/tenant/zero.go`, `pkg/tenant/starter.go`, `pkg/tenant/db9.go`
+- provider initialization entry points: `pkg/tenant/tidbzero`, `pkg/tenant/tidbcloudnative`, `pkg/tenant/db9`
 
 Another fact that needs to be made explicit is that the current repository has no tenant data-plane migration runner. `InitSchema()` is only executed when creating a new tenant database. There is no unified framework today for migrating schema on already-existing tenants. Based on that, Phase A makes a more direct tradeoff: schema changes in this phase are treated as a breaking change. It guarantees only that the new schema is correct, does not cover old-tenant data migration, and does not introduce a generic tenant migration runner.
 
@@ -373,7 +373,7 @@ If the test environment allows it, multi-provider contract tests should share th
 
 ### Workstream A: Schema contract
 
-1. modify `pkg/tenant/schema_zero.go`, `pkg/tenant/schema_starter.go`, and `pkg/tenant/schema_db9.go`
+1. modify `pkg/tenant/schema/tidb_auto.go`, `pkg/tenant/schema/tidb_app.go`, and `pkg/tenant/db9/schema.go`
 2. change `files.embedding` to a normal nullable column and add `embedding_revision`
 3. add `semantic_tasks` DDL and the claim index
 4. keep the existing `idx_files_cosine` name unchanged, so later search SQL and operational terminology do not fork

@@ -33,16 +33,28 @@ type fakeBranchProvisioner struct {
 	systemPassword     string
 	systemUserErr      error
 	systemUserCalls    int
+	defaultPublicKey   string
+	defaultPrivateKey  string
 }
 
 func (f *fakeBranchProvisioner) ProviderType() string {
 	if f.provider != "" {
 		return f.provider
 	}
-	return tenant.ProviderTiDBCloudStarter
+	return tenant.ProviderTiDBCloudNative
 }
 
 func (f *fakeBranchProvisioner) InitSchema(context.Context, string) error { return f.initErr }
+
+func (f *fakeBranchProvisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, bool) {
+	if f.defaultPublicKey == "" || f.defaultPrivateKey == "" {
+		return tenant.CredentialProvisionRequest{}, false
+	}
+	return tenant.CredentialProvisionRequest{
+		PublicKey:  f.defaultPublicKey,
+		PrivateKey: f.defaultPrivateKey,
+	}, true
+}
 
 func (f *fakeBranchProvisioner) EnsureSystemUser(context.Context, string, string) (string, string, error) {
 	f.mu.Lock()
@@ -190,7 +202,7 @@ func (f *fakeBranchProvisioner) systemUserCallCount() int {
 
 type nonBranchOnlyProvisioner struct{}
 
-func (nonBranchOnlyProvisioner) ProviderType() string { return tenant.ProviderTiDBCloudStarter }
+func (nonBranchOnlyProvisioner) ProviderType() string { return tenant.ProviderTiDBCloudNative }
 
 func (nonBranchOnlyProvisioner) InitSchema(context.Context, string) error { return nil }
 
@@ -214,7 +226,10 @@ func newForkCleanupTestRuntime(t *testing.T) *forkCleanupTestRuntime {
 	t.Helper()
 	db := newTestDBInfo(t)
 	cleanupForkTestTables(t, db.Meta)
-	prov := &fakeBranchProvisioner{}
+	prov := &fakeBranchProvisioner{
+		defaultPublicKey:  "default-public",
+		defaultPrivateKey: "default-private",
+	}
 	server := NewWithConfig(Config{TokenSecret: []byte("ctx-fork-test-secret")})
 	server.meta = db.Meta
 	server.pool = db.Pool
@@ -256,7 +271,7 @@ func (rt *forkCleanupTestRuntime) insertForkTenant(t *testing.T, id string, stat
 
 func (rt *forkCleanupTestRuntime) insertLiveTenant(t *testing.T, id string) {
 	t.Helper()
-	rt.insertLiveTenantWithProvider(t, id, tenant.ProviderTiDBCloudStarter)
+	rt.insertLiveTenantWithProvider(t, id, tenant.ProviderTiDBCloudNative)
 }
 
 func (rt *forkCleanupTestRuntime) insertLiveTenantWithProvider(t *testing.T, id, provider string) {
@@ -266,7 +281,7 @@ func (rt *forkCleanupTestRuntime) insertLiveTenantWithProvider(t *testing.T, id,
 
 func (rt *forkCleanupTestRuntime) insertTenant(t *testing.T, id string, status meta.TenantStatus, kind meta.TenantKind, parentID, namespaceID, branchID string) {
 	t.Helper()
-	rt.insertTenantWithProvider(t, id, status, kind, parentID, namespaceID, branchID, tenant.ProviderTiDBCloudStarter)
+	rt.insertTenantWithProvider(t, id, status, kind, parentID, namespaceID, branchID, tenant.ProviderTiDBCloudNative)
 }
 
 func (rt *forkCleanupTestRuntime) insertTenantWithProvider(t *testing.T, id string, status meta.TenantStatus, kind meta.TenantKind, parentID, namespaceID, branchID, provider string) {
@@ -832,7 +847,7 @@ func TestHandleForkDeleteNativeFailedBranchIDEmptyNoCredentialsDeletesLocally(t 
 	}
 }
 
-func TestHandleForkDeleteNativeRejectedWhenRequestLacksKey(t *testing.T) {
+func TestHandleForkDeleteNativeUsesDefaultCredentialsWhenRequestLacksKey(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
 	rt.prov.provider = tenant.ProviderTiDBCloudNative
 	rt.insertTenantWithProvider(t, "fork-native-def", meta.TenantFailed, meta.TenantKindFork, "parent", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
@@ -846,18 +861,19 @@ func TestHandleForkDeleteNativeRejectedWhenRequestLacksKey(t *testing.T) {
 	rr := httptest.NewRecorder()
 	rt.server.handleForkDelete(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
+	if rr.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
-	body := rr.Body.String()
-	if !strings.Contains(body, "invalid or missing TiDB Cloud credentials") {
-		t.Fatalf("body missing expected error: %s", body)
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-a" {
+		t.Fatalf("deleted branches = %#v", deleted)
 	}
 }
 
 func TestHandleForkDeleteNativeRejectsWhenNoCredentialsAvailable(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
 	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.prov.defaultPublicKey = ""
+	rt.prov.defaultPrivateKey = ""
 	rt.insertTenantWithProvider(t, "fork-native-noc", meta.TenantFailed, meta.TenantKindFork, "parent", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
 	if _, err := rt.meta.DB().ExecContext(context.Background(),
 		`UPDATE tenants SET db_host = '', db_port = 0, db_user = '' WHERE id = ?`, "fork-native-noc"); err != nil {
@@ -913,6 +929,8 @@ func TestCreateForkTenantNativeProvisionsWhenCredentialsPresent(t *testing.T) {
 func TestCreateForkTenantNativeNoDefaultCredentialReturnsError(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
 	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.prov.defaultPublicKey = ""
+	rt.prov.defaultPrivateKey = ""
 	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
 	rt.prov.cluster = &tenant.ClusterInfo{
 		ClusterID: "cluster-a",

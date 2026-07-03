@@ -19,7 +19,7 @@ func TestRegionListTextAndJSON(t *testing.T) {
 		},
 		{
 			RegionCode:    "aws-us-east-1",
-			Mode:          RegionModeTiDBCloudStarter,
+			Mode:          RegionModeAnonymous,
 			ServerURL:     "https://api.drive9.ai",
 			CloudProvider: "aws",
 			TiDBRegion:    "us-east-1",
@@ -49,7 +49,7 @@ func TestRegionListTextAndJSON(t *testing.T) {
 	if strings.Contains(textOut, "NAME") {
 		t.Fatalf("text output = %q, want no NAME column", textOut)
 	}
-	if strings.Contains(textOut, "tidb_cloud_native") || strings.Contains(textOut, "tidb_cloud_starter") {
+	if strings.Contains(textOut, "tidb_cloud_native") || strings.Contains(textOut, "anonymous") {
 		t.Fatalf("text output = %q, want mapped mode labels", textOut)
 	}
 
@@ -79,7 +79,8 @@ func TestRegionModeLabel(t *testing.T) {
 		mode string
 		want string
 	}{
-		{mode: RegionModeTiDBCloudStarter, want: "Anonymous"},
+		{mode: RegionModeAnonymous, want: "Anonymous"},
+		{mode: RegionModeStarterLegacy, want: "Anonymous"},
 		{mode: RegionModeTiDBCloudNative, want: "TiDBCloud"},
 		{mode: "custom", want: "custom"},
 	}
@@ -136,10 +137,27 @@ func TestValidateRegionManifestAllowsSameRegionDifferentModes(t *testing.T) {
 		Service: "drive9",
 		Default: &RegionManifestDefault{
 			RegionCode: "aws-us-east-1",
-			Mode:       RegionModeTiDBCloudStarter,
+			Mode:       RegionModeAnonymous,
 		},
 		Regions: []RegionManifestEntry{
-			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarter, ServerURL: "https://starter.example"},
+			{RegionCode: "aws-us-east-1", Mode: RegionModeAnonymous, ServerURL: "https://anonymous.example"},
+			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, ServerURL: "https://native.example"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("validateRegionManifest: %v", err)
+	}
+}
+
+func TestValidateRegionManifestAcceptsLegacyAnonymousDefault(t *testing.T) {
+	err := validateRegionManifest(&RegionManifest{
+		Service: "drive9",
+		Default: &RegionManifestDefault{
+			RegionCode: "aws-us-east-1",
+			Mode:       RegionModeStarterLegacy,
+		},
+		Regions: []RegionManifestEntry{
+			{RegionCode: "aws-us-east-1", Mode: RegionModeStarterLegacy, ServerURL: "https://anonymous.example"},
 			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, ServerURL: "https://native.example"},
 		},
 	})
@@ -156,7 +174,7 @@ func TestValidateRegionManifestRejectsMissingDefaultEntry(t *testing.T) {
 			Mode:       RegionModeTiDBCloudNative,
 		},
 		Regions: []RegionManifestEntry{
-			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarter, ServerURL: "https://starter.example"},
+			{RegionCode: "aws-us-east-1", Mode: RegionModeAnonymous, ServerURL: "https://anonymous.example"},
 		},
 	})
 	if err == nil {
@@ -171,8 +189,24 @@ func TestValidateRegionManifestRejectsDuplicateRegionMode(t *testing.T) {
 	err := validateRegionManifest(&RegionManifest{
 		Service: "drive9",
 		Regions: []RegionManifestEntry{
-			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarter, ServerURL: "https://starter-a.example"},
-			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarter, ServerURL: "https://starter-b.example"},
+			{RegionCode: "aws-us-east-1", Mode: RegionModeAnonymous, ServerURL: "https://anonymous-a.example"},
+			{RegionCode: "aws-us-east-1", Mode: RegionModeAnonymous, ServerURL: "https://anonymous-b.example"},
+		},
+	})
+	if err == nil {
+		t.Fatal("validateRegionManifest error = nil, want duplicate key error")
+	}
+	if !strings.Contains(err.Error(), "duplicate region_code") {
+		t.Fatalf("validateRegionManifest error = %q", err)
+	}
+}
+
+func TestValidateRegionManifestRejectsDuplicateLegacyAnonymousMode(t *testing.T) {
+	err := validateRegionManifest(&RegionManifest{
+		Service: "drive9",
+		Regions: []RegionManifestEntry{
+			{RegionCode: "aws-us-east-1", Mode: RegionModeAnonymous, ServerURL: "https://anonymous-a.example"},
+			{RegionCode: "aws-us-east-1", Mode: RegionModeStarterLegacy, ServerURL: "https://anonymous-b.example"},
 		},
 	})
 	if err == nil {
@@ -185,14 +219,42 @@ func TestValidateRegionManifestRejectsDuplicateRegionMode(t *testing.T) {
 
 func TestSelectRegionServerMatchesRegionAndExactMode(t *testing.T) {
 	entry, err := selectRegionServer([]RegionManifestEntry{
-		{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarter, ServerURL: "https://starter.example"},
+		{RegionCode: "aws-us-east-1", Mode: RegionModeAnonymous, ServerURL: "https://anonymous.example"},
 		{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, ServerURL: "https://native.example"},
-	}, "aws-us-east-1", RegionModeTiDBCloudStarter)
+	}, "aws-us-east-1", RegionModeAnonymous)
 	if err != nil {
 		t.Fatalf("selectRegionServer: %v", err)
 	}
-	if entry.ServerURL != "https://starter.example" {
-		t.Fatalf("server = %q, want starter", entry.ServerURL)
+	if entry.ServerURL != "https://anonymous.example" {
+		t.Fatalf("server = %q, want anonymous", entry.ServerURL)
+	}
+}
+
+func TestSelectRegionServerAcceptsLegacyAnonymousMode(t *testing.T) {
+	entry, err := selectRegionServer([]RegionManifestEntry{
+		{RegionCode: "aws-us-east-1", Mode: RegionModeStarterLegacy, ServerURL: "https://legacy-anonymous.example"},
+		{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, ServerURL: "https://native.example"},
+	}, "aws-us-east-1", RegionModeAnonymous)
+	if err != nil {
+		t.Fatalf("selectRegionServer: %v", err)
+	}
+	if entry.ServerURL != "https://legacy-anonymous.example" {
+		t.Fatalf("server = %q, want legacy anonymous", entry.ServerURL)
+	}
+}
+
+func TestSelectRegionServerPreservesRequestedModeInError(t *testing.T) {
+	_, err := selectRegionServer([]RegionManifestEntry{
+		{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, ServerURL: "https://native.example"},
+	}, "aws-us-east-1", RegionModeStarterLegacy)
+	if err == nil {
+		t.Fatal("selectRegionServer error = nil, want unsupported mode error")
+	}
+	if !strings.Contains(err.Error(), `mode "tidb_cloud_starter"`) {
+		t.Fatalf("selectRegionServer error = %q", err)
+	}
+	if strings.Contains(err.Error(), `mode "anonymous"`) {
+		t.Fatalf("selectRegionServer error = %q, should preserve requested mode", err)
 	}
 }
 

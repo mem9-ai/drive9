@@ -23,7 +23,7 @@ const (
 )
 
 func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
-	if s.meta == nil || s.pool == nil || s.provisioner == nil || len(s.tokenSecret) == 0 {
+	if s.meta == nil || s.pool == nil || (s.provisioner == nil && s.legacyStarterProvisioner == nil) || len(s.tokenSecret) == 0 {
 		errJSON(w, http.StatusNotFound, "tenant delete not enabled")
 		return
 	}
@@ -61,7 +61,7 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusConflict, "tidb_zero tenants expire automatically and do not support delete")
 		return
 	}
-	if t.Provider != tenant.ProviderTiDBCloudStarter && t.Provider != tenant.ProviderTiDBCloudNative {
+	if !tenant.SupportsClusterDelete(t.Provider) {
 		errJSON(w, http.StatusConflict, "tenant delete is not supported for provider")
 		return
 	}
@@ -190,10 +190,10 @@ func (s *Server) deprovisionTenantCluster(ctx context.Context, t *meta.Tenant, r
 			return fmt.Errorf("provisioner does not support credential deprovision")
 		}
 		return deprovisioner.DeprovisionWithCredentials(ctx, cluster, req)
-	case tenant.ProviderTiDBCloudStarter:
-		deprovisioner, ok := s.provisioner.(tenant.Deprovisioner)
+	case tenant.ProviderTiDBCloudStarterLegacy:
+		deprovisioner, ok := s.legacyStarterProvisioner.(tenant.Deprovisioner)
 		if !ok {
-			return fmt.Errorf("provisioner does not support deprovision")
+			return fmt.Errorf("legacy starter provisioner does not support deprovision")
 		}
 		return deprovisioner.Deprovision(ctx, cluster)
 	default:

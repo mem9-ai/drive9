@@ -961,7 +961,7 @@ func TestQuotaSetRejectsInvalidQuotaValues(t *testing.T) {
 }
 
 func TestQuotaSetRejectsNonCloudNativeTenant(t *testing.T) {
-	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudStarter)
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBZero)
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 

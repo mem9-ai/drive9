@@ -23,7 +23,7 @@ The large-file path returns `202` through `PUT /v1/fs/{path}`, then `pkg/backend
 
 The current search path concurrently executes FTS and vector search in `pkg/datastore/search.go`. `vectorSearch` requires `f.embedding IS NOT NULL` and directly calls `VEC_EMBED_COSINE_DISTANCE(f.embedding, ?)`, passing the raw query string as the second parameter.
 
-The tenant schema still assumes the database can generate text embeddings automatically. `pkg/tenant/schema_zero.go`, `pkg/tenant/schema_starter.go`, and `pkg/tenant/schema_db9.go` all define `files.embedding` as `GENERATED ALWAYS AS (EMBED_TEXT(...))`. But `drive9` origin issue #30 has already confirmed that online db9 instances do not provide `EMBED_TEXT(text) -> vector`, `CHUNK_TEXT(text)`, or `vec_embed_cosine_distance(vector, text)`.
+The tenant schema still assumes the database can generate text embeddings automatically. `pkg/tenant/schema/tidb_auto.go` defines `files.embedding` as `GENERATED ALWAYS AS (EMBED_TEXT(...))`. But `drive9` origin issue #30 has already confirmed that online db9 instances do not provide `EMBED_TEXT(text) -> vector`, `CHUNK_TEXT(text)`, or `vec_embed_cosine_distance(vector, text)`.
 
 `drive9-2` already has a content-semantic worker, but it only covers image -> text enrichment. `pkg/backend/options.go` starts `imageExtractQueue` / a goroutine when constructing the backend, `pkg/backend/image_extract.go` performs revision-gated async writeback through `UpdateFileSearchText(ctx, fileID, revision, text)`, and `pkg/backend/image_extract_test.go` covers the case where a stale revision must not write back new content.
 
@@ -413,6 +413,6 @@ Phase D is also the place to decide the minimum production observability set nee
 - `drive9-2/pkg/datastore/search.go`
 - `drive9-2/pkg/datastore/store.go`
 - `drive9-2/pkg/tenant/pool.go`
-- `drive9-2/pkg/tenant/schema_zero.go`
-- `drive9-2/pkg/tenant/schema_starter.go`
-- `drive9-2/pkg/tenant/schema_db9.go`
+- `drive9-2/pkg/tenant/schema/tidb_auto.go`
+- `drive9-2/pkg/tenant/schema/tidb_app.go`
+- `drive9-2/pkg/tenant/db9/schema.go`

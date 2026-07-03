@@ -274,7 +274,7 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 	clearProvisionEnv(t)
 
 	var nativeHits int32
-	var starterHits int32
+	var anonymousHits int32
 	bodyCh := make(chan map[string]any, 1)
 	native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&nativeHits, 1)
@@ -296,16 +296,16 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 		})
 	}))
 	defer native.Close()
-	starter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&starterHits, 1)
-		http.Error(w, "starter server should not be used", http.StatusInternalServerError)
+	anonymous := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&anonymousHits, 1)
+		http.Error(w, "anonymous server should not be used", http.StatusInternalServerError)
 	}))
-	defer starter.Close()
+	defer anonymous.Close()
 	manifest := newRegionManifestTestServer(t, []RegionManifestEntry{
 		{
 			RegionCode: "aws-us-east-1",
-			Mode:       RegionModeTiDBCloudStarter,
-			ServerURL:  starter.URL,
+			Mode:       RegionModeAnonymous,
+			ServerURL:  anonymous.URL,
 		},
 		{
 			RegionCode: " aws-us-east-1 ",
@@ -333,8 +333,8 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 	if atomic.LoadInt32(&nativeHits) != 1 {
 		t.Fatalf("native hits = %d, want 1", nativeHits)
 	}
-	if atomic.LoadInt32(&starterHits) != 0 {
-		t.Fatalf("starter hits = %d, want 0", starterHits)
+	if atomic.LoadInt32(&anonymousHits) != 0 {
+		t.Fatalf("anonymous hits = %d, want 0", anonymousHits)
 	}
 	var gotBody map[string]any
 	select {
@@ -371,30 +371,30 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 	}
 }
 
-func TestCreateRegionCodeSelectsStarterWithoutBody(t *testing.T) {
+func TestCreateRegionCodeSelectsAnonymousWithoutBody(t *testing.T) {
 	withIsolatedHome(t)
 	clearProvisionEnv(t)
 
-	var starterHits int32
+	var anonymousHits int32
 	requestBodyCh := make(chan string, 1)
-	starter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&starterHits, 1)
+	anonymous := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&anonymousHits, 1)
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/provision" {
-			t.Fatalf("unexpected starter request %s %s", r.Method, r.URL.Path)
+			t.Fatalf("unexpected anonymous request %s %s", r.Method, r.URL.Path)
 		}
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
-			t.Fatalf("read starter body: %v", err)
+			t.Fatalf("read anonymous body: %v", err)
 		}
 		requestBodyCh <- string(raw)
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"tenant_id": "tenant-starter",
-			"api_key":   "owner-starter",
+			"tenant_id": "tenant-anonymous",
+			"api_key":   "owner-anonymous",
 			"status":    "active",
 		})
 	}))
-	defer starter.Close()
+	defer anonymous.Close()
 	native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "native server should not be used", http.StatusInternalServerError)
 	}))
@@ -407,8 +407,8 @@ func TestCreateRegionCodeSelectsStarterWithoutBody(t *testing.T) {
 		},
 		{
 			RegionCode: "aws-us-east-1",
-			Mode:       RegionModeTiDBCloudStarter,
-			ServerURL:  starter.URL,
+			Mode:       RegionModeAnonymous,
+			ServerURL:  anonymous.URL,
 		},
 	})
 	defer manifest.Close()
@@ -418,20 +418,20 @@ func TestCreateRegionCodeSelectsStarterWithoutBody(t *testing.T) {
 	resetCredentialCacheForTest()
 
 	if _, err := captureStdoutE(t, func() error {
-		return Create([]string{"--name", "starter-region"})
+		return Create([]string{"--name", "anonymous-region"})
 	}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if atomic.LoadInt32(&starterHits) != 1 {
-		t.Fatalf("starter hits = %d, want 1", starterHits)
+	if atomic.LoadInt32(&anonymousHits) != 1 {
+		t.Fatalf("anonymous hits = %d, want 1", anonymousHits)
 	}
 	select {
 	case requestBody := <-requestBodyCh:
 		if requestBody != "" {
-			t.Fatalf("starter body = %q, want empty", requestBody)
+			t.Fatalf("anonymous body = %q, want empty", requestBody)
 		}
 	default:
-		t.Fatal("starter server was not called")
+		t.Fatal("anonymous server was not called")
 	}
 	if got := readTrimEnv(EnvRegionCode); got != "aws-us-east-1" {
 		t.Fatalf("%s = %q, want preserved region code", EnvRegionCode, got)

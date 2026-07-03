@@ -376,7 +376,7 @@ The design intent of this boundary is:
 This proposal recommends supporting the following providers first:
 
 - `tidb_zero`
-- `tidb_cloud_starter`
+- `tidb_cloud_native`
 
 The reason is that the system already has a closure under those providers:
 

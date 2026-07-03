@@ -1,4 +1,5 @@
-// Package starter implements the TiDB Cloud Starter tenant provisioner.
+// Package starter implements compatibility operations for TiDB Cloud Starter
+// tenants persisted before starter provisioning was removed.
 package starter
 
 import (
@@ -9,11 +10,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/big"
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -22,160 +21,71 @@ import (
 )
 
 const (
-	envTiDBAPIURL     = "DRIVE9_TIDBCLOUD_API_URL"
-	envTiDBAPIKey     = "DRIVE9_TIDBCLOUD_API_KEY"
-	envTiDBAPISecret  = "DRIVE9_TIDBCLOUD_API_SECRET"
-	envTiDBPoolID     = "DRIVE9_TIDBCLOUD_POOL_ID"
-	envTiDBSpendLimit = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
+	EnvTiDBCloudNativeAPIURL    = "DRIVE9_TIDBCLOUD_NATIVE_API_URL"
+	EnvTiDBCloudLegacyAPIURL    = "DRIVE9_TIDBCLOUD_API_URL"
+	EnvTiDBCloudAPIKey          = "DRIVE9_TIDBCLOUD_API_KEY"
+	EnvTiDBCloudDAT9APISecret   = "DRIVE9_DAT9_TIDBCLOUD_API_SECRET"
+	EnvTiDBCloudLegacyAPISecret = "DRIVE9_TIDBCLOUD_API_SECRET"
 )
 
-type Provisioner struct {
-	apiURL            string
-	apiKey            string
-	apiSecret         string
-	poolID            string
-	defaultSpendLimit *int32
-	client            *http.Client
+// LegacyProvisioner keeps delete/fork operations available for persisted
+// tidb_cloud_starter tenants. It must not be used for new tenant provisioning.
+type LegacyProvisioner struct {
+	apiURL    string
+	apiKey    string
+	apiSecret string
+	client    *http.Client
 }
 
-func NewProvisionerFromEnv() (*Provisioner, error) {
-	apiURL := os.Getenv(envTiDBAPIURL)
-	apiKey := os.Getenv(envTiDBAPIKey)
-	apiSecret := os.Getenv(envTiDBAPISecret)
-	poolID := os.Getenv(envTiDBPoolID)
-	if apiURL == "" || apiKey == "" || apiSecret == "" || poolID == "" {
-		return nil, fmt.Errorf("%s, %s, %s and %s are required", envTiDBAPIURL, envTiDBAPIKey, envTiDBAPISecret, envTiDBPoolID)
+func NewLegacyProvisionerFromEnv() (*LegacyProvisioner, error) {
+	apiURL := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeAPIURL))
+	if apiURL == "" {
+		apiURL = strings.TrimSpace(os.Getenv(EnvTiDBCloudLegacyAPIURL))
 	}
-	defaultSpendLimit, err := parseDefaultSpendLimit(os.Getenv(envTiDBSpendLimit))
-	if err != nil {
-		return nil, err
+	apiKey := strings.TrimSpace(os.Getenv(EnvTiDBCloudAPIKey))
+	apiSecret := strings.TrimSpace(os.Getenv(EnvTiDBCloudDAT9APISecret))
+	if apiSecret == "" {
+		apiSecret = strings.TrimSpace(os.Getenv(EnvTiDBCloudLegacyAPISecret))
 	}
-	return &Provisioner{
-		apiURL:            strings.TrimRight(apiURL, "/"),
-		apiKey:            apiKey,
-		apiSecret:         apiSecret,
-		poolID:            poolID,
-		defaultSpendLimit: defaultSpendLimit,
-		client:            &http.Client{Timeout: 60 * time.Second},
+	if apiURL == "" || apiKey == "" || apiSecret == "" {
+		return nil, fmt.Errorf("%s or %s, %s, and %s or %s are required for legacy starter operations",
+			EnvTiDBCloudNativeAPIURL, EnvTiDBCloudLegacyAPIURL, EnvTiDBCloudAPIKey, EnvTiDBCloudDAT9APISecret, EnvTiDBCloudLegacyAPISecret)
+	}
+	parsed, err := url.Parse(apiURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return nil, fmt.Errorf("%s or %s must be a valid https URL", EnvTiDBCloudNativeAPIURL, EnvTiDBCloudLegacyAPIURL)
+	}
+	return &LegacyProvisioner{
+		apiURL:    strings.TrimRight(apiURL, "/"),
+		apiKey:    apiKey,
+		apiSecret: apiSecret,
+		client:    &http.Client{Timeout: 60 * time.Second},
 	}, nil
 }
 
-func (p *Provisioner) ProviderType() string { return tenant.ProviderTiDBCloudStarter }
+func LegacyEnvPresent() bool {
+	return strings.TrimSpace(os.Getenv(EnvTiDBCloudAPIKey)) != "" ||
+		strings.TrimSpace(os.Getenv(EnvTiDBCloudDAT9APISecret)) != "" ||
+		strings.TrimSpace(os.Getenv(EnvTiDBCloudLegacyAPISecret)) != ""
+}
 
-// InitSchema repairs known launch-schema drift (for example, missing uploads
-// columns from legacy tenants) and validates the TiDB auto-embedding contract.
-func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
+func (p *LegacyProvisioner) ProviderType() string {
+	return tenant.ProviderTiDBCloudStarterLegacy
+}
+
+func (p *LegacyProvisioner) InitSchema(ctx context.Context, dsn string) error {
 	return schema.EnsureTiDBSchemaForModeDSN(ctx, dsn, schema.TiDBEmbeddingModeAuto)
 }
 
-func (p *Provisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, dsn string, profile schema.TiDBAutoEmbeddingProfile) error {
+func (p *LegacyProvisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, dsn string, profile schema.TiDBAutoEmbeddingProfile) error {
 	return schema.EnsureTiDBSchemaForAutoEmbeddingProfileDSN(ctx, dsn, profile)
 }
 
-func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
-	password, err := generateRandomPassword(24)
-	if err != nil {
-		return nil, err
-	}
-	body, err := json.Marshal(map[string]string{"pool_id": p.poolID, "root_password": password})
-	if err != nil {
-		return nil, err
-	}
-	endpoint := p.apiURL + "/v1beta1/clusters:takeoverFromPool"
-	resp, err := p.doDigestAuthRequest(ctx, http.MethodPost, endpoint, body)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("starter provision status %d: %s", resp.StatusCode, string(raw))
-	}
-
-	var out struct {
-		ClusterID string `json:"clusterId"`
-		Endpoints struct {
-			Public struct {
-				Host string `json:"host"`
-				Port int    `json:"port"`
-			} `json:"public"`
-		} `json:"endpoints"`
-		UserPrefix string `json:"userPrefix"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, err
-	}
-	if out.Endpoints.Public.Host == "" || out.Endpoints.Public.Port == 0 {
-		return nil, fmt.Errorf("starter response missing endpoint")
-	}
-	if out.ClusterID == "" {
-		return nil, fmt.Errorf("starter response missing cluster id")
-	}
-	if out.UserPrefix == "" {
-		return nil, fmt.Errorf("starter response missing user prefix")
-	}
-	cluster := &tenant.ClusterInfo{
-		TenantID:  tenantID,
-		ClusterID: out.ClusterID,
-		Host:      out.Endpoints.Public.Host,
-		Port:      out.Endpoints.Public.Port,
-		Username:  out.UserPrefix + ".root",
-		Password:  password,
-		DBName:    "test",
-		Provider:  tenant.ProviderTiDBCloudStarter,
-	}
-	if p.defaultSpendLimit != nil {
-		if err := p.UpdateSpendingLimit(ctx, out.ClusterID, *p.defaultSpendLimit); err != nil {
-			return cluster, fmt.Errorf("update starter spending limit for cluster %s: %w", out.ClusterID, err)
-		}
-	}
-
-	return cluster, nil
+func (p *LegacyProvisioner) Provision(context.Context, string) (*tenant.ClusterInfo, error) {
+	return nil, fmt.Errorf("legacy TiDB Cloud Starter provisioning is disabled")
 }
 
-func parseDefaultSpendLimit(raw string) (*int32, error) {
-	if raw == "" {
-		return nil, nil
-	}
-	trimmed := strings.TrimSpace(raw)
-	monthly, err := strconv.ParseInt(trimmed, 10, 32)
-	if err != nil || monthly < 0 {
-		return nil, fmt.Errorf("invalid %s value %q: must be a non-negative integer", envTiDBSpendLimit, raw)
-	}
-	out := int32(monthly)
-	return &out, nil
-}
-
-func (p *Provisioner) UpdateSpendingLimit(ctx context.Context, clusterID string, monthly int32) error {
-	if clusterID == "" {
-		return fmt.Errorf("cluster id is required")
-	}
-	if monthly < 0 {
-		return fmt.Errorf("spending limit must be non-negative")
-	}
-	body, err := json.Marshal(map[string]any{
-		"updateMask": "spendingLimit.monthly",
-		"cluster": map[string]any{
-			"spendingLimit": map[string]int32{"monthly": monthly},
-		},
-	})
-	if err != nil {
-		return err
-	}
-	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, clusterID)
-	resp, err := p.doDigestAuthRequest(ctx, http.MethodPatch, endpoint, body)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("starter spending limit update status %d: %s", resp.StatusCode, string(raw))
-	}
-	return nil
-}
-
-func (p *Provisioner) Deprovision(ctx context.Context, cluster *tenant.ClusterInfo) error {
+func (p *LegacyProvisioner) Deprovision(ctx context.Context, cluster *tenant.ClusterInfo) error {
 	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
 		return fmt.Errorf("cluster id is required")
 	}
@@ -192,7 +102,7 @@ func (p *Provisioner) Deprovision(ctx context.Context, cluster *tenant.ClusterIn
 	return nil
 }
 
-func (p *Provisioner) ProvisionBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+func (p *LegacyProvisioner) ProvisionBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
 	out, err := p.CreateBranch(ctx, forkTenantID, source)
 	if err != nil {
 		return out, err
@@ -203,7 +113,7 @@ func (p *Provisioner) ProvisionBranch(ctx context.Context, forkTenantID string, 
 	return p.WaitForBranchActive(ctx, out)
 }
 
-func (p *Provisioner) CreateBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+func (p *LegacyProvisioner) CreateBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
 	if source == nil {
 		return nil, fmt.Errorf("source cluster info is required")
 	}
@@ -225,7 +135,7 @@ func (p *Provisioner) CreateBranch(ctx context.Context, forkTenantID string, sou
 	if err != nil {
 		return nil, err
 	}
-	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches", p.apiURL, source.ClusterID)
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches", p.apiURL, url.PathEscape(source.ClusterID))
 	resp, err := p.doDigestAuthRequest(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
 		return nil, err
@@ -253,7 +163,7 @@ func (p *Provisioner) CreateBranch(ctx context.Context, forkTenantID string, sou
 		BranchID:  branch.BranchID,
 		Password:  source.Password,
 		DBName:    dbName,
-		Provider:  tenant.ProviderTiDBCloudStarter,
+		Provider:  tenant.ProviderTiDBCloudStarterLegacy,
 	}
 	if branch.State != "" && branch.State != "ACTIVE" {
 		return out, nil
@@ -266,7 +176,7 @@ func (p *Provisioner) CreateBranch(ctx context.Context, forkTenantID string, sou
 	return out, nil
 }
 
-func (p *Provisioner) WaitForBranchActive(ctx context.Context, branch *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+func (p *LegacyProvisioner) WaitForBranchActive(ctx context.Context, branch *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
 	if branch == nil {
 		return nil, fmt.Errorf("branch cluster info is required")
 	}
@@ -281,27 +191,15 @@ func (p *Provisioner) WaitForBranchActive(ctx context.Context, branch *tenant.Cl
 	if err := fillBranchEndpoint(&out, info); err != nil {
 		return &out, err
 	}
+	out.Provider = tenant.ProviderTiDBCloudStarterLegacy
 	return &out, nil
 }
 
-func fillBranchEndpoint(out *tenant.ClusterInfo, branch *starterBranchInfo) error {
-	if branch.Endpoints.Public.Host == "" || branch.Endpoints.Public.Port == 0 {
-		return fmt.Errorf("starter branch response missing endpoint")
-	}
-	if branch.UserPrefix == "" {
-		return fmt.Errorf("starter branch response missing user prefix")
-	}
-	out.Host = branch.Endpoints.Public.Host
-	out.Port = branch.Endpoints.Public.Port
-	out.Username = branch.UserPrefix + ".root"
-	return nil
-}
-
-func (p *Provisioner) DeleteBranch(ctx context.Context, clusterID, branchID string) error {
+func (p *LegacyProvisioner) DeleteBranch(ctx context.Context, clusterID, branchID string) error {
 	if clusterID == "" || branchID == "" {
 		return fmt.Errorf("cluster id and branch id are required")
 	}
-	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches/%s", p.apiURL, clusterID, branchID)
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches/%s", p.apiURL, url.PathEscape(clusterID), url.PathEscape(branchID))
 	resp, err := p.doDigestAuthRequest(ctx, http.MethodDelete, endpoint, nil)
 	if err != nil {
 		return err
@@ -334,10 +232,23 @@ func parseStarterBranchInfo(raw []byte) (*starterBranchInfo, error) {
 	return &out, nil
 }
 
-func (p *Provisioner) waitForBranchActive(ctx context.Context, clusterID, branchID string) (*starterBranchInfo, error) {
+func fillBranchEndpoint(out *tenant.ClusterInfo, branch *starterBranchInfo) error {
+	if branch.Endpoints.Public.Host == "" || branch.Endpoints.Public.Port == 0 {
+		return fmt.Errorf("starter branch response missing endpoint")
+	}
+	if branch.UserPrefix == "" {
+		return fmt.Errorf("starter branch response missing user prefix")
+	}
+	out.Host = branch.Endpoints.Public.Host
+	out.Port = branch.Endpoints.Public.Port
+	out.Username = branch.UserPrefix + ".root"
+	return nil
+}
+
+func (p *LegacyProvisioner) waitForBranchActive(ctx context.Context, clusterID, branchID string) (*starterBranchInfo, error) {
 	deadline := time.Now().Add(10 * time.Minute)
 	for {
-		endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches/%s?view=BASIC", p.apiURL, clusterID, branchID)
+		endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches/%s?view=BASIC", p.apiURL, url.PathEscape(clusterID), url.PathEscape(branchID))
 		resp, err := p.doDigestAuthRequest(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, err
@@ -365,7 +276,7 @@ func (p *Provisioner) waitForBranchActive(ctx context.Context, clusterID, branch
 	}
 }
 
-func (p *Provisioner) doDigestAuthRequest(ctx context.Context, method, uri string, body []byte) (*http.Response, error) {
+func (p *LegacyProvisioner) doDigestAuthRequest(ctx context.Context, method, uri string, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, uri, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -445,18 +356,4 @@ func generateNonce() (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%x", b), nil
-}
-
-func generateRandomPassword(length int) (string, error) {
-	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, length)
-	max := big.NewInt(int64(len(chars)))
-	for i := range b {
-		n, err := rand.Int(rand.Reader, max)
-		if err != nil {
-			return "", err
-		}
-		b[i] = chars[n.Int64()]
-	}
-	return string(b), nil
 }
