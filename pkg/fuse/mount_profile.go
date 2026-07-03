@@ -95,7 +95,7 @@ func ParseSyncMode(s string) (SyncMode, error) {
 const rttThreshold = 10 * time.Millisecond
 
 // maxCommitQueuePending is the backpressure limit for the commit queue.
-const maxCommitQueuePending = 100
+const maxCommitQueuePending = 500
 
 // MeasureRTT measures the round-trip time to the server by issuing a HEAD
 // request to the root path. Returns the measured duration.
