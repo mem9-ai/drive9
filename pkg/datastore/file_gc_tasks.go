@@ -112,6 +112,18 @@ func (s *Store) ListFileGCTaskS3Refs(ctx context.Context, cursor string, limit i
 	return out, nextCursor, nil
 }
 
+// CountQueuedFileGCTasks returns the number of file_gc tasks in queued status.
+// This is a read-only query used by the safety-net scan to detect unclaimed
+// tasks without claiming them (unlike ClaimFileGCTask which mutates state).
+func (s *Store) CountQueuedFileGCTasks(ctx context.Context) (count int64, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "count_queued_file_gc_tasks", start, &err)
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM file_gc_tasks WHERE status = ?`,
+		"queued").Scan(&count)
+	return count, err
+}
+
 // ClaimFileGCTask claims one queued file GC task and leases it to the caller.
 func (s *Store) ClaimFileGCTask(ctx context.Context, now time.Time, leaseDuration time.Duration) (out *FileGCTask, found bool, err error) {
 	start := time.Now()
