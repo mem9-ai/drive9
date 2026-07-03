@@ -43,6 +43,9 @@ jobs:
       - name: Test
         run: make test TEST_TIMEOUT=25m
 
+      - name: Cleanup test containers
+        run: docker rm -f $(docker ps -aq --filter "ancestor=mysql:8.0.36") 2>/dev/null || true
+
       - name: Install failpoint-ctl
         run: go install github.com/pingcap/failpoint/failpoint-ctl@latest
 
