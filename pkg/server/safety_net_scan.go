@@ -114,12 +114,12 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 					needKick = true
 				}
 				// Recover expired file_gc leases.
-				if _, err := store.RecoverExpiredFileGCTasks(ctx, now, safetyNetRecoverLimit); err != nil {
+				if recovered, err := store.RecoverExpiredFileGCTasks(ctx, now, safetyNetRecoverLimit); err != nil {
 					if ctx.Err() == nil {
 						logger.Warn(ctx, "safety_net_scan_file_gc_recover_failed",
 							zap.String("tenant_id", t.ID), zap.Error(err))
 					}
-				} else {
+				} else if recovered > 0 {
 					needKick = true
 				}
 				// Check for unclaimed queued semantic tasks. If the outbox
