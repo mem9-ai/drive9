@@ -48,8 +48,8 @@ func NewLegacyProvisionerFromEnv() (*LegacyProvisioner, error) {
 		apiSecret = strings.TrimSpace(os.Getenv(EnvTiDBCloudLegacyAPISecret))
 	}
 	if apiURL == "" || apiKey == "" || apiSecret == "" {
-		return nil, fmt.Errorf("%s or %s, %s and %s are required for legacy starter operations",
-			EnvTiDBCloudNativeAPIURL, EnvTiDBCloudLegacyAPIURL, EnvTiDBCloudAPIKey, EnvTiDBCloudDAT9APISecret)
+		return nil, fmt.Errorf("%s or %s, %s, and %s or %s are required for legacy starter operations",
+			EnvTiDBCloudNativeAPIURL, EnvTiDBCloudLegacyAPIURL, EnvTiDBCloudAPIKey, EnvTiDBCloudDAT9APISecret, EnvTiDBCloudLegacyAPISecret)
 	}
 	parsed, err := url.Parse(apiURL)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
