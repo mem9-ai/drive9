@@ -46,12 +46,12 @@ const (
 // per-tenant TiDB scanning. Idle tenant TiDBs can scale to zero because the
 // poller never touches them — it only reads the central meta DB.
 type tenantOutboxPoller struct {
-	metaStore       *meta.Store
-	buses           *eventBuses
-	worker          outboxKicker
-	shardFn         func(string) bool
-	podID           string
-	interval        time.Duration
+	metaStore        *meta.Store
+	buses            *eventBuses
+	worker           outboxKicker
+	shardFn          func(string) bool
+	podID            string
+	interval         time.Duration
 	cursorFlushEvery time.Duration
 
 	lastID uint64

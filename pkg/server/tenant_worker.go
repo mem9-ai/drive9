@@ -26,8 +26,8 @@ const (
 	defaultTenantWorkers              = 1
 	defaultTenantPollInterval         = 200 * time.Millisecond
 	defaultTenantLeaseDuration        = 30 * time.Second
-	defaultTenantRetryBaseDelay        = 200 * time.Millisecond
-	defaultTenantRetryMaxDelay         = 30 * time.Second
+	defaultTenantRetryBaseDelay       = 200 * time.Millisecond
+	defaultTenantRetryMaxDelay        = 30 * time.Second
 	defaultTenantPerTenantConcurrency = 1
 	tenantLocalID                     = "local"
 	// tenantKickQueueCapacity bounds buffered kicks; overflow kicks are left

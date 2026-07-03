@@ -3679,10 +3679,18 @@ func (s *Store) UpsertTenantOutboxCursor(ctx context.Context, podID string, last
 
 // DeleteTenantOutboxCursor removes the cursor row for podID. Used when a pod
 // is decommissioned so its cursor doesn't linger.
+// DeleteTenantOutboxCursor deletes the cursor row for the given pod, but only
+// if the pod is currently stale in pod_registry. This prevents a TOCTOU race
+// where a pod recovers between ListStalePods and the cursor delete — a
+// recovered pod retains its cursor so its last_id is not lost. The conditional
+// join mirrors DeleteSubscriptionsForStalePods.
 func (s *Store) DeleteTenantOutboxCursor(ctx context.Context, podID string) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "delete_tenant_outbox_cursor", start, &err)
-	_, err = s.db.ExecContext(ctx, `DELETE FROM tenant_outbox_cursor WHERE pod_id = ?`, podID)
+	_, err = s.db.ExecContext(ctx,
+		`DELETE FROM tenant_outbox_cursor WHERE pod_id = ?
+		 AND EXISTS (SELECT 1 FROM pod_registry WHERE pod_id = ? AND status = 'stale')`,
+		podID, podID)
 	return err
 }
 

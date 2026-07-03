@@ -105,15 +105,15 @@ type Config struct {
 	// PodNotifySecret is retained for backward compatibility (the internal
 	// /v1/internal/sse-notify endpoint). Cross-pod push is superseded by the
 	// unified outbox poller; the secret still gates the legacy endpoint.
-	TenantOutboxPollInterval      time.Duration
+	TenantOutboxPollInterval        time.Duration
 	TenantOutboxCursorFlushInterval time.Duration
-	TenantShardRefreshInterval    time.Duration
-	TenantMaintenanceInterval      time.Duration
-	SafetyNetScanInterval          time.Duration
-	SSENotifyRetention             time.Duration
-	PodID                          string
-	PodAddr                        string
-	PodNotifySecret                []byte
+	TenantShardRefreshInterval      time.Duration
+	TenantMaintenanceInterval       time.Duration
+	SafetyNetScanInterval           time.Duration
+	SSENotifyRetention              time.Duration
+	PodID                           string
+	PodAddr                         string
+	PodNotifySecret                 []byte
 }
 
 type SlockOAuthClient interface {
@@ -325,14 +325,14 @@ func NewWithConfig(cfg Config) *Server {
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
 			apiBase: strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIBase),
 		},
-		disableDBAutoEmbed:  cfg.DisableDatabaseAutoEmbedding || (cfg.Pool != nil && cfg.Pool.IsAutoEmbeddingDisabled()),
-		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
-		forkWorkerCtx:       forkWorkerCtx,
-		forkWorkerCancel:    forkWorkerCancel,
-		leader:                 cfg.Leader,
-		podNotifySecret:        cfg.PodNotifySecret,
-		sseNotifyRetention:     cfg.SSENotifyRetention,
-		safetyNetScanInterval:  cfg.SafetyNetScanInterval,
+		disableDBAutoEmbed:    cfg.DisableDatabaseAutoEmbedding || (cfg.Pool != nil && cfg.Pool.IsAutoEmbeddingDisabled()),
+		journalCursorSecret:   newJournalCursorSecret(cfg.TokenSecret),
+		forkWorkerCtx:         forkWorkerCtx,
+		forkWorkerCancel:      forkWorkerCancel,
+		leader:                cfg.Leader,
+		podNotifySecret:       cfg.PodNotifySecret,
+		sseNotifyRetention:    cfg.SSENotifyRetention,
+		safetyNetScanInterval: cfg.SafetyNetScanInterval,
 	}
 	// Default SSE notify retention.
 	if s.sseNotifyRetention <= 0 {

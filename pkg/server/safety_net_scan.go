@@ -76,6 +76,7 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 				if store == nil {
 					return
 				}
+				needKick := false
 				// Recover expired semantic task leases.
 				if recovered, err := store.RecoverExpiredSemanticTasks(ctx, now, safetyNetRecoverLimit); err != nil {
 					if ctx.Err() == nil {
@@ -84,6 +85,7 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 					}
 				} else if recovered > 0 {
 					metrics.RecordTenantOperation(t.ID, "semantic_worker", "safety_net_recover", "ok", 0)
+					needKick = true
 				}
 				// Recover expired file_gc leases.
 				if _, err := store.RecoverExpiredFileGCTasks(ctx, now, safetyNetRecoverLimit); err != nil {
@@ -91,6 +93,26 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 						logger.Warn(ctx, "safety_net_scan_file_gc_recover_failed",
 							zap.String("tenant_id", t.ID), zap.Error(err))
 					}
+				} else {
+					needKick = true
+				}
+				// Check for unclaimed queued semantic tasks. If the outbox kick was
+				// lost (cursor advanced past the row, pod crashed before processing),
+				// queued tasks may never be claimed. ObserveSemanticTasks is a cheap
+				// read that returns the queued count. If >0, kick the worker.
+				if obs, err := store.ObserveSemanticTasks(ctx, now); err == nil && obs.Queued > 0 {
+					needKick = true
+				}
+				// Check for unclaimed queued file_gc tasks by attempting a probe
+				// claim. If found, release it back to queued and kick the worker.
+				if _, found, err := store.ClaimFileGCTask(ctx, now, 1*time.Second); err == nil && found {
+					// The claim set the task to processing with a 1s lease. It will
+					// be recovered by the next safety-net cycle if the worker doesn't
+					// process it in time. Kick the worker so it drains it immediately.
+					needKick = true
+				}
+				if needKick && s.tenantWorker != nil {
+					s.tenantWorker.Kick(t.ID, WorkSemantic|WorkFileGC)
 				}
 			}()
 		}

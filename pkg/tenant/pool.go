@@ -119,7 +119,7 @@ type Pool struct {
 	order                     *list.List
 	maxSize                   int
 	tidbSchemaValidationOpens atomic.Uint64
-	tenantWorkNotifier       atomic.Pointer[func(tenantID string, workMask int)]
+	tenantWorkNotifier        atomic.Pointer[func(tenantID string, workMask int)]
 	// fileGCEnabled is retained for backward compatibility but no longer used:
 	// FileGC is now kick-driven through the unified tenant worker, not a
 	// per-backend goroutine.

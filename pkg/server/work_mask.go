@@ -4,8 +4,9 @@ import "github.com/mem9-ai/drive9/pkg/backend"
 
 // Work mask constants for the unified tenant notify outbox. Each bit in
 // work_mask selects one work type. The poller dispatches by testing bits:
-//   SSE bit  → wake local SSE bus (broadcast: all pods with subscribers)
-//   Semantic/GC/Quota bits → kick unified worker (sharded: shard owner only)
+//
+//	SSE bit  → wake local SSE bus (broadcast: all pods with subscribers)
+//	Semantic/GC/Quota bits → kick unified worker (sharded: shard owner only)
 //
 // These mirror the backend.Work* constants in pkg/backend/dat9.go. The
 // compile-time assertions below ensure the values stay in sync.
