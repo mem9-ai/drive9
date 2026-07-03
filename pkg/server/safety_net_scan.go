@@ -16,31 +16,43 @@ const (
 	safetyNetScanBatchSize = 128
 	// safetyNetRecoverLimit bounds expired lease recovery per tenant per scan.
 	safetyNetRecoverLimit = 64
-	// safetyNetColdOpenLimit bounds the number of cold (not cached) tenants
-	// that the safety-net will open per scan cycle. This prevents waking too
-	// many serverless TiDBs in one sweep while still catching stranded queued
-	// tasks for idle tenants whose outbox kick was lost.
-	safetyNetColdOpenLimit = 10
 )
 
 // safetyNetScan is a periodic (5min) scan that recovers expired leases and
 // discovers unclaimed queued tasks for tenants this pod owns. It runs on every
 // pod (not leader-gated) and filters by shard ownership.
 //
-// For warm tenants (already in the pool cache via AcquireCached), it:
+// **Design constraint — warm-only, never opens cold tenant TiDBs:**
+// The scan exclusively uses AcquireCached (warm-only). A cold tenant whose
+// TiDB has scaled to zero is never opened by the safety-net. This preserves
+// the issue #658 invariant: "no periodic goroutine ever touches idle tenant
+// TiDBs." Opening cold tenants would reintroduce the exact periodic-scan
+// cost this PR eliminates.
+//
+// **Lost-kick recovery for cold tenants:**
+// If an outbox kick is lost (cursor advanced past the row, pod crash before
+// processing) AND the tenant subsequently goes cold (TiDB scales to zero),
+// unclaimed queued tasks are not discovered by the safety-net. They remain
+// in the tenant TiDB until the next write triggers a fresh outbox row →
+// kick → worker opens the TiDB → drains queued tasks. This is a design
+// constraint, not a bug:
+//  1. Queued tasks are produced by writes. A write always triggers an
+//     in-process kick (~0ms) on the same pod. The kick is lost only if the
+//     pod crashes between commit and worker processing — an extreme case.
+//  2. A cold tenant has no traffic (no writes, no reads). Its queued tasks
+//     have no consumer — no one is searching or reading the content that
+//     the task would index. The delay is invisible to users.
+//  3. The next write (whenever it comes) produces a fresh kick that opens
+//     the TiDB and drains all queued tasks. The task rows are durable in
+//     the tenant TiDB — they are never lost, only delayed.
+//
+// This is the safety net, not the primary path: the unified outbox poller
+// is the primary delivery mechanism. The scan catches the rare case where
+// a kick was lost for a warm tenant (pod crash before cursor flush, outbox
+// row pruned before read, etc). For warm tenants it:
 //   - recovers expired semantic and file_gc leases
 //   - checks for unclaimed queued tasks (ObserveSemanticTasks, CountQueuedFileGCTasks)
 //   - kicks the worker if any work is found
-//
-// For cold tenants (not cached), it opens up to safetyNetColdOpenLimit per
-// cycle via pool.Acquire to check for queued tasks. This is the durable
-// fallback for the lost-kick scenario: if the outbox kick was lost and the
-// tenant has no subsequent writes, the safety-net discovers the stranded
-// queued tasks within 5 minutes. The cold-open limit prevents waking too many
-// serverless TiDBs in a single sweep.
-// This is the safety net, not the primary path: the unified outbox poller is
-// the primary delivery mechanism. The scan catches the rare case where a kick
-// was lost (pod crash before cursor flush, outbox row pruned before read, etc).
 func (s *Server) safetyNetScan(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
@@ -55,7 +67,6 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 	now := time.Now().UTC()
 	var afterCreatedAt time.Time
 	var afterID string
-	coldOpens := 0
 	for {
 		if ctx.Err() != nil {
 			return
@@ -76,25 +87,14 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 			if !shardFn(t.ID) {
 				continue
 			}
-			// Try warm-only first (AcquireCached — no cold open).
+			// Warm-only: AcquireCached returns the backend only if it's
+			// already in the pool cache. A cold tenant (TiDB scaled to zero)
+			// is skipped — the safety-net never opens a cold TiDB. See the
+			// design constraint comment above for the lost-kick recovery
+			// semantics of cold tenants.
 			b, release, ok := s.pool.AcquireCached(&t)
 			if !ok {
-				// Cold tenant: not in pool cache. Open it via pool.Acquire
-				// to check for stranded queued tasks, but limit the number
-				// of cold opens per scan cycle to avoid waking too many
-				// serverless TiDBs at once.
-				if coldOpens >= safetyNetColdOpenLimit {
-					continue
-				}
-				b, release, err = s.pool.Acquire(ctx, &t)
-				if err != nil {
-					if ctx.Err() == nil {
-						logger.Warn(ctx, "safety_net_scan_cold_open_failed",
-							zap.String("tenant_id", t.ID), zap.Error(err))
-					}
-					continue
-				}
-				coldOpens++
+				continue
 			}
 			func() {
 				defer release()
@@ -122,16 +122,18 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 				} else {
 					needKick = true
 				}
-				// Check for unclaimed queued semantic tasks. If the outbox kick
-				// was lost (cursor advanced past the row, pod crashed before
-				// processing), queued tasks may never be claimed.
-				// ObserveSemanticTasks is a read-only query. If queued > 0, kick.
+				// Check for unclaimed queued semantic tasks. If the outbox
+				// kick was lost (cursor advanced past the row, pod crashed
+				// before processing), queued tasks may never be claimed.
+				// ObserveSemanticTasks is a read-only query. If queued > 0,
+				// kick the worker so it claims and processes them.
 				if obs, err := store.ObserveSemanticTasks(ctx, now); err == nil && obs.Queued > 0 {
 					needKick = true
 				}
-				// Check for unclaimed queued file_gc tasks via a read-only count.
-				// Do NOT use ClaimFileGCTask here — it would mutate the task to
-				// processing and make it invisible to the worker's drainFileGC.
+				// Check for unclaimed queued file_gc tasks via a read-only
+				// count. Do NOT use ClaimFileGCTask here — it would mutate
+				// the task to processing and make it invisible to the
+				// worker's drainFileGC.
 				if n, err := store.CountQueuedFileGCTasks(ctx); err == nil && n > 0 {
 					needKick = true
 				}

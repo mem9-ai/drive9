@@ -611,9 +611,9 @@ func TestAutoImagePutWritesContentTextEndToEnd(t *testing.T) {
 			Extractor: staticServerImageExtractor{text: "caption from http put"},
 		},
 	}, TenantWorkerOptions{
-		Workers:         1,
-		PollInterval:    10 * time.Millisecond,
-		LeaseDuration:   200 * time.Millisecond,
+		Workers:       1,
+		PollInterval:  10 * time.Millisecond,
+		LeaseDuration: 200 * time.Millisecond,
 	})
 	ts := httptest.NewServer(s)
 	defer ts.Close()
@@ -1107,9 +1107,9 @@ func TestAutoImageMultipartOverwriteWritesContentTextEndToEnd(t *testing.T) {
 			Extractor: staticServerImageExtractor{text: "caption from multipart overwrite"},
 		},
 	}, TenantWorkerOptions{
-		Workers:         1,
-		PollInterval:    10 * time.Millisecond,
-		LeaseDuration:   200 * time.Millisecond,
+		Workers:       1,
+		PollInterval:  10 * time.Millisecond,
+		LeaseDuration: 200 * time.Millisecond,
 	})
 	ts := httptest.NewServer(s)
 	defer ts.Close()

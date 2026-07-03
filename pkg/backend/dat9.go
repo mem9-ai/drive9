@@ -74,9 +74,9 @@ const (
 // package so the write path can signal which work types were enqueued without
 // importing the server package (which would be a circular dependency).
 const (
-	BackendWorkSSE      = 1  // wake local SSE bus
-	BackendWorkSemantic  = 2  // kick semantic worker
-	BackendWorkFileGC    = 4  // kick file GC worker
+	BackendWorkSSE      = 1 // wake local SSE bus
+	BackendWorkSemantic = 2 // kick semantic worker
+	BackendWorkFileGC   = 4 // kick file GC worker
 )
 
 // Dat9Backend implements filesystem.FileSystem with the inode model.

@@ -35,7 +35,7 @@ type podRegistry struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
-	wg    sync.WaitGroup
+	wg     sync.WaitGroup
 }
 
 const (

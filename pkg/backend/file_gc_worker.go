@@ -16,10 +16,10 @@ import (
 
 const (
 	defaultFileGCLeaseDuration  = 5 * time.Minute
-	defaultFileGCBatchSize       = 100
-	defaultFileGCRecoverLimit    = 100
-	defaultFileGCRetryBaseDelay  = 2 * time.Second
-	defaultFileGCRetryMaxDelay   = 2 * time.Minute
+	defaultFileGCBatchSize      = 100
+	defaultFileGCRecoverLimit   = 100
+	defaultFileGCRetryBaseDelay = 2 * time.Second
+	defaultFileGCRetryMaxDelay  = 2 * time.Minute
 )
 
 // FileGCWorkerOptions controls file GC task processing parameters. These

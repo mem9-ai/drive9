@@ -7,7 +7,7 @@ import (
 func TestJumpConsistentHash(t *testing.T) {
 	t.Parallel()
 	// Same key + same bucket count → same bucket.
-	for _, key := range []uint64{0, 1, 42, 1000, 1<<33, ^uint64(0)} {
+	for _, key := range []uint64{0, 1, 42, 1000, 1 << 33, ^uint64(0)} {
 		a := jumpConsistentHash(key, 10)
 		b := jumpConsistentHash(key, 10)
 		if a != b {
