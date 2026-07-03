@@ -146,49 +146,18 @@ jobs:
           kubectl --context us -n drive9-tidbcloud \
             rollout undo deployment/drive9-server
 
-      - name: Deploy to aws-us-west-2
-        id: deploy-uw2
-        if: inputs.region == 'all' || inputs.region == 'aws-us-west-2'
-        run: |
-          aws eks update-kubeconfig \
-            --name prod-drive9-usw2 \
-            --region us-west-2 \
-            --alias uw2
-          kubectl --context uw2 -n "${{ env.DEPLOY_NAMESPACE }}" \
-            set image "deployment/${{ env.K8S_DEPLOYMENT }}" \
-            "${{ env.K8S_DEPLOYMENT }}=$IMAGE"
-          REPLICAS=$(kubectl --context uw2 -n "${{ env.DEPLOY_NAMESPACE }}" \
-            get "deployment/${{ env.K8S_DEPLOYMENT }}" \
-            -o 'jsonpath={.spec.replicas}')
-          if [ "$REPLICAS" != "0" ]; then
-            kubectl --context uw2 -n "${{ env.DEPLOY_NAMESPACE }}" \
-              rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
-              --timeout=300s
-          fi
-
-      - name: Rollback aws-us-west-2 dat9 on failure
-        if: failure() && steps.deploy-uw2.outcome == 'failure'
-        run: |
-          kubectl --context uw2 -n "${{ env.DEPLOY_NAMESPACE }}" \
-            rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
-
       - name: Deploy drive9-tidbcloud to aws-us-west-2
-        id: deploy-uw2-native
+        id: deploy-uw2
         if: inputs.region == 'all' || inputs.region == 'aws-us-west-2'
         run: |
           kubectl --context uw2 -n drive9-tidbcloud \
             set image deployment/drive9-server \
             drive9-server=$IMAGE
-          REPLICAS=$(kubectl --context uw2 -n drive9-tidbcloud \
-            get deployment/drive9-server \
-            -o 'jsonpath={.spec.replicas}')
-          if [ "$REPLICAS" != "0" ]; then
-            kubectl --context uw2 -n drive9-tidbcloud \
-              rollout status deployment/drive9-server --timeout=300s
-          fi
+          kubectl --context uw2 -n drive9-tidbcloud \
+            rollout status deployment/drive9-server --timeout=300s
 
       - name: Rollback drive9-tidbcloud aws-us-west-2 on failure
-        if: failure() && steps.deploy-uw2-native.outcome == 'failure'
+        if: failure() && steps.deploy-uw2.outcome == 'failure'
         run: |
           kubectl --context uw2 -n drive9-tidbcloud \
             rollout undo deployment/drive9-server
