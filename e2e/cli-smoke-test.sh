@@ -353,6 +353,12 @@ CLI_IMAGE_UPLOADED=0
 FORK_CTX_NAME="fork-${TS}"
 FORK_REMOTE="/cli-${TS}-fork-smoke.txt"
 FORK_LOCAL="/tmp/drive9-cli-fork-${TS}.txt"
+ARCHIVE_REMOTE_DIR="/cli-${TS}-archive"
+ARCHIVE_LOCAL_TARGZ="/tmp/drive9-cli-archive-${TS}.tar.gz"
+ARCHIVE_LOCAL_TARGZ2="/tmp/drive9-cli-archive-${TS}-2.tar.gz"
+ARCHIVE_LOCAL_ZIP="/tmp/drive9-cli-archive-${TS}.zip"
+ARCHIVE_LOCAL_FLAT="/tmp/drive9-cli-archive-flat-${TS}.tar.gz"
+ARCHIVE_EXTRACT_DIR="/tmp/drive9-cli-archive-extract-${TS}"
 
 echo "[3.1] ctx fork smoke"
 if fork_checks_enabled; then
@@ -567,6 +573,92 @@ else
   restored_src_present="false"
 fi
 check_eq "configured profile pack skips ordinary source file" "$restored_src_present" "false"
+
+echo "[4.3] cli fs archive — download remote tree as tar.gz/zip with filtering"
+# Seed a remote tree: README.md at root, src/app.go, src/util/util.go, plus a
+# node_modules/ subtree and a .git/ subtree that filtering should skip.
+drive9_retry fs mkdir ":$ARCHIVE_REMOTE_DIR" >/dev/null
+drive9_retry fs mkdir ":$ARCHIVE_REMOTE_DIR/src" >/dev/null
+drive9_retry fs mkdir ":$ARCHIVE_REMOTE_DIR/src/util" >/dev/null
+drive9_retry fs mkdir ":$ARCHIVE_REMOTE_DIR/node_modules" >/dev/null
+drive9_retry fs mkdir ":$ARCHIVE_REMOTE_DIR/node_modules/react" >/dev/null
+drive9_retry fs mkdir ":$ARCHIVE_REMOTE_DIR/.git" >/dev/null
+printf 'archive-readme-%s\n' "$TS" > "$SMALL_LOCAL"
+drive9_retry fs cp "$SMALL_LOCAL" ":$ARCHIVE_REMOTE_DIR/README.md" >/dev/null
+printf 'package main\n' > "$SMALL_LOCAL"
+drive9_retry fs cp "$SMALL_LOCAL" ":$ARCHIVE_REMOTE_DIR/src/app.go" >/dev/null
+printf 'package util\n' > "$SMALL_LOCAL"
+drive9_retry fs cp "$SMALL_LOCAL" ":$ARCHIVE_REMOTE_DIR/src/util/util.go" >/dev/null
+printf 'module.exports\n' > "$SMALL_LOCAL"
+drive9_retry fs cp "$SMALL_LOCAL" ":$ARCHIVE_REMOTE_DIR/node_modules/react/index.js" >/dev/null
+printf 'ref: refs/heads/main\n' > "$SMALL_LOCAL"
+drive9_retry fs cp "$SMALL_LOCAL" ":$ARCHIVE_REMOTE_DIR/.git/HEAD" >/dev/null
+
+# 4.3a: plain tar.gz, no filter — should contain all files.
+drive9_retry fs archive ":$ARCHIVE_REMOTE_DIR" "$ARCHIVE_LOCAL_TARGZ" >/dev/null
+check_cmd "archive tar.gz produced" test -s "$ARCHIVE_LOCAL_TARGZ"
+archive_names="$(tar -tzf "$ARCHIVE_LOCAL_TARGZ" 2>/dev/null | sort)"
+check_eq "plain archive includes README.md" "$(printf '%s' "$archive_names" | grep -c 'README.md')" "1"
+check_eq "plain archive includes node_modules/react/index.js" "$(printf '%s' "$archive_names" | grep -c 'node_modules/react/index.js')" "1"
+check_eq "plain archive includes .git/HEAD" "$(printf '%s' "$archive_names" | grep -c '\.git/HEAD')" "1"
+check_eq "plain archive includes src/app.go" "$(printf '%s' "$archive_names" | grep -c 'src/app.go')" "1"
+
+# 4.3b: --exclude skips node_modules and .git subtrees.
+drive9_retry fs archive ":$ARCHIVE_REMOTE_DIR" "$ARCHIVE_LOCAL_TARGZ2" --exclude '**/node_modules/**' --exclude '**/.git/**' >/dev/null
+archive_names_excluded="$(tar -tzf "$ARCHIVE_LOCAL_TARGZ2" 2>/dev/null | sort)"
+check_eq "excluded archive still has README.md" "$(printf '%s' "$archive_names_excluded" | grep -c 'README.md')" "1"
+check_eq "excluded archive still has src/app.go" "$(printf '%s' "$archive_names_excluded" | grep -c 'src/app.go')" "1"
+check_eq "excluded archive drops node_modules" "$(printf '%s' "$archive_names_excluded" | grep -c 'node_modules')" "0"
+check_eq "excluded archive drops .git" "$(printf '%s' "$archive_names_excluded" | grep -c '\.git/')" "0"
+
+# 4.3c: --profile coding-agent skips the same default set as mount.
+ARCHIVE_PROFILE_DIR="$CLI_ENV_HOME/.drive9/profiles"
+mkdir -p "$ARCHIVE_PROFILE_DIR"
+drive9_retry fs archive ":$ARCHIVE_REMOTE_DIR" "$ARCHIVE_LOCAL_TARGZ" --profile coding-agent >/dev/null
+archive_names_profile="$(tar -tzf "$ARCHIVE_LOCAL_TARGZ" 2>/dev/null | sort)"
+check_eq "profile archive drops node_modules" "$(printf '%s' "$archive_names_profile" | grep -c 'node_modules')" "0"
+check_eq "profile archive drops .git" "$(printf '%s' "$archive_names_profile" | grep -c '\.git/')" "0"
+check_eq "profile archive keeps src/app.go" "$(printf '%s' "$archive_names_profile" | grep -c 'src/app.go')" "1"
+
+# 4.3d: --include whitelist keeps only matching paths.
+drive9_retry fs archive ":$ARCHIVE_REMOTE_DIR" "$ARCHIVE_LOCAL_TARGZ2" --include 'src/**' --include 'README.md' >/dev/null
+archive_names_include="$(tar -tzf "$ARCHIVE_LOCAL_TARGZ2" 2>/dev/null | sort)"
+check_eq "include archive keeps README.md" "$(printf '%s' "$archive_names_include" | grep -c 'README.md')" "1"
+check_eq "include archive keeps src/app.go" "$(printf '%s' "$archive_names_include" | grep -c 'src/app.go')" "1"
+check_eq "include archive drops node_modules" "$(printf '%s' "$archive_names_include" | grep -c 'node_modules')" "0"
+check_eq "include archive drops .git" "$(printf '%s' "$archive_names_include" | grep -c '\.git/')" "0"
+
+# 4.3e: --format zip produces a valid zip archive.
+drive9_retry fs archive ":$ARCHIVE_REMOTE_DIR" "$ARCHIVE_LOCAL_ZIP" --format zip --exclude '**/node_modules/**' --exclude '**/.git/**' >/dev/null
+check_cmd "archive zip produced" test -s "$ARCHIVE_LOCAL_ZIP"
+check_cmd "archive zip is valid" python3 -c 'import zipfile,sys; zipfile.ZipFile(sys.argv[1]).testzip() is None' "$ARCHIVE_LOCAL_ZIP"
+archive_zip_names="$(python3 -c 'import zipfile,sys; print("\n".join(sorted(zipfile.ZipFile(sys.argv[1]).namelist())))' "$ARCHIVE_LOCAL_ZIP")"
+check_eq "zip archive includes README.md" "$(printf '%s' "$archive_zip_names" | grep -c 'README.md')" "1"
+check_eq "zip archive drops node_modules" "$(printf '%s' "$archive_zip_names" | grep -c 'node_modules')" "0"
+
+# 4.3f: --flat strips directory hierarchy; archive contains basenames only.
+drive9_retry fs archive ":$ARCHIVE_REMOTE_DIR" "$ARCHIVE_LOCAL_FLAT" --flat --exclude '**/node_modules/**' --exclude '**/.git/**' >/dev/null
+archive_flat_names="$(tar -tzf "$ARCHIVE_LOCAL_FLAT" 2>/dev/null | sort)"
+check_eq "flat archive has app.go basename" "$(printf '%s' "$archive_flat_names" | grep -cx 'app.go')" "1"
+check_eq "flat archive has util.go basename" "$(printf '%s' "$archive_flat_names" | grep -cx 'util.go')" "1"
+check_eq "flat archive has no slash paths" "$(printf '%s' "$archive_flat_names" | grep -c '/')" "0"
+
+# 4.3g: --stdout produces a valid tar.gz on stdout that can be piped to tar.
+archive_stdout_names="$(drive9_retry fs archive ":$ARCHIVE_REMOTE_DIR" --stdout --exclude '**/node_modules/**' --exclude '**/.git/**' 2>/dev/null | tar -tzf - 2>/dev/null | sort)"
+check_eq "stdout archive includes README.md" "$(printf '%s' "$archive_stdout_names" | grep -c 'README.md')" "1"
+check_eq "stdout archive drops node_modules" "$(printf '%s' "$archive_stdout_names" | grep -c 'node_modules')" "0"
+
+# 4.3h: extracted archive contents match the uploaded bytes.
+rm -rf "$ARCHIVE_EXTRACT_DIR"
+mkdir -p "$ARCHIVE_EXTRACT_DIR"
+tar -xzf "$ARCHIVE_LOCAL_TARGZ2" -C "$ARCHIVE_EXTRACT_DIR" 2>/dev/null
+extracted_appgo="$(cat "$ARCHIVE_EXTRACT_DIR/$(basename "$ARCHIVE_REMOTE_DIR")/src/app.go" 2>/dev/null)"
+check_eq "extracted src/app.go content matches" "$extracted_appgo" 'package main'
+
+# Cleanup archive fixtures.
+drive9_retry fs rm -r ":$ARCHIVE_REMOTE_DIR" >/dev/null
+rm -f "$ARCHIVE_LOCAL_TARGZ" "$ARCHIVE_LOCAL_TARGZ2" "$ARCHIVE_LOCAL_ZIP" "$ARCHIVE_LOCAL_FLAT" "$SMALL_LOCAL"
+rm -rf "$ARCHIVE_EXTRACT_DIR"
 
 echo "[5] batch small-file upload/list/read via cli"
 mkdir -p "$BATCH_LOCAL_DIR"

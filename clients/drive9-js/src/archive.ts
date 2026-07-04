@@ -261,12 +261,14 @@ async function archiveToFileZipImpl(
   }
   // Central directory.
   const centralStart = offset;
+  let centralSize = 0;
   for (const c of central) {
     const rec = buildZipCentralHeader(c.name, c.crc, c.size, c.size, c.offset);
     await writeChunk(rec);
     offset += rec.length;
+    centralSize += rec.length;
   }
-  const eocd = buildZipEOCD(central.length, centralStart, offset);
+  const eocd = buildZipEOCD(central.length, centralStart, centralSize);
   await writeChunk(eocd);
   await new Promise<void>((resolve) => out.end(resolve));
 }

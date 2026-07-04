@@ -395,11 +395,12 @@ func TestArchiveInvalidFormat(t *testing.T) {
 	}
 }
 
-func TestBuildArchiveMatcherProfileExcludeMerge(t *testing.T) {
-	m, err := buildArchiveMatcher("coding-agent", nil, []string{"**/secret/**"})
+func TestBuildArchiveOptionsProfileExcludeMerge(t *testing.T) {
+	opts, err := buildArchiveOptions("coding-agent", nil, []string{"**/secret/**"}, "tar.gz", false, 16)
 	if err != nil {
-		t.Fatalf("buildArchiveMatcher: %v", err)
+		t.Fatalf("buildArchiveOptions: %v", err)
 	}
+	m := pathfilter.NewMatcher(opts.Include, opts.Exclude, opts.Override)
 	// Coding-agent excludes node_modules; combined with --exclude secret.
 	if !m.HasExclude() {
 		t.Fatal("matcher should have excludes")
@@ -415,7 +416,7 @@ func TestBuildArchiveMatcherProfileExcludeMerge(t *testing.T) {
 	}
 }
 
-func TestBuildArchiveMatcherOverrideRestores(t *testing.T) {
+func TestBuildArchiveOptionsOverrideRestores(t *testing.T) {
 	// Build a profile on disk with a [remote] override that restores a path
 	// the [local] exclude would drop.
 	dir := t.TempDir()
@@ -434,10 +435,11 @@ proj/node_modules/.package-lock.json
 		t.Fatalf("write profile: %v", err)
 	}
 
-	m, err := buildArchiveMatcher("test-override", nil, nil)
+	opts, err := buildArchiveOptions("test-override", nil, nil, "tar.gz", false, 16)
 	if err != nil {
-		t.Fatalf("buildArchiveMatcher: %v", err)
+		t.Fatalf("buildArchiveOptions: %v", err)
 	}
+	m := pathfilter.NewMatcher(opts.Include, opts.Exclude, opts.Override)
 	if m.Match("proj/node_modules/react/x.js") {
 		t.Fatal("node_modules should be excluded")
 	}
@@ -462,34 +464,18 @@ func TestArchiveEmptyDirPreserved(t *testing.T) {
 
 	out := filepath.Join(t.TempDir(), "proj.tar.gz")
 	ctx := context.Background()
-	if err := runArchive(ctx, c, "/proj", "proj", "tar.gz", out, false, pathfilter.Matcher{}, false, archiveDefaultJobs); err != nil {
-		t.Fatalf("runArchive: %v", err)
+	f, err := os.Create(out)
+	if err != nil {
+		t.Fatalf("create: %v", err)
 	}
+	if err := c.ArchiveDir(ctx, "/proj", f, client.ArchiveOptions{}); err != nil {
+		_ = f.Close()
+		t.Fatalf("ArchiveDir: %v", err)
+	}
+	_ = f.Close()
 	got := tarEntries(t, out)
 	if !contains(got, "proj/src/") {
 		t.Fatalf("empty dir src/ should be preserved: %v", got)
-	}
-}
-
-func TestArchiveName(t *testing.T) {
-	cases := []struct {
-		root   string
-		rel    string
-		flat   bool
-		isDir  bool
-		want   string
-	}{
-		{"proj", "foo/bar.txt", false, false, "proj/foo/bar.txt"},
-		{"proj", "foo/bar", false, true, "proj/foo/bar/"},
-		{"proj", "foo/bar.txt", true, false, "bar.txt"},
-		{"proj", "foo/bar", true, true, ""}, // flat drops dirs
-		{"proj", "", false, false, ""},
-		{"", "foo.txt", false, false, "/foo.txt"},
-	}
-	for _, tc := range cases {
-		if got := archiveName(tc.root, tc.rel, tc.flat, tc.isDir); got != tc.want {
-			t.Fatalf("archiveName(%q,%q,%v,%v) = %q, want %q", tc.root, tc.rel, tc.flat, tc.isDir, got, tc.want)
-		}
 	}
 }
 

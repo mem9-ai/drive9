@@ -182,6 +182,46 @@ func ExampleClient_transfersAppendPatchAndStreaming() {
 	_ = described.Abort(ctx)
 }
 
+// ExampleClient_archive demonstrates downloading a remote directory tree as a
+// streaming tar.gz (or zip) archive with profile-based filtering. The archive
+// is streamed directly into the provided io.Writer — pipe it to a file, stdout,
+// or an HTTP response body. The walk + bounded download + tar/zip writing all
+// happen client-side; the server stays file-level.
+func ExampleClient_archive() {
+	ctx := context.Background()
+	c := drive9.New("https://drive9.example.com", "api-key")
+	var out = io.Discard // replace with os.Stdout or *os.File
+
+	// Default: tar.gz, no filtering.
+	_ = c.ArchiveDir(ctx, "/proj", out, drive9.ArchiveOptions{})
+
+	// Zip format.
+	_ = c.ArchiveDir(ctx, "/proj", out, drive9.ArchiveOptions{
+		Format: drive9.ArchiveFormatZip,
+	})
+
+	// Exclude node_modules and .git from the archive.
+	_ = c.ArchiveDir(ctx, "/proj", out, drive9.ArchiveOptions{
+		Exclude: []string{"**/node_modules/**", "**/.git/**"},
+	})
+
+	// Include only Go source files under src/ plus go.mod at the root.
+	_ = c.ArchiveDir(ctx, "/proj", out, drive9.ArchiveOptions{
+		Include: []string{"src/**", "go.mod"},
+	})
+
+	// Flat mode: strip the directory hierarchy, archive basenames only.
+	_ = c.ArchiveDir(ctx, "/proj", out, drive9.ArchiveOptions{Flat: true})
+
+	// Override restores a path that an exclude would drop (the override list
+	// is typically populated from a profile's [remote] rules; callers can pass
+	// it directly when not using --profile).
+	_ = c.ArchiveDir(ctx, "/proj", out, drive9.ArchiveOptions{
+		Exclude:  []string{"**/node_modules/**"},
+		Override: []string{"proj/node_modules/.package-lock.json"},
+	})
+}
+
 func ExampleClient_tokensAndVault() {
 	ctx := context.Background()
 	owner := drive9.New("https://drive9.example.com", "owner-api-key")
@@ -452,6 +492,7 @@ var coveredClientMethods = map[string]bool{
 	"AppendJournalEntries":                 true,
 	"AppendStream":                         true,
 	"APIKey":                               true,
+	"ArchiveDir":                           true,
 	"BaseURL":                              true,
 	"BatchReadSmallCtx":                    true,
 	"BatchStatCtx":                         true,

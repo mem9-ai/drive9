@@ -97,7 +97,9 @@ func TestRunUsesDrive9GoSDK(t *testing.T) {
 				"tags":          map[string]string{"example": "go-sdk", "kind": "smoke"},
 			})
 		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
-			if remotePath != root {
+			// ArchiveDir normalizes the root to drop a trailing slash, so the
+			// list handler must accept both "/sdk-test/" and "/sdk-test".
+			if remotePath != root && remotePath != strings.TrimSuffix(root, "/") {
 				t.Fatalf("list path = %q, want %q", remotePath, root)
 			}
 			writeJSON(t, w, map[string]any{
@@ -148,7 +150,8 @@ func TestRunUsesDrive9GoSDK(t *testing.T) {
 	}
 	if got := out.String(); !strings.Contains(got, "upload_mode: direct_put") ||
 		!strings.Contains(got, "batch_status: 200") ||
-		!strings.Contains(got, "search_results: 1") {
+		!strings.Contains(got, "search_results: 1") ||
+		!strings.Contains(got, "archive_entries: 2") {
 		t.Fatalf("unexpected output:\n%s", got)
 	}
 }

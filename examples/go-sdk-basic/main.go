@@ -2,7 +2,9 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -94,8 +96,21 @@ func run(ctx context.Context, c *client.Client, root string, out io.Writer) erro
 		return fmt.Errorf("grep %s: %w", root, err)
 	}
 
+	// Archive the scratch directory as a streaming tar.gz. ArchiveDir walks
+	// the remote tree (ListCtx) and streams each leaf (ReadStream) straight
+	// into the archive writer — no temp file. Here we buffer it in memory to
+	// count the archived entries; in practice you would pipe to os.Stdout or
+	// *os.File.
+	var archiveBuf bytes.Buffer
+	if err := c.ArchiveDir(ctx, root, &archiveBuf, client.ArchiveOptions{
+		Exclude: []string{"**/node_modules/**"},
+	}); err != nil {
+		return fmt.Errorf("archive %s: %w", root, err)
+	}
+	archiveEntries := countArchiveEntries(archiveBuf.Bytes())
+
 	if _, err := io.WriteString(out, fmt.Sprintf(
-		"root: %s\nfile: %s\nupload_mode: %s\nrevision: %d\nsize: %d\nentries: %d\nbatch_status: %d\nsearch_results: %d\n",
+		"root: %s\nfile: %s\nupload_mode: %s\nrevision: %d\nsize: %d\nentries: %d\nbatch_status: %d\nsearch_results: %d\narchive_entries: %d\n",
 		root,
 		remoteFile,
 		summary.Mode,
@@ -104,6 +119,7 @@ func run(ctx context.Context, c *client.Client, root string, out io.Writer) erro
 		len(entries),
 		batch[0].Status,
 		len(results),
+		archiveEntries,
 	)); err != nil {
 		return fmt.Errorf("write summary: %w", err)
 	}
@@ -238,4 +254,27 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// countArchiveEntries counts the entries (dirs + files) in a tar.gz byte slice.
+// Used by the smoke test to verify the archive captured the uploaded file.
+func countArchiveEntries(tarGz []byte) int {
+	gz, err := gzip.NewReader(bytes.NewReader(tarGz))
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	count := 0
+	for {
+		_, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return count
+		}
+		count++
+	}
+	return count
 }
