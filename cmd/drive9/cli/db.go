@@ -147,7 +147,7 @@ func Create(args []string) error {
 		return err
 	}
 
-	if mode == RegionModeTiDBCloudStarter {
+	if mode == RegionModeAnonymous {
 		fmt.Fprintf(os.Stderr, "Note: Anonymous mode in drive9 transfers data management rights to PingCAP.\n")
 	}
 
@@ -231,8 +231,9 @@ func Create(args []string) error {
 }
 
 const (
-	RegionModeTiDBCloudNative  = "tidb_cloud_native"
-	RegionModeTiDBCloudStarter = "tidb_cloud_starter"
+	RegionModeAnonymous       = "anonymous"
+	RegionModeStarterLegacy   = "tidb_cloud_starter"
+	RegionModeTiDBCloudNative = "tidb_cloud_native"
 
 	ModeLabelAnonymous = "Anonymous"
 	ModeLabelTiDBCloud = "TiDBCloud"
@@ -296,7 +297,7 @@ func provisionModeForCredentials(publicKey, privateKey string) string {
 	if strings.TrimSpace(publicKey) != "" || strings.TrimSpace(privateKey) != "" {
 		return RegionModeTiDBCloudNative
 	}
-	return RegionModeTiDBCloudStarter
+	return RegionModeAnonymous
 }
 
 func provisionRequestBody(publicKey, privateKey string, tidbCloudSpendingLimit *int64) (io.Reader, error) {
@@ -351,18 +352,19 @@ func resolveProvisionServer(serverFlag, regionCode, mode, fallbackServer string)
 
 func selectRegionServer(entries []RegionManifestEntry, regionCode, mode string) (*RegionManifestEntry, error) {
 	regionCode = strings.TrimSpace(regionCode)
-	mode = strings.TrimSpace(mode)
+	requestedMode := strings.TrimSpace(mode)
+	canonicalMode := canonicalRegionMode(mode)
 	var matches []RegionManifestEntry
 	for _, entry := range entries {
-		if strings.TrimSpace(entry.RegionCode) == regionCode && strings.TrimSpace(entry.Mode) == mode {
+		if strings.TrimSpace(entry.RegionCode) == regionCode && canonicalRegionMode(entry.Mode) == canonicalMode {
 			matches = append(matches, entry)
 		}
 	}
 	if len(matches) == 0 {
-		return nil, fmt.Errorf("region %q does not support mode %q; run `drive9 region list`", regionCode, mode)
+		return nil, fmt.Errorf("region %q does not support mode %q; run `drive9 region list`", regionCode, requestedMode)
 	}
 	if len(matches) > 1 {
-		return nil, fmt.Errorf("region %q mode %q matches multiple servers; pass --server explicitly", regionCode, mode)
+		return nil, fmt.Errorf("region %q mode %q matches multiple servers; pass --server explicitly", regionCode, requestedMode)
 	}
 	return &matches[0], nil
 }

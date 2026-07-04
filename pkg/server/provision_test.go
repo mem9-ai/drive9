@@ -1241,7 +1241,7 @@ func TestProvisionRejectsCredentialsForNonNativeProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, provider := range []string{tenant.ProviderTiDBZero, tenant.ProviderTiDBCloudStarter, tenant.ProviderDB9} {
+	for _, provider := range []string{tenant.ProviderTiDBZero, tenant.ProviderDB9} {
 		prov := &fakeProvisioner{provider: provider}
 		srv := NewWithConfig(Config{
 			Meta:        metaStore,
@@ -1592,7 +1592,7 @@ func TestProvisionPersistsPartialClusterBeforeMarkingFailed(t *testing.T) {
 	}
 
 	prov := &fakeProvisioner{
-		provider: tenant.ProviderTiDBCloudStarter,
+		provider: tenant.ProviderTiDBCloudNative,
 		cluster: &tenant.ClusterInfo{
 			ClusterID: "cluster-after-takeover",
 			Host:      "db.example",
@@ -1601,7 +1601,9 @@ func TestProvisionPersistsPartialClusterBeforeMarkingFailed(t *testing.T) {
 			Password:  "secret",
 			DBName:    "test",
 		},
-		provisionErr: fmt.Errorf("update starter spending limit for cluster cluster-after-takeover: limit rejected"),
+		provisionErr:      fmt.Errorf("provision native cluster cluster-after-takeover: limit rejected"),
+		defaultPublicKey:  "default-public",
+		defaultPrivateKey: "default-private",
 	}
 
 	srv := NewWithConfig(Config{
@@ -1614,8 +1616,7 @@ func TestProvisionPersistsPartialClusterBeforeMarkingFailed(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	body, _ := json.Marshal(map[string]any{"provider": tenant.ProviderTiDBCloudStarter})
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", nil)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -1638,8 +1639,8 @@ func TestProvisionPersistsPartialClusterBeforeMarkingFailed(t *testing.T) {
 	if status != string(meta.TenantFailed) {
 		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
 	}
-	if provider != tenant.ProviderTiDBCloudStarter || clusterID != "cluster-after-takeover" {
-		t.Fatalf("tenant provider/cluster = %s/%s, want %s/cluster-after-takeover", provider, clusterID, tenant.ProviderTiDBCloudStarter)
+	if provider != tenant.ProviderTiDBCloudNative || clusterID != "cluster-after-takeover" {
+		t.Fatalf("tenant provider/cluster = %s/%s, want %s/cluster-after-takeover", provider, clusterID, tenant.ProviderTiDBCloudNative)
 	}
 	if host != "db.example" || port != 4000 || user != "u1.root" || dbName != "test" {
 		t.Fatalf("tenant connection = %s:%d %s/%s, want db.example:4000 u1.root/test", host, port, user, dbName)

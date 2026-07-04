@@ -95,7 +95,7 @@ func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleForkCreate(w http.ResponseWriter, r *http.Request) {
-	if s.meta == nil || s.pool == nil || s.provisioner == nil || len(s.tokenSecret) == 0 {
+	if s.meta == nil || s.pool == nil || (s.provisioner == nil && s.legacyStarterProvisioner == nil) || len(s.tokenSecret) == 0 {
 		errJSON(w, http.StatusNotFound, "fork not enabled")
 		return
 	}
@@ -220,7 +220,10 @@ func (s *Server) resolveForkCredentialRequest(provider string, req *tenant.Crede
 		return nil, nil
 	}
 	if req == nil {
-		return nil, tenant.ErrCredentialsRequired
+		req = resolveDefaultCredentials(s.provisioner)
+		if req == nil {
+			return nil, tenant.ErrCredentialsRequired
+		}
 	}
 	if validator, ok := s.provisioner.(credentialProvisionRequestValidator); ok {
 		if err := validator.ValidateCredentialProvisionRequest(*req); err != nil {
@@ -230,24 +233,32 @@ func (s *Server) resolveForkCredentialRequest(provider string, req *tenant.Crede
 	return req, nil
 }
 
-func (s *Server) forkBranchCreateSupported(req *tenant.CredentialProvisionRequest) bool {
+func (s *Server) forkBranchCreateSupported(provider string, req *tenant.CredentialProvisionRequest) bool {
+	provisioner := s.provisionerForTenantProvider(provider)
+	if provisioner == nil {
+		return false
+	}
 	if req != nil {
-		_, ok := s.provisioner.(tenant.CredentialBranchProvisioner)
+		_, ok := provisioner.(tenant.CredentialBranchProvisioner)
 		return ok
 	}
-	_, ok := s.provisioner.(tenant.AsyncBranchProvisioner)
+	_, ok := provisioner.(tenant.AsyncBranchProvisioner)
 	return ok
 }
 
 func (s *Server) createForkBranch(ctx context.Context, forkID string, source *tenant.ClusterInfo, req *tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	provisioner := s.provisionerForTenantProvider(source.Provider)
+	if provisioner == nil {
+		return nil, fmt.Errorf("fork provisioner not configured for provider %s", source.Provider)
+	}
 	if req != nil {
-		branchProvisioner, ok := s.provisioner.(tenant.CredentialBranchProvisioner)
+		branchProvisioner, ok := provisioner.(tenant.CredentialBranchProvisioner)
 		if !ok {
 			return nil, fmt.Errorf("fork requires credential branch-capable provisioner")
 		}
 		return branchProvisioner.CreateBranchWithCredentials(ctx, forkID, source, *req)
 	}
-	branchProvisioner, ok := s.provisioner.(tenant.AsyncBranchProvisioner)
+	branchProvisioner, ok := provisioner.(tenant.AsyncBranchProvisioner)
 	if !ok {
 		return nil, fmt.Errorf("fork requires branch-capable provisioner")
 	}
@@ -255,29 +266,37 @@ func (s *Server) createForkBranch(ctx context.Context, forkID string, source *te
 }
 
 func (s *Server) waitForForkBranchActive(ctx context.Context, branch *tenant.ClusterInfo, req *tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	provisioner := s.provisionerForTenantProvider(branch.Provider)
+	if provisioner == nil {
+		return nil, fmt.Errorf("fork provisioner not configured for provider %s", branch.Provider)
+	}
 	if req != nil {
-		branchProvisioner, ok := s.provisioner.(tenant.CredentialBranchProvisioner)
+		branchProvisioner, ok := provisioner.(tenant.CredentialBranchProvisioner)
 		if !ok {
 			return nil, fmt.Errorf("fork requires credential branch-capable provisioner")
 		}
 		return branchProvisioner.WaitForBranchActiveWithCredentials(ctx, branch, *req)
 	}
-	branchProvisioner, ok := s.provisioner.(tenant.AsyncBranchProvisioner)
+	branchProvisioner, ok := provisioner.(tenant.AsyncBranchProvisioner)
 	if !ok {
 		return nil, fmt.Errorf("fork requires branch-capable provisioner")
 	}
 	return branchProvisioner.WaitForBranchActive(ctx, branch)
 }
 
-func (s *Server) deleteForkBranch(ctx context.Context, clusterID, branchID string, req *tenant.CredentialProvisionRequest) error {
+func (s *Server) deleteForkBranch(ctx context.Context, provider, clusterID, branchID string, req *tenant.CredentialProvisionRequest) error {
+	provisioner := s.provisionerForTenantProvider(provider)
+	if provisioner == nil {
+		return fmt.Errorf("fork provisioner not configured for provider %s", provider)
+	}
 	if req != nil {
-		branchProvisioner, ok := s.provisioner.(tenant.CredentialBranchProvisioner)
+		branchProvisioner, ok := provisioner.(tenant.CredentialBranchProvisioner)
 		if !ok {
 			return fmt.Errorf("fork requires credential branch-capable provisioner")
 		}
 		return branchProvisioner.DeleteBranchWithCredentials(ctx, clusterID, branchID, *req)
 	}
-	branchProvisioner, ok := s.provisioner.(tenant.BranchProvisioner)
+	branchProvisioner, ok := provisioner.(tenant.BranchProvisioner)
 	if !ok {
 		return fmt.Errorf("fork requires branch-capable provisioner")
 	}
@@ -295,7 +314,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	if source.Status != meta.TenantActive {
 		return nil, forkErr(http.StatusConflict, "source tenant is not active")
 	}
-	if !forkProviderSupported(source.Provider) {
+	if !s.forkProviderSupported(source.Provider) {
 		return nil, forkErr(http.StatusConflict, "fork is not supported in this TiDBCloud mode")
 	}
 	credentialReq, err = s.resolveForkCredentialRequest(source.Provider, credentialReq)
@@ -305,7 +324,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	if source.StorageNamespaceID == "" {
 		return nil, forkErr(http.StatusConflict, "source tenant storage namespace is not initialized")
 	}
-	if !s.forkBranchCreateSupported(credentialReq) {
+	if !s.forkBranchCreateSupported(source.Provider, credentialReq) {
 		return nil, forkErr(http.StatusConflict, "fork requires branch-capable provisioner")
 	}
 	if hasReservations, err := s.sourceHasActiveUploadReservations(ctx, source.ID); err != nil {
@@ -593,10 +612,10 @@ func (s *Server) provisionForkTenantOnceWithCredentials(ctx context.Context, for
 	if source.Status != meta.TenantActive {
 		return forkErr(http.StatusConflict, "source tenant is not active")
 	}
-	if !forkProviderSupported(source.Provider) {
+	if !s.forkProviderSupported(source.Provider) {
 		return &forkFatalProvisionError{err: forkErr(http.StatusConflict, "fork is not supported in this TiDBCloud mode")}
 	}
-	if !s.forkBranchCreateSupported(credentialReq) {
+	if !s.forkBranchCreateSupported(source.Provider, credentialReq) {
 		return &forkFatalProvisionError{err: forkErr(http.StatusConflict, "fork requires branch-capable provisioner")}
 	}
 	if hasReservations, err := s.sourceHasActiveUploadReservations(ctx, source.ID); err != nil {
@@ -609,7 +628,11 @@ func (s *Server) provisionForkTenantOnceWithCredentials(ctx context.Context, for
 	if err != nil {
 		return err
 	}
-	if err := s.schemaInitForTenant(forkID, forkTenant.Provider, s.provisioner.InitSchema)(ctx, dsn); err != nil {
+	schemaProvisioner := s.provisionerForTenantProvider(forkTenant.Provider)
+	if schemaProvisioner == nil {
+		return fmt.Errorf("fork provisioner not configured for provider %s", forkTenant.Provider)
+	}
+	if err := s.schemaInitForTenant(forkID, forkTenant.Provider, schemaProvisioner.InitSchema)(ctx, dsn); err != nil {
 		return err
 	}
 	if err := s.finalizeTenantSchemaInit(ctx, forkID, dsn, forkTenant.Provider); err != nil {
@@ -658,7 +681,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 		if forkTenant.DBHost != "" && forkTenant.DBPort != 0 && forkTenant.DBUser != "" {
 			return tenantDSN(forkTenant.DBUser, string(plain), forkTenant.DBHost, forkTenant.DBPort, forkTenant.DBName, forkTenant.DBTLS, forkTenant.Provider), nil
 		}
-		if branchProv, ok := s.provisioner.(tenant.CredentialBranchProvisioner); ok && credentialReq != nil {
+		if branchProv, ok := s.provisionerForTenantProvider(forkTenant.Provider).(tenant.CredentialBranchProvisioner); ok && credentialReq != nil {
 			username, err := branchProv.WaitForBranchUserWithCredentials(ctx, forkTenant.ClusterID, forkTenant.BranchID, *credentialReq)
 			if err != nil {
 				return "", err
@@ -733,7 +756,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 		return "", err
 	}
 	if cluster == nil || cluster.ClusterID == "" || cluster.BranchID == "" {
-		return "", forkErr(http.StatusBadGateway, "starter branch response missing required metadata")
+		return "", forkErr(http.StatusBadGateway, "database branch response missing required metadata")
 	}
 	if err := s.meta.UpdateTenantConnection(ctx, forkTenant.ID, &meta.Tenant{
 		DBHost:           cluster.Host,
@@ -778,7 +801,7 @@ func (s *Server) deleteForkBranchOrPersist(ctx context.Context, forkID string, c
 	if cluster == nil || cluster.ClusterID == "" || cluster.BranchID == "" {
 		return true
 	}
-	if err := s.deleteForkBranch(ctx, cluster.ClusterID, cluster.BranchID, credentialReq); err == nil {
+	if err := s.deleteForkBranch(ctx, cluster.Provider, cluster.ClusterID, cluster.BranchID, credentialReq); err == nil {
 		return true
 	}
 	if perr := s.meta.UpdateTenantBranch(ctx, forkID, &meta.Tenant{
@@ -816,8 +839,13 @@ func clusterInfoFromTenant(t *meta.Tenant) *tenant.ClusterInfo {
 	}
 }
 
-func forkProviderSupported(provider string) bool {
-	return provider == tenant.ProviderTiDBCloudStarter || provider == tenant.ProviderTiDBCloudNative
+func (s *Server) forkProviderSupported(provider string) bool {
+	switch provider {
+	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBCloudStarterLegacy:
+		return s.provisionerForTenantProvider(provider) != nil
+	default:
+		return false
+	}
 }
 
 func (s *Server) sourceHasActiveUploadReservations(ctx context.Context, tenantID string) (bool, error) {
@@ -866,7 +894,7 @@ func forkQuotaMediaContentType(contentType string) bool {
 }
 
 func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
-	if s.meta == nil || s.pool == nil || s.provisioner == nil {
+	if s.meta == nil || s.pool == nil || (s.provisioner == nil && s.legacyStarterProvisioner == nil) {
 		errJSON(w, http.StatusNotFound, "fork delete not enabled")
 		return
 	}
@@ -904,16 +932,16 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if t.Status == meta.TenantDeleting {
-		if t.Provider == tenant.ProviderTiDBCloudNative {
-			s.cleanupNativeFork(w, r, t, credentialReq)
+		if s.forkProviderSupported(t.Provider) {
+			s.cleanupForkInline(w, r, t, credentialReq)
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleting)})
 		return
 	}
-	if t.Provider == tenant.ProviderTiDBCloudNative && t.Status == meta.TenantFailed {
-		s.cleanupNativeFork(w, r, t, credentialReq)
+	if s.forkProviderSupported(t.Provider) && t.Status == meta.TenantFailed {
+		s.cleanupForkInline(w, r, t, credentialReq)
 		return
 	}
 	updated, err := s.meta.UpdateTenantStatusIf(r.Context(), t.ID, t.Status, meta.TenantDeleting)
@@ -926,8 +954,8 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleting)})
 		return
 	}
-	if t.Provider == tenant.ProviderTiDBCloudNative {
-		s.cleanupNativeFork(w, r, t, credentialReq)
+	if s.forkProviderSupported(t.Provider) {
+		s.cleanupForkInline(w, r, t, credentialReq)
 		return
 	}
 	_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
@@ -936,7 +964,7 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleting)})
 }
 
-func (s *Server) cleanupNativeFork(w http.ResponseWriter, r *http.Request, t *meta.Tenant, credentialReq *tenant.CredentialProvisionRequest) {
+func (s *Server) cleanupForkInline(w http.ResponseWriter, r *http.Request, t *meta.Tenant, credentialReq *tenant.CredentialProvisionRequest) {
 	if t.BranchID != "" {
 		var err error
 		credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
@@ -946,7 +974,7 @@ func (s *Server) cleanupNativeFork(w http.ResponseWriter, r *http.Request, t *me
 		}
 	}
 	if err := s.cleanupForkTenantOnce(r.Context(), t.ID, credentialReq); err != nil {
-		logger.Error(r.Context(), "native_fork_cleanup_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+		logger.Error(r.Context(), "fork_inline_cleanup_failed", zap.String("tenant_id", t.ID), zap.String("provider", t.Provider), zap.Error(err))
 		errJSON(w, http.StatusBadGateway, "fork delete cleanup failed")
 		return
 	}
@@ -983,8 +1011,12 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 		}
 		return nil
 	}
-	if t.Provider == tenant.ProviderTiDBCloudNative && credentialReq == nil {
-		return tenant.ErrCredentialsRequired
+	if t.Provider == tenant.ProviderTiDBCloudNative {
+		var err error
+		credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
+		if err != nil {
+			return err
+		}
 	}
 	if t.Status != meta.TenantDeleting {
 		return s.cleanupFailedForkBranch(ctx, t, credentialReq)
@@ -1005,7 +1037,7 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 	if err := store.SanitizeForkRuntimeState(ctx); err != nil {
 		return fmt.Errorf("sanitize fork runtime state: %w", err)
 	}
-	if err := s.deleteForkBranch(ctx, t.ClusterID, t.BranchID, credentialReq); err != nil {
+	if err := s.deleteForkBranch(ctx, t.Provider, t.ClusterID, t.BranchID, credentialReq); err != nil {
 		return fmt.Errorf("delete fork branch: %w", err)
 	}
 	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantDeleted); err != nil {
@@ -1015,7 +1047,7 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 }
 
 func (s *Server) cleanupFailedForkBranch(ctx context.Context, t *meta.Tenant, credentialReq *tenant.CredentialProvisionRequest) error {
-	if err := s.deleteForkBranch(ctx, t.ClusterID, t.BranchID, credentialReq); err != nil {
+	if err := s.deleteForkBranch(ctx, t.Provider, t.ClusterID, t.BranchID, credentialReq); err != nil {
 		return fmt.Errorf("delete failed fork branch: %w", err)
 	}
 	if err := s.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted); err != nil {

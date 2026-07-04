@@ -1214,6 +1214,7 @@ func systemUserStatements(dbName, username, password string) []string {
 	return []string{
 		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdent(dbName)),
 		fmt.Sprintf("CREATE ROLE IF NOT EXISTS %s", quoteString(roleName)),
+		fmt.Sprintf("GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO %s", quoteString(roleName)),
 		fmt.Sprintf("GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON %s.* TO %s", quoteIdent(dbName), quoteString(roleName)),
 		fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
 		fmt.Sprintf("ALTER USER %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),

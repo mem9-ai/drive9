@@ -708,13 +708,14 @@ func (e *tidbSchemaDiffError) Error() string {
 	return fmt.Sprintf("tidb schema contract mismatch for mode %q: %s", e.mode, strings.Join(parts, "; "))
 }
 
-// Keep this statement list aligned with the externally managed tidb_cloud_starter
-// schema. If you change columns, indexes, generated expressions, or
+// Keep this statement list aligned with externally managed schema exports. If
+// you change columns, indexes, generated expressions, or
 // constraints here, rerun:
 //
-//	drive9-server schema dump-init-sql --provider tidb_cloud_starter
+//	drive9-server schema dump-init-sql --provider tidb_zero
+//	drive9-server schema dump-init-sql --provider tidb_cloud_native
 //
-// and update tidb_cloud_starter with the exported SQL.
+// and update external schema definitions with the exported SQL.
 func tidbAutoEmbeddingSchemaStatements() []string {
 	return tidbAutoEmbeddingSchemaStatementsForConfig(currentTiDBAutoEmbeddingRenderConfig())
 }
