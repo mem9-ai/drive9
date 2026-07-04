@@ -276,9 +276,10 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	}
 }
 
-// Close stops background workers owned by this backend instance.
+// Close stops background workers owned by this backend instance. FileGC and
+// quota outbox processing are now kick-driven through the unified tenant
+// worker, so there are no per-backend goroutines to stop for them.
 func (b *Dat9Backend) Close() {
-	b.StopFileGCWorker()
 	if b.imageExtractEnabled {
 		globalBackendRuntimeMetrics.deactivateImage(b.runtimeMetricsID)
 		b.imageExtractEnabled = false

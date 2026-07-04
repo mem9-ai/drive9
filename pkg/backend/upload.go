@@ -1227,7 +1227,9 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		return err
 	}
 	txDurationMs := uploadPhaseMs(txStart)
-	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
+	if semanticTaskEnqueued {
+		b.notifyWorkEnqueued(BackendWorkSemantic)
+	}
 	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
 	defer cancelQuota()
 	if err := b.completeUploadReservation(quotaCtx, uploadID, upload.TotalSize, confirmedFileID, oldSizeBytes, oldIsMedia, upload.TotalSize, newIsMedia); err != nil {

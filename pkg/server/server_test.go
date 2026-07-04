@@ -55,7 +55,9 @@ func newTestServerWithLogger(t *testing.T, log *zap.Logger) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewWithConfig(Config{Backend: b, Logger: log})
+	s := NewWithConfig(Config{Backend: b, Logger: log})
+	t.Cleanup(func() { s.Close() })
+	return s
 }
 
 func insertTestS3File(t *testing.T, s *Server, p string, size int64) {
@@ -1254,7 +1256,7 @@ func TestSymlinkAllowsMaxTargetWithWorstCaseJSONEscaping(t *testing.T) {
 }
 
 func TestSymlinkReturns507WhenTenantStorageQuotaExceeded(t *testing.T) {
-	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 10}, SemanticWorkerOptions{})
+	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 10}, TenantWorkerOptions{})
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 

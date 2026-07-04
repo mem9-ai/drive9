@@ -69,6 +69,16 @@ const (
 	symlinkContentType        = "application/x-symlink"
 )
 
+// Work mask constants for the unified tenant notify outbox. These mirror the
+// constants in pkg/server/work_mask.go but are defined here in the backend
+// package so the write path can signal which work types were enqueued without
+// importing the server package (which would be a circular dependency).
+const (
+	BackendWorkSSE      = 1 // wake local SSE bus
+	BackendWorkSemantic = 2 // kick semantic worker
+	BackendWorkFileGC   = 4 // kick file GC worker
+)
+
 // Dat9Backend implements filesystem.FileSystem with the inode model.
 type Dat9Backend struct {
 	store         *datastore.Store
@@ -134,13 +144,13 @@ type Dat9Backend struct {
 	audioExtractMaxSize      int64
 	maxAudioExtractTextBytes int
 
-	fileGCWorker     *FileGCWorker
 	runtimeMetricsID uint64
 
-	// semanticTaskNotifier, when set, runs after a write or upload commit that
-	// enqueued at least one durable semantic task, so the semantic worker can
-	// claim it immediately instead of waiting for the tenant scan.
-	semanticTaskNotifier atomic.Pointer[func()]
+	// workEnqueuedNotifier, when set, runs after a write or upload commit that
+	// enqueued durable work (semantic task, file_gc task, quota outbox row),
+	// so the unified tenant worker can claim it immediately instead of waiting
+	// for a kick from the outbox poller.
+	workEnqueuedNotifier atomic.Pointer[func(workMask int)]
 
 	// Monthly LLM cost budget (P1).
 	maxMonthlyLLMCostMillicents     int64
@@ -163,24 +173,25 @@ func newBaseBackend(store *datastore.Store) *Dat9Backend {
 	}
 }
 
-// SetSemanticTaskEnqueuedNotifier registers fn to run after a write or upload
-// commit that enqueued at least one durable semantic task. fn must be cheap
-// and non-blocking: it is invoked inline on the write path. A dropped or
-// missing notification is safe — tasks are durable and the semantic worker's
-// periodic tenant scan claims them eventually.
-func (b *Dat9Backend) SetSemanticTaskEnqueuedNotifier(fn func()) {
+// SetWorkEnqueuedNotifier registers fn to run after a write or upload commit
+// that enqueues durable work (semantic task, file_gc task, or quota outbox row).
+// The workMask argument tells the caller which work types were enqueued. fn
+// must be cheap and non-blocking: it is invoked inline on the write path. A
+// dropped or missing notification is safe — work is durable and the unified
+// outbox poller + safety-net scan claim it eventually.
+func (b *Dat9Backend) SetWorkEnqueuedNotifier(fn func(workMask int)) {
 	if b == nil {
 		return
 	}
-	b.semanticTaskNotifier.Store(&fn)
+	b.workEnqueuedNotifier.Store(&fn)
 }
 
-func (b *Dat9Backend) notifySemanticTaskEnqueued(enqueued bool) {
-	if !enqueued {
+func (b *Dat9Backend) notifyWorkEnqueued(workMask int) {
+	if workMask == 0 {
 		return
 	}
-	if fn := b.semanticTaskNotifier.Load(); fn != nil && *fn != nil {
-		(*fn)()
+	if fn := b.workEnqueuedNotifier.Load(); fn != nil && *fn != nil {
+		(*fn)(workMask)
 	}
 }
 
@@ -475,6 +486,9 @@ func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 		return b.store.DeleteEmptyDir(ctx, path)
 	}
 	_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+	if err == nil {
+		b.notifyWorkEnqueued(BackendWorkFileGC)
+	}
 	return err
 }
 
@@ -490,6 +504,9 @@ func (b *Dat9Backend) RemoveFileCtx(ctx context.Context, path string) (err error
 		return err
 	}
 	_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+	if err == nil {
+		b.notifyWorkEnqueued(BackendWorkFileGC)
+	}
 	return err
 }
 
@@ -524,9 +541,15 @@ func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error)
 	}
 	if !node.IsDirectory {
 		_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+		if err == nil {
+			b.notifyWorkEnqueued(BackendWorkFileGC)
+		}
 		return err
 	}
 	_, err = b.store.DeleteDirRecursive(ctx, path)
+	if err == nil {
+		b.notifyWorkEnqueued(BackendWorkFileGC)
+	}
 	return err
 }
 
@@ -1016,7 +1039,9 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	if timingEnabled {
 		tenantTxDuration = time.Since(txStart)
 	}
-	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
+	if semanticTaskEnqueued {
+		b.notifyWorkEnqueued(BackendWorkSemantic)
+	}
 	centralQuotaStart := time.Time{}
 	if timingEnabled {
 		centralQuotaStart = time.Now()
@@ -1276,7 +1301,12 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		}
 		return 0, 0, err
 	}
-	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
+	// Notify semantic worker if new content was enqueued for embedding.
+	// Note: overwrite uses object GC (deleteBlobIfS3Ctx) for the old blob, not
+	// file_gc_tasks, so no BackendWorkFileGC is needed here.
+	if semanticTaskEnqueued {
+		b.notifyWorkEnqueued(BackendWorkSemantic)
+	}
 	centralQuotaStart := time.Time{}
 	if timingEnabled {
 		centralQuotaStart = time.Now()
@@ -1691,6 +1721,11 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 		return err
 	}
 	_, err = b.store.RenameFileReplacingTarget(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
+	if err == nil {
+		// RenameFileReplacingTarget may enqueue a file_gc task for the replaced
+		// target file's old blob.
+		b.notifyWorkEnqueued(BackendWorkFileGC)
+	}
 	return err
 }
 
