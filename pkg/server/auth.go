@@ -11,6 +11,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 	"github.com/mem9-ai/drive9/pkg/tenantctx"
@@ -319,6 +320,10 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 		acquireStart := time.Now()
 		b, release, err := pool.Acquire(r.Context(), &resolved.Tenant)
 		acquireDurationMs := authPhaseMs(acquireStart)
+		// Request-path acquire: this is the expected hot-path user-DB access,
+		// driven by real traffic. Record so scan-detection alerts can compare
+		// periodic-path rates against this baseline.
+		metrics.RecordTenantOperation(resolved.Tenant.ID, "user_db_access", "auth_acquire", metrics.ResultForError(err), time.Since(acquireStart))
 		if err != nil {
 			if isClientCanceled(r.Context(), err) {
 				logAuthClientCanceled(r.Context(), "backend_load_client_canceled", "tenant_id", resolved.Tenant.ID)
@@ -454,7 +459,11 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 			return
 		}
 
+		capAcquireStart := time.Now()
 		b, release, err := pool.Acquire(r.Context(), tenant)
+		// Capability-token request-path acquire: same baseline signal as the
+		// API-key path above, but for the /v1/vault/read surface.
+		metrics.RecordTenantOperation(tenantID, "user_db_access", "auth_acquire", metrics.ResultForError(err), time.Since(capAcquireStart))
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "capability_backend_load_failed", "tenant_id", tenantID, "error", err)...)
 			errJSON(w, http.StatusInternalServerError, "backend unavailable")

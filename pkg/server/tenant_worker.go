@@ -627,14 +627,24 @@ func (m *tenantWorkerManager) targetForRef(ctx context.Context, ref semanticTena
 	if ref.tenant == nil {
 		return nil, fmt.Errorf("tenant metadata missing for %s", ref.id)
 	}
+	acquireStart := time.Now()
 	b, release, err := m.pool.Acquire(ctx, ref.tenant)
 	if err != nil {
+		// Kick-driven acquire failure: a kick arrived but the tenant TiDB could
+		// not be opened. Record so the major alert can detect sustained worker
+		// acquire errors (kicks not reaching the tenant DB).
+		metrics.RecordTenantOperation(ref.tenant.ID, "user_db_access", "tenant_worker_acquire", metrics.ResultForError(err), time.Since(acquireStart))
 		return nil, fmt.Errorf("acquire tenant backend: %w", err)
 	}
 	if b == nil {
 		release()
+		metrics.RecordTenantOperation(ref.tenant.ID, "user_db_access", "tenant_worker_acquire", "error", time.Since(acquireStart))
 		return nil, fmt.Errorf("backend missing for %s", ref.id)
 	}
+	// Kick-driven acquire success: the tenant TiDB is now open for this kick.
+	// The rate follows write traffic (kicks are produced by writes). A spike
+	// uncorrelated with writes would suggest a scan path regressing.
+	metrics.RecordTenantOperation(ref.tenant.ID, "user_db_access", "tenant_worker_acquire", "ok", time.Since(acquireStart))
 	return &tenantTarget{
 		tenantID:         ref.id,
 		backend:          b,

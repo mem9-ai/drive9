@@ -319,9 +319,17 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	createBackendStart := time.Now()
 	b, st, err := p.createBackend(ctx, t)
 	if err != nil {
+		// Cold-open failure: a tenant TiDB open was attempted but failed.
+		// Record so alerts can detect a scan path that is churning cold opens.
+		metrics.RecordTenantOperation(t.ID, "user_db_access", "acquire_cold_open", "error", time.Since(createBackendStart))
 		return nil, nil, err
 	}
 	createBackendDurationMs := float64(time.Since(createBackendStart).Microseconds()) / 1000.0
+	// Cold-open success: a tenant TiDB was opened from scratch (cache miss).
+	// This is the canonical "a serverless TiDB was woken up" signal — the
+	// primary billing-storm indicator. PR #660 eliminated periodic scans that
+	// caused cold opens at scale; this metric guards against regressions.
+	metrics.RecordTenantOperation(t.ID, "user_db_access", "acquire_cold_open", "ok", time.Since(createBackendStart))
 
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
@@ -439,16 +447,26 @@ func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release fu
 	e, exists := p.items[t.ID]
 	if !exists {
 		p.mu.Unlock()
+		// Cold-skip: the tenant is not cached (TiDB likely scaled to zero).
+		// This is the warm-only invariant working as designed — the safety-net
+		// must never open a cold tenant TiDB. Record so the invariant-violation
+		// alert can confirm AcquireCached is staying warm-only.
+		metrics.RecordTenantOperation(t.ID, "user_db_access", "acquire_cached", "cold_skipped", 0)
 		return nil, nil, false
 	}
 	if e.s3EncryptionPolicy != s3EncryptionPolicy || (t.StorageNamespaceID != "" && e.storageNamespaceID != t.StorageNamespaceID) {
 		p.mu.Unlock()
+		// Stale-skip: the cached backend's encryption policy / storage namespace
+		// no longer matches the tenant. The safety-net defers to the next write
+		// kick. Record so this rare edge case is observable.
+		metrics.RecordTenantOperation(t.ID, "user_db_access", "acquire_cached", "stale_skipped", 0)
 		return nil, nil, false
 	}
 	e.refs++
 	p.order.MoveToFront(e.elem)
 	p.mu.Unlock()
 	metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
+	metrics.RecordTenantOperation(t.ID, "user_db_access", "acquire_cached", "hit", 0)
 	return e.backend, p.makeRelease(e), true
 }
 

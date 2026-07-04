@@ -8,6 +8,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"go.uber.org/zap"
 )
@@ -106,6 +107,9 @@ func (w *objectGCWorker) processOnce(ctx context.Context) (fatal bool) {
 			return true
 		}
 		logger.Warn(ctx, "object_gc_list_due_failed", zap.Error(err))
+		// List failure: the meta-DB read that drives object GC failed. Record
+		// so the warning alert can detect sustained listing trouble.
+		metrics.RecordOperation("user_db_access", "object_gc_list", "error", 0)
 		return false
 	}
 	for _, candidate := range candidates {
@@ -143,11 +147,20 @@ func (w *objectGCWorker) processCandidate(ctx context.Context, candidate meta.Ob
 		return w.meta.PostponeObjectGCCandidate(ctx, candidate, time.Now().UTC().Add(defaultObjectGCInactiveOwnerTTL), "namespace owner is not active")
 	}
 
+	acquireStart := time.Now()
 	b, release, err := w.pool.Acquire(ctx, owner)
 	if err != nil {
+		// Acquire failure: could not open the owner tenant TiDB for this GC
+		// candidate. Record so the warning alert can detect a GC path that is
+		// churning cold opens or hitting bad connections.
+		metrics.RecordTenantOperation(owner.ID, "user_db_access", "object_gc_acquire", metrics.ResultForError(err), time.Since(acquireStart))
 		return err
 	}
 	defer release()
+	// Acquire success: the owner tenant TiDB is now open for this GC check.
+	// Object-GC is leader-gated and opens cold tenants — a spike here is a
+	// potential billing-storm contributor, hence the warning alert.
+	metrics.RecordTenantOperation(owner.ID, "user_db_access", "object_gc_acquire", "ok", time.Since(acquireStart))
 
 	reachable, err := b.HasConfirmedS3StorageRef(ctx, candidate.StorageRefHash, candidate.StorageRef)
 	if err != nil {
