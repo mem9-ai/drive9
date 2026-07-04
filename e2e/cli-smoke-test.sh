@@ -644,7 +644,13 @@ check_eq "flat archive has util.go basename" "$(printf '%s' "$archive_flat_names
 check_eq "flat archive has no slash paths" "$(printf '%s' "$archive_flat_names" | grep -c '/')" "0"
 
 # 4.3g: --stdout produces a valid tar.gz on stdout that can be piped to tar.
-archive_stdout_names="$(drive9_retry fs archive ":$ARCHIVE_REMOTE_DIR" --stdout --exclude '**/node_modules/**' --exclude '**/.git/**' 2>/dev/null | tar -tzf - 2>/dev/null | sort)"
+# NOTE: drive9_retry captures stdout in a shell variable and reprints it, which
+# corrupts binary archive bytes (NUL truncation). For --stdout we call drive9
+# directly so the binary stream flows untouched into the tar pipeline. Guard
+# with set +e so a transient failure does not abort the whole script under -e.
+set +e
+archive_stdout_names="$(drive9 fs archive ":$ARCHIVE_REMOTE_DIR" --stdout --exclude '**/node_modules/**' --exclude '**/.git/**' 2>/dev/null | tar -tzf - 2>/dev/null | sort)"
+set -e
 check_eq "stdout archive includes README.md" "$(printf '%s' "$archive_stdout_names" | grep -c 'README.md')" "1"
 check_eq "stdout archive drops node_modules" "$(printf '%s' "$archive_stdout_names" | grep -c 'node_modules')" "0"
 
