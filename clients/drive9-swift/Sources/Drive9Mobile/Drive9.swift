@@ -167,7 +167,18 @@ public final class Drive9Client: @unchecked Sendable {
         request.setValue("bytes=\(offset)-\(offset + length - 1)", forHTTPHeaderField: "Range")
         do {
             let response = try await send(request)
-            return Drive9DownloadAsyncSequence(chunks: splitChunks(response.data), cancel: cancel)
+            // When the file is inline (small) the server may return the whole
+            // body with status 200 instead of a 206 partial. In that case slice
+            // the requested range out of the full body locally.
+            var data = response.data
+            if response.http.statusCode == 200, data.count > Int(length) {
+                let start = Int(offset)
+                let end = min(start + Int(length), data.count)
+                if start < end {
+                    data = data.subdata(in: start..<end)
+                }
+            }
+            return Drive9DownloadAsyncSequence(chunks: splitChunks(data), cancel: cancel)
         } catch let error as Drive9Exception {
             if case let .Drive9(_, statusCode, _, _) = error, statusCode == 416 {
                 return Drive9DownloadAsyncSequence(chunks: [], cancel: cancel)

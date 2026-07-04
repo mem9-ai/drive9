@@ -47,7 +47,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local e2e-local docker-build
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local e2e-local sdk-integration-tests docker-build
 
 mod:
 	$(GO) mod tidy
@@ -119,6 +119,16 @@ run-server-local: build-server-local
 
 e2e-local:
 	bash e2e/local-smoke.sh
+
+# Run the cross-SDK live-server integration suites for all drive9 SDKs
+# (Go, TypeScript, Rust, Python, Kotlin, Swift). Boots a disposable Docker MySQL
+# container, starts drive9-server-local, points each SDK at it via
+# DRIVE9_SERVER/DRIVE9_API_KEY, runs every suite, and tears it all down.
+# Pass extra args through to the runner, e.g.:
+#   make sdk-integration-tests -- --only go,ts
+#   make sdk-integration-tests -- --keep-server
+sdk-integration-tests:
+	bash scripts/sdk-integration-tests.sh $(SDK_INTEGRATION_ARGS)
 
 build-cli:
 	mkdir -p $(BIN_DIR)
