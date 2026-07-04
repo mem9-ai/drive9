@@ -147,8 +147,8 @@ func (w *objectGCWorker) processCandidate(ctx context.Context, candidate meta.Ob
 		return w.meta.PostponeObjectGCCandidate(ctx, candidate, time.Now().UTC().Add(defaultObjectGCInactiveOwnerTTL), "namespace owner is not active")
 	}
 
-	b, release, err := w.pool.Acquire(ctx, owner)
 	acquireStart := time.Now()
+	b, release, err := w.pool.Acquire(ctx, owner)
 	if err != nil {
 		// Acquire failure: could not open the owner tenant TiDB for this GC
 		// candidate. Record so the warning alert can detect a GC path that is
