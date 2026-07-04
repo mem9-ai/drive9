@@ -175,7 +175,12 @@ func (p *tenantOutboxPoller) pollOnce(ctx context.Context) {
 			logger.Warn(ctx, "tenant_outbox_poller_list_failed",
 				zap.Uint64("after_id", p.lastID),
 				zap.Error(err))
-			metrics.RecordEventBusPollFailure("tenant_outbox_poller")
+			// List failure: the meta-DB read that drives kick dispatch failed.
+			// Record as a user_db_access path-level signal (the poller itself
+			// only reads the meta DB, but a list failure delays all downstream
+			// tenant-DB work). Avoids the previous abuse of putting the pod
+			// name in the tenant_id label of drive9_event_bus_poll_failures_total.
+			metrics.RecordOperation("user_db_access", "outbox_poll_list", "error", 0)
 			return
 		}
 		for _, row := range rows {
@@ -205,6 +210,11 @@ func (p *tenantOutboxPoller) dispatch(ctx context.Context, row meta.TenantNotify
 		// the safety-net scan recovers any work whose kick was lost.
 		if p.shardFn(row.TenantID) {
 			p.worker.Kick(row.TenantID, shardedMask)
+			// Record the kick that will trigger a tenant-DB access via the
+			// worker. This gives a baseline rate of "kicks dispatched" to
+			// compare against actual tenant_worker_acquire — a divergence
+			// (kicks without acquires) points to lost work.
+			metrics.RecordTenantOperationCount(row.TenantID, "user_db_access", "outbox_dispatch_kick", "ok")
 		}
 	}
 }

@@ -60,6 +60,7 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 	if s.meta == nil || s.pool == nil {
 		return
 	}
+	scanStart := time.Now()
 	shardFn := func(string) bool { return true }
 	if s.shardResolver != nil {
 		shardFn = s.shardResolver.ownsTenantFn()
@@ -69,18 +70,29 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 	var afterID string
 	for {
 		if ctx.Err() != nil {
+			// Record the scan cycle with a canceled result so the alert can
+			// distinguish a full cycle from one interrupted by shutdown.
+			metrics.RecordOperation("user_db_access", "safety_net_scan_cycle", "canceled", time.Since(scanStart))
 			return
 		}
 		tenants, err := s.meta.ListTenantsByStatusAfter(ctx, meta.TenantActive, afterCreatedAt, afterID, safetyNetScanBatchSize)
 		if err != nil {
-			logger.Warn(ctx, "safety_net_scan_list_failed", zap.Error(err))
+			if ctx.Err() == nil {
+				logger.Warn(ctx, "safety_net_scan_list_failed", zap.Error(err))
+			}
+			// List failure: the meta-DB read that drives the scan failed. The
+			// scan stops early — warm-tenant recovery is degraded this cycle.
+			metrics.RecordOperation("user_db_access", "safety_net_scan_list", "error", 0)
+			metrics.RecordOperation("user_db_access", "safety_net_scan_cycle", "error", time.Since(scanStart))
 			return
 		}
 		if len(tenants) == 0 {
+			metrics.RecordOperation("user_db_access", "safety_net_scan_cycle", "ok", time.Since(scanStart))
 			return
 		}
 		for _, t := range tenants {
 			if ctx.Err() != nil {
+				metrics.RecordOperation("user_db_access", "safety_net_scan_cycle", "canceled", time.Since(scanStart))
 				return
 			}
 			// Shard filter: only process tenants this pod owns.
@@ -102,6 +114,11 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 				if store == nil {
 					return
 				}
+				// Per-warm-tenant touch: record that the safety-net accessed
+				// this tenant's user DB this cycle. A spike in this rate is a
+				// precursor to a scan touching many DBs — the warning alert
+				// catches it before it becomes a billing storm.
+				metrics.RecordTenantOperationCount(t.ID, "user_db_access", "safety_net_tenant_scan", "ok")
 				needKick := false
 				// Recover expired semantic task leases.
 				if recovered, err := store.RecoverExpiredSemanticTasks(ctx, now, safetyNetRecoverLimit); err != nil {
@@ -109,8 +126,10 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 						logger.Warn(ctx, "safety_net_scan_semantic_recover_failed",
 							zap.String("tenant_id", t.ID), zap.Error(err))
 					}
+					metrics.RecordTenantOperationCount(t.ID, "user_db_access", "safety_net_semantic_recover", "error")
 				} else if recovered > 0 {
 					metrics.RecordTenantOperation(t.ID, "semantic_worker", "safety_net_recover", "ok", 0)
+					metrics.RecordTenantOperationCount(t.ID, "user_db_access", "safety_net_semantic_recover", "ok")
 					needKick = true
 				}
 				// Recover expired file_gc leases.
@@ -119,7 +138,9 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 						logger.Warn(ctx, "safety_net_scan_file_gc_recover_failed",
 							zap.String("tenant_id", t.ID), zap.Error(err))
 					}
+					metrics.RecordTenantOperationCount(t.ID, "user_db_access", "safety_net_file_gc_recover", "error")
 				} else if recovered > 0 {
+					metrics.RecordTenantOperationCount(t.ID, "user_db_access", "safety_net_file_gc_recover", "ok")
 					needKick = true
 				}
 				// Check for unclaimed queued semantic tasks. If the outbox
@@ -147,6 +168,7 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 		afterCreatedAt = last.CreatedAt.UTC()
 		afterID = last.ID
 		if len(tenants) < safetyNetScanBatchSize {
+			metrics.RecordOperation("user_db_access", "safety_net_scan_cycle", "ok", time.Since(scanStart))
 			return
 		}
 	}
