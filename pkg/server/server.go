@@ -186,7 +186,7 @@ type Server struct {
 	tenantWorker             *tenantWorkerManager
 	shardResolver            *semanticShardResolver
 	journalCursorSecret      []byte
-	objectGCWorker            *objectGCWorker
+	objectGCWorker           *objectGCWorker
 	slockOAuth               SlockOAuthClient
 	tidbAutoEmbedding        tenantAutoEmbeddingDefault
 	disableDBAutoEmbed       bool
@@ -342,14 +342,14 @@ func NewWithConfig(cfg Config) *Server {
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
 			apiBase: strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIBase),
 		},
-		disableDBAutoEmbed:        cfg.DisableDatabaseAutoEmbedding || (cfg.Pool != nil && cfg.Pool.IsAutoEmbeddingDisabled()),
-		journalCursorSecret:       newJournalCursorSecret(cfg.TokenSecret),
-		forkWorkerCtx:             forkWorkerCtx,
-		forkWorkerCancel:          forkWorkerCancel,
-		leader:                    cfg.Leader,
-		podNotifySecret:           cfg.PodNotifySecret,
-		sseNotifyRetention:        cfg.SSENotifyRetention,
-		safetyNetScanInterval:     cfg.SafetyNetScanInterval,
+		disableDBAutoEmbed:    cfg.DisableDatabaseAutoEmbedding || (cfg.Pool != nil && cfg.Pool.IsAutoEmbeddingDisabled()),
+		journalCursorSecret:   newJournalCursorSecret(cfg.TokenSecret),
+		forkWorkerCtx:         forkWorkerCtx,
+		forkWorkerCancel:      forkWorkerCancel,
+		leader:                cfg.Leader,
+		podNotifySecret:       cfg.PodNotifySecret,
+		sseNotifyRetention:    cfg.SSENotifyRetention,
+		safetyNetScanInterval: cfg.SafetyNetScanInterval,
 	}
 	// Default SSE notify retention.
 	if s.sseNotifyRetention <= 0 {
