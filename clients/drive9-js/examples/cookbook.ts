@@ -4,6 +4,8 @@ export const coveredClientMethods = new Set([
   "appendJournalEntries",
   "append",
   "appendStream",
+  "archive",
+  "archiveToFile",
   "authHeaders",
   "baseURL",
   "batchReadSmall",
@@ -131,6 +133,18 @@ export async function streamingCookbook(client: Client, data: Uint8Array): Promi
   const writer = client.newStreamWriter("/sdk-ts/manual.bin", data.length);
   await writer.writePart(1, data);
   await writer.complete(0, new Uint8Array());
+  // Archive: download a remote tree as a streaming tar.gz with profile-based
+  // filtering. The stream can be piped to stdout or a file.
+  const archiveStream = await client.archive("/sdk-ts/", {
+    exclude: ["**/node_modules/**"],
+  });
+  // Drain the archive stream (caller would pipe to a file in practice).
+  const reader = archiveStream.getReader();
+  while (true) {
+    const { done } = await reader.read();
+    if (done) break;
+  }
+  await client.archiveToFile("/sdk-ts/", "/tmp/sdk-ts-archive.tar.gz");
 }
 
 export function streamWriterCookbook(writer: StreamWriter): Promise<void> {

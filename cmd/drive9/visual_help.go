@@ -557,6 +557,15 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "find [dir] -older YYYY-MM-DD", Desc: "modified before date"},
 					{Name: "find [dir] -size +N|-N", Desc: "size filter in bytes"},
 				}},
+				{Title: "Archive (download tree)", Flags: []visualHelpFlag{
+					{Name: "archive <remote:/dir> [<out>]", Desc: "download tree as tar.gz (default) or zip"},
+					{Name: "archive --format zip", Desc: "emit a zip archive instead of tar.gz"},
+					{Name: "archive --exclude <pattern>", Desc: "skip paths matching pattern (repeatable)"},
+					{Name: "archive --include <pattern>", Desc: "keep only paths matching pattern (repeatable)"},
+					{Name: "archive --profile <name>", Desc: "apply profile [local]/[remote] rules"},
+					{Name: "archive --stdout", Desc: "stream archive to stdout for piping"},
+					{Name: "archive --flat", Desc: "strip directory hierarchy; archive basenames only"},
+				}},
 				{Title: "Layers", Flags: []visualHelpFlag{
 					{Name: "layer create [flags] <base-root>", Desc: "create writable fs layer"},
 					{Name: "layer list [--json]", Desc: "list layers"},
@@ -570,6 +579,8 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Command: "drive9 fs ls -l :/", Desc: "list root"},
 				{Command: "drive9 fs cp ./notes.md :/team/notes.md", Desc: "upload a file"},
 				{Command: "drive9 fs find :/team -tag owner=agent", Desc: "find by exact tag"},
+				{Command: "drive9 fs archive :/proj ./proj.tar.gz --profile coding-agent", Desc: "download tree, skip node_modules/.git"},
+				{Command: "drive9 fs archive :/proj --stdout | tar -tzf -", Desc: "list archive contents via pipe"},
 			},
 		},
 		{

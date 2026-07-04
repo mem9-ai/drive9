@@ -63,6 +63,14 @@ drive9 mount --mode=fuse :/ ~/drive9
 git clone https://github.com/mem9-ai/drive9.git ~/drive9/drive9
 ```
 
+The CLI also supports bulk tree download as a single archive, with the same
+profile-based filtering that mount uses to skip `node_modules`/`.git`/`dist`:
+
+```bash
+drive9 fs archive :/proj ./proj.tar.gz --profile coding-agent
+drive9 fs archive :/proj --stdout | tar -tzf -    # stream to stdout for piping
+```
+
 ### Two-Tier Workspace State
 
 Source files and work products are durable workspace state. `.git`, dependencies,

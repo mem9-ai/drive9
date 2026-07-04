@@ -117,6 +117,7 @@ import {
   updateVaultSecret,
 } from "./vault.js";
 import { watchEvents, watchEventsWithLifecycle } from "./events.js";
+import { archiveImpl, archiveToFileImpl, type ArchiveOptions } from "./archive.js";
 
 const DEFAULT_SMALL_FILE_THRESHOLD = 50_000;
 const DEFAULT_SERVER = "https://api.drive9.ai";
@@ -618,6 +619,23 @@ export class Client {
         }
       })();
     });
+  }
+
+  /**
+   * Download a remote directory tree as a streaming tar.gz archive. The
+   * returned ReadableStream can be piped to a file or stdout. Filtering uses
+   * the same pattern forms as the Go CLI (subpath, prefix, exact/glob).
+   */
+  async archive(remoteDir: string, opts?: ArchiveOptions): Promise<ReadableStream<Uint8Array>> {
+    return archiveImpl(this, remoteDir, opts ?? {});
+  }
+
+  /**
+   * Download a remote directory tree to a local archive file (tar.gz by
+   * default, or zip via opts.format). Convenience wrapper around archive().
+   */
+  async archiveToFile(remoteDir: string, localPath: string, opts?: ArchiveOptions): Promise<void> {
+    return archiveToFileImpl(this, remoteDir, localPath, opts ?? {});
   }
 
   async resumeUpload(path: string, data: Uint8Array): Promise<void> {
