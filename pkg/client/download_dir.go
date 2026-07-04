@@ -24,6 +24,10 @@ const recursiveDownloadConcurrency = 16
 // treated as a conflict and aborts the download before any file is
 // written, so DownloadDir never overwrites or truncates existing local
 // files. Symlinks in the remote tree are rejected.
+//
+// If a download fails after the preflight phase, successfully-written
+// files and created directories remain on disk; cleanup is the caller's
+// responsibility.
 func (c *Client) DownloadDir(remoteDir, localDir string) error {
 	return c.DownloadDirCtx(context.Background(), remoteDir, localDir)
 }

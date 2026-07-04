@@ -158,4 +158,26 @@ describe("downloadDir", () => {
 
     expect(fs.readFileSync(path.join(dst, "x.txt"), "utf8")).toBe("x");
   });
+
+  it("rejects a symlink in the remote tree", async () => {
+    // S_IFLNK = 0o120000; a symlink mode like 0o120777 has (mode & 0o170000) === 0o120000.
+    server.use(
+      http.head(`${BASE}/v1/fs/symtree`, statHandler(true)),
+      http.get(`${BASE}/v1/fs/symtree`, ({ request }) => {
+        const url = new URL(request.url);
+        if (url.searchParams.get("list") === "1") {
+          return HttpResponse.json({
+            entries: [
+              { name: "link", size: 0, isDir: false, mode: 0o120777, hasMode: true },
+            ],
+          });
+        }
+        return new HttpResponse(null, { status: 404 });
+      })
+    );
+
+    const client = new Client(BASE, "test-key");
+    const dst = fs.mkdtempSync(path.join(os.tmpdir(), "d9-dl-"));
+    await expect(client.downloadDir("/symtree", dst)).rejects.toThrow(/symlink/);
+  });
 });

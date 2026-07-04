@@ -379,12 +379,16 @@ export class Client {
   async list(path: string): Promise<FileInfo[]> {
     const resp = await fetch(`${this.fsUrl(path)}?list=1`, { headers: this.authHeaders() });
     await checkError(resp);
-    const body = (await resp.json()) as { entries?: Array<{ name: string; size: number; isDir: boolean; mtime?: number }> };
+    const body = (await resp.json()) as {
+      entries?: Array<{ name: string; size: number; isDir: boolean; mtime?: number; mode?: number; hasMode?: boolean }>;
+    };
     return (body.entries || []).map((e) => ({
       name: e.name,
       size: e.size,
       isDir: e.isDir,
       mtime: e.mtime != null ? new Date(e.mtime * 1000) : undefined,
+      mode: e.mode,
+      hasMode: e.hasMode,
     }));
   }
 
@@ -631,8 +635,17 @@ export class Client {
    * downloadDir never overwrites or truncates existing local files.
    * Symlinks in the remote tree are rejected.
    *
+   * If a download fails after the preflight phase, successfully-written
+   * files and created directories remain on disk; cleanup is the caller's
+   * responsibility.
+   *
    * Mirrors the Go SDK's Client.DownloadDirCtx and the CLI's
    * `drive9 fs cp -r` remote→local path.
+   *
+   * Note: the preflight and mkdir phases use synchronous fs.*Sync calls
+   * which block the Node.js event loop. For trees with many descendants
+   * this may cause a brief stall in server-side contexts. The BFS walk
+   * and parallel download phase are fully async.
    */
   async downloadDir(remotePath: string, localPath: string): Promise<void> {
     // Source must exist and be a directory.
@@ -644,6 +657,11 @@ export class Client {
     // Walk the remote tree via list() BFS, collecting relative dirs and
     // files BEFORE touching the local filesystem so a malformed listing
     // or transport error can't leave a partial dst dir.
+    //
+    // Note: unlike the Go SDK's walkRemoteTreeBFS (which honors
+    // context.Context), this BFS loop has no AbortSignal cancellation
+    // path. A cancelled operation will complete the walk before the
+    // error surfaces. This is a known parity gap for future work.
     const dirs: string[] = []; // relative (slash-separated) dir paths
     const files: { remote: string; rel: string }[] = []; // relative file paths
     const queue: string[] = [""]; // relative paths to expand; "" = root
@@ -655,6 +673,10 @@ export class Client {
         const childRel = rel === "" ? e.name : `${rel}/${e.name}`;
         // Reject entry names that could escape localPath.
         joinLocalSafe(localPath, childRel);
+        // Reject symlinks — same as the Go SDK's remoteInfoIsSymlink.
+        if (e.hasMode && (e.mode! & 0o170000) === 0o120000) {
+          throw new Drive9Error(`downloadDir does not support symlinks (path: ${childRel})`);
+        }
         if (e.isDir) {
           dirs.push(childRel);
           queue.push(childRel);
@@ -705,6 +727,9 @@ export class Client {
 
     // Bounded-parallel download. Sibling failures are collected; the
     // first error is re-thrown after all in-flight downloads settle.
+    // If one or more downloads fail, successfully-written files and
+    // created directories remain on disk; cleanup is the caller's
+    // responsibility.
     const sem = new Semaphore(DOWNLOAD_DIR_CONCURRENCY);
     const errors: unknown[] = [];
     await Promise.all(
