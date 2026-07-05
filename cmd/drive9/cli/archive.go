@@ -155,6 +155,16 @@ func Archive(c *client.Client, args []string) error {
 		return err
 	}
 
+	// Honor a context-qualified source (e.g. `drive9 fs archive prod:/proj`)
+	// by switching to that context's client, mirroring `fs cp` behavior.
+	sourceClient := c
+	if srcRP.Context != "" {
+		sourceClient, err = newFSClientForContext(srcRP.Context)
+		if err != nil {
+			return fmt.Errorf("resolve context %q: %w", srcRP.Context, err)
+		}
+	}
+
 	ctx := context.Background()
 	var out io.Writer
 	var closeOut func() error
@@ -171,7 +181,7 @@ func Archive(c *client.Client, args []string) error {
 	}
 	defer func() { _ = closeOut() }()
 
-	return c.ArchiveDir(ctx, srcRP.Path, out, opts)
+	return sourceClient.ArchiveDir(ctx, srcRP.Path, out, opts)
 }
 
 // buildArchiveOptions merges profile rules with explicit flags into

@@ -129,6 +129,24 @@ export async function archiveImpl(
   const writer = gzip.writable.getWriter();
   const output = new ReadableStream<Uint8Array>({
     async start(controller) {
+      // Pump gzip output to the controller CONCURRENTLY with the write phase.
+      // If we waited to read gzip.readable until after writer.close(), Web
+      // Streams backpressure on incompressible data could deadlock the
+      // CompressionStream (its internal buffer fills, blocking writes). By
+      // draining in parallel we keep the pipeline flowing.
+      let pumpErr: unknown = null;
+      const pumpDone = (async () => {
+        const reader = gzip.readable.getReader();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) controller.enqueue(value);
+          }
+        } catch (err) {
+          pumpErr = err;
+        }
+      })();
       try {
         // Directories first (preserves empty dirs). Writes are serialized
         // because the writer is a single gzip stream.
@@ -161,13 +179,8 @@ export async function archiveImpl(
         await writer.write(new Uint8Array(TAR_BLOCK));
         await writer.write(new Uint8Array(TAR_BLOCK));
         await writer.close();
-        // Pipe gzip output to the controller.
-        const reader = gzip.readable.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) controller.enqueue(value);
-        }
+        await pumpDone;
+        if (pumpErr) throw pumpErr;
         controller.close();
       } catch (err) {
         controller.error(err);
@@ -410,24 +423,42 @@ async function collectArchiveTree(
 ): Promise<{ dirs: ArchiveEntry[]; files: ArchiveEntry[] }> {
   const dirs: ArchiveEntry[] = [{ rel: "", remote: root, root: archiveRoot, size: 0, isDir: true, mode: 0o755 }];
   const files: ArchiveEntry[] = [];
+  const flatSeen = new Map<string, string>(); // basename -> first rel that claimed it
   await walkRemoteTreeBFS(client, root, signal, (rel, info) => {
-    if (rel === "") return;
-    if (!match(matcher, rel)) return;
+    if (rel === "") return true;
+    if (!match(matcher, rel)) {
+      // Tell the walker not to descend into an excluded directory, pruning
+      // the whole subtree (e.g. node_modules) at BFS time so we never issue
+      // list() calls for directories that would only be filtered out.
+      return info.isDir ? false : true;
+    }
     const remote = joinRemote(root, rel);
     if (info.isDir) {
       dirs.push({ rel, remote, root: archiveRoot, size: 0, isDir: true, mode: 0o755 });
-      return;
+      return true;
+    }
+    if (flat) {
+      const base = archiveName(archiveRoot, rel, flat);
+      if (flatSeen.has(base)) {
+        throw new Error(`flat archive collision: ${flatSeen.get(base)} and ${rel} both map to basename ${base}`);
+      }
+      flatSeen.set(base, rel);
     }
     files.push({ rel, remote, root: archiveRoot, size: info.size, isDir: false });
+    return true;
   });
   return { dirs, files };
 }
 
+// walkRemoteTreeBFS walks a remote directory tree breadth-first via list().
+// The visit callback returns false to skip enqueuing a directory's children
+// (subtree pruning for excluded dirs), true to descend. Any thrown error
+// aborts the walk.
 async function walkRemoteTreeBFS(
   client: Client,
   root: string,
   signal: AbortSignal | undefined,
-  visit: (rel: string, info: FileInfo) => void
+  visit: (rel: string, info: FileInfo) => boolean
 ): Promise<void> {
   const queue: string[] = [""];
   while (queue.length > 0) {
@@ -437,8 +468,8 @@ async function walkRemoteTreeBFS(
     const entries = await client.list(absDir);
     for (const e of entries) {
       const childRel = rel === "" ? e.name : `${rel}/${e.name}`;
-      visit(childRel, e);
-      if (e.isDir) queue.push(childRel);
+      const descend = visit(childRel, e);
+      if (e.isDir && descend) queue.push(childRel);
     }
   }
 }
@@ -454,6 +485,10 @@ async function parallelMap<T>(
   signal: AbortSignal | undefined,
   fn: (item: T) => Promise<void>
 ): Promise<void> {
+  if (items.length === 0) return;
+  // Clamp non-positive concurrency to the default; otherwise Math.min(0, n)
+  // would start zero workers and silently drop every file.
+  const safeConcurrency = concurrency > 0 ? concurrency : DEFAULT_JOBS;
   let index = 0;
   const workers: Promise<void>[] = [];
   const errors: Error[] = [];
@@ -469,7 +504,7 @@ async function parallelMap<T>(
       }
     }
   };
-  for (let w = 0; w < Math.min(concurrency, items.length || 1); w++) workers.push(run());
+  for (let w = 0; w < Math.min(safeConcurrency, items.length); w++) workers.push(run());
   await Promise.all(workers);
   if (errors.length > 0) throw errors[0];
 }

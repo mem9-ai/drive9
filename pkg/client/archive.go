@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -15,6 +16,12 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/pathfilter"
 )
+
+// errArchiveSkipDir is the sentinel returned by the collectArchiveTree visitor
+// to tell walkRemoteTreeBFS not to enqueue a directory's children. Mirrors
+// filepath.SkipDir semantics so excluded subtrees (e.g. node_modules under
+// --profile coding-agent) are pruned at BFS time rather than listed in full.
+var errArchiveSkipDir = errors.New("archive: skip directory subtree")
 
 // ArchiveFormat selects the archive container for ArchiveDir.
 type ArchiveFormat string
@@ -100,11 +107,22 @@ func (c *Client) ArchiveDir(ctx context.Context, remoteDir string, w io.Writer, 
 	}
 }
 
-func (c *Client) archiveTarGz(ctx context.Context, root, archiveRoot string, w io.Writer, matcher pathfilter.Matcher, flat bool, jobs int) error {
+func (c *Client) archiveTarGz(ctx context.Context, root, archiveRoot string, w io.Writer, matcher pathfilter.Matcher, flat bool, jobs int) (err error) {
 	gw := gzip.NewWriter(w)
-	defer func() { _ = gw.Close() }()
 	tw := tar.NewWriter(gw)
-	defer func() { _ = tw.Close() }()
+	// Close in reverse order; surface finalization errors (tar end blocks,
+	// gzip trailer/flush) instead of discarding them so a full disk or broken
+	// pipe does not leave an invalid archive with a nil return.
+	defer func() {
+		closeErr := tw.Close()
+		if err == nil && closeErr != nil {
+			err = fmt.Errorf("close tar writer: %w", closeErr)
+		}
+		gzErr := gw.Close()
+		if err == nil && gzErr != nil {
+			err = fmt.Errorf("close gzip writer: %w", gzErr)
+		}
+	}()
 
 	dirs, files, err := c.collectArchiveTree(ctx, root, archiveRoot, matcher, flat)
 	if err != nil {
@@ -128,20 +146,27 @@ func (c *Client) archiveTarGz(ctx context.Context, root, archiveRoot string, w i
 	}
 
 	var writeMu sync.Mutex
-	if err := c.archiveParallel(ctx, files, jobs, func(ctx context.Context, e archiveEntry) error {
-		rc, err := c.ReadStream(ctx, e.remote)
-		if err != nil {
-			return fmt.Errorf("open %q: %w", e.remote, err)
-		}
-		defer func() { _ = rc.Close() }()
+	transferErr := c.archiveParallel(ctx, files, jobs, func(ctx context.Context, e archiveEntry) error {
 		name := archiveName(e.root, e.rel, flat)
 		if name == "" {
 			return nil
 		}
+		// Download the body BEFORE acquiring the write lock so network reads
+		// run in parallel across workers; only the tar header+body write is
+		// serialized (the tar writer is not concurrency-safe).
+		rc, err := c.ReadStream(ctx, e.remote)
+		if err != nil {
+			return fmt.Errorf("open %q: %w", e.remote, err)
+		}
+		body, err := io.ReadAll(io.LimitReader(rc, e.size))
+		_ = rc.Close()
+		if err != nil {
+			return fmt.Errorf("read %q: %w", e.remote, err)
+		}
 		hdr := &tar.Header{
 			Name:     name,
 			Mode:     archiveTarMode(e.mode, false),
-			Size:     e.size,
+			Size:     int64(len(body)),
 			Typeflag: tar.TypeReg,
 			ModTime:  archiveModTime(),
 		}
@@ -150,20 +175,28 @@ func (c *Client) archiveTarGz(ctx context.Context, root, archiveRoot string, w i
 		if err := tw.WriteHeader(hdr); err != nil {
 			return fmt.Errorf("write header %q: %w", name, err)
 		}
-		if _, err := io.Copy(tw, io.LimitReader(rc, e.size)); err != nil {
-			return fmt.Errorf("copy body %q: %w", name, err)
+		if _, err := tw.Write(body); err != nil {
+			return fmt.Errorf("write body %q: %w", name, err)
 		}
 		return nil
-	}); err != nil {
-		return fmt.Errorf("archive transfer: %w", err)
+	})
+	if transferErr != nil {
+		return fmt.Errorf("archive transfer: %w", transferErr)
 	}
 	_ = jobs
 	return nil
 }
 
-func (c *Client) archiveZip(ctx context.Context, root, archiveRoot string, w io.Writer, matcher pathfilter.Matcher, flat bool, jobs int) error {
+func (c *Client) archiveZip(ctx context.Context, root, archiveRoot string, w io.Writer, matcher pathfilter.Matcher, flat bool, jobs int) (err error) {
 	zw := zip.NewWriter(w)
-	defer func() { _ = zw.Close() }()
+	// Surface the zip writer's finalization error (central directory flush)
+	// instead of discarding it.
+	defer func() {
+		closeErr := zw.Close()
+		if err == nil && closeErr != nil {
+			err = fmt.Errorf("close zip writer: %w", closeErr)
+		}
+	}()
 
 	dirs, files, err := c.collectArchiveTree(ctx, root, archiveRoot, matcher, flat)
 	if err != nil {
@@ -176,22 +209,29 @@ func (c *Client) archiveZip(ctx context.Context, root, archiveRoot string, w io.
 			continue
 		}
 		hdr := &zip.FileHeader{Name: name, Method: zip.Store}
-		hdr.SetMode(archiveZipMode(d.mode, true) | 0o750)
+		hdr.SetMode(archiveZipMode(d.mode, true))
 		if _, err := zw.CreateHeader(hdr); err != nil {
 			return fmt.Errorf("zip create dir %q: %w", name, err)
 		}
 	}
 
 	var writeMu sync.Mutex
-	if err := c.archiveParallel(ctx, files, jobs, func(ctx context.Context, e archiveEntry) error {
+	transferErr := c.archiveParallel(ctx, files, jobs, func(ctx context.Context, e archiveEntry) error {
+		name := archiveName(e.root, e.rel, flat)
+		if name == "" {
+			return nil
+		}
+		// Download the body BEFORE acquiring the write lock so network reads
+		// run in parallel; zip writers require sequential entry creation, so
+		// only CreateHeader + Write are serialized.
 		rc, err := c.ReadStream(ctx, e.remote)
 		if err != nil {
 			return fmt.Errorf("open %q: %w", e.remote, err)
 		}
-		defer func() { _ = rc.Close() }()
-		name := archiveName(e.root, e.rel, flat)
-		if name == "" {
-			return nil
+		body, err := io.ReadAll(io.LimitReader(rc, e.size))
+		_ = rc.Close()
+		if err != nil {
+			return fmt.Errorf("read %q: %w", e.remote, err)
 		}
 		hdr := &zip.FileHeader{Name: name, Method: zip.Deflate}
 		hdr.SetMode(archiveZipMode(e.mode, false))
@@ -201,25 +241,36 @@ func (c *Client) archiveZip(ctx context.Context, root, archiveRoot string, w io.
 		if err != nil {
 			return fmt.Errorf("zip create %q: %w", name, err)
 		}
-		if _, err := io.Copy(out, io.LimitReader(rc, e.size)); err != nil {
-			return fmt.Errorf("zip copy %q: %w", name, err)
+		if _, err := out.Write(body); err != nil {
+			return fmt.Errorf("zip write %q: %w", name, err)
 		}
 		return nil
-	}); err != nil {
-		return fmt.Errorf("archive transfer: %w", err)
+	})
+	if transferErr != nil {
+		return fmt.Errorf("archive transfer: %w", transferErr)
 	}
 	return nil
 }
 
 // collectArchiveTree walks the remote tree once, applying the matcher to prune
 // excluded directories at BFS time and collecting surviving leaf entries.
+// In flat mode it rejects duplicate basenames (two files that would collapse to
+// the same in-archive name) so extraction never silently overwrites one.
 func (c *Client) collectArchiveTree(ctx context.Context, root, archiveRoot string, matcher pathfilter.Matcher, flat bool) (dirs []archiveEntry, files []archiveEntry, err error) {
 	dirs = append(dirs, archiveEntry{rel: "", remote: root, root: archiveRoot, mode: 0o755})
+	flatSeen := map[string]string{} // basename -> first rel that claimed it
 	err = c.walkRemoteTreeBFS(ctx, root, func(rel string, info FileInfo) error {
 		if rel == "" {
 			return nil
 		}
 		if !matcher.Match(rel) {
+			// Drop the entry. If it is a directory, tell the walker not to
+			// enqueue its children — this prunes the whole excluded subtree
+			// (e.g. node_modules) at BFS time, so we never issue ListCtx
+			// calls for directories that would only be filtered out.
+			if info.IsDir {
+				return errArchiveSkipDir
+			}
 			return nil
 		}
 		entry := archiveEntry{
@@ -234,6 +285,13 @@ func (c *Client) collectArchiveTree(ctx context.Context, root, archiveRoot strin
 			dirs = append(dirs, entry)
 			return nil
 		}
+		if flat {
+			base := archiveName(archiveRoot, rel, flat)
+			if first, dup := flatSeen[base]; dup {
+				return fmt.Errorf("flat archive collision: %q and %q both map to basename %q", first, rel, base)
+			}
+			flatSeen[base] = rel
+		}
 		entry.size = info.Size
 		files = append(files, entry)
 		return nil
@@ -242,6 +300,11 @@ func (c *Client) collectArchiveTree(ctx context.Context, root, archiveRoot strin
 }
 
 // walkRemoteTreeBFS walks a remote directory tree breadth-first via ListCtx.
+// The visit callback may return the sentinel errArchiveSkipDir to indicate that
+// a directory's children should NOT be enqueued — this is how collectArchiveTree
+// prunes excluded subtrees at BFS time, avoiding extra ListCtx round-trips for
+// children that the matcher would drop anyway (e.g. node_modules/.git under
+// --profile coding-agent). Any other non-nil error aborts the walk.
 func (c *Client) walkRemoteTreeBFS(ctx context.Context, root string, visit func(rel string, info FileInfo) error) error {
 	queue := []string{""}
 	for len(queue) > 0 {
@@ -261,6 +324,10 @@ func (c *Client) walkRemoteTreeBFS(ctx context.Context, root string, visit func(
 				childRel = rel + "/" + e.Name
 			}
 			if err := visit(childRel, e); err != nil {
+				if errors.Is(err, errArchiveSkipDir) {
+					// Visitor asked us not to descend into this directory.
+					continue
+				}
 				return err
 			}
 			if e.IsDir {

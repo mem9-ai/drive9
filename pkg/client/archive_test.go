@@ -22,12 +22,14 @@ type archiveMockServer struct {
 	mu          sync.Mutex
 	listEntries map[string][]FileInfo
 	fileBodies  map[string][]byte
+	listCalls   map[string]int // path -> number of ListCtx calls
 }
 
 func newArchiveMockServer(files map[string]string) *archiveMockServer {
 	m := &archiveMockServer{
 		listEntries: map[string][]FileInfo{},
 		fileBodies:  map[string][]byte{},
+		listCalls:   map[string]int{},
 	}
 	dirSeen := map[string]map[string]bool{}
 	addChild := func(dir, name string, info FileInfo) {
@@ -75,6 +77,7 @@ func (m *archiveMockServer) server(t *testing.T) *httptest.Server {
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/fs/") && r.URL.Query().Has("list"):
 			p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+			m.listCalls[p]++
 			entries := m.listEntries[p]
 			out := make([]map[string]any, len(entries))
 			for i, e := range entries {
@@ -286,6 +289,76 @@ func TestArchiveDirFlatStripsHierarchy(t *testing.T) {
 	for _, n := range names {
 		if strings.Contains(n, "/") {
 			t.Fatalf("flat mode should emit basenames only, got %q", n)
+		}
+	}
+}
+
+func TestArchiveDirFlatRejectsDuplicateBasenames(t *testing.T) {
+	mock := newArchiveMockServer(map[string]string{
+		"/proj/src/config.json":  "{}\n",
+		"/proj/test/config.json": "{}\n",
+	})
+	srv := mock.server(t)
+	defer srv.Close()
+	c := New(srv.URL, "")
+	c.smallFileThreshold = DefaultSmallFileThreshold
+
+	var buf bytes.Buffer
+	err := c.ArchiveDir(context.Background(), "/proj", &buf, ArchiveOptions{Flat: true})
+	if err == nil {
+		t.Fatal("expected collision error for duplicate basenames in flat mode")
+	}
+	if !strings.Contains(err.Error(), "collision") {
+		t.Fatalf("expected collision error, got: %v", err)
+	}
+}
+
+func TestArchiveDirDirectoryPruningSkipsExcludedSubtree(t *testing.T) {
+	// Tree with a nested node_modules subtree. The mock records ListCtx calls
+	// so we can assert that excluded subtrees are NOT listed.
+	mock := newArchiveMockServer(map[string]string{
+		"/proj/src/app.go":                    "package src\n",
+		"/proj/node_modules/react/index.js":    "module.exports\n",
+		"/proj/node_modules/react/foo/bar.js":  "foo\n",
+	})
+	srv := mock.server(t)
+	defer srv.Close()
+	c := New(srv.URL, "")
+	c.smallFileThreshold = DefaultSmallFileThreshold
+
+	var buf bytes.Buffer
+	if err := c.ArchiveDir(context.Background(), "/proj", &buf, ArchiveOptions{
+		Exclude: []string{"**/node_modules/**"},
+	}); err != nil {
+		t.Fatalf("ArchiveDir: %v", err)
+	}
+	// The excluded subtree's nested directories must NOT have been listed —
+	// directory pruning at BFS time means we never issue ListCtx for children
+	// of an excluded directory.
+	mock.mu.Lock()
+	reactCalls := mock.listCalls["/proj/node_modules/react"]
+	reactFooCalls := mock.listCalls["/proj/node_modules/react/foo"]
+	mock.mu.Unlock()
+	if reactCalls > 0 {
+		t.Fatalf("pruned subtree /proj/node_modules/react was listed %d time(s); expected 0", reactCalls)
+	}
+	if reactFooCalls > 0 {
+		t.Fatalf("pruned subtree /proj/node_modules/react/foo was listed %d time(s); expected 0", reactFooCalls)
+	}
+	// And the archive must contain no node_modules entries.
+	gz, _ := gzip.NewReader(bytes.NewReader(buf.Bytes()))
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar next: %v", err)
+		}
+		if strings.Contains(hdr.Name, "node_modules") {
+			t.Fatalf("excluded node_modules leaked into archive: %q", hdr.Name)
 		}
 	}
 }
