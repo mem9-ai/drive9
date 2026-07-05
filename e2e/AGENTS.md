@@ -513,8 +513,21 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 1. Provision tenant via `drive9 create` with `--tidbcloud-public-key` / `--tidbcloud-private-key`
 2. Poll `GET /v1/status` until active
 3. Basic CLI fs operations (`mkdir`, `cp`, `cat`, `ls`, `rm`)
-4. Delete tenant via `drive9 delete` and verify removal (401/403/404 on `GET /v1/status`)
-5. Trap-based cleanup: attempts `drive9 delete` on script failure unless `SKIP_CLEANUP=1`
+4. Batch small file + large file upload/download + checksum verification
+5. Fork smoke (`ctx fork`, fork readiness polling, read/write verification, fork delete)
+6. `drive9 admin tenant list` — list tenants, verify active tenant appears
+7. `drive9 admin tenant get` — get tenant details and quota info
+8. `drive9 admin tenant set-quota` — set restrictive file-size quota (storage=102400 Mi, file-size=2 Mi)
+9. Verify max-file-size enforcement: 3 MiB file rejected, 1 MiB file accepted
+10. `drive9 admin tenant set-quota` — set generous file-count (1000), create 5 files, then lower to 5
+11. Verify max-file-count enforcement: 5 files created, excess file rejected at limit=5
+12. `drive9 admin tenant set-quota` — set max-storage-size=1 Mi, verify 2 MiB file rejected
+13. `drive9 admin tenant set-quota` (reset) — reset all quotas to generous values
+14. `drive9 admin tenant create` — create tenant with initial quotas, verify response
+15. `drive9 admin tenant get` — verify initial quotas are reflected on the new tenant
+16. `drive9 admin tenant delete` — delete the admin-created tenant
+17. Delete main tenant via `drive9 delete` and verify removal (401/403/404 on `GET /v1/status`)
+18. Trap-based cleanup: attempts to delete both admin and main tenants on script failure unless `SKIP_CLEANUP=1`
 
 ## Environment variables
 
