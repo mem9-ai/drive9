@@ -1,4 +1,7 @@
 import XCTest
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import Drive9Mobile
 
 /// Live-server integration tests for the Drive9 Swift SDK.

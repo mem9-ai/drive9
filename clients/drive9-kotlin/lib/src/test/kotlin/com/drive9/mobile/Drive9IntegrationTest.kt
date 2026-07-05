@@ -363,7 +363,7 @@ class Drive9IntegrationTest {
         c.deleteVaultSecret(secName)
     }
 
-    private fun expectFails(block: () -> Unit) {
+    private suspend fun expectFails(block: suspend () -> Unit) {
         try {
             block()
             throw AssertionError("expected call to fail but it succeeded")
