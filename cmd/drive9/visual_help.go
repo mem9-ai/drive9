@@ -431,7 +431,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			Summary: "provision a new tenant and save an owner context",
 			Details: []string{
 				"no TiDB Cloud keys -> Anonymous mode; TiDB Cloud keys -> TiDBCloud Mode",
-				"Anonymous mode transfers data management rights to PingCAP",
+				"Anonymous mode is a quick-start workspace hosted by TiDB so you can try drive9 without an account; files are tenant-isolated and encrypted in transit. Sign up at drive9.ai for a workspace tied to your own account. Details: drive9.ai/security",
 			},
 			Flags: []visualHelpFlag{
 				{Name: "--name NAME", Desc: "context name; defaults to an auto-generated 7-character name"},
@@ -665,7 +665,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			},
 			Details: []string{
 				"text output columns: REGION CODE, CLOUD PROVIDER, REGION, MODE, SERVER",
-				"Anonymous regions print a data-management rights note on stderr",
+				"Anonymous regions print a tenant-isolation and encryption note on stderr",
 			},
 			Examples: []visualHelpExample{
 				{Command: "drive9 region list", Desc: "human-readable regions"},

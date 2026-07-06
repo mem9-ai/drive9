@@ -148,7 +148,7 @@ func Create(args []string) error {
 	}
 
 	if mode == RegionModeAnonymous {
-		fmt.Fprintf(os.Stderr, "Note: Anonymous mode is for evaluation and functional testing only. Please do not put production data in it.\n")
+		fmt.Fprintf(os.Stderr, "Anonymous mode: a quick-start workspace hosted by TiDB. Your files are tenant-isolated and encrypted in transit. For a workspace tied to your own account (recommended for important data), sign up at drive9.ai. Details: drive9.ai/security\n")
 	}
 
 	cfg := loadConfig()
@@ -290,7 +290,7 @@ examples:
   # list available regions
   drive9 region list
 
-note: Anonymous mode is for evaluation and functional testing only. Please do not put production data in it.`
+note: Anonymous mode is a quick-start workspace hosted by TiDB — tenant-isolated, encrypted in transit. Sign up at drive9.ai for your own account workspace. Details: drive9.ai/security`
 }
 
 func provisionModeForCredentials(publicKey, privateKey string) string {
