@@ -9,6 +9,13 @@ including local single-tenant validation via `drive9-server-local`.
 - `jq` installed
 - Bash 4+
 
+For `tidb_cloud_native` endpoints that do not have server-side default TiDB
+Cloud credentials, set `DRIVE9_TIDBCLOUD_PUBLIC_KEY` and
+`DRIVE9_TIDBCLOUD_PRIVATE_KEY`. The general provisioning smoke scripts then send
+those fields in `/v1/provision`; when unset, they keep the existing empty-body
+provisioning behavior for anonymous/default-key endpoints. Optionally set
+`DRIVE9_TIDBCLOUD_SPENDING_LIMIT` to include `tidbcloud_spending_limit`.
+
 ## Scripts
 
 | Script | What it validates |
@@ -192,6 +199,11 @@ bash e2e/posix-permission-smoke-test.sh
 DRIVE9_TIDBCLOUD_PUBLIC_KEY=xxx DRIVE9_TIDBCLOUD_PRIVATE_KEY=xxx bash e2e/native-smoke-test.sh
 
 bash e2e/smoke-all.sh
+
+# Use TiDB Cloud credentials for tidb_cloud_native endpoints without a
+# server-side default key.
+DRIVE9_TIDBCLOUD_PUBLIC_KEY=xxx DRIVE9_TIDBCLOUD_PRIVATE_KEY=xxx \
+  bash e2e/smoke-all.sh
 
 # Include portable profile pack/unpack coverage in smoke-all.
 RUN_PORTABLE_PACK_E2E=1 bash e2e/smoke-all.sh
