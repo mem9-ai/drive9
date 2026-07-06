@@ -250,6 +250,28 @@ func waitForTiDBCloudOrgBindingNotFound(t *testing.T, metaStore *meta.Store, ten
 	}
 }
 
+func waitForTenantClusterReference(t *testing.T, metaStore *meta.Store, tenantID, wantClusterID string) (status, provider, clusterID, host, user, dbName string, port int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := metaStore.DB().QueryRow(`
+			SELECT status, provider, COALESCE(cluster_id, ''), db_host, db_port, db_user, db_name
+			FROM tenants WHERE id = ?`,
+			tenantID,
+		).Scan(&status, &provider, &clusterID, &host, &port, &user, &dbName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if clusterID == wantClusterID {
+			return status, provider, clusterID, host, user, dbName, port
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tenant cluster_id = %s, want %s", clusterID, wantClusterID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 type credentialOnlyProvisioner struct {
 	provider string
 	cluster  *tenant.ClusterInfo
@@ -1201,14 +1223,11 @@ func TestProvisionTiDBCloudNativePersistsClusterReferenceWhenCleanupFails(t *tes
 	}
 	waitForDeprovisionCalls(t, prov, 1)
 
-	var status, provider, clusterID, host, user, dbName string
-	var port int
-	if err := metaStore.DB().QueryRow(`
-		SELECT status, provider, COALESCE(cluster_id, ''), db_host, db_port, db_user, db_name
-		FROM tenants LIMIT 1`,
-	).Scan(&status, &provider, &clusterID, &host, &port, &user, &dbName); err != nil {
+	var tenantID string
+	if err := metaStore.DB().QueryRow("SELECT id FROM tenants LIMIT 1").Scan(&tenantID); err != nil {
 		t.Fatal(err)
 	}
+	status, provider, clusterID, host, user, dbName, port := waitForTenantClusterReference(t, metaStore, tenantID, "native-cluster-cleanup-error")
 	if status != string(meta.TenantFailed) {
 		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
 	}
@@ -1906,20 +1925,18 @@ func TestProvisionCleansPartialClusterBeforeMarkingFailed(t *testing.T) {
 		t.Fatalf("status=%d, want %d", resp.StatusCode, http.StatusBadGateway)
 	}
 
-	var status, clusterID string
+	var tenantID, status string
 	if err := metaStore.DB().QueryRow(`
-		SELECT status, COALESCE(cluster_id, '')
+		SELECT id, status
 		FROM tenants LIMIT 1`,
-	).Scan(&status, &clusterID); err != nil {
+	).Scan(&tenantID, &status); err != nil {
 		t.Fatalf("QueryRow tenant: %v", err)
 	}
 	if status != string(meta.TenantFailed) {
 		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
 	}
-	if clusterID != "" {
-		t.Fatalf("tenant cluster_id = %s, want empty after cleanup", clusterID)
-	}
 	waitForDeprovisionCalls(t, prov, 1)
+	waitForTenantClusterReference(t, metaStore, tenantID, "")
 	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "cluster-after-takeover" {
 		t.Fatalf("deprovision cluster = %#v", prov.lastDeprovision)
 	}

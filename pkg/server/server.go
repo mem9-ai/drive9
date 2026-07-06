@@ -4765,13 +4765,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to encrypt db password", err)
 	}
 	logProvisionStage(ctx, "provision_db_password_encrypted", tenantID, provider, stageStarted)
-	dbtls := true
-	if provider == tenant.ProviderTiDBCloudNative {
-		v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
-		if v == "1" || v == "true" || v == "yes" {
-			dbtls = false
-		}
-	}
+	dbtls := dbTLSForProvisionedTenant(provider)
 	stageStarted = time.Now()
 	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
 		DBHost:           cluster.Host,
@@ -4858,13 +4852,20 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 		return
 	}
 	t := &meta.Tenant{
-		ID:        tenantID,
-		Provider:  provider,
-		ClusterID: cluster.ClusterID,
-		DBHost:    cluster.Host,
-		DBPort:    cluster.Port,
-		DBUser:    cluster.Username,
-		DBName:    cluster.DBName,
+		ID:             tenantID,
+		Provider:       provider,
+		ClusterID:      cluster.ClusterID,
+		BranchID:       cluster.BranchID,
+		DBHost:         cluster.Host,
+		DBPort:         cluster.Port,
+		DBUser:         cluster.Username,
+		DBName:         cluster.DBName,
+		DBTLS:          dbTLSForProvisionedTenant(provider),
+		ClaimURL:       cluster.ClaimURL,
+		ClaimExpiresAt: cluster.ClaimExpiresAt,
+	}
+	if uerr := s.meta.UpdateTenantClusterReference(cleanupCtx, tenantID, t); uerr != nil {
+		logger.Error(cleanupCtx, "server_event", eventFields(cleanupCtx, "provision_cluster_cleanup_reference_persist_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", uerr)...)
 	}
 	var req tenant.CredentialProvisionRequest
 	if provider == tenant.ProviderTiDBCloudNative {
@@ -4888,6 +4889,14 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 			logger.Error(workerCtx, "server_event", eventFields(workerCtx, "provision_metadata_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
 		}
 	})
+}
+
+func dbTLSForProvisionedTenant(provider string) bool {
+	if provider != tenant.ProviderTiDBCloudNative {
+		return true
+	}
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
+	return v != "1" && v != "true" && v != "yes"
 }
 
 func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {
