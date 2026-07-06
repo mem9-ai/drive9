@@ -90,8 +90,43 @@ Environment variables `DRIVE9_SERVER` or `DRIVE9_BASE` and `DRIVE9_API_KEY` take
 | Read range stream | `client.readStreamRange(path, offset, length)` |
 | Read range bytes | `client.readAt(path, offset, length)` |
 | Download to local file | `client.downloadToFile(remotePath, localPath)` |
+| Download directory tree | `client.downloadDir(remotePath, localPath)` |
 | Stream writer | `client.newStreamWriter(path, totalSize, options?)` |
 | Append | `client.append(path, data)` |
+
+### Directory archive
+
+Download an entire remote directory tree as a `tar.gz` (or `zip`) archive. Filtering mirrors the
+Go CLI's `drive9 fs archive` (subpath, prefix, exact/glob patterns, profile-based rules).
+
+```typescript
+// Stream a tar.gz to stdout or a file
+const stream = await client.archive("/projects/app", { exclude: ["**/node_modules/**"] });
+const out = createWriteStream("app.tar.gz");
+for await (const chunk of stream) out.write(Buffer.from(chunk));
+out.end();
+
+// Or write directly to a local file (tar.gz or zip)
+await client.archiveToFile("/projects/app", "app.zip", {
+  format: "zip",
+  exclude: ["**/node_modules/**", "**/dist/**"],
+  profile: "coding-agent",
+  jobs: 16,
+  flat: false,
+});
+```
+
+`ArchiveOptions`:
+
+| Option | Description |
+|--------|-------------|
+| `format` | `"tar.gz"` (default) or `"zip"` |
+| `exclude` | Skip paths matching these patterns |
+| `include` | Keep only paths matching these patterns |
+| `profile` | Apply a named profile's rules (e.g. `"coding-agent"`) |
+| `jobs` | Concurrent file downloads (default 16) |
+| `flat` | Strip directory hierarchy; archive basenames only |
+| `signal` | `AbortSignal` to cancel the operation |
 
 `append` uses the native server append flow for existing S3-backed files. When
 native append is unavailable, the SDK only uses a bounded small-file rewrite and
