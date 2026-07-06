@@ -131,7 +131,7 @@ func regionListCmd(args []string) error {
 	}
 	for _, entry := range manifest.Regions {
 		if regionModeLabel(entry.Mode) == ModeLabelAnonymous {
-			fmt.Fprintln(os.Stderr, "Note: Anonymous mode in drive9 transfers data management rights to PingCAP.")
+			fmt.Fprintln(os.Stderr, "Note: Anonymous mode is for evaluation and functional testing only. Please do not put production data in it.")
 			break
 		}
 	}
