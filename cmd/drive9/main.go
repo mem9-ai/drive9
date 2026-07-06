@@ -374,6 +374,8 @@ func runFS(args []string) {
 		err = cli.Grep(c, rest)
 	case "find":
 		err = cli.Find(c, rest)
+	case "archive":
+		err = cli.Archive(c, rest)
 	case "layer":
 		err = cli.Layer(c, rest)
 	case "-h", "-help", "--help", "help":
@@ -502,6 +504,16 @@ commands:
     -newer <YYYY-MM-DD>  modified after date
     -older <YYYY-MM-DD>  modified before date
     -size <+N|-N>        size filter in bytes
+  archive [flags] <remote:/dir> [<out>]
+                       download a remote directory tree as tar.gz/zip
+    --format tar.gz|zip  archive format (default tar.gz)
+    --exclude <pattern>  skip paths matching pattern (repeatable)
+    --include <pattern>  keep only paths matching pattern (repeatable)
+    --profile <name>     apply profile [local]/[remote] filter rules
+    --jobs <n>           concurrent downloads (default 16)
+    --stdout             write archive to stdout (pipe-friendly)
+    --flat               strip directory hierarchy; archive basenames only
+    --output <path>      output file path
   layer <command>      manage filesystem layers
     create [flags] <base-root>
     list [--json]

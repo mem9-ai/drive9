@@ -148,6 +148,12 @@ func (c *Client) DownloadDirCtx(ctx context.Context, remoteDir, localDir string)
 // under root. `rel` is the slash-separated path relative to root; root
 // itself is not visited. The drive9 server has no recursive readdir
 // primitive, so the BFS is fully client-driven.
+//
+// If visit returns the sentinel errArchiveSkipDir (defined in archive.go),
+// the walker skips enqueuing that directory's children — this is how
+// archive pruning drops excluded subtrees (e.g. node_modules under
+// --profile coding-agent) without issuing ListCtx calls for them. Any
+// other non-nil error aborts the walk.
 func walkRemoteTreeBFS(ctx context.Context, c *Client, root string, visit func(rel string, info FileInfo) error) error {
 	queue := []string{""} // relative paths to expand; "" = root
 	for len(queue) > 0 {
@@ -168,6 +174,10 @@ func walkRemoteTreeBFS(ctx context.Context, c *Client, root string, visit func(r
 				childRel = rel + "/" + e.Name
 			}
 			if err := visit(childRel, e); err != nil {
+				if errors.Is(err, errArchiveSkipDir) {
+					// Visitor asked us not to descend into this directory.
+					continue
+				}
 				return err
 			}
 			if e.IsDir {

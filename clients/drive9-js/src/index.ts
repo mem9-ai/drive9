@@ -72,3 +72,4 @@ export type {
   WriteOptions,
 } from "./models.js";
 export type { ReadPartFn, ProgressFn } from "./patch.js";
+export type { ArchiveOptions } from "./archive.js";
