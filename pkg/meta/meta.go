@@ -1415,13 +1415,6 @@ func (s *Store) GetTenantTiDBCloudOrgBinding(ctx context.Context, tenantID strin
 	return &rec, nil
 }
 
-func (s *Store) DeleteTenantTiDBCloudOrgBinding(ctx context.Context, tenantID string) (err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "delete_tidbcloud_org_binding", start, &err)
-	_, err = s.db.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID)
-	return err
-}
-
 func (s *Store) CreateTenantPool(ctx context.Context, p *TenantPool) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "create_tidbcloud_pool", start, &err)
@@ -2464,6 +2457,52 @@ func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (s *Store) UpdateTenantClusterReference(ctx context.Context, id string, cluster *Tenant) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_cluster_reference", start, &err)
+	if cluster == nil {
+		return fmt.Errorf("tenant cluster reference is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants
+		SET db_host = ?, db_port = ?, db_user = ?, db_name = ?, db_tls = ?,
+			provider = ?, cluster_id = ?, branch_id = ?, claim_url = ?, claim_expires_at = ?, updated_at = ?
+		WHERE id = ?`,
+		cluster.DBHost, cluster.DBPort, cluster.DBUser, cluster.DBName, boolToInt(cluster.DBTLS),
+		cluster.Provider, nullStr(cluster.ClusterID), cluster.BranchID, nullStr(cluster.ClaimURL), cluster.ClaimExpiresAt,
+		time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) ClearTenantProvisionMetadata(ctx context.Context, tenantID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "clear_tenant_provision_metadata", start, &err)
+	now := time.Now().UTC()
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE tenants
+			SET db_host = '', db_port = 0, db_user = '', db_password = ?, db_name = '', db_tls = 1,
+				cluster_id = NULL, branch_id = '', claim_url = NULL, claim_expires_at = NULL, updated_at = ?
+			WHERE id = ?`,
+			[]byte{}, now, tenantID)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(res); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, dbUser string, dbPasswordCipher []byte) (updated bool, err error) {

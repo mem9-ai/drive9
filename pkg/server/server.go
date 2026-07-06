@@ -4879,12 +4879,13 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 		defer cancel()
 		if err := s.deprovisionTenantCluster(workerCtx, t, req); err != nil {
 			logger.Error(workerCtx, "server_event", eventFields(workerCtx, "provision_cluster_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
+			if uerr := s.meta.UpdateTenantClusterReference(workerCtx, tenantID, t); uerr != nil {
+				logger.Error(workerCtx, "server_event", eventFields(workerCtx, "provision_cluster_cleanup_reference_persist_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", uerr)...)
+			}
 			return
 		}
-		if provider == tenant.ProviderTiDBCloudNative {
-			if err := s.meta.DeleteTenantTiDBCloudOrgBinding(workerCtx, tenantID); err != nil {
-				logger.Error(workerCtx, "server_event", eventFields(workerCtx, "provision_tidbcloud_org_binding_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
-			}
+		if err := s.meta.ClearTenantProvisionMetadata(workerCtx, tenantID); err != nil {
+			logger.Error(workerCtx, "server_event", eventFields(workerCtx, "provision_metadata_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
 		}
 	})
 }
