@@ -53,6 +53,24 @@ type fakeProvisioner struct {
 	defaultPrivateKey      string
 }
 
+type failingEncryptor struct {
+	err error
+}
+
+func (e failingEncryptor) Encrypt(context.Context, []byte) ([]byte, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	return nil, fmt.Errorf("encrypt failed")
+}
+
+func (e failingEncryptor) Decrypt(context.Context, []byte) ([]byte, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	return nil, fmt.Errorf("decrypt failed")
+}
+
 func (f *fakeProvisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, bool) {
 	if f.defaultPublicKey == "" || f.defaultPrivateKey == "" {
 		return tenant.CredentialProvisionRequest{}, false
@@ -1017,6 +1035,147 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenOrgBindingMissing(t *testing.T
 	}
 }
 
+func TestProvisionTiDBCloudNativeCleansClusterWhenProvisionReturnsClusterAndError(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{
+		provider:      tenant.ProviderTiDBCloudNative,
+		cloudProvider: "aws",
+		region:        "us-east-1",
+		provisionErr:  fmt.Errorf("wait metadata failed"),
+		cluster: &tenant.ClusterInfo{
+			ClusterID: "native-cluster-provision-error",
+			Password:  "db-pass",
+			DBName:    "customer_db",
+		},
+	}
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{
+		KeyName:               "default",
+		TokenVersion:          1,
+		CredentialProvisioner: &cred,
+	})
+	if err == nil {
+		t.Fatal("provisionTenant error = nil, want provision error")
+	}
+	if got := prov.deprovisionCalls.Load(); got != 1 {
+		t.Fatalf("deprovision calls = %d, want 1", got)
+	}
+	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "native-cluster-provision-error" {
+		t.Fatalf("deprovision cluster = %#v", prov.lastDeprovision)
+	}
+	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" {
+		t.Fatalf("cleanup credentials = %+v", prov.lastCredentialReq)
+	}
+
+	var status string
+	if err := metaStore.DB().QueryRow("SELECT status FROM tenants").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantFailed) {
+		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
+	}
+}
+
+func TestProvisionTiDBCloudNativeCleansClusterWhenPasswordEncryptFails(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, failingEncryptor{err: fmt.Errorf("kms unavailable")})
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{
+		provider:      tenant.ProviderTiDBCloudNative,
+		cloudProvider: "aws",
+		region:        "us-east-1",
+		cluster: &tenant.ClusterInfo{
+			ClusterID:      "native-cluster-encrypt-error",
+			OrganizationID: "org-1",
+			Host:           "db.example",
+			Port:           4000,
+			Username:       "u1.root",
+			Password:       "db-pass",
+			DBName:         "customer_db",
+		},
+	}
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{
+		KeyName:               "default",
+		TokenVersion:          1,
+		CredentialProvisioner: &cred,
+	})
+	if err == nil {
+		t.Fatal("provisionTenant error = nil, want encrypt error")
+	}
+	var provisionErr *provisionTenantError
+	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusInternalServerError {
+		t.Fatalf("provision error = %#v, want 500 provisionTenantError", err)
+	}
+	if got := prov.deprovisionCalls.Load(); got != 1 {
+		t.Fatalf("deprovision calls = %d, want 1", got)
+	}
+	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "native-cluster-encrypt-error" {
+		t.Fatalf("deprovision cluster = %#v", prov.lastDeprovision)
+	}
+	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" {
+		t.Fatalf("cleanup credentials = %+v", prov.lastCredentialReq)
+	}
+
+	var status string
+	if err := metaStore.DB().QueryRow("SELECT status FROM tenants").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantFailed) {
+		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
+	}
+}
+
 func TestProvisionTiDBCloudNativeRequiresRequestCredentials(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -1567,7 +1726,7 @@ func TestProvisionPersistsTenantBeforeProvisionFailure(t *testing.T) {
 	}
 }
 
-func TestProvisionPersistsPartialClusterBeforeMarkingFailed(t *testing.T) {
+func TestProvisionCleansPartialClusterBeforeMarkingFailed(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -1627,30 +1786,27 @@ func TestProvisionPersistsPartialClusterBeforeMarkingFailed(t *testing.T) {
 		t.Fatalf("status=%d, want %d", resp.StatusCode, http.StatusBadGateway)
 	}
 
-	var status, provider, clusterID, host, user, dbName string
-	var port int
-	var passCipher []byte
+	var status, clusterID string
 	if err := metaStore.DB().QueryRow(`
-		SELECT status, provider, cluster_id, db_host, db_port, db_user, db_password, db_name
+		SELECT status, COALESCE(cluster_id, '')
 		FROM tenants LIMIT 1`,
-	).Scan(&status, &provider, &clusterID, &host, &port, &user, &passCipher, &dbName); err != nil {
+	).Scan(&status, &clusterID); err != nil {
 		t.Fatalf("QueryRow tenant: %v", err)
 	}
 	if status != string(meta.TenantFailed) {
 		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
 	}
-	if provider != tenant.ProviderTiDBCloudNative || clusterID != "cluster-after-takeover" {
-		t.Fatalf("tenant provider/cluster = %s/%s, want %s/cluster-after-takeover", provider, clusterID, tenant.ProviderTiDBCloudNative)
+	if clusterID != "" {
+		t.Fatalf("tenant cluster_id = %s, want empty after cleanup", clusterID)
 	}
-	if host != "db.example" || port != 4000 || user != "u1.root" || dbName != "test" {
-		t.Fatalf("tenant connection = %s:%d %s/%s, want db.example:4000 u1.root/test", host, port, user, dbName)
+	if got := prov.deprovisionCalls.Load(); got != 1 {
+		t.Fatalf("deprovision calls = %d, want 1", got)
 	}
-	plain, err := pool.Decrypt(context.Background(), passCipher)
-	if err != nil {
-		t.Fatalf("decrypt persisted password: %v", err)
+	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "cluster-after-takeover" {
+		t.Fatalf("deprovision cluster = %#v", prov.lastDeprovision)
 	}
-	if string(plain) != "secret" {
-		t.Fatalf("persisted password = %q, want secret", plain)
+	if prov.lastCredentialReq.PublicKey != "default-public" || prov.lastCredentialReq.PrivateKey != "default-private" {
+		t.Fatalf("cleanup credentials = %+v", prov.lastCredentialReq)
 	}
 }
 
