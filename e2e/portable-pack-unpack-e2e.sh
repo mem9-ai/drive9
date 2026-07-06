@@ -3,6 +3,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/provision-helper.sh"
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
@@ -223,7 +225,7 @@ fi
 echo "[1] provision tenant"
 if [ -z "$DRIVE9_API_KEY" ]; then
   pfile="$(mktemp)"
-  pcode=$(curl -sS -o "$pfile" -w "%{http_code}" -X POST "$BASE/v1/provision")
+  pcode=$(drive9_provision_to_file "$BASE" "$pfile")
   check_eq "POST /v1/provision returns 202" "$pcode" "202"
   API_KEY=$(jq -r '.api_key // empty' "$pfile")
   rm -f "$pfile"

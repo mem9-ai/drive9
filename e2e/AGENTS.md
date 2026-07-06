@@ -40,6 +40,13 @@ export DRIVE9_BASE="https://api.drive9.ai"
 
 Use the dev value unless the environment owner announces a new endpoint.
 
+For `tidb_cloud_native` endpoints that do not provide server-side default TiDB
+Cloud credentials, set `DRIVE9_TIDBCLOUD_PUBLIC_KEY` and
+`DRIVE9_TIDBCLOUD_PRIVATE_KEY`. The common e2e provisioning helper sends them in
+`/v1/provision` for the standard smoke scripts while preserving empty-body
+provisioning when they are unset. Set `DRIVE9_TIDBCLOUD_SPENDING_LIMIT` only
+when the run must override the create-time TiDB Cloud spending limit.
+
 #### Run smoke scripts
 
 ```bash

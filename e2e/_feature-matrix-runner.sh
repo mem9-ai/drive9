@@ -43,6 +43,7 @@ PJDFSTEST_ALLOW_NONROOT="${PJDFSTEST_ALLOW_NONROOT:-0}"
 PJDFSTEST_MOUNT_ALLOW_OTHER="${PJDFSTEST_MOUNT_ALLOW_OTHER:-auto}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/provision-helper.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 FEATURE_MATRIX_REPORT_DIR="${FEATURE_MATRIX_REPORT_DIR:-$REPO_ROOT/e2e/reports}"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -1284,7 +1285,7 @@ main() {
     record "PASS" "Provisioning" "use provided DRIVE9_API_KEY" "provided"
   else
     local resp code body
-    resp=$(curl_body_code POST "$BASE/v1/provision")
+    resp=$(drive9_provision_curl_body_code "$BASE")
     code=$(http_code "$resp")
     body=$(json_body "$resp")
     if [ "$code" = "202" ]; then

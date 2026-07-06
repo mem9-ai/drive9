@@ -3,6 +3,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/provision-helper.sh"
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
@@ -264,7 +266,7 @@ stop_mount() {
 provision_key() {
   local resp code body status deadline
 
-  resp=$(curl_body_code POST "$BASE/v1/provision")
+  resp=$(drive9_provision_curl_body_code "$BASE")
   code=$(http_code "$resp")
   body=$(json_body "$resp")
   check_eq "POST /v1/provision returns 202" "$code" "202"

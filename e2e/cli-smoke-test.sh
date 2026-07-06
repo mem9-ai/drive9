@@ -4,6 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/provision-helper.sh"
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 DRIVE9_IMAGE_FIXTURE_PATH="${DRIVE9_IMAGE_FIXTURE_PATH:-$SCRIPT_DIR/fixtures/cat03.jpg}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
@@ -131,9 +132,11 @@ check_cmd "local image fixture exists" test -s "$DRIVE9_IMAGE_FIXTURE_PATH"
 
 echo "[1] provision tenant"
 pfile="$(mktemp)"
-pcode=$(curl -sS -o "$pfile" -w "%{http_code}" -X POST "$BASE/v1/provision")
+pcode=$(drive9_provision_to_file "$BASE" "$pfile")
 check_eq "POST /v1/provision returns 202" "$pcode" "202"
 API_KEY=$(jq -r '.api_key // empty' "$pfile")
+PROVISION_CLOUD_PROVIDER=$(jq -r '.cloud_provider // empty' "$pfile")
+PROVISION_REGION=$(jq -r '.region // empty' "$pfile")
 check_cmd "provision returns api_key" test -n "$API_KEY"
 
 echo "[2] wait tenant active"
@@ -164,7 +167,24 @@ drive9() {
 }
 
 drive9_ctx() {
-  env -u DRIVE9_SERVER -u DRIVE9_API_KEY -u DRIVE9_VAULT_TOKEN HOME="$CLI_CTX_HOME" "$CLI_BIN" "$@"
+  env -u DRIVE9_SERVER -u DRIVE9_API_KEY -u DRIVE9_VAULT_TOKEN \
+    DRIVE9_PUBLIC_KEY="${DRIVE9_TIDBCLOUD_PUBLIC_KEY:-${DRIVE9_PUBLIC_KEY:-}}" \
+    DRIVE9_PRIVATE_KEY="${DRIVE9_TIDBCLOUD_PRIVATE_KEY:-${DRIVE9_PRIVATE_KEY:-}}" \
+    HOME="$CLI_CTX_HOME" "$CLI_BIN" "$@"
+}
+
+drive9_ctx_add_owner() {
+  local args=(ctx add --name owner --server "$BASE" --api-key "$API_KEY")
+  if [ -n "$PROVISION_CLOUD_PROVIDER$PROVISION_REGION${DRIVE9_TIDBCLOUD_PUBLIC_KEY:-}${DRIVE9_TIDBCLOUD_PRIVATE_KEY:-}" ]; then
+    args+=(--mode TiDBCloud)
+    if [ -n "$PROVISION_CLOUD_PROVIDER" ]; then
+      args+=(--cloud-provider "$PROVISION_CLOUD_PROVIDER")
+    fi
+    if [ -n "$PROVISION_REGION" ]; then
+      args+=(--region "$PROVISION_REGION")
+    fi
+  fi
+  drive9_ctx "${args[@]}"
 }
 
 drive9_retry() {
@@ -366,7 +386,7 @@ ARCHIVE_EXTRACT_DIR="/tmp/drive9-cli-archive-extract-${TS}"
 
 echo "[3.1] ctx fork smoke"
 if fork_checks_enabled; then
-  drive9_ctx ctx add --name owner --server "$BASE" --api-key "$API_KEY" >/dev/null
+  drive9_ctx_add_owner >/dev/null
   fork_json="$(drive9_ctx ctx fork "$FORK_CTX_NAME" --from owner --json)"
   fork_api_key="$(jq -r '.api_key // empty' <<<"$fork_json")"
   fork_tenant_id="$(jq -r '.tenant_id // empty' <<<"$fork_json")"
@@ -399,17 +419,14 @@ if fork_checks_enabled; then
   fork_cat="$(drive9_ctx_retry fs cat "$FORK_REMOTE")"
   check_eq "fork context can read written file" "$fork_cat" "fork-smoke-${TS}"
 
-  fork_delete_body="$(mktemp)"
-  fork_delete_code=$(curl -sS -o "$fork_delete_body" -w "%{http_code}" -X DELETE -H "Authorization: Bearer $fork_api_key" "$BASE/v1/fork")
-  check_eq "DELETE /v1/fork returns 202" "$fork_delete_code" "202"
-  rm -f "$fork_delete_body"
+  check_cmd "drive9 delete fork returns accepted" drive9_ctx_retry delete -y
 else
   skip_check "ctx fork returns api_key"
   skip_check "ctx fork returns tenant_id"
   skip_check "ctx fork initial status is provisioning"
   skip_check "fork tenant becomes active"
   skip_check "fork context can read written file"
-  skip_check "DELETE /v1/fork returns 202"
+  skip_check "drive9 delete fork returns accepted"
 fi
 
 echo "[4] small file ops via cli"
