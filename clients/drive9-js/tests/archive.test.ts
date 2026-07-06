@@ -182,4 +182,50 @@ describe("archive", () => {
     expect(names).toContain("a.go");
     expect(names).toContain("b.go");
   });
+
+  it("zip format via archiveToFile", async () => {
+    mountTree("/proj", [
+      { path: "/proj/a.txt", body: "AAA" },
+      { path: "/proj/b/c.txt", body: "CCC" },
+    ]);
+    const client = new Client("http://localhost:9009", "test-key");
+    const out = `/tmp/drive9-ts-zip-${Date.now()}.zip`;
+    await client.archiveToFile("/proj", out, { format: "zip" });
+    const fs = await import("node:fs");
+    const data = fs.readFileSync(out);
+    // Validate the zip is well-formed and has the expected entries.
+    const { execSync } = await import("node:child_process");
+    const list = execSync(`python3 -c 'import zipfile,sys; print("\\n".join(sorted(zipfile.ZipFile(sys.argv[1]).namelist())))' ${out}`, { encoding: "utf8" });
+    expect(list).toContain("proj/a.txt");
+    expect(list).toContain("proj/b/c.txt");
+    // testzip returns None when valid.
+    const valid = execSync(`python3 -c 'import zipfile,sys; print("valid" if zipfile.ZipFile(sys.argv[1]).testzip() is None else "corrupt")' ${out}`, { encoding: "utf8" }).trim();
+    expect(valid).toBe("valid");
+    fs.unlinkSync(out);
+  });
+
+  it("flat mode rejects duplicate basenames", async () => {
+    mountTree("/proj", [
+      { path: "/proj/src/config.json", body: "{}\n" },
+      { path: "/proj/test/config.json", body: "{}\n" },
+    ]);
+    const client = new Client("http://localhost:9009", "test-key");
+    await expect(client.archive("/proj", { flat: true })).rejects.toThrow(/collision/);
+  });
+
+  it("include nested file does not prune parent directory", async () => {
+    // Reproduces B2: --include "src/app.go" must walk into src/ even though
+    // "src" itself does not match the include pattern, otherwise the leaf is
+    // never visited and the archive is empty.
+    mountTree("/proj", [
+      { path: "/proj/src/app.go", body: "package main\n" },
+      { path: "/proj/src/util/util.go", body: "package util\n" },
+      { path: "/proj/other/notes.txt", body: "notes\n" },
+    ]);
+    const client = new Client("http://localhost:9009", "test-key");
+    const stream = await client.archive("/proj", { include: ["src/app.go"] });
+    const names = readTarGz(await streamToBuffer(stream));
+    expect(names).toContain("proj/src/app.go");
+    expect(names.some((n) => n.endsWith("notes.txt"))).toBe(false);
+  });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compile, compileAll, match, newMatcher, validate, matchPattern } from "../src/pathfilter.js";
+import { compile, compileAll, match, matchExcluded, newMatcher, validate, matchPattern } from "../src/pathfilter.js";
 
 describe("pathfilter compile", () => {
   it("compiles subpath form **/x/**", () => {
@@ -73,5 +73,45 @@ describe("pathfilter validate", () => {
 describe("pathfilter compileAll", () => {
   it("skips blank entries", () => {
     expect(compileAll(["", "  ", "dist/**"]).length).toBe(1);
+  });
+});
+
+describe("pathfilter matchExcluded", () => {
+  it("returns true only for exclude-matched paths not restored by override", () => {
+    const m = newMatcher({
+      include: ["src/app.go"],
+      exclude: ["**/node_modules/**", "**/.git/**"],
+      override: ["proj/node_modules/.package-lock.json"],
+    });
+    expect(matchExcluded(m, "proj/node_modules/react")).toBe(true);
+    expect(matchExcluded(m, "proj/.git")).toBe(true);
+    // Override restores — not excluded.
+    expect(matchExcluded(m, "proj/node_modules/.package-lock.json")).toBe(false);
+    // A directory that only fails the include whitelist is NOT excluded —
+    // pruning it would drop its child src/app.go (the B2 bug).
+    expect(matchExcluded(m, "src")).toBe(false);
+    expect(matchExcluded(m, "src/util.go")).toBe(false);
+  });
+});
+
+describe("pathfilter glob ? and [abc]", () => {
+  it("supports ? as single non-separator char", () => {
+    const p = compile("a?.go");
+    expect(matchPattern(p, "ab.go")).toBe(true);
+    expect(matchPattern(p, "abc.go")).toBe(false); // ? is single char
+    expect(matchPattern(p, "a/.go")).toBe(false); // ? does not cross separators
+  });
+
+  it("supports character classes", () => {
+    const p = compile("*.[Tt]xt");
+    expect(matchPattern(p, "a.txt")).toBe(true);
+    expect(matchPattern(p, "a.Txt")).toBe(true);
+    expect(matchPattern(p, "a.go")).toBe(false);
+  });
+
+  it("supports negated character classes", () => {
+    const p = compile("*.[^Tt]xt");
+    expect(matchPattern(p, "a.txt")).toBe(false);
+    expect(matchPattern(p, "a.bxt")).toBe(true);
   });
 });

@@ -61,16 +61,69 @@ function containsSubpath(segments: string[], subpath: string[]): boolean {
   return false;
 }
 
-/** Minimal glob matcher supporting * (single-segment wildcard). */
+/**
+ * globMatch mirrors Go's path.Match glob semantics:
+ *   *        matches any sequence of non-separator chars
+ *   ?        matches any single non-separator char
+ *   [abc]    matches one char from the class (with ranges and negation via [^...])
+ *   /        is the separator (never matched by a wildcard)
+ * Other regex specials are escaped.
+ */
 function globMatch(pattern: string, value: string): boolean {
   if (pattern === value) return true;
-  // Convert glob to regex: * → [^/]*, escape regex specials.
   let re = "^";
-  for (let i = 0; i < pattern.length; i++) {
+  let i = 0;
+  while (i < pattern.length) {
     const c = pattern[i];
-    if (c === "*") re += "[^/]*";
-    else if ("\\^$.+?()[]{}|".includes(c)) re += "\\" + c;
-    else re += c;
+    switch (c) {
+      case "*":
+        re += "[^/]*";
+        i++;
+        break;
+      case "?":
+        re += "[^/]";
+        i++;
+        break;
+      case "[": {
+        // Character class: copy it through to the regex, translating the
+        // leading negation (^) and the class body verbatim, but ensure '/' is
+        // excluded from the match so it stays a separator.
+        let cls = "[";
+        i++;
+        if (i < pattern.length && pattern[i] === "^") {
+          cls += "^";
+          i++;
+        }
+        // A leading ] is a literal ] in the class.
+        if (i < pattern.length && pattern[i] === "]") {
+          cls += "]";
+          i++;
+        }
+        let closed = false;
+        while (i < pattern.length) {
+          const ch = pattern[i];
+          if (ch === "]") {
+            cls += "]";
+            i++;
+            closed = true;
+            break;
+          }
+          cls += ch;
+          i++;
+        }
+        if (!closed) {
+          // Unterminated class — treat '[' literally.
+          re += "\\[";
+        } else {
+          re += cls;
+        }
+        break;
+      }
+      default:
+        if ("\\^$.+(){}|".includes(c)) re += "\\" + c;
+        else re += c;
+        i++;
+    }
   }
   re += "$";
   return new RegExp(re).test(value);
@@ -181,4 +234,19 @@ export function hasInclude(m: Matcher): boolean {
 
 export function hasExclude(m: Matcher): boolean {
   return m.exclude.length > 0;
+}
+
+/**
+ * matchExcluded reports whether a path is dropped by an exclude pattern that
+ * no override restores. This is the "should this directory's subtree be
+ * pruned" predicate: a directory pruned by matchExcluded means every
+ * descendant is guaranteed to be dropped too (exclude is subtree-inheritable
+ * unless override restores it). A directory that matchExcluded returns false
+ * for may still fail the include whitelist at match() — but its children
+ * must be walked because include matches leaf files, not necessarily their
+ * parent directories.
+ */
+export function matchExcluded(m: Matcher, path: string): boolean {
+  if (m.override.length > 0 && matchesAny(m.override, path)) return false;
+  return matchesAny(m.exclude, path);
 }

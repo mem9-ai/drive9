@@ -183,6 +183,21 @@ func (m Matcher) HasInclude() bool { return len(m.Include) > 0 }
 // HasExclude reports whether the matcher has any exclude patterns.
 func (m Matcher) HasExclude() bool { return len(m.Exclude) > 0 }
 
+// MatchExcluded reports whether a path is dropped by an exclude pattern that
+// no override restores. This is the "should this directory's subtree be
+// pruned" predicate: a directory pruned by MatchExcluded means every
+// descendant is guaranteed to be dropped too (exclude is subtree-inheritable
+// unless override restores it). A directory that MatchExcluded returns false
+// for may still fail the include whitelist at Match() — but its children
+// must be walked because include matches leaf files, not necessarily their
+// parent directories.
+func (m Matcher) MatchExcluded(path string) bool {
+	if len(m.Override) > 0 && matchesAny(m.Override, path) {
+		return false
+	}
+	return matchesAny(m.Exclude, path)
+}
+
 func matchesAny(patterns []Pattern, path string) bool {
 	for _, p := range patterns {
 		if p.Match(path) {

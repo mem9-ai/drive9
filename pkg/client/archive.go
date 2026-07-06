@@ -263,14 +263,36 @@ func (c *Client) collectArchiveTree(ctx context.Context, root, archiveRoot strin
 		if rel == "" {
 			return nil
 		}
-		if !matcher.Match(rel) {
-			// Drop the entry. If it is a directory, tell the walker not to
-			// enqueue its children — this prunes the whole excluded subtree
-			// (e.g. node_modules) at BFS time, so we never issue ListCtx
-			// calls for directories that would only be filtered out.
-			if info.IsDir {
+		// Directory pruning is driven by MatchExcluded, NOT Match: an include
+		// whitelist that matches a leaf file (e.g. --include "src/main.go")
+		// does NOT match its parent directory "src". If we pruned "src" the
+		// leaf would never be visited and the archive would be empty. So we
+		// only prune a directory when an exclude pattern drops it (and no
+		// override restores it) — that guarantees every descendant is dropped
+		// too. Otherwise we keep walking and let Match() decide at the leaf.
+		if info.IsDir {
+			if matcher.MatchExcluded(rel) {
 				return errArchiveSkipDir
 			}
+			// Keep the directory entry only if Match says so (include
+			// whitelists may drop intermediate dirs from the archive while
+			// still letting us walk through them to reach leaves). The
+			// archive root is always emitted (added above).
+			if matcher.Match(rel) {
+				entry := archiveEntry{
+					rel:    rel,
+					remote: joinArchiveRemote(root, rel),
+					root:   archiveRoot,
+				}
+				if info.HasMode {
+					entry.mode = info.Mode
+				}
+				dirs = append(dirs, entry)
+			}
+			return nil
+		}
+		// Leaf: apply the full matcher (include + exclude + override).
+		if !matcher.Match(rel) {
 			return nil
 		}
 		entry := archiveEntry{
@@ -280,10 +302,6 @@ func (c *Client) collectArchiveTree(ctx context.Context, root, archiveRoot strin
 		}
 		if info.HasMode {
 			entry.mode = info.Mode
-		}
-		if info.IsDir {
-			dirs = append(dirs, entry)
-			return nil
 		}
 		if flat {
 			base := archiveName(archiveRoot, rel, flat)
@@ -380,8 +398,9 @@ launch:
 		}(item)
 	}
 	wg.Wait()
-	if len(failures) > 0 {
-		return failures[0]
+	if n := len(failures); n > 0 {
+		// Surface the count so subsequent errors are not silently dropped.
+		return fmt.Errorf("%w (and %d more error(s))", failures[0], n-1)
 	}
 	return nil
 }

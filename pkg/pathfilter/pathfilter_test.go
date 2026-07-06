@@ -170,3 +170,74 @@ func TestCompileAllSkipsBlankAndInvalid(t *testing.T) {
 		t.Fatalf("CompileAll kept wrong pattern: %q", got[0].Raw())
 	}
 }
+
+func TestMatchExcluded(t *testing.T) {
+	m := NewMatcher(
+		[]string{"src/app.go"}, // include whitelist (only this leaf)
+		[]string{"**/node_modules/**", "**/.git/**"},
+		[]string{"proj/node_modules/.package-lock.json"}, // override
+	)
+	// Excluded subtrees.
+	if !m.MatchExcluded("proj/node_modules/react") {
+		t.Fatal("node_modules/react should be MatchExcluded (prune subtree)")
+	}
+	if !m.MatchExcluded("proj/.git") {
+		t.Fatal(".git should be MatchExcluded")
+	}
+	// Override restores — NOT excluded.
+	if m.MatchExcluded("proj/node_modules/.package-lock.json") {
+		t.Fatal("override should make package-lock.json not MatchExcluded")
+	}
+	// A directory that only fails the include whitelist is NOT MatchExcluded —
+	// pruning it would drop its children (the B2 bug).
+	if m.MatchExcluded("src") {
+		t.Fatal("src (only failing include) must NOT be MatchExcluded — its child src/app.go is included")
+	}
+	// Leaf that fails include is not "excluded" in the prune sense either.
+	if m.MatchExcluded("src/util.go") {
+		t.Fatal("src/util.go is dropped by include, not by exclude — not MatchExcluded")
+	}
+}
+
+func TestGlobQuestionAndCharClass(t *testing.T) {
+	// Character class form: use direct pattern matching (compile + Match)
+	// so the matcher's include/exclude semantics don't interfere.
+	p, err := Compile("*.[Tt]xt")
+	if err != nil {
+		t.Fatalf("Compile *.[Tt]xt: %v", err)
+	}
+	if !p.Match("a.txt") {
+		t.Fatal("*.[Tt]xt should match a.txt")
+	}
+	if !p.Match("a.Txt") {
+		t.Fatal("*.[Tt]xt should match a.Txt")
+	}
+	if p.Match("a.go") {
+		t.Fatal("*.[Tt]xt should not match a.go")
+	}
+	// ? matches a single non-separator char.
+	pq, err := Compile("a?.go")
+	if err != nil {
+		t.Fatalf("Compile a?.go: %v", err)
+	}
+	if !pq.Match("ab.go") {
+		t.Fatal("a?.go should match ab.go")
+	}
+	if pq.Match("abc.go") {
+		t.Fatal("a?.go should not match abc.go (? is single char)")
+	}
+	if pq.Match("a/.go") {
+		t.Fatal("a?.go should not match a/.go (? does not cross separators)")
+	}
+	// Negated class.
+	pn, err := Compile("*.[^Tt]xt")
+	if err != nil {
+		t.Fatalf("Compile *.[^Tt]xt: %v", err)
+	}
+	if pn.Match("a.txt") {
+		t.Fatal("*.[^Tt]xt should not match a.txt")
+	}
+	if !pn.Match("a.bxt") {
+		t.Fatal("*.[^Tt]xt should match a.bxt")
+	}
+}

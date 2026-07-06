@@ -228,6 +228,54 @@ func TestArchiveDirIncludeWhitelist(t *testing.T) {
 	}
 }
 
+// TestArchiveDirIncludeNestedFileNotPrunedByParentDir reproduces the B2 bug:
+// --include "src/app.go" must NOT prune the "src" directory (which itself does
+// not match the include pattern), otherwise the leaf is never visited and
+// the archive is empty. Pruning must be driven by MatchExcluded, not Match.
+func TestArchiveDirIncludeNestedFileNotPrunedByParentDir(t *testing.T) {
+	mock := newArchiveMockServer(map[string]string{
+		"/proj/src/app.go":          "package main\n",
+		"/proj/src/util/util.go":    "package util\n",
+		"/proj/other/notes.txt":     "notes\n",
+		"/proj/README.md":           "# readme\n",
+	})
+	srv := mock.server(t)
+	defer srv.Close()
+	c := New(srv.URL, "")
+	c.smallFileThreshold = DefaultSmallFileThreshold
+
+	var buf bytes.Buffer
+	if err := c.ArchiveDir(context.Background(), "/proj", &buf, ArchiveOptions{
+		Include: []string{"src/app.go"},
+	}); err != nil {
+		t.Fatalf("ArchiveDir: %v", err)
+	}
+	gz, _ := gzip.NewReader(bytes.NewReader(buf.Bytes()))
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	var names []string
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar next: %v", err)
+		}
+		names = append(names, hdr.Name)
+	}
+	if !containsStr(names, "proj/src/app.go") {
+		t.Fatalf("include src/app.go missing (parent dir was pruned): %v", names)
+	}
+	// The other leaf must be dropped by the include whitelist.
+	if containsStr(names, "proj/other/notes.txt") {
+		t.Fatalf("notes.txt should be dropped by include whitelist: %v", names)
+	}
+	if containsStr(names, "proj/README.md") {
+		t.Fatalf("README.md should be dropped by include whitelist: %v", names)
+	}
+}
+
 func TestArchiveDirZipFormat(t *testing.T) {
 	mock := newArchiveMockServer(map[string]string{
 		"/proj/a.txt":   "AAA",

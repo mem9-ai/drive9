@@ -82,7 +82,7 @@ func Archive(c *client.Client, args []string) error {
 		output      = fs.String("output", "", "output file path (or '-' for stdout)")
 	)
 	fs.Var(&excludes, "exclude", "skip paths matching pattern (repeatable); patterns use **/x/**, prefix/**, or exact/glob forms")
-	fs.Var(&includes, "include", "include only paths matching pattern (repeatable); excludes take precedence")
+	fs.Var(&includes, "include", "include only paths matching pattern (repeatable); override > exclude > include")
 
 	positionals, flagArgs := splitArchiveArgs(args)
 	if err := fs.Parse(flagArgs); err != nil {

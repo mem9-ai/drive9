@@ -11,7 +11,7 @@
 
 import { Client } from "./client.js";
 import type { FileInfo } from "./models.js";
-import { match, newMatcher, hasInclude, type Matcher, type MatcherOptions } from "./pathfilter.js";
+import { match, matchExcluded, newMatcher, hasInclude, type Matcher, type MatcherOptions } from "./pathfilter.js";
 
 const DEFAULT_JOBS = 16;
 
@@ -426,17 +426,24 @@ async function collectArchiveTree(
   const flatSeen = new Map<string, string>(); // basename -> first rel that claimed it
   await walkRemoteTreeBFS(client, root, signal, (rel, info) => {
     if (rel === "") return true;
-    if (!match(matcher, rel)) {
-      // Tell the walker not to descend into an excluded directory, pruning
-      // the whole subtree (e.g. node_modules) at BFS time so we never issue
-      // list() calls for directories that would only be filtered out.
-      return info.isDir ? false : true;
-    }
-    const remote = joinRemote(root, rel);
+    // Directory pruning is driven by matchExcluded, NOT match: an include
+    // whitelist that matches a leaf file (e.g. --include "src/main.go")
+    // does NOT match its parent directory "src". If we pruned "src" the
+    // leaf would never be visited and the archive would be empty. So we
+    // only prune a directory when an exclude pattern drops it (and no
+    // override restores it) — that guarantees every descendant is dropped
+    // too. Otherwise we keep walking and let match() decide at the leaf.
     if (info.isDir) {
-      dirs.push({ rel, remote, root: archiveRoot, size: 0, isDir: true, mode: 0o755 });
-      return true;
+      if (matchExcluded(matcher, rel)) {
+        return false; // skip this directory's subtree
+      }
+      if (match(matcher, rel)) {
+        dirs.push({ rel, remote: joinRemote(root, rel), root: archiveRoot, size: 0, isDir: true, mode: 0o755 });
+      }
+      return true; // keep walking to reach leaves
     }
+    // Leaf: apply the full matcher (include + exclude + override).
+    if (!match(matcher, rel)) return true; // not a dir, no prune signal needed
     if (flat) {
       const base = archiveName(archiveRoot, rel, flat);
       if (flatSeen.has(base)) {
@@ -444,7 +451,7 @@ async function collectArchiveTree(
       }
       flatSeen.set(base, rel);
     }
-    files.push({ rel, remote, root: archiveRoot, size: info.size, isDir: false });
+    files.push({ rel, remote: joinRemote(root, rel), root: archiveRoot, size: info.size, isDir: false });
     return true;
   });
   return { dirs, files };
