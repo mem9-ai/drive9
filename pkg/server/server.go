@@ -276,11 +276,12 @@ type TenantStatusResponse struct {
 }
 
 const (
-	maxBatchStatPaths                     = 256
-	maxBatchReadSmallPaths                = 128
-	maxBatchReadSmallBytes                = 50_000
-	defaultBatchReadMaxBody               = 1 << 20
-	maxCredentialProvisionBodyBytes int64 = 1 << 20
+	maxBatchStatPaths                           = 256
+	maxBatchReadSmallPaths                      = 128
+	maxBatchReadSmallBytes                      = 50_000
+	defaultBatchReadMaxBody                     = 1 << 20
+	maxCredentialProvisionBodyBytes       int64 = 1 << 20
+	provisionFailureClusterCleanupTimeout       = 2 * time.Minute
 )
 
 func New(b *backend.Dat9Backend) *Server {
@@ -4714,10 +4715,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
-		s.persistFailedProvisionClusterInfo(context.Background(), tenantID, provider, cluster)
-		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
-		}
+		s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "cluster_provision_error")
 		msg := fmt.Sprintf("provision tenant cluster failed: %v", err)
 		if strings.Contains(strings.ToLower(err.Error()), "free cluster") {
 			msg = "TiDB Cloud free cluster limit reached. Set a monthly Spending Limit to continue. See https://www.pingcap.com/tidb-cloud-starter-pricing-details/#cost-and-limitations"
@@ -4763,19 +4761,11 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
-		}
+		s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "password_encrypt_error")
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to encrypt db password", err)
 	}
 	logProvisionStage(ctx, "provision_db_password_encrypted", tenantID, provider, stageStarted)
-	dbtls := true
-	if provider == tenant.ProviderTiDBCloudNative {
-		v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
-		if v == "1" || v == "true" || v == "yes" {
-			dbtls = false
-		}
-	}
+	dbtls := dbTLSForProvisionedTenant(provider)
 	stageStarted = time.Now()
 	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
 		DBHost:           cluster.Host,
@@ -4791,9 +4781,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}); err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_update_tenant_connection_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
-		}
+		s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "connection_persist_error")
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant connection", err)
 	}
 	logProvisionStage(ctx, "provision_tenant_connection_persisted", tenantID, provider, stageStarted, "cluster_id", cluster.ClusterID, "db_tls", dbtls)
@@ -4801,9 +4789,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_update_tenant_status_failed", "tenant_id", tenantID, "provider", provider, "status", meta.TenantProvisioning, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
-		}
+		s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "status_update_error")
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to update tenant status", err)
 	}
 	logProvisionStage(ctx, "provision_tenant_status_updated", tenantID, provider, stageStarted, "status", meta.TenantProvisioning)
@@ -4832,7 +4818,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_api_key_failed", "tenant_id", tenantID, "api_key_id", apiKeyID, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
 		metricEvent(ctx, "metadb_query", "api", "insert_api_key", "result", "error")
-		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+		s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "api_key_persist_error")
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist api key", err)
 	}
 	logProvisionStage(ctx, "provision_api_key_issued", tenantID, provider, stageStarted, "api_key_id", apiKeyID)
@@ -4858,21 +4844,28 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 }
 
 func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Context, tenantID, provider string, cluster *tenant.ClusterInfo, cred *tenant.CredentialProvisionRequest, reason string) {
-	if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+	cleanupCtx := backgroundWithTrace(ctx)
+	if uerr := s.meta.UpdateTenantStatus(cleanupCtx, tenantID, meta.TenantFailed); uerr != nil {
+		logger.Error(cleanupCtx, "server_event", eventFields(cleanupCtx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
 	}
 	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
 		return
 	}
-	cleanupCtx := backgroundWithTrace(ctx)
 	t := &meta.Tenant{
-		ID:        tenantID,
-		Provider:  provider,
-		ClusterID: cluster.ClusterID,
-		DBHost:    cluster.Host,
-		DBPort:    cluster.Port,
-		DBUser:    cluster.Username,
-		DBName:    cluster.DBName,
+		ID:             tenantID,
+		Provider:       provider,
+		ClusterID:      cluster.ClusterID,
+		BranchID:       cluster.BranchID,
+		DBHost:         cluster.Host,
+		DBPort:         cluster.Port,
+		DBUser:         cluster.Username,
+		DBName:         cluster.DBName,
+		DBTLS:          dbTLSForProvisionedTenant(provider),
+		ClaimURL:       cluster.ClaimURL,
+		ClaimExpiresAt: cluster.ClaimExpiresAt,
+	}
+	if uerr := s.meta.UpdateTenantClusterReference(cleanupCtx, tenantID, t); uerr != nil {
+		logger.Error(cleanupCtx, "server_event", eventFields(cleanupCtx, "provision_cluster_cleanup_reference_persist_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", uerr)...)
 	}
 	var req tenant.CredentialProvisionRequest
 	if provider == tenant.ProviderTiDBCloudNative {
@@ -4882,9 +4875,28 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 		}
 		req = *cred
 	}
-	if err := s.deprovisionTenantCluster(cleanupCtx, t, req); err != nil {
-		logger.Error(cleanupCtx, "server_event", eventFields(cleanupCtx, "provision_cluster_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
+	s.startServerWorker(cleanupCtx, func(workerCtx context.Context) {
+		workerCtx, cancel := context.WithTimeout(workerCtx, provisionFailureClusterCleanupTimeout)
+		defer cancel()
+		if err := s.deprovisionTenantCluster(workerCtx, t, req); err != nil {
+			logger.Error(workerCtx, "server_event", eventFields(workerCtx, "provision_cluster_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
+			if uerr := s.meta.UpdateTenantClusterReference(workerCtx, tenantID, t); uerr != nil {
+				logger.Error(workerCtx, "server_event", eventFields(workerCtx, "provision_cluster_cleanup_reference_persist_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", uerr)...)
+			}
+			return
+		}
+		if err := s.meta.ClearTenantProvisionMetadata(workerCtx, tenantID); err != nil {
+			logger.Error(workerCtx, "server_event", eventFields(workerCtx, "provision_metadata_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
+		}
+	})
+}
+
+func dbTLSForProvisionedTenant(provider string) bool {
+	if provider != tenant.ProviderTiDBCloudNative {
+		return true
 	}
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
+	return v != "1" && v != "true" && v != "yes"
 }
 
 func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {
@@ -4896,34 +4908,6 @@ func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {
 		return "", ""
 	}
 	return strings.TrimSpace(regionProvider.ProvisioningCloudProvider()), strings.TrimSpace(regionProvider.ProvisioningRegion())
-}
-
-func (s *Server) persistFailedProvisionClusterInfo(ctx context.Context, tenantID, provider string, cluster *tenant.ClusterInfo) {
-	if cluster == nil || cluster.ClusterID == "" {
-		return
-	}
-	cluster.Provider = provider
-	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
-	if err != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "provision_failed_cluster_encrypt_password_failed", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
-		return
-	}
-	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
-		DBHost:           cluster.Host,
-		DBPort:           cluster.Port,
-		DBUser:           cluster.Username,
-		DBPasswordCipher: cipherPass,
-		DBName:           cluster.DBName,
-		DBTLS:            true,
-		Provider:         provider,
-		ClusterID:        cluster.ClusterID,
-		ClaimURL:         cluster.ClaimURL,
-		ClaimExpiresAt:   cluster.ClaimExpiresAt,
-	}); err != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "provision_failed_cluster_persist_connection_failed", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
-		return
-	}
-	logger.Info(ctx, "server_event", eventFields(ctx, "provision_failed_cluster_persisted", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID)...)
 }
 
 func (s *Server) startProvisionedTenantSchemaInit(ctx context.Context, res *provisionTenantResult) {
