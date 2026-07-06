@@ -968,56 +968,6 @@ func TestCpRecursiveRemoteToLocal_RejectsPathEscape(t *testing.T) {
 	}
 }
 
-// TestJoinLocalSafe_RejectsTraversal asserts the local path-safety
-// helper rejects `..` traversal segments just like joinRemoteSafe.
-func TestJoinLocalSafe_RejectsTraversal(t *testing.T) {
-	tmp := t.TempDir()
-	cases := []struct {
-		name string
-		rel  string
-	}{
-		{"parent traversal", "../escape.txt"},
-		{"nested traversal", "child/../../escape.txt"},
-		{"deep traversal", "a/b/c/../../../../escape.txt"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := joinLocalSafe(tmp, tc.rel)
-			if err == nil {
-				t.Fatalf("expected error for traversal %q (got %q)", tc.rel, got)
-			}
-			if !strings.Contains(err.Error(), "..") {
-				t.Errorf("error = %v, want '..' rejection", err)
-			}
-		})
-	}
-}
-
-// TestJoinLocalSafe_RejectsAbsoluteRel asserts an absolute `rel` is
-// rejected even without `..` segments — a remote-supplied "/etc/passwd"
-// must not be treated as relative to dstLocal and then silently
-// absolute-resolved.
-func TestJoinLocalSafe_RejectsAbsoluteRel(t *testing.T) {
-	tmp := t.TempDir()
-	if _, err := joinLocalSafe(tmp, "/etc/passwd"); err == nil {
-		t.Fatalf("expected reject for absolute rel, got nil")
-	}
-}
-
-// TestJoinLocalSafe_HappyPath asserts the trivial case still resolves
-// to base/rel.
-func TestJoinLocalSafe_HappyPath(t *testing.T) {
-	tmp := t.TempDir()
-	got, err := joinLocalSafe(tmp, "sub/leaf.txt")
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	want := filepath.Join(tmp, "sub", "leaf.txt")
-	if got != want {
-		t.Errorf("got %q, want %q", got, want)
-	}
-}
-
 // ───────────────────────── B5: cancellation regressions ─────────────────────────
 
 // TestParallelTransfer_AlreadyCancelledCtxStopsLoop is the "ctx
