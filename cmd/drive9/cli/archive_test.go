@@ -170,7 +170,7 @@ func TestArchiveStdoutProducesValidTarGz(t *testing.T) {
 	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 
 	// Capture stdout.
-oldStdout := os.Stdout
+	oldStdout := os.Stdout
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
@@ -220,7 +220,7 @@ oldStdout := os.Stdout
 func TestArchiveExcludeSkipsNodeModules(t *testing.T) {
 	mock := newMockTreeServer()
 	seedRemoteTree(mock, "/proj", map[string]string{
-		"/proj/src/app.go":           "package src\n",
+		"/proj/src/app.go":                  "package src\n",
 		"/proj/node_modules/react/index.js": "module.exports\n",
 		"/proj/node_modules/react/foo.js":   "foo\n",
 	})
@@ -248,11 +248,11 @@ func TestArchiveExcludeSkipsNodeModules(t *testing.T) {
 func TestArchiveProfileCodingAgentSkipsDefaults(t *testing.T) {
 	mock := newMockTreeServer()
 	seedRemoteTree(mock, "/proj", map[string]string{
-		"/proj/main.go":                  "package main\n",
-		"/proj/dist/bundle.js":           "bundle\n",
-		"/proj/node_modules/react/x.js":  "x\n",
-		"/proj/.git/HEAD":                "ref: refs/heads/main\n",
-		"/proj/.cache/foo":               "cached\n",
+		"/proj/main.go":                 "package main\n",
+		"/proj/dist/bundle.js":          "bundle\n",
+		"/proj/node_modules/react/x.js": "x\n",
+		"/proj/.git/HEAD":               "ref: refs/heads/main\n",
+		"/proj/.cache/foo":              "cached\n",
 	})
 	srv := mock.httpServer(t)
 	defer srv.Close()
@@ -280,7 +280,7 @@ func TestArchiveProfileCodingAgentSkipsDefaults(t *testing.T) {
 func TestArchiveZipFormat(t *testing.T) {
 	mock := newMockTreeServer()
 	seedRemoteTree(mock, "/proj", map[string]string{
-		"/proj/a.txt": "AAA",
+		"/proj/a.txt":   "AAA",
 		"/proj/b/c.txt": "CCC",
 	})
 	srv := mock.httpServer(t)
@@ -452,7 +452,7 @@ func TestArchiveEmptyDirPreserved(t *testing.T) {
 	mock := newMockTreeServer()
 	// Tree with an empty subdir.
 	mock.listEntries = map[string][]client.FileInfo{
-		"/proj":   {{Name: "src", IsDir: true, HasMode: true, Mode: 0o755}, {Name: "a.txt", Size: 3, IsDir: false, HasMode: true, Mode: 0o644}},
+		"/proj":     {{Name: "src", IsDir: true, HasMode: true, Mode: 0o755}, {Name: "a.txt", Size: 3, IsDir: false, HasMode: true, Mode: 0o644}},
 		"/proj/src": {}, // empty dir
 	}
 	mock.fileBodies = map[string][]byte{"/proj/a.txt": []byte("AAA")}

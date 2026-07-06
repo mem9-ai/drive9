@@ -158,10 +158,10 @@ func NewMatcher(includePatterns, excludePatterns, overridePatterns []string) Mat
 
 // Match reports whether a path should be included in the archive.
 //
-//	1. If Override contains a matching pattern → include (true).
-//	2. Else if Exclude contains a matching pattern → drop (false).
-//	3. Else if Include is non-empty and no include pattern matches → drop (false).
-//	4. Otherwise → include (true).
+//  1. If Override contains a matching pattern → include (true).
+//  2. Else if Exclude contains a matching pattern → drop (false).
+//  3. Else if Include is non-empty and no include pattern matches → drop (false).
+//  4. Otherwise → include (true).
 func (m Matcher) Match(path string) bool {
 	if len(m.Override) > 0 && matchesAny(m.Override, path) {
 		return true

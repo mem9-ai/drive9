@@ -71,7 +71,7 @@ function writeString(buf: Uint8Array, offset: number, text: string, maxLen: numb
   for (let i = 0; i < len; i++) buf[offset + i] = encoded[i];
 }
 
-function buildTarHeader(name: string, size: number, typeflag: "0" | "5", mode: number, mtime: number): Uint8Array {
+function buildTarHeader(name: string, size: number, typeflag: "0" | "5" | "x", mode: number, mtime: number): Uint8Array {
   const header = new Uint8Array(TAR_BLOCK);
   writeString(header, 0, name, 100);
   writeString(header, 100, encodeOctal(mode, 7) + "\0", 8);
@@ -90,6 +90,42 @@ function buildTarHeader(name: string, size: number, typeflag: "0" | "5", mode: n
   return header;
 }
 
+// paxRecord builds a single PAX extended-header record: "%d %s=%s\n" where
+// %d is the byte length of the entire record (length field, space, key,
+// '=', value, and trailing newline). Returns the UTF-8 encoded bytes.
+function paxRecord(key: string, value: string): Uint8Array {
+  const suffix = ` ${key}=${value}\n`;
+  // Solve L = digits(L) + suffix.length for L. The length field counts
+  // itself; iterate to a fixed point (converges in a couple of steps).
+  let len = suffix.length;
+  for (;;) {
+    const digits = String(len).length;
+    const total = digits + suffix.length;
+    if (total === len) break;
+    len = total;
+  }
+  return new TextEncoder().encode(`${len}${suffix}`);
+}
+
+// buildPAXLongNameEntry returns the (header, body) pair for a PAX 'x' entry
+// that carries the full long path in a "path" record, so entry names longer
+// than the 100-byte ustar name field are preserved instead of silently
+// truncated. Mirrors what Go's archive/tar does for long names. The body is
+// padded to a 512-byte boundary.
+function buildPAXLongNameEntry(path: string, mode: number, mtime: number): { header: Uint8Array; body: Uint8Array } {
+  const record = paxRecord("path", path);
+  const pad = padToBlock(record.length);
+  const body = concat3(record, pad, new Uint8Array(0));
+  const header = buildTarHeader("PaxHeader/path", body.length, "x", mode, mtime);
+  return { header, body };
+}
+
+// nameFitsUstar reports whether a UTF-8 encoded path fits in the 100-byte
+// ustar name field.
+function nameFitsUstar(name: string): boolean {
+  return new TextEncoder().encode(name).length <= 100;
+}
+
 function padToBlock(size: number): Uint8Array {
   const remainder = size % TAR_BLOCK;
   if (remainder === 0) return new Uint8Array(0);
@@ -101,6 +137,16 @@ function concat3(a: Uint8Array, b: Uint8Array, c: Uint8Array): Uint8Array {
   out.set(a, 0);
   out.set(b, a.length);
   out.set(c, a.length + b.length);
+  return out;
+}
+
+function concat4(a: Uint8Array, b: Uint8Array, c: Uint8Array, d: Uint8Array): Uint8Array {
+  const out = new Uint8Array(a.length + b.length + c.length + d.length);
+  let off = 0;
+  out.set(a, off); off += a.length;
+  out.set(b, off); off += b.length;
+  out.set(c, off); off += c.length;
+  out.set(d, off);
   return out;
 }
 
@@ -148,27 +194,45 @@ export async function archiveImpl(
         }
       })();
       try {
+        const now = mtimeNow();
         // Directories first (preserves empty dirs). Writes are serialized
-        // because the writer is a single gzip stream.
+        // because the writer is a single gzip stream. Names longer than the
+        // 100-byte ustar name field get a PAX 'x' extended header so the
+        // full path survives extraction (matches Go's archive/tar behavior).
         for (const d of dirs) {
           const name = archiveDirName(d.root, d.rel, flat);
           if (!name) continue;
-          const header = buildTarHeader(name, 0, "5", d.mode ?? 0o755, mtimeNow());
+          const mode = d.mode ?? 0o755;
+          if (!nameFitsUstar(name)) {
+            const pax = buildPAXLongNameEntry(name, mode, now);
+            await writer.write(concat3(pax.header, pax.body, new Uint8Array(0)));
+          }
+          const header = buildTarHeader(name, 0, "5", mode, now);
           await writer.write(header);
         }
         // Files: download in parallel (bounded), but serialize the
         // header+body+pad write to keep the tar byte stream coherent. Each
         // worker builds a single concatenated Uint8Array for its entry and
-        // acquires the write lock only for the final write.
+        // acquires the write lock only for the final write. Long names emit
+        // a PAX 'x' entry chained before the regular entry.
         let writeLock: Promise<void> = Promise.resolve();
         await parallelMap(files, jobs, signal, async (e) => {
           const stream = await client.readStream(e.remote);
           const buf = await streamToUint8Array(stream, e.size);
           const name = archiveName(e.root, e.rel, flat);
           if (!name) return;
-          const header = buildTarHeader(name, e.size, "0", e.mode ?? 0o644, mtimeNow());
+          const mode = e.mode ?? 0o644;
+          const fileNow = mtimeNow();
           const pad = padToBlock(e.size);
-          const entry = concat3(header, buf, pad);
+          let entry: Uint8Array;
+          if (!nameFitsUstar(name)) {
+            const pax = buildPAXLongNameEntry(name, mode, fileNow);
+            const regHeader = buildTarHeader(name, e.size, "0", mode, fileNow);
+            entry = concat4(pax.header, pax.body, regHeader, concat3(buf, pad, new Uint8Array(0)));
+          } else {
+            const regHeader = buildTarHeader(name, e.size, "0", mode, fileNow);
+            entry = concat3(regHeader, buf, pad);
+          }
           // Serialize the write: chain onto writeLock so only one worker
           // writes at a time. The download stays parallel; only the gzip
           // write is serialized.

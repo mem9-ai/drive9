@@ -146,7 +146,7 @@ func TestArchiveDirTarGzBasicTree(t *testing.T) {
 
 func TestArchiveDirExcludeSkipsNodeModules(t *testing.T) {
 	mock := newArchiveMockServer(map[string]string{
-		"/proj/src/app.go":            "package src\n",
+		"/proj/src/app.go":              "package src\n",
 		"/proj/node_modules/react/x.js": "module.exports\n",
 	})
 	srv := mock.server(t)
@@ -183,8 +183,8 @@ func TestArchiveDirExcludeSkipsNodeModules(t *testing.T) {
 
 func TestArchiveDirIncludeWhitelist(t *testing.T) {
 	mock := newArchiveMockServer(map[string]string{
-		"/proj/src/app.go":  "package src\n",
-		"/proj/README.md":   "# readme\n",
+		"/proj/src/app.go":    "package src\n",
+		"/proj/README.md":     "# readme\n",
 		"/proj/docs/guide.md": "# guide\n",
 	})
 	srv := mock.server(t)
@@ -234,10 +234,10 @@ func TestArchiveDirIncludeWhitelist(t *testing.T) {
 // the archive is empty. Pruning must be driven by MatchExcluded, not Match.
 func TestArchiveDirIncludeNestedFileNotPrunedByParentDir(t *testing.T) {
 	mock := newArchiveMockServer(map[string]string{
-		"/proj/src/app.go":          "package main\n",
-		"/proj/src/util/util.go":    "package util\n",
-		"/proj/other/notes.txt":     "notes\n",
-		"/proj/README.md":           "# readme\n",
+		"/proj/src/app.go":       "package main\n",
+		"/proj/src/util/util.go": "package util\n",
+		"/proj/other/notes.txt":  "notes\n",
+		"/proj/README.md":        "# readme\n",
 	})
 	srv := mock.server(t)
 	defer srv.Close()
@@ -366,8 +366,8 @@ func TestArchiveDirDirectoryPruningSkipsExcludedSubtree(t *testing.T) {
 	// so we can assert that excluded subtrees are NOT listed.
 	mock := newArchiveMockServer(map[string]string{
 		"/proj/src/app.go":                    "package src\n",
-		"/proj/node_modules/react/index.js":    "module.exports\n",
-		"/proj/node_modules/react/foo/bar.js":  "foo\n",
+		"/proj/node_modules/react/index.js":   "module.exports\n",
+		"/proj/node_modules/react/foo/bar.js": "foo\n",
 	})
 	srv := mock.server(t)
 	defer srv.Close()

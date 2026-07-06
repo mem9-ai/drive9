@@ -62,13 +62,13 @@ func TestMatcherIncludeExclude(t *testing.T) {
 		path string
 		want bool
 	}{
-		{"proj/src/main.go", true},            // matches include, not exclude
-		{"proj/src/server/server.go", true},   // matches include, not exclude
-		{"go.mod", true},                       // exact include match
-		{"proj/vendor/foo.go", false},          // matches include but excluded (vendor)
-		{"proj/main_test.go", true},           // *_test.go exclude is root-level glob only
-		{"main_test.go", false},                // excluded by root-level *_test.go glob
-		{"README.md", false},                   // not in include whitelist
+		{"proj/src/main.go", true},          // matches include, not exclude
+		{"proj/src/server/server.go", true}, // matches include, not exclude
+		{"go.mod", true},                    // exact include match
+		{"proj/vendor/foo.go", false},       // matches include but excluded (vendor)
+		{"proj/main_test.go", true},         // *_test.go exclude is root-level glob only
+		{"main_test.go", false},             // excluded by root-level *_test.go glob
+		{"README.md", false},                // not in include whitelist
 	}
 	for _, tc := range cases {
 		t.Run(tc.path, func(t *testing.T) {

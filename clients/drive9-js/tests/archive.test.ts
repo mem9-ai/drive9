@@ -228,4 +228,36 @@ describe("archive", () => {
     expect(names).toContain("proj/src/app.go");
     expect(names.some((n) => n.endsWith("notes.txt"))).toBe(false);
   });
+
+  it("long entry names use a PAX header instead of truncating", async () => {
+    // A path > 100 bytes must survive via a PAX 'x' extended header. Use
+    // python's tarfile to parse since it honors PAX records (the minimal
+    // ustar reader in this test file does not).
+    const longDir =
+      "/proj/very/deeply/nested/path/that/definitely/exceeds/the/ustar/one/hundred/byte/name/field/limit";
+    const longFile = `${longDir}/module.ts`;
+    mountTree("/proj", [{ path: longFile, body: "export {}\n" }]);
+    const client = new Client("http://localhost:9009", "test-key");
+    const stream = await client.archive("/proj");
+    const buf = await streamToBuffer(stream);
+    const fs = await import("node:fs");
+    const tmp = `/tmp/drive9-ts-longname-${Date.now()}.tar.gz`;
+    fs.writeFileSync(tmp, buf);
+    try {
+      const { execSync } = await import("node:child_process");
+      const list = execSync(
+        `python3 -c 'import tarfile,sys; [print(m.name) for m in tarfile.open(sys.argv[1],"r:gz")]' ${tmp}`,
+        { encoding: "utf8" }
+      );
+      // The full long path must appear (archiveName prepends the archive root
+      // "proj/", and longFile already starts with "/proj/...", so the in-archive
+      // name is longFile with its leading "/" stripped).
+      const expectedName = longFile.slice(1);
+      expect(list).toContain(expectedName);
+      // Sanity: the name is genuinely > 100 bytes so the PAX path was needed.
+      expect(expectedName.length).toBeGreaterThan(100);
+    } finally {
+      fs.unlinkSync(tmp);
+    }
+  });
 });
