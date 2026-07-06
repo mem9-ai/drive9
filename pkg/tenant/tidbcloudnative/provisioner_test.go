@@ -1653,6 +1653,68 @@ func TestNewProvisionerFromEnvRejectsMalformedPrivateEndpointFlag(t *testing.T) 
 	}
 }
 
+func TestNewProvisionerFromEnvRequiresAlicloudPrivateEndpointDomain(t *testing.T) {
+	setPrivateEnv := func(provider string) {
+		t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
+		t.Setenv(EnvTiDBCloudNativeCloudProvider, provider)
+		t.Setenv(EnvTiDBCloudNativeRegion, "ap-southeast-1")
+		t.Setenv(EnvTiDBCloudNativeUsePrivateEndpoint, "true")
+		t.Setenv(EnvTiDBCloudTencentPrivateEndpointHost, "")
+		t.Setenv(EnvTiDBCloudAlicloudPrivateEndpointDomain, "")
+	}
+
+	t.Run("alicloud missing domain", func(t *testing.T) {
+		setPrivateEnv("alicloud")
+		_, err := NewProvisionerFromEnv()
+		if err == nil {
+			t.Fatalf("expected error for alicloud private endpoint without domain")
+		}
+	})
+
+	t.Run("alicloud with domain", func(t *testing.T) {
+		setPrivateEnv("alicloud")
+		t.Setenv(EnvTiDBCloudAlicloudPrivateEndpointDomain, "alicloud.internal")
+		p, err := NewProvisionerFromEnv()
+		if err != nil {
+			t.Fatalf("NewProvisionerFromEnv with alicloud domain: %v", err)
+		}
+		if p.alicloudPrivateEndpointHost != "alicloud.internal" {
+			t.Fatalf("alicloudPrivateEndpointHost = %q, want alicloud.internal", p.alicloudPrivateEndpointHost)
+		}
+	})
+
+	t.Run("tencentcloud missing host", func(t *testing.T) {
+		setPrivateEnv("tencentcloud")
+		_, err := NewProvisionerFromEnv()
+		if err == nil {
+			t.Fatalf("expected error for tencentcloud private endpoint without host")
+		}
+	})
+
+	t.Run("tencentcloud with host", func(t *testing.T) {
+		setPrivateEnv("tencentcloud")
+		t.Setenv(EnvTiDBCloudTencentPrivateEndpointHost, "tencent.internal")
+		p, err := NewProvisionerFromEnv()
+		if err != nil {
+			t.Fatalf("NewProvisionerFromEnv with tencentcloud host: %v", err)
+		}
+		if p.tencentPrivateEndpointHost != "tencent.internal" {
+			t.Fatalf("tencentPrivateEndpointHost = %q, want tencent.internal", p.tencentPrivateEndpointHost)
+		}
+	})
+
+	t.Run("aws no override required", func(t *testing.T) {
+		setPrivateEnv("aws")
+		p, err := NewProvisionerFromEnv()
+		if err != nil {
+			t.Fatalf("NewProvisionerFromEnv with aws and no override: %v", err)
+		}
+		if p.usePrivateEndpoint != true {
+			t.Fatalf("usePrivateEndpoint = %v, want true", p.usePrivateEndpoint)
+		}
+	})
+}
+
 func TestClusterConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	info := &clusterInfo{
 		ClusterID:  "cluster-1",
@@ -1771,5 +1833,51 @@ func TestFillBranchEndpointUsesPrivateEndpoint(t *testing.T) {
 	}
 	if out.Username != "u1.root" {
 		t.Fatalf("Username = %q, want u1.root", out.Username)
+	}
+}
+
+func TestFillBranchEndpointOverrideTakesPriority(t *testing.T) {
+	branch := &branchInfo{
+		BranchID:   "branch-1",
+		UserPrefix: "u1",
+	}
+	branch.Endpoints.Public.Host = "public.example"
+	branch.Endpoints.Public.Port = 4000
+	branch.Endpoints.Private.Host = "private.internal"
+	branch.Endpoints.Private.Port = 4001
+
+	p := &Provisioner{
+		usePrivateEndpoint:          true,
+		alicloudPrivateEndpointHost: "alicloud.override.internal",
+		cloudProvider:               cloudProviderAliCloud,
+	}
+	out := &tenant.ClusterInfo{}
+	if err := p.fillBranchEndpoint(out, branch); err != nil {
+		t.Fatalf("fillBranchEndpoint: %v", err)
+	}
+	if out.Host != "alicloud.override.internal" {
+		t.Fatalf("Host = %q, want alicloud.override.internal (override takes priority)", out.Host)
+	}
+}
+
+func TestClusterInfoFromResponseOverrideTakesPriority(t *testing.T) {
+	info := &clusterInfo{
+		ClusterID:  "cluster-1",
+		UserPrefix: "u1",
+		Labels:     map[string]string{TiDBCloudOrganizationLabel: "org-1"},
+	}
+	info.Endpoints.Public.Host = "public.example"
+	info.Endpoints.Public.Port = 4000
+	info.Endpoints.Private.Host = "private.internal"
+	info.Endpoints.Private.Port = 4001
+
+	p := &Provisioner{
+		usePrivateEndpoint:          true,
+		alicloudPrivateEndpointHost: "alicloud.override.internal",
+		cloudProvider:               cloudProviderAliCloud,
+	}
+	out := p.clusterInfoFromResponse("tenant-1", "db1", "pass1", info)
+	if out.Host != "alicloud.override.internal" {
+		t.Fatalf("Host = %q, want alicloud.override.internal (override takes priority)", out.Host)
 	}
 }

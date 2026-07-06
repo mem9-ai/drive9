@@ -311,11 +311,13 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 	var host string
 	var port int
 	if p.usePrivateEndpoint {
-		host = info.Endpoints.Private.Host
-		port = info.Endpoints.Private.Port
-		if host == "" && p.privateEndpointOverrideHost() != "" {
-			host = p.privateEndpointOverrideHost()
+		overrideHost := p.privateEndpointOverrideHost()
+		if overrideHost != "" {
+			host = overrideHost
+		} else {
+			host = info.Endpoints.Private.Host
 		}
+		port = info.Endpoints.Private.Port
 	} else {
 		host = info.Endpoints.Public.Host
 		port = info.Endpoints.Public.Port
@@ -1562,11 +1564,13 @@ func (p *Provisioner) clusterInfoFromResponse(tenantID, dbName, password string,
 	var host string
 	var port int
 	if p.usePrivateEndpoint {
-		host = info.Endpoints.Private.Host
-		port = info.Endpoints.Private.Port
-		if host == "" && p.privateEndpointOverrideHost() != "" {
-			host = p.privateEndpointOverrideHost()
+		overrideHost := p.privateEndpointOverrideHost()
+		if overrideHost != "" {
+			host = overrideHost
+		} else {
+			host = info.Endpoints.Private.Host
 		}
+		port = info.Endpoints.Private.Port
 	} else {
 		host = info.Endpoints.Public.Host
 		port = info.Endpoints.Public.Port
@@ -1632,11 +1636,13 @@ func (p *Provisioner) fillBranchEndpoint(out *tenant.ClusterInfo, branch *branch
 	var host string
 	var port int
 	if p.usePrivateEndpoint {
-		host = branch.Endpoints.Private.Host
-		port = branch.Endpoints.Private.Port
-		if host == "" && p.privateEndpointOverrideHost() != "" {
-			host = p.privateEndpointOverrideHost()
+		overrideHost := p.privateEndpointOverrideHost()
+		if overrideHost != "" {
+			host = overrideHost
+		} else {
+			host = branch.Endpoints.Private.Host
 		}
+		port = branch.Endpoints.Private.Port
 	} else {
 		host = branch.Endpoints.Public.Host
 		port = branch.Endpoints.Public.Port
