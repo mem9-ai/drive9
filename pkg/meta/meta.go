@@ -1415,6 +1415,13 @@ func (s *Store) GetTenantTiDBCloudOrgBinding(ctx context.Context, tenantID strin
 	return &rec, nil
 }
 
+func (s *Store) DeleteTenantTiDBCloudOrgBinding(ctx context.Context, tenantID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_tidbcloud_org_binding", start, &err)
+	_, err = s.db.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID)
+	return err
+}
+
 func (s *Store) CreateTenantPool(ctx context.Context, p *TenantPool) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "create_tidbcloud_pool", start, &err)

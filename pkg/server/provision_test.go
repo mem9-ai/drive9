@@ -169,21 +169,21 @@ func (f *fakeProvisioner) ProvisionWithCredentialsAndQuota(_ context.Context, te
 }
 
 func (f *fakeProvisioner) Deprovision(_ context.Context, cluster *tenant.ClusterInfo) error {
-	f.deprovisionCalls.Add(1)
 	if cluster != nil {
 		out := *cluster
 		f.lastDeprovision = &out
 	}
+	f.deprovisionCalls.Add(1)
 	return f.deprovisionErr
 }
 
 func (f *fakeProvisioner) DeprovisionWithCredentials(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
-	f.deprovisionCalls.Add(1)
 	f.lastCredentialReq = req
 	if cluster != nil {
 		out := *cluster
 		f.lastDeprovision = &out
 	}
+	f.deprovisionCalls.Add(1)
 	return f.deprovisionErr
 }
 
@@ -219,6 +219,35 @@ func (f *fakeProvisioner) UpdateQuota(_ context.Context, cluster *tenant.Cluster
 
 func (f *fakeProvisioner) ProvisionCallCount() int {
 	return int(f.provisionCalls.Load())
+}
+
+func waitForDeprovisionCalls(t *testing.T, prov *fakeProvisioner, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if got := prov.deprovisionCalls.Load(); got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("deprovision calls = %d, want %d", prov.deprovisionCalls.Load(), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForTiDBCloudOrgBindingNotFound(t *testing.T, metaStore *meta.Store, tenantID string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := metaStore.GetTenantTiDBCloudOrgBinding(context.Background(), tenantID); errors.Is(err, meta.ErrNotFound) {
+			return
+		}
+		if time.Now().After(deadline) {
+			binding, err := metaStore.GetTenantTiDBCloudOrgBinding(context.Background(), tenantID)
+			t.Fatalf("tidbcloud org binding = %#v, err = %v, want ErrNotFound", binding, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 type credentialOnlyProvisioner struct {
@@ -860,13 +889,14 @@ func TestProvisionTiDBCloudNativeCreateTimeQuotaRequiresQuotaProvisioner(t *test
 	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusInternalServerError {
 		t.Fatalf("provision error = %#v, want 500 provisionTenantError", err)
 	}
-	var status string
-	if err := metaStore.DB().QueryRow("SELECT status FROM tenants").Scan(&status); err != nil {
+	var tenantID, status string
+	if err := metaStore.DB().QueryRow("SELECT id, status FROM tenants").Scan(&tenantID, &status); err != nil {
 		t.Fatal(err)
 	}
 	if status != string(meta.TenantFailed) {
 		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
 	}
+	waitForTiDBCloudOrgBindingNotFound(t, metaStore, tenantID)
 }
 
 func TestProvisionTiDBCloudNativeCreateTimeQuotaLocalPersistenceErrorIsInternal(t *testing.T) {
@@ -939,16 +969,15 @@ func TestProvisionTiDBCloudNativeCreateTimeQuotaLocalPersistenceErrorIsInternal(
 	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusInternalServerError {
 		t.Fatalf("provision error = %#v, want 500 provisionTenantError", err)
 	}
-	if got := prov.deprovisionCalls.Load(); got != 1 {
-		t.Fatalf("deprovision calls = %d, want 1", got)
-	}
-	var status string
-	if err := metaStore.DB().QueryRow("SELECT status FROM tenants").Scan(&status); err != nil {
+	waitForDeprovisionCalls(t, prov, 1)
+	var tenantID, status string
+	if err := metaStore.DB().QueryRow("SELECT id, status FROM tenants").Scan(&tenantID, &status); err != nil {
 		t.Fatal(err)
 	}
 	if status != string(meta.TenantFailed) {
 		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
 	}
+	waitForTiDBCloudOrgBindingNotFound(t, metaStore, tenantID)
 }
 
 func TestProvisionTiDBCloudNativeCleansClusterWhenOrgBindingMissing(t *testing.T) {
@@ -1009,9 +1038,7 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenOrgBindingMissing(t *testing.T
 	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusBadGateway {
 		t.Fatalf("provision error = %#v, want 502 provisionTenantError", err)
 	}
-	if got := prov.deprovisionCalls.Load(); got != 1 {
-		t.Fatalf("deprovision calls = %d, want 1", got)
-	}
+	waitForDeprovisionCalls(t, prov, 1)
 	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "native-cluster-missing-org" {
 		t.Fatalf("deprovision cluster = %#v", prov.lastDeprovision)
 	}
@@ -1087,9 +1114,7 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenProvisionReturnsClusterAndErro
 	if err == nil {
 		t.Fatal("provisionTenant error = nil, want provision error")
 	}
-	if got := prov.deprovisionCalls.Load(); got != 1 {
-		t.Fatalf("deprovision calls = %d, want 1", got)
-	}
+	waitForDeprovisionCalls(t, prov, 1)
 	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "native-cluster-provision-error" {
 		t.Fatalf("deprovision cluster = %#v", prov.lastDeprovision)
 	}
@@ -1097,13 +1122,14 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenProvisionReturnsClusterAndErro
 		t.Fatalf("cleanup credentials = %+v", prov.lastCredentialReq)
 	}
 
-	var status string
-	if err := metaStore.DB().QueryRow("SELECT status FROM tenants").Scan(&status); err != nil {
+	var tenantID, status string
+	if err := metaStore.DB().QueryRow("SELECT id, status FROM tenants").Scan(&tenantID, &status); err != nil {
 		t.Fatal(err)
 	}
 	if status != string(meta.TenantFailed) {
 		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
 	}
+	waitForTiDBCloudOrgBindingNotFound(t, metaStore, tenantID)
 }
 
 func TestProvisionTiDBCloudNativeCleansClusterWhenPasswordEncryptFails(t *testing.T) {
@@ -1157,9 +1183,7 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenPasswordEncryptFails(t *testin
 	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusInternalServerError {
 		t.Fatalf("provision error = %#v, want 500 provisionTenantError", err)
 	}
-	if got := prov.deprovisionCalls.Load(); got != 1 {
-		t.Fatalf("deprovision calls = %d, want 1", got)
-	}
+	waitForDeprovisionCalls(t, prov, 1)
 	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "native-cluster-encrypt-error" {
 		t.Fatalf("deprovision cluster = %#v", prov.lastDeprovision)
 	}
@@ -1167,13 +1191,14 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenPasswordEncryptFails(t *testin
 		t.Fatalf("cleanup credentials = %+v", prov.lastCredentialReq)
 	}
 
-	var status string
-	if err := metaStore.DB().QueryRow("SELECT status FROM tenants").Scan(&status); err != nil {
+	var tenantID, status string
+	if err := metaStore.DB().QueryRow("SELECT id, status FROM tenants").Scan(&tenantID, &status); err != nil {
 		t.Fatal(err)
 	}
 	if status != string(meta.TenantFailed) {
 		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
 	}
+	waitForTiDBCloudOrgBindingNotFound(t, metaStore, tenantID)
 }
 
 func TestProvisionTiDBCloudNativeRequiresRequestCredentials(t *testing.T) {
@@ -1799,9 +1824,7 @@ func TestProvisionCleansPartialClusterBeforeMarkingFailed(t *testing.T) {
 	if clusterID != "" {
 		t.Fatalf("tenant cluster_id = %s, want empty after cleanup", clusterID)
 	}
-	if got := prov.deprovisionCalls.Load(); got != 1 {
-		t.Fatalf("deprovision calls = %d, want 1", got)
-	}
+	waitForDeprovisionCalls(t, prov, 1)
 	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "cluster-after-takeover" {
 		t.Fatalf("deprovision cluster = %#v", prov.lastDeprovision)
 	}

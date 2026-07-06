@@ -276,11 +276,12 @@ type TenantStatusResponse struct {
 }
 
 const (
-	maxBatchStatPaths                     = 256
-	maxBatchReadSmallPaths                = 128
-	maxBatchReadSmallBytes                = 50_000
-	defaultBatchReadMaxBody               = 1 << 20
-	maxCredentialProvisionBodyBytes int64 = 1 << 20
+	maxBatchStatPaths                           = 256
+	maxBatchReadSmallPaths                      = 128
+	maxBatchReadSmallBytes                      = 50_000
+	defaultBatchReadMaxBody                     = 1 << 20
+	maxCredentialProvisionBodyBytes       int64 = 1 << 20
+	provisionFailureClusterCleanupTimeout       = 2 * time.Minute
 )
 
 func New(b *backend.Dat9Backend) *Server {
@@ -4714,13 +4715,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
-		if cluster != nil && strings.TrimSpace(cluster.ClusterID) != "" {
-			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "cluster_provision_error")
-		} else {
-			if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
-				logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
-			}
-		}
+		s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "cluster_provision_error")
 		msg := fmt.Sprintf("provision tenant cluster failed: %v", err)
 		if strings.Contains(strings.ToLower(err.Error()), "free cluster") {
 			msg = "TiDB Cloud free cluster limit reached. Set a monthly Spending Limit to continue. See https://www.pingcap.com/tidb-cloud-starter-pricing-details/#cost-and-limitations"
@@ -4855,13 +4850,13 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 }
 
 func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Context, tenantID, provider string, cluster *tenant.ClusterInfo, cred *tenant.CredentialProvisionRequest, reason string) {
-	if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+	cleanupCtx := backgroundWithTrace(ctx)
+	if uerr := s.meta.UpdateTenantStatus(cleanupCtx, tenantID, meta.TenantFailed); uerr != nil {
+		logger.Error(cleanupCtx, "server_event", eventFields(cleanupCtx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
 	}
 	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
 		return
 	}
-	cleanupCtx := backgroundWithTrace(ctx)
 	t := &meta.Tenant{
 		ID:        tenantID,
 		Provider:  provider,
@@ -4879,9 +4874,19 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 		}
 		req = *cred
 	}
-	if err := s.deprovisionTenantCluster(cleanupCtx, t, req); err != nil {
-		logger.Error(cleanupCtx, "server_event", eventFields(cleanupCtx, "provision_cluster_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
-	}
+	s.startServerWorker(cleanupCtx, func(workerCtx context.Context) {
+		workerCtx, cancel := context.WithTimeout(workerCtx, provisionFailureClusterCleanupTimeout)
+		defer cancel()
+		if err := s.deprovisionTenantCluster(workerCtx, t, req); err != nil {
+			logger.Error(workerCtx, "server_event", eventFields(workerCtx, "provision_cluster_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
+			return
+		}
+		if provider == tenant.ProviderTiDBCloudNative {
+			if err := s.meta.DeleteTenantTiDBCloudOrgBinding(workerCtx, tenantID); err != nil {
+				logger.Error(workerCtx, "server_event", eventFields(workerCtx, "provision_tidbcloud_org_binding_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
+			}
+		}
+	})
 }
 
 func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {
