@@ -123,8 +123,11 @@ internal/
 e2e/                    Live bash smoke tests; read e2e/AGENTS.md first
 scripts/                Shell helpers for local dev and test
 docs/                   Design documents
-site/                   Frontend / release assets
 ```
+
+The frontend and CLI release assets live in a separate repository,
+`github.com/mem9-ai/drive9-fe` (served under `site/` there); the release workflow
+publishes CLI binaries into `drive9-fe`'s `site/releases/` directly.
 
 When creating a new GitHub issue, follow the templates under `.github/ISSUE_TEMPLATE/`
 to keep issue structure and required context consistent.
