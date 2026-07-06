@@ -431,7 +431,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			Summary: "provision a new tenant and save an owner context",
 			Details: []string{
 				"no TiDB Cloud keys -> Anonymous mode; TiDB Cloud keys -> TiDBCloud Mode",
-				"Anonymous mode is a quick-start workspace hosted by TiDB so you can try drive9 without an account; files are tenant-isolated and encrypted in transit. Sign up at drive9.ai for a workspace tied to your own account. Details: drive9.ai/security",
+				"Anonymous mode is a quick-start workspace hosted by TiDB so you can try drive9 without TiDB Cloud credentials; files are tenant-isolated and encrypted in transit. For a workspace tied to your own TiDB Cloud account, run drive9 create with your TiDB Cloud keys. Details: drive9.ai/security",
 			},
 			Flags: []visualHelpFlag{
 				{Name: "--name NAME", Desc: "context name; defaults to an auto-generated 7-character name"},

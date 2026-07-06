@@ -131,7 +131,7 @@ func regionListCmd(args []string) error {
 	}
 	for _, entry := range manifest.Regions {
 		if regionModeLabel(entry.Mode) == ModeLabelAnonymous {
-			fmt.Fprintln(os.Stderr, "Note: Anonymous mode is a quick-start workspace hosted by TiDB — tenant-isolated, encrypted in transit. Sign up at drive9.ai for your own account workspace. Details: drive9.ai/security")
+			fmt.Fprintln(os.Stderr, "Note: Anonymous mode is a quick-start workspace hosted by TiDB — tenant-isolated, encrypted in transit. For an account-bound workspace, pass your TiDB Cloud keys to drive9 create (TiDBCloud Mode). Details: drive9.ai/security")
 			break
 		}
 	}
