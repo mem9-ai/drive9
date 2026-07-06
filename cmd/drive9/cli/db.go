@@ -148,7 +148,7 @@ func Create(args []string) error {
 	}
 
 	if mode == RegionModeAnonymous {
-		fmt.Fprintf(os.Stderr, "Note: Anonymous mode in drive9 transfers data management rights to PingCAP.\n")
+		fmt.Fprintf(os.Stderr, "Note: Anonymous mode is for evaluation and functional testing only. Please do not put production data in it.\n")
 	}
 
 	cfg := loadConfig()
@@ -290,7 +290,7 @@ examples:
   # list available regions
   drive9 region list
 
-note: Anonymous mode in drive9 transfers data management rights to PingCAP.`
+note: Anonymous mode is for evaluation and functional testing only. Please do not put production data in it.`
 }
 
 func provisionModeForCredentials(publicKey, privateKey string) string {
