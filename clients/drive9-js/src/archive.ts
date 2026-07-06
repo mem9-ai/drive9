@@ -90,33 +90,46 @@ function buildTarHeader(name: string, size: number, typeflag: "0" | "5" | "x", m
   return header;
 }
 
+// utf8Len returns the byte length of a string encoded as UTF-8 (not the
+// UTF-16 code-unit length that string.length reports). PAX record lengths
+// are specified in bytes, so this is required for non-ASCII paths.
+function utf8Len(s: string): number {
+  return new TextEncoder().encode(s).length;
+}
+
 // paxRecord builds a single PAX extended-header record: "%d %s=%s\n" where
-// %d is the byte length of the entire record (length field, space, key,
-// '=', value, and trailing newline). Returns the UTF-8 encoded bytes.
+// %d is the BYTE length of the entire record (length field, space, key,
+// '=', value, and trailing newline), counted in UTF-8 bytes. Returns the
+// UTF-8 encoded bytes.
 function paxRecord(key: string, value: string): Uint8Array {
+  // suffix = " key=value\n" — its byte length excludes the length field.
   const suffix = ` ${key}=${value}\n`;
-  // Solve L = digits(L) + suffix.length for L. The length field counts
+  const suffixBytes = utf8Len(suffix);
+  // Solve L = digits(L) + suffixBytes for L. The length field counts
   // itself; iterate to a fixed point (converges in a couple of steps).
-  let len = suffix.length;
+  let len = suffixBytes;
   for (;;) {
     const digits = String(len).length;
-    const total = digits + suffix.length;
+    const total = digits + suffixBytes;
     if (total === len) break;
     len = total;
   }
+  // Encode the full record "<len><suffix>" to UTF-8 bytes.
   return new TextEncoder().encode(`${len}${suffix}`);
 }
 
 // buildPAXLongNameEntry returns the (header, body) pair for a PAX 'x' entry
 // that carries the full long path in a "path" record, so entry names longer
 // than the 100-byte ustar name field are preserved instead of silently
-// truncated. Mirrors what Go's archive/tar does for long names. The body is
-// padded to a 512-byte boundary.
+// truncated. Mirrors what Go's archive/tar does for long names. The header
+// size is the record payload length in bytes (excluding block padding); the
+// padded body is still written on the wire.
 function buildPAXLongNameEntry(path: string, mode: number, mtime: number): { header: Uint8Array; body: Uint8Array } {
   const record = paxRecord("path", path);
   const pad = padToBlock(record.length);
   const body = concat3(record, pad, new Uint8Array(0));
-  const header = buildTarHeader("PaxHeader/path", body.length, "x", mode, mtime);
+  // PAX header size = record payload bytes (NOT the padded body length).
+  const header = buildTarHeader("PaxHeader/path", record.length, "x", mode, mtime);
   return { header, body };
 }
 

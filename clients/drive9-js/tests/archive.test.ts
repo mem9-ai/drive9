@@ -57,7 +57,9 @@ function mountTree(root: string, files: MockFile[]) {
     }),
     http.get(/http:\/\/localhost:9009\/v1\/fs\/.+/, ({ request }) => {
       const url = new URL(request.url);
-      const p = url.pathname.replace("/v1/fs", "");
+      // pathname is percent-encoded for non-ASCII segments; decode so the
+      // lookup keys (which are raw UTF-8 paths like "/proj/目录") match.
+      const p = decodeURIComponent(url.pathname.replace("/v1/fs", ""));
       if (url.searchParams.has("list")) {
         const entries = dirs[p] || [];
         return HttpResponse.json({ entries });
@@ -256,6 +258,38 @@ describe("archive", () => {
       expect(list).toContain(expectedName);
       // Sanity: the name is genuinely > 100 bytes so the PAX path was needed.
       expect(expectedName.length).toBeGreaterThan(100);
+    } finally {
+      fs.unlinkSync(tmp);
+    }
+  });
+
+  it("long non-ASCII entry names survive via UTF-8-correct PAX header", async () => {
+    // drive9 paths are NFC-normalized UTF-8 and may contain CJK/emoji. The
+    // PAX record length must be counted in UTF-8 BYTES (not JS UTF-16 code
+    // units) and the PAX header size must be the record payload length
+    // (not the padded body length). A non-ASCII path > 100 UTF-8 bytes
+    // exercises both: nameFitsUstar routes by UTF-8 bytes, and paxRecord
+    // must emit a byte-accurate length so a real tar reader can parse it.
+    const longDir =
+      "/proj/目录/很深/嵌套/路径/确实/超过/ustar/一百/字节/名字/字段/限制/再加一点padding让它真的超过";
+    const longFile = `${longDir}/模块.ts`;
+    mountTree("/proj", [{ path: longFile, body: "export {}\n" }]);
+    const client = new Client("http://localhost:9009", "test-key");
+    const stream = await client.archive("/proj");
+    const buf = await streamToBuffer(stream);
+    const fs = await import("node:fs");
+    const tmp = `/tmp/drive9-ts-longname-utf8-${Date.now()}.tar.gz`;
+    fs.writeFileSync(tmp, buf);
+    try {
+      const { execSync } = await import("node:child_process");
+      const list = execSync(
+        `python3 -c 'import tarfile,sys; [print(m.name) for m in tarfile.open(sys.argv[1],"r:gz")]' ${tmp}`,
+        { encoding: "utf8" }
+      );
+      const expectedName = longFile.slice(1);
+      expect(list).toContain(expectedName);
+      // Sanity: the name is genuinely > 100 UTF-8 bytes so PAX was needed.
+      expect(new TextEncoder().encode(expectedName).length).toBeGreaterThan(100);
     } finally {
       fs.unlinkSync(tmp);
     }
