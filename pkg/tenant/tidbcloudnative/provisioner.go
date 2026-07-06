@@ -29,15 +29,15 @@ import (
 )
 
 const (
-	EnvTiDBCloudNativeAPIURL               = "DRIVE9_TIDBCLOUD_NATIVE_API_URL"
-	EnvTiDBCloudNativeCloudProvider        = "DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER"
-	EnvTiDBCloudNativeRegion               = "DRIVE9_TIDBCLOUD_NATIVE_REGION"
-	EnvTiDBCloudNativeDefaultDatabaseName  = "DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME"
-	EnvTiDBCloudDefaultSpendingLimit       = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
-	EnvTiDBCloudNativePublicKey            = "DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY"
-	EnvTiDBCloudNativePrivateKey           = "DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY"
-	EnvTiDBCloudNativeUsePrivateEndpoint   = "DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT"
-	EnvTiDBCloudTencentPrivateEndpointHost = "DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST"
+	EnvTiDBCloudNativeAPIURL                  = "DRIVE9_TIDBCLOUD_NATIVE_API_URL"
+	EnvTiDBCloudNativeCloudProvider           = "DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER"
+	EnvTiDBCloudNativeRegion                  = "DRIVE9_TIDBCLOUD_NATIVE_REGION"
+	EnvTiDBCloudNativeDefaultDatabaseName     = "DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME"
+	EnvTiDBCloudDefaultSpendingLimit          = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
+	EnvTiDBCloudNativePublicKey               = "DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY"
+	EnvTiDBCloudNativePrivateKey              = "DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY"
+	EnvTiDBCloudNativeUsePrivateEndpoint      = "DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT"
+	EnvTiDBCloudTencentPrivateEndpointHost    = "DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST"
 	EnvTiDBCloudAlicloudPrivateEndpointDomain = "DRIVE9_TIDBCLOUD_ALICLOUD_PRIVATE_ENDPOINT_DOMAIN"
 
 	DefaultDatabaseName = "tidbcloud_fs"
@@ -45,7 +45,7 @@ const (
 	stateActive         = "ACTIVE"
 
 	cloudProviderTencentCloud = "tencentcloud"
-	cloudProviderAlicloud     = "alicloud"
+	cloudProviderAliCloud     = "alicloud"
 	cloudProviderAWS          = "aws"
 
 	Drive9ManagedLabel         = "drive9.ai/managed"
@@ -78,13 +78,13 @@ var (
 )
 
 type Provisioner struct {
-	apiURL                     string
-	cloudProvider              string
-	region                     string
-	defaultDatabaseName        string
-	defaultSpendLimit          *int32
-	defaultPublicKey           string
-	defaultPrivateKey          string
+	apiURL                      string
+	cloudProvider               string
+	region                      string
+	defaultDatabaseName         string
+	defaultSpendLimit           *int32
+	defaultPublicKey            string
+	defaultPrivateKey           string
 	usePrivateEndpoint          bool
 	tencentPrivateEndpointHost  string
 	alicloudPrivateEndpointHost string
@@ -123,7 +123,7 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 			EnvTiDBCloudTencentPrivateEndpointHost, EnvTiDBCloudNativeUsePrivateEndpoint)
 	}
 	alicloudPrivateHost := strings.TrimSpace(os.Getenv(EnvTiDBCloudAlicloudPrivateEndpointDomain))
-	if usePrivate && strings.EqualFold(cloudProvider, cloudProviderAlicloud) && alicloudPrivateHost == "" {
+	if usePrivate && strings.EqualFold(cloudProvider, cloudProviderAliCloud) && alicloudPrivateHost == "" {
 		return nil, fmt.Errorf("%s is required when %s=true and cloud provider is alicloud",
 			EnvTiDBCloudAlicloudPrivateEndpointDomain, EnvTiDBCloudNativeUsePrivateEndpoint)
 	}
@@ -1198,8 +1198,10 @@ func (p *Provisioner) privateEndpointOverrideHost() string {
 	switch strings.ToLower(p.cloudProvider) {
 	case cloudProviderTencentCloud:
 		return p.tencentPrivateEndpointHost
-	case cloudProviderAlicloud:
+	case cloudProviderAliCloud:
 		return p.alicloudPrivateEndpointHost
+	case cloudProviderAWS:
+		return ""
 	default:
 		return ""
 	}
