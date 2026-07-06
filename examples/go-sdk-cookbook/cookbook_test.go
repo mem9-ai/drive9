@@ -150,6 +150,8 @@ func ExampleClient_transfersAppendPatchAndStreaming() {
 	}
 	_ = c.DownloadToFile(ctx, "/uploads/large.bin", "./large.bin", 10<<20)
 	_, _ = c.DownloadToFileWithSummary(ctx, "/uploads/large.bin", "./large.bin", 10<<20)
+	_ = c.DownloadDir("/uploads", "./downloads")
+	_ = c.DownloadDirCtx(ctx, "/uploads", "./downloads-ctx")
 
 	_ = c.ResumeUpload(ctx, "/uploads/resume.bin", bytes.NewReader(body), int64(len(body)), nil)
 	_ = c.ResumeUploadWithTags(ctx, "/uploads/resume-tags.bin", bytes.NewReader(body), int64(len(body)), nil, map[string]string{"kind": "resume"})
@@ -516,6 +518,8 @@ var coveredClientMethods = map[string]bool{
 	"DeleteVaultSecret":                    true,
 	"DiffFSLayer":                          true,
 	"DiffFSLayerAtSeq":                     true,
+	"DownloadDir":                          true,
+	"DownloadDirCtx":                       true,
 	"DownloadToFile":                       true,
 	"DownloadToFileWithSummary":            true,
 	"Find":                                 true,

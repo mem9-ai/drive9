@@ -84,6 +84,9 @@ TEST_DIR="native-smoke-${TS}"
 TENANT_ID=""
 API_KEY=""
 CREATED=0
+ADMIN_CREATED=0
+ADMIN_TENANT_ID=""
+ADMIN_FLAGS="--server $BASE --tidbcloud-public-key $PUBLIC_KEY --tidbcloud-private-key $PRIVATE_KEY"
 TMP_FILE="$(mktemp)"
 
 drive9() {
@@ -127,6 +130,11 @@ drive9_ctx_retry() {
 }
 
 cleanup() {
+  if [ "${ADMIN_CREATED:-0}" -eq 1 ] && [ "$SKIP_CLEANUP" != "1" ] && [ -n "${ADMIN_TENANT_ID:-}" ]; then
+    echo "[cleanup] deleting admin tenant $ADMIN_TENANT_ID" >&2
+    drive9_ctx admin tenant delete --tenant-id "$ADMIN_TENANT_ID" $ADMIN_FLAGS \
+      >/tmp/native-admin-cleanup.log 2>&1 || true
+  fi
   if [ "$CREATED" -eq 1 ] && [ "$SKIP_CLEANUP" != "1" ] && [ -n "${TENANT_ID:-}" ]; then
     echo "[cleanup] deleting tenant $TENANT_ID" >&2
     for i in $(seq 1 3); do
@@ -150,6 +158,32 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Poll until quota enforcement rejects a file (cache-refresh-aware).
+# Uses the same remote path on every attempt; cleans up successful
+# uploads before retrying so orphan files do not inflate tenant counters.
+wait_quota_reject() {
+  local desc="$1" local_path="$2" remote_path="$3"
+  local deadline=$(( $(date +%s) + 60 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    set +e
+    local out rc
+    out="$(drive9 fs cp "$local_path" ":$remote_path" 2>&1)"
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ] && echo "$out" | grep -qE 'quota|exceeded|507'; then
+      echo "quota cache refreshed for: $desc" >&2
+      return 0
+    fi
+    # clean up successful upload before next retry
+    if [ "$rc" -eq 0 ]; then
+      drive9 fs rm "$remote_path" >/dev/null 2>&1 || true
+    fi
+    sleep 5
+  done
+  echo "timeout waiting for quota: $desc" >&2
+  return 1
+}
+
 echo "hello native smoke test $TS" > "$TMP_FILE"
 
 # ── [1] provision tenant ────────────────────────────────────────────────────
@@ -160,6 +194,7 @@ create_out="$(drive9_ctx create \
   --server "$BASE" \
   --tidbcloud-public-key "$PUBLIC_KEY" \
   --tidbcloud-private-key "$PRIVATE_KEY" \
+  --tidbcloud-spending-limit 1000 \
   --json 2>&1)"
 create_code=$?
 set -e
@@ -321,7 +356,225 @@ fork_delete_code=$(curl -sS -o "$fork_delete_body" -w "%{http_code}" -X DELETE \
 check_eq "DELETE /v1/fork returns 202" "$fork_delete_code" "202"
 rm -f "$fork_delete_body" "$FORK_LOCAL"
 
-echo "[6] delete tenant"
+# ── [8] admin tenant list ───────────────────────────────────────────────────
+
+echo "[8] admin tenant list"
+
+set +e
+list_json="$(drive9_ctx admin tenant list $ADMIN_FLAGS --include-quota --json 2>&1)"
+list_rc=$?
+set -e
+check_eq "admin tenant list exit 0" "$list_rc" "0"
+
+list_tid="$(echo "$list_json" | jq -r --arg tid "$TENANT_ID" '.tenants[]? | select(.tenant_id == $tid) | .tenant_id')"
+check_eq "admin list contains tenant_id" "$list_tid" "$TENANT_ID"
+
+# ── [9] admin tenant get ────────────────────────────────────────────────────
+
+echo "[9] admin tenant get"
+
+set +e
+get_json="$(drive9_ctx admin tenant get --tenant-id "$TENANT_ID" $ADMIN_FLAGS --json 2>&1)"
+get_rc=$?
+set -e
+check_eq "admin tenant get exit 0" "$get_rc" "0"
+check_eq "admin get tenant_id" "$(echo "$get_json" | jq -r '.tenant_id')" "$TENANT_ID"
+check_eq "admin get status active" "$(echo "$get_json" | jq -r '.status')" "active"
+
+# ── [10] admin tenant set-quota (file-size=2) ───────────────────────────────
+
+echo "[10] admin tenant set-quota (file-size=2)"
+
+set +e
+set_q_json="$(drive9_ctx admin tenant set-quota \
+  --tenant-id "$TENANT_ID" \
+  --max-storage-size 102400 \
+  --max-file-size 2 \
+  --max-file-count 0 \
+  $ADMIN_FLAGS --json 2>&1)"
+set_q_rc=$?
+set -e
+check_eq "admin set-quota exit 0" "$set_q_rc" "0"
+check_eq "config.max_storage_size=102400" "$(echo "$set_q_json" | jq -r '.config.max_storage_size')" "102400"
+check_eq "config.max_file_size=2" "$(echo "$set_q_json" | jq -r '.config.max_file_size')" "2"
+
+# ── [11] verify max-file-size enforcement ───────────────────────────────────
+
+echo "[11] verify max-file-size enforcement (limit=2 MiB)"
+
+QS_DIR="/admin-quota-fs-${TS}"
+drive9_retry fs mkdir "$QS_DIR" >/dev/null
+
+# file > 2 MiB → wait until cache refreshed then verify rejected
+BIG_F="$(mktemp)"
+dd if=/dev/zero of="$BIG_F" bs=1M count=3 status=none
+check_cmd "3M file rejected (max-file-size=2M)" wait_quota_reject "max-file-size=2M" "$BIG_F" "$QS_DIR/too-big.bin"
+rm -f "$BIG_F"
+
+# file ≤ 2 MiB → accepted
+SM_F="$(mktemp)"
+dd if=/dev/zero of="$SM_F" bs=1M count=1 status=none
+set +e
+drive9 fs cp "$SM_F" ":$QS_DIR/within-limit.bin" >/dev/null 2>&1
+cp_1m_rc=$?
+set -e
+check_eq "1M file accepted (max-file-size=2M)" "$cp_1m_rc" "0"
+rm -f "$SM_F"
+
+drive9_retry fs rm -r "$QS_DIR" >/dev/null
+# wait for deletion and quota usage cache (250ms TTL) to settle
+sleep 3
+
+# ── [12] verify max-file-count enforcement ──────────────────────────────────
+
+echo "[12] verify max-file-count enforcement"
+
+FC_DIR="/admin-quota-fc-${TS}"
+drive9_retry fs mkdir "$FC_DIR" >/dev/null
+
+# Set a generous file-count limit so all 5 files are guaranteed to succeed
+set +e
+fc_set_json="$(drive9_ctx admin tenant set-quota \
+  --tenant-id "$TENANT_ID" \
+  --max-file-count 1000 \
+  $ADMIN_FLAGS --json 2>&1)"
+fc_set_rc=$?
+set -e
+check_eq "set-quota max-file-count=1000 exit 0" "$fc_set_rc" "0"
+check_eq "config.max_file_count=1000" "$(echo "$fc_set_json" | jq -r '.config.max_file_count')" "1000"
+
+set +e
+fc_count=0
+for i in $(seq 1 5); do
+  tf="$(mktemp)"
+  echo "fc-$i" > "$tf"
+  if drive9 fs cp "$tf" ":$FC_DIR/fc-${i}.txt" >/dev/null 2>&1; then
+    fc_count=$((fc_count + 1))
+  fi
+  rm -f "$tf"
+done
+set -e
+check_eq "5 files created under generous limit" "$fc_count" "5"
+
+# Lower max-file-count to 5 and verify the next file is rejected
+set +e
+fc_lo_json="$(drive9_ctx admin tenant set-quota \
+  --tenant-id "$TENANT_ID" \
+  --max-file-count 5 \
+  $ADMIN_FLAGS --json 2>&1)"
+fc_lo_rc=$?
+set -e
+check_eq "set-quota max-file-count=5 exit 0" "$fc_lo_rc" "0"
+check_eq "config.max_file_count=5" "$(echo "$fc_lo_json" | jq -r '.config.max_file_count')" "5"
+
+fc6_f="$(mktemp)"
+echo "fc-6" > "$fc6_f"
+check_cmd "excess file rejected (max-file-count=5 enforced)" wait_quota_reject "max-file-count=5" "$fc6_f" "$FC_DIR/fc-excess.txt"
+rm -f "$fc6_f"
+
+# ── [13] verify max-storage-size enforcement ────────────────────────────────
+
+echo "[13] verify max-storage-size enforcement"
+
+SS_DIR="/admin-quota-ss-${TS}"
+drive9_retry fs mkdir "$SS_DIR" >/dev/null
+
+# Set storage quota low (1 MiB), keep generous file-size/count
+set +e
+ss_set_json="$(drive9_ctx admin tenant set-quota \
+  --tenant-id "$TENANT_ID" \
+  --max-storage-size 1 \
+  --max-file-size 10240 \
+  --max-file-count 0 \
+  $ADMIN_FLAGS --json 2>&1)"
+ss_set_rc=$?
+set -e
+check_eq "set-quota max-storage-size=1 exit 0" "$ss_set_rc" "0"
+check_eq "config.max_storage_size=1" "$(echo "$ss_set_json" | jq -r '.config.max_storage_size')" "1"
+
+BIG2_F="$(mktemp)"
+dd if=/dev/zero of="$BIG2_F" bs=1M count=2 status=none
+check_cmd "2M file rejected (max-storage-size=1M)" wait_quota_reject "max-storage-size=1M" "$BIG2_F" "$SS_DIR/too-big-store.bin"
+rm -f "$BIG2_F"
+
+# clean up quota test directories
+drive9_retry fs rm -r "$FC_DIR" >/dev/null || true
+drive9_retry fs rm -r "$SS_DIR" >/dev/null || true
+
+# ── [14] admin tenant set-quota (reset) ─────────────────────────────────────
+
+echo "[14] admin tenant set-quota (reset to generous)"
+
+set +e
+reset_json="$(drive9_ctx admin tenant set-quota \
+  --tenant-id "$TENANT_ID" \
+  --max-storage-size 102400 \
+  --max-file-size 10240 \
+  --max-file-count 0 \
+  $ADMIN_FLAGS --json 2>&1)"
+reset_rc=$?
+set -e
+check_eq "admin set-quota reset exit 0" "$reset_rc" "0"
+check_eq "reset max_storage_size=102400" "$(echo "$reset_json" | jq -r '.config.max_storage_size')" "102400"
+check_eq "reset max_file_size=10240" "$(echo "$reset_json" | jq -r '.config.max_file_size')" "10240"
+check_eq "reset max_file_count=0 (unlimited)" "$(echo "$reset_json" | jq -r '.config.max_file_count')" "0"
+
+# ── [15] admin tenant create (with initial quotas) ──────────────────────────
+
+echo "[15] admin tenant create with initial quotas"
+
+set +e
+create_json="$(drive9_ctx admin tenant create \
+  --max-storage-size 500 \
+  --max-file-size 10 \
+  --max-file-count 100 \
+  --tidbcloud-spending-limit 1000 \
+  $ADMIN_FLAGS --json 2>&1)"
+create_rc=$?
+set -e
+check_eq "admin tenant create exit 0" "$create_rc" "0"
+
+ADMIN_TENANT_ID="$(echo "$create_json" | jq -r '.tenant_id // empty')"
+ADMIN_TENANT_KEY="$(echo "$create_json" | jq -r '.api_key // empty')"
+check_cmd "admin create returns tenant_id" test -n "$ADMIN_TENANT_ID"
+check_cmd "admin create returns api_key" test -n "$ADMIN_TENANT_KEY"
+CREATE_STATUS="$(echo "$create_json" | jq -r '.status // empty')"
+check_cmd "admin create status provisioning|active" bash -c "echo \"\$1\" | grep -qE 'provisioning|active'" _ "$CREATE_STATUS"
+ADMIN_CREATED=1
+
+# ── [16] admin tenant get (verify quotas on new tenant) ─────────────────────
+
+echo "[16] admin tenant get (verify initial quotas)"
+
+set +e
+get2_json="$(drive9_ctx admin tenant get --tenant-id "$ADMIN_TENANT_ID" $ADMIN_FLAGS --json 2>&1)"
+get2_rc=$?
+set -e
+check_eq "admin get new tenant exit 0" "$get2_rc" "0"
+check_eq "new tenant max_storage_size=500" "$(echo "$get2_json" | jq -r '.quota.config.max_storage_size')" "500"
+check_eq "new tenant max_file_size=10" "$(echo "$get2_json" | jq -r '.quota.config.max_file_size')" "10"
+check_eq "new tenant max_file_count=100" "$(echo "$get2_json" | jq -r '.quota.config.max_file_count')" "100"
+
+# ── [17] admin tenant delete ────────────────────────────────────────────────
+
+echo "[17] admin tenant delete (new tenant)"
+
+del_rc=1
+del_json=""
+for i in $(seq 1 3); do
+  set +e
+  del_json="$(drive9_ctx admin tenant delete --tenant-id "$ADMIN_TENANT_ID" $ADMIN_FLAGS --json 2>&1)"
+  del_rc=$?
+  set -e
+  if [ "$del_rc" -eq 0 ]; then break; fi
+  sleep 10
+done
+check_eq "admin tenant delete exit 0" "$del_rc" "0"
+del_status="$(echo "$del_json" | jq -r '.status // "unknown"')"
+check_cmd "admin delete status" bash -c "echo \"\$1\" | grep -qE 'deleted|deleting|unknown'" _ "$del_status"
+ADMIN_CREATED=0
+
+echo "[18] delete tenant"
 set +e
 delete_out="$(drive9_ctx delete \
   --server "$BASE" \
@@ -338,9 +591,9 @@ DELETE_STATUS="$(printf '%s' "$delete_out" | jq -r '.status // empty')"
 check_cmd "delete status is deleted or deleting" bash -c "echo \"\$1\" | grep -qE 'deleted|deleting'" _ "$DELETE_STATUS"
 CREATED=0
 
-# ── [5] verify tenant gone ──────────────────────────────────────────────────
+# ── [19] verify tenant gone ──────────────────────────────────────────────────
 
-echo "[7] verify tenant removed"
+echo "[19] verify tenant removed"
 vfile="$(mktemp)"
 vcode=$(curl -sS -o "$vfile" -w "%{http_code}" -H "Authorization: Bearer $API_KEY" "$BASE/v1/status")
 rm -f "$vfile"

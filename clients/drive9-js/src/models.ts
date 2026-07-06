@@ -4,6 +4,10 @@ export interface FileInfo {
   isDir: boolean;
   /** UTC epoch seconds from server; converted to Date by the client. */
   mtime?: Date;
+  /** POSIX mode bits (e.g. 0o120777 for a symlink). Absent on old servers. */
+  mode?: number;
+  /** True when the server returned a mode header/value. */
+  hasMode?: boolean;
 }
 
 export interface StatResult {

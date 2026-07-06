@@ -259,7 +259,7 @@ func (c *Client) archiveZip(ctx context.Context, root, archiveRoot string, w io.
 func (c *Client) collectArchiveTree(ctx context.Context, root, archiveRoot string, matcher pathfilter.Matcher, flat bool) (dirs []archiveEntry, files []archiveEntry, err error) {
 	dirs = append(dirs, archiveEntry{rel: "", remote: root, root: archiveRoot, mode: 0o755})
 	flatSeen := map[string]string{} // basename -> first rel that claimed it
-	err = c.walkRemoteTreeBFS(ctx, root, func(rel string, info FileInfo) error {
+	err = walkRemoteTreeBFS(ctx, c, root, func(rel string, info FileInfo) error {
 		if rel == "" {
 			return nil
 		}
@@ -315,45 +315,6 @@ func (c *Client) collectArchiveTree(ctx context.Context, root, archiveRoot strin
 		return nil
 	})
 	return dirs, files, err
-}
-
-// walkRemoteTreeBFS walks a remote directory tree breadth-first via ListCtx.
-// The visit callback may return the sentinel errArchiveSkipDir to indicate that
-// a directory's children should NOT be enqueued — this is how collectArchiveTree
-// prunes excluded subtrees at BFS time, avoiding extra ListCtx round-trips for
-// children that the matcher would drop anyway (e.g. node_modules/.git under
-// --profile coding-agent). Any other non-nil error aborts the walk.
-func (c *Client) walkRemoteTreeBFS(ctx context.Context, root string, visit func(rel string, info FileInfo) error) error {
-	queue := []string{""}
-	for len(queue) > 0 {
-		rel := queue[0]
-		queue = queue[1:]
-		absDir := root
-		if rel != "" {
-			absDir = joinArchiveRemote(root, rel)
-		}
-		entries, err := c.ListCtx(ctx, absDir)
-		if err != nil {
-			return fmt.Errorf("list %q: %w", absDir, err)
-		}
-		for _, e := range entries {
-			childRel := e.Name
-			if rel != "" {
-				childRel = rel + "/" + e.Name
-			}
-			if err := visit(childRel, e); err != nil {
-				if errors.Is(err, errArchiveSkipDir) {
-					// Visitor asked us not to descend into this directory.
-					continue
-				}
-				return err
-			}
-			if e.IsDir {
-				queue = append(queue, childRel)
-			}
-		}
-	}
-	return nil
 }
 
 // archiveParallel runs op for each entry with bounded concurrency. The first
