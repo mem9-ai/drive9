@@ -1006,12 +1006,15 @@ function joinLocalSafe(base: string, rel: string): string {
       throw new Drive9Error(`relative segment must not contain ..: ${rel}`);
     }
   }
-  const joined = path.join(base, rel);
+  // Resolve both sides to the same (absolute) coordinate system before
+  // the prefix check, so a relative base like "downloaded" works just as
+  // well as an absolute one like "/tmp/downloaded".
+  const joined = path.resolve(path.join(base, rel));
   const cleanBase = path.resolve(base);
   if (cleanBase !== "" && !joined.startsWith(cleanBase + path.sep) && joined !== cleanBase) {
     throw new Drive9Error(`computed path ${joined} escapes base ${base}`);
   }
-  return joined;
+  return path.join(base, rel);
 }
 
 // preflightLocalDestinations checks every local destination path with

@@ -126,8 +126,12 @@ export async function filesystemCookbook(client: Client): Promise<void> {
   await client.grep("hello", "/sdk-ts/", 10);
   await client.find("/sdk-ts/", { type: "file" });
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "drive9-cookbook-"));
-  await client.downloadDir("/sdk-ts/", tmpDir);
-  await client.removeAll("/sdk-ts/");
+  try {
+    await client.downloadDir("/sdk-ts/", tmpDir);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    await client.removeAll("/sdk-ts/");
+  }
 }
 
 export async function streamingCookbook(client: Client, data: Uint8Array): Promise<void> {

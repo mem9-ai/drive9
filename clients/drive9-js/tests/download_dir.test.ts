@@ -180,4 +180,30 @@ describe("downloadDir", () => {
     const dst = fs.mkdtempSync(path.join(os.tmpdir(), "d9-dl-"));
     await expect(client.downloadDir("/symtree", dst)).rejects.toThrow(/symlink/);
   });
+
+  it("works with a relative local destination path", async () => {
+    server.use(
+      http.head(`${BASE}/v1/fs/reltree`, statHandler(true)),
+      http.get(`${BASE}/v1/fs/reltree`, ({ request }) => {
+        const url = new URL(request.url);
+        if (url.searchParams.get("list") === "1") {
+          return HttpResponse.json({
+            entries: [{ name: "a.txt", size: 3, isDir: false }],
+          });
+        }
+        return new HttpResponse(null, { status: 404 });
+      }),
+      http.get(`${BASE}/v1/fs/reltree/a.txt`, fileBodyHandler("abc"))
+    );
+
+    // Use a relative destination directory (relative to process.cwd()).
+    const relDst = path.join("d9-relative-test-" + Date.now());
+    try {
+      const client = new Client(BASE, "test-key");
+      await client.downloadDir("/reltree", relDst);
+      expect(fs.readFileSync(path.join(relDst, "a.txt"), "utf8")).toBe("abc");
+    } finally {
+      fs.rmSync(relDst, { recursive: true, force: true });
+    }
+  });
 });

@@ -80,8 +80,8 @@ func run(ctx context.Context, c *client.Client, root string) error {
 
 	// 3. Verify the round-trip.
 	wantFiles := map[string]string{
-		filepath.Join(localDir, "top.txt"):              "top content",
-		filepath.Join(localDir, "sub", "nested.txt"):    "nested content",
+		filepath.Join(localDir, "top.txt"):                 "top content",
+		filepath.Join(localDir, "sub", "nested.txt"):       "nested content",
 		filepath.Join(localDir, "sub", "deep", "leaf.txt"): "leaf content",
 	}
 	for localPath, want := range wantFiles {

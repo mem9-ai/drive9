@@ -57,9 +57,9 @@ func TestDownloadDir_HappyPath(t *testing.T) {
 
 	// Verify files.
 	wantFiles := map[string]string{
-		filepath.Join(dst, "a.txt"):           "alpha",
-		filepath.Join(dst, "b.txt"):           "bravo",
-		filepath.Join(dst, "sub", "c.txt"):    "charlie",
+		filepath.Join(dst, "a.txt"):                "alpha",
+		filepath.Join(dst, "b.txt"):                "bravo",
+		filepath.Join(dst, "sub", "c.txt"):         "charlie",
 		filepath.Join(dst, "sub", "deep", "d.txt"): "delta",
 	}
 	for localPath, wantContent := range wantFiles {
