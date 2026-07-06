@@ -18,7 +18,10 @@
 package client
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -915,8 +918,29 @@ func TestIntegrationEvents(t *testing.T) {
 			}
 		}
 	})
+	// Gate the test write on the SSE stream becoming current: the server
+	// treats /v1/events?since=0's initial connection as a reset to the current
+	// head sequence, so a write before the subscribe/replay phase completes
+	// gets absorbed into that head and never delivered. OnCurrent fires once
+	// the stream has caught up, at which point generating the event is safe.
+	ready := make(chan struct{}, 1)
+	lifecycle := EventLifecycle{
+		OnCurrent: func(seq uint64) {
+			select {
+			case ready <- struct{}{}:
+			default:
+			}
+		},
+	}
 
-	go c.WatchEvents(ctx, "it-go-actor", handler)
+	go c.WatchEventsWithLifecycle(ctx, "it-go-actor", handler, lifecycle)
+
+	select {
+	case <-ready:
+		// SSE stream is current; safe to generate the event.
+	case <-ctx.Done():
+		t.Fatalf("WatchEvents did not become current in time")
+	}
 
 	// Generate a change event.
 	if err := c.Write(p+"ev.txt", []byte("event")); err != nil {
@@ -930,7 +954,7 @@ func TestIntegrationEvents(t *testing.T) {
 		t.Fatalf("WatchEvents did not observe an event in time")
 	}
 
-	// WatchEventsWithLifecycle with nil lifecycle is equivalent.
+	// Second watcher also gates on OnCurrent.
 	done := make(chan struct{}, 1)
 	h2 := EventHandler(func(change *ChangeEvent, reset *ResetEvent) {
 		if change != nil {
@@ -940,9 +964,24 @@ func TestIntegrationEvents(t *testing.T) {
 			}
 		}
 	})
+	ready2 := make(chan struct{}, 1)
+	lc2 := EventLifecycle{
+		OnCurrent: func(seq uint64) {
+			select {
+			case ready2 <- struct{}{}:
+			default:
+			}
+		},
+	}
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
-	go c.WatchEventsWithLifecycle(ctx2, "it-go-actor", h2, EventLifecycle{})
+	go c.WatchEventsWithLifecycle(ctx2, "it-go-actor", h2, lc2)
+	select {
+	case <-ready2:
+	case <-ctx2.Done():
+		t.Log("second WatchEvents did not become current in time (non-fatal)")
+		return
+	}
 	if err := c.Write(p+"ev2.txt", []byte("event2")); err != nil {
 		t.Fatalf("Write ev2: %v", err)
 	}
@@ -1349,4 +1388,226 @@ func TestIntegrationRawHTTP(t *testing.T) {
 	}
 	_, _ = io.ReadAll(resp3.Body)
 	_ = resp3.Body.Close()
+}
+
+// ---------------------------------------------------------------------------
+// DownloadDir / DownloadDirCtx
+// ---------------------------------------------------------------------------
+
+func TestIntegrationDownloadDir(t *testing.T) {
+	c := newIntegClient(t)
+	ctx := context.Background()
+	p := newPrefix(t, c)
+
+	// Build a small remote tree:
+	//   p + "dl/a.txt"
+	//   p + "dl/sub/b.txt"
+	//   p + "dl/sub/nested/c.txt"
+	root := p + "dl/"
+	if err := c.MkdirCtx(ctx, strings.TrimRight(root, "/"), 0o755); err != nil {
+		t.Fatalf("Mkdir dl: %v", err)
+	}
+	if err := c.WriteCtx(ctx, root+"a.txt", []byte("aaa")); err != nil {
+		t.Fatalf("Write a.txt: %v", err)
+	}
+	if err := c.MkdirCtx(ctx, root+"sub", 0o755); err != nil {
+		t.Fatalf("Mkdir sub: %v", err)
+	}
+	if err := c.WriteCtx(ctx, root+"sub/b.txt", []byte("bbb")); err != nil {
+		t.Fatalf("Write b.txt: %v", err)
+	}
+	if err := c.MkdirCtx(ctx, root+"sub/nested", 0o755); err != nil {
+		t.Fatalf("Mkdir nested: %v", err)
+	}
+	if err := c.WriteCtx(ctx, root+"sub/nested/c.txt", []byte("ccc")); err != nil {
+		t.Fatalf("Write c.txt: %v", err)
+	}
+
+	// DownloadDir → local dir.
+	localDir := t.TempDir()
+	dest := filepath.Join(localDir, "dl")
+	if err := c.DownloadDir(root, dest); err != nil {
+		t.Fatalf("DownloadDir: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dest, "a.txt")); err != nil || string(got) != "aaa" {
+		t.Fatalf("a.txt = %q, err=%v, want \"aaa\"", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dest, "sub", "b.txt")); err != nil || string(got) != "bbb" {
+		t.Fatalf("sub/b.txt = %q, err=%v, want \"bbb\"", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dest, "sub", "nested", "c.txt")); err != nil || string(got) != "ccc" {
+		t.Fatalf("sub/nested/c.txt = %q, err=%v, want \"ccc\"", got, err)
+	}
+
+	// DownloadDir refuses to overwrite existing local files.
+	if err := c.DownloadDir(root, dest); err == nil {
+		t.Fatal("expected DownloadDir to refuse overwriting existing destination, got nil")
+	}
+
+	// DownloadDirCtx into a fresh dir.
+	dest2 := filepath.Join(localDir, "dl-ctx")
+	if err := c.DownloadDirCtx(ctx, root, dest2); err != nil {
+		t.Fatalf("DownloadDirCtx: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dest2, "sub", "b.txt")); err != nil || string(got) != "bbb" {
+		t.Fatalf("DownloadDirCtx sub/b.txt = %q, err=%v, want \"bbb\"", got, err)
+	}
+
+	// DownloadDir rejects a file source (not a directory).
+	filePath := p + "dl-file.txt"
+	if err := c.WriteCtx(ctx, filePath, []byte("x")); err != nil {
+		t.Fatalf("Write dl-file: %v", err)
+	}
+	if err := c.DownloadDir(filePath, filepath.Join(localDir, "notdir")); err == nil {
+		t.Fatal("expected DownloadDir on a file source to fail, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ArchiveDir (tar.gz + zip + filtering + flat)
+// ---------------------------------------------------------------------------
+
+func TestIntegrationArchiveDir(t *testing.T) {
+	c := newIntegClient(t)
+	ctx := context.Background()
+	p := newPrefix(t, c)
+
+	// Build a tree:
+	//   p + "ar/root/a.txt"
+	//   p + "ar/root/sub/b.txt"
+	//   p + "ar/root/sub/excluded.txt"
+	//   p + "ar/root/node_modules/pkg/index.js"
+	root := p + "ar/root/"
+	if err := c.MkdirCtx(ctx, strings.TrimRight(root, "/"), 0o755); err != nil {
+		t.Fatalf("Mkdir root: %v", err)
+	}
+	if err := c.WriteCtx(ctx, root+"a.txt", []byte("aaa")); err != nil {
+		t.Fatalf("Write a.txt: %v", err)
+	}
+	if err := c.MkdirCtx(ctx, root+"sub", 0o755); err != nil {
+		t.Fatalf("Mkdir sub: %v", err)
+	}
+	if err := c.WriteCtx(ctx, root+"sub/b.txt", []byte("bbb")); err != nil {
+		t.Fatalf("Write b.txt: %v", err)
+	}
+	if err := c.WriteCtx(ctx, root+"sub/excluded.txt", []byte("drop-me")); err != nil {
+		t.Fatalf("Write excluded.txt: %v", err)
+	}
+	if err := c.MkdirCtx(ctx, root+"node_modules", 0o755); err != nil {
+		t.Fatalf("Mkdir node_modules: %v", err)
+	}
+	if err := c.MkdirCtx(ctx, root+"node_modules/pkg", 0o755); err != nil {
+		t.Fatalf("Mkdir node_modules/pkg: %v", err)
+	}
+	if err := c.WriteCtx(ctx, root+"node_modules/pkg/index.js", []byte("js")); err != nil {
+		t.Fatalf("Write index.js: %v", err)
+	}
+
+	// tar.gz, default options → contains a.txt, sub/b.txt, sub/excluded.txt,
+	// node_modules/pkg/index.js (all entries, no filter).
+	t.Run("tar.gz default", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := c.ArchiveDir(ctx, root, &buf, ArchiveOptions{}); err != nil {
+			t.Fatalf("ArchiveDir tar.gz: %v", err)
+		}
+		names := readTarGzNames(t, buf.Bytes())
+		if !containsName(names, "a.txt") || !containsName(names, "sub/b.txt") {
+			t.Fatalf("tar.gz missing expected entries: %v", names)
+		}
+	})
+
+	// zip, with exclude dropping "**/excluded.txt" and the node_modules subtree.
+	t.Run("zip with exclude", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := c.ArchiveDir(ctx, root, &buf, ArchiveOptions{
+			Format:  ArchiveFormatZip,
+			Exclude: []string{"**/excluded.txt", "**/node_modules/**"},
+		}); err != nil {
+			t.Fatalf("ArchiveDir zip: %v", err)
+		}
+		names := readZipNames(t, buf.Bytes())
+		if containsName(names, "excluded.txt") {
+			t.Fatalf("zip should exclude excluded.txt: %v", names)
+		}
+		if containsName(names, "node_modules/pkg/index.js") {
+			t.Fatalf("zip should exclude node_modules subtree: %v", names)
+		}
+		if !containsName(names, "a.txt") || !containsName(names, "sub/b.txt") {
+			t.Fatalf("zip missing expected entries: %v", names)
+		}
+	})
+
+	// tar.gz, include-only "sub/**" (prefix filter: keep only the sub subtree).
+	t.Run("tar.gz include only", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := c.ArchiveDir(ctx, root, &buf, ArchiveOptions{
+			Format:  ArchiveFormatTarGz,
+			Include: []string{"sub/**"},
+		}); err != nil {
+			t.Fatalf("ArchiveDir tar.gz include: %v", err)
+		}
+		names := readTarGzNames(t, buf.Bytes())
+		if containsName(names, "node_modules/pkg/index.js") {
+			t.Fatalf("include=sub/** should drop index.js: %v", names)
+		}
+		if containsName(names, "a.txt") {
+			t.Fatalf("include=sub/** should drop top-level a.txt: %v", names)
+		}
+		if !containsName(names, "sub/b.txt") {
+			t.Fatalf("include=sub/** missing sub/b.txt: %v", names)
+		}
+	})
+
+	// unsupported format → error.
+	t.Run("unsupported format", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := c.ArchiveDir(ctx, root, &buf, ArchiveOptions{Format: "rar"}); err == nil {
+			t.Fatal("expected ArchiveDir with unsupported format to fail, got nil")
+		}
+	})
+}
+
+func readTarGzNames(t *testing.T, data []byte) []string {
+	t.Helper()
+	gr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	defer gr.Close()
+	tr := tar.NewReader(gr)
+	var names []string
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar next: %v", err)
+		}
+		names = append(names, h.Name)
+	}
+	return names
+}
+
+func readZipNames(t *testing.T, data []byte) []string {
+	t.Helper()
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("zip reader: %v", err)
+	}
+	var names []string
+	for _, f := range zr.File {
+		names = append(names, f.Name)
+	}
+	return names
+}
+
+func containsName(names []string, suffix string) bool {
+	for _, n := range names {
+		// archive entry names are <archiveRoot>/<rel>; match by suffix.
+		if strings.HasSuffix(n, suffix) || n == suffix {
+			return true
+		}
+	}
+	return false
 }

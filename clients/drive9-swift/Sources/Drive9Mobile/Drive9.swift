@@ -169,13 +169,18 @@ public final class Drive9Client: @unchecked Sendable {
             let response = try await send(request)
             // When the file is inline (small) the server may return the whole
             // body with status 200 instead of a 206 partial. In that case slice
-            // the requested range out of the full body locally.
+            // the requested range out of the full body locally. Always honor a
+            // nonzero offset; if offset is past EOF, return empty (matching the
+            // 416 path semantics).
             var data = response.data
-            if response.http.statusCode == 200, data.count > Int(length) {
-                let start = Int(offset)
-                let end = min(start + Int(length), data.count)
+            if response.http.statusCode == 200 {
+                let total = data.count
+                let start = min(Int(offset), total)
+                let end = min(start + Int(length), total)
                 if start < end {
                     data = data.subdata(in: start..<end)
+                } else {
+                    data = Data()
                 }
             }
             return Drive9DownloadAsyncSequence(chunks: splitChunks(data), cancel: cancel)

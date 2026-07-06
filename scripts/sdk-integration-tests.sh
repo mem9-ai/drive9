@@ -115,10 +115,9 @@ wait_for_http() {
 }
 
 wait_for_mysql() {
-  local host="$1" port="$2" tries="${3:-90}"
+  local cid="$1" tries="${2:-90}"
   for _ in $(seq 1 "$tries"); do
-    if docker run --rm --network host mysql:8.0 \
-         mysqladmin ping -h "$host" -P "$port" -u root -p"$MYSQL_ROOT_PASSWORD" \
+    if docker exec "$cid" mysqladmin ping -h 127.0.0.1 -u root -p"$MYSQL_ROOT_PASSWORD" \
          --silent 2>/dev/null; then
       return 0
     fi
@@ -197,12 +196,12 @@ bootstrap_db() {
   fi
   MYSQL_CID="$(docker run -d --rm \
     --name "$MYSQL_CONTAINER_NAME" \
-    -p "${MYSQL_CONTAINER_PORT}:3306" \
+    -p "127.0.0.1:${MYSQL_CONTAINER_PORT}:3306" \
     -e MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PASSWORD" \
     -e MYSQL_DATABASE="$MYSQL_DB" \
     mysql:8.0)"
   echo "mysql container: $MYSQL_CID"
-  if ! wait_for_mysql 127.0.0.1 "$MYSQL_CONTAINER_PORT" 90; then
+  if ! wait_for_mysql "$MYSQL_CID" 90; then
     echo "mysql did not become ready in time" >&2
     docker logs "$MYSQL_CID" | tail -30 >&2 || true
     exit 1

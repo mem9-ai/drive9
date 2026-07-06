@@ -16,11 +16,52 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as zlib from "node:zlib";
+import { execSync } from "node:child_process";
 import { Client, StreamWriter, ConflictError } from "../src/index.js";
 
 const ENABLED = !!process.env.DRIVE9_INTEGRATION;
 const BASE = (process.env.DRIVE9_SERVER ?? "http://127.0.0.1:9009").replace(/\/$/, "");
 const API_KEY = process.env.DRIVE9_API_KEY ?? "local-dev-key";
+
+// Minimal ustar reader: returns entry names (dirs get trailing slash).
+function listTarGzNames(buf: Buffer): string[] {
+  const decompressed = zlib.gunzipSync(buf);
+  const names: string[] = [];
+  let offset = 0;
+  while (offset + 512 <= decompressed.length) {
+    const header = decompressed.subarray(offset, offset + 512);
+    let allZero = true;
+    for (let i = 0; i < 512; i++) {
+      if (header[i] !== 0) { allZero = false; break; }
+    }
+    if (allZero) break;
+    const name = header.subarray(0, 100).toString("utf8").replace(/\0+$/, "");
+    const typeflag = String.fromCharCode(header[156]);
+    const sizeStr = header.subarray(124, 136).toString("utf8").replace(/\0+$/, "").trim();
+    const size = parseInt(sizeStr, 8) || 0;
+    names.push(typeflag === "5" ? name.replace(/\/?$/, "/") : name);
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  return names.sort();
+}
+
+// List zip entries via python3 (no native zip dep in the test env).
+// python's zipfile needs a seekable file, so write the buffer to a temp file.
+function listZipNames(buf: Buffer): string[] {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "drive9-ts-zip-"));
+  const zipPath = path.join(tmp, "out.zip");
+  try {
+    fs.writeFileSync(zipPath, buf);
+    const out = execSync(
+      `python3 -c 'import zipfile,sys; print("\\n".join(sorted(zipfile.ZipFile(sys.argv[1]).namelist())))' ${zipPath}`,
+      { encoding: "utf8" }
+    );
+    return out.trim().split("\n").filter(Boolean);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
 
 function makeClient(): Client {
   // defaultClient() reads DRIVE9_SERVER / DRIVE9_API_KEY / ~/.drive9/config.
@@ -439,17 +480,19 @@ describeIntegration("TypeScript SDK integration", () => {
     const enc = new TextEncoder();
     const ctrl = new AbortController();
     let seen = false;
+    // Pass the abort signal into watchEvents so ctrl.abort() actually stops
+    // the SSE loop (otherwise the watcher keeps reconnecting after the test).
     const promise = c.watchEvents("it-ts-actor", (change, reset) => {
       if (change && change.path.startsWith(prefix)) {
         seen = true;
         ctrl.abort();
       }
-    });
+    }, { signal: ctrl.signal });
     // give the SSE connection a moment to establish before writing
     await new Promise((r) => setTimeout(r, 500));
     // generate an event
     await c.write(prefix + "ev.txt", enc.encode("event"));
-    // wait up to 12s for the event
+    // wait up to 12s for the event / abort
     const timeout = new Promise((resolve) => setTimeout(resolve, 12000));
     await Promise.race([promise.catch(() => {}), timeout]);
     ctrl.abort();
@@ -650,5 +693,92 @@ describeIntegration("TypeScript SDK integration", () => {
     const resp2 = await c.rawDelete(`/v1/fs${file}`);
     expect(resp2.status).toBeLessThan(300);
     await resp2.text();
+  });
+
+  // ---------------------------------------------------------------------------
+  // downloadDir
+  // ---------------------------------------------------------------------------
+
+  it("downloadDir downloads a remote tree to a local dir", async () => {
+    const c = makeClient();
+    const enc = new TextEncoder();
+    const root = prefix + "dl/";
+    await c.mkdir(root.replace(/\/$/, ""));
+    await c.write(root + "a.txt", enc.encode("aaa"));
+    await c.mkdir(root + "sub");
+    await c.write(root + "sub/b.txt", enc.encode("bbb"));
+    await c.mkdir(root + "sub/nested");
+    await c.write(root + "sub/nested/c.txt", enc.encode("ccc"));
+
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "drive9-ts-dd-"));
+    const dest = path.join(tmp, "dl");
+    await c.downloadDir(root, dest);
+    expect(fs.readFileSync(path.join(dest, "a.txt"), "utf8")).toBe("aaa");
+    expect(fs.readFileSync(path.join(dest, "sub", "b.txt"), "utf8")).toBe("bbb");
+    expect(fs.readFileSync(path.join(dest, "sub", "nested", "c.txt"), "utf8")).toBe("ccc");
+
+    // downloadDir refuses to overwrite an existing destination.
+    await expect(c.downloadDir(root, dest)).rejects.toThrow();
+
+    // downloadDir rejects a file source (not a directory).
+    const fileSrc = prefix + "dl-file.txt";
+    await c.write(fileSrc, enc.encode("x"));
+    await expect(c.downloadDir(fileSrc, path.join(tmp, "notdir"))).rejects.toThrow();
+
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // ---------------------------------------------------------------------------
+  // archive / archiveToFile
+  // ---------------------------------------------------------------------------
+
+  it("archive + archiveToFile (tar.gz + zip + exclude)", async () => {
+    const c = makeClient();
+    const enc = new TextEncoder();
+    const root = prefix + "ar/";
+    await c.mkdir(root.replace(/\/$/, ""));
+    await c.write(root + "a.txt", enc.encode("aaa"));
+    await c.mkdir(root + "sub");
+    await c.write(root + "sub/b.txt", enc.encode("bbb"));
+    await c.write(root + "sub/excluded.txt", enc.encode("drop-me"));
+    await c.mkdir(root + "node_modules");
+    await c.mkdir(root + "node_modules/pkg");
+    await c.write(root + "node_modules/pkg/index.js", enc.encode("js"));
+
+    // archive() returns a streaming tar.gz; collect it and inspect entries.
+    const stream = await c.archive(root);
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream as any) {
+      chunks.push(Buffer.from(chunk));
+    }
+    const tarGz = Buffer.concat(chunks);
+    const tarNames = listTarGzNames(tarGz);
+    expect(tarNames.some((n) => n.endsWith("a.txt"))).toBe(true);
+    expect(tarNames.some((n) => n.endsWith("sub/b.txt"))).toBe(true);
+
+    // archiveToFile zip with exclude dropping "**/excluded.txt" and node_modules.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "drive9-ts-ar-"));
+    const zipPath = path.join(tmp, "out.zip");
+    await c.archiveToFile(root, zipPath, {
+      format: "zip",
+      exclude: ["**/excluded.txt", "**/node_modules/**"],
+    });
+    const zipBuf = fs.readFileSync(zipPath);
+    const zipNames = listZipNames(zipBuf);
+    expect(zipNames.some((n) => n.endsWith("excluded.txt"))).toBe(false);
+    expect(zipNames.some((n) => n.includes("node_modules"))).toBe(false);
+    expect(zipNames.some((n) => n.endsWith("a.txt"))).toBe(true);
+    expect(zipNames.some((n) => n.endsWith("sub/b.txt"))).toBe(true);
+
+    // archiveToFile default tar.gz with include-only "sub/**" (prefix filter:
+    // keep only the sub subtree).
+    const tarGzPath = path.join(tmp, "out.tar.gz");
+    await c.archiveToFile(root, tarGzPath, { include: ["sub/**"] });
+    const incNames = listTarGzNames(fs.readFileSync(tarGzPath));
+    expect(incNames.some((n) => n.endsWith("node_modules/pkg/index.js"))).toBe(false);
+    expect(incNames.some((n) => n.endsWith("a.txt"))).toBe(false);
+    expect(incNames.some((n) => n.endsWith("sub/b.txt"))).toBe(true);
+
+    fs.rmSync(tmp, { recursive: true, force: true });
   });
 });

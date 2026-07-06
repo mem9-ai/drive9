@@ -124,9 +124,12 @@ e2e-local:
 # (Go, TypeScript, Rust, Python, Kotlin, Swift). Boots a disposable Docker MySQL
 # container, starts drive9-server-local, points each SDK at it via
 # DRIVE9_SERVER/DRIVE9_API_KEY, runs every suite, and tears it all down.
-# Pass extra args through to the runner, e.g.:
-#   make sdk-integration-tests -- --only go,ts
-#   make sdk-integration-tests -- --keep-server
+# Pass extra args through to the runner via SDK_INTEGRATION_ARGS, e.g.:
+#   make sdk-integration-tests
+#   make sdk-integration-tests SDK_INTEGRATION_ARGS="--only go,ts"
+#   make sdk-integration-tests SDK_INTEGRATION_ARGS="--keep-server"
+# (GNU make treats tokens after `--` as goals, so forward args through the
+#  SDK_INTEGRATION_ARGS variable rather than `make ... -- ...`.)
 sdk-integration-tests:
 	bash scripts/sdk-integration-tests.sh $(SDK_INTEGRATION_ARGS)
 

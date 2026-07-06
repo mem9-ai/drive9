@@ -64,7 +64,11 @@ final class Drive9IntegrationTests: XCTestCase {
     }
 
     private func cleanup(prefix: String) async {
-        let url = "\(base)/v1/fs\(prefix.trimmingCharacters(in: CharacterSet(charactersIn: "/")))?recursive=1"
+        // prefix looks like "/it-swift-.../"; strip only the trailing slash so
+        // the DELETE targets /v1/fs/it-swift-... (not /v1/fsit-swift-...).
+        var path = prefix
+        while path.hasSuffix("/") { path.removeLast() }
+        let url = "\(base)/v1/fs\(path)?recursive=1"
         guard let u = URL(string: url) else { return }
         var req = URLRequest(url: u)
         req.httpMethod = "DELETE"
@@ -230,7 +234,9 @@ final class Drive9IntegrationTests: XCTestCase {
         XCTAssertEqual(collected, Data("hello world".utf8))
 
         // downloadRangeStream — keep the file below the inline threshold so a
-        // single PUT succeeds.
+        // single PUT succeeds. Assert the actual slice content (not just the
+        // length) to catch the inline-200 fallback returning the full body or
+        // starting from byte 0.
         let bigRemote = p + "big.bin"
         let big = Data((0..<10_000).map { UInt8($0 & 0xFF) })
         try await c.write(path: bigRemote, data: big)
@@ -238,7 +244,25 @@ final class Drive9IntegrationTests: XCTestCase {
         var rangeCollected = Data()
         var rit = rangeSeq.makeAsyncIterator()
         while let chunk = try await rit.next() { rangeCollected.append(chunk) }
-        XCTAssertEqual(rangeCollected.count, 10)
+        XCTAssertEqual(rangeCollected, Data((5..<15).map { UInt8($0 & 0xFF) }))
+
+        // nonzero offset on a short inline file where length extends past EOF —
+        // must return only bytes [offset..<EOF], not the full body from 0.
+        let smallRemote = p + "small.bin"
+        let smallBody = Data("abcdefghij".utf8) // 10 bytes
+        try await c.write(path: smallRemote, data: smallBody)
+        let tailSeq = try await c.downloadRangeStream(remotePath: smallRemote, offset: 8, length: 10)
+        var tailCollected = Data()
+        var tit = tailSeq.makeAsyncIterator()
+        while let chunk = try await tit.next() { tailCollected.append(chunk) }
+        XCTAssertEqual(tailCollected, Data("ij".utf8))
+
+        // offset past EOF → empty result (not the whole body).
+        let pastSeq = try await c.downloadRangeStream(remotePath: smallRemote, offset: 100, length: 10)
+        var pastCollected = Data()
+        var pit = pastSeq.makeAsyncIterator()
+        while let chunk = try await pit.next() { pastCollected.append(chunk) }
+        XCTAssertTrue(pastCollected.isEmpty)
     }
 
     // MARK: - newStreamUpload + Drive9StreamUpload

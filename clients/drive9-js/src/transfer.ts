@@ -60,7 +60,8 @@ async function streamToUint8Array(stream: ReadableStream<Uint8Array>, size: numb
 }
 
 export async function readStreamImpl(client: Client, path: string): Promise<ReadableStream<Uint8Array>> {
-  const resp = await fetch(client.fsUrl(path), {
+  const baseUrl = client.fsUrl(path);
+  const resp = await fetch(baseUrl, {
     method: "GET",
     headers: client["authHeaders"](),
     redirect: "manual",
@@ -69,7 +70,11 @@ export async function readStreamImpl(client: Client, path: string): Promise<Read
   if (status === 302 || status === 307) {
     const location = resp.headers.get("location") || resp.headers.get("Location");
     if (!location) throw new Drive9Error("302 without Location header");
-    const resp2 = await fetch(location, { method: "GET" });
+    // The server may return a relative Location (e.g. the local S3 mock's
+    // /s3/... path). fetch requires an absolute URL, so resolve it against
+    // the original request URL.
+    const absLocation = new URL(location, baseUrl).toString();
+    const resp2 = await fetch(absLocation, { method: "GET" });
     await checkError(resp2);
     if (!resp2.body) throw new Drive9Error("empty response body");
     return resp2.body;
