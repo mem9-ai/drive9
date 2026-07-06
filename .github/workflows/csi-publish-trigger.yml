@@ -1,0 +1,78 @@
+name: Publish CSI image (drive9-ai/k8s-csi)
+
+# Dispatches drive9-ai/k8s-csi's `publish-image.yml` to build the drive9-csi
+# container image pinned to a specific drive9 commit. Runs in parallel with
+# `prod-cd` (invoked as a reusable workflow) and can also be triggered
+# manually from the Actions UI.
+#
+# Requires repo secret `CSI_DISPATCH_TOKEN`: a PAT with `actions:write` on
+# `drive9-ai/k8s-csi` (fine-grained PAT recommended). The default
+# `GITHUB_TOKEN` cannot dispatch workflows in a different repository.
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive9_ref:
+        description: "drive9 commit SHA to bake into the CSI image (default: this workflow's commit)"
+        required: false
+        type: string
+      csi_ref:
+        description: "k8s-csi ref to build from (default: main)"
+        required: false
+        type: string
+        default: main
+  workflow_call:
+    inputs:
+      drive9_ref:
+        description: "drive9 commit SHA to bake into the CSI image"
+        required: true
+        type: string
+      csi_ref:
+        description: "k8s-csi ref to build from"
+        required: false
+        type: string
+        default: main
+    secrets:
+      CSI_DISPATCH_TOKEN:
+        required: true
+
+jobs:
+  dispatch:
+    name: Dispatch k8s-csi publish-image workflow
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve drive9 ref
+        id: resolve
+        env:
+          INPUT_DRIVE9_REF: ${{ inputs.drive9_ref }}
+          FALLBACK_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          REF="${INPUT_DRIVE9_REF:-$FALLBACK_SHA}"
+          case "$REF" in
+            *[![:alnum:]_.-]*)
+              echo "Invalid drive9_ref: $REF" >&2
+              exit 1
+              ;;
+          esac
+          printf 'drive9_ref=%s\n' "$REF" >> "$GITHUB_OUTPUT"
+          printf 'Dispatching k8s-csi build for drive9 ref: %s\n' "$REF"
+
+      - name: Trigger drive9-ai/k8s-csi publish-image.yml
+        env:
+          GH_TOKEN: ${{ secrets.CSI_DISPATCH_TOKEN }}
+          DRIVE9_REF: ${{ steps.resolve.outputs.drive9_ref }}
+          CSI_REF: ${{ inputs.csi_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "CSI_DISPATCH_TOKEN secret is not set on this repository." >&2
+            echo "Create a PAT with actions:write on drive9-ai/k8s-csi and add it as CSI_DISPATCH_TOKEN." >&2
+            exit 1
+          fi
+          gh workflow run publish-image.yml \
+            --repo drive9-ai/k8s-csi \
+            --ref "$CSI_REF" \
+            -f drive9_ref="$DRIVE9_REF"
+          echo "Dispatched drive9-ai/k8s-csi publish-image.yml (csi ref: $CSI_REF, drive9_ref: $DRIVE9_REF)"
+          echo "Watch: https://github.com/drive9-ai/k8s-csi/actions/workflows/publish-image.yml"

@@ -262,3 +262,79 @@ jobs:
             kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
               rollout undo deployment/drive9-server
           fi
+
+  resolve-drive9-sha:
+    # Resolves the drive9 short SHA from the image tag being promoted, so the
+    # csi-publish job can dispatch a matching k8s-csi build in parallel with
+    # the deploy job. Kept independent of `deploy` so both run concurrently.
+    name: Resolve drive9 SHA for CSI build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      drive9_sha: ${{ steps.resolve.outputs.drive9_sha }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ASSUME_ARN_PROD }}
+          aws-region: ap-southeast-1
+
+      - name: Update kubeconfig for dev
+        run: |
+          aws eks update-kubeconfig \
+            --name dev-dat9 \
+            --region ap-southeast-1 \
+            --alias dev
+
+      - name: Resolve drive9 short SHA from image tag
+        id: resolve
+        run: |
+          set -euo pipefail
+          INPUT_TAG='${{ inputs.image_tag }}'
+          if [ -n "$INPUT_TAG" ]; then
+            case "$INPUT_TAG" in
+              *[![:alnum:]_.-]*)
+                echo "Invalid image tag override" >&2
+                exit 1
+                ;;
+            esac
+            TAG="$INPUT_TAG"
+          else
+            IMAGE=$(kubectl --context dev -n "${{ env.DEPLOY_NAMESPACE }}" \
+              get "deployment/${{ env.K8S_DEPLOYMENT }}" \
+              -o 'jsonpath={.spec.template.spec.containers[?(@.name=="dat9-server")].image}')
+            if [ -z "$IMAGE" ]; then
+              echo "Failed to resolve image from dev" >&2
+              exit 1
+            fi
+            TAG="${IMAGE##*:}"
+          fi
+          # dev-cd tags images as `<branch>-<sha7>`; extract the trailing SHA.
+          SHA="${TAG##*-}"
+          if [ -z "$SHA" ] || [ "${#SHA}" -lt 7 ]; then
+            echo "Could not extract drive9 short SHA from tag: $TAG" >&2
+            exit 1
+          fi
+          case "$SHA" in
+            *[![:alnum:]]*)
+              echo "Extracted SHA has unexpected characters: $SHA" >&2
+              exit 1
+              ;;
+          esac
+          printf 'Resolved drive9 short SHA: %s (from tag %s)\n' "$SHA" "$TAG"
+          printf 'drive9_sha=%s\n' "$SHA" >> "$GITHUB_OUTPUT"
+
+  csi-publish:
+    # Dispatches drive9-ai/k8s-csi's publish-image.yml to build a drive9-csi
+    # image pinned to the drive9 commit currently being promoted to prod.
+    # Runs in parallel with `deploy` — a failed prod rollout does not cancel
+    # the CSI build (and vice versa).
+    name: Publish drive9-csi image
+    needs: resolve-drive9-sha
+    uses: ./.github/workflows/csi-publish-trigger.yml
+    with:
+      drive9_ref: ${{ needs.resolve-drive9-sha.outputs.drive9_sha }}
+    secrets:
+      CSI_DISPATCH_TOKEN: ${{ secrets.CSI_DISPATCH_TOKEN }}
