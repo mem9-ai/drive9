@@ -112,7 +112,7 @@ class Drive9SqliteBlackbox(Drive9WorkflowBase):
             conn.execute("BEGIN")
             conn.executemany(
                 "INSERT INTO counter(n) VALUES (?)",
-                [(1000 + idx) for idx in range(COUNTER_ROLLBACK_ROWS)],
+                [(1000 + idx,) for idx in range(COUNTER_ROLLBACK_ROWS)],
             )
             conn.execute("ROLLBACK")
 
