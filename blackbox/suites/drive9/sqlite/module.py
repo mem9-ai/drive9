@@ -56,7 +56,10 @@ class Drive9SqliteBlackbox(Drive9WorkflowBase):
     def _create_and_populate(self, ctx: Context, db_path: Any) -> dict[str, Any]:
         """Create test.db on the FUSE mount, enable WAL, run the SQL workload,
         and return the expected state captured before unmount."""
-        conn = sqlite3.connect(str(db_path))
+        # isolation_level=None puts the connection in autocommit mode so we
+        # can issue explicit BEGIN/COMMIT/ROLLBACK for the transaction tests
+        # without colliding with Python sqlite3's implicit transactions.
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
         try:
             # Enable WAL and confirm it sticks.
             mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
@@ -135,7 +138,7 @@ class Drive9SqliteBlackbox(Drive9WorkflowBase):
 
     def _verify(self, ctx: Context, db_path: Any, expected: dict[str, Any]) -> None:
         """Re-open the DB after remount and assert the state matches phase 1."""
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
         try:
             mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
             if mode != "wal":
