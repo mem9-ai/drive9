@@ -8373,6 +8373,18 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 		dh.Entries = entries
 	}
 
+	// POSIX readdir yields "." and ".." before the real entries. go-fuse's raw
+	// layer does not synthesize them (only nodefs does), so emit them here at
+	// the first page (offset 0). Pagination offsets for real entries start at
+	// len(synthetic)+1 so subsequent pages skip this block.
+	if input.Offset == 0 {
+		for _, e := range fs.dotDotEntries(dh) {
+			if !out.AddDirEntry(e) {
+				return gofuse.OK
+			}
+		}
+	}
+
 	for i := int(input.Offset); i < len(dh.Entries); i++ {
 		e := dh.Entries[i]
 		if !validDirEntryName(e.Name) {
@@ -8408,6 +8420,23 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 			return listDirErrToFuseStatus(err)
 		}
 		dh.Entries = entries
+	}
+
+	// POSIX "." / ".." entries on the first page (see ReadDir).
+	if input.Offset == 0 {
+		for _, e := range fs.dotDotEntries(dh) {
+			entryOut := out.AddDirLookupEntry(e)
+			if entryOut == nil {
+				return gofuse.OK
+			}
+			// Do not increment the lookup count for synthetic "." / "..":
+			// they share the directory / parent inode and must not pin extra
+			// kernel references. Fill attrs opportunistically when the entry
+			// exists so getdents see correct mode/size.
+			if inoEntry, found := fs.inodes.GetEntry(e.Ino); found {
+				fs.fillEntryOut(inoEntry, entryOut)
+			}
+		}
 	}
 
 	for i := int(input.Offset); i < len(dh.Entries); i++ {
@@ -8974,6 +9003,40 @@ func validDirEntryName(name string) bool {
 		name != ".." &&
 		!strings.ContainsRune(name, '/') &&
 		!strings.ContainsRune(name, 0)
+}
+
+// dotDotEntries returns the synthetic POSIX "." and ".." directory entries for
+// a directory handle. "." references the directory itself; ".." references the
+// parent directory (the root is its own parent). They use offset values 1 and
+// 2 so they sort before real entries and are only emitted on the first readdir
+// page (input.Offset == 0), keeping pagination stable. The inodes are resolved
+// best-effort: when unknown, go-fuse serializes Ino=0 as FUSE_UNKNOWN_INO,
+// which the kernel accepts for "." / ".." without a lookup refcount.
+func (fs *Dat9FS) dotDotEntries(dh *DirHandle) []gofuse.DirEntry {
+	dirMode := uint32(syscall.S_IFDIR) | 0o755
+	entries := make([]gofuse.DirEntry, 0, 2)
+	entries = append(entries, gofuse.DirEntry{Name: ".", Ino: dh.Ino, Mode: dirMode, Off: 1})
+	parentIno := fs.parentDirIno(dh.Path)
+	entries = append(entries, gofuse.DirEntry{Name: "..", Ino: parentIno, Mode: dirMode, Off: 2})
+	return entries
+}
+
+// parentDirIno returns the inode of a directory's parent, or 0 (FUSE_UNKNOWN_INO)
+// when the parent is not currently known. The root directory is its own parent.
+func (fs *Dat9FS) parentDirIno(dirPath string) uint64 {
+	parentPath := pathutil.ParentPath(dirPath)
+	if parentPath == dirPath {
+		// Root: parent is itself.
+		return fs.inodeOrZero(dirPath)
+	}
+	return fs.inodeOrZero(parentPath)
+}
+
+func (fs *Dat9FS) inodeOrZero(p string) uint64 {
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		return ino
+	}
+	return 0
 }
 
 func dirEntryChildPath(dirPath, name string) string {

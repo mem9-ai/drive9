@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,11 +23,23 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/s3client"
 )
+
+var nativeEndian = func() binary.ByteOrder {
+	// Detect host endianness so the dirent wire-format parser in tests
+	// matches the platform go-fuse serialized the buffer with.
+	var probe uint16 = 1
+	b := (*[2]byte)(unsafe.Pointer(&probe))
+	if b[0] == 1 {
+		return binary.LittleEndian
+	}
+	return binary.BigEndian
+}()
 
 type testErrorRecorder struct {
 	mu  sync.Mutex
@@ -6224,6 +6237,144 @@ func TestLookupNegativeStormOversizedListingCoolsDown(t *testing.T) {
 	if got := headCalls.Load(); got != 10 {
 		t.Fatalf("HEAD calls = %d, want 10", got)
 	}
+}
+
+// TestReadDirEmitsDotAndDotDot verifies that readdir on a Drive9 directory
+// yields the POSIX "." and ".." entries before the real children (LTP
+// getdents01 asserts their presence). The entries must carry S_IFDIR and
+// reference the directory itself / its parent, and must not be repeated on
+// later readdir pages (offset > 0).
+func TestReadDirEmitsDotAndDotDot(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	dirIno := fs.inodes.Lookup("/parent/dir", true, 0, time.Now())
+	parentIno := fs.inodes.Lookup("/parent/", true, 0, time.Now())
+
+	dh := &DirHandle{
+		Ino:  dirIno,
+		Path: "/parent/dir",
+		Entries: []DirEntry{{
+			Name: "file.txt",
+			Ino:  fs.inodes.Lookup("/parent/dir/file.txt", false, 9, time.Now()),
+			Mode: uint32(syscall.S_IFREG) | 0o644,
+		}},
+	}
+	fh := fs.dirHandles.Allocate(dh)
+
+	// First page (offset 0) must contain ".", "..", then "file.txt".
+	buf := make([]byte, 4096)
+	out := gofuse.NewDirEntryList(buf, 0)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, out); st != gofuse.OK {
+		t.Fatalf("ReadDir status = %v, want OK", st)
+	}
+	names := parseDirEntryNames(t, out)
+	if len(names) != 3 || names[0] != "." || names[1] != ".." || names[2] != "file.txt" {
+		t.Fatalf("readdir first page = %v, want [. .. file.txt]", names)
+	}
+
+	// A second call with offset past the synthetic entries must not repeat them.
+	out2 := gofuse.NewDirEntryList(make([]byte, 4096), 1)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Offset:   1,
+		Size:     4096,
+	}, out2); st != gofuse.OK {
+		t.Fatalf("ReadDir page 2 status = %v, want OK", st)
+	}
+	page2 := parseDirEntryNames(t, out2)
+	for _, n := range page2 {
+		if n == "." || n == ".." {
+			t.Fatalf("readdir page 2 repeated synthetic entry %q; got %v", n, page2)
+		}
+	}
+
+	// dotDotEntries must reference the directory itself and its parent.
+	dots := fs.dotDotEntries(dh)
+	if len(dots) != 2 || dots[0].Name != "." || dots[1].Name != ".." {
+		t.Fatalf("dotDotEntries = %v, want [. ..]", dots)
+	}
+	if dots[0].Ino != dirIno {
+		t.Fatalf("dotDotEntries '.' ino = %d, want dir ino %d", dots[0].Ino, dirIno)
+	}
+	if dots[1].Ino != parentIno {
+		t.Fatalf("dotDotEntries '..' ino = %d, want parent ino %d", dots[1].Ino, parentIno)
+	}
+	for _, e := range dots {
+		if e.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFDIR) {
+			t.Fatalf("dotDotEntries %q mode = %o, want S_IFDIR", e.Name, e.Mode)
+		}
+	}
+}
+
+// TestReadDirEmitsDotAndDotDotAtRoot verifies ".." at the root resolves to the
+// root inode itself rather than a missing parent.
+func TestReadDirEmitsDotAndDotDotAtRoot(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	rootIno := fs.inodes.Lookup("/", true, 0, time.Now())
+	dh := &DirHandle{Ino: rootIno, Path: "/", Entries: nil}
+	// Populate Entries directly to avoid a remote listDir round-trip.
+	dh.Entries = []DirEntry{{
+		Name: "child",
+		Ino:  fs.inodes.Lookup("/child", false, 0, time.Now()),
+		Mode: uint32(syscall.S_IFREG) | 0o644,
+	}}
+	fh := fs.dirHandles.Allocate(dh)
+
+	out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: rootIno},
+		Fh:       fh,
+		Offset:   0,
+		Size:     4096,
+	}, out); st != gofuse.OK {
+		t.Fatalf("ReadDir status = %v, want OK", st)
+	}
+	names := parseDirEntryNames(t, out)
+	if len(names) != 3 || names[0] != "." || names[1] != ".." || names[2] != "child" {
+		t.Fatalf("root readdir first page = %v, want [. .. child]", names)
+	}
+	dots := fs.dotDotEntries(dh)
+	if dots[1].Ino != rootIno {
+		t.Fatalf("root '..' ino = %d, want root ino %d (root is its own parent)", dots[1].Ino, rootIno)
+	}
+}
+
+func parseDirEntryNames(t *testing.T, out *gofuse.DirEntryList) []string {
+	t.Helper()
+	// DirEntryList.bytes() is unexported in go-fuse; read the underlying buf
+	// via reflect so the test stays in package fuse without a go-fuse patch.
+	v := reflect.ValueOf(out).Elem()
+	buf := v.FieldByName("buf").Bytes()
+	var names []string
+	// Parse the FUSE _Dirent wire layout (Ino u64, Off u64, NameLen u32,
+	// Typ u32 = 24-byte header, then name padded to 8 bytes). go-fuse's
+	// DirEntry.Parse is platform-dependent (darwin uses Namlen), so decode
+	// the wire format directly here.
+	const headerSize = 24
+	for len(buf) >= headerSize {
+		nameLen := nativeEndian.Uint32(buf[16:20])
+		_ = nativeEndian.Uint32(buf[20:24]) // Typ
+		// Record length: header + name padded to 8 bytes.
+		recLen := int(headerSize+nameLen+7) &^ 7
+		if recLen > len(buf) {
+			t.Fatalf("dirent recLen=%d exceeds buf len %d (nameLen=%d)", recLen, len(buf), nameLen)
+		}
+		nameBytes := buf[headerSize : headerSize+nameLen]
+		names = append(names, string(nameBytes))
+		buf = buf[recLen:]
+	}
+	return names
 }
 
 func TestReadDirPlusRecreatesStaleSnapshotInode(t *testing.T) {
