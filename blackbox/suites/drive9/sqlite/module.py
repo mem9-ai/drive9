@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ctypes
+import os
 import sqlite3
+import sys
 from typing import Any
 
 from harness.core import BlackboxError, Context
@@ -15,12 +18,22 @@ DELETE_KEY = "k127"
 K000_VAL_BUMP = 1000  # value added to val for updated rows.
 INDEX_NAME = "idx_kv_val"
 
+# SQLite mmap_size used to exercise mmap of the *main* DB file over a
+# FUSE mount. The drive9 FUSE layer opens *.db with FOPEN_DIRECT_IO, so
+# unless the kernel negotiated CAP_DIRECT_IO_ALLOW_MMAP, an mmap of the
+# main DB returns ENODEV. SQLite itself gracefully falls back to pread on
+# ENODEV, so this PRAGMA alone does not surface the failure — we add a
+# direct mmap probe (see _mmap_probe) to detect the gap deterministically.
+SQLITE_MMAP_SIZE = 4 * 1024 * 1024  # 4 MiB — comfortably above one page.
+
 
 class Drive9SqliteBlackbox(Drive9WorkflowBase):
     description = (
         "Drive9 FUSE SQLite durability: create a WAL-mode SQLite DB on a "
-        "FUSE mount, run a deterministic SQL workload, unmount, remount to a "
-        "different directory, and verify the database is consistent and complete."
+        "FUSE mount with a non-zero mmap_size, run a deterministic SQL "
+        "workload, unmount, remount to a different directory, and verify "
+        "the database is consistent, complete, and its main DB file is "
+        "mmap-able (exercises FOPEN_DIRECT_IO + CAP_DIRECT_IO_ALLOW_MMAP)."
     )
     timeout = 1200
 
@@ -47,6 +60,7 @@ class Drive9SqliteBlackbox(Drive9WorkflowBase):
             "rows_counter": expected["rows_counter"],
             "wal": expected["wal"],
             "integrity": expected["integrity"],
+            "mmap_ok": expected["mmap_ok"],
         }
 
     # ------------------------------------------------------------------
@@ -66,6 +80,16 @@ class Drive9SqliteBlackbox(Drive9WorkflowBase):
             if mode != "wal":
                 raise BlackboxError(f"failed to enable WAL mode, got {mode!r}")
             conn.execute("PRAGMA synchronous=NORMAL")
+
+            # Request mmap for the main DB file. SQLite honors this by
+            # mmap-ing the DB with MAP_SHARED. On a drive9 FUSE mount the
+            # main DB is opened FOPEN_DIRECT_IO, so this mmap either
+            # succeeds (kernel negotiated CAP_DIRECT_IO_ALLOW_MMAP) or
+            # fails with ENODEV (SQLite falls back to pread). We assert
+            # the pragma is accepted and probe mmap directly in phase 2.
+            mmap_size_row = conn.execute(f"PRAGMA mmap_size={SQLITE_MMAP_SIZE}").fetchone()
+            if mmap_size_row[0] != SQLITE_MMAP_SIZE:
+                raise BlackboxError(f"mmap_size not accepted: got {mmap_size_row!r}")
 
             # Schema.
             conn.execute("CREATE TABLE kv(key TEXT PRIMARY KEY, val INTEGER, note TEXT)")
@@ -125,6 +149,7 @@ class Drive9SqliteBlackbox(Drive9WorkflowBase):
             expected["integrity"] = integrity
             expected["updated"] = updated
             expected["deleted"] = deleted
+            expected["mmap_size"] = mmap_size_row[0]
             # Force a WAL checkpoint so the main DB file is up to date before
             # the mount goes away. TRUNCATE also reclaims the WAL file.
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -137,7 +162,10 @@ class Drive9SqliteBlackbox(Drive9WorkflowBase):
     # ------------------------------------------------------------------
 
     def _verify(self, ctx: Context, db_path: Any, expected: dict[str, Any]) -> None:
-        """Re-open the DB after remount and assert the state matches phase 1."""
+        """Re-open the DB after remount and assert the state matches phase 1,
+        plus verify the main DB file is mmap-able over the FUSE mount."""
+        # First, close any open SQLite connection before probing mmap so the
+        # kernel page cache / mmap does not race with an active handle.
         conn = sqlite3.connect(str(db_path), isolation_level=None)
         try:
             mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
@@ -190,6 +218,21 @@ class Drive9SqliteBlackbox(Drive9WorkflowBase):
         finally:
             conn.close()
 
+        # Direct mmap probe of the main DB file. The main DB is opened with
+        # FOPEN_DIRECT_IO by drive9, so an mmap(MAP_SHARED) either succeeds
+        # (CAP_DIRECT_IO_ALLOW_MMAP negotiated) or fails with ENODEV. This is
+        # the deterministic check that the fix is in effect; SQLite's own
+        # graceful ENODEV→pread fallback hides the failure otherwise.
+        mmap_ok = self._mmap_probe(db_path)
+        if not mmap_ok:
+            raise BlackboxError(
+                "mmap of main DB file over FUSE mount failed (ENODEV). "
+                "The FUSE mount did not negotiate CAP_DIRECT_IO_ALLOW_MMAP, "
+                "so FOPEN_DIRECT_IO files cannot be mmap-ed. See the "
+                "go-fuse MountOptions.EnableDirectIoMmap / drive9 "
+                "newGoFuseMountOptions fix."
+            )
+
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
@@ -215,3 +258,62 @@ class Drive9SqliteBlackbox(Drive9WorkflowBase):
             "min_key": min_key,
             "max_key": max_key,
         }
+
+    def _mmap_probe(self, db_path: Any) -> bool:
+        """Attempt a read-only MAP_SHARED mmap of the main DB file.
+
+        Returns True if the mmap succeeds, False if the kernel rejects it
+        with ENODEV (the FOPEN_DIRECT_IO + no CAP_DIRECT_IO_ALLOW_MMAP
+        failure mode). Any other error is re-raised so we do not mask
+        unrelated failures.
+        """
+        path = os.fspath(db_path)
+        size = os.path.getsize(path)
+        if size == 0:
+            return False
+        libc = _libc()
+        # O_RDONLY = 0 on POSIX.
+        fd = libc.open(path, 0)
+        if fd < 0:
+            err = ctypes.get_errno()
+            raise BlackboxError(f"open({path!r}) failed: errno={err}")
+        try:
+            # PROT_READ = 1, MAP_SHARED = 1.
+            addr = libc.mmap(None, size, 1, 1, fd, 0)
+            if addr is None or addr == ctypes.c_void_p(-1).value:
+                err = ctypes.get_errno()
+                # ENODEV (19 on Linux, 6 on macOS) is the target failure.
+                if err in (19, 6):
+                    return False
+                raise BlackboxError(f"mmap({path!r}) failed: errno={err}")
+            # Read the SQLite header magic to confirm the mapping is usable.
+            # A valid SQLite DB file starts with "SQLite format 3\0".
+            try:
+                buf = (ctypes.c_char * 16).from_address(addr)
+                if buf.value[:15] != b"SQLite format 3":
+                    raise BlackboxError(
+                        f"mmap succeeded but header magic mismatch: {bytes(buf.value)!r}"
+                    )
+            finally:
+                libc.munmap(addr, size)
+            return True
+        finally:
+            libc.close(fd)
+
+
+def _libc() -> ctypes.CDLL:
+    """Return libc with errno propagation enabled."""
+    if sys.platform == "darwin":
+        lib = ctypes.CDLL("libc.dylib", use_errno=True)
+    else:
+        lib = ctypes.CDLL("libc.so.6", use_errno=True)
+    # prototypes so the calls behave across platforms.
+    lib.open.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    lib.open.restype = ctypes.c_int
+    lib.close.argtypes = [ctypes.c_int]
+    lib.close.restype = ctypes.c_int
+    lib.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_longlong]
+    lib.mmap.restype = ctypes.c_void_p
+    lib.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.munmap.restype = ctypes.c_int
+    return lib
