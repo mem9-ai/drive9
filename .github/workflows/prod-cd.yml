@@ -130,7 +130,7 @@ jobs:
       contents: read
     env:
       TAG: ${{ needs.resolve.outputs.tag }}
-      IMAGE: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ needs.resolve.outputs.tag }}
+      IMAGE: ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ needs.resolve.outputs.tag }}
 
     steps:
       - name: Configure AWS credentials
