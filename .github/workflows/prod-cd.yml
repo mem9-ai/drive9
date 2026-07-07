@@ -130,9 +130,12 @@ jobs:
       contents: read
     env:
       TAG: ${{ needs.resolve.outputs.tag }}
-      IMAGE: ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ needs.resolve.outputs.tag }}
 
     steps:
+      - name: Resolve image ref
+        run: |
+          echo "IMAGE=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG" >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
