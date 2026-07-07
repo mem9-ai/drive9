@@ -209,6 +209,7 @@ cleanup() {
 echo "=== drive9 portable pack/unpack e2e ==="
 echo "BASE=$BASE"
 echo "CLI_SOURCE=$CLI_SOURCE"
+echo "E2E_TMPDIR=$DRIVE9_E2E_TMPDIR"
 
 check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
 check_cmd "curl is available" bash -c 'command -v curl >/dev/null'
@@ -259,7 +260,7 @@ prepare_cli_binary
 check_cmd "drive9 binary ready" test -x "$CLI_BIN"
 
 TS="$(date +%s)-$$"
-WORK_ROOT="$(mktemp -d "/tmp/drive9-portable-pack-e2e-${TS}.XXXXXX")"
+WORK_ROOT="$(mktemp -d "$(drive9_e2e_tmp_path "drive9-portable-pack-e2e-${TS}.XXXXXX")")"
 CLI_ENV_HOME="$WORK_ROOT/home"
 SRC_LOCAL_ROOT="$WORK_ROOT/source-local"
 RESTORE_LOCAL_ROOT="$WORK_ROOT/restore-local"

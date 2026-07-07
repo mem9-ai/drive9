@@ -19,13 +19,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.quota.yml"
+. "${SCRIPT_DIR}/../tmp-helper.sh"
+drive9_e2e_init_tmpdir
 
 # Configuration
 META_DSN="root:root@tcp(127.0.0.1:13306)/drive9_meta?parseTime=true"
 TENANT_DSN="root@tcp(127.0.0.1:14000)/drive9_local?parseTime=true"
 API_BASE="http://127.0.0.1:19009"
 API_KEY="quota-e2e-key"
-S3_DIR="/tmp/drive9-quota-e2e-s3"
+S3_DIR="$(drive9_e2e_tmp_path "drive9-quota-e2e-s3")"
 SERVER_PID=""
 KEEP_CONTAINERS="${KEEP_CONTAINERS:-0}"
 

@@ -16,6 +16,11 @@ those fields in `/v1/provision`; when unset, they keep the existing empty-body
 provisioning behavior for anonymous/default-key endpoints. Optionally set
 `DRIVE9_TIDBCLOUD_SPENDING_LIMIT` to include `tidbcloud_spending_limit`.
 
+Use `DRIVE9_E2E_TMPDIR` to move generated e2e local artifacts off `/tmp`.
+Scripts create the directory if needed, export `TMPDIR` from it so `mktemp`
+uses the same root, and default FUSE run roots to it unless `FUSE_MOUNT_ROOT`
+is set explicitly.
+
 ## Hosted cleanup
 
 Hosted smoke suites create real Drive9 tenants/spaces. By default cleanup is
@@ -28,7 +33,9 @@ DRIVE9_E2E_CLEANUP=0 bash e2e/smoke-all.sh
 For scheduled online checks, enable registry-based cleanup explicitly:
 
 ```bash
-DRIVE9_E2E_CLEANUP=always bash e2e/smoke-all.sh
+DRIVE9_E2E_TMPDIR="$HOME/.cache/drive9-smoke/tmp" \
+DRIVE9_E2E_CLEANUP=always \
+bash e2e/smoke-all.sh
 ```
 
 `smoke-all.sh` creates a `drive9-e2e-*` run registry under
@@ -450,7 +457,8 @@ CLI_SOURCE=official bash e2e/git-workspace-smoke-test.sh
 - CLI batch small-file coverage can be tuned with `CLI_BATCH_SMALL_FILE_COUNT` (default `10`).
 - API retry knobs for throttling are `REQUEST_MAX_RETRIES` and `REQUEST_RETRY_SLEEP_S`; the FUSE correctness/SQLite/concurrency workloads use these for provisioning/status and CLI retry loops.
 - CLI retry knobs for `cli-smoke-test.sh` and `fuse-smoke-test.sh` throttling are `CLI_MAX_RETRIES` and `CLI_RETRY_SLEEP_S`.
-- FUSE mount readiness knobs are `MOUNT_READY_TIMEOUT_S`, `MOUNT_READY_INTERVAL_S`, and `FUSE_MOUNT_ROOT`.
+- Temporary artifact root is `DRIVE9_E2E_TMPDIR` (default `${TMPDIR:-/tmp}`); scripts export `TMPDIR` from it and use it for named large fixtures, local work roots, cleanup run dirs, and default FUSE roots.
+- FUSE mount readiness knobs are `MOUNT_READY_TIMEOUT_S`, `MOUNT_READY_INTERVAL_S`, and `FUSE_MOUNT_ROOT` (default `$DRIVE9_E2E_TMPDIR`).
 - FUSE correctness workload knobs are `FUSE_CORRECTNESS_LARGE_MB` and `FUSE_CORRECTNESS_KEEP_ARTIFACTS`.
 - FUSE SQLite correctness workload knobs are `FUSE_SQLITE_ROWS`, `FUSE_SQLITE_CHURN_ROUNDS`, `FUSE_SQLITE_CONCURRENCY_READERS`, `FUSE_SQLITE_CONCURRENCY_WRITES`, `FUSE_SQLITE_WORKLOAD_TIMEOUT_S`, `FUSE_SQLITE_KEEP_ARTIFACTS`, `RUN_FUSE_SQLITE_WAL`, `RUN_FUSE_SQLITE_CHURN`, and `RUN_FUSE_SQLITE_CONCURRENCY`.
 - FUSE concurrency workload knobs are `FUSE_CONCURRENCY_WORKERS`, `FUSE_CONCURRENCY_FILES_PER_WORKER`, `FUSE_CONCURRENCY_READER_WORKERS`, `FUSE_CONCURRENCY_PAYLOAD_KB`, `FUSE_CONCURRENCY_TIMEOUT_S`, and `FUSE_CONCURRENCY_KEEP_ARTIFACTS`.

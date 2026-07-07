@@ -98,7 +98,9 @@ bash e2e/smoke-all.sh
 # Scheduled hosted smoke runs should opt into registry-based cleanup. Cleanup
 # only deletes tenants/forks registered by this local drive9-e2e run; it does not
 # scan server tenants.
-DRIVE9_E2E_CLEANUP=always bash e2e/smoke-all.sh
+DRIVE9_E2E_TMPDIR="$HOME/.cache/drive9-smoke/tmp" \
+DRIVE9_E2E_CLEANUP=always \
+bash e2e/smoke-all.sh
 
 # Or enable optional Git coverage in that same single smoke-all run.
 # Set either variable to 1 as needed; setting both includes both Git suites.
@@ -568,6 +570,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | Variable | Default | Used by |
 |----------|---------|---------|
 | `DRIVE9_BASE` | `http://127.0.0.1:9009` | all scripts |
+| `DRIVE9_E2E_TMPDIR` | `${TMPDIR:-/tmp}` | shared e2e temp root; scripts export `TMPDIR` from it and default FUSE roots to it |
 | `DRIVE9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh` |
 | `DRIVE9_API_KEY` | - | `api-smoke-test-existing-key.sh` |
 | `DRIVE9_API_KEY` | - | `fuse-smoke-test.sh` (optional; skip provision when set) |
@@ -599,7 +602,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
 | `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
 | `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
+| `FUSE_MOUNT_ROOT` | `$DRIVE9_E2E_TMPDIR` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
 | `CLI_MAX_RETRIES` | `8` | `fuse-smoke-test.sh` |
 | `CLI_RETRY_SLEEP_S` | `2` | `fuse-smoke-test.sh` |
 | `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |

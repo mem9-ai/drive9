@@ -13,11 +13,17 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$REPO_ROOT/e2e/tmp-helper.sh"
+drive9_e2e_init_tmpdir
+
 CLI="${CLI:-./bin/drive9}"
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 API_KEY="${DRIVE9_API_KEY:-local-dev-key}"
 DB="${DRIVE9_DB:-root@tcp(127.0.0.1:4000)/drive9_local}"
 MYSQL_CLIENT="${MYSQL_CLIENT:-mycli --dsn ${DB}}"
+SMOKE_LARGE_BIN="$(drive9_e2e_tmp_path "smoke-large.bin")"
 
 PASS=0
 FAIL=0
@@ -120,8 +126,8 @@ check_eq "description_embedding_revision matches revision" "$REV_MATCH" "1"
 # ------------------------------------------------------------------
 echo ""
 echo "[2/5] Large file multipart upload with description..."
-dd if=/dev/urandom of=/tmp/smoke-large.bin bs=1M count=5 2>/dev/null
-$CLI fs cp --description "5MB random blob for backup" /tmp/smoke-large.bin :/smoke-large.bin
+dd if=/dev/urandom of="$SMOKE_LARGE_BIN" bs=1M count=5 2>/dev/null
+$CLI fs cp --description "5MB random blob for backup" "$SMOKE_LARGE_BIN" :/smoke-large.bin
 
 DESC2=$(sql_scalar "SELECT description FROM files f JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.path = '/smoke-large.bin';")
 check_eq "large file description stored" "$DESC2" "5MB random blob for backup"

@@ -7,6 +7,11 @@
 # - require e2e source markers and drive9-e2e-* run IDs before deletion;
 # - keep raw registries owner-readable only because they contain API keys.
 
+_drive9_cleanup_helper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -z "${DRIVE9_TMP_HELPER_LOADED:-}" ]; then
+  . "$_drive9_cleanup_helper_dir/tmp-helper.sh"
+fi
+
 DRIVE9_CLEANUP_HELPER_LOADED=1
 DRIVE9_E2E_CLEANUP_SOURCE="drive9-e2e-cleanup-v1"
 
@@ -141,7 +146,8 @@ drive9_cleanup_init_run() {
   pending_dir="${DRIVE9_E2E_CLEANUP_PENDING_DIR:-$cache_root/cleanup-pending}"
   completed_dir="${DRIVE9_E2E_CLEANUP_COMPLETED_DIR:-$cache_root/cleanup-completed}"
   retained_dir="${DRIVE9_E2E_CLEANUP_RETAINED_DIR:-$cache_root/cleanup-retained}"
-  run_dir="${DRIVE9_E2E_RUN_DIR:-/tmp/drive9-smoke/$run_id}"
+  drive9_e2e_init_tmpdir || return 1
+  run_dir="${DRIVE9_E2E_RUN_DIR:-$(drive9_e2e_tmp_path "drive9-smoke/$run_id")}"
   registry="${DRIVE9_E2E_CLEANUP_REGISTRY:-$pending_dir/$run_id.jsonl}"
   lock_file="${registry}.lock"
   drive9_cleanup_validate_registry_name "$registry" || return 1

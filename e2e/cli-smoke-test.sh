@@ -121,6 +121,7 @@ echo "=== drive9 CLI smoke test ==="
 echo "BASE=$BASE"
 echo "CLI_SOURCE=$CLI_SOURCE"
 echo "IMAGE_FIXTURE=$DRIVE9_IMAGE_FIXTURE_PATH"
+echo "E2E_TMPDIR=$DRIVE9_E2E_TMPDIR"
 
 check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
 if [ "$CLI_SOURCE" = "build" ]; then
@@ -330,30 +331,33 @@ PY
 TS="$(date +%s)"
 CLI_ENV_HOME="$(mktemp -d)"
 CLI_CTX_HOME="$(mktemp -d)"
-SMALL_LOCAL="/tmp/drive9-cli-small-${TS}.txt"
+SMALL_LOCAL="$(drive9_e2e_tmp_path "drive9-cli-small-${TS}.txt")"
 SMALL_REMOTE="/cli-${TS}-small.txt"
 SMALL_RENAMED="/cli-${TS}-small-renamed.txt"
 SMALL_SYMLINK="/cli-${TS}-small-link"
 SMALL_HARDLINK="/cli-${TS}-small-hardlink.txt"
 CP_DIR_REMOTE="/cli-${TS}-cpdir"
 CP_DIR_REMOTE_COPY="/cli-${TS}-cpdir-copy"
-CP_DIR_LOCAL="/tmp/drive9-cli-cpdir-${TS}"
-RECURSIVE_LOCAL_ROOT="/tmp/drive9-cli-recursive-${TS}"
+CP_DIR_LOCAL="$(drive9_e2e_tmp_path "drive9-cli-cpdir-${TS}")"
+RECURSIVE_LOCAL_ROOT="$(drive9_e2e_tmp_path "drive9-cli-recursive-${TS}")"
 RECURSIVE_REMOTE="/cli-${TS}-recursive-tree"
 RECURSIVE_REMOTE_COPY="/cli-${TS}-recursive-tree-copy"
-RECURSIVE_DOWNLOADED="/tmp/drive9-cli-recursive-downloaded-${TS}"
-HARDLINK_LOCAL="/tmp/drive9-cli-hardlink-${TS}.txt"
-TAG_LOCAL="/tmp/drive9-cli-tag-${TS}.txt"
+RECURSIVE_DOWNLOADED="$(drive9_e2e_tmp_path "drive9-cli-recursive-downloaded-${TS}")"
+HARDLINK_LOCAL="$(drive9_e2e_tmp_path "drive9-cli-hardlink-${TS}.txt")"
+TAG_LOCAL="$(drive9_e2e_tmp_path "drive9-cli-tag-${TS}.txt")"
 TAG_REMOTE="/cli-${TS}-tagged.txt"
-IMAGE_LOCAL="/tmp/drive9-cli-image-${TS}.jpg"
+IMAGE_LOCAL="$(drive9_e2e_tmp_path "drive9-cli-image-${TS}.jpg")"
 IMAGE_REMOTE="/cli-${TS}-image.jpg"
 SEM_TEXT_TARGET="/cli-${TS}-cat-story.txt"
 SEM_TEXT_OTHER="/cli-${TS}-dog-story.txt"
 IMAGE_CAPTION_REMOTE="/cli-${TS}-image.caption.txt"
-BATCH_LOCAL_DIR="/tmp/drive9-cli-batch-${TS}"
+SEM_TEXT_TARGET_LOCAL="$(drive9_e2e_tmp_path "drive9-cli-sem-target-${TS}.txt")"
+SEM_TEXT_OTHER_LOCAL="$(drive9_e2e_tmp_path "drive9-cli-sem-other-${TS}.txt")"
+IMAGE_CAPTION_LOCAL="$(drive9_e2e_tmp_path "drive9-cli-image-caption-${TS}.txt")"
+BATCH_LOCAL_DIR="$(drive9_e2e_tmp_path "drive9-cli-batch-${TS}")"
 BATCH_REMOTE_DIR="/cli-${TS}-batch"
-PACK_LOCAL_ROOT="/tmp/drive9-cli-pack-local-${TS}"
-PACK_RESTORE_ROOT="/tmp/drive9-cli-pack-restore-${TS}"
+PACK_LOCAL_ROOT="$(drive9_e2e_tmp_path "drive9-cli-pack-local-${TS}")"
+PACK_RESTORE_ROOT="$(drive9_e2e_tmp_path "drive9-cli-pack-restore-${TS}")"
 PACK_REMOTE_ROOT="/workspace"
 PACK_PROFILE="e2e-pack"
 PACK_REMOTE_ARCHIVE="$(python3 - "$PACK_REMOTE_ROOT" "$PACK_PROFILE" <<'PY'
@@ -369,20 +373,20 @@ digest = hashlib.sha256((profile + "\0" + root).encode()).hexdigest()[:16]
 print(f"/.drive9/packs/{safe}-{digest}.tar.gz")
 PY
 )"
-LARGE_LOCAL="/tmp/drive9-cli-large-${TS}.bin"
+LARGE_LOCAL="$(drive9_e2e_tmp_path "drive9-cli-large-${TS}.bin")"
 LARGE_REMOTE="/cli-${TS}-large-${CLI_LARGE_FILE_MB}m.bin"
-LARGE_DOWNLOADED="/tmp/drive9-cli-large-${TS}.download.bin"
+LARGE_DOWNLOADED="$(drive9_e2e_tmp_path "drive9-cli-large-${TS}.download.bin")"
 LARGE_BYTES=$((CLI_LARGE_FILE_MB * 1024 * 1024))
 CLI_IMAGE_UPLOADED=0
 FORK_CTX_NAME="fork-${TS}"
 FORK_REMOTE="/cli-${TS}-fork-smoke.txt"
-FORK_LOCAL="/tmp/drive9-cli-fork-${TS}.txt"
+FORK_LOCAL="$(drive9_e2e_tmp_path "drive9-cli-fork-${TS}.txt")"
 ARCHIVE_REMOTE_DIR="/cli-${TS}-archive"
-ARCHIVE_LOCAL_TARGZ="/tmp/drive9-cli-archive-${TS}.tar.gz"
-ARCHIVE_LOCAL_TARGZ2="/tmp/drive9-cli-archive-${TS}-2.tar.gz"
-ARCHIVE_LOCAL_ZIP="/tmp/drive9-cli-archive-${TS}.zip"
-ARCHIVE_LOCAL_FLAT="/tmp/drive9-cli-archive-flat-${TS}.tar.gz"
-ARCHIVE_EXTRACT_DIR="/tmp/drive9-cli-archive-extract-${TS}"
+ARCHIVE_LOCAL_TARGZ="$(drive9_e2e_tmp_path "drive9-cli-archive-${TS}.tar.gz")"
+ARCHIVE_LOCAL_TARGZ2="$(drive9_e2e_tmp_path "drive9-cli-archive-${TS}-2.tar.gz")"
+ARCHIVE_LOCAL_ZIP="$(drive9_e2e_tmp_path "drive9-cli-archive-${TS}.zip")"
+ARCHIVE_LOCAL_FLAT="$(drive9_e2e_tmp_path "drive9-cli-archive-flat-${TS}.tar.gz")"
+ARCHIVE_EXTRACT_DIR="$(drive9_e2e_tmp_path "drive9-cli-archive-extract-${TS}")"
 
 echo "[3.1] ctx fork smoke"
 if fork_checks_enabled; then
@@ -831,10 +835,10 @@ check_eq "cli find by name returns txt files" "$find_has_txt" "true"
 
 echo "[6.1] cli semantic text recall checks"
 if [ "$RUN_CLI_SEMANTIC_CHECKS" = "1" ]; then
-  printf "A cat is resting on a sofa near a window." > "/tmp/drive9-cli-sem-target-${TS}.txt"
-  printf "A dog is running in a field under bright sun." > "/tmp/drive9-cli-sem-other-${TS}.txt"
-  drive9_retry fs cp "/tmp/drive9-cli-sem-target-${TS}.txt" ":$SEM_TEXT_TARGET" >/dev/null
-  drive9_retry fs cp "/tmp/drive9-cli-sem-other-${TS}.txt" ":$SEM_TEXT_OTHER" >/dev/null
+  printf "A cat is resting on a sofa near a window." > "$SEM_TEXT_TARGET_LOCAL"
+  printf "A dog is running in a field under bright sun." > "$SEM_TEXT_OTHER_LOCAL"
+  drive9_retry fs cp "$SEM_TEXT_TARGET_LOCAL" ":$SEM_TEXT_TARGET" >/dev/null
+  drive9_retry fs cp "$SEM_TEXT_OTHER_LOCAL" ":$SEM_TEXT_OTHER" >/dev/null
 
   wait_cli_grep_target "cli semantic grep includes cat-story target" "feline sofa" "$SEM_TEXT_TARGET"
   wait_cli_grep_target "cli semantic grep includes dog-story target" "canine field" "$SEM_TEXT_OTHER"
@@ -850,8 +854,8 @@ if [ "$RUN_CLI_SEMANTIC_CHECKS" = "1" ]; then
   check_cmd "local cli jpg fixture exists" test -s "$IMAGE_LOCAL"
   drive9_retry fs cp "$IMAGE_LOCAL" ":$IMAGE_REMOTE" >/dev/null
   CLI_IMAGE_UPLOADED=1
-  printf "This image shows a cat face icon." > "/tmp/drive9-cli-image-caption-${TS}.txt"
-  drive9_retry fs cp "/tmp/drive9-cli-image-caption-${TS}.txt" ":$IMAGE_CAPTION_REMOTE" >/dev/null
+  printf "This image shows a cat face icon." > "$IMAGE_CAPTION_LOCAL"
+  drive9_retry fs cp "$IMAGE_CAPTION_LOCAL" ":$IMAGE_CAPTION_REMOTE" >/dev/null
 
   wait_cli_grep_target "cli image-associated grep includes caption" "feline face icon" "$IMAGE_CAPTION_REMOTE"
 
@@ -1049,7 +1053,7 @@ fi
 rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$HARDLINK_LOCAL" "$IMAGE_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
 rm -f "$TAG_LOCAL"
 rm -f "$FORK_LOCAL"
-rm -f "/tmp/drive9-cli-sem-target-${TS}.txt" "/tmp/drive9-cli-sem-other-${TS}.txt" "/tmp/drive9-cli-image-caption-${TS}.txt"
+rm -f "$SEM_TEXT_TARGET_LOCAL" "$SEM_TEXT_OTHER_LOCAL" "$IMAGE_CAPTION_LOCAL"
 rm -rf "$BATCH_LOCAL_DIR" "$CP_DIR_LOCAL" "$PACK_LOCAL_ROOT" "$PACK_RESTORE_ROOT" "$CLI_ENV_HOME" "$CLI_CTX_HOME"
 
 echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"

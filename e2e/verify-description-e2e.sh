@@ -20,6 +20,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+. "$SCRIPT_DIR/tmp-helper.sh"
+drive9_e2e_init_tmpdir
 
 # ------------------------------------------------------------------
 # Configuration
@@ -34,6 +36,8 @@ SERVER_PORT="9009"
 SERVER_PID=""
 STUB_PID=""
 COMPOSE_PROJECT="drive9-desc-e2e"
+SERVER_LOG="$(drive9_e2e_tmp_path "drive9-server-local-e2e.log")"
+SMOKE_LARGE_BIN="$(drive9_e2e_tmp_path "smoke-large.bin")"
 
 USE_LOCAL_OLLAMA="${USE_LOCAL_OLLAMA:-0}"
 USE_STUB_EMBEDDER="${USE_STUB_EMBEDDER:-1}"
@@ -223,7 +227,7 @@ export DRIVE9_SEMANTIC_WORKERS=1
 export DRIVE9_SEMANTIC_POLL_INTERVAL_MS=200
 
 # Start server in background, capture logs
-"${PROJECT_ROOT}/bin/drive9-server-local" > /tmp/drive9-server-local-e2e.log 2>&1 &
+"${PROJECT_ROOT}/bin/drive9-server-local" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
@@ -342,8 +346,8 @@ check_eq "description_embedding_revision matches revision" "$REV_MATCH" "1"
 # ---- 2. Large file multipart upload with description ----
 echo ""
 log_info "[2/5] Large file multipart upload with description..."
-dd if=/dev/urandom of=/tmp/smoke-large.bin bs=1M count=5 2>/dev/null
-$CLI fs cp --description "5MB random blob for backup" /tmp/smoke-large.bin :/smoke-large.bin
+dd if=/dev/urandom of="$SMOKE_LARGE_BIN" bs=1M count=5 2>/dev/null
+$CLI fs cp --description "5MB random blob for backup" "$SMOKE_LARGE_BIN" :/smoke-large.bin
 
 DESC2=$(sql_scalar "SELECT description FROM files f JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.path = '/smoke-large.bin';")
 check_eq "large file description stored" "$DESC2" "5MB random blob for backup"
@@ -388,7 +392,7 @@ echo "Summary: ${PASS}/${TOTAL} passed, ${FAIL}/${TOTAL} failed"
 echo "========================================"
 
 if [ "$FAIL" -gt 0 ]; then
-    log_err "Some tests failed. Server logs: /tmp/drive9-server-local-e2e.log"
+    log_err "Some tests failed. Server logs: $SERVER_LOG"
     exit 1
 fi
 
