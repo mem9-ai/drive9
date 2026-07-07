@@ -153,5 +153,7 @@ build-cli-release:
 	done; \
 	cd $(DIST_DIR) && sha256sum $(CLI_NAME)-* > checksums.txt && printf '%s\n' "$(VERSION)" > version
 
+DOCKER_BUILD_ARGS ?=
+
 docker-build: build-server
-	$(DOCKER) build -t $(IMAGE) .
+	$(DOCKER) build $(DOCKER_BUILD_ARGS) -t $(IMAGE) .

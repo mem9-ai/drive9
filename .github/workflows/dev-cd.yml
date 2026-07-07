@@ -76,20 +76,18 @@ jobs:
       - name: Build and push image
         run: |
           IMAGE_BASE=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
-          LDFLAGS="-X github.com/mem9-ai/drive9/pkg/buildinfo.Version=${{ env.IMAGE_TAG }} -X github.com/mem9-ai/drive9/pkg/buildinfo.GitHash=$(git rev-parse --short=7 HEAD) -X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          VERSION=${{ env.IMAGE_TAG }}
           # amd64
-          make docker-build IMAGE_REPO=$IMAGE_BASE IMAGE_TAG=${{ env.IMAGE_TAG }}-amd64 GOARCH=amd64
-          docker push $IMAGE_BASE:${{ env.IMAGE_TAG }}-amd64
+          make docker-build IMAGE_REPO=$IMAGE_BASE IMAGE_TAG=$VERSION-amd64 GOARCH=amd64 VERSION=$VERSION GIT_BRANCH=${{ github.ref_name }}
+          docker push $IMAGE_BASE:$VERSION-amd64
           # arm64
-          mkdir -p bin
-          CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o bin/drive9-server ./cmd/drive9-server
-          docker build --platform linux/arm64 -t $IMAGE_BASE:${{ env.IMAGE_TAG }}-arm64 .
-          docker push $IMAGE_BASE:${{ env.IMAGE_TAG }}-arm64
+          make docker-build IMAGE_REPO=$IMAGE_BASE IMAGE_TAG=$VERSION-arm64 GOARCH=arm64 VERSION=$VERSION GIT_BRANCH=${{ github.ref_name }} DOCKER_BUILD_ARGS="--platform linux/arm64"
+          docker push $IMAGE_BASE:$VERSION-arm64
           # multi-arch manifest
-          docker manifest create $IMAGE_BASE:${{ env.IMAGE_TAG }} \
-            $IMAGE_BASE:${{ env.IMAGE_TAG }}-amd64 \
-            $IMAGE_BASE:${{ env.IMAGE_TAG }}-arm64
-          docker manifest push $IMAGE_BASE:${{ env.IMAGE_TAG }}
+          docker manifest create $IMAGE_BASE:$VERSION \
+            $IMAGE_BASE:$VERSION-amd64 \
+            $IMAGE_BASE:$VERSION-arm64
+          docker manifest push $IMAGE_BASE:$VERSION
 
       - name: Update kubeconfig
         run: |
