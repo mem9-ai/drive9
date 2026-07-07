@@ -73,13 +73,15 @@ jobs:
       - name: Build and push image
         run: |
           IMAGE_BASE=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
-          # amd64
+          # amd64 (native)
           make docker-build IMAGE_REPO=$IMAGE_BASE IMAGE_TAG=${{ env.IMAGE_TAG }}-amd64 GOARCH=amd64
           docker push $IMAGE_BASE:${{ env.IMAGE_TAG }}-amd64
-          # arm64
-          make docker-build IMAGE_REPO=$IMAGE_BASE IMAGE_TAG=${{ env.IMAGE_TAG }}-arm64 GOARCH=arm64
+          # arm64 — cross-compile binary, then build arm64 Docker image
+          mkdir -p bin
+          CGO_ENABLED=0 GOARCH=arm64 go build -o bin/drive9-server ./cmd/drive9-server
+          docker build --platform linux/arm64 -t $IMAGE_BASE:${{ env.IMAGE_TAG }}-arm64 .
           docker push $IMAGE_BASE:${{ env.IMAGE_TAG }}-arm64
-          # manifest
+          # multi-arch manifest
           docker manifest create $IMAGE_BASE:${{ env.IMAGE_TAG }} \
             $IMAGE_BASE:${{ env.IMAGE_TAG }}-amd64 \
             $IMAGE_BASE:${{ env.IMAGE_TAG }}-arm64
