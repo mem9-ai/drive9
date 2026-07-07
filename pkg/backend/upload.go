@@ -17,6 +17,12 @@ import (
 	"go.uber.org/zap"
 )
 
+const postS3UploadFinalizeTimeout = 2 * time.Minute
+
+func postS3UploadFinalizeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), postS3UploadFinalizeTimeout)
+}
+
 // UploadPlan is returned by InitiateUpload for the 202 response.
 type UploadPlan struct {
 	UploadID string                    `json:"upload_id"`
@@ -1001,7 +1007,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	if err := b.s3.CompleteMultipartUpload(ctx, upload.S3Key, upload.S3UploadID, parts); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_complete_multipart_failed", zap.String("upload_id", uploadID), zap.Error(err))
 		if b.UseServerQuota() {
-			cleanupCtx, cancelCleanup := postCommitQuotaMutationContext()
+			cleanupCtx, cancelCleanup := postS3UploadFinalizeContext(ctx)
 			if resetErr := b.metaStore.UpdateUploadReservationStatus(cleanupCtx, b.tenantID, uploadID, "active"); resetErr != nil {
 				logger.Warn(cleanupCtx, "central_quota_upload_reset_active_failed",
 					zap.String("tenant_id", b.tenantID),
@@ -1017,7 +1023,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		return fmt.Errorf("complete multipart: %w", err)
 	}
 	completeMultipartDurationMs := uploadPhaseMs(completeMultipartStart)
-	finalizeCtx, cancelFinalize := postCommitQuotaMutationContext()
+	finalizeCtx, cancelFinalize := postS3UploadFinalizeContext(ctx)
 	defer cancelFinalize()
 
 	var oldStorageRef string
@@ -1220,11 +1226,14 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		return nil
 	}); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
-		cleanupCtx, cancelCleanup := postCommitQuotaMutationContext()
+		cleanupCtx, cancelCleanup := postS3UploadFinalizeContext(ctx)
 		b.cleanupFailedFinalizeUpload(cleanupCtx, upload)
-		// Abort the server-side reservation since the tenant DB tx failed.
-		b.abortUploadReservation(cleanupCtx, uploadID, upload.TotalSize)
 		cancelCleanup()
+
+		// Abort the server-side reservation since the tenant DB tx failed.
+		quotaCleanupCtx, cancelQuotaCleanup := postS3UploadFinalizeContext(ctx)
+		b.abortUploadReservation(quotaCleanupCtx, uploadID, upload.TotalSize)
+		cancelQuotaCleanup()
 		metrics.RecordTenantOperation(b.tenantID, "backend", "finalize_upload", "error", time.Since(start))
 		return err
 	}
@@ -1232,7 +1241,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	if semanticTaskEnqueued {
 		b.notifyWorkEnqueued(BackendWorkSemantic)
 	}
-	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
+	quotaCtx, cancelQuota := postS3UploadFinalizeContext(ctx)
 	defer cancelQuota()
 	if err := b.completeUploadReservation(quotaCtx, uploadID, upload.TotalSize, confirmedFileID, oldSizeBytes, oldIsMedia, upload.TotalSize, newIsMedia); err != nil {
 		metrics.RecordTenantOperation(b.tenantID, "backend", "finalize_upload", "error", time.Since(start))
@@ -1240,7 +1249,9 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	}
 
 	if isOverwrite {
-		b.deleteBlobIfS3Ctx(finalizeCtx, oldStorageType, oldStorageRef, upload.S3Key)
+		gcCtx, cancelGC := postS3UploadFinalizeContext(ctx)
+		b.deleteBlobIfS3Ctx(gcCtx, oldStorageType, oldStorageRef, upload.S3Key)
+		cancelGC()
 	}
 	logger.InfoBenchTiming(ctx, "backend_finalize_upload_timing",
 		zap.String("upload_id", uploadID),

@@ -282,14 +282,14 @@ func TestConfirmUploadFinalizesAfterRequestContextCanceledPostS3Complete(t *test
 		t.Fatal(err)
 	}
 	if upload.Status != datastore.UploadCompleted {
-		t.Fatalf("upload status = %s, want %s", upload.Status, datastore.UploadCompleted)
+		t.Errorf("upload status = %s, want %s", upload.Status, datastore.UploadCompleted)
 	}
 	info, err := b.store.Stat(verifyCtx, "/complete-after-cancel.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if info.File == nil || info.File.SizeBytes != totalSize {
-		t.Fatalf("file size = %v, want %d", info.File, totalSize)
+		t.Errorf("file size = %v, want %d", info.File, totalSize)
 	}
 }
 
