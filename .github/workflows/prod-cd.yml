@@ -275,19 +275,19 @@ jobs:
         run: |
           mkdir -p ~/.kube
           aliyun --profile github-actions cs GET "/k8s/c4dad0ecde1e94472a36fec0498e181ed/user_config" --region ap-southeast-1 | jq -r '.config' > ~/.kube/alicloud-config
-          kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
-            set image "deployment/${{ env.K8S_DEPLOYMENT }}" \
-            "${{ env.K8S_DEPLOYMENT }}=$ACR_IMAGE"
-          kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
-            rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
+          kubectl --kubeconfig ~/.kube/alicloud-config -n drive9-tidbcloud \
+            set image deployment/drive9-server \
+            drive9-server=$ACR_IMAGE
+          kubectl --kubeconfig ~/.kube/alicloud-config -n drive9-tidbcloud \
+            rollout status deployment/drive9-server \
             --timeout=300s
 
       - name: Rollback alicloud-ap-southeast-1 on failure
         if: failure() && steps.deploy-alicloud.outcome == 'failure'
         run: |
           if [ -f ~/.kube/alicloud-config ]; then
-            kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
-              rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
+            kubectl --kubeconfig ~/.kube/alicloud-config -n drive9-tidbcloud \
+              rollout undo deployment/drive9-server
           fi
 
       - name: Configure Tencent Cloud credentials
