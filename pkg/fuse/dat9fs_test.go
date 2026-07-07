@@ -6250,7 +6250,9 @@ func TestReadDirEmitsDotAndDotDot(t *testing.T) {
 	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	dirIno := fs.inodes.Lookup("/parent/dir", true, 0, time.Now())
-	parentIno := fs.inodes.Lookup("/parent/", true, 0, time.Now())
+	// The inode table stores directory paths without trailing slashes (root
+	// is "/"), which is the convention parentDirIno must resolve against.
+	parentIno := fs.inodes.Lookup("/parent", true, 0, time.Now())
 
 	dh := &DirHandle{
 		Ino:  dirIno,
@@ -6279,12 +6281,13 @@ func TestReadDirEmitsDotAndDotDot(t *testing.T) {
 		t.Fatalf("readdir first page = %v, want [. .. file.txt]", names)
 	}
 
-	// A second call with offset past the synthetic entries must not repeat them.
-	out2 := gofuse.NewDirEntryList(make([]byte, 4096), 1)
+	// A second call with offset past the synthetic entries (offset 3 = after
+	// "." at 1 and ".." at 2) must not repeat them.
+	out2 := gofuse.NewDirEntryList(make([]byte, 4096), 3)
 	if st := fs.ReadDir(nil, &gofuse.ReadIn{
 		InHeader: gofuse.InHeader{NodeId: dirIno},
 		Fh:       fh,
-		Offset:   1,
+		Offset:   3,
 		Size:     4096,
 	}, out2); st != gofuse.OK {
 		t.Fatalf("ReadDir page 2 status = %v, want OK", st)
@@ -6294,6 +6297,45 @@ func TestReadDirEmitsDotAndDotDot(t *testing.T) {
 		if n == "." || n == ".." {
 			t.Fatalf("readdir page 2 repeated synthetic entry %q; got %v", n, page2)
 		}
+	}
+
+	// Small-buffer pagination: a page that only fits "." / ".." must let the
+	// next page (resumed at the synthetic offset) still reach the real
+	// children without skipping them. Use a buffer that holds one entry.
+	out3 := gofuse.NewDirEntryList(make([]byte, 64), 0)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Offset:   0,
+		Size:     64,
+	}, out3); st != gofuse.OK {
+		t.Fatalf("ReadDir small-buffer page 1 status = %v, want OK", st)
+	}
+	page1 := parseDirEntryNames(t, out3)
+	if len(page1) == 0 {
+		t.Fatal("small-buffer page 1 returned no entries")
+	}
+	// Resume from the offset of the last entry returned (kernel does this).
+	lastOff := smallPageLastOffset(t, out3)
+	out4 := gofuse.NewDirEntryList(make([]byte, 4096), lastOff)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Offset:   lastOff,
+		Size:     4096,
+	}, out4); st != gofuse.OK {
+		t.Fatalf("ReadDir small-buffer page 2 status = %v, want OK", st)
+	}
+	page2small := parseDirEntryNames(t, out4)
+	// file.txt must eventually be reached across the small-buffer pages.
+	found := false
+	for _, n := range append(append([]string{}, page1...), page2small...) {
+		if n == "file.txt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("file.txt never reached across small-buffer pages; p1=%v p2=%v", page1, page2small)
 	}
 
 	// dotDotEntries must reference the directory itself and its parent.
@@ -6350,12 +6392,86 @@ func TestReadDirEmitsDotAndDotDotAtRoot(t *testing.T) {
 	}
 }
 
+// TestReadDirPlusDotDotUsesUnknownIno verifies that READDIRPLUS serves "."
+// and ".." with FUSE_UNKNOWN_INO and does not increment their inode lookup
+// counts. The kernel does not create dentries for FUSE_UNKNOWN_INO, so a
+// later FORGET cannot drive the directory or parent Nlookup negative.
+// Also asserts the ".." parent inode resolves correctly against the no-
+// trailing-slash inode-table convention (parent registered as "/parent",
+// not "/parent/").
+func TestReadDirPlusDotDotUsesUnknownIno(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	dirIno := fs.inodes.Lookup("/parent/dir", true, 0, time.Now())
+	parentIno := fs.inodes.Lookup("/parent", true, 0, time.Now())
+
+	dh := &DirHandle{
+		Ino:  dirIno,
+		Path: "/parent/dir",
+		Entries: []DirEntry{{
+			Name: "file.txt",
+			Ino:  fs.inodes.Lookup("/parent/dir/file.txt", false, 9, time.Now()),
+			Mode: uint32(syscall.S_IFREG) | 0o644,
+		}},
+	}
+	fh := fs.dirHandles.Allocate(dh)
+
+	dirEntryBefore, _ := fs.inodes.GetEntry(dirIno)
+	parentEntryBefore, _ := fs.inodes.GetEntry(parentIno)
+	dirLookBefore := dirEntryBefore.Nlookup
+	parentLookBefore := parentEntryBefore.Nlookup
+
+	out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Offset:   0,
+		Size:     4096,
+	}, out); st != gofuse.OK {
+		t.Fatalf("ReadDirPlus status = %v, want OK", st)
+	}
+
+	// The first two entries must be "." and ".." advertised with
+	// FUSE_UNKNOWN_INO (EntryOut.NodeId), so the kernel does not create
+	// dentries for them. ReadDirPlus serializes [EntryOut][Dirent][name].
+	buf := dirEntryListBuf(t, out)
+	const entryOutSize = 144 // unsafe.Sizeof(gofuse.EntryOut{})
+	const direntSize = 24    // unsafe.Sizeof(gofuse._Dirent{})
+	dotNodeId := nativeEndian.Uint64(buf[0:8])
+	if dotNodeId != gofuse.FUSE_UNKNOWN_INO {
+		t.Fatalf("'.' NodeId = %d, want FUSE_UNKNOWN_INO (0x%x)", dotNodeId, gofuse.FUSE_UNKNOWN_INO)
+	}
+	dotNameLen := nativeEndian.Uint32(buf[entryOutSize+16 : entryOutSize+20])
+	recLen1 := int(entryOutSize+direntSize+int(dotNameLen)+7) &^ 7
+	dotdotNodeId := nativeEndian.Uint64(buf[recLen1 : recLen1+8])
+	if dotdotNodeId != gofuse.FUSE_UNKNOWN_INO {
+		t.Fatalf("'..' NodeId = %d, want FUSE_UNKNOWN_INO (0x%x)", dotdotNodeId, gofuse.FUSE_UNKNOWN_INO)
+	}
+
+	// Lookup counts for the directory and parent must be unchanged: "."
+	// and ".." did not get IncrementLookup'd.
+	dirEntryAfter, _ := fs.inodes.GetEntry(dirIno)
+	parentEntryAfter, _ := fs.inodes.GetEntry(parentIno)
+	if dirEntryAfter.Nlookup != dirLookBefore {
+		t.Fatalf("dir Nlookup after ReadDirPlus = %d, want %d (\".\" must not increment)", dirEntryAfter.Nlookup, dirLookBefore)
+	}
+	if parentEntryAfter.Nlookup != parentLookBefore {
+		t.Fatalf("parent Nlookup after ReadDirPlus = %d, want %d (\"..\" must not increment)", parentEntryAfter.Nlookup, parentLookBefore)
+	}
+
+	// dotDotEntries (the ReadDir helper) must still resolve the real parent
+	// inode for ".." via the no-trailing-slash convention.
+	dots := fs.dotDotEntries(dh)
+	if dots[1].Ino != parentIno {
+		t.Fatalf("dotDotEntries '..' ino = %d, want parent ino %d", dots[1].Ino, parentIno)
+	}
+}
+
 func parseDirEntryNames(t *testing.T, out *gofuse.DirEntryList) []string {
 	t.Helper()
-	// DirEntryList.bytes() is unexported in go-fuse; read the underlying buf
-	// via reflect so the test stays in package fuse without a go-fuse patch.
-	v := reflect.ValueOf(out).Elem()
-	buf := v.FieldByName("buf").Bytes()
+	buf := dirEntryListBuf(t, out)
 	var names []string
 	// Parse the FUSE _Dirent wire layout (Ino u64, Off u64, NameLen u32,
 	// Typ u32 = 24-byte header, then name padded to 8 bytes). go-fuse's
@@ -6375,6 +6491,35 @@ func parseDirEntryNames(t *testing.T, out *gofuse.DirEntryList) []string {
 		buf = buf[recLen:]
 	}
 	return names
+}
+
+// smallPageLastOffset returns the Off field of the last serialized dirent in a
+// DirEntryList, so a test can resume a readdir at the same offset the kernel
+// would use after a short page.
+func smallPageLastOffset(t *testing.T, out *gofuse.DirEntryList) uint64 {
+	t.Helper()
+	buf := dirEntryListBuf(t, out)
+	const headerSize = 24
+	var lastOff uint64
+	for len(buf) >= headerSize {
+		nameLen := nativeEndian.Uint32(buf[16:20])
+		off := nativeEndian.Uint64(buf[8:16])
+		recLen := int(headerSize+nameLen+7) &^ 7
+		if recLen > len(buf) {
+			t.Fatalf("dirent recLen=%d exceeds buf len %d", recLen, len(buf))
+		}
+		lastOff = off
+		buf = buf[recLen:]
+	}
+	return lastOff
+}
+
+func dirEntryListBuf(t *testing.T, out *gofuse.DirEntryList) []byte {
+	t.Helper()
+	// DirEntryList.bytes() is unexported in go-fuse; read the underlying buf
+	// via reflect so the test stays in package fuse without a go-fuse patch.
+	v := reflect.ValueOf(out).Elem()
+	return v.FieldByName("buf").Bytes()
 }
 
 func TestReadDirPlusRecreatesStaleSnapshotInode(t *testing.T) {
@@ -12851,6 +12996,115 @@ func TestSetAttr_WriteBackPathTruncateCreatedNonZero(t *testing.T) {
 	}
 
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+}
+
+// TestSetAttr_WriteBackPathTruncateCreatedNonZeroMultipleHandles covers the
+// multi-dirty-handle case: a just-created, uncommitted file open for writing
+// twice (two dirty handles) must still adopt a path-based truncate on the
+// local dirty buffer instead of falling back to the remote server (which has
+// no copy of the file yet and would return ENOENT). Adopting any one dirty
+// handle is sufficient; a path-truncate collapses the file to a single size.
+func TestSetAttr_WriteBackPathTruncateCreatedNonZeroMultipleHandles(t *testing.T) {
+	const callerPID = 6363
+	var readCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/created.bin" && r.URL.RawQuery == "create=1":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+		case r.Method == http.MethodGet:
+			readCalls.Add(1)
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:   8,
+		queue:        []*CommitEntry{},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+		workCh:       make(chan *CommitEntry, 16),
+	}
+
+	// Create the file with two open writers.
+	var createOut1, createOut2 gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1, Caller: gofuse.Caller{Pid: callerPID}},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     defaultRegularFileMode,
+	}, "created.bin", &createOut1)
+	if st != gofuse.OK {
+		t.Fatalf("Create 1 status = %v, want OK", st)
+	}
+	// Re-open for a second writer; emulate by issuing another Create with O_CREAT
+	// (the harness's openHandles tracks both).
+	st = fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: createOut1.NodeId, Caller: gofuse.Caller{Pid: callerPID}},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     defaultRegularFileMode,
+	}, "created.bin", &createOut2)
+	if st != gofuse.OK {
+		t.Fatalf("Create 2 status = %v, want OK", st)
+	}
+	fh1, ok := fs.fileHandles.Get(createOut1.Fh)
+	if !ok {
+		t.Fatal("created file handle 1 missing")
+	}
+	fh2, ok := fs.fileHandles.Get(createOut2.Fh)
+	if !ok {
+		t.Fatal("created file handle 2 missing")
+	}
+
+	oldData := bytes.Repeat([]byte{0x41}, 1024)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut1.NodeId},
+		Fh:       createOut1.Fh,
+		Offset:   0,
+	}, oldData); st != gofuse.OK {
+		t.Fatalf("Write old data status = %v, want OK", st)
+	}
+
+	const truncSize = 256
+	var attrOut gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: createOut1.NodeId, Caller: gofuse.Caller{Pid: callerPID}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     uint64(truncSize),
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr path truncate (multi-handle) status = %v, want OK", st)
+	}
+	if got := readCalls.Load(); got != 0 {
+		t.Fatalf("remote GET calls during multi-handle path truncate = %d, want 0", got)
+	}
+	// At least one of the dirty handles should reflect the truncated size.
+	adopted := fh1.Dirty.Size() == truncSize || fh2.Dirty.Size() == truncSize
+	if !adopted {
+		t.Fatalf("no dirty handle adopted the truncate: fh1=%d fh2=%d, want %d", fh1.Dirty.Size(), fh2.Dirty.Size(), truncSize)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut1.Fh})
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut2.Fh})
 }
 
 func TestSetAttr_WriteBackPathTruncateSkipsDefaultInheritedMode(t *testing.T) {

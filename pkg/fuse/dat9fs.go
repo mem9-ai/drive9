@@ -1620,11 +1620,15 @@ func (fs *Dat9FS) adoptOpenHandlePathTruncate(entry *InodeEntry, ino uint64, cal
 	for _, fh := range matching {
 		var abortStreamer func()
 		fh.Lock()
-		// Prefer the handle owned by the truncating caller when there is
-		// exactly one matching handle; otherwise adopt any dirty handle so a
-		// sibling-process truncate still succeeds against the local data.
+		// Prefer the handle owned by the truncating caller; otherwise adopt
+		// any dirty handle. This keeps a multi-open, uncommitted new file on
+		// the local path instead of falling back to the remote server (which
+		// has no copy yet and would return ENOENT). Adopting one dirty handle
+		// is enough: a path-truncate collapses the file to a single size; any
+		// sibling dirty handles will reconcile against the shadow store /
+		// pending index and re-sync on their next write.
 		ownerMatch := shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching))
-		if ownerMatch || len(matching) == 1 {
+		if !adopted && (ownerMatch || len(matching) >= 1) {
 			var err error
 			abortStreamer, err = fs.truncateWritableHandleLocked(fh, newSize)
 			if err != nil {
@@ -1637,6 +1641,10 @@ func (fs *Dat9FS) adoptOpenHandlePathTruncate(entry *InodeEntry, ino uint64, cal
 		fh.Unlock()
 		if abortStreamer != nil {
 			abortStreamer()
+		}
+		// Stop once one handle has adopted the truncate.
+		if adopted {
+			break
 		}
 	}
 	if !adopted {
@@ -8374,18 +8382,22 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	}
 
 	// POSIX readdir yields "." and ".." before the real entries. go-fuse's raw
-	// layer does not synthesize them (only nodefs does), so emit them here at
-	// the first page (offset 0). Pagination offsets for real entries start at
-	// len(synthetic)+1 so subsequent pages skip this block.
-	if input.Offset == 0 {
-		for _, e := range fs.dotDotEntries(dh) {
-			if !out.AddDirEntry(e) {
-				return gofuse.OK
-			}
+	// layer does not synthesize them (only nodefs does), so emit them here.
+	// Use a stable offset scheme: "." occupies offset 1, ".." offset 2, and
+	// real entry i occupies offset i + dotDirCount + 1, so the kernel can
+	// resume past the synthetic entries without skipping real children.
+	dots := fs.dotDotEntries(dh)
+	for d := int(input.Offset); d < len(dots); d++ {
+		if !out.AddDirEntry(dots[d]) {
+			return gofuse.OK
 		}
 	}
 
-	for i := int(input.Offset); i < len(dh.Entries); i++ {
+	realStart := int(input.Offset) - len(dots)
+	if realStart < 0 {
+		realStart = 0
+	}
+	for i := realStart; i < len(dh.Entries); i++ {
 		e := dh.Entries[i]
 		if !validDirEntryName(e.Name) {
 			continue
@@ -8394,7 +8406,7 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 			Name: e.Name,
 			Ino:  e.Ino,
 			Mode: e.Mode,
-			Off:  uint64(i + 1),
+			Off:  uint64(i + len(dots) + 1),
 		}) {
 			break
 		}
@@ -8422,24 +8434,33 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 		dh.Entries = entries
 	}
 
-	// POSIX "." / ".." entries on the first page (see ReadDir).
-	if input.Offset == 0 {
-		for _, e := range fs.dotDotEntries(dh) {
-			entryOut := out.AddDirLookupEntry(e)
-			if entryOut == nil {
-				return gofuse.OK
-			}
-			// Do not increment the lookup count for synthetic "." / "..":
-			// they share the directory / parent inode and must not pin extra
-			// kernel references. Fill attrs opportunistically when the entry
-			// exists so getdents see correct mode/size.
-			if inoEntry, found := fs.inodes.GetEntry(e.Ino); found {
-				fs.fillEntryOut(inoEntry, entryOut)
-			}
+	// POSIX "." / ".." entries before real children (see ReadDir). For
+	// READDIRPLUS the kernel treats a successful entry with a known inode as
+	// a lookup reference and will issue FORGET later, decrementing the inode
+	// Nlookup. Match go-fuse's nodefs behavior: emit "." / ".." with
+	// FUSE_UNKNOWN_INO (Ino=0) and do not fill attributes or increment the
+	// lookup count, so the kernel does not create dentries for them and the
+	// directory / parent inode lifetime accounting stays correct.
+	dots := fs.dotDotEntries(dh)
+	for d := int(input.Offset); d < len(dots); d++ {
+		e := dots[d]
+		e.Ino = 0 // addDirEntry maps 0 -> FUSE_UNKNOWN_INO; no kernel lookup ref.
+		entryOut := out.AddDirLookupEntry(e)
+		if entryOut == nil {
+			return gofuse.OK
 		}
+		// Match go-fuse's nodefs: advertise FUSE_UNKNOWN_INO so the kernel does
+		// not create a dentry for "." / ".." and never issues FORGET for them.
+		// This keeps the directory / parent Nlookup accounting correct (no
+		// IncrementLookup was done for these entries).
+		entryOut.NodeId = gofuse.FUSE_UNKNOWN_INO
 	}
 
-	for i := int(input.Offset); i < len(dh.Entries); i++ {
+	realStart := int(input.Offset) - len(dots)
+	if realStart < 0 {
+		realStart = 0
+	}
+	for i := realStart; i < len(dh.Entries); i++ {
 		e := dh.Entries[i]
 		if !validDirEntryName(e.Name) {
 			continue
@@ -8452,7 +8473,7 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 			Name: e.Name,
 			Ino:  e.Ino,
 			Mode: e.Mode,
-			Off:  uint64(i + 1),
+			Off:  uint64(i + len(dots) + 1),
 		})
 		if entryOut == nil {
 			break
@@ -9023,13 +9044,25 @@ func (fs *Dat9FS) dotDotEntries(dh *DirHandle) []gofuse.DirEntry {
 
 // parentDirIno returns the inode of a directory's parent, or 0 (FUSE_UNKNOWN_INO)
 // when the parent is not currently known. The root directory is its own parent.
+// The inode table stores directory paths without trailing slashes (root is "/"),
+// while pathutil.ParentPath returns a trailing slash for non-root parents, so
+// strip it before lookup.
 func (fs *Dat9FS) parentDirIno(dirPath string) uint64 {
 	parentPath := pathutil.ParentPath(dirPath)
 	if parentPath == dirPath {
 		// Root: parent is itself.
 		return fs.inodeOrZero(dirPath)
 	}
-	return fs.inodeOrZero(parentPath)
+	return fs.inodeOrZero(stripTrailingSlash(parentPath))
+}
+
+// stripTrailingSlash removes a single trailing slash from a non-root path so
+// it matches the inode-table convention; "/" is returned unchanged.
+func stripTrailingSlash(p string) string {
+	if p == "/" || !strings.HasSuffix(p, "/") {
+		return p
+	}
+	return strings.TrimSuffix(p, "/")
 }
 
 func (fs *Dat9FS) inodeOrZero(p string) uint64 {
