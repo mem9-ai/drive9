@@ -7815,6 +7815,64 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 	}
 }
 
+func TestFsyncDirRemotePathReturnsOK(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be used for directory fsync", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	dirIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	fh := fs.dirHandles.Allocate(&DirHandle{Ino: dirIno, Path: "/repo"})
+
+	if st := fs.FsyncDir(nil, &gofuse.FsyncIn{Fh: fh}); st != gofuse.OK {
+		t.Fatalf("FsyncDir remote path status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+}
+
+func TestFsyncDirLocalOverlaySyncsDirectory(t *testing.T) {
+	var syncCalls atomic.Int32
+	previousSync := syncOpenLocalFile
+	syncOpenLocalFile = func(file *os.File) error {
+		syncCalls.Add(1)
+		return nil
+	}
+	t.Cleanup(func() {
+		syncOpenLocalFile = previousSync
+	})
+
+	opts := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: t.TempDir(),
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var gitOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Mode:     0o755,
+	}, ".git", &gitOut); st != gofuse.OK {
+		t.Fatalf("Mkdir .git: %v", st)
+	}
+	fh := fs.dirHandles.Allocate(&DirHandle{Ino: gitOut.NodeId, Path: "/repo/.git"})
+
+	if st := fs.FsyncDir(nil, &gofuse.FsyncIn{Fh: fh}); st != gofuse.OK {
+		t.Fatalf("FsyncDir local overlay status = %v, want OK", st)
+	}
+	if got := syncCalls.Load(); got != 1 {
+		t.Fatalf("FsyncDir sync calls = %d, want 1", got)
+	}
+}
+
 func TestSQLiteWALIndexSidecarUsesTransientLocalOverlay(t *testing.T) {
 	var remoteCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -7847,10 +7905,13 @@ func TestSQLiteWALIndexSidecarUsesTransientLocalOverlay(t *testing.T) {
 	var createOut gofuse.CreateOut
 	if st := fs.Create(nil, &gofuse.CreateIn{
 		InHeader: gofuse.InHeader{NodeId: repoIno},
-		Flags:    uint32(syscall.O_RDWR),
+		Flags:    uint32(syscall.O_RDWR | syscall.O_TRUNC),
 		Mode:     0o644,
 	}, "workload.db-shm", &createOut); st != gofuse.OK {
 		t.Fatalf("Create workload.db-shm: %v", st)
+	}
+	if createOut.OpenFlags != gofuse.FOPEN_KEEP_CACHE {
+		t.Fatalf("Create workload.db-shm open flags = %d, want FOPEN_KEEP_CACHE for local mmap", createOut.OpenFlags)
 	}
 
 	content := []byte("sqlite wal-index bytes")
@@ -7897,6 +7958,9 @@ func TestSQLiteWALIndexSidecarUsesTransientLocalOverlay(t *testing.T) {
 		Flags:    uint32(syscall.O_RDONLY),
 	}, &openOut); st != gofuse.OK {
 		t.Fatalf("Open workload.db-shm: %v", st)
+	}
+	if openOut.OpenFlags != gofuse.FOPEN_KEEP_CACHE {
+		t.Fatalf("Open workload.db-shm open flags = %d, want FOPEN_KEEP_CACHE for local mmap", openOut.OpenFlags)
 	}
 	buf := make([]byte, len(content)+8)
 	result, st := fs.Read(nil, &gofuse.ReadIn{
