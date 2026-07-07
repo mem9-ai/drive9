@@ -267,8 +267,8 @@ class Drive9SqliteBlackbox(Drive9WorkflowBase):
         failure mode). Any other error is re-raised so we do not mask
         unrelated failures.
         """
-        path = os.fspath(db_path)
-        size = os.path.getsize(path)
+        path = os.fsencode(os.fspath(db_path))
+        size = os.path.getsize(os.fspath(db_path))
         if size == 0:
             return False
         libc = _libc()
@@ -285,7 +285,7 @@ class Drive9SqliteBlackbox(Drive9WorkflowBase):
                 # ENODEV (19 on Linux, 6 on macOS) is the target failure.
                 if err in (19, 6):
                     return False
-                raise BlackboxError(f"mmap({path!r}) failed: errno={err}")
+                raise BlackboxError(f"mmap({db_path!r}) failed: errno={err}")
             # Read the SQLite header magic to confirm the mapping is usable.
             # A valid SQLite DB file starts with "SQLite format 3\0".
             try:
