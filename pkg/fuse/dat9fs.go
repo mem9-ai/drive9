@@ -1584,6 +1584,70 @@ func (fs *Dat9FS) adoptSingleCallerPathTruncate(remotePath string, callerPID uin
 	return adopted
 }
 
+// adoptOpenHandlePathTruncate applies a path-based truncate of an uncommitted
+// newly-created file (entry.Revision <= 0) to its owning open dirty handle
+// instead of the remote server, which has no copy of the data yet. It returns
+// OK when a dirty handle adopted the truncation, ENOENT when no eligible dirty
+// handle exists (callers fall back to the remote path), or another status on
+// a hard failure. Unlike adoptSingleCallerPathTruncate this handles any
+// newSize and does not require the truncating PID to own the handle, so a
+// different process can truncate a just-created file by path before Flush.
+func (fs *Dat9FS) adoptOpenHandlePathTruncate(entry *InodeEntry, ino uint64, callerPID uint32, newSize int64) gofuse.Status {
+	if fs == nil || fs.openHandles == nil || entry == nil || entry.Path == "" {
+		return gofuse.ENOENT
+	}
+	if newSize < 0 {
+		return gofuse.Status(syscall.EINVAL)
+	}
+
+	var matching []*FileHandle
+	for _, fh := range fs.openHandles.SnapshotPath(entry.Path) {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		dirty := fh.Dirty != nil
+		fh.Unlock()
+		if dirty {
+			matching = append(matching, fh)
+		}
+	}
+	if len(matching) == 0 {
+		return gofuse.ENOENT
+	}
+
+	adopted := false
+	for _, fh := range matching {
+		var abortStreamer func()
+		fh.Lock()
+		// Prefer the handle owned by the truncating caller when there is
+		// exactly one matching handle; otherwise adopt any dirty handle so a
+		// sibling-process truncate still succeeds against the local data.
+		ownerMatch := shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching))
+		if ownerMatch || len(matching) == 1 {
+			var err error
+			abortStreamer, err = fs.truncateWritableHandleLocked(fh, newSize)
+			if err != nil {
+				log.Printf("open-handle path truncate failed for %s: %v", fh.Path, err)
+				fh.Unlock()
+				continue
+			}
+			adopted = true
+		}
+		fh.Unlock()
+		if abortStreamer != nil {
+			abortStreamer()
+		}
+	}
+	if !adopted {
+		return gofuse.ENOENT
+	}
+	if newSize == 0 {
+		fs.markDirtySize(ino, 0)
+	}
+	return gofuse.OK
+}
+
 func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision int64, skip *FileHandle) {
 	if fs == nil || fs.openHandles == nil || path == "" || revision <= 0 {
 		return
@@ -2443,6 +2507,24 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 	}
 	if newSize > int64(int(^uint(0)>>1)) {
 		return gofuse.Status(syscall.EFBIG)
+	}
+
+	// A newly-created file (e.g. open(O_CREAT) in write-back mode) may have
+	// data only in an open dirty handle and the shadow store, with no remote
+	// base revision yet. A path-based truncate(path, size) on such a file must
+	// not consult the remote server — the file does not exist there and the
+	// read would return NotFound, surfacing a spurious ENOENT to the caller
+	// (observed with LTP truncate02: create -> write -> truncate(path)).
+	// Delegate the truncation to the owning dirty handle, mirroring the
+	// newSize==0 adoption path; the handle commits the new size on Flush.
+	if entry.Revision <= 0 && !fs.layerEnabled() {
+		if st := fs.adoptOpenHandlePathTruncate(entry, ino, pid, newSize); st == gofuse.OK {
+			fs.invalidateReadCacheAndTargets(entry.Path)
+			fs.cacheFileForPath(entry.Path, newSize, entry.Mtime, 0)
+			return gofuse.OK
+		} else if st != gofuse.ENOENT {
+			return st
+		}
 	}
 
 	apiPath := fs.remotePath(entry.Path)

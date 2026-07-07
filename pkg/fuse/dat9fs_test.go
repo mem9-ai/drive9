@@ -12559,6 +12559,149 @@ func TestSetAttr_WriteBackPathTruncateAdoptsCreatedSameCallerWriter(t *testing.T
 	}
 }
 
+// TestSetAttr_WriteBackPathTruncateCreatedNonZero reproduces LTP truncate02:
+// a file created with O_CREAT and written to in write-back mode has no remote
+// base revision yet, so a path-based truncate(path, size) with a non-zero size
+// must not consult the remote server (which would return NotFound and surface
+// ENOENT to the caller). The truncation should be applied to the open dirty
+// handle and committed on Flush, leaving the remote untouched until then.
+func TestSetAttr_WriteBackPathTruncateCreatedNonZero(t *testing.T) {
+	const callerPID = 6262
+	var readCalls atomic.Int32
+	var putCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/created.bin" && r.URL.RawQuery == "create=1":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+		case r.Method == http.MethodGet:
+			readCalls.Add(1)
+			http.NotFound(w, r)
+		case r.Method == http.MethodPut:
+			putCalls.Add(1)
+			http.Error(w, "unexpected PUT", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:   8,
+		queue:        []*CommitEntry{},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+		workCh:       make(chan *CommitEntry, 16),
+	}
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1, Caller: gofuse.Caller{Pid: callerPID}},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     defaultRegularFileMode,
+	}, "created.bin", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created file handle missing")
+	}
+
+	const initialSize = 1024
+	oldData := bytes.Repeat([]byte{0x41}, initialSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, oldData); st != gofuse.OK {
+		t.Fatalf("Write old data status = %v, want OK", st)
+	}
+	if got := fh.Dirty.Size(); got != initialSize {
+		t.Fatalf("dirty size after write = %d, want %d", got, initialSize)
+	}
+
+	// Path-based truncate(path, 256) — FATTR_SIZE only, no FATTR_FH.
+	const truncSize = 256
+	var attrOut gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId, Caller: gofuse.Caller{Pid: callerPID}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     uint64(truncSize),
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr path truncate status = %v, want OK (truncate02 regression)", st)
+	}
+	if got := fh.Dirty.Size(); got != truncSize {
+		t.Fatalf("dirty size after path truncate = %d, want %d", got, truncSize)
+	}
+	if attrOut.Size != truncSize {
+		t.Fatalf("attr size after path truncate = %d, want %d", attrOut.Size, truncSize)
+	}
+	if got := readCalls.Load(); got != 0 {
+		t.Fatalf("remote GET calls during created path truncate = %d, want 0 (no remote data to read)", got)
+	}
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("remote PUT calls during created path truncate = %d, want 0 (commit deferred to Flush)", got)
+	}
+	if fs.commitQueue.HasPath("/created.bin") {
+		t.Fatal("created non-zero truncate queued an overwrite commit before Flush")
+	}
+
+	// The first 256 bytes of the original content must survive the truncate.
+	gotShadow, err := shadow.ReadAll("/created.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotShadow) != truncSize {
+		t.Fatalf("shadow size after path truncate = %d, want %d", len(gotShadow), truncSize)
+	}
+	if !bytes.Equal(gotShadow, oldData[:truncSize]) {
+		t.Fatalf("shadow prefix mismatch after path truncate: got %q, want %q", gotShadow, oldData[:truncSize])
+	}
+
+	// A read via the open handle must see the truncated content.
+	readBuf := make([]byte, truncSize)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+		Size:     uint32(truncSize),
+	}, readBuf)
+	if st != gofuse.OK {
+		t.Fatalf("Read after path truncate status = %v, want OK", st)
+	}
+	read, st := result.Bytes(nil)
+	if st != gofuse.OK {
+		t.Fatalf("Read.Bytes after path truncate status = %v, want OK", st)
+	}
+	if len(read) != truncSize {
+		t.Fatalf("Read after path truncate returned %d bytes, want %d", len(read), truncSize)
+	}
+	if !bytes.Equal(read, oldData[:truncSize]) {
+		t.Fatalf("read content after path truncate = %q, want %q", read, oldData[:truncSize])
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+}
+
 func TestSetAttr_WriteBackPathTruncateSkipsDefaultInheritedMode(t *testing.T) {
 	fs, shadow, pending := newWriteBackPathTruncateModeTestFS(t)
 
