@@ -131,11 +131,19 @@ do the failure analysis before creating or changing repo issues:
 3. Report the findings first in the Slock/Raft smoke-test thread that requested
    or owns the run. Include the failed case, evidence, log path, impact, and
    root-cause assessment.
-4. If the failure is a code problem, search existing GitHub issues before filing
+4. Include an investigation-context block with non-secret identifiers needed for
+   external/cloud-side debugging when they are available: run id, branch/commit,
+   endpoint/region, parent/fork/admin tenant ids, Drive9 tenant status/kind,
+   TiDB Cloud cluster id/state, branch id/state/display name/user prefix/public
+   endpoint, relevant create/update/failure timestamps, failed checks, cleanup
+   registry path, pending-cleanup state, and retained-resource decision. Never
+   include API keys, private keys, DB passwords, bearer tokens, full DSNs, or
+   credential files in chat or issues.
+5. If the failure is a code problem, search existing GitHub issues before filing
    a new one. Create or update the matching issue with: background, reproduction
    steps, evidence logs, impact, root-cause analysis or suspicious code path,
    suggested fix direction, and validation plan.
-5. If the failure is due to environment, credentials, runner setup, endpoint
+6. If the failure is due to environment, credentials, runner setup, endpoint
    availability, or another non-code operational condition, report that in the
    Slock/Raft thread instead of filing a code bug, unless durable repo tracking
    is needed because the condition is recurring or needs engineering follow-up.
