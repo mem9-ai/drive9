@@ -63,6 +63,14 @@ done
 
 if [ -n "$ONLY" ]; then
   SDKS="$(echo "$ONLY" | tr ',' ' ')"
+  # Validate tokens so a typo (e.g. --only go,typescript) doesn't silently
+  # run nothing for the unrecognized SDK.
+  for s in $SDKS; do
+    if ! echo "$ALL_SDKS" | grep -qw "$s"; then
+      echo "unknown SDK in --only: '$s' (known: $(echo $ALL_SDKS))" >&2
+      exit 2
+    fi
+  done
 else
   SDKS="$ALL_SDKS"
 fi
@@ -194,6 +202,11 @@ bootstrap_db() {
     echo "docker is required to bootstrap MySQL but was not found" >&2
     exit 1
   fi
+  # Remove any stale container from a previous run (--keep-server, a crash
+  # where --rm didn't fire, etc.) before starting a fresh one. docker run
+  # fails immediately on a name conflict, so this prevents a confusing
+  # "container name already in use" exit.
+  docker rm -f "$MYSQL_CONTAINER_NAME" >/dev/null 2>&1 || true
   MYSQL_CID="$(docker run -d --rm \
     --name "$MYSQL_CONTAINER_NAME" \
     -p "127.0.0.1:${MYSQL_CONTAINER_PORT}:3306" \

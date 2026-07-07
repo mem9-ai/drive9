@@ -186,10 +186,7 @@ class StreamWriter:
         if executor is not None:
             executor.shutdown(wait=True)
         if upload_id is not None:
-            try:
-                self._client._abort_upload_v2(upload_id)
-            finally:
-                pass
+            self._client._abort_upload_v2(upload_id)
 
     def _wait_inflight(self):
         with self._mu:
