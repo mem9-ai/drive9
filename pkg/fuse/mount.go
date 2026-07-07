@@ -1194,15 +1194,16 @@ func transientOverlayMountID() string {
 
 func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 	fuseOpts := &gofuse.MountOptions{
-		FsName:        "drive9",
-		Name:          "drive9",
-		MaxReadAhead:  8 * 1024 * 1024, // 8MB — larger readahead reduces FUSE kernel↔userspace switches
-		MaxWrite:      128 * 1024,      // 128KB per write request (default 64KB)
-		MaxBackground: 32,              // concurrent background FUSE requests (default 12)
-		SyncRead:      opts.SyncRead,   // disables FUSE_CAP_ASYNC_READ; one read in flight per file handle
-		EnableLocks:   true,
-		Debug:         opts.Debug,
-		AllowOther:    opts.AllowOther,
+		FsName:             "drive9",
+		Name:               "drive9",
+		MaxReadAhead:       8 * 1024 * 1024, // 8MB — larger readahead reduces FUSE kernel↔userspace switches
+		MaxWrite:           128 * 1024,      // 128KB per write request (default 64KB)
+		MaxBackground:      32,              // concurrent background FUSE requests (default 12)
+		SyncRead:           opts.SyncRead,   // disables FUSE_CAP_ASYNC_READ; one read in flight per file handle
+		EnableLocks:        true,
+		Debug:              opts.Debug,
+		AllowOther:         opts.AllowOther,
+		EnableDirectIoMmap: true, // allow mmap on FOPEN_DIRECT_IO handles (e.g. SQLite *.db with mmap_size>0); no-op on kernels without CAP_DIRECT_IO_ALLOW_MMAP
 	}
 	if runtime.GOOS == "linux" {
 		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
