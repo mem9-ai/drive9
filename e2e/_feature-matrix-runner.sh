@@ -1286,7 +1286,7 @@ main() {
     record "PASS" "Provisioning" "use provided DRIVE9_API_KEY" "provided"
   else
     local resp code body
-    resp=$(drive9_provision_curl_body_code "$BASE")
+    resp=$(drive9_provision_curl_body_code "$BASE" || true)
     code=$(http_code "$resp")
     body=$(json_body "$resp")
     if [ "$code" = "202" ]; then

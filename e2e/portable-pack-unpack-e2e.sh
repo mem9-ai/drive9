@@ -226,7 +226,7 @@ fi
 echo "[1] provision tenant"
 if [ -z "$DRIVE9_API_KEY" ]; then
   pfile="$(mktemp)"
-  pcode=$(drive9_provision_to_file "$BASE" "$pfile")
+  pcode=$(drive9_provision_to_file "$BASE" "$pfile" || true)
   check_eq "POST /v1/provision returns 202" "$pcode" "202"
   API_KEY=$(jq -r '.api_key // empty' "$pfile")
   rm -f "$pfile"

@@ -55,15 +55,16 @@ drive9_provision_to_file() {
 
   while :; do
     if [ -n "$body" ]; then
-      code=$(curl -sS -o "$output_file" -w "%{http_code}" -X POST \
+      code=$(printf '%s' "$body" | curl -sS -o "$output_file" -w "%{http_code}" -X POST \
         -H "Content-Type: application/json" \
-        --data-binary "$body" \
-        "$base/v1/provision")
+        --data-binary @- \
+        "$base/v1/provision" || true)
     else
-      code=$(curl -sS -o "$output_file" -w "%{http_code}" -X POST "$base/v1/provision")
+      code=$(curl -sS -o "$output_file" -w "%{http_code}" -X POST "$base/v1/provision" || true)
     fi
+    code="$(drive9_provision_normalize_http_code "$code")"
 
-    if [ "$code" != "429" ] || [ "$attempt" -ge "$max_retries" ]; then
+    if ! drive9_provision_retryable_code "$code" || [ "$attempt" -ge "$max_retries" ]; then
       if [ "$code" = "202" ]; then
         tenant_id="$(jq -r '.tenant_id // empty' "$output_file" 2>/dev/null || true)"
         api_key="$(jq -r '.api_key // empty' "$output_file" 2>/dev/null || true)"
@@ -83,10 +84,24 @@ drive9_provision_to_file() {
       return
     fi
 
-    echo "provision throttled (429), retrying ${attempt}/${max_retries}" >&2
+    echo "provision returned http=$code, retrying ${attempt}/${max_retries}" >&2
     attempt=$((attempt + 1))
     sleep "$retry_sleep"
   done
+}
+
+drive9_provision_normalize_http_code() {
+  case "$1" in
+    [0-9][0-9][0-9]) printf '%s' "$1" ;;
+    *) printf '000' ;;
+  esac
+}
+
+drive9_provision_retryable_code() {
+  case "$1" in
+    000|403|429|5??) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 drive9_provision_curl_body_code() {

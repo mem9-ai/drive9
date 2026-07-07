@@ -47,6 +47,10 @@ sanitized summary under `~/.cache/drive9-smoke/cleanup-completed/`; incomplete
 cleanup leaves the raw registry pending for retry by `e2e/cleanup-pending.sh`.
 Standalone suites fail before provisioning if cleanup is enabled without a
 registry prepared by `smoke-all.sh`.
+If a pending registry was created with TiDBCloud-native credentials, retries must
+run with the same `DRIVE9_TIDBCLOUD_PUBLIC_KEY` and
+`DRIVE9_TIDBCLOUD_PRIVATE_KEY` environment available; the registry records only
+that credentials are required, not the credential values themselves.
 
 Supported modes:
 
@@ -62,6 +66,7 @@ Supported modes:
 | `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download |
 | `api-smoke-test-existing-key.sh` | Existing API key status/list checks |
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, default-slot `pack`/`unpack`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
+| `cleanup-pending.sh` | Manual retry helper for pending hosted cleanup registries left by interrupted `smoke-all.sh` runs; `smoke-all.sh` also invokes the same pending cleanup path before starting a new cleanup-enabled run |
 | `layer-fs-smoke-test.sh` | Layer filesystem API+CLI+FUSE workflow: create by name/tag, diff/checkpoint lookup, rollback, commit, scope rejection, conflict detection, mkdir/upsert/whiteout/rename/symlink/chmod entries, and checkpoint/full restore into fresh local roots |
 | `layer-fs-smoke-test-realdev.sh` | Manual realdev wrapper for `layer-fs-smoke-test.sh`; defaults to the shared dev endpoint and enables strict FUSE restore coverage without being wired into `local-e2e` CI |
 | `portable-pack-unpack-e2e.sh` | Portable profile pack/unpack over a deterministic local repo: offline npm `file:` install creates `node_modules`, Git staged/unstaged/untracked status changes are captured, pack writes the default hidden archive, fresh local-root unpack restores overlay files, symlinks, `.git`, `node_modules`, branch, HEAD, and `git status` |
@@ -94,7 +99,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, full `smoke-all.sh` (journal, posix-permission, git-workspace), git feature matrix |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | `e2e-all` workflow (`Run workflow` button) | Everything above + pjdfstest POSIX suite (best-effort) via `run_all_e2e=1` |
-| Manual only | not wired, run by hand | `layer-fs-smoke-test-realdev.sh` (shared dev endpoint), `verify-description-e2e.sh` (Docker + Ollama), `verify-description-tidb-zero-e2e.sh` (TiDB Cloud Zero), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `local-smoke.sh` (`make e2e-local` wrapper) |
+| Manual only | not wired, run by hand | `layer-fs-smoke-test-realdev.sh` (shared dev endpoint), `verify-description-e2e.sh` (Docker + Ollama), `verify-description-tidb-zero-e2e.sh` (TiDB Cloud Zero), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `cleanup-pending.sh` (manual pending cleanup retry helper; also invoked by cleanup-enabled `smoke-all.sh` before a run), `local-smoke.sh` (`make e2e-local` wrapper) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
