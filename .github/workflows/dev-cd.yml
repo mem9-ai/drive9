@@ -70,15 +70,19 @@ jobs:
       - name: Log in to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Set up QEMU for cross-platform builds
+        uses: docker/setup-qemu-action@v3
+
       - name: Build and push image
         run: |
           IMAGE_BASE=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
-          # amd64 (native)
+          LDFLAGS="-X github.com/mem9-ai/drive9/pkg/buildinfo.Version=${{ env.IMAGE_TAG }} -X github.com/mem9-ai/drive9/pkg/buildinfo.GitHash=$(git rev-parse --short=7 HEAD) -X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          # amd64
           make docker-build IMAGE_REPO=$IMAGE_BASE IMAGE_TAG=${{ env.IMAGE_TAG }}-amd64 GOARCH=amd64
           docker push $IMAGE_BASE:${{ env.IMAGE_TAG }}-amd64
-          # arm64 — cross-compile binary, then build arm64 Docker image
+          # arm64
           mkdir -p bin
-          CGO_ENABLED=0 GOARCH=arm64 go build -o bin/drive9-server ./cmd/drive9-server
+          CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o bin/drive9-server ./cmd/drive9-server
           docker build --platform linux/arm64 -t $IMAGE_BASE:${{ env.IMAGE_TAG }}-arm64 .
           docker push $IMAGE_BASE:${{ env.IMAGE_TAG }}-arm64
           # multi-arch manifest
