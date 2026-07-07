@@ -161,7 +161,7 @@ func TestDispatchHelpCommandShowsVisualTreeHelp(t *testing.T) {
 		"drive9 <command> [args] [flags]",
 		"drive9 fs <command> [arguments]",
 		"drive9 git <clone|worktree|hydrate>",
-		"Anonymous mode transfers data management rights to PingCAP",
+		"Anonymous mode is a quick-start workspace hosted by TiDB",
 		"--tidbcloud-public-key KEY",
 		"--tidbcloud-private-key KEY",
 		"drive9 region list [--json] [--manifest-url URL]",
