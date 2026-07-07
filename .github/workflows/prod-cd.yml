@@ -42,8 +42,7 @@ jobs:
       id-token: write
       contents: read
     outputs:
-      image: ${{ steps.resolve.outputs.image }}
-      registry: ${{ steps.resolve.outputs.registry }}
+      tag: ${{ steps.resolve.outputs.tag }}
       drive9_sha: ${{ steps.resolve.outputs.drive9_sha }}
     steps:
       - name: Configure AWS credentials
@@ -117,10 +116,8 @@ jobs:
             exit 1
           fi
 
-          REGISTRY="${IMAGE%%/*}"
           {
-            echo "image=$IMAGE"
-            echo "registry=$REGISTRY"
+            echo "tag=$TAG"
             echo "drive9_sha=$SHA"
           } >> "$GITHUB_OUTPUT"
 
@@ -132,10 +129,13 @@ jobs:
       id-token: write
       contents: read
     env:
-      IMAGE: ${{ needs.resolve.outputs.image }}
-      REGISTRY: ${{ needs.resolve.outputs.registry }}
+      TAG: ${{ needs.resolve.outputs.tag }}
 
     steps:
+      - name: Resolve image ref
+        run: |
+          echo "IMAGE=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG" >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -149,7 +149,7 @@ jobs:
           set -euo pipefail
           echo "Promoting image: $IMAGE"
           aws ecr get-login-password --region ap-southeast-1 | \
-            docker login --username AWS --password-stdin "$REGISTRY"
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
           docker pull "$IMAGE"
       - name: Deploy to aws-ap-southeast-1
         id: deploy-sg
