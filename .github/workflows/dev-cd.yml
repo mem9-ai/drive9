@@ -70,10 +70,24 @@ jobs:
       - name: Log in to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Set up QEMU for cross-platform builds
+        uses: docker/setup-qemu-action@v3
+
       - name: Build and push image
         run: |
-          make docker-build IMAGE_REPO=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} IMAGE_TAG=${{ env.IMAGE_TAG }}
-          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          IMAGE_BASE=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+          VERSION=${{ env.IMAGE_TAG }}
+          # amd64
+          make docker-build IMAGE_REPO=$IMAGE_BASE IMAGE_TAG=$VERSION-amd64 GOARCH=amd64 VERSION=$VERSION GIT_BRANCH=${{ github.ref_name }}
+          docker push $IMAGE_BASE:$VERSION-amd64
+          # arm64
+          make docker-build IMAGE_REPO=$IMAGE_BASE IMAGE_TAG=$VERSION-arm64 GOARCH=arm64 VERSION=$VERSION GIT_BRANCH=${{ github.ref_name }} DOCKER_BUILD_ARGS="--platform linux/arm64"
+          docker push $IMAGE_BASE:$VERSION-arm64
+          # multi-arch manifest
+          docker manifest create $IMAGE_BASE:$VERSION \
+            $IMAGE_BASE:$VERSION-amd64 \
+            $IMAGE_BASE:$VERSION-arm64
+          docker manifest push $IMAGE_BASE:$VERSION
 
       - name: Update kubeconfig
         run: |
