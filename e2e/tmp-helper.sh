@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Shared temporary-directory helpers for live e2e scripts.
 
+if [ -n "${DRIVE9_TMP_HELPER_LOADED:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 DRIVE9_TMP_HELPER_LOADED=1
 
 drive9_e2e_init_tmpdir() {
@@ -11,8 +14,11 @@ drive9_e2e_init_tmpdir() {
     return 1
   fi
 
-  umask 077
   mkdir -p "$tmp_root" || return 1
+  case "$tmp_root" in
+    /tmp|/tmp/|/var/tmp|/var/tmp/) ;;
+    *) chmod 700 "$tmp_root" || return 1 ;;
+  esac
   export DRIVE9_E2E_TMPDIR="$tmp_root"
   export TMPDIR="$tmp_root"
 }

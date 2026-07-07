@@ -234,7 +234,7 @@ SEM_TEXT_OTHER="${ROOT_DIR}/notes/dog-story-${TS}.txt"
 IMAGE_CAPTION_REMOTE="${ROOT_DIR}/assets/icon-${TS}.caption.txt"
 
 step "1" "Provision tenant"
-resp=$(drive9_provision_curl_body_code "$BASE")
+resp=$(drive9_provision_curl_body_code "$BASE" || true)
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "POST /v1/provision returns 202" "$code" "202"

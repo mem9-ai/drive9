@@ -538,7 +538,7 @@ if [ -n "$DRIVE9_API_KEY" ]; then
   API_KEY="$DRIVE9_API_KEY"
   check_eq "use provided DRIVE9_API_KEY" "true" "true"
 else
-  resp=$(drive9_provision_curl_body_code "$BASE")
+  resp=$(drive9_provision_curl_body_code "$BASE" || true)
   code=$(http_code "$resp")
   body=$(json_body "$resp")
   check_eq "POST /v1/provision returns 202" "$code" "202"

@@ -3,6 +3,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/tmp-helper.sh"
+drive9_e2e_init_tmpdir
+
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-60}"

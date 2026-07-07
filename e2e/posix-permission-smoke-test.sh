@@ -288,7 +288,7 @@ fi
 # [1] Provision tenant
 # ---------------------------------------------------------------------------
 echo "[1] provision tenant"
-resp=$(drive9_provision_curl_body_code "$BASE")
+resp=$(drive9_provision_curl_body_code "$BASE" || true)
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "POST /v1/provision returns 202" "$code" "202"

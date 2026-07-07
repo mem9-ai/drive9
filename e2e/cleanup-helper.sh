@@ -127,7 +127,7 @@ drive9_cleanup_lock_active() {
 }
 
 drive9_cleanup_init_run() {
-  local mode run_id cache_root pending_dir completed_dir retained_dir registry lock_file run_dir
+  local mode run_id cache_root pending_dir completed_dir retained_dir registry lock_file run_dir old_umask
 
   mode="$(drive9_cleanup_mode)"
   case "$mode" in
@@ -153,17 +153,38 @@ drive9_cleanup_init_run() {
   drive9_cleanup_validate_registry_name "$registry" || return 1
   drive9_cleanup_validate_registry_run_id "$registry" "$run_id" || return 1
 
+  old_umask="$(umask)"
   umask 077
-  mkdir -p "$pending_dir" "$completed_dir" "$retained_dir" "$run_dir" || return 1
+  mkdir -p "$pending_dir" "$completed_dir" "$retained_dir" "$run_dir" || {
+    umask "$old_umask"
+    return 1
+  }
   if [ -s "$registry" ]; then
     echo "cleanup registry already exists and is non-empty: $registry" >&2
+    umask "$old_umask"
     return 1
   fi
-  : >"$registry" || return 1
-  chmod 600 "$registry" || return 1
-  drive9_cleanup_validate_registry_file "$registry" || return 1
-  printf '%s\n' "$$" >"$lock_file" || return 1
-  chmod 600 "$lock_file" || return 1
+  : >"$registry" || {
+    umask "$old_umask"
+    return 1
+  }
+  chmod 600 "$registry" || {
+    umask "$old_umask"
+    return 1
+  }
+  drive9_cleanup_validate_registry_file "$registry" || {
+    umask "$old_umask"
+    return 1
+  }
+  printf '%s\n' "$$" >"$lock_file" || {
+    umask "$old_umask"
+    return 1
+  }
+  chmod 600 "$lock_file" || {
+    umask "$old_umask"
+    return 1
+  }
+  umask "$old_umask"
 
   export DRIVE9_E2E_RUN_ID="$run_id"
   export DRIVE9_E2E_RUN_DIR="$run_dir"
@@ -212,7 +233,7 @@ drive9_cleanup_require_ready() {
 
 drive9_cleanup_register() {
   local kind="$1" suite="$2" base="$3" tenant_id="$4" api_key="$5"
-  local registry run_id created_at
+  local registry run_id created_at public_key private_key cleanup_requires_tidbcloud=false
 
   if ! drive9_cleanup_require_ready; then
     return 1
@@ -247,6 +268,15 @@ drive9_cleanup_register() {
     echo "jq is required for cleanup registration" >&2
     return 1
   fi
+  public_key="${DRIVE9_TIDBCLOUD_PUBLIC_KEY:-${DRIVE9_PUBLIC_KEY:-}}"
+  private_key="${DRIVE9_TIDBCLOUD_PRIVATE_KEY:-${DRIVE9_PRIVATE_KEY:-}}"
+  if [ -n "$public_key" ] || [ -n "$private_key" ]; then
+    if [ -z "$public_key" ] || [ -z "$private_key" ]; then
+      echo "cleanup registration requires both TiDBCloud public and private keys, or neither for default-key endpoints" >&2
+      return 1
+    fi
+    cleanup_requires_tidbcloud=true
+  fi
 
   jq -cn \
     --arg source "$DRIVE9_E2E_CLEANUP_SOURCE" \
@@ -257,7 +287,8 @@ drive9_cleanup_register() {
     --arg tenant_id "$tenant_id" \
     --arg api_key "$api_key" \
     --arg created_at "$created_at" \
-    '{source:$source, run_id:$run_id, kind:$kind, suite:$suite, base:$base, tenant_id:$tenant_id, api_key:$api_key, created_at:$created_at}' \
+    --argjson cleanup_requires_tidbcloud "$cleanup_requires_tidbcloud" \
+    '{source:$source, run_id:$run_id, kind:$kind, suite:$suite, base:$base, tenant_id:$tenant_id, api_key:$api_key, created_at:$created_at, cleanup_requires_tidbcloud:$cleanup_requires_tidbcloud}' \
     >>"$registry"
   chmod 600 "$registry" >/dev/null 2>&1 || true
   echo "registered cleanup: suite=$suite kind=$kind tenant_id=$tenant_id" >&2
@@ -297,7 +328,8 @@ drive9_cleanup_validate_registry() {
        and (.suite | type == "string")
        and (.base | type == "string" and (startswith("http://") or startswith("https://")))
        and (.tenant_id | type == "string" and length > 0)
-       and (.api_key | type == "string" and length > 0)' \
+       and (.api_key | type == "string" and length > 0)
+       and ((.cleanup_requires_tidbcloud // false) | type == "boolean")' \
       >/dev/null 2>&1 <<<"$line"; then
       echo "refusing cleanup: invalid registry record at $registry:$n" >&2
       return 1
@@ -309,8 +341,13 @@ drive9_cleanup_body_args() {
   local public_key="${DRIVE9_TIDBCLOUD_PUBLIC_KEY:-${DRIVE9_PUBLIC_KEY:-}}"
   local private_key="${DRIVE9_TIDBCLOUD_PRIVATE_KEY:-${DRIVE9_PRIVATE_KEY:-}}"
   local body_file="$1"
+  local requires_tidbcloud="${2:-false}"
 
   if [ -z "$public_key" ] && [ -z "$private_key" ]; then
+    if [ "$requires_tidbcloud" = "true" ]; then
+      echo "TiDBCloud cleanup requires DRIVE9_TIDBCLOUD_PUBLIC_KEY and DRIVE9_TIDBCLOUD_PRIVATE_KEY for this pending registry" >&2
+      return 1
+    fi
     return 0
   fi
   if [ -z "$public_key" ] || [ -z "$private_key" ]; then
@@ -318,6 +355,7 @@ drive9_cleanup_body_args() {
     return 1
   fi
   jq -cn --arg pk "$public_key" --arg sk "$private_key" '{public_key:$pk, private_key:$sk}' >"$body_file"
+  chmod 600 "$body_file" >/dev/null 2>&1 || true
   printf '%s' "1"
 }
 
@@ -356,13 +394,14 @@ drive9_cleanup_verify_deleted() {
 
 drive9_cleanup_delete_record() {
   local record="$1" dry_run="${DRIVE9_E2E_CLEANUP_DRY_RUN:-0}"
-  local kind suite base tenant_id api_key endpoint resp_file body_file body_present code reason verify
+  local kind suite base tenant_id api_key requires_tidbcloud endpoint resp_file body_file body_present code reason verify
 
   kind="$(jq -r '.kind' <<<"$record")"
   suite="$(jq -r '.suite' <<<"$record")"
   base="$(jq -r '.base' <<<"$record")"
   tenant_id="$(jq -r '.tenant_id' <<<"$record")"
   api_key="$(jq -r '.api_key' <<<"$record")"
+  requires_tidbcloud="$(jq -r '.cleanup_requires_tidbcloud // false' <<<"$record")"
 
   case "$kind" in
     live|admin_live) endpoint="$base/v1/tenant" ;;
@@ -380,7 +419,7 @@ drive9_cleanup_delete_record() {
 
   resp_file="$(mktemp)"
   body_file="$(mktemp)"
-  body_present="$(drive9_cleanup_body_args "$body_file")" || {
+  body_present="$(drive9_cleanup_body_args "$body_file" "$requires_tidbcloud")" || {
     rm -f "$resp_file" "$body_file"
     return 1
   }

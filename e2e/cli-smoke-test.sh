@@ -133,7 +133,7 @@ check_cmd "local image fixture exists" test -s "$DRIVE9_IMAGE_FIXTURE_PATH"
 
 echo "[1] provision tenant"
 pfile="$(mktemp)"
-pcode=$(drive9_provision_to_file "$BASE" "$pfile")
+pcode=$(drive9_provision_to_file "$BASE" "$pfile" || true)
 check_eq "POST /v1/provision returns 202" "$pcode" "202"
 API_KEY=$(jq -r '.api_key // empty' "$pfile")
 PROVISION_CLOUD_PROVIDER=$(jq -r '.cloud_provider // empty' "$pfile")
