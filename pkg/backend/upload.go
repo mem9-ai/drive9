@@ -1017,6 +1017,8 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		return fmt.Errorf("complete multipart: %w", err)
 	}
 	completeMultipartDurationMs := uploadPhaseMs(completeMultipartStart)
+	finalizeCtx, cancelFinalize := postCommitQuotaMutationContext()
+	defer cancelFinalize()
 
 	var oldStorageRef string
 	var oldStorageType datastore.StorageType
@@ -1042,14 +1044,14 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	enqueueUploadSemanticTasks := func(tx *sql.Tx, mediaDelta int64) error {
 		stepStart := time.Now()
 		if b.UsesDatabaseAutoEmbedding() {
-			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType, mediaDelta)
+			created, err := b.enqueueExtractSemanticTasksTx(finalizeCtx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType, mediaDelta)
 			semanticTaskEnqueued = created
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			return err
 		}
 		// App-embedding mode: image/audio extract tasks are durable and
 		// independent of EMBED_TEXT, so register them in the same transaction.
-		extractCreated, err := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType, mediaDelta)
+		extractCreated, err := b.enqueueExtractSemanticTasksTx(finalizeCtx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType, mediaDelta)
 		if err != nil {
 			return err
 		}
@@ -1064,7 +1066,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 		return nil
 	}
-	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+	if err := b.store.InTx(finalizeCtx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
 		oldStorageRef = ""
 		oldStorageType = ""
@@ -1218,9 +1220,9 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		return nil
 	}); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
-		b.cleanupFailedFinalizeUpload(ctx, upload)
-		// Abort the server-side reservation since the tenant DB tx failed.
 		cleanupCtx, cancelCleanup := postCommitQuotaMutationContext()
+		b.cleanupFailedFinalizeUpload(cleanupCtx, upload)
+		// Abort the server-side reservation since the tenant DB tx failed.
 		b.abortUploadReservation(cleanupCtx, uploadID, upload.TotalSize)
 		cancelCleanup()
 		metrics.RecordTenantOperation(b.tenantID, "backend", "finalize_upload", "error", time.Since(start))
@@ -1238,7 +1240,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	}
 
 	if isOverwrite {
-		b.deleteBlobIfS3Ctx(ctx, oldStorageType, oldStorageRef, upload.S3Key)
+		b.deleteBlobIfS3Ctx(finalizeCtx, oldStorageType, oldStorageRef, upload.S3Key)
 	}
 	logger.InfoBenchTiming(ctx, "backend_finalize_upload_timing",
 		zap.String("upload_id", uploadID),

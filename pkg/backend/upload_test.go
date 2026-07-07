@@ -68,6 +68,19 @@ func (c *completeRecordingS3Client) CompleteMultipartUpload(ctx context.Context,
 	return c.S3Client.CompleteMultipartUpload(ctx, key, uploadID, parts)
 }
 
+type cancelAfterCompleteS3Client struct {
+	s3client.S3Client
+	cancel context.CancelFunc
+}
+
+func (c *cancelAfterCompleteS3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []s3client.Part) error {
+	err := c.S3Client.CompleteMultipartUpload(ctx, key, uploadID, parts)
+	if err == nil && c.cancel != nil {
+		c.cancel()
+	}
+	return err
+}
+
 func newTestBackendNoS3(t *testing.T) *Dat9Backend {
 	t.Helper()
 	initBackendSchema(t, testDSN)
@@ -229,6 +242,54 @@ func TestInitiateAndConfirmUpload(t *testing.T) {
 	}
 	if url == "" {
 		t.Error("expected non-empty presigned URL")
+	}
+}
+
+func TestConfirmUploadFinalizesAfterRequestContextCanceledPostS3Complete(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/complete-after-cancel.bin", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upload, err := b.GetUpload(ctx, plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partData := bytes.Repeat([]byte("x"), int(totalSize))
+	for _, p := range plan.Parts {
+		start := int64(p.Number-1) * plan.PartSize
+		end := start + p.Size
+		if end > totalSize {
+			end = totalSize
+		}
+		if _, err := b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, p.Number, bytes.NewReader(partData[start:end])); err != nil {
+			t.Fatalf("upload part %d: %v", p.Number, err)
+		}
+	}
+
+	b.s3 = &cancelAfterCompleteS3Client{S3Client: b.s3, cancel: cancel}
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatalf("ConfirmUpload after post-S3 context cancel: %v", err)
+	}
+
+	verifyCtx := context.Background()
+	upload, err = b.GetUpload(verifyCtx, plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.Status != datastore.UploadCompleted {
+		t.Fatalf("upload status = %s, want %s", upload.Status, datastore.UploadCompleted)
+	}
+	info, err := b.store.Stat(verifyCtx, "/complete-after-cancel.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.File == nil || info.File.SizeBytes != totalSize {
+		t.Fatalf("file size = %v, want %d", info.File, totalSize)
 	}
 }
 
