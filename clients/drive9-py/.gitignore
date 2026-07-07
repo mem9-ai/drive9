@@ -72,3 +72,6 @@ dmypy.json
 
 # Ruff
 .ruff_cache/
+
+# Integration-test virtualenv (created by scripts/sdk-integration-tests.sh)
+.venv-it/

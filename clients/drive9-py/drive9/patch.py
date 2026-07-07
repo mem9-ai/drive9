@@ -69,9 +69,9 @@ class PatchMixin:
                 read_url=p.get("read_url"),
                 read_headers=p.get("read_headers"),
             )
-            for p in plan.get("upload_parts", [])
+            for p in (plan.get("upload_parts") or [])
         ]
-        copied_parts = plan.get("copied_parts", [])
+        copied_parts = plan.get("copied_parts") or []
         total_parts = len(upload_parts) + len(copied_parts)
 
         max_concurrency = 4
