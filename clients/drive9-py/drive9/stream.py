@@ -171,16 +171,22 @@ class StreamWriter:
 
         self._wait_inflight()
 
+        executor = None
+        upload_id = None
         with self._mu:
-            self._aborted = True
-            if not self._started or self._plan is None:
-                self._shutdown_executor()
+            if self._aborted:
                 return
-            upload_id = self._plan["upload_id"]
-        try:
+            self._aborted = True
+            if self._started and self._plan is not None:
+                upload_id = self._plan["upload_id"]
+            executor = self._executor
+            self._executor = None
+        # Shutdown outside the lock to avoid a non-reentrant self-deadlock
+        # (threading.Lock cannot be acquired twice by the same thread).
+        if executor is not None:
+            executor.shutdown(wait=True)
+        if upload_id is not None:
             self._client._abort_upload_v2(upload_id)
-        finally:
-            self._shutdown_executor()
 
     def _wait_inflight(self):
         with self._mu:
