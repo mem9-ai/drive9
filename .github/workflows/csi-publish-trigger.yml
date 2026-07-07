@@ -1,74 +1,35 @@
 name: Publish CSI image (drive9-ai/k8s-csi)
 
-# Dispatches drive9-ai/k8s-csi's `publish-image.yml` to build the drive9-csi
-# container image pinned to a specific drive9 commit. Runs in parallel with
-# `prod-cd` (invoked as a reusable workflow) and can also be triggered
-# manually from the Actions UI.
+# Dispatches drive9-ai/k8s-csi's `publish-image.yml` after Drive9 CLI binaries
+# are released. The CSI image downloads the released CLI via install.sh, so the
+# dispatch must run after `release-cli` updates drive9.ai/releases.
 #
 # Requires repo secret `CSI_DISPATCH_TOKEN`: a PAT with `actions:write` on
 # `drive9-ai/k8s-csi` (fine-grained PAT recommended). The default
 # `GITHUB_TOKEN` cannot dispatch workflows in a different repository.
 
 on:
+  workflow_run:
+    workflows: ["Release CLI binaries"]
+    types:
+      - completed
   workflow_dispatch:
     inputs:
-      drive9_ref:
-        description: "drive9 commit SHA to bake into the CSI image (default: this workflow's commit)"
-        required: false
-        type: string
       csi_ref:
         description: "k8s-csi ref to build from (default: main)"
         required: false
         type: string
         default: main
-  workflow_call:
-    inputs:
-      drive9_ref:
-        description: "drive9 commit SHA to bake into the CSI image"
-        required: true
-        type: string
-      csi_ref:
-        description: "k8s-csi ref to build from"
-        required: false
-        type: string
-        default: main
-    secrets:
-      CSI_DISPATCH_TOKEN:
-        required: true
 
 jobs:
   dispatch:
     name: Dispatch k8s-csi publish-image workflow
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve drive9 ref
-        id: resolve
-        env:
-          INPUT_DRIVE9_REF: ${{ inputs.drive9_ref }}
-          FALLBACK_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          REF="${INPUT_DRIVE9_REF:-$FALLBACK_SHA}"
-          # Require a hex commit SHA (7-40 chars). Earlier
-          # alnum+dot+dash validation would let branch/tag names
-          # through (e.g. `main`, `v1.2.3`), but k8s-csi bakes the
-          # value into the image tag `drive9-<ref7>-csi-<sha7>` and
-          # into the container image. A branch head can move between
-          # dispatch and build, producing a non-reproducible image
-          # under a misleading tag. Refuse anything that isn't a
-          # canonical SHA up-front so the failure mode is clear at
-          # dispatch time, not silently downstream.
-          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{7,40}$'; then
-            echo "Invalid drive9_ref (must be a 7-40 char hex commit SHA): $REF" >&2
-            exit 1
-          fi
-          printf 'drive9_ref=%s\n' "$REF" >> "$GITHUB_OUTPUT"
-          printf 'Dispatching k8s-csi build for drive9 ref: %s\n' "$REF"
-
       - name: Trigger drive9-ai/k8s-csi publish-image.yml
         env:
           GH_TOKEN: ${{ secrets.CSI_DISPATCH_TOKEN }}
-          DRIVE9_REF: ${{ steps.resolve.outputs.drive9_ref }}
           CSI_REF: ${{ inputs.csi_ref || 'main' }}
         run: |
           set -euo pipefail
@@ -79,7 +40,6 @@ jobs:
           fi
           gh workflow run publish-image.yml \
             --repo drive9-ai/k8s-csi \
-            --ref "$CSI_REF" \
-            -f drive9_ref="$DRIVE9_REF"
-          echo "Dispatched drive9-ai/k8s-csi publish-image.yml (csi ref: $CSI_REF, drive9_ref: $DRIVE9_REF)"
+            --ref "$CSI_REF"
+          echo "Dispatched drive9-ai/k8s-csi publish-image.yml (csi ref: $CSI_REF)"
           echo "Watch: https://github.com/drive9-ai/k8s-csi/actions/workflows/publish-image.yml"

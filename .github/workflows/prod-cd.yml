@@ -25,10 +25,9 @@ env:
   K8S_DEPLOYMENT: dat9-server
 
 jobs:
-  # Resolves the drive9 image + short SHA ONCE from either the
-  # `image_tag` override or the dev deployment. Downstream jobs
-  # (deploy + csi-publish) consume the outputs, so prod promotion
-  # and the paired CSI image build agree on the same drive9 commit.
+  # Resolves the drive9 image ONCE from either the `image_tag` override or
+  # the dev deployment. Downstream deploy jobs consume the same output so all
+  # prod regions promote the same image.
   #
   # Prior versions had `deploy` and `resolve-drive9-sha` each read
   # dev independently. If a dev-cd retag landed between the two
@@ -44,7 +43,6 @@ jobs:
     outputs:
       image: ${{ steps.resolve.outputs.image }}
       registry: ${{ steps.resolve.outputs.registry }}
-      drive9_sha: ${{ steps.resolve.outputs.drive9_sha }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -100,28 +98,10 @@ jobs:
           fi
           echo "Resolved image: $IMAGE (tag: $TAG)"
 
-          # dev-cd tags images as `<branch>-<sha7>` where sha7 is
-          # exactly 7 hex chars from `git rev-parse --short=7 HEAD`.
-          # Extract the trailing token and REQUIRE it to be 7-40
-          # hex chars — the earlier check accepted any alphanumeric
-          # of length >= 7, so `prod-release1` or `v1.2.3` sneaked
-          # through and got baked into the CSI image as if it were
-          # a commit SHA. A branch or tag name that ends in a
-          # non-hex token now fails fast at prod-cd time rather
-          # than producing a misleading `drive9-<not-a-sha>-csi-*`
-          # image downstream.
-          SHA="${TAG##*-}"
-          if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{7,40}$'; then
-            echo "Could not extract hex drive9 SHA from tag: $TAG (extracted: $SHA)" >&2
-            echo "Expected pattern: <ref-name>-<7-40 hex chars>" >&2
-            exit 1
-          fi
-
           REGISTRY="${IMAGE%%/*}"
           {
             echo "image=$IMAGE"
             echo "registry=$REGISTRY"
-            echo "drive9_sha=$SHA"
           } >> "$GITHUB_OUTPUT"
 
   deploy:
@@ -343,20 +323,3 @@ jobs:
             kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
               rollout undo deployment/drive9-server
           fi
-
-  csi-publish:
-    # Dispatches drive9-ai/k8s-csi's publish-image.yml to build a drive9-csi
-    # image pinned to the drive9 commit currently being promoted to prod.
-    # Consumes the same `resolve` output as `deploy`, so the CSI image is
-    # guaranteed to be baked for the exact drive9 build going to prod
-    # (no dev-cd retag can slip between the two reads any more).
-    # Still runs in parallel with `deploy` — a failed prod rollout does
-    # not cancel the CSI build and vice versa; only the shared resolve
-    # is sequenced first.
-    name: Publish drive9-csi image
-    needs: resolve
-    uses: ./.github/workflows/csi-publish-trigger.yml
-    with:
-      drive9_ref: ${{ needs.resolve.outputs.drive9_sha }}
-    secrets:
-      CSI_DISPATCH_TOKEN: ${{ secrets.CSI_DISPATCH_TOKEN }}
