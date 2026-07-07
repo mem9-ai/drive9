@@ -49,12 +49,19 @@ jobs:
         run: |
           set -euo pipefail
           REF="${INPUT_DRIVE9_REF:-$FALLBACK_SHA}"
-          case "$REF" in
-            *[![:alnum:]_.-]*)
-              echo "Invalid drive9_ref: $REF" >&2
-              exit 1
-              ;;
-          esac
+          # Require a hex commit SHA (7-40 chars). Earlier
+          # alnum+dot+dash validation would let branch/tag names
+          # through (e.g. `main`, `v1.2.3`), but k8s-csi bakes the
+          # value into the image tag `drive9-<ref7>-csi-<sha7>` and
+          # into the container image. A branch head can move between
+          # dispatch and build, producing a non-reproducible image
+          # under a misleading tag. Refuse anything that isn't a
+          # canonical SHA up-front so the failure mode is clear at
+          # dispatch time, not silently downstream.
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{7,40}$'; then
+            echo "Invalid drive9_ref (must be a 7-40 char hex commit SHA): $REF" >&2
+            exit 1
+          fi
           printf 'drive9_ref=%s\n' "$REF" >> "$GITHUB_OUTPUT"
           printf 'Dispatching k8s-csi build for drive9 ref: %s\n' "$REF"
 

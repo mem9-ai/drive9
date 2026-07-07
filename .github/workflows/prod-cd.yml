@@ -25,13 +25,26 @@ env:
   K8S_DEPLOYMENT: dat9-server
 
 jobs:
-  deploy:
-    name: Deploy to ${{ inputs.region }}
+  # Resolves the drive9 image + short SHA ONCE from either the
+  # `image_tag` override or the dev deployment. Downstream jobs
+  # (deploy + csi-publish) consume the outputs, so prod promotion
+  # and the paired CSI image build agree on the same drive9 commit.
+  #
+  # Prior versions had `deploy` and `resolve-drive9-sha` each read
+  # dev independently. If a dev-cd retag landed between the two
+  # reads, prod would promote tag A while CSI baked SHA B — the
+  # CSI image would misidentify what drive9 build it was published
+  # for. Consolidating the read here removes that race.
+  resolve:
+    name: Resolve drive9 image + SHA
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
-
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+      registry: ${{ steps.resolve.outputs.registry }}
+      drive9_sha: ${{ steps.resolve.outputs.drive9_sha }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -46,9 +59,26 @@ jobs:
             --region ap-southeast-1 \
             --alias dev
 
-      - name: Resolve image from dev
+      - name: Resolve image + drive9 SHA
+        id: resolve
+        env:
+          # Route the user-controlled `image_tag` input through an
+          # env var, NOT direct GitHub Actions expression
+          # interpolation into the shell script. Direct
+          # interpolation of `${{ inputs.image_tag }}` into a shell
+          # literal is a template-injection surface: a value like
+          # `; malicious-command #` would break out of the string
+          # and execute. Env-var injection makes the value plain
+          # data at runtime and unable to break out of the quoted
+          # variable expansion. Companion to the same pattern
+          # already used in `csi-publish-trigger.yml`.
+          INPUT_TAG: ${{ inputs.image_tag }}
+          ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          DEPLOY_NAMESPACE: ${{ env.DEPLOY_NAMESPACE }}
+          K8S_DEPLOYMENT: ${{ env.K8S_DEPLOYMENT }}
         run: |
-          INPUT_TAG='${{ inputs.image_tag }}'
+          set -euo pipefail
           if [ -n "$INPUT_TAG" ]; then
             case "$INPUT_TAG" in
               *[![:alnum:]_.-]*)
@@ -56,19 +86,70 @@ jobs:
                 exit 1
                 ;;
             esac
-            IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$INPUT_TAG"
+            IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$INPUT_TAG"
+            TAG="$INPUT_TAG"
           else
-            IMAGE=$(kubectl --context dev -n "${{ env.DEPLOY_NAMESPACE }}" \
-              get "deployment/${{ env.K8S_DEPLOYMENT }}" \
+            IMAGE=$(kubectl --context dev -n "$DEPLOY_NAMESPACE" \
+              get "deployment/$K8S_DEPLOYMENT" \
               -o 'jsonpath={.spec.template.spec.containers[?(@.name=="dat9-server")].image}')
+            if [ -z "$IMAGE" ]; then
+              echo "Failed to resolve image from dev" >&2
+              exit 1
+            fi
+            TAG="${IMAGE##*:}"
           fi
-          if [ -z "$IMAGE" ]; then
-            echo "Failed to resolve image" >&2
+          echo "Resolved image: $IMAGE (tag: $TAG)"
+
+          # dev-cd tags images as `<branch>-<sha7>` where sha7 is
+          # exactly 7 hex chars from `git rev-parse --short=7 HEAD`.
+          # Extract the trailing token and REQUIRE it to be 7-40
+          # hex chars — the earlier check accepted any alphanumeric
+          # of length >= 7, so `prod-release1` or `v1.2.3` sneaked
+          # through and got baked into the CSI image as if it were
+          # a commit SHA. A branch or tag name that ends in a
+          # non-hex token now fails fast at prod-cd time rather
+          # than producing a misleading `drive9-<not-a-sha>-csi-*`
+          # image downstream.
+          SHA="${TAG##*-}"
+          if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{7,40}$'; then
+            echo "Could not extract hex drive9 SHA from tag: $TAG (extracted: $SHA)" >&2
+            echo "Expected pattern: <ref-name>-<7-40 hex chars>" >&2
             exit 1
           fi
+
+          REGISTRY="${IMAGE%%/*}"
+          {
+            echo "image=$IMAGE"
+            echo "registry=$REGISTRY"
+            echo "drive9_sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to ${{ inputs.region }}
+    needs: resolve
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      IMAGE: ${{ needs.resolve.outputs.image }}
+      REGISTRY: ${{ needs.resolve.outputs.registry }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ASSUME_ARN_PROD }}
+          aws-region: ap-southeast-1
+
+      - name: Pull image from ECR
+        # Uses the image resolved by the `resolve` job so prod
+        # promotion agrees with the CSI publish exactly.
+        run: |
+          set -euo pipefail
           echo "Promoting image: $IMAGE"
-          printf '%s=%s\n' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
-          aws ecr get-login-password --region ap-southeast-1 | docker login --username AWS --password-stdin "${IMAGE%%/*}"
+          aws ecr get-login-password --region ap-southeast-1 | \
+            docker login --username AWS --password-stdin "$REGISTRY"
           docker pull "$IMAGE"
       - name: Deploy to aws-ap-southeast-1
         id: deploy-sg
@@ -263,78 +344,19 @@ jobs:
               rollout undo deployment/drive9-server
           fi
 
-  resolve-drive9-sha:
-    # Resolves the drive9 short SHA from the image tag being promoted, so the
-    # csi-publish job can dispatch a matching k8s-csi build in parallel with
-    # the deploy job. Kept independent of `deploy` so both run concurrently.
-    name: Resolve drive9 SHA for CSI build
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    outputs:
-      drive9_sha: ${{ steps.resolve.outputs.drive9_sha }}
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ASSUME_ARN_PROD }}
-          aws-region: ap-southeast-1
-
-      - name: Update kubeconfig for dev
-        run: |
-          aws eks update-kubeconfig \
-            --name dev-dat9 \
-            --region ap-southeast-1 \
-            --alias dev
-
-      - name: Resolve drive9 short SHA from image tag
-        id: resolve
-        run: |
-          set -euo pipefail
-          INPUT_TAG='${{ inputs.image_tag }}'
-          if [ -n "$INPUT_TAG" ]; then
-            case "$INPUT_TAG" in
-              *[![:alnum:]_.-]*)
-                echo "Invalid image tag override" >&2
-                exit 1
-                ;;
-            esac
-            TAG="$INPUT_TAG"
-          else
-            IMAGE=$(kubectl --context dev -n "${{ env.DEPLOY_NAMESPACE }}" \
-              get "deployment/${{ env.K8S_DEPLOYMENT }}" \
-              -o 'jsonpath={.spec.template.spec.containers[?(@.name=="dat9-server")].image}')
-            if [ -z "$IMAGE" ]; then
-              echo "Failed to resolve image from dev" >&2
-              exit 1
-            fi
-            TAG="${IMAGE##*:}"
-          fi
-          # dev-cd tags images as `<branch>-<sha7>`; extract the trailing SHA.
-          SHA="${TAG##*-}"
-          if [ -z "$SHA" ] || [ "${#SHA}" -lt 7 ]; then
-            echo "Could not extract drive9 short SHA from tag: $TAG" >&2
-            exit 1
-          fi
-          case "$SHA" in
-            *[![:alnum:]]*)
-              echo "Extracted SHA has unexpected characters: $SHA" >&2
-              exit 1
-              ;;
-          esac
-          printf 'Resolved drive9 short SHA: %s (from tag %s)\n' "$SHA" "$TAG"
-          printf 'drive9_sha=%s\n' "$SHA" >> "$GITHUB_OUTPUT"
-
   csi-publish:
     # Dispatches drive9-ai/k8s-csi's publish-image.yml to build a drive9-csi
     # image pinned to the drive9 commit currently being promoted to prod.
-    # Runs in parallel with `deploy` — a failed prod rollout does not cancel
-    # the CSI build (and vice versa).
+    # Consumes the same `resolve` output as `deploy`, so the CSI image is
+    # guaranteed to be baked for the exact drive9 build going to prod
+    # (no dev-cd retag can slip between the two reads any more).
+    # Still runs in parallel with `deploy` — a failed prod rollout does
+    # not cancel the CSI build and vice versa; only the shared resolve
+    # is sequenced first.
     name: Publish drive9-csi image
-    needs: resolve-drive9-sha
+    needs: resolve
     uses: ./.github/workflows/csi-publish-trigger.yml
     with:
-      drive9_ref: ${{ needs.resolve-drive9-sha.outputs.drive9_sha }}
+      drive9_ref: ${{ needs.resolve.outputs.drive9_sha }}
     secrets:
       CSI_DISPATCH_TOKEN: ${{ secrets.CSI_DISPATCH_TOKEN }}
