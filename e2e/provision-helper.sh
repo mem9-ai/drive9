@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Shared /v1/provision helpers for live e2e scripts.
 
+_drive9_provision_helper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -z "${DRIVE9_CLEANUP_HELPER_LOADED:-}" ]; then
+  . "$_drive9_provision_helper_dir/cleanup-helper.sh"
+fi
+
 drive9_provision_body() {
   local public_key="${DRIVE9_TIDBCLOUD_PUBLIC_KEY:-}"
   local private_key="${DRIVE9_TIDBCLOUD_PRIVATE_KEY:-}"
@@ -39,9 +44,10 @@ drive9_provision_body() {
 drive9_provision_to_file() {
   local base="$1"
   local output_file="$2"
-  local body max_retries retry_sleep attempt code
+  local body max_retries retry_sleep attempt code tenant_id api_key suite
 
   body="$(drive9_provision_body)" || return 1
+  drive9_cleanup_require_ready || return 1
   max_retries="${DRIVE9_PROVISION_MAX_RETRIES:-${REQUEST_MAX_RETRIES:-${CLI_MAX_RETRIES:-1}}}"
   retry_sleep="${DRIVE9_PROVISION_RETRY_SLEEP_S:-${REQUEST_RETRY_SLEEP_S:-${CLI_RETRY_SLEEP_S:-2}}}"
   attempt=1
@@ -57,6 +63,21 @@ drive9_provision_to_file() {
     fi
 
     if [ "$code" != "429" ] || [ "$attempt" -ge "$max_retries" ]; then
+      if [ "$code" = "202" ]; then
+        tenant_id="$(jq -r '.tenant_id // empty' "$output_file" 2>/dev/null || true)"
+        api_key="$(jq -r '.api_key // empty' "$output_file" 2>/dev/null || true)"
+        suite="${DRIVE9_E2E_SUITE_NAME:-$(basename "${BASH_SOURCE[1]:-${0:-provision}}")}"
+        if drive9_cleanup_is_enabled; then
+          if [ -z "$tenant_id" ] || [ -z "$api_key" ]; then
+            echo "CRITICAL: provision succeeded but response lacks tenant_id/api_key; cannot register cleanup" >&2
+            return 1
+          fi
+          if ! drive9_cleanup_register_live "$suite" "$base" "$tenant_id" "$api_key"; then
+            echo "CRITICAL: provisioned tenant $tenant_id but failed to register cleanup" >&2
+            return 1
+          fi
+        fi
+      fi
       printf '%s' "$code"
       return
     fi

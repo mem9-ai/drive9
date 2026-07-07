@@ -3,6 +3,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/cleanup-helper.sh"
+
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 RUN_GIT_OPS_SMOKE="${RUN_GIT_OPS_SMOKE:-0}"
 RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
@@ -13,6 +16,37 @@ RUN_PORTABLE_PACK_E2E="${RUN_PORTABLE_PACK_E2E:-0}"
 
 PASS=0
 FAIL=0
+FINAL_RC=0
+
+cleanup_exit() {
+  local rc=$?
+  if [ -n "${DRIVE9_E2E_CLEANUP_REGISTRY:-}" ]; then
+    drive9_cleanup_finish "$rc" || rc=1
+  fi
+  trap - EXIT
+  exit "$rc"
+}
+
+case "$(drive9_cleanup_mode)" in
+  always|success)
+    CLEANUP_ENABLED=1
+    ;;
+  0|off|false|"")
+    CLEANUP_ENABLED=0
+    ;;
+  *)
+    echo "invalid DRIVE9_E2E_CLEANUP=${DRIVE9_E2E_CLEANUP:-}; expected 0, always, or success" >&2
+    exit 1
+    ;;
+esac
+
+if [ "$CLEANUP_ENABLED" = "1" ]; then
+  if [ "${DRIVE9_E2E_CLEANUP_PENDING:-1}" = "1" ]; then
+    drive9_cleanup_run_pending
+  fi
+  drive9_cleanup_init_run
+  trap cleanup_exit EXIT
+fi
 
 run_case() {
   local name="$1"
@@ -21,7 +55,13 @@ run_case() {
   echo
   echo "=== [$name] $script ==="
   set +e
-  DRIVE9_BASE="$BASE" bash "$script"
+  DRIVE9_BASE="$BASE" \
+    DRIVE9_E2E_SUITE_NAME="$name" \
+    DRIVE9_E2E_RUN_ID="${DRIVE9_E2E_RUN_ID:-}" \
+    DRIVE9_E2E_RUN_DIR="${DRIVE9_E2E_RUN_DIR:-}" \
+    DRIVE9_E2E_CLEANUP="${DRIVE9_E2E_CLEANUP:-0}" \
+    DRIVE9_E2E_CLEANUP_REGISTRY="${DRIVE9_E2E_CLEANUP_REGISTRY:-}" \
+    bash "$script"
   local rc=$?
   set -e
 
@@ -76,5 +116,7 @@ echo "=== smoke-all result ==="
 echo "PASS=$PASS FAIL=$FAIL"
 
 if [ "$FAIL" -ne 0 ]; then
-  exit 1
+  FINAL_RC=1
 fi
+
+exit "$FINAL_RC"

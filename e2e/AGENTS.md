@@ -95,6 +95,11 @@ bash e2e/posix-permission-smoke-test.sh
 # Run the default smoke-all sequence once
 bash e2e/smoke-all.sh
 
+# Scheduled hosted smoke runs should opt into registry-based cleanup. Cleanup
+# only deletes tenants/forks registered by this local drive9-e2e run; it does not
+# scan server tenants.
+DRIVE9_E2E_CLEANUP=always bash e2e/smoke-all.sh
+
 # Or enable optional Git coverage in that same single smoke-all run.
 # Set either variable to 1 as needed; setting both includes both Git suites.
 RUN_GIT_OPS_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
