@@ -232,6 +232,7 @@ class Drive9SqliteBlackbox(Drive9WorkflowBase):
                 "go-fuse MountOptions.EnableDirectIoMmap / drive9 "
                 "newGoFuseMountOptions fix."
             )
+        expected["mmap_ok"] = mmap_ok
 
     # ------------------------------------------------------------------
     # helpers
