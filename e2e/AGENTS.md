@@ -116,6 +116,28 @@ DRIVE9_TIDBCLOUD_PRIVATE_KEY="$DRIVE9_TIDBCLOUD_PRIVATE_KEY" \
 bash e2e/native-smoke-test.sh
 ```
 
+### Scheduled smoke-all failure handling
+
+When a scheduled `smoke-all.sh` run finishes with any failed suite or assertion,
+do the failure analysis before creating or changing repo issues:
+
+1. Identify the failed suite, failed case/assertion, smoke endpoint, command,
+   exit status, cleanup result, and full log path.
+2. Analyze the failed case enough to state a likely root cause or the concrete
+   blocker that prevents a root-cause call. Use the repo, smoke logs, and
+   relevant code paths; do not report only the aggregate `PASS=N FAIL=M` line.
+3. Report the findings first in the Slock/Raft smoke-test thread that requested
+   or owns the run. Include the failed case, evidence, log path, impact, and
+   root-cause assessment.
+4. If the failure is a code problem, search existing GitHub issues before filing
+   a new one. Create or update the matching issue with: background, reproduction
+   steps, evidence logs, impact, root-cause analysis or suspicious code path,
+   suggested fix direction, and validation plan.
+5. If the failure is due to environment, credentials, runner setup, endpoint
+   availability, or another non-code operational condition, report that in the
+   Slock/Raft thread instead of filing a code bug, unless durable repo tracking
+   is needed because the condition is recurring or needs engineering follow-up.
+
 ### Local via `drive9-server-local`
 
 When the task is specifically about local validation on this machine, prefer
