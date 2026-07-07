@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"sync/atomic"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"go.uber.org/zap"
 )
 
 // QuotaConfig holds per-tenant quota limits stored in the central server DB.
@@ -148,6 +151,9 @@ func (s *Store) GetQuotaConfigVersion(ctx context.Context, tenantID string) (str
 		 FROM tenant_quota_config WHERE tenant_id = ?`, tenantID,
 	).Scan(&maxStorageBytes, &maxFileSizeBytes, &maxFileCount, &maxMediaLLMFiles, &maxMonthlyCostMC)
 	if err == sql.ErrNoRows {
+		logger.Info(ctx, "quota_config_not_found_using_defaults",
+			zap.String("tenant_id", tenantID))
+		err = nil
 		return "", nil
 	}
 	if err != nil {
