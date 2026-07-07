@@ -16,6 +16,38 @@ those fields in `/v1/provision`; when unset, they keep the existing empty-body
 provisioning behavior for anonymous/default-key endpoints. Optionally set
 `DRIVE9_TIDBCLOUD_SPENDING_LIMIT` to include `tidbcloud_spending_limit`.
 
+## Hosted cleanup
+
+Hosted smoke suites create real Drive9 tenants/spaces. By default cleanup is
+disabled to preserve the historical debugging behavior:
+
+```bash
+DRIVE9_E2E_CLEANUP=0 bash e2e/smoke-all.sh
+```
+
+For scheduled online checks, enable registry-based cleanup explicitly:
+
+```bash
+DRIVE9_E2E_CLEANUP=always bash e2e/smoke-all.sh
+```
+
+`smoke-all.sh` creates a `drive9-e2e-*` run registry under
+`~/.cache/drive9-smoke/cleanup-pending/`. Each provisioned tenant/fork is
+registered immediately after creation; the finalizer deletes only those
+registered resources and never scans the server for tenants. Registries are
+owner-readable only because they contain API keys. Successful cleanup writes a
+sanitized summary under `~/.cache/drive9-smoke/cleanup-completed/`; incomplete
+cleanup leaves the raw registry pending for retry by `e2e/cleanup-pending.sh`.
+Standalone suites fail before provisioning if cleanup is enabled without a
+registry prepared by `smoke-all.sh`.
+
+Supported modes:
+
+- `DRIVE9_E2E_CLEANUP=0`: register/delete disabled.
+- `DRIVE9_E2E_CLEANUP=always`: delete registered resources on success or failure.
+- `DRIVE9_E2E_CLEANUP=success`: delete only after a fully successful run; failed
+  runs move the registry to `cleanup-retained/` for manual debugging.
+
 ## Scripts
 
 | Script | What it validates |

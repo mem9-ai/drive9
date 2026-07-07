@@ -391,6 +391,9 @@ if fork_checks_enabled; then
   fork_api_key="$(jq -r '.api_key // empty' <<<"$fork_json")"
   fork_tenant_id="$(jq -r '.tenant_id // empty' <<<"$fork_json")"
   fork_status="$(jq -r '.status // empty' <<<"$fork_json")"
+  if [ -n "$fork_api_key" ] && [ -n "$fork_tenant_id" ]; then
+    drive9_cleanup_register_fork "${DRIVE9_E2E_SUITE_NAME:-cli}" "$BASE" "$fork_tenant_id" "$fork_api_key"
+  fi
   check_cmd "ctx fork returns api_key" test -n "$fork_api_key"
   check_cmd "ctx fork returns tenant_id" test -n "$fork_tenant_id"
   check_eq "ctx fork initial status is provisioning" "$fork_status" "provisioning"
