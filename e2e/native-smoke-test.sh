@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/tmp-helper.sh"
+drive9_e2e_init_tmpdir
+
 # native-smoke-test.sh — TiDB Cloud Native tenant lifecycle smoke test.
 # Manual-only: requires TiDB Cloud API credentials (public/private key).
 
@@ -13,6 +17,8 @@ CLI_SOURCE="${CLI_SOURCE:-build}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
 SKIP_CLEANUP="${SKIP_CLEANUP:-0}"
+NATIVE_ADMIN_CLEANUP_LOG="$(drive9_e2e_tmp_path "native-admin-cleanup.log")"
+NATIVE_CLEANUP_LOG="$(drive9_e2e_tmp_path "native-cleanup.log")"
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -133,7 +139,7 @@ cleanup() {
   if [ "${ADMIN_CREATED:-0}" -eq 1 ] && [ "$SKIP_CLEANUP" != "1" ] && [ -n "${ADMIN_TENANT_ID:-}" ]; then
     echo "[cleanup] deleting admin tenant $ADMIN_TENANT_ID" >&2
     drive9_ctx admin tenant delete --tenant-id "$ADMIN_TENANT_ID" $ADMIN_FLAGS \
-      >/tmp/native-admin-cleanup.log 2>&1 || true
+      >"$NATIVE_ADMIN_CLEANUP_LOG" 2>&1 || true
   fi
   if [ "$CREATED" -eq 1 ] && [ "$SKIP_CLEANUP" != "1" ] && [ -n "${TENANT_ID:-}" ]; then
     echo "[cleanup] deleting tenant $TENANT_ID" >&2
@@ -144,11 +150,11 @@ cleanup() {
         --tidbcloud-public-key "$PUBLIC_KEY" \
         --tidbcloud-private-key "$PRIVATE_KEY" \
         -y \
-        >/tmp/native-cleanup.log 2>&1; then
+        >"$NATIVE_CLEANUP_LOG" 2>&1; then
         echo "[cleanup] tenant $TENANT_ID deleted" >&2
         break
       fi
-      echo "[cleanup] retry $i/3 deleting tenant $TENANT_ID (see /tmp/native-cleanup.log)" >&2
+      echo "[cleanup] retry $i/3 deleting tenant $TENANT_ID (see $NATIVE_CLEANUP_LOG)" >&2
       sleep 30
     done
   fi

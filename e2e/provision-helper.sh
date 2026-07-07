@@ -5,6 +5,7 @@ _drive9_provision_helper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -z "${DRIVE9_CLEANUP_HELPER_LOADED:-}" ]; then
   . "$_drive9_provision_helper_dir/cleanup-helper.sh"
 fi
+drive9_e2e_init_tmpdir
 
 drive9_provision_body() {
   local public_key="${DRIVE9_TIDBCLOUD_PUBLIC_KEY:-}"

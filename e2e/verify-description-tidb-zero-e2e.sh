@@ -28,6 +28,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+. "$SCRIPT_DIR/tmp-helper.sh"
+drive9_e2e_init_tmpdir
 
 # ------------------------------------------------------------------
 # Configuration
@@ -36,6 +38,8 @@ SERVER_PORT="9009"
 SERVER_PID=""
 ZERO_INSTANCE_ID=""
 ZERO_CLAIM_URL=""
+SERVER_LOG="$(drive9_e2e_tmp_path "drive9-server-local-zero-e2e.log")"
+SMOKE_LARGE_BIN="$(drive9_e2e_tmp_path "smoke-large.bin")"
 
 TIDB_ZERO_TAG="${DRIVE9_TIDB_ZERO_TAG:-drive9-description-e2e}"
 
@@ -194,14 +198,14 @@ export DRIVE9_LOCAL_DSN="$DB_DSN"
 export DRIVE9_LOCAL_INIT_SCHEMA="true"
 export DRIVE9_LOCAL_EMBEDDING_MODE="auto"
 export DRIVE9_LOCAL_API_KEY="${DRIVE9_API_KEY:-local-dev-key}"
-export DRIVE9_S3_DIR="${TMPDIR:-/tmp}/drive9-zero-e2e-s3"
+export DRIVE9_S3_DIR="$(drive9_e2e_tmp_path "drive9-zero-e2e-s3")"
 
 # No semantic workers needed in auto-embedding mode (database handles embedding)
 # But keep minimal config for task polling
 export DRIVE9_SEMANTIC_WORKERS=0
 export DRIVE9_SEMANTIC_POLL_INTERVAL_MS=200
 
-"${PROJECT_ROOT}/bin/drive9-server-local" > /tmp/drive9-server-local-zero-e2e.log 2>&1 &
+"${PROJECT_ROOT}/bin/drive9-server-local" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
@@ -212,7 +216,7 @@ waited=0
 while ! curl -sf "http://127.0.0.1:${SERVER_PORT}/v1/status" -H "Authorization: Bearer ${API_KEY}" >/dev/null 2>&1; do
     if [ "$waited" -ge "$POLL_TIMEOUT_S" ]; then
         log_err "Timeout: drive9-server-local did not become ready within ${POLL_TIMEOUT_S}s"
-        log_err "Server logs: /tmp/drive9-server-local-zero-e2e.log"
+        log_err "Server logs: $SERVER_LOG"
         exit 1
     fi
     sleep "$POLL_INTERVAL_S"
@@ -323,8 +327,8 @@ check_eq "description_embedding_revision matches revision" "$REV_MATCH" "1"
 # ---- 2. Large file multipart upload with description ----
 echo ""
 log_info "[2/7] Large file multipart upload with description..."
-dd if=/dev/urandom of=/tmp/smoke-large.bin bs=1M count=5 2>/dev/null
-$CLI fs cp --description "5MB random blob for backup" /tmp/smoke-large.bin :/smoke-large.bin
+dd if=/dev/urandom of="$SMOKE_LARGE_BIN" bs=1M count=5 2>/dev/null
+$CLI fs cp --description "5MB random blob for backup" "$SMOKE_LARGE_BIN" :/smoke-large.bin
 
 DESC2=$(sql_scalar "SELECT description FROM files f JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.path = '/smoke-large.bin';")
 check_eq "large file description stored" "$DESC2" "5MB random blob for backup"
@@ -403,7 +407,7 @@ echo "Summary: ${PASS}/${TOTAL} passed, ${FAIL}/${TOTAL} failed"
 echo "========================================"
 
 if [ "$FAIL" -gt 0 ]; then
-    log_err "Some tests failed. Server logs: /tmp/drive9-server-local-zero-e2e.log"
+    log_err "Some tests failed. Server logs: $SERVER_LOG"
     exit 1
 fi
 

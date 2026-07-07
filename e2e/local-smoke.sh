@@ -4,6 +4,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$ROOT_DIR/e2e/tmp-helper.sh"
+drive9_e2e_init_tmpdir
 cd "$ROOT_DIR"
 
 DB_RUNTIME="${DRIVE9_LOCAL_E2E_DB_RUNTIME:-}"
@@ -172,7 +174,7 @@ if [ -z "$S3_DIR" ]; then
   S3_DIR="$TMP_DIR/s3"
 fi
 if [ -z "$SERVER_LOG" ]; then
-  SERVER_LOG="${TMPDIR:-/tmp}/drive9-server-local-e2e-$(date +%s)-$$.log"
+  SERVER_LOG="$(drive9_e2e_tmp_path "drive9-server-local-e2e-$(date +%s)-$$.log")"
 fi
 
 case "$EMBEDDING_MODE" in

@@ -7,11 +7,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/cleanup-helper.sh"
 
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
+drive9_e2e_init_tmpdir
 RUN_GIT_OPS_SMOKE="${RUN_GIT_OPS_SMOKE:-0}"
 RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
 RUN_FUSE_SMOKE="${RUN_FUSE_SMOKE:-1}"
 RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-$RUN_FUSE_SMOKE}"
 export RUN_LAYER_FUSE_SMOKE
+FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-$DRIVE9_E2E_TMPDIR}"
+export FUSE_MOUNT_ROOT
 RUN_PORTABLE_PACK_E2E="${RUN_PORTABLE_PACK_E2E:-0}"
 
 PASS=0
@@ -56,6 +59,9 @@ run_case() {
   echo "=== [$name] $script ==="
   set +e
   DRIVE9_BASE="$BASE" \
+    DRIVE9_E2E_TMPDIR="$DRIVE9_E2E_TMPDIR" \
+    TMPDIR="$TMPDIR" \
+    FUSE_MOUNT_ROOT="$FUSE_MOUNT_ROOT" \
     DRIVE9_E2E_SUITE_NAME="$name" \
     DRIVE9_E2E_RUN_ID="${DRIVE9_E2E_RUN_ID:-}" \
     DRIVE9_E2E_RUN_DIR="${DRIVE9_E2E_RUN_DIR:-}" \
@@ -76,6 +82,8 @@ run_case() {
 
 echo "=== drive9 smoke-all ==="
 echo "BASE=$BASE"
+echo "E2E_TMPDIR=$DRIVE9_E2E_TMPDIR"
+echo "FUSE_MOUNT_ROOT=$FUSE_MOUNT_ROOT"
 
 run_case "api" "e2e/api-smoke-test.sh"
 run_case "cli" "e2e/cli-smoke-test.sh"

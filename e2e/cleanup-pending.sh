@@ -5,6 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/cleanup-helper.sh"
+drive9_e2e_init_tmpdir
 
 DRIVE9_E2E_CLEANUP="${DRIVE9_E2E_CLEANUP:-always}"
 export DRIVE9_E2E_CLEANUP
