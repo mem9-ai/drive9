@@ -1045,6 +1045,61 @@ func TestProvisionForkTenantWithCredentialsUsesRequestKeyForWait(t *testing.T) {
 	}
 }
 
+func TestCreateForkTenantPersistsPrivateEndpointDBTLS(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		envValue   string
+		wantDBTLS  bool
+		wantDSNTLS string
+	}{
+		{name: "public_endpoint_uses_tls", envValue: "", wantDBTLS: true, wantDSNTLS: "tls=true"},
+		{name: "private_endpoint_skips_verify", envValue: "1", wantDBTLS: false, wantDSNTLS: "tls=skip-verify"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT", tc.envValue)
+
+			rt := newForkCleanupTestRuntime(t)
+			rt.prov.provider = tenant.ProviderTiDBCloudNative
+			rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+			rt.prov.cluster = &tenant.ClusterInfo{
+				ClusterID: "cluster-a",
+				BranchID:  "branch-created",
+				Host:      rt.dbHost,
+				Port:      rt.dbPort,
+				Username:  rt.dbUser,
+				DBName:    rt.dbName,
+				Provider:  tenant.ProviderTiDBCloudNative,
+			}
+			rt.prov.provisionErr = context.Canceled
+
+			resp, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
+				PublicKey:  "public-1",
+				PrivateKey: "private-1",
+			})
+			if err != nil {
+				t.Fatalf("createForkTenant error = %v, want nil (provision is async)", err)
+			}
+
+			forkTenant, err := rt.meta.GetTenant(context.Background(), resp.TenantID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if forkTenant.DBTLS != tc.wantDBTLS {
+				t.Fatalf("fork DBTLS = %v, want %v", forkTenant.DBTLS, tc.wantDBTLS)
+			}
+
+			plain, err := rt.pool.Decrypt(context.Background(), forkTenant.DBPasswordCipher)
+			if err != nil {
+				t.Fatalf("decrypt fork password: %v", err)
+			}
+			dsn := tenantDSN(forkTenant.DBUser, string(plain), forkTenant.DBHost, forkTenant.DBPort, forkTenant.DBName, forkTenant.DBTLS, forkTenant.Provider)
+			if !strings.Contains(dsn, tc.wantDSNTLS) {
+				t.Fatalf("fork DSN = %q, want it to contain %q", dsn, tc.wantDSNTLS)
+			}
+		})
+	}
+}
+
 func TestProvisionForkTenantAsyncWithProvisionCallsProvisionClosure(t *testing.T) {
 	var called bool
 	rt := newForkCleanupTestRuntime(t)
