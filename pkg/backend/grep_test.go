@@ -135,6 +135,52 @@ func TestGrepFallsBackToKeywordWhenFTSIsEmptyAndVectorFails(t *testing.T) {
 	}
 }
 
+func TestGrepContentTextAlwaysWrittenToSemantic(t *testing.T) {
+	// Regression: content_text must always be written to the semantic table
+	// so FTS and LIKE searches work even when auto-embedding is disabled.
+	b := newTestBackend(t)
+	if _, err := b.Write("/notes/always.txt", []byte("content always indexed"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := b.Grep(context.Background(), "always indexed", "/notes/", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Path != "/notes/always.txt" {
+		t.Fatalf("expected grep to find /notes/always.txt via keyword, got %+v", results)
+	}
+}
+
+func TestGrepContentTextWrittenOnOverwrite(t *testing.T) {
+	// Verify content_text is updated when a file is overwritten.
+	b := newTestBackend(t)
+	if _, err := b.Write("/notes/overwrite.txt", []byte("original content alpha"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/notes/overwrite.txt", []byte("replaced content beta"), 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	// Old content should not match.
+	results, err := b.Grep(context.Background(), "alpha", "/notes/", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected old content 'alpha' to not match after overwrite, got %+v", results)
+	}
+
+	// New content should match.
+	results, err = b.Grep(context.Background(), "beta", "/notes/", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Path != "/notes/overwrite.txt" {
+		t.Fatalf("expected grep to find /notes/overwrite.txt via keyword 'beta', got %+v", results)
+	}
+}
+
 func TestGrepAutoEmbeddingSkipsApplicationQueryEmbedder(t *testing.T) {
 	seen := make(chan string, 1)
 	b := newTestBackendWithOptions(t, Options{

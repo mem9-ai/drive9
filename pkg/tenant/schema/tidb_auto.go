@@ -26,6 +26,7 @@ const (
 	TiDBEmbeddingModeUnknown TiDBEmbeddingMode = "unknown"
 	TiDBEmbeddingModeAuto    TiDBEmbeddingMode = "auto-embedding"
 	TiDBEmbeddingModeApp     TiDBEmbeddingMode = "app-managed"
+	TiDBEmbeddingModeFTSOnly TiDBEmbeddingMode = "fts-only"
 )
 
 // Reference of Auto Embedding in TiDB Cloud: https://docs.pingcap.com/ai/vector-search-auto-embedding-amazon-titan/
@@ -100,9 +101,10 @@ var (
 var CurrentTiDBTenantSchemaVersion = currentTiDBTenantSchemaVersion(tidbAutoEmbeddingSchemaStatements())
 
 type tidbAutoEmbeddingRenderConfig struct {
-	model       string
-	dimensions  int
-	optionsJSON string
+	model                     string
+	dimensions                int
+	optionsJSON               string
+	disableGeneratedEmbedding bool
 }
 
 type tidbAutoEmbeddingProviderSetting struct {
@@ -609,6 +611,26 @@ func TiDBTenantSchemaVersionForAutoEmbeddingProfile(profile TiDBAutoEmbeddingPro
 	return currentTiDBTenantSchemaVersion(tidbAutoEmbeddingSchemaStatementsForConfig(render)), nil
 }
 
+func TiDBTenantSchemaVersionForFTSOnlyProfile(profile TiDBAutoEmbeddingProfile) (int, error) {
+	render, err := tidbAutoEmbeddingRenderConfigForProfile(profile)
+	if err != nil {
+		return 0, err
+	}
+	render.disableGeneratedEmbedding = true
+	return currentTiDBTenantSchemaVersion(tidbAutoEmbeddingSchemaStatementsForConfig(render)), nil
+}
+
+func TiDBTenantSchemaVersionForEmbeddingModeProfile(mode TiDBEmbeddingMode, profile TiDBAutoEmbeddingProfile) (int, error) {
+	switch mode {
+	case TiDBEmbeddingModeAuto:
+		return TiDBTenantSchemaVersionForAutoEmbeddingProfile(profile)
+	case TiDBEmbeddingModeFTSOnly:
+		return TiDBTenantSchemaVersionForFTSOnlyProfile(profile)
+	default:
+		return 0, validateTiDBSchemaMode(mode)
+	}
+}
+
 func currentTiDBTenantSchemaVersion(stmts []string) int {
 	// Hash only statements that are parsed into the schema spec (CREATE TABLE,
 	// CREATE [UNIQUE] INDEX, ALTER TABLE ... ADD ... INDEX).  Statements that
@@ -723,6 +745,16 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfig) []string {
 	modelLiteral := tidbSQLStringLiteral(cfg.model)
 	optionsLiteral := tidbSQLStringLiteral(cfg.optionsJSON)
+	// These fragments are embedded in schema-version-hashed DDL. Preserve the
+	// rendered shape unless intentionally changing the tenant schema version.
+	embeddingColumn := fmt.Sprintf("VECTOR(%d) GENERATED ALWAYS AS (EMBED_TEXT(\n\t\t\t\t%s,\n\t\t\t\tcontent_text,\n\t\t\t\t%s\n\t\t\t)) STORED",
+		cfg.dimensions, modelLiteral, optionsLiteral)
+	descriptionEmbeddingColumn := fmt.Sprintf("VECTOR(%d) GENERATED ALWAYS AS (EMBED_TEXT(\n\t\t\t\t%s,\n\t\t\t\tdescription,\n\t\t\t\t%s\n\t\t\t)) STORED",
+		cfg.dimensions, modelLiteral, optionsLiteral)
+	if cfg.disableGeneratedEmbedding {
+		embeddingColumn = fmt.Sprintf("VECTOR(%d)", cfg.dimensions)
+		descriptionEmbeddingColumn = fmt.Sprintf("VECTOR(%d)", cfg.dimensions)
+	}
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
@@ -770,17 +802,9 @@ func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfi
 			inode_id                           VARCHAR(64) PRIMARY KEY,
 			content_text                       LONGTEXT,
 			description                        LONGTEXT,
-			embedding                          VECTOR(` + strconv.Itoa(cfg.dimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
-				` + modelLiteral + `,
-				content_text,
-				` + optionsLiteral + `
-			)) STORED,
+			embedding                          ` + embeddingColumn + `,
 			embedding_revision                 BIGINT,
-			description_embedding              VECTOR(` + strconv.Itoa(cfg.dimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
-				` + modelLiteral + `,
-				description,
-				` + optionsLiteral + `
-			)) STORED,
+			description_embedding              ` + descriptionEmbeddingColumn + `,
 			description_embedding_revision     BIGINT,
 			FULLTEXT INDEX idx_semantic_fts_content (content_text) WITH PARSER MULTILINGUAL,
 			FULLTEXT INDEX idx_semantic_fts_description (description) WITH PARSER MULTILINGUAL
@@ -992,6 +1016,26 @@ func ValidateTiDBSchemaForAutoEmbeddingProfile(ctx context.Context, db *sql.DB, 
 	return validateTiDBSchemaForModeWithConfig(ctx, db, TiDBEmbeddingModeAuto, render)
 }
 
+func ValidateTiDBSchemaForFTSOnlyProfile(ctx context.Context, db *sql.DB, profile TiDBAutoEmbeddingProfile) error {
+	render, err := tidbAutoEmbeddingRenderConfigForProfile(profile)
+	if err != nil {
+		return err
+	}
+	render.disableGeneratedEmbedding = true
+	return validateTiDBSchemaForModeWithConfig(ctx, db, TiDBEmbeddingModeFTSOnly, render)
+}
+
+func ValidateTiDBSchemaForEmbeddingModeProfile(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode, profile TiDBAutoEmbeddingProfile) error {
+	switch mode {
+	case TiDBEmbeddingModeAuto:
+		return ValidateTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile)
+	case TiDBEmbeddingModeFTSOnly:
+		return ValidateTiDBSchemaForFTSOnlyProfile(ctx, db, profile)
+	default:
+		return validateTiDBSchemaMode(mode)
+	}
+}
+
 func validateTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) error {
 	start := time.Now()
 	logger.Info(ctx, "tenant_tidb_schema_validate_started",
@@ -1044,6 +1088,26 @@ func EnsureTiDBSchemaForAutoEmbeddingProfile(ctx context.Context, db *sql.DB, pr
 		return err
 	}
 	return ensureTiDBSchemaForModeWithConfig(ctx, db, TiDBEmbeddingModeAuto, render)
+}
+
+func EnsureTiDBSchemaForFTSOnlyProfile(ctx context.Context, db *sql.DB, profile TiDBAutoEmbeddingProfile) error {
+	render, err := tidbAutoEmbeddingRenderConfigForProfile(profile)
+	if err != nil {
+		return err
+	}
+	render.disableGeneratedEmbedding = true
+	return ensureTiDBSchemaForModeWithConfig(ctx, db, TiDBEmbeddingModeFTSOnly, render)
+}
+
+func EnsureTiDBSchemaForEmbeddingModeProfile(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode, profile TiDBAutoEmbeddingProfile) error {
+	switch mode {
+	case TiDBEmbeddingModeAuto:
+		return EnsureTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile)
+	case TiDBEmbeddingModeFTSOnly:
+		return EnsureTiDBSchemaForFTSOnlyProfile(ctx, db, profile)
+	default:
+		return validateTiDBSchemaMode(mode)
+	}
 }
 
 func ensureTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) error {
@@ -1129,7 +1193,7 @@ func ensureTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiD
 }
 
 func validateTiDBSchemaMode(mode TiDBEmbeddingMode) error {
-	if mode != TiDBEmbeddingModeAuto && mode != TiDBEmbeddingModeApp {
+	if mode != TiDBEmbeddingModeAuto && mode != TiDBEmbeddingModeApp && mode != TiDBEmbeddingModeFTSOnly {
 		return fmt.Errorf("unsupported TiDB embedding mode %q", mode)
 	}
 	return nil
@@ -1191,12 +1255,31 @@ func initTiDBAutoEmbeddingSchemaWithConfig(ctx context.Context, dsn string, cfg 
 }
 
 func initTiDBAutoEmbeddingSchemaWithProfile(ctx context.Context, dsn string, profile TiDBAutoEmbeddingProfile) error {
+	return initTiDBSchemaWithProfileAndMode(ctx, dsn, profile, TiDBEmbeddingModeAuto)
+}
+
+func initTiDBFTSOnlySchema(ctx context.Context, dsn string) error {
+	profile, err := TiDBAutoEmbeddingProfileFromConfig(CurrentTiDBAutoEmbeddingConfig())
+	if err != nil {
+		return err
+	}
+	return initTiDBSchemaWithProfileAndMode(ctx, dsn, profile, TiDBEmbeddingModeFTSOnly)
+}
+
+func initTiDBFTSOnlySchemaWithProfile(ctx context.Context, dsn string, profile TiDBAutoEmbeddingProfile) error {
+	return initTiDBSchemaWithProfileAndMode(ctx, dsn, profile, TiDBEmbeddingModeFTSOnly)
+}
+
+func initTiDBSchemaWithProfileAndMode(ctx context.Context, dsn string, profile TiDBAutoEmbeddingProfile, mode TiDBEmbeddingMode) error {
 	start := time.Now()
 	logger.Info(ctx, "tenant_tidb_schema_init_started",
-		zap.String("mode", string(TiDBEmbeddingModeAuto)))
+		zap.String("mode", string(mode)))
 	render, err := tidbAutoEmbeddingRenderConfigForProfile(profile)
 	if err != nil {
 		return err
+	}
+	if mode == TiDBEmbeddingModeFTSOnly {
+		render.disableGeneratedEmbedding = true
 	}
 	db, err := OpenTiDBSchemaDB(ctx, dsn)
 	if err != nil {
@@ -1212,11 +1295,20 @@ func initTiDBAutoEmbeddingSchemaWithProfile(ctx context.Context, dsn string, pro
 	if err := ExecSchemaStatementsParallelByTableContext(ctx, db, tidbAutoEmbeddingSchemaStatementsForConfig(render)); err != nil {
 		return err
 	}
-	if err := EnsureTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile); err != nil {
-		return err
+	switch mode {
+	case TiDBEmbeddingModeAuto:
+		if err := EnsureTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile); err != nil {
+			return err
+		}
+	case TiDBEmbeddingModeFTSOnly:
+		if err := EnsureTiDBSchemaForFTSOnlyProfile(ctx, db, profile); err != nil {
+			return err
+		}
+	default:
+		return validateTiDBSchemaMode(mode)
 	}
 	logger.Info(ctx, "tenant_tidb_schema_init_finished",
-		zap.String("mode", string(TiDBEmbeddingModeAuto)),
+		zap.String("mode", string(mode)),
 		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
 	return nil
 }
@@ -1315,6 +1407,10 @@ func detectTiDBEmbeddingModeFromMeta(meta tidbTableMeta) (TiDBEmbeddingMode, err
 	if expr != "" {
 		return TiDBEmbeddingModeUnknown, errors.New("embedding generation expression present without generated column metadata")
 	}
+	// Column metadata alone cannot distinguish app-managed from fts_only:
+	// both use writable nullable VECTOR columns. fts_only is a tenant profile
+	// contract enforced by the mode-aware schema validators, while this detector
+	// is kept for local app-vs-auto startup detection.
 	return TiDBEmbeddingModeApp, nil
 }
 
@@ -1654,6 +1750,8 @@ func tidbSchemaSpecForModeWithConfig(mode TiDBEmbeddingMode, cfg tidbAutoEmbeddi
 				return validateTiDBAutoEmbeddingDiffsWithConfig(meta, cfg)
 			case TiDBEmbeddingModeApp:
 				return validateTiDBAppEmbeddingDiffs(meta)
+			case TiDBEmbeddingModeFTSOnly:
+				return validateTiDBFTSOnlyDiffsWithConfig(meta, cfg)
 			default:
 				return []tidbSchemaDiff{{kind: tidbSchemaDiffTableContract, tableName: "semantic", detail: fmt.Sprintf("semantic schema contract: unsupported TiDB embedding mode %q", mode)}}
 			}
@@ -1686,6 +1784,8 @@ func legacyTiDBFilesTableSpecForModeWithConfig(mode TiDBEmbeddingMode, cfg tidbA
 				return validateTiDBAutoEmbeddingFilesDiffsWithConfig(meta, cfg)
 			case TiDBEmbeddingModeApp:
 				return validateTiDBAppEmbeddingFilesDiffs(meta)
+			case TiDBEmbeddingModeFTSOnly:
+				return validateTiDBFTSOnlyFilesDiffsWithConfig(meta, cfg)
 			default:
 				return []tidbSchemaDiff{{kind: tidbSchemaDiffTableContract, tableName: "files", detail: fmt.Sprintf("files legacy schema contract: unsupported TiDB embedding mode %q", mode)}}
 			}
@@ -1705,7 +1805,7 @@ func legacyTiDBFilesSchemaStatementsForModeWithConfig(mode TiDBEmbeddingMode, cf
 			cfg.dimensions, modelLiteral, optionsLiteral)
 		descriptionEmbeddingColumn = fmt.Sprintf("VECTOR(%d) GENERATED ALWAYS AS (EMBED_TEXT(%s, description, %s)) STORED",
 			cfg.dimensions, modelLiteral, optionsLiteral)
-	} else if mode != TiDBEmbeddingModeApp {
+	} else if mode != TiDBEmbeddingModeApp && mode != TiDBEmbeddingModeFTSOnly {
 		return nil, fmt.Errorf("unsupported TiDB embedding mode %q", mode)
 	}
 	stmts := []string{
@@ -1736,7 +1836,7 @@ func legacyTiDBFilesSchemaStatementsForModeWithConfig(mode TiDBEmbeddingMode, cf
 		`CREATE INDEX idx_status ON files(status, created_at)`,
 		`CREATE INDEX idx_files_storage_ref_hash ON files(storage_ref_hash)`,
 	}
-	if mode == TiDBEmbeddingModeAuto {
+	if mode == TiDBEmbeddingModeAuto || mode == TiDBEmbeddingModeFTSOnly {
 		stmts = append(stmts,
 			`ALTER TABLE files
 				ADD FULLTEXT INDEX idx_fts_content(content_text)
@@ -2664,9 +2764,21 @@ func isSafeTiDBRepairDiff(diff tidbSchemaDiff) bool {
 		return isSafeModifyColumnRepairSQL(diff)
 	case tidbSchemaDiffExtraColumn:
 		return isSafeDropLegacyUploadActiveTargetPathRepairSQL(diff)
+	case tidbSchemaDiffTableContract:
+		return isSafeFTSOnlyEmbeddingColumnRepairSQL(diff.repairSQL)
 	default:
 		return false
 	}
+}
+
+func isSafeFTSOnlyEmbeddingColumnRepairSQL(sqlText string) bool {
+	normalized := normalizeSQLFragment(sqlText)
+	if !strings.HasPrefix(normalized, "alter table ") {
+		return false
+	}
+	return (strings.Contains(normalized, " modify column embedding vector(") ||
+		strings.Contains(normalized, " modify column description_embedding vector(")) &&
+		strings.HasSuffix(normalized, " null")
 }
 
 func isSafeAddColumnRepairSQL(sqlText string) bool {
@@ -3063,6 +3175,40 @@ func validateTiDBAppEmbeddingDiffs(meta tidbTableMeta) []tidbSchemaDiff {
 
 func validateTiDBAppEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
 	return validateTiDBAppEmbeddingTableDiffs(meta, "files")
+}
+
+func validateTiDBFTSOnlyDiffsWithConfig(meta tidbTableMeta, cfg tidbAutoEmbeddingRenderConfig) []tidbSchemaDiff {
+	return validateTiDBFTSOnlyTableDiffs(meta, "semantic", cfg)
+}
+
+func validateTiDBFTSOnlyFilesDiffsWithConfig(meta tidbTableMeta, cfg tidbAutoEmbeddingRenderConfig) []tidbSchemaDiff {
+	return validateTiDBFTSOnlyTableDiffs(meta, "files", cfg)
+}
+
+func validateTiDBFTSOnlyTableDiffs(meta tidbTableMeta, tableName string, cfg tidbAutoEmbeddingRenderConfig) []tidbSchemaDiff {
+	var diffs []tidbSchemaDiff
+	for _, colName := range []string{"embedding", "description_embedding"} {
+		col, err := meta.requireColumn(colName)
+		if err != nil {
+			return nil
+		}
+		extra := normalizeSQLFragment(col.extra)
+		expr := normalizeSQLFragment(col.generationExpression)
+		if strings.Contains(extra, "generated") || expr != "" {
+			// TiDB Cloud permits this one-way conversion from a stored generated
+			// EMBED_TEXT column to a writable nullable VECTOR column. The reverse
+			// ordinary VECTOR -> stored generated column conversion is not
+			// supported, so tenant embedding_mode remains immutable.
+			diffs = append(diffs, tidbSchemaDiff{
+				kind:       tidbSchemaDiffTableContract,
+				tableName:  tableName,
+				columnName: colName,
+				detail:     fmt.Sprintf("%s schema contract: %s column must be nullable writable vector in fts-only mode", tableName, colName),
+				repairSQL:  fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s VECTOR(%d) NULL", tableName, colName, cfg.dimensions),
+			})
+		}
+	}
+	return diffs
 }
 
 func validateTiDBAppEmbeddingTableDiffs(meta tidbTableMeta, tableName string) []tidbSchemaDiff {

@@ -662,7 +662,11 @@ func (s *Server) provisionForkTenantOnceWithCredentials(ctx context.Context, for
 	if err != nil {
 		return err
 	}
-	version, err := schema.TiDBTenantSchemaVersionForAutoEmbeddingProfile(profile)
+	tidbMode, err := tenant.TiDBEmbeddingModeForTenantMode(profile.mode)
+	if err != nil {
+		return err
+	}
+	version, err := schema.TiDBTenantSchemaVersionForEmbeddingModeProfile(tidbMode, profile.schemaProfile)
 	if err != nil {
 		return err
 	}
