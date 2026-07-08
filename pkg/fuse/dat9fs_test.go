@@ -21456,6 +21456,36 @@ func TestCanSupersedeInFlightCommitForTruncate_CancelsQueuedEntry(t *testing.T) 
 	}
 }
 
+// TestCanSupersedeInFlightCommitForTruncate_CancelsDebouncedFlush verifies
+// that supersede also cancels any pending debounced flush for the same path,
+// preventing a stale snapshot from being uploaded after the new O_TRUNC write.
+func TestCanSupersedeInFlightCommitForTruncate_CancelsDebouncedFlush(t *testing.T) {
+	opts := &MountOptions{WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	path := "/config.json"
+
+	// Set up a debouncer with a long delay so it stays pending.
+	fs.debouncer = newFlushDebouncer(10 * time.Second)
+	var called atomic.Bool
+	fs.debouncer.Schedule(path, func() { called.Store(true) })
+
+	// No commit queue entry — just debounced flush.
+	fs.commitQueue = &CommitQueue{
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+
+	if !fs.canSupersedeInFlightCommitForTruncate(path) {
+		t.Fatal("should return true")
+	}
+	// Give the debounce timer a chance to fire (it shouldn't).
+	time.Sleep(50 * time.Millisecond)
+	if called.Load() {
+		t.Fatal("debounced flush should have been canceled, but it fired")
+	}
+}
+
 // TestOpenTruncateSupersedesInFlightCommitForSamePath verifies that opening
 // a file with O_TRUNC cancels an in-flight commit via the supersede path
 // instead of spin-waiting. This is the core optimization for config file

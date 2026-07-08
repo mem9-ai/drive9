@@ -6014,9 +6014,16 @@ func (fs *Dat9FS) lockWritableRemoteCommitPathForWritableOpenTruncate(p string, 
 // file content (O_TRUNC open). The cancelled commit's data is stale and
 // will be superseded by the new write. This avoids blocking the open on
 // the previous upload finishing (~100ms per same-path rewrite).
+//
+// Also cancels any pending debounced flush for the same path to prevent a
+// stale snapshot from being uploaded after the new write begins.
 func (fs *Dat9FS) canSupersedeInFlightCommitForTruncate(p string) bool {
 	if fs == nil || p == "" || fs.mountWritePolicy() != WritePolicyWriteBack {
 		return false
+	}
+	// Cancel any pending debounced flush — the old snapshot is stale.
+	if fs.debouncer != nil {
+		fs.debouncer.Cancel(p)
 	}
 	if fs.commitQueue == nil {
 		return true
