@@ -214,6 +214,12 @@ const MaxBatchStatPaths = 256
 // MaxBatchReadSmallPaths is the maximum number of paths accepted by BatchReadSmallCtx.
 const MaxBatchReadSmallPaths = 128
 
+// MaxBatchWriteItems is the maximum number of write items accepted by BatchWriteCtx.
+const MaxBatchWriteItems = 128
+
+// MaxBatchWriteBytes is the maximum total payload accepted by BatchWriteCtx.
+const MaxBatchWriteBytes int64 = 4 << 20
+
 // BatchStatResult is one per-path result from BatchStatCtx.
 //
 // Status is the HTTP-like per-path status. A missing path returns Status 404
@@ -253,6 +259,28 @@ type BatchReadSmallResult struct {
 
 // OK reports whether the per-path batch read-small result is successful.
 func (r BatchReadSmallResult) OK() bool {
+	return r.Status >= 200 && r.Status < 300 && r.Error == ""
+}
+
+// BatchWriteItem is one conditional small-file write in a batch.
+type BatchWriteItem struct {
+	Path             string `json:"path"`
+	ExpectedRevision int64  `json:"expected_revision"`
+	Data             []byte `json:"data"`
+	Mode             uint32 `json:"mode,omitempty"`
+	HasMode          bool   `json:"hasMode,omitempty"`
+}
+
+// BatchWriteResult is one per-path result from BatchWriteCtx.
+type BatchWriteResult struct {
+	Path     string `json:"path"`
+	Status   int    `json:"status"`
+	Error    string `json:"error,omitempty"`
+	Revision int64  `json:"revision,omitempty"`
+}
+
+// OK reports whether the per-path batch write result is successful.
+func (r BatchWriteResult) OK() bool {
 	return r.Status >= 200 && r.Status < 300 && r.Error == ""
 }
 
@@ -770,6 +798,61 @@ func (c *Client) BatchReadSmallCtx(ctx context.Context, paths []string, maxBytes
 	for i := range out.Results {
 		if out.Results[i].Path != paths[i] {
 			return nil, fmt.Errorf("batch read-small: result[%d] path = %q, want %q", i, out.Results[i].Path, paths[i])
+		}
+	}
+	return out.Results, nil
+}
+
+// BatchWriteCtx writes up to MaxBatchWriteItems small files in one request.
+//
+// Transport/request errors fail the method. Per-path write errors are returned
+// inside the corresponding BatchWriteResult so one conflict does not fail the
+// whole batch.
+func (c *Client) BatchWriteCtx(ctx context.Context, items []BatchWriteItem) ([]BatchWriteResult, error) {
+	if len(items) == 0 {
+		return []BatchWriteResult{}, nil
+	}
+	if len(items) > MaxBatchWriteItems {
+		return nil, fmt.Errorf("batch write: %d items exceeds limit of %d", len(items), MaxBatchWriteItems)
+	}
+	var total int64
+	for _, item := range items {
+		total += int64(len(item.Data))
+		if total > MaxBatchWriteBytes {
+			return nil, fmt.Errorf("batch write: %d bytes exceeds limit of %d", total, MaxBatchWriteBytes)
+		}
+	}
+	body, err := json.Marshal(struct {
+		Items []BatchWriteItem `json:"items"`
+	}{Items: items})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/fs:batch-write", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out struct {
+		Results []BatchWriteResult `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	if len(out.Results) != len(items) {
+		return nil, fmt.Errorf("batch write: got %d results for %d items", len(out.Results), len(items))
+	}
+	for i := range out.Results {
+		if out.Results[i].Path != items[i].Path {
+			return nil, fmt.Errorf("batch write: result[%d] path = %q, want %q", i, out.Results[i].Path, items[i].Path)
 		}
 	}
 	return out.Results, nil

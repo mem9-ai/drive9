@@ -157,6 +157,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	writeCacheFreeRatio := fs.Float64("write-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before write-back refuses writes with ENOSPC (0 disables)")
 	writeCacheSizeMB := fs.Int64("write-cache-size-mb", 1024, "shadow cache byte quota in MB (default 1024; 0 disables); shadow writes exceeding this return ENOSPC")
 	commitQueueMaxPending := fs.Int("commit-queue-max-pending", 500, "maximum pending entries in CommitQueue before backpressure")
+	writeBackBatchWindow := fs.Duration("writeback-batch-window", 0, "writeback-only small-file batch window (default 0 disables)")
+	writeBackBatchMaxFiles := fs.Int("writeback-batch-max-files", 64, "maximum files in one writeback batch when enabled")
+	writeBackBatchMaxBytes := fs.Int64("writeback-batch-max-bytes", client.MaxBatchWriteBytes, "maximum bytes in one writeback batch when enabled")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")
@@ -245,6 +248,15 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if *commitQueueMaxPending <= 0 {
 		return fmt.Errorf("drive9 mount: --commit-queue-max-pending must be > 0")
 	}
+	if *writeBackBatchWindow < 0 {
+		return fmt.Errorf("drive9 mount: --writeback-batch-window must be >= 0")
+	}
+	if *writeBackBatchMaxFiles < 0 {
+		return fmt.Errorf("drive9 mount: --writeback-batch-max-files must be >= 0")
+	}
+	if *writeBackBatchMaxBytes < 0 {
+		return fmt.Errorf("drive9 mount: --writeback-batch-max-bytes must be >= 0")
+	}
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
 	}
@@ -311,6 +323,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	syncModeVal, writePolicyVal, err := parseFuseDurability(*durability)
 	if err != nil {
 		return err
+	}
+	if *writeBackBatchWindow > 0 && writePolicyVal != fuseWritePolicyWriteBack {
+		return fmt.Errorf("drive9 mount: --writeback-batch-window requires --durability auto, interactive, or fsync")
 	}
 	if *readCacheMaxFile <= 0 {
 		return fmt.Errorf("drive9 mount: --read-cache-max-file-mb must be > 0")
@@ -543,6 +558,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		UploadConcurrency:       *uploadConcurrency,
 		DirCacheMaxEntries:      *dirCacheMaxEntries,
 		CommitQueueMaxPending:   *commitQueueMaxPending,
+		WriteBackBatchWindow:    *writeBackBatchWindow,
+		WriteBackBatchMaxFiles:  *writeBackBatchMaxFiles,
+		WriteBackBatchMaxBytes:  *writeBackBatchMaxBytes,
 		WriteCacheFreeRatio:     normalizedWriteCacheFreeRatio,
 		WriteCacheSizeMB:        normalizedWriteCacheSizeMB,
 		ReadConcurrency:         *readConcurrency,

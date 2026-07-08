@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
@@ -75,6 +77,282 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 	}
 	if shadow.Has("/ok.txt") {
 		t.Fatal("shadow should be removed after successful commit")
+	}
+}
+
+func TestCommitQueueBatchWriteUsesBatchEndpoint(t *testing.T) {
+	var batchCalls atomic.Int32
+	var putCalls atomic.Int32
+	var gotPaths []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": 50000})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-write":
+			batchCalls.Add(1)
+			var req struct {
+				Items []client.BatchWriteItem `json:"items"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode batch request: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			results := make([]map[string]any, len(req.Items))
+			for i, item := range req.Items {
+				gotPaths = append(gotPaths, item.Path)
+				results[i] = map[string]any{"path": item.Path, "status": 200, "revision": i + 1}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
+		case r.Method == http.MethodPut:
+			putCalls.Add(1)
+			http.Error(w, "unexpected single PUT", http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/a.txt", []byte("a"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/b.txt", []byte("b"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/a.txt", 1, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/b.txt", 1, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.Warm(context.Background())
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.ConfigureBatchWrite(10*time.Millisecond, 64, client.MaxBatchWriteBytes)
+	if err := cq.Enqueue(&CommitEntry{Path: "/a.txt", Size: 1, Kind: PendingNew}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{Path: "/b.txt", Size: 1, Kind: PendingNew}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if got := batchCalls.Load(); got != 1 {
+		t.Fatalf("batch calls = %d, want 1", got)
+	}
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("PUT calls = %d, want 0", got)
+	}
+	if strings.Join(gotPaths, ",") != "/a.txt,/b.txt" {
+		t.Fatalf("batch paths = %v, want /a.txt,/b.txt", gotPaths)
+	}
+	if pending.HasPending("/a.txt") || pending.HasPending("/b.txt") {
+		t.Fatal("pending entries should be removed after successful batch commit")
+	}
+	if shadow.Has("/a.txt") || shadow.Has("/b.txt") {
+		t.Fatal("shadow entries should be removed after successful batch commit")
+	}
+}
+
+func TestCommitQueueBatchWriteFallsBackWhenUnsupported(t *testing.T) {
+	var batchCalls atomic.Int32
+	var putCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": 50000})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-write":
+			batchCalls.Add(1)
+			http.NotFound(w, r)
+		case r.Method == http.MethodPut:
+			putCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"status":"ok","revision":%d}`, putCalls.Load())
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/a.txt", "/b.txt"} {
+		if err := shadow.WriteFull(path, []byte("x"), 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pending.PutWithBaseRev(path, 1, PendingNew, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := newTestClient(ts.URL)
+	c.Warm(context.Background())
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.ConfigureBatchWrite(10*time.Millisecond, 64, client.MaxBatchWriteBytes)
+	if err := cq.Enqueue(&CommitEntry{Path: "/a.txt", Size: 1, Kind: PendingNew}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{Path: "/b.txt", Size: 1, Kind: PendingNew}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if got := batchCalls.Load(); got != 1 {
+		t.Fatalf("batch calls = %d, want 1", got)
+	}
+	if got := putCalls.Load(); got != 2 {
+		t.Fatalf("PUT calls = %d, want 2", got)
+	}
+	if pending.HasPending("/a.txt") || pending.HasPending("/b.txt") {
+		t.Fatal("pending entries should be removed after fallback commits")
+	}
+}
+
+func TestCommitQueueBatchWriteFallsBackPerItemFailure(t *testing.T) {
+	var batchCalls atomic.Int32
+	var putPaths []string
+	var putMu sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": 50000})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-write":
+			batchCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []map[string]any{
+					{"path": "/a.txt", "status": 200, "revision": 1},
+					{"path": "/b.txt", "status": 500, "error": "temporary"},
+				},
+			})
+		case r.Method == http.MethodPut:
+			putMu.Lock()
+			putPaths = append(putPaths, r.URL.Path)
+			putMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","revision":2}`))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/a.txt", "/b.txt"} {
+		if err := shadow.WriteFull(path, []byte("x"), 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pending.PutWithBaseRev(path, 1, PendingNew, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := newTestClient(ts.URL)
+	c.Warm(context.Background())
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.ConfigureBatchWrite(10*time.Millisecond, 64, client.MaxBatchWriteBytes)
+	if err := cq.Enqueue(&CommitEntry{Path: "/a.txt", Size: 1, Kind: PendingNew}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{Path: "/b.txt", Size: 1, Kind: PendingNew}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if got := batchCalls.Load(); got != 1 {
+		t.Fatalf("batch calls = %d, want 1", got)
+	}
+	putMu.Lock()
+	gotPutPaths := append([]string(nil), putPaths...)
+	putMu.Unlock()
+	if strings.Join(gotPutPaths, ",") != "/v1/fs/b.txt" {
+		t.Fatalf("PUT paths = %v, want only /v1/fs/b.txt", gotPutPaths)
+	}
+	if pending.HasPending("/a.txt") || pending.HasPending("/b.txt") {
+		t.Fatal("pending entries should be removed after per-item fallback")
+	}
+}
+
+func TestCommitQueueBatchWriteSkipsLayerRef(t *testing.T) {
+	var batchCalls atomic.Int32
+	var layerCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": 50000})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-write":
+			batchCalls.Add(1)
+			http.Error(w, "unexpected batch", http.StatusInternalServerError)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/lyr_123/entries":
+			layerCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{LayerID: "lyr_123", EntrySeq: int64(layerCalls.Load())})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/a.txt", "/b.txt"} {
+		if err := shadow.WriteFull(path, []byte("x"), 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pending.PutWithBaseRev(path, 1, PendingNew, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := newTestClient(ts.URL)
+	c.Warm(context.Background())
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.SetLayerRef("lyr_123")
+	cq.ConfigureBatchWrite(10*time.Millisecond, 64, client.MaxBatchWriteBytes)
+	if err := cq.Enqueue(&CommitEntry{Path: "/a.txt", Size: 1, Kind: PendingNew}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{Path: "/b.txt", Size: 1, Kind: PendingNew}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if got := batchCalls.Load(); got != 0 {
+		t.Fatalf("batch calls = %d, want 0", got)
+	}
+	if got := layerCalls.Load(); got != 2 {
+		t.Fatalf("layer calls = %d, want 2", got)
 	}
 }
 

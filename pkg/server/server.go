@@ -282,6 +282,9 @@ const (
 	maxBatchReadSmallPaths                      = 128
 	maxBatchReadSmallBytes                      = 50_000
 	defaultBatchReadMaxBody                     = 1 << 20
+	maxBatchWriteItems                          = 128
+	maxBatchWriteBytes                    int64 = 4 << 20
+	defaultBatchWriteMaxBody              int64 = 8 << 20
 	maxCredentialProvisionBodyBytes       int64 = 1 << 20
 	provisionFailureClusterCleanupTimeout       = 2 * time.Minute
 )
@@ -371,6 +374,7 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	mux.Handle("/v1/fs:batch-stat", business)
 	mux.Handle("/v1/fs:batch-read-small", business)
+	mux.Handle("/v1/fs:batch-write", business)
 	mux.Handle("/v1/fs/", business)
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
@@ -1225,6 +1229,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleBatchStat(w, r)
 	case r.URL.Path == "/v1/fs:batch-read-small":
 		s.handleBatchReadSmall(w, r)
+	case r.URL.Path == "/v1/fs:batch-write":
+		s.handleBatchWrite(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/fs/"):
 		s.handleFS(w, r)
 	case r.URL.Path == "/v1/uploads/initiate":
@@ -1269,7 +1275,7 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 //
 // Workspace zones coverage as of C2b:
 //   - GET/HEAD /v1/fs/* (read-side, action-arm allowlist)
-//   - POST /v1/fs:batch-stat / batch-read-small (per-path authorize)
+//   - POST /v1/fs:batch-stat / batch-read-small / batch-write (per-path authorize)
 //   - PUT/PATCH/DELETE/POST /v1/fs/* (write-side, action-arm allowlist;
 //     chmod stays owner-only)
 //   - /v1/uploads* + /v2/uploads/* (action-aware, mirrors actual upload
@@ -1302,7 +1308,7 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 	path := r.URL.Path
 
 	// Batch FS endpoints (always POST). Handlers do per-path AuthorizeFS internally.
-	if path == "/v1/fs:batch-stat" || path == "/v1/fs:batch-read-small" {
+	if path == "/v1/fs:batch-stat" || path == "/v1/fs:batch-read-small" || path == "/v1/fs:batch-write" {
 		return r.Method == http.MethodPost
 	}
 
@@ -2591,6 +2597,29 @@ type batchReadSmallResult struct {
 	Mtime    int64  `json:"mtime,omitempty"`
 }
 
+type batchWriteRequest struct {
+	Items []batchWriteItem `json:"items"`
+}
+
+type batchWriteItem struct {
+	Path             string `json:"path"`
+	ExpectedRevision int64  `json:"expected_revision"`
+	Data             []byte `json:"data"`
+	Mode             uint32 `json:"mode,omitempty"`
+	HasMode          bool   `json:"hasMode,omitempty"`
+}
+
+type batchWriteResponse struct {
+	Results []batchWriteResult `json:"results"`
+}
+
+type batchWriteResult struct {
+	Path     string `json:"path"`
+	Status   int    `json:"status"`
+	Error    string `json:"error,omitempty"`
+	Revision int64  `json:"revision,omitempty"`
+}
+
 func (s *Server) handleBatchStat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_stat_method_not_allowed", "method", r.Method)...)
@@ -2724,6 +2753,141 @@ func (s *Server) batchReadSmallOne(ctx context.Context, b *backend.Dat9Backend, 
 	return result
 }
 
+func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_method_not_allowed", "method", r.Method)...)
+		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_missing_scope")...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+
+	var req batchWriteRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, defaultBatchWriteMaxBody)).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_decode_failed", "error", err)...)
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("batch write body exceeds limit %d bytes", defaultBatchWriteMaxBody))
+			return
+		}
+		errJSON(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if len(req.Items) > maxBatchWriteItems {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_too_many_items", "count", len(req.Items), "limit", maxBatchWriteItems)...)
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("too many items: %d exceeds limit %d", len(req.Items), maxBatchWriteItems))
+		return
+	}
+
+	results := make([]batchWriteResult, len(req.Items))
+	allowedIndexes := make([]int, 0, len(req.Items))
+	backendItems := make([]backend.BatchWriteItem, 0, len(req.Items))
+	scope := ScopeFromContext(r.Context())
+	var totalBytes int64
+	for i, item := range req.Items {
+		results[i].Path = item.Path
+		itemBytes := int64(len(item.Data))
+		totalBytes += itemBytes
+		if totalBytes > maxBatchWriteBytes {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_too_many_bytes", "bytes", totalBytes, "limit", maxBatchWriteBytes)...)
+			errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("batch write exceeds limit %d bytes", maxBatchWriteBytes))
+			return
+		}
+		if err := validateBatchWritePath(item.Path); err != nil {
+			results[i].Status = http.StatusBadRequest
+			results[i].Error = err.Error()
+			continue
+		}
+		if s.maxUploadBytes > 0 && itemBytes > s.maxUploadBytes {
+			results[i].Status = http.StatusRequestEntityTooLarge
+			results[i].Error = fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes)
+			continue
+		}
+		if status, msg, allowed := authorizeFSPathForBatch(scope, FSOpWrite, item.Path); !allowed {
+			results[i].Status = status
+			results[i].Error = msg
+			continue
+		}
+		allowedIndexes = append(allowedIndexes, i)
+		backendItems = append(backendItems, backend.BatchWriteItem{
+			Path:             item.Path,
+			Data:             item.Data,
+			ExpectedRevision: item.ExpectedRevision,
+			Mode:             item.Mode,
+			HasMode:          item.HasMode,
+		})
+	}
+
+	backendResults, err := b.BatchWriteCtx(r.Context(), backendItems)
+	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "batch_write_failed", "error", err)...)
+		errJSONInternalStorage(w)
+		return
+	}
+	if len(backendResults) != len(allowedIndexes) {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "batch_write_result_count_mismatch", "expected", len(allowedIndexes), "got", len(backendResults))...)
+		errJSONInternalStorage(w)
+		return
+	}
+
+	var writtenBytes int64
+	for i, backendResult := range backendResults {
+		resultIndex := allowedIndexes[i]
+		reqItem := req.Items[resultIndex]
+		result := batchWriteResult{Path: backendResult.Path}
+		if backendResult.Err != nil {
+			result.Status = batchWriteStatusForError(backendResult.Err)
+			result.Error = batchWriteErrorMessage(backendResult.Err, result.Status)
+			results[resultIndex] = result
+			continue
+		}
+		result.Status = http.StatusOK
+		result.Revision = backendResult.Revision
+		results[resultIndex] = result
+		writtenBytes += int64(len(reqItem.Data))
+		s.publishEvent(r, result.Path, "write")
+	}
+	recordTenantFileBytes(r.Context(), "fs", "batch_write", "write", writtenBytes)
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "batch_write_ok", "count", len(req.Items), "written_bytes", writtenBytes)...)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(batchWriteResponse{Results: results})
+}
+
+func batchWriteStatusForError(err error) int {
+	switch {
+	case errors.Is(err, backend.ErrUploadTooLarge):
+		return http.StatusRequestEntityTooLarge
+	case isBatchWriteQuotaError(err):
+		return http.StatusInsufficientStorage
+	case errors.Is(err, datastore.ErrRevisionConflict),
+		errors.Is(err, datastore.ErrPathConflict),
+		errors.Is(err, datastore.ErrUploadConflict),
+		errors.Is(err, backend.ErrBatchWriteDirectory):
+		return http.StatusConflict
+	case errors.Is(err, datastore.ErrNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, datastore.ErrInvalidRootDentry):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func batchWriteErrorMessage(err error, status int) string {
+	if status == http.StatusInternalServerError {
+		return internalStorageErrorMessage
+	}
+	return err.Error()
+}
+
+func isBatchWriteQuotaError(err error) bool {
+	return isBackendQuotaExceeded(err) || errors.Is(err, backend.ErrMediaLLMQuotaExceeded)
+}
+
 func (s *Server) batchStatOne(ctx context.Context, b *backend.Dat9Backend, rawPath string) batchStatResult {
 	result := batchStatResult{Path: rawPath}
 	path := rawPath
@@ -2786,6 +2950,20 @@ func validateBatchStatPath(rawPath string) error {
 	}
 	_, err := pathutil.Canonicalize(rawPath)
 	return err
+}
+
+func validateBatchWritePath(rawPath string) error {
+	if pathutil.IsDir(rawPath) {
+		return fmt.Errorf("batch write path must be a file path")
+	}
+	path, err := pathutil.Canonicalize(rawPath)
+	if err != nil {
+		return err
+	}
+	if path == "/" {
+		return datastore.ErrInvalidRootDentry
+	}
+	return nil
 }
 
 func nodeResourceID(nf *datastore.NodeWithFile) string {

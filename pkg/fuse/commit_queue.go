@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,8 @@ var errCommitPostUpload = errors.New("commit post-upload step failed")
 const (
 	maxInlineLayerEntryBytes     = 96 << 20
 	zeroTruncateCommitQueueDelay = 50 * time.Millisecond
+	defaultCommitBatchMaxItems   = 64
+	defaultCommitBatchMaxBytes   = client.MaxBatchWriteBytes
 )
 
 // directPutThreshold returns the size limit below which commit queue workers
@@ -103,6 +107,9 @@ type CommitQueue struct {
 	workCh chan *CommitEntry
 
 	zeroTruncateDelay time.Duration
+	batchWindow       time.Duration
+	batchMaxItems     int
+	batchMaxBytes     int64
 
 	perf *fusePerfCounters
 }
@@ -146,6 +153,37 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 
 func (cq *CommitQueue) SetPerfCounters(perf *fusePerfCounters) {
 	cq.perf = perf
+}
+
+// ConfigureBatchWrite enables a small writeback-only direct-PUT batch window.
+// A non-positive window disables batching.
+func (cq *CommitQueue) ConfigureBatchWrite(window time.Duration, maxItems int, maxBytes int64) {
+	if cq == nil {
+		return
+	}
+	if maxItems <= 0 {
+		maxItems = defaultCommitBatchMaxItems
+	}
+	if maxItems > client.MaxBatchWriteItems {
+		maxItems = client.MaxBatchWriteItems
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultCommitBatchMaxBytes
+	}
+	if maxBytes > client.MaxBatchWriteBytes {
+		maxBytes = client.MaxBatchWriteBytes
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if window <= 0 || maxItems <= 1 || maxBytes <= 0 {
+		cq.batchWindow = 0
+		cq.batchMaxItems = 0
+		cq.batchMaxBytes = 0
+		return
+	}
+	cq.batchWindow = window
+	cq.batchMaxItems = maxItems
+	cq.batchMaxBytes = maxBytes
 }
 
 func (cq *CommitQueue) SetLayerRef(layerRef string) {
@@ -819,26 +857,28 @@ func (cq *CommitQueue) isEntryCanceled(entry *CommitEntry) bool {
 func (cq *CommitQueue) worker() {
 	defer cq.wg.Done()
 	for entry := range cq.workCh {
-		// Check if this entry was canceled while buffered in workCh.
-		if cq.isEntryCanceled(entry) {
-			cq.removeFromQueue(entry)
-			log.Printf("commit queue: skipping canceled entry for %s", entry.Path)
-			continue
-		}
+		cq.processEntry(entry)
+	}
+}
 
-		// Mark as in-flight so WaitPath blocks until cleanup finishes. Entries
-		// for the same path must not upload concurrently because uploadEntry
-		// reads the mutable per-path shadow.
-		if !cq.beginInFlight(entry) {
-			cq.removeFromQueue(entry)
-			log.Printf("commit queue: entry for %s was canceled before in-flight", entry.Path)
-			continue
-		}
-
+func (cq *CommitQueue) processEntry(entry *CommitEntry) {
+	if cq.isEntryCanceled(entry) {
+		cq.removeFromQueue(entry)
+		log.Printf("commit queue: skipping canceled entry for %s", entry.Path)
+		return
+	}
+	if !cq.beginInFlight(entry) {
+		cq.removeFromQueue(entry)
+		log.Printf("commit queue: entry for %s was canceled before in-flight", entry.Path)
+		return
+	}
+	handled, deferred := cq.tryCommitBatch(entry)
+	if !handled {
 		cq.commitOne(entry)
-
-		// Clear in-flight after all cleanup is done.
 		cq.endInFlight(entry)
+	}
+	for _, next := range deferred {
+		cq.processEntry(next)
 	}
 }
 
@@ -868,6 +908,26 @@ func (cq *CommitQueue) beginInFlight(entry *CommitEntry) bool {
 		cq.mu.Unlock()
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+func (cq *CommitQueue) tryBeginInFlight(entry *CommitEntry) bool {
+	if cq == nil || entry == nil {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if entry.canceled {
+		return false
+	}
+	if cq.inFlight == nil {
+		cq.inFlight = make(map[string]*CommitEntry)
+	}
+	oldest := cq.oldestQueuedForPathLocked(entry.Path)
+	if cq.inFlight[entry.Path] != nil || (oldest != nil && oldest != entry) {
+		return false
+	}
+	cq.inFlight[entry.Path] = entry
+	return true
 }
 
 func (cq *CommitQueue) oldestQueuedForPathLocked(path string) *CommitEntry {
@@ -1012,6 +1072,268 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		return
 	}
 	cq.onCommitTerminalFailure(entry)
+}
+
+type commitBatchConfig struct {
+	window   time.Duration
+	maxItems int
+	maxBytes int64
+}
+
+func (cq *CommitQueue) batchConfigSnapshot() commitBatchConfig {
+	if cq == nil {
+		return commitBatchConfig{}
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	return commitBatchConfig{
+		window:   cq.batchWindow,
+		maxItems: cq.batchMaxItems,
+		maxBytes: cq.batchMaxBytes,
+	}
+}
+
+func (cq *CommitQueue) tryCommitBatch(first *CommitEntry) (bool, []*CommitEntry) {
+	cfg := cq.batchConfigSnapshot()
+	if cfg.window <= 0 || cfg.maxItems <= 1 || cfg.maxBytes <= 0 || !cq.batchWriteEligible(first) {
+		return false, nil
+	}
+	entries, deferred := cq.collectBatchEntries(first, cfg)
+	if len(entries) < 2 {
+		return false, deferred
+	}
+	cq.commitBatch(entries)
+	return true, deferred
+}
+
+func (cq *CommitQueue) collectBatchEntries(first *CommitEntry, cfg commitBatchConfig) ([]*CommitEntry, []*CommitEntry) {
+	entries := []*CommitEntry{first}
+	deferred := []*CommitEntry{}
+	seenPaths := map[string]struct{}{first.Path: {}}
+	totalBytes := first.Size
+	timer := time.NewTimer(cfg.window)
+	defer timer.Stop()
+	for len(entries) < cfg.maxItems && totalBytes < cfg.maxBytes {
+		select {
+		case <-timer.C:
+			return entries, deferred
+		case candidate, ok := <-cq.workCh:
+			if !ok {
+				return entries, deferred
+			}
+			if cq.isEntryCanceled(candidate) {
+				cq.removeFromQueue(candidate)
+				log.Printf("commit queue: skipping canceled entry for %s", candidate.Path)
+				continue
+			}
+			if !cq.canAddToBatch(candidate, seenPaths, totalBytes, cfg) {
+				deferred = append(deferred, candidate)
+				continue
+			}
+			if !cq.tryBeginInFlight(candidate) {
+				deferred = append(deferred, candidate)
+				continue
+			}
+			entries = append(entries, candidate)
+			seenPaths[candidate.Path] = struct{}{}
+			totalBytes += candidate.Size
+		}
+	}
+	return entries, deferred
+}
+
+func (cq *CommitQueue) canAddToBatch(entry *CommitEntry, seenPaths map[string]struct{}, totalBytes int64, cfg commitBatchConfig) bool {
+	if !cq.batchWriteEligible(entry) {
+		return false
+	}
+	if _, ok := seenPaths[entry.Path]; ok {
+		return false
+	}
+	return totalBytes+entry.Size <= cfg.maxBytes
+}
+
+func (cq *CommitQueue) batchWriteEligible(entry *CommitEntry) bool {
+	if cq == nil || entry == nil || entry.canceled || entry.ShadowSpill || cq.shadows == nil || cq.client == nil {
+		return false
+	}
+	if cq.layerRefSnapshot() != "" {
+		return false
+	}
+	if entry.Kind == PendingOverwrite && entry.BaseRev <= 0 {
+		return false
+	}
+	if entry.Kind != PendingNew && entry.Kind != PendingOverwrite {
+		return false
+	}
+	threshold := cq.directPutThreshold()
+	return entry.Size == 0 || (threshold > 0 && entry.Size < threshold)
+}
+
+func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
+	entryCtx, entryCancel := context.WithCancel(context.Background())
+	cq.mu.Lock()
+	for _, entry := range entries {
+		entry.cancelCommit = entryCancel
+	}
+	cq.mu.Unlock()
+	defer func() {
+		cq.mu.Lock()
+		for _, entry := range entries {
+			entry.cancelCommit = nil
+			entry.cancelUpload = nil
+		}
+		cq.mu.Unlock()
+		entryCancel()
+	}()
+
+	timeout := uploadTimeout
+	for _, entry := range entries {
+		if entry.ShadowSpill {
+			timeout = releaseTimeout(entry.Size)
+			break
+		}
+	}
+	ctx, cancel := context.WithTimeout(entryCtx, timeout)
+	cq.mu.Lock()
+	for _, entry := range entries {
+		if entry.canceled {
+			continue
+		}
+		entry.cancelUpload = cancel
+	}
+	cq.mu.Unlock()
+	remoteItems, err := cq.prepareBatchWriteItems(entries)
+	if err != nil {
+		cancel()
+		cq.fallbackBatchEntries(entries)
+		return
+	}
+
+	unlockPaths := cq.lockBatchPaths(entries)
+	start := time.Now()
+	results, err := cq.client.BatchWriteCtx(ctx, remoteItems)
+	if cq.perf != nil {
+		var bytes uint64
+		for _, item := range remoteItems {
+			bytes += uint64(len(item.Data))
+		}
+		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), bytes)
+	}
+	cq.mu.Lock()
+	for _, entry := range entries {
+		entry.cancelUpload = nil
+	}
+	cq.mu.Unlock()
+	cancel()
+	unlockPaths()
+
+	if err != nil {
+		if isBatchWriteUnsupported(err) {
+			cq.ConfigureBatchWrite(0, 0, 0)
+		}
+		log.Printf("commit queue: batch write failed for %d entries, falling back to single commits: %v", len(entries), err)
+		cq.fallbackBatchEntries(entries)
+		return
+	}
+	if len(results) != len(entries) {
+		log.Printf("commit queue: batch write returned %d results for %d entries, falling back to single commits", len(results), len(entries))
+		cq.fallbackBatchEntries(entries)
+		return
+	}
+	for i, result := range results {
+		entry := entries[i]
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			cq.endInFlight(entry)
+			log.Printf("commit queue: entry for %s was canceled after batch upload, skipping cleanup to preserve newer staged data", entry.Path)
+			continue
+		}
+		if result.OK() {
+			if err := cq.onCommitSuccessWithOptions(entry, entry.BaseRev, result.Revision, remoteItems[i].HasMode); err != nil {
+				log.Printf("commit queue: batch post-upload failed for %s: %v", entry.Path, err)
+				cq.onCommitPostUploadFailure(entry, err)
+			}
+			cq.endInFlight(entry)
+			continue
+		}
+		resultErr := batchWriteResultError(result)
+		if errors.Is(resultErr, client.ErrConflict) {
+			log.Printf("commit queue: batch conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
+			cq.tryAutoResolveConflict(entryCtx, entry)
+			cq.endInFlight(entry)
+			continue
+		}
+		log.Printf("commit queue: batch write result failed for %s, falling back to single commit: %v", entry.Path, resultErr)
+		cq.commitOne(entry)
+		cq.endInFlight(entry)
+	}
+}
+
+func (cq *CommitQueue) prepareBatchWriteItems(entries []*CommitEntry) ([]client.BatchWriteItem, error) {
+	items := make([]client.BatchWriteItem, len(entries))
+	for i, entry := range entries {
+		data, err := cq.shadows.ReadAll(entry.Path)
+		if err != nil {
+			return nil, fmt.Errorf("read shadow %s: %w", entry.Path, err)
+		}
+		item := client.BatchWriteItem{
+			Path:             cq.remotePath(entry.Path),
+			ExpectedRevision: entry.BaseRev,
+			Data:             data,
+		}
+		if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
+			item.Mode = remoteChmodMode(entry.Mode & posixPermissionModeMask)
+			item.HasMode = true
+		}
+		items[i] = item
+	}
+	return items, nil
+}
+
+func (cq *CommitQueue) lockBatchPaths(entries []*CommitEntry) func() {
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		paths = append(paths, entry.Path)
+	}
+	sort.Strings(paths)
+	unlocks := make([]func(), 0, len(paths))
+	var last string
+	for _, path := range paths {
+		if path == last {
+			continue
+		}
+		last = path
+		unlocks = append(unlocks, cq.lockPath(path))
+	}
+	return func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}
+}
+
+func (cq *CommitQueue) fallbackBatchEntries(entries []*CommitEntry) {
+	for _, entry := range entries {
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			cq.endInFlight(entry)
+			continue
+		}
+		cq.commitOne(entry)
+		cq.endInFlight(entry)
+	}
+}
+
+func isBatchWriteUnsupported(err error) bool {
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	return statusErr.StatusCode == http.StatusNotFound || statusErr.StatusCode == http.StatusMethodNotAllowed
+}
+
+func batchWriteResultError(result client.BatchWriteResult) error {
+	return &client.StatusError{StatusCode: result.Status, Message: result.Error}
 }
 
 func sleepWithCancel(ctx context.Context, delay time.Duration) bool {
@@ -1256,12 +1578,16 @@ func (cq *CommitQueue) rebuildQueuedIndexLocked() {
 }
 
 func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, expectedRevision, committedRev int64) error {
+	return cq.onCommitSuccessWithOptions(entry, expectedRevision, committedRev, false)
+}
+
+func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRevision, committedRev int64, remoteModeAlreadyApplied bool) error {
 	layerRef := cq.layerRefSnapshot()
 	if layerRef == "" {
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	}
 
-	if layerRef == "" && shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
+	if layerRef == "" && !remoteModeAlreadyApplied && shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		var err error
 		mode := entry.Mode & posixPermissionModeMask

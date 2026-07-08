@@ -719,6 +719,104 @@ func TestHardlinkCtxPreservesStatusError(t *testing.T) {
 	}
 }
 
+func TestBatchWriteCtxPreservesPerPathErrors(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/fs:batch-write" {
+			t.Fatalf("path = %q, want /v1/fs:batch-write", r.URL.Path)
+		}
+		var req struct {
+			Items []BatchWriteItem `json:"items"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if len(req.Items) != 2 {
+			t.Fatalf("items len = %d, want 2", len(req.Items))
+		}
+		if req.Items[0].Path != "/a.txt" || req.Items[0].ExpectedRevision != 0 || string(req.Items[0].Data) != "a" {
+			t.Fatalf("first item = %+v, want /a create", req.Items[0])
+		}
+		if req.Items[1].Path != "/b.txt" || req.Items[1].ExpectedRevision != 7 || string(req.Items[1].Data) != "b" || !req.Items[1].HasMode || req.Items[1].Mode != 0o755 {
+			t.Fatalf("second item = %+v, want /b overwrite mode", req.Items[1])
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{
+				{"path": "/a.txt", "status": 200, "revision": 1},
+				{"path": "/b.txt", "status": 409, "error": "revision conflict"},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	results, err := c.BatchWriteCtx(context.Background(), []BatchWriteItem{
+		{Path: "/a.txt", Data: []byte("a")},
+		{Path: "/b.txt", ExpectedRevision: 7, Data: []byte("b"), HasMode: true, Mode: 0o755},
+	})
+	if err != nil {
+		t.Fatalf("BatchWriteCtx error = %v, want nil", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results len = %d, want 2", len(results))
+	}
+	if !results[0].OK() || results[0].Revision != 1 {
+		t.Fatalf("first result = %+v, want ok revision 1", results[0])
+	}
+	if results[1].OK() || results[1].Status != http.StatusConflict {
+		t.Fatalf("second result = %+v, want per-path 409", results[1])
+	}
+}
+
+func TestBatchWriteCtxRejectsLimitsBeforeRequest(t *testing.T) {
+	var called bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	items := make([]BatchWriteItem, MaxBatchWriteItems+1)
+	_, err := c.BatchWriteCtx(context.Background(), items)
+	if err == nil {
+		t.Fatal("BatchWriteCtx error = nil, want too-many-items error")
+	}
+	if called {
+		t.Fatal("server was called despite client-side item limit")
+	}
+
+	items = []BatchWriteItem{{Path: "/too-large.txt", Data: bytes.Repeat([]byte("x"), int(MaxBatchWriteBytes)+1)}}
+	_, err = c.BatchWriteCtx(context.Background(), items)
+	if err == nil {
+		t.Fatal("BatchWriteCtx error = nil, want too-many-bytes error")
+	}
+	if called {
+		t.Fatal("server was called despite client-side byte limit")
+	}
+}
+
+func TestBatchWriteCtxRejectsPathMismatch(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{
+				{"path": "/b.txt", "status": 200, "revision": 1},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	_, err := c.BatchWriteCtx(context.Background(), []BatchWriteItem{{Path: "/a.txt", Data: []byte("a")}})
+	if err == nil {
+		t.Fatal("BatchWriteCtx error = nil, want path mismatch error")
+	}
+	if !strings.Contains(err.Error(), `result[0] path = "/b.txt", want "/a.txt"`) {
+		t.Fatalf("BatchWriteCtx error = %v, want path mismatch", err)
+	}
+}
+
 func TestStatCtxParsesResourceIDAndNlink(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodHead {

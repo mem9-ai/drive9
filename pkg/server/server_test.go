@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -752,6 +753,110 @@ func TestBatchReadSmallEmptyTooLargeAndFileTooLarge(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("too-large status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestBatchWriteReturnsPerPathResults(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/existing.txt", strings.NewReader("old"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed write: %d", resp.StatusCode)
+	}
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/data/dir?mkdir", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir: %d", resp.StatusCode)
+	}
+
+	payload, err := json.Marshal(batchWriteRequest{Items: []batchWriteItem{
+		{Path: "/data/a.txt", Data: []byte("a")},
+		{Path: "/data/existing.txt", ExpectedRevision: 1, Data: []byte("new")},
+		{Path: "/data/existing.txt", ExpectedRevision: 1, Data: []byte("stale")},
+		{Path: "/data/dir", ExpectedRevision: 1, Data: []byte("dir")},
+		{Path: "/bad\\path", Data: []byte("bad")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs:batch-write", strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		response, _ := io.ReadAll(resp.Body)
+		t.Fatalf("batch write status = %d, body %s", resp.StatusCode, response)
+	}
+	var out batchWriteResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 5 {
+		t.Fatalf("results len = %d, want 5", len(out.Results))
+	}
+	if out.Results[0].Status != http.StatusOK || out.Results[0].Revision != 1 {
+		t.Fatalf("create result = %+v, want ok rev 1", out.Results[0])
+	}
+	if out.Results[1].Status != http.StatusOK || out.Results[1].Revision != 2 {
+		t.Fatalf("overwrite result = %+v, want ok rev 2", out.Results[1])
+	}
+	if out.Results[2].Status != http.StatusConflict || out.Results[2].Error == "" {
+		t.Fatalf("conflict result = %+v, want per-path 409", out.Results[2])
+	}
+	if out.Results[3].Status != http.StatusConflict || out.Results[3].Error == "" {
+		t.Fatalf("directory result = %+v, want per-path 409", out.Results[3])
+	}
+	if out.Results[4].Status != http.StatusBadRequest || out.Results[4].Error == "" {
+		t.Fatalf("invalid path result = %+v, want per-path 400", out.Results[4])
+	}
+}
+
+func TestBatchWriteRejectsRequestLimits(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	items := make([]batchWriteItem, maxBatchWriteItems+1)
+	payload, err := json.Marshal(batchWriteRequest{Items: items})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs:batch-write", strings.NewReader(string(payload)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("too-many-items status = %d, want 400", resp.StatusCode)
+	}
+
+	payload, err = json.Marshal(batchWriteRequest{Items: []batchWriteItem{{Path: "/big.txt", Data: bytes.Repeat([]byte("x"), int(maxBatchWriteBytes)+1)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs:batch-write", strings.NewReader(string(payload)))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("too-many-bytes status = %d, want 413", resp.StatusCode)
 	}
 }
 

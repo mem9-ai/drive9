@@ -58,6 +58,9 @@ type MountOptions struct {
 	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for overlay-profile mounts
 	PackPaths               []string      // local overlay paths auto-packed after unmount
 	CommitQueueMaxPending   int           // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
+	WriteBackBatchWindow    time.Duration // writeback-only small-file batch window (default 0 disabled)
+	WriteBackBatchMaxFiles  int           // maximum files in one writeback batch (default 64 when enabled)
+	WriteBackBatchMaxBytes  int64         // maximum bytes in one writeback batch (default 4MiB when enabled)
 	WriteCacheFreeRatio     float64       // minimum free-space ratio on cache-dir partition before write-back refuses writes (default 0.10); negative disables
 	WriteCacheSizeMB        int64         // shadow cache byte quota in MB (default 1024 = 1GB); negative disables; shadow writes exceeding this return ENOSPC
 	UploadConcurrency       int           // number of background upload workers (default 4)
@@ -435,6 +438,9 @@ func Mount(opts *MountOptions) error {
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
 				cq.OnCleanup = dat9fs.onCommitQueueCleanup
 				cq.PathLock = dat9fs.lockRemoteCommitPath
+				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {
+					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
+				}
 				cq.RecoverPending()
 				shadowStore.RecoverPendingBytes()
 				if opts.LayerRef != "" {
@@ -934,6 +940,18 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	opts.LocalRoot = strings.TrimSpace(opts.LocalRoot)
 	if opts.EnableGitWorkspaces && opts.LocalRoot == "" {
 		return fmt.Errorf("mount: EnableGitWorkspaces requires LocalRoot")
+	}
+	if opts.WriteBackBatchWindow < 0 {
+		return fmt.Errorf("mount: WriteBackBatchWindow must be >= 0")
+	}
+	if opts.WriteBackBatchMaxFiles < 0 {
+		return fmt.Errorf("mount: WriteBackBatchMaxFiles must be >= 0")
+	}
+	if opts.WriteBackBatchMaxBytes < 0 {
+		return fmt.Errorf("mount: WriteBackBatchMaxBytes must be >= 0")
+	}
+	if opts.WriteBackBatchWindow > 0 && opts.WritePolicy != WritePolicyWriteBack {
+		return fmt.Errorf("mount: WriteBackBatchWindow requires writeback policy")
 	}
 	hasOverlayOptions := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0 || len(opts.PackPaths) > 0
 	if !profileAllowsLocalPolicy(opts.Profile) {
