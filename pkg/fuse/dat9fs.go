@@ -6922,6 +6922,15 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		fs.inodes.UpdateSize(input.NodeId, newSize)
 		if newSize != oldSize {
 			metadataChanged = true
+			// POSIX: truncation updates mtime (not just ctime). The trailing
+			// metadataChanged block only updates ctime, so update mtime
+			// explicitly here. Without this, open(O_TRUNC) — which the
+			// kernel translates to SetAttr(FATTR_SIZE, 0) + Open — would
+			// not advance mtime, failing POSIX mtime-advance checks
+			// (pjdfstest open/00.t test 43).
+			truncMtime := time.Now()
+			entry.Mtime = truncMtime
+			fs.inodes.UpdateMtime(input.NodeId, truncMtime)
 		}
 		// Kernel already receives updated attrs via the SetAttr reply —
 		// no need for an explicit notifyInode here.
