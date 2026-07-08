@@ -8490,7 +8490,7 @@ func (fs *Dat9FS) FsyncDir(cancel <-chan struct{}, input *gofuse.FsyncIn) (statu
 		if err != nil {
 			return localErrToFuseStatus(err)
 		}
-		defer dir.Close()
+		defer func() { _ = dir.Close() }()
 		if err := syncOpenLocalFile(dir); err != nil {
 			return localErrToFuseStatus(err)
 		}
