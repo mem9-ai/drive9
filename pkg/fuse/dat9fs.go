@@ -6321,8 +6321,15 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				fs.inodes.UpdateMode(input.NodeId, stat.Mode)
 			}
 			if !stat.Mtime.IsZero() {
-				entry.Mtime = stat.Mtime
-				fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+				// Only adopt the remote mtime when the inode does not already
+				// have a newer local mtime. This prevents a stale remote mtime
+				// (e.g. creation time from before a local truncation) from
+				// clobbering a locally-updated mtime after the dirty handle is
+				// flushed and the remote stat path runs.
+				if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
+					entry.Mtime = stat.Mtime
+					fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+				}
 			}
 		}
 	} else if input.NodeId != 1 {
@@ -6352,8 +6359,10 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				fs.inodes.UpdateMode(input.NodeId, stat.Mode)
 			}
 			if !stat.Mtime.IsZero() {
-				entry.Mtime = stat.Mtime
-				fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+				if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
+					entry.Mtime = stat.Mtime
+					fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+				}
 			}
 		}
 	}
