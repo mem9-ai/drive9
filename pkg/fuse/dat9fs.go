@@ -6562,6 +6562,29 @@ func (fs *Dat9FS) checkSetAttrOwnerForCaller(input *gofuse.SetAttrIn, entry *Ino
 	return gofuse.OK
 }
 
+// chownPreserveID is the sentinel value (uint32(-1)) the Linux kernel sends
+// via FATTR_UID/FATTR_GID to indicate "do not change this field" in a chown
+// call (e.g. chown(path, -1, gid) or chown(path, -1, -1)).
+const chownPreserveID = ^uint32(0)
+
+// resolveSetAttrOwner reads the requested uid/gid from input, treating the
+// chown(-1) preserve sentinel (0xFFFFFFFF) as "not set" so that callers do
+// not overwrite the existing owner with a literal 0xFFFFFFFF. The Linux kernel
+// always sets FATTR_UID/FATTR_GID when chown is invoked, even for fields the
+// caller wants to preserve, so GetUID()/GetGID() report hasUID/hasGID=true
+// with the sentinel value — this helper normalizes that back to hasUID=false.
+func resolveSetAttrOwner(input *gofuse.SetAttrIn) (uid uint32, hasUID bool, gid uint32, hasGID bool) {
+	uid, hasUID = input.GetUID()
+	gid, hasGID = input.GetGID()
+	if hasUID && uid == chownPreserveID {
+		hasUID = false
+	}
+	if hasGID && gid == chownPreserveID {
+		hasGID = false
+	}
+	return uid, hasUID, gid, hasGID
+}
+
 func processHasSupplementaryGroup(pid, gid uint32) bool {
 	if pid == 0 {
 		return false
@@ -6677,8 +6700,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			fs.inodes.UpdateAtime(input.NodeId, atime)
 			metadataChanged = true
 		}
-		ownerUID, hasUID := input.GetUID()
-		ownerGID, hasGID := input.GetGID()
+		ownerUID, hasUID, ownerGID, hasGID := resolveSetAttrOwner(input)
 		if hasUID || hasGID {
 			if st := fs.checkSetAttrOwnerForCaller(input, entry, ownerUID, hasUID, ownerGID, hasGID); st != gofuse.OK {
 				return st
@@ -6767,8 +6789,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 
 	// Handle owner updates. Drive9 does not persist uid/gid remotely yet, but
 	// the FUSE mount should report the ownership it has acknowledged.
-	ownerUID, hasUID := input.GetUID()
-	ownerGID, hasGID := input.GetGID()
+	ownerUID, hasUID, ownerGID, hasGID := resolveSetAttrOwner(input)
 	if hasUID || hasGID {
 		if st := fs.checkSetAttrOwnerForCaller(input, entry, ownerUID, hasUID, ownerGID, hasGID); st != gofuse.OK {
 			return st
@@ -9373,6 +9394,16 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.ZeroBase = true
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 			fs.inodes.UpdateSize(fh.Ino, 0)
+			// Truncation updates mtime and ctime (POSIX). The SetAttr
+			// FATTR_SIZE path does this via the trailing metadataChanged
+			// block; Open(O_TRUNC) must do the same explicitly.
+			truncTime := time.Now()
+			if entry != nil {
+				entry.Mtime = truncTime
+				entry.Ctime = truncTime
+			}
+			fs.inodes.UpdateMtime(fh.Ino, truncTime)
+			fs.inodes.UpdateCtime(fh.Ino, truncTime)
 			if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 				if err := fs.shadowStore.WriteFull(p, nil, fh.BaseRev); err != nil {
 					log.Printf("shadow reset failed for truncate-open %s: %v", p, err)
