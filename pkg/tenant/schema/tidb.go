@@ -25,6 +25,9 @@ func initTiDBTenantSchemaStatementsForModeWithConfig(mode TiDBEmbeddingMode, cfg
 	switch mode {
 	case TiDBEmbeddingModeAuto:
 		return CloneStatements(tidbAutoEmbeddingSchemaStatementsForConfig(cfg)), nil
+	case TiDBEmbeddingModeFTSOnly:
+		cfg.disableGeneratedEmbedding = true
+		return CloneStatements(tidbAutoEmbeddingSchemaStatementsForConfig(cfg)), nil
 	case TiDBEmbeddingModeApp:
 		return CloneStatements(tidbAppEmbeddingSchemaStatements()), nil
 	default:
@@ -70,6 +73,8 @@ func InitTiDBTenantSchemaForModeWithOptionsContext(ctx context.Context, dsn stri
 	switch mode {
 	case TiDBEmbeddingModeAuto:
 		return initTiDBAutoEmbeddingSchema(ctx, dsn)
+	case TiDBEmbeddingModeFTSOnly:
+		return initTiDBFTSOnlySchema(ctx, dsn)
 	case TiDBEmbeddingModeApp:
 		return initTiDBAppEmbeddingSchema(ctx, dsn, opts)
 	default:
@@ -85,4 +90,8 @@ func InitTiDBTenantSchemaForAutoEmbeddingConfigContext(ctx context.Context, dsn 
 
 func InitTiDBTenantSchemaForAutoEmbeddingProfileContext(ctx context.Context, dsn string, profile TiDBAutoEmbeddingProfile) error {
 	return initTiDBAutoEmbeddingSchemaWithProfile(ctx, dsn, profile)
+}
+
+func InitTiDBTenantSchemaForFTSOnlyProfileContext(ctx context.Context, dsn string, profile TiDBAutoEmbeddingProfile) error {
+	return initTiDBFTSOnlySchemaWithProfile(ctx, dsn, profile)
 }

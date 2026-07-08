@@ -771,9 +771,6 @@ func (m *tenantWorkerManager) taskTypesForProvider(provider string) []semantic.T
 			return nil
 		}
 		types := m.pool.AutoSemanticTaskTypes()
-		if m.pool.IsAutoEmbeddingDisabled() {
-			return unionTaskTypes(m.appManagedTaskTypes(), types)
-		}
 		if types != nil {
 			return types
 		}
