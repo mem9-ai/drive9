@@ -411,6 +411,8 @@ func requestRoute(path string) string {
 		return "/v1/fs:batch-stat"
 	case path == "/v1/fs:batch-read-small":
 		return "/v1/fs:batch-read-small"
+	case path == "/v1/fs:batch-write":
+		return "/v1/fs:batch-write"
 	case strings.HasPrefix(path, "/v1/fs/"):
 		return "/v1/fs/*"
 	case path == "/v1/uploads":
@@ -451,6 +453,8 @@ func classifyTenantRequest(r *http.Request) tenantRequestClass {
 		return tenantRequestClass{surface: "fs", action: "batch_stat"}
 	case path == "/v1/fs:batch-read-small":
 		return tenantRequestClass{surface: "fs", action: "batch_read_small"}
+	case path == "/v1/fs:batch-write":
+		return tenantRequestClass{surface: "fs", action: "batch_write"}
 	case strings.HasPrefix(path, "/v1/fs/"):
 		return tenantRequestClass{surface: "fs", action: classifyFSAction(r)}
 	case path == "/v1/uploads":

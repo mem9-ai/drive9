@@ -62,6 +62,13 @@ func ExampleClient_filesystemCRUDAndMetadata() {
 	_ = c.WriteCtxConditionalWithTags(ctx, "/workspace/tagged.txt", []byte("tagged"), -1, map[string]string{"kind": "note"})
 	_ = c.WriteCtxConditionalWithDescription(ctx, "/workspace/described.txt", []byte("body"), -1, "short description")
 	_, _ = c.WriteCtxConditionalWithRevision(ctx, "/workspace/revision.txt", []byte("body"), -1)
+	batchResults, _ := c.BatchWriteCtx(ctx, []drive9.BatchWriteItem{
+		{Path: "/workspace/batch-a.txt", ExpectedRevision: 0, Data: []byte("a"), Mode: 0o644, HasMode: true},
+		{Path: "/workspace/batch-b.txt", ExpectedRevision: -1, Data: []byte("b")},
+	})
+	for _, result := range batchResults {
+		_ = result.OK()
+	}
 
 	_, _ = c.CreateFile("/workspace/empty.txt")
 	_, _ = c.CreateFileCtx(ctx, "/workspace/empty-ctx.txt")
@@ -498,6 +505,7 @@ var coveredClientMethods = map[string]bool{
 	"BaseURL":                              true,
 	"BatchReadSmallCtx":                    true,
 	"BatchStatCtx":                         true,
+	"BatchWriteCtx":                        true,
 	"CachedSmallFileThreshold":             true,
 	"CheckpointFSLayer":                    true,
 	"Chmod":                                true,

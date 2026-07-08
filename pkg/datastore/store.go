@@ -1692,6 +1692,22 @@ func (s *Store) Stat(ctx context.Context, path string) (out *NodeWithFile, err e
 	return out, nil
 }
 
+// StatTx is like Stat but reads through an existing transaction.
+func (s *Store) StatTx(ctx context.Context, db execer, path string) (out *NodeWithFile, err error) {
+	row := db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
+		i.inode_id, c.storage_type, c.storage_ref, c.storage_encryption_mode, c.storage_encryption_key_id,
+		c.content_blob, c.content_type, i.size_bytes,
+		c.checksum_sha256, i.revision, i.mode, s.embedding_revision, i.status, c.source_id, s.content_text,
+		s.description, s.description_embedding_revision, i.created_at, i.confirmed_at, i.expires_at
+		FROM file_nodes fn
+		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
+		LEFT JOIN contents c ON i.inode_id = c.inode_id
+		LEFT JOIN semantic s ON i.inode_id = s.inode_id
+		WHERE fn.path_hash = ? AND fn.path = ?
+		LIMIT 1`, fileNodePathHash(path), path)
+	return scanNodeWithFileWithBlob(row)
+}
+
 func (s *Store) StatPathFallback(ctx context.Context, primaryPath, fallbackPath string) (out *NodeWithFile, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "stat_path_fallback", start, &err)

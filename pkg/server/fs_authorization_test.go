@@ -170,6 +170,7 @@ func TestIsScopedBusinessRequestAllowed(t *testing.T) {
 			{http.MethodHead, "/v1/fs/main.txt", ""},
 			{http.MethodPost, "/v1/fs:batch-stat", ""},
 			{http.MethodPost, "/v1/fs:batch-read-small", ""},
+			{http.MethodPost, "/v1/fs:batch-write", ""},
 		}
 		for _, tc := range cases {
 			r := newScopedRequest(t, tc.method, tc.path, tc.query)
@@ -192,6 +193,7 @@ func TestIsScopedBusinessRequestAllowed(t *testing.T) {
 			{http.MethodPost, "/v1/fs/main.txt", "chmod=1"}, // owner-only forever
 			{http.MethodGet, "/v1/fs:batch-stat", ""},       // wrong method for this endpoint
 			{http.MethodGet, "/v1/fs:batch-read-small", ""}, // wrong method
+			{http.MethodGet, "/v1/fs:batch-write", ""},      // wrong method
 			{http.MethodPost, "/v1/sql", ""},                // out of scope
 			{http.MethodPost, "/v1/fork", ""},               // out of scope
 			{http.MethodGet, "/v1/events", ""},              // out of scope
