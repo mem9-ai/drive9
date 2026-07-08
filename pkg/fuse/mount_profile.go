@@ -154,3 +154,23 @@ func ApplyInteractiveProfile(opts *MountOptions) {
 		opts.UploadConcurrency = defaultUploadConcurrency
 	}
 }
+
+// ApplyCodingAgentProfile configures MountOptions for AI coding agent
+// workloads (CSI-mounted volumes in containerized environments). Uses longer
+// kernel cache TTLs than interactive to reduce syscall count — critical for
+// gVisor 9p environments where each syscall incurs a cross-process round-trip.
+func ApplyCodingAgentProfile(opts *MountOptions) {
+	ApplyInteractiveProfile(opts)
+	if opts.AttrTTL <= 1*time.Second {
+		opts.AttrTTL = 30 * time.Second
+	}
+	if opts.EntryTTL <= 1*time.Second {
+		opts.EntryTTL = 30 * time.Second
+	}
+	if opts.DirTTL <= 2*time.Second {
+		opts.DirTTL = 30 * time.Second
+	}
+	if opts.NegativeEntryTTL <= 1*time.Second {
+		opts.NegativeEntryTTL = 10 * time.Second
+	}
+}

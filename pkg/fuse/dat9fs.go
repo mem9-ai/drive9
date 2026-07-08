@@ -5976,8 +5976,27 @@ func (fs *Dat9FS) waitQueuedRemoteCommitBeforeWrite(p string) func() {
 }
 
 func (fs *Dat9FS) lockWritableRemoteCommitPathForWritableOpen(p string) func() {
+	return fs.lockWritableRemoteCommitPathForWritableOpenTruncate(p, false)
+}
+
+func (fs *Dat9FS) lockWritableRemoteCommitPathForWritableOpenTruncate(p string, truncate bool) func() {
 	if fs == nil || p == "" {
 		return func() {}
+	}
+	// When the caller opens with O_TRUNC, the entire file content will be
+	// replaced. Any queued or in-flight upload for the same path is uploading
+	// stale data — cancel it and proceed immediately instead of spin-waiting
+	// for the upload to finish. This eliminates ~100ms of blocking per
+	// same-path rewrite (e.g. config files rewritten 30x during startup).
+	if truncate && fs.canSupersedeInFlightCommitForTruncate(p) {
+		unlockRemoteCommit := fs.lockRemoteCommitPath(p)
+		if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
+			// Race: a new entry was queued between cancel and lock.
+			// Fall back to spin-wait.
+			unlockRemoteCommit()
+			return fs.lockWritableRemoteCommitPath(p)
+		}
+		return unlockRemoteCommit
 	}
 	if !fs.canSupersedeQueuedPathTruncate(p) {
 		return fs.lockWritableRemoteCommitPath(p)
@@ -5988,6 +6007,31 @@ func (fs *Dat9FS) lockWritableRemoteCommitPathForWritableOpen(p string) func() {
 		return fs.lockWritableRemoteCommitPath(p)
 	}
 	return unlockRemoteCommit
+}
+
+// canSupersedeInFlightCommitForTruncate cancels both queued and in-flight
+// commits for the given path when the caller is about to fully replace the
+// file content (O_TRUNC open). The cancelled commit's data is stale and
+// will be superseded by the new write. This avoids blocking the open on
+// the previous upload finishing (~100ms per same-path rewrite).
+func (fs *Dat9FS) canSupersedeInFlightCommitForTruncate(p string) bool {
+	if fs == nil || p == "" || fs.mountWritePolicy() != WritePolicyWriteBack {
+		return false
+	}
+	if fs.commitQueue == nil {
+		return true
+	}
+	if !fs.commitQueue.HasPath(p) {
+		return true
+	}
+	fs.debugf("supersede in-flight commit for truncate: %s", p)
+	fs.commitQueue.CancelPath(p)
+	// Brief wait for worker to acknowledge cancellation and exit in-flight
+	// state. The worker checks isEntryCanceled before onCommitSuccess cleanup
+	// (skipping cleanup if canceled), so this wait ensures the old entry's
+	// cleanup has either run or been skipped before we stage new data.
+	fs.commitQueue.WaitPathTimeout(p, 100*time.Millisecond)
+	return true
 }
 
 func (fs *Dat9FS) canSupersedeQueuedPathTruncate(p string) bool {
@@ -9304,7 +9348,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		if fs.opts.ReadOnly {
 			return gofuse.EROFS
 		}
-		unlockRemoteCommit := fs.lockWritableRemoteCommitPathForWritableOpen(p)
+		unlockRemoteCommit := fs.lockWritableRemoteCommitPathForWritableOpenTruncate(p, input.Flags&syscall.O_TRUNC != 0)
 		defer func() {
 			if unlockRemoteCommit != nil {
 				unlockRemoteCommit()

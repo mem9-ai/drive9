@@ -96,6 +96,9 @@ func (o *MountOptions) setDefaults() {
 	if o.Profile == MountProfileInteractive {
 		ApplyInteractiveProfile(o)
 	}
+	if o.Profile == MountProfileCodingAgent {
+		ApplyCodingAgentProfile(o)
+	}
 	if o.CacheSize <= 0 {
 		o.CacheSize = defaultReadCacheMaxSize
 	}
