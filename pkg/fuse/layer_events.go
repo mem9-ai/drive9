@@ -60,10 +60,22 @@ func refreshLayerEvents(ctx context.Context, c *client.Client, opts *MountOption
 		return since, nil
 	}
 	maxSeq := since
+	rolledBack := false
 	for i := range events {
 		if events[i].Seq > maxSeq {
 			maxSeq = events[i].Seq
 		}
+		if events[i].Op == "rollback" {
+			rolledBack = true
+		}
+	}
+	// When a rollback event is observed, clear the overlay and halt the
+	// mount's layer write path — do NOT call restoreLayerEntries, which
+	// would re-replay the abandoned layer's still-present fs_layer_entries
+	// and re-add the overlay we just cleared.
+	if rolledBack {
+		fs.applyLayerRollback(shadows, pending)
+		return maxSeq, nil
 	}
 	if err := restoreLayerEntries(ctx, c, opts, shadows, pending, fs); err != nil {
 		return since, err

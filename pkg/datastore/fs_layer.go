@@ -41,6 +41,13 @@ const (
 	FSLayerEntryKindFile    FSLayerEntryKind = "file"
 	FSLayerEntryKindDir     FSLayerEntryKind = "dir"
 	FSLayerEntryKindSymlink FSLayerEntryKind = "symlink"
+
+	// fsLayerEventOpRollback is the synthetic event op emitted into
+	// fs_layer_events when a layer is rolled back. It lets mounted FUSE
+	// clients detect the rollback via the layer-event watcher and refresh
+	// their view without a remount. Unlike entry ops it is never written
+	// to fs_layer_entries and bypasses validateFSLayerEntryOp.
+	fsLayerEventOpRollback = "rollback"
 )
 
 type FSLayer struct {
@@ -409,25 +416,72 @@ func (s *Store) RollbackFSLayer(ctx context.Context, layerID string) error {
 	if layerID == "" {
 		return fmt.Errorf("fs layer id is required")
 	}
-	err := s.SetFSLayerStateIf(ctx, layerID, []FSLayerState{
-		FSLayerStateActive,
-		FSLayerStateSealed,
-		FSLayerStateConflicted,
-	}, FSLayerStateAbandoned)
-	if err == nil {
-		return nil
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin rollback fs layer transaction: %w", err)
 	}
-	if !errors.Is(err, ErrFSLayerStateConflict) {
+	defer func() { _ = tx.Rollback() }()
+
+	// Flip the layer state to abandoned. The UPDATE is conditional on the
+	// current state being one of the rollback-eligible states, mirroring
+	// SetFSLayerStateIf but inside this transaction so the synthetic event
+	// is committed atomically with the state transition.
+	res, err := tx.ExecContext(ctx, `
+UPDATE fs_layers
+SET state = ?, updated_at = UTC_TIMESTAMP(3), sealed_at = COALESCE(sealed_at, UTC_TIMESTAMP(3))
+WHERE layer_id = ? AND state IN (?, ?, ?)`,
+		string(FSLayerStateAbandoned), layerID,
+		string(FSLayerStateActive), string(FSLayerStateSealed), string(FSLayerStateConflicted))
+	if err != nil {
+		return fmt.Errorf("rollback fs layer %s: %w", layerID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
 		return err
 	}
-	layer, getErr := s.GetFSLayer(ctx, layerID)
-	if getErr != nil {
-		return getErr
+	if n == 0 {
+		// No row was updated: either the layer does not exist, or it was
+		// already in a terminal state. Distinguish the two and, for the
+		// already-abandoned case, return nil idempotently WITHOUT
+		// re-emitting the rollback event.
+		var state string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM fs_layers WHERE layer_id = ?`, layerID).Scan(&state); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return fmt.Errorf("read fs layer %s: %w", layerID, err)
+		}
+		if FSLayerState(state) == FSLayerStateAbandoned {
+			return nil
+		}
+		return ErrFSLayerStateConflict
 	}
-	if layer.State == FSLayerStateAbandoned {
-		return nil
+
+	// Allocate a seq strictly greater than any existing event seq for this
+	// layer so the FUSE layer-event watcher (which keys off seq > lastSeq)
+	// observes the rollback. Events today share the entry_seq namespace,
+	// but a rollback produces no fs_layer_entries row, so we allocate from
+	// fs_layer_events.seq directly to stay monotonic and unique under
+	// uk_fs_layer_events_seq(layer_id, seq).
+	var maxSeq sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM fs_layer_events WHERE layer_id = ?`, layerID).Scan(&maxSeq); err != nil {
+		return fmt.Errorf("read fs layer max event seq: %w", err)
 	}
-	return ErrFSLayerStateConflict
+	seq := int64(1)
+	if maxSeq.Valid && maxSeq.Int64 >= seq {
+		seq = maxSeq.Int64 + 1
+	}
+	eventID := fmt.Sprintf("%s:rollback:%d", layerID, seq)
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO fs_layer_events (event_id, layer_id, seq, actor_id, op, path, created_at)
+VALUES (?, ?, ?, '', ?, '/', UTC_TIMESTAMP(3))`,
+		eventID, layerID, seq, fsLayerEventOpRollback); err != nil {
+		return fmt.Errorf("insert fs layer rollback event %s: %w", layerID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit rollback fs layer %s: %w", layerID, err)
+	}
+	return nil
 }
 
 func (s *Store) ListFSLayerEntryLog(ctx context.Context, layerID string) ([]FSLayerEntry, error) {

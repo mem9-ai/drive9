@@ -86,6 +86,11 @@ type CommitQueue struct {
 	journal      *Journal
 	wg           sync.WaitGroup
 	stopped      bool
+	// abandoned is set by AbandonLayer when the mounted layer was rolled
+	// back. When true, Enqueue returns errLayerRolledBack and commitOne
+	// skips tryAutoResolveConflict, going straight to terminal failure so
+	// pending writes are preserved as PendingConflict.
+	abandoned    bool
 
 	// OnSuccess is called after successful upload with the committed
 	// revision. Used by dat9fs to seed readCache and update inode revision.
@@ -189,6 +194,9 @@ func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 	if cq.stopped {
 		if cq.perf != nil {
 			cq.perf.commitEnqueueError.add(1)
+		}
+		if cq.abandoned {
+			return errLayerRolledBack
 		}
 		return fmt.Errorf("commit queue stopped")
 	}
@@ -454,6 +462,44 @@ func (cq *CommitQueue) IsFull() bool {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
 	return len(cq.queue) >= cq.maxPending
+}
+
+// AbandonLayer halts the commit queue because the mounted layer was rolled
+// back. New Enqueue calls return errLayerRolledBack. Queued (not-yet-
+// dispatched) entries are canceled so workers remove them; their pending
+// state is preserved on disk. In-flight uploads are left to finish — they
+// will fail with 409 and fall to onCommitTerminalFailure, which marks them
+// PendingConflict. Unlike DrainAll this does NOT block (no wg.Wait) so the
+// caller is not stalled waiting on uploads to a now-dead layer.
+func (cq *CommitQueue) AbandonLayer() {
+	if cq == nil {
+		return
+	}
+	cq.mu.Lock()
+	if cq.stopped {
+		// Already stopped (e.g. DrainAll ran first); just mark abandoned so
+		// Enqueue returns the rolled-back sentinel instead of the generic
+		// "commit queue stopped" message.
+		cq.abandoned = true
+		cq.mu.Unlock()
+		return
+	}
+	cq.abandoned = true
+	cq.stopped = true
+	close(cq.workCh)
+	// Cancel all queued (not-yet-dispatched) entries so the worker loop
+	// removes them; their pending state is preserved on disk.
+	for _, entry := range cq.queue {
+		if entry != nil {
+			entry.canceled = true
+		}
+	}
+	cq.forceAllDelayedLocked()
+	cq.queue = nil
+	cq.queuedByPath = make(map[string]map[*CommitEntry]struct{})
+	cq.mu.Unlock()
+	// Do NOT wg.Wait() — let in-flight workers finish their current upload
+	// (they will 409 → onCommitTerminalFailure → MarkConflict on their own).
 }
 
 // DrainAll stops accepting new entries and waits for all workers to finish.
@@ -996,6 +1042,19 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			return
 		}
 		if errors.Is(err, client.ErrConflict) {
+			// When the layer was rolled back, the 409 is a state conflict
+			// (not a revision conflict); skip the Stat/HEAD auto-resolve
+			// round-trip and go straight to terminal failure so the entry
+			// is preserved as PendingConflict.
+			cq.mu.Lock()
+			abandoned := cq.abandoned
+			cq.mu.Unlock()
+			if abandoned {
+				log.Printf("commit queue: layer abandoned, terminal failure for %s", entry.Path)
+				cq.onCommitTerminalFailure(entry)
+				unlockPath()
+				return
+			}
 			log.Printf("commit queue: conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
 			cq.tryAutoResolveConflict(entryCtx, entry)
 			unlockPath()
@@ -1048,6 +1107,12 @@ func (cq *CommitQueue) entryUploadContext(parent context.Context, entry *CommitE
 // by workers. It is used as a fallback when the async queue rejects an entry
 // after local state has already moved to the final path.
 func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error {
+	cq.mu.Lock()
+	abandoned := cq.abandoned
+	cq.mu.Unlock()
+	if abandoned {
+		return errLayerRolledBack
+	}
 	unlockPath := cq.lockPath(entry.Path)
 	defer unlockPath()
 	return cq.commitNowPathLocked(ctx, entry)

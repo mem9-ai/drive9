@@ -117,6 +117,77 @@ func TestFSLayerRollbackRejectsCommittedAndCommitting(t *testing.T) {
 	}
 }
 
+func TestRollbackFSLayerEmitsEvent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateFSLayer(ctx, &FSLayer{LayerID: "layer-rollback-event", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	// Upsert an entry so there is a prior entry-event seq; the rollback
+	// event seq must be strictly greater so the FUSE watcher observes it.
+	if err := s.UpsertFSLayerEntry(ctx, &FSLayerEntry{
+		LayerID:     "layer-rollback-event",
+		Path:        "/repo/a.txt",
+		Op:          FSLayerEntryOpUpsert,
+		Kind:        FSLayerEntryKindFile,
+		ContentBlob: []byte("data"),
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry: %v", err)
+	}
+	priorEvents, err := s.ListFSLayerEvents(ctx, "layer-rollback-event", 0, 1000)
+	if err != nil {
+		t.Fatalf("ListFSLayerEvents before rollback: %v", err)
+	}
+	if len(priorEvents) != 1 || priorEvents[0].Op != "upsert" {
+		t.Fatalf("prior events = %+v, want 1 upsert event", priorEvents)
+	}
+
+	// Rollback → emits a synthetic rollback event.
+	if err := s.RollbackFSLayer(ctx, "layer-rollback-event"); err != nil {
+		t.Fatalf("RollbackFSLayer: %v", err)
+	}
+	events, err := s.ListFSLayerEvents(ctx, "layer-rollback-event", 0, 1000)
+	if err != nil {
+		t.Fatalf("ListFSLayerEvents after rollback: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events after rollback = %d, want 2 (upsert + rollback)", len(events))
+	}
+	rbEvent := events[1]
+	if rbEvent.Op != "rollback" {
+		t.Fatalf("rollback event op = %q, want %q", rbEvent.Op, "rollback")
+	}
+	if rbEvent.LayerID != "layer-rollback-event" {
+		t.Fatalf("rollback event layer_id = %q, want layer-rollback-event", rbEvent.LayerID)
+	}
+	if rbEvent.Seq <= priorEvents[0].Seq {
+		t.Fatalf("rollback event seq %d <= prior upsert seq %d", rbEvent.Seq, priorEvents[0].Seq)
+	}
+	if rbEvent.EventID == "" || rbEvent.EventID == events[0].EventID {
+		t.Fatalf("rollback event_id = %q, want unique non-empty", rbEvent.EventID)
+	}
+
+	// Idempotent rollback (already abandoned): must NOT re-emit the event.
+	if err := s.RollbackFSLayer(ctx, "layer-rollback-event"); err != nil {
+		t.Fatalf("RollbackFSLayer idempotent: %v", err)
+	}
+	events2, err := s.ListFSLayerEvents(ctx, "layer-rollback-event", 0, 1000)
+	if err != nil {
+		t.Fatalf("ListFSLayerEvents after idempotent rollback: %v", err)
+	}
+	if len(events2) != len(events) {
+		t.Fatalf("events after idempotent rollback = %d, want %d (no re-emit)", len(events2), len(events))
+	}
+}
+
+func TestRollbackFSLayerNotFound(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.RollbackFSLayer(ctx, "nonexistent-layer"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("RollbackFSLayer nonexistent err=%v, want ErrNotFound", err)
+	}
+}
+
 func TestFSLayerUpsertRejectsNonActiveLayer(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

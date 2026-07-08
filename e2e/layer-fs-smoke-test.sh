@@ -1011,6 +1011,71 @@ if require_layer_fuse_prereqs; then
   check_cmd_fail "committed FUSE whiteout visible in base" drive9 fs cat "${fuse_root}/delete.txt"
   check_cmd_fail "committed FUSE rename source visible in base" drive9 fs cat "${fuse_root}/move.txt"
   check_eq "committed FUSE rename target visible" "$(drive9_retry fs cat "${fuse_root}/moved.txt")" "$(cat "$fuse_move_local")"
+
+  # ------------------------------------------------------------------
+  # [fuse] layer rollback hot-refresh: a mounted layer should revert to
+  # the base view after `fs layer rollback` WITHOUT requiring a remount.
+  # ------------------------------------------------------------------
+  rollback_fuse_root="/layer-rollback-fuse-${ts}"
+  rollback_fuse_layer="layer-rollback-fuse-${ts}"
+  rollback_fuse_base_local="/tmp/drive9-layer-rollback-base-${ts}.txt"
+  printf 'rollback fuse base %s\n' "$ts" >"$rollback_fuse_base_local"
+  drive9_retry fs mkdir "$rollback_fuse_root" >/dev/null
+  drive9_retry fs cp "$rollback_fuse_base_local" ":${rollback_fuse_root}/base.txt" >/dev/null
+
+  rollback_fuse_layer_json=$(drive9_retry fs layer create \
+    --name "$rollback_fuse_layer" \
+    --tag "rollback_fuse_run=$ts" \
+    --durability restore-safe \
+    --json \
+    ":$rollback_fuse_root")
+  rollback_fuse_layer_id=$(printf '%s' "$rollback_fuse_layer_json" | jq -r '.layer_id // empty')
+  check_cmd "rollback fuse layer create returns id" test -n "$rollback_fuse_layer_id"
+
+  mount_rb="${FUSE_MOUNT_ROOT%/}/drive9-layer-rollback-${ts}"
+  local_rb="/tmp/drive9-layer-local-rollback-${ts}"
+  log_rb="/tmp/drive9-layer-rollback-${ts}.log"
+  start_layer_mount "tag:rollback_fuse_run=$ts" "" "$rollback_fuse_root" "$mount_rb" "$local_rb" "$log_rb"
+  check_eq "rollback fuse mount reads base before edit" "$(cat "$mount_rb/base.txt")" "$(cat "$rollback_fuse_base_local")"
+
+  # Write a file through the layer mount — it should be visible via the overlay.
+  printf 'rollback fuse new file %s\n' "$ts" >"$mount_rb/new.txt"
+  check_eq "rollback fuse new file visible in layer mount" "$(cat "$mount_rb/new.txt")" "rollback fuse new file ${ts}"
+
+  # Roll back the layer from a separate CLI call (not through the mount).
+  check_eq "rollback fuse command returns ok" "$(drive9_retry fs layer rollback "tag:rollback_fuse_run=$ts")" "ok"
+  rollback_fuse_status=$(drive9_retry fs layer status --json "$rollback_fuse_layer")
+  check_eq "rollback fuse layer state is abandoned" "$(printf '%s' "$rollback_fuse_status" | jq -r '.state')" "abandoned"
+
+  # Without remounting, the layer overlay should clear within the watcher
+  # poll interval (~1s). Poll up to LAYER_DIFF_TIMEOUT_S for the new file
+  # to disappear (base view restored).
+  rollback_hot_refresh_ok="no"
+  rollback_poll_elapsed=0
+  while [ "$rollback_poll_elapsed" -lt "$LAYER_DIFF_TIMEOUT_S" ]; do
+    if [ ! -e "$mount_rb/new.txt" ]; then
+      rollback_hot_refresh_ok="yes"
+      break
+    fi
+    sleep "$LAYER_DIFF_INTERVAL_S"
+    rollback_poll_elapsed=$((rollback_poll_elapsed + LAYER_DIFF_INTERVAL_S))
+  done
+  check_eq "rollback fuse overlay clears without remount (new.txt disappears)" "$rollback_hot_refresh_ok" "yes"
+
+  # Base file should still be visible after rollback.
+  check_eq "rollback fuse base still visible after hot refresh" "$(cat "$mount_rb/base.txt")" "$(cat "$rollback_fuse_base_local")"
+
+  # A new write through the now-abandoned mount should fail with ESTALE.
+  rollback_write_err=""
+  if printf 'should fail %s\n' "$ts" >"$mount_rb/post-rollback.txt" 2>/dev/null; then
+    rollback_write_err="success"
+  else
+    rollback_write_err="failure"
+  fi
+  check_eq "rollback fuse new write after rollback fails (ESTALE)" "$rollback_write_err" "failure"
+
+  check_cmd "unmount rollback fuse mount" unmount_layer_mount
+  check_cmd "rollback fuse mount log clean" audit_mount_log "$log_rb"
 fi
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"
