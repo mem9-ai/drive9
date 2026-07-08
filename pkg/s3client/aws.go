@@ -689,7 +689,15 @@ func (c *AWSS3Client) deleteObjectsByPrefix(ctx context.Context, fullPrefix stri
 					},
 				})
 				if err != nil {
-					return fmt.Errorf("delete objects by prefix: %w", err)
+					if !isDeleteObjectsCompatibilityError(err) {
+						return fmt.Errorf("delete objects by prefix: %w", err)
+					}
+					deleted, fallbackErr := c.deleteObjectsOneByOne(ctx, objects)
+					out.DeletedObjects += deleted
+					if fallbackErr != nil {
+						return fmt.Errorf("delete objects by prefix fallback: %w", fallbackErr)
+					}
+					continue
 				}
 				if len(del.Errors) > 0 {
 					first := del.Errors[0]
@@ -703,6 +711,34 @@ func (c *AWSS3Client) deleteObjectsByPrefix(ctx context.Context, fullPrefix stri
 		}
 		continuation = res.NextContinuationToken
 	}
+}
+
+func isDeleteObjectsCompatibilityError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "MissingArgument") ||
+		strings.Contains(msg, "MalformedXML") ||
+		strings.Contains(msg, "NotImplemented")
+}
+
+func (c *AWSS3Client) deleteObjectsOneByOne(ctx context.Context, objects []types.ObjectIdentifier) (int64, error) {
+	var deleted int64
+	for _, obj := range objects {
+		key := aws.ToString(obj.Key)
+		if key == "" {
+			continue
+		}
+		if _, err := c.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &c.bucket,
+			Key:    aws.String(key),
+		}); err != nil {
+			return deleted, fmt.Errorf("delete object %s: %w", key, err)
+		}
+		deleted++
+	}
+	return deleted, nil
 }
 
 func (c *AWSS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID string, partNumber int, sourceKey string, startByte, endByte int64) (string, error) {
