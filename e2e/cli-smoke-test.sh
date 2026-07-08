@@ -789,6 +789,17 @@ PY
 )
 check_eq "cli grep finds batch file" "$grep_has_batch" "true"
 
+echo "[6.0] cli grep --json checks"
+grep_json_out="$(drive9_retry fs grep --json "cli-batch-$TS" "/")"
+check_cmd "grep --json emits a JSON array" \
+  bash -c 'jq -e "type == \"array\"" >/dev/null <<<"$1"' -- "$grep_json_out"
+grep_json_has_batch=$(jq -r --arg target "$BATCH_REMOTE_DIR/file-1.txt" \
+  '([ .[] | select(.path == $target) ] | length > 0)' <<<"$grep_json_out")
+check_eq "grep --json finds batch file in array" "$grep_json_has_batch" "true"
+
+grep_json_empty="$(drive9_retry fs grep --json "zzz_nonexistent_marker_xyz" "/")"
+check_eq "grep --json empty result is []" "$(jq -c <<<"$grep_json_empty")" "[]"
+
 find_out="$(drive9_retry fs find / -name "*.txt")"
 find_has_txt=$(python3 - "$find_out" <<'PY'
 import sys

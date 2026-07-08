@@ -496,7 +496,8 @@ commands:
   rm [-r|--recursive] <path>
                        remove file or directory tree
   sh                  interactive shell
-  grep <pattern> [dir] search file contents
+  grep [--json] <pattern> [dir]
+                       search file contents
   find [dir] [flags]   find files by attributes
     -name <glob>         match filename
     -tag <key=value>     exact match tag key/value
