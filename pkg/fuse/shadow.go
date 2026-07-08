@@ -333,22 +333,27 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 		return 0, err
 	}
 
-	// Pre-check: estimate growth delta. For sparse writes (small data at a
-	// large offset), the physical disk usage is bounded by len(data), not
-	// the logical file extension (end - oldSize). The quota check should
-	// guard against actual disk consumption, not logical file size, because
-	// the shadow file is a sparse file on disk.
+	// Pre-check: estimate growth delta for both quota and accounting.
+	// Shadow files are sparse on disk — a small write at a large offset
+	// only allocates blocks for the written region, not the hole. We use
+	// the logical file-size growth for pendingBytes (consistent with
+	// Ensure/Remove accounting) but only enforce the physical free-space
+	// ratio check, not the logical byte quota, so sparse writes are not
+	// rejected for inflating the logical file size beyond the byte quota
+	// while the actual disk allocation remains small.
 	writeLen := int64(len(data))
 	end := offset + writeLen
 	s.mu.RLock()
 	oldSize := sf.size
 	s.mu.RUnlock()
-	if end > oldSize {
-		// Use the actual data length as the physical delta for quota purposes.
-		// The filesystem will allocate only the blocks touched by the write,
-		// not the entire hole from oldSize to end.
-		if err := s.checkQuotaForDelta(writeLen); err != nil {
-			return 0, err
+	logicalDelta := end - oldSize
+	if logicalDelta > 0 {
+		// Only enforce the free-space ratio check (physical disk), not
+		// the byte quota (logical size), because shadow files are sparse.
+		if s.writeCacheFreeRatio > 0 {
+			if err := s.checkFreeRatio(writeLen); err != nil {
+				return 0, err
+			}
 		}
 	}
 
@@ -368,10 +373,8 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 	}
 	newSize := sf.size
 	s.mu.Unlock()
-	// Track logical file size growth for pendingBytes (consistent with
-	// Ensure and the original accounting). The quota check above uses
-	// len(data) to avoid rejecting sparse writes that only touch a few
-	// blocks at a large offset.
+	// Track logical file size growth for pendingBytes, consistent with
+	// Ensure and Remove accounting.
 	if delta := newSize - prevSize; delta > 0 {
 		s.pendingBytes.Add(delta)
 	}
