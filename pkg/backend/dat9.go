@@ -2208,9 +2208,99 @@ func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit 
 			err = searchErr
 			return nil, err
 		}
+		if len(rows) > 0 {
+			return rows, nil
+		}
+		// All indexed search paths returned empty. Fall back to reading raw
+		// file content and doing substring matching. This covers deployments
+		// where semantic.content_text is not populated (e.g. TiDB auto-embedding
+		// schema with the provider disabled).
+		rawRows, rawErr := b.grepRawContent(ctx, query, pathPrefix, limit)
+		if rawErr != nil {
+			logger.Warn(ctx, "backend_grep_raw_fallback_failed",
+				zap.Int("query_len", len(query)),
+				zap.String("path_prefix", pathPrefix),
+				zap.Int("limit", limit),
+				zap.Error(rawErr))
+		}
+		if len(rawRows) > 0 {
+			return rawRows, nil
+		}
 		return rows, nil
 	}
 	return rows, nil
+}
+
+// grepRawContent reads file content directly and performs substring matching.
+// This is the last-resort fallback when semantic.content_text is not populated
+// (e.g. TiDB auto-embedding schema with the provider disabled). It handles
+// both single-file paths and directory prefix paths.
+func (b *Dat9Backend) grepRawContent(ctx context.Context, query, pathPrefix string, limit int) ([]datastore.SearchResult, error) {
+	const maxFileSize = 1 << 20 // 1 MiB per file
+	const maxFiles = 100        // max files to scan
+
+	lowerQuery := strings.ToLower(query)
+
+	// Try single file first.
+	nf, statErr := b.store.Stat(ctx, pathPrefix)
+	if statErr == nil && nf != nil && !nf.Node.IsDirectory && nf.File != nil {
+		if nf.File.SizeBytes > maxFileSize {
+			return nil, nil
+		}
+		data, readErr := b.readFileDataCtx(ctx, nf.File)
+		if readErr != nil {
+			return nil, readErr
+		}
+		if !isTextContent(data) {
+			return nil, nil
+		}
+		if strings.Contains(strings.ToLower(string(data)), lowerQuery) {
+			return []datastore.SearchResult{{
+				Path:      nf.Node.Path,
+				Name:      nf.Node.Name,
+				SizeBytes: nf.File.SizeBytes,
+			}}, nil
+		}
+		return nil, nil
+	}
+
+	// Directory/prefix: list files and scan text content.
+	files, findErr := b.store.Find(ctx, &datastore.FindFilter{
+		PathPrefix: pathPrefix,
+		Limit:      maxFiles,
+	})
+	if findErr != nil {
+		return nil, findErr
+	}
+
+	var results []datastore.SearchResult
+	for _, f := range files {
+		if f.SizeBytes > maxFileSize {
+			continue
+		}
+		if len(results) >= limit {
+			break
+		}
+		filePath := f.Path
+		if filePath == "" {
+			continue
+		}
+		data, readErr := b.ReadCtx(ctx, filePath, 0, f.SizeBytes)
+		if readErr != nil {
+			continue
+		}
+		if !isTextContent(data) {
+			continue
+		}
+		if strings.Contains(strings.ToLower(string(data)), lowerQuery) {
+			results = append(results, datastore.SearchResult{
+				Path:      f.Path,
+				Name:      f.Name,
+				SizeBytes: f.SizeBytes,
+			})
+		}
+	}
+	return results, nil
 }
 
 // grepMerge takes the raw results from FTS, content-vector, and description-vector

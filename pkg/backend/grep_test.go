@@ -161,3 +161,75 @@ func TestGrepAutoEmbeddingSkipsApplicationQueryEmbedder(t *testing.T) {
 	default:
 	}
 }
+
+func TestGrepRawContentFallbackWhenSemanticTextEmpty(t *testing.T) {
+	// Simulate the TiDB auto-embedding case where content_text is not written
+	// to the semantic table. The raw-content fallback should read the file
+	// directly and find the match.
+	b := newTestBackend(t)
+	b.store.DisableAutoEmbedTextWrites()
+
+	if _, err := b.Write("/notes/raw.txt", []byte("secret payment info"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := b.Grep(context.Background(), "payment", "/notes/", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Path != "/notes/raw.txt" {
+		t.Fatalf("expected raw fallback to find /notes/raw.txt, got %+v", results)
+	}
+}
+
+func TestGrepRawContentFallbackSingleFile(t *testing.T) {
+	b := newTestBackend(t)
+	b.store.DisableAutoEmbedTextWrites()
+
+	if _, err := b.Write("/data.txt", []byte("hello world grep test"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := b.Grep(context.Background(), "hello", "/data.txt", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Path != "/data.txt" {
+		t.Fatalf("expected raw fallback to find /data.txt, got %+v", results)
+	}
+}
+
+func TestGrepRawContentFallbackNoMatchReturnsEmpty(t *testing.T) {
+	b := newTestBackend(t)
+	b.store.DisableAutoEmbedTextWrites()
+
+	if _, err := b.Write("/notes/no.txt", []byte("nothing relevant here"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := b.Grep(context.Background(), "payment", "/notes/", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected empty results, got %+v", results)
+	}
+}
+
+func TestGrepRawContentFallbackSkipsBinaryFiles(t *testing.T) {
+	b := newTestBackend(t)
+	b.store.DisableAutoEmbedTextWrites()
+
+	// Write a binary file (contains null byte)
+	if _, err := b.Write("/notes/bin.dat", []byte("payment\x00binary"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := b.Grep(context.Background(), "payment", "/notes/", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected binary file to be skipped, got %+v", results)
+	}
+}
