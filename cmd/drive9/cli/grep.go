@@ -10,12 +10,12 @@ import (
 )
 
 func Grep(c *client.Client, args []string) error {
-	layerRef, args, err := parseLayerFlag(args)
+	layerRef, jsonMode, args, err := parseGrepFlags(args)
 	if err != nil {
 		return err
 	}
 	if len(args) < 1 {
-		return fmt.Errorf("usage: drive9 fs grep [--layer <ref>] <pattern> [path]")
+		return fmt.Errorf("usage: drive9 fs grep [--layer <ref>] [--json] <pattern> [path]")
 	}
 	query := args[0]
 	path := "/"
@@ -31,6 +31,14 @@ func Grep(c *client.Client, args []string) error {
 	results, err := c.GrepWithLayer(query, path, 20, layerRef)
 	if err != nil {
 		return err
+	}
+	if jsonMode {
+		if results == nil {
+			results = []client.SearchResult{}
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(results)
 	}
 	if len(results) == 0 {
 		return nil
@@ -45,32 +53,24 @@ func Grep(c *client.Client, args []string) error {
 	return nil
 }
 
-func GrepJSON(c *client.Client, args []string) error {
-	layerRef, args, err := parseLayerFlag(args)
+// parseGrepFlags strips --layer <ref> and --json from args, returning the
+// layer reference, whether JSON output mode is requested, and the remaining
+// positional args. It extends parseLayerFlag with grep-specific --json.
+func parseGrepFlags(args []string) (string, bool, []string, error) {
+	layerRef, filtered, err := parseLayerFlag(args)
 	if err != nil {
-		return err
+		return "", false, nil, err
 	}
-	if len(args) < 1 {
-		return fmt.Errorf("usage: drive9 fs grep [--layer <ref>] <pattern> [path]")
+	jsonMode := false
+	remaining := make([]string, 0, len(filtered))
+	for _, arg := range filtered {
+		if arg == "--json" {
+			jsonMode = true
+		} else {
+			remaining = append(remaining, arg)
+		}
 	}
-	query := args[0]
-	path := "/"
-	if len(args) > 1 {
-		path = args[1]
-	}
-
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
-	if err != nil {
-		return err
-	}
-
-	results, err := c.GrepWithLayer(query, path, 20, layerRef)
-	if err != nil {
-		return err
-	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(results)
+	return layerRef, jsonMode, remaining, nil
 }
 
 func parseLayerFlag(args []string) (string, []string, error) {
