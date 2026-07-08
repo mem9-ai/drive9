@@ -222,23 +222,42 @@ func (p *Prefetcher) OnRead(offset int64, size int) {
 		p.readSize = size
 	}
 
-	if offset == p.nextExpect {
-		// Sequential read detected — grow window
-		p.window *= 2
-		if p.window < int64(size) {
-			p.window = int64(size)
-		}
-		if p.window > prefetchMaxWindow {
-			p.window = prefetchMaxWindow
-		}
+	end := offset + int64(size)
 
-		// Trigger prefetch for next region if not already cached or inflight.
-		prefetchStart := offset + int64(size)
+	// A read is sequential if its offset stays within the region the
+	// prefetcher is tracking: no further than window bytes behind the
+	// consumed frontier (nextExpect) and no further than window bytes ahead of
+	// it. The kernel issues several reads ahead of the consumer position and
+	// they may complete in any order, so a strict offset==nextExpect match
+	// misclassified those out-of-order completions as random and reset the
+	// prefetch window on every interleaving, collapsing prefetch to
+	// single-stream fetch latency. A read that jumps outside the tracked
+	// region — forward beyond nextExpect+window or backward beyond
+	// nextExpect-window — is a genuine random seek and resets.
+	withinWindow := offset >= p.nextExpect-p.window && offset <= p.nextExpect+p.window
+	if withinWindow {
+		if end > p.nextExpect {
+			// Forward read advancing the frontier — grow the window and prefetch.
+			p.window *= 2
+			if p.window < int64(size) {
+				p.window = int64(size)
+			}
+			if p.window > prefetchMaxWindow {
+				p.window = prefetchMaxWindow
+			}
+			p.nextExpect = end
+		}
+		// Trigger prefetch for the next region beyond the frontier if not
+		// already cached or inflight. This also covers end==nextExpect (a read
+		// landing exactly at the frontier, e.g. the first read or a readahead
+		// re-read) and out-of-order completions behind the frontier that are
+		// within the window — neither advances the frontier, neither resets.
+		prefetchStart := p.nextExpect
 		if prefetchStart < p.fileSize && !p.inflight[prefetchStart] && p.cache[prefetchStart] == nil {
 			p.startPrefetch(prefetchStart, p.window)
 		}
 	} else {
-		// Random read — reset
+		// Random read outside the tracked region — reset.
 		if p.nextExpect != 0 || len(p.cache) > 0 || len(p.inflight) > 0 {
 			p.debugf("random reset path=%s offset=%d size=%d next_expect=%d cache=%d inflight=%d", p.pathString(), offset, size, p.nextExpect, len(p.cache), len(p.inflight))
 		}
@@ -250,9 +269,8 @@ func (p *Prefetcher) OnRead(offset int64, size int) {
 		for k := range p.inflight {
 			delete(p.inflight, k)
 		}
+		p.nextExpect = end
 	}
-
-	p.nextExpect = offset + int64(size)
 }
 
 // Close cancels all inflight prefetch goroutines and clears the cache.
