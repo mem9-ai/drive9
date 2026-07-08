@@ -3159,6 +3159,21 @@ func isMissingColumnError(err error) bool {
 func DropGeneratedEmbeddingColumns(ctx context.Context, db *sql.DB) error {
 	start := time.Now()
 
+	// Fast path: if neither generated column exists, skip entirely.
+	// This avoids 4 information_schema queries on every tenant init
+	// in the steady-state case where columns are already dropped.
+	hasEmbedding, err := columnExistsOnTable(ctx, db, "semantic", "embedding")
+	if err != nil {
+		return fmt.Errorf("check embedding column: %w", err)
+	}
+	hasDescEmbedding, err := columnExistsOnTable(ctx, db, "semantic", "description_embedding")
+	if err != nil {
+		return fmt.Errorf("check description_embedding column: %w", err)
+	}
+	if !hasEmbedding && !hasDescEmbedding {
+		return nil
+	}
+
 	// Drop vector indexes first (must happen before dropping the columns they reference).
 	for _, idx := range []string{"idx_semantic_cosine", "idx_semantic_desc_cosine"} {
 		exists, err := indexExistsOnTable(ctx, db, "semantic", idx)
