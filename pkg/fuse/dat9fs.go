@@ -5512,7 +5512,7 @@ func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
 		return nil, false
 	}
 	mtime := item.Mtime
-	if mtime.IsZero() {
+	if mtime.IsZero() || (!entry.Mtime.IsZero() && entry.Mtime.After(mtime)) {
 		mtime = entry.Mtime
 	}
 	if mtime.IsZero() {
