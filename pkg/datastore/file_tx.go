@@ -367,17 +367,12 @@ func (s *Store) ClearFileEmbeddingStateTx(db execer, fileID string) error {
 			return err
 		}
 	}
-	// Dual-write to split tables
-	// Skip the explicit NULL write when embedding is a GENERATED column (TiDB
-	// auto-embedding schema) — only clear the revision marker instead.
-	if s.disableAutoEmbedTextWrites {
-		if _, err := db.Exec(`UPDATE semantic SET embedding_revision = NULL WHERE inode_id = ?`, fileID); err != nil {
-			return fmt.Errorf("update semantic embedding revision: %w", err)
-		}
-		return nil
-	}
-	if _, err := db.Exec(`UPDATE semantic SET embedding = NULL, embedding_revision = NULL WHERE inode_id = ?`, fileID); err != nil {
-		return fmt.Errorf("update semantic embedding: %w", err)
+	// Clear embedding revision marker on the split semantic table.
+	// The embedding/description_embedding vector columns may not exist
+	// (dropped when auto-embedding is disabled), so only clear the
+	// revision marker which is always present.
+	if _, err := db.Exec(`UPDATE semantic SET embedding_revision = NULL WHERE inode_id = ?`, fileID); err != nil {
+		return fmt.Errorf("update semantic embedding revision: %w", err)
 	}
 	return nil
 }

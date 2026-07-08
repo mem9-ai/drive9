@@ -3148,3 +3148,74 @@ func isMissingColumnError(err error) bool {
 		strings.Contains(msg, "unknown column") ||
 		(strings.Contains(msg, "column") && strings.Contains(msg, "does not exist"))
 }
+
+// DropGeneratedEmbeddingColumns removes the GENERATED STORED embedding and
+// description_embedding columns (and their VECTOR indexes) from the semantic
+// table. This allows content_text to be written without triggering EMBED_TEXT()
+// computation, which fails when the embedding provider is not configured.
+//
+// The function is idempotent: it checks information_schema before each DROP
+// and silently succeeds when the target column or index does not exist.
+func DropGeneratedEmbeddingColumns(ctx context.Context, db *sql.DB) error {
+	start := time.Now()
+
+	// Drop vector indexes first (must happen before dropping the columns they reference).
+	for _, idx := range []string{"idx_semantic_cosine", "idx_semantic_desc_cosine"} {
+		exists, err := indexExistsOnTable(ctx, db, "semantic", idx)
+		if err != nil {
+			return fmt.Errorf("check index %s: %w", idx, err)
+		}
+		if !exists {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, "ALTER TABLE semantic DROP INDEX "+idx); err != nil {
+			return fmt.Errorf("drop index %s: %w", idx, err)
+		}
+		logger.Info(ctx, "tenant_drop_generated_embedding_index",
+			zap.String("index", idx))
+	}
+
+	// Drop generated columns.
+	for _, col := range []string{"embedding", "description_embedding"} {
+		exists, err := columnExistsOnTable(ctx, db, "semantic", col)
+		if err != nil {
+			return fmt.Errorf("check column %s: %w", col, err)
+		}
+		if !exists {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, "ALTER TABLE semantic DROP COLUMN "+col); err != nil {
+			return fmt.Errorf("drop column %s: %w", col, err)
+		}
+		logger.Info(ctx, "tenant_drop_generated_embedding_column",
+			zap.String("column", col))
+	}
+
+	logger.Info(ctx, "tenant_drop_generated_embedding_columns_finished",
+		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+	return nil
+}
+
+func indexExistsOnTable(ctx context.Context, db *sql.DB, table, indexName string) (bool, error) {
+	var count int
+	err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM information_schema.statistics
+		 WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?`,
+		table, indexName).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func columnExistsOnTable(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	var count int
+	err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM information_schema.columns
+		 WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
+		table, column).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}

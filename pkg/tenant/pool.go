@@ -718,9 +718,6 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	if err != nil {
 		return nil, nil, fmt.Errorf("open datastore: %w", err)
 	}
-	if p.cfg.DisableDatabaseAutoEmbedding && UsesTiDBAutoEmbedding(t.Provider) {
-		store.DisableAutoEmbedTextWrites()
-	}
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
 	ensureSchemaDurationMs := 0.0
 	migrateDurationMs := 0.0
@@ -767,6 +764,17 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 					return nil, nil, fmt.Errorf("validate tidb auto-embedding schema: %w", err)
 				}
 				ensureSchemaDurationMs += float64(time.Since(validateSchemaStart).Microseconds()) / 1000.0
+			}
+		}
+		// When auto-embedding is disabled at runtime, drop the GENERATED
+		// STORED embedding columns so that content_text can be written
+		// without triggering EMBED_TEXT() (which fails with error 1105
+		// when the provider is not configured). The function is idempotent
+		// and checks information_schema before each DROP.
+		if p.cfg.DisableDatabaseAutoEmbedding {
+			if err := schema.DropGeneratedEmbeddingColumns(ctx, store.DB()); err != nil {
+				_ = store.Close()
+				return nil, nil, fmt.Errorf("drop generated embedding columns: %w", err)
 			}
 		}
 	}

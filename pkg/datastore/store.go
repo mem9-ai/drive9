@@ -151,10 +151,6 @@ type Upload struct {
 type Store struct {
 	db             *sql.DB
 	useLegacyFiles bool // true when the legacy `files` table exists and needs dual-write
-	// disableAutoEmbedTextWrites suppresses content_text/description writes to the
-	// semantic table so TiDB does not attempt to compute EMBED_TEXT() generated
-	// columns when the cluster has no supported auto-embedding provider.
-	disableAutoEmbedTextWrites bool
 }
 
 func Open(dsn string) (*Store, error) {
@@ -187,12 +183,6 @@ func (s *Store) DB() *sql.DB  { return s.db }
 // tenant database. When false, all writes skip the `files` table entirely
 // and only target the split tables (inodes / contents / semantic).
 func (s *Store) HasLegacyFiles() bool { return s.useLegacyFiles }
-
-// DisableAutoEmbedTextWrites configures the store to omit content_text and
-// description when inserting/updating the semantic table. Use this when the
-// TiDB Cloud cluster has no supported auto-embedding provider so that
-// EMBED_TEXT() generated columns are not triggered.
-func (s *Store) DisableAutoEmbedTextWrites() { s.disableAutoEmbedTextWrites = true }
 
 func (s *Store) detectLegacyFiles(ctx context.Context) (bool, error) {
 	var n int
@@ -930,12 +920,10 @@ func (s *Store) insertSplitTablesTx(tx execer, f *File) error {
 	}
 	semantic := &Semantic{
 		InodeID:                      f.FileID,
+		ContentText:                  f.ContentText,
+		Description:                  f.Description,
 		EmbeddingRevision:            f.EmbeddingRevision,
 		DescriptionEmbeddingRevision: f.DescriptionEmbeddingRevision,
-	}
-	if !s.disableAutoEmbedTextWrites {
-		semantic.ContentText = f.ContentText
-		semantic.Description = f.Description
 	}
 	if err := s.InsertSemanticTx(tx, semantic); err != nil {
 		return fmt.Errorf("insert semantic: %w", err)
@@ -1100,12 +1088,6 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 		if err != nil {
 			return nil, err
 		}
-		// Skip when auto-embed text writes are disabled: return after updating
-		// files table, skip semantic dual-write. Return the real res so
-		// RowsAffected() reflects whether the files row actually matched.
-		if s.disableAutoEmbedTextWrites {
-			return res, nil
-		}
 		if expectedRevision > 0 {
 			if _, err := db.Exec(`UPDATE semantic SET content_text = ?
 				WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`,
@@ -1122,30 +1104,6 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 		return res, nil
 	}
 	// New tenant without legacy files: write directly to semantic.
-	// Skip when auto-embed text writes are disabled: any write to content_text
-	// triggers EMBED_TEXT() recomputation on the GENERATED embedding column,
-	// which fails with error 1105 when the provider is not available on this cluster.
-	// We still gate on the revision/status check so stale tasks are correctly
-	// rejected (returning 0 rows), while current tasks return 1 so the caller
-	// can proceed to write tags (stored in file_tags, unaffected by EMBED_TEXT).
-	if s.disableAutoEmbedTextWrites {
-		var n int
-		var err error
-		if expectedRevision > 0 {
-			err = db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?`,
-				fileID, expectedRevision).Scan(&n)
-		} else {
-			err = db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED'`,
-				fileID).Scan(&n)
-		}
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return noopResult{0}, nil // stale or not found: report 0 rows
-			}
-			return nil, fmt.Errorf("check inode for search text skip: %w", err)
-		}
-		return noopResult{1}, nil // found: report 1 row so tags are written
-	}
 	if expectedRevision > 0 {
 		return db.Exec(`UPDATE semantic SET content_text = ?
 			WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`,
@@ -1258,14 +1216,6 @@ type execer interface {
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
 }
-
-// noopResult is a sql.Result that reports a configurable number of rows
-// affected and zero last insert ID. Used when a write is intentionally skipped
-// but the caller may need to know whether the target row existed.
-type noopResult struct{ rows int64 }
-
-func (r noopResult) LastInsertId() (int64, error) { return 0, nil }
-func (r noopResult) RowsAffected() (int64, error) { return r.rows, nil }
 
 // FileStorageMeta holds the lightweight storage metadata needed by upload
 // overwrite logic, fetched with FOR UPDATE row locking.
