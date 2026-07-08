@@ -9421,6 +9421,17 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			}
 			fs.inodes.UpdateMtime(fh.Ino, truncTime)
 			fs.inodes.UpdateCtime(fh.Ino, truncTime)
+			// Invalidate the kernel's attribute cache synchronously so the
+			// next stat() sees the updated mtime/ctime instead of a stale
+			// cached value. Without this, the kernel may serve the pre-
+			// truncation mtime from its AttrTTL window (default 60s),
+			// causing POSIX mtime-advance checks to fail (pjdfstest
+			// open/00.t test 43). Use a synchronous InodeNotify (not the
+			// async notifyInode goroutine) to guarantee the cache is
+			// invalidated before Open returns to the kernel.
+			if fs.server != nil {
+				_ = fs.server.InodeNotify(input.NodeId, 0, 0)
+			}
 			if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 				if err := fs.shadowStore.WriteFull(p, nil, fh.BaseRev); err != nil {
 					log.Printf("shadow reset failed for truncate-open %s: %v", p, err)
