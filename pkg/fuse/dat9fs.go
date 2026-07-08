@@ -155,6 +155,12 @@ type Dat9FS struct {
 	layerFiles        map[string]uint32
 	layerDirs         map[string]uint32
 	layerSymlinks     map[string]layerSymlinkState
+	// layerAbandoned is set when the layer-event watcher observes a
+	// rollback event, signalling that the mounted layer is now abandoned.
+	// Subsequent write ops short-circuit with errLayerRolledBack (→ ESTALE)
+	// and the commit queue halts. The in-memory overlay is cleared so the
+	// mount reflects the base view without a remount.
+	layerAbandoned atomic.Bool
 
 	// smallFileMax mirrors the server's inline_threshold (fetched lazily via
 	// the dat9 client). When 0, defaultSmallFileThreshold is used. Use the
@@ -497,7 +503,20 @@ func (fs *Dat9FS) layerEnabled() bool {
 	return fs.layerRef() != ""
 }
 
+func (fs *Dat9FS) setLayerAbandoned() {
+	if fs != nil {
+		fs.layerAbandoned.Store(true)
+	}
+}
+
+func (fs *Dat9FS) isLayerAbandoned() bool {
+	return fs != nil && fs.layerAbandoned.Load()
+}
+
 func (fs *Dat9FS) upsertLayerEntry(ctx context.Context, req client.FSLayerEntryRequest, bytes uint64) error {
+	if fs.isLayerAbandoned() {
+		return errLayerRolledBack
+	}
 	layerRef := fs.layerRef()
 	if layerRef == "" {
 		return fmt.Errorf("fs layer is not configured")
@@ -510,6 +529,9 @@ func (fs *Dat9FS) upsertLayerEntry(ctx context.Context, req client.FSLayerEntryR
 
 func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []byte, expectedRevision int64, mode uint32, hasMode bool) error {
 	if int64(len(data)) > maxInlineLayerEntryBytes {
+		if fs.isLayerAbandoned() {
+			return errLayerRolledBack
+		}
 		start := fs.perfStart()
 		_, err := fs.client.UploadFSLayerFile(ctx, fs.layerRef(), fs.remotePath(localPath), bytes.NewReader(data), int64(len(data)), expectedRevision, mode, hasMode)
 		fs.perfRecordRemote(perfRemoteMutation, start, err, uint64(len(data)))
@@ -867,11 +889,125 @@ func (fs *Dat9FS) commitLayerShadowLocked(ctx context.Context, fh *FileHandle, s
 	return nil
 }
 
+// clearLayerOverlay drops the entire in-memory layer overlay so the mount
+// reflects the base view. Called by applyLayerRollback after the layer is
+// rolled back. Rebuilding from a fresh replay would re-add the abandoned
+// layer's still-present fs_layer_entries, so we zero the maps directly.
+func (fs *Dat9FS) clearLayerOverlay() {
+	if fs == nil {
+		return
+	}
+	fs.layerMu.Lock()
+	fs.layerWhiteouts = make(map[string]struct{})
+	fs.layerFiles = make(map[string]uint32)
+	fs.layerDirs = make(map[string]uint32)
+	fs.layerSymlinks = make(map[string]layerSymlinkState)
+	fs.layerMu.Unlock()
+}
+
+// resetMountView flushes all userspace caches and notifies the kernel to
+// invalidate cached inodes/dentries. Shared by applyLayerRollback and
+// SSEWatcher.handleReset so both paths stay in sync.
+//
+// Do not invalidate a directory's own parent dentry. Linux getcwd(2) walks
+// parent dentries; dropping the dentry for a process's current working
+// directory can make git's remote helpers fail with ENOENT even though the
+// directory still exists. The flush already clears userspace directory
+// caches and notifies the directory inode, so future readdir/attr paths are
+// refreshed without detaching cwd names.
+func (fs *Dat9FS) resetMountView() {
+	if fs == nil {
+		return
+	}
+	// Clear all user-space caches.
+	if fs.readCache != nil {
+		fs.readCache.InvalidateAll()
+	}
+	if fs.diskReadCache != nil {
+		fs.diskReadCache.InvalidateAll()
+	}
+	fs.clearAllReadTargets()
+	if fs.dirCache != nil {
+		fs.dirCache.InvalidateAll()
+	}
+
+	// Best-effort kernel cache invalidation for all known inodes.
+	// Snapshot entries first so we don't hold the inode map lock during
+	// potentially slow kernel notify calls.
+	// InodeToPath is kept intact (stale but resolvable).
+	if fs.inodes == nil {
+		return
+	}
+	entries := fs.inodes.Snapshot()
+	for _, entry := range entries {
+		fs.notifyInode(entry.Ino)
+		if entry.Path != "/" && !entry.IsDir {
+			parent := parentDir(entry.Path)
+			if parentIno, ok := fs.inodes.GetInode(parent); ok {
+				fs.notifyEntry(parentIno, path.Base(entry.Path))
+			}
+		}
+	}
+}
+
+// applyLayerRollback reacts to a rollback event observed by the layer-event
+// watcher. It clears the in-memory overlay so the mount reflects the base
+// view, halts the commit queue so no further writes reach the abandoned
+// layer, preserves any locally staged (not-yet-committed) writes as
+// PendingConflict for manual recovery, and flushes userspace + kernel caches
+// so the new view is visible without a remount.
+//
+// The shadow store and pending index are passed explicitly (rather than
+// read from fs fields) to match the watcher's existing call signature which
+// already holds references to them.
+func (fs *Dat9FS) applyLayerRollback(shadows *ShadowStore, pending *PendingIndex) {
+	if fs == nil {
+		return
+	}
+
+	// 1. Mark abandoned: future writes return ESTALE, commit queue rejects.
+	fs.setLayerAbandoned()
+
+	// 2. Halt the commit queue (non-blocking; in-flight uploads will fail
+	//    with 409 and fall to onCommitTerminalFailure → MarkConflict).
+	if fs.commitQueue != nil {
+		fs.commitQueue.AbandonLayer()
+	}
+
+	// 3. Preserve local staged writes as PendingConflict so the user can
+	//    recover them; do not delete shadow blobs. RecoverPending skips
+	//    conflict entries, so they will not be retried against the dead layer.
+	if pending != nil {
+		for p := range pending.ListPendingPaths() {
+			_ = pending.MarkConflict(p)
+		}
+	}
+
+	// 4. Clear the in-memory overlay so the base view reappears.
+	fs.clearLayerOverlay()
+
+	// 5. Flush userspace caches + notify kernel (shared with SSE reset).
+	fs.resetMountView()
+
+	// 6. Force re-fetch on next Getattr/Read (belt + suspenders with the
+	//    cache flush above; matches SSE OnDisconnected, sse.go:38-42).
+	fs.markStatCacheUnverified()
+
+	fmt.Fprintf(os.Stderr, "drive9: fs layer rolled back — mount now reflects base view; pending local writes preserved as conflict for manual recovery\n")
+}
+
 func (fs *Dat9FS) markLayerWhiteout(localPath string) {
 	if fs == nil || localPath == "" {
 		return
 	}
 	fs.layerMu.Lock()
+	// Skip overlay mutation if the layer was rolled back — a racing write
+	// that completed on the server just before applyLayerRollback cleared
+	// the overlay must not re-populate it.
+	if fs.layerAbandoned.Load() {
+		fs.layerMu.Unlock()
+		return
+	}
 	if fs.layerWhiteouts == nil {
 		fs.layerWhiteouts = make(map[string]struct{})
 	}
@@ -887,6 +1023,10 @@ func (fs *Dat9FS) markLayerFile(localPath string) {
 		return
 	}
 	fs.layerMu.Lock()
+	if fs.layerAbandoned.Load() {
+		fs.layerMu.Unlock()
+		return
+	}
 	delete(fs.layerWhiteouts, localPath)
 	delete(fs.layerFiles, localPath)
 	delete(fs.layerDirs, localPath)
@@ -899,6 +1039,10 @@ func (fs *Dat9FS) markLayerFileMode(localPath string, mode uint32) {
 		return
 	}
 	fs.layerMu.Lock()
+	if fs.layerAbandoned.Load() {
+		fs.layerMu.Unlock()
+		return
+	}
 	if fs.layerFiles == nil {
 		fs.layerFiles = make(map[string]uint32)
 	}
@@ -914,6 +1058,10 @@ func (fs *Dat9FS) markLayerDir(localPath string, mode uint32) {
 		return
 	}
 	fs.layerMu.Lock()
+	if fs.layerAbandoned.Load() {
+		fs.layerMu.Unlock()
+		return
+	}
 	if fs.layerDirs == nil {
 		fs.layerDirs = make(map[string]uint32)
 	}
@@ -934,6 +1082,10 @@ func (fs *Dat9FS) markLayerSymlink(localPath, target string, mode uint32) {
 		mode = uint32(syscall.S_IFLNK) | (mode & 0o777)
 	}
 	fs.layerMu.Lock()
+	if fs.layerAbandoned.Load() {
+		fs.layerMu.Unlock()
+		return
+	}
 	if fs.layerSymlinks == nil {
 		fs.layerSymlinks = make(map[string]layerSymlinkState)
 	}
@@ -3690,6 +3842,9 @@ func httpToFuseStatus(err error) gofuse.Status {
 	if err == nil {
 		return gofuse.OK
 	}
+	if errors.Is(err, errLayerRolledBack) {
+		return gofuse.Status(syscall.ESTALE)
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return gofuse.Status(syscall.EAGAIN)
 	}
@@ -3831,6 +3986,11 @@ func isCreateActionUnsupportedErr(err error) bool {
 // errReadRetriesExhausted is a sentinel indicating all detached read retries
 // failed with transient errors. Callers should map this to EIO.
 var errReadRetriesExhausted = errors.New("read retries exhausted")
+
+// errLayerRolledBack is returned by layer write paths after the layer-event
+// watcher observed a rollback event. It maps to ESTALE via httpToFuseStatus
+// so FUSE clients see a "stale file handle" instead of an opaque 409/EEXIST.
+var errLayerRolledBack = errors.New("fs layer has been rolled back; remount required")
 
 // isTransientReadErr classifies errors for Read-path detached retry.
 // Same classification as isTransientLookupErr — kept as a separate function
