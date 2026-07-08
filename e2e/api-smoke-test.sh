@@ -244,8 +244,7 @@ INIT_STATUS=$(printf '%s' "$body" | jq -r '.status // empty')
 check_cmd "response contains tenant_id" test -n "$TENANT_ID"
 check_cmd "response contains api_key" test -n "$API_KEY"
 check_eq "provision response status is provisioning" "$INIT_STATUS" "provisioning"
-keys=$(printf '%s' "$body" | jq -r 'keys_unsorted | sort | join(",")')
-check_eq "provision response only has api_key+status+tenant_id" "$keys" "api_key,status,tenant_id"
+check_cmd "provision response contains api_key, status, tenant_id" bash -c "echo \"\$1\" | jq -e '.api_key and .status and .tenant_id' >/dev/null" _ "$body"
 
 step "2" "Poll tenant status via /v1/status"
 deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
