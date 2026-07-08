@@ -12488,7 +12488,17 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// re-adding it here with the upload's size/revision would resurrect a
 	// stale entry. The new path (fh.Path) will be cached on its own flush.
 	if !pathRetargeted {
-		fs.cacheFileForPath(handlePath, publishSize, time.Now(), committedRev)
+		commitTime := time.Now()
+		fs.cacheFileForPath(handlePath, publishSize, commitTime, committedRev)
+		// Ensure the inode's mtime advances to at least the commit time.
+		// Without this, GetAttr may report a stale mtime from before the
+		// write/truncation if it reads the inode directly (bypassing the
+		// dir cache), causing POSIX mtime-advance checks to fail.
+		if entry, ok := fs.inodes.GetEntry(handleIno); ok {
+			if entry.Mtime.Before(commitTime) {
+				fs.inodes.UpdateMtime(handleIno, commitTime)
+			}
+		}
 	}
 	// Local flush — kernel receives the Flush reply with status.
 	// No notifyInode/notifyEntry needed; userspace caches are updated
