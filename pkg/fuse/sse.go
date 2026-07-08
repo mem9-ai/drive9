@@ -130,35 +130,7 @@ func (w *SSEWatcher) handleReset(resets ...*client.ResetEvent) {
 	fmt.Fprintf(os.Stderr, "drive9: SSE reset — invalidating all caches\n")
 	w.fs.debugf("sse reset start seq=%d reason=%s", seq, reason)
 
-	// 1. Clear all user-space caches.
-	w.fs.readCache.InvalidateAll()
-	if w.fs.diskReadCache != nil {
-		w.fs.diskReadCache.InvalidateAll()
-	}
-	w.fs.clearAllReadTargets()
-	w.fs.dirCache.InvalidateAll()
+	w.fs.resetMountView()
 
-	// 2. Best-effort kernel cache invalidation for all known inodes.
-	//    Snapshot entries first so we don't hold the inode map lock during
-	//    potentially slow kernel notify calls.
-	//    InodeToPath is kept intact (stale but resolvable).
-	entries := w.fs.inodes.Snapshot()
-	w.fs.debugf("sse reset snapshot seq=%d reason=%s inodes=%d", seq, reason, len(entries))
-	for _, entry := range entries {
-		w.fs.notifyInode(entry.Ino)
-
-		// Do not invalidate a directory's own parent dentry during a broad reset.
-		// Linux getcwd(2) walks parent dentries; dropping the dentry for a
-		// process's current working directory can make git's remote helpers fail
-		// with ENOENT even though the directory still exists. The reset already
-		// clears userspace directory caches and notifies the directory inode, so
-		// future readdir/attr paths are refreshed without detaching cwd names.
-		if entry.Path != "/" && !entry.IsDir {
-			parent := parentDir(entry.Path)
-			if parentIno, ok := w.fs.inodes.GetInode(parent); ok {
-				w.fs.notifyEntry(parentIno, path.Base(entry.Path))
-			}
-		}
-	}
-	w.fs.debugf("sse reset done seq=%d reason=%s inodes=%d dur=%s", seq, reason, len(entries), time.Since(start))
+	w.fs.debugf("sse reset done seq=%d reason=%s dur=%s", seq, reason, time.Since(start))
 }

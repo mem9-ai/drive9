@@ -115,6 +115,11 @@ type FSLayerEvent struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// FSLayerEventOpRollback is the synthetic event op emitted into
+// fs_layer_events when a layer is rolled back. FUSE clients detect this
+// op via the layer-event watcher and refresh their view without a remount.
+const FSLayerEventOpRollback = "rollback"
+
 func (c *Client) CreateFSLayer(ctx context.Context, req FSLayerCreateRequest) (*FSLayer, error) {
 	body, err := json.Marshal(req)
 	if err != nil {

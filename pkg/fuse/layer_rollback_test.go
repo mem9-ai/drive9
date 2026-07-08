@@ -146,7 +146,7 @@ func TestRefreshLayerEventsDetectsRollback(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"events": []client.FSLayerEvent{
 					{EventID: "layer-rb:1", LayerID: "layer-rb", Seq: 1, Op: "upsert", Path: "/repo/a.txt"},
-					{EventID: "layer-rb:rollback:2", LayerID: "layer-rb", Seq: 2, Op: "rollback", Path: "/"},
+					{EventID: "layer-rb:rollback:2", LayerID: "layer-rb", Seq: 2, Op: client.FSLayerEventOpRollback, Path: "/"},
 				},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-rb/diff":

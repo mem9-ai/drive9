@@ -46,7 +46,9 @@ const (
 	// fs_layer_events when a layer is rolled back. It lets mounted FUSE
 	// clients detect the rollback via the layer-event watcher and refresh
 	// their view without a remount. Unlike entry ops it is never written
-	// to fs_layer_entries and bypasses validateFSLayerEntryOp.
+	// to fs_layer_entries and bypasses validateFSLayerEntryOp. The
+	// consumer-side constant lives in pkg/client as FSLayerEventOpRollback
+	// (shared via the FSLayerEvent struct). Both equal "rollback".
 	fsLayerEventOpRollback = "rollback"
 )
 
@@ -116,6 +118,18 @@ func (s *Store) CreateFSLayer(ctx context.Context, layer *FSLayer) error {
 	layer.LayerID = strings.TrimSpace(layer.LayerID)
 	if layer.LayerID == "" {
 		return fmt.Errorf("fs layer id is required")
+	}
+	// fs_layer_events.event_id is VARCHAR(64) PRIMARY KEY. Normal upsert
+	// event_ids use "<layerID>:<seq>"; rollback event_ids use
+	// "<layerID>:rollback:<seq>" (9 chars longer). A layer_id near 64
+	// chars would overflow the PK on rollback, and a layer_id containing
+	// ":" could collide with another layer's rollback event_id. Reject
+	// both here so all event_id formats always fit the schema.
+	if len(layer.LayerID) > 50 {
+		return fmt.Errorf("fs layer id too long (%d chars, max 50)", len(layer.LayerID))
+	}
+	if strings.Contains(layer.LayerID, ":") {
+		return fmt.Errorf("fs layer id must not contain \":\"")
 	}
 	root, err := pathutil.CanonicalizeDir(layer.BaseRootPath)
 	if err != nil {
@@ -437,7 +451,7 @@ WHERE layer_id = ? AND state IN (?, ?, ?)`,
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return err
+		return fmt.Errorf("rollback fs layer %s rows affected: %w", layerID, err)
 	}
 	if n == 0 {
 		// No row was updated: either the layer does not exist, or it was

@@ -905,6 +905,51 @@ func (fs *Dat9FS) clearLayerOverlay() {
 	fs.layerMu.Unlock()
 }
 
+// resetMountView flushes all userspace caches and notifies the kernel to
+// invalidate cached inodes/dentries. Shared by applyLayerRollback and
+// SSEWatcher.handleReset so both paths stay in sync.
+//
+// Do not invalidate a directory's own parent dentry. Linux getcwd(2) walks
+// parent dentries; dropping the dentry for a process's current working
+// directory can make git's remote helpers fail with ENOENT even though the
+// directory still exists. The flush already clears userspace directory
+// caches and notifies the directory inode, so future readdir/attr paths are
+// refreshed without detaching cwd names.
+func (fs *Dat9FS) resetMountView() {
+	if fs == nil {
+		return
+	}
+	// Clear all user-space caches.
+	if fs.readCache != nil {
+		fs.readCache.InvalidateAll()
+	}
+	if fs.diskReadCache != nil {
+		fs.diskReadCache.InvalidateAll()
+	}
+	fs.clearAllReadTargets()
+	if fs.dirCache != nil {
+		fs.dirCache.InvalidateAll()
+	}
+
+	// Best-effort kernel cache invalidation for all known inodes.
+	// Snapshot entries first so we don't hold the inode map lock during
+	// potentially slow kernel notify calls.
+	// InodeToPath is kept intact (stale but resolvable).
+	if fs.inodes == nil {
+		return
+	}
+	entries := fs.inodes.Snapshot()
+	for _, entry := range entries {
+		fs.notifyInode(entry.Ino)
+		if entry.Path != "/" && !entry.IsDir {
+			parent := parentDir(entry.Path)
+			if parentIno, ok := fs.inodes.GetInode(parent); ok {
+				fs.notifyEntry(parentIno, path.Base(entry.Path))
+			}
+		}
+	}
+}
+
 // applyLayerRollback reacts to a rollback event observed by the layer-event
 // watcher. It clears the in-memory overlay so the mount reflects the base
 // view, halts the commit queue so no further writes reach the abandoned
@@ -941,34 +986,10 @@ func (fs *Dat9FS) applyLayerRollback(shadows *ShadowStore, pending *PendingIndex
 	// 4. Clear the in-memory overlay so the base view reappears.
 	fs.clearLayerOverlay()
 
-	// 5. Flush userspace caches (mirrors SSEWatcher.handleReset, sse.go:122).
-	if fs.readCache != nil {
-		fs.readCache.InvalidateAll()
-	}
-	if fs.diskReadCache != nil {
-		fs.diskReadCache.InvalidateAll()
-	}
-	fs.clearAllReadTargets()
-	if fs.dirCache != nil {
-		fs.dirCache.InvalidateAll()
-	}
+	// 5. Flush userspace caches + notify kernel (shared with SSE reset).
+	fs.resetMountView()
 
-	// 6. Best-effort kernel cache invalidation for all known inodes.
-	//    Skip parent dentry notify for directories (see sse.go:150-156).
-	if fs.inodes != nil {
-		entries := fs.inodes.Snapshot()
-		for _, entry := range entries {
-			fs.notifyInode(entry.Ino)
-			if entry.Path != "/" && !entry.IsDir {
-				parent := parentDir(entry.Path)
-				if parentIno, ok := fs.inodes.GetInode(parent); ok {
-					fs.notifyEntry(parentIno, path.Base(entry.Path))
-				}
-			}
-		}
-	}
-
-	// 7. Force re-fetch on next Getattr/Read (belt + suspenders with the
+	// 6. Force re-fetch on next Getattr/Read (belt + suspenders with the
 	//    cache flush above; matches SSE OnDisconnected, sse.go:38-42).
 	fs.markStatCacheUnverified()
 
@@ -980,6 +1001,13 @@ func (fs *Dat9FS) markLayerWhiteout(localPath string) {
 		return
 	}
 	fs.layerMu.Lock()
+	// Skip overlay mutation if the layer was rolled back — a racing write
+	// that completed on the server just before applyLayerRollback cleared
+	// the overlay must not re-populate it.
+	if fs.layerAbandoned.Load() {
+		fs.layerMu.Unlock()
+		return
+	}
 	if fs.layerWhiteouts == nil {
 		fs.layerWhiteouts = make(map[string]struct{})
 	}
@@ -995,6 +1023,10 @@ func (fs *Dat9FS) markLayerFile(localPath string) {
 		return
 	}
 	fs.layerMu.Lock()
+	if fs.layerAbandoned.Load() {
+		fs.layerMu.Unlock()
+		return
+	}
 	delete(fs.layerWhiteouts, localPath)
 	delete(fs.layerFiles, localPath)
 	delete(fs.layerDirs, localPath)
@@ -1007,6 +1039,10 @@ func (fs *Dat9FS) markLayerFileMode(localPath string, mode uint32) {
 		return
 	}
 	fs.layerMu.Lock()
+	if fs.layerAbandoned.Load() {
+		fs.layerMu.Unlock()
+		return
+	}
 	if fs.layerFiles == nil {
 		fs.layerFiles = make(map[string]uint32)
 	}
@@ -1022,6 +1058,10 @@ func (fs *Dat9FS) markLayerDir(localPath string, mode uint32) {
 		return
 	}
 	fs.layerMu.Lock()
+	if fs.layerAbandoned.Load() {
+		fs.layerMu.Unlock()
+		return
+	}
 	if fs.layerDirs == nil {
 		fs.layerDirs = make(map[string]uint32)
 	}
@@ -1042,6 +1082,10 @@ func (fs *Dat9FS) markLayerSymlink(localPath, target string, mode uint32) {
 		mode = uint32(syscall.S_IFLNK) | (mode & 0o777)
 	}
 	fs.layerMu.Lock()
+	if fs.layerAbandoned.Load() {
+		fs.layerMu.Unlock()
+		return
+	}
 	if fs.layerSymlinks == nil {
 		fs.layerSymlinks = make(map[string]layerSymlinkState)
 	}

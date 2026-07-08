@@ -65,7 +65,7 @@ func refreshLayerEvents(ctx context.Context, c *client.Client, opts *MountOption
 		if events[i].Seq > maxSeq {
 			maxSeq = events[i].Seq
 		}
-		if events[i].Op == "rollback" {
+		if events[i].Op == client.FSLayerEventOpRollback {
 			rolledBack = true
 		}
 	}
