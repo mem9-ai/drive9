@@ -1049,11 +1049,14 @@ if require_layer_fuse_prereqs; then
 
   # Without remounting, the layer overlay should clear within the watcher
   # poll interval (~1s). Poll up to LAYER_DIFF_TIMEOUT_S for the new file
-  # to disappear (base view restored).
+  # to become unreadable (base view restored). We check readability rather
+  # than existence because the kernel dentry cache may retain a stale
+  # entry for the overlaid file — but the overlay is gone, so reading
+  # returns EIO (the file does not exist in the base view).
   rollback_hot_refresh_ok="no"
   rollback_poll_elapsed=0
   while [ "$rollback_poll_elapsed" -lt "$LAYER_DIFF_TIMEOUT_S" ]; do
-    if [ ! -e "$mount_rb/new.txt" ]; then
+    if ! cat "$mount_rb/new.txt" >/dev/null 2>&1; then
       rollback_hot_refresh_ok="yes"
       break
     fi
