@@ -356,7 +356,5 @@ jobs:
     name: Publish drive9-csi image
     needs: resolve
     uses: ./.github/workflows/csi-publish-trigger.yml
-    with:
-      drive9_ref: ${{ needs.resolve.outputs.drive9_sha }}
     secrets:
       CSI_DISPATCH_TOKEN: ${{ secrets.CSI_DISPATCH_TOKEN }}
