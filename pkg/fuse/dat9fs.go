@@ -8599,6 +8599,38 @@ func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
 	fs.dirHandles.Delete(input.Fh)
 }
 
+func (fs *Dat9FS) FsyncDir(cancel <-chan struct{}, input *gofuse.FsyncIn) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseFsyncDir, perfStart, status, 0) }()
+
+	dh, ok := fs.dirHandles.Get(input.Fh)
+	if !ok {
+		return gofuse.OK
+	}
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
+	if overlay, local, st := fs.localOverlayForDirPath(ctx, dh.Path); local {
+		if st != gofuse.OK {
+			return st
+		}
+		abs, err := overlay.abs(dh.Path)
+		if err != nil {
+			return localErrToFuseStatus(err)
+		}
+		dir, err := os.Open(abs)
+		if err != nil {
+			return localErrToFuseStatus(err)
+		}
+		defer func() { _ = dir.Close() }()
+		if err := syncOpenLocalFile(dir); err != nil {
+			return localErrToFuseStatus(err)
+		}
+	}
+
+	return gofuse.OK
+}
+
 func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, error) {
 	if overlay, local, st := fs.localOverlayForPath(ctx, dirPath); local {
 		if st != gofuse.OK {
