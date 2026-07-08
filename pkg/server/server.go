@@ -74,8 +74,9 @@ type Config struct {
 	TiDBAutoEmbeddingConfig  tenantschema.TiDBAutoEmbeddingConfig
 	TiDBAutoEmbeddingAPIKey  string
 	TiDBAutoEmbeddingAPIBase string
-	// DisableDatabaseAutoEmbedding suppresses runtime writes that would trigger
-	// TiDB EMBED_TEXT, but TiDB tenants still use the normal auto schema.
+	// DisableDatabaseAutoEmbedding makes new or unresolved tenant embedding
+	// profiles default to fts_only mode. Resolved tenant-level embedding_mode is
+	// the runtime source of truth.
 	DisableDatabaseAutoEmbedding bool
 	// Leader, when set, gates background schedulers (semantic worker, object GC,
 	// tenant delete cleanup, pending tenant reconciler, one-time resume tasks,
@@ -242,11 +243,12 @@ type tenantAutoEmbeddingDefault struct {
 }
 
 var (
-	schemaInitRetryWindow    = 10 * time.Minute
-	schemaInitInitialBackoff = 2 * time.Second
-	schemaInitMaxBackoff     = 30 * time.Second
-	pendingTenantStaleAfter  = 10 * time.Minute
-	pendingTenantSweepEvery  = time.Minute
+	schemaInitRetryWindow                     = 10 * time.Minute
+	schemaInitInitialBackoff                  = 2 * time.Second
+	schemaInitMaxBackoff                      = 30 * time.Second
+	pendingTenantStaleAfter                   = 10 * time.Minute
+	pendingTenantSweepEvery                   = time.Minute
+	initTiDBTenantSchemaForFTSOnlyProfileFunc = tenantschema.InitTiDBTenantSchemaForFTSOnlyProfileContext
 )
 
 // DefaultMaxUploadBytes is the server-wide fallback upload size limit.
@@ -343,7 +345,7 @@ func NewWithConfig(cfg Config) *Server {
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
 			apiBase: strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIBase),
 		},
-		disableDBAutoEmbed:    cfg.DisableDatabaseAutoEmbedding || (cfg.Pool != nil && cfg.Pool.IsAutoEmbeddingDisabled()),
+		disableDBAutoEmbed:    cfg.DisableDatabaseAutoEmbedding,
 		journalCursorSecret:   newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:         forkWorkerCtx,
 		forkWorkerCancel:      forkWorkerCancel,
@@ -4478,7 +4480,11 @@ func (s *Server) defaultAutoEmbeddingProfileForTenant(ctx context.Context, tenan
 	if err != nil {
 		return nil, err
 	}
-	if !s.disableDBAutoEmbed {
+	mode, _, err := s.resolveTenantEmbeddingMode("")
+	if err != nil {
+		return nil, err
+	}
+	if mode == meta.TenantEmbeddingModeAuto {
 		if err := tenantschema.ValidateTiDBAutoEmbeddingProviderConfig(tenantschema.TiDBAutoEmbeddingProviderConfig{
 			Model:   schemaProfile.Model,
 			APIKey:  s.tidbAutoEmbedding.apiKey,
@@ -4496,14 +4502,15 @@ func (s *Server) defaultAutoEmbeddingProfileForTenant(ctx context.Context, tenan
 		apiKeyCipher = cipher
 	}
 	return &meta.TenantAutoEmbeddingProfile{
-		TenantID:     tenantID,
-		Model:        schemaProfile.Model,
-		Dimensions:   schemaProfile.Dimensions,
-		OptionsJSON:  schemaProfile.OptionsJSON,
-		APIBase:      s.tidbAutoEmbedding.apiBase,
-		APIKeyCipher: apiKeyCipher,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		TenantID:      tenantID,
+		EmbeddingMode: mode,
+		Model:         schemaProfile.Model,
+		Dimensions:    schemaProfile.Dimensions,
+		OptionsJSON:   schemaProfile.OptionsJSON,
+		APIBase:       s.tidbAutoEmbedding.apiBase,
+		APIKeyCipher:  apiKeyCipher,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}, nil
 }
 
@@ -4515,15 +4522,20 @@ func (s *Server) copyAutoEmbeddingProfileForFork(ctx context.Context, sourceTena
 	if err != nil {
 		return err
 	}
+	mode, _, err := s.resolveTenantEmbeddingMode(sourceProfile.EmbeddingMode)
+	if err != nil {
+		return err
+	}
 	return s.meta.UpsertTenantAutoEmbeddingProfile(ctx, &meta.TenantAutoEmbeddingProfile{
-		TenantID:     forkTenantID,
-		Model:        sourceProfile.Model,
-		Dimensions:   sourceProfile.Dimensions,
-		OptionsJSON:  sourceProfile.OptionsJSON,
-		APIBase:      sourceProfile.APIBase,
-		APIKeyCipher: append([]byte(nil), sourceProfile.APIKeyCipher...),
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		TenantID:      forkTenantID,
+		EmbeddingMode: mode,
+		Model:         sourceProfile.Model,
+		Dimensions:    sourceProfile.Dimensions,
+		OptionsJSON:   sourceProfile.OptionsJSON,
+		APIBase:       sourceProfile.APIBase,
+		APIKeyCipher:  append([]byte(nil), sourceProfile.APIKeyCipher...),
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	})
 }
 
@@ -4554,18 +4566,44 @@ func (s *Server) applyAutoEmbeddingProviderConfig(ctx context.Context, tenantID,
 	})
 }
 
-func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID string) (tenantschema.TiDBAutoEmbeddingProfile, error) {
+type serverTenantAutoEmbeddingProfile struct {
+	schemaProfile tenantschema.TiDBAutoEmbeddingProfile
+	mode          string
+	modeWasNull   bool
+}
+
+func (s *Server) resolveTenantEmbeddingMode(persisted string) (mode string, wasNull bool, err error) {
+	return meta.ResolveTenantEmbeddingMode(persisted, s.disableDBAutoEmbed)
+}
+
+func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID string) (serverTenantAutoEmbeddingProfile, error) {
 	if s.meta == nil {
-		return tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
+		profile, err := tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
+		if err != nil {
+			return serverTenantAutoEmbeddingProfile{}, err
+		}
+		mode, _, err := s.resolveTenantEmbeddingMode("")
+		if err != nil {
+			return serverTenantAutoEmbeddingProfile{}, err
+		}
+		return serverTenantAutoEmbeddingProfile{schemaProfile: profile, mode: mode}, nil
 	}
 	profile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, tenantID)
 	if err != nil {
-		return tenantschema.TiDBAutoEmbeddingProfile{}, err
+		return serverTenantAutoEmbeddingProfile{}, err
 	}
-	return tenantschema.TiDBAutoEmbeddingProfile{
-		Model:       profile.Model,
-		Dimensions:  profile.Dimensions,
-		OptionsJSON: profile.OptionsJSON,
+	mode, modeWasNull, err := s.resolveTenantEmbeddingMode(profile.EmbeddingMode)
+	if err != nil {
+		return serverTenantAutoEmbeddingProfile{}, err
+	}
+	return serverTenantAutoEmbeddingProfile{
+		mode:        mode,
+		modeWasNull: modeWasNull,
+		schemaProfile: tenantschema.TiDBAutoEmbeddingProfile{
+			Model:       profile.Model,
+			Dimensions:  profile.Dimensions,
+			OptionsJSON: profile.OptionsJSON,
+		},
 	}, nil
 }
 
@@ -4591,12 +4629,27 @@ func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(co
 		if err != nil {
 			return fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
 		}
-		if !s.disableDBAutoEmbed {
-			if err := s.applyAutoEmbeddingProviderConfig(ctx, tenantID, dsn, profile); err != nil {
+		switch profile.mode {
+		case meta.TenantEmbeddingModeAuto:
+			if err := s.applyAutoEmbeddingProviderConfig(ctx, tenantID, dsn, profile.schemaProfile); err != nil {
 				return fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
 			}
+			if err := profileAware.InitSchemaForAutoEmbeddingProfile(ctx, dsn, profile.schemaProfile); err != nil {
+				return err
+			}
+		case meta.TenantEmbeddingModeFTSOnly:
+			if err := initTiDBTenantSchemaForFTSOnlyProfileFunc(ctx, dsn, profile.schemaProfile); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported tenant embedding mode %q", profile.mode)
 		}
-		return profileAware.InitSchemaForAutoEmbeddingProfile(ctx, dsn, profile)
+		if profile.modeWasNull && s.meta != nil {
+			if _, err := s.meta.SetTenantAutoEmbeddingProfileModeIfNull(ctx, tenantID, profile.mode); err != nil {
+				return fmt.Errorf("persist tenant embedding mode: %w", err)
+			}
+		}
+		return nil
 	}
 }
 

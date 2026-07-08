@@ -1700,15 +1700,29 @@ func TestProvisionPersistsAutoEmbeddingProfileWhenDatabaseAutoEmbeddingDisabled(
 	if profile.Model != "openai/text-embedding-3-small" || profile.Dimensions != 1536 {
 		t.Fatalf("profile = %+v", profile)
 	}
+	if profile.EmbeddingMode != meta.TenantEmbeddingModeFTSOnly {
+		t.Fatalf("embedding_mode=%q, want %q", profile.EmbeddingMode, meta.TenantEmbeddingModeFTSOnly)
+	}
 	if len(profile.APIKeyCipher) != 0 {
 		t.Fatal("disabled auto-embedding profile should not store an empty API key cipher")
 	}
 }
 
-func TestSchemaInitForTenantUsesAutoEmbeddingProfileWhenDatabaseAutoEmbeddingDisabled(t *testing.T) {
+func TestSchemaInitForTenantUsesFTSOnlyProfileWhenDatabaseAutoEmbeddingDisabled(t *testing.T) {
 	prov := &profileAwareFakeProvisioner{
 		fakeProvisioner: fakeProvisioner{provider: tenant.ProviderTiDBZero},
 	}
+	origInitFTSOnly := initTiDBTenantSchemaForFTSOnlyProfileFunc
+	var ftsOnlyInitCalls int
+	var ftsOnlyProfile tenantschema.TiDBAutoEmbeddingProfile
+	initTiDBTenantSchemaForFTSOnlyProfileFunc = func(_ context.Context, _ string, profile tenantschema.TiDBAutoEmbeddingProfile) error {
+		ftsOnlyInitCalls++
+		ftsOnlyProfile = profile
+		return nil
+	}
+	t.Cleanup(func() {
+		initTiDBTenantSchemaForFTSOnlyProfileFunc = origInitFTSOnly
+	})
 	srv := NewWithConfig(Config{
 		Provisioner:                  prov,
 		DisableDatabaseAutoEmbedding: true,
@@ -1731,11 +1745,14 @@ func TestSchemaInitForTenantUsesAutoEmbeddingProfileWhenDatabaseAutoEmbeddingDis
 	if fallbackCalled {
 		t.Fatal("fallback InitSchema was called")
 	}
-	if prov.profileInitCalls.Load() != 1 {
-		t.Fatalf("profile init calls = %d, want 1", prov.profileInitCalls.Load())
+	if prov.profileInitCalls.Load() != 0 {
+		t.Fatalf("profile init calls = %d, want 0", prov.profileInitCalls.Load())
 	}
-	if prov.lastProfile.Model != "openai/text-embedding-3-small" || prov.lastProfile.Dimensions != 1536 {
-		t.Fatalf("profile init profile = %+v", prov.lastProfile)
+	if ftsOnlyInitCalls != 1 {
+		t.Fatalf("fts-only init calls = %d, want 1", ftsOnlyInitCalls)
+	}
+	if ftsOnlyProfile.Model != "openai/text-embedding-3-small" || ftsOnlyProfile.Dimensions != 1536 {
+		t.Fatalf("fts-only init profile = %+v", ftsOnlyProfile)
 	}
 }
 
@@ -1754,14 +1771,14 @@ func TestAutoEmbeddingProfileForTenantEnsuresDefaultProfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("autoEmbeddingProfileForTenant: %v", err)
 	}
-	if profile.Model != tenantschema.DefaultTiDBAutoEmbeddingModel {
-		t.Fatalf("profile model = %q", profile.Model)
+	if profile.schemaProfile.Model != tenantschema.DefaultTiDBAutoEmbeddingModel {
+		t.Fatalf("profile model = %q", profile.schemaProfile.Model)
 	}
-	if profile.Dimensions != tenantschema.DefaultTiDBAutoEmbeddingDimensions {
-		t.Fatalf("profile dimensions = %d", profile.Dimensions)
+	if profile.schemaProfile.Dimensions != tenantschema.DefaultTiDBAutoEmbeddingDimensions {
+		t.Fatalf("profile dimensions = %d", profile.schemaProfile.Dimensions)
 	}
-	if profile.OptionsJSON != `{"dimensions":1024}` {
-		t.Fatalf("profile options_json = %q", profile.OptionsJSON)
+	if profile.schemaProfile.OptionsJSON != `{"dimensions":1024}` {
+		t.Fatalf("profile options_json = %q", profile.schemaProfile.OptionsJSON)
 	}
 
 	stored, err := metaStore.GetTenantAutoEmbeddingProfile(context.Background(), "tenant-default-profile")
@@ -1786,11 +1803,11 @@ func TestAutoEmbeddingProfileForTenantWithoutMetaUsesConfiguredDefault(t *testin
 	if err != nil {
 		t.Fatalf("autoEmbeddingProfileForTenant: %v", err)
 	}
-	if profile.Model != "openai/text-embedding-3-small" {
-		t.Fatalf("profile model = %q", profile.Model)
+	if profile.schemaProfile.Model != "openai/text-embedding-3-small" {
+		t.Fatalf("profile model = %q", profile.schemaProfile.Model)
 	}
-	if profile.Dimensions != 1536 {
-		t.Fatalf("profile dimensions = %d", profile.Dimensions)
+	if profile.schemaProfile.Dimensions != 1536 {
+		t.Fatalf("profile dimensions = %d", profile.schemaProfile.Dimensions)
 	}
 }
 

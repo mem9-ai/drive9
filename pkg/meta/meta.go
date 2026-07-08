@@ -89,14 +89,34 @@ type Tenant struct {
 }
 
 type TenantAutoEmbeddingProfile struct {
-	TenantID     string
-	Model        string
-	Dimensions   int
-	OptionsJSON  string
-	APIBase      string
-	APIKeyCipher []byte
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	TenantID      string
+	EmbeddingMode string
+	Model         string
+	Dimensions    int
+	OptionsJSON   string
+	APIBase       string
+	APIKeyCipher  []byte
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+const (
+	TenantEmbeddingModeAuto    = "auto"
+	TenantEmbeddingModeFTSOnly = "fts_only"
+)
+
+func ResolveTenantEmbeddingMode(persisted string, defaultFTSOnly bool) (mode string, wasNull bool, err error) {
+	switch persisted {
+	case "":
+		if defaultFTSOnly {
+			return TenantEmbeddingModeFTSOnly, true, nil
+		}
+		return TenantEmbeddingModeAuto, true, nil
+	case TenantEmbeddingModeAuto, TenantEmbeddingModeFTSOnly:
+		return persisted, false, nil
+	default:
+		return "", false, fmt.Errorf("unsupported tenant embedding mode %q", persisted)
+	}
 }
 
 type StorageNamespaceState string
@@ -470,6 +490,7 @@ func metaInitSchemaStatements() []string {
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_auto_embedding_profiles (
 			tenant_id      VARCHAR(64) PRIMARY KEY,
+			embedding_mode VARCHAR(32) NULL,
 			model          VARCHAR(255) NOT NULL DEFAULT 'tidbcloud_free/amazon/titan-embed-text-v2',
 			dimensions     INT UNSIGNED NOT NULL DEFAULT 1024,
 			options_json   VARCHAR(2048) NOT NULL DEFAULT '{"dimensions":1024}',
@@ -1227,16 +1248,17 @@ func (s *Store) UpsertTenantAutoEmbeddingProfile(ctx context.Context, p *TenantA
 		return fmt.Errorf("nil tenant auto-embedding profile")
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_auto_embedding_profiles
-		(tenant_id, model, dimensions, options_json, api_base, api_key_cipher, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		(tenant_id, embedding_mode, model, dimensions, options_json, api_base, api_key_cipher, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
+			embedding_mode = VALUES(embedding_mode),
 			model = VALUES(model),
 			dimensions = VALUES(dimensions),
 			options_json = VALUES(options_json),
 			api_base = VALUES(api_base),
 			api_key_cipher = VALUES(api_key_cipher),
 			updated_at = VALUES(updated_at)`,
-		p.TenantID, p.Model, p.Dimensions, p.OptionsJSON, nullStr(p.APIBase), nullableBytes(p.APIKeyCipher),
+		p.TenantID, nullStr(p.EmbeddingMode), p.Model, p.Dimensions, p.OptionsJSON, nullStr(p.APIBase), nullableBytes(p.APIKeyCipher),
 		p.CreatedAt.UTC(), p.UpdatedAt.UTC())
 	return err
 }
@@ -1244,19 +1266,23 @@ func (s *Store) UpsertTenantAutoEmbeddingProfile(ctx context.Context, p *TenantA
 func (s *Store) GetTenantAutoEmbeddingProfile(ctx context.Context, tenantID string) (out *TenantAutoEmbeddingProfile, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "get_tenant_auto_embedding_profile", start, &err)
-	row := s.db.QueryRowContext(ctx, `SELECT tenant_id, model, dimensions, options_json,
+	row := s.db.QueryRowContext(ctx, `SELECT tenant_id, embedding_mode, model, dimensions, options_json,
 			api_base, api_key_cipher, created_at, updated_at
 		FROM tenant_auto_embedding_profiles WHERE tenant_id = ?`, tenantID)
 	var rec TenantAutoEmbeddingProfile
+	var embeddingMode sql.NullString
 	var apiBase sql.NullString
 	var apiKeyCipher []byte
-	if err = row.Scan(&rec.TenantID, &rec.Model, &rec.Dimensions, &rec.OptionsJSON,
+	if err = row.Scan(&rec.TenantID, &embeddingMode, &rec.Model, &rec.Dimensions, &rec.OptionsJSON,
 		&apiBase, &apiKeyCipher, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = ErrNotFound
 			return nil, err
 		}
 		return nil, err
+	}
+	if embeddingMode.Valid {
+		rec.EmbeddingMode = embeddingMode.String
 	}
 	if apiBase.Valid {
 		rec.APIBase = apiBase.String
@@ -1280,6 +1306,22 @@ func (s *Store) EnsureTenantAutoEmbeddingProfile(ctx context.Context, tenantID s
 		return nil, err
 	}
 	return s.GetTenantAutoEmbeddingProfile(ctx, tenantID)
+}
+
+func (s *Store) SetTenantAutoEmbeddingProfileModeIfNull(ctx context.Context, tenantID, mode string) (updated bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "set_tenant_auto_embedding_profile_mode_if_null", start, &err)
+	res, err := s.db.ExecContext(ctx, `UPDATE tenant_auto_embedding_profiles
+		SET embedding_mode = ?, updated_at = CURRENT_TIMESTAMP(3)
+		WHERE tenant_id = ? AND embedding_mode IS NULL`, mode, tenantID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func (s *Store) InsertAPIKey(ctx context.Context, k *APIKey) (err error) {
