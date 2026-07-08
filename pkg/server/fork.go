@@ -462,7 +462,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		DBUser:           cluster.Username,
 		DBPasswordCipher: forkRoot.DBPasswordCipher,
 		DBName:           cluster.DBName,
-		DBTLS:            true,
+		DBTLS:            dbTLSForProvisionedTenant(cluster.Provider),
 		Provider:         cluster.Provider,
 		ClusterID:        cluster.ClusterID,
 		BranchID:         cluster.BranchID,
@@ -703,14 +703,14 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 				DBUser:           username,
 				DBPasswordCipher: forkTenant.DBPasswordCipher,
 				DBName:           forkTenant.DBName,
-				DBTLS:            true,
+				DBTLS:            dbTLSForProvisionedTenant(forkTenant.Provider),
 				Provider:         forkTenant.Provider,
 				ClusterID:        forkTenant.ClusterID,
 				BranchID:         forkTenant.BranchID,
 			}); err != nil {
 				return "", err
 			}
-			return tenantDSN(username, string(plain), host, port, forkTenant.DBName, true, forkTenant.Provider), nil
+			return tenantDSN(username, string(plain), host, port, forkTenant.DBName, dbTLSForProvisionedTenant(forkTenant.Provider), forkTenant.Provider), nil
 		}
 		cluster, err := s.waitForForkBranchActive(ctx, &tenant.ClusterInfo{
 			TenantID:  forkTenant.ID,
@@ -729,7 +729,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 			DBUser:           cluster.Username,
 			DBPasswordCipher: forkTenant.DBPasswordCipher,
 			DBName:           cluster.DBName,
-			DBTLS:            true,
+			DBTLS:            dbTLSForProvisionedTenant(cluster.Provider),
 			Provider:         cluster.Provider,
 			ClusterID:        cluster.ClusterID,
 			BranchID:         cluster.BranchID,
@@ -738,7 +738,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 		}); err != nil {
 			return "", err
 		}
-		return tenantDSN(cluster.Username, string(plain), cluster.Host, cluster.Port, cluster.DBName, true, cluster.Provider), nil
+		return tenantDSN(cluster.Username, string(plain), cluster.Host, cluster.Port, cluster.DBName, dbTLSForProvisionedTenant(cluster.Provider), cluster.Provider), nil
 	}
 
 	branchPassword, err := s.pool.Decrypt(ctx, forkTenant.DBPasswordCipher)
@@ -764,7 +764,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 		DBUser:           cluster.Username,
 		DBPasswordCipher: forkTenant.DBPasswordCipher,
 		DBName:           cluster.DBName,
-		DBTLS:            true,
+		DBTLS:            dbTLSForProvisionedTenant(cluster.Provider),
 		Provider:         cluster.Provider,
 		ClusterID:        cluster.ClusterID,
 		BranchID:         cluster.BranchID,
@@ -777,7 +777,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 	if cluster.Host == "" || cluster.Port == 0 || cluster.Username == "" {
 		return "", forkErr(http.StatusServiceUnavailable, "database branch is not active yet")
 	}
-	return tenantDSN(cluster.Username, string(branchPassword), cluster.Host, cluster.Port, cluster.DBName, true, cluster.Provider), nil
+	return tenantDSN(cluster.Username, string(branchPassword), cluster.Host, cluster.Port, cluster.DBName, dbTLSForProvisionedTenant(cluster.Provider), cluster.Provider), nil
 }
 
 func generateForkDBPassword(length int) (string, error) {
