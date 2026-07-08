@@ -5390,6 +5390,60 @@ func TestSymlinkCreatesRemoteLinkAndCachesEntry(t *testing.T) {
 	}
 }
 
+func TestSymlinkStoresCallerOwner(t *testing.T) {
+	const target = "../target"
+	symlinkMode := uint32(syscall.S_IFLNK) | 0o777
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(target)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(symlinkMode), 10))
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write([]byte(target))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	// Create a symlink as uid 1234/gid 5678.
+	var out gofuse.EntryOut
+	st := fs.Symlink(nil, &gofuse.InHeader{
+		Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 1234, Gid: 5678}},
+		NodeId: 1,
+	}, target, "link", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Symlink status = %v, want OK", st)
+	}
+
+	// The symlink entry must carry the caller's uid/gid so that lstat
+	// reports the correct owner (not the mount process's default uid).
+	if out.Uid != 1234 {
+		t.Fatalf("symlink out uid = %d, want 1234", out.Uid)
+	}
+	if out.Gid != 5678 {
+		t.Fatalf("symlink out gid = %d, want 5678", out.Gid)
+	}
+
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("symlink entry not found")
+	}
+	if !entry.HasUID || entry.Uid != 1234 || !entry.HasGID || entry.Gid != 5678 {
+		t.Fatalf("symlink entry owner = uid:%d/%t gid:%d/%t, want 1234/true 5678/true",
+			entry.Uid, entry.HasUID, entry.Gid, entry.HasGID)
+	}
+}
+
 func TestSymlinkNegativeCachedConflictDoesNotDeleteRemoteTarget(t *testing.T) {
 	const target = "test"
 	var postCalls atomic.Int32

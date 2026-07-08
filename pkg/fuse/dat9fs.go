@@ -7242,6 +7242,7 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	mode := symlinkMode()
 	ino := fs.inodes.Lookup(childP, false, int64(len(pointedTo)), time.Now())
 	fs.inodes.UpdateMode(ino, mode)
+	fs.inodes.UpdateOwner(ino, header.Uid, header.Gid, true, true)
 	if stat, err := fs.client.StatCtx(ctx, fs.remotePath(childP)); err == nil && stat != nil {
 		if stat.ResourceID != "" || stat.Nlink > 0 {
 			fs.inodes.SetIdentity(ino, stat.ResourceID, stat.Nlink)
