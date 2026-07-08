@@ -344,17 +344,17 @@ jobs:
               rollout undo deployment/drive9-server
           fi
 
-  csi-publish:
-    # Dispatches drive9-ai/k8s-csi's publish-image.yml to build a drive9-csi
-    # image pinned to the drive9 commit currently being promoted to prod.
-    # Consumes the same `resolve` output as `deploy`, so the CSI image is
-    # guaranteed to be baked for the exact drive9 build going to prod
-    # (no dev-cd retag can slip between the two reads any more).
-    # Still runs in parallel with `deploy` — a failed prod rollout does
-    # not cancel the CSI build and vice versa; only the shared resolve
-    # is sequenced first.
-    name: Publish drive9-csi image
-    needs: resolve
-    uses: ./.github/workflows/csi-publish-trigger.yml
-    secrets:
-      CSI_DISPATCH_TOKEN: ${{ secrets.CSI_DISPATCH_TOKEN }}
+  # csi-publish:
+  #   # Dispatches drive9-ai/k8s-csi's publish-image.yml to build a drive9-csi
+  #   # image pinned to the drive9 commit currently being promoted to prod.
+  #   # Consumes the same `resolve` output as `deploy`, so the CSI image is
+  #   # guaranteed to be baked for the exact drive9 build going to prod
+  #   # (no dev-cd retag can slip between the two reads any more).
+  #   # Still runs in parallel with `deploy` — a failed prod rollout does
+  #   # not cancel the CSI build and vice versa; only the shared resolve
+  #   # is sequenced first.
+  #   name: Publish drive9-csi image
+  #   needs: resolve
+  #   uses: ./.github/workflows/csi-publish-trigger.yml
+  #   secrets:
+  #     CSI_DISPATCH_TOKEN: ${{ secrets.CSI_DISPATCH_TOKEN }}
