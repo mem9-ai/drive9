@@ -209,8 +209,7 @@ func (fs *Dat9FS) setMetadataOnlySpecialAttr(input *gofuse.SetAttrIn, entry *Ino
 		metadataChanged = true
 	}
 
-	ownerUID, hasUID := input.GetUID()
-	ownerGID, hasGID := input.GetGID()
+	ownerUID, hasUID, ownerGID, hasGID := resolveSetAttrOwner(input)
 	if hasUID || hasGID {
 		if st := fs.checkSetAttrOwnerForCaller(input, entry, ownerUID, hasUID, ownerGID, hasGID); st != gofuse.OK {
 			return st

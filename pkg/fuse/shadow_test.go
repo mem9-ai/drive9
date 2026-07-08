@@ -1143,6 +1143,34 @@ func TestEnsureQuotaEnforcement(t *testing.T) {
 	}
 }
 
+// TestWriteAtSparseDoesNotPoisonByteQuota verifies that a sparse write
+// (small data at a large offset) does not inflate pendingBytes to the
+// point where subsequent small writes are rejected with ENOSPC. The
+// WriteAt quota check uses physical data length, not logical file growth,
+// so sparse writes pass the free-space ratio check while the byte quota
+// (if configured) is not consulted for WriteAt.
+func TestWriteAtSparseDoesNotPoisonByteQuota(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota, no free-ratio
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Sparse write: 1 byte at offset 1<<20 (1 MiB).
+	_, err = ss.WriteAt("/sparse.txt", 1<<20, []byte("a"), 1)
+	if err != nil {
+		t.Fatalf("sparse WriteAt should succeed: %v", err)
+	}
+
+	// Subsequent small append at the next offset should also succeed,
+	// not be rejected because the first write inflated pendingBytes.
+	_, err = ss.WriteAt("/sparse.txt", (1<<20)+1, []byte("b"), 1)
+	if err != nil {
+		t.Fatalf("append after sparse WriteAt should succeed: %v", err)
+	}
+}
+
 func TestCheckWriteBackQuotaThrottled(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStoreWithQuota(dir, 0.10, 0)

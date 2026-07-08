@@ -2796,6 +2796,57 @@ func TestOpenTruncateWriteThroughShadow(t *testing.T) {
 	}
 }
 
+func TestOpenTruncUpdatesMtimeAndCtime(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 32, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "existing remote content that should be truncated")
+	})
+	defer cleanup()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	// Seed a known old mtime/ctime so we can detect the truncation bump.
+	oldTime := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	fs.inodes.UpdateMtime(ino, oldTime)
+	fs.inodes.UpdateCtime(ino, oldTime)
+
+	before := time.Now()
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	after := time.Now()
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if !entry.Mtime.After(oldTime) {
+		t.Fatalf("mtime = %v, want after %v (truncation should bump mtime)", entry.Mtime, oldTime)
+	}
+	if entry.Mtime.Before(before) || entry.Mtime.After(after) {
+		t.Fatalf("mtime = %v, expected between %v and %v", entry.Mtime, before, after)
+	}
+	if !entry.Ctime.After(oldTime) {
+		t.Fatalf("ctime = %v, want after %v (truncation should bump ctime)", entry.Ctime, oldTime)
+	}
+}
+
 func TestFlushSkipsAsyncShadowForPartialExistingSnapshot(t *testing.T) {
 	const size = int64(9 << 20) // > 8MB part size and < 10MB write-back threshold
 
@@ -5336,6 +5387,60 @@ func TestSymlinkCreatesRemoteLinkAndCachesEntry(t *testing.T) {
 	}
 	if string(got) != target {
 		t.Fatalf("Readlink target = %q, want %q", got, target)
+	}
+}
+
+func TestSymlinkStoresCallerOwner(t *testing.T) {
+	const target = "../target"
+	symlinkMode := uint32(syscall.S_IFLNK) | 0o777
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(target)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(symlinkMode), 10))
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write([]byte(target))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	// Create a symlink as uid 1234/gid 5678.
+	var out gofuse.EntryOut
+	st := fs.Symlink(nil, &gofuse.InHeader{
+		Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 1234, Gid: 5678}},
+		NodeId: 1,
+	}, target, "link", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Symlink status = %v, want OK", st)
+	}
+
+	// The symlink entry must carry the caller's uid/gid so that lstat
+	// reports the correct owner (not the mount process's default uid).
+	if out.Uid != 1234 {
+		t.Fatalf("symlink out uid = %d, want 1234", out.Uid)
+	}
+	if out.Gid != 5678 {
+		t.Fatalf("symlink out gid = %d, want 5678", out.Gid)
+	}
+
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("symlink entry not found")
+	}
+	if !entry.HasUID || entry.Uid != 1234 || !entry.HasGID || entry.Gid != 5678 {
+		t.Fatalf("symlink entry owner = uid:%d/%t gid:%d/%t, want 1234/true 5678/true",
+			entry.Uid, entry.HasUID, entry.Gid, entry.HasGID)
 	}
 }
 
@@ -12409,6 +12514,85 @@ func TestSetAttr_OwnerUpdate(t *testing.T) {
 	}
 	if out.Uid != 1234 || out.Gid != 5678 {
 		t.Fatalf("out owner = %d:%d, want 1234:5678", out.Uid, out.Gid)
+	}
+}
+
+func TestSetAttr_ChownPreserveSentinel(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, 42))
+	})
+	defer cleanup()
+
+	// Simulate a file owned by root (0:0).
+	fs.inodes.UpdateOwner(ino, 0, 0, true, true)
+
+	// chown(path, -1, -1): the kernel sets FATTR_UID|FATTR_GID with
+	// Uid=Gid=0xFFFFFFFF (the "preserve" sentinel). A non-root caller
+	// (uid=1000) issues this; POSIX requires it to succeed and preserve
+	// the existing 0:0 ownership.
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{
+				NodeId: ino,
+				Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 1000, Gid: 1000}},
+			},
+			Valid: gofuse.FATTR_UID | gofuse.FATTR_GID,
+			Owner: gofuse.Owner{Uid: chownPreserveID, Gid: chownPreserveID},
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr chown(-1,-1) status = %v, want OK", st)
+	}
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.Uid != 0 || entry.Gid != 0 {
+		t.Fatalf("owner = uid:%d gid:%d, want 0:0 (preserved)", entry.Uid, entry.Gid)
+	}
+	if out.Uid != 0 || out.Gid != 0 {
+		t.Fatalf("out owner = %d:%d, want 0:0 (preserved)", out.Uid, out.Gid)
+	}
+}
+
+func TestSetAttr_ChownPreserveGIDOnly(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, 42))
+	})
+	defer cleanup()
+
+	// File owned by root.
+	fs.inodes.UpdateOwner(ino, 0, 0, true, true)
+
+	// chown(path, -1, 100): preserve uid (sentinel), change gid to 100.
+	// A non-root caller cannot change gid to a group they are not in, so
+	// use root as the caller to isolate the sentinel logic.
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{
+				NodeId: ino,
+				Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 0, Gid: 0}},
+			},
+			Valid: gofuse.FATTR_UID | gofuse.FATTR_GID,
+			Owner: gofuse.Owner{Uid: chownPreserveID, Gid: 100},
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr chown(-1,100) status = %v, want OK", st)
+	}
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.Uid != 0 {
+		t.Fatalf("uid = %d, want 0 (preserved)", entry.Uid)
+	}
+	if entry.Gid != 100 {
+		t.Fatalf("gid = %d, want 100 (changed)", entry.Gid)
 	}
 }
 

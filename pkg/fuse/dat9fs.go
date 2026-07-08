@@ -5073,7 +5073,14 @@ func (fs *Dat9FS) hasKnownLocalDirectoryChildren(dirPath string) bool {
 		return false
 	}
 	if fs.dirCache != nil && fs.dirCache.HasPositiveEntries(dirPath) {
-		return true
+		// The dirCache may contain stale positive entries for recently
+		// unlinked files (re-populated by SSE events or remote listings).
+		// Cross-check against delete tombstones before declaring the
+		// directory non-empty — if every positive entry is tombstoned,
+		// the directory is effectively empty.
+		if fs.dirCache.HasPositiveEntriesExceptTombstones(dirPath, fs.snapshotDeletedPaths()) {
+			return true
+		}
 	}
 	for _, entry := range fs.inodes.Snapshot() {
 		if entry.Unlinked {
@@ -5512,7 +5519,7 @@ func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
 		return nil, false
 	}
 	mtime := item.Mtime
-	if mtime.IsZero() {
+	if mtime.IsZero() || (!entry.Mtime.IsZero() && entry.Mtime.After(mtime)) {
 		mtime = entry.Mtime
 	}
 	if mtime.IsZero() {
@@ -6278,7 +6285,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		if fs.pendingIndex != nil {
 			if meta, ok := fs.pendingIndex.GetMeta(entry.Path); ok {
 				entry.Size = meta.Size
-				if !meta.Mtime.IsZero() {
+				if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
 					entry.Mtime = meta.Mtime
 				}
 				pendingFound = true
@@ -6287,7 +6294,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		if !pendingFound {
 			if meta, ok := fs.writeBack.GetMeta(entry.Path); ok {
 				entry.Size = meta.Size
-				if !meta.Mtime.IsZero() {
+				if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
 					entry.Mtime = meta.Mtime
 				}
 				pendingFound = true
@@ -6321,8 +6328,15 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				fs.inodes.UpdateMode(input.NodeId, stat.Mode)
 			}
 			if !stat.Mtime.IsZero() {
-				entry.Mtime = stat.Mtime
-				fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+				// Only adopt the remote mtime when the inode does not already
+				// have a newer local mtime. This prevents a stale remote mtime
+				// (e.g. creation time from before a local truncation) from
+				// clobbering a locally-updated mtime after the dirty handle is
+				// flushed and the remote stat path runs.
+				if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
+					entry.Mtime = stat.Mtime
+					fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+				}
 			}
 		}
 	} else if input.NodeId != 1 {
@@ -6352,8 +6366,10 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				fs.inodes.UpdateMode(input.NodeId, stat.Mode)
 			}
 			if !stat.Mtime.IsZero() {
-				entry.Mtime = stat.Mtime
-				fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+				if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
+					entry.Mtime = stat.Mtime
+					fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+				}
 			}
 		}
 	}
@@ -6562,6 +6578,29 @@ func (fs *Dat9FS) checkSetAttrOwnerForCaller(input *gofuse.SetAttrIn, entry *Ino
 	return gofuse.OK
 }
 
+// chownPreserveID is the sentinel value (uint32(-1)) the Linux kernel sends
+// via FATTR_UID/FATTR_GID to indicate "do not change this field" in a chown
+// call (e.g. chown(path, -1, gid) or chown(path, -1, -1)).
+const chownPreserveID = ^uint32(0)
+
+// resolveSetAttrOwner reads the requested uid/gid from input, treating the
+// chown(-1) preserve sentinel (0xFFFFFFFF) as "not set" so that callers do
+// not overwrite the existing owner with a literal 0xFFFFFFFF. The Linux kernel
+// always sets FATTR_UID/FATTR_GID when chown is invoked, even for fields the
+// caller wants to preserve, so GetUID()/GetGID() report hasUID/hasGID=true
+// with the sentinel value — this helper normalizes that back to hasUID=false.
+func resolveSetAttrOwner(input *gofuse.SetAttrIn) (uid uint32, hasUID bool, gid uint32, hasGID bool) {
+	uid, hasUID = input.GetUID()
+	gid, hasGID = input.GetGID()
+	if hasUID && uid == chownPreserveID {
+		hasUID = false
+	}
+	if hasGID && gid == chownPreserveID {
+		hasGID = false
+	}
+	return uid, hasUID, gid, hasGID
+}
+
 func processHasSupplementaryGroup(pid, gid uint32) bool {
 	if pid == 0 {
 		return false
@@ -6677,8 +6716,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			fs.inodes.UpdateAtime(input.NodeId, atime)
 			metadataChanged = true
 		}
-		ownerUID, hasUID := input.GetUID()
-		ownerGID, hasGID := input.GetGID()
+		ownerUID, hasUID, ownerGID, hasGID := resolveSetAttrOwner(input)
 		if hasUID || hasGID {
 			if st := fs.checkSetAttrOwnerForCaller(input, entry, ownerUID, hasUID, ownerGID, hasGID); st != gofuse.OK {
 				return st
@@ -6767,8 +6805,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 
 	// Handle owner updates. Drive9 does not persist uid/gid remotely yet, but
 	// the FUSE mount should report the ownership it has acknowledged.
-	ownerUID, hasUID := input.GetUID()
-	ownerGID, hasGID := input.GetGID()
+	ownerUID, hasUID, ownerGID, hasGID := resolveSetAttrOwner(input)
 	if hasUID || hasGID {
 		if st := fs.checkSetAttrOwnerForCaller(input, entry, ownerUID, hasUID, ownerGID, hasGID); st != gofuse.OK {
 			return st
@@ -6885,6 +6922,15 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		fs.inodes.UpdateSize(input.NodeId, newSize)
 		if newSize != oldSize {
 			metadataChanged = true
+			// POSIX: truncation updates mtime (not just ctime). The trailing
+			// metadataChanged block only updates ctime, so update mtime
+			// explicitly here. Without this, open(O_TRUNC) — which the
+			// kernel translates to SetAttr(FATTR_SIZE, 0) + Open — would
+			// not advance mtime, failing POSIX mtime-advance checks
+			// (pjdfstest open/00.t test 43).
+			truncMtime := time.Now()
+			entry.Mtime = truncMtime
+			fs.inodes.UpdateMtime(input.NodeId, truncMtime)
 		}
 		// Kernel already receives updated attrs via the SetAttr reply —
 		// no need for an explicit notifyInode here.
@@ -7221,6 +7267,7 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	mode := symlinkMode()
 	ino := fs.inodes.Lookup(childP, false, int64(len(pointedTo)), time.Now())
 	fs.inodes.UpdateMode(ino, mode)
+	fs.inodes.UpdateOwner(ino, header.Uid, header.Gid, true, true)
 	if stat, err := fs.client.StatCtx(ctx, fs.remotePath(childP)); err == nil && stat != nil {
 		if stat.ResourceID != "" || stat.Nlink > 0 {
 			fs.inodes.SetIdentity(ino, stat.ResourceID, stat.Nlink)
@@ -9405,6 +9452,27 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.ZeroBase = true
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 			fs.inodes.UpdateSize(fh.Ino, 0)
+			// Truncation updates mtime and ctime (POSIX). The SetAttr
+			// FATTR_SIZE path does this via the trailing metadataChanged
+			// block; Open(O_TRUNC) must do the same explicitly.
+			truncTime := time.Now()
+			if entry != nil {
+				entry.Mtime = truncTime
+				entry.Ctime = truncTime
+			}
+			fs.inodes.UpdateMtime(fh.Ino, truncTime)
+			fs.inodes.UpdateCtime(fh.Ino, truncTime)
+			// Invalidate the kernel's attribute cache synchronously so the
+			// next stat() sees the updated mtime/ctime instead of a stale
+			// cached value. Without this, the kernel may serve the pre-
+			// truncation mtime from its AttrTTL window (default 60s),
+			// causing POSIX mtime-advance checks to fail (pjdfstest
+			// open/00.t test 43). Use a synchronous InodeNotify (not the
+			// async notifyInode goroutine) to guarantee the cache is
+			// invalidated before Open returns to the kernel.
+			if fs.server != nil {
+				_ = fs.server.InodeNotify(input.NodeId, 0, 0)
+			}
 			if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 				if err := fs.shadowStore.WriteFull(p, nil, fh.BaseRev); err != nil {
 					log.Printf("shadow reset failed for truncate-open %s: %v", p, err)
@@ -12472,7 +12540,17 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// re-adding it here with the upload's size/revision would resurrect a
 	// stale entry. The new path (fh.Path) will be cached on its own flush.
 	if !pathRetargeted {
-		fs.cacheFileForPath(handlePath, publishSize, time.Now(), committedRev)
+		commitTime := time.Now()
+		fs.cacheFileForPath(handlePath, publishSize, commitTime, committedRev)
+		// Ensure the inode's mtime advances to at least the commit time.
+		// Without this, GetAttr may report a stale mtime from before the
+		// write/truncation if it reads the inode directly (bypassing the
+		// dir cache), causing POSIX mtime-advance checks to fail.
+		if entry, ok := fs.inodes.GetEntry(handleIno); ok {
+			if entry.Mtime.Before(commitTime) {
+				fs.inodes.UpdateMtime(handleIno, commitTime)
+			}
+		}
 	}
 	// Local flush — kernel receives the Flush reply with status.
 	// No notifyInode/notifyEntry needed; userspace caches are updated

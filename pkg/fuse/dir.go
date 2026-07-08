@@ -232,6 +232,33 @@ func (dc *DirCache) HasPositiveEntries(dirPath string) bool {
 	return len(entry.items) > 0
 }
 
+// HasPositiveEntriesExceptTombstones returns true if the directory has any
+// positive cache entries whose child path is not in the tombstones set.
+// tombstones is a map of full child paths (dirPath + "/" + name) that have
+// been recently deleted. This prevents stale SSE-repopulated dir cache
+// entries from causing rmdir to return ENOTEMPTY for recently-unlinked files.
+func (dc *DirCache) HasPositiveEntriesExceptTombstones(dirPath string, tombstones map[string]struct{}) bool {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	now := time.Now()
+	entry, ok := dc.getEntryLocked(dirPath, now)
+	if !ok || !entry.positiveValid(now) {
+		return false
+	}
+	for name := range entry.items {
+		childP := dirPath + "/" + name
+		if dirPath == "/" {
+			childP = "/" + name
+		}
+		if _, isTombstoned := tombstones[childP]; isTombstoned {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 // MarkNegative records a short-lived ENOENT marker for parent/name.
 func (dc *DirCache) MarkNegative(parentPath, name string) {
 	if name == "" || dc.negativeTTL <= 0 {
