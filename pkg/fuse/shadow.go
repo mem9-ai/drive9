@@ -359,17 +359,21 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 
 	actualEnd := offset + int64(n)
 	s.mu.Lock()
+	prevSize := sf.size
 	if actualEnd > sf.size {
 		sf.size = actualEnd
 	}
 	if baseRev != 0 {
 		sf.baseRev = baseRev
 	}
+	newSize := sf.size
 	s.mu.Unlock()
-	// Track physical allocation (actual data written), not logical file size
-	// growth, to avoid inflating pendingBytes for sparse writes.
-	if physDelta := int64(n); physDelta > 0 {
-		s.pendingBytes.Add(physDelta)
+	// Track logical file size growth for pendingBytes (consistent with
+	// Ensure and the original accounting). The quota check above uses
+	// len(data) to avoid rejecting sparse writes that only touch a few
+	// blocks at a large offset.
+	if delta := newSize - prevSize; delta > 0 {
+		s.pendingBytes.Add(delta)
 	}
 	return n, nil
 }
