@@ -757,7 +757,10 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 						recordTenantSchemaVersionUpdateFailure(ctx, t.ID, targetSchemaVersion, time.Since(updateSchemaVersionStart), verErr)
 					}
 				}
-			} else if p.shouldPeriodicValidateTiDBSchemaOnOpen() {
+			} else if p.shouldPeriodicValidateTiDBSchemaOnOpen() && !p.cfg.DisableDatabaseAutoEmbedding {
+				// Skip auto-embedding schema validation when embedding is
+				// disabled: the generated embedding columns are intentionally
+				// dropped and validation would fail on their absence.
 				validateSchemaStart := time.Now()
 				if err := validateTiDBSchemaForAutoEmbeddingProfile(ctx, store.DB(), autoEmbeddingProfile.schemaProfile); err != nil {
 					_ = store.Close()
