@@ -333,13 +333,21 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 		return 0, err
 	}
 
-	// Pre-check: estimate growth delta.
-	end := offset + int64(len(data))
+	// Pre-check: estimate growth delta. For sparse writes (small data at a
+	// large offset), the physical disk usage is bounded by len(data), not
+	// the logical file extension (end - oldSize). The quota check should
+	// guard against actual disk consumption, not logical file size, because
+	// the shadow file is a sparse file on disk.
+	writeLen := int64(len(data))
+	end := offset + writeLen
 	s.mu.RLock()
 	oldSize := sf.size
 	s.mu.RUnlock()
-	if delta := end - oldSize; delta > 0 {
-		if err := s.checkQuotaForDelta(delta); err != nil {
+	if end > oldSize {
+		// Use the actual data length as the physical delta for quota purposes.
+		// The filesystem will allocate only the blocks touched by the write,
+		// not the entire hole from oldSize to end.
+		if err := s.checkQuotaForDelta(writeLen); err != nil {
 			return 0, err
 		}
 	}
@@ -351,17 +359,17 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 
 	actualEnd := offset + int64(n)
 	s.mu.Lock()
-	prevSize := sf.size
 	if actualEnd > sf.size {
 		sf.size = actualEnd
 	}
 	if baseRev != 0 {
 		sf.baseRev = baseRev
 	}
-	newSize := sf.size
 	s.mu.Unlock()
-	if delta := newSize - prevSize; delta > 0 {
-		s.pendingBytes.Add(delta)
+	// Track physical allocation (actual data written), not logical file size
+	// growth, to avoid inflating pendingBytes for sparse writes.
+	if physDelta := int64(n); physDelta > 0 {
+		s.pendingBytes.Add(physDelta)
 	}
 	return n, nil
 }

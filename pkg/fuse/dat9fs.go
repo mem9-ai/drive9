@@ -5073,7 +5073,14 @@ func (fs *Dat9FS) hasKnownLocalDirectoryChildren(dirPath string) bool {
 		return false
 	}
 	if fs.dirCache != nil && fs.dirCache.HasPositiveEntries(dirPath) {
-		return true
+		// The dirCache may contain stale positive entries for recently
+		// unlinked files (re-populated by SSE events or remote listings).
+		// Cross-check against delete tombstones before declaring the
+		// directory non-empty — if every positive entry is tombstoned,
+		// the directory is effectively empty.
+		if fs.dirCache.HasPositiveEntriesExceptTombstones(dirPath, fs.snapshotDeletedPaths()) {
+			return true
+		}
 	}
 	for _, entry := range fs.inodes.Snapshot() {
 		if entry.Unlinked {
@@ -6278,7 +6285,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		if fs.pendingIndex != nil {
 			if meta, ok := fs.pendingIndex.GetMeta(entry.Path); ok {
 				entry.Size = meta.Size
-				if !meta.Mtime.IsZero() {
+				if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
 					entry.Mtime = meta.Mtime
 				}
 				pendingFound = true
@@ -6287,7 +6294,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		if !pendingFound {
 			if meta, ok := fs.writeBack.GetMeta(entry.Path); ok {
 				entry.Size = meta.Size
-				if !meta.Mtime.IsZero() {
+				if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
 					entry.Mtime = meta.Mtime
 				}
 				pendingFound = true
