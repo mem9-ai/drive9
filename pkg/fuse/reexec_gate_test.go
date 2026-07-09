@@ -8,7 +8,6 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/stretchr/testify/require"
 )
 
 func newTestReexecFS() *Dat9FS {
@@ -24,42 +23,55 @@ func newTestReexecFS() *Dat9FS {
 func TestReexecPreflightIdleMount(t *testing.T) {
 	fs := newTestReexecFS()
 	result := fs.ReexecPreflight()
-	require.True(t, result.OK, "idle mount should pass preflight")
-	require.Empty(t, result.Refusals)
+	if !result.OK {
+		t.Fatalf("idle mount should pass preflight, got refusals: %+v", result.Refusals)
+	}
+	if len(result.Refusals) != 0 {
+		t.Fatalf("expected no refusals, got %d", len(result.Refusals))
+	}
 }
 
 func TestReexecPreflightRefusesOpenFileHandle(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.fileHandles.Allocate(&FileHandle{Path: "/test.txt"})
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	require.Len(t, result.Refusals, 1)
-	require.Equal(t, "file_handles", result.Refusals[0].Gate)
-	require.Equal(t, 1, result.Refusals[0].Count)
+	if result.OK {
+		t.Fatal("expected preflight to fail with open file handle")
+	}
+	if len(result.Refusals) != 1 {
+		t.Fatalf("expected 1 refusal, got %d", len(result.Refusals))
+	}
+	if result.Refusals[0].Gate != "file_handles" {
+		t.Fatalf("expected gate file_handles, got %s", result.Refusals[0].Gate)
+	}
+	if result.Refusals[0].Count != 1 {
+		t.Fatalf("expected count 1, got %d", result.Refusals[0].Count)
+	}
 }
 
 func TestReexecPreflightRefusesOpenDirHandle(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.dirHandles.Allocate(&DirHandle{Path: "/"})
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	require.Len(t, result.Refusals, 1)
-	require.Equal(t, "dir_handles", result.Refusals[0].Gate)
+	if result.OK {
+		t.Fatal("expected preflight to fail with open dir handle")
+	}
+	if len(result.Refusals) != 1 {
+		t.Fatalf("expected 1 refusal, got %d", len(result.Refusals))
+	}
+	if result.Refusals[0].Gate != "dir_handles" {
+		t.Fatalf("expected gate dir_handles, got %s", result.Refusals[0].Gate)
+	}
 }
 
 func TestReexecPreflightRefusesNonRootNlookup(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.inodes.Lookup("/foo", false, 0, time.Time{})
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "inode_nlookup" {
-			hasGate = true
-			require.Equal(t, 1, r.Count)
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with non-root nlookup")
 	}
-	require.True(t, hasGate, "should refuse on non-root inode with Nlookup > 0")
+	assertHasGate(t, result.Refusals, "inode_nlookup", 1)
 }
 
 func TestReexecPreflightRefusesFuseLock(t *testing.T) {
@@ -70,263 +82,201 @@ func TestReexecPreflightRefusesFuseLock(t *testing.T) {
 		Typ:   uint32(syscall.F_WRLCK),
 	}, false)
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "fuse_locks" {
-			hasGate = true
-			require.Equal(t, 1, r.Count)
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with held FUSE lock")
 	}
-	require.True(t, hasGate, "should refuse when FUSE lock is held")
+	assertHasGate(t, result.Refusals, "fuse_locks", 1)
 }
 
 func TestReexecPreflightRefusesXattr(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.xattrs.Set("/test.txt", "user.test", []byte("value"))
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "xattrs" {
-			hasGate = true
-			require.Equal(t, 1, r.Count)
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with xattrs")
 	}
-	require.True(t, hasGate, "should refuse when xattrs exist")
+	assertHasGate(t, result.Refusals, "xattrs", 1)
 }
 
 func TestReexecPreflightRefusesLocalOverlay(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.localOverlay = &LocalOverlay{root: "/tmp/overlay"}
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "local_overlay" {
-			hasGate = true
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with local overlay enabled")
 	}
-	require.True(t, hasGate, "should refuse when local overlay is enabled")
+	assertHasGate(t, result.Refusals, "local_overlay", -1)
 }
 
 func TestReexecPreflightRefusesGitWorkspace(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.git = &gitWorkspaceLayer{}
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "git_workspace" {
-			hasGate = true
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with git workspace enabled")
 	}
-	require.True(t, hasGate, "should refuse when git workspace is enabled")
+	assertHasGate(t, result.Refusals, "git_workspace", -1)
 }
 
 func TestReexecPreflightRefusesNonEmptyTransientOverlay(t *testing.T) {
 	dir := t.TempDir()
 	overlayRoot := filepath.Join(dir, "overlay")
-	require.NoError(t, os.MkdirAll(overlayRoot, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(overlayRoot, "file.txt"), []byte("data"), 0o644))
+	if err := os.MkdirAll(overlayRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(overlayRoot, "file.txt"), []byte("data"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 
 	fs := newTestReexecFS()
 	fs.transientLocalOverlay = &LocalOverlay{root: overlayRoot}
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "transient_overlay" {
-			hasGate = true
-			require.Equal(t, 1, r.Count)
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with non-empty transient overlay")
 	}
-	require.True(t, hasGate, "should refuse when transient overlay has entries")
+	assertHasGate(t, result.Refusals, "transient_overlay", 1)
 }
 
 func TestReexecPreflightAllowsEmptyTransientOverlay(t *testing.T) {
 	dir := t.TempDir()
 	overlayRoot := filepath.Join(dir, "overlay")
-	require.NoError(t, os.MkdirAll(overlayRoot, 0o755))
+	if err := os.MkdirAll(overlayRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
 
 	fs := newTestReexecFS()
 	fs.transientLocalOverlay = &LocalOverlay{root: overlayRoot}
 	result := fs.ReexecPreflight()
-	require.True(t, result.OK, "empty transient overlay should pass preflight")
+	if !result.OK {
+		t.Fatalf("empty transient overlay should pass preflight, got refusals: %+v", result.Refusals)
+	}
 }
 
 func TestReexecPreflightRefusesPendingIndex(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := NewPendingIndex(dir)
-	require.NoError(t, err)
-	_, err = idx.Put("/test.txt", 100, PendingNew)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewPendingIndex: %v", err)
+	}
+	if _, err := idx.Put("/test.txt", 100, PendingNew); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	fs := newTestReexecFS()
 	fs.pendingIndex = idx
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "pending_index" {
-			hasGate = true
-			require.Equal(t, 1, r.Count)
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with pending index entries")
 	}
-	require.True(t, hasGate, "should refuse when pending index has entries")
+	assertHasGate(t, result.Refusals, "pending_index", 1)
 }
 
 func TestReexecPreflightRefusesJournal(t *testing.T) {
 	dir := t.TempDir()
 	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
-	require.NoError(t, err)
-	require.NoError(t, j.Append(JournalEntry{Op: JournalWrite, Path: "/test.txt"}))
+	if err != nil {
+		t.Fatalf("NewJournal: %v", err)
+	}
+	if err := j.Append(JournalEntry{Op: JournalWrite, Path: "/test.txt"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
 
 	fs := newTestReexecFS()
 	fs.journal = j
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "journal" {
-			hasGate = true
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with uncommitted journal frames")
 	}
-	require.True(t, hasGate, "should refuse when journal has uncommitted frames")
+	assertHasGate(t, result.Refusals, "journal", -1)
 }
 
 func TestReexecPreflightJournalPassesAfterCommit(t *testing.T) {
 	dir := t.TempDir()
 	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
-	require.NoError(t, err)
-	require.NoError(t, j.Append(JournalEntry{Op: JournalWrite, Path: "/test.txt"}))
-	require.NoError(t, j.Append(JournalEntry{Op: JournalCommit, Path: "/test.txt"}))
+	if err != nil {
+		t.Fatalf("NewJournal: %v", err)
+	}
+	if err := j.Append(JournalEntry{Op: JournalWrite, Path: "/test.txt"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := j.Append(JournalEntry{Op: JournalCommit, Path: "/test.txt"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
 
 	fs := newTestReexecFS()
 	fs.journal = j
 	result := fs.ReexecPreflight()
-	hasJournalRefusal := false
 	for _, r := range result.Refusals {
 		if r.Gate == "journal" {
-			hasJournalRefusal = true
+			t.Fatal("journal with committed frames should not refuse")
 		}
 	}
-	require.False(t, hasJournalRefusal, "journal with committed frames should not refuse")
 }
 
 func TestReexecPreflightRefusesShadowStorePendingBytes(t *testing.T) {
 	dir := t.TempDir()
 	shadowDir := filepath.Join(dir, "shadow")
 	ss, err := NewShadowStore(shadowDir)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewShadowStore: %v", err)
+	}
 
-	// Write a shadow file to create pending bytes.
 	shadowPath := filepath.Join(shadowDir, "test.shadow")
-	require.NoError(t, os.WriteFile(shadowPath, []byte("dirty data"), 0o644))
+	if err := os.WriteFile(shadowPath, []byte("dirty data"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 	ss.RecoverPendingBytes()
-	require.Greater(t, ss.PendingBytes(), int64(0), "shadow store should have pending bytes")
+	if ss.PendingBytes() <= 0 {
+		t.Fatal("shadow store should have pending bytes after recovery")
+	}
 
 	fs := newTestReexecFS()
 	fs.shadowStore = ss
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "shadow_store" {
-			hasGate = true
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with shadow store pending bytes")
 	}
-	require.True(t, hasGate, "should refuse when shadow store has pending bytes")
-}
-
-func TestReexecPreflightRefusesCommitQueuePendingWork(t *testing.T) {
-	// CommitQueue requires a full client + shadow + pending setup.
-	// Create a minimal CommitQueue with a pending entry via the public API.
-	dir := t.TempDir()
-	shadowDir := filepath.Join(dir, "shadow")
-	ss, err := NewShadowStore(shadowDir)
-	require.NoError(t, err)
-	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
-	require.NoError(t, err)
-	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
-	require.NoError(t, err)
-
-	cq := NewCommitQueue(nil, ss, idx, j, 1, 100)
-	// Enqueue work — this will fail to commit (nil client) but the entry
-	// stays pending, which is what we need for the snapshot check.
-	seq, err := idx.Put("/test.txt", 10, PendingNew)
-	require.NoError(t, err)
-	_ = seq
-
-	fs := newTestReexecFS()
-	fs.commitQueue = cq
-	fs.pendingIndex = idx
-	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	// Should have pending_index refusal at minimum
-	hasIndex := false
-	for _, r := range result.Refusals {
-		if r.Gate == "pending_index" {
-			hasIndex = true
-		}
-	}
-	require.True(t, hasIndex, "should refuse when pending index has entries (commit queue scenario)")
+	assertHasGate(t, result.Refusals, "shadow_store", -1)
 }
 
 func TestReexecPreflightRefusesLayerOverlayWhiteouts(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.layerWhiteouts = map[string]struct{}{"/deleted": {}}
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "layer_overlay" {
-			hasGate = true
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with layer whiteouts")
 	}
-	require.True(t, hasGate, "should refuse when layerWhiteouts is non-empty")
+	assertHasGate(t, result.Refusals, "layer_overlay", -1)
 }
 
 func TestReexecPreflightRefusesLayerOverlayFiles(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.layerFiles = map[string]uint32{"/new.txt": 0o644}
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "layer_overlay" {
-			hasGate = true
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with layer files")
 	}
-	require.True(t, hasGate, "should refuse when layerFiles is non-empty")
+	assertHasGate(t, result.Refusals, "layer_overlay", -1)
 }
 
 func TestReexecPreflightRefusesLayerOverlayDirs(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.layerDirs = map[string]uint32{"/newdir": 0o755}
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "layer_overlay" {
-			hasGate = true
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with layer dirs")
 	}
-	require.True(t, hasGate, "should refuse when layerDirs is non-empty")
+	assertHasGate(t, result.Refusals, "layer_overlay", -1)
 }
 
 func TestReexecPreflightRefusesLayerOverlaySymlinks(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.layerSymlinks = map[string]layerSymlinkState{"/link": {Target: "/target", Mode: 0o777}}
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "layer_overlay" {
-			hasGate = true
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with layer symlinks")
 	}
-	require.True(t, hasGate, "should refuse when layerSymlinks is non-empty")
+	assertHasGate(t, result.Refusals, "layer_overlay", -1)
 }
 
 func TestReexecPreflightRefusesUploaderQueued(t *testing.T) {
@@ -339,15 +289,10 @@ func TestReexecPreflightRefusesUploaderQueued(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.uploader = u
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "uploader_queued" {
-			hasGate = true
-			require.Equal(t, 1, r.Count)
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with uploader queued entries")
 	}
-	require.True(t, hasGate, "should refuse when uploader has queued entries")
+	assertHasGate(t, result.Refusals, "uploader_queued", 1)
 }
 
 func TestReexecPreflightRefusesUploaderInFlight(t *testing.T) {
@@ -358,21 +303,18 @@ func TestReexecPreflightRefusesUploaderInFlight(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.uploader = u
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "uploader_inflight" {
-			hasGate = true
-			require.Equal(t, 1, r.Count)
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with uploader in-flight entries")
 	}
-	require.True(t, hasGate, "should refuse when uploader has in-flight entries")
+	assertHasGate(t, result.Refusals, "uploader_inflight", 1)
 }
 
 func TestReexecPreflightRefusesUploaderCached(t *testing.T) {
 	dir := t.TempDir()
 	cache, err := NewWriteBackCache(dir)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewWriteBackCache: %v", err)
+	}
 	cache.mu.Lock()
 	cache.metas["/cached.txt"] = &WriteBackMeta{Path: "/cached.txt", Size: 42}
 	cache.mu.Unlock()
@@ -385,25 +327,26 @@ func TestReexecPreflightRefusesUploaderCached(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.uploader = u
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "uploader_cached" {
-			hasGate = true
-			require.Equal(t, 1, r.Count)
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with uploader cached entries")
 	}
-	require.True(t, hasGate, "should refuse when uploader has cached entries")
+	assertHasGate(t, result.Refusals, "uploader_cached", 1)
 }
 
 func TestReexecPreflightRefusesCommitQueuePending(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStore(filepath.Join(dir, "shadow"))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewShadowStore: %v", err)
+	}
 	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewPendingIndex: %v", err)
+	}
 	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewJournal: %v", err)
+	}
 
 	cq := NewCommitQueue(nil, ss, idx, j, 1, 100)
 	cq.mu.Lock()
@@ -413,25 +356,26 @@ func TestReexecPreflightRefusesCommitQueuePending(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.commitQueue = cq
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "commit_queue_pending" {
-			hasGate = true
-			require.Equal(t, 1, r.Count)
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with commit queue pending entries")
 	}
-	require.True(t, hasGate, "should refuse when commit queue has pending entries")
+	assertHasGate(t, result.Refusals, "commit_queue_pending", 1)
 }
 
 func TestReexecPreflightRefusesCommitQueueInFlight(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStore(filepath.Join(dir, "shadow"))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewShadowStore: %v", err)
+	}
 	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewPendingIndex: %v", err)
+	}
 	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewJournal: %v", err)
+	}
 
 	cq := NewCommitQueue(nil, ss, idx, j, 1, 100)
 	cq.mu.Lock()
@@ -441,73 +385,72 @@ func TestReexecPreflightRefusesCommitQueueInFlight(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.commitQueue = cq
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "commit_queue_inflight" {
-			hasGate = true
-			require.Equal(t, 1, r.Count)
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with commit queue in-flight entries")
 	}
-	require.True(t, hasGate, "should refuse when commit queue has in-flight entries")
+	assertHasGate(t, result.Refusals, "commit_queue_inflight", 1)
 }
 
 func TestReexecPreflightRefusesCommitQueueDelayed(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStore(filepath.Join(dir, "shadow"))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewShadowStore: %v", err)
+	}
 	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewPendingIndex: %v", err)
+	}
 	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewJournal: %v", err)
+	}
 
 	cq := NewCommitQueue(nil, ss, idx, j, 1, 100)
 	entry := &CommitEntry{Path: "/delayed.txt", Size: 10}
+	timer := time.NewTimer(time.Hour)
+	t.Cleanup(func() { timer.Stop() })
 	cq.mu.Lock()
-	cq.delayed[entry] = time.NewTimer(time.Hour)
+	cq.delayed[entry] = timer
 	cq.mu.Unlock()
 
 	fs := newTestReexecFS()
 	fs.commitQueue = cq
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "commit_queue_delayed" {
-			hasGate = true
-			require.Equal(t, 1, r.Count)
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with commit queue delayed entries")
 	}
-	require.True(t, hasGate, "should refuse when commit queue has delayed entries")
+	assertHasGate(t, result.Refusals, "commit_queue_delayed", 1)
 }
 
 func TestReexecPreflightRefusesCommitQueueConflicts(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStore(filepath.Join(dir, "shadow"))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewShadowStore: %v", err)
+	}
 	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewPendingIndex: %v", err)
+	}
 	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewJournal: %v", err)
+	}
 
-	// Add a conflict entry via the pending index.
-	_, err = idx.Put("/conflict.txt", 100, PendingConflict)
-	require.NoError(t, err)
+	if _, err := idx.Put("/conflict.txt", 100, PendingConflict); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	cq := NewCommitQueue(nil, ss, idx, j, 1, 100)
 
 	fs := newTestReexecFS()
 	fs.commitQueue = cq
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	hasGate := false
-	for _, r := range result.Refusals {
-		if r.Gate == "commit_queue_conflicts" {
-			hasGate = true
-			require.Equal(t, 1, r.Count)
-		}
+	if result.OK {
+		t.Fatal("expected preflight to fail with commit queue conflicts")
 	}
-	require.True(t, hasGate, "should refuse when commit queue has conflicts")
+	assertHasGate(t, result.Refusals, "commit_queue_conflicts", 1)
 }
 
 func TestReexecPreflightCollectsMultipleRefusals(t *testing.T) {
@@ -516,18 +459,32 @@ func TestReexecPreflightCollectsMultipleRefusals(t *testing.T) {
 	fs.dirHandles.Allocate(&DirHandle{Path: "/"})
 	fs.xattrs.Set("/b.txt", "user.test", []byte("val"))
 	result := fs.ReexecPreflight()
-	require.False(t, result.OK)
-	require.GreaterOrEqual(t, len(result.Refusals), 3, "should collect all refusals, not stop at first")
+	if result.OK {
+		t.Fatal("expected preflight to fail with multiple dirty states")
+	}
+	if len(result.Refusals) < 3 {
+		t.Fatalf("expected at least 3 refusals, got %d", len(result.Refusals))
+	}
 }
 
 func TestReexecGuardPreventsConcurrent(t *testing.T) {
 	g := &reexecGuard{}
-	require.True(t, g.tryAcquire(), "first acquire should succeed")
-	require.True(t, g.isActive())
-	require.False(t, g.tryAcquire(), "second acquire should fail")
+	if !g.tryAcquire() {
+		t.Fatal("first acquire should succeed")
+	}
+	if !g.isActive() {
+		t.Fatal("guard should be active after acquire")
+	}
+	if g.tryAcquire() {
+		t.Fatal("second acquire should fail")
+	}
 	g.release()
-	require.False(t, g.isActive())
-	require.True(t, g.tryAcquire(), "acquire after release should succeed")
+	if g.isActive() {
+		t.Fatal("guard should not be active after release")
+	}
+	if !g.tryAcquire() {
+		t.Fatal("acquire after release should succeed")
+	}
 	g.release()
 }
 
@@ -535,74 +492,152 @@ func TestReexecGuardPreventsConcurrent(t *testing.T) {
 
 func TestNonRootLookupCount(t *testing.T) {
 	m := NewInodeToPath()
-	require.Equal(t, 0, m.NonRootLookupCount(), "empty inode table has no non-root lookups")
+	if got := m.nonRootLookupCount(); got != 0 {
+		t.Fatalf("empty inode table: want 0, got %d", got)
+	}
 
 	m.Lookup("/foo", false, 0, time.Time{})
-	require.Equal(t, 1, m.NonRootLookupCount())
+	if got := m.nonRootLookupCount(); got != 1 {
+		t.Fatalf("after one lookup: want 1, got %d", got)
+	}
 
 	m.Lookup("/bar", false, 0, time.Time{})
-	require.Equal(t, 2, m.NonRootLookupCount())
+	if got := m.nonRootLookupCount(); got != 2 {
+		t.Fatalf("after two lookups: want 2, got %d", got)
+	}
 }
 
 func TestFuseLockTableTotalCount(t *testing.T) {
 	lt := newFuseLockTable()
-	require.Equal(t, 0, lt.totalCount())
+	if got := lt.totalCount(); got != 0 {
+		t.Fatalf("empty lock table: want 0, got %d", got)
+	}
 
 	lt.set(nil, 1, 100, 1, gofuse.FileLock{Start: 0, End: 10, Typ: uint32(syscall.F_RDLCK)}, false)
-	require.Equal(t, 1, lt.totalCount())
+	if got := lt.totalCount(); got != 1 {
+		t.Fatalf("after one lock: want 1, got %d", got)
+	}
 
 	lt.set(nil, 2, 200, 2, gofuse.FileLock{Start: 0, End: 10, Typ: uint32(syscall.F_WRLCK)}, false)
-	require.Equal(t, 2, lt.totalCount())
+	if got := lt.totalCount(); got != 2 {
+		t.Fatalf("after two locks: want 2, got %d", got)
+	}
 
 	lt.release(1, 100)
-	require.Equal(t, 1, lt.totalCount())
+	if got := lt.totalCount(); got != 1 {
+		t.Fatalf("after release: want 1, got %d", got)
+	}
 }
 
 func TestXAttrStoreTotalCount(t *testing.T) {
 	s := NewXAttrStore()
-	require.Equal(t, 0, s.TotalCount())
+	if got := s.totalCount(); got != 0 {
+		t.Fatalf("empty store: want 0, got %d", got)
+	}
 
 	s.Set("/a", "user.x", []byte("1"))
-	require.Equal(t, 1, s.TotalCount())
+	if got := s.totalCount(); got != 1 {
+		t.Fatalf("after one set: want 1, got %d", got)
+	}
 
 	s.Set("/a", "user.y", []byte("2"))
-	require.Equal(t, 2, s.TotalCount())
+	if got := s.totalCount(); got != 2 {
+		t.Fatalf("after two sets: want 2, got %d", got)
+	}
 
 	s.Set("/b", "user.x", []byte("3"))
-	require.Equal(t, 3, s.TotalCount())
+	if got := s.totalCount(); got != 3 {
+		t.Fatalf("after three sets: want 3, got %d", got)
+	}
 
 	s.Remove("/a", "user.x")
-	require.Equal(t, 2, s.TotalCount())
+	if got := s.totalCount(); got != 2 {
+		t.Fatalf("after remove: want 2, got %d", got)
+	}
 }
 
 func TestLocalOverlayEntryCount(t *testing.T) {
-	require.Equal(t, 0, localOverlayEntryCount(nil))
+	if got := localOverlayEntryCount(nil); got != 0 {
+		t.Fatalf("nil overlay: want 0, got %d", got)
+	}
 
 	dir := t.TempDir()
 	o := &LocalOverlay{root: dir}
-	require.Equal(t, 0, localOverlayEntryCount(o))
+	if got := localOverlayEntryCount(o); got != 0 {
+		t.Fatalf("empty dir: want 0, got %d", got)
+	}
 
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), nil, 0o644))
-	require.Equal(t, 1, localOverlayEntryCount(o))
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), nil, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if got := localOverlayEntryCount(o); got != 1 {
+		t.Fatalf("one file: want 1, got %d", got)
+	}
 
-	require.NoError(t, os.Mkdir(filepath.Join(dir, "subdir"), 0o755))
-	require.Equal(t, 2, localOverlayEntryCount(o))
+	if err := os.Mkdir(filepath.Join(dir, "subdir"), 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if got := localOverlayEntryCount(o); got != 2 {
+		t.Fatalf("file + dir: want 2, got %d", got)
+	}
 }
 
-func TestJournalFrameCount(t *testing.T) {
-	require.Equal(t, 0, journalFrameCount(nil))
+func TestLocalOverlayEntryCountReturnsNegativeOnReadError(t *testing.T) {
+	// A root that exists as a file (not directory) should cause ReadDir to fail.
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(filePath, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	o := &LocalOverlay{root: filePath}
+	if got := localOverlayEntryCount(o); got != -1 {
+		t.Fatalf("read error: want -1, got %d", got)
+	}
+}
 
+func TestJournalUncommittedFrameCount(t *testing.T) {
 	dir := t.TempDir()
 	j, err := NewJournal(filepath.Join(dir, "test.wal"))
-	require.NoError(t, err)
-	require.Equal(t, 0, journalFrameCount(j))
+	if err != nil {
+		t.Fatalf("NewJournal: %v", err)
+	}
+	if got := j.UncommittedFrameCount(); got != 0 {
+		t.Fatalf("empty journal: want 0, got %d", got)
+	}
 
-	require.NoError(t, j.Append(JournalEntry{Op: JournalWrite, Path: "/a"}))
-	require.Equal(t, 1, journalFrameCount(j))
+	if err := j.Append(JournalEntry{Op: JournalWrite, Path: "/a"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if got := j.UncommittedFrameCount(); got != 1 {
+		t.Fatalf("one write: want 1, got %d", got)
+	}
 
-	require.NoError(t, j.Append(JournalEntry{Op: JournalWrite, Path: "/b"}))
-	require.Equal(t, 2, journalFrameCount(j))
+	if err := j.Append(JournalEntry{Op: JournalWrite, Path: "/b"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if got := j.UncommittedFrameCount(); got != 2 {
+		t.Fatalf("two writes: want 2, got %d", got)
+	}
 
-	require.NoError(t, j.Append(JournalEntry{Op: JournalCommit, Path: "/a"}))
-	require.Equal(t, 1, journalFrameCount(j), "committed path should not count")
+	if err := j.Append(JournalEntry{Op: JournalCommit, Path: "/a"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if got := j.UncommittedFrameCount(); got != 1 {
+		t.Fatalf("after commit of /a: want 1, got %d", got)
+	}
+}
+
+// assertHasGate checks that at least one refusal has the given gate name.
+// If wantCount >= 0, it also asserts the count matches.
+func assertHasGate(t *testing.T, refusals []ReexecRefusal, gate string, wantCount int) {
+	t.Helper()
+	for _, r := range refusals {
+		if r.Gate == gate {
+			if wantCount >= 0 && r.Count != wantCount {
+				t.Fatalf("gate %s: want count %d, got %d", gate, wantCount, r.Count)
+			}
+			return
+		}
+	}
+	t.Fatalf("gate %q not found in refusals: %+v", gate, refusals)
 }

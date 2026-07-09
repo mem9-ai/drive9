@@ -7,6 +7,7 @@ import (
 
 // ReexecProtocolVersion is the wire protocol version for the reexec handshake.
 // Both old and new processes must advertise the same version.
+// Consumed by the fd handoff protocol in Phase 3.
 const ReexecProtocolVersion = 1
 
 // ReexecRefusal describes a single reason why reexec was refused.
@@ -68,8 +69,12 @@ func (fs *Dat9FS) ReexecPreflight() ReexecPreflightResult {
 		refuse("local_overlay", "user/profile local overlay is enabled", 0)
 	}
 
-	if n := fs.transientOverlayEntryCount(); n > 0 {
-		refuse("transient_overlay", "transient local overlay has entries", n)
+	if n := fs.transientOverlayEntryCount(); n != 0 {
+		if n < 0 {
+			refuse("transient_overlay", "transient local overlay root cannot be read", 0)
+		} else {
+			refuse("transient_overlay", "transient local overlay has entries", n)
+		}
 	}
 
 	if fs.git != nil {
@@ -148,7 +153,7 @@ func (fs *Dat9FS) ReexecPreflight() ReexecPreflightResult {
 	}
 
 	if fs.journal != nil {
-		if n := journalFrameCount(fs.journal); n > 0 {
+		if n := fs.journal.UncommittedFrameCount(); n > 0 {
 			refuse("journal", "journal has replay-required frames", n)
 		}
 	}
@@ -165,12 +170,12 @@ func (fs *Dat9FS) nonRootKernelLookupCount() int {
 	if fs.inodes == nil {
 		return 0
 	}
-	return fs.inodes.NonRootLookupCount()
+	return fs.inodes.nonRootLookupCount()
 }
 
-// NonRootLookupCount returns the number of non-root inodes with positive
+// nonRootLookupCount returns the number of non-root inodes with positive
 // kernel lookup references (Nlookup > 0).
-func (m *InodeToPath) NonRootLookupCount() int {
+func (m *InodeToPath) nonRootLookupCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	count := 0
@@ -204,11 +209,11 @@ func (fs *Dat9FS) xattrCount() int {
 	if fs.xattrs == nil {
 		return 0
 	}
-	return fs.xattrs.TotalCount()
+	return fs.xattrs.totalCount()
 }
 
-// TotalCount returns the total number of xattr entries across all paths.
-func (s *XAttrStore) TotalCount() int {
+// totalCount returns the total number of xattr entries across all paths.
+func (s *XAttrStore) totalCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	count := 0
@@ -226,14 +231,19 @@ func (fs *Dat9FS) transientOverlayEntryCount() int {
 }
 
 // localOverlayEntryCount returns the number of filesystem entries under the
-// overlay root directory. Returns 0 if the root does not exist.
+// overlay root directory. Returns 0 if the overlay is nil, empty, or the root
+// does not exist. Returns -1 if the root exists but cannot be read (permission
+// error, etc.) — the caller must treat -1 as a refusal, not a clean pass.
 func localOverlayEntryCount(o *LocalOverlay) int {
 	if o == nil || o.root == "" {
 		return 0
 	}
 	entries, err := os.ReadDir(o.root)
 	if err != nil {
-		return 0
+		if os.IsNotExist(err) {
+			return 0
+		}
+		return -1
 	}
 	return len(entries)
 }
@@ -245,13 +255,17 @@ func (fs *Dat9FS) hasLayerOverlayState() bool {
 		len(fs.layerDirs) > 0 || len(fs.layerSymlinks) > 0
 }
 
-// journalFrameCount returns the number of uncommitted frames in the journal.
-// It reads the journal file directly via os.ReadFile. This assumes the caller
-// has already drained (Drain + journal Fsync) before preflight, so all
-// buffered writes are on disk. If called without a prior drain, buffered
-// writes not yet flushed could be missed.
-func journalFrameCount(j *Journal) int {
-	if j == nil || j.path == "" {
+// UncommittedFrameCount returns the number of uncommitted frames in the
+// journal. It acquires j.mu to prevent races with concurrent Append calls.
+//
+// This assumes the caller has already drained (Drain + Fsync) before
+// preflight, so all buffered writes are on disk. If called without a prior
+// drain, buffered writes not yet flushed could be missed.
+func (j *Journal) UncommittedFrameCount() int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	if j.path == "" {
 		return 0
 	}
 	data, err := os.ReadFile(j.path)
