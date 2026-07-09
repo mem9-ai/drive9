@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResultForError(t *testing.T) {
@@ -48,6 +49,77 @@ func TestRecordTenantOperationCountDoesNotRecordDuration(t *testing.T) {
 	}
 	if strings.Contains(text, `drive9_service_operation_duration_seconds_count{component="`+component+`",operation="`+operation+`",result="ok",tenant_id="tenant-a"}`) {
 		t.Fatalf("counter-only operation unexpectedly recorded a duration:\n%s", text)
+	}
+}
+
+func TestRecordTenantPoolMetadataResumeWaitIncludesPoolAndOrganizationID(t *testing.T) {
+	const poolID = "pool-metadata-resume-metrics-test"
+	const organizationID = "org-metadata-resume-metrics-test"
+
+	RecordTenantPoolMetadataResumeWait(poolID, organizationID, "group", "ok", 10*time.Minute)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_tenant_pool_metadata_resume_wait_total{organization_id="`+organizationID+`",pool_id="`+poolID+`",result="ok",scope="group"} 1`) {
+		t.Fatalf("missing tenant pool metadata resume wait total with pool_id and organization_id:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_pool_metadata_resume_wait_duration_seconds_count{organization_id="`+organizationID+`",pool_id="`+poolID+`",result="ok",scope="group"} 1`) {
+		t.Fatalf("missing tenant pool metadata resume wait duration with pool_id and organization_id:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_pool_metadata_resume_wait_duration_seconds_bucket{organization_id="`+organizationID+`",pool_id="`+poolID+`",result="ok",scope="group",le="480"} 0`) {
+		t.Fatalf("missing 480s tenant pool metadata resume wait duration bucket:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_pool_metadata_resume_wait_duration_seconds_bucket{organization_id="`+organizationID+`",pool_id="`+poolID+`",result="ok",scope="group",le="600"} 1`) {
+		t.Fatalf("missing 600s tenant pool metadata resume wait duration bucket:\n%s", text)
+	}
+}
+
+func TestRecordHTTPRequestIncludesLongWriteLatencyBuckets(t *testing.T) {
+	const route = "/v1/fs/http-long-bucket-test"
+
+	RecordHTTPRequest("POST", route, 200, 25*time.Second)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_http_request_duration_seconds_bucket{method="POST",route="`+route+`",le="20"} 0`) {
+		t.Fatalf("missing 20s HTTP duration bucket:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_http_request_duration_seconds_bucket{method="POST",route="`+route+`",le="30"} 1`) {
+		t.Fatalf("missing 30s HTTP duration bucket:\n%s", text)
+	}
+}
+
+func TestRecordOperationIncludesLongAdminTenantPoolUpdateBuckets(t *testing.T) {
+	RecordOperation("admin_tenant_pool", "update", "ok", 5*time.Minute)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_service_operation_duration_seconds_bucket{component="admin_tenant_pool",operation="update",result="ok",le="300"} 1`) {
+		t.Fatalf("missing 300s service operation duration bucket:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_service_operation_duration_seconds_bucket{component="admin_tenant_pool",operation="update",result="ok",le="600"} 1`) {
+		t.Fatalf("missing 600s service operation duration bucket:\n%s", text)
+	}
+}
+
+func TestRecordTenantPoolCapacityIncludesPoolOrganizationAndState(t *testing.T) {
+	const poolID = "pool-capacity-metrics-test"
+	const organizationID = "org-capacity-metrics-test"
+
+	RecordTenantPoolCapacity(poolID, organizationID, "size", 10)
+	RecordTenantPoolCapacity(poolID, organizationID, "free", 1)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_tenant_pool_capacity{organization_id="`+organizationID+`",pool_id="`+poolID+`",state="size"} 10`) {
+		t.Fatalf("missing tenant pool size capacity gauge:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_pool_capacity{organization_id="`+organizationID+`",pool_id="`+poolID+`",state="free"} 1`) {
+		t.Fatalf("missing tenant pool free capacity gauge:\n%s", text)
 	}
 }
 

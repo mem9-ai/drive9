@@ -12,8 +12,9 @@ import (
 	"time"
 )
 
-var operationDurationBounds = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
-var httpDurationBounds = []float64{0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10}
+var operationDurationBounds = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600}
+var httpDurationBounds = []float64{0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10, 15, 20, 30, 60}
+var tenantPoolMetadataResumeWaitDurationBounds = []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 240, 480, 600, 900, 1200}
 
 // sseConnectionDurationBounds covers SSE connection lifetimes, which can
 // range from sub-second probes to long-lived mounts. Buckets extend well
@@ -45,6 +46,9 @@ var tenantMeter = globalMeterProvider.Meter("tenant")
 var serviceOperationsTotal = serviceMeter.Int64Counter("drive9_service_operations_total", "Service operations by component/operation/result")
 var serviceOperationDuration = serviceMeter.Float64Histogram("drive9_service_operation_duration_seconds", "Service operation duration histogram", operationDurationBounds)
 var serviceGauge = serviceMeter.Float64Gauge("drive9_service_gauge", "Service gauges by component/name")
+var tenantPoolMetadataResumeWaitTotal = serviceMeter.Int64Counter("drive9_tenant_pool_metadata_resume_wait_total", "Tenant pool metadata resume wait attempts by pool_id/organization_id/scope/result")
+var tenantPoolMetadataResumeWaitDuration = serviceMeter.Float64Histogram("drive9_tenant_pool_metadata_resume_wait_duration_seconds", "Tenant pool metadata resume wait duration by pool_id/organization_id/scope/result", tenantPoolMetadataResumeWaitDurationBounds)
+var tenantPoolCapacity = serviceMeter.Float64Gauge("drive9_tenant_pool_capacity", "Tenant pool capacity by pool_id/organization_id/state")
 
 var httpRequestsTotal = httpMeter.Int64Counter("drive9_http_requests_total", "Total HTTP requests by method/route/status")
 var httpRequestDuration = httpMeter.Float64Histogram("drive9_http_request_duration_seconds", "HTTP request duration histogram by method/route", httpDurationBounds)
@@ -119,6 +123,30 @@ func RecordTenantOperation(tenantID, component, operation, result string, d time
 	}
 	serviceOperationsTotal.Add(1, attrs...)
 	serviceOperationDuration.Observe(d.Seconds(), attrs...)
+}
+
+func RecordTenantPoolMetadataResumeWait(poolID, organizationID, scope, result string, d time.Duration) {
+	poolID = cleanMetricValue(poolID, "unknown")
+	organizationID = cleanMetricValue(organizationID, "unknown")
+	scope = cleanMetricValue(scope, "unknown")
+	result = cleanMetricValue(result, "unknown")
+	attrs := []Attribute{
+		Attr("pool_id", poolID),
+		Attr("organization_id", organizationID),
+		Attr("scope", scope),
+		Attr("result", result),
+	}
+	tenantPoolMetadataResumeWaitTotal.Add(1, attrs...)
+	tenantPoolMetadataResumeWaitDuration.Observe(d.Seconds(), attrs...)
+}
+
+func RecordTenantPoolCapacity(poolID, organizationID, state string, value float64) {
+	RegisterModule("admin_tenant_pool")
+	tenantPoolCapacity.Set(value,
+		Attr("pool_id", cleanMetricValue(poolID, "unknown")),
+		Attr("organization_id", cleanMetricValue(organizationID, "unknown")),
+		Attr("state", cleanMetricValue(state, "unknown")),
+	)
 }
 
 // ResultForError returns a stable metric result label for common infrastructure

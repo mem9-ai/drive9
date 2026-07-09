@@ -181,6 +181,15 @@ func execSchemaStatement(ctx context.Context, db *sql.DB, stmt string, index, co
 				zap.Error(err))
 			return nil
 		}
+		if IsTransientSchemaError(err) {
+			logger.Warn(ctx, "schema_statement_exec_retryable_failed",
+				zap.Int("statement_index", index),
+				zap.Int("statement_count", count),
+				zap.String("statement", snippet),
+				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
+				zap.Error(err))
+			return fmt.Errorf("exec %q: %w", snippet, err)
+		}
 		logger.Error(ctx, "schema_statement_exec_failed",
 			zap.Int("statement_index", index),
 			zap.Int("statement_count", count),
@@ -230,6 +239,15 @@ func ExecOptionalSchemaStatements(ctx context.Context, db *sql.DB, stmts []strin
 					zap.Error(err))
 				continue
 			}
+			if IsTransientSchemaError(err) {
+				logger.Warn(ctx, "optional_schema_statement_exec_retryable_failed",
+					zap.Int("statement_index", i+1),
+					zap.Int("statement_count", len(stmts)),
+					zap.String("statement", snippet),
+					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
+					zap.Error(err))
+				return skipped, fmt.Errorf("exec optional %q: %w", snippet, err)
+			}
 			logger.Error(ctx, "optional_schema_statement_exec_failed",
 				zap.Int("statement_index", i+1),
 				zap.Int("statement_count", len(stmts)),
@@ -250,6 +268,32 @@ func ExecOptionalSchemaStatements(ctx context.Context, db *sql.DB, stmts []strin
 func HasMultiStatements(dsn string) bool {
 	lower := strings.ToLower(dsn)
 	return strings.Contains(lower, "multistatements=true") || strings.Contains(lower, "multistatements=1")
+}
+
+// IsBenignSchemaError reports idempotent DDL errors that can arise when two
+// schema initializers race and one has already applied the same change.
+func IsBenignSchemaError(err error) bool {
+	return isIgnorableSchemaError(err)
+}
+
+// IsTransientSchemaError reports retryable TiDB DDL metadata races.
+func IsTransientSchemaError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 8028 {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "information schema is changed during the execution of the statement") ||
+		strings.Contains(msg, "[try again later]")
+}
+
+// IsExpectedSchemaInitRetryError reports schema init failures that are noisy
+// but expected during concurrent or eventually consistent DDL setup.
+func IsExpectedSchemaInitRetryError(err error) bool {
+	return IsBenignSchemaError(err) || IsTransientSchemaError(err)
 }
 
 func isIgnorableSchemaError(err error) bool {

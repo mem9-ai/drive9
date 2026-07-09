@@ -236,6 +236,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 					zap.Error(err))
 			}
 		}
+		s.recordTenantPoolCapacity(poolID, orgID, *req.PoolSize, freeSize)
 		writeJSON(w, http.StatusAccepted, adminTenantPoolResponse{
 			PoolID:         poolID,
 			OrganizationID: orgID,
@@ -280,6 +281,7 @@ func (s *Server) handleAdminTenantPoolGet(w http.ResponseWriter, r *http.Request
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.recordTenantPoolCapacity(pool.PoolID, pool.OrganizationID, pool.Size, freeSize)
 	writeJSON(w, http.StatusOK, adminTenantPoolResponse{
 		PoolID:         pool.PoolID,
 		OrganizationID: pool.OrganizationID,
@@ -459,6 +461,7 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 			FreeSize:       freeSize,
 			Status:         adminTenantPoolDisplayStatus(pool.Status, freeSize, slotSize),
 		}
+		s.recordTenantPoolCapacity(pool.PoolID, pool.OrganizationID, targetSize, freeSize)
 		return nil
 	}); err != nil {
 		metricResult = adminTenantPoolMetricResult(err)
@@ -610,6 +613,7 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 		"free_size", 0,
 		"status", meta.TenantPoolDeleting,
 		"duration_ms", durationMillis(deleteStarted))...)
+	s.recordTenantPoolCapacity(pool.PoolID, pool.OrganizationID, 0, 0)
 	writeJSON(w, http.StatusAccepted, out)
 }
 
@@ -645,6 +649,35 @@ func (s *Server) tenantPoolSizes(ctx context.Context, organizationID string) (in
 		return 0, 0, fmt.Errorf("tenant pool slot size lookup failed")
 	}
 	return freeSize, slotSize, nil
+}
+
+func (s *Server) recordTenantPoolCapacity(poolID, organizationID string, size, freeSize int) {
+	if poolID == "" || organizationID == "" {
+		return
+	}
+	if size < 0 {
+		size = 0
+	}
+	if freeSize < 0 {
+		freeSize = 0
+	}
+	metrics.RecordTenantPoolCapacity(poolID, organizationID, "size", float64(size))
+	metrics.RecordTenantPoolCapacity(poolID, organizationID, "free", float64(freeSize))
+}
+
+func (s *Server) refreshTenantPoolCapacity(ctx context.Context, pool *meta.TenantPool) {
+	if s == nil || s.meta == nil || pool == nil || pool.OrganizationID == "" {
+		return
+	}
+	freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, pool.OrganizationID)
+	if err != nil {
+		logger.Warn(ctx, "admin_tenant_pool_capacity_refresh_failed",
+			zap.String("pool_id", pool.PoolID),
+			zap.String("organization_id", pool.OrganizationID),
+			zap.Error(err))
+		return
+	}
+	s.recordTenantPoolCapacity(pool.PoolID, pool.OrganizationID, pool.Size, freeSize)
 }
 
 func (s *Server) firstManagedOrganization(ctx context.Context, cred tenant.CredentialProvisionRequest) (string, error) {
@@ -985,9 +1018,19 @@ func (s *Server) startPoolClustersMetadataResume(ctx context.Context, poolID str
 }
 
 func (s *Server) resumePoolClustersMetadataGroups(ctx context.Context, started time.Time, poolID string, clusters []*tenant.ClusterInfo, cred tenant.CredentialProvisionRequest) {
+	waitStarted := time.Now()
 	groups := poolMetadataResumeGroups(clusters, tenantPoolMetadataResumeGroupSize)
 	if len(groups) == 0 {
 		return
+	}
+	overallResult := "ok"
+	var overallMu sync.Mutex
+	recordGroupResult := func(result string) {
+		overallMu.Lock()
+		defer overallMu.Unlock()
+		if adminTenantPoolMetadataResumeResultRank(result) > adminTenantPoolMetadataResumeResultRank(overallResult) {
+			overallResult = result
+		}
 	}
 	var wg sync.WaitGroup
 	for i, group := range groups {
@@ -996,7 +1039,13 @@ func (s *Server) resumePoolClustersMetadataGroups(ctx context.Context, started t
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			groupStarted := time.Now()
 			updated, err := s.waitForPoolClustersMetadata(ctx, group, cred)
+			groupResult := metrics.ResultForError(err)
+			groupDuration := time.Since(groupStarted)
+			metrics.RecordOperation(adminTenantPoolMetricsComponent, "metadata_resume_group_wait", groupResult, groupDuration)
+			metrics.RecordTenantPoolMetadataResumeWait(poolID, poolResumeOrganizationID(group), "group", groupResult, groupDuration)
+			recordGroupResult(groupResult)
 			if err != nil {
 				logger.Warn(ctx, "admin_tenant_pool_metadata_resume_batch_failed",
 					zap.String("pool_id", poolID),
@@ -1013,6 +1062,26 @@ func (s *Server) resumePoolClustersMetadataGroups(ctx context.Context, started t
 		}()
 	}
 	wg.Wait()
+	waitDuration := time.Since(waitStarted)
+	metrics.RecordOperation(adminTenantPoolMetricsComponent, "metadata_resume_wait", overallResult, waitDuration)
+	metrics.RecordTenantPoolMetadataResumeWait(poolID, poolResumeOrganizationID(clusters), "batch", overallResult, waitDuration)
+}
+
+func adminTenantPoolMetadataResumeResultRank(result string) int {
+	switch result {
+	case "ok":
+		return 0
+	case "canceled":
+		return 1
+	case "deadline_exceeded":
+		return 2
+	case "bad_conn":
+		return 3
+	case "error":
+		return 4
+	default:
+		return 4
+	}
 }
 
 func poolMetadataResumeGroups(clusters []*tenant.ClusterInfo, groupSize int) [][]*tenant.ClusterInfo {
@@ -1050,6 +1119,18 @@ func poolResumeClusterIDs(clusters []*tenant.ClusterInfo) []string {
 		out = append(out, strings.TrimSpace(cluster.ClusterID))
 	}
 	return out
+}
+
+func poolResumeOrganizationID(clusters []*tenant.ClusterInfo) string {
+	for _, cluster := range clusters {
+		if cluster == nil {
+			continue
+		}
+		if orgID := strings.TrimSpace(cluster.OrganizationID); orgID != "" {
+			return orgID
+		}
+	}
+	return ""
 }
 
 func compactPoolResumeClusters(clusters []*tenant.ClusterInfo) []*tenant.ClusterInfo {
@@ -1404,6 +1485,7 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 				metricResult = "skipped"
 				return nil
 			}
+			defer s.refreshTenantPoolCapacity(ctx, current)
 			slotSize, err := s.meta.CountTenantPoolFreeSlots(ctx, current.OrganizationID)
 			if err != nil {
 				logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
@@ -1473,6 +1555,7 @@ func (s *Server) pendingTenantPoolResumeClusters(ctx context.Context, poolID str
 			continue
 		}
 		cluster := clusterInfoFromTenant(&row.Tenant)
+		cluster.OrganizationID = row.Binding.OrganizationID
 		cluster.Password = string(plainPass)
 		clusters = append(clusters, cluster)
 	}
@@ -1538,6 +1621,7 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_skipped", "provider", tenant.ProviderTiDBCloudNative, "pool_id", pool.PoolID, "organization_id", orgID, "reason", "pool_inactive", "pool_status", pool.Status, "duration_ms", durationMillis(claimStarted))...)
 		return nil, nil, false, nil
 	}
+	defer s.refreshTenantPoolCapacity(ctx, pool)
 	s.resumePendingTenantPoolAsync(ctx, pool, cred)
 	stageStarted = time.Now()
 	row, err := s.meta.ClaimOldestFreeTenantPoolBinding(ctx, orgID)

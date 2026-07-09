@@ -5366,8 +5366,11 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 				return
 			}
 			s.schemaInitErrors.Store(tenantID, schemaInitStatusErrorMessage(err))
-			logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", err)...)
-			if s.metrics != nil {
+			expectedRetryErr := tenantschema.IsExpectedSchemaInitRetryError(err)
+			if !expectedRetryErr {
+				logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", err)...)
+			}
+			if s.metrics != nil && !expectedRetryErr {
 				s.metrics.recordEvent(tenantID, "tenant_schema_init", "provider", provider, "result", "error")
 			}
 			remaining := time.Until(deadline)
@@ -5380,7 +5383,15 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 						zap.String("provider", provider),
 						zap.String("reason", "status_changed"))
 				}
-				logger.Error(ctx, "schema_init_retry_exhausted", zap.String("tenant_id", tenantID), zap.Error(err))
+				if expectedRetryErr {
+					logger.Warn(ctx, "schema_init_retry_exhausted",
+						zap.String("tenant_id", tenantID),
+						zap.String("provider", provider),
+						zap.Int("attempt", attempt),
+						zap.Error(err))
+				} else {
+					logger.Error(ctx, "schema_init_retry_exhausted", zap.String("tenant_id", tenantID), zap.Error(err))
+				}
 				return
 			}
 			logger.Warn(ctx, "schema_init_attempt_failed",
@@ -5388,6 +5399,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 				zap.String("provider", provider),
 				zap.Int("attempt", attempt),
 				zap.String("remaining", remaining.Round(time.Second).String()),
+				zap.Bool("business_event_recorded", !expectedRetryErr),
 				zap.Error(err),
 			)
 		}
