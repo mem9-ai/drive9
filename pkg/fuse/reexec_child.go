@@ -82,8 +82,14 @@ func ReexecChildHandshake(cfg ReexecChildConfig) (fd int, conn *net.UnixConn, er
 // message back to the parent through parentConn.
 //
 // On success, the returned server is already serving in a background
-// goroutine. On failure, the server is stopped (fd closed) and an error
-// is returned.
+// goroutine. On failure, an error is returned and the caller should exit
+// the process (the OS will close the fd and stop the Serve goroutine).
+//
+// IMPORTANT: failure paths must NOT call server.Unmount() because the
+// server was created via ImportFd (not Mount). Unmount() would call
+// fusermount -u, destroying the parent's mount and preventing rollback.
+// Instead, we let the child process exit — the OS closes the fd, which
+// causes Serve() to get EBADF/ENODEV and exit its read loop.
 func ReexecChildImportAndServe(fd int, mountPoint string, rawFS gofuse.RawFileSystem, opts *gofuse.MountOptions, parentConn *net.UnixConn) (*gofuse.Server, error) {
 	server, err := gofuse.ImportFd(rawFS, mountPoint, fd, opts)
 	if err != nil {
@@ -92,11 +98,7 @@ func ReexecChildImportAndServe(fd int, mountPoint string, rawFS gofuse.RawFileSy
 	}
 
 	// Start serving in background. Serve() will close the fd when it exits.
-	serveDone := make(chan struct{})
-	go func() {
-		server.Serve()
-		close(serveDone)
-	}()
+	go server.Serve()
 
 	// Probe the mount point to verify the FUSE connection is working.
 	// The probe stat is queued by the kernel until Serve() starts reading
@@ -111,14 +113,9 @@ func ReexecChildImportAndServe(fd int, mountPoint string, rawFS gofuse.RawFileSy
 	select {
 	case err := <-probeDone:
 		if err != nil {
-			// Probe failed — close the fd so Serve() exits, then wait.
-			_ = server.Unmount()
-			<-serveDone
 			return nil, fmt.Errorf("reexec child: mount probe failed: %w", err)
 		}
 	case <-time.After(10 * time.Second):
-		_ = server.Unmount()
-		<-serveDone
 		return nil, fmt.Errorf("reexec child: mount probe timed out after 10s")
 	}
 
@@ -128,8 +125,6 @@ func ReexecChildImportAndServe(fd int, mountPoint string, rawFS gofuse.RawFileSy
 		Version: ReexecProtocolVersion,
 	}
 	if err := json.NewEncoder(parentConn).Encode(&msg); err != nil {
-		_ = server.Unmount()
-		<-serveDone
 		return nil, fmt.Errorf("reexec child: send accept: %w", err)
 	}
 
