@@ -70,7 +70,7 @@ func ReexecChildHandshake(cfg ReexecChildConfig) (fd int, conn *net.UnixConn, er
 	unixConn := rawConn.(*net.UnixConn)
 	fd, err = recvFd(unixConn)
 	if err != nil {
-		unixConn.Close()
+		_ = unixConn.Close()
 		return -1, nil, fmt.Errorf("reexec child: receive fd: %w", err)
 	}
 
@@ -87,7 +87,7 @@ func ReexecChildHandshake(cfg ReexecChildConfig) (fd int, conn *net.UnixConn, er
 func ReexecChildImportAndServe(fd int, mountPoint string, rawFS gofuse.RawFileSystem, opts *gofuse.MountOptions, parentConn *net.UnixConn) (*gofuse.Server, error) {
 	server, err := gofuse.ImportFd(rawFS, mountPoint, fd, opts)
 	if err != nil {
-		syscall.Close(fd)
+		_ = syscall.Close(fd)
 		return nil, fmt.Errorf("reexec child: import fd: %w", err)
 	}
 
@@ -112,12 +112,12 @@ func ReexecChildImportAndServe(fd int, mountPoint string, rawFS gofuse.RawFileSy
 	case err := <-probeDone:
 		if err != nil {
 			// Probe failed — close the fd so Serve() exits, then wait.
-			server.Unmount()
+			_ = server.Unmount()
 			<-serveDone
 			return nil, fmt.Errorf("reexec child: mount probe failed: %w", err)
 		}
 	case <-time.After(10 * time.Second):
-		server.Unmount()
+		_ = server.Unmount()
 		<-serveDone
 		return nil, fmt.Errorf("reexec child: mount probe timed out after 10s")
 	}
@@ -128,7 +128,7 @@ func ReexecChildImportAndServe(fd int, mountPoint string, rawFS gofuse.RawFileSy
 		Version: ReexecProtocolVersion,
 	}
 	if err := json.NewEncoder(parentConn).Encode(&msg); err != nil {
-		server.Unmount()
+		_ = server.Unmount()
 		<-serveDone
 		return nil, fmt.Errorf("reexec child: send accept: %w", err)
 	}

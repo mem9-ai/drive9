@@ -73,5 +73,5 @@ func TestSendRecvFd(t *testing.T) {
 	if got := string(buf[:n]); got != "hello fd" {
 		t.Fatalf("read content: want %q, got %q", "hello fd", got)
 	}
-	tmpFile.Close()
+	_ = tmpFile.Close()
 }
