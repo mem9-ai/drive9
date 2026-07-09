@@ -166,3 +166,35 @@ func TestReexecChildEnvMissingVersion(t *testing.T) {
 		t.Fatal("expected error for missing DRIVE9_REEXEC_VERSION")
 	}
 }
+
+func TestReexecChildModeDetection(t *testing.T) {
+	// Verify IsReexecChild gates the child path.
+	if IsReexecChild() {
+		t.Fatal("should not be reexec child without env vars")
+	}
+
+	t.Setenv("DRIVE9_REEXEC_SOCK", "/tmp/reexec.sock")
+	if !IsReexecChild() {
+		t.Fatal("should be reexec child when DRIVE9_REEXEC_SOCK is set")
+	}
+}
+
+func TestReexecProtocolVersionConsistency(t *testing.T) {
+	// Verify that the protocol version constant is used consistently in
+	// accept messages and child config parsing.
+	if ReexecProtocolVersion < 1 {
+		t.Fatal("ReexecProtocolVersion must be >= 1")
+	}
+	msg := reexecAcceptMsg{Accept: true, Version: ReexecProtocolVersion}
+	data, err := json.Marshal(&msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded reexecAcceptMsg
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Version != ReexecProtocolVersion {
+		t.Fatalf("version mismatch after round-trip: want %d, got %d", ReexecProtocolVersion, decoded.Version)
+	}
+}
