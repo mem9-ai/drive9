@@ -2,8 +2,13 @@ package meta
 
 import (
 	"context"
+	"errors"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 func TestDefaultMaxStorageBytesDefault(t *testing.T) {
@@ -223,5 +228,72 @@ func TestAtomicReserveAndInsertUploadBootstrapsUsageRow(t *testing.T) {
 	}
 	if reservation.Status != "active" || reservation.ReservedBytes != 40 || reservation.FileCountDelta != 1 {
 		t.Fatalf("reservation = %+v, want active reserved=40", reservation)
+	}
+}
+
+func TestRetryMetaLockConflictRetriesDeadlock(t *testing.T) {
+	var calls int
+	err := retryMetaLockConflict(context.Background(), "tenant-retry-metric", "reserve_upload", "test_op", func() error {
+		calls++
+		if calls < 3 {
+			return errors.New("Error 1213 (40001): Deadlock found when trying to get lock; try restarting transaction")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryMetaLockConflict returned error: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("calls = %d, want 3", calls)
+	}
+
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	if !strings.Contains(rec.Body.String(), `drive9_service_operations_total{component="central_quota",operation="reserve_upload",result="lock_conflict_retry",tenant_id="tenant-retry-metric"} 2`) {
+		t.Fatalf("missing lock conflict retry metric:\n%s", rec.Body.String())
+	}
+}
+
+func TestRetryMetaLockConflictDoesNotRetryBusinessError(t *testing.T) {
+	var calls int
+	err := retryMetaLockConflict(context.Background(), "tenant-business-error", "reserve_upload", "test_op", func() error {
+		calls++
+		return ErrStorageQuotaExceeded
+	})
+	if !errors.Is(err, ErrStorageQuotaExceeded) {
+		t.Fatalf("err = %v, want ErrStorageQuotaExceeded", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1", calls)
+	}
+}
+
+func TestRetryMetaLockConflictExhaustedReturnsBusy(t *testing.T) {
+	var calls int
+	err := retryMetaLockConflict(context.Background(), "tenant-busy", "reserve_upload", "test_op", func() error {
+		calls++
+		return errors.New("Error 1213 (40001): Deadlock found when trying to get lock; try restarting transaction")
+	})
+	if !errors.Is(err, ErrQuotaReservationBusy) {
+		t.Fatalf("err = %v, want ErrQuotaReservationBusy", err)
+	}
+	if calls != metaLockConflictRetryAttempts {
+		t.Fatalf("calls = %d, want %d", calls, metaLockConflictRetryAttempts)
+	}
+}
+
+func TestRetryMetaLockConflictHonorsContextDuringBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls int
+	err := retryMetaLockConflict(ctx, "tenant-canceled", "reserve_upload", "test_op", func() error {
+		calls++
+		cancel()
+		return errors.New("SQLSTATE 40001 serialization failure")
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1", calls)
 	}
 }

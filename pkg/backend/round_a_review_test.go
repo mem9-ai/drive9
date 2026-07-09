@@ -144,6 +144,20 @@ func TestRoundA_Fix1_ReserveUploadOnServer_NoLeakOnInsertFailure(t *testing.T) {
 	}
 }
 
+func TestReserveUploadOnServer_BusyFailOpensWithoutLeak(t *testing.T) {
+	b, fake := newCentralQuotaBackend(t)
+	fake.insertReservationErr = ErrQuotaReservationBusy
+
+	reserved, err := b.reserveUploadOnServer(context.Background(), "u1", "/a", 100, 0)
+	if reserved || err != nil {
+		t.Fatalf("busy fail-open path: reserved=%v err=%v, want (false, nil)", reserved, err)
+	}
+	u, _ := fake.GetQuotaUsage(context.Background(), "tenant-a")
+	if u.ReservedBytes != 0 {
+		t.Fatalf("reserved_bytes = %d after busy reserve, want 0", u.ReservedBytes)
+	}
+}
+
 func TestRoundA_Fix1_ReserveUploadOnServer_DuplicateIsIdempotent(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
 

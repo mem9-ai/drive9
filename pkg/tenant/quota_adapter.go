@@ -135,6 +135,8 @@ func (a *metaQuotaAdapter) AtomicReserveAndInsertUpload(ctx context.Context, r *
 		return backend.ErrFileCountQuotaExceeded
 	case errors.Is(err, meta.ErrReservationAlreadyExists):
 		return backend.ErrReservationAlreadyExists
+	case errors.Is(err, meta.ErrQuotaReservationBusy):
+		return backend.ErrQuotaReservationBusy
 	}
 	return err
 }

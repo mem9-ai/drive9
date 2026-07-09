@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"go.uber.org/zap"
 )
 
@@ -467,6 +469,11 @@ func SetDefaultMaxFileSizeBytes(bytes int64) {
 // DefaultMaxFileSizeBytes returns the configured per-tenant fallback file size quota.
 func DefaultMaxFileSizeBytes() int64 { return defaultMaxFileSizeBytes.Load() }
 
+const (
+	metaLockConflictRetryAttempts = 4
+	metaLockConflictRetryBase     = 20 * time.Millisecond
+)
+
 // AtomicReserveAndInsertUpload claims reserved_bytes and inserts the reservation
 // tracking row inside a single server DB transaction. This is the correct API
 // for the upload-initiate path: either both rows are written, or neither is.
@@ -486,7 +493,14 @@ func (s *Store) AtomicReserveAndInsertUpload(ctx context.Context, r *UploadReser
 	var err error
 	defer observeMeta(ctx, "atomic_reserve_and_insert_upload", start, &err)
 
-	err = s.InTx(ctx, func(tx *sql.Tx) error {
+	err = retryMetaLockConflict(ctx, r.TenantID, "reserve_upload", "atomic_reserve_and_insert_upload", func() error {
+		return s.atomicReserveAndInsertUploadOnce(ctx, r)
+	})
+	return err
+}
+
+func (s *Store) atomicReserveAndInsertUploadOnce(ctx context.Context, r *UploadReservation) error {
+	return s.InTx(ctx, func(tx *sql.Tx) error {
 		if _, execErr := tx.ExecContext(ctx,
 			`INSERT IGNORE INTO tenant_quota_usage (tenant_id) VALUES (?)`,
 			r.TenantID); execErr != nil {
@@ -526,7 +540,43 @@ func (s *Store) AtomicReserveAndInsertUpload(ctx context.Context, r *UploadReser
 		}
 		return nil
 	})
-	return err
+}
+
+func retryMetaLockConflict(ctx context.Context, tenantID, metricOperation, logOperation string, fn func() error) error {
+	var lastErr error
+	for attempt := 1; attempt <= metaLockConflictRetryAttempts; attempt++ {
+		err := fn()
+		if err == nil || !isMetaLockConflictError(err) {
+			return err
+		}
+		lastErr = err
+		if attempt == metaLockConflictRetryAttempts {
+			break
+		}
+		logger.Warn(ctx, "meta_lock_conflict_retry",
+			zap.String("operation", logOperation),
+			zap.Int("attempt", attempt),
+			zap.Error(err))
+		metrics.RecordTenantOperationCount(tenantID, "central_quota", metricOperation, "lock_conflict_retry")
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * metaLockConflictRetryBase):
+		}
+	}
+	return fmt.Errorf("%w: %v", ErrQuotaReservationBusy, lastErr)
+}
+
+func isMetaLockConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Deadlock found") ||
+		strings.Contains(msg, "Error 1213") ||
+		strings.Contains(msg, "40001") ||
+		strings.Contains(msg, "Lock wait timeout exceeded") ||
+		strings.Contains(msg, "Error 1205")
 }
 
 func (s *Store) uploadReservationQuotaErrorTx(ctx context.Context, tx *sql.Tx, r *UploadReservation) error {
