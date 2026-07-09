@@ -144,7 +144,7 @@ func (fs *Dat9FS) Reexec(cfg ReexecConfig) ReexecResult {
 	}
 	defer func() {
 		// Close our dup if we didn't hand it off successfully.
-		syscall.Close(fd)
+		_ = syscall.Close(fd)
 	}()
 
 	// Step 6: create Unix socket and spawn child.
@@ -152,14 +152,14 @@ func (fs *Dat9FS) Reexec(cfg ReexecConfig) ReexecResult {
 	if err != nil {
 		return ReexecResult{Err: fmt.Errorf("reexec: create temp dir: %w", err)}
 	}
-	defer os.RemoveAll(sockDir)
+	defer func() { _ = os.RemoveAll(sockDir) }()
 	sockPath := filepath.Join(sockDir, "reexec.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
 		return ReexecResult{Err: fmt.Errorf("reexec: listen: %w", err)}
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	// Spawn the child process with reexec-specific env vars.
 	// os.Args[1:] is passed through intentionally — the child's main()
@@ -188,41 +188,41 @@ func (fs *Dat9FS) Reexec(cfg ReexecConfig) ReexecResult {
 
 	// Step 7: accept connection from child and send fd.
 	acceptDeadline := time.Now().Add(cfg.acceptTimeout())
-	listener.(*net.UnixListener).SetDeadline(acceptDeadline)
+	_ = listener.(*net.UnixListener).SetDeadline(acceptDeadline)
 
 	conn, err := listener.Accept()
 	if err != nil {
-		child.Process.Kill()
+		_ = child.Process.Kill()
 		<-childDone
 		return ReexecResult{Err: fmt.Errorf("reexec: accept connection: %w", err)}
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	unixConn := conn.(*net.UnixConn)
 	if err := sendFd(unixConn, fd); err != nil {
-		child.Process.Kill()
+		_ = child.Process.Kill()
 		<-childDone
 		return ReexecResult{Err: fmt.Errorf("reexec: send fd: %w", err)}
 	}
 
 	// Step 8: wait for accept message from child.
-	conn.SetReadDeadline(acceptDeadline)
+	_ = conn.SetReadDeadline(acceptDeadline)
 	decoder := json.NewDecoder(conn)
 	var msg reexecAcceptMsg
 	if err := decoder.Decode(&msg); err != nil {
-		child.Process.Kill()
+		_ = child.Process.Kill()
 		<-childDone
 		return ReexecResult{Err: fmt.Errorf("reexec: read accept: %w", err)}
 	}
 
 	if !msg.Accept {
-		child.Process.Kill()
+		_ = child.Process.Kill()
 		<-childDone
 		return ReexecResult{Err: fmt.Errorf("reexec: child rejected handoff")}
 	}
 
 	if msg.Version != ReexecProtocolVersion {
-		child.Process.Kill()
+		_ = child.Process.Kill()
 		<-childDone
 		return ReexecResult{Err: fmt.Errorf("reexec: protocol version mismatch: want %d, got %d", ReexecProtocolVersion, msg.Version)}
 	}
