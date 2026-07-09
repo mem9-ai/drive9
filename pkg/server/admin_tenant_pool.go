@@ -981,9 +981,19 @@ func (s *Server) startPoolClustersMetadataResume(ctx context.Context, poolID str
 }
 
 func (s *Server) resumePoolClustersMetadataGroups(ctx context.Context, started time.Time, poolID string, clusters []*tenant.ClusterInfo, cred tenant.CredentialProvisionRequest) {
+	waitStarted := time.Now()
 	groups := poolMetadataResumeGroups(clusters, tenantPoolMetadataResumeGroupSize)
 	if len(groups) == 0 {
 		return
+	}
+	overallResult := "ok"
+	var overallMu sync.Mutex
+	recordGroupResult := func(result string) {
+		overallMu.Lock()
+		defer overallMu.Unlock()
+		if overallResult == "ok" || result == "deadline_exceeded" || result == "canceled" {
+			overallResult = result
+		}
 	}
 	var wg sync.WaitGroup
 	for i, group := range groups {
@@ -992,7 +1002,11 @@ func (s *Server) resumePoolClustersMetadataGroups(ctx context.Context, started t
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			groupStarted := time.Now()
 			updated, err := s.waitForPoolClustersMetadata(ctx, group, cred)
+			groupResult := metrics.ResultForError(err)
+			metrics.RecordOperation(adminTenantPoolMetricsComponent, "metadata_resume_group_wait", groupResult, time.Since(groupStarted))
+			recordGroupResult(groupResult)
 			if err != nil {
 				logger.Warn(ctx, "admin_tenant_pool_metadata_resume_batch_failed",
 					zap.String("pool_id", poolID),
@@ -1009,6 +1023,7 @@ func (s *Server) resumePoolClustersMetadataGroups(ctx context.Context, started t
 		}()
 	}
 	wg.Wait()
+	metrics.RecordOperation(adminTenantPoolMetricsComponent, "metadata_resume_wait", overallResult, time.Since(waitStarted))
 }
 
 func poolMetadataResumeGroups(clusters []*tenant.ClusterInfo, groupSize int) [][]*tenant.ClusterInfo {
