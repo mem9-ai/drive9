@@ -45,6 +45,8 @@ var tenantMeter = globalMeterProvider.Meter("tenant")
 var serviceOperationsTotal = serviceMeter.Int64Counter("drive9_service_operations_total", "Service operations by component/operation/result")
 var serviceOperationDuration = serviceMeter.Float64Histogram("drive9_service_operation_duration_seconds", "Service operation duration histogram", operationDurationBounds)
 var serviceGauge = serviceMeter.Float64Gauge("drive9_service_gauge", "Service gauges by component/name")
+var tenantPoolMetadataResumeWaitTotal = serviceMeter.Int64Counter("drive9_tenant_pool_metadata_resume_wait_total", "Tenant pool metadata resume wait attempts by pool_id/organization_id/scope/result")
+var tenantPoolMetadataResumeWaitDuration = serviceMeter.Float64Histogram("drive9_tenant_pool_metadata_resume_wait_duration_seconds", "Tenant pool metadata resume wait duration by pool_id/organization_id/scope/result", operationDurationBounds)
 
 var httpRequestsTotal = httpMeter.Int64Counter("drive9_http_requests_total", "Total HTTP requests by method/route/status")
 var httpRequestDuration = httpMeter.Float64Histogram("drive9_http_request_duration_seconds", "HTTP request duration histogram by method/route", httpDurationBounds)
@@ -119,6 +121,21 @@ func RecordTenantOperation(tenantID, component, operation, result string, d time
 	}
 	serviceOperationsTotal.Add(1, attrs...)
 	serviceOperationDuration.Observe(d.Seconds(), attrs...)
+}
+
+func RecordTenantPoolMetadataResumeWait(poolID, organizationID, scope, result string, d time.Duration) {
+	poolID = cleanMetricValue(poolID, "unknown")
+	organizationID = cleanMetricValue(organizationID, "unknown")
+	scope = cleanMetricValue(scope, "unknown")
+	result = cleanMetricValue(result, "unknown")
+	attrs := []Attribute{
+		Attr("pool_id", poolID),
+		Attr("organization_id", organizationID),
+		Attr("scope", scope),
+		Attr("result", result),
+	}
+	tenantPoolMetadataResumeWaitTotal.Add(1, attrs...)
+	tenantPoolMetadataResumeWaitDuration.Observe(d.Seconds(), attrs...)
 }
 
 // ResultForError returns a stable metric result label for common infrastructure

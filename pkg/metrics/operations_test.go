@@ -51,6 +51,23 @@ func TestRecordTenantOperationCountDoesNotRecordDuration(t *testing.T) {
 	}
 }
 
+func TestRecordTenantPoolMetadataResumeWaitIncludesPoolAndOrganizationID(t *testing.T) {
+	const poolID = "pool-metadata-resume-metrics-test"
+	const organizationID = "org-metadata-resume-metrics-test"
+
+	RecordTenantPoolMetadataResumeWait(poolID, organizationID, "group", "ok", 0)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_tenant_pool_metadata_resume_wait_total{organization_id="`+organizationID+`",pool_id="`+poolID+`",result="ok",scope="group"} 1`) {
+		t.Fatalf("missing tenant pool metadata resume wait total with pool_id and organization_id:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_pool_metadata_resume_wait_duration_seconds_count{organization_id="`+organizationID+`",pool_id="`+poolID+`",result="ok",scope="group"} 1`) {
+		t.Fatalf("missing tenant pool metadata resume wait duration with pool_id and organization_id:\n%s", text)
+	}
+}
+
 func TestRecordDBOperationOmitsTenantID(t *testing.T) {
 	const tenantID = "tenant-db-operation-test"
 

@@ -1005,7 +1005,9 @@ func (s *Server) resumePoolClustersMetadataGroups(ctx context.Context, started t
 			groupStarted := time.Now()
 			updated, err := s.waitForPoolClustersMetadata(ctx, group, cred)
 			groupResult := metrics.ResultForError(err)
-			metrics.RecordOperation(adminTenantPoolMetricsComponent, "metadata_resume_group_wait", groupResult, time.Since(groupStarted))
+			groupDuration := time.Since(groupStarted)
+			metrics.RecordOperation(adminTenantPoolMetricsComponent, "metadata_resume_group_wait", groupResult, groupDuration)
+			metrics.RecordTenantPoolMetadataResumeWait(poolID, poolResumeOrganizationID(group), "group", groupResult, groupDuration)
 			recordGroupResult(groupResult)
 			if err != nil {
 				logger.Warn(ctx, "admin_tenant_pool_metadata_resume_batch_failed",
@@ -1023,7 +1025,9 @@ func (s *Server) resumePoolClustersMetadataGroups(ctx context.Context, started t
 		}()
 	}
 	wg.Wait()
-	metrics.RecordOperation(adminTenantPoolMetricsComponent, "metadata_resume_wait", overallResult, time.Since(waitStarted))
+	waitDuration := time.Since(waitStarted)
+	metrics.RecordOperation(adminTenantPoolMetricsComponent, "metadata_resume_wait", overallResult, waitDuration)
+	metrics.RecordTenantPoolMetadataResumeWait(poolID, poolResumeOrganizationID(clusters), "batch", overallResult, waitDuration)
 }
 
 func poolMetadataResumeGroups(clusters []*tenant.ClusterInfo, groupSize int) [][]*tenant.ClusterInfo {
@@ -1061,6 +1065,18 @@ func poolResumeClusterIDs(clusters []*tenant.ClusterInfo) []string {
 		out = append(out, strings.TrimSpace(cluster.ClusterID))
 	}
 	return out
+}
+
+func poolResumeOrganizationID(clusters []*tenant.ClusterInfo) string {
+	for _, cluster := range clusters {
+		if cluster == nil {
+			continue
+		}
+		if orgID := strings.TrimSpace(cluster.OrganizationID); orgID != "" {
+			return orgID
+		}
+	}
+	return ""
 }
 
 func compactPoolResumeClusters(clusters []*tenant.ClusterInfo) []*tenant.ClusterInfo {
@@ -1484,6 +1500,7 @@ func (s *Server) pendingTenantPoolResumeClusters(ctx context.Context, poolID str
 			continue
 		}
 		cluster := clusterInfoFromTenant(&row.Tenant)
+		cluster.OrganizationID = row.Binding.OrganizationID
 		cluster.Password = string(plainPass)
 		clusters = append(clusters, cluster)
 	}
