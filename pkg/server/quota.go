@@ -234,6 +234,9 @@ func (s *Server) validateQuotaSetRequest(req quotaRequest) error {
 	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit < 0 {
 		return fmt.Errorf("tidbcloud_spending_limit must be non-negative")
 	}
+	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit > 0 && *req.TiDBCloudSpendingLimit < 10 {
+		return fmt.Errorf("tidbcloud_spending_limit must be 0 or at least 10 RMB")
+	}
 	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit > maxInt32 {
 		return fmt.Errorf("tidbcloud_spending_limit is too large")
 	}
@@ -428,15 +431,13 @@ func quotaStorageBytesToSize(sizeBytes int64) int64 {
 const quotaBackendNotFoundMessage = "backend service exception; please check TiDB Cloud starter/native cluster status"
 
 func writeQuotaCredentialError(w http.ResponseWriter, ctx context.Context, err error, action string) {
-	switch {
-	case errors.Is(err, tenant.ErrQuotaPermissionDenied):
-		errJSON(w, http.StatusForbidden, "no permission to "+action+" quota with TiDB Cloud API key")
-	case errors.Is(err, tenant.ErrQuotaBackendNotFound):
+	if errors.Is(err, tenant.ErrQuotaBackendNotFound) {
 		errJSON(w, http.StatusNotFound, quotaBackendNotFoundMessage)
-	default:
-		logger.Warn(ctx, "tidbcloud_quota_failed", zap.String("action", action), zap.Error(err))
-		errJSON(w, http.StatusBadGateway, "tidbcloud quota "+action+" failed")
+		return
 	}
+	logger.Warn(ctx, "tidbcloud_quota_failed", zap.String("action", action), zap.Error(err))
+	status, msg := clientFacingErrorResponse(http.StatusBadGateway, "tidbcloud quota "+action+" failed", err)
+	errJSON(w, status, msg)
 }
 
 func writeQuotaSetError(w http.ResponseWriter, ctx context.Context, err error, action string) {

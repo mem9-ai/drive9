@@ -172,7 +172,8 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_started", "provider", tenant.ProviderTiDBCloudNative, "quota_requested", quotaOpt != nil)...)
 	if res, pool, claimed, err := s.claimAdminTenantFromPool(r.Context(), cred, quotaOpt); err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_failed", "provider", tenant.ProviderTiDBCloudNative, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
-		errJSON(w, http.StatusBadGateway, fmt.Sprintf("claim tenant pool tenant failed: %v", err))
+		status, msg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", err)
+		errJSON(w, status, msg)
 		return
 	} else if claimed {
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
@@ -409,7 +410,8 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 		if t.Status != meta.TenantDeleting {
 			_, _ = s.meta.UpdateTenantStatusIf(r.Context(), t.ID, meta.TenantDeleting, t.Status)
 		}
-		errJSON(w, http.StatusBadGateway, fmt.Sprintf("delete tenant cluster failed: %v", err))
+		status, msg := clientFacingErrorResponse(http.StatusBadGateway, "delete tenant cluster failed", err)
+		errJSON(w, status, msg)
 		return
 	}
 	_ = s.meta.AbortActiveUploadReservations(r.Context(), t.ID)
@@ -690,13 +692,11 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func writeAdminTiDBCloudError(w http.ResponseWriter, ctx context.Context, err error, action string) {
-	switch {
-	case errors.Is(err, tenant.ErrQuotaPermissionDenied):
-		errJSON(w, http.StatusForbidden, "no permission to "+action+" with TiDB Cloud API key")
-	case errors.Is(err, tenant.ErrQuotaBackendNotFound):
+	if errors.Is(err, tenant.ErrQuotaBackendNotFound) {
 		errJSON(w, http.StatusNotFound, quotaBackendNotFoundMessage)
-	default:
-		logger.Warn(ctx, "tidbcloud_admin_failed", zap.String("action", action), zap.Error(err))
-		errJSON(w, http.StatusBadGateway, "tidbcloud admin "+action+" failed")
+		return
 	}
+	logger.Warn(ctx, "tidbcloud_admin_failed", zap.String("action", action), zap.Error(err))
+	status, msg := clientFacingErrorResponse(http.StatusBadGateway, "tidbcloud admin "+action+" failed", err)
+	errJSON(w, status, msg)
 }

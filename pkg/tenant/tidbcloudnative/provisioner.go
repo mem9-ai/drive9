@@ -1254,6 +1254,9 @@ func validateTiDBCloudSpendingLimit(monthly int64) error {
 	if monthly < 0 {
 		return fmt.Errorf("tidbcloud_spending_limit must be non-negative")
 	}
+	if monthly > 0 && monthly < 10 {
+		return fmt.Errorf("tidbcloud_spending_limit must be 0 or at least 10 RMB")
+	}
 	if monthly > maxInt32 {
 		return fmt.Errorf("tidbcloud_spending_limit is too large")
 	}

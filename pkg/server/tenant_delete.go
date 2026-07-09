@@ -130,7 +130,8 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 		if t.Status != meta.TenantDeleting {
 			_, _ = s.meta.UpdateTenantStatusIf(r.Context(), t.ID, meta.TenantDeleting, t.Status)
 		}
-		errJSON(w, http.StatusBadGateway, fmt.Sprintf("delete tenant cluster failed: %v", err))
+		status, msg := clientFacingErrorResponse(http.StatusBadGateway, "delete tenant cluster failed", err)
+		errJSON(w, status, msg)
 		return
 	}
 

@@ -221,6 +221,38 @@ func (f *fakeProvisioner) ProvisionCallCount() int {
 	return int(f.provisionCalls.Load())
 }
 
+func TestClientFacingErrorResponseMapsTiDBCloudClientErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "invalid request",
+			err:        errors.New(`update cluster spending limit: tidbcloud native cluster spending limit update status 400: {"code":400,"message":"Scalable cluster can not set spending limit to 0."}`),
+			wantStatus: http.StatusBadRequest,
+			wantBody:   "Scalable cluster can not set spending limit to 0",
+		},
+		{
+			name:       "invalid api key",
+			err:        errors.New("list managed clusters: tidbcloud native cluster list status 401: invalid TiDB Cloud API key"),
+			wantStatus: http.StatusUnauthorized,
+			wantBody:   "invalid TiDB Cloud API key",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotStatus, gotMsg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", tc.err)
+			if gotStatus != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; msg=%s", gotStatus, tc.wantStatus, gotMsg)
+			}
+			if !strings.Contains(gotMsg, tc.wantBody) {
+				t.Fatalf("msg = %q, want containing %q", gotMsg, tc.wantBody)
+			}
+		})
+	}
+}
+
 func waitForDeprovisionCalls(t *testing.T, prov *fakeProvisioner, want int32) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

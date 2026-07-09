@@ -926,6 +926,7 @@ func TestQuotaSetRejectsInvalidQuotaValues(t *testing.T) {
 		{name: "file_size_above_server_max", field: "max_file_size", value: 10241, wantErr: "max_file_size must be less than or equal to server max upload size"},
 		{name: "negative_file_count", field: "max_file_count", value: -1, wantErr: "max_file_count must be non-negative"},
 		{name: "negative_spending_limit", field: "tidbcloud_spending_limit", value: -1, wantErr: "tidbcloud_spending_limit must be non-negative"},
+		{name: "small_spending_limit", field: "tidbcloud_spending_limit", value: 9, wantErr: "tidbcloud_spending_limit must be 0 or at least 10 RMB"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)

@@ -4411,7 +4411,8 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		if res, pool, claimed, err := s.claimAdminTenantFromPool(r.Context(), *credentialReq, quotaReq); err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_failed", "provider", provider, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", provisionTenantPoolClaimMetricResult(err))
-			errJSON(w, http.StatusBadGateway, "claim tenant pool tenant failed")
+			status, msg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", err)
+			errJSON(w, status, msg)
 			return
 		} else if claimed {
 			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
@@ -4455,6 +4456,43 @@ func provisionTenantPoolClaimMetricResult(err error) string {
 		return "cluster_error"
 	}
 	return "error"
+}
+
+func clientFacingErrorResponse(defaultStatus int, defaultMessage string, err error) (int, string) {
+	msg := strings.TrimSpace(defaultMessage)
+	if err != nil {
+		detail := strings.TrimSpace(err.Error())
+		if detail != "" {
+			if msg != "" {
+				msg += ": " + detail
+			} else {
+				msg = detail
+			}
+		}
+	}
+	if msg == "" {
+		msg = http.StatusText(defaultStatus)
+	}
+	switch {
+	case errors.Is(err, tenant.ErrCredentialsRequired), errors.Is(err, tenant.ErrPartialCredentials):
+		return http.StatusBadRequest, msg
+	case isTiDBCloudStatusError(err, http.StatusBadRequest):
+		return http.StatusBadRequest, msg
+	case isTiDBCloudStatusError(err, http.StatusUnauthorized):
+		return http.StatusUnauthorized, msg
+	case errors.Is(err, tenant.ErrQuotaPermissionDenied), isTiDBCloudStatusError(err, http.StatusForbidden):
+		return http.StatusForbidden, msg
+	default:
+		return defaultStatus, msg
+	}
+}
+
+func isTiDBCloudStatusError(err error, code int) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "tidbcloud native ") && strings.Contains(msg, fmt.Sprintf(" status %d", code))
 }
 
 func writeProvisionTenantAccepted(w http.ResponseWriter, res *provisionTenantResult) {
@@ -4950,19 +4988,19 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
 		s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "cluster_provision_error")
-		msg := fmt.Sprintf("provision tenant cluster failed: %v", err)
-		if strings.Contains(strings.ToLower(err.Error()), "free cluster") {
-			msg = "TiDB Cloud free cluster limit reached. Set a monthly Spending Limit to continue. See https://www.pingcap.com/tidb-cloud-starter-pricing-details/#cost-and-limitations"
-		} else if strings.Contains(strings.ToLower(err.Error()), "credits") || strings.Contains(strings.ToLower(err.Error()), "payment") {
-			msg = "TiDB Cloud payment required. Add a payment method at https://tidbcloud.com/org-settings/billing/payments"
-		} else if strings.Contains(strings.ToLower(err.Error()), "instance capacity limit") || strings.Contains(strings.ToLower(err.Error()), "capacity limit") {
-			msg = "TiDB Cloud cluster capacity limit reached"
-		} else if strings.Contains(strings.ToLower(err.Error()), "status 401") || strings.Contains(strings.ToLower(err.Error()), "invalid tidb cloud") || strings.Contains(strings.ToLower(err.Error()), "unauthorized") {
-			msg = "invalid TiDB Cloud API key"
-		} else if strings.Contains(strings.ToLower(err.Error()), "cluster limit") {
-			msg = "TiDB Cloud cluster limit reached (100 clusters per organization). Contact PingCAP support for assistance."
+		status, msg := clientFacingErrorResponse(http.StatusBadGateway, "provision tenant cluster failed", err)
+		if status == http.StatusBadGateway {
+			if strings.Contains(strings.ToLower(err.Error()), "free cluster") {
+				msg = "TiDB Cloud free cluster limit reached. Set a monthly Spending Limit to continue. See https://www.pingcap.com/tidb-cloud-starter-pricing-details/#cost-and-limitations"
+			} else if strings.Contains(strings.ToLower(err.Error()), "credits") || strings.Contains(strings.ToLower(err.Error()), "payment") {
+				msg = "TiDB Cloud payment required. Add a payment method at https://tidbcloud.com/org-settings/billing/payments"
+			} else if strings.Contains(strings.ToLower(err.Error()), "instance capacity limit") || strings.Contains(strings.ToLower(err.Error()), "capacity limit") {
+				msg = "TiDB Cloud cluster capacity limit reached"
+			} else if strings.Contains(strings.ToLower(err.Error()), "cluster limit") {
+				msg = "TiDB Cloud cluster limit reached (100 clusters per organization). Contact PingCAP support for assistance."
+			}
 		}
-		return nil, newProvisionTenantError(http.StatusBadGateway, msg, err)
+		return nil, newProvisionTenantError(status, msg, err)
 	}
 	logProvisionStage(ctx, "provision_cluster_provisioned", tenantID, provider, stageStarted, "mode", provisionMode, "cluster_id", cluster.ClusterID, "organization_id", cluster.OrganizationID)
 	cluster.Provider = provider
