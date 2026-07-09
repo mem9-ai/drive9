@@ -232,6 +232,20 @@ func TestTenantPoolMetadataResumePersistsAfterWaitDeadline(t *testing.T) {
 	}
 }
 
+func TestTenantPoolMetadataResumePersistContextPreservesServerCancellation(t *testing.T) {
+	srv := NewWithConfig(Config{})
+	ctx, cancel := srv.tenantPoolMetadataResumePersistContext(context.Background())
+	defer cancel()
+
+	srv.Close()
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("persist context was not canceled by server close")
+	}
+}
+
 type adminTenantPoolSchemaInitRecorder struct {
 	*quotaTestProvisioner
 

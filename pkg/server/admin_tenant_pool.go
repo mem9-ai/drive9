@@ -1022,7 +1022,7 @@ func (s *Server) waitForPoolClustersMetadata(ctx context.Context, clusters []*te
 }
 
 func (s *Server) completePoolClusterMetadataResume(ctx context.Context, started time.Time, updated *tenant.ClusterInfo) {
-	ctx, cancel := context.WithTimeout(backgroundWithTrace(ctx), tenantPoolMetadataResumePersistTimeout)
+	ctx, cancel := s.tenantPoolMetadataResumePersistContext(ctx)
 	defer cancel()
 
 	if !poolClusterConnectionReady(updated) {
@@ -1067,6 +1067,14 @@ func (s *Server) completePoolClusterMetadataResume(ctx context.Context, started 
 		Region:         region,
 		OrganizationID: strings.TrimSpace(updated.OrganizationID),
 	})
+}
+
+func (s *Server) tenantPoolMetadataResumePersistContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	parent := backgroundWithTrace(ctx)
+	if s.forkWorkerCtx != nil {
+		parent = contextWithTrace(s.forkWorkerCtx, ctx)
+	}
+	return context.WithTimeout(parent, tenantPoolMetadataResumePersistTimeout)
 }
 
 func (s *Server) cleanupPoolProvisionedClusters(ctx context.Context, clusters []*tenant.ClusterInfo, cred tenant.CredentialProvisionRequest, tenantIDs []string, reason string) {
