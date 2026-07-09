@@ -956,7 +956,7 @@ func (s *Server) startPoolClustersMetadataResume(ctx context.Context, poolID str
 		if poolID != "" {
 			defer s.tenantPoolResumeJobs.Delete(poolID)
 		}
-		workerCtx, cancel := context.WithTimeout(workerCtx, 10*time.Minute)
+		workerCtx, cancel := context.WithTimeout(workerCtx, tenantPoolMetadataResumeWaitTimeout)
 		defer cancel()
 
 		for {
@@ -1022,6 +1022,9 @@ func (s *Server) waitForPoolClustersMetadata(ctx context.Context, clusters []*te
 }
 
 func (s *Server) completePoolClusterMetadataResume(ctx context.Context, started time.Time, updated *tenant.ClusterInfo) {
+	ctx, cancel := context.WithTimeout(backgroundWithTrace(ctx), tenantPoolMetadataResumePersistTimeout)
+	defer cancel()
+
 	if !poolClusterConnectionReady(updated) {
 		if updated != nil {
 			logger.Warn(ctx, "admin_tenant_pool_metadata_resume_incomplete",

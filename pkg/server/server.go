@@ -246,6 +246,8 @@ var (
 	schemaInitRetryWindow                     = 10 * time.Minute
 	schemaInitInitialBackoff                  = 2 * time.Second
 	schemaInitMaxBackoff                      = 30 * time.Second
+	tenantPoolMetadataResumeWaitTimeout       = 10 * time.Minute
+	tenantPoolMetadataResumePersistTimeout    = 2 * time.Minute
 	pendingTenantStaleAfter                   = 10 * time.Minute
 	pendingTenantSweepEvery                   = time.Minute
 	initTiDBTenantSchemaForFTSOnlyProfileFunc = tenantschema.InitTiDBTenantSchemaForFTSOnlyProfileContext

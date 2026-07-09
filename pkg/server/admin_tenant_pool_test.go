@@ -140,6 +140,98 @@ func TestTenantPoolMetadataResumeUsesPrivateEndpointDBTLS(t *testing.T) {
 	assertSchemaInitUsesPrivateEndpointTLS(t, schemaInitRecorder.lastSchemaInitDSNSnapshot())
 }
 
+func TestTenantPoolMetadataResumePersistsAfterWaitDeadline(t *testing.T) {
+	oldWaitTimeout := tenantPoolMetadataResumeWaitTimeout
+	tenantPoolMetadataResumeWaitTimeout = 20 * time.Millisecond
+	t.Cleanup(func() {
+		tenantPoolMetadataResumeWaitTimeout = oldWaitTimeout
+	})
+
+	rt, schemaInitRecorder := newAdminTenantPoolRuntime(t)
+	waiter := &deadlineMetadataResumeProvisioner{
+		adminTenantPoolSchemaInitRecorder: schemaInitRecorder,
+		waitStarted:                       make(chan struct{}),
+	}
+	rt.server.provisioner = waiter
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
+		PoolID:         "pool-1",
+		OrganizationID: "org-1",
+		Size:           1,
+		Status:         meta.TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	passCipher, err := rt.server.pool.Encrypt(ctx, []byte("pool-pass"))
+	if err != nil {
+		t.Fatalf("encrypt password: %v", err)
+	}
+	tenantID := "pool-deadline-resume-1"
+	clusterID := "cluster-deadline-resume-1"
+	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantPending,
+		DBPasswordCipher: passCipher,
+		DBName:           "tidbcloud_fs",
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		ClusterID:        clusterID,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatalf("insert tenant: %v", err)
+	}
+	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+		TenantID:       tenantID,
+		OrganizationID: "org-1",
+		ClusterID:      clusterID,
+		PoolID:         "pool-1",
+		PoolStatus:     meta.TenantPoolBindingFree,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("upsert binding: %v", err)
+	}
+
+	rt.server.startPoolClustersMetadataResume(ctx, "pool-1", []*tenant.ClusterInfo{{
+		TenantID:       tenantID,
+		ClusterID:      clusterID,
+		OrganizationID: "org-1",
+		Password:       "pool-pass",
+		DBName:         "tidbcloud_fs",
+		Provider:       tenant.ProviderTiDBCloudNative,
+	}}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+
+	select {
+	case <-waiter.waitStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("metadata resume did not start")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got, err := rt.meta.GetTenant(ctx, tenantID)
+		if err != nil {
+			t.Fatalf("get tenant: %v", err)
+		}
+		if rt.prov.metadataBatchWaitCalls.Load() >= 1 && schemaInitRecorder.schemaInitCalls.Load() >= 1 && got.DBHost == "db.example.com" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tenant after deadline resume = status %s host %q, metadata waits=%d, schema init calls=%d", got.Status, got.DBHost, rt.prov.metadataBatchWaitCalls.Load(), schemaInitRecorder.schemaInitCalls.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 type adminTenantPoolSchemaInitRecorder struct {
 	*quotaTestProvisioner
 
@@ -154,6 +246,19 @@ func newAdminTenantPoolRuntime(t *testing.T) (*quotaRuntime, *adminTenantPoolSch
 	recorder := &adminTenantPoolSchemaInitRecorder{quotaTestProvisioner: rt.prov}
 	rt.server.provisioner = recorder
 	return rt, recorder
+}
+
+type deadlineMetadataResumeProvisioner struct {
+	*adminTenantPoolSchemaInitRecorder
+
+	waitStarted     chan struct{}
+	waitStartedOnce sync.Once
+}
+
+func (p *deadlineMetadataResumeProvisioner) WaitForPoolClustersMetadata(ctx context.Context, clusters []*tenant.ClusterInfo, req tenant.CredentialProvisionRequest) ([]*tenant.ClusterInfo, error) {
+	p.waitStartedOnce.Do(func() { close(p.waitStarted) })
+	<-ctx.Done()
+	return p.quotaTestProvisioner.WaitForPoolClustersMetadata(context.Background(), clusters, req)
 }
 
 func (p *adminTenantPoolSchemaInitRecorder) InitSchema(_ context.Context, dsn string) error {
