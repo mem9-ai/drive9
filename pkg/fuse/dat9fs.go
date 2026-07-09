@@ -176,6 +176,9 @@ type Dat9FS struct {
 	// expire after deletedPathTTL (default 30s).
 	deletedPaths   map[string]time.Time
 	deletedPathsMu sync.Mutex
+
+	// reexecGuard prevents concurrent reexec attempts.
+	reexecGuard reexecGuard
 }
 
 // deletedPathTTL is how long a delete tombstone remains active.
