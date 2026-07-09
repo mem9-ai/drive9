@@ -769,7 +769,7 @@ func mountReexecChild(dat9fs *Dat9FS, opts *MountOptions, fuseOpts *gofuse.Mount
 
 	fmt.Fprintf(os.Stderr, "drive9: reexec child: fd received, importing...\n")
 
-	server, err := ReexecChildImportAndServe(fd, cfg.MountPoint, dat9fs, fuseOpts, parentConn)
+	server, err := ReexecChildImportAndServe(fd, cfg.MountPoint, dat9fs, fuseOpts)
 	if err != nil {
 		return fmt.Errorf("reexec child: %w", err)
 	}
@@ -814,6 +814,14 @@ func mountReexecChild(dat9fs *Dat9FS, opts *MountOptions, fuseOpts *gofuse.Mount
 			}
 		}()
 	}
+
+	// Send accept AFTER control socket and pidfile are established.
+	// This ensures the parent cannot race-delete the child's resources
+	// during its post-accept cleanup.
+	if err := SendReexecAccept(parentConn); err != nil {
+		return fmt.Errorf("reexec child: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "drive9: reexec child: accept sent, parent will exit\n")
 
 	shutdown := newMountShutdown(stopWatchers, dat9fs.FlushAll)
 
