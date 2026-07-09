@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	pathpkg "path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -4458,10 +4459,12 @@ func provisionTenantPoolClaimMetricResult(err error) string {
 	return "error"
 }
 
+var tidbCloudStatusErrorPattern = regexp.MustCompile(`tidbcloud native ([A-Za-z0-9 _-]+) status ([0-9]{3})(?:: (.*))?`)
+
 func clientFacingErrorResponse(defaultStatus int, defaultMessage string, err error) (int, string) {
 	msg := strings.TrimSpace(defaultMessage)
 	if err != nil {
-		detail := strings.TrimSpace(err.Error())
+		detail := clientFacingErrorDetail(err)
 		if detail != "" {
 			if msg != "" {
 				msg += ": " + detail
@@ -4488,11 +4491,65 @@ func clientFacingErrorResponse(defaultStatus int, defaultMessage string, err err
 }
 
 func isTiDBCloudStatusError(err error, code int) bool {
-	if err == nil {
-		return false
+	_, got, ok := parseTiDBCloudStatusError(err)
+	return ok && got == code
+}
+
+func clientFacingErrorDetail(err error) string {
+	if operation, code, ok := parseTiDBCloudStatusError(err); ok {
+		body := strings.TrimSpace(tidbCloudStatusBody(err))
+		if msg := tidbCloudStatusMessage(body); msg != "" {
+			return msg
+		}
+		if body != "" {
+			return fmt.Sprintf("TiDB Cloud %s failed with status %d: %s", operation, code, body)
+		}
+		return fmt.Sprintf("TiDB Cloud %s failed with status %d", operation, code)
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "tidbcloud native ") && strings.Contains(msg, fmt.Sprintf(" status %d", code))
+	if err == nil {
+		return ""
+	}
+	return strings.TrimSpace(err.Error())
+}
+
+func parseTiDBCloudStatusError(err error) (operation string, code int, ok bool) {
+	if err == nil {
+		return "", 0, false
+	}
+	matches := tidbCloudStatusErrorPattern.FindStringSubmatch(err.Error())
+	if len(matches) == 0 {
+		return "", 0, false
+	}
+	code, convErr := strconv.Atoi(matches[2])
+	if convErr != nil {
+		return "", 0, false
+	}
+	return strings.TrimSpace(matches[1]), code, true
+}
+
+func tidbCloudStatusBody(err error) string {
+	if err == nil {
+		return ""
+	}
+	matches := tidbCloudStatusErrorPattern.FindStringSubmatch(err.Error())
+	if len(matches) < 4 {
+		return ""
+	}
+	return strings.TrimSpace(matches[3])
+}
+
+func tidbCloudStatusMessage(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ""
+	}
+	var decoded struct {
+		Message string `json:"message"`
+	}
+	if strings.HasPrefix(body, "{") && json.Unmarshal([]byte(body), &decoded) == nil && strings.TrimSpace(decoded.Message) != "" {
+		return strings.TrimSpace(decoded.Message)
+	}
+	return body
 }
 
 func writeProvisionTenantAccepted(w http.ResponseWriter, res *provisionTenantResult) {

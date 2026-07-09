@@ -230,7 +230,7 @@ func TestClientFacingErrorResponseMapsTiDBCloudClientErrors(t *testing.T) {
 	}{
 		{
 			name:       "invalid request",
-			err:        errors.New(`update cluster spending limit: tidbcloud native cluster spending limit update status 400: {"code":400,"message":"Scalable cluster can not set spending limit to 0."}`),
+			err:        errors.New(`update cluster spending limit: tidbcloud native cluster spending limit update status 400: {"code":400,"message":"Scalable cluster can not set spending limit to 0.","details":[{"requestId":"202607090625337c3caba58b2eb378ca"}]}`),
 			wantStatus: http.StatusBadRequest,
 			wantBody:   "Scalable cluster can not set spending limit to 0",
 		},
@@ -248,6 +248,9 @@ func TestClientFacingErrorResponseMapsTiDBCloudClientErrors(t *testing.T) {
 			}
 			if !strings.Contains(gotMsg, tc.wantBody) {
 				t.Fatalf("msg = %q, want containing %q", gotMsg, tc.wantBody)
+			}
+			if strings.Contains(gotMsg, "requestId") || strings.Contains(gotMsg, "details") {
+				t.Fatalf("msg = %q, should not expose raw TiDB Cloud details", gotMsg)
 			}
 		})
 	}
