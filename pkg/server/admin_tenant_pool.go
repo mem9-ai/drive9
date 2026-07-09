@@ -1024,7 +1024,7 @@ func (s *Server) resumePoolClustersMetadataGroups(ctx context.Context, started t
 	recordGroupResult := func(result string) {
 		overallMu.Lock()
 		defer overallMu.Unlock()
-		if overallResult == "ok" || result == "deadline_exceeded" || result == "canceled" {
+		if adminTenantPoolMetadataResumeResultRank(result) > adminTenantPoolMetadataResumeResultRank(overallResult) {
 			overallResult = result
 		}
 	}
@@ -1061,6 +1061,23 @@ func (s *Server) resumePoolClustersMetadataGroups(ctx context.Context, started t
 	waitDuration := time.Since(waitStarted)
 	metrics.RecordOperation(adminTenantPoolMetricsComponent, "metadata_resume_wait", overallResult, waitDuration)
 	metrics.RecordTenantPoolMetadataResumeWait(poolID, poolResumeOrganizationID(clusters), "batch", overallResult, waitDuration)
+}
+
+func adminTenantPoolMetadataResumeResultRank(result string) int {
+	switch result {
+	case "ok":
+		return 0
+	case "canceled":
+		return 1
+	case "deadline_exceeded":
+		return 2
+	case "bad_conn":
+		return 3
+	case "error":
+		return 4
+	default:
+		return 4
+	}
 }
 
 func poolMetadataResumeGroups(clusters []*tenant.ClusterInfo, groupSize int) [][]*tenant.ClusterInfo {

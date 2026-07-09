@@ -15,6 +15,17 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
+func TestAdminTenantPoolMetadataResumeResultRank(t *testing.T) {
+	ordered := []string{"ok", "canceled", "deadline_exceeded", "bad_conn", "error", "unknown"}
+	for i := 1; i < len(ordered); i++ {
+		prev := ordered[i-1]
+		next := ordered[i]
+		if adminTenantPoolMetadataResumeResultRank(next) < adminTenantPoolMetadataResumeResultRank(prev) {
+			t.Fatalf("rank(%q) < rank(%q)", next, prev)
+		}
+	}
+}
+
 func TestAdminTenantPoolCreateUsesPrivateEndpointDBTLS(t *testing.T) {
 	t.Setenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT", "1")
 	rt, schemaInitRecorder := newAdminTenantPoolRuntime(t)
