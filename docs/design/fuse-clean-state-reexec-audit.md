@@ -19,6 +19,18 @@ V0 explicitly does not cover:
 Those require a later CSI/mount-pod lifecycle split plus fd relay through the
 node agent.
 
+## V0 Applicability
+
+V0 applies only when the mount is fully idle: no open file or directory
+handles, no kernel-held non-root inode lookup references, no in-flight FUSE
+requests, no local locks or xattrs, and no pending writeback, commit, journal,
+or shadow state.
+
+That makes V0 suitable for explicit maintenance or low-load windows. It is not
+intended to make busy production mounts upgrade transparently; a mount with
+ordinary active clients is expected to refuse reexec until those clients close
+their handles and the dirty/pending state drains to zero.
+
 ## Current FUSE Lifecycle
 
 The CLI default path starts a background child process and turns the request
@@ -43,6 +55,11 @@ The mounted FUSE connection fd is currently private to go-fuse. Drive9 calls
 vendored replacement's `fuse.Server` stores it in private field `mountFd`, and
 `Serve` closes it when the serve loop exits. V0 cannot implement fd handoff
 without either a go-fuse extension or a Drive9-owned mount/server wrapper.
+This repository currently uses a fork replacement in `go.mod`
+(`github.com/hanwen/go-fuse/v2` replaced by `github.com/mornyx/go-fuse/v2`), so
+the initial implementation path can add an explicit fd export/import API to
+that fork or wrap the mount/server locally. The implementation must not depend
+on reflection or private field access for `mountFd`.
 
 ## Existing Drain Semantics
 
@@ -79,6 +96,7 @@ successful drain response as sufficient.
 | Read cache and disk read cache | `ReadCache`, `DiskReadCache` | 不需要 | Drop and rebuild from server. |
 | Directory/stat caches | `DirCache`, stat freshness flags | 不需要 | Drop and rebuild from server after inode gate passes. |
 | Remote read singleflight/read slots | `SingleFlight`, `readSlots` | 不需要 | Must have no in-flight requests at cutover. |
+| Flush debouncer | `Dat9FS.debouncer`, `flushDebouncer` | 不需要 | `Drain` flushes debounced callbacks; V0 still refuses if that leaves dirty handles, queued writeback, or commit work. |
 | `PendingIndex` metadata | `<cache>/<mount-hash>/pending/*.meta` | 已持久化可重建 | V0 still requires no pending entries; non-empty state is a refusal until reexec recovery tests exist. |
 | `ShadowStore` file data | `<cache>/<mount-hash>/shadow/*.shadow` | 已持久化可重建 | V0 still requires no active dirty shadow/pending bytes; non-empty dirty state is a refusal. |
 | `Journal` WAL | `<cache>/<mount-hash>/journal.wal` | 已持久化可重建 | V0 requires drain/compact to leave no replay-required state. |
@@ -91,7 +109,8 @@ successful drain response as sufficient.
 | Inode/path map with kernel refs | `InodeToPath` and kernel NodeId cache | 必须传递 | V0 refuses if any non-root inode has `Nlookup > 0`; entries with no kernel refs may be dropped. |
 | FUSE lock table | `fuseLockTable` | 必须传递 | V0 refuses if any lock is held; add a mechanical count before implementation. |
 | In-memory xattrs | `XAttrStore` | 必须传递 | V0 refuses if any xattr exists; add a mechanical count before implementation. |
-| `committedRev` and path commit locks | `Dat9FS.committedRev`, `remoteCommitLocks` | 不需要 | Drop only after no open handles and no commit/upload work. |
+| `committedRev` and path commit locks | `Dat9FS.committedRev`, `remoteCommitLocks` | 不需要 | Drop only after no open handles and no commit/upload work; the first new-process read/stat may observe a newer server revision, which is acceptable in clean state. |
+| Quota/accounting caches | backend `quotaConfigCache`, `quotaUsageCache`, `quotaPendingCache`; writeback byte quota counters | 不需要 | No current `pkg/fuse` `quotaTracker` field exists. Re-fetch backend quota state on demand; if a local FUSE quota tracker is added, V0 must classify it explicitly and refuse unless it is empty or disposable. |
 | Deleted-path tombstones | `Dat9FS.deletedPaths` | 不需要 | Drop; stale backend listings are a temporary cache concern, not durable state. |
 | Local overlay / git workspace state | `LocalOverlay`, `gitWorkspaceLayer`, git checkpoint queues | 必须阻止升级 | Out of V0 unless a separate audit proves all local state is persisted and idle. |
 | FS layer overlay state | layer maps, whiteouts, layer event watcher | 必须阻止升级 | Out of V0 unless a separate audit proves restore equivalence. |
@@ -151,7 +170,8 @@ The reexec request must be rejected unless every check below passes.
 The first implementation PR must include these tests before fd handoff can be
 reviewed as correct:
 
-1. Idle mount reexec keeps the mount point mounted and readable.
+1. Idle mount reexec keeps the mount point mounted and reads a file through the
+   mount point; checking mount-point existence alone is insufficient.
 2. Dirty file handle refuses reexec and old process continues serving.
 3. Clean open read handle refuses reexec because the fh table is not transferred.
 4. Open directory handle refuses reexec.
@@ -175,8 +195,8 @@ handle ids are process-local.
 The smallest safe implementation sequence is:
 
 1. Add read-only snapshot/count helpers for reexec gates: file handles, dir
-   handles, inode lookup refs, locks, xattrs, pending index, shadow store,
-   journal replay state, and in-flight FUSE request count.
+   handles, inode lookup refs, locks, xattrs, flush debouncer work, pending
+   index, shadow store, journal replay state, and in-flight FUSE request count.
 2. Add a reexec preflight command path that returns structured refusal reasons
    without spawning a child.
 3. Extend or wrap go-fuse so Drive9 can create a server from an already-mounted
