@@ -91,6 +91,20 @@ func TestRecordHTTPRequestIncludesLongWriteLatencyBuckets(t *testing.T) {
 	}
 }
 
+func TestRecordOperationIncludesLongAdminTenantPoolUpdateBuckets(t *testing.T) {
+	RecordOperation("admin_tenant_pool", "update", "ok", 5*time.Minute)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_service_operation_duration_seconds_bucket{component="admin_tenant_pool",operation="update",result="ok",le="300"} 1`) {
+		t.Fatalf("missing 300s service operation duration bucket:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_service_operation_duration_seconds_bucket{component="admin_tenant_pool",operation="update",result="ok",le="600"} 1`) {
+		t.Fatalf("missing 600s service operation duration bucket:\n%s", text)
+	}
+}
+
 func TestRecordTenantPoolCapacityIncludesPoolOrganizationAndState(t *testing.T) {
 	const poolID = "pool-capacity-metrics-test"
 	const organizationID = "org-capacity-metrics-test"
