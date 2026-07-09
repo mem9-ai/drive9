@@ -15,7 +15,7 @@ func TestSendRecvFd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	// Create a temp file to use as our fd.
 	tmpFile, err := os.CreateTemp(dir, "fd-test-*")
@@ -35,7 +35,7 @@ func TestSendRecvFd(t *testing.T) {
 			errCh <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		errCh <- sendFd(conn.(*net.UnixConn), origFd)
 	}()
 
@@ -44,7 +44,7 @@ func TestSendRecvFd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	recvdFd, err := recvFd(conn.(*net.UnixConn))
 	if err != nil {
@@ -53,7 +53,7 @@ func TestSendRecvFd(t *testing.T) {
 	defer func() {
 		// Don't close origFd — tmpFile.Close() handles that.
 		// But do close the received dup.
-		os.NewFile(uintptr(recvdFd), "received").Close()
+		_ = os.NewFile(uintptr(recvdFd), "received").Close()
 	}()
 
 	if sendErr := <-errCh; sendErr != nil {

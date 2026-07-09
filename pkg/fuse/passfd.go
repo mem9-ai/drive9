@@ -42,7 +42,7 @@ func recvFd(conn *net.UnixConn) (int, error) {
 		if len(fds) > 0 {
 			// Close any extra fds beyond the first.
 			for i := 1; i < len(fds); i++ {
-				syscall.Close(fds[i])
+				_ = syscall.Close(fds[i])
 			}
 			return fds[0], nil
 		}
