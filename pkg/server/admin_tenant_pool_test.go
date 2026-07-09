@@ -232,6 +232,131 @@ func TestTenantPoolMetadataResumePersistsAfterWaitDeadline(t *testing.T) {
 	}
 }
 
+func TestTenantPoolMetadataResumePersistsReadyGroupBeforeSlowGroup(t *testing.T) {
+	oldGroupSize := tenantPoolMetadataResumeGroupSize
+	tenantPoolMetadataResumeGroupSize = 1
+	t.Cleanup(func() {
+		tenantPoolMetadataResumeGroupSize = oldGroupSize
+	})
+
+	rt, schemaInitRecorder := newAdminTenantPoolRuntime(t)
+	waiter := &groupStreamingMetadataResumeProvisioner{
+		adminTenantPoolSchemaInitRecorder: schemaInitRecorder,
+		slowTenantID:                      "pool-stream-resume-slow",
+		slowStarted:                       make(chan struct{}),
+		releaseSlow:                       make(chan struct{}),
+	}
+	var releaseSlowOnce sync.Once
+	t.Cleanup(func() {
+		releaseSlowOnce.Do(func() { close(waiter.releaseSlow) })
+	})
+	rt.server.provisioner = waiter
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
+		PoolID:         "pool-1",
+		OrganizationID: "org-1",
+		Size:           2,
+		Status:         meta.TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	makePending := func(tenantID, clusterID string) *tenant.ClusterInfo {
+		t.Helper()
+		passCipher, err := rt.server.pool.Encrypt(ctx, []byte("pool-pass"))
+		if err != nil {
+			t.Fatalf("encrypt password: %v", err)
+		}
+		if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+			ID:               tenantID,
+			Status:           meta.TenantPending,
+			DBPasswordCipher: passCipher,
+			DBName:           "tidbcloud_fs",
+			DBTLS:            true,
+			Provider:         tenant.ProviderTiDBCloudNative,
+			ClusterID:        clusterID,
+			SchemaVersion:    1,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}); err != nil {
+			t.Fatalf("insert tenant %s: %v", tenantID, err)
+		}
+		if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+			TenantID:       tenantID,
+			OrganizationID: "org-1",
+			ClusterID:      clusterID,
+			PoolID:         "pool-1",
+			PoolStatus:     meta.TenantPoolBindingFree,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}); err != nil {
+			t.Fatalf("upsert binding %s: %v", tenantID, err)
+		}
+		return &tenant.ClusterInfo{
+			TenantID:       tenantID,
+			ClusterID:      clusterID,
+			OrganizationID: "org-1",
+			Password:       "pool-pass",
+			DBName:         "tidbcloud_fs",
+			Provider:       tenant.ProviderTiDBCloudNative,
+		}
+	}
+	slow := makePending(waiter.slowTenantID, "cluster-stream-resume-slow")
+	fast := makePending("pool-stream-resume-fast", "cluster-stream-resume-fast")
+
+	rt.server.startPoolClustersMetadataResume(ctx, "pool-1", []*tenant.ClusterInfo{slow, fast}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+
+	select {
+	case <-waiter.slowStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("slow metadata resume group did not start")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got, err := rt.meta.GetTenant(ctx, fast.TenantID)
+		if err != nil {
+			t.Fatalf("get fast tenant: %v", err)
+		}
+		if got.DBHost == "db.example.com" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fast tenant was not persisted while slow group was blocked: status %s host %q", got.Status, got.DBHost)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	slowTenant, err := rt.meta.GetTenant(ctx, slow.TenantID)
+	if err != nil {
+		t.Fatalf("get slow tenant: %v", err)
+	}
+	if slowTenant.DBHost != "" {
+		t.Fatalf("slow tenant host = %q before slow group release, want empty", slowTenant.DBHost)
+	}
+
+	releaseSlowOnce.Do(func() { close(waiter.releaseSlow) })
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		got, err := rt.meta.GetTenant(ctx, slow.TenantID)
+		if err != nil {
+			t.Fatalf("get slow tenant: %v", err)
+		}
+		if got.DBHost == "db.example.com" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("slow tenant was not persisted after release: status %s host %q", got.Status, got.DBHost)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestTenantPoolMetadataResumePersistContextPreservesServerCancellation(t *testing.T) {
 	srv := NewWithConfig(Config{})
 	ctx, cancel := srv.tenantPoolMetadataResumePersistContext(context.Background())
@@ -273,6 +398,30 @@ func (p *deadlineMetadataResumeProvisioner) WaitForPoolClustersMetadata(ctx cont
 	p.waitStartedOnce.Do(func() { close(p.waitStarted) })
 	<-ctx.Done()
 	return p.quotaTestProvisioner.WaitForPoolClustersMetadata(context.Background(), clusters, req)
+}
+
+type groupStreamingMetadataResumeProvisioner struct {
+	*adminTenantPoolSchemaInitRecorder
+
+	slowTenantID string
+	slowStarted  chan struct{}
+	releaseSlow  chan struct{}
+	slowOnce     sync.Once
+}
+
+func (p *groupStreamingMetadataResumeProvisioner) WaitForPoolClustersMetadata(ctx context.Context, clusters []*tenant.ClusterInfo, req tenant.CredentialProvisionRequest) ([]*tenant.ClusterInfo, error) {
+	for _, cluster := range clusters {
+		if cluster != nil && cluster.TenantID == p.slowTenantID {
+			p.slowOnce.Do(func() { close(p.slowStarted) })
+			select {
+			case <-p.releaseSlow:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			break
+		}
+	}
+	return p.quotaTestProvisioner.WaitForPoolClustersMetadata(ctx, clusters, req)
 }
 
 func (p *adminTenantPoolSchemaInitRecorder) InitSchema(_ context.Context, dsn string) error {
