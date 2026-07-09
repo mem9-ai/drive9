@@ -3,7 +3,6 @@ package fuse
 import (
 	"os"
 	"sync"
-	"sync/atomic"
 )
 
 // ReexecProtocolVersion is the wire protocol version for the reexec handshake.
@@ -26,27 +25,29 @@ type ReexecPreflightResult struct {
 // reexecGuard prevents concurrent reexec attempts.
 type reexecGuard struct {
 	mu     sync.Mutex
-	active atomic.Bool
+	active bool
 }
 
 func (g *reexecGuard) tryAcquire() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.active.Load() {
+	if g.active {
 		return false
 	}
-	g.active.Store(true)
+	g.active = true
 	return true
 }
 
 func (g *reexecGuard) release() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.active.Store(false)
+	g.active = false
 }
 
 func (g *reexecGuard) isActive() bool {
-	return g.active.Load()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.active
 }
 
 // ReexecPreflight checks all V0 gates and returns structured refusal reasons.
@@ -245,6 +246,10 @@ func (fs *Dat9FS) hasLayerOverlayState() bool {
 }
 
 // journalFrameCount returns the number of uncommitted frames in the journal.
+// It reads the journal file directly via os.ReadFile. This assumes the caller
+// has already drained (Drain + journal Fsync) before preflight, so all
+// buffered writes are on disk. If called without a prior drain, buffered
+// writes not yet flushed could be missed.
 func journalFrameCount(j *Journal) int {
 	if j == nil || j.path == "" {
 		return 0

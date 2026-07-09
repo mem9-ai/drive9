@@ -214,6 +214,65 @@ func TestReexecPreflightJournalPassesAfterCommit(t *testing.T) {
 	require.False(t, hasJournalRefusal, "journal with committed frames should not refuse")
 }
 
+func TestReexecPreflightRefusesShadowStorePendingBytes(t *testing.T) {
+	dir := t.TempDir()
+	shadowDir := filepath.Join(dir, "shadow")
+	ss, err := NewShadowStore(shadowDir)
+	require.NoError(t, err)
+
+	// Write a shadow file to create pending bytes.
+	shadowPath := filepath.Join(shadowDir, "test.shadow")
+	require.NoError(t, os.WriteFile(shadowPath, []byte("dirty data"), 0o644))
+	ss.RecoverPendingBytes()
+	require.Greater(t, ss.PendingBytes(), int64(0), "shadow store should have pending bytes")
+
+	fs := newTestReexecFS()
+	fs.shadowStore = ss
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	hasGate := false
+	for _, r := range result.Refusals {
+		if r.Gate == "shadow_store" {
+			hasGate = true
+		}
+	}
+	require.True(t, hasGate, "should refuse when shadow store has pending bytes")
+}
+
+func TestReexecPreflightRefusesCommitQueuePendingWork(t *testing.T) {
+	// CommitQueue requires a full client + shadow + pending setup.
+	// Create a minimal CommitQueue with a pending entry via the public API.
+	dir := t.TempDir()
+	shadowDir := filepath.Join(dir, "shadow")
+	ss, err := NewShadowStore(shadowDir)
+	require.NoError(t, err)
+	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
+	require.NoError(t, err)
+	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	require.NoError(t, err)
+
+	cq := NewCommitQueue(nil, ss, idx, j, 1, 100)
+	// Enqueue work — this will fail to commit (nil client) but the entry
+	// stays pending, which is what we need for the snapshot check.
+	seq, err := idx.Put("/test.txt", 10, PendingNew)
+	require.NoError(t, err)
+	_ = seq
+
+	fs := newTestReexecFS()
+	fs.commitQueue = cq
+	fs.pendingIndex = idx
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	// Should have pending_index refusal at minimum
+	hasIndex := false
+	for _, r := range result.Refusals {
+		if r.Gate == "pending_index" {
+			hasIndex = true
+		}
+	}
+	require.True(t, hasIndex, "should refuse when pending index has entries (commit queue scenario)")
+}
+
 func TestReexecPreflightCollectsMultipleRefusals(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.fileHandles.Allocate(&FileHandle{Path: "/a.txt"})
