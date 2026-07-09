@@ -78,19 +78,22 @@ func ReexecChildHandshake(cfg ReexecChildConfig) (fd int, conn *net.UnixConn, er
 }
 
 // ReexecChildImportAndServe imports the FUSE device fd, creates a server,
-// starts serving, validates the mount is working, and sends the accept
-// message back to the parent through parentConn.
+// starts serving, and validates the mount is working.
 //
 // On success, the returned server is already serving in a background
-// goroutine. On failure, an error is returned and the caller should exit
-// the process (the OS will close the fd and stop the Serve goroutine).
+// goroutine. The caller must call SendReexecAccept on parentConn after
+// establishing full operational ownership (control socket, pidfile, etc.)
+// to signal the parent to exit.
+//
+// On failure, an error is returned and the caller should exit the
+// process (the OS will close the fd and stop the Serve goroutine).
 //
 // IMPORTANT: failure paths must NOT call server.Unmount() because the
 // server was created via ImportFd (not Mount). Unmount() would call
 // fusermount -u, destroying the parent's mount and preventing rollback.
 // Instead, we let the child process exit — the OS closes the fd, which
 // causes Serve() to get EBADF/ENODEV and exit its read loop.
-func ReexecChildImportAndServe(fd int, mountPoint string, rawFS gofuse.RawFileSystem, opts *gofuse.MountOptions, parentConn *net.UnixConn) (*gofuse.Server, error) {
+func ReexecChildImportAndServe(fd int, mountPoint string, rawFS gofuse.RawFileSystem, opts *gofuse.MountOptions) (*gofuse.Server, error) {
 	server, err := gofuse.ImportFd(rawFS, mountPoint, fd, opts)
 	if err != nil {
 		_ = syscall.Close(fd)
@@ -119,14 +122,20 @@ func ReexecChildImportAndServe(fd int, mountPoint string, rawFS gofuse.RawFileSy
 		return nil, fmt.Errorf("reexec child: mount probe timed out after 10s")
 	}
 
-	// Send accept to parent.
+	return server, nil
+}
+
+// SendReexecAccept sends the accept message to the parent process over
+// the handshake connection. This must be called only after the child has
+// fully established operational ownership (control socket, pidfile, etc.)
+// so the parent can safely release its resources without racing the child.
+func SendReexecAccept(parentConn *net.UnixConn) error {
 	msg := reexecAcceptMsg{
 		Accept:  true,
 		Version: ReexecProtocolVersion,
 	}
 	if err := json.NewEncoder(parentConn).Encode(&msg); err != nil {
-		return nil, fmt.Errorf("reexec child: send accept: %w", err)
+		return fmt.Errorf("reexec child: send accept: %w", err)
 	}
-
-	return server, nil
+	return nil
 }
