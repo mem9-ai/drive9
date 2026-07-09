@@ -688,6 +688,41 @@ func (cq *CommitQueue) WaitPrefix(prefix string) {
 	}
 }
 
+// WaitPrefixTimeout waits for all in-flight and queued entries under the
+// given prefix to drain, or returns when the timeout elapses. Unlike
+// WaitPrefix, it is bounded so callers like Rmdir do not block
+// indefinitely if the commit queue is stuck or slow.
+func (cq *CommitQueue) WaitPrefixTimeout(prefix string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		cq.mu.Lock()
+		cq.forceDelayedPrefixLocked(prefix)
+		found := false
+		for p := range cq.inFlight {
+			if strings.HasPrefix(p, prefix) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			for _, e := range cq.queue {
+				if strings.HasPrefix(e.Path, prefix) {
+					found = true
+					break
+				}
+			}
+		}
+		cq.mu.Unlock()
+		if !found {
+			return true // drained
+		}
+		if time.Now().After(deadline) {
+			return false // timed out
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // CancelPath marks currently queued or in-flight entries for path as canceled,
 // removes queued entries, and cleans up shadow/index state. Cancellation is
 // entry-scoped so future files that reuse the same path (for example git's

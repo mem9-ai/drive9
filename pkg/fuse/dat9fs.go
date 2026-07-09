@@ -7983,14 +7983,21 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			status = gofuse.Status(syscall.ENOTEMPTY)
 			return status
 		}
+		// Wait for the commit queue to drain pending uploads under this
+		// directory before checking the remote listing. Without this, a
+		// rapid batch of Unlinks (e.g. mdtest deleting 1000 files) can leave
+		// the commit queue still processing uploads when rmdir checks the
+		// remote listing, causing a stale ENOTEMPTY even though every file
+		// has been locally unlinked and remotely deleted. The wait is
+		// bounded (10s) to avoid blocking indefinitely; the polling loop
+		// below provides additional eventual-consistency tolerance.
+		if fs.commitQueue != nil {
+			fs.commitQueue.WaitPrefixTimeout(childP+"/", 10*time.Second)
+		}
 		// Local state says empty. The remote listing may be stale due to
-		// eventual-consistency lag on just-completed Unlinks. We skip the
-		// non-cancel-aware WaitPrefix/WaitPath calls and rely on tombstones
-		// + the cancel-aware polling loop below to handle eventual consistency.
-		// This avoids widening the uninterruptible wait surface for rmdir.
-		// Now check the remote listing. If it still shows children, it's
-		// either a real child (not locally known) or eventual-consistency lag.
-		// Poll for up to 2 seconds (4 × 500ms) when the local state is empty,
+		// eventual-consistency lag on just-completed Unlinks. We rely on
+		// tombstones + the cancel-aware polling loop below to handle any
+		// remaining eventual consistency.
 		// giving the backend time to propagate recent deletes.
 		hasChildren, err := fs.remoteDirectoryHasChildren(ctx, childP)
 		if err == nil && hasChildren {
@@ -12039,6 +12046,16 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 			handle.Unlock()
 			return
 		}
+		// Skip the upload if the file has been unlinked since the debounce
+		// was scheduled. After Unlink, the inode is removed from the path
+		// map (RemoveLink). Without this check, the debounced callback
+		// would upload the file to the server after Unlink has already
+		// processed it, leaving a stale server-side file that causes
+		// rmdir to fail with ENOTEMPTY.
+		if _, ok := fs.inodes.GetPath(ino); !ok {
+			handle.Unlock()
+			return
+		}
 
 		// B13: Acquire remoteCommitLock to serialize with any concurrent
 		// forced flush (Path 2). Lock ordering is handle.Lock() →
@@ -12112,6 +12129,14 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		}
 		fs.inodes.UpdateSize(ino, int64(len(data)))
 		fs.cacheFileForPath(filePath, int64(len(data)), time.Now(), committedRev)
+		// The file is now committed on the server. Update the writeBack
+		// entry from PendingNew to PendingOverwrite so that Unlink does not
+		// skip the remote DELETE (thinking the file was never uploaded).
+		if fs.writeBack != nil {
+			if meta, ok := fs.writeBack.GetMeta(filePath); ok && meta.Kind == PendingNew {
+				_ = fs.writeBack.PutWithBaseRev(filePath, nil, int64(len(data)), PendingOverwrite, committedRev)
+			}
+		}
 		// Local debounced flush — kernel is not aware of this async
 		// operation and does not need notify. Userspace caches are
 		// updated above; kernel will pick up new attrs on next getattr.

@@ -3095,6 +3095,79 @@ func TestCommitQueueWaitPrefixForcesDelayedZeroTruncate(t *testing.T) {
 	}
 }
 
+func TestCommitQueueWaitPrefixTimeoutDrainsAndReturnsTrue(t *testing.T) {
+	uploadDone := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case uploadDone <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/dir/file.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/dir/file.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	if err := cq.Enqueue(&CommitEntry{Path: "/dir/file.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7}); err != nil {
+		t.Fatal(err)
+	}
+	// WaitPrefixTimeout should drain the entry and return true.
+	if !cq.WaitPrefixTimeout("/dir/", 5*time.Second) {
+		t.Fatal("WaitPrefixTimeout should return true when queue drains")
+	}
+}
+
+func TestCommitQueueWaitPrefixTimeoutReturnsFalseOnTimeout(t *testing.T) {
+	// Server that never responds, so the in-flight entry stays forever.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(10 * time.Second)
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/dir/file.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/dir/file.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	if err := cq.Enqueue(&CommitEntry{Path: "/dir/file.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7}); err != nil {
+		t.Fatal(err)
+	}
+	// WaitPrefixTimeout should time out and return false.
+	if cq.WaitPrefixTimeout("/dir/", 200*time.Millisecond) {
+		t.Fatal("WaitPrefixTimeout should return false on timeout")
+	}
+}
+
 func TestCommitQueueDrainAllForcesDelayedZeroTruncate(t *testing.T) {
 	var uploads atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
