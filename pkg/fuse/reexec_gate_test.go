@@ -177,7 +177,7 @@ func TestReexecPreflightRefusesJournal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewJournal: %v", err)
 	}
-	if err := j.Append(JournalEntry{Op: JournalWrite, Path: "/test.txt"}); err != nil {
+	if err := j.Append(JournalEntry{Op: JournalFsync, Path: "/test.txt"}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 
@@ -196,7 +196,7 @@ func TestReexecPreflightJournalPassesAfterCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewJournal: %v", err)
 	}
-	if err := j.Append(JournalEntry{Op: JournalWrite, Path: "/test.txt"}); err != nil {
+	if err := j.Append(JournalEntry{Op: JournalFsync, Path: "/test.txt"}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	if err := j.Append(JournalEntry{Op: JournalCommit, Path: "/test.txt"}); err != nil {
@@ -211,6 +211,34 @@ func TestReexecPreflightJournalPassesAfterCommit(t *testing.T) {
 			t.Fatal("journal with committed frames should not refuse")
 		}
 	}
+}
+
+func TestReexecPreflightRefusesJournalFsyncAfterCommit(t *testing.T) {
+	// Regression: Fsync → Commit → Fsync on the same path must refuse.
+	// The second Fsync has a higher Seq than the Commit, so the path
+	// is still replay-required.
+	dir := t.TempDir()
+	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	if err != nil {
+		t.Fatalf("NewJournal: %v", err)
+	}
+	if err := j.Append(JournalEntry{Op: JournalFsync, Path: "/same.txt"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := j.Append(JournalEntry{Op: JournalCommit, Path: "/same.txt"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := j.Append(JournalEntry{Op: JournalFsync, Path: "/same.txt"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	fs := newTestReexecFS()
+	fs.journal = j
+	result := fs.ReexecPreflight()
+	if result.OK {
+		t.Fatal("expected preflight to fail: Fsync after Commit on same path is replay-required")
+	}
+	assertHasGate(t, result.Refusals, "journal", -1)
 }
 
 func TestReexecPreflightRefusesShadowStorePendingBytes(t *testing.T) {
@@ -605,18 +633,18 @@ func TestJournalUncommittedFrameCount(t *testing.T) {
 		t.Fatalf("empty journal: want 0, got %d", got)
 	}
 
-	if err := j.Append(JournalEntry{Op: JournalWrite, Path: "/a"}); err != nil {
+	if err := j.Append(JournalEntry{Op: JournalFsync, Path: "/a"}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	if got := j.UncommittedFrameCount(); got != 1 {
-		t.Fatalf("one write: want 1, got %d", got)
+		t.Fatalf("one fsync: want 1, got %d", got)
 	}
 
-	if err := j.Append(JournalEntry{Op: JournalWrite, Path: "/b"}); err != nil {
+	if err := j.Append(JournalEntry{Op: JournalFsync, Path: "/b"}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	if got := j.UncommittedFrameCount(); got != 2 {
-		t.Fatalf("two writes: want 2, got %d", got)
+		t.Fatalf("two fsyncs: want 2, got %d", got)
 	}
 
 	if err := j.Append(JournalEntry{Op: JournalCommit, Path: "/a"}); err != nil {
@@ -624,6 +652,14 @@ func TestJournalUncommittedFrameCount(t *testing.T) {
 	}
 	if got := j.UncommittedFrameCount(); got != 1 {
 		t.Fatalf("after commit of /a: want 1, got %d", got)
+	}
+
+	// Fsync after Commit on same path: must count as uncommitted again.
+	if err := j.Append(JournalEntry{Op: JournalFsync, Path: "/a"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if got := j.UncommittedFrameCount(); got != 2 {
+		t.Fatalf("fsync after commit on /a: want 2, got %d", got)
 	}
 }
 

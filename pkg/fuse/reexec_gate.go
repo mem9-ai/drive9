@@ -255,12 +255,15 @@ func (fs *Dat9FS) hasLayerOverlayState() bool {
 		len(fs.layerDirs) > 0 || len(fs.layerSymlinks) > 0
 }
 
-// UncommittedFrameCount returns the number of uncommitted frames in the
-// journal. It acquires j.mu to prevent races with concurrent Append calls.
+// UncommittedFrameCount returns the number of paths that have replay-required
+// journal state: a JournalFsync entry not superseded by a later
+// JournalCommit/JournalUnlink. This mirrors the classification logic of
+// replayJournalIntoPending so that preflight and crash recovery agree on
+// what constitutes dirty journal state.
 //
-// This assumes the caller has already drained (Drain + Fsync) before
-// preflight, so all buffered writes are on disk. If called without a prior
-// drain, buffered writes not yet flushed could be missed.
+// It acquires j.mu to prevent races with concurrent Append calls.
+// The caller should drain (Drain + Fsync) before calling so all buffered
+// writes are on disk.
 func (j *Journal) UncommittedFrameCount() int {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -272,20 +275,28 @@ func (j *Journal) UncommittedFrameCount() int {
 	if err != nil || len(data) == 0 {
 		return 0
 	}
-	committed := make(map[string]bool)
-	var pending []string
+
+	latestData := make(map[string]uint64) // path → latest JournalFsync seq
+	latestDone := make(map[string]uint64) // path → latest JournalCommit/Unlink seq
 	scanJournalFrames(data, func(entry JournalEntry, _ []byte) {
-		if entry.Op == JournalCommit {
-			committed[entry.Path] = true
-		} else {
-			pending = append(pending, entry.Path)
+		switch entry.Op {
+		case JournalCommit, JournalUnlink:
+			if entry.Seq > latestDone[entry.Path] {
+				latestDone[entry.Path] = entry.Seq
+			}
+		case JournalFsync:
+			if entry.Seq > latestData[entry.Path] {
+				latestData[entry.Path] = entry.Seq
+			}
 		}
 	})
+
 	count := 0
-	for _, p := range pending {
-		if !committed[p] {
-			count++
+	for path, dataSeq := range latestData {
+		if doneSeq, ok := latestDone[path]; ok && doneSeq > dataSeq {
+			continue
 		}
+		count++
 	}
 	return count
 }
