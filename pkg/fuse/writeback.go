@@ -466,6 +466,42 @@ func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []by
 	return &cp, dataCopy, true
 }
 
+// GetMetaAndViewWithCallback is like GetMetaAndView but invokes onLocked while
+// the per-path lock is still held (after the meta+data snapshot is read). This
+// lets callers atomically capture associated staging-store generations (e.g.
+// pendingIndex/shadowStore) under the same serialization window so a concurrent
+// same-path Put cannot race the snapshot and leave a stale upload holding newer
+// generations it is not responsible for.
+func (c *WriteBackCache) GetMetaAndViewWithCallback(remotePath string, onLocked func()) (*WriteBackMeta, []byte, bool) {
+	pl := c.acquirePathLock(remotePath)
+	defer c.releasePathLock(remotePath, pl)
+
+	c.mu.Lock()
+	meta, ok := c.metas[remotePath]
+	if !ok {
+		c.mu.Unlock()
+		return nil, nil, false
+	}
+	cp := *meta
+
+	data, dataOK := c.getViewLocked(remotePath)
+	c.mu.Unlock()
+
+	if !dataOK {
+		return nil, nil, false
+	}
+
+	// Invoke the callback while the path lock is still held so staging-gen
+	// snapshots are consistent with this meta+data read.
+	if onLocked != nil {
+		onLocked()
+	}
+
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	return &cp, dataCopy, true
+}
+
 // Remove deletes the cached data and metadata for remotePath.
 func (c *WriteBackCache) Remove(remotePath string) {
 	pl := c.acquirePathLock(remotePath)

@@ -372,22 +372,21 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	// Atomically read meta + data under one path lock so they are guaranteed
 	// to be from the same generation. Without this, a concurrent Put could
 	// replace the data between GetMeta and getView, causing the uploader to
-	// upload new data with old baseRev/generation.
-	meta, data, ok := u.cache.GetMetaAndView(localPath)
+	// upload new data with old baseRev/generation. The onLocked callback
+	// captures the staging-store generations under the same path-lock window so
+	// the OnSuccess cleanup is generation-guarded consistently — a concurrent
+	// same-path write cannot race the snapshot and leave a stale upload holding
+	// newer generations it is not responsible for.
+	var stagingGens StagingGens
+	meta, data, ok := u.cache.GetMetaAndViewWithCallback(localPath, func() {
+		if u.SnapshotStagingGens != nil {
+			stagingGens = u.SnapshotStagingGens(localPath)
+		}
+	})
 	if !ok {
 		return // Already uploaded or removed.
 	}
 	gen := meta.Generation
-
-	// Snapshot the staging-store generations alongside the writeBack read so
-	// the OnSuccess cleanup can be generation-guarded. A concurrent same-path
-	// write would bump all three generations; capturing them here (under the
-	// same path-lock window as GetMetaAndView) ties the cleanup to exactly the
-	// staging entries this upload is responsible for.
-	var stagingGens StagingGens
-	if u.SnapshotStagingGens != nil {
-		stagingGens = u.SnapshotStagingGens(localPath)
-	}
 	// Use the writeBack generation we just read (authoritative) rather than
 	// a re-read from the snapshot callback, which could race with a concurrent
 	// Put between GetMetaAndView and the callback.
