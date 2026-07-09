@@ -807,11 +807,13 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 				return nil, err
 			}
 			res.Status = meta.TenantProvisioning
-			res.TenantDSN = tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true, provider)
+			dbtls := dbTLSForProvisionedTenant(provider)
+			res.TenantDSN = tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, dbtls, provider)
 			logProvisionStage(ctx, "admin_tenant_pool_free_tenant_connection_persisted", tenantID, provider, stageStarted,
 				"pool_id", poolID,
 				"organization_id", orgID,
 				"cluster_id", cluster.ClusterID,
+				"db_tls", dbtls,
 				"status", meta.TenantProvisioning)
 		} else {
 			stageStarted = time.Now()
@@ -882,7 +884,7 @@ func (s *Server) persistPoolTenantProvisionSeed(ctx context.Context, cluster *te
 	return s.meta.UpdateTenantConnection(ctx, cluster.TenantID, &meta.Tenant{
 		DBPasswordCipher: cipherPass,
 		DBName:           cluster.DBName,
-		DBTLS:            true,
+		DBTLS:            dbTLSForProvisionedTenant(provider),
 		Provider:         provider,
 		ClusterID:        cluster.ClusterID,
 	})
@@ -908,7 +910,7 @@ func (s *Server) persistPoolTenantConnection(ctx context.Context, cluster *tenan
 		DBUser:           cluster.Username,
 		DBPasswordCipher: cipherPass,
 		DBName:           cluster.DBName,
-		DBTLS:            true,
+		DBTLS:            dbTLSForProvisionedTenant(provider),
 		Provider:         provider,
 		ClusterID:        cluster.ClusterID,
 	})
@@ -1051,12 +1053,13 @@ func (s *Server) completePoolClusterMetadataResume(ctx context.Context, started 
 		return
 	}
 	cloudProvider, region := provisioningCloudRegion(s.provisioner)
+	dbtls := dbTLSForProvisionedTenant(tenant.ProviderTiDBCloudNative)
 	logProvisionStage(ctx, "admin_tenant_pool_metadata_resume_done", updated.TenantID, tenant.ProviderTiDBCloudNative, started, "cluster_id", updated.ClusterID, "organization_id", updated.OrganizationID)
 	s.startProvisionedTenantSchemaInit(ctx, &provisionTenantResult{
 		TenantID:       updated.TenantID,
 		Status:         meta.TenantProvisioning,
 		Provider:       tenant.ProviderTiDBCloudNative,
-		TenantDSN:      tenantDSN(updated.Username, updated.Password, updated.Host, updated.Port, updated.DBName, true, tenant.ProviderTiDBCloudNative),
+		TenantDSN:      tenantDSN(updated.Username, updated.Password, updated.Host, updated.Port, updated.DBName, dbtls, tenant.ProviderTiDBCloudNative),
 		CloudProvider:  cloudProvider,
 		Region:         region,
 		OrganizationID: strings.TrimSpace(updated.OrganizationID),
