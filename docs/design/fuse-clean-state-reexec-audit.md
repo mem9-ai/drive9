@@ -85,12 +85,34 @@ It does not:
 Therefore V0 must add a stricter reexec-specific gate instead of treating a
 successful drain response as sufficient.
 
+## Request Quiesce Barrier
+
+A clean-state snapshot is only valid if no new FUSE handler can mutate `Dat9FS`
+between the snapshot and fd handoff. V0 therefore needs an explicit
+prepare-phase quiesce barrier before any state snapshot:
+
+1. Enter `prepare` and mark a single reexec attempt active.
+2. Install a dispatcher barrier below normal FUSE handlers.
+3. Requests that arrive after the barrier must either block/queue before handler
+   dispatch or cause a deterministic abort before snapshot; they must not enter
+   normal handlers while the clean-state snapshot is being prepared.
+4. Wait for already-dispatched FUSE handlers to reach zero.
+5. Run `Drain` and take the clean-state snapshot while the barrier remains held.
+6. Transfer the fd only after the snapshot passes.
+7. On new-process accept, old process may exit; on validation failure, timeout,
+   or child crash, old process removes the barrier and resumes serving.
+
+Without this barrier, the gate has a time-of-check/time-of-use race: an open,
+lookup, create, write, or fsync request can enter after the snapshot but before
+new-process accept and make the inherited state no longer clean.
+
 ## State Matrix
 
 | State | Current owner | Classification | V0 gate |
 | --- | --- | --- | --- |
 | Kernel FUSE connection fd | go-fuse `Server.mountFd` | 必须传递 | Blocked until Drive9 can extract/import the fd without closing the mount. |
 | go-fuse serve loop and request readers | go-fuse `Server` | 必须传递 | New process must not serve until old process explicitly cuts over. |
+| FUSE request dispatcher/quiesce barrier | go-fuse wrapper or fork extension | 必须阻止升级 | V0 refuses unless old process can block/queue new requests before snapshot and release them on rollback. |
 | Mount process state and control socket | `pkg/mountstate`, `mount_control_unix.go` | 不需要 | Recreate after accept; old state remains authoritative until cutover. |
 | SSE and layer event watchers | `pkg/fuse/sse.go`, `layer_events.go` | 不需要 | Stop/recreate; no correctness state may live only in the watcher. |
 | Read cache and disk read cache | `ReadCache`, `DiskReadCache` | 不需要 | Drop and rebuild from server. |
@@ -112,7 +134,9 @@ successful drain response as sufficient.
 | `committedRev` and path commit locks | `Dat9FS.committedRev`, `remoteCommitLocks` | 不需要 | Drop only after no open handles and no commit/upload work; the first new-process read/stat may observe a newer server revision, which is acceptable in clean state. |
 | Quota/accounting caches | backend `quotaConfigCache`, `quotaUsageCache`, `quotaPendingCache`; writeback byte quota counters | 不需要 | No current `pkg/fuse` `quotaTracker` field exists. Re-fetch backend quota state on demand; if a local FUSE quota tracker is added, V0 must classify it explicitly and refuse unless it is empty or disposable. |
 | Deleted-path tombstones | `Dat9FS.deletedPaths` | 不需要 | Drop; stale backend listings are a temporary cache concern, not durable state. |
-| Local overlay / git workspace state | `LocalOverlay`, `gitWorkspaceLayer`, git checkpoint queues | 必须阻止升级 | Out of V0 unless a separate audit proves all local state is persisted and idle. |
+| User/profile local overlay state | `Dat9FS.localOverlay`, `MountOptions.LocalRoot`, local-only patterns | 必须阻止升级 | Out of V0; this is user-visible local state and must not be silently dropped. |
+| Transient local overlay state | `Dat9FS.transientLocalOverlay`, SQLite WAL/SHM sidecars | 必须阻止升级 | Writable mounts may initialize the root automatically; V0 allows only an empty transient overlay with no handles. Any transient overlay entry is a refusal until separately audited. |
+| Git workspace overlay state | `gitWorkspaceLayer`, `gitCheckpoints`, `gitOverlayPending` | 必须阻止升级 | Out of V0 unless a separate audit proves all local state is persisted and idle. |
 | FS layer overlay state | layer maps, whiteouts, layer event watcher | 必须阻止升级 | Out of V0 unless a separate audit proves restore equivalence. |
 | Perf/profiling state | `Profiler`, `ContinuousPerfRecorder` | 不需要 | Recreate after accept. |
 
@@ -123,8 +147,9 @@ The reexec request must be rejected unless every check below passes.
 ### Static Scope Checks
 
 - Mount kind is normal FUSE, not vault or WebDAV.
-- No local overlay, git workspace, fs layer, checkpoint, or pack/unpack profile
-  state is enabled.
+- Request quiesce barrier support is available in the old process.
+- No user/profile local overlay, git workspace, fs layer, checkpoint, or
+  pack/unpack profile state is enabled.
 - Old and new process advertise the same reexec protocol version.
 - New binary path and argv/env are resolved before the old process changes any
   serve-loop state.
@@ -134,6 +159,11 @@ The reexec request must be rejected unless every check below passes.
 ### Runtime Clean-State Checks
 
 - A reexec coordinator has stopped accepting new reexec attempts.
+- The old process has installed the FUSE request quiesce barrier before `Drain`
+  or clean-state snapshot starts.
+- Requests arriving after the barrier are blocked/queued before normal handler
+  dispatch, or the attempt aborts before snapshot and rolls back.
+- Already-dispatched FUSE handler count reaches zero while the barrier is held.
 - A Drive9-side drain succeeds before timeout.
 - No file handles exist.
 - No directory handles exist.
@@ -147,8 +177,9 @@ The reexec request must be rejected unless every check below passes.
 - Pending index has no pending paths.
 - Shadow store has zero pending bytes and no active shadow files.
 - Journal has no replay-required frames.
+- Transient local overlay root is empty or absent.
 - No git overlay/checkpoint work is pending.
-- In-flight FUSE request count reaches zero before timeout.
+- The clean-state snapshot is taken after quiesce and before fd transfer.
 
 ### Failure Semantics
 
@@ -159,6 +190,8 @@ The reexec request must be rejected unless every check below passes.
 - If fd transfer succeeds but the new process does not acknowledge accept before
   timeout, abort and keep the old process serving; the old process must still own
   its fd until accept.
+- If validation fails, the child exits, or accept times out, old process removes
+  the quiesce barrier and resumes dispatching queued requests.
 - If protocol versions differ, abort before fd transfer.
 - If a second `SIGHUP` arrives during an attempt, return a deterministic
   `already_in_progress` result and do not start a second child.
@@ -184,6 +217,11 @@ reviewed as correct:
 11. New process protocol mismatch keeps old process serving.
 12. Repeated `SIGHUP` during a running attempt returns `already_in_progress`.
 13. FUSE drain timeout refuses reexec with a defined error.
+14. Request race during prepare refuses or blocks safely: a concurrent
+    open/write/lookup arriving after quiesce starts must not mutate state after
+    the clean snapshot and before accept.
+15. Non-empty transient local overlay refuses reexec; an empty automatic
+    transient overlay root alone does not force read-only-only V0.
 
 Existing tests already cover parts of the drain behavior, but they are not
 enough for V0. In particular, `TestDrainAllowsCleanOpenHandles` is correct for
@@ -194,16 +232,20 @@ handle ids are process-local.
 
 The smallest safe implementation sequence is:
 
-1. Add read-only snapshot/count helpers for reexec gates: file handles, dir
+1. Extend or wrap go-fuse with a request quiesce barrier and in-flight handler
+   counter that sits before normal `Dat9FS` handler dispatch.
+2. Add read-only snapshot/count helpers for reexec gates: file handles, dir
    handles, inode lookup refs, locks, xattrs, flush debouncer work, pending
-   index, shadow store, journal replay state, and in-flight FUSE request count.
-2. Add a reexec preflight command path that returns structured refusal reasons
+   index, shadow store, journal replay state, transient overlay entries, and
+   in-flight FUSE request count.
+3. Add a reexec preflight command path that returns structured refusal reasons
    without spawning a child.
-3. Extend or wrap go-fuse so Drive9 can create a server from an already-mounted
+4. Extend or wrap go-fuse so Drive9 can create a server from an already-mounted
    FUSE fd and transfer the old fd by `SCM_RIGHTS`.
-4. Add a two-phase old/new handshake: `prepare -> send_fd -> validate -> accept`
-   with old-process rollback until `accept`.
-5. Only after those gates pass should `SIGHUP` call the reexec path.
+5. Add a two-phase old/new handshake:
+   `prepare -> quiesce -> snapshot -> send_fd -> validate -> accept`, with
+   old-process rollback and barrier removal until `accept`.
+6. Only after those gates pass should `SIGHUP` call the reexec path.
 
 Any implementation that sends the fd before proving the clean-state matrix, or
 lets the old process exit before new-process accept, is outside this V0 scope.
