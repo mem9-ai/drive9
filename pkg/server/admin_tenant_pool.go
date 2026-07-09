@@ -956,21 +956,12 @@ func (s *Server) startPoolClustersMetadataResume(ctx context.Context, poolID str
 		if poolID != "" {
 			defer s.tenantPoolResumeJobs.Delete(poolID)
 		}
-		workerCtx, cancel := context.WithTimeout(workerCtx, 10*time.Minute)
+		workerCtx, cancel := context.WithTimeout(workerCtx, tenantPoolMetadataResumeWaitTimeout)
 		defer cancel()
 
 		for {
 			started := time.Now()
-			updated, err := s.waitForPoolClustersMetadata(workerCtx, clusterCopies, cred)
-			if err != nil {
-				logger.Warn(workerCtx, "admin_tenant_pool_metadata_resume_batch_failed",
-					zap.String("pool_id", poolID),
-					zap.Int("cluster_count", len(clusterCopies)),
-					zap.Error(err))
-			}
-			for _, cluster := range updated {
-				s.completePoolClusterMetadataResume(workerCtx, started, cluster)
-			}
+			s.resumePoolClustersMetadataGroups(workerCtx, started, poolID, clusterCopies, cred)
 			if poolID == "" || !job.rerun.Swap(false) {
 				return
 			}
@@ -987,6 +978,74 @@ func (s *Server) startPoolClustersMetadataResume(ctx context.Context, poolID str
 			}
 		}
 	})
+}
+
+func (s *Server) resumePoolClustersMetadataGroups(ctx context.Context, started time.Time, poolID string, clusters []*tenant.ClusterInfo, cred tenant.CredentialProvisionRequest) {
+	groups := poolMetadataResumeGroups(clusters, tenantPoolMetadataResumeGroupSize)
+	if len(groups) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	for i, group := range groups {
+		groupIndex := i
+		group := group
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			updated, err := s.waitForPoolClustersMetadata(ctx, group, cred)
+			if err != nil {
+				logger.Warn(ctx, "admin_tenant_pool_metadata_resume_batch_failed",
+					zap.String("pool_id", poolID),
+					zap.Int("group_index", groupIndex),
+					zap.Int("group_count", len(groups)),
+					zap.Int("cluster_count", len(group)),
+					zap.Strings("tenant_ids", poolResumeTenantIDs(group)),
+					zap.Strings("cluster_ids", poolResumeClusterIDs(group)),
+					zap.Error(err))
+			}
+			for _, cluster := range updated {
+				s.completePoolClusterMetadataResume(ctx, started, cluster)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func poolMetadataResumeGroups(clusters []*tenant.ClusterInfo, groupSize int) [][]*tenant.ClusterInfo {
+	if groupSize <= 0 {
+		groupSize = 10
+	}
+	groups := make([][]*tenant.ClusterInfo, 0, (len(clusters)+groupSize-1)/groupSize)
+	for start := 0; start < len(clusters); start += groupSize {
+		end := start + groupSize
+		if end > len(clusters) {
+			end = len(clusters)
+		}
+		groups = append(groups, clusters[start:end])
+	}
+	return groups
+}
+
+func poolResumeTenantIDs(clusters []*tenant.ClusterInfo) []string {
+	out := make([]string, 0, len(clusters))
+	for _, cluster := range clusters {
+		if cluster == nil {
+			continue
+		}
+		out = append(out, strings.TrimSpace(cluster.TenantID))
+	}
+	return out
+}
+
+func poolResumeClusterIDs(clusters []*tenant.ClusterInfo) []string {
+	out := make([]string, 0, len(clusters))
+	for _, cluster := range clusters {
+		if cluster == nil {
+			continue
+		}
+		out = append(out, strings.TrimSpace(cluster.ClusterID))
+	}
+	return out
 }
 
 func compactPoolResumeClusters(clusters []*tenant.ClusterInfo) []*tenant.ClusterInfo {
@@ -1022,6 +1081,9 @@ func (s *Server) waitForPoolClustersMetadata(ctx context.Context, clusters []*te
 }
 
 func (s *Server) completePoolClusterMetadataResume(ctx context.Context, started time.Time, updated *tenant.ClusterInfo) {
+	ctx, cancel := s.tenantPoolMetadataResumePersistContext(ctx)
+	defer cancel()
+
 	if !poolClusterConnectionReady(updated) {
 		if updated != nil {
 			logger.Warn(ctx, "admin_tenant_pool_metadata_resume_incomplete",
@@ -1064,6 +1126,14 @@ func (s *Server) completePoolClusterMetadataResume(ctx context.Context, started 
 		Region:         region,
 		OrganizationID: strings.TrimSpace(updated.OrganizationID),
 	})
+}
+
+func (s *Server) tenantPoolMetadataResumePersistContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	parent := backgroundWithTrace(ctx)
+	if s.forkWorkerCtx != nil {
+		parent = contextWithTrace(s.forkWorkerCtx, ctx)
+	}
+	return context.WithTimeout(parent, tenantPoolMetadataResumePersistTimeout)
 }
 
 func (s *Server) cleanupPoolProvisionedClusters(ctx context.Context, clusters []*tenant.ClusterInfo, cred tenant.CredentialProvisionRequest, tenantIDs []string, reason string) {

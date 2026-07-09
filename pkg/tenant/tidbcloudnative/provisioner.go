@@ -18,14 +18,17 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
+	"go.uber.org/zap"
 )
 
 const (
@@ -501,6 +504,7 @@ func (p *Provisioner) waitForBatchClusterProvisionMetadata(ctx context.Context, 
 }
 
 func (p *Provisioner) waitForBatchClusterProvisionMetadataGroup(ctx context.Context, publicKey, privateKey, poolID string, group []batchClusterMetadataTarget, out []*tenant.ClusterInfo, errs []error) {
+	started := time.Now()
 	deadline := time.Now().Add(10 * time.Minute)
 	pending := make(map[string]batchClusterMetadataTarget, len(group))
 	clusterIDs := make([]string, 0, len(group))
@@ -513,13 +517,32 @@ func (p *Provisioner) waitForBatchClusterProvisionMetadataGroup(ctx context.Cont
 		pending[clusterID] = target
 		clusterIDs = append(clusterIDs, clusterID)
 	}
+	logger.Info(ctx, "tidbcloud_native_batch_metadata_wait_started",
+		zap.Int("group_size", len(group)),
+		zap.Int("pending_count", len(pending)),
+		zap.String("pool_id", strings.TrimSpace(poolID)),
+		zap.Strings("cluster_ids", sortedClusterIDs(pending)),
+		zap.Strings("tenant_ids", sortedTenantIDs(pending)))
+	pollCount := 0
 	for len(pending) > 0 {
+		pollCount++
+		seenCount := 0
+		readyCount := 0
+		incompleteClusterIDs := make([]string, 0, len(pending))
 		infos, err := p.listClusterInfosWithCredentials(ctx, publicKey, privateKey, clusterIDs, len(clusterIDs))
 		if err != nil {
 			if !isTiDBCloudStatus(err, http.StatusTooManyRequests) || time.Now().After(deadline) {
 				for _, target := range pending {
 					errs[target.index] = err
 				}
+				logger.Warn(ctx, "tidbcloud_native_batch_metadata_wait_failed",
+					zap.Int("poll_count", pollCount),
+					zap.Int("pending_count", len(pending)),
+					zap.String("pool_id", strings.TrimSpace(poolID)),
+					zap.Strings("cluster_ids", sortedClusterIDs(pending)),
+					zap.Strings("tenant_ids", sortedTenantIDs(pending)),
+					zap.Duration("elapsed", time.Since(started)),
+					zap.Error(err))
 				return
 			}
 		} else {
@@ -530,6 +553,7 @@ func (p *Provisioner) waitForBatchClusterProvisionMetadataGroup(ctx context.Cont
 				if !ok {
 					continue
 				}
+				seenCount++
 				if tenantID := strings.TrimSpace(info.Labels[Drive9TenantIDLabel]); tenantID != target.tenantID {
 					errs[target.index] = fmt.Errorf("tidbcloud native batch metadata tenant label mismatch for cluster %q: got %q, want %q", clusterID, tenantID, target.tenantID)
 					delete(pending, clusterID)
@@ -541,19 +565,44 @@ func (p *Provisioner) waitForBatchClusterProvisionMetadataGroup(ctx context.Cont
 					continue
 				}
 				if clusterProvisionMetadataIncomplete(&info, p.usePrivateEndpoint, p.privateEndpointOverrideHost()) {
+					incompleteClusterIDs = append(incompleteClusterIDs, clusterID)
 					continue
 				}
 				out[target.index] = p.clusterInfoFromResponse(target.tenantID, target.dbName, target.password, &info)
 				delete(pending, clusterID)
+				readyCount++
 			}
 		}
 		if len(pending) == 0 {
+			logger.Info(ctx, "tidbcloud_native_batch_metadata_wait_finished",
+				zap.Int("poll_count", pollCount),
+				zap.Int("ready_count", readyCount),
+				zap.String("pool_id", strings.TrimSpace(poolID)),
+				zap.Duration("elapsed", time.Since(started)))
 			return
 		}
+		sort.Strings(incompleteClusterIDs)
+		logger.Info(ctx, "tidbcloud_native_batch_metadata_wait_pending",
+			zap.Int("poll_count", pollCount),
+			zap.Int("pending_count", len(pending)),
+			zap.Int("seen_count", seenCount),
+			zap.Int("ready_count", readyCount),
+			zap.String("pool_id", strings.TrimSpace(poolID)),
+			zap.Strings("pending_cluster_ids", sortedClusterIDs(pending)),
+			zap.Strings("pending_tenant_ids", sortedTenantIDs(pending)),
+			zap.Strings("incomplete_cluster_ids", incompleteClusterIDs),
+			zap.Duration("elapsed", time.Since(started)))
 		if time.Now().After(deadline) {
 			for clusterID, target := range pending {
 				errs[target.index] = fmt.Errorf("tidbcloud native cluster %s missing connection metadata or organization label before timeout", clusterID)
 			}
+			logger.Warn(ctx, "tidbcloud_native_batch_metadata_wait_timeout",
+				zap.Int("poll_count", pollCount),
+				zap.Int("pending_count", len(pending)),
+				zap.String("pool_id", strings.TrimSpace(poolID)),
+				zap.Strings("cluster_ids", sortedClusterIDs(pending)),
+				zap.Strings("tenant_ids", sortedTenantIDs(pending)),
+				zap.Duration("elapsed", time.Since(started)))
 			return
 		}
 		select {
@@ -561,10 +610,36 @@ func (p *Provisioner) waitForBatchClusterProvisionMetadataGroup(ctx context.Cont
 			for _, target := range pending {
 				errs[target.index] = ctx.Err()
 			}
+			logger.Warn(ctx, "tidbcloud_native_batch_metadata_wait_canceled",
+				zap.Int("poll_count", pollCount),
+				zap.Int("pending_count", len(pending)),
+				zap.String("pool_id", strings.TrimSpace(poolID)),
+				zap.Strings("cluster_ids", sortedClusterIDs(pending)),
+				zap.Strings("tenant_ids", sortedTenantIDs(pending)),
+				zap.Duration("elapsed", time.Since(started)),
+				zap.Error(ctx.Err()))
 			return
 		case <-time.After(batchMetadataPollInterval()):
 		}
 	}
+}
+
+func sortedClusterIDs(pending map[string]batchClusterMetadataTarget) []string {
+	out := make([]string, 0, len(pending))
+	for clusterID := range pending {
+		out = append(out, clusterID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedTenantIDs(pending map[string]batchClusterMetadataTarget) []string {
+	out := make([]string, 0, len(pending))
+	for _, target := range pending {
+		out = append(out, target.tenantID)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func batchMetadataPollInterval() time.Duration {
