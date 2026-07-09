@@ -47,6 +47,7 @@ var serviceOperationDuration = serviceMeter.Float64Histogram("drive9_service_ope
 var serviceGauge = serviceMeter.Float64Gauge("drive9_service_gauge", "Service gauges by component/name")
 var tenantPoolMetadataResumeWaitTotal = serviceMeter.Int64Counter("drive9_tenant_pool_metadata_resume_wait_total", "Tenant pool metadata resume wait attempts by pool_id/organization_id/scope/result")
 var tenantPoolMetadataResumeWaitDuration = serviceMeter.Float64Histogram("drive9_tenant_pool_metadata_resume_wait_duration_seconds", "Tenant pool metadata resume wait duration by pool_id/organization_id/scope/result", operationDurationBounds)
+var tenantPoolCapacity = serviceMeter.Float64Gauge("drive9_tenant_pool_capacity", "Tenant pool capacity by pool_id/organization_id/state")
 
 var httpRequestsTotal = httpMeter.Int64Counter("drive9_http_requests_total", "Total HTTP requests by method/route/status")
 var httpRequestDuration = httpMeter.Float64Histogram("drive9_http_request_duration_seconds", "HTTP request duration histogram by method/route", httpDurationBounds)
@@ -136,6 +137,15 @@ func RecordTenantPoolMetadataResumeWait(poolID, organizationID, scope, result st
 	}
 	tenantPoolMetadataResumeWaitTotal.Add(1, attrs...)
 	tenantPoolMetadataResumeWaitDuration.Observe(d.Seconds(), attrs...)
+}
+
+func RecordTenantPoolCapacity(poolID, organizationID, state string, value float64) {
+	RegisterModule("admin_tenant_pool")
+	tenantPoolCapacity.Set(value,
+		Attr("pool_id", cleanMetricValue(poolID, "unknown")),
+		Attr("organization_id", cleanMetricValue(organizationID, "unknown")),
+		Attr("state", cleanMetricValue(state, "unknown")),
+	)
 }
 
 // ResultForError returns a stable metric result label for common infrastructure

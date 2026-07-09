@@ -68,6 +68,24 @@ func TestRecordTenantPoolMetadataResumeWaitIncludesPoolAndOrganizationID(t *test
 	}
 }
 
+func TestRecordTenantPoolCapacityIncludesPoolOrganizationAndState(t *testing.T) {
+	const poolID = "pool-capacity-metrics-test"
+	const organizationID = "org-capacity-metrics-test"
+
+	RecordTenantPoolCapacity(poolID, organizationID, "size", 10)
+	RecordTenantPoolCapacity(poolID, organizationID, "free", 1)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_tenant_pool_capacity{organization_id="`+organizationID+`",pool_id="`+poolID+`",state="size"} 10`) {
+		t.Fatalf("missing tenant pool size capacity gauge:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_pool_capacity{organization_id="`+organizationID+`",pool_id="`+poolID+`",state="free"} 1`) {
+		t.Fatalf("missing tenant pool free capacity gauge:\n%s", text)
+	}
+}
+
 func TestRecordDBOperationOmitsTenantID(t *testing.T) {
 	const tenantID = "tenant-db-operation-test"
 
