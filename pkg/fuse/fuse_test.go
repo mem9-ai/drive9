@@ -2476,6 +2476,168 @@ func TestFlushDebouncer_IndependentPaths(t *testing.T) {
 	}
 }
 
+// TestFlushDebouncer_CancelWaitsForRunningCallback verifies that Cancel blocks
+// until a running uploadFn finishes. This is critical for Unlink correctness:
+// the callback may be cleaning up pendingIndex, and Unlink must not read
+// pendingIndex until the cleanup is done.
+func TestFlushDebouncer_CancelWaitsForRunningCallback(t *testing.T) {
+	d := newFlushDebouncer(20 * time.Millisecond)
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	var finished atomic.Bool
+	d.Schedule("/a", func() {
+		close(started)
+		<-finish // block until test signals
+		finished.Store(true)
+	})
+
+	// Wait for the callback to start running.
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback did not start within 2s")
+	}
+
+	// Cancel should block because the callback is still running.
+	cancelDone := make(chan struct{})
+	go func() {
+		d.Cancel("/a")
+		close(cancelDone)
+	}()
+
+	select {
+	case <-cancelDone:
+		t.Fatal("Cancel returned before callback finished")
+	case <-time.After(100 * time.Millisecond):
+		// Good — Cancel is still blocked.
+	}
+
+	// Let the callback finish.
+	close(finish)
+
+	select {
+	case <-cancelDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cancel did not return after callback finished")
+	}
+	if !finished.Load() {
+		t.Fatal("callback did not finish")
+	}
+}
+
+// TestFlushDebouncer_CancelAfterCallbackSelfDeletes verifies that Cancel does
+// not deadlock when the timer callback has already removed the pending entry
+// and is still running uploadFn. Cancel should detect the inflight entry and
+// wait for it.
+func TestFlushDebouncer_CancelAfterCallbackSelfDeletes(t *testing.T) {
+	d := newFlushDebouncer(20 * time.Millisecond)
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(started)
+		<-finish
+	})
+
+	// Wait for the callback to start (entry self-deleted from pending, now inflight).
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback did not start within 2s")
+	}
+
+	// Cancel should block (callback inflight) then return once it finishes.
+	cancelDone := make(chan struct{})
+	go func() {
+		d.Cancel("/a")
+		close(cancelDone)
+	}()
+
+	select {
+	case <-cancelDone:
+		t.Fatal("Cancel returned before callback finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(finish)
+
+	select {
+	case <-cancelDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cancel did not return after callback finished")
+	}
+}
+
+// TestFlushDebouncer_ScheduleReplacesWhileCallbackRunning verifies no
+// panic/deadlock when Schedule replaces a pending entry while the previous
+// callback is still running.
+func TestFlushDebouncer_ScheduleReplacesWhileCallbackRunning(t *testing.T) {
+	d := newFlushDebouncer(20 * time.Millisecond)
+	firstStarted := make(chan struct{})
+	firstFinish := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(firstStarted)
+		<-firstFinish
+	})
+
+	// Wait for the first callback to start.
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first callback did not start")
+	}
+
+	// Schedule a replacement while the first callback is running.
+	secondDone := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(secondDone)
+	})
+
+	// Let the first callback finish.
+	close(firstFinish)
+
+	// The replacement's timer (20ms) should fire and run the second callback.
+	select {
+	case <-secondDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second callback did not fire within 2s")
+	}
+
+	// Cancel should return without deadlock (no pending or inflight).
+	d.Cancel("/a")
+}
+
+// TestFlushDebouncer_CancelNoWaitDoesNotBlock verifies that CancelNoWait
+// returns immediately even when a callback is running.
+func TestFlushDebouncer_CancelNoWaitDoesNotBlock(t *testing.T) {
+	d := newFlushDebouncer(20 * time.Millisecond)
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(started)
+		<-finish
+	})
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback did not start")
+	}
+
+	// CancelNoWait must return immediately despite the running callback.
+	done := make(chan struct{})
+	go func() {
+		d.CancelNoWait("/a")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("CancelNoWait blocked while callback was running")
+	}
+
+	close(finish)
+}
+
 func TestInodeToPath_UpdateMtime(t *testing.T) {
 	m := NewInodeToPath()
 	ino := m.Lookup("/f", false, 10, time.Now())

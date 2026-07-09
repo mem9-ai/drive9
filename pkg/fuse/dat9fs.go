@@ -6301,7 +6301,7 @@ func (fs *Dat9FS) syncOpenSourceForHardlink(ctx context.Context, ino uint64) gof
 		}
 		size := fh.Dirty.Size()
 		if fs.debouncer != nil {
-			fs.debouncer.Cancel(fh.Path)
+			fs.debouncer.CancelNoWait(fh.Path)
 		}
 		syncCtx, cancel := context.WithTimeout(ctx, releaseTimeout(size))
 		st := fs.syncHandleToRemoteLocked(syncCtx, fh)
@@ -11735,7 +11735,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		}
 		// Cancel any pending debounce for this path — Release always flushes immediately.
 		phase = "cancel-debounce"
-		fs.debouncer.Cancel(fh.Path)
+		fs.debouncer.CancelNoWait(fh.Path)
 
 		// close-sync is primarily enforced in Flush so close(2) can receive
 		// remote upload errors. Keep Release as a best-effort fallback for
@@ -12129,13 +12129,24 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		}
 		fs.inodes.UpdateSize(ino, int64(len(data)))
 		fs.cacheFileForPath(filePath, int64(len(data)), time.Now(), committedRev)
-		// The file is now committed on the server. Update the writeBack
-		// entry from PendingNew to PendingOverwrite so that Unlink does not
-		// skip the remote DELETE (thinking the file was never uploaded).
+		// The file is now committed on the server. Clean up local staging
+		// state so that Unlink sees a consistent picture: writeBack is
+		// promoted from PendingNew to PendingOverwrite (so the writeBack
+		// GetMeta check at dat9fs.go:7751 does not skip the DELETE), and
+		// pendingIndex + shadowStore entries are removed (so the re-check
+		// at dat9fs.go:7770 does not see a stale PendingNew and override
+		// pendingNew back to true). This mirrors commitQueue's
+		// onCommitSuccessWithOptions cleanup (shadow + index removal).
 		if fs.writeBack != nil {
 			if meta, ok := fs.writeBack.GetMeta(filePath); ok && meta.Kind == PendingNew {
 				_ = fs.writeBack.PutWithBaseRev(filePath, nil, int64(len(data)), PendingOverwrite, committedRev)
 			}
+		}
+		if fs.pendingIndex != nil {
+			fs.pendingIndex.Remove(filePath)
+		}
+		if fs.shadowStore != nil {
+			fs.shadowStore.Remove(filePath)
 		}
 		// Local debounced flush — kernel is not aware of this async
 		// operation and does not need notify. Userspace caches are
@@ -12494,7 +12505,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// expectedRevision after acquiring the lock and skips the upload if
 	// the revision advanced (see flushHandleDebounced callback).
 	if fs.debouncer != nil {
-		fs.debouncer.Cancel(handlePath)
+		fs.debouncer.CancelNoWait(handlePath)
 	}
 
 	uploadStart := time.Now()
@@ -12990,6 +13001,20 @@ func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int6
 		fs.forgetCommittedRevision(meta.Path)
 	}
 	fs.cacheFileForPath(meta.Path, meta.Size, time.Now(), committedRev)
+	// Clean up pendingIndex and shadowStore so that Unlink does not see a
+	// stale PendingNew entry and skip the remote DELETE (thinking the file
+	// was never uploaded). This mirrors commitQueue's onCommitSuccessWithOptions
+	// cleanup (shadow + index removal at commit_queue.go:1746-1749). Without
+	// this, files uploaded by the legacy uploader (when commitQueue is full or
+	// shadow staging failed) leave a PendingNew pendingIndex entry that causes
+	// Unlink to skip DELETE, leaving orphan files on the server and causing
+	// rmdir to fail with ENOTEMPTY.
+	if fs.pendingIndex != nil {
+		fs.pendingIndex.Remove(meta.Path)
+	}
+	if fs.shadowStore != nil {
+		fs.shadowStore.Remove(meta.Path)
+	}
 }
 
 func (fs *Dat9FS) onCommitQueueCleanup(entry *CommitEntry) {
