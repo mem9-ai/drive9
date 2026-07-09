@@ -59,6 +59,24 @@ func TestNewProvisionerFromEnvUsesBuiltinDefaultSpendingLimit(t *testing.T) {
 	}
 }
 
+func TestNewProvisionerFromEnvRejectsTooSmallDefaultSpendingLimit(t *testing.T) {
+	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
+	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
+	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
+	t.Setenv(EnvTiDBCloudDefaultSpendingLimit, "5")
+
+	_, err := NewProvisionerFromEnv()
+	if err == nil {
+		t.Fatal("expected invalid default spending limit error")
+	}
+	if !strings.Contains(err.Error(), EnvTiDBCloudDefaultSpendingLimit) {
+		t.Fatalf("error = %v, want env name", err)
+	}
+	if !strings.Contains(err.Error(), "must be 0 or at least 10 RMB") {
+		t.Fatalf("error = %v, want spending-limit floor", err)
+	}
+}
+
 func TestNewProvisionerFromEnvRequiresCloudProviderAndRegion(t *testing.T) {
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "")

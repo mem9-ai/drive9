@@ -1254,6 +1254,9 @@ func validateTiDBCloudSpendingLimit(monthly int64) error {
 	if monthly < 0 {
 		return fmt.Errorf("tidbcloud_spending_limit must be non-negative")
 	}
+	if monthly > 0 && monthly < 10 {
+		return fmt.Errorf("tidbcloud_spending_limit must be 0 or at least 10 RMB")
+	}
 	if monthly > maxInt32 {
 		return fmt.Errorf("tidbcloud_spending_limit is too large")
 	}
@@ -1362,6 +1365,9 @@ func parseDefaultSpendLimit(raw string) (*int32, error) {
 	monthly, err := strconv.ParseInt(trimmed, 10, 32)
 	if err != nil || monthly < 0 {
 		return nil, fmt.Errorf("invalid %s value %q: must be a non-negative integer", EnvTiDBCloudDefaultSpendingLimit, raw)
+	}
+	if err := validateTiDBCloudSpendingLimit(monthly); err != nil {
+		return nil, fmt.Errorf("invalid %s value %q: %w", EnvTiDBCloudDefaultSpendingLimit, raw, err)
 	}
 	out := int32(monthly)
 	return &out, nil

@@ -221,6 +221,56 @@ func (f *fakeProvisioner) ProvisionCallCount() int {
 	return int(f.provisionCalls.Load())
 }
 
+func TestClientFacingErrorResponseMapsTiDBCloudClientErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "invalid request",
+			err:        errors.New(`update cluster spending limit: tidbcloud native cluster spending limit update status 400: {"code":400,"message":"Scalable cluster can not set spending limit to 0.","details":[{"requestId":"202607090625337c3caba58b2eb378ca"}]}`),
+			wantStatus: http.StatusBadRequest,
+			wantBody:   "Scalable cluster can not set spending limit to 0",
+		},
+		{
+			name:       "invalid api key",
+			err:        errors.New("list managed clusters: tidbcloud native cluster list status 401: invalid TiDB Cloud API key"),
+			wantStatus: http.StatusUnauthorized,
+			wantBody:   "invalid TiDB Cloud API key",
+		},
+		{
+			name:       "forbidden",
+			err:        errors.New("update quota: tidbcloud native cluster spending limit update status 403: access denied"),
+			wantStatus: http.StatusForbidden,
+			wantBody:   "access denied",
+		},
+		{
+			name:       "generic error hides detail",
+			err:        errors.New("internal upstream detail"),
+			wantStatus: http.StatusBadGateway,
+			wantBody:   "claim tenant pool tenant failed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotStatus, gotMsg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", tc.err)
+			if gotStatus != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; msg=%s", gotStatus, tc.wantStatus, gotMsg)
+			}
+			if !strings.Contains(gotMsg, tc.wantBody) {
+				t.Fatalf("msg = %q, want containing %q", gotMsg, tc.wantBody)
+			}
+			if strings.Contains(gotMsg, "requestId") || strings.Contains(gotMsg, "details") {
+				t.Fatalf("msg = %q, should not expose raw TiDB Cloud details", gotMsg)
+			}
+			if strings.Contains(gotMsg, "internal upstream detail") {
+				t.Fatalf("msg = %q, should not expose generic upstream details", gotMsg)
+			}
+		})
+	}
+}
+
 func waitForDeprovisionCalls(t *testing.T, prov *fakeProvisioner, want int32) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

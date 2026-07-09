@@ -187,7 +187,8 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 				"error", err)...)
 			s.deleteTenantPoolMetadata(ctx, poolID, "create_free_tenants_error")
 			metricResult = "cluster_error"
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("create tenant pool failed: %v", err))
+			status, msg := clientFacingErrorResponse(http.StatusBadGateway, "create tenant pool failed", err)
+			errJSON(w, status, msg)
 			return nil
 		}
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_create_free_tenants_done",
@@ -370,7 +371,8 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 					"grow_count", growCount,
 					"duration_ms", durationMillis(stageStarted),
 					"error", err)...)
-				return adminTenantPoolError(http.StatusBadGateway, fmt.Sprintf("grow tenant pool failed: %v", err))
+				status, msg := clientFacingErrorResponse(http.StatusBadGateway, "grow tenant pool failed", err)
+				return adminTenantPoolError(status, msg)
 			}
 			for _, res := range results {
 				s.startProvisionedTenantSchemaInit(ctx, res)
@@ -413,7 +415,8 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 					"deleted_count", deleted,
 					"duration_ms", durationMillis(stageStarted),
 					"error", err)...)
-				return adminTenantPoolError(http.StatusBadGateway, fmt.Sprintf("shrink tenant pool failed: %v", err))
+				status, msg := clientFacingErrorResponse(http.StatusBadGateway, "shrink tenant pool failed", err)
+				return adminTenantPoolError(status, msg)
 			}
 			logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_update_shrink_done",
 				"provider", tenant.ProviderTiDBCloudNative,
@@ -562,7 +565,8 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 			"organization_id", pool.OrganizationID)...)
 		deleted, err := s.deleteNewestFreePoolTenants(ctx, pool.PoolID, pool.OrganizationID, 0, cred, true)
 		if err != nil {
-			return adminTenantPoolError(http.StatusBadGateway, fmt.Sprintf("delete tenant pool failed: %v", err))
+			status, msg := clientFacingErrorResponse(http.StatusBadGateway, "delete tenant pool failed", err)
+			return adminTenantPoolError(status, msg)
 		}
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_delete_free_tenants_done",
 			"provider", tenant.ProviderTiDBCloudNative,
