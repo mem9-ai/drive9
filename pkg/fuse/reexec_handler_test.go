@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -32,21 +33,22 @@ func TestReexecRefusesConcurrent(t *testing.T) {
 	}
 }
 
-func TestReexecRefusesDirtyState(t *testing.T) {
-	// Use a real Dat9FS-like setup with open file handles to trigger
-	// preflight refusal. We can't easily test the full Reexec path
-	// without a real FUSE server, but we can verify that preflight
-	// gates are checked by the Reexec method.
+func TestReexecGuardAcquireReleaseCycle(t *testing.T) {
 	fs := newTestReexecFS()
-	fs.fileHandles.Allocate(&FileHandle{Path: "/dirty.txt"})
-
-	// Reexec will fail because fs.server is nil (step 1), not because
-	// of dirty state (step 4). The dirty state test is really a
-	// preflight test which is covered in reexec_gate_test.go.
-	result := fs.Reexec(ReexecConfig{MountPoint: "/mnt"})
-	if result.Accepted {
-		t.Fatal("expected reexec to fail")
+	// First acquire succeeds.
+	if !fs.reexecGuard.tryAcquire() {
+		t.Fatal("first acquire should succeed")
 	}
+	// Second acquire fails.
+	if fs.reexecGuard.tryAcquire() {
+		t.Fatal("second acquire should fail")
+	}
+	// After release, acquire succeeds again.
+	fs.reexecGuard.release()
+	if !fs.reexecGuard.tryAcquire() {
+		t.Fatal("acquire after release should succeed")
+	}
+	fs.reexecGuard.release()
 }
 
 func TestReexecChildEnvParsing(t *testing.T) {
@@ -113,9 +115,54 @@ func TestReexecChildVersionMismatch(t *testing.T) {
 }
 
 func TestReexecAcceptMsgRoundTrip(t *testing.T) {
-	// Verify the accept message struct can be marshaled/unmarshaled correctly.
-	msg := reexecAcceptMsg{Accept: true, Version: 1}
-	if !msg.Accept || msg.Version != 1 {
-		t.Fatal("accept msg fields incorrect")
+	orig := reexecAcceptMsg{Accept: true, Version: ReexecProtocolVersion}
+	data, err := json.Marshal(&orig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded reexecAcceptMsg
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Accept != orig.Accept {
+		t.Fatalf("Accept: want %v, got %v", orig.Accept, decoded.Accept)
+	}
+	if decoded.Version != orig.Version {
+		t.Fatalf("Version: want %d, got %d", orig.Version, decoded.Version)
+	}
+}
+
+func TestReexecAcceptMsgRejectRoundTrip(t *testing.T) {
+	orig := reexecAcceptMsg{Accept: false, Version: ReexecProtocolVersion}
+	data, err := json.Marshal(&orig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded reexecAcceptMsg
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Accept != false {
+		t.Fatal("Accept should be false")
+	}
+}
+
+func TestReexecChildEnvMissingMount(t *testing.T) {
+	t.Setenv("DRIVE9_REEXEC_SOCK", "/tmp/test.sock")
+	t.Setenv("DRIVE9_REEXEC_VERSION", "1")
+
+	_, err := ParseReexecChildEnv()
+	if err == nil {
+		t.Fatal("expected error for missing DRIVE9_REEXEC_MOUNT")
+	}
+}
+
+func TestReexecChildEnvMissingVersion(t *testing.T) {
+	t.Setenv("DRIVE9_REEXEC_SOCK", "/tmp/test.sock")
+	t.Setenv("DRIVE9_REEXEC_MOUNT", "/mnt/test")
+
+	_, err := ParseReexecChildEnv()
+	if err == nil {
+		t.Fatal("expected error for missing DRIVE9_REEXEC_VERSION")
 	}
 }

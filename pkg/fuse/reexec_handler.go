@@ -162,6 +162,11 @@ func (fs *Dat9FS) Reexec(cfg ReexecConfig) ReexecResult {
 	defer listener.Close()
 
 	// Spawn the child process with reexec-specific env vars.
+	// os.Args[1:] is passed through intentionally — the child's main()
+	// calls IsReexecChild() early and takes the reexec import path,
+	// skipping any one-shot flags (e.g. --migrate). The DRIVE9_REEXEC_*
+	// env vars are the real control channel; args are preserved so the
+	// child's normal flag parser sees the same mount config.
 	child := exec.Command(binaryPath, os.Args[1:]...)
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
