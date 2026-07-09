@@ -328,19 +328,51 @@ jobs:
         id: deploy-tencent
         if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
         run: |
+          set -euo pipefail
+          retry_kubectl() {
+            local attempt=1
+            local max_attempts=5
+            while true; do
+              if kubectl --kubeconfig ~/.kube/tencent-config "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                return 1
+              fi
+              echo "kubectl failed (attempt ${attempt}/${max_attempts}); retrying in 10s..." >&2
+              attempt=$((attempt + 1))
+              sleep 10
+            done
+          }
           mkdir -p ~/.kube
           tccli tke DescribeClusterKubeconfig --ClusterId cls-6dpiw235 --IsExtranet true --region ap-beijing | python3 -c "import sys,json; print(json.load(sys.stdin)['Kubeconfig'])" > ~/.kube/tencent-config
-          kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
+          retry_kubectl -n drive9-tidbcloud \
             set image deployment/drive9-server \
             drive9-server=$TCR_IMAGE
-          kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
+          retry_kubectl -n drive9-tidbcloud \
             rollout status deployment/drive9-server --timeout=300s
 
       - name: Rollback tencentcloud-ap-beijing on failure
         if: failure() && steps.deploy-tencent.outcome == 'failure'
         run: |
+          set -euo pipefail
+          retry_kubectl() {
+            local attempt=1
+            local max_attempts=3
+            while true; do
+              if kubectl --kubeconfig ~/.kube/tencent-config "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                return 1
+              fi
+              echo "kubectl rollback failed (attempt ${attempt}/${max_attempts}); retrying in 10s..." >&2
+              attempt=$((attempt + 1))
+              sleep 10
+            done
+          }
           if [ -f ~/.kube/tencent-config ]; then
-            kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
+            retry_kubectl -n drive9-tidbcloud \
               rollout undo deployment/drive9-server
           fi
 
