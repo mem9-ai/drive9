@@ -1366,6 +1366,9 @@ func parseDefaultSpendLimit(raw string) (*int32, error) {
 	if err != nil || monthly < 0 {
 		return nil, fmt.Errorf("invalid %s value %q: must be a non-negative integer", EnvTiDBCloudDefaultSpendingLimit, raw)
 	}
+	if err := validateTiDBCloudSpendingLimit(monthly); err != nil {
+		return nil, fmt.Errorf("invalid %s value %q: %w", EnvTiDBCloudDefaultSpendingLimit, raw, err)
+	}
 	out := int32(monthly)
 	return &out, nil
 }

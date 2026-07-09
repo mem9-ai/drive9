@@ -241,6 +241,12 @@ func TestClientFacingErrorResponseMapsTiDBCloudClientErrors(t *testing.T) {
 			wantBody:   "invalid TiDB Cloud API key",
 		},
 		{
+			name:       "forbidden",
+			err:        errors.New("update quota: tidbcloud native cluster spending limit update status 403: access denied"),
+			wantStatus: http.StatusForbidden,
+			wantBody:   "access denied",
+		},
+		{
 			name:       "generic error hides detail",
 			err:        errors.New("internal upstream detail"),
 			wantStatus: http.StatusBadGateway,
