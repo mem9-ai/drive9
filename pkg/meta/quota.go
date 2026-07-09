@@ -564,7 +564,7 @@ func retryMetaLockConflict(ctx context.Context, tenantID, metricOperation, logOp
 		case <-time.After(time.Duration(attempt) * metaLockConflictRetryBase):
 		}
 	}
-	return fmt.Errorf("%w: %v", ErrQuotaReservationBusy, lastErr)
+	return fmt.Errorf("%w: %w", ErrQuotaReservationBusy, lastErr)
 }
 
 func isMetaLockConflictError(err error) bool {
@@ -572,11 +572,14 @@ func isMetaLockConflictError(err error) bool {
 		return false
 	}
 	msg := err.Error()
+	lower := strings.ToLower(msg)
 	return strings.Contains(msg, "Deadlock found") ||
 		strings.Contains(msg, "Error 1213") ||
 		strings.Contains(msg, "40001") ||
 		strings.Contains(msg, "Lock wait timeout exceeded") ||
-		strings.Contains(msg, "Error 1205")
+		strings.Contains(msg, "Error 1205") ||
+		(strings.Contains(msg, "9007") && strings.Contains(lower, "write conflict")) ||
+		strings.Contains(lower, "write conflict")
 }
 
 func (s *Store) uploadReservationQuotaErrorTx(ctx context.Context, tx *sql.Tx, r *UploadReservation) error {

@@ -270,15 +270,50 @@ func TestRetryMetaLockConflictDoesNotRetryBusinessError(t *testing.T) {
 
 func TestRetryMetaLockConflictExhaustedReturnsBusy(t *testing.T) {
 	var calls int
+	lockErr := errors.New("Error 1213 (40001): Deadlock found when trying to get lock; try restarting transaction")
 	err := retryMetaLockConflict(context.Background(), "tenant-busy", "reserve_upload", "test_op", func() error {
 		calls++
-		return errors.New("Error 1213 (40001): Deadlock found when trying to get lock; try restarting transaction")
+		return lockErr
 	})
 	if !errors.Is(err, ErrQuotaReservationBusy) {
 		t.Fatalf("err = %v, want ErrQuotaReservationBusy", err)
 	}
+	if !errors.Is(err, lockErr) {
+		t.Fatalf("err = %v, want wrapped lock conflict error", err)
+	}
 	if calls != metaLockConflictRetryAttempts {
 		t.Fatalf("calls = %d, want %d", calls, metaLockConflictRetryAttempts)
+	}
+}
+
+func TestIsMetaLockConflictErrorIncludesTiDBWriteConflict(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "tidb write conflict code",
+			err:  errors.New("ERROR 9007 (HY000): Write conflict, txnStartTS=123, conflictStartTS=456"),
+			want: true,
+		},
+		{
+			name: "tidb write conflict message",
+			err:  errors.New("write conflict, retry txn"),
+			want: true,
+		},
+		{
+			name: "unrelated 9007",
+			err:  errors.New("ERROR 9007 quota unavailable"),
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isMetaLockConflictError(tt.err); got != tt.want {
+				t.Fatalf("isMetaLockConflictError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 
