@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResultForError(t *testing.T) {
@@ -55,7 +56,7 @@ func TestRecordTenantPoolMetadataResumeWaitIncludesPoolAndOrganizationID(t *test
 	const poolID = "pool-metadata-resume-metrics-test"
 	const organizationID = "org-metadata-resume-metrics-test"
 
-	RecordTenantPoolMetadataResumeWait(poolID, organizationID, "group", "ok", 0)
+	RecordTenantPoolMetadataResumeWait(poolID, organizationID, "group", "ok", 10*time.Minute)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
@@ -65,6 +66,28 @@ func TestRecordTenantPoolMetadataResumeWaitIncludesPoolAndOrganizationID(t *test
 	}
 	if !strings.Contains(text, `drive9_tenant_pool_metadata_resume_wait_duration_seconds_count{organization_id="`+organizationID+`",pool_id="`+poolID+`",result="ok",scope="group"} 1`) {
 		t.Fatalf("missing tenant pool metadata resume wait duration with pool_id and organization_id:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_pool_metadata_resume_wait_duration_seconds_bucket{organization_id="`+organizationID+`",pool_id="`+poolID+`",result="ok",scope="group",le="480"} 0`) {
+		t.Fatalf("missing 480s tenant pool metadata resume wait duration bucket:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_pool_metadata_resume_wait_duration_seconds_bucket{organization_id="`+organizationID+`",pool_id="`+poolID+`",result="ok",scope="group",le="600"} 1`) {
+		t.Fatalf("missing 600s tenant pool metadata resume wait duration bucket:\n%s", text)
+	}
+}
+
+func TestRecordHTTPRequestIncludesLongWriteLatencyBuckets(t *testing.T) {
+	const route = "/v1/fs/http-long-bucket-test"
+
+	RecordHTTPRequest("POST", route, 200, 25*time.Second)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_http_request_duration_seconds_bucket{method="POST",route="`+route+`",le="20"} 0`) {
+		t.Fatalf("missing 20s HTTP duration bucket:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_http_request_duration_seconds_bucket{method="POST",route="`+route+`",le="30"} 1`) {
+		t.Fatalf("missing 30s HTTP duration bucket:\n%s", text)
 	}
 }
 
