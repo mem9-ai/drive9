@@ -273,6 +273,215 @@ func TestReexecPreflightRefusesCommitQueuePendingWork(t *testing.T) {
 	require.True(t, hasIndex, "should refuse when pending index has entries (commit queue scenario)")
 }
 
+func TestReexecPreflightRefusesLayerOverlayWhiteouts(t *testing.T) {
+	fs := newTestReexecFS()
+	fs.layerWhiteouts = map[string]struct{}{"/deleted": {}}
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	hasGate := false
+	for _, r := range result.Refusals {
+		if r.Gate == "layer_overlay" {
+			hasGate = true
+		}
+	}
+	require.True(t, hasGate, "should refuse when layerWhiteouts is non-empty")
+}
+
+func TestReexecPreflightRefusesLayerOverlayFiles(t *testing.T) {
+	fs := newTestReexecFS()
+	fs.layerFiles = map[string]uint32{"/new.txt": 0o644}
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	hasGate := false
+	for _, r := range result.Refusals {
+		if r.Gate == "layer_overlay" {
+			hasGate = true
+		}
+	}
+	require.True(t, hasGate, "should refuse when layerFiles is non-empty")
+}
+
+func TestReexecPreflightRefusesLayerOverlayDirs(t *testing.T) {
+	fs := newTestReexecFS()
+	fs.layerDirs = map[string]uint32{"/newdir": 0o755}
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	hasGate := false
+	for _, r := range result.Refusals {
+		if r.Gate == "layer_overlay" {
+			hasGate = true
+		}
+	}
+	require.True(t, hasGate, "should refuse when layerDirs is non-empty")
+}
+
+func TestReexecPreflightRefusesLayerOverlaySymlinks(t *testing.T) {
+	fs := newTestReexecFS()
+	fs.layerSymlinks = map[string]layerSymlinkState{"/link": {Target: "/target", Mode: 0o777}}
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	hasGate := false
+	for _, r := range result.Refusals {
+		if r.Gate == "layer_overlay" {
+			hasGate = true
+		}
+	}
+	require.True(t, hasGate, "should refuse when layerSymlinks is non-empty")
+}
+
+func TestReexecPreflightRefusesUploaderQueued(t *testing.T) {
+	ch := make(chan string, 10)
+	ch <- "/queued.txt"
+	u := &WriteBackUploader{
+		uploadCh: ch,
+		inflight: make(map[string]*pathState),
+	}
+	fs := newTestReexecFS()
+	fs.uploader = u
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	hasGate := false
+	for _, r := range result.Refusals {
+		if r.Gate == "uploader_queued" {
+			hasGate = true
+			require.Equal(t, 1, r.Count)
+		}
+	}
+	require.True(t, hasGate, "should refuse when uploader has queued entries")
+}
+
+func TestReexecPreflightRefusesUploaderInFlight(t *testing.T) {
+	u := &WriteBackUploader{
+		uploadCh: make(chan string, 10),
+		inflight: map[string]*pathState{"/uploading.txt": {done: make(chan struct{})}},
+	}
+	fs := newTestReexecFS()
+	fs.uploader = u
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	hasGate := false
+	for _, r := range result.Refusals {
+		if r.Gate == "uploader_inflight" {
+			hasGate = true
+			require.Equal(t, 1, r.Count)
+		}
+	}
+	require.True(t, hasGate, "should refuse when uploader has in-flight entries")
+}
+
+func TestReexecPreflightRefusesUploaderCached(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	require.NoError(t, err)
+	cache.mu.Lock()
+	cache.metas["/cached.txt"] = &WriteBackMeta{Path: "/cached.txt", Size: 42}
+	cache.mu.Unlock()
+
+	u := &WriteBackUploader{
+		uploadCh: make(chan string, 10),
+		inflight: make(map[string]*pathState),
+		cache:    cache,
+	}
+	fs := newTestReexecFS()
+	fs.uploader = u
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	hasGate := false
+	for _, r := range result.Refusals {
+		if r.Gate == "uploader_cached" {
+			hasGate = true
+			require.Equal(t, 1, r.Count)
+		}
+	}
+	require.True(t, hasGate, "should refuse when uploader has cached entries")
+}
+
+func TestReexecPreflightRefusesCommitQueueInFlight(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(filepath.Join(dir, "shadow"))
+	require.NoError(t, err)
+	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
+	require.NoError(t, err)
+	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	require.NoError(t, err)
+
+	cq := NewCommitQueue(nil, ss, idx, j, 1, 100)
+	cq.mu.Lock()
+	cq.inFlight["/inflight.txt"] = &CommitEntry{Path: "/inflight.txt", Size: 10}
+	cq.mu.Unlock()
+
+	fs := newTestReexecFS()
+	fs.commitQueue = cq
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	hasGate := false
+	for _, r := range result.Refusals {
+		if r.Gate == "commit_queue_inflight" {
+			hasGate = true
+			require.Equal(t, 1, r.Count)
+		}
+	}
+	require.True(t, hasGate, "should refuse when commit queue has in-flight entries")
+}
+
+func TestReexecPreflightRefusesCommitQueueDelayed(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(filepath.Join(dir, "shadow"))
+	require.NoError(t, err)
+	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
+	require.NoError(t, err)
+	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	require.NoError(t, err)
+
+	cq := NewCommitQueue(nil, ss, idx, j, 1, 100)
+	entry := &CommitEntry{Path: "/delayed.txt", Size: 10}
+	cq.mu.Lock()
+	cq.delayed[entry] = time.NewTimer(time.Hour)
+	cq.mu.Unlock()
+
+	fs := newTestReexecFS()
+	fs.commitQueue = cq
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	hasGate := false
+	for _, r := range result.Refusals {
+		if r.Gate == "commit_queue_delayed" {
+			hasGate = true
+			require.Equal(t, 1, r.Count)
+		}
+	}
+	require.True(t, hasGate, "should refuse when commit queue has delayed entries")
+}
+
+func TestReexecPreflightRefusesCommitQueueConflicts(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(filepath.Join(dir, "shadow"))
+	require.NoError(t, err)
+	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
+	require.NoError(t, err)
+	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	require.NoError(t, err)
+
+	// Add a conflict entry via the pending index.
+	_, err = idx.Put("/conflict.txt", 100, PendingConflict)
+	require.NoError(t, err)
+
+	cq := NewCommitQueue(nil, ss, idx, j, 1, 100)
+
+	fs := newTestReexecFS()
+	fs.commitQueue = cq
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	hasGate := false
+	for _, r := range result.Refusals {
+		if r.Gate == "commit_queue_conflicts" {
+			hasGate = true
+			require.Equal(t, 1, r.Count)
+		}
+	}
+	require.True(t, hasGate, "should refuse when commit queue has conflicts")
+}
+
 func TestReexecPreflightCollectsMultipleRefusals(t *testing.T) {
 	fs := newTestReexecFS()
 	fs.fileHandles.Allocate(&FileHandle{Path: "/a.txt"})
