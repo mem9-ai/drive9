@@ -240,6 +240,12 @@ func TestClientFacingErrorResponseMapsTiDBCloudClientErrors(t *testing.T) {
 			wantStatus: http.StatusUnauthorized,
 			wantBody:   "invalid TiDB Cloud API key",
 		},
+		{
+			name:       "generic error hides detail",
+			err:        errors.New("internal upstream detail"),
+			wantStatus: http.StatusBadGateway,
+			wantBody:   "claim tenant pool tenant failed",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gotStatus, gotMsg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", tc.err)
@@ -251,6 +257,9 @@ func TestClientFacingErrorResponseMapsTiDBCloudClientErrors(t *testing.T) {
 			}
 			if strings.Contains(gotMsg, "requestId") || strings.Contains(gotMsg, "details") {
 				t.Fatalf("msg = %q, should not expose raw TiDB Cloud details", gotMsg)
+			}
+			if strings.Contains(gotMsg, "internal upstream detail") {
+				t.Fatalf("msg = %q, should not expose generic upstream details", gotMsg)
 			}
 		})
 	}

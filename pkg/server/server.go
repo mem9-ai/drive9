@@ -4509,7 +4509,18 @@ func clientFacingErrorDetail(err error) string {
 	if err == nil {
 		return ""
 	}
-	return strings.TrimSpace(err.Error())
+	switch {
+	case errors.Is(err, tenant.ErrCredentialsRequired):
+		return tenant.ErrCredentialsRequired.Error()
+	case errors.Is(err, tenant.ErrPartialCredentials):
+		return tenant.ErrPartialCredentials.Error()
+	case errors.Is(err, tenant.ErrQuotaPermissionDenied):
+		return tenant.ErrQuotaPermissionDenied.Error()
+	case errors.Is(err, tenant.ErrQuotaBackendNotFound):
+		return tenant.ErrQuotaBackendNotFound.Error()
+	default:
+		return ""
+	}
 }
 
 func parseTiDBCloudStatusError(err error) (operation string, code int, ok bool) {
