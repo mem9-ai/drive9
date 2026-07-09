@@ -11,6 +11,15 @@ const defaultFlushDebounce = 2 * time.Second
 // is called for a path that already has a pending timer, the previous timer is
 // reset and the new uploadFn replaces the old one — only the latest snapshot
 // will be uploaded.
+//
+// Concurrency model: at most one callback per path is executing at any time
+// (tracked in inflight). The timer callback captures the specific pendingFlush
+// it was created for and verifies it is still the current pending entry (via
+// pointer identity) before running; this prevents a stale timer from acting on
+// a newer Schedule's entry or clobbering a newer inflight slot. Cancel and
+// CancelNoWait are safe to call concurrently with the timer callback. Cancel
+// blocks until an in-flight callback for the path finishes so callers (e.g.
+// Unlink) can safely inspect server-side state afterwards.
 type flushDebouncer struct {
 	mu       sync.Mutex
 	delay    time.Duration
@@ -45,6 +54,11 @@ func newFlushDebouncer(delay time.Duration) *flushDebouncer {
 // Schedule registers (or replaces) a deferred upload for path. If a previous
 // timer exists for path, it is stopped and replaced. The uploadFn is called
 // after delay elapses without another Schedule call for the same path.
+//
+// If a callback for path is already executing (inflight), the new entry is
+// still recorded in pending so it fires after the in-flight callback finishes;
+// the timer callback will not run a second concurrent callback for the same
+// path — it waits for the existing inflight to drain first.
 func (d *flushDebouncer) Schedule(path string, uploadFn func()) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -57,24 +71,52 @@ func (d *flushDebouncer) Schedule(path string, uploadFn func()) {
 
 	pf := &pendingFlush{uploadFn: uploadFn, done: make(chan struct{})}
 	pf.timer = time.AfterFunc(d.delay, func() {
-		d.mu.Lock()
-		current, ok := d.pending[path]
-		if ok {
-			delete(d.pending, path)
-			d.inflight[path] = current
-		}
-		d.mu.Unlock()
-
-		if ok && current.uploadFn != nil {
-			current.uploadFn()
-		}
-
-		d.mu.Lock()
-		delete(d.inflight, path)
-		d.mu.Unlock()
-		current.finish()
+		d.runCallback(path, pf)
 	})
 	d.pending[path] = pf
+}
+
+// runCallback is the timer body. It verifies pf is still the current pending
+// entry for path (via pointer identity), waits for any pre-existing in-flight
+// callback to finish, then promotes pf to inflight and runs uploadFn.
+func (d *flushDebouncer) runCallback(path string, pf *pendingFlush) {
+	for {
+		d.mu.Lock()
+		// Verify pf is still the current pending entry. A newer Schedule may
+		// have replaced it (and finished the old done channel); in that case
+		// this timer is stale and must not run.
+		current, ok := d.pending[path]
+		if !ok || current != pf {
+			d.mu.Unlock()
+			return
+		}
+		// If a previous callback is still in-flight for this path, wait for it
+		// to finish before promoting ourselves. This prevents two same-path
+		// callbacks from running concurrently and clobbering the inflight slot.
+		if running, rok := d.inflight[path]; rok {
+			d.mu.Unlock()
+			<-running.done
+			continue // re-check pending in case a newer Schedule arrived
+		}
+		delete(d.pending, path)
+		d.inflight[path] = pf
+		d.mu.Unlock()
+
+		if pf.uploadFn != nil {
+			pf.uploadFn()
+		}
+
+		d.mu.Lock()
+		// Only delete inflight if pf is still the one we installed. A newer
+		// Schedule cannot have overwritten inflight (we hold the slot until
+		// here), but guard defensively.
+		if d.inflight[path] == pf {
+			delete(d.inflight, path)
+		}
+		d.mu.Unlock()
+		pf.finish()
+		return
+	}
 }
 
 // Cancel stops and removes the pending debounce for path without executing
@@ -116,11 +158,22 @@ func (d *flushDebouncer) CancelNoWait(path string) {
 }
 
 // FlushAll executes all pending uploads immediately and clears the pending map.
-// Used during graceful shutdown.
+// Used during graceful shutdown. It waits for any callbacks that were already
+// in-flight when called to finish, avoiding a concurrent map iteration/write.
 func (d *flushDebouncer) FlushAll() {
 	d.mu.Lock()
-	pending := d.pending
+	// Snapshot pending entries and clear the map under the lock.
+	pending := make([]*pendingFlush, 0, len(d.pending))
+	for _, pf := range d.pending {
+		pending = append(pending, pf)
+	}
 	d.pending = make(map[string]*pendingFlush)
+	// Snapshot inflight pointers under the lock so the range below does not
+	// race with timer callbacks that delete from d.inflight concurrently.
+	inflight := make([]*pendingFlush, 0, len(d.inflight))
+	for _, pf := range d.inflight {
+		inflight = append(inflight, pf)
+	}
 	d.mu.Unlock()
 
 	for _, pf := range pending {
@@ -131,10 +184,6 @@ func (d *flushDebouncer) FlushAll() {
 		pf.finish()
 	}
 
-	// Wait for any callbacks that were already running when FlushAll was called.
-	d.mu.Lock()
-	inflight := d.inflight
-	d.mu.Unlock()
 	for _, pf := range inflight {
 		<-pf.done
 	}

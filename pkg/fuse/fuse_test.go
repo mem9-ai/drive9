@@ -2638,6 +2638,118 @@ func TestFlushDebouncer_CancelNoWaitDoesNotBlock(t *testing.T) {
 	close(finish)
 }
 
+// TestFlushDebouncer_SamePathNoDoubleInflight verifies that when callback A
+// is already running for a path, a new Schedule for the same path does not
+// cause a second callback to run concurrently. The new callback must wait for
+// the in-flight one to finish first. This is the race qiffang identified: a
+// second Schedule could overwrite inflight[path], and Cancel would return
+// while the second callback was still running.
+func TestFlushDebouncer_SamePathNoDoubleInflight(t *testing.T) {
+	d := newFlushDebouncer(20 * time.Millisecond)
+	aStarted := make(chan struct{})
+	aFinish := make(chan struct{})
+	var concurrent atomic.Int32
+
+	d.Schedule("/a", func() {
+		close(aStarted)
+		<-aFinish
+	})
+
+	// Wait for callback A to start (it's now in-flight).
+	select {
+	case <-aStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback A did not start")
+	}
+
+	// Schedule B while A is still running.
+	bDone := make(chan struct{})
+	d.Schedule("/a", func() {
+		if concurrent.Add(1) > 1 {
+			close(bDone)
+			t.Fatal("two callbacks ran concurrently")
+		}
+		concurrent.Add(-1)
+		close(bDone)
+	})
+
+	// Let A finish. B's timer fires after, and must wait for A's inflight to
+	// drain before running.
+	close(aFinish)
+
+	select {
+	case <-bDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback B did not run within 2s")
+	}
+
+	// Cancel must not return while any callback is still running. After both
+	// finish, Cancel returns immediately.
+	d.Cancel("/a")
+}
+
+// TestFlushDebouncer_StaleTimerDoesNotRunNewerEntry verifies that a stale timer
+// (from a superseded Schedule) does not act on the newer pending entry. When
+// Schedule replaces a pending entry, the old timer must detect it is stale and
+// skip, leaving only the new entry's callback to fire.
+func TestFlushDebouncer_StaleTimerDoesNotRunNewerEntry(t *testing.T) {
+	d := newFlushDebouncer(50 * time.Millisecond)
+	var firstRan, secondRan atomic.Bool
+
+	// Schedule first, then immediately replace it. The first timer is stale.
+	d.Schedule("/a", func() { firstRan.Store(true) })
+	// Replace before the first timer fires.
+	d.Schedule("/a", func() { secondRan.Store(true) })
+
+	// Wait long enough for both timers to have fired.
+	time.Sleep(200 * time.Millisecond)
+
+	if firstRan.Load() {
+		t.Fatal("stale (superseded) callback should not have run")
+	}
+	if !secondRan.Load() {
+		t.Fatal("latest callback should have run")
+	}
+}
+
+// TestFlushDebouncer_FlushAllNoMapRace verifies FlushAll does not panic with
+// concurrent map iteration/write when timer callbacks delete from inflight
+// concurrently. This is a race test — run with -race to catch the bug.
+func TestFlushDebouncer_FlushAllNoMapRace(t *testing.T) {
+	d := newFlushDebouncer(10 * time.Millisecond)
+
+	// Start a callback that blocks so it is in-flight when FlushAll runs.
+	aStarted := make(chan struct{})
+	aFinish := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(aStarted)
+		<-aFinish
+	})
+
+	// Wait for A to be in-flight.
+	select {
+	case <-aStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback A did not start")
+	}
+
+	// Schedule B (pending, not yet fired) and call FlushAll while A is running.
+	flushDone := make(chan struct{})
+	go func() {
+		d.FlushAll()
+		close(flushDone)
+	}()
+
+	// Let A finish so FlushAll can complete.
+	close(aFinish)
+
+	select {
+	case <-flushDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("FlushAll did not complete")
+	}
+}
+
 func TestInodeToPath_UpdateMtime(t *testing.T) {
 	m := NewInodeToPath()
 	ino := m.Lookup("/f", false, 10, time.Now())

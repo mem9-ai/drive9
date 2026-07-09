@@ -36,7 +36,24 @@ type pathState struct {
 	done chan struct{} // closed when the current upload finishes
 }
 
-type WriteBackSuccessFunc func(meta WriteBackMeta, committedRev int64)
+type WriteBackSuccessFunc func(meta WriteBackMeta, committedRev int64, gens StagingGens)
+
+// StagingGens captures the generations of the writeBack, pendingIndex and
+// shadowStore entries associated with a writeBack entry at the moment it is
+// read for upload. This lets the OnSuccess callback perform generation-guarded
+// cleanup so a stale upload does not remove a fresher same-path staging entry
+// that was created by a concurrent write while the upload was in flight.
+type StagingGens struct {
+	WriteBackGen     uint64
+	PendingIndexGen  uint64
+	ShadowGen        uint64
+}
+
+// SnapshotStagingGensFunc snapshots the pendingIndex and shadowStore generations
+// for a path. If either store is absent or has no entry, the corresponding gen
+// is 0 (which never matches, so the guarded remove is skipped). Optional — if
+// nil, OnSuccess receives zero-value gens.
+type SnapshotStagingGensFunc func(remotePath string) StagingGens
 
 // WriteBackUploader consumes pending write-back cache entries and uploads
 // them to the server in the background. It runs a fixed number of worker
@@ -62,6 +79,9 @@ type WriteBackUploader struct {
 
 	perf      *fusePerfCounters
 	OnSuccess WriteBackSuccessFunc
+	// SnapshotStagingGens optionally captures the pendingIndex/shadowStore
+	// generations for a path so OnSuccess can do generation-guarded cleanup.
+	SnapshotStagingGens SnapshotStagingGensFunc
 }
 
 // NewWriteBackUploader creates and starts a background uploader with
@@ -359,6 +379,20 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	}
 	gen := meta.Generation
 
+	// Snapshot the staging-store generations alongside the writeBack read so
+	// the OnSuccess cleanup can be generation-guarded. A concurrent same-path
+	// write would bump all three generations; capturing them here (under the
+	// same path-lock window as GetMetaAndView) ties the cleanup to exactly the
+	// staging entries this upload is responsible for.
+	var stagingGens StagingGens
+	if u.SnapshotStagingGens != nil {
+		stagingGens = u.SnapshotStagingGens(localPath)
+	}
+	// Use the writeBack generation we just read (authoritative) rather than
+	// a re-read from the snapshot callback, which could race with a concurrent
+	// Put between GetMetaAndView and the callback.
+	stagingGens.WriteBackGen = gen
+
 	expectedRevision, err := expectedRevisionForWriteBack(meta)
 	if err != nil {
 		// TODO: add a migration or cleanup path for legacy overwrite entries
@@ -438,7 +472,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		u.perf.uploaderSuccess.add(1)
 	}
 	if u.OnSuccess != nil {
-		u.OnSuccess(*meta, committedRev)
+		u.OnSuccess(*meta, committedRev, stagingGens)
 	}
 }
 

@@ -12039,6 +12039,11 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	handle := fh               // capture for goroutine
 	snapshotSeq := fh.DirtySeq // capture current dirty sequence
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
+	// Snapshot the staging-store generations so the post-upload cleanup can be
+	// generation-guarded. A concurrent same-path write while the debounce is
+	// pending/in-flight would bump these generations, and removing the fresher
+	// entry would lose that pending data.
+	stagingGens := fs.snapshotStagingGens(filePath)
 
 	fs.debouncer.Schedule(filePath, func() {
 		handle.Lock()
@@ -12130,23 +12135,32 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		fs.inodes.UpdateSize(ino, int64(len(data)))
 		fs.cacheFileForPath(filePath, int64(len(data)), time.Now(), committedRev)
 		// The file is now committed on the server. Clean up local staging
-		// state so that Unlink sees a consistent picture: writeBack is
-		// promoted from PendingNew to PendingOverwrite (so the writeBack
-		// GetMeta check at dat9fs.go:7751 does not skip the DELETE), and
-		// pendingIndex + shadowStore entries are removed (so the re-check
-		// at dat9fs.go:7770 does not see a stale PendingNew and override
-		// pendingNew back to true). This mirrors commitQueue's
-		// onCommitSuccessWithOptions cleanup (shadow + index removal).
-		if fs.writeBack != nil {
-			if meta, ok := fs.writeBack.GetMeta(filePath); ok && meta.Kind == PendingNew {
-				_ = fs.writeBack.PutWithBaseRev(filePath, nil, int64(len(data)), PendingOverwrite, committedRev)
-			}
+		// state so that Unlink sees a consistent picture: the writeBack,
+		// pendingIndex and shadowStore entries for this upload are removed so
+		// the re-check at dat9fs.go:7770 does not see a stale PendingNew and
+		// override pendingNew back to true (which would skip the remote DELETE
+		// and leave an orphan file that makes rmdir fail with ENOTEMPTY). This
+		// mirrors commitQueue's onCommitSuccessWithOptions cleanup.
+		//
+		// The cleanup is generation-guarded: a newer same-path write may have
+		// replaced the staging entries (bumping their generations) while this
+		// upload was in flight, and removing the fresher entries would lose
+		// that pending data. stagingGens was captured under the handle lock at
+		// Schedule time, tying the cleanup to exactly the entries this upload
+		// is responsible for.
+		if fs.writeBack != nil && stagingGens.WriteBackGen != 0 {
+			// Remove the entry instead of promoting it to PendingOverwrite with
+			// a nil .dat payload — a nil-data Put would leave a zero-byte .dat
+			// with a nonzero Size in meta, an inconsistent snapshot. Removing
+			// the committed entry is safe: Unlink's GetMeta check returns
+			// ok=false so pendingNew stays false and the DELETE proceeds.
+			fs.writeBack.RemoveIfGeneration(filePath, stagingGens.WriteBackGen)
 		}
-		if fs.pendingIndex != nil {
-			fs.pendingIndex.Remove(filePath)
+		if fs.pendingIndex != nil && stagingGens.PendingIndexGen != 0 {
+			fs.pendingIndex.RemoveIfGeneration(filePath, stagingGens.PendingIndexGen)
 		}
-		if fs.shadowStore != nil {
-			fs.shadowStore.Remove(filePath)
+		if fs.shadowStore != nil && stagingGens.ShadowGen != 0 {
+			fs.shadowStore.RemoveIfGeneration(filePath, stagingGens.ShadowGen)
 		}
 		// Local debounced flush — kernel is not aware of this async
 		// operation and does not need notify. Userspace caches are
@@ -12986,7 +13000,23 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 	}
 }
 
-func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int64) {
+func (fs *Dat9FS) snapshotStagingGens(remotePath string) StagingGens {
+	var g StagingGens
+	if fs.writeBack != nil {
+		if meta, ok := fs.writeBack.GetMeta(remotePath); ok {
+			g.WriteBackGen = meta.Generation
+		}
+	}
+	if fs.pendingIndex != nil {
+		g.PendingIndexGen = fs.pendingIndex.Generation(remotePath)
+	}
+	if fs.shadowStore != nil {
+		g.ShadowGen = fs.shadowStore.ActiveGeneration(remotePath)
+	}
+	return g
+}
+
+func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int64, gens StagingGens) {
 	if fs == nil {
 		return
 	}
@@ -13009,11 +13039,17 @@ func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int6
 	// shadow staging failed) leave a PendingNew pendingIndex entry that causes
 	// Unlink to skip DELETE, leaving orphan files on the server and causing
 	// rmdir to fail with ENOTEMPTY.
-	if fs.pendingIndex != nil {
-		fs.pendingIndex.Remove(meta.Path)
+	//
+	// The cleanup is generation-guarded: a newer same-path write may have
+	// bumped the pendingIndex/shadowStore generations while this upload was in
+	// flight, and removing the fresher entry would lose that pending data.
+	// SnapshotStagingGens captured the generations at upload start; we only
+	// remove if they still match.
+	if fs.pendingIndex != nil && gens.PendingIndexGen != 0 {
+		fs.pendingIndex.RemoveIfGeneration(meta.Path, gens.PendingIndexGen)
 	}
-	if fs.shadowStore != nil {
-		fs.shadowStore.Remove(meta.Path)
+	if fs.shadowStore != nil && gens.ShadowGen != 0 {
+		fs.shadowStore.RemoveIfGeneration(meta.Path, gens.ShadowGen)
 	}
 }
 

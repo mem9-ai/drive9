@@ -964,7 +964,7 @@ func TestWriteBackUploader_OnSuccessInfersStreamRevision(t *testing.T) {
 		successMeta WriteBackMeta
 		successRev  int64
 	)
-	uploader.OnSuccess = func(meta WriteBackMeta, committedRev int64) {
+	uploader.OnSuccess = func(meta WriteBackMeta, committedRev int64, gens StagingGens) {
 		successMeta = meta
 		successRev = committedRev
 	}
