@@ -222,6 +222,10 @@ reviewed as correct:
     the clean snapshot and before accept.
 15. Non-empty transient local overlay refuses reexec; an empty automatic
     transient overlay root alone does not force read-only-only V0.
+16. Accept timeout after fd transfer rolls back safely: new process receives fd
+    but does not send accept before timeout; old process removes the quiesce
+    barrier, resumes serving, and queued/blocked requests complete according to
+    the defined rollback behavior.
 
 Existing tests already cover parts of the drain behavior, but they are not
 enough for V0. In particular, `TestDrainAllowsCleanOpenHandles` is correct for
