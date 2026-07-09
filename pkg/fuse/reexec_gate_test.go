@@ -396,6 +396,34 @@ func TestReexecPreflightRefusesUploaderCached(t *testing.T) {
 	require.True(t, hasGate, "should refuse when uploader has cached entries")
 }
 
+func TestReexecPreflightRefusesCommitQueuePending(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(filepath.Join(dir, "shadow"))
+	require.NoError(t, err)
+	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
+	require.NoError(t, err)
+	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	require.NoError(t, err)
+
+	cq := NewCommitQueue(nil, ss, idx, j, 1, 100)
+	cq.mu.Lock()
+	cq.queue = append(cq.queue, &CommitEntry{Path: "/pending.txt", Size: 10})
+	cq.mu.Unlock()
+
+	fs := newTestReexecFS()
+	fs.commitQueue = cq
+	result := fs.ReexecPreflight()
+	require.False(t, result.OK)
+	hasGate := false
+	for _, r := range result.Refusals {
+		if r.Gate == "commit_queue_pending" {
+			hasGate = true
+			require.Equal(t, 1, r.Count)
+		}
+	}
+	require.True(t, hasGate, "should refuse when commit queue has pending entries")
+}
+
 func TestReexecPreflightRefusesCommitQueueInFlight(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStore(filepath.Join(dir, "shadow"))
