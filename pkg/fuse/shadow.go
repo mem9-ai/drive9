@@ -958,12 +958,38 @@ func (s *ShadowStore) Unpin(gen uint64) {
 	}
 }
 
-// Remove removes a shadow file from memory and disk. If the path has active
-// pins, the shadow is "retired" — removed from the active files map so new
-// writers get a fresh shadow, but kept alive for existing readers until the
-// last Unpin.
-func (s *ShadowStore) Remove(remotePath string) {
-	s.mu.Lock()
+// shadowRemoveCleanup captures the disk cleanup work remaining after the
+// per-path maps have been updated under s.mu. Callers perform these filesystem
+// operations after releasing the lock to avoid holding s.mu over slow I/O.
+type shadowRemoveCleanup struct {
+	// removedSize is the shadow size to subtract from pendingBytes (after unlock).
+	removedSize int64
+
+	// For the retire path: rename srcDiskPath → retiredPath so Has() and
+	// ensureShadowFile don't see the stale data while pinned readers keep
+	// using the retired fd. If rename fails, fall back to os.Remove(srcDiskPath).
+	retire      bool
+	srcDiskPath string
+	retiredPath string
+
+	// For the immediate path: unconditionally os.Remove the disk shadow.
+	immediatePath string
+}
+
+// removeCoreLocked performs all in-memory map removal for remotePath under
+// s.mu and returns the disk cleanup to run after unlocking. If expectedGen is
+// nonzero, the removal is skipped (returns false) when the current writeGen
+// does not match. This makes the generation check + retirement/removal atomic
+// so a concurrent same-path write cannot bump writeGen between the check and
+// the actual map deletions.
+func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64) (shadowRemoveCleanup, bool) {
+	if expectedGen != 0 && s.writeGen[remotePath] != expectedGen {
+		return shadowRemoveCleanup{}, false
+	}
+
+	var cleanup shadowRemoveCleanup
+	diskPath := s.shadowPath(remotePath)
+
 	gen := s.active[remotePath]
 	if gen != 0 && s.refs[gen] > 0 {
 		// Retire: remove from active maps, keep fd alive for pinned readers.
@@ -972,31 +998,25 @@ func (s *ShadowStore) Remove(remotePath string) {
 		delete(s.active, remotePath)
 		delete(s.genFile, gen)
 		delete(s.writeGen, remotePath)
-		diskPath := s.shadowPath(remotePath)
 		// Rename disk file so Has() / ensureShadowFile don't see stale data.
 		// If rename fails, delete the original to avoid new writers reusing
 		// stale content via O_CREATE|O_RDWR. The retired fd remains valid
 		// (unix: open fd survives unlink).
 		retiredPath := fmt.Sprintf("%s.retired.%d", diskPath, gen)
-		if err := os.Rename(diskPath, retiredPath); err != nil {
-			_ = os.Remove(diskPath)
-			retiredPath = diskPath // fd still valid, disk file gone
-		}
-		var removedSize int64
+		cleanup.retire = true
+		cleanup.srcDiskPath = diskPath
+		cleanup.retiredPath = retiredPath
 		if sf != nil {
-			removedSize = sf.size
+			cleanup.removedSize = sf.size
 			s.retired[gen] = &retiredShadow{
 				fd:       sf.fd,
 				diskPath: retiredPath,
 				size:     sf.size,
 			}
 		}
-		s.mu.Unlock()
-		if removedSize > 0 {
-			s.pendingBytes.Add(-removedSize)
-		}
-		return
+		return cleanup, true
 	}
+
 	// No active pins — remove immediately.
 	if gen != 0 {
 		delete(s.active, remotePath)
@@ -1004,41 +1024,64 @@ func (s *ShadowStore) Remove(remotePath string) {
 		delete(s.refs, gen)
 	}
 	delete(s.writeGen, remotePath)
-	var removedSize int64
-	sf, ok := s.files[remotePath]
-	if ok {
-		removedSize = sf.size
+	if sf, ok := s.files[remotePath]; ok {
+		cleanup.removedSize = sf.size
 		_ = sf.fd.Close()
 		delete(s.files, remotePath)
 	}
-	s.mu.Unlock()
-	if removedSize > 0 {
-		s.pendingBytes.Add(-removedSize)
-	}
+	cleanup.immediatePath = diskPath
+	return cleanup, true
+}
 
-	// Always attempt disk cleanup — the shadow may exist only on disk
-	// (e.g. after crash/restart recovery where it was never loaded into
-	// the files map). Without this, a successfully committed shadow
-	// would remain on disk and be served as stale local data by
-	// Has()/ReadAt()/ReadAll() fallback paths.
-	sp := s.shadowPath(remotePath)
-	_ = os.Remove(sp)
+// runRemoveCleanup performs the disk cleanup returned by removeCoreLocked and
+// accounts the pendingBytes delta. Must be called after releasing s.mu.
+func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
+	if cleanup.removedSize > 0 {
+		s.pendingBytes.Add(-cleanup.removedSize)
+	}
+	if cleanup.retire {
+		if err := os.Rename(cleanup.srcDiskPath, cleanup.retiredPath); err != nil {
+			_ = os.Remove(cleanup.srcDiskPath)
+		}
+	} else if cleanup.immediatePath != "" {
+		// Always attempt disk cleanup — the shadow may exist only on disk
+		// (e.g. after crash/restart recovery where it was never loaded into
+		// the files map). Without this, a successfully committed shadow
+		// would remain on disk and be served as stale local data by
+		// Has()/ReadAt()/ReadAll() fallback paths.
+		_ = os.Remove(cleanup.immediatePath)
+	}
+}
+
+// Remove removes a shadow file from memory and disk. If the path has active
+// pins, the shadow is "retired" — removed from the active files map so new
+// writers get a fresh shadow, but kept alive for existing readers until the
+// last Unpin.
+func (s *ShadowStore) Remove(remotePath string) {
+	s.mu.Lock()
+	cleanup, ok := s.removeCoreLocked(remotePath, 0)
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	s.runRemoveCleanup(cleanup)
 }
 
 // RemoveIfGeneration removes the shadow file for remotePath only if its current
-// content generation matches expectedGen. Returns true if the entry was removed.
-// This prevents a stale upload from removing a fresher shadow that was written
-// (via a newer WriteFull/Ensure/WriteAt) while the old upload was in flight.
+// content generation matches expectedGen, and does so atomically: the
+// generation check and the map deletions/retirement run under a single s.mu
+// hold so a concurrent same-path WriteFull/WriteAt/Ensure cannot bump writeGen
+// between the check and the actual removal. Returns true only if the entry was
+// removed. This prevents a stale upload from removing a fresher shadow that
+// was written while the old upload was in flight.
 func (s *ShadowStore) RemoveIfGeneration(remotePath string, expectedGen uint64) bool {
 	s.mu.Lock()
-	gen := s.writeGen[remotePath]
-	if gen != expectedGen {
-		s.mu.Unlock()
+	cleanup, ok := s.removeCoreLocked(remotePath, expectedGen)
+	s.mu.Unlock()
+	if !ok {
 		return false
 	}
-	s.mu.Unlock()
-	// Defer to Remove which handles retire/immediate paths and disk cleanup.
-	s.Remove(remotePath)
+	s.runRemoveCleanup(cleanup)
 	return true
 }
 

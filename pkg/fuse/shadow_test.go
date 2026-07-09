@@ -1365,3 +1365,57 @@ func TestFreeRatioIndependentOfByteQuota(t *testing.T) {
 	}
 	t.Logf("free-ratio guard did not trigger (disk has >99.99%% free): err=%v; this is acceptable on large disks", err)
 }
+
+// TestShadowStoreRemoveIfGenerationRaceStaleVsNewerWrite exercises the
+// interleaving qiffang flagged: a stale RemoveIfGeneration(oldGen) racing with
+// a concurrent same-path WriteFull. After the newer write bumps writeGen, the
+// stale removal must never delete the newer shadow.
+//
+// We deterministically force the worst-case ordering: (1) snapshot the old gen,
+// (2) perform the newer WriteFull (bumping writeGen to N+1) and wait for it to
+// finish, (3) then call RemoveIfGeneration(oldGen). The atomic generation recheck
+// inside removeCoreLocked must observe the bumped gen and refuse the removal,
+// so the newer shadow survives.
+func TestShadowStoreRemoveIfGenerationRaceStaleVsNewerWrite(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	const path = "/race/file.txt"
+	if err := ss.WriteFull(path, []byte("original"), 0); err != nil {
+		t.Fatal(err)
+	}
+	newest := []byte("newer-content")
+
+	// Snapshot the OLD generation (as the uploader would at upload start).
+	oldGen := ss.ActiveGeneration(path)
+	if oldGen == 0 {
+		t.Fatal("expected nonzero generation after initial WriteFull")
+	}
+
+	// Simulate a concurrent same-path write that bumps writeGen to N+1.
+	if err := ss.WriteFull(path, newest, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stale remote completion now calls RemoveIfGeneration with the OLD gen.
+	// The atomic recheck must observe N+1 and refuse, preserving the newer entry.
+	if ss.RemoveIfGeneration(path, oldGen) {
+		t.Fatal("stale RemoveIfGeneration(oldGen) must not succeed after a newer write bumped the generation")
+	}
+	if !ss.Has(path) {
+		t.Fatal("newer shadow must survive stale RemoveIfGeneration")
+	}
+
+	// Content must be the newer data, not corrupted/removed.
+	got, err := ss.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, newest) {
+		t.Fatalf("content = %q, want %q (newer content must survive)", got, newest)
+	}
+}
