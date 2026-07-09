@@ -578,7 +578,6 @@ func isMetaLockConflictError(err error) bool {
 		strings.Contains(msg, "40001") ||
 		strings.Contains(msg, "Lock wait timeout exceeded") ||
 		strings.Contains(msg, "Error 1205") ||
-		(strings.Contains(msg, "9007") && strings.Contains(lower, "write conflict")) ||
 		strings.Contains(lower, "write conflict")
 }
 
