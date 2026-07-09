@@ -469,6 +469,12 @@ func Mount(opts *MountOptions) error {
 	// Configure FUSE mount options
 	fuseOpts := newGoFuseMountOptions(opts)
 
+	// Reexec child path: if this process was spawned by a parent's Reexec(),
+	// receive the FUSE fd via the handshake instead of mounting a new one.
+	if IsReexecChild() {
+		return mountReexecChild(dat9fs, opts, fuseOpts, c, actorID, layerEventWatcherStop)
+	}
+
 	// Create FUSE server
 	server, err := gofuse.NewServer(dat9fs, opts.MountPoint, fuseOpts)
 	if err != nil {
@@ -625,6 +631,35 @@ func Mount(opts *MountOptions) error {
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	// SIGHUP triggers a clean-state binary reexec: drain → quiesce →
+	// export fd → spawn child → hand off → exit. If reexec succeeds, the
+	// old process exits without unmounting; the new process inherits the
+	// FUSE connection. If reexec fails, the old process resumes serving.
+	sighupCh := make(chan os.Signal, 1)
+	signal.Notify(sighupCh, syscall.SIGHUP)
+	go func() {
+		for range sighupCh {
+			fmt.Fprintf(os.Stderr, "drive9: SIGHUP received, starting reexec...\n")
+			result := dat9fs.Reexec(ReexecConfig{
+				MountPoint: opts.MountPoint,
+			})
+			if result.Accepted {
+				fmt.Fprintf(os.Stderr, "drive9: reexec succeeded, new process is serving. Exiting.\n")
+				// Stop watchers and control socket before exit.
+				// Do NOT call server.Unmount() — the new process owns the fd.
+				stopWatchers()
+				if controlServer != nil {
+					controlServer.Close()
+				}
+				if pidFile != "" {
+					_ = os.Remove(pidFile)
+				}
+				os.Exit(0)
+			}
+			fmt.Fprintf(os.Stderr, "drive9: reexec failed: %v (resuming normal serving)\n", result.Err)
+		}
+	}()
+
 	go func() {
 		<-sigCh
 		fmt.Fprintf(os.Stderr, "\ndrive9: unmounting %s...\n", opts.MountPoint)
@@ -711,6 +746,120 @@ func Mount(opts *MountOptions) error {
 
 	fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
 		opts.MountPoint, opts.Server, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
+	server.Wait()
+	shutdown()
+	return nil
+}
+
+// mountReexecChild handles the child side of a clean-state binary reexec.
+// It is called from Mount() when IsReexecChild() returns true. Instead of
+// creating a new FUSE server via NewServer, it receives the fd from the
+// parent's Reexec() handshake and imports it.
+func mountReexecChild(dat9fs *Dat9FS, opts *MountOptions, fuseOpts *gofuse.MountOptions, c *client.Client, actorID string, layerEventWatcherStop func()) error {
+	cfg, err := ParseReexecChildEnv()
+	if err != nil {
+		return fmt.Errorf("reexec child: %w", err)
+	}
+
+	fd, parentConn, err := ReexecChildHandshake(cfg)
+	if err != nil {
+		return fmt.Errorf("reexec child: %w", err)
+	}
+	defer func() { _ = parentConn.Close() }()
+
+	fmt.Fprintf(os.Stderr, "drive9: reexec child: fd received, importing...\n")
+
+	server, err := ReexecChildImportAndServe(fd, cfg.MountPoint, dat9fs, fuseOpts, parentConn)
+	if err != nil {
+		return fmt.Errorf("reexec child: %w", err)
+	}
+
+	// From here on, the child is serving. Set up watchers, control socket,
+	// and signal handling as in the normal mount path.
+	dat9fs.server = server
+
+	sseWatcher := StartSSEWatcher(dat9fs, c, actorID)
+	stopWatchers := func() {
+		if sseWatcher != nil {
+			sseWatcher.Stop()
+		}
+		layerEventWatcherStop()
+	}
+
+	controlServer, err := startMountControlServer(opts.MountPoint, dat9fs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "drive9: reexec child: control socket failed: %v\n", err)
+	}
+	if controlServer != nil {
+		defer controlServer.Close()
+	}
+
+	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
+		PID:            os.Getpid(),
+		Component:      "drive9-fuse",
+		MountKind:      mountstate.MountKindFUSE,
+		MountPoint:     opts.MountPoint,
+		RemoteRoot:     opts.RemoteRoot,
+		Server:         opts.Server,
+		StartedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+		ControlSocket:  controlServer.SocketPath(),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "drive9: reexec child: pid file failed: %v\n", err)
+	}
+	if pidFile != "" {
+		defer func() {
+			if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, err)
+			}
+		}()
+	}
+
+	shutdown := newMountShutdown(stopWatchers, dat9fs.FlushAll)
+
+	// Signal handling (same as normal mount).
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// SIGHUP for chained reexec.
+	sighupCh := make(chan os.Signal, 1)
+	signal.Notify(sighupCh, syscall.SIGHUP)
+	go func() {
+		for range sighupCh {
+			fmt.Fprintf(os.Stderr, "drive9: SIGHUP received, starting reexec...\n")
+			result := dat9fs.Reexec(ReexecConfig{MountPoint: opts.MountPoint})
+			if result.Accepted {
+				fmt.Fprintf(os.Stderr, "drive9: reexec succeeded, new process is serving. Exiting.\n")
+				stopWatchers()
+				if controlServer != nil {
+					controlServer.Close()
+				}
+				if pidFile != "" {
+					_ = os.Remove(pidFile)
+				}
+				os.Exit(0)
+			}
+			fmt.Fprintf(os.Stderr, "drive9: reexec failed: %v (resuming normal serving)\n", result.Err)
+		}
+	}()
+
+	go func() {
+		<-sigCh
+		fmt.Fprintf(os.Stderr, "\ndrive9: unmounting %s...\n", opts.MountPoint)
+		go func() {
+			<-sigCh
+			fmt.Fprintf(os.Stderr, "drive9: force-quit\n")
+			forceUnmount(opts.MountPoint)
+			os.Exit(1)
+		}()
+		shutdown()
+		if unmountErr := server.Unmount(); unmountErr != nil {
+			fmt.Fprintf(os.Stderr, "drive9: unmount failed: %v, force-unmounting\n", unmountErr)
+			forceUnmount(opts.MountPoint)
+		}
+	}()
+
+	fmt.Fprintf(os.Stderr, "drive9: reexec child serving on %s (server: %s)\n", opts.MountPoint, opts.Server)
 	server.Wait()
 	shutdown()
 	return nil
