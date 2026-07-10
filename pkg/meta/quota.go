@@ -257,6 +257,7 @@ func (s *Store) SetQuotaConfigPatch(ctx context.Context, tenantID string, patch 
 	var err error
 	defer observeMeta(ctx, "set_quota_config_patch", start, &err)
 
+	quotaLimitOverrideSet := patch.quotaLimitOverrideSet()
 	insertStorage := DefaultMaxStorageBytes()
 	if patch.MaxStorageBytes != nil {
 		insertStorage = *patch.MaxStorageBytes
@@ -271,7 +272,6 @@ func (s *Store) SetQuotaConfigPatch(ctx context.Context, tenantID string, patch 
 	}
 	insertSpendingLimit := nullInt64FromPtr(patch.TiDBCloudSpendingLimit)
 	insertCheckedAt := nullTimeFromPtr(patch.TiDBCloudSpendingLimitCheckedAt)
-	insertOverride := patch.quotaLimitOverrideSet()
 	updateStorage := sql.NullInt64{}
 	if patch.MaxStorageBytes != nil {
 		updateStorage = sql.NullInt64{Int64: *patch.MaxStorageBytes, Valid: true}
@@ -291,15 +291,16 @@ func (s *Store) SetQuotaConfigPatch(ctx context.Context, tenantID string, patch 
 		                                  quota_limits_overridden, tidbcloud_spending_limit,
 		                                  tidbcloud_spending_limit_checked_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)
-		 ON DUPLICATE KEY UPDATE
-		   max_storage_bytes = COALESCE(?, max_storage_bytes),
-		   max_file_size_bytes = COALESCE(?, max_file_size_bytes),
-		   max_file_count = COALESCE(?, max_file_count),
-		   quota_limits_overridden = IF(?, 1, quota_limits_overridden),
-		   tidbcloud_spending_limit = COALESCE(?, tidbcloud_spending_limit),
-		   tidbcloud_spending_limit_checked_at = COALESCE(?, tidbcloud_spending_limit_checked_at)`,
-		tenantID, insertStorage, insertFileSize, insertFileCount, insertOverride, insertSpendingLimit, insertCheckedAt,
-		updateStorage, updateFileSize, updateFileCount, patch.quotaLimitOverrideSet(), updateSpendingLimit, updateCheckedAt)
+			 ON DUPLICATE KEY UPDATE
+			   max_storage_bytes = COALESCE(?, max_storage_bytes),
+			   max_file_size_bytes = COALESCE(?, max_file_size_bytes),
+			   max_file_count = COALESCE(?, max_file_count),
+			   /* Storage quota overrides are sticky once any storage/file limit is explicitly set. */
+			   quota_limits_overridden = IF(?, 1, quota_limits_overridden),
+			   tidbcloud_spending_limit = COALESCE(?, tidbcloud_spending_limit),
+			   tidbcloud_spending_limit_checked_at = COALESCE(?, tidbcloud_spending_limit_checked_at)`,
+		tenantID, insertStorage, insertFileSize, insertFileCount, quotaLimitOverrideSet, insertSpendingLimit, insertCheckedAt,
+		updateStorage, updateFileSize, updateFileCount, quotaLimitOverrideSet, updateSpendingLimit, updateCheckedAt)
 	if err != nil {
 		return fmt.Errorf("set quota config patch for tenant %q: %w", tenantID, err)
 	}
