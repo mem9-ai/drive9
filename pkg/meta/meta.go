@@ -26,6 +26,7 @@ var (
 	ErrStorageQuotaExceeded     = errors.New("tenant storage quota exceeded")
 	ErrFileCountQuotaExceeded   = errors.New("tenant file count quota exceeded")
 	ErrReservationAlreadyExists = errors.New("upload reservation already exists")
+	ErrQuotaReservationBusy     = errors.New("quota reservation busy")
 )
 
 type TenantStatus string

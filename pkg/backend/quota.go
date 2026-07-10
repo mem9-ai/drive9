@@ -21,6 +21,7 @@ var (
 	ErrMediaLLMQuotaExceeded    = errors.New("tenant media LLM file quota exceeded")
 	ErrReservationNotFound      = errors.New("upload reservation not found")
 	ErrReservationAlreadyExists = errors.New("upload reservation already exists")
+	ErrQuotaReservationBusy     = errors.New("quota reservation busy")
 )
 
 type storageQuotaCheckResult struct {

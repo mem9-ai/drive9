@@ -29,6 +29,10 @@ import (
 //     server DB is unreachable (fail-open). Callers treat this as "no
 //     server-side reservation", so the matching abort/complete paths skip
 //     counter adjustments.
+//   - (false, nil): central quota stayed lock-contended after bounded retries.
+//     This also fail-opens to avoid a user-visible upload-initiate failure, but
+//     it records a distinct busy_fail_open metric so quota-admission bypass risk
+//     is observable.
 //
 // Idempotency: a duplicate (tenant_id, upload_id) is treated as
 // (true, nil) — the original initiate already claimed the reservation;
@@ -88,6 +92,14 @@ func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targe
 			zap.String("upload_id", uploadID))
 		metrics.RecordTenantOperation(b.tenantID, "central_quota", "reserve_upload", "duplicate", time.Since(start))
 		return true, nil
+	case errors.Is(err, ErrQuotaReservationBusy):
+		logger.Warn(ctx, "central_quota_reserve_upload_busy_fail_open",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("upload_id", uploadID),
+			zap.Int64("size", totalSize),
+			zap.Error(err))
+		metrics.RecordTenantOperation(b.tenantID, "central_quota", "reserve_upload", "busy_fail_open", time.Since(start))
+		return false, nil
 	default:
 		logger.Warn(ctx, "central_quota_reserve_upload_failed",
 			zap.String("tenant_id", b.tenantID),
