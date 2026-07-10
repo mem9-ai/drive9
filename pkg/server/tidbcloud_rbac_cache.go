@@ -10,10 +10,14 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
-const tidbCloudRBACCacheTTL = 6 * time.Hour
+const (
+	tidbCloudRBACCacheTTL        = time.Hour
+	tidbCloudRBACCacheMaxEntries = 10000
+	tidbCloudRBACCacheMaxLists   = 1000
+)
 
 type tidbCloudRBACCache struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	ttl     time.Duration
 	entries map[string]tidbCloudRBACEntry
 	lists   map[string]tidbCloudRBACListEntry
@@ -49,13 +53,20 @@ func (c *tidbCloudRBACCache) getCluster(cred tenant.CredentialProvisionRequest, 
 	if clusterID == "" {
 		return tenant.CloudClusterInfo{}, false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	entry, ok := c.entries[c.entryKey(cred, clusterID)]
-	if !ok || time.Now().After(entry.expiresAt) {
-		if ok {
-			delete(c.entries, c.entryKey(cred, clusterID))
+	key := c.entryKey(cred, clusterID)
+	now := time.Now()
+	c.mu.RLock()
+	entry, ok := c.entries[key]
+	c.mu.RUnlock()
+	if !ok {
+		return tenant.CloudClusterInfo{}, false
+	}
+	if now.After(entry.expiresAt) {
+		c.mu.Lock()
+		if current, currentOK := c.entries[key]; currentOK && now.After(current.expiresAt) {
+			delete(c.entries, key)
 		}
+		c.mu.Unlock()
 		return tenant.CloudClusterInfo{}, false
 	}
 	return tenant.CloudClusterInfo{ClusterID: entry.clusterID, OrganizationID: entry.organizationID}, true
@@ -65,14 +76,20 @@ func (c *tidbCloudRBACCache) getClusterList(cred tenant.CredentialProvisionReque
 	if c == nil {
 		return nil, false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	key := c.credentialKey(cred)
+	now := time.Now()
+	c.mu.RLock()
 	entry, ok := c.lists[key]
-	if !ok || time.Now().After(entry.expiresAt) {
-		if ok {
+	c.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	if now.After(entry.expiresAt) {
+		c.mu.Lock()
+		if current, currentOK := c.lists[key]; currentOK && now.After(current.expiresAt) {
 			delete(c.lists, key)
 		}
+		c.mu.Unlock()
 		return nil, false
 	}
 	out := make([]tenant.CloudClusterInfo, len(entry.clusters))
@@ -89,13 +106,16 @@ func (c *tidbCloudRBACCache) rememberCluster(cred tenant.CredentialProvisionRequ
 		return
 	}
 	cluster.OrganizationID = strings.TrimSpace(cluster.OrganizationID)
+	key := c.entryKey(cred, cluster.ClusterID)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[c.entryKey(cred, cluster.ClusterID)] = tidbCloudRBACEntry{
+	c.pruneLocked(time.Now())
+	c.entries[key] = tidbCloudRBACEntry{
 		clusterID:      cluster.ClusterID,
 		organizationID: cluster.OrganizationID,
 		expiresAt:      time.Now().Add(c.ttl),
 	}
+	c.enforceSizeLocked()
 }
 
 func (c *tidbCloudRBACCache) rememberClusterList(cred tenant.CredentialProvisionRequest, clusters []tenant.CloudClusterInfo) {
@@ -108,6 +128,7 @@ func (c *tidbCloudRBACCache) rememberClusterList(cred tenant.CredentialProvision
 	out := make([]tenant.CloudClusterInfo, 0, len(clusters))
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.pruneLocked(now)
 	for _, cluster := range clusters {
 		cluster.ClusterID = strings.TrimSpace(cluster.ClusterID)
 		if cluster.ClusterID == "" || seen[cluster.ClusterID] {
@@ -122,7 +143,50 @@ func (c *tidbCloudRBACCache) rememberClusterList(cred tenant.CredentialProvision
 		}
 		out = append(out, tenant.CloudClusterInfo{ClusterID: cluster.ClusterID, OrganizationID: cluster.OrganizationID})
 	}
-	c.lists[c.credentialKey(cred)] = tidbCloudRBACListEntry{clusters: out, expiresAt: expiresAt}
+	key := c.credentialKey(cred)
+	if len(out) == 0 {
+		delete(c.lists, key)
+		return
+	}
+	c.lists[key] = tidbCloudRBACListEntry{clusters: out, expiresAt: expiresAt}
+	c.enforceSizeLocked()
+}
+
+func (c *tidbCloudRBACCache) forgetClusterList(cred tenant.CredentialProvisionRequest) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.lists, c.credentialKey(cred))
+}
+
+func (c *tidbCloudRBACCache) pruneLocked(now time.Time) {
+	for key, entry := range c.entries {
+		if now.After(entry.expiresAt) {
+			delete(c.entries, key)
+		}
+	}
+	for key, entry := range c.lists {
+		if now.After(entry.expiresAt) {
+			delete(c.lists, key)
+		}
+	}
+}
+
+func (c *tidbCloudRBACCache) enforceSizeLocked() {
+	for len(c.entries) > tidbCloudRBACCacheMaxEntries {
+		for key := range c.entries {
+			delete(c.entries, key)
+			break
+		}
+	}
+	for len(c.lists) > tidbCloudRBACCacheMaxLists {
+		for key := range c.lists {
+			delete(c.lists, key)
+			break
+		}
+	}
 }
 
 func (c *tidbCloudRBACCache) credentialKey(cred tenant.CredentialProvisionRequest) string {

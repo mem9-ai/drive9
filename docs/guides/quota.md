@@ -38,9 +38,11 @@ tenant providers use their configured defaults.
 
 Tenant list/get validates that the supplied TiDB Cloud API key can access the
 tenant's cluster. Drive9 caches successful API-key-to-cluster authorization in
-process to avoid calling the TiDB Cloud OpenAPI on every read. The quota
-response itself is assembled from Drive9's local tenant, quota config, and usage
-tables after authorization succeeds.
+process for up to one hour to avoid calling the TiDB Cloud OpenAPI on every
+read. Empty managed-cluster list results are not retained, and successful tenant
+create/delete paths invalidate the full-list cache for the submitted
+credentials. The quota response itself is assembled from Drive9's local tenant,
+quota config, and usage tables after authorization succeeds.
 
 Quota update first reads the TiDB Cloud cluster labels, then patches the Drive9
 quota update labels to confirm the API key has cluster write permission. If that

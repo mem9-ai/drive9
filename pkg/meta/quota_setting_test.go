@@ -102,6 +102,9 @@ func TestQuotaConfigStoresTiDBCloudSpendingLimitWithoutStorageVersion(t *testing
 	if cfg.MaxStorageBytes != DefaultMaxStorageBytes() || cfg.MaxFileSizeBytes != DefaultMaxFileSizeBytes() || cfg.MaxFileCount != 0 {
 		t.Fatalf("storage quota fields = %#v, want defaults", cfg)
 	}
+	if cfg.QuotaLimitsOverridden {
+		t.Fatalf("QuotaLimitsOverridden = true, want false for spending-only row")
+	}
 	version, err := s.GetQuotaConfigVersion(ctx, "tenant-spending-only")
 	if err != nil {
 		t.Fatal(err)
@@ -120,6 +123,20 @@ func TestQuotaConfigStoresTiDBCloudSpendingLimitWithoutStorageVersion(t *testing
 	}
 	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != updated {
 		t.Fatalf("updated spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, updated)
+	}
+	checkedAt := time.Now().UTC()
+	if err := s.SetQuotaConfigPatch(ctx, "tenant-spending-only", QuotaConfigPatch{TiDBCloudSpendingLimitCheckedAt: &checkedAt}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = s.GetQuotaConfig(ctx, "tenant-spending-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TiDBCloudSpendingLimitCheckedAt == nil {
+		t.Fatal("spending limit checked_at = nil, want timestamp")
+	}
+	if cfg.QuotaLimitsOverridden {
+		t.Fatalf("QuotaLimitsOverridden after checked_at = true, want false")
 	}
 }
 

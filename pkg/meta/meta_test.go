@@ -971,6 +971,20 @@ func TestMetaSchemaSpecTracksPrimaryKeyConstraint(t *testing.T) {
 	if spendingLimit.addSQL != "ALTER TABLE tenant_quota_config ADD COLUMN tidbcloud_spending_limit BIGINT NULL" {
 		t.Fatalf("tidbcloud_spending_limit addSQL = %q", spendingLimit.addSQL)
 	}
+	quotaOverride, ok := table.columns["quota_limits_overridden"]
+	if !ok {
+		t.Fatal("tenant_quota_config schema missing quota_limits_overridden")
+	}
+	if quotaOverride.addSQL != "ALTER TABLE tenant_quota_config ADD COLUMN quota_limits_overridden TINYINT(1) NOT NULL DEFAULT 1" {
+		t.Fatalf("quota_limits_overridden addSQL = %q", quotaOverride.addSQL)
+	}
+	checkedAt, ok := table.columns["tidbcloud_spending_limit_checked_at"]
+	if !ok {
+		t.Fatal("tenant_quota_config schema missing tidbcloud_spending_limit_checked_at")
+	}
+	if checkedAt.addSQL != "ALTER TABLE tenant_quota_config ADD COLUMN tidbcloud_spending_limit_checked_at DATETIME(3) NULL" {
+		t.Fatalf("tidbcloud_spending_limit_checked_at addSQL = %q", checkedAt.addSQL)
+	}
 }
 
 func TestMetaSchemaSpecIncludesTenantS3EncryptionColumns(t *testing.T) {
@@ -1340,15 +1354,17 @@ func TestDiffMetaTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
 	meta := metaTableMeta{
 		tableName: "tenant_quota_config",
 		columns: map[string]metaColumnMeta{
-			"tenant_id":                {columnType: "varchar(64)"},
-			"max_storage_bytes":        {columnType: "bigint"},
-			"max_file_size_bytes":      {columnType: "bigint"},
-			"max_file_count":           {columnType: "bigint"},
-			"max_media_llm_files":      {columnType: "bigint"},
-			"max_monthly_cost_mc":      {columnType: "bigint"},
-			"tidbcloud_spending_limit": {columnType: "bigint"},
-			"created_at":               {columnType: "datetime(3)"},
-			"updated_at":               {columnType: "datetime(3)"},
+			"tenant_id":                           {columnType: "varchar(64)"},
+			"max_storage_bytes":                   {columnType: "bigint"},
+			"max_file_size_bytes":                 {columnType: "bigint"},
+			"max_file_count":                      {columnType: "bigint"},
+			"max_media_llm_files":                 {columnType: "bigint"},
+			"max_monthly_cost_mc":                 {columnType: "bigint"},
+			"quota_limits_overridden":             {columnType: "tinyint(1)"},
+			"tidbcloud_spending_limit":            {columnType: "bigint"},
+			"tidbcloud_spending_limit_checked_at": {columnType: "datetime(3)"},
+			"created_at":                          {columnType: "datetime(3)"},
+			"updated_at":                          {columnType: "datetime(3)"},
 		},
 	}
 	createStmt := `CREATE TABLE tenant_quota_config (
@@ -1358,7 +1374,9 @@ func TestDiffMetaTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
 		max_file_count BIGINT NOT NULL,
 		max_media_llm_files BIGINT NOT NULL,
 		max_monthly_cost_mc BIGINT NOT NULL,
+		quota_limits_overridden TINYINT(1) NOT NULL DEFAULT 1,
 		tidbcloud_spending_limit BIGINT NULL,
+		tidbcloud_spending_limit_checked_at DATETIME(3) NULL,
 		created_at DATETIME(3) NOT NULL,
 		updated_at DATETIME(3) NOT NULL
 	)`

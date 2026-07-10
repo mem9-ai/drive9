@@ -873,9 +873,13 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 				cleanupOnError = true
 				return nil, err
 			}
-			if err := s.syncTiDBCloudSpendingLimit(ctx, "pool_create", tenantID, batchCloudCfg); err != nil {
-				cleanupOnError = true
-				return nil, err
+			if err := s.syncTiDBCloudSpendingLimit(ctx, "pool_create", tenantID, batchCloudCfg, time.Time{}); err != nil {
+				logger.Warn(ctx, "admin_tenant_pool_spending_limit_sync_failed",
+					zap.String("tenant_id", tenantID),
+					zap.String("pool_id", poolID),
+					zap.String("organization_id", orgID),
+					zap.String("cluster_id", cluster.ClusterID),
+					zap.Error(err))
 			}
 			logProvisionStage(ctx, "admin_tenant_pool_free_tenant_quota_local_config_applied", tenantID, provider, stageStarted,
 				"pool_id", poolID,
@@ -1677,7 +1681,7 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		if err := s.applyQuotaLocalConfig(ctx, "pool_claim", row.Tenant.ID, quotaReq); err != nil {
 			return nil, nil, false, err
 		}
-		if err := s.syncTiDBCloudSpendingLimit(ctx, "pool_claim", row.Tenant.ID, cloudCfg); err != nil {
+		if err := s.syncTiDBCloudSpendingLimit(ctx, "pool_claim", row.Tenant.ID, cloudCfg, time.Time{}); err != nil {
 			return nil, nil, false, err
 		}
 		logProvisionStage(ctx, "admin_tenant_pool_claim_quota_local_config_applied", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID, "create_time_spending_limit", cloudCfg != nil && cloudCfg.TiDBCloudSpendingLimitMonthly != nil)

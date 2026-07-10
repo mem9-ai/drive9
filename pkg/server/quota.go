@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -122,6 +123,7 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 		needRefresh = true
 	}
 	if needRefresh {
+		observedAt := time.Now().UTC()
 		cloudCfg, err := getter.GetQuota(r.Context(), clusterInfoFromTenant(t), cred)
 		if err != nil {
 			metrics.RecordTiDBCloudOpenAPIRequest("quota_get", "get_quota", "error")
@@ -130,7 +132,7 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 		}
 		metrics.RecordTiDBCloudOpenAPIRequest("quota_get", "get_quota", "ok")
 		s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{ClusterID: t.ClusterID})
-		if err := s.syncTiDBCloudSpendingLimit(r.Context(), "quota_get", t.ID, cloudCfg); err != nil {
+		if err := s.syncTiDBCloudSpendingLimit(r.Context(), "quota_get", t.ID, cloudCfg, observedAt); err != nil {
 			logger.Warn(r.Context(), "tidbcloud_spending_limit_sync_failed", zap.String("tenant_id", t.ID), zap.Error(err))
 			errJSON(w, http.StatusInternalServerError, "quota config update failed")
 			return
@@ -532,6 +534,10 @@ func (s *Server) rememberTiDBCloudRBAC(cred tenant.CredentialProvisionRequest, c
 	s.tidbCloudRBACCache.rememberCluster(cred, cluster)
 }
 
+func (s *Server) forgetTiDBCloudRBACList(cred tenant.CredentialProvisionRequest) {
+	s.tidbCloudRBACCache.forgetClusterList(cred)
+}
+
 func tidbCloudSpendingLimitFromCloud(cloudCfg *tenant.QuotaCloudConfig) *int64 {
 	if cloudCfg == nil || cloudCfg.TiDBCloudSpendingLimitMonthly == nil {
 		return nil
@@ -540,9 +546,14 @@ func tidbCloudSpendingLimitFromCloud(cloudCfg *tenant.QuotaCloudConfig) *int64 {
 	return &limit
 }
 
-func (s *Server) syncTiDBCloudSpendingLimit(ctx context.Context, source, tenantID string, cloudCfg *tenant.QuotaCloudConfig) error {
+func (s *Server) syncTiDBCloudSpendingLimit(ctx context.Context, source, tenantID string, cloudCfg *tenant.QuotaCloudConfig, observedAt time.Time) error {
+	checkedAt := time.Now().UTC()
 	limit := tidbCloudSpendingLimitFromCloud(cloudCfg)
 	if limit == nil {
+		if err := s.meta.SetQuotaConfigPatch(ctx, tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimitCheckedAt: &checkedAt}); err != nil {
+			metrics.RecordTiDBCloudSpendingLimitSync(source, "error")
+			return err
+		}
 		metrics.RecordTiDBCloudSpendingLimitSync(source, "missing_cloud_value")
 		return nil
 	}
@@ -552,10 +563,28 @@ func (s *Server) syncTiDBCloudSpendingLimit(ctx context.Context, source, tenantI
 		return err
 	}
 	if result == "unchanged" {
+		if err := s.meta.SetQuotaConfigPatch(ctx, tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimitCheckedAt: &checkedAt}); err != nil {
+			metrics.RecordTiDBCloudSpendingLimitSync(source, "error")
+			return err
+		}
 		metrics.RecordTiDBCloudSpendingLimitSync(source, result)
 		return nil
 	}
-	if err := s.meta.SetQuotaConfigPatch(ctx, tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimit: limit}); err != nil {
+	if !observedAt.IsZero() {
+		cfg, err := s.meta.GetQuotaConfig(ctx, tenantID)
+		if err != nil {
+			metrics.RecordTiDBCloudSpendingLimitSync(source, "error")
+			return err
+		}
+		if cfg.TiDBCloudSpendingLimit != nil && cfg.UpdatedAt.After(observedAt) {
+			metrics.RecordTiDBCloudSpendingLimitSync(source, "skipped_newer_local")
+			return nil
+		}
+	}
+	if err := s.meta.SetQuotaConfigPatch(ctx, tenantID, meta.QuotaConfigPatch{
+		TiDBCloudSpendingLimit:          limit,
+		TiDBCloudSpendingLimitCheckedAt: &checkedAt,
+	}); err != nil {
 		metrics.RecordTiDBCloudSpendingLimitSync(source, "error")
 		return err
 	}
