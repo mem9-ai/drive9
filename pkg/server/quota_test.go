@@ -589,6 +589,34 @@ func TestQuotaGetUsesDrive9APIKeyWhenLocalSpendingLimitExists(t *testing.T) {
 	}
 }
 
+func TestSyncTiDBCloudSpendingLimitSkipsNewerLocalAtSameTimestampTick(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ctx := context.Background()
+
+	newLimit := int64(200)
+	if err := rt.meta.SetQuotaConfigPatch(ctx, rt.tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimit: &newLimit}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	staleLimit := int64(100)
+	if err := rt.server.syncTiDBCloudSpendingLimit(ctx, "quota_get", rt.tenantID, &tenant.QuotaCloudConfig{
+		TiDBCloudSpendingLimitMonthly: &staleLimit,
+	}, cfg.UpdatedAt); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = rt.meta.GetQuotaConfig(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != newLimit {
+		t.Fatalf("spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, newLimit)
+	}
+}
+
 func TestQuotaGetUsesTiDBCloudAuthorization(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ts := httptest.NewServer(rt.server)

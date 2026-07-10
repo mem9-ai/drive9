@@ -308,6 +308,46 @@ func (s *Store) SetQuotaConfigPatch(ctx context.Context, tenantID string, patch 
 	return nil
 }
 
+// SetTiDBCloudSpendingLimitIfNotUpdatedAfter stores a TiDB Cloud spending-limit
+// observation only when the local quota row was not updated after the cloud read
+// began. It returns false when the guard skips the write.
+func (s *Store) SetTiDBCloudSpendingLimitIfNotUpdatedAfter(ctx context.Context, tenantID string, limit int64, checkedAt, observedAt time.Time) (bool, error) {
+	start := time.Now()
+	var err error
+	defer observeMeta(ctx, "set_tidbcloud_spending_limit_if_not_updated_after", start, &err)
+
+	if observedAt.IsZero() {
+		err = s.SetQuotaConfigPatch(ctx, tenantID, QuotaConfigPatch{
+			TiDBCloudSpendingLimit:          &limit,
+			TiDBCloudSpendingLimitCheckedAt: &checkedAt,
+		})
+		return err == nil, err
+	}
+
+	// tenant_quota_config timestamps use DATETIME(3). Use a strict millisecond
+	// cutoff so writes in the same DB timestamp tick as observedAt are treated as
+	// newer and cannot be overwritten by a stale cloud observation.
+	observedCutoff := observedAt.UTC().Truncate(time.Millisecond)
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes, max_file_size_bytes, max_file_count,
+		                                  quota_limits_overridden, tidbcloud_spending_limit,
+		                                  tidbcloud_spending_limit_checked_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE
+		   tidbcloud_spending_limit = IF(updated_at < ?, VALUES(tidbcloud_spending_limit), tidbcloud_spending_limit),
+		   tidbcloud_spending_limit_checked_at = IF(updated_at < ?, VALUES(tidbcloud_spending_limit_checked_at), tidbcloud_spending_limit_checked_at)`,
+		tenantID, DefaultMaxStorageBytes(), int64(0), int64(0), false, sql.NullInt64{Int64: limit, Valid: true}, sql.NullTime{Time: checkedAt, Valid: true},
+		observedCutoff, observedCutoff)
+	if err != nil {
+		return false, fmt.Errorf("set tidbcloud spending limit for tenant %q: %w", tenantID, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("set tidbcloud spending limit rows affected for tenant %q: %w", tenantID, err)
+	}
+	return rows > 0, nil
+}
+
 func nullInt64FromPtr(v *int64) sql.NullInt64 {
 	if v == nil {
 		return sql.NullInt64{}

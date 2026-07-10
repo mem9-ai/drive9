@@ -646,23 +646,14 @@ func (s *Server) syncTiDBCloudSpendingLimit(ctx context.Context, source, tenantI
 		metrics.RecordTiDBCloudSpendingLimitSync(source, result)
 		return nil
 	}
-	if !observedAt.IsZero() {
-		cfg, err := s.meta.GetQuotaConfig(ctx, tenantID)
-		if err != nil {
-			metrics.RecordTiDBCloudSpendingLimitSync(source, "error")
-			return err
-		}
-		if cfg.TiDBCloudSpendingLimit != nil && cfg.UpdatedAt.After(observedAt) {
-			metrics.RecordTiDBCloudSpendingLimitSync(source, "skipped_newer_local")
-			return nil
-		}
-	}
-	if err := s.meta.SetQuotaConfigPatch(ctx, tenantID, meta.QuotaConfigPatch{
-		TiDBCloudSpendingLimit:          limit,
-		TiDBCloudSpendingLimitCheckedAt: &checkedAt,
-	}); err != nil {
+	applied, err := s.meta.SetTiDBCloudSpendingLimitIfNotUpdatedAfter(ctx, tenantID, *limit, checkedAt, observedAt)
+	if err != nil {
 		metrics.RecordTiDBCloudSpendingLimitSync(source, "error")
 		return err
+	}
+	if !applied {
+		metrics.RecordTiDBCloudSpendingLimitSync(source, "skipped_newer_local")
+		return nil
 	}
 	metrics.RecordTiDBCloudSpendingLimitSync(source, result)
 	return nil

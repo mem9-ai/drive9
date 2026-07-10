@@ -288,6 +288,50 @@ func TestSetQuotaConfigPatchUpdatesExternalFieldsOnly(t *testing.T) {
 	}
 }
 
+func TestSetTiDBCloudSpendingLimitIfNotUpdatedAfterSkipsNewerLocal(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	newLimit := int64(200)
+	if err := s.SetQuotaConfigPatch(ctx, "tenant-spending-cas", QuotaConfigPatch{TiDBCloudSpendingLimit: &newLimit}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := s.GetQuotaConfig(ctx, "tenant-spending-cas")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	applied, err := s.SetTiDBCloudSpendingLimitIfNotUpdatedAfter(ctx, "tenant-spending-cas", 100, time.Now().UTC(), cfg.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatal("stale spending limit sync applied, want skipped")
+	}
+	cfg, err = s.GetQuotaConfig(ctx, "tenant-spending-cas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != newLimit {
+		t.Fatalf("spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, newLimit)
+	}
+
+	applied, err = s.SetTiDBCloudSpendingLimitIfNotUpdatedAfter(ctx, "tenant-spending-cas", 300, time.Now().UTC(), cfg.UpdatedAt.Add(2*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("fresh spending limit sync skipped, want applied")
+	}
+	cfg, err = s.GetQuotaConfig(ctx, "tenant-spending-cas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != 300 {
+		t.Fatalf("spending limit after fresh sync = %#v, want 300", cfg.TiDBCloudSpendingLimit)
+	}
+}
+
 func TestAtomicReserveAndInsertUploadBootstrapsUsageRow(t *testing.T) {
 	orig := DefaultMaxStorageBytes()
 	defer func() { SetDefaultMaxStorageBytes(orig) }()
