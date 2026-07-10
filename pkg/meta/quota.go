@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
+
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"go.uber.org/zap"
@@ -571,14 +573,28 @@ func isMetaLockConflictError(err error) bool {
 	if err == nil {
 		return false
 	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		if string(mysqlErr.SQLState[:]) == "40001" {
+			return true
+		}
+		switch mysqlErr.Number {
+		case 1213, 1205:
+			return true
+		case 9007:
+			return strings.Contains(strings.ToLower(mysqlErr.Message), "write conflict")
+		}
+		return false
+	}
 	msg := err.Error()
 	lower := strings.ToLower(msg)
-	return strings.Contains(msg, "Deadlock found") ||
-		strings.Contains(msg, "Error 1213") ||
-		strings.Contains(msg, "40001") ||
-		strings.Contains(msg, "Lock wait timeout exceeded") ||
-		strings.Contains(msg, "Error 1205") ||
-		strings.Contains(lower, "write conflict")
+	return (strings.Contains(msg, "Error 1213") && strings.Contains(msg, "Deadlock found")) ||
+		(strings.Contains(msg, "ERROR 1213") && strings.Contains(msg, "Deadlock found")) ||
+		(strings.Contains(msg, "Error 1205") && strings.Contains(msg, "Lock wait timeout exceeded")) ||
+		(strings.Contains(msg, "ERROR 1205") && strings.Contains(msg, "Lock wait timeout exceeded")) ||
+		strings.Contains(msg, "SQLSTATE 40001") ||
+		((strings.Contains(msg, "Error 9007 (") || strings.Contains(msg, "ERROR 9007 (")) &&
+			strings.Contains(lower, "write conflict"))
 }
 
 func (s *Store) uploadReservationQuotaErrorTx(ctx context.Context, tx *sql.Tx, r *UploadReservation) error {

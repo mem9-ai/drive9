@@ -3,10 +3,13 @@ package meta
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	mysql "github.com/go-sql-driver/mysql"
 
 	"github.com/mem9-ai/drive9/pkg/metrics"
 )
@@ -293,13 +296,28 @@ func TestIsMetaLockConflictErrorIncludesTiDBWriteConflict(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "tidb write conflict code",
-			err:  errors.New("ERROR 9007 (HY000): Write conflict, txnStartTS=123, conflictStartTS=456"),
+			name: "tidb write conflict mysql error",
+			err:  &mysql.MySQLError{Number: 9007, SQLState: [5]byte{'H', 'Y', '0', '0', '0'}, Message: "Write conflict, txnStartTS=123, conflictStartTS=456"},
 			want: true,
 		},
 		{
-			name: "tidb write conflict message",
-			err:  errors.New("write conflict, retry txn"),
+			name: "mysql deadlock",
+			err:  &mysql.MySQLError{Number: 1213, SQLState: [5]byte{'4', '0', '0', '0', '1'}, Message: "Deadlock found when trying to get lock; try restarting transaction"},
+			want: true,
+		},
+		{
+			name: "mysql lock wait timeout",
+			err:  &mysql.MySQLError{Number: 1205, SQLState: [5]byte{'H', 'Y', '0', '0', '0'}, Message: "Lock wait timeout exceeded; try restarting transaction"},
+			want: true,
+		},
+		{
+			name: "sqlstate serialization failure",
+			err:  &mysql.MySQLError{Number: 1105, SQLState: [5]byte{'4', '0', '0', '0', '1'}, Message: "transaction aborted"},
+			want: true,
+		},
+		{
+			name: "tidb write conflict db-shaped fallback",
+			err:  errors.New("ERROR 9007 (HY000): Write conflict, txnStartTS=123, conflictStartTS=456"),
 			want: true,
 		},
 		{
@@ -307,11 +325,78 @@ func TestIsMetaLockConflictErrorIncludesTiDBWriteConflict(t *testing.T) {
 			err:  errors.New("ERROR 9007 quota unavailable"),
 			want: false,
 		},
+		{
+			name: "tidb mysql error without write conflict",
+			err:  &mysql.MySQLError{Number: 9007, SQLState: [5]byte{'H', 'Y', '0', '0', '0'}, Message: "quota unavailable"},
+			want: false,
+		},
+		{
+			name: "unrelated 40001 string",
+			err:  errors.New("quota request 40001 rejected by policy"),
+			want: false,
+		},
+		{
+			name: "unrelated write conflict string",
+			err:  errors.New("application write conflict in cache layer"),
+			want: false,
+		},
+		{
+			name: "wrapped non-db context with 40001",
+			err:  fmt.Errorf("quota admission 40001: %w", errors.New("application rejected write")),
+			want: false,
+		},
+		{
+			name: "wrapped non-db context with write conflict",
+			err:  fmt.Errorf("quota admission write conflict: %w", errors.New("application rejected write")),
+			want: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isMetaLockConflictError(tt.err); got != tt.want {
 				t.Fatalf("isMetaLockConflictError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRetryMetaLockConflictDoesNotRetryFalsePositiveLockText(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "unrelated 40001 string",
+			err:  errors.New("quota request 40001 rejected by policy"),
+		},
+		{
+			name: "unrelated write conflict string",
+			err:  errors.New("application write conflict in cache layer"),
+		},
+		{
+			name: "wrapped non-db context with 40001",
+			err:  fmt.Errorf("quota admission 40001: %w", errors.New("application rejected write")),
+		},
+		{
+			name: "wrapped non-db context with write conflict",
+			err:  fmt.Errorf("quota admission write conflict: %w", errors.New("application rejected write")),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls int
+			err := retryMetaLockConflict(context.Background(), "tenant-false-positive", "reserve_upload", "test_op", func() error {
+				calls++
+				return tt.err
+			})
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("err = %v, want original error %v", err, tt.err)
+			}
+			if errors.Is(err, ErrQuotaReservationBusy) {
+				t.Fatalf("err = %v, want no busy fail-open sentinel", err)
+			}
+			if calls != 1 {
+				t.Fatalf("calls = %d, want 1", calls)
 			}
 		})
 	}
