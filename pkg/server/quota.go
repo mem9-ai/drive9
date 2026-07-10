@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
 
 type quotaRequest struct {
@@ -87,10 +89,16 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req := decodeQuotaGetRequest(r)
-	cred, err := quotaCredentials(req)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, err.Error())
-		return
+	hasTiDBCloudCreds := req.PublicKey != "" || req.PrivateKey != ""
+	var apiKeyTenant *meta.TenantWithAPIKey
+	var apiKeyErr error
+	if req.TenantID == "" && bearerToken(r) != "" {
+		apiKeyTenant, apiKeyErr = s.resolveQuotaAPIKey(r.Context(), r)
+		if apiKeyErr != nil {
+			writeQuotaAPIKeyError(w, r.Context(), apiKeyErr)
+			return
+		}
+		req.TenantID = apiKeyTenant.Tenant.ID
 	}
 	t, ok := s.quotaTenant(w, r.Context(), req.TenantID)
 	if !ok {
@@ -112,6 +120,29 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 	cfg, err := s.meta.GetQuotaConfig(r.Context(), t.ID)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "quota config lookup failed")
+		return
+	}
+	if cfg.TiDBCloudSpendingLimit != nil && bearerToken(r) != "" {
+		if apiKeyTenant == nil && apiKeyErr == nil {
+			apiKeyTenant, apiKeyErr = s.resolveQuotaAPIKey(r.Context(), r)
+		}
+		if apiKeyErr == nil && apiKeyTenant != nil && apiKeyTenant.Tenant.ID == t.ID {
+			setRequestMetricTenant(r.Context(), t.ID, apiKeyTenant.APIKey.ID, t.Provider, classifyTenantRequest(r))
+			s.writeQuotaResponse(w, r, t)
+			return
+		}
+		if !hasTiDBCloudCreds {
+			if apiKeyErr != nil {
+				writeQuotaAPIKeyError(w, r.Context(), apiKeyErr)
+				return
+			}
+			errJSON(w, http.StatusForbidden, "API key tenant does not match requested tenant")
+			return
+		}
+	}
+	cred, err := quotaCredentials(req)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	needRefresh := false
@@ -140,6 +171,63 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 	}
 	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, classifyTenantRequest(r))
 	s.writeQuotaResponse(w, r, t)
+}
+
+var (
+	errQuotaAPIKeyAuthNotEnabled = errors.New("API key quota auth not enabled")
+	errQuotaAPIKeyMissing        = errors.New("missing or malformed Authorization header")
+	errQuotaAPIKeyInvalid        = errors.New("invalid API key")
+)
+
+func (s *Server) resolveQuotaAPIKey(ctx context.Context, r *http.Request) (*meta.TenantWithAPIKey, error) {
+	if s.meta == nil || s.pool == nil || len(s.tokenSecret) == 0 {
+		return nil, errQuotaAPIKeyAuthNotEnabled
+	}
+	tok := bearerToken(r)
+	if tok == "" {
+		return nil, errQuotaAPIKeyMissing
+	}
+	hash := token.HashToken(tok)
+	resolved, err := s.meta.ResolveByAPIKeyHash(ctx, hash)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			return nil, errQuotaAPIKeyInvalid
+		}
+		return nil, fmt.Errorf("resolve API key: %w", err)
+	}
+	if subtle.ConstantTimeCompare([]byte(hash), []byte(resolved.APIKey.JWTHash)) != 1 {
+		return nil, errQuotaAPIKeyInvalid
+	}
+	if resolved.APIKey.Status != meta.APIKeyActive {
+		return nil, errQuotaAPIKeyInvalid
+	}
+	plain, err := poolDecryptToken(ctx, s.pool, resolved.APIKey.JWTCiphertext)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt API key: %w", err)
+	}
+	if subtle.ConstantTimeCompare([]byte(tok), plain) != 1 {
+		return nil, errQuotaAPIKeyInvalid
+	}
+	claims, err := token.ParseAndVerifyToken(s.tokenSecret, tok)
+	if err != nil {
+		return nil, errQuotaAPIKeyInvalid
+	}
+	if claims.TenantID != resolved.Tenant.ID || claims.TokenVersion != resolved.APIKey.TokenVersion {
+		return nil, errQuotaAPIKeyInvalid
+	}
+	return resolved, nil
+}
+
+func writeQuotaAPIKeyError(w http.ResponseWriter, ctx context.Context, err error) {
+	switch {
+	case errors.Is(err, errQuotaAPIKeyMissing), errors.Is(err, errQuotaAPIKeyInvalid):
+		errJSON(w, http.StatusUnauthorized, errQuotaAPIKeyInvalid.Error())
+	case errors.Is(err, errQuotaAPIKeyAuthNotEnabled):
+		errJSON(w, http.StatusNotFound, "quota query not enabled")
+	default:
+		logger.Warn(ctx, "quota_api_key_auth_failed", zap.Error(err))
+		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
+	}
 }
 
 func decodeQuotaGetRequest(r *http.Request) quotaRequest {

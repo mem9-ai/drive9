@@ -548,6 +548,47 @@ func TestQuotaGetReturnsConfigStorageUsageAndSpendingLimit(t *testing.T) {
 	}
 }
 
+func TestQuotaGetUsesDrive9APIKeyWhenLocalSpendingLimitExists(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	spendingLimit := int64(10000)
+	ctx := context.Background()
+	if err := rt.meta.SetQuotaConfigPatch(ctx, rt.tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimit: &spendingLimit}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.EnsureQuotaUsageRow(ctx, rt.tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.SetQuotaCounters(ctx, rt.tenantID, 321, 7, 9); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.IncrReservedBytes(ctx, rt.tenantID, 7); err != nil {
+		t.Fatal(err)
+	}
+	rt.prov.getErr = errors.New("should not call TiDB Cloud when Drive9 API key and local spending limit are present")
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := getQuota(t, ts.URL, rt.tenantID, "", "", rt.apiKey)
+	defer func(body io.Closer) { _ = body.Close() }(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var out quotaResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Config.TiDBCloudSpendingLimit == nil || *out.Config.TiDBCloudSpendingLimit != spendingLimit {
+		t.Fatalf("spending limit = %#v, want %d", out.Config.TiDBCloudSpendingLimit, spendingLimit)
+	}
+	if out.Usage.StorageBytes != 321 || out.Usage.ReservedBytes != 7 || out.Usage.FileCount != 9 {
+		t.Fatalf("usage = %#v", out.Usage)
+	}
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("get calls = %d, want 0", got)
+	}
+}
+
 func TestQuotaGetUsesTiDBCloudAuthorization(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ts := httptest.NewServer(rt.server)
