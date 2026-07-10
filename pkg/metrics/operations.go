@@ -49,6 +49,10 @@ var serviceGauge = serviceMeter.Float64Gauge("drive9_service_gauge", "Service ga
 var tenantPoolMetadataResumeWaitTotal = serviceMeter.Int64Counter("drive9_tenant_pool_metadata_resume_wait_total", "Tenant pool metadata resume wait attempts by pool_id/organization_id/scope/result")
 var tenantPoolMetadataResumeWaitDuration = serviceMeter.Float64Histogram("drive9_tenant_pool_metadata_resume_wait_duration_seconds", "Tenant pool metadata resume wait duration by pool_id/organization_id/scope/result", tenantPoolMetadataResumeWaitDurationBounds)
 var tenantPoolCapacity = serviceMeter.Float64Gauge("drive9_tenant_pool_capacity", "Tenant pool capacity by pool_id/organization_id/state")
+var tidbCloudRBACCacheRequestsTotal = serviceMeter.Int64Counter("drive9_tidbcloud_rbac_cache_requests_total", "TiDB Cloud API key to cluster RBAC cache requests by path/scope/result")
+var tidbCloudOpenAPIRequestsTotal = serviceMeter.Int64Counter("drive9_tidbcloud_openapi_requests_total", "TiDB Cloud OpenAPI requests by path/operation/result")
+var tidbCloudSpendingLimitSyncTotal = serviceMeter.Int64Counter("drive9_tidbcloud_spending_limit_sync_total", "TiDB Cloud spending limit local sync outcomes by source/result")
+var tidbCloudSpendingLimitMissingTotal = serviceMeter.Int64Counter("drive9_tidbcloud_spending_limit_missing_total", "TiDB Cloud spending limit missing local config observations by path")
 
 var httpRequestsTotal = httpMeter.Int64Counter("drive9_http_requests_total", "Total HTTP requests by method/route/status")
 var httpRequestDuration = httpMeter.Float64Histogram("drive9_http_request_duration_seconds", "HTTP request duration histogram by method/route", httpDurationBounds)
@@ -146,6 +150,39 @@ func RecordTenantPoolCapacity(poolID, organizationID, state string, value float6
 		Attr("pool_id", cleanMetricValue(poolID, "unknown")),
 		Attr("organization_id", cleanMetricValue(organizationID, "unknown")),
 		Attr("state", cleanMetricValue(state, "unknown")),
+	)
+}
+
+func RecordTiDBCloudRBACCacheRequest(path, scope, result string) {
+	RegisterModule("tidbcloud_quota")
+	tidbCloudRBACCacheRequestsTotal.Add(1,
+		Attr("path", cleanMetricValue(path, "unknown")),
+		Attr("scope", cleanMetricValue(scope, "unknown")),
+		Attr("result", cleanMetricValue(result, "unknown")),
+	)
+}
+
+func RecordTiDBCloudOpenAPIRequest(path, operation, result string) {
+	RegisterModule("tidbcloud_quota")
+	tidbCloudOpenAPIRequestsTotal.Add(1,
+		Attr("path", cleanMetricValue(path, "unknown")),
+		Attr("operation", cleanMetricValue(operation, "unknown")),
+		Attr("result", cleanMetricValue(result, "unknown")),
+	)
+}
+
+func RecordTiDBCloudSpendingLimitSync(source, result string) {
+	RegisterModule("tidbcloud_quota")
+	tidbCloudSpendingLimitSyncTotal.Add(1,
+		Attr("source", cleanMetricValue(source, "unknown")),
+		Attr("result", cleanMetricValue(result, "unknown")),
+	)
+}
+
+func RecordTiDBCloudSpendingLimitMissing(path string) {
+	RegisterModule("tidbcloud_quota")
+	tidbCloudSpendingLimitMissingTotal.Add(1,
+		Attr("path", cleanMetricValue(path, "unknown")),
 	)
 }
 

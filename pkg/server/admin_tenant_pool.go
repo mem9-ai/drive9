@@ -869,11 +869,11 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 			stageStarted = time.Now()
 			quotaReq := *quotaOpt
 			quotaReq.TenantID = tenantID
-			if err := s.applyQuotaLocalConfig(ctx, tenantID, quotaReq); err != nil {
+			if err := s.applyQuotaLocalConfig(ctx, "pool_create", tenantID, quotaReq); err != nil {
 				cleanupOnError = true
 				return nil, err
 			}
-			if err := s.syncTiDBCloudSpendingLimit(ctx, tenantID, batchCloudCfg); err != nil {
+			if err := s.syncTiDBCloudSpendingLimit(ctx, "pool_create", tenantID, batchCloudCfg); err != nil {
 				cleanupOnError = true
 				return nil, err
 			}
@@ -1674,10 +1674,10 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		stageStarted = time.Now()
 		quotaReq := *quotaOpt
 		quotaReq.TenantID = row.Tenant.ID
-		if err := s.applyQuotaLocalConfig(ctx, row.Tenant.ID, quotaReq); err != nil {
+		if err := s.applyQuotaLocalConfig(ctx, "pool_claim", row.Tenant.ID, quotaReq); err != nil {
 			return nil, nil, false, err
 		}
-		if err := s.syncTiDBCloudSpendingLimit(ctx, row.Tenant.ID, cloudCfg); err != nil {
+		if err := s.syncTiDBCloudSpendingLimit(ctx, "pool_claim", row.Tenant.ID, cloudCfg); err != nil {
 			return nil, nil, false, err
 		}
 		logProvisionStage(ctx, "admin_tenant_pool_claim_quota_local_config_applied", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID, "create_time_spending_limit", cloudCfg != nil && cloudCfg.TiDBCloudSpendingLimitMonthly != nil)

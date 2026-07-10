@@ -13,6 +13,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
@@ -112,14 +113,24 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "quota config lookup failed")
 		return
 	}
-	if cfg.TiDBCloudSpendingLimit == nil || !s.tidbCloudRBACAllowed(cred, t.ClusterID) {
+	needRefresh := false
+	if cfg.TiDBCloudSpendingLimit == nil {
+		metrics.RecordTiDBCloudSpendingLimitMissing("quota_get")
+		metrics.RecordTiDBCloudRBACCacheRequest("quota_get", "cluster", "bypass")
+		needRefresh = true
+	} else if !s.tidbCloudRBACAllowed(cred, t.ClusterID, "quota_get") {
+		needRefresh = true
+	}
+	if needRefresh {
 		cloudCfg, err := getter.GetQuota(r.Context(), clusterInfoFromTenant(t), cred)
 		if err != nil {
+			metrics.RecordTiDBCloudOpenAPIRequest("quota_get", "get_quota", "error")
 			writeQuotaCredentialError(w, r.Context(), err, "query")
 			return
 		}
+		metrics.RecordTiDBCloudOpenAPIRequest("quota_get", "get_quota", "ok")
 		s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{ClusterID: t.ClusterID})
-		if err := s.syncTiDBCloudSpendingLimit(r.Context(), t.ID, cloudCfg); err != nil {
+		if err := s.syncTiDBCloudSpendingLimit(r.Context(), "quota_get", t.ID, cloudCfg); err != nil {
 			logger.Warn(r.Context(), "tidbcloud_spending_limit_sync_failed", zap.String("tenant_id", t.ID), zap.Error(err))
 			errJSON(w, http.StatusInternalServerError, "quota config update failed")
 			return
@@ -178,7 +189,7 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusConflict, err.Error())
 		return
 	}
-	if err := s.applyQuotaSet(r.Context(), t, cred, req); err != nil {
+	if err := s.applyQuotaSet(r.Context(), "quota_set", t, cred, req); err != nil {
 		writeQuotaSetError(w, r.Context(), err, "update")
 		return
 	}
@@ -276,7 +287,7 @@ func (s *Server) rejectQuotaSetForTenantStatus(t *meta.Tenant) error {
 	}
 }
 
-func (s *Server) applyQuotaSet(ctx context.Context, t *meta.Tenant, cred tenant.CredentialProvisionRequest, req quotaRequest) error {
+func (s *Server) applyQuotaSet(ctx context.Context, metricPath string, t *meta.Tenant, cred tenant.CredentialProvisionRequest, req quotaRequest) error {
 	if t == nil {
 		return fmt.Errorf("tenant is required")
 	}
@@ -289,16 +300,20 @@ func (s *Server) applyQuotaSet(ctx context.Context, t *meta.Tenant, cred tenant.
 	}
 	cloudCfg, err := updater.MarkQuotaUpdateStarted(ctx, clusterInfoFromTenant(t), cred)
 	if err != nil {
+		metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "mark_quota_update_started", "error")
 		return err
 	}
+	metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "mark_quota_update_started", "ok")
 	s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{ClusterID: t.ClusterID})
 	if req.TiDBCloudSpendingLimit != nil {
 		updatedCloudCfg, err := updater.UpdateQuota(ctx, clusterInfoFromTenant(t), cred, tenant.QuotaUpdateOptions{
 			TiDBCloudSpendingLimitMonthly: req.TiDBCloudSpendingLimit,
 		})
 		if err != nil {
+			metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "update_quota", "error")
 			return err
 		}
+		metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "update_quota", "ok")
 		if cloudCfg == nil {
 			cloudCfg = updatedCloudCfg
 		} else if updatedCloudCfg != nil && updatedCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
@@ -313,8 +328,21 @@ func (s *Server) applyQuotaSet(ctx context.Context, t *meta.Tenant, cred tenant.
 		quotaPatch.TiDBCloudSpendingLimit = cloudLimit
 	}
 	if quotaPatch.AnySet() {
+		hasSpendingLimitPatch := quotaPatch.TiDBCloudSpendingLimit != nil
+		spendingSyncResult := ""
+		if hasSpendingLimitPatch {
+			if result, resultErr := s.tidbCloudSpendingLimitSyncResult(ctx, t.ID, quotaPatch.TiDBCloudSpendingLimit); resultErr == nil {
+				spendingSyncResult = result
+			}
+		}
 		if err := s.meta.SetQuotaConfigPatch(ctx, t.ID, quotaPatch); err != nil {
+			if hasSpendingLimitPatch {
+				metrics.RecordTiDBCloudSpendingLimitSync(metricPath, "error")
+			}
 			return fmt.Errorf("%w: quota config update failed: %w", errQuotaLocalUpdateFailed, err)
+		}
+		if spendingSyncResult != "" {
+			metrics.RecordTiDBCloudSpendingLimitSync(metricPath, spendingSyncResult)
 		}
 		if err := s.meta.EnsureQuotaUsageRow(ctx, t.ID); err != nil {
 			return fmt.Errorf("%w: quota usage initialization failed: %w", errQuotaLocalUpdateFailed, err)
@@ -323,7 +351,7 @@ func (s *Server) applyQuotaSet(ctx context.Context, t *meta.Tenant, cred tenant.
 	return nil
 }
 
-func (s *Server) applyQuotaLocalConfig(ctx context.Context, tenantID string, req quotaRequest) error {
+func (s *Server) applyQuotaLocalConfig(ctx context.Context, source, tenantID string, req quotaRequest) error {
 	quotaPatch, err := quotaConfigPatchFromRequest(req)
 	if err != nil {
 		return err
@@ -331,8 +359,21 @@ func (s *Server) applyQuotaLocalConfig(ctx context.Context, tenantID string, req
 	if !quotaPatch.AnySet() {
 		return nil
 	}
+	hasSpendingLimitPatch := quotaPatch.TiDBCloudSpendingLimit != nil
+	spendingSyncResult := ""
+	if hasSpendingLimitPatch {
+		if result, resultErr := s.tidbCloudSpendingLimitSyncResult(ctx, tenantID, quotaPatch.TiDBCloudSpendingLimit); resultErr == nil {
+			spendingSyncResult = result
+		}
+	}
 	if err := s.meta.SetQuotaConfigPatch(ctx, tenantID, quotaPatch); err != nil {
+		if hasSpendingLimitPatch {
+			metrics.RecordTiDBCloudSpendingLimitSync(source, "error")
+		}
 		return fmt.Errorf("%w: quota config update failed: %w", errQuotaLocalUpdateFailed, err)
+	}
+	if spendingSyncResult != "" {
+		metrics.RecordTiDBCloudSpendingLimitSync(source, spendingSyncResult)
 	}
 	if err := s.meta.EnsureQuotaUsageRow(ctx, tenantID); err != nil {
 		return fmt.Errorf("%w: quota usage initialization failed: %w", errQuotaLocalUpdateFailed, err)
@@ -477,8 +518,13 @@ func quotaSetErrorStatusMessage(err error, action string) (int, string, bool) {
 	}
 }
 
-func (s *Server) tidbCloudRBACAllowed(cred tenant.CredentialProvisionRequest, clusterID string) bool {
+func (s *Server) tidbCloudRBACAllowed(cred tenant.CredentialProvisionRequest, clusterID, metricPath string) bool {
 	_, ok := s.tidbCloudRBACCache.getCluster(cred, clusterID)
+	result := "miss"
+	if ok {
+		result = "hit"
+	}
+	metrics.RecordTiDBCloudRBACCacheRequest(metricPath, "cluster", result)
 	return ok
 }
 
@@ -494,17 +540,42 @@ func tidbCloudSpendingLimitFromCloud(cloudCfg *tenant.QuotaCloudConfig) *int64 {
 	return &limit
 }
 
-func (s *Server) syncTiDBCloudSpendingLimit(ctx context.Context, tenantID string, cloudCfg *tenant.QuotaCloudConfig) error {
+func (s *Server) syncTiDBCloudSpendingLimit(ctx context.Context, source, tenantID string, cloudCfg *tenant.QuotaCloudConfig) error {
 	limit := tidbCloudSpendingLimitFromCloud(cloudCfg)
 	if limit == nil {
+		metrics.RecordTiDBCloudSpendingLimitSync(source, "missing_cloud_value")
 		return nil
+	}
+	result, err := s.tidbCloudSpendingLimitSyncResult(ctx, tenantID, limit)
+	if err != nil {
+		metrics.RecordTiDBCloudSpendingLimitSync(source, "error")
+		return err
+	}
+	if result == "unchanged" {
+		metrics.RecordTiDBCloudSpendingLimitSync(source, result)
+		return nil
+	}
+	if err := s.meta.SetQuotaConfigPatch(ctx, tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimit: limit}); err != nil {
+		metrics.RecordTiDBCloudSpendingLimitSync(source, "error")
+		return err
+	}
+	metrics.RecordTiDBCloudSpendingLimitSync(source, result)
+	return nil
+}
+
+func (s *Server) tidbCloudSpendingLimitSyncResult(ctx context.Context, tenantID string, limit *int64) (string, error) {
+	if limit == nil {
+		return "", nil
 	}
 	cfg, err := s.meta.GetQuotaConfig(ctx, tenantID)
 	if err != nil {
-		return err
+		return "error", err
 	}
-	if cfg.TiDBCloudSpendingLimit != nil && *cfg.TiDBCloudSpendingLimit == *limit {
-		return nil
+	if cfg.TiDBCloudSpendingLimit == nil {
+		return "inserted", nil
 	}
-	return s.meta.SetQuotaConfigPatch(ctx, tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimit: limit})
+	if *cfg.TiDBCloudSpendingLimit == *limit {
+		return "unchanged", nil
+	}
+	return "updated", nil
 }

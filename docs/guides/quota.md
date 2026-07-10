@@ -205,3 +205,13 @@ The quota API returns JSON errors through the standard server error shape.
   gaps require operational reconciliation from tenant file metadata.
 - Multipart uploads use a stricter reserve-first path before writing tenant
   upload state.
+- TiDB Cloud quota reads expose low-cardinality observability counters:
+  `drive9_tidbcloud_rbac_cache_requests_total`,
+  `drive9_tidbcloud_openapi_requests_total`,
+  `drive9_tidbcloud_spending_limit_sync_total`, and
+  `drive9_tidbcloud_spending_limit_missing_total`. These metrics intentionally
+  do not include `tenant_id`.
+- Do not alert on cache misses, spending-limit backfills, or missing local
+  spending-limit observations being greater than zero. Those are normal during
+  first access, key changes, or migration. Alert only on sustained TiDB Cloud
+  OpenAPI error rate or an unexpected OpenAPI call-rate baseline increase.

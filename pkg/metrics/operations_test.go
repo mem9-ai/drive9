@@ -123,6 +123,32 @@ func TestRecordTenantPoolCapacityIncludesPoolOrganizationAndState(t *testing.T) 
 	}
 }
 
+func TestTiDBCloudQuotaMetricsOmitTenantID(t *testing.T) {
+	RecordTiDBCloudRBACCacheRequest("quota_get", "cluster", "hit")
+	RecordTiDBCloudOpenAPIRequest("admin_tenant_get", "list_managed_clusters", "ok")
+	RecordTiDBCloudSpendingLimitSync("quota_get", "updated")
+	RecordTiDBCloudSpendingLimitMissing("admin_tenant_list")
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	for _, want := range []string{
+		`drive9_tidbcloud_rbac_cache_requests_total{path="quota_get",result="hit",scope="cluster"} 1`,
+		`drive9_tidbcloud_openapi_requests_total{operation="list_managed_clusters",path="admin_tenant_get",result="ok"} 1`,
+		`drive9_tidbcloud_spending_limit_sync_total{result="updated",source="quota_get"} 1`,
+		`drive9_tidbcloud_spending_limit_missing_total{path="admin_tenant_list"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing TiDB Cloud quota metric %q:\n%s", want, text)
+		}
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "drive9_tidbcloud_") && strings.Contains(line, `tenant_id=`) {
+			t.Fatalf("TiDB Cloud quota metrics must not carry tenant_id:\n%s", text)
+		}
+	}
+}
+
 func TestRecordDBOperationOmitsTenantID(t *testing.T) {
 	const tenantID = "tenant-db-operation-test"
 

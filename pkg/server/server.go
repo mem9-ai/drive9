@@ -5140,13 +5140,13 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		stageStarted = time.Now()
 		quotaReq := *opts.Quota
 		quotaReq.TenantID = tenantID
-		if err := s.applyQuotaLocalConfig(ctx, tenantID, quotaReq); err != nil {
+		if err := s.applyQuotaLocalConfig(ctx, "provision", tenantID, quotaReq); err != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
 			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
 			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to set tenant quota", err)
 		}
-		if err := s.syncTiDBCloudSpendingLimit(ctx, tenantID, provisionCloudCfg); err != nil {
+		if err := s.syncTiDBCloudSpendingLimit(ctx, "provision", tenantID, provisionCloudCfg); err != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
 			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
