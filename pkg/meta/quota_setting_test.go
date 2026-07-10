@@ -223,6 +223,40 @@ func TestSetQuotaStorageBytesInsertsInternalDefaults(t *testing.T) {
 	}
 }
 
+func TestSetQuotaStorageBytesOverridesSpendingOnlyRow(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	spendingLimit := int64(100)
+	if err := s.SetQuotaConfigPatch(ctx, "tenant-spending-then-storage", QuotaConfigPatch{TiDBCloudSpendingLimit: &spendingLimit}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := s.GetQuotaConfig(ctx, "tenant-spending-then-storage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QuotaLimitsOverridden {
+		t.Fatal("QuotaLimitsOverridden after spending-only patch = true, want false")
+	}
+
+	if err := s.SetQuotaStorageBytes(ctx, "tenant-spending-then-storage", 12345); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = s.GetQuotaConfig(ctx, "tenant-spending-then-storage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxStorageBytes != 12345 {
+		t.Fatalf("MaxStorageBytes = %d, want 12345", cfg.MaxStorageBytes)
+	}
+	if !cfg.QuotaLimitsOverridden {
+		t.Fatal("QuotaLimitsOverridden = false, want true after storage override")
+	}
+	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != spendingLimit {
+		t.Fatalf("TiDBCloudSpendingLimit = %#v, want %d", cfg.TiDBCloudSpendingLimit, spendingLimit)
+	}
+}
+
 func TestSetQuotaConfigPatchUpdatesExternalFieldsOnly(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()

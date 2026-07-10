@@ -239,10 +239,11 @@ func (s *Store) SetQuotaStorageBytes(ctx context.Context, tenantID string, maxSt
 	defer observeMeta(ctx, "set_quota_storage_bytes", start, &err)
 
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes)
-		 VALUES (?, ?)
+		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes, quota_limits_overridden)
+		 VALUES (?, ?, 1)
 		 ON DUPLICATE KEY UPDATE
-		   max_storage_bytes = VALUES(max_storage_bytes)`,
+		   max_storage_bytes = VALUES(max_storage_bytes),
+		   quota_limits_overridden = 1`,
 		tenantID, maxStorageBytes)
 	if err != nil {
 		return fmt.Errorf("set quota storage bytes for tenant %q: %w", tenantID, err)
