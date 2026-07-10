@@ -242,6 +242,7 @@ type TenantTiDBCloudOrgBinding struct {
 	TenantID       string
 	OrganizationID string
 	ClusterID      string
+	BranchID       string
 	PoolID         string
 	PoolStatus     TenantPoolBindingStatus
 	UsedAt         *time.Time
@@ -252,6 +253,11 @@ type TenantTiDBCloudOrgBinding struct {
 type TenantWithTiDBCloudOrgBinding struct {
 	Tenant  Tenant
 	Binding TenantTiDBCloudOrgBinding
+}
+
+type metaQueryExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 type TenantPoolBindingStatus string
@@ -308,6 +314,8 @@ const metaSchemaMigrateLockNamePrefix = "dat9_meta_schema_migrate:"
 const metaSchemaMigrateLockTimeoutSeconds = 30
 const externalBindingLockTimeoutSeconds = 90
 const externalBindingReleaseLockTimeout = 5 * time.Second
+const tidbCloudOrgBindingLockTimeoutSeconds = 90
+const tidbCloudOrgBindingReleaseLockTimeout = 5 * time.Second
 const tenantPoolLockTimeoutSeconds = 300
 const tenantPoolReleaseLockTimeout = 5 * time.Second
 
@@ -336,6 +344,9 @@ func (s *Store) migrate() (err error) {
 		return fmt.Errorf("diff meta schema: %w", err)
 	}
 	if err := applyMetaSchemaRepairs(ctx, s.db, plannedMetaSchemaRepairs(diffs)); err != nil {
+		return err
+	}
+	if err := backfillTiDBCloudOrgBindingBranchIDs(ctx, s.db); err != nil {
 		return err
 	}
 	diffs, err = diffMetaSchema(ctx, s.db, spec)
@@ -581,12 +592,13 @@ func metaInitSchemaStatements() []string {
 				tenant_id       VARCHAR(64) PRIMARY KEY,
 				organization_id VARCHAR(64) NOT NULL,
 				cluster_id      VARCHAR(255) NOT NULL,
+				branch_id       VARCHAR(255) NOT NULL DEFAULT '',
 				pool_id         VARCHAR(64) NOT NULL DEFAULT '',
 				pool_status     VARCHAR(20) NOT NULL DEFAULT 'used',
 				used_at         DATETIME(3) NULL,
 				created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 				updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-				INDEX idx_tidbcloud_org_cluster (organization_id, cluster_id, created_at, tenant_id),
+				INDEX idx_tidbcloud_org_cluster (organization_id, cluster_id, branch_id, created_at, tenant_id),
 				INDEX idx_tidbcloud_org_created (organization_id, created_at, tenant_id),
 				INDEX idx_tidbcloud_pool_free (organization_id, pool_status, created_at, tenant_id)
 			)`,
@@ -762,10 +774,20 @@ func dropObsoleteMetaIndexes(ctx context.Context, db *sql.DB) error {
 	if err := dropMetaIndexIfExists(ctx, db, "tenant_api_keys", "idx_api_keys_tenant_name"); err != nil {
 		return fmt.Errorf("drop obsolete meta index idx_api_keys_tenant_name: %w", err)
 	}
+	if err := dropMetaIndexIfColumns(ctx, db, "tenant_tidbcloud_org_bindings", "idx_tidbcloud_org_cluster",
+		[]string{"organization_id", "cluster_id", "created_at", "tenant_id"}); err != nil {
+		return fmt.Errorf("drop obsolete meta index idx_tidbcloud_org_cluster: %w", err)
+	}
 	return nil
 }
 
 func dropMetaIndexIfExists(ctx context.Context, db *sql.DB, tableName, indexName string) error {
+	if err := validateMetaIdentifier(tableName); err != nil {
+		return fmt.Errorf("invalid table name %q: %w", tableName, err)
+	}
+	if err := validateMetaIdentifier(indexName); err != nil {
+		return fmt.Errorf("invalid index name %q: %w", indexName, err)
+	}
 	var count int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
 		FROM information_schema.statistics
@@ -778,6 +800,72 @@ func dropMetaIndexIfExists(ctx context.Context, db *sql.DB, tableName, indexName
 	}
 	_, err := db.ExecContext(ctx, fmt.Sprintf("DROP INDEX %s ON %s", indexName, tableName))
 	return err
+}
+
+func dropMetaIndexIfColumns(ctx context.Context, db *sql.DB, tableName, indexName string, columns []string) error {
+	if err := validateMetaIdentifier(tableName); err != nil {
+		return fmt.Errorf("invalid table name %q: %w", tableName, err)
+	}
+	if err := validateMetaIdentifier(indexName); err != nil {
+		return fmt.Errorf("invalid index name %q: %w", indexName, err)
+	}
+	got, err := loadMetaIndexColumns(ctx, db, tableName, indexName)
+	if err != nil {
+		return err
+	}
+	if !sameStringSlice(got, columns) {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP INDEX %s ON %s", indexName, tableName))
+	return err
+}
+
+func validateMetaIdentifier(s string) error {
+	if s == "" {
+		return fmt.Errorf("identifier is empty")
+	}
+	for _, r := range s {
+		if r == '_' || ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z') || ('0' <= r && r <= '9') {
+			continue
+		}
+		return fmt.Errorf("identifier contains unsupported character %q", r)
+	}
+	return nil
+}
+
+func loadMetaIndexColumns(ctx context.Context, db *sql.DB, tableName, indexName string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `SELECT column_name
+		FROM information_schema.statistics
+		WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?
+		ORDER BY seq_in_index`, tableName, indexName)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			return nil, err
+		}
+		out = append(out, strings.ToLower(col))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func sameStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func metaSchemaSpecFromStatements(stmts []string) (metaSchemaSpec, error) {
@@ -998,6 +1086,17 @@ func applyMetaSchemaRepairs(ctx context.Context, db *sql.DB, stmts []string) err
 			}
 			return fmt.Errorf("apply meta schema repair %q: %w", schemaSnippet(stmt), err)
 		}
+	}
+	return nil
+}
+
+func backfillTiDBCloudOrgBindingBranchIDs(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `UPDATE tenant_tidbcloud_org_bindings b
+		JOIN tenants t ON t.id = b.tenant_id
+		SET b.branch_id = TRIM(COALESCE(t.branch_id, ''))
+		WHERE b.branch_id <> TRIM(COALESCE(t.branch_id, ''))`)
+	if err != nil {
+		return fmt.Errorf("backfill tidbcloud org binding branch ids: %w", err)
 	}
 	return nil
 }
@@ -1412,6 +1511,14 @@ func (s *Store) UpsertTenantTiDBCloudOrgBinding(ctx context.Context, b *TenantTi
 	if clusterID == "" {
 		return fmt.Errorf("cluster_id is required")
 	}
+	branchID := strings.TrimSpace(b.BranchID)
+	// tenants.branch_id is the source of truth; callers cannot override the
+	// branch dimension used for duplicate-ownership checks.
+	if tenantBranchID, ok, lookupErr := s.lookupTenantBranchID(ctx, tenantID); lookupErr != nil {
+		return lookupErr
+	} else if ok {
+		branchID = tenantBranchID
+	}
 	now := time.Now().UTC()
 	createdAt := b.CreatedAt
 	if createdAt.IsZero() {
@@ -1421,29 +1528,116 @@ func (s *Store) UpsertTenantTiDBCloudOrgBinding(ctx context.Context, b *TenantTi
 	if updatedAt.IsZero() {
 		updatedAt = now
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_tidbcloud_org_bindings
-		(tenant_id, organization_id, cluster_id, pool_id, pool_status, used_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE
-			organization_id = VALUES(organization_id),
-			cluster_id = VALUES(cluster_id),
-			pool_id = VALUES(pool_id),
-			pool_status = VALUES(pool_status),
-			used_at = VALUES(used_at),
+	return s.withTiDBCloudOrgBindingLock(ctx, organizationID, clusterID, branchID, func(ctx context.Context, conn metaQueryExecer) error {
+		if err := ensureTiDBCloudOrgBindingAvailable(ctx, conn, tenantID, organizationID, clusterID, branchID); err != nil {
+			return err
+		}
+		_, execErr := conn.ExecContext(ctx, `INSERT INTO tenant_tidbcloud_org_bindings
+			(tenant_id, organization_id, cluster_id, branch_id, pool_id, pool_status, used_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON DUPLICATE KEY UPDATE
+				organization_id = VALUES(organization_id),
+				cluster_id = VALUES(cluster_id),
+				branch_id = VALUES(branch_id),
+				pool_id = VALUES(pool_id),
+				pool_status = VALUES(pool_status),
+				used_at = VALUES(used_at),
 			updated_at = VALUES(updated_at)`,
-		tenantID, organizationID, clusterID, strings.TrimSpace(b.PoolID), tenantPoolBindingStatusForInsert(b.PoolStatus), b.UsedAt,
-		createdAt.UTC(), updatedAt.UTC())
-	return err
+			tenantID, organizationID, clusterID, branchID, strings.TrimSpace(b.PoolID), tenantPoolBindingStatusForInsert(b.PoolStatus), b.UsedAt,
+			createdAt.UTC(), updatedAt.UTC())
+		return execErr
+	})
+}
+
+func (s *Store) lookupTenantBranchID(ctx context.Context, tenantID string) (string, bool, error) {
+	var branchID sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT branch_id FROM tenants WHERE id = ?`, tenantID).Scan(&branchID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if branchID.Valid {
+		return strings.TrimSpace(branchID.String), true, nil
+	}
+	return "", true, nil
+}
+
+func (s *Store) withTiDBCloudOrgBindingLock(ctx context.Context, organizationID, clusterID, branchID string, fn func(context.Context, metaQueryExecer) error) (err error) {
+	if fn == nil {
+		return fmt.Errorf("tidbcloud org binding lock callback is required")
+	}
+	lockName := tidbCloudOrgBindingLockName(organizationID, clusterID, branchID)
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	var databaseName sql.NullString
+	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
+		return err
+	}
+	lockName = tenantPoolDatabaseLockName(lockName, databaseName.String)
+
+	var got sql.NullInt64
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, tidbCloudOrgBindingLockTimeoutSeconds).Scan(&got); err != nil {
+		return err
+	}
+	if !got.Valid {
+		return fmt.Errorf("tidbcloud org binding named lock returned NULL")
+	}
+	if got.Int64 != 1 {
+		return fmt.Errorf("timed out waiting for tidbcloud org binding named lock")
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), tidbCloudOrgBindingReleaseLockTimeout)
+		defer cancel()
+		var released sql.NullInt64
+		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
+		if releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+			return
+		}
+		if !released.Valid {
+			err = errors.Join(err, fmt.Errorf("tidbcloud org binding named lock release returned NULL"))
+			return
+		}
+		if released.Int64 != 1 {
+			err = errors.Join(err, fmt.Errorf("tidbcloud org binding named lock was not held by current connection"))
+		}
+	}()
+
+	return fn(ctx, conn)
+}
+
+func ensureTiDBCloudOrgBindingAvailable(ctx context.Context, q metaQueryExecer, tenantID, organizationID, clusterID, branchID string) error {
+	var existingTenantID string
+	err := q.QueryRowContext(ctx, `SELECT b.tenant_id
+		FROM tenant_tidbcloud_org_bindings b
+		JOIN tenants t ON t.id = b.tenant_id
+		WHERE b.organization_id = ? AND b.cluster_id = ? AND b.branch_id = ?
+			AND b.tenant_id <> ? AND t.status <> ?
+		LIMIT 1`,
+		organizationID, clusterID, branchID, tenantID, TenantDeleted).Scan(&existingTenantID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: tidbcloud organization cluster branch already bound to tenant %s", ErrDuplicate, existingTenantID)
 }
 
 func (s *Store) GetTenantTiDBCloudOrgBinding(ctx context.Context, tenantID string) (out *TenantTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "get_tidbcloud_org_binding", start, &err)
-	row := s.db.QueryRowContext(ctx, `SELECT tenant_id, organization_id, cluster_id, pool_id, pool_status, used_at, created_at, updated_at
+	row := s.db.QueryRowContext(ctx, `SELECT tenant_id, organization_id, cluster_id, branch_id, pool_id, pool_status, used_at, created_at, updated_at
 		FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID)
 	var rec TenantTiDBCloudOrgBinding
 	var usedAt sql.NullTime
-	if err = row.Scan(&rec.TenantID, &rec.OrganizationID, &rec.ClusterID, &rec.PoolID, &rec.PoolStatus, &usedAt, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+	if err = row.Scan(&rec.TenantID, &rec.OrganizationID, &rec.ClusterID, &rec.BranchID, &rec.PoolID, &rec.PoolStatus, &usedAt, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = ErrNotFound
 			return nil, err
@@ -1617,7 +1811,7 @@ func (s *Store) listFreeTenantPoolBindings(ctx context.Context, organizationID s
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
 			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
-			b.tenant_id, b.organization_id, b.cluster_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
+			b.tenant_id, b.organization_id, b.cluster_id, b.branch_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
 		FROM tenant_tidbcloud_org_bindings b
 		JOIN tenants t ON t.id = b.tenant_id
 			WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
@@ -1651,7 +1845,7 @@ func (s *Store) ClaimOldestFreeTenantPoolBinding(ctx context.Context, organizati
 				t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
 				t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
 				t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
-				b.tenant_id, b.organization_id, b.cluster_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
+				b.tenant_id, b.organization_id, b.cluster_id, b.branch_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
 			FROM tenant_tidbcloud_org_bindings b
 			JOIN tenants t ON t.id = b.tenant_id
 				WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
@@ -1828,7 +2022,7 @@ func (s *Store) ListTenantsByTiDBCloudOrganizations(ctx context.Context, organiz
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
 			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
-			b.tenant_id, b.organization_id, b.cluster_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
+			b.tenant_id, b.organization_id, b.cluster_id, b.branch_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
 			FROM tenant_tidbcloud_org_bindings b
 			JOIN tenants t ON t.id = b.tenant_id
 			WHERE b.organization_id IN (` + strings.Join(placeholders, ",") + `)
@@ -1870,7 +2064,7 @@ func (s *Store) ListTenantsByTiDBCloudOrgClusterBindings(ctx context.Context, bi
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
 			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
-			b.tenant_id, b.organization_id, b.cluster_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
+			b.tenant_id, b.organization_id, b.cluster_id, b.branch_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
 			FROM tenant_tidbcloud_org_bindings b
 			JOIN tenants t ON t.id = b.tenant_id
 			WHERE (b.organization_id, b.cluster_id) IN (` + strings.Join(placeholders, ",") + `)
@@ -2027,6 +2221,11 @@ func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(c
 func externalBindingLockName(provider, subjectKey string) string {
 	sum := sha256.Sum256([]byte(provider + "\x00" + subjectKey))
 	return "d9_extbind:" + hex.EncodeToString(sum[:20])
+}
+
+func tidbCloudOrgBindingLockName(organizationID, clusterID, branchID string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(organizationID) + "\x00" + strings.TrimSpace(clusterID) + "\x00" + strings.TrimSpace(branchID)))
+	return "d9_tidb_orgbind:" + hex.EncodeToString(sum[:16])
 }
 
 func tenantPoolLockName(poolID string) string {
@@ -2423,7 +2622,7 @@ func scanTenantBindingScanner(row tenantBindingScanner) (*TenantWithTiDBCloudOrg
 		&rec.Tenant.DBHost, &rec.Tenant.DBPort, &rec.Tenant.DBUser, &rec.Tenant.DBPasswordCipher,
 		&rec.Tenant.DBName, &dbTLS, &rec.Tenant.Provider, &clusterID, &rec.Tenant.BranchID, &claimURL, &claimExp, &rec.Tenant.SchemaVersion,
 		&rec.Tenant.S3EncryptionMode, &rec.Tenant.S3KMSKeyID, &s3BucketKeyEnabled, &rec.Tenant.CreatedAt, &rec.Tenant.UpdatedAt,
-		&rec.Binding.TenantID, &rec.Binding.OrganizationID, &rec.Binding.ClusterID, &rec.Binding.PoolID, &rec.Binding.PoolStatus, &usedAt,
+		&rec.Binding.TenantID, &rec.Binding.OrganizationID, &rec.Binding.ClusterID, &rec.Binding.BranchID, &rec.Binding.PoolID, &rec.Binding.PoolStatus, &usedAt,
 		&rec.Binding.CreatedAt, &rec.Binding.UpdatedAt); err != nil {
 		return nil, err
 	}

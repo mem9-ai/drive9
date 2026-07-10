@@ -928,6 +928,19 @@ func TestMetaSchemaSpecFromStatementsParsesNewTable(t *testing.T) {
 	}
 }
 
+func TestValidateMetaIdentifier(t *testing.T) {
+	for _, id := range []string{"tenant_tidbcloud_org_bindings", "idx_tidbcloud_org_cluster", "A1_b2"} {
+		if err := validateMetaIdentifier(id); err != nil {
+			t.Fatalf("validateMetaIdentifier(%q): %v", id, err)
+		}
+	}
+	for _, id := range []string{"", "tenant-table", "idx;drop", "idx name"} {
+		if err := validateMetaIdentifier(id); err == nil {
+			t.Fatalf("validateMetaIdentifier(%q) error = nil, want error", id)
+		}
+	}
+}
+
 func TestDiffMetaTableMetaReportsMissingColumnAndIndex(t *testing.T) {
 	spec := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_api_keys")
 	meta := metaTableMeta{
@@ -1197,7 +1210,7 @@ func TestMetaSchemaSpecIncludesExternalBindings(t *testing.T) {
 
 func TestMetaSchemaSpecIncludesTiDBCloudOrgBindings(t *testing.T) {
 	table := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_tidbcloud_org_bindings")
-	for _, column := range []string{"tenant_id", "organization_id", "cluster_id", "created_at", "updated_at"} {
+	for _, column := range []string{"tenant_id", "organization_id", "cluster_id", "branch_id", "created_at", "updated_at"} {
 		if _, ok := table.columns[column]; !ok {
 			t.Fatalf("tenant_tidbcloud_org_bindings schema missing %s", column)
 		}
@@ -1209,10 +1222,39 @@ func TestMetaSchemaSpecIncludesTiDBCloudOrgBindings(t *testing.T) {
 	}
 }
 
-func TestUpsertTenantTiDBCloudOrgBindingAllowsSharedCluster(t *testing.T) {
+func TestUpsertTenantTiDBCloudOrgBindingRejectsDuplicateLiveClusterBranch(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
+	insertTiDBCloudBindingTenant(t, s, "binding-live-tenant", TenantKindLive, TenantActive, "cluster-shared", "", now)
+	insertTiDBCloudBindingTenant(t, s, "binding-other-tenant", TenantKindLive, TenantActive, "cluster-shared", "", now)
+	if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+		TenantID:       "binding-live-tenant",
+		OrganizationID: "org-1",
+		ClusterID:      "cluster-shared",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("upsert first binding: %v", err)
+	}
+	err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+		TenantID:       "binding-other-tenant",
+		OrganizationID: "org-1",
+		ClusterID:      "cluster-shared",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	if !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("duplicate cluster branch upsert err = %v, want ErrDuplicate", err)
+	}
+}
+
+func TestUpsertTenantTiDBCloudOrgBindingAllowsSharedClusterAcrossBranches(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	insertTiDBCloudBindingTenant(t, s, "binding-live-tenant", TenantKindLive, TenantActive, "cluster-shared", "", now)
+	insertTiDBCloudBindingTenant(t, s, "binding-fork-tenant", TenantKindFork, TenantActive, "cluster-shared", "branch-1", now)
 	for _, tenantID := range []string{"binding-live-tenant", "binding-fork-tenant"} {
 		if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
 			TenantID:       tenantID,
@@ -1224,14 +1266,84 @@ func TestUpsertTenantTiDBCloudOrgBindingAllowsSharedCluster(t *testing.T) {
 			t.Fatalf("upsert binding for %s: %v", tenantID, err)
 		}
 	}
-	for _, tenantID := range []string{"binding-live-tenant", "binding-fork-tenant"} {
-		binding, err := s.GetTenantTiDBCloudOrgBinding(ctx, tenantID)
-		if err != nil {
-			t.Fatalf("get binding for %s: %v", tenantID, err)
-		}
-		if binding.ClusterID != "cluster-shared" || binding.OrganizationID != "org-1" {
-			t.Fatalf("binding for %s = %#v", tenantID, binding)
-		}
+	forkBinding, err := s.GetTenantTiDBCloudOrgBinding(ctx, "binding-fork-tenant")
+	if err != nil {
+		t.Fatalf("get fork binding: %v", err)
+	}
+	if forkBinding.BranchID != "branch-1" {
+		t.Fatalf("fork binding branch id = %q, want branch-1", forkBinding.BranchID)
+	}
+}
+
+func TestUpsertTenantTiDBCloudOrgBindingIgnoresDeletedClusterBranch(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	insertTiDBCloudBindingTenant(t, s, "binding-deleted-tenant", TenantKindLive, TenantDeleted, "cluster-reused", "", now)
+	insertTiDBCloudBindingTenant(t, s, "binding-new-tenant", TenantKindLive, TenantActive, "cluster-reused", "", now)
+	if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+		TenantID:       "binding-deleted-tenant",
+		OrganizationID: "org-1",
+		ClusterID:      "cluster-reused",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("upsert deleted binding: %v", err)
+	}
+	if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+		TenantID:       "binding-new-tenant",
+		OrganizationID: "org-1",
+		ClusterID:      "cluster-reused",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("upsert new binding after deleted tenant: %v", err)
+	}
+}
+
+func TestBackfillTiDBCloudOrgBindingBranchIDsTrimsTenantBranchID(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	insertTiDBCloudBindingTenant(t, s, "binding-spaced-branch-tenant", TenantKindFork, TenantActive, "cluster-spaced", " branch-1 ", now)
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO tenant_tidbcloud_org_bindings
+		(tenant_id, organization_id, cluster_id, branch_id, pool_id, pool_status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"binding-spaced-branch-tenant", "org-1", "cluster-spaced", "", "", TenantPoolBindingUsed, now, now); err != nil {
+		t.Fatalf("insert raw binding: %v", err)
+	}
+	if err := backfillTiDBCloudOrgBindingBranchIDs(ctx, s.DB()); err != nil {
+		t.Fatalf("backfill branch ids: %v", err)
+	}
+	binding, err := s.GetTenantTiDBCloudOrgBinding(ctx, "binding-spaced-branch-tenant")
+	if err != nil {
+		t.Fatalf("get binding: %v", err)
+	}
+	if binding.BranchID != "branch-1" {
+		t.Fatalf("binding branch id = %q, want branch-1", binding.BranchID)
+	}
+}
+
+func insertTiDBCloudBindingTenant(t *testing.T, s *Store, tenantID string, kind TenantKind, status TenantStatus, clusterID, branchID string, now time.Time) {
+	t.Helper()
+	if err := s.InsertTenant(context.Background(), &Tenant{
+		ID:               tenantID,
+		Status:           status,
+		Kind:             kind,
+		DBHost:           "db.example.com",
+		DBPort:           4000,
+		DBUser:           "u.root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tidbcloud_fs",
+		DBTLS:            true,
+		Provider:         "tidb_cloud_native",
+		ClusterID:        clusterID,
+		BranchID:         branchID,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatalf("insert tenant %s: %v", tenantID, err)
 	}
 }
 
