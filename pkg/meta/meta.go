@@ -42,6 +42,7 @@ const (
 )
 
 const tidbCloudNativeProvider = "tidb_cloud_native"
+const maxTiDBCloudOrgBindingDuplicateTuples = 20
 
 type TenantKind string
 
@@ -350,6 +351,12 @@ func (s *Store) migrate() (err error) {
 	if err := backfillTiDBCloudOrgBindingBranchIDs(ctx, s.db); err != nil {
 		return err
 	}
+	if err := deleteStaleTiDBCloudOrgBindings(ctx, s.db); err != nil {
+		return err
+	}
+	if err := ensureTiDBCloudOrgBindingUniqueIndex(ctx, s.db); err != nil {
+		return err
+	}
 	diffs, err = diffMetaSchema(ctx, s.db, spec)
 	if err != nil {
 		return fmt.Errorf("re-diff meta schema: %w", err)
@@ -599,6 +606,7 @@ func metaInitSchemaStatements() []string {
 				used_at         DATETIME(3) NULL,
 				created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 				updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+				UNIQUE INDEX uk_tidbcloud_org_cluster_branch (organization_id, cluster_id, branch_id),
 				INDEX idx_tidbcloud_org_cluster (organization_id, cluster_id, branch_id, created_at, tenant_id),
 				INDEX idx_tidbcloud_org_created (organization_id, created_at, tenant_id),
 				INDEX idx_tidbcloud_pool_free (organization_id, pool_status, created_at, tenant_id)
@@ -1105,6 +1113,93 @@ func backfillTiDBCloudOrgBindingBranchIDs(ctx context.Context, db *sql.DB) error
 	return nil
 }
 
+func deleteStaleTiDBCloudOrgBindings(ctx context.Context, db metaQueryExecer) error {
+	_, err := db.ExecContext(ctx, `DELETE b
+		FROM tenant_tidbcloud_org_bindings b
+		LEFT JOIN tenants t ON t.id = b.tenant_id
+		WHERE t.id IS NULL OR t.status = ?`, TenantDeleted)
+	if err != nil {
+		return fmt.Errorf("delete stale tidbcloud org bindings: %w", err)
+	}
+	return nil
+}
+
+func ensureTiDBCloudOrgBindingUniqueIndex(ctx context.Context, db *sql.DB) error {
+	exists, err := metaIndexExists(ctx, db, "tenant_tidbcloud_org_bindings", "uk_tidbcloud_org_cluster_branch")
+	if err != nil {
+		return fmt.Errorf("check tidbcloud org binding unique index: %w", err)
+	}
+	if exists {
+		return nil
+	}
+	if err := ensureNoDuplicateTiDBCloudOrgBindingTuples(ctx, db); err != nil {
+		return fmt.Errorf("preflight tidbcloud org binding unique index: %w", err)
+	}
+	_, err = db.ExecContext(ctx, `CREATE UNIQUE INDEX uk_tidbcloud_org_cluster_branch
+		ON tenant_tidbcloud_org_bindings(organization_id, cluster_id, branch_id)`)
+	if err != nil {
+		if isIgnorableMetaSchemaError(err) {
+			return nil
+		}
+		return fmt.Errorf("create tidbcloud org binding unique index: %w", err)
+	}
+	return nil
+}
+
+func metaIndexExists(ctx context.Context, db *sql.DB, tableName, indexName string) (bool, error) {
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM information_schema.statistics
+		WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?`,
+		tableName, indexName).Scan(&count); err != nil {
+		return false, fmt.Errorf("check meta index %s.%s exists: %w", tableName, indexName, err)
+	}
+	return count > 0, nil
+}
+
+func ensureNoDuplicateTiDBCloudOrgBindingTuples(ctx context.Context, db *sql.DB) error {
+	var total int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM (
+		SELECT organization_id, cluster_id, branch_id
+		FROM tenant_tidbcloud_org_bindings
+		GROUP BY organization_id, cluster_id, branch_id
+		HAVING COUNT(*) > 1
+	) duplicates`).Scan(&total); err != nil {
+		return fmt.Errorf("count duplicate tidbcloud org binding tuples: %w", err)
+	}
+	if total == 0 {
+		return nil
+	}
+
+	rows, err := db.QueryContext(ctx, `SELECT organization_id, cluster_id, branch_id, COUNT(*) AS n, GROUP_CONCAT(tenant_id ORDER BY tenant_id)
+		FROM tenant_tidbcloud_org_bindings
+		GROUP BY organization_id, cluster_id, branch_id
+		HAVING COUNT(*) > 1
+		ORDER BY n DESC, organization_id, cluster_id, branch_id
+		LIMIT ?`, maxTiDBCloudOrgBindingDuplicateTuples)
+	if err != nil {
+		return fmt.Errorf("list duplicate tidbcloud org binding tuples: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	conflicts := make([]string, 0, min(total, maxTiDBCloudOrgBindingDuplicateTuples))
+	for rows.Next() {
+		var organizationID, clusterID, branchID, tenantIDs string
+		var count int
+		if err := rows.Scan(&organizationID, &clusterID, &branchID, &count, &tenantIDs); err != nil {
+			return fmt.Errorf("scan duplicate tidbcloud org binding tuple: %w", err)
+		}
+		conflicts = append(conflicts, fmt.Sprintf("organization_id=%q cluster_id=%q branch_id=%q count=%d tenant_ids=%s", organizationID, clusterID, branchID, count, tenantIDs))
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate duplicate tidbcloud org binding tuples: %w", err)
+	}
+	if total > len(conflicts) {
+		conflicts = append(conflicts, fmt.Sprintf("... %d more duplicate tuple(s) omitted", total-len(conflicts)))
+	}
+	return fmt.Errorf("cannot create tidbcloud org binding unique index: found %d duplicate tuple(s): %s", total, strings.Join(conflicts, "; "))
+}
+
 func parseMetaCreateTableStatement(stmt string) (tableName string, definitions string, ok bool, err error) {
 	return schemaspec.ParseCreateTableStatement(stmt)
 }
@@ -1533,6 +1628,9 @@ func (s *Store) UpsertTenantTiDBCloudOrgBinding(ctx context.Context, b *TenantTi
 		updatedAt = now
 	}
 	return s.withTiDBCloudOrgBindingLock(ctx, organizationID, clusterID, branchID, func(ctx context.Context, conn metaQueryExecer) error {
+		if err := deleteStaleTiDBCloudOrgBindingConflicts(ctx, conn, tenantID, organizationID, clusterID, branchID); err != nil {
+			return err
+		}
 		if err := ensureTiDBCloudOrgBindingAvailable(ctx, conn, tenantID, organizationID, clusterID, branchID); err != nil {
 			return err
 		}
@@ -1551,6 +1649,19 @@ func (s *Store) UpsertTenantTiDBCloudOrgBinding(ctx context.Context, b *TenantTi
 			createdAt.UTC(), updatedAt.UTC())
 		return execErr
 	})
+}
+
+func deleteStaleTiDBCloudOrgBindingConflicts(ctx context.Context, q metaQueryExecer, tenantID, organizationID, clusterID, branchID string) error {
+	_, err := q.ExecContext(ctx, `DELETE b
+		FROM tenant_tidbcloud_org_bindings b
+		LEFT JOIN tenants t ON t.id = b.tenant_id
+		WHERE b.organization_id = ? AND b.cluster_id = ? AND b.branch_id = ?
+			AND b.tenant_id <> ? AND (t.id IS NULL OR t.status = ?)`,
+		organizationID, clusterID, branchID, tenantID, TenantDeleted)
+	if err != nil {
+		return fmt.Errorf("delete stale tidbcloud org binding conflicts: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) lookupTenantBranchID(ctx context.Context, tenantID string) (string, bool, error) {

@@ -1236,7 +1236,7 @@ func TestMetaSchemaSpecIncludesTiDBCloudOrgBindings(t *testing.T) {
 			t.Fatalf("tenant_tidbcloud_org_bindings schema missing %s", column)
 		}
 	}
-	for _, index := range []string{"primary", "idx_tidbcloud_org_cluster", "idx_tidbcloud_org_created"} {
+	for _, index := range []string{"primary", "uk_tidbcloud_org_cluster_branch", "idx_tidbcloud_org_cluster", "idx_tidbcloud_org_created"} {
 		if _, ok := table.indexes[index]; !ok {
 			t.Fatalf("tenant_tidbcloud_org_bindings schema missing index %s", index)
 		}
@@ -1319,6 +1319,53 @@ func TestUpsertTenantTiDBCloudOrgBindingIgnoresDeletedClusterBranch(t *testing.T
 		UpdatedAt:      now,
 	}); err != nil {
 		t.Fatalf("upsert new binding after deleted tenant: %v", err)
+	}
+}
+
+func TestEnsureNoDuplicateTiDBCloudOrgBindingTuplesReportsConflict(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	tenantIDs := []string{"binding-dup-1", "binding-dup-2", "binding-dup-3", "binding-dup-4"}
+	if _, err := s.DB().ExecContext(ctx, `DROP INDEX uk_tidbcloud_org_cluster_branch ON tenant_tidbcloud_org_bindings`); err != nil {
+		t.Fatalf("drop unique index: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.DB().ExecContext(context.Background(), `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id IN (?, ?, ?, ?)`, tenantIDs[0], tenantIDs[1], tenantIDs[2], tenantIDs[3])
+		_, _ = s.DB().ExecContext(context.Background(), `DELETE FROM tenants WHERE id IN (?, ?, ?, ?)`, tenantIDs[0], tenantIDs[1], tenantIDs[2], tenantIDs[3])
+		if err := ensureTiDBCloudOrgBindingUniqueIndex(context.Background(), s.DB()); err != nil {
+			t.Fatalf("restore unique index: %v", err)
+		}
+	})
+	insertTiDBCloudBindingTenant(t, s, "binding-dup-1", TenantKindLive, TenantActive, "cluster-dup-a", "", now)
+	insertTiDBCloudBindingTenant(t, s, "binding-dup-2", TenantKindLive, TenantActive, "cluster-dup-a", "", now)
+	insertTiDBCloudBindingTenant(t, s, "binding-dup-3", TenantKindLive, TenantActive, "cluster-dup-b", "branch-dup", now)
+	insertTiDBCloudBindingTenant(t, s, "binding-dup-4", TenantKindLive, TenantActive, "cluster-dup-b", "branch-dup", now)
+	for _, binding := range []struct {
+		tenantID  string
+		clusterID string
+		branchID  string
+	}{
+		{tenantID: "binding-dup-1", clusterID: "cluster-dup-a"},
+		{tenantID: "binding-dup-2", clusterID: "cluster-dup-a"},
+		{tenantID: "binding-dup-3", clusterID: "cluster-dup-b", branchID: "branch-dup"},
+		{tenantID: "binding-dup-4", clusterID: "cluster-dup-b", branchID: "branch-dup"},
+	} {
+		if _, err := s.DB().ExecContext(ctx, `INSERT INTO tenant_tidbcloud_org_bindings
+			(tenant_id, organization_id, cluster_id, branch_id, pool_id, pool_status, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			binding.tenantID, "org-1", binding.clusterID, binding.branchID, "", TenantPoolBindingUsed, now, now); err != nil {
+			t.Fatalf("insert duplicate binding %s: %v", binding.tenantID, err)
+		}
+	}
+	err := ensureNoDuplicateTiDBCloudOrgBindingTuples(ctx, s.DB())
+	if err == nil {
+		t.Fatal("ensureNoDuplicateTiDBCloudOrgBindingTuples error = nil, want duplicate error")
+	}
+	for _, want := range []string{"found 2 duplicate tuple(s)", "org-1", "cluster-dup-a", "cluster-dup-b", "branch-dup", "binding-dup-1", "binding-dup-2", "binding-dup-3", "binding-dup-4"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("duplicate error %q does not contain %q", err, want)
+		}
 	}
 }
 
