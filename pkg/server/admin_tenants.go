@@ -15,6 +15,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
@@ -178,6 +179,7 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 	} else if claimed {
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
 		setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
+		s.forgetTiDBCloudRBACList(cred)
 		if res.Status == meta.TenantProvisioning {
 			s.startProvisionedTenantSchemaInit(r.Context(), res)
 		}
@@ -211,6 +213,7 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
+	s.forgetTiDBCloudRBACList(cred)
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -229,7 +232,8 @@ func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	clusters, err := s.listAllManagedClusters(r.Context(), cred, "")
+	listStarted := time.Now().UTC()
+	clusters, clustersFromCache, err := s.listAllManagedClusters(r.Context(), cred, "", "admin_tenant_list")
 	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "list tenants")
 		return
@@ -261,15 +265,32 @@ func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {
 		nextPage = page + 1
 	}
 	clusterMap := cloudClusterMap(clusters)
+	if includeQuota {
+		if err := s.syncAdminTenantSpendingLimits(r.Context(), rows, clusterMap, listStarted); err != nil {
+			logger.Warn(r.Context(), "admin_tenant_spending_limit_sync_failed", zap.Error(err))
+			errJSON(w, http.StatusInternalServerError, "quota lookup failed")
+			return
+		}
+		if clustersFromCache && s.adminTenantRowsNeedSpendingLimitBackfill(r.Context(), "admin_tenant_list", rows) {
+			listStarted = time.Now().UTC()
+			clusters, _, err = s.listAllManagedClustersFresh(r.Context(), cred, "", "admin_tenant_list")
+			if err != nil {
+				writeAdminTiDBCloudError(w, r.Context(), err, "list tenants")
+				return
+			}
+			clusterMap = cloudClusterMap(clusters)
+			if err := s.syncAdminTenantSpendingLimits(r.Context(), rows, clusterMap, listStarted); err != nil {
+				logger.Warn(r.Context(), "admin_tenant_spending_limit_sync_failed", zap.Error(err))
+				errJSON(w, http.StatusInternalServerError, "quota lookup failed")
+				return
+			}
+		}
+	}
 	out := make([]adminTenantResponse, 0, len(rows))
 	for _, row := range rows {
 		var quota *adminTenantQuotaSummary
 		if includeQuota {
-			cloudCfg := &tenant.QuotaCloudConfig{}
-			if cloud, ok := clusterMap[row.Binding.ClusterID]; ok {
-				cloudCfg.TiDBCloudSpendingLimitMonthly = cloud.TiDBCloudSpendingLimitMonthly
-			}
-			quota = s.adminTenantQuotaSummary(r.Context(), &row.Tenant, cloudCfg)
+			quota = s.adminTenantQuotaSummary(r.Context(), &row.Tenant)
 		}
 		out = append(out, s.adminTenantResponse(&row.Tenant, &row.Binding, quota))
 	}
@@ -282,11 +303,11 @@ func (s *Server) handleAdminTenantGet(w http.ResponseWriter, r *http.Request, te
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	t, binding, cloudCfg, ok := s.authorizedAdminTenant(w, r, tenantID, cred, true, false)
+	t, binding, ok := s.authorizedAdminTenant(w, r, tenantID, cred, true, false)
 	if !ok {
 		return
 	}
-	quota, err := s.loadAdminTenantQuotaSummary(r.Context(), t, cloudCfg)
+	quota, err := s.loadAdminTenantQuotaSummary(r.Context(), t)
 	if err != nil {
 		logger.Warn(r.Context(), "admin_tenant_quota_lookup_failed", zap.String("tenant_id", t.ID), zap.Error(err))
 		errJSON(w, http.StatusInternalServerError, "quota lookup failed")
@@ -314,7 +335,7 @@ func (s *Server) handleAdminTenantQuotaSet(w http.ResponseWriter, r *http.Reques
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	t, _, _, ok := s.authorizedAdminTenant(w, r, tenantID, cred, false, false)
+	t, _, ok := s.authorizedAdminTenant(w, r, tenantID, cred, false, false)
 	if !ok {
 		return
 	}
@@ -322,12 +343,11 @@ func (s *Server) handleAdminTenantQuotaSet(w http.ResponseWriter, r *http.Reques
 		errJSON(w, http.StatusConflict, err.Error())
 		return
 	}
-	cloudCfg, err := s.applyQuotaSet(r.Context(), t, cred, quotaReq)
-	if err != nil {
+	if err := s.applyQuotaSet(r.Context(), "admin_tenant_quota_set", t, cred, quotaReq); err != nil {
 		writeQuotaSetError(w, r.Context(), err, "update")
 		return
 	}
-	s.writeAdminQuotaResponse(w, r, t, cloudCfg)
+	s.writeAdminQuotaResponse(w, r, t)
 }
 
 func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request, tenantID string) {
@@ -344,7 +364,7 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	t, _, _, ok := s.authorizedAdminTenant(w, r, tenantID, cred, false, true)
+	t, _, ok := s.authorizedAdminTenant(w, r, tenantID, cred, false, true)
 	if !ok {
 		return
 	}
@@ -421,83 +441,140 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
+	s.forgetTiDBCloudRBACList(cred)
 	writeJSON(w, http.StatusAccepted, adminTenantDeleteResponse{TenantID: t.ID, Status: string(status)})
 }
 
-func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, tenantID string, cred tenant.CredentialProvisionRequest, loadQuota bool, allowDeletingMissingCluster bool) (*meta.Tenant, *meta.TenantTiDBCloudOrgBinding, *tenant.QuotaCloudConfig, bool) {
+func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, tenantID string, cred tenant.CredentialProvisionRequest, loadQuota bool, allowDeletingMissingCluster bool) (*meta.Tenant, *meta.TenantTiDBCloudOrgBinding, bool) {
 	t, err := s.meta.GetTenant(r.Context(), tenantID)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "tenant not found")
-			return nil, nil, nil, false
+			return nil, nil, false
 		}
 		errJSON(w, http.StatusInternalServerError, "tenant lookup failed")
-		return nil, nil, nil, false
+		return nil, nil, false
 	}
 	if t.Provider != tenant.ProviderTiDBCloudNative {
 		errJSON(w, http.StatusConflict, "admin tenant API is only supported for tidb_cloud_native tenants")
-		return nil, nil, nil, false
+		return nil, nil, false
 	}
 	if t.Status == meta.TenantDeleted {
 		errJSON(w, http.StatusNotFound, "tenant not found")
-		return nil, nil, nil, false
+		return nil, nil, false
 	}
 	binding, err := s.meta.GetTenantTiDBCloudOrgBinding(r.Context(), tenantID)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "tenant tidbcloud organization binding not found")
-			return nil, nil, nil, false
+			return nil, nil, false
 		}
 		errJSON(w, http.StatusInternalServerError, "tenant organization binding lookup failed")
-		return nil, nil, nil, false
+		return nil, nil, false
 	}
 	if binding.PoolStatus == meta.TenantPoolBindingFree {
 		errJSON(w, http.StatusNotFound, "tenant not found")
-		return nil, nil, nil, false
+		return nil, nil, false
 	}
-	clusters, err := s.listAllManagedClusters(r.Context(), cred, binding.ClusterID)
+	allowCache := true
+	if loadQuota {
+		cfg, err := s.meta.GetQuotaConfig(r.Context(), tenantID)
+		if err != nil {
+			errJSON(w, http.StatusInternalServerError, "quota config lookup failed")
+			return nil, nil, false
+		}
+		allowCache = cfg.TiDBCloudSpendingLimit != nil
+	}
+	listStarted := time.Now().UTC()
+	clusters, _, err := s.listAllManagedClustersCached(r.Context(), cred, binding.ClusterID, allowCache, adminTenantMetricPath(loadQuota, allowDeletingMissingCluster))
 	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
-		return nil, nil, nil, false
+		return nil, nil, false
 	}
 	if len(clusters) == 0 && allowDeletingMissingCluster && t.Status == meta.TenantDeleting {
-		clusters, err = s.listAllManagedClusters(r.Context(), cred, "")
+		clusters, _, err = s.listAllManagedClusters(r.Context(), cred, "", adminTenantMetricPath(loadQuota, allowDeletingMissingCluster))
 		if err != nil {
 			writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
-			return nil, nil, nil, false
+			return nil, nil, false
 		}
 		for _, cluster := range clusters {
 			if cluster.OrganizationID == binding.OrganizationID {
-				return t, binding, nil, true
+				return t, binding, true
 			}
 		}
 	}
 	if len(clusters) == 0 {
 		errJSON(w, http.StatusForbidden, "no permission to access tenant with TiDB Cloud API key")
-		return nil, nil, nil, false
+		return nil, nil, false
 	}
-	var cloudCfg *tenant.QuotaCloudConfig
+	var authorizedCluster tenant.CloudClusterInfo
 	authorized := false
 	for _, cluster := range clusters {
 		if cluster.ClusterID == binding.ClusterID && cluster.OrganizationID == binding.OrganizationID {
 			authorized = true
-			if loadQuota {
-				cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: cluster.TiDBCloudSpendingLimitMonthly}
-			}
+			authorizedCluster = cluster
 			break
 		}
 	}
 	if !authorized {
 		errJSON(w, http.StatusForbidden, "no permission to access tenant with TiDB Cloud API key")
-		return nil, nil, nil, false
+		return nil, nil, false
 	}
-	return t, binding, cloudCfg, true
+	if loadQuota {
+		cloudCfg := &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: authorizedCluster.TiDBCloudSpendingLimitMonthly}
+		if err := s.syncTiDBCloudSpendingLimit(r.Context(), "admin_tenant_get", t.ID, cloudCfg, listStarted); err != nil {
+			logger.Warn(r.Context(), "admin_tenant_spending_limit_sync_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+			errJSON(w, http.StatusInternalServerError, "quota lookup failed")
+			return nil, nil, false
+		}
+	}
+	return t, binding, true
 }
 
-func (s *Server) listAllManagedClusters(ctx context.Context, cred tenant.CredentialProvisionRequest, clusterID string) ([]tenant.CloudClusterInfo, error) {
+func adminTenantMetricPath(loadQuota bool, allowDeletingMissingCluster bool) string {
+	switch {
+	case loadQuota:
+		return "admin_tenant_get"
+	case allowDeletingMissingCluster:
+		return "admin_tenant_delete"
+	default:
+		return "admin_tenant_quota_set"
+	}
+}
+
+func (s *Server) listAllManagedClusters(ctx context.Context, cred tenant.CredentialProvisionRequest, clusterID, metricPath string) ([]tenant.CloudClusterInfo, bool, error) {
+	return s.listAllManagedClustersCached(ctx, cred, clusterID, true, metricPath)
+}
+
+func (s *Server) listAllManagedClustersFresh(ctx context.Context, cred tenant.CredentialProvisionRequest, clusterID, metricPath string) ([]tenant.CloudClusterInfo, bool, error) {
+	return s.listAllManagedClustersCached(ctx, cred, clusterID, false, metricPath)
+}
+
+func (s *Server) listAllManagedClustersCached(ctx context.Context, cred tenant.CredentialProvisionRequest, clusterID string, allowCache bool, metricPath string) ([]tenant.CloudClusterInfo, bool, error) {
+	clusterID = strings.TrimSpace(clusterID)
+	scope := "list"
+	if clusterID != "" {
+		scope = "cluster"
+	}
+	if allowCache {
+		if clusterID != "" {
+			if cluster, ok := s.tidbCloudRBACCache.getCluster(cred, clusterID); ok {
+				if cluster.OrganizationID != "" {
+					metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "hit")
+					return []tenant.CloudClusterInfo{cluster}, true, nil
+				}
+			}
+		} else if clusters, ok := s.tidbCloudRBACCache.getClusterList(cred); ok {
+			metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "hit")
+			return clusters, true, nil
+		}
+		metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "miss")
+	} else {
+		metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "bypass")
+	}
 	lister, ok := s.provisioner.(tenant.ManagedClusterLister)
 	if !ok {
-		return nil, fmt.Errorf("managed cluster list not enabled")
+		return nil, false, fmt.Errorf("managed cluster list not enabled")
 	}
 	var out []tenant.CloudClusterInfo
 	pageToken := ""
@@ -508,15 +585,27 @@ func (s *Server) listAllManagedClusters(ctx context.Context, cred tenant.Credent
 			ClusterID: clusterID,
 		})
 		if err != nil {
-			return nil, err
+			metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "list_managed_clusters", "error")
+			return nil, false, err
 		}
+		metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "list_managed_clusters", "ok")
 		if page == nil {
-			return out, nil
+			if clusterID == "" {
+				s.tidbCloudRBACCache.rememberClusterList(cred, out)
+			}
+			return out, false, nil
 		}
 		out = append(out, page.Clusters...)
 		pageToken = strings.TrimSpace(page.NextPageToken)
 		if pageToken == "" || clusterID != "" {
-			return out, nil
+			if clusterID == "" {
+				s.tidbCloudRBACCache.rememberClusterList(cred, out)
+			} else {
+				for _, cluster := range out {
+					s.rememberTiDBCloudRBAC(cred, cluster)
+				}
+			}
+			return out, false, nil
 		}
 	}
 }
@@ -530,8 +619,8 @@ func (s *Server) adminTenantResponse(t *meta.Tenant, _ *meta.TenantTiDBCloudOrgB
 	}
 }
 
-func (s *Server) adminTenantQuotaSummary(ctx context.Context, t *meta.Tenant, cloudCfg *tenant.QuotaCloudConfig) *adminTenantQuotaSummary {
-	out, err := s.loadAdminTenantQuotaSummary(ctx, t, cloudCfg)
+func (s *Server) adminTenantQuotaSummary(ctx context.Context, t *meta.Tenant) *adminTenantQuotaSummary {
+	out, err := s.loadAdminTenantQuotaSummary(ctx, t)
 	if err != nil {
 		logger.Warn(ctx, "admin_tenant_quota_lookup_failed", zap.String("tenant_id", t.ID), zap.Error(err))
 		return nil
@@ -539,7 +628,7 @@ func (s *Server) adminTenantQuotaSummary(ctx context.Context, t *meta.Tenant, cl
 	return out
 }
 
-func (s *Server) loadAdminTenantQuotaSummary(ctx context.Context, t *meta.Tenant, cloudCfg *tenant.QuotaCloudConfig) (*adminTenantQuotaSummary, error) {
+func (s *Server) loadAdminTenantQuotaSummary(ctx context.Context, t *meta.Tenant) (*adminTenantQuotaSummary, error) {
 	cfg, err := s.meta.GetQuotaConfig(ctx, t.ID)
 	if err != nil {
 		return nil, fmt.Errorf("quota config lookup failed: %w", err)
@@ -548,16 +637,12 @@ func (s *Server) loadAdminTenantQuotaSummary(ctx context.Context, t *meta.Tenant
 	if err != nil {
 		return nil, fmt.Errorf("quota usage lookup failed: %w", err)
 	}
-	var spendingLimit *int64
-	if cloudCfg != nil {
-		spendingLimit = cloudCfg.TiDBCloudSpendingLimitMonthly
-	}
 	return &adminTenantQuotaSummary{
 		Config: quotaConfigResponse{
 			MaxStorageSize:         quotaStorageBytesToSize(cfg.MaxStorageBytes),
 			MaxFileSize:            quotaStorageBytesToSize(cfg.MaxFileSizeBytes),
 			MaxFileCount:           cfg.MaxFileCount,
-			TiDBCloudSpendingLimit: spendingLimit,
+			TiDBCloudSpendingLimit: cfg.TiDBCloudSpendingLimit,
 		},
 		Usage: quotaUsageResponse{
 			StorageBytes:  usage.StorageBytes,
@@ -567,8 +652,8 @@ func (s *Server) loadAdminTenantQuotaSummary(ctx context.Context, t *meta.Tenant
 	}, nil
 }
 
-func (s *Server) writeAdminQuotaResponse(w http.ResponseWriter, r *http.Request, t *meta.Tenant, cloudCfg *tenant.QuotaCloudConfig) {
-	quota, err := s.loadAdminTenantQuotaSummary(r.Context(), t, cloudCfg)
+func (s *Server) writeAdminQuotaResponse(w http.ResponseWriter, r *http.Request, t *meta.Tenant) {
+	quota, err := s.loadAdminTenantQuotaSummary(r.Context(), t)
 	if err != nil {
 		logger.Warn(r.Context(), "admin_tenant_quota_lookup_failed", zap.String("tenant_id", t.ID), zap.Error(err))
 		errJSON(w, http.StatusInternalServerError, "quota lookup failed")
@@ -609,6 +694,35 @@ func cloudClusterMap(clusters []tenant.CloudClusterInfo) map[string]tenant.Cloud
 		}
 	}
 	return out
+}
+
+func (s *Server) syncAdminTenantSpendingLimits(ctx context.Context, rows []meta.TenantWithTiDBCloudOrgBinding, clusters map[string]tenant.CloudClusterInfo, observedAt time.Time) error {
+	for _, row := range rows {
+		cluster, ok := clusters[row.Binding.ClusterID]
+		if !ok || cluster.OrganizationID != row.Binding.OrganizationID {
+			continue
+		}
+		if err := s.syncTiDBCloudSpendingLimit(ctx, "admin_tenant_list", row.Tenant.ID, &tenant.QuotaCloudConfig{
+			TiDBCloudSpendingLimitMonthly: cluster.TiDBCloudSpendingLimitMonthly,
+		}, observedAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) adminTenantRowsNeedSpendingLimitBackfill(ctx context.Context, metricPath string, rows []meta.TenantWithTiDBCloudOrgBinding) bool {
+	for _, row := range rows {
+		cfg, err := s.meta.GetQuotaConfig(ctx, row.Tenant.ID)
+		if err != nil {
+			return false
+		}
+		if cfg.TiDBCloudSpendingLimit == nil && cfg.TiDBCloudSpendingLimitCheckedAt == nil {
+			metrics.RecordTiDBCloudSpendingLimitMissing(metricPath)
+			return true
+		}
+	}
+	return false
 }
 
 func adminCredentialsFromHeaders(r *http.Request) (tenant.CredentialProvisionRequest, error) {

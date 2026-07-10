@@ -200,6 +200,7 @@ type Server struct {
 	tenantPoolLocks          sync.Map
 	tenantPoolCreateLocks    sync.Map
 	tenantPoolResumeJobs     sync.Map
+	tidbCloudRBACCache       *tidbCloudRBACCache
 	schemaInitErrors         sync.Map
 	leader                   *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
@@ -356,6 +357,7 @@ func NewWithConfig(cfg Config) *Server {
 		journalCursorSecret:   newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:         forkWorkerCtx,
 		forkWorkerCancel:      forkWorkerCancel,
+		tidbCloudRBACCache:    newTiDBCloudRBACCache(tidbCloudRBACCacheTTL),
 		leader:                cfg.Leader,
 		podNotifySecret:       cfg.PodNotifySecret,
 		sseNotifyRetention:    cfg.SSENotifyRetention,
@@ -4418,6 +4420,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		} else if claimed {
 			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
 			setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
+			s.forgetTiDBCloudRBACList(*credentialReq)
 			if res.Status == meta.TenantProvisioning {
 				s.startProvisionedTenantSchemaInit(r.Context(), res)
 			}
@@ -4448,6 +4451,9 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
+	if credentialReq != nil {
+		s.forgetTiDBCloudRBACList(*credentialReq)
+	}
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
 	writeProvisionTenantAccepted(w, res)
 }
@@ -5138,14 +5144,18 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		stageStarted = time.Now()
 		quotaReq := *opts.Quota
 		quotaReq.TenantID = tenantID
-		if err := s.applyQuotaLocalConfig(ctx, tenantID, quotaReq); err != nil {
+		if err := s.applyQuotaLocalConfig(ctx, "provision", tenantID, quotaReq); err != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
 			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
 			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to set tenant quota", err)
 		}
-		// The TiDB Cloud spending limit is applied in the create-cluster request and
-		// remains cloud-side; list/get quota reads it back from TiDB Cloud.
+		if err := s.syncTiDBCloudSpendingLimit(ctx, "provision", tenantID, provisionCloudCfg, time.Time{}); err != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
+			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
+			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to set tenant quota", err)
+		}
 		if provisionCloudCfg != nil && provisionCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
 			metricEvent(ctx, "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
 		}
