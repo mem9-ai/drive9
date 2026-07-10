@@ -1,6 +1,6 @@
 # drive9 quota guide
 
-Last verified: 2026-06-24.
+Last verified: 2026-07-10.
 
 This guide shows how to read and update Drive9 tenant quota from the CLI and
 HTTP API in TiDBCloud Mode.
@@ -14,7 +14,7 @@ Drive9 exposes these user-settable quota settings:
 | `max_storage_size` | Maximum confirmed plus reserved file storage size, in Mi. Stored in Drive9. |
 | `max_file_size` | Maximum single file size, in Mi. Stored in Drive9. Must not exceed the server `DRIVE9_MAX_UPLOAD_BYTES` limit. |
 | `max_file_count` | Maximum file count. Stored in Drive9. `0` means unlimited. |
-| `tidbcloud_spending_limit` | TiDB Cloud Cluster Spending Limit. The value is passed through to TiDB Cloud, read from and written to the TiDB Cloud cluster, and not stored in Drive9. See the [TiDB Cloud Spending Limit guide](https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit). |
+| `tidbcloud_spending_limit` | TiDB Cloud Cluster Spending Limit. Drive9 stores the latest known value locally after create/update or a TiDB Cloud authorization refresh. `0` is a valid explicit value; missing local data is treated as unknown until it is backfilled from TiDB Cloud. See the [TiDB Cloud Spending Limit guide](https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit). |
 
 Quota responses include these storage usage counters:
 
@@ -36,14 +36,18 @@ the same keys as the server defaults when passed explicitly.
 Only `tidb_cloud_native` tenants support quota update through this API. Other
 tenant providers use their configured defaults.
 
-Tenant list/get first lists TiDB Cloud managed clusters with the supplied TiDB
-Cloud API keys. Drive9 reads local tenant and quota config only after that read
-succeeds.
+Tenant list/get validates that the supplied TiDB Cloud API key can access the
+tenant's cluster. Drive9 caches successful API-key-to-cluster authorization in
+process to avoid calling the TiDB Cloud OpenAPI on every read. The quota
+response itself is assembled from Drive9's local tenant, quota config, and usage
+tables after authorization succeeds.
 
 Quota update first reads the TiDB Cloud cluster labels, then patches the Drive9
 quota update labels to confirm the API key has cluster write permission. If that
 label patch succeeds, Drive9 patches `tidbcloud_spending_limit` when present and
-then writes any Drive9-stored quota fields.
+then writes any Drive9-stored quota fields. If a TiDB Cloud read returns a
+spending limit that is missing or different locally, Drive9 updates the local
+copy before returning the quota response.
 
 ## CLI
 

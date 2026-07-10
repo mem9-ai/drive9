@@ -732,7 +732,7 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 		"pool_id", poolID,
 		"count", len(tenantIDs),
 		"quota_requested", quotaOpt != nil)...)
-	clusters, _, err := manager.BatchProvisionFreeClustersWithCredentialsAndQuota(ctx, tenantIDs, cred, opts)
+	clusters, batchCloudCfg, err := manager.BatchProvisionFreeClustersWithCredentialsAndQuota(ctx, tenantIDs, cred, opts)
 	if err != nil && len(clusters) == 0 {
 		logger.Error(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_batch_create_failed",
 			"provider", provider,
@@ -864,6 +864,24 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 				"organization_id", orgID,
 				"cluster_id", cluster.ClusterID,
 				"status", meta.TenantPending)
+		}
+		if quotaOpt != nil {
+			stageStarted = time.Now()
+			quotaReq := *quotaOpt
+			quotaReq.TenantID = tenantID
+			if err := s.applyQuotaLocalConfig(ctx, tenantID, quotaReq); err != nil {
+				cleanupOnError = true
+				return nil, err
+			}
+			if err := s.syncTiDBCloudSpendingLimit(ctx, tenantID, batchCloudCfg); err != nil {
+				cleanupOnError = true
+				return nil, err
+			}
+			logProvisionStage(ctx, "admin_tenant_pool_free_tenant_quota_local_config_applied", tenantID, provider, stageStarted,
+				"pool_id", poolID,
+				"organization_id", orgID,
+				"cluster_id", cluster.ClusterID,
+				"create_time_spending_limit", batchCloudCfg != nil && batchCloudCfg.TiDBCloudSpendingLimitMonthly != nil)
 		}
 		results = append(results, res)
 	}
@@ -1640,7 +1658,8 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 	}
 	cluster := clusterInfoFromTenant(&row.Tenant)
 	stageStarted = time.Now()
-	if _, err := manager.MarkClusterPoolUsed(ctx, cluster, cred, usedAt, opts); err != nil {
+	cloudCfg, err := manager.MarkClusterPoolUsed(ctx, cluster, cred, usedAt, opts)
+	if err != nil {
 		s.releaseClaimedPoolTenant(ctx, manager, cluster, cred, row.Tenant.ID, "mark_used_error")
 		return nil, nil, false, err
 	}
@@ -1658,7 +1677,10 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		if err := s.applyQuotaLocalConfig(ctx, row.Tenant.ID, quotaReq); err != nil {
 			return nil, nil, false, err
 		}
-		logProvisionStage(ctx, "admin_tenant_pool_claim_quota_local_config_applied", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID)
+		if err := s.syncTiDBCloudSpendingLimit(ctx, row.Tenant.ID, cloudCfg); err != nil {
+			return nil, nil, false, err
+		}
+		logProvisionStage(ctx, "admin_tenant_pool_claim_quota_local_config_applied", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID, "create_time_spending_limit", cloudCfg != nil && cloudCfg.TiDBCloudSpendingLimitMonthly != nil)
 	}
 	stageStarted = time.Now()
 	plainPass, err := s.pool.Decrypt(ctx, row.Tenant.DBPasswordCipher)

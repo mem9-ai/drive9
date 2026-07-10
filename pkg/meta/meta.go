@@ -631,6 +631,7 @@ func metaInitSchemaStatements() []string {
 			max_file_count        BIGINT NOT NULL DEFAULT 0,
 			max_media_llm_files   BIGINT NOT NULL DEFAULT 500,
 			max_monthly_cost_mc   BIGINT NOT NULL DEFAULT 0,
+			tidbcloud_spending_limit BIGINT NULL,
 			created_at            DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at            DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,

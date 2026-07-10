@@ -76,6 +76,53 @@ func TestGetQuotaConfigUsesConfiguredDefaultStorageBytes(t *testing.T) {
 	}
 }
 
+func TestQuotaConfigStoresTiDBCloudSpendingLimitWithoutStorageVersion(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	cfg, err := s.GetQuotaConfig(ctx, "tenant-spending-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TiDBCloudSpendingLimit != nil {
+		t.Fatalf("default spending limit = %#v, want nil", cfg.TiDBCloudSpendingLimit)
+	}
+
+	zero := int64(0)
+	if err := s.SetQuotaConfigPatch(ctx, "tenant-spending-only", QuotaConfigPatch{TiDBCloudSpendingLimit: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = s.GetQuotaConfig(ctx, "tenant-spending-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != 0 {
+		t.Fatalf("spending limit = %#v, want 0", cfg.TiDBCloudSpendingLimit)
+	}
+	if cfg.MaxStorageBytes != DefaultMaxStorageBytes() || cfg.MaxFileSizeBytes != DefaultMaxFileSizeBytes() || cfg.MaxFileCount != 0 {
+		t.Fatalf("storage quota fields = %#v, want defaults", cfg)
+	}
+	version, err := s.GetQuotaConfigVersion(ctx, "tenant-spending-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != "" {
+		t.Fatalf("storage quota version = %q, want empty", version)
+	}
+
+	updated := int64(123)
+	if err := s.SetQuotaConfigPatch(ctx, "tenant-spending-only", QuotaConfigPatch{TiDBCloudSpendingLimit: &updated}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = s.GetQuotaConfig(ctx, "tenant-spending-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != updated {
+		t.Fatalf("updated spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, updated)
+	}
+}
+
 func TestGetQuotaConfigVersion(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()

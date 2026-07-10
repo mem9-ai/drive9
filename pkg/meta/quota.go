@@ -21,8 +21,11 @@ type QuotaConfig struct {
 	MaxFileCount     int64 // 0 = unlimited
 	MaxMediaLLMFiles int64
 	MaxMonthlyCostMC int64 // millicents; 0 = disabled
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	// TiDBCloudSpendingLimit is nullable because existing tenants may not have
+	// been backfilled from TiDB Cloud yet; 0 is a valid explicit spending limit.
+	TiDBCloudSpendingLimit *int64
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }
 
 // QuotaUsage holds pre-aggregated quota counters for a tenant.
@@ -38,9 +41,17 @@ type QuotaUsage struct {
 // QuotaConfigPatch carries externally settable quota limits. Nil fields leave
 // existing values unchanged; inserted rows inherit defaults for nil fields.
 type QuotaConfigPatch struct {
-	MaxStorageBytes  *int64
-	MaxFileSizeBytes *int64
-	MaxFileCount     *int64
+	MaxStorageBytes        *int64
+	MaxFileSizeBytes       *int64
+	MaxFileCount           *int64
+	TiDBCloudSpendingLimit *int64
+}
+
+func (p QuotaConfigPatch) AnySet() bool {
+	return p.MaxStorageBytes != nil ||
+		p.MaxFileSizeBytes != nil ||
+		p.MaxFileCount != nil ||
+		p.TiDBCloudSpendingLimit != nil
 }
 
 // FileMeta tracks per-file quota-relevant metadata in the server DB.
@@ -110,12 +121,14 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 	defer observeMeta(ctx, "get_quota_config", start, &err)
 
 	cfg := &QuotaConfig{TenantID: tenantID}
+	var spendingLimit sql.NullInt64
 	err = s.db.QueryRowContext(ctx,
 		`SELECT max_storage_bytes, max_file_size_bytes, max_file_count,
-		        max_media_llm_files, max_monthly_cost_mc, created_at, updated_at
+		        max_media_llm_files, max_monthly_cost_mc, tidbcloud_spending_limit,
+		        created_at, updated_at
 		 FROM tenant_quota_config WHERE tenant_id = ?`, tenantID,
 	).Scan(&cfg.MaxStorageBytes, &cfg.MaxFileSizeBytes, &cfg.MaxFileCount,
-		&cfg.MaxMediaLLMFiles, &cfg.MaxMonthlyCostMC, &cfg.CreatedAt, &cfg.UpdatedAt)
+		&cfg.MaxMediaLLMFiles, &cfg.MaxMonthlyCostMC, &spendingLimit, &cfg.CreatedAt, &cfg.UpdatedAt)
 	if err == sql.ErrNoRows {
 		// Return defaults when no per-tenant config exists.
 		cfg.MaxStorageBytes = DefaultMaxStorageBytes()
@@ -131,14 +144,16 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 	if cfg.MaxFileSizeBytes <= 0 {
 		cfg.MaxFileSizeBytes = DefaultMaxFileSizeBytes()
 	}
+	cfg.TiDBCloudSpendingLimit = ptrFromNullInt64(spendingLimit)
 	return cfg, nil
 }
 
 // GetQuotaConfigVersion returns a lightweight content token for a tenant's
-// explicit quota config. An empty token means no row exists and callers should
-// use GetQuotaConfig's default config. The token is derived from the effective
-// config values instead of updated_at so updates inside the same timestamp tick
-// cannot hide a real config change from cache invalidation.
+// explicit storage quota config. An empty token means no storage-relevant row
+// exists and callers should use GetQuotaConfig's default storage config. The
+// token is derived from the effective config values instead of updated_at so
+// updates inside the same timestamp tick cannot hide a real config change from
+// cache invalidation.
 func (s *Store) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
 	start := time.Now()
 	var err error
@@ -159,6 +174,13 @@ func (s *Store) GetQuotaConfigVersion(ctx context.Context, tenantID string) (str
 	if err != nil {
 		return "", fmt.Errorf("get quota config version for tenant %q: %w", tenantID, err)
 	}
+	if maxStorageBytes == DefaultMaxStorageBytes() &&
+		maxFileSizeBytes == 0 &&
+		maxFileCount == 0 &&
+		maxMediaLLMFiles == 500 &&
+		maxMonthlyCostMC == 0 {
+		return "", nil
+	}
 	return fmt.Sprintf("v2:%d:%d:%d:%d:%d", maxStorageBytes, maxFileSizeBytes, maxFileCount, maxMediaLLMFiles, maxMonthlyCostMC), nil
 }
 
@@ -170,16 +192,17 @@ func (s *Store) SetQuotaConfig(ctx context.Context, cfg *QuotaConfig) error {
 
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes, max_file_size_bytes, max_file_count,
-		                                  max_media_llm_files, max_monthly_cost_mc)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		                                  max_media_llm_files, max_monthly_cost_mc, tidbcloud_spending_limit)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON DUPLICATE KEY UPDATE
 		   max_storage_bytes = VALUES(max_storage_bytes),
 		   max_file_size_bytes = VALUES(max_file_size_bytes),
 		   max_file_count = VALUES(max_file_count),
 		   max_media_llm_files = VALUES(max_media_llm_files),
-		   max_monthly_cost_mc = VALUES(max_monthly_cost_mc)`,
+		   max_monthly_cost_mc = VALUES(max_monthly_cost_mc),
+		   tidbcloud_spending_limit = VALUES(tidbcloud_spending_limit)`,
 		cfg.TenantID, cfg.MaxStorageBytes, cfg.MaxFileSizeBytes, cfg.MaxFileCount,
-		cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC)
+		cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC, nullInt64FromPtr(cfg.TiDBCloudSpendingLimit))
 	return err
 }
 
@@ -222,6 +245,7 @@ func (s *Store) SetQuotaConfigPatch(ctx context.Context, tenantID string, patch 
 	if patch.MaxFileCount != nil {
 		insertFileCount = *patch.MaxFileCount
 	}
+	insertSpendingLimit := nullInt64FromPtr(patch.TiDBCloudSpendingLimit)
 	updateStorage := sql.NullInt64{}
 	if patch.MaxStorageBytes != nil {
 		updateStorage = sql.NullInt64{Int64: *patch.MaxStorageBytes, Valid: true}
@@ -234,19 +258,36 @@ func (s *Store) SetQuotaConfigPatch(ctx context.Context, tenantID string, patch 
 	if patch.MaxFileCount != nil {
 		updateFileCount = sql.NullInt64{Int64: *patch.MaxFileCount, Valid: true}
 	}
+	updateSpendingLimit := nullInt64FromPtr(patch.TiDBCloudSpendingLimit)
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes, max_file_size_bytes, max_file_count)
-		 VALUES (?, ?, ?, ?)
+		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes, max_file_size_bytes, max_file_count, tidbcloud_spending_limit)
+		 VALUES (?, ?, ?, ?, ?)
 		 ON DUPLICATE KEY UPDATE
 		   max_storage_bytes = COALESCE(?, max_storage_bytes),
 		   max_file_size_bytes = COALESCE(?, max_file_size_bytes),
-		   max_file_count = COALESCE(?, max_file_count)`,
-		tenantID, insertStorage, insertFileSize, insertFileCount,
-		updateStorage, updateFileSize, updateFileCount)
+		   max_file_count = COALESCE(?, max_file_count),
+		   tidbcloud_spending_limit = COALESCE(?, tidbcloud_spending_limit)`,
+		tenantID, insertStorage, insertFileSize, insertFileCount, insertSpendingLimit,
+		updateStorage, updateFileSize, updateFileCount, updateSpendingLimit)
 	if err != nil {
 		return fmt.Errorf("set quota config patch for tenant %q: %w", tenantID, err)
 	}
 	return nil
+}
+
+func nullInt64FromPtr(v *int64) sql.NullInt64 {
+	if v == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: *v, Valid: true}
+}
+
+func ptrFromNullInt64(v sql.NullInt64) *int64 {
+	if !v.Valid {
+		return nil
+	}
+	out := v.Int64
+	return &out
 }
 
 func (s *Store) CopyQuotaConfig(ctx context.Context, sourceTenantID, destTenantID string) error {

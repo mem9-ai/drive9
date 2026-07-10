@@ -200,6 +200,7 @@ type Server struct {
 	tenantPoolLocks          sync.Map
 	tenantPoolCreateLocks    sync.Map
 	tenantPoolResumeJobs     sync.Map
+	tidbCloudRBACCache       *tidbCloudRBACCache
 	schemaInitErrors         sync.Map
 	leader                   *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
@@ -356,6 +357,7 @@ func NewWithConfig(cfg Config) *Server {
 		journalCursorSecret:   newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:         forkWorkerCtx,
 		forkWorkerCancel:      forkWorkerCancel,
+		tidbCloudRBACCache:    newTiDBCloudRBACCache(tidbCloudRBACCacheTTL),
 		leader:                cfg.Leader,
 		podNotifySecret:       cfg.PodNotifySecret,
 		sseNotifyRetention:    cfg.SSENotifyRetention,
@@ -5144,8 +5146,12 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
 			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to set tenant quota", err)
 		}
-		// The TiDB Cloud spending limit is applied in the create-cluster request and
-		// remains cloud-side; list/get quota reads it back from TiDB Cloud.
+		if err := s.syncTiDBCloudSpendingLimit(ctx, tenantID, provisionCloudCfg); err != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
+			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
+			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to set tenant quota", err)
+		}
 		if provisionCloudCfg != nil && provisionCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
 			metricEvent(ctx, "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
 		}
