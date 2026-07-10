@@ -987,7 +987,7 @@ func tenantPoolRefillFreeRatioFromEnv() (float64, error) {
 		return server.DefaultTenantPoolRefillFreeRatio, nil
 	}
 	v, err := strconv.ParseFloat(raw, 64)
-	if err != nil || v <= 0 || v > 1 {
+	if err != nil || v <= 0 || v > 1 || v != v {
 		return 0, fmt.Errorf("invalid DRIVE9_TENANT_POOL_REFILL_FREE_RATIO=%q: must be a number in (0,1]", raw)
 	}
 	return v, nil

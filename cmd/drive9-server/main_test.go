@@ -136,7 +136,7 @@ func TestTenantPoolRefillFreeRatioFromEnv(t *testing.T) {
 		t.Fatalf("refill ratio = %f, want 0.75", got)
 	}
 
-	for _, raw := range []string{"0", "-0.1", "1.1", "bad"} {
+	for _, raw := range []string{"0", "-0.1", "1.1", "NaN", "bad"} {
 		setEnv(t, key, raw)
 		if _, err := tenantPoolRefillFreeRatioFromEnv(); err == nil {
 			t.Fatalf("tenantPoolRefillFreeRatioFromEnv(%q) error = nil, want error", raw)

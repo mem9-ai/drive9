@@ -1524,6 +1524,9 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 				metricResult = "noop"
 				return nil
 			}
+			// Trigger on active free tenants, but size refill against all free
+			// slots, including in-flight pending/provisioning tenants, so
+			// concurrent replenishment does not double-provision.
 			slotSize, err := s.meta.CountTenantPoolFreeSlots(ctx, current.OrganizationID)
 			if err != nil {
 				logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
@@ -1563,10 +1566,10 @@ func (s *Server) tenantPoolBelowRefillWatermark(freeSize, poolSize int) bool {
 }
 
 func (s *Server) effectiveTenantPoolRefillFreeRatio() float64 {
-	if s == nil || s.tenantPoolRefillFreeRatio <= 0 || s.tenantPoolRefillFreeRatio > 1 {
+	if s == nil {
 		return DefaultTenantPoolRefillFreeRatio
 	}
-	return s.tenantPoolRefillFreeRatio
+	return normalizeTenantPoolRefillFreeRatio(s.tenantPoolRefillFreeRatio)
 }
 
 func (s *Server) resumePendingTenantPoolAsync(ctx context.Context, pool *meta.TenantPool, cred tenant.CredentialProvisionRequest) {

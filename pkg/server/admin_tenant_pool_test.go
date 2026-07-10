@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -461,6 +462,13 @@ func TestAdminTenantPoolReplenishBatchesBelowFreeWatermark(t *testing.T) {
 			t.Fatalf("free size = %d, want 10 after refill", free)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestTenantPoolEffectiveRefillRatioRejectsNaN(t *testing.T) {
+	s := &Server{tenantPoolRefillFreeRatio: math.NaN()}
+	if got := s.effectiveTenantPoolRefillFreeRatio(); got != DefaultTenantPoolRefillFreeRatio {
+		t.Fatalf("effective refill ratio = %f, want %f", got, DefaultTenantPoolRefillFreeRatio)
 	}
 }
 

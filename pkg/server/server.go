@@ -65,8 +65,8 @@ type Config struct {
 	TenantPoolMaxSize int
 	// TenantPoolRefillFreeRatio controls when claim-triggered asynchronous pool
 	// refill creates replacement tenants. Refill runs only when active free
-	// tenants fall below this ratio of the configured pool size. Values <= 0 are
-	// normalized to DefaultTenantPoolRefillFreeRatio.
+	// tenants fall below this ratio of the configured pool size. Values outside
+	// (0,1] are normalized to DefaultTenantPoolRefillFreeRatio.
 	TenantPoolRefillFreeRatio float64
 	// InlineThreshold is the server-wide DB-inline vs S3 cutoff surfaced to
 	// clients via /v1/status. When 0, the value is inferred from
@@ -339,10 +339,7 @@ func NewWithConfig(cfg Config) *Server {
 	if tenantPoolMaxSize <= 0 {
 		tenantPoolMaxSize = DefaultTenantPoolMaxSize
 	}
-	tenantPoolRefillFreeRatio := cfg.TenantPoolRefillFreeRatio
-	if tenantPoolRefillFreeRatio <= 0 || tenantPoolRefillFreeRatio > 1 {
-		tenantPoolRefillFreeRatio = DefaultTenantPoolRefillFreeRatio
-	}
+	tenantPoolRefillFreeRatio := normalizeTenantPoolRefillFreeRatio(cfg.TenantPoolRefillFreeRatio)
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
 		fallback:                  cfg.Backend,
@@ -550,6 +547,13 @@ func NewWithConfig(cfg Config) *Server {
 		s.logTenantWorkerStatus(cfg, appManagedTaskTypes, fallbackTaskTypes, poolAutoTaskTypes)
 	}
 	return s
+}
+
+func normalizeTenantPoolRefillFreeRatio(ratio float64) float64 {
+	if ratio <= 0 || ratio > 1 || ratio != ratio {
+		return DefaultTenantPoolRefillFreeRatio
+	}
+	return ratio
 }
 
 // insertTenantNotify writes a best-effort unified outbox row so other pods
