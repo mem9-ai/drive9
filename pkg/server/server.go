@@ -63,6 +63,11 @@ type Config struct {
 	// <= 0 are normalized to DefaultTenantPoolMaxSize; the pool is never
 	// intentionally uncapped.
 	TenantPoolMaxSize int
+	// TenantPoolRefillFreeRatio controls when claim-triggered asynchronous pool
+	// refill creates replacement tenants. Refill runs only when active free
+	// tenants fall below this ratio of the configured pool size. Values <= 0 are
+	// normalized to DefaultTenantPoolRefillFreeRatio.
+	TenantPoolRefillFreeRatio float64
 	// InlineThreshold is the server-wide DB-inline vs S3 cutoff surfaced to
 	// clients via /v1/status. When 0, the value is inferred from
 	// cfg.Backend.InlineThreshold() (or omitted in responses if no backend).
@@ -168,41 +173,42 @@ func (s *Server) provisionerForTenantProvider(provider string) tenant.Provisione
 }
 
 type Server struct {
-	fallback                 *backend.Dat9Backend
-	meta                     *meta.Store
-	pool                     *tenant.Pool
-	provisioner              tenant.Provisioner
-	legacyStarterProvisioner tenant.Provisioner
-	tokenSecret              []byte
-	localTenantAPIKey        string
-	vaultMK                  *vault.MasterKey
-	vaultIssuerURL           string
-	publicURL                string
-	maxUploadBytes           int64
-	tenantPoolMaxSize        int
-	inlineThreshold          int64
-	metrics                  *serverMetrics
-	logger                   *zap.Logger
-	mux                      *http.ServeMux
-	events                   *eventBuses
-	tenantWorker             *tenantWorkerManager
-	shardResolver            *semanticShardResolver
-	journalCursorSecret      []byte
-	objectGCWorker           *objectGCWorker
-	slockOAuth               SlockOAuthClient
-	tidbAutoEmbedding        tenantAutoEmbeddingDefault
-	disableDBAutoEmbed       bool
-	forkWorkerCtx            context.Context
-	forkWorkerCancel         context.CancelFunc
-	forkWorkerWG             sync.WaitGroup
-	forkWorkerMu             sync.Mutex
-	forkWorkerClosed         bool
-	tenantPoolLocks          sync.Map
-	tenantPoolCreateLocks    sync.Map
-	tenantPoolResumeJobs     sync.Map
-	tidbCloudRBACCache       *tidbCloudRBACCache
-	schemaInitErrors         sync.Map
-	leader                   *leader.Manager
+	fallback                  *backend.Dat9Backend
+	meta                      *meta.Store
+	pool                      *tenant.Pool
+	provisioner               tenant.Provisioner
+	legacyStarterProvisioner  tenant.Provisioner
+	tokenSecret               []byte
+	localTenantAPIKey         string
+	vaultMK                   *vault.MasterKey
+	vaultIssuerURL            string
+	publicURL                 string
+	maxUploadBytes            int64
+	tenantPoolMaxSize         int
+	tenantPoolRefillFreeRatio float64
+	inlineThreshold           int64
+	metrics                   *serverMetrics
+	logger                    *zap.Logger
+	mux                       *http.ServeMux
+	events                    *eventBuses
+	tenantWorker              *tenantWorkerManager
+	shardResolver             *semanticShardResolver
+	journalCursorSecret       []byte
+	objectGCWorker            *objectGCWorker
+	slockOAuth                SlockOAuthClient
+	tidbAutoEmbedding         tenantAutoEmbeddingDefault
+	disableDBAutoEmbed        bool
+	forkWorkerCtx             context.Context
+	forkWorkerCancel          context.CancelFunc
+	forkWorkerWG              sync.WaitGroup
+	forkWorkerMu              sync.Mutex
+	forkWorkerClosed          bool
+	tenantPoolLocks           sync.Map
+	tenantPoolCreateLocks     sync.Map
+	tenantPoolResumeJobs      sync.Map
+	tidbCloudRBACCache        *tidbCloudRBACCache
+	schemaInitErrors          sync.Map
+	leader                    *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
 	// changes, this context is cancelled and recreated. Workers that use it
 	// (pending tenant reconciler, tenant delete cleanup, one-time resume tasks)
@@ -263,6 +269,10 @@ const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
 // DefaultTenantPoolMaxSize caps admin tenant pools unless overridden by server
 // configuration with a positive value.
 const DefaultTenantPoolMaxSize = 200
+
+// DefaultTenantPoolRefillFreeRatio delays claim-triggered pool refill until the
+// active free tenant count falls below 80% of the configured pool size.
+const DefaultTenantPoolRefillFreeRatio = 0.8
 
 // TenantStatusResponse is the JSON body of GET /v1/status. Fields are filled
 // per authenticated tenant so callers can discover their effective limits
@@ -329,25 +339,30 @@ func NewWithConfig(cfg Config) *Server {
 	if tenantPoolMaxSize <= 0 {
 		tenantPoolMaxSize = DefaultTenantPoolMaxSize
 	}
+	tenantPoolRefillFreeRatio := cfg.TenantPoolRefillFreeRatio
+	if tenantPoolRefillFreeRatio <= 0 || tenantPoolRefillFreeRatio > 1 {
+		tenantPoolRefillFreeRatio = DefaultTenantPoolRefillFreeRatio
+	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
-		fallback:                 cfg.Backend,
-		meta:                     cfg.Meta,
-		pool:                     cfg.Pool,
-		tokenSecret:              cfg.TokenSecret,
-		localTenantAPIKey:        strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:                  vaultMK,
-		vaultIssuerURL:           strings.TrimSpace(cfg.VaultIssuerURL),
-		publicURL:                strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
-		provisioner:              cfg.Provisioner,
-		legacyStarterProvisioner: cfg.LegacyStarterProvisioner,
-		maxUploadBytes:           maxUpload,
-		tenantPoolMaxSize:        tenantPoolMaxSize,
-		inlineThreshold:          inlineThreshold,
-		metrics:                  newServerMetrics(),
-		logger:                   logger,
-		events:                   newEventBuses(),
-		slockOAuth:               cfg.SlockOAuth,
+		fallback:                  cfg.Backend,
+		meta:                      cfg.Meta,
+		pool:                      cfg.Pool,
+		tokenSecret:               cfg.TokenSecret,
+		localTenantAPIKey:         strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:                   vaultMK,
+		vaultIssuerURL:            strings.TrimSpace(cfg.VaultIssuerURL),
+		publicURL:                 strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
+		provisioner:               cfg.Provisioner,
+		legacyStarterProvisioner:  cfg.LegacyStarterProvisioner,
+		maxUploadBytes:            maxUpload,
+		tenantPoolMaxSize:         tenantPoolMaxSize,
+		tenantPoolRefillFreeRatio: tenantPoolRefillFreeRatio,
+		inlineThreshold:           inlineThreshold,
+		metrics:                   newServerMetrics(),
+		logger:                    logger,
+		events:                    newEventBuses(),
+		slockOAuth:                cfg.SlockOAuth,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
 			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),

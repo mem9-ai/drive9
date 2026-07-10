@@ -1392,6 +1392,13 @@ func TestNewWithConfigUsesDefaultTenantPoolMaxSize(t *testing.T) {
 	}
 }
 
+func TestNewWithConfigUsesDefaultTenantPoolRefillFreeRatio(t *testing.T) {
+	s := NewWithConfig(Config{})
+	if s.tenantPoolRefillFreeRatio != DefaultTenantPoolRefillFreeRatio {
+		t.Fatalf("default tenantPoolRefillFreeRatio = %f, want %f", s.tenantPoolRefillFreeRatio, DefaultTenantPoolRefillFreeRatio)
+	}
+}
+
 func TestDeclaredContentLengthOverMaxRejected(t *testing.T) {
 	base, _ := newTestServerWithS3(t)
 	s := NewWithConfig(Config{Backend: base.fallback, MaxUploadBytes: 10})

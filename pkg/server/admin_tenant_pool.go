@@ -1508,6 +1508,22 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 				return nil
 			}
 			defer s.refreshTenantPoolCapacity(ctx, current)
+			freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
+			if err != nil {
+				logger.Warn(ctx, "admin_tenant_pool_replenish_free_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+				metricResult = "error"
+				return nil
+			}
+			if !s.tenantPoolBelowRefillWatermark(freeSize, current.Size) {
+				logger.Info(ctx, "admin_tenant_pool_replenish_skipped",
+					zap.String("pool_id", current.PoolID),
+					zap.String("organization_id", current.OrganizationID),
+					zap.Int("pool_size", current.Size),
+					zap.Int("free_size", freeSize),
+					zap.Float64("refill_free_ratio", s.effectiveTenantPoolRefillFreeRatio()))
+				metricResult = "noop"
+				return nil
+			}
 			slotSize, err := s.meta.CountTenantPoolFreeSlots(ctx, current.OrganizationID)
 			if err != nil {
 				logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
@@ -1534,6 +1550,23 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 			metricResult = adminTenantPoolMetricResult(err)
 		}
 	})
+}
+
+func (s *Server) tenantPoolBelowRefillWatermark(freeSize, poolSize int) bool {
+	if poolSize <= 0 {
+		return false
+	}
+	if freeSize < 0 {
+		freeSize = 0
+	}
+	return float64(freeSize)/float64(poolSize) < s.effectiveTenantPoolRefillFreeRatio()
+}
+
+func (s *Server) effectiveTenantPoolRefillFreeRatio() float64 {
+	if s == nil || s.tenantPoolRefillFreeRatio <= 0 || s.tenantPoolRefillFreeRatio > 1 {
+		return DefaultTenantPoolRefillFreeRatio
+	}
+	return s.tenantPoolRefillFreeRatio
 }
 
 func (s *Server) resumePendingTenantPoolAsync(ctx context.Context, pool *meta.TenantPool, cred tenant.CredentialProvisionRequest) {

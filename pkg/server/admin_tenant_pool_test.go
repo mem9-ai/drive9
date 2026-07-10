@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -382,6 +383,87 @@ func TestTenantPoolMetadataResumePersistContextPreservesServerCancellation(t *te
 	}
 }
 
+func TestAdminTenantPoolReplenishSkipsAtFreeWatermark(t *testing.T) {
+	rt, _ := newAdminTenantPoolRuntime(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	pool := &meta.TenantPool{
+		PoolID:         "pool-watermark-skip",
+		OrganizationID: "org-1",
+		Size:           10,
+		Status:         meta.TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := rt.meta.CreateTenantPool(ctx, pool); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	for i := 1; i <= 8; i++ {
+		insertAdminPoolFreeTenant(t, rt, pool.PoolID, pool.OrganizationID, i)
+	}
+
+	rt.server.replenishTenantPoolAsync(ctx, pool, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	rt.server.forkWorkerWG.Wait()
+
+	if got := rt.prov.batchPoolCalls.Load(); got != 0 {
+		t.Fatalf("batch pool calls = %d, want 0", got)
+	}
+	free, err := rt.meta.CountFreeTenantPoolBindings(ctx, pool.OrganizationID)
+	if err != nil {
+		t.Fatalf("count free: %v", err)
+	}
+	if free != 8 {
+		t.Fatalf("free size = %d, want 8", free)
+	}
+}
+
+func TestAdminTenantPoolReplenishBatchesBelowFreeWatermark(t *testing.T) {
+	rt, _ := newAdminTenantPoolRuntime(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	pool := &meta.TenantPool{
+		PoolID:         "pool-watermark-refill",
+		OrganizationID: "org-1",
+		Size:           10,
+		Status:         meta.TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := rt.meta.CreateTenantPool(ctx, pool); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	for i := 1; i <= 7; i++ {
+		insertAdminPoolFreeTenant(t, rt, pool.PoolID, pool.OrganizationID, i)
+	}
+
+	rt.server.replenishTenantPoolAsync(ctx, pool, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	rt.server.forkWorkerWG.Wait()
+
+	if got := rt.prov.batchPoolCalls.Load(); got != 1 {
+		t.Fatalf("batch pool calls = %d, want 1", got)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		free, err := rt.meta.CountFreeTenantPoolBindings(ctx, pool.OrganizationID)
+		if err != nil {
+			t.Fatalf("count free: %v", err)
+		}
+		if free == 10 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("free size = %d, want 10 after refill", free)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 type adminTenantPoolSchemaInitRecorder struct {
 	*quotaTestProvisioner
 
@@ -396,6 +478,47 @@ func newAdminTenantPoolRuntime(t *testing.T) (*quotaRuntime, *adminTenantPoolSch
 	recorder := &adminTenantPoolSchemaInitRecorder{quotaTestProvisioner: rt.prov}
 	rt.server.provisioner = recorder
 	return rt, recorder
+}
+
+func insertAdminPoolFreeTenant(t *testing.T, rt *quotaRuntime, poolID, organizationID string, index int) string {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC().Add(time.Duration(index) * time.Second)
+	tenantID := fmt.Sprintf("%s-free-%d", poolID, index)
+	clusterID := fmt.Sprintf("%s-cluster-%d", poolID, index)
+	passCipher, err := rt.server.pool.Encrypt(ctx, []byte("pool-pass"))
+	if err != nil {
+		t.Fatalf("encrypt password: %v", err)
+	}
+	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantActive,
+		DBHost:           "db.example.com",
+		DBPort:           4000,
+		DBUser:           "u.root",
+		DBPasswordCipher: passCipher,
+		DBName:           "tidbcloud_fs",
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		ClusterID:        clusterID,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatalf("insert tenant %s: %v", tenantID, err)
+	}
+	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+		TenantID:       tenantID,
+		OrganizationID: organizationID,
+		ClusterID:      clusterID,
+		PoolID:         poolID,
+		PoolStatus:     meta.TenantPoolBindingFree,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("upsert binding %s: %v", tenantID, err)
+	}
+	return tenantID
 }
 
 type deadlineMetadataResumeProvisioner struct {

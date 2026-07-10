@@ -113,6 +113,37 @@ func TestTenantPoolMaxSizeFromEnv(t *testing.T) {
 	}
 }
 
+func TestTenantPoolRefillFreeRatioFromEnv(t *testing.T) {
+	const key = "DRIVE9_TENANT_POOL_REFILL_FREE_RATIO"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	unsetEnv(t, []string{key})
+	got, err := tenantPoolRefillFreeRatioFromEnv()
+	if err != nil {
+		t.Fatalf("tenantPoolRefillFreeRatioFromEnv empty: %v", err)
+	}
+	if got != server.DefaultTenantPoolRefillFreeRatio {
+		t.Fatalf("empty refill ratio = %f, want %f", got, server.DefaultTenantPoolRefillFreeRatio)
+	}
+
+	setEnv(t, key, "0.75")
+	got, err = tenantPoolRefillFreeRatioFromEnv()
+	if err != nil {
+		t.Fatalf("tenantPoolRefillFreeRatioFromEnv valid: %v", err)
+	}
+	if got != 0.75 {
+		t.Fatalf("refill ratio = %f, want 0.75", got)
+	}
+
+	for _, raw := range []string{"0", "-0.1", "1.1", "bad"} {
+		setEnv(t, key, raw)
+		if _, err := tenantPoolRefillFreeRatioFromEnv(); err == nil {
+			t.Fatalf("tenantPoolRefillFreeRatioFromEnv(%q) error = nil, want error", raw)
+		}
+	}
+}
+
 func TestDBHealthProbeOptionsFromEnvDefaults(t *testing.T) {
 	keys := []string{
 		"DRIVE9_DB_HEALTH_PROBE_META_ENABLED",
