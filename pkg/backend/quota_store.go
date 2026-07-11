@@ -64,6 +64,7 @@ type MetaQuotaStore interface {
 	ObservePendingMutations(ctx context.Context) ([]MutationBacklogView, error)
 	HasPendingFileMutation(ctx context.Context, tenantID, fileID string) (bool, error)
 	MarkMutationAppliedTx(tx *sql.Tx, id int64) error
+	IsMutationAlreadyAppliedError(err error) bool
 	IncrMutationRetry(ctx context.Context, id int64, maxRetries int) error
 
 	// Transaction support
