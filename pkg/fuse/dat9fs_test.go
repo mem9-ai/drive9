@@ -16415,13 +16415,13 @@ func TestFlushHandle_Path2_DebounceCancelledBeforeUnlock(t *testing.T) {
 //
 // Interleaving under test:
 //
-//	1. Hold fh.Lock() → schedule debounce (short delay) → keep lock held
-//	2. Timer fires → callback blocks on handle.Lock() (we hold it)
-//	3. Call flushHandle (Path 2) while holding lock — Path 2 internally
-//	   releases fh.mu, uploads, records committed revision, releases
-//	   remoteCommitLock, reacquires fh.mu, returns
-//	4. fh.Unlock() → callback acquires handle.Lock() → acquires
-//	   remoteCommitLock → re-checks expectedRevision → skip (no double PUT)
+//  1. Hold fh.Lock() → schedule debounce (short delay) → keep lock held
+//  2. Timer fires → callback blocks on handle.Lock() (we hold it)
+//  3. Call flushHandle (Path 2) while holding lock — Path 2 internally
+//     releases fh.mu, uploads, records committed revision, releases
+//     remoteCommitLock, reacquires fh.mu, returns
+//  4. fh.Unlock() → callback acquires handle.Lock() → acquires
+//     remoteCommitLock → re-checks expectedRevision → skip (no double PUT)
 func TestFlushHandle_Path2_DebounceAlreadyFiredSkipsUpload(t *testing.T) {
 	var uploadCount atomic.Int32
 

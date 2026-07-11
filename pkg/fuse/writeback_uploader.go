@@ -44,9 +44,9 @@ type WriteBackSuccessFunc func(meta WriteBackMeta, committedRev int64, gens Stag
 // cleanup so a stale upload does not remove a fresher same-path staging entry
 // that was created by a concurrent write while the upload was in flight.
 type StagingGens struct {
-	WriteBackGen     uint64
-	PendingIndexGen  uint64
-	ShadowGen        uint64
+	WriteBackGen    uint64
+	PendingIndexGen uint64
+	ShadowGen       uint64
 }
 
 // SnapshotStagingGensFunc snapshots the pendingIndex and shadowStore generations

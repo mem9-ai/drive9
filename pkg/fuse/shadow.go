@@ -77,8 +77,8 @@ type ShadowStore struct {
 	// lets post-upload cleanup verify the shadow has not been overwritten by a
 	// concurrent same-path write since the upload started, so a stale upload
 	// does not remove a fresher shadow.
-	nextWriteGen atomic.Uint64            // monotonic content generation counter
-	writeGen     map[string]uint64        // path → content generation
+	nextWriteGen atomic.Uint64     // monotonic content generation counter
+	writeGen     map[string]uint64 // path → content generation
 
 	// Write-back disk protection: configurable free-space ratio guard and
 	// optional byte quota. See CheckWriteBackQuota.
