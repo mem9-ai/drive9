@@ -133,6 +133,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	parallelReadConcurrency := fs.Int("parallel-read-concurrency", defaultFuseParallelReadConcurrency, "maximum concurrent block reads for one large FUSE read")
 	parallelReadBlockSize := fs.Int64("parallel-read-block-size-mb", defaultFuseParallelReadBlockSizeMB, "block size in MB for parallel large-file reads")
 	syncRead := fs.Bool("fuse-sync-read", false, "disable kernel async read dispatch; at most one read in flight per file handle")
+	directMountStrict := fs.Bool("direct-mount-strict", false, "Linux only: mount directly with mount(2) and do not fall back to fusermount")
 	legacyDirStatFallback := fs.Bool("legacy-dir-stat-fallback", false, "on Lookup stat 404, list parent to support legacy servers without directory stat")
 	readDirPrefetch := fs.Bool("readdir-prefetch", false, "prefetch small files after directory reads into the read cache")
 	prefetchMaxFiles := fs.Int("readdir-prefetch-max-files", 32, "maximum small files prefetched per directory read")
@@ -305,6 +306,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	profileGiven := flagProvided(fs, "profile")
 	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
 	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
+	if *directMountStrict && resolved == MountModeWebDAV {
+		return fmt.Errorf("drive9 mount: --direct-mount-strict is not supported with WebDAV mode")
+	}
+	if *directMountStrict && runtime.GOOS != "linux" {
+		return fmt.Errorf("drive9 mount: --direct-mount-strict is only supported on Linux")
+	}
 	var profileCfg profileConfig
 	if !profileGiven && resolved == MountModeWebDAV {
 		profileCfg = builtinNoneProfile()
@@ -567,6 +574,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		ParallelReadConcurrency: *parallelReadConcurrency,
 		ParallelReadBlockSize:   *parallelReadBlockSize << 20,
 		SyncRead:                *syncRead,
+		DirectMountStrict:       *directMountStrict,
 		AllowOther:              *allowOther,
 		ReadOnly:                *readOnly,
 		Debug:                   *debug,

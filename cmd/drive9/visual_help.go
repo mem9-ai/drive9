@@ -724,6 +724,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "--api-key KEY", Desc: "owner API key; overrides DRIVE9_API_KEY and config"},
 					{Name: "--mode auto|fuse|webdav", Desc: "mount mode; auto selects the best supported mode"},
 					{Name: "--foreground", Desc: "run in foreground and block until unmounted"},
+					{Name: "--direct-mount-strict", Desc: "Linux only; use mount(2) without fallback to fusermount"},
 				}},
 				{Title: "Read cache", Flags: []visualHelpFlag{
 					{Name: "--cache-dir DIR", Desc: "write-back cache directory; default ~/.cache/drive9"},
