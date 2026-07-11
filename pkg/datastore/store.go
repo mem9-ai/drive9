@@ -3033,8 +3033,10 @@ func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error
 				result = "error"
 			}
 		}
-		if result != "canceled" && result != "deadline_exceeded" && result != "conn_closed" {
+		if shouldLogStoreOpFailure(result) {
 			logger.Error(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+		} else {
+			logger.Warn(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
 		}
 	}
 	logger.InfoBenchTiming(ctx, "datastore_op_timing",
@@ -3042,6 +3044,15 @@ func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error
 		zap.String("result", result),
 		zap.Float64("duration_ms", float64(elapsed.Microseconds())/1000.0))
 	metrics.RecordOperation("datastore", op, result, elapsed)
+}
+
+func shouldLogStoreOpFailure(result string) bool {
+	switch result {
+	case "not_found", "canceled", "deadline_exceeded", "conn_closed":
+		return false
+	default:
+		return true
+	}
 }
 
 func (s *Store) ExecSQL(ctx context.Context, query string) (out []map[string]interface{}, err error) {

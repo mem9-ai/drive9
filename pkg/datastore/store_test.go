@@ -27,6 +27,27 @@ func newTestStore(t *testing.T) *Store {
 
 var seq int
 
+func TestShouldLogStoreOpFailure(t *testing.T) {
+	tests := []struct {
+		result string
+		want   bool
+	}{
+		{result: "not_found", want: false},
+		{result: "canceled", want: false},
+		{result: "deadline_exceeded", want: false},
+		{result: "conn_closed", want: false},
+		{result: "conflict", want: true},
+		{result: "error", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.result, func(t *testing.T) {
+			if got := shouldLogStoreOpFailure(tt.result); got != tt.want {
+				t.Fatalf("shouldLogStoreOpFailure(%q) = %v, want %v", tt.result, got, tt.want)
+			}
+		})
+	}
+}
+
 func genID() string {
 	seq++
 	return fmt.Sprintf("id-%04d", seq)

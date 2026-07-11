@@ -52,6 +52,75 @@ func TestRecordTenantOperationCountDoesNotRecordDuration(t *testing.T) {
 	}
 }
 
+func TestRecordTenantOperationZeroDurationDoesNotRecordDuration(t *testing.T) {
+	const component = "zero_duration_test_component"
+	const operation = "zero_duration_test_operation"
+
+	RecordTenantOperation("tenant-zero", component, operation, "ok", 0)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_service_operations_total{component="`+component+`",operation="`+operation+`",result="ok",tenant_id="tenant-zero"} 1`) {
+		t.Fatalf("missing zero-duration operation total:\n%s", text)
+	}
+	if strings.Contains(text, `drive9_service_operation_duration_seconds_count{component="`+component+`",operation="`+operation+`",result="ok",tenant_id="tenant-zero"}`) {
+		t.Fatalf("zero-duration operation unexpectedly recorded a duration:\n%s", text)
+	}
+}
+
+func TestRecordTenantRequestZeroDurationDoesNotRecordDuration(t *testing.T) {
+	const tenantID = "tenant-zero-request"
+
+	RecordTenantRequest(tenantID, "zero_surface", "zero_action", "ok", 200, 0)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_tenant_requests_total{action="zero_action",result="ok",status="200",status_class="2xx",surface="zero_surface",tenant_id="`+tenantID+`"} 1`) {
+		t.Fatalf("missing zero-duration tenant request total:\n%s", text)
+	}
+	if strings.Contains(text, `drive9_tenant_request_duration_seconds_count{action="zero_action",result="ok",status="200",status_class="2xx",surface="zero_surface",tenant_id="`+tenantID+`"}`) {
+		t.Fatalf("zero-duration tenant request unexpectedly recorded a duration:\n%s", text)
+	}
+}
+
+func TestRecordSSEConnectionZeroDurationDoesNotRecordDuration(t *testing.T) {
+	const tenantID = "tenant-zero-sse-connection"
+
+	RecordSSEConnection(tenantID, "closed", 0)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_sse_connections_total{reason="closed",tenant_id="`+tenantID+`"} 1`) {
+		t.Fatalf("missing zero-duration SSE connection total:\n%s", text)
+	}
+	if strings.Contains(text, `drive9_sse_connection_duration_seconds_count{tenant_id="`+tenantID+`"}`) {
+		t.Fatalf("zero-duration SSE connection unexpectedly recorded a duration:\n%s", text)
+	}
+}
+
+func TestRecordTenantDurationMetricsSkipZeroDuration(t *testing.T) {
+	const (
+		phaseTenant    = "tenant-zero-sse-phase1"
+		eventBusTenant = "tenant-zero-event-bus"
+	)
+
+	RecordSSEPhase1(phaseTenant, 0)
+	RecordEventBusQuery(eventBusTenant, "events_since", "ok", 0)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if strings.Contains(text, `drive9_sse_phase1_duration_seconds_count{tenant_id="`+phaseTenant+`"}`) {
+		t.Fatalf("zero-duration SSE phase1 unexpectedly recorded a duration:\n%s", text)
+	}
+	if strings.Contains(text, `drive9_event_bus_query_duration_seconds_count{operation="events_since",result="ok",tenant_id="`+eventBusTenant+`"}`) {
+		t.Fatalf("zero-duration event bus query unexpectedly recorded a duration:\n%s", text)
+	}
+}
+
 func TestRecordTenantPoolMetadataResumeWaitIncludesPoolAndOrganizationID(t *testing.T) {
 	const poolID = "pool-metadata-resume-metrics-test"
 	const organizationID = "org-metadata-resume-metrics-test"

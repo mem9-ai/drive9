@@ -126,6 +126,9 @@ func RecordTenantOperation(tenantID, component, operation, result string, d time
 		attrs = append(attrs, Attr("tenant_id", tenantID))
 	}
 	serviceOperationsTotal.Add(1, attrs...)
+	if d <= 0 {
+		return
+	}
 	serviceOperationDuration.Observe(d.Seconds(), attrs...)
 }
 
@@ -347,6 +350,9 @@ func RecordTenantRequest(tenantID, surface, action, result string, status int, d
 		Attr("status_class", statusClass),
 	}
 	tenantRequestsTotal.Add(1, attrs...)
+	if d <= 0 {
+		return
+	}
 	tenantRequestDuration.Observe(d.Seconds(), attrs...)
 }
 
@@ -438,6 +444,9 @@ func RecordSSEConnection(tenantID, reason string, d time.Duration) {
 	RegisterModule("sse")
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	sseConnectionsTotal.Add(1, Attr("tenant_id", tenantID), Attr("reason", cleanMetricValue(reason, "unknown")))
+	if d <= 0 {
+		return
+	}
 	sseConnectionDuration.Observe(d.Seconds(), Attr("tenant_id", tenantID))
 }
 
@@ -455,6 +464,9 @@ func RecordSSEInFlight(tenantID string, count float64) {
 
 // RecordSSEPhase1 records the duration of the SSE Phase-1 replay/reset stage.
 func RecordSSEPhase1(tenantID string, d time.Duration) {
+	if d <= 0 {
+		return
+	}
 	RegisterModule("sse")
 	ssePhase1Duration.Observe(d.Seconds(), Attr("tenant_id", cleanMetricValue(tenantID, "unknown")))
 }
@@ -487,6 +499,9 @@ func RecordSSEHeartbeatSent(tenantID string) {
 // the error-only counters, this records every query (ok and error) so DB
 // pressure and table growth on the events path are observable.
 func RecordEventBusQuery(tenantID, operation, result string, d time.Duration) {
+	if d <= 0 {
+		return
+	}
 	RegisterModule("sse")
 	eventBusQueryDuration.Observe(d.Seconds(),
 		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
