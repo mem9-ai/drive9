@@ -291,7 +291,7 @@ func TestRenderDrive9VisualHelpColor(t *testing.T) {
 	if !strings.Contains(out, "\x1b[") {
 		t.Fatalf("renderDrive9VisualHelp(true) missing ANSI color escapes")
 	}
-	for _, want := range []string{"drive9", "create", "fs", "git", "less", "-R", "-S"} {
+	for _, want := range []string{"drive9", "create", "fs", "git", "--direct-mount-strict", "less", "-R", "-S"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("rendered help missing %q:\n%s", want, out)
 		}

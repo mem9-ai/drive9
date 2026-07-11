@@ -924,6 +924,11 @@ func TestForegroundMountCommandArgs(t *testing.T) {
 			want: []string{"mount", "--foreground", "--mode", "fuse", "/mnt/drive9"},
 		},
 		{
+			name: "fs preserve direct mount strict",
+			in:   []string{"--direct-mount-strict", "/mnt/drive9"},
+			want: []string{"mount", "--foreground", "--direct-mount-strict", "/mnt/drive9"},
+		},
+		{
 			name: "vault",
 			in:   []string{"vault", "--dir-ttl", "1s", "/mnt/vault"},
 			want: []string{"mount", "vault", "--foreground", "--dir-ttl", "1s", "/mnt/vault"},
@@ -1638,6 +1643,86 @@ func TestMountCmdPassesFuseSyncReadOption(t *testing.T) {
 	}
 	if !got.SyncRead {
 		t.Fatal("SyncRead = false, want true")
+	}
+}
+
+func TestMountCmdMapsDirectMountStrictOption(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "default"},
+		{name: "enabled", args: []string{"--direct-mount-strict"}, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.want && runtime.GOOS != "linux" {
+				t.Skip("direct mount is only supported on Linux")
+			}
+
+			var got *mountFuseOptions
+			mountFuse = func(opts *mountFuseOptions) error {
+				copied := *opts
+				got = &copied
+				return nil
+			}
+
+			args := []string{
+				"--foreground",
+				"--mode", "fuse",
+				"--server", "https://drive9.example",
+				"--api-key", "sk-test",
+			}
+			args = append(args, tt.args...)
+			args = append(args, t.TempDir())
+
+			if err := MountCmd(args); err != nil {
+				t.Fatalf("MountCmd: %v", err)
+			}
+			if got == nil {
+				t.Fatal("mountFuse was not called")
+			}
+			if got.DirectMountStrict != tt.want {
+				t.Fatalf("DirectMountStrict = %t, want %t", got.DirectMountStrict, tt.want)
+			}
+		})
+	}
+}
+
+func TestMountCmdRejectsDirectMountStrictWithWebDAV(t *testing.T) {
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "webdav",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--direct-mount-strict",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--direct-mount-strict is not supported with WebDAV mode") {
+		t.Fatalf("MountCmd error = %v, want direct-mount-strict WebDAV validation error", err)
+	}
+}
+
+func TestMountCmdRejectsDirectMountStrictOutsideLinux(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("non-Linux validation")
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--direct-mount-strict",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--direct-mount-strict is only supported on Linux") {
+		t.Fatalf("MountCmd error = %v, want direct-mount-strict platform validation error", err)
 	}
 }
 

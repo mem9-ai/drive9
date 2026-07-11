@@ -64,6 +64,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		ParallelReadConcurrency: opts.ParallelReadConcurrency,
 		ParallelReadBlockSize:   opts.ParallelReadBlockSize,
 		SyncRead:                opts.SyncRead,
+		DirectMountStrict:       opts.DirectMountStrict,
 		AllowOther:              opts.AllowOther,
 		ReadOnly:                opts.ReadOnly,
 		Debug:                   opts.Debug,

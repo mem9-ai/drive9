@@ -8690,6 +8690,18 @@ func TestGoFuseMountOptionsMapsSyncRead(t *testing.T) {
 	}
 }
 
+func TestGoFuseMountOptionsMapsDirectMountStrict(t *testing.T) {
+	defaults := newGoFuseMountOptions(&MountOptions{})
+	if defaults.DirectMountStrict {
+		t.Fatal("default go-fuse DirectMountStrict = true, want false")
+	}
+
+	explicit := newGoFuseMountOptions(&MountOptions{DirectMountStrict: true})
+	if !explicit.DirectMountStrict {
+		t.Fatal("explicit go-fuse DirectMountStrict = false, want true")
+	}
+}
+
 func TestGoFuseMountOptionsAllowOtherUsesDefaultPermissionsOnLinux(t *testing.T) {
 	opts := newGoFuseMountOptions(&MountOptions{AllowOther: true})
 	hasDefaultPermissions := false

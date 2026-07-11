@@ -71,6 +71,7 @@ type mountFuseOptions struct {
 	ParallelReadConcurrency int
 	ParallelReadBlockSize   int64
 	SyncRead                bool
+	DirectMountStrict       bool
 	AllowOther              bool
 	ReadOnly                bool
 	Debug                   bool
