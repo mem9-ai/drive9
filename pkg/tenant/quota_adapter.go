@@ -315,6 +315,10 @@ func (a *metaQuotaAdapter) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
 	return a.s.MarkMutationAppliedTx(tx, id)
 }
 
+func (a *metaQuotaAdapter) IsMutationAlreadyAppliedError(err error) bool {
+	return meta.IsMutationAlreadyAppliedError(err)
+}
+
 func (a *metaQuotaAdapter) IncrMutationRetry(ctx context.Context, id int64, maxRetries int) error {
 	return a.s.IncrMutationRetry(ctx, id, maxRetries)
 }

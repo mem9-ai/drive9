@@ -153,6 +153,7 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 	applied := 0
 	failed := 0
 	skipped := 0
+	skippedAlreadyApplied := 0
 	blockedTenants := make(map[string]struct{})
 	for _, entry := range entries {
 		if _, blocked := blockedTenants[entry.TenantID]; blocked {
@@ -160,6 +161,10 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 			continue
 		}
 		if err := w.replayOne(ctx, entry); err != nil {
+			if w.store.IsMutationAlreadyAppliedError(err) {
+				skippedAlreadyApplied++
+				continue
+			}
 			logger.Warn(ctx, "mutation_replay_entry_failed",
 				zap.Int64("log_id", entry.ID),
 				zap.String("tenant_id", entry.TenantID),
@@ -183,12 +188,14 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 	metrics.RecordGauge("mutation_replay", "batch_applied", float64(applied))
 	metrics.RecordGauge("mutation_replay", "batch_failed", float64(failed))
 	metrics.RecordGauge("mutation_replay", "batch_skipped", float64(skipped))
+	metrics.RecordGauge("mutation_replay", "batch_already_applied", float64(skippedAlreadyApplied))
 	w.recordPendingBacklogIfDue(ctx)
 	logger.Info(ctx, "mutation_replay_batch_complete",
 		zap.Int("total", len(entries)),
 		zap.Int("applied", applied),
 		zap.Int("failed", failed),
 		zap.Int("skipped_after_barrier", skipped),
+		zap.Int("skipped_already_applied", skippedAlreadyApplied),
 		zap.Float64("duration_ms", float64(time.Since(start).Milliseconds())))
 	return false
 }

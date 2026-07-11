@@ -178,7 +178,7 @@ func execSchemaStatement(ctx context.Context, db *sql.DB, stmt string, index, co
 				zap.Int("statement_count", count),
 				zap.String("statement", snippet),
 				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
-				zap.Error(err))
+				zap.String("skip_reason", err.Error()))
 			return nil
 		}
 		if IsTransientSchemaError(err) {
@@ -187,7 +187,7 @@ func execSchemaStatement(ctx context.Context, db *sql.DB, stmt string, index, co
 				zap.Int("statement_count", count),
 				zap.String("statement", snippet),
 				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
-				zap.Error(err))
+				zap.String("reason", err.Error()))
 			return fmt.Errorf("exec %q: %w", snippet, err)
 		}
 		logger.Error(ctx, "schema_statement_exec_failed",
@@ -226,7 +226,7 @@ func ExecOptionalSchemaStatements(ctx context.Context, db *sql.DB, stmts []strin
 					zap.Int("statement_count", len(stmts)),
 					zap.String("statement", snippet),
 					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
-					zap.Error(err))
+					zap.String("skip_reason", err.Error()))
 				continue
 			}
 			if isIgnorableOptionalSchemaError(err) {
@@ -236,7 +236,7 @@ func ExecOptionalSchemaStatements(ctx context.Context, db *sql.DB, stmts []strin
 					zap.Int("statement_count", len(stmts)),
 					zap.String("statement", snippet),
 					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
-					zap.Error(err))
+					zap.String("skip_reason", err.Error()))
 				continue
 			}
 			if IsTransientSchemaError(err) {
@@ -245,7 +245,7 @@ func ExecOptionalSchemaStatements(ctx context.Context, db *sql.DB, stmts []strin
 					zap.Int("statement_count", len(stmts)),
 					zap.String("statement", snippet),
 					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
-					zap.Error(err))
+					zap.String("reason", err.Error()))
 				return skipped, fmt.Errorf("exec optional %q: %w", snippet, err)
 			}
 			logger.Error(ctx, "optional_schema_statement_exec_failed",
