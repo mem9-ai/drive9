@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1389,6 +1390,20 @@ func TestNewWithConfigUsesDefaultTenantPoolMaxSize(t *testing.T) {
 	s := NewWithConfig(Config{})
 	if s.tenantPoolMaxSize != DefaultTenantPoolMaxSize {
 		t.Fatalf("default tenantPoolMaxSize = %d, want %d", s.tenantPoolMaxSize, DefaultTenantPoolMaxSize)
+	}
+}
+
+func TestNewWithConfigUsesDefaultTenantPoolRefillFreeRatio(t *testing.T) {
+	s := NewWithConfig(Config{})
+	if s.tenantPoolRefillFreeRatio != DefaultTenantPoolRefillFreeRatio {
+		t.Fatalf("default tenantPoolRefillFreeRatio = %f, want %f", s.tenantPoolRefillFreeRatio, DefaultTenantPoolRefillFreeRatio)
+	}
+}
+
+func TestNewWithConfigRejectsNaNTenantPoolRefillFreeRatio(t *testing.T) {
+	s := NewWithConfig(Config{TenantPoolRefillFreeRatio: math.NaN()})
+	if s.tenantPoolRefillFreeRatio != DefaultTenantPoolRefillFreeRatio {
+		t.Fatalf("NaN tenantPoolRefillFreeRatio = %f, want %f", s.tenantPoolRefillFreeRatio, DefaultTenantPoolRefillFreeRatio)
 	}
 }
 
