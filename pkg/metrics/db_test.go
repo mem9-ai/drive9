@@ -158,8 +158,17 @@ func TestDBHealthProbeSkipsTenantPools(t *testing.T) {
 	if !strings.Contains(out, `drive9_db_pool_registered{role="user",tenant_id="`+tenantID+`"} 1`) {
 		t.Fatalf("expected tenant pool_registered series, got:\n%s", out)
 	}
-	if !strings.Contains(out, `drive9_db_pool_wait_count_total{role="user",tenant_id="`+tenantID+`"} 0`) {
-		t.Fatalf("expected tenant pool wait series, got:\n%s", out)
+	if strings.Contains(out, `drive9_db_pool_wait_count_total{role="user",tenant_id="`+tenantID+`"`) {
+		t.Fatalf("expected tenant pool with zero wait count to omit wait count series, got:\n%s", out)
+	}
+	if strings.Contains(out, `drive9_db_pool_wait_duration_seconds_total{role="user",tenant_id="`+tenantID+`"`) {
+		t.Fatalf("expected tenant pool with zero wait duration to omit wait duration series, got:\n%s", out)
+	}
+	if strings.Contains(out, `drive9_db_pool_closes_total{role="user",tenant_id="`+tenantID+`"`) {
+		t.Fatalf("expected tenant pool with zero closes to omit close series, got:\n%s", out)
+	}
+	if strings.Contains(out, `drive9_db_pool_connections{role="user",tenant_id="`+tenantID+`"`) {
+		t.Fatalf("expected tenant pool with no open connections to omit pool connection series, got:\n%s", out)
 	}
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
@@ -189,6 +198,43 @@ func TestDBHealthProbeSkipsUserSchemaPools(t *testing.T) {
 	}
 	if !strings.Contains(out, `drive9_db_pool_registered{role="user_schema"} 1`) {
 		t.Fatalf("expected role-only user_schema pool stats to remain visible, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_pool_connections{role="user_schema",state="open"} 0`) {
+		t.Fatalf("expected role-only user_schema pool connections to remain visible, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_pool_wait_count_total{role="user_schema"} 0`) {
+		t.Fatalf("expected role-only user_schema wait count to remain visible, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_pool_closes_total{reason="max_idle",role="user_schema"} 0`) &&
+		!strings.Contains(out, `drive9_db_pool_closes_total{role="user_schema",reason="max_idle"} 0`) {
+		t.Fatalf("expected role-only user_schema close count to remain visible, got:\n%s", out)
+	}
+}
+
+func TestDBPoolConnectionsIncludesTenantPoolsWithOpenConnections(t *testing.T) {
+	const (
+		role     = "user"
+		tenantID = "tenant-db-open-metrics-test"
+	)
+
+	healthy := &atomic.Bool{}
+	healthy.Store(true)
+	db := sql.OpenDB(fakeConnector{healthy: healthy})
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		_ = db.Close()
+	})
+
+	RegisterTenantDB(role, tenantID, db)
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatalf("ping tenant db: %v", err)
+	}
+
+	out := renderDB(t)
+	if !strings.Contains(out, `drive9_db_pool_connections{role="user",tenant_id="`+tenantID+`",state="open"} 1`) {
+		t.Fatalf("expected tenant pool with open connections to emit pool connection series, got:\n%s", out)
 	}
 }
 

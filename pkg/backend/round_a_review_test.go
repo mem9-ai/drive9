@@ -319,6 +319,28 @@ func TestRoundA_Fix3_ReplayWorker_PerTenantFailureBarrier(t *testing.T) {
 	}
 }
 
+func TestMutationReplayWorkerAlreadyAppliedMarkDoesNotFailOrBlockTenant(t *testing.T) {
+	fake := newFakeMetaQuotaStore()
+	fake.mutations = []fakeMutationRecord{
+		{tenantID: "tenant-a", id: 1, typ: "file_create", status: "pending", data: []byte(`{"file_id":"f1","size_bytes":0,"is_media":false}`)},
+		{tenantID: "tenant-a", id: 2, typ: "file_create", status: "pending", data: []byte(`{"file_id":"f2","size_bytes":0,"is_media":false}`)},
+	}
+	fake.nextID = 3
+	fake.alreadyAppliedOnMarkErr = map[int64]bool{1: true}
+
+	w := &MutationReplayWorker{store: fake}
+	w.replayBatch(context.Background())
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.mutations[0].status != "applied" || fake.mutations[0].retryCount != 0 {
+		t.Fatalf("already-applied entry = {status=%q retry=%d}, want {applied, 0}", fake.mutations[0].status, fake.mutations[0].retryCount)
+	}
+	if fake.mutations[1].status != "applied" || fake.mutations[1].retryCount != 0 {
+		t.Fatalf("following entry was blocked by benign already-applied race: status=%q retry=%d", fake.mutations[1].status, fake.mutations[1].retryCount)
+	}
+}
+
 // Invariant sanity check: without the barrier contract, a per-tenant
 // create-then-delete sequence where create fails would run delete on a
 // nonexistent row. The barrier prevents that.

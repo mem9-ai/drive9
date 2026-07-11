@@ -17,6 +17,12 @@ import (
 	"go.uber.org/zap"
 )
 
+var errMutationAlreadyApplied = errors.New("mutation already applied")
+
+func IsMutationAlreadyAppliedError(err error) bool {
+	return errors.Is(err, errMutationAlreadyApplied)
+}
+
 // QuotaConfig holds per-tenant quota limits stored in the central server DB.
 type QuotaConfig struct {
 	TenantID         string
@@ -1298,7 +1304,14 @@ func (s *Store) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("mutation %d already applied or not pending", id)
+		var status string
+		if err := tx.QueryRow(`SELECT status FROM quota_mutation_log WHERE id = ?`, id).Scan(&status); err != nil {
+			return fmt.Errorf("mutation %d not pending and status lookup failed: %w", id, err)
+		}
+		if status == "applied" {
+			return fmt.Errorf("mutation %d: %w", id, errMutationAlreadyApplied)
+		}
+		return fmt.Errorf("mutation %d unexpectedly left pending state before mark applied: status=%q", id, status)
 	}
 	return nil
 }

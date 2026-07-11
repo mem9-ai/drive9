@@ -16,6 +16,8 @@ import (
 	"github.com/mem9-ai/drive9/pkg/meta"
 )
 
+var errFakeMutationAlreadyApplied = errors.New("mutation already applied")
+
 type fakeMutationRecord struct {
 	tenantID   string
 	id         int64
@@ -27,24 +29,25 @@ type fakeMutationRecord struct {
 }
 
 type fakeMetaQuotaStore struct {
-	mu                   sync.Mutex
-	usage                map[string]*QuotaUsageView
-	config               map[string]*QuotaConfigView
-	fileMeta             map[string]*FileMetaView
-	reservations         map[string]*UploadReservationView
-	monthly              map[string]int64
-	llmUsage             []LLMUsageView
-	objectGCCandidates   []meta.ObjectGCCandidateInput
-	mutations            []fakeMutationRecord
-	nextID               int64
-	markAppliedCalls     int // Finding B invariant: count MarkMutationAppliedTx calls (pre-guard, on-entry)
-	observePendingCalls  int
-	monthlyCostErr       error
-	insertMutationErr    error
-	objectGCCandidateErr error
-	insertReservationErr error // injected into AtomicReserveAndInsertUpload to simulate INSERT failure inside the tx
-	getReservationErr    error // injected into GetUploadReservation to simulate transient DB error
-	inTxHook             func(context.Context) error
+	mu                      sync.Mutex
+	usage                   map[string]*QuotaUsageView
+	config                  map[string]*QuotaConfigView
+	fileMeta                map[string]*FileMetaView
+	reservations            map[string]*UploadReservationView
+	monthly                 map[string]int64
+	llmUsage                []LLMUsageView
+	objectGCCandidates      []meta.ObjectGCCandidateInput
+	mutations               []fakeMutationRecord
+	nextID                  int64
+	markAppliedCalls        int // Finding B invariant: count MarkMutationAppliedTx calls (pre-guard, on-entry)
+	observePendingCalls     int
+	monthlyCostErr          error
+	insertMutationErr       error
+	objectGCCandidateErr    error
+	insertReservationErr    error // injected into AtomicReserveAndInsertUpload to simulate INSERT failure inside the tx
+	getReservationErr       error // injected into GetUploadReservation to simulate transient DB error
+	inTxHook                func(context.Context) error
+	alreadyAppliedOnMarkErr map[int64]bool
 }
 
 func (f *fakeMetaQuotaStore) EnqueueObjectGCCandidate(_ context.Context, c *meta.ObjectGCCandidateInput) error {
@@ -481,9 +484,13 @@ func (f *fakeMetaQuotaStore) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
 	f.markAppliedCalls++
 	for i := range f.mutations {
 		if f.mutations[i].id == id {
-			// Mirror the real Store's WHERE status='pending' guard
-			// (pkg/meta/quota.go). Silent no-op on non-pending — same symmetry
-			// as fake.IncrMutationRetry.
+			if f.alreadyAppliedOnMarkErr[id] {
+				f.mutations[i].status = "applied"
+				return fmt.Errorf("mutation %d: %w", id, errFakeMutationAlreadyApplied)
+			}
+			// Preserve the WHERE status='pending' guard shape used by the real
+			// store. Most tests keep non-pending rows as no-ops; tests that need
+			// the real already-applied race inject alreadyAppliedOnMarkErr above.
 			if f.mutations[i].status != "pending" {
 				return nil
 			}
@@ -492,6 +499,10 @@ func (f *fakeMetaQuotaStore) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
 		}
 	}
 	return fmt.Errorf("mutation %d not found", id)
+}
+
+func (f *fakeMetaQuotaStore) IsMutationAlreadyAppliedError(err error) bool {
+	return errors.Is(err, errFakeMutationAlreadyApplied)
 }
 
 // mutationStatus is a test-only helper for reading mutation row status by id

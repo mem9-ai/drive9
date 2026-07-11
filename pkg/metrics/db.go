@@ -383,6 +383,9 @@ func writeDBPrometheus(w http.ResponseWriter) {
 	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_pool_connections gauge")
 	for _, key := range keys {
 		totals := poolTotals[key]
+		if key.hasTenantID() && totals.openConnections == 0 {
+			continue
+		}
 		labels := dbLabels(key)
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"open\"} %d\n", labels, totals.openConnections)
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"in_use\"} %d\n", labels, totals.inUseConnections)
@@ -393,12 +396,18 @@ func writeDBPrometheus(w http.ResponseWriter) {
 	_, _ = fmt.Fprintln(w, "# HELP drive9_db_pool_wait_count_total Aggregated database pool wait count by role")
 	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_pool_wait_count_total counter")
 	for _, key := range keys {
+		if key.hasTenantID() && poolTotals[key].waitCount == 0 {
+			continue
+		}
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_wait_count_total{%s} %d\n", dbLabels(key), poolTotals[key].waitCount)
 	}
 
 	_, _ = fmt.Fprintln(w, "# HELP drive9_db_pool_wait_duration_seconds_total Aggregated database pool wait duration by role")
 	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_pool_wait_duration_seconds_total counter")
 	for _, key := range keys {
+		if key.hasTenantID() && poolTotals[key].waitDuration == 0 {
+			continue
+		}
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_wait_duration_seconds_total{%s} %.6f\n", dbLabels(key), poolTotals[key].waitDuration)
 	}
 
@@ -407,10 +416,17 @@ func writeDBPrometheus(w http.ResponseWriter) {
 	for _, key := range keys {
 		totals := poolTotals[key]
 		labels := dbLabels(key)
-		_, _ = fmt.Fprintf(w, "drive9_db_pool_closes_total{%s,reason=\"max_idle\"} %d\n", labels, totals.maxIdleClosed)
-		_, _ = fmt.Fprintf(w, "drive9_db_pool_closes_total{%s,reason=\"max_idle_time\"} %d\n", labels, totals.maxIdleTimeClosed)
-		_, _ = fmt.Fprintf(w, "drive9_db_pool_closes_total{%s,reason=\"max_lifetime\"} %d\n", labels, totals.maxLifetimeClosed)
+		writeDBPoolCloses(w, key, labels, "max_idle", totals.maxIdleClosed)
+		writeDBPoolCloses(w, key, labels, "max_idle_time", totals.maxIdleTimeClosed)
+		writeDBPoolCloses(w, key, labels, "max_lifetime", totals.maxLifetimeClosed)
 	}
+}
+
+func writeDBPoolCloses(w http.ResponseWriter, key dbMetricKey, labels, reason string, value int64) {
+	if key.hasTenantID() && value == 0 {
+		return
+	}
+	_, _ = fmt.Fprintf(w, "drive9_db_pool_closes_total{%s,reason=\"%s\"} %d\n", labels, reason, value)
 }
 
 func (p registeredDB) metricKey() dbMetricKey {
@@ -465,10 +481,14 @@ func observeDBProbeDuration(start time.Time, role, result string) {
 
 func dbLabels(key dbMetricKey) string {
 	labels := fmt.Sprintf("role=\"%s\"", EscapePromLabel(key.role))
-	if key.tenantID != "" && key.tenantID != "unknown" {
+	if key.hasTenantID() {
 		labels += fmt.Sprintf(",tenant_id=\"%s\"", EscapePromLabel(key.tenantID))
 	}
 	return labels
+}
+
+func (key dbMetricKey) hasTenantID() bool {
+	return key.tenantID != "" && key.tenantID != "unknown"
 }
 
 func sortedDBMetricKeys(totals map[dbMetricKey]dbPoolTotals) []dbMetricKey {
