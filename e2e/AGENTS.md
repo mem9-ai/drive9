@@ -128,6 +128,11 @@ do the failure analysis before creating or changing repo issues:
 2. Analyze the failed case enough to state a likely root cause or the concrete
    blocker that prevents a root-cause call. Use the repo, smoke logs, and
    relevant code paths; do not report only the aggregate `PASS=N FAIL=M` line.
+   If service/app logs are available through local tooling, include them in the
+   analysis. If they are not available from the current machine or agent, state
+   that limitation explicitly and continue the local-log/code-path analysis.
+   Keep machine-specific log access details in local runbooks or agent memory,
+   not in this repo-level policy.
 3. Report the findings first in the Slock/Raft smoke-test thread that requested
    or owns the run. Include the failed case, evidence, log path, impact, and
    root-cause assessment.
