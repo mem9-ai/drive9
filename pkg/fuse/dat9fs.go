@@ -12042,8 +12042,16 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	// Snapshot the staging-store generations so the post-upload cleanup can be
 	// generation-guarded. A concurrent same-path write while the debounce is
 	// pending/in-flight would bump these generations, and removing the fresher
-	// entry would lose that pending data.
+	// entry would lose that pending data. snapshotStagingGens does not read
+	// writeBack (to avoid a path-lock self-deadlock in the uploadOne callback),
+	// so capture WriteBackGen separately here — this runs under the handle lock,
+	// not the writeBack path lock, so GetMeta is safe.
 	stagingGens := fs.snapshotStagingGens(filePath)
+	if fs.writeBack != nil {
+		if meta, ok := fs.writeBack.GetMeta(filePath); ok {
+			stagingGens.WriteBackGen = meta.Generation
+		}
+	}
 
 	fs.debouncer.Schedule(filePath, func() {
 		handle.Lock()
@@ -13000,13 +13008,15 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 	}
 }
 
+// snapshotStagingGens captures the pendingIndex and shadowStore content
+// generations for remotePath. It deliberately does NOT read writeBack.GetMeta
+// because GetMeta acquires the writeBack per-path lock — calling it from the
+// GetMetaAndViewWithCallback onLocked callback (which already holds that lock)
+// would self-deadlock. The WriteBackGen is set by the caller from the meta it
+// already holds (uploadOne sets it from meta.Generation; the debounced path
+// sets it separately via a safe GetMeta call outside any path lock).
 func (fs *Dat9FS) snapshotStagingGens(remotePath string) StagingGens {
 	var g StagingGens
-	if fs.writeBack != nil {
-		if meta, ok := fs.writeBack.GetMeta(remotePath); ok {
-			g.WriteBackGen = meta.Generation
-		}
-	}
 	if fs.pendingIndex != nil {
 		g.PendingIndexGen = fs.pendingIndex.Generation(remotePath)
 	}
