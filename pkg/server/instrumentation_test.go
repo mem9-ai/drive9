@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 )
 
 func TestRequestRoute(t *testing.T) {
@@ -207,5 +208,50 @@ func TestFlusherResponseWriterDelegatesFlush(t *testing.T) {
 	fw.Flush()
 	if !rec.flushed {
 		t.Fatal("expected Flush to delegate to wrapped writer")
+	}
+}
+
+// TestSSEEstablishmentDuration verifies that markSSEStreamEstablished records
+// the establishment timestamp so observe can measure the time-to-first-byte
+// (request → 200 headers + flush) rather than the full SSE connection
+// lifetime. This is the core invariant that keeps /v1/events in the HTTP p99
+// latency alert on a bounded, meaningful basis without the select-loop
+// hold-open time polluting the histogram.
+func TestSSEEstablishmentDuration(t *testing.T) {
+	state := &requestMetricState{}
+	ctx := withRequestMetricState(context.Background(), state)
+
+	// Before establishment: flag is false and duration is unavailable.
+	if sseStreamEstablished(ctx) {
+		t.Fatal("sseStreamEstablished should be false before markSSEStreamEstablished")
+	}
+	start := time.Now()
+	if _, ok := sseEstablishmentDuration(ctx, start); ok {
+		t.Fatal("sseEstablishmentDuration should return false before establishment")
+	}
+
+	// Simulate the establishment point (handleEvents writing 200 headers).
+	time.Sleep(2 * time.Millisecond)
+	markSSEStreamEstablished(ctx)
+
+	if !sseStreamEstablished(ctx) {
+		t.Fatal("sseStreamEstablished should be true after markSSEStreamEstablished")
+	}
+
+	estDur, ok := sseEstablishmentDuration(ctx, start)
+	if !ok {
+		t.Fatal("sseEstablishmentDuration should return true after establishment")
+	}
+	if estDur < time.Millisecond {
+		t.Fatalf("establishment duration = %v, want >= 1ms", estDur)
+	}
+
+	// The establishment duration must be bounded and significantly shorter
+	// than a simulated connection lifetime. observe uses estDur (not
+	// time.Since(start)) for the HTTP duration histogram when the stream is
+	// established.
+	connLifetime := time.Since(start)
+	if estDur > connLifetime {
+		t.Fatalf("establishment duration %v should not exceed connection lifetime %v", estDur, connLifetime)
 	}
 }
