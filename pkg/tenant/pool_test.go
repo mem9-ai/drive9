@@ -638,3 +638,165 @@ type poolDummyAudioExtractor struct{}
 func (poolDummyAudioExtractor) ExtractAudioText(context.Context, backend.AudioExtractRequest) (string, backend.AudioExtractUsage, error) {
 	return "", backend.AudioExtractUsage{}, nil
 }
+
+func TestIdleEviction(t *testing.T) {
+	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
+		MaxTenants:       2,
+		IdleTimeout:      50 * time.Millisecond,
+		IdleReapInterval: 10 * time.Millisecond,
+	}, "tenant-idle")
+	ctx := context.Background()
+
+	b, release, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := b.Store()
+	assertStoreOpen(t, store)
+	release()
+
+	// Wait for idle timeout to lapse, then reap manually.
+	time.Sleep(60 * time.Millisecond)
+	pool.reapOnce(ctx)
+
+	assertStoreClosed(t, store)
+	if _, ok := pool.items[tenant.ID]; ok {
+		t.Fatal("expected entry to be evicted from pool")
+	}
+}
+
+func TestIdleEvictionSkippedByRecentAcquire(t *testing.T) {
+	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
+		MaxTenants:       2,
+		IdleTimeout:      50 * time.Millisecond,
+		IdleReapInterval: 10 * time.Millisecond,
+	}, "tenant-recent")
+	ctx := context.Background()
+
+	b, release, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := b.Store()
+	release()
+
+	// Re-acquire immediately — lastUsed is refreshed to now.
+	b2, release2, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b2 != b {
+		t.Fatal("expected same backend on cache hit")
+	}
+	release2()
+
+	// Reap immediately — lastUsed is recent, should not evict.
+	pool.reapOnce(ctx)
+	assertStoreOpen(t, store)
+	if _, ok := pool.items[tenant.ID]; !ok {
+		t.Fatal("expected entry to remain in pool after recent acquire")
+	}
+}
+
+func TestIdleEvictionNotRefreshedByAcquireCached(t *testing.T) {
+	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
+		MaxTenants:       2,
+		IdleTimeout:      50 * time.Millisecond,
+		IdleReapInterval: 10 * time.Millisecond,
+	}, "tenant-cached")
+	ctx := context.Background()
+
+	// Cold-open via Acquire so the backend enters the pool.
+	b, release, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := b.Store()
+	release()
+
+	// Wait long enough that lastUsed is stale, but use AcquireCached
+	// before reaping — AcquireCached must NOT refresh lastUsed.
+	time.Sleep(60 * time.Millisecond)
+	b2, release2, ok := pool.AcquireCached(tenant)
+	if !ok {
+		t.Fatal("expected AcquireCached to hit warm cache")
+	}
+	if b2 != b {
+		t.Fatal("expected same backend from AcquireCached")
+	}
+	release2()
+
+	// Reap — entry should be evicted because AcquireCached did not
+	// refresh lastUsed.
+	pool.reapOnce(ctx)
+	assertStoreClosed(t, store)
+	if _, ok := pool.items[tenant.ID]; ok {
+		t.Fatal("expected entry to be evicted despite AcquireCached touch")
+	}
+}
+
+func TestIdleEvictionRespectsRefs(t *testing.T) {
+	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
+		MaxTenants:       2,
+		IdleTimeout:      50 * time.Millisecond,
+		IdleReapInterval: 10 * time.Millisecond,
+	}, "tenant-pinned")
+	ctx := context.Background()
+
+	b, release, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := b.Store()
+
+	// Wait for idle timeout, but don't release — refs > 0 must prevent
+	// eviction.
+	time.Sleep(60 * time.Millisecond)
+	pool.reapOnce(ctx)
+	assertStoreOpen(t, store)
+	if _, ok := pool.items[tenant.ID]; !ok {
+		t.Fatal("expected pinned entry to remain in pool")
+	}
+
+	// Now release and reap — should evict.
+	release()
+	pool.reapOnce(ctx)
+	assertStoreClosed(t, store)
+}
+
+func TestIdleEvictionDisabled(t *testing.T) {
+	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
+		MaxTenants:    2,
+		IdleTimeout:   0, // disabled
+	}, "tenant-disabled")
+	ctx := context.Background()
+
+	b, release, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := b.Store()
+	release()
+
+	// Wait well beyond any idle timeout, but since IdleTimeout=0 the
+	// reaper is disabled and reapOnce is a no-op (idleTimeout is 0 so
+	// now.Sub(lastUsed) > 0 is always true — but Start won't have been
+	// called). Call reapOnce directly to confirm it's a no-op.
+	time.Sleep(20 * time.Millisecond)
+	pool.reapOnce(ctx)
+	assertStoreOpen(t, store)
+	if _, ok := pool.items[tenant.ID]; !ok {
+		t.Fatal("expected entry to remain when idle eviction is disabled")
+	}
+}
+
+func TestIdleEvictionStartNoOpWhenDisabled(t *testing.T) {
+	pool := NewPool(PoolConfig{
+		MaxTenants:  2,
+		IdleTimeout: 0,
+	}, nil)
+	pool.Start(context.Background())
+	if pool.reapStop != nil {
+		t.Fatal("expected reapStop to be nil when IdleTimeout=0")
+	}
+}

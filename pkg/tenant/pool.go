@@ -64,6 +64,18 @@ type PoolConfig struct {
 	// resolves to the post-transition state instead of a moment-in-time
 	// IsLeader() snapshot.
 	LeaderChecker LeaderChecker
+
+	// IdleTimeout controls how long a cached backend with no user traffic
+	// (Get/Acquire) can stay in the warm cache before the idle reaper evicts
+	// it. 0 disables idle eviction (LRU capacity eviction still applies).
+	// AcquireCached (safety-net scan etc.) does NOT refresh the idle timer —
+	// only real user traffic does, so periodic internal scans cannot keep a
+	// tenant warm forever.
+	IdleTimeout time.Duration
+
+	// IdleReapInterval is how often the idle reaper scans for idle backends.
+	// Defaults to defaultTenantPoolIdleReapInterval when IdleTimeout > 0.
+	IdleReapInterval time.Duration
 }
 
 // LeaderChecker reports whether the current process is the leader. Used by
@@ -123,6 +135,10 @@ type Pool struct {
 	// FileGC is now kick-driven through the unified tenant worker, not a
 	// per-backend goroutine.
 	fileGCEnabled bool
+	idleTimeout   time.Duration
+	reapInterval  time.Duration
+	reapStop      context.CancelFunc
+	reapWG        sync.WaitGroup
 }
 
 type tenantAutoEmbeddingProfile struct {
@@ -144,6 +160,7 @@ var (
 	periodicTiDBSchemaValidationEvery uint64 = 32
 	defaultTenantPoolDrainTimeout            = 30 * time.Second
 	defaultTenantPoolMaxTenants              = 1024
+	defaultTenantPoolIdleReapInterval        = 5 * time.Minute
 )
 
 func tenantSchemaVersionForEmbeddingMode(mode string, profile schema.TiDBAutoEmbeddingProfile) (int, error) {
@@ -197,6 +214,7 @@ type entry struct {
 	elem               *list.Element
 	refs               int
 	retired            bool
+	lastUsed           time.Time // updated only on Get/Acquire (user traffic), not AcquireCached
 }
 
 func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
@@ -204,14 +222,21 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 	if max <= 0 {
 		max = defaultTenantPoolMaxTenants
 	}
+	idleTimeout := cfg.IdleTimeout
+	reapInterval := cfg.IdleReapInterval
+	if reapInterval <= 0 && idleTimeout > 0 {
+		reapInterval = defaultTenantPoolIdleReapInterval
+	}
 	return &Pool{
-		cfg:     cfg,
-		enc:     enc,
-		items:   map[string]*entry{},
-		order:   list.New(),
-		maxSize: max,
+		cfg:          cfg,
+		enc:          enc,
+		items:        map[string]*entry{},
+		order:        list.New(),
+		maxSize:      max,
 		// No LeaderChecker means single-pod mode: FileGC runs unconditionally.
 		fileGCEnabled: cfg.LeaderChecker == nil,
+		idleTimeout:   idleTimeout,
+		reapInterval:  reapInterval,
 	}
 }
 
@@ -264,6 +289,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 	if e, ok := p.items[t.ID]; ok {
 		if e.s3EncryptionPolicy == s3EncryptionPolicy && (storageNamespaceID == "" || e.storageNamespaceID == storageNamespaceID) {
 			p.order.MoveToFront(e.elem)
+			e.lastUsed = time.Now()
 			b := e.backend
 			p.mu.Unlock()
 			return b, nil
@@ -291,6 +317,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 			b.Close()
 			_ = st.Close()
 			p.order.MoveToFront(e.elem)
+			e.lastUsed = time.Now()
 			p.mu.Unlock()
 			return e.backend, nil
 		}
@@ -298,7 +325,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 			toClose = append(toClose, removed)
 		}
 	}
-	e := &entry{tenantID: t.ID, storageNamespaceID: t.StorageNamespaceID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st}
+	e := &entry{tenantID: t.ID, storageNamespaceID: t.StorageNamespaceID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st, lastUsed: time.Now()}
 	e.elem = p.order.PushFront(e)
 	p.items[t.ID] = e
 	for p.order.Len() > p.maxSize {
@@ -341,6 +368,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		if e.s3EncryptionPolicy == s3EncryptionPolicy && (storageNamespaceID == "" || e.storageNamespaceID == storageNamespaceID) {
 			e.refs++
 			p.order.MoveToFront(e.elem)
+			e.lastUsed = time.Now()
 			p.mu.Unlock()
 			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
 			logger.InfoBenchTiming(ctx, "tenant_pool_acquire_timing",
@@ -381,6 +409,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		if e.s3EncryptionPolicy == s3EncryptionPolicy && (t.StorageNamespaceID == "" || e.storageNamespaceID == t.StorageNamespaceID) {
 			e.refs++
 			p.order.MoveToFront(e.elem)
+			e.lastUsed = time.Now()
 			p.mu.Unlock()
 			b.Close()
 			_ = st.Close()
@@ -396,7 +425,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			toClose = append(toClose, removed)
 		}
 	}
-	e := &entry{tenantID: t.ID, storageNamespaceID: t.StorageNamespaceID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st, refs: 1}
+	e := &entry{tenantID: t.ID, storageNamespaceID: t.StorageNamespaceID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st, refs: 1, lastUsed: time.Now()}
 	e.elem = p.order.PushFront(e)
 	p.items[t.ID] = e
 	for p.order.Len() > p.maxSize {
@@ -632,7 +661,67 @@ func withTenantPoolDrainTimeout(ctx context.Context) (context.Context, context.C
 	return context.WithTimeout(ctx, defaultTenantPoolDrainTimeout)
 }
 
+// Start launches the idle reaper goroutine if IdleTimeout is configured.
+// Safe to call on a pool with IdleTimeout=0 (no-op). The reaper is stopped
+// by Close.
+func (p *Pool) Start(ctx context.Context) {
+	if p == nil || p.idleTimeout <= 0 {
+		return
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	p.reapStop = cancel
+	p.reapWG.Add(1)
+	go func() {
+		defer p.reapWG.Done()
+		p.reapLoop(workerCtx)
+	}()
+}
+
+func (p *Pool) reapLoop(ctx context.Context) {
+	ticker := time.NewTicker(p.reapInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.reapOnce(ctx)
+		}
+	}
+}
+
+func (p *Pool) reapOnce(ctx context.Context) {
+	if p.idleTimeout <= 0 {
+		return
+	}
+	now := time.Now()
+	var toClose []*entry
+	p.mu.Lock()
+	for _, e := range p.items {
+		if e.retired || e.refs > 0 {
+			continue
+		}
+		if now.Sub(e.lastUsed) > p.idleTimeout {
+			if removed := p.removeLocked(e.elem, "idle"); removed != nil {
+				toClose = append(toClose, removed)
+			}
+		}
+	}
+	cachedCount := len(p.items)
+	p.mu.Unlock()
+	for _, retired := range toClose {
+		closeEntry(retired)
+	}
+	metrics.RecordGauge("tenant_pool", "cached_backends", float64(cachedCount))
+}
+
 func (p *Pool) Close() {
+	// Stop the idle reaper first so it doesn't race with shutdown eviction.
+	if p.reapStop != nil {
+		p.reapStop()
+		p.reapWG.Wait()
+		p.reapStop = nil
+	}
 	toClose := make([]*entry, 0, p.order.Len())
 	p.mu.Lock()
 	for p.order.Len() > 0 {
