@@ -904,16 +904,18 @@ func TestIdleEvictionStartAutoEvictsAndCloseStops(t *testing.T) {
 
 	// Wait for the ticker-driven reaper to auto-evict (within ~2s).
 	deadline := time.Now().Add(2 * time.Second)
+	evicted := false
 	for time.Now().Before(deadline) {
 		pool.mu.Lock()
 		_, ok := pool.items[tenant.ID]
 		pool.mu.Unlock()
 		if !ok {
+			evicted = true
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if _, ok := pool.items[tenant.ID]; ok {
+	if !evicted {
 		t.Fatal("expected auto-eviction by ticker")
 	}
 	assertStoreClosed(t, store)

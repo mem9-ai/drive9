@@ -65,12 +65,21 @@ type PoolConfig struct {
 	// IsLeader() snapshot.
 	LeaderChecker LeaderChecker
 
-	// IdleTimeout controls how long a cached backend with no user traffic
-	// (Get/Acquire) can stay in the warm cache before the idle reaper evicts
-	// it. 0 disables idle eviction (LRU capacity eviction still applies).
-	// AcquireCached (safety-net scan etc.) does NOT refresh the idle timer —
-	// only real user traffic does, so periodic internal scans cannot keep a
-	// tenant warm forever.
+	// IdleTimeout controls how long a cached backend can stay in the warm
+	// cache without any activity before the idle reaper evicts it. 0
+	// disables idle eviction (LRU capacity eviction still applies).
+	//
+	// "Activity" means any access through Get, Acquire, or S3Backend —
+	// including foreground user requests (HTTP/FUSE), tenant-specific
+	// durable work driven by kicks (semantic/file_gc task processing), and
+	// object-GC candidate processing. These are all legitimate uses that
+	// should keep a tenant warm.
+	//
+	// AcquireCached (safety-net scan) does NOT refresh the idle timer on
+	// acquire or release, so warm-only periodic observation cannot keep an
+	// idle tenant warm forever. Object-GC may cold-open a tenant for a due
+	// candidate and intentionally keeps it warm for one idle-TTL window
+	// per due attempt.
 	IdleTimeout time.Duration
 
 	// IdleReapInterval is how often the idle reaper scans for idle backends.
@@ -214,7 +223,7 @@ type entry struct {
 	elem               *list.Element
 	refs               int
 	retired            bool
-	lastUsed           time.Time // updated only on Get/Acquire (user traffic), not AcquireCached
+	lastUsed           time.Time // refreshed by Get/Acquire/S3Backend (foreground + durable work) and on Acquire release; never by AcquireCached
 }
 
 func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
