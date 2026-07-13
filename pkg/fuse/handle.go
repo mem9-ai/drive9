@@ -63,6 +63,34 @@ func (fh *FileHandle) TryLock() bool { return fh.mu.TryLock() }
 // Unlock releases the file handle mutex.
 func (fh *FileHandle) Unlock() { fh.mu.Unlock() }
 
+// LockWithTimeout attempts to acquire the file handle mutex within the given
+// deadline. Returns true if the lock was acquired, false if the deadline
+// expired. This is used by FUSE Flush to avoid blocking the kernel's
+// close_range/filp_flush path forever when a debounced-flush callback or
+// background upload is holding fh.mu.
+func (fh *FileHandle) LockWithTimeout(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	backoff := 10 * time.Millisecond
+	const maxBackoff = 500 * time.Millisecond
+	for {
+		if fh.mu.TryLock() {
+			return true
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		sleep := backoff
+		if remaining < sleep {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+		if backoff < maxBackoff {
+			backoff *= 2
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // DirHandle / DirEntry
 // ---------------------------------------------------------------------------

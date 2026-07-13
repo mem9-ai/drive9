@@ -22,7 +22,8 @@ Each subdirectory is one auto-discovered module (`module.py`), optionally with a
 | `community.pyxattr` | compatibility | pyxattr-backed extended attribute checks. |
 | `community.vdbench` | performance | vdbench file workload (manual dependency). |
 
-The two LTP modules share one `module.py` (`community.ltp.fs` + `community.ltp.syscalls`).
+The two LTP modules each have their own `module.py` but share the LTP
+dependency logic (`ltp_fs/deps.py`, re-exported by `ltp_syscalls/deps.py`).
 
 ## Selection
 
@@ -62,7 +63,7 @@ PJDFSTEST_DIR=/path/to/pjdfstest
 PJDFSTEST_TESTS=/path/to/pjdfstest/tests
 PJDFSTEST_BIN=/path/to/pjdfstest
 PJDFSTEST_ALLOW_NONROOT=1          # pjdfstest normally requires root
-LTP_ROOT=/path/to/ltp              # installed tree with runltp, bin/ltp-pan, runtest/, testcases/bin/
+LTP_ROOT=/path/to/ltp              # installed tree with kirk (or runltp), runtest/, testcases/bin/
 LTP_INSTALL_ROOT=/path/to/ltp-install
 FIO_BIN=/path/to/fio
 MDTEST_BIN=/path/to/mdtest
@@ -75,10 +76,14 @@ Tunables read via the harness `env_value` helper accept a `BLACKBOX_` prefix
 (`BLACKBOX_LTP_REF` is equivalent to the documented base name):
 
 ```bash
-LTP_REF=20240129
-LTP_FS_CASES="openfile01 stream01 ftest01 lftest01 writetest01"
+LTP_REF=20260529
+LTP_RUNNER=kirk                     # kirk (default) or runltp
+LTP_FS_CASES="openfile01 stream01 ftest01 lftest01 writetest01"  # allow-list override
+LTP_FS_EXCLUDE="gf01 gf02 ... read_all_dev proc01"               # deny-list override
 LTP_SYSCALL_DIRS="access chmod chown close ..."
-LTP_SYSCALL_CASES="access01 chmod01 open01 write01 ..."
+LTP_SYSCALL_CASES="access01 chmod01 open01 write01 ..."          # allow-list override
+LTP_SYSCALL_EXCLUDE="alarm02 bind01 ..."                          # deny-list override
+LTP_SYSCALLS_SHARDS=3               # split syscalls into N shard files
 LTP_MAKE_JOBS=2
 LTP_BUILD_TIMEOUT_S=1800
 FIO_REF=fio-3.42
@@ -90,21 +95,40 @@ IOR_BUILD_TIMEOUT_S=1800
 SECFS_TEST_REF=master               # fsx fallback source
 ```
 
-`LTP_ROOT` must point to an installed LTP tree containing `runltp`,
-`bin/ltp-pan`, `runtest/`, and `testcases/bin/`. When LTP is auto-fetched, the
+`LTP_ROOT` must point to an installed LTP tree containing `kirk` (or `runltp`),
+`runtest/`, and `testcases/bin/`. When LTP is auto-fetched, the
 source checkout is kept under `<work-dir>/cache/tools/ltp/<ref>` and the runnable
 install tree under `<work-dir>/cache/tools/ltp-install/<ref>`.
 
-The auto-fetched LTP build intentionally does not build the full upstream tree.
-It prepares the required runtime tools, a bounded filesystem smoke scenario
-(`drive9-fs-smoke`), and a filesystem-oriented syscall subset
-(`drive9-syscalls-fs`). `community.ltp.fs` runs `drive9-fs-smoke` by default;
-set `LTP_FS_CASES` to choose a different bounded set, or
-`LTP_FS_SCENARIO=fs` for the full upstream filesystem scenario when `LTP_ROOT`
-points to a full installation. `community.ltp.syscalls` runs `drive9-syscalls-fs`
-by default; widen it with `LTP_SYSCALL_CASES` / `LTP_SYSCALL_DIRS`, or set
-`LTP_SYSCALLS_SCENARIO=syscalls` for full syscall coverage against a full LTP
-install.
+The auto-fetched LTP build (LTP `20260529`) uses the **kirk** runner by default
+(LTP's modern Python-based executor), not the legacy `runltp` wrapper. Set
+`LTP_RUNNER=runltp` to fall back to `runltp` if kirk is unavailable. The build
+fetches the `tools/kirk/kirk-src` submodule automatically so `make -C tools
+install` installs kirk into the tree.
+
+The fs and syscall test selections use **deny-lists** aligned with the
+[JuiceFS LTP CI](https://github.com/juicedata/juicefs/blob/main/.github/workflows/ltpfs.yml)
+intent — long-running tests (`growfiles`, `rwtest`, `iogen`, `fs_fill`,
+`fsx-linux`) and host-specific tests (`isofs`, `quota_remount`, `read_all_*`,
+`proc01`) are excluded. `lftest01` is retained (JuiceFS's `rm_list.sh` had a
+tokenisation bug that incidentally stripped it; we do not replicate that bug).
+`read_all_dev/proc/sys` and `proc01` are explicitly excluded because they read
+host `/dev`, `/proc`, `/sys` (not the FUSE mount) and `read_all_dev` can hang
+forever reading `/dev/fuse`.
+
+`community.ltp.fs` runs `drive9-fs-smoke` (deny-list from `runtest/fs`) by
+default; set `LTP_FS_CASES` to switch to an explicit allow-list for debugging,
+or `LTP_FS_SCENARIO=fs` for the full upstream filesystem scenario when
+`LTP_ROOT` points to a full installation. Default timeout: 1800s
+(`LTP_FS_TIMEOUT_S`).
+
+`community.ltp.syscalls` runs `drive9-syscalls-fs` (deny-list from
+`runtest/syscalls`, aligned with JuiceFS `rm_syscalls`) by default. The
+surviving tests are split into `LTP_SYSCALLS_SHARDS` (default 3) shard files
+(`drive9-syscalls-fs-0/1/2`), each run sequentially with its own 1800s timeout
+(`LTP_SYSCALLS_TIMEOUT_S`). Set `LTP_SYSCALL_CASES` to switch to an
+allow-list (no deny, no sharding), or `LTP_SYSCALLS_SCENARIO=syscalls` for full
+syscall coverage against a full LTP install.
 
 `community.fio` auto-fetches and builds fio when `fio` is not already available.
 `community.mdtest` auto-fetches and builds IOR/mdtest when `mdtest` is not
@@ -130,9 +154,7 @@ Linux requirements: `/dev/fuse` and `fusermount3` or `fusermount`.
    inline or via a `deps.py` in the module directory.
 4. Implement `run(ctx)` returning a small metrics/details dict; mount through
    `ctx.target.mount(...)` and always unmount in `finally`.
-5. Implement `run(ctx)` returning a small metrics/details dict; mount through
-   `ctx.target.mount(...)` and always unmount in `finally`.
-6. The module is auto-discovered — no registration step.
+5. The module is auto-discovered — no registration step.
 
 Keep module IDs stable; CI reports and dashboards can depend on them.
 
