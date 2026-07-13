@@ -158,31 +158,71 @@ func (d *flushDebouncer) CancelNoWait(path string) {
 }
 
 // FlushAll executes all pending uploads immediately and clears the pending map.
-// Used during graceful shutdown. It waits for any callbacks that were already
-// in-flight when called to finish, avoiding a concurrent map iteration/write.
+// Used during graceful shutdown. It preserves the same per-path serialization
+// contract as runCallback: a pending callback for a path does not start until
+// any already-in-flight callback for the same path has finished. This prevents
+// two same-path callbacks from running concurrently via the shutdown path.
 func (d *flushDebouncer) FlushAll() {
 	d.mu.Lock()
-	// Snapshot pending entries and clear the map under the lock.
-	pending := make([]*pendingFlush, 0, len(d.pending))
-	for _, pf := range d.pending {
-		pending = append(pending, pf)
+	// Snapshot pending entries (with their paths) and clear the map under the
+	// lock so timer callbacks cannot mutate the map during iteration.
+	type pendingEntry struct {
+		path string
+		pf   *pendingFlush
+	}
+	pending := make([]pendingEntry, 0, len(d.pending))
+	for path, pf := range d.pending {
+		pending = append(pending, pendingEntry{path: path, pf: pf})
 	}
 	d.pending = make(map[string]*pendingFlush)
-	// Snapshot inflight pointers under the lock so the range below does not
-	// race with timer callbacks that delete from d.inflight concurrently.
+	d.mu.Unlock()
+
+	// Stop all pending timers — we run the callbacks directly below.
+	for _, e := range pending {
+		e.pf.timer.Stop()
+	}
+
+	for _, e := range pending {
+		path := e.path
+		pf := e.pf
+
+		// Wait for any in-flight callback for the same path before running
+		// pf, preserving the at-most-one-per-path contract. This also handles
+		// the case where a timer callback started before FlushAll acquired the
+		// lock and is still executing.
+		for {
+			d.mu.Lock()
+			running, rok := d.inflight[path]
+			if !rok {
+				// No inflight for this path — promote pf and run it.
+				d.inflight[path] = pf
+				d.mu.Unlock()
+				break
+			}
+			d.mu.Unlock()
+			<-running.done
+		}
+
+		if pf.uploadFn != nil {
+			pf.uploadFn()
+		}
+
+		d.mu.Lock()
+		if d.inflight[path] == pf {
+			delete(d.inflight, path)
+		}
+		d.mu.Unlock()
+		pf.finish()
+	}
+
+	// Wait for any remaining inflight callbacks that were running before
+	// FlushAll was called (for paths not in the pending set).
+	d.mu.Lock()
 	inflight := make([]*pendingFlush, 0, len(d.inflight))
 	for _, pf := range d.inflight {
 		inflight = append(inflight, pf)
 	}
 	d.mu.Unlock()
-
-	for _, pf := range pending {
-		pf.timer.Stop()
-		if pf.uploadFn != nil {
-			pf.uploadFn()
-		}
-		pf.finish()
-	}
 
 	for _, pf := range inflight {
 		<-pf.done
