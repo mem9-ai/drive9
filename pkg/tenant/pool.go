@@ -868,8 +868,9 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 					// Version-matched opens trust this durable value and skip the
 					// physical diff by default; out-of-band schema drift is detected
 					// only when the target schema version changes, or through an
-					// explicit validation/repair path. SkipTiDBSchemaCheck remains
-					// the opt-out for externally managed schemas.
+					// explicit validation/repair path. SkipTiDBSchemaCheck disables
+					// the Acquire-time TiDB schema ensure/check entirely, mainly for
+					// tests that use a TiDB-class provider against plain MySQL.
 					updateSchemaVersionStart := time.Now()
 					if verErr := p.metaStore.UpdateTenantSchemaVersion(ctx, t.ID, targetSchemaVersion); verErr != nil {
 						recordTenantSchemaVersionUpdateFailure(ctx, t.ID, targetSchemaVersion, time.Since(updateSchemaVersionStart), verErr)
