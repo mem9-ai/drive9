@@ -16,7 +16,7 @@ const (
 	defaultUserConnMaxLifetime       = 30 * time.Second
 	defaultUserConnMaxIdleTime       = 30 * time.Second
 	defaultUserMaxOpenConns          = 6
-	defaultUserMaxIdleConns          = 2
+	defaultUserMaxIdleConns          = 0
 	defaultUserSchemaConnMaxLifetime = 1 * time.Minute
 	defaultUserSchemaConnMaxIdleTime = 10 * time.Second
 	defaultUserSchemaMaxOpenConns    = 8

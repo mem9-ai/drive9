@@ -534,7 +534,7 @@ environment:
   DRIVE9_META_DB_MAX_OPEN_CONNS max open connections for the per-pod meta DB pool (default: 100)
   DRIVE9_META_DB_MAX_IDLE_CONNS max idle connections for the per-pod meta DB pool (default: 20)
   DRIVE9_USER_DB_MAX_OPEN_CONNS max open connections for each cached tenant user DB pool (default: 6)
-  DRIVE9_USER_DB_MAX_IDLE_CONNS max idle connections for each cached tenant user DB pool (default: 2)
+  DRIVE9_USER_DB_MAX_IDLE_CONNS max idle connections for each cached tenant user DB pool (default: 0)
   DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS max open connections for tenant schema-init DB pools (default: 8)
   DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS max idle connections for tenant schema-init DB pools (default: 0)
   DRIVE9_DB_HEALTH_PROBE_INTERVAL_SECONDS DB health probe interval seconds (default: 15)
