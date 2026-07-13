@@ -5346,6 +5346,7 @@ func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN, provider string, schemaInit func(context.Context, string) error) {
 	ctx = ensureTrace(ctx)
+	ctx = tenantschema.WithTenantID(ctx, tenantID)
 	ctx = logger.WithContext(ctx, logger.FromContext(ctx).With(
 		zap.String("tenant_id", tenantID),
 		zap.String("provider", provider),
