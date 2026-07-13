@@ -131,15 +131,14 @@ type TenantStoreEntry struct {
 }
 
 type Pool struct {
-	mu                        sync.Mutex
-	cfg                       PoolConfig
-	enc                       encrypt.Encryptor
-	metaStore                 *meta.Store // central server DB for quota operations; nil disables central quota
-	items                     map[string]*entry
-	order                     *list.List
-	maxSize                   int
-	tidbSchemaValidationOpens atomic.Uint64
-	tenantWorkNotifier        atomic.Pointer[func(tenantID string, workMask int)]
+	mu                 sync.Mutex
+	cfg                PoolConfig
+	enc                encrypt.Encryptor
+	metaStore          *meta.Store // central server DB for quota operations; nil disables central quota
+	items              map[string]*entry
+	order              *list.List
+	maxSize            int
+	tenantWorkNotifier atomic.Pointer[func(tenantID string, workMask int)]
 	// fileGCEnabled is retained for backward compatibility but no longer used:
 	// FileGC is now kick-driven through the unified tenant worker, not a
 	// per-backend goroutine.
@@ -158,19 +157,12 @@ type tenantAutoEmbeddingProfile struct {
 }
 
 var (
-	applyTiDBAutoEmbeddingProviderConfig      = schema.ApplyTiDBAutoEmbeddingProviderConfig
-	ensureTiDBSchemaForAutoEmbeddingProfile   = schema.EnsureTiDBSchemaForAutoEmbeddingProfile
-	validateTiDBSchemaForAutoEmbeddingProfile = schema.ValidateTiDBSchemaForAutoEmbeddingProfile
-	ensureTiDBSchemaForFTSOnlyProfile         = schema.EnsureTiDBSchemaForFTSOnlyProfile
-	validateTiDBSchemaForFTSOnlyProfile       = schema.ValidateTiDBSchemaForFTSOnlyProfile
-	// Version-matched tenant opens trust the durable tenant schema_version by
-	// default. Set this non-zero in targeted tests or emergency builds to sample
-	// out-of-band schema drift without putting a full schema diff on every cold
-	// tenant open.
-	periodicTiDBSchemaValidationEvery uint64 = 0
-	defaultTenantPoolDrainTimeout            = 30 * time.Second
-	defaultTenantPoolMaxTenants              = 1024
-	defaultTenantPoolIdleReapInterval        = 5 * time.Minute
+	applyTiDBAutoEmbeddingProviderConfig    = schema.ApplyTiDBAutoEmbeddingProviderConfig
+	ensureTiDBSchemaForAutoEmbeddingProfile = schema.EnsureTiDBSchemaForAutoEmbeddingProfile
+	ensureTiDBSchemaForFTSOnlyProfile       = schema.EnsureTiDBSchemaForFTSOnlyProfile
+	defaultTenantPoolDrainTimeout           = 30 * time.Second
+	defaultTenantPoolMaxTenants             = 1024
+	defaultTenantPoolIdleReapInterval       = 5 * time.Minute
 )
 
 func tenantSchemaVersionForEmbeddingMode(mode string, profile schema.TiDBAutoEmbeddingProfile) (int, error) {
@@ -193,21 +185,6 @@ func ensureTiDBSchemaForEmbeddingMode(ctx context.Context, db *sql.DB, mode stri
 		return ensureTiDBSchemaForFTSOnlyProfile(ctx, db, profile)
 	default:
 		return schema.EnsureTiDBSchemaForEmbeddingModeProfile(ctx, db, tidbMode, profile)
-	}
-}
-
-func validateTiDBSchemaForEmbeddingMode(ctx context.Context, db *sql.DB, mode string, profile schema.TiDBAutoEmbeddingProfile) error {
-	tidbMode, err := TiDBEmbeddingModeForTenantMode(mode)
-	if err != nil {
-		return err
-	}
-	switch tidbMode {
-	case schema.TiDBEmbeddingModeAuto:
-		return validateTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile)
-	case schema.TiDBEmbeddingModeFTSOnly:
-		return validateTiDBSchemaForFTSOnlyProfile(ctx, db, profile)
-	default:
-		return schema.ValidateTiDBSchemaForEmbeddingModeProfile(ctx, db, tidbMode, profile)
 	}
 }
 
@@ -238,11 +215,11 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 		reapInterval = defaultTenantPoolIdleReapInterval
 	}
 	return &Pool{
-		cfg:          cfg,
-		enc:          enc,
-		items:        map[string]*entry{},
-		order:        list.New(),
-		maxSize:      max,
+		cfg:     cfg,
+		enc:     enc,
+		items:   map[string]*entry{},
+		order:   list.New(),
+		maxSize: max,
 		// No LeaderChecker means single-pod mode: FileGC runs unconditionally.
 		fileGCEnabled: cfg.LeaderChecker == nil,
 		idleTimeout:   idleTimeout,
@@ -896,13 +873,6 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 						recordTenantSchemaVersionUpdateFailure(ctx, t.ID, targetSchemaVersion, time.Since(updateSchemaVersionStart), verErr)
 					}
 				}
-			} else if p.shouldPeriodicValidateTiDBSchemaOnOpen() {
-				validateSchemaStart := time.Now()
-				if err := validateTiDBSchemaForEmbeddingMode(ctx, store.DB(), autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile); err != nil {
-					_ = store.Close()
-					return nil, nil, fmt.Errorf("validate tidb embedding schema: %w", err)
-				}
-				ensureSchemaDurationMs += float64(time.Since(validateSchemaStart).Microseconds()) / 1000.0
 			}
 			if autoEmbeddingProfile.modeWasNull && p.metaStore != nil {
 				if _, modeErr := p.metaStore.SetTenantAutoEmbeddingProfileModeIfNull(ctx, t.ID, autoEmbeddingProfile.mode); modeErr != nil {
@@ -1103,18 +1073,6 @@ func defaultTenantAutoEmbeddingProfile() (tenantAutoEmbeddingProfile, error) {
 			Model: schemaProfile.Model,
 		},
 	}, nil
-}
-
-func (p *Pool) shouldPeriodicValidateTiDBSchemaOnOpen() bool {
-	if p == nil {
-		return false
-	}
-	every := periodicTiDBSchemaValidationEvery
-	if every == 0 {
-		return false
-	}
-	count := p.tidbSchemaValidationOpens.Add(1)
-	return count == 1 || count%every == 0
 }
 
 func recordTenantSchemaVersionUpdateFailure(ctx context.Context, tenantID string, version int, d time.Duration, err error) {
