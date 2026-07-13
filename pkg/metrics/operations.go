@@ -117,25 +117,23 @@ func RecordTenantOperation(tenantID, component, operation, result string, d time
 	result = cleanMetricValue(result, "unknown")
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	RegisterModule(component)
-	counterAttrs := []Attribute{
+	baseAttrs := [4]Attribute{
 		Attr("component", component),
 		Attr("operation", operation),
 		Attr("result", result),
 	}
+	counterAttrs := baseAttrs[:3]
 	if tenantID != "unknown" {
-		counterAttrs = append(counterAttrs, Attr("tenant_id", tenantID))
+		baseAttrs[3] = Attr("tenant_id", tenantID)
+		counterAttrs = baseAttrs[:4]
 	}
 	serviceOperationsTotal.Add(1, counterAttrs...)
 	if d <= 0 {
 		return
 	}
-	durationAttrs := []Attribute{
-		Attr("component", component),
-		Attr("operation", operation),
-		Attr("result", result),
-	}
+	durationAttrs := baseAttrs[:3]
 	if tenantID != "unknown" && serviceOperationDurationIncludesTenant(component) {
-		durationAttrs = append(durationAttrs, Attr("tenant_id", tenantID))
+		durationAttrs = baseAttrs[:4]
 	}
 	serviceOperationDuration.Observe(d.Seconds(), durationAttrs...)
 }
