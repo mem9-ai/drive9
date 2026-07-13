@@ -164,6 +164,25 @@ func (idx *PendingIndex) Remove(remotePath string) {
 	_ = os.Remove(metaPath)
 }
 
+// RemoveIfGeneration atomically checks that the current generation matches
+// expectedGen before removing the entry. Returns true if the entry was
+// removed. This prevents a stale upload from removing a fresher pending entry
+// that was created (via a newer Put) while the old upload was in flight.
+func (idx *PendingIndex) RemoveIfGeneration(remotePath string, expectedGen uint64) bool {
+	idx.mu.Lock()
+	meta, ok := idx.items[remotePath]
+	if !ok || meta.Generation != expectedGen {
+		idx.mu.Unlock()
+		return false
+	}
+	delete(idx.items, remotePath)
+	idx.mu.Unlock()
+
+	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
+	_ = os.Remove(metaPath)
+	return true
+}
+
 // Generation returns the current generation for a path, or 0 if not found.
 func (idx *PendingIndex) Generation(remotePath string) uint64 {
 	idx.mu.RLock()

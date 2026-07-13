@@ -2476,6 +2476,374 @@ func TestFlushDebouncer_IndependentPaths(t *testing.T) {
 	}
 }
 
+// TestFlushDebouncer_CancelWaitsForRunningCallback verifies that Cancel blocks
+// until a running uploadFn finishes. This is critical for Unlink correctness:
+// the callback may be cleaning up pendingIndex, and Unlink must not read
+// pendingIndex until the cleanup is done.
+func TestFlushDebouncer_CancelWaitsForRunningCallback(t *testing.T) {
+	d := newFlushDebouncer(20 * time.Millisecond)
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	var finished atomic.Bool
+	d.Schedule("/a", func() {
+		close(started)
+		<-finish // block until test signals
+		finished.Store(true)
+	})
+
+	// Wait for the callback to start running.
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback did not start within 2s")
+	}
+
+	// Cancel should block because the callback is still running.
+	cancelDone := make(chan struct{})
+	go func() {
+		d.Cancel("/a")
+		close(cancelDone)
+	}()
+
+	select {
+	case <-cancelDone:
+		t.Fatal("Cancel returned before callback finished")
+	case <-time.After(100 * time.Millisecond):
+		// Good — Cancel is still blocked.
+	}
+
+	// Let the callback finish.
+	close(finish)
+
+	select {
+	case <-cancelDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cancel did not return after callback finished")
+	}
+	if !finished.Load() {
+		t.Fatal("callback did not finish")
+	}
+}
+
+// TestFlushDebouncer_CancelAfterCallbackSelfDeletes verifies that Cancel does
+// not deadlock when the timer callback has already removed the pending entry
+// and is still running uploadFn. Cancel should detect the inflight entry and
+// wait for it.
+func TestFlushDebouncer_CancelAfterCallbackSelfDeletes(t *testing.T) {
+	d := newFlushDebouncer(20 * time.Millisecond)
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(started)
+		<-finish
+	})
+
+	// Wait for the callback to start (entry self-deleted from pending, now inflight).
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback did not start within 2s")
+	}
+
+	// Cancel should block (callback inflight) then return once it finishes.
+	cancelDone := make(chan struct{})
+	go func() {
+		d.Cancel("/a")
+		close(cancelDone)
+	}()
+
+	select {
+	case <-cancelDone:
+		t.Fatal("Cancel returned before callback finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(finish)
+
+	select {
+	case <-cancelDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cancel did not return after callback finished")
+	}
+}
+
+// TestFlushDebouncer_ScheduleReplacesWhileCallbackRunning verifies no
+// panic/deadlock when Schedule replaces a pending entry while the previous
+// callback is still running.
+func TestFlushDebouncer_ScheduleReplacesWhileCallbackRunning(t *testing.T) {
+	d := newFlushDebouncer(20 * time.Millisecond)
+	firstStarted := make(chan struct{})
+	firstFinish := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(firstStarted)
+		<-firstFinish
+	})
+
+	// Wait for the first callback to start.
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first callback did not start")
+	}
+
+	// Schedule a replacement while the first callback is running.
+	secondDone := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(secondDone)
+	})
+
+	// Let the first callback finish.
+	close(firstFinish)
+
+	// The replacement's timer (20ms) should fire and run the second callback.
+	select {
+	case <-secondDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second callback did not fire within 2s")
+	}
+
+	// Cancel should return without deadlock (no pending or inflight).
+	d.Cancel("/a")
+}
+
+// TestFlushDebouncer_CancelNoWaitDoesNotBlock verifies that CancelNoWait
+// returns immediately even when a callback is running.
+func TestFlushDebouncer_CancelNoWaitDoesNotBlock(t *testing.T) {
+	d := newFlushDebouncer(20 * time.Millisecond)
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(started)
+		<-finish
+	})
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback did not start")
+	}
+
+	// CancelNoWait must return immediately despite the running callback.
+	done := make(chan struct{})
+	go func() {
+		d.CancelNoWait("/a")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("CancelNoWait blocked while callback was running")
+	}
+
+	close(finish)
+}
+
+// TestFlushDebouncer_SamePathNoDoubleInflight verifies that when callback A
+// is already running for a path, a new Schedule for the same path does not
+// cause a second callback to run concurrently. The new callback must wait for
+// the in-flight one to finish first. This is the race qiffang identified: a
+// second Schedule could overwrite inflight[path], and Cancel would return
+// while the second callback was still running.
+func TestFlushDebouncer_SamePathNoDoubleInflight(t *testing.T) {
+	d := newFlushDebouncer(20 * time.Millisecond)
+	aStarted := make(chan struct{})
+	aFinish := make(chan struct{})
+	var concurrent atomic.Int32
+
+	d.Schedule("/a", func() {
+		close(aStarted)
+		<-aFinish
+	})
+
+	// Wait for callback A to start (it's now in-flight).
+	select {
+	case <-aStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback A did not start")
+	}
+
+	// Schedule B while A is still running.
+	bDone := make(chan struct{})
+	d.Schedule("/a", func() {
+		if concurrent.Add(1) > 1 {
+			close(bDone)
+			t.Fatal("two callbacks ran concurrently")
+		}
+		concurrent.Add(-1)
+		close(bDone)
+	})
+
+	// Let A finish. B's timer fires after, and must wait for A's inflight to
+	// drain before running.
+	close(aFinish)
+
+	select {
+	case <-bDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback B did not run within 2s")
+	}
+
+	// Cancel must not return while any callback is still running. After both
+	// finish, Cancel returns immediately.
+	d.Cancel("/a")
+}
+
+// TestFlushDebouncer_StaleTimerDoesNotRunNewerEntry verifies that a stale timer
+// (from a superseded Schedule) does not act on the newer pending entry. When
+// Schedule replaces a pending entry, the old timer must detect it is stale and
+// skip, leaving only the new entry's callback to fire.
+func TestFlushDebouncer_StaleTimerDoesNotRunNewerEntry(t *testing.T) {
+	d := newFlushDebouncer(50 * time.Millisecond)
+	var firstRan, secondRan atomic.Bool
+
+	// Schedule first, then immediately replace it. The first timer is stale.
+	d.Schedule("/a", func() { firstRan.Store(true) })
+	// Replace before the first timer fires.
+	d.Schedule("/a", func() { secondRan.Store(true) })
+
+	// Wait long enough for both timers to have fired.
+	time.Sleep(200 * time.Millisecond)
+
+	if firstRan.Load() {
+		t.Fatal("stale (superseded) callback should not have run")
+	}
+	if !secondRan.Load() {
+		t.Fatal("latest callback should have run")
+	}
+}
+
+// TestFlushDebouncer_FlushAllNoMapRace verifies FlushAll does not panic with
+// concurrent map iteration/write when timer callbacks delete from inflight
+// concurrently. It also verifies that a pending callback for the same path as
+// an in-flight callback does not start until the in-flight one finishes.
+// This is a race test — run with -race to catch the bug.
+func TestFlushDebouncer_FlushAllNoMapRace(t *testing.T) {
+	d := newFlushDebouncer(10 * time.Millisecond)
+
+	// Start a callback that blocks so it is in-flight when FlushAll runs.
+	aStarted := make(chan struct{})
+	aFinish := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(aStarted)
+		<-aFinish
+	})
+
+	// Wait for A to be in-flight.
+	select {
+	case <-aStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback A did not start")
+	}
+
+	// Schedule B (pending, not yet fired) for the same path while A is running.
+	bRan := make(chan struct{})
+	bStarted := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(bStarted)
+		<-bRan
+	})
+
+	// Call FlushAll while A is still running. FlushAll should not run B until
+	// A has finished (same-path serialization).
+	flushDone := make(chan struct{})
+	go func() {
+		d.FlushAll()
+		close(flushDone)
+	}()
+
+	// B must NOT start while A is still running.
+	select {
+	case <-bStarted:
+		t.Fatal("FlushAll ran pending same-path callback while the older callback was still inflight")
+	case <-time.After(100 * time.Millisecond):
+		// Good — B is correctly waiting for A to finish.
+	}
+
+	// Let A finish. Now B should be allowed to start.
+	close(aFinish)
+
+	select {
+	case <-bStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("FlushAll did not run pending callback B after A finished")
+	}
+
+	// Let B finish so FlushAll can complete.
+	close(bRan)
+
+	select {
+	case <-flushDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("FlushAll did not complete")
+	}
+}
+
+// TestFlushDebouncer_FlushAllWaitsForInflightSamePath verifies that FlushAll
+// preserves the per-path inflight serialization: if A is inflight for /a and B
+// is pending for /a, FlushAll must not start B until A has completed. This is
+// the regression qiffang requested.
+func TestFlushDebouncer_FlushAllWaitsForInflightSamePath(t *testing.T) {
+	d := newFlushDebouncer(20 * time.Millisecond)
+
+	aStarted := make(chan struct{})
+	aFinish := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(aStarted)
+		<-aFinish
+	})
+
+	// Wait for A to be in-flight.
+	select {
+	case <-aStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback A did not start")
+	}
+
+	// Schedule B for the same path while A is running.
+	bStarted := make(chan struct{})
+	bDone := make(chan struct{})
+	d.Schedule("/a", func() {
+		close(bStarted)
+		close(bDone)
+	})
+
+	// Call FlushAll while A is still running.
+	flushDone := make(chan struct{})
+	go func() {
+		d.FlushAll()
+		close(flushDone)
+	}()
+
+	// B must NOT start while A is still running.
+	select {
+	case <-bStarted:
+		t.Fatal("FlushAll ran pending same-path callback while an older callback was still inflight")
+	case <-time.After(100 * time.Millisecond):
+		// Good — B is waiting for A.
+	}
+
+	// Let A finish. B should now start.
+	close(aFinish)
+
+	select {
+	case <-bStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback B did not start after A finished")
+	}
+
+	// Wait for B to finish and FlushAll to complete.
+	select {
+	case <-bDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback B did not finish")
+	}
+	select {
+	case <-flushDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("FlushAll did not complete")
+	}
+}
+
 func TestInodeToPath_UpdateMtime(t *testing.T) {
 	m := NewInodeToPath()
 	ino := m.Lookup("/f", false, 10, time.Now())

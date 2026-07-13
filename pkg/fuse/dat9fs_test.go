@@ -16427,13 +16427,13 @@ func TestFlushHandle_Path2_DebounceCancelledBeforeUnlock(t *testing.T) {
 //
 // Interleaving under test:
 //
-//	1. Hold fh.Lock() → schedule debounce (short delay) → keep lock held
-//	2. Timer fires → callback blocks on handle.Lock() (we hold it)
-//	3. Call flushHandle (Path 2) while holding lock — Path 2 internally
-//	   releases fh.mu, uploads, records committed revision, releases
-//	   remoteCommitLock, reacquires fh.mu, returns
-//	4. fh.Unlock() → callback acquires handle.Lock() → acquires
-//	   remoteCommitLock → re-checks expectedRevision → skip (no double PUT)
+//  1. Hold fh.Lock() → schedule debounce (short delay) → keep lock held
+//  2. Timer fires → callback blocks on handle.Lock() (we hold it)
+//  3. Call flushHandle (Path 2) while holding lock — Path 2 internally
+//     releases fh.mu, uploads, records committed revision, releases
+//     remoteCommitLock, reacquires fh.mu, returns
+//  4. fh.Unlock() → callback acquires handle.Lock() → acquires
+//     remoteCommitLock → re-checks expectedRevision → skip (no double PUT)
 func TestFlushHandle_Path2_DebounceAlreadyFiredSkipsUpload(t *testing.T) {
 	var uploadCount atomic.Int32
 
@@ -21634,5 +21634,435 @@ func TestLookupParsesModeHeaderDir(t *testing.T) {
 	}
 	if entry.Mode != 0o700 {
 		t.Errorf("inode mode = %o, want 0o700", entry.Mode)
+	}
+}
+
+// TestOnWriteBackUploadSuccessRemovesPendingIndex verifies that the legacy
+// uploader's success callback cleans up the pendingIndex entry. Without this
+// cleanup, Unlink's pendingIndex re-check (dat9fs.go:7770) sees a stale
+// PendingNew and skips the remote DELETE, leaving orphan files on the server
+// and causing rmdir to fail with ENOTEMPTY.
+func TestOnWriteBackUploadSuccessRemovesPendingIndex(t *testing.T) {
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.pendingIndex = pending
+	fs.shadowStore = shadow
+
+	// Simulate a PendingNew file staged by the write-back fast path.
+	if _, err := pending.PutWithBaseRev("/dir/file.txt", 10, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/dir/file.txt", []byte("hello"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify entries exist before the callback.
+	if _, ok := pending.GetMeta("/dir/file.txt"); !ok {
+		t.Fatal("pendingIndex should have the entry before upload success")
+	}
+	if !shadow.Has("/dir/file.txt") {
+		t.Fatal("shadowStore should have the entry before upload success")
+	}
+
+	// Capture the staging generations (as the uploader would) so the cleanup is
+	// generation-guarded. With no concurrent write, these match and the entries
+	// are removed.
+	gens := fs.snapshotStagingGens("/dir/file.txt")
+
+	// Simulate the legacy uploader's success callback.
+	fs.onWriteBackUploadSuccess(WriteBackMeta{
+		Path: "/dir/file.txt",
+		Size: 10,
+		Kind: PendingNew,
+	}, 5, gens)
+
+	// The pendingIndex entry should be removed so Unlink sees no stale PendingNew.
+	if _, ok := pending.GetMeta("/dir/file.txt"); ok {
+		t.Fatal("pendingIndex should be removed after onWriteBackUploadSuccess")
+	}
+	// The shadowStore entry should also be removed.
+	if shadow.Has("/dir/file.txt") {
+		t.Fatal("shadowStore should be removed after onWriteBackUploadSuccess")
+	}
+}
+
+// TestOnWriteBackUploadSuccessNoPendingIndexDoesNotPanic verifies the callback
+// is safe when pendingIndex/shadowStore are nil (e.g. configs without staging).
+func TestOnWriteBackUploadSuccessNoPendingIndexDoesNotPanic(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	// No pendingIndex, no shadowStore set. Zero-value gens — no cleanup, no panic.
+	fs.onWriteBackUploadSuccess(WriteBackMeta{
+		Path: "/dir/file.txt",
+		Size: 10,
+		Kind: PendingNew,
+	}, 5, StagingGens{})
+}
+
+// TestDebouncedFlushRemovesPendingIndexAfterUpload verifies that the debounced
+// flush callback removes the pendingIndex and shadowStore entries after a
+// successful upload. Without this, Unlink's pendingIndex re-check sees a stale
+// PendingNew and skips the remote DELETE.
+func TestDebouncedFlushRemovesPendingIndexAfterUpload(t *testing.T) {
+	var uploadSuccess atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+			w.Header().Set("Content-Length", "5")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "0")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+			uploadSuccess.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","revision":7}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 50 * time.Millisecond}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024 * 1024) // large threshold so file is "small"
+	fs := NewDat9FS(c, opts)
+	fs.debouncer = newFlushDebouncer(50 * time.Millisecond)
+
+	writeBack, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.writeBack = writeBack
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.pendingIndex = pending
+
+	filePath := "/file.txt"
+	data := []byte("hello")
+	ino := fs.inodes.Lookup(filePath, false, int64(len(data)), time.Now())
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		IsNew:    true,
+		OrigSize: 0,
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.allocateFileHandle(fh)
+
+	// Stage a pendingIndex + shadowStore + writeBack entry as the write-back
+	// fast path would.
+	if _, err := pending.PutWithBaseRev(filePath, int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(filePath, data, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeBack.PutWithBaseRev(filePath, data, int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Trigger the debounced flush (force=false so it goes through the debounce path).
+	fh.Lock()
+	flushSt := fs.flushHandleDebounced(context.Background(), fh, false)
+	fh.Unlock()
+	if flushSt != gofuse.OK {
+		t.Fatalf("flushHandleDebounced status = %v, want OK", flushSt)
+	}
+
+	// Wait for the debounced callback to fire and upload.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if uploadSuccess.Load() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if uploadSuccess.Load() == 0 {
+		t.Fatal("debounced upload did not complete within 5s")
+	}
+
+	// Give the callback a moment to finish post-upload cleanup.
+	time.Sleep(50 * time.Millisecond)
+
+	// The pendingIndex entry should be removed.
+	if _, ok := pending.GetMeta(filePath); ok {
+		t.Fatal("pendingIndex should be removed after debounced upload")
+	}
+	// The shadowStore entry should be removed.
+	if shadow.Has(filePath) {
+		t.Fatal("shadowStore should be removed after debounced upload")
+	}
+}
+
+// TestOnWriteBackUploadSuccessStaleUploadPreservesNewerPending verifies that a
+// stale upload's OnSuccess callback does NOT remove pendingIndex/shadowStore
+// entries that were created by a newer same-path write while the upload was in
+// flight. The generation guard (StagingGens) must prevent the stale cleanup from
+// deleting the fresher N+1 state.
+func TestOnWriteBackUploadSuccessStaleUploadPreservesNewerPending(t *testing.T) {
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.pendingIndex = pending
+	fs.shadowStore = shadow
+
+	// Stage the original entry (generation N).
+	if _, err := pending.PutWithBaseRev("/dir/file.txt", 10, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/dir/file.txt", []byte("hello"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot the original generations (as the uploader would at upload start).
+	gens := fs.snapshotStagingGens("/dir/file.txt")
+
+	// Simulate a concurrent same-path write creating a newer entry (generation N+1).
+	if _, err := pending.PutWithBaseRev("/dir/file.txt", 20, PendingNew, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/dir/file.txt", []byte("newer data here!"), 5); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stale upload's OnSuccess fires with the OLD gens. The generation guard
+	// must prevent removal of the newer N+1 entries.
+	fs.onWriteBackUploadSuccess(WriteBackMeta{
+		Path: "/dir/file.txt",
+		Size: 10,
+		Kind: PendingNew,
+	}, 5, gens)
+
+	// The newer pendingIndex entry must survive.
+	meta, ok := pending.GetMeta("/dir/file.txt")
+	if !ok {
+		t.Fatal("pendingIndex entry should survive stale upload cleanup")
+	}
+	if meta.Size != 20 {
+		t.Fatalf("pendingIndex size = %d, want 20 (newer entry preserved)", meta.Size)
+	}
+	// The newer shadowStore entry must survive.
+	if !shadow.Has("/dir/file.txt") {
+		t.Fatal("shadowStore entry should survive stale upload cleanup")
+	}
+}
+
+// TestDebouncedFlushStaleUploadPreservesNewerPending verifies that the debounced
+// flush callback does NOT remove pendingIndex/shadowStore/writeBack entries
+// that were created by a newer same-path write while the debounce was in flight.
+func TestDebouncedFlushStaleUploadPreservesNewerPending(t *testing.T) {
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	writeBack, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.pendingIndex = pending
+	fs.shadowStore = shadow
+	fs.writeBack = writeBack
+
+	// Stage the original entry (generation N).
+	if _, err := pending.PutWithBaseRev("/dir/file.txt", 10, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/dir/file.txt", []byte("hello"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeBack.PutWithBaseRev("/dir/file.txt", []byte("hello"), 10, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot the original generations (as the debounce would at Schedule time).
+	gens := fs.snapshotStagingGens("/dir/file.txt")
+
+	// Simulate a concurrent same-path write creating newer entries (generation N+1).
+	if _, err := pending.PutWithBaseRev("/dir/file.txt", 20, PendingNew, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/dir/file.txt", []byte("newer data here!"), 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeBack.PutWithBaseRev("/dir/file.txt", []byte("newer data here!"), 20, PendingNew, 5); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the stale debounced callback's cleanup with the OLD gens. The
+	// generation guards must prevent removal of the newer N+1 entries.
+	if writeBack != nil && gens.WriteBackGen != 0 {
+		writeBack.RemoveIfGeneration("/dir/file.txt", gens.WriteBackGen)
+	}
+	if pending != nil && gens.PendingIndexGen != 0 {
+		pending.RemoveIfGeneration("/dir/file.txt", gens.PendingIndexGen)
+	}
+	if shadow != nil && gens.ShadowGen != 0 {
+		shadow.RemoveIfGeneration("/dir/file.txt", gens.ShadowGen)
+	}
+
+	// The newer pendingIndex entry must survive.
+	meta, ok := pending.GetMeta("/dir/file.txt")
+	if !ok {
+		t.Fatal("pendingIndex entry should survive stale debounced cleanup")
+	}
+	if meta.Size != 20 {
+		t.Fatalf("pendingIndex size = %d, want 20 (newer entry preserved)", meta.Size)
+	}
+	// The newer shadowStore entry must survive.
+	if !shadow.Has("/dir/file.txt") {
+		t.Fatal("shadowStore entry should survive stale debounced cleanup")
+	}
+	// The newer writeBack entry must survive.
+	if _, ok := writeBack.GetMeta("/dir/file.txt"); !ok {
+		t.Fatal("writeBack entry should survive stale debounced cleanup")
+	}
+}
+
+// TestShadowStoreRemoveIfGeneration verifies the shadow content-generation
+// guard: a stale generation does not remove the entry, while the matching
+// generation does.
+func TestShadowStoreRemoveIfGeneration(t *testing.T) {
+	s, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := "/file.txt"
+	if err := s.WriteFull(p, []byte("first"), 0); err != nil {
+		t.Fatal(err)
+	}
+	gen := s.ActiveGeneration(p)
+	if gen == 0 {
+		t.Fatal("expected nonzero generation after WriteFull")
+	}
+
+	// Stale generation must NOT remove.
+	if s.RemoveIfGeneration(p, gen+999) {
+		t.Fatal("RemoveIfGeneration should return false for stale generation")
+	}
+	if !s.Has(p) {
+		t.Fatal("shadow should survive stale RemoveIfGeneration")
+	}
+
+	// A newer write bumps the generation.
+	if err := s.WriteFull(p, []byte("second version"), 0); err != nil {
+		t.Fatal(err)
+	}
+	newGen := s.ActiveGeneration(p)
+	if newGen == gen {
+		t.Fatal("expected generation to bump after second WriteFull")
+	}
+
+	// Old generation must NOT remove the newer entry.
+	if s.RemoveIfGeneration(p, gen) {
+		t.Fatal("RemoveIfGeneration should return false for old generation")
+	}
+	if !s.Has(p) {
+		t.Fatal("newer shadow should survive old-generation RemoveIfGeneration")
+	}
+
+	// Current generation removes.
+	if !s.RemoveIfGeneration(p, newGen) {
+		t.Fatal("RemoveIfGeneration should return true for current generation")
+	}
+	if s.Has(p) {
+		t.Fatal("shadow should be removed by matching-generation RemoveIfGeneration")
+	}
+}
+
+// TestPendingIndexRemoveIfGeneration verifies the pendingIndex generation guard.
+func TestPendingIndexRemoveIfGeneration(t *testing.T) {
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := "/file.txt"
+	gen1, err := idx.PutWithBaseRev(p, 10, PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stale generation must NOT remove.
+	if idx.RemoveIfGeneration(p, gen1+999) {
+		t.Fatal("RemoveIfGeneration should return false for stale generation")
+	}
+	if _, ok := idx.GetMeta(p); !ok {
+		t.Fatal("entry should survive stale RemoveIfGeneration")
+	}
+
+	// Newer Put bumps the generation.
+	gen2, err := idx.PutWithBaseRev(p, 20, PendingNew, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen2 == gen1 {
+		t.Fatal("expected generation to bump after second Put")
+	}
+
+	// Old generation must NOT remove the newer entry.
+	if idx.RemoveIfGeneration(p, gen1) {
+		t.Fatal("RemoveIfGeneration should return false for old generation")
+	}
+	meta, ok := idx.GetMeta(p)
+	if !ok {
+		t.Fatal("newer entry should survive old-generation RemoveIfGeneration")
+	}
+	if meta.Size != 20 {
+		t.Fatalf("size = %d, want 20 (newer entry preserved)", meta.Size)
+	}
+
+	// Current generation removes.
+	if !idx.RemoveIfGeneration(p, gen2) {
+		t.Fatal("RemoveIfGeneration should return true for current generation")
+	}
+	if _, ok := idx.GetMeta(p); ok {
+		t.Fatal("entry should be removed by matching-generation RemoveIfGeneration")
 	}
 }
