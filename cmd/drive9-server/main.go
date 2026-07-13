@@ -318,12 +318,15 @@ func main() {
 			S3EncryptionPolicy:           s3cfg.EncryptionPolicy,
 			BackendOptions:               backendOptions,
 			MaxTenants:                   envInt("DRIVE9_POOL_MAX_TENANTS", 0),
+			IdleTimeout:                  envDuration("DRIVE9_POOL_IDLE_TTL", 10*time.Minute),
+			IdleReapInterval:             envDuration("DRIVE9_POOL_IDLE_REAP_INTERVAL", 0),
 			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 			LeaderChecker:                leaderManager,
 		}, enc)
 		defer pool.Close()
 
 		pool.SetMetaStore(store)
+		pool.Start(context.Background())
 
 		// The mutation replay and expiry sweep workers are owned by the server
 		// (started/stopped in its leader-gated startLeaderWorkers/stopLeaderWorkers),
@@ -526,6 +529,8 @@ environment:
   DRIVE9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
   DRIVE9_META_DSN    control-plane MySQL DSN (required)
   DRIVE9_POOL_MAX_TENANTS max cached tenant user DB pools per pod (default: 1024)
+  DRIVE9_POOL_IDLE_TTL  idle duration before a cached tenant backend is evicted (default: 10m, 0=disabled)
+  DRIVE9_POOL_IDLE_REAP_INTERVAL  how often the idle reaper scans (default: 5m)
   DRIVE9_META_DB_MAX_OPEN_CONNS max open connections for the per-pod meta DB pool (default: 100)
   DRIVE9_META_DB_MAX_IDLE_CONNS max idle connections for the per-pod meta DB pool (default: 20)
   DRIVE9_USER_DB_MAX_OPEN_CONNS max open connections for each cached tenant user DB pool (default: 6)
