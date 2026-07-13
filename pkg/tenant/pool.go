@@ -541,7 +541,7 @@ func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release fu
 	p.mu.Unlock()
 	metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
 	metrics.RecordTenantOperation(t.ID, "user_db_access", "acquire_cached", "hit", 0)
-	return e.backend, p.makeRelease(e), true
+	return e.backend, p.makeReleaseNoRefresh(e), true
 }
 
 func (p *Pool) InvalidateAndWait(ctx context.Context, tenantID string) error {
@@ -678,6 +678,9 @@ func (p *Pool) Start(ctx context.Context) {
 }
 
 func (p *Pool) reapLoop(ctx context.Context) {
+	if p.reapInterval <= 0 {
+		return
+	}
 	ticker := time.NewTicker(p.reapInterval)
 	defer ticker.Stop()
 	for {
@@ -739,6 +742,7 @@ func (p *Pool) S3Backend(tenantID string) *backend.Dat9Backend {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.items[tenantID]; ok {
+		e.lastUsed = time.Now()
 		return e.backend
 	}
 	return nil
@@ -1175,12 +1179,24 @@ func (p *Pool) makeRelease(e *entry) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			p.releaseEntry(e)
+			p.releaseEntry(e, true)
 		})
 	}
 }
 
-func (p *Pool) releaseEntry(e *entry) {
+// makeReleaseNoRefresh is like makeRelease but does not refresh lastUsed on
+// release. Used by AcquireCached so internal scans (safety-net) do not reset
+// the idle timer.
+func (p *Pool) makeReleaseNoRefresh(e *entry) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.releaseEntry(e, false)
+		})
+	}
+}
+
+func (p *Pool) releaseEntry(e *entry, refreshLastUsed bool) {
 	if e == nil {
 		return
 	}
@@ -1188,6 +1204,9 @@ func (p *Pool) releaseEntry(e *entry) {
 	p.mu.Lock()
 	if e.refs > 0 {
 		e.refs--
+	}
+	if e.refs == 0 && !e.retired && refreshLastUsed {
+		e.lastUsed = time.Now()
 	}
 	if e.refs == 0 && e.retired {
 		toClose = e

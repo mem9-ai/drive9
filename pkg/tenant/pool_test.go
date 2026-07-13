@@ -758,8 +758,14 @@ func TestIdleEvictionRespectsRefs(t *testing.T) {
 		t.Fatal("expected pinned entry to remain in pool")
 	}
 
-	// Now release and reap — should evict.
+	// Release refreshes lastUsed (user release), so entry stays warm
+	// for another IdleTimeout window.
 	release()
+	pool.reapOnce(ctx)
+	assertStoreOpen(t, store)
+
+	// Now wait for idle timeout to lapse after release, then reap.
+	time.Sleep(60 * time.Millisecond)
 	pool.reapOnce(ctx)
 	assertStoreClosed(t, store)
 }
@@ -799,4 +805,116 @@ func TestIdleEvictionStartNoOpWhenDisabled(t *testing.T) {
 	if pool.reapStop != nil {
 		t.Fatal("expected reapStop to be nil when IdleTimeout=0")
 	}
+}
+
+// TestIdleEvictionReleaseRefreshesLastUsed verifies that a long-running user
+// request (held longer than IdleTimeout) is not immediately evicted on
+// release. The release path must refresh lastUsed so the idle timer starts
+// counting from "user finished", not "user started".
+func TestIdleEvictionReleaseRefreshesLastUsed(t *testing.T) {
+	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
+		MaxTenants:       2,
+		IdleTimeout:      50 * time.Millisecond,
+		IdleReapInterval: 10 * time.Millisecond,
+	}, "tenant-long")
+	ctx := context.Background()
+
+	b, release, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := b.Store()
+
+	// Hold the backend longer than IdleTimeout. The reaper must skip it
+	// because refs > 0.
+	time.Sleep(80 * time.Millisecond)
+	pool.reapOnce(ctx)
+	assertStoreOpen(t, store)
+
+	// Release now — lastUsed is refreshed. Immediate reap must NOT evict.
+	release()
+	pool.reapOnce(ctx)
+	assertStoreOpen(t, store)
+	if _, ok := pool.items[tenant.ID]; !ok {
+		t.Fatal("expected entry to remain after release refreshed lastUsed")
+	}
+
+	// Wait for idle timeout to lapse after release, then reap.
+	time.Sleep(60 * time.Millisecond)
+	pool.reapOnce(ctx)
+	assertStoreClosed(t, store)
+}
+
+// TestIdleEvictionAcquireCachedReleaseDoesNotRefresh verifies that
+// AcquireCached's release does not refresh lastUsed. A safety-net scan
+// touch must not reset the idle timer even on release.
+func TestIdleEvictionAcquireCachedReleaseDoesNotRefresh(t *testing.T) {
+	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
+		MaxTenants:       2,
+		IdleTimeout:      50 * time.Millisecond,
+		IdleReapInterval: 10 * time.Millisecond,
+	}, "tenant-cached-release")
+	ctx := context.Background()
+
+	b, release, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := b.Store()
+	release()
+
+	// Wait until lastUsed is stale.
+	time.Sleep(60 * time.Millisecond)
+
+	// AcquireCached + release should not refresh lastUsed.
+	_, release2, ok := pool.AcquireCached(tenant)
+	if !ok {
+		t.Fatal("expected AcquireCached to hit warm cache")
+	}
+	release2()
+
+	// Reap — should evict because neither AcquireCached nor its release
+	// refreshed lastUsed.
+	pool.reapOnce(ctx)
+	assertStoreClosed(t, store)
+	if _, ok := pool.items[tenant.ID]; ok {
+		t.Fatal("expected entry to be evicted — AcquireCached release must not refresh lastUsed")
+	}
+}
+
+// TestIdleEvictionStartAutoEvictsAndCloseStops verifies the end-to-end
+// lifecycle: Start launches the reaper, the ticker automatically evicts an
+// idle entry, and Close stops the reaper cleanly.
+func TestIdleEvictionStartAutoEvictsAndCloseStops(t *testing.T) {
+	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
+		MaxTenants:       2,
+		IdleTimeout:      50 * time.Millisecond,
+		IdleReapInterval: 10 * time.Millisecond,
+	}, "tenant-e2e")
+	ctx := context.Background()
+	pool.Start(ctx)
+	defer pool.Close()
+
+	b, release, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := b.Store()
+	release()
+
+	// Wait for the ticker-driven reaper to auto-evict (within ~2s).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		pool.mu.Lock()
+		_, ok := pool.items[tenant.ID]
+		pool.mu.Unlock()
+		if !ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, ok := pool.items[tenant.ID]; ok {
+		t.Fatal("expected auto-eviction by ticker")
+	}
+	assertStoreClosed(t, store)
 }
