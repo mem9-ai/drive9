@@ -4920,18 +4920,22 @@ func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID str
 }
 
 func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(context.Context, string) error) func(context.Context, string) error {
+	fallbackWithTenant := func(ctx context.Context, dsn string) error {
+		return fallback(tenantschema.WithTenantID(ctx, tenantID), dsn)
+	}
 	if !tenant.UsesTiDBAutoEmbedding(provider) {
-		return fallback
+		return fallbackWithTenant
 	}
 	provisioner := s.provisionerForTenantProvider(provider)
 	if provisioner == nil {
-		return fallback
+		return fallbackWithTenant
 	}
 	profileAware, ok := provisioner.(autoEmbeddingSchemaProvisioner)
 	if !ok {
-		return fallback
+		return fallbackWithTenant
 	}
 	return func(ctx context.Context, dsn string) error {
+		ctx = tenantschema.WithTenantID(ctx, tenantID)
 		if ensurer, ok := provisioner.(tenantDatabaseEnsurer); ok {
 			if err := ensurer.EnsureDatabase(ctx, dsn); err != nil {
 				return fmt.Errorf("ensure tenant database: %w", err)

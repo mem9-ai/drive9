@@ -13,7 +13,8 @@ func WithTenantID(ctx context.Context, tenantID string) context.Context {
 	return context.WithValue(ctx, tenantIDContextKey{}, tenantID)
 }
 
-func tenantIDFromContext(ctx context.Context) string {
+// TenantIDFromContext returns the tenant attribution attached with WithTenantID.
+func TenantIDFromContext(ctx context.Context) string {
 	tenantID, _ := ctx.Value(tenantIDContextKey{}).(string)
 	return tenantID
 }

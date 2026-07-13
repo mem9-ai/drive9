@@ -1377,7 +1377,7 @@ func OpenTiDBSchemaDB(ctx context.Context, dsn string) (*sql.DB, error) {
 	if HasMultiStatements(dsn) {
 		return nil, fmt.Errorf("multiStatements is not allowed")
 	}
-	db, err := mysqlutil.OpenInstrumentedForTenant(ctx, dsn, mysqlutil.RoleUserSchema, tenantIDFromContext(ctx))
+	db, err := mysqlutil.OpenInstrumentedForTenant(ctx, dsn, mysqlutil.RoleUserSchema, TenantIDFromContext(ctx))
 	if err != nil {
 		return nil, err
 	}

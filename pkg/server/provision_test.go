@@ -347,13 +347,14 @@ func (f *credentialOnlyProvisioner) ProvisionWithCredentials(_ context.Context, 
 
 type profileAwareFakeProvisioner struct {
 	fakeProvisioner
-	mu               sync.Mutex
-	profileInitCalls atomic.Int32
-	ensureDBCalls    atomic.Int32
-	lastProfile      tenantschema.TiDBAutoEmbeddingProfile
-	ensureDBErr      error
-	lastEnsureDSN    string
-	callOrder        []string
+	mu                  sync.Mutex
+	profileInitCalls    atomic.Int32
+	ensureDBCalls       atomic.Int32
+	lastProfile         tenantschema.TiDBAutoEmbeddingProfile
+	lastProfileTenantID string
+	ensureDBErr         error
+	lastEnsureDSN       string
+	callOrder           []string
 }
 
 func (f *profileAwareFakeProvisioner) EnsureDatabase(_ context.Context, dsn string) error {
@@ -365,11 +366,12 @@ func (f *profileAwareFakeProvisioner) EnsureDatabase(_ context.Context, dsn stri
 	return f.ensureDBErr
 }
 
-func (f *profileAwareFakeProvisioner) InitSchemaForAutoEmbeddingProfile(_ context.Context, _ string, profile tenantschema.TiDBAutoEmbeddingProfile) error {
+func (f *profileAwareFakeProvisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, _ string, profile tenantschema.TiDBAutoEmbeddingProfile) error {
 	f.profileInitCalls.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastProfile = profile
+	f.lastProfileTenantID = tenantschema.TenantIDFromContext(ctx)
 	f.callOrder = append(f.callOrder, "profile-init")
 	return nil
 }
@@ -443,6 +445,12 @@ func TestSchemaInitForTenantEnsuresDatabaseBeforeProfileInit(t *testing.T) {
 	}
 	if got, want := prov.callOrderString(), "ensure,profile-init"; got != want {
 		t.Fatalf("call order = %s, want %s", got, want)
+	}
+	prov.mu.Lock()
+	lastProfileTenantID := prov.lastProfileTenantID
+	prov.mu.Unlock()
+	if lastProfileTenantID != "tenant-native" {
+		t.Fatalf("profile init tenant id = %q, want tenant-native", lastProfileTenantID)
 	}
 }
 

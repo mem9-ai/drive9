@@ -865,9 +865,11 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 				if p.metaStore != nil {
 					// Record the tenant-profile-specific version only after the
 					// schema has been confirmed to match that tenant's profile.
-					// Any tenant whose schema diverges between two consecutive
-					// opens will be caught on the next open because its stored
-					// version will differ from the profile-derived target.
+					// Version-matched opens trust this durable value and skip the
+					// physical diff by default; out-of-band schema drift is detected
+					// only when the target schema version changes, or through an
+					// explicit validation/repair path. SkipTiDBSchemaCheck remains
+					// the opt-out for externally managed schemas.
 					updateSchemaVersionStart := time.Now()
 					if verErr := p.metaStore.UpdateTenantSchemaVersion(ctx, t.ID, targetSchemaVersion); verErr != nil {
 						recordTenantSchemaVersionUpdateFailure(ctx, t.ID, targetSchemaVersion, time.Since(updateSchemaVersionStart), verErr)
