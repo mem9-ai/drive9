@@ -117,19 +117,36 @@ func RecordTenantOperation(tenantID, component, operation, result string, d time
 	result = cleanMetricValue(result, "unknown")
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	RegisterModule(component)
-	attrs := []Attribute{
+	counterAttrs := []Attribute{
 		Attr("component", component),
 		Attr("operation", operation),
 		Attr("result", result),
 	}
 	if tenantID != "unknown" {
-		attrs = append(attrs, Attr("tenant_id", tenantID))
+		counterAttrs = append(counterAttrs, Attr("tenant_id", tenantID))
 	}
-	serviceOperationsTotal.Add(1, attrs...)
+	serviceOperationsTotal.Add(1, counterAttrs...)
 	if d <= 0 {
 		return
 	}
-	serviceOperationDuration.Observe(d.Seconds(), attrs...)
+	durationAttrs := []Attribute{
+		Attr("component", component),
+		Attr("operation", operation),
+		Attr("result", result),
+	}
+	if tenantID != "unknown" && serviceOperationDurationIncludesTenant(component) {
+		durationAttrs = append(durationAttrs, Attr("tenant_id", tenantID))
+	}
+	serviceOperationDuration.Observe(d.Seconds(), durationAttrs...)
+}
+
+func serviceOperationDurationIncludesTenant(component string) bool {
+	switch component {
+	case "file_gc", "quota_config_cache", "server_quota", "user_db_access":
+		return false
+	default:
+		return true
+	}
 }
 
 func RecordTenantPoolMetadataResumeWait(poolID, organizationID, scope, result string, d time.Duration) {

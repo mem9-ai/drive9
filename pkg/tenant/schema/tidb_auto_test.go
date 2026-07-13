@@ -852,6 +852,94 @@ func TestDiffTiDBTableUsesInformationSchemaIndexesForUploads(t *testing.T) {
 	}
 }
 
+func TestDiffTiDBTablesRunsIndependentTablesConcurrently(t *testing.T) {
+	tables := []tidbTableSpec{
+		{
+			name:            "diff_parallel_t1",
+			createStatement: "CREATE TABLE diff_parallel_t1 (id VARCHAR(64))",
+			columns: map[string]tidbColumnSpec{
+				"id": {columnType: "varchar(64)"},
+			},
+		},
+		{
+			name:            "diff_parallel_t2",
+			createStatement: "CREATE TABLE diff_parallel_t2 (id VARCHAR(64))",
+			columns: map[string]tidbColumnSpec{
+				"id": {columnType: "varchar(64)"},
+			},
+		},
+	}
+
+	started := make(chan string, len(tables))
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+
+	db := newTestRepairDBWithArgs(t, func(query string, args []driver.NamedValue) testRepairQueryResult {
+		normalized := normalizeSQLFragment(query)
+		switch {
+		case strings.Contains(normalized, "from information_schema.columns"):
+			tableName := fmt.Sprint(args[0].Value)
+			select {
+			case started <- tableName:
+			default:
+			}
+			<-release
+			return testRepairQueryResult{
+				columns: []string{"column_name", "column_type", "extra", "generation_expression"},
+				rows: [][]driver.Value{
+					{"id", "varchar(64)", "", ""},
+				},
+			}
+		case strings.HasPrefix(normalized, "show create table"):
+			tableName := strings.TrimSpace(strings.TrimPrefix(query, "SHOW CREATE TABLE "))
+			return testRepairQueryResult{
+				columns: []string{"Table", "Create Table"},
+				rows: [][]driver.Value{
+					{tableName, fmt.Sprintf("CREATE TABLE %s (id VARCHAR(64))", tableName)},
+				},
+			}
+		case strings.Contains(normalized, "from information_schema.statistics"):
+			return testRepairQueryResult{columns: []string{"index_name"}}
+		default:
+			return testRepairQueryResult{err: fmt.Errorf("unexpected query: %s", query)}
+		}
+	}, nil)
+	db.SetMaxOpenConns(2)
+
+	errCh := make(chan error, 1)
+	go func() {
+		diffs, parallelism, err := diffTiDBTables(context.Background(), db, tables)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if parallelism != 2 {
+			errCh <- fmt.Errorf("parallelism = %d, want 2", parallelism)
+			return
+		}
+		if len(diffs) != 0 {
+			errCh <- fmt.Errorf("diff count = %d, want 0: %#v", len(diffs), diffs)
+			return
+		}
+		errCh <- nil
+	}()
+
+	got := map[string]bool{}
+	for len(got) < len(tables) {
+		select {
+		case tableName := <-started:
+			got[tableName] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for concurrent table metadata queries; got %v", got)
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-errCh; err != nil {
+		t.Fatalf("diffTiDBTables: %v", err)
+	}
+}
+
 func TestRepairMySQLPathHashSchemaUpgradesLegacyPathIndexes(t *testing.T) {
 	if testDSN == "" {
 		t.Skip("mysql test DSN not configured")

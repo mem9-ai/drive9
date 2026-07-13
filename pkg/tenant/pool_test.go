@@ -418,6 +418,53 @@ func TestPoolCreateBackendPeriodicallyValidatesSchemaWhenVersionMatches(t *testi
 	}
 }
 
+func TestPoolCreateBackendSkipsSchemaValidationWhenVersionMatchesByDefault(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-skip-validate")
+	tenant.Provider = ProviderTiDBZero
+	tenant.SchemaVersion = schema.CurrentTiDBTenantSchemaVersion
+
+	origEnsure := ensureTiDBSchemaForAutoEmbeddingProfile
+	origValidate := validateTiDBSchemaForAutoEmbeddingProfile
+	origApply := applyTiDBAutoEmbeddingProviderConfig
+	origEvery := periodicTiDBSchemaValidationEvery
+	ensureCalls := 0
+	validateCalls := 0
+	ensureTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
+		ensureCalls++
+		return nil
+	}
+	validateTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
+		validateCalls++
+		return nil
+	}
+	applyTiDBAutoEmbeddingProviderConfig = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProviderConfig) error {
+		return nil
+	}
+	periodicTiDBSchemaValidationEvery = 0
+	t.Cleanup(func() {
+		ensureTiDBSchemaForAutoEmbeddingProfile = origEnsure
+		validateTiDBSchemaForAutoEmbeddingProfile = origValidate
+		applyTiDBAutoEmbeddingProviderConfig = origApply
+		periodicTiDBSchemaValidationEvery = origEvery
+	})
+
+	backend, store, err := pool.createBackend(context.Background(), tenant)
+	if err != nil {
+		t.Fatalf("createBackend(): %v", err)
+	}
+	backend.Close()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	if ensureCalls != 0 {
+		t.Fatalf("ensureTiDBSchemaForAutoEmbeddingProfile called %d times, want 0", ensureCalls)
+	}
+	if validateCalls != 0 {
+		t.Fatalf("validateTiDBSchemaForAutoEmbeddingProfile called %d times, want 0", validateCalls)
+	}
+}
+
 func TestPoolCreateBackendEnsuresSchemaForTiDBCloudNative(t *testing.T) {
 	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-native-ensure")
 	tenant.Provider = ProviderTiDBCloudNative

@@ -69,6 +69,47 @@ func TestRecordTenantOperationZeroDurationDoesNotRecordDuration(t *testing.T) {
 	}
 }
 
+func TestRecordTenantOperationOmitsTenantFromSelectedDurationHistograms(t *testing.T) {
+	const operation = "duration_tenant_omit_test_operation"
+
+	for _, component := range []string{"file_gc", "quota_config_cache", "server_quota", "user_db_access"} {
+		t.Run(component, func(t *testing.T) {
+			tenantID := "tenant-duration-omit-" + component
+			RecordTenantOperation(tenantID, component, operation, "ok", time.Second)
+
+			rec := httptest.NewRecorder()
+			WritePrometheus(rec)
+			text := rec.Body.String()
+			if !strings.Contains(text, `drive9_service_operations_total{component="`+component+`",operation="`+operation+`",result="ok",tenant_id="`+tenantID+`"} 1`) {
+				t.Fatalf("missing tenant-scoped operation total:\n%s", text)
+			}
+			if !strings.Contains(text, `drive9_service_operation_duration_seconds_count{component="`+component+`",operation="`+operation+`",result="ok"} 1`) {
+				t.Fatalf("missing tenant-omitted duration histogram:\n%s", text)
+			}
+			if strings.Contains(text, `drive9_service_operation_duration_seconds_count{component="`+component+`",operation="`+operation+`",result="ok",tenant_id="`+tenantID+`"}`) {
+				t.Fatalf("duration histogram unexpectedly carried tenant_id:\n%s", text)
+			}
+		})
+	}
+}
+
+func TestRecordTenantOperationKeepsTenantOnBackendDurationHistogram(t *testing.T) {
+	const (
+		tenantID  = "tenant-duration-backend"
+		component = "backend"
+		operation = "duration_tenant_keep_test_operation"
+	)
+
+	RecordTenantOperation(tenantID, component, operation, "ok", time.Second)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_service_operation_duration_seconds_count{component="`+component+`",operation="`+operation+`",result="ok",tenant_id="`+tenantID+`"} 1`) {
+		t.Fatalf("backend duration histogram should keep tenant_id:\n%s", text)
+	}
+}
+
 func TestRecordTenantRequestZeroDurationDoesNotRecordDuration(t *testing.T) {
 	const tenantID = "tenant-zero-request"
 

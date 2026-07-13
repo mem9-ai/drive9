@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
@@ -28,6 +29,8 @@ const (
 	TiDBEmbeddingModeApp     TiDBEmbeddingMode = "app-managed"
 	TiDBEmbeddingModeFTSOnly TiDBEmbeddingMode = "fts-only"
 )
+
+const maxConcurrentTiDBSchemaDiffTables = 4
 
 // Reference of Auto Embedding in TiDB Cloud: https://docs.pingcap.com/ai/vector-search-auto-embedding-amazon-titan/
 const (
@@ -1583,14 +1586,11 @@ func diffTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiDBE
 	if err != nil {
 		return nil, err
 	}
-	var diffs []tidbSchemaDiff
-	for _, table := range spec.tables {
-		tableDiffs, err := diffTiDBTable(ctx, db, table)
-		if err != nil {
-			return nil, err
-		}
-		diffs = append(diffs, tableDiffs...)
+	tableDiffs, tableParallelism, err := diffTiDBTables(ctx, db, spec.tables)
+	if err != nil {
+		return nil, err
 	}
+	diffs := append([]tidbSchemaDiff(nil), tableDiffs...)
 	legacyFilesDiffs, err := diffLegacyTiDBFilesTableIfExistsWithConfig(ctx, db, mode, cfg)
 	if err != nil {
 		return nil, err
@@ -1599,9 +1599,73 @@ func diffTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiDBE
 	logger.Info(ctx, "tenant_tidb_schema_diff_finished",
 		zap.String("mode", string(mode)),
 		zap.Int("table_count", len(spec.tables)),
+		zap.Int("table_parallelism", tableParallelism),
 		zap.Int("diff_count", len(diffs)),
 		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
 	return diffs, nil
+}
+
+func diffTiDBTables(ctx context.Context, db *sql.DB, tables []tidbTableSpec) ([]tidbSchemaDiff, int, error) {
+	if len(tables) == 0 {
+		return nil, 0, nil
+	}
+	workerCount := maxConcurrentTiDBSchemaDiffTables
+	if len(tables) < workerCount {
+		workerCount = len(tables)
+	}
+
+	diffCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan int)
+	errCh := make(chan error, 1)
+	results := make([][]tidbSchemaDiff, len(tables))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for tableIndex := range jobs {
+				tableDiffs, err := diffTiDBTable(diffCtx, db, tables[tableIndex])
+				if err != nil {
+					select {
+					case errCh <- err:
+						cancel()
+					default:
+					}
+					return
+				}
+				results[tableIndex] = tableDiffs
+			}
+		}()
+	}
+
+sendJobs:
+	for tableIndex := range tables {
+		select {
+		case <-diffCtx.Done():
+			break sendJobs
+		case jobs <- tableIndex:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return nil, workerCount, err
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, workerCount, err
+	}
+
+	var diffs []tidbSchemaDiff
+	for _, tableDiffs := range results {
+		diffs = append(diffs, tableDiffs...)
+	}
+	return diffs, workerCount, nil
 }
 
 func diffLegacyTiDBFilesTableIfExists(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode) ([]tidbSchemaDiff, error) {

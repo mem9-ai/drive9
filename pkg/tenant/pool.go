@@ -163,10 +163,11 @@ var (
 	validateTiDBSchemaForAutoEmbeddingProfile = schema.ValidateTiDBSchemaForAutoEmbeddingProfile
 	ensureTiDBSchemaForFTSOnlyProfile         = schema.EnsureTiDBSchemaForFTSOnlyProfile
 	validateTiDBSchemaForFTSOnlyProfile       = schema.ValidateTiDBSchemaForFTSOnlyProfile
-	// Validate once on the first version-matched open after process start, then
-	// periodically thereafter to catch out-of-band schema drift without putting a
-	// full schema diff on every tenant open.
-	periodicTiDBSchemaValidationEvery uint64 = 32
+	// Version-matched tenant opens trust the durable tenant schema_version by
+	// default. Set this non-zero in targeted tests or emergency builds to sample
+	// out-of-band schema drift without putting a full schema diff on every cold
+	// tenant open.
+	periodicTiDBSchemaValidationEvery uint64 = 0
 	defaultTenantPoolDrainTimeout            = 30 * time.Second
 	defaultTenantPoolMaxTenants              = 1024
 	defaultTenantPoolIdleReapInterval        = 5 * time.Minute
