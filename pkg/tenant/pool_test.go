@@ -369,52 +369,37 @@ func TestPoolAutoSemanticTaskTypes(t *testing.T) {
 	}
 }
 
-func TestPoolCreateBackendPeriodicallyValidatesSchemaWhenVersionMatches(t *testing.T) {
-	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-validate")
+func TestPoolCreateBackendSkipsSchemaEnsureWhenVersionMatches(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-skip-validate")
 	tenant.Provider = ProviderTiDBZero
 	tenant.SchemaVersion = schema.CurrentTiDBTenantSchemaVersion
 
 	origEnsure := ensureTiDBSchemaForAutoEmbeddingProfile
-	origValidate := validateTiDBSchemaForAutoEmbeddingProfile
 	origApply := applyTiDBAutoEmbeddingProviderConfig
-	origEvery := periodicTiDBSchemaValidationEvery
 	ensureCalls := 0
-	validateCalls := 0
 	ensureTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
 		ensureCalls++
-		return nil
-	}
-	validateTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
-		validateCalls++
 		return nil
 	}
 	applyTiDBAutoEmbeddingProviderConfig = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProviderConfig) error {
 		return nil
 	}
-	periodicTiDBSchemaValidationEvery = 4
 	t.Cleanup(func() {
 		ensureTiDBSchemaForAutoEmbeddingProfile = origEnsure
-		validateTiDBSchemaForAutoEmbeddingProfile = origValidate
 		applyTiDBAutoEmbeddingProviderConfig = origApply
-		periodicTiDBSchemaValidationEvery = origEvery
 	})
 
-	for i := 0; i < 4; i++ {
-		backend, store, err := pool.createBackend(context.Background(), tenant)
-		if err != nil {
-			t.Fatalf("createBackend() iteration %d: %v", i, err)
-		}
-		backend.Close()
-		if err := store.Close(); err != nil {
-			t.Fatalf("close store iteration %d: %v", i, err)
-		}
+	backend, store, err := pool.createBackend(context.Background(), tenant)
+	if err != nil {
+		t.Fatalf("createBackend(): %v", err)
+	}
+	backend.Close()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
 	}
 
 	if ensureCalls != 0 {
 		t.Fatalf("ensureTiDBSchemaForAutoEmbeddingProfile called %d times, want 0", ensureCalls)
-	}
-	if validateCalls != 2 {
-		t.Fatalf("validateTiDBSchemaForAutoEmbeddingProfile called %d times, want 2", validateCalls)
 	}
 }
 
@@ -424,14 +409,10 @@ func TestPoolCreateBackendEnsuresSchemaForTiDBCloudNative(t *testing.T) {
 	tenant.SchemaVersion = 0
 
 	origEnsure := ensureTiDBSchemaForAutoEmbeddingProfile
-	origValidate := validateTiDBSchemaForAutoEmbeddingProfile
 	origApply := applyTiDBAutoEmbeddingProviderConfig
 	ensureCalls := 0
 	ensureTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
 		ensureCalls++
-		return nil
-	}
-	validateTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
 		return nil
 	}
 	applyTiDBAutoEmbeddingProviderConfig = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProviderConfig) error {
@@ -439,7 +420,6 @@ func TestPoolCreateBackendEnsuresSchemaForTiDBCloudNative(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		ensureTiDBSchemaForAutoEmbeddingProfile = origEnsure
-		validateTiDBSchemaForAutoEmbeddingProfile = origValidate
 		applyTiDBAutoEmbeddingProviderConfig = origApply
 	})
 
@@ -465,9 +445,7 @@ func TestPoolCreateBackendRepairsFTSOnlySchemaWhenDatabaseAutoEmbeddingDisabled(
 	tenant.SchemaVersion = 0
 
 	origEnsure := ensureTiDBSchemaForAutoEmbeddingProfile
-	origValidate := validateTiDBSchemaForAutoEmbeddingProfile
 	origEnsureFTS := ensureTiDBSchemaForFTSOnlyProfile
-	origValidateFTS := validateTiDBSchemaForFTSOnlyProfile
 	origApply := applyTiDBAutoEmbeddingProviderConfig
 	autoEnsureCalls := 0
 	ftsEnsureCalls := 0
@@ -480,21 +458,13 @@ func TestPoolCreateBackendRepairsFTSOnlySchemaWhenDatabaseAutoEmbeddingDisabled(
 		ftsEnsureCalls++
 		return nil
 	}
-	validateTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
-		return nil
-	}
-	validateTiDBSchemaForFTSOnlyProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
-		return nil
-	}
 	applyTiDBAutoEmbeddingProviderConfig = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProviderConfig) error {
 		applyCalls++
 		return nil
 	}
 	t.Cleanup(func() {
 		ensureTiDBSchemaForAutoEmbeddingProfile = origEnsure
-		validateTiDBSchemaForAutoEmbeddingProfile = origValidate
 		ensureTiDBSchemaForFTSOnlyProfile = origEnsureFTS
-		validateTiDBSchemaForFTSOnlyProfile = origValidateFTS
 		applyTiDBAutoEmbeddingProviderConfig = origApply
 	})
 
@@ -517,39 +487,6 @@ func TestPoolCreateBackendRepairsFTSOnlySchemaWhenDatabaseAutoEmbeddingDisabled(
 	}
 	if applyCalls != 0 {
 		t.Fatalf("applyTiDBAutoEmbeddingProviderConfig called %d times, want 0", applyCalls)
-	}
-}
-
-func TestPoolCreateBackendReturnsValidationErrorWhenPeriodicCheckFails(t *testing.T) {
-	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-validate-fail")
-	tenant.Provider = ProviderTiDBZero
-	tenant.SchemaVersion = schema.CurrentTiDBTenantSchemaVersion
-
-	origEnsure := ensureTiDBSchemaForAutoEmbeddingProfile
-	origValidate := validateTiDBSchemaForAutoEmbeddingProfile
-	origApply := applyTiDBAutoEmbeddingProviderConfig
-	origEvery := periodicTiDBSchemaValidationEvery
-	ensureTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
-		return nil
-	}
-	validateTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
-		return fmt.Errorf("schema drift")
-	}
-	applyTiDBAutoEmbeddingProviderConfig = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProviderConfig) error {
-		return nil
-	}
-	periodicTiDBSchemaValidationEvery = 1
-	t.Cleanup(func() {
-		ensureTiDBSchemaForAutoEmbeddingProfile = origEnsure
-		validateTiDBSchemaForAutoEmbeddingProfile = origValidate
-		applyTiDBAutoEmbeddingProviderConfig = origApply
-		periodicTiDBSchemaValidationEvery = origEvery
-	})
-
-	if _, _, err := pool.createBackend(context.Background(), tenant); err == nil {
-		t.Fatal("expected periodic validation failure to propagate")
-	} else if !strings.Contains(err.Error(), "validate tidb embedding schema") {
-		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -772,8 +709,8 @@ func TestIdleEvictionRespectsRefs(t *testing.T) {
 
 func TestIdleEvictionDisabled(t *testing.T) {
 	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
-		MaxTenants:    2,
-		IdleTimeout:   0, // disabled
+		MaxTenants:  2,
+		IdleTimeout: 0, // disabled
 	}, "tenant-disabled")
 	ctx := context.Background()
 
