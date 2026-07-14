@@ -1860,6 +1860,7 @@ func TestInitTenantSchemaAsyncPersistsTargetSchemaVersion(t *testing.T) {
 	srv := NewWithConfig(Config{Meta: metaStore})
 	defer srv.Close()
 	schemaInitCalls := 0
+	// Direct invocation is blocking; production launches this function in a worker.
 	srv.initTenantSchemaAsync(context.Background(), tenantID, "unused-dsn", tenant.ProviderTiDBZero, func(context.Context, string) error {
 		schemaInitCalls++
 		return nil

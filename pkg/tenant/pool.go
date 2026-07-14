@@ -165,14 +165,6 @@ var (
 	defaultTenantPoolIdleReapInterval       = 5 * time.Minute
 )
 
-func tenantSchemaVersionForEmbeddingMode(mode string, profile schema.TiDBAutoEmbeddingProfile) (int, error) {
-	tidbMode, err := TiDBEmbeddingModeForTenantMode(mode)
-	if err != nil {
-		return 0, err
-	}
-	return schema.TiDBTenantSchemaVersionForEmbeddingModeProfile(tidbMode, profile)
-}
-
 func ensureTiDBSchemaForEmbeddingMode(ctx context.Context, db *sql.DB, mode string, profile schema.TiDBAutoEmbeddingProfile) error {
 	tidbMode, err := TiDBEmbeddingModeForTenantMode(mode)
 	if err != nil {
@@ -850,7 +842,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			opts.AsyncAudioExtract = backend.AsyncAudioExtractOptions{}
 		}
 		if !p.cfg.SkipTiDBSchemaCheck {
-			targetSchemaVersion, err := tenantSchemaVersionForEmbeddingMode(autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile)
+			targetSchemaVersion, err := TiDBTenantSchemaVersionForEmbeddingMode(autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile)
 			if err != nil {
 				_ = store.Close()
 				return nil, nil, fmt.Errorf("resolve tenant embedding schema version: %w", err)

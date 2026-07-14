@@ -4977,11 +4977,7 @@ func (s *Server) updateTenantSchemaVersionForProfile(ctx context.Context, tenant
 	if err != nil {
 		return fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
 	}
-	tidbMode, err := tenant.TiDBEmbeddingModeForTenantMode(profile.mode)
-	if err != nil {
-		return err
-	}
-	version, err := tenantschema.TiDBTenantSchemaVersionForEmbeddingModeProfile(tidbMode, profile.schemaProfile)
+	version, err := tenant.TiDBTenantSchemaVersionForEmbeddingMode(profile.mode, profile.schemaProfile)
 	if err != nil {
 		return err
 	}
@@ -5401,7 +5397,13 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			}
 			err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
 			if err == nil {
-				err = s.updateTenantSchemaVersionForProfile(ctx, tenantID, provider)
+				if versionErr := s.updateTenantSchemaVersionForProfile(ctx, tenantID, provider); versionErr != nil {
+					logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_version_persist_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", versionErr)...)
+					if s.metrics != nil {
+						s.metrics.recordEvent(tenantID, "tenant_schema_init", "provider", provider, "result", "error", "stage", "schema_version_persist")
+					}
+					err = versionErr
+				}
 			}
 		}
 		if err == nil {

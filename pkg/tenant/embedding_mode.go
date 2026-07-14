@@ -19,3 +19,13 @@ func TiDBEmbeddingModeForTenantMode(mode string) (schema.TiDBEmbeddingMode, erro
 		return schema.TiDBEmbeddingModeUnknown, fmt.Errorf("unsupported tenant embedding mode %q", mode)
 	}
 }
+
+// TiDBTenantSchemaVersionForEmbeddingMode derives the profile-specific TiDB
+// schema version for a persisted tenant-level embedding mode.
+func TiDBTenantSchemaVersionForEmbeddingMode(mode string, profile schema.TiDBAutoEmbeddingProfile) (int, error) {
+	tidbMode, err := TiDBEmbeddingModeForTenantMode(mode)
+	if err != nil {
+		return 0, err
+	}
+	return schema.TiDBTenantSchemaVersionForEmbeddingModeProfile(tidbMode, profile)
+}
