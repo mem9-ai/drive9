@@ -8,13 +8,13 @@ This dashboard set expects the `drive9_*` Prometheus namespace. The previous `da
 
 ## 1. Usage dashboard
 
-- `drive9-tenant-usage-dashboard.json`: first-stop dashboard for tenant-level product usage: active tenants, request frequency, in-flight requests, logical file reads/writes, HTTP transport bytes, storage/media quota state, latency, and non-OK rates by tenant/surface. Use this to answer `who is using Drive9, how much, and through which workflows?`
+- `drive9-tenant-usage-dashboard.json`: first-stop dashboard for tenant-level product usage: active tenants, request frequency, in-flight requests, logical file reads/writes, HTTP transport bytes, storage/media quota state, latency, and non-OK rates by tenant/surface/action. Use this to answer `who is using Drive9, how much, and through which workflows?`
 
 Tenant usage metrics intentionally allow `tenant_id` as a Prometheus label, but keep high-cardinality values out of labels: no path, file ID, upload ID, API key ID, raw URL, user agent, or trace ID.
 
 ## Tenant metric contract
 
-- `drive9_tenant_requests_total`: request count by `tenant_id`, `surface`, `result`, and `status_class`.
+- `drive9_tenant_requests_total`: request count by `tenant_id`, `surface`, `action`, `result`, and `status_class`.
 - `drive9_tenant_request_duration_seconds`: request latency histogram by `surface` and `status_class`.
 - `drive9_tenant_inflight_requests`: current in-flight request gauge by `tenant_id`, `surface`, and `action`.
 - `drive9_tenant_http_bytes_total`: HTTP transport bytes by `tenant_id`, `surface`, and `direction=request|response`.

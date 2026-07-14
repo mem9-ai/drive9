@@ -105,14 +105,13 @@ func TestRecordTenantRequestOmitsHighCardinalityLabels(t *testing.T) {
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `drive9_tenant_requests_total{result="ok",status_class="2xx",surface="`+surface+`",tenant_id="`+tenantID+`"} 1`) {
+	if !strings.Contains(text, `drive9_tenant_requests_total{action="`+action+`",result="ok",status_class="2xx",surface="`+surface+`",tenant_id="`+tenantID+`"} 1`) {
 		t.Errorf("missing tenant-scoped request total:\n%s", text)
 	}
 	if !strings.Contains(text, `drive9_tenant_request_duration_seconds_count{status_class="2xx",surface="`+surface+`"} 1`) {
 		t.Errorf("missing reduced request duration histogram:\n%s", text)
 	}
 	for _, unexpected := range []string{
-		`drive9_tenant_requests_total{action="` + action + `"`,
 		`drive9_tenant_requests_total{result="ok",status="201"`,
 		`drive9_tenant_request_duration_seconds_count{action="` + action + `"`,
 		`drive9_tenant_request_duration_seconds_count{result="ok"`,
@@ -132,7 +131,7 @@ func TestRecordTenantRequestZeroDurationDoesNotRecordDuration(t *testing.T) {
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `drive9_tenant_requests_total{result="ok",status_class="2xx",surface="zero_surface",tenant_id="`+tenantID+`"} 1`) {
+	if !strings.Contains(text, `drive9_tenant_requests_total{action="zero_action",result="ok",status_class="2xx",surface="zero_surface",tenant_id="`+tenantID+`"} 1`) {
 		t.Errorf("missing zero-duration tenant request total:\n%s", text)
 	}
 	if strings.Contains(text, `drive9_tenant_request_duration_seconds_count{surface="zero_surface"`) {

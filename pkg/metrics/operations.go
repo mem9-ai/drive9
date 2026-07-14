@@ -68,7 +68,7 @@ var fuseRemoteOperationsTotal = fuseMeter.Int64Counter("drive9_fuse_remote_opera
 var fuseRemoteOperationDuration = fuseMeter.Float64Histogram("drive9_fuse_remote_operation_duration_seconds", "Remote FUSE operation duration histogram", operationDurationBounds)
 var fuseRemoteOperationBytes = fuseMeter.Int64Counter("drive9_fuse_remote_operation_bytes_total", "Bytes processed by remote FUSE operation/result")
 
-var tenantRequestsTotal = tenantMeter.Int64Counter("drive9_tenant_requests_total", "Tenant-scoped requests by tenant/surface/result/status_class")
+var tenantRequestsTotal = tenantMeter.Int64Counter("drive9_tenant_requests_total", "Tenant-scoped requests by tenant/surface/action/result/status_class")
 var tenantRequestDuration = tenantMeter.Float64Histogram("drive9_tenant_request_duration_seconds", "Tenant request duration histogram by surface/status_class", httpDurationBounds)
 var tenantInflight = tenantMeter.Float64Gauge("drive9_tenant_inflight_requests", "Current in-flight tenant-scoped requests by tenant/surface/action")
 var tenantHTTPBytes = tenantMeter.Int64Counter("drive9_tenant_http_bytes_total", "Tenant-scoped HTTP transport bytes by tenant/surface/direction")
@@ -286,11 +286,13 @@ func RecordHTTPRequestCount(method, route string, status int) {
 func RecordTenantRequestCount(tenantID, surface, action, result string, status int) {
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	surface = cleanMetricValue(surface, "other")
+	action = cleanMetricValue(action, "other")
 	result = cleanMetricValue(result, "unknown")
 	RegisterModule("tenant_usage")
 	attrs := []Attribute{
 		Attr("tenant_id", tenantID),
 		Attr("surface", surface),
+		Attr("action", action),
 		Attr("result", result),
 		Attr("status_class", statusClass(status)),
 	}
@@ -328,6 +330,7 @@ func RecordTenantEvent(tenantID, event string, labels ...string) {
 func RecordTenantRequest(tenantID, surface, action, result string, status int, d time.Duration) {
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	surface = cleanMetricValue(surface, "other")
+	action = cleanMetricValue(action, "other")
 	result = cleanMetricValue(result, "unknown")
 	statusClass := "unknown"
 	if status > 0 {
@@ -337,6 +340,7 @@ func RecordTenantRequest(tenantID, surface, action, result string, status int, d
 	attrs := []Attribute{
 		Attr("tenant_id", tenantID),
 		Attr("surface", surface),
+		Attr("action", action),
 		Attr("result", result),
 		Attr("status_class", statusClass),
 	}
