@@ -8,16 +8,16 @@ This dashboard set expects the `drive9_*` Prometheus namespace. The previous `da
 
 ## 1. Usage dashboard
 
-- `drive9-tenant-usage-dashboard.json`: first-stop dashboard for tenant-level product usage: active tenants, request frequency, in-flight requests, logical file reads/writes, HTTP transport bytes, storage/media quota state, latency, and non-OK rates by tenant/surface/action. Use this to answer `who is using Drive9, how much, and through which workflows?`
+- `drive9-tenant-usage-dashboard.json`: first-stop dashboard for tenant-level product usage: active tenants, request frequency, in-flight requests, logical file reads/writes, HTTP transport bytes, storage/media quota state, latency, and non-OK rates by tenant/surface. Use this to answer `who is using Drive9, how much, and through which workflows?`
 
 Tenant usage metrics intentionally allow `tenant_id` as a Prometheus label, but keep high-cardinality values out of labels: no path, file ID, upload ID, API key ID, raw URL, user agent, or trace ID.
 
 ## Tenant metric contract
 
-- `drive9_tenant_requests_total`: request count by `tenant_id`, `surface`, `action`, `result`, `status`, and `status_class`.
-- `drive9_tenant_request_duration_seconds`: request latency histogram with the same labels as `drive9_tenant_requests_total`.
+- `drive9_tenant_requests_total`: request count by `tenant_id`, `surface`, `result`, and `status_class`.
+- `drive9_tenant_request_duration_seconds`: request latency histogram by `surface` and `status_class`.
 - `drive9_tenant_inflight_requests`: current in-flight request gauge by `tenant_id`, `surface`, and `action`.
-- `drive9_tenant_http_bytes_total`: HTTP transport bytes by `tenant_id`, `surface`, `action`, and `direction=request|response`.
+- `drive9_tenant_http_bytes_total`: HTTP transport bytes by `tenant_id`, `surface`, and `direction=request|response`.
 - `drive9_tenant_file_bytes_total`: logical file bytes by `tenant_id`, `surface`, `action`, and `direction=read|write`.
 - `drive9_tenant_storage_bytes`: opportunistically published quota storage gauge by `tenant_id` and `state=confirmed|reserved|limit`.
 - `drive9_tenant_media_files`: opportunistically published quota media-file gauge by `tenant_id` and `state=confirmed|limit`.

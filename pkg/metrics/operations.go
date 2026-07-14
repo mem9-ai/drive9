@@ -68,10 +68,10 @@ var fuseRemoteOperationsTotal = fuseMeter.Int64Counter("drive9_fuse_remote_opera
 var fuseRemoteOperationDuration = fuseMeter.Float64Histogram("drive9_fuse_remote_operation_duration_seconds", "Remote FUSE operation duration histogram", operationDurationBounds)
 var fuseRemoteOperationBytes = fuseMeter.Int64Counter("drive9_fuse_remote_operation_bytes_total", "Bytes processed by remote FUSE operation/result")
 
-var tenantRequestsTotal = tenantMeter.Int64Counter("drive9_tenant_requests_total", "Tenant-scoped requests by tenant/surface/action/result/status/status_class")
-var tenantRequestDuration = tenantMeter.Float64Histogram("drive9_tenant_request_duration_seconds", "Tenant request duration histogram by surface/action/result/status_class", httpDurationBounds)
+var tenantRequestsTotal = tenantMeter.Int64Counter("drive9_tenant_requests_total", "Tenant-scoped requests by tenant/surface/result/status_class")
+var tenantRequestDuration = tenantMeter.Float64Histogram("drive9_tenant_request_duration_seconds", "Tenant request duration histogram by surface/status_class", httpDurationBounds)
 var tenantInflight = tenantMeter.Float64Gauge("drive9_tenant_inflight_requests", "Current in-flight tenant-scoped requests by tenant/surface/action")
-var tenantHTTPBytes = tenantMeter.Int64Counter("drive9_tenant_http_bytes_total", "Tenant-scoped HTTP transport bytes by tenant/surface/action/direction")
+var tenantHTTPBytes = tenantMeter.Int64Counter("drive9_tenant_http_bytes_total", "Tenant-scoped HTTP transport bytes by tenant/surface/direction")
 var tenantFileBytes = tenantMeter.Int64Counter("drive9_tenant_file_bytes_total", "Tenant-scoped logical file bytes by tenant/surface/action/direction")
 var tenantStorageBytes = tenantMeter.Float64Gauge("drive9_tenant_storage_bytes", "Tenant storage bytes by state")
 var tenantMediaFiles = tenantMeter.Float64Gauge("drive9_tenant_media_files", "Tenant media file count by state")
@@ -286,19 +286,12 @@ func RecordHTTPRequestCount(method, route string, status int) {
 func RecordTenantRequestCount(tenantID, surface, action, result string, status int) {
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	surface = cleanMetricValue(surface, "other")
-	action = cleanMetricValue(action, "other")
 	result = cleanMetricValue(result, "unknown")
-	statusValue := "unknown"
-	if status > 0 {
-		statusValue = strconv.Itoa(status)
-	}
 	RegisterModule("tenant_usage")
 	attrs := []Attribute{
 		Attr("tenant_id", tenantID),
 		Attr("surface", surface),
-		Attr("action", action),
 		Attr("result", result),
-		Attr("status", statusValue),
 		Attr("status_class", statusClass(status)),
 	}
 	tenantRequestsTotal.Add(1, attrs...)
@@ -335,21 +328,16 @@ func RecordTenantEvent(tenantID, event string, labels ...string) {
 func RecordTenantRequest(tenantID, surface, action, result string, status int, d time.Duration) {
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	surface = cleanMetricValue(surface, "other")
-	action = cleanMetricValue(action, "other")
 	result = cleanMetricValue(result, "unknown")
-	statusValue := "unknown"
 	statusClass := "unknown"
 	if status > 0 {
-		statusValue = strconv.Itoa(status)
 		statusClass = strconv.Itoa(status/100) + "xx"
 	}
 	RegisterModule("tenant_usage")
 	attrs := []Attribute{
 		Attr("tenant_id", tenantID),
 		Attr("surface", surface),
-		Attr("action", action),
 		Attr("result", result),
-		Attr("status", statusValue),
 		Attr("status_class", statusClass),
 	}
 	tenantRequestsTotal.Add(1, attrs...)
@@ -358,14 +346,12 @@ func RecordTenantRequest(tenantID, surface, action, result string, status int, d
 	}
 	tenantRequestDuration.Observe(d.Seconds(),
 		Attr("surface", surface),
-		Attr("action", action),
-		Attr("result", result),
 		Attr("status_class", statusClass),
 	)
 }
 
 func RecordTenantHTTPBytes(tenantID, surface, action, direction string, bytes int64) {
-	recordTenantBytes(tenantHTTPBytes, tenantID, surface, action, direction, bytes)
+	recordTenantHTTPBytes(tenantID, surface, direction, bytes)
 }
 
 func RecordTenantFileBytes(tenantID, surface, action, direction string, bytes int64) {
@@ -417,6 +403,18 @@ func recordTenantBytes(counter *Int64Counter, tenantID, surface, action, directi
 		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
 		Attr("surface", cleanMetricValue(surface, "other")),
 		Attr("action", cleanMetricValue(action, "other")),
+		Attr("direction", cleanMetricValue(direction, "unknown")),
+	)
+}
+
+func recordTenantHTTPBytes(tenantID, surface, direction string, bytes int64) {
+	if bytes <= 0 {
+		return
+	}
+	RegisterModule("tenant_usage")
+	tenantHTTPBytes.Add(bytes,
+		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
+		Attr("surface", cleanMetricValue(surface, "other")),
 		Attr("direction", cleanMetricValue(direction, "unknown")),
 	)
 }
