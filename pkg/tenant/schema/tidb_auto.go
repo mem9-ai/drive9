@@ -654,6 +654,13 @@ func currentTiDBTenantSchemaVersion(stmts []string) int {
 	return schemaspec.CRC32Version(specStmts)
 }
 
+func tenantSchemaLogFields(ctx context.Context, fields ...zap.Field) []zap.Field {
+	if tenantID := TenantIDFromContext(ctx); tenantID != "" {
+		fields = append([]zap.Field{zap.String("tenant_id", tenantID)}, fields...)
+	}
+	return fields
+}
+
 type tidbColumnMeta struct {
 	columnType           string
 	extra                string
@@ -1041,8 +1048,8 @@ func ValidateTiDBSchemaForEmbeddingModeProfile(ctx context.Context, db *sql.DB, 
 
 func validateTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) error {
 	start := time.Now()
-	logger.Info(ctx, "tenant_tidb_schema_validate_started",
-		zap.String("mode", string(mode)))
+	logger.Info(ctx, "tenant_tidb_schema_validate_started", tenantSchemaLogFields(ctx,
+		zap.String("mode", string(mode)))...)
 	if db == nil {
 		return fmt.Errorf("nil db")
 	}
@@ -1057,17 +1064,17 @@ func validateTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode T
 		return err
 	}
 	if len(diffs) > 0 {
-		logger.Warn(ctx, "tenant_tidb_schema_validate_failed",
+		logger.Warn(ctx, "tenant_tidb_schema_validate_failed", tenantSchemaLogFields(ctx,
 			zap.String("mode", string(mode)),
 			zap.Int("diff_count", len(diffs)),
 			zap.Strings("diffs", summarizeTiDBSchemaDiffs(diffs)),
-			zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+			zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))...)
 		return &tidbSchemaDiffError{mode: mode, diffs: diffs}
 	}
-	logger.Info(ctx, "tenant_tidb_schema_validate_finished",
+	logger.Info(ctx, "tenant_tidb_schema_validate_finished", tenantSchemaLogFields(ctx,
 		zap.String("mode", string(mode)),
 		zap.Int("diff_count", 0),
-		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))...)
 	return nil
 }
 
@@ -1116,8 +1123,8 @@ func EnsureTiDBSchemaForEmbeddingModeProfile(ctx context.Context, db *sql.DB, mo
 func ensureTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) error {
 	start := time.Now()
 	attemptedPasses := 0
-	logger.Info(ctx, "tenant_tidb_schema_ensure_started",
-		zap.String("mode", string(mode)))
+	logger.Info(ctx, "tenant_tidb_schema_ensure_started", tenantSchemaLogFields(ctx,
+		zap.String("mode", string(mode)))...)
 	if db == nil {
 		return fmt.Errorf("nil db")
 	}
@@ -1138,13 +1145,13 @@ func ensureTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiD
 		if err != nil {
 			return err
 		}
-		logger.Info(ctx, "tenant_tidb_schema_ensure_diff_pass_finished",
+		logger.Info(ctx, "tenant_tidb_schema_ensure_diff_pass_finished", tenantSchemaLogFields(ctx,
 			zap.String("mode", string(mode)),
 			zap.Int("repair_pass", i+1),
 			zap.Int("max_repair_passes", maxRepairPasses),
 			zap.Int("diff_count", len(diffs)),
 			zap.Strings("diffs", summarizeTiDBSchemaDiffs(diffs)),
-			zap.Float64("duration_ms", float64(time.Since(passStart).Microseconds())/1000.0))
+			zap.Float64("duration_ms", float64(time.Since(passStart).Microseconds())/1000.0))...)
 		if err := BackfillPathHashes(ctx, db); err != nil {
 			return fmt.Errorf("backfill path hashes before repair: %w", err)
 		}
@@ -1152,26 +1159,26 @@ func ensureTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiD
 			if err := BackfillStorageRefHashes(ctx, db); err != nil {
 				return fmt.Errorf("backfill storage_ref_hash: %w", err)
 			}
-			logger.Info(ctx, "tenant_tidb_schema_ensure_finished",
+			logger.Info(ctx, "tenant_tidb_schema_ensure_finished", tenantSchemaLogFields(ctx,
 				zap.String("mode", string(mode)),
 				zap.Int("repair_passes", attemptedPasses),
-				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))...)
 			return nil
 		}
 		repairs := plannedTiDBSchemaRepairs(diffs)
 		if len(repairs) == 0 {
-			logger.Warn(ctx, "tenant_tidb_schema_ensure_no_safe_repairs",
+			logger.Warn(ctx, "tenant_tidb_schema_ensure_no_safe_repairs", tenantSchemaLogFields(ctx,
 				zap.String("mode", string(mode)),
 				zap.Int("repair_pass", i+1),
-				zap.Strings("diffs", summarizeTiDBSchemaDiffs(diffs)))
+				zap.Strings("diffs", summarizeTiDBSchemaDiffs(diffs)))...)
 			// Drift remains but nothing in it is safe to repair automatically.
 			break
 		}
-		logger.Info(ctx, "tenant_tidb_schema_ensure_repair_pass_started",
+		logger.Info(ctx, "tenant_tidb_schema_ensure_repair_pass_started", tenantSchemaLogFields(ctx,
 			zap.String("mode", string(mode)),
 			zap.Int("repair_pass", i+1),
 			zap.Int("repair_count", len(repairs)),
-			zap.Strings("repairs", summarizeSchemaStatements(repairs)))
+			zap.Strings("repairs", summarizeSchemaStatements(repairs)))...)
 		if err := applyTiDBSchemaRepairs(ctx, db, repairs); err != nil {
 			return err
 		}
@@ -1188,10 +1195,10 @@ func ensureTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiD
 	if err := BackfillPathHashes(ctx, db); err != nil {
 		return fmt.Errorf("backfill path hashes: %w", err)
 	}
-	logger.Info(ctx, "tenant_tidb_schema_ensure_finished",
+	logger.Info(ctx, "tenant_tidb_schema_ensure_finished", tenantSchemaLogFields(ctx,
 		zap.String("mode", string(mode)),
 		zap.Int("repair_passes", attemptedPasses),
-		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))...)
 	return nil
 }
 
@@ -1275,8 +1282,8 @@ func initTiDBFTSOnlySchemaWithProfile(ctx context.Context, dsn string, profile T
 
 func initTiDBSchemaWithProfileAndMode(ctx context.Context, dsn string, profile TiDBAutoEmbeddingProfile, mode TiDBEmbeddingMode) error {
 	start := time.Now()
-	logger.Info(ctx, "tenant_tidb_schema_init_started",
-		zap.String("mode", string(mode)))
+	logger.Info(ctx, "tenant_tidb_schema_init_started", tenantSchemaLogFields(ctx,
+		zap.String("mode", string(mode)))...)
 	render, err := tidbAutoEmbeddingRenderConfigForProfile(profile)
 	if err != nil {
 		return err
@@ -1310,9 +1317,9 @@ func initTiDBSchemaWithProfileAndMode(ctx context.Context, dsn string, profile T
 	default:
 		return validateTiDBSchemaMode(mode)
 	}
-	logger.Info(ctx, "tenant_tidb_schema_init_finished",
+	logger.Info(ctx, "tenant_tidb_schema_init_finished", tenantSchemaLogFields(ctx,
 		zap.String("mode", string(mode)),
-		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))...)
 	return nil
 }
 
@@ -1377,7 +1384,7 @@ func OpenTiDBSchemaDB(ctx context.Context, dsn string) (*sql.DB, error) {
 	if HasMultiStatements(dsn) {
 		return nil, fmt.Errorf("multiStatements is not allowed")
 	}
-	db, err := mysqlutil.OpenInstrumentedForTenant(ctx, dsn, mysqlutil.RoleUserSchema, tenantIDFromContext(ctx))
+	db, err := mysqlutil.OpenInstrumentedForTenant(ctx, dsn, mysqlutil.RoleUserSchema, TenantIDFromContext(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -1596,12 +1603,12 @@ func diffTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiDBE
 		return nil, err
 	}
 	diffs = append(diffs, legacyFilesDiffs...)
-	logger.Info(ctx, "tenant_tidb_schema_diff_finished",
+	logger.Info(ctx, "tenant_tidb_schema_diff_finished", tenantSchemaLogFields(ctx,
 		zap.String("mode", string(mode)),
 		zap.Int("table_count", len(spec.tables)),
 		zap.Int("table_parallelism", tableParallelism),
 		zap.Int("diff_count", len(diffs)),
-		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))...)
 	return diffs, nil
 }
 
@@ -1703,7 +1710,7 @@ func diffTiDBTable(ctx context.Context, db *sql.DB, table tidbTableSpec) ([]tidb
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			diffs := missingTableAndIndexDiffs(table)
-			logger.Info(ctx, "tenant_tidb_schema_diff_table_finished",
+			logger.Info(ctx, "tenant_tidb_schema_diff_table_finished", tenantSchemaLogFields(ctx,
 				zap.String("table", table.name),
 				zap.Bool("table_missing", true),
 				zap.Float64("load_columns_ms", loadColumnsDurationMs),
@@ -1711,7 +1718,7 @@ func diffTiDBTable(ctx context.Context, db *sql.DB, table tidbTableSpec) ([]tidb
 				zap.Float64("load_indexes_ms", 0),
 				zap.Int("diff_count", len(diffs)),
 				zap.Strings("diffs", summarizeTiDBSchemaDiffs(diffs)),
-				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))...)
 			return diffs, nil
 		}
 		return nil, fmt.Errorf("load %s table metadata: %w", table.name, err)
@@ -1726,7 +1733,7 @@ func diffTiDBTable(ctx context.Context, db *sql.DB, table tidbTableSpec) ([]tidb
 	observedIndexes, indexesObserved := loadObservedTiDBIndexes(ctx, db, table.name, createStmt)
 	loadIndexesDurationMs := float64(time.Since(loadIndexesStart).Microseconds()) / 1000.0
 	diffs := diffTiDBTableMetaWithObservedIndexes(table, meta, createStmt, observedIndexes, indexesObserved)
-	logger.Info(ctx, "tenant_tidb_schema_diff_table_finished",
+	logger.Info(ctx, "tenant_tidb_schema_diff_table_finished", tenantSchemaLogFields(ctx,
 		zap.String("table", table.name),
 		zap.Bool("table_missing", false),
 		zap.Bool("indexes_observed", indexesObserved),
@@ -1736,16 +1743,16 @@ func diffTiDBTable(ctx context.Context, db *sql.DB, table tidbTableSpec) ([]tidb
 		zap.Int("column_count", len(meta.columns)),
 		zap.Int("diff_count", len(diffs)),
 		zap.Strings("diffs", summarizeTiDBSchemaDiffs(diffs)),
-		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))...)
 	return diffs, nil
 }
 
 func loadObservedTiDBIndexes(ctx context.Context, db *sql.DB, tableName, createStmt string) (map[string]struct{}, bool) {
 	indexNames, statErr := loadTiDBIndexNames(ctx, db, tableName)
 	if statErr != nil {
-		logger.Warn(ctx, "tenant_tidb_schema_load_index_metadata_failed",
+		logger.Warn(ctx, "tenant_tidb_schema_load_index_metadata_failed", tenantSchemaLogFields(ctx,
 			zap.String("table", tableName),
-			zap.Error(statErr))
+			zap.Error(statErr))...)
 	}
 
 	merged := make(map[string]struct{})
@@ -1762,8 +1769,8 @@ func loadObservedTiDBIndexes(ctx context.Context, db *sql.DB, tableName, createS
 			}
 		}
 	} else if statErr != nil {
-		logger.Warn(ctx, "tenant_tidb_schema_parse_show_create_indexes_failed",
-			zap.String("table", tableName))
+		logger.Warn(ctx, "tenant_tidb_schema_parse_show_create_indexes_failed", tenantSchemaLogFields(ctx,
+			zap.String("table", tableName))...)
 	}
 
 	if len(merged) == 0 && statErr != nil {
@@ -2946,10 +2953,10 @@ func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string
 	for i, stmt := range statements {
 		start := time.Now()
 		snippet := schemaStatementSnippet(stmt)
-		logger.Info(ctx, "tenant_tidb_schema_repair_statement_started",
+		logger.Info(ctx, "tenant_tidb_schema_repair_statement_started", tenantSchemaLogFields(ctx,
 			zap.Int("statement_index", i+1),
 			zap.Int("statement_count", len(statements)),
-			zap.String("statement", snippet))
+			zap.String("statement", snippet))...)
 		if isUniqueIndexRepairSQL(stmt) {
 			repair, ok := parseUniqueIndexRepairStatement(stmt)
 			if !ok {
@@ -2965,12 +2972,12 @@ func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string
 		}
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			if isIgnorableTiDBSchemaError(err) {
-				logger.Info(ctx, "tenant_tidb_schema_repair_statement_skipped_existing",
+				logger.Info(ctx, "tenant_tidb_schema_repair_statement_skipped_existing", tenantSchemaLogFields(ctx,
 					zap.Int("statement_index", i+1),
 					zap.Int("statement_count", len(statements)),
 					zap.String("statement", snippet),
 					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
-					zap.Error(err))
+					zap.Error(err))...)
 				continue
 			}
 			// FULLTEXT and VECTOR index repairs may fail with optional-feature
@@ -2979,27 +2986,27 @@ func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string
 			// 1105: FULLTEXT index is not supported). Treat these the same as
 			// when the statement was skipped during initial provisioning.
 			if isFulltextOrVectorIndexRepairSQL(stmt) && isIgnorableOptionalSchemaError(err) {
-				logger.Warn(ctx, "tenant_tidb_schema_repair_optional_index_skipped",
+				logger.Warn(ctx, "tenant_tidb_schema_repair_optional_index_skipped", tenantSchemaLogFields(ctx,
 					zap.Int("statement_index", i+1),
 					zap.Int("statement_count", len(statements)),
 					zap.String("statement", snippet),
 					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
-					zap.Error(err))
+					zap.Error(err))...)
 				continue
 			}
-			logger.Error(ctx, "tenant_tidb_schema_repair_statement_failed",
+			logger.Error(ctx, "tenant_tidb_schema_repair_statement_failed", tenantSchemaLogFields(ctx,
 				zap.Int("statement_index", i+1),
 				zap.Int("statement_count", len(statements)),
 				zap.String("statement", snippet),
 				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
-				zap.Error(err))
+				zap.Error(err))...)
 			return fmt.Errorf("apply tidb schema repair %q: %w", snippet, err)
 		}
-		logger.Info(ctx, "tenant_tidb_schema_repair_statement_finished",
+		logger.Info(ctx, "tenant_tidb_schema_repair_statement_finished", tenantSchemaLogFields(ctx,
 			zap.Int("statement_index", i+1),
 			zap.Int("statement_count", len(statements)),
 			zap.String("statement", snippet),
-			zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+			zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))...)
 	}
 	return nil
 }
@@ -3093,28 +3100,28 @@ func parseAlterTableAddUniqueIndexRepairStatement(stmt string) (tableName, index
 
 func ensureUniqueIndexRepairSafe(ctx context.Context, db *sql.DB, repair tidbUniqueIndexRepair) error {
 	start := time.Now()
-	logger.Info(ctx, "tenant_tidb_schema_unique_index_preflight_started",
+	logger.Info(ctx, "tenant_tidb_schema_unique_index_preflight_started", tenantSchemaLogFields(ctx,
 		zap.String("table", repair.tableName),
 		zap.String("index", repair.indexName),
-		zap.Strings("columns", repair.columns))
+		zap.Strings("columns", repair.columns))...)
 	var exists int
 	err := db.QueryRowContext(ctx, buildUniqueIndexDuplicateCheckSQL(repair)).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
-		logger.Info(ctx, "tenant_tidb_schema_unique_index_preflight_finished",
+		logger.Info(ctx, "tenant_tidb_schema_unique_index_preflight_finished", tenantSchemaLogFields(ctx,
 			zap.String("table", repair.tableName),
 			zap.String("index", repair.indexName),
 			zap.Bool("duplicates_found", false),
-			zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+			zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))...)
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("preflight unique index repair %s on %s: %w", repair.indexName, repair.tableName, err)
 	}
-	logger.Warn(ctx, "tenant_tidb_schema_unique_index_preflight_finished",
+	logger.Warn(ctx, "tenant_tidb_schema_unique_index_preflight_finished", tenantSchemaLogFields(ctx,
 		zap.String("table", repair.tableName),
 		zap.String("index", repair.indexName),
 		zap.Bool("duplicates_found", true),
-		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))...)
 	return fmt.Errorf("cannot auto-repair unique index %s on %s: duplicate rows exist for columns (%s)", repair.indexName, repair.tableName, strings.Join(repair.columns, ", "))
 }
 

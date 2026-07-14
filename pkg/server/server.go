@@ -4920,18 +4920,22 @@ func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID str
 }
 
 func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(context.Context, string) error) func(context.Context, string) error {
+	fallbackWithTenant := func(ctx context.Context, dsn string) error {
+		return fallback(tenantschema.WithTenantID(ctx, tenantID), dsn)
+	}
 	if !tenant.UsesTiDBAutoEmbedding(provider) {
-		return fallback
+		return fallbackWithTenant
 	}
 	provisioner := s.provisionerForTenantProvider(provider)
 	if provisioner == nil {
-		return fallback
+		return fallbackWithTenant
 	}
 	profileAware, ok := provisioner.(autoEmbeddingSchemaProvisioner)
 	if !ok {
-		return fallback
+		return fallbackWithTenant
 	}
 	return func(ctx context.Context, dsn string) error {
+		ctx = tenantschema.WithTenantID(ctx, tenantID)
 		if ensurer, ok := provisioner.(tenantDatabaseEnsurer); ok {
 			if err := ensurer.EnsureDatabase(ctx, dsn); err != nil {
 				return fmt.Errorf("ensure tenant database: %w", err)
@@ -4963,6 +4967,24 @@ func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(co
 		}
 		return nil
 	}
+}
+
+func (s *Server) updateTenantSchemaVersionForProfile(ctx context.Context, tenantID, provider string) error {
+	if s.meta == nil || !tenant.UsesTiDBAutoEmbedding(provider) {
+		return nil
+	}
+	profile, err := s.autoEmbeddingProfileForTenant(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
+	}
+	version, err := tenant.TiDBTenantSchemaVersionForEmbeddingMode(profile.mode, profile.schemaProfile)
+	if err != nil {
+		return fmt.Errorf("resolve tenant embedding schema version: %w", err)
+	}
+	if err := s.meta.UpdateTenantSchemaVersion(ctx, tenantID, version); err != nil {
+		return fmt.Errorf("persist tenant schema version: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOptions) (*provisionTenantResult, error) {
@@ -5374,6 +5396,15 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 				return
 			}
 			err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+			if err == nil {
+				if versionErr := s.updateTenantSchemaVersionForProfile(ctx, tenantID, provider); versionErr != nil {
+					logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_version_persist_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", versionErr)...)
+					if s.metrics != nil {
+						s.metrics.recordEvent(tenantID, "tenant_schema_init", "provider", provider, "result", "error", "stage", "schema_version_persist")
+					}
+					err = versionErr
+				}
+			}
 		}
 		if err == nil {
 			s.schemaInitErrors.Delete(tenantID)
