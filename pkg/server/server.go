@@ -4979,7 +4979,7 @@ func (s *Server) updateTenantSchemaVersionForProfile(ctx context.Context, tenant
 	}
 	version, err := tenant.TiDBTenantSchemaVersionForEmbeddingMode(profile.mode, profile.schemaProfile)
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve tenant embedding schema version: %w", err)
 	}
 	if err := s.meta.UpdateTenantSchemaVersion(ctx, tenantID, version); err != nil {
 		return fmt.Errorf("persist tenant schema version: %w", err)
