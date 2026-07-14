@@ -12,6 +12,7 @@ from .core import progress
 FUSE_TOOLS = (
     "fio",
     "java",
+    "kirk",
     "mdtest",
     "perl",
     "prove",

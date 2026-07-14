@@ -308,6 +308,14 @@ func (fs *Dat9FS) flushPendingWriteBack(ctx context.Context, remotePath string) 
 // This prevents slow/dead servers from blocking the FUSE event loop forever.
 const fuseTimeout = 30 * time.Second
 
+// flushLockTimeout bounds how long Flush waits to acquire fh.mu. A
+// debounced-flush callback or background upload may hold fh.mu while doing
+// network I/O. Without a deadline, close_range() (which issues a Flush for
+// every inherited FUSE fd) blocks the kernel's request_wait_answer forever.
+// 60s is generous: releaseTimeout gives the upload itself up to 15 min, but
+// the lock holder releases fh.mu during the actual HTTP transfer.
+const flushLockTimeout = 60 * time.Second
+
 const (
 	// lookupTransientRetryCount is the number of detached retries after the
 	// initial Lookup StatCtx attempt fails with a transient error.
@@ -1640,6 +1648,17 @@ func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) (f
 	}
 	fh.ZeroBase = newSize == 0
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+	// Reset OrigSize only when truncating to 0 or shrinking below the
+	// original size. When truncating to 0, the server re-stores the file as
+	// db9 (small-file storage), so OrigSize must be 0 to avoid selecting
+	// PatchFile (which requires S3 storage). When growing, the server-side
+	// storage type doesn't change, so keeping OrigSize at the new size is
+	// safe only if the file was already S3-backed; if it was db9-backed,
+	// OrigSize should stay at the pre-truncate value to avoid PatchFile
+	// (qiffang B5). Use the minimum to be safe.
+	if newSize == 0 || newSize < fh.OrigSize {
+		fh.OrigSize = newSize
+	}
 	return abortStreamer, nil
 }
 
@@ -2161,6 +2180,47 @@ func (fs *Dat9FS) lockRemoteCommitPath(path string) func() {
 	return lock.Unlock
 }
 
+// lockRemoteCommitPathTimeout is like lockRemoteCommitPath but bounded by a
+// deadline. If the deadline expires, it returns (nil, false) and the caller
+// must proceed without the lock. This prevents close_range Flush from
+// blocking forever when a commit-queue worker holds the per-path mutex.
+func (fs *Dat9FS) lockRemoteCommitPathTimeout(path string, timeout time.Duration) (func(), bool) {
+	if fs == nil || path == "" {
+		return func() {}, true
+	}
+	fs.remoteCommitMu.Lock()
+	if fs.remoteCommitLocks == nil {
+		fs.remoteCommitLocks = make(map[string]*sync.Mutex)
+	}
+	lock := fs.remoteCommitLocks[path]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		fs.remoteCommitLocks[path] = lock
+	}
+	fs.remoteCommitMu.Unlock()
+
+	deadline := time.Now().Add(timeout)
+	backoff := 10 * time.Millisecond
+	const maxBackoff = 500 * time.Millisecond
+	for {
+		if lock.TryLock() {
+			return lock.Unlock, true
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, false
+		}
+		sleep := backoff
+		if remaining < sleep {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+		if backoff < maxBackoff {
+			backoff *= 2
+		}
+	}
+}
+
 // tryLockRemoteCommitPath attempts to acquire the per-path remote commit
 // lock without blocking. Returns (unlock, true) on success, (nil, false) if
 // the lock is already held.
@@ -2464,6 +2524,45 @@ func (fs *Dat9FS) fileHandlesForInode(ino uint64) []*FileHandle {
 		}
 	})
 	return handles
+}
+
+// syncOpenHandlesAfterPathTruncate truncates the WriteBuffer of every open
+// dirty handle for the given inode after a path-based truncate(path, size).
+//
+// Without this, applyRemoteTruncate updates the remote file and the inode's
+// cached size, but the open handle's WriteBuffer still holds the pre-truncate
+// data. A subsequent fstat(fd) calls GetAttr → dirtyHandleSize(ino), which
+// returns the stale WriteBuffer size instead of the truncated size, causing
+// fstat() mismatch (LTP ftest01 m_fstat case).
+//
+// Both shrink and grow are handled. For shrink, the buffer is truncated.
+// For grow, the buffer is zero-extended so a later flush uploads the correct
+// size (not stale shorter content that could shrink the file back).
+func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
+	for _, fh := range fs.fileHandlesForInode(ino) {
+		fh.Lock()
+		if fh.Dirty == nil {
+			fh.Unlock()
+			continue
+		}
+		curSize := fh.Dirty.Size()
+		if curSize != newSize {
+			if err := fh.Dirty.Truncate(newSize); err != nil {
+				log.Printf("path-truncate sync: dirty buffer truncate failed for %s: %v", fh.Path, err)
+				fh.Unlock()
+				continue
+			}
+			fh.Dirty.ResetSequentialState(newSize)
+			fh.ZeroBase = newSize == 0
+			// Reset OrigSize only when truncating to 0 or shrinking to
+			// prevent PatchFile on db9-backed files (see B5 rationale).
+			if newSize == 0 || newSize < fh.OrigSize {
+				fh.OrigSize = newSize
+			}
+		}
+		fh.DirtySeq = fs.markDirtySize(ino, newSize)
+		fh.Unlock()
+	}
 }
 
 func (fs *Dat9FS) setPendingMetadataMode(path string, mode uint32) {
@@ -6179,6 +6278,17 @@ func (fs *Dat9FS) lockWritableRemoteCommitPath(p string) func() {
 	if fs.opts != nil {
 		timeout = fs.opts.RemoteCommitWaitTimeout
 	}
+	// timeout == 0 means "no deadline / wait forever" (the semantics that
+	// existed before the bounded-lock change). Delegate to the original
+	// unbounded lockRemoteCommitPath so we don't spin on a zero deadline.
+	if timeout <= 0 {
+		// Still drain the commit queue first, then take the lock — same
+		// ordering as the timed path below.
+		if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
+			fs.commitQueue.WaitPathTimeout(p, 50*time.Millisecond)
+		}
+		return fs.lockRemoteCommitPath(p)
+	}
 	deadline := time.Now().Add(timeout)
 	for {
 		if timeout > 0 && time.Now().After(deadline) {
@@ -6220,7 +6330,20 @@ func (fs *Dat9FS) lockWritableRemoteCommitPath(p string) func() {
 			}
 			continue
 		}
-		unlockRemoteCommit := fs.lockRemoteCommitPath(p)
+		// Use a bounded lock attempt instead of the unbounded
+		// lockRemoteCommitPath. If the lock is held by another goroutine
+		// (e.g. a commit-queue worker that acquired it between our HasPath
+		// check and here), we poll up to the remaining deadline, then fall
+		// through to the deadline-expired path which proceeds without the
+		// lock. This prevents close_range Flush from blocking forever.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			continue // re-enter loop, hit deadline-expired path
+		}
+		unlockRemoteCommit, ok := fs.lockRemoteCommitPathTimeout(p, remaining)
+		if !ok {
+			continue // deadline expired, re-enter loop
+		}
 		if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
 			unlockRemoteCommit()
 			if !fs.commitQueue.WaitPathTimeout(p, 50*time.Millisecond) {
@@ -7077,6 +7200,12 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
 				return st
 			}
+			// Path-based truncate(path, size) truncates the remote file but
+			// does not update open dirty handles' WriteBuffers. Without this
+			// sync, a subsequent fstat(fd) on an open dirty handle returns the
+			// stale (pre-truncate) size via dirtyHandleSize(), causing
+			// fstat() mismatch failures (LTP ftest01 m_fstat case).
+			fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
 		}
 		entry.Size = newSize
 		fs.inodes.UpdateSize(input.NodeId, newSize)
@@ -10950,7 +11079,10 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	phase := "start"
 	fs.debugf("flush start path=%s fh=%d ino=%d", fh.Path, input.Fh, fh.Ino)
 	lockStart := time.Now()
-	fh.Lock()
+	if !fh.LockWithTimeout(flushLockTimeout) {
+		fs.debugf("flush lock timeout path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, time.Since(lockStart))
+		return gofuse.EIO
+	}
 	if lockWait := time.Since(lockStart); fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 		fs.debugf("flush lock wait path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, lockWait)
 	}
@@ -12076,7 +12208,13 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		// so no deadlock. Path 2 holds remoteCommitLock and releases fh.mu
 		// before uploading, so the callback blocks here until Path 2
 		// finishes and releases remoteCommitLock.
-		unlockRemoteCommit := fs.lockRemoteCommitPath(filePath)
+		//
+		// Use lockWritableRemoteCommitPath (bounded by
+		// RemoteCommitWaitTimeout, default 5s) instead of the unbounded
+		// lockRemoteCommitPath. Without this, a stuck commit-queue worker
+		// holding remoteCommitLocks[path] would block this callback forever,
+		// which in turn blocks fh.Lock() → any subsequent Flush hangs.
+		unlockRemoteCommit := fs.lockWritableRemoteCommitPath(filePath)
 
 		// Re-check the expected revision after acquiring both locks.
 		// Path 2 records committed revision while holding remoteCommitLock,
