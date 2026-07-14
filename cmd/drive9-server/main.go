@@ -577,6 +577,8 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidb_cloud_native database name (default: tidbcloud_fs)
   DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY optional default TiDB Cloud API public key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY optional default TiDB Cloud API private key for tidb_cloud_native create/delete when caller omits it
+  DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT true|false to use TiDB Cloud private endpoint hosts for tidb_cloud_native
+  DRIVE9_TIDBCLOUD_PRIVATE_ENDPOINT_HOST_MAP comma-separated public_host=private_host mappings used when private endpoint host is absent
   DRIVE9_TENANT_POOL_MAX_SIZE maximum admin tenant pool size (default: %d)
   DRIVE9_TENANT_POOL_REFILL_FREE_RATIO claim-triggered refill runs when active free tenants fall below this ratio (default: %.2f)
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*

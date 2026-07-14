@@ -26,6 +26,7 @@ import (
 
 	mysql "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 	"go.uber.org/zap"
@@ -40,6 +41,7 @@ const (
 	EnvTiDBCloudNativePublicKey               = "DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY"
 	EnvTiDBCloudNativePrivateKey              = "DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY"
 	EnvTiDBCloudNativeUsePrivateEndpoint      = "DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT"
+	EnvTiDBCloudPrivateEndpointHostMap        = "DRIVE9_TIDBCLOUD_PRIVATE_ENDPOINT_HOST_MAP"
 	EnvTiDBCloudTencentPrivateEndpointHost    = "DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST"
 	EnvTiDBCloudAlicloudPrivateEndpointDomain = "DRIVE9_TIDBCLOUD_ALICLOUD_PRIVATE_ENDPOINT_DOMAIN"
 
@@ -74,10 +76,11 @@ var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 var displayNameCharPattern = regexp.MustCompile(`[^A-Za-z0-9-]`)
 
 var (
-	ensureDatabaseFunc                       = ensureDatabase
-	tidbCloudNativePollInterval              = 5 * time.Second
-	tidbCloudNativeBatchMetadataGroupSize    = 10
-	tidbCloudNativeBatchMetadataPollInterval = 15 * time.Second
+	ensureDatabaseFunc                        = ensureDatabase
+	tidbCloudNativePollInterval               = 5 * time.Second
+	tidbCloudNativeBatchMetadataGroupSize     = 10
+	tidbCloudNativeBatchMetadataPollInterval  = 15 * time.Second
+	tidbCloudNativeMetadataNotReadyAlertAfter = 5 * time.Minute
 )
 
 type Provisioner struct {
@@ -89,6 +92,7 @@ type Provisioner struct {
 	defaultPublicKey            string
 	defaultPrivateKey           string
 	usePrivateEndpoint          bool
+	privateEndpointHostMap      map[string]string
 	tencentPrivateEndpointHost  string
 	alicloudPrivateEndpointHost string
 	client                      *http.Client
@@ -121,14 +125,10 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 		return nil, err
 	}
 	tencentPrivateHost := strings.TrimSpace(os.Getenv(EnvTiDBCloudTencentPrivateEndpointHost))
-	if usePrivate && strings.EqualFold(cloudProvider, cloudProviderTencentCloud) && tencentPrivateHost == "" {
-		return nil, fmt.Errorf("%s is required when %s=true and cloud provider is tencentcloud",
-			EnvTiDBCloudTencentPrivateEndpointHost, EnvTiDBCloudNativeUsePrivateEndpoint)
-	}
 	alicloudPrivateHost := strings.TrimSpace(os.Getenv(EnvTiDBCloudAlicloudPrivateEndpointDomain))
-	if usePrivate && strings.EqualFold(cloudProvider, cloudProviderAliCloud) && alicloudPrivateHost == "" {
-		return nil, fmt.Errorf("%s is required when %s=true and cloud provider is alicloud",
-			EnvTiDBCloudAlicloudPrivateEndpointDomain, EnvTiDBCloudNativeUsePrivateEndpoint)
+	hostMap, err := parsePrivateEndpointHostMap(os.Getenv(EnvTiDBCloudPrivateEndpointHostMap))
+	if err != nil {
+		return nil, err
 	}
 	return &Provisioner{
 		apiURL:                      strings.TrimRight(apiURL, "/"),
@@ -139,6 +139,7 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 		defaultPublicKey:            strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePublicKey)),
 		defaultPrivateKey:           strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePrivateKey)),
 		usePrivateEndpoint:          usePrivate,
+		privateEndpointHostMap:      hostMap,
 		tencentPrivateEndpointHost:  tencentPrivateHost,
 		alicloudPrivateEndpointHost: alicloudPrivateHost,
 		client:                      &http.Client{Timeout: 60 * time.Second},
@@ -298,7 +299,7 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 	if info.ClusterID == "" {
 		return nil, nil, fmt.Errorf("tidbcloud native response missing cluster id")
 	}
-	if clusterProvisionMetadataIncomplete(info, p.usePrivateEndpoint, p.privateEndpointOverrideHost()) {
+	if p.clusterProvisionMetadataIncomplete(info) {
 		clusterID := info.ClusterID
 		info, err = p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, clusterID)
 		if err != nil {
@@ -311,32 +312,16 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 			}, nil, err
 		}
 	}
-	var host string
-	var port int
-	if p.usePrivateEndpoint {
-		overrideHost := p.privateEndpointOverrideHost()
-		if overrideHost != "" {
-			host = overrideHost
-		} else {
-			host = info.Endpoints.Private.Host
-		}
-		port = info.Endpoints.Private.Port
-	} else {
-		host = info.Endpoints.Public.Host
-		port = info.Endpoints.Public.Port
-	}
-	out := &tenant.ClusterInfo{
-		TenantID:       tenantID,
-		ClusterID:      info.ClusterID,
-		OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
-		Host:           host,
-		Port:           port,
-		Password:       password,
-		DBName:         dbName,
-		Provider:       tenant.ProviderTiDBCloudNative,
-	}
-	if info.UserPrefix != "" {
-		out.Username = info.UserPrefix + ".root"
+	out, err := p.clusterInfoFromResponse(tenantID, dbName, password, info)
+	if err != nil {
+		return &tenant.ClusterInfo{
+			TenantID:       tenantID,
+			ClusterID:      info.ClusterID,
+			OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
+			Password:       password,
+			DBName:         dbName,
+			Provider:       tenant.ProviderTiDBCloudNative,
+		}, nil, err
 	}
 	cloudCfg := &tenant.QuotaCloudConfig{
 		Labels: map[string]string{
@@ -454,7 +439,7 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 			errs[i] = fmt.Errorf("tidbcloud native batch response missing cluster id for tenant %q", tenantID)
 			continue
 		}
-		out[i] = p.clusterInfoFromResponse(tenantID, dbName, password, &info)
+		out[i], errs[i] = p.clusterInfoFromResponse(tenantID, dbName, password, &info)
 	}
 	for _, err := range errs {
 		if err != nil {
@@ -524,11 +509,13 @@ func (p *Provisioner) waitForBatchClusterProvisionMetadataGroup(ctx context.Cont
 		zap.Strings("cluster_ids", sortedClusterIDs(pending)),
 		zap.Strings("tenant_ids", sortedTenantIDs(pending)))
 	pollCount := 0
+	notReadyAlertRecorded := false
 	for len(pending) > 0 {
 		pollCount++
 		seenCount := 0
 		readyCount := 0
 		incompleteClusterIDs := make([]string, 0, len(pending))
+		incompleteReasons := make(map[string]struct{})
 		infos, err := p.listClusterInfosWithCredentials(ctx, publicKey, privateKey, clusterIDs, len(clusterIDs))
 		if err != nil {
 			if !isTiDBCloudStatus(err, http.StatusTooManyRequests) || time.Now().After(deadline) {
@@ -564,11 +551,18 @@ func (p *Provisioner) waitForBatchClusterProvisionMetadataGroup(ctx context.Cont
 					delete(pending, clusterID)
 					continue
 				}
-				if clusterProvisionMetadataIncomplete(&info, p.usePrivateEndpoint, p.privateEndpointOverrideHost()) {
+				if p.clusterProvisionMetadataIncomplete(&info) {
 					incompleteClusterIDs = append(incompleteClusterIDs, clusterID)
+					incompleteReasons[p.metadataIncompleteReasonForCluster(&info)] = struct{}{}
 					continue
 				}
-				out[target.index] = p.clusterInfoFromResponse(target.tenantID, target.dbName, target.password, &info)
+				updated, err := p.clusterInfoFromResponse(target.tenantID, target.dbName, target.password, &info)
+				if err != nil {
+					errs[target.index] = err
+					delete(pending, clusterID)
+					continue
+				}
+				out[target.index] = updated
 				delete(pending, clusterID)
 				readyCount++
 			}
@@ -592,6 +586,7 @@ func (p *Provisioner) waitForBatchClusterProvisionMetadataGroup(ctx context.Cont
 			zap.Strings("pending_tenant_ids", sortedTenantIDs(pending)),
 			zap.Strings("incomplete_cluster_ids", incompleteClusterIDs),
 			zap.Duration("elapsed", time.Since(started)))
+		p.recordMetadataNotReadyAlert(ctx, "cluster_batch", "", "", batchMetadataIncompleteReason(seenCount, incompleteReasons), started, &notReadyAlertRecorded)
 		if time.Now().After(deadline) {
 			for clusterID, target := range pending {
 				errs[target.index] = fmt.Errorf("tidbcloud native cluster %s missing connection metadata or organization label before timeout", clusterID)
@@ -687,7 +682,7 @@ func (p *Provisioner) WaitForPoolClusterMetadata(ctx context.Context, cluster *t
 	if err != nil {
 		return nil, err
 	}
-	return p.clusterInfoFromResponse(strings.TrimSpace(cluster.TenantID), dbName, cluster.Password, info), nil
+	return p.clusterInfoFromResponse(strings.TrimSpace(cluster.TenantID), dbName, cluster.Password, info)
 }
 
 func (p *Provisioner) WaitForPoolClustersMetadata(ctx context.Context, clusters []*tenant.ClusterInfo, req tenant.CredentialProvisionRequest) ([]*tenant.ClusterInfo, error) {
@@ -906,7 +901,7 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 		DBName:    dbName,
 		Provider:  tenant.ProviderTiDBCloudNative,
 	}
-	if !branchConnectionIncomplete(branch, p.usePrivateEndpoint, p.privateEndpointOverrideHost()) {
+	if !p.branchConnectionIncomplete(branch) {
 		if err := p.fillBranchEndpoint(out, branch); err != nil {
 			return out, err
 		}
@@ -1275,6 +1270,9 @@ func (p *Provisioner) regionName() string {
 }
 
 func (p *Provisioner) privateEndpointOverrideHost() string {
+	if len(p.privateEndpointHostMap) > 0 {
+		return ""
+	}
 	switch strings.ToLower(p.cloudProvider) {
 	case cloudProviderTencentCloud:
 		return p.tencentPrivateEndpointHost
@@ -1285,6 +1283,67 @@ func (p *Provisioner) privateEndpointOverrideHost() string {
 	default:
 		return ""
 	}
+}
+
+func (p *Provisioner) mappedPrivateEndpointHost(publicHost string) (string, bool) {
+	if len(p.privateEndpointHostMap) == 0 {
+		return "", false
+	}
+	host, ok := p.privateEndpointHostMap[privateEndpointHostMapKey(publicHost)]
+	if !ok || strings.TrimSpace(host) == "" {
+		return "", false
+	}
+	return host, true
+}
+
+func (p *Provisioner) resolveClusterEndpoint(info *clusterInfo) (string, int, error) {
+	if info == nil {
+		return "", 0, fmt.Errorf("tidbcloud native response missing cluster connection metadata")
+	}
+	if !p.usePrivateEndpoint {
+		return strings.TrimSpace(info.Endpoints.Public.Host), info.Endpoints.Public.Port, nil
+	}
+	host, err := p.resolvePrivateEndpointHost("cluster", info.Endpoints.Public.Host, info.Endpoints.Private.Host)
+	if err != nil {
+		return "", 0, err
+	}
+	return host, info.Endpoints.Private.Port, nil
+}
+
+func (p *Provisioner) resolveBranchEndpoint(branch *branchInfo) (string, int, error) {
+	if branch == nil {
+		return "", 0, fmt.Errorf("tidbcloud native response missing branch connection metadata")
+	}
+	if !p.usePrivateEndpoint {
+		return strings.TrimSpace(branch.Endpoints.Public.Host), branch.Endpoints.Public.Port, nil
+	}
+	host, err := p.resolvePrivateEndpointHost("branch", branch.Endpoints.Public.Host, branch.Endpoints.Private.Host)
+	if err != nil {
+		return "", 0, err
+	}
+	return host, branch.Endpoints.Private.Port, nil
+}
+
+func (p *Provisioner) resolvePrivateEndpointHost(resource, publicHost, privateHost string) (string, error) {
+	if host := strings.TrimSpace(privateHost); host != "" {
+		return host, nil
+	}
+	publicHost = strings.TrimSpace(publicHost)
+	if publicHost != "" {
+		if host, ok := p.mappedPrivateEndpointHost(publicHost); ok {
+			return host, nil
+		}
+	}
+	if len(p.privateEndpointHostMap) == 0 {
+		if host := p.privateEndpointOverrideHost(); host != "" {
+			return host, nil
+		}
+	}
+	metrics.RecordOperation("tidbcloud_native", "private_endpoint_host_lookup", "mapping_missing", 0)
+	if publicHost == "" {
+		return "", fmt.Errorf("tidbcloud native %s private endpoint host is empty and public host is unavailable for %s lookup", resource, EnvTiDBCloudPrivateEndpointHostMap)
+	}
+	return "", fmt.Errorf("tidbcloud native %s private endpoint host is empty and public host %q has no private host mapping in %s", resource, publicHost, EnvTiDBCloudPrivateEndpointHostMap)
 }
 
 func clusterDisplayName(tenantID string) string {
@@ -1385,6 +1444,142 @@ func parseBoolEnv(name string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("%s must be 1/true/yes or 0/false/no, got %q", name, os.Getenv(name))
+}
+
+func parsePrivateEndpointHostMap(raw string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	entries := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n'
+	})
+	out := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			key, value, ok = strings.Cut(entry, ":")
+		}
+		if !ok {
+			return nil, fmt.Errorf("%s entry %q must use public_host=private_host", EnvTiDBCloudPrivateEndpointHostMap, entry)
+		}
+		key = privateEndpointHostMapKey(strings.Trim(strings.TrimSpace(key), `"'`))
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		if key == "" || value == "" {
+			return nil, fmt.Errorf("%s entry %q must include both public and private hosts", EnvTiDBCloudPrivateEndpointHostMap, entry)
+		}
+		if prev, exists := out[key]; exists && prev != value {
+			return nil, fmt.Errorf("%s has duplicate public host %q", EnvTiDBCloudPrivateEndpointHostMap, key)
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func privateEndpointHostMapKey(host string) string {
+	host = strings.TrimSpace(strings.ToLower(host))
+	host = strings.TrimSuffix(host, ".")
+	return host
+}
+
+func (p *Provisioner) metadataIncompleteReasonForCluster(info *clusterInfo) string {
+	if info == nil {
+		return "response_missing"
+	}
+	if strings.TrimSpace(info.UserPrefix) == "" {
+		return "user_prefix_missing"
+	}
+	if !p.usePrivateEndpoint {
+		if strings.TrimSpace(info.Endpoints.Public.Host) == "" {
+			return "public_host_missing"
+		}
+		if info.Endpoints.Public.Port == 0 {
+			return "public_port_missing"
+		}
+		if strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]) == "" {
+			return "organization_label_missing"
+		}
+		return "connection_metadata_missing"
+	}
+	if info.Endpoints.Private.Port == 0 {
+		return "private_port_missing"
+	}
+	if strings.TrimSpace(info.Endpoints.Private.Host) == "" && strings.TrimSpace(info.Endpoints.Public.Host) == "" {
+		return "public_host_missing"
+	}
+	if strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]) == "" {
+		return "organization_label_missing"
+	}
+	return "connection_metadata_missing"
+}
+
+func (p *Provisioner) metadataIncompleteReasonForBranch(info *branchInfo) string {
+	if info == nil {
+		return "response_missing"
+	}
+	if strings.TrimSpace(info.UserPrefix) == "" {
+		return "user_prefix_missing"
+	}
+	if !p.usePrivateEndpoint {
+		if strings.TrimSpace(info.Endpoints.Public.Host) == "" {
+			return "public_host_missing"
+		}
+		if info.Endpoints.Public.Port == 0 {
+			return "public_port_missing"
+		}
+		return "connection_metadata_missing"
+	}
+	if info.Endpoints.Private.Port == 0 {
+		return "private_port_missing"
+	}
+	if strings.TrimSpace(info.Endpoints.Private.Host) == "" && strings.TrimSpace(info.Endpoints.Public.Host) == "" {
+		return "public_host_missing"
+	}
+	return "connection_metadata_missing"
+}
+
+func batchMetadataIncompleteReason(seenCount int, reasons map[string]struct{}) string {
+	if seenCount == 0 {
+		return "cluster_not_seen"
+	}
+	if len(reasons) == 1 {
+		for reason := range reasons {
+			return reason
+		}
+	}
+	if len(reasons) > 1 {
+		return "multiple_missing_fields"
+	}
+	return "metadata_pending"
+}
+
+func (p *Provisioner) recordMetadataNotReadyAlert(ctx context.Context, resource, clusterID, branchID, reason string, started time.Time, recorded *bool) {
+	if recorded == nil || *recorded {
+		return
+	}
+	threshold := tidbCloudNativeMetadataNotReadyAlertAfter
+	if threshold <= 0 || time.Since(started) < threshold {
+		return
+	}
+	*recorded = true
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "not_ready"
+	}
+	metrics.RecordOperation("tidbcloud_native", "metadata_not_ready_5m", reason, time.Since(started))
+	logger.Warn(ctx, "tidbcloud_native_metadata_not_ready_5m",
+		zap.String("resource", resource),
+		zap.String("cluster_id", strings.TrimSpace(clusterID)),
+		zap.String("branch_id", strings.TrimSpace(branchID)),
+		zap.String("reason", reason),
+		zap.Duration("elapsed", time.Since(started)))
 }
 
 func normalizeDatabaseName(name string) (string, error) {
@@ -1633,28 +1828,18 @@ func compactNonEmptyStrings(values []string) []string {
 	return out
 }
 
-func (p *Provisioner) clusterInfoFromResponse(tenantID, dbName, password string, info *clusterInfo) *tenant.ClusterInfo {
+func (p *Provisioner) clusterInfoFromResponse(tenantID, dbName, password string, info *clusterInfo) (*tenant.ClusterInfo, error) {
 	if info == nil {
 		return &tenant.ClusterInfo{
 			TenantID: tenantID,
 			Password: password,
 			DBName:   dbName,
 			Provider: tenant.ProviderTiDBCloudNative,
-		}
+		}, nil
 	}
-	var host string
-	var port int
-	if p.usePrivateEndpoint {
-		overrideHost := p.privateEndpointOverrideHost()
-		if overrideHost != "" {
-			host = overrideHost
-		} else {
-			host = info.Endpoints.Private.Host
-		}
-		port = info.Endpoints.Private.Port
-	} else {
-		host = info.Endpoints.Public.Host
-		port = info.Endpoints.Public.Port
+	host, port, err := p.resolveClusterEndpoint(info)
+	if err != nil {
+		return nil, err
 	}
 	out := &tenant.ClusterInfo{
 		TenantID:       tenantID,
@@ -1669,7 +1854,7 @@ func (p *Provisioner) clusterInfoFromResponse(tenantID, dbName, password string,
 	if info.UserPrefix != "" {
 		out.Username = info.UserPrefix + ".root"
 	}
-	return out
+	return out, nil
 }
 
 func parseBranchInfo(raw []byte) (*branchInfo, error) {
@@ -1693,8 +1878,33 @@ func clusterConnectionIncomplete(info *clusterInfo, usePrivate bool, overridePri
 	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || info.UserPrefix == ""
 }
 
-func clusterProvisionMetadataIncomplete(info *clusterInfo, usePrivate bool, overridePrivateHost string) bool {
-	if clusterConnectionIncomplete(info, usePrivate, overridePrivateHost) {
+func (p *Provisioner) clusterConnectionIncomplete(info *clusterInfo) bool {
+	if info == nil {
+		return true
+	}
+	if !p.usePrivateEndpoint {
+		return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || info.UserPrefix == ""
+	}
+	if info.Endpoints.Private.Port == 0 || info.UserPrefix == "" {
+		return true
+	}
+	if strings.TrimSpace(info.Endpoints.Private.Host) != "" {
+		return false
+	}
+	if strings.TrimSpace(info.Endpoints.Public.Host) == "" {
+		return true
+	}
+	if _, ok := p.mappedPrivateEndpointHost(info.Endpoints.Public.Host); ok {
+		return false
+	}
+	if len(p.privateEndpointHostMap) == 0 && p.privateEndpointOverrideHost() != "" {
+		return false
+	}
+	return false
+}
+
+func (p *Provisioner) clusterProvisionMetadataIncomplete(info *clusterInfo) bool {
+	if p.clusterConnectionIncomplete(info) {
 		return true
 	}
 	return strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]) == ""
@@ -1713,20 +1923,35 @@ func branchConnectionIncomplete(info *branchInfo, usePrivate bool, overridePriva
 	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || info.UserPrefix == ""
 }
 
+func (p *Provisioner) branchConnectionIncomplete(info *branchInfo) bool {
+	if info == nil {
+		return true
+	}
+	if !p.usePrivateEndpoint {
+		return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || info.UserPrefix == ""
+	}
+	if info.Endpoints.Private.Port == 0 || info.UserPrefix == "" {
+		return true
+	}
+	if strings.TrimSpace(info.Endpoints.Private.Host) != "" {
+		return false
+	}
+	if strings.TrimSpace(info.Endpoints.Public.Host) == "" {
+		return true
+	}
+	if _, ok := p.mappedPrivateEndpointHost(info.Endpoints.Public.Host); ok {
+		return false
+	}
+	if len(p.privateEndpointHostMap) == 0 && p.privateEndpointOverrideHost() != "" {
+		return false
+	}
+	return false
+}
+
 func (p *Provisioner) fillBranchEndpoint(out *tenant.ClusterInfo, branch *branchInfo) error {
-	var host string
-	var port int
-	if p.usePrivateEndpoint {
-		overrideHost := p.privateEndpointOverrideHost()
-		if overrideHost != "" {
-			host = overrideHost
-		} else {
-			host = branch.Endpoints.Private.Host
-		}
-		port = branch.Endpoints.Private.Port
-	} else {
-		host = branch.Endpoints.Public.Host
-		port = branch.Endpoints.Public.Port
+	host, port, err := p.resolveBranchEndpoint(branch)
+	if err != nil {
+		return err
 	}
 	if branch.UserPrefix != "" {
 		out.Username = branch.UserPrefix + ".root"
@@ -1737,7 +1962,9 @@ func (p *Provisioner) fillBranchEndpoint(out *tenant.ClusterInfo, branch *branch
 }
 
 func (p *Provisioner) waitForClusterProvisionMetadata(ctx context.Context, publicKey, privateKey, clusterID string) (*clusterInfo, error) {
+	started := time.Now()
 	deadline := time.Now().Add(10 * time.Minute)
+	notReadyAlertRecorded := false
 	for {
 		endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s?view=BASIC", p.apiURL, clusterID)
 		resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
@@ -1768,9 +1995,10 @@ func (p *Provisioner) waitForClusterProvisionMetadata(ctx context.Context, publi
 		if err != nil {
 			return nil, err
 		}
-		if !clusterProvisionMetadataIncomplete(info, p.usePrivateEndpoint, p.privateEndpointOverrideHost()) {
+		if !p.clusterProvisionMetadataIncomplete(info) {
 			return info, nil
 		}
+		p.recordMetadataNotReadyAlert(ctx, "cluster", clusterID, "", p.metadataIncompleteReasonForCluster(info), started, &notReadyAlertRecorded)
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("tidbcloud native cluster %s missing connection metadata or organization label before timeout: %s", clusterID, info.State)
 		}
@@ -1783,7 +2011,9 @@ func (p *Provisioner) waitForClusterProvisionMetadata(ctx context.Context, publi
 }
 
 func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privateKey, clusterID, branchID string) (*branchInfo, error) {
+	started := time.Now()
 	deadline := time.Now().Add(10 * time.Minute)
+	notReadyAlertRecorded := false
 	for {
 		endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches/%s?view=BASIC", p.apiURL, url.PathEscape(clusterID), url.PathEscape(branchID))
 		resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
@@ -1806,9 +2036,14 @@ func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privat
 		if err != nil {
 			return nil, err
 		}
-		if info.State == stateActive && !branchConnectionIncomplete(info, p.usePrivateEndpoint, p.privateEndpointOverrideHost()) {
+		if info.State == stateActive && !p.branchConnectionIncomplete(info) {
 			return info, nil
 		}
+		reason := p.metadataIncompleteReasonForBranch(info)
+		if info.State != stateActive {
+			reason = "state_not_active"
+		}
+		p.recordMetadataNotReadyAlert(ctx, "branch", clusterID, branchID, reason, started, &notReadyAlertRecorded)
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("tidbcloud native branch %s not active before timeout: %s", branchID, info.State)
 		}
@@ -1826,7 +2061,9 @@ func (p *Provisioner) WaitForBranchUserWithCredentials(ctx context.Context, clus
 	if publicKey == "" || privateKey == "" {
 		return "", tenant.ErrCredentialsRequired
 	}
+	started := time.Now()
 	deadline := time.Now().Add(10 * time.Minute)
+	notReadyAlertRecorded := false
 	for {
 		endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches/%s?view=BASIC", p.apiURL, url.PathEscape(clusterID), url.PathEscape(branchID))
 		resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
@@ -1852,6 +2089,7 @@ func (p *Provisioner) WaitForBranchUserWithCredentials(ctx context.Context, clus
 		if info.UserPrefix != "" {
 			return info.UserPrefix + ".root", nil
 		}
+		p.recordMetadataNotReadyAlert(ctx, "branch_user", clusterID, branchID, "user_prefix_missing", started, &notReadyAlertRecorded)
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("tidbcloud native branch %s user prefix not available before timeout", branchID)
 		}

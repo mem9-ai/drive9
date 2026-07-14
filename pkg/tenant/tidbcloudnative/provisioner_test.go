@@ -1671,7 +1671,7 @@ func TestNewProvisionerFromEnvRejectsMalformedPrivateEndpointFlag(t *testing.T) 
 	}
 }
 
-func TestNewProvisionerFromEnvRequiresAlicloudPrivateEndpointDomain(t *testing.T) {
+func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 	setPrivateEnv := func(provider string) {
 		t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 		t.Setenv(EnvTiDBCloudNativeCloudProvider, provider)
@@ -1679,17 +1679,21 @@ func TestNewProvisionerFromEnvRequiresAlicloudPrivateEndpointDomain(t *testing.T
 		t.Setenv(EnvTiDBCloudNativeUsePrivateEndpoint, "true")
 		t.Setenv(EnvTiDBCloudTencentPrivateEndpointHost, "")
 		t.Setenv(EnvTiDBCloudAlicloudPrivateEndpointDomain, "")
+		t.Setenv(EnvTiDBCloudPrivateEndpointHostMap, "")
 	}
 
-	t.Run("alicloud missing domain", func(t *testing.T) {
+	t.Run("alicloud no startup override required", func(t *testing.T) {
 		setPrivateEnv("alicloud")
-		_, err := NewProvisionerFromEnv()
-		if err == nil {
-			t.Fatalf("expected error for alicloud private endpoint without domain")
+		p, err := NewProvisionerFromEnv()
+		if err != nil {
+			t.Fatalf("NewProvisionerFromEnv without alicloud host override: %v", err)
+		}
+		if !p.usePrivateEndpoint {
+			t.Fatalf("usePrivateEndpoint = false, want true")
 		}
 	})
 
-	t.Run("alicloud with domain", func(t *testing.T) {
+	t.Run("alicloud legacy domain fallback", func(t *testing.T) {
 		setPrivateEnv("alicloud")
 		t.Setenv(EnvTiDBCloudAlicloudPrivateEndpointDomain, "alicloud.internal")
 		p, err := NewProvisionerFromEnv()
@@ -1701,15 +1705,18 @@ func TestNewProvisionerFromEnvRequiresAlicloudPrivateEndpointDomain(t *testing.T
 		}
 	})
 
-	t.Run("tencentcloud missing host", func(t *testing.T) {
+	t.Run("tencentcloud no startup override required", func(t *testing.T) {
 		setPrivateEnv("tencentcloud")
-		_, err := NewProvisionerFromEnv()
-		if err == nil {
-			t.Fatalf("expected error for tencentcloud private endpoint without host")
+		p, err := NewProvisionerFromEnv()
+		if err != nil {
+			t.Fatalf("NewProvisionerFromEnv without tencentcloud host override: %v", err)
+		}
+		if !p.usePrivateEndpoint {
+			t.Fatalf("usePrivateEndpoint = false, want true")
 		}
 	})
 
-	t.Run("tencentcloud with host", func(t *testing.T) {
+	t.Run("tencentcloud legacy host fallback", func(t *testing.T) {
 		setPrivateEnv("tencentcloud")
 		t.Setenv(EnvTiDBCloudTencentPrivateEndpointHost, "tencent.internal")
 		p, err := NewProvisionerFromEnv()
@@ -1729,6 +1736,21 @@ func TestNewProvisionerFromEnvRequiresAlicloudPrivateEndpointDomain(t *testing.T
 		}
 		if p.usePrivateEndpoint != true {
 			t.Fatalf("usePrivateEndpoint = %v, want true", p.usePrivateEndpoint)
+		}
+	})
+
+	t.Run("host map", func(t *testing.T) {
+		setPrivateEnv("tencentcloud")
+		t.Setenv(EnvTiDBCloudPrivateEndpointHostMap, "public-a.example=private-a.internal, public-b.example:private-b.internal")
+		p, err := NewProvisionerFromEnv()
+		if err != nil {
+			t.Fatalf("NewProvisionerFromEnv with host map: %v", err)
+		}
+		if got := p.privateEndpointHostMap["public-a.example"]; got != "private-a.internal" {
+			t.Fatalf("host map public-a = %q, want private-a.internal", got)
+		}
+		if got := p.privateEndpointHostMap["public-b.example"]; got != "private-b.internal" {
+			t.Fatalf("host map public-b = %q, want private-b.internal", got)
 		}
 	})
 }
@@ -1810,6 +1832,94 @@ func TestProvisionWithCredentialsUsesPrivateEndpoint(t *testing.T) {
 	}
 }
 
+func TestProvisionWithCredentialsMapsPublicHostToPrivateEndpoint(t *testing.T) {
+	origEnsureDatabase := ensureDatabaseFunc
+	ensureDatabaseFunc = func(context.Context, string, string, string, int, string) error {
+		return nil
+	}
+	t.Cleanup(func() { ensureDatabaseFunc = origEnsureDatabase })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"clusterId":  "cluster-1",
+			"state":      "ACTIVE",
+			"userPrefix": "u1",
+			"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1"},
+			"endpoints": map[string]any{
+				"public":  map[string]any{"host": "public-a.example", "port": 4000},
+				"private": map[string]any{"host": "", "port": 4001},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:                 ts.URL,
+		defaultDatabaseName:    DefaultDatabaseName,
+		usePrivateEndpoint:     true,
+		privateEndpointHostMap: map[string]string{"public-a.example": "private-a.internal"},
+		client:                 ts.Client(),
+	}
+	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+		PublicKey: "public-1", PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{})
+	if err != nil {
+		t.Fatalf("ProvisionWithCredentialsAndQuota: %v", err)
+	}
+	if res.Host != "private-a.internal" {
+		t.Fatalf("Host = %q, want private-a.internal", res.Host)
+	}
+	if res.Port != 4001 {
+		t.Fatalf("Port = %d, want 4001", res.Port)
+	}
+}
+
+func TestProvisionWithCredentialsErrorsWhenPrivateHostMappingMissing(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"clusterId":  "cluster-1",
+			"state":      "ACTIVE",
+			"userPrefix": "u1",
+			"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1"},
+			"endpoints": map[string]any{
+				"public":  map[string]any{"host": "unmapped.example", "port": 4000},
+				"private": map[string]any{"host": "", "port": 4001},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:                 ts.URL,
+		defaultDatabaseName:    DefaultDatabaseName,
+		usePrivateEndpoint:     true,
+		privateEndpointHostMap: map[string]string{"public-a.example": "private-a.internal"},
+		client:                 ts.Client(),
+	}
+	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+		PublicKey: "public-1", PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{})
+	if err == nil {
+		t.Fatalf("ProvisionWithCredentialsAndQuota error = nil, want missing mapping error")
+	}
+	if !strings.Contains(err.Error(), EnvTiDBCloudPrivateEndpointHostMap) || !strings.Contains(err.Error(), "unmapped.example") {
+		t.Fatalf("error = %v, want mapping miss with public host", err)
+	}
+	if res == nil || res.ClusterID != "cluster-1" {
+		t.Fatalf("partial cluster = %#v, want cluster id preserved", res)
+	}
+}
+
 func TestBranchConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	branch := &branchInfo{
 		BranchID:   "branch-1",
@@ -1854,7 +1964,7 @@ func TestFillBranchEndpointUsesPrivateEndpoint(t *testing.T) {
 	}
 }
 
-func TestFillBranchEndpointOverrideTakesPriority(t *testing.T) {
+func TestFillBranchEndpointUsesClusterPrivateHostBeforeLegacyOverride(t *testing.T) {
 	branch := &branchInfo{
 		BranchID:   "branch-1",
 		UserPrefix: "u1",
@@ -1873,12 +1983,21 @@ func TestFillBranchEndpointOverrideTakesPriority(t *testing.T) {
 	if err := p.fillBranchEndpoint(out, branch); err != nil {
 		t.Fatalf("fillBranchEndpoint: %v", err)
 	}
+	if out.Host != "private.internal" {
+		t.Fatalf("Host = %q, want private.internal", out.Host)
+	}
+
+	branch.Endpoints.Private.Host = ""
+	out = &tenant.ClusterInfo{}
+	if err := p.fillBranchEndpoint(out, branch); err != nil {
+		t.Fatalf("fillBranchEndpoint with empty private host: %v", err)
+	}
 	if out.Host != "alicloud.override.internal" {
-		t.Fatalf("Host = %q, want alicloud.override.internal (override takes priority)", out.Host)
+		t.Fatalf("Host with empty private host = %q, want alicloud.override.internal", out.Host)
 	}
 }
 
-func TestClusterInfoFromResponseOverrideTakesPriority(t *testing.T) {
+func TestClusterInfoFromResponseUsesClusterPrivateHostBeforeLegacyOverride(t *testing.T) {
 	info := &clusterInfo{
 		ClusterID:  "cluster-1",
 		UserPrefix: "u1",
@@ -1894,8 +2013,20 @@ func TestClusterInfoFromResponseOverrideTakesPriority(t *testing.T) {
 		alicloudPrivateEndpointHost: "alicloud.override.internal",
 		cloudProvider:               cloudProviderAliCloud,
 	}
-	out := p.clusterInfoFromResponse("tenant-1", "db1", "pass1", info)
+	out, err := p.clusterInfoFromResponse("tenant-1", "db1", "pass1", info)
+	if err != nil {
+		t.Fatalf("clusterInfoFromResponse: %v", err)
+	}
+	if out.Host != "private.internal" {
+		t.Fatalf("Host = %q, want private.internal", out.Host)
+	}
+
+	info.Endpoints.Private.Host = ""
+	out, err = p.clusterInfoFromResponse("tenant-1", "db1", "pass1", info)
+	if err != nil {
+		t.Fatalf("clusterInfoFromResponse with empty private host: %v", err)
+	}
 	if out.Host != "alicloud.override.internal" {
-		t.Fatalf("Host = %q, want alicloud.override.internal (override takes priority)", out.Host)
+		t.Fatalf("Host with empty private host = %q, want alicloud.override.internal", out.Host)
 	}
 }
