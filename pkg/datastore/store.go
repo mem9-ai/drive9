@@ -3036,7 +3036,7 @@ func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error
 		if shouldLogStoreOpFailure(result) {
 			logger.Error(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
 		} else {
-			logger.Warn(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+			logger.Warn(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.String("detail", (*errp).Error()))
 		}
 	}
 	logger.InfoBenchTiming(ctx, "datastore_op_timing",

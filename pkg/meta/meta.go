@@ -3517,7 +3517,7 @@ func observeMeta(ctx context.Context, op string, start time.Time, errp *error) {
 			// Connection closed during shutdown — suppress the noisy log and
 			// only record the metric below.
 		case "not_found", "duplicate":
-			logger.Warn(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+			logger.Warn(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.String("detail", (*errp).Error()))
 		case "error":
 			logger.Error(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
 		}
