@@ -25,7 +25,11 @@ func TiDBEmbeddingModeForTenantMode(mode string) (schema.TiDBEmbeddingMode, erro
 func TiDBTenantSchemaVersionForEmbeddingMode(mode string, profile schema.TiDBAutoEmbeddingProfile) (int, error) {
 	tidbMode, err := TiDBEmbeddingModeForTenantMode(mode)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("map tenant embedding mode %q: %w", mode, err)
 	}
-	return schema.TiDBTenantSchemaVersionForEmbeddingModeProfile(tidbMode, profile)
+	version, err := schema.TiDBTenantSchemaVersionForEmbeddingModeProfile(tidbMode, profile)
+	if err != nil {
+		return 0, fmt.Errorf("derive tenant schema version for mode %q: %w", mode, err)
+	}
+	return version, nil
 }
