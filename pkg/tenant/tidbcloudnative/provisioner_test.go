@@ -1778,12 +1778,8 @@ func TestClusterConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	}
 
 	p := &Provisioner{usePrivateEndpoint: true}
-	if !p.clusterConnectionIncomplete(info) {
-		t.Fatalf("private mode without host map or legacy override should keep waiting for API private host")
-	}
-	p.privateEndpointHostMap = map[string]string{"other-public.example": "private.internal"}
 	if p.clusterConnectionIncomplete(info) {
-		t.Fatalf("private mode with host map should stop waiting and let endpoint resolution fail fast on an unmapped public host")
+		t.Fatalf("private mode should stop waiting once public host, private port, and user prefix are ready")
 	}
 }
 
@@ -1952,12 +1948,8 @@ func TestBranchConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	}
 
 	p := &Provisioner{usePrivateEndpoint: true}
-	if !p.branchConnectionIncomplete(branch) {
-		t.Fatalf("private mode without host map or legacy override should keep waiting for API private host")
-	}
-	p.privateEndpointHostMap = map[string]string{"other-public.example": "private.internal"}
 	if p.branchConnectionIncomplete(branch) {
-		t.Fatalf("private mode with host map should stop waiting and let endpoint resolution fail fast on an unmapped public host")
+		t.Fatalf("private mode should stop waiting once public host, private port, and user prefix are ready")
 	}
 }
 

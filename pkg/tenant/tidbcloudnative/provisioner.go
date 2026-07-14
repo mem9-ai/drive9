@@ -1943,13 +1943,10 @@ func (p *Provisioner) endpointConnectionIncomplete(publicHost, privateHost strin
 	if publicHost == "" {
 		return true
 	}
-	if len(p.privateEndpointHostMap) > 0 {
-		return false
-	}
-	if p.privateEndpointOverrideHost() != "" {
-		return false
-	}
-	return true
+	// TiDB Cloud exposes public/private endpoint host readiness together. Once
+	// public host is visible, an empty private host is a resolution problem:
+	// use the public->private map or fail fast instead of polling indefinitely.
+	return false
 }
 
 func (p *Provisioner) fillBranchEndpoint(out *tenant.ClusterInfo, branch *branchInfo) error {
