@@ -163,6 +163,13 @@ func (g *Float64Gauge) Set(value float64, attrs ...Attribute) {
 	g.registry.setGauge(g.name, labelsKey(attrs), value)
 }
 
+func (g *Float64Gauge) Delete(attrs ...Attribute) {
+	if g == nil || g.registry == nil {
+		return
+	}
+	g.registry.deleteGauge(g.name, labelsKey(attrs))
+}
+
 func (h *Float64Histogram) Observe(value float64, attrs ...Attribute) {
 	if h == nil || h.registry == nil {
 		return
@@ -274,6 +281,16 @@ func (r *Registry) setGauge(name, labels string, value float64) {
 		panic(fmt.Sprintf("metrics: gauge %s not registered", name))
 	}
 	inst.values[labels] = value
+}
+
+func (r *Registry) deleteGauge(name, labels string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	inst := r.gauges[name]
+	if inst == nil {
+		panic(fmt.Sprintf("metrics: gauge %s not registered", name))
+	}
+	delete(inst.values, labels)
 }
 
 func (r *Registry) observeHistogram(name, labels string, value float64) {

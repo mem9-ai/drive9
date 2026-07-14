@@ -44,7 +44,7 @@ var sseMeter = globalMeterProvider.Meter("sse")
 var tenantMeter = globalMeterProvider.Meter("tenant")
 
 var serviceOperationsTotal = serviceMeter.Int64Counter("drive9_service_operations_total", "Service operations by component/operation/result")
-var serviceOperationDuration = serviceMeter.Float64Histogram("drive9_service_operation_duration_seconds", "Service operation duration histogram", operationDurationBounds)
+var serviceOperationDuration = serviceMeter.Float64Histogram("drive9_service_operation_duration_seconds", "Service operation duration histogram by component/operation/result", operationDurationBounds)
 var serviceGauge = serviceMeter.Float64Gauge("drive9_service_gauge", "Service gauges by component/name")
 var tenantPoolMetadataResumeWaitTotal = serviceMeter.Int64Counter("drive9_tenant_pool_metadata_resume_wait_total", "Tenant pool metadata resume wait attempts by pool_id/organization_id/scope/result")
 var tenantPoolMetadataResumeWaitDuration = serviceMeter.Float64Histogram("drive9_tenant_pool_metadata_resume_wait_duration_seconds", "Tenant pool metadata resume wait duration by pool_id/organization_id/scope/result", tenantPoolMetadataResumeWaitDurationBounds)
@@ -69,7 +69,7 @@ var fuseRemoteOperationDuration = fuseMeter.Float64Histogram("drive9_fuse_remote
 var fuseRemoteOperationBytes = fuseMeter.Int64Counter("drive9_fuse_remote_operation_bytes_total", "Bytes processed by remote FUSE operation/result")
 
 var tenantRequestsTotal = tenantMeter.Int64Counter("drive9_tenant_requests_total", "Tenant-scoped requests by tenant/surface/action/result/status/status_class")
-var tenantRequestDuration = tenantMeter.Float64Histogram("drive9_tenant_request_duration_seconds", "Tenant-scoped request duration histogram", httpDurationBounds)
+var tenantRequestDuration = tenantMeter.Float64Histogram("drive9_tenant_request_duration_seconds", "Tenant request duration histogram by surface/action/result/status_class", httpDurationBounds)
 var tenantInflight = tenantMeter.Float64Gauge("drive9_tenant_inflight_requests", "Current in-flight tenant-scoped requests by tenant/surface/action")
 var tenantHTTPBytes = tenantMeter.Int64Counter("drive9_tenant_http_bytes_total", "Tenant-scoped HTTP transport bytes by tenant/surface/action/direction")
 var tenantFileBytes = tenantMeter.Int64Counter("drive9_tenant_file_bytes_total", "Tenant-scoped logical file bytes by tenant/surface/action/direction")
@@ -90,7 +90,7 @@ var sseHeartbeatsSentTotal = sseMeter.Int64Counter("drive9_sse_heartbeats_sent_t
 // Event-bus query instruments. Covers all fs_events DB reads (events_since,
 // poll, latest, oldest) so DB pressure and table growth on the events path
 // are observable without direct DB access.
-var eventBusQueryDuration = serviceMeter.Float64Histogram("drive9_event_bus_query_duration_seconds", "Event-bus fs_events query duration by operation/result/tenant_id", eventBusQueryDurationBounds)
+var eventBusQueryDuration = serviceMeter.Float64Histogram("drive9_event_bus_query_duration_seconds", "Event-bus fs_events query duration by operation/result", eventBusQueryDurationBounds)
 var eventBusPollFailuresTotal = sseMeter.Int64Counter("drive9_event_bus_poll_failures_total", "Event-bus cross-pod poll query failures by tenant_id")
 var eventBusPublishErrorsTotal = sseMeter.Int64Counter("drive9_event_bus_publish_errors_total", "Event-bus fs_events INSERT failures by tenant_id")
 
@@ -132,19 +132,7 @@ func RecordTenantOperation(tenantID, component, operation, result string, d time
 		return
 	}
 	durationAttrs := baseAttrs[:3]
-	if tenantID != "unknown" && serviceOperationDurationIncludesTenant(component) {
-		durationAttrs = baseAttrs[:4]
-	}
 	serviceOperationDuration.Observe(d.Seconds(), durationAttrs...)
-}
-
-func serviceOperationDurationIncludesTenant(component string) bool {
-	switch component {
-	case "file_gc", "quota_config_cache", "server_quota", "user_db_access":
-		return false
-	default:
-		return true
-	}
 }
 
 func RecordTenantPoolMetadataResumeWait(poolID, organizationID, scope, result string, d time.Duration) {
@@ -368,7 +356,12 @@ func RecordTenantRequest(tenantID, surface, action, result string, status int, d
 	if d <= 0 {
 		return
 	}
-	tenantRequestDuration.Observe(d.Seconds(), attrs...)
+	tenantRequestDuration.Observe(d.Seconds(),
+		Attr("surface", surface),
+		Attr("action", action),
+		Attr("result", result),
+		Attr("status_class", statusClass),
+	)
 }
 
 func RecordTenantHTTPBytes(tenantID, surface, action, direction string, bytes int64) {
@@ -381,11 +374,16 @@ func RecordTenantFileBytes(tenantID, surface, action, direction string, bytes in
 
 func RecordTenantInFlight(tenantID, surface, action string, value float64) {
 	RegisterModule("tenant_usage")
-	tenantInflight.Set(value,
+	attrs := []Attribute{
 		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
 		Attr("surface", cleanMetricValue(surface, "other")),
 		Attr("action", cleanMetricValue(action, "other")),
-	)
+	}
+	if value <= 0 {
+		tenantInflight.Delete(attrs...)
+		return
+	}
+	tenantInflight.Set(value, attrs...)
 }
 
 func RecordTenantStorageBytes(tenantID, state string, bytes int64) {
@@ -519,7 +517,6 @@ func RecordEventBusQuery(tenantID, operation, result string, d time.Duration) {
 	}
 	RegisterModule("sse")
 	eventBusQueryDuration.Observe(d.Seconds(),
-		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
 		Attr("operation", cleanMetricValue(operation, "unknown")),
 		Attr("result", cleanMetricValue(result, "unknown")),
 	)

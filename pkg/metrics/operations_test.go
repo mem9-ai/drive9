@@ -69,10 +69,10 @@ func TestRecordTenantOperationZeroDurationDoesNotRecordDuration(t *testing.T) {
 	}
 }
 
-func TestRecordTenantOperationOmitsTenantFromSelectedDurationHistograms(t *testing.T) {
+func TestRecordTenantOperationOmitsTenantFromDurationHistograms(t *testing.T) {
 	const operation = "duration_tenant_omit_test_operation"
 
-	for _, component := range []string{"file_gc", "quota_config_cache", "server_quota", "user_db_access"} {
+	for _, component := range []string{"backend", "central_quota", "file_gc", "quota_config_cache", "server_quota", "user_db_access", "vault"} {
 		t.Run(component, func(t *testing.T) {
 			tenantID := "tenant-duration-omit-" + component
 			RecordTenantOperation(tenantID, component, operation, "ok", time.Second)
@@ -93,20 +93,27 @@ func TestRecordTenantOperationOmitsTenantFromSelectedDurationHistograms(t *testi
 	}
 }
 
-func TestRecordTenantOperationKeepsTenantOnBackendDurationHistogram(t *testing.T) {
+func TestRecordTenantRequestDurationOmitsTenantAndStatus(t *testing.T) {
 	const (
-		tenantID  = "tenant-duration-backend"
-		component = "backend"
-		operation = "duration_tenant_keep_test_operation"
+		tenantID = "tenant-request-duration-omit"
+		surface  = "request_duration_surface"
+		action   = "request_duration_action"
 	)
 
-	RecordTenantOperation(tenantID, component, operation, "ok", time.Second)
+	RecordTenantRequest(tenantID, surface, action, "ok", 201, time.Second)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `drive9_service_operation_duration_seconds_count{component="`+component+`",operation="`+operation+`",result="ok",tenant_id="`+tenantID+`"} 1`) {
-		t.Fatalf("backend duration histogram should keep tenant_id:\n%s", text)
+	if !strings.Contains(text, `drive9_tenant_requests_total{action="`+action+`",result="ok",status="201",status_class="2xx",surface="`+surface+`",tenant_id="`+tenantID+`"} 1`) {
+		t.Fatalf("missing tenant-scoped request total:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_request_duration_seconds_count{action="`+action+`",result="ok",status_class="2xx",surface="`+surface+`"} 1`) {
+		t.Fatalf("missing tenant-omitted request duration histogram:\n%s", text)
+	}
+	if strings.Contains(text, `drive9_tenant_request_duration_seconds_count{action="`+action+`",result="ok",status="201"`) ||
+		strings.Contains(text, `drive9_tenant_request_duration_seconds_count{action="`+action+`",result="ok",status_class="2xx",surface="`+surface+`",tenant_id="`+tenantID+`"}`) {
+		t.Fatalf("request duration histogram unexpectedly carried status or tenant_id:\n%s", text)
 	}
 }
 
@@ -159,6 +166,46 @@ func TestRecordTenantDurationMetricsSkipZeroDuration(t *testing.T) {
 	}
 	if strings.Contains(text, `drive9_event_bus_query_duration_seconds_count{operation="events_since",result="ok",tenant_id="`+eventBusTenant+`"}`) {
 		t.Fatalf("zero-duration event bus query unexpectedly recorded a duration:\n%s", text)
+	}
+}
+
+func TestRecordEventBusQueryDurationOmitsTenant(t *testing.T) {
+	const tenantID = "tenant-event-bus-duration-omit"
+
+	RecordEventBusQuery(tenantID, "event_bus_duration_omit", "ok", time.Second)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_event_bus_query_duration_seconds_count{operation="event_bus_duration_omit",result="ok"} 1`) {
+		t.Fatalf("missing tenant-omitted event bus duration:\n%s", text)
+	}
+	if strings.Contains(text, `drive9_event_bus_query_duration_seconds_count{operation="event_bus_duration_omit",result="ok",tenant_id="`+tenantID+`"}`) {
+		t.Fatalf("event bus duration unexpectedly carried tenant_id:\n%s", text)
+	}
+}
+
+func TestRecordTenantInFlightDeletesZeroValue(t *testing.T) {
+	const (
+		tenantID = "tenant-inflight-delete"
+		surface  = "inflight_delete_surface"
+		action   = "inflight_delete_action"
+	)
+
+	RecordTenantInFlight(tenantID, surface, action, 1)
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_tenant_inflight_requests{action="`+action+`",surface="`+surface+`",tenant_id="`+tenantID+`"} 1.000000`) {
+		t.Fatalf("missing tenant in-flight gauge:\n%s", text)
+	}
+
+	RecordTenantInFlight(tenantID, surface, action, 0)
+	rec = httptest.NewRecorder()
+	WritePrometheus(rec)
+	text = rec.Body.String()
+	if strings.Contains(text, `drive9_tenant_inflight_requests{action="`+action+`",surface="`+surface+`",tenant_id="`+tenantID+`"}`) {
+		t.Fatalf("tenant in-flight gauge should be deleted at zero:\n%s", text)
 	}
 }
 
