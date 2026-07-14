@@ -416,8 +416,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, tenant_id, surface, action) (rate(drive9_tenant_request_duration_seconds_bucket{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval])))",
-          "legendFormat": "{{tenant_id}} {{surface}}/{{action}} p95",
+          "expr": "histogram_quantile(0.95, sum by (le, surface) (rate(drive9_tenant_request_duration_seconds_bucket{surface=~\"$surface\"}[$__rate_interval])))",
+          "legendFormat": "{{surface}} p95",
           "refId": "A"
         },
         {
@@ -425,8 +425,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le, tenant_id, surface, action) (rate(drive9_tenant_request_duration_seconds_bucket{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval])))",
-          "legendFormat": "{{tenant_id}} {{surface}}/{{action}} p99",
+          "expr": "histogram_quantile(0.99, sum by (le, surface) (rate(drive9_tenant_request_duration_seconds_bucket{surface=~\"$surface\"}[$__rate_interval])))",
+          "legendFormat": "{{surface}} p99",
           "refId": "B"
         }
       ],
@@ -517,8 +517,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (surface, action, direction) (rate(drive9_tenant_http_bytes_total{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval]))",
-          "legendFormat": "{{surface}}/{{action}} {{direction}}",
+          "expr": "sum by (surface, direction) (rate(drive9_tenant_http_bytes_total{tenant_id=~\"$tenant\",surface=~\"$surface\"}[$__rate_interval]))",
+          "legendFormat": "{{surface}} {{direction}}",
           "refId": "A"
         }
       ],

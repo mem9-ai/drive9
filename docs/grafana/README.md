@@ -14,10 +14,10 @@ Tenant usage metrics intentionally allow `tenant_id` as a Prometheus label, but 
 
 ## Tenant metric contract
 
-- `drive9_tenant_requests_total`: request count by `tenant_id`, `surface`, `action`, `result`, `status`, and `status_class`.
-- `drive9_tenant_request_duration_seconds`: request latency histogram with the same labels as `drive9_tenant_requests_total`.
+- `drive9_tenant_requests_total`: request count by `tenant_id`, `surface`, `action`, `result`, and `status_class`.
+- `drive9_tenant_request_duration_seconds`: request latency histogram by `surface` and `status_class`.
 - `drive9_tenant_inflight_requests`: current in-flight request gauge by `tenant_id`, `surface`, and `action`.
-- `drive9_tenant_http_bytes_total`: HTTP transport bytes by `tenant_id`, `surface`, `action`, and `direction=request|response`.
+- `drive9_tenant_http_bytes_total`: HTTP transport bytes by `tenant_id`, `surface`, and `direction=request|response`.
 - `drive9_tenant_file_bytes_total`: logical file bytes by `tenant_id`, `surface`, `action`, and `direction=read|write`.
 - `drive9_tenant_storage_bytes`: opportunistically published quota storage gauge by `tenant_id` and `state=confirmed|reserved|limit`.
 - `drive9_tenant_media_files`: opportunistically published quota media-file gauge by `tenant_id` and `state=confirmed|limit`.
