@@ -165,14 +165,6 @@ var (
 	defaultTenantPoolIdleReapInterval       = 5 * time.Minute
 )
 
-func tenantSchemaVersionForEmbeddingMode(mode string, profile schema.TiDBAutoEmbeddingProfile) (int, error) {
-	tidbMode, err := TiDBEmbeddingModeForTenantMode(mode)
-	if err != nil {
-		return 0, err
-	}
-	return schema.TiDBTenantSchemaVersionForEmbeddingModeProfile(tidbMode, profile)
-}
-
 func ensureTiDBSchemaForEmbeddingMode(ctx context.Context, db *sql.DB, mode string, profile schema.TiDBAutoEmbeddingProfile) error {
 	tidbMode, err := TiDBEmbeddingModeForTenantMode(mode)
 	if err != nil {
@@ -850,14 +842,15 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			opts.AsyncAudioExtract = backend.AsyncAudioExtractOptions{}
 		}
 		if !p.cfg.SkipTiDBSchemaCheck {
-			targetSchemaVersion, err := tenantSchemaVersionForEmbeddingMode(autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile)
+			targetSchemaVersion, err := TiDBTenantSchemaVersionForEmbeddingMode(autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile)
 			if err != nil {
 				_ = store.Close()
 				return nil, nil, fmt.Errorf("resolve tenant embedding schema version: %w", err)
 			}
 			if t.SchemaVersion != targetSchemaVersion {
 				ensureSchemaStart := time.Now()
-				if err := ensureTiDBSchemaForEmbeddingMode(ctx, store.DB(), autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile); err != nil {
+				schemaCtx := schema.WithTenantID(ctx, t.ID)
+				if err := ensureTiDBSchemaForEmbeddingMode(schemaCtx, store.DB(), autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile); err != nil {
 					_ = store.Close()
 					return nil, nil, fmt.Errorf("ensure tidb embedding schema: %w", err)
 				}
@@ -865,9 +858,12 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 				if p.metaStore != nil {
 					// Record the tenant-profile-specific version only after the
 					// schema has been confirmed to match that tenant's profile.
-					// Any tenant whose schema diverges between two consecutive
-					// opens will be caught on the next open because its stored
-					// version will differ from the profile-derived target.
+					// Version-matched opens trust this durable value and skip the
+					// physical diff by default; out-of-band schema drift is detected
+					// only when the target schema version changes, or through an
+					// explicit validation/repair path. SkipTiDBSchemaCheck disables
+					// the Acquire-time TiDB schema ensure/check entirely, mainly for
+					// tests that use a TiDB-class provider against plain MySQL.
 					updateSchemaVersionStart := time.Now()
 					if verErr := p.metaStore.UpdateTenantSchemaVersion(ctx, t.ID, targetSchemaVersion); verErr != nil {
 						recordTenantSchemaVersionUpdateFailure(ctx, t.ID, targetSchemaVersion, time.Since(updateSchemaVersionStart), verErr)

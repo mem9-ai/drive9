@@ -347,13 +347,14 @@ func (f *credentialOnlyProvisioner) ProvisionWithCredentials(_ context.Context, 
 
 type profileAwareFakeProvisioner struct {
 	fakeProvisioner
-	mu               sync.Mutex
-	profileInitCalls atomic.Int32
-	ensureDBCalls    atomic.Int32
-	lastProfile      tenantschema.TiDBAutoEmbeddingProfile
-	ensureDBErr      error
-	lastEnsureDSN    string
-	callOrder        []string
+	mu                  sync.Mutex
+	profileInitCalls    atomic.Int32
+	ensureDBCalls       atomic.Int32
+	lastProfile         tenantschema.TiDBAutoEmbeddingProfile
+	lastProfileTenantID string
+	ensureDBErr         error
+	lastEnsureDSN       string
+	callOrder           []string
 }
 
 func (f *profileAwareFakeProvisioner) EnsureDatabase(_ context.Context, dsn string) error {
@@ -365,11 +366,12 @@ func (f *profileAwareFakeProvisioner) EnsureDatabase(_ context.Context, dsn stri
 	return f.ensureDBErr
 }
 
-func (f *profileAwareFakeProvisioner) InitSchemaForAutoEmbeddingProfile(_ context.Context, _ string, profile tenantschema.TiDBAutoEmbeddingProfile) error {
+func (f *profileAwareFakeProvisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, _ string, profile tenantschema.TiDBAutoEmbeddingProfile) error {
 	f.profileInitCalls.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastProfile = profile
+	f.lastProfileTenantID = tenantschema.TenantIDFromContext(ctx)
 	f.callOrder = append(f.callOrder, "profile-init")
 	return nil
 }
@@ -443,6 +445,12 @@ func TestSchemaInitForTenantEnsuresDatabaseBeforeProfileInit(t *testing.T) {
 	}
 	if got, want := prov.callOrderString(), "ensure,profile-init"; got != want {
 		t.Fatalf("call order = %s, want %s", got, want)
+	}
+	prov.mu.Lock()
+	lastProfileTenantID := prov.lastProfileTenantID
+	prov.mu.Unlock()
+	if lastProfileTenantID != "tenant-native" {
+		t.Fatalf("profile init tenant id = %q, want tenant-native", lastProfileTenantID)
 	}
 }
 
@@ -1803,6 +1811,73 @@ func TestSchemaInitForTenantUsesFTSOnlyProfileWhenDatabaseAutoEmbeddingDisabled(
 	}
 	if ftsOnlyProfile.Model != "openai/text-embedding-3-small" || ftsOnlyProfile.Dimensions != 1536 {
 		t.Fatalf("fts-only init profile = %+v", ftsOnlyProfile)
+	}
+}
+
+func TestInitTenantSchemaAsyncPersistsTargetSchemaVersion(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	tenantID := token.NewID()
+	now := time.Now().UTC()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantProvisioning,
+		DBPasswordCipher: []byte{},
+		Provider:         tenant.ProviderTiDBZero,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	profile := tenantschema.TiDBAutoEmbeddingProfile{
+		Model:       "openai/text-embedding-v4",
+		Dimensions:  1024,
+		OptionsJSON: `{"dimensions":1024}`,
+	}
+	targetVersion, err := tenantschema.TiDBTenantSchemaVersionForEmbeddingModeProfile(tenantschema.TiDBEmbeddingModeFTSOnly, profile)
+	if err != nil {
+		t.Fatalf("target schema version: %v", err)
+	}
+	if err := metaStore.UpsertTenantAutoEmbeddingProfile(context.Background(), &meta.TenantAutoEmbeddingProfile{
+		TenantID:      tenantID,
+		EmbeddingMode: meta.TenantEmbeddingModeFTSOnly,
+		Model:         profile.Model,
+		Dimensions:    profile.Dimensions,
+		OptionsJSON:   profile.OptionsJSON,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := NewWithConfig(Config{Meta: metaStore})
+	defer srv.Close()
+	schemaInitCalls := 0
+	// Direct invocation is blocking; production launches this function in a worker.
+	srv.initTenantSchemaAsync(context.Background(), tenantID, "unused-dsn", tenant.ProviderTiDBZero, func(context.Context, string) error {
+		schemaInitCalls++
+		return nil
+	})
+
+	if schemaInitCalls != 1 {
+		t.Fatalf("schema init calls = %d, want 1", schemaInitCalls)
+	}
+	updated, err := metaStore.GetTenant(context.Background(), tenantID)
+	if err != nil {
+		t.Fatalf("GetTenant: %v", err)
+	}
+	if updated.Status != meta.TenantActive {
+		t.Fatalf("status = %q, want %q", updated.Status, meta.TenantActive)
+	}
+	if updated.SchemaVersion != targetVersion {
+		t.Fatalf("schema version = %d, want %d", updated.SchemaVersion, targetVersion)
 	}
 }
 
