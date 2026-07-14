@@ -350,7 +350,7 @@ func RecordTenantRequest(tenantID, surface, action, result string, status int, d
 	)
 }
 
-func RecordTenantHTTPBytes(tenantID, surface, action, direction string, bytes int64) {
+func RecordTenantHTTPBytes(tenantID, surface, _, direction string, bytes int64) {
 	recordTenantHTTPBytes(tenantID, surface, direction, bytes)
 }
 

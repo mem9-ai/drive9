@@ -288,7 +288,7 @@ func (r *Registry) deleteGauge(name, labels string) {
 	defer r.mu.Unlock()
 	inst := r.gauges[name]
 	if inst == nil {
-		panic(fmt.Sprintf("metrics: gauge %s not registered", name))
+		return
 	}
 	delete(inst.values, labels)
 }

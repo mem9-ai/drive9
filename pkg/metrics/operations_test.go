@@ -106,10 +106,10 @@ func TestRecordTenantRequestOmitsHighCardinalityLabels(t *testing.T) {
 	WritePrometheus(rec)
 	text := rec.Body.String()
 	if !strings.Contains(text, `drive9_tenant_requests_total{result="ok",status_class="2xx",surface="`+surface+`",tenant_id="`+tenantID+`"} 1`) {
-		t.Fatalf("missing tenant-scoped request total:\n%s", text)
+		t.Errorf("missing tenant-scoped request total:\n%s", text)
 	}
 	if !strings.Contains(text, `drive9_tenant_request_duration_seconds_count{status_class="2xx",surface="`+surface+`"} 1`) {
-		t.Fatalf("missing reduced request duration histogram:\n%s", text)
+		t.Errorf("missing reduced request duration histogram:\n%s", text)
 	}
 	for _, unexpected := range []string{
 		`drive9_tenant_requests_total{action="` + action + `"`,
@@ -119,7 +119,7 @@ func TestRecordTenantRequestOmitsHighCardinalityLabels(t *testing.T) {
 		`drive9_tenant_request_duration_seconds_count{status_class="2xx",surface="` + surface + `",tenant_id="` + tenantID + `"`,
 	} {
 		if strings.Contains(text, unexpected) {
-			t.Fatalf("tenant request metric unexpectedly carried high-cardinality label %q:\n%s", unexpected, text)
+			t.Errorf("tenant request metric unexpectedly carried high-cardinality label %q:\n%s", unexpected, text)
 		}
 	}
 }
@@ -133,10 +133,10 @@ func TestRecordTenantRequestZeroDurationDoesNotRecordDuration(t *testing.T) {
 	WritePrometheus(rec)
 	text := rec.Body.String()
 	if !strings.Contains(text, `drive9_tenant_requests_total{result="ok",status_class="2xx",surface="zero_surface",tenant_id="`+tenantID+`"} 1`) {
-		t.Fatalf("missing zero-duration tenant request total:\n%s", text)
+		t.Errorf("missing zero-duration tenant request total:\n%s", text)
 	}
 	if strings.Contains(text, `drive9_tenant_request_duration_seconds_count{surface="zero_surface"`) {
-		t.Fatalf("zero-duration tenant request unexpectedly recorded a duration:\n%s", text)
+		t.Errorf("zero-duration tenant request unexpectedly recorded a duration:\n%s", text)
 	}
 }
 
@@ -185,10 +185,10 @@ func TestRecordEventBusQueryDurationOmitsTenant(t *testing.T) {
 	WritePrometheus(rec)
 	text := rec.Body.String()
 	if !strings.Contains(text, `drive9_event_bus_query_duration_seconds_count{operation="event_bus_duration_omit",result="ok"} 1`) {
-		t.Fatalf("missing tenant-omitted event bus duration:\n%s", text)
+		t.Errorf("missing tenant-omitted event bus duration:\n%s", text)
 	}
 	if strings.Contains(text, `drive9_event_bus_query_duration_seconds_count{operation="event_bus_duration_omit",result="ok",tenant_id="`+tenantID+`"}`) {
-		t.Fatalf("event bus duration unexpectedly carried tenant_id:\n%s", text)
+		t.Errorf("event bus duration unexpectedly carried tenant_id:\n%s", text)
 	}
 }
 
@@ -204,7 +204,7 @@ func TestRecordTenantInFlightDeletesZeroValue(t *testing.T) {
 	WritePrometheus(rec)
 	text := rec.Body.String()
 	if !strings.Contains(text, `drive9_tenant_inflight_requests{action="`+action+`",surface="`+surface+`",tenant_id="`+tenantID+`"} 1.000000`) {
-		t.Fatalf("missing tenant in-flight gauge:\n%s", text)
+		t.Errorf("missing tenant in-flight gauge:\n%s", text)
 	}
 
 	RecordTenantInFlight(tenantID, surface, action, 0)
@@ -212,7 +212,7 @@ func TestRecordTenantInFlightDeletesZeroValue(t *testing.T) {
 	WritePrometheus(rec)
 	text = rec.Body.String()
 	if strings.Contains(text, `drive9_tenant_inflight_requests{action="`+action+`",surface="`+surface+`",tenant_id="`+tenantID+`"}`) {
-		t.Fatalf("tenant in-flight gauge should be deleted at zero:\n%s", text)
+		t.Errorf("tenant in-flight gauge should be deleted at zero:\n%s", text)
 	}
 }
 

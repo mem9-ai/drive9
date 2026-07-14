@@ -365,12 +365,12 @@ func TestVaultMetricsExposed(t *testing.T) {
 		t.Fatalf("metrics missing vault module availability: %s", metricsText)
 	}
 	if !strings.Contains(metricsText, "drive9_service_operations_total{component=\"vault\",operation=\"read_secret\",result=\"ok\",tenant_id=\"") {
-		t.Fatalf("metrics missing vault service operation counter: %s", metricsText)
+		t.Errorf("metrics missing vault service operation counter: %s", metricsText)
 	}
 	if !strings.Contains(metricsText, "drive9_service_operation_duration_seconds_count{component=\"vault\",operation=\"read_secret\",result=\"ok\"}") {
-		t.Fatalf("metrics missing vault service duration histogram: %s", metricsText)
+		t.Errorf("metrics missing vault service duration histogram: %s", metricsText)
 	}
 	if strings.Contains(metricsText, "drive9_service_operation_duration_seconds_count{component=\"vault\",operation=\"read_secret\",result=\"ok\",tenant_id=\"") {
-		t.Fatalf("vault service duration histogram should not carry tenant_id: %s", metricsText)
+		t.Errorf("vault service duration histogram should not carry tenant_id: %s", metricsText)
 	}
 }
