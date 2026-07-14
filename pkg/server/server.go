@@ -4969,6 +4969,28 @@ func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(co
 	}
 }
 
+func (s *Server) updateTenantSchemaVersionForProfile(ctx context.Context, tenantID, provider string) error {
+	if s.meta == nil || !tenant.UsesTiDBAutoEmbedding(provider) {
+		return nil
+	}
+	profile, err := s.autoEmbeddingProfileForTenant(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
+	}
+	tidbMode, err := tenant.TiDBEmbeddingModeForTenantMode(profile.mode)
+	if err != nil {
+		return err
+	}
+	version, err := tenantschema.TiDBTenantSchemaVersionForEmbeddingModeProfile(tidbMode, profile.schemaProfile)
+	if err != nil {
+		return err
+	}
+	if err := s.meta.UpdateTenantSchemaVersion(ctx, tenantID, version); err != nil {
+		return fmt.Errorf("persist tenant schema version: %w", err)
+	}
+	return nil
+}
+
 func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOptions) (*provisionTenantResult, error) {
 	rawProvider := s.provisioner.ProviderType()
 	provider, err := tenant.NormalizeProvider(rawProvider)
@@ -5378,6 +5400,9 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 				return
 			}
 			err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+			if err == nil {
+				err = s.updateTenantSchemaVersionForProfile(ctx, tenantID, provider)
+			}
 		}
 		if err == nil {
 			s.schemaInitErrors.Delete(tenantID)

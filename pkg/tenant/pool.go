@@ -857,7 +857,8 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			}
 			if t.SchemaVersion != targetSchemaVersion {
 				ensureSchemaStart := time.Now()
-				if err := ensureTiDBSchemaForEmbeddingMode(ctx, store.DB(), autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile); err != nil {
+				schemaCtx := schema.WithTenantID(ctx, t.ID)
+				if err := ensureTiDBSchemaForEmbeddingMode(schemaCtx, store.DB(), autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile); err != nil {
 					_ = store.Close()
 					return nil, nil, fmt.Errorf("ensure tidb embedding schema: %w", err)
 				}

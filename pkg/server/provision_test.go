@@ -1814,6 +1814,72 @@ func TestSchemaInitForTenantUsesFTSOnlyProfileWhenDatabaseAutoEmbeddingDisabled(
 	}
 }
 
+func TestInitTenantSchemaAsyncPersistsTargetSchemaVersion(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	tenantID := token.NewID()
+	now := time.Now().UTC()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantProvisioning,
+		DBPasswordCipher: []byte{},
+		Provider:         tenant.ProviderTiDBZero,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	profile := tenantschema.TiDBAutoEmbeddingProfile{
+		Model:       "openai/text-embedding-v4",
+		Dimensions:  1024,
+		OptionsJSON: `{"dimensions":1024}`,
+	}
+	targetVersion, err := tenantschema.TiDBTenantSchemaVersionForEmbeddingModeProfile(tenantschema.TiDBEmbeddingModeFTSOnly, profile)
+	if err != nil {
+		t.Fatalf("target schema version: %v", err)
+	}
+	if err := metaStore.UpsertTenantAutoEmbeddingProfile(context.Background(), &meta.TenantAutoEmbeddingProfile{
+		TenantID:      tenantID,
+		EmbeddingMode: meta.TenantEmbeddingModeFTSOnly,
+		Model:         profile.Model,
+		Dimensions:    profile.Dimensions,
+		OptionsJSON:   profile.OptionsJSON,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := NewWithConfig(Config{Meta: metaStore})
+	defer srv.Close()
+	schemaInitCalls := 0
+	srv.initTenantSchemaAsync(context.Background(), tenantID, "unused-dsn", tenant.ProviderTiDBZero, func(context.Context, string) error {
+		schemaInitCalls++
+		return nil
+	})
+
+	if schemaInitCalls != 1 {
+		t.Fatalf("schema init calls = %d, want 1", schemaInitCalls)
+	}
+	updated, err := metaStore.GetTenant(context.Background(), tenantID)
+	if err != nil {
+		t.Fatalf("GetTenant: %v", err)
+	}
+	if updated.Status != meta.TenantActive {
+		t.Fatalf("status = %q, want %q", updated.Status, meta.TenantActive)
+	}
+	if updated.SchemaVersion != targetVersion {
+		t.Fatalf("schema version = %d, want %d", updated.SchemaVersion, targetVersion)
+	}
+}
+
 func TestAutoEmbeddingProfileForTenantEnsuresDefaultProfile(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
