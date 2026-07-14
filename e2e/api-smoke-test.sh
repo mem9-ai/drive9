@@ -243,7 +243,7 @@ TENANT_ID=$(printf '%s' "$body" | jq -r '.tenant_id // empty')
 INIT_STATUS=$(printf '%s' "$body" | jq -r '.status // empty')
 check_cmd "response contains tenant_id" test -n "$TENANT_ID"
 check_cmd "response contains api_key" test -n "$API_KEY"
-check_cmd "provision response status is provisioning or active" bash -c 'case "$1" in provisioning|active) exit 0;; *) exit 1;; esac' _ "$INIT_STATUS"
+check_cmd "provision response status is provisioning or active (got=$INIT_STATUS)" bash -c 'case "$1" in provisioning|active) exit 0;; *) exit 1;; esac' _ "$INIT_STATUS"
 check_cmd "provision response contains api_key, status, tenant_id" bash -c "echo \"\$1\" | jq -e '.api_key and .status and .tenant_id' >/dev/null" _ "$body"
 
 step "2" "Poll tenant status via /v1/status"
