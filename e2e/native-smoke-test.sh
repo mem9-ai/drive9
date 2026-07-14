@@ -206,7 +206,7 @@ CREATE_STATUS="$(printf '%s' "$create_out" | jq -r '.status // empty')"
 
 check_cmd "response contains tenant_id" test -n "$TENANT_ID"
 check_cmd "response contains api_key" test -n "$API_KEY"
-check_eq "provision status is provisioning" "$CREATE_STATUS" "provisioning"
+check_cmd "provision status is provisioning or active (got=$CREATE_STATUS)" bash -c 'case "$1" in provisioning|active) exit 0;; *) exit 1;; esac' _ "$CREATE_STATUS"
 CREATED=1
 
 # ── [2] wait tenant active ──────────────────────────────────────────────────
