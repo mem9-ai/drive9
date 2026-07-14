@@ -1270,6 +1270,9 @@ func (p *Provisioner) regionName() string {
 }
 
 func (p *Provisioner) privateEndpointOverrideHost() string {
+	// A non-empty host map is authoritative. Falling back to the legacy
+	// provider-wide host for unmapped public hosts can route clusters from a
+	// different VPC to the wrong private endpoint.
 	if len(p.privateEndpointHostMap) > 0 {
 		return ""
 	}
@@ -1882,25 +1885,13 @@ func (p *Provisioner) clusterConnectionIncomplete(info *clusterInfo) bool {
 	if info == nil {
 		return true
 	}
-	if !p.usePrivateEndpoint {
-		return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || info.UserPrefix == ""
-	}
-	if info.Endpoints.Private.Port == 0 || info.UserPrefix == "" {
-		return true
-	}
-	if strings.TrimSpace(info.Endpoints.Private.Host) != "" {
-		return false
-	}
-	if strings.TrimSpace(info.Endpoints.Public.Host) == "" {
-		return true
-	}
-	if _, ok := p.mappedPrivateEndpointHost(info.Endpoints.Public.Host); ok {
-		return false
-	}
-	if len(p.privateEndpointHostMap) == 0 && p.privateEndpointOverrideHost() != "" {
-		return false
-	}
-	return false
+	return p.endpointConnectionIncomplete(
+		info.Endpoints.Public.Host,
+		info.Endpoints.Private.Host,
+		info.Endpoints.Public.Port,
+		info.Endpoints.Private.Port,
+		info.UserPrefix,
+	)
 }
 
 func (p *Provisioner) clusterProvisionMetadataIncomplete(info *clusterInfo) bool {
@@ -1927,25 +1918,38 @@ func (p *Provisioner) branchConnectionIncomplete(info *branchInfo) bool {
 	if info == nil {
 		return true
 	}
+	return p.endpointConnectionIncomplete(
+		info.Endpoints.Public.Host,
+		info.Endpoints.Private.Host,
+		info.Endpoints.Public.Port,
+		info.Endpoints.Private.Port,
+		info.UserPrefix,
+	)
+}
+
+func (p *Provisioner) endpointConnectionIncomplete(publicHost, privateHost string, publicPort, privatePort int, userPrefix string) bool {
+	publicHost = strings.TrimSpace(publicHost)
+	privateHost = strings.TrimSpace(privateHost)
+	userPrefix = strings.TrimSpace(userPrefix)
 	if !p.usePrivateEndpoint {
-		return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || info.UserPrefix == ""
+		return publicHost == "" || publicPort == 0 || userPrefix == ""
 	}
-	if info.Endpoints.Private.Port == 0 || info.UserPrefix == "" {
+	if privatePort == 0 || userPrefix == "" {
 		return true
 	}
-	if strings.TrimSpace(info.Endpoints.Private.Host) != "" {
+	if privateHost != "" {
 		return false
 	}
-	if strings.TrimSpace(info.Endpoints.Public.Host) == "" {
+	if publicHost == "" {
 		return true
 	}
-	if _, ok := p.mappedPrivateEndpointHost(info.Endpoints.Public.Host); ok {
+	if len(p.privateEndpointHostMap) > 0 {
 		return false
 	}
-	if len(p.privateEndpointHostMap) == 0 && p.privateEndpointOverrideHost() != "" {
+	if p.privateEndpointOverrideHost() != "" {
 		return false
 	}
-	return false
+	return true
 }
 
 func (p *Provisioner) fillBranchEndpoint(out *tenant.ClusterInfo, branch *branchInfo) error {

@@ -1672,7 +1672,8 @@ func TestNewProvisionerFromEnvRejectsMalformedPrivateEndpointFlag(t *testing.T) 
 }
 
 func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
-	setPrivateEnv := func(provider string) {
+	setPrivateEnv := func(t *testing.T, provider string) {
+		t.Helper()
 		t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 		t.Setenv(EnvTiDBCloudNativeCloudProvider, provider)
 		t.Setenv(EnvTiDBCloudNativeRegion, "ap-southeast-1")
@@ -1683,7 +1684,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 	}
 
 	t.Run("alicloud no startup override required", func(t *testing.T) {
-		setPrivateEnv("alicloud")
+		setPrivateEnv(t, "alicloud")
 		p, err := NewProvisionerFromEnv()
 		if err != nil {
 			t.Fatalf("NewProvisionerFromEnv without alicloud host override: %v", err)
@@ -1694,7 +1695,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 	})
 
 	t.Run("alicloud legacy domain fallback", func(t *testing.T) {
-		setPrivateEnv("alicloud")
+		setPrivateEnv(t, "alicloud")
 		t.Setenv(EnvTiDBCloudAlicloudPrivateEndpointDomain, "alicloud.internal")
 		p, err := NewProvisionerFromEnv()
 		if err != nil {
@@ -1706,7 +1707,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 	})
 
 	t.Run("tencentcloud no startup override required", func(t *testing.T) {
-		setPrivateEnv("tencentcloud")
+		setPrivateEnv(t, "tencentcloud")
 		p, err := NewProvisionerFromEnv()
 		if err != nil {
 			t.Fatalf("NewProvisionerFromEnv without tencentcloud host override: %v", err)
@@ -1717,7 +1718,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 	})
 
 	t.Run("tencentcloud legacy host fallback", func(t *testing.T) {
-		setPrivateEnv("tencentcloud")
+		setPrivateEnv(t, "tencentcloud")
 		t.Setenv(EnvTiDBCloudTencentPrivateEndpointHost, "tencent.internal")
 		p, err := NewProvisionerFromEnv()
 		if err != nil {
@@ -1729,7 +1730,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 	})
 
 	t.Run("aws no override required", func(t *testing.T) {
-		setPrivateEnv("aws")
+		setPrivateEnv(t, "aws")
 		p, err := NewProvisionerFromEnv()
 		if err != nil {
 			t.Fatalf("NewProvisionerFromEnv with aws and no override: %v", err)
@@ -1740,7 +1741,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 	})
 
 	t.Run("host map", func(t *testing.T) {
-		setPrivateEnv("tencentcloud")
+		setPrivateEnv(t, "tencentcloud")
 		t.Setenv(EnvTiDBCloudPrivateEndpointHostMap, "public-a.example=private-a.internal, public-b.example:private-b.internal")
 		p, err := NewProvisionerFromEnv()
 		if err != nil {
@@ -1774,6 +1775,15 @@ func TestClusterConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	// With tencent override host set, API private host empty is OK
 	if clusterConnectionIncomplete(info, true, "tencent.internal") {
 		t.Fatalf("private mode with override host should report complete even if API private host is empty")
+	}
+
+	p := &Provisioner{usePrivateEndpoint: true}
+	if !p.clusterConnectionIncomplete(info) {
+		t.Fatalf("private mode without host map or legacy override should keep waiting for API private host")
+	}
+	p.privateEndpointHostMap = map[string]string{"other-public.example": "private.internal"}
+	if p.clusterConnectionIncomplete(info) {
+		t.Fatalf("private mode with host map should stop waiting and let endpoint resolution fail fast on an unmapped public host")
 	}
 }
 
@@ -1859,11 +1869,13 @@ func TestProvisionWithCredentialsMapsPublicHostToPrivateEndpoint(t *testing.T) {
 	defer ts.Close()
 
 	p := &Provisioner{
-		apiURL:                 ts.URL,
-		defaultDatabaseName:    DefaultDatabaseName,
-		usePrivateEndpoint:     true,
-		privateEndpointHostMap: map[string]string{"public-a.example": "private-a.internal"},
-		client:                 ts.Client(),
+		apiURL:                      ts.URL,
+		defaultDatabaseName:         DefaultDatabaseName,
+		usePrivateEndpoint:          true,
+		cloudProvider:               cloudProviderAliCloud,
+		alicloudPrivateEndpointHost: "legacy-alicloud.internal",
+		privateEndpointHostMap:      map[string]string{"public-a.example": "private-a.internal"},
+		client:                      ts.Client(),
 	}
 	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey: "public-1", PrivateKey: "private-1",
@@ -1900,11 +1912,13 @@ func TestProvisionWithCredentialsErrorsWhenPrivateHostMappingMissing(t *testing.
 	defer ts.Close()
 
 	p := &Provisioner{
-		apiURL:                 ts.URL,
-		defaultDatabaseName:    DefaultDatabaseName,
-		usePrivateEndpoint:     true,
-		privateEndpointHostMap: map[string]string{"public-a.example": "private-a.internal"},
-		client:                 ts.Client(),
+		apiURL:                      ts.URL,
+		defaultDatabaseName:         DefaultDatabaseName,
+		usePrivateEndpoint:          true,
+		cloudProvider:               cloudProviderAliCloud,
+		alicloudPrivateEndpointHost: "legacy-alicloud.internal",
+		privateEndpointHostMap:      map[string]string{"public-a.example": "private-a.internal"},
+		client:                      ts.Client(),
 	}
 	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey: "public-1", PrivateKey: "private-1",
@@ -1935,6 +1949,15 @@ func TestBranchConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	}
 	if !branchConnectionIncomplete(branch, true, "") {
 		t.Fatalf("private mode should report incomplete when private host is empty")
+	}
+
+	p := &Provisioner{usePrivateEndpoint: true}
+	if !p.branchConnectionIncomplete(branch) {
+		t.Fatalf("private mode without host map or legacy override should keep waiting for API private host")
+	}
+	p.privateEndpointHostMap = map[string]string{"other-public.example": "private.internal"}
+	if p.branchConnectionIncomplete(branch) {
+		t.Fatalf("private mode with host map should stop waiting and let endpoint resolution fail fast on an unmapped public host")
 	}
 }
 
