@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -203,6 +204,26 @@ func (o *MountOptions) setDefaults() {
 	}
 }
 
+func validateWorkspaceRoot(c *client.Client) error {
+	stat, err := c.Stat("/")
+	if err == nil {
+		if !stat.IsDir {
+			return fmt.Errorf("remote root %q is not a directory", "/")
+		}
+		return nil
+	}
+
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) ||
+		(statusErr.StatusCode != http.StatusNotFound && statusErr.StatusCode != http.StatusMethodNotAllowed) {
+		return fmt.Errorf("cannot reach drive9 server: %w", err)
+	}
+	if _, listErr := c.List("/"); listErr != nil {
+		return fmt.Errorf("cannot reach drive9 server: %w", listErr)
+	}
+	return nil
+}
+
 // Mount creates and serves a FUSE mount. It blocks until the filesystem
 // is unmounted or a signal (SIGINT, SIGTERM) is received.
 func Mount(opts *MountOptions) error {
@@ -261,8 +282,8 @@ func Mount(opts *MountOptions) error {
 	}
 	opts.RemoteRoot = remoteRoot
 	if remoteRoot == "/" {
-		if _, err := c.List("/"); err != nil {
-			return fmt.Errorf("cannot reach drive9 server: %w", err)
+		if err := validateWorkspaceRoot(c); err != nil {
+			return err
 		}
 	} else {
 		stat, err := c.Stat(remoteRoot)
