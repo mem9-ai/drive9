@@ -876,10 +876,10 @@ func TestCountTenants(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.TotalNonDeleted != 3 {
-		t.Fatalf("TotalNonDeleted = %d, want 3", got.TotalNonDeleted)
+		t.Errorf("TotalNonDeleted = %d, want 3", got.TotalNonDeleted)
 	}
 	if got.Active != 1 {
-		t.Fatalf("Active = %d, want 1", got.Active)
+		t.Errorf("Active = %d, want 1", got.Active)
 	}
 }
 

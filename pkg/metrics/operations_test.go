@@ -227,7 +227,7 @@ func TestRecordTenantCountIncludesState(t *testing.T) {
 		`drive9_tenant_count{state="active_test"} 3.000000`,
 	} {
 		if !strings.Contains(text, want) {
-			t.Fatalf("missing tenant count metric %q:\n%s", want, text)
+			t.Errorf("missing tenant count metric %q:\n%s", want, text)
 		}
 	}
 }

@@ -2637,6 +2637,9 @@ func (s *Store) CountTenants(ctx context.Context) (out TenantCounts, err error) 
 			COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0)
 		FROM tenants
 		WHERE status <> ?`, TenantActive, TenantDeleted).Scan(&out.TotalNonDeleted, &out.Active)
+	if err != nil {
+		err = fmt.Errorf("count tenants: %w", err)
+	}
 	return out, err
 }
 

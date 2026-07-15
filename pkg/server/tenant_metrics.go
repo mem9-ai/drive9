@@ -20,7 +20,7 @@ func (s *Server) observeTenantCounts(ctx context.Context) {
 	metrics.RecordOperation("tenant_usage", "count_tenants", result, time.Since(start))
 	if err != nil {
 		if ctx.Err() == nil {
-			logger.Warn(ctx, "tenant_count_metrics_failed", zap.Error(err))
+			logger.Warn(ctx, "tenant_count_metrics_failed", zap.String("detail", err.Error()))
 		}
 		return
 	}
