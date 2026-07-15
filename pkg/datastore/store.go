@@ -3014,25 +3014,7 @@ func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error
 	elapsed := time.Since(start)
 	result := "ok"
 	if errp != nil && *errp != nil {
-		switch {
-		case errors.Is(*errp, ErrNotFound):
-			result = "not_found"
-		case errors.Is(*errp, ErrPathConflict), errors.Is(*errp, ErrUploadConflict), errors.Is(*errp, ErrIdempotencyConflict):
-			result = "conflict"
-		case errors.Is(*errp, context.Canceled):
-			result = "canceled"
-		case errors.Is(*errp, context.DeadlineExceeded):
-			result = "deadline_exceeded"
-		case errors.Is(*errp, sql.ErrConnDone):
-			// Connection closed during shutdown — not an unexpected failure.
-			result = "conn_closed"
-		default:
-			if strings.Contains((*errp).Error(), "database is closed") {
-				result = "conn_closed"
-			} else {
-				result = "error"
-			}
-		}
+		result = storeOpResultForError(*errp)
 		if shouldLogStoreOpFailure(result) {
 			logger.Error(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
 		} else {
@@ -3046,9 +3028,36 @@ func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error
 	metrics.RecordOperation("datastore", op, result, elapsed)
 }
 
+func storeOpResultForError(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, ErrNotFound):
+		return "not_found"
+	case errors.Is(err, ErrPathConflict),
+		errors.Is(err, ErrRevisionConflict),
+		errors.Is(err, ErrUploadConflict),
+		errors.Is(err, ErrUploadNotActive),
+		errors.Is(err, ErrIdempotencyConflict),
+		errors.Is(err, ErrJournalConflict):
+		return "conflict"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	case errors.Is(err, sql.ErrConnDone):
+		return "conn_closed"
+	default:
+		if strings.Contains(err.Error(), "database is closed") {
+			return "conn_closed"
+		}
+		return "error"
+	}
+}
+
 func shouldLogStoreOpFailure(result string) bool {
 	switch result {
-	case "not_found", "canceled", "deadline_exceeded", "conn_closed":
+	case "not_found", "conflict", "canceled", "deadline_exceeded", "conn_closed":
 		return false
 	default:
 		return true
