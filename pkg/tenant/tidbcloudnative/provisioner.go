@@ -1868,19 +1868,6 @@ func parseBranchInfo(raw []byte) (*branchInfo, error) {
 	return &out, nil
 }
 
-func clusterConnectionIncomplete(info *clusterInfo, usePrivate bool, overridePrivateHost string) bool {
-	if info == nil {
-		return true
-	}
-	if usePrivate {
-		if overridePrivateHost != "" {
-			return info.Endpoints.Private.Port == 0 || info.UserPrefix == ""
-		}
-		return info.Endpoints.Private.Host == "" || info.Endpoints.Private.Port == 0 || info.UserPrefix == ""
-	}
-	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || info.UserPrefix == ""
-}
-
 func (p *Provisioner) clusterConnectionIncomplete(info *clusterInfo) bool {
 	if info == nil {
 		return true
@@ -1899,19 +1886,6 @@ func (p *Provisioner) clusterProvisionMetadataIncomplete(info *clusterInfo) bool
 		return true
 	}
 	return strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]) == ""
-}
-
-func branchConnectionIncomplete(info *branchInfo, usePrivate bool, overridePrivateHost string) bool {
-	if info == nil {
-		return true
-	}
-	if usePrivate {
-		if overridePrivateHost != "" {
-			return info.Endpoints.Private.Port == 0 || info.UserPrefix == ""
-		}
-		return info.Endpoints.Private.Host == "" || info.Endpoints.Private.Port == 0 || info.UserPrefix == ""
-	}
-	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || info.UserPrefix == ""
 }
 
 func (p *Provisioner) branchConnectionIncomplete(info *branchInfo) bool {

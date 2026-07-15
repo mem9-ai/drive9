@@ -1766,20 +1766,17 @@ func TestClusterConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	info.Endpoints.Private.Host = ""
 	info.Endpoints.Private.Port = 4000
 
-	if clusterConnectionIncomplete(info, false, "") {
+	p := &Provisioner{}
+	if p.clusterConnectionIncomplete(info) {
 		t.Fatalf("public mode should report complete")
 	}
-	if !clusterConnectionIncomplete(info, true, "") {
-		t.Fatalf("private mode should report incomplete when private host is empty")
-	}
-	// With tencent override host set, API private host empty is OK
-	if clusterConnectionIncomplete(info, true, "tencent.internal") {
-		t.Fatalf("private mode with override host should report complete even if API private host is empty")
-	}
-
-	p := &Provisioner{usePrivateEndpoint: true}
+	p.usePrivateEndpoint = true
 	if p.clusterConnectionIncomplete(info) {
 		t.Fatalf("private mode should stop waiting once public host, private port, and user prefix are ready")
+	}
+	info.Endpoints.Public.Host = ""
+	if !p.clusterConnectionIncomplete(info) {
+		t.Fatalf("private mode should keep waiting while public host is empty")
 	}
 }
 
@@ -1940,16 +1937,17 @@ func TestBranchConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	branch.Endpoints.Private.Host = ""
 	branch.Endpoints.Private.Port = 4000
 
-	if branchConnectionIncomplete(branch, false, "") {
+	p := &Provisioner{}
+	if p.branchConnectionIncomplete(branch) {
 		t.Fatalf("public mode should report complete")
 	}
-	if !branchConnectionIncomplete(branch, true, "") {
-		t.Fatalf("private mode should report incomplete when private host is empty")
-	}
-
-	p := &Provisioner{usePrivateEndpoint: true}
+	p.usePrivateEndpoint = true
 	if p.branchConnectionIncomplete(branch) {
 		t.Fatalf("private mode should stop waiting once public host, private port, and user prefix are ready")
+	}
+	branch.Endpoints.Public.Host = ""
+	if !p.branchConnectionIncomplete(branch) {
+		t.Fatalf("private mode should keep waiting while public host is empty")
 	}
 }
 

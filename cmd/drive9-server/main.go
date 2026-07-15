@@ -580,6 +580,8 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT true|false to use TiDB Cloud private endpoint hosts for tidb_cloud_native
   DRIVE9_TIDBCLOUD_PRIVATE_ENDPOINT_HOST_MAP comma-separated public_host=private_host mappings (also accepts public_host:private_host);
                                              when set, disables legacy single-host private endpoint overrides
+  DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST legacy tencentcloud private endpoint fallback host, used only when host map is unset
+  DRIVE9_TIDBCLOUD_ALICLOUD_PRIVATE_ENDPOINT_DOMAIN legacy alicloud private endpoint fallback domain, used only when host map is unset
   DRIVE9_TENANT_POOL_MAX_SIZE maximum admin tenant pool size (default: %d)
   DRIVE9_TENANT_POOL_REFILL_FREE_RATIO claim-triggered refill runs when active free tenants fall below this ratio (default: %.2f)
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*
