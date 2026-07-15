@@ -90,6 +90,11 @@ type Tenant struct {
 	UpdatedAt          time.Time
 }
 
+type TenantCounts struct {
+	TotalNonDeleted int64
+	Active          int64
+}
+
 type TenantAutoEmbeddingProfile struct {
 	TenantID      string
 	EmbeddingMode string
@@ -2623,6 +2628,21 @@ func (s *Store) ListTenantsByStatus(ctx context.Context, status TenantStatus, li
 	return scanTenantRows(rows)
 }
 
+func (s *Store) CountTenants(ctx context.Context) (out TenantCounts, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "count_tenants", start, &err)
+	err = s.db.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0)
+		FROM tenants
+		WHERE status <> ?`, TenantActive, TenantDeleted).Scan(&out.TotalNonDeleted, &out.Active)
+	if err != nil {
+		err = fmt.Errorf("count tenants: %w", err)
+	}
+	return out, err
+}
+
 // ListTenantsByStatusAfter returns one keyset page of tenants after
 // (afterCreatedAt, afterID), ordered by (created_at, id). Pass a zero
 // afterCreatedAt and empty afterID to scan from the beginning.
@@ -3517,7 +3537,7 @@ func observeMeta(ctx context.Context, op string, start time.Time, errp *error) {
 			// Connection closed during shutdown — suppress the noisy log and
 			// only record the metric below.
 		case "not_found", "duplicate":
-			logger.Warn(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+			logger.Warn(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.String("detail", (*errp).Error()))
 		case "error":
 			logger.Error(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
 		}
