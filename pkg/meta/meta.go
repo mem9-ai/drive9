@@ -90,6 +90,11 @@ type Tenant struct {
 	UpdatedAt          time.Time
 }
 
+type TenantCounts struct {
+	TotalNonDeleted int64
+	Active          int64
+}
+
 type TenantAutoEmbeddingProfile struct {
 	TenantID      string
 	EmbeddingMode string
@@ -2621,6 +2626,18 @@ func (s *Store) ListTenantsByStatus(ctx context.Context, status TenantStatus, li
 	defer func() { _ = rows.Close() }()
 
 	return scanTenantRows(rows)
+}
+
+func (s *Store) CountTenants(ctx context.Context) (out TenantCounts, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "count_tenants", start, &err)
+	err = s.db.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0)
+		FROM tenants
+		WHERE status <> ?`, TenantActive, TenantDeleted).Scan(&out.TotalNonDeleted, &out.Active)
+	return out, err
 }
 
 // ListTenantsByStatusAfter returns one keyset page of tenants after

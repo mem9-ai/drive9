@@ -215,6 +215,23 @@ func TestRecordTenantInFlightDeletesZeroValue(t *testing.T) {
 	}
 }
 
+func TestRecordTenantCountIncludesState(t *testing.T) {
+	RecordTenantCount("total_non_deleted_test", 7)
+	RecordTenantCount("active_test", 3)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	for _, want := range []string{
+		`drive9_tenant_count{state="total_non_deleted_test"} 7.000000`,
+		`drive9_tenant_count{state="active_test"} 3.000000`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing tenant count metric %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestRecordTenantPoolMetadataResumeWaitIncludesPoolAndOrganizationID(t *testing.T) {
 	const poolID = "pool-metadata-resume-metrics-test"
 	const organizationID = "org-metadata-resume-metrics-test"

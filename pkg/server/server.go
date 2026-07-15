@@ -259,6 +259,7 @@ var (
 	tenantPoolMetadataResumeGroupSize         = 10
 	pendingTenantStaleAfter                   = 10 * time.Minute
 	pendingTenantSweepEvery                   = time.Minute
+	tenantCountMetricsInterval                = time.Minute
 	initTiDBTenantSchemaForFTSOnlyProfileFunc = tenantschema.InitTiDBTenantSchemaForFTSOnlyProfileContext
 )
 
@@ -798,6 +799,19 @@ func (s *Server) startLeaderWorkers() {
 	if s.meta != nil {
 		s.replayWorker = backend.StartMutationReplayWorker(tenant.NewMetaQuotaAdapter(s.meta))
 		s.expirySweepWorker = backend.StartExpirySweepWorker(s.meta)
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(tenantCountMetricsInterval)
+			defer ticker.Stop()
+			s.observeTenantCounts(workerCtx)
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.observeTenantCounts(workerCtx)
+				}
+			}
+		})
 	}
 	// Per-tenant FileGC and quota outbox workers are no longer per-backend
 	// goroutines — they are driven by kicks through the unified tenant worker.

@@ -73,6 +73,7 @@ var tenantRequestDuration = tenantMeter.Float64Histogram("drive9_tenant_request_
 var tenantInflight = tenantMeter.Float64Gauge("drive9_tenant_inflight_requests", "Current in-flight tenant-scoped requests by tenant/surface/action")
 var tenantHTTPBytes = tenantMeter.Int64Counter("drive9_tenant_http_bytes_total", "Tenant-scoped HTTP transport bytes by tenant/surface/direction")
 var tenantFileBytes = tenantMeter.Int64Counter("drive9_tenant_file_bytes_total", "Tenant-scoped logical file bytes by tenant/surface/action/direction")
+var tenantCount = tenantMeter.Float64Gauge("drive9_tenant_count", "Tenant count by state")
 var tenantStorageBytes = tenantMeter.Float64Gauge("drive9_tenant_storage_bytes", "Tenant storage bytes by state")
 var tenantMediaFiles = tenantMeter.Float64Gauge("drive9_tenant_media_files", "Tenant media file count by state")
 
@@ -374,6 +375,16 @@ func RecordTenantInFlight(tenantID, surface, action string, value float64) {
 		return
 	}
 	tenantInflight.Set(value, attrs...)
+}
+
+func RecordTenantCount(state string, count int64) {
+	if count < 0 {
+		return
+	}
+	RegisterModule("tenant_usage")
+	tenantCount.Set(float64(count),
+		Attr("state", cleanMetricValue(state, "unknown")),
+	)
 }
 
 func RecordTenantStorageBytes(tenantID, state string, bytes int64) {

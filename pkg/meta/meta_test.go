@@ -841,6 +841,48 @@ func TestListTenantsByStatus(t *testing.T) {
 	}
 }
 
+func TestCountTenants(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC()
+	for _, tc := range []struct {
+		id     string
+		status TenantStatus
+	}{
+		{id: "count-active", status: TenantActive},
+		{id: "count-provisioning", status: TenantProvisioning},
+		{id: "count-failed", status: TenantFailed},
+		{id: "count-deleted", status: TenantDeleted},
+	} {
+		if err := s.InsertTenant(context.Background(), &Tenant{
+			ID:               tc.id,
+			Status:           tc.status,
+			DBHost:           "127.0.0.1",
+			DBPort:           4000,
+			DBUser:           "root",
+			DBPasswordCipher: []byte("cipher"),
+			DBName:           "tenant_db",
+			DBTLS:            true,
+			Provider:         "tidb_zero",
+			SchemaVersion:    1,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.CountTenants(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TotalNonDeleted != 3 {
+		t.Fatalf("TotalNonDeleted = %d, want 3", got.TotalNonDeleted)
+	}
+	if got.Active != 1 {
+		t.Fatalf("Active = %d, want 1", got.Active)
+	}
+}
+
 func TestListTenantsByStatusAfterKeyset(t *testing.T) {
 	s := newControlStore(t)
 	now := time.Now().UTC().Truncate(time.Millisecond)
