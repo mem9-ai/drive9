@@ -8702,6 +8702,30 @@ func TestGoFuseMountOptionsMapsDirectMountStrict(t *testing.T) {
 	}
 }
 
+func TestGoFuseMountOptionsMapsReadOnly(t *testing.T) {
+	defaults := newGoFuseMountOptions(&MountOptions{})
+	if defaults.DirectMountFlags != 0 {
+		t.Fatalf("writable DirectMountFlags = %#x, want 0", defaults.DirectMountFlags)
+	}
+
+	readOnly := newGoFuseMountOptions(&MountOptions{ReadOnly: true})
+	hasReadOnlyOption := false
+	for _, option := range readOnly.Options {
+		if option == "ro" {
+			hasReadOnlyOption = true
+			break
+		}
+	}
+	if !hasReadOnlyOption {
+		t.Fatal("read-only mount missing ro option")
+	}
+
+	wantDirectMountFlags := readOnlyDirectMountFlags()
+	if readOnly.DirectMountFlags != wantDirectMountFlags {
+		t.Fatalf("read-only DirectMountFlags = %#x, want %#x", readOnly.DirectMountFlags, wantDirectMountFlags)
+	}
+}
+
 func TestGoFuseMountOptionsAllowOtherUsesDefaultPermissionsOnLinux(t *testing.T) {
 	opts := newGoFuseMountOptions(&MountOptions{AllowOther: true})
 	hasDefaultPermissions := false
