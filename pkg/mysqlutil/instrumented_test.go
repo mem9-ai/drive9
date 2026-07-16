@@ -17,9 +17,11 @@ import (
 )
 
 func TestObserveDBOperationLogsSQLTraceWithoutArgs(t *testing.T) {
-	t.Setenv("DRIVE9_BENCH_TIMING_LOG_ENABLED", "true")
+	t.Setenv("DRIVE9_DB_TRACE_LOG_ENABLED", "true")
 	logger.ResetBenchTimingLogEnabledForTest()
+	logger.ResetDBTraceLogEnabledForTest()
 	t.Cleanup(logger.ResetBenchTimingLogEnabledForTest)
+	t.Cleanup(logger.ResetDBTraceLogEnabledForTest)
 
 	core, recorded := observer.New(zap.InfoLevel)
 	prevLogger := logger.L()
@@ -110,9 +112,11 @@ func TestNormalizeSQLForTraceStripsComments(t *testing.T) {
 }
 
 func TestObserveDBOperationLogsSafeErrorDetails(t *testing.T) {
-	t.Setenv("DRIVE9_BENCH_TIMING_LOG_ENABLED", "true")
+	t.Setenv("DRIVE9_DB_TRACE_LOG_ENABLED", "true")
 	logger.ResetBenchTimingLogEnabledForTest()
+	logger.ResetDBTraceLogEnabledForTest()
 	t.Cleanup(logger.ResetBenchTimingLogEnabledForTest)
+	t.Cleanup(logger.ResetDBTraceLogEnabledForTest)
 
 	core, recorded := observer.New(zap.InfoLevel)
 	prevLogger := logger.L()
@@ -144,9 +148,11 @@ func TestObserveDBOperationLogsSafeErrorDetails(t *testing.T) {
 }
 
 func TestObserveDBOperationBoundsSQLTraceField(t *testing.T) {
-	t.Setenv("DRIVE9_BENCH_TIMING_LOG_ENABLED", "true")
+	t.Setenv("DRIVE9_DB_TRACE_LOG_ENABLED", "true")
 	logger.ResetBenchTimingLogEnabledForTest()
+	logger.ResetDBTraceLogEnabledForTest()
 	t.Cleanup(logger.ResetBenchTimingLogEnabledForTest)
+	t.Cleanup(logger.ResetDBTraceLogEnabledForTest)
 
 	core, recorded := observer.New(zap.InfoLevel)
 	prevLogger := logger.L()
@@ -196,7 +202,27 @@ func TestObserveDBOperationSkipsTraceFieldsWhenBenchTimingDisabled(t *testing.T)
 		t.Fatalf("db_operation_timing entries = %d, want 0", len(entries))
 	}
 	if res.rowsAffectedCalled {
-		t.Fatal("RowsAffected called while bench timing logs are disabled")
+		t.Fatal("RowsAffected called while DB trace logs are disabled")
+	}
+}
+
+func TestObserveDBOperationSkipsTraceWhenOnlyBenchTimingEnabled(t *testing.T) {
+	t.Setenv("DRIVE9_BENCH_TIMING_LOG_ENABLED", "true")
+	t.Setenv("DRIVE9_DB_TRACE_LOG_ENABLED", "false")
+	logger.ResetBenchTimingLogEnabledForTest()
+	logger.ResetDBTraceLogEnabledForTest()
+	t.Cleanup(logger.ResetBenchTimingLogEnabledForTest)
+	t.Cleanup(logger.ResetDBTraceLogEnabledForTest)
+
+	core, recorded := observer.New(zap.InfoLevel)
+	prevLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(prevLogger) })
+
+	observeDBOperation(context.Background(), RoleUser, "query", "SELECT * FROM file_nodes", time.Now(), nil)
+
+	if entries := recorded.FilterMessage("db_operation_timing").All(); len(entries) != 0 {
+		t.Fatalf("db_operation_timing entries = %d, want 0", len(entries))
 	}
 }
 

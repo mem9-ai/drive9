@@ -283,7 +283,7 @@ func observeDBOperation(ctx context.Context, role, operation, query string, star
 	result := dbResult(err)
 	metrics.RecordDBOperation(role, operation, result, elapsed)
 
-	if !logger.BenchTimingLogEnabled() && !logger.DBTraceLogEnabled() {
+	if !logger.DBTraceLogEnabled() {
 		return
 	}
 
