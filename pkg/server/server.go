@@ -1998,6 +1998,8 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})
+
+	logSlowFSList(r.Context(), path, len(entries), time.Since(start), readDirDuration)
 }
 
 func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path string) {
@@ -2354,6 +2356,30 @@ func requestBodyReadMetricBytes(declared int64, observed int) int64 {
 }
 
 const slowWriteBodyReadThreshold = 5 * time.Second
+
+// slowFSRequestThreshold is the minimum handler-internal duration before a
+// slow-path diagnostic log is emitted for FS list operations. This only
+// covers the handler phase (ReadDir + serialization); auth/middleware overhead
+// is not included — that gap is a known limitation to be addressed in a
+// follow-up PR.
+const slowFSRequestThreshold = 500 * time.Millisecond
+
+func logSlowFSList(ctx context.Context, path string, entries int, total, readDir time.Duration) {
+	if total < slowFSRequestThreshold {
+		return
+	}
+	tenantID, apiKeyID, _ := requestMetricScope(ctx)
+	logger.Info(ctx, "fs_slow_request",
+		zap.String("op", "list"),
+		zap.String("path", path),
+		zap.Int("entries", entries),
+		zap.Int("status", http.StatusOK),
+		zap.Float64("total_ms", serverDurationMs(total)),
+		zap.Float64("read_dir_ms", serverDurationMs(readDir)),
+		zap.String("tenant_id", tenantID),
+		zap.String("api_key_id", apiKeyID),
+	)
+}
 
 func logSlowWriteBodyRead(ctx context.Context, r *http.Request, route string, bytes int64, d time.Duration) {
 	if d < slowWriteBodyReadThreshold {
