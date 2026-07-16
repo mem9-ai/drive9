@@ -11,6 +11,9 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -36,7 +39,7 @@ func TestShouldLogStoreOpFailure(t *testing.T) {
 		{result: "canceled", want: false},
 		{result: "deadline_exceeded", want: false},
 		{result: "conn_closed", want: false},
-		{result: "conflict", want: true},
+		{result: "conflict", want: false},
 		{result: "error", want: true},
 	}
 	for _, tt := range tests {
@@ -45,6 +48,58 @@ func TestShouldLogStoreOpFailure(t *testing.T) {
 				t.Fatalf("shouldLogStoreOpFailure(%q) = %v, want %v", tt.result, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestStoreOpResultForErrorClassifiesExpectedConflicts(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "nil", err: nil, want: "ok"},
+		{name: "not found", err: ErrNotFound, want: "not_found"},
+		{name: "path conflict", err: ErrPathConflict, want: "conflict"},
+		{name: "revision conflict", err: ErrRevisionConflict, want: "conflict"},
+		{name: "upload conflict", err: ErrUploadConflict, want: "conflict"},
+		{name: "upload not active", err: ErrUploadNotActive, want: "conflict"},
+		{name: "idempotency conflict", err: ErrIdempotencyConflict, want: "conflict"},
+		{name: "journal conflict", err: ErrJournalConflict, want: "conflict"},
+		{name: "canceled", err: context.Canceled, want: "canceled"},
+		{name: "deadline", err: context.DeadlineExceeded, want: "deadline_exceeded"},
+		{name: "generic", err: errors.New("boom"), want: "error"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := storeOpResultForError(tt.err); got != tt.want {
+				t.Errorf("storeOpResultForError(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestObserveStoreOpConflictLogsWarnDetail(t *testing.T) {
+	core, recorded := observer.New(zap.WarnLevel)
+	prevLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(prevLogger) })
+
+	err := ErrPathConflict
+	observeStoreOp(context.Background(), "in_tx", time.Now(), &err)
+
+	entries := recorded.FilterMessage("datastore_op_failed").All()
+	if len(entries) != 1 {
+		t.Fatalf("datastore_op_failed entries = %d, want 1", len(entries))
+	}
+	if entries[0].Level != zap.WarnLevel {
+		t.Fatalf("datastore_op_failed level = %s, want warn", entries[0].Level)
+	}
+	fields := entries[0].ContextMap()
+	if _, ok := fields["error"]; ok {
+		t.Fatalf("conflict log must not include error field: %#v", fields)
+	}
+	if fields["detail"] != ErrPathConflict.Error() {
+		t.Fatalf("detail field = %v, want %q", fields["detail"], ErrPathConflict.Error())
 	}
 }
 

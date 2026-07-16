@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -50,6 +51,33 @@ func newTestBackendWithOptions(t *testing.T, opts Options) *Dat9Backend {
 }
 
 var _ filesystem.FileSystem = (*Dat9Backend)(nil)
+
+func TestBackendResultForErrorClassifiesExpectedConflicts(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "nil", err: nil, want: "ok"},
+		{name: "not found", err: datastore.ErrNotFound, want: "not_found"},
+		{name: "path conflict", err: datastore.ErrPathConflict, want: "conflict"},
+		{name: "revision conflict", err: datastore.ErrRevisionConflict, want: "conflict"},
+		{name: "upload conflict", err: datastore.ErrUploadConflict, want: "conflict"},
+		{name: "upload not active", err: datastore.ErrUploadNotActive, want: "conflict"},
+		{name: "idempotency conflict", err: datastore.ErrIdempotencyConflict, want: "conflict"},
+		{name: "wrapped conflict", err: fmt.Errorf("create node: %w", datastore.ErrPathConflict), want: "conflict"},
+		{name: "canceled", err: context.Canceled, want: "canceled"},
+		{name: "deadline", err: context.DeadlineExceeded, want: "deadline_exceeded"},
+		{name: "generic", err: errors.New("boom"), want: "error"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := backendResultForError(tt.err); got != tt.want {
+				t.Errorf("backendResultForError(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestCreateAndStat(t *testing.T) {
 	b := newTestBackend(t)

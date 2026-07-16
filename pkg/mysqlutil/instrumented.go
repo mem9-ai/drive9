@@ -283,7 +283,10 @@ func observeDBOperation(ctx context.Context, role, operation, query string, star
 	result := dbResult(err)
 	metrics.RecordDBOperation(role, operation, result, elapsed)
 
-	if !logger.BenchTimingLogEnabled() {
+	if !logger.DBTraceLogEnabled() {
+		return
+	}
+	if threshold := logger.DBSlowTraceThreshold(); threshold > 0 && elapsed < threshold {
 		return
 	}
 
@@ -308,7 +311,7 @@ func observeDBOperation(ctx context.Context, role, operation, query string, star
 	if err != nil {
 		fields = append(fields, safeDBErrorFields(err)...)
 	}
-	logger.InfoBenchTiming(ctx, "db_operation_timing", fields...)
+	logger.Info(ctx, "db_operation_timing", fields...)
 }
 
 func dbResult(err error) string {

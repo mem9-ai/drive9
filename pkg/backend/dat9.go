@@ -2271,13 +2271,22 @@ func (b *Dat9Backend) Find(ctx context.Context, f *datastore.FindFilter) ([]data
 }
 
 func observeBackend(ctx context.Context, tenantID, op string, err error, start time.Time) {
-	result := "ok"
-	if err != nil {
-		if errors.Is(err, datastore.ErrNotFound) {
-			result = "not_found"
-		} else {
-			result = "error"
-		}
+	metrics.RecordTenantOperation(tenantID, "backend", op, backendResultForError(err), time.Since(start))
+}
+
+func backendResultForError(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, datastore.ErrNotFound):
+		return "not_found"
+	case errors.Is(err, datastore.ErrPathConflict),
+		errors.Is(err, datastore.ErrRevisionConflict),
+		errors.Is(err, datastore.ErrUploadConflict),
+		errors.Is(err, datastore.ErrUploadNotActive),
+		errors.Is(err, datastore.ErrIdempotencyConflict):
+		return "conflict"
+	default:
+		return metrics.ResultForError(err)
 	}
-	metrics.RecordTenantOperation(tenantID, "backend", op, result, time.Since(start))
 }

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
@@ -103,6 +104,70 @@ func TestBenchTimingLogEnabledCachesUntilReset(t *testing.T) {
 	resetBenchTimingLogEnabledForTest()
 	if BenchTimingLogEnabled() {
 		t.Fatal("expected bench timing log to be disabled after reset")
+	}
+}
+
+func TestDBTraceLogEnabledCachesUntilReset(t *testing.T) {
+	resetDBTraceLogEnabledForTest()
+	t.Cleanup(resetDBTraceLogEnabledForTest)
+
+	if !DBTraceLogEnabled() {
+		t.Fatal("expected DB trace log to be enabled by default")
+	}
+
+	t.Setenv(envDBTraceLogEnabled, "false")
+	if !DBTraceLogEnabled() {
+		t.Fatal("expected cached enabled value to remain true before reset")
+	}
+
+	resetDBTraceLogEnabledForTest()
+	if DBTraceLogEnabled() {
+		t.Fatal("expected DB trace log to be disabled after reset")
+	}
+
+	t.Setenv(envDBTraceLogEnabled, "true")
+	resetDBTraceLogEnabledForTest()
+	if !DBTraceLogEnabled() {
+		t.Fatal("expected DB trace log to be enabled")
+	}
+}
+
+func TestDBSlowTraceThresholdDefaultsTo300MS(t *testing.T) {
+	resetDBSlowTraceThresholdForTest()
+	t.Cleanup(resetDBSlowTraceThresholdForTest)
+
+	if got := DBSlowTraceThreshold(); got != 300*time.Millisecond {
+		t.Fatalf("DBSlowTraceThreshold() = %s, want 300ms", got)
+	}
+}
+
+func TestDBSlowTraceThresholdAcceptsZeroForAllOperations(t *testing.T) {
+	resetDBSlowTraceThresholdForTest()
+	t.Cleanup(resetDBSlowTraceThresholdForTest)
+
+	t.Setenv(envDBSlowTraceMS, "0")
+	if got := DBSlowTraceThreshold(); got != 0 {
+		t.Fatalf("DBSlowTraceThreshold() = %s, want 0", got)
+	}
+}
+
+func TestDBSlowTraceThresholdCachesUntilReset(t *testing.T) {
+	resetDBSlowTraceThresholdForTest()
+	t.Cleanup(resetDBSlowTraceThresholdForTest)
+
+	t.Setenv(envDBSlowTraceMS, "250")
+	if got := DBSlowTraceThreshold(); got != 250*time.Millisecond {
+		t.Fatalf("DBSlowTraceThreshold() = %s, want 250ms", got)
+	}
+
+	t.Setenv(envDBSlowTraceMS, "500")
+	if got := DBSlowTraceThreshold(); got != 250*time.Millisecond {
+		t.Fatalf("DBSlowTraceThreshold() = %s, want cached 250ms before reset", got)
+	}
+
+	resetDBSlowTraceThresholdForTest()
+	if got := DBSlowTraceThreshold(); got != 500*time.Millisecond {
+		t.Fatalf("DBSlowTraceThreshold() after reset = %s, want 500ms", got)
 	}
 }
 

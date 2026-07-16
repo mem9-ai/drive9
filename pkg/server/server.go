@@ -2212,13 +2212,13 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 				return
 			}
 			if errors.Is(err, datastore.ErrUploadConflict) {
-				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_upload_conflict", "path", path, "error", err)...)
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_upload_conflict", "path", path, "detail", err.Error())...)
 				metricEvent(r.Context(), "fs_write", "result", "conflict")
 				errJSON(w, http.StatusConflict, err.Error())
 				return
 			}
 			if errors.Is(err, datastore.ErrRevisionConflict) {
-				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_upload_revision_conflict", "path", path, "error", err)...)
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_upload_revision_conflict", "path", path, "detail", err.Error())...)
 				metricEvent(r.Context(), "fs_write", "result", "conflict")
 				errJSON(w, http.StatusConflict, err.Error())
 				return
@@ -2295,7 +2295,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			return
 		}
 		if errors.Is(err, datastore.ErrRevisionConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_conflict", "path", path, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_conflict", "path", path, "detail", err.Error())...)
 			metricEvent(r.Context(), "fs_write", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
@@ -2462,7 +2462,7 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 			return
 		}
 		if errors.Is(err, datastore.ErrRevisionConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_revision_conflict", "path", path, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_revision_conflict", "path", path, "detail", err.Error())...)
 			metricEvent(r.Context(), "fs_patch", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
@@ -2560,7 +2560,7 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 			return
 		}
 		if errors.Is(err, datastore.ErrRevisionConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_revision_conflict", "path", path, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_revision_conflict", "path", path, "detail", err.Error())...)
 			metricEvent(r.Context(), "fs_append", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
@@ -3322,7 +3322,7 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 	}
 	if err := b.MkdirCtx(r.Context(), path, mode); err != nil {
 		if errors.Is(err, datastore.ErrPathConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "mkdir_conflict", "path", path, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "mkdir_conflict", "path", path, "detail", err.Error())...)
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
@@ -3391,7 +3391,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 	}
 	if err := b.CreateCtx(r.Context(), path); err != nil {
 		if errors.Is(err, datastore.ErrPathConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_conflict", "path", path, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_conflict", "path", path, "detail", err.Error())...)
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
@@ -3453,7 +3453,7 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 			return
 		}
 		if errors.Is(err, datastore.ErrPathConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_conflict", "path", path, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_conflict", "path", path, "detail", err.Error())...)
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
@@ -3629,13 +3629,13 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 			return
 		}
 		if errors.Is(err, datastore.ErrUploadConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_conflict", "path", req.Path, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_conflict", "path", req.Path, "detail", err.Error())...)
 			metricEvent(r.Context(), "fs_write", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
 		if errors.Is(err, datastore.ErrRevisionConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_revision_conflict", "path", req.Path, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_revision_conflict", "path", req.Path, "detail", err.Error())...)
 			metricEvent(r.Context(), "fs_write", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
@@ -3738,7 +3738,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 			return
 		}
 		if errors.Is(err, datastore.ErrUploadNotActive) || errors.Is(err, datastore.ErrPathConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_conflict", "upload_id", uploadID, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_conflict", "upload_id", uploadID, "detail", err.Error())...)
 			metricEvent(r.Context(), "upload_complete", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
@@ -3750,7 +3750,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 			return
 		}
 		if errors.Is(err, datastore.ErrRevisionConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_revision_conflict", "upload_id", uploadID, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_revision_conflict", "upload_id", uploadID, "detail", err.Error())...)
 			metricEvent(r.Context(), "upload_complete", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
@@ -4095,13 +4095,13 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if errors.Is(err, datastore.ErrUploadConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_conflict", "path", req.Path, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_conflict", "path", req.Path, "detail", err.Error())...)
 			metricEvent(r.Context(), "v2_upload_initiate", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
 		if errors.Is(err, datastore.ErrRevisionConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_revision_conflict", "path", req.Path, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_revision_conflict", "path", req.Path, "detail", err.Error())...)
 			metricEvent(r.Context(), "v2_upload_initiate", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
@@ -4303,13 +4303,13 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		if errors.Is(err, datastore.ErrPathConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_conflict", "upload_id", uploadID, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_conflict", "upload_id", uploadID, "detail", err.Error())...)
 			metricEvent(r.Context(), "v2_upload_complete", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
 		if errors.Is(err, datastore.ErrRevisionConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_revision_conflict", "upload_id", uploadID, "error", err)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_revision_conflict", "upload_id", uploadID, "detail", err.Error())...)
 			metricEvent(r.Context(), "v2_upload_complete", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
