@@ -552,6 +552,7 @@ environment:
   DRIVE9_DEFAULT_STORAGE_QUOTA_BYTES fallback per-tenant total storage limit when no explicit quota is configured (default: %d)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
+  DRIVE9_DB_TRACE_LOG_ENABLED true|false to emit DB operation trace logs with redacted SQL (default: false)
   DRIVE9_QUOTA_USAGE_CACHE_TTL soft small-write central usage cache TTL, e.g. 250ms or 1s
   DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL soft small-write in-process pending mutation cache TTL, e.g. 250ms or 1s
   DRIVE9_QUOTA_REPLAY_POLL_MS central quota mutation replay poll interval in milliseconds (default: 1000)

@@ -15,6 +15,7 @@ import (
 
 const (
 	envBenchTimingLogEnabled = "DRIVE9_BENCH_TIMING_LOG_ENABLED"
+	envDBTraceLogEnabled     = "DRIVE9_DB_TRACE_LOG_ENABLED"
 	envLogLevel              = "DRIVE9_LOG_LEVEL"
 )
 
@@ -24,7 +25,14 @@ const (
 	benchTimingLogEnabled
 )
 
+const (
+	dbTraceLogUnknown uint32 = iota
+	dbTraceLogDisabled
+	dbTraceLogEnabled
+)
+
 var benchTimingLogState atomic.Uint32
+var dbTraceLogState atomic.Uint32
 
 func NewServerLogger() (*zap.Logger, error) {
 	cfg := zap.NewProductionConfig()
@@ -56,6 +64,23 @@ func BenchTimingLogEnabled() bool {
 		return true
 	}
 	benchTimingLogState.Store(benchTimingLogDisabled)
+	return false
+}
+
+func DBTraceLogEnabled() bool {
+	switch dbTraceLogState.Load() {
+	case dbTraceLogDisabled:
+		return false
+	case dbTraceLogEnabled:
+		return true
+	}
+
+	enabled := envBool(envDBTraceLogEnabled, false)
+	if enabled {
+		dbTraceLogState.Store(dbTraceLogEnabled)
+		return true
+	}
+	dbTraceLogState.Store(dbTraceLogDisabled)
 	return false
 }
 
@@ -142,9 +167,20 @@ func resetBenchTimingLogEnabledForTest() {
 	benchTimingLogState.Store(benchTimingLogUnknown)
 }
 
+func resetDBTraceLogEnabledForTest() {
+	dbTraceLogState.Store(dbTraceLogUnknown)
+}
+
 // ResetBenchTimingLogEnabledForTest clears the cached benchmark timing flag.
 // It is intended for tests in packages outside logger that need to toggle
 // DRIVE9_BENCH_TIMING_LOG_ENABLED deterministically.
 func ResetBenchTimingLogEnabledForTest() {
 	resetBenchTimingLogEnabledForTest()
+}
+
+// ResetDBTraceLogEnabledForTest clears the cached DB trace flag.
+// It is intended for tests in packages outside logger that need to toggle
+// DRIVE9_DB_TRACE_LOG_ENABLED deterministically.
+func ResetDBTraceLogEnabledForTest() {
+	resetDBTraceLogEnabledForTest()
 }

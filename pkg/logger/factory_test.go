@@ -106,6 +106,26 @@ func TestBenchTimingLogEnabledCachesUntilReset(t *testing.T) {
 	}
 }
 
+func TestDBTraceLogEnabledCachesUntilReset(t *testing.T) {
+	resetDBTraceLogEnabledForTest()
+	t.Cleanup(resetDBTraceLogEnabledForTest)
+
+	t.Setenv(envDBTraceLogEnabled, "true")
+	if !DBTraceLogEnabled() {
+		t.Fatal("expected DB trace log to be enabled")
+	}
+
+	t.Setenv(envDBTraceLogEnabled, "false")
+	if !DBTraceLogEnabled() {
+		t.Fatal("expected cached enabled value to remain true before reset")
+	}
+
+	resetDBTraceLogEnabledForTest()
+	if DBTraceLogEnabled() {
+		t.Fatal("expected DB trace log to be disabled after reset")
+	}
+}
+
 func TestInfoBenchTimingHonorsEnabledFlag(t *testing.T) {
 	resetBenchTimingLogEnabledForTest()
 	t.Cleanup(resetBenchTimingLogEnabledForTest)

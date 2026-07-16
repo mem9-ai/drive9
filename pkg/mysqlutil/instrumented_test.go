@@ -55,6 +55,31 @@ func TestObserveDBOperationLogsSQLTraceWithoutArgs(t *testing.T) {
 	}
 }
 
+func TestObserveDBOperationLogsSQLTraceWhenDBTraceEnabled(t *testing.T) {
+	t.Setenv("DRIVE9_BENCH_TIMING_LOG_ENABLED", "false")
+	t.Setenv("DRIVE9_DB_TRACE_LOG_ENABLED", "true")
+	logger.ResetBenchTimingLogEnabledForTest()
+	logger.ResetDBTraceLogEnabledForTest()
+	t.Cleanup(logger.ResetBenchTimingLogEnabledForTest)
+	t.Cleanup(logger.ResetDBTraceLogEnabledForTest)
+
+	core, recorded := observer.New(zap.InfoLevel)
+	prevLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(prevLogger) })
+
+	observeDBOperation(context.Background(), RoleUser, "query", "SELECT * FROM file_nodes WHERE path = ?", time.Now(), nil)
+
+	entries := recorded.FilterMessage("db_operation_timing").All()
+	if len(entries) != 1 {
+		t.Fatalf("db_operation_timing entries = %d, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["sql"] != "SELECT * FROM file_nodes WHERE path = ?" {
+		t.Errorf("sql field = %v", fields["sql"])
+	}
+}
+
 func TestNormalizeSQLForTraceRedactsLiterals(t *testing.T) {
 	query := `SELECT * FROM files
 		WHERE name = 'agent secret'
@@ -153,8 +178,11 @@ func TestObserveDBOperationBoundsSQLTraceField(t *testing.T) {
 
 func TestObserveDBOperationSkipsTraceFieldsWhenBenchTimingDisabled(t *testing.T) {
 	t.Setenv("DRIVE9_BENCH_TIMING_LOG_ENABLED", "false")
+	t.Setenv("DRIVE9_DB_TRACE_LOG_ENABLED", "false")
 	logger.ResetBenchTimingLogEnabledForTest()
+	logger.ResetDBTraceLogEnabledForTest()
 	t.Cleanup(logger.ResetBenchTimingLogEnabledForTest)
+	t.Cleanup(logger.ResetDBTraceLogEnabledForTest)
 
 	core, recorded := observer.New(zap.InfoLevel)
 	prevLogger := logger.L()
