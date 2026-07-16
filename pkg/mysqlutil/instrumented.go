@@ -286,6 +286,9 @@ func observeDBOperation(ctx context.Context, role, operation, query string, star
 	if !logger.DBTraceLogEnabled() {
 		return
 	}
+	if threshold := logger.DBSlowTraceThreshold(); threshold > 0 && elapsed < threshold {
+		return
+	}
 
 	fields := []zap.Field{
 		zap.String("role", role),

@@ -29,7 +29,7 @@ func TestObserveDBOperationLogsSQLTraceWithoutArgs(t *testing.T) {
 	t.Cleanup(func() { logger.Set(prevLogger) })
 
 	ctx := context.Background()
-	start := time.Now().Add(-10 * time.Millisecond)
+	start := time.Now().Add(-350 * time.Millisecond)
 	observeDBOperation(ctx, RoleUser, "exec", "  INSERT INTO file_nodes\n(path, name) VALUES (?, ?)  ", start, errors.New("duplicate key"))
 
 	entries := recorded.FilterMessage("db_operation_timing").All()
@@ -70,7 +70,7 @@ func TestObserveDBOperationLogsSQLTraceWhenDBTraceEnabled(t *testing.T) {
 	logger.Set(zap.New(core))
 	t.Cleanup(func() { logger.Set(prevLogger) })
 
-	observeDBOperation(context.Background(), RoleUser, "query", "SELECT * FROM file_nodes WHERE path = ?", time.Now(), nil)
+	observeDBOperation(context.Background(), RoleUser, "query", "SELECT * FROM file_nodes WHERE path = ?", time.Now().Add(-350*time.Millisecond), nil)
 
 	entries := recorded.FilterMessage("db_operation_timing").All()
 	if len(entries) != 1 {
@@ -128,7 +128,7 @@ func TestObserveDBOperationLogsSafeErrorDetails(t *testing.T) {
 		Number:  1062,
 		Message: "Duplicate entry '" + secret + "' for key 'files.name'",
 	}
-	observeDBOperation(context.Background(), RoleUser, "exec", "INSERT INTO files(name) VALUES (?)", time.Now(), dbErr)
+	observeDBOperation(context.Background(), RoleUser, "exec", "INSERT INTO files(name) VALUES (?)", time.Now().Add(-350*time.Millisecond), dbErr)
 
 	entries := recorded.FilterMessage("db_operation_timing").All()
 	if len(entries) != 1 {
@@ -160,7 +160,7 @@ func TestObserveDBOperationBoundsSQLTraceField(t *testing.T) {
 	t.Cleanup(func() { logger.Set(prevLogger) })
 
 	query := "SELECT " + strings.Repeat("x", maxSQLTraceLen*3) + " FROM files"
-	observeDBOperation(context.Background(), RoleUser, "query", query, time.Now(), nil)
+	observeDBOperation(context.Background(), RoleUser, "query", query, time.Now().Add(-350*time.Millisecond), nil)
 
 	entries := recorded.FilterMessage("db_operation_timing").All()
 	if len(entries) != 1 {
@@ -223,6 +223,63 @@ func TestObserveDBOperationSkipsTraceWhenOnlyBenchTimingEnabled(t *testing.T) {
 
 	if entries := recorded.FilterMessage("db_operation_timing").All(); len(entries) != 0 {
 		t.Fatalf("db_operation_timing entries = %d, want 0", len(entries))
+	}
+}
+
+func TestObserveDBOperationSkipsTraceBelowDefaultSlowThreshold(t *testing.T) {
+	t.Setenv("DRIVE9_DB_TRACE_LOG_ENABLED", "true")
+	logger.ResetDBTraceLogEnabledForTest()
+	logger.ResetDBSlowTraceThresholdForTest()
+	t.Cleanup(logger.ResetDBTraceLogEnabledForTest)
+	t.Cleanup(logger.ResetDBSlowTraceThresholdForTest)
+
+	core, recorded := observer.New(zap.InfoLevel)
+	prevLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(prevLogger) })
+
+	observeDBOperation(context.Background(), RoleUser, "query", "SELECT * FROM file_nodes", time.Now().Add(-50*time.Millisecond), nil)
+
+	if entries := recorded.FilterMessage("db_operation_timing").All(); len(entries) != 0 {
+		t.Fatalf("db_operation_timing entries = %d, want 0", len(entries))
+	}
+}
+
+func TestObserveDBOperationLogsTraceAboveDefaultSlowThreshold(t *testing.T) {
+	logger.ResetDBTraceLogEnabledForTest()
+	logger.ResetDBSlowTraceThresholdForTest()
+	t.Cleanup(logger.ResetDBTraceLogEnabledForTest)
+	t.Cleanup(logger.ResetDBSlowTraceThresholdForTest)
+
+	core, recorded := observer.New(zap.InfoLevel)
+	prevLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(prevLogger) })
+
+	observeDBOperation(context.Background(), RoleUser, "query", "SELECT * FROM file_nodes", time.Now().Add(-350*time.Millisecond), nil)
+
+	if entries := recorded.FilterMessage("db_operation_timing").All(); len(entries) != 1 {
+		t.Fatalf("db_operation_timing entries = %d, want 1", len(entries))
+	}
+}
+
+func TestObserveDBOperationLogsTraceWhenSlowThresholdIsZero(t *testing.T) {
+	t.Setenv("DRIVE9_DB_TRACE_LOG_ENABLED", "true")
+	t.Setenv("DRIVE9_DB_SLOW_TRACE_MS", "0")
+	logger.ResetDBTraceLogEnabledForTest()
+	logger.ResetDBSlowTraceThresholdForTest()
+	t.Cleanup(logger.ResetDBTraceLogEnabledForTest)
+	t.Cleanup(logger.ResetDBSlowTraceThresholdForTest)
+
+	core, recorded := observer.New(zap.InfoLevel)
+	prevLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(prevLogger) })
+
+	observeDBOperation(context.Background(), RoleUser, "query", "SELECT * FROM file_nodes", time.Now(), nil)
+
+	if entries := recorded.FilterMessage("db_operation_timing").All(); len(entries) != 1 {
+		t.Fatalf("db_operation_timing entries = %d, want 1", len(entries))
 	}
 }
 

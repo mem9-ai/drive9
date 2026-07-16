@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -16,8 +17,11 @@ import (
 const (
 	envBenchTimingLogEnabled = "DRIVE9_BENCH_TIMING_LOG_ENABLED"
 	envDBTraceLogEnabled     = "DRIVE9_DB_TRACE_LOG_ENABLED"
+	envDBSlowTraceMS         = "DRIVE9_DB_SLOW_TRACE_MS"
 	envLogLevel              = "DRIVE9_LOG_LEVEL"
 )
+
+const defaultDBSlowTraceThreshold = 300 * time.Millisecond
 
 const (
 	benchTimingLogUnknown uint32 = iota
@@ -33,6 +37,7 @@ const (
 
 var benchTimingLogState atomic.Uint32
 var dbTraceLogState atomic.Uint32
+var dbSlowTraceThresholdNS atomic.Int64
 
 func NewServerLogger() (*zap.Logger, error) {
 	cfg := zap.NewProductionConfig()
@@ -75,13 +80,23 @@ func DBTraceLogEnabled() bool {
 		return true
 	}
 
-	enabled := envBool(envDBTraceLogEnabled, false)
+	enabled := envBool(envDBTraceLogEnabled, true)
 	if enabled {
 		dbTraceLogState.Store(dbTraceLogEnabled)
 		return true
 	}
 	dbTraceLogState.Store(dbTraceLogDisabled)
 	return false
+}
+
+func DBSlowTraceThreshold() time.Duration {
+	if value := dbSlowTraceThresholdNS.Load(); value >= 0 {
+		return time.Duration(value)
+	}
+
+	threshold := envDurationMS(envDBSlowTraceMS, defaultDBSlowTraceThreshold)
+	dbSlowTraceThresholdNS.Store(int64(threshold))
+	return threshold
 }
 
 func CLIEnabled() bool {
@@ -163,12 +178,28 @@ func envBool(key string, fallback bool) bool {
 	return v
 }
 
+func envDurationMS(key string, fallback time.Duration) time.Duration {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < 0 {
+		return fallback
+	}
+	return time.Duration(v) * time.Millisecond
+}
+
 func resetBenchTimingLogEnabledForTest() {
 	benchTimingLogState.Store(benchTimingLogUnknown)
 }
 
 func resetDBTraceLogEnabledForTest() {
 	dbTraceLogState.Store(dbTraceLogUnknown)
+}
+
+func resetDBSlowTraceThresholdForTest() {
+	dbSlowTraceThresholdNS.Store(-1)
 }
 
 // ResetBenchTimingLogEnabledForTest clears the cached benchmark timing flag.
@@ -183,4 +214,15 @@ func ResetBenchTimingLogEnabledForTest() {
 // DRIVE9_DB_TRACE_LOG_ENABLED deterministically.
 func ResetDBTraceLogEnabledForTest() {
 	resetDBTraceLogEnabledForTest()
+}
+
+// ResetDBSlowTraceThresholdForTest clears the cached DB slow trace threshold.
+// It is intended for tests in packages outside logger that need to toggle
+// DRIVE9_DB_SLOW_TRACE_MS deterministically.
+func ResetDBSlowTraceThresholdForTest() {
+	resetDBSlowTraceThresholdForTest()
+}
+
+func init() {
+	resetDBSlowTraceThresholdForTest()
 }
