@@ -149,3 +149,8 @@ echo "  export DRIVE9_LOCAL_EMBEDDING_MODE=auto DRIVE9_AUDIO_EXTRACT_ENABLED=tru
 echo "  export DRIVE9_AUDIO_EXTRACT_API_BASE=... DRIVE9_AUDIO_EXTRACT_API_KEY=... DRIVE9_AUDIO_EXTRACT_MODEL=..."
 echo "  make run-server-local"
 echo "  python3 scripts/verify_local_audio_extract.py --mode openai --audio-file /path/to/sample.wav"
+echo ""
+echo "Video voice search smoke (optional):"
+echo "  export DRIVE9_LOCAL_EMBEDDING_MODE=auto DRIVE9_AUDIO_EXTRACT_ENABLED=true DRIVE9_AUDIO_EXTRACT_MODE=stub"
+echo "  make run-server-local"
+echo "  python3 scripts/verify_local_video_voice_search_demo.py --mode stub"
