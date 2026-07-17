@@ -30,6 +30,13 @@ func TestNewPoolUsesDefaultMaxTenants(t *testing.T) {
 	}
 }
 
+func TestNewPoolUsesDocumentedDefaultIdleReapInterval(t *testing.T) {
+	pool := NewPool(PoolConfig{IdleTimeout: time.Minute}, nil)
+	if pool.reapInterval != 2*time.Minute {
+		t.Fatalf("reap interval = %s, want 2m", pool.reapInterval)
+	}
+}
+
 func TestPoolAcquireInvalidateDefersCloseUntilRelease(t *testing.T) {
 	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-a")
 	ctx := context.Background()

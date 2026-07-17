@@ -3,6 +3,7 @@ package logger
 import (
 	"context"
 	"sync/atomic"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/traceid"
 	"go.uber.org/zap"
@@ -62,6 +63,19 @@ func Info(ctx context.Context, msg string, fields ...zap.Field) {
 
 func InfoBenchTiming(ctx context.Context, msg string, fields ...zap.Field) {
 	if !BenchTimingLogEnabled() {
+		return
+	}
+	FromContext(ctx).WithOptions(zap.AddCallerSkip(1)).Info(msg, fields...)
+}
+
+// InfoOpenPoolTiming logs open-pool timing only when the whole span is slow
+// enough. The slow threshold applies to the supplied total span duration, not
+// to individual sub-phase fields included in the log entry.
+func InfoOpenPoolTiming(ctx context.Context, msg string, total time.Duration, fields ...zap.Field) {
+	if !OpenPoolTimingLogEnabled() {
+		return
+	}
+	if threshold := OpenPoolTimingSlowThreshold(); threshold > 0 && total < threshold {
 		return
 	}
 	FromContext(ctx).WithOptions(zap.AddCallerSkip(1)).Info(msg, fields...)
