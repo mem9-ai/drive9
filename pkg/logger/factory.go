@@ -15,13 +15,16 @@ import (
 )
 
 const (
-	envBenchTimingLogEnabled = "DRIVE9_BENCH_TIMING_LOG_ENABLED"
-	envDBTraceLogEnabled     = "DRIVE9_DB_TRACE_LOG_ENABLED"
-	envDBSlowTraceMS         = "DRIVE9_DB_SLOW_TRACE_MS"
-	envLogLevel              = "DRIVE9_LOG_LEVEL"
+	envBenchTimingLogEnabled    = "DRIVE9_BENCH_TIMING_LOG_ENABLED"
+	envDBTraceLogEnabled        = "DRIVE9_DB_TRACE_LOG_ENABLED"
+	envDBSlowTraceMS            = "DRIVE9_DB_SLOW_TRACE_MS"
+	envOpenPoolTimingLogEnabled = "DRIVE9_OPEN_POOL_TIMING_LOG_ENABLED"
+	envOpenPoolTimingSlowMS     = "DRIVE9_OPEN_POOL_TIMING_SLOW_MS"
+	envLogLevel                 = "DRIVE9_LOG_LEVEL"
 )
 
 const defaultDBSlowTraceThreshold = 300 * time.Millisecond
+const defaultOpenPoolTimingSlowThreshold = 500 * time.Millisecond
 
 const (
 	benchTimingLogUnknown uint32 = iota
@@ -35,9 +38,17 @@ const (
 	dbTraceLogEnabled
 )
 
+const (
+	openPoolTimingLogUnknown uint32 = iota
+	openPoolTimingLogDisabled
+	openPoolTimingLogEnabled
+)
+
 var benchTimingLogState atomic.Uint32
 var dbTraceLogState atomic.Uint32
+var openPoolTimingLogState atomic.Uint32
 var dbSlowTraceThresholdNS atomic.Int64
+var openPoolTimingSlowThresholdNS atomic.Int64
 
 func NewServerLogger() (*zap.Logger, error) {
 	cfg := zap.NewProductionConfig()
@@ -96,6 +107,33 @@ func DBSlowTraceThreshold() time.Duration {
 
 	threshold := envDurationMS(envDBSlowTraceMS, defaultDBSlowTraceThreshold)
 	dbSlowTraceThresholdNS.Store(int64(threshold))
+	return threshold
+}
+
+func OpenPoolTimingLogEnabled() bool {
+	switch openPoolTimingLogState.Load() {
+	case openPoolTimingLogDisabled:
+		return false
+	case openPoolTimingLogEnabled:
+		return true
+	}
+
+	enabled := envBool(envOpenPoolTimingLogEnabled, true)
+	if enabled {
+		openPoolTimingLogState.Store(openPoolTimingLogEnabled)
+		return true
+	}
+	openPoolTimingLogState.Store(openPoolTimingLogDisabled)
+	return false
+}
+
+func OpenPoolTimingSlowThreshold() time.Duration {
+	if value := openPoolTimingSlowThresholdNS.Load(); value >= 0 {
+		return time.Duration(value)
+	}
+
+	threshold := envDurationMS(envOpenPoolTimingSlowMS, defaultOpenPoolTimingSlowThreshold)
+	openPoolTimingSlowThresholdNS.Store(int64(threshold))
 	return threshold
 }
 
@@ -202,6 +240,14 @@ func resetDBSlowTraceThresholdForTest() {
 	dbSlowTraceThresholdNS.Store(-1)
 }
 
+func resetOpenPoolTimingLogEnabledForTest() {
+	openPoolTimingLogState.Store(openPoolTimingLogUnknown)
+}
+
+func resetOpenPoolTimingSlowThresholdForTest() {
+	openPoolTimingSlowThresholdNS.Store(-1)
+}
+
 // ResetBenchTimingLogEnabledForTest clears the cached benchmark timing flag.
 // It is intended for tests in packages outside logger that need to toggle
 // DRIVE9_BENCH_TIMING_LOG_ENABLED deterministically.
@@ -223,6 +269,21 @@ func ResetDBSlowTraceThresholdForTest() {
 	resetDBSlowTraceThresholdForTest()
 }
 
+// ResetOpenPoolTimingLogEnabledForTest clears the cached open-pool timing flag.
+// It is intended for tests in packages outside logger that need to toggle
+// DRIVE9_OPEN_POOL_TIMING_LOG_ENABLED deterministically.
+func ResetOpenPoolTimingLogEnabledForTest() {
+	resetOpenPoolTimingLogEnabledForTest()
+}
+
+// ResetOpenPoolTimingSlowThresholdForTest clears the cached open-pool timing
+// slow threshold. It is intended for tests in packages outside logger that need
+// to toggle DRIVE9_OPEN_POOL_TIMING_SLOW_MS deterministically.
+func ResetOpenPoolTimingSlowThresholdForTest() {
+	resetOpenPoolTimingSlowThresholdForTest()
+}
+
 func init() {
 	resetDBSlowTraceThresholdForTest()
+	resetOpenPoolTimingSlowThresholdForTest()
 }
