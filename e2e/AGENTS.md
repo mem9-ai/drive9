@@ -538,7 +538,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `DRIVE9_API_KEY` | - | `api-smoke-test-existing-key.sh` |
 | `DRIVE9_API_KEY` | - | `fuse-smoke-test.sh` (optional; skip provision when set) |
 | `DRIVE9_API_KEY` | - | `posix-permission-smoke-test.sh` (optional; skip provision when set) |
-| `POLL_TIMEOUT_S` | `120` (smoke), `60` (existing-key) | polling scripts |
+| `POLL_TIMEOUT_S` | `300` (api smoke), `120` (other smoke), `60` (existing-key) | polling scripts |
 | `POLL_INTERVAL_S` | `5` | polling scripts |
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
 | `LARGE_FILE_MB` | `100` | `api-smoke-test.sh` |

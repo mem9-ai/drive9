@@ -337,7 +337,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 		}
 		defer release()
 		metricEvent(r.Context(), "auth", "result", "ok")
-		logger.InfoBenchTiming(r.Context(), "tenant_auth_timing",
+		logger.InfoOpenPoolTiming(r.Context(), "tenant_auth_timing", time.Since(authStart),
 			zap.String("path", r.URL.Path),
 			zap.String("method", r.Method),
 			zap.String("tenant_id", resolved.Tenant.ID),

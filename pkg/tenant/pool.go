@@ -162,7 +162,7 @@ var (
 	ensureTiDBSchemaForFTSOnlyProfile       = schema.EnsureTiDBSchemaForFTSOnlyProfile
 	defaultTenantPoolDrainTimeout           = 30 * time.Second
 	defaultTenantPoolMaxTenants             = 1024
-	defaultTenantPoolIdleReapInterval       = 5 * time.Minute
+	defaultTenantPoolIdleReapInterval       = 1 * time.Minute
 )
 
 func ensureTiDBSchemaForEmbeddingMode(ctx context.Context, db *sql.DB, mode string, profile schema.TiDBAutoEmbeddingProfile) error {
@@ -350,7 +350,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			e.lastUsed = time.Now()
 			p.mu.Unlock()
 			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
-			logger.InfoBenchTiming(ctx, "tenant_pool_acquire_timing",
+			logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", time.Since(start),
 				zap.String("tenant_id", t.ID),
 				zap.Bool("cache_hit", true),
 				zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
@@ -393,7 +393,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			b.Close()
 			_ = st.Close()
 			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
-			logger.InfoBenchTiming(ctx, "tenant_pool_acquire_timing",
+			logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", time.Since(start),
 				zap.String("tenant_id", t.ID),
 				zap.Bool("cache_hit", true),
 				zap.Float64("create_backend_ms", createBackendDurationMs),
@@ -424,7 +424,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		closeEntry(retired)
 	}
 	metrics.RecordOperation("tenant_pool", "cache_lookup", "miss", 0)
-	logger.InfoBenchTiming(ctx, "tenant_pool_acquire_timing",
+	logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", time.Since(start),
 		zap.String("tenant_id", t.ID),
 		zap.Bool("cache_hit", false),
 		zap.Float64("create_backend_ms", createBackendDurationMs),
@@ -921,7 +921,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			return nil, nil, fmt.Errorf("create backend with s3 mode: %w", err)
 		}
 		backendCreateDurationMs := float64(time.Since(backendCreateStart).Microseconds()) / 1000.0
-		logger.InfoBenchTiming(ctx, "tenant_pool_create_backend_timing",
+		logger.InfoOpenPoolTiming(ctx, "tenant_pool_create_backend_timing", time.Since(start),
 			zap.String("tenant_id", t.ID),
 			zap.String("provider", t.Provider),
 			zap.String("storage_mode", "aws_s3"),
@@ -961,7 +961,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			return nil, nil, fmt.Errorf("create backend with local s3 mode: %w", err)
 		}
 		backendCreateDurationMs := float64(time.Since(backendCreateStart).Microseconds()) / 1000.0
-		logger.InfoBenchTiming(ctx, "tenant_pool_create_backend_timing",
+		logger.InfoOpenPoolTiming(ctx, "tenant_pool_create_backend_timing", time.Since(start),
 			zap.String("tenant_id", t.ID),
 			zap.String("provider", t.Provider),
 			zap.String("storage_mode", "local_s3"),
@@ -983,7 +983,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		return nil, nil, fmt.Errorf("create backend: %w", err)
 	}
 	backendCreateDurationMs := float64(time.Since(backendCreateStart).Microseconds()) / 1000.0
-	logger.InfoBenchTiming(ctx, "tenant_pool_create_backend_timing",
+	logger.InfoOpenPoolTiming(ctx, "tenant_pool_create_backend_timing", time.Since(start),
 		zap.String("tenant_id", t.ID),
 		zap.String("provider", t.Provider),
 		zap.String("storage_mode", "db_only"),

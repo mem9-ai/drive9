@@ -171,6 +171,56 @@ func TestDBSlowTraceThresholdCachesUntilReset(t *testing.T) {
 	}
 }
 
+func TestOpenPoolTimingLogEnabledDefaultsToTrue(t *testing.T) {
+	resetOpenPoolTimingLogEnabledForTest()
+	t.Cleanup(resetOpenPoolTimingLogEnabledForTest)
+
+	if !OpenPoolTimingLogEnabled() {
+		t.Fatal("expected open pool timing log to be enabled by default")
+	}
+}
+
+func TestOpenPoolTimingSlowThresholdDefaultsTo500MS(t *testing.T) {
+	resetOpenPoolTimingSlowThresholdForTest()
+	t.Cleanup(resetOpenPoolTimingSlowThresholdForTest)
+
+	if got := OpenPoolTimingSlowThreshold(); got != 500*time.Millisecond {
+		t.Fatalf("OpenPoolTimingSlowThreshold() = %s, want 500ms", got)
+	}
+}
+
+func TestInfoOpenPoolTimingHonorsEnabledFlagAndSlowThreshold(t *testing.T) {
+	resetOpenPoolTimingLogEnabledForTest()
+	resetOpenPoolTimingSlowThresholdForTest()
+	t.Cleanup(resetOpenPoolTimingLogEnabledForTest)
+	t.Cleanup(resetOpenPoolTimingSlowThresholdForTest)
+
+	core, recorded := observer.New(zap.InfoLevel)
+	ctx := WithContext(context.Background(), zap.New(core))
+
+	t.Setenv(envOpenPoolTimingLogEnabled, "true")
+	t.Setenv(envOpenPoolTimingSlowMS, "500")
+	InfoOpenPoolTiming(ctx, "below_threshold", 499*time.Millisecond)
+	if entries := recorded.All(); len(entries) != 0 {
+		t.Fatalf("recorded %d entries below threshold, want 0", len(entries))
+	}
+
+	InfoOpenPoolTiming(ctx, "at_threshold", 500*time.Millisecond)
+	if entries := recorded.All(); len(entries) != 1 {
+		t.Fatalf("recorded %d entries at threshold, want 1", len(entries))
+	}
+	if recorded.All()[0].Message != "at_threshold" {
+		t.Fatalf("message = %q, want at_threshold", recorded.All()[0].Message)
+	}
+
+	t.Setenv(envOpenPoolTimingLogEnabled, "false")
+	resetOpenPoolTimingLogEnabledForTest()
+	InfoOpenPoolTiming(ctx, "disabled", 2*time.Second)
+	if entries := recorded.All(); len(entries) != 1 {
+		t.Fatalf("recorded %d entries after disabled log, want 1", len(entries))
+	}
+}
+
 func TestInfoBenchTimingHonorsEnabledFlag(t *testing.T) {
 	resetBenchTimingLogEnabledForTest()
 	t.Cleanup(resetBenchTimingLogEnabledForTest)

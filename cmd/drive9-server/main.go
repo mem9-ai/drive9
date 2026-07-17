@@ -318,8 +318,8 @@ func main() {
 			S3EncryptionPolicy:           s3cfg.EncryptionPolicy,
 			BackendOptions:               backendOptions,
 			MaxTenants:                   envInt("DRIVE9_POOL_MAX_TENANTS", 0),
-			IdleTimeout:                  envDuration("DRIVE9_POOL_IDLE_TTL", 10*time.Minute),
-			IdleReapInterval:             envDuration("DRIVE9_POOL_IDLE_REAP_INTERVAL", 0),
+			IdleTimeout:                  envDuration("DRIVE9_POOL_IDLE_TTL", 5*time.Minute),
+			IdleReapInterval:             envDuration("DRIVE9_POOL_IDLE_REAP_INTERVAL", 2*time.Minute),
 			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 			LeaderChecker:                leaderManager,
 		}, enc)
@@ -529,14 +529,14 @@ environment:
   DRIVE9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
   DRIVE9_META_DSN    control-plane MySQL DSN (required)
   DRIVE9_POOL_MAX_TENANTS max cached tenant user DB pools per pod (default: 1024)
-  DRIVE9_POOL_IDLE_TTL  idle duration before a cached tenant backend is evicted (default: 10m, 0=disabled)
-  DRIVE9_POOL_IDLE_REAP_INTERVAL  how often the idle reaper scans (default: 5m)
+  DRIVE9_POOL_IDLE_TTL  idle duration before a cached tenant backend is evicted (default: 5m, 0=disabled)
+  DRIVE9_POOL_IDLE_REAP_INTERVAL  how often the idle reaper scans (default: 2m)
   DRIVE9_META_DB_MAX_OPEN_CONNS max open connections for the per-pod meta DB pool (default: 100)
   DRIVE9_META_DB_MAX_IDLE_CONNS max idle connections for the per-pod meta DB pool (default: 20)
   DRIVE9_USER_DB_MAX_OPEN_CONNS max open connections for each cached tenant user DB pool (default: 6)
-  DRIVE9_USER_DB_MAX_IDLE_CONNS max idle connections for each cached tenant user DB pool (default: 0)
+  DRIVE9_USER_DB_MAX_IDLE_CONNS max idle connections for each cached tenant user DB pool (default: 2)
   DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS max open connections for tenant schema-init DB pools (default: 8)
-  DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS max idle connections for tenant schema-init DB pools (default: 0)
+  DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS max idle connections for tenant schema-init DB pools (default: 2)
   DRIVE9_DB_HEALTH_PROBE_INTERVAL_SECONDS DB health probe interval seconds (default: 15)
   DRIVE9_DB_HEALTH_PROBE_TIMEOUT_SECONDS DB health probe timeout seconds (default: 3)
   DRIVE9_DB_HEALTH_PROBE_META_ENABLED true|false to probe the control-plane DB (default: true)
@@ -552,6 +552,8 @@ environment:
   DRIVE9_DEFAULT_STORAGE_QUOTA_BYTES fallback per-tenant total storage limit when no explicit quota is configured (default: %d)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
+  DRIVE9_OPEN_POOL_TIMING_LOG_ENABLED true|false to emit slow tenant backend open timing logs (default: true)
+  DRIVE9_OPEN_POOL_TIMING_SLOW_MS minimum total open-pool duration in ms for timing logs (default: 500, 0=all)
   DRIVE9_DB_TRACE_LOG_ENABLED true|false to emit DB operation trace logs with redacted SQL (default: true)
   DRIVE9_DB_SLOW_TRACE_MS minimum DB operation duration in ms for DB trace logs (default: 300, 0=all)
   DRIVE9_QUOTA_USAGE_CACHE_TTL soft small-write central usage cache TTL, e.g. 250ms or 1s

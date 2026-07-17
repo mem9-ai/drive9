@@ -13,14 +13,14 @@ const (
 	defaultMetaConnMaxIdleTime       = 45 * time.Second
 	defaultMetaMaxOpenConns          = 100
 	defaultMetaMaxIdleConns          = 20
-	defaultUserConnMaxLifetime       = 30 * time.Second
-	defaultUserConnMaxIdleTime       = 15 * time.Second
+	defaultUserConnMaxLifetime       = 45 * time.Second
+	defaultUserConnMaxIdleTime       = 30 * time.Second
 	defaultUserMaxOpenConns          = 6
-	defaultUserMaxIdleConns          = 0
+	defaultUserMaxIdleConns          = 2
 	defaultUserSchemaConnMaxLifetime = 1 * time.Minute
-	defaultUserSchemaConnMaxIdleTime = 10 * time.Second
+	defaultUserSchemaConnMaxIdleTime = 20 * time.Second
 	defaultUserSchemaMaxOpenConns    = 8
-	defaultUserSchemaMaxIdleConns    = 0
+	defaultUserSchemaMaxIdleConns    = 2
 )
 
 // ApplyPoolDefaults rotates and prunes idle connections before common LB/NAT
