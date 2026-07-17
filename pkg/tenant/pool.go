@@ -823,7 +823,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	}
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
 	openStoreStart := time.Now()
-	store, err := datastore.OpenForTenant(dsn, t.ID)
+	store, err := datastore.OpenForTenant(ctx, dsn, t.ID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open datastore: %w", err)
 	}
