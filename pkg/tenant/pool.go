@@ -162,7 +162,7 @@ var (
 	ensureTiDBSchemaForFTSOnlyProfile       = schema.EnsureTiDBSchemaForFTSOnlyProfile
 	defaultTenantPoolDrainTimeout           = 30 * time.Second
 	defaultTenantPoolMaxTenants             = 1024
-	defaultTenantPoolIdleReapInterval       = 1 * time.Minute
+	defaultTenantPoolIdleReapInterval       = 2 * time.Minute
 )
 
 func ensureTiDBSchemaForEmbeddingMode(ctx context.Context, db *sql.DB, mode string, profile schema.TiDBAutoEmbeddingProfile) error {
