@@ -184,6 +184,18 @@ func durationMs(d time.Duration) float64 {
 	return float64(d.Microseconds()) / 1000.0
 }
 
+func poolAcquireTimingFields(tenantID string, coldOpen bool, createBackendDurationMs float64, totalDuration time.Duration) []zap.Field {
+	fields := []zap.Field{
+		zap.String("tenant_id", tenantID),
+		zap.Bool("cold_open", coldOpen),
+	}
+	if coldOpen {
+		fields = append(fields, zap.Float64("create_backend_ms", createBackendDurationMs))
+	}
+	fields = append(fields, zap.Float64("total_ms", durationMs(totalDuration)))
+	return fields
+}
+
 func (p *Pool) resolveTenantEmbeddingMode(persisted string) (mode string, wasNull bool, err error) {
 	return meta.ResolveTenantEmbeddingMode(persisted, p.cfg.DisableDatabaseAutoEmbedding)
 }
@@ -356,9 +368,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
 			totalDuration := time.Since(start)
 			logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
-				zap.String("tenant_id", t.ID),
-				zap.Bool("cache_hit", true),
-				zap.Float64("total_ms", durationMs(totalDuration)))
+				poolAcquireTimingFields(t.ID, false, 0, totalDuration)...)
 			return e.backend, p.makeRelease(e), nil
 		}
 		if removed := p.removeLocked(e.elem, "replace"); removed != nil {
@@ -400,10 +410,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
 			totalDuration := time.Since(start)
 			logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
-				zap.String("tenant_id", t.ID),
-				zap.Bool("cache_hit", true),
-				zap.Float64("create_backend_ms", createBackendDurationMs),
-				zap.Float64("total_ms", durationMs(totalDuration)))
+				poolAcquireTimingFields(t.ID, true, createBackendDurationMs, totalDuration)...)
 			return e.backend, p.makeRelease(e), nil
 		}
 		if removed := p.removeLocked(e.elem, "replace"); removed != nil {
@@ -432,10 +439,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	metrics.RecordOperation("tenant_pool", "cache_lookup", "miss", 0)
 	totalDuration := time.Since(start)
 	logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
-		zap.String("tenant_id", t.ID),
-		zap.Bool("cache_hit", false),
-		zap.Float64("create_backend_ms", createBackendDurationMs),
-		zap.Float64("total_ms", durationMs(totalDuration)))
+		poolAcquireTimingFields(t.ID, true, createBackendDurationMs, totalDuration)...)
 	return b, p.makeRelease(e), nil
 }
 
