@@ -154,20 +154,20 @@ type Store struct {
 }
 
 func Open(dsn string) (*Store, error) {
-	return OpenForTenant(dsn, "")
+	return OpenForTenant(context.Background(), dsn, "")
 }
 
-func OpenForTenant(dsn, tenantID string) (*Store, error) {
+func OpenForTenant(ctx context.Context, dsn, tenantID string) (*Store, error) {
 	lower := strings.ToLower(dsn)
 	if strings.Contains(lower, "multistatements=true") || strings.Contains(lower, "multistatements=1") {
 		return nil, fmt.Errorf("multiStatements is not allowed in production DSN")
 	}
-	db, err := mysqlutil.OpenInstrumentedForTenant(context.Background(), dsn, mysqlutil.RoleUser, tenantID)
+	db, err := mysqlutil.OpenInstrumentedForTenant(ctx, dsn, mysqlutil.RoleUser, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	s := &Store{db: db}
-	hasLegacy, err := s.detectLegacyFiles(context.Background())
+	hasLegacy, err := s.detectLegacyFiles(ctx)
 	if err != nil {
 		_ = mysqlutil.CloseInstrumented(db)
 		return nil, fmt.Errorf("detect legacy files table: %w", err)

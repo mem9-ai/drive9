@@ -12,6 +12,7 @@ import (
 
 	"github.com/mem9-ai/drive9/internal/testmysql"
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/traceid"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
@@ -101,6 +102,39 @@ func TestObserveStoreOpConflictLogsWarnDetail(t *testing.T) {
 	if fields["detail"] != ErrPathConflict.Error() {
 		t.Fatalf("detail field = %v, want %q", fields["detail"], ErrPathConflict.Error())
 	}
+}
+
+func TestOpenForTenantPropagatesTraceToDBTiming(t *testing.T) {
+	initDatastoreSchema(t, testDSN)
+	t.Setenv("DRIVE9_DB_TRACE_LOG_ENABLED", "true")
+	t.Setenv("DRIVE9_DB_SLOW_TRACE_MS", "0")
+	logger.ResetDBTraceLogEnabledForTest()
+	logger.ResetDBSlowTraceThresholdForTest()
+	t.Cleanup(logger.ResetDBTraceLogEnabledForTest)
+	t.Cleanup(logger.ResetDBSlowTraceThresholdForTest)
+
+	core, recorded := observer.New(zap.InfoLevel)
+	prevLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(prevLogger) })
+
+	const wantTraceID = "trace-open-store"
+	store, err := OpenForTenant(traceid.With(context.Background(), wantTraceID), testDSN, "tenant-trace")
+	if err != nil {
+		t.Fatalf("OpenForTenant: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	entries := recorded.FilterMessage("db_operation_timing").All()
+	if len(entries) == 0 {
+		t.Fatal("db_operation_timing entries = 0, want at least 1")
+	}
+	for _, entry := range entries {
+		if entry.ContextMap()["trace_id"] == wantTraceID {
+			return
+		}
+	}
+	t.Fatalf("no db_operation_timing entry carried trace_id %q; entries=%#v", wantTraceID, entries)
 }
 
 func genID() string {
