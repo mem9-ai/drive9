@@ -138,7 +138,11 @@ func withScope(ctx context.Context, scope *TenantScope) context.Context {
 }
 
 func authPhaseMs(start time.Time) float64 {
-	return float64(time.Since(start).Microseconds()) / 1000.0
+	return durationMs(time.Since(start))
+}
+
+func durationMs(d time.Duration) float64 {
+	return float64(d.Microseconds()) / 1000.0
 }
 
 func isClientCanceled(ctx context.Context, err error) bool {
@@ -337,7 +341,8 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 		}
 		defer release()
 		metricEvent(r.Context(), "auth", "result", "ok")
-		logger.InfoOpenPoolTiming(r.Context(), "tenant_auth_timing", time.Since(authStart),
+		totalDuration := time.Since(authStart)
+		logger.InfoOpenPoolTiming(r.Context(), "tenant_auth_timing", totalDuration,
 			zap.String("path", r.URL.Path),
 			zap.String("method", r.Method),
 			zap.String("tenant_id", resolved.Tenant.ID),
@@ -346,7 +351,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			zap.Float64("decrypt_token_ms", decryptDurationMs),
 			zap.Float64("verify_token_ms", verifyDurationMs),
 			zap.Float64("pool_acquire_ms", acquireDurationMs),
-			zap.Float64("total_ms", authPhaseMs(authStart)),
+			zap.Float64("total_ms", durationMs(totalDuration)),
 		)
 
 		scope := &TenantScope{

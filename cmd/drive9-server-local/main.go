@@ -373,8 +373,8 @@ environment:
   DRIVE9_VAULT_MASTER_KEY 32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
-  DRIVE9_OPEN_POOL_TIMING_LOG_ENABLED true|false to emit slow tenant backend open timing logs (default: true)
-  DRIVE9_OPEN_POOL_TIMING_SLOW_MS minimum total open-pool duration in ms for timing logs (default: 500, 0=all)
+  DRIVE9_OPEN_POOL_TIMING_LOG_ENABLED true|false to emit slow tenant pool and authentication timing logs (default: true)
+  DRIVE9_OPEN_POOL_TIMING_SLOW_MS minimum duration in ms for open-pool timing logs (default: 500, 0=all)
   DRIVE9_DB_TRACE_LOG_ENABLED true|false to emit DB operation trace logs with redacted SQL (default: true)
   DRIVE9_DB_SLOW_TRACE_MS minimum DB operation duration in ms for DB trace logs (default: 300, 0=all)
   DRIVE9_QUOTA_USAGE_CACHE_TTL soft small-write central usage cache TTL, e.g. 250ms or 1s

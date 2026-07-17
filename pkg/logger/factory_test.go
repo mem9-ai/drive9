@@ -174,6 +174,7 @@ func TestDBSlowTraceThresholdCachesUntilReset(t *testing.T) {
 func TestOpenPoolTimingLogEnabledDefaultsToTrue(t *testing.T) {
 	resetOpenPoolTimingLogEnabledForTest()
 	t.Cleanup(resetOpenPoolTimingLogEnabledForTest)
+	t.Setenv(envOpenPoolTimingLogEnabled, "")
 
 	if !OpenPoolTimingLogEnabled() {
 		t.Fatal("expected open pool timing log to be enabled by default")
@@ -183,6 +184,7 @@ func TestOpenPoolTimingLogEnabledDefaultsToTrue(t *testing.T) {
 func TestOpenPoolTimingSlowThresholdDefaultsTo500MS(t *testing.T) {
 	resetOpenPoolTimingSlowThresholdForTest()
 	t.Cleanup(resetOpenPoolTimingSlowThresholdForTest)
+	t.Setenv(envOpenPoolTimingSlowMS, "")
 
 	if got := OpenPoolTimingSlowThreshold(); got != 500*time.Millisecond {
 		t.Fatalf("OpenPoolTimingSlowThreshold() = %s, want 500ms", got)
