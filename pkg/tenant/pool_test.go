@@ -21,6 +21,8 @@ import (
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/semantic"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestNewPoolUsesDefaultMaxTenants(t *testing.T) {
@@ -34,6 +36,44 @@ func TestNewPoolUsesDocumentedDefaultIdleReapInterval(t *testing.T) {
 	pool := NewPool(PoolConfig{IdleTimeout: time.Minute}, nil)
 	if pool.reapInterval != 2*time.Minute {
 		t.Fatalf("reap interval = %s, want 2m", pool.reapInterval)
+	}
+}
+
+func TestPoolAcquireTimingFieldsClassifyColdOpen(t *testing.T) {
+	tests := []struct {
+		name              string
+		coldOpen          bool
+		createBackendMs   float64
+		wantCreateBackend bool
+	}{
+		{name: "hot cache hit", coldOpen: false},
+		{name: "cold open inserted", coldOpen: true, createBackendMs: 12.5, wantCreateBackend: true},
+		{name: "cold open discarded by cache race", coldOpen: true, createBackendMs: 15.25, wantCreateBackend: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			core, recorded := observer.New(zap.InfoLevel)
+			zap.New(core).Info("timing", poolAcquireTimingFields("tenant-a", tt.coldOpen, tt.createBackendMs, 20*time.Millisecond)...)
+
+			entries := recorded.FilterMessage("timing").All()
+			if len(entries) != 1 {
+				t.Fatalf("entries = %d, want 1", len(entries))
+			}
+			fields := entries[0].ContextMap()
+			if fields["tenant_id"] != "tenant-a" {
+				t.Errorf("tenant_id = %v, want tenant-a", fields["tenant_id"])
+			}
+			if _, ok := fields["cache_hit"]; ok {
+				t.Errorf("cache_hit field should be omitted: %#v", fields)
+			}
+			if fields["cold_open"] != tt.coldOpen {
+				t.Errorf("cold_open = %v, want %v", fields["cold_open"], tt.coldOpen)
+			}
+			if _, ok := fields["create_backend_ms"]; ok != tt.wantCreateBackend {
+				t.Errorf("create_backend_ms present = %v, want %v", ok, tt.wantCreateBackend)
+			}
+		})
 	}
 }
 
