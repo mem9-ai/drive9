@@ -195,12 +195,14 @@ func TestShouldEnqueueVideoExtractTask(t *testing.T) {
 		t.Fatal("should not enqueue when video extract not configured")
 	}
 
-	// Configured — video types should enqueue
+	// Configured with allowlisted tenant — video types should enqueue
 	b2 := newTestBackendWithOptions(t, Options{
+		TenantID:              "test-tenant",
 		DatabaseAutoEmbedding: true,
 		AsyncVideoExtract: AsyncVideoExtractOptions{
-			Enabled:   true,
-			Extractor: &staticVideoExtractor{text: "test"},
+			Enabled:         true,
+			Extractor:       &staticVideoExtractor{text: "test"},
+			TenantAllowlist: map[string]struct{}{"test-tenant": {}},
 		},
 	})
 	if !b2.shouldEnqueueVideoExtractTask("/x.mp4", "video/mp4") {
@@ -240,18 +242,18 @@ func TestVideoExtractTenantAllowlist(t *testing.T) {
 		t.Fatal("non-allowlisted tenant should not enqueue video extract")
 	}
 
-	// Nil allowlist (not set) — all tenants allowed.
-	all := newTestBackendWithOptions(t, Options{
+	// Nil allowlist (fail-closed) — no tenant allowed.
+	nilList := newTestBackendWithOptions(t, Options{
 		TenantID:              "tenant-any",
 		DatabaseAutoEmbedding: true,
 		AsyncVideoExtract: AsyncVideoExtractOptions{
 			Enabled:   true,
 			Extractor: &staticVideoExtractor{text: "test"},
-			// TenantAllowlist nil = no restriction
+			// TenantAllowlist nil = fail-closed, no tenant allowed
 		},
 	})
-	if !all.shouldEnqueueVideoExtractTask("/x.mp4", "video/mp4") {
-		t.Fatal("nil allowlist should allow all tenants")
+	if nilList.shouldEnqueueVideoExtractTask("/x.mp4", "video/mp4") {
+		t.Fatal("nil allowlist should deny all tenants (fail-closed)")
 	}
 
 	// Empty allowlist — no tenant allowed.
@@ -274,10 +276,12 @@ func TestMP4VideoExcludesAudioEnqueue(t *testing.T) {
 	// enqueue video_extract_visual, not audio_extract_text, to avoid
 	// dual content_text overwrites.
 	b := newTestBackendWithOptions(t, Options{
+		TenantID:              "test-tenant",
 		DatabaseAutoEmbedding: true,
 		AsyncVideoExtract: AsyncVideoExtractOptions{
-			Enabled:   true,
-			Extractor: &staticVideoExtractor{text: "visual content"},
+			Enabled:         true,
+			Extractor:       &staticVideoExtractor{text: "visual content"},
+			TenantAllowlist: map[string]struct{}{"test-tenant": {}},
 		},
 		AsyncAudioExtract: AsyncAudioExtractOptions{
 			Enabled:   true,

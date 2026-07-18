@@ -646,10 +646,12 @@ func TestAutoImagePutWritesContentTextEndToEnd(t *testing.T) {
 
 func TestAutoVideoPutWritesVisualContentTextEndToEnd(t *testing.T) {
 	s, _ := newTestServerWithS3Config(t, backend.Options{
+		TenantID:              "test-tenant",
 		DatabaseAutoEmbedding: true,
 		AsyncVideoExtract: backend.AsyncVideoExtractOptions{
-			Enabled:   true,
-			Extractor: staticServerVideoExtractor{text: "a golden retriever running through a sunlit park with oak trees"},
+			Enabled:         true,
+			Extractor:       staticServerVideoExtractor{text: "a golden retriever running through a sunlit park with oak trees"},
+			TenantAllowlist: map[string]struct{}{"test-tenant": {}},
 		},
 	}, TenantWorkerOptions{
 		Workers:       1,

@@ -166,9 +166,10 @@ type AsyncVideoExtractOptions struct {
 	TaskTimeout         time.Duration
 	MaxExtractTextBytes int
 	Extractor           VideoTextExtractor
-	// TenantAllowlist, when non-nil and non-empty, restricts video extraction
-	// to only the listed tenant IDs. An empty map means no tenant is allowed.
-	// A nil map means all tenants are allowed (no filtering).
+	// TenantAllowlist restricts video extraction to only the listed tenant
+	// IDs. An empty or nil map means no tenant is allowed (fail-closed).
+	// Production callers must explicitly populate this from
+	// DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST.
 	TenantAllowlist map[string]struct{}
 }
 

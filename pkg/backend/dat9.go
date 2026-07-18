@@ -150,7 +150,7 @@ type Dat9Backend struct {
 	videoExtractTimeout          time.Duration
 	videoExtractMaxSize          int64
 	maxVideoExtractTextBytes     int
-	videoExtractTenantAllowlist  map[string]struct{} // nil = all tenants; non-nil = only listed
+	videoExtractTenantAllowlist  map[string]struct{} // nil or empty = no tenant (fail-closed)
 
 	runtimeMetricsID uint64
 
