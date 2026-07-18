@@ -64,25 +64,27 @@ func (b *Dat9Backend) enqueueExtractSemanticTasksTx(ctx context.Context, tx *sql
 	if !isImage && !isAudio && !isVideo {
 		return false, nil
 	}
-	if b.mediaLLMQuotaExceededCheckTx(ctx, tx, currentMediaDelta) {
-		metrics.RecordTenantOperation(b.tenantID, "media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
-		return false, nil
-	}
 	enqueued := false
-	if isImage {
-		created, err := b.enqueueImgExtractTaskTx(tx, fileID, revision, path, contentType)
-		if err != nil {
-			return enqueued, err
+	// Image and audio share the general media LLM quota.
+	if (isImage || isAudio) && b.mediaLLMQuotaExceededCheckTx(ctx, tx, currentMediaDelta) {
+		metrics.RecordTenantOperation(b.tenantID, "media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
+	} else {
+		if isImage {
+			created, err := b.enqueueImgExtractTaskTx(tx, fileID, revision, path, contentType)
+			if err != nil {
+				return enqueued, err
+			}
+			enqueued = enqueued || created
 		}
-		enqueued = enqueued || created
-	}
-	if isAudio {
-		created, err := b.enqueueAudioExtractTaskTx(tx, fileID, revision, path, contentType)
-		if err != nil {
-			return enqueued, err
+		if isAudio {
+			created, err := b.enqueueAudioExtractTaskTx(tx, fileID, revision, path, contentType)
+			if err != nil {
+				return enqueued, err
+			}
+			enqueued = enqueued || created
 		}
-		enqueued = enqueued || created
 	}
+	// Video has its own independent quota.
 	if isVideo {
 		if b.videoLLMQuotaExceededTx(tx) {
 			metrics.RecordTenantOperation(b.tenantID, "video_llm_budget", "enqueue_skip", "quota_exceeded", 0)

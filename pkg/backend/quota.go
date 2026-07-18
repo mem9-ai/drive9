@@ -386,7 +386,7 @@ func (b *Dat9Backend) videoLLMQuotaExceededTx(tx *sql.Tx) bool {
 		logger.Warn(backgroundWithTrace(), "video_llm_quota_check_fail_open", zap.Error(err))
 		return false
 	}
-	return count > b.maxVideoLLMFiles
+	return count >= b.maxVideoLLMFiles
 }
 
 // ensureTenantStorageQuotaTx is the legacy tenant-DB storage quota check.

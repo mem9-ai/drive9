@@ -285,6 +285,39 @@ func TestVideoExtractTenantAllowlist(t *testing.T) {
 	}
 }
 
+func TestVideoLLMQuotaDefault(t *testing.T) {
+	// Verify default MaxVideoLLMFiles is 50 when not explicitly set.
+	b := newTestBackendWithOptions(t, Options{
+		TenantID:              "test-tenant",
+		DatabaseAutoEmbedding: true,
+		AsyncVideoExtract: AsyncVideoExtractOptions{
+			Enabled:         true,
+			AllTenants:      true,
+			Extractor:       &staticVideoExtractor{text: "test"},
+			// MaxVideoLLMFiles not set → should use default 50
+		},
+	})
+	if b.maxVideoLLMFiles != 50 {
+		t.Fatalf("maxVideoLLMFiles=%d, want 50", b.maxVideoLLMFiles)
+	}
+}
+
+func TestVideoLLMQuotaCustom(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		TenantID:              "test-tenant",
+		DatabaseAutoEmbedding: true,
+		AsyncVideoExtract: AsyncVideoExtractOptions{
+			Enabled:          true,
+			AllTenants:       true,
+			Extractor:        &staticVideoExtractor{text: "test"},
+			MaxVideoLLMFiles: 10,
+		},
+	})
+	if b.maxVideoLLMFiles != 10 {
+		t.Fatalf("maxVideoLLMFiles=%d, want 10", b.maxVideoLLMFiles)
+	}
+}
+
 func TestParseVideoExtractTenantAllowlist(t *testing.T) {
 	tests := []struct {
 		name       string
