@@ -166,7 +166,7 @@ type AsyncVideoExtractOptions struct {
 	Enabled             bool
 	AllTenants          bool // true when allowlist is "*"
 	MaxVideoBytes       int64
-	MaxVideoLLMFiles    int64 // per-tenant video file quota (default 50)
+	MaxVideoLLMFiles    int64 // per-tenant video extraction quota: each Vision API call counts as one (default 50)
 	TaskTimeout         time.Duration
 	MaxExtractTextBytes int
 	Extractor           VideoTextExtractor

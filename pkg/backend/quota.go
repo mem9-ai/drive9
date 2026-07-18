@@ -375,15 +375,15 @@ func (b *Dat9Backend) mediaLLMQuotaExceededTx(tx *sql.Tx) bool {
 }
 
 // videoLLMQuotaExceededTx checks whether the tenant has exceeded its per-tenant
-// video LLM file quota. Counts distinct resource_ids with video_extract_visual
-// tasks (any status), excluding the current fileID so that re-uploads of an
-// existing video are never blocked by the quota.
-func (b *Dat9Backend) videoLLMQuotaExceededTx(tx *sql.Tx, fileID string) bool {
+// video extraction quota. Counts every video_extract_visual task row (any
+// status) — each Vision API call consumes one unit, including re-extractions
+// of the same file.
+func (b *Dat9Backend) videoLLMQuotaExceededTx(tx *sql.Tx) bool {
 	if b.maxVideoLLMFiles <= 0 {
 		return false
 	}
 	var count int64
-	if err := tx.QueryRow(`SELECT COUNT(DISTINCT resource_id) FROM semantic_tasks WHERE task_type = 'video_extract_visual' AND resource_id != ?`, fileID).Scan(&count); err != nil {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM semantic_tasks WHERE task_type = 'video_extract_visual'`).Scan(&count); err != nil {
 		logger.Warn(backgroundWithTrace(), "video_llm_quota_check_fail_open", zap.Error(err))
 		return false
 	}

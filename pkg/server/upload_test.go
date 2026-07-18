@@ -745,7 +745,9 @@ func TestVideoQuotaSkipsEnqueueAtLimit(t *testing.T) {
 		t.Fatalf("second video should have 0 tasks (quota), got %d: %+v", len(tasks2), tasks2)
 	}
 
-	// Re-upload first video (overwrite) — should still enqueue (existing file excluded from count).
+	// Re-upload first video (overwrite) — quota counts per-extraction-attempt,
+	// so the re-upload also consumes quota. With quota=1, already used by the
+	// first upload, this re-upload should NOT enqueue a new extraction.
 	req3, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/first.mp4", bytes.NewReader([]byte("vid1-v2")))
 	req3.ContentLength = 7
 	resp3, err := http.DefaultClient.Do(req3)
@@ -756,7 +758,13 @@ func TestVideoQuotaSkipsEnqueueAtLimit(t *testing.T) {
 	if resp3.StatusCode != http.StatusOK {
 		t.Fatalf("re-upload: status=%d", resp3.StatusCode)
 	}
-	waitForTaskStatus(t, s.fallback, file1.FileID, 2, string(semantic.TaskSucceeded), 3*time.Second)
+	// The first upload consumed the only quota slot. Re-upload must not
+	// create a second video_extract_visual task.
+	time.Sleep(200 * time.Millisecond)
+	tasks3 := loadSemanticTaskRowsForResource(t, s.fallback, file1.FileID)
+	if len(tasks3) != 1 {
+		t.Fatalf("re-upload of first video should still have 1 task (quota exhausted), got %d: %+v", len(tasks3), tasks3)
+	}
 }
 
 func TestUploadCompleteEndpoint(t *testing.T) {
