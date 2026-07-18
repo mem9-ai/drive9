@@ -931,15 +931,26 @@ func buildVideoExtractOptionsFromEnv() (backend.AsyncVideoExtractOptions, error)
 	if err != nil {
 		return backend.AsyncVideoExtractOptions{}, fmt.Errorf("init video extractor: %w", err)
 	}
+	var tenantAllowlist map[string]struct{}
+	if raw := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST")); raw != "" {
+		tenantAllowlist = make(map[string]struct{})
+		for _, id := range strings.Split(raw, ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				tenantAllowlist[id] = struct{}{}
+			}
+		}
+	}
 	async := backend.AsyncVideoExtractOptions{
 		Enabled:             true,
 		MaxVideoBytes:       envInt64("DRIVE9_VIDEO_EXTRACT_MAX_BYTES", 200<<20),
 		TaskTimeout:         videoTimeout,
 		MaxExtractTextBytes: envInt("DRIVE9_VIDEO_EXTRACT_MAX_TEXT_BYTES", 32<<10),
 		Extractor:           extractor,
+		TenantAllowlist:     tenantAllowlist,
 	}
 	logger.Info(context.Background(), "video_extract_mode_configured",
-		zap.String("model", videoModel), zap.String("base_url", videoBaseURL))
+		zap.String("model", videoModel), zap.String("base_url", videoBaseURL),
+		zap.Int("tenant_allowlist_size", len(tenantAllowlist)))
 	return async, nil
 }
 

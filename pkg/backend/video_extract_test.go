@@ -211,6 +211,64 @@ func TestShouldEnqueueVideoExtractTask(t *testing.T) {
 	}
 }
 
+func TestVideoExtractTenantAllowlist(t *testing.T) {
+	// Allowlist set — only listed tenant can enqueue.
+	allowed := newTestBackendWithOptions(t, Options{
+		TenantID:              "tenant-abc",
+		DatabaseAutoEmbedding: true,
+		AsyncVideoExtract: AsyncVideoExtractOptions{
+			Enabled:         true,
+			Extractor:       &staticVideoExtractor{text: "test"},
+			TenantAllowlist: map[string]struct{}{"tenant-abc": {}},
+		},
+	})
+	if !allowed.shouldEnqueueVideoExtractTask("/x.mp4", "video/mp4") {
+		t.Fatal("allowlisted tenant should enqueue video extract")
+	}
+
+	// Non-allowlisted tenant — should NOT enqueue.
+	denied := newTestBackendWithOptions(t, Options{
+		TenantID:              "tenant-xyz",
+		DatabaseAutoEmbedding: true,
+		AsyncVideoExtract: AsyncVideoExtractOptions{
+			Enabled:         true,
+			Extractor:       &staticVideoExtractor{text: "test"},
+			TenantAllowlist: map[string]struct{}{"tenant-abc": {}},
+		},
+	})
+	if denied.shouldEnqueueVideoExtractTask("/x.mp4", "video/mp4") {
+		t.Fatal("non-allowlisted tenant should not enqueue video extract")
+	}
+
+	// Nil allowlist (not set) — all tenants allowed.
+	all := newTestBackendWithOptions(t, Options{
+		TenantID:              "tenant-any",
+		DatabaseAutoEmbedding: true,
+		AsyncVideoExtract: AsyncVideoExtractOptions{
+			Enabled:   true,
+			Extractor: &staticVideoExtractor{text: "test"},
+			// TenantAllowlist nil = no restriction
+		},
+	})
+	if !all.shouldEnqueueVideoExtractTask("/x.mp4", "video/mp4") {
+		t.Fatal("nil allowlist should allow all tenants")
+	}
+
+	// Empty allowlist — no tenant allowed.
+	none := newTestBackendWithOptions(t, Options{
+		TenantID:              "tenant-any",
+		DatabaseAutoEmbedding: true,
+		AsyncVideoExtract: AsyncVideoExtractOptions{
+			Enabled:         true,
+			Extractor:       &staticVideoExtractor{text: "test"},
+			TenantAllowlist: map[string]struct{}{},
+		},
+	})
+	if none.shouldEnqueueVideoExtractTask("/x.mp4", "video/mp4") {
+		t.Fatal("empty allowlist should deny all tenants")
+	}
+}
+
 func TestMP4VideoExcludesAudioEnqueue(t *testing.T) {
 	// When both video and audio extract are enabled, MP4 files should only
 	// enqueue video_extract_visual, not audio_extract_text, to avoid

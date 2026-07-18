@@ -145,11 +145,12 @@ type Dat9Backend struct {
 	maxAudioExtractTextBytes int
 
 	// Durable video visual extraction (semantic_tasks only; no local queue).
-	videoExtractEnabled      bool
-	videoExtractor           VideoTextExtractor
-	videoExtractTimeout      time.Duration
-	videoExtractMaxSize      int64
-	maxVideoExtractTextBytes int
+	videoExtractEnabled          bool
+	videoExtractor               VideoTextExtractor
+	videoExtractTimeout          time.Duration
+	videoExtractMaxSize          int64
+	maxVideoExtractTextBytes     int
+	videoExtractTenantAllowlist  map[string]struct{} // nil = all tenants; non-nil = only listed
 
 	runtimeMetricsID uint64
 

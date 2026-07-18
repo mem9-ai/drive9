@@ -166,6 +166,10 @@ type AsyncVideoExtractOptions struct {
 	TaskTimeout         time.Duration
 	MaxExtractTextBytes int
 	Extractor           VideoTextExtractor
+	// TenantAllowlist, when non-nil and non-empty, restricts video extraction
+	// to only the listed tenant IDs. An empty map means no tenant is allowed.
+	// A nil map means all tenants are allowed (no filtering).
+	TenantAllowlist map[string]struct{}
 }
 
 // AsyncVideoExtractWillWireRuntime reports whether async video extraction should
@@ -311,6 +315,7 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 		b.videoExtractTimeout = v.TaskTimeout
 		b.videoExtractMaxSize = v.MaxVideoBytes
 		b.maxVideoExtractTextBytes = v.MaxExtractTextBytes
+		b.videoExtractTenantAllowlist = v.TenantAllowlist
 		logger.Info(backgroundWithTrace(), "backend_video_extract_runtime_configured",
 			zap.Duration("task_timeout", v.TaskTimeout),
 			zap.Int64("max_video_bytes", v.MaxVideoBytes),
