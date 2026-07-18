@@ -11,7 +11,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -151,6 +150,7 @@ type Upload struct {
 type Store struct {
 	db             *sql.DB
 	useLegacyFiles bool // true when the legacy `files` table exists and needs dual-write
+	scope          Scope
 }
 
 func Open(dsn string) (*Store, error) {
@@ -162,6 +162,13 @@ func OpenForTenant(ctx context.Context, dsn, tenantID string) (*Store, error) {
 }
 
 func OpenForTenantWithOrg(ctx context.Context, dsn, tenantID, tidbCloudOrgID string) (*Store, error) {
+	return OpenForTenantScoped(ctx, dsn, tenantID, tidbCloudOrgID, StandaloneScope(0))
+}
+
+// OpenForTenantScoped opens a Store whose SQL is shaped by scope: standalone
+// (per-tenant DB, no fs_id columns) or shared (multi-tenant DB with fs_id
+// row keys). The scope is fixed for the lifetime of the Store.
+func OpenForTenantScoped(ctx context.Context, dsn, tenantID, tidbCloudOrgID string, scope Scope) (*Store, error) {
 	lower := strings.ToLower(dsn)
 	if strings.Contains(lower, "multistatements=true") || strings.Contains(lower, "multistatements=1") {
 		return nil, fmt.Errorf("multiStatements is not allowed in production DSN")
@@ -170,7 +177,7 @@ func OpenForTenantWithOrg(ctx context.Context, dsn, tenantID, tidbCloudOrgID str
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, scope: scope}
 	hasLegacy, err := s.detectLegacyFiles(ctx)
 	if err != nil {
 		_ = mysqlutil.CloseInstrumented(db)
@@ -182,6 +189,9 @@ func OpenForTenantWithOrg(ctx context.Context, dsn, tenantID, tidbCloudOrgID str
 
 func (s *Store) Close() error { return mysqlutil.CloseInstrumented(s.db) }
 func (s *Store) DB() *sql.DB  { return s.db }
+
+// Scope returns the schema-shape scope fixed at construction.
+func (s *Store) Scope() Scope { return s.scope }
 
 // HasLegacyFiles reports whether the legacy `files` table exists in this
 // tenant database. When false, all writes skip the `files` table entirely
@@ -252,10 +262,10 @@ func (s *Store) InsertNode(ctx context.Context, n *FileNode) error {
 		opErr = ErrInvalidRootDentry
 		return ErrInvalidRootDentry
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		n.NodeID, n.Path, fileNodePathHash(n.Path), n.ParentPath, fileNodePathHash(n.ParentPath),
-		n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
+		s.scope.Args(n.NodeID, n.Path, fileNodePathHash(n.Path), n.ParentPath, fileNodePathHash(n.ParentPath),
+			n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())...)
 	if isUniqueViolation(err) {
 		opErr = ErrPathConflict
 		return ErrPathConflict
@@ -270,7 +280,7 @@ func (s *Store) GetNode(ctx context.Context, path string) (*FileNode, error) {
 	defer observeStoreOp(ctx, "get_node", start, &opErr)
 
 	row := s.db.QueryRowContext(ctx, `SELECT node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at
-		FROM file_nodes WHERE path_hash = ? AND path = ?`, fileNodePathHash(path), path)
+		FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`), s.scope.Args(fileNodePathHash(path), path)...)
 	n, err := scanNode(row)
 	opErr = err
 	return n, err
@@ -284,8 +294,8 @@ func (s *Store) NodeExists(ctx context.Context, path string) (exists bool, err e
 	defer observeStoreOp(ctx, "node_exists", start, &err)
 
 	var one int
-	err = s.db.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE path_hash = ? AND path = ? LIMIT 1`,
-		fileNodePathHash(path), path).Scan(&one)
+	err = s.db.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` LIMIT 1`,
+		s.scope.Args(fileNodePathHash(path), path)...).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -300,7 +310,8 @@ func (s *Store) ListNodes(ctx context.Context, parentPath string) (out []*FileNo
 	defer observeStoreOp(ctx, "list_nodes", start, &err)
 
 	rows, err := s.db.QueryContext(ctx, `SELECT node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at
-		FROM file_nodes WHERE parent_path_hash = ? AND parent_path = ? ORDER BY name`, fileNodePathHash(parentPath), parentPath)
+		FROM file_nodes WHERE `+s.scope.And(`parent_path_hash = ? AND parent_path = ?`)+` ORDER BY name`,
+		s.scope.Args(fileNodePathHash(parentPath), parentPath)...)
 	if err != nil {
 		return nil, err
 	}
@@ -327,7 +338,8 @@ func (s *Store) DeleteNode(ctx context.Context, path string) (err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_node", start, &err)
 
-	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE path_hash = ? AND path = ?`, fileNodePathHash(path), path)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
+		s.scope.Args(fileNodePathHash(path), path)...)
 	if err != nil {
 		return err
 	}
@@ -349,14 +361,15 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	hasChildren, err := dirHasChildrenTx(ctx, tx, path)
+	hasChildren, err := s.dirHasChildrenTx(ctx, tx, path)
 	if err != nil {
 		return err
 	}
 	if hasChildren {
 		return fmt.Errorf("directory not empty: %s", path)
 	}
-	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path_hash = ? AND path = ? AND is_directory = 1`, fileNodePathHash(path), path)
+	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ? AND is_directory = 1`),
+		s.scope.Args(fileNodePathHash(path), path)...)
 	if err != nil {
 		return err
 	}
@@ -373,7 +386,7 @@ func (s *Store) DeleteNodesByPrefix(ctx context.Context, prefix string) (n int64
 	defer observeStoreOp(ctx, "delete_nodes_by_prefix", start, &err)
 
 	where, args := pathPrefixPredicate("path", prefix)
-	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+where, args...)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(where), s.scope.Args(args...)...)
 	if err != nil {
 		return 0, err
 	}
@@ -389,8 +402,9 @@ func (s *Store) UpdateNodePath(ctx context.Context, oldPath, newPath, newParentP
 		return ErrInvalidRootDentry
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?
-		WHERE path_hash = ? AND path = ?`,
-		newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName, fileNodePathHash(oldPath), oldPath)
+		WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
+		append([]any{newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName},
+			s.scope.Args(fileNodePathHash(oldPath), oldPath)...)...)
 	if err != nil {
 		return err
 	}
@@ -423,8 +437,8 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 		isDir  bool
 	}
 	var old nodeRef
-	err = tx.QueryRow(`SELECT node_id, file_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
-		fileNodePathHash(oldPath), oldPath).Scan(&old.nodeID, &old.fileID, &old.isDir)
+	err = tx.QueryRow(`SELECT node_id, file_id, is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+		s.scope.Args(fileNodePathHash(oldPath), oldPath)...).Scan(&old.nodeID, &old.fileID, &old.isDir)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -440,8 +454,8 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 
 	var dst nodeRef
 	hasDst := false
-	err = tx.QueryRow(`SELECT node_id, file_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
-		fileNodePathHash(newPath), newPath).Scan(&dst.nodeID, &dst.fileID, &dst.isDir)
+	err = tx.QueryRow(`SELECT node_id, file_id, is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+		s.scope.Args(fileNodePathHash(newPath), newPath)...).Scan(&dst.nodeID, &dst.fileID, &dst.isDir)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
@@ -454,13 +468,13 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 		if dst.nodeID == old.nodeID {
 			return nil, tx.Commit()
 		}
-		if _, err := tx.Exec(`DELETE FROM file_nodes WHERE node_id = ?`, dst.nodeID); err != nil {
+		if _, err := tx.Exec(`DELETE FROM file_nodes WHERE `+s.scope.And(`node_id = ?`), s.scope.Args(dst.nodeID)...); err != nil {
 			return nil, err
 		}
 	}
 
-	res, err := tx.Exec(`UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE node_id = ?`,
-		newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName, old.nodeID)
+	res, err := tx.Exec(`UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE `+s.scope.And(`node_id = ?`),
+		append([]any{newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName}, s.scope.Args(old.nodeID)...)...)
 	if isUniqueViolation(err) {
 		return nil, ErrPathConflict
 	}
@@ -474,7 +488,7 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 
 	if hasDst && dst.fileID.Valid && dst.fileID.String != "" {
 		var count int64
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE file_id = ? FOR UPDATE`, dst.fileID.String).Scan(&count); err != nil {
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE `+s.scope.And(`file_id = ?`)+` FOR UPDATE`, s.scope.Args(dst.fileID.String)...).Scan(&count); err != nil {
 			return nil, err
 		}
 		if count == 0 {
@@ -483,10 +497,10 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 					return nil, err
 				}
 			}
-			if _, err := tx.Exec(`UPDATE inodes SET status = 'DELETED' WHERE inode_id = ?`, dst.fileID.String); err != nil {
+			if _, err := tx.Exec(`UPDATE inodes SET status = 'DELETED' WHERE `+s.scope.And(`inode_id = ?`), s.scope.Args(dst.fileID.String)...); err != nil {
 				return nil, err
 			}
-			if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, dst.fileID.String); err != nil {
+			if _, err := tx.Exec(`DELETE FROM file_tags WHERE `+s.scope.And(`file_id = ?`), s.scope.Args(dst.fileID.String)...); err != nil {
 				return nil, err
 			}
 			f, err := s.scanFileForGCTx(tx, dst.fileID.String)
@@ -531,8 +545,8 @@ func (s *Store) RenameFileNoReplace(ctx context.Context, oldPath, newPath, newPa
 		isDir  bool
 	}
 	var old nodeRef
-	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
-		fileNodePathHash(oldPath), oldPath).Scan(&old.nodeID, &old.isDir)
+	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+		s.scope.Args(fileNodePathHash(oldPath), oldPath)...).Scan(&old.nodeID, &old.isDir)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
@@ -547,8 +561,8 @@ func (s *Store) RenameFileNoReplace(ctx context.Context, oldPath, newPath, newPa
 	}
 
 	var dst nodeRef
-	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
-		fileNodePathHash(newPath), newPath).Scan(&dst.nodeID, &dst.isDir)
+	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+		s.scope.Args(fileNodePathHash(newPath), newPath)...).Scan(&dst.nodeID, &dst.isDir)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -561,7 +575,8 @@ func (s *Store) RenameFileNoReplace(ctx context.Context, oldPath, newPath, newPa
 	}
 
 	res, err := tx.ExecContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?
-		WHERE node_id = ?`, newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName, old.nodeID)
+		WHERE `+s.scope.And(`node_id = ?`),
+		append([]any{newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName}, s.scope.Args(old.nodeID)...)...)
 	if err != nil {
 		if strings.Contains(err.Error(), "Duplicate entry") {
 			return ErrPathConflict
@@ -598,7 +613,8 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 	defer func() { _ = tx.Rollback() }()
 
 	rows, err := tx.QueryContext(ctx, `SELECT node_id, path, parent_path, name FROM file_nodes
-		WHERE path = ? OR path LIKE ? ORDER BY path FOR UPDATE`, oldPrefix, oldPrefix+"%")
+		WHERE `+s.andAsGrouped("", `path = ? OR path LIKE ?`)+` ORDER BY path FOR UPDATE`,
+		s.scope.Args(oldPrefix, oldPrefix+"%")...)
 	if err != nil {
 		return 0, err
 	}
@@ -632,8 +648,8 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 		isDir  bool
 	}
 	var dst dstRef
-	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
-		fileNodePathHash(newPrefix), newPrefix).Scan(&dst.nodeID, &dst.isDir)
+	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+		s.scope.Args(fileNodePathHash(newPrefix), newPrefix)...).Scan(&dst.nodeID, &dst.isDir)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return 0, err
@@ -642,8 +658,8 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 		if !dst.isDir {
 			return 0, ErrPathConflict
 		}
-		childRows, err := tx.QueryContext(ctx, `SELECT node_id FROM file_nodes WHERE parent_path_hash = ? AND parent_path = ? FOR UPDATE`,
-			fileNodePathHash(newPrefix), newPrefix)
+		childRows, err := tx.QueryContext(ctx, `SELECT node_id FROM file_nodes WHERE `+s.scope.And(`parent_path_hash = ? AND parent_path = ?`)+` FOR UPDATE`,
+			s.scope.Args(fileNodePathHash(newPrefix), newPrefix)...)
 		if err != nil {
 			return 0, err
 		}
@@ -654,19 +670,19 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 		if hasChild {
 			return 0, ErrPathConflict
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE node_id = ?`, dst.nodeID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(`node_id = ?`), s.scope.Args(dst.nodeID)...); err != nil {
 			return 0, err
 		}
 	}
 
-	stmt, err := tx.PrepareContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE node_id = ?`)
+	stmt, err := tx.PrepareContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE `+s.scope.And(`node_id = ?`))
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = stmt.Close() }()
 
 	for _, u := range updates {
-		if _, err := stmt.Exec(u.newPath, fileNodePathHash(u.newPath), u.newParent, fileNodePathHash(u.newParent), u.newName, u.nodeID); err != nil {
+		if _, err := stmt.Exec(append([]any{u.newPath, fileNodePathHash(u.newPath), u.newParent, fileNodePathHash(u.newParent), u.newName}, s.scope.Args(u.nodeID)...)...); err != nil {
 			if isUniqueViolation(err) {
 				return 0, ErrPathConflict
 			}
@@ -685,7 +701,7 @@ func (s *Store) RefCount(ctx context.Context, fileID string) (count int64, err e
 	start := time.Now()
 	defer observeStoreOp(ctx, "ref_count", start, &err)
 
-	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_nodes WHERE file_id = ?`, fileID).Scan(&count)
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_nodes WHERE `+s.scope.And(`file_id = ?`), s.scope.Args(fileID)...).Scan(&count)
 	return count, err
 }
 
@@ -715,8 +731,8 @@ func (s *Store) RefCounts(ctx context.Context, fileIDs []string) (counts map[str
 		}
 		batch := unique[start:end]
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT file_id, COUNT(*) FROM file_nodes WHERE file_id IN (`+questionPlaceholders(len(batch))+`) GROUP BY file_id`,
-			stringsToAny(batch)...)
+			`SELECT file_id, COUNT(*) FROM file_nodes WHERE `+s.scope.And(`file_id IN (`+questionPlaceholders(len(batch))+`)`)+` GROUP BY file_id`,
+			s.scope.Args(stringsToAny(batch)...)...)
 		if err != nil {
 			return nil, err
 		}
@@ -765,8 +781,8 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath,
 	}
 	if dstParentPath != "/" {
 		var parentIsDir bool
-		err := db.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
-			fileNodePathHash(dstParentPath), dstParentPath).Scan(&parentIsDir)
+		err := db.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+			s.scope.Args(fileNodePathHash(dstParentPath), dstParentPath)...).Scan(&parentIsDir)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
@@ -780,8 +796,8 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath,
 
 	var fileID, inodeID sql.NullString
 	var isDir bool
-	err := db.QueryRowContext(ctx, `SELECT file_id, inode_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
-		fileNodePathHash(srcPath), srcPath).Scan(&fileID, &inodeID, &isDir)
+	err := db.QueryRowContext(ctx, `SELECT file_id, inode_id, is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+		s.scope.Args(fileNodePathHash(srcPath), srcPath)...).Scan(&fileID, &inodeID, &isDir)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
@@ -801,9 +817,9 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath,
 	if inodeID.Valid && inodeID.String != "" {
 		linkInodeID = inodeID.String
 	}
-	_, err = db.Exec(`INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-		nodeID, dstPath, fileNodePathHash(dstPath), dstParentPath, fileNodePathHash(dstParentPath), dstName, fileID.String, linkInodeID, createdAt.UTC())
+	_, err = db.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 0, ?, ?, ?`)+`)`,
+		s.scope.Args(nodeID, dstPath, fileNodePathHash(dstPath), dstParentPath, fileNodePathHash(dstParentPath), dstName, fileID.String, linkInodeID, createdAt.UTC())...)
 	if isUniqueViolation(err) {
 		return ErrPathConflict
 	}
@@ -829,7 +845,7 @@ func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() 
 		if err != nil {
 			return err
 		}
-		err = ensureParentDirsWithExecer(ctx, tx, path, genID)
+		err = s.ensureParentDirsWithExecer(ctx, tx, path, genID)
 		if err != nil {
 			_ = tx.Rollback()
 			if isDeadlock(err) && attempt < maxAttempts-1 {
@@ -970,8 +986,8 @@ func (s *Store) HasConfirmedS3StorageRef(ctx context.Context, storageRefHash, st
 	}
 	row := s.db.QueryRowContext(ctx, `SELECT 1
 		FROM contents c JOIN inodes i ON i.inode_id = c.inode_id
-		WHERE c.storage_type = ? AND i.status = ? AND c.storage_ref_hash = ? AND c.storage_ref = ?
-		LIMIT 1`, StorageS3, StatusConfirmed, storageRefHash, storageRef)
+		WHERE `+s.scope.AndAs("c", `c.storage_type = ? AND i.status = ? AND c.storage_ref_hash = ? AND c.storage_ref = ?`)+`
+		LIMIT 1`, s.scope.Args(StorageS3, StatusConfirmed, storageRefHash, storageRef)...)
 	var one int
 	if err := row.Scan(&one); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1023,7 +1039,7 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 		}
 	} else {
 		var currentRev int64
-		if err := tx.QueryRow(`SELECT revision FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' FOR UPDATE`, fileID).Scan(&currentRev); err != nil {
+		if err := tx.QueryRow(`SELECT revision FROM inodes WHERE `+s.scope.And(`inode_id = ? AND status = 'CONFIRMED'`)+` FOR UPDATE`, s.scope.Args(fileID)...).Scan(&currentRev); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return 0, ErrNotFound
 			}
@@ -1037,7 +1053,7 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 		return 0, fmt.Errorf("update inode: %w", err)
 	}
 	var encryptionMode StorageEncryptionMode
-	if err := tx.QueryRow(`SELECT storage_encryption_mode FROM contents WHERE inode_id = ?`, fileID).Scan(&encryptionMode); err != nil {
+	if err := tx.QueryRow(`SELECT storage_encryption_mode FROM contents WHERE `+s.scope.And(`inode_id = ?`), s.scope.Args(fileID)...).Scan(&encryptionMode); err != nil {
 		return 0, fmt.Errorf("read encryption mode: %w", err)
 	}
 	if err := s.UpdateContentTx(tx, fileID, storageType, storageRef, contentType, checksum, contentBlob, encryptionMode); err != nil {
@@ -1094,15 +1110,15 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 		}
 		if expectedRevision > 0 {
 			if _, err := db.Exec(`UPDATE semantic SET content_text = ?
-				WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`,
-				nullStr(contentText), fileID, fileID, expectedRevision); err != nil {
+				WHERE `+s.scope.And(`inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`),
+				append([]any{nullStr(contentText)}, s.scope.Args(fileID, fileID, expectedRevision)...)...); err != nil {
 				return nil, fmt.Errorf("update semantic content_text: %w", err)
 			}
 			return res, nil
 		}
 		if _, err := db.Exec(`UPDATE semantic SET content_text = ?
-			WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED')`,
-			nullStr(contentText), fileID, fileID); err != nil {
+			WHERE `+s.scope.And(`inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED')`),
+			append([]any{nullStr(contentText)}, s.scope.Args(fileID, fileID)...)...); err != nil {
 			return nil, fmt.Errorf("update semantic content_text: %w", err)
 		}
 		return res, nil
@@ -1110,12 +1126,12 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 	// New tenant without legacy files: write directly to semantic.
 	if expectedRevision > 0 {
 		return db.Exec(`UPDATE semantic SET content_text = ?
-			WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`,
-			nullStr(contentText), fileID, fileID, expectedRevision)
+			WHERE `+s.scope.And(`inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`),
+			append([]any{nullStr(contentText)}, s.scope.Args(fileID, fileID, expectedRevision)...)...)
 	}
 	return db.Exec(`UPDATE semantic SET content_text = ?
-		WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED')`,
-		nullStr(contentText), fileID, fileID)
+		WHERE `+s.scope.And(`inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED')`),
+		append([]any{nullStr(contentText)}, s.scope.Args(fileID, fileID)...)...)
 }
 
 // ReplaceFileTagsTx replaces all tags for fileID inside an existing transaction.
@@ -1124,7 +1140,7 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 // the current write revision. Passing an empty map clears all existing tags.
 // Callers that intend to preserve the current tag set must skip this call.
 func (s *Store) ReplaceFileTagsTx(db execer, fileID string, tags map[string]string) error {
-	if _, err := db.Exec(`DELETE FROM file_tags WHERE file_id = ?`, fileID); err != nil {
+	if _, err := db.Exec(`DELETE FROM file_tags WHERE `+s.scope.And(`file_id = ?`), s.scope.Args(fileID)...); err != nil {
 		return err
 	}
 	if len(tags) == 0 {
@@ -1138,7 +1154,8 @@ func (s *Store) ReplaceFileTagsTx(db execer, fileID string, tags map[string]stri
 	sort.Strings(keys)
 
 	for _, k := range keys {
-		if _, err := db.Exec(`INSERT INTO file_tags (file_id, tag_key, tag_value) VALUES (?, ?, ?)`, fileID, k, tags[k]); err != nil {
+		if _, err := db.Exec(`INSERT INTO file_tags (`+s.scope.InsCols(`file_id, tag_key, tag_value`)+`) VALUES (`+s.scope.InsVals(`?, ?, ?`)+`)`,
+			s.scope.Args(fileID, k, tags[k])...); err != nil {
 			return err
 		}
 	}
@@ -1156,7 +1173,7 @@ func (s *Store) ReplaceFileTagsByPrefixTx(db execer, fileID string, prefix strin
 		return fmt.Errorf("tag prefix is required")
 	}
 	pattern := likeLiteralPrefixPattern(prefix)
-	if _, err := db.Exec(`DELETE FROM file_tags WHERE file_id = ? AND tag_key LIKE ? ESCAPE '\\'`, fileID, pattern); err != nil {
+	if _, err := db.Exec(`DELETE FROM file_tags WHERE `+s.scope.And(`file_id = ? AND tag_key LIKE ? ESCAPE '\\'`), s.scope.Args(fileID, pattern)...); err != nil {
 		return err
 	}
 	if len(tags) == 0 {
@@ -1173,7 +1190,8 @@ func (s *Store) ReplaceFileTagsByPrefixTx(db execer, fileID string, prefix strin
 	sort.Strings(keys)
 
 	for _, k := range keys {
-		if _, err := db.Exec(`INSERT INTO file_tags (file_id, tag_key, tag_value) VALUES (?, ?, ?)`, fileID, k, tags[k]); err != nil {
+		if _, err := db.Exec(`INSERT INTO file_tags (`+s.scope.InsCols(`file_id, tag_key, tag_value`)+`) VALUES (`+s.scope.InsVals(`?, ?, ?`)+`)`,
+			s.scope.Args(fileID, k, tags[k])...); err != nil {
 			return err
 		}
 	}
@@ -1190,7 +1208,7 @@ func (s *Store) GetFileTags(ctx context.Context, fileID string) (out map[string]
 	start := time.Now()
 	defer observeStoreOp(ctx, "get_file_tags", start, &err)
 
-	rows, err := s.db.QueryContext(ctx, `SELECT tag_key, tag_value FROM file_tags WHERE file_id = ? ORDER BY tag_key`, fileID)
+	rows, err := s.db.QueryContext(ctx, `SELECT tag_key, tag_value FROM file_tags WHERE `+s.scope.And(`file_id = ?`)+` ORDER BY tag_key`, s.scope.Args(fileID)...)
 	if err != nil {
 		return nil, err
 	}
@@ -1238,7 +1256,7 @@ func (s *Store) GetFileStorageMetaForUpdateTx(db execer, fileID string) (*FileSt
 	var contentType sql.NullString
 	err := db.QueryRow(`SELECT c.storage_type, c.storage_ref, i.revision, i.size_bytes, COALESCE(c.content_type, '')
 		FROM inodes i JOIN contents c ON i.inode_id = c.inode_id
-		WHERE i.inode_id = ? AND i.status = 'CONFIRMED' FOR UPDATE`, fileID).Scan(
+		WHERE `+s.scope.AndAs("i", `i.inode_id = ? AND i.status = 'CONFIRMED'`)+` FOR UPDATE`, s.scope.Args(fileID)...).Scan(
 		&m.StorageType, &m.StorageRef, &m.Revision, &m.SizeBytes, &contentType)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1253,7 +1271,8 @@ func (s *Store) GetFileStorageMetaForUpdateTx(db execer, fileID string) (*FileSt
 func (s *Store) CompleteUploadTx(db execer, uploadID string) error {
 	_, err := db.Exec(`UPDATE uploads SET status = 'COMPLETED',
 		updated_at = ?
-		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
+		WHERE `+s.scope.And(`upload_id = ? AND status = 'UPLOADING'`),
+		append([]any{time.Now().UTC()}, s.scope.Args(uploadID)...)...)
 	return err
 }
 
@@ -1281,14 +1300,15 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 	}
 
 	var currentMode uint32
-	if err := s.db.QueryRowContext(ctx, `SELECT mode FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED'`, inodeID).Scan(&currentMode); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT mode FROM inodes WHERE `+s.scope.And(`inode_id = ? AND status = 'CONFIRMED'`), s.scope.Args(inodeID)...).Scan(&currentMode); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		return err
 	}
 	mode = (mode & permissionModeMask) | (currentMode & fileTypeModeMask)
-	res, err := s.db.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE inode_id = ? AND status = 'CONFIRMED'`, mode, inodeID)
+	res, err := s.db.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE `+s.scope.And(`inode_id = ? AND status = 'CONFIRMED'`),
+		append([]any{mode}, s.scope.Args(inodeID)...)...)
 	if err != nil {
 		return err
 	}
@@ -1299,7 +1319,7 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 }
 
 func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) error {
-	return ensureParentDirsWithExecer(context.Background(), db, path, genID)
+	return s.ensureParentDirsWithExecer(context.Background(), db, path, genID)
 }
 
 // deterministicNodeID returns a stable 64-char hex ID derived from the path.
@@ -1317,7 +1337,7 @@ func deterministicNodeID(path string) string {
 // derived from the path so concurrent attempts to create the same missing
 // parent cannot leak orphan inodes, even on TiDB which does not support gap
 // locking for SELECT ... FOR UPDATE on non-existing rows.
-func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, genID func() string) error {
+func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path string, genID func() string) error {
 	var ancestors []string
 	cur := path
 	for {
@@ -1337,8 +1357,8 @@ func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, gen
 		// Check if the directory already exists and has an inode_id.
 		var existingInodeID sql.NullString
 		selectErr := db.QueryRowContext(ctx,
-			`SELECT inode_id FROM file_nodes WHERE path_hash = ? AND path = ? AND is_directory = 1`,
-			fileNodePathHash(dirPath), dirPath).Scan(&existingInodeID)
+			`SELECT inode_id FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ? AND is_directory = 1`),
+			s.scope.Args(fileNodePathHash(dirPath), dirPath)...).Scan(&existingInodeID)
 		if selectErr == nil && existingInodeID.Valid {
 			// Already exists and has an inode_id — nothing to do.
 			continue
@@ -1353,9 +1373,9 @@ func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, gen
 		// as well as MySQL because it does not rely on gap locking.
 		nodeID := deterministicNodeID(dirPath)
 		_, err := db.ExecContext(ctx, `INSERT IGNORE INTO inodes
-			(inode_id, size_bytes, revision, mode, status, created_at, mtime)
-			VALUES (?, 0, 1, ?, 'CONFIRMED', ?, ?)`,
-			nodeID, 0o755, now, now)
+			(`+s.scope.InsCols(`inode_id, size_bytes, revision, mode, status, created_at, mtime`)+`)
+			VALUES (`+s.scope.InsVals(`?, 0, 1, ?, 'CONFIRMED', ?, ?`)+`)`,
+			s.scope.Args(nodeID, 0o755, now, now)...)
 		if err != nil {
 			return fmt.Errorf("ensure parent inode %s: %w", dirPath, err)
 		}
@@ -1364,8 +1384,8 @@ func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, gen
 			// Directory row exists from pre-migration (inode_id was NULL).
 			// Backfill the inode_id.
 			_, err = db.ExecContext(ctx,
-				`UPDATE file_nodes SET inode_id = ? WHERE path_hash = ? AND path = ? AND is_directory = 1`,
-				nodeID, fileNodePathHash(dirPath), dirPath)
+				`UPDATE file_nodes SET inode_id = ? WHERE `+s.scope.And(`path_hash = ? AND path = ? AND is_directory = 1`),
+				append([]any{nodeID}, s.scope.Args(fileNodePathHash(dirPath), dirPath)...)...)
 			if err != nil {
 				return fmt.Errorf("backfill parent inode_id %s: %w", dirPath, err)
 			}
@@ -1374,10 +1394,10 @@ func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, gen
 
 		// Directory does not exist — insert the dentry.
 		_, err = db.ExecContext(ctx, `INSERT INTO file_nodes
-			(node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, inode_id, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+			(`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, inode_id, created_at`)+`)
+			VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 1, ?, ?`)+`)
 			ON DUPLICATE KEY UPDATE node_id = node_id`,
-			nodeID, dirPath, fileNodePathHash(dirPath), pp, fileNodePathHash(pp), name, nodeID, now)
+			s.scope.Args(nodeID, dirPath, fileNodePathHash(dirPath), pp, fileNodePathHash(pp), name, nodeID, now)...)
 		if err != nil && !isUniqueViolation(err) {
 			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
 		}
@@ -1394,10 +1414,10 @@ func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
 			return err
 		}
 	}
-	_, err := db.Exec(`INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		n.NodeID, n.Path, fileNodePathHash(n.Path), n.ParentPath, fileNodePathHash(n.ParentPath),
-		n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())
+	_, err := db.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
+		s.scope.Args(n.NodeID, n.Path, fileNodePathHash(n.Path), n.ParentPath, fileNodePathHash(n.ParentPath),
+			n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())...)
 	if isUniqueViolation(err) {
 		return ErrPathConflict
 	}
@@ -1417,7 +1437,7 @@ func (s *Store) lockConfirmedFileForAttachTx(db execer, fileID string) error {
 			return ErrNotFound
 		}
 	}
-	if err := db.QueryRow(`SELECT status FROM inodes WHERE inode_id = ? FOR UPDATE`, fileID).Scan(&status); err != nil {
+	if err := db.QueryRow(`SELECT status FROM inodes WHERE `+s.scope.And(`inode_id = ?`)+` FOR UPDATE`, s.scope.Args(fileID)...).Scan(&status); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -1439,7 +1459,7 @@ func (s *Store) MarkFileDeleted(ctx context.Context, fileID string) (err error) 
 			return err
 		}
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE inodes SET status = 'DELETED' WHERE inode_id = ?`, fileID)
+	_, err = s.db.ExecContext(ctx, `UPDATE inodes SET status = 'DELETED' WHERE `+s.scope.And(`inode_id = ?`), s.scope.Args(fileID)...)
 	return err
 }
 
@@ -1447,7 +1467,7 @@ func (s *Store) MarkFileDeleted(ctx context.Context, fileID string) (err error) 
 // entities in the current tenant database.
 func (s *Store) ConfirmedStorageBytesTx(db execer) (int64, error) {
 	var total sql.NullInt64
-	if err := db.QueryRow(`SELECT COALESCE(SUM(size_bytes), 0) FROM inodes WHERE status = 'CONFIRMED'`).Scan(&total); err != nil {
+	if err := db.QueryRow(`SELECT COALESCE(SUM(size_bytes), 0) FROM inodes WHERE `+s.scope.And(`status = 'CONFIRMED'`), s.scope.Args()...).Scan(&total); err != nil {
 		return 0, err
 	}
 	return total.Int64, nil
@@ -1460,7 +1480,7 @@ func (s *Store) ConfirmedStorageBytesTx(db execer) (int64, error) {
 // are not enqueued.
 func (s *Store) ConfirmedMediaFileCountTx(db execer) (int64, error) {
 	var count sql.NullInt64
-	if err := db.QueryRow(`SELECT COUNT(*) FROM inodes i JOIN contents c ON i.inode_id = c.inode_id WHERE i.status = 'CONFIRMED' AND (c.content_type LIKE 'image/%' OR c.content_type LIKE 'audio/%')`).Scan(&count); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM inodes i JOIN contents c ON i.inode_id = c.inode_id WHERE `+s.scope.AndAs("i", `i.status = 'CONFIRMED' AND (c.content_type LIKE 'image/%' OR c.content_type LIKE 'audio/%')`), s.scope.Args()...).Scan(&count); err != nil {
 		return 0, err
 	}
 	return count.Int64, nil
@@ -1473,6 +1493,11 @@ func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {
 	// TODO: This aggregation joins uploads -> file_nodes -> files on every quota
 	// check. If upload concurrency grows, re-evaluate the access path and add a
 	// more targeted uploads status/index strategy or a pre-aggregated quota state.
+	//
+	// In shared shape the fs_id predicate on the uploads driving alias is not
+	// enough: target paths are not globally unique, so the file_nodes join must
+	// also carry fs_id in its ON clause or one tenant's upload could join
+	// another tenant's dentry at the same path and misread its size.
 	err := db.QueryRow(`SELECT COALESCE(SUM(
 		CASE
 			WHEN u.total_size > COALESCE(i.size_bytes, 0) THEN u.total_size - COALESCE(i.size_bytes, 0)
@@ -1480,9 +1505,10 @@ func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {
 		END
 	), 0)
 		FROM uploads u
-		LEFT JOIN file_nodes fn ON fn.path_hash = u.target_path_hash AND fn.path = u.target_path
+		LEFT JOIN file_nodes fn ON `+s.scope.AndAs("fn", `fn.path_hash = u.target_path_hash AND fn.path = u.target_path`)+`
 		LEFT JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id) AND i.status = 'CONFIRMED'
-		WHERE u.status IN ('INITIATED', 'UPLOADING') AND u.expires_at > ?`, time.Now().UTC()).Scan(&total)
+		WHERE `+s.scope.AndAs("u", `u.status IN ('INITIATED', 'UPLOADING') AND u.expires_at > ?`),
+		append(s.scope.Args(), s.scope.Args(time.Now().UTC())...)...).Scan(&total)
 	if err != nil {
 		return 0, err
 	}
@@ -1496,8 +1522,8 @@ func (s *Store) ConfirmedFileSizeByPathTx(db execer, path string) (int64, error)
 	err := db.QueryRow(`SELECT i.size_bytes
 		FROM file_nodes fn
 		JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id)
-		WHERE fn.path_hash = ? AND fn.path = ? AND fn.is_directory = 0 AND i.status = 'CONFIRMED'
-		LIMIT 1`, fileNodePathHash(path), path).Scan(&size)
+		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ? AND fn.is_directory = 0 AND i.status = 'CONFIRMED'`)+`
+		LIMIT 1`, s.scope.Args(fileNodePathHash(path), path)...).Scan(&size)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -1527,14 +1553,14 @@ func (s *Store) ListConfirmedFileSummaries(ctx context.Context, cursor string, l
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT i.inode_id, i.size_bytes, COALESCE(c.content_type, '')
 			 FROM inodes i JOIN contents c ON i.inode_id = c.inode_id
-			 WHERE i.status = 'CONFIRMED'
-			 ORDER BY i.inode_id ASC LIMIT ?`, limit)
+			 WHERE `+s.scope.AndAs("i", `i.status = 'CONFIRMED'`)+`
+			 ORDER BY i.inode_id ASC LIMIT ?`, s.scope.Args(limit)...)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT i.inode_id, i.size_bytes, COALESCE(c.content_type, '')
 			 FROM inodes i JOIN contents c ON i.inode_id = c.inode_id
-			 WHERE i.status = 'CONFIRMED' AND i.inode_id > ?
-			 ORDER BY i.inode_id ASC LIMIT ?`, cursor, limit)
+			 WHERE `+s.scope.AndAs("i", `i.status = 'CONFIRMED' AND i.inode_id > ?`)+`
+			 ORDER BY i.inode_id ASC LIMIT ?`, s.scope.Args(cursor, limit)...)
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("query confirmed files: %w", err)
@@ -1574,14 +1600,14 @@ func (s *Store) ListConfirmedS3Refs(ctx context.Context, cursor string, limit in
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT c.storage_ref, c.storage_ref_hash
 			 FROM contents c JOIN inodes i ON i.inode_id = c.inode_id
-			 WHERE i.status = 'CONFIRMED' AND c.storage_type = 's3' AND c.storage_ref <> ''
-			 ORDER BY c.storage_ref ASC LIMIT ?`, limit)
+			 WHERE `+s.scope.AndAs("i", `i.status = 'CONFIRMED' AND c.storage_type = 's3' AND c.storage_ref <> ''`)+`
+			 ORDER BY c.storage_ref ASC LIMIT ?`, s.scope.Args(limit)...)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT c.storage_ref, c.storage_ref_hash
 			 FROM contents c JOIN inodes i ON i.inode_id = c.inode_id
-			 WHERE i.status = 'CONFIRMED' AND c.storage_type = 's3' AND c.storage_ref <> '' AND c.storage_ref > ?
-			 ORDER BY c.storage_ref ASC LIMIT ?`, cursor, limit)
+			 WHERE `+s.scope.AndAs("i", `i.status = 'CONFIRMED' AND c.storage_type = 's3' AND c.storage_ref <> '' AND c.storage_ref > ?`)+`
+			 ORDER BY c.storage_ref ASC LIMIT ?`, s.scope.Args(cursor, limit)...)
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("query confirmed s3 refs: %w", err)
@@ -1613,8 +1639,8 @@ func (s *Store) HasActiveUploads(ctx context.Context) (bool, error) {
 	var one int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT 1 FROM uploads
-		 WHERE status IN ('INITIATED', 'UPLOADING') AND expires_at > ?
-		 LIMIT 1`, time.Now().UTC()).Scan(&one)
+		 WHERE `+s.scope.And(`status IN ('INITIATED', 'UPLOADING') AND expires_at > ?`)+`
+		 LIMIT 1`, s.scope.Args(time.Now().UTC())...).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -1626,14 +1652,14 @@ func (s *Store) HasActiveUploads(ctx context.Context) (bool, error) {
 
 func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
 	return s.InTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE fn FROM file_nodes fn JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id) WHERE i.status <> 'CONFIRMED'`); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE fn FROM file_nodes fn JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id) WHERE `+s.scope.AndAs("i", `i.status <> 'CONFIRMED'`), s.scope.Args()...); err != nil {
 			return err
 		}
 		now := time.Now().UTC()
-		if _, err := tx.ExecContext(ctx, `UPDATE contents c JOIN inodes i ON i.inode_id = c.inode_id SET c.storage_ref = '', c.storage_ref_hash = '', c.content_blob = NULL WHERE i.status <> 'CONFIRMED'`); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE contents c JOIN inodes i ON i.inode_id = c.inode_id SET c.storage_ref = '', c.storage_ref_hash = '', c.content_blob = NULL WHERE `+s.scope.AndAs("i", `i.status <> 'CONFIRMED'`), s.scope.Args()...); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE inodes SET status = 'DELETED', expires_at = ? WHERE status <> 'CONFIRMED'`, now); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE inodes SET status = 'DELETED', expires_at = ? WHERE `+s.scope.And(`status <> 'CONFIRMED'`), append([]any{now}, s.scope.Args()...)...); err != nil {
 			return err
 		}
 		if s.useLegacyFiles {
@@ -1641,20 +1667,30 @@ func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
 				return err
 			}
 		}
-		for _, stmt := range []string{
-			`DELETE FROM uploads`,
-			`DELETE FROM file_gc_tasks`,
-			`DELETE FROM semantic_tasks`,
-			`DELETE FROM llm_usage`,
-			`DELETE FROM vault_audit_log`,
-			`DELETE FROM vault_grants`,
-			`DELETE FROM vault_tokens`,
-			`DELETE FROM vault_secret_fields`,
-			`DELETE FROM vault_secrets`,
-			`DELETE FROM vault_policies`,
-			`DELETE FROM vault_deks`,
+		// Whole-table wipes. In shared shape every one of these tables carries
+		// an fs_id column (vault tables included), so the DELETE must be
+		// restricted to this tenant's rows — unscoped it would destroy other
+		// tenants' runtime state.
+		for _, tbl := range []string{
+			"uploads",
+			"file_gc_tasks",
+			"semantic_tasks",
+			"llm_usage",
+			"vault_audit_log",
+			"vault_grants",
+			"vault_tokens",
+			"vault_secret_fields",
+			"vault_secrets",
+			"vault_policies",
+			"vault_deks",
 		} {
-			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			stmt := `DELETE FROM ` + tbl
+			args := []any(nil)
+			if s.scope.Shared() {
+				stmt += ` WHERE fs_id = ?`
+				args = s.scope.Args()
+			}
+			if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
 				if isMissingTableError(err) {
 					continue
 				}
@@ -1707,8 +1743,8 @@ func (s *Store) StatTx(ctx context.Context, db execer, path string) (out *NodeWi
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
 		LEFT JOIN contents c ON i.inode_id = c.inode_id
 		LEFT JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE fn.path_hash = ? AND fn.path = ?
-		LIMIT 1`, fileNodePathHash(path), path)
+		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
+		LIMIT 1`, s.scope.Args(fileNodePathHash(path), path)...)
 	return scanNodeWithFileWithBlob(row)
 }
 
@@ -1725,9 +1761,9 @@ func (s *Store) StatPathFallback(ctx context.Context, primaryPath, fallbackPath 
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
 		LEFT JOIN contents c ON i.inode_id = c.inode_id
 		LEFT JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE (fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)
+		WHERE `+s.andAsGrouped("fn", `(fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)`)+`
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
-		LIMIT 1`, fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)
+		LIMIT 1`, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)
 	out, err = scanNodeWithFileWithBlob(row)
 	return out, err
 }
@@ -1743,9 +1779,9 @@ func (s *Store) StatPathFallbackLite(ctx context.Context, primaryPath, fallbackP
 		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
-		WHERE (fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)
+		WHERE `+s.andAsGrouped("fn", `(fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)`)+`
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
-		LIMIT 1`, fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)
+		LIMIT 1`, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)
 	out, err = scanNodeWithFileLite(row)
 	return out, err
 }
@@ -1759,8 +1795,8 @@ func (s *Store) StatLite(ctx context.Context, path string) (out *NodeWithFile, e
 		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
-		WHERE fn.path_hash = ? AND fn.path = ?
-		LIMIT 1`, fileNodePathHash(path), path)
+		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
+		LIMIT 1`, s.scope.Args(fileNodePathHash(path), path)...)
 	out, err = scanNodeWithFileLite(row)
 	return out, err
 }
@@ -1778,8 +1814,8 @@ func (s *Store) StatForRead(ctx context.Context, path string) (out *NodeWithFile
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
 		LEFT JOIN contents c ON i.inode_id = c.inode_id
-		WHERE fn.path_hash = ? AND fn.path = ?
-		LIMIT 1`, fileNodePathHash(path), path)
+		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
+		LIMIT 1`, s.scope.Args(fileNodePathHash(path), path)...)
 	out, err = scanNodeWithFileForRead(row)
 	return out, err
 }
@@ -1794,9 +1830,9 @@ func (s *Store) StatPathFallbackForRead(ctx context.Context, primaryPath, fallba
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
 		LEFT JOIN contents c ON i.inode_id = c.inode_id
-		WHERE (fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)
+		WHERE `+s.andAsGrouped("fn", `(fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)`)+`
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
-		LIMIT 1`, fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)
+		LIMIT 1`, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)
 	out, err = scanNodeWithFileForRead(row)
 	return out, err
 }
@@ -1813,9 +1849,9 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
 		LEFT JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE fn.parent_path_hash = ? AND fn.parent_path = ?
+		WHERE ` + s.scope.AndAs("fn", `fn.parent_path_hash = ? AND fn.parent_path = ?`) + `
 		ORDER BY fn.name`
-	rows, err := s.db.QueryContext(ctx, q, fileNodePathHash(parentPath), parentPath)
+	rows, err := s.db.QueryContext(ctx, q, s.scope.Args(fileNodePathHash(parentPath), parentPath)...)
 	if err != nil {
 		return nil, err
 	}
@@ -1896,7 +1932,8 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 		return nil, ErrNotFound
 	}
 
-	if _, err := tx.Exec(`DELETE FROM file_nodes WHERE path_hash = ? AND path = ?`, fileNodePathHash(path), path); err != nil {
+	if _, err := tx.Exec(`DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
+		s.scope.Args(fileNodePathHash(path), path)...); err != nil {
 		return nil, err
 	}
 
@@ -1908,7 +1945,7 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	}
 
 	var count int64
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_nodes WHERE file_id = ? FOR UPDATE`, candidate.fileID).Scan(&count)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_nodes WHERE `+s.scope.And(`file_id = ?`)+` FOR UPDATE`, s.scope.Args(candidate.fileID)...).Scan(&count)
 	if err != nil {
 		return nil, err
 	}
@@ -1924,7 +1961,7 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	if err := s.markFilesDeletedTx(ctx, tx, []string{candidate.fileID}); err != nil {
 		return nil, err
 	}
-	if err := deleteFileTagsByIDsTx(ctx, tx, []string{candidate.fileID}); err != nil {
+	if err := s.deleteFileTagsByIDsTx(ctx, tx, []string{candidate.fileID}); err != nil {
 		return nil, err
 	}
 
@@ -1955,7 +1992,7 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 	defer func() { _ = tx.Rollback() }()
 
 	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT file_id FROM file_nodes
-		WHERE (path = ? OR path LIKE ?) AND file_id IS NOT NULL`, dirPath, dirPath+"%")
+		WHERE `+s.scope.And(`(path = ? OR path LIKE ?) AND file_id IS NOT NULL`), s.scope.Args(dirPath, dirPath+"%")...)
 	if err != nil {
 		return nil, err
 	}
@@ -1974,8 +2011,8 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		return nil, err
 	}
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ? OR path LIKE ?`,
-		dirPath, dirPath+"%"); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.andAsGrouped("", `path = ? OR path LIKE ?`),
+		s.scope.Args(dirPath, dirPath+"%")...); err != nil {
 		return nil, err
 	}
 
@@ -1990,7 +2027,7 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 	if err := s.markFilesDeletedTx(ctx, tx, orphanIDs); err != nil {
 		return nil, err
 	}
-	if err := deleteFileTagsByIDsTx(ctx, tx, orphanIDs); err != nil {
+	if err := s.deleteFileTagsByIDsTx(ctx, tx, orphanIDs); err != nil {
 		return nil, err
 	}
 
@@ -2038,8 +2075,8 @@ func (s *Store) scanDeleteCandidateTx(ctx context.Context, tx *sql.Tx, path stri
 		LEFT JOIN inodes i ON i.inode_id = fn.file_id
 		LEFT JOIN contents c ON c.inode_id = fn.file_id
 		LEFT JOIN semantic s ON s.inode_id = fn.file_id
-		WHERE fn.path_hash = ? AND fn.path = ?
-		FOR UPDATE`, fileNodePathHash(path), path)
+		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
+		FOR UPDATE`, s.scope.Args(fileNodePathHash(path), path)...)
 	return scanSplitDeleteCandidate(row)
 }
 
@@ -2127,8 +2164,9 @@ func (s *Store) scanOrphanedFilesByIDTx(ctx context.Context, tx *sql.Tx, fileIDs
 				FROM inodes i
 				JOIN contents c ON c.inode_id = i.inode_id
 				LEFT JOIN semantic s ON s.inode_id = i.inode_id
-				WHERE i.inode_id IN (` + placeholders + `)
-				  AND NOT EXISTS (SELECT 1 FROM file_nodes fn WHERE fn.file_id = i.inode_id)`
+				WHERE ` + s.scope.AndAs("i", `i.inode_id IN (`+placeholders+`)
+				  AND NOT EXISTS (SELECT 1 FROM file_nodes fn WHERE fn.file_id = i.inode_id)`)
+			args = s.scope.Args(args...)
 		}
 		rows, err := tx.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -2205,7 +2243,7 @@ func (s *Store) lockFileIDsForDeleteTx(ctx context.Context, tx *sql.Tx, fileIDs 
 				return err
 			}
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT inode_id FROM inodes WHERE inode_id IN (`+placeholders+`) FOR UPDATE`, args...)
+		rows, err := tx.QueryContext(ctx, `SELECT inode_id FROM inodes WHERE `+s.scope.And(`inode_id IN (`+placeholders+`)`)+` FOR UPDATE`, s.scope.Args(args...)...)
 		if err != nil {
 			return err
 		}
@@ -2248,7 +2286,7 @@ func (s *Store) markFilesDeletedTx(ctx context.Context, tx *sql.Tx, fileIDs []st
 				return err
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE inodes SET status = 'DELETED' WHERE inode_id IN (`+placeholders+`)`, args...); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE inodes SET status = 'DELETED' WHERE `+s.scope.And(`inode_id IN (`+placeholders+`)`), s.scope.Args(args...)...); err != nil {
 			return err
 		}
 	}
@@ -2287,7 +2325,7 @@ func fileFromLegacyGCScan(fileID string, storageType, storageRef, encMode, encKe
 	return f
 }
 
-func deleteFileTagsByIDsTx(ctx context.Context, tx *sql.Tx, fileIDs []string) error {
+func (s *Store) deleteFileTagsByIDsTx(ctx context.Context, tx *sql.Tx, fileIDs []string) error {
 	for start := 0; start < len(fileIDs); start += deleteFileIDBatchSize {
 		end := start + deleteFileIDBatchSize
 		if end > len(fileIDs) {
@@ -2297,7 +2335,8 @@ func deleteFileTagsByIDsTx(ctx context.Context, tx *sql.Tx, fileIDs []string) er
 		if len(batch) == 0 {
 			continue
 		}
-		_, err := tx.ExecContext(ctx, `DELETE FROM file_tags WHERE file_id IN (`+questionPlaceholders(len(batch))+`)`, stringsToAny(batch)...)
+		_, err := tx.ExecContext(ctx, `DELETE FROM file_tags WHERE `+s.scope.And(`file_id IN (`+questionPlaceholders(len(batch))+`)`),
+			s.scope.Args(stringsToAny(batch)...)...)
 		if err != nil {
 			return err
 		}
@@ -2313,9 +2352,10 @@ func stringsToAny(values []string) []any {
 	return args
 }
 
-func dirHasChildrenTx(ctx context.Context, tx *sql.Tx, path string) (bool, error) {
+func (s *Store) dirHasChildrenTx(ctx context.Context, tx *sql.Tx, path string) (bool, error) {
 	var one int
-	err := tx.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE parent_path_hash = ? AND parent_path = ? LIMIT 1 FOR UPDATE`, fileNodePathHash(path), path).Scan(&one)
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE `+s.scope.And(`parent_path_hash = ? AND parent_path = ?`)+` LIMIT 1 FOR UPDATE`,
+		s.scope.Args(fileNodePathHash(path), path)...).Scan(&one)
 	if err == nil {
 		return true, nil
 	}
@@ -2327,6 +2367,21 @@ func dirHasChildrenTx(ctx context.Context, tx *sql.Tx, path string) (bool, error
 
 func pathPrefixPredicate(column, prefix string) (string, []any) {
 	return "BINARY " + column + " LIKE BINARY ? ESCAPE '\\\\'", []any{likeLiteralPrefixPattern(prefix)}
+}
+
+// andAsGrouped prefixes pred with the scope's fs_id predicate for WHERE
+// clauses whose top-level OR would otherwise escape the fs_id conjunct:
+// shared shape wraps pred in parentheses before applying And/AndAs. alias may
+// be empty for unqualified predicates. Standalone shape returns pred
+// byte-identical.
+func (s *Store) andAsGrouped(alias, pred string) string {
+	if !s.scope.Shared() {
+		return pred
+	}
+	if alias == "" {
+		return s.scope.And("(" + pred + ")")
+	}
+	return s.scope.AndAs(alias, "("+pred+")")
 }
 
 // --- uploads operations ---
@@ -2342,15 +2397,15 @@ func (s *Store) InsertUpload(ctx context.Context, u *Upload) (err error) {
 func (s *Store) InsertUploadTx(db execer, u *Upload) error {
 	mode := uploadStorageEncryptionModeForWrite(u.StorageEncryptionMode)
 	_, err := db.Exec(`INSERT INTO uploads
-		(upload_id, file_id, target_path, target_path_hash, s3_upload_id, s3_key, storage_encryption_mode,
+		(`+s.scope.InsCols(`upload_id, file_id, target_path, target_path_hash, s3_upload_id, s3_key, storage_encryption_mode,
 		 storage_encryption_key_id, total_size, part_size,
-		 parts_total, expected_revision, status, fingerprint_sha256, idempotency_key, description, created_at, updated_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		u.UploadID, u.FileID, u.TargetPath, fileNodePathHash(u.TargetPath), u.S3UploadID, u.S3Key,
-		mode, storageEncryptionKeyIDForWrite(mode, u.StorageEncryptionKeyID),
-		u.TotalSize, u.PartSize, u.PartsTotal, nullInt64Ptr(u.ExpectedRevision), u.Status,
-		nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey), nullStr(u.Description),
-		u.CreatedAt.UTC(), u.UpdatedAt.UTC(), u.ExpiresAt.UTC())
+		 parts_total, expected_revision, status, fingerprint_sha256, idempotency_key, description, created_at, updated_at, expires_at`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
+		s.scope.Args(u.UploadID, u.FileID, u.TargetPath, fileNodePathHash(u.TargetPath), u.S3UploadID, u.S3Key,
+			mode, storageEncryptionKeyIDForWrite(mode, u.StorageEncryptionKeyID),
+			u.TotalSize, u.PartSize, u.PartsTotal, nullInt64Ptr(u.ExpectedRevision), u.Status,
+			nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey), nullStr(u.Description),
+			u.CreatedAt.UTC(), u.UpdatedAt.UTC(), u.ExpiresAt.UTC())...)
 	if isUniqueViolation(err) {
 		// Distinguish constraint: idx_idempotency (duplicate key) vs idx_uploads_active (concurrent path).
 		// MySQL embeds the constraint name in the error message; no structured alternative exists.
@@ -2373,7 +2428,7 @@ func (s *Store) GetUpload(ctx context.Context, uploadID string) (out *Upload, er
 		storage_encryption_mode, storage_encryption_key_id,
 		total_size, part_size, parts_total, expected_revision, status, fingerprint_sha256, idempotency_key,
 		description, created_at, updated_at, expires_at
-		FROM uploads WHERE upload_id = ?`, uploadID)
+		FROM uploads WHERE `+s.scope.And(`upload_id = ?`), s.scope.Args(uploadID)...)
 	queryContextDurationMs := datastorePhaseMs(queryStart)
 	if err != nil {
 		opErr = err
@@ -2462,8 +2517,8 @@ func (s *Store) GetUploadByPath(ctx context.Context, targetPath string) (out *Up
 		storage_encryption_mode, storage_encryption_key_id,
 		total_size, part_size, parts_total, expected_revision, status, fingerprint_sha256, idempotency_key,
 		description, created_at, updated_at, expires_at
-		FROM uploads WHERE target_path_hash = ? AND target_path = ? AND status IN ('INITIATED', 'UPLOADING') AND expires_at > ?
-		ORDER BY created_at DESC LIMIT 1`, fileNodePathHash(targetPath), targetPath, time.Now().UTC())
+		FROM uploads WHERE `+s.scope.And(`target_path_hash = ? AND target_path = ? AND status IN ('INITIATED', 'UPLOADING') AND expires_at > ?`)+`
+		ORDER BY created_at DESC LIMIT 1`, s.scope.Args(fileNodePathHash(targetPath), targetPath, time.Now().UTC())...)
 	out, err = scanUpload(row)
 	return out, err
 }
@@ -2474,7 +2529,8 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID string) (err error)
 
 	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = 'COMPLETED',
 		updated_at = ?
-		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
+		WHERE `+s.scope.And(`upload_id = ? AND status = 'UPLOADING'`),
+		append([]any{time.Now().UTC()}, s.scope.Args(uploadID)...)...)
 	return err
 }
 
@@ -2484,7 +2540,8 @@ func (s *Store) AbortUpload(ctx context.Context, uploadID string) (err error) {
 
 	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = 'ABORTED',
 		updated_at = ?
-		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
+		WHERE `+s.scope.And(`upload_id = ? AND status = 'UPLOADING'`),
+		append([]any{time.Now().UTC()}, s.scope.Args(uploadID)...)...)
 	return err
 }
 
@@ -2497,7 +2554,8 @@ func (s *Store) AbortUploadV2(ctx context.Context, uploadID string) (aborted boo
 
 	res, err := s.db.ExecContext(ctx, `UPDATE uploads SET status = 'ABORTED',
 		updated_at = ?
-		WHERE upload_id = ? AND status IN ('INITIATED', 'UPLOADING')`, time.Now().UTC(), uploadID)
+		WHERE `+s.scope.And(`upload_id = ? AND status IN ('INITIATED', 'UPLOADING')`),
+		append([]any{time.Now().UTC()}, s.scope.Args(uploadID)...)...)
 	if err != nil {
 		return false, err
 	}
@@ -2515,7 +2573,8 @@ func (s *Store) UpdateUploadStatus(ctx context.Context, uploadID string, status 
 
 	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = ?,
 		updated_at = ?
-		WHERE upload_id = ?`, string(status), time.Now().UTC(), uploadID)
+		WHERE `+s.scope.And(`upload_id = ?`),
+		append([]any{string(status), time.Now().UTC()}, s.scope.Args(uploadID)...)...)
 	return err
 }
 
@@ -2527,7 +2586,8 @@ func (s *Store) TransitionUploadStatus(ctx context.Context, uploadID string, exp
 
 	res, err := s.db.ExecContext(ctx, `UPDATE uploads SET status = ?,
 		updated_at = ?
-		WHERE upload_id = ? AND status = ?`, string(newStatus), time.Now().UTC(), uploadID, string(expectedStatus))
+		WHERE `+s.scope.And(`upload_id = ? AND status = ?`),
+		append([]any{string(newStatus), time.Now().UTC()}, s.scope.Args(uploadID, string(expectedStatus))...)...)
 	if err != nil {
 		return err
 	}
@@ -2549,8 +2609,8 @@ func (s *Store) ListUploadsByPath(ctx context.Context, targetPath string, status
 		storage_encryption_mode, storage_encryption_key_id,
 		total_size, part_size, parts_total, expected_revision, status, fingerprint_sha256, idempotency_key,
 		description, created_at, updated_at, expires_at
-		FROM uploads WHERE target_path_hash = ? AND target_path = ? AND status = ?
-		ORDER BY created_at DESC`, fileNodePathHash(targetPath), targetPath, status)
+		FROM uploads WHERE `+s.scope.And(`target_path_hash = ? AND target_path = ? AND status = ?`)+`
+		ORDER BY created_at DESC`, s.scope.Args(fileNodePathHash(targetPath), targetPath, status)...)
 	if err != nil {
 		return nil, err
 	}
@@ -2680,7 +2740,7 @@ func (s *Store) scanFileForGCTx(db execer, fileID string) (*File, error) {
 		FROM inodes i
 		JOIN contents c ON i.inode_id = c.inode_id
 		LEFT JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE i.inode_id = ?`, fileID).Scan(
+		WHERE `+s.scope.AndAs("i", `i.inode_id = ?`), s.scope.Args(fileID)...).Scan(
 		&f.StorageType, &f.StorageRef, &f.SizeBytes, &contentType, &embRev)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -3004,12 +3064,6 @@ func isDeadlock(err error) bool {
 	return strings.Contains(msg, "Deadlock found") || strings.Contains(msg, "deadlock")
 }
 
-var wsNorm = regexp.MustCompile(`\s+`)
-
-func normalizeSQL(s string) string {
-	return wsNorm.ReplaceAllString(strings.TrimSpace(s), " ")
-}
-
 func datastorePhaseMs(start time.Time) float64 {
 	return float64(time.Since(start).Microseconds()) / 1000.0
 }
@@ -3066,129 +3120,4 @@ func shouldLogStoreOpFailure(result string) bool {
 	default:
 		return true
 	}
-}
-
-func (s *Store) ExecSQL(ctx context.Context, query string) (out []map[string]interface{}, err error) {
-	start := time.Now()
-	defer func() {
-		result := "ok"
-		if err != nil {
-			result = "error"
-		}
-		metrics.RecordOperation("datastore", "exec_sql", result, time.Since(start))
-	}()
-
-	q := strings.TrimSpace(query)
-	norm := strings.ToUpper(normalizeSQL(q))
-
-	isSelect := strings.HasPrefix(norm, "SELECT")
-	if strings.HasPrefix(norm, "WITH") {
-		hasDML := strings.Contains(norm, "INSERT") ||
-			strings.Contains(norm, "UPDATE") ||
-			strings.Contains(norm, "DELETE") ||
-			strings.Contains(norm, "DROP") ||
-			strings.Contains(norm, "ALTER") ||
-			strings.Contains(norm, "TRUNCATE")
-		if !hasDML {
-			isSelect = true
-		}
-	}
-	isTagWrite := strings.HasPrefix(norm, "INSERT INTO FILE_TAGS") ||
-		strings.HasPrefix(norm, "UPDATE FILE_TAGS") ||
-		strings.HasPrefix(norm, "DELETE FROM FILE_TAGS")
-
-	if isTagWrite {
-		if strings.HasPrefix(norm, "UPDATE") || strings.HasPrefix(norm, "DELETE") {
-			if strings.Contains(norm, " JOIN ") || strings.Contains(norm, " USING ") {
-				return nil, fmt.Errorf("multi-table DML not allowed; single-table statements on file_tags only")
-			}
-			if strings.HasPrefix(norm, "UPDATE") {
-				setIdx := strings.Index(norm, " SET ")
-				if setIdx > 0 && strings.Contains(norm[:setIdx], ",") {
-					return nil, fmt.Errorf("multi-table DML not allowed; single-table statements on file_tags only")
-				}
-			}
-			if strings.HasPrefix(norm, "DELETE") {
-				fromIdx := strings.Index(norm, " FROM ")
-				if fromIdx > 0 {
-					rest := norm[fromIdx+6:]
-					endIdx := strings.IndexAny(rest, " ;")
-					if endIdx < 0 {
-						endIdx = len(rest)
-					}
-					tablePart := rest[:endIdx]
-					if strings.Contains(tablePart, ",") {
-						return nil, fmt.Errorf("multi-table DML not allowed; single-table statements on file_tags only")
-					}
-				}
-			}
-		}
-	}
-
-	if !isSelect && !isTagWrite {
-		err = fmt.Errorf("only SELECT queries and INSERT/UPDATE/DELETE on file_tags are allowed")
-		logger.Warn(ctx, "datastore_exec_sql_rejected", zap.Int("query_len", len(q)), zap.Error(err))
-		return nil, err
-	}
-	if s == nil || s.db == nil {
-		err = fmt.Errorf("database is closed")
-		logger.Error(ctx, "datastore_exec_sql_closed", zap.Error(err))
-		return nil, err
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	if isTagWrite {
-		res, err := s.db.ExecContext(ctx, q)
-		if err != nil {
-			logger.Error(ctx, "datastore_exec_sql_tag_write_failed", zap.Int("query_len", len(q)), zap.Error(err))
-			return nil, err
-		}
-		affected, _ := res.RowsAffected()
-		return []map[string]interface{}{{"rows_affected": affected}}, nil
-	}
-
-	rows, err := s.db.QueryContext(ctx, q)
-	if err != nil {
-		logger.Error(ctx, "datastore_exec_sql_query_failed", zap.Int("query_len", len(q)), zap.Error(err))
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-
-	const maxRows = 1000
-	result := make([]map[string]interface{}, 0)
-	for rows.Next() {
-		if len(result) >= maxRows {
-			break
-		}
-		vals := make([]interface{}, len(cols))
-		ptrs := make([]interface{}, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			return nil, err
-		}
-		row := make(map[string]interface{}, len(cols))
-		for i, col := range cols {
-			v := vals[i]
-			if b, ok := v.([]byte); ok {
-				row[col] = string(b)
-			} else {
-				row[col] = v
-			}
-		}
-		result = append(result, row)
-	}
-	if err := rows.Err(); err != nil {
-		logger.Error(ctx, "datastore_exec_sql_scan_failed", zap.Int("query_len", len(q)), zap.Error(err))
-		return nil, err
-	}
-	return result, nil
 }

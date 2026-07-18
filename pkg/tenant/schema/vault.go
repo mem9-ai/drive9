@@ -93,3 +93,113 @@ func VaultTiDBSchemaStatements() []string {
 		)`,
 	}
 }
+
+// VaultTiDBSharedSchemaStatements returns the vault DDL for the shared
+// (multi-tenant) schema shape on TiDB: identical to VaultTiDBSchemaStatements
+// except the tenant_id VARCHAR(64) discriminator column is replaced by
+// fs_id BIGINT in every table, unique key, and index, and vault_secret_fields
+// — which has no tenant column in the standalone shape — gains fs_id BIGINT
+// as its first column. The composite primary key of vault_secret_fields is
+// declared CLUSTERED: TiDB creates composite primary keys NONCLUSTERED by
+// default, and the shared shape relies on clustered keys to physically
+// co-locate one tenant's rows. vault_deks keeps its single-column integer
+// primary key, which TiDB clusters by default, so it needs no keyword. For
+// plain MySQL use VaultMySQLSharedSchemaStatements (same shape without the
+// keyword). Keep both in lockstep with VaultTiDBSchemaStatements — the drift
+// test in vault_shared_test.go enforces parity.
+func VaultTiDBSharedSchemaStatements() []string {
+	return []string{
+		`CREATE TABLE IF NOT EXISTS vault_deks (
+			fs_id        BIGINT PRIMARY KEY,
+			wrapped_dek  BLOB NOT NULL,
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS vault_secrets (
+			secret_id    VARCHAR(64) PRIMARY KEY,
+			fs_id        BIGINT NOT NULL,
+			name         VARCHAR(255) NOT NULL,
+			secret_type  VARCHAR(32) NOT NULL DEFAULT 'generic',
+			revision     BIGINT NOT NULL DEFAULT 1,
+			created_by   VARCHAR(255) NOT NULL,
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			deleted_at   DATETIME(3),
+			UNIQUE INDEX uk_vault_secrets_tenant_name (fs_id, name),
+			INDEX idx_vault_secrets_tenant (fs_id)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS vault_secret_fields (
+			fs_id           BIGINT NOT NULL,
+			secret_id       VARCHAR(64) NOT NULL,
+			field_name      VARCHAR(255) NOT NULL,
+			encrypted_value BLOB NOT NULL,
+			nonce           BLOB NOT NULL,
+			PRIMARY KEY (fs_id, secret_id, field_name) CLUSTERED
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS vault_tokens (
+			token_id      VARCHAR(64) PRIMARY KEY,
+			fs_id         BIGINT NOT NULL,
+			agent_id      VARCHAR(255) NOT NULL,
+			task_id       VARCHAR(255),
+			scope_json    JSON NOT NULL,
+			issued_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			expires_at    DATETIME(3) NOT NULL,
+			revoked_at    DATETIME(3),
+			revoked_by    VARCHAR(255),
+			revoke_reason VARCHAR(255),
+			INDEX idx_vault_token_tenant (fs_id),
+			INDEX idx_vault_token_agent (agent_id)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS vault_grants (
+			grant_id       VARCHAR(64) PRIMARY KEY,
+			fs_id          BIGINT NOT NULL,
+			issuer         VARCHAR(256) NOT NULL,
+			principal_type VARCHAR(16) NOT NULL,
+			agent          VARCHAR(128) NOT NULL,
+			scope_json     JSON NOT NULL,
+			perm           VARCHAR(8) NOT NULL,
+			label_hint     VARCHAR(128),
+			issued_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			expires_at     DATETIME(3) NOT NULL,
+			revoked_at     DATETIME(3),
+			revoked_by     VARCHAR(128),
+			revoke_reason  VARCHAR(256),
+			INDEX idx_vault_grants_tenant (fs_id),
+			INDEX idx_vault_grants_expires (expires_at)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS vault_policies (
+			policy_id   VARCHAR(64) PRIMARY KEY,
+			fs_id       BIGINT NOT NULL,
+			name        VARCHAR(255) NOT NULL,
+			rules_json  JSON NOT NULL,
+			created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS vault_audit_log (
+			event_id     VARCHAR(64) PRIMARY KEY,
+			fs_id        BIGINT NOT NULL,
+			event_type   VARCHAR(32) NOT NULL,
+			token_id     VARCHAR(64),
+			agent_id     VARCHAR(255),
+			task_id      VARCHAR(255),
+			secret_name  VARCHAR(255),
+			field_name   VARCHAR(255),
+			adapter      VARCHAR(16),
+			detail_json  JSON,
+			timestamp    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			INDEX idx_vault_audit_tenant_time (fs_id, timestamp),
+			INDEX idx_vault_audit_secret (secret_name, timestamp)
+		)`,
+	}
+}
+
+// VaultMySQLSharedSchemaStatements is the plain-MySQL variant of
+// VaultTiDBSharedSchemaStatements, derived by removing TiDB-only keywords.
+// Use it for local development databases and MySQL-backed tests/e2e.
+func VaultMySQLSharedSchemaStatements() []string {
+	return mysqlCompatibleSharedStatements(VaultTiDBSharedSchemaStatements())
+}

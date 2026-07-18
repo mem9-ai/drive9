@@ -807,6 +807,16 @@ func (s *Server) startLeaderWorkers() {
 	if s.meta != nil {
 		s.replayWorker = backend.StartMutationReplayWorker(tenant.NewMetaQuotaAdapter(s.meta))
 		s.expirySweepWorker = backend.StartExpirySweepWorker(s.meta)
+		// One-time fs_registry backfill so pre-existing tenants hold a stable
+		// internal fs_id before the routing layer needs it. Idempotent.
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			inserted, err := s.meta.BackfillFsRegistry(workerCtx)
+			if err != nil {
+				logger.Error(workerCtx, "server_event", eventFields(workerCtx, "fs_registry_backfill_failed", "error", err)...)
+				return
+			}
+			logger.Info(workerCtx, "server_event", eventFields(workerCtx, "fs_registry_backfill_done", "inserted", inserted)...)
+		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			ticker := time.NewTicker(tenantCountMetricsInterval)
 			defer ticker.Stop()

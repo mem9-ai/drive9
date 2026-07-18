@@ -806,6 +806,21 @@ func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantI
 	return b
 }
 
+// fsIDForTenant resolves the tenant's internal fs_id from the meta DB,
+// allocating one on first use. Returns (0, nil) when the pool has no meta
+// store (tests, non-multi-tenant mode); the standalone SQL shape never emits
+// fs_id, so 0 is inert there.
+func (p *Pool) fsIDForTenant(ctx context.Context, t *meta.Tenant) (int64, error) {
+	if p.metaStore == nil || t == nil || t.ID == "" {
+		return 0, nil
+	}
+	fsID, err := p.metaStore.EnsureFsID(ctx, t.ID)
+	if err != nil {
+		return 0, fmt.Errorf("ensure fs_id for tenant %s: %w", t.ID, err)
+	}
+	return fsID, nil
+}
+
 func (p *Pool) tenantMetricTiDBCloudOrgID(ctx context.Context, t *meta.Tenant) string {
 	if t == nil || strings.TrimSpace(t.ID) == "" || t.Provider != ProviderTiDBCloudNative {
 		return defaultTenantMetricTiDBCloudOrgID
@@ -856,8 +871,12 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		query += "&tls=skip-verify"
 	}
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
+	fsID, err := p.fsIDForTenant(ctx, t)
+	if err != nil {
+		return nil, nil, tidbCloudOrgID, err
+	}
 	openStoreStart := time.Now()
-	store, err := datastore.OpenForTenantWithOrg(ctx, dsn, t.ID, tidbCloudOrgID)
+	store, err := datastore.OpenForTenantScoped(ctx, dsn, t.ID, tidbCloudOrgID, datastore.StandaloneScope(fsID))
 	if err != nil {
 		return nil, nil, tidbCloudOrgID, fmt.Errorf("open datastore: %w", err)
 	}

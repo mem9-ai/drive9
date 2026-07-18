@@ -161,10 +161,10 @@ func (s *Store) CreateFSLayer(ctx context.Context, layer *FSLayer) error {
 	defer func() { _ = tx.Rollback() }()
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO fs_layers (
-	layer_id, base_root_path, name, state, durability_mode, actor_id, durable_seq, created_at, updated_at, sealed_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), ?)`,
-		layer.LayerID, layer.BaseRootPath, layer.Name, string(layer.State), string(layer.DurabilityMode), layer.ActorID,
-		layer.DurableSeq, nilTime(layer.SealedAt))
+	`+s.scope.InsCols(`layer_id, base_root_path, name, state, durability_mode, actor_id, durable_seq, created_at, updated_at, sealed_at`)+`
+) VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), ?`)+`)`,
+		s.scope.Args(layer.LayerID, layer.BaseRootPath, layer.Name, string(layer.State), string(layer.DurabilityMode), layer.ActorID,
+			layer.DurableSeq, nilTime(layer.SealedAt))...)
 	if err != nil {
 		return fmt.Errorf("create fs layer %s: %w", layer.LayerID, err)
 	}
@@ -186,7 +186,7 @@ func (s *Store) GetFSLayer(ctx context.Context, layerID string) (*FSLayer, error
 	row := s.db.QueryRowContext(ctx, `
 SELECT layer_id, base_root_path, name, state, durability_mode, actor_id, durable_seq, created_at, updated_at, sealed_at
 	FROM fs_layers
-	WHERE layer_id = ?`, layerID)
+	WHERE `+s.scope.And(`layer_id = ?`), s.scope.Args(layerID)...)
 	layer, err := scanFSLayer(row)
 	if err != nil {
 		return nil, err
@@ -198,10 +198,20 @@ SELECT layer_id, base_root_path, name, state, durability_mode, actor_id, durable
 }
 
 func (s *Store) ListFSLayers(ctx context.Context) ([]FSLayer, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	// A full layer list has no natural WHERE clause; in shared shape still
+	// restrict the scan to this tenant's fs_id.
+	query := `
 SELECT layer_id, base_root_path, name, state, durability_mode, actor_id, durable_seq, created_at, updated_at, sealed_at
-FROM fs_layers
-ORDER BY updated_at DESC, layer_id`)
+FROM fs_layers`
+	var args []any
+	if s.scope.Shared() {
+		query += `
+WHERE fs_id = ?`
+		args = append(args, s.scope.FsID())
+	}
+	query += `
+ORDER BY updated_at DESC, layer_id`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list fs layers: %w", err)
 	}
@@ -279,7 +289,7 @@ func (s *Store) SetFSLayerTags(ctx context.Context, layerID string, tags map[str
 	}
 	defer func() { _ = tx.Rollback() }()
 	var existing string
-	if err := tx.QueryRowContext(ctx, `SELECT layer_id FROM fs_layers WHERE layer_id = ?`, layerID).Scan(&existing); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT layer_id FROM fs_layers WHERE `+s.scope.And(`layer_id = ?`), s.scope.Args(layerID)...).Scan(&existing); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -302,8 +312,8 @@ func (s *Store) GetFSLayerTags(ctx context.Context, layerID string) (map[string]
 	rows, err := s.db.QueryContext(ctx, `
 SELECT tag_key, tag_value
 FROM fs_layer_tags
-WHERE layer_id = ?
-ORDER BY tag_key`, layerID)
+WHERE `+s.scope.And(`layer_id = ?`)+`
+ORDER BY tag_key`, s.scope.Args(layerID)...)
 	if err != nil {
 		return nil, fmt.Errorf("list fs layer tags: %w", err)
 	}
@@ -330,12 +340,12 @@ func (s *Store) SetFSLayerState(ctx context.Context, layerID string, state FSLay
 		return err
 	}
 	query := `UPDATE fs_layers SET state = ?, updated_at = UTC_TIMESTAMP(3)`
-	args := []any{string(state)}
+	setArgs := []any{string(state)}
 	if state == FSLayerStateSealed || state == FSLayerStateCommitting || state == FSLayerStateCommitted || state == FSLayerStateAbandoned || state == FSLayerStateConflicted {
 		query += `, sealed_at = COALESCE(sealed_at, UTC_TIMESTAMP(3))`
 	}
-	query += ` WHERE layer_id = ?`
-	args = append(args, layerID)
+	query += ` WHERE ` + s.scope.And(`layer_id = ?`)
+	args := append(setArgs, s.scope.Args(layerID)...)
 	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("set fs layer state %s: %w", layerID, err)
@@ -363,14 +373,13 @@ func (s *Store) SetFSLayerStateIf(ctx context.Context, layerID string, from []FS
 	if err := validateFSLayerState(to); err != nil {
 		return err
 	}
-	args := make([]any, 0, 2+len(from))
+	setArgs := []any{string(to)}
 	query := `UPDATE fs_layers SET state = ?, updated_at = UTC_TIMESTAMP(3)`
-	args = append(args, string(to))
 	if to == FSLayerStateSealed || to == FSLayerStateCommitting || to == FSLayerStateCommitted || to == FSLayerStateAbandoned || to == FSLayerStateConflicted {
 		query += `, sealed_at = COALESCE(sealed_at, UTC_TIMESTAMP(3))`
 	}
-	query += ` WHERE layer_id = ? AND state IN (`
-	args = append(args, layerID)
+	query += ` WHERE ` + s.scope.And(`layer_id = ? AND state IN (`)
+	whereArgs := []any{layerID}
 	for i, state := range from {
 		if err := validateFSLayerState(state); err != nil {
 			return err
@@ -379,9 +388,10 @@ func (s *Store) SetFSLayerStateIf(ctx context.Context, layerID string, from []FS
 			query += `, `
 		}
 		query += `?`
-		args = append(args, string(state))
+		whereArgs = append(whereArgs, string(state))
 	}
 	query += `)`
+	args := append(setArgs, s.scope.Args(whereArgs...)...)
 	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("set fs layer state %s: %w", layerID, err)
@@ -407,8 +417,9 @@ func (s *Store) BeginFSLayerCommit(ctx context.Context, layerID string) error {
 	res, err := s.db.ExecContext(ctx, `
 UPDATE fs_layers
 SET state = ?, sealed_at = COALESCE(sealed_at, UTC_TIMESTAMP(3)), updated_at = UTC_TIMESTAMP(3)
-WHERE layer_id = ? AND state IN (?, ?)`,
-		string(FSLayerStateCommitting), layerID, string(FSLayerStateActive), string(FSLayerStateSealed))
+WHERE `+s.scope.And(`layer_id = ? AND state IN (?, ?)`),
+		append([]any{string(FSLayerStateCommitting)},
+			s.scope.Args(layerID, string(FSLayerStateActive), string(FSLayerStateSealed))...)...)
 	if err != nil {
 		return fmt.Errorf("begin fs layer commit %s: %w", layerID, err)
 	}
@@ -443,9 +454,9 @@ func (s *Store) RollbackFSLayer(ctx context.Context, layerID string) error {
 	res, err := tx.ExecContext(ctx, `
 UPDATE fs_layers
 SET state = ?, updated_at = UTC_TIMESTAMP(3), sealed_at = COALESCE(sealed_at, UTC_TIMESTAMP(3))
-WHERE layer_id = ? AND state IN (?, ?, ?)`,
-		string(FSLayerStateAbandoned), layerID,
-		string(FSLayerStateActive), string(FSLayerStateSealed), string(FSLayerStateConflicted))
+WHERE `+s.scope.And(`layer_id = ? AND state IN (?, ?, ?)`),
+		append([]any{string(FSLayerStateAbandoned)},
+			s.scope.Args(layerID, string(FSLayerStateActive), string(FSLayerStateSealed), string(FSLayerStateConflicted))...)...)
 	if err != nil {
 		return fmt.Errorf("rollback fs layer %s: %w", layerID, err)
 	}
@@ -459,7 +470,7 @@ WHERE layer_id = ? AND state IN (?, ?, ?)`,
 		// already-abandoned case, return nil idempotently WITHOUT
 		// re-emitting the rollback event.
 		var state string
-		if err := tx.QueryRowContext(ctx, `SELECT state FROM fs_layers WHERE layer_id = ?`, layerID).Scan(&state); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM fs_layers WHERE `+s.scope.And(`layer_id = ?`), s.scope.Args(layerID)...).Scan(&state); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -478,7 +489,7 @@ WHERE layer_id = ? AND state IN (?, ?, ?)`,
 	// fs_layer_events.seq directly to stay monotonic and unique under
 	// uk_fs_layer_events_seq(layer_id, seq).
 	var maxSeq sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM fs_layer_events WHERE layer_id = ?`, layerID).Scan(&maxSeq); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM fs_layer_events WHERE `+s.scope.And(`layer_id = ?`), s.scope.Args(layerID)...).Scan(&maxSeq); err != nil {
 		return fmt.Errorf("read fs layer max event seq: %w", err)
 	}
 	seq := int64(1)
@@ -487,9 +498,9 @@ WHERE layer_id = ? AND state IN (?, ?, ?)`,
 	}
 	eventID := fmt.Sprintf("%s:rollback:%d", layerID, seq)
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO fs_layer_events (event_id, layer_id, seq, actor_id, op, path, created_at)
-VALUES (?, ?, ?, '', ?, '/', UTC_TIMESTAMP(3))`,
-		eventID, layerID, seq, fsLayerEventOpRollback); err != nil {
+INSERT INTO fs_layer_events (`+s.scope.InsCols(`event_id, layer_id, seq, actor_id, op, path, created_at`)+`)
+VALUES (`+s.scope.InsVals(`?, ?, ?, '', ?, '/', UTC_TIMESTAMP(3)`)+`)`,
+		s.scope.Args(eventID, layerID, seq, fsLayerEventOpRollback)...); err != nil {
 		return fmt.Errorf("insert fs layer rollback event %s: %w", layerID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -518,8 +529,8 @@ func (s *Store) ListFSLayerEntryLogAtSeq(ctx context.Context, layerID string, ma
 }
 
 func (s *Store) listFSLayerEntryLog(ctx context.Context, layerID string, maxSeq *int64) ([]FSLayerEntry, error) {
-	where := "WHERE layer_id = ?"
-	args := []any{layerID}
+	where := "WHERE " + s.scope.And("layer_id = ?")
+	args := s.scope.Args(layerID)
 	if maxSeq != nil {
 		where += " AND entry_seq <= ?"
 		args = append(args, *maxSeq)
@@ -565,7 +576,7 @@ func (s *Store) UpsertFSLayerEntry(ctx context.Context, entry *FSLayerEntry) err
 		baseRoot string
 		state    string
 	)
-	if err := tx.QueryRowContext(ctx, `SELECT base_root_path, state FROM fs_layers WHERE layer_id = ? FOR UPDATE`, entry.LayerID).Scan(&baseRoot, &state); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT base_root_path, state FROM fs_layers WHERE `+s.scope.And(`layer_id = ?`)+` FOR UPDATE`, s.scope.Args(entry.LayerID)...).Scan(&baseRoot, &state); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -579,7 +590,7 @@ func (s *Store) UpsertFSLayerEntry(ctx context.Context, entry *FSLayerEntry) err
 	}
 	if entry.EntrySeq <= 0 {
 		var seq sql.NullInt64
-		if err := tx.QueryRowContext(ctx, `SELECT MAX(entry_seq) FROM fs_layer_entries WHERE layer_id = ?`, entry.LayerID).Scan(&seq); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT MAX(entry_seq) FROM fs_layer_entries WHERE `+s.scope.And(`layer_id = ?`), s.scope.Args(entry.LayerID)...).Scan(&seq); err != nil {
 			return fmt.Errorf("read fs layer max seq: %w", err)
 		}
 		entry.EntrySeq = 1
@@ -589,24 +600,24 @@ func (s *Store) UpsertFSLayerEntry(ctx context.Context, entry *FSLayerEntry) err
 	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO fs_layer_entries (
-	layer_id, path, path_hash, parent_path, parent_path_hash, name, op, kind, base_inode_id, base_revision,
+	`+s.scope.InsCols(`layer_id, path, path_hash, parent_path, parent_path_hash, name, op, kind, base_inode_id, base_revision,
 	storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
-	content_blob, content_type, content_text, checksum_sha256, size_bytes, mode, entry_seq, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))`,
-		entry.LayerID, entry.Path, entry.PathHash, entry.ParentPath, entry.ParentPathHash, entry.Name,
-		string(entry.Op), string(entry.Kind), entry.BaseInodeID, entry.BaseRevision, entry.StorageType,
-		entry.StorageRef, entry.StorageRefHash, fileStorageEncryptionModeForWrite(entry.StorageEncryptionMode),
-		storageEncryptionKeyIDForWrite(entry.StorageEncryptionMode, entry.StorageEncryptionKeyID),
-		nilBytes(entry.ContentBlob), nullStr(entry.ContentType),
-		nullStr(entry.ContentText), entry.ChecksumSHA256, entry.SizeBytes, entry.Mode, entry.EntrySeq)
+	content_blob, content_type, content_text, checksum_sha256, size_bytes, mode, entry_seq, created_at, updated_at`)+`
+) VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)`)+`)`,
+		s.scope.Args(entry.LayerID, entry.Path, entry.PathHash, entry.ParentPath, entry.ParentPathHash, entry.Name,
+			string(entry.Op), string(entry.Kind), entry.BaseInodeID, entry.BaseRevision, entry.StorageType,
+			entry.StorageRef, entry.StorageRefHash, fileStorageEncryptionModeForWrite(entry.StorageEncryptionMode),
+			storageEncryptionKeyIDForWrite(entry.StorageEncryptionMode, entry.StorageEncryptionKeyID),
+			nilBytes(entry.ContentBlob), nullStr(entry.ContentType),
+			nullStr(entry.ContentText), entry.ChecksumSHA256, entry.SizeBytes, entry.Mode, entry.EntrySeq)...)
 	if err != nil {
 		return fmt.Errorf("upsert fs layer entry %s:%s: %w", entry.LayerID, entry.Path, err)
 	}
 	eventID := fmt.Sprintf("%s:%d", entry.LayerID, entry.EntrySeq)
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO fs_layer_events (event_id, layer_id, seq, actor_id, op, path, created_at)
-VALUES (?, ?, ?, '', ?, ?, UTC_TIMESTAMP(3))`,
-		eventID, entry.LayerID, entry.EntrySeq, string(entry.Op), entry.Path); err != nil {
+INSERT INTO fs_layer_events (`+s.scope.InsCols(`event_id, layer_id, seq, actor_id, op, path, created_at`)+`)
+VALUES (`+s.scope.InsVals(`?, ?, ?, '', ?, ?, UTC_TIMESTAMP(3)`)+`)`,
+		s.scope.Args(eventID, entry.LayerID, entry.EntrySeq, string(entry.Op), entry.Path)...); err != nil {
 		return fmt.Errorf("insert fs layer event %s:%s: %w", entry.LayerID, entry.Path, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -629,9 +640,9 @@ SELECT layer_id, path, path_hash, parent_path, parent_path_hash, name, op, kind,
 	storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
 	content_blob, content_type, content_text, checksum_sha256, size_bytes, mode, entry_seq, created_at, updated_at
 FROM fs_layer_entries
-WHERE layer_id = ? AND path_hash = ? AND path = ?
+WHERE `+s.scope.And(`layer_id = ? AND path_hash = ? AND path = ?`)+`
 ORDER BY entry_seq DESC
-LIMIT 1`, layerID, fsLayerPathHash(canonical), canonical)
+LIMIT 1`, s.scope.Args(layerID, fsLayerPathHash(canonical), canonical)...)
 	return scanFSLayerEntry(row)
 }
 
@@ -652,9 +663,9 @@ SELECT layer_id, path, path_hash, parent_path, parent_path_hash, name, op, kind,
 	storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
 	content_blob, content_type, content_text, checksum_sha256, size_bytes, mode, entry_seq, created_at, updated_at
 FROM fs_layer_entries
-WHERE layer_id = ? AND path_hash = ? AND path = ? AND entry_seq <= ?
+WHERE `+s.scope.And(`layer_id = ? AND path_hash = ? AND path = ? AND entry_seq <= ?`)+`
 ORDER BY entry_seq DESC
-LIMIT 1`, layerID, fsLayerPathHash(canonical), canonical, maxSeq)
+LIMIT 1`, s.scope.Args(layerID, fsLayerPathHash(canonical), canonical, maxSeq)...)
 	return scanFSLayerEntry(row)
 }
 
@@ -678,12 +689,16 @@ func (s *Store) listFSLayerEntriesLatest(ctx context.Context, layerID string, ma
 	if layerID == "" {
 		return nil, fmt.Errorf("fs layer id is required")
 	}
-	where := "WHERE layer_id = ?"
-	args := []any{layerID}
+	where := "WHERE " + s.scope.And("layer_id = ?")
+	args := s.scope.Args(layerID)
 	if maxSeq != nil {
 		where += " AND entry_seq <= ?"
 		args = append(args, *maxSeq)
 	}
+	// Both the derived latest table and the outer fs_layer_entries alias get
+	// an fs_id predicate in shared shape: the same (layer_id, path) pair can
+	// exist under another fs_id, and an unfiltered MAX(entry_seq) could then
+	// hide this tenant's newest entry.
 	query := `
 SELECT e.layer_id, e.path, e.path_hash, e.parent_path, e.parent_path_hash, e.name, e.op, e.kind, e.base_inode_id, e.base_revision,
 	e.storage_type, e.storage_ref, e.storage_ref_hash, e.storage_encryption_mode, e.storage_encryption_key_id,
@@ -695,9 +710,9 @@ JOIN (
 		` + where + `
 		GROUP BY layer_id, path_hash, path
 	) latest ON latest.layer_id = e.layer_id AND latest.path_hash = e.path_hash AND latest.path = e.path AND latest.entry_seq = e.entry_seq
-WHERE e.layer_id = ?
+WHERE ` + s.scope.AndAs("e", "e.layer_id = ?") + `
 ORDER BY e.entry_seq, e.path`
-	args = append(args, layerID)
+	args = append(args, s.scope.Args(layerID)...)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list fs layer entries: %w", err)
@@ -735,14 +750,14 @@ func (s *Store) CreateFSLayerCheckpoint(ctx context.Context, checkpoint *FSLayer
 	}
 	defer func() { _ = tx.Rollback() }()
 	var existingLayerID string
-	if err := tx.QueryRowContext(ctx, `SELECT layer_id FROM fs_layers WHERE layer_id = ? FOR UPDATE`, checkpoint.LayerID).Scan(&existingLayerID); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT layer_id FROM fs_layers WHERE `+s.scope.And(`layer_id = ?`)+` FOR UPDATE`, s.scope.Args(checkpoint.LayerID)...).Scan(&existingLayerID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		return fmt.Errorf("read fs layer %s: %w", checkpoint.LayerID, err)
 	}
 	var seq sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT MAX(entry_seq) FROM fs_layer_entries WHERE layer_id = ?`, checkpoint.LayerID).Scan(&seq); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(entry_seq) FROM fs_layer_entries WHERE `+s.scope.And(`layer_id = ?`), s.scope.Args(checkpoint.LayerID)...).Scan(&seq); err != nil {
 		return fmt.Errorf("read fs layer max seq: %w", err)
 	}
 	if seq.Valid {
@@ -751,15 +766,16 @@ func (s *Store) CreateFSLayerCheckpoint(ctx context.Context, checkpoint *FSLayer
 		checkpoint.DurableSeq = 0
 	}
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO fs_layer_checkpoints (checkpoint_id, layer_id, durable_seq, label, created_at)
-VALUES (?, ?, ?, ?, UTC_TIMESTAMP(3))`,
-		checkpoint.CheckpointID, checkpoint.LayerID, checkpoint.DurableSeq, checkpoint.Label)
+INSERT INTO fs_layer_checkpoints (`+s.scope.InsCols(`checkpoint_id, layer_id, durable_seq, label, created_at`)+`)
+VALUES (`+s.scope.InsVals(`?, ?, ?, ?, UTC_TIMESTAMP(3)`)+`)`,
+		s.scope.Args(checkpoint.CheckpointID, checkpoint.LayerID, checkpoint.DurableSeq, checkpoint.Label)...)
 	if err != nil {
 		return fmt.Errorf("create fs layer checkpoint %s: %w", checkpoint.CheckpointID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 UPDATE fs_layers SET durable_seq = GREATEST(durable_seq, ?), updated_at = UTC_TIMESTAMP(3)
-WHERE layer_id = ?`, checkpoint.DurableSeq, checkpoint.LayerID); err != nil {
+WHERE `+s.scope.And(`layer_id = ?`),
+		append([]any{checkpoint.DurableSeq}, s.scope.Args(checkpoint.LayerID)...)...); err != nil {
 		return fmt.Errorf("update fs layer durable seq %s: %w", checkpoint.LayerID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -776,7 +792,7 @@ func (s *Store) GetFSLayerCheckpoint(ctx context.Context, checkpointID string) (
 	row := s.db.QueryRowContext(ctx, `
 SELECT checkpoint_id, layer_id, durable_seq, label, created_at
 FROM fs_layer_checkpoints
-WHERE checkpoint_id = ?`, checkpointID)
+WHERE `+s.scope.And(`checkpoint_id = ?`), s.scope.Args(checkpointID)...)
 	return scanFSLayerCheckpoint(row)
 }
 
@@ -791,9 +807,9 @@ func (s *Store) ListFSLayerEvents(ctx context.Context, layerID string, since int
 	rows, err := s.db.QueryContext(ctx, `
 SELECT event_id, layer_id, seq, actor_id, op, path, created_at
 FROM fs_layer_events
-WHERE layer_id = ? AND seq > ?
+WHERE `+s.scope.And(`layer_id = ? AND seq > ?`)+`
 ORDER BY seq ASC
-LIMIT ?`, layerID, since, limit)
+LIMIT ?`, s.scope.Args(layerID, since, limit)...)
 	if err != nil {
 		return nil, fmt.Errorf("list fs layer events %s: %w", layerID, err)
 	}
@@ -844,8 +860,8 @@ func (s *Store) listFSLayersByName(ctx context.Context, name string) ([]FSLayer,
 	rows, err := s.db.QueryContext(ctx, `
 SELECT layer_id, base_root_path, name, state, durability_mode, actor_id, durable_seq, created_at, updated_at, sealed_at
 FROM fs_layers
-WHERE name = ?
-ORDER BY updated_at DESC, layer_id`, name)
+WHERE `+s.scope.And(`name = ?`)+`
+ORDER BY updated_at DESC, layer_id`, s.scope.Args(name)...)
 	if err != nil {
 		return nil, fmt.Errorf("list fs layers by name: %w", err)
 	}
@@ -853,13 +869,26 @@ ORDER BY updated_at DESC, layer_id`, name)
 	return s.scanFSLayersWithTags(ctx, rows, "list fs layers by name")
 }
 
+// fsLayerJoinArgs prepends the two fs_id bind arguments used when a query
+// filters both fs_layer join aliases in shared shape; standalone shape
+// leaves args unchanged.
+func (s *Store) fsLayerJoinArgs(args ...any) []any {
+	if s.scope.Shared() {
+		return append([]any{s.scope.FsID(), s.scope.FsID()}, args...)
+	}
+	return args
+}
+
 func (s *Store) listFSLayersByTag(ctx context.Context, key, value string, hasValue bool) ([]FSLayer, error) {
+	// The same layer_id can exist under two fs_ids in shared shape, so both
+	// join aliases get an fs_id predicate: one-sided filtering could join a
+	// tag row to another tenant's layer row (or duplicate the result rows).
 	query := `
 SELECT l.layer_id, l.base_root_path, l.name, l.state, l.durability_mode, l.actor_id, l.durable_seq, l.created_at, l.updated_at, l.sealed_at
 FROM fs_layers l
 JOIN fs_layer_tags t ON t.layer_id = l.layer_id
-WHERE t.tag_key = ?`
-	args := []any{key}
+WHERE ` + s.scope.AndAs("l", s.scope.AndAs("t", "t.tag_key = ?"))
+	args := s.fsLayerJoinArgs(key)
 	if hasValue {
 		query += ` AND t.tag_value = ?`
 		args = append(args, value)
@@ -905,13 +934,13 @@ func (s *Store) loadFSLayerTags(ctx context.Context, layer *FSLayer) error {
 }
 
 func (s *Store) replaceFSLayerTagsTx(ctx context.Context, tx *sql.Tx, layerID string, tags map[string]string) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM fs_layer_tags WHERE layer_id = ?`, layerID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM fs_layer_tags WHERE `+s.scope.And(`layer_id = ?`), s.scope.Args(layerID)...); err != nil {
 		return fmt.Errorf("delete fs layer tags %s: %w", layerID, err)
 	}
 	for key, value := range tags {
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO fs_layer_tags (layer_id, tag_key, tag_value, created_at)
-VALUES (?, ?, ?, UTC_TIMESTAMP(3))`, layerID, key, value); err != nil {
+INSERT INTO fs_layer_tags (`+s.scope.InsCols(`layer_id, tag_key, tag_value, created_at`)+`)
+VALUES (`+s.scope.InsVals(`?, ?, ?, UTC_TIMESTAMP(3)`)+`)`, s.scope.Args(layerID, key, value)...); err != nil {
 			return fmt.Errorf("insert fs layer tag %s:%s: %w", layerID, key, err)
 		}
 	}

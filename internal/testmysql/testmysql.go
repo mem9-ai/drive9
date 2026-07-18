@@ -114,6 +114,7 @@ func ResetMetaDB(t *testing.T, db *sql.DB) {
 		"DELETE FROM tenant_external_bindings",
 		"DELETE FROM tenant_tidbcloud_org_bindings",
 		"DELETE FROM tenant_tidbcloud_pools",
+		"DELETE FROM fs_registry",
 		"DELETE FROM tenants",
 	}
 	for _, q := range queries {

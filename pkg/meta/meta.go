@@ -548,6 +548,11 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_tenant_namespace (storage_namespace_id, kind, status),
 			INDEX idx_tenant_parent (parent_tenant_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS fs_registry (
+			fs_id      BIGINT AUTO_INCREMENT PRIMARY KEY,
+			tenant_id  VARCHAR(64) NOT NULL UNIQUE,
+			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_auto_embedding_profiles (
 			tenant_id      VARCHAR(64) PRIMARY KEY,
 			embedding_mode VARCHAR(32) NULL,
@@ -1466,19 +1471,29 @@ func schemaSnippet(stmt string) string {
 func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "insert_tenant", start, &err)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO tenants
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO tenants
 		(id, status, kind, parent_tenant_id, storage_namespace_id, db_host, db_port, db_user, db_password, db_name, db_tls,
 		 provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
 		 s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Status, tenantKindForInsert(t), t.ParentTenantID, t.StorageNamespaceID,
-		t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
-		t.Provider, nullStr(t.ClusterID), t.BranchID, nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
-		tenantS3EncryptionModeForInsert(t), t.S3KMSKeyID, boolToInt(tenantS3BucketKeyEnabledForInsert(t)),
-		t.CreatedAt.UTC(), t.UpdatedAt.UTC())
-	if isDuplicateEntry(err) {
-		return ErrDuplicate
-	}
+			t.ID, t.Status, tenantKindForInsert(t), t.ParentTenantID, t.StorageNamespaceID,
+			t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
+			t.Provider, nullStr(t.ClusterID), t.BranchID, nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
+			tenantS3EncryptionModeForInsert(t), t.S3KMSKeyID, boolToInt(tenantS3BucketKeyEnabledForInsert(t)),
+			t.CreatedAt.UTC(), t.UpdatedAt.UTC())
+		if isDuplicateEntry(err) {
+			return ErrDuplicate
+		}
+		if err != nil {
+			return err
+		}
+		// Every tenant gets a stable internal fs_id at creation time (see
+		// fs_registry). INSERT IGNORE keeps this idempotent for tenants that
+		// were pre-registered by BackfillFsRegistry.
+		_, err = tx.ExecContext(ctx, `INSERT IGNORE INTO fs_registry (tenant_id) VALUES (?)`, t.ID)
+		return err
+	})
 	return err
 }
 

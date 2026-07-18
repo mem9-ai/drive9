@@ -74,9 +74,35 @@ func subtreeCond(prefix string) (string, []any) {
 	return "(fn.path = ? OR fn.path LIKE ?)", []any{prefix, prefix + "/%"}
 }
 
+// scopeWhereAnd prefixes a WHERE predicate with one fs_id predicate per JOIN
+// alias in shared shape and returns it unchanged in standalone shape. Every
+// joined alias is filtered, not just the driving table: entity ids are
+// globally unique ULIDs in production, but if ids ever collide the bare
+// id-only join conditions would otherwise fan out across tenants and leak
+// rows sideways.
+func scopeWhereAnd(scope Scope, pred string, aliases ...string) string {
+	for i := len(aliases) - 1; i >= 0; i-- {
+		pred = scope.AndAs(aliases[i], pred)
+	}
+	return pred
+}
+
+// scopeWhereArgs prepends one fs_id bind argument per alias, matching the
+// predicate order produced by scopeWhereAnd.
+func scopeWhereArgs(scope Scope, aliases int, args ...any) []any {
+	if !scope.Shared() {
+		return args
+	}
+	out := make([]any, 0, aliases+len(args))
+	for i := 0; i < aliases; i++ {
+		out = append(out, scope.FsID())
+	}
+	return append(out, args...)
+}
+
 // VectorSearch runs a vector similarity search for the supplied embedding.
 func (s *Store) VectorSearch(ctx context.Context, queryEmbedding []float32, pathPrefix string, limit int) ([]SearchResult, error) {
-	q, args, ok := buildVectorSearchQuery(queryEmbedding, pathPrefix, limit)
+	q, args, ok := buildVectorSearchQueryScoped(s.scope, queryEmbedding, pathPrefix, limit)
 	if !ok {
 		return nil, nil
 	}
@@ -85,7 +111,7 @@ func (s *Store) VectorSearch(ctx context.Context, queryEmbedding []float32, path
 
 // VectorSearchByText runs a TiDB-side text-query vector similarity search.
 func (s *Store) VectorSearchByText(ctx context.Context, queryText, pathPrefix string, limit int) ([]SearchResult, error) {
-	q, args, ok := buildVectorSearchByTextQuery(queryText, pathPrefix, limit)
+	q, args, ok := buildVectorSearchByTextQueryScoped(s.scope, queryText, pathPrefix, limit)
 	if !ok {
 		return nil, nil
 	}
@@ -120,6 +146,13 @@ func (s *Store) runVectorSearch(ctx context.Context, q string, args []any) ([]Se
 }
 
 func buildVectorSearchQuery(queryEmbedding []float32, pathPrefix string, limit int) (string, []any, bool) {
+	return buildVectorSearchQueryScoped(StandaloneScope(0), queryEmbedding, pathPrefix, limit)
+}
+
+// buildVectorSearchQueryScoped builds the vector search query for the given
+// schema-shape scope. In shared shape every joined alias carries an fs_id
+// predicate (see scopeWhereAnd).
+func buildVectorSearchQueryScoped(scope Scope, queryEmbedding []float32, pathPrefix string, limit int) (string, []any, bool) {
 	if len(queryEmbedding) == 0 {
 		return "", nil, false
 	}
@@ -127,40 +160,50 @@ func buildVectorSearchQuery(queryEmbedding []float32, pathPrefix string, limit i
 	vecParam := embedding.FormatVector(queryEmbedding)
 	args := []any{vecParam}
 
+	var condArgs []any
 	if pathPrefix != "" && pathPrefix != "/" {
 		cond, pargs := subtreeCond(pathPrefix)
 		conds = append(conds, cond)
-		args = append(args, pargs...)
+		condArgs = append(condArgs, pargs...)
 	}
+	// The fs_id predicates lead the WHERE clause in shared shape, so their
+	// bind arguments go right after the SELECT-list distance placeholder.
+	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, vecParam, limit)
 
 	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.embedding, ?) AS distance
 		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE ` + strings.Join(conds, " AND ") + `
+		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY VEC_EMBED_COSINE_DISTANCE(s.embedding, ?)
 	LIMIT ?`
 	return q, args, true
 }
 
 func buildVectorSearchByTextQuery(queryText, pathPrefix string, limit int) (string, []any, bool) {
+	return buildVectorSearchByTextQueryScoped(StandaloneScope(0), queryText, pathPrefix, limit)
+}
+
+func buildVectorSearchByTextQueryScoped(scope Scope, queryText, pathPrefix string, limit int) (string, []any, bool) {
 	if strings.TrimSpace(queryText) == "" {
 		return "", nil, false
 	}
 	conds := []string{"i.status = 'CONFIRMED'", "s.embedding IS NOT NULL"}
 	args := []any{queryText}
 
+	var condArgs []any
 	if pathPrefix != "" && pathPrefix != "/" {
 		cond, pargs := subtreeCond(pathPrefix)
 		conds = append(conds, cond)
-		args = append(args, pargs...)
+		condArgs = append(condArgs, pargs...)
 	}
+	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, limit)
 
 	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.embedding, ?) AS distance
 		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE ` + strings.Join(conds, " AND ") + `
+		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY distance
 		LIMIT ?`
 	return q, args, true
@@ -168,7 +211,7 @@ func buildVectorSearchByTextQuery(queryText, pathPrefix string, limit int) (stri
 
 // VectorSearchDescription runs a vector similarity search over files.description_embedding.
 func (s *Store) VectorSearchDescription(ctx context.Context, queryEmbedding []float32, pathPrefix string, limit int) ([]SearchResult, error) {
-	q, args, ok := buildVectorSearchDescriptionQuery(queryEmbedding, pathPrefix, limit)
+	q, args, ok := buildVectorSearchDescriptionQueryScoped(s.scope, queryEmbedding, pathPrefix, limit)
 	if !ok {
 		return nil, nil
 	}
@@ -178,14 +221,14 @@ func (s *Store) VectorSearchDescription(ctx context.Context, queryEmbedding []fl
 // VectorSearchDescriptionByText runs a TiDB-side text-query vector similarity search
 // over files.description_embedding.
 func (s *Store) VectorSearchDescriptionByText(ctx context.Context, queryText, pathPrefix string, limit int) ([]SearchResult, error) {
-	q, args, ok := buildVectorSearchDescriptionByTextQuery(queryText, pathPrefix, limit)
+	q, args, ok := buildVectorSearchDescriptionByTextQueryScoped(s.scope, queryText, pathPrefix, limit)
 	if !ok {
 		return nil, nil
 	}
 	return s.runVectorSearch(ctx, q, args)
 }
 
-func buildVectorSearchDescriptionQuery(queryEmbedding []float32, pathPrefix string, limit int) (string, []any, bool) {
+func buildVectorSearchDescriptionQueryScoped(scope Scope, queryEmbedding []float32, pathPrefix string, limit int) (string, []any, bool) {
 	if len(queryEmbedding) == 0 {
 		return "", nil, false
 	}
@@ -193,23 +236,25 @@ func buildVectorSearchDescriptionQuery(queryEmbedding []float32, pathPrefix stri
 	vecParam := embedding.FormatVector(queryEmbedding)
 	args := []any{vecParam}
 
+	var condArgs []any
 	if pathPrefix != "" && pathPrefix != "/" {
 		cond, pargs := subtreeCond(pathPrefix)
 		conds = append(conds, cond)
-		args = append(args, pargs...)
+		condArgs = append(condArgs, pargs...)
 	}
+	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, vecParam, limit)
 
 	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?) AS distance
 		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE ` + strings.Join(conds, " AND ") + `
+		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?)
 	LIMIT ?`
 	return q, args, true
 }
 
-func buildVectorSearchDescriptionByTextQuery(queryText, pathPrefix string, limit int) (string, []any, bool) {
+func buildVectorSearchDescriptionByTextQueryScoped(scope Scope, queryText, pathPrefix string, limit int) (string, []any, bool) {
 	if strings.TrimSpace(queryText) == "" {
 		return "", nil, false
 	}
@@ -218,19 +263,21 @@ func buildVectorSearchDescriptionByTextQuery(queryText, pathPrefix string, limit
 	conds := []string{"i.status = 'CONFIRMED'", "s.description_embedding IS NOT NULL"}
 	args := []any{queryText}
 
+	var condArgs []any
 	if pathPrefix != "" && pathPrefix != "/" {
 		cond, pargs := subtreeCond(pathPrefix)
 		conds = append(conds, cond)
-		args = append(args, pargs...)
+		condArgs = append(condArgs, pargs...)
 	}
+	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, limit)
 
 	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?) AS distance
 		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE ` + strings.Join(conds, " AND ") + `
+		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY distance
-	LIMIT ?`
+		LIMIT ?`
 	return q, args, true
 }
 
@@ -247,40 +294,7 @@ func ftsSafe(s string) string {
 
 // FTSSearch runs a full-text search over files.content_text and files.description.
 func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
-	safe := ftsSafe(query)
-
-	var args []any
-	args = append(args, limit)
-
-	contentExpr := "fts_match_word('" + safe + "', content_text)"
-	descExpr := "fts_match_word('" + safe + "', description)"
-
-	innerQ := `SELECT inode_id, MAX(score) AS score FROM (
-		SELECT inode_id, ` + contentExpr + ` AS score
-		FROM semantic WHERE ` + contentExpr + `
-		UNION ALL
-		SELECT inode_id, ` + descExpr + ` AS score
-		FROM semantic WHERE ` + descExpr + `
-	) fts GROUP BY inode_id ORDER BY score DESC LIMIT ?`
-
-	var outerConds []string
-	var outerArgs []any
-	if pathPrefix != "" && pathPrefix != "/" {
-		cond, pargs := subtreeCond(pathPrefix)
-		outerConds = append(outerConds, cond)
-		outerArgs = append(outerArgs, pargs...)
-	}
-
-	outerConds = append([]string{"i.status = 'CONFIRMED'"}, outerConds...)
-	q := `SELECT fn.path, fn.name, i.size_bytes, fts.score
-		FROM (` + innerQ + `) fts
-		JOIN file_nodes fn ON COALESCE(fn.inode_id, fn.file_id) = fts.inode_id
-		JOIN inodes i ON i.inode_id = fts.inode_id`
-	if len(outerConds) > 0 {
-		q += ` WHERE ` + strings.Join(outerConds, " AND ")
-	}
-
-	allArgs := append(args, outerArgs...)
+	q, allArgs := buildFTSSearchQuery(s.scope, ftsSafe(query), pathPrefix, limit)
 	rows, err := s.db.QueryContext(ctx, q, allArgs...)
 	if err != nil {
 		return nil, err
@@ -303,6 +317,47 @@ func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit i
 	return out, nil
 }
 
+// buildFTSSearchQuery assembles the full-text search query for the given
+// schema-shape scope. safeQuery must already be escaped with ftsSafe.
+func buildFTSSearchQuery(scope Scope, safeQuery, pathPrefix string, limit int) (string, []any) {
+	contentExpr := "fts_match_word('" + safeQuery + "', content_text)"
+	descExpr := "fts_match_word('" + safeQuery + "', description)"
+
+	// In shared shape the fs_id predicate must live inside each UNION branch
+	// (before the GROUP BY/LIMIT aggregation), otherwise other tenants' rows
+	// compete for the shared LIMIT and dilute per-tenant recall.
+	innerQ := `SELECT inode_id, MAX(score) AS score FROM (
+		SELECT inode_id, ` + contentExpr + ` AS score
+		FROM semantic WHERE ` + scope.And(contentExpr) + `
+		UNION ALL
+		SELECT inode_id, ` + descExpr + ` AS score
+		FROM semantic WHERE ` + scope.And(descExpr) + `
+	) fts GROUP BY inode_id ORDER BY score DESC LIMIT ?`
+
+	args := append(scope.Args(), scope.Args()...)
+	args = append(args, limit)
+
+	var outerConds []string
+	var outerArgs []any
+	if pathPrefix != "" && pathPrefix != "/" {
+		cond, pargs := subtreeCond(pathPrefix)
+		outerConds = append(outerConds, cond)
+		outerArgs = append(outerArgs, pargs...)
+	}
+
+	outerConds = append([]string{"i.status = 'CONFIRMED'"}, outerConds...)
+	q := `SELECT fn.path, fn.name, i.size_bytes, fts.score
+		FROM (` + innerQ + `) fts
+		JOIN file_nodes fn ON COALESCE(fn.inode_id, fn.file_id) = fts.inode_id
+		JOIN inodes i ON i.inode_id = fts.inode_id`
+	if len(outerConds) > 0 {
+		q += ` WHERE ` + scopeWhereAnd(scope, strings.Join(outerConds, " AND "), "fn", "i")
+		outerArgs = scopeWhereArgs(scope, 2, outerArgs...)
+	}
+
+	return q, append(args, outerArgs...)
+}
+
 // KeywordSearch runs a LIKE-based fallback search when semantic ranking is unavailable.
 func (s *Store) KeywordSearch(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
 	conds := []string{"i.status = 'CONFIRMED'", "s.content_text LIKE CONCAT('%', ?, '%')"}
@@ -317,10 +372,10 @@ func (s *Store) KeywordSearch(ctx context.Context, query, pathPrefix string, lim
 
 	q := `SELECT fn.path, fn.name, i.size_bytes
 		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE ` + strings.Join(conds, " AND ") + `
+		WHERE ` + scopeWhereAnd(s.scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY i.confirmed_at DESC LIMIT ?`
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.db.QueryContext(ctx, q, scopeWhereArgs(s.scope, 3, args...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -357,11 +412,11 @@ func (s *Store) Find(ctx context.Context, f *FindFilter) ([]SearchResult, error)
 	}
 	if f.TagKey != "" {
 		if f.TagValue != "" {
-			conds = append(conds, `EXISTS (SELECT 1 FROM file_tags t WHERE t.file_id = i.inode_id AND t.tag_key = ? AND t.tag_value = ?)`)
-			args = append(args, f.TagKey, f.TagValue)
+			conds = append(conds, `EXISTS (SELECT 1 FROM file_tags t WHERE `+s.scope.AndAs("t", `t.file_id = i.inode_id AND t.tag_key = ? AND t.tag_value = ?`)+`)`)
+			args = append(args, s.scope.Args(f.TagKey, f.TagValue)...)
 		} else {
-			conds = append(conds, `EXISTS (SELECT 1 FROM file_tags t WHERE t.file_id = i.inode_id AND t.tag_key = ?)`)
-			args = append(args, f.TagKey)
+			conds = append(conds, `EXISTS (SELECT 1 FROM file_tags t WHERE `+s.scope.AndAs("t", `t.file_id = i.inode_id AND t.tag_key = ?`)+`)`)
+			args = append(args, s.scope.Args(f.TagKey)...)
 		}
 	}
 	if f.After != nil {
@@ -384,10 +439,10 @@ func (s *Store) Find(ctx context.Context, f *FindFilter) ([]SearchResult, error)
 
 	q := `SELECT fn.path, fn.name, i.size_bytes
 		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id
-		WHERE ` + strings.Join(conds, " AND ") + `
+		WHERE ` + scopeWhereAnd(s.scope, strings.Join(conds, " AND "), "fn", "i") + `
 		ORDER BY fn.path LIMIT ?`
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.db.QueryContext(ctx, q, scopeWhereArgs(s.scope, 2, args...)...)
 	if err != nil {
 		return nil, err
 	}

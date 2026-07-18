@@ -98,6 +98,120 @@ func GitWorkspaceTiDBSchemaStatements() []string {
 	}
 }
 
+// GitWorkspaceTiDBSharedSchemaStatements returns the git workspace DDL for the
+// shared (multi-tenant) schema shape on TiDB (docs/TENANT_DB_REDESIGN.md
+// §5.2.3): the same tables as GitWorkspaceTiDBSchemaStatements, but every
+// table gains an fs_id BIGINT discriminator as its first column and every
+// primary key, unique key, and index is prefixed with fs_id so one tenant's
+// rows stay physically co-located. Composite primary keys are declared
+// CLUSTERED — TiDB creates them NONCLUSTERED by default. The standalone
+// repair-style ALTER TABLE ... ADD COLUMN statements are folded into the
+// CREATE TABLE here: shared schemas are created fresh, so there is nothing to
+// repair. For plain MySQL use GitWorkspaceMySQLSharedSchemaStatements (same
+// shape without the keyword). Keep both in lockstep with
+// GitWorkspaceTiDBSchemaStatements — the drift test in git_shared_test.go
+// enforces parity.
+func GitWorkspaceTiDBSharedSchemaStatements() []string {
+	return []string{
+		`CREATE TABLE IF NOT EXISTS git_workspaces (
+			fs_id BIGINT NOT NULL,
+			workspace_id VARCHAR(64) NOT NULL,
+			root_path    VARCHAR(512) NOT NULL,
+			repo_url     TEXT NOT NULL,
+			remote_name  VARCHAR(128) NOT NULL DEFAULT 'origin',
+			branch_name  VARCHAR(255) NOT NULL DEFAULT '',
+			base_commit  VARCHAR(64) NOT NULL DEFAULT '',
+			head_commit  VARCHAR(64) NOT NULL DEFAULT '',
+			mode         VARCHAR(32) NOT NULL DEFAULT 'fast',
+			workspace_kind VARCHAR(16) NOT NULL DEFAULT 'main',
+			common_workspace_id VARCHAR(64) NOT NULL DEFAULT '',
+			worktree_name VARCHAR(255) NOT NULL DEFAULT '',
+			gitdir_rel VARCHAR(1024) NOT NULL DEFAULT '',
+			status       VARCHAR(32) NOT NULL DEFAULT 'active',
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (fs_id, workspace_id) CLUSTERED,
+			UNIQUE KEY uk_git_workspaces_root (fs_id, root_path),
+			KEY idx_git_workspaces_status (fs_id, status, updated_at),
+			KEY idx_git_workspaces_common (fs_id, common_workspace_id, status)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS git_workspace_tree_nodes (
+			fs_id BIGINT NOT NULL,
+			workspace_id VARCHAR(64) NOT NULL,
+			commit_sha   VARCHAR(64) NOT NULL,
+			path         VARCHAR(1024) NOT NULL,
+			path_hash    VARCHAR(64) NOT NULL,
+			parent_path  VARCHAR(1024) NOT NULL DEFAULT '',
+			parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
+			name         VARCHAR(255) NOT NULL,
+			kind         VARCHAR(16) NOT NULL,
+			mode         VARCHAR(16) NOT NULL,
+			object_sha   VARCHAR(64) NOT NULL DEFAULT '',
+			size_bytes   BIGINT NOT NULL DEFAULT -1,
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (fs_id, workspace_id, commit_sha, path_hash) CLUSTERED,
+			KEY idx_git_tree_parent (fs_id, workspace_id, commit_sha, parent_path_hash)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS git_workspace_git_state (
+			fs_id BIGINT NOT NULL,
+			workspace_id      VARCHAR(64) NOT NULL,
+			checkpoint_commit VARCHAR(64) NOT NULL DEFAULT '',
+			storage_type      VARCHAR(32) NOT NULL DEFAULT '',
+			storage_ref       TEXT NOT NULL,
+			storage_ref_hash  VARCHAR(64) NOT NULL DEFAULT '',
+			checksum_sha256   VARCHAR(128) NOT NULL DEFAULT '',
+			size_bytes        BIGINT NOT NULL DEFAULT 0,
+			content_blob      LONGBLOB,
+			created_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (fs_id, workspace_id) CLUSTERED,
+			KEY idx_git_state_ref_hash (fs_id, storage_ref_hash)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS git_workspace_object_packs (
+			fs_id BIGINT NOT NULL,
+			workspace_id    VARCHAR(64) NOT NULL,
+			pack_id         VARCHAR(64) NOT NULL,
+			checksum_sha256 VARCHAR(128) NOT NULL DEFAULT '',
+			size_bytes      BIGINT NOT NULL DEFAULT 0,
+			content_blob    LONGBLOB,
+			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (fs_id, workspace_id, pack_id) CLUSTERED,
+			KEY idx_git_object_packs_created (fs_id, workspace_id, created_at)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS git_workspace_overlay (
+			fs_id BIGINT NOT NULL,
+			workspace_id    VARCHAR(64) NOT NULL,
+			path            VARCHAR(1024) NOT NULL,
+			path_hash       VARCHAR(64) NOT NULL,
+			op              VARCHAR(16) NOT NULL,
+			kind            VARCHAR(16) NOT NULL DEFAULT 'file',
+			mode            VARCHAR(16) NOT NULL DEFAULT '',
+			storage_type    VARCHAR(32) NOT NULL DEFAULT '',
+			storage_ref     TEXT NOT NULL,
+			storage_ref_hash VARCHAR(64) NOT NULL DEFAULT '',
+			checksum_sha256 VARCHAR(128) NOT NULL DEFAULT '',
+			size_bytes      BIGINT NOT NULL DEFAULT 0,
+			base_object_sha VARCHAR(64) NOT NULL DEFAULT '',
+			content_blob    LONGBLOB,
+			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (fs_id, workspace_id, path_hash) CLUSTERED,
+			KEY idx_git_overlay_op (fs_id, workspace_id, op)
+		)`,
+	}
+}
+
+// GitWorkspaceMySQLSharedSchemaStatements is the plain-MySQL variant of
+// GitWorkspaceTiDBSharedSchemaStatements, derived by removing TiDB-only
+// keywords. Use it for local development databases and MySQL-backed tests/e2e.
+func GitWorkspaceMySQLSharedSchemaStatements() []string {
+	return mysqlCompatibleSharedStatements(GitWorkspaceTiDBSharedSchemaStatements())
+}
+
 // GitWorkspaceDB9SchemaStatements is the PostgreSQL/db9 equivalent of
 // GitWorkspaceTiDBSchemaStatements.
 func GitWorkspaceDB9SchemaStatements() []string {
