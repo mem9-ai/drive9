@@ -404,7 +404,7 @@ func TestBatchProvisionFreeClustersUsesBatchCreateAndFreeLabel(t *testing.T) {
 	}
 }
 
-func TestBatchProvisionFreeClustersReturnsCreatedClustersWithoutMetadataWait(t *testing.T) {
+func TestBatchProvisionFreeClustersDefersIncompletePublicHostWithoutMetadataWait(t *testing.T) {
 	var listCalls atomic.Int32
 	handlerErrs := make(chan error, 2)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -470,8 +470,69 @@ func TestBatchProvisionFreeClustersReturnsCreatedClustersWithoutMetadataWait(t *
 	if out[0].Password == "" || out[1].Password == "" {
 		t.Fatalf("clusters did not preserve generated passwords: %#v", out)
 	}
-	if out[1].Host != "" || out[1].Port != 0 {
-		t.Fatalf("incomplete cluster connection = %#v, want no endpoint", out[1])
+	if out[1].Host != "" || out[1].Port != 0 || out[1].Username != "" {
+		t.Fatalf("incomplete cluster connection = %#v, want seed without endpoint", out[1])
+	}
+}
+
+func TestBatchProvisionFreeClustersDefersPrivateEndpointPublicHostWithoutMappingError(t *testing.T) {
+	var listCalls atomic.Int32
+	handlerErrs := make(chan error, 2)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1beta1/clusters:batchCreate":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusters": []map[string]any{
+					{
+						"clusterId":  "cluster-1",
+						"state":      "ACTIVE",
+						"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1", Drive9TenantIDLabel: "tenant-1"},
+						"userPrefix": "u1",
+						"endpoints":  map[string]any{"private": map[string]any{"port": 4001}},
+					},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters":
+			listCalls.Add(1)
+			handlerErrs <- fmt.Errorf("unexpected metadata wait request %q", r.URL.String())
+			http.Error(w, "unexpected metadata wait", http.StatusInternalServerError)
+		default:
+			handlerErrs <- fmt.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:                 ts.URL,
+		cloudProvider:          "aws",
+		region:                 "us-east-1",
+		defaultDatabaseName:    DefaultDatabaseName,
+		usePrivateEndpoint:     true,
+		privateEndpointHostMap: map[string]string{"public-a.example": "private-a.internal"},
+		client:                 ts.Client(),
+	}
+	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(context.Background(), []string{"tenant-1"}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{})
+	if err != nil {
+		t.Fatalf("BatchProvisionFreeClustersWithCredentialsAndQuota: %v", err)
+	}
+	assertNoHandlerError(t, handlerErrs)
+	if listCalls.Load() != 0 {
+		t.Fatalf("metadata list calls = %d, want 0", listCalls.Load())
+	}
+	if len(out) != 1 || out[0].TenantID != "tenant-1" || out[0].ClusterID != "cluster-1" {
+		t.Fatalf("clusters = %#v", out)
+	}
+	if out[0].Host != "" || out[0].Port != 0 || out[0].Username != "" {
+		t.Fatalf("incomplete cluster connection = %#v, want seed without endpoint", out[0])
 	}
 }
 
