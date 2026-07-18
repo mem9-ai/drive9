@@ -152,6 +152,7 @@ type Dat9Backend struct {
 	videoExtractMaxSize          int64
 	maxVideoExtractTextBytes     int
 	videoExtractTenantAllowlist  map[string]struct{} // nil or empty = no tenant (fail-closed)
+	maxVideoLLMFiles            int64               // per-tenant video file quota
 
 	runtimeMetricsID uint64
 

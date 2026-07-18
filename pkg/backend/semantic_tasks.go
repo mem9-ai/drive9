@@ -84,11 +84,15 @@ func (b *Dat9Backend) enqueueExtractSemanticTasksTx(ctx context.Context, tx *sql
 		enqueued = enqueued || created
 	}
 	if isVideo {
-		created, err := b.enqueueVideoExtractTaskTx(tx, fileID, revision, path, contentType)
-		if err != nil {
-			return enqueued, err
+		if b.videoLLMQuotaExceededTx(tx) {
+			metrics.RecordTenantOperation(b.tenantID, "video_llm_budget", "enqueue_skip", "quota_exceeded", 0)
+		} else {
+			created, err := b.enqueueVideoExtractTaskTx(tx, fileID, revision, path, contentType)
+			if err != nil {
+				return enqueued, err
+			}
+			enqueued = enqueued || created
 		}
-		enqueued = enqueued || created
 	}
 	return enqueued, nil
 }

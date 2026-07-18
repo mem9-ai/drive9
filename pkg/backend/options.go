@@ -28,6 +28,7 @@ const (
 	defaultMaxUploadBytes             = int64(10 * (1 << 30)) // 10 GiB
 	defaultMaxTenantStorageBytes      = int64(50 * (1 << 30)) // 50 GiB
 	defaultMaxMediaLLMFiles           = int64(500)            // 500 media files per tenant
+	defaultMaxVideoLLMFiles           = int64(50)             // 50 video files per tenant
 	// defaultMaxMonthlyLLMCostMillicents is the per-tenant monthly LLM spend
 	// cap applied when no explicit budget is configured. $10.00 USD, expressed
 	// in millicents (0.001 cents; $10 = 1000 cents = 1_000_000 millicents).
@@ -165,6 +166,7 @@ type AsyncVideoExtractOptions struct {
 	Enabled             bool
 	AllTenants          bool // true when allowlist is "*"
 	MaxVideoBytes       int64
+	MaxVideoLLMFiles    int64 // per-tenant video file quota (default 50)
 	TaskTimeout         time.Duration
 	MaxExtractTextBytes int
 	Extractor           VideoTextExtractor
@@ -357,6 +359,11 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 		b.videoExtractMaxSize = v.MaxVideoBytes
 		b.maxVideoExtractTextBytes = v.MaxExtractTextBytes
 		b.videoExtractTenantAllowlist = v.TenantAllowlist
+		if v.MaxVideoLLMFiles > 0 {
+			b.maxVideoLLMFiles = v.MaxVideoLLMFiles
+		} else {
+			b.maxVideoLLMFiles = defaultMaxVideoLLMFiles
+		}
 		logger.Info(backgroundWithTrace(), "backend_video_extract_runtime_configured",
 			zap.Duration("task_timeout", v.TaskTimeout),
 			zap.Int64("max_video_bytes", v.MaxVideoBytes),

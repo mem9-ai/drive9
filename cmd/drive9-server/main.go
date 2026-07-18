@@ -946,6 +946,7 @@ func buildVideoExtractOptionsFromEnv() (backend.AsyncVideoExtractOptions, error)
 		Enabled:             true,
 		AllTenants:          allTenants,
 		MaxVideoBytes:       envInt64("DRIVE9_VIDEO_EXTRACT_MAX_BYTES", 200<<20),
+		MaxVideoLLMFiles:    envInt64("DRIVE9_VIDEO_EXTRACT_MAX_FILES", 50),
 		TaskTimeout:         videoTimeout,
 		MaxExtractTextBytes: envInt("DRIVE9_VIDEO_EXTRACT_MAX_TEXT_BYTES", 32<<10),
 		Extractor:           extractor,
