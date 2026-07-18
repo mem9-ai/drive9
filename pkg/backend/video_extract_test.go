@@ -269,6 +269,20 @@ func TestVideoExtractTenantAllowlist(t *testing.T) {
 	if none.shouldEnqueueVideoExtractTask("/x.mp4", "video/mp4") {
 		t.Fatal("empty allowlist should deny all tenants")
 	}
+
+	// AllTenants ("*") — any tenant allowed.
+	wildcard := newTestBackendWithOptions(t, Options{
+		TenantID:              "tenant-any",
+		DatabaseAutoEmbedding: true,
+		AsyncVideoExtract: AsyncVideoExtractOptions{
+			Enabled:    true,
+			AllTenants: true,
+			Extractor:  &staticVideoExtractor{text: "test"},
+		},
+	})
+	if !wildcard.shouldEnqueueVideoExtractTask("/x.mp4", "video/mp4") {
+		t.Fatal("AllTenants=true should allow any tenant")
+	}
 }
 
 func TestMP4VideoExcludesAudioEnqueue(t *testing.T) {

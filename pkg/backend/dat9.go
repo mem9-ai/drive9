@@ -146,6 +146,7 @@ type Dat9Backend struct {
 
 	// Durable video visual extraction (semantic_tasks only; no local queue).
 	videoExtractEnabled          bool
+	videoExtractAllTenants       bool                // "*" allowlist
 	videoExtractor               VideoTextExtractor
 	videoExtractTimeout          time.Duration
 	videoExtractMaxSize          int64

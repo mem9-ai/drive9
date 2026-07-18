@@ -104,10 +104,11 @@ func (b *Dat9Backend) shouldEnqueueVideoExtractTask(path, contentType string) bo
 	if !b.SupportsAsyncVideoExtract() {
 		return false
 	}
-	// Fail-closed: only tenants explicitly listed in the allowlist may
-	// enqueue video extraction tasks. nil or empty = no tenant allowed.
-	if _, ok := b.videoExtractTenantAllowlist[b.tenantID]; !ok {
-		return false
+	// Tenant check: "*" allows all; otherwise only explicitly listed tenants.
+	if !b.videoExtractAllTenants {
+		if _, ok := b.videoExtractTenantAllowlist[b.tenantID]; !ok {
+			return false
+		}
 	}
 	return isSupportedVideoForSemanticTask(path, contentType)
 }

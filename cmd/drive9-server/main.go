@@ -906,14 +906,39 @@ func buildAudioExtractOptionsFromEnv() (backend.AsyncAudioExtractOptions, error)
 }
 
 func buildVideoExtractOptionsFromEnv() (backend.AsyncVideoExtractOptions, error) {
-	if !envBool("DRIVE9_VIDEO_EXTRACT_ENABLED", false) {
+	// Single-config design: DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST controls
+	// everything. Empty/unset = off. "*" = all tenants. Otherwise comma-
+	// separated tenant IDs.
+	raw := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST"))
+	if raw == "" {
 		return backend.AsyncVideoExtractOptions{}, nil
 	}
+
+	// Parse and validate allowlist tokens.
+	var allTenants bool
+	tenantAllowlist := make(map[string]struct{})
+	for _, tok := range strings.Split(raw, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		if tok == "*" {
+			allTenants = true
+		} else if strings.Contains(tok, "*") {
+			return backend.AsyncVideoExtractOptions{}, fmt.Errorf("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST: glob/prefix patterns not supported (got %q); use exact tenant IDs or \"*\" for all", tok)
+		} else {
+			tenantAllowlist[tok] = struct{}{}
+		}
+	}
+	if allTenants && len(tenantAllowlist) > 0 {
+		return backend.AsyncVideoExtractOptions{}, fmt.Errorf("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST: \"*\" cannot be mixed with tenant IDs (got %q)", raw)
+	}
+
 	videoBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_API_BASE"))
 	videoAPIKey := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_API_KEY"))
 	videoModel := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_MODEL"))
 	if videoBaseURL == "" || videoAPIKey == "" || videoModel == "" {
-		return backend.AsyncVideoExtractOptions{}, fmt.Errorf("DRIVE9_VIDEO_EXTRACT_API_BASE, DRIVE9_VIDEO_EXTRACT_API_KEY and DRIVE9_VIDEO_EXTRACT_MODEL must be set together when DRIVE9_VIDEO_EXTRACT_ENABLED=true")
+		return backend.AsyncVideoExtractOptions{}, fmt.Errorf("DRIVE9_VIDEO_EXTRACT_API_BASE, DRIVE9_VIDEO_EXTRACT_API_KEY and DRIVE9_VIDEO_EXTRACT_MODEL must be set when DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST is non-empty")
 	}
 	videoPrompt := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_PROMPT"))
 	videoTimeout := time.Duration(envInt("DRIVE9_VIDEO_EXTRACT_TIMEOUT_SECONDS", 300)) * time.Second
@@ -931,19 +956,9 @@ func buildVideoExtractOptionsFromEnv() (backend.AsyncVideoExtractOptions, error)
 	if err != nil {
 		return backend.AsyncVideoExtractOptions{}, fmt.Errorf("init video extractor: %w", err)
 	}
-	// Fail-closed: when video extract is enabled but no allowlist is set,
-	// default to empty map so no tenant can enqueue. Operators must
-	// explicitly list tenant IDs to enable extraction.
-	tenantAllowlist := make(map[string]struct{})
-	if raw := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST")); raw != "" {
-		for _, id := range strings.Split(raw, ",") {
-			if id = strings.TrimSpace(id); id != "" {
-				tenantAllowlist[id] = struct{}{}
-			}
-		}
-	}
 	async := backend.AsyncVideoExtractOptions{
 		Enabled:             true,
+		AllTenants:          allTenants,
 		MaxVideoBytes:       envInt64("DRIVE9_VIDEO_EXTRACT_MAX_BYTES", 200<<20),
 		TaskTimeout:         videoTimeout,
 		MaxExtractTextBytes: envInt("DRIVE9_VIDEO_EXTRACT_MAX_TEXT_BYTES", 32<<10),
@@ -952,7 +967,7 @@ func buildVideoExtractOptionsFromEnv() (backend.AsyncVideoExtractOptions, error)
 	}
 	logger.Info(context.Background(), "video_extract_mode_configured",
 		zap.String("model", videoModel), zap.String("base_url", videoBaseURL),
-		zap.Int("tenant_allowlist_size", len(tenantAllowlist)))
+		zap.Bool("all_tenants", allTenants), zap.Int("tenant_allowlist_size", len(tenantAllowlist)))
 	return async, nil
 }
 

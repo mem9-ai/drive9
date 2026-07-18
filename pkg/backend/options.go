@@ -162,14 +162,14 @@ func AsyncAudioExtractWillWireRuntime(opts AsyncAudioExtractOptions) bool {
 // Vision model. Delivery uses semantic_tasks only; no local worker queue.
 type AsyncVideoExtractOptions struct {
 	Enabled             bool
+	AllTenants          bool // true when allowlist is "*"
 	MaxVideoBytes       int64
 	TaskTimeout         time.Duration
 	MaxExtractTextBytes int
 	Extractor           VideoTextExtractor
 	// TenantAllowlist restricts video extraction to only the listed tenant
-	// IDs. An empty or nil map means no tenant is allowed (fail-closed).
-	// Production callers must explicitly populate this from
-	// DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST.
+	// IDs. Ignored when AllTenants is true. An empty or nil map with
+	// AllTenants false means no tenant is allowed (fail-closed).
 	TenantAllowlist map[string]struct{}
 }
 
@@ -312,6 +312,7 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 			v.MaxExtractTextBytes = defaultMaxVideoExtractedTextBytes
 		}
 		b.videoExtractEnabled = true
+		b.videoExtractAllTenants = v.AllTenants
 		b.videoExtractor = v.Extractor
 		b.videoExtractTimeout = v.TaskTimeout
 		b.videoExtractMaxSize = v.MaxVideoBytes
