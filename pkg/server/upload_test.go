@@ -694,6 +694,71 @@ func TestAutoVideoPutWritesVisualContentTextEndToEnd(t *testing.T) {
 	}
 }
 
+func TestVideoQuotaSkipsEnqueueAtLimit(t *testing.T) {
+	s, _ := newTestServerWithS3Config(t, backend.Options{
+		TenantID:              "test-tenant",
+		DatabaseAutoEmbedding: true,
+		AsyncVideoExtract: backend.AsyncVideoExtractOptions{
+			Enabled:          true,
+			Extractor:        staticServerVideoExtractor{text: "visual content"},
+			TenantAllowlist:  map[string]struct{}{"test-tenant": {}},
+			MaxVideoLLMFiles: 1, // allow only 1 video
+		},
+	}, TenantWorkerOptions{
+		Workers:       1,
+		PollInterval:  10 * time.Millisecond,
+		LeaseDuration: 200 * time.Millisecond,
+	})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Upload first video — should enqueue and succeed.
+	req1, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/first.mp4", bytes.NewReader([]byte("vid1")))
+	req1.ContentLength = 4
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first upload: status=%d", resp1.StatusCode)
+	}
+	file1 := mustServerFile(t, s.fallback, "/first.mp4")
+	waitForTaskStatus(t, s.fallback, file1.FileID, 1, string(semantic.TaskSucceeded), 3*time.Second)
+
+	// Upload second video — upload succeeds but no video_extract_visual task.
+	req2, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/second.mp4", bytes.NewReader([]byte("vid2")))
+	req2.ContentLength = 4
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second upload: status=%d, want 200 (upload must succeed)", resp2.StatusCode)
+	}
+	file2 := mustServerFile(t, s.fallback, "/second.mp4")
+	// Give a short window for any mistaken enqueue to appear.
+	time.Sleep(200 * time.Millisecond)
+	tasks2 := loadSemanticTaskRowsForResource(t, s.fallback, file2.FileID)
+	if len(tasks2) != 0 {
+		t.Fatalf("second video should have 0 tasks (quota), got %d: %+v", len(tasks2), tasks2)
+	}
+
+	// Re-upload first video (overwrite) — should still enqueue (existing file excluded from count).
+	req3, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/first.mp4", bytes.NewReader([]byte("vid1-v2")))
+	req3.ContentLength = 7
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		t.Fatalf("re-upload: status=%d", resp3.StatusCode)
+	}
+	waitForTaskStatus(t, s.fallback, file1.FileID, 2, string(semantic.TaskSucceeded), 3*time.Second)
+}
+
 func TestUploadCompleteEndpoint(t *testing.T) {
 	s, s3c := newTestServerWithS3(t)
 	ts := httptest.NewServer(s)
