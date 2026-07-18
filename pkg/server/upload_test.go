@@ -644,6 +644,54 @@ func TestAutoImagePutWritesContentTextEndToEnd(t *testing.T) {
 	}
 }
 
+func TestAutoVideoPutWritesVisualContentTextEndToEnd(t *testing.T) {
+	s, _ := newTestServerWithS3Config(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncVideoExtract: backend.AsyncVideoExtractOptions{
+			Enabled:   true,
+			Extractor: staticServerVideoExtractor{text: "a golden retriever running through a sunlit park with oak trees"},
+		},
+	}, TenantWorkerOptions{
+		Workers:       1,
+		PollInterval:  10 * time.Millisecond,
+		LeaseDuration: 200 * time.Millisecond,
+	})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/e2e-video.mp4", bytes.NewReader([]byte("fake-mp4-bytes")))
+	req.ContentLength = int64(len("fake-mp4-bytes"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	file := mustServerFile(t, s.fallback, "/e2e-video.mp4")
+
+	// Wait for the visual description to be written back as content_text.
+	// "golden retriever" is a visual-only term that proves the Vision extractor
+	// path was invoked, not the audio transcript path.
+	waitForContentTextOnServer(t, s.fallback, "/e2e-video.mp4", "golden retriever", 3*time.Second)
+	waitForTaskStatus(t, s.fallback, file.FileID, 1, string(semantic.TaskSucceeded), 3*time.Second)
+
+	// Verify exactly one task was created and it is video_extract_visual (not audio_extract_text).
+	tasks := loadSemanticTaskRowsForResource(t, s.fallback, file.FileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1 (video only, no audio)", len(tasks))
+	}
+	if tasks[0].TaskType != string(semantic.TaskTypeVideoExtractVisual) {
+		t.Fatalf("task type=%q, want %q", tasks[0].TaskType, semantic.TaskTypeVideoExtractVisual)
+	}
+	if tasks[0].Status != string(semantic.TaskSucceeded) {
+		t.Fatalf("task status=%q, want %q", tasks[0].Status, semantic.TaskSucceeded)
+	}
+}
+
 func TestUploadCompleteEndpoint(t *testing.T) {
 	s, s3c := newTestServerWithS3(t)
 	ts := httptest.NewServer(s)
