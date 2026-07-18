@@ -910,13 +910,14 @@ func buildVideoExtractOptionsFromEnv() (backend.AsyncVideoExtractOptions, error)
 	// everything. Empty/unset = off. "*" = all tenants. Otherwise comma-
 	// separated tenant IDs.
 	raw := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST"))
-	if raw == "" {
-		return backend.AsyncVideoExtractOptions{}, nil
-	}
-
 	allTenants, tenantAllowlist, err := backend.ParseVideoExtractTenantAllowlist(raw)
 	if err != nil {
 		return backend.AsyncVideoExtractOptions{}, fmt.Errorf("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST: %w", err)
+	}
+	// Parser returns nil allowlist + allTenants=false when input is empty
+	// or contains only commas/whitespace → off, no runtime init needed.
+	if !allTenants && tenantAllowlist == nil {
+		return backend.AsyncVideoExtractOptions{}, nil
 	}
 
 	videoBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_API_BASE"))
