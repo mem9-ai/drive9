@@ -281,11 +281,12 @@ func (a *metaQuotaAdapter) ListPendingMutations(ctx context.Context, minAge time
 	views := make([]backend.MutationLogView, len(entries))
 	for i, e := range entries {
 		views[i] = backend.MutationLogView{
-			ID:           e.ID,
-			TenantID:     e.TenantID,
-			MutationType: e.MutationType,
-			MutationData: e.MutationData,
-			RetryCount:   e.RetryCount,
+			ID:             e.ID,
+			TenantID:       e.TenantID,
+			TiDBCloudOrgID: e.TiDBCloudOrgID,
+			MutationType:   e.MutationType,
+			MutationData:   e.MutationData,
+			RetryCount:     e.RetryCount,
 		}
 	}
 	return views, nil
@@ -300,6 +301,7 @@ func (a *metaQuotaAdapter) ObservePendingMutations(ctx context.Context) ([]backe
 	for i, e := range entries {
 		views[i] = backend.MutationBacklogView{
 			TenantID:                e.TenantID,
+			TiDBCloudOrgID:          e.TiDBCloudOrgID,
 			PendingCount:            e.PendingCount,
 			OldestPendingAgeSeconds: e.OldestPendingAgeSeconds,
 		}

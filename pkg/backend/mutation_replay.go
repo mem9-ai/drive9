@@ -64,7 +64,7 @@ type MutationReplayWorker struct {
 	store                  MetaQuotaStore
 	cancel                 context.CancelFunc
 	done                   chan struct{}
-	observedBacklogTenants map[string]struct{}
+	observedBacklogTenants map[string]string
 	lastBacklogObservation time.Time
 }
 
@@ -79,7 +79,7 @@ func StartMutationReplayWorker(store MetaQuotaStore) *MutationReplayWorker {
 		store:                  store,
 		cancel:                 cancel,
 		done:                   make(chan struct{}),
-		observedBacklogTenants: make(map[string]struct{}),
+		observedBacklogTenants: make(map[string]string),
 	}
 	go w.run(ctx)
 	return w
@@ -176,11 +176,11 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 					zap.Int64("log_id", entry.ID),
 					zap.Error(rErr))
 			}
-			metrics.RecordTenantOperationCount(entry.TenantID, "mutation_replay", entry.MutationType, metrics.ResultForError(err))
+			metrics.RecordTenantOperationCountWithOrg(entry.TenantID, entry.TiDBCloudOrgID, "mutation_replay", entry.MutationType, metrics.ResultForError(err))
 			blockedTenants[entry.TenantID] = struct{}{}
 			failed++
 		} else {
-			metrics.RecordTenantOperationCount(entry.TenantID, "mutation_replay", entry.MutationType, "ok")
+			metrics.RecordTenantOperationCountWithOrg(entry.TenantID, entry.TiDBCloudOrgID, "mutation_replay", entry.MutationType, "ok")
 			applied++
 		}
 	}
@@ -209,7 +209,7 @@ func (w *MutationReplayWorker) recordPendingBacklogIfDue(ctx context.Context) {
 
 func (w *MutationReplayWorker) recordPendingBacklog(ctx context.Context) {
 	if w.observedBacklogTenants == nil {
-		w.observedBacklogTenants = make(map[string]struct{})
+		w.observedBacklogTenants = make(map[string]string)
 	}
 	w.lastBacklogObservation = time.Now()
 	start := time.Now()
@@ -219,28 +219,29 @@ func (w *MutationReplayWorker) recordPendingBacklog(ctx context.Context) {
 		metrics.RecordOperation("mutation_replay", "observe_pending", metrics.ResultForError(err), time.Since(start))
 		return
 	}
-	current := make(map[string]struct{}, len(observations))
+	current := make(map[string]string, len(observations))
 	for _, obs := range observations {
-		current[obs.TenantID] = struct{}{}
-		w.observedBacklogTenants[obs.TenantID] = struct{}{}
-		metrics.RecordTenantGauge(obs.TenantID, "mutation_replay", "pending_mutations", float64(obs.PendingCount))
-		metrics.RecordTenantGauge(obs.TenantID, "mutation_replay", "oldest_pending_age_seconds", obs.OldestPendingAgeSeconds)
+		orgID := normalizeTenantMetricTiDBCloudOrgID(obs.TiDBCloudOrgID)
+		current[obs.TenantID] = orgID
+		w.observedBacklogTenants[obs.TenantID] = orgID
+		metrics.RecordTenantGaugeWithOrg(obs.TenantID, orgID, "mutation_replay", "pending_mutations", float64(obs.PendingCount))
+		metrics.RecordTenantGaugeWithOrg(obs.TenantID, orgID, "mutation_replay", "oldest_pending_age_seconds", obs.OldestPendingAgeSeconds)
 	}
-	for tenantID := range w.observedBacklogTenants {
+	for tenantID, orgID := range w.observedBacklogTenants {
 		if _, ok := current[tenantID]; ok {
 			continue
 		}
-		metrics.RecordTenantGauge(tenantID, "mutation_replay", "pending_mutations", 0)
-		metrics.RecordTenantGauge(tenantID, "mutation_replay", "oldest_pending_age_seconds", 0)
+		metrics.RecordTenantGaugeWithOrg(tenantID, orgID, "mutation_replay", "pending_mutations", 0)
+		metrics.RecordTenantGaugeWithOrg(tenantID, orgID, "mutation_replay", "oldest_pending_age_seconds", 0)
 		delete(w.observedBacklogTenants, tenantID)
 	}
 	metrics.RecordOperation("mutation_replay", "observe_pending", "ok", time.Since(start))
 }
 
 func (w *MutationReplayWorker) clearPendingBacklogGauges() {
-	for tenantID := range w.observedBacklogTenants {
-		metrics.RecordTenantGauge(tenantID, "mutation_replay", "pending_mutations", 0)
-		metrics.RecordTenantGauge(tenantID, "mutation_replay", "oldest_pending_age_seconds", 0)
+	for tenantID, orgID := range w.observedBacklogTenants {
+		metrics.RecordTenantGaugeWithOrg(tenantID, orgID, "mutation_replay", "pending_mutations", 0)
+		metrics.RecordTenantGaugeWithOrg(tenantID, orgID, "mutation_replay", "oldest_pending_age_seconds", 0)
 		delete(w.observedBacklogTenants, tenantID)
 	}
 }

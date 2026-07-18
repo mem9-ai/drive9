@@ -301,7 +301,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 		p.mu.Unlock()
 	}
 
-	b, st, err := p.createBackend(ctx, t)
+	b, st, _, err := p.createBackend(ctx, t)
 	if err != nil {
 		return nil, err
 	}
@@ -384,11 +384,11 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	}
 
 	createBackendStart := time.Now()
-	b, st, err := p.createBackend(ctx, t)
+	b, st, tidbCloudOrgID, err := p.createBackend(ctx, t)
 	if err != nil {
 		// Cold-open failure: a tenant TiDB open was attempted but failed.
 		// Record so alerts can detect a scan path that is churning cold opens.
-		metrics.RecordTenantOperation(t.ID, "user_db_access", "acquire_cold_open", "error", time.Since(createBackendStart))
+		metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "error", time.Since(createBackendStart))
 		return nil, nil, err
 	}
 	createBackendDurationMs := float64(time.Since(createBackendStart).Microseconds()) / 1000.0
@@ -396,7 +396,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	// This is the canonical "a serverless TiDB was woken up" signal — the
 	// primary billing-storm indicator. PR #660 eliminated periodic scans that
 	// caused cold opens at scale; this metric guards against regressions.
-	metrics.RecordTenantOperation(t.ID, "user_db_access", "acquire_cold_open", "ok", time.Since(createBackendStart))
+	metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "ok", time.Since(createBackendStart))
 
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
@@ -515,7 +515,7 @@ func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release fu
 		// This is the warm-only invariant working as designed — the safety-net
 		// must never open a cold tenant TiDB. Record so the invariant-violation
 		// alert can confirm AcquireCached is staying warm-only.
-		metrics.RecordTenantOperation(t.ID, "user_db_access", "acquire_cached", "cold_skipped", 0)
+		metrics.RecordTenantOperationWithOrg(t.ID, defaultTenantMetricTiDBCloudOrgID, "user_db_access", "acquire_cached", "cold_skipped", 0)
 		return nil, nil, false
 	}
 	if e.s3EncryptionPolicy != s3EncryptionPolicy || (t.StorageNamespaceID != "" && e.storageNamespaceID != t.StorageNamespaceID) {
@@ -523,14 +523,14 @@ func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release fu
 		// Stale-skip: the cached backend's encryption policy / storage namespace
 		// no longer matches the tenant. The safety-net defers to the next write
 		// kick. Record so this rare edge case is observable.
-		metrics.RecordTenantOperation(t.ID, "user_db_access", "acquire_cached", "stale_skipped", 0)
+		metrics.RecordTenantOperationWithOrg(t.ID, e.backend.TiDBCloudOrgID(), "user_db_access", "acquire_cached", "stale_skipped", 0)
 		return nil, nil, false
 	}
 	e.refs++
 	p.order.MoveToFront(e.elem)
 	p.mu.Unlock()
 	metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
-	metrics.RecordTenantOperation(t.ID, "user_db_access", "acquire_cached", "hit", 0)
+	metrics.RecordTenantOperationWithOrg(t.ID, e.backend.TiDBCloudOrgID(), "user_db_access", "acquire_cached", "hit", 0)
 	return e.backend, p.makeReleaseNoRefresh(e), true
 }
 
@@ -804,20 +804,42 @@ func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantI
 	return b
 }
 
-func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9Backend, *datastore.Store, error) {
+func (p *Pool) tenantMetricTiDBCloudOrgID(ctx context.Context, t *meta.Tenant) string {
+	if p == nil || p.metaStore == nil || t == nil || strings.TrimSpace(t.ID) == "" || t.Provider != ProviderTiDBCloudNative {
+		return defaultTenantMetricTiDBCloudOrgID
+	}
+	binding, err := p.metaStore.GetTenantTiDBCloudOrgBinding(ctx, t.ID)
+	if err != nil {
+		if !errors.Is(err, meta.ErrNotFound) {
+			logger.Warn(ctx, "tenant_pool_metric_org_lookup_failed",
+				zap.String("tenant_id", t.ID),
+				zap.Error(err))
+		}
+		return defaultTenantMetricTiDBCloudOrgID
+	}
+	orgID := strings.TrimSpace(binding.OrganizationID)
+	if orgID == "" {
+		return defaultTenantMetricTiDBCloudOrgID
+	}
+	return orgID
+}
+
+func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9Backend, *datastore.Store, string, error) {
 	start := time.Now()
+	tidbCloudOrgID := p.tenantMetricTiDBCloudOrgID(ctx, t)
 	decryptStart := time.Now()
 	pass, err := p.enc.Decrypt(ctx, t.DBPasswordCipher)
 	if err != nil {
-		return nil, nil, fmt.Errorf("decrypt db password: %w", err)
+		return nil, nil, tidbCloudOrgID, fmt.Errorf("decrypt db password: %w", err)
 	}
 	decryptDurationMs := float64(time.Since(decryptStart).Microseconds()) / 1000.0
 	opts := p.cfg.BackendOptions
 	resolvedEncryptionPolicy, err := meta.ResolveS3EncryptionPolicy(p.cfg.S3EncryptionPolicy, t.S3EncryptionPolicy())
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolve s3 encryption policy: %w", err)
+		return nil, nil, tidbCloudOrgID, fmt.Errorf("resolve s3 encryption policy: %w", err)
 	}
 	opts.TenantID = t.ID
+	opts.TiDBCloudOrgID = tidbCloudOrgID
 	opts.S3EncryptionPolicy = resolvedEncryptionPolicy
 	query := "parseTime=true"
 	if t.DBTLS {
@@ -827,9 +849,9 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	}
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
 	openStoreStart := time.Now()
-	store, err := datastore.OpenForTenant(ctx, dsn, t.ID)
+	store, err := datastore.OpenForTenantWithOrg(ctx, dsn, t.ID, tidbCloudOrgID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open datastore: %w", err)
+		return nil, nil, tidbCloudOrgID, fmt.Errorf("open datastore: %w", err)
 	}
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
 	ensureSchemaDurationMs := 0.0
@@ -838,13 +860,13 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		autoEmbeddingProfile, err := p.autoEmbeddingProfileForTenant(ctx, t)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
 		}
 		if autoEmbeddingProfile.mode == meta.TenantEmbeddingModeAuto {
 			opts.DatabaseAutoEmbedding = true
 			if err := applyTiDBAutoEmbeddingProviderConfig(ctx, store.DB(), autoEmbeddingProfile.provider); err != nil {
 				_ = store.Close()
-				return nil, nil, fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
+				return nil, nil, tidbCloudOrgID, fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
 			}
 		} else {
 			opts.DatabaseAutoEmbedding = false
@@ -856,14 +878,14 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			targetSchemaVersion, err := TiDBTenantSchemaVersionForEmbeddingMode(autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile)
 			if err != nil {
 				_ = store.Close()
-				return nil, nil, fmt.Errorf("resolve tenant embedding schema version: %w", err)
+				return nil, nil, tidbCloudOrgID, fmt.Errorf("resolve tenant embedding schema version: %w", err)
 			}
 			if t.SchemaVersion != targetSchemaVersion {
 				ensureSchemaStart := time.Now()
 				schemaCtx := schema.WithTenantID(ctx, t.ID)
 				if err := ensureTiDBSchemaForEmbeddingMode(schemaCtx, store.DB(), autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile); err != nil {
 					_ = store.Close()
-					return nil, nil, fmt.Errorf("ensure tidb embedding schema: %w", err)
+					return nil, nil, tidbCloudOrgID, fmt.Errorf("ensure tidb embedding schema: %w", err)
 				}
 				ensureSchemaDurationMs += float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
 				if p.metaStore != nil {
@@ -884,7 +906,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			if autoEmbeddingProfile.modeWasNull && p.metaStore != nil {
 				if _, modeErr := p.metaStore.SetTenantAutoEmbeddingProfileModeIfNull(ctx, t.ID, autoEmbeddingProfile.mode); modeErr != nil {
 					_ = store.Close()
-					return nil, nil, fmt.Errorf("persist tenant embedding mode: %w", modeErr)
+					return nil, nil, tidbCloudOrgID, fmt.Errorf("persist tenant embedding mode: %w", modeErr)
 				}
 			}
 		}
@@ -895,7 +917,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	if store.HasLegacyFiles() {
 		if err := p.migrateSplitTables(ctx, store.DB(), t.Provider); err != nil {
 			_ = store.Close()
-			return nil, nil, fmt.Errorf("migrate split tables: %w", err)
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("migrate split tables: %w", err)
 		}
 	}
 	migrateDurationMs = float64(time.Since(migrateStart).Microseconds()) / 1000.0
@@ -903,7 +925,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		ns, err := p.resolveStorageNamespace(ctx, t, "s3", p.cfg.S3Bucket)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, err
+			return nil, nil, tidbCloudOrgID, err
 		}
 		opts.StorageNamespaceID = ns.ID
 		prefix := ns.Prefix
@@ -921,7 +943,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		})
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, fmt.Errorf("create aws s3 client: %w", err)
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("create aws s3 client: %w", err)
 		}
 		s3ClientDurationMs := float64(time.Since(s3ClientStart).Microseconds()) / 1000.0
 		smallInDB := SmallInDB(t.Provider)
@@ -929,7 +951,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, opts)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, fmt.Errorf("create backend with s3 mode: %w", err)
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("create backend with s3 mode: %w", err)
 		}
 		backendCreateDurationMs := float64(time.Since(backendCreateStart).Microseconds()) / 1000.0
 		totalDuration := time.Since(start)
@@ -946,13 +968,13 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("total_ms", durationMs(totalDuration)))
 		p.wireQuotaStore(ctx, b, t.ID)
 		p.wireTenantWorkNotifier(b, t.ID)
-		return b, store, nil
+		return b, store, tidbCloudOrgID, nil
 	}
 	if p.cfg.S3Dir != "" {
 		ns, err := p.resolveStorageNamespace(ctx, t, "local", "")
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, err
+			return nil, nil, tidbCloudOrgID, err
 		}
 		opts.StorageNamespaceID = ns.ID
 		localPrefix := strings.Trim(ns.Prefix, "/")
@@ -962,7 +984,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		s3c, err := s3client.NewLocal(s3Dir, s3BaseURL)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, fmt.Errorf("create local s3 client: %w", err)
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("create local s3 client: %w", err)
 		}
 		s3ClientDurationMs := float64(time.Since(s3ClientStart).Microseconds()) / 1000.0
 		smallInDB := SmallInDB(t.Provider)
@@ -970,7 +992,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, opts)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, fmt.Errorf("create backend with local s3 mode: %w", err)
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("create backend with local s3 mode: %w", err)
 		}
 		backendCreateDurationMs := float64(time.Since(backendCreateStart).Microseconds()) / 1000.0
 		totalDuration := time.Since(start)
@@ -987,13 +1009,13 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("total_ms", durationMs(totalDuration)))
 		p.wireQuotaStore(ctx, b, t.ID)
 		p.wireTenantWorkNotifier(b, t.ID)
-		return b, store, nil
+		return b, store, tidbCloudOrgID, nil
 	}
 	backendCreateStart := time.Now()
 	b, err := backend.NewWithOptions(store, opts)
 	if err != nil {
 		_ = store.Close()
-		return nil, nil, fmt.Errorf("create backend: %w", err)
+		return nil, nil, tidbCloudOrgID, fmt.Errorf("create backend: %w", err)
 	}
 	backendCreateDurationMs := float64(time.Since(backendCreateStart).Microseconds()) / 1000.0
 	totalDuration := time.Since(start)
@@ -1010,7 +1032,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("total_ms", durationMs(totalDuration)))
 	p.wireQuotaStore(ctx, b, t.ID)
 	p.wireTenantWorkNotifier(b, t.ID)
-	return b, store, nil
+	return b, store, tidbCloudOrgID, nil
 }
 
 func (p *Pool) migrateSplitTables(ctx context.Context, db *sql.DB, provider string) error {
@@ -1213,6 +1235,7 @@ const (
 	tenantPoolResultAuthFailed           tenantPoolResult = "auth_failed"
 	tenantPoolResultUsageQuotaExhausted  tenantPoolResult = "usage_quota_exhausted"
 	tenantPoolResultError                tenantPoolResult = "error"
+	defaultTenantMetricTiDBCloudOrgID    string           = "guest"
 	mysqlErrAccessDenied                 uint16           = 1045
 	mysqlErrUsageQuotaExhaustedCandidate uint16           = 1105
 )

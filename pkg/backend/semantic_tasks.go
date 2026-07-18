@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/semantic"
 )
 
@@ -51,7 +50,7 @@ func (b *Dat9Backend) enqueueExtractSemanticTasksTx(ctx context.Context, tx *sql
 		return false, nil
 	}
 	if b.mediaLLMQuotaExceededCheckTx(ctx, tx, currentMediaDelta) {
-		metrics.RecordTenantOperation(b.tenantID, "media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
+		b.recordTenantOperation("media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
 		return false, nil
 	}
 	enqueued := false

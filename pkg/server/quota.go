@@ -115,7 +115,7 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 	if cfg.TiDBCloudSpendingLimit != nil && bearerToken(r) != "" {
 		apiKeyTenant, apiKeyErr := s.resolveQuotaAPIKey(r.Context(), r)
 		if apiKeyErr == nil && apiKeyTenant != nil && apiKeyTenant.Tenant.ID == t.ID {
-			setRequestMetricTenant(r.Context(), t.ID, apiKeyTenant.APIKey.ID, t.Provider, classifyTenantRequest(r))
+			setRequestMetricTenant(r.Context(), t.ID, apiKeyTenant.APIKey.ID, t.Provider, apiKeyTenant.TiDBCloudOrgID, classifyTenantRequest(r))
 			s.writeQuotaResponse(w, r, t)
 			return
 		}
@@ -157,7 +157,7 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, classifyTenantRequest(r))
+	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, s.tenantMetricTiDBCloudOrgID(r.Context(), t), classifyTenantRequest(r))
 	s.writeQuotaResponse(w, r, t)
 }
 
@@ -271,7 +271,7 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		writeQuotaSetError(w, r.Context(), err, "update")
 		return
 	}
-	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, classifyTenantRequest(r))
+	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, s.tenantMetricTiDBCloudOrgID(r.Context(), t), classifyTenantRequest(r))
 	s.writeQuotaResponse(w, r, t)
 }
 

@@ -41,6 +41,16 @@ const (
 	TenantDeleted      TenantStatus = "deleted"
 )
 
+var allTenantStatuses = []TenantStatus{
+	TenantPending,
+	TenantProvisioning,
+	TenantActive,
+	TenantFailed,
+	TenantSuspended,
+	TenantDeleting,
+	TenantDeleted,
+}
+
 const tidbCloudNativeProvider = "tidb_cloud_native"
 const maxTiDBCloudOrgBindingDuplicateTuples = 20
 
@@ -91,8 +101,25 @@ type Tenant struct {
 }
 
 type TenantCounts struct {
-	TotalNonDeleted int64
-	Active          int64
+	Statuses []TenantStatusCount
+}
+
+type TenantStatusCount struct {
+	Status TenantStatus
+	Count  int64
+}
+
+func TenantStatuses() []TenantStatus {
+	return append([]TenantStatus(nil), allTenantStatuses...)
+}
+
+func (c TenantCounts) Count(status TenantStatus) int64 {
+	for _, rec := range c.Statuses {
+		if rec.Status == status {
+			return rec.Count
+		}
+	}
+	return 0
 }
 
 type TenantAutoEmbeddingProfile struct {
@@ -232,8 +259,9 @@ type APIKeyFSScope struct {
 }
 
 type TenantWithAPIKey struct {
-	Tenant Tenant
-	APIKey APIKey
+	Tenant         Tenant
+	APIKey         APIKey
+	TiDBCloudOrgID string
 }
 
 type ExternalBinding struct {
@@ -288,6 +316,13 @@ type TenantPool struct {
 	Status         TenantPoolStatus
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+}
+
+type TenantPoolBindingStatusCount struct {
+	PoolID         string
+	OrganizationID string
+	Status         TenantPoolBindingStatus
+	Count          int64
 }
 
 type Store struct {
@@ -1886,6 +1921,51 @@ func (s *Store) countFreeTenantPoolBindingsByStatus(ctx context.Context, organiz
 	return out, nil
 }
 
+func (s *Store) CountTenantPoolBindingsByStatus(ctx context.Context) (out []TenantPoolBindingStatusCount, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "count_tidbcloud_pool_bindings_by_status", start, &err)
+	rows, err := s.db.QueryContext(ctx, `SELECT
+			p.pool_id,
+			p.organization_id,
+			statuses.pool_status,
+			COUNT(t.id)
+		FROM tenant_tidbcloud_pools p
+		JOIN (
+			SELECT ? AS pool_status
+			UNION ALL
+			SELECT ? AS pool_status
+		) statuses
+		LEFT JOIN tenant_tidbcloud_org_bindings b
+			ON b.pool_id = p.pool_id
+			AND b.organization_id = p.organization_id
+			AND b.pool_status = statuses.pool_status
+		LEFT JOIN tenants t
+			ON t.id = b.tenant_id
+			AND t.provider = ?
+			AND t.status <> ?
+		WHERE p.pool_id <> ''
+			AND p.organization_id IS NOT NULL
+			AND p.organization_id <> ''
+		GROUP BY p.pool_id, p.organization_id, statuses.pool_status
+		ORDER BY p.pool_id, p.organization_id, statuses.pool_status`,
+		TenantPoolBindingFree, TenantPoolBindingUsed, tidbCloudNativeProvider, TenantDeleted)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var rec TenantPoolBindingStatusCount
+		if err := rows.Scan(&rec.PoolID, &rec.OrganizationID, &rec.Status, &rec.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (s *Store) ListFreeTenantPoolBindings(ctx context.Context, organizationID string, newestFirst bool, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_free_tidbcloud_pool_bindings", start, &err)
@@ -2372,9 +2452,10 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
 			k.id, k.tenant_id, k.key_name, k.jwt_ciphertext, k.jwt_hash, k.token_version, k.status, k.scope_kind,
 			k.issued_by_provider, k.issued_by_subject_key, k.issued_by_metadata_json, k.issued_at,
-			k.revoked_at, k.created_at, k.updated_at
+			k.revoked_at, k.created_at, k.updated_at, COALESCE(b.organization_id, '')
 		FROM tenant_api_keys k
 		JOIN tenants t ON t.id = k.tenant_id
+		LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = t.id
 		WHERE k.jwt_hash = ?`, hash)
 
 	var rec TenantWithAPIKey
@@ -2398,7 +2479,7 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 		&rec.APIKey.ID, &rec.APIKey.TenantID, &rec.APIKey.KeyName, &rec.APIKey.JWTCiphertext,
 		&rec.APIKey.JWTHash, &rec.APIKey.TokenVersion, &rec.APIKey.Status, &rec.APIKey.ScopeKind,
 		&issuedByProvider, &issuedBySubjectKey, &issuedByMetadataJSON, &rec.APIKey.IssuedAt,
-		&revokedAt, &rec.APIKey.CreatedAt, &rec.APIKey.UpdatedAt,
+		&revokedAt, &rec.APIKey.CreatedAt, &rec.APIKey.UpdatedAt, &rec.TiDBCloudOrgID,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = ErrNotFound
@@ -2631,16 +2712,32 @@ func (s *Store) ListTenantsByStatus(ctx context.Context, status TenantStatus, li
 func (s *Store) CountTenants(ctx context.Context) (out TenantCounts, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "count_tenants", start, &err)
-	err = s.db.QueryRowContext(ctx, `
-		SELECT
-			COUNT(*),
-			COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0)
-		FROM tenants
-		WHERE status <> ?`, TenantActive, TenantDeleted).Scan(&out.TotalNonDeleted, &out.Active)
-	if err != nil {
-		err = fmt.Errorf("count tenants: %w", err)
+	counts := make(map[TenantStatus]int64, len(allTenantStatuses))
+	for _, status := range allTenantStatuses {
+		counts[status] = 0
 	}
-	return out, err
+	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM tenants GROUP BY status`)
+	if err != nil {
+		return out, fmt.Errorf("count tenants: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var status TenantStatus
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			return out, fmt.Errorf("scan tenant count: %w", err)
+		}
+		if _, ok := counts[status]; ok {
+			counts[status] = count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return out, fmt.Errorf("count tenants rows: %w", err)
+	}
+	for _, status := range allTenantStatuses {
+		out.Statuses = append(out.Statuses, TenantStatusCount{Status: status, Count: counts[status]})
+	}
+	return out, nil
 }
 
 // ListTenantsByStatusAfter returns one keyset page of tenants after

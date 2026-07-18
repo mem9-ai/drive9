@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,8 +59,12 @@ func (s *Server) handleVault(w http.ResponseWriter, r *http.Request) {
 
 var errVaultUnsupported = errors.New("vault is not supported for this provider")
 
-func recordVaultOperation(tenantID, op string, start time.Time, result string) {
-	metrics.RecordTenantOperation(tenantID, "vault", op, result, time.Since(start))
+func recordVaultOperation(ctx context.Context, tenantID, op string, start time.Time, result string) {
+	scopeTenantID, _, _, tidbCloudOrgID := requestMetricScope(ctx)
+	if scopeTenantID != tenantID {
+		tidbCloudOrgID = defaultTenantMetricTiDBCloudOrgID
+	}
+	metrics.RecordTenantOperationWithOrg(tenantID, tidbCloudOrgID, "vault", op, result, time.Since(start))
 }
 
 // vaultStore returns the vault store for the current tenant.
@@ -146,7 +151,7 @@ func (s *Server) handleVaultSecrets(w http.ResponseWriter, r *http.Request, sub 
 func (s *Server) handleVaultSecretCreate(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(tenantID, "secret_create", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), tenantID, "secret_create", start, result) }()
 
 	var req struct {
 		Name       string            `json:"name"`
@@ -213,7 +218,7 @@ func (s *Server) handleVaultSecretCreate(w http.ResponseWriter, r *http.Request,
 func (s *Server) handleVaultSecretList(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(tenantID, "secret_list", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), tenantID, "secret_list", start, result) }()
 
 	secrets, err := vs.ListSecrets(r.Context(), tenantID)
 	if err != nil {
@@ -231,7 +236,7 @@ func (s *Server) handleVaultSecretList(w http.ResponseWriter, r *http.Request, v
 func (s *Server) handleVaultSecretGet(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, name string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(tenantID, "secret_get", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), tenantID, "secret_get", start, result) }()
 
 	sec, err := vs.GetSecret(r.Context(), tenantID, name)
 	if err != nil {
@@ -253,7 +258,7 @@ func (s *Server) handleVaultSecretGet(w http.ResponseWriter, r *http.Request, vs
 func (s *Server) handleVaultSecretReadValue(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, secretName string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(tenantID, "secret_read_value", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), tenantID, "secret_read_value", start, result) }()
 
 	fields, err := vs.ReadSecretFields(r.Context(), tenantID, secretName)
 	if err != nil {
@@ -301,7 +306,7 @@ func (s *Server) handleVaultSecretReadValue(w http.ResponseWriter, r *http.Reque
 func (s *Server) handleVaultSecretReadField(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, secretName, fieldName string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(tenantID, "secret_read_field", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), tenantID, "secret_read_field", start, result) }()
 
 	plaintext, err := vs.ReadSecretField(r.Context(), tenantID, secretName, fieldName)
 	if err != nil {
@@ -332,7 +337,7 @@ func (s *Server) handleVaultSecretReadField(w http.ResponseWriter, r *http.Reque
 func (s *Server) handleVaultSecretUpdate(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, name string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(tenantID, "secret_update", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), tenantID, "secret_update", start, result) }()
 
 	var req struct {
 		Fields    map[string]string `json:"fields"`
@@ -387,7 +392,7 @@ func (s *Server) handleVaultSecretUpdate(w http.ResponseWriter, r *http.Request,
 func (s *Server) handleVaultSecretDelete(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, name string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(tenantID, "secret_delete", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), tenantID, "secret_delete", start, result) }()
 
 	err := vs.DeleteSecret(r.Context(), tenantID, name)
 	if err != nil {
@@ -448,7 +453,7 @@ func (s *Server) handleVaultTokens(w http.ResponseWriter, r *http.Request, sub s
 func (s *Server) handleVaultTokenIssue(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(tenantID, "token_issue", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), tenantID, "token_issue", start, result) }()
 
 	var req struct {
 		AgentID string   `json:"agent_id"`
@@ -508,7 +513,7 @@ func (s *Server) handleVaultTokenIssue(w http.ResponseWriter, r *http.Request, v
 func (s *Server) handleVaultTokenRevoke(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, tokenID string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(tenantID, "token_revoke", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), tenantID, "token_revoke", start, result) }()
 
 	var req struct {
 		RevokedBy string `json:"revoked_by"`
@@ -589,7 +594,7 @@ func (s *Server) handleVaultGrants(w http.ResponseWriter, r *http.Request, sub s
 func (s *Server) handleVaultGrantIssue(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(tenantID, "grant_issue", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), tenantID, "grant_issue", start, result) }()
 
 	// Grants require a canonical server URL for the `iss` claim. If the
 	// operator hasn't configured one, we cannot mint non-forgeable tokens:
@@ -678,7 +683,7 @@ func (s *Server) handleVaultGrantIssue(w http.ResponseWriter, r *http.Request, v
 func (s *Server) handleVaultGrantRevoke(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, grantID string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(tenantID, "grant_revoke", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), tenantID, "grant_revoke", start, result) }()
 
 	var req struct {
 		RevokedBy string `json:"revoked_by"`
@@ -732,7 +737,7 @@ func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	auditTenantID := scope.TenantID
-	defer func() { recordVaultOperation(auditTenantID, "audit_query", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), auditTenantID, "audit_query", start, result) }()
 
 	if r.Method != http.MethodGet {
 		result = "invalid_argument"
@@ -908,7 +913,7 @@ func (s *Server) verifyGrantReadToken(r *http.Request, vs *vault.Store, tenantID
 func (s *Server) handleVaultReadEnumerate(w http.ResponseWriter, r *http.Request, vs *vault.Store, p *vaultReadPrincipal) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(p.TenantID, "read_enumerate", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), p.TenantID, "read_enumerate", start, result) }()
 
 	scopedNames := vault.ScopedSecretNames(p.Scope)
 	// Filter to secrets that actually exist.
@@ -939,7 +944,7 @@ func (s *Server) handleVaultReadEnumerate(w http.ResponseWriter, r *http.Request
 func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, vs *vault.Store, p *vaultReadPrincipal, secretName string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(p.TenantID, "read_secret", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), p.TenantID, "read_secret", start, result) }()
 
 	// Scope check.
 	allFields, allowedFields := vault.AllowedFields(p.Scope, secretName)
@@ -1016,7 +1021,7 @@ func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, v
 func (s *Server) handleVaultReadField(w http.ResponseWriter, r *http.Request, vs *vault.Store, p *vaultReadPrincipal, secretName, fieldName string) {
 	start := time.Now()
 	result := "ok"
-	defer func() { recordVaultOperation(p.TenantID, "read_field", start, result) }()
+	defer func() { recordVaultOperation(r.Context(), p.TenantID, "read_field", start, result) }()
 
 	// Scope check.
 	if !vault.CheckScope(p.Scope, secretName, fieldName) {

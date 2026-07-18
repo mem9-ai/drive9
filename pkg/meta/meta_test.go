@@ -875,11 +875,22 @@ func TestCountTenants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.TotalNonDeleted != 3 {
-		t.Errorf("TotalNonDeleted = %d, want 3", got.TotalNonDeleted)
+	want := map[TenantStatus]int64{
+		TenantPending:      0,
+		TenantProvisioning: 1,
+		TenantActive:       1,
+		TenantFailed:       1,
+		TenantSuspended:    0,
+		TenantDeleting:     0,
+		TenantDeleted:      1,
 	}
-	if got.Active != 1 {
-		t.Errorf("Active = %d, want 1", got.Active)
+	if len(got.Statuses) != len(want) {
+		t.Fatalf("status count length = %d, want %d: %+v", len(got.Statuses), len(want), got.Statuses)
+	}
+	for status, wantCount := range want {
+		if got.Count(status) != wantCount {
+			t.Errorf("count[%s] = %d, want %d", status, got.Count(status), wantCount)
+		}
 	}
 }
 
@@ -1547,6 +1558,78 @@ func TestClaimOldestFreeTenantPoolBindingRequiresActiveTenant(t *testing.T) {
 	}
 	if provisioningBinding.PoolStatus != TenantPoolBindingFree {
 		t.Errorf("provisioning pool status = %s, want %s", provisioningBinding.PoolStatus, TenantPoolBindingFree)
+	}
+}
+
+func TestCountTenantPoolBindingsByStatusGroupsByPoolOrganizationAndStatus(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for _, pool := range []TenantPool{
+		{
+			PoolID:         "pool-binding-counts-a",
+			OrganizationID: "org-binding-counts-a",
+			Size:           4,
+			Status:         TenantPoolActive,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		},
+		{
+			PoolID:         "pool-binding-counts-empty",
+			OrganizationID: "org-binding-counts-empty",
+			Size:           2,
+			Status:         TenantPoolActive,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		},
+	} {
+		if err := s.CreateTenantPool(ctx, &pool); err != nil {
+			t.Fatalf("create tenant pool %s: %v", pool.PoolID, err)
+		}
+	}
+	for _, tc := range []struct {
+		tenantID string
+		cluster  string
+		status   TenantStatus
+		pool     TenantPoolBindingStatus
+	}{
+		{tenantID: "binding-counts-free-1", cluster: "cluster-binding-counts-free-1", status: TenantActive, pool: TenantPoolBindingFree},
+		{tenantID: "binding-counts-free-2", cluster: "cluster-binding-counts-free-2", status: TenantProvisioning, pool: TenantPoolBindingFree},
+		{tenantID: "binding-counts-used-1", cluster: "cluster-binding-counts-used-1", status: TenantActive, pool: TenantPoolBindingUsed},
+		{tenantID: "binding-counts-deleted-1", cluster: "cluster-binding-counts-deleted-1", status: TenantDeleted, pool: TenantPoolBindingFree},
+	} {
+		insertTiDBCloudBindingTenant(t, s, tc.tenantID, TenantKindLive, tc.status, tc.cluster, "", now)
+		if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+			TenantID:       tc.tenantID,
+			OrganizationID: "org-binding-counts-a",
+			ClusterID:      tc.cluster,
+			PoolID:         "pool-binding-counts-a",
+			PoolStatus:     tc.pool,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}); err != nil {
+			t.Fatalf("upsert binding %s: %v", tc.tenantID, err)
+		}
+	}
+
+	counts, err := s.CountTenantPoolBindingsByStatus(ctx)
+	if err != nil {
+		t.Fatalf("count tenant pool bindings by status: %v", err)
+	}
+	got := map[string]int64{}
+	for _, count := range counts {
+		got[count.PoolID+"|"+count.OrganizationID+"|"+string(count.Status)] = count.Count
+	}
+	want := map[string]int64{
+		"pool-binding-counts-a|org-binding-counts-a|free":         2,
+		"pool-binding-counts-a|org-binding-counts-a|used":         1,
+		"pool-binding-counts-empty|org-binding-counts-empty|free": 0,
+		"pool-binding-counts-empty|org-binding-counts-empty|used": 0,
+	}
+	for key, wantCount := range want {
+		if got[key] != wantCount {
+			t.Fatalf("count %s = %d, want %d; all counts=%v", key, got[key], wantCount, got)
+		}
 	}
 }
 

@@ -40,16 +40,16 @@ func TestBackendRuntimeMetricsAggregateAcrossBackends(t *testing.T) {
 	}
 	// Image extract delivery is now durable (semantic_tasks), so queue capacity
 	// and workers are always 0 — the semantic worker handles processing.
-	if !strings.Contains(metricsText, 	"drive9_service_gauge{component=\"image_extract\",name=\"queue_capacity\",tenant_id=\"\"} 0") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"queue_capacity\",tenant_id=\"\",tidbcloud_org_id=\"guest\"} 0") {
 		t.Fatalf("metrics missing aggregated image queue capacity: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, 	"drive9_service_gauge{component=\"image_extract\",name=\"workers\",tenant_id=\"\"} 0") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"workers\",tenant_id=\"\",tidbcloud_org_id=\"guest\"} 0") {
 		t.Fatalf("metrics missing aggregated image workers: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\",tenant_id=\"\"} 4096") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\",tenant_id=\"\",tidbcloud_org_id=\"guest\"} 4096") {
 		t.Fatalf("metrics missing aggregated audio max bytes: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"task_timeout_seconds\",tenant_id=\"\"} 3") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"task_timeout_seconds\",tenant_id=\"\",tidbcloud_org_id=\"guest\"} 3") {
 		t.Fatalf("metrics missing aggregated audio timeout: %s", metricsText)
 	}
 
@@ -59,19 +59,19 @@ func TestBackendRuntimeMetricsAggregateAcrossBackends(t *testing.T) {
 	if !strings.Contains(metricsText, "drive9_module_up{module=\"image_extract\"} 1") {
 		t.Fatalf("metrics should keep image_extract available while one backend remains: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, 	"drive9_service_gauge{component=\"image_extract\",name=\"queue_capacity\",tenant_id=\"\"} 0") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"queue_capacity\",tenant_id=\"\",tidbcloud_org_id=\"guest\"} 0") {
 		t.Fatalf("metrics should keep image queue capacity at 0 after one backend closes: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, 	"drive9_service_gauge{component=\"image_extract\",name=\"workers\",tenant_id=\"\"} 0") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"workers\",tenant_id=\"\",tidbcloud_org_id=\"guest\"} 0") {
 		t.Fatalf("metrics should keep image workers at 0 after one backend closes: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\",tenant_id=\"\"} 2048") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\",tenant_id=\"\",tidbcloud_org_id=\"guest\"} 2048") {
 		t.Fatalf("metrics should retain remaining audio max bytes: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_extract_text_bytes\",tenant_id=\"\"} 555") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_extract_text_bytes\",tenant_id=\"\",tidbcloud_org_id=\"guest\"} 555") {
 		t.Fatalf("metrics should retain remaining audio text limit: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"task_timeout_seconds\",tenant_id=\"\"} 2") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"task_timeout_seconds\",tenant_id=\"\",tidbcloud_org_id=\"guest\"} 2") {
 		t.Fatalf("metrics should retain remaining audio timeout: %s", metricsText)
 	}
 

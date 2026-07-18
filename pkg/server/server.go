@@ -476,7 +476,7 @@ func NewWithConfig(cfg Config) *Server {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			setRequestMetricTenant(r.Context(), tenantID, "", "", classifyTenantRequest(r))
+			setRequestMetricTenant(r.Context(), tenantID, "", "", b.TiDBCloudOrgID(), classifyTenantRequest(r))
 			subReq := r.Clone(r.Context())
 			subURL := *r.URL
 			subURL.Path = "/" + sub
@@ -803,12 +803,14 @@ func (s *Server) startLeaderWorkers() {
 			ticker := time.NewTicker(tenantCountMetricsInterval)
 			defer ticker.Stop()
 			s.observeTenantCounts(workerCtx)
+			s.observeTenantPoolBindingCounts(workerCtx)
 			for {
 				select {
 				case <-workerCtx.Done():
 					return
 				case <-ticker.C:
 					s.observeTenantCounts(workerCtx)
+					s.observeTenantPoolBindingCounts(workerCtx)
 				}
 			}
 		})
@@ -1681,7 +1683,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
-	setRequestMetricTenant(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, classifyTenantRequest(r))
+	setRequestMetricTenant(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, resolved.TiDBCloudOrgID, classifyTenantRequest(r))
 	if resolved.APIKey.Status != meta.APIKeyActive {
 		metricEvent(r.Context(), "auth", "result", "key_inactive")
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_inactive", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "status", resolved.APIKey.Status)...)
@@ -1780,7 +1782,7 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
-	setRequestMetricTenant(r.Context(), "local", "local", "local", classifyTenantRequest(r))
+	setRequestMetricTenant(r.Context(), "local", "local", "local", defaultTenantMetricTiDBCloudOrgID, classifyTenantRequest(r))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", "local", "status", "active")...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
@@ -4452,7 +4454,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if claimed {
 			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
-			setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
+			setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
 			s.forgetTiDBCloudRBACList(*credentialReq)
 			if res.Status == meta.TenantProvisioning {
 				s.startProvisionedTenantSchemaInit(r.Context(), res)
@@ -4483,7 +4485,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "failed to provision tenant")
 		return
 	}
-	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
+	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
 	if credentialReq != nil {
 		s.forgetTiDBCloudRBACList(*credentialReq)
 	}
@@ -5019,7 +5021,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	tenantID := token.NewID()
 	provisionStarted := time.Now()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
-	setRequestMetricTenant(ctx, tenantID, "", provider, tenantRequestClass{surface: "provision", action: "post"})
+	setRequestMetricTenant(ctx, tenantID, "", provider, defaultTenantMetricTiDBCloudOrgID, tenantRequestClass{surface: "provision", action: "post"})
 
 	keyName := strings.TrimSpace(opts.KeyName)
 	if keyName == "" {
@@ -5368,7 +5370,7 @@ func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string,
 // compatibility path so e2e scripts can obtain one stable API key without
 // enabling the multi-tenant provision flow.
 func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Request) {
-	setRequestMetricTenant(r.Context(), "local", "local", "local", classifyTenantRequest(r))
+	setRequestMetricTenant(r.Context(), "local", "local", "local", defaultTenantMetricTiDBCloudOrgID, classifyTenantRequest(r))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", "local", "provider", "local")...)
 	metricEvent(r.Context(), "tenant_provision", "provider", "local", "result", "ok")
 	w.Header().Set("Content-Type", "application/json")

@@ -44,33 +44,32 @@ func (b *Dat9Backend) ProcessOneFileGCTask(ctx context.Context) (bool, error) {
 
 func (b *Dat9Backend) processOneFileGCTask(ctx context.Context, opts FileGCWorkerOptions) (processed bool, err error) {
 	start := time.Now()
-	tenantID := b.tenantID
 	task, found, err := b.store.ClaimFileGCTask(ctx, time.Now().UTC(), opts.LeaseDuration)
 	if err != nil {
-		metrics.RecordTenantOperation(tenantID, "file_gc", "claim", metrics.ResultForError(err), time.Since(start))
+		b.recordTenantOperation("file_gc", "claim", metrics.ResultForError(err), time.Since(start))
 		return false, err
 	}
 	if !found {
-		metrics.RecordTenantOperation(tenantID, "file_gc", "claim", "empty", time.Since(start))
+		b.recordTenantOperation("file_gc", "claim", "empty", time.Since(start))
 		return false, nil
 	}
 
 	err = b.processFileGCTask(ctx, task)
 	if err == nil {
 		if ackErr := b.store.AckFileGCTask(ctx, task.TaskID, task.Receipt); ackErr != nil {
-			metrics.RecordTenantOperation(tenantID, "file_gc", "ack", metrics.ResultForError(ackErr), time.Since(start))
+			b.recordTenantOperation("file_gc", "ack", metrics.ResultForError(ackErr), time.Since(start))
 			return true, ackErr
 		}
-		metrics.RecordTenantOperation(tenantID, "file_gc", "process", "ok", time.Since(start))
+		b.recordTenantOperation("file_gc", "process", "ok", time.Since(start))
 		return true, nil
 	}
 
 	retryAt := time.Now().UTC().Add(fileGCRetryDelay(task.AttemptCount, opts.RetryBase, opts.RetryMax))
 	if retryErr := b.store.RetryFileGCTask(ctx, task.TaskID, task.Receipt, retryAt, err.Error()); retryErr != nil {
-		metrics.RecordTenantOperation(tenantID, "file_gc", "retry", metrics.ResultForError(retryErr), time.Since(start))
+		b.recordTenantOperation("file_gc", "retry", metrics.ResultForError(retryErr), time.Since(start))
 		return true, fmt.Errorf("process file gc task %s: %w; update retry: %v", task.TaskID, err, retryErr)
 	}
-	metrics.RecordTenantOperation(tenantID, "file_gc", "process", metrics.ResultForError(err), time.Since(start))
+	b.recordTenantOperation("file_gc", "process", metrics.ResultForError(err), time.Since(start))
 	return true, err
 }
 

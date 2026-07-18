@@ -4,7 +4,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
-	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // ImageExtractUsage reports the resource consumption of one Vision API call.
@@ -40,7 +39,7 @@ func (b *Dat9Backend) recordImageExtractUsage(taskID string, usage ImageExtractU
 				zap.String("task_type", "img_extract_text"),
 				zap.String("task_id", taskID),
 				zap.Error(err))
-			metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "usage_insert", "error", 0)
+			b.recordTenantOperation("llm_cost_budget", "usage_insert", "error", 0)
 		}
 	}
 	if err := b.syncCentralLLMCostRecord(backgroundWithTrace(), "img_extract_text", taskID, cost, totalTokens, "tokens"); err != nil {
@@ -49,7 +48,7 @@ func (b *Dat9Backend) recordImageExtractUsage(taskID string, usage ImageExtractU
 			zap.String("task_type", "img_extract_text"),
 			zap.String("task_id", taskID),
 			zap.Error(err))
-		metrics.RecordTenantOperation(b.tenantID, "central_quota", "llm_cost_record", "log_error", 0)
+		b.recordTenantOperation("central_quota", "llm_cost_record", "log_error", 0)
 	}
 }
 
@@ -82,7 +81,7 @@ func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractU
 				zap.String("task_type", "audio_extract_text"),
 				zap.String("task_id", taskID),
 				zap.Error(err))
-			metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "usage_insert", "error", 0)
+			b.recordTenantOperation("llm_cost_budget", "usage_insert", "error", 0)
 		}
 	}
 	if err := b.syncCentralLLMCostRecord(backgroundWithTrace(), "audio_extract_text", taskID, cost, rawUnits, rawUnitType); err != nil {
@@ -91,7 +90,7 @@ func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractU
 			zap.String("task_type", "audio_extract_text"),
 			zap.String("task_id", taskID),
 			zap.Error(err))
-		metrics.RecordTenantOperation(b.tenantID, "central_quota", "llm_cost_record", "log_error", 0)
+		b.recordTenantOperation("central_quota", "llm_cost_record", "log_error", 0)
 	}
 }
 
@@ -130,7 +129,7 @@ func (b *Dat9Backend) monthlyLLMCostExceeded() bool {
 	total, err := b.store.MonthlyLLMCostMillicents()
 	if err != nil {
 		logger.Warn(backgroundWithTrace(), "llm_cost_budget_check_fail_open", zap.String("tenant_id", b.tenantID), zap.Error(err))
-		metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "quota_check", "fail_open", 0)
+		b.recordTenantOperation("llm_cost_budget", "quota_check", "fail_open", 0)
 		return false
 	}
 	return total > b.maxMonthlyLLMCostMillicents

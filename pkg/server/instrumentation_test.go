@@ -121,7 +121,7 @@ func TestRequestTenantID(t *testing.T) {
 	}
 	ctx := withRequestMetricState(req.Context(), &requestMetricState{})
 	req = req.WithContext(ctx)
-	setRequestMetricTenant(req.Context(), "tenant-a", "", "", tenantRequestClass{surface: "object_store", action: "get_object"})
+	setRequestMetricTenant(req.Context(), "tenant-a", "", "", "org-a", tenantRequestClass{surface: "object_store", action: "get_object"})
 	if got := requestTenantID(req); got != "tenant-a" {
 		t.Fatalf("requestTenantID with verified scope = %q, want tenant-a", got)
 	}
@@ -134,16 +134,16 @@ func TestSetRequestMetricTenantMovesInFlightLabel(t *testing.T) {
 	ctx = withRequestMetricState(ctx, state)
 	class := tenantRequestClass{surface: "object_store", action: "upload_part"}
 
-	setRequestMetricTenant(ctx, "local", "", "", class)
-	if got := m.tenantInFlight[tenantInFlightKey("local", "object_store", "upload_part")]; got != 1 {
+	setRequestMetricTenant(ctx, "local", "", "", "", class)
+	if got := m.tenantInFlight[tenantInFlightKey("local", defaultTenantMetricTiDBCloudOrgID, "object_store", "upload_part")]; got != 1 {
 		t.Fatalf("local in-flight = %d, want 1", got)
 	}
 
-	setRequestMetricTenant(ctx, "tenant-a", "", "", class)
-	if got := m.tenantInFlight[tenantInFlightKey("local", "object_store", "upload_part")]; got != 0 {
+	setRequestMetricTenant(ctx, "tenant-a", "", "", "org-a", class)
+	if got := m.tenantInFlight[tenantInFlightKey("local", defaultTenantMetricTiDBCloudOrgID, "object_store", "upload_part")]; got != 0 {
 		t.Fatalf("local in-flight after move = %d, want 0", got)
 	}
-	if got := m.tenantInFlight[tenantInFlightKey("tenant-a", "object_store", "upload_part")]; got != 1 {
+	if got := m.tenantInFlight[tenantInFlightKey("tenant-a", "org-a", "object_store", "upload_part")]; got != 1 {
 		t.Fatalf("tenant-a in-flight = %d, want 1", got)
 	}
 

@@ -436,7 +436,7 @@ func TestPoolCreateBackendSkipsSchemaEnsureWhenVersionMatches(t *testing.T) {
 		applyTiDBAutoEmbeddingProviderConfig = origApply
 	})
 
-	backend, store, err := pool.createBackend(context.Background(), tenant)
+	backend, store, _, err := pool.createBackend(context.Background(), tenant)
 	if err != nil {
 		t.Fatalf("createBackend(): %v", err)
 	}
@@ -470,7 +470,7 @@ func TestPoolCreateBackendEnsuresSchemaForTiDBCloudNative(t *testing.T) {
 		applyTiDBAutoEmbeddingProviderConfig = origApply
 	})
 
-	backend, store, err := pool.createBackend(context.Background(), tenant)
+	backend, store, _, err := pool.createBackend(context.Background(), tenant)
 	if err != nil {
 		t.Fatalf("createBackend(): %v", err)
 	}
@@ -515,7 +515,7 @@ func TestPoolCreateBackendRepairsFTSOnlySchemaWhenDatabaseAutoEmbeddingDisabled(
 		applyTiDBAutoEmbeddingProviderConfig = origApply
 	})
 
-	b, store, err := pool.createBackend(context.Background(), tenant)
+	b, store, _, err := pool.createBackend(context.Background(), tenant)
 	if err != nil {
 		t.Fatalf("createBackend(): %v", err)
 	}

@@ -214,7 +214,7 @@ func (p *tenantOutboxPoller) dispatch(ctx context.Context, row meta.TenantNotify
 			// worker. This gives a baseline rate of "kicks dispatched" to
 			// compare against actual tenant_worker_acquire — a divergence
 			// (kicks without acquires) points to lost work.
-			metrics.RecordTenantOperationCount(row.TenantID, "user_db_access", "outbox_dispatch_kick", "ok")
+			metrics.RecordTenantOperationCountWithOrg(row.TenantID, defaultTenantMetricTiDBCloudOrgID, "user_db_access", "outbox_dispatch_kick", "ok")
 		}
 	}
 }

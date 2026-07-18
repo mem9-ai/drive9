@@ -20,13 +20,15 @@ type dbProbeState struct {
 }
 
 type registeredDB struct {
-	role     string
-	tenantID string
+	role           string
+	tenantID       string
+	tidbCloudOrgID string
 }
 
 type dbMetricKey struct {
-	role     string
-	tenantID string
+	role           string
+	tenantID       string
+	tidbCloudOrgID string
 }
 
 type dbMetrics struct {
@@ -93,12 +95,16 @@ func RegisterDB(role string, db *sql.DB) {
 }
 
 func RegisterTenantDB(role, tenantID string, db *sql.DB) {
+	RegisterTenantDBWithOrg(role, tenantID, "", db)
+}
+
+func RegisterTenantDBWithOrg(role, tenantID, tidbCloudOrgID string, db *sql.DB) {
 	if db == nil {
 		return
 	}
 	RegisterModule("db")
 	globalDB.mu.Lock()
-	globalDB.dbs[db] = registeredDB{role: role, tenantID: tenantID}
+	globalDB.dbs[db] = registeredDB{role: role, tenantID: tenantID, tidbCloudOrgID: tidbCloudOrgID}
 	globalDB.mu.Unlock()
 }
 
@@ -431,8 +437,9 @@ func writeDBPoolCloses(w http.ResponseWriter, key dbMetricKey, labels, reason st
 
 func (p registeredDB) metricKey() dbMetricKey {
 	return dbMetricKey{
-		role:     cleanMetricValue(p.role, "unknown"),
-		tenantID: cleanMetricValue(p.tenantID, "unknown"),
+		role:           cleanMetricValue(p.role, "unknown"),
+		tenantID:       cleanMetricValue(p.tenantID, "unknown"),
+		tidbCloudOrgID: cleanTiDBCloudOrgID(p.tidbCloudOrgID),
 	}
 }
 
@@ -482,7 +489,7 @@ func observeDBProbeDuration(start time.Time, role, result string) {
 func dbLabels(key dbMetricKey) string {
 	labels := fmt.Sprintf("role=\"%s\"", EscapePromLabel(key.role))
 	if key.hasTenantID() {
-		labels += fmt.Sprintf(",tenant_id=\"%s\"", EscapePromLabel(key.tenantID))
+		labels += fmt.Sprintf(",tenant_id=\"%s\",tidbcloud_org_id=\"%s\"", EscapePromLabel(key.tenantID), EscapePromLabel(key.tidbCloudOrgID))
 	}
 	return labels
 }
@@ -500,7 +507,10 @@ func sortedDBMetricKeys(totals map[dbMetricKey]dbPoolTotals) []dbMetricKey {
 		if keys[i].role != keys[j].role {
 			return keys[i].role < keys[j].role
 		}
-		return keys[i].tenantID < keys[j].tenantID
+		if keys[i].tenantID != keys[j].tenantID {
+			return keys[i].tenantID < keys[j].tenantID
+		}
+		return keys[i].tidbCloudOrgID < keys[j].tidbCloudOrgID
 	})
 	return keys
 }

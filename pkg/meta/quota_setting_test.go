@@ -394,7 +394,7 @@ func TestRetryMetaLockConflictRetriesDeadlock(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	metrics.WritePrometheus(rec)
-	if !strings.Contains(rec.Body.String(), `drive9_service_operations_total{component="central_quota",operation="reserve_upload",result="lock_conflict_retry",tenant_id="tenant-retry-metric"} 2`) {
+	if !strings.Contains(rec.Body.String(), `drive9_service_operations_total{component="central_quota",operation="reserve_upload",result="lock_conflict_retry",tenant_id="tenant-retry-metric",tidbcloud_org_id="guest"} 2`) {
 		t.Fatalf("missing lock conflict retry metric:\n%s", rec.Body.String())
 	}
 }

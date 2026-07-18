@@ -28,6 +28,7 @@ type TenantScope struct {
 	APIKeyID           string
 	TokenVersion       int
 	Provider           string
+	TiDBCloudOrgID     string
 	Backend            *backend.Dat9Backend
 	JournalPermissions map[string]bool
 	ScopeKind          meta.APIKeyScopeKind
@@ -204,7 +205,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			errJSON(w, http.StatusUnauthorized, "invalid API key")
 			return
 		}
-		setRequestMetricTenant(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, classifyTenantRequest(r))
+		setRequestMetricTenant(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, resolved.TiDBCloudOrgID, classifyTenantRequest(r))
 
 		if resolved.APIKey.Status != meta.APIKeyActive {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_key_inactive", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "status", resolved.APIKey.Status)...)
@@ -327,7 +328,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 		// Request-path acquire: this is the expected hot-path user-DB access,
 		// driven by real traffic. Record so scan-detection alerts can compare
 		// periodic-path rates against this baseline.
-		metrics.RecordTenantOperation(resolved.Tenant.ID, "user_db_access", "auth_acquire", metrics.ResultForError(err), time.Since(acquireStart))
+		metrics.RecordTenantOperationWithOrg(resolved.Tenant.ID, resolved.TiDBCloudOrgID, "user_db_access", "auth_acquire", metrics.ResultForError(err), time.Since(acquireStart))
 		if err != nil {
 			if isClientCanceled(r.Context(), err) {
 				logAuthClientCanceled(r.Context(), "backend_load_client_canceled", "tenant_id", resolved.Tenant.ID)
@@ -347,6 +348,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			zap.String("method", r.Method),
 			zap.String("tenant_id", resolved.Tenant.ID),
 			zap.String("api_key_id", resolved.APIKey.ID),
+			zap.String("tidbcloud_org_id", b.TiDBCloudOrgID()),
 			zap.Float64("resolve_api_key_hash_ms", resolveDurationMs),
 			zap.Float64("decrypt_token_ms", decryptDurationMs),
 			zap.Float64("verify_token_ms", verifyDurationMs),
@@ -359,6 +361,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			APIKeyID:           resolved.APIKey.ID,
 			TokenVersion:       resolved.APIKey.TokenVersion,
 			Provider:           resolved.Tenant.Provider,
+			TiDBCloudOrgID:     b.TiDBCloudOrgID(),
 			Backend:            b,
 			JournalPermissions: journalPermissionsFromClaims(claims),
 			ScopeKind:          scopeKind,
@@ -425,6 +428,7 @@ func handleDeleteNoAcquireAuth(w http.ResponseWriter, r *http.Request, pool *ten
 		APIKeyID:           resolved.APIKey.ID,
 		TokenVersion:       resolved.APIKey.TokenVersion,
 		Provider:           resolved.Tenant.Provider,
+		TiDBCloudOrgID:     resolved.TiDBCloudOrgID,
 		JournalPermissions: journalPermissionsFromClaims(claims),
 		ScopeKind:          scopeKind,
 		IsScoped:           isScoped,
@@ -468,7 +472,11 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 		b, release, err := pool.Acquire(r.Context(), tenant)
 		// Capability-token request-path acquire: same baseline signal as the
 		// API-key path above, but for the /v1/vault/read surface.
-		metrics.RecordTenantOperation(tenantID, "user_db_access", "auth_acquire", metrics.ResultForError(err), time.Since(capAcquireStart))
+		authAcquireOrgID := defaultTenantMetricTiDBCloudOrgID
+		if b != nil {
+			authAcquireOrgID = b.TiDBCloudOrgID()
+		}
+		metrics.RecordTenantOperationWithOrg(tenantID, authAcquireOrgID, "user_db_access", "auth_acquire", metrics.ResultForError(err), time.Since(capAcquireStart))
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "capability_backend_load_failed", "tenant_id", tenantID, "error", err)...)
 			errJSON(w, http.StatusInternalServerError, "backend unavailable")
@@ -476,7 +484,7 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 		}
 		defer release()
 
-		scope := &TenantScope{TenantID: tenantID, Provider: tenant.Provider, Backend: b}
+		scope := &TenantScope{TenantID: tenantID, Provider: tenant.Provider, TiDBCloudOrgID: b.TiDBCloudOrgID(), Backend: b}
 		setRequestMetricScope(r.Context(), scope, classifyTenantRequest(r))
 		sub := strings.TrimPrefix(r.URL.Path, "/v1/vault/read")
 		s.handleVaultRead(w, r.WithContext(withScope(r.Context(), scope)), sub)

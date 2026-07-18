@@ -153,14 +153,14 @@ func (w *objectGCWorker) processCandidate(ctx context.Context, candidate meta.Ob
 		// Acquire failure: could not open the owner tenant TiDB for this GC
 		// candidate. Record so the warning alert can detect a GC path that is
 		// churning cold opens or hitting bad connections.
-		metrics.RecordTenantOperation(owner.ID, "user_db_access", "object_gc_acquire", metrics.ResultForError(err), time.Since(acquireStart))
+		metrics.RecordTenantOperationWithOrg(owner.ID, tenantMetricTiDBCloudOrgIDFromMeta(ctx, w.meta, owner), "user_db_access", "object_gc_acquire", metrics.ResultForError(err), time.Since(acquireStart))
 		return err
 	}
 	defer release()
 	// Acquire success: the owner tenant TiDB is now open for this GC check.
 	// Object-GC is leader-gated and opens cold tenants — a spike here is a
 	// potential billing-storm contributor, hence the warning alert.
-	metrics.RecordTenantOperation(owner.ID, "user_db_access", "object_gc_acquire", "ok", time.Since(acquireStart))
+	metrics.RecordTenantOperationWithOrg(owner.ID, b.TiDBCloudOrgID(), "user_db_access", "object_gc_acquire", "ok", time.Since(acquireStart))
 
 	reachable, err := b.HasConfirmedS3StorageRef(ctx, candidate.StorageRefHash, candidate.StorageRef)
 	if err != nil {

@@ -4,12 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
+
+const defaultTenantMetricTiDBCloudOrgID = "guest"
 
 // MetaQuotaStore defines the interface for central quota operations on the
 // drive9 server DB. Implemented by *meta.Store; injected via Pool to avoid
@@ -121,17 +125,19 @@ type LLMUsageView struct {
 
 // MutationLogView is the backend-side view of a quota mutation log entry.
 type MutationLogView struct {
-	ID           int64 // populated only when read from ListPendingMutations
-	TenantID     string
-	MutationType string
-	MutationData json.RawMessage
-	RetryCount   int // populated only when read from ListPendingMutations
+	ID             int64 // populated only when read from ListPendingMutations
+	TenantID       string
+	TiDBCloudOrgID string
+	MutationType   string
+	MutationData   json.RawMessage
+	RetryCount     int // populated only when read from ListPendingMutations
 }
 
 // MutationBacklogView is a tenant-level observation of pending quota mutation
 // replay work. It is used only for runtime metrics and alerting.
 type MutationBacklogView struct {
 	TenantID                string
+	TiDBCloudOrgID          string
 	PendingCount            int64
 	OldestPendingAgeSeconds float64
 }
@@ -139,7 +145,7 @@ type MutationBacklogView struct {
 // SetMetaQuotaStore sets the central quota store on the backend.
 // Called by tenant.Pool after backend creation.
 func (b *Dat9Backend) SetMetaQuotaStore(ctx context.Context, tenantID string, mqs MetaQuotaStore) {
-	b.tenantID = tenantID
+	b.SetTenantMetricScope(tenantID, b.tidbCloudOrgID)
 	b.metaStore = mqs
 	if mqs != nil {
 		if err := mqs.EnsureQuotaUsageRow(ctx, tenantID); err != nil {
@@ -149,14 +155,41 @@ func (b *Dat9Backend) SetMetaQuotaStore(ctx context.Context, tenantID string, mq
 		}
 	}
 	if mqs != nil {
-		b.quotaConfigCache = newQuotaConfigCache(tenantID, mqs)
-		b.quotaUsageCache = newQuotaUsageCache(tenantID, mqs, quotaUsageCacheTTL)
-		b.quotaPendingCache = newQuotaPendingDeltasCache(b.tenantID, nil, quotaPendingDeltasCacheTTL)
+		b.quotaConfigCache = newQuotaConfigCache(tenantID, b.tidbCloudOrgID, mqs)
+		b.quotaUsageCache = newQuotaUsageCache(tenantID, b.tidbCloudOrgID, mqs, quotaUsageCacheTTL)
+		b.quotaPendingCache = newQuotaPendingDeltasCache(b.tenantID, b.tidbCloudOrgID, nil, quotaPendingDeltasCacheTTL)
 		b.startMutationWorker()
 	}
+}
+
+// SetTenantMetricScope sets the tenant dimensions used by backend-owned
+// metrics. It does not perform tenant lookup; callers must pass the resolved
+// TiDB Cloud org explicitly.
+func (b *Dat9Backend) SetTenantMetricScope(tenantID, tidbCloudOrgID string) {
+	if strings.TrimSpace(tenantID) != "" {
+		b.tenantID = tenantID
+	}
+	b.tidbCloudOrgID = normalizeTenantMetricTiDBCloudOrgID(tidbCloudOrgID)
 }
 
 // TenantID returns the tenant identifier for this backend instance.
 func (b *Dat9Backend) TenantID() string {
 	return b.tenantID
+}
+
+// TiDBCloudOrgID returns the TiDB Cloud org label value for tenant metrics.
+func (b *Dat9Backend) TiDBCloudOrgID() string {
+	return normalizeTenantMetricTiDBCloudOrgID(b.tidbCloudOrgID)
+}
+
+func normalizeTenantMetricTiDBCloudOrgID(orgID string) string {
+	orgID = strings.TrimSpace(orgID)
+	if orgID == "" {
+		return defaultTenantMetricTiDBCloudOrgID
+	}
+	return orgID
+}
+
+func (b *Dat9Backend) recordTenantOperation(component, operation, result string, d time.Duration) {
+	metrics.RecordTenantOperationWithOrg(b.tenantID, b.tidbCloudOrgID, component, operation, result, d)
 }
