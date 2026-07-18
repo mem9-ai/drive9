@@ -404,7 +404,11 @@ func TestBatchProvisionFreeClustersUsesBatchCreateAndFreeLabel(t *testing.T) {
 	}
 }
 
-func TestBatchProvisionFreeClustersReturnsCreatedClustersWithoutMetadataWait(t *testing.T) {
+func TestBatchProvisionFreeClustersWaitsForPublicHost(t *testing.T) {
+	origPoll := tidbCloudNativeBatchMetadataPollInterval
+	tidbCloudNativeBatchMetadataPollInterval = time.Millisecond
+	t.Cleanup(func() { tidbCloudNativeBatchMetadataPollInterval = origPoll })
+
 	var listCalls atomic.Int32
 	handlerErrs := make(chan error, 2)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -434,8 +438,25 @@ func TestBatchProvisionFreeClustersReturnsCreatedClustersWithoutMetadataWait(t *
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters":
 			listCalls.Add(1)
-			handlerErrs <- fmt.Errorf("unexpected metadata wait request %q", r.URL.String())
-			http.Error(w, "unexpected metadata wait", http.StatusInternalServerError)
+			if filter := r.URL.Query().Get("filter"); !strings.Contains(filter, `clusterId = "cluster-2"`) || !strings.Contains(filter, Drive9ManagedLabel) {
+				handlerErrs <- fmt.Errorf("unexpected list filter %q", filter)
+				http.Error(w, "unexpected filter", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusters": []map[string]any{
+					{
+						"clusterId": "cluster-2",
+						"state":     "ACTIVE",
+						"labels": map[string]string{
+							TiDBCloudOrganizationLabel: "org-1",
+							Drive9TenantIDLabel:        "tenant-2",
+						},
+						"userPrefix": "u2",
+						"endpoints":  map[string]any{"public": map[string]any{"host": "db2.example", "port": 4000}},
+					},
+				},
+			})
 		default:
 			handlerErrs <- fmt.Errorf("unexpected request %s %s", r.Method, r.URL.String())
 			http.Error(w, "unexpected request", http.StatusInternalServerError)
@@ -458,8 +479,8 @@ func TestBatchProvisionFreeClustersReturnsCreatedClustersWithoutMetadataWait(t *
 		t.Fatalf("BatchProvisionFreeClustersWithCredentialsAndQuota: %v", err)
 	}
 	assertNoHandlerError(t, handlerErrs)
-	if listCalls.Load() != 0 {
-		t.Fatalf("metadata list calls = %d, want 0", listCalls.Load())
+	if listCalls.Load() != 1 {
+		t.Fatalf("metadata list calls = %d, want 1", listCalls.Load())
 	}
 	if len(out) != 2 {
 		t.Fatalf("clusters = %d, want 2: %#v", len(out), out)
@@ -470,8 +491,90 @@ func TestBatchProvisionFreeClustersReturnsCreatedClustersWithoutMetadataWait(t *
 	if out[0].Password == "" || out[1].Password == "" {
 		t.Fatalf("clusters did not preserve generated passwords: %#v", out)
 	}
-	if out[1].Host != "" || out[1].Port != 0 {
-		t.Fatalf("incomplete cluster connection = %#v, want no endpoint", out[1])
+	if out[1].Host != "db2.example" || out[1].Port != 4000 || out[1].Username != "u2.root" {
+		t.Fatalf("cluster 2 connection = %#v", out[1])
+	}
+}
+
+func TestBatchProvisionFreeClustersWaitsForPrivateEndpointPublicHost(t *testing.T) {
+	origPoll := tidbCloudNativeBatchMetadataPollInterval
+	tidbCloudNativeBatchMetadataPollInterval = time.Millisecond
+	t.Cleanup(func() { tidbCloudNativeBatchMetadataPollInterval = origPoll })
+
+	var listCalls atomic.Int32
+	handlerErrs := make(chan error, 2)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1beta1/clusters:batchCreate":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusters": []map[string]any{
+					{
+						"clusterId":  "cluster-1",
+						"state":      "ACTIVE",
+						"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1", Drive9TenantIDLabel: "tenant-1"},
+						"userPrefix": "u1",
+						"endpoints":  map[string]any{"private": map[string]any{"port": 4001}},
+					},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters":
+			listCalls.Add(1)
+			if filter := r.URL.Query().Get("filter"); !strings.Contains(filter, `clusterId = "cluster-1"`) || !strings.Contains(filter, Drive9ManagedLabel) {
+				handlerErrs <- fmt.Errorf("unexpected list filter %q", filter)
+				http.Error(w, "unexpected filter", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusters": []map[string]any{
+					{
+						"clusterId": "cluster-1",
+						"state":     "ACTIVE",
+						"labels": map[string]string{
+							TiDBCloudOrganizationLabel: "org-1",
+							Drive9TenantIDLabel:        "tenant-1",
+						},
+						"userPrefix": "u1",
+						"endpoints": map[string]any{
+							"public":  map[string]any{"host": "public-a.example", "port": 4000},
+							"private": map[string]any{"port": 4001},
+						},
+					},
+				},
+			})
+		default:
+			handlerErrs <- fmt.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:                 ts.URL,
+		cloudProvider:          "aws",
+		region:                 "us-east-1",
+		defaultDatabaseName:    DefaultDatabaseName,
+		usePrivateEndpoint:     true,
+		privateEndpointHostMap: map[string]string{"public-a.example": "private-a.internal"},
+		client:                 ts.Client(),
+	}
+	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(context.Background(), []string{"tenant-1"}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{})
+	if err != nil {
+		t.Fatalf("BatchProvisionFreeClustersWithCredentialsAndQuota: %v", err)
+	}
+	assertNoHandlerError(t, handlerErrs)
+	if listCalls.Load() != 1 {
+		t.Fatalf("metadata list calls = %d, want 1", listCalls.Load())
+	}
+	if len(out) != 1 || out[0].Host != "private-a.internal" || out[0].Port != 4001 || out[0].Username != "u1.root" {
+		t.Fatalf("clusters = %#v", out)
 	}
 }
 

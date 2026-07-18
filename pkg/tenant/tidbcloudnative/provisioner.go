@@ -422,6 +422,7 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 	}
 	out := make([]*tenant.ClusterInfo, len(created.Clusters))
 	errs := make([]error, len(created.Clusters))
+	pending := make([]batchClusterMetadataTarget, 0, len(created.Clusters))
 	for i := range created.Clusters {
 		i := i
 		info := created.Clusters[i]
@@ -439,7 +440,20 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 			errs[i] = fmt.Errorf("tidbcloud native batch response missing cluster id for tenant %q", tenantID)
 			continue
 		}
+		if p.clusterProvisionMetadataIncomplete(&info) {
+			pending = append(pending, batchClusterMetadataTarget{
+				index:    i,
+				tenantID: tenantID,
+				password: password,
+				dbName:   dbName,
+				initial:  info,
+			})
+			continue
+		}
 		out[i], errs[i] = p.clusterInfoFromResponse(tenantID, dbName, password, &info)
+	}
+	if len(pending) > 0 {
+		p.waitForBatchClusterProvisionMetadata(ctx, publicKey, privateKey, strings.TrimSpace(opts.TenantPoolID), pending, out, errs)
 	}
 	for _, err := range errs {
 		if err != nil {
