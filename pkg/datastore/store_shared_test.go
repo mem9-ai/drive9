@@ -74,7 +74,7 @@ func countFsIDRows(t *testing.T, s *Store, tbl string, fsID int64) int64 {
 // runStoreCoreScenario exercises the Core FS flows — create file (inode,
 // content, semantic, dentry), get/list by path and by parent, overwrite with
 // revision bump, tag replace/query, upload reservation lifecycle, ref-checked
-// delete with GC enqueue, and llm_usage accounting — against a store. It runs
+// delete with GC enqueue — against a store. It runs
 // against the shared schema shape to prove behavioral parity with the
 // standalone flows covered by store_test.go / file_tx_test.go.
 func runStoreCoreScenario(t *testing.T, s *Store, pfx string) {
@@ -329,18 +329,6 @@ func runStoreCoreScenario(t *testing.T, s *Store, pfx string) {
 	if task.Status != FileGCTaskQueued || task.StorageRef != "inline:"+pfx+":v2" {
 		t.Fatalf("gc task = %+v", task)
 	}
-
-	// llm_usage accounting.
-	if err := s.InsertLLMUsage("img_extract_text", pfx+"-llm", 42, 1, "image"); err != nil {
-		t.Fatalf("InsertLLMUsage: %v", err)
-	}
-	cost, err := s.MonthlyLLMCostMillicents()
-	if err != nil {
-		t.Fatalf("MonthlyLLMCostMillicents: %v", err)
-	}
-	if cost != 42 {
-		t.Fatalf("monthly llm cost = %d, want 42", cost)
-	}
 }
 
 // TestStoreSharedShapeParity runs the Core FS scenario against the shared
@@ -358,7 +346,7 @@ func TestStoreSharedShapeParity(t *testing.T) {
 // TestStoreSharedShapeCrossTenantIsolation proves rows of one fs_id are
 // invisible to another fs_id on the same shared tables: the same path can
 // coexist under two fs_ids (UNIQUE (fs_id, path_hash)), and reads, writes,
-// deletes, uploads, and llm_usage never cross the tenant boundary.
+// deletes, and uploads never cross the tenant boundary.
 func TestStoreSharedShapeCrossTenantIsolation(t *testing.T) {
 	installSharedCoreFSNoLegacy(t)
 	ctx := context.Background()
@@ -477,20 +465,6 @@ func TestStoreSharedShapeCrossTenantIsolation(t *testing.T) {
 		t.Fatalf("B upload status after A abort = %q, want UPLOADING", upB.Status)
 	}
 
-	// llm_usage sums stay per-tenant.
-	if err := storeA.InsertLLMUsage("embed", "iso-a-llm", 100, 1, "req"); err != nil {
-		t.Fatalf("InsertLLMUsage A: %v", err)
-	}
-	if err := storeB.InsertLLMUsage("embed", "iso-b-llm", 7, 1, "req"); err != nil {
-		t.Fatalf("InsertLLMUsage B: %v", err)
-	}
-	if cost, err := storeA.MonthlyLLMCostMillicents(); err != nil || cost != 100 {
-		t.Fatalf("A monthly llm cost = %d, %v; want 100, nil", cost, err)
-	}
-	if cost, err := storeB.MonthlyLLMCostMillicents(); err != nil || cost != 7 {
-		t.Fatalf("B monthly llm cost = %d, %v; want 7, nil", cost, err)
-	}
-
 	// A delete under A must not touch B's dentry or file.
 	if err := storeA.DeleteNode(ctx, "/iso/shared.txt"); err != nil {
 		t.Fatalf("DeleteNode A: %v", err)
@@ -535,11 +509,11 @@ func TestStoreSharedShapeStoresFsID(t *testing.T) {
 	}
 
 	// The scenario writes file_nodes, inodes, contents, semantic, file_tags,
-	// uploads, and llm_usage directly; the ref-checked delete additionally
-	// enqueues a file_gc_tasks row.
+	// and uploads directly; the ref-checked delete additionally enqueues a
+	// file_gc_tasks row.
 	for _, tbl := range []string{
 		"file_nodes", "inodes", "contents", "semantic", "file_tags",
-		"uploads", "llm_usage", "file_gc_tasks",
+		"uploads", "file_gc_tasks",
 	} {
 		requireOnlyFsIDRows(t, store, tbl, fsID)
 	}
@@ -547,8 +521,8 @@ func TestStoreSharedShapeStoresFsID(t *testing.T) {
 
 // TestSanitizeForkRuntimeStateSharedShape proves the fork sanitize only wipes
 // its own fs_id's runtime state on the shared schema: pending upload state,
-// uploads, task tables, llm_usage, and vault rows of the other tenant must
-// survive untouched.
+// uploads, task tables, and vault rows of the other tenant must survive
+// untouched.
 func TestSanitizeForkRuntimeStateSharedShape(t *testing.T) {
 	installSharedCoreFSNoLegacy(t)
 	installSharedVaultSchema(t)
@@ -596,9 +570,6 @@ func TestSanitizeForkRuntimeStateSharedShape(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("InsertUpload %s: %v", tc.pfx, err)
 		}
-		if err := tc.store.InsertLLMUsage("embed", tc.pfx+"-llm", 11, 1, "req"); err != nil {
-			t.Fatalf("InsertLLMUsage %s: %v", tc.pfx, err)
-		}
 		// Rows in the task/vault tables that sanitize wipes wholesale.
 		if _, err := tc.store.DB().Exec(`INSERT INTO file_gc_tasks (fs_id, task_id, file_id, storage_type, storage_ref, status)
 			VALUES (?, ?, ?, 'db9', 'ref', 'QUEUED')`, tc.fsID, "gc-"+tc.pfx, "file-"+tc.pfx); err != nil {
@@ -641,10 +612,7 @@ func TestSanitizeForkRuntimeStateSharedShape(t *testing.T) {
 	if _, err := storeA.GetUpload(ctx, "san-a-upload"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("A upload err = %v, want ErrNotFound", err)
 	}
-	if cost, err := storeA.MonthlyLLMCostMillicents(); err != nil || cost != 0 {
-		t.Fatalf("A monthly llm cost after sanitize = %d, %v; want 0, nil", cost, err)
-	}
-	for _, tbl := range []string{"uploads", "file_gc_tasks", "semantic_tasks", "llm_usage", "vault_deks"} {
+	for _, tbl := range []string{"uploads", "file_gc_tasks", "semantic_tasks", "vault_deks"} {
 		if n := countFsIDRows(t, storeA, tbl, fsA); n != 0 {
 			t.Fatalf("A %s rows after sanitize = %d, want 0", tbl, n)
 		}
@@ -664,10 +632,7 @@ func TestSanitizeForkRuntimeStateSharedShape(t *testing.T) {
 	if _, err := storeB.GetUpload(ctx, "san-b-upload"); err != nil {
 		t.Fatalf("B upload: %v", err)
 	}
-	if cost, err := storeB.MonthlyLLMCostMillicents(); err != nil || cost != 11 {
-		t.Fatalf("B monthly llm cost = %d, %v; want 11, nil", cost, err)
-	}
-	for _, tbl := range []string{"uploads", "file_gc_tasks", "semantic_tasks", "llm_usage", "vault_deks"} {
+	for _, tbl := range []string{"uploads", "file_gc_tasks", "semantic_tasks", "vault_deks"} {
 		if n := countFsIDRows(t, storeB, tbl, fsB); n != 1 {
 			t.Fatalf("B %s rows = %d, want 1", tbl, n)
 		}

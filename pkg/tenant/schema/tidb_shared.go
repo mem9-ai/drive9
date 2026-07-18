@@ -15,14 +15,18 @@ import (
 // definitions otherwise mirror the standalone ones verbatim, so primary key
 // member columns pick up their implicit NOT NULL from the key itself.
 //
-// Two documented exceptions keep their global AUTO_INCREMENT physical primary
-// key unchanged (docs/TENANT_DB_REDESIGN.md §5.4) and only gain the fs_id
-// column plus (fs_id, ...) lookup indexes:
+// fs_events is the one documented exception that keeps its global
+// AUTO_INCREMENT physical primary key unchanged and only gains the fs_id
+// column plus an (fs_id, ...) lookup index: seq stays the primary key;
+// idx_fs_events_created stays unprefixed; idx_fs_events_fs_seq (fs_id, seq)
+// is new.
 //
-//   - llm_usage: id stays the primary key; idx_llm_usage_created stays
-//     unprefixed; idx_llm_usage_fs (fs_id, created_at) is new.
-//   - fs_events: seq stays the primary key; idx_fs_events_created stays
-//     unprefixed; idx_fs_events_fs_seq (fs_id, seq) is new.
+// llm_usage is deliberately NOT part of the shared schema. The central meta
+// DB ledger (tenant_llm_usage) is authoritative in multi-tenant deployments —
+// the backend only writes the tenant-DB llm_usage when server quota is not
+// active (single-tenant/local mode), which shared-schema databases never run.
+// Carrying the table in shared shape would duplicate the central ledger for
+// no reader.
 //
 // The uploads repair artifact (the standalone ALTER TABLE uploads ADD COLUMN
 // expected_revision) is folded directly into the CREATE TABLE. The semantic
@@ -178,18 +182,6 @@ func CoreFSTiDBSharedSchemaStatements() []string {
 			UNIQUE KEY uk_file_gc_file_id (fs_id, file_id),
 			UNIQUE KEY uk_file_gc_inode_id (fs_id, inode_id),
 			KEY idx_file_gc_claim (fs_id, status, available_at, lease_until, created_at)
-		)`,
-		`CREATE TABLE IF NOT EXISTS llm_usage (
-			fs_id           BIGINT      NOT NULL,
-			id              BIGINT      AUTO_INCREMENT PRIMARY KEY,
-			task_type       VARCHAR(32) NOT NULL,
-			task_id         VARCHAR(64) NOT NULL,
-			cost_millicents BIGINT      NOT NULL DEFAULT 0,
-			raw_units       BIGINT      NOT NULL DEFAULT 0,
-			raw_unit_type   VARCHAR(16) NOT NULL,
-			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			KEY idx_llm_usage_created (created_at),
-			KEY idx_llm_usage_fs (fs_id, created_at)
 		)`,
 		`CREATE TABLE IF NOT EXISTS fs_events (
 			fs_id      BIGINT       NOT NULL,

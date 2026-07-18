@@ -1670,12 +1670,15 @@ func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
 		// Whole-table wipes. In shared shape every one of these tables carries
 		// an fs_id column (vault tables included), so the DELETE must be
 		// restricted to this tenant's rows — unscoped it would destroy other
-		// tenants' runtime state.
-		for _, tbl := range []string{
-			"uploads",
-			"file_gc_tasks",
-			"semantic_tasks",
-			"llm_usage",
+		// tenants' runtime state. llm_usage is standalone-only (the central
+		// meta DB ledger is authoritative in shared deployments) and is wiped
+		// only there; a leftover standalone llm_usage table on a shared DB has
+		// no fs_id column to restrict by, so it must not be touched.
+		wipeTables := []string{"uploads", "file_gc_tasks", "semantic_tasks"}
+		if !s.scope.Shared() {
+			wipeTables = append(wipeTables, "llm_usage")
+		}
+		wipeTables = append(wipeTables,
 			"vault_audit_log",
 			"vault_grants",
 			"vault_tokens",
@@ -1683,7 +1686,8 @@ func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
 			"vault_secrets",
 			"vault_policies",
 			"vault_deks",
-		} {
+		)
+		for _, tbl := range wipeTables {
 			stmt := `DELETE FROM ` + tbl
 			args := []any(nil)
 			if s.scope.Shared() {

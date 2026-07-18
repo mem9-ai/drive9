@@ -49,13 +49,15 @@ func installSharedTables(t *testing.T, tables []string, stmts []string) {
 
 var coreFSSharedTables = []string{
 	"file_nodes", "inodes", "contents", "semantic", "file_tags",
-	"uploads", "semantic_tasks", "file_gc_tasks", "llm_usage", "fs_events",
+	"uploads", "semantic_tasks", "file_gc_tasks", "fs_events",
 }
 
-// installSharedCoreFSSchema swaps the 10 Core FS tables to the shared shape.
+// installSharedCoreFSSchema swaps the 9 Core FS tables to the shared shape.
+// It also drops the standalone llm_usage table so the test database matches a
+// real shared-schema database, which has no llm_usage at all.
 func installSharedCoreFSSchema(t *testing.T) {
 	t.Helper()
-	installSharedTables(t, coreFSSharedTables, schema.CoreFSMySQLSharedSchemaStatements())
+	installSharedTables(t, append(append([]string{}, coreFSSharedTables...), "llm_usage"), schema.CoreFSMySQLSharedSchemaStatements())
 }
 
 var fsLayerSharedTables = []string{

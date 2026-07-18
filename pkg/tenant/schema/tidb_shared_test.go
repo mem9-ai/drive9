@@ -7,10 +7,12 @@ import (
 	"github.com/mem9-ai/drive9/internal/schemaspec"
 )
 
-// sharedCoreFSTables lists the ten Core FS tables that
+// sharedCoreFSTables lists the nine Core FS tables that
 // CoreFSTiDBSharedSchemaStatements mirrors from
 // tidbAppEmbeddingBaseSchemaStatements. Git workspace, fs_layer, journal, and
-// vault statements in the standalone list are out of scope here.
+// vault statements in the standalone list are out of scope here. llm_usage is
+// intentionally NOT mirrored: the central meta DB ledger is authoritative in
+// multi-tenant deployments, so the shared schema drops the duplicate table.
 var sharedCoreFSTables = []string{
 	"file_nodes",
 	"inodes",
@@ -20,31 +22,25 @@ var sharedCoreFSTables = []string{
 	"uploads",
 	"semantic_tasks",
 	"file_gc_tasks",
-	"llm_usage",
 	"fs_events",
 }
 
-// sharedCoreFSPhysicalPKTables documents the two exception tables that keep
-// their global AUTO_INCREMENT physical primary key unchanged in the shared
-// shape (docs/TENANT_DB_REDESIGN.md §5.4) instead of gaining an fs_id-prefixed
-// composite primary key.
+// sharedCoreFSPhysicalPKTables documents the exception table that keeps its
+// global AUTO_INCREMENT physical primary key unchanged in the shared shape
+// instead of gaining an fs_id-prefixed composite primary key.
 var sharedCoreFSPhysicalPKTables = map[string]bool{
-	"llm_usage": true,
 	"fs_events": true,
 }
 
 // sharedCoreFSUnprefixedIndexes whitelists the standalone indexes that stay
-// without an fs_id prefix in the shared shape (both live on the exception
-// tables above).
+// without an fs_id prefix in the shared shape (on the exception table above).
 var sharedCoreFSUnprefixedIndexes = map[string]bool{
-	"idx_llm_usage_created": true,
 	"idx_fs_events_created": true,
 }
 
 // sharedCoreFSOnlyIndexes lists the (fs_id, ...) lookup indexes that exist
 // only in the shared shape, with their expected column lists.
 var sharedCoreFSOnlyIndexes = map[string][]string{
-	"idx_llm_usage_fs":     {"fs_id", "created_at"},
 	"idx_fs_events_fs_seq": {"fs_id", "seq"},
 }
 
@@ -70,8 +66,8 @@ type sharedCoreFSTable struct {
 // DDL to the standalone one: the shared shape must be exactly the standalone
 // shape plus an fs_id BIGINT NOT NULL first column, an fs_id prefix on the
 // primary key and on every secondary index / unique constraint — modulo the
-// documented llm_usage / fs_events exceptions. Any column, type, default, or
-// key change on either side that is not mirrored on the other fails here.
+// documented fs_events exception. Any column, type, default, or key change on
+// either side that is not mirrored on the other fails here.
 // The comparison uses the MySQL shared variant, which carries no TiDB-only
 // CLUSTERED keyword and maps VECTOR(n) columns to LONGTEXT (plain MySQL has
 // no vector type); the standalone side is normalized the same way.
@@ -161,10 +157,10 @@ func TestCoreFSSharedSchemaMatchesStandaloneModuloFsID(t *testing.T) {
 
 // TestCoreFSTiDBSharedSchemaDeclaresClusteredPKs ensures the TiDB variant
 // declares every composite primary key CLUSTERED (TiDB defaults composite PKs
-// to NONCLUSTERED, which would scatter each tenant's rows), that the two
-// exception tables keep their inline AUTO_INCREMENT primary key, and that the
-// MySQL variant differs only by the mechanical dialect rewrites (CLUSTERED
-// removal, VECTOR→LONGTEXT).
+// to NONCLUSTERED, which would scatter each tenant's rows), that the
+// fs_events exception table keeps its inline AUTO_INCREMENT primary key, and
+// that the MySQL variant differs only by the mechanical dialect rewrites
+// (CLUSTERED removal, VECTOR→LONGTEXT).
 func TestCoreFSTiDBSharedSchemaDeclaresClusteredPKs(t *testing.T) {
 	tidbStmts := CoreFSTiDBSharedSchemaStatements()
 	mysqlStmts := CoreFSMySQLSharedSchemaStatements()
@@ -208,6 +204,23 @@ func TestCoreFSTiDBSharedSchemaDeclaresClusteredPKs(t *testing.T) {
 	}
 	if want := len(sharedCoreFSTables) - len(sharedCoreFSPhysicalPKTables); clusteredTables != want {
 		t.Errorf("clustered composite primary keys = %d, want %d", clusteredTables, want)
+	}
+}
+
+// TestCoreFSSharedSchemaOmitsLLMUsage guards the intentional absence of
+// llm_usage from the shared schema: the central meta DB ledger
+// (tenant_llm_usage) is authoritative in multi-tenant deployments, so the
+// tenant-DB duplicate is not carried into shared shape.
+func TestCoreFSSharedSchemaOmitsLLMUsage(t *testing.T) {
+	for name, stmts := range map[string][]string{
+		"tidb":  CoreFSTiDBSharedSchemaStatements(),
+		"mysql": CoreFSMySQLSharedSchemaStatements(),
+	} {
+		for _, stmt := range stmts {
+			if strings.Contains(stmt, "llm_usage") {
+				t.Errorf("%s shared variant must not reference llm_usage:\n%s", name, stmt)
+			}
+		}
 	}
 }
 
