@@ -17,6 +17,12 @@ import (
 // exists to make drive9-server-local and e2e smoke tests runnable against an
 // ordinary MySQL-compatible database while preserving the same core filesystem,
 // layer, journal, git workspace, and vault tables.
+//
+// The legacy `files` table is NOT part of this list: fresh local databases
+// start on the split-table schema only. Tests that exercise the legacy
+// dual-write path can add it explicitly via
+// MySQLNoEmbeddingLegacyFilesStatements; existing databases that already have
+// the table keep working (Store detects it at open time).
 func MySQLNoEmbeddingTenantSchemaStatements() []string {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
@@ -35,33 +41,6 @@ func MySQLNoEmbeddingTenantSchemaStatements() []string {
 		`CREATE INDEX idx_parent ON file_nodes(parent_path_hash, name)`,
 		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
 		`CREATE INDEX idx_inode_id ON file_nodes(inode_id)`,
-
-		`CREATE TABLE IF NOT EXISTS files (
-			file_id                    VARCHAR(64) PRIMARY KEY,
-			storage_type               VARCHAR(32) NOT NULL,
-			storage_ref                TEXT NOT NULL,
-			storage_ref_hash           VARCHAR(64) NOT NULL DEFAULT '',
-			storage_encryption_mode    VARCHAR(16) NOT NULL DEFAULT 'legacy',
-			storage_encryption_key_id  VARCHAR(256) NOT NULL DEFAULT '',
-			content_blob               LONGBLOB,
-			content_type               VARCHAR(255),
-			size_bytes                 BIGINT NOT NULL DEFAULT 0,
-			checksum_sha256            VARCHAR(128),
-			revision                   BIGINT NOT NULL DEFAULT 1,
-			status                     VARCHAR(32) NOT NULL DEFAULT 'PENDING',
-			source_id                  VARCHAR(255),
-			content_text               LONGTEXT,
-			description                LONGTEXT,
-			embedding                  LONGTEXT,
-			embedding_revision         BIGINT,
-			description_embedding      LONGTEXT,
-			description_embedding_revision BIGINT,
-			created_at                 DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			confirmed_at               DATETIME(3),
-			expires_at                 DATETIME(3)
-		)`,
-		`CREATE INDEX idx_status ON files(status, created_at)`,
-		`CREATE INDEX idx_files_storage_ref_hash ON files(storage_ref_hash)`,
 
 		`CREATE TABLE IF NOT EXISTS inodes (
 			inode_id     VARCHAR(64) PRIMARY KEY,
@@ -264,4 +243,40 @@ func ValidateMySQLNoEmbeddingTenantSchema(ctx context.Context, db *sql.DB) error
 		return fmt.Errorf("local no-embedding schema missing required tables: got %d want %d", count, len(required))
 	}
 	return nil
+}
+
+// MySQLNoEmbeddingLegacyFilesStatements returns the legacy `files` table DDL
+// (and its indexes) for the local no-embedding schema. It is deliberately NOT
+// part of MySQLNoEmbeddingTenantSchemaStatements: fresh databases start on
+// the split-table schema only. These statements exist so tests can opt into
+// the legacy dual-write path explicitly.
+func MySQLNoEmbeddingLegacyFilesStatements() []string {
+	return []string{
+		`CREATE TABLE IF NOT EXISTS files (
+			file_id                    VARCHAR(64) PRIMARY KEY,
+			storage_type               VARCHAR(32) NOT NULL,
+			storage_ref                TEXT NOT NULL,
+			storage_ref_hash           VARCHAR(64) NOT NULL DEFAULT '',
+			storage_encryption_mode    VARCHAR(16) NOT NULL DEFAULT 'legacy',
+			storage_encryption_key_id  VARCHAR(256) NOT NULL DEFAULT '',
+			content_blob               LONGBLOB,
+			content_type               VARCHAR(255),
+			size_bytes                 BIGINT NOT NULL DEFAULT 0,
+			checksum_sha256            VARCHAR(128),
+			revision                   BIGINT NOT NULL DEFAULT 1,
+			status                     VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+			source_id                  VARCHAR(255),
+			content_text               LONGTEXT,
+			description                LONGTEXT,
+			embedding                  LONGTEXT,
+			embedding_revision         BIGINT,
+			description_embedding      LONGTEXT,
+			description_embedding_revision BIGINT,
+			created_at                 DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			confirmed_at               DATETIME(3),
+			expires_at                 DATETIME(3)
+		)`,
+		`CREATE INDEX idx_status ON files(status, created_at)`,
+		`CREATE INDEX idx_files_storage_ref_hash ON files(storage_ref_hash)`,
+	}
 }
