@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"testing"
 )
 
@@ -84,10 +83,34 @@ func TestBuildVideoExtractOptionsFromEnv_WildcardRequiresAPIEnvs(t *testing.T) {
 	}
 }
 
-// TestBuildVideoExtractOptionsFromEnv_NoTestMain verifies these tests
-// do not depend on TestMain / testcontainers — they only test env parsing.
-func TestBuildVideoExtractOptionsFromEnv_NoTestMain(t *testing.T) {
-	// This test exists solely to confirm the test file compiles and runs
-	// without Docker. If it reaches here, the file is self-contained.
-	_ = os.Getenv("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST")
+func TestBuildVideoExtractOptionsFromEnv_MaxFilesDefault(t *testing.T) {
+	t.Setenv("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST", "tenant-a")
+	t.Setenv("DRIVE9_VIDEO_EXTRACT_API_BASE", "http://example.com")
+	t.Setenv("DRIVE9_VIDEO_EXTRACT_API_KEY", "sk-test")
+	t.Setenv("DRIVE9_VIDEO_EXTRACT_MODEL", "test-model")
+	t.Setenv("DRIVE9_VIDEO_EXTRACT_MAX_FILES", "")
+
+	opts, err := buildVideoExtractOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if opts.MaxVideoLLMFiles != 50 {
+		t.Fatalf("MaxVideoLLMFiles=%d, want 50 (default)", opts.MaxVideoLLMFiles)
+	}
+}
+
+func TestBuildVideoExtractOptionsFromEnv_MaxFilesCustom(t *testing.T) {
+	t.Setenv("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST", "tenant-a")
+	t.Setenv("DRIVE9_VIDEO_EXTRACT_API_BASE", "http://example.com")
+	t.Setenv("DRIVE9_VIDEO_EXTRACT_API_KEY", "sk-test")
+	t.Setenv("DRIVE9_VIDEO_EXTRACT_MODEL", "test-model")
+	t.Setenv("DRIVE9_VIDEO_EXTRACT_MAX_FILES", "25")
+
+	opts, err := buildVideoExtractOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if opts.MaxVideoLLMFiles != 25 {
+		t.Fatalf("MaxVideoLLMFiles=%d, want 25", opts.MaxVideoLLMFiles)
+	}
 }
