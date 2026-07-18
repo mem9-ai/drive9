@@ -20,6 +20,13 @@ type AudioExtractTaskPayload struct {
 	ContentType string `json:"content_type,omitempty"`
 }
 
+// VideoExtractTaskPayload carries non-authoritative hints for durable video
+// visual extraction. The task identity remains resource_id + resource_version.
+type VideoExtractTaskPayload struct {
+	Path        string `json:"path,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+}
+
 // TaskType identifies the durable semantic work to execute.
 type TaskType string
 
@@ -30,6 +37,8 @@ const (
 	TaskTypeImgExtractText TaskType = "img_extract_text"
 	// TaskTypeAudioExtractText extracts or refreshes audio-derived file content_text.
 	TaskTypeAudioExtractText TaskType = "audio_extract_text"
+	// TaskTypeVideoExtractVisual extracts or refreshes video-derived visual content_text.
+	TaskTypeVideoExtractVisual TaskType = "video_extract_visual"
 	// TaskTypeGenerateL0 generates or refreshes .abstract.md style summaries.
 	TaskTypeGenerateL0 TaskType = "generate_l0"
 	// TaskTypeGenerateL1 generates or refreshes .overview.md style summaries.

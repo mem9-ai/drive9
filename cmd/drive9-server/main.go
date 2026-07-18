@@ -781,6 +781,13 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	if audioExtract.Enabled {
 		opts.AsyncAudioExtract = audioExtract
 	}
+	videoExtract, err := buildVideoExtractOptionsFromEnv()
+	if err != nil {
+		return backend.Options{}, err
+	}
+	if videoExtract.Enabled {
+		opts.AsyncVideoExtract = videoExtract
+	}
 	return opts, nil
 }
 
@@ -895,6 +902,44 @@ func buildAudioExtractOptionsFromEnv() (backend.AsyncAudioExtractOptions, error)
 	}
 	logger.Info(context.Background(), "audio_extract_mode_configured",
 		zap.String("mode", audioMode), zap.String("model", audioModel), zap.String("base_url", audioBaseURL))
+	return async, nil
+}
+
+func buildVideoExtractOptionsFromEnv() (backend.AsyncVideoExtractOptions, error) {
+	if !envBool("DRIVE9_VIDEO_EXTRACT_ENABLED", false) {
+		return backend.AsyncVideoExtractOptions{}, nil
+	}
+	videoBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_API_BASE"))
+	videoAPIKey := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_API_KEY"))
+	videoModel := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_MODEL"))
+	if videoBaseURL == "" || videoAPIKey == "" || videoModel == "" {
+		return backend.AsyncVideoExtractOptions{}, fmt.Errorf("DRIVE9_VIDEO_EXTRACT_API_BASE, DRIVE9_VIDEO_EXTRACT_API_KEY and DRIVE9_VIDEO_EXTRACT_MODEL must be set together when DRIVE9_VIDEO_EXTRACT_ENABLED=true")
+	}
+	videoPrompt := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_PROMPT"))
+	videoTimeout := time.Duration(envInt("DRIVE9_VIDEO_EXTRACT_TIMEOUT_SECONDS", 300)) * time.Second
+	ffmpegPath := strings.TrimSpace(os.Getenv("DRIVE9_FFMPEG_PATH"))
+	extractor, err := backend.NewOpenAIVideoTextExtractor(backend.OpenAIVideoTextExtractorConfig{
+		BaseURL:       videoBaseURL,
+		APIKey:        videoAPIKey,
+		Model:         videoModel,
+		Prompt:        videoPrompt,
+		Timeout:       videoTimeout,
+		FrameInterval: envInt("DRIVE9_VIDEO_EXTRACT_FRAME_INTERVAL", 5),
+		MaxFrames:     envInt("DRIVE9_VIDEO_EXTRACT_MAX_FRAMES", 10),
+		FFmpegPath:    ffmpegPath,
+	})
+	if err != nil {
+		return backend.AsyncVideoExtractOptions{}, fmt.Errorf("init video extractor: %w", err)
+	}
+	async := backend.AsyncVideoExtractOptions{
+		Enabled:             true,
+		MaxVideoBytes:       envInt64("DRIVE9_VIDEO_EXTRACT_MAX_BYTES", 200<<20),
+		TaskTimeout:         videoTimeout,
+		MaxExtractTextBytes: envInt("DRIVE9_VIDEO_EXTRACT_MAX_TEXT_BYTES", 32<<10),
+		Extractor:           extractor,
+	}
+	logger.Info(context.Background(), "video_extract_mode_configured",
+		zap.String("model", videoModel), zap.String("base_url", videoBaseURL))
 	return async, nil
 }
 
