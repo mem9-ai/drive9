@@ -211,6 +211,10 @@ func ParseVideoExtractTenantAllowlist(raw string) (allTenants bool, allowlist ma
 	if allTenants {
 		return true, nil, nil
 	}
+	// All tokens were empty (e.g. "," or ", ,") — treat as off.
+	if len(allowlist) == 0 {
+		return false, nil, nil
+	}
 	return false, allowlist, nil
 }
 
