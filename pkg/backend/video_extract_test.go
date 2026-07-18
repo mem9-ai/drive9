@@ -285,6 +285,55 @@ func TestVideoExtractTenantAllowlist(t *testing.T) {
 	}
 }
 
+func TestParseVideoExtractTenantAllowlist(t *testing.T) {
+	tests := []struct {
+		name       string
+		raw        string
+		wantAll    bool
+		wantList   map[string]struct{}
+		wantErr    bool
+	}{
+		{"empty", "", false, nil, false},
+		{"whitespace only", "  ", false, nil, false},
+		{"single tenant", "tenant-a", false, map[string]struct{}{"tenant-a": {}}, false},
+		{"multi tenant", "tenant-a,tenant-b", false, map[string]struct{}{"tenant-a": {}, "tenant-b": {}}, false},
+		{"multi tenant with spaces", " tenant-a , tenant-b ", false, map[string]struct{}{"tenant-a": {}, "tenant-b": {}}, false},
+		{"wildcard all", "*", true, nil, false},
+		{"wildcard with spaces", " * ", true, nil, false},
+		{"trailing comma", "tenant-a,", false, map[string]struct{}{"tenant-a": {}}, false},
+		{"mixed wildcard and tenant", "*,tenant-a", false, nil, true},
+		{"glob prefix pattern", "tenant-*", false, nil, true},
+		{"glob in middle", "ten*ant", false, nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotAll, gotList, err := ParseVideoExtractTenantAllowlist(tt.raw)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err=%v, wantErr=%v", err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if gotAll != tt.wantAll {
+				t.Fatalf("allTenants=%v, want %v", gotAll, tt.wantAll)
+			}
+			if tt.wantList == nil && gotList != nil {
+				t.Fatalf("allowlist=%v, want nil", gotList)
+			}
+			if tt.wantList != nil {
+				if len(gotList) != len(tt.wantList) {
+					t.Fatalf("allowlist len=%d, want %d", len(gotList), len(tt.wantList))
+				}
+				for k := range tt.wantList {
+					if _, ok := gotList[k]; !ok {
+						t.Fatalf("allowlist missing %q", k)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestMP4VideoExcludesAudioEnqueue(t *testing.T) {
 	// When both video and audio extract are enabled, MP4 files should only
 	// enqueue video_extract_visual, not audio_extract_text, to avoid

@@ -914,24 +914,9 @@ func buildVideoExtractOptionsFromEnv() (backend.AsyncVideoExtractOptions, error)
 		return backend.AsyncVideoExtractOptions{}, nil
 	}
 
-	// Parse and validate allowlist tokens.
-	var allTenants bool
-	tenantAllowlist := make(map[string]struct{})
-	for _, tok := range strings.Split(raw, ",") {
-		tok = strings.TrimSpace(tok)
-		if tok == "" {
-			continue
-		}
-		if tok == "*" {
-			allTenants = true
-		} else if strings.Contains(tok, "*") {
-			return backend.AsyncVideoExtractOptions{}, fmt.Errorf("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST: glob/prefix patterns not supported (got %q); use exact tenant IDs or \"*\" for all", tok)
-		} else {
-			tenantAllowlist[tok] = struct{}{}
-		}
-	}
-	if allTenants && len(tenantAllowlist) > 0 {
-		return backend.AsyncVideoExtractOptions{}, fmt.Errorf("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST: \"*\" cannot be mixed with tenant IDs (got %q)", raw)
+	allTenants, tenantAllowlist, err := backend.ParseVideoExtractTenantAllowlist(raw)
+	if err != nil {
+		return backend.AsyncVideoExtractOptions{}, fmt.Errorf("DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST: %w", err)
 	}
 
 	videoBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_VIDEO_EXTRACT_API_BASE"))

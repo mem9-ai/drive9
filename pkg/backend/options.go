@@ -2,6 +2,7 @@ package backend
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/embedding"
@@ -177,6 +178,40 @@ type AsyncVideoExtractOptions struct {
 // be treated as fully configured. Both Enabled and a non-nil Extractor are required.
 func AsyncVideoExtractWillWireRuntime(opts AsyncVideoExtractOptions) bool {
 	return opts.Enabled && opts.Extractor != nil
+}
+
+// ParseVideoExtractTenantAllowlist parses a raw allowlist string into
+// (allTenants, allowlist, error). Rules:
+//   - empty → off (false, nil, nil)
+//   - "*"   → all tenants (true, nil, nil)
+//   - "a,b" → specific tenants (false, {"a":{},"b":{}}, nil)
+//   - "*,a" or "a-*" → error (no mixing, no glob patterns)
+func ParseVideoExtractTenantAllowlist(raw string) (allTenants bool, allowlist map[string]struct{}, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false, nil, nil
+	}
+	allowlist = make(map[string]struct{})
+	for _, tok := range strings.Split(raw, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		if tok == "*" {
+			allTenants = true
+		} else if strings.Contains(tok, "*") {
+			return false, nil, fmt.Errorf("glob/prefix patterns not supported (got %q); use exact tenant IDs or \"*\" for all", tok)
+		} else {
+			allowlist[tok] = struct{}{}
+		}
+	}
+	if allTenants && len(allowlist) > 0 {
+		return false, nil, fmt.Errorf("\"*\" cannot be mixed with tenant IDs (got %q)", raw)
+	}
+	if allTenants {
+		return true, nil, nil
+	}
+	return false, allowlist, nil
 }
 
 // QueryEmbeddingOptions controls app-side query embedding for semantic search.
