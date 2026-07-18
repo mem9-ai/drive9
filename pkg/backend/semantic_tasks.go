@@ -55,8 +55,12 @@ func (b *Dat9Backend) enqueueVideoExtractTaskTx(tx *sql.Tx, fileID string, revis
 // usage has not converged yet.
 func (b *Dat9Backend) enqueueExtractSemanticTasksTx(ctx context.Context, tx *sql.Tx, fileID string, revision int64, path, contentType string, currentMediaDelta int64) (bool, error) {
 	isImage := b.hasAsyncImageTextSource(path, contentType)
-	isAudio := b.shouldEnqueueAudioExtractTask(path, contentType)
 	isVideo := b.shouldEnqueueVideoExtractTask(path, contentType)
+	// When video visual extraction is enabled for this file, skip audio
+	// extraction to avoid dual content_text overwrites on the same revision.
+	// Video extraction captures visual content; the audio transcript path
+	// (which normalizes video/mp4 → audio/mp4) would race on content_text.
+	isAudio := !isVideo && b.shouldEnqueueAudioExtractTask(path, contentType)
 	if !isImage && !isAudio && !isVideo {
 		return false, nil
 	}

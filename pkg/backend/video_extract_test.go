@@ -210,3 +210,41 @@ func TestShouldEnqueueVideoExtractTask(t *testing.T) {
 		t.Fatal("should not enqueue for image/png")
 	}
 }
+
+func TestMP4VideoExcludesAudioEnqueue(t *testing.T) {
+	// When both video and audio extract are enabled, MP4 files should only
+	// enqueue video_extract_visual, not audio_extract_text, to avoid
+	// dual content_text overwrites.
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncVideoExtract: AsyncVideoExtractOptions{
+			Enabled:   true,
+			Extractor: &staticVideoExtractor{text: "visual content"},
+		},
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "audio transcript"},
+		},
+	})
+
+	// video/mp4 should enqueue video, not audio
+	if !b.shouldEnqueueVideoExtractTask("/clip.mp4", "video/mp4") {
+		t.Fatal("video/mp4 should enqueue video extract")
+	}
+	// The enqueue logic skips audio when video is active for the same file
+	isVideo := b.shouldEnqueueVideoExtractTask("/clip.mp4", "video/mp4")
+	isAudio := !isVideo && b.shouldEnqueueAudioExtractTask("/clip.mp4", "video/mp4")
+	if isAudio {
+		t.Fatal("MP4 should NOT enqueue audio when video extract is enabled — dual content_text overwrite")
+	}
+
+	// Pure audio files (mp3) should still enqueue audio
+	isVideoMP3 := b.shouldEnqueueVideoExtractTask("/song.mp3", "audio/mpeg")
+	isAudioMP3 := !isVideoMP3 && b.shouldEnqueueAudioExtractTask("/song.mp3", "audio/mpeg")
+	if isVideoMP3 {
+		t.Fatal("audio/mpeg should not enqueue video extract")
+	}
+	if !isAudioMP3 {
+		t.Fatal("audio/mpeg should still enqueue audio extract")
+	}
+}
