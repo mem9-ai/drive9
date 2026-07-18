@@ -439,6 +439,10 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 			errs[i] = fmt.Errorf("tidbcloud native batch response missing cluster id for tenant %q", tenantID)
 			continue
 		}
+		if p.clusterProvisionMetadataIncomplete(&info) {
+			out[i] = fallbackBatchClusterInfo(info, dbName, passwords)
+			continue
+		}
 		out[i], errs[i] = p.clusterInfoFromResponse(tenantID, dbName, password, &info)
 	}
 	for _, err := range errs {
@@ -647,18 +651,21 @@ func batchMetadataPollInterval() time.Duration {
 func fallbackBatchClusterInfos(clusters []clusterInfo, dbName string, passwords map[string]string) []*tenant.ClusterInfo {
 	out := make([]*tenant.ClusterInfo, 0, len(clusters))
 	for i := range clusters {
-		info := clusters[i]
-		tenantID := strings.TrimSpace(info.Labels[Drive9TenantIDLabel])
-		out = append(out, &tenant.ClusterInfo{
-			TenantID:       tenantID,
-			ClusterID:      strings.TrimSpace(info.ClusterID),
-			OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
-			Password:       passwords[tenantID],
-			DBName:         dbName,
-			Provider:       tenant.ProviderTiDBCloudNative,
-		})
+		out = append(out, fallbackBatchClusterInfo(clusters[i], dbName, passwords))
 	}
 	return out
+}
+
+func fallbackBatchClusterInfo(info clusterInfo, dbName string, passwords map[string]string) *tenant.ClusterInfo {
+	tenantID := strings.TrimSpace(info.Labels[Drive9TenantIDLabel])
+	return &tenant.ClusterInfo{
+		TenantID:       tenantID,
+		ClusterID:      strings.TrimSpace(info.ClusterID),
+		OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
+		Password:       passwords[tenantID],
+		DBName:         dbName,
+		Provider:       tenant.ProviderTiDBCloudNative,
+	}
 }
 
 func (p *Provisioner) WaitForPoolClusterMetadata(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
