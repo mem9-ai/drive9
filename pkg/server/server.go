@@ -5053,11 +5053,19 @@ func (s *Server) findSharedDBForProvision(ctx context.Context, provider string, 
 		return nil
 	}
 	orgID := ""
-	if provider == tenant.ProviderTiDBCloudNative && opts.CredentialProvisioner != nil {
-		if id, err := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner); err == nil {
-			orgID = id
-		} else {
-			logger.Warn(ctx, "server_event", eventFields(ctx, "provision_org_resolve_failed", "error", err)...)
+	if provider == tenant.ProviderTiDBCloudNative {
+		if opts.CredentialProvisioner != nil {
+			if id, err := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner); err == nil {
+				orgID = id
+			} else {
+				logger.Warn(ctx, "server_event", eventFields(ctx, "provision_org_resolve_failed", "error", err)...)
+			}
+		}
+		if orgID == "" {
+			// Never fall back to the wildcard pool when the tenant's org cannot
+			// be resolved: an unresolved org must stay on the dedicated path
+			// even if a wildcard pool exists.
+			return nil
 		}
 	}
 	sharedDB, err := s.meta.FindSharedDBForOrg(ctx, orgID)

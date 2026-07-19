@@ -332,14 +332,24 @@ func main() {
 
 		// Optional shared-schema pool: when DRIVE9_SHARED_POOL_DSN is set,
 		// initialize the shared schema on that database and register it in
-		// db_pool so tenants in the matching org (default: wildcard) are
-		// provisioned onto it instead of getting a dedicated cluster.
+		// db_pool so tenants in the matching org are provisioned onto it
+		// instead of getting a dedicated cluster. The org binding is always
+		// explicit — DRIVE9_SHARED_POOL_ORG has no default, and the '*' wildcard
+		// (which places ALL new tenants on the shared pool) is opt-in and loud.
 		if sharedDSN := strings.TrimSpace(os.Getenv("DRIVE9_SHARED_POOL_DSN")); sharedDSN != "" {
-			if err := registerSharedPoolFromEnv(context.Background(), store, pool, sharedDSN, envOr("DRIVE9_SHARED_POOL_ORG", meta.SharedDBOrgWildcard)); err != nil {
+			sharedOrg := strings.TrimSpace(os.Getenv("DRIVE9_SHARED_POOL_ORG"))
+			if sharedOrg == "" {
+				die(fmt.Errorf("DRIVE9_SHARED_POOL_ORG is required when DRIVE9_SHARED_POOL_DSN is set (set an explicit org id; use '*' only to intentionally place ALL new tenants on the shared pool)"))
+			}
+			if err := registerSharedPoolFromEnv(context.Background(), store, pool, sharedDSN, sharedOrg); err != nil {
 				die(fmt.Errorf("register shared pool: %w", err))
 			}
+			if sharedOrg == meta.SharedDBOrgWildcard {
+				logger.Warn(context.Background(), "shared_pool_wildcard_all_new_tenants",
+					zap.String("warning", "ALL new tenants will be provisioned onto the shared pool"))
+			}
 			logger.Info(context.Background(), "shared_pool_registered",
-				zap.String("org", envOr("DRIVE9_SHARED_POOL_ORG", meta.SharedDBOrgWildcard)))
+				zap.String("org", sharedOrg))
 		}
 
 		// The mutation replay and expiry sweep workers are owned by the server
@@ -590,7 +600,7 @@ environment:
   DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS max open connections for tenant schema-init DB pools (default: 8)
   DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS max idle connections for tenant schema-init DB pools (default: 2)
   DRIVE9_SHARED_POOL_DSN register a shared-schema DB at startup and place matching tenants on it (empty = disabled)
-  DRIVE9_SHARED_POOL_ORG TiDB Cloud org the shared pool serves (default: * = any org)
+  DRIVE9_SHARED_POOL_ORG TiDB Cloud org the shared pool serves (required when DSN is set; '*' = all orgs, loud warn)
   DRIVE9_SHARED_DB_MAX_OPEN_CONNS max open connections for each shared-schema DB handle (default: 50)
   DRIVE9_SHARED_DB_MAX_IDLE_CONNS max idle connections for each shared-schema DB handle (default: 10)
   DRIVE9_DB_HEALTH_PROBE_INTERVAL_SECONDS DB health probe interval seconds (default: 15)
