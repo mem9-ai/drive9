@@ -115,6 +115,80 @@ func TestEventBusEventsSinceReplays(t *testing.T) {
 	}
 }
 
+// Interior seq holes (e.g. AUTO_INCREMENT ids burned by rolled-back inserts,
+// or other tenants interleaved on a shared-schema table) must NOT trigger a
+// reset: no events of this tenant were lost, so delivery continues normally.
+func TestEventBusEventsSinceInteriorGapDelivers(t *testing.T) {
+	store := newTestStoreForEventBus(t)
+	bus := NewEventBus("test-tenant", store)
+	ctx := context.Background()
+
+	seq1, err := store.InsertFSEvent(ctx, "/a.txt", "write", "actor1", time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq2, err := store.InsertFSEvent(ctx, "/hole.txt", "write", "actor1", time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq3, err := store.InsertFSEvent(ctx, "/b.txt", "write", "actor1", time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Burn the middle seq, leaving an interior hole at seq2 while seq1 stays
+	// retained (the cursor is not behind the oldest event).
+	if _, err := store.DB().ExecContext(ctx, `DELETE FROM fs_events WHERE seq = ?`, seq2); err != nil {
+		t.Fatal(err)
+	}
+
+	events, headSeq, ok := bus.EventsSince(ctx, uint64(seq1))
+	if !ok {
+		t.Fatal("EventsSince with an interior hole should deliver, not reset")
+	}
+	if len(events) != 1 || events[0].Path != "/b.txt" {
+		t.Fatalf("events = %+v, want only /b.txt", events)
+	}
+	if headSeq != uint64(seq3) {
+		t.Fatalf("headSeq = %d, want %d", headSeq, seq3)
+	}
+}
+
+// A gap reaching back past the oldest retained seq means events were pruned
+// after the client's cursor — that must still reset.
+func TestEventBusEventsSincePrunedGapResets(t *testing.T) {
+	store := newTestStoreForEventBus(t)
+	bus := NewEventBus("test-tenant", store)
+	ctx := context.Background()
+
+	seq1, err := store.InsertFSEvent(ctx, "/a.txt", "write", "actor1", time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq2, err := store.InsertFSEvent(ctx, "/b.txt", "write", "actor1", time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq3, err := store.InsertFSEvent(ctx, "/c.txt", "write", "actor1", time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Prune everything through seq2, so the client's cursor (seq1) falls
+	// behind the oldest retained event (seq3).
+	for _, seq := range []int64{seq1, seq2} {
+		if _, err := store.DB().ExecContext(ctx, `DELETE FROM fs_events WHERE seq = ?`, seq); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	events, headSeq, ok := bus.EventsSince(ctx, uint64(seq1))
+	if ok {
+		t.Fatalf("EventsSince with a pruned gap should reset, got events %+v", events)
+	}
+	if headSeq != uint64(seq3) {
+		t.Fatalf("headSeq = %d, want %d", headSeq, seq3)
+	}
+}
+
 func TestEventBusSeq(t *testing.T) {
 	store := newTestStoreForEventBus(t)
 	bus := NewEventBus("test-tenant", store)
