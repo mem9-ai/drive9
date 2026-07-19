@@ -904,9 +904,9 @@ func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) 
 	query := "parseTime=true"
 	if info.TLS {
 		query += "&tls=true"
-	} else {
-		query += "&tls=skip-verify"
 	}
+	// TLS=false means a plain connection (local/self-hosted databases); shared
+	// DBs on TiDB Cloud are registered with TLS=true explicitly.
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", info.User, string(pass), info.Host, info.Port, info.Name, query)
 	db, err := mysqlutil.OpenInstrumentedForTenant(ctx, dsn, mysqlutil.RoleShared, fmt.Sprintf("shared:%d", dbID))
 	if err != nil {
