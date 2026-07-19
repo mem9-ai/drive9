@@ -134,6 +134,10 @@ func (eb *EventBus) Seq(ctx context.Context) uint64 {
 //   - since == 0: initial_sync
 //   - since < oldestSeq: events pruned between client cursor and retained window
 //   - since > headSeq: server_restart (client cursor ahead of head)
+//
+// Interior seq holes (other tenants interleaved on a shared-schema table, or
+// AUTO_INCREMENT ids burned by rolled-back inserts) are NOT a reset
+// condition: no events of this tenant were lost, so delivery continues.
 func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []ChangeEvent, headSeq uint64, ok bool) {
 	store := eb.store.Load()
 	if store == nil {
@@ -175,13 +179,21 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 		})
 	}
 	if len(events) > 0 {
-		// Got rows: check for a gap between the client's cursor and the
-		// first retained event. If since+1 < first event seq, events were
-		// pruned in between → reset to avoid silently missing them.
+		// Got rows: a gap between the client's cursor and the first returned
+		// event means one of two things. Either events were pruned at the left
+		// edge of the retained window (the client missed real events → reset),
+		// or the hole is interior: other tenants' interleaved seqs on a
+		// shared-schema fs_events table, or AUTO_INCREMENT ids burned by
+		// rolled-back inserts (no events lost → deliver normally). Pruning
+		// only happens at the left edge, so compare against the oldest
+		// retained seq to tell them apart.
 		firstSeq := events[0].Seq
 		if since+1 < firstSeq {
-			headSeq = events[len(events)-1].Seq
-			return nil, headSeq, false // gap detected → reset
+			oldest := oldestSeqSafeWithMetric(ctx, store, eb.tenantID)
+			if int64(since)+1 < oldest {
+				headSeq = events[len(events)-1].Seq
+				return nil, headSeq, false // pruned gap → reset
+			}
 		}
 		headSeq = events[len(events)-1].Seq
 		return events, headSeq, true
