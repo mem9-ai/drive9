@@ -233,8 +233,8 @@ graph TB
 | `uploads` | `UNIQUE (upload_id)`; generated column `active_target_path_hash VIRTUAL` + unique index | `UNIQUE(fs_id, upload_id)`; `UNIQUE(fs_id, active_target_path_hash)` |
 | `semantic_tasks` | `UNIQUE (task_id)`; `UNIQUE (task_type, resource_id, resource_version)` | Add `fs_id` prefix to both unique constraints |
 | `file_gc_tasks` | `UNIQUE (task_id)`; `uk_file_gc_file_id`; `uk_file_gc_inode_id` | Add `fs_id` prefix to all three unique constraints |
-| `llm_usage` | `id AUTO_INCREMENT PK` | `id` stays a purely physical primary key (cluster-global auto-increment); add `KEY(fs_id, ...)`; see 5.4 |
-| `fs_events` | `seq AUTO_INCREMENT PK` | Same as above; add `KEY(fs_id, seq)`; SSE cursor handling in 5.4 |
+| `llm_usage` | `id AUTO_INCREMENT PK` | **Dropped from the shared schema** — the backend only writes the tenant-DB `llm_usage` when server quota is inactive (single-tenant/local mode), which shared-schema databases never run; the central `tenant_llm_usage` ledger is authoritative in multi-tenant deployments, so the duplicate table is not carried over |
+| `fs_events` | `seq AUTO_INCREMENT PK` | `seq` stays a purely physical primary key (cluster-global auto-increment); add `KEY(fs_id, seq)`; SSE cursor handling in 5.4 |
 
 #### 5.2.2 Git Workspace (5 tables)
 
@@ -282,8 +282,8 @@ db9 (PostgreSQL + pgvector, 24 tables) is **not in scope** for this shared-table
 
 | Table | Current state | Shared-table handling |
 |---|---|---|
-| `llm_usage` | `id AUTO_INCREMENT` | Keep the auto-increment id as a cluster-global physical primary key (physical ordering only); all queries go through `(fs_id, ...)` indexes; no external references, so values need not be preserved during migration |
-| `fs_events` | `seq AUTO_INCREMENT`, consumed by the SSE cursor (`WHERE seq > cursor`) | In shared tables seq is globally monotonic with per-tenant gaps — `WHERE fs_id=? AND seq>cursor` semantics stay correct; **seq values cannot be preserved during migration**. On cutover, write a migration checkpoint event into the target DB; the SSE layer detects it and tells clients to re-sync their cursor |
+| `llm_usage` | `id AUTO_INCREMENT` | **Dropped from the shared schema** (see 5.2.1) — no AUTO_INCREMENT handling needed |
+| `fs_events` | `seq AUTO_INCREMENT`, consumed by the SSE cursor (`WHERE seq > cursor`) | In shared tables seq is globally monotonic with per-tenant gaps. Gap detection in the SSE layer previously treated any hole as pruning (reset storm under interleaved tenants); it now resets only when the cursor falls behind the oldest retained seq (shipped in #754), so `WHERE fs_id=? AND seq>cursor` delivers correctly through interior gaps. **seq values cannot be preserved during migration**: on cutover, write a migration checkpoint event into the target DB; the SSE layer detects it and tells clients to re-sync their cursor |
 
 ### 5.5 Partitioning strategy
 
@@ -480,7 +480,7 @@ A drive9 write is **a single transaction spanning 5~7 tables** (file write: `ino
 | Idempotency | `ON DUPLICATE KEY UPDATE` (**do not use** `INSERT IGNORE` / `REPLACE INTO`) | INSERT IGNORE skips rows with older versions causing inconsistency; REPLACE INTO's delete-then-insert semantics has side effects |
 | Table by table | Backfill only one table at a time | Control pressure on the source DB |
 | DELETE synchronization | Backfill SELECT cannot see already-deleted rows; deletions are guaranteed entirely by dual-write + retry log | Separation of concerns |
-| AUTO_INCREMENT tables | `llm_usage.id` / `fs_events.seq` values are not preserved; the target side auto-increments anew (see 5.4) | Shared-table auto-increment cannot preserve values |
+| AUTO_INCREMENT tables | `fs_events.seq` values are not preserved; the target side auto-increments anew (see 5.4) | Shared-table auto-increment cannot preserve values |
 
 ### 8.4 Dual-write failure handling
 
@@ -819,8 +819,10 @@ Export frequency is configured per paid tier (RPO disclosure); export jobs reuse
 | 13.10 | **fork latency regression** (branch → logical copy) | fork becomes an async state machine with disclosure; small filesystems barely affected; mid-term application-layer CoW fork fixes it for good (§7) |
 | 13.11 | **Vector/FTS + fs_id filtering execution plan** below expectations (post-filter recall dilution) | Phase 0 empirical verification; fallbacks: top-k over-fetch + rerank, HASH partition pruning, two-phase query (5.3, 14.1) |
 | 13.12 | **meta DB becoming a hot-path bottleneck and single point of failure** | In-process placement cache + epoch invalidation; quota already has a fail-open precedent; only migration operations hit meta directly (6.4) |
-| 13.13 | **AUTO_INCREMENT semantic change** (SSE cursor, llm_usage id) | fs_events writes a migration checkpoint event; SSE triggers client re-sync (5.4) |
+| 13.13 | **AUTO_INCREMENT semantic change** (SSE cursor) | fs_events writes a migration checkpoint event; SSE triggers client re-sync (5.4); SSE gap detection already tolerates interior seq holes (merged in #754) |
 | 13.14 | **Shared connection-pool capacity** (aggregated QPS of N tenants on one `*sql.DB`) | Configure `MaxOpenConns` per cluster capacity; monitor connection-wait queues; migrate hot tenants out promptly |
+| 13.15 | **Tenant deletion on a shared DB** (the current delete flow assumes cluster==tenant and deprovisions the cluster) | Shared-tenant deletion must instead batch-DELETE all rows `WHERE fs_id = ?` across the shared tables (batched + pauses, as in 13.5), clean the S3 namespace and meta-side state, and **never deprovision the shared cluster**; fork deletion follows the same rule (S3 is a shared namespace with refcount GC). Owned by Phase 3 (§14) |
+| 13.16 | **Unbounded row growth on shared tables** (`fs_events` retention today is driven by per-tenant worker activity, so idle tenants' rows accumulate forever — on a shared table this is a cluster-wide growth problem) | Cluster-level batched retention sweep (`DELETE WHERE created_at < cutoff`, no fs_id filter, off-peak, rate-limited) owned by Phase 3 (§14); completed/dead `semantic_tasks`/`file_gc_tasks` rows get the same treatment later (pre-existing issue, amplified by sharing) |
 
 ---
 
@@ -833,7 +835,7 @@ Export frequency is configured per paid tier (RPO disclosure); export jobs reuse
 | **Phase 0 Verification** | ① Table-count limit confirmation ② Single-cluster RU stress test (N tenants sharing) ③ Cross-org connectivity (application → two DBs) ④ scale-to-zero cold start ⑤ **Vector top-k + fs_id filtering execution plan and recall rate** ⑥ **FTS + fs_id filtering execution plan** ⑦ **Verify index hit for `VEC_COSINE_DISTANCE` vs `VEC_EMBED_COSINE_DISTANCE`** ⑧ **Inventory of legacy `files` table distribution** ⑨ **Unified embedding model selection + re-embedding cost estimate for existing tenants** |
 | **Phase 1 Schema** | 32-table shared schema (fs_id + indexes + constraints); `semantic` app-managed conversion; `fs_registry`; schema version registration; datastore dual-shape rework |
 | **Phase 2 Routing layer** | pool.go routing rework (UUID→fs_id→placement); `tenant_placements` + `db_pool`; cache + epoch fencing; routing hot update |
-| **Phase 3 Shared pool** | Shared-pool instance management; new-tenant assignment; provisioning integration (including dedicated-as-shared-schema) |
+| **Phase 3 Shared pool** | Shared-pool instance management; new-tenant assignment; provisioning integration (including dedicated-as-shared-schema); **shared-tenant deletion flow** (batched `WHERE fs_id = ?` deletes, no cluster deprovisioning; 13.15); **cluster-level retention sweep for shared tables** (13.16) |
 | **Phase 4 Migration mechanism** | Transaction-mirrored dual-write + backfill; retry log (reusing the MutationReplayWorker pattern); verification + epoch cutover + deferred cleanup; migration orchestration state machine (reusing the notify_outbox base) |
 | **Phase 5 Monitoring & scheduling** | Global + per-tenant metrics; hotspot detection + migration triggering |
 | **Phase 6 Existing-tenant migration** | Batched migration (each tenant's split migration completes first); verify cost per batch |
