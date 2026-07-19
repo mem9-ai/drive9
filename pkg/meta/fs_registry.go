@@ -8,6 +8,26 @@ import (
 	"time"
 )
 
+// withMetaLockConflictRetry runs fn with a few bounded retries on InnoDB
+// lock-conflict errors (1213/1205/40001), which are expected when concurrent
+// provision/Acquire paths allocate fs_ids for different tenants at the same
+// time (unique-index gap locks on fs_registry). Mirrors the retry pattern
+// used by the quota reservation path.
+func withMetaLockConflictRetry(fn func() error) error {
+	const maxAttempts = 4
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if !isMetaLockConflictError(err) {
+			return err
+		}
+		time.Sleep(time.Duration(20*(1<<attempt)) * time.Millisecond)
+	}
+	return err
+}
+
 // EnsureFsID returns the internal numeric fs_id for tenantID, allocating a new
 // one on first call. The mapping is stable for the lifetime of the tenant and
 // is safe to call concurrently: allocation uses INSERT IGNORE against the
@@ -25,8 +45,11 @@ func (s *Store) EnsureFsID(ctx context.Context, tenantID string) (fsID int64, er
 	if !errors.Is(err, ErrNotFound) {
 		return 0, err
 	}
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT IGNORE INTO fs_registry (tenant_id) VALUES (?)`, tenantID); err != nil {
+	if err := withMetaLockConflictRetry(func() error {
+		_, err := s.db.ExecContext(ctx,
+			`INSERT IGNORE INTO fs_registry (tenant_id) VALUES (?)`, tenantID)
+		return err
+	}); err != nil {
 		return 0, fmt.Errorf("insert fs_registry row: %w", err)
 	}
 	fsID, err = s.ResolveFsID(ctx, tenantID)
