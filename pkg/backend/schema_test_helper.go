@@ -17,6 +17,7 @@ func initBackendSchema(t *testing.T, dsn string) {
 	}
 	defer func() { _ = db.Close() }()
 	stmts := schema.MySQLNoEmbeddingTenantSchemaStatements()
+	stmts = append(stmts, schema.MySQLNoEmbeddingLegacyFilesStatements()...)
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
 			msg := err.Error()
