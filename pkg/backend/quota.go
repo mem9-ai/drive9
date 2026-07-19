@@ -378,13 +378,13 @@ func (b *Dat9Backend) mediaLLMQuotaExceededTx(tx *sql.Tx) bool {
 // video extraction quota. Counts every video_extract_visual task row (any
 // status) — each Vision API call consumes one unit, including re-extractions
 // of the same file.
-func (b *Dat9Backend) videoLLMQuotaExceededTx(tx *sql.Tx) bool {
+func (b *Dat9Backend) videoLLMQuotaExceededTx(ctx context.Context, tx *sql.Tx) bool {
 	if b.maxVideoLLMFiles <= 0 {
 		return false
 	}
 	var count int64
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM semantic_tasks WHERE task_type = 'video_extract_visual'`).Scan(&count); err != nil {
-		logger.Warn(backgroundWithTrace(), "video_llm_quota_check_fail_open", zap.Error(err))
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM semantic_tasks WHERE task_type = 'video_extract_visual'`).Scan(&count); err != nil {
+		logger.Warn(ctx, "video_llm_quota_check_fail_open", zap.Error(err))
 		return false
 	}
 	return count >= b.maxVideoLLMFiles
