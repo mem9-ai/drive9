@@ -37,6 +37,15 @@ func (b *Dat9Backend) enqueueAudioExtractTaskTx(tx *sql.Tx, fileID string, revis
 	return b.store.EnqueueSemanticTaskTx(tx, task)
 }
 
+func (b *Dat9Backend) enqueueVideoExtractTaskTx(tx *sql.Tx, fileID string, revision int64, path, contentType string) (bool, error) {
+	now := time.Now().UTC()
+	task, err := newVideoExtractTask(b.genID(), fileID, revision, path, contentType, now)
+	if err != nil {
+		return false, err
+	}
+	return b.store.EnqueueSemanticTaskTx(tx, task)
+}
+
 // enqueueExtractSemanticTasksTx registers durable img_extract_text and/or
 // audio_extract_text tasks for one confirmed file revision. It applies in both
 // database auto-embedding and app-embedding modes: image/audio extraction does
@@ -46,28 +55,46 @@ func (b *Dat9Backend) enqueueAudioExtractTaskTx(tx *sql.Tx, fileID string, revis
 // usage has not converged yet.
 func (b *Dat9Backend) enqueueExtractSemanticTasksTx(ctx context.Context, tx *sql.Tx, fileID string, revision int64, path, contentType string, currentMediaDelta int64) (bool, error) {
 	isImage := b.hasAsyncImageTextSource(path, contentType)
-	isAudio := b.shouldEnqueueAudioExtractTask(path, contentType)
-	if !isImage && !isAudio {
-		return false, nil
-	}
-	if b.mediaLLMQuotaExceededCheckTx(ctx, tx, currentMediaDelta) {
-		metrics.RecordTenantOperation(b.tenantID, "media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
+	isVideo := b.shouldEnqueueVideoExtractTask(path, contentType)
+	// When video visual extraction is enabled for this file, skip audio
+	// extraction to avoid dual content_text overwrites on the same revision.
+	// Video extraction captures visual content; the audio transcript path
+	// (which normalizes video/mp4 → audio/mp4) would race on content_text.
+	isAudio := !isVideo && b.shouldEnqueueAudioExtractTask(path, contentType)
+	if !isImage && !isAudio && !isVideo {
 		return false, nil
 	}
 	enqueued := false
-	if isImage {
-		created, err := b.enqueueImgExtractTaskTx(tx, fileID, revision, path, contentType)
-		if err != nil {
-			return enqueued, err
+	// Image and audio share the general media LLM quota.
+	if (isImage || isAudio) && b.mediaLLMQuotaExceededCheckTx(ctx, tx, currentMediaDelta) {
+		metrics.RecordTenantOperation(b.tenantID, "media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
+	} else {
+		if isImage {
+			created, err := b.enqueueImgExtractTaskTx(tx, fileID, revision, path, contentType)
+			if err != nil {
+				return enqueued, err
+			}
+			enqueued = enqueued || created
 		}
-		enqueued = enqueued || created
+		if isAudio {
+			created, err := b.enqueueAudioExtractTaskTx(tx, fileID, revision, path, contentType)
+			if err != nil {
+				return enqueued, err
+			}
+			enqueued = enqueued || created
+		}
 	}
-	if isAudio {
-		created, err := b.enqueueAudioExtractTaskTx(tx, fileID, revision, path, contentType)
-		if err != nil {
-			return enqueued, err
+	// Video has its own independent quota.
+	if isVideo {
+		if b.videoLLMQuotaExceededTx(tx) {
+			metrics.RecordTenantOperation(b.tenantID, "video_llm_budget", "enqueue_skip", "quota_exceeded", 0)
+		} else {
+			created, err := b.enqueueVideoExtractTaskTx(tx, fileID, revision, path, contentType)
+			if err != nil {
+				return enqueued, err
+			}
+			enqueued = enqueued || created
 		}
-		enqueued = enqueued || created
 	}
 	return enqueued, nil
 }
@@ -77,6 +104,19 @@ func (b *Dat9Backend) shouldEnqueueAudioExtractTask(path, contentType string) bo
 		return false
 	}
 	return isSupportedAudioForSemanticTask(path, contentType)
+}
+
+func (b *Dat9Backend) shouldEnqueueVideoExtractTask(path, contentType string) bool {
+	if !b.SupportsAsyncVideoExtract() {
+		return false
+	}
+	// Tenant check: "*" allows all; otherwise only explicitly listed tenants.
+	if !b.videoExtractAllTenants {
+		if _, ok := b.videoExtractTenantAllowlist[b.tenantID]; !ok {
+			return false
+		}
+	}
+	return isSupportedVideoForSemanticTask(path, contentType)
 }
 
 func newEmbedTask(taskID, fileID string, revision int64, now time.Time) *semantic.Task {
@@ -144,6 +184,31 @@ func newAudioExtractTask(taskID, fileID string, revision int64, path, contentTyp
 	}, nil
 }
 
+func newVideoExtractTask(taskID, fileID string, revision int64, path, contentType string, now time.Time) (*semantic.Task, error) {
+	now = now.UTC()
+	payload := semantic.VideoExtractTaskPayload{Path: path, ContentType: contentType}
+	var payloadJSON []byte
+	if payload.Path != "" || payload.ContentType != "" {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		payloadJSON = encoded
+	}
+	return &semantic.Task{
+		TaskID:          taskID,
+		TaskType:        semantic.TaskTypeVideoExtractVisual,
+		ResourceID:      fileID,
+		ResourceVersion: revision,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     now,
+		PayloadJSON:     payloadJSON,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}, nil
+}
+
 func (b *Dat9Backend) shouldEnqueueEmbedForRevision(path, contentType, contentText, description string) bool {
 	if !b.appSemanticTasksEnabled {
 		return false
@@ -184,6 +249,9 @@ func (b *Dat9Backend) AutoSemanticTaskTypes() []semantic.TaskType {
 	}
 	if b.SupportsAsyncAudioExtract() {
 		out = append(out, semantic.TaskTypeAudioExtractText)
+	}
+	if b.SupportsAsyncVideoExtract() {
+		out = append(out, semantic.TaskTypeVideoExtractVisual)
 	}
 	if len(out) == 0 {
 		return nil
