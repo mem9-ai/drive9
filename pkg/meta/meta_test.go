@@ -69,7 +69,7 @@ func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
 		DBPasswordCipher: []byte("root-cipher"),
 		DBName:           "tenant_db",
 		DBTLS:            true,
-		Provider:         "tidb_cloud_native",
+		Provider:         tidbCloudNativeProvider,
 		SchemaVersion:    1,
 		CreatedAt:        now,
 		UpdatedAt:        now,
@@ -727,7 +727,7 @@ func TestFinalizeTenantDeleteUpdatesJobNamespaceAndTenant(t *testing.T) {
 		DBPasswordCipher:   []byte("cipher"),
 		DBName:             "tenant_delete_finalize",
 		DBTLS:              true,
-		Provider:           "tidb_cloud_native",
+		Provider:           tidbCloudNativeProvider,
 		SchemaVersion:      1,
 		CreatedAt:          now,
 		UpdatedAt:          now,
@@ -885,7 +885,7 @@ func TestCountTenants(t *testing.T) {
 		TenantDeleted:      1,
 	}
 	if len(got.Statuses) != len(want) {
-		t.Fatalf("status count length = %d, want %d: %+v", len(got.Statuses), len(want), got.Statuses)
+		t.Errorf("status count length = %d, want %d: %+v", len(got.Statuses), len(want), got.Statuses)
 	}
 	for status, wantCount := range want {
 		if got.Count(status) != wantCount {
@@ -1457,7 +1457,7 @@ func insertTiDBCloudBindingTenant(t *testing.T, s *Store, tenantID string, kind 
 		DBPasswordCipher: []byte("cipher"),
 		DBName:           "tidbcloud_fs",
 		DBTLS:            true,
-		Provider:         "tidb_cloud_native",
+		Provider:         tidbCloudNativeProvider,
 		ClusterID:        clusterID,
 		BranchID:         branchID,
 		SchemaVersion:    1,
@@ -1493,7 +1493,7 @@ func TestClaimOldestFreeTenantPoolBindingRequiresActiveTenant(t *testing.T) {
 		DBPasswordCipher: []byte("cipher"),
 		DBName:           "tidbcloud_fs",
 		DBTLS:            true,
-		Provider:         "tidb_cloud_native",
+		Provider:         tidbCloudNativeProvider,
 		ClusterID:        "cluster-provisioning",
 		SchemaVersion:    1,
 		CreatedAt:        provisioningCreated,
@@ -1527,7 +1527,7 @@ func TestClaimOldestFreeTenantPoolBindingRequiresActiveTenant(t *testing.T) {
 		DBPasswordCipher: []byte("cipher"),
 		DBName:           "tidbcloud_fs",
 		DBTLS:            true,
-		Provider:         "tidb_cloud_native",
+		Provider:         tidbCloudNativeProvider,
 		ClusterID:        "cluster-active",
 		SchemaVersion:    1,
 		CreatedAt:        activeCreated,
@@ -1628,7 +1628,7 @@ func TestCountTenantPoolBindingsByStatusGroupsByPoolOrganizationAndStatus(t *tes
 	}
 	for key, wantCount := range want {
 		if got[key] != wantCount {
-			t.Fatalf("count %s = %d, want %d; all counts=%v", key, got[key], wantCount, got)
+			t.Errorf("count %s = %d, want %d; all counts=%v", key, got[key], wantCount, got)
 		}
 	}
 }

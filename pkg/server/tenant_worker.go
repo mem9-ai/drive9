@@ -769,6 +769,9 @@ func (m *tenantWorkerManager) fallbackExtractTaskTypes() []semantic.TaskType {
 	if m.fallback.SupportsAsyncAudioExtract() {
 		out = append(out, semantic.TaskTypeAudioExtractText)
 	}
+	if m.fallback.SupportsAsyncVideoExtract() {
+		out = append(out, semantic.TaskTypeVideoExtractVisual)
+	}
 	return out
 }
 
@@ -812,6 +815,9 @@ func (m *tenantWorkerManager) taskTypesForTarget(b *backend.Dat9Backend) []seman
 	}
 	if b.SupportsAsyncAudioExtract() {
 		out = append(out, semantic.TaskTypeAudioExtractText)
+	}
+	if b.SupportsAsyncVideoExtract() {
+		out = append(out, semantic.TaskTypeVideoExtractVisual)
 	}
 	out = append(out, m.appManagedTaskTypes()...)
 	if len(out) == 0 {

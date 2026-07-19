@@ -51,7 +51,7 @@ var serviceGauge = serviceMeter.Float64Gauge("drive9_service_gauge", "Service ga
 var tenantPoolMetadataResumeWaitTotal = serviceMeter.Int64Counter("drive9_tenant_pool_metadata_resume_wait_total", "Tenant pool metadata resume wait attempts by pool_id/organization_id/scope/result")
 var tenantPoolMetadataResumeWaitDuration = serviceMeter.Float64Histogram("drive9_tenant_pool_metadata_resume_wait_duration_seconds", "Tenant pool metadata resume wait duration by pool_id/organization_id/scope/result", tenantPoolMetadataResumeWaitDurationBounds)
 var tenantPoolCapacity = serviceMeter.Float64Gauge("drive9_tenant_pool_capacity", "Tenant pool capacity by pool_id/organization_id/state")
-var tenantPoolBindings = serviceMeter.Float64Gauge("drive9_tenant_pool_bindings", "Tenant pool binding count by pool_id/tidbcloud_org_id/pool_status")
+var tenantPoolBindings = serviceMeter.Float64Gauge("drive9_tenant_pool_bindings", "Tenant pool binding count by pool_id/tidbcloud_org_id/status")
 var tidbCloudRBACCacheRequestsTotal = serviceMeter.Int64Counter("drive9_tidbcloud_rbac_cache_requests_total", "TiDB Cloud API key to cluster RBAC cache requests by path/scope/result")
 var tidbCloudOpenAPIRequestsTotal = serviceMeter.Int64Counter("drive9_tidbcloud_openapi_requests_total", "TiDB Cloud OpenAPI requests by path/operation/result")
 var tidbCloudSpendingLimitSyncTotal = serviceMeter.Int64Counter("drive9_tidbcloud_spending_limit_sync_total", "TiDB Cloud spending limit local sync outcomes by source/result")
@@ -173,8 +173,16 @@ func RecordTenantPoolBindings(poolID, tidbCloudOrgID, poolStatus string, count i
 	RegisterModule("admin_tenant_pool")
 	tenantPoolBindings.Set(float64(count),
 		Attr("pool_id", cleanMetricValue(poolID, "unknown")),
-		Attr("tidbcloud_org_id", cleanMetricValue(tidbCloudOrgID, "unknown")),
-		Attr("pool_status", cleanMetricValue(poolStatus, "unknown")),
+		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
+		Attr("status", cleanMetricValue(poolStatus, "unknown")),
+	)
+}
+
+func DeleteTenantPoolBindings(poolID, tidbCloudOrgID, poolStatus string) {
+	tenantPoolBindings.Delete(
+		Attr("pool_id", cleanMetricValue(poolID, "unknown")),
+		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
+		Attr("status", cleanMetricValue(poolStatus, "unknown")),
 	)
 }
 

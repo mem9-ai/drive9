@@ -372,15 +372,34 @@ func TestRecordTenantPoolBindingsIncludesPoolTiDBCloudOrgAndStatus(t *testing.T)
 
 	RecordTenantPoolBindings(poolID, orgID, "free", 3)
 	RecordTenantPoolBindings(poolID, orgID, "used", 2)
+	RecordTenantPoolBindings(poolID+"-guest", "", "free", 1)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `drive9_tenant_pool_bindings{pool_id="`+poolID+`",pool_status="free",tidbcloud_org_id="`+orgID+`"} 3`) {
+	if !strings.Contains(text, `drive9_tenant_pool_bindings{pool_id="`+poolID+`",status="free",tidbcloud_org_id="`+orgID+`"} 3`) {
 		t.Fatalf("missing tenant pool free binding gauge:\n%s", text)
 	}
-	if !strings.Contains(text, `drive9_tenant_pool_bindings{pool_id="`+poolID+`",pool_status="used",tidbcloud_org_id="`+orgID+`"} 2`) {
+	if !strings.Contains(text, `drive9_tenant_pool_bindings{pool_id="`+poolID+`",status="used",tidbcloud_org_id="`+orgID+`"} 2`) {
 		t.Fatalf("missing tenant pool used binding gauge:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_pool_bindings{pool_id="`+poolID+`-guest",status="free",tidbcloud_org_id="guest"} 1`) {
+		t.Fatalf("missing tenant pool guest org binding gauge:\n%s", text)
+	}
+	if strings.Contains(text, `pool_status=`) {
+		t.Fatalf("tenant pool binding metrics must use status label, not pool_status:\n%s", text)
+	}
+
+	DeleteTenantPoolBindings(poolID, orgID, "free")
+
+	rec = httptest.NewRecorder()
+	WritePrometheus(rec)
+	text = rec.Body.String()
+	if strings.Contains(text, `drive9_tenant_pool_bindings{pool_id="`+poolID+`",status="free",tidbcloud_org_id="`+orgID+`"}`) {
+		t.Fatalf("tenant pool free binding gauge was not deleted:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_pool_bindings{pool_id="`+poolID+`",status="used",tidbcloud_org_id="`+orgID+`"} 2`) {
+		t.Fatalf("tenant pool used binding gauge should remain after deleting free gauge:\n%s", text)
 	}
 }
 

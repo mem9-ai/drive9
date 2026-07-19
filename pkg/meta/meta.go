@@ -1950,18 +1950,18 @@ func (s *Store) CountTenantPoolBindingsByStatus(ctx context.Context) (out []Tena
 		ORDER BY p.pool_id, p.organization_id, statuses.pool_status`,
 		TenantPoolBindingFree, TenantPoolBindingUsed, tidbCloudNativeProvider, TenantDeleted)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("count tenant pool bindings by status query: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var rec TenantPoolBindingStatusCount
 		if err := rows.Scan(&rec.PoolID, &rec.OrganizationID, &rec.Status, &rec.Count); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("count tenant pool bindings by status scan: %w", err)
 		}
 		out = append(out, rec)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("count tenant pool bindings by status rows: %w", err)
 	}
 	return out, nil
 }

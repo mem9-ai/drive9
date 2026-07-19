@@ -219,6 +219,8 @@ func (m *tenantWorkerManager) dispatchTask(ctx context.Context, target *tenantTa
 		return m.processImgExtractTask(ctx, target.backend, task)
 	case semantic.TaskTypeAudioExtractText:
 		return m.processAudioExtractTask(ctx, target.backend, task)
+	case semantic.TaskTypeVideoExtractVisual:
+		return m.processVideoExtractTask(ctx, target.backend, task)
 	default:
 		message := fmt.Sprintf("unsupported task type %q", task.TaskType)
 		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "unsupported", message: message}
@@ -493,6 +495,17 @@ func (m *tenantWorkerManager) processAudioExtractTask(ctx context.Context, b *ba
 	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: string(result)}
 }
 
+func (m *tenantWorkerManager) processVideoExtractTask(ctx context.Context, b *backend.Dat9Backend, task *semantic.Task) semanticTaskOutcome {
+	result, err := b.ProcessVideoExtractTask(ctx, videoExtractTaskSpecFromSemanticTask(task))
+	if err != nil {
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: string(result), message: err.Error()}
+	}
+	if result == backend.VideoExtractResultBudgetExhausted {
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: "monthly_llm_cost_budget_exhausted"}
+	}
+	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: string(result)}
+}
+
 func (m *tenantWorkerManager) semanticTaskStillOwned(ctx context.Context, target *tenantTarget, task *semantic.Task, result string) (bool, error) {
 	tenantID := target.tenantID
 	store := target.store
@@ -576,6 +589,22 @@ func audioExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.AudioExtr
 		return spec
 	}
 	var payload semantic.AudioExtractTaskPayload
+	if err := json.Unmarshal(task.PayloadJSON, &payload); err == nil {
+		spec.Path = payload.Path
+		spec.ContentType = payload.ContentType
+	}
+	return spec
+}
+
+func videoExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.VideoExtractTaskSpec {
+	if task == nil {
+		return backend.VideoExtractTaskSpec{}
+	}
+	spec := backend.VideoExtractTaskSpec{FileID: task.ResourceID, Revision: task.ResourceVersion}
+	if len(task.PayloadJSON) == 0 {
+		return spec
+	}
+	var payload semantic.VideoExtractTaskPayload
 	if err := json.Unmarshal(task.PayloadJSON, &payload); err == nil {
 		spec.Path = payload.Path
 		spec.ContentType = payload.ContentType

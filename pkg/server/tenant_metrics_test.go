@@ -9,6 +9,7 @@ import (
 
 	"github.com/mem9-ai/drive9/internal/testmysql"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
 func TestObserveTenantPoolBindingCountsRecordsUsedAndFreeByPoolAndOrg(t *testing.T) {
@@ -61,12 +62,27 @@ func TestObserveTenantPoolBindingCountsRecordsUsedAndFreeByPoolAndOrg(t *testing
 	s.metrics.writePrometheus(rec)
 	text := rec.Body.String()
 	for _, want := range []string{
-		`drive9_tenant_pool_bindings{pool_id="pool-observe-bindings",pool_status="free",tidbcloud_org_id="org-observe-bindings"} 2`,
-		`drive9_tenant_pool_bindings{pool_id="pool-observe-bindings",pool_status="used",tidbcloud_org_id="org-observe-bindings"} 1`,
+		`drive9_tenant_pool_bindings{pool_id="pool-observe-bindings",status="free",tidbcloud_org_id="org-observe-bindings"} 2`,
+		`drive9_tenant_pool_bindings{pool_id="pool-observe-bindings",status="used",tidbcloud_org_id="org-observe-bindings"} 1`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing tenant pool binding metric %q:\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, "pool_status=") {
+		t.Fatalf("tenant pool binding metrics must use status label, not pool_status:\n%s", text)
+	}
+
+	if err := metaStore.DeleteTenantPool(ctx, "pool-observe-bindings"); err != nil {
+		t.Fatalf("delete tenant pool: %v", err)
+	}
+	s.observeTenantPoolBindingCounts(ctx)
+
+	rec = httptest.NewRecorder()
+	s.metrics.writePrometheus(rec)
+	text = rec.Body.String()
+	if strings.Contains(text, `drive9_tenant_pool_bindings{pool_id="pool-observe-bindings"`) {
+		t.Fatalf("deleted pool binding metrics should be removed after next observation:\n%s", text)
 	}
 }
 
@@ -153,7 +169,7 @@ func insertTenantPoolMetricTenant(t *testing.T, s *meta.Store, tenantID, cluster
 		DBPasswordCipher: []byte("cipher"),
 		DBName:           "tidbcloud_fs",
 		DBTLS:            true,
-		Provider:         "tidb_cloud_native",
+		Provider:         tenant.ProviderTiDBCloudNative,
 		ClusterID:        clusterID,
 		SchemaVersion:    1,
 		CreatedAt:        now,

@@ -2,6 +2,7 @@ package backend
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/embedding"
@@ -21,9 +22,13 @@ const (
 	defaultAudioExtractMaxSize        = int64(32 << 20) // 32 MiB
 	defaultAudioExtractTimeout        = 2 * time.Minute
 	defaultMaxAudioExtractedTextBytes = 8 << 10               // 8 KiB
+	defaultVideoExtractMaxSize        = int64(200 << 20) // 200 MiB
+	defaultVideoExtractTimeout        = 5 * time.Minute
+	defaultMaxVideoExtractedTextBytes = 32 << 10 // 32 KiB
 	defaultMaxUploadBytes             = int64(10 * (1 << 30)) // 10 GiB
 	defaultMaxTenantStorageBytes      = int64(50 * (1 << 30)) // 50 GiB
 	defaultMaxMediaLLMFiles           = int64(500)            // 500 media files per tenant
+	defaultMaxVideoLLMFiles           = int64(50)             // 50 video files per tenant
 	// defaultMaxMonthlyLLMCostMillicents is the per-tenant monthly LLM spend
 	// cap applied when no explicit budget is configured. $10.00 USD, expressed
 	// in millicents (0.001 cents; $10 = 1000 cents = 1_000_000 millicents).
@@ -44,6 +49,7 @@ type Options struct {
 	// TiDB auto-embedding path. Unlike async image extract, there is no in-process
 	// queue; work is delivered only via semantic_tasks when runtime is wired.
 	AsyncAudioExtract AsyncAudioExtractOptions
+	AsyncVideoExtract AsyncVideoExtractOptions
 	QueryEmbedding    QueryEmbeddingOptions
 	MaxUploadBytes    int64
 	// MaxTenantStorageBytes caps the total logical storage a single tenant may
@@ -155,6 +161,66 @@ type AsyncAudioExtractOptions struct {
 // default extractor: both Enabled and a non-nil Extractor are required.
 func AsyncAudioExtractWillWireRuntime(opts AsyncAudioExtractOptions) bool {
 	return opts.Enabled && opts.Extractor != nil
+}
+
+// AsyncVideoExtractOptions configures video visual extraction via FFmpeg +
+// Vision model. Delivery uses semantic_tasks only; no local worker queue.
+type AsyncVideoExtractOptions struct {
+	Enabled             bool
+	AllTenants          bool // true when allowlist is "*"
+	MaxVideoBytes       int64
+	MaxVideoLLMFiles    int64 // per-tenant video extraction quota: each Vision API call counts as one (default 50)
+	TaskTimeout         time.Duration
+	MaxExtractTextBytes int
+	Extractor           VideoTextExtractor
+	// TenantAllowlist restricts video extraction to only the listed tenant
+	// IDs. Ignored when AllTenants is true. An empty or nil map with
+	// AllTenants false means no tenant is allowed (fail-closed).
+	TenantAllowlist map[string]struct{}
+}
+
+// AsyncVideoExtractWillWireRuntime reports whether async video extraction should
+// be treated as fully configured. Both Enabled and a non-nil Extractor are required.
+func AsyncVideoExtractWillWireRuntime(opts AsyncVideoExtractOptions) bool {
+	return opts.Enabled && opts.Extractor != nil
+}
+
+// ParseVideoExtractTenantAllowlist parses a raw allowlist string into
+// (allTenants, allowlist, error). Rules:
+//   - empty → off (false, nil, nil)
+//   - "*"   → all tenants (true, nil, nil)
+//   - "a,b" → specific tenants (false, {"a":{},"b":{}}, nil)
+//   - "*,a" or "a-*" → error (no mixing, no glob patterns)
+func ParseVideoExtractTenantAllowlist(raw string) (allTenants bool, allowlist map[string]struct{}, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false, nil, nil
+	}
+	allowlist = make(map[string]struct{})
+	for _, tok := range strings.Split(raw, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		if tok == "*" {
+			allTenants = true
+		} else if strings.Contains(tok, "*") {
+			return false, nil, fmt.Errorf("glob/prefix patterns not supported (got %q); use exact tenant IDs or \"*\" for all", tok)
+		} else {
+			allowlist[tok] = struct{}{}
+		}
+	}
+	if allTenants && len(allowlist) > 0 {
+		return false, nil, fmt.Errorf("\"*\" cannot be mixed with tenant IDs (got %q)", raw)
+	}
+	if allTenants {
+		return true, nil, nil
+	}
+	// All tokens were empty (e.g. "," or ", ,") — treat as off.
+	if len(allowlist) == 0 {
+		return false, nil, nil
+	}
+	return false, allowlist, nil
 }
 
 // QueryEmbeddingOptions controls app-side query embedding for semantic search.
@@ -278,6 +344,36 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 			zap.Int("max_extract_text_bytes", a.MaxExtractTextBytes),
 			zap.String("extractor_type", fmt.Sprintf("%T", a.Extractor)))
 	}
+
+	v := opts.AsyncVideoExtract
+	if AsyncVideoExtractWillWireRuntime(v) {
+		if v.MaxVideoBytes <= 0 {
+			v.MaxVideoBytes = defaultVideoExtractMaxSize
+		}
+		if v.TaskTimeout <= 0 {
+			v.TaskTimeout = defaultVideoExtractTimeout
+		}
+		if v.MaxExtractTextBytes <= 0 {
+			v.MaxExtractTextBytes = defaultMaxVideoExtractedTextBytes
+		}
+		b.videoExtractEnabled = true
+		b.videoExtractAllTenants = v.AllTenants
+		b.videoExtractor = v.Extractor
+		b.videoExtractTimeout = v.TaskTimeout
+		b.videoExtractMaxSize = v.MaxVideoBytes
+		b.maxVideoExtractTextBytes = v.MaxExtractTextBytes
+		b.videoExtractTenantAllowlist = v.TenantAllowlist
+		if v.MaxVideoLLMFiles > 0 {
+			b.maxVideoLLMFiles = v.MaxVideoLLMFiles
+		} else {
+			b.maxVideoLLMFiles = defaultMaxVideoLLMFiles
+		}
+		logger.Info(backgroundWithTrace(), "backend_video_extract_runtime_configured",
+			zap.Duration("task_timeout", v.TaskTimeout),
+			zap.Int64("max_video_bytes", v.MaxVideoBytes),
+			zap.Int("max_extract_text_bytes", v.MaxExtractTextBytes),
+			zap.String("extractor_type", fmt.Sprintf("%T", v.Extractor)))
+	}
 }
 
 // Close stops background workers owned by this backend instance. FileGC and
@@ -291,6 +387,9 @@ func (b *Dat9Backend) Close() {
 	if b.audioExtractEnabled {
 		globalBackendRuntimeMetrics.deactivateAudio(b.runtimeMetricsID)
 		b.audioExtractEnabled = false
+	}
+	if b.videoExtractEnabled {
+		b.videoExtractEnabled = false
 	}
 	b.stopMutationWorker()
 	if b.quotaConfigCache != nil {

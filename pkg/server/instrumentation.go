@@ -297,16 +297,19 @@ type serverMetrics struct {
 	routeMu  sync.Mutex
 	routes   map[string]int64
 
-	tenantMu       sync.Mutex
-	tenantInFlight map[string]int64
+	tenantMu          sync.Mutex
+	tenantInFlight    map[string]int64
+	tenantPoolBindMu  sync.Mutex
+	tenantPoolBinding map[tenantPoolBindingMetricKey]struct{}
 }
 
 func newServerMetrics() *serverMetrics {
 	metrics.SetModuleAvailability("server", true)
 	metrics.RecordHTTPInFlight(0)
 	return &serverMetrics{
-		routes:         map[string]int64{},
-		tenantInFlight: map[string]int64{},
+		routes:            map[string]int64{},
+		tenantInFlight:    map[string]int64{},
+		tenantPoolBinding: map[tenantPoolBindingMetricKey]struct{}{},
 	}
 }
 

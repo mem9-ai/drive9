@@ -972,8 +972,12 @@ func (b *Dat9Backend) ConfirmUploadWithTags(ctx context.Context, uploadID string
 		}
 	}
 
+	if err := b.finalizeUpload(ctx, upload, parts, tags); err != nil {
+		b.recordTenantOperation("backend", "confirm_upload", "error", time.Since(start))
+		return err
+	}
 	b.recordTenantOperation("backend", "confirm_upload", "ok", time.Since(start))
-	return b.finalizeUpload(ctx, upload, parts, tags)
+	return nil
 }
 
 // finalizeUpload completes the S3 multipart upload and creates the file node.

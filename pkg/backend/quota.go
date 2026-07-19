@@ -374,6 +374,22 @@ func (b *Dat9Backend) mediaLLMQuotaExceededTx(tx *sql.Tx) bool {
 	return count > b.maxMediaLLMFiles
 }
 
+// videoLLMQuotaExceededTx checks whether the tenant has exceeded its per-tenant
+// video extraction quota. Counts every video_extract_visual task row (any
+// status) — each Vision API call consumes one unit, including re-extractions
+// of the same file.
+func (b *Dat9Backend) videoLLMQuotaExceededTx(tx *sql.Tx) bool {
+	if b.maxVideoLLMFiles <= 0 {
+		return false
+	}
+	var count int64
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM semantic_tasks WHERE task_type = 'video_extract_visual'`).Scan(&count); err != nil {
+		logger.Warn(backgroundWithTrace(), "video_llm_quota_check_fail_open", zap.Error(err))
+		return false
+	}
+	return count >= b.maxVideoLLMFiles
+}
+
 // ensureTenantStorageQuotaTx is the legacy tenant-DB storage quota check.
 // Used as fallback when metaStore is not wired.
 func (b *Dat9Backend) ensureTenantStorageQuotaTx(tx *sql.Tx, path string, newSize int64) error {
