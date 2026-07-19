@@ -13,8 +13,8 @@ type mockKicker struct {
 	kicks []kickMsg
 }
 
-func (m *mockKicker) Kick(tenantID string, workMask int) {
-	m.kicks = append(m.kicks, kickMsg{tenantID: tenantID, workMask: workMask})
+func (m *mockKicker) KickWithOrg(tenantID, tidbCloudOrgID string, workMask int) {
+	m.kicks = append(m.kicks, kickMsg{tenantID: tenantID, tidbCloudOrgID: tidbCloudOrgID, workMask: workMask})
 }
 
 func TestTenantOutboxPollerShardFilter(t *testing.T) {
@@ -30,6 +30,21 @@ func TestTenantOutboxPollerShardFilter(t *testing.T) {
 	}
 	if k.kicks[0].workMask != WorkSemantic {
 		t.Fatalf("expected WorkSemantic mask, got %d", k.kicks[0].workMask)
+	}
+}
+
+func TestTenantOutboxPollerPassesOrgToWorker(t *testing.T) {
+	t.Parallel()
+	buses := newEventBuses()
+	k := &mockKicker{}
+	p := newTenantOutboxPoller(nil, buses, k, nil, "pod1", 0, 0)
+	row := meta.TenantNotifyRow{ID: 1, TenantID: "t1", TiDBCloudOrgID: "org-t1", WorkMask: WorkFileGC, CreatedAt: time.Now()}
+	p.dispatch(context.Background(), row)
+	if len(k.kicks) != 1 {
+		t.Fatalf("expected 1 kick, got %d", len(k.kicks))
+	}
+	if k.kicks[0].tidbCloudOrgID != "org-t1" {
+		t.Fatalf("kick org = %q, want org-t1", k.kicks[0].tidbCloudOrgID)
 	}
 }
 

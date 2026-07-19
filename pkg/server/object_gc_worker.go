@@ -153,7 +153,7 @@ func (w *objectGCWorker) processCandidate(ctx context.Context, candidate meta.Ob
 		// Acquire failure: could not open the owner tenant TiDB for this GC
 		// candidate. Record so the warning alert can detect a GC path that is
 		// churning cold opens or hitting bad connections.
-		metrics.RecordTenantOperationWithOrg(owner.ID, tenantMetricTiDBCloudOrgIDFromMeta(ctx, w.meta, owner), "user_db_access", "object_gc_acquire", metrics.ResultForError(err), time.Since(acquireStart))
+		metrics.RecordTenantOperationWithOrg(owner.ID, "", "user_db_access", "object_gc_acquire", metrics.ResultForError(err), time.Since(acquireStart))
 		return err
 	}
 	defer release()

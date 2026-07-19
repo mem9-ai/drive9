@@ -138,7 +138,7 @@ type Pool struct {
 	items              map[string]*entry
 	order              *list.List
 	maxSize            int
-	tenantWorkNotifier atomic.Pointer[func(tenantID string, workMask int)]
+	tenantWorkNotifier atomic.Pointer[func(tenantID, tidbCloudOrgID string, workMask int)]
 	// fileGCEnabled is retained for backward compatibility but no longer used:
 	// FileGC is now kick-driven through the unified tenant worker, not a
 	// per-backend goroutine.
@@ -243,11 +243,12 @@ func (p *Pool) SetMetaStore(ms *meta.Store) {
 	p.metaStore = ms
 }
 
-// SetTenantWorkNotifier registers a callback invoked with the tenant ID and a
-// work mask whenever one of this pool's backends commits durable work (semantic
-// task, file_gc task, quota outbox row), so the tenant worker can claim the new
-// work immediately instead of waiting for a periodic scan.
-func (p *Pool) SetTenantWorkNotifier(fn func(tenantID string, workMask int)) {
+// SetTenantWorkNotifier registers a callback invoked with the tenant ID, TiDB
+// Cloud org ID, and work mask whenever one of this pool's backends commits
+// durable work (semantic task, file_gc task, quota outbox row), so the tenant
+// worker can claim the new work immediately instead of waiting for a periodic
+// scan.
+func (p *Pool) SetTenantWorkNotifier(fn func(tenantID, tidbCloudOrgID string, workMask int)) {
 	if p == nil {
 		return
 	}
@@ -258,9 +259,9 @@ func (p *Pool) wireTenantWorkNotifier(b *backend.Dat9Backend, tenantID string) {
 	// Resolve the notifier at call time, not wire time, so backends created
 	// before SetTenantWorkNotifier (e.g. during tenant resume on startup) still
 	// notify once the tenant worker registers.
-	b.SetWorkEnqueuedNotifier(func(workMask int) {
+	b.SetWorkEnqueuedNotifier(func(workMask int, tidbCloudOrgID string) {
 		if fn := p.tenantWorkNotifier.Load(); fn != nil && *fn != nil {
-			(*fn)(tenantID, workMask)
+			(*fn)(tenantID, tidbCloudOrgID, workMask)
 		}
 	})
 }
@@ -515,7 +516,7 @@ func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release fu
 		// This is the warm-only invariant working as designed — the safety-net
 		// must never open a cold tenant TiDB. Record so the invariant-violation
 		// alert can confirm AcquireCached is staying warm-only.
-		metrics.RecordTenantOperationWithOrg(t.ID, defaultTenantMetricTiDBCloudOrgID, "user_db_access", "acquire_cached", "cold_skipped", 0)
+		metrics.RecordTenantOperationWithOrg(t.ID, "", "user_db_access", "acquire_cached", "cold_skipped", 0)
 		return nil, nil, false
 	}
 	if e.s3EncryptionPolicy != s3EncryptionPolicy || (t.StorageNamespaceID != "" && e.storageNamespaceID != t.StorageNamespaceID) {

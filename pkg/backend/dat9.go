@@ -146,13 +146,13 @@ type Dat9Backend struct {
 	maxAudioExtractTextBytes int
 
 	// Durable video visual extraction (semantic_tasks only; no local queue).
-	videoExtractEnabled          bool
-	videoExtractAllTenants       bool                // "*" allowlist
-	videoExtractor               VideoTextExtractor
-	videoExtractTimeout          time.Duration
-	videoExtractMaxSize          int64
-	maxVideoExtractTextBytes     int
-	videoExtractTenantAllowlist  map[string]struct{} // nil or empty = no tenant (fail-closed)
+	videoExtractEnabled         bool
+	videoExtractAllTenants      bool // "*" allowlist
+	videoExtractor              VideoTextExtractor
+	videoExtractTimeout         time.Duration
+	videoExtractMaxSize         int64
+	maxVideoExtractTextBytes    int
+	videoExtractTenantAllowlist map[string]struct{} // nil or empty = no tenant (fail-closed)
 	maxVideoLLMFiles            int64               // per-tenant video file quota
 
 	runtimeMetricsID uint64
@@ -161,7 +161,7 @@ type Dat9Backend struct {
 	// enqueued durable work (semantic task, file_gc task, quota outbox row),
 	// so the unified tenant worker can claim it immediately instead of waiting
 	// for a kick from the outbox poller.
-	workEnqueuedNotifier atomic.Pointer[func(workMask int)]
+	workEnqueuedNotifier atomic.Pointer[func(workMask int, tidbCloudOrgID string)]
 
 	// Monthly LLM cost budget (P1).
 	maxMonthlyLLMCostMillicents     int64
@@ -187,11 +187,12 @@ func newBaseBackend(store *datastore.Store) *Dat9Backend {
 
 // SetWorkEnqueuedNotifier registers fn to run after a write or upload commit
 // that enqueues durable work (semantic task, file_gc task, or quota outbox row).
-// The workMask argument tells the caller which work types were enqueued. fn
-// must be cheap and non-blocking: it is invoked inline on the write path. A
-// dropped or missing notification is safe — work is durable and the unified
-// outbox poller + safety-net scan claim it eventually.
-func (b *Dat9Backend) SetWorkEnqueuedNotifier(fn func(workMask int)) {
+// The workMask argument tells the caller which work types were enqueued, and
+// tidbCloudOrgID carries the backend's resolved org metric label. fn must be
+// cheap and non-blocking: it is invoked inline on the write path. A dropped or
+// missing notification is safe — work is durable and the unified outbox poller
+// + safety-net scan claim it eventually.
+func (b *Dat9Backend) SetWorkEnqueuedNotifier(fn func(workMask int, tidbCloudOrgID string)) {
 	if b == nil {
 		return
 	}
@@ -203,7 +204,7 @@ func (b *Dat9Backend) notifyWorkEnqueued(workMask int) {
 		return
 	}
 	if fn := b.workEnqueuedNotifier.Load(); fn != nil && *fn != nil {
-		(*fn)(workMask)
+		(*fn)(workMask, b.TiDBCloudOrgID())
 	}
 }
 

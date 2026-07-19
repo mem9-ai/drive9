@@ -472,7 +472,7 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 		b, release, err := pool.Acquire(r.Context(), tenant)
 		// Capability-token request-path acquire: same baseline signal as the
 		// API-key path above, but for the /v1/vault/read surface.
-		authAcquireOrgID := defaultTenantMetricTiDBCloudOrgID
+		authAcquireOrgID := ""
 		if b != nil {
 			authAcquireOrgID = b.TiDBCloudOrgID()
 		}

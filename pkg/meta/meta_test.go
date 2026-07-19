@@ -800,6 +800,53 @@ func TestFinalizeTenantDeleteUpdatesJobNamespaceAndTenant(t *testing.T) {
 	}
 }
 
+func TestListTenantNotifySinceIncludesTiDBCloudOrgBinding(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	tenantID := "notify-binding-tenant"
+	if err := s.InsertTenant(ctx, &Tenant{
+		ID:                 tenantID,
+		Status:             TenantActive,
+		StorageNamespaceID: "notify-binding-ns",
+		DBHost:             "127.0.0.1",
+		DBPort:             4000,
+		DBUser:             "root",
+		DBPasswordCipher:   []byte("cipher"),
+		DBName:             "tenant_notify_binding",
+		DBTLS:              true,
+		Provider:           tidbCloudNativeProvider,
+		SchemaVersion:      1,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+		TenantID:       tenantID,
+		OrganizationID: "org-notify",
+		ClusterID:      "cluster-notify",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertTenantNotify(ctx, tenantID, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ListTenantNotifySince(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("notify row count = %d, want 1", len(rows))
+	}
+	if rows[0].TiDBCloudOrgID != "org-notify" {
+		t.Fatalf("notify row org = %q, want org-notify", rows[0].TiDBCloudOrgID)
+	}
+}
+
 func TestListTenantsByStatus(t *testing.T) {
 	s := newControlStore(t)
 	now := time.Now().UTC()

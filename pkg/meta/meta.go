@@ -4071,10 +4071,11 @@ func (s *Store) DeleteSubscriptionsForStalePods(ctx context.Context) (n int64, e
 // lightweight work signal: tenant_id identifies the tenant and work_mask is a
 // bitmask of work types to dispatch (SSE, semantic, file_gc, quota).
 type TenantNotifyRow struct {
-	ID        uint64
-	TenantID  string
-	WorkMask  int
-	CreatedAt time.Time
+	ID             uint64
+	TenantID       string
+	TiDBCloudOrgID string
+	WorkMask       int
+	CreatedAt      time.Time
 }
 
 // InsertTenantNotify writes a unified work signal to tenant_notify_outbox.
@@ -4100,7 +4101,12 @@ func (s *Store) ListTenantNotifySince(ctx context.Context, afterID uint64, limit
 		limit = 1000
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, tenant_id, work_mask, created_at FROM tenant_notify_outbox WHERE id > ? ORDER BY id LIMIT ?`,
+		`SELECT o.id, o.tenant_id, COALESCE(b.organization_id, ''), o.work_mask, o.created_at
+		 FROM tenant_notify_outbox o
+		 LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = o.tenant_id
+		 WHERE o.id > ?
+		 ORDER BY o.id
+		 LIMIT ?`,
 		afterID, limit)
 	if err != nil {
 		return nil, err
@@ -4108,7 +4114,7 @@ func (s *Store) ListTenantNotifySince(ctx context.Context, afterID uint64, limit
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var rec TenantNotifyRow
-		if err = rows.Scan(&rec.ID, &rec.TenantID, &rec.WorkMask, &rec.CreatedAt); err != nil {
+		if err = rows.Scan(&rec.ID, &rec.TenantID, &rec.TiDBCloudOrgID, &rec.WorkMask, &rec.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, rec)

@@ -705,7 +705,7 @@ func retryMetaLockConflict(ctx context.Context, tenantID, metricOperation, logOp
 			zap.String("operation", logOperation),
 			zap.Int("attempt", attempt),
 			zap.Error(err))
-		metrics.RecordTenantOperationCountWithOrg(tenantID, "guest", "central_quota", metricOperation, "lock_conflict_retry")
+		metrics.RecordTenantOperationCountWithOrg(tenantID, "", "central_quota", metricOperation, "lock_conflict_retry")
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

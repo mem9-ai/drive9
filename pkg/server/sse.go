@@ -206,7 +206,7 @@ func (s *Server) tenantEventBus(r *http.Request) *EventBus {
 	if s.fallback != nil {
 		store = s.fallback.Store()
 	}
-	return s.events.getWithOrg("", defaultTenantMetricTiDBCloudOrgID, store)
+	return s.events.getWithOrg("", "", store)
 }
 
 func (s *Server) publishEvent(r *http.Request, path, op string) {

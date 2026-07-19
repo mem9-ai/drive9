@@ -153,6 +153,22 @@ func TestSetRequestMetricTenantMovesInFlightLabel(t *testing.T) {
 	}
 }
 
+func TestRequestTenantMetricScopeFallbackLeavesOrgEmpty(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "http://example.test/s3/objects/blob", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = req.WithContext(withRequestMetricState(req.Context(), &requestMetricState{}))
+
+	tenantID, tidbCloudOrgID := requestTenantMetricScope(req)
+	if tenantID != "local" {
+		t.Fatalf("tenant id = %q, want local", tenantID)
+	}
+	if tidbCloudOrgID != "" {
+		t.Fatalf("tidb cloud org id = %q, want empty", tidbCloudOrgID)
+	}
+}
+
 type flushRecorder struct {
 	header  http.Header
 	flushed bool

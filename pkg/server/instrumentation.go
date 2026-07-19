@@ -694,7 +694,7 @@ func requestTenantMetricScope(r *http.Request) (tenantID, tidbCloudOrgID string)
 		return tenantID, tidbCloudOrgID
 	}
 	if fallback := requestTenantID(r); fallback != "" {
-		return fallback, defaultTenantMetricTiDBCloudOrgID
+		return fallback, ""
 	}
 	return "", ""
 }
@@ -755,7 +755,7 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 	}()
 
 	if strings.HasPrefix(r.URL.Path, "/s3/") {
-		setRequestMetricTenant(r.Context(), requestTenantID(r), "", "", defaultTenantMetricTiDBCloudOrgID, classifyTenantRequest(r))
+		setRequestMetricTenant(r.Context(), requestTenantID(r), "", "", "", classifyTenantRequest(r))
 	}
 
 	next.ServeHTTP(rw, r)

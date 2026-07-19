@@ -62,7 +62,7 @@ var errVaultUnsupported = errors.New("vault is not supported for this provider")
 func recordVaultOperation(ctx context.Context, tenantID, op string, start time.Time, result string) {
 	scopeTenantID, _, _, tidbCloudOrgID := requestMetricScope(ctx)
 	if scopeTenantID != tenantID {
-		tidbCloudOrgID = defaultTenantMetricTiDBCloudOrgID
+		tidbCloudOrgID = ""
 	}
 	metrics.RecordTenantOperationWithOrg(tenantID, tidbCloudOrgID, "vault", op, result, time.Since(start))
 }

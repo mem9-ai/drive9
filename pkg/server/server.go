@@ -493,16 +493,16 @@ func NewWithConfig(cfg Config) *Server {
 		// quota work triggers an immediate in-process kick (~0ms latency for
 		// same-pod writes) plus a best-effort outbox INSERT for cross-pod
 		// delivery. The pool wires each backend's notifier to call
-		// SetWorkEnqueuedNotifier which invokes the tenant worker's Kick.
+		// SetWorkEnqueuedNotifier which invokes the tenant worker's org-aware kick.
 		if cfg.Pool != nil {
-			cfg.Pool.SetTenantWorkNotifier(func(tenantID string, workMask int) {
-				s.tenantWorker.Kick(tenantID, workMask)
+			cfg.Pool.SetTenantWorkNotifier(func(tenantID, tidbCloudOrgID string, workMask int) {
+				s.tenantWorker.KickWithOrg(tenantID, tidbCloudOrgID, workMask)
 				s.insertTenantNotify(tenantID, workMask)
 			})
 		}
 		if cfg.Backend != nil {
-			cfg.Backend.SetWorkEnqueuedNotifier(func(workMask int) {
-				s.tenantWorker.Kick(tenantLocalID, workMask)
+			cfg.Backend.SetWorkEnqueuedNotifier(func(workMask int, tidbCloudOrgID string) {
+				s.tenantWorker.KickWithOrg(tenantLocalID, tidbCloudOrgID, workMask)
 				s.insertTenantNotify(tenantLocalID, workMask)
 			})
 		}
@@ -1782,7 +1782,7 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
-	setRequestMetricTenant(r.Context(), "local", "local", "local", defaultTenantMetricTiDBCloudOrgID, classifyTenantRequest(r))
+	setRequestMetricTenant(r.Context(), "local", "local", "local", "", classifyTenantRequest(r))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", "local", "status", "active")...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
@@ -5021,7 +5021,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	tenantID := token.NewID()
 	provisionStarted := time.Now()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
-	setRequestMetricTenant(ctx, tenantID, "", provider, defaultTenantMetricTiDBCloudOrgID, tenantRequestClass{surface: "provision", action: "post"})
+	setRequestMetricTenant(ctx, tenantID, "", provider, "", tenantRequestClass{surface: "provision", action: "post"})
 
 	keyName := strings.TrimSpace(opts.KeyName)
 	if keyName == "" {
@@ -5370,7 +5370,7 @@ func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string,
 // compatibility path so e2e scripts can obtain one stable API key without
 // enabling the multi-tenant provision flow.
 func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Request) {
-	setRequestMetricTenant(r.Context(), "local", "local", "local", defaultTenantMetricTiDBCloudOrgID, classifyTenantRequest(r))
+	setRequestMetricTenant(r.Context(), "local", "local", "local", "", classifyTenantRequest(r))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", "local", "provider", "local")...)
 	metricEvent(r.Context(), "tenant_provision", "provider", "local", "result", "ok")
 	w.Header().Set("Content-Type", "application/json")
