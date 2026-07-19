@@ -644,6 +644,129 @@ func TestAutoImagePutWritesContentTextEndToEnd(t *testing.T) {
 	}
 }
 
+func TestAutoVideoPutWritesVisualContentTextEndToEnd(t *testing.T) {
+	s, _ := newTestServerWithS3Config(t, backend.Options{
+		TenantID:              "test-tenant",
+		DatabaseAutoEmbedding: true,
+		AsyncVideoExtract: backend.AsyncVideoExtractOptions{
+			Enabled:         true,
+			Extractor:       staticServerVideoExtractor{text: "a golden retriever running through a sunlit park with oak trees"},
+			TenantAllowlist: map[string]struct{}{"test-tenant": {}},
+		},
+	}, TenantWorkerOptions{
+		Workers:       1,
+		PollInterval:  10 * time.Millisecond,
+		LeaseDuration: 200 * time.Millisecond,
+	})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/e2e-video.mp4", bytes.NewReader([]byte("fake-mp4-bytes")))
+	req.ContentLength = int64(len("fake-mp4-bytes"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	file := mustServerFile(t, s.fallback, "/e2e-video.mp4")
+
+	// Wait for the visual description to be written back as content_text.
+	// "golden retriever" is a visual-only term that proves the Vision extractor
+	// path was invoked, not the audio transcript path.
+	waitForContentTextOnServer(t, s.fallback, "/e2e-video.mp4", "golden retriever", 3*time.Second)
+	waitForTaskStatus(t, s.fallback, file.FileID, 1, string(semantic.TaskSucceeded), 3*time.Second)
+
+	// Verify exactly one task was created and it is video_extract_visual (not audio_extract_text).
+	tasks := loadSemanticTaskRowsForResource(t, s.fallback, file.FileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1 (video only, no audio)", len(tasks))
+	}
+	if tasks[0].TaskType != string(semantic.TaskTypeVideoExtractVisual) {
+		t.Fatalf("task type=%q, want %q", tasks[0].TaskType, semantic.TaskTypeVideoExtractVisual)
+	}
+	if tasks[0].Status != string(semantic.TaskSucceeded) {
+		t.Fatalf("task status=%q, want %q", tasks[0].Status, semantic.TaskSucceeded)
+	}
+}
+
+func TestVideoQuotaSkipsEnqueueAtLimit(t *testing.T) {
+	s, _ := newTestServerWithS3Config(t, backend.Options{
+		TenantID:              "test-tenant",
+		DatabaseAutoEmbedding: true,
+		AsyncVideoExtract: backend.AsyncVideoExtractOptions{
+			Enabled:          true,
+			Extractor:        staticServerVideoExtractor{text: "visual content"},
+			TenantAllowlist:  map[string]struct{}{"test-tenant": {}},
+			MaxVideoLLMFiles: 1, // allow only 1 video
+		},
+	}, TenantWorkerOptions{
+		Workers:       1,
+		PollInterval:  10 * time.Millisecond,
+		LeaseDuration: 200 * time.Millisecond,
+	})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Upload first video — should enqueue and succeed.
+	req1, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/first.mp4", bytes.NewReader([]byte("vid1")))
+	req1.ContentLength = 4
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first upload: status=%d", resp1.StatusCode)
+	}
+	file1 := mustServerFile(t, s.fallback, "/first.mp4")
+	waitForTaskStatus(t, s.fallback, file1.FileID, 1, string(semantic.TaskSucceeded), 3*time.Second)
+
+	// Upload second video — upload succeeds but no video_extract_visual task.
+	req2, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/second.mp4", bytes.NewReader([]byte("vid2")))
+	req2.ContentLength = 4
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second upload: status=%d, want 200 (upload must succeed)", resp2.StatusCode)
+	}
+	file2 := mustServerFile(t, s.fallback, "/second.mp4")
+	// Give a short window for any mistaken enqueue to appear.
+	time.Sleep(200 * time.Millisecond)
+	tasks2 := loadSemanticTaskRowsForResource(t, s.fallback, file2.FileID)
+	if len(tasks2) != 0 {
+		t.Fatalf("second video should have 0 tasks (quota), got %d: %+v", len(tasks2), tasks2)
+	}
+
+	// Re-upload first video (overwrite) — quota counts per-extraction-attempt,
+	// so the re-upload also consumes quota. With quota=1, already used by the
+	// first upload, this re-upload should NOT enqueue a new extraction.
+	req3, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/first.mp4", bytes.NewReader([]byte("vid1-v2")))
+	req3.ContentLength = 7
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		t.Fatalf("re-upload: status=%d", resp3.StatusCode)
+	}
+	// The first upload consumed the only quota slot. Re-upload must not
+	// create a second video_extract_visual task.
+	time.Sleep(200 * time.Millisecond)
+	tasks3 := loadSemanticTaskRowsForResource(t, s.fallback, file1.FileID)
+	if len(tasks3) != 1 {
+		t.Fatalf("re-upload of first video should still have 1 task (quota exhausted), got %d: %+v", len(tasks3), tasks3)
+	}
+}
+
 func TestUploadCompleteEndpoint(t *testing.T) {
 	s, s3c := newTestServerWithS3(t)
 	ts := httptest.NewServer(s)

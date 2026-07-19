@@ -95,6 +95,35 @@ func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractU
 	}
 }
 
+func (b *Dat9Backend) recordVideoExtractUsage(taskID string, usage VideoExtractUsage) {
+	totalTokens := int64(usage.TotalTokens())
+	cost := b.imageTokenCostMillicents(totalTokens) // reuse vision cost rate
+	if cost == 0 && totalTokens == 0 {
+		cost = b.fallbackImageCostMillicents
+	}
+	if cost <= 0 {
+		return
+	}
+	if !b.UseServerQuota() {
+		if err := b.store.InsertLLMUsage("video_extract_visual", taskID, cost, totalTokens, "tokens"); err != nil {
+			logger.Warn(backgroundWithTrace(), "llm_usage_insert_failed",
+				zap.String("tenant_id", b.tenantID),
+				zap.String("task_type", "video_extract_visual"),
+				zap.String("task_id", taskID),
+				zap.Error(err))
+			metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "usage_insert", "error", 0)
+		}
+	}
+	if err := b.syncCentralLLMCostRecord(backgroundWithTrace(), "video_extract_visual", taskID, cost, totalTokens, "tokens"); err != nil {
+		logger.Warn(backgroundWithTrace(), "central_quota_llm_cost_record_failed",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("task_type", "video_extract_visual"),
+			zap.String("task_id", taskID),
+			zap.Error(err))
+		metrics.RecordTenantOperation(b.tenantID, "central_quota", "llm_cost_record", "log_error", 0)
+	}
+}
+
 func (b *Dat9Backend) imageTokenCostMillicents(totalTokens int64) int64 {
 	if b.visionCostPerKTokenMillicents <= 0 || totalTokens <= 0 {
 		return 0

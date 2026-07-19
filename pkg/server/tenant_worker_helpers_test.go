@@ -100,6 +100,18 @@ func mustServerFile(t *testing.T, b *backend.Dat9Backend, path string) *datastor
 	return nf.File
 }
 
+type staticServerVideoExtractor struct {
+	text string
+	err  error
+}
+
+func (e staticServerVideoExtractor) ExtractVideoText(_ context.Context, _ backend.VideoExtractRequest) (string, backend.VideoExtractUsage, error) {
+	if e.err != nil {
+		return "", backend.VideoExtractUsage{}, e.err
+	}
+	return e.text, backend.VideoExtractUsage{}, nil
+}
+
 type serverSemanticTaskRow struct {
 	TaskType string
 	Status   string

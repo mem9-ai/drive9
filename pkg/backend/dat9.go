@@ -144,6 +144,16 @@ type Dat9Backend struct {
 	audioExtractMaxSize      int64
 	maxAudioExtractTextBytes int
 
+	// Durable video visual extraction (semantic_tasks only; no local queue).
+	videoExtractEnabled          bool
+	videoExtractAllTenants       bool                // "*" allowlist
+	videoExtractor               VideoTextExtractor
+	videoExtractTimeout          time.Duration
+	videoExtractMaxSize          int64
+	maxVideoExtractTextBytes     int
+	videoExtractTenantAllowlist  map[string]struct{} // nil or empty = no tenant (fail-closed)
+	maxVideoLLMFiles            int64               // per-tenant video file quota
+
 	runtimeMetricsID uint64
 
 	// workEnqueuedNotifier, when set, runs after a write or upload commit that
