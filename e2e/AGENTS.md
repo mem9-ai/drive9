@@ -529,6 +529,23 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 17. Delete main tenant via `drive9 delete` and verify removal (401/403/404 on `GET /v1/status`)
 18. Trap-based cleanup: attempts to delete both admin and main tenants on script failure unless `SKIP_CLEANUP=1`
 
+### `shared-mode-smoke-test.sh`
+
+Shared-schema (fs_id) mode end-to-end smoke: starts a throwaway MySQL
+container (or uses `META_DSN`/`SHARED_DSN` you provide, e.g. a TiDB endpoint),
+then boots `drive9-server` with `DRIVE9_SHARED_POOL_DSN` registered as a
+wildcard shared pool.
+
+1. Two tenants provision — both placed on the shared DB and `active` immediately (no cluster creation)
+2. File CRUD + mkdir + directory listing on tenant A
+3. Cross-tenant isolation: same path under tenant B holds different content; B cannot read A's nested file
+4. Raw SQL on the shared DB: both tenants' rows share tables with distinct `fs_id`s
+5. `DELETE /v1/tenant` on A: shared rows purged (`file_nodes`/`inodes` empty for A's fs_id), A's key revoked (401/403), B fully intact
+
+Knobs: `META_DSN` / `SHARED_DSN` (skip the container), `KEEP_DB=1`,
+`DRIVE9_SHARED_E2E_DB_RUNTIME`, `DRIVE9_SHARED_E2E_DB_IMAGE`,
+`DRIVE9_SHARED_E2E_DB_PASSWORD`.
+
 ## Environment variables
 
 | Variable | Default | Used by |

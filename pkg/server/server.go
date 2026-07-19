@@ -5021,6 +5021,114 @@ func (s *Server) updateTenantSchemaVersionForProfile(ctx context.Context, tenant
 	return nil
 }
 
+// tenantIsSharedSchema reports whether the tenant is placed on a
+// shared-schema database. Tenants without a placement row are standalone.
+func (s *Server) tenantIsSharedSchema(ctx context.Context, tenantID string) (bool, error) {
+	if s.meta == nil {
+		return false, nil
+	}
+	fsID, err := s.meta.ResolveFsID(ctx, tenantID)
+	if errors.Is(err, meta.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("resolve fs_id: %w", err)
+	}
+	placement, err := s.meta.GetTenantPlacement(ctx, fsID)
+	if errors.Is(err, meta.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("resolve tenant placement: %w", err)
+	}
+	return placement.SchemaShape == meta.SchemaShapeShared, nil
+}
+
+// findSharedDBForProvision resolves whether the tenant being provisioned
+// should be placed on a shared-schema database: a registered shared pool for
+// the request's org, or the wildcard pool. Returns nil when the tenant should
+// follow the normal per-tenant provisioning path.
+func (s *Server) findSharedDBForProvision(ctx context.Context, provider string, opts provisionTenantOptions) *meta.SharedDB {
+	if s.meta == nil {
+		return nil
+	}
+	orgID := ""
+	if provider == tenant.ProviderTiDBCloudNative && opts.CredentialProvisioner != nil {
+		if id, err := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner); err == nil {
+			orgID = id
+		} else {
+			logger.Warn(ctx, "server_event", eventFields(ctx, "provision_org_resolve_failed", "error", err)...)
+		}
+	}
+	sharedDB, err := s.meta.FindSharedDBForOrg(ctx, orgID)
+	if err != nil {
+		if !errors.Is(err, meta.ErrNotFound) {
+			logger.Warn(ctx, "server_event", eventFields(ctx, "shared_pool_lookup_failed", "error", err)...)
+		}
+		return nil
+	}
+	return sharedDB
+}
+
+// provisionTenantOnSharedDB completes provisioning for a tenant placed on a
+// shared-schema database: no cluster is created and the schema already exists
+// there. It writes the placement, forces the fts_only embedding profile
+// (shared tables carry plain VECTOR columns — per-tenant EMBED_TEXT generated
+// columns are impossible), marks the tenant active, and issues the owner key.
+func (s *Server) provisionTenantOnSharedDB(ctx context.Context, tenantID string, sharedDB *meta.SharedDB, provider, keyName string, opts provisionTenantOptions, now time.Time) (*provisionTenantResult, error) {
+	fail := func(err error) (*provisionTenantResult, error) {
+		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+		}
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to place tenant on shared pool", err)
+	}
+	// Create-time spending limits are per-cluster in the shared world and are
+	// managed on the shared DB itself, not per tenant.
+	if opts.Quota != nil && opts.Quota.TiDBCloudSpendingLimit != nil {
+		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+		return nil, newProvisionTenantError(http.StatusBadRequest, "tidbcloud spending limit is not supported for shared-pool tenants", fmt.Errorf("spending limit requested for shared-pool tenant"))
+	}
+	fsID, err := s.meta.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		return fail(err)
+	}
+	if err := s.meta.UpsertTenantAutoEmbeddingProfile(ctx, &meta.TenantAutoEmbeddingProfile{
+		TenantID:      tenantID,
+		EmbeddingMode: meta.TenantEmbeddingModeFTSOnly,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		return fail(err)
+	}
+	if err := s.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID:        fsID,
+		DbID:        sharedDB.DbID,
+		Placement:   meta.PlacementShared,
+		SchemaShape: meta.SchemaShapeShared,
+	}); err != nil {
+		return fail(err)
+	}
+	if err := s.meta.IncrSharedDBTenantCount(ctx, sharedDB.DbID, 1); err != nil {
+		logger.Warn(ctx, "server_event", eventFields(ctx, "shared_pool_tenant_count_failed", "tenant_id", tenantID, "error", err)...)
+	}
+	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantActive); err != nil {
+		return fail(err)
+	}
+	apiToken, apiKeyID, err := s.issueOwnerAPIKey(ctx, tenantID, keyName, opts.TokenVersion, opts.APIKeySource)
+	if err != nil {
+		return fail(err)
+	}
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_shared_pool_placed", "tenant_id", tenantID, "provider", provider, "db_id", sharedDB.DbID, "org_id", sharedDB.OrgID)...)
+	metricEvent(ctx, "tenant_provision", "provider", provider, "result", "shared_pool")
+	return &provisionTenantResult{
+		TenantID: tenantID,
+		APIKey:   apiToken,
+		APIKeyID: apiKeyID,
+		Status:   meta.TenantActive,
+		Provider: provider,
+	}, nil
+}
+
 func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOptions) (*provisionTenantResult, error) {
 	rawProvider := s.provisioner.ProviderType()
 	provider, err := tenant.NormalizeProvider(rawProvider)
@@ -5076,6 +5184,13 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "ok")
 	logProvisionStage(ctx, "provision_tenant_inserted", tenantID, provider, stageStarted, "status", meta.TenantPending)
+
+	// Shared-pool placement: when a shared-schema database is registered for
+	// this tenant's org (or a wildcard pool exists), the tenant is placed on
+	// it directly — no cluster is created and the schema already exists there.
+	if sharedDB := s.findSharedDBForProvision(ctx, provider, opts); sharedDB != nil {
+		return s.provisionTenantOnSharedDB(ctx, tenantID, sharedDB, provider, keyName, opts, now)
+	}
 
 	if autoProfile != nil {
 		stageStarted = time.Now()

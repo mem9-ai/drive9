@@ -553,6 +553,49 @@ func metaInitSchemaStatements() []string {
 			tenant_id  VARCHAR(64) NOT NULL UNIQUE,
 			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 		)`,
+		// db_pool is the fleet-wide registry of physical databases available
+		// for tenant placement under the shared-schema layout. org_id scopes a
+		// database to a TiDB Cloud organization; the '*' wildcard row serves
+		// organizations without an exact entry. db_password holds the same
+		// encrypted envelope as tenants.db_password. tenant_count is maintained
+		// via IncrSharedDBTenantCount as placements are created and removed.
+		// The `role` column name is backtick-quoted because ROLE is a reserved
+		// word in MySQL 8.0.
+		`CREATE TABLE IF NOT EXISTS db_pool (
+			db_id        BIGINT AUTO_INCREMENT PRIMARY KEY,
+			org_id       VARCHAR(64) NOT NULL DEFAULT '',
+			` + "`role`" + `       VARCHAR(20) NOT NULL,
+			db_host      VARCHAR(255) NOT NULL,
+			db_port      INT NOT NULL,
+			db_user      VARCHAR(255) NOT NULL,
+			db_password  VARBINARY(2048) NOT NULL,
+			db_name      VARCHAR(255) NOT NULL,
+			db_tls       TINYINT(1) NOT NULL DEFAULT 1,
+			max_tenants  INT NOT NULL DEFAULT 0,
+			tenant_count INT NOT NULL DEFAULT 0,
+			status       VARCHAR(20) NOT NULL DEFAULT 'active',
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			UNIQUE INDEX uk_db_pool_endpoint (org_id, db_host, db_name),
+			INDEX idx_db_pool_org (org_id, status)
+		)`,
+		// tenant_placements records which physical database (db_pool row) hosts
+		// each filesystem (fs_registry row). A missing row means the tenant
+		// still lives on its legacy standalone database. epoch is reserved for
+		// optimistic concurrency during future migrations; it stays 1 unless a
+		// migration explicitly bumps it.
+		`CREATE TABLE IF NOT EXISTS tenant_placements (
+			fs_id        BIGINT PRIMARY KEY,
+			db_id        BIGINT NOT NULL,
+			placement    VARCHAR(20) NOT NULL,
+			schema_shape VARCHAR(20) NOT NULL,
+			status       VARCHAR(20) NOT NULL DEFAULT 'active',
+			target_db_id BIGINT NULL,
+			epoch        BIGINT NOT NULL DEFAULT 1,
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			INDEX idx_placement_db (db_id, status)
+		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_auto_embedding_profiles (
 			tenant_id      VARCHAR(64) PRIMARY KEY,
 			embedding_mode VARCHAR(32) NULL,

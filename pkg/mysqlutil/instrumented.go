@@ -21,6 +21,10 @@ const (
 	RoleMeta       = "meta"
 	RoleUser       = "user"
 	RoleUserSchema = "user_schema"
+	// RoleShared labels *sql.DB handles to shared-schema databases that serve
+	// many tenants at once (fs_id row keys). Pool limits for this role must be
+	// sized for the whole cluster, not for one tenant.
+	RoleShared = "shared"
 )
 
 const (
