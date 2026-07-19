@@ -664,7 +664,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(15, ((drive9_tenant_media_files{tidbcloud_org_id=~\"$org\",tenant_id=~\"$tenant\",state=\"confirmed\"} / on (tenant_id, tidbcloud_org_id) drive9_tenant_media_files{tidbcloud_org_id=~\"$org\",tenant_id=~\"$tenant\",state=\"limit\"}) and on (tenant_id, tidbcloud_org_id) (drive9_tenant_media_files{tidbcloud_org_id=~\"$org\",tenant_id=~\"$tenant\",state=\"limit\"} > 0)))",
+          "expr": "topk(15, ((sum by (tenant_id, tidbcloud_org_id) (drive9_tenant_media_files{tidbcloud_org_id=~\"$org\",tenant_id=~\"$tenant\",state=\"confirmed\"}) / sum by (tenant_id, tidbcloud_org_id) (drive9_tenant_media_files{tidbcloud_org_id=~\"$org\",tenant_id=~\"$tenant\",state=\"limit\"})) and on (tenant_id, tidbcloud_org_id) (sum by (tenant_id, tidbcloud_org_id) (drive9_tenant_media_files{tidbcloud_org_id=~\"$org\",tenant_id=~\"$tenant\",state=\"limit\"}) > 0)))",
           "legendFormat": "{{tenant_id}} / {{tidbcloud_org_id}} media files",
           "refId": "B"
         }
