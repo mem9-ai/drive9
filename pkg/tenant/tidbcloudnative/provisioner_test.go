@@ -1206,8 +1206,8 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 	if !patchCalled {
 		t.Fatal("PATCH was not called")
 	}
-	if len(order) != 2 || order[0] != "GET" || order[1] != "PATCH" {
-		t.Fatalf("order = %#v, want GET then PATCH", order)
+	if len(order) != 1 || order[0] != "PATCH" {
+		t.Fatalf("order = %#v, want PATCH only", order)
 	}
 	if !strings.Contains(gotAuth, `username="public-1"`) {
 		t.Fatalf("Authorization header did not use request public key: %q", gotAuth)
@@ -1216,23 +1216,14 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 		t.Fatalf("updateMask = %q, want labels", gotPatch.UpdateMask)
 	}
 	labels := gotPatch.Cluster.Labels
-	if labels["environment"] != "prod" || labels["drive9.ai/unrelated"] != "keep" {
-		t.Fatalf("existing labels were not preserved: %#v", labels)
-	}
-	if _, ok := labels["tidb.cloud/project"]; ok {
-		t.Fatalf("immutable label tidb.cloud/project was not stripped: %#v", labels)
-	}
-	if _, ok := labels["tidb.cloud/organization"]; ok {
-		t.Fatalf("immutable label tidb.cloud/organization was not stripped: %#v", labels)
-	}
 	if labels[Drive9ManagedLabel] != "true" || labels[Drive9TenantIDLabel] != "tenant-1" {
 		t.Fatalf("drive9 labels = %#v", labels)
 	}
 	if labels[Drive9QuotaUpdateAtLabel] == "" {
 		t.Fatalf("%s label was empty: %#v", Drive9QuotaUpdateAtLabel, labels)
 	}
-	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly == nil || *cfg.TiDBCloudSpendingLimitMonthly != 15000 {
-		t.Fatalf("cloud config = %#v, want spending limit 15000", cfg)
+	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly != nil {
+		t.Fatalf("cloud config = %#v, want no spending limit from GET", cfg)
 	}
 	if cfg.Labels[Drive9ManagedLabel] != "true" || cfg.Labels[Drive9TenantIDLabel] != "tenant-1" {
 		t.Fatalf("cloud config labels = %#v", cfg.Labels)

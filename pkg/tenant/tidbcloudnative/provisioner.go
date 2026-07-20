@@ -761,24 +761,17 @@ func (p *Provisioner) MarkClusterPoolUsed(ctx context.Context, cluster *tenant.C
 		}
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
-	if err != nil {
-		return nil, fmt.Errorf("load cluster pool label info: %w", err)
+	labels := map[string]string{
+		Drive9ManagedLabel:   "true",
+		Drive9PoolStatusLabel: "used",
+		Drive9PoolUsedAtLabel: usedAt.UTC().Format(time.RFC3339),
 	}
-	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
 		labels[Drive9TenantIDLabel] = tenantID
 	}
-	labels[Drive9PoolStatusLabel] = "used"
-	labels[Drive9PoolUsedAtLabel] = usedAt.UTC().Format(time.RFC3339)
-	for _, k := range immutableLabelKeys {
-		delete(labels, k)
-	}
+	cloudCfg := &tenant.QuotaCloudConfig{}
 	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
 		return nil, fmt.Errorf("update cluster pool labels: %w", err)
-	}
-	if cloudCfg == nil {
-		cloudCfg = &tenant.QuotaCloudConfig{}
 	}
 	cloudCfg.Labels = labels
 	if opts.TiDBCloudSpendingLimitMonthly != nil {
@@ -801,18 +794,12 @@ func (p *Provisioner) MarkClusterPoolFree(ctx context.Context, cluster *tenant.C
 		return fmt.Errorf("cluster id is required")
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels, _, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
-	if err != nil {
-		return fmt.Errorf("load cluster pool label info: %w", err)
+	labels := map[string]string{
+		Drive9ManagedLabel:   "true",
+		Drive9PoolStatusLabel: "free",
 	}
-	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
 		labels[Drive9TenantIDLabel] = tenantID
-	}
-	labels[Drive9PoolStatusLabel] = "free"
-	delete(labels, Drive9PoolUsedAtLabel)
-	for _, k := range immutableLabelKeys {
-		delete(labels, k)
 	}
 	return p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels)
 }
