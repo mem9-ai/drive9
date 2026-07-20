@@ -1154,32 +1154,30 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		if r.URL.Path != "/v1beta1/clusters/cluster-1" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
 		gotAuth = r.Header.Get("Authorization")
-		switch r.Method {
-		case http.MethodGet:
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters":
 			order = append(order, "GET")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"clusterId": "cluster-1",
-				"labels": map[string]string{
-					"environment":             "prod",
-					Drive9ManagedLabel:        "old",
-					Drive9TenantIDLabel:       "old-tenant",
-					"drive9.ai/unrelated":     "keep",
-					"tidb.cloud/project":      "123",
-					"tidb.cloud/organization": "456",
-				},
-				"spendingLimit": map[string]int32{
-					"monthly": 15000,
+				"clusters": []map[string]any{
+					{
+						"clusterId": "cluster-1",
+						"labels": map[string]string{
+							"environment":             "prod",
+							Drive9ManagedLabel:        "old",
+							Drive9TenantIDLabel:       "old-tenant",
+							"drive9.ai/unrelated":     "keep",
+							"tidb.cloud/project":      "123",
+							"tidb.cloud/organization": "456",
+						},
+					},
 				},
 			})
 			return
-		case http.MethodPatch:
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1beta1/clusters/cluster-1":
 			order = append(order, "PATCH")
 		default:
-			t.Fatalf("unexpected method %s", r.Method)
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 		patchCalled = true
 		if err := json.NewDecoder(r.Body).Decode(&gotPatch); err != nil {
@@ -1206,8 +1204,8 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 	if !patchCalled {
 		t.Fatal("PATCH was not called")
 	}
-	if len(order) != 1 || order[0] != "PATCH" {
-		t.Fatalf("order = %#v, want PATCH only", order)
+	if len(order) != 2 || order[0] != "GET" || order[1] != "PATCH" {
+		t.Fatalf("order = %#v, want GET then PATCH", order)
 	}
 	if !strings.Contains(gotAuth, `username="public-1"`) {
 		t.Fatalf("Authorization header did not use request public key: %q", gotAuth)
@@ -1216,6 +1214,9 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 		t.Fatalf("updateMask = %q, want labels", gotPatch.UpdateMask)
 	}
 	labels := gotPatch.Cluster.Labels
+	if labels["environment"] != "prod" || labels["drive9.ai/unrelated"] != "keep" {
+		t.Fatalf("existing labels were not preserved: %#v", labels)
+	}
 	if labels[Drive9ManagedLabel] != "true" || labels[Drive9TenantIDLabel] != "tenant-1" {
 		t.Fatalf("drive9 labels = %#v", labels)
 	}
@@ -1223,7 +1224,7 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 		t.Fatalf("%s label was empty: %#v", Drive9QuotaUpdateAtLabel, labels)
 	}
 	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly != nil {
-		t.Fatalf("cloud config = %#v, want no spending limit from GET", cfg)
+		t.Fatalf("cloud config = %#v, want no spending limit", cfg)
 	}
 	if cfg.Labels[Drive9ManagedLabel] != "true" || cfg.Labels[Drive9TenantIDLabel] != "tenant-1" {
 		t.Fatalf("cloud config labels = %#v", cfg.Labels)

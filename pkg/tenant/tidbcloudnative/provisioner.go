@@ -65,8 +65,6 @@ const (
 	upstreamClusterBodyLimit = 1 << 20
 )
 
-var ()
-
 var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 var displayNameCharPattern = regexp.MustCompile(`[^A-Za-z0-9-]`)
 
@@ -756,19 +754,20 @@ func (p *Provisioner) MarkClusterPoolUsed(ctx context.Context, cluster *tenant.C
 		}
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels := map[string]string{
-		Drive9ManagedLabel:   "true",
-		Drive9PoolStatusLabel: "used",
-		Drive9PoolUsedAtLabel: usedAt.UTC().Format(time.RFC3339),
+	labels, err := p.getClusterLabelsWithCredentials(ctx, publicKey, privateKey, clusterID)
+	if err != nil {
+		return nil, fmt.Errorf("load cluster labels: %w", err)
 	}
+	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
 		labels[Drive9TenantIDLabel] = tenantID
 	}
-	cloudCfg := &tenant.QuotaCloudConfig{}
+	labels[Drive9PoolStatusLabel] = "used"
+	labels[Drive9PoolUsedAtLabel] = usedAt.UTC().Format(time.RFC3339)
 	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
 		return nil, fmt.Errorf("update cluster pool labels: %w", err)
 	}
-	cloudCfg.Labels = labels
+	cloudCfg := &tenant.QuotaCloudConfig{Labels: labels}
 	if opts.TiDBCloudSpendingLimitMonthly != nil {
 		monthly := *opts.TiDBCloudSpendingLimitMonthly
 		if err := p.updateSpendingLimitWithCredentials(ctx, publicKey, privateKey, clusterID, monthly); err != nil {
@@ -789,13 +788,16 @@ func (p *Provisioner) MarkClusterPoolFree(ctx context.Context, cluster *tenant.C
 		return fmt.Errorf("cluster id is required")
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels := map[string]string{
-		Drive9ManagedLabel:   "true",
-		Drive9PoolStatusLabel: "free",
+	labels, err := p.getClusterLabelsWithCredentials(ctx, publicKey, privateKey, clusterID)
+	if err != nil {
+		return fmt.Errorf("load cluster labels: %w", err)
 	}
+	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
 		labels[Drive9TenantIDLabel] = tenantID
 	}
+	labels[Drive9PoolStatusLabel] = "free"
+	delete(labels, Drive9PoolUsedAtLabel)
 	return p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels)
 }
 
@@ -1027,18 +1029,19 @@ func (p *Provisioner) MarkQuotaUpdateStarted(ctx context.Context, cluster *tenan
 		return nil, fmt.Errorf("cluster id is required")
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels := map[string]string{
-		Drive9ManagedLabel:     "true",
-		Drive9QuotaUpdateAtLabel: strconv.FormatInt(time.Now().UTC().Unix(), 10),
+	labels, err := p.getClusterLabelsWithCredentials(ctx, publicKey, privateKey, clusterID)
+	if err != nil {
+		return nil, fmt.Errorf("load cluster labels: %w", err)
 	}
+	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
 		labels[Drive9TenantIDLabel] = tenantID
 	}
-	cloudCfg := &tenant.QuotaCloudConfig{}
+	labels[Drive9QuotaUpdateAtLabel] = strconv.FormatInt(time.Now().UTC().Unix(), 10)
 	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
 		return nil, fmt.Errorf("update cluster quota labels: %w", err)
 	}
-	cloudCfg.Labels = labels
+	cloudCfg := &tenant.QuotaCloudConfig{Labels: labels}
 	return cloudCfg, nil
 }
 
@@ -1162,6 +1165,21 @@ func (p *Provisioner) listClusterInfosPageWithCredentials(ctx context.Context, p
 		return nil, "", fmt.Errorf("parse cluster list: %w", err)
 	}
 	return list.Clusters, strings.TrimSpace(list.NextPageToken), nil
+}
+
+func (p *Provisioner) getClusterLabelsWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, error) {
+	infos, _, err := p.listClusterInfosPageWithCredentials(ctx, publicKey, privateKey, []string{clusterID}, 1, "")
+	if err != nil {
+		return nil, fmt.Errorf("list cluster labels: %w", err)
+	}
+	if len(infos) == 0 {
+		return nil, fmt.Errorf("cluster %q not found", clusterID)
+	}
+	labels := make(map[string]string, len(infos[0].Labels))
+	for k, v := range infos[0].Labels {
+		labels[k] = v
+	}
+	return labels, nil
 }
 
 func (p *Provisioner) clusterQuotaInfo(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, *tenant.QuotaCloudConfig, error) {
@@ -2072,7 +2090,7 @@ func (p *Provisioner) doDigestAuthRequest(ctx context.Context, publicKey, privat
 			zap.String("method", method),
 			zap.String("path", requestPath(uri)),
 			zap.String("result", "error"),
-			zap.Duration("duration_ms", time.Since(start)),
+			zap.Int64("duration_ms", time.Since(start).Milliseconds()),
 			zap.Error(err))
 		return nil, err
 	}
@@ -2081,7 +2099,7 @@ func (p *Provisioner) doDigestAuthRequest(ctx context.Context, publicKey, privat
 			zap.String("method", method),
 			zap.String("path", requestPath(uri)),
 			zap.Int("status", resp.StatusCode),
-			zap.Duration("duration_ms", time.Since(start)))
+			zap.Int64("duration_ms", time.Since(start).Milliseconds()))
 		return resp, nil
 	}
 	_ = resp.Body.Close()
@@ -2108,7 +2126,7 @@ func (p *Provisioner) doDigestAuthRequest(ctx context.Context, publicKey, privat
 			zap.String("method", method),
 			zap.String("path", requestPath(uri)),
 			zap.String("result", "error"),
-			zap.Duration("duration_ms", time.Since(start2)),
+			zap.Int64("duration_ms", time.Since(start2).Milliseconds()),
 			zap.Error(err))
 		return nil, err
 	}
@@ -2116,7 +2134,7 @@ func (p *Provisioner) doDigestAuthRequest(ctx context.Context, publicKey, privat
 		zap.String("method", method),
 		zap.String("path", requestPath(uri)),
 		zap.Int("status", resp2.StatusCode),
-		zap.Duration("duration_ms", time.Since(start2)))
+		zap.Int64("duration_ms", time.Since(start2).Milliseconds()))
 	return resp2, nil
 }
 
