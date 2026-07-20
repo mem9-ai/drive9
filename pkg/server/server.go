@@ -5213,11 +5213,14 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		logProvisionStage(ctx, "provision_quota_local_config_applied", tenantID, provider, stageStarted)
 	}
 	stageStarted = time.Now()
-	checkedAt := time.Now().UTC()
-	if err := s.meta.SetQuotaConfigPatch(ctx, tenantID, meta.QuotaConfigPatch{
-		TiDBCloudSpendingLimit:           tidbCloudSpendingLimitFromCloud(provisionCloudCfg),
-		TiDBCloudSpendingLimitCheckedAt: &checkedAt,
-	}); err != nil {
+	quotaSeed := meta.QuotaConfigPatch{
+		TiDBCloudSpendingLimit: tidbCloudSpendingLimitFromCloud(provisionCloudCfg),
+	}
+	if provisionCloudCfg != nil {
+		checkedAt := time.Now().UTC()
+		quotaSeed.TiDBCloudSpendingLimitCheckedAt = &checkedAt
+	}
+	if err := s.meta.SetQuotaConfigPatch(ctx, tenantID, quotaSeed); err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
 		s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
