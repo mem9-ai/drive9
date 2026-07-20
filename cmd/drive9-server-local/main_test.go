@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/meta"
@@ -689,4 +690,29 @@ func TestLocalStubAudioTextExtractorTranscript(t *testing.T) {
 	if got != want {
 		t.Fatalf("transcript=%q, want %q", got, want)
 	}
+}
+
+func TestEnvDurationCompat(t *testing.T) {
+	const canonical = "DRIVE9_TEST_DURATION_COMPAT"
+	const deprecated = "DRIVE9_TEST_DURATION_COMPAT_DEPRECATED_MS"
+	fallback := 5 * time.Minute
+
+	t.Run("fallback when neither is set", func(t *testing.T) {
+		if got := envDurationCompat(canonical, deprecated, fallback); got != fallback {
+			t.Fatalf("expected fallback %v, got %v", fallback, got)
+		}
+	})
+	t.Run("canonical wins when both are set", func(t *testing.T) {
+		t.Setenv(canonical, "10s")
+		t.Setenv(deprecated, "20s")
+		if got := envDurationCompat(canonical, deprecated, fallback); got != 10*time.Second {
+			t.Fatalf("expected canonical 10s, got %v", got)
+		}
+	})
+	t.Run("deprecated name honored when canonical is unset", func(t *testing.T) {
+		t.Setenv(deprecated, "20s")
+		if got := envDurationCompat(canonical, deprecated, fallback); got != 20*time.Second {
+			t.Fatalf("expected deprecated 20s, got %v", got)
+		}
+	})
 }
