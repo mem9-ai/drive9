@@ -16,7 +16,7 @@ import (
 // (semantic/file_gc/quota) to the unified worker. The worker deduplicates
 // kicks by tenant and OR-accumulates the work_mask.
 type outboxKicker interface {
-	Kick(tenantID string, workMask int)
+	KickWithOrg(tenantID, tidbCloudOrgID string, workMask int)
 }
 
 const (
@@ -209,12 +209,12 @@ func (p *tenantOutboxPoller) dispatch(ctx context.Context, row meta.TenantNotify
 		// Sharded work: only the shard owner processes it. Other pods skip;
 		// the safety-net scan recovers any work whose kick was lost.
 		if p.shardFn(row.TenantID) {
-			p.worker.Kick(row.TenantID, shardedMask)
+			p.worker.KickWithOrg(row.TenantID, row.TiDBCloudOrgID, shardedMask)
 			// Record the kick that will trigger a tenant-DB access via the
 			// worker. This gives a baseline rate of "kicks dispatched" to
 			// compare against actual tenant_worker_acquire — a divergence
 			// (kicks without acquires) points to lost work.
-			metrics.RecordTenantOperationCount(row.TenantID, "user_db_access", "outbox_dispatch_kick", "ok")
+			metrics.RecordTenantOperationCountWithOrg(row.TenantID, row.TiDBCloudOrgID, "user_db_access", "outbox_dispatch_kick", "ok")
 		}
 	}
 }

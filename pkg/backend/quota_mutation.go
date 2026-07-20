@@ -11,7 +11,6 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
-	"github.com/mem9-ai/drive9/pkg/metrics"
 	"go.uber.org/zap"
 )
 
@@ -103,7 +102,7 @@ func (b *Dat9Backend) logQuotaMutation(ctx context.Context, mutationType string,
 			zap.String("tenant_id", b.tenantID),
 			zap.String("mutation_type", mutationType),
 			zap.Error(err))
-		metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "log_error", time.Duration(0))
+		b.recordTenantOperation("central_quota", mutationType, "log_error", time.Duration(0))
 		return 0, err
 	}
 	return logID, nil
@@ -124,14 +123,14 @@ func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType strin
 			zap.String("mutation_type", mutationType),
 			zap.Int64("log_id", logID),
 			zap.Error(err))
-		metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "pending", time.Duration(0))
+		b.recordTenantOperation("central_quota", mutationType, "pending", time.Duration(0))
 		return
 	}
 	if b.quotaUsageCache != nil {
 		b.quotaUsageCache.invalidate()
 	}
 	b.clearPendingCentralMutationDeltas(pending.storageDelta, pending.fileDelta, pending.mediaDelta)
-	metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "ok", time.Duration(0))
+	b.recordTenantOperation("central_quota", mutationType, "ok", time.Duration(0))
 }
 
 // logAndEnqueueMutation atomically logs a mutation and enqueues its apply

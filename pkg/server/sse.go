@@ -138,9 +138,14 @@ func newEventBuses() *eventBuses {
 }
 
 func (ebs *eventBuses) get(tenantID string, store *datastore.Store) *EventBus {
+	return ebs.getWithOrg(tenantID, "", store)
+}
+
+func (ebs *eventBuses) getWithOrg(tenantID, tidbCloudOrgID string, store *datastore.Store) *EventBus {
 	ebs.mu.Lock()
 	defer ebs.mu.Unlock()
 	if bus, ok := ebs.buses[tenantID]; ok {
+		bus.SetMetricOrgID(tidbCloudOrgID)
 		// Refresh the store reference if a non-nil store is provided: the pool
 		// may have invalidated and recreated the backend (closing the old store
 		// and opening a new one), so the cached bus's store could be stale/closed.
@@ -152,7 +157,7 @@ func (ebs *eventBuses) get(tenantID string, store *datastore.Store) *EventBus {
 		}
 		return bus
 	}
-	bus := NewEventBus(tenantID, store)
+	bus := NewEventBusWithOrg(tenantID, tidbCloudOrgID, store)
 	ebs.buses[tenantID] = bus
 	return bus
 }
@@ -190,14 +195,18 @@ func (ebs *eventBuses) activeTenantIDs() []string {
 func (s *Server) tenantEventBus(r *http.Request) *EventBus {
 	scope := ScopeFromContext(r.Context())
 	if scope != nil && scope.Backend != nil {
-		return s.events.get(scope.TenantID, scope.Backend.Store())
+		tidbCloudOrgID := scope.TiDBCloudOrgID
+		if tidbCloudOrgID == "" {
+			tidbCloudOrgID = scope.Backend.TiDBCloudOrgID()
+		}
+		return s.events.getWithOrg(scope.TenantID, tidbCloudOrgID, scope.Backend.Store())
 	}
 	// Single-tenant / fallback mode.
 	var store *datastore.Store
 	if s.fallback != nil {
 		store = s.fallback.Store()
 	}
-	return s.events.get("", store)
+	return s.events.getWithOrg("", "", store)
 }
 
 func (s *Server) publishEvent(r *http.Request, path, op string) {
@@ -227,8 +236,8 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 				zap.String("path", path),
 				zap.String("op", op),
 				zap.Error(err))
-			metrics.RecordTenantOperation(bus.tenantID, "event_bus", "publish", metrics.ResultForError(err), 0)
-			metrics.RecordEventBusPublishError(bus.tenantID)
+			metrics.RecordTenantOperationWithOrg(bus.tenantID, bus.TiDBCloudOrgID(), "event_bus", "publish", metrics.ResultForError(err), 0)
+			metrics.RecordEventBusPublishErrorWithOrg(bus.tenantID, bus.TiDBCloudOrgID())
 		}
 	}
 
@@ -329,6 +338,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	bus := s.tenantEventBus(r)
 	tenantID := bus.tenantID
+	tidbCloudOrgID := bus.TiDBCloudOrgID()
 	connStart := time.Now()
 	// Track SSE inflight and connection lifetime. The inflight count is
 	// derived from the EventBus listener set (adjusted in Subscribe/
@@ -336,7 +346,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// dedicated SSE metrics (NOT the HTTP duration histogram — see the
 	// route guard in observe).
 	defer func() {
-		metrics.RecordSSEConnection(tenantID, "closed", time.Since(connStart))
+		metrics.RecordSSEConnectionWithOrg(tenantID, tidbCloudOrgID, "closed", time.Since(connStart))
 	}()
 
 	subID, notify := bus.Subscribe()
@@ -374,7 +384,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		sendSSEReset(bw, headSeq, reason)
-		metrics.RecordSSEResetSent(tenantID, reason)
+		metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, reason)
 		lastSeen = headSeq
 	} else {
 		for _, ev := range events {
@@ -382,9 +392,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if isStructuralOp(ev.Op) {
 				// Structural ops are emitted as reset events (see sendSSEEvent),
 				// so count them as resets, not file_changed deliveries.
-				metrics.RecordSSEResetSent(tenantID, "structural_change")
+				metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, "structural_change")
 			} else {
-				metrics.RecordSSEEventSent(tenantID, ev.Op)
+				metrics.RecordSSEEventSentWithOrg(tenantID, tidbCloudOrgID, ev.Op)
 			}
 			lastSeen = ev.Seq
 		}
@@ -394,13 +404,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// were marked unverified on disconnect become verified without waiting
 	// for the periodic heartbeat.
 	sendSSEHeartbeat(bw, lastSeen)
-	metrics.RecordSSEHeartbeatSent(tenantID)
+	metrics.RecordSSEHeartbeatSentWithOrg(tenantID, tidbCloudOrgID)
 	// Flush initial replay/reset immediately so the client receives the
 	// cursor position without waiting for the periodic heartbeat.
 	if err := bw.Flush(); err != nil {
 		return
 	}
-	metrics.RecordSSEPhase1(tenantID, time.Since(phase1Start))
+	metrics.RecordSSEPhase1WithOrg(tenantID, tidbCloudOrgID, time.Since(phase1Start))
 
 	// Phase 2: Live stream with micro-batching.
 	// The notify channel catches same-pod events instantly. A 1s poll ticker
@@ -429,7 +439,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		liveEvents, liveHead, liveOK := bus.EventsSince(ctx, lastSeen)
 		if !liveOK {
 			sendSSEReset(bw, liveHead, "seq_too_old")
-			metrics.RecordSSEResetSent(tenantID, "seq_too_old")
+			metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, "seq_too_old")
 			lastSeen = liveHead
 			if err := bw.Flush(); err != nil {
 				return false
@@ -443,9 +453,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		for _, ev := range liveEvents {
 			sendSSEEvent(bw, ev)
 			if isStructuralOp(ev.Op) {
-				metrics.RecordSSEResetSent(tenantID, "structural_change")
+				metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, "structural_change")
 			} else {
-				metrics.RecordSSEEventSent(tenantID, ev.Op)
+				metrics.RecordSSEEventSentWithOrg(tenantID, tidbCloudOrgID, ev.Op)
 			}
 			lastSeen = ev.Seq
 		}
@@ -477,7 +487,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-heartbeat.C:
 			sendSSEHeartbeat(bw, lastSeen)
-			metrics.RecordSSEHeartbeatSent(tenantID)
+			metrics.RecordSSEHeartbeatSentWithOrg(tenantID, tidbCloudOrgID)
 			if err := bw.Flush(); err != nil {
 				return
 			}

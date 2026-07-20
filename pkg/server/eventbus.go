@@ -43,18 +43,25 @@ const (
 // A podNotifier additionally pushes notifications to peers for <10ms latency.
 // Neither path touches a tenant TiDB unless that tenant actually has new events.
 type EventBus struct {
-	tenantID string
-	store    atomic.Pointer[datastore.Store]
-	mu       sync.Mutex
-	listeners map[uint64]chan struct{}
-	nextID    uint64
+	tenantID       string
+	tidbCloudOrgID string
+	store          atomic.Pointer[datastore.Store]
+	mu             sync.Mutex
+	listeners      map[uint64]chan struct{}
+	nextID         uint64
 }
 
 // NewEventBus creates a new EventBus backed by the given tenant store.
 func NewEventBus(tenantID string, store *datastore.Store) *EventBus {
+	return NewEventBusWithOrg(tenantID, "", store)
+}
+
+// NewEventBusWithOrg creates a new EventBus with explicit tenant metric org scope.
+func NewEventBusWithOrg(tenantID, tidbCloudOrgID string, store *datastore.Store) *EventBus {
 	eb := &EventBus{
-		tenantID:  tenantID,
-		listeners: make(map[uint64]chan struct{}),
+		tenantID:       tenantID,
+		tidbCloudOrgID: normalizeTenantMetricTiDBCloudOrgID(tidbCloudOrgID),
+		listeners:      make(map[uint64]chan struct{}),
 	}
 	eb.store.Store(store)
 	return eb
@@ -65,11 +72,37 @@ func (eb *EventBus) TenantID() string {
 	return eb.tenantID
 }
 
+// TiDBCloudOrgID returns the org label value used by tenant-scoped SSE metrics.
+func (eb *EventBus) TiDBCloudOrgID() string {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+	return normalizeTenantMetricTiDBCloudOrgID(eb.tidbCloudOrgID)
+}
+
 // SetStore atomically updates the backing store. Called by eventBuses.get
 // when the pool invalidates and recreates a backend (closing the old store
 // and opening a new one).
 func (eb *EventBus) SetStore(store *datastore.Store) {
 	eb.store.Store(store)
+}
+
+// SetMetricOrgID updates the org label for this bus without touching its store.
+func (eb *EventBus) SetMetricOrgID(tidbCloudOrgID string) {
+	nextOrgID := normalizeTenantMetricTiDBCloudOrgID(tidbCloudOrgID)
+	eb.mu.Lock()
+	prevOrgID := normalizeTenantMetricTiDBCloudOrgID(eb.tidbCloudOrgID)
+	if prevOrgID == nextOrgID {
+		eb.tidbCloudOrgID = nextOrgID
+		eb.mu.Unlock()
+		return
+	}
+	listeners := len(eb.listeners)
+	eb.tidbCloudOrgID = nextOrgID
+	eb.mu.Unlock()
+	if listeners > 0 {
+		metrics.RecordSSEInFlightWithOrg(eb.tenantID, prevOrgID, 0)
+		metrics.RecordSSEInFlightWithOrg(eb.tenantID, nextOrgID, float64(listeners))
+	}
 }
 
 // HasListeners returns true if this bus currently has at least one subscriber.
@@ -108,7 +141,7 @@ func (eb *EventBus) Subscribe() (uint64, chan struct{}) {
 	eb.nextID++
 	ch := make(chan struct{}, eventBusListenerChanSize)
 	eb.listeners[id] = ch
-	metrics.RecordSSEInFlight(eb.tenantID, float64(len(eb.listeners)))
+	metrics.RecordSSEInFlightWithOrg(eb.tenantID, eb.tidbCloudOrgID, float64(len(eb.listeners)))
 	return id, ch
 }
 
@@ -119,7 +152,7 @@ func (eb *EventBus) Unsubscribe(id uint64) {
 		delete(eb.listeners, id)
 		close(ch)
 	}
-	metrics.RecordSSEInFlight(eb.tenantID, float64(len(eb.listeners)))
+	metrics.RecordSSEInFlightWithOrg(eb.tenantID, eb.tidbCloudOrgID, float64(len(eb.listeners)))
 	eb.mu.Unlock()
 }
 
@@ -164,7 +197,7 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 			zap.Uint64("since", since),
 			zap.Float64("query_ms", float64(time.Since(queryStart).Microseconds())/1000),
 			zap.Error(err))
-		metrics.RecordTenantOperation(eb.tenantID, "event_bus", "query", metrics.ResultForError(err), 0)
+		metrics.RecordTenantOperationWithOrg(eb.tenantID, eb.TiDBCloudOrgID(), "event_bus", "query", metrics.ResultForError(err), 0)
 		headSeq = since // keep the client's cursor unchanged
 		return nil, headSeq, true
 	}

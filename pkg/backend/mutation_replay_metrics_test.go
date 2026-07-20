@@ -21,10 +21,10 @@ func TestMutationReplayWorkerRecordsPendingBacklogGauges(t *testing.T) {
 	w.recordPendingBacklog(context.Background())
 
 	metricsText := readBackendMetrics()
-	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="pending_mutations",tenant_id="tenant-backlog"} 2`) {
+	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="pending_mutations",tenant_id="tenant-backlog",tidbcloud_org_id="guest"} 2`) {
 		t.Errorf("metrics missing pending mutation backlog gauge: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="oldest_pending_age_seconds",tenant_id="tenant-backlog"}`) {
+	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="oldest_pending_age_seconds",tenant_id="tenant-backlog",tidbcloud_org_id="guest"}`) {
 		t.Errorf("metrics missing oldest pending age gauge: %s", metricsText)
 	}
 
@@ -35,18 +35,18 @@ func TestMutationReplayWorkerRecordsPendingBacklogGauges(t *testing.T) {
 	w.recordPendingBacklog(context.Background())
 
 	metricsText = readBackendMetrics()
-	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="pending_mutations",tenant_id="tenant-backlog"} 0`) {
+	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="pending_mutations",tenant_id="tenant-backlog",tidbcloud_org_id="guest"} 0`) {
 		t.Errorf("metrics did not clear pending mutation backlog gauge: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="oldest_pending_age_seconds",tenant_id="tenant-backlog"} 0`) {
+	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="oldest_pending_age_seconds",tenant_id="tenant-backlog",tidbcloud_org_id="guest"} 0`) {
 		t.Errorf("metrics did not clear oldest pending age gauge: %s", metricsText)
 	}
 }
 
 func TestMutationReplayWorkerClearsPendingBacklogGaugesOnStop(t *testing.T) {
 	w := &MutationReplayWorker{
-		observedBacklogTenants: map[string]struct{}{
-			"tenant-stop": {},
+		observedBacklogTenants: map[string]string{
+			"tenant-stop": "guest",
 		},
 	}
 	metrics.RecordTenantGauge("tenant-stop", "mutation_replay", "pending_mutations", 3)
@@ -55,10 +55,10 @@ func TestMutationReplayWorkerClearsPendingBacklogGaugesOnStop(t *testing.T) {
 	w.clearPendingBacklogGauges()
 
 	metricsText := readBackendMetrics()
-	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="pending_mutations",tenant_id="tenant-stop"} 0`) {
+	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="pending_mutations",tenant_id="tenant-stop",tidbcloud_org_id="guest"} 0`) {
 		t.Errorf("metrics did not clear pending mutation backlog gauge on stop: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="oldest_pending_age_seconds",tenant_id="tenant-stop"} 0`) {
+	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="oldest_pending_age_seconds",tenant_id="tenant-stop",tidbcloud_org_id="guest"} 0`) {
 		t.Errorf("metrics did not clear oldest pending age gauge on stop: %s", metricsText)
 	}
 	if len(w.observedBacklogTenants) != 0 {
@@ -99,8 +99,8 @@ func TestMutationReplayWorkerRunDoesNotClearPendingBacklogGaugesOnFatalExit(t *t
 	w := &MutationReplayWorker{
 		store: store,
 		done:  make(chan struct{}),
-		observedBacklogTenants: map[string]struct{}{
-			"tenant-fatal-run": {},
+		observedBacklogTenants: map[string]string{
+			"tenant-fatal-run": "guest",
 		},
 	}
 	metrics.RecordTenantGauge("tenant-fatal-run", "mutation_replay", "pending_mutations", 5)
@@ -109,10 +109,10 @@ func TestMutationReplayWorkerRunDoesNotClearPendingBacklogGaugesOnFatalExit(t *t
 	w.run(context.Background())
 
 	metricsText := readBackendMetrics()
-	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="pending_mutations",tenant_id="tenant-fatal-run"} 5`) {
+	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="pending_mutations",tenant_id="tenant-fatal-run",tidbcloud_org_id="guest"} 5`) {
 		t.Errorf("fatal run should keep pending mutation backlog gauge: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="oldest_pending_age_seconds",tenant_id="tenant-fatal-run"} 13`) {
+	if !strings.Contains(metricsText, `drive9_service_gauge{component="mutation_replay",name="oldest_pending_age_seconds",tenant_id="tenant-fatal-run",tidbcloud_org_id="guest"} 13`) {
 		t.Errorf("fatal run should keep oldest pending age gauge: %s", metricsText)
 	}
 }

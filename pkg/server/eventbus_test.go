@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/mem9-ai/drive9/internal/testmysql"
 	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 func newTestStoreForEventBus(t *testing.T) *datastore.Store {
@@ -65,6 +67,25 @@ func TestEventBusSubscribeAndNotify(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for signal")
+	}
+}
+
+func TestEventBusSetMetricOrgIDMovesInFlightGauge(t *testing.T) {
+	const tenantID = "eventbus-relabel-tenant"
+	bus := NewEventBusWithOrg(tenantID, "", nil)
+	subID, _ := bus.Subscribe()
+	defer bus.Unsubscribe(subID)
+
+	bus.SetMetricOrgID("org-eventbus-relabel")
+
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_sse_inflight_connections{tenant_id="`+tenantID+`",tidbcloud_org_id="guest"} 0.000000`) {
+		t.Fatalf("old guest in-flight series was not zeroed:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_sse_inflight_connections{tenant_id="`+tenantID+`",tidbcloud_org_id="org-eventbus-relabel"} 1.000000`) {
+		t.Fatalf("new org in-flight series was not recorded:\n%s", text)
 	}
 }
 

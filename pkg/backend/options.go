@@ -75,6 +75,9 @@ type Options struct {
 	LLMCostBudget LLMCostBudgetOptions
 	// TenantID is used for per-write S3 encryption context and audit metadata.
 	TenantID string
+	// TiDBCloudOrgID is used only as the tidbcloud_org_id label on tenant
+	// metrics. Empty means "guest".
+	TiDBCloudOrgID string
 	// StorageNamespaceID is the control-plane namespace for S3 object lifecycle.
 	StorageNamespaceID string
 	// S3EncryptionPolicy is the already-resolved policy for this backend.
@@ -229,6 +232,7 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	if opts.TenantID != "" {
 		b.tenantID = opts.TenantID
 	}
+	b.tidbCloudOrgID = normalizeTenantMetricTiDBCloudOrgID(opts.TiDBCloudOrgID)
 	if opts.StorageNamespaceID != "" {
 		b.storageNamespaceID = opts.StorageNamespaceID
 	}

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -10,7 +11,9 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/traceid"
 	"go.uber.org/zap"
 )
@@ -22,6 +25,8 @@ const (
 	requestMetricsKey
 )
 
+const defaultTenantMetricTiDBCloudOrgID = "guest"
+
 func eventFields(ctx context.Context, event string, kv ...any) []zap.Field {
 	fields := make([]zap.Field, 0, len(kv)/2+3)
 	fields = append(fields, zap.String("event", event))
@@ -31,6 +36,9 @@ func eventFields(ctx context.Context, event string, kv ...any) []zap.Field {
 		}
 		if scope.APIKeyID != "" {
 			fields = append(fields, zap.String("api_key_id", scope.APIKeyID))
+		}
+		if scope.TiDBCloudOrgID != "" {
+			fields = append(fields, zap.String("tidbcloud_org_id", scope.TiDBCloudOrgID))
 		}
 	}
 	for i := 0; i+1 < len(kv); i += 2 {
@@ -46,6 +54,7 @@ func eventFields(ctx context.Context, event string, kv ...any) []zap.Field {
 type requestMetricState struct {
 	mu             sync.Mutex
 	tenantID       string
+	tidbCloudOrgID string
 	apiKeyID       string
 	provider       string
 	surface        string
@@ -143,14 +152,15 @@ func setRequestMetricScope(ctx context.Context, scope *TenantScope, class tenant
 	if scope == nil {
 		return
 	}
-	setRequestMetricTenant(ctx, scope.TenantID, scope.APIKeyID, scope.Provider, class)
+	setRequestMetricTenant(ctx, scope.TenantID, scope.APIKeyID, scope.Provider, scope.TiDBCloudOrgID, class)
 }
 
-func setRequestMetricTenant(ctx context.Context, tenantID, apiKeyID, provider string, class tenantRequestClass) {
+func setRequestMetricTenant(ctx context.Context, tenantID, apiKeyID, provider, tidbCloudOrgID string, class tenantRequestClass) {
 	state := requestMetricStateFromContext(ctx)
 	if state == nil || tenantID == "" {
 		return
 	}
+	tidbCloudOrgID = normalizeTenantMetricTiDBCloudOrgID(tidbCloudOrgID)
 	surface := strings.TrimSpace(class.surface)
 	if surface == "" {
 		surface = "other"
@@ -160,31 +170,35 @@ func setRequestMetricTenant(ctx context.Context, tenantID, apiKeyID, provider st
 		action = "other"
 	}
 
-	var oldTenantID, oldSurface, oldAction string
+	var oldTenantID, oldTiDBCloudOrgID, oldSurface, oldAction string
 	var shouldMove bool
 	state.mu.Lock()
 	if state.tenantInFlight {
-		shouldMove = state.tenantID != tenantID || state.surface != surface || state.action != action
+		shouldMove = state.tenantID != tenantID || state.tidbCloudOrgID != tidbCloudOrgID || state.surface != surface || state.action != action
 		if shouldMove {
 			oldTenantID = state.tenantID
+			oldTiDBCloudOrgID = state.tidbCloudOrgID
 			oldSurface = state.surface
 			oldAction = state.action
+			state.tidbCloudOrgID = tidbCloudOrgID
 			state.surface = surface
 			state.action = action
 		}
 		state.tenantID = tenantID
+		state.tidbCloudOrgID = tidbCloudOrgID
 		state.apiKeyID = apiKeyID
 		state.provider = provider
 		state.mu.Unlock()
 		if shouldMove {
 			if m := metricsFromContext(ctx); m != nil {
-				m.adjustTenantInFlight(oldTenantID, oldSurface, oldAction, -1)
-				m.adjustTenantInFlight(tenantID, surface, action, 1)
+				m.adjustTenantInFlight(oldTenantID, oldTiDBCloudOrgID, oldSurface, oldAction, -1)
+				m.adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, action, 1)
 			}
 		}
 		return
 	}
 	state.tenantID = tenantID
+	state.tidbCloudOrgID = tidbCloudOrgID
 	state.apiKeyID = apiKeyID
 	state.provider = provider
 	state.surface = surface
@@ -193,18 +207,18 @@ func setRequestMetricTenant(ctx context.Context, tenantID, apiKeyID, provider st
 	state.mu.Unlock()
 
 	if m := metricsFromContext(ctx); m != nil {
-		m.adjustTenantInFlight(tenantID, surface, action, 1)
+		m.adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, action, 1)
 	}
 }
 
-func requestMetricScope(ctx context.Context) (tenantID, apiKeyID, provider string) {
+func requestMetricScope(ctx context.Context) (tenantID, apiKeyID, provider, tidbCloudOrgID string) {
 	state := requestMetricStateFromContext(ctx)
 	if state == nil {
-		return "", "", ""
+		return "", "", "", ""
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	return state.tenantID, state.apiKeyID, state.provider
+	return state.tenantID, state.apiKeyID, state.provider, state.tidbCloudOrgID
 }
 
 func requestMetricClass(ctx context.Context) (tenantRequestClass, bool) {
@@ -258,13 +272,14 @@ func finishRequestMetricTenant(ctx context.Context) {
 		return
 	}
 	tenantID := state.tenantID
+	tidbCloudOrgID := state.tidbCloudOrgID
 	surface := state.surface
 	action := state.action
 	state.tenantInFlight = false
 	state.mu.Unlock()
 
 	if m := metricsFromContext(ctx); m != nil {
-		m.adjustTenantInFlight(tenantID, surface, action, -1)
+		m.adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, action, -1)
 	}
 }
 
@@ -273,8 +288,8 @@ func metricEvent(ctx context.Context, event string, labels ...string) {
 	if m == nil {
 		return
 	}
-	tenantID, _, _ := requestMetricScope(ctx)
-	m.recordEvent(tenantID, event, labels...)
+	tenantID, _, _, tidbCloudOrgID := requestMetricScope(ctx)
+	m.recordEvent(tenantID, tidbCloudOrgID, event, labels...)
 }
 
 type serverMetrics struct {
@@ -282,16 +297,19 @@ type serverMetrics struct {
 	routeMu  sync.Mutex
 	routes   map[string]int64
 
-	tenantMu       sync.Mutex
-	tenantInFlight map[string]int64
+	tenantMu          sync.Mutex
+	tenantInFlight    map[string]int64
+	tenantPoolBindMu  sync.Mutex
+	tenantPoolBinding map[tenantPoolBindingMetricKey]struct{}
 }
 
 func newServerMetrics() *serverMetrics {
 	metrics.SetModuleAvailability("server", true)
 	metrics.RecordHTTPInFlight(0)
 	return &serverMetrics{
-		routes:         map[string]int64{},
-		tenantInFlight: map[string]int64{},
+		routes:            map[string]int64{},
+		tenantInFlight:    map[string]int64{},
+		tenantPoolBinding: map[tenantPoolBindingMetricKey]struct{}{},
 	}
 }
 
@@ -303,8 +321,8 @@ func (m *serverMetrics) recordBodyRead(method, route string, status int, bodyByt
 	metrics.RecordHTTPRequestBodyRead(method, route, status, bodyBytes, d)
 }
 
-func (m *serverMetrics) recordEvent(tenantID, event string, labels ...string) {
-	metrics.RecordTenantEvent(tenantID, event, labels...)
+func (m *serverMetrics) recordEvent(tenantID, tidbCloudOrgID, event string, labels ...string) {
+	metrics.RecordTenantEventWithOrg(tenantID, tidbCloudOrgID, event, labels...)
 }
 
 func (m *serverMetrics) writePrometheus(w http.ResponseWriter) {
@@ -327,11 +345,12 @@ func (m *serverMetrics) adjustRouteInFlight(route string, delta int64) int64 {
 	return next
 }
 
-func (m *serverMetrics) adjustTenantInFlight(tenantID, surface, action string, delta int64) int64 {
+func (m *serverMetrics) adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, action string, delta int64) int64 {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return 0
 	}
+	tidbCloudOrgID = normalizeTenantMetricTiDBCloudOrgID(tidbCloudOrgID)
 	surface = strings.TrimSpace(surface)
 	if surface == "" {
 		surface = "other"
@@ -340,23 +359,23 @@ func (m *serverMetrics) adjustTenantInFlight(tenantID, surface, action string, d
 	if action == "" {
 		action = "other"
 	}
-	key := tenantInFlightKey(tenantID, surface, action)
+	key := tenantInFlightKey(tenantID, tidbCloudOrgID, surface, action)
 
 	m.tenantMu.Lock()
 	defer m.tenantMu.Unlock()
 	next := m.tenantInFlight[key] + delta
 	if next <= 0 {
 		delete(m.tenantInFlight, key)
-		metrics.RecordTenantInFlight(tenantID, surface, action, 0)
+		metrics.RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, surface, action, 0)
 		return 0
 	}
 	m.tenantInFlight[key] = next
-	metrics.RecordTenantInFlight(tenantID, surface, action, float64(next))
+	metrics.RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, surface, action, float64(next))
 	return next
 }
 
-func tenantInFlightKey(tenantID, surface, action string) string {
-	return tenantID + "\x00" + surface + "\x00" + action
+func tenantInFlightKey(tenantID, tidbCloudOrgID, surface, action string) string {
+	return tenantID + "\x00" + tidbCloudOrgID + "\x00" + surface + "\x00" + action
 }
 
 type observedResponseWriter struct {
@@ -654,7 +673,7 @@ func tenantRequestResult(status int) string {
 }
 
 func requestTenantID(r *http.Request) string {
-	tenantID, _, _ := requestMetricScope(r.Context())
+	tenantID, _, _, _ := requestMetricScope(r.Context())
 	if tenantID != "" {
 		return tenantID
 	}
@@ -669,8 +688,19 @@ func requestTenantID(r *http.Request) string {
 	return ""
 }
 
+func requestTenantMetricScope(r *http.Request) (tenantID, tidbCloudOrgID string) {
+	tenantID, _, _, tidbCloudOrgID = requestMetricScope(r.Context())
+	if tenantID != "" {
+		return tenantID, tidbCloudOrgID
+	}
+	if fallback := requestTenantID(r); fallback != "" {
+		return fallback, ""
+	}
+	return "", ""
+}
+
 func recordTenantHTTPRequest(r *http.Request, status int, d time.Duration, responseBytes int) {
-	tenantID := requestTenantID(r)
+	tenantID, tidbCloudOrgID := requestTenantMetricScope(r)
 	if tenantID == "" {
 		return
 	}
@@ -678,21 +708,21 @@ func recordTenantHTTPRequest(r *http.Request, status int, d time.Duration, respo
 	if scopedClass, ok := requestMetricClass(r.Context()); ok {
 		class = scopedClass
 	}
-	metrics.RecordTenantRequest(tenantID, class.surface, class.action, tenantRequestResult(status), status, d)
+	metrics.RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, class.surface, class.action, tenantRequestResult(status), status, d)
 	if r.ContentLength > 0 {
-		metrics.RecordTenantHTTPBytes(tenantID, class.surface, class.action, "request", r.ContentLength)
+		metrics.RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, class.surface, class.action, "request", r.ContentLength)
 	}
 	if responseBytes > 0 {
-		metrics.RecordTenantHTTPBytes(tenantID, class.surface, class.action, "response", int64(responseBytes))
+		metrics.RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, class.surface, class.action, "response", int64(responseBytes))
 	}
 }
 
 func recordTenantFileBytes(ctx context.Context, surface, action, direction string, bytes int64) {
-	tenantID, _, _ := requestMetricScope(ctx)
+	tenantID, _, _, tidbCloudOrgID := requestMetricScope(ctx)
 	if tenantID == "" || bytes <= 0 {
 		return
 	}
-	metrics.RecordTenantFileBytes(tenantID, surface, action, direction, bytes)
+	metrics.RecordTenantFileBytesWithOrg(tenantID, tidbCloudOrgID, surface, action, direction, bytes)
 }
 
 func generateTraceID() string { return traceid.Generate() }
@@ -725,7 +755,7 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 	}()
 
 	if strings.HasPrefix(r.URL.Path, "/s3/") {
-		setRequestMetricTenant(r.Context(), requestTenantID(r), "", "", classifyTenantRequest(r))
+		setRequestMetricTenant(r.Context(), requestTenantID(r), "", "", "", classifyTenantRequest(r))
 	}
 
 	next.ServeHTTP(rw, r)
@@ -768,7 +798,7 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 		recordTenantHTTPRequest(r, ow.status, dur, ow.size)
 	}
 
-	tenantID, apiKeyID, _ := requestMetricScope(r.Context())
+	tenantID, apiKeyID, _, tidbCloudOrgID := requestMetricScope(r.Context())
 
 	fields := []zap.Field{
 		zap.String("method", r.Method),
@@ -786,6 +816,9 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 	if apiKeyID != "" {
 		fields = append(fields, zap.String("api_key_id", apiKeyID))
 	}
+	if tidbCloudOrgID != "" {
+		fields = append(fields, zap.String("tidbcloud_org_id", tidbCloudOrgID))
+	}
 	if route == "/metrics" || route == "/healthz" {
 		return
 	}
@@ -798,4 +831,38 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.metrics.writePrometheus(w)
+}
+
+func normalizeTenantMetricTiDBCloudOrgID(orgID string) string {
+	orgID = strings.TrimSpace(orgID)
+	if orgID == "" {
+		return defaultTenantMetricTiDBCloudOrgID
+	}
+	return orgID
+}
+
+func (s *Server) tenantMetricTiDBCloudOrgID(ctx context.Context, t *meta.Tenant) string {
+	if s == nil {
+		return defaultTenantMetricTiDBCloudOrgID
+	}
+	return tenantMetricTiDBCloudOrgIDFromMeta(ctx, s.meta, t)
+}
+
+func tenantMetricTiDBCloudOrgIDFromMeta(ctx context.Context, metaStore *meta.Store, t *meta.Tenant) string {
+	if metaStore == nil || t == nil || strings.TrimSpace(t.ID) == "" || t.Provider != tenant.ProviderTiDBCloudNative {
+		return defaultTenantMetricTiDBCloudOrgID
+	}
+	if orgID := strings.TrimSpace(t.TiDBCloudOrgID); orgID != "" {
+		return normalizeTenantMetricTiDBCloudOrgID(orgID)
+	}
+	binding, err := metaStore.GetTenantTiDBCloudOrgBinding(ctx, t.ID)
+	if err != nil {
+		if !errors.Is(err, meta.ErrNotFound) {
+			logger.Warn(ctx, "server_metric_org_lookup_failed",
+				zap.String("tenant_id", t.ID),
+				zap.Error(err))
+		}
+		return defaultTenantMetricTiDBCloudOrgID
+	}
+	return normalizeTenantMetricTiDBCloudOrgID(binding.OrganizationID)
 }

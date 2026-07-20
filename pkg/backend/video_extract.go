@@ -12,7 +12,6 @@ import (
 	"github.com/pingcap/failpoint"
 
 	"github.com/mem9-ai/drive9/pkg/datastore"
-	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // VideoExtractRequest is the input to a pluggable video->text extractor.
@@ -70,10 +69,10 @@ const (
 
 // allowedVideoMIME is the closed set of MIME types for video visual extraction.
 var allowedVideoMIME = map[string]struct{}{
-	"video/mp4":       {},
-	"video/quicktime": {},
-	"video/x-msvideo": {},
-	"video/webm":      {},
+	"video/mp4":        {},
+	"video/quicktime":  {},
+	"video/x-msvideo":  {},
+	"video/webm":       {},
 	"video/x-matroska": {},
 }
 
@@ -123,8 +122,8 @@ func (b *Dat9Backend) SupportsAsyncVideoExtract() bool {
 	return b != nil && b.videoExtractEnabled && b.videoExtractor != nil
 }
 
-// errVideoExtractSourceTooLarge signals the video exceeds MaxVideoBytes.
-var errVideoExtractSourceTooLarge = errors.New("video extract source exceeds configured max bytes")
+// ErrVideoExtractSourceTooLarge signals the video exceeds MaxVideoBytes.
+var ErrVideoExtractSourceTooLarge = errors.New("video extract source exceeds configured max bytes")
 
 // ProcessVideoExtractTask runs visual extraction for one durable
 // video_extract_visual task. Terminal business outcomes return a nil error;
@@ -133,7 +132,7 @@ func (b *Dat9Backend) ProcessVideoExtractTask(ctx context.Context, task VideoExt
 	start := time.Now()
 	var result VideoExtractResult
 	defer func() {
-		metrics.RecordTenantOperation(b.tenantID, "video_extract", "process", string(result), time.Since(start))
+		b.recordTenantOperation("video_extract", "process", string(result), time.Since(start))
 	}()
 
 	if !b.SupportsAsyncVideoExtract() {
@@ -141,7 +140,7 @@ func (b *Dat9Backend) ProcessVideoExtractTask(ctx context.Context, task VideoExt
 		return result, fmt.Errorf("async video extract runtime not configured")
 	}
 	if b.monthlyLLMCostExceededCheck(ctx) {
-		metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "process_skip", "budget_exhausted", 0)
+		b.recordTenantOperation("llm_cost_budget", "process_skip", "budget_exhausted", 0)
 		result = VideoExtractResultBudgetExhausted
 		return result, nil
 	}
@@ -176,7 +175,7 @@ func (b *Dat9Backend) ProcessVideoExtractTask(ctx context.Context, task VideoExt
 
 	data, err := b.loadVideoBytesForExtract(ctx, f)
 	if err != nil {
-		if errors.Is(err, errVideoExtractSourceTooLarge) {
+		if errors.Is(err, ErrVideoExtractSourceTooLarge) {
 			result = VideoExtractResultTooLarge
 			return result, nil
 		}
@@ -184,15 +183,17 @@ func (b *Dat9Backend) ProcessVideoExtractTask(ctx context.Context, task VideoExt
 		return result, fmt.Errorf("load video bytes: %w", err)
 	}
 
-	taskCtx, cancel := context.WithTimeout(ctx, b.videoExtractTimeout)
-	text, videoUsage, err := b.videoExtractor.ExtractVideoText(taskCtx, VideoExtractRequest{
-		TenantID:    b.tenantID,
-		FileID:      task.FileID,
-		Path:        task.Path,
-		ContentType: resolvedMIME,
-		Data:        data,
-	})
-	cancel()
+	text, videoUsage, err := func() (string, VideoExtractUsage, error) {
+		taskCtx, cancel := context.WithTimeout(ctx, b.videoExtractTimeout)
+		defer cancel()
+		return b.videoExtractor.ExtractVideoText(taskCtx, VideoExtractRequest{
+			TenantID:    b.tenantID,
+			FileID:      task.FileID,
+			Path:        task.Path,
+			ContentType: resolvedMIME,
+			Data:        data,
+		})
+	}()
 	if err != nil {
 		result = VideoExtractResultExtractError
 		return result, fmt.Errorf("extract video text: %w", err)
@@ -257,11 +258,11 @@ func injectedVideoExtractWritebackError(name string) error {
 
 func (b *Dat9Backend) loadVideoBytesForExtract(ctx context.Context, f *datastore.File) ([]byte, error) {
 	if b.videoExtractMaxSize > 0 && f.SizeBytes > b.videoExtractMaxSize {
-		return nil, errVideoExtractSourceTooLarge
+		return nil, ErrVideoExtractSourceTooLarge
 	}
 	if f.StorageType == datastore.StorageDB9 {
 		if b.videoExtractMaxSize > 0 && int64(len(f.ContentBlob)) > b.videoExtractMaxSize {
-			return nil, errVideoExtractSourceTooLarge
+			return nil, ErrVideoExtractSourceTooLarge
 		}
 		return append([]byte(nil), f.ContentBlob...), nil
 	}
@@ -286,7 +287,7 @@ func (b *Dat9Backend) loadVideoBytesForExtract(ctx context.Context, f *datastore
 		return nil, err
 	}
 	if b.videoExtractMaxSize > 0 && int64(len(data)) > b.videoExtractMaxSize {
-		return nil, errVideoExtractSourceTooLarge
+		return nil, ErrVideoExtractSourceTooLarge
 	}
 	return data, nil
 }

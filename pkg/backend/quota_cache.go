@@ -77,8 +77,9 @@ func cloneQuotaConfigView(cfg *QuotaConfigView) *QuotaConfigView {
 // only removes repeated config reads and uses version polling so config changes
 // converge without a cross-server invalidation channel.
 type quotaConfigCache struct {
-	tenantID string
-	store    MetaQuotaStore
+	tenantID       string
+	tidbCloudOrgID string
+	store          MetaQuotaStore
 
 	mu       sync.RWMutex
 	snapshot *quotaConfigSnapshot
@@ -92,13 +93,14 @@ type quotaConfigCache struct {
 // Backend construction must stay cheap for read-only operations such as ls, so
 // the initial load is lazy: the first quota check loads config on demand and
 // the background refresher keeps it current after that.
-func newQuotaConfigCache(tenantID string, store MetaQuotaStore) *quotaConfigCache {
+func newQuotaConfigCache(tenantID, tidbCloudOrgID string, store MetaQuotaStore) *quotaConfigCache {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &quotaConfigCache{
-		tenantID: tenantID,
-		store:    store,
-		cancel:   cancel,
-		done:     make(chan struct{}),
+		tenantID:       tenantID,
+		tidbCloudOrgID: normalizeTenantMetricTiDBCloudOrgID(tidbCloudOrgID),
+		store:          store,
+		cancel:         cancel,
+		done:           make(chan struct{}),
 	}
 	go c.run(ctx)
 	return c
@@ -130,23 +132,23 @@ func (c *quotaConfigCache) load(ctx context.Context) *QuotaConfigView {
 	if err != nil {
 		logger.Warn(ctx, "quota_config_cache_config_failed",
 			zap.String("tenant_id", c.tenantID), zap.Error(err))
-		metrics.RecordTenantOperation(c.tenantID, "quota_config_cache", "load", "config_error", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "load", "config_error", time.Since(start))
 		return nil
 	}
 	if cfg == nil {
-		metrics.RecordTenantOperation(c.tenantID, "quota_config_cache", "load", "config_empty", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "load", "config_empty", time.Since(start))
 		return nil
 	}
 	c.mu.Lock()
 	if c.snapshot != nil && c.snapshot.config != nil {
 		existing := cloneQuotaConfigView(c.snapshot.config)
 		c.mu.Unlock()
-		metrics.RecordTenantOperation(c.tenantID, "quota_config_cache", "load", "raced_refresh", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "load", "raced_refresh", time.Since(start))
 		return existing
 	}
 	c.snapshot = &quotaConfigSnapshot{config: cloneQuotaConfigView(cfg), version: ""}
 	c.mu.Unlock()
-	metrics.RecordTenantOperation(c.tenantID, "quota_config_cache", "load", "ok", time.Since(start))
+	metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "load", "ok", time.Since(start))
 	return cloneQuotaConfigView(cfg)
 }
 
@@ -175,7 +177,7 @@ func (c *quotaConfigCache) refresh(ctx context.Context) {
 	if err != nil {
 		logger.Warn(ctx, "quota_config_cache_version_failed",
 			zap.String("tenant_id", c.tenantID), zap.Error(err))
-		metrics.RecordTenantOperation(c.tenantID, "quota_config_cache", "refresh", "version_error", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "refresh", "version_error", time.Since(start))
 		return
 	}
 
@@ -183,7 +185,7 @@ func (c *quotaConfigCache) refresh(ctx context.Context) {
 	snapshot := c.snapshot
 	if snapshot != nil && snapshot.version == version {
 		c.mu.RUnlock()
-		metrics.RecordTenantOperation(c.tenantID, "quota_config_cache", "refresh", "unchanged", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "refresh", "unchanged", time.Since(start))
 		return
 	}
 	c.mu.RUnlock()
@@ -192,13 +194,13 @@ func (c *quotaConfigCache) refresh(ctx context.Context) {
 	if err != nil {
 		logger.Warn(ctx, "quota_config_cache_config_failed",
 			zap.String("tenant_id", c.tenantID), zap.Error(err))
-		metrics.RecordTenantOperation(c.tenantID, "quota_config_cache", "refresh", "config_error", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "refresh", "config_error", time.Since(start))
 		return
 	}
 	c.mu.Lock()
 	c.snapshot = &quotaConfigSnapshot{config: cloneQuotaConfigView(cfg), version: version}
 	c.mu.Unlock()
-	metrics.RecordTenantOperation(c.tenantID, "quota_config_cache", "refresh", "ok", time.Since(start))
+	metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "refresh", "ok", time.Since(start))
 }
 
 type quotaUsageSnapshot struct {
@@ -212,20 +214,21 @@ type quotaUsageSnapshot struct {
 // usage snapshot that is stale by at most ttl; strict upload reservations must
 // continue to call loadQuotaUsage directly.
 type quotaUsageCache struct {
-	tenantID string
-	store    MetaQuotaStore
-	ttl      time.Duration
+	tenantID       string
+	tidbCloudOrgID string
+	store          MetaQuotaStore
+	ttl            time.Duration
 
 	mu       sync.RWMutex
 	snapshot *quotaUsageSnapshot
 	loadMu   sync.Mutex
 }
 
-func newQuotaUsageCache(tenantID string, store MetaQuotaStore, ttl time.Duration) *quotaUsageCache {
+func newQuotaUsageCache(tenantID, tidbCloudOrgID string, store MetaQuotaStore, ttl time.Duration) *quotaUsageCache {
 	if ttl <= 0 {
 		ttl = quotaUsageCacheTTL
 	}
-	return &quotaUsageCache{tenantID: tenantID, store: store, ttl: ttl}
+	return &quotaUsageCache{tenantID: tenantID, tidbCloudOrgID: normalizeTenantMetricTiDBCloudOrgID(tidbCloudOrgID), store: store, ttl: ttl}
 }
 
 func (c *quotaUsageCache) get(ctx context.Context) *QuotaUsageView {
@@ -246,11 +249,11 @@ func (c *quotaUsageCache) get(ctx context.Context) *QuotaUsageView {
 	if err != nil {
 		logger.Warn(ctx, "server_quota_usage_fail_open",
 			zap.String("tenant_id", c.tenantID), zap.Error(err))
-		metrics.RecordTenantOperation(c.tenantID, "server_quota", "usage_cache", "load_error", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "server_quota", "usage_cache", "load_error", time.Since(start))
 		return nil
 	}
 	if usage == nil {
-		metrics.RecordTenantOperation(c.tenantID, "server_quota", "usage_cache", "load_empty", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "server_quota", "usage_cache", "load_empty", time.Since(start))
 		return nil
 	}
 	copied := *usage
@@ -260,7 +263,7 @@ func (c *quotaUsageCache) get(ctx context.Context) *QuotaUsageView {
 		expiresAt: time.Now().Add(c.ttl),
 	}
 	c.mu.Unlock()
-	metrics.RecordTenantOperation(c.tenantID, "server_quota", "usage_cache", "load_ok", time.Since(start))
+	metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "server_quota", "usage_cache", "load_ok", time.Since(start))
 	return cloneQuotaUsageView(usage)
 }
 
@@ -312,10 +315,11 @@ type quotaPendingDeltasLoader func(context.Context) (storageDelta, fileDelta, me
 // have been logged but not yet applied. It deliberately has no tenant-DB
 // fallback: runtime quota admission must not SUM quota_outbox from the user DB.
 type quotaPendingDeltasCache struct {
-	tenantID   string
-	load       quotaPendingDeltasLoader
-	ttl        time.Duration
-	pendingTTL time.Duration
+	tenantID       string
+	tidbCloudOrgID string
+	load           quotaPendingDeltasLoader
+	ttl            time.Duration
+	pendingTTL     time.Duration
 
 	mu                  sync.RWMutex
 	snapshot            *quotaPendingDeltasSnapshot
@@ -326,11 +330,11 @@ type quotaPendingDeltasCache struct {
 	loadMu              sync.Mutex
 }
 
-func newQuotaPendingDeltasCache(tenantID string, load quotaPendingDeltasLoader, ttl time.Duration) *quotaPendingDeltasCache {
+func newQuotaPendingDeltasCache(tenantID, tidbCloudOrgID string, load quotaPendingDeltasLoader, ttl time.Duration) *quotaPendingDeltasCache {
 	if ttl <= 0 {
 		ttl = quotaPendingDeltasCacheTTL
 	}
-	return &quotaPendingDeltasCache{tenantID: tenantID, load: load, ttl: ttl, pendingTTL: localPendingMutationTTL()}
+	return &quotaPendingDeltasCache{tenantID: tenantID, tidbCloudOrgID: normalizeTenantMetricTiDBCloudOrgID(tidbCloudOrgID), load: load, ttl: ttl, pendingTTL: localPendingMutationTTL()}
 }
 
 func localPendingMutationTTL() time.Duration {
@@ -377,7 +381,7 @@ func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, 
 	storageDelta, fileDelta, mediaDelta, err := c.load(ctx)
 	if err != nil {
 		logger.Warn(ctx, "server_quota_pending_outbox_delta_fail_open", zap.String("tenant_id", c.tenantID), zap.Error(err))
-		metrics.RecordTenantOperation(c.tenantID, "server_quota", "pending_delta_cache", "load_error", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "server_quota", "pending_delta_cache", "load_error", time.Since(start))
 		return quotaPendingDeltas{}, false
 	}
 	deltas := quotaPendingDeltas{
@@ -397,7 +401,7 @@ func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, 
 		// A local mutation raced this DB load. This legacy loader path is kept
 		// only for tests; runtime central quota uses in-memory deltas with no
 		// tenant DB read.
-		metrics.RecordTenantOperation(c.tenantID, "server_quota", "pending_delta_cache", "raced_local_delta", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "server_quota", "pending_delta_cache", "raced_local_delta", time.Since(start))
 		return deltas, true
 	}
 	c.snapshot = &quotaPendingDeltasSnapshot{
@@ -405,7 +409,7 @@ func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, 
 		expiresAt: expiresAt,
 	}
 	c.mu.Unlock()
-	metrics.RecordTenantOperation(c.tenantID, "server_quota", "pending_delta_cache", "load_ok", time.Since(start))
+	metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "server_quota", "pending_delta_cache", "load_ok", time.Since(start))
 	return deltas, true
 }
 

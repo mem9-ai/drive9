@@ -74,8 +74,9 @@ func (m *tenantWorkerManager) processTask(ctx context.Context, target *tenantTar
 	start := time.Now()
 	result := "ok"
 	tenantID := target.tenantID
+	tidbCloudOrgID := target.metricOrgID()
 	defer func() {
-		metrics.RecordTenantOperation(tenantID, "semantic_worker", string(task.TaskType), result, time.Since(start))
+		metrics.RecordTenantOperationWithOrg(tenantID, tidbCloudOrgID, "semantic_worker", string(task.TaskType), result, time.Since(start))
 	}()
 	leaseExec := m.startTaskLeaseExecution(ctx, target, task)
 	var (
@@ -100,7 +101,7 @@ func (m *tenantWorkerManager) processTask(ctx context.Context, target *tenantTar
 	m.injectBeforeSemanticTaskFinalize(target.tenantID, target.store, task, outcome)
 	// Re-check ownership after the handler returns so tests can deterministically
 	// force a lease-loss window before any terminal state mutation happens.
-	stillOwned, err := m.semanticTaskStillOwned(ctx, target.tenantID, target.store, task, outcome.result)
+	stillOwned, err := m.semanticTaskStillOwned(ctx, target, task, outcome.result)
 	if err != nil {
 		logger.Warn(ctx, "tenant_worker_finalize_ownership_check_failed",
 			append([]zap.Field{
@@ -114,9 +115,9 @@ func (m *tenantWorkerManager) processTask(ctx context.Context, target *tenantTar
 	case semanticTaskActionAck:
 		m.ackTask(ctx, target.tenantID, target.store, task, outcome.message)
 	case semanticTaskActionRetry:
-		m.retryTask(ctx, target.tenantID, target.store, task, outcome.message)
+		m.retryTask(ctx, target, task, outcome.message)
 	case semanticTaskActionDeadLetter:
-		m.deadLetterTask(ctx, target.tenantID, target.store, task, outcome.message)
+		m.deadLetterTask(ctx, target, task, outcome.message)
 	}
 }
 
@@ -138,12 +139,14 @@ func (m *tenantWorkerManager) ackTask(ctx context.Context, tenantID string, stor
 		}, semanticTaskLogFields(task)...)...)
 }
 
-func (m *tenantWorkerManager) retryTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, message string) {
+func (m *tenantWorkerManager) retryTask(ctx context.Context, target *tenantTarget, task *semantic.Task, message string) {
 	start := time.Now()
+	tenantID := target.tenantID
+	store := target.store
 	retryAt := time.Now().UTC().Add(m.retryDelay(task.AttemptCount))
 	willDeadLetter := task.AttemptCount >= task.MaxAttempts
 	if err := store.RetrySemanticTask(ctx, task.TaskID, task.Receipt, retryAt, message); err != nil {
-		metrics.RecordTenantOperation(tenantID, "semantic_worker", "retry", "error", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(tenantID, target.metricOrgID(), "semantic_worker", "retry", "error", time.Since(start))
 		logger.Warn(ctx, "tenant_worker_retry_failed",
 			append([]zap.Field{
 				zap.String("tenant_id", tenantID),
@@ -157,7 +160,7 @@ func (m *tenantWorkerManager) retryTask(ctx context.Context, tenantID string, st
 		result = "dead_lettered"
 		logMessage = "tenant_worker_dead_lettered"
 	}
-	metrics.RecordTenantOperation(tenantID, "semantic_worker", "retry", result, time.Since(start))
+	metrics.RecordTenantOperationWithOrg(tenantID, target.metricOrgID(), "semantic_worker", "retry", result, time.Since(start))
 	fields := append([]zap.Field{
 		zap.String("tenant_id", tenantID),
 		zap.String("result", result),
@@ -169,10 +172,12 @@ func (m *tenantWorkerManager) retryTask(ctx context.Context, tenantID string, st
 	logger.Warn(ctx, logMessage, fields...)
 }
 
-func (m *tenantWorkerManager) deadLetterTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, message string) {
+func (m *tenantWorkerManager) deadLetterTask(ctx context.Context, target *tenantTarget, task *semantic.Task, message string) {
 	start := time.Now()
+	tenantID := target.tenantID
+	store := target.store
 	if err := store.DeadLetterSemanticTask(ctx, task.TaskID, task.Receipt, message); err != nil {
-		metrics.RecordTenantOperation(tenantID, "semantic_worker", "dead_letter", "error", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(tenantID, target.metricOrgID(), "semantic_worker", "dead_letter", "error", time.Since(start))
 		logger.Warn(ctx, "tenant_worker_dead_letter_failed",
 			append([]zap.Field{
 				zap.String("tenant_id", tenantID),
@@ -180,7 +185,7 @@ func (m *tenantWorkerManager) deadLetterTask(ctx context.Context, tenantID strin
 			}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
 		return
 	}
-	metrics.RecordTenantOperation(tenantID, "semantic_worker", "dead_letter", "dead_lettered", time.Since(start))
+	metrics.RecordTenantOperationWithOrg(tenantID, target.metricOrgID(), "semantic_worker", "dead_letter", "dead_lettered", time.Since(start))
 	logger.Warn(ctx, "tenant_worker_dead_lettered",
 		append([]zap.Field{
 			zap.String("tenant_id", tenantID),
@@ -307,10 +312,10 @@ func (e *semanticTaskLeaseExecution) run(m *tenantWorkerManager, target *tenantT
 			leaseUntil, err := target.store.RenewSemanticTask(e.ctx, task.TaskID, task.Receipt, m.opts.LeaseDuration)
 			if err != nil {
 				if errors.Is(err, semantic.ErrTaskLeaseMismatch) || errors.Is(err, semantic.ErrTaskNotFound) {
-					metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "renew", "error", time.Since(renewStart))
+					metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "semantic_worker", "renew", "error", time.Since(renewStart))
 					e.markLeaseLost()
 					failpoint.InjectCall("semanticWorkerOnLeaseLost", target.tenantID, target.store, task, err)
-					metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "lease_lost", "ok", time.Since(renewStart))
+					metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "semantic_worker", "lease_lost", "ok", time.Since(renewStart))
 					logger.Warn(e.ctx, "tenant_worker_lease_lost",
 						append([]zap.Field{
 							zap.String("tenant_id", target.tenantID),
@@ -324,7 +329,7 @@ func (e *semanticTaskLeaseExecution) run(m *tenantWorkerManager, target *tenantT
 					e.logStopped(m, target, task)
 					return
 				}
-				metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "renew", "error", time.Since(renewStart))
+				metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "semantic_worker", "renew", "error", time.Since(renewStart))
 				logger.Warn(e.ctx, "tenant_worker_lease_renew_failed",
 					append([]zap.Field{
 						zap.String("tenant_id", target.tenantID),
@@ -334,7 +339,7 @@ func (e *semanticTaskLeaseExecution) run(m *tenantWorkerManager, target *tenantT
 			}
 			e.recordRenewedLease(leaseUntil)
 			failpoint.InjectCall("semanticWorkerAfterRenew", target.tenantID, target.store, task, leaseUntil)
-			metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "renew", "ok", time.Since(renewStart))
+			metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "semantic_worker", "renew", "ok", time.Since(renewStart))
 		}
 	}
 }
@@ -501,7 +506,9 @@ func (m *tenantWorkerManager) processVideoExtractTask(ctx context.Context, b *ba
 	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: string(result)}
 }
 
-func (m *tenantWorkerManager) semanticTaskStillOwned(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, result string) (bool, error) {
+func (m *tenantWorkerManager) semanticTaskStillOwned(ctx context.Context, target *tenantTarget, task *semantic.Task, result string) (bool, error) {
+	tenantID := target.tenantID
+	store := target.store
 	if store == nil || task == nil {
 		return false, fmt.Errorf("check semantic task ownership: nil store or task")
 	}
@@ -516,7 +523,7 @@ func (m *tenantWorkerManager) semanticTaskStillOwned(ctx context.Context, tenant
 	if count > 0 {
 		return true, nil
 	}
-	metrics.RecordTenantOperation(tenantID, "semantic_worker", "lease_lost", "ok", 0)
+	metrics.RecordTenantOperationWithOrg(tenantID, target.metricOrgID(), "semantic_worker", "lease_lost", "ok", 0)
 	logger.Warn(ctx, "tenant_worker_finalize_skipped_lease_lost",
 		append([]zap.Field{
 			zap.String("tenant_id", tenantID),

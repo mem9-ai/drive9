@@ -132,8 +132,14 @@ func ValidateDurableAsyncExtractRequiresTenantWorker(cfg Config, template backen
 
 // kickMsg carries a tenant ID and accumulated work mask to a worker goroutine.
 type kickMsg struct {
-	tenantID string
-	workMask int
+	tenantID       string
+	tidbCloudOrgID string
+	workMask       int
+}
+
+type pendingKick struct {
+	tidbCloudOrgID string
+	workMask       int
 }
 
 // tenantWorkerManager is the unified worker that processes kicks from the
@@ -154,7 +160,7 @@ type tenantWorkerManager struct {
 	mu          sync.Mutex
 	inflight    map[string]int
 	processing  int
-	kickPending map[string]int // tenantID → accumulated work_mask
+	kickPending map[string]pendingKick // tenantID → accumulated work_mask + best-known org id
 
 	kicks chan kickMsg
 
@@ -166,10 +172,18 @@ type tenantWorkerManager struct {
 
 type tenantTarget struct {
 	tenantID         string
+	tidbCloudOrgID   string
 	backend          *backend.Dat9Backend
 	store            *datastore.Store
 	allowedTaskTypes []semantic.TaskType
 	release          func()
+}
+
+func (t *tenantTarget) metricOrgID() string {
+	if t == nil {
+		return defaultTenantMetricTiDBCloudOrgID
+	}
+	return normalizeTenantMetricTiDBCloudOrgID(t.tidbCloudOrgID)
 }
 
 func newTenantWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store, pool *tenant.Pool, embedder embedding.Client, opts TenantWorkerOptions, maintenanceInterval time.Duration) *tenantWorkerManager {
@@ -198,7 +212,7 @@ func newTenantWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store
 	opts.normalize()
 	m.opts = opts
 	m.inflight = make(map[string]int)
-	m.kickPending = make(map[string]int)
+	m.kickPending = make(map[string]pendingKick)
 	m.lastMaintenance = make(map[string]time.Time)
 	m.kicks = make(chan kickMsg, tenantKickQueueCapacity)
 	return m
@@ -211,27 +225,45 @@ func newTenantWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store
 // the buffer is full — flushDelayedKicks re-enqueues it on the next ticker
 // tick, and the safety-net scan remains the durable fallback path.
 func (m *tenantWorkerManager) Kick(tenantID string, workMask int) {
+	m.KickWithOrg(tenantID, "", workMask)
+}
+
+// KickWithOrg is Kick with an already-resolved TiDB Cloud org label. Callers
+// without a resolved org should pass an empty string and let metrics normalize
+// it to the shared guest label.
+func (m *tenantWorkerManager) KickWithOrg(tenantID, tidbCloudOrgID string, workMask int) {
 	if m == nil || tenantID == "" || workMask == 0 {
 		return
 	}
 	m.mu.Lock()
 	if pending, ok := m.kickPending[tenantID]; ok {
-		m.kickPending[tenantID] = pending | workMask
+		pending.workMask |= workMask
+		pending.tidbCloudOrgID = mergeKickOrgID(pending.tidbCloudOrgID, tidbCloudOrgID)
+		m.kickPending[tenantID] = pending
 		m.mu.Unlock()
-		metrics.RecordTenantOperation(tenantID, "tenant_worker", "kick", "coalesced", 0)
+		metrics.RecordTenantOperationWithOrg(tenantID, pending.tidbCloudOrgID, "tenant_worker", "kick", "coalesced", 0)
 		return
 	}
-	m.kickPending[tenantID] = workMask
+	tidbCloudOrgID = strings.TrimSpace(tidbCloudOrgID)
+	m.kickPending[tenantID] = pendingKick{tidbCloudOrgID: tidbCloudOrgID, workMask: workMask}
 	m.mu.Unlock()
 	select {
-	case m.kicks <- kickMsg{tenantID: tenantID, workMask: workMask}:
-		metrics.RecordTenantOperation(tenantID, "tenant_worker", "kick", "queued", 0)
+	case m.kicks <- kickMsg{tenantID: tenantID, tidbCloudOrgID: tidbCloudOrgID, workMask: workMask}:
+		metrics.RecordTenantOperationWithOrg(tenantID, tidbCloudOrgID, "tenant_worker", "kick", "queued", 0)
 	default:
 		// Channel full: leave kickPending so flushDelayedKicks (ticked from
 		// workerLoop) re-enqueues when the channel has space. The work mask is
 		// already recorded in kickPending above; do NOT clear it.
-		metrics.RecordTenantOperation(tenantID, "tenant_worker", "kick", "delayed", 0)
+		metrics.RecordTenantOperationWithOrg(tenantID, tidbCloudOrgID, "tenant_worker", "kick", "delayed", 0)
 	}
+}
+
+func mergeKickOrgID(current, next string) string {
+	next = strings.TrimSpace(next)
+	if next != "" {
+		return next
+	}
+	return current
 }
 
 func (m *tenantWorkerManager) clearKickPending(tenantID string) {
@@ -240,15 +272,20 @@ func (m *tenantWorkerManager) clearKickPending(tenantID string) {
 	m.mu.Unlock()
 }
 
-// pendingWorkMask returns the accumulated work mask for a tenant (0 if none
-// pending), and clears the pending entry. Called by the worker before
+// takePendingKick returns the accumulated work mask and best-known org id for
+// a tenant, and clears the pending entry. Called by the worker before
 // dispatching so a kick arriving during processing triggers a fresh kick.
-func (m *tenantWorkerManager) takePendingWorkMask(tenantID string) int {
+func (m *tenantWorkerManager) takePendingKick(tenantID string) pendingKick {
 	m.mu.Lock()
-	mask := m.kickPending[tenantID]
+	pending := m.kickPending[tenantID]
 	delete(m.kickPending, tenantID)
 	m.mu.Unlock()
-	return mask
+	return pending
+}
+
+func (m *tenantWorkerManager) takePendingWorkMask(tenantID string) int {
+	pending := m.takePendingKick(tenantID)
+	return pending.workMask
 }
 
 // flushDelayedKicks re-enqueues kicks that were left pending when the kicks
@@ -263,18 +300,18 @@ func (m *tenantWorkerManager) flushDelayedKicks() {
 		m.mu.Unlock()
 		return
 	}
-	pending := make(map[string]int, len(m.kickPending))
-	for tenantID, mask := range m.kickPending {
-		pending[tenantID] = mask
+	pending := make(map[string]pendingKick, len(m.kickPending))
+	for tenantID, entry := range m.kickPending {
+		pending[tenantID] = entry
 	}
 	m.mu.Unlock()
-	for tenantID, mask := range pending {
+	for tenantID, entry := range pending {
 		select {
-		case m.kicks <- kickMsg{tenantID: tenantID, workMask: mask}:
+		case m.kicks <- kickMsg{tenantID: tenantID, tidbCloudOrgID: entry.tidbCloudOrgID, workMask: entry.workMask}:
 			// Successfully (re-)queued. Leave the kickPending entry in place:
 			// the worker merges it via takePendingWorkMask after claiming the
 			// slot, so any further coalesced kicks are not lost.
-			metrics.RecordTenantOperation(tenantID, "tenant_worker", "kick", "flushed", 0)
+			metrics.RecordTenantOperationWithOrg(tenantID, entry.tidbCloudOrgID, "tenant_worker", "kick", "flushed", 0)
 		default:
 			// Still full; leave pending for the next tick.
 		}
@@ -340,7 +377,7 @@ func (m *tenantWorkerManager) workerLoop(ctx context.Context, workerID int) {
 			logger.Info(ctx, "tenant_worker_stopped", zap.Int("worker_id", workerID))
 			return
 		case msg := <-m.kicks:
-			m.processKicked(ctx, msg.tenantID, msg.workMask)
+			m.processKicked(ctx, msg.tenantID, msg.tidbCloudOrgID, msg.workMask)
 		case <-ticker.C:
 			// Re-enqueue delayed kicks now that the channel may have space.
 			m.flushDelayedKicks()
@@ -392,7 +429,7 @@ func (m *tenantWorkerManager) shouldPollFallback() bool {
 // selected work types. workMask selects which drains run. After draining, it
 // recovers expired leases and runs piggyback maintenance (throttled). The
 // tenant is re-kicked if more work remains.
-func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID string, workMask int) {
+func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID, tidbCloudOrgID string, workMask int) {
 	// Do NOT clear kickPending here — a kick coalesced while this message was
 	// in the channel must be consumed after acquiring the tenant slot.
 	ref, ok := m.kickRef(ctx, tenantID)
@@ -404,9 +441,11 @@ func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID string
 		// Another worker holds the slot; leave kickPending for that worker to consume.
 		return
 	}
-	// Merge any work mask that coalesced while this kick was queued.
-	workMask |= m.takePendingWorkMask(tenantID)
-	target, err := m.targetForRef(ctx, ref)
+	// Merge any work that coalesced while this kick was queued.
+	pending := m.takePendingKick(tenantID)
+	workMask |= pending.workMask
+	tidbCloudOrgID = mergeKickOrgID(tidbCloudOrgID, pending.tidbCloudOrgID)
+	target, err := m.targetForRef(ctx, ref, tidbCloudOrgID)
 	if err != nil {
 		logger.Warn(ctx, "tenant_worker_kick_open_store_failed",
 			zap.String("tenant_id", ref.id),
@@ -452,10 +491,10 @@ func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID string
 
 	// Re-kick if there's pending work accumulated during processing, or if a
 	// drain hit its cap (more work likely remains for that type).
-	pending := m.takePendingWorkMask(tenantID)
-	reKick := pending | reKickMask
+	pending = m.takePendingKick(tenantID)
+	reKick := pending.workMask | reKickMask
 	if reKick != 0 {
-		m.Kick(tenantID, reKick)
+		m.KickWithOrg(tenantID, mergeKickOrgID(target.metricOrgID(), pending.tidbCloudOrgID), reKick)
 	}
 }
 
@@ -503,14 +542,14 @@ func (m *tenantWorkerManager) recoverExpired(ctx context.Context, target *tenant
 	recovered, err := target.store.RecoverExpiredSemanticTasks(ctx, time.Now().UTC(), semanticRecoverLimit)
 	if err != nil {
 		if !isContextDoneErr(err) {
-			metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "recover", "error", time.Since(start))
+			metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "semantic_worker", "recover", "error", time.Since(start))
 			logger.Warn(ctx, "tenant_worker_recover_failed",
 				zap.String("tenant_id", target.tenantID), zap.Error(err))
 		}
 		return
 	}
 	if recovered > 0 {
-		metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "recover", "ok", time.Since(start))
+		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "semantic_worker", "recover", "ok", time.Since(start))
 		logger.Info(ctx, "tenant_worker_recover_ok",
 			zap.String("tenant_id", target.tenantID),
 			zap.Int("recovered", recovered))
@@ -536,7 +575,7 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 
 	// fs_events cleanup: prune rows older than fsEventsRetention.
 	if count, err := target.store.CountFSEvents(ctx); err == nil {
-		metrics.RecordFSEventsRows(target.tenantID, count)
+		metrics.RecordFSEventsRowsWithOrg(target.tenantID, target.metricOrgID(), count)
 	}
 	if n, err := target.store.DeleteFSEventsBefore(ctx, now.Add(-fsEventsRetention)); err != nil {
 		if ctx.Err() == nil {
@@ -544,7 +583,7 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 				zap.String("tenant_id", target.tenantID), zap.Error(err))
 		}
 	} else {
-		metrics.RecordFSEventsPruned(target.tenantID, n)
+		metrics.RecordFSEventsPrunedWithOrg(target.tenantID, target.metricOrgID(), n)
 	}
 
 	// Observation metrics: sample queue depth + dead-letter count.
@@ -560,7 +599,7 @@ func (m *tenantWorkerManager) observeTenant(ctx context.Context, target *tenantT
 		}
 		return
 	}
-	metrics.RecordTenantGauge(target.tenantID, "semantic_worker", "dead_lettered", float64(obs.DeadLettered))
+	metrics.RecordTenantGaugeWithOrg(target.tenantID, target.metricOrgID(), "semantic_worker", "dead_lettered", float64(obs.DeadLettered))
 	tenantLag := float64(0)
 	if obs.OldestClaimableAvailableAt != nil {
 		tenantLag = now.UTC().Sub(obs.OldestClaimableAvailableAt.UTC()).Seconds()
@@ -568,7 +607,7 @@ func (m *tenantWorkerManager) observeTenant(ctx context.Context, target *tenantT
 			tenantLag = 0
 		}
 	}
-	metrics.RecordTenantGauge(target.tenantID, "semantic_worker", "queue_lag_seconds", tenantLag)
+	metrics.RecordTenantGaugeWithOrg(target.tenantID, target.metricOrgID(), "semantic_worker", "queue_lag_seconds", tenantLag)
 }
 
 // kickRef resolves a kicked tenant ID to a schedulable ref, applying the same
@@ -611,13 +650,14 @@ func (m *tenantWorkerManager) hasShardedWorkForTenant(provider string) bool {
 	return true
 }
 
-func (m *tenantWorkerManager) targetForRef(ctx context.Context, ref semanticTenantRef) (*tenantTarget, error) {
+func (m *tenantWorkerManager) targetForRef(ctx context.Context, ref semanticTenantRef, tidbCloudOrgID string) (*tenantTarget, error) {
 	if ref.id == tenantLocalID {
 		if m.fallback == nil {
 			return nil, fmt.Errorf("backend missing for %s", ref.id)
 		}
 		return &tenantTarget{
 			tenantID:         ref.id,
+			tidbCloudOrgID:   m.fallback.TiDBCloudOrgID(),
 			backend:          m.fallback,
 			store:            m.fallback.Store(),
 			allowedTaskTypes: m.taskTypesForTarget(m.fallback),
@@ -633,20 +673,21 @@ func (m *tenantWorkerManager) targetForRef(ctx context.Context, ref semanticTena
 		// Kick-driven acquire failure: a kick arrived but the tenant TiDB could
 		// not be opened. Record so the major alert can detect sustained worker
 		// acquire errors (kicks not reaching the tenant DB).
-		metrics.RecordTenantOperation(ref.tenant.ID, "user_db_access", "tenant_worker_acquire", metrics.ResultForError(err), time.Since(acquireStart))
+		metrics.RecordTenantOperationWithOrg(ref.tenant.ID, tidbCloudOrgID, "user_db_access", "tenant_worker_acquire", metrics.ResultForError(err), time.Since(acquireStart))
 		return nil, fmt.Errorf("acquire tenant backend: %w", err)
 	}
 	if b == nil {
 		release()
-		metrics.RecordTenantOperation(ref.tenant.ID, "user_db_access", "tenant_worker_acquire", "error", time.Since(acquireStart))
+		metrics.RecordTenantOperationWithOrg(ref.tenant.ID, tidbCloudOrgID, "user_db_access", "tenant_worker_acquire", "error", time.Since(acquireStart))
 		return nil, fmt.Errorf("backend missing for %s", ref.id)
 	}
 	// Kick-driven acquire success: the tenant TiDB is now open for this kick.
 	// The rate follows write traffic (kicks are produced by writes). A spike
 	// uncorrelated with writes would suggest a scan path regressing.
-	metrics.RecordTenantOperation(ref.tenant.ID, "user_db_access", "tenant_worker_acquire", "ok", time.Since(acquireStart))
+	metrics.RecordTenantOperationWithOrg(ref.tenant.ID, b.TiDBCloudOrgID(), "user_db_access", "tenant_worker_acquire", "ok", time.Since(acquireStart))
 	return &tenantTarget{
 		tenantID:         ref.id,
+		tidbCloudOrgID:   b.TiDBCloudOrgID(),
 		backend:          b,
 		store:            b.Store(),
 		allowedTaskTypes: m.taskTypesForTarget(b),
@@ -671,7 +712,7 @@ func (m *tenantWorkerManager) claimAndProcessOne(ctx context.Context, target *te
 	claimStart := time.Now()
 	task, found, err := target.store.ClaimSemanticTask(ctx, time.Now().UTC(), m.opts.LeaseDuration, target.allowedTaskTypes...)
 	if err != nil {
-		metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "claim", "error", time.Since(claimStart))
+		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "semantic_worker", "claim", "error", time.Since(claimStart))
 		logger.Warn(ctx, "tenant_worker_claim_failed",
 			append([]zap.Field{
 				zap.String("tenant_id", target.tenantID),
@@ -683,7 +724,7 @@ func (m *tenantWorkerManager) claimAndProcessOne(ctx context.Context, target *te
 	if !found {
 		return false
 	}
-	metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "claim", "ok", time.Since(claimStart))
+	metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "semantic_worker", "claim", "ok", time.Since(claimStart))
 	logger.Info(ctx, "tenant_worker_claim_ok",
 		append([]zap.Field{
 			zap.String("tenant_id", target.tenantID),

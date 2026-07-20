@@ -2236,31 +2236,31 @@ func TestMetricsEndpoint(t *testing.T) {
 	if !strings.Contains(text, `drive9_db_pool_registered{role="user"`) {
 		t.Fatalf("expected user db pool metric in response: %s", text)
 	}
-	if !strings.Contains(text, `drive9_tenant_requests_total{action="write",result="ok",status_class="2xx",surface="fs",tenant_id="local"}`) {
+	if !strings.Contains(text, `drive9_tenant_requests_total{action="write",result="ok",status_class="2xx",surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Errorf("expected tenant request usage metric in response: %s", text)
 	}
 	if !strings.Contains(text, `drive9_tenant_request_duration_seconds_bucket{status_class="2xx",surface="fs",le="0.1"}`) {
 		t.Errorf("expected tenant request duration usage metric in response: %s", text)
 	}
-	if strings.Contains(text, `drive9_tenant_inflight_requests{action="read",surface="fs",tenant_id="local"}`) {
+	if strings.Contains(text, `drive9_tenant_inflight_requests{action="read",surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Errorf("completed tenant in-flight usage metric should be removed: %s", text)
 	}
-	if !strings.Contains(text, `drive9_tenant_http_bytes_total{direction="request",surface="fs",tenant_id="local"}`) {
+	if !strings.Contains(text, `drive9_tenant_http_bytes_total{direction="request",surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Errorf("expected tenant HTTP byte metric in response: %s", text)
 	}
 	if strings.Contains(text, `drive9_tenant_http_bytes_total{action="`) {
 		t.Errorf("tenant HTTP byte metric should not carry action: %s", text)
 	}
-	if !strings.Contains(text, `drive9_tenant_file_bytes_total{action="write",direction="write",surface="fs",tenant_id="local"}`) {
+	if !strings.Contains(text, `drive9_tenant_file_bytes_total{action="write",direction="write",surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Fatalf("expected tenant file write byte metric in response: %s", text)
 	}
-	if !strings.Contains(text, `drive9_tenant_file_bytes_total{action="read",direction="read",surface="fs",tenant_id="local"}`) {
+	if !strings.Contains(text, `drive9_tenant_file_bytes_total{action="read",direction="read",surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Fatalf("expected tenant file read byte metric in response: %s", text)
 	}
-	if !strings.Contains(text, `drive9_business_events_total{event="fs_write",result="ok",tenant_id="local"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="fs_write",result="ok",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Fatalf("expected fs_write tenant event metric in response: %s", text)
 	}
-	if !strings.Contains(text, `drive9_business_events_total{event="fs_read",result="ok",tenant_id="local"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="fs_read",result="ok",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Fatalf("expected fs_read tenant event metric in response: %s", text)
 	}
 	if !strings.Contains(text, `drive9_business_events_total{event="tenant_provision",result="error"}`) {
@@ -2359,13 +2359,13 @@ func TestUploadActionMetrics(t *testing.T) {
 	body, _ := io.ReadAll(metricsResp.Body)
 	text := string(body)
 
-	if !strings.Contains(text, `drive9_business_events_total{event="upload_complete",result="error",tenant_id="local"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="upload_complete",result="error",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Fatalf("expected upload_complete metric, got: %s", text)
 	}
-	if !strings.Contains(text, `drive9_business_events_total{event="upload_resume",result="error",tenant_id="local"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="upload_resume",result="error",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Fatalf("expected upload_resume metric, got: %s", text)
 	}
-	if !strings.Contains(text, `drive9_business_events_total{event="upload_abort",result="error",tenant_id="local"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="upload_abort",result="error",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Fatalf("expected upload_abort metric, got: %s", text)
 	}
 }

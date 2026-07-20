@@ -77,6 +77,19 @@ func TestPoolAcquireTimingFieldsClassifyColdOpen(t *testing.T) {
 	}
 }
 
+func TestTenantMetricTiDBCloudOrgIDUsesPreResolvedTenantOrg(t *testing.T) {
+	pool := NewPool(PoolConfig{}, nil)
+	got := pool.tenantMetricTiDBCloudOrgID(context.Background(), &meta.Tenant{
+		ID:             "tenant-pre-resolved-org",
+		Status:         meta.TenantActive,
+		Provider:       ProviderTiDBCloudNative,
+		TiDBCloudOrgID: "org-pre-resolved",
+	})
+	if got != "org-pre-resolved" {
+		t.Fatalf("org = %q, want org-pre-resolved", got)
+	}
+}
+
 func TestPoolAcquireInvalidateDefersCloseUntilRelease(t *testing.T) {
 	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-a")
 	ctx := context.Background()
@@ -436,7 +449,7 @@ func TestPoolCreateBackendSkipsSchemaEnsureWhenVersionMatches(t *testing.T) {
 		applyTiDBAutoEmbeddingProviderConfig = origApply
 	})
 
-	backend, store, err := pool.createBackend(context.Background(), tenant)
+	backend, store, _, err := pool.createBackend(context.Background(), tenant)
 	if err != nil {
 		t.Fatalf("createBackend(): %v", err)
 	}
@@ -470,7 +483,7 @@ func TestPoolCreateBackendEnsuresSchemaForTiDBCloudNative(t *testing.T) {
 		applyTiDBAutoEmbeddingProviderConfig = origApply
 	})
 
-	backend, store, err := pool.createBackend(context.Background(), tenant)
+	backend, store, _, err := pool.createBackend(context.Background(), tenant)
 	if err != nil {
 		t.Fatalf("createBackend(): %v", err)
 	}
@@ -515,7 +528,7 @@ func TestPoolCreateBackendRepairsFTSOnlySchemaWhenDatabaseAutoEmbeddingDisabled(
 		applyTiDBAutoEmbeddingProviderConfig = origApply
 	})
 
-	b, store, err := pool.createBackend(context.Background(), tenant)
+	b, store, _, err := pool.createBackend(context.Background(), tenant)
 	if err != nil {
 		t.Fatalf("createBackend(): %v", err)
 	}
