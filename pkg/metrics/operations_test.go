@@ -250,6 +250,7 @@ func TestTenantIDMetricsIncludeTiDBCloudOrgID(t *testing.T) {
 	RecordTenantFileBytesWithOrg(tenantID, orgID, "surface_org_label_test", "write", "out", 20)
 	RecordTenantStorageBytesWithOrg(tenantID, orgID, "confirmed", 30)
 	RecordTenantMediaFilesWithOrg(tenantID, orgID, "confirmed", 40)
+	RecordTenantVideoFilesWithOrg(tenantID, orgID, "limit", 50)
 	RecordSSEInFlightWithOrg(tenantID, orgID, 1)
 	RecordSSEPhase1WithOrg(tenantID, orgID, time.Second)
 	RecordSSEEventSentWithOrg(tenantID, orgID, "write")
@@ -271,6 +272,7 @@ func TestTenantIDMetricsIncludeTiDBCloudOrgID(t *testing.T) {
 		`drive9_tenant_file_bytes_total{action="write",direction="out",surface="surface_org_label_test",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 20`,
 		`drive9_tenant_storage_bytes{state="confirmed",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 30.000000`,
 		`drive9_tenant_media_files{state="confirmed",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 40.000000`,
+		`drive9_tenant_video_files{state="limit",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 50.000000`,
 		`drive9_sse_inflight_connections{tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1.000000`,
 		`drive9_sse_phase1_duration_seconds_count{tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
 		`drive9_sse_events_sent_total{op="write",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
