@@ -77,6 +77,19 @@ func TestPoolAcquireTimingFieldsClassifyColdOpen(t *testing.T) {
 	}
 }
 
+func TestTenantMetricTiDBCloudOrgIDUsesPreResolvedTenantOrg(t *testing.T) {
+	pool := NewPool(PoolConfig{}, nil)
+	got := pool.tenantMetricTiDBCloudOrgID(context.Background(), &meta.Tenant{
+		ID:             "tenant-pre-resolved-org",
+		Status:         meta.TenantActive,
+		Provider:       ProviderTiDBCloudNative,
+		TiDBCloudOrgID: "org-pre-resolved",
+	})
+	if got != "org-pre-resolved" {
+		t.Fatalf("org = %q, want org-pre-resolved", got)
+	}
+}
+
 func TestPoolAcquireInvalidateDefersCloseUntilRelease(t *testing.T) {
 	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-a")
 	ctx := context.Background()

@@ -11,6 +11,25 @@ import (
 	"time"
 )
 
+func hasMetricLineWith(text, metric string, fragments ...string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if !strings.HasPrefix(line, metric+"{") && !strings.HasPrefix(line, metric+" ") {
+			continue
+		}
+		matches := true
+		for _, fragment := range fragments {
+			if !strings.Contains(line, fragment) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
 func TestResultForError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -111,14 +130,17 @@ func TestRecordTenantRequestOmitsHighCardinalityLabels(t *testing.T) {
 	if !strings.Contains(text, `drive9_tenant_request_duration_seconds_count{status_class="2xx",surface="`+surface+`"} 1`) {
 		t.Errorf("missing reduced request duration histogram:\n%s", text)
 	}
+	if hasMetricLineWith(text, "drive9_tenant_requests_total", `status="201"`) {
+		t.Errorf("tenant request total unexpectedly carried raw status label:\n%s", text)
+	}
 	for _, unexpected := range []string{
-		`drive9_tenant_requests_total{result="ok",status="201"`,
-		`drive9_tenant_request_duration_seconds_count{action="` + action + `"`,
-		`drive9_tenant_request_duration_seconds_count{result="ok"`,
-		`drive9_tenant_request_duration_seconds_count{status_class="2xx",surface="` + surface + `",tenant_id="` + tenantID + `"`,
+		`action="` + action + `"`,
+		`result="ok"`,
+		`tenant_id="` + tenantID + `"`,
+		`tidbcloud_org_id="org-request-duration"`,
 	} {
-		if strings.Contains(text, unexpected) {
-			t.Errorf("tenant request metric unexpectedly carried high-cardinality label %q:\n%s", unexpected, text)
+		if hasMetricLineWith(text, "drive9_tenant_request_duration_seconds_count", unexpected) {
+			t.Errorf("tenant request duration unexpectedly carried label %q:\n%s", unexpected, text)
 		}
 	}
 }
@@ -134,7 +156,7 @@ func TestRecordTenantRequestZeroDurationDoesNotRecordDuration(t *testing.T) {
 	if !strings.Contains(text, `drive9_tenant_requests_total{action="zero_action",result="ok",status_class="2xx",surface="zero_surface",tenant_id="`+tenantID+`",tidbcloud_org_id="guest"} 1`) {
 		t.Errorf("missing zero-duration tenant request total:\n%s", text)
 	}
-	if strings.Contains(text, `drive9_tenant_request_duration_seconds_count{surface="zero_surface"`) {
+	if hasMetricLineWith(text, "drive9_tenant_request_duration_seconds_count", `surface="zero_surface"`) {
 		t.Errorf("zero-duration tenant request unexpectedly recorded a duration:\n%s", text)
 	}
 }
@@ -150,7 +172,7 @@ func TestRecordSSEConnectionZeroDurationDoesNotRecordDuration(t *testing.T) {
 	if !strings.Contains(text, `drive9_sse_connections_total{reason="closed",tenant_id="`+tenantID+`",tidbcloud_org_id="org-sse-zero"} 1`) {
 		t.Fatalf("missing zero-duration SSE connection total:\n%s", text)
 	}
-	if strings.Contains(text, `drive9_sse_connection_duration_seconds_count{tenant_id="`+tenantID+`"}`) {
+	if hasMetricLineWith(text, "drive9_sse_connection_duration_seconds_count", `tenant_id="`+tenantID+`"`) {
 		t.Fatalf("zero-duration SSE connection unexpectedly recorded a duration:\n%s", text)
 	}
 }
@@ -167,10 +189,10 @@ func TestRecordTenantDurationMetricsSkipZeroDuration(t *testing.T) {
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
-	if strings.Contains(text, `drive9_sse_phase1_duration_seconds_count{tenant_id="`+phaseTenant+`"}`) {
+	if hasMetricLineWith(text, "drive9_sse_phase1_duration_seconds_count", `tenant_id="`+phaseTenant+`"`) {
 		t.Fatalf("zero-duration SSE phase1 unexpectedly recorded a duration:\n%s", text)
 	}
-	if strings.Contains(text, `drive9_event_bus_query_duration_seconds_count{operation="events_since",result="ok",tenant_id="`+eventBusTenant+`"}`) {
+	if hasMetricLineWith(text, "drive9_event_bus_query_duration_seconds_count", `operation="events_since"`, `result="ok"`) {
 		t.Fatalf("zero-duration event bus query unexpectedly recorded a duration:\n%s", text)
 	}
 }

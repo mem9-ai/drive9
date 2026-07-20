@@ -852,6 +852,9 @@ func tenantMetricTiDBCloudOrgIDFromMeta(ctx context.Context, metaStore *meta.Sto
 	if metaStore == nil || t == nil || strings.TrimSpace(t.ID) == "" || t.Provider != tenant.ProviderTiDBCloudNative {
 		return defaultTenantMetricTiDBCloudOrgID
 	}
+	if orgID := strings.TrimSpace(t.TiDBCloudOrgID); orgID != "" {
+		return normalizeTenantMetricTiDBCloudOrgID(orgID)
+	}
 	binding, err := metaStore.GetTenantTiDBCloudOrgBinding(ctx, t.ID)
 	if err != nil {
 		if !errors.Is(err, meta.ErrNotFound) {

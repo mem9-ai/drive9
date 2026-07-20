@@ -81,3 +81,15 @@ func (m *serverMetrics) syncTenantPoolBindingSnapshot(next map[tenantPoolBinding
 	}
 	m.tenantPoolBinding = next
 }
+
+func (m *serverMetrics) clearTenantPoolBindingSnapshot() {
+	if m == nil {
+		return
+	}
+	m.tenantPoolBindMu.Lock()
+	defer m.tenantPoolBindMu.Unlock()
+	for prev := range m.tenantPoolBinding {
+		metrics.DeleteTenantPoolBindings(prev.poolID, prev.tidbCloudOrgID, prev.status)
+	}
+	m.tenantPoolBinding = map[tenantPoolBindingMetricKey]struct{}{}
+}

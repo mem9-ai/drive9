@@ -806,7 +806,13 @@ func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantI
 }
 
 func (p *Pool) tenantMetricTiDBCloudOrgID(ctx context.Context, t *meta.Tenant) string {
-	if p == nil || p.metaStore == nil || t == nil || strings.TrimSpace(t.ID) == "" || t.Provider != ProviderTiDBCloudNative {
+	if t == nil || strings.TrimSpace(t.ID) == "" || t.Provider != ProviderTiDBCloudNative {
+		return defaultTenantMetricTiDBCloudOrgID
+	}
+	if orgID := strings.TrimSpace(t.TiDBCloudOrgID); orgID != "" {
+		return orgID
+	}
+	if p == nil || p.metaStore == nil {
 		return defaultTenantMetricTiDBCloudOrgID
 	}
 	binding, err := p.metaStore.GetTenantTiDBCloudOrgBinding(ctx, t.ID)

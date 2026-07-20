@@ -128,6 +128,15 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 	if err := s.InsertTenant(context.Background(), tenant); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.UpsertTenantTiDBCloudOrgBinding(context.Background(), &TenantTiDBCloudOrgBinding{
+		TenantID:       tenant.ID,
+		OrganizationID: "org-resolved",
+		ClusterID:      "cluster-resolved",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	key := &APIKey{
 		ID:            "k1",
 		TenantID:      tenant.ID,
@@ -153,6 +162,12 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 	}
 	if got.Tenant.Status != TenantActive {
 		t.Fatalf("unexpected tenant status: %s", got.Tenant.Status)
+	}
+	if got.TiDBCloudOrgID != "org-resolved" {
+		t.Fatalf("resolved org = %q, want org-resolved", got.TiDBCloudOrgID)
+	}
+	if got.Tenant.TiDBCloudOrgID != "org-resolved" {
+		t.Fatalf("tenant org = %q, want org-resolved", got.Tenant.TiDBCloudOrgID)
 	}
 	if got.Tenant.S3EncryptionMode != S3EncryptionModeInherit {
 		t.Fatalf("unexpected tenant encryption mode: %s", got.Tenant.S3EncryptionMode)

@@ -943,6 +943,9 @@ func (s *Server) stopLeaderWorkers() {
 	if expirySweepWorker != nil {
 		expirySweepWorker.Stop()
 	}
+	if s.metrics != nil {
+		s.metrics.clearTenantPoolBindingSnapshot()
+	}
 	// In multi-tenant mode the tenant worker is started/stopped in
 	// startNotifyInfrastructure. In single-tenant mode (s.meta == nil) it is
 	// started here in startLeaderWorkers and must be stopped here too.

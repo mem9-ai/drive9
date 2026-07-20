@@ -88,6 +88,7 @@ type Tenant struct {
 	DBName             string
 	DBTLS              bool
 	Provider           string
+	TiDBCloudOrgID     string
 	ClusterID          string
 	BranchID           string
 	ClaimURL           string
@@ -1928,6 +1929,7 @@ func (s *Store) CountTenantPoolBindingsByStatus(ctx context.Context) (out []Tena
 			p.pool_id,
 			p.organization_id,
 			statuses.pool_status,
+			/* Count only live tenant slots; deleted-tenant bindings are cleanup debt, not usable capacity. */
 			COUNT(t.id)
 		FROM tenant_tidbcloud_pools p
 		JOIN (
@@ -2509,6 +2511,7 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 		t := revokedAt.Time.UTC()
 		rec.APIKey.RevokedAt = &t
 	}
+	rec.Tenant.TiDBCloudOrgID = rec.TiDBCloudOrgID
 	if issuedByProvider.Valid {
 		rec.APIKey.IssuedByProvider = issuedByProvider.String
 	}

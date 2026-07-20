@@ -9,6 +9,7 @@ import (
 
 	"github.com/mem9-ai/drive9/internal/testmysql"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
@@ -133,6 +134,31 @@ func TestObserveTenantCountsRecordsAllRealStatuses(t *testing.T) {
 	}
 	if strings.Contains(text, "drive9_tenant_non_deleted_count") || strings.Contains(text, "total_non_deleted") {
 		t.Fatalf("tenant count metrics must only use real status values:\n%s", text)
+	}
+}
+
+func TestStopLeaderWorkersClearsTenantPoolBindingSnapshot(t *testing.T) {
+	key := tenantPoolBindingMetricKey{
+		poolID:         "pool-leader-loss-clear",
+		tidbCloudOrgID: "org-leader-loss-clear",
+		status:         string(meta.TenantPoolBindingUsed),
+	}
+	s := &Server{metrics: newServerMetrics(), leaderWorkersStarted: true}
+	metrics.RecordTenantPoolBindings(key.poolID, key.tidbCloudOrgID, key.status, 1)
+	s.metrics.syncTenantPoolBindingSnapshot(map[tenantPoolBindingMetricKey]struct{}{key: struct{}{}})
+
+	rec := httptest.NewRecorder()
+	s.metrics.writePrometheus(rec)
+	if !strings.Contains(rec.Body.String(), `drive9_tenant_pool_bindings{pool_id="pool-leader-loss-clear",status="used",tidbcloud_org_id="org-leader-loss-clear"} 1`) {
+		t.Fatalf("missing tenant pool binding metric before leadership loss:\n%s", rec.Body.String())
+	}
+
+	s.stopLeaderWorkers()
+
+	rec = httptest.NewRecorder()
+	s.metrics.writePrometheus(rec)
+	if strings.Contains(rec.Body.String(), `drive9_tenant_pool_bindings{pool_id="pool-leader-loss-clear"`) {
+		t.Fatalf("tenant pool binding metric should be removed after leadership loss:\n%s", rec.Body.String())
 	}
 }
 

@@ -88,9 +88,21 @@ func (eb *EventBus) SetStore(store *datastore.Store) {
 
 // SetMetricOrgID updates the org label for this bus without touching its store.
 func (eb *EventBus) SetMetricOrgID(tidbCloudOrgID string) {
+	nextOrgID := normalizeTenantMetricTiDBCloudOrgID(tidbCloudOrgID)
 	eb.mu.Lock()
-	eb.tidbCloudOrgID = normalizeTenantMetricTiDBCloudOrgID(tidbCloudOrgID)
+	prevOrgID := normalizeTenantMetricTiDBCloudOrgID(eb.tidbCloudOrgID)
+	if prevOrgID == nextOrgID {
+		eb.tidbCloudOrgID = nextOrgID
+		eb.mu.Unlock()
+		return
+	}
+	listeners := len(eb.listeners)
+	eb.tidbCloudOrgID = nextOrgID
 	eb.mu.Unlock()
+	if listeners > 0 {
+		metrics.RecordSSEInFlightWithOrg(eb.tenantID, prevOrgID, 0)
+		metrics.RecordSSEInFlightWithOrg(eb.tenantID, nextOrgID, float64(listeners))
+	}
 }
 
 // HasListeners returns true if this bus currently has at least one subscriber.
