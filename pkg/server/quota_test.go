@@ -475,6 +475,7 @@ func TestQuotaGetAllowsExplicitDefaultTiDBCloudCredentials(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.prov.defaultPublicKey = "default-pk"
 	rt.prov.defaultPrivateKey = "default-sk"
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "default-pk", PrivateKey: "default-sk"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -483,27 +484,23 @@ func TestQuotaGetAllowsExplicitDefaultTiDBCloudCredentials(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("get calls = %d, want 1", got)
-	}
-	lastCredentials := rt.prov.lastCredentialsSnapshot()
-	if lastCredentials.PublicKey != "default-pk" || lastCredentials.PrivateKey != "default-sk" {
-		t.Fatalf("last credentials = %#v", lastCredentials)
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("get calls = %d, want 0", got)
 	}
 }
 
 func TestQuotaGetReturnsConfigStorageUsageAndSpendingLimit(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	spendingLimit := int64(10000)
-	rt.prov.cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: &spendingLimit}
 	ctx := context.Background()
 	if err := rt.meta.SetQuotaConfig(ctx, &meta.QuotaConfig{
-		TenantID:         rt.tenantID,
-		MaxStorageBytes:  123 * quotaStorageSizeBytes,
-		MaxFileSizeBytes: 12 * quotaStorageSizeBytes,
-		MaxFileCount:     34,
-		MaxMediaLLMFiles: 56,
-		MaxMonthlyCostMC: 789,
+		TenantID:                  rt.tenantID,
+		MaxStorageBytes:           123 * quotaStorageSizeBytes,
+		MaxFileSizeBytes:          12 * quotaStorageSizeBytes,
+		MaxFileCount:              34,
+		MaxMediaLLMFiles:          56,
+		MaxMonthlyCostMC:          789,
+		TiDBCloudSpendingLimit:    &spendingLimit,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -516,6 +513,7 @@ func TestQuotaGetReturnsConfigStorageUsageAndSpendingLimit(t *testing.T) {
 	if err := rt.meta.IncrReservedBytes(ctx, rt.tenantID, 11); err != nil {
 		t.Fatal(err)
 	}
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
 
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
@@ -538,13 +536,6 @@ func TestQuotaGetReturnsConfigStorageUsageAndSpendingLimit(t *testing.T) {
 	}
 	if out.Config.MaxStorageSize != 123 || out.Config.MaxFileSize != 12 || out.Config.MaxFileCount != 34 || out.Config.TiDBCloudSpendingLimit == nil || *out.Config.TiDBCloudSpendingLimit != spendingLimit {
 		t.Fatalf("config = %#v", out.Config)
-	}
-	cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != spendingLimit {
-		t.Fatalf("persisted spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, spendingLimit)
 	}
 	if out.Usage.StorageBytes != 321 || out.Usage.ReservedBytes != 11 || out.Usage.FileCount != 9 {
 		t.Fatalf("usage = %#v", out.Usage)
@@ -625,6 +616,7 @@ func TestSyncTiDBCloudSpendingLimitSkipsNewerLocalAtSameTimestampTick(t *testing
 
 func TestQuotaGetUsesTiDBCloudAuthorization(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -633,26 +625,19 @@ func TestQuotaGetUsesTiDBCloudAuthorization(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("get calls = %d, want 1", got)
-	}
-	if got := rt.prov.updateCalls.Load(); got != 0 {
-		t.Fatalf("update calls = %d, want 0", got)
-	}
-	lastCluster := rt.prov.lastClusterSnapshot()
-	if lastCluster == nil || lastCluster.ClusterID != "cluster-quota-1" || lastCluster.TenantID != rt.tenantID {
-		t.Fatalf("last cluster = %#v", lastCluster)
-	}
-	lastCredentials := rt.prov.lastCredentialsSnapshot()
-	if lastCredentials.PublicKey != "public-1" || lastCredentials.PrivateKey != "private-1" {
-		t.Fatalf("last credentials = %#v", lastCredentials)
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("get calls = %d, want 0", got)
 	}
 }
 
 func TestQuotaGetCachesTiDBCloudRBACAndBackfillsSpendingLimit(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	spendingLimit := int64(222)
-	rt.prov.cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: &spendingLimit}
+	ctx := context.Background()
+	if err := rt.meta.SetQuotaConfigPatch(ctx, rt.tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimit: &spendingLimit}); err != nil {
+		t.Fatal(err)
+	}
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -663,18 +648,7 @@ func TestQuotaGetCachesTiDBCloudRBACAndBackfillsSpendingLimit(t *testing.T) {
 		t.Fatalf("first status = %d, want 200: %s", resp.StatusCode, body)
 	}
 	_ = resp.Body.Close()
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("get calls after first request = %d, want 1", got)
-	}
-	cfg, err := rt.meta.GetQuotaConfig(context.Background(), rt.tenantID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != spendingLimit {
-		t.Fatalf("persisted spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, spendingLimit)
-	}
 
-	rt.prov.getErr = errors.New("should not call TiDB Cloud while RBAC cache and local spending limit are present")
 	resp2 := getQuota(t, ts.URL, rt.tenantID, "public-1", "private-1", "")
 	defer func() { _ = resp2.Body.Close() }()
 	if resp2.StatusCode != http.StatusOK {
@@ -688,33 +662,30 @@ func TestQuotaGetCachesTiDBCloudRBACAndBackfillsSpendingLimit(t *testing.T) {
 	if out.Config.TiDBCloudSpendingLimit == nil || *out.Config.TiDBCloudSpendingLimit != spendingLimit {
 		t.Fatalf("response spending limit = %#v, want %d", out.Config.TiDBCloudSpendingLimit, spendingLimit)
 	}
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("get calls after cached request = %d, want 1", got)
+
+	updatedLimit := int64(333)
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-2"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
+	if err := rt.meta.SetQuotaConfigPatch(ctx, rt.tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimit: &updatedLimit}); err != nil {
+		t.Fatal(err)
 	}
 
-	rt.prov.getErr = nil
-	updatedLimit := int64(333)
-	rt.prov.cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: &updatedLimit}
 	resp3 := getQuota(t, ts.URL, rt.tenantID, "public-1", "private-2", "")
 	defer func() { _ = resp3.Body.Close() }()
 	if resp3.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp3.Body)
 		t.Fatalf("third status = %d, want 200: %s", resp3.StatusCode, body)
 	}
-	if got := rt.prov.getCalls.Load(); got != 2 {
-		t.Fatalf("get calls after new credential = %d, want 2", got)
-	}
-	cfg, err = rt.meta.GetQuotaConfig(context.Background(), rt.tenantID)
-	if err != nil {
+	if err := json.NewDecoder(resp3.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != updatedLimit {
-		t.Fatalf("updated spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, updatedLimit)
+	if out.Config.TiDBCloudSpendingLimit == nil || *out.Config.TiDBCloudSpendingLimit != updatedLimit {
+		t.Fatalf("updated spending limit = %#v, want %d", out.Config.TiDBCloudSpendingLimit, updatedLimit)
 	}
 }
 
 func TestDeprecatedQuotaGetWorksWithoutTiDBCloudOrgBinding(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -724,8 +695,8 @@ func TestDeprecatedQuotaGetWorksWithoutTiDBCloudOrgBinding(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 200 without tenant-org binding: %s", resp.StatusCode, body)
 	}
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("get calls = %d, want 1", got)
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("get calls = %d, want 0", got)
 	}
 	if got := rt.prov.listCalls.Load(); got != 0 {
 		t.Fatalf("list calls = %d, want 0", got)
@@ -745,16 +716,7 @@ func TestQuotaSetChecksClusterWritePermissionBeforeMaxStorageUpdate(t *testing.T
 	}); err != nil {
 		t.Fatal(err)
 	}
-	rt.prov.markHook = func() error {
-		cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
-		if err != nil {
-			return err
-		}
-		if cfg.MaxStorageBytes != 100 {
-			return fmt.Errorf("max storage bytes before label patch = %d, want old value 100", cfg.MaxStorageBytes)
-		}
-		return nil
-	}
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -771,12 +733,8 @@ func TestQuotaSetChecksClusterWritePermissionBeforeMaxStorageUpdate(t *testing.T
 	if got := rt.prov.updateCalls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)
 	}
-	if got := rt.prov.markCalls.Load(); got != 1 {
-		t.Fatalf("mark calls = %d, want 1", got)
-	}
-	calls := rt.prov.callsSnapshot()
-	if len(calls) != 1 || calls[0] != "mark" {
-		t.Fatalf("calls = %#v, want mark only", calls)
+	if got := rt.prov.markCalls.Load(); got != 0 {
+		t.Fatalf("mark calls = %d, want 0", got)
 	}
 	cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
 	if err != nil {
@@ -789,6 +747,7 @@ func TestQuotaSetChecksClusterWritePermissionBeforeMaxStorageUpdate(t *testing.T
 
 func TestDeprecatedQuotaSetWorksWithoutTiDBCloudOrgBinding(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -803,8 +762,8 @@ func TestDeprecatedQuotaSetWorksWithoutTiDBCloudOrgBinding(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 200 without tenant-org binding: %s", resp.StatusCode, body)
 	}
-	if got := rt.prov.markCalls.Load(); got != 1 {
-		t.Fatalf("mark calls = %d, want 1", got)
+	if got := rt.prov.markCalls.Load(); got != 0 {
+		t.Fatalf("mark calls = %d, want 0", got)
 	}
 	if got := rt.prov.listCalls.Load(); got != 0 {
 		t.Fatalf("list calls = %d, want 0", got)
@@ -851,16 +810,7 @@ func TestQuotaSetChecksClusterWritePermissionBeforeFileLimitUpdate(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	rt.prov.markHook = func() error {
-		cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
-		if err != nil {
-			return err
-		}
-		if cfg.MaxFileSizeBytes != 200 || cfg.MaxFileCount != 300 {
-			return fmt.Errorf("file limits before label patch = size:%d count:%d, want old values", cfg.MaxFileSizeBytes, cfg.MaxFileCount)
-		}
-		return nil
-	}
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -878,12 +828,8 @@ func TestQuotaSetChecksClusterWritePermissionBeforeFileLimitUpdate(t *testing.T)
 	if got := rt.prov.updateCalls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)
 	}
-	if got := rt.prov.markCalls.Load(); got != 1 {
-		t.Fatalf("mark calls = %d, want 1", got)
-	}
-	calls := rt.prov.callsSnapshot()
-	if len(calls) != 1 || calls[0] != "mark" {
-		t.Fatalf("calls = %#v, want mark only", calls)
+	if got := rt.prov.markCalls.Load(); got != 0 {
+		t.Fatalf("mark calls = %d, want 0", got)
 	}
 	cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
 	if err != nil {
@@ -897,7 +843,7 @@ func TestQuotaSetChecksClusterWritePermissionBeforeFileLimitUpdate(t *testing.T)
 func TestQuotaSetSpendingLimitOnlyPersistsSpendingLimitConfig(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	spendingLimit := int64(0)
-	rt.prov.cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: &spendingLimit}
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -911,19 +857,11 @@ func TestQuotaSetSpendingLimitOnlyPersistsSpendingLimitConfig(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	if got := rt.prov.updateCalls.Load(); got != 1 {
-		t.Fatalf("update calls = %d, want 1", got)
+	if got := rt.prov.updateCalls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want 0", got)
 	}
-	if got := rt.prov.markCalls.Load(); got != 1 {
-		t.Fatalf("mark calls = %d, want 1", got)
-	}
-	calls := rt.prov.callsSnapshot()
-	if len(calls) != 2 || calls[0] != "mark" || calls[1] != "update" {
-		t.Fatalf("calls = %#v, want mark before update", calls)
-	}
-	lastOptions := rt.prov.lastOptionsSnapshot()
-	if lastOptions.TiDBCloudSpendingLimitMonthly == nil || *lastOptions.TiDBCloudSpendingLimitMonthly != spendingLimit {
-		t.Fatalf("spending limit option = %#v, want %d", lastOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
+	if got := rt.prov.markCalls.Load(); got != 0 {
+		t.Fatalf("mark calls = %d, want 0", got)
 	}
 	cfg, err := rt.meta.GetQuotaConfig(context.Background(), rt.tenantID)
 	if err != nil {
@@ -1017,6 +955,7 @@ func TestQuotaSetAllowsExplicitDefaultTiDBCloudCredentials(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.prov.defaultPublicKey = "default-pk"
 	rt.prov.defaultPrivateKey = "default-sk"
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "default-pk", PrivateKey: "default-sk"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -1033,16 +972,8 @@ func TestQuotaSetAllowsExplicitDefaultTiDBCloudCredentials(t *testing.T) {
 	if got := rt.prov.updateCalls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)
 	}
-	if got := rt.prov.markCalls.Load(); got != 1 {
-		t.Fatalf("mark calls = %d, want 1", got)
-	}
-	calls := rt.prov.callsSnapshot()
-	if len(calls) != 1 || calls[0] != "mark" {
-		t.Fatalf("calls = %#v, want mark only", calls)
-	}
-	lastCredentials := rt.prov.lastCredentialsSnapshot()
-	if lastCredentials.PublicKey != "default-pk" || lastCredentials.PrivateKey != "default-sk" {
-		t.Fatalf("last credentials = %#v", lastCredentials)
+	if got := rt.prov.markCalls.Load(); got != 0 {
+		t.Fatalf("mark calls = %d, want 0", got)
 	}
 }
 
@@ -1129,8 +1060,8 @@ func TestQuotaSetRejectsNonCloudNativeTenant(t *testing.T) {
 		"max_storage_size": int64(1000),
 	}, "")
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
 	}
 	if got := rt.prov.updateCalls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)
@@ -1138,77 +1069,24 @@ func TestQuotaSetRejectsNonCloudNativeTenant(t *testing.T) {
 }
 
 func TestQuotaGetMapsTiDBCloudCredentialErrors(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		err        error
-		wantStatus int
-	}{
-		{name: "forbidden", err: tenant.ErrQuotaPermissionDenied, wantStatus: http.StatusForbidden},
-		{name: "not_found", err: tenant.ErrQuotaBackendNotFound, wantStatus: http.StatusNotFound},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-			rt.prov.getErr = tc.err
-			ts := httptest.NewServer(rt.server)
-			defer ts.Close()
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
 
-			resp := getQuota(t, ts.URL, rt.tenantID, "public-1", "private-1", "")
-			defer func() { _ = resp.Body.Close() }()
-			if resp.StatusCode != tc.wantStatus {
-				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
-			}
-			if got := rt.prov.getCalls.Load(); got != 1 {
-				t.Fatalf("get calls = %d, want 1", got)
-			}
-		})
+	resp := getQuota(t, ts.URL, rt.tenantID, "public-1", "private-1", "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("get calls = %d, want 0", got)
 	}
 }
 
 func TestQuotaSetMapsTiDBCloudCredentialErrorsWithoutWritingConfig(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		err        error
-		wantStatus int
-	}{
-		{name: "forbidden", err: tenant.ErrQuotaPermissionDenied, wantStatus: http.StatusForbidden},
-		{name: "not_found", err: tenant.ErrQuotaBackendNotFound, wantStatus: http.StatusNotFound},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-			rt.prov.markErr = tc.err
-			ts := httptest.NewServer(rt.server)
-			defer ts.Close()
-
-			resp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
-				"tenant_id":        rt.tenantID,
-				"public_key":       "public-1",
-				"private_key":      "private-1",
-				"max_storage_size": int64(1000),
-			}, "")
-			defer func() { _ = resp.Body.Close() }()
-			if resp.StatusCode != tc.wantStatus {
-				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
-			}
-			version, err := rt.meta.GetQuotaConfigVersion(context.Background(), rt.tenantID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if version != "" {
-				t.Fatalf("quota config version = %q, want empty", version)
-			}
-			if got := rt.prov.markCalls.Load(); got != 1 {
-				t.Fatalf("mark calls = %d, want 1", got)
-			}
-			if got := rt.prov.updateCalls.Load(); got != 0 {
-				t.Fatalf("update calls = %d, want 0", got)
-			}
-		})
-	}
-}
-
-func TestQuotaSetHidesGenericTiDBCloudQuotaError(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	rt.prov.markErr = errors.New("upstream leaked detail")
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -1219,21 +1097,42 @@ func TestQuotaSetHidesGenericTiDBCloudQuotaError(t *testing.T) {
 		"max_storage_size": int64(1000),
 	}, "")
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	raw, err := io.ReadAll(resp.Body)
+	version, err := rt.meta.GetQuotaConfigVersion(context.Background(), rt.tenantID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "tidbcloud quota update failed") {
-		t.Fatalf("body = %q, want stable quota failure message", raw)
+	if version == "" {
+		t.Fatalf("quota config version should be non-empty when config was written")
 	}
-	if strings.Contains(string(raw), "upstream leaked detail") {
-		t.Fatalf("body leaked upstream detail: %q", raw)
+	if got := rt.prov.markCalls.Load(); got != 0 {
+		t.Fatalf("mark calls = %d, want 0", got)
 	}
-	if got := rt.prov.markCalls.Load(); got != 1 {
-		t.Fatalf("mark calls = %d, want 1", got)
+	if got := rt.prov.updateCalls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want 0", got)
+	}
+}
+
+func TestQuotaSetHidesGenericTiDBCloudQuotaError(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.server.tidbCloudRBACCache.rememberCluster(tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}, tenant.CloudClusterInfo{ClusterID: "cluster-quota-1"})
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
+		"tenant_id":        rt.tenantID,
+		"public_key":       "public-1",
+		"private_key":      "private-1",
+		"max_storage_size": int64(1000),
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := rt.prov.markCalls.Load(); got != 0 {
+		t.Fatalf("mark calls = %d, want 0", got)
 	}
 	if got := rt.prov.updateCalls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)

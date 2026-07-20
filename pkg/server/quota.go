@@ -89,74 +89,38 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req := decodeQuotaGetRequest(r)
-	hasTiDBCloudCreds := req.PublicKey != "" || req.PrivateKey != ""
 	t, ok := s.quotaTenant(w, r.Context(), req.TenantID)
 	if !ok {
-		return
-	}
-	if t.Provider != tenant.ProviderTiDBCloudNative {
-		errJSON(w, http.StatusConflict, "tidbcloud credential quota query is only supported for tidb_cloud_native tenants")
 		return
 	}
 	if strings.TrimSpace(t.ClusterID) == "" {
 		errJSON(w, http.StatusNotFound, quotaBackendNotFoundMessage)
 		return
 	}
-	getter, ok := s.provisioner.(tenant.QuotaGetter)
-	if !ok {
-		errJSON(w, http.StatusNotFound, "quota query not enabled")
-		return
-	}
-	cfg, err := s.meta.GetQuotaConfig(r.Context(), t.ID)
-	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "quota config lookup failed")
-		return
-	}
-	if cfg.TiDBCloudSpendingLimit != nil && bearerToken(r) != "" {
+	if bearerToken(r) != "" {
 		apiKeyTenant, apiKeyErr := s.resolveQuotaAPIKey(r.Context(), r)
 		if apiKeyErr == nil && apiKeyTenant != nil && apiKeyTenant.Tenant.ID == t.ID {
 			setRequestMetricTenant(r.Context(), t.ID, apiKeyTenant.APIKey.ID, t.Provider, apiKeyTenant.TiDBCloudOrgID, classifyTenantRequest(r))
 			s.writeQuotaResponse(w, r, t)
 			return
 		}
-		if !hasTiDBCloudCreds {
-			if apiKeyErr != nil {
-				writeQuotaAPIKeyError(w, r.Context(), apiKeyErr)
-				return
-			}
-			errJSON(w, http.StatusForbidden, "API key tenant does not match requested tenant")
+		if apiKeyErr != nil {
+			writeQuotaAPIKeyError(w, r.Context(), apiKeyErr)
 			return
 		}
+		errJSON(w, http.StatusForbidden, "API key tenant does not match requested tenant")
+		return
 	}
 	cred, err := quotaCredentials(req)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	needRefresh := false
-	if cfg.TiDBCloudSpendingLimit == nil {
-		metrics.RecordTiDBCloudSpendingLimitMissing("quota_get")
-		metrics.RecordTiDBCloudRBACCacheRequest("quota_get", "cluster", "bypass")
-		needRefresh = true
-	} else if !s.tidbCloudRBACAllowed(cred, t.ClusterID, "quota_get") {
-		needRefresh = true
+	if !s.tidbCloudRBACAllowed(cred, t.ClusterID, "quota_get") {
+		errJSON(w, http.StatusForbidden, "rbac check failed")
+		return
 	}
-	if needRefresh {
-		observedAt := time.Now().UTC()
-		cloudCfg, err := getter.GetQuota(r.Context(), clusterInfoFromTenant(t), cred)
-		if err != nil {
-			metrics.RecordTiDBCloudOpenAPIRequest("quota_get", "get_quota", "error")
-			writeQuotaCredentialError(w, r.Context(), err, "query")
-			return
-		}
-		metrics.RecordTiDBCloudOpenAPIRequest("quota_get", "get_quota", "ok")
-		s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{ClusterID: t.ClusterID})
-		if err := s.syncTiDBCloudSpendingLimit(r.Context(), "quota_get", t.ID, cloudCfg, observedAt); err != nil {
-			logger.Warn(r.Context(), "tidbcloud_spending_limit_sync_failed", zap.String("tenant_id", t.ID), zap.Error(err))
-			errJSON(w, http.StatusInternalServerError, "quota config update failed")
-			return
-		}
-	}
+	s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{ClusterID: t.ClusterID})
 	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, s.tenantMetricTiDBCloudOrgID(r.Context(), t), classifyTenantRequest(r))
 	s.writeQuotaResponse(w, r, t)
 }
@@ -259,15 +223,16 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if t.Provider != tenant.ProviderTiDBCloudNative {
-		errJSON(w, http.StatusConflict, "quota setting is only supported for tidb_cloud_native tenants")
-		return
-	}
 	if err := s.rejectQuotaSetForTenantStatus(t); err != nil {
 		errJSON(w, http.StatusConflict, err.Error())
 		return
 	}
-	if err := s.applyQuotaSet(r.Context(), "quota_set", t, cred, req); err != nil {
+	if !s.tidbCloudRBACAllowed(cred, t.ClusterID, "quota_set") {
+		errJSON(w, http.StatusForbidden, "rbac check failed")
+		return
+	}
+	s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{ClusterID: t.ClusterID})
+	if err := s.applyQuotaLocalConfig(r.Context(), "quota_set", t.ID, req); err != nil {
 		writeQuotaSetError(w, r.Context(), err, "update")
 		return
 	}
