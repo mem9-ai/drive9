@@ -1168,15 +1168,29 @@ func (p *Provisioner) listClusterInfosPageWithCredentials(ctx context.Context, p
 }
 
 func (p *Provisioner) getClusterLabelsWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, error) {
-	infos, _, err := p.listClusterInfosPageWithCredentials(ctx, publicKey, privateKey, []string{clusterID}, 1, "")
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s?view=local", p.apiURL, url.PathEscape(clusterID))
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("list cluster labels: %w", err)
+		return nil, fmt.Errorf("get cluster labels: %w", err)
 	}
-	if len(infos) == 0 {
-		return nil, fmt.Errorf("cluster %q not found", clusterID)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, fmt.Errorf("read cluster get error body: %w", readErr)
+		}
+		return nil, quotaStatusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
-	labels := make(map[string]string, len(infos[0].Labels))
-	for k, v := range infos[0].Labels {
+	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
+	if readErr != nil {
+		return nil, fmt.Errorf("read cluster body: %w", readErr)
+	}
+	info, err := parseClusterInfo(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse cluster info: %w", err)
+	}
+	labels := make(map[string]string, len(info.Labels))
+	for k, v := range info.Labels {
 		labels[k] = v
 	}
 	return labels, nil

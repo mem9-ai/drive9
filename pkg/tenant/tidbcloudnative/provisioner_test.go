@@ -1156,21 +1156,17 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 		}
 		gotAuth = r.Header.Get("Authorization")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters/cluster-1" && r.URL.RawQuery == "view=local":
 			order = append(order, "GET")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"clusters": []map[string]any{
-					{
-						"clusterId": "cluster-1",
-						"labels": map[string]string{
-							"environment":             "prod",
-							Drive9ManagedLabel:        "old",
-							Drive9TenantIDLabel:       "old-tenant",
-							"drive9.ai/unrelated":     "keep",
-							"tidb.cloud/project":      "123",
-							"tidb.cloud/organization": "456",
-						},
-					},
+				"clusterId": "cluster-1",
+				"labels": map[string]string{
+					"environment":             "prod",
+					Drive9ManagedLabel:        "old",
+					Drive9TenantIDLabel:       "old-tenant",
+					"drive9.ai/unrelated":     "keep",
+					"tidb.cloud/project":      "123",
+					"tidb.cloud/organization": "456",
 				},
 			})
 			return
