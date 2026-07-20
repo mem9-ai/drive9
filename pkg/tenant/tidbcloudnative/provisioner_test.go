@@ -1156,7 +1156,7 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 		}
 		gotAuth = r.Header.Get("Authorization")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters/cluster-1" && r.URL.RawQuery == "view=local":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters/cluster-1" && r.URL.RawQuery == "view=BASIC":
 			order = append(order, "GET")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"clusterId": "cluster-1",

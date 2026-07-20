@@ -1168,7 +1168,7 @@ func (p *Provisioner) listClusterInfosPageWithCredentials(ctx context.Context, p
 }
 
 func (p *Provisioner) getClusterLabelsWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, error) {
-	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s?view=local", p.apiURL, url.PathEscape(clusterID))
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s?view=BASIC", p.apiURL, url.PathEscape(clusterID))
 	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get cluster labels: %w", err)
