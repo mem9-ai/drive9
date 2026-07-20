@@ -637,3 +637,37 @@ func TestEnvDurationCompat(t *testing.T) {
 		}
 	})
 }
+
+func TestBuildBackendOptionsFromEnvMaxMediaLLMFiles(t *testing.T) {
+	const key = "DRIVE9_MEDIA_EXTRACT_MAX_FILES"
+	keys := []string{
+		key,
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_MODE",
+		"DRIVE9_VIDEO_EXTRACT_TENANT_ALLOWLIST",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	opts, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildBackendOptionsFromEnv: %v", err)
+	}
+	if opts.MaxMediaLLMFiles != 0 {
+		t.Fatalf("MaxMediaLLMFiles unset = %d, want 0", opts.MaxMediaLLMFiles)
+	}
+
+	setEnv(t, key, "100")
+	opts, err = buildBackendOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildBackendOptionsFromEnv: %v", err)
+	}
+	if opts.MaxMediaLLMFiles != 100 {
+		t.Fatalf("MaxMediaLLMFiles = %d, want 100", opts.MaxMediaLLMFiles)
+	}
+}

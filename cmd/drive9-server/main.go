@@ -736,6 +736,8 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	if strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE")) != "" {
 		return backend.Options{}, fmt.Errorf("DRIVE9_QUOTA_SOURCE has been removed; central quota is now driven by meta-store wiring")
 	}
+	opts.MaxMediaLLMFiles = envInt64("DRIVE9_MEDIA_EXTRACT_MAX_FILES", 0)
+
 	opts.MaxTenantStorageBytes = envInt64("DRIVE9_MAX_TENANT_STORAGE_BYTES", 50*(1<<30))
 	if opts.MaxTenantStorageBytes <= 0 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_MAX_TENANT_STORAGE_BYTES must be a positive integer")

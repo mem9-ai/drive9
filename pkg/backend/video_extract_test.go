@@ -2,9 +2,12 @@ package backend
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type staticVideoExtractor struct {
@@ -315,6 +318,43 @@ func TestVideoLLMQuotaCustom(t *testing.T) {
 	})
 	if b.maxVideoLLMFiles != 10 {
 		t.Fatalf("maxVideoLLMFiles=%d, want 10", b.maxVideoLLMFiles)
+	}
+}
+
+func TestVideoLLMQuotaEnforcementUsesCentralConfig(t *testing.T) {
+	b, fake := newCentralQuotaBackend(t)
+	fake.config["tenant-a"].MaxVideoLLMFiles = 2
+	ctx := context.Background()
+
+	insertVideoTask := func(tx *sql.Tx, id string) error {
+		now := time.Now().UTC()
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO semantic_tasks
+			 (task_id, task_type, resource_id, resource_version, status, attempt_count, max_attempts,
+			  receipt, payload_json, created_at, updated_at)
+			 VALUES (?, 'video_extract_visual', ?, ?, 'queued', 0, 3,
+			         ?, '{}', ?, ?)`,
+			id, "file-"+id, 1, id[:8], now, now)
+		return err
+	}
+
+	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := insertVideoTask(tx, uuid.NewString()); err != nil {
+			return err
+		}
+		if b.videoLLMQuotaExceededTx(ctx, tx) {
+			t.Error("quota should not be exceeded at 1 task with limit=2 from central config")
+		}
+		if err := insertVideoTask(tx, uuid.NewString()); err != nil {
+			return err
+		}
+		if !b.videoLLMQuotaExceededTx(ctx, tx) {
+			t.Error("quota should be exceeded at 2 tasks with limit=2 from central config")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("transaction failed: %v", err)
 	}
 }
 

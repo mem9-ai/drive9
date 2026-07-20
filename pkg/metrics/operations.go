@@ -79,6 +79,7 @@ var tenantFileBytes = tenantMeter.Int64Counter("drive9_tenant_file_bytes_total",
 var tenantCount = tenantMeter.Float64Gauge("drive9_tenant_count", "Tenant count by status")
 var tenantStorageBytes = tenantMeter.Float64Gauge("drive9_tenant_storage_bytes", "Tenant storage bytes by tenant/tidbcloud_org/state")
 var tenantMediaFiles = tenantMeter.Float64Gauge("drive9_tenant_media_files", "Tenant media file count by tenant/tidbcloud_org/state")
+var tenantVideoFiles = tenantMeter.Float64Gauge("drive9_tenant_video_files", "Tenant video extraction count by tenant/tidbcloud_org/state")
 
 // SSE-specific instruments. SSE connection lifetimes are recorded here, not
 // in drive9_http_request_duration_seconds (which would pollute HTTP latency
@@ -484,6 +485,22 @@ func RecordTenantMediaFilesWithOrg(tenantID, tidbCloudOrgID, state string, count
 	}
 	RegisterModule("tenant_usage")
 	tenantMediaFiles.Set(float64(count),
+		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
+		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
+		Attr("state", cleanMetricValue(state, "unknown")),
+	)
+}
+
+func RecordTenantVideoFiles(tenantID, state string, count int64) {
+	RecordTenantVideoFilesWithOrg(tenantID, "", state, count)
+}
+
+func RecordTenantVideoFilesWithOrg(tenantID, tidbCloudOrgID, state string, count int64) {
+	if count < 0 {
+		return
+	}
+	RegisterModule("tenant_usage")
+	tenantVideoFiles.Set(float64(count),
 		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
 		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
 		Attr("state", cleanMetricValue(state, "unknown")),

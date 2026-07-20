@@ -29,8 +29,9 @@ type QuotaConfig struct {
 	MaxStorageBytes  int64
 	MaxFileSizeBytes int64
 	MaxFileCount     int64 // 0 = unlimited
-	MaxMediaLLMFiles int64
-	MaxMonthlyCostMC int64 // millicents; 0 = disabled
+	MaxMediaLLMFiles  int64
+	MaxVideoLLMFiles  int64
+	MaxMonthlyCostMC  int64 // millicents; 0 = disabled
 	// QuotaLimitsOverridden tracks whether storage/file quota columns should
 	// override process defaults. Spending-limit-only rows keep this false.
 	QuotaLimitsOverridden bool
@@ -149,12 +150,12 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 	var checkedAt sql.NullTime
 	err = s.db.QueryRowContext(ctx,
 		`SELECT max_storage_bytes, max_file_size_bytes, max_file_count,
-		        max_media_llm_files, max_monthly_cost_mc, quota_limits_overridden,
+		        max_media_llm_files, max_video_llm_files, max_monthly_cost_mc, quota_limits_overridden,
 		        tidbcloud_spending_limit, tidbcloud_spending_limit_checked_at,
 		        created_at, updated_at
 		 FROM tenant_quota_config WHERE tenant_id = ?`, tenantID,
 	).Scan(&cfg.MaxStorageBytes, &cfg.MaxFileSizeBytes, &cfg.MaxFileCount,
-		&cfg.MaxMediaLLMFiles, &cfg.MaxMonthlyCostMC, &cfg.QuotaLimitsOverridden,
+		&cfg.MaxMediaLLMFiles, &cfg.MaxVideoLLMFiles, &cfg.MaxMonthlyCostMC, &cfg.QuotaLimitsOverridden,
 		&spendingLimit, &checkedAt, &cfg.CreatedAt, &cfg.UpdatedAt)
 	if err == sql.ErrNoRows {
 		// Return defaults when no per-tenant config exists.
@@ -162,6 +163,7 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 		cfg.MaxFileSizeBytes = DefaultMaxFileSizeBytes()
 		cfg.MaxFileCount = 0
 		cfg.MaxMediaLLMFiles = 500
+		cfg.MaxVideoLLMFiles = 50
 		cfg.MaxMonthlyCostMC = 0
 		cfg.QuotaLimitsOverridden = false
 		return cfg, nil
@@ -174,6 +176,7 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 		cfg.MaxFileSizeBytes = DefaultMaxFileSizeBytes()
 		cfg.MaxFileCount = 0
 		cfg.MaxMediaLLMFiles = 500
+		cfg.MaxVideoLLMFiles = 50
 		cfg.MaxMonthlyCostMC = 0
 	} else if cfg.MaxFileSizeBytes <= 0 {
 		cfg.MaxFileSizeBytes = DefaultMaxFileSizeBytes()
@@ -194,13 +197,13 @@ func (s *Store) GetQuotaConfigVersion(ctx context.Context, tenantID string) (str
 	var err error
 	defer observeMeta(ctx, "get_quota_config_version", start, &err)
 
-	var maxStorageBytes, maxFileSizeBytes, maxFileCount, maxMediaLLMFiles, maxMonthlyCostMC int64
+	var maxStorageBytes, maxFileSizeBytes, maxFileCount, maxMediaLLMFiles, maxVideoLLMFiles, maxMonthlyCostMC int64
 	var quotaLimitsOverridden bool
 	err = s.db.QueryRowContext(ctx,
 		`SELECT max_storage_bytes, max_file_size_bytes, max_file_count,
-		        max_media_llm_files, max_monthly_cost_mc, quota_limits_overridden
+		        max_media_llm_files, max_video_llm_files, max_monthly_cost_mc, quota_limits_overridden
 		 FROM tenant_quota_config WHERE tenant_id = ?`, tenantID,
-	).Scan(&maxStorageBytes, &maxFileSizeBytes, &maxFileCount, &maxMediaLLMFiles, &maxMonthlyCostMC, &quotaLimitsOverridden)
+	).Scan(&maxStorageBytes, &maxFileSizeBytes, &maxFileCount, &maxMediaLLMFiles, &maxVideoLLMFiles, &maxMonthlyCostMC, &quotaLimitsOverridden)
 	if err == sql.ErrNoRows {
 		logger.Info(ctx, "quota_config_not_found_using_defaults",
 			zap.String("tenant_id", tenantID))
@@ -213,7 +216,7 @@ func (s *Store) GetQuotaConfigVersion(ctx context.Context, tenantID string) (str
 	if !quotaLimitsOverridden {
 		return "", nil
 	}
-	return fmt.Sprintf("v2:%d:%d:%d:%d:%d", maxStorageBytes, maxFileSizeBytes, maxFileCount, maxMediaLLMFiles, maxMonthlyCostMC), nil
+	return fmt.Sprintf("v3:%d:%d:%d:%d:%d:%d", maxStorageBytes, maxFileSizeBytes, maxFileCount, maxMediaLLMFiles, maxVideoLLMFiles, maxMonthlyCostMC), nil
 }
 
 // SetQuotaConfig upserts per-tenant quota configuration.
@@ -224,20 +227,21 @@ func (s *Store) SetQuotaConfig(ctx context.Context, cfg *QuotaConfig) error {
 
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes, max_file_size_bytes, max_file_count,
-		                                  max_media_llm_files, max_monthly_cost_mc, quota_limits_overridden,
+		                                  max_media_llm_files, max_video_llm_files, max_monthly_cost_mc, quota_limits_overridden,
 		                                  tidbcloud_spending_limit, tidbcloud_spending_limit_checked_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON DUPLICATE KEY UPDATE
 		   max_storage_bytes = VALUES(max_storage_bytes),
 		   max_file_size_bytes = VALUES(max_file_size_bytes),
 		   max_file_count = VALUES(max_file_count),
 		   max_media_llm_files = VALUES(max_media_llm_files),
+		   max_video_llm_files = VALUES(max_video_llm_files),
 		   max_monthly_cost_mc = VALUES(max_monthly_cost_mc),
 		   quota_limits_overridden = VALUES(quota_limits_overridden),
 		   tidbcloud_spending_limit = VALUES(tidbcloud_spending_limit),
 		   tidbcloud_spending_limit_checked_at = VALUES(tidbcloud_spending_limit_checked_at)`,
 		cfg.TenantID, cfg.MaxStorageBytes, cfg.MaxFileSizeBytes, cfg.MaxFileCount,
-		cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC, true,
+		cfg.MaxMediaLLMFiles, cfg.MaxVideoLLMFiles, cfg.MaxMonthlyCostMC, true,
 		nullInt64FromPtr(cfg.TiDBCloudSpendingLimit), nullTimeFromPtr(cfg.TiDBCloudSpendingLimitCheckedAt))
 	return err
 }
