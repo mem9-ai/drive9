@@ -2065,11 +2065,23 @@ func (p *Provisioner) doDigestAuthRequest(ctx context.Context, publicKey, privat
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	start := time.Now()
 	resp, err := p.client.Do(req)
 	if err != nil {
+		logger.Error(ctx, "tidbcloud_api_request",
+			zap.String("method", method),
+			zap.String("path", requestPath(uri)),
+			zap.String("result", "error"),
+			zap.Duration("duration_ms", time.Since(start)),
+			zap.Error(err))
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusUnauthorized {
+		logger.Info(ctx, "tidbcloud_api_request",
+			zap.String("method", method),
+			zap.String("path", requestPath(uri)),
+			zap.Int("status", resp.StatusCode),
+			zap.Duration("duration_ms", time.Since(start)))
 		return resp, nil
 	}
 	_ = resp.Body.Close()
@@ -2089,7 +2101,31 @@ func (p *Provisioner) doDigestAuthRequest(ctx context.Context, publicKey, privat
 	}
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Authorization", auth)
-	return p.client.Do(req2)
+	start2 := time.Now()
+	resp2, err := p.client.Do(req2)
+	if err != nil {
+		logger.Error(ctx, "tidbcloud_api_request",
+			zap.String("method", method),
+			zap.String("path", requestPath(uri)),
+			zap.String("result", "error"),
+			zap.Duration("duration_ms", time.Since(start2)),
+			zap.Error(err))
+		return nil, err
+	}
+	logger.Info(ctx, "tidbcloud_api_request",
+		zap.String("method", method),
+		zap.String("path", requestPath(uri)),
+		zap.Int("status", resp2.StatusCode),
+		zap.Duration("duration_ms", time.Since(start2)))
+	return resp2, nil
+}
+
+func requestPath(uri string) string {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return uri
+	}
+	return u.Path
 }
 
 func parseDigestChallenge(header string) (nonce, realm, qop string) {
