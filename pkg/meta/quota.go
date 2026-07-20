@@ -149,6 +149,7 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 	cfg := &QuotaConfig{TenantID: tenantID}
 	var spendingLimit sql.NullInt64
 	var checkedAt sql.NullTime
+	var quotaOverridden bool
 	err = s.db.QueryRowContext(ctx,
 		`SELECT max_storage_bytes, max_file_size_bytes, max_file_count,
 		        max_media_llm_files, max_video_llm_files, max_monthly_cost_mc, quota_limits_overridden,
@@ -156,30 +157,22 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 		        created_at, updated_at
 		 FROM tenant_quota_config WHERE tenant_id = ?`, tenantID,
 	).Scan(&cfg.MaxStorageBytes, &cfg.MaxFileSizeBytes, &cfg.MaxFileCount,
-		&cfg.MaxMediaLLMFiles, &cfg.MaxVideoLLMFiles, &cfg.MaxMonthlyCostMC, &cfg.QuotaLimitsOverridden,
+		&cfg.MaxMediaLLMFiles, &cfg.MaxVideoLLMFiles, &cfg.MaxMonthlyCostMC, &quotaOverridden,
 		&spendingLimit, &checkedAt, &cfg.CreatedAt, &cfg.UpdatedAt)
 	if err == sql.ErrNoRows {
-		// Return defaults when no per-tenant config exists.
 		cfg.MaxStorageBytes = DefaultMaxStorageBytes()
 		cfg.MaxFileSizeBytes = DefaultMaxFileSizeBytes()
 		cfg.MaxFileCount = 0
 		cfg.MaxMediaLLMFiles = DefaultMaxMediaLLMFiles()
 		cfg.MaxVideoLLMFiles = DefaultMaxVideoLLMFiles()
 		cfg.MaxMonthlyCostMC = 0
-		cfg.QuotaLimitsOverridden = false
 		return cfg, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if !cfg.QuotaLimitsOverridden {
-		cfg.MaxStorageBytes = DefaultMaxStorageBytes()
-		cfg.MaxFileSizeBytes = DefaultMaxFileSizeBytes()
-		cfg.MaxFileCount = 0
-		cfg.MaxMediaLLMFiles = DefaultMaxMediaLLMFiles()
-		cfg.MaxVideoLLMFiles = DefaultMaxVideoLLMFiles()
-		cfg.MaxMonthlyCostMC = 0
-	} else if cfg.MaxFileSizeBytes <= 0 {
+	cfg.QuotaLimitsOverridden = quotaOverridden
+	if cfg.MaxFileSizeBytes <= 0 {
 		cfg.MaxFileSizeBytes = DefaultMaxFileSizeBytes()
 	}
 	cfg.TiDBCloudSpendingLimit = ptrFromNullInt64(spendingLimit)
@@ -199,12 +192,11 @@ func (s *Store) GetQuotaConfigVersion(ctx context.Context, tenantID string) (str
 	defer observeMeta(ctx, "get_quota_config_version", start, &err)
 
 	var maxStorageBytes, maxFileSizeBytes, maxFileCount, maxMediaLLMFiles, maxVideoLLMFiles, maxMonthlyCostMC int64
-	var quotaLimitsOverridden bool
 	err = s.db.QueryRowContext(ctx,
 		`SELECT max_storage_bytes, max_file_size_bytes, max_file_count,
-		        max_media_llm_files, max_video_llm_files, max_monthly_cost_mc, quota_limits_overridden
+		        max_media_llm_files, max_video_llm_files, max_monthly_cost_mc
 		 FROM tenant_quota_config WHERE tenant_id = ?`, tenantID,
-	).Scan(&maxStorageBytes, &maxFileSizeBytes, &maxFileCount, &maxMediaLLMFiles, &maxVideoLLMFiles, &maxMonthlyCostMC, &quotaLimitsOverridden)
+	).Scan(&maxStorageBytes, &maxFileSizeBytes, &maxFileCount, &maxMediaLLMFiles, &maxVideoLLMFiles, &maxMonthlyCostMC)
 	if err == sql.ErrNoRows {
 		logger.Info(ctx, "quota_config_not_found_using_defaults",
 			zap.String("tenant_id", tenantID))
@@ -213,9 +205,6 @@ func (s *Store) GetQuotaConfigVersion(ctx context.Context, tenantID string) (str
 	}
 	if err != nil {
 		return "", fmt.Errorf("get quota config version for tenant %q: %w", tenantID, err)
-	}
-	if !quotaLimitsOverridden {
-		return "", nil
 	}
 	return fmt.Sprintf("v3:%d:%d:%d:%d:%d:%d", maxStorageBytes, maxFileSizeBytes, maxFileCount, maxMediaLLMFiles, maxVideoLLMFiles, maxMonthlyCostMC), nil
 }
