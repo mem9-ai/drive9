@@ -447,7 +447,18 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 	}
 	for _, err := range errs {
 		if err != nil {
-			return fallbackBatchClusterInfos(created.Clusters, dbName, passwords), nil, err
+			cfgs := fallbackBatchClusterInfos(created.Clusters, dbName, passwords)
+			cloudCfg := &tenant.QuotaCloudConfig{Labels: map[string]string{
+				Drive9ManagedLabel:    "true",
+				Drive9PoolStatusLabel: "free",
+			}}
+			if poolID := strings.TrimSpace(opts.TenantPoolID); poolID != "" {
+				cloudCfg.Labels[Drive9PoolIDLabel] = poolID
+			}
+			if spendingLimit != nil {
+				cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(*spendingLimit)
+			}
+			return cfgs, cloudCfg, err
 		}
 	}
 	cloudCfg := &tenant.QuotaCloudConfig{Labels: map[string]string{

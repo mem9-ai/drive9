@@ -2098,3 +2098,66 @@ func TestClusterInfoFromResponseUsesClusterPrivateHostBeforeLegacyOverride(t *te
 		t.Fatalf("Host with empty private host = %q, want alicloud.override.internal", out.Host)
 	}
 }
+
+func TestBatchProvisionFreeClustersReturnsSpendingLimitOnPartialFailure(t *testing.T) {
+	defaultLimit := int32(1000)
+	handlerErrs := make(chan error, 2)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/v1beta1/clusters:batchCreate" {
+			handlerErrs <- fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"clusters": []map[string]any{
+				{
+					"clusterId":  "cluster-1",
+					"state":      "ACTIVE",
+					"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1", Drive9TenantIDLabel: "tenant-1"},
+					"userPrefix": "u1",
+					"endpoints":  map[string]any{"public": map[string]any{"host": "db1.example", "port": 4000}},
+				},
+				{
+					"clusterId":  "cluster-2",
+					"state":      "ACTIVE",
+					"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1"},
+					"userPrefix": "u2",
+					"endpoints":  map[string]any{"public": map[string]any{"host": "db2.example", "port": 4000}},
+				},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		cloudProvider:       "aws",
+		region:              "us-east-1",
+		defaultDatabaseName: DefaultDatabaseName,
+		defaultSpendLimit:   &defaultLimit,
+		client:              ts.Client(),
+	}
+	clusters, cloudCfg, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(
+		context.Background(),
+		[]string{"tenant-1", "tenant-2"},
+		tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"},
+		tenant.QuotaUpdateOptions{},
+	)
+	if err == nil {
+		t.Fatal("expected error from missing tenant ID label")
+	}
+	if len(clusters) != 2 {
+		t.Fatalf("clusters = %d, want 2 (with fallback)", len(clusters))
+	}
+	if cloudCfg == nil {
+		t.Fatal("cloud config is nil on partial failure, want non-nil with spending limit")
+	}
+	if cloudCfg.TiDBCloudSpendingLimitMonthly == nil || *cloudCfg.TiDBCloudSpendingLimitMonthly != int64(defaultLimit) {
+		t.Fatalf("spending limit = %#v, want %d", cloudCfg.TiDBCloudSpendingLimitMonthly, defaultLimit)
+	}
+}
