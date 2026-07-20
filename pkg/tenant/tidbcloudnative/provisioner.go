@@ -1045,21 +1045,14 @@ func (p *Provisioner) MarkQuotaUpdateStarted(ctx context.Context, cluster *tenan
 		return nil, fmt.Errorf("cluster id is required")
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
-	if err != nil {
-		return nil, fmt.Errorf("load cluster quota info: %w", err)
+	labels := map[string]string{
+		Drive9ManagedLabel:     "true",
+		Drive9QuotaUpdateAtLabel: strconv.FormatInt(time.Now().UTC().Unix(), 10),
 	}
-	if cloudCfg == nil {
-		cloudCfg = &tenant.QuotaCloudConfig{}
-	}
-	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
 		labels[Drive9TenantIDLabel] = tenantID
 	}
-	labels[Drive9QuotaUpdateAtLabel] = strconv.FormatInt(time.Now().UTC().Unix(), 10)
-	for _, k := range immutableLabelKeys {
-		delete(labels, k)
-	}
+	cloudCfg := &tenant.QuotaCloudConfig{}
 	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
 		return nil, fmt.Errorf("update cluster quota labels: %w", err)
 	}
