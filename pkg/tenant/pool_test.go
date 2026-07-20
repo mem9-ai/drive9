@@ -32,6 +32,63 @@ func TestNewPoolUsesDefaultMaxTenants(t *testing.T) {
 	}
 }
 
+func TestNewPoolRecordsBackendCacheCapacityMetrics(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		maxTenants int
+		wantMax    int
+	}{
+		{name: "default capacity", wantMax: defaultTenantPoolMaxTenants},
+		{name: "configured capacity", maxTenants: 7, wantMax: 7},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			NewPool(PoolConfig{MaxTenants: tt.maxTenants}, nil)
+
+			rec := httptest.NewRecorder()
+			metrics.WritePrometheus(rec)
+			text := rec.Body.String()
+			if !strings.Contains(text, `drive9_service_gauge{component="tenant_pool",name="cached_backends",tenant_id="",tidbcloud_org_id="guest"} 0.000000`) {
+				t.Fatalf("missing initialized cached backend gauge:\n%s", text)
+			}
+			wantMax := `drive9_service_gauge{component="tenant_pool",name="max_backends",tenant_id="",tidbcloud_org_id="guest"} ` + strconv.Itoa(tt.wantMax) + `.000000`
+			if !strings.Contains(text, wantMax) {
+				t.Fatalf("missing max backend gauge %q:\n%s", wantMax, text)
+			}
+		})
+	}
+}
+
+func TestPoolGetRecordsCachedBackendGauge(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-metric-get")
+	if _, err := pool.Get(context.Background(), tenant); err != nil {
+		t.Fatal(err)
+	}
+	assertCachedBackendGauge(t, 1)
+}
+
+func TestPoolInvalidateRecordsCachedBackendGauge(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-metric-invalidate")
+	_, release, err := pool.Acquire(context.Background(), tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	assertCachedBackendGauge(t, 1)
+
+	pool.Invalidate(tenant.ID)
+	assertCachedBackendGauge(t, 0)
+}
+
+func assertCachedBackendGauge(t *testing.T, want int) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	wantMetric := `drive9_service_gauge{component="tenant_pool",name="cached_backends",tenant_id="",tidbcloud_org_id="guest"} ` + strconv.Itoa(want) + `.000000`
+	if !strings.Contains(rec.Body.String(), wantMetric) {
+		t.Fatalf("missing cached backend gauge %q:\n%s", wantMetric, rec.Body.String())
+	}
+}
+
 func TestNewPoolUsesDocumentedDefaultIdleReapInterval(t *testing.T) {
 	pool := NewPool(PoolConfig{IdleTimeout: time.Minute}, nil)
 	if pool.reapInterval != 2*time.Minute {

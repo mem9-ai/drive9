@@ -5210,17 +5210,26 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
 			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to set tenant quota", err)
 		}
-		if err := s.syncTiDBCloudSpendingLimit(ctx, "provision", tenantID, provisionCloudCfg, time.Time{}); err != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
-			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
-			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to set tenant quota", err)
-		}
-		if provisionCloudCfg != nil && provisionCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
-			metricEvent(ctx, "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
-		}
-		logProvisionStage(ctx, "provision_quota_local_config_applied", tenantID, provider, stageStarted, "create_time_spending_limit", provisionCloudCfg != nil && provisionCloudCfg.TiDBCloudSpendingLimitMonthly != nil)
+		logProvisionStage(ctx, "provision_quota_local_config_applied", tenantID, provider, stageStarted)
 	}
+	stageStarted = time.Now()
+	quotaSeed := meta.QuotaConfigPatch{
+		TiDBCloudSpendingLimit: tidbCloudSpendingLimitFromCloud(provisionCloudCfg),
+	}
+	if provisionCloudCfg != nil {
+		checkedAt := time.Now().UTC()
+		quotaSeed.TiDBCloudSpendingLimitCheckedAt = &checkedAt
+	}
+	if err := s.meta.SetQuotaConfigPatch(ctx, tenantID, quotaSeed); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
+		s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to set tenant quota", err)
+	}
+	if provisionCloudCfg != nil && provisionCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
+		metricEvent(ctx, "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
+	}
+	logProvisionStage(ctx, "provision_quota_seeded", tenantID, provider, stageStarted, "create_time_spending_limit", provisionCloudCfg != nil && provisionCloudCfg.TiDBCloudSpendingLimitMonthly != nil)
 
 	stageStarted = time.Now()
 	apiToken, apiKeyID, err := s.issueOwnerAPIKey(ctx, tenantID, keyName, opts.TokenVersion, opts.APIKeySource)

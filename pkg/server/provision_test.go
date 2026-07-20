@@ -908,6 +908,106 @@ func TestProvisionTiDBCloudNativeCreateQuotaSkipsQuotaPatch(t *testing.T) {
 	}
 }
 
+func TestProvisionSeedsQuotaConfigWithoutExplicitQuota(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{
+		provider:      tenant.ProviderTiDBCloudNative,
+		cloudProvider: "aws",
+		region:        "us-east-1",
+		cluster: &tenant.ClusterInfo{
+			ClusterID:      "native-cluster-seed-quota",
+			OrganizationID: "org-1",
+			Host:           "db.example",
+			Port:           4000,
+			Username:       "u1.root",
+			Password:       "db-pass",
+			DBName:         "customer_db",
+		},
+	}
+
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	body, _ := json.Marshal(map[string]string{
+		"public_key":  "public-1",
+		"private_key": "private-1",
+	})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+
+	var out map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out["tenant_id"] == "" || out["api_key"] == "" || out["status"] != string(meta.TenantProvisioning) {
+		t.Fatalf("unexpected response: %+v", out)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var status string
+		if err := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", out["tenant_id"]).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == string(meta.TenantActive) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tenant did not become active in time: status=%s", status)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	cfg, err := metaStore.GetQuotaConfig(context.Background(), out["tenant_id"])
+	if err != nil {
+		t.Fatalf("get quota config: %v", err)
+	}
+	if cfg.TiDBCloudSpendingLimit != nil {
+		t.Fatalf("spending limit = %d, want nil", *cfg.TiDBCloudSpendingLimit)
+	}
+	if cfg.TiDBCloudSpendingLimitCheckedAt != nil {
+		t.Fatalf("checked_at = %v, want nil", cfg.TiDBCloudSpendingLimitCheckedAt)
+	}
+}
+
 func TestProvisionTiDBCloudNativeCreateTimeQuotaRequiresQuotaProvisioner(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

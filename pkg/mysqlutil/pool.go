@@ -13,8 +13,8 @@ const (
 	defaultMetaConnMaxIdleTime       = 45 * time.Second
 	defaultMetaMaxOpenConns          = 100
 	defaultMetaMaxIdleConns          = 20
-	defaultUserConnMaxLifetime       = 45 * time.Second
-	defaultUserConnMaxIdleTime       = 30 * time.Second
+	defaultUserConnMaxLifetime       = 5 * time.Minute
+	defaultUserConnMaxIdleTime       = 1 * time.Minute
 	defaultUserMaxOpenConns          = 6
 	defaultUserMaxIdleConns          = 2
 	defaultUserSchemaConnMaxLifetime = 1 * time.Minute
