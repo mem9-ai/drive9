@@ -65,6 +65,13 @@ const (
 	upstreamClusterBodyLimit = 1 << 20
 )
 
+var (
+	immutableLabelKeys = []string{
+		"tidb.cloud/project",
+		TiDBCloudOrganizationLabel,
+	}
+)
+
 var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 var displayNameCharPattern = regexp.MustCompile(`[^A-Za-z0-9-]`)
 
@@ -764,6 +771,9 @@ func (p *Provisioner) MarkClusterPoolUsed(ctx context.Context, cluster *tenant.C
 	}
 	labels[Drive9PoolStatusLabel] = "used"
 	labels[Drive9PoolUsedAtLabel] = usedAt.UTC().Format(time.RFC3339)
+	for _, k := range immutableLabelKeys {
+		delete(labels, k)
+	}
 	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
 		return nil, fmt.Errorf("update cluster pool labels: %w", err)
 	}
@@ -798,6 +808,9 @@ func (p *Provisioner) MarkClusterPoolFree(ctx context.Context, cluster *tenant.C
 	}
 	labels[Drive9PoolStatusLabel] = "free"
 	delete(labels, Drive9PoolUsedAtLabel)
+	for _, k := range immutableLabelKeys {
+		delete(labels, k)
+	}
 	return p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels)
 }
 
@@ -1038,6 +1051,9 @@ func (p *Provisioner) MarkQuotaUpdateStarted(ctx context.Context, cluster *tenan
 		labels[Drive9TenantIDLabel] = tenantID
 	}
 	labels[Drive9QuotaUpdateAtLabel] = strconv.FormatInt(time.Now().UTC().Unix(), 10)
+	for _, k := range immutableLabelKeys {
+		delete(labels, k)
+	}
 	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
 		return nil, fmt.Errorf("update cluster quota labels: %w", err)
 	}

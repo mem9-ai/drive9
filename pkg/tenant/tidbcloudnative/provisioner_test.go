@@ -1213,6 +1213,12 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 	if labels["environment"] != "prod" || labels["drive9.ai/unrelated"] != "keep" {
 		t.Fatalf("existing labels were not preserved: %#v", labels)
 	}
+	if _, ok := labels["tidb.cloud/project"]; ok {
+		t.Fatalf("immutable label tidb.cloud/project was not stripped: %#v", labels)
+	}
+	if _, ok := labels["tidb.cloud/organization"]; ok {
+		t.Fatalf("immutable label tidb.cloud/organization was not stripped: %#v", labels)
+	}
 	if labels[Drive9ManagedLabel] != "true" || labels[Drive9TenantIDLabel] != "tenant-1" {
 		t.Fatalf("drive9 labels = %#v", labels)
 	}
