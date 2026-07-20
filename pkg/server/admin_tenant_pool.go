@@ -873,6 +873,12 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 				cleanupOnError = true
 				return nil, err
 			}
+			logProvisionStage(ctx, "admin_tenant_pool_free_tenant_quota_local_config_applied", tenantID, provider, stageStarted,
+				"pool_id", poolID,
+				"organization_id", orgID,
+				"cluster_id", cluster.ClusterID)
+		}
+		if batchCloudCfg != nil && batchCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
 			if err := s.syncTiDBCloudSpendingLimit(ctx, "pool_create", tenantID, batchCloudCfg, time.Time{}); err != nil {
 				logger.Warn(ctx, "admin_tenant_pool_spending_limit_sync_failed",
 					zap.String("tenant_id", tenantID),
@@ -881,11 +887,6 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 					zap.String("cluster_id", cluster.ClusterID),
 					zap.Error(err))
 			}
-			logProvisionStage(ctx, "admin_tenant_pool_free_tenant_quota_local_config_applied", tenantID, provider, stageStarted,
-				"pool_id", poolID,
-				"organization_id", orgID,
-				"cluster_id", cluster.ClusterID,
-				"create_time_spending_limit", batchCloudCfg != nil && batchCloudCfg.TiDBCloudSpendingLimitMonthly != nil)
 		}
 		results = append(results, res)
 	}
