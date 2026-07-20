@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/meta"
 )
@@ -41,5 +42,20 @@ func TestSafetyNetScanSkipsNilTenant(t *testing.T) {
 	_, _, ok := pool.AcquireCached(nil)
 	if ok {
 		t.Fatal("AcquireCached should return false for nil tenant")
+	}
+}
+
+func TestSafetyNetScanIntervalZeroDisables(t *testing.T) {
+	// A zero SafetyNetScanInterval must be preserved as disabled instead of
+	// falling back to the old 5min default — the default now lives in the
+	// server binaries' env parsing, not in NewWithConfig. A configured
+	// interval passes through untouched.
+	s := NewWithConfig(Config{})
+	if s.safetyNetScanInterval != 0 {
+		t.Fatalf("expected zero SafetyNetScanInterval to be preserved (disabled), got %v", s.safetyNetScanInterval)
+	}
+	s = NewWithConfig(Config{SafetyNetScanInterval: 30 * time.Minute})
+	if s.safetyNetScanInterval != 30*time.Minute {
+		t.Fatalf("expected configured interval to be preserved, got %v", s.safetyNetScanInterval)
 	}
 }
