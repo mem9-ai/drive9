@@ -111,6 +111,10 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusForbidden, "API key tenant does not match requested tenant")
 		return
 	}
+	if t.Provider != tenant.ProviderTiDBCloudNative {
+		errJSON(w, http.StatusConflict, "tidbcloud credential quota query is only supported for tidb_cloud_native tenants")
+		return
+	}
 	cred, err := quotaCredentials(req)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
