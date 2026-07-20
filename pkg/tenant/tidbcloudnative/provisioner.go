@@ -79,8 +79,8 @@ var (
 	ensureDatabaseFunc                        = ensureDatabase
 	tidbCloudNativePollInterval               = 5 * time.Second
 	tidbCloudNativeBatchMetadataGroupSize     = 10
-	tidbCloudNativeBatchMetadataPollInterval  = 15 * time.Second
-	tidbCloudNativeMetadataNotReadyAlertAfter = 5 * time.Minute
+	tidbCloudNativeBatchMetadataPollInterval  = 30 * time.Second
+	tidbCloudNativeMetadataNotReadyAlertAfter = 10 * time.Minute
 )
 
 type Provisioner struct {
