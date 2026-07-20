@@ -56,6 +56,7 @@ func (a *metaQuotaAdapter) GetQuotaUsage(ctx context.Context, tenantID string) (
 		ReservedBytes:  u.ReservedBytes,
 		FileCount:      u.FileCount,
 		MediaFileCount: u.MediaFileCount,
+		VideoFileCount: u.VideoFileCount,
 	}, nil
 }
 
@@ -106,6 +107,14 @@ func (a *metaQuotaAdapter) IncrMediaFileCount(ctx context.Context, tenantID stri
 
 func (a *metaQuotaAdapter) IncrMediaFileCountTx(tx *sql.Tx, tenantID string, delta int64) error {
 	return a.s.IncrMediaFileCountTx(tx, tenantID, delta)
+}
+
+func (a *metaQuotaAdapter) IncrVideoFileCount(ctx context.Context, tenantID string, delta int64) error {
+	return a.s.IncrVideoFileCount(ctx, tenantID, delta)
+}
+
+func (a *metaQuotaAdapter) IncrVideoFileCountTx(tx *sql.Tx, tenantID string, delta int64) error {
+	return a.s.IncrVideoFileCountTx(tx, tenantID, delta)
 }
 
 func (a *metaQuotaAdapter) TransferReservedToConfirmed(ctx context.Context, tenantID string, reservedDelta, storageDelta int64) error {

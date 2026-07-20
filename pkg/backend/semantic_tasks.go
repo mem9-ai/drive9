@@ -7,7 +7,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/semantic"
+	"go.uber.org/zap"
 )
 
 // The enqueue helpers report whether a task row was actually created (the
@@ -91,6 +93,12 @@ func (b *Dat9Backend) enqueueExtractSemanticTasksTx(ctx context.Context, tx *sql
 			created, err := b.enqueueVideoExtractTaskTx(tx, fileID, revision, path, contentType)
 			if err != nil {
 				return enqueued, err
+			}
+			if created && b.metaStore != nil {
+				if err := b.metaStore.IncrVideoFileCount(ctx, b.tenantID, 1); err != nil {
+					logger.Warn(ctx, "video_llm_central_count_failed",
+						zap.String("tenant_id", b.tenantID), zap.Error(err))
+				}
 			}
 			enqueued = enqueued || created
 		}

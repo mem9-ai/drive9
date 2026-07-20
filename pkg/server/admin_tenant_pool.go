@@ -1710,18 +1710,27 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 			s.releaseClaimedPoolTenant(ctx, manager, cluster, cred, row.Tenant.ID, "claim_error")
 		}
 	}()
-	if quotaOpt != nil {
-		stageStarted = time.Now()
-		quotaReq := *quotaOpt
-		quotaReq.TenantID = row.Tenant.ID
-		if err := s.applyQuotaLocalConfig(ctx, "pool_claim", row.Tenant.ID, quotaReq); err != nil {
-			return nil, nil, false, err
-		}
-		logProvisionStage(ctx, "admin_tenant_pool_claim_quota_local_config_applied", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID)
-	}
 	stageStarted = time.Now()
 	quotaSeed := meta.QuotaConfigPatch{
 		TiDBCloudSpendingLimit: tidbCloudSpendingLimitFromCloud(cloudCfg),
+	}
+	if quotaOpt != nil {
+		qp, err := quotaConfigPatchFromRequest(*quotaOpt)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if qp.MaxStorageBytes != nil {
+			quotaSeed.MaxStorageBytes = qp.MaxStorageBytes
+		}
+		if qp.MaxFileSizeBytes != nil {
+			quotaSeed.MaxFileSizeBytes = qp.MaxFileSizeBytes
+		}
+		if qp.MaxFileCount != nil {
+			quotaSeed.MaxFileCount = qp.MaxFileCount
+		}
+		if qp.TiDBCloudSpendingLimit != nil {
+			quotaSeed.TiDBCloudSpendingLimit = qp.TiDBCloudSpendingLimit
+		}
 	}
 	if cloudCfg != nil {
 		checkedAt := time.Now().UTC()

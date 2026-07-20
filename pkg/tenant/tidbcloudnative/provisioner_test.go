@@ -1154,12 +1154,9 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		if r.URL.Path != "/v1beta1/clusters/cluster-1" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
 		gotAuth = r.Header.Get("Authorization")
-		switch r.Method {
-		case http.MethodGet:
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters/cluster-1" && r.URL.RawQuery == "view=BASIC":
 			order = append(order, "GET")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"clusterId": "cluster-1",
@@ -1171,15 +1168,12 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 					"tidb.cloud/project":      "123",
 					"tidb.cloud/organization": "456",
 				},
-				"spendingLimit": map[string]int32{
-					"monthly": 15000,
-				},
 			})
 			return
-		case http.MethodPatch:
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1beta1/clusters/cluster-1":
 			order = append(order, "PATCH")
 		default:
-			t.Fatalf("unexpected method %s", r.Method)
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 		patchCalled = true
 		if err := json.NewDecoder(r.Body).Decode(&gotPatch); err != nil {
@@ -1231,8 +1225,8 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 	if labels[Drive9QuotaUpdateAtLabel] == "" {
 		t.Fatalf("%s label was empty: %#v", Drive9QuotaUpdateAtLabel, labels)
 	}
-	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly == nil || *cfg.TiDBCloudSpendingLimitMonthly != 15000 {
-		t.Fatalf("cloud config = %#v, want spending limit 15000", cfg)
+	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly != nil {
+		t.Fatalf("cloud config = %#v, want no spending limit", cfg)
 	}
 	if cfg.Labels[Drive9ManagedLabel] != "true" || cfg.Labels[Drive9TenantIDLabel] != "tenant-1" {
 		t.Fatalf("cloud config labels = %#v", cfg.Labels)
