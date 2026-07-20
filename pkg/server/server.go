@@ -5212,7 +5212,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	if opts.Quota != nil {
 		qp, err := quotaConfigPatchFromRequest(*opts.Quota)
 		if err != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_patch_invalid", "tenant_id", tenantID, "provider", provider, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
 			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
 			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to set tenant quota", err)

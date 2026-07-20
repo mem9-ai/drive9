@@ -126,7 +126,6 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusNotFound, "quota query not enabled")
 			return
 		}
-		metrics.RecordTiDBCloudRBACCacheRequest("quota_get", "cluster", "bypass")
 		observedAt := time.Now().UTC()
 		cloudCfg, err := getter.GetQuota(r.Context(), clusterInfoFromTenant(t), cred)
 		if err != nil {
