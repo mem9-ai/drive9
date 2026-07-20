@@ -104,8 +104,8 @@ type Config struct {
 	// active pod ring (default 5s).
 	// TenantMaintenanceInterval throttles piggybacked fs_events cleanup +
 	// observation metrics per tenant (default 5min).
-	// SafetyNetScanInterval is how often the leader runs the safety-net scan
-	// (default 5min).
+	// SafetyNetScanInterval is how often each pod runs the safety-net scan
+	// over its shard's warm tenants. A non-positive value disables the scan.
 	// SSENotifyRetention is how long outbox rows are kept before leader-gated
 	// pruning (default 1h).
 	//
@@ -240,7 +240,8 @@ type Server struct {
 	notifyWG        sync.WaitGroup
 	// sseNotifyRetention is how long outbox rows are kept before leader pruning.
 	sseNotifyRetention time.Duration
-	// safetyNetScanInterval is how often the leader runs the safety-net scan.
+	// safetyNetScanInterval is how often each pod runs the safety-net scan.
+	// Non-positive disables it.
 	safetyNetScanInterval time.Duration
 }
 
@@ -380,9 +381,10 @@ func NewWithConfig(cfg Config) *Server {
 	if s.sseNotifyRetention <= 0 {
 		s.sseNotifyRetention = defaultSSENotifyRetention
 	}
-	if s.safetyNetScanInterval <= 0 {
-		s.safetyNetScanInterval = defaultSafetyNetScanInterval
-	}
+	// safetyNetScanInterval is taken as configured: a non-positive value
+	// disables the safety-net scan entirely (see startNotifyInfrastructure).
+	// The 5min default lives in the server binaries' env fallback, not here,
+	// so a zero Config keeps the scan off.
 	mux := http.NewServeMux()
 
 	var business http.Handler = http.HandlerFunc(s.handleBusiness)
@@ -645,8 +647,12 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 	// Safety-net scan runs on every pod (not leader-gated) so each pod
 	// recovers expired leases for its own shard's warm tenants. This
 	// complements the per-pod tenant worker — if a kick is lost, the
-	// safety-net catches it within 5min for any warm tenant owned by this pod.
-	if s.meta != nil && s.pool != nil {
+	// safety-net catches it within one scan interval for any warm tenant
+	// owned by this pod. A non-positive safetyNetScanInterval disables the
+	// scan entirely: outbox kicks remain the primary delivery path, and
+	// lost-kick/expired-lease recovery for idle tenants is deferred to the
+	// tenant's next write.
+	if s.meta != nil && s.pool != nil && s.safetyNetScanInterval > 0 {
 		s.notifyWG.Add(1)
 		go func() {
 			defer s.notifyWG.Done()
@@ -661,6 +667,8 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 				}
 			}
 		}()
+	} else if s.meta != nil && s.pool != nil {
+		logger.Info(notifyCtx, "safety_net_scan_disabled")
 	}
 }
 
@@ -874,9 +882,6 @@ const fsEventsRetention = 1 * time.Hour
 // before the leader prunes them. Matches fs_events retention so the outbox
 // doesn't outlive the work it points to.
 const defaultSSENotifyRetention = 1 * time.Hour
-
-// defaultSafetyNetScanInterval is how often the leader runs the safety-net scan.
-const defaultSafetyNetScanInterval = 5 * time.Minute
 
 // tenantNotifyCleanupInterval is how often the leader prunes old outbox rows.
 const tenantNotifyCleanupInterval = 5 * time.Minute

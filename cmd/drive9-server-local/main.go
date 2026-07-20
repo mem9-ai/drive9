@@ -305,7 +305,7 @@ func main() {
 		TenantOutboxCursorFlushInterval: envDuration("DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_MS", 5000*time.Millisecond),
 		TenantShardRefreshInterval:      envDuration("DRIVE9_TENANT_SHARD_REFRESH_MS", 5000*time.Millisecond),
 		TenantMaintenanceInterval:       envDuration("DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS", 300000*time.Millisecond),
-		SafetyNetScanInterval:           envDuration("DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS", 300000*time.Millisecond),
+		SafetyNetScanInterval:           envDuration("DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS", 5*time.Minute),
 	})
 	defer srv.Close()
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_server")
@@ -420,7 +420,8 @@ environment:
   DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_MS   poller cursor flush interval (default: 5000)
   DRIVE9_TENANT_SHARD_REFRESH_MS         shard resolver ring refresh (default: 5000)
   DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS  piggyback maintenance throttle (default: 300000)
-  DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS     leader safety-net scan interval (default: 300000)
+  DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS     per-pod safety-net scan interval as a Go
+                    duration (e.g. 5m, 24h); 0 disables the scan (default: 5m)
 
   Image extraction (async image -> text for search):
   DRIVE9_IMAGE_EXTRACT_ENABLED true|false (default: false)

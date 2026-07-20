@@ -427,7 +427,7 @@ func main() {
 		TenantOutboxCursorFlushInterval: envDuration("DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_MS", 5000*time.Millisecond),
 		TenantShardRefreshInterval:      envDuration("DRIVE9_TENANT_SHARD_REFRESH_MS", 5000*time.Millisecond),
 		TenantMaintenanceInterval:       envDuration("DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS", 300000*time.Millisecond),
-		SafetyNetScanInterval:           envDuration("DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS", 300000*time.Millisecond),
+		SafetyNetScanInterval:           envDuration("DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS", 5*time.Minute),
 		SSENotifyRetention:              sseNotifyRetention,
 		PodID:                           podID,
 		PodAddr:                         podAddr,
@@ -611,7 +611,8 @@ environment:
   DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_MS   how often the poller persists its cursor (default: 5000)
   DRIVE9_TENANT_SHARD_REFRESH_MS         shard resolver pod ring refresh interval (default: 5000)
   DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS  piggyback maintenance throttle per tenant (default: 300000)
-  DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS     leader safety-net scan interval (default: 300000)
+  DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS     per-pod safety-net scan interval as a Go
+                    duration (e.g. 5m, 24h); 0 disables the scan (default: 5m)
 
   S3 storage (set DRIVE9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)

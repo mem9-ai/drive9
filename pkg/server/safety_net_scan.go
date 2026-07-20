@@ -18,9 +18,10 @@ const (
 	safetyNetRecoverLimit = 64
 )
 
-// safetyNetScan is a periodic (5min) scan that recovers expired leases and
-// discovers unclaimed queued tasks for tenants this pod owns. It runs on every
-// pod (not leader-gated) and filters by shard ownership.
+// safetyNetScan is a periodic scan (SafetyNetScanInterval; 5min by default in
+// the server binaries, disabled when non-positive) that recovers expired
+// leases and discovers unclaimed queued tasks for tenants this pod owns. It
+// runs on every pod (not leader-gated) and filters by shard ownership.
 //
 // **Design constraint — warm-only, never opens cold tenant TiDBs:**
 // The scan exclusively uses AcquireCached (warm-only). A cold tenant whose
