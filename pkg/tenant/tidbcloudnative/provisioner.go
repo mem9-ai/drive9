@@ -65,12 +65,7 @@ const (
 	upstreamClusterBodyLimit = 1 << 20
 )
 
-var (
-	immutableLabelKeys = []string{
-		"tidb.cloud/project",
-		TiDBCloudOrganizationLabel,
-	}
-)
+var ()
 
 var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 var displayNameCharPattern = regexp.MustCompile(`[^A-Za-z0-9-]`)
