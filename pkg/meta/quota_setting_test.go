@@ -79,6 +79,9 @@ func TestGetQuotaConfigUsesConfiguredDefaultStorageBytes(t *testing.T) {
 	if cfg.MaxMediaLLMFiles != 500 {
 		t.Errorf("MaxMediaLLMFiles = %d, want default 500", cfg.MaxMediaLLMFiles)
 	}
+	if cfg.MaxVideoLLMFiles != 50 {
+		t.Errorf("MaxVideoLLMFiles = %d, want default 50", cfg.MaxVideoLLMFiles)
+	}
 	if cfg.MaxMonthlyCostMC != 0 {
 		t.Errorf("MaxMonthlyCostMC = %d, want default 0", cfg.MaxMonthlyCostMC)
 	}
@@ -166,6 +169,7 @@ func TestGetQuotaConfigVersion(t *testing.T) {
 		MaxFileSizeBytes: 234,
 		MaxFileCount:     345,
 		MaxMediaLLMFiles: 456,
+		MaxVideoLLMFiles: 567,
 		MaxMonthlyCostMC: 789,
 	}); err != nil {
 		t.Fatal(err)
@@ -199,6 +203,7 @@ func TestSetQuotaStorageBytesUpdatesStorageOnly(t *testing.T) {
 		MaxFileSizeBytes: 101,
 		MaxFileCount:     102,
 		MaxMediaLLMFiles: 200,
+		MaxVideoLLMFiles: 210,
 		MaxMonthlyCostMC: 300,
 	}); err != nil {
 		t.Fatal(err)
@@ -210,8 +215,8 @@ func TestSetQuotaStorageBytesUpdatesStorageOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MaxStorageBytes != 999 || cfg.MaxFileSizeBytes != 101 || cfg.MaxFileCount != 102 || cfg.MaxMediaLLMFiles != 200 || cfg.MaxMonthlyCostMC != 300 {
-		t.Errorf("cfg = %+v, want storage=999 file_size=101 file_count=102 media=200 monthly=300", cfg)
+	if cfg.MaxStorageBytes != 999 || cfg.MaxFileSizeBytes != 101 || cfg.MaxFileCount != 102 || cfg.MaxMediaLLMFiles != 200 || cfg.MaxVideoLLMFiles != 210 || cfg.MaxMonthlyCostMC != 300 {
+		t.Errorf("cfg = %+v, want storage=999 file_size=101 file_count=102 media=200 video=210 monthly=300", cfg)
 	}
 }
 
@@ -226,7 +231,7 @@ func TestSetQuotaStorageBytesInsertsInternalDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MaxStorageBytes != 12345 || cfg.MaxFileSizeBytes != DefaultMaxFileSizeBytes() || cfg.MaxFileCount != 0 || cfg.MaxMediaLLMFiles != 500 || cfg.MaxMonthlyCostMC != 0 {
+	if cfg.MaxStorageBytes != 12345 || cfg.MaxFileSizeBytes != DefaultMaxFileSizeBytes() || cfg.MaxFileCount != 0 || cfg.MaxMediaLLMFiles != 500 || cfg.MaxVideoLLMFiles != 50 || cfg.MaxMonthlyCostMC != 0 {
 		t.Errorf("cfg = %+v, want storage patch with internal defaults", cfg)
 	}
 }
@@ -275,6 +280,7 @@ func TestSetQuotaConfigPatchUpdatesExternalFieldsOnly(t *testing.T) {
 		MaxFileSizeBytes: 200,
 		MaxFileCount:     300,
 		MaxMediaLLMFiles: 400,
+		MaxVideoLLMFiles: 410,
 		MaxMonthlyCostMC: 500,
 	}); err != nil {
 		t.Fatal(err)
@@ -291,7 +297,7 @@ func TestSetQuotaConfigPatchUpdatesExternalFieldsOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MaxStorageBytes != 100 || cfg.MaxFileSizeBytes != 222 || cfg.MaxFileCount != 333 || cfg.MaxMediaLLMFiles != 400 || cfg.MaxMonthlyCostMC != 500 {
+	if cfg.MaxStorageBytes != 100 || cfg.MaxFileSizeBytes != 222 || cfg.MaxFileCount != 333 || cfg.MaxMediaLLMFiles != 400 || cfg.MaxVideoLLMFiles != 410 || cfg.MaxMonthlyCostMC != 500 {
 		t.Fatalf("cfg = %+v", cfg)
 	}
 }

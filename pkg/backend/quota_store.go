@@ -82,6 +82,7 @@ type QuotaConfigView struct {
 	MaxFileSizeBytes int64
 	MaxFileCount     int64
 	MaxMediaLLMFiles int64
+	MaxVideoLLMFiles int64
 	MaxMonthlyCostMC int64
 }
 

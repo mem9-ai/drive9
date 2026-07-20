@@ -286,6 +286,9 @@ func recordTenantQuotaSnapshot(tenantID, tidbCloudOrgID string, usage *QuotaUsag
 	if cfg.MaxMediaLLMFiles > 0 {
 		metrics.RecordTenantMediaFilesWithOrg(tenantID, tidbCloudOrgID, "limit", cfg.MaxMediaLLMFiles)
 	}
+	if cfg.MaxVideoLLMFiles > 0 {
+		metrics.RecordTenantVideoFilesWithOrg(tenantID, tidbCloudOrgID, "limit", cfg.MaxVideoLLMFiles)
+	}
 }
 
 func quotaMediaDelta(oldIsMedia, newIsMedia bool) int64 {
@@ -377,9 +380,14 @@ func (b *Dat9Backend) mediaLLMQuotaExceededTx(tx *sql.Tx) bool {
 // videoLLMQuotaExceededTx checks whether the tenant has exceeded its per-tenant
 // video extraction quota. Counts every video_extract_visual task row (any
 // status) — each Vision API call consumes one unit, including re-extractions
-// of the same file.
+// of the same file. Prefers per-tenant central config (MaxVideoLLMFiles) when
+// available; falls back to the process-level default.
 func (b *Dat9Backend) videoLLMQuotaExceededTx(ctx context.Context, tx *sql.Tx) bool {
-	if b.maxVideoLLMFiles <= 0 {
+	limit := b.maxVideoLLMFiles
+	if cfg := b.cachedQuotaConfig(ctx); cfg != nil && cfg.MaxVideoLLMFiles > 0 {
+		limit = cfg.MaxVideoLLMFiles
+	}
+	if limit <= 0 {
 		return false
 	}
 	var count int64
@@ -387,7 +395,7 @@ func (b *Dat9Backend) videoLLMQuotaExceededTx(ctx context.Context, tx *sql.Tx) b
 		logger.Warn(ctx, "video_llm_quota_check_fail_open", zap.Error(err))
 		return false
 	}
-	return count >= b.maxVideoLLMFiles
+	return count >= limit
 }
 
 // ensureTenantStorageQuotaTx is the legacy tenant-DB storage quota check.
