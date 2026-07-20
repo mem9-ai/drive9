@@ -423,11 +423,11 @@ func main() {
 		TiDBAutoEmbeddingAPIBase:        autoEmbeddingAPIBase,
 		DisableDatabaseAutoEmbedding:    disableDatabaseAutoEmbedding,
 		Leader:                          leaderManager,
-		TenantOutboxPollInterval:        envDuration("DRIVE9_TENANT_OUTBOX_POLL_INTERVAL_MS", 200*time.Millisecond),
-		TenantOutboxCursorFlushInterval: envDuration("DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_MS", 5000*time.Millisecond),
-		TenantShardRefreshInterval:      envDuration("DRIVE9_TENANT_SHARD_REFRESH_MS", 5000*time.Millisecond),
-		TenantMaintenanceInterval:       envDuration("DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS", 300000*time.Millisecond),
-		SafetyNetScanInterval:           envDuration("DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS", 300000*time.Millisecond),
+		TenantOutboxPollInterval:        envDurationCompat("DRIVE9_TENANT_OUTBOX_POLL_INTERVAL", "DRIVE9_TENANT_OUTBOX_POLL_INTERVAL_MS", 200*time.Millisecond),
+		TenantOutboxCursorFlushInterval: envDurationCompat("DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_INTERVAL", "DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_MS", 5*time.Second),
+		TenantShardRefreshInterval:      envDurationCompat("DRIVE9_TENANT_SHARD_REFRESH_INTERVAL", "DRIVE9_TENANT_SHARD_REFRESH_MS", 5*time.Second),
+		TenantMaintenanceInterval:       envDurationCompat("DRIVE9_TENANT_MAINTENANCE_INTERVAL", "DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS", 5*time.Minute),
+		SafetyNetScanInterval:           envDurationCompat("DRIVE9_SAFETY_NET_SCAN_INTERVAL", "DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS", 5*time.Minute),
 		SSENotifyRetention:              sseNotifyRetention,
 		PodID:                           podID,
 		PodAddr:                         podAddr,
@@ -607,11 +607,17 @@ environment:
                     outbox poller is the primary cross-pod path).
   DRIVE9_SSE_NOTIFY_RETENTION      how long tenant_notify_outbox rows are kept before
                     leader pruning (default: 1h)
-  DRIVE9_TENANT_OUTBOX_POLL_INTERVAL_MS  unified outbox poll interval (default: 200)
-  DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_MS   how often the poller persists its cursor (default: 5000)
-  DRIVE9_TENANT_SHARD_REFRESH_MS         shard resolver pod ring refresh interval (default: 5000)
-  DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS  piggyback maintenance throttle per tenant (default: 300000)
-  DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS     leader safety-net scan interval (default: 300000)
+  DRIVE9_TENANT_OUTBOX_POLL_INTERVAL     unified outbox poll interval (default: 200ms)
+  DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_INTERVAL
+                    how often the poller persists its cursor (default: 5s)
+  DRIVE9_TENANT_SHARD_REFRESH_INTERVAL   shard resolver pod ring refresh interval (default: 5s)
+  DRIVE9_TENANT_MAINTENANCE_INTERVAL     piggyback maintenance throttle per tenant (default: 5m)
+  DRIVE9_SAFETY_NET_SCAN_INTERVAL        per-pod safety-net scan interval (default: 5m);
+                    0 disables the scan
+  Interval vars accept Go durations (e.g. 500ms, 5m). The former *_MS names
+  (DRIVE9_TENANT_OUTBOX_POLL_INTERVAL_MS, DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_MS,
+  DRIVE9_TENANT_SHARD_REFRESH_MS, DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS,
+  DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS) are deprecated but still honored.
 
   S3 storage (set DRIVE9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
@@ -1082,4 +1088,19 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return v
+}
+
+// envDurationCompat reads a Go-duration env var under its canonical name. When
+// the canonical name is unset but the deprecated legacy name is set, the legacy
+// value is honored with a deprecation warning. The canonical name wins when
+// both are set.
+func envDurationCompat(canonical, deprecated string, fallback time.Duration) time.Duration {
+	if strings.TrimSpace(os.Getenv(canonical)) != "" {
+		return envDuration(canonical, fallback)
+	}
+	if strings.TrimSpace(os.Getenv(deprecated)) != "" {
+		fmt.Fprintf(os.Stderr, "warning: %s is deprecated, use %s instead\n", deprecated, canonical)
+		return envDuration(deprecated, fallback)
+	}
+	return fallback
 }
