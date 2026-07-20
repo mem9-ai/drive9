@@ -1720,11 +1720,14 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		logProvisionStage(ctx, "admin_tenant_pool_claim_quota_local_config_applied", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID)
 	}
 	stageStarted = time.Now()
-	now := time.Now().UTC()
-	if err := s.meta.SetQuotaConfigPatch(ctx, row.Tenant.ID, meta.QuotaConfigPatch{
-		TiDBCloudSpendingLimit:           tidbCloudSpendingLimitFromCloud(cloudCfg),
-		TiDBCloudSpendingLimitCheckedAt: &now,
-	}); err != nil {
+	quotaSeed := meta.QuotaConfigPatch{
+		TiDBCloudSpendingLimit: tidbCloudSpendingLimitFromCloud(cloudCfg),
+	}
+	if cloudCfg != nil {
+		checkedAt := time.Now().UTC()
+		quotaSeed.TiDBCloudSpendingLimitCheckedAt = &checkedAt
+	}
+	if err := s.meta.SetQuotaConfigPatch(ctx, row.Tenant.ID, quotaSeed); err != nil {
 		return nil, nil, false, err
 	}
 	logProvisionStage(ctx, "admin_tenant_pool_claim_quota_seeded", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID, "create_time_spending_limit", cloudCfg != nil && cloudCfg.TiDBCloudSpendingLimitMonthly != nil)

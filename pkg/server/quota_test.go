@@ -307,6 +307,12 @@ func (p *quotaTestProvisioner) WaitForPoolClustersMetadata(_ context.Context, cl
 func (p *quotaTestProvisioner) MarkClusterPoolUsed(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, _ time.Time, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
 	p.markPoolUsedCalls.Add(1)
 	p.recordCall("mark_pool_used", req, cluster, &opts)
+	if p.cloudCfg != nil {
+		return p.cloudCfg, nil
+	}
+	if opts.TiDBCloudSpendingLimitMonthly == nil {
+		return nil, nil
+	}
 	return &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: opts.TiDBCloudSpendingLimitMonthly}, nil
 }
 
@@ -2240,8 +2246,8 @@ func TestTenantPoolClaimSeedsQuotaConfigWithoutExplicitQuota(t *testing.T) {
 	if cfg.TiDBCloudSpendingLimit != nil {
 		t.Fatalf("spending limit = %d, want nil", *cfg.TiDBCloudSpendingLimit)
 	}
-	if cfg.TiDBCloudSpendingLimitCheckedAt == nil {
-		t.Fatal("checked_at is nil, want non-nil (cloud was observed)")
+	if cfg.TiDBCloudSpendingLimitCheckedAt != nil {
+		t.Fatalf("checked_at = %v, want nil without a cloud observation", cfg.TiDBCloudSpendingLimitCheckedAt)
 	}
 }
 
