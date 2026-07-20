@@ -117,10 +117,25 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.tidbCloudRBACAllowed(cred, t.ClusterID, "quota_get") {
-		errJSON(w, http.StatusForbidden, "rbac check failed")
-		return
+		getter, ok := s.provisioner.(tenant.QuotaGetter)
+		if !ok {
+			errJSON(w, http.StatusNotFound, "quota query not enabled")
+			return
+		}
+		metrics.RecordTiDBCloudRBACCacheRequest("quota_get", "cluster", "bypass")
+		observedAt := time.Now().UTC()
+		cloudCfg, err := getter.GetQuota(r.Context(), clusterInfoFromTenant(t), cred)
+		if err != nil {
+			metrics.RecordTiDBCloudOpenAPIRequest("quota_get", "get_quota", "error")
+			writeQuotaCredentialError(w, r.Context(), err, "query")
+			return
+		}
+		metrics.RecordTiDBCloudOpenAPIRequest("quota_get", "get_quota", "ok")
+		s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{ClusterID: t.ClusterID})
+		if err := s.syncTiDBCloudSpendingLimit(r.Context(), "quota_get", t.ID, cloudCfg, observedAt); err != nil {
+			logger.Warn(r.Context(), "tidbcloud_spending_limit_sync_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+		}
 	}
-	s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{ClusterID: t.ClusterID})
 	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, s.tenantMetricTiDBCloudOrgID(r.Context(), t), classifyTenantRequest(r))
 	s.writeQuotaResponse(w, r, t)
 }
