@@ -761,9 +761,9 @@ func (p *Provisioner) MarkClusterPoolUsed(ctx context.Context, cluster *tenant.C
 		}
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
+	labels, err := p.getClusterLabelsWithCredentials(ctx, publicKey, privateKey, clusterID)
 	if err != nil {
-		return nil, fmt.Errorf("load cluster pool label info: %w", err)
+		return nil, fmt.Errorf("load cluster labels: %w", err)
 	}
 	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
@@ -777,10 +777,7 @@ func (p *Provisioner) MarkClusterPoolUsed(ctx context.Context, cluster *tenant.C
 	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
 		return nil, fmt.Errorf("update cluster pool labels: %w", err)
 	}
-	if cloudCfg == nil {
-		cloudCfg = &tenant.QuotaCloudConfig{}
-	}
-	cloudCfg.Labels = labels
+	cloudCfg := &tenant.QuotaCloudConfig{Labels: labels}
 	if opts.TiDBCloudSpendingLimitMonthly != nil {
 		monthly := *opts.TiDBCloudSpendingLimitMonthly
 		if err := p.updateSpendingLimitWithCredentials(ctx, publicKey, privateKey, clusterID, monthly); err != nil {
@@ -801,9 +798,9 @@ func (p *Provisioner) MarkClusterPoolFree(ctx context.Context, cluster *tenant.C
 		return fmt.Errorf("cluster id is required")
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels, _, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
+	labels, err := p.getClusterLabelsWithCredentials(ctx, publicKey, privateKey, clusterID)
 	if err != nil {
-		return fmt.Errorf("load cluster pool label info: %w", err)
+		return fmt.Errorf("load cluster labels: %w", err)
 	}
 	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
@@ -1045,12 +1042,9 @@ func (p *Provisioner) MarkQuotaUpdateStarted(ctx context.Context, cluster *tenan
 		return nil, fmt.Errorf("cluster id is required")
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
+	labels, err := p.getClusterLabelsWithCredentials(ctx, publicKey, privateKey, clusterID)
 	if err != nil {
-		return nil, fmt.Errorf("load cluster quota info: %w", err)
-	}
-	if cloudCfg == nil {
-		cloudCfg = &tenant.QuotaCloudConfig{}
+		return nil, fmt.Errorf("load cluster labels: %w", err)
 	}
 	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
@@ -1063,7 +1057,7 @@ func (p *Provisioner) MarkQuotaUpdateStarted(ctx context.Context, cluster *tenan
 	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
 		return nil, fmt.Errorf("update cluster quota labels: %w", err)
 	}
-	cloudCfg.Labels = labels
+	cloudCfg := &tenant.QuotaCloudConfig{Labels: labels}
 	return cloudCfg, nil
 }
 
@@ -1187,6 +1181,35 @@ func (p *Provisioner) listClusterInfosPageWithCredentials(ctx context.Context, p
 		return nil, "", fmt.Errorf("parse cluster list: %w", err)
 	}
 	return list.Clusters, strings.TrimSpace(list.NextPageToken), nil
+}
+
+func (p *Provisioner) getClusterLabelsWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, error) {
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s?view=BASIC", p.apiURL, url.PathEscape(clusterID))
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get cluster labels: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, fmt.Errorf("read cluster get error body: %w", readErr)
+		}
+		return nil, quotaStatusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw))
+	}
+	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
+	if readErr != nil {
+		return nil, fmt.Errorf("read cluster body: %w", readErr)
+	}
+	info, err := parseClusterInfo(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse cluster info: %w", err)
+	}
+	labels := make(map[string]string, len(info.Labels))
+	for k, v := range info.Labels {
+		labels[k] = v
+	}
+	return labels, nil
 }
 
 func (p *Provisioner) clusterQuotaInfo(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, *tenant.QuotaCloudConfig, error) {
@@ -2090,11 +2113,23 @@ func (p *Provisioner) doDigestAuthRequest(ctx context.Context, publicKey, privat
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	start := time.Now()
 	resp, err := p.client.Do(req)
 	if err != nil {
+		logger.Error(ctx, "tidbcloud_api_request",
+			zap.String("method", method),
+			zap.String("path", requestPath(uri)),
+			zap.String("result", "error"),
+			zap.Int64("duration_ms", time.Since(start).Milliseconds()),
+			zap.Error(err))
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusUnauthorized {
+		logger.Info(ctx, "tidbcloud_api_request",
+			zap.String("method", method),
+			zap.String("path", requestPath(uri)),
+			zap.Int("status", resp.StatusCode),
+			zap.Int64("duration_ms", time.Since(start).Milliseconds()))
 		return resp, nil
 	}
 	_ = resp.Body.Close()
@@ -2114,7 +2149,31 @@ func (p *Provisioner) doDigestAuthRequest(ctx context.Context, publicKey, privat
 	}
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Authorization", auth)
-	return p.client.Do(req2)
+	start2 := time.Now()
+	resp2, err := p.client.Do(req2)
+	if err != nil {
+		logger.Error(ctx, "tidbcloud_api_request",
+			zap.String("method", method),
+			zap.String("path", requestPath(uri)),
+			zap.String("result", "error"),
+			zap.Int64("duration_ms", time.Since(start2).Milliseconds()),
+			zap.Error(err))
+		return nil, err
+	}
+	logger.Info(ctx, "tidbcloud_api_request",
+		zap.String("method", method),
+		zap.String("path", requestPath(uri)),
+		zap.Int("status", resp2.StatusCode),
+		zap.Int64("duration_ms", time.Since(start2).Milliseconds()))
+	return resp2, nil
+}
+
+func requestPath(uri string) string {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return uri
+	}
+	return u.Path
 }
 
 func parseDigestChallenge(header string) (nonce, realm, qop string) {

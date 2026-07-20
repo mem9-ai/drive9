@@ -120,8 +120,8 @@ func TestQuotaConfigStoresTiDBCloudSpendingLimitWithoutStorageVersion(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != "" {
-		t.Fatalf("storage quota version = %q, want empty", version)
+	if version == "" {
+		t.Fatalf("storage quota version should be non-empty when config row exists")
 	}
 
 	updated := int64(123)

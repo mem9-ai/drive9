@@ -253,7 +253,7 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	if opts.MaxMediaLLMFiles > 0 {
 		b.maxMediaLLMFiles = opts.MaxMediaLLMFiles
 	} else {
-		b.maxMediaLLMFiles = defaultMaxMediaLLMFiles
+		b.maxMediaLLMFiles = meta.DefaultMaxMediaLLMFiles()
 	}
 	if opts.MaxTenantStorageBytes > 0 {
 		b.maxTenantStorageBytes = opts.MaxTenantStorageBytes
@@ -366,7 +366,7 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 		if v.MaxVideoLLMFiles > 0 {
 			b.maxVideoLLMFiles = v.MaxVideoLLMFiles
 		} else {
-			b.maxVideoLLMFiles = defaultMaxVideoLLMFiles
+			b.maxVideoLLMFiles = meta.DefaultMaxVideoLLMFiles()
 		}
 		logger.Info(backgroundWithTrace(), "backend_video_extract_runtime_configured",
 			zap.Duration("task_timeout", v.TaskTimeout),

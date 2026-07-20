@@ -30,12 +30,14 @@ type MetaQuotaStore interface {
 	IncrReservedBytes(ctx context.Context, tenantID string, delta int64) error
 	IncrFileCount(ctx context.Context, tenantID string, delta int64) error
 	IncrMediaFileCount(ctx context.Context, tenantID string, delta int64) error
+	IncrVideoFileCount(ctx context.Context, tenantID string, delta int64) error
 	TransferReservedToConfirmed(ctx context.Context, tenantID string, reservedDelta, storageDelta int64) error
 	AtomicReserveAndInsertUpload(ctx context.Context, r *UploadReservationView) error
 	IncrStorageBytesTx(tx *sql.Tx, tenantID string, delta int64) error
 	IncrReservedBytesTx(tx *sql.Tx, tenantID string, delta int64) error
 	IncrFileCountTx(tx *sql.Tx, tenantID string, delta int64) error
 	IncrMediaFileCountTx(tx *sql.Tx, tenantID string, delta int64) error
+	IncrVideoFileCountTx(tx *sql.Tx, tenantID string, delta int64) error
 	TransferReservedToConfirmedTx(tx *sql.Tx, tenantID string, reservedDelta, storageDelta int64) error
 
 	// File meta (server-authored shadow state)
@@ -93,6 +95,7 @@ type QuotaUsageView struct {
 	ReservedBytes  int64
 	FileCount      int64
 	MediaFileCount int64
+	VideoFileCount int64
 }
 
 // FileMetaView is the backend-side view of per-file quota metadata.
