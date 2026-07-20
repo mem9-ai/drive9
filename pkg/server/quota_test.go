@@ -939,8 +939,8 @@ func TestQuotaSetSpendingLimitOnlyPersistsSpendingLimitConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != "" {
-		t.Fatalf("storage quota config version = %q, want empty", version)
+	if version == "" {
+		t.Fatalf("storage quota config version should be non-empty when config row exists")
 	}
 	var out quotaResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
