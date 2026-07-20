@@ -162,8 +162,8 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 		cfg.MaxStorageBytes = DefaultMaxStorageBytes()
 		cfg.MaxFileSizeBytes = DefaultMaxFileSizeBytes()
 		cfg.MaxFileCount = 0
-		cfg.MaxMediaLLMFiles = 500
-		cfg.MaxVideoLLMFiles = 50
+		cfg.MaxMediaLLMFiles = DefaultMaxMediaLLMFiles()
+		cfg.MaxVideoLLMFiles = DefaultMaxVideoLLMFiles()
 		cfg.MaxMonthlyCostMC = 0
 		cfg.QuotaLimitsOverridden = false
 		return cfg, nil
@@ -175,8 +175,8 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 		cfg.MaxStorageBytes = DefaultMaxStorageBytes()
 		cfg.MaxFileSizeBytes = DefaultMaxFileSizeBytes()
 		cfg.MaxFileCount = 0
-		cfg.MaxMediaLLMFiles = 500
-		cfg.MaxVideoLLMFiles = 50
+		cfg.MaxMediaLLMFiles = DefaultMaxMediaLLMFiles()
+		cfg.MaxVideoLLMFiles = DefaultMaxVideoLLMFiles()
 		cfg.MaxMonthlyCostMC = 0
 	} else if cfg.MaxFileSizeBytes <= 0 {
 		cfg.MaxFileSizeBytes = DefaultMaxFileSizeBytes()
@@ -289,6 +289,8 @@ func (s *Store) SetQuotaConfigPatch(ctx context.Context, tenantID string, patch 
 	}
 	insertSpendingLimit := nullInt64FromPtr(patch.TiDBCloudSpendingLimit)
 	insertCheckedAt := nullTimeFromPtr(patch.TiDBCloudSpendingLimitCheckedAt)
+	insertMediaLLM := DefaultMaxMediaLLMFiles()
+	insertVideoLLM := DefaultMaxVideoLLMFiles()
 	updateStorage := sql.NullInt64{}
 	if patch.MaxStorageBytes != nil {
 		updateStorage = sql.NullInt64{Int64: *patch.MaxStorageBytes, Valid: true}
@@ -306,8 +308,8 @@ func (s *Store) SetQuotaConfigPatch(ctx context.Context, tenantID string, patch 
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes, max_file_size_bytes, max_file_count,
 		                                  quota_limits_overridden, tidbcloud_spending_limit,
-		                                  tidbcloud_spending_limit_checked_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		                                  tidbcloud_spending_limit_checked_at, max_media_llm_files, max_video_llm_files)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON DUPLICATE KEY UPDATE
 			   max_storage_bytes = COALESCE(?, max_storage_bytes),
 			   max_file_size_bytes = COALESCE(?, max_file_size_bytes),
@@ -315,8 +317,11 @@ func (s *Store) SetQuotaConfigPatch(ctx context.Context, tenantID string, patch 
 			   /* Storage quota overrides are sticky once any storage/file limit is explicitly set. */
 			   quota_limits_overridden = IF(?, 1, quota_limits_overridden),
 			   tidbcloud_spending_limit = COALESCE(?, tidbcloud_spending_limit),
-			   tidbcloud_spending_limit_checked_at = COALESCE(?, tidbcloud_spending_limit_checked_at)`,
+			   tidbcloud_spending_limit_checked_at = COALESCE(?, tidbcloud_spending_limit_checked_at),
+			   max_media_llm_files = COALESCE(NULL, max_media_llm_files),
+			   max_video_llm_files = COALESCE(NULL, max_video_llm_files)`,
 		tenantID, insertStorage, insertFileSize, insertFileCount, quotaLimitOverrideSet, insertSpendingLimit, insertCheckedAt,
+			insertMediaLLM, insertVideoLLM,
 		updateStorage, updateFileSize, updateFileCount, quotaLimitOverrideSet, updateSpendingLimit, updateCheckedAt)
 	if err != nil {
 		return fmt.Errorf("set quota config patch for tenant %q: %w", tenantID, err)
@@ -592,10 +597,14 @@ func (s *Store) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID string, reser
 // defaultMaxStorageBytes is the fallback limit when no per-tenant config row exists.
 var defaultMaxStorageBytes atomic.Int64
 var defaultMaxFileSizeBytes atomic.Int64
+var defaultMaxMediaLLMFiles atomic.Int64
+var defaultMaxVideoLLMFiles atomic.Int64
 
 func init() {
 	defaultMaxStorageBytes.Store(int64(50 * (1 << 30)))  // 50 GiB
 	defaultMaxFileSizeBytes.Store(int64(10 * (1 << 30))) // 10 GiB
+	defaultMaxMediaLLMFiles.Store(int64(500))
+	defaultMaxVideoLLMFiles.Store(int64(50))
 }
 
 // SetDefaultMaxStorageBytes overrides the per-tenant fallback storage quota.
@@ -617,6 +626,26 @@ func SetDefaultMaxFileSizeBytes(bytes int64) {
 
 // DefaultMaxFileSizeBytes returns the configured per-tenant fallback file size quota.
 func DefaultMaxFileSizeBytes() int64 { return defaultMaxFileSizeBytes.Load() }
+
+// SetDefaultMaxMediaLLMFiles overrides the per-tenant fallback media LLM file limit.
+func SetDefaultMaxMediaLLMFiles(n int64) {
+	if n > 0 {
+		defaultMaxMediaLLMFiles.Store(n)
+	}
+}
+
+// DefaultMaxMediaLLMFiles returns the configured per-tenant fallback media LLM file limit.
+func DefaultMaxMediaLLMFiles() int64 { return defaultMaxMediaLLMFiles.Load() }
+
+// SetDefaultMaxVideoLLMFiles overrides the per-tenant fallback video LLM file limit.
+func SetDefaultMaxVideoLLMFiles(n int64) {
+	if n > 0 {
+		defaultMaxVideoLLMFiles.Store(n)
+	}
+}
+
+// DefaultMaxVideoLLMFiles returns the configured per-tenant fallback video LLM file limit.
+func DefaultMaxVideoLLMFiles() int64 { return defaultMaxVideoLLMFiles.Load() }
 
 const (
 	metaLockConflictRetryAttempts = 4
