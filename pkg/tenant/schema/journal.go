@@ -1,5 +1,10 @@
 package schema
 
+import (
+	"context"
+	"database/sql"
+)
+
 // JournalTiDBSchemaStatements returns the tenant journal DDL used by TiDB and
 // MySQL-compatible tenants. The first implementation intentionally creates
 // the Phase 1 tables only: artifacts, filesystem projection, and seals are
@@ -315,4 +320,26 @@ func JournalDB9SchemaStatements() []string {
 		`CREATE INDEX IF NOT EXISTS idx_journal_entry_subjects_entry ON journal_entry_subjects(tenant_id, entry_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_entry_subjects_journal_seq ON journal_entry_subjects(tenant_id, journal_id, seq)`,
 	}
+}
+
+// JournalMySQLSharedSchemaStatements is the plain-MySQL variant of
+// JournalTiDBSharedSchemaStatements, derived by removing TiDB-only keywords.
+// Use it for local development databases and MySQL-backed tests/e2e.
+func JournalMySQLSharedSchemaStatements() []string {
+	return mysqlCompatibleSharedStatements(JournalTiDBSharedSchemaStatements())
+}
+
+// JournalSharedSchemaStatementsForDB selects the shared journal DDL matching
+// the connected database's dialect: TiDB clusters get the CLUSTERED variant,
+// anything else (plain MySQL, e.g. local e2e) the compatible variant. Dialect
+// detection failures are returned, never silently treated as MySQL.
+func JournalSharedSchemaStatementsForDB(ctx context.Context, db *sql.DB) ([]string, error) {
+	isTiDB, err := IsTiDBClusterE(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	if isTiDB {
+		return JournalTiDBSharedSchemaStatements(), nil
+	}
+	return JournalMySQLSharedSchemaStatements(), nil
 }

@@ -41,7 +41,8 @@ var sharedCoreFSUnprefixedIndexes = map[string]bool{
 // sharedCoreFSOnlyIndexes lists the (fs_id, ...) lookup indexes that exist
 // only in the shared shape, with their expected column lists.
 var sharedCoreFSOnlyIndexes = map[string][]string{
-	"idx_fs_events_fs_seq": {"fs_id", "seq"},
+	"idx_fs_events_fs_seq":     {"fs_id", "seq"},
+	"idx_fs_events_fs_created": {"fs_id", "created_at"},
 }
 
 type sharedCoreFSColumn struct {
@@ -210,8 +211,20 @@ func TestCoreFSTiDBSharedSchemaDeclaresClusteredPKs(t *testing.T) {
 // TestCoreFSSharedSchemaOmitsLLMUsage guards the intentional absence of
 // llm_usage from the shared schema: the central meta DB ledger
 // (tenant_llm_usage) is authoritative in multi-tenant deployments, so the
-// tenant-DB duplicate is not carried into shared shape.
+// tenant-DB duplicate is not carried into shared shape. The standalone
+// baseline must still contain it — otherwise this exclusion test would pass
+// silently against a schema that lost llm_usage on both shapes.
 func TestCoreFSSharedSchemaOmitsLLMUsage(t *testing.T) {
+	standaloneHasLLMUsage := false
+	for _, stmt := range tidbAppEmbeddingBaseSchemaStatements() {
+		if strings.Contains(stmt, "llm_usage") {
+			standaloneHasLLMUsage = true
+			break
+		}
+	}
+	if !standaloneHasLLMUsage {
+		t.Fatal("standalone baseline no longer contains llm_usage; re-evaluate the shared-schema exclusion instead of letting it pass silently")
+	}
 	for name, stmts := range map[string][]string{
 		"tidb":  CoreFSTiDBSharedSchemaStatements(),
 		"mysql": CoreFSMySQLSharedSchemaStatements(),

@@ -1648,37 +1648,52 @@ func tenantPoolCreateDatabaseLockKey(cred tenant.CredentialProvisionRequest) str
 	return "create:" + key
 }
 
-func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) (*provisionTenantResult, *meta.TenantPool, bool, error) {
+// claimAdminTenantFromPool tries to hand out a pre-warmed tenant from the
+// caller org's tenant pool. sharedPoolMatched reports that the org has a
+// registered shared-schema pool instead — callers decide what that means
+// (admin create fails closed; the owner provision path falls through to
+// provisionTenant, which routes the tenant onto the shared pool).
+func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) (*provisionTenantResult, *meta.TenantPool, bool, bool, error) {
 	claimStarted := time.Now()
 	manager, ok := s.provisioner.(tenant.TenantPoolClusterManager)
 	if !ok {
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_skipped", "provider", tenant.ProviderTiDBCloudNative, "reason", "pool_manager_unavailable", "duration_ms", durationMillis(claimStarted))...)
-		return nil, nil, false, nil
+		return nil, nil, false, false, nil
 	}
 	if _, ok := s.provisioner.(tenant.ManagedClusterLister); !ok {
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_skipped", "provider", tenant.ProviderTiDBCloudNative, "reason", "managed_cluster_lister_unavailable", "duration_ms", durationMillis(claimStarted))...)
-		return nil, nil, false, nil
+		return nil, nil, false, false, nil
 	}
 	stageStarted := time.Now()
 	orgID, err := s.firstManagedOrganization(ctx, cred)
 	if err != nil || orgID == "" {
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_org_lookup_done", "provider", tenant.ProviderTiDBCloudNative, "organization_id", orgID, "duration_ms", durationMillis(stageStarted), "has_error", err != nil)...)
-		return nil, nil, false, err
+		return nil, nil, false, false, err
 	}
 	logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_org_lookup_done", "provider", tenant.ProviderTiDBCloudNative, "organization_id", orgID, "duration_ms", durationMillis(stageStarted))...)
+	// An org with a registered shared-schema pool places new tenants on it;
+	// the warm pool (pre-provisioned dedicated clusters) must not hand out a
+	// different tenant shape. Fall through to provisionTenant, which routes
+	// the tenant onto the shared pool.
+	if sharedDB, sharedErr := s.meta.FindSharedDBForOrg(ctx, orgID); sharedErr == nil && sharedDB != nil {
+		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_skipped", "provider", tenant.ProviderTiDBCloudNative, "organization_id", orgID, "reason", "shared_pool_registered", "duration_ms", durationMillis(claimStarted))...)
+		return nil, nil, false, true, nil
+	} else if sharedErr != nil && !errors.Is(sharedErr, meta.ErrNotFound) {
+		return nil, nil, false, false, sharedErr
+	}
 	stageStarted = time.Now()
 	pool, err := s.meta.GetTenantPoolByOrganization(ctx, orgID)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_pool_lookup_missed", "provider", tenant.ProviderTiDBCloudNative, "organization_id", orgID, "duration_ms", durationMillis(stageStarted))...)
-			return nil, nil, false, nil
+			return nil, nil, false, false, nil
 		}
-		return nil, nil, false, err
+		return nil, nil, false, false, err
 	}
 	logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_pool_lookup_done", "provider", tenant.ProviderTiDBCloudNative, "pool_id", pool.PoolID, "organization_id", orgID, "pool_size", pool.Size, "pool_status", pool.Status, "duration_ms", durationMillis(stageStarted))...)
 	if pool.Status != meta.TenantPoolActive {
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_skipped", "provider", tenant.ProviderTiDBCloudNative, "pool_id", pool.PoolID, "organization_id", orgID, "reason", "pool_inactive", "pool_status", pool.Status, "duration_ms", durationMillis(claimStarted))...)
-		return nil, nil, false, nil
+		return nil, nil, false, false, nil
 	}
 	defer s.refreshTenantPoolCapacity(ctx, pool)
 	s.resumePendingTenantPoolAsync(ctx, pool, cred)
@@ -1687,9 +1702,9 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_free_tenant_missed", "provider", tenant.ProviderTiDBCloudNative, "pool_id", pool.PoolID, "organization_id", orgID, "duration_ms", durationMillis(stageStarted))...)
-			return nil, pool, false, nil
+			return nil, pool, false, false, nil
 		}
-		return nil, nil, false, err
+		return nil, nil, false, false, err
 	}
 	logProvisionStage(ctx, "admin_tenant_pool_claim_free_tenant_claimed", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID, "cluster_id", row.Binding.ClusterID, "status", row.Tenant.Status)
 	usedAt := time.Now().UTC()
@@ -1702,7 +1717,7 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 	cloudCfg, err := manager.MarkClusterPoolUsed(ctx, cluster, cred, usedAt, opts)
 	if err != nil {
 		s.releaseClaimedPoolTenant(ctx, manager, cluster, cred, row.Tenant.ID, "mark_used_error")
-		return nil, nil, false, err
+		return nil, nil, false, false, err
 	}
 	logProvisionStage(ctx, "admin_tenant_pool_claim_cluster_marked_used", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID, "cluster_id", cluster.ClusterID, "quota_requested", quotaOpt != nil)
 	success := false
@@ -1718,7 +1733,7 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 	if quotaOpt != nil {
 		qp, err := quotaConfigPatchFromRequest(*quotaOpt)
 		if err != nil {
-			return nil, nil, false, err
+			return nil, nil, false, false, err
 		}
 		if qp.MaxStorageBytes != nil {
 			quotaSeed.MaxStorageBytes = qp.MaxStorageBytes
@@ -1738,19 +1753,19 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		quotaSeed.TiDBCloudSpendingLimitCheckedAt = &checkedAt
 	}
 	if err := s.meta.SetQuotaConfigPatch(ctx, row.Tenant.ID, quotaSeed); err != nil {
-		return nil, nil, false, err
+		return nil, nil, false, false, err
 	}
 	logProvisionStage(ctx, "admin_tenant_pool_claim_quota_seeded", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID, "create_time_spending_limit", cloudCfg != nil && cloudCfg.TiDBCloudSpendingLimitMonthly != nil)
 	stageStarted = time.Now()
 	plainPass, err := s.pool.Decrypt(ctx, row.Tenant.DBPasswordCipher)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, false, false, err
 	}
 	logProvisionStage(ctx, "admin_tenant_pool_claim_db_password_decrypted", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID)
 	stageStarted = time.Now()
 	apiToken, apiKeyID, err := s.issueOwnerAPIKey(ctx, row.Tenant.ID, "default", 1, apiKeyIssueSource{})
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, false, false, err
 	}
 	logProvisionStage(ctx, "admin_tenant_pool_claim_api_key_issued", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID, "api_key_id", apiKeyID)
 	cloudProvider, region := provisioningCloudRegion(s.provisioner)
@@ -1766,7 +1781,7 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		CloudProvider:  cloudProvider,
 		Region:         region,
 		OrganizationID: row.Binding.OrganizationID,
-	}, pool, true, nil
+	}, pool, true, false, nil
 }
 
 func (s *Server) releaseClaimedPoolTenant(ctx context.Context, manager tenant.TenantPoolClusterManager, cluster *tenant.ClusterInfo, cred tenant.CredentialProvisionRequest, tenantID, reason string) {

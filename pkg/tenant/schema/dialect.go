@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"context"
-	"database/sql"
 	"regexp"
 	"strings"
 )
@@ -42,21 +40,4 @@ var tidbVectorColumnType = regexp.MustCompile(`(?i)VECTOR\(\d+\)`)
 
 func stripTiDBVectorColumnType(stmt string) string {
 	return tidbVectorColumnType.ReplaceAllString(stmt, "LONGTEXT")
-}
-
-// JournalMySQLSharedSchemaStatements is the plain-MySQL variant of
-// JournalTiDBSharedSchemaStatements, derived by removing TiDB-only keywords.
-// Use it for local development databases and MySQL-backed tests/e2e.
-func JournalMySQLSharedSchemaStatements() []string {
-	return mysqlCompatibleSharedStatements(JournalTiDBSharedSchemaStatements())
-}
-
-// JournalSharedSchemaStatementsForDB selects the shared journal DDL matching
-// the connected database's dialect: TiDB clusters get the CLUSTERED variant,
-// anything else (plain MySQL, e.g. local e2e) the compatible variant.
-func JournalSharedSchemaStatementsForDB(ctx context.Context, db *sql.DB) []string {
-	if IsTiDBCluster(ctx, db) {
-		return JournalTiDBSharedSchemaStatements()
-	}
-	return JournalMySQLSharedSchemaStatements()
 }

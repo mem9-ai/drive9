@@ -335,10 +335,21 @@ func schemaStatementSnippet(stmt string) string {
 	return schemaspec.SQLSnippet(stmt)
 }
 
+// IsTiDBCluster reports whether the connected database is TiDB. Detection
+// errors fail open to false; schema-shape selection must use IsTiDBClusterE
+// instead, where silently choosing the MySQL variant would apply the wrong
+// DDL to a TiDB cluster.
 func IsTiDBCluster(ctx context.Context, db *sql.DB) bool {
+	ok, _ := IsTiDBClusterE(ctx, db)
+	return ok
+}
+
+// IsTiDBClusterE reports whether the connected database is TiDB, returning
+// detection errors to the caller.
+func IsTiDBClusterE(ctx context.Context, db *sql.DB) (bool, error) {
 	var ver string
 	if err := db.QueryRowContext(ctx, `SELECT VERSION()`).Scan(&ver); err != nil {
-		return false
+		return false, fmt.Errorf("detect database dialect: %w", err)
 	}
-	return strings.Contains(strings.ToLower(ver), "tidb")
+	return strings.Contains(strings.ToLower(ver), "tidb"), nil
 }

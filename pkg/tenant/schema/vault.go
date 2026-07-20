@@ -99,14 +99,14 @@ func VaultTiDBSchemaStatements() []string {
 // except the tenant_id VARCHAR(64) discriminator column is replaced by
 // fs_id BIGINT in every table, unique key, and index, and vault_secret_fields
 // — which has no tenant column in the standalone shape — gains fs_id BIGINT
-// as its first column. The composite primary key of vault_secret_fields is
-// declared CLUSTERED: TiDB creates composite primary keys NONCLUSTERED by
-// default, and the shared shape relies on clustered keys to physically
-// co-locate one tenant's rows. vault_deks keeps its single-column integer
-// primary key, which TiDB clusters by default, so it needs no keyword. For
-// plain MySQL use VaultMySQLSharedSchemaStatements (same shape without the
-// keyword). Keep both in lockstep with VaultTiDBSchemaStatements — the drift
-// test in vault_shared_test.go enforces parity.
+// as its first column. Every table's primary key leads with fs_id and is
+// declared CLUSTERED, physically co-locating one tenant's rows like the
+// other shared table groups do; composite keys need the keyword because TiDB
+// creates composite primary keys NONCLUSTERED by default (vault_deks keeps
+// its single-column integer primary key, which TiDB clusters by default).
+// For plain MySQL use VaultMySQLSharedSchemaStatements (same shape without
+// the keyword). Keep both in lockstep with VaultTiDBSchemaStatements — the
+// drift test in vault_shared_test.go enforces parity.
 func VaultTiDBSharedSchemaStatements() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS vault_deks (
@@ -116,7 +116,7 @@ func VaultTiDBSharedSchemaStatements() []string {
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_secrets (
-			secret_id    VARCHAR(64) PRIMARY KEY,
+			secret_id    VARCHAR(64) NOT NULL,
 			fs_id        BIGINT NOT NULL,
 			name         VARCHAR(255) NOT NULL,
 			secret_type  VARCHAR(32) NOT NULL DEFAULT 'generic',
@@ -125,8 +125,8 @@ func VaultTiDBSharedSchemaStatements() []string {
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			deleted_at   DATETIME(3),
-			UNIQUE INDEX uk_vault_secrets_tenant_name (fs_id, name),
-			INDEX idx_vault_secrets_tenant (fs_id)
+			PRIMARY KEY (fs_id, secret_id) CLUSTERED,
+			UNIQUE INDEX uk_vault_secrets_tenant_name (fs_id, name)
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_secret_fields (
@@ -139,7 +139,7 @@ func VaultTiDBSharedSchemaStatements() []string {
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_tokens (
-			token_id      VARCHAR(64) PRIMARY KEY,
+			token_id      VARCHAR(64) NOT NULL,
 			fs_id         BIGINT NOT NULL,
 			agent_id      VARCHAR(255) NOT NULL,
 			task_id       VARCHAR(255),
@@ -149,12 +149,12 @@ func VaultTiDBSharedSchemaStatements() []string {
 			revoked_at    DATETIME(3),
 			revoked_by    VARCHAR(255),
 			revoke_reason VARCHAR(255),
-			INDEX idx_vault_token_tenant (fs_id),
+			PRIMARY KEY (fs_id, token_id) CLUSTERED,
 			INDEX idx_vault_token_agent (agent_id)
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_grants (
-			grant_id       VARCHAR(64) PRIMARY KEY,
+			grant_id       VARCHAR(64) NOT NULL,
 			fs_id          BIGINT NOT NULL,
 			issuer         VARCHAR(256) NOT NULL,
 			principal_type VARCHAR(16) NOT NULL,
@@ -167,20 +167,21 @@ func VaultTiDBSharedSchemaStatements() []string {
 			revoked_at     DATETIME(3),
 			revoked_by     VARCHAR(128),
 			revoke_reason  VARCHAR(256),
-			INDEX idx_vault_grants_tenant (fs_id),
+			PRIMARY KEY (fs_id, grant_id) CLUSTERED,
 			INDEX idx_vault_grants_expires (expires_at)
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_policies (
-			policy_id   VARCHAR(64) PRIMARY KEY,
+			policy_id   VARCHAR(64) NOT NULL,
 			fs_id       BIGINT NOT NULL,
 			name        VARCHAR(255) NOT NULL,
 			rules_json  JSON NOT NULL,
-			created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+			created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (fs_id, policy_id) CLUSTERED
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_audit_log (
-			event_id     VARCHAR(64) PRIMARY KEY,
+			event_id     VARCHAR(64) NOT NULL,
 			fs_id        BIGINT NOT NULL,
 			event_type   VARCHAR(32) NOT NULL,
 			token_id     VARCHAR(64),
@@ -191,6 +192,7 @@ func VaultTiDBSharedSchemaStatements() []string {
 			adapter      VARCHAR(16),
 			detail_json  JSON,
 			timestamp    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (fs_id, event_id) CLUSTERED,
 			INDEX idx_vault_audit_tenant_time (fs_id, timestamp),
 			INDEX idx_vault_audit_secret (secret_name, timestamp)
 		)`,

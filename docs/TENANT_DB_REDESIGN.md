@@ -128,6 +128,8 @@ CREATE TABLE fs_registry (
 
 Existing data handling: the existing `tenant_id VARCHAR(64)` columns in journal/vault tables are uniformly replaced by `fs_id BIGINT` in the shared schema; backfill converts via `fs_registry`. Application-layer interface signatures are unchanged.
 
+**Persisted provider for shared tenants**: a tenant placed on a shared DB is persisted with provider `tidb_cloud_native_shared` (a first-class provider in `pkg/tenant/provider.go`), not the request's original provider. This gives every lifecycle surface a durable, placement-row-independent routing signal: capability helpers classify it as TiDB-backed but with **no database auto-embedding** (shared tables have no generated columns) and **no per-tenant cluster to delete or fork** (`SupportsClusterDelete` = false). The admin tenant API is cluster-centric and explicitly rejects shared tenants (409); shared tenants are managed through the owner API. Placement lookup errors fail closed everywhere — a meta read failure never silently falls back to dedicated-cluster provisioning.
+
 ### 4.2 Layered architecture overview
 
 ```mermaid

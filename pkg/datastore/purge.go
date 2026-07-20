@@ -2,7 +2,6 @@ package datastore
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 )
 
@@ -47,14 +46,6 @@ var sharedPurgeTables = []string{
 	"inodes",
 }
 
-// NewStoreWithDB wraps an externally owned *sql.DB (e.g. a shared-pool handle
-// serving many tenants) with the given scope. Close is a no-op — the owner
-// controls the handle's lifetime. No legacy-files detection runs: shared
-// schema databases never carry the legacy files table.
-func NewStoreWithDB(db *sql.DB, scope Scope) *Store {
-	return &Store{db: db, scope: scope, externalDB: true}
-}
-
 // PurgeTenantData deletes all rows belonging to this store's tenant (fs_id)
 // from every shared-schema table, in bounded batches. It is only valid on
 // shared-scope stores; on a standalone store it returns an error because the
@@ -79,7 +70,10 @@ func (s *Store) PurgeTenantData(ctx context.Context) error {
 				return fmt.Errorf("purge table %s: %w", tbl, err)
 			}
 			n, err := res.RowsAffected()
-			if err != nil || n == 0 {
+			if err != nil {
+				return fmt.Errorf("purge table %s rows affected: %w", tbl, err)
+			}
+			if n == 0 {
 				break
 			}
 		}

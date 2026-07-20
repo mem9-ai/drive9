@@ -513,11 +513,10 @@ func (s *Store) selectJournalTx(ctx context.Context, tx *sql.Tx, tenantID, journ
 		query += " FOR UPDATE"
 	}
 	row := tx.QueryRowContext(ctx, query, s.tenantArg(tenantID), journalID)
-	j, createHash, err := scanJournal(row)
+	j, createHash, err := scanJournal(row, tenantID)
 	if err != nil {
 		return nil, "", err
 	}
-	j.TenantID = tenantID
 	labels, err := s.selectJournalLabelsTx(ctx, tx, tenantID, journalID)
 	if err != nil {
 		return nil, "", err
@@ -561,13 +560,19 @@ func (s *Store) journalExists(ctx context.Context, tenantID, journalID string) (
 	return true, nil
 }
 
-func scanJournal(row interface{ Scan(dest ...any) error }) (*journal.Journal, string, error) {
+// scanJournal scans one journals row. The leading column is the tenant
+// discriminator (tenant_id in standalone shape, fs_id in shared shape); it is
+// discarded and tenantID — the authoritative identity the caller resolved —
+// is stamped onto the result instead, so a shared-shape numeric fs_id can
+// never leak into Journal.TenantID.
+func scanJournal(row interface{ Scan(dest ...any) error }, tenantID string) (*journal.Journal, string, error) {
 	var j journal.Journal
 	var title, actorType, actorID, source sql.NullString
 	var metaRaw, retentionRaw []byte
 	var closedAt sql.NullTime
 	var createHash string
-	if err := row.Scan(&j.TenantID, &j.JournalID, &j.Kind, &title, &actorType, &actorID, &source,
+	var tenantDiscriminator any
+	if err := row.Scan(&tenantDiscriminator, &j.JournalID, &j.Kind, &title, &actorType, &actorID, &source,
 		&metaRaw, &retentionRaw, &j.NextSeq, &j.GenesisHash, &j.HeadHash, &j.CreatedAt,
 		&j.UpdatedAt, &closedAt, &createHash); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -575,6 +580,7 @@ func scanJournal(row interface{ Scan(dest ...any) error }) (*journal.Journal, st
 		}
 		return nil, "", err
 	}
+	j.TenantID = tenantID
 	j.Title = title.String
 	j.Actor = journal.Actor{Type: actorType.String, ID: actorID.String}
 	j.Source = source.String

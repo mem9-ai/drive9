@@ -198,6 +198,14 @@ func (s *Store) Close() error {
 }
 func (s *Store) DB() *sql.DB  { return s.db }
 
+// NewStoreWithDB wraps an externally owned *sql.DB (e.g. a shared-pool handle
+// serving many tenants) with the given scope. Close is a no-op — the owner
+// controls the handle's lifetime. No legacy-files detection runs: shared
+// schema databases never carry the legacy files table.
+func NewStoreWithDB(db *sql.DB, scope Scope) *Store {
+	return &Store{db: db, scope: scope, externalDB: true}
+}
+
 // Scope returns the schema-shape scope fixed at construction.
 func (s *Store) Scope() Scope { return s.scope }
 
@@ -994,8 +1002,8 @@ func (s *Store) HasConfirmedS3StorageRef(ctx context.Context, storageRefHash, st
 	}
 	row := s.db.QueryRowContext(ctx, `SELECT 1
 		FROM contents c JOIN inodes i ON i.inode_id = c.inode_id
-		WHERE `+s.scope.AndAs("c", `c.storage_type = ? AND i.status = ? AND c.storage_ref_hash = ? AND c.storage_ref = ?`)+`
-		LIMIT 1`, s.scope.Args(StorageS3, StatusConfirmed, storageRefHash, storageRef)...)
+		WHERE `+scopeWhereAnd(s.scope, `c.storage_type = ? AND i.status = ? AND c.storage_ref_hash = ? AND c.storage_ref = ?`, "c", "i")+`
+		LIMIT 1`, scopeWhereArgs(s.scope, 2, StorageS3, StatusConfirmed, storageRefHash, storageRef)...)
 	var one int
 	if err := row.Scan(&one); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1118,15 +1126,15 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 		}
 		if expectedRevision > 0 {
 			if _, err := db.Exec(`UPDATE semantic SET content_text = ?
-				WHERE `+s.scope.And(`inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`),
-				append([]any{nullStr(contentText)}, s.scope.Args(fileID, fileID, expectedRevision)...)...); err != nil {
+				WHERE `+s.scope.And(`inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE `+s.scope.And(`inode_id = ? AND status = 'CONFIRMED' AND revision = ?`)+`)`),
+				append([]any{nullStr(contentText)}, append(s.scope.Args(fileID), s.scope.Args(fileID, expectedRevision)...)...)...); err != nil {
 				return nil, fmt.Errorf("update semantic content_text: %w", err)
 			}
 			return res, nil
 		}
 		if _, err := db.Exec(`UPDATE semantic SET content_text = ?
-			WHERE `+s.scope.And(`inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED')`),
-			append([]any{nullStr(contentText)}, s.scope.Args(fileID, fileID)...)...); err != nil {
+			WHERE `+s.scope.And(`inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE `+s.scope.And(`inode_id = ? AND status = 'CONFIRMED'`)+`)`),
+			append([]any{nullStr(contentText)}, append(s.scope.Args(fileID), s.scope.Args(fileID)...)...)...); err != nil {
 			return nil, fmt.Errorf("update semantic content_text: %w", err)
 		}
 		return res, nil
@@ -1134,12 +1142,12 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 	// New tenant without legacy files: write directly to semantic.
 	if expectedRevision > 0 {
 		return db.Exec(`UPDATE semantic SET content_text = ?
-			WHERE `+s.scope.And(`inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`),
-			append([]any{nullStr(contentText)}, s.scope.Args(fileID, fileID, expectedRevision)...)...)
+			WHERE `+s.scope.And(`inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE `+s.scope.And(`inode_id = ? AND status = 'CONFIRMED' AND revision = ?`)+`)`),
+			append([]any{nullStr(contentText)}, append(s.scope.Args(fileID), s.scope.Args(fileID, expectedRevision)...)...)...)
 	}
 	return db.Exec(`UPDATE semantic SET content_text = ?
-		WHERE `+s.scope.And(`inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED')`),
-		append([]any{nullStr(contentText)}, s.scope.Args(fileID, fileID)...)...)
+		WHERE `+s.scope.And(`inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE `+s.scope.And(`inode_id = ? AND status = 'CONFIRMED'`)+`)`),
+		append([]any{nullStr(contentText)}, append(s.scope.Args(fileID), s.scope.Args(fileID)...)...)...)
 }
 
 // ReplaceFileTagsTx replaces all tags for fileID inside an existing transaction.
@@ -1264,7 +1272,7 @@ func (s *Store) GetFileStorageMetaForUpdateTx(db execer, fileID string) (*FileSt
 	var contentType sql.NullString
 	err := db.QueryRow(`SELECT c.storage_type, c.storage_ref, i.revision, i.size_bytes, COALESCE(c.content_type, '')
 		FROM inodes i JOIN contents c ON i.inode_id = c.inode_id
-		WHERE `+s.scope.AndAs("i", `i.inode_id = ? AND i.status = 'CONFIRMED'`)+` FOR UPDATE`, s.scope.Args(fileID)...).Scan(
+		WHERE `+scopeWhereAnd(s.scope, `i.inode_id = ? AND i.status = 'CONFIRMED'`, "i", "c")+` FOR UPDATE`, scopeWhereArgs(s.scope, 2, fileID)...).Scan(
 		&m.StorageType, &m.StorageRef, &m.Revision, &m.SizeBytes, &contentType)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1488,7 +1496,7 @@ func (s *Store) ConfirmedStorageBytesTx(db execer) (int64, error) {
 // are not enqueued.
 func (s *Store) ConfirmedMediaFileCountTx(db execer) (int64, error) {
 	var count sql.NullInt64
-	if err := db.QueryRow(`SELECT COUNT(*) FROM inodes i JOIN contents c ON i.inode_id = c.inode_id WHERE `+s.scope.AndAs("i", `i.status = 'CONFIRMED' AND (c.content_type LIKE 'image/%' OR c.content_type LIKE 'audio/%')`), s.scope.Args()...).Scan(&count); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM inodes i JOIN contents c ON i.inode_id = c.inode_id WHERE `+scopeWhereAnd(s.scope, `i.status = 'CONFIRMED' AND (c.content_type LIKE 'image/%' OR c.content_type LIKE 'audio/%')`, "i", "c"), scopeWhereArgs(s.scope, 2)...).Scan(&count); err != nil {
 		return 0, err
 	}
 	return count.Int64, nil
@@ -1505,7 +1513,10 @@ func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {
 	// In shared shape the fs_id predicate on the uploads driving alias is not
 	// enough: target paths are not globally unique, so the file_nodes join must
 	// also carry fs_id in its ON clause or one tenant's upload could join
-	// another tenant's dentry at the same path and misread its size.
+	// another tenant's dentry at the same path and misread its size. The
+	// inodes join needs the same guard: inode ids are unique only within a
+	// tenant in shared shape, so an unscoped join could read another tenant's
+	// confirmed size and understate this tenant's reservation.
 	err := db.QueryRow(`SELECT COALESCE(SUM(
 		CASE
 			WHEN u.total_size > COALESCE(i.size_bytes, 0) THEN u.total_size - COALESCE(i.size_bytes, 0)
@@ -1514,9 +1525,9 @@ func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {
 	), 0)
 		FROM uploads u
 		LEFT JOIN file_nodes fn ON `+s.scope.AndAs("fn", `fn.path_hash = u.target_path_hash AND fn.path = u.target_path`)+`
-		LEFT JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id) AND i.status = 'CONFIRMED'
+		LEFT JOIN inodes i ON `+s.scope.AndOn(`i.inode_id = COALESCE(fn.inode_id, fn.file_id) AND i.status = 'CONFIRMED'`, "i")+`
 		WHERE `+s.scope.AndAs("u", `u.status IN ('INITIATED', 'UPLOADING') AND u.expires_at > ?`),
-		append(s.scope.Args(), s.scope.Args(time.Now().UTC())...)...).Scan(&total)
+		append(append(s.scope.Args(), s.scope.Args()...), s.scope.Args(time.Now().UTC())...)...).Scan(&total)
 	if err != nil {
 		return 0, err
 	}
@@ -1530,8 +1541,8 @@ func (s *Store) ConfirmedFileSizeByPathTx(db execer, path string) (int64, error)
 	err := db.QueryRow(`SELECT i.size_bytes
 		FROM file_nodes fn
 		JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id)
-		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ? AND fn.is_directory = 0 AND i.status = 'CONFIRMED'`)+`
-		LIMIT 1`, s.scope.Args(fileNodePathHash(path), path)...).Scan(&size)
+		WHERE `+scopeWhereAnd(s.scope, `fn.path_hash = ? AND fn.path = ? AND fn.is_directory = 0 AND i.status = 'CONFIRMED'`, "fn", "i")+`
+		LIMIT 1`, scopeWhereArgs(s.scope, 2, fileNodePathHash(path), path)...).Scan(&size)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -1561,14 +1572,14 @@ func (s *Store) ListConfirmedFileSummaries(ctx context.Context, cursor string, l
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT i.inode_id, i.size_bytes, COALESCE(c.content_type, '')
 			 FROM inodes i JOIN contents c ON i.inode_id = c.inode_id
-			 WHERE `+s.scope.AndAs("i", `i.status = 'CONFIRMED'`)+`
-			 ORDER BY i.inode_id ASC LIMIT ?`, s.scope.Args(limit)...)
+			 WHERE `+scopeWhereAnd(s.scope, `i.status = 'CONFIRMED'`, "i", "c")+`
+			 ORDER BY i.inode_id ASC LIMIT ?`, scopeWhereArgs(s.scope, 2, limit)...)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT i.inode_id, i.size_bytes, COALESCE(c.content_type, '')
 			 FROM inodes i JOIN contents c ON i.inode_id = c.inode_id
-			 WHERE `+s.scope.AndAs("i", `i.status = 'CONFIRMED' AND i.inode_id > ?`)+`
-			 ORDER BY i.inode_id ASC LIMIT ?`, s.scope.Args(cursor, limit)...)
+			 WHERE `+scopeWhereAnd(s.scope, `i.status = 'CONFIRMED' AND i.inode_id > ?`, "i", "c")+`
+			 ORDER BY i.inode_id ASC LIMIT ?`, scopeWhereArgs(s.scope, 2, cursor, limit)...)
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("query confirmed files: %w", err)
@@ -1608,14 +1619,14 @@ func (s *Store) ListConfirmedS3Refs(ctx context.Context, cursor string, limit in
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT c.storage_ref, c.storage_ref_hash
 			 FROM contents c JOIN inodes i ON i.inode_id = c.inode_id
-			 WHERE `+s.scope.AndAs("i", `i.status = 'CONFIRMED' AND c.storage_type = 's3' AND c.storage_ref <> ''`)+`
-			 ORDER BY c.storage_ref ASC LIMIT ?`, s.scope.Args(limit)...)
+			 WHERE `+scopeWhereAnd(s.scope, `i.status = 'CONFIRMED' AND c.storage_type = 's3' AND c.storage_ref <> ''`, "c", "i")+`
+			 ORDER BY c.storage_ref ASC LIMIT ?`, scopeWhereArgs(s.scope, 2, limit)...)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT c.storage_ref, c.storage_ref_hash
 			 FROM contents c JOIN inodes i ON i.inode_id = c.inode_id
-			 WHERE `+s.scope.AndAs("i", `i.status = 'CONFIRMED' AND c.storage_type = 's3' AND c.storage_ref <> '' AND c.storage_ref > ?`)+`
-			 ORDER BY c.storage_ref ASC LIMIT ?`, s.scope.Args(cursor, limit)...)
+			 WHERE `+scopeWhereAnd(s.scope, `i.status = 'CONFIRMED' AND c.storage_type = 's3' AND c.storage_ref <> '' AND c.storage_ref > ?`, "c", "i")+`
+			 ORDER BY c.storage_ref ASC LIMIT ?`, scopeWhereArgs(s.scope, 2, cursor, limit)...)
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("query confirmed s3 refs: %w", err)
@@ -1660,11 +1671,11 @@ func (s *Store) HasActiveUploads(ctx context.Context) (bool, error) {
 
 func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
 	return s.InTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE fn FROM file_nodes fn JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id) WHERE `+s.scope.AndAs("i", `i.status <> 'CONFIRMED'`), s.scope.Args()...); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE fn FROM file_nodes fn JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id) WHERE `+scopeWhereAnd(s.scope, `i.status <> 'CONFIRMED'`, "fn", "i"), scopeWhereArgs(s.scope, 2)...); err != nil {
 			return err
 		}
 		now := time.Now().UTC()
-		if _, err := tx.ExecContext(ctx, `UPDATE contents c JOIN inodes i ON i.inode_id = c.inode_id SET c.storage_ref = '', c.storage_ref_hash = '', c.content_blob = NULL WHERE `+s.scope.AndAs("i", `i.status <> 'CONFIRMED'`), s.scope.Args()...); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE contents c JOIN inodes i ON i.inode_id = c.inode_id SET c.storage_ref = '', c.storage_ref_hash = '', c.content_blob = NULL WHERE `+scopeWhereAnd(s.scope, `i.status <> 'CONFIRMED'`, "c", "i"), scopeWhereArgs(s.scope, 2)...); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE inodes SET status = 'DELETED', expires_at = ? WHERE `+s.scope.And(`status <> 'CONFIRMED'`), append([]any{now}, s.scope.Args()...)...); err != nil {
@@ -1752,11 +1763,11 @@ func (s *Store) StatTx(ctx context.Context, db execer, path string) (out *NodeWi
 		c.checksum_sha256, i.revision, i.mode, s.embedding_revision, i.status, c.source_id, s.content_text,
 		s.description, s.description_embedding_revision, i.created_at, i.confirmed_at, i.expires_at
 		FROM file_nodes fn
-		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
-		LEFT JOIN contents c ON i.inode_id = c.inode_id
-		LEFT JOIN semantic s ON i.inode_id = s.inode_id
+		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
+		LEFT JOIN contents c ON `+s.scope.AndOn(`i.inode_id = c.inode_id`, "c")+`
+		LEFT JOIN semantic s ON `+s.scope.AndOn(`i.inode_id = s.inode_id`, "s")+`
 		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
-		LIMIT 1`, s.scope.Args(fileNodePathHash(path), path)...)
+		LIMIT 1`, scopeWhereArgs(s.scope, 3, s.scope.Args(fileNodePathHash(path), path)...)...)
 	return scanNodeWithFileWithBlob(row)
 }
 
@@ -1770,12 +1781,12 @@ func (s *Store) StatPathFallback(ctx context.Context, primaryPath, fallbackPath 
 		c.checksum_sha256, i.revision, i.mode, s.embedding_revision, i.status, c.source_id, s.content_text,
 		s.description, s.description_embedding_revision, i.created_at, i.confirmed_at, i.expires_at
 		FROM file_nodes fn
-		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
-		LEFT JOIN contents c ON i.inode_id = c.inode_id
-		LEFT JOIN semantic s ON i.inode_id = s.inode_id
+		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
+		LEFT JOIN contents c ON `+s.scope.AndOn(`i.inode_id = c.inode_id`, "c")+`
+		LEFT JOIN semantic s ON `+s.scope.AndOn(`i.inode_id = s.inode_id`, "s")+`
 		WHERE `+s.andAsGrouped("fn", `(fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)`)+`
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
-		LIMIT 1`, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)
+		LIMIT 1`, scopeWhereArgs(s.scope, 3, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)...)
 	out, err = scanNodeWithFileWithBlob(row)
 	return out, err
 }
@@ -1790,10 +1801,10 @@ func (s *Store) StatPathFallbackLite(ctx context.Context, primaryPath, fallbackP
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
 		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
 		FROM file_nodes fn
-		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
+		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
 		WHERE `+s.andAsGrouped("fn", `(fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)`)+`
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
-		LIMIT 1`, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)
+		LIMIT 1`, scopeWhereArgs(s.scope, 1, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)...)
 	out, err = scanNodeWithFileLite(row)
 	return out, err
 }
@@ -1806,9 +1817,9 @@ func (s *Store) StatLite(ctx context.Context, path string) (out *NodeWithFile, e
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
 		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
 		FROM file_nodes fn
-		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
+		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
 		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
-		LIMIT 1`, s.scope.Args(fileNodePathHash(path), path)...)
+		LIMIT 1`, scopeWhereArgs(s.scope, 1, s.scope.Args(fileNodePathHash(path), path)...)...)
 	out, err = scanNodeWithFileLite(row)
 	return out, err
 }
@@ -1824,10 +1835,10 @@ func (s *Store) StatForRead(ctx context.Context, path string) (out *NodeWithFile
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
 		i.inode_id, c.storage_type, c.storage_ref, c.content_blob, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
 		FROM file_nodes fn
-		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
-		LEFT JOIN contents c ON i.inode_id = c.inode_id
+		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
+		LEFT JOIN contents c ON `+s.scope.AndOn(`i.inode_id = c.inode_id`, "c")+`
 		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
-		LIMIT 1`, s.scope.Args(fileNodePathHash(path), path)...)
+		LIMIT 1`, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(path), path)...)...)
 	out, err = scanNodeWithFileForRead(row)
 	return out, err
 }
@@ -1840,11 +1851,11 @@ func (s *Store) StatPathFallbackForRead(ctx context.Context, primaryPath, fallba
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
 		i.inode_id, c.storage_type, c.storage_ref, c.content_blob, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
 		FROM file_nodes fn
-		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
-		LEFT JOIN contents c ON i.inode_id = c.inode_id
+		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
+		LEFT JOIN contents c ON `+s.scope.AndOn(`i.inode_id = c.inode_id`, "c")+`
 		WHERE `+s.andAsGrouped("fn", `(fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)`)+`
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
-		LIMIT 1`, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)
+		LIMIT 1`, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)...)
 	out, err = scanNodeWithFileForRead(row)
 	return out, err
 }
@@ -1859,11 +1870,11 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at,
 		s.embedding_revision
 		FROM file_nodes fn
-		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
-		LEFT JOIN semantic s ON i.inode_id = s.inode_id
+		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
+		LEFT JOIN semantic s ON `+s.scope.AndOn(`i.inode_id = s.inode_id`, "s")+`
 		WHERE ` + s.scope.AndAs("fn", `fn.parent_path_hash = ? AND fn.parent_path = ?`) + `
 		ORDER BY fn.name`
-	rows, err := s.db.QueryContext(ctx, q, s.scope.Args(fileNodePathHash(parentPath), parentPath)...)
+	rows, err := s.db.QueryContext(ctx, q, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(parentPath), parentPath)...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -2084,11 +2095,11 @@ func (s *Store) scanDeleteCandidateTx(ctx context.Context, tx *sql.Tx, path stri
 		c.storage_type, c.storage_ref, i.size_bytes, COALESCE(c.content_type, ''),
 		s.embedding_revision
 		FROM file_nodes fn
-		LEFT JOIN inodes i ON i.inode_id = fn.file_id
-		LEFT JOIN contents c ON c.inode_id = fn.file_id
-		LEFT JOIN semantic s ON s.inode_id = fn.file_id
+		LEFT JOIN inodes i ON `+s.scope.AndOn(`i.inode_id = fn.file_id`, "i")+`
+		LEFT JOIN contents c ON `+s.scope.AndOn(`c.inode_id = fn.file_id`, "c")+`
+		LEFT JOIN semantic s ON `+s.scope.AndOn(`s.inode_id = fn.file_id`, "s")+`
 		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
-		FOR UPDATE`, s.scope.Args(fileNodePathHash(path), path)...)
+		FOR UPDATE`, scopeWhereArgs(s.scope, 3, s.scope.Args(fileNodePathHash(path), path)...)...)
 	return scanSplitDeleteCandidate(row)
 }
 
@@ -2175,10 +2186,10 @@ func (s *Store) scanOrphanedFilesByIDTx(ctx context.Context, tx *sql.Tx, fileIDs
 				COALESCE(c.content_type, ''), s.embedding_revision
 				FROM inodes i
 				JOIN contents c ON c.inode_id = i.inode_id
-				LEFT JOIN semantic s ON s.inode_id = i.inode_id
-				WHERE ` + s.scope.AndAs("i", `i.inode_id IN (`+placeholders+`)
-				  AND NOT EXISTS (SELECT 1 FROM file_nodes fn WHERE fn.file_id = i.inode_id)`)
-			args = s.scope.Args(args...)
+				LEFT JOIN semantic s ON ` + s.scope.AndOn(`s.inode_id = i.inode_id`, "s") + `
+				WHERE ` + s.scope.AndAs("i", s.scope.AndAs("c", `i.inode_id IN (`+placeholders+`)
+				  AND NOT EXISTS (SELECT 1 FROM file_nodes fn WHERE `+s.scope.AndAs("fn", `fn.file_id = i.inode_id`)+`)`))
+			args = append(scopeWhereArgs(s.scope, 2, s.scope.Args(args...)...), s.scope.Args()...)
 		}
 		rows, err := tx.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -2751,8 +2762,8 @@ func (s *Store) scanFileForGCTx(db execer, fileID string) (*File, error) {
 		s.embedding_revision
 		FROM inodes i
 		JOIN contents c ON i.inode_id = c.inode_id
-		LEFT JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE `+s.scope.AndAs("i", `i.inode_id = ?`), s.scope.Args(fileID)...).Scan(
+		LEFT JOIN semantic s ON `+s.scope.AndOn(`i.inode_id = s.inode_id`, "s")+`
+		WHERE `+scopeWhereAnd(s.scope, `i.inode_id = ?`, "i", "c"), scopeWhereArgs(s.scope, 3, fileID)...).Scan(
 		&f.StorageType, &f.StorageRef, &f.SizeBytes, &contentType, &embRev)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

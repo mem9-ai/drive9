@@ -115,7 +115,10 @@ func TestSharedMySQLSchemaStatementsDialect(t *testing.T) {
 func TestSharedSchemaStatementsForDBSelectsMySQL(t *testing.T) {
 	db := testmysql.OpenDB(t, testDSN)
 
-	got := SharedSchemaStatementsForDB(context.Background(), db)
+	got, err := SharedSchemaStatementsForDB(context.Background(), db)
+	if err != nil {
+		t.Fatalf("SharedSchemaStatementsForDB: %v", err)
+	}
 	want := SharedMySQLSchemaStatements()
 	if len(got) != len(want) {
 		t.Fatalf("ForDB returned %d statements, want %d", len(got), len(want))

@@ -15,7 +15,7 @@ func registerTestSharedDB(t *testing.T, s *Store, orgID, host, name string) int6
 		User:           "root",
 		PasswordCipher: []byte("cipher-" + name),
 		Name:           name,
-		TLS:            true,
+		TLSMode:        "skip-verify",
 		MaxTenants:     100,
 	})
 	if err != nil {
@@ -61,8 +61,8 @@ func TestRegisterSharedDBRoundTrip(t *testing.T) {
 	if got.Name != "shared_db_a" {
 		t.Fatalf("Name = %q, want shared_db_a", got.Name)
 	}
-	if !got.TLS {
-		t.Fatal("TLS = false, want true")
+	if got.TLSMode != "skip-verify" {
+		t.Fatalf("TLSMode = %q, want skip-verify", got.TLSMode)
 	}
 	if got.MaxTenants != 100 {
 		t.Fatalf("MaxTenants = %d, want 100", got.MaxTenants)
@@ -95,7 +95,7 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 		User:           "app",
 		PasswordCipher: []byte("rotated-cipher"),
 		Name:           "shared_db_a",
-		TLS:            false,
+		TLSMode:        "true",
 		MaxTenants:     200,
 	})
 	if err != nil {
@@ -110,7 +110,7 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 		t.Fatalf("GetSharedDB: %v", err)
 	}
 	if got.Port != 5000 || got.User != "app" || string(got.PasswordCipher) != "rotated-cipher" ||
-		got.MaxTenants != 200 || got.TLS {
+		got.MaxTenants != 200 || got.TLSMode != "true" {
 		t.Fatalf("upsert did not refresh connection fields: %+v", got)
 	}
 	if got.TenantCount != 3 {
@@ -349,6 +349,7 @@ func TestTenantPlacementValidation(t *testing.T) {
 		"non-positive db_id":   func(p *TenantPlacement) { p.DbID = 0 },
 		"unknown placement":    func(p *TenantPlacement) { p.Placement = "bogus" },
 		"unknown schema shape": func(p *TenantPlacement) { p.SchemaShape = "bogus" },
+		"unknown status":       func(p *TenantPlacement) { p.Status = "bogus" },
 	}
 	for name, mutate := range cases {
 		p := valid()
@@ -356,6 +357,54 @@ func TestTenantPlacementValidation(t *testing.T) {
 		if err := s.UpsertTenantPlacement(ctx, p); err == nil {
 			t.Fatalf("%s: expected error, got nil", name)
 		}
+	}
+}
+
+func TestFindSharedDBForOrgSkipsFullPools(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	// The exact-org pool is capped at 1 tenant; once full, selection must
+	// fall through to the wildcard pool rather than overfill it.
+	fullID := registerTestSharedDB(t, s, "org-capped", "shared-capped.example.com", "shared_db_capped")
+	if _, err := s.RegisterSharedDB(ctx, &SharedDB{
+		OrgID:          "org-capped",
+		Host:           "shared-capped.example.com",
+		Port:           4000,
+		User:           "root",
+		PasswordCipher: []byte("cipher"),
+		Name:           "shared_db_capped",
+		MaxTenants:     1,
+	}); err != nil {
+		t.Fatalf("cap pool at 1: %v", err)
+	}
+	wildID := registerTestSharedDB(t, s, SharedDBOrgWildcard, "shared-wild.example.com", "shared_db_wild")
+
+	got, err := s.FindSharedDBForOrg(ctx, "org-capped")
+	if err != nil {
+		t.Fatalf("FindSharedDBForOrg before full: %v", err)
+	}
+	if got.DbID != fullID {
+		t.Fatalf("before full db_id = %d, want exact pool %d", got.DbID, fullID)
+	}
+
+	if err := s.IncrSharedDBTenantCount(ctx, fullID, 1); err != nil {
+		t.Fatalf("fill pool: %v", err)
+	}
+	got, err = s.FindSharedDBForOrg(ctx, "org-capped")
+	if err != nil {
+		t.Fatalf("FindSharedDBForOrg after full: %v", err)
+	}
+	if got.DbID != wildID {
+		t.Fatalf("after full db_id = %d, want wildcard %d", got.DbID, wildID)
+	}
+
+	// With no wildcard fallback, a full pool reads as not found.
+	if _, err := s.db.Exec(`DELETE FROM db_pool WHERE db_id = ?`, wildID); err != nil {
+		t.Fatalf("remove wildcard: %v", err)
+	}
+	if _, err := s.FindSharedDBForOrg(ctx, "org-capped"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("full pool without fallback error = %v, want ErrNotFound", err)
 	}
 }
 

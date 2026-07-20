@@ -37,12 +37,19 @@ func SharedMySQLSchemaStatements() []string {
 
 // SharedSchemaStatementsForDB selects the shared schema DDL matching the
 // connected database's dialect: TiDB clusters get the CLUSTERED variant,
-// anything else (plain MySQL, e.g. local e2e) the compatible variant.
-func SharedSchemaStatementsForDB(ctx context.Context, db *sql.DB) []string {
-	if IsTiDBCluster(ctx, db) {
-		return SharedTiDBSchemaStatements()
+// anything else (plain MySQL, e.g. local e2e) the compatible variant. A
+// dialect-detection failure is an error, never a silent MySQL fallback —
+// applying the non-CLUSTERED variant to a TiDB cluster would lose row
+// co-location without any visible failure.
+func SharedSchemaStatementsForDB(ctx context.Context, db *sql.DB) ([]string, error) {
+	isTiDB, err := IsTiDBClusterE(ctx, db)
+	if err != nil {
+		return nil, err
 	}
-	return SharedMySQLSchemaStatements()
+	if isTiDB {
+		return SharedTiDBSchemaStatements(), nil
+	}
+	return SharedMySQLSchemaStatements(), nil
 }
 
 // InitSharedSchema initializes the shared (multi-tenant) schema on the
@@ -58,7 +65,11 @@ func InitSharedSchema(ctx context.Context, dsn string) error {
 		return err
 	}
 	defer func() { _ = closeTiDBSchemaDB(db) }()
-	if err := ExecSchemaStatementsParallelByTableContext(ctx, db, SharedSchemaStatementsForDB(ctx, db)); err != nil {
+	stmts, err := SharedSchemaStatementsForDB(ctx, db)
+	if err != nil {
+		return err
+	}
+	if err := ExecSchemaStatementsParallelByTableContext(ctx, db, stmts); err != nil {
 		return err
 	}
 	if !IsTiDBCluster(ctx, db) {

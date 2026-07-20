@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -39,6 +40,35 @@ func TestEnsureFsIDRejectsEmptyTenant(t *testing.T) {
 	s := newControlStore(t)
 	if _, err := s.EnsureFsID(context.Background(), ""); err == nil {
 		t.Fatal("expected error for empty tenant id")
+	}
+}
+
+// TestEnsureFsIDConcurrent exercises the documented "safe to call
+// concurrently" contract: many goroutines racing the first allocation for
+// the same tenant must all observe the same fs_id.
+func TestEnsureFsIDConcurrent(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	const racers = 16
+	ids := make([]int64, racers)
+	errs := make([]error, racers)
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i], errs[i] = s.EnsureFsID(ctx, "tenant-fs-race")
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < racers; i++ {
+		if errs[i] != nil {
+			t.Fatalf("racer %d: %v", i, errs[i])
+		}
+		if ids[i] != ids[0] {
+			t.Fatalf("racer %d got fs_id %d, want %d", i, ids[i], ids[0])
+		}
 	}
 }
 

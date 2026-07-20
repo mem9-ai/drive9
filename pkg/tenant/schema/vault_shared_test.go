@@ -9,17 +9,41 @@ import (
 
 // TestVaultSharedSchemaMatchesStandaloneModuloFsID pins the shared vault DDL
 // to the standalone one: for the six tables that carry a tenant discriminator
-// column, renaming tenant_id VARCHAR(64) -> fs_id BIGINT in the normalized
-// standalone statements must reproduce the shared statements exactly, so the
-// two shapes cannot drift apart silently. vault_secret_fields is skipped here
-// — it has no tenant column and gains fs_id structurally; it is covered by
-// TestVaultSharedSecretFieldsGainsFsID. The comparison uses the MySQL
-// variant, which carries no TiDB-only CLUSTERED keyword.
+// column, the shared statement must be exactly the standalone statement with
+// tenant_id VARCHAR(64) renamed to fs_id BIGINT, plus two structural changes
+// the rename cannot express:
+//
+//   - the standalone single-column inline PRIMARY KEY on the surrogate id
+//     column becomes a table-level composite PRIMARY KEY (fs_id, <id>), so
+//     one tenant's rows stay physically co-located;
+//   - single-column tenant indexes (idx_vault_*_tenant) are dropped: the
+//     composite primary key's fs_id prefix already serves those lookups.
+//
+// vault_secret_fields is skipped here — it has no tenant column and gains
+// fs_id structurally; it is covered by TestVaultSharedSecretFieldsGainsFsID.
+// The comparison uses the MySQL variant, which carries no TiDB-only
+// CLUSTERED keyword.
 func TestVaultSharedSchemaMatchesStandaloneModuloFsID(t *testing.T) {
 	standalone := VaultTiDBSchemaStatements()
 	shared := VaultMySQLSharedSchemaStatements()
 	if len(standalone) != len(shared) {
 		t.Fatalf("statement count mismatch: standalone %d, shared %d", len(standalone), len(shared))
+	}
+	// idColumn maps each table whose inline single-column primary key becomes
+	// a composite (fs_id, <id>) primary key in shared shape.
+	idColumn := map[string]string{
+		"vault_secrets":   "secret_id",
+		"vault_tokens":    "token_id",
+		"vault_grants":    "grant_id",
+		"vault_policies":  "policy_id",
+		"vault_audit_log": "event_id",
+	}
+	// droppedTenantIdx names the single-column tenant indexes removed in
+	// shared shape because the composite primary key prefix covers them.
+	droppedTenantIdx := map[string]bool{
+		"index idx_vault_secrets_tenant (fs_id)": true,
+		"index idx_vault_token_tenant (fs_id)":   true,
+		"index idx_vault_grants_tenant (fs_id)":  true,
 	}
 	renamed := 0
 	for i := range standalone {
@@ -34,12 +58,42 @@ func TestVaultSharedSchemaMatchesStandaloneModuloFsID(t *testing.T) {
 		if name == "vault_secret_fields" {
 			continue
 		}
-		want := schemaspec.NormalizeSQLFragment(standalone[i])
-		want = strings.ReplaceAll(want, "tenant_id varchar(64)", "fs_id bigint")
-		want = strings.ReplaceAll(want, "tenant_id", "fs_id")
-		got := schemaspec.NormalizeSQLFragment(shared[i])
-		if got != want {
-			t.Errorf("table %s drift:\nstandalone (tenant_id->fs_id): %s\nshared (mysql): %s", name, want, got)
+		standaloneDefs := createTableDefinitions(t, VaultTiDBSchemaStatements(), name)
+		var want []string
+		for _, def := range standaloneDefs {
+			def = strings.ReplaceAll(def, "tenant_id varchar(64)", "fs_id bigint")
+			def = strings.ReplaceAll(def, "tenant_id", "fs_id")
+			if idCol, ok := idColumn[name]; ok && strings.HasPrefix(def, idCol+" ") {
+				// The inline PRIMARY KEY attribute implies NOT NULL; the
+				// composite table-level key makes the column explicitly so.
+				def = strings.TrimSuffix(def, " primary key") + " not null"
+			}
+			if droppedTenantIdx[def] {
+				continue
+			}
+			want = append(want, def)
+		}
+		if idCol, ok := idColumn[name]; ok {
+			// Insert the composite primary key before the first index
+			// definition, or at the end when the table has none.
+			pk := "primary key (fs_id, " + idCol + ")"
+			at := len(want)
+			for j, def := range want {
+				if strings.HasPrefix(def, "index ") || strings.HasPrefix(def, "unique index ") {
+					at = j
+					break
+				}
+			}
+			want = append(want[:at], append([]string{pk}, want[at:]...)...)
+		}
+		got := createTableDefinitions(t, VaultMySQLSharedSchemaStatements(), name)
+		if len(got) != len(want) {
+			t.Fatalf("table %s definition count drift: got %d, want %d\ngot:  %v\nwant: %v", name, len(got), len(want), got, want)
+		}
+		for j := range want {
+			if got[j] != want[j] {
+				t.Errorf("table %s definition %d drift:\nstandalone-derived: %s\nshared (mysql):     %s", name, j, want[j], got[j])
+			}
 		}
 		renamed++
 	}
@@ -104,8 +158,8 @@ func TestVaultTiDBSharedSchemaDeclaresClusteredPKs(t *testing.T) {
 			t.Errorf("statement %d variants differ beyond the keyword:\ntidb stripped: %s\nmysql: %s", i, want, got)
 		}
 	}
-	if compositePKs != 1 {
-		t.Fatalf("composite primary keys = %d, want 1 (vault_secret_fields)", compositePKs)
+	if compositePKs != 6 {
+		t.Fatalf("composite primary keys = %d, want 6 (every vault table except vault_deks)", compositePKs)
 	}
 }
 

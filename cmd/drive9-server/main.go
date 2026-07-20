@@ -490,7 +490,13 @@ func registerSharedPoolFromEnv(ctx context.Context, metaStore *meta.Store, pool 
 	if err != nil {
 		return fmt.Errorf("parse DRIVE9_SHARED_POOL_DSN port %q: %w", portStr, err)
 	}
-	tls := cfg.TLSConfig != "" && cfg.TLSConfig != "false"
+	// Persist the driver TLS mode verbatim ("true", "skip-verify", a custom
+	// registered config name; "" for plaintext) so the runtime handle reopens
+	// the DB with exactly the mode the schema init DSN used.
+	tlsMode := cfg.TLSConfig
+	if tlsMode == "false" {
+		tlsMode = ""
+	}
 	_, err = metaStore.RegisterSharedDB(ctx, &meta.SharedDB{
 		OrgID:          orgID,
 		Role:           meta.SharedDBRoleShared,
@@ -499,7 +505,7 @@ func registerSharedPoolFromEnv(ctx context.Context, metaStore *meta.Store, pool 
 		User:           cfg.User,
 		PasswordCipher: passCipher,
 		Name:           cfg.DBName,
-		TLS:            tls,
+		TLSMode:        tlsMode,
 	})
 	return err
 }

@@ -902,11 +902,11 @@ func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) 
 		return nil, fmt.Errorf("shared db %d: decrypt password: %w", dbID, err)
 	}
 	query := "parseTime=true"
-	if info.TLS {
-		query += "&tls=true"
+	if info.TLSMode != "" {
+		query += "&tls=" + info.TLSMode
 	}
-	// TLS=false means a plain connection (local/self-hosted databases); shared
-	// DBs on TiDB Cloud are registered with TLS=true explicitly.
+	// An empty TLSMode means a plain connection (local/self-hosted databases);
+	// shared DBs on TiDB Cloud are registered with tls=skip-verify or tls=true.
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", info.User, string(pass), info.Host, info.Port, info.Name, query)
 	db, err := mysqlutil.OpenInstrumentedForTenant(ctx, dsn, mysqlutil.RoleShared, fmt.Sprintf("shared:%d", dbID))
 	if err != nil {
@@ -948,6 +948,15 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		return nil, nil, tidbCloudOrgID, err
 	}
 	sharedTenant := placement != nil && placement.SchemaShape == meta.SchemaShapeShared
+	if IsSharedSchemaProvider(t.Provider) && !sharedTenant {
+		// The persisted provider says shared but the placement row is gone.
+		// Opening a standalone store against the (connectionless) tenant row
+		// would fail with a confusing empty-host DSN error — and if the row
+		// still had coordinates it could even serve the wrong schema shape.
+		// This happens only mid-delete (placement is removed before final
+		// cleanup), so fail fast with a clear message instead.
+		return nil, nil, tidbCloudOrgID, fmt.Errorf("tenant %s is shared-schema but has no placement row", t.ID)
+	}
 
 	decryptDurationMs := 0.0
 	openStoreStart := time.Now()

@@ -17,9 +17,10 @@ import (
 //
 // fs_events is the one documented exception that keeps its global
 // AUTO_INCREMENT physical primary key unchanged and only gains the fs_id
-// column plus an (fs_id, ...) lookup index: seq stays the primary key;
+// column plus (fs_id, ...) lookup indexes: seq stays the primary key;
 // idx_fs_events_created stays unprefixed; idx_fs_events_fs_seq (fs_id, seq)
-// is new.
+// and idx_fs_events_fs_created (fs_id, created_at) — the per-tenant
+// retention-delete path — are new.
 //
 // llm_usage is deliberately NOT part of the shared schema. The central meta
 // DB ledger (tenant_llm_usage) is authoritative in multi-tenant deployments —
@@ -192,7 +193,8 @@ func CoreFSTiDBSharedSchemaStatements() []string {
 			ts         BIGINT       NOT NULL,
 			created_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			KEY idx_fs_events_created (created_at),
-			KEY idx_fs_events_fs_seq (fs_id, seq)
+			KEY idx_fs_events_fs_seq (fs_id, seq),
+			KEY idx_fs_events_fs_created (fs_id, created_at)
 		)`,
 	}
 }

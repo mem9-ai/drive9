@@ -33,7 +33,10 @@ const sharedDBStatusActive = "active"
 
 // SharedDB is one physical database registered in db_pool. PasswordCipher
 // holds the same encrypted envelope as tenants.db_password; the plaintext
-// never crosses this layer. MaxTenants of 0 means unlimited.
+// never crosses this layer. TLSMode is the go-sql-driver tls DSN parameter
+// verbatim ("true", "skip-verify", a custom registered config name, or ""
+// for plaintext) so the runtime handle reopens the DB with exactly the TLS
+// mode it was registered with. MaxTenants of 0 means unlimited.
 type SharedDB struct {
 	DbID           int64
 	OrgID          string
@@ -43,7 +46,7 @@ type SharedDB struct {
 	User           string
 	PasswordCipher []byte
 	Name           string
-	TLS            bool
+	TLSMode        string
 	MaxTenants     int
 	TenantCount    int
 	Status         string
@@ -96,6 +99,9 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 	if in.MaxTenants < 0 {
 		return 0, fmt.Errorf("max tenants must not be negative")
 	}
+	if len(in.TLSMode) > 32 {
+		return 0, fmt.Errorf("tls mode %q is too long", in.TLSMode)
+	}
 	role := in.Role
 	if role == "" {
 		role = SharedDBRoleShared
@@ -114,7 +120,7 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 			"db_password = VALUES(db_password), db_tls = VALUES(db_tls), "+
 			"max_tenants = VALUES(max_tenants), status = VALUES(status)",
 		in.OrgID, role, in.Host, in.Port, in.User, in.PasswordCipher, in.Name,
-		boolToInt(in.TLS), in.MaxTenants, status); err != nil {
+		in.TLSMode, in.MaxTenants, status); err != nil {
 		return 0, fmt.Errorf("upsert db_pool row: %w", err)
 	}
 	// ON DUPLICATE KEY UPDATE does not reliably report the existing
@@ -172,9 +178,14 @@ func (s *Store) FindSharedDBForOrg(ctx context.Context, orgID string) (db *Share
 }
 
 func (s *Store) findActiveSharedDB(ctx context.Context, orgID string) (*SharedDB, error) {
+	// Capacity is enforced at selection time: a pool at its max_tenants limit
+	// is invisible to new placements (0 means unlimited). tenant_count is a
+	// denormalized counter, so a rare drift can over- or under-admit; closing
+	// that fully needs a transactional reserve, which is a planned follow-up.
 	db, err := scanSharedDBRow(s.db.QueryRowContext(ctx,
 		"SELECT "+sharedDBSelectColumns+" FROM db_pool "+
-			"WHERE org_id = ? AND `role` = ? AND status = ? ORDER BY db_id LIMIT 1",
+			"WHERE org_id = ? AND `role` = ? AND status = ? "+
+			"AND (max_tenants = 0 OR tenant_count < max_tenants) ORDER BY db_id LIMIT 1",
 		orgID, SharedDBRoleShared, sharedDBStatusActive))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -190,20 +201,18 @@ func (s *Store) ListSharedDBs(ctx context.Context) (out []*SharedDB, err error) 
 	start := time.Now()
 	defer observeMeta(ctx, "list_shared_dbs", start, &err)
 	rows, err := s.db.QueryContext(ctx,
-		"SELECT "+sharedDBSelectColumns+" FROM db_pool WHERE status = ? ORDER BY db_id",
-		sharedDBStatusActive)
+		"SELECT "+sharedDBSelectColumns+" FROM db_pool WHERE `role` = ? AND status = ? ORDER BY db_id",
+		SharedDBRoleShared, sharedDBStatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("list shared dbs: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var rec SharedDB
-		var tls int
 		if err = rows.Scan(&rec.DbID, &rec.OrgID, &rec.Role, &rec.Host, &rec.Port, &rec.User,
-			&rec.PasswordCipher, &rec.Name, &tls, &rec.MaxTenants, &rec.TenantCount, &rec.Status); err != nil {
+			&rec.PasswordCipher, &rec.Name, &rec.TLSMode, &rec.MaxTenants, &rec.TenantCount, &rec.Status); err != nil {
 			return nil, err
 		}
-		rec.TLS = tls == 1
 		out = append(out, &rec)
 	}
 	return out, rows.Err()
@@ -273,6 +282,11 @@ func (s *Store) UpsertTenantPlacement(ctx context.Context, p *TenantPlacement) (
 	if status == "" {
 		status = sharedDBStatusActive
 	}
+	switch status {
+	case sharedDBStatusActive, "migrating":
+	default:
+		return fmt.Errorf("unsupported placement status %q", status)
+	}
 	var target any
 	if p.TargetDbID != nil {
 		target = *p.TargetDbID
@@ -333,11 +347,9 @@ func (s *Store) DeleteTenantPlacement(ctx context.Context, fsID int64) (err erro
 // scanSharedDBRow scans one db_pool row selected with sharedDBSelectColumns.
 func scanSharedDBRow(row *sql.Row) (*SharedDB, error) {
 	var rec SharedDB
-	var tls int
 	if err := row.Scan(&rec.DbID, &rec.OrgID, &rec.Role, &rec.Host, &rec.Port, &rec.User,
-		&rec.PasswordCipher, &rec.Name, &tls, &rec.MaxTenants, &rec.TenantCount, &rec.Status); err != nil {
+		&rec.PasswordCipher, &rec.Name, &rec.TLSMode, &rec.MaxTenants, &rec.TenantCount, &rec.Status); err != nil {
 		return nil, err
 	}
-	rec.TLS = tls == 1
 	return &rec, nil
 }

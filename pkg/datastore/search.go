@@ -76,10 +76,9 @@ func subtreeCond(prefix string) (string, []any) {
 
 // scopeWhereAnd prefixes a WHERE predicate with one fs_id predicate per JOIN
 // alias in shared shape and returns it unchanged in standalone shape. Every
-// joined alias is filtered, not just the driving table: entity ids are
-// globally unique ULIDs in production, but if ids ever collide the bare
-// id-only join conditions would otherwise fan out across tenants and leak
-// rows sideways.
+// joined alias is filtered, not just the driving table: in shared shape
+// entity ids are unique only within a tenant, so an id-only join condition
+// would fan out across tenants and leak rows sideways on collision.
 func scopeWhereAnd(scope Scope, pred string, aliases ...string) string {
 	for i := len(aliases) - 1; i >= 0; i-- {
 		pred = scope.AndAs(aliases[i], pred)

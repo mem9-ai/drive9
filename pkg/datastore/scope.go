@@ -69,14 +69,30 @@ func (s Scope) And(pred string) string {
 }
 
 // AndAs is And with a table-alias qualifier, for JOIN queries: shared shape
-// emits "<alias>.fs_id = ? AND <pred>". Filter the driving table of the join;
-// entity ids (inode_id, file_id, layer_id, workspace_id, ...) are globally
-// unique, so a one-sided fs_id predicate is sufficient for correctness.
+// emits "<alias>.fs_id = ? AND <pred>". In shared shape entity ids (inode_id,
+// file_id, layer_id, workspace_id, ...) are unique only within a tenant —
+// the composite (fs_id, id) keys deliberately allow the same id under two
+// fs_ids — so EVERY alias of a multi-table join must carry an fs_id
+// predicate (scopeWhereAnd for inner joins, AndOn for LEFT JOIN ON clauses),
+// never just the driving table.
 func (s Scope) AndAs(alias, pred string) string {
 	if s.shared {
 		return alias + ".fs_id = ? AND " + pred
 	}
 	return pred
+}
+
+// AndOn appends "AND <alias>.fs_id = ?" to a JOIN ON condition in shared
+// shape and returns it unchanged in standalone shape. Use it for LEFT JOINs:
+// a WHERE-clause fs_id predicate on the right table would discard the
+// null-extended rows and silently turn the LEFT JOIN into an INNER JOIN.
+// The bind argument belongs before the WHERE arguments (ON clauses precede
+// WHERE textually).
+func (s Scope) AndOn(cond, alias string) string {
+	if s.shared {
+		return cond + " AND " + alias + ".fs_id = ?"
+	}
+	return cond
 }
 
 // Args prepends the fs_id bind argument in shared shape and returns args

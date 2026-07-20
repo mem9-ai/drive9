@@ -570,7 +570,7 @@ func metaInitSchemaStatements() []string {
 			db_user      VARCHAR(255) NOT NULL,
 			db_password  VARBINARY(2048) NOT NULL,
 			db_name      VARCHAR(255) NOT NULL,
-			db_tls       TINYINT(1) NOT NULL DEFAULT 1,
+			db_tls       VARCHAR(32) NOT NULL DEFAULT '',
 			max_tenants  INT NOT NULL DEFAULT 0,
 			tenant_count INT NOT NULL DEFAULT 0,
 			status       VARCHAR(20) NOT NULL DEFAULT 'active',
@@ -1518,7 +1518,7 @@ func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
 	// fs_ids through EnsureFsID, and the two-table write below (tenants +
 	// fs_registry) can deadlock with them on the unique index of
 	// fs_registry.tenant_id. The deadlock victim retries cleanly.
-	return withMetaLockConflictRetry(func() error {
+	return withMetaLockConflictRetry(ctx, "insert_tenant", func() error {
 		return s.InTx(ctx, func(tx *sql.Tx) error {
 			_, err := tx.ExecContext(ctx, `INSERT INTO tenants
 			(id, status, kind, parent_tenant_id, storage_namespace_id, db_host, db_port, db_user, db_password, db_name, db_tls,
@@ -2955,6 +2955,25 @@ func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status Tenant
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_status", start, &err)
 	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`, status, time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateTenantProvider rewrites a tenant's persisted provider. It exists for
+// the shared-pool placement path, where the tenant row is inserted with the
+// request provider (e.g. tidb_cloud_native) and must be re-labeled as
+// tidb_cloud_native_shared once placement on a shared-schema DB is decided,
+// so provider-driven capability checks classify the tenant correctly.
+func (s *Store) UpdateTenantProvider(ctx context.Context, id, provider string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_provider", start, &err)
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET provider = ?, updated_at = ? WHERE id = ?`, provider, time.Now().UTC(), id)
 	if err != nil {
 		return err
 	}

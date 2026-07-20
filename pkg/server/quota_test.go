@@ -2237,7 +2237,7 @@ func TestTenantPoolClaimMissTriggersPendingMetadataResume(t *testing.T) {
 		t.Fatalf("upsert binding: %v", err)
 	}
 
-	res, pool, claimed, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
+	res, pool, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	}, nil)

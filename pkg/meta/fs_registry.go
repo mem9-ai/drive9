@@ -6,14 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"go.uber.org/zap"
 )
 
 // withMetaLockConflictRetry runs fn with a few bounded retries on InnoDB
 // lock-conflict errors (1213/1205/40001), which are expected when concurrent
 // provision/Acquire paths allocate fs_ids for different tenants at the same
-// time (unique-index gap locks on fs_registry). Mirrors the retry pattern
-// used by the quota reservation path.
-func withMetaLockConflictRetry(fn func() error) error {
+// time (unique-index gap locks on fs_registry). Mirrors the quota path's
+// retryMetaLockConflict: context cancellation aborts the backoff and each
+// retry is logged so deadlock storms stay visible.
+func withMetaLockConflictRetry(ctx context.Context, operation string, fn func() error) error {
 	const maxAttempts = 4
 	var err error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -23,7 +27,15 @@ func withMetaLockConflictRetry(fn func() error) error {
 		if !isMetaLockConflictError(err) {
 			return err
 		}
-		time.Sleep(time.Duration(20*(1<<attempt)) * time.Millisecond)
+		logger.Warn(ctx, "meta_lock_conflict_retry",
+			zap.String("operation", operation),
+			zap.Int("attempt", attempt+1),
+			zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(20*(1<<attempt)) * time.Millisecond):
+		}
 	}
 	return err
 }
@@ -45,7 +57,7 @@ func (s *Store) EnsureFsID(ctx context.Context, tenantID string) (fsID int64, er
 	if !errors.Is(err, ErrNotFound) {
 		return 0, err
 	}
-	if err := withMetaLockConflictRetry(func() error {
+	if err := withMetaLockConflictRetry(ctx, "ensure_fs_id", func() error {
 		_, err := s.db.ExecContext(ctx,
 			`INSERT IGNORE INTO fs_registry (tenant_id) VALUES (?)`, tenantID)
 		return err
