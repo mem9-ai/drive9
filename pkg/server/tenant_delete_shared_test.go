@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/tenant/token"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
@@ -395,5 +397,52 @@ func TestFindSharedDBForProvisionSkipsNonTiDBProviders(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("tidb_zero did not match the wildcard pool, want match")
+	}
+}
+
+// TestProvisionTenantOnSharedDBReleasesReservationOnFailure proves the
+// compensation path: when any step after the capacity/placement reserve
+// fails, the reservation is rolled back — no leaked capacity slot and no
+// placement row pointing at a failed tenant.
+func TestProvisionTenantOnSharedDBReleasesReservationOnFailure(t *testing.T) {
+	db := newTenantDeleteDBInfo(t)
+	testmysql.ResetMetaDB(t, db.Meta.DB())
+	ctx := context.Background()
+	dbID, err := db.Meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		OrgID: "org-provision-fail", Host: "shared.example.com", Port: 4000, User: "root",
+		PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 10,
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	sharedDB, err := db.Meta.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	s := &Server{meta: db.Meta}
+	tenantID := token.NewID()
+	// No tenant row is inserted, so UpdateTenantProvider fails right after the
+	// reserve — the failure must trigger the compensation.
+	if _, err := s.provisionTenantOnSharedDB(ctx, tenantID, sharedDB, tenant.ProviderTiDBCloudNative, "default", provisionTenantOptions{}, time.Now().UTC()); err == nil {
+		t.Fatal("provisionTenantOnSharedDB succeeded, want error")
+	} else {
+		var pe *provisionTenantError
+		if !errors.As(err, &pe) || pe.status != http.StatusInternalServerError {
+			t.Fatalf("error = %v, want provisionTenantError 500", err)
+		}
+	}
+	fsID, err := db.Meta.ResolveFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("ResolveFsID: %v", err)
+	}
+	if _, err := db.Meta.GetTenantPlacement(ctx, fsID); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("placement after compensated failure = %v, want ErrNotFound", err)
+	}
+	got, err := db.Meta.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB after failure: %v", err)
+	}
+	if got.TenantCount != 0 {
+		t.Fatalf("TenantCount = %d, want 0 (reservation released)", got.TenantCount)
 	}
 }

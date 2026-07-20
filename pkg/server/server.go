@@ -5083,7 +5083,17 @@ func (s *Server) findSharedDBForProvision(ctx context.Context, provider string, 
 // carry plain VECTOR columns — per-tenant EMBED_TEXT generated columns are
 // impossible), marks the tenant active, and issues the owner key.
 func (s *Server) provisionTenantOnSharedDB(ctx context.Context, tenantID string, sharedDB *meta.SharedDB, provider, keyName string, opts provisionTenantOptions, now time.Time) (*provisionTenantResult, error) {
+	// Once the placement is reserved, every later failure must release it:
+	// the reservation holds a capacity slot and a routing row that nothing
+	// else reclaims, so a transient failure would permanently leak both.
+	fsID := int64(0)
+	reserved := false
 	fail := func(err error) (*provisionTenantResult, error) {
+		if reserved {
+			if cerr := s.meta.DeleteTenantPlacementAndDecrCount(context.Background(), fsID, sharedDB.DbID); cerr != nil {
+				logger.Error(ctx, "server_event", eventFields(ctx, "shared_pool_reserve_compensate_failed", "tenant_id", tenantID, "db_id", sharedDB.DbID, "error", cerr)...)
+			}
+		}
 		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
 		}
@@ -5122,6 +5132,7 @@ func (s *Server) provisionTenantOnSharedDB(ctx context.Context, tenantID string,
 		}
 		return fail(err)
 	}
+	reserved = true
 	if err := s.meta.UpdateTenantProvider(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
 		return fail(err)
 	}
