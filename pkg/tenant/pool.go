@@ -222,6 +222,8 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 	if reapInterval <= 0 && idleTimeout > 0 {
 		reapInterval = defaultTenantPoolIdleReapInterval
 	}
+	metrics.RecordGauge("tenant_pool", "cached_backends", 0)
+	metrics.RecordGauge("tenant_pool", "max_backends", float64(max))
 	return &Pool{
 		cfg:     cfg,
 		enc:     enc,
@@ -332,6 +334,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 			}
 		}
 	}
+	p.recordCachedBackendCountLocked()
 	// FileGC is now kick-driven through the unified tenant worker; no
 	// per-backend goroutine is started here.
 	p.mu.Unlock()
@@ -429,11 +432,10 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			}
 		}
 	}
+	p.recordCachedBackendCountLocked()
 	// FileGC is now kick-driven through the unified tenant worker; no
 	// per-backend goroutine is started here.
-	cachedCount := len(p.items)
 	p.mu.Unlock()
-	metrics.RecordGauge("tenant_pool", "cached_backends", float64(cachedCount))
 	for _, retired := range toClose {
 		closeEntry(retired)
 	}
@@ -701,12 +703,11 @@ func (p *Pool) reapOnce(ctx context.Context) {
 			}
 		}
 	}
-	cachedCount := len(p.items)
+	p.recordCachedBackendCountLocked()
 	p.mu.Unlock()
 	for _, retired := range toClose {
 		closeEntry(retired)
 	}
-	metrics.RecordGauge("tenant_pool", "cached_backends", float64(cachedCount))
 }
 
 func (p *Pool) Close() {
@@ -1175,11 +1176,16 @@ func (p *Pool) removeLocked(elem *list.Element, reason string) *entry {
 	e.elem = nil
 	delete(p.items, e.tenantID)
 	e.retired = true
+	p.recordCachedBackendCountLocked()
 	metrics.RecordOperation("tenant_pool", "remove", reason, 0)
 	if e.refs == 0 {
 		return e
 	}
 	return nil
+}
+
+func (p *Pool) recordCachedBackendCountLocked() {
+	metrics.RecordGauge("tenant_pool", "cached_backends", float64(len(p.items)))
 }
 
 func (p *Pool) makeRelease(e *entry) func() {

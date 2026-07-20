@@ -307,6 +307,12 @@ func (p *quotaTestProvisioner) WaitForPoolClustersMetadata(_ context.Context, cl
 func (p *quotaTestProvisioner) MarkClusterPoolUsed(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, _ time.Time, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
 	p.markPoolUsedCalls.Add(1)
 	p.recordCall("mark_pool_used", req, cluster, &opts)
+	if p.cloudCfg != nil {
+		return p.cloudCfg, nil
+	}
+	if opts.TiDBCloudSpendingLimitMonthly == nil {
+		return nil, nil
+	}
 	return &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: opts.TiDBCloudSpendingLimitMonthly}, nil
 }
 
@@ -2165,6 +2171,83 @@ func TestTenantPoolClaimMissTriggersPendingMetadataResume(t *testing.T) {
 			t.Fatalf("tenant after pending resume = status %s host %q user %q, metadata batch waits=%d", tnt.Status, tnt.DBHost, tnt.DBUser, rt.prov.metadataBatchWaitCalls.Load())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestTenantPoolClaimSeedsQuotaConfigWithoutExplicitQuota(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
+		Clusters: []tenant.CloudClusterInfo{{
+			ClusterID:      "cluster-pool-claim-seed",
+			OrganizationID: "org-1",
+		}},
+	}}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
+		PoolID:         "pool-seed-quota",
+		OrganizationID: "org-1",
+		Size:           1,
+		Status:         meta.TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	passCipher, err := rt.server.pool.Encrypt(ctx, []byte("pool-pass"))
+	if err != nil {
+		t.Fatalf("encrypt password: %v", err)
+	}
+	tenantID := "pool-claim-seed-quota"
+	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantActive,
+		DBHost:           "db.example.com",
+		DBPort:           4000,
+		DBUser:           "u.root",
+		DBPasswordCipher: passCipher,
+		DBName:           "tidbcloud_fs",
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		ClusterID:        "cluster-pool-claim-seed",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatalf("insert tenant: %v", err)
+	}
+	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+		TenantID:       tenantID,
+		OrganizationID: "org-1",
+		ClusterID:      "cluster-pool-claim-seed",
+		PoolID:         "pool-seed-quota",
+		PoolStatus:     meta.TenantPoolBindingFree,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("upsert binding: %v", err)
+	}
+
+	res, _, claimed, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("claim from pool: %v", err)
+	}
+	if !claimed || res == nil {
+		t.Fatalf("claim result res=%#v claimed=%v, want claimed", res, claimed)
+	}
+
+	cfg, err := rt.meta.GetQuotaConfig(ctx, res.TenantID)
+	if err != nil {
+		t.Fatalf("get quota config: %v", err)
+	}
+	if cfg.TiDBCloudSpendingLimit != nil {
+		t.Fatalf("spending limit = %d, want nil", *cfg.TiDBCloudSpendingLimit)
+	}
+	if cfg.TiDBCloudSpendingLimitCheckedAt != nil {
+		t.Fatalf("checked_at = %v, want nil without a cloud observation", cfg.TiDBCloudSpendingLimitCheckedAt)
 	}
 }
 
