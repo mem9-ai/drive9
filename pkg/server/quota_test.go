@@ -30,6 +30,7 @@ type quotaTestProvisioner struct {
 	getErr                      error
 	deprovisionErr              error
 	cloudCfg                    *tenant.QuotaCloudConfig
+	batchPoolCloudCfg           *tenant.QuotaCloudConfig
 	defaultPublicKey            string
 	defaultPrivateKey           string
 	markHook                    func() error
@@ -254,7 +255,7 @@ func (p *quotaTestProvisioner) BatchProvisionFreeClustersWithCredentialsAndQuota
 			out[len(out)-1].Username = "u.root"
 		}
 	}
-	return out, nil, p.batchPoolErr
+	return out, p.batchPoolCloudCfg, p.batchPoolErr
 }
 
 func (p *quotaTestProvisioner) WaitForPoolClusterMetadata(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
@@ -2656,6 +2657,11 @@ func TestAdminTenantPoolReplenishUsesDefaultSpendingLimit(t *testing.T) {
 		t.Fatalf("create pool: %v", err)
 	}
 
+	defaultLimit := int64(1000)
+	rt.prov.batchPoolCloudCfg = &tenant.QuotaCloudConfig{
+		TiDBCloudSpendingLimitMonthly: &defaultLimit,
+	}
+
 	rt.server.replenishTenantPoolAsync(ctx, pool, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
@@ -2668,6 +2674,28 @@ func TestAdminTenantPoolReplenishUsesDefaultSpendingLimit(t *testing.T) {
 	lastOptions := rt.prov.lastOptionsSnapshot()
 	if lastOptions.TiDBCloudSpendingLimitMonthly != nil {
 		t.Fatalf("replenish spending limit = %#v, want nil", lastOptions.TiDBCloudSpendingLimitMonthly)
+	}
+
+	tenants, err := rt.meta.ListTenantsByStatus(ctx, meta.TenantActive, 10)
+	if err != nil {
+		t.Fatalf("list tenants: %v", err)
+	}
+	var poolTenantID string
+	for _, tenant := range tenants {
+		if tenant.ID != rt.tenantID {
+			poolTenantID = tenant.ID
+			break
+		}
+	}
+	if poolTenantID == "" {
+		t.Fatal("no pool tenant created by replenish")
+	}
+	cfg, err := rt.meta.GetQuotaConfig(ctx, poolTenantID)
+	if err != nil {
+		t.Fatalf("get quota config: %v", err)
+	}
+	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != defaultLimit {
+		t.Fatalf("persisted spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, defaultLimit)
 	}
 }
 

@@ -449,7 +449,7 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 		if err != nil {
 			cfgs := fallbackBatchClusterInfos(created.Clusters, dbName, passwords)
 			cloudCfg := &tenant.QuotaCloudConfig{Labels: map[string]string{
-				Drive9ManagedLabel:  "true",
+				Drive9ManagedLabel:    "true",
 				Drive9PoolStatusLabel: "free",
 			}}
 			if poolID := strings.TrimSpace(opts.TenantPoolID); poolID != "" {
