@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -400,11 +401,86 @@ func TestFindSharedDBForProvisionSkipsNonTiDBProviders(t *testing.T) {
 	}
 }
 
-// TestProvisionTenantOnSharedDBReleasesReservationOnFailure proves the
-// compensation path: when any step after the capacity/placement reserve
-// fails, the reservation is rolled back — no leaked capacity slot and no
-// placement row pointing at a failed tenant.
-func TestProvisionTenantOnSharedDBReleasesReservationOnFailure(t *testing.T) {
+// TestProvisionTenantOnSharedDBCommitsAtomically covers the happy path of
+// the atomic provision transition: placement, provider re-label, active
+// status, capacity slot, and the owner key all land together.
+func TestProvisionTenantOnSharedDBCommitsAtomically(t *testing.T) {
+	db := newTenantDeleteDBInfo(t)
+	testmysql.ResetMetaDB(t, db.Meta.DB())
+	ctx := context.Background()
+	dbID, err := db.Meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		OrgID: "org-provision-ok", Host: "shared.example.com", Port: 4000, User: "root",
+		PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 10,
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	sharedDB, err := db.Meta.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{meta: db.Meta, pool: db.Pool, tokenSecret: tokenSecret}
+	now := time.Now().UTC()
+	tenantID := token.NewID()
+	if err := db.Meta.InsertTenant(ctx, &meta.Tenant{
+		ID: tenantID, Status: meta.TenantPending, Kind: meta.TenantKindLive,
+		Provider: tenant.ProviderTiDBCloudNative, DBPasswordCipher: []byte{},
+		SchemaVersion: 1, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("InsertTenant: %v", err)
+	}
+
+	res, err := s.provisionTenantOnSharedDB(ctx, tenantID, sharedDB, tenant.ProviderTiDBCloudNative, "default", provisionTenantOptions{}, now)
+	if err != nil {
+		t.Fatalf("provisionTenantOnSharedDB: %v", err)
+	}
+	if res.Provider != tenant.ProviderTiDBCloudNativeShared || res.APIKey == "" {
+		t.Fatalf("result = provider %q api_key %q", res.Provider, res.APIKey)
+	}
+	got, err := db.Meta.GetTenant(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("GetTenant: %v", err)
+	}
+	if got.Provider != tenant.ProviderTiDBCloudNativeShared || got.Status != meta.TenantActive {
+		t.Fatalf("tenant = provider %q status %q, want tidb_cloud_native_shared/active", got.Provider, got.Status)
+	}
+	fsID, err := db.Meta.ResolveFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("ResolveFsID: %v", err)
+	}
+	p, err := db.Meta.GetTenantPlacement(ctx, fsID)
+	if err != nil {
+		t.Fatalf("GetTenantPlacement: %v", err)
+	}
+	if p.DbID != dbID || p.SchemaShape != meta.SchemaShapeShared {
+		t.Fatalf("placement = %+v", p)
+	}
+	dbRow, err := db.Meta.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if dbRow.TenantCount != 1 {
+		t.Fatalf("TenantCount = %d, want 1", dbRow.TenantCount)
+	}
+	var activeKeys int
+	if err := db.Meta.DB().QueryRow("SELECT COUNT(*) FROM tenant_api_keys WHERE tenant_id = ? AND status = ?", tenantID, meta.APIKeyActive).Scan(&activeKeys); err != nil {
+		t.Fatal(err)
+	}
+	if activeKeys != 1 {
+		t.Fatalf("active owner keys = %d, want 1", activeKeys)
+	}
+}
+
+// TestProvisionTenantOnSharedDBFailureLeavesNoPartialState proves the atomic
+// transition leaves nothing behind on failure: when any write of the
+// provision transaction fails, no placement row, no reserved capacity, no
+// owner key persists, and the tenant never becomes active — there is no
+// best-effort compensation window that could orphan an active shared tenant.
+func TestProvisionTenantOnSharedDBFailureLeavesNoPartialState(t *testing.T) {
 	db := newTenantDeleteDBInfo(t)
 	testmysql.ResetMetaDB(t, db.Meta.DB())
 	ctx := context.Background()
@@ -419,10 +495,15 @@ func TestProvisionTenantOnSharedDBReleasesReservationOnFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSharedDB: %v", err)
 	}
-	s := &Server{meta: db.Meta}
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{meta: db.Meta, pool: db.Pool, tokenSecret: tokenSecret}
 	tenantID := token.NewID()
-	// No tenant row is inserted, so UpdateTenantProvider fails right after the
-	// reserve — the failure must trigger the compensation.
+	// No tenant row is inserted, so the tenant activation inside the
+	// transaction fails and rolls back the capacity reservation, the
+	// placement, and the owner key insert.
 	if _, err := s.provisionTenantOnSharedDB(ctx, tenantID, sharedDB, tenant.ProviderTiDBCloudNative, "default", provisionTenantOptions{}, time.Now().UTC()); err == nil {
 		t.Fatal("provisionTenantOnSharedDB succeeded, want error")
 	} else {
@@ -436,13 +517,20 @@ func TestProvisionTenantOnSharedDBReleasesReservationOnFailure(t *testing.T) {
 		t.Fatalf("ResolveFsID: %v", err)
 	}
 	if _, err := db.Meta.GetTenantPlacement(ctx, fsID); !errors.Is(err, meta.ErrNotFound) {
-		t.Fatalf("placement after compensated failure = %v, want ErrNotFound", err)
+		t.Fatalf("placement after failed provision = %v, want ErrNotFound", err)
 	}
 	got, err := db.Meta.GetSharedDB(ctx, dbID)
 	if err != nil {
 		t.Fatalf("GetSharedDB after failure: %v", err)
 	}
 	if got.TenantCount != 0 {
-		t.Fatalf("TenantCount = %d, want 0 (reservation released)", got.TenantCount)
+		t.Fatalf("TenantCount = %d, want 0 (nothing reserved)", got.TenantCount)
+	}
+	var keyCount int
+	if err := db.Meta.DB().QueryRow("SELECT COUNT(*) FROM tenant_api_keys WHERE tenant_id = ?", tenantID).Scan(&keyCount); err != nil {
+		t.Fatal(err)
+	}
+	if keyCount != 0 {
+		t.Fatalf("owner keys after failed provision = %d, want 0", keyCount)
 	}
 }

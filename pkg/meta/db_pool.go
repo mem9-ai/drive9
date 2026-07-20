@@ -344,18 +344,34 @@ func (s *Store) DeleteTenantPlacement(ctx context.Context, fsID int64) (err erro
 	return nil
 }
 
-// ErrSharedDBCapacityExhausted is returned by ReserveSharedDBPlacement when
-// the target pool has no free capacity (max_tenants reached).
+// ErrSharedDBCapacityExhausted is returned when a shared-pool reservation
+// cannot be made because the target pool has no free capacity
+// (max_tenants reached).
 var ErrSharedDBCapacityExhausted = errors.New("shared db capacity exhausted")
 
-// ReserveSharedDBPlacement atomically reserves one capacity slot on a shared
-// DB and records the tenant's placement in a single transaction: the counter
-// increment is conditional on free capacity, so two concurrent provisions
-// cannot both take the last slot, and the placement row never exists without
-// its reserved capacity (or vice versa).
-func (s *Store) ReserveSharedDBPlacement(ctx context.Context, p *TenantPlacement) (err error) {
+// CompleteSharedTenantProvision atomically performs every meta write that
+// turns a pending tenant into a live shared-pool tenant, in one transaction:
+//
+//  1. the conditional capacity reservation (two concurrent provisions
+//     cannot take the same last slot — the loser gets
+//     ErrSharedDBCapacityExhausted),
+//  2. the placement insert,
+//  3. the provider re-label and active-status transition on the tenant row
+//     (ErrNotFound when the tenant row does not exist), and
+//  4. the owner API key insert (ErrDuplicate on key id collision).
+//
+// Either all of it commits or none does: a shared tenant can never become
+// active without its placement row, its reserved capacity, and its owner
+// key, and a failed attempt leaves no partial state behind.
+func (s *Store) CompleteSharedTenantProvision(ctx context.Context, tenantID, provider string, p *TenantPlacement, k *APIKey) (err error) {
 	start := time.Now()
-	defer observeMeta(ctx, "reserve_shared_db_placement", start, &err)
+	defer observeMeta(ctx, "complete_shared_tenant_provision", start, &err)
+	if tenantID == "" {
+		return fmt.Errorf("tenant id is required")
+	}
+	if provider == "" {
+		return fmt.Errorf("provider is required")
+	}
 	if p == nil {
 		return fmt.Errorf("tenant placement is required")
 	}
@@ -366,12 +382,20 @@ func (s *Store) ReserveSharedDBPlacement(ctx context.Context, p *TenantPlacement
 		return fmt.Errorf("db_id must be positive")
 	}
 	if p.Placement != PlacementShared || p.SchemaShape != SchemaShapeShared {
-		return fmt.Errorf("reserve requires shared placement and schema shape")
+		return fmt.Errorf("provision requires shared placement and schema shape")
+	}
+	if k == nil {
+		return fmt.Errorf("api key is required")
+	}
+	scopeKind, err := apiKeyScopeKindForInsert(k)
+	if err != nil {
+		return err
 	}
 	status := p.Status
 	if status == "" {
 		status = sharedDBStatusActive
 	}
+	now := time.Now().UTC()
 	return s.InTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE db_pool SET tenant_count = tenant_count + 1
@@ -395,6 +419,32 @@ func (s *Store) ReserveSharedDBPlacement(ctx context.Context, p *TenantPlacement
 				VALUES (?, ?, ?, ?, ?, ?)`,
 			p.FsID, p.DbID, p.Placement, p.SchemaShape, status, target); err != nil {
 			return fmt.Errorf("insert placement for fs_id %d: %w", p.FsID, err)
+		}
+		res, err = tx.ExecContext(ctx,
+			`UPDATE tenants SET provider = ?, status = ?, updated_at = ? WHERE id = ?`,
+			provider, TenantActive, now, tenantID)
+		if err != nil {
+			return fmt.Errorf("activate tenant %s: %w", tenantID, err)
+		}
+		affected, err = res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("activate tenant rows affected for %s: %w", tenantID, err)
+		}
+		if affected == 0 {
+			return ErrNotFound
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO tenant_api_keys
+			(id, tenant_id, key_name, jwt_ciphertext, jwt_hash, token_version, status, scope_kind,
+			 issued_by_provider, issued_by_subject_key, issued_by_metadata_json,
+			 issued_at, revoked_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			k.ID, k.TenantID, k.KeyName, k.JWTCiphertext, k.JWTHash, k.TokenVersion, k.Status, scopeKind,
+			k.IssuedByProvider, k.IssuedBySubjectKey, nullableBytes(k.IssuedByMetadataJSON),
+			k.IssuedAt.UTC(), k.RevokedAt, k.CreatedAt.UTC(), k.UpdatedAt.UTC()); err != nil {
+			if isDuplicateEntry(err) {
+				return ErrDuplicate
+			}
+			return fmt.Errorf("insert owner api key: %w", err)
 		}
 		return nil
 	})

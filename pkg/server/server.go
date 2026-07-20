@@ -5077,23 +5077,15 @@ func (s *Server) findSharedDBForProvision(ctx context.Context, provider string, 
 
 // provisionTenantOnSharedDB completes provisioning for a tenant placed on a
 // shared-schema database: no cluster is created and the schema already exists
-// there. It writes the placement, re-labels the tenant row with the shared
-// provider (tidb_cloud_native_shared) so provider-driven capability checks
-// classify it correctly, forces the fts_only embedding profile (shared tables
-// carry plain VECTOR columns — per-tenant EMBED_TEXT generated columns are
-// impossible), marks the tenant active, and issues the owner key.
+// there. After the idempotent identity/profile steps, every state-changing
+// meta write — the capacity reservation and placement, the provider re-label
+// (tidb_cloud_native_shared, so provider-driven capability checks classify
+// the tenant correctly), the active-status transition, and the owner key —
+// commits in ONE meta transaction (CompleteSharedTenantProvision). A failed
+// provision therefore leaves no partial state: no active shared tenant
+// without a placement row, no capacity leak, no orphaned key.
 func (s *Server) provisionTenantOnSharedDB(ctx context.Context, tenantID string, sharedDB *meta.SharedDB, provider, keyName string, opts provisionTenantOptions, now time.Time) (*provisionTenantResult, error) {
-	// Once the placement is reserved, every later failure must release it:
-	// the reservation holds a capacity slot and a routing row that nothing
-	// else reclaims, so a transient failure would permanently leak both.
-	fsID := int64(0)
-	reserved := false
 	fail := func(err error) (*provisionTenantResult, error) {
-		if reserved {
-			if cerr := s.meta.DeleteTenantPlacementAndDecrCount(context.Background(), fsID, sharedDB.DbID); cerr != nil {
-				logger.Error(ctx, "server_event", eventFields(ctx, "shared_pool_reserve_compensate_failed", "tenant_id", tenantID, "db_id", sharedDB.DbID, "error", cerr)...)
-			}
-		}
 		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
 		}
@@ -5109,6 +5101,8 @@ func (s *Server) provisionTenantOnSharedDB(ctx context.Context, tenantID string,
 	if err != nil {
 		return fail(err)
 	}
+	// Forces the fts_only embedding profile (shared tables carry plain VECTOR
+	// columns — per-tenant EMBED_TEXT generated columns are impossible).
 	if err := s.meta.UpsertTenantAutoEmbeddingProfile(ctx, &meta.TenantAutoEmbeddingProfile{
 		TenantID:      tenantID,
 		EmbeddingMode: meta.TenantEmbeddingModeFTSOnly,
@@ -5117,32 +5111,25 @@ func (s *Server) provisionTenantOnSharedDB(ctx context.Context, tenantID string,
 	}); err != nil {
 		return fail(err)
 	}
-	// Capacity and placement are reserved atomically: two concurrent
-	// provisions cannot take the same last slot, and a placement row never
-	// exists without its reserved capacity.
-	if err := s.meta.ReserveSharedDBPlacement(ctx, &meta.TenantPlacement{
+	// Token generation and encryption are pure computation — build the key
+	// material first so its insert can join the atomic transition.
+	apiToken, apiKeyID, keyRec, err := s.buildOwnerAPIKey(ctx, tenantID, keyName, opts.TokenVersion, opts.APIKeySource)
+	if err != nil {
+		return fail(err)
+	}
+	if err := s.meta.CompleteSharedTenantProvision(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared, &meta.TenantPlacement{
 		FsID:        fsID,
 		DbID:        sharedDB.DbID,
 		Placement:   meta.PlacementShared,
 		SchemaShape: meta.SchemaShapeShared,
-	}); err != nil {
+	}, keyRec); err != nil {
 		if errors.Is(err, meta.ErrSharedDBCapacityExhausted) {
 			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 			return nil, newProvisionTenantError(http.StatusConflict, "shared pool is at capacity", err)
 		}
 		return fail(err)
 	}
-	reserved = true
-	if err := s.meta.UpdateTenantProvider(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
-		return fail(err)
-	}
-	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantActive); err != nil {
-		return fail(err)
-	}
-	apiToken, apiKeyID, err := s.issueOwnerAPIKey(ctx, tenantID, keyName, opts.TokenVersion, opts.APIKeySource)
-	if err != nil {
-		return fail(err)
-	}
+	metricEvent(ctx, "metadb_query", "api", "insert_api_key", "result", "ok")
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_shared_pool_placed", "tenant_id", tenantID, "provider", tenant.ProviderTiDBCloudNativeShared, "db_id", sharedDB.DbID, "org_id", sharedDB.OrgID)...)
 	metricEvent(ctx, "tenant_provision", "provider", tenant.ProviderTiDBCloudNativeShared, "result", "shared_pool")
 	return &provisionTenantResult{
@@ -5512,24 +5499,27 @@ func (s *Server) startProvisionedTenantSchemaInit(ctx context.Context, res *prov
 	})
 }
 
-func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string, tokenVersion int, source apiKeyIssueSource) (rawToken, apiKeyID string, err error) {
+// buildOwnerAPIKey generates the owner token and encrypts it, returning the
+// API key record ready for persistence. It performs no writes, so callers
+// can fold the insert into a larger transaction.
+func (s *Server) buildOwnerAPIKey(ctx context.Context, tenantID, keyName string, tokenVersion int, source apiKeyIssueSource) (rawToken, apiKeyID string, rec *meta.APIKey, err error) {
 	if tokenVersion <= 0 {
 		tokenVersion, err = newScopedTokenVersion()
 		if err != nil {
-			return "", "", err
+			return "", "", nil, err
 		}
 	}
 	rawToken, err = token.IssueTokenWithJournalPermissions(s.tokenSecret, tenantID, tokenVersion, time.Time{}, ownerJournalPermissionList())
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 	cipherToken, err := s.pool.Encrypt(ctx, []byte(rawToken))
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 	now := time.Now().UTC()
 	apiKeyID = token.NewID()
-	if err := s.meta.InsertAPIKey(ctx, &meta.APIKey{
+	return rawToken, apiKeyID, &meta.APIKey{
 		ID:                   apiKeyID,
 		TenantID:             tenantID,
 		KeyName:              keyName,
@@ -5544,7 +5534,15 @@ func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string,
 		IssuedAt:             now,
 		CreatedAt:            now,
 		UpdatedAt:            now,
-	}); err != nil {
+	}, nil
+}
+
+func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string, tokenVersion int, source apiKeyIssueSource) (rawToken, apiKeyID string, err error) {
+	rawToken, apiKeyID, rec, err := s.buildOwnerAPIKey(ctx, tenantID, keyName, tokenVersion, source)
+	if err != nil {
+		return "", "", err
+	}
+	if err := s.meta.InsertAPIKey(ctx, rec); err != nil {
 		return "", "", err
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_api_key", "result", "ok")

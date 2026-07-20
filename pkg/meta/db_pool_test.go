@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 func registerTestSharedDB(t *testing.T, s *Store, orgID, host, name string) int64 {
@@ -415,45 +416,172 @@ func TestGetTenantPlacementNotFound(t *testing.T) {
 	}
 }
 
-func TestReserveSharedDBPlacementEnforcesCapacityAtomically(t *testing.T) {
+func seedPendingTenant(t *testing.T, s *Store, tenantID string) {
+	t.Helper()
+	now := time.Now().UTC()
+	if err := s.InsertTenant(context.Background(), &Tenant{
+		ID: tenantID, Status: TenantPending, Provider: "tidb_cloud_native",
+		DBPasswordCipher: []byte{}, SchemaVersion: 1, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("InsertTenant: %v", err)
+	}
+}
+
+func testOwnerKey(tenantID string) *APIKey {
+	now := time.Now().UTC()
+	return &APIKey{
+		ID: "key-" + tenantID, TenantID: tenantID, KeyName: "default",
+		JWTCiphertext: []byte("cipher-" + tenantID), JWTHash: "hash-" + tenantID,
+		TokenVersion: 1, Status: APIKeyActive, ScopeKind: APIKeyScopeKindOwner,
+		IssuedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+}
+
+func TestCompleteSharedTenantProvisionCommitsAtomically(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 
 	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
-		OrgID: "org-reserve", Host: "h", Port: 4000, User: "u",
-		PasswordCipher: []byte("c"), Name: "reserve_db", MaxTenants: 2,
+		OrgID: "org-complete", Host: "h", Port: 4000, User: "u",
+		PasswordCipher: []byte("c"), Name: "complete_db", MaxTenants: 5,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
 	}
-	reserve := func(fsID int64) error {
-		return s.ReserveSharedDBPlacement(ctx, &TenantPlacement{
-			FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
-		})
+	seedPendingTenant(t, s, "tenant-complete-1")
+	fsID, err := s.EnsureFsID(ctx, "tenant-complete-1")
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
 	}
-	if err := reserve(101); err != nil {
-		t.Fatalf("reserve 101: %v", err)
+	if err := s.CompleteSharedTenantProvision(ctx, "tenant-complete-1", "tidb_cloud_native_shared", &TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}, testOwnerKey("tenant-complete-1")); err != nil {
+		t.Fatalf("CompleteSharedTenantProvision: %v", err)
 	}
-	if err := reserve(102); err != nil {
-		t.Fatalf("reserve 102: %v", err)
+
+	tenant, err := s.GetTenant(ctx, "tenant-complete-1")
+	if err != nil {
+		t.Fatalf("GetTenant: %v", err)
 	}
-	// The third reservation exceeds max_tenants=2 and must fail without
-	// writing a placement row.
-	if err := reserve(103); !errors.Is(err, ErrSharedDBCapacityExhausted) {
-		t.Fatalf("reserve 103 error = %v, want ErrSharedDBCapacityExhausted", err)
+	if tenant.Provider != "tidb_cloud_native_shared" || tenant.Status != TenantActive {
+		t.Fatalf("tenant = provider %q status %q, want tidb_cloud_native_shared/active", tenant.Provider, tenant.Status)
 	}
-	if _, err := s.GetTenantPlacement(ctx, 103); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("placement 103 after failed reserve = %v, want ErrNotFound", err)
+	p, err := s.GetTenantPlacement(ctx, fsID)
+	if err != nil {
+		t.Fatalf("GetTenantPlacement: %v", err)
 	}
-	got, err := s.GetSharedDB(ctx, dbID)
+	if p.DbID != dbID || p.Placement != PlacementShared {
+		t.Fatalf("placement = %+v", p)
+	}
+	db, err := s.GetSharedDB(ctx, dbID)
 	if err != nil {
 		t.Fatalf("GetSharedDB: %v", err)
 	}
-	if got.TenantCount != 2 {
-		t.Fatalf("TenantCount = %d, want 2 (no leak from failed reserve)", got.TenantCount)
+	if db.TenantCount != 1 {
+		t.Fatalf("TenantCount = %d, want 1", db.TenantCount)
 	}
-	if _, err := s.GetTenantPlacement(ctx, 101); err != nil {
-		t.Fatalf("placement 101 missing after successful reserve: %v", err)
+	var keyCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tenant_api_keys WHERE tenant_id = ?`, "tenant-complete-1").Scan(&keyCount); err != nil {
+		t.Fatal(err)
+	}
+	if keyCount != 1 {
+		t.Fatalf("owner keys = %d, want 1", keyCount)
+	}
+}
+
+func TestCompleteSharedTenantProvisionCapacityExhaustedLeavesNoPartialState(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		OrgID: "org-capped", Host: "h", Port: 4000, User: "u",
+		PasswordCipher: []byte("c"), Name: "capped_db", MaxTenants: 1,
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	seedPendingTenant(t, s, "tenant-cap-1")
+	seedPendingTenant(t, s, "tenant-cap-2")
+	fs1, _ := s.EnsureFsID(ctx, "tenant-cap-1")
+	fs2, _ := s.EnsureFsID(ctx, "tenant-cap-2")
+	if err := s.CompleteSharedTenantProvision(ctx, "tenant-cap-1", "tidb_cloud_native_shared", &TenantPlacement{
+		FsID: fs1, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}, testOwnerKey("tenant-cap-1")); err != nil {
+		t.Fatalf("first provision: %v", err)
+	}
+	err = s.CompleteSharedTenantProvision(ctx, "tenant-cap-2", "tidb_cloud_native_shared", &TenantPlacement{
+		FsID: fs2, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}, testOwnerKey("tenant-cap-2"))
+	if !errors.Is(err, ErrSharedDBCapacityExhausted) {
+		t.Fatalf("second provision error = %v, want ErrSharedDBCapacityExhausted", err)
+	}
+
+	// Nothing of the losing provision may persist.
+	if _, err := s.GetTenantPlacement(ctx, fs2); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("loser placement = %v, want ErrNotFound", err)
+	}
+	tenant, err := s.GetTenant(ctx, "tenant-cap-2")
+	if err != nil {
+		t.Fatalf("GetTenant: %v", err)
+	}
+	if tenant.Provider != "tidb_cloud_native" || tenant.Status != TenantPending {
+		t.Fatalf("loser tenant = provider %q status %q, want unchanged tidb_cloud_native/pending", tenant.Provider, tenant.Status)
+	}
+	var keyCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tenant_api_keys WHERE tenant_id = ?`, "tenant-cap-2").Scan(&keyCount); err != nil {
+		t.Fatal(err)
+	}
+	if keyCount != 0 {
+		t.Fatalf("loser owner keys = %d, want 0", keyCount)
+	}
+	db, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if db.TenantCount != 1 {
+		t.Fatalf("TenantCount = %d, want 1 (no leak)", db.TenantCount)
+	}
+}
+
+func TestCompleteSharedTenantProvisionRollsBackOnMissingTenant(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		OrgID: "org-rollback", Host: "h", Port: 4000, User: "u",
+		PasswordCipher: []byte("c"), Name: "rollback_db",
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	fsID, err := s.EnsureFsID(ctx, "tenant-ghost")
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	// No tenant row for tenant-ghost: the tenant update fails and the whole
+	// transaction must roll back — no placement, no capacity, no key.
+	err = s.CompleteSharedTenantProvision(ctx, "tenant-ghost", "tidb_cloud_native_shared", &TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}, testOwnerKey("tenant-ghost"))
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("provision error = %v, want ErrNotFound", err)
+	}
+	if _, err := s.GetTenantPlacement(ctx, fsID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("placement after rollback = %v, want ErrNotFound", err)
+	}
+	db, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if db.TenantCount != 0 {
+		t.Fatalf("TenantCount = %d, want 0 after rollback", db.TenantCount)
+	}
+	var keyCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tenant_api_keys WHERE tenant_id = ?`, "tenant-ghost").Scan(&keyCount); err != nil {
+		t.Fatal(err)
+	}
+	if keyCount != 0 {
+		t.Fatalf("owner keys after rollback = %d, want 0", keyCount)
 	}
 }
 
@@ -468,16 +596,21 @@ func TestDeleteTenantPlacementAndDecrCountIsAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
 	}
-	if err := s.ReserveSharedDBPlacement(ctx, &TenantPlacement{
-		FsID: 201, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
-	}); err != nil {
-		t.Fatalf("reserve: %v", err)
+	seedPendingTenant(t, s, "tenant-release-1")
+	fsID, err := s.EnsureFsID(ctx, "tenant-release-1")
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	if err := s.CompleteSharedTenantProvision(ctx, "tenant-release-1", "tidb_cloud_native_shared", &TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}, testOwnerKey("tenant-release-1")); err != nil {
+		t.Fatalf("provision: %v", err)
 	}
 
-	if err := s.DeleteTenantPlacementAndDecrCount(ctx, 201, dbID); err != nil {
+	if err := s.DeleteTenantPlacementAndDecrCount(ctx, fsID, dbID); err != nil {
 		t.Fatalf("DeleteTenantPlacementAndDecrCount: %v", err)
 	}
-	if _, err := s.GetTenantPlacement(ctx, 201); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetTenantPlacement(ctx, fsID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("placement after delete = %v, want ErrNotFound", err)
 	}
 	got, err := s.GetSharedDB(ctx, dbID)
