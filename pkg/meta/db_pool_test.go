@@ -414,3 +414,96 @@ func TestGetTenantPlacementNotFound(t *testing.T) {
 		t.Fatalf("GetTenantPlacement error = %v, want ErrNotFound", err)
 	}
 }
+
+func TestReserveSharedDBPlacementEnforcesCapacityAtomically(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		OrgID: "org-reserve", Host: "h", Port: 4000, User: "u",
+		PasswordCipher: []byte("c"), Name: "reserve_db", MaxTenants: 2,
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	reserve := func(fsID int64) error {
+		return s.ReserveSharedDBPlacement(ctx, &TenantPlacement{
+			FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+		})
+	}
+	if err := reserve(101); err != nil {
+		t.Fatalf("reserve 101: %v", err)
+	}
+	if err := reserve(102); err != nil {
+		t.Fatalf("reserve 102: %v", err)
+	}
+	// The third reservation exceeds max_tenants=2 and must fail without
+	// writing a placement row.
+	if err := reserve(103); !errors.Is(err, ErrSharedDBCapacityExhausted) {
+		t.Fatalf("reserve 103 error = %v, want ErrSharedDBCapacityExhausted", err)
+	}
+	if _, err := s.GetTenantPlacement(ctx, 103); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("placement 103 after failed reserve = %v, want ErrNotFound", err)
+	}
+	got, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if got.TenantCount != 2 {
+		t.Fatalf("TenantCount = %d, want 2 (no leak from failed reserve)", got.TenantCount)
+	}
+	if _, err := s.GetTenantPlacement(ctx, 101); err != nil {
+		t.Fatalf("placement 101 missing after successful reserve: %v", err)
+	}
+}
+
+func TestDeleteTenantPlacementAndDecrCountIsAtomic(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		OrgID: "org-release", Host: "h", Port: 4000, User: "u",
+		PasswordCipher: []byte("c"), Name: "release_db",
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	if err := s.ReserveSharedDBPlacement(ctx, &TenantPlacement{
+		FsID: 201, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+
+	if err := s.DeleteTenantPlacementAndDecrCount(ctx, 201, dbID); err != nil {
+		t.Fatalf("DeleteTenantPlacementAndDecrCount: %v", err)
+	}
+	if _, err := s.GetTenantPlacement(ctx, 201); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("placement after delete = %v, want ErrNotFound", err)
+	}
+	got, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if got.TenantCount != 0 {
+		t.Fatalf("TenantCount = %d, want 0", got.TenantCount)
+	}
+
+	// Missing placement: ErrNotFound.
+	if err := s.DeleteTenantPlacementAndDecrCount(ctx, 299, dbID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete missing placement error = %v, want ErrNotFound", err)
+	}
+
+	// When the pool row is gone, the whole tx must roll back: the placement
+	// row survives so the caller can retry instead of orphaning it.
+	if err := s.UpsertTenantPlacement(ctx, &TenantPlacement{
+		FsID: 301, DbID: dbID + 999, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}); err != nil {
+		t.Fatalf("seed orphan-candidate placement: %v", err)
+	}
+	if err := s.DeleteTenantPlacementAndDecrCount(ctx, 301, dbID+999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete with missing pool error = %v, want ErrNotFound", err)
+	}
+	if _, err := s.GetTenantPlacement(ctx, 301); err != nil {
+		t.Fatalf("placement must survive rolled-back delete: %v", err)
+	}
+}

@@ -7,9 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // TestSharedTenantDeleteRetriesAfterPlacementRemoval covers the shared-delete
@@ -107,8 +112,25 @@ func TestSharedTenantDeleteWithCleanupJobShortCircuits(t *testing.T) {
 // allocates identity: a shared tenant without an fs_registry row fails the
 // delete instead of minting a phantom fs_id (ResolveFsID, not EnsureFsID).
 func TestSharedTenantDeleteWithoutFsIDFails(t *testing.T) {
+	// The server's one-time startup backfill re-registers any tenant without
+	// an fs_id, so the row deletion below must happen strictly after that
+	// backfill has run — otherwise the test races it (the backfill recreates
+	// the row and the delete returns 202). Watch the global logger for the
+	// backfill's completion marker.
+	core, recorded := observer.New(zap.InfoLevel)
+	prev := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(prev) })
+
 	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudNativeShared, meta.APIKeyScopeKindOwner)
 	ctx := context.Background()
+	deadline := time.Now().Add(10 * time.Second)
+	for recorded.FilterField(zap.String("event", "fs_registry_backfill_done")).Len() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("startup fs_registry backfill did not complete in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	// InsertTenant allocated an fs_id at provision time; simulate a tenant
 	// whose registry row was reaped out of band — the delete must fail, not
 	// mint a new one.
@@ -261,5 +283,117 @@ func TestAdminTenantGetRejectsSharedProvider(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
+	}
+}
+
+// TestSharedTenantDeletePlacementRemovalFailureStaysRetryable injects a
+// failure into the placement-removal transaction (the pool row disappears
+// between purge and removal) and proves the delete fails closed: 500, tenant
+// stays deleting, the placement row survives for the retry, and the owner
+// key stays active — instead of orphaning the placement on a terminal
+// tenant.
+func TestSharedTenantDeletePlacementRemovalFailureStaysRetryable(t *testing.T) {
+	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudNativeShared, meta.APIKeyScopeKindOwner)
+	ctx := context.Background()
+	fsID, err := rt.meta.EnsureFsID(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	db := newTenantDeleteDBInfo(t)
+	passCipher, err := rt.pool.Encrypt(ctx, []byte(db.DBPass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		OrgID: "org-shared-delete", Host: db.DBHost, Port: db.DBPort, User: db.DBUser,
+		PasswordCipher: passCipher, Name: db.DBName,
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+	}); err != nil {
+		t.Fatalf("UpsertTenantPlacement: %v", err)
+	}
+	// Pre-warm the shared handle with a scratch database in which every
+	// shared-schema table is absent: the purge in the delete below reuses
+	// the cached handle and succeeds trivially, but the placement removal
+	// transaction cannot release capacity on a missing pool row and must
+	// roll back. (The test DB carries standalone-shape tables of the same
+	// names, so drop them first — the next test's schema init recreates
+	// them.)
+	for _, tbl := range []string{
+		"journal_entry_subjects", "journal_entries", "journal_append_requests", "journal_labels", "journals",
+		"vault_audit_log", "vault_grants", "vault_tokens", "vault_secret_fields", "vault_secrets", "vault_policies", "vault_deks",
+		"git_workspace_object_packs", "git_workspace_overlay", "git_workspace_git_state", "git_workspace_tree_nodes", "git_workspaces",
+		"fs_layer_checkpoints", "fs_layer_events", "fs_layer_tags", "fs_layer_entries", "fs_layers",
+		"fs_events", "semantic_tasks", "file_gc_tasks", "uploads", "file_tags", "file_nodes", "semantic", "contents", "inodes",
+	} {
+		if _, err := rt.meta.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
+			t.Fatalf("drop %s: %v", tbl, err)
+		}
+	}
+	if err := rt.pool.PurgeSharedTenant(ctx, fsID, dbID); err != nil {
+		t.Fatalf("pre-warm purge: %v", err)
+	}
+	if _, err := rt.meta.DB().ExecContext(ctx, "DELETE FROM db_pool WHERE db_id = ?", dbID); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := rt.deleteTenant(t, nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
+	}
+	var status string
+	if err := rt.meta.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", rt.tenantID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantDeleting) {
+		t.Fatalf("tenant status = %s, want %s", status, meta.TenantDeleting)
+	}
+	if _, err := rt.meta.GetTenantPlacement(ctx, fsID); err != nil {
+		t.Fatalf("placement must survive the rolled-back removal: %v", err)
+	}
+	var activeKeys int
+	if err := rt.meta.DB().QueryRow("SELECT COUNT(*) FROM tenant_api_keys WHERE tenant_id = ? AND status = ?", rt.tenantID, meta.APIKeyActive).Scan(&activeKeys); err != nil {
+		t.Fatal(err)
+	}
+	if activeKeys != 1 {
+		t.Fatalf("active api keys = %d, want 1 (owner can retry)", activeKeys)
+	}
+}
+
+// TestFindSharedDBForProvisionSkipsNonTiDBProviders proves a wildcard shared
+// pool only ever captures TiDB-dialect tenants: db9 (PostgreSQL) tenants must
+// never be placed on the TiDB shared schema and relabeled
+// tidb_cloud_native_shared.
+func TestFindSharedDBForProvisionSkipsNonTiDBProviders(t *testing.T) {
+	db := newTenantDeleteDBInfo(t)
+	testmysql.ResetMetaDB(t, db.Meta.DB())
+	ctx := context.Background()
+	if _, err := db.Meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		OrgID: meta.SharedDBOrgWildcard, Host: "shared.example.com", Port: 4000, User: "root",
+		PasswordCipher: []byte("cipher"), Name: "shared_db",
+	}); err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	s := &Server{meta: db.Meta}
+
+	got, err := s.findSharedDBForProvision(ctx, tenant.ProviderDB9, provisionTenantOptions{})
+	if err != nil {
+		t.Fatalf("db9 lookup: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("db9 matched shared pool %v, want no match", got)
+	}
+	// TiDB-dialect providers still route: tidb_zero matches the wildcard.
+	got, err = s.findSharedDBForProvision(ctx, tenant.ProviderTiDBZero, provisionTenantOptions{})
+	if err != nil {
+		t.Fatalf("tidb_zero lookup: %v", err)
+	}
+	if got == nil {
+		t.Fatal("tidb_zero did not match the wildcard pool, want match")
 	}
 }

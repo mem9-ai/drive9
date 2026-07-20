@@ -31,6 +31,12 @@ KEEP_DB="${KEEP_DB:-0}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-180}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-2}"
 
+# Remember which endpoints were supplied externally: the container startup
+# paths assign these variables too, and only externally supplied endpoints
+# should bypass container execs.
+META_DSN_EXTERNAL=0; [ -n "$META_DSN" ] && META_DSN_EXTERNAL=1
+SHARED_DSN_EXTERNAL=0; [ -n "$SHARED_DSN" ] && SHARED_DSN_EXTERNAL=1
+
 MYSQL_CONTAINER=""
 TIDB_CONTAINER=""
 NETWORK=""
@@ -57,7 +63,10 @@ cleanup() {
   fi
   [ "$rc" -eq 0 ] && rm -rf "$TMP_DIR" || log "failed; artifacts kept at $TMP_DIR"
   log "passed=$PASS_COUNT failed=$FAIL_COUNT"
-  [ "$FAIL_COUNT" -eq 0 ]
+  # Fold the trapped exit code into the final status: a hard abort under
+  # set -e (build failure, container startup, ...) must not report success
+  # just because no check_eq ran yet.
+  [ "$rc" -eq 0 ] && [ "$FAIL_COUNT" -eq 0 ]
   exit $?
 }
 trap cleanup EXIT
@@ -82,8 +91,36 @@ detect_runtime() {
   exit 1
 }
 
-meta_exec() { "$DB_RUNTIME" exec "$MYSQL_CONTAINER" mysql -uroot -p"$DB_PASSWORD" -N -e "$1"; }
-tidb_exec() { "$DB_RUNTIME" exec "$MYSQL_CONTAINER" mysql -h tidb-e2e -P 4000 -uroot -N -e "$1" 2>/dev/null; }
+# run_mysql_dsn runs the mysql client against a DSN of the form
+# user:pass@tcp(host:port)/dbname?params. Used instead of container execs
+# when an endpoint is supplied externally.
+run_mysql_dsn() {
+  python3 - "$1" "$2" <<'PY'
+import re, subprocess, sys
+dsn, sql = sys.argv[1], sys.argv[2]
+m = re.match(r'([^:]+):([^@]*)@tcp\(([^:]+):(\d+)\)/([^?]+)', dsn)
+if not m:
+    sys.exit(f"cannot parse DSN for mysql client: {dsn!r}")
+user, pw, host, port, _db = m.groups()
+cmd = ["mysql", "-N", "-h", host, "-P", port, "-u", user, f"-p{pw}", "-e", sql]
+sys.exit(subprocess.run(cmd).returncode)
+PY
+}
+
+meta_exec() {
+  if [ "$META_DSN_EXTERNAL" = "1" ]; then
+    run_mysql_dsn "$META_DSN" "$1"
+  else
+    "$DB_RUNTIME" exec "$MYSQL_CONTAINER" mysql -uroot -p"$DB_PASSWORD" -N -e "$1"
+  fi
+}
+tidb_exec() {
+  if [ "$SHARED_DSN_EXTERNAL" = "1" ]; then
+    run_mysql_dsn "$SHARED_DSN" "$1" 2>/dev/null
+  else
+    "$DB_RUNTIME" exec "$MYSQL_CONTAINER" mysql -h tidb-e2e -P 4000 -uroot -N -e "$1" 2>/dev/null
+  fi
+}
 
 start_mysql_container() {
   MYSQL_CONTAINER="drive9-shared-e2e-mysql-$(date +%s)-$$"
@@ -181,9 +218,16 @@ stop_server() {
 }
 
 need_cmd curl; need_cmd python3; need_cmd jq; need_cmd go
+if [ "$META_DSN_EXTERNAL" = "1" ] || [ "$SHARED_DSN_EXTERNAL" = "1" ]; then
+  # External endpoints are probed with the local mysql client instead of
+  # container execs.
+  need_cmd mysql
+fi
 
-detect_runtime
 if [ -z "$META_DSN" ] || [ -z "$SHARED_DSN" ] || [ -z "$STANDALONE_DSN" ]; then
+  # A container runtime is only needed when one of the DSNs is not supplied
+  # externally; with all three set, no container is started at all.
+  detect_runtime
   NETWORK="drive9-shared-e2e-net-$$"
   "$DB_RUNTIME" network create "$NETWORK" >/dev/null
 fi

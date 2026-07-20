@@ -5027,8 +5027,17 @@ func (s *Server) updateTenantSchemaVersionForProfile(ctx context.Context, tenant
 // tenant should follow the normal per-tenant provisioning path. Lookup
 // failures are returned as errors — never silently treated as "no pool",
 // which would provision the wrong tenant shape on a transient meta outage.
+//
+// Only TiDB-dialect providers may route to a shared pool (the shared schema
+// is TiDB/MySQL DDL): db9 tenants are PostgreSQL-backed and engine-
+// incompatible, so a wildcard pool must never capture them.
 func (s *Server) findSharedDBForProvision(ctx context.Context, provider string, opts provisionTenantOptions) (*meta.SharedDB, error) {
 	if s.meta == nil {
+		return nil, nil
+	}
+	switch provider {
+	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBCloudNativeShared, tenant.ProviderTiDBZero:
+	default:
 		return nil, nil
 	}
 	orgID := ""
@@ -5098,19 +5107,23 @@ func (s *Server) provisionTenantOnSharedDB(ctx context.Context, tenantID string,
 	}); err != nil {
 		return fail(err)
 	}
-	if err := s.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+	// Capacity and placement are reserved atomically: two concurrent
+	// provisions cannot take the same last slot, and a placement row never
+	// exists without its reserved capacity.
+	if err := s.meta.ReserveSharedDBPlacement(ctx, &meta.TenantPlacement{
 		FsID:        fsID,
 		DbID:        sharedDB.DbID,
 		Placement:   meta.PlacementShared,
 		SchemaShape: meta.SchemaShapeShared,
 	}); err != nil {
+		if errors.Is(err, meta.ErrSharedDBCapacityExhausted) {
+			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			return nil, newProvisionTenantError(http.StatusConflict, "shared pool is at capacity", err)
+		}
 		return fail(err)
 	}
 	if err := s.meta.UpdateTenantProvider(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
 		return fail(err)
-	}
-	if err := s.meta.IncrSharedDBTenantCount(ctx, sharedDB.DbID, 1); err != nil {
-		logger.Warn(ctx, "server_event", eventFields(ctx, "shared_pool_tenant_count_failed", "tenant_id", tenantID, "error", err)...)
 	}
 	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantActive); err != nil {
 		return fail(err)

@@ -2321,7 +2321,7 @@ func TestTenantPoolClaimSeedsQuotaConfigWithoutExplicitQuota(t *testing.T) {
 		t.Fatalf("upsert binding: %v", err)
 	}
 
-	res, _, claimed, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
+	res, _, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	}, nil)

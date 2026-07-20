@@ -344,6 +344,107 @@ func (s *Store) DeleteTenantPlacement(ctx context.Context, fsID int64) (err erro
 	return nil
 }
 
+// ErrSharedDBCapacityExhausted is returned by ReserveSharedDBPlacement when
+// the target pool has no free capacity (max_tenants reached).
+var ErrSharedDBCapacityExhausted = errors.New("shared db capacity exhausted")
+
+// ReserveSharedDBPlacement atomically reserves one capacity slot on a shared
+// DB and records the tenant's placement in a single transaction: the counter
+// increment is conditional on free capacity, so two concurrent provisions
+// cannot both take the last slot, and the placement row never exists without
+// its reserved capacity (or vice versa).
+func (s *Store) ReserveSharedDBPlacement(ctx context.Context, p *TenantPlacement) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "reserve_shared_db_placement", start, &err)
+	if p == nil {
+		return fmt.Errorf("tenant placement is required")
+	}
+	if p.FsID <= 0 {
+		return fmt.Errorf("fs_id must be positive")
+	}
+	if p.DbID <= 0 {
+		return fmt.Errorf("db_id must be positive")
+	}
+	if p.Placement != PlacementShared || p.SchemaShape != SchemaShapeShared {
+		return fmt.Errorf("reserve requires shared placement and schema shape")
+	}
+	status := p.Status
+	if status == "" {
+		status = sharedDBStatusActive
+	}
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE db_pool SET tenant_count = tenant_count + 1
+				WHERE db_id = ? AND (max_tenants = 0 OR tenant_count < max_tenants)`, p.DbID)
+		if err != nil {
+			return fmt.Errorf("reserve capacity on db %d: %w", p.DbID, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("reserve capacity rows affected for db %d: %w", p.DbID, err)
+		}
+		if affected == 0 {
+			return ErrSharedDBCapacityExhausted
+		}
+		var target any
+		if p.TargetDbID != nil {
+			target = *p.TargetDbID
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO tenant_placements (fs_id, db_id, placement, schema_shape, status, target_db_id)
+				VALUES (?, ?, ?, ?, ?, ?)`,
+			p.FsID, p.DbID, p.Placement, p.SchemaShape, status, target); err != nil {
+			return fmt.Errorf("insert placement for fs_id %d: %w", p.FsID, err)
+		}
+		return nil
+	})
+}
+
+// DeleteTenantPlacementAndDecrCount atomically removes a tenant's placement
+// and releases its capacity slot in a single transaction. Making the two
+// writes atomic keeps the shared delete path retry-safe: a failure rolls both
+// back, so a retried delete re-enters with the placement row still present
+// and cannot orphan the row or double-decrement the counter. Returns
+// ErrNotFound when the placement row does not exist.
+func (s *Store) DeleteTenantPlacementAndDecrCount(ctx context.Context, fsID, dbID int64) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_tenant_placement_and_decr_count", start, &err)
+	if fsID <= 0 {
+		return fmt.Errorf("fs_id must be positive")
+	}
+	if dbID <= 0 {
+		return fmt.Errorf("db_id must be positive")
+	}
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `DELETE FROM tenant_placements WHERE fs_id = ?`, fsID)
+		if err != nil {
+			return fmt.Errorf("delete tenant placement for fs_id %d: %w", fsID, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("delete tenant placement rows affected for fs_id %d: %w", fsID, err)
+		}
+		if affected == 0 {
+			return ErrNotFound
+		}
+		res, err = tx.ExecContext(ctx,
+			`UPDATE db_pool SET tenant_count = GREATEST(tenant_count - 1, 0) WHERE db_id = ?`, dbID)
+		if err != nil {
+			return fmt.Errorf("release capacity on db %d: %w", dbID, err)
+		}
+		affected, err = res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("release capacity rows affected for db %d: %w", dbID, err)
+		}
+		if affected == 0 {
+			// The placement pointed at a pool row that no longer exists —
+			// a data-integrity problem the caller must not silently pass.
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
 // scanSharedDBRow scans one db_pool row selected with sharedDBSelectColumns.
 func scanSharedDBRow(row *sql.Row) (*SharedDB, error) {
 	var rec SharedDB

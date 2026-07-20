@@ -558,7 +558,8 @@ func metaInitSchemaStatements() []string {
 		// database to a TiDB Cloud organization; the '*' wildcard row serves
 		// organizations without an exact entry. db_password holds the same
 		// encrypted envelope as tenants.db_password. tenant_count is maintained
-		// via IncrSharedDBTenantCount as placements are created and removed.
+		// atomically with placement writes via ReserveSharedDBPlacement and
+		// DeleteTenantPlacementAndDecrCount.
 		// The `role` column name is backtick-quoted because ROLE is a reserved
 		// word in MySQL 8.0.
 		`CREATE TABLE IF NOT EXISTS db_pool (
