@@ -110,7 +110,7 @@ func (f *fakeMetaQuotaStore) GetQuotaConfigVersion(ctx context.Context, tenantID
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if cfg, ok := f.config[tenantID]; ok {
-		return fmt.Sprintf("%d:%d:%d:%d:%d:%d", cfg.MaxStorageBytes, cfg.MaxFileSizeBytes, cfg.MaxFileCount, cfg.MaxMediaLLMFiles, cfg.MaxVideoLLMFiles, cfg.MaxMonthlyCostMC), nil
+		return fmt.Sprintf("v3:%d:%d:%d:%d:%d:%d", cfg.MaxStorageBytes, cfg.MaxFileSizeBytes, cfg.MaxFileCount, cfg.MaxMediaLLMFiles, cfg.MaxVideoLLMFiles, cfg.MaxMonthlyCostMC), nil
 	}
 	return "", nil
 }

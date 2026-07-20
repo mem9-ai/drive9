@@ -1712,6 +1712,7 @@ func TestDiffMetaTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
 			"max_file_size_bytes":                 {columnType: "bigint"},
 			"max_file_count":                      {columnType: "bigint"},
 			"max_media_llm_files":                 {columnType: "bigint"},
+			"max_video_llm_files":                 {columnType: "bigint"},
 			"max_monthly_cost_mc":                 {columnType: "bigint"},
 			"quota_limits_overridden":             {columnType: "tinyint(1)"},
 			"tidbcloud_spending_limit":            {columnType: "bigint"},
