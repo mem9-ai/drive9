@@ -115,20 +115,22 @@ type LLMUsageRecord struct {
 
 // MutationLogEntry represents a durable outbox entry for quota state mutations.
 type MutationLogEntry struct {
-	ID           int64
-	TenantID     string
-	MutationType string // file_create, file_overwrite, file_delete, upload_initiate, upload_complete, upload_abort, llm_cost_record
-	MutationData json.RawMessage
-	Status       string // "pending", "applied", "failed"
-	RetryCount   int
-	CreatedAt    time.Time
-	AppliedAt    *time.Time
+	ID             int64
+	TenantID       string
+	TiDBCloudOrgID string
+	MutationType   string // file_create, file_overwrite, file_delete, upload_initiate, upload_complete, upload_abort, llm_cost_record
+	MutationData   json.RawMessage
+	Status         string // "pending", "applied", "failed"
+	RetryCount     int
+	CreatedAt      time.Time
+	AppliedAt      *time.Time
 }
 
 // MutationBacklogObservation is a tenant-level view of pending quota mutation
 // replay work for metrics and alerts.
 type MutationBacklogObservation struct {
 	TenantID                string
+	TiDBCloudOrgID          string
 	PendingCount            int64
 	OldestPendingAgeSeconds float64
 }
@@ -703,7 +705,7 @@ func retryMetaLockConflict(ctx context.Context, tenantID, metricOperation, logOp
 			zap.String("operation", logOperation),
 			zap.Int("attempt", attempt),
 			zap.Error(err))
-		metrics.RecordTenantOperationCount(tenantID, "central_quota", metricOperation, "lock_conflict_retry")
+		metrics.RecordTenantOperationCountWithOrg(tenantID, "", "central_quota", metricOperation, "lock_conflict_retry")
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -1208,10 +1210,11 @@ func (s *Store) ListPendingMutations(ctx context.Context, minAge time.Duration, 
 	}
 	cutoff := time.Now().UTC().Add(-minAge)
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, tenant_id, mutation_type, mutation_data, status, retry_count, created_at, applied_at
-		 FROM quota_mutation_log
-		 WHERE status = 'pending' AND created_at < ?
-		 ORDER BY tenant_id, id ASC
+		`SELECT q.id, q.tenant_id, COALESCE(b.organization_id, ''), q.mutation_type, q.mutation_data, q.status, q.retry_count, q.created_at, q.applied_at
+		 FROM quota_mutation_log q
+		 LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = q.tenant_id
+		 WHERE q.status = 'pending' AND q.created_at < ?
+		 ORDER BY q.tenant_id, q.id ASC
 		 LIMIT ?`, cutoff, limit)
 	if err != nil {
 		return nil, err
@@ -1221,7 +1224,7 @@ func (s *Store) ListPendingMutations(ctx context.Context, minAge time.Duration, 
 	var entries []MutationLogEntry
 	for rows.Next() {
 		var e MutationLogEntry
-		if err := rows.Scan(&e.ID, &e.TenantID, &e.MutationType, &e.MutationData, &e.Status, &e.RetryCount, &e.CreatedAt, &e.AppliedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.TenantID, &e.TiDBCloudOrgID, &e.MutationType, &e.MutationData, &e.Status, &e.RetryCount, &e.CreatedAt, &e.AppliedAt); err != nil {
 			return entries, err
 		}
 		entries = append(entries, e)
@@ -1236,11 +1239,12 @@ func (s *Store) ObservePendingMutations(ctx context.Context) ([]MutationBacklogO
 	defer observeMeta(ctx, "observe_pending_mutations", start, &err)
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT tenant_id, COUNT(*), MIN(created_at)
-		 FROM quota_mutation_log FORCE INDEX (idx_pending_tenant_age)
-		 WHERE status = 'pending'
-		 GROUP BY tenant_id
-		 ORDER BY tenant_id`)
+		`SELECT q.tenant_id, COALESCE(b.organization_id, ''), COUNT(*), MIN(q.created_at)
+		 FROM quota_mutation_log q FORCE INDEX (idx_pending_tenant_age)
+		 LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = q.tenant_id
+		 WHERE q.status = 'pending'
+		 GROUP BY q.tenant_id, b.organization_id
+		 ORDER BY q.tenant_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -1251,7 +1255,7 @@ func (s *Store) ObservePendingMutations(ctx context.Context) ([]MutationBacklogO
 	for rows.Next() {
 		var obs MutationBacklogObservation
 		var oldest time.Time
-		if err = rows.Scan(&obs.TenantID, &obs.PendingCount, &oldest); err != nil {
+		if err = rows.Scan(&obs.TenantID, &obs.TiDBCloudOrgID, &obs.PendingCount, &oldest); err != nil {
 			return out, err
 		}
 		age := now.Sub(oldest.UTC()).Seconds()

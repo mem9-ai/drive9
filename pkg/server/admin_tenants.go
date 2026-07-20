@@ -178,7 +178,7 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		return
 	} else if claimed {
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
-		setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
+		setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
 		s.forgetTiDBCloudRBACList(cred)
 		if res.Status == meta.TenantProvisioning {
 			s.startProvisionedTenantSchemaInit(r.Context(), res)
@@ -212,7 +212,7 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		errJSON(w, http.StatusInternalServerError, "failed to provision tenant")
 		return
 	}
-	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
+	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
 	s.forgetTiDBCloudRBACList(cred)
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
 	w.Header().Set("Content-Type", "application/json")

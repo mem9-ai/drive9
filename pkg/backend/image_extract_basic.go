@@ -68,7 +68,7 @@ func (e *fallbackImageTextExtractor) ExtractImageText(ctx context.Context, req I
 			zap.String("path", req.Path),
 			zap.String("content_type", req.ContentType),
 			zap.Error(err))
-		metrics.RecordTenantOperation(req.TenantID, "image_extract", "fallback", "primary_error", 0)
+		metrics.RecordTenantOperationWithOrg(req.TenantID, req.TiDBCloudOrgID, "image_extract", "fallback", "primary_error", 0)
 		return "", usage, fmt.Errorf("primary image extractor: %w", err)
 	}
 	if strings.TrimSpace(text) != "" {
@@ -77,6 +77,6 @@ func (e *fallbackImageTextExtractor) ExtractImageText(ctx context.Context, req I
 	logger.Warn(ctx, "backend_image_extract_primary_empty_use_fallback", zap.String("tenant_id", req.TenantID),
 		zap.String("file_id", req.FileID),
 		zap.String("path", req.Path))
-	metrics.RecordTenantOperation(req.TenantID, "image_extract", "fallback", "primary_empty", 0)
+	metrics.RecordTenantOperationWithOrg(req.TenantID, req.TiDBCloudOrgID, "image_extract", "fallback", "primary_empty", 0)
 	return e.fallback.ExtractImageText(ctx, req)
 }

@@ -13,7 +13,6 @@ import (
 	"github.com/pingcap/failpoint"
 
 	"github.com/mem9-ai/drive9/pkg/datastore"
-	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // AudioExtractRequest is the input to a pluggable audio->text extractor.
@@ -285,7 +284,7 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	start := time.Now()
 	var result AudioExtractResult
 	defer func() {
-		metrics.RecordTenantOperation(b.tenantID, "audio_extract", "process", legacyAudioExtractMetricResult(result), time.Since(start))
+		b.recordTenantOperation("audio_extract", "process", legacyAudioExtractMetricResult(result), time.Since(start))
 	}()
 
 	if !b.SupportsAsyncAudioExtract() {
@@ -293,7 +292,7 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 		return result, fmt.Errorf("async audio extract runtime not configured")
 	}
 	if b.monthlyLLMCostExceededCheck(ctx) {
-		metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "process_skip", "budget_exhausted", 0)
+		b.recordTenantOperation("llm_cost_budget", "process_skip", "budget_exhausted", 0)
 		result = AudioExtractResultBudgetExhausted
 		return result, nil
 	}

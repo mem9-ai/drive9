@@ -133,6 +133,7 @@ func TestDBHealthProbeSkipsTenantPools(t *testing.T) {
 	const (
 		role     = "user"
 		tenantID = "tenant-db-metrics-test"
+		orgID    = "org-db-metrics-test"
 	)
 
 	healthy := &atomic.Bool{}
@@ -145,7 +146,7 @@ func TestDBHealthProbeSkipsTenantPools(t *testing.T) {
 		_ = db.Close()
 	})
 
-	RegisterTenantDB(role, tenantID, db)
+	RegisterTenantDBWithOrg(role, tenantID, orgID, db)
 	globalDB.probeOnce(context.Background(), time.Second, nil)
 	out := renderDB(t)
 
@@ -155,19 +156,19 @@ func TestDBHealthProbeSkipsTenantPools(t *testing.T) {
 	if strings.Contains(out, `drive9_db_unreachable_pools{role="user"`) {
 		t.Fatalf("expected user pool to have no unreachable probe series, got:\n%s", out)
 	}
-	if !strings.Contains(out, `drive9_db_pool_registered{role="user",tenant_id="`+tenantID+`"} 1`) {
+	if !strings.Contains(out, `drive9_db_pool_registered{role="user",tenant_id="`+tenantID+`",tidbcloud_org_id="`+orgID+`"} 1`) {
 		t.Fatalf("expected tenant pool_registered series, got:\n%s", out)
 	}
-	if strings.Contains(out, `drive9_db_pool_wait_count_total{role="user",tenant_id="`+tenantID+`"`) {
+	if strings.Contains(out, `drive9_db_pool_wait_count_total{role="user",tenant_id="`+tenantID+`",tidbcloud_org_id="`+orgID+`"`) {
 		t.Fatalf("expected tenant pool with zero wait count to omit wait count series, got:\n%s", out)
 	}
-	if strings.Contains(out, `drive9_db_pool_wait_duration_seconds_total{role="user",tenant_id="`+tenantID+`"`) {
+	if strings.Contains(out, `drive9_db_pool_wait_duration_seconds_total{role="user",tenant_id="`+tenantID+`",tidbcloud_org_id="`+orgID+`"`) {
 		t.Fatalf("expected tenant pool with zero wait duration to omit wait duration series, got:\n%s", out)
 	}
-	if strings.Contains(out, `drive9_db_pool_closes_total{role="user",tenant_id="`+tenantID+`"`) {
+	if strings.Contains(out, `drive9_db_pool_closes_total{role="user",tenant_id="`+tenantID+`",tidbcloud_org_id="`+orgID+`"`) {
 		t.Fatalf("expected tenant pool with zero closes to omit close series, got:\n%s", out)
 	}
-	if strings.Contains(out, `drive9_db_pool_connections{role="user",tenant_id="`+tenantID+`"`) {
+	if strings.Contains(out, `drive9_db_pool_connections{role="user",tenant_id="`+tenantID+`",tidbcloud_org_id="`+orgID+`"`) {
 		t.Fatalf("expected tenant pool with no open connections to omit pool connection series, got:\n%s", out)
 	}
 	rec := httptest.NewRecorder()
@@ -233,7 +234,7 @@ func TestDBPoolConnectionsIncludesTenantPoolsWithOpenConnections(t *testing.T) {
 	}
 
 	out := renderDB(t)
-	if !strings.Contains(out, `drive9_db_pool_connections{role="user",tenant_id="`+tenantID+`",state="open"} 1`) {
+	if !strings.Contains(out, `drive9_db_pool_connections{role="user",tenant_id="`+tenantID+`",tidbcloud_org_id="guest",state="open"} 1`) {
 		t.Fatalf("expected tenant pool with open connections to emit pool connection series, got:\n%s", out)
 	}
 }

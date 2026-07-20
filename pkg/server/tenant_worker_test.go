@@ -35,22 +35,31 @@ func TestTenantWorkerKickAccumulation(t *testing.T) {
 	// kick dedup logic directly with a manually constructed manager.
 	m := &tenantWorkerManager{
 		inflight:    make(map[string]int),
-		kickPending: make(map[string]int),
+		kickPending: make(map[string]pendingKick),
 		kicks:       make(chan kickMsg, tenantKickQueueCapacity),
 	}
 	// First kick should be queued.
-	m.Kick("t1", WorkSemantic)
+	m.KickWithOrg("t1", "org-t1", WorkSemantic)
 	if len(m.kicks) != 1 {
 		t.Fatalf("expected 1 queued kick, got %d", len(m.kicks))
 	}
+	msg := <-m.kicks
+	if msg.tidbCloudOrgID != "org-t1" {
+		t.Fatalf("queued kick org = %q, want org-t1", msg.tidbCloudOrgID)
+	}
+	m.kicks <- msg
 	// Second kick for same tenant should coalesce (OR-accumulate mask).
 	m.Kick("t1", WorkFileGC)
 	// kickPending should have the accumulated mask.
 	m.mu.Lock()
-	pending := m.kickPending["t1"]
+	pending := m.kickPending["t1"].workMask
+	orgID := m.kickPending["t1"].tidbCloudOrgID
 	m.mu.Unlock()
 	if pending != WorkSemantic|WorkFileGC {
 		t.Fatalf("expected accumulated mask %d, got %d", WorkSemantic|WorkFileGC, pending)
+	}
+	if orgID != "org-t1" {
+		t.Fatalf("pending kick org = %q, want org-t1", orgID)
 	}
 	// Only one kick should be in the channel (coalesced, not duplicated).
 	if len(m.kicks) != 1 {
@@ -62,7 +71,7 @@ func TestTenantWorkerKickEmptyIgnored(t *testing.T) {
 	t.Parallel()
 	m := &tenantWorkerManager{
 		inflight:    make(map[string]int),
-		kickPending: make(map[string]int),
+		kickPending: make(map[string]pendingKick),
 		kicks:       make(chan kickMsg, tenantKickQueueCapacity),
 	}
 	m.Kick("t1", 0)
@@ -79,10 +88,10 @@ func TestTenantWorkerTakePendingWorkMask(t *testing.T) {
 	t.Parallel()
 	m := &tenantWorkerManager{
 		inflight:    make(map[string]int),
-		kickPending: make(map[string]int),
+		kickPending: make(map[string]pendingKick),
 		kicks:       make(chan kickMsg, tenantKickQueueCapacity),
 	}
-	m.kickPending["t1"] = WorkSemantic | WorkFileGC
+	m.kickPending["t1"] = pendingKick{workMask: WorkSemantic | WorkFileGC, tidbCloudOrgID: "org-t1"}
 	mask := m.takePendingWorkMask("t1")
 	if mask != WorkSemantic|WorkFileGC {
 		t.Fatalf("expected mask %d, got %d", WorkSemantic|WorkFileGC, mask)
@@ -91,5 +100,26 @@ func TestTenantWorkerTakePendingWorkMask(t *testing.T) {
 	mask2 := m.takePendingWorkMask("t1")
 	if mask2 != 0 {
 		t.Fatalf("expected 0 after take, got %d", mask2)
+	}
+}
+
+func TestTenantWorkerTakePendingKickIncludesOrg(t *testing.T) {
+	t.Parallel()
+	m := &tenantWorkerManager{
+		inflight:    make(map[string]int),
+		kickPending: make(map[string]pendingKick),
+		kicks:       make(chan kickMsg, tenantKickQueueCapacity),
+	}
+	m.kickPending["t1"] = pendingKick{workMask: WorkSemantic, tidbCloudOrgID: "org-t1"}
+
+	pending := m.takePendingKick("t1")
+	if pending.workMask != WorkSemantic {
+		t.Fatalf("pending mask = %d, want %d", pending.workMask, WorkSemantic)
+	}
+	if pending.tidbCloudOrgID != "org-t1" {
+		t.Fatalf("pending org = %q, want org-t1", pending.tidbCloudOrgID)
+	}
+	if _, ok := m.kickPending["t1"]; ok {
+		t.Fatal("pending kick should be cleared")
 	}
 }

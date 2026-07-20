@@ -13,16 +13,16 @@ import (
 	"github.com/pingcap/failpoint"
 
 	"github.com/mem9-ai/drive9/pkg/datastore"
-	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // ImageExtractRequest is the input to a pluggable image->text extractor.
 type ImageExtractRequest struct {
-	TenantID    string
-	FileID      string
-	Path        string
-	ContentType string
-	Data        []byte
+	TenantID       string
+	TiDBCloudOrgID string
+	FileID         string
+	Path           string
+	ContentType    string
+	Data           []byte
 }
 
 // ImageTextExtractor extracts searchable text from image bytes.
@@ -95,7 +95,7 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 		return ImageExtractResultRuntimeNotConfigured, fmt.Errorf("async image extract runtime not configured")
 	}
 	if b.monthlyLLMCostExceededCheck(ctx) {
-		metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "process_skip", "budget_exhausted", 0)
+		b.recordTenantOperation("llm_cost_budget", "process_skip", "budget_exhausted", 0)
 		return ImageExtractResultBudgetExhausted, nil
 	}
 
@@ -133,11 +133,12 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 
 	taskCtx, cancel := context.WithTimeout(ctx, b.imageExtractTimeout)
 	text, imageUsage, err := b.imageExtractor.ExtractImageText(taskCtx, ImageExtractRequest{
-		TenantID:    b.tenantID,
-		FileID:      task.FileID,
-		Path:        task.Path,
-		ContentType: ct,
-		Data:        data,
+		TenantID:       b.tenantID,
+		TiDBCloudOrgID: b.tidbCloudOrgID,
+		FileID:         task.FileID,
+		Path:           task.Path,
+		ContentType:    ct,
+		Data:           data,
 	})
 	cancel()
 	if err != nil {

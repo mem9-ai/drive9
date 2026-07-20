@@ -158,11 +158,15 @@ func Open(dsn string) (*Store, error) {
 }
 
 func OpenForTenant(ctx context.Context, dsn, tenantID string) (*Store, error) {
+	return OpenForTenantWithOrg(ctx, dsn, tenantID, "")
+}
+
+func OpenForTenantWithOrg(ctx context.Context, dsn, tenantID, tidbCloudOrgID string) (*Store, error) {
 	lower := strings.ToLower(dsn)
 	if strings.Contains(lower, "multistatements=true") || strings.Contains(lower, "multistatements=1") {
 		return nil, fmt.Errorf("multiStatements is not allowed in production DSN")
 	}
-	db, err := mysqlutil.OpenInstrumentedForTenant(ctx, dsn, mysqlutil.RoleUser, tenantID)
+	db, err := mysqlutil.OpenInstrumentedForTenantWithOrg(ctx, dsn, mysqlutil.RoleUser, tenantID, tidbCloudOrgID)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}

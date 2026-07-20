@@ -54,7 +54,7 @@ func (m *cacheTestStore) GetQuotaConfigVersion(ctx context.Context, tenantID str
 func TestQuotaConfigCacheLazyLoad(t *testing.T) {
 	store := newCacheTestStore()
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
-	c := newQuotaConfigCache("t1", store)
+	c := newQuotaConfigCache("t1", "", store)
 	defer c.stop()
 
 	cfg := c.get()
@@ -89,7 +89,7 @@ func TestQuotaConfigCacheLazyLoad(t *testing.T) {
 func TestQuotaConfigCacheRefreshFailOpenOnVersionError(t *testing.T) {
 	store := newCacheTestStore()
 	store.versionErr = context.DeadlineExceeded
-	c := newQuotaConfigCache("t1", store)
+	c := newQuotaConfigCache("t1", "", store)
 	defer c.stop()
 
 	c.refresh(context.Background())
@@ -110,7 +110,7 @@ func TestQuotaConfigCacheRefreshFailOpenOnVersionError(t *testing.T) {
 func TestQuotaConfigCacheRefreshOnlyLoadsConfigWhenVersionChanges(t *testing.T) {
 	store := newCacheTestStore()
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
-	c := newQuotaConfigCache("t1", store)
+	c := newQuotaConfigCache("t1", "", store)
 	defer c.stop()
 
 	c.refresh(context.Background())
@@ -155,7 +155,7 @@ func TestQuotaConfigCacheRefreshOnlyLoadsConfigWhenVersionChanges(t *testing.T) 
 func TestQuotaConfigCacheLazyLoadDoesNotOverwriteRefreshedSnapshot(t *testing.T) {
 	store := newCacheTestStore()
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
-	c := newQuotaConfigCache("t1", store)
+	c := newQuotaConfigCache("t1", "", store)
 	defer c.stop()
 
 	store.configHook = func() {
@@ -183,7 +183,7 @@ func TestQuotaConfigCacheLazyLoadDoesNotOverwriteRefreshedSnapshot(t *testing.T)
 func TestQuotaConfigCacheLazyLoadReturnsDefensiveCopy(t *testing.T) {
 	store := newCacheTestStore()
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
-	c := newQuotaConfigCache("t1", store)
+	c := newQuotaConfigCache("t1", "", store)
 	defer c.stop()
 
 	cfg := c.load(context.Background())
@@ -204,7 +204,7 @@ func TestQuotaConfigCacheLazyLoadReturnsDefensiveCopy(t *testing.T) {
 func TestQuotaUsageCacheUsesTTL(t *testing.T) {
 	store := newCacheTestStore()
 	store.usage["t1"] = &QuotaUsageView{TenantID: "t1", StorageBytes: 10}
-	c := newQuotaUsageCache("t1", store, time.Hour)
+	c := newQuotaUsageCache("t1", "", store, time.Hour)
 
 	first := c.get(context.Background())
 	if first == nil || first.StorageBytes != 10 {
@@ -225,7 +225,7 @@ func TestQuotaUsageCacheUsesTTL(t *testing.T) {
 func TestQuotaUsageCacheCoalescesConcurrentMisses(t *testing.T) {
 	store := newCacheTestStore()
 	store.usage["t1"] = &QuotaUsageView{TenantID: "t1", StorageBytes: 10}
-	c := newQuotaUsageCache("t1", store, time.Hour)
+	c := newQuotaUsageCache("t1", "", store, time.Hour)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
@@ -258,7 +258,7 @@ func TestQuotaUsageCacheCoalescesConcurrentMisses(t *testing.T) {
 func TestQuotaUsageCacheInvalidateForcesReload(t *testing.T) {
 	store := newCacheTestStore()
 	store.usage["t1"] = &QuotaUsageView{TenantID: "t1", StorageBytes: 10}
-	c := newQuotaUsageCache("t1", store, time.Hour)
+	c := newQuotaUsageCache("t1", "", store, time.Hour)
 
 	first := c.get(context.Background())
 	if first == nil || first.StorageBytes != 10 {
@@ -286,7 +286,7 @@ func TestQuotaPendingDeltasCacheUsesTTLAndLocalAdjustments(t *testing.T) {
 	storage := int64(10)
 	file := int64(1)
 	media := int64(0)
-	c := newQuotaPendingDeltasCache("test-tenant", func(context.Context) (int64, int64, int64, error) {
+	c := newQuotaPendingDeltasCache("test-tenant", "", func(context.Context) (int64, int64, int64, error) {
 		calls.Add(1)
 		return storage, file, media, nil
 	}, time.Hour)
@@ -319,7 +319,7 @@ func TestQuotaPendingDeltasCachePublishesConservativeSnapshotWhenLocalDeltaRaces
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	c := newQuotaPendingDeltasCache("test-tenant", func(context.Context) (int64, int64, int64, error) {
+	c := newQuotaPendingDeltasCache("test-tenant", "", func(context.Context) (int64, int64, int64, error) {
 		calls.Add(1)
 		once.Do(func() { close(started) })
 		<-release
@@ -364,7 +364,7 @@ func TestQuotaPendingDeltasCacheIgnoresNegativeRaceDeltasWhenPublishing(t *testi
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	c := newQuotaPendingDeltasCache("test-tenant", func(context.Context) (int64, int64, int64, error) {
+	c := newQuotaPendingDeltasCache("test-tenant", "", func(context.Context) (int64, int64, int64, error) {
 		calls.Add(1)
 		once.Do(func() { close(started) })
 		<-release
@@ -405,7 +405,7 @@ func TestQuotaPendingDeltasCacheIgnoresNegativeRaceDeltasWhenPublishing(t *testi
 }
 
 func TestQuotaPendingDeltasCacheExpiresNoLoaderPending(t *testing.T) {
-	c := newQuotaPendingDeltasCache("test-tenant", nil, time.Hour)
+	c := newQuotaPendingDeltasCache("test-tenant", "", nil, time.Hour)
 	c.pendingTTL = 10 * time.Millisecond
 
 	c.addPending(8, 1, -1)
@@ -428,7 +428,7 @@ func TestQuotaPendingDeltasCacheExpiresNoLoaderPending(t *testing.T) {
 }
 
 func TestQuotaPendingDeltasCacheClearPreventsExpiryDoubleSubtract(t *testing.T) {
-	c := newQuotaPendingDeltasCache("test-tenant", nil, time.Hour)
+	c := newQuotaPendingDeltasCache("test-tenant", "", nil, time.Hour)
 	c.pendingTTL = 10 * time.Millisecond
 
 	c.addPending(8, 1, 0)
@@ -452,7 +452,7 @@ func TestQuotaPendingDeltasCacheClearPreventsExpiryDoubleSubtract(t *testing.T) 
 }
 
 func TestQuotaPendingDeltasCacheClearAfterExpiryDoesNotGoNegative(t *testing.T) {
-	c := newQuotaPendingDeltasCache("test-tenant", nil, time.Hour)
+	c := newQuotaPendingDeltasCache("test-tenant", "", nil, time.Hour)
 	c.pendingTTL = 10 * time.Millisecond
 
 	c.addPending(8, 1, 0)
@@ -476,7 +476,7 @@ func TestQuotaPendingDeltasCacheClearAfterExpiryDoesNotGoNegative(t *testing.T) 
 }
 
 func TestQuotaPendingDeltasCacheRemovesPositiveRaceDeltasOnClearAndExpire(t *testing.T) {
-	c := newQuotaPendingDeltasCache("test-tenant", nil, time.Hour)
+	c := newQuotaPendingDeltasCache("test-tenant", "", nil, time.Hour)
 	c.pendingTTL = 10 * time.Millisecond
 
 	c.addPending(8, 1, -1)
@@ -497,7 +497,7 @@ func TestQuotaPendingDeltasCacheRemovesPositiveRaceDeltasOnClearAndExpire(t *tes
 
 func TestQuotaConfigCacheStop(t *testing.T) {
 	store := newCacheTestStore()
-	c := newQuotaConfigCache("t1", store)
+	c := newQuotaConfigCache("t1", "", store)
 	c.stop()
 	// Should not panic or block.
 }

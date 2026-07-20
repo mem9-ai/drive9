@@ -6,21 +6,25 @@ This directory uses a usage-first layout plus focused incident drill-downs.
 
 This dashboard set expects the `drive9_*` Prometheus namespace. The previous `dat9_*` metric names are intentionally not dual-emitted by Drive9 after this metrics contract rewrite. Existing external dashboards, alerts, and recording rules must be migrated from `dat9_*` to `drive9_*` at the same time as this server rollout.
 
+`drive9_tenant_count` also changes its label contract. The old synthetic series such as `drive9_tenant_count{state="total_non_deleted"}` and `drive9_tenant_count{state="active"}` are not emitted. Use `drive9_tenant_count{status="<real status>"}` instead, where status is one of `pending`, `provisioning`, `active`, `failed`, `suspended`, `deleting`, or `deleted`. Dashboards or alerts that need "non-deleted" totals should aggregate the real statuses they want to include instead of depending on a synthetic metric state.
+
 ## 1. Usage dashboard
 
-- `drive9-tenant-usage-dashboard.json`: first-stop dashboard for tenant-level product usage: active tenants, request frequency, in-flight requests, logical file reads/writes, HTTP transport bytes, storage/media quota state, latency, and non-OK rates by tenant/surface/action. Use this to answer `who is using Drive9, how much, and through which workflows?`
+- `drive9-tenant-usage-dashboard.json`: first-stop dashboard for tenant-level product usage: active tenants, request frequency, in-flight requests, logical file reads/writes, HTTP transport bytes, storage/media quota state, latency, and non-OK rates by TiDB Cloud org/tenant/surface/action. Use this to answer `who is using Drive9, how much, and through which workflows?`
 
-Tenant usage metrics intentionally allow `tenant_id` as a Prometheus label, but keep high-cardinality values out of labels: no path, file ID, upload ID, API key ID, raw URL, user agent, or trace ID.
+Tenant usage metrics intentionally allow `tenant_id` and `tidbcloud_org_id` as Prometheus labels, but keep high-cardinality values out of labels: no path, file ID, upload ID, API key ID, raw URL, user agent, or trace ID. When a tenant has no TiDB Cloud org binding, or a hot path cannot safely resolve the binding without extra work, `tidbcloud_org_id` is reported as `guest`.
 
 ## Tenant metric contract
 
-- `drive9_tenant_requests_total`: request count by `tenant_id`, `surface`, `action`, `result`, and `status_class`.
+- `drive9_tenant_count`: tenant count by real tenant `status`.
+- `drive9_tenant_pool_bindings`: tenant-pool binding count by `pool_id`, `tidbcloud_org_id`, and binding `status=free|used`. The binding label is `status`, not `pool_status`.
+- `drive9_tenant_requests_total`: request count by `tenant_id`, `tidbcloud_org_id`, `surface`, `action`, `result`, and `status_class`.
 - `drive9_tenant_request_duration_seconds`: request latency histogram by `surface` and `status_class`.
-- `drive9_tenant_inflight_requests`: current in-flight request gauge by `tenant_id`, `surface`, and `action`.
-- `drive9_tenant_http_bytes_total`: HTTP transport bytes by `tenant_id`, `surface`, and `direction=request|response`.
-- `drive9_tenant_file_bytes_total`: logical file bytes by `tenant_id`, `surface`, `action`, and `direction=read|write`.
-- `drive9_tenant_storage_bytes`: opportunistically published quota storage gauge by `tenant_id` and `state=confirmed|reserved|limit`.
-- `drive9_tenant_media_files`: opportunistically published quota media-file gauge by `tenant_id` and `state=confirmed|limit`.
+- `drive9_tenant_inflight_requests`: current in-flight request gauge by `tenant_id`, `tidbcloud_org_id`, `surface`, and `action`.
+- `drive9_tenant_http_bytes_total`: HTTP transport bytes by `tenant_id`, `tidbcloud_org_id`, `surface`, and `direction=request|response`.
+- `drive9_tenant_file_bytes_total`: logical file bytes by `tenant_id`, `tidbcloud_org_id`, `surface`, `action`, and `direction=read|write`.
+- `drive9_tenant_storage_bytes`: opportunistically published quota storage gauge by `tenant_id`, `tidbcloud_org_id`, and `state=confirmed|reserved|limit`.
+- `drive9_tenant_media_files`: opportunistically published quota media-file gauge by `tenant_id`, `tidbcloud_org_id`, and `state=confirmed|limit`.
 
 ## 2. Service overview dashboards
 

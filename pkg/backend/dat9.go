@@ -106,6 +106,7 @@ type Dat9Backend struct {
 
 	// Central quota enforcement (Rev 4 migration).
 	tenantID           string
+	tidbCloudOrgID     string
 	storageNamespaceID string
 	metaStore          MetaQuotaStore // nil when central quota is not wired (tests, fallback)
 	quotaConfigCache   *quotaConfigCache
@@ -145,13 +146,13 @@ type Dat9Backend struct {
 	maxAudioExtractTextBytes int
 
 	// Durable video visual extraction (semantic_tasks only; no local queue).
-	videoExtractEnabled          bool
-	videoExtractAllTenants       bool                // "*" allowlist
-	videoExtractor               VideoTextExtractor
-	videoExtractTimeout          time.Duration
-	videoExtractMaxSize          int64
-	maxVideoExtractTextBytes     int
-	videoExtractTenantAllowlist  map[string]struct{} // nil or empty = no tenant (fail-closed)
+	videoExtractEnabled         bool
+	videoExtractAllTenants      bool // "*" allowlist
+	videoExtractor              VideoTextExtractor
+	videoExtractTimeout         time.Duration
+	videoExtractMaxSize         int64
+	maxVideoExtractTextBytes    int
+	videoExtractTenantAllowlist map[string]struct{} // nil or empty = no tenant (fail-closed)
 	maxVideoLLMFiles            int64               // per-tenant video file quota
 
 	runtimeMetricsID uint64
@@ -160,7 +161,7 @@ type Dat9Backend struct {
 	// enqueued durable work (semantic task, file_gc task, quota outbox row),
 	// so the unified tenant worker can claim it immediately instead of waiting
 	// for a kick from the outbox poller.
-	workEnqueuedNotifier atomic.Pointer[func(workMask int)]
+	workEnqueuedNotifier atomic.Pointer[func(workMask int, tidbCloudOrgID string)]
 
 	// Monthly LLM cost budget (P1).
 	maxMonthlyLLMCostMillicents     int64
@@ -179,17 +180,19 @@ func newBaseBackend(store *datastore.Store) *Dat9Backend {
 		entropy:             ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0),
 		inlineThreshold:     DefaultInlineThreshold,
 		textExtractMaxBytes: DefaultTextExtractMaxBytes,
+		tidbCloudOrgID:      defaultTenantMetricTiDBCloudOrgID,
 		runtimeMetricsID:    globalBackendRuntimeMetrics.allocateID(),
 	}
 }
 
 // SetWorkEnqueuedNotifier registers fn to run after a write or upload commit
 // that enqueues durable work (semantic task, file_gc task, or quota outbox row).
-// The workMask argument tells the caller which work types were enqueued. fn
-// must be cheap and non-blocking: it is invoked inline on the write path. A
-// dropped or missing notification is safe — work is durable and the unified
-// outbox poller + safety-net scan claim it eventually.
-func (b *Dat9Backend) SetWorkEnqueuedNotifier(fn func(workMask int)) {
+// The workMask argument tells the caller which work types were enqueued, and
+// tidbCloudOrgID carries the backend's resolved org metric label. fn must be
+// cheap and non-blocking: it is invoked inline on the write path. A dropped or
+// missing notification is safe — work is durable and the unified outbox poller
+// + safety-net scan claim it eventually.
+func (b *Dat9Backend) SetWorkEnqueuedNotifier(fn func(workMask int, tidbCloudOrgID string)) {
 	if b == nil {
 		return
 	}
@@ -201,7 +204,7 @@ func (b *Dat9Backend) notifyWorkEnqueued(workMask int) {
 		return
 	}
 	if fn := b.workEnqueuedNotifier.Load(); fn != nil && *fn != nil {
-		(*fn)(workMask)
+		(*fn)(workMask, b.TiDBCloudOrgID())
 	}
 }
 
@@ -260,7 +263,7 @@ func (b *Dat9Backend) Create(path string) error {
 
 func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "create", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "create", err, start) }()
 
 	path, err = pathutil.Canonicalize(path)
 	if err != nil {
@@ -337,7 +340,7 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 // payload and whose inode mode carries the POSIX symlink file type bits.
 func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target string) (err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "create_symlink", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "create_symlink", err, start) }()
 
 	data := []byte(target)
 	if target == "" || strings.ContainsRune(target, 0) || len(data) > MaxSymlinkTargetBytes {
@@ -413,7 +416,7 @@ func (b *Dat9Backend) Mkdir(path string, perm uint32) error {
 
 func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "mkdir", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "mkdir", err, start) }()
 
 	dirPath, err := pathutil.CanonicalizeDir(path)
 	if err != nil {
@@ -461,7 +464,7 @@ func (b *Dat9Backend) Chmod(path string, mode uint32) error {
 
 func (b *Dat9Backend) ChmodCtx(ctx context.Context, path string, mode uint32) (err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "chmod", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "chmod", err, start) }()
 
 	path, err = pathutil.Canonicalize(path)
 	if err != nil {
@@ -483,7 +486,7 @@ func (b *Dat9Backend) Remove(path string) error {
 
 func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "remove", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "remove", err, start) }()
 
 	path, node, err := b.resolveNodePath(ctx, path)
 	if err != nil {
@@ -504,7 +507,7 @@ func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 
 func (b *Dat9Backend) RemoveFileCtx(ctx context.Context, path string) (err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "remove_file", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "remove_file", err, start) }()
 
 	path, err = pathutil.Canonicalize(path)
 	if err != nil {
@@ -522,7 +525,7 @@ func (b *Dat9Backend) RemoveFileCtx(ctx context.Context, path string) (err error
 
 func (b *Dat9Backend) RemoveDirCtx(ctx context.Context, path string) (err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "remove_dir", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "remove_dir", err, start) }()
 
 	path, err = pathutil.CanonicalizeDir(path)
 	if err != nil {
@@ -540,7 +543,7 @@ func (b *Dat9Backend) RemoveAll(path string) error {
 
 func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "remove_all", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "remove_all", err, start) }()
 
 	path, node, err := b.resolveNodePath(ctx, path)
 	if err != nil {
@@ -569,7 +572,7 @@ func (b *Dat9Backend) Read(path string, offset int64, size int64) ([]byte, error
 
 func (b *Dat9Backend) ReadCtx(ctx context.Context, path string, offset int64, size int64) (data []byte, err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "read", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "read", err, start) }()
 
 	path, err = pathutil.Canonicalize(path)
 	if err != nil {
@@ -650,7 +653,7 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 	var statDuration time.Duration
 	var implementationDuration time.Duration
 	defer func() {
-		observeBackend(ctx, b.tenantID, "write", err, start)
+		observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "write", err, start)
 		if !timingEnabled {
 			return
 		}
@@ -1354,7 +1357,7 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 	var canonicalPath string
 	var listDuration time.Duration
 	defer func() {
-		observeBackend(ctx, b.tenantID, "read_dir", err, start)
+		observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "read_dir", err, start)
 		fields := []zap.Field{
 			zap.String("path", path),
 			zap.String("canonical_path", canonicalPath),
@@ -1549,7 +1552,7 @@ func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (plan *ReadP
 	var size int64
 	phase := "canonicalize"
 	defer func() {
-		observeBackend(ctx, b.tenantID, "read_plan", err, start)
+		observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "read_plan", err, start)
 		fields := []zap.Field{
 			zap.String("path", path),
 			zap.String("phase", phase),
@@ -1630,7 +1633,7 @@ func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (plan *ReadP
 // without reading or presigning object storage data.
 func (b *Dat9Backend) ReadInlinePlanCtx(ctx context.Context, path string) (plan *ReadPlan, err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "read_inline_plan", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "read_inline_plan", err, start) }()
 
 	resolvedPath, err := pathutil.Canonicalize(path)
 	if err != nil {
@@ -1705,7 +1708,7 @@ func (b *Dat9Backend) Rename(oldPath, newPath string) error {
 
 func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "rename", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "rename", err, start) }()
 
 	oldPath, node, err := b.resolveNodePath(ctx, oldPath)
 	if err != nil {
@@ -1743,7 +1746,7 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 // if the target path already exists.
 func (b *Dat9Backend) RenameFileNoReplaceCtx(ctx context.Context, oldPath, newPath string) (err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "rename_file_no_replace", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "rename_file_no_replace", err, start) }()
 
 	oldPath, node, err := b.resolveNodePath(ctx, oldPath)
 	if err != nil {
@@ -1804,7 +1807,7 @@ func (b *Dat9Backend) CopyFile(srcPath, dstPath string) error {
 
 func (b *Dat9Backend) CopyFileCtx(ctx context.Context, srcPath, dstPath string) (err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "copy_file", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "copy_file", err, start) }()
 
 	srcPath, err = pathutil.Canonicalize(srcPath)
 	if err != nil {
@@ -1849,7 +1852,7 @@ func (b *Dat9Backend) HardlinkFile(srcPath, dstPath string) error {
 
 func (b *Dat9Backend) HardlinkFileCtx(ctx context.Context, srcPath, dstPath string) (err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, b.tenantID, "hardlink_file", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "hardlink_file", err, start) }()
 
 	dstPath, err = pathutil.Canonicalize(dstPath)
 	if err != nil {
@@ -2113,7 +2116,7 @@ func extractText(data []byte, contentType string, maxBytes int64) string {
 func (b *Dat9Backend) ExecSQL(ctx context.Context, query string) ([]map[string]interface{}, error) {
 	start := time.Now()
 	rows, err := b.store.ExecSQL(ctx, query)
-	observeBackend(ctx, b.tenantID, "exec_sql", err, start)
+	observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "exec_sql", err, start)
 	if err != nil {
 		logger.Error(ctx, "backend_exec_sql_failed", zap.Int("query_len", len(query)), zap.Error(err))
 		return nil, err
@@ -2124,7 +2127,7 @@ func (b *Dat9Backend) ExecSQL(ctx context.Context, query string) ([]map[string]i
 func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit int) ([]datastore.SearchResult, error) {
 	start := time.Now()
 	var err error
-	defer func() { observeBackend(ctx, b.tenantID, "grep", err, start) }()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "grep", err, start) }()
 
 	if strings.TrimSpace(query) == "" {
 		err = fmt.Errorf("empty query")
@@ -2272,7 +2275,7 @@ func mergeVectorResults(a, b []datastore.SearchResult) []datastore.SearchResult 
 func (b *Dat9Backend) Find(ctx context.Context, f *datastore.FindFilter) ([]datastore.SearchResult, error) {
 	start := time.Now()
 	rows, err := b.store.Find(ctx, f)
-	observeBackend(ctx, b.tenantID, "find", err, start)
+	observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "find", err, start)
 	if err != nil {
 		logger.Error(ctx, "backend_find_failed", zap.String("path", f.PathPrefix), zap.String("name", f.NameGlob), zap.Error(err))
 		return nil, err
@@ -2280,8 +2283,8 @@ func (b *Dat9Backend) Find(ctx context.Context, f *datastore.FindFilter) ([]data
 	return rows, nil
 }
 
-func observeBackend(ctx context.Context, tenantID, op string, err error, start time.Time) {
-	metrics.RecordTenantOperation(tenantID, "backend", op, backendResultForError(err), time.Since(start))
+func observeBackend(ctx context.Context, tenantID, tidbCloudOrgID, op string, err error, start time.Time) {
+	metrics.RecordTenantOperationWithOrg(tenantID, tidbCloudOrgID, "backend", op, backendResultForError(err), time.Since(start))
 }
 
 func backendResultForError(err error) string {
