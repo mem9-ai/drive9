@@ -36,6 +36,7 @@ func (a *metaQuotaAdapter) GetQuotaConfig(ctx context.Context, tenantID string) 
 		MaxFileSizeBytes: cfg.MaxFileSizeBytes,
 		MaxFileCount:     cfg.MaxFileCount,
 		MaxMediaLLMFiles: cfg.MaxMediaLLMFiles,
+		MaxVideoLLMFiles: cfg.MaxVideoLLMFiles,
 		MaxMonthlyCostMC: cfg.MaxMonthlyCostMC,
 	}, nil
 }
