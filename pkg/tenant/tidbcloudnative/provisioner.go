@@ -772,10 +772,11 @@ func (p *Provisioner) MarkClusterPoolUsed(ctx context.Context, cluster *tenant.C
 		}
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels, err := p.getClusterLabelsWithCredentials(ctx, publicKey, privateKey, clusterID)
+	info, err := p.getClusterBasicInfoWithCredentials(ctx, publicKey, privateKey, clusterID)
 	if err != nil {
-		return nil, fmt.Errorf("load cluster labels: %w", err)
+		return nil, fmt.Errorf("load cluster basic info: %w", err)
 	}
+	labels := info.Labels
 	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
 		labels[Drive9TenantIDLabel] = tenantID
@@ -809,10 +810,11 @@ func (p *Provisioner) MarkClusterPoolFree(ctx context.Context, cluster *tenant.C
 		return fmt.Errorf("cluster id is required")
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels, err := p.getClusterLabelsWithCredentials(ctx, publicKey, privateKey, clusterID)
+	info, err := p.getClusterBasicInfoWithCredentials(ctx, publicKey, privateKey, clusterID)
 	if err != nil {
-		return fmt.Errorf("load cluster labels: %w", err)
+		return fmt.Errorf("load cluster basic info: %w", err)
 	}
+	labels := info.Labels
 	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
 		labels[Drive9TenantIDLabel] = tenantID
@@ -1053,10 +1055,11 @@ func (p *Provisioner) MarkQuotaUpdateStarted(ctx context.Context, cluster *tenan
 		return nil, fmt.Errorf("cluster id is required")
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels, err := p.getClusterLabelsWithCredentials(ctx, publicKey, privateKey, clusterID)
+	info, err := p.getClusterBasicInfoWithCredentials(ctx, publicKey, privateKey, clusterID)
 	if err != nil {
-		return nil, fmt.Errorf("load cluster labels: %w", err)
+		return nil, fmt.Errorf("load cluster basic info: %w", err)
 	}
+	labels := info.Labels
 	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
 		labels[Drive9TenantIDLabel] = tenantID
@@ -1107,11 +1110,15 @@ func (p *Provisioner) GetQuota(ctx context.Context, cluster *tenant.ClusterInfo,
 	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
 		return nil, fmt.Errorf("cluster id is required")
 	}
-	_, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, strings.TrimSpace(cluster.ClusterID))
+	info, err := p.getClusterBasicInfoWithCredentials(ctx, publicKey, privateKey, strings.TrimSpace(cluster.ClusterID))
 	if err != nil {
-		return nil, fmt.Errorf("load cluster quota info: %w", err)
+		return nil, fmt.Errorf("load cluster basic info: %w", err)
 	}
-	return cloudCfg, nil
+	labels := make(map[string]string, len(info.Labels))
+	for key, value := range info.Labels {
+		labels[key] = value
+	}
+	return &tenant.QuotaCloudConfig{Labels: labels}, nil
 }
 
 func (p *Provisioner) ListManagedClusters(ctx context.Context, req tenant.CredentialProvisionRequest, opts tenant.ManagedClusterListOptions) (*tenant.ManagedClusterListResult, error) {
@@ -1194,11 +1201,11 @@ func (p *Provisioner) listClusterInfosPageWithCredentials(ctx context.Context, p
 	return list.Clusters, strings.TrimSpace(list.NextPageToken), nil
 }
 
-func (p *Provisioner) getClusterLabelsWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, error) {
+func (p *Provisioner) getClusterBasicInfoWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string) (*clusterInfo, error) {
 	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s?view=BASIC", p.apiURL, url.PathEscape(clusterID))
 	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("get cluster labels: %w", err)
+		return nil, fmt.Errorf("get cluster basic info: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
@@ -1216,44 +1223,10 @@ func (p *Provisioner) getClusterLabelsWithCredentials(ctx context.Context, publi
 	if err != nil {
 		return nil, fmt.Errorf("parse cluster info: %w", err)
 	}
-	labels := make(map[string]string, len(info.Labels))
-	for k, v := range info.Labels {
-		labels[k] = v
+	if info.Labels == nil {
+		info.Labels = make(map[string]string)
 	}
-	return labels, nil
-}
-
-func (p *Provisioner) clusterQuotaInfo(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, *tenant.QuotaCloudConfig, error) {
-	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
-	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, nil, fmt.Errorf("get cluster quota info: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
-		if readErr != nil {
-			return nil, nil, fmt.Errorf("read cluster get error body: %w", readErr)
-		}
-		return nil, nil, quotaStatusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw))
-	}
-	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
-	if readErr != nil {
-		return nil, nil, fmt.Errorf("read cluster body: %w", readErr)
-	}
-	info, err := parseClusterInfo(raw)
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse cluster quota info: %w", err)
-	}
-	labels := make(map[string]string, len(info.Labels)+3)
-	for k, v := range info.Labels {
-		labels[k] = v
-	}
-	cloudCfg := &tenant.QuotaCloudConfig{}
-	if info.SpendingLimit != nil {
-		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(int64(info.SpendingLimit.Monthly))
-	}
-	return labels, cloudCfg, nil
+	return info, nil
 }
 
 func (p *Provisioner) updateSpendingLimitWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string, monthly int64) error {

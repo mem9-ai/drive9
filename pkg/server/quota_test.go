@@ -495,16 +495,18 @@ func TestQuotaGetAllowsExplicitDefaultTiDBCloudCredentials(t *testing.T) {
 
 func TestQuotaGetReturnsConfigStorageUsageAndSpendingLimit(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	spendingLimit := int64(10000)
-	rt.prov.cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: &spendingLimit}
+	localSpendingLimit := int64(9000)
+	cloudSpendingLimit := int64(10000)
+	rt.prov.cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: &cloudSpendingLimit}
 	ctx := context.Background()
 	if err := rt.meta.SetQuotaConfig(ctx, &meta.QuotaConfig{
-		TenantID:         rt.tenantID,
-		MaxStorageBytes:  123 * quotaStorageSizeBytes,
-		MaxFileSizeBytes: 12 * quotaStorageSizeBytes,
-		MaxFileCount:     34,
-		MaxMediaLLMFiles: 56,
-		MaxMonthlyCostMC: 789,
+		TenantID:               rt.tenantID,
+		MaxStorageBytes:        123 * quotaStorageSizeBytes,
+		MaxFileSizeBytes:       12 * quotaStorageSizeBytes,
+		MaxFileCount:           34,
+		MaxMediaLLMFiles:       56,
+		MaxMonthlyCostMC:       789,
+		TiDBCloudSpendingLimit: &localSpendingLimit,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -537,15 +539,18 @@ func TestQuotaGetReturnsConfigStorageUsageAndSpendingLimit(t *testing.T) {
 	if out.TenantID != rt.tenantID || !out.SupportsUpdate {
 		t.Fatalf("response tenant/update = %#v", out)
 	}
-	if out.Config.MaxStorageSize != 123 || out.Config.MaxFileSize != 12 || out.Config.MaxFileCount != 34 || out.Config.TiDBCloudSpendingLimit == nil || *out.Config.TiDBCloudSpendingLimit != spendingLimit {
+	if out.Config.MaxStorageSize != 123 || out.Config.MaxFileSize != 12 || out.Config.MaxFileCount != 34 || out.Config.TiDBCloudSpendingLimit == nil || *out.Config.TiDBCloudSpendingLimit != localSpendingLimit {
 		t.Fatalf("config = %#v", out.Config)
 	}
 	cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != spendingLimit {
-		t.Fatalf("persisted spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, spendingLimit)
+	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != localSpendingLimit {
+		t.Fatalf("persisted spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, localSpendingLimit)
+	}
+	if cfg.TiDBCloudSpendingLimitCheckedAt != nil {
+		t.Fatalf("checked_at = %v, want nil after GET", cfg.TiDBCloudSpendingLimitCheckedAt)
 	}
 	if out.Usage.StorageBytes != 321 || out.Usage.ReservedBytes != 11 || out.Usage.FileCount != 9 {
 		t.Fatalf("usage = %#v", out.Usage)
@@ -650,7 +655,7 @@ func TestQuotaGetUsesTiDBCloudAuthorization(t *testing.T) {
 	}
 }
 
-func TestQuotaGetCachesTiDBCloudRBACAndBackfillsSpendingLimit(t *testing.T) {
+func TestQuotaGetCachesTiDBCloudRBACWithoutBackfillingSpendingLimit(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	spendingLimit := int64(222)
 	rt.prov.cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: &spendingLimit}
@@ -671,8 +676,11 @@ func TestQuotaGetCachesTiDBCloudRBACAndBackfillsSpendingLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != spendingLimit {
-		t.Fatalf("persisted spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, spendingLimit)
+	if cfg.TiDBCloudSpendingLimit != nil {
+		t.Fatalf("persisted spending limit = %#v, want nil", cfg.TiDBCloudSpendingLimit)
+	}
+	if cfg.TiDBCloudSpendingLimitCheckedAt != nil {
+		t.Fatalf("checked_at = %v, want nil after GET", cfg.TiDBCloudSpendingLimitCheckedAt)
 	}
 
 	rt.prov.getErr = errors.New("should not call TiDB Cloud while RBAC cache and local spending limit are present")
@@ -686,8 +694,8 @@ func TestQuotaGetCachesTiDBCloudRBACAndBackfillsSpendingLimit(t *testing.T) {
 	if err := json.NewDecoder(resp2.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if out.Config.TiDBCloudSpendingLimit == nil || *out.Config.TiDBCloudSpendingLimit != spendingLimit {
-		t.Fatalf("response spending limit = %#v, want %d", out.Config.TiDBCloudSpendingLimit, spendingLimit)
+	if out.Config.TiDBCloudSpendingLimit != nil {
+		t.Fatalf("response spending limit = %#v, want nil", out.Config.TiDBCloudSpendingLimit)
 	}
 	if got := rt.prov.getCalls.Load(); got != 1 {
 		t.Fatalf("get calls after cached request = %d, want 1", got)
@@ -709,8 +717,11 @@ func TestQuotaGetCachesTiDBCloudRBACAndBackfillsSpendingLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != updatedLimit {
-		t.Fatalf("updated spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, updatedLimit)
+	if cfg.TiDBCloudSpendingLimit != nil {
+		t.Fatalf("updated spending limit = %#v, want nil", cfg.TiDBCloudSpendingLimit)
+	}
+	if cfg.TiDBCloudSpendingLimitCheckedAt != nil {
+		t.Fatalf("checked_at = %v, want nil after GET with new credentials", cfg.TiDBCloudSpendingLimitCheckedAt)
 	}
 }
 
@@ -1385,6 +1396,78 @@ func TestAdminTenantListFiltersByAuthorizedClusters(t *testing.T) {
 	}
 }
 
+func TestAdminTenantListIncludeQuotaDoesNotBackfillSpendingLimit(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+		TenantID:       rt.tenantID,
+		OrganizationID: "org-1",
+		ClusterID:      "cluster-quota-1",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.SetQuotaConfig(ctx, &meta.QuotaConfig{
+		TenantID:         rt.tenantID,
+		MaxStorageBytes:  100 * quotaStorageSizeBytes,
+		MaxFileSizeBytes: 10 * quotaStorageSizeBytes,
+		MaxFileCount:     7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.EnsureQuotaUsageRow(ctx, rt.tenantID); err != nil {
+		t.Fatal(err)
+	}
+	cloudSpendingLimit := int64(12345)
+	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
+		Clusters: []tenant.CloudClusterInfo{{
+			ClusterID:                     "cluster-quota-1",
+			OrganizationID:                "org-1",
+			TiDBCloudSpendingLimitMonthly: &cloudSpendingLimit,
+		}},
+	}}
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/admin/tenants?include_quota=true", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(quotaPublicKeyHeader, "public-1")
+	req.Header.Set(quotaPrivateKeyHeader, "private-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var out adminTenantListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Tenants) != 1 || out.Tenants[0].Quota == nil {
+		t.Fatalf("tenants = %#v, want one tenant with quota", out.Tenants)
+	}
+	if out.Tenants[0].Quota.Config.TiDBCloudSpendingLimit != nil {
+		t.Fatalf("response spending limit = %#v, want local nil value", out.Tenants[0].Quota.Config.TiDBCloudSpendingLimit)
+	}
+	cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TiDBCloudSpendingLimit != nil || cfg.TiDBCloudSpendingLimitCheckedAt != nil {
+		t.Fatalf("quota config mutated by GET: %#v", cfg)
+	}
+	if got := rt.prov.listCalls.Load(); got != 1 {
+		t.Fatalf("list calls = %d, want 1", got)
+	}
+}
+
 func TestAdminTenantGetHidesFreePoolTenant(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
@@ -1523,23 +1606,25 @@ func TestAdminTenantGetUsesListClusterAuthorizationAndReturnsQuota(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
+	localSpendingLimit := int64(7000)
 	if err := rt.meta.SetQuotaConfig(ctx, &meta.QuotaConfig{
-		TenantID:         rt.tenantID,
-		MaxStorageBytes:  100 * quotaStorageSizeBytes,
-		MaxFileSizeBytes: 10 * quotaStorageSizeBytes,
-		MaxFileCount:     7,
+		TenantID:               rt.tenantID,
+		MaxStorageBytes:        100 * quotaStorageSizeBytes,
+		MaxFileSizeBytes:       10 * quotaStorageSizeBytes,
+		MaxFileCount:           7,
+		TiDBCloudSpendingLimit: &localSpendingLimit,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := rt.meta.EnsureQuotaUsageRow(ctx, rt.tenantID); err != nil {
 		t.Fatal(err)
 	}
-	spendingLimit := int64(12345)
+	cloudSpendingLimit := int64(12345)
 	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
 		Clusters: []tenant.CloudClusterInfo{{
 			ClusterID:                     "cluster-quota-1",
 			OrganizationID:                "org-1",
-			TiDBCloudSpendingLimitMonthly: &spendingLimit,
+			TiDBCloudSpendingLimitMonthly: &cloudSpendingLimit,
 		}},
 	}}
 	ts := httptest.NewServer(rt.server)
@@ -1583,8 +1668,15 @@ func TestAdminTenantGetUsesListClusterAuthorizationAndReturnsQuota(t *testing.T)
 	if out.Quota == nil || out.Quota.Config.MaxStorageSize != 100 || out.Quota.Config.MaxFileSize != 10 || out.Quota.Config.MaxFileCount != 7 {
 		t.Fatalf("quota = %#v, want config in response", out.Quota)
 	}
-	if out.Quota.Config.TiDBCloudSpendingLimit == nil || *out.Quota.Config.TiDBCloudSpendingLimit != spendingLimit {
-		t.Fatalf("spending limit = %#v, want %d", out.Quota.Config.TiDBCloudSpendingLimit, spendingLimit)
+	if out.Quota.Config.TiDBCloudSpendingLimit == nil || *out.Quota.Config.TiDBCloudSpendingLimit != localSpendingLimit {
+		t.Fatalf("spending limit = %#v, want local value %d", out.Quota.Config.TiDBCloudSpendingLimit, localSpendingLimit)
+	}
+	cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != localSpendingLimit || cfg.TiDBCloudSpendingLimitCheckedAt != nil {
+		t.Fatalf("quota config mutated by GET: %#v", cfg)
 	}
 	if got := rt.prov.listCalls.Load(); got != 1 {
 		t.Fatalf("list calls = %d, want 1", got)
@@ -1619,8 +1711,8 @@ func TestAdminTenantGetUsesListClusterAuthorizationAndReturnsQuota(t *testing.T)
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if out.Quota == nil || out.Quota.Config.TiDBCloudSpendingLimit == nil || *out.Quota.Config.TiDBCloudSpendingLimit != spendingLimit {
-		t.Fatalf("cached spending limit = %#v, want %d", out.Quota, spendingLimit)
+	if out.Quota == nil || out.Quota.Config.TiDBCloudSpendingLimit == nil || *out.Quota.Config.TiDBCloudSpendingLimit != localSpendingLimit {
+		t.Fatalf("cached spending limit = %#v, want local value %d", out.Quota, localSpendingLimit)
 	}
 }
 

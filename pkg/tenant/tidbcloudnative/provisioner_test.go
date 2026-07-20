@@ -1393,9 +1393,10 @@ func TestUpdateQuotaRejectsInvalidSpendingLimitBeforeRequest(t *testing.T) {
 	}
 }
 
-func TestGetQuotaOnlyGetsCluster(t *testing.T) {
+func TestGetQuotaUsesBasicClusterInfoForAuthorization(t *testing.T) {
 	var patchCalled bool
 	var getCalled bool
+	var gotRawQuery string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
 			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
@@ -1405,6 +1406,7 @@ func TestGetQuotaOnlyGetsCluster(t *testing.T) {
 		switch r.Method {
 		case http.MethodGet:
 			getCalled = true
+			gotRawQuery = r.URL.RawQuery
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"clusterId": "cluster-1",
 				"labels":    map[string]string{Drive9ManagedLabel: "true"},
@@ -1431,12 +1433,15 @@ func TestGetQuotaOnlyGetsCluster(t *testing.T) {
 	if !getCalled {
 		t.Fatal("GET was not called")
 	}
+	if gotRawQuery != "view=BASIC" {
+		t.Fatalf("query = %q, want view=BASIC", gotRawQuery)
+	}
 	if patchCalled {
 		t.Fatal("PATCH should not be called for read-only quota authorization")
 	}
 }
 
-func TestGetQuotaReadsSpendingLimit(t *testing.T) {
+func TestGetQuotaDoesNotReadSpendingLimit(t *testing.T) {
 	var patchCalled bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
@@ -1475,8 +1480,14 @@ func TestGetQuotaReadsSpendingLimit(t *testing.T) {
 	if patchCalled {
 		t.Fatal("PATCH should not be called for quota query")
 	}
-	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly == nil || *cfg.TiDBCloudSpendingLimitMonthly != 15000 {
-		t.Fatalf("quota cloud config = %#v, want spending limit 15000", cfg)
+	if cfg == nil {
+		t.Fatal("quota cloud config was nil")
+	}
+	if cfg.TiDBCloudSpendingLimitMonthly != nil {
+		t.Fatalf("spending limit = %#v, want nil for BASIC authorization", cfg.TiDBCloudSpendingLimitMonthly)
+	}
+	if cfg.Labels[Drive9ManagedLabel] != "true" {
+		t.Fatalf("labels = %#v, want parsed BASIC labels", cfg.Labels)
 	}
 }
 
