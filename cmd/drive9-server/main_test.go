@@ -2,7 +2,6 @@ package main
 
 import (
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -656,34 +655,20 @@ func TestStartupEnvsSetMetaMediaAndVideoDefaults(t *testing.T) {
 	}()
 
 	if meta.DefaultMaxMediaLLMFiles() != 500 {
-		t.Fatalf("default media = %d, want 500", meta.DefaultMaxMediaLLMFiles())
+		t.Errorf("default media = %d, want 500", meta.DefaultMaxMediaLLMFiles())
 	}
 	if meta.DefaultMaxVideoLLMFiles() != 50 {
-		t.Fatalf("default video = %d, want 50", meta.DefaultMaxVideoLLMFiles())
+		t.Errorf("default video = %d, want 50", meta.DefaultMaxVideoLLMFiles())
 	}
 
 	setEnv(t, "DRIVE9_MEDIA_EXTRACT_MAX_FILES", "10000")
 	setEnv(t, "DRIVE9_VIDEO_EXTRACT_MAX_FILES", "10000")
-	parseAndApplyStartupEnvs()
+	applyQuotaDefaultsFromEnv()
 
 	if meta.DefaultMaxMediaLLMFiles() != 10000 {
-		t.Fatalf("default media = %d, want 10000", meta.DefaultMaxMediaLLMFiles())
+		t.Errorf("default media = %d, want 10000", meta.DefaultMaxMediaLLMFiles())
 	}
 	if meta.DefaultMaxVideoLLMFiles() != 10000 {
-		t.Fatalf("default video = %d, want 10000", meta.DefaultMaxVideoLLMFiles())
-	}
-}
-
-// parseAndApplyStartupEnvs mirrors the startup env parsing for the media/video default quotas.
-func parseAndApplyStartupEnvs() {
-	if raw := os.Getenv("DRIVE9_MEDIA_EXTRACT_MAX_FILES"); raw != "" {
-		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
-			meta.SetDefaultMaxMediaLLMFiles(v)
-		}
-	}
-	if raw := os.Getenv("DRIVE9_VIDEO_EXTRACT_MAX_FILES"); raw != "" {
-		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
-			meta.SetDefaultMaxVideoLLMFiles(v)
-		}
+		t.Errorf("default video = %d, want 10000", meta.DefaultMaxVideoLLMFiles())
 	}
 }

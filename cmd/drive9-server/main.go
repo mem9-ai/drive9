@@ -137,16 +137,7 @@ func main() {
 			meta.SetDefaultMaxStorageBytes(v)
 		}
 	}
-	if raw := os.Getenv("DRIVE9_MEDIA_EXTRACT_MAX_FILES"); raw != "" {
-		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
-			meta.SetDefaultMaxMediaLLMFiles(v)
-		}
-	}
-	if raw := os.Getenv("DRIVE9_VIDEO_EXTRACT_MAX_FILES"); raw != "" {
-		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
-			meta.SetDefaultMaxVideoLLMFiles(v)
-		}
-	}
+	applyQuotaDefaultsFromEnv()
 	defer func() { _ = store.Close() }()
 
 	// Continuously probe the long-lived metadata ("meta") store so a control-plane
@@ -738,6 +729,19 @@ func publicBaseURL(listenAddr string) string {
 		fmt.Fprintf(os.Stderr, "drive9-server: DRIVE9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback). Set DRIVE9_PUBLIC_URL to the externally reachable base URL.\n", listenAddr)
 		os.Exit(1)
 		return "" // unreachable
+	}
+}
+
+func applyQuotaDefaultsFromEnv() {
+	if raw := os.Getenv("DRIVE9_MEDIA_EXTRACT_MAX_FILES"); raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
+			meta.SetDefaultMaxMediaLLMFiles(v)
+		}
+	}
+	if raw := os.Getenv("DRIVE9_VIDEO_EXTRACT_MAX_FILES"); raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
+			meta.SetDefaultMaxVideoLLMFiles(v)
+		}
 	}
 }
 

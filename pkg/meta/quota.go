@@ -307,9 +307,7 @@ func (s *Store) SetQuotaConfigPatch(ctx context.Context, tenantID string, patch 
 			   /* Storage quota overrides are sticky once any storage/file limit is explicitly set. */
 			   quota_limits_overridden = IF(?, 1, quota_limits_overridden),
 			   tidbcloud_spending_limit = COALESCE(?, tidbcloud_spending_limit),
-			   tidbcloud_spending_limit_checked_at = COALESCE(?, tidbcloud_spending_limit_checked_at),
-			   max_media_llm_files = COALESCE(NULL, max_media_llm_files),
-			   max_video_llm_files = COALESCE(NULL, max_video_llm_files)`,
+			   tidbcloud_spending_limit_checked_at = COALESCE(?, tidbcloud_spending_limit_checked_at)`,
 		tenantID, insertStorage, insertFileSize, insertFileCount, quotaLimitOverrideSet, insertSpendingLimit, insertCheckedAt,
 			insertMediaLLM, insertVideoLLM,
 		updateStorage, updateFileSize, updateFileCount, quotaLimitOverrideSet, updateSpendingLimit, updateCheckedAt)
