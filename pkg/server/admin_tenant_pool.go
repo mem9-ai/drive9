@@ -1717,11 +1717,17 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		if err := s.applyQuotaLocalConfig(ctx, "pool_claim", row.Tenant.ID, quotaReq); err != nil {
 			return nil, nil, false, err
 		}
-		if err := s.syncTiDBCloudSpendingLimit(ctx, "pool_claim", row.Tenant.ID, cloudCfg, time.Time{}); err != nil {
-			return nil, nil, false, err
-		}
-		logProvisionStage(ctx, "admin_tenant_pool_claim_quota_local_config_applied", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID, "create_time_spending_limit", cloudCfg != nil && cloudCfg.TiDBCloudSpendingLimitMonthly != nil)
+		logProvisionStage(ctx, "admin_tenant_pool_claim_quota_local_config_applied", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID)
 	}
+	stageStarted = time.Now()
+	now := time.Now().UTC()
+	if err := s.meta.SetQuotaConfigPatch(ctx, row.Tenant.ID, meta.QuotaConfigPatch{
+		TiDBCloudSpendingLimit:           tidbCloudSpendingLimitFromCloud(cloudCfg),
+		TiDBCloudSpendingLimitCheckedAt: &now,
+	}); err != nil {
+		return nil, nil, false, err
+	}
+	logProvisionStage(ctx, "admin_tenant_pool_claim_quota_seeded", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID, "create_time_spending_limit", cloudCfg != nil && cloudCfg.TiDBCloudSpendingLimitMonthly != nil)
 	stageStarted = time.Now()
 	plainPass, err := s.pool.Decrypt(ctx, row.Tenant.DBPasswordCipher)
 	if err != nil {
