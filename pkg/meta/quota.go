@@ -50,6 +50,7 @@ type QuotaUsage struct {
 	ReservedBytes  int64
 	FileCount      int64
 	MediaFileCount int64
+	VideoFileCount int64
 	UpdatedAt      time.Time
 }
 
@@ -428,9 +429,9 @@ func (s *Store) GetQuotaUsage(ctx context.Context, tenantID string) (*QuotaUsage
 
 	u := &QuotaUsage{TenantID: tenantID}
 	err = s.db.QueryRowContext(ctx,
-		`SELECT storage_bytes, reserved_bytes, file_count, media_file_count, updated_at
+		`SELECT storage_bytes, reserved_bytes, file_count, media_file_count, video_file_count, updated_at
 		 FROM tenant_quota_usage WHERE tenant_id = ?`, tenantID,
-	).Scan(&u.StorageBytes, &u.ReservedBytes, &u.FileCount, &u.MediaFileCount, &u.UpdatedAt)
+	).Scan(&u.StorageBytes, &u.ReservedBytes, &u.FileCount, &u.MediaFileCount, &u.VideoFileCount, &u.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return u, nil // zero counters
 	}
@@ -557,6 +558,32 @@ func (s *Store) IncrMediaFileCount(ctx context.Context, tenantID string, delta i
 func (s *Store) IncrMediaFileCountTx(tx *sql.Tx, tenantID string, delta int64) error {
 	res, err := tx.Exec(
 		`UPDATE tenant_quota_usage SET media_file_count = media_file_count + ? WHERE tenant_id = ?`,
+		delta, tenantID)
+	if err != nil {
+		return err
+	}
+	return ensureRowsAffected(res, tenantID)
+}
+
+// IncrVideoFileCount atomically adjusts the video_file_count counter.
+func (s *Store) IncrVideoFileCount(ctx context.Context, tenantID string, delta int64) error {
+	start := time.Now()
+	var err error
+	defer observeMeta(ctx, "incr_video_file_count", start, &err)
+
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tenant_quota_usage SET video_file_count = video_file_count + ? WHERE tenant_id = ?`,
+		delta, tenantID)
+	if err != nil {
+		return err
+	}
+	return ensureRowsAffected(res, tenantID)
+}
+
+// IncrVideoFileCountTx atomically adjusts the video_file_count counter inside a transaction.
+func (s *Store) IncrVideoFileCountTx(tx *sql.Tx, tenantID string, delta int64) error {
+	res, err := tx.Exec(
+		`UPDATE tenant_quota_usage SET video_file_count = video_file_count + ? WHERE tenant_id = ?`,
 		delta, tenantID)
 	if err != nil {
 		return err

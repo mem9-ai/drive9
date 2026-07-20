@@ -40,7 +40,8 @@ func (m *mockQuotaStore) EnsureQuotaUsageRow(_ context.Context, _ string) error 
 func (m *mockQuotaStore) IncrStorageBytes(_ context.Context, _ string, _ int64) error   { return nil }
 func (m *mockQuotaStore) IncrReservedBytes(_ context.Context, _ string, _ int64) error  { return nil }
 func (m *mockQuotaStore) IncrFileCount(_ context.Context, _ string, _ int64) error      { return nil }
-func (m *mockQuotaStore) IncrMediaFileCount(_ context.Context, _ string, _ int64) error { return nil }
+func (m *mockQuotaStore) IncrMediaFileCount(_ context.Context, _ string, _ int64) error  { return nil }
+func (m *mockQuotaStore) IncrVideoFileCount(_ context.Context, _ string, _ int64) error  { return nil }
 func (m *mockQuotaStore) TransferReservedToConfirmed(_ context.Context, _ string, _, _ int64) error {
 	return nil
 }
@@ -50,7 +51,8 @@ func (m *mockQuotaStore) AtomicReserveAndInsertUpload(_ context.Context, _ *Uplo
 func (m *mockQuotaStore) IncrStorageBytesTx(_ *sql.Tx, _ string, _ int64) error   { return nil }
 func (m *mockQuotaStore) IncrReservedBytesTx(_ *sql.Tx, _ string, _ int64) error  { return nil }
 func (m *mockQuotaStore) IncrFileCountTx(_ *sql.Tx, _ string, _ int64) error      { return nil }
-func (m *mockQuotaStore) IncrMediaFileCountTx(_ *sql.Tx, _ string, _ int64) error { return nil }
+func (m *mockQuotaStore) IncrMediaFileCountTx(_ *sql.Tx, _ string, _ int64) error  { return nil }
+func (m *mockQuotaStore) IncrVideoFileCountTx(_ *sql.Tx, _ string, _ int64) error  { return nil }
 func (m *mockQuotaStore) TransferReservedToConfirmedTx(_ *sql.Tx, _ string, _, _ int64) error {
 	return nil
 }

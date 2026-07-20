@@ -173,6 +173,17 @@ func (f *fakeMetaQuotaStore) IncrMediaFileCountTx(tx *sql.Tx, tenantID string, d
 	return f.IncrMediaFileCount(context.Background(), tenantID, delta)
 }
 
+func (f *fakeMetaQuotaStore) IncrVideoFileCount(ctx context.Context, tenantID string, delta int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureUsageLocked(tenantID).VideoFileCount += delta
+	return nil
+}
+
+func (f *fakeMetaQuotaStore) IncrVideoFileCountTx(tx *sql.Tx, tenantID string, delta int64) error {
+	return f.IncrVideoFileCount(context.Background(), tenantID, delta)
+}
+
 func (f *fakeMetaQuotaStore) TransferReservedToConfirmed(ctx context.Context, tenantID string, reservedDelta, storageDelta int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -92,6 +92,9 @@ func (b *Dat9Backend) enqueueExtractSemanticTasksTx(ctx context.Context, tx *sql
 			if err != nil {
 				return enqueued, err
 			}
+			if created && b.metaStore != nil {
+				_ = b.metaStore.IncrVideoFileCount(ctx, b.tenantID, 1)
+			}
 			enqueued = enqueued || created
 		}
 	}
