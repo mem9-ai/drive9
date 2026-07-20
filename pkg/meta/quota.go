@@ -340,12 +340,13 @@ func (s *Store) SetTiDBCloudSpendingLimitIfNotUpdatedAfter(ctx context.Context, 
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes, max_file_size_bytes, max_file_count,
 		                                  quota_limits_overridden, tidbcloud_spending_limit,
-		                                  tidbcloud_spending_limit_checked_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		                                  tidbcloud_spending_limit_checked_at, max_media_llm_files, max_video_llm_files)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON DUPLICATE KEY UPDATE
 		   tidbcloud_spending_limit = IF(updated_at < ?, VALUES(tidbcloud_spending_limit), tidbcloud_spending_limit),
 		   tidbcloud_spending_limit_checked_at = IF(updated_at < ?, VALUES(tidbcloud_spending_limit_checked_at), tidbcloud_spending_limit_checked_at)`,
 		tenantID, DefaultMaxStorageBytes(), int64(0), int64(0), false, sql.NullInt64{Int64: limit, Valid: true}, sql.NullTime{Time: checkedAt, Valid: true},
+			DefaultMaxMediaLLMFiles(), DefaultMaxVideoLLMFiles(),
 		observedCutoff, observedCutoff)
 	if err != nil {
 		return false, fmt.Errorf("set tidbcloud spending limit for tenant %q: %w", tenantID, err)
