@@ -5205,21 +5205,30 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	logProvisionStage(ctx, "provision_tenant_status_updated", tenantID, provider, stageStarted, "status", meta.TenantProvisioning)
 
+	stageStarted = time.Now()
+	quotaSeed := meta.QuotaConfigPatch{
+		TiDBCloudSpendingLimit: tidbCloudSpendingLimitFromCloud(provisionCloudCfg),
+	}
 	if opts.Quota != nil {
-		stageStarted = time.Now()
-		quotaReq := *opts.Quota
-		quotaReq.TenantID = tenantID
-		if err := s.applyQuotaLocalConfig(ctx, "provision", tenantID, quotaReq); err != nil {
+		qp, err := quotaConfigPatchFromRequest(*opts.Quota)
+		if err != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
 			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
 			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to set tenant quota", err)
 		}
-		logProvisionStage(ctx, "provision_quota_local_config_applied", tenantID, provider, stageStarted)
-	}
-	stageStarted = time.Now()
-	quotaSeed := meta.QuotaConfigPatch{
-		TiDBCloudSpendingLimit: tidbCloudSpendingLimitFromCloud(provisionCloudCfg),
+		if qp.MaxStorageBytes != nil {
+			quotaSeed.MaxStorageBytes = qp.MaxStorageBytes
+		}
+		if qp.MaxFileSizeBytes != nil {
+			quotaSeed.MaxFileSizeBytes = qp.MaxFileSizeBytes
+		}
+		if qp.MaxFileCount != nil {
+			quotaSeed.MaxFileCount = qp.MaxFileCount
+		}
+		if qp.TiDBCloudSpendingLimit != nil {
+			quotaSeed.TiDBCloudSpendingLimit = qp.TiDBCloudSpendingLimit
+		}
 	}
 	if provisionCloudCfg != nil {
 		checkedAt := time.Now().UTC()
