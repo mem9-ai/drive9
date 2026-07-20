@@ -640,3 +640,53 @@ func TestDeleteTenantPlacementAndDecrCountIsAtomic(t *testing.T) {
 		t.Fatalf("placement must survive rolled-back delete: %v", err)
 	}
 }
+
+// TestCompleteSharedTenantProvisionRollsBackOnKeyFailure covers the named
+// failure class from review: the owner key insert fails (duplicate key id)
+// inside the provision transaction, so the capacity reservation, the
+// placement, AND the active/provider transition must all roll back with it —
+// the tenant can never be left active without its placement and key.
+func TestCompleteSharedTenantProvisionRollsBackOnKeyFailure(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		OrgID: "org-keyfail", Host: "h", Port: 4000, User: "u",
+		PasswordCipher: []byte("c"), Name: "keyfail_db",
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	seedPendingTenant(t, s, "tenant-keyfail")
+	fsID, err := s.EnsureFsID(ctx, "tenant-keyfail")
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	// Pre-insert a key with the same id, so the tx's key insert duplicates.
+	if err := s.InsertAPIKey(ctx, testOwnerKey("tenant-keyfail")); err != nil {
+		t.Fatalf("seed duplicate key: %v", err)
+	}
+	err = s.CompleteSharedTenantProvision(ctx, "tenant-keyfail", "tidb_cloud_native_shared", &TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}, testOwnerKey("tenant-keyfail"))
+	if !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("provision error = %v, want ErrDuplicate", err)
+	}
+	tenant, err := s.GetTenant(ctx, "tenant-keyfail")
+	if err != nil {
+		t.Fatalf("GetTenant: %v", err)
+	}
+	if tenant.Provider != "tidb_cloud_native" || tenant.Status != TenantPending {
+		t.Fatalf("tenant = provider %q status %q, want unchanged tidb_cloud_native/pending", tenant.Provider, tenant.Status)
+	}
+	if _, err := s.GetTenantPlacement(ctx, fsID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("placement after key-failure rollback = %v, want ErrNotFound", err)
+	}
+	db, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if db.TenantCount != 0 {
+		t.Fatalf("TenantCount = %d, want 0 after key-failure rollback", db.TenantCount)
+	}
+}
