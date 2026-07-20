@@ -198,11 +198,12 @@ func (s *Store) GetQuotaConfigVersion(ctx context.Context, tenantID string) (str
 	defer observeMeta(ctx, "get_quota_config_version", start, &err)
 
 	var maxStorageBytes, maxFileSizeBytes, maxFileCount, maxMediaLLMFiles, maxVideoLLMFiles, maxMonthlyCostMC int64
+	var quotaLimitsOverridden bool
 	err = s.db.QueryRowContext(ctx,
 		`SELECT max_storage_bytes, max_file_size_bytes, max_file_count,
-		        max_media_llm_files, max_video_llm_files, max_monthly_cost_mc
+		        max_media_llm_files, max_video_llm_files, max_monthly_cost_mc, quota_limits_overridden
 		 FROM tenant_quota_config WHERE tenant_id = ?`, tenantID,
-	).Scan(&maxStorageBytes, &maxFileSizeBytes, &maxFileCount, &maxMediaLLMFiles, &maxVideoLLMFiles, &maxMonthlyCostMC)
+	).Scan(&maxStorageBytes, &maxFileSizeBytes, &maxFileCount, &maxMediaLLMFiles, &maxVideoLLMFiles, &maxMonthlyCostMC, &quotaLimitsOverridden)
 	if err == sql.ErrNoRows {
 		logger.Info(ctx, "quota_config_not_found_using_defaults",
 			zap.String("tenant_id", tenantID))
@@ -211,6 +212,9 @@ func (s *Store) GetQuotaConfigVersion(ctx context.Context, tenantID string) (str
 	}
 	if err != nil {
 		return "", fmt.Errorf("get quota config version for tenant %q: %w", tenantID, err)
+	}
+	if !quotaLimitsOverridden {
+		return "", nil
 	}
 	return fmt.Sprintf("v3:%d:%d:%d:%d:%d:%d", maxStorageBytes, maxFileSizeBytes, maxFileCount, maxMediaLLMFiles, maxVideoLLMFiles, maxMonthlyCostMC), nil
 }
