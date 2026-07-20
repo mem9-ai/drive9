@@ -9,15 +9,15 @@ import (
 )
 
 const (
-	defaultMetaConnMaxLifetime       = 5 * time.Minute
-	defaultMetaConnMaxIdleTime       = 45 * time.Second
+	defaultMetaConnMaxLifetime       = 10 * time.Minute
+	defaultMetaConnMaxIdleTime       = 1 * time.Minute
 	defaultMetaMaxOpenConns          = 100
 	defaultMetaMaxIdleConns          = 20
 	defaultUserConnMaxLifetime       = 5 * time.Minute
 	defaultUserConnMaxIdleTime       = 1 * time.Minute
 	defaultUserMaxOpenConns          = 6
 	defaultUserMaxIdleConns          = 2
-	defaultUserSchemaConnMaxLifetime = 1 * time.Minute
+	defaultUserSchemaConnMaxLifetime = 3 * time.Minute
 	defaultUserSchemaConnMaxIdleTime = 20 * time.Second
 	defaultUserSchemaMaxOpenConns    = 8
 	defaultUserSchemaMaxIdleConns    = 2
