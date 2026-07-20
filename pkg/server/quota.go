@@ -223,16 +223,15 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if t.Provider != tenant.ProviderTiDBCloudNative {
+		errJSON(w, http.StatusConflict, "quota setting is only supported for tidb_cloud_native tenants")
+		return
+	}
 	if err := s.rejectQuotaSetForTenantStatus(t); err != nil {
 		errJSON(w, http.StatusConflict, err.Error())
 		return
 	}
-	if !s.tidbCloudRBACAllowed(cred, t.ClusterID, "quota_set") {
-		errJSON(w, http.StatusForbidden, "rbac check failed")
-		return
-	}
-	s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{ClusterID: t.ClusterID})
-	if err := s.applyQuotaLocalConfig(r.Context(), "quota_set", t.ID, req); err != nil {
+	if err := s.applyQuotaSet(r.Context(), "quota_set", t, cred, req); err != nil {
 		writeQuotaSetError(w, r.Context(), err, "update")
 		return
 	}
