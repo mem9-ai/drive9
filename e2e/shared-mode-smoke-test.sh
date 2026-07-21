@@ -6,11 +6,18 @@
 #                            standalone tenant DB (coexistence)
 #
 # Covers: provision onto shared pool (instant active), CRUD, cross-tenant
-# isolation, SSE events, multipart upload, fork rejection, shared delete +
-# purge, server restart persistence, and standalone↔shared coexistence.
+# isolation (read/list/grep/find/copy/hardlink/rename/delete, concurrent
+# same-path writes, SSE non-leak, multipart session ownership), SSE events,
+# multipart upload, fork rejection, shared delete + purge, server restart
+# persistence, standalone↔shared coexistence, then the full
+# api-smoke-test.sh + cli-smoke-test.sh suites against the same shared
+# server (each suite provisions its own fresh tenant; fork/sql/semantic skipped).
 #
 # Override endpoints to skip containers:
 #   META_DSN=... SHARED_DSN=... STANDALONE_DSN=... bash e2e/shared-mode-smoke-test.sh
+#
+# Knobs:
+#   RUN_SHARED_API_CLI_SMOKE=0  skip the nested api/cli suites (default 1)
 
 set -euo pipefail
 
@@ -30,6 +37,10 @@ STANDALONE_DSN="${STANDALONE_DSN:-}"
 KEEP_DB="${KEEP_DB:-0}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-180}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-2}"
+# After the shared-mode-specific checks, re-run the full API + CLI smoke suites
+# against this shared server. Each suite provisions its own tenant (DRIVE9_API_KEY
+# is cleared). Default on; set RUN_SHARED_API_CLI_SMOKE=0 to skip.
+RUN_SHARED_API_CLI_SMOKE="${RUN_SHARED_API_CLI_SMOKE:-1}"
 
 # Remember which endpoints were supplied externally: the container startup
 # paths assign these variables too, and only externally supplied endpoints
@@ -180,7 +191,53 @@ http() { # method path [api_key] [body]
   code=$(curl "${args[@]}" "http://127.0.0.1:${SERVER_PORT}${path}" 2>/dev/null) || code="000"
   printf '%s|%s' "$code" "$(cat "$TMP_DIR/resp.json" 2>/dev/null || true)"
 }
+# http_hdr METHOD PATH API_KEY HEADER_NAME HEADER_VALUE [HEADER_NAME HEADER_VALUE ...]
+# Used for copy/hardlink/rename which carry the source path in a header.
+http_hdr() {
+  local method="$1" path="$2" key="$3"
+  shift 3
+  local args=(-sS -o "$TMP_DIR/resp.json" -w "%{http_code}" -X "$method" -H "Authorization: Bearer $key")
+  while [ "$#" -ge 2 ]; do
+    args+=(-H "$1: $2")
+    shift 2
+  done
+  local code
+  code=$(curl "${args[@]}" "http://127.0.0.1:${SERVER_PORT}${path}" 2>/dev/null) || code="000"
+  printf '%s|%s' "$code" "$(cat "$TMP_DIR/resp.json" 2>/dev/null || true)"
+}
 field() { printf '%s' "$2" | python3 -c "import sys,json;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null || true; }
+# list_has_name BODY NAME → "true"/"false" for list responses {entries:[{name:...}]}
+list_has_name() {
+  printf '%s' "$1" | python3 -c '
+import json, sys
+name = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("false"); raise SystemExit
+entries = data.get("entries") if isinstance(data, dict) else None
+if not isinstance(entries, list):
+    print("false"); raise SystemExit
+print("true" if any(isinstance(e, dict) and e.get("name") == name for e in entries) else "false")
+' "$2" 2>/dev/null || echo "false"
+}
+# search_has_path BODY PATH → "true"/"false" for grep/find arrays [{path:...}].
+# Accepts paths with or without a leading slash (API responses vary by suite).
+search_has_path() {
+  printf '%s' "$1" | python3 -c '
+import json, sys
+want = sys.argv[1].lstrip("/")
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("false"); raise SystemExit
+if not isinstance(data, list):
+    print("false"); raise SystemExit
+def norm(p):
+    return (p or "").lstrip("/")
+print("true" if any(isinstance(e, dict) and norm(e.get("path")) == want for e in data) else "false")
+' "$2" 2>/dev/null || echo "false"
+}
 
 start_server() {
   env \
@@ -279,6 +336,102 @@ check_eq "A still reads its own /a.txt content" "hello from A" "${resp#*|}"
 resp=$(http GET /v1/fs/docs/note.txt "$B_KEY")
 check_eq "B cannot read A's /docs/note.txt" "404" "${resp%%|*}"
 
+# ============ 2b. Cross-tenant isolation: list / grep / find / mutations ============
+# A-only marker used for search isolation (unique string B must never see).
+ISOLATION_MARKER="shared-isolation-marker-A-only"
+resp=$(http PUT /v1/fs/docs/secret-a.txt "$A_KEY" "$ISOLATION_MARKER")
+check_eq "A write isolation marker returns 200" "200" "${resp%%|*}"
+
+# Root list: each tenant only sees its own tree (B must not see A's /docs).
+resp=$(http GET "/v1/fs/?list" "$A_KEY")
+check_eq "A root list returns 200" "200" "${resp%%|*}"
+check_eq "A root list includes a.txt" "true" "$(list_has_name "${resp#*|}" "a.txt")"
+check_eq "A root list includes docs/" "true" "$(list_has_name "${resp#*|}" "docs")"
+resp=$(http GET "/v1/fs/?list" "$B_KEY")
+check_eq "B root list returns 200" "200" "${resp%%|*}"
+check_eq "B root list includes a.txt" "true" "$(list_has_name "${resp#*|}" "a.txt")"
+check_eq "B root list does NOT include A's docs/" "false" "$(list_has_name "${resp#*|}" "docs")"
+
+# B listing a directory that only exists under A must not leak A's children.
+# Product behavior: missing dir may be 404 or 200+empty entries; either is fine
+# as long as A's note.txt / secret-a.txt never appear.
+resp=$(http GET "/v1/fs/docs/?list" "$B_KEY")
+B_DOCS_CODE="${resp%%|*}"
+B_DOCS_BODY="${resp#*|}"
+case "$B_DOCS_CODE" in
+  404) pass "B list of A's /docs returns 404" ;;
+  200)
+    pass "B list of A's /docs returns 200 (empty-or-local only)"
+    check_eq "B list /docs does NOT include note.txt" "false" "$(list_has_name "$B_DOCS_BODY" "note.txt")"
+    check_eq "B list /docs does NOT include secret-a.txt" "false" "$(list_has_name "$B_DOCS_BODY" "secret-a.txt")"
+    entry_n=$(printf '%s' "$B_DOCS_BODY" | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin); e=d.get("entries") if isinstance(d,dict) else None
+  print(len(e) if isinstance(e,list) else -1)
+except Exception:
+  print(-1)')
+    check_eq "B list /docs entry count is 0" "0" "$entry_n"
+    ;;
+  *) fail "B list of A's /docs unexpected status $B_DOCS_CODE body=$B_DOCS_BODY" ;;
+esac
+
+# Grep: A finds its marker; B's grep for the same string is empty.
+resp=$(http GET "/v1/fs/?grep=shared-isolation-marker-A-only&limit=20" "$A_KEY")
+check_eq "A grep isolation marker returns 200" "200" "${resp%%|*}"
+check_eq "A grep finds /docs/secret-a.txt" "true" "$(search_has_path "${resp#*|}" "/docs/secret-a.txt")"
+resp=$(http GET "/v1/fs/?grep=shared-isolation-marker-A-only&limit=20" "$B_KEY")
+check_eq "B grep isolation marker returns 200" "200" "${resp%%|*}"
+check_eq "B grep does NOT find A's secret" "false" "$(search_has_path "${resp#*|}" "/docs/secret-a.txt")"
+# Empty array is also fine; any hit with A's path is a leak.
+case "${resp#*|}" in *secret-a*|*isolation-marker*) fail "B grep body leaked A content: ${resp#*|}" ;; *) pass "B grep body has no A marker/path" ;; esac
+
+# Find by name: note.txt only exists under A.
+resp=$(http GET "/v1/fs/?find=&name=note.txt" "$A_KEY")
+check_eq "A find note.txt returns 200" "200" "${resp%%|*}"
+check_eq "A find returns /docs/note.txt" "true" "$(search_has_path "${resp#*|}" "/docs/note.txt")"
+resp=$(http GET "/v1/fs/?find=&name=note.txt" "$B_KEY")
+check_eq "B find note.txt returns 200" "200" "${resp%%|*}"
+check_eq "B find does NOT return A's note.txt" "false" "$(search_has_path "${resp#*|}" "/docs/note.txt")"
+
+# Mutations must not reach the other tenant's namespace (source missing → 404).
+resp=$(http_hdr POST "/v1/fs/stolen-copy.txt?copy" "$B_KEY" "X-Dat9-Copy-Source" "/docs/note.txt")
+check_eq "B copy from A's /docs/note.txt returns 404" "404" "${resp%%|*}"
+resp=$(http_hdr POST "/v1/fs/stolen-link.txt?hardlink=1" "$B_KEY" "X-Dat9-Hardlink-Source" "/docs/note.txt")
+check_eq "B hardlink from A's /docs/note.txt returns 404" "404" "${resp%%|*}"
+resp=$(http_hdr POST "/v1/fs/stolen-renamed.txt?rename" "$B_KEY" "X-Dat9-Rename-Source" "/docs/note.txt")
+check_eq "B rename of A's /docs/note.txt returns 404" "404" "${resp%%|*}"
+resp=$(http DELETE /v1/fs/docs/note.txt "$B_KEY")
+check_eq "B delete of A's /docs/note.txt returns 404" "404" "${resp%%|*}"
+resp=$(http GET /v1/fs/docs/note.txt "$A_KEY")
+check_eq "A still has /docs/note.txt after B mutation attempts" "nested note" "${resp#*|}"
+
+# Delete own path must not affect the peer's same-path file.
+resp=$(http DELETE /v1/fs/a.txt "$B_KEY")
+check_eq "B delete own /a.txt returns 200" "200" "${resp%%|*}"
+resp=$(http GET /v1/fs/a.txt "$A_KEY")
+check_eq "A /a.txt intact after B deletes same path" "hello from A" "${resp#*|}"
+resp=$(http GET /v1/fs/a.txt "$B_KEY")
+check_eq "B /a.txt gone after self-delete" "404" "${resp%%|*}"
+# Restore B's /a.txt for later shared-mode steps (restart / standalone checks).
+resp=$(http PUT /v1/fs/a.txt "$B_KEY" "hello from B")
+check_eq "B restore /a.txt returns 200" "200" "${resp%%|*}"
+
+# Concurrent same-path writes: each tenant still reads only its own bytes.
+# Use dedicated curl (not http()) so concurrent jobs do not share resp.json.
+curl -sS -o /dev/null -X PUT \
+  -H "Authorization: Bearer $A_KEY" -H "Content-Type: application/octet-stream" \
+  --data-binary "race-from-A" "http://127.0.0.1:${SERVER_PORT}/v1/fs/race.txt" &
+PID_A=$!
+curl -sS -o /dev/null -X PUT \
+  -H "Authorization: Bearer $B_KEY" -H "Content-Type: application/octet-stream" \
+  --data-binary "race-from-B" "http://127.0.0.1:${SERVER_PORT}/v1/fs/race.txt" &
+PID_B=$!
+wait "$PID_A" "$PID_B" || true
+resp=$(http GET /v1/fs/race.txt "$A_KEY")
+check_eq "A reads own race.txt after concurrent write" "race-from-A" "${resp#*|}"
+resp=$(http GET /v1/fs/race.txt "$B_KEY")
+check_eq "B reads own race.txt after concurrent write" "race-from-B" "${resp#*|}"
+
 # ============ 3. Raw SQL on TiDB: fs_id isolation + CLUSTERED ============
 if [ -n "$TIDB_CONTAINER" ]; then
   A_FS_ID=$(meta_exec "SELECT fs_id FROM $META_DB.fs_registry WHERE tenant_id='$A_TENANT';")
@@ -296,21 +449,37 @@ if [ -n "$TIDB_CONTAINER" ]; then
   check_eq "shared DB has no llm_usage table" "0" "${N:-?}"
 fi
 
-# ============ 4. SSE events on shared tenant ============
+# ============ 4. SSE events on shared tenant (+ cross-tenant non-leak) ============
 SSE_OUT="$TMP_DIR/sse.log"
+SSE_A_OUT="$TMP_DIR/sse-a.log"
 curl -sS -N --max-time 12 -H "Authorization: Bearer $B_KEY" \
   "http://127.0.0.1:$SERVER_PORT/v1/events?since=0" >"$SSE_OUT" 2>/dev/null &
 SSE_PID=$!
+curl -sS -N --max-time 12 -H "Authorization: Bearer $A_KEY" \
+  "http://127.0.0.1:$SERVER_PORT/v1/events?since=0" >"$SSE_A_OUT" 2>/dev/null &
+SSE_A_PID=$!
 sleep 2
 resp=$(http PUT /v1/fs/sse-target.txt "$B_KEY" "sse payload")
 check_eq "B write for SSE returns 200" "200" "${resp%%|*}"
 sleep 4
 kill "$SSE_PID" >/dev/null 2>&1 || true
+kill "$SSE_A_PID" >/dev/null 2>&1 || true
 wait "$SSE_PID" 2>/dev/null || true
+wait "$SSE_A_PID" 2>/dev/null || true
 if grep -q "initial_sync\|server_restart" "$SSE_OUT" && grep -q "sse-target.txt" "$SSE_OUT"; then
   pass "SSE stream delivered reset + file event for shared tenant"
 else
   fail "SSE stream missing events: $(head -c 400 "$SSE_OUT")"
+fi
+if grep -q "initial_sync\|server_restart" "$SSE_A_OUT"; then
+  pass "A SSE stream delivered reset event"
+else
+  fail "A SSE stream missing reset: $(head -c 400 "$SSE_A_OUT")"
+fi
+if grep -q "sse-target.txt" "$SSE_A_OUT"; then
+  fail "A SSE stream leaked B's sse-target.txt event"
+else
+  pass "A SSE stream does not contain B's sse-target.txt"
 fi
 
 # ============ 5. Multipart upload (v2) on shared tenant ============
@@ -381,6 +550,50 @@ else
   resp=$(http GET /v1/fs/big.bin "$B_KEY")
   check_eq "multipart file readable inline" "200" "${resp%%|*}"
 fi
+# Peer tenant must not see the completed multipart object.
+resp=$(http GET /v1/fs/big.bin "$A_KEY")
+check_eq "A cannot read B's multipart /big.bin" "404" "${resp%%|*}"
+# Upload session ownership: A cannot complete B's in-flight upload_id.
+jq -n --arg path "/iso-upload.bin" --argjson total_size 10485760 --arg checksums "$CHECKSUMS" \
+  '{path:$path,total_size:$total_size,part_checksums:($checksums|split(","))}' > "$TMP_DIR/init-iso.json"
+code=$(curl -sS -o "$TMP_DIR/plan-iso.json" -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $B_KEY" -H "Content-Type: application/json" \
+  --data-binary "@$TMP_DIR/init-iso.json" "http://127.0.0.1:$SERVER_PORT/v1/uploads/initiate")
+check_eq "B isolation multipart initiate returns 202" "202" "$code"
+ISO_UPLOAD_ID=$(jq -r '.upload_id // empty' "$TMP_DIR/plan-iso.json")
+[ -n "$ISO_UPLOAD_ID" ] && pass "B isolation upload_id issued" || fail "B isolation upload_id empty"
+resp=$(http POST "/v1/uploads/$ISO_UPLOAD_ID/complete" "$A_KEY")
+# Wrong-tenant complete must not succeed (404 not-found or 403 forbidden).
+case "${resp%%|*}" in
+  404|403) pass "A cannot complete B's upload session (got ${resp%%|*})" ;;
+  *) fail "A complete of B's upload want 404/403 got ${resp%%|*} body=${resp#*|}" ;;
+esac
+# B can still complete its own session after parts are uploaded.
+python3 - "$TMP_DIR/plan-iso.json" "$BIG_FILE" <<'PY'
+import json, sys, urllib.request
+plan_path, file_path = sys.argv[1], sys.argv[2]
+plan = json.load(open(plan_path))
+with open(file_path, "rb") as data_file:
+    for idx, p in enumerate(plan.get("parts", []), 1):
+        size = int(p["size"])
+        data = data_file.read(size)
+        if len(data) != size:
+            raise SystemExit(f"short read part {idx}")
+        req = urllib.request.Request(p["url"], data=data, method="PUT")
+        req.add_header("Content-Length", str(size))
+        for hk, hv in (p.get("headers") or {}).items():
+            req.add_header(hk, hv)
+        if p.get("checksum_crc32c"):
+            req.add_header("x-amz-checksum-crc32c", p["checksum_crc32c"])
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            if getattr(resp, "status", 200) >= 300:
+                raise SystemExit(f"part {idx} HTTP {resp.status}")
+PY
+check_eq "B isolation multipart parts uploaded" "0" "$?"
+resp=$(http POST "/v1/uploads/$ISO_UPLOAD_ID/complete" "$B_KEY")
+check_eq "B completes own isolation upload" "200" "${resp%%|*}"
+resp=$(http GET /v1/fs/iso-upload.bin "$A_KEY")
+check_eq "A cannot read B's iso-upload.bin" "404" "${resp%%|*}"
 
 # ============ 6. Fork rejected on shared tenant ============
 resp=$(http POST /v1/fork "$B_KEY")
@@ -437,6 +650,43 @@ if [ -n "$TIDB_CONTAINER" ]; then
   check_eq "A's inodes purged from shared DB" "0" "${N:-?}"
   N=$(tidb_exec "SELECT COUNT(*) FROM $SHARED_DB.file_nodes WHERE fs_id=$B_FS_ID;")
   [ "${N:-0}" -ge 1 ] && pass "B's rows still in shared DB" || fail "B's rows missing after A purge"
+fi
+
+# ============ 10. Full API + CLI smoke (fresh tenants each) ============
+# Reuse the live shared-mode server for the broad regression suites. Each
+# suite provisions its own tenant; we intentionally do not hand them A/B/S
+# keys. Semantic checks are off because this server boots with
+# DRIVE9_DISABLE_AUTO_EMBEDDING=true. Fork is unsupported on shared tenants
+# (409), so RUN_CLI_FORK_CHECKS=0.
+run_full_smoke() {
+  local name="$1"
+  local script="$2"
+  log "=== [$name] $script (fresh provision against shared server) ==="
+  set +e
+  # -u DRIVE9_API_KEY forces fresh provision even if the outer env has a key.
+  # Semantic is off (no auto-embedding). Fork is off (shared tenants 409).
+  # SQL is off (ExecSQL is unsupported on shared-schema stores).
+  env -u DRIVE9_API_KEY \
+    DRIVE9_BASE="http://127.0.0.1:$SERVER_PORT" \
+    RUN_SEMANTIC_CHECKS=0 \
+    RUN_CLI_SEMANTIC_CHECKS=0 \
+    RUN_CLI_FORK_CHECKS=0 \
+    RUN_SQL_CHECKS=0 \
+    bash "$script"
+  local rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    pass "$name smoke against shared server"
+  else
+    fail "$name smoke against shared server (rc=$rc)"
+  fi
+}
+
+if [ "$RUN_SHARED_API_CLI_SMOKE" = "1" ]; then
+  run_full_smoke "api" "e2e/api-smoke-test.sh"
+  run_full_smoke "cli" "e2e/cli-smoke-test.sh"
+else
+  log "skipping nested api/cli smoke (RUN_SHARED_API_CLI_SMOKE=$RUN_SHARED_API_CLI_SMOKE)"
 fi
 
 log "all shared-mode e2e checks done"
