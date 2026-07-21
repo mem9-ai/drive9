@@ -243,7 +243,7 @@ func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	clusters, _, err := s.listAllManagedClusters(r.Context(), cred, "", "admin_tenant_list")
+	clusters, err := s.listAllManagedClusters(r.Context(), cred, "", "admin_tenant_list")
 	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "list tenants")
 		return
@@ -464,13 +464,13 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 		errJSON(w, http.StatusNotFound, "tenant not found")
 		return nil, nil, false
 	}
-	clusters, _, err := s.listAllManagedClustersCached(r.Context(), cred, binding.ClusterID, true, adminTenantMetricPath(loadQuota, allowDeletingMissingCluster))
+	clusters, err := s.listAllManagedClusters(r.Context(), cred, binding.ClusterID, adminTenantMetricPath(loadQuota, allowDeletingMissingCluster))
 	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
 		return nil, nil, false
 	}
 	if len(clusters) == 0 && allowDeletingMissingCluster && t.Status == meta.TenantDeleting {
-		clusters, _, err = s.listAllManagedClusters(r.Context(), cred, "", adminTenantMetricPath(loadQuota, allowDeletingMissingCluster))
+		clusters, err = s.listAllManagedClusters(r.Context(), cred, "", adminTenantMetricPath(loadQuota, allowDeletingMissingCluster))
 		if err != nil {
 			writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
 			return nil, nil, false
@@ -510,35 +510,27 @@ func adminTenantMetricPath(loadQuota bool, allowDeletingMissingCluster bool) str
 	}
 }
 
-func (s *Server) listAllManagedClusters(ctx context.Context, cred tenant.CredentialProvisionRequest, clusterID, metricPath string) ([]tenant.CloudClusterInfo, bool, error) {
-	return s.listAllManagedClustersCached(ctx, cred, clusterID, true, metricPath)
-}
-
-func (s *Server) listAllManagedClustersCached(ctx context.Context, cred tenant.CredentialProvisionRequest, clusterID string, allowCache bool, metricPath string) ([]tenant.CloudClusterInfo, bool, error) {
+func (s *Server) listAllManagedClusters(ctx context.Context, cred tenant.CredentialProvisionRequest, clusterID, metricPath string) ([]tenant.CloudClusterInfo, error) {
 	clusterID = strings.TrimSpace(clusterID)
 	scope := "list"
 	if clusterID != "" {
 		scope = "cluster"
 	}
-	if allowCache {
-		if clusterID != "" {
-			if cluster, ok := s.tidbCloudRBACCache.getCluster(cred, clusterID); ok {
-				if cluster.OrganizationID != "" {
-					metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "hit")
-					return []tenant.CloudClusterInfo{cluster}, true, nil
-				}
+	if clusterID != "" {
+		if cluster, ok := s.tidbCloudRBACCache.getCluster(cred, clusterID); ok {
+			if cluster.OrganizationID != "" {
+				metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "hit")
+				return []tenant.CloudClusterInfo{cluster}, nil
 			}
-		} else if clusters, ok := s.tidbCloudRBACCache.getClusterList(cred); ok {
-			metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "hit")
-			return clusters, true, nil
 		}
-		metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "miss")
-	} else {
-		metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "bypass")
+	} else if clusters, ok := s.tidbCloudRBACCache.getClusterList(cred); ok {
+		metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "hit")
+		return clusters, nil
 	}
+	metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "miss")
 	lister, ok := s.provisioner.(tenant.ManagedClusterLister)
 	if !ok {
-		return nil, false, fmt.Errorf("managed cluster list not enabled")
+		return nil, fmt.Errorf("managed cluster list not enabled")
 	}
 	var out []tenant.CloudClusterInfo
 	pageToken := ""
@@ -550,14 +542,14 @@ func (s *Server) listAllManagedClustersCached(ctx context.Context, cred tenant.C
 		})
 		if err != nil {
 			metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "list_managed_clusters", "error")
-			return nil, false, err
+			return nil, err
 		}
 		metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "list_managed_clusters", "ok")
 		if page == nil {
 			if clusterID == "" {
 				s.tidbCloudRBACCache.rememberClusterList(cred, out)
 			}
-			return out, false, nil
+			return out, nil
 		}
 		out = append(out, page.Clusters...)
 		pageToken = strings.TrimSpace(page.NextPageToken)
@@ -569,7 +561,7 @@ func (s *Server) listAllManagedClustersCached(ctx context.Context, cred tenant.C
 					s.rememberTiDBCloudRBAC(cred, cluster)
 				}
 			}
-			return out, false, nil
+			return out, nil
 		}
 	}
 }
