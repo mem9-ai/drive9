@@ -187,6 +187,16 @@ func DeleteTenantPoolBindings(poolID, tidbCloudOrgID, poolStatus string) {
 	)
 }
 
+func DeleteTenantCounters(tenantID string) {
+	tenantID = cleanMetricValue(tenantID, "unknown")
+	if tenantID == "unknown" {
+		return
+	}
+	globalRegistry.DeleteCountersByLabel("tenant_id", tenantID)
+	globalRegistry.DeleteHistogramsByLabel("tenant_id", tenantID)
+	globalRegistry.DeleteGaugesByLabel("tenant_id", tenantID)
+}
+
 func RecordTiDBCloudRBACCacheRequest(path, scope, result string) {
 	RegisterModule("tidbcloud_quota")
 	tidbCloudRBACCacheRequestsTotal.Add(1,

@@ -1374,6 +1374,7 @@ func closeEntry(e *entry) {
 	if e.store != nil {
 		_ = e.store.Close()
 	}
+	metrics.DeleteTenantCounters(e.tenantID)
 }
 
 type tenantPoolResult string
