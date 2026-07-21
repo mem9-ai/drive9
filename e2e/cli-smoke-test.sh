@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
 # drive9 CLI smoke test against a live deployment.
+#
+# Tenant mode:
+#  - Fresh (default): POST /v1/provision a new tenant, then run the suite.
+#  - Existing (DRIVE9_API_KEY set): skip provision and reuse the tenant the
+#    key belongs to. The CLI upload-limit boundary check (step [9]) defaults
+#    to OFF in this mode because reserving `total_size` against an existing
+#    tenant's quota can spuriously fail with 507; an explicit
+#    RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1 still wins. The rest of the suite
+#    (fork flow, small-file ops, pack/archive, step [8] cleanup) is already
+#    compatible with an existing tenant and unchanged.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
+API_KEY="${DRIVE9_API_KEY:-}"
 DRIVE9_IMAGE_FIXTURE_PATH="${DRIVE9_IMAGE_FIXTURE_PATH:-$SCRIPT_DIR/fixtures/cat03.jpg}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
@@ -15,7 +26,16 @@ CLI_LARGE_FILE_MB="${CLI_LARGE_FILE_MB:-100}"
 CLI_BATCH_SMALL_FILE_COUNT="${CLI_BATCH_SMALL_FILE_COUNT:-10}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
-RUN_CLI_UPLOAD_LIMIT_BOUNDARY="${RUN_CLI_UPLOAD_LIMIT_BOUNDARY:-1}"
+# CLI upload-limit boundary check defaults to OFF in existing-tenant mode
+# (same rationale as the API suite). An explicit RUN_CLI_UPLOAD_LIMIT_BOUNDARY
+# still wins.
+if [ -z "${RUN_CLI_UPLOAD_LIMIT_BOUNDARY:-}" ]; then
+  if [ -n "$API_KEY" ]; then
+    RUN_CLI_UPLOAD_LIMIT_BOUNDARY=0
+  else
+    RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1
+  fi
+fi
 CLI_UPLOAD_LIMIT_BYTES="${CLI_UPLOAD_LIMIT_BYTES:-10737418240}"
 CLI_SEMANTIC_TIMEOUT_S="${CLI_SEMANTIC_TIMEOUT_S:-90}"
 CLI_SEMANTIC_INTERVAL_S="${CLI_SEMANTIC_INTERVAL_S:-3}"
@@ -116,8 +136,14 @@ prepare_cli_binary() {
   esac
 }
 
+if [ -n "$API_KEY" ]; then
+  TENANT_MODE="existing (DRIVE9_API_KEY)"
+else
+  TENANT_MODE="fresh provision"
+fi
 echo "=== drive9 CLI smoke test ==="
 echo "BASE=$BASE"
+echo "Tenant=$TENANT_MODE"
 echo "CLI_SOURCE=$CLI_SOURCE"
 echo "IMAGE_FIXTURE=$DRIVE9_IMAGE_FIXTURE_PATH"
 
@@ -130,11 +156,16 @@ fi
 check_cmd "local image fixture exists" test -s "$DRIVE9_IMAGE_FIXTURE_PATH"
 
 echo "[1] provision tenant"
-pfile="$(mktemp)"
-pcode=$(curl -sS -o "$pfile" -w "%{http_code}" -X POST "$BASE/v1/provision")
-check_eq "POST /v1/provision returns 202" "$pcode" "202"
-API_KEY=$(jq -r '.api_key // empty' "$pfile")
-check_cmd "provision returns api_key" test -n "$API_KEY"
+if [ -n "$API_KEY" ]; then
+  echo "using existing DRIVE9_API_KEY (skip provision)"
+  check_eq "use provided DRIVE9_API_KEY" "true" "true"
+else
+  pfile="$(mktemp)"
+  pcode=$(curl -sS -o "$pfile" -w "%{http_code}" -X POST "$BASE/v1/provision")
+  check_eq "POST /v1/provision returns 202" "$pcode" "202"
+  API_KEY=$(jq -r '.api_key // empty' "$pfile")
+  check_cmd "provision returns api_key" test -n "$API_KEY"
+fi
 
 echo "[2] wait tenant active"
 deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
@@ -1026,7 +1057,7 @@ PY
   rm -f "$boundary_over_payload" "$over_file"
 fi
 
-rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$HARDLINK_LOCAL" "$IMAGE_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
+rm -f "${pfile:-}" "$CLI_BIN" "$SMALL_LOCAL" "$HARDLINK_LOCAL" "$IMAGE_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
 rm -f "$TAG_LOCAL"
 rm -f "$FORK_LOCAL"
 rm -f "/tmp/drive9-cli-sem-target-${TS}.txt" "/tmp/drive9-cli-sem-other-${TS}.txt" "/tmp/drive9-cli-image-caption-${TS}.txt"

@@ -104,6 +104,47 @@ DRIVE9_TIDBCLOUD_PRIVATE_KEY="$DRIVE9_TIDBCLOUD_PRIVATE_KEY" \
 bash e2e/native-smoke-test.sh
 ```
 
+#### Existing-tenant regression
+
+After a dev release, run `api-smoke-test.sh` and `cli-smoke-test.sh` twice:
+once against an existing tenant (set `DRIVE9_API_KEY`) and once against a fresh
+provision (unset `DRIVE9_API_KEY`). In existing-tenant mode both suites skip
+provision and reuse the tenant; `api-smoke-test.sh` also cleans up its
+timestamped test tree at the end, and the upload-limit boundary checks default
+to `0` because reserving `total_size` against an existing tenant's quota can
+spuriously fail with 507.
+
+```bash
+# Export credentials from the current drive9 ctx tenant
+# (--reveal prints the full key; keep it out of logs/screenshots)
+eval "$(drive9 ctx show --json --reveal | jq -r '"export DRIVE9_BASE=\(.server)\nexport DRIVE9_API_KEY=\(.api_key)"')"
+
+# Pass 1 — existing tenant
+bash e2e/api-smoke-test.sh
+bash e2e/cli-smoke-test.sh
+
+# Or run the whole smoke-all matrix in existing-tenant mode (re-exports
+# DRIVE9_API_KEY to every sub-suite). Set RUN_API_ONLY=1 for just the core
+# api + cli pair, RUN_FUSE_SMOKE=0 on hosts without real FUSE.
+RUN_API_ONLY=1 bash e2e/smoke-all.sh
+
+# Pass 2 — fresh tenant
+unset DRIVE9_API_KEY
+bash e2e/api-smoke-test.sh
+bash e2e/cli-smoke-test.sh
+```
+
+Useful knobs for existing-tenant runs:
+
+- `RUN_CLI_FORK_CHECKS=0` — skip the fork flow. Recommended for shared-schema
+  tenants (which reject `/v1/fork` with 409) or very large tenants where
+  forking is undesirable.
+- `RUN_LARGE_FILE=0` — skip the 100MB API large-file upload.
+- `RUN_SEMANTIC_CHECKS=0` / `RUN_CLI_SEMANTIC_CHECKS=0` — skip semantic recall
+  checks when no embedding endpoint is available.
+- `RUN_UPLOAD_LIMIT_BOUNDARY=1` / `RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1` — force the
+  upload-limit boundary checks back on in existing-tenant mode.
+
 ### Local via `drive9-server-local`
 
 When the task is specifically about local validation on this machine, prefer
@@ -201,6 +242,8 @@ use the same value as `DRIVE9_API_KEY` here.
 ### `api-smoke-test.sh`
 
 1. `POST /v1/provision` returns `202` with `tenant_id`, `api_key`, and `status`
+   — honors `DRIVE9_API_KEY`: when set, step 1 skips provision (emits SKIP
+   checks) and reuses the existing tenant
 2. `GET /v1/status` polled until `active`
 3. `GET /v1/fs/?list` returns `entries[]`
 4. Nested `mkdir` (`/team/...`) across multi-level paths
@@ -216,6 +259,8 @@ use the same value as `DRIVE9_API_KEY` here.
 14. Large multipart upload (`POST /v1/uploads/initiate` + presigned part uploads + complete + download checksum)
 
 15. Upload-limit boundary (`10GiB` initiate accepted, `10GiB+1` rejected)
+16. Cleanup test tree (existing-tenant mode only): `DELETE /v1/fs/team-${TS}?recursive`
+    removes the timestamped test tree so an existing tenant is not polluted
 
 ### `api-smoke-test-existing-key.sh`
 
@@ -225,7 +270,8 @@ use the same value as `DRIVE9_API_KEY` here.
 
 ### `cli-smoke-test.sh`
 
-1. Provision + readiness polling
+1. Provision + readiness polling — honors `DRIVE9_API_KEY`: when set, step 1
+   skips provision and reuses the existing tenant
 2. Prepare `drive9` CLI binary (build local or download official release)
 3. CLI fork flow (`ctx add`, `ctx fork`, fork readiness polling, fork-context file read/write, fork delete)
 4. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `symlink`, `hardlink`, `rm`)
@@ -506,6 +552,13 @@ enabled.
 5. Runs `portable-pack-unpack-e2e.sh` when `RUN_PORTABLE_PACK_E2E=1`
 6. Aggregates pass/fail at script level for quick regression checks
 
+Re-exports `DRIVE9_API_KEY` when set so every sub-suite that honors it (api,
+cli, journal, layer-fs, fuse, posix-permission, git suites, portable pack)
+runs in existing-tenant mode in one shot. Set `RUN_API_ONLY=1` to run only the
+core api + cli pair (useful for a quick existing-tenant regression). Set
+`RUN_FUSE_SMOKE=0` to skip FUSE (and derived `RUN_LAYER_FUSE_SMOKE`); macOS
+WebDAV fallback cannot satisfy symlink/hardlink asserts.
+
 ### `native-smoke-test.sh`
 
 Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
@@ -538,17 +591,32 @@ with `DRIVE9_SHARED_POOL_DSN` registered as a wildcard shared pool.
 
 1. Two tenants provision — both placed on the shared DB and `active` immediately (no cluster creation)
 2. File CRUD + mkdir + directory listing on tenant A
-3. Cross-tenant isolation: same path under tenant B holds different content; B cannot read A's nested file
+3. Cross-tenant isolation:
+   - same path under A/B holds different content; B cannot read A's nested file
+   - root `?list`: B does not see A's `/docs`; B listing A's dir is 404 or 200+empty (no A children)
+   - `?grep` / `?find`: B does not return A's marker file or `note.txt`
+   - B `copy` / `hardlink` / `rename` / `delete` against A's paths returns 404; A's content intact
+   - B delete of own `/a.txt` leaves A's same-path file intact
+   - concurrent same-path writes: each tenant still reads only its own bytes
 4. Raw SQL on TiDB: rows share tables with distinct `fs_id`s; `file_nodes` is `TIDB_PK_TYPE=CLUSTERED`; no `llm_usage` table
-5. SSE `/v1/events` stream delivers initial reset + file event on a shared tenant
-6. Multipart upload (v2 initiate/parts/complete) on a shared tenant, served via redirect
+5. SSE `/v1/events`: B stream delivers reset + file event; A stream gets reset but does **not** receive B's file event
+6. Multipart upload (v2 initiate/parts/complete) on a shared tenant, served via redirect; A cannot read B's completed object; A cannot complete B's in-flight `upload_id`
 7. `POST /v1/fork` on a shared tenant is rejected (409)
 8. Standalone tenant coexistence (registered directly via `e2e/harness/standalone-tenant` with `-skip-ensure`): standalone CRUD, no `fs_id` column in its tables, no row leakage either direction
 9. Server restart persistence: both shared and standalone backends keep working
 10. `DELETE /v1/tenant` on A: shared rows purged (`file_nodes`/`inodes` empty for A's fs_id), A's key revoked (401/403), B and standalone fully intact
+11. Full `api-smoke-test.sh` then `cli-smoke-test.sh` against the same shared
+    server: each suite provisions its own fresh tenant (`DRIVE9_API_KEY` is
+    cleared). Semantic checks are forced off (`RUN_SEMANTIC_CHECKS=0`,
+    `RUN_CLI_SEMANTIC_CHECKS=0`) because the server boots with
+    `DRIVE9_DISABLE_AUTO_EMBEDDING=true`. CLI fork is forced off
+    (`RUN_CLI_FORK_CHECKS=0`) because shared tenants reject `/v1/fork` with 409.
+    SQL checks are forced off (`RUN_SQL_CHECKS=0`) because `POST /v1/sql` is
+    unsupported on shared-schema stores (`ErrExecSQLNotSupportedShared` → 400).
 
 Knobs: `META_DSN` / `SHARED_DSN` / `STANDALONE_DSN` (skip the containers),
-`KEEP_DB=1`, `DRIVE9_SHARED_E2E_DB_RUNTIME`, `DRIVE9_SHARED_E2E_MYSQL_IMAGE`,
+`KEEP_DB=1`, `RUN_SHARED_API_CLI_SMOKE=0` (skip nested api/cli suites),
+`DRIVE9_SHARED_E2E_DB_RUNTIME`, `DRIVE9_SHARED_E2E_MYSQL_IMAGE`,
 `DRIVE9_SHARED_E2E_TIDB_IMAGE`, `DRIVE9_SHARED_E2E_DB_PASSWORD`.
 
 ### `harness/standalone-tenant`
@@ -566,6 +634,8 @@ engines without FTS/vector support such as self-hosted TiDB.
 | `DRIVE9_BASE` | `http://127.0.0.1:9009` | all scripts |
 | `DRIVE9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh` |
 | `DRIVE9_API_KEY` | - | `api-smoke-test-existing-key.sh` |
+| `DRIVE9_API_KEY` | - | `api-smoke-test.sh` (optional; when set, skip provision and reuse the tenant; cleanup test tree at end) |
+| `DRIVE9_API_KEY` | - | `cli-smoke-test.sh` (optional; when set, skip provision and reuse the tenant) |
 | `DRIVE9_API_KEY` | - | `fuse-smoke-test.sh` (optional; skip provision when set) |
 | `DRIVE9_API_KEY` | - | `posix-permission-smoke-test.sh` (optional; skip provision when set) |
 | `POLL_TIMEOUT_S` | `300` (api smoke), `120` (other smoke), `60` (existing-key) | polling scripts |
@@ -575,16 +645,17 @@ engines without FTS/vector support such as self-hosted TiDB.
 | `BATCH_SMALL_FILE_COUNT` | `10` | `api-smoke-test.sh` |
 | `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
 | `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` | `api-smoke-test.sh` |
+| `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` (defaults to `0` when `DRIVE9_API_KEY` is set) | `api-smoke-test.sh` |
 | `UPLOAD_LIMIT_BYTES` | `10737418240` | `api-smoke-test.sh` |
 | `RUN_SEMANTIC_CHECKS` | `1` | `api-smoke-test.sh` |
+| `RUN_SQL_CHECKS` | `1` | `api-smoke-test.sh` (set `0` for shared-schema; `POST /v1/sql` is unsupported there) |
 | `SEMANTIC_TIMEOUT_S` | `90` | `api-smoke-test.sh` |
 | `SEMANTIC_INTERVAL_S` | `3` | `api-smoke-test.sh` |
 | `CLI_LARGE_FILE_MB` | `100` | `cli-smoke-test.sh` |
 | `CLI_BATCH_SMALL_FILE_COUNT` | `10` | `cli-smoke-test.sh` |
 | `CLI_MAX_RETRIES` | `8` | `cli-smoke-test.sh` |
 | `CLI_RETRY_SLEEP_S` | `2` | `cli-smoke-test.sh` |
-| `RUN_CLI_UPLOAD_LIMIT_BOUNDARY` | `1` | `cli-smoke-test.sh` |
+| `RUN_CLI_UPLOAD_LIMIT_BOUNDARY` | `1` (defaults to `0` when `DRIVE9_API_KEY` is set) | `cli-smoke-test.sh` |
 | `CLI_UPLOAD_LIMIT_BYTES` | `10737418240` | `cli-smoke-test.sh` |
 | `RUN_CLI_SEMANTIC_CHECKS` | `1` | `cli-smoke-test.sh` |
 | `RUN_CLI_FORK_CHECKS` | `1` (auto-skip when `/v1/fork` is unavailable) | `cli-smoke-test.sh` |
@@ -642,6 +713,8 @@ engines without FTS/vector support such as self-hosted TiDB.
 | `RUN_FUSE_UMOUNT_DURABLE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `RUN_FUSE_LOG_AUDIT` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `RUN_GIT_WORKSPACE_SMOKE` | `0` | `smoke-all.sh` |
+| `RUN_API_ONLY` | `0` | `smoke-all.sh` (run only api + cli, skip the rest) |
+| `RUN_SHARED_API_CLI_SMOKE` | `1` | `shared-mode-smoke-test.sh` (run nested api + cli suites after shared-mode checks; each suite fresh-provisions; fork/semantic forced off) |
 | `RUN_PORTABLE_PACK_E2E` | `0` | `smoke-all.sh`; `portable-pack-unpack-e2e.sh` is required separately by `local-e2e.yml` |
 | `GIT_WORKSPACE_REPOS` | `drive9=...,kimi-cli=...,kimi-code=...` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_SCENARIOS` | `agent_edit_add_commit,agent_patch_apply,sandbox_restore,fast_worktree` | `git-workspace-smoke-test.sh` |
