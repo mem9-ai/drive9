@@ -468,3 +468,75 @@ func TestRecordDBOperationOmitsTenantID(t *testing.T) {
 		t.Fatalf("db operation metrics must not carry tenant_id:\n%s", text)
 	}
 }
+
+func TestDeleteTenantCounters(t *testing.T) {
+	const tenantID = "tenant-delete-counter-test"
+	const tidbCloudOrgID = "org-delete-counter"
+
+	RecordTenantOperationCountWithOrg(tenantID, tidbCloudOrgID, "cmp", "op", "ok")
+	RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, "api", "read", "ok", 200)
+	RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, "api", "", "upload", 1024)
+	RecordSSEConnectionWithOrg(tenantID, tidbCloudOrgID, "mount", time.Second)
+	RecordSSEEventSentWithOrg(tenantID, tidbCloudOrgID, "write")
+	RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, "api", "read", 3)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `tenant_id="`+tenantID+`"`) {
+		t.Fatalf("tenant_id not found before delete:\n%s", text)
+	}
+
+	DeleteTenantCounters(tenantID)
+
+	rec2 := httptest.NewRecorder()
+	WritePrometheus(rec2)
+	text2 := rec2.Body.String()
+
+	counterNames := []string{
+		"drive9_service_operations_total",
+		"drive9_tenant_requests_total",
+		"drive9_tenant_http_bytes_total",
+		"drive9_sse_connections_total",
+		"drive9_sse_events_sent_total",
+	}
+	histogramNames := []string{
+		"drive9_sse_connection_duration_seconds_bucket",
+		"drive9_sse_connection_duration_seconds_count",
+		"drive9_sse_connection_duration_seconds_sum",
+	}
+	gaugeNames := []string{
+		"drive9_tenant_inflight_requests",
+	}
+	var failures int
+	for _, line := range strings.Split(text2, "\n") {
+		if !strings.Contains(line, `tenant_id="`+tenantID+`"`) {
+			continue
+		}
+		for _, name := range counterNames {
+			if strings.HasPrefix(line, name) {
+				t.Errorf("counter line with tenant_id still present: %s", line)
+				failures++
+			}
+		}
+		for _, name := range histogramNames {
+			if strings.HasPrefix(line, name) {
+				t.Errorf("histogram line with tenant_id still present: %s", line)
+				failures++
+			}
+		}
+		for _, name := range gaugeNames {
+			if strings.HasPrefix(line, name) {
+				t.Errorf("gauge line with tenant_id still present: %s", line)
+				failures++
+			}
+		}
+	}
+	if failures > 0 {
+		t.Fatalf("%d tenant-scoped lines leaked after DeleteTenantCounters", failures)
+	}
+}
+
+func TestDeleteTenantCountersEmptyIsNoop(t *testing.T) {
+	DeleteTenantCounters("")
+}
