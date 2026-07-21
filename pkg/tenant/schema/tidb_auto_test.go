@@ -1944,3 +1944,24 @@ func (r *testRepairRows) Next(dest []driver.Value) error {
 	r.index++
 	return nil
 }
+
+func TestIsFulltextOrVectorIndexRepairSQLCoversCreateIndexForms(t *testing.T) {
+	cases := []struct {
+		stmt string
+		want bool
+	}{
+		{"ALTER TABLE semantic ADD FULLTEXT INDEX idx_semantic_fts_content(content_text) WITH PARSER MULTILINGUAL", true},
+		{"ALTER TABLE semantic ADD VECTOR INDEX idx_semantic_cosine((VEC_COSINE_DISTANCE(embedding))) ADD_COLUMNAR_REPLICA_ON_DEMAND", true},
+		// Repair-planner output form for a missing index (self-hosted engines
+		// without FTS/vector support must be able to skip these).
+		{"CREATE FULLTEXT INDEX idx_semantic_fts_content ON semantic(content_text) WITH PARSER MULTILINGUAL", true},
+		{"CREATE VECTOR INDEX idx_semantic_cosine ON semantic(embedding)", true},
+		{"CREATE UNIQUE INDEX idx_path ON file_nodes(path_hash)", false},
+		{"CREATE INDEX idx_parent ON file_nodes(parent_path_hash, name)", false},
+	}
+	for _, tc := range cases {
+		if got := isFulltextOrVectorIndexRepairSQL(tc.stmt); got != tc.want {
+			t.Errorf("isFulltextOrVectorIndexRepairSQL(%q) = %v, want %v", tc.stmt, got, tc.want)
+		}
+	}
+}

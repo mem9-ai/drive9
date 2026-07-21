@@ -65,7 +65,7 @@ func (s *Store) GetFileGCTaskByFileID(ctx context.Context, fileID string) (out *
 	row := s.db.QueryRowContext(ctx, `SELECT task_id, file_id, storage_type, storage_ref,
 		size_bytes, content_type, status, attempt_count, max_attempts, receipt,
 		leased_at, lease_until, available_at, last_error, created_at, updated_at, completed_at
-		FROM file_gc_tasks WHERE file_id = ?`, fileID)
+		FROM file_gc_tasks WHERE `+s.scope.And(`file_id = ?`), s.scope.Args(fileID)...)
 	return scanFileGCTask(row)
 }
 
@@ -79,14 +79,14 @@ func (s *Store) ListFileGCTaskS3Refs(ctx context.Context, cursor string, limit i
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT DISTINCT storage_ref
 			 FROM file_gc_tasks
-			 WHERE storage_type = 's3' AND storage_ref <> ''
-			 ORDER BY storage_ref ASC LIMIT ?`, limit)
+			 WHERE `+s.scope.And(`storage_type = 's3' AND storage_ref <> ''`)+`
+			 ORDER BY storage_ref ASC LIMIT ?`, s.scope.Args(limit)...)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT DISTINCT storage_ref
 			 FROM file_gc_tasks
-			 WHERE storage_type = 's3' AND storage_ref <> '' AND storage_ref > ?
-			 ORDER BY storage_ref ASC LIMIT ?`, cursor, limit)
+			 WHERE `+s.scope.And(`storage_type = 's3' AND storage_ref <> '' AND storage_ref > ?`)+`
+			 ORDER BY storage_ref ASC LIMIT ?`, s.scope.Args(cursor, limit)...)
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("query file gc s3 refs: %w", err)
@@ -119,8 +119,8 @@ func (s *Store) CountQueuedFileGCTasks(ctx context.Context) (count int64, err er
 	start := time.Now()
 	defer observeStoreOp(ctx, "count_queued_file_gc_tasks", start, &err)
 	err = s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM file_gc_tasks WHERE status = ?`,
-		"queued").Scan(&count)
+		`SELECT COUNT(*) FROM file_gc_tasks WHERE `+s.scope.And(`status = ?`),
+		s.scope.Args("queued")...).Scan(&count)
 	return count, err
 }
 
@@ -148,10 +148,10 @@ func (s *Store) ClaimFileGCTask(ctx context.Context, now time.Time, leaseDuratio
 		size_bytes, content_type, status, attempt_count, max_attempts, receipt,
 		leased_at, lease_until, available_at, last_error, created_at, updated_at, completed_at
 		FROM file_gc_tasks
-		WHERE status = ? AND available_at <= ?
+		WHERE `+s.scope.And(`status = ? AND available_at <= ?`)+`
 		ORDER BY available_at, created_at, task_id
 		LIMIT 1
-		FOR UPDATE SKIP LOCKED`, FileGCTaskQueued, now)
+		FOR UPDATE SKIP LOCKED`, s.scope.Args(FileGCTaskQueued, now)...)
 	task, err := scanFileGCTask(row)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -166,9 +166,9 @@ func (s *Store) ClaimFileGCTask(ctx context.Context, now time.Time, leaseDuratio
 	res, err := tx.ExecContext(ctx, `UPDATE file_gc_tasks SET status = ?,
 		attempt_count = attempt_count + 1, receipt = ?, leased_at = ?,
 		lease_until = ?, updated_at = ?
-		WHERE task_id = ? AND status = ? AND available_at <= ?`,
-		FileGCTaskProcessing, receipt, leasedAt, leaseUntil, now,
-		task.TaskID, FileGCTaskQueued, now)
+		WHERE `+s.scope.And(`task_id = ? AND status = ? AND available_at <= ?`),
+		append([]any{FileGCTaskProcessing, receipt, leasedAt, leaseUntil, now},
+			s.scope.Args(task.TaskID, FileGCTaskQueued, now)...)...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -201,8 +201,9 @@ func (s *Store) AckFileGCTask(ctx context.Context, taskID, receipt string) (err 
 	now := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx, `UPDATE file_gc_tasks SET status = ?, receipt = NULL,
 		leased_at = NULL, lease_until = NULL, completed_at = ?, updated_at = ?
-		WHERE task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
-		FileGCTaskSucceeded, now, now, taskID, FileGCTaskProcessing, receipt, now)
+		WHERE `+s.scope.And(`task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`),
+		append([]any{FileGCTaskSucceeded, now, now},
+			s.scope.Args(taskID, FileGCTaskProcessing, receipt, now)...)...)
 	if err != nil {
 		return err
 	}
@@ -237,7 +238,7 @@ func (s *Store) RetryFileGCTask(ctx context.Context, taskID, receipt string, ret
 	row := tx.QueryRowContext(ctx, `SELECT task_id, file_id, storage_type, storage_ref,
 		size_bytes, content_type, status, attempt_count, max_attempts, receipt,
 		leased_at, lease_until, available_at, last_error, created_at, updated_at, completed_at
-		FROM file_gc_tasks WHERE task_id = ? FOR UPDATE`, taskID)
+		FROM file_gc_tasks WHERE `+s.scope.And(`task_id = ?`)+` FOR UPDATE`, s.scope.Args(taskID)...)
 	task, err := scanFileGCTask(row)
 	if err != nil {
 		return err
@@ -249,12 +250,14 @@ func (s *Store) RetryFileGCTask(ctx context.Context, taskID, receipt string, ret
 	if task.MaxAttempts > 0 && task.AttemptCount >= task.MaxAttempts {
 		_, err = tx.ExecContext(ctx, `UPDATE file_gc_tasks SET status = ?, receipt = NULL,
 			leased_at = NULL, lease_until = NULL, last_error = ?, completed_at = ?, updated_at = ?
-			WHERE task_id = ?`, FileGCTaskDeadLettered, nullStr(lastErr), now, now, taskID)
+			WHERE `+s.scope.And(`task_id = ?`),
+			append([]any{FileGCTaskDeadLettered, nullStr(lastErr), now, now}, s.scope.Args(taskID)...)...)
 	} else {
 		_, err = tx.ExecContext(ctx, `UPDATE file_gc_tasks SET status = ?, receipt = NULL,
 			leased_at = NULL, lease_until = NULL, available_at = ?, last_error = ?,
 			completed_at = NULL, updated_at = ?
-			WHERE task_id = ?`, FileGCTaskQueued, retryAt, nullStr(lastErr), now, taskID)
+			WHERE `+s.scope.And(`task_id = ?`),
+			append([]any{FileGCTaskQueued, retryAt, nullStr(lastErr), now}, s.scope.Args(taskID)...)...)
 	}
 	if err != nil {
 		return err
@@ -280,9 +283,9 @@ func (s *Store) RecoverExpiredFileGCTasks(ctx context.Context, now time.Time, li
 	defer func() { _ = tx.Rollback() }()
 
 	query := `SELECT task_id FROM file_gc_tasks
-		WHERE status = ? AND lease_until IS NOT NULL AND lease_until < ?
+		WHERE ` + s.scope.And(`status = ? AND lease_until IS NOT NULL AND lease_until < ?`) + `
 		ORDER BY lease_until, created_at, task_id`
-	args := []any{FileGCTaskProcessing, now}
+	args := s.scope.Args(FileGCTaskProcessing, now)
 	if limit > 0 {
 		query += ` LIMIT ?`
 		args = append(args, limit)
@@ -309,8 +312,9 @@ func (s *Store) RecoverExpiredFileGCTasks(ctx context.Context, now time.Time, li
 	for _, taskID := range taskIDs {
 		res, err := tx.ExecContext(ctx, `UPDATE file_gc_tasks SET status = ?, receipt = NULL,
 			leased_at = NULL, lease_until = NULL, available_at = ?, updated_at = ?
-			WHERE task_id = ? AND status = ? AND lease_until IS NOT NULL AND lease_until < ?`,
-			FileGCTaskQueued, now, now, taskID, FileGCTaskProcessing, now)
+			WHERE `+s.scope.And(`task_id = ? AND status = ? AND lease_until IS NOT NULL AND lease_until < ?`),
+			append([]any{FileGCTaskQueued, now, now},
+				s.scope.Args(taskID, FileGCTaskProcessing, now)...)...)
 		if err != nil {
 			return 0, err
 		}
@@ -387,15 +391,15 @@ func (s *Store) enqueueFileGCTask(db execer, task *FileGCTask) (bool, error) {
 	}
 
 	_, err := db.Exec(`INSERT INTO file_gc_tasks
-		(task_id, file_id, storage_type, storage_ref, size_bytes, content_type,
+		(`+s.scope.InsCols(`task_id, file_id, storage_type, storage_ref, size_bytes, content_type,
 		 status, attempt_count, max_attempts, receipt, leased_at, lease_until,
-		 available_at, last_error, created_at, updated_at, completed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		task.TaskID, task.FileID, task.StorageType, task.StorageRef, task.SizeBytes,
-		nullStr(task.ContentType), status, task.AttemptCount, maxAttempts,
-		nullStr(task.Receipt), nilTime(task.LeasedAt), nilTime(task.LeaseUntil),
-		availableAt.UTC(), nullStr(task.LastError), createdAt.UTC(),
-		updatedAt.UTC(), nilTime(task.CompletedAt))
+		 available_at, last_error, created_at, updated_at, completed_at`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
+		s.scope.Args(task.TaskID, task.FileID, task.StorageType, task.StorageRef, task.SizeBytes,
+			nullStr(task.ContentType), status, task.AttemptCount, maxAttempts,
+			nullStr(task.Receipt), nilTime(task.LeasedAt), nilTime(task.LeaseUntil),
+			availableAt.UTC(), nullStr(task.LastError), createdAt.UTC(),
+			updatedAt.UTC(), nilTime(task.CompletedAt))...)
 	if err == nil {
 		return true, nil
 	}
@@ -407,7 +411,7 @@ func (s *Store) enqueueFileGCTask(db execer, task *FileGCTask) (bool, error) {
 
 func (s *Store) fileGCTaskLeaseError(ctx context.Context, taskID string) error {
 	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_gc_tasks WHERE task_id = ?`, taskID).Scan(&count)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_gc_tasks WHERE `+s.scope.And(`task_id = ?`), s.scope.Args(taskID)...).Scan(&count)
 	if err != nil {
 		return err
 	}

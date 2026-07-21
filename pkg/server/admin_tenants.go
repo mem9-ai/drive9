@@ -171,7 +171,8 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 	}
 	poolClaimStarted := time.Now()
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_started", "provider", tenant.ProviderTiDBCloudNative, "quota_requested", quotaOpt != nil)...)
-	if res, pool, claimed, err := s.claimAdminTenantFromPool(r.Context(), cred, quotaOpt); err != nil {
+	res, pool, claimed, sharedPoolMatched, err := s.claimAdminTenantFromPool(r.Context(), cred, quotaOpt)
+	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_failed", "provider", tenant.ProviderTiDBCloudNative, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
 		status, msg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", err)
 		errJSON(w, status, msg)
@@ -196,8 +197,18 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_create_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted))...)
 		return
 	}
+	// The admin tenant API is cluster-centric (org binding, cluster existence
+	// checks, per-cluster quota): a tenant placed on a shared-schema DB has no
+	// per-tenant cluster and would be unmanageable through this surface. Fail
+	// closed when the caller's org matches a shared pool instead of creating
+	// a tenant with no valid admin lifecycle. (The owner provision API below
+	// routes the same org onto the shared pool instead.)
+	if sharedPoolMatched {
+		errJSON(w, http.StatusConflict, "tenant org is registered for shared-pool placement, which the admin tenant API does not support")
+		return
+	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_missed", "provider", tenant.ProviderTiDBCloudNative, "duration_ms", durationMillis(poolClaimStarted))...)
-	res, err := s.provisionTenant(r.Context(), provisionTenantOptions{
+	res, err = s.provisionTenant(r.Context(), provisionTenantOptions{
 		KeyName:               "default",
 		TokenVersion:          1,
 		CredentialProvisioner: &cred,

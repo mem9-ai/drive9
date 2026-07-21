@@ -81,9 +81,9 @@ func (s *Store) ObserveSemanticTasks(ctx context.Context, now time.Time) (out *S
 	obs := &SemanticTaskObservation{}
 
 	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM semantic_tasks
-		WHERE status IN (?, ?, ?)
+		WHERE `+s.scope.And(`status IN (?, ?, ?)`)+`
 		GROUP BY status`,
-		semantic.TaskQueued, semantic.TaskProcessing, semantic.TaskDeadLettered)
+		s.scope.Args(semantic.TaskQueued, semantic.TaskProcessing, semantic.TaskDeadLettered)...)
 	if err != nil {
 		return nil, err
 	}
@@ -112,10 +112,10 @@ func (s *Store) ObserveSemanticTasks(ctx context.Context, now time.Time) (out *S
 
 	var availableAt sql.NullTime
 	err = s.db.QueryRowContext(ctx, `SELECT available_at FROM semantic_tasks
-		WHERE status = ? AND available_at <= ?
+		WHERE `+s.scope.And(`status = ? AND available_at <= ?`)+`
 		ORDER BY available_at, created_at, task_id
 		LIMIT 1`,
-		semantic.TaskQueued, now).Scan(&availableAt)
+		s.scope.Args(semantic.TaskQueued, now)...).Scan(&availableAt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
@@ -153,21 +153,21 @@ func (s *Store) enqueueSemanticTask(db execer, task *semantic.Task) (bool, error
 	}
 
 	_, err := db.Exec(`INSERT INTO semantic_tasks
-		(task_id, task_type, resource_id, resource_version, status, attempt_count, max_attempts,
+		(`+s.scope.InsCols(`task_id, task_type, resource_id, resource_version, status, attempt_count, max_attempts,
 		 receipt, leased_at, lease_until, available_at, payload_json, last_error,
-		 created_at, updated_at, completed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		task.TaskID, task.TaskType, task.ResourceID, task.ResourceVersion, status, task.AttemptCount,
-		maxAttempts, nullStr(task.Receipt), nilTime(task.LeasedAt), nilTime(task.LeaseUntil),
-		availableAt.UTC(), nilBytes(task.PayloadJSON), nullStr(task.LastError),
-		createdAt.UTC(), updatedAt.UTC(), nilTime(task.CompletedAt))
+		 created_at, updated_at, completed_at`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
+		s.scope.Args(task.TaskID, task.TaskType, task.ResourceID, task.ResourceVersion, status, task.AttemptCount,
+			maxAttempts, nullStr(task.Receipt), nilTime(task.LeasedAt), nilTime(task.LeaseUntil),
+			availableAt.UTC(), nilBytes(task.PayloadJSON), nullStr(task.LastError),
+			createdAt.UTC(), updatedAt.UTC(), nilTime(task.CompletedAt))...)
 	if err == nil {
 		return true, nil
 	}
 	if !isUniqueViolation(err) {
 		return false, err
 	}
-	duplicate, dupErr := semanticTaskExistsByResource(db, task.TaskType, task.ResourceID, task.ResourceVersion)
+	duplicate, dupErr := s.semanticTaskExistsByResource(db, task.TaskType, task.ResourceID, task.ResourceVersion)
 	if dupErr != nil {
 		return false, dupErr
 	}
@@ -194,8 +194,8 @@ func (s *Store) ensureSemanticTaskQueuedTx(tx *sql.Tx, task *semantic.Task) (boo
 		attempt_count, max_attempts, receipt, leased_at, lease_until, available_at,
 		payload_json, last_error, created_at, updated_at, completed_at
 		FROM semantic_tasks
-		WHERE task_type = ? AND resource_id = ? AND resource_version = ?
-		FOR UPDATE`, task.TaskType, task.ResourceID, task.ResourceVersion)
+		WHERE `+s.scope.And(`task_type = ? AND resource_id = ? AND resource_version = ?`)+`
+		FOR UPDATE`, s.scope.Args(task.TaskType, task.ResourceID, task.ResourceVersion)...)
 	existing, err := scanSemanticTask(row)
 	if err != nil {
 		return false, err
@@ -219,8 +219,9 @@ func (s *Store) ensureSemanticTaskQueuedTx(tx *sql.Tx, task *semantic.Task) (boo
 	_, err = tx.Exec(`UPDATE semantic_tasks SET status = ?, receipt = NULL, leased_at = NULL,
 		lease_until = NULL, available_at = ?, payload_json = ?, last_error = NULL,
 		max_attempts = ?, completed_at = NULL, updated_at = ?
-		WHERE task_id = ?`,
-		semantic.TaskQueued, availableAt.UTC(), nilBytes(payload), maxAttempts, now, existing.TaskID)
+		WHERE `+s.scope.And(`task_id = ?`),
+		append([]any{semantic.TaskQueued, availableAt.UTC(), nilBytes(payload), maxAttempts, now},
+			s.scope.Args(existing.TaskID)...)...)
 	if err != nil {
 		return false, err
 	}
@@ -256,7 +257,7 @@ func (s *Store) claimSemanticTask(ctx context.Context, now time.Time, leaseDurat
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	query, args := claimSemanticTaskQuery(now, normalizedTypes)
+	query, args := s.claimSemanticTaskQuery(now, normalizedTypes)
 	row := tx.QueryRowContext(ctx, query, args...)
 	task, scanErr := scanSemanticTask(row)
 	if scanErr != nil {
@@ -271,9 +272,9 @@ func (s *Store) claimSemanticTask(ctx context.Context, now time.Time, leaseDurat
 	leaseUntil := now.Add(leaseDuration)
 	res, err := tx.ExecContext(ctx, `UPDATE semantic_tasks SET status = ?, attempt_count = attempt_count + 1,
 		receipt = ?, leased_at = ?, lease_until = ?, updated_at = ?
-		WHERE task_id = ? AND status = ? AND available_at <= ?`,
-		semantic.TaskProcessing, receipt, leasedAt, leaseUntil, now,
-		task.TaskID, semantic.TaskQueued, now)
+		WHERE `+s.scope.And(`task_id = ? AND status = ? AND available_at <= ?`),
+		append([]any{semantic.TaskProcessing, receipt, leasedAt, leaseUntil, now},
+			s.scope.Args(task.TaskID, semantic.TaskQueued, now)...)...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -317,13 +318,13 @@ func normalizeClaimTaskTypes(taskTypes []semantic.TaskType) ([]semantic.TaskType
 	return normalized, nil
 }
 
-func claimSemanticTaskQuery(now time.Time, taskTypes []semantic.TaskType) (string, []any) {
+func (s *Store) claimSemanticTaskQuery(now time.Time, taskTypes []semantic.TaskType) (string, []any) {
 	query := `SELECT task_id, task_type, resource_id, resource_version, status,
 		attempt_count, max_attempts, receipt, leased_at, lease_until, available_at,
 		payload_json, last_error, created_at, updated_at, completed_at
 		FROM semantic_tasks
-		WHERE status = ?`
-	args := []any{semantic.TaskQueued}
+		WHERE ` + s.scope.And(`status = ?`)
+	args := s.scope.Args(semantic.TaskQueued)
 	if len(taskTypes) == 1 {
 		query += ` AND task_type = ?`
 		args = append(args, taskTypes[0])
@@ -360,8 +361,9 @@ func (s *Store) AckSemanticTask(ctx context.Context, taskID, receipt string) (er
 	now := semanticTaskLeaseNow()
 	res, err := s.db.ExecContext(ctx, `UPDATE semantic_tasks SET status = ?, receipt = NULL,
 		leased_at = NULL, lease_until = NULL, completed_at = ?, updated_at = ?
-		WHERE task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
-		semantic.TaskSucceeded, now, now, taskID, semantic.TaskProcessing, receipt, now)
+		WHERE `+s.scope.And(`task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`),
+		append([]any{semantic.TaskSucceeded, now, now},
+			s.scope.Args(taskID, semantic.TaskProcessing, receipt, now)...)...)
 	if err != nil {
 		return err
 	}
@@ -384,8 +386,9 @@ func (s *Store) DeadLetterSemanticTask(ctx context.Context, taskID, receipt, las
 	now := semanticTaskLeaseNow()
 	res, err := s.db.ExecContext(ctx, `UPDATE semantic_tasks SET status = ?, receipt = NULL,
 		leased_at = NULL, lease_until = NULL, last_error = ?, completed_at = ?, updated_at = ?
-		WHERE task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
-		semantic.TaskDeadLettered, nullStr(lastErr), now, now, taskID, semantic.TaskProcessing, receipt, now)
+		WHERE `+s.scope.And(`task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`),
+		append([]any{semantic.TaskDeadLettered, nullStr(lastErr), now, now},
+			s.scope.Args(taskID, semantic.TaskProcessing, receipt, now)...)...)
 	if err != nil {
 		return err
 	}
@@ -415,8 +418,9 @@ func (s *Store) RenewSemanticTask(ctx context.Context, taskID, receipt string, l
 	}
 	leaseUntil = now.Add(leaseDuration)
 	res, err := s.db.ExecContext(ctx, `UPDATE semantic_tasks SET lease_until = ?, updated_at = ?
-		WHERE task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
-		leaseUntil, now, taskID, semantic.TaskProcessing, receipt, now)
+		WHERE `+s.scope.And(`task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`),
+		append([]any{leaseUntil, now},
+			s.scope.Args(taskID, semantic.TaskProcessing, receipt, now)...)...)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -458,7 +462,7 @@ func (s *Store) RetrySemanticTask(ctx context.Context, taskID, receipt string, r
 	row := tx.QueryRowContext(ctx, `SELECT task_id, task_type, resource_id, resource_version, status,
 		attempt_count, max_attempts, receipt, leased_at, lease_until, available_at,
 		payload_json, last_error, created_at, updated_at, completed_at
-		FROM semantic_tasks WHERE task_id = ? FOR UPDATE`, taskID)
+		FROM semantic_tasks WHERE `+s.scope.And(`task_id = ?`)+` FOR UPDATE`, s.scope.Args(taskID)...)
 	task, err := scanSemanticTask(row)
 	if err != nil {
 		if errors.Is(err, semantic.ErrTaskNotFound) {
@@ -473,11 +477,13 @@ func (s *Store) RetrySemanticTask(ctx context.Context, taskID, receipt string, r
 	if task.AttemptCount >= task.MaxAttempts {
 		_, err = tx.ExecContext(ctx, `UPDATE semantic_tasks SET status = ?, receipt = NULL, leased_at = NULL,
 			lease_until = NULL, last_error = ?, completed_at = ?, updated_at = ?
-			WHERE task_id = ?`, semantic.TaskDeadLettered, nullStr(lastErr), now, now, taskID)
+			WHERE `+s.scope.And(`task_id = ?`),
+			append([]any{semantic.TaskDeadLettered, nullStr(lastErr), now, now}, s.scope.Args(taskID)...)...)
 	} else {
 		_, err = tx.ExecContext(ctx, `UPDATE semantic_tasks SET status = ?, receipt = NULL, leased_at = NULL,
 			lease_until = NULL, available_at = ?, last_error = ?, completed_at = NULL, updated_at = ?
-			WHERE task_id = ?`, semantic.TaskQueued, retryAt, nullStr(lastErr), now, taskID)
+			WHERE `+s.scope.And(`task_id = ?`),
+			append([]any{semantic.TaskQueued, retryAt, nullStr(lastErr), now}, s.scope.Args(taskID)...)...)
 	}
 	if err != nil {
 		return err
@@ -503,9 +509,9 @@ func (s *Store) RecoverExpiredSemanticTasks(ctx context.Context, now time.Time, 
 	defer func() { _ = tx.Rollback() }()
 
 	query := `SELECT task_id FROM semantic_tasks
-		WHERE status = ? AND lease_until IS NOT NULL AND lease_until < ?
+		WHERE ` + s.scope.And(`status = ? AND lease_until IS NOT NULL AND lease_until < ?`) + `
 		ORDER BY lease_until, created_at, task_id`
-	args := []any{semantic.TaskProcessing, now}
+	args := s.scope.Args(semantic.TaskProcessing, now)
 	if limit > 0 {
 		query += ` LIMIT ?`
 		args = append(args, limit)
@@ -532,8 +538,9 @@ func (s *Store) RecoverExpiredSemanticTasks(ctx context.Context, now time.Time, 
 	for _, taskID := range taskIDs {
 		res, err := tx.ExecContext(ctx, `UPDATE semantic_tasks SET status = ?, receipt = NULL,
 			leased_at = NULL, lease_until = NULL, available_at = ?, updated_at = ?
-			WHERE task_id = ? AND status = ? AND lease_until IS NOT NULL AND lease_until < ?`,
-			semantic.TaskQueued, now, now, taskID, semantic.TaskProcessing, now)
+			WHERE `+s.scope.And(`task_id = ? AND status = ? AND lease_until IS NOT NULL AND lease_until < ?`),
+			append([]any{semantic.TaskQueued, now, now},
+				s.scope.Args(taskID, semantic.TaskProcessing, now)...)...)
 		if err != nil {
 			return 0, err
 		}
@@ -550,11 +557,11 @@ func (s *Store) RecoverExpiredSemanticTasks(ctx context.Context, now time.Time, 
 	return recovered, nil
 }
 
-func semanticTaskExistsByResource(db execer, taskType semantic.TaskType, resourceID string, resourceVersion int64) (bool, error) {
+func (s *Store) semanticTaskExistsByResource(db execer, taskType semantic.TaskType, resourceID string, resourceVersion int64) (bool, error) {
 	var count int
 	err := db.QueryRow(`SELECT COUNT(*) FROM semantic_tasks
-		WHERE task_type = ? AND resource_id = ? AND resource_version = ?`,
-		taskType, resourceID, resourceVersion).Scan(&count)
+		WHERE `+s.scope.And(`task_type = ? AND resource_id = ? AND resource_version = ?`),
+		s.scope.Args(taskType, resourceID, resourceVersion)...).Scan(&count)
 	if err != nil {
 		return false, err
 	}
@@ -563,7 +570,7 @@ func semanticTaskExistsByResource(db execer, taskType semantic.TaskType, resourc
 
 func (s *Store) semanticTaskLeaseError(ctx context.Context, taskID string) error {
 	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM semantic_tasks WHERE task_id = ?`, taskID).Scan(&count)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM semantic_tasks WHERE `+s.scope.And(`task_id = ?`), s.scope.Args(taskID)...).Scan(&count)
 	if err != nil {
 		return err
 	}

@@ -67,7 +67,7 @@ func (s *Store) CreateJournal(ctx context.Context, tenantID string, req journal.
 	for attempt := 0; attempt < maxCreateAttempts; attempt++ {
 		out = nil
 		err = s.InTx(ctx, func(tx *sql.Tx) error {
-			existing, existingCreateHash, err := selectJournalTx(ctx, tx, tenantID, req.JournalID, true)
+			existing, existingCreateHash, err := s.selectJournalTx(ctx, tx, tenantID, req.JournalID, true)
 			if err == nil {
 				if existingCreateHash != createHash {
 					return ErrJournalConflict
@@ -78,15 +78,15 @@ func (s *Store) CreateJournal(ctx context.Context, tenantID string, req journal.
 			if !errors.Is(err, ErrNotFound) {
 				return err
 			}
-			_, err = tx.ExecContext(ctx, `INSERT INTO journals
-			(tenant_id, journal_id, kind, title, actor_type, actor_id, source, meta, retention,
+			_, err = tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO journals
+			(%s, journal_id, kind, title, actor_type, actor_id, source, meta, retention,
 			 next_seq, genesis, create_hash, genesis_hash, head_hash, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
-				tenantID, req.JournalID, req.Kind, nullStr(req.Title), nullStr(req.Actor.Type), nullStr(req.Actor.ID),
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`, s.tenantCol()),
+				s.tenantArg(tenantID), req.JournalID, req.Kind, nullStr(req.Title), nullStr(req.Actor.Type), nullStr(req.Actor.ID),
 				nullStr(req.Source), nullJSON(metaRaw), nullJSON(req.Retention), string(genesisRaw), createHash,
 				genesisHash, genesisHash, now, now)
 			if isUniqueViolation(err) {
-				existing, existingCreateHash, readErr := selectJournalTx(ctx, tx, tenantID, req.JournalID, true)
+				existing, existingCreateHash, readErr := s.selectJournalTx(ctx, tx, tenantID, req.JournalID, true)
 				if readErr != nil {
 					return ErrJournalConflict
 				}
@@ -100,10 +100,10 @@ func (s *Store) CreateJournal(ctx context.Context, tenantID string, req journal.
 				return err
 			}
 			for _, label := range req.Labels {
-				if _, err := tx.ExecContext(ctx, `INSERT INTO journal_labels
-				(tenant_id, label_key, label_hash, label_value, journal_id, created_at, source_seq)
-				VALUES (?, ?, ?, ?, ?, ?, NULL)`,
-					tenantID, label.Key, journal.LabelHash(label.Key, label.Value), label.Value, req.JournalID, now); err != nil {
+				if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO journal_labels
+				(%s, label_key, label_hash, label_value, journal_id, created_at, source_seq)
+				VALUES (?, ?, ?, ?, ?, ?, NULL)`, s.tenantCol()),
+					s.tenantArg(tenantID), label.Key, journal.LabelHash(label.Key, label.Value), label.Value, req.JournalID, now); err != nil {
 					return err
 				}
 			}
@@ -211,14 +211,14 @@ func (s *Store) AppendJournalEntries(ctx context.Context, tenantID, journalID, a
 	}
 	var out *journal.AppendResponse
 	err = s.InTx(ctx, func(tx *sql.Tx) error {
-		current, _, err := selectJournalTx(ctx, tx, tenantID, journalID, true)
+		current, _, err := s.selectJournalTx(ctx, tx, tenantID, journalID, true)
 		if err != nil {
 			return err
 		}
 		if current.ClosedAt != nil {
 			return ErrJournalClosed
 		}
-		if existing, err := selectAppendRequestTx(ctx, tx, tenantID, journalID, appendID); err == nil {
+		if existing, err := s.selectAppendRequestTx(ctx, tx, tenantID, journalID, appendID); err == nil {
 			if existing.requestHash != requestHash || existing.writerType != writer.Type ||
 				existing.writerID != writer.ID || existing.effectiveSource != effectiveSource {
 				return ErrIdempotencyConflict
@@ -275,11 +275,11 @@ func (s *Store) AppendJournalEntries(ctx context.Context, tenantID, journalID, a
 		firstSeq := inserted[0].Seq
 		lastSeq := inserted[len(inserted)-1].Seq
 		headHash := inserted[len(inserted)-1].EntryHash
-		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_append_requests
-			(tenant_id, journal_id, append_id, request_hash, writer_type, writer_id, effective_source,
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO journal_append_requests
+			(%s, journal_id, append_id, request_hash, writer_type, writer_id, effective_source,
 			 first_seq, last_seq, count, head_hash, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			tenantID, journalID, appendID, requestHash, writer.Type, writer.ID, effectiveSource,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.tenantCol()),
+			s.tenantArg(tenantID), journalID, appendID, requestHash, writer.Type, writer.ID, effectiveSource,
 			firstSeq, lastSeq, len(inserted), headHash, observedAt); err != nil {
 			if isUniqueViolation(err) {
 				return ErrIdempotencyConflict
@@ -287,14 +287,14 @@ func (s *Store) AppendJournalEntries(ctx context.Context, tenantID, journalID, a
 			return err
 		}
 		for _, entry := range inserted {
-			if err := insertJournalEntryTx(ctx, tx, entry); err != nil {
+			if err := s.insertJournalEntryTx(ctx, tx, entry); err != nil {
 				return err
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE journals
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE journals
 			SET next_seq = ?, head_hash = ?, updated_at = ?
-			WHERE tenant_id = ? AND journal_id = ?`,
-			lastSeq+1, headHash, observedAt, tenantID, journalID); err != nil {
+			WHERE %s = ? AND journal_id = ?`, s.tenantCol()),
+			lastSeq+1, headHash, observedAt, s.tenantArg(tenantID), journalID); err != nil {
 			return err
 		}
 		out = &journal.AppendResponse{
@@ -329,17 +329,17 @@ func (s *Store) ListJournalEntries(ctx context.Context, tenantID, journalID stri
 		return nil, fmt.Errorf("%w: %v", ErrJournalValidation, err)
 	}
 	limit = journal.NormalizeLimit(limit)
-	rows, err := s.db.QueryContext(ctx, selectEntryColumns()+`
+	rows, err := s.db.QueryContext(ctx, s.selectEntryColumns()+fmt.Sprintf(`
 		FROM journal_entries
-		WHERE tenant_id = ? AND journal_id = ? AND seq > ?
+		WHERE %[1]s = ? AND journal_id = ? AND seq > ?
 		ORDER BY seq
-		LIMIT ?`, tenantID, journalID, afterSeq, limit)
+		LIMIT ?`, s.tenantCol()), s.tenantArg(tenantID), journalID, afterSeq, limit)
 	if err != nil {
 		opErr = err
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	out, err := scanEntryRows(rows)
+	out, err := scanEntryRows(rows, tenantID)
 	if err != nil {
 		opErr = err
 		return nil, err
@@ -394,8 +394,8 @@ func (s *Store) VerifyJournal(ctx context.Context, tenantID, journalID string) (
 
 	var genesisRaw []byte
 	var storedGenesisHash, storedHead string
-	err := s.db.QueryRowContext(ctx, `SELECT genesis, genesis_hash, head_hash
-		FROM journals WHERE tenant_id = ? AND journal_id = ?`, tenantID, journalID).
+	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT genesis, genesis_hash, head_hash
+		FROM journals WHERE %s = ? AND journal_id = ?`, s.tenantCol()), s.tenantArg(tenantID), journalID).
 		Scan(&genesisRaw, &storedGenesisHash, &storedHead)
 	if err != nil {
 		opErr = err
@@ -505,19 +505,19 @@ func (r appendRequestRow) response(journalID, appendID string) *journal.AppendRe
 	}
 }
 
-func selectJournalTx(ctx context.Context, tx *sql.Tx, tenantID, journalID string, forUpdate bool) (*journal.Journal, string, error) {
-	query := `SELECT tenant_id, journal_id, kind, title, actor_type, actor_id, source, meta, retention,
+func (s *Store) selectJournalTx(ctx context.Context, tx *sql.Tx, tenantID, journalID string, forUpdate bool) (*journal.Journal, string, error) {
+	query := fmt.Sprintf(`SELECT %s, journal_id, kind, title, actor_type, actor_id, source, meta, retention,
 		next_seq, genesis_hash, head_hash, created_at, updated_at, closed_at, create_hash
-		FROM journals WHERE tenant_id = ? AND journal_id = ?`
+		FROM journals WHERE %[1]s = ? AND journal_id = ?`, s.tenantCol())
 	if forUpdate {
 		query += " FOR UPDATE"
 	}
-	row := tx.QueryRowContext(ctx, query, tenantID, journalID)
-	j, createHash, err := scanJournal(row)
+	row := tx.QueryRowContext(ctx, query, s.tenantArg(tenantID), journalID)
+	j, createHash, err := scanJournal(row, tenantID)
 	if err != nil {
 		return nil, "", err
 	}
-	labels, err := selectJournalLabelsTx(ctx, tx, tenantID, journalID)
+	labels, err := s.selectJournalLabelsTx(ctx, tx, tenantID, journalID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -528,11 +528,11 @@ func selectJournalTx(ctx context.Context, tx *sql.Tx, tenantID, journalID string
 	return j, createHash, nil
 }
 
-func selectJournalLabelsTx(ctx context.Context, tx *sql.Tx, tenantID, journalID string) ([]journal.Label, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT label_key, label_value
+func (s *Store) selectJournalLabelsTx(ctx context.Context, tx *sql.Tx, tenantID, journalID string) ([]journal.Label, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`SELECT label_key, label_value
 		FROM journal_labels
-		WHERE tenant_id = ? AND journal_id = ?
-		ORDER BY label_key, label_value`, tenantID, journalID)
+		WHERE %s = ? AND journal_id = ?
+		ORDER BY label_key, label_value`, s.tenantCol()), s.tenantArg(tenantID), journalID)
 	if err != nil {
 		return nil, err
 	}
@@ -550,7 +550,7 @@ func selectJournalLabelsTx(ctx context.Context, tx *sql.Tx, tenantID, journalID 
 
 func (s *Store) journalExists(ctx context.Context, tenantID, journalID string) (bool, error) {
 	var one int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM journals WHERE tenant_id = ? AND journal_id = ?`, tenantID, journalID).Scan(&one)
+	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT 1 FROM journals WHERE %s = ? AND journal_id = ?`, s.tenantCol()), s.tenantArg(tenantID), journalID).Scan(&one)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
@@ -560,13 +560,19 @@ func (s *Store) journalExists(ctx context.Context, tenantID, journalID string) (
 	return true, nil
 }
 
-func scanJournal(row interface{ Scan(dest ...any) error }) (*journal.Journal, string, error) {
+// scanJournal scans one journals row. The leading column is the tenant
+// discriminator (tenant_id in standalone shape, fs_id in shared shape); it is
+// discarded and tenantID — the authoritative identity the caller resolved —
+// is stamped onto the result instead, so a shared-shape numeric fs_id can
+// never leak into Journal.TenantID.
+func scanJournal(row interface{ Scan(dest ...any) error }, tenantID string) (*journal.Journal, string, error) {
 	var j journal.Journal
 	var title, actorType, actorID, source sql.NullString
 	var metaRaw, retentionRaw []byte
 	var closedAt sql.NullTime
 	var createHash string
-	if err := row.Scan(&j.TenantID, &j.JournalID, &j.Kind, &title, &actorType, &actorID, &source,
+	var tenantDiscriminator any
+	if err := row.Scan(&tenantDiscriminator, &j.JournalID, &j.Kind, &title, &actorType, &actorID, &source,
 		&metaRaw, &retentionRaw, &j.NextSeq, &j.GenesisHash, &j.HeadHash, &j.CreatedAt,
 		&j.UpdatedAt, &closedAt, &createHash); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -574,6 +580,7 @@ func scanJournal(row interface{ Scan(dest ...any) error }) (*journal.Journal, st
 		}
 		return nil, "", err
 	}
+	j.TenantID = tenantID
 	j.Title = title.String
 	j.Actor = journal.Actor{Type: actorType.String, ID: actorID.String}
 	j.Source = source.String
@@ -593,13 +600,13 @@ func scanJournal(row interface{ Scan(dest ...any) error }) (*journal.Journal, st
 	return &j, createHash, nil
 }
 
-func selectAppendRequestTx(ctx context.Context, tx *sql.Tx, tenantID, journalID, appendID string) (*appendRequestRow, error) {
+func (s *Store) selectAppendRequestTx(ctx context.Context, tx *sql.Tx, tenantID, journalID, appendID string) (*appendRequestRow, error) {
 	var r appendRequestRow
-	err := tx.QueryRowContext(ctx, `SELECT request_hash, writer_type, writer_id, effective_source,
+	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT request_hash, writer_type, writer_id, effective_source,
 		first_seq, last_seq, count, head_hash
 		FROM journal_append_requests
-		WHERE tenant_id = ? AND journal_id = ? AND append_id = ?`,
-		tenantID, journalID, appendID).
+		WHERE %s = ? AND journal_id = ? AND append_id = ?`, s.tenantCol()),
+		s.tenantArg(tenantID), journalID, appendID).
 		Scan(&r.requestHash, &r.writerType, &r.writerID, &r.effectiveSource,
 			&r.firstSeq, &r.lastSeq, &r.count, &r.headHash)
 	if err != nil {
@@ -611,7 +618,7 @@ func selectAppendRequestTx(ctx context.Context, tx *sql.Tx, tenantID, journalID,
 	return &r, nil
 }
 
-func insertJournalEntryTx(ctx context.Context, tx *sql.Tx, entry journal.Entry) error {
+func (s *Store) insertJournalEntryTx(ctx context.Context, tx *sql.Tx, entry journal.Entry) error {
 	subjectsRaw, err := json.Marshal(entry.Subjects)
 	if err != nil {
 		return err
@@ -621,12 +628,12 @@ func insertJournalEntryTx(ctx context.Context, tx *sql.Tx, entry journal.Entry) 
 	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO journal_entries
-		(tenant_id, journal_id, seq, entry_id, type, schema_version, status, occurred_at, observed_at,
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO journal_entries
+		(%s, journal_id, seq, entry_id, type, schema_version, status, occurred_at, observed_at,
 		 actor_type, actor_id, source, parent_entry_id, correlation_id, subjects, summary, artifact_refs,
 		 prev_hash, entry_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		entry.TenantID, entry.JournalID, entry.Seq, entry.EntryID, entry.Type, entry.SchemaVersion,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.tenantCol()),
+		s.tenantArg(entry.TenantID), entry.JournalID, entry.Seq, entry.EntryID, entry.Type, entry.SchemaVersion,
 		nullStr(entry.Status), entry.OccurredAt, entry.ObservedAt, nullStr(entry.Actor.Type),
 		nullStr(entry.Actor.ID), entry.Source, nullStr(entry.ParentEntryID), nullStr(entry.CorrelationID),
 		nullJSON(subjectsRaw), nullJSON(summaryRaw), nullJSON(artifactRefsRaw), entry.PrevHash, entry.EntryHash); err != nil {
@@ -637,10 +644,10 @@ func insertJournalEntryTx(ctx context.Context, tx *sql.Tx, entry journal.Entry) 
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_entry_subjects
-			(tenant_id, subject_type, subject_hash, subject_id, occurred_at, observed_at, journal_id, seq, entry_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			entry.TenantID, subjectType, journal.SubjectHash(subjectType, subjectID), subjectID,
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO journal_entry_subjects
+			(%s, subject_type, subject_hash, subject_id, occurred_at, observed_at, journal_id, seq, entry_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.tenantCol()),
+			s.tenantArg(entry.TenantID), subjectType, journal.SubjectHash(subjectType, subjectID), subjectID,
 			entry.OccurredAt, entry.ObservedAt, entry.JournalID, entry.Seq, entry.EntryID); err != nil {
 			return err
 		}
@@ -648,15 +655,16 @@ func insertJournalEntryTx(ctx context.Context, tx *sql.Tx, entry journal.Entry) 
 	return nil
 }
 
-func selectEntryColumns() string {
-	return `SELECT tenant_id, journal_id, seq, entry_id, type, schema_version, status, occurred_at, observed_at,
+func (s *Store) selectEntryColumns() string {
+	return fmt.Sprintf(`SELECT %s, journal_id, seq, entry_id, type, schema_version, status, occurred_at, observed_at,
 		actor_type, actor_id, source, parent_entry_id, correlation_id, subjects, summary, artifact_refs,
-		prev_hash, entry_hash `
+		prev_hash, entry_hash `, s.tenantCol())
 }
 
-func selectEntryColumnsAlias(alias string) string {
+func (s *Store) selectEntryColumnsAlias(alias string) string {
 	prefix := alias + "."
-	return `SELECT ` + prefix + `tenant_id, ` + prefix + `journal_id, ` + prefix + `seq, ` +
+	col := prefix + s.tenantCol()
+	return `SELECT ` + col + `, ` + prefix + `journal_id, ` + prefix + `seq, ` +
 		prefix + `entry_id, ` + prefix + `type, ` + prefix + `schema_version, ` + prefix + `status, ` +
 		prefix + `occurred_at, ` + prefix + `observed_at, ` + prefix + `actor_type, ` + prefix + `actor_id, ` +
 		prefix + `source, ` + prefix + `parent_entry_id, ` + prefix + `correlation_id, ` +
@@ -664,10 +672,13 @@ func selectEntryColumnsAlias(alias string) string {
 		prefix + `prev_hash, ` + prefix + `entry_hash `
 }
 
-func scanEntryRows(rows *sql.Rows) ([]journal.Entry, error) {
+// scanEntryRows scans journal entry rows and stamps each entry's TenantID
+// with tenantID: in shared shape the leading column is fs_id (numeric), and
+// the app-layer tenant UUID comes from the request scope, not the row.
+func scanEntryRows(rows *sql.Rows, tenantID string) ([]journal.Entry, error) {
 	var out []journal.Entry
 	for rows.Next() {
-		entry, err := scanEntry(rows)
+		entry, err := scanEntry(rows, tenantID)
 		if err != nil {
 			return nil, err
 		}
@@ -676,7 +687,7 @@ func scanEntryRows(rows *sql.Rows) ([]journal.Entry, error) {
 	return out, rows.Err()
 }
 
-func scanEntry(row interface{ Scan(dest ...any) error }) (*journal.Entry, error) {
+func scanEntry(row interface{ Scan(dest ...any) error }, tenantID string) (*journal.Entry, error) {
 	var e journal.Entry
 	var status, actorType, actorID, parentEntryID, correlationID sql.NullString
 	var subjectsRaw, summaryRaw, artifactRefsRaw []byte
@@ -685,6 +696,7 @@ func scanEntry(row interface{ Scan(dest ...any) error }) (*journal.Entry, error)
 		&correlationID, &subjectsRaw, &summaryRaw, &artifactRefsRaw, &e.PrevHash, &e.EntryHash); err != nil {
 		return nil, err
 	}
+	e.TenantID = tenantID
 	e.Status = status.String
 	e.Actor = journal.Actor{Type: actorType.String, ID: actorID.String}
 	e.ParentEntryID = parentEntryID.String
@@ -704,10 +716,10 @@ func scanEntry(row interface{ Scan(dest ...any) error }) (*journal.Entry, error)
 }
 
 func (s *Store) loadJournalEntrySubjects(ctx context.Context, tenantID, journalID string, firstSeq, lastSeq int64) (map[int64][]string, bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT seq, subject_type, subject_hash, subject_id
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`SELECT seq, subject_type, subject_hash, subject_id
 		FROM journal_entry_subjects
-		WHERE tenant_id = ? AND journal_id = ? AND seq >= ? AND seq <= ?
-		ORDER BY seq`, tenantID, journalID, firstSeq, lastSeq)
+		WHERE %s = ? AND journal_id = ? AND seq >= ? AND seq <= ?
+		ORDER BY seq`, s.tenantCol()), s.tenantArg(tenantID), journalID, firstSeq, lastSeq)
 	if err != nil {
 		return nil, false, err
 	}
@@ -747,10 +759,10 @@ func (s *Store) loadJournalEntrySubjects(ctx context.Context, tenantID, journalI
 }
 
 func (s *Store) loadJournalLabels(ctx context.Context, tenantID, journalID string) ([]journal.Label, bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT label_key, label_hash, label_value
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`SELECT label_key, label_hash, label_value
 		FROM journal_labels
-		WHERE tenant_id = ? AND journal_id = ?
-		ORDER BY label_key, label_value`, tenantID, journalID)
+		WHERE %s = ? AND journal_id = ?
+		ORDER BY label_key, label_value`, s.tenantCol()), s.tenantArg(tenantID), journalID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -818,10 +830,11 @@ func equalLabels(a, b []journal.Label) bool {
 func (s *Store) searchJournalEntries(ctx context.Context, tenantID string, req journal.SearchRequest) ([]journal.SearchMatch, error) {
 	var b strings.Builder
 	args := []any{}
+	col := s.tenantCol()
 	labels := journal.NormalizeLabels(req.Labels)
 	labelAnchored := false
 	if req.Entries {
-		b.WriteString(selectEntryColumnsAlias("e"))
+		b.WriteString(s.selectEntryColumnsAlias("e"))
 	} else {
 		b.WriteString(`SELECT e.journal_id, e.seq, e.type, e.status, e.observed_at `)
 	}
@@ -830,26 +843,26 @@ func (s *Store) searchJournalEntries(ctx context.Context, tenantID string, req j
 		if err != nil {
 			return nil, err
 		}
-		b.WriteString(`FROM journal_entry_subjects s JOIN journal_entries e
-			ON e.tenant_id = s.tenant_id AND e.journal_id = s.journal_id AND e.seq = s.seq
-			JOIN journals j ON j.tenant_id = e.tenant_id AND j.journal_id = e.journal_id
-			WHERE s.tenant_id = ? AND s.subject_type = ? AND s.subject_hash = ? AND s.subject_id = ? `)
-		args = append(args, tenantID, subjectType, journal.SubjectHash(subjectType, subjectID), subjectID)
+		b.WriteString(fmt.Sprintf(`FROM journal_entry_subjects s JOIN journal_entries e
+			ON e.%[1]s = s.%[1]s AND e.journal_id = s.journal_id AND e.seq = s.seq
+			JOIN journals j ON j.%[1]s = e.%[1]s AND j.journal_id = e.journal_id
+			WHERE s.%[1]s = ? AND s.subject_type = ? AND s.subject_hash = ? AND s.subject_id = ? `, col))
+		args = append(args, s.tenantArg(tenantID), subjectType, journal.SubjectHash(subjectType, subjectID), subjectID)
 	} else if len(labels) > 0 {
 		first := labels[0]
 		labelAnchored = true
-		b.WriteString(`FROM journal_labels l JOIN journals j
-			ON j.tenant_id = l.tenant_id AND j.journal_id = l.journal_id
-			JOIN journal_entries e ON e.tenant_id = j.tenant_id AND e.journal_id = j.journal_id
-			WHERE l.tenant_id = ? AND l.label_key = ? AND l.label_hash = ? AND l.label_value = ? `)
-		args = append(args, tenantID, first.Key, journal.LabelHash(first.Key, first.Value), first.Value)
+		b.WriteString(fmt.Sprintf(`FROM journal_labels l JOIN journals j
+			ON j.%[1]s = l.%[1]s AND j.journal_id = l.journal_id
+			JOIN journal_entries e ON e.%[1]s = j.%[1]s AND e.journal_id = j.journal_id
+			WHERE l.%[1]s = ? AND l.label_key = ? AND l.label_hash = ? AND l.label_value = ? `, col))
+		args = append(args, s.tenantArg(tenantID), first.Key, journal.LabelHash(first.Key, first.Value), first.Value)
 	} else {
-		b.WriteString(`FROM journal_entries e
-			JOIN journals j ON j.tenant_id = e.tenant_id AND j.journal_id = e.journal_id
-			WHERE e.tenant_id = ? `)
-		args = append(args, tenantID)
+		b.WriteString(fmt.Sprintf(`FROM journal_entries e
+			JOIN journals j ON j.%[1]s = e.%[1]s AND j.journal_id = e.journal_id
+			WHERE e.%[1]s = ? `, col))
+		args = append(args, s.tenantArg(tenantID))
 	}
-	if err := appendEntryFilters(&b, &args, req, labelAnchored); err != nil {
+	if err := appendEntryFilters(&b, &args, req, labelAnchored, col); err != nil {
 		return nil, err
 	}
 	b.WriteString(` ORDER BY e.observed_at DESC, e.journal_id DESC, e.seq DESC LIMIT ?`)
@@ -863,7 +876,7 @@ func (s *Store) searchJournalEntries(ctx context.Context, tenantID string, req j
 	var out []journal.SearchMatch
 	for rows.Next() {
 		if req.Entries {
-			entry, err := scanEntry(rows)
+			entry, err := scanEntry(rows, tenantID)
 			if err != nil {
 				return nil, err
 			}
@@ -893,7 +906,7 @@ func (s *Store) searchJournalEntries(ctx context.Context, tenantID string, req j
 	return out, rows.Err()
 }
 
-func appendEntryFilters(b *strings.Builder, args *[]any, req journal.SearchRequest, skipFirstLabel bool) error {
+func appendEntryFilters(b *strings.Builder, args *[]any, req journal.SearchRequest, skipFirstLabel bool, col string) error {
 	if req.Type != "" {
 		b.WriteString(`AND e.type = ? `)
 		*args = append(*args, req.Type)
@@ -932,9 +945,9 @@ func appendEntryFilters(b *strings.Builder, args *[]any, req journal.SearchReque
 			if err != nil {
 				return err
 			}
-			b.WriteString(`AND EXISTS (SELECT 1 FROM journal_entry_subjects sx
-			WHERE sx.tenant_id = e.tenant_id AND sx.journal_id = e.journal_id AND sx.seq = e.seq
-			AND sx.subject_type = ? AND sx.subject_hash = ? AND sx.subject_id = ?) `)
+			fmt.Fprintf(b, `AND EXISTS (SELECT 1 FROM journal_entry_subjects sx
+			WHERE sx.%[1]s = e.%[1]s AND sx.journal_id = e.journal_id AND sx.seq = e.seq
+			AND sx.subject_type = ? AND sx.subject_hash = ? AND sx.subject_id = ?) `, col)
 			*args = append(*args, subjectType, journal.SubjectHash(subjectType, subjectID), subjectID)
 		}
 	}
@@ -943,9 +956,9 @@ func appendEntryFilters(b *strings.Builder, args *[]any, req journal.SearchReque
 		labels = labels[1:]
 	}
 	for _, label := range labels {
-		b.WriteString(`AND EXISTS (SELECT 1 FROM journal_labels lx
-			WHERE lx.tenant_id = j.tenant_id AND lx.journal_id = j.journal_id
-			AND lx.label_key = ? AND lx.label_hash = ? AND lx.label_value = ?) `)
+		fmt.Fprintf(b, `AND EXISTS (SELECT 1 FROM journal_labels lx
+			WHERE lx.%[1]s = j.%[1]s AND lx.journal_id = j.journal_id
+			AND lx.label_key = ? AND lx.label_hash = ? AND lx.label_value = ?) `, col)
 		*args = append(*args, label.Key, journal.LabelHash(label.Key, label.Value), label.Value)
 	}
 	return nil
@@ -955,18 +968,19 @@ func (s *Store) searchJournalLabels(ctx context.Context, tenantID string, req jo
 	labels := journal.NormalizeLabels(req.Labels)
 	var b strings.Builder
 	args := []any{}
+	col := s.tenantCol()
 	b.WriteString(`SELECT j.journal_id, j.kind, j.title, j.created_at, `)
 	if len(labels) > 0 {
 		first := labels[0]
 		b.WriteString(`l.created_at FROM `)
-		b.WriteString(`journal_labels l JOIN journals j
-			ON j.tenant_id = l.tenant_id AND j.journal_id = l.journal_id
-			WHERE l.tenant_id = ? AND l.label_key = ? AND l.label_hash = ? AND l.label_value = ? `)
-		args = append(args, tenantID, first.Key, journal.LabelHash(first.Key, first.Value), first.Value)
+		b.WriteString(fmt.Sprintf(`journal_labels l JOIN journals j
+			ON j.%[1]s = l.%[1]s AND j.journal_id = l.journal_id
+			WHERE l.%[1]s = ? AND l.label_key = ? AND l.label_hash = ? AND l.label_value = ? `, col))
+		args = append(args, s.tenantArg(tenantID), first.Key, journal.LabelHash(first.Key, first.Value), first.Value)
 	} else {
 		b.WriteString(`j.created_at FROM `)
-		b.WriteString(`journals j WHERE j.tenant_id = ? `)
-		args = append(args, tenantID)
+		b.WriteString(fmt.Sprintf(`journals j WHERE j.%s = ? `, col))
+		args = append(args, s.tenantArg(tenantID))
 	}
 	if req.Kind != "" {
 		b.WriteString(`AND j.kind = ? `)
@@ -1001,9 +1015,9 @@ func (s *Store) searchJournalLabels(ctx context.Context, tenantID string, req jo
 		if i == 0 {
 			continue
 		}
-		b.WriteString(`AND EXISTS (SELECT 1 FROM journal_labels lx
-			WHERE lx.tenant_id = j.tenant_id AND lx.journal_id = j.journal_id
-			AND lx.label_key = ? AND lx.label_hash = ? AND lx.label_value = ?) `)
+		b.WriteString(fmt.Sprintf(`AND EXISTS (SELECT 1 FROM journal_labels lx
+			WHERE lx.%[1]s = j.%[1]s AND lx.journal_id = j.journal_id
+			AND lx.label_key = ? AND lx.label_hash = ? AND lx.label_value = ?) `, col))
 		args = append(args, label.Key, journal.LabelHash(label.Key, label.Value), label.Value)
 	}
 	if len(labels) > 0 {
