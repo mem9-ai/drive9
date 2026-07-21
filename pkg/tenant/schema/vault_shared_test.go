@@ -35,7 +35,6 @@ func TestVaultSharedSchemaMatchesStandaloneModuloFsID(t *testing.T) {
 		"vault_secrets":   "secret_id",
 		"vault_tokens":    "token_id",
 		"vault_grants":    "grant_id",
-		"vault_policies":  "policy_id",
 		"vault_audit_log": "event_id",
 	}
 	// droppedTenantIdx names the single-column tenant indexes removed in
@@ -97,8 +96,8 @@ func TestVaultSharedSchemaMatchesStandaloneModuloFsID(t *testing.T) {
 		}
 		renamed++
 	}
-	if renamed != 6 {
-		t.Fatalf("renamed tables = %d, want 6 (all vault tables except vault_secret_fields)", renamed)
+	if renamed != 5 {
+		t.Fatalf("renamed tables = %d, want 5 (all vault tables except vault_secret_fields)", renamed)
 	}
 }
 
@@ -158,8 +157,8 @@ func TestVaultTiDBSharedSchemaDeclaresClusteredPKs(t *testing.T) {
 			t.Errorf("statement %d variants differ beyond the keyword:\ntidb stripped: %s\nmysql: %s", i, want, got)
 		}
 	}
-	if compositePKs != 6 {
-		t.Fatalf("composite primary keys = %d, want 6 (every vault table except vault_deks)", compositePKs)
+	if compositePKs != 5 {
+		t.Fatalf("composite primary keys = %d, want 5 (every vault table except vault_deks)", compositePKs)
 	}
 }
 

@@ -18,7 +18,7 @@ func newTestStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	// Clean vault tables before each test.
-	for _, tbl := range []string{"vault_audit_log", "vault_tokens", "vault_secret_fields", "vault_secrets", "vault_deks", "vault_policies"} {
+	for _, tbl := range []string{"vault_audit_log", "vault_tokens", "vault_secret_fields", "vault_secrets", "vault_deks"} {
 		if _, err := testDB.Exec("DELETE FROM " + tbl); err != nil {
 			t.Fatalf("clean %s: %v", tbl, err)
 		}

@@ -723,18 +723,6 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_fs_scopes_api_key (api_key_id),
 			INDEX idx_fs_scopes_tenant_key (tenant_id, api_key_id)
 		)`,
-		`CREATE TABLE IF NOT EXISTS llm_usage (
-			id              BIGINT AUTO_INCREMENT PRIMARY KEY,
-			tenant_id       VARCHAR(64) NOT NULL DEFAULT '',
-			task_type       VARCHAR(64) NOT NULL,
-			task_id         VARCHAR(255) NOT NULL,
-			cost_millicents BIGINT NOT NULL,
-			raw_units       BIGINT NOT NULL DEFAULT 0,
-			raw_unit_type   VARCHAR(32) NOT NULL DEFAULT '',
-			created_at      DATETIME(3) NOT NULL,
-			INDEX idx_llm_usage_tenant_created (tenant_id, created_at),
-			INDEX idx_llm_usage_created (created_at)
-		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_quota_config (
 			tenant_id             VARCHAR(64) PRIMARY KEY,
 			max_storage_bytes     BIGINT NOT NULL DEFAULT 53687091200,
@@ -809,19 +797,6 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_pending (status, created_at),
 			INDEX idx_pending_tenant_age (status, tenant_id, created_at),
 			INDEX idx_tenant_order (tenant_id, id)
-		)`,
-		// sse_notify_outbox is the legacy central notification pointer table for
-		// cross-pod SSE event fan-out. Deprecated: replaced by
-		// tenant_notify_outbox (which carries the SSE work bit alongside
-		// semantic/file_gc/quota). The table is retained in the schema for
-		// migration safety (no DROP) but production code no longer writes to
-		// it. To be dropped in a future PR.
-		`CREATE TABLE IF NOT EXISTS sse_notify_outbox (
-			id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-			tenant_id  VARCHAR(64) NOT NULL,
-			seq        BIGINT UNSIGNED NOT NULL,
-			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			INDEX idx_sse_notify_created (created_at)
 		)`,
 		// pod_registry tracks all drive9-server pods for cross-pod SSE push
 		// notification routing. Each pod upserts its row on startup and heartbeats
@@ -3814,21 +3789,8 @@ func isDuplicateEntry(err error) bool {
 }
 
 // ---------------------------------------------------------------------------
-// SSE notify outbox (deprecated — replaced by tenant_notify_outbox)
+// Pod registry
 // ---------------------------------------------------------------------------
-
-// SSENotifyRow mirrors a row in sse_notify_outbox.
-//
-// Deprecated: replaced by tenant_notify_outbox + TenantNotifyRow. The
-// sse_notify_outbox table is no longer written to by production code; it is
-// retained in the schema for migration safety and will be dropped in a future
-// PR.
-type SSENotifyRow struct {
-	ID        uint64
-	TenantID  string
-	Seq       uint64
-	CreatedAt time.Time
-}
 
 // PodRegistryStatus is the lifecycle state of a pod in pod_registry.
 type PodRegistryStatus string
@@ -3844,82 +3806,6 @@ type PodRow struct {
 	Addr   string
 	Status PodRegistryStatus
 }
-
-// InsertSSENotify writes a notification pointer to sse_notify_outbox.
-//
-// Deprecated: replaced by InsertTenantNotify. Retained for migration safety;
-// production code no longer calls this. The sse_notify_outbox table will be
-// dropped in a future PR.
-func (s *Store) InsertSSENotify(ctx context.Context, tenantID string, seq uint64) (err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "insert_sse_notify", start, &err)
-	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO sse_notify_outbox (tenant_id, seq) VALUES (?, ?)`,
-		tenantID, seq)
-	return err
-}
-
-// ListSSENotifySince returns outbox rows with id > afterID, ordered by id, up to
-// limit.
-//
-// Deprecated: replaced by ListTenantNotifySince.
-func (s *Store) ListSSENotifySince(ctx context.Context, afterID uint64, limit int) (out []SSENotifyRow, err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "list_sse_notify_since", start, &err)
-	if limit <= 0 {
-		limit = 1000
-	}
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, tenant_id, seq, created_at FROM sse_notify_outbox WHERE id > ? ORDER BY id LIMIT ?`,
-		afterID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var rec SSENotifyRow
-		if err = rows.Scan(&rec.ID, &rec.TenantID, &rec.Seq, &rec.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, rec)
-	}
-	return out, rows.Err()
-}
-
-// MaxSSENotifyID returns the current maximum id in sse_notify_outbox, or 0 if
-// the table is empty.
-//
-// Deprecated: replaced by MaxTenantNotifyID.
-func (s *Store) MaxSSENotifyID(ctx context.Context) (out uint64, err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "max_sse_notify_id", start, &err)
-	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM sse_notify_outbox`)
-	if err = row.Scan(&out); err != nil {
-		return 0, err
-	}
-	return out, nil
-}
-
-// DeleteSSENotifyBefore prunes outbox rows older than the given threshold.
-//
-// Deprecated: replaced by DeleteTenantNotifyBefore.
-func (s *Store) DeleteSSENotifyBefore(ctx context.Context, before time.Time) (n int64, err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "delete_sse_notify_before", start, &err)
-	res, err := s.db.ExecContext(ctx, `DELETE FROM sse_notify_outbox WHERE created_at < ?`, before)
-	if err != nil {
-		return 0, err
-	}
-	n, err = res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	return n, nil
-}
-
-// ---------------------------------------------------------------------------
-// Pod registry
-// ---------------------------------------------------------------------------
 
 // UpsertPod registers or refreshes this pod's heartbeat in pod_registry. On
 // first insert the row is created with status='active'; on subsequent calls

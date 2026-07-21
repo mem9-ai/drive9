@@ -280,7 +280,7 @@ drive9-server schema dump-init-sql --provider tidb_cloud_native_shared
 ```
 
 - The `tidb_cloud_native_shared` provider dumps the new shared (multi-tenant) schema shape: all
-  31 tenant tables in one physical database, each carrying an `fs_id BIGINT NOT NULL`
+  30 tenant tables in one physical database, each carrying an `fs_id BIGINT NOT NULL`
   discriminator column.
 
 - Do not maintain a second handwritten copy of those init SQL statements when a command can

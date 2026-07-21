@@ -328,7 +328,7 @@ func TestSharedTenantDeletePlacementRemovalFailureStaysRetryable(t *testing.T) {
 	// them.)
 	for _, tbl := range []string{
 		"journal_entry_subjects", "journal_entries", "journal_append_requests", "journal_labels", "journals",
-		"vault_audit_log", "vault_grants", "vault_tokens", "vault_secret_fields", "vault_secrets", "vault_policies", "vault_deks",
+		"vault_audit_log", "vault_grants", "vault_tokens", "vault_secret_fields", "vault_secrets", "vault_deks",
 		"git_workspace_object_packs", "git_workspace_overlay", "git_workspace_git_state", "git_workspace_tree_nodes", "git_workspaces",
 		"fs_layer_checkpoints", "fs_layer_events", "fs_layer_tags", "fs_layer_entries", "fs_layers",
 		"fs_events", "semantic_tasks", "file_gc_tasks", "uploads", "file_tags", "file_nodes", "semantic", "contents", "inodes",

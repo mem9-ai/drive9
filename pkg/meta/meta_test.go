@@ -22,7 +22,6 @@ func newControlStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	testmysql.ResetMetaDB(t, s.DB())
-	_, _ = s.DB().Exec("DELETE FROM llm_usage")
 	return s
 }
 

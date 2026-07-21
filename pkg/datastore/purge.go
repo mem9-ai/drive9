@@ -23,7 +23,6 @@ var sharedPurgeTables = []string{
 	"vault_tokens",
 	"vault_secret_fields",
 	"vault_secrets",
-	"vault_policies",
 	"vault_deks",
 	"git_workspace_object_packs",
 	"git_workspace_overlay",

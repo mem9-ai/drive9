@@ -68,14 +68,6 @@ func VaultTiDBSchemaStatements() []string {
 			INDEX idx_vault_grants_expires (expires_at)
 		)`,
 
-		`CREATE TABLE IF NOT EXISTS vault_policies (
-			policy_id   VARCHAR(64) PRIMARY KEY,
-			tenant_id   VARCHAR(64) NOT NULL,
-			name        VARCHAR(255) NOT NULL,
-			rules_json  JSON NOT NULL,
-			created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
-		)`,
-
 		`CREATE TABLE IF NOT EXISTS vault_audit_log (
 			event_id     VARCHAR(64) PRIMARY KEY,
 			tenant_id    VARCHAR(64) NOT NULL,
@@ -169,15 +161,6 @@ func VaultTiDBSharedSchemaStatements() []string {
 			revoke_reason  VARCHAR(256),
 			PRIMARY KEY (fs_id, grant_id) CLUSTERED,
 			INDEX idx_vault_grants_expires (expires_at)
-		)`,
-
-		`CREATE TABLE IF NOT EXISTS vault_policies (
-			policy_id   VARCHAR(64) NOT NULL,
-			fs_id       BIGINT NOT NULL,
-			name        VARCHAR(255) NOT NULL,
-			rules_json  JSON NOT NULL,
-			created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			PRIMARY KEY (fs_id, policy_id) CLUSTERED
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_audit_log (
