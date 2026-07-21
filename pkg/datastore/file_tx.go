@@ -56,7 +56,7 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 		}
 		if description != "" {
 			var currentDesc sql.NullString
-			if err := db.QueryRow(`SELECT description FROM semantic WHERE inode_id = ?`, fileID).Scan(&currentDesc); err != nil {
+			if err := db.QueryRow(`SELECT description FROM semantic WHERE `+s.scope.And(`inode_id = ?`), s.scope.Args(fileID)...).Scan(&currentDesc); err != nil {
 				return 0, fmt.Errorf("read current description: %w", err)
 			}
 			query += ` description = ?,`
@@ -107,7 +107,7 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 		}
 	} else {
 		var currentRev int64
-		if err := db.QueryRow(`SELECT revision FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' FOR UPDATE`, fileID).Scan(&currentRev); err != nil {
+		if err := db.QueryRow(`SELECT revision FROM inodes WHERE `+s.scope.And(`inode_id = ? AND status = 'CONFIRMED'`)+` FOR UPDATE`, s.scope.Args(fileID)...).Scan(&currentRev); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				if expectedRevision > 0 {
 					return 0, ErrRevisionConflict
@@ -127,7 +127,7 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 		return 0, fmt.Errorf("update inode: %w", err)
 	}
 	var encryptionMode StorageEncryptionMode
-	if err := db.QueryRow(`SELECT storage_encryption_mode FROM contents WHERE inode_id = ?`, fileID).Scan(&encryptionMode); err != nil {
+	if err := db.QueryRow(`SELECT storage_encryption_mode FROM contents WHERE `+s.scope.And(`inode_id = ?`), s.scope.Args(fileID)...).Scan(&encryptionMode); err != nil {
 		return 0, fmt.Errorf("read encryption mode: %w", err)
 	}
 	if err := s.UpdateContentTx(db, fileID, storageType, storageRef, contentType, checksum, contentBlob, encryptionMode); err != nil {
@@ -161,7 +161,7 @@ func (s *Store) UpdateFileStorageEncryptionTx(db execer, fileID string, mode Sto
 		}
 		if rowsAffected == 0 {
 			var exists int
-			if err := db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ?`, fileID).Scan(&exists); err != nil {
+			if err := db.QueryRow(`SELECT 1 FROM inodes WHERE `+s.scope.And(`inode_id = ?`), s.scope.Args(fileID)...).Scan(&exists); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return ErrNotFound
 				}
@@ -170,7 +170,7 @@ func (s *Store) UpdateFileStorageEncryptionTx(db execer, fileID string, mode Sto
 		}
 	} else {
 		var exists int
-		if err := db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ?`, fileID).Scan(&exists); err != nil {
+		if err := db.QueryRow(`SELECT 1 FROM inodes WHERE `+s.scope.And(`inode_id = ?`), s.scope.Args(fileID)...).Scan(&exists); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -178,8 +178,8 @@ func (s *Store) UpdateFileStorageEncryptionTx(db execer, fileID string, mode Sto
 		}
 	}
 	// Dual-write to split tables
-	if _, err := db.Exec(`UPDATE contents SET storage_encryption_mode = ?, storage_encryption_key_id = ? WHERE inode_id = ?`,
-		mode, storageEncryptionKeyIDForWrite(mode, keyID), fileID); err != nil {
+	if _, err := db.Exec(`UPDATE contents SET storage_encryption_mode = ?, storage_encryption_key_id = ? WHERE `+s.scope.And(`inode_id = ?`),
+		append([]any{mode, storageEncryptionKeyIDForWrite(mode, keyID)}, s.scope.Args(fileID)...)...); err != nil {
 		return fmt.Errorf("update contents encryption: %w", err)
 	}
 	return nil
@@ -227,7 +227,7 @@ func (s *Store) ConfirmPendingFileTx(db execer, fileID string, storageType Stora
 		}
 	} else {
 		var status string
-		if err := db.QueryRow(`SELECT status FROM inodes WHERE inode_id = ? FOR UPDATE`, fileID).Scan(&status); err != nil {
+		if err := db.QueryRow(`SELECT status FROM inodes WHERE `+s.scope.And(`inode_id = ?`)+` FOR UPDATE`, s.scope.Args(fileID)...).Scan(&status); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -242,7 +242,7 @@ func (s *Store) ConfirmPendingFileTx(db execer, fileID string, storageType Stora
 		return fmt.Errorf("update inode: %w", err)
 	}
 	var encMode StorageEncryptionMode
-	if err := db.QueryRow(`SELECT storage_encryption_mode FROM contents WHERE inode_id = ?`, fileID).Scan(&encMode); err != nil {
+	if err := db.QueryRow(`SELECT storage_encryption_mode FROM contents WHERE `+s.scope.And(`inode_id = ?`), s.scope.Args(fileID)...).Scan(&encMode); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("read content encryption: %w", err)
 		}
@@ -285,7 +285,7 @@ func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, stor
 		}
 	} else {
 		var status string
-		if err := db.QueryRow(`SELECT status FROM inodes WHERE inode_id = ? FOR UPDATE`, fileID).Scan(&status); err != nil {
+		if err := db.QueryRow(`SELECT status FROM inodes WHERE `+s.scope.And(`inode_id = ?`)+` FOR UPDATE`, s.scope.Args(fileID)...).Scan(&status); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -300,7 +300,7 @@ func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, stor
 		return fmt.Errorf("update inode: %w", err)
 	}
 	var encMode StorageEncryptionMode
-	if err := db.QueryRow(`SELECT storage_encryption_mode FROM contents WHERE inode_id = ?`, fileID).Scan(&encMode); err != nil {
+	if err := db.QueryRow(`SELECT storage_encryption_mode FROM contents WHERE `+s.scope.And(`inode_id = ?`), s.scope.Args(fileID)...).Scan(&encMode); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("read content encryption: %w", err)
 		}
@@ -331,14 +331,16 @@ func (s *Store) DeletePendingFileTx(db execer, fileID string) error {
 			return ErrNotFound
 		}
 	}
-	res, err := db.Exec(`UPDATE inodes SET status = 'DELETED', mtime = ? WHERE inode_id = ? AND status = 'PENDING'`, now, fileID)
+	res, err := db.Exec(`UPDATE inodes SET status = 'DELETED', mtime = ? WHERE `+s.scope.And(`inode_id = ? AND status = 'PENDING'`),
+		append([]any{now}, s.scope.Args(fileID)...)...)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
-	if _, err := db.Exec(`UPDATE contents SET storage_ref = '', storage_ref_hash = '' WHERE inode_id = ?`, fileID); err != nil {
+	if _, err := db.Exec(`UPDATE contents SET storage_ref = '', storage_ref_hash = '' WHERE `+s.scope.And(`inode_id = ?`),
+		s.scope.Args(fileID)...); err != nil {
 		return err
 	}
 	return nil
@@ -360,7 +362,7 @@ func (s *Store) ClearFileEmbeddingStateTx(db execer, fileID string) error {
 		}
 	} else {
 		var exists int
-		if err := db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ?`, fileID).Scan(&exists); err != nil {
+		if err := db.QueryRow(`SELECT 1 FROM inodes WHERE `+s.scope.And(`inode_id = ?`), s.scope.Args(fileID)...).Scan(&exists); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -368,7 +370,8 @@ func (s *Store) ClearFileEmbeddingStateTx(db execer, fileID string) error {
 		}
 	}
 	// Dual-write to split tables.
-	if _, err := db.Exec(`UPDATE semantic SET embedding = NULL, embedding_revision = NULL WHERE inode_id = ?`, fileID); err != nil {
+	if _, err := db.Exec(`UPDATE semantic SET embedding = NULL, embedding_revision = NULL WHERE `+s.scope.And(`inode_id = ?`),
+		s.scope.Args(fileID)...); err != nil {
 		return fmt.Errorf("update semantic embedding: %w", err)
 	}
 	return nil

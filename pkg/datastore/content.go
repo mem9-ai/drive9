@@ -25,13 +25,13 @@ type Content struct {
 func (s *Store) InsertContent(ctx context.Context, content *Content) error {
 	mode := fileStorageEncryptionModeForWrite(content.StorageEncryptionMode)
 	_, err := s.db.ExecContext(ctx, `INSERT INTO contents
-		(inode_id, storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
-		 content_blob, content_type, checksum_sha256, source_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		content.InodeID, content.StorageType, content.StorageRef, StorageRefHash(content.StorageRef), mode,
-		storageEncryptionKeyIDForWrite(mode, content.StorageEncryptionKeyID),
-		nilBytes(content.ContentBlob), nullStr(content.ContentType),
-		nullStr(content.ChecksumSHA256), nullStr(content.SourceID))
+		(`+s.scope.InsCols(`inode_id, storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
+		 content_blob, content_type, checksum_sha256, source_id`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
+		s.scope.Args(content.InodeID, content.StorageType, content.StorageRef, StorageRefHash(content.StorageRef), mode,
+			storageEncryptionKeyIDForWrite(mode, content.StorageEncryptionKeyID),
+			nilBytes(content.ContentBlob), nullStr(content.ContentType),
+			nullStr(content.ChecksumSHA256), nullStr(content.SourceID))...)
 	return err
 }
 
@@ -39,13 +39,13 @@ func (s *Store) InsertContent(ctx context.Context, content *Content) error {
 func (s *Store) InsertContentTx(db execer, content *Content) error {
 	mode := fileStorageEncryptionModeForWrite(content.StorageEncryptionMode)
 	_, err := db.Exec(`INSERT INTO contents
-		(inode_id, storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
-		 content_blob, content_type, checksum_sha256, source_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		content.InodeID, content.StorageType, content.StorageRef, StorageRefHash(content.StorageRef), mode,
-		storageEncryptionKeyIDForWrite(mode, content.StorageEncryptionKeyID),
-		nilBytes(content.ContentBlob), nullStr(content.ContentType),
-		nullStr(content.ChecksumSHA256), nullStr(content.SourceID))
+		(`+s.scope.InsCols(`inode_id, storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
+		 content_blob, content_type, checksum_sha256, source_id`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
+		s.scope.Args(content.InodeID, content.StorageType, content.StorageRef, StorageRefHash(content.StorageRef), mode,
+			storageEncryptionKeyIDForWrite(mode, content.StorageEncryptionKeyID),
+			nilBytes(content.ContentBlob), nullStr(content.ContentType),
+			nullStr(content.ChecksumSHA256), nullStr(content.SourceID))...)
 	return err
 }
 
@@ -54,7 +54,7 @@ func (s *Store) GetContent(ctx context.Context, inodeID string) (*Content, error
 	row := s.db.QueryRowContext(ctx, `SELECT inode_id, storage_type, storage_ref,
 		storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
 		content_blob, content_type, checksum_sha256, source_id
-		FROM contents WHERE inode_id = ?`, inodeID)
+		FROM contents WHERE `+s.scope.And(`inode_id = ?`), s.scope.Args(inodeID)...)
 	return scanContent(row)
 }
 
@@ -64,9 +64,9 @@ func (s *Store) UpdateContentTx(db execer, inodeID string, storageType StorageTy
 	_, err := db.Exec(`UPDATE contents SET
 		storage_type = ?, storage_ref = ?, storage_ref_hash = ?, storage_encryption_mode = ?,
 		content_blob = ?, content_type = ?, checksum_sha256 = ?
-		WHERE inode_id = ?`,
-		storageType, storageRef, StorageRefHash(storageRef), mode,
-		nilBytes(contentBlob), nullStr(contentType), nullStr(checksum), inodeID)
+		WHERE `+s.scope.And(`inode_id = ?`),
+		append([]any{storageType, storageRef, StorageRefHash(storageRef), mode,
+			nilBytes(contentBlob), nullStr(contentType), nullStr(checksum)}, s.scope.Args(inodeID)...)...)
 	return err
 }
 

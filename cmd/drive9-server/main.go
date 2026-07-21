@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 
 	"github.com/mem9-ai/drive9/pkg/backend"
@@ -329,6 +330,28 @@ func main() {
 		pool.SetMetaStore(store)
 		pool.Start(context.Background())
 
+		// Optional shared-schema pool: when DRIVE9_SHARED_POOL_DSN is set,
+		// initialize the shared schema on that database and register it in
+		// db_pool so tenants in the matching org are provisioned onto it
+		// instead of getting a dedicated cluster. The org binding is always
+		// explicit — DRIVE9_SHARED_POOL_ORG has no default, and the '*' wildcard
+		// (which places ALL new tenants on the shared pool) is opt-in and loud.
+		if sharedDSN := strings.TrimSpace(os.Getenv("DRIVE9_SHARED_POOL_DSN")); sharedDSN != "" {
+			sharedOrg := strings.TrimSpace(os.Getenv("DRIVE9_SHARED_POOL_ORG"))
+			if sharedOrg == "" {
+				die(fmt.Errorf("DRIVE9_SHARED_POOL_ORG is required when DRIVE9_SHARED_POOL_DSN is set (set an explicit org id; use '*' only to intentionally place ALL new tenants on the shared pool)"))
+			}
+			if err := registerSharedPoolFromEnv(context.Background(), store, pool, sharedDSN, sharedOrg); err != nil {
+				die(fmt.Errorf("register shared pool: %w", err))
+			}
+			if sharedOrg == meta.SharedDBOrgWildcard {
+				logger.Warn(context.Background(), "shared_pool_wildcard_all_new_tenants",
+					zap.String("warning", "ALL new tenants will be provisioned onto the shared pool"))
+			}
+			logger.Info(context.Background(), "shared_pool_registered",
+				zap.String("org", sharedOrg))
+		}
+
 		// The mutation replay and expiry sweep workers are owned by the server
 		// (started/stopped in its leader-gated startLeaderWorkers/stopLeaderWorkers),
 		// so they follow leadership transitions alongside the other leader-gated
@@ -443,6 +466,50 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// registerSharedPoolFromEnv initializes the shared schema on the database at
+// dsn and upserts it into db_pool with the given org binding. The DSN carries
+// a plaintext password (local/dev convenience); it is encrypted with the
+// pool's encryptor before persistence, like tenant DB passwords.
+func registerSharedPoolFromEnv(ctx context.Context, metaStore *meta.Store, pool *tenant.Pool, dsn, orgID string) error {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return fmt.Errorf("parse DRIVE9_SHARED_POOL_DSN: %w", err)
+	}
+	if err := schema.InitSharedSchema(ctx, dsn); err != nil {
+		return fmt.Errorf("init shared schema: %w", err)
+	}
+	passCipher, err := pool.Encrypt(ctx, []byte(cfg.Passwd))
+	if err != nil {
+		return fmt.Errorf("encrypt shared db password: %w", err)
+	}
+	host, portStr, err := net.SplitHostPort(cfg.Addr)
+	if err != nil {
+		return fmt.Errorf("parse DRIVE9_SHARED_POOL_DSN address %q: %w", cfg.Addr, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("parse DRIVE9_SHARED_POOL_DSN port %q: %w", portStr, err)
+	}
+	// Persist the driver TLS mode verbatim ("true", "skip-verify", a custom
+	// registered config name; "" for plaintext) so the runtime handle reopens
+	// the DB with exactly the mode the schema init DSN used.
+	tlsMode := cfg.TLSConfig
+	if tlsMode == "false" {
+		tlsMode = ""
+	}
+	_, err = metaStore.RegisterSharedDB(ctx, &meta.SharedDB{
+		OrgID:          orgID,
+		Role:           meta.SharedDBRoleShared,
+		Host:           host,
+		Port:           port,
+		User:           cfg.User,
+		PasswordCipher: passCipher,
+		Name:           cfg.DBName,
+		TLSMode:        tlsMode,
+	})
+	return err
+}
+
 func slockOAuthFromEnv() (*slockoauth.Client, error) {
 	origin := strings.TrimSpace(os.Getenv("DRIVE9_SLOCK_ORIGIN"))
 	if origin == "" {
@@ -538,6 +605,10 @@ environment:
   DRIVE9_USER_DB_MAX_IDLE_CONNS max idle connections for each cached tenant user DB pool (default: 2)
   DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS max open connections for tenant schema-init DB pools (default: 8)
   DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS max idle connections for tenant schema-init DB pools (default: 2)
+  DRIVE9_SHARED_POOL_DSN register a shared-schema DB at startup and place matching tenants on it (empty = disabled)
+  DRIVE9_SHARED_POOL_ORG TiDB Cloud org the shared pool serves (required when DSN is set; '*' = all orgs, loud warn)
+  DRIVE9_SHARED_DB_MAX_OPEN_CONNS max open connections for each shared-schema DB handle (default: 50)
+  DRIVE9_SHARED_DB_MAX_IDLE_CONNS max idle connections for each shared-schema DB handle (default: 10)
   DRIVE9_DB_HEALTH_PROBE_INTERVAL_SECONDS DB health probe interval seconds (default: 15)
   DRIVE9_DB_HEALTH_PROBE_TIMEOUT_SECONDS DB health probe timeout seconds (default: 3)
   DRIVE9_DB_HEALTH_PROBE_META_ENABLED true|false to probe the control-plane DB (default: true)

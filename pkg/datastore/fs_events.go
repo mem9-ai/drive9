@@ -21,8 +21,8 @@ type FSEventRow struct {
 // INSERT — wrapping it in BEGIN/COMMIT adds 2 unnecessary RTTs per event.
 func (s *Store) InsertFSEvent(ctx context.Context, path, op, actor string, ts int64) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO fs_events (path, op, actor, ts) VALUES (?, ?, ?, ?)`,
-		path, op, actor, ts)
+		`INSERT INTO fs_events (`+s.scope.InsCols(`path, op, actor, ts`)+`) VALUES (`+s.scope.InsVals(`?, ?, ?, ?`)+`)`,
+		s.scope.Args(path, op, actor, ts)...)
 	if err != nil {
 		return 0, fmt.Errorf("insert fs_event: %w", err)
 	}
@@ -34,13 +34,18 @@ func (s *Store) InsertFSEvent(ctx context.Context, path, op, actor string, ts in
 }
 
 // ListFSEventsSince returns events with seq > since, ordered by seq, up to limit.
+//
+// In shared shape seq stays a table-global AUTO_INCREMENT, so interleaved
+// tenants produce holes in each tenant's per-fs_id seq stream. Consumers must
+// tolerate the gaps; the SSE gap/reset handling for that lives in pkg/server
+// eventbus and is a separate change.
 func (s *Store) ListFSEventsSince(ctx context.Context, since int64, limit int) ([]FSEventRow, error) {
 	if limit <= 0 {
 		limit = 1000
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT seq, path, op, actor, ts FROM fs_events WHERE seq > ? ORDER BY seq LIMIT ?`,
-		since, limit)
+		`SELECT seq, path, op, actor, ts FROM fs_events WHERE `+s.scope.And(`seq > ?`)+` ORDER BY seq LIMIT ?`,
+		s.scope.Args(since, limit)...)
 	if err != nil {
 		return nil, fmt.Errorf("list fs_events since %d: %w", since, err)
 	}
@@ -60,8 +65,14 @@ func (s *Store) ListFSEventsSince(ctx context.Context, since int64, limit int) (
 
 // LatestFSEventSeq returns the current max seq in fs_events, or 0 if empty.
 func (s *Store) LatestFSEventSeq(ctx context.Context) (int64, error) {
+	q := `SELECT MAX(seq) FROM fs_events`
+	var args []any
+	if s.scope.Shared() {
+		q += ` WHERE fs_id = ?`
+		args = s.scope.Args()
+	}
 	var seq sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT MAX(seq) FROM fs_events`).Scan(&seq); err != nil {
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&seq); err != nil {
 		return 0, fmt.Errorf("latest fs_event seq: %w", err)
 	}
 	if !seq.Valid {
@@ -72,8 +83,14 @@ func (s *Store) LatestFSEventSeq(ctx context.Context) (int64, error) {
 
 // OldestFSEventSeq returns the current min seq in fs_events, or 0 if empty.
 func (s *Store) OldestFSEventSeq(ctx context.Context) (int64, error) {
+	q := `SELECT MIN(seq) FROM fs_events`
+	var args []any
+	if s.scope.Shared() {
+		q += ` WHERE fs_id = ?`
+		args = s.scope.Args()
+	}
 	var seq sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT MIN(seq) FROM fs_events`).Scan(&seq); err != nil {
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&seq); err != nil {
 		return 0, fmt.Errorf("oldest fs_event seq: %w", err)
 	}
 	if !seq.Valid {
@@ -94,8 +111,14 @@ func (s *Store) OldestFSEventSeq(ctx context.Context) (int64, error) {
 // `WHERE created_at > NOW() - INTERVAL 2 HOUR`) or an approximate count from
 // information_schema.TABLES.
 func (s *Store) CountFSEvents(ctx context.Context) (int64, error) {
+	q := `SELECT COUNT(*) FROM fs_events`
+	var args []any
+	if s.scope.Shared() {
+		q += ` WHERE fs_id = ?`
+		args = s.scope.Args()
+	}
 	var count int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM fs_events`).Scan(&count); err != nil {
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count fs_events: %w", err)
 	}
 	return count, nil
@@ -109,7 +132,7 @@ func (s *Store) CountFSEvents(ctx context.Context) (int64, error) {
 // ts-based deletion path would be needed. For now, created_at is indexed and
 // sufficient because the SSE protocol uses seq (not ts) for cursor management.
 func (s *Store) DeleteFSEventsBefore(ctx context.Context, before time.Time) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM fs_events WHERE created_at < ?`, before)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM fs_events WHERE `+s.scope.And(`created_at < ?`), s.scope.Args(before)...)
 	if err != nil {
 		return 0, fmt.Errorf("delete fs_events before %s: %w", before, err)
 	}

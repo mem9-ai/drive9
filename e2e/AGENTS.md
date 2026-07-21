@@ -529,6 +529,36 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 17. Delete main tenant via `drive9 delete` and verify removal (401/403/404 on `GET /v1/status`)
 18. Trap-based cleanup: attempts to delete both admin and main tenants on script failure unless `SKIP_CLEANUP=1`
 
+### `shared-mode-smoke-test.sh`
+
+Shared-schema (fs_id) mode end-to-end smoke against real engines: a MySQL
+container for the meta DB and a TiDB (`pingcap/tidb:v8.5.6`) container holding
+both the shared DB and a standalone tenant DB, then boots `drive9-server`
+with `DRIVE9_SHARED_POOL_DSN` registered as a wildcard shared pool.
+
+1. Two tenants provision — both placed on the shared DB and `active` immediately (no cluster creation)
+2. File CRUD + mkdir + directory listing on tenant A
+3. Cross-tenant isolation: same path under tenant B holds different content; B cannot read A's nested file
+4. Raw SQL on TiDB: rows share tables with distinct `fs_id`s; `file_nodes` is `TIDB_PK_TYPE=CLUSTERED`; no `llm_usage` table
+5. SSE `/v1/events` stream delivers initial reset + file event on a shared tenant
+6. Multipart upload (v2 initiate/parts/complete) on a shared tenant, served via redirect
+7. `POST /v1/fork` on a shared tenant is rejected (409)
+8. Standalone tenant coexistence (registered directly via `e2e/harness/standalone-tenant` with `-skip-ensure`): standalone CRUD, no `fs_id` column in its tables, no row leakage either direction
+9. Server restart persistence: both shared and standalone backends keep working
+10. `DELETE /v1/tenant` on A: shared rows purged (`file_nodes`/`inodes` empty for A's fs_id), A's key revoked (401/403), B and standalone fully intact
+
+Knobs: `META_DSN` / `SHARED_DSN` / `STANDALONE_DSN` (skip the containers),
+`KEEP_DB=1`, `DRIVE9_SHARED_E2E_DB_RUNTIME`, `DRIVE9_SHARED_E2E_MYSQL_IMAGE`,
+`DRIVE9_SHARED_E2E_TIDB_IMAGE`, `DRIVE9_SHARED_E2E_DB_PASSWORD`.
+
+### `harness/standalone-tenant`
+
+Go helper that registers a pre-existing standalone tenant directly in the meta
+DB (tenant row + owner API key), bypassing cluster provisioning. `-skip-ensure`
+initializes the standalone DB with the base (no FTS/vector) schema and stamps
+`tenants.schema_version` so the Acquire-time ensure is skipped — required for
+engines without FTS/vector support such as self-hosted TiDB.
+
 ## Environment variables
 
 | Variable | Default | Used by |

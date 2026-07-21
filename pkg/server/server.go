@@ -165,7 +165,7 @@ func (s *Server) provisionerForTenantProvider(provider string) tenant.Provisione
 	switch provider {
 	case tenant.ProviderTiDBCloudStarterLegacy:
 		return s.legacyStarterProvisioner
-	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBZero, tenant.ProviderDB9:
+	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBZero, tenant.ProviderDB9, tenant.ProviderTiDBCloudNativeShared:
 		return s.provisioner
 	default:
 		return nil
@@ -807,6 +807,16 @@ func (s *Server) startLeaderWorkers() {
 	if s.meta != nil {
 		s.replayWorker = backend.StartMutationReplayWorker(tenant.NewMetaQuotaAdapter(s.meta))
 		s.expirySweepWorker = backend.StartExpirySweepWorker(s.meta)
+		// One-time fs_registry backfill so pre-existing tenants hold a stable
+		// internal fs_id before the routing layer needs it. Idempotent.
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			inserted, err := s.meta.BackfillFsRegistry(workerCtx)
+			if err != nil {
+				logger.Error(workerCtx, "server_event", eventFields(workerCtx, "fs_registry_backfill_failed", "error", err)...)
+				return
+			}
+			logger.Info(workerCtx, "server_event", eventFields(workerCtx, "fs_registry_backfill_done", "inserted", inserted)...)
+		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			ticker := time.NewTicker(tenantCountMetricsInterval)
 			defer ticker.Stop()
@@ -4454,7 +4464,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	if provider == tenant.ProviderTiDBCloudNative && credentialReq != nil {
 		poolClaimStarted := time.Now()
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_started", "provider", provider, "quota_requested", quotaReq != nil)...)
-		if res, pool, claimed, err := s.claimAdminTenantFromPool(r.Context(), *credentialReq, quotaReq); err != nil {
+		if res, pool, claimed, _, err := s.claimAdminTenantFromPool(r.Context(), *credentialReq, quotaReq); err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_failed", "provider", provider, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", provisionTenantPoolClaimMetricResult(err))
 			status, msg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", err)
@@ -5011,6 +5021,126 @@ func (s *Server) updateTenantSchemaVersionForProfile(ctx context.Context, tenant
 	return nil
 }
 
+// findSharedDBForProvision resolves whether the tenant being provisioned
+// should be placed on a shared-schema database: a registered shared pool for
+// the request's org, or the wildcard pool. It returns (nil, nil) when the
+// tenant should follow the normal per-tenant provisioning path. Lookup
+// failures are returned as errors — never silently treated as "no pool",
+// which would provision the wrong tenant shape on a transient meta outage.
+//
+// Only TiDB-dialect providers may route to a shared pool (the shared schema
+// is TiDB/MySQL DDL): db9 tenants are PostgreSQL-backed and engine-
+// incompatible, so a wildcard pool must never capture them.
+func (s *Server) findSharedDBForProvision(ctx context.Context, provider string, opts provisionTenantOptions) (*meta.SharedDB, error) {
+	if s.meta == nil {
+		return nil, nil
+	}
+	switch provider {
+	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBCloudNativeShared, tenant.ProviderTiDBZero:
+	default:
+		return nil, nil
+	}
+	orgID := ""
+	if provider == tenant.ProviderTiDBCloudNative || provider == tenant.ProviderTiDBCloudNativeShared {
+		if opts.CredentialProvisioner != nil {
+			if id, err := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner); err == nil {
+				orgID = id
+			} else {
+				logger.Warn(ctx, "server_event", eventFields(ctx, "provision_org_resolve_failed", "error", err)...)
+			}
+		}
+		if orgID == "" {
+			if provider == tenant.ProviderTiDBCloudNativeShared {
+				// An explicit shared placement request must fail closed: an
+				// unresolvable org can never silently become a dedicated
+				// cluster (nor match the wildcard pool).
+				return nil, fmt.Errorf("cannot resolve tidbcloud organization for shared-pool placement")
+			}
+			// Never fall back to the wildcard pool when the tenant's org cannot
+			// be resolved: an unresolved org must stay on the dedicated path
+			// even if a wildcard pool exists.
+			return nil, nil
+		}
+	}
+	sharedDB, err := s.meta.FindSharedDBForOrg(ctx, orgID)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			if provider == tenant.ProviderTiDBCloudNativeShared {
+				return nil, fmt.Errorf("no shared-schema pool registered for org %q", orgID)
+			}
+			return nil, nil
+		}
+		return nil, fmt.Errorf("resolve shared-schema pool for org %q: %w", orgID, err)
+	}
+	return sharedDB, nil
+}
+
+// provisionTenantOnSharedDB completes provisioning for a tenant placed on a
+// shared-schema database: no cluster is created and the schema already exists
+// there. After the idempotent identity/profile steps, every state-changing
+// meta write — the capacity reservation and placement, the provider re-label
+// (tidb_cloud_native_shared, so provider-driven capability checks classify
+// the tenant correctly), the active-status transition, and the owner key —
+// commits in ONE meta transaction (CompleteSharedTenantProvision). A failed
+// provision therefore leaves no partial state: no active shared tenant
+// without a placement row, no capacity leak, no orphaned key.
+func (s *Server) provisionTenantOnSharedDB(ctx context.Context, tenantID string, sharedDB *meta.SharedDB, provider, keyName string, opts provisionTenantOptions, now time.Time) (*provisionTenantResult, error) {
+	fail := func(err error) (*provisionTenantResult, error) {
+		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+		}
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to place tenant on shared pool", err)
+	}
+	// Create-time spending limits are per-cluster in the shared world and are
+	// managed on the shared DB itself, not per tenant.
+	if opts.Quota != nil && opts.Quota.TiDBCloudSpendingLimit != nil {
+		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+		return nil, newProvisionTenantError(http.StatusBadRequest, "tidbcloud spending limit is not supported for shared-pool tenants", fmt.Errorf("spending limit requested for shared-pool tenant"))
+	}
+	fsID, err := s.meta.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		return fail(err)
+	}
+	// Forces the fts_only embedding profile (shared tables carry plain VECTOR
+	// columns — per-tenant EMBED_TEXT generated columns are impossible).
+	if err := s.meta.UpsertTenantAutoEmbeddingProfile(ctx, &meta.TenantAutoEmbeddingProfile{
+		TenantID:      tenantID,
+		EmbeddingMode: meta.TenantEmbeddingModeFTSOnly,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		return fail(err)
+	}
+	// Token generation and encryption are pure computation — build the key
+	// material first so its insert can join the atomic transition.
+	apiToken, apiKeyID, keyRec, err := s.buildOwnerAPIKey(ctx, tenantID, keyName, opts.TokenVersion, opts.APIKeySource)
+	if err != nil {
+		return fail(err)
+	}
+	if err := s.meta.CompleteSharedTenantProvision(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared, &meta.TenantPlacement{
+		FsID:        fsID,
+		DbID:        sharedDB.DbID,
+		Placement:   meta.PlacementShared,
+		SchemaShape: meta.SchemaShapeShared,
+	}, keyRec); err != nil {
+		if errors.Is(err, meta.ErrSharedDBCapacityExhausted) {
+			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			return nil, newProvisionTenantError(http.StatusConflict, "shared pool is at capacity", err)
+		}
+		return fail(err)
+	}
+	metricEvent(ctx, "metadb_query", "api", "insert_api_key", "result", "ok")
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_shared_pool_placed", "tenant_id", tenantID, "provider", tenant.ProviderTiDBCloudNativeShared, "db_id", sharedDB.DbID, "org_id", sharedDB.OrgID)...)
+	metricEvent(ctx, "tenant_provision", "provider", tenant.ProviderTiDBCloudNativeShared, "result", "shared_pool")
+	return &provisionTenantResult{
+		TenantID: tenantID,
+		APIKey:   apiToken,
+		APIKeyID: apiKeyID,
+		Status:   meta.TenantActive,
+		Provider: tenant.ProviderTiDBCloudNativeShared,
+	}, nil
+}
+
 func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOptions) (*provisionTenantResult, error) {
 	rawProvider := s.provisioner.ProviderType()
 	provider, err := tenant.NormalizeProvider(rawProvider)
@@ -5066,6 +5196,22 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "ok")
 	logProvisionStage(ctx, "provision_tenant_inserted", tenantID, provider, stageStarted, "status", meta.TenantPending)
+
+	// Shared-pool placement: when a shared-schema database is registered for
+	// this tenant's org (or a wildcard pool exists), the tenant is placed on
+	// it directly — no cluster is created and the schema already exists there.
+	sharedDB, err := s.findSharedDBForProvision(ctx, provider, opts)
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_shared_pool_resolve_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+		}
+		return nil, newProvisionTenantError(http.StatusBadGateway, "failed to resolve shared-schema pool", err)
+	}
+	if sharedDB != nil {
+		return s.provisionTenantOnSharedDB(ctx, tenantID, sharedDB, provider, keyName, opts, now)
+	}
 
 	if autoProfile != nil {
 		stageStarted = time.Now()
@@ -5353,24 +5499,27 @@ func (s *Server) startProvisionedTenantSchemaInit(ctx context.Context, res *prov
 	})
 }
 
-func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string, tokenVersion int, source apiKeyIssueSource) (rawToken, apiKeyID string, err error) {
+// buildOwnerAPIKey generates the owner token and encrypts it, returning the
+// API key record ready for persistence. It performs no writes, so callers
+// can fold the insert into a larger transaction.
+func (s *Server) buildOwnerAPIKey(ctx context.Context, tenantID, keyName string, tokenVersion int, source apiKeyIssueSource) (rawToken, apiKeyID string, rec *meta.APIKey, err error) {
 	if tokenVersion <= 0 {
 		tokenVersion, err = newScopedTokenVersion()
 		if err != nil {
-			return "", "", err
+			return "", "", nil, err
 		}
 	}
 	rawToken, err = token.IssueTokenWithJournalPermissions(s.tokenSecret, tenantID, tokenVersion, time.Time{}, ownerJournalPermissionList())
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 	cipherToken, err := s.pool.Encrypt(ctx, []byte(rawToken))
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 	now := time.Now().UTC()
 	apiKeyID = token.NewID()
-	if err := s.meta.InsertAPIKey(ctx, &meta.APIKey{
+	return rawToken, apiKeyID, &meta.APIKey{
 		ID:                   apiKeyID,
 		TenantID:             tenantID,
 		KeyName:              keyName,
@@ -5385,7 +5534,15 @@ func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string,
 		IssuedAt:             now,
 		CreatedAt:            now,
 		UpdatedAt:            now,
-	}); err != nil {
+	}, nil
+}
+
+func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string, tokenVersion int, source apiKeyIssueSource) (rawToken, apiKeyID string, err error) {
+	rawToken, apiKeyID, rec, err := s.buildOwnerAPIKey(ctx, tenantID, keyName, tokenVersion, source)
+	if err != nil {
+		return "", "", err
+	}
+	if err := s.meta.InsertAPIKey(ctx, rec); err != nil {
 		return "", "", err
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_api_key", "result", "ok")

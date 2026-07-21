@@ -3023,7 +3023,9 @@ func isUniqueIndexRepairSQL(sqlText string) bool {
 func isFulltextOrVectorIndexRepairSQL(sqlText string) bool {
 	normalized := normalizeSQLFragment(sqlText)
 	return strings.Contains(normalized, " add fulltext index ") ||
-		strings.Contains(normalized, " add vector index ")
+		strings.Contains(normalized, " add vector index ") ||
+		strings.HasPrefix(normalized, "create fulltext index ") ||
+		strings.HasPrefix(normalized, "create vector index ")
 }
 
 func parseUniqueIndexRepairStatement(stmt string) (tidbUniqueIndexRepair, bool) {

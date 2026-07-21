@@ -20,6 +20,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/migrate"
+	"github.com/mem9-ai/drive9/pkg/mysqlutil"
 	"github.com/mem9-ai/drive9/pkg/s3client"
 	"github.com/mem9-ai/drive9/pkg/semantic"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
@@ -147,6 +148,12 @@ type Pool struct {
 	reapInterval  time.Duration
 	reapStop      context.CancelFunc
 	reapWG        sync.WaitGroup
+	// sharedDBs caches one *sql.DB handle per shared-schema database (keyed by
+	// db_pool.db_id). All tenants placed on the same shared DB share its
+	// handle; each Acquire still gets its own Store (carrying that tenant's
+	// fs_id scope) over the shared handle.
+	sharedMu  sync.Mutex
+	sharedDBs map[int64]*sql.DB
 }
 
 type tenantAutoEmbeddingProfile struct {
@@ -225,11 +232,12 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 	metrics.RecordGauge("tenant_pool", "cached_backends", 0)
 	metrics.RecordGauge("tenant_pool", "max_backends", float64(max))
 	return &Pool{
-		cfg:     cfg,
-		enc:     enc,
-		items:   map[string]*entry{},
-		order:   list.New(),
-		maxSize: max,
+		cfg:       cfg,
+		enc:       enc,
+		items:     map[string]*entry{},
+		order:     list.New(),
+		maxSize:   max,
+		sharedDBs: map[int64]*sql.DB{},
 		// No LeaderChecker means single-pod mode: FileGC runs unconditionally.
 		fileGCEnabled: cfg.LeaderChecker == nil,
 		idleTimeout:   idleTimeout,
@@ -728,6 +736,14 @@ func (p *Pool) Close() {
 	for _, retired := range toClose {
 		closeEntry(retired)
 	}
+	p.sharedMu.Lock()
+	for dbID, db := range p.sharedDBs {
+		if err := mysqlutil.CloseInstrumented(db); err != nil {
+			logger.Warn(context.Background(), "shared_db_close_failed", zap.Int64("db_id", dbID), zap.Error(err))
+		}
+		delete(p.sharedDBs, dbID)
+	}
+	p.sharedMu.Unlock()
 }
 
 func (p *Pool) S3Backend(tenantID string) *backend.Dat9Backend {
@@ -806,6 +822,21 @@ func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantI
 	return b
 }
 
+// fsIDForTenant resolves the tenant's internal fs_id from the meta DB,
+// allocating one on first use. Returns (0, nil) when the pool has no meta
+// store (tests, non-multi-tenant mode); the standalone SQL shape never emits
+// fs_id, so 0 is inert there.
+func (p *Pool) fsIDForTenant(ctx context.Context, t *meta.Tenant) (int64, error) {
+	if p.metaStore == nil || t == nil || t.ID == "" {
+		return 0, nil
+	}
+	fsID, err := p.metaStore.EnsureFsID(ctx, t.ID)
+	if err != nil {
+		return 0, fmt.Errorf("ensure fs_id for tenant %s: %w", t.ID, err)
+	}
+	return fsID, nil
+}
+
 func (p *Pool) tenantMetricTiDBCloudOrgID(ctx context.Context, t *meta.Tenant) string {
 	if t == nil || strings.TrimSpace(t.ID) == "" || t.Provider != ProviderTiDBCloudNative {
 		return defaultTenantMetricTiDBCloudOrgID
@@ -832,15 +863,73 @@ func (p *Pool) tenantMetricTiDBCloudOrgID(ctx context.Context, t *meta.Tenant) s
 	return orgID
 }
 
+// placementForTenant returns the tenant's placement row, or (nil, nil) when
+// the tenant has none — which is the normal case for every standalone tenant
+// today. Placement lookup errors are fatal to the cold open: silently falling
+// back to standalone could route a shared tenant with the wrong schema shape.
+func (p *Pool) placementForTenant(ctx context.Context, fsID int64) (*meta.TenantPlacement, error) {
+	if p.metaStore == nil || fsID <= 0 {
+		return nil, nil
+	}
+	placement, err := p.metaStore.GetTenantPlacement(ctx, fsID)
+	if errors.Is(err, meta.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resolve tenant placement for fs_id %d: %w", fsID, err)
+	}
+	return placement, nil
+}
+
+// sharedDBHandle returns the cached *sql.DB for a shared-schema database
+// (db_pool.db_id), opening it on first use. Handles live for the process
+// lifetime and are closed by Close.
+func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) {
+	p.sharedMu.Lock()
+	defer p.sharedMu.Unlock()
+	if db, ok := p.sharedDBs[dbID]; ok {
+		return db, nil
+	}
+	if p.metaStore == nil {
+		return nil, fmt.Errorf("shared db %d: no meta store", dbID)
+	}
+	info, err := p.metaStore.GetSharedDB(ctx, dbID)
+	if err != nil {
+		return nil, fmt.Errorf("shared db %d: %w", dbID, err)
+	}
+	pass, err := p.enc.Decrypt(ctx, info.PasswordCipher)
+	if err != nil {
+		return nil, fmt.Errorf("shared db %d: decrypt password: %w", dbID, err)
+	}
+	query := "parseTime=true"
+	if info.TLSMode != "" {
+		query += "&tls=" + info.TLSMode
+	}
+	// An empty TLSMode means a plain connection (local/self-hosted databases);
+	// shared DBs on TiDB Cloud are registered with tls=skip-verify or tls=true.
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", info.User, string(pass), info.Host, info.Port, info.Name, query)
+	db, err := mysqlutil.OpenInstrumentedForTenant(ctx, dsn, mysqlutil.RoleShared, fmt.Sprintf("shared:%d", dbID))
+	if err != nil {
+		return nil, fmt.Errorf("shared db %d: open: %w", dbID, err)
+	}
+	p.sharedDBs[dbID] = db
+	return db, nil
+}
+
+// PurgeSharedTenant deletes all rows belonging to fsID from the shared DB it
+// is placed on, in bounded batches. It runs after the tenant's pool entry has
+// been drained, so no backend is concurrently writing through the same scope.
+func (p *Pool) PurgeSharedTenant(ctx context.Context, fsID, dbID int64) error {
+	handle, err := p.sharedDBHandle(ctx, dbID)
+	if err != nil {
+		return err
+	}
+	return datastore.NewStoreWithDB(handle, datastore.SharedScope(fsID)).PurgeTenantData(ctx)
+}
+
 func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9Backend, *datastore.Store, string, error) {
 	start := time.Now()
 	tidbCloudOrgID := p.tenantMetricTiDBCloudOrgID(ctx, t)
-	decryptStart := time.Now()
-	pass, err := p.enc.Decrypt(ctx, t.DBPasswordCipher)
-	if err != nil {
-		return nil, nil, tidbCloudOrgID, fmt.Errorf("decrypt db password: %w", err)
-	}
-	decryptDurationMs := float64(time.Since(decryptStart).Microseconds()) / 1000.0
 	opts := p.cfg.BackendOptions
 	resolvedEncryptionPolicy, err := meta.ResolveS3EncryptionPolicy(p.cfg.S3EncryptionPolicy, t.S3EncryptionPolicy())
 	if err != nil {
@@ -849,22 +938,69 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	opts.TenantID = t.ID
 	opts.TiDBCloudOrgID = tidbCloudOrgID
 	opts.S3EncryptionPolicy = resolvedEncryptionPolicy
-	query := "parseTime=true"
-	if t.DBTLS {
-		query += "&tls=true"
-	} else if t.Provider == ProviderTiDBCloudNative {
-		query += "&tls=skip-verify"
-	}
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
-	openStoreStart := time.Now()
-	store, err := datastore.OpenForTenantWithOrg(ctx, dsn, t.ID, tidbCloudOrgID)
+
+	fsID, err := p.fsIDForTenant(ctx, t)
 	if err != nil {
-		return nil, nil, tidbCloudOrgID, fmt.Errorf("open datastore: %w", err)
+		return nil, nil, tidbCloudOrgID, err
+	}
+	placement, err := p.placementForTenant(ctx, fsID)
+	if err != nil {
+		return nil, nil, tidbCloudOrgID, err
+	}
+	sharedTenant := placement != nil && placement.SchemaShape == meta.SchemaShapeShared
+	if IsSharedSchemaProvider(t.Provider) && !sharedTenant {
+		// The persisted provider says shared but the placement row is gone.
+		// Opening a standalone store against the (connectionless) tenant row
+		// would fail with a confusing empty-host DSN error — and if the row
+		// still had coordinates it could even serve the wrong schema shape.
+		// This happens only mid-delete (placement is removed before final
+		// cleanup), so fail fast with a clear message instead.
+		return nil, nil, tidbCloudOrgID, fmt.Errorf("tenant %s is shared-schema but has no placement row", t.ID)
+	}
+
+	decryptDurationMs := 0.0
+	openStoreStart := time.Now()
+	var store *datastore.Store
+	if sharedTenant {
+		// Shared-schema tenant: connect through the shared DB handle and skip
+		// the per-tenant DSN/decrypt entirely — the tenant row carries no
+		// connection coordinates for shared placements.
+		handle, err := p.sharedDBHandle(ctx, placement.DbID)
+		if err != nil {
+			return nil, nil, tidbCloudOrgID, err
+		}
+		store = datastore.NewStoreWithDB(handle, datastore.SharedScope(fsID))
+	} else {
+		decryptStart := time.Now()
+		pass, err := p.enc.Decrypt(ctx, t.DBPasswordCipher)
+		if err != nil {
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("decrypt db password: %w", err)
+		}
+		decryptDurationMs = float64(time.Since(decryptStart).Microseconds()) / 1000.0
+		query := "parseTime=true"
+		if t.DBTLS {
+			query += "&tls=true"
+		} else if t.Provider == ProviderTiDBCloudNative {
+			query += "&tls=skip-verify"
+		}
+		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
+		store, err = datastore.OpenForTenantScoped(ctx, dsn, t.ID, tidbCloudOrgID, datastore.StandaloneScope(fsID))
+		if err != nil {
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("open datastore: %w", err)
+		}
 	}
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
 	ensureSchemaDurationMs := 0.0
 	migrateDurationMs := 0.0
-	if UsesTiDBAutoEmbedding(t.Provider) {
+	if sharedTenant {
+		// Shared schema has no generated columns, so database auto-embedding
+		// is unavailable; schema is managed per physical DB, not per tenant,
+		// so the Acquire-time ensure below is skipped entirely.
+		opts.DatabaseAutoEmbedding = false
+		opts.AppSemanticTasksEnabled = false
+		opts.AsyncImageExtract = backend.AsyncImageExtractOptions{}
+		opts.AsyncAudioExtract = backend.AsyncAudioExtractOptions{}
+	} else if UsesTiDBAutoEmbedding(t.Provider) {
 		autoEmbeddingProfile, err := p.autoEmbeddingProfileForTenant(ctx, t)
 		if err != nil {
 			_ = store.Close()

@@ -548,6 +548,55 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_tenant_namespace (storage_namespace_id, kind, status),
 			INDEX idx_tenant_parent (parent_tenant_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS fs_registry (
+			fs_id      BIGINT AUTO_INCREMENT PRIMARY KEY,
+			tenant_id  VARCHAR(64) NOT NULL UNIQUE,
+			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+		)`,
+		// db_pool is the fleet-wide registry of physical databases available
+		// for tenant placement under the shared-schema layout. org_id scopes a
+		// database to a TiDB Cloud organization; the '*' wildcard row serves
+		// organizations without an exact entry. db_password holds the same
+		// encrypted envelope as tenants.db_password. tenant_count is maintained
+		// atomically with placement writes via ReserveSharedDBPlacement and
+		// DeleteTenantPlacementAndDecrCount.
+		// The `role` column name is backtick-quoted because ROLE is a reserved
+		// word in MySQL 8.0.
+		`CREATE TABLE IF NOT EXISTS db_pool (
+			db_id        BIGINT AUTO_INCREMENT PRIMARY KEY,
+			org_id       VARCHAR(64) NOT NULL DEFAULT '',
+			` + "`role`" + `       VARCHAR(20) NOT NULL,
+			db_host      VARCHAR(255) NOT NULL,
+			db_port      INT NOT NULL,
+			db_user      VARCHAR(255) NOT NULL,
+			db_password  VARBINARY(2048) NOT NULL,
+			db_name      VARCHAR(255) NOT NULL,
+			db_tls       VARCHAR(32) NOT NULL DEFAULT '',
+			max_tenants  INT NOT NULL DEFAULT 0,
+			tenant_count INT NOT NULL DEFAULT 0,
+			status       VARCHAR(20) NOT NULL DEFAULT 'active',
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			UNIQUE INDEX uk_db_pool_endpoint (org_id, db_host, db_name),
+			INDEX idx_db_pool_org (org_id, status)
+		)`,
+		// tenant_placements records which physical database (db_pool row) hosts
+		// each filesystem (fs_registry row). A missing row means the tenant
+		// still lives on its legacy standalone database. epoch is reserved for
+		// optimistic concurrency during future migrations; it stays 1 unless a
+		// migration explicitly bumps it.
+		`CREATE TABLE IF NOT EXISTS tenant_placements (
+			fs_id        BIGINT PRIMARY KEY,
+			db_id        BIGINT NOT NULL,
+			placement    VARCHAR(20) NOT NULL,
+			schema_shape VARCHAR(20) NOT NULL,
+			status       VARCHAR(20) NOT NULL DEFAULT 'active',
+			target_db_id BIGINT NULL,
+			epoch        BIGINT NOT NULL DEFAULT 1,
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			INDEX idx_placement_db (db_id, status)
+		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_auto_embedding_profiles (
 			tenant_id      VARCHAR(64) PRIMARY KEY,
 			embedding_mode VARCHAR(32) NULL,
@@ -1466,20 +1515,35 @@ func schemaSnippet(stmt string) string {
 func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "insert_tenant", start, &err)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO tenants
-		(id, status, kind, parent_tenant_id, storage_namespace_id, db_host, db_port, db_user, db_password, db_name, db_tls,
-		 provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
-		 s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Status, tenantKindForInsert(t), t.ParentTenantID, t.StorageNamespaceID,
-		t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
-		t.Provider, nullStr(t.ClusterID), t.BranchID, nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
-		tenantS3EncryptionModeForInsert(t), t.S3KMSKeyID, boolToInt(tenantS3BucketKeyEnabledForInsert(t)),
-		t.CreatedAt.UTC(), t.UpdatedAt.UTC())
-	if isDuplicateEntry(err) {
-		return ErrDuplicate
-	}
-	return err
+	// Retry the whole tx on lock conflicts: concurrent cold Acquires allocate
+	// fs_ids through EnsureFsID, and the two-table write below (tenants +
+	// fs_registry) can deadlock with them on the unique index of
+	// fs_registry.tenant_id. The deadlock victim retries cleanly.
+	return withMetaLockConflictRetry(ctx, "insert_tenant", func() error {
+		return s.InTx(ctx, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `INSERT INTO tenants
+			(id, status, kind, parent_tenant_id, storage_namespace_id, db_host, db_port, db_user, db_password, db_name, db_tls,
+			 provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
+			 s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				t.ID, t.Status, tenantKindForInsert(t), t.ParentTenantID, t.StorageNamespaceID,
+				t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
+				t.Provider, nullStr(t.ClusterID), t.BranchID, nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
+				tenantS3EncryptionModeForInsert(t), t.S3KMSKeyID, boolToInt(tenantS3BucketKeyEnabledForInsert(t)),
+				t.CreatedAt.UTC(), t.UpdatedAt.UTC())
+			if isDuplicateEntry(err) {
+				return ErrDuplicate
+			}
+			if err != nil {
+				return err
+			}
+			// Every tenant gets a stable internal fs_id at creation time (see
+			// fs_registry). INSERT IGNORE keeps this idempotent for tenants that
+			// were pre-registered by BackfillFsRegistry.
+			_, err = tx.ExecContext(ctx, `INSERT IGNORE INTO fs_registry (tenant_id) VALUES (?)`, t.ID)
+			return err
+		})
+	})
 }
 
 func (s *Store) UpsertTenantAutoEmbeddingProfile(ctx context.Context, p *TenantAutoEmbeddingProfile) (err error) {
@@ -2892,6 +2956,25 @@ func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status Tenant
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_status", start, &err)
 	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`, status, time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateTenantProvider rewrites a tenant's persisted provider. It exists for
+// the shared-pool placement path, where the tenant row is inserted with the
+// request provider (e.g. tidb_cloud_native) and must be re-labeled as
+// tidb_cloud_native_shared once placement on a shared-schema DB is decided,
+// so provider-driven capability checks classify the tenant correctly.
+func (s *Store) UpdateTenantProvider(ctx context.Context, id, provider string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_provider", start, &err)
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET provider = ?, updated_at = ? WHERE id = ?`, provider, time.Now().UTC(), id)
 	if err != nil {
 		return err
 	}

@@ -314,6 +314,12 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	if source.Status != meta.TenantActive {
 		return nil, forkErr(http.StatusConflict, "source tenant is not active")
 	}
+	// Fork today is a TiDB Cloud Branch of the source tenant's own cluster;
+	// shared-schema tenants have no per-tenant cluster to branch, so reject
+	// explicitly instead of misrouting the branch onto the shared DB.
+	if tenant.IsSharedSchemaProvider(source.Provider) {
+		return nil, forkErr(http.StatusConflict, "fork is not supported for shared-pool tenants")
+	}
 	if !s.forkProviderSupported(source.Provider) {
 		return nil, forkErr(http.StatusConflict, "fork is not supported in this TiDBCloud mode")
 	}

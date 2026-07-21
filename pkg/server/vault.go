@@ -80,7 +80,7 @@ func (s *Server) vaultStore(r *http.Request) (*vault.Store, error) {
 	if s.vaultMK == nil {
 		return nil, fmt.Errorf("vault master key not configured")
 	}
-	return vault.NewStore(scope.Backend.Store().DB(), s.vaultMK), nil
+	return vault.NewStoreScoped(scope.Backend.Store().DB(), s.vaultMK, scope.Backend.Store().Scope()), nil
 }
 
 // ---- Management API: /v1/vault/secrets ----
@@ -825,7 +825,7 @@ func (s *Server) handleVaultRead(w http.ResponseWriter, r *http.Request, sub str
 		return
 	}
 
-	vs := vault.NewStore(scope.Backend.Store().DB(), s.vaultMK)
+	vs := vault.NewStoreScoped(scope.Backend.Store().DB(), s.vaultMK, scope.Backend.Store().Scope())
 
 	// Full verification: HMAC signature → TTL → DB revocation → claims.
 	// IMPORTANT: Do NOT write audit events before verification succeeds.

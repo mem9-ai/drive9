@@ -151,10 +151,10 @@ func (s *Store) UpsertGitWorkspace(ctx context.Context, ws GitWorkspace) error {
 	}
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO git_workspaces (
-	workspace_id, root_path, repo_url, remote_name, branch_name,
+	`+s.scope.InsCols(`workspace_id, root_path, repo_url, remote_name, branch_name,
 	base_commit, head_commit, mode, workspace_kind, common_workspace_id,
-	worktree_name, gitdir_rel, status, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
+	worktree_name, gitdir_rel, status, created_at, updated_at`)+`
+) VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)`)+`)
 ON DUPLICATE KEY UPDATE
 	repo_url = VALUES(repo_url),
 	remote_name = VALUES(remote_name),
@@ -168,9 +168,9 @@ ON DUPLICATE KEY UPDATE
 	gitdir_rel = VALUES(gitdir_rel),
 	status = VALUES(status),
 	updated_at = UTC_TIMESTAMP(3)`,
-		ws.WorkspaceID, ws.RootPath, ws.RepoURL, ws.RemoteName, ws.BranchName,
-		ws.BaseCommit, ws.HeadCommit, string(ws.Mode), string(ws.Kind), ws.CommonID,
-		ws.WorktreeName, ws.GitDirRel, string(ws.Status))
+		s.scope.Args(ws.WorkspaceID, ws.RootPath, ws.RepoURL, ws.RemoteName, ws.BranchName,
+			ws.BaseCommit, ws.HeadCommit, string(ws.Mode), string(ws.Kind), ws.CommonID,
+			ws.WorktreeName, ws.GitDirRel, string(ws.Status))...)
 	if err != nil {
 		return fmt.Errorf("upsert git workspace %s: %w", ws.WorkspaceID, err)
 	}
@@ -183,7 +183,7 @@ SELECT workspace_id, root_path, repo_url, remote_name, branch_name,
 	base_commit, head_commit, mode, workspace_kind, common_workspace_id,
 	worktree_name, gitdir_rel, status, created_at, updated_at
 FROM git_workspaces
-WHERE workspace_id = ?`, workspaceID)
+WHERE `+s.scope.And(`workspace_id = ?`), s.scope.Args(workspaceID)...)
 	return scanGitWorkspace(row)
 }
 
@@ -197,7 +197,7 @@ func (s *Store) GetGitWorkspaceByRoot(ctx context.Context, rootPath string) (*Gi
 		base_commit, head_commit, mode, workspace_kind, common_workspace_id,
 		worktree_name, gitdir_rel, status, created_at, updated_at
 	FROM git_workspaces
-	WHERE root_path = ?`, root)
+	WHERE `+s.scope.And(`root_path = ?`), s.scope.Args(root)...)
 	return scanGitWorkspace(row)
 }
 
@@ -207,8 +207,8 @@ SELECT workspace_id, root_path, repo_url, remote_name, branch_name,
 	base_commit, head_commit, mode, workspace_kind, common_workspace_id,
 	worktree_name, gitdir_rel, status, created_at, updated_at
 FROM git_workspaces
-WHERE status = ?
-	ORDER BY root_path`, string(GitWorkspaceStatusLive))
+WHERE `+s.scope.And(`status = ?`)+`
+	ORDER BY root_path`, s.scope.Args(string(GitWorkspaceStatusLive))...)
 	if err != nil {
 		return nil, fmt.Errorf("list git workspaces: %w", err)
 	}
@@ -234,7 +234,8 @@ func (s *Store) DeleteGitWorkspace(ctx context.Context, workspaceID string) erro
 	res, err := s.db.ExecContext(ctx, `
 	UPDATE git_workspaces
 	SET status = ?, updated_at = UTC_TIMESTAMP(3)
-	WHERE workspace_id = ?`, string(GitWorkspaceStatusDeleted), workspaceID)
+	WHERE `+s.scope.And(`workspace_id = ?`),
+		append([]any{string(GitWorkspaceStatusDeleted)}, s.scope.Args(workspaceID)...)...)
 	if err != nil {
 		return fmt.Errorf("delete git workspace %s: %w", workspaceID, err)
 	}
@@ -322,15 +323,15 @@ func (s *Store) ReplaceGitTreeNodes(ctx context.Context, workspaceID, commitSHA 
 	}()
 	if _, err = tx.ExecContext(ctx, `
 DELETE FROM git_workspace_tree_nodes
-WHERE workspace_id = ? AND commit_sha = ?`, workspaceID, commitSHA); err != nil {
+WHERE `+s.scope.And(`workspace_id = ? AND commit_sha = ?`), s.scope.Args(workspaceID, commitSHA)...); err != nil {
 		return fmt.Errorf("delete git tree nodes: %w", err)
 	}
 	if len(nodes) > 0 {
 		stmt, prepErr := tx.PrepareContext(ctx, `
 INSERT INTO git_workspace_tree_nodes (
-	workspace_id, commit_sha, path, path_hash, parent_path, parent_path_hash,
-	name, kind, mode, object_sha, size_bytes, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3))`)
+	`+s.scope.InsCols(`workspace_id, commit_sha, path, path_hash, parent_path, parent_path_hash,
+	name, kind, mode, object_sha, size_bytes, created_at`)+`
+) VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3)`)+`)`)
 		if prepErr != nil {
 			return fmt.Errorf("prepare insert git tree node: %w", prepErr)
 		}
@@ -362,10 +363,10 @@ INSERT INTO git_workspace_tree_nodes (
 			} else if n.Name != name {
 				return fmt.Errorf("insert git tree node %s: name mismatch", n.Path)
 			}
-			if _, err = stmt.ExecContext(ctx,
+			if _, err = stmt.ExecContext(ctx, s.scope.Args(
 				n.WorkspaceID, n.CommitSHA, n.Path, gitPathHash(n.Path), n.ParentPath, gitPathHash(n.ParentPath),
 				n.Name, string(n.Kind), n.Mode, n.ObjectSHA, n.SizeBytes,
-			); err != nil {
+			)...); err != nil {
 				return fmt.Errorf("insert git tree node %s: %w", n.Path, err)
 			}
 		}
@@ -382,8 +383,8 @@ func (s *Store) ListGitTreeNodes(ctx context.Context, workspaceID, commitSHA str
 SELECT workspace_id, commit_sha, path, parent_path, name, kind, mode,
 	object_sha, size_bytes, created_at
 FROM git_workspace_tree_nodes
-WHERE workspace_id = ? AND commit_sha = ?
-ORDER BY path`, workspaceID, commitSHA)
+WHERE `+s.scope.And(`workspace_id = ? AND commit_sha = ?`)+`
+ORDER BY path`, s.scope.Args(workspaceID, commitSHA)...)
 	if err != nil {
 		return nil, fmt.Errorf("list git tree nodes: %w", err)
 	}
@@ -413,9 +414,9 @@ func (s *Store) UpsertGitState(ctx context.Context, state GitState) error {
 	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO git_workspace_git_state (
-	workspace_id, checkpoint_commit, storage_type, storage_ref, storage_ref_hash,
-	checksum_sha256, size_bytes, content_blob, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
+	`+s.scope.InsCols(`workspace_id, checkpoint_commit, storage_type, storage_ref, storage_ref_hash,
+	checksum_sha256, size_bytes, content_blob, created_at, updated_at`)+`
+) VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)`)+`)
 ON DUPLICATE KEY UPDATE
 	checkpoint_commit = VALUES(checkpoint_commit),
 	storage_type = VALUES(storage_type),
@@ -425,8 +426,8 @@ ON DUPLICATE KEY UPDATE
 	size_bytes = VALUES(size_bytes),
 	content_blob = VALUES(content_blob),
 	updated_at = UTC_TIMESTAMP(3)`,
-		state.WorkspaceID, state.CheckpointCommit, state.StorageType, state.StorageRef,
-		state.StorageRefHash, state.ChecksumSHA256, state.SizeBytes, state.ContentBlob)
+		s.scope.Args(state.WorkspaceID, state.CheckpointCommit, state.StorageType, state.StorageRef,
+			state.StorageRefHash, state.ChecksumSHA256, state.SizeBytes, state.ContentBlob)...)
 	if err != nil {
 		return fmt.Errorf("upsert git state %s: %w", state.WorkspaceID, err)
 	}
@@ -438,7 +439,7 @@ func (s *Store) GetGitState(ctx context.Context, workspaceID string) (*GitState,
 SELECT workspace_id, checkpoint_commit, storage_type, storage_ref, storage_ref_hash,
 	checksum_sha256, size_bytes, content_blob, created_at, updated_at
 FROM git_workspace_git_state
-WHERE workspace_id = ?`, workspaceID)
+WHERE `+s.scope.And(`workspace_id = ?`), s.scope.Args(workspaceID)...)
 	var state GitState
 	if err := row.Scan(
 		&state.WorkspaceID, &state.CheckpointCommit, &state.StorageType, &state.StorageRef,
@@ -464,13 +465,13 @@ func (s *Store) UpsertGitObjectPack(ctx context.Context, pack GitObjectPack) err
 	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO git_workspace_object_packs (
-	workspace_id, pack_id, checksum_sha256, size_bytes, content_blob, created_at
-) VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(3))
+	`+s.scope.InsCols(`workspace_id, pack_id, checksum_sha256, size_bytes, content_blob, created_at`)+`
+) VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, UTC_TIMESTAMP(3)`)+`)
 ON DUPLICATE KEY UPDATE
 	checksum_sha256 = VALUES(checksum_sha256),
 	size_bytes = VALUES(size_bytes),
 	content_blob = VALUES(content_blob)`,
-		pack.WorkspaceID, pack.PackID, pack.ChecksumSHA256, pack.SizeBytes, pack.ContentBlob)
+		s.scope.Args(pack.WorkspaceID, pack.PackID, pack.ChecksumSHA256, pack.SizeBytes, pack.ContentBlob)...)
 	if err != nil {
 		return fmt.Errorf("upsert git object pack %s: %w", pack.PackID, err)
 	}
@@ -481,8 +482,8 @@ func (s *Store) ListGitObjectPacks(ctx context.Context, workspaceID string) ([]G
 	rows, err := s.db.QueryContext(ctx, `
 SELECT workspace_id, pack_id, checksum_sha256, size_bytes, created_at
 FROM git_workspace_object_packs
-WHERE workspace_id = ?
-ORDER BY created_at, pack_id`, workspaceID)
+WHERE `+s.scope.And(`workspace_id = ?`)+`
+ORDER BY created_at, pack_id`, s.scope.Args(workspaceID)...)
 	if err != nil {
 		return nil, fmt.Errorf("list git object packs: %w", err)
 	}
@@ -507,7 +508,7 @@ func (s *Store) GetGitObjectPack(ctx context.Context, workspaceID, packID string
 	row := s.db.QueryRowContext(ctx, `
 SELECT workspace_id, pack_id, checksum_sha256, size_bytes, content_blob, created_at
 FROM git_workspace_object_packs
-WHERE workspace_id = ? AND pack_id = ?`, workspaceID, packID)
+WHERE `+s.scope.And(`workspace_id = ? AND pack_id = ?`), s.scope.Args(workspaceID, packID)...)
 	var pack GitObjectPack
 	if err := row.Scan(
 		&pack.WorkspaceID, &pack.PackID, &pack.ChecksumSHA256, &pack.SizeBytes, &pack.ContentBlob, &pack.CreatedAt,
@@ -540,9 +541,9 @@ func (s *Store) UpsertGitOverlayEntry(ctx context.Context, entry GitOverlayEntry
 	}
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO git_workspace_overlay (
-	workspace_id, path, path_hash, op, kind, mode, storage_type, storage_ref, storage_ref_hash,
-	checksum_sha256, size_bytes, base_object_sha, content_blob, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
+	`+s.scope.InsCols(`workspace_id, path, path_hash, op, kind, mode, storage_type, storage_ref, storage_ref_hash,
+	checksum_sha256, size_bytes, base_object_sha, content_blob, created_at, updated_at`)+`
+) VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)`)+`)
 ON DUPLICATE KEY UPDATE
 	path = VALUES(path),
 	op = VALUES(op),
@@ -556,8 +557,8 @@ ON DUPLICATE KEY UPDATE
 	base_object_sha = VALUES(base_object_sha),
 	content_blob = VALUES(content_blob),
 	updated_at = UTC_TIMESTAMP(3)`,
-		entry.WorkspaceID, entry.Path, gitPathHash(entry.Path), string(entry.Op), string(entry.Kind), entry.Mode, entry.StorageType, entry.StorageRef,
-		entry.StorageRefHash, entry.ChecksumSHA256, entry.SizeBytes, entry.BaseObjectSHA, entry.ContentBlob)
+		s.scope.Args(entry.WorkspaceID, entry.Path, gitPathHash(entry.Path), string(entry.Op), string(entry.Kind), entry.Mode, entry.StorageType, entry.StorageRef,
+			entry.StorageRefHash, entry.ChecksumSHA256, entry.SizeBytes, entry.BaseObjectSHA, entry.ContentBlob)...)
 	if err != nil {
 		return fmt.Errorf("upsert git overlay entry %s: %w", entry.Path, err)
 	}
@@ -569,8 +570,8 @@ func (s *Store) ListGitOverlayEntries(ctx context.Context, workspaceID string) (
 SELECT workspace_id, path, op, kind, mode, storage_type, storage_ref, storage_ref_hash,
 	checksum_sha256, size_bytes, base_object_sha, content_blob, created_at, updated_at
 FROM git_workspace_overlay
-WHERE workspace_id = ?
-ORDER BY path`, workspaceID)
+WHERE `+s.scope.And(`workspace_id = ?`)+`
+ORDER BY path`, s.scope.Args(workspaceID)...)
 	if err != nil {
 		return nil, fmt.Errorf("list git overlay entries: %w", err)
 	}
@@ -604,7 +605,7 @@ func (s *Store) GetGitOverlayEntry(ctx context.Context, workspaceID, relPath str
 SELECT workspace_id, path, op, kind, mode, storage_type, storage_ref, storage_ref_hash,
 	checksum_sha256, size_bytes, base_object_sha, content_blob, created_at, updated_at
 FROM git_workspace_overlay
-	WHERE workspace_id = ? AND path_hash = ? AND path = ?`, workspaceID, gitPathHash(relPath), relPath)
+	WHERE `+s.scope.And(`workspace_id = ? AND path_hash = ? AND path = ?`), s.scope.Args(workspaceID, gitPathHash(relPath), relPath)...)
 	var e GitOverlayEntry
 	var op, kind string
 	if err := row.Scan(

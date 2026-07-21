@@ -77,11 +77,11 @@ func (s *Store) IssueGrant(
 
 	scopeJSON, _ := json.Marshal(scope)
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO vault_grants (
-			grant_id, tenant_id, issuer, principal_type, agent, scope_json,
+		fmt.Sprintf(`INSERT INTO vault_grants (
+			grant_id, %s, issuer, principal_type, agent, scope_json,
 			perm, label_hint, issued_at, expires_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		grantID, tenantID, issuer, string(principal), agent, scopeJSON,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.tenantCol()),
+		grantID, s.tenantArg(tenantID), issuer, string(principal), agent, scopeJSON,
 		string(perm), nullableString(labelHint), now, expiresAt,
 	)
 	if err != nil {
@@ -110,8 +110,9 @@ func (s *Store) IssueGrant(
 //  5. scope validity (via VerifyGrant)
 //  6. DB revocation (scoped to tenant for isolation)
 //
-// Per pr-a-jwt-implementation.md §4 step 6: the DB query MUST filter on
-// tenant_id to prevent cross-tenant token reuse.
+// Per pr-a-jwt-implementation.md §4 step 6: the DB query MUST filter on the
+// tenant discriminator (tenant_id in standalone shape, fs_id in shared shape)
+// to prevent cross-tenant token reuse.
 //
 // The iss claim is additionally checked against expectedIssuer; a mismatch
 // fails closed. An empty expectedIssuer disables this check (useful for unit
@@ -140,8 +141,8 @@ func (s *Store) VerifyAndResolveGrant(
 
 	var revokedAt *time.Time
 	err = s.db.QueryRowContext(ctx,
-		`SELECT revoked_at FROM vault_grants WHERE tenant_id = ? AND grant_id = ?`,
-		tenantID, claims.GrantID,
+		fmt.Sprintf(`SELECT revoked_at FROM vault_grants WHERE %s = ? AND grant_id = ?`, s.tenantCol()),
+		s.tenantArg(tenantID), claims.GrantID,
 	).Scan(&revokedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("grant not found")
@@ -160,9 +161,9 @@ func (s *Store) VerifyAndResolveGrant(
 func (s *Store) RevokeGrant(ctx context.Context, tenantID, grantID, revokedBy, reason string) error {
 	now := time.Now()
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE vault_grants SET revoked_at = ?, revoked_by = ?, revoke_reason = ?
-		 WHERE tenant_id = ? AND grant_id = ? AND revoked_at IS NULL`,
-		now, revokedBy, reason, tenantID, grantID,
+		fmt.Sprintf(`UPDATE vault_grants SET revoked_at = ?, revoked_by = ?, revoke_reason = ?
+		 WHERE %s = ? AND grant_id = ? AND revoked_at IS NULL`, s.tenantCol()),
+		now, revokedBy, reason, s.tenantArg(tenantID), grantID,
 	)
 	if err != nil {
 		return fmt.Errorf("revoke grant: %w", err)
