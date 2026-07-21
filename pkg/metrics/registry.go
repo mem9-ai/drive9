@@ -156,6 +156,13 @@ func (c *Int64Counter) Add(value int64, attrs ...Attribute) {
 	c.registry.addCounter(c.name, labelsKey(attrs), value)
 }
 
+func (c *Int64Counter) Delete(attrs ...Attribute) {
+	if c == nil || c.registry == nil {
+		return
+	}
+	c.registry.deleteCounter(c.name, labelsKey(attrs))
+}
+
 func (g *Float64Gauge) Set(value float64, attrs ...Attribute) {
 	if g == nil || g.registry == nil {
 		return
@@ -283,6 +290,16 @@ func (r *Registry) setGauge(name, labels string, value float64) {
 	inst.values[labels] = value
 }
 
+func (r *Registry) deleteCounter(name, labels string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	inst := r.counters[name]
+	if inst == nil {
+		return
+	}
+	delete(inst.values, labels)
+}
+
 func (r *Registry) deleteGauge(name, labels string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -291,6 +308,54 @@ func (r *Registry) deleteGauge(name, labels string) {
 		return
 	}
 	delete(inst.values, labels)
+}
+
+func labelHasKeyValue(labels, match string) bool {
+	if labels == match {
+		return true
+	}
+	return strings.HasPrefix(labels, match+`,`) ||
+		strings.Contains(labels, `,`+match+`,`) ||
+		strings.HasSuffix(labels, `,`+match)
+}
+
+func (r *Registry) DeleteCountersByLabel(labelKey, labelValue string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	match := labelKey + `="` + EscapePromLabel(labelValue) + `"`
+	for _, inst := range r.counters {
+		for labels := range inst.values {
+			if labelHasKeyValue(labels, match) {
+				delete(inst.values, labels)
+			}
+		}
+	}
+}
+
+func (r *Registry) DeleteHistogramsByLabel(labelKey, labelValue string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	match := labelKey + `="` + EscapePromLabel(labelValue) + `"`
+	for _, inst := range r.histograms {
+		for labels := range inst.values {
+			if labelHasKeyValue(labels, match) {
+				delete(inst.values, labels)
+			}
+		}
+	}
+}
+
+func (r *Registry) DeleteGaugesByLabel(labelKey, labelValue string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	match := labelKey + `="` + EscapePromLabel(labelValue) + `"`
+	for _, inst := range r.gauges {
+		for labels := range inst.values {
+			if labelHasKeyValue(labels, match) {
+				delete(inst.values, labels)
+			}
+		}
+	}
 }
 
 func (r *Registry) observeHistogram(name, labels string, value float64) {
