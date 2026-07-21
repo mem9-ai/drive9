@@ -685,7 +685,7 @@ func (s *Server) firstManagedOrganization(ctx context.Context, cred tenant.Crede
 	// request path (warm-pool claim + shared-pool check) and across
 	// consecutive provisions do not each cost a TiDB Cloud list call. The
 	// cache is invalidated on tenant mutations (forgetTiDBCloudRBACList).
-	clusters, _, err := s.listAllManagedClustersCached(ctx, cred, "", true, "provision_org_resolve")
+	clusters, err := s.listAllManagedClusters(ctx, cred, "", "provision_org_resolve")
 	if err != nil || len(clusters) == 0 {
 		return "", err
 	}
