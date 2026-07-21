@@ -444,6 +444,86 @@ func TestListDir(t *testing.T) {
 	}
 }
 
+func TestListDirFastNoSlowLog(t *testing.T) {
+	core, recorded := observer.New(zap.InfoLevel)
+	s := newTestServerWithLogger(t, zap.New(core))
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/x.txt", strings.NewReader("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	resp, err = http.Get(ts.URL + "/v1/fs/data/?list=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if entries := recorded.FilterMessage("fs_slow_request").AllUntimed(); len(entries) != 0 {
+		t.Errorf("fast list should not produce fs_slow_request; got %d entries", len(entries))
+	}
+}
+
+func TestLogSlowFSListThreshold(t *testing.T) {
+	core, recorded := observer.New(zap.InfoLevel)
+	ctx := logger.WithContext(context.Background(), zap.New(core))
+
+	// Below threshold: no log
+	logSlowFSList(ctx, "/data", 5, http.StatusOK, slowFSRequestThreshold-time.Millisecond, 100*time.Millisecond)
+	if n := recorded.FilterMessage("fs_slow_request").Len(); n != 0 {
+		t.Errorf("below threshold: expected 0 logs, got %d", n)
+	}
+
+	// At threshold: log emitted
+	logSlowFSList(ctx, "/data/sub", 11, http.StatusOK, slowFSRequestThreshold, 200*time.Millisecond)
+	entries := recorded.FilterMessage("fs_slow_request").AllUntimed()
+	if len(entries) != 1 {
+		t.Fatalf("at threshold: expected 1 log, got %d", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	for _, key := range []string{"op", "path", "entries", "status", "total_ms", "read_dir_ms"} {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("fs_slow_request missing field %q; got %v", key, fields)
+		}
+	}
+	if fields["op"] != "list" {
+		t.Errorf("op = %v, want list", fields["op"])
+	}
+	if fields["path"] != "/data/sub" {
+		t.Errorf("path = %v, want /data/sub", fields["path"])
+	}
+	if fields["entries"] != int64(11) {
+		t.Errorf("entries = %v, want 11", fields["entries"])
+	}
+	if fields["status"] != int64(http.StatusOK) {
+		t.Errorf("status = %v, want %d", fields["status"], http.StatusOK)
+	}
+
+	// Above threshold: log emitted
+	logSlowFSList(ctx, "/data/big", 100, http.StatusOK, 2*time.Second, 1900*time.Millisecond)
+	if n := recorded.FilterMessage("fs_slow_request").Len(); n != 2 {
+		t.Errorf("above threshold: expected 2 total logs, got %d", n)
+	}
+
+	// Slow error path: log emitted with the failure status.
+	logSlowFSList(ctx, "/data/err", 0, http.StatusInternalServerError, 3*time.Second, 2900*time.Millisecond)
+	errEntries := recorded.FilterMessage("fs_slow_request").AllUntimed()
+	if len(errEntries) != 3 {
+		t.Fatalf("slow error path: expected 3 total logs, got %d", len(errEntries))
+	}
+	errFields := errEntries[2].ContextMap()
+	if errFields["status"] != int64(http.StatusInternalServerError) {
+		t.Errorf("error path status = %v, want %d", errFields["status"], http.StatusInternalServerError)
+	}
+}
+
 func TestStat(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
