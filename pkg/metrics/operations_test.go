@@ -478,6 +478,7 @@ func TestDeleteTenantCounters(t *testing.T) {
 	RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, "api", "", "upload", 1024)
 	RecordSSEConnectionWithOrg(tenantID, tidbCloudOrgID, "mount", time.Second)
 	RecordSSEEventSentWithOrg(tenantID, tidbCloudOrgID, "write")
+	RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, "api", "read", 3)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
@@ -504,20 +505,35 @@ func TestDeleteTenantCounters(t *testing.T) {
 		"drive9_sse_connection_duration_seconds_count",
 		"drive9_sse_connection_duration_seconds_sum",
 	}
+	gaugeNames := []string{
+		"drive9_tenant_inflight_requests",
+	}
+	var failures int
 	for _, line := range strings.Split(text2, "\n") {
 		if !strings.Contains(line, `tenant_id="`+tenantID+`"`) {
 			continue
 		}
 		for _, name := range counterNames {
 			if strings.HasPrefix(line, name) {
-				t.Fatalf("counter line with tenant_id still present: %s", line)
+				t.Errorf("counter line with tenant_id still present: %s", line)
+				failures++
 			}
 		}
 		for _, name := range histogramNames {
 			if strings.HasPrefix(line, name) {
-				t.Fatalf("histogram line with tenant_id still present: %s", line)
+				t.Errorf("histogram line with tenant_id still present: %s", line)
+				failures++
 			}
 		}
+		for _, name := range gaugeNames {
+			if strings.HasPrefix(line, name) {
+				t.Errorf("gauge line with tenant_id still present: %s", line)
+				failures++
+			}
+		}
+	}
+	if failures > 0 {
+		t.Fatalf("%d tenant-scoped lines leaked after DeleteTenantCounters", failures)
 	}
 }
 

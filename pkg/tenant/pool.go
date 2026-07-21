@@ -305,7 +305,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 		}
 		p.mu.Unlock()
 		for _, retired := range toClose {
-			closeEntry(retired)
+			p.closeEntry(retired)
 		}
 		toClose = nil
 	} else {
@@ -347,7 +347,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 	// per-backend goroutine is started here.
 	p.mu.Unlock()
 	for _, retired := range toClose {
-		closeEntry(retired)
+		p.closeEntry(retired)
 	}
 	return b, nil
 }
@@ -388,7 +388,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		}
 		p.mu.Unlock()
 		for _, retired := range toClose {
-			closeEntry(retired)
+			p.closeEntry(retired)
 		}
 		toClose = nil
 	} else {
@@ -445,7 +445,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	// per-backend goroutine is started here.
 	p.mu.Unlock()
 	for _, retired := range toClose {
-		closeEntry(retired)
+		p.closeEntry(retired)
 	}
 	metrics.RecordOperation("tenant_pool", "cache_lookup", "miss", 0)
 	totalDuration := time.Since(start)
@@ -461,7 +461,7 @@ func (p *Pool) Invalidate(tenantID string) {
 		toClose = p.removeLocked(e.elem, "invalidate")
 	}
 	p.mu.Unlock()
-	closeEntry(toClose)
+	p.closeEntry(toClose)
 }
 
 func (p *Pool) WaitTenantIdle(ctx context.Context, tenantID string) error {
@@ -556,7 +556,7 @@ func (p *Pool) InvalidateAndWait(ctx context.Context, tenantID string) error {
 		toClose = p.removeLocked(e.elem, "invalidate")
 	}
 	p.mu.Unlock()
-	closeEntry(toClose)
+	p.closeEntry(toClose)
 	if retired == nil || toClose != nil {
 		return nil
 	}
@@ -714,7 +714,7 @@ func (p *Pool) reapOnce(ctx context.Context) {
 	p.recordCachedBackendCountLocked()
 	p.mu.Unlock()
 	for _, retired := range toClose {
-		closeEntry(retired)
+		p.closeEntry(retired)
 	}
 }
 
@@ -734,7 +734,7 @@ func (p *Pool) Close() {
 	}
 	p.mu.Unlock()
 	for _, retired := range toClose {
-		closeEntry(retired)
+		p.closeEntry(retired)
 	}
 	p.sharedMu.Lock()
 	for dbID, db := range p.sharedDBs {
@@ -1361,10 +1361,12 @@ func (p *Pool) releaseEntry(e *entry, refreshLastUsed bool) {
 		toClose = e
 	}
 	p.mu.Unlock()
-	closeEntry(toClose)
+	if toClose != nil {
+		p.closeEntry(toClose)
+	}
 }
 
-func closeEntry(e *entry) {
+func (p *Pool) closeEntry(e *entry) {
 	if e == nil {
 		return
 	}
@@ -1374,7 +1376,12 @@ func closeEntry(e *entry) {
 	if e.store != nil {
 		_ = e.store.Close()
 	}
-	metrics.DeleteTenantCounters(e.tenantID)
+	p.mu.Lock()
+	_, active := p.items[e.tenantID]
+	p.mu.Unlock()
+	if !active {
+		metrics.DeleteTenantCounters(e.tenantID)
+	}
 }
 
 type tenantPoolResult string

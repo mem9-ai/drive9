@@ -311,7 +311,12 @@ func (r *Registry) deleteGauge(name, labels string) {
 }
 
 func labelHasKeyValue(labels, match string) bool {
-	return strings.HasSuffix(labels, match) || strings.Contains(labels, match+",")
+	if labels == match {
+		return true
+	}
+	return strings.HasPrefix(labels, match+`,`) ||
+		strings.Contains(labels, `,`+match+`,`) ||
+		strings.HasSuffix(labels, `,`+match)
 }
 
 func (r *Registry) DeleteCountersByLabel(labelKey, labelValue string) {
