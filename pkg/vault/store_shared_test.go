@@ -17,10 +17,9 @@ var vaultSharedTables = []string{
 	"vault_secret_fields",
 	"vault_secrets",
 	"vault_deks",
-	"vault_policies",
 }
 
-// installSharedVaultSchema swaps the 7 vault tables to the shared (fs_id)
+// installSharedVaultSchema swaps the 6 vault tables to the shared (fs_id)
 // shape and restores the standalone schema on cleanup. Tests in this package
 // run sequentially, so the swap is safe. A second database cannot be used
 // instead: the testcontainer MySQL user only has privileges on the test
@@ -373,9 +372,6 @@ func TestVaultSharedShapeStoresFsID(t *testing.T) {
 		}
 		if got != 0 {
 			t.Fatalf("%s has %d rows with fs_id != %d", tbl, got, fsID)
-		}
-		if tbl == "vault_policies" {
-			continue // no writer path for policies in pkg/vault
 		}
 		var total int64
 		if err := store.DB().QueryRow("SELECT COUNT(*) FROM " + tbl).Scan(&total); err != nil {

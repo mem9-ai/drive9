@@ -10,7 +10,7 @@ import (
 
 // SharedTiDBSchemaStatements returns the complete shared (multi-tenant) schema
 // DDL for TiDB in one list: the Core FS, journal, vault, git workspace, and FS
-// layer shared shapes concatenated in creation order. The shared schema has 31
+// layer shared shapes concatenated in creation order. The shared schema has 30
 // tables; llm_usage is deliberately omitted (the central meta DB ledger is
 // authoritative in multi-tenant deployments — see
 // CoreFSTiDBSharedSchemaStatements). There are no foreign keys, so statement

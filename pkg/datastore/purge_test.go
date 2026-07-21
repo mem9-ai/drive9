@@ -19,7 +19,7 @@ func TestPurgeTenantDataSharedShape(t *testing.T) {
 	installSharedGitSchema(t)
 	installSharedTables(t, []string{
 		"vault_audit_log", "vault_grants", "vault_tokens", "vault_secret_fields",
-		"vault_secrets", "vault_policies", "vault_deks",
+		"vault_secrets", "vault_deks",
 	}, schema.VaultMySQLSharedSchemaStatements())
 
 	ctx := context.Background()

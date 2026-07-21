@@ -9,7 +9,7 @@ import (
 	"github.com/mem9-ai/drive9/internal/testmysql"
 )
 
-// sharedSchemaTables lists the 31 tables of the shared (multi-tenant) schema
+// sharedSchemaTables lists the 30 tables of the shared (multi-tenant) schema
 // shape across the five statement groups. llm_usage is intentionally absent:
 // the central meta DB ledger is authoritative in multi-tenant deployments.
 var sharedSchemaTables = []string{
@@ -29,13 +29,12 @@ var sharedSchemaTables = []string{
 	"journal_append_requests",
 	"journal_entries",
 	"journal_entry_subjects",
-	// Vault (7).
+	// Vault (6).
 	"vault_deks",
 	"vault_secrets",
 	"vault_secret_fields",
 	"vault_tokens",
 	"vault_grants",
-	"vault_policies",
 	"vault_audit_log",
 	// Git workspace (5).
 	"git_workspaces",
@@ -52,7 +51,7 @@ var sharedSchemaTables = []string{
 }
 
 // TestSharedTiDBSchemaStatementsContainsAllTables pins the aggregate list to
-// exactly the 31 expected tables across the five groups: every statement must
+// exactly the 30 expected tables across the five groups: every statement must
 // be a CREATE TABLE for one of them, with no duplicates and no extras.
 func TestSharedTiDBSchemaStatementsContainsAllTables(t *testing.T) {
 	stmts := SharedTiDBSchemaStatements()
@@ -82,7 +81,7 @@ func TestSharedTiDBSchemaStatementsContainsAllTables(t *testing.T) {
 
 // TestSharedMySQLSchemaStatementsDialect ensures the MySQL variant carries no
 // TiDB-only constructs — no CLUSTERED keyword and no VECTOR(n) column types —
-// while keeping the same 31 tables.
+// while keeping the same 30 tables.
 func TestSharedMySQLSchemaStatementsDialect(t *testing.T) {
 	stmts := SharedMySQLSchemaStatements()
 	if len(stmts) != len(sharedSchemaTables) {

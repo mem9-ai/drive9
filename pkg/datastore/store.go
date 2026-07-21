@@ -1703,7 +1703,6 @@ func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
 			"vault_tokens",
 			"vault_secret_fields",
 			"vault_secrets",
-			"vault_policies",
 			"vault_deks",
 		)
 		for _, tbl := range wipeTables {
