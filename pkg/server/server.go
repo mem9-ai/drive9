@@ -1940,11 +1940,13 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "list_not_found", "path", path)...)
 			errJSON(w, http.StatusNotFound, err.Error())
+			logSlowFSList(r.Context(), path, 0, http.StatusNotFound, time.Since(start), readDirDuration)
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "list_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "list", "result", "error")
 		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		logSlowFSList(r.Context(), path, 0, http.StatusInternalServerError, time.Since(start), readDirDuration)
 		return
 	}
 	metricEvent(r.Context(), "userdb_query", "api", "list", "result", "ok")
@@ -1999,7 +2001,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})
 
-	logSlowFSList(r.Context(), path, len(entries), time.Since(start), readDirDuration)
+	logSlowFSList(r.Context(), path, len(entries), http.StatusOK, time.Since(start), readDirDuration)
 }
 
 func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path string) {
@@ -2364,7 +2366,7 @@ const slowWriteBodyReadThreshold = 5 * time.Second
 // follow-up PR.
 const slowFSRequestThreshold = 500 * time.Millisecond
 
-func logSlowFSList(ctx context.Context, path string, entries int, total, readDir time.Duration) {
+func logSlowFSList(ctx context.Context, path string, entries, status int, total, readDir time.Duration) {
 	if total < slowFSRequestThreshold {
 		return
 	}
@@ -2373,7 +2375,7 @@ func logSlowFSList(ctx context.Context, path string, entries int, total, readDir
 		zap.String("op", "list"),
 		zap.String("path", path),
 		zap.Int("entries", entries),
-		zap.Int("status", http.StatusOK),
+		zap.Int("status", status),
 		zap.Float64("total_ms", serverDurationMs(total)),
 		zap.Float64("read_dir_ms", serverDurationMs(readDir)),
 		zap.String("tenant_id", tenantID),
