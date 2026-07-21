@@ -36,12 +36,28 @@ func Start(ctx context.Context) (*Instance, error) {
 	ctx, cancel := context.WithTimeout(ctx, 4*time.Minute)
 	defer cancel()
 
-	c, err := tcmysql.Run(ctx,
-		"mysql:8.0.36",
-		tcmysql.WithDatabase("dat9_test"),
-		tcmysql.WithUsername("dat9"),
-		tcmysql.WithPassword("dat9pass"),
-	)
+	// The MySQL container asks Docker for an ephemeral host port, but Docker's
+	// port allocator can lose a race on busy CI runners and fail container
+	// start with "failed to bind host port ...: address already in use".
+	// Retrying picks a fresh port and is far cheaper than re-running the job.
+	var c *tcmysql.MySQLContainer
+	var err error
+	for attempt := 1; ; attempt++ {
+		c, err = tcmysql.Run(ctx,
+			"mysql:8.0.36",
+			tcmysql.WithDatabase("dat9_test"),
+			tcmysql.WithUsername("dat9"),
+			tcmysql.WithPassword("dat9pass"),
+		)
+		if err == nil || attempt >= 3 || !isPortBindConflict(err) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("start mysql container: %w", ctx.Err())
+		case <-time.After(time.Duration(attempt) * 2 * time.Second):
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("start mysql container: %w", err)
 	}
@@ -159,6 +175,17 @@ func ResetDBWithoutFiles(t *testing.T, db *sql.DB) {
 			t.Fatalf("reset test db: %v", err)
 		}
 	}
+}
+
+// isPortBindConflict reports whether a container-start failure is Docker's
+// ephemeral host-port allocation race, which a retry can recover from.
+func isPortBindConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "failed to bind host port") &&
+		strings.Contains(msg, "address already in use")
 }
 
 func isMissingTableError(err error) bool {
