@@ -183,10 +183,11 @@ func main() {
 	if err != nil {
 		die(err)
 	}
-	tenantPoolRefillFreeRatio, err := tenantPoolRefillFreeRatioFromEnv()
+	tenantPoolRefillBatchSize, err := tenantPoolRefillBatchSizeFromEnv()
 	if err != nil {
 		die(err)
 	}
+	tenantPoolRefillInterval := envDuration("DRIVE9_TENANT_POOL_REFILL_INTERVAL", server.DefaultTenantPoolRefillInterval)
 	maxUploadBytes := server.DefaultMaxUploadBytes
 	if raw := os.Getenv("DRIVE9_MAX_UPLOAD_BYTES"); raw != "" {
 		maxUploadBytes, err = strconv.ParseInt(raw, 10, 64)
@@ -436,7 +437,8 @@ func main() {
 		S3Dir:                           s3cfg.Dir,
 		MaxUploadBytes:                  maxUploadBytes,
 		TenantPoolMaxSize:               tenantPoolMaxSize,
-		TenantPoolRefillFreeRatio:       tenantPoolRefillFreeRatio,
+		TenantPoolRefillBatchSize:       tenantPoolRefillBatchSize,
+		TenantPoolRefillInterval:        tenantPoolRefillInterval,
 		InlineThreshold:                 backendOptions.InlineThreshold,
 		Logger:                          srvLogger,
 		SemanticEmbedder:                semanticEmbedder,
@@ -659,7 +661,10 @@ environment:
   DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST legacy tencentcloud private endpoint fallback host, used only when host map is unset
   DRIVE9_TIDBCLOUD_ALICLOUD_PRIVATE_ENDPOINT_DOMAIN legacy alicloud private endpoint fallback domain, used only when host map is unset
   DRIVE9_TENANT_POOL_MAX_SIZE maximum admin tenant pool size (default: %d)
-  DRIVE9_TENANT_POOL_REFILL_FREE_RATIO claim-triggered refill runs when active free tenants fall below this ratio (default: %.2f)
+  DRIVE9_TENANT_POOL_REFILL_BATCH_SIZE async cluster creations dispatched per refill round (default: %d)
+  DRIVE9_TENANT_POOL_REFILL_INTERVAL delay between refill dispatch rounds (default: %s);
+                                             caps the cluster-creation start rate at batch-size/interval,
+                                             independent of how long individual creations take
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*
   DRIVE9_SLOCK_API_ORIGIN Slock API origin (required when DRIVE9_SLOCK_ORIGIN is set)
   DRIVE9_SLOCK_CLIENT_ID Slock connected-app client id (required when DRIVE9_SLOCK_ORIGIN is set)
@@ -757,7 +762,7 @@ environment:
 schema tooling:
   dump-init-sql writes the exact init schema SQL to stdout so external systems
   can stay in sync with drive9's schema source of truth.
-`, server.DefaultMaxUploadBytes, meta.DefaultMaxStorageBytes(), server.DefaultTenantPoolMaxSize, server.DefaultTenantPoolRefillFreeRatio)
+`, server.DefaultMaxUploadBytes, meta.DefaultMaxStorageBytes(), server.DefaultTenantPoolMaxSize, server.DefaultTenantPoolRefillBatchSize, server.DefaultTenantPoolRefillInterval)
 	os.Exit(exitCode)
 }
 
@@ -1146,14 +1151,14 @@ func tenantPoolMaxSizeFromEnv() (int, error) {
 	return v, nil
 }
 
-func tenantPoolRefillFreeRatioFromEnv() (float64, error) {
-	raw := strings.TrimSpace(os.Getenv("DRIVE9_TENANT_POOL_REFILL_FREE_RATIO"))
+func tenantPoolRefillBatchSizeFromEnv() (int, error) {
+	raw := strings.TrimSpace(os.Getenv("DRIVE9_TENANT_POOL_REFILL_BATCH_SIZE"))
 	if raw == "" {
-		return server.DefaultTenantPoolRefillFreeRatio, nil
+		return server.DefaultTenantPoolRefillBatchSize, nil
 	}
-	v, err := strconv.ParseFloat(raw, 64)
-	if err != nil || v <= 0 || v > 1 || v != v {
-		return 0, fmt.Errorf("invalid DRIVE9_TENANT_POOL_REFILL_FREE_RATIO=%q: must be a number in (0,1]", raw)
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0, fmt.Errorf("invalid DRIVE9_TENANT_POOL_REFILL_BATCH_SIZE=%q: must be a positive integer", raw)
 	}
 	return v, nil
 }

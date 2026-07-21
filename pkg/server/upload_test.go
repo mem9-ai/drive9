@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1516,17 +1515,23 @@ func TestNewWithConfigUsesDefaultTenantPoolMaxSize(t *testing.T) {
 	}
 }
 
-func TestNewWithConfigUsesDefaultTenantPoolRefillFreeRatio(t *testing.T) {
+func TestNewWithConfigUsesDefaultTenantPoolRefillConfig(t *testing.T) {
 	s := NewWithConfig(Config{})
-	if s.tenantPoolRefillFreeRatio != DefaultTenantPoolRefillFreeRatio {
-		t.Fatalf("default tenantPoolRefillFreeRatio = %f, want %f", s.tenantPoolRefillFreeRatio, DefaultTenantPoolRefillFreeRatio)
+	if s.tenantPoolRefillBatchSize != DefaultTenantPoolRefillBatchSize {
+		t.Fatalf("default tenantPoolRefillBatchSize = %d, want %d", s.tenantPoolRefillBatchSize, DefaultTenantPoolRefillBatchSize)
+	}
+	if s.tenantPoolRefillInterval != DefaultTenantPoolRefillInterval {
+		t.Fatalf("default tenantPoolRefillInterval = %s, want %s", s.tenantPoolRefillInterval, DefaultTenantPoolRefillInterval)
 	}
 }
 
-func TestNewWithConfigRejectsNaNTenantPoolRefillFreeRatio(t *testing.T) {
-	s := NewWithConfig(Config{TenantPoolRefillFreeRatio: math.NaN()})
-	if s.tenantPoolRefillFreeRatio != DefaultTenantPoolRefillFreeRatio {
-		t.Fatalf("NaN tenantPoolRefillFreeRatio = %f, want %f", s.tenantPoolRefillFreeRatio, DefaultTenantPoolRefillFreeRatio)
+func TestNewWithConfigNormalizesInvalidTenantPoolRefillConfig(t *testing.T) {
+	s := NewWithConfig(Config{TenantPoolRefillBatchSize: -1, TenantPoolRefillInterval: -time.Second})
+	if s.tenantPoolRefillBatchSize != DefaultTenantPoolRefillBatchSize {
+		t.Fatalf("invalid tenantPoolRefillBatchSize = %d, want %d", s.tenantPoolRefillBatchSize, DefaultTenantPoolRefillBatchSize)
+	}
+	if s.tenantPoolRefillInterval != DefaultTenantPoolRefillInterval {
+		t.Fatalf("invalid tenantPoolRefillInterval = %s, want %s", s.tenantPoolRefillInterval, DefaultTenantPoolRefillInterval)
 	}
 }
 

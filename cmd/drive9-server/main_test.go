@@ -114,33 +114,33 @@ func TestTenantPoolMaxSizeFromEnv(t *testing.T) {
 	}
 }
 
-func TestTenantPoolRefillFreeRatioFromEnv(t *testing.T) {
-	const key = "DRIVE9_TENANT_POOL_REFILL_FREE_RATIO"
+func TestTenantPoolRefillBatchSizeFromEnv(t *testing.T) {
+	const key = "DRIVE9_TENANT_POOL_REFILL_BATCH_SIZE"
 	restore := snapshotEnv(t, []string{key})
 	t.Cleanup(func() { restoreEnv(t, restore) })
 
 	unsetEnv(t, []string{key})
-	got, err := tenantPoolRefillFreeRatioFromEnv()
+	got, err := tenantPoolRefillBatchSizeFromEnv()
 	if err != nil {
-		t.Fatalf("tenantPoolRefillFreeRatioFromEnv empty: %v", err)
+		t.Fatalf("tenantPoolRefillBatchSizeFromEnv empty: %v", err)
 	}
-	if got != server.DefaultTenantPoolRefillFreeRatio {
-		t.Fatalf("empty refill ratio = %f, want %f", got, server.DefaultTenantPoolRefillFreeRatio)
+	if got != server.DefaultTenantPoolRefillBatchSize {
+		t.Fatalf("empty refill batch size = %d, want %d", got, server.DefaultTenantPoolRefillBatchSize)
 	}
 
-	setEnv(t, key, "0.75")
-	got, err = tenantPoolRefillFreeRatioFromEnv()
+	setEnv(t, key, "5")
+	got, err = tenantPoolRefillBatchSizeFromEnv()
 	if err != nil {
-		t.Fatalf("tenantPoolRefillFreeRatioFromEnv valid: %v", err)
+		t.Fatalf("tenantPoolRefillBatchSizeFromEnv valid: %v", err)
 	}
-	if got != 0.75 {
-		t.Fatalf("refill ratio = %f, want 0.75", got)
+	if got != 5 {
+		t.Fatalf("refill batch size = %d, want 5", got)
 	}
 
-	for _, raw := range []string{"0", "-0.1", "1.1", "NaN", "bad"} {
+	for _, raw := range []string{"0", "-1", "bad"} {
 		setEnv(t, key, raw)
-		if _, err := tenantPoolRefillFreeRatioFromEnv(); err == nil {
-			t.Fatalf("tenantPoolRefillFreeRatioFromEnv(%q) error = nil, want error", raw)
+		if _, err := tenantPoolRefillBatchSizeFromEnv(); err == nil {
+			t.Fatalf("tenantPoolRefillBatchSizeFromEnv(%q) error = nil, want error", raw)
 		}
 	}
 }

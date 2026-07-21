@@ -2265,6 +2265,78 @@ func (s *Store) MarkFreeTenantPoolTenantDeleting(ctx context.Context, tenantID s
 	return updated, nil
 }
 
+// FailStalePlaceholderTenantPoolTenants fails pending pool tenants whose
+// binding still carries a placeholder cluster id (cluster creation in flight
+// or abandoned) older than the cutoff. Failing the tenant frees the slot from
+// CountTenantPoolFreeSlots so the refill worker replaces it. If the abandoned
+// creation later completes, the creator observes the non-pending tenant and
+// deprovisions the cluster instead of resurrecting the slot. Returns the
+// number of tenants marked failed.
+func (s *Store) FailStalePlaceholderTenantPoolTenants(ctx context.Context, organizationID, clusterIDPrefix string, olderThan time.Time, limit int) (failed int, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "fail_stale_placeholder_tidbcloud_pool_tenants", start, &err)
+	organizationID = strings.TrimSpace(organizationID)
+	if organizationID == "" {
+		return 0, fmt.Errorf("organization_id is required")
+	}
+	if strings.TrimSpace(clusterIDPrefix) == "" {
+		return 0, fmt.Errorf("cluster id prefix is required")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		rows, queryErr := tx.QueryContext(ctx, `SELECT t.id
+			FROM tenants t
+			JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = t.id
+			WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ? AND t.status = ?
+				AND b.cluster_id LIKE ? AND b.created_at < ?
+			ORDER BY b.created_at ASC
+			LIMIT ? FOR UPDATE`,
+			organizationID, TenantPoolBindingFree, tidbCloudNativeProvider, TenantPending,
+			clusterIDPrefix+"%", olderThan.UTC(), limit)
+		if queryErr != nil {
+			return queryErr
+		}
+		var ids []string
+		for rows.Next() {
+			var id string
+			if scanErr := rows.Scan(&id); scanErr != nil {
+				_ = rows.Close()
+				return scanErr
+			}
+			ids = append(ids, id)
+		}
+		if closeErr := rows.Close(); closeErr != nil {
+			return closeErr
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, 0, len(ids)+3)
+		args = append(args, TenantFailed, time.Now().UTC(), TenantPending)
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		res, execErr := tx.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ?
+			WHERE status = ? AND id IN (`+placeholders+`)`, args...)
+		if execErr != nil {
+			return execErr
+		}
+		n, _ := res.RowsAffected()
+		failed = int(n)
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return failed, nil
+}
+
 func (s *Store) ListTenantsByTiDBCloudOrganizations(ctx context.Context, organizationIDs []string, offset, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_tenants_by_tidbcloud_orgs", start, &err)
