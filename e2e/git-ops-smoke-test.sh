@@ -4,13 +4,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/provision-helper.sh"
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
 MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
-FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
+FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-$DRIVE9_E2E_TMPDIR}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
@@ -771,7 +772,7 @@ else
 fi
 precheck_fuse
 
-RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/drive9-git-ops.XXXXXX")"
+RUN_ROOT="$(mktemp -d "$(drive9_e2e_tmp_path "drive9-git-ops.XXXXXX")")"
 CLI_HOME="$RUN_ROOT/home"
 mkdir -p "$CLI_HOME"
 write_portable_profile
@@ -781,7 +782,7 @@ if [ -n "$DRIVE9_API_KEY" ]; then
   echo "[1] use provided DRIVE9_API_KEY"
 else
   echo "[1] provision tenant"
-  resp=$(curl_body_code POST "$BASE/v1/provision")
+  resp=$(drive9_provision_curl_body_code "$BASE" || true)
   code=$(http_code "$resp")
   check_eq "POST /v1/provision returns 202" "$code" "202"
   API_KEY=$(json_body "$resp" | jq -r '.api_key // empty')

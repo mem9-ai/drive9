@@ -21,6 +21,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/provision-helper.sh"
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 DRIVE9_IMAGE_FIXTURE_PATH="${DRIVE9_IMAGE_FIXTURE_PATH:-$SCRIPT_DIR/fixtures/cat03.jpg}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-300}"
@@ -222,18 +223,18 @@ BACKEND_DIR="${ROOT_DIR}/backend/go"
 FRONTEND_DIR="${ROOT_DIR}/frontend/web"
 BATCH_DIR="${ROOT_DIR}/batch"
 LARGE_FILE_BYTES=$((LARGE_FILE_MB * 1024 * 1024))
-LARGE_FILE_LOCAL="/tmp/drive9-e2e-large-${TS}.bin"
-LARGE_FILE_DOWNLOADED="/tmp/drive9-e2e-large-${TS}.download.bin"
+LARGE_FILE_LOCAL="$(drive9_e2e_tmp_path "drive9-e2e-large-${TS}.bin")"
+LARGE_FILE_DOWNLOADED="$(drive9_e2e_tmp_path "drive9-e2e-large-${TS}.download.bin")"
 LARGE_REMOTE_DIR="${ROOT_DIR}/large"
 LARGE_REMOTE_FILE="${LARGE_REMOTE_DIR}/blob-${LARGE_FILE_MB}m.bin"
-IMAGE_LOCAL="/tmp/drive9-e2e-image-${TS}.jpg"
+IMAGE_LOCAL="$(drive9_e2e_tmp_path "drive9-e2e-image-${TS}.jpg")"
 IMAGE_REMOTE="${ROOT_DIR}/assets/icon-${TS}.jpg"
 SEM_TEXT_TARGET="${ROOT_DIR}/notes/cat-story-${TS}.txt"
 SEM_TEXT_OTHER="${ROOT_DIR}/notes/dog-story-${TS}.txt"
 IMAGE_CAPTION_REMOTE="${ROOT_DIR}/assets/icon-${TS}.caption.txt"
 
 step "1" "Provision tenant"
-resp=$(curl_body_code POST "$BASE/v1/provision")
+resp=$(drive9_provision_curl_body_code "$BASE" || true)
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "POST /v1/provision returns 202" "$code" "202"

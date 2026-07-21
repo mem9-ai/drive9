@@ -9,6 +9,56 @@ including local single-tenant validation via `drive9-server-local`.
 - `jq` installed
 - Bash 4+
 
+For `tidb_cloud_native` endpoints that do not have server-side default TiDB
+Cloud credentials, set `DRIVE9_TIDBCLOUD_PUBLIC_KEY` and
+`DRIVE9_TIDBCLOUD_PRIVATE_KEY`. The general provisioning smoke scripts then send
+those fields in `/v1/provision`; when unset, they keep the existing empty-body
+provisioning behavior for anonymous/default-key endpoints. Optionally set
+`DRIVE9_TIDBCLOUD_SPENDING_LIMIT` to include `tidbcloud_spending_limit`.
+
+Use `DRIVE9_E2E_TMPDIR` to move generated e2e local artifacts off `/tmp`.
+Scripts create the directory if needed, export `TMPDIR` from it so `mktemp`
+uses the same root, and default FUSE run roots to it unless `FUSE_MOUNT_ROOT`
+is set explicitly.
+
+## Hosted cleanup
+
+Hosted smoke suites create real Drive9 tenants/spaces. By default cleanup is
+disabled to preserve the historical debugging behavior:
+
+```bash
+DRIVE9_E2E_CLEANUP=0 bash e2e/smoke-all.sh
+```
+
+For scheduled online checks, enable registry-based cleanup explicitly:
+
+```bash
+DRIVE9_E2E_TMPDIR="$HOME/.cache/drive9-smoke/tmp" \
+DRIVE9_E2E_CLEANUP=always \
+bash e2e/smoke-all.sh
+```
+
+`smoke-all.sh` creates a `drive9-e2e-*` run registry under
+`~/.cache/drive9-smoke/cleanup-pending/`. Each provisioned tenant/fork is
+registered immediately after creation; the finalizer deletes only those
+registered resources and never scans the server for tenants. Registries are
+owner-readable only because they contain API keys. Successful cleanup writes a
+sanitized summary under `~/.cache/drive9-smoke/cleanup-completed/`; incomplete
+cleanup leaves the raw registry pending for retry by `e2e/cleanup-pending.sh`.
+Standalone suites fail before provisioning if cleanup is enabled without a
+registry prepared by `smoke-all.sh`.
+If a pending registry was created with TiDBCloud-native credentials, retries must
+run with the same `DRIVE9_TIDBCLOUD_PUBLIC_KEY` and
+`DRIVE9_TIDBCLOUD_PRIVATE_KEY` environment available; the registry records only
+that credentials are required, not the credential values themselves.
+
+Supported modes:
+
+- `DRIVE9_E2E_CLEANUP=0`: register/delete disabled.
+- `DRIVE9_E2E_CLEANUP=always`: delete registered resources on success or failure.
+- `DRIVE9_E2E_CLEANUP=success`: delete only after a fully successful run; failed
+  runs move the registry to `cleanup-retained/` for manual debugging.
+
 ## Scripts
 
 | Script | What it validates |
@@ -16,6 +66,7 @@ including local single-tenant validation via `drive9-server-local`.
 | `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download |
 | `api-smoke-test-existing-key.sh` | Existing API key status/list checks |
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, default-slot `pack`/`unpack`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
+| `cleanup-pending.sh` | Manual retry helper for pending hosted cleanup registries left by interrupted `smoke-all.sh` runs; `smoke-all.sh` also invokes the same pending cleanup path before starting a new cleanup-enabled run |
 | `layer-fs-smoke-test.sh` | Layer filesystem API+CLI+FUSE workflow: create by name/tag, diff/checkpoint lookup, rollback, commit, scope rejection, conflict detection, mkdir/upsert/whiteout/rename/symlink/chmod entries, and checkpoint/full restore into fresh local roots |
 | `layer-fs-smoke-test-realdev.sh` | Manual realdev wrapper for `layer-fs-smoke-test.sh`; defaults to the shared dev endpoint and enables strict FUSE restore coverage without being wired into `local-e2e` CI |
 | `portable-pack-unpack-e2e.sh` | Portable profile pack/unpack over a deterministic local repo: offline npm `file:` install creates `node_modules`, Git staged/unstaged/untracked status changes are captured, pack writes the default hidden archive, fresh local-root unpack restores overlay files, symlinks, `.git`, `node_modules`, branch, HEAD, and `git status` |
@@ -48,7 +99,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, full `smoke-all.sh` (journal, posix-permission, git-workspace), git feature matrix |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | `e2e-all` workflow (`Run workflow` button) | Everything above + pjdfstest POSIX suite (best-effort) via `run_all_e2e=1` |
-| Manual only | not wired, run by hand | `layer-fs-smoke-test-realdev.sh` (shared dev endpoint), `verify-description-e2e.sh` (Docker + Ollama), `verify-description-tidb-zero-e2e.sh` (TiDB Cloud Zero), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `local-smoke.sh` (`make e2e-local` wrapper) |
+| Manual only | not wired, run by hand | `layer-fs-smoke-test-realdev.sh` (shared dev endpoint), `verify-description-e2e.sh` (Docker + Ollama), `verify-description-tidb-zero-e2e.sh` (TiDB Cloud Zero), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `cleanup-pending.sh` (manual pending cleanup retry helper; also invoked by cleanup-enabled `smoke-all.sh` before a run), `local-smoke.sh` (`make e2e-local` wrapper) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
@@ -192,6 +243,11 @@ bash e2e/posix-permission-smoke-test.sh
 DRIVE9_TIDBCLOUD_PUBLIC_KEY=xxx DRIVE9_TIDBCLOUD_PRIVATE_KEY=xxx bash e2e/native-smoke-test.sh
 
 bash e2e/smoke-all.sh
+
+# Use TiDB Cloud credentials for tidb_cloud_native endpoints without a
+# server-side default key.
+DRIVE9_TIDBCLOUD_PUBLIC_KEY=xxx DRIVE9_TIDBCLOUD_PRIVATE_KEY=xxx \
+  bash e2e/smoke-all.sh
 
 # Include portable profile pack/unpack coverage in smoke-all.
 RUN_PORTABLE_PACK_E2E=1 bash e2e/smoke-all.sh
@@ -407,7 +463,8 @@ CLI_SOURCE=official bash e2e/git-workspace-smoke-test.sh
 - CLI batch small-file coverage can be tuned with `CLI_BATCH_SMALL_FILE_COUNT` (default `10`).
 - API retry knobs for throttling are `REQUEST_MAX_RETRIES` and `REQUEST_RETRY_SLEEP_S`; the FUSE correctness/SQLite/concurrency workloads use these for provisioning/status and CLI retry loops.
 - CLI retry knobs for `cli-smoke-test.sh` and `fuse-smoke-test.sh` throttling are `CLI_MAX_RETRIES` and `CLI_RETRY_SLEEP_S`.
-- FUSE mount readiness knobs are `MOUNT_READY_TIMEOUT_S`, `MOUNT_READY_INTERVAL_S`, and `FUSE_MOUNT_ROOT`.
+- Temporary artifact root is `DRIVE9_E2E_TMPDIR` (default `${TMPDIR:-/tmp}`); scripts export `TMPDIR` from it and use it for named large fixtures, local work roots, cleanup run dirs, and default FUSE roots.
+- FUSE mount readiness knobs are `MOUNT_READY_TIMEOUT_S`, `MOUNT_READY_INTERVAL_S`, and `FUSE_MOUNT_ROOT` (default `$DRIVE9_E2E_TMPDIR`).
 - FUSE correctness workload knobs are `FUSE_CORRECTNESS_LARGE_MB` and `FUSE_CORRECTNESS_KEEP_ARTIFACTS`.
 - FUSE SQLite correctness workload knobs are `FUSE_SQLITE_ROWS`, `FUSE_SQLITE_CHURN_ROUNDS`, `FUSE_SQLITE_CONCURRENCY_READERS`, `FUSE_SQLITE_CONCURRENCY_WRITES`, `FUSE_SQLITE_WORKLOAD_TIMEOUT_S`, `FUSE_SQLITE_KEEP_ARTIFACTS`, `RUN_FUSE_SQLITE_WAL`, `RUN_FUSE_SQLITE_CHURN`, and `RUN_FUSE_SQLITE_CONCURRENCY`.
 - FUSE concurrency workload knobs are `FUSE_CONCURRENCY_WORKERS`, `FUSE_CONCURRENCY_FILES_PER_WORKER`, `FUSE_CONCURRENCY_READER_WORKERS`, `FUSE_CONCURRENCY_PAYLOAD_KB`, `FUSE_CONCURRENCY_TIMEOUT_S`, and `FUSE_CONCURRENCY_KEEP_ARTIFACTS`.

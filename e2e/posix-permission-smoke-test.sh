@@ -14,6 +14,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/provision-helper.sh"
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
@@ -24,7 +26,7 @@ CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
 MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
 MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
-FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
+FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-$DRIVE9_E2E_TMPDIR}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 
 PASS=0
@@ -286,7 +288,7 @@ fi
 # [1] Provision tenant
 # ---------------------------------------------------------------------------
 echo "[1] provision tenant"
-resp=$(curl_body_code POST "$BASE/v1/provision")
+resp=$(drive9_provision_curl_body_code "$BASE" || true)
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "POST /v1/provision returns 202" "$code" "202"
@@ -393,11 +395,12 @@ check_cmd "drive9 binary ready" test -x "$CLI_BIN"
 
 CLI_PERM_FILE="/cli-perm-${TS}.txt"
 CLI_PERM_DIR="/cli-perm-${TS}"
+CLI_PERM_LOCAL="$(drive9_e2e_tmp_path "drive9-perm-${TS}.txt")"
 
 # Create file and dir via CLI
 drive9_retry fs mkdir "$CLI_PERM_DIR" >/dev/null
-printf "cli-perm-%s" "$TS" > "/tmp/drive9-perm-${TS}.txt"
-drive9_retry fs cp "/tmp/drive9-perm-${TS}.txt" ":$CLI_PERM_FILE" >/dev/null
+printf "cli-perm-%s" "$TS" > "$CLI_PERM_LOCAL"
+drive9_retry fs cp "$CLI_PERM_LOCAL" ":$CLI_PERM_FILE" >/dev/null
 
 # 4.1 CLI chmod file
 drive9_retry fs chmod 600 "$CLI_PERM_FILE" >/dev/null
@@ -507,7 +510,7 @@ fi
 # [6] Cleanup
 # ---------------------------------------------------------------------------
 echo "[6] cleanup"
-rm -f "/tmp/drive9-perm-${TS}.txt"
+rm -f "$CLI_PERM_LOCAL"
 rm -f "$CLI_BIN"
 
 resp=$(curl_body_code DELETE "$BASE/v1/fs/$PERM_ROOT?recursive" "$API_KEY")

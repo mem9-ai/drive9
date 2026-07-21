@@ -3,6 +3,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/provision-helper.sh"
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
@@ -207,6 +209,7 @@ cleanup() {
 echo "=== drive9 portable pack/unpack e2e ==="
 echo "BASE=$BASE"
 echo "CLI_SOURCE=$CLI_SOURCE"
+echo "E2E_TMPDIR=$DRIVE9_E2E_TMPDIR"
 
 check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
 check_cmd "curl is available" bash -c 'command -v curl >/dev/null'
@@ -223,7 +226,7 @@ fi
 echo "[1] provision tenant"
 if [ -z "$DRIVE9_API_KEY" ]; then
   pfile="$(mktemp)"
-  pcode=$(curl -sS -o "$pfile" -w "%{http_code}" -X POST "$BASE/v1/provision")
+  pcode=$(drive9_provision_to_file "$BASE" "$pfile" || true)
   check_eq "POST /v1/provision returns 202" "$pcode" "202"
   API_KEY=$(jq -r '.api_key // empty' "$pfile")
   rm -f "$pfile"
@@ -257,7 +260,7 @@ prepare_cli_binary
 check_cmd "drive9 binary ready" test -x "$CLI_BIN"
 
 TS="$(date +%s)-$$"
-WORK_ROOT="$(mktemp -d "/tmp/drive9-portable-pack-e2e-${TS}.XXXXXX")"
+WORK_ROOT="$(mktemp -d "$(drive9_e2e_tmp_path "drive9-portable-pack-e2e-${TS}.XXXXXX")")"
 CLI_ENV_HOME="$WORK_ROOT/home"
 SRC_LOCAL_ROOT="$WORK_ROOT/source-local"
 RESTORE_LOCAL_ROOT="$WORK_ROOT/restore-local"

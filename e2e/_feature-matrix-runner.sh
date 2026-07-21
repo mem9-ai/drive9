@@ -14,6 +14,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/provision-helper.sh"
+
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
@@ -22,7 +25,7 @@ MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-25}"
 MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
 REMOTE_VISIBILITY_TIMEOUT_S="${REMOTE_VISIBILITY_TIMEOUT_S:-20}"
 REMOTE_VISIBILITY_INTERVAL_S="${REMOTE_VISIBILITY_INTERVAL_S:-0.5}"
-FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
+FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-$DRIVE9_E2E_TMPDIR}"
 FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
@@ -42,7 +45,6 @@ PJDFSTEST_TIMEOUT_S="${PJDFSTEST_TIMEOUT_S:-900}"
 PJDFSTEST_ALLOW_NONROOT="${PJDFSTEST_ALLOW_NONROOT:-0}"
 PJDFSTEST_MOUNT_ALLOW_OTHER="${PJDFSTEST_MOUNT_ALLOW_OTHER:-auto}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 FEATURE_MATRIX_REPORT_DIR="${FEATURE_MATRIX_REPORT_DIR:-$REPO_ROOT/e2e/reports}"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -1284,7 +1286,7 @@ main() {
     record "PASS" "Provisioning" "use provided DRIVE9_API_KEY" "provided"
   else
     local resp code body
-    resp=$(curl_body_code POST "$BASE/v1/provision")
+    resp=$(drive9_provision_curl_body_code "$BASE" || true)
     code=$(http_code "$resp")
     body=$(json_body "$resp")
     if [ "$code" = "202" ]; then

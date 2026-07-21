@@ -8,13 +8,15 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/provision-helper.sh"
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
 MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
-FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
+FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-$DRIVE9_E2E_TMPDIR}"
 FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 FUSE_CORRECTNESS_KEEP_ARTIFACTS="${FUSE_CORRECTNESS_KEEP_ARTIFACTS:-0}"
@@ -536,7 +538,7 @@ if [ -n "$DRIVE9_API_KEY" ]; then
   API_KEY="$DRIVE9_API_KEY"
   check_eq "use provided DRIVE9_API_KEY" "true" "true"
 else
-  resp=$(curl_body_code POST "$BASE/v1/provision")
+  resp=$(drive9_provision_curl_body_code "$BASE" || true)
   code=$(http_code "$resp")
   body=$(json_body "$resp")
   check_eq "POST /v1/provision returns 202" "$code" "202"

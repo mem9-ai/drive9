@@ -40,6 +40,13 @@ export DRIVE9_BASE="https://api.drive9.ai"
 
 Use the dev value unless the environment owner announces a new endpoint.
 
+For `tidb_cloud_native` endpoints that do not provide server-side default TiDB
+Cloud credentials, set `DRIVE9_TIDBCLOUD_PUBLIC_KEY` and
+`DRIVE9_TIDBCLOUD_PRIVATE_KEY`. The common e2e provisioning helper sends them in
+`/v1/provision` for the standard smoke scripts while preserving empty-body
+provisioning when they are unset. Set `DRIVE9_TIDBCLOUD_SPENDING_LIMIT` only
+when the run must override the create-time TiDB Cloud spending limit.
+
 #### Run smoke scripts
 
 ```bash
@@ -88,6 +95,13 @@ bash e2e/posix-permission-smoke-test.sh
 # Run the default smoke-all sequence once
 bash e2e/smoke-all.sh
 
+# Scheduled hosted smoke runs should opt into registry-based cleanup. Cleanup
+# only deletes tenants/forks registered by this local drive9-e2e run; it does not
+# scan server tenants.
+DRIVE9_E2E_TMPDIR="$HOME/.cache/drive9-smoke/tmp" \
+DRIVE9_E2E_CLEANUP=always \
+bash e2e/smoke-all.sh
+
 # Or enable optional Git coverage in that same single smoke-all run.
 # Set either variable to 1 as needed; setting both includes both Git suites.
 RUN_GIT_OPS_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
@@ -103,6 +117,41 @@ DRIVE9_TIDBCLOUD_PUBLIC_KEY="$DRIVE9_TIDBCLOUD_PUBLIC_KEY" \
 DRIVE9_TIDBCLOUD_PRIVATE_KEY="$DRIVE9_TIDBCLOUD_PRIVATE_KEY" \
 bash e2e/native-smoke-test.sh
 ```
+
+### Scheduled smoke-all failure handling
+
+When a scheduled `smoke-all.sh` run finishes with any failed suite or assertion,
+do the failure analysis before creating or changing repo issues:
+
+1. Identify the failed suite, failed case/assertion, smoke endpoint, command,
+   exit status, cleanup result, and full log path.
+2. Analyze the failed case enough to state a likely root cause or the concrete
+   blocker that prevents a root-cause call. Use the repo, smoke logs, and
+   relevant code paths; do not report only the aggregate `PASS=N FAIL=M` line.
+   If service/app logs are available through local tooling, include them in the
+   analysis. If they are not available from the current machine or agent, state
+   that limitation explicitly and continue the local-log/code-path analysis.
+   Keep machine-specific log access details in local runbooks or agent memory,
+   not in this repo-level policy.
+3. Report the findings first in the Slock/Raft smoke-test thread that requested
+   or owns the run. Include the failed case, evidence, log path, impact, and
+   root-cause assessment.
+4. Include an investigation-context block with non-secret identifiers needed for
+   external/cloud-side debugging when they are available: run id, branch/commit,
+   endpoint/region, parent/fork/admin tenant ids, Drive9 tenant status/kind,
+   TiDB Cloud cluster id/state, branch id/state/display name/user prefix/public
+   endpoint, relevant create/update/failure timestamps, failed checks, cleanup
+   registry path, pending-cleanup state, and retained-resource decision. Never
+   include API keys, private keys, DB passwords, bearer tokens, full DSNs, or
+   credential files in chat or issues.
+5. If the failure is a code problem, search existing GitHub issues before filing
+   a new one. Create or update the matching issue with: background, reproduction
+   steps, evidence logs, impact, root-cause analysis or suspicious code path,
+   suggested fix direction, and validation plan.
+6. If the failure is due to environment, credentials, runner setup, endpoint
+   availability, or another non-code operational condition, report that in the
+   Slock/Raft thread instead of filing a code bug, unless durable repo tracking
+   is needed because the condition is recurring or needs engineering follow-up.
 
 ### Local via `drive9-server-local`
 
@@ -534,6 +583,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | Variable | Default | Used by |
 |----------|---------|---------|
 | `DRIVE9_BASE` | `http://127.0.0.1:9009` | all scripts |
+| `DRIVE9_E2E_TMPDIR` | `${TMPDIR:-/tmp}` | shared e2e temp root; scripts export `TMPDIR` from it and default FUSE roots to it |
 | `DRIVE9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh` |
 | `DRIVE9_API_KEY` | - | `api-smoke-test-existing-key.sh` |
 | `DRIVE9_API_KEY` | - | `fuse-smoke-test.sh` (optional; skip provision when set) |
@@ -565,7 +615,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
 | `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
 | `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
+| `FUSE_MOUNT_ROOT` | `$DRIVE9_E2E_TMPDIR` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
 | `CLI_MAX_RETRIES` | `8` | `fuse-smoke-test.sh` |
 | `CLI_RETRY_SLEEP_S` | `2` | `fuse-smoke-test.sh` |
 | `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
