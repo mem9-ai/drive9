@@ -3,6 +3,7 @@ package fuse
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -11,6 +12,10 @@ import (
 	"syscall"
 	"time"
 )
+
+// ErrReexecInProgress is returned by Reexec when another reexec attempt is
+// already holding the guard. Callers should compare with errors.Is.
+var ErrReexecInProgress = errors.New("reexec: already in progress")
 
 // ReexecConfig holds parameters for a binary reexec attempt.
 type ReexecConfig struct {
@@ -88,7 +93,7 @@ func (fs *Dat9FS) Reexec(cfg ReexecConfig) ReexecResult {
 	// Step 1: acquire the reexec guard (must be first to prevent concurrent
 	// attempts even when preconditions fail).
 	if !fs.reexecGuard.tryAcquire() {
-		return ReexecResult{Err: fmt.Errorf("reexec: already in progress")}
+		return ReexecResult{Err: ErrReexecInProgress}
 	}
 	defer fs.reexecGuard.release()
 
@@ -175,6 +180,14 @@ func (fs *Dat9FS) Reexec(cfg ReexecConfig) ReexecResult {
 		"DRIVE9_REEXEC_MOUNT="+cfg.MountPoint,
 		fmt.Sprintf("DRIVE9_REEXEC_VERSION=%d", ReexecProtocolVersion),
 	)
+	// Re-inject the live credential snapshot so the child can rebuild its
+	// Drive9 client after fd import. The parent's ResolveCredentials already
+	// unset DRIVE9_SERVER/DRIVE9_API_KEY/DRIVE9_VAULT_TOKEN from its own
+	// environment (the "strip DRIVE9_* before exec" mitigation), so inheriting
+	// only os.Environ() would leave a child that was started with explicit or
+	// env credentials unable to authenticate. fs.opts holds the credential this
+	// mount is bound to for its lifetime (Invariant #3); pass it through.
+	child.Env = append(child.Env, reexecCredentialEnv(fs.opts)...)
 
 	if err := child.Start(); err != nil {
 		return ReexecResult{Err: fmt.Errorf("reexec: start child: %w", err)}
@@ -190,11 +203,38 @@ func (fs *Dat9FS) Reexec(cfg ReexecConfig) ReexecResult {
 	acceptDeadline := time.Now().Add(cfg.acceptTimeout())
 	_ = listener.(*net.UnixListener).SetDeadline(acceptDeadline)
 
-	conn, err := listener.Accept()
-	if err != nil {
-		_ = child.Process.Kill()
-		<-childDone
-		return ReexecResult{Err: fmt.Errorf("reexec: accept connection: %w", err)}
+	// Accept in a goroutine so we can also observe childDone: if the child
+	// exits before dialing the socket (e.g. an incompatible child rejecting
+	// DRIVE9_REEXEC_VERSION, or a startup crash), a blocking Accept would wait
+	// out the full AcceptTimeout while the mount stays quiesced. Selecting on
+	// childDone lets the old process resume immediately instead.
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		c, err := listener.Accept()
+		acceptCh <- acceptResult{conn: c, err: err}
+	}()
+
+	var conn net.Conn
+	select {
+	case res := <-acceptCh:
+		if res.err != nil {
+			_ = child.Process.Kill()
+			<-childDone
+			return ReexecResult{Err: fmt.Errorf("reexec: accept connection: %w", res.err)}
+		}
+		conn = res.conn
+	case childErr := <-childDone:
+		// Child is gone before connecting. Unblock the Accept goroutine by
+		// closing the listener, then drain its result so the goroutine exits.
+		_ = listener.Close()
+		if res := <-acceptCh; res.conn != nil {
+			_ = res.conn.Close()
+		}
+		return ReexecResult{Err: fmt.Errorf("reexec: child exited before connecting: %w", childErr)}
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -206,7 +246,13 @@ func (fs *Dat9FS) Reexec(cfg ReexecConfig) ReexecResult {
 	}
 
 	// Step 8: wait for accept message from child.
-	_ = conn.SetReadDeadline(acceptDeadline)
+	//
+	// Reset the read deadline after the fd is sent so AcceptTimeout governs
+	// only the "wait for the child to import/probe the fd and send its accept
+	// message" phase, not the earlier connect wait. Reusing the single
+	// acceptDeadline would let a slow-connecting child burn the read budget
+	// and trigger a premature rollback.
+	_ = conn.SetReadDeadline(time.Now().Add(cfg.acceptTimeout()))
 	decoder := json.NewDecoder(conn)
 	var msg reexecAcceptMsg
 	if err := decoder.Decode(&msg); err != nil {
@@ -233,4 +279,25 @@ func (fs *Dat9FS) Reexec(cfg ReexecConfig) ReexecResult {
 	// since the child has its own copy via SCM_RIGHTS.
 	accepted = true
 	return ReexecResult{Accepted: true}
+}
+
+// reexecCredentialEnv builds the DRIVE9_SERVER/DRIVE9_API_KEY/DRIVE9_VAULT_TOKEN
+// env entries the child needs to rebuild its Drive9 client. APIKey and Token are
+// mutually exclusive (Invariant #3), so at most one credential var is emitted.
+// Empty fields are omitted so we never plant a blank credential that would
+// shadow a config-context fallback in the child's ResolveCredentials.
+func reexecCredentialEnv(opts *MountOptions) []string {
+	if opts == nil {
+		return nil
+	}
+	var env []string
+	if opts.Server != "" {
+		env = append(env, "DRIVE9_SERVER="+opts.Server)
+	}
+	if opts.Token != "" {
+		env = append(env, "DRIVE9_VAULT_TOKEN="+opts.Token)
+	} else if opts.APIKey != "" {
+		env = append(env, "DRIVE9_API_KEY="+opts.APIKey)
+	}
+	return env
 }

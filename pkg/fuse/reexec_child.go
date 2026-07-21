@@ -12,6 +12,12 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
 
+// reexecRecvFdTimeout bounds how long the child waits to receive the FUSE
+// device fd from the parent after connecting. It mirrors the parent's default
+// AcceptTimeout so a dead/stalled parent cannot leave the child blocked forever
+// in recvFd. It is a var (not const) so tests can shorten it.
+var reexecRecvFdTimeout = 30 * time.Second
+
 // IsReexecChild returns true if the current process was spawned by a reexec
 // parent. The parent sets DRIVE9_REEXEC_SOCK to the Unix socket path.
 func IsReexecChild() bool {
@@ -68,10 +74,24 @@ func ReexecChildHandshake(cfg ReexecChildConfig) (fd int, conn *net.UnixConn, er
 	}
 
 	unixConn := rawConn.(*net.UnixConn)
+	// Bound the SCM_RIGHTS wait: if the parent dies or stalls between accepting
+	// the connection and sending the fd, recvFd would otherwise block forever,
+	// leaving a stray reexec child. A deadline makes the child fail fast so
+	// supervisors can retry or report the failed handoff.
+	if err := unixConn.SetReadDeadline(time.Now().Add(reexecRecvFdTimeout)); err != nil {
+		_ = unixConn.Close()
+		return -1, nil, fmt.Errorf("reexec child: set recv deadline: %w", err)
+	}
 	fd, err = recvFd(unixConn)
 	if err != nil {
 		_ = unixConn.Close()
 		return -1, nil, fmt.Errorf("reexec child: receive fd: %w", err)
+	}
+	// Clear the deadline: the same conn is reused to send the accept message
+	// after serving starts, which happens well after this bounded wait.
+	if err := unixConn.SetReadDeadline(time.Time{}); err != nil {
+		_ = unixConn.Close()
+		return -1, nil, fmt.Errorf("reexec child: clear recv deadline: %w", err)
 	}
 
 	return fd, unixConn, nil
@@ -96,7 +116,9 @@ func ReexecChildHandshake(cfg ReexecChildConfig) (fd int, conn *net.UnixConn, er
 func ReexecChildImportAndServe(fd int, mountPoint string, rawFS gofuse.RawFileSystem, opts *gofuse.MountOptions) (*gofuse.Server, error) {
 	server, err := gofuse.ImportFd(rawFS, mountPoint, fd, opts)
 	if err != nil {
-		_ = syscall.Close(fd)
+		// ImportFd already closes fd on failure (documented contract), so we
+		// must NOT close it again — a double-close can hit an unrelated
+		// descriptor if the number was reused in between.
 		return nil, fmt.Errorf("reexec child: import fd: %w", err)
 	}
 
@@ -116,13 +138,33 @@ func ReexecChildImportAndServe(fd int, mountPoint string, rawFS gofuse.RawFileSy
 	select {
 	case err := <-probeDone:
 		if err != nil {
+			teardownImportedServer(server, fd)
 			return nil, fmt.Errorf("reexec child: mount probe failed: %w", err)
 		}
 	case <-time.After(10 * time.Second):
+		teardownImportedServer(server, fd)
 		return nil, fmt.Errorf("reexec child: mount probe timed out after 10s")
 	}
 
 	return server, nil
+}
+
+// teardownImportedServer stops a server started via ImportFd after a
+// post-Serve failure (probe failed/timed out), honoring the
+// ReexecChildImportAndServe contract that failures must not leave the
+// handed-off FUSE connection alive.
+//
+// It must NOT call server.Unmount(): that runs `fusermount -u` and would
+// destroy the parent's still-live mount, defeating rollback. Instead it closes
+// the FUSE device fd, which makes the Serve() read loop fail with ENODEV/EBADF
+// and exit. Serve() then closes ms.mountFd itself; that second close targets an
+// already-closed descriptor and returns EBADF, which is harmless here because
+// this function opens no new fds between the close and Wait(), so the number
+// cannot have been reused. Wait() blocks until the Serve goroutine has fully
+// exited so the caller can return knowing the connection is released.
+func teardownImportedServer(server *gofuse.Server, fd int) {
+	_ = syscall.Close(fd)
+	server.Wait()
 }
 
 // SendReexecAccept sends the accept message to the parent process over

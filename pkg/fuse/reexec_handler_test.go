@@ -2,8 +2,125 @@ package fuse
 
 import (
 	"encoding/json"
+	"errors"
+	"net"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestReexecChildHandshakeRecvFdTimeout(t *testing.T) {
+	// Parent accepts the connection but never sends the fd. The child's
+	// bounded recvFd wait must fail fast instead of blocking forever.
+	//
+	// Use os.MkdirTemp (short base path) rather than t.TempDir(): macOS caps
+	// Unix socket paths near 104 bytes and t.TempDir()'s long names overflow it.
+	sockDir, err := os.MkdirTemp("", "reexec-recvfd-*")
+	if err != nil {
+		t.Fatalf("mkdir temp: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(sockDir) }()
+	sockPath := filepath.Join(sockDir, "s.sock")
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	// Accept and hold the connection open without ever sending an fd.
+	acceptedCh := make(chan net.Conn, 1)
+	go func() {
+		c, err := listener.Accept()
+		if err != nil {
+			acceptedCh <- nil
+			return
+		}
+		acceptedCh <- c
+	}()
+
+	orig := reexecRecvFdTimeout
+	reexecRecvFdTimeout = 100 * time.Millisecond
+	defer func() { reexecRecvFdTimeout = orig }()
+
+	cfg := ReexecChildConfig{
+		SockPath:   sockPath,
+		MountPoint: "/mnt/test",
+		Version:    ReexecProtocolVersion,
+	}
+
+	done := make(chan struct{})
+	var handshakeErr error
+	go func() {
+		_, _, handshakeErr = ReexecChildHandshake(cfg)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if handshakeErr == nil {
+			t.Fatal("expected recvFd to fail on stalled parent, got nil error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReexecChildHandshake blocked past the recv deadline")
+	}
+
+	if c := <-acceptedCh; c != nil {
+		_ = c.Close()
+	}
+}
+
+func TestReexecCredentialEnv(t *testing.T) {
+	tests := []struct {
+		name string
+		opts *MountOptions
+		want []string
+	}{
+		{
+			name: "nil opts",
+			opts: nil,
+			want: nil,
+		},
+		{
+			name: "server and api key",
+			opts: &MountOptions{Server: "https://api.drive9.ai", APIKey: "drive9_owner"},
+			want: []string{"DRIVE9_SERVER=https://api.drive9.ai", "DRIVE9_API_KEY=drive9_owner"},
+		},
+		{
+			name: "server and token",
+			opts: &MountOptions{Server: "https://api.drive9.ai", Token: "jwt.abc.def"},
+			want: []string{"DRIVE9_SERVER=https://api.drive9.ai", "DRIVE9_VAULT_TOKEN=jwt.abc.def"},
+		},
+		{
+			name: "token wins over api key (mutually exclusive)",
+			opts: &MountOptions{Server: "s", APIKey: "k", Token: "t"},
+			want: []string{"DRIVE9_SERVER=s", "DRIVE9_VAULT_TOKEN=t"},
+		},
+		{
+			name: "empty fields omitted",
+			opts: &MountOptions{},
+			want: nil,
+		},
+		{
+			name: "api key without server",
+			opts: &MountOptions{APIKey: "k"},
+			want: []string{"DRIVE9_API_KEY=k"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := reexecCredentialEnv(tt.opts)
+			if len(got) != len(tt.want) {
+				t.Fatalf("len = %d, want %d (got %v)", len(got), len(tt.want), got)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("env[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
 
 func TestReexecRefusesWithoutServer(t *testing.T) {
 	fs := newTestReexecFS()
@@ -28,8 +145,8 @@ func TestReexecRefusesConcurrent(t *testing.T) {
 	if result.Accepted {
 		t.Fatal("expected concurrent reexec to be refused")
 	}
-	if result.Err == nil || result.Err.Error() != "reexec: already in progress" {
-		t.Fatalf("expected 'already in progress' error, got: %v", result.Err)
+	if result.Err == nil || !errors.Is(result.Err, ErrReexecInProgress) {
+		t.Fatalf("expected ErrReexecInProgress, got: %v", result.Err)
 	}
 }
 
