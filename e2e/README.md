@@ -13,9 +13,9 @@ including local single-tenant validation via `drive9-server-local`.
 
 | Script | What it validates |
 |--------|--------------------|
-| `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download |
+| `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download; honors `DRIVE9_API_KEY` to skip provision and reuse an existing tenant (cleans up its test tree in that mode) |
 | `api-smoke-test-existing-key.sh` | Existing API key status/list checks |
-| `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, default-slot `pack`/`unpack`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
+| `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, default-slot `pack`/`unpack`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download; honors `DRIVE9_API_KEY` to skip provision and reuse an existing tenant |
 | `layer-fs-smoke-test.sh` | Layer filesystem API+CLI+FUSE workflow: create by name/tag, diff/checkpoint lookup, rollback, commit, scope rejection, conflict detection, mkdir/upsert/whiteout/rename/symlink/chmod entries, and checkpoint/full restore into fresh local roots |
 | `layer-fs-smoke-test-realdev.sh` | Manual realdev wrapper for `layer-fs-smoke-test.sh`; defaults to the shared dev endpoint and enables strict FUSE restore coverage without being wired into `local-e2e` CI |
 | `portable-pack-unpack-e2e.sh` | Portable profile pack/unpack over a deterministic local repo: offline npm `file:` install creates `node_modules`, Git staged/unstaged/untracked status changes are captured, pack writes the default hidden archive, fresh local-root unpack restores overlay files, symlinks, `.git`, `node_modules`, branch, HEAD, and `git status` |
@@ -33,7 +33,7 @@ including local single-tenant validation via `drive9-server-local`.
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
 | `native-smoke-test.sh` | TiDB Cloud Native tenant lifecycle: CLI provision with credentials, status poll, basic fs ops (mkdir/cp/cat/ls/rm), delete + verification, trap cleanup on failure |
 | `pjdfstest-suite.sh` | On-demand Linux/macOS pjdfstest POSIX compatibility suite over a real Drive9 FUSE mount; `pjdfstests.sh` and `posix-feature-matrix.sh` are aliases |
-| `smoke-all.sh` | Runs API + CLI + journal + layer FS + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; set `RUN_FUSE_SMOKE=0` to skip FUSE symlink/hardlink coverage, `RUN_GIT_OPS_SMOKE=1` to include lightweight Git coverage, `RUN_GIT_WORKSPACE_SMOKE=1` to include heavier Git workspace coverage, and `RUN_PORTABLE_PACK_E2E=1` to include portable pack/unpack coverage |
+| `smoke-all.sh` | Runs API + CLI + journal + layer FS + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; re-exports `DRIVE9_API_KEY` so every sub-suite runs in existing-tenant mode when set; set `RUN_FUSE_SMOKE=0` to skip FUSE symlink/hardlink coverage, `RUN_API_ONLY=1` to run only the core api + cli pair, `RUN_GIT_OPS_SMOKE=1` to include lightweight Git coverage, `RUN_GIT_WORKSPACE_SMOKE=1` to include heavier Git workspace coverage, and `RUN_PORTABLE_PACK_E2E=1` to include portable pack/unpack coverage |
 | `local-smoke.sh` | Starts `drive9-server-local` with a disposable local DB by default, then runs `smoke-all.sh` with semantic checks disabled and FUSE smoke skipped unless `RUN_FUSE_SMOKE=1` |
 
 ## CI automation tiers
@@ -196,6 +196,46 @@ bash e2e/smoke-all.sh
 # Include portable profile pack/unpack coverage in smoke-all.
 RUN_PORTABLE_PACK_E2E=1 bash e2e/smoke-all.sh
 ```
+
+#### Existing-tenant regression
+
+After a dev release, run `api-smoke-test.sh` and `cli-smoke-test.sh` twice:
+once against an existing tenant (set `DRIVE9_API_KEY`) and once against a fresh
+provision (unset `DRIVE9_API_KEY`). In existing-tenant mode both suites skip
+provision and reuse the tenant; `api-smoke-test.sh` also cleans up its
+timestamped test tree at the end, and the upload-limit boundary checks default
+to `0` because reserving `total_size` against an existing tenant's quota can
+spuriously fail with 507.
+
+```bash
+# Export credentials from the current drive9 ctx tenant
+# (--reveal prints the full key; keep it out of logs/screenshots)
+eval "$(drive9 ctx show --json --reveal | jq -r '"export DRIVE9_BASE=\(.server)\nexport DRIVE9_API_KEY=\(.api_key)"')"
+
+# Pass 1 — existing tenant
+bash e2e/api-smoke-test.sh
+bash e2e/cli-smoke-test.sh
+
+# Or run the whole smoke-all matrix in existing-tenant mode (re-exports
+# DRIVE9_API_KEY to every sub-suite). Set RUN_API_ONLY=1 for just the core
+# api + cli pair, RUN_FUSE_SMOKE=0 on hosts without real FUSE.
+RUN_API_ONLY=1 bash e2e/smoke-all.sh
+
+# Pass 2 — fresh tenant
+unset DRIVE9_API_KEY
+bash e2e/api-smoke-test.sh
+bash e2e/cli-smoke-test.sh
+```
+
+Useful knobs for existing-tenant runs:
+
+- `RUN_CLI_FORK_CHECKS=0` — skip the fork flow (shared-schema tenants reject
+  `/v1/fork` with 409; very large tenants should not be forked).
+- `RUN_LARGE_FILE=0` — skip the 100MB API large-file upload.
+- `RUN_SEMANTIC_CHECKS=0` / `RUN_CLI_SEMANTIC_CHECKS=0` — skip semantic recall
+  checks when no embedding endpoint is available.
+- `RUN_UPLOAD_LIMIT_BOUNDARY=1` / `RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1` — force the
+  upload-limit boundary checks back on in existing-tenant mode.
 
 #### On-demand pjdfstest POSIX compatibility suite
 
@@ -437,9 +477,9 @@ CLI_SOURCE=official bash e2e/git-workspace-smoke-test.sh
   `GIT_OPS_CLONE_TIMEOUT_S`, `GIT_OPS_KEEP_ARTIFACTS`, and
   `GIT_OPS_TRACE_GIT`.
 - CLI source knobs are `CLI_SOURCE` (`build` or `official`), `CLI_RELEASE_BASE_URL`, and optional `CLI_RELEASE_VERSION`.
-- API upload-limit boundary check is enabled by default via `RUN_UPLOAD_LIMIT_BOUNDARY=1`.
+- API upload-limit boundary check is enabled by default via `RUN_UPLOAD_LIMIT_BOUNDARY=1`. It defaults to `0` when `DRIVE9_API_KEY` is set (existing-tenant mode), because reserving `total_size` against an already-consumed quota can spuriously fail with 507.
 - `UPLOAD_LIMIT_BYTES` controls the boundary value checked by API e2e (default `10737418240`).
-- CLI upload-limit boundary check is enabled by default via `RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1`.
+- CLI upload-limit boundary check is enabled by default via `RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1`. It defaults to `0` when `DRIVE9_API_KEY` is set (existing-tenant mode), for the same reason as the API check.
 - `CLI_UPLOAD_LIMIT_BYTES` controls the boundary value checked by CLI e2e (default `10737418240`).
 - `fuse-smoke-test.sh` will `SKIP` when host prerequisites are missing (for example no `/dev/fuse`) unless `FUSE_STRICT_PREREQS=1`.
 - `fuse-release-gate.sh` is the strict CI/release entry point and enables git clone/status/log, durable `umount --timeout` remount checks, mount-log audit, manifest read correctness, and SQLite rollback-journal correctness. Set `RUN_FUSE_ALL_WORKLOADS=1` to add concurrency stress, fsx-style POSIX coverage, and threshold-free performance metrics in one command. Set `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip SQLite temporarily while diagnosing host-specific FUSE failures, `RUN_FUSE_CONCURRENCY_STRESS=1` to add bounded concurrency stress, `RUN_FUSE_POSIX_FSX=1` to add fsx-style POSIX coverage, or `RUN_FUSE_PERFORMANCE_BASELINE=1` to add threshold-free performance metrics.

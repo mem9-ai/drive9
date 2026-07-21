@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
 # drive9 API smoke test against a live drive9-server deployment.
 #
+# Tenant mode:
+#  - Fresh (default): POST /v1/provision a new tenant, then run the suite.
+#  - Existing (DRIVE9_API_KEY set): skip provision and reuse the tenant the
+#    key belongs to. Step 1 skips provision and emits SKIP checks so the
+#    PASS/FAIL/SKIP/TOTAL accounting stays consistent. The upload-limit
+#    boundary check (step 15) defaults to OFF in this mode because reserving
+#    `total_size` against an existing tenant's quota can spuriously fail with
+#    507; an explicit RUN_UPLOAD_LIMIT_BOUNDARY=1 still wins. A final
+#    cleanup step removes the timestamped test tree (`team-${TS}`) so the
+#    existing tenant is not polluted.
+#
 # Coverage:
 #  1) Provision tenant (expect 202, tenant_id + api_key + status)
+#     - honors DRIVE9_API_KEY: skips provision when set
 #  2) Poll tenant status via GET /v1/status until active
 #  3) Root list
 #  4) Nested mkdir (multi-level directories)
@@ -17,11 +29,13 @@
 # 13) Final list verification
 # 14) 100MB multipart upload via POST /v1/uploads/initiate + download checksum
 # 15) Max-upload boundary check (limit allowed, limit+1 rejected)
+# 16) Cleanup test tree (existing tenant mode only)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
+API_KEY="${DRIVE9_API_KEY:-}"
 DRIVE9_IMAGE_FIXTURE_PATH="${DRIVE9_IMAGE_FIXTURE_PATH:-$SCRIPT_DIR/fixtures/cat03.jpg}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-300}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
@@ -30,11 +44,23 @@ LARGE_FILE_MB="${LARGE_FILE_MB:-100}"
 BATCH_SMALL_FILE_COUNT="${BATCH_SMALL_FILE_COUNT:-10}"
 REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-8}"
 REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-2}"
-RUN_UPLOAD_LIMIT_BOUNDARY="${RUN_UPLOAD_LIMIT_BOUNDARY:-1}"
+# Upload-limit boundary check defaults to OFF in existing-tenant mode: reserving
+# `total_size` against a tenant that already consumed quota can spuriously fail
+# with 507. An explicit RUN_UPLOAD_LIMIT_BOUNDARY still wins.
+if [ -z "${RUN_UPLOAD_LIMIT_BOUNDARY:-}" ]; then
+  if [ -n "$API_KEY" ]; then
+    RUN_UPLOAD_LIMIT_BOUNDARY=0
+  else
+    RUN_UPLOAD_LIMIT_BOUNDARY=1
+  fi
+fi
 UPLOAD_LIMIT_BYTES="${UPLOAD_LIMIT_BYTES:-10737418240}"
 SEMANTIC_TIMEOUT_S="${SEMANTIC_TIMEOUT_S:-90}"
 SEMANTIC_INTERVAL_S="${SEMANTIC_INTERVAL_S:-3}"
 RUN_SEMANTIC_CHECKS="${RUN_SEMANTIC_CHECKS:-1}"
+# Raw POST /v1/sql is unsupported on shared-schema stores (returns 400).
+# Set RUN_SQL_CHECKS=0 for shared-mode / fs_id backends.
+RUN_SQL_CHECKS="${RUN_SQL_CHECKS:-1}"
 
 PASS=0
 FAIL=0
@@ -207,9 +233,16 @@ wait_grep_contains_path() {
   check_eq "$desc" "$found" "true"
 }
 
+if [ -n "$API_KEY" ]; then
+  TENANT_MODE="existing (DRIVE9_API_KEY)"
+else
+  TENANT_MODE="fresh provision"
+fi
+
 echo "========================================================"
 echo "  drive9 API smoke test"
 echo "  Base URL : $BASE"
+echo "  Tenant   : $TENANT_MODE"
 echo "  Image fixture : $DRIVE9_IMAGE_FIXTURE_PATH"
 echo "  Started  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "========================================================"
@@ -233,18 +266,27 @@ SEM_TEXT_OTHER="${ROOT_DIR}/notes/dog-story-${TS}.txt"
 IMAGE_CAPTION_REMOTE="${ROOT_DIR}/assets/icon-${TS}.caption.txt"
 
 step "1" "Provision tenant"
-resp=$(curl_body_code POST "$BASE/v1/provision")
-code=$(http_code "$resp")
-body=$(json_body "$resp")
-check_eq "POST /v1/provision returns 202" "$code" "202"
+if [ -z "$API_KEY" ]; then
+  resp=$(curl_body_code POST "$BASE/v1/provision")
+  code=$(http_code "$resp")
+  body=$(json_body "$resp")
+  check_eq "POST /v1/provision returns 202" "$code" "202"
 
-API_KEY=$(printf '%s' "$body" | jq -r '.api_key // empty')
-TENANT_ID=$(printf '%s' "$body" | jq -r '.tenant_id // empty')
-INIT_STATUS=$(printf '%s' "$body" | jq -r '.status // empty')
-check_cmd "response contains tenant_id" test -n "$TENANT_ID"
-check_cmd "response contains api_key" test -n "$API_KEY"
-check_cmd "provision response status is provisioning or active (got=$INIT_STATUS)" bash -c 'case "$1" in provisioning|active) exit 0;; *) exit 1;; esac' _ "$INIT_STATUS"
-check_cmd "provision response contains api_key, status, tenant_id" bash -c "echo \"\$1\" | jq -e '.api_key and .status and .tenant_id' >/dev/null" _ "$body"
+  API_KEY=$(printf '%s' "$body" | jq -r '.api_key // empty')
+  TENANT_ID=$(printf '%s' "$body" | jq -r '.tenant_id // empty')
+  INIT_STATUS=$(printf '%s' "$body" | jq -r '.status // empty')
+  check_cmd "response contains tenant_id" test -n "$TENANT_ID"
+  check_cmd "response contains api_key" test -n "$API_KEY"
+  check_cmd "provision response status is provisioning or active (got=$INIT_STATUS)" bash -c 'case "$1" in provisioning|active) exit 0;; *) exit 1;; esac' _ "$INIT_STATUS"
+  check_cmd "provision response contains api_key, status, tenant_id" bash -c "echo \"\$1\" | jq -e '.api_key and .status and .tenant_id' >/dev/null" _ "$body"
+else
+  info "using existing DRIVE9_API_KEY (skip provision)"
+  skip_check "POST /v1/provision returns 202"
+  skip_check "response contains tenant_id"
+  skip_check "response contains api_key"
+  skip_check "provision response status is provisioning or active"
+  skip_check "provision response contains api_key, status, tenant_id"
+fi
 
 step "2" "Poll tenant status via /v1/status"
 deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
@@ -528,14 +570,20 @@ else
 fi
 
 step "11" "SQL endpoint sanity"
-sql_req='{"query":"SELECT 1 AS n"}'
-sql_body="$(mktemp)"
-code=$(curl -sS -o "$sql_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" --data-binary "$sql_req" "$BASE/v1/sql")
-body=$(cat "$sql_body")
-rm -f "$sql_body"
-check_eq "POST /v1/sql returns 200" "$code" "200"
-sql_n=$(printf '%s' "$body" | jq -r '.[0].n')
-check_eq "SQL query result n=1" "$sql_n" "1"
+if [ "$RUN_SQL_CHECKS" = "1" ]; then
+  sql_req='{"query":"SELECT 1 AS n"}'
+  sql_body="$(mktemp)"
+  code=$(curl -sS -o "$sql_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" --data-binary "$sql_req" "$BASE/v1/sql")
+  body=$(cat "$sql_body")
+  rm -f "$sql_body"
+  check_eq "POST /v1/sql returns 200" "$code" "200"
+  sql_n=$(printf '%s' "$body" | jq -r '.[0].n')
+  check_eq "SQL query result n=1" "$sql_n" "1"
+else
+  info "SQL endpoint checks skipped (RUN_SQL_CHECKS=$RUN_SQL_CHECKS)"
+  skip_check "POST /v1/sql returns 200"
+  skip_check "SQL query result n=1"
+fi
 
 step "12" "Copy, hardlink, rename, delete"
 copy_body="$(mktemp)"
@@ -865,6 +913,13 @@ PY
 fi
 
 rm -f "$IMAGE_LOCAL"
+
+if [ -n "$API_KEY" ] && [ -n "${DRIVE9_API_KEY:-}" ]; then
+  step "16" "Cleanup test tree (existing tenant mode)"
+  resp=$(curl_body_code DELETE "$BASE/v1/fs/$ROOT_DIR?recursive" "$API_KEY")
+  code=$(http_code "$resp")
+  check_eq "DELETE /v1/fs/$ROOT_DIR?recursive returns 200" "$code" "200"
+fi
 
 echo
 echo "========================================================"
