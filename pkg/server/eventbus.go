@@ -28,7 +28,7 @@ const (
 // EventBus is a per-tenant event hub backed by the durable fs_events table.
 // Events are stored in the shared tenant database so that they propagate across
 // all pods. The local notify channel provides instant push to same-pod SSE
-// clients; cross-pod events are discovered via the central sse_notify_outbox
+// clients; cross-pod events are discovered via the central tenant_notify_outbox
 // table in the meta DB (polled by a single global notifyPoller per pod, not a
 // per-bus goroutine) and optionally via direct pod-to-pod HTTP push.
 //
@@ -38,7 +38,7 @@ const (
 // Design note: prior to the outbox redesign, each EventBus ran its own 1s poll
 // goroutine querying the tenant's fs_events table. With ~100k tenants this
 // kept every serverless tenant TiDB awake (RCU cost). Now cross-pod discovery is
-// centralized: a single notifyPoller reads the lightweight sse_notify_outbox
+// centralized: a single notifyPoller reads the lightweight tenant_notify_outbox
 // (in the always-provisioned meta DB) and calls Publish() on matching buses.
 // A podNotifier additionally pushes notifications to peers for <10ms latency.
 // Neither path touches a tenant TiDB unless that tenant actually has new events.

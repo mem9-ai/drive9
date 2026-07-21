@@ -52,7 +52,7 @@ func newSSEOutboxTestCluster(t *testing.T) *sseOutboxTestCluster {
 	// Clean up SSE notify tables (ResetMetaDB may not know about new tables).
 	// Fail on error so stale rows don't leak between tests.
 	ctx := context.Background()
-	for _, table := range []string{"sse_notify_outbox", "tenant_notify_outbox", "tenant_outbox_cursor", "pod_subscriptions", "pod_registry", "tenant_api_keys", "tenants"} {
+	for _, table := range []string{"tenant_notify_outbox", "tenant_outbox_cursor", "pod_subscriptions", "pod_registry", "tenant_api_keys", "tenants"} {
 		if _, err := metaStore.DB().ExecContext(ctx, "DELETE FROM "+table); err != nil {
 			t.Fatalf("clean up %s: %v", table, err)
 		}

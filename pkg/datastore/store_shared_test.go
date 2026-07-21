@@ -29,10 +29,10 @@ func installSharedCoreFSNoLegacy(t *testing.T) {
 
 var vaultSharedTables = []string{
 	"vault_audit_log", "vault_grants", "vault_tokens", "vault_secret_fields",
-	"vault_secrets", "vault_policies", "vault_deks",
+	"vault_secrets", "vault_deks",
 }
 
-// installSharedVaultSchema swaps the 7 vault tables to the shared (fs_id)
+// installSharedVaultSchema swaps the 6 vault tables to the shared (fs_id)
 // shape so SanitizeForkRuntimeState can be exercised against its full table
 // list: in shared shape its wholesale DELETEs must carry fs_id predicates.
 func installSharedVaultSchema(t *testing.T) {

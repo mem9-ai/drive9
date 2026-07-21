@@ -113,7 +113,6 @@ func newVaultGrantReadRuntime(t *testing.T) *vaultGrantReadRuntime {
 		"vault_secret_fields",
 		"vault_secrets",
 		"vault_deks",
-		"vault_policies",
 	} {
 		if _, err := backend.Store().DB().Exec("DELETE FROM " + tbl); err != nil {
 			t.Fatalf("clean %s: %v", tbl, err)
