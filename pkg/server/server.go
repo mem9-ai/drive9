@@ -63,11 +63,16 @@ type Config struct {
 	// <= 0 are normalized to DefaultTenantPoolMaxSize; the pool is never
 	// intentionally uncapped.
 	TenantPoolMaxSize int
-	// TenantPoolRefillFreeRatio controls when claim-triggered asynchronous pool
-	// refill creates replacement tenants. Refill runs only when active free
-	// tenants fall below this ratio of the configured pool size. Values outside
-	// (0,1] are normalized to DefaultTenantPoolRefillFreeRatio.
-	TenantPoolRefillFreeRatio float64
+	// TenantPoolRefillBatchSize caps how many async cluster creations the
+	// claim-triggered background refill worker dispatches per round. Values
+	// <= 0 are normalized to DefaultTenantPoolRefillBatchSize.
+	TenantPoolRefillBatchSize int
+	// TenantPoolRefillInterval is the delay between refill dispatch rounds.
+	// It is the token bucket for cluster creation: the start rate is capped
+	// at TenantPoolRefillBatchSize/TenantPoolRefillInterval regardless of how
+	// long individual creations take. Values <= 0 are normalized to
+	// DefaultTenantPoolRefillInterval.
+	TenantPoolRefillInterval time.Duration
 	// InlineThreshold is the server-wide DB-inline vs S3 cutoff surfaced to
 	// clients via /v1/status. When 0, the value is inferred from
 	// cfg.Backend.InlineThreshold() (or omitted in responses if no backend).
@@ -185,7 +190,8 @@ type Server struct {
 	publicURL                 string
 	maxUploadBytes            int64
 	tenantPoolMaxSize         int
-	tenantPoolRefillFreeRatio float64
+	tenantPoolRefillBatchSize int
+	tenantPoolRefillInterval  time.Duration
 	inlineThreshold           int64
 	metrics                   *serverMetrics
 	logger                    *zap.Logger
@@ -206,6 +212,7 @@ type Server struct {
 	tenantPoolLocks           sync.Map
 	tenantPoolCreateLocks     sync.Map
 	tenantPoolResumeJobs      sync.Map
+	tenantPoolRefillJobs      sync.Map
 	tidbCloudRBACCache        *tidbCloudRBACCache
 	schemaInitErrors          sync.Map
 	leader                    *leader.Manager
@@ -272,9 +279,14 @@ const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
 // configuration with a positive value.
 const DefaultTenantPoolMaxSize = 200
 
-// DefaultTenantPoolRefillFreeRatio delays claim-triggered pool refill until the
-// active free tenant count falls below 80% of the configured pool size.
-const DefaultTenantPoolRefillFreeRatio = 0.8
+// DefaultTenantPoolRefillBatchSize caps how many replacement tenants the
+// claim-triggered refill worker creates per round.
+const DefaultTenantPoolRefillBatchSize = 1
+
+// DefaultTenantPoolRefillInterval is the default delay between refill worker
+// rounds. With the default batch size the steady refill rate is 1 tenant per
+// second, independent of the claim burst rate.
+const DefaultTenantPoolRefillInterval = time.Second
 
 // TenantStatusResponse is the JSON body of GET /v1/status. Fields are filled
 // per authenticated tenant so callers can discover their effective limits
@@ -341,7 +353,14 @@ func NewWithConfig(cfg Config) *Server {
 	if tenantPoolMaxSize <= 0 {
 		tenantPoolMaxSize = DefaultTenantPoolMaxSize
 	}
-	tenantPoolRefillFreeRatio := normalizeTenantPoolRefillFreeRatio(cfg.TenantPoolRefillFreeRatio)
+	tenantPoolRefillBatchSize := cfg.TenantPoolRefillBatchSize
+	if tenantPoolRefillBatchSize <= 0 {
+		tenantPoolRefillBatchSize = DefaultTenantPoolRefillBatchSize
+	}
+	tenantPoolRefillInterval := cfg.TenantPoolRefillInterval
+	if tenantPoolRefillInterval <= 0 {
+		tenantPoolRefillInterval = DefaultTenantPoolRefillInterval
+	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
 		fallback:                  cfg.Backend,
@@ -356,7 +375,8 @@ func NewWithConfig(cfg Config) *Server {
 		legacyStarterProvisioner:  cfg.LegacyStarterProvisioner,
 		maxUploadBytes:            maxUpload,
 		tenantPoolMaxSize:         tenantPoolMaxSize,
-		tenantPoolRefillFreeRatio: tenantPoolRefillFreeRatio,
+		tenantPoolRefillBatchSize: tenantPoolRefillBatchSize,
+		tenantPoolRefillInterval:  tenantPoolRefillInterval,
 		inlineThreshold:           inlineThreshold,
 		metrics:                   newServerMetrics(),
 		logger:                    logger,
@@ -552,11 +572,18 @@ func NewWithConfig(cfg Config) *Server {
 	return s
 }
 
-func normalizeTenantPoolRefillFreeRatio(ratio float64) float64 {
-	if ratio <= 0 || ratio > 1 || ratio != ratio {
-		return DefaultTenantPoolRefillFreeRatio
+// tenantPoolRefillConfig returns the normalized refill dispatch pacing: at
+// most batchSize async creations started per interval.
+func (s *Server) tenantPoolRefillConfig() (batchSize int, interval time.Duration) {
+	batchSize = s.tenantPoolRefillBatchSize
+	if batchSize <= 0 {
+		batchSize = DefaultTenantPoolRefillBatchSize
 	}
-	return ratio
+	interval = s.tenantPoolRefillInterval
+	if interval <= 0 {
+		interval = DefaultTenantPoolRefillInterval
+	}
+	return batchSize, interval
 }
 
 // insertTenantNotify writes a best-effort unified outbox row so other pods
@@ -4477,7 +4504,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			if res.Status == meta.TenantProvisioning {
 				s.startProvisionedTenantSchemaInit(r.Context(), res)
 			}
-			s.replenishTenantPoolAsync(r.Context(), pool, *credentialReq)
+			s.kickTenantPoolRefill(r.Context(), pool, *credentialReq)
 			if quotaReq != nil && quotaReq.TiDBCloudSpendingLimit != nil {
 				metricEvent(r.Context(), "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
 			}

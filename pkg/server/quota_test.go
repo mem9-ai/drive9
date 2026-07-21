@@ -53,6 +53,7 @@ type quotaTestProvisioner struct {
 	listErr                     error
 	listPages                   []*tenant.ManagedClusterListResult
 	batchPoolErr                error
+	batchPoolHook               func(call int)
 	batchPoolOmitConnectionInfo bool
 	batchPoolEmptyPassword      bool
 	batchPoolMissingOrg         map[int]bool
@@ -227,8 +228,11 @@ func (p *quotaTestProvisioner) ListManagedClusters(_ context.Context, req tenant
 }
 
 func (p *quotaTestProvisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(_ context.Context, tenantIDs []string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) ([]*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
-	p.batchPoolCalls.Add(1)
+	call := int(p.batchPoolCalls.Add(1))
 	p.recordCall("batch_pool", req, nil, &opts)
+	if p.batchPoolHook != nil {
+		p.batchPoolHook(call)
+	}
 	out := make([]*tenant.ClusterInfo, 0, len(tenantIDs))
 	for i, tenantID := range tenantIDs {
 		password := "pool-pass"
@@ -237,7 +241,7 @@ func (p *quotaTestProvisioner) BatchProvisionFreeClustersWithCredentialsAndQuota
 		}
 		out = append(out, &tenant.ClusterInfo{
 			TenantID:       tenantID,
-			ClusterID:      fmt.Sprintf("pool-cluster-%d", i+1),
+			ClusterID:      fmt.Sprintf("pool-cluster-%d-%d", call, i+1),
 			OrganizationID: "org-1",
 			Password:       password,
 			DBName:         "tidbcloud_fs",
@@ -2059,8 +2063,8 @@ func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneOrganizationMissi
 		t.Fatalf("deprovision calls = %d, want 1", got)
 	}
 	lastDeprovision := rt.prov.lastDeprovisionSnapshot()
-	if lastDeprovision == nil || lastDeprovision.ClusterID != "pool-cluster-2" {
-		t.Fatalf("last deprovision = %#v, want pool-cluster-2", lastDeprovision)
+	if lastDeprovision == nil || lastDeprovision.ClusterID != "pool-cluster-1-2" {
+		t.Fatalf("last deprovision = %#v, want pool-cluster-1-2", lastDeprovision)
 	}
 }
 
@@ -2109,8 +2113,8 @@ func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneTenantLabelMissin
 		t.Fatalf("deprovision calls = %d, want 1", got)
 	}
 	lastDeprovision := rt.prov.lastDeprovisionSnapshot()
-	if lastDeprovision == nil || lastDeprovision.ClusterID != "pool-cluster-2" {
-		t.Fatalf("last deprovision = %#v, want pool-cluster-2", lastDeprovision)
+	if lastDeprovision == nil || lastDeprovision.ClusterID != "pool-cluster-1-2" {
+		t.Fatalf("last deprovision = %#v, want pool-cluster-1-2", lastDeprovision)
 	}
 }
 
@@ -2563,7 +2567,7 @@ func TestAdminTenantPoolReplenishSkipsDeletedOrShrunkPool(t *testing.T) {
 		t.Fatalf("shrink pool: %v", err)
 	}
 
-	rt.server.replenishTenantPoolAsync(ctx, stalePool, tenant.CredentialProvisionRequest{
+	rt.server.kickTenantPoolRefill(ctx, stalePool, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	})
@@ -2754,7 +2758,7 @@ func TestAdminTenantPoolReplenishUsesDefaultSpendingLimit(t *testing.T) {
 		TiDBCloudSpendingLimitMonthly: &defaultLimit,
 	}
 
-	rt.server.replenishTenantPoolAsync(ctx, pool, tenant.CredentialProvisionRequest{
+	rt.server.kickTenantPoolRefill(ctx, pool, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	})

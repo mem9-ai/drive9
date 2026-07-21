@@ -42,6 +42,68 @@ type tenantPoolResumeJob struct {
 	rerun atomic.Bool
 }
 
+// tenantPoolRefillJob coordinates the per-pool background refill worker. The
+// credential is kept in memory only (never persisted) and is refreshed on
+// every kick so key rotation is picked up on the next round.
+type tenantPoolRefillJob struct {
+	rerun atomic.Bool
+	mu    sync.Mutex
+	cred  tenant.CredentialProvisionRequest
+	// inflight counts async cluster creations dispatched but not yet finished.
+	// The worker stays alive until they settle so failures reopen the deficit
+	// while the worker is still around to retry it.
+	inflight atomic.Int32
+	// consecutiveFailures counts finished creations that failed in a row; the
+	// worker stops at tenantPoolRefillMaxConsecutiveFailures (e.g. invalid
+	// credentials) instead of hammering the TiDB Cloud API forever.
+	consecutiveFailures atomic.Int32
+	lastReapNanos       atomic.Int64
+}
+
+func (j *tenantPoolRefillJob) setCred(cred tenant.CredentialProvisionRequest) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.cred = cred
+}
+
+func (j *tenantPoolRefillJob) getCred() tenant.CredentialProvisionRequest {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.cred
+}
+
+// tenantPoolRefillMaxConsecutiveFailures stops the refill worker after this
+// many consecutive failed creations. The next claim kicks a fresh worker.
+const tenantPoolRefillMaxConsecutiveFailures = 5
+
+// tenantPoolPlaceholderClusterIDPrefix prefixes the cluster id of pool
+// bindings whose cluster creation is still in flight. The placeholder binding
+// makes in-flight creations visible to CountTenantPoolFreeSlots (including
+// across pods), so the dispatcher never over-provisions; the pending tenant
+// behind it is not claimable (claims require Active) and not resumable.
+const tenantPoolPlaceholderClusterIDPrefix = "pending:"
+
+func isTenantPoolPlaceholderClusterID(clusterID string) bool {
+	return strings.HasPrefix(clusterID, tenantPoolPlaceholderClusterIDPrefix)
+}
+
+const (
+	// tenantPoolPlaceholderMaxAge bounds how long a placeholder may occupy a
+	// slot before the reaper fails its tenant and frees the slot for retry.
+	tenantPoolPlaceholderMaxAge = 15 * time.Minute
+	// tenantPoolPlaceholderReapInterval throttles reaper sweeps inside the
+	// refill worker loop.
+	tenantPoolPlaceholderReapInterval = time.Minute
+)
+
+// Refill round outcomes, also used as the replenish operation metric result.
+const (
+	refillRoundCreated = "ok"
+	refillRoundFull    = "noop_full"
+	refillRoundExit    = "exit"
+	refillRoundError   = "error"
+)
+
 type adminTenantPoolStatus string
 
 const adminTenantPoolStatusCreating adminTenantPoolStatus = "creating"
@@ -693,8 +755,7 @@ func (s *Server) firstManagedOrganization(ctx context.Context, cred tenant.Crede
 }
 
 func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count int, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) ([]*provisionTenantResult, error) {
-	manager, ok := s.provisioner.(tenant.TenantPoolClusterManager)
-	if !ok {
+	if _, ok := s.provisioner.(tenant.TenantPoolClusterManager); !ok {
 		return nil, fmt.Errorf("tenant pool provisioning not enabled")
 	}
 	if count <= 0 {
@@ -721,12 +782,29 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 		"pool_id", poolID,
 		"count", len(tenantIDs),
 		"duration_ms", durationMillis(stageStarted))...)
+	clusters, batchCloudCfg, err := s.batchProvisionFreePoolClusters(ctx, poolID, tenantIDs, cred, quotaOpt)
+	if err != nil && len(clusters) == 0 {
+		return nil, err
+	}
+	return s.persistFreePoolClusters(ctx, poolID, tenantIDs, clusters, batchCloudCfg, cred, quotaOpt)
+}
+
+// batchProvisionFreePoolClusters issues the TiDB Cloud batchCreate call for
+// the given pending pool tenants. On a total failure it cleans up and marks
+// the tenants failed before returning the error; partial responses (some
+// clusters, plus an error) are returned for the caller to persist.
+func (s *Server) batchProvisionFreePoolClusters(ctx context.Context, poolID string, tenantIDs []string, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) ([]*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
+	manager, ok := s.provisioner.(tenant.TenantPoolClusterManager)
+	if !ok {
+		return nil, nil, fmt.Errorf("tenant pool provisioning not enabled")
+	}
+	provider := tenant.ProviderTiDBCloudNative
 	var opts tenant.QuotaUpdateOptions
 	if quotaOpt != nil {
 		opts.TiDBCloudSpendingLimitMonthly = quotaOpt.TiDBCloudSpendingLimit
 	}
 	opts.TenantPoolID = poolID
-	stageStarted = time.Now()
+	stageStarted := time.Now()
 	logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_batch_create_started",
 		"provider", provider,
 		"pool_id", poolID,
@@ -744,7 +822,7 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 		for _, tenantID := range tenantIDs {
 			s.markTenantPoolTenantFailed(ctx, tenantID, "batch_provision_error")
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_batch_create_done",
 		"provider", provider,
@@ -759,6 +837,16 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 			zap.Int("cluster_count", len(clusters)),
 			zap.Error(err))
 	}
+	return clusters, batchCloudCfg, err
+}
+
+// persistFreePoolClusters persists batch-created clusters as free pool
+// tenants: binding upsert, connection metadata, quota seeding, and metadata
+// resume for incomplete clusters. On error it deprovisions the affected
+// clusters and marks the tenants failed.
+func (s *Server) persistFreePoolClusters(ctx context.Context, poolID string, tenantIDs []string, clusters []*tenant.ClusterInfo, batchCloudCfg *tenant.QuotaCloudConfig, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) ([]*provisionTenantResult, error) {
+	provider := tenant.ProviderTiDBCloudNative
+	now := time.Now().UTC()
 	cleanupOnError := true
 	defer func() {
 		if cleanupOnError {
@@ -771,6 +859,7 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 	discardedTenants := make(map[string]struct{}, len(clusters))
 	cloudProvider, region := provisioningCloudRegion(s.provisioner)
 	poolOrgID := ""
+	var stageStarted time.Time
 	for _, cluster := range clusters {
 		if cluster == nil {
 			continue
@@ -1389,21 +1478,34 @@ func (s *Server) deleteNewestFreePoolTenants(ctx context.Context, poolID, organi
 				"status", t.Status,
 				"delete_all", deleteAll)
 			stageStarted = time.Now()
-			if err := s.deprovisionTenantCluster(ctx, &t, cred); err != nil {
-				_, _ = s.meta.UpdateTenantStatusIf(context.Background(), t.ID, meta.TenantDeleting, t.Status)
-				logProvisionStage(ctx, "admin_tenant_pool_free_tenant_delete_cluster_failed", t.ID, t.Provider, stageStarted,
+			if isTenantPoolPlaceholderClusterID(row.Binding.ClusterID) {
+				// Placeholder slot: the cluster creation is still in flight
+				// (or abandoned), so there is nothing to deprovision yet. The
+				// async creator observes the reclaimed (non-pending) tenant
+				// when its TiDB Cloud call returns and deprovisions the
+				// cluster itself.
+				logProvisionStage(ctx, "admin_tenant_pool_free_tenant_delete_placeholder_skipped", t.ID, t.Provider, stageStarted,
+					"pool_id", poolID,
+					"organization_id", organizationID,
+					"cluster_id", row.Binding.ClusterID,
+					"delete_all", deleteAll)
+			} else {
+				if err := s.deprovisionTenantCluster(ctx, &t, cred); err != nil {
+					_, _ = s.meta.UpdateTenantStatusIf(context.Background(), t.ID, meta.TenantDeleting, t.Status)
+					logProvisionStage(ctx, "admin_tenant_pool_free_tenant_delete_cluster_failed", t.ID, t.Provider, stageStarted,
+						"pool_id", poolID,
+						"organization_id", organizationID,
+						"cluster_id", t.ClusterID,
+						"delete_all", deleteAll,
+						"error", err)
+					return deleted, err
+				}
+				logProvisionStage(ctx, "admin_tenant_pool_free_tenant_delete_cluster_deleted", t.ID, t.Provider, stageStarted,
 					"pool_id", poolID,
 					"organization_id", organizationID,
 					"cluster_id", t.ClusterID,
-					"delete_all", deleteAll,
-					"error", err)
-				return deleted, err
+					"delete_all", deleteAll)
 			}
-			logProvisionStage(ctx, "admin_tenant_pool_free_tenant_delete_cluster_deleted", t.ID, t.Provider, stageStarted,
-				"pool_id", poolID,
-				"organization_id", organizationID,
-				"cluster_id", t.ClusterID,
-				"delete_all", deleteAll)
 			stageStarted = time.Now()
 			_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
 			if err := s.meta.MarkTenantDeleted(ctx, t.ID); err != nil {
@@ -1479,98 +1581,267 @@ func firstResultOrganizationID(results []*provisionTenantResult) string {
 	return ""
 }
 
-func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.TenantPool, cred tenant.CredentialProvisionRequest) {
-	if pool == nil || pool.OrganizationID == "" || pool.Size <= 0 {
+// kickTenantPoolRefill starts (or nudges) the per-pool background refill
+// worker after a successful claim. The worker tops the pool up at a fixed
+// rate — TenantPoolRefillBatchSize tenants per TenantPoolRefillInterval —
+// whenever the pool has fewer free slots than its configured size. Claim
+// bursts only drain the pool; they no longer trigger a catch-up batch, so the
+// TiDB Cloud API sees a steady creation rate decoupled from request bursts.
+func (s *Server) kickTenantPoolRefill(ctx context.Context, pool *meta.TenantPool, cred tenant.CredentialProvisionRequest) {
+	if pool == nil || pool.PoolID == "" || pool.OrganizationID == "" || pool.Size <= 0 {
+		return
+	}
+	poolID := pool.PoolID
+	job := &tenantPoolRefillJob{}
+	job.setCred(cred)
+	if actual, loaded := s.tenantPoolRefillJobs.LoadOrStore(poolID, job); loaded {
+		existing, ok := actual.(*tenantPoolRefillJob)
+		if !ok {
+			return
+		}
+		existing.setCred(cred)
+		existing.rerun.Store(true)
 		return
 	}
 	workerCtx := backgroundWithTrace(ctx)
 	s.startServerWorker(workerCtx, func(ctx context.Context) {
-		replenishStarted := time.Now()
-		metricResult := "ok"
-		defer func() {
-			metrics.RecordOperation(adminTenantPoolMetricsComponent, "replenish", metricResult, time.Since(replenishStarted))
-		}()
-		lock := s.tenantPoolLock(pool.PoolID)
-		lock.Lock()
-		defer lock.Unlock()
-		if err := s.meta.WithTenantPoolLock(ctx, pool.PoolID, func(ctx context.Context) error {
-			current, err := s.meta.GetTenantPoolByID(ctx, pool.PoolID)
-			if err != nil {
-				if !errors.Is(err, meta.ErrNotFound) {
-					logger.Warn(ctx, "admin_tenant_pool_replenish_get_pool_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
-					metricResult = "error"
-				} else {
-					metricResult = "not_found"
-				}
-				return nil
-			}
-			if current.Status != meta.TenantPoolActive || current.OrganizationID == "" || current.Size <= 0 {
-				metricResult = "skipped"
-				return nil
-			}
-			defer s.refreshTenantPoolCapacity(ctx, current)
-			freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
-			if err != nil {
-				logger.Warn(ctx, "admin_tenant_pool_replenish_free_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
-				metricResult = "error"
-				return nil
-			}
-			if !s.tenantPoolBelowRefillWatermark(freeSize, current.Size) {
-				logger.Info(ctx, "admin_tenant_pool_replenish_skipped",
-					zap.String("pool_id", current.PoolID),
-					zap.String("organization_id", current.OrganizationID),
-					zap.Int("pool_size", current.Size),
-					zap.Int("free_size", freeSize),
-					zap.Float64("refill_free_ratio", s.effectiveTenantPoolRefillFreeRatio()))
-				metricResult = "noop"
-				return nil
-			}
-			// Trigger on active free tenants, but size refill against all free
-			// slots, including in-flight pending/provisioning tenants, so
-			// concurrent replenishment does not double-provision.
-			slotSize, err := s.meta.CountTenantPoolFreeSlots(ctx, current.OrganizationID)
-			if err != nil {
-				logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
-				metricResult = "error"
-				return nil
-			}
-			missing := current.Size - slotSize
-			if missing <= 0 {
-				metricResult = "noop"
-				return nil
-			}
-			results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
-			if err != nil {
-				logger.Warn(ctx, "admin_tenant_pool_replenish_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
-				metricResult = "cluster_error"
-				return nil
-			}
-			for _, res := range results {
-				s.startProvisionedTenantSchemaInit(ctx, res)
-			}
-			return nil
-		}); err != nil {
-			logger.Warn(ctx, "admin_tenant_pool_replenish_lock_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
-			metricResult = adminTenantPoolMetricResult(err)
-		}
+		defer s.tenantPoolRefillJobs.Delete(poolID)
+		s.runTenantPoolRefillWorker(ctx, poolID, job)
 	})
 }
 
-func (s *Server) tenantPoolBelowRefillWatermark(freeSize, poolSize int) bool {
-	if poolSize <= 0 {
-		return false
+func (s *Server) runTenantPoolRefillWorker(ctx context.Context, poolID string, job *tenantPoolRefillJob) {
+	batchSize, interval := s.tenantPoolRefillConfig()
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if fails := job.consecutiveFailures.Load(); fails >= tenantPoolRefillMaxConsecutiveFailures {
+			logger.Warn(ctx, "admin_tenant_pool_refill_worker_stopped",
+				zap.String("pool_id", poolID),
+				zap.Int32("consecutive_failures", fails),
+				zap.String("reason", "max_consecutive_failures"))
+			return
+		}
+		result := s.tenantPoolRefillRound(ctx, poolID, job, batchSize)
+		if result == refillRoundExit {
+			return
+		}
+		if result == refillRoundFull && job.inflight.Load() == 0 {
+			// Pool is full and nothing is in flight: exit unless a claim
+			// kicked us mid-round — the claim may have drained a slot after
+			// our count. A later claim starts a fresh worker either way; the
+			// deficit is durable in the DB.
+			if !job.rerun.Swap(false) {
+				return
+			}
+		}
+		// Always pace dispatch rounds at the configured interval: this is the
+		// token bucket that caps the cluster-creation start rate at
+		// batchSize/interval regardless of how long individual creations take.
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
-	if freeSize < 0 {
-		freeSize = 0
-	}
-	return float64(freeSize)/float64(poolSize) < s.effectiveTenantPoolRefillFreeRatio()
 }
 
-func (s *Server) effectiveTenantPoolRefillFreeRatio() float64 {
-	if s == nil {
-		return DefaultTenantPoolRefillFreeRatio
+// tenantPoolRefillRound dispatches up to batchSize async cluster creations
+// when the pool is below its configured size, and reports the round outcome.
+// Each dispatched creation first records a pending tenant plus a placeholder
+// binding (inside the pool locks), so its slot is immediately visible to every
+// pod's deficit accounting while the TiDB Cloud call runs.
+func (s *Server) tenantPoolRefillRound(ctx context.Context, poolID string, job *tenantPoolRefillJob, batchSize int) string {
+	roundStarted := time.Now()
+	result := refillRoundCreated
+	defer func() {
+		metrics.RecordOperation(adminTenantPoolMetricsComponent, "replenish", result, time.Since(roundStarted))
+	}()
+	lock := s.tenantPoolLock(poolID)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := s.meta.WithTenantPoolLock(ctx, poolID, func(ctx context.Context) error {
+		current, err := s.meta.GetTenantPoolByID(ctx, poolID)
+		if err != nil {
+			if errors.Is(err, meta.ErrNotFound) {
+				result = refillRoundExit
+				return nil
+			}
+			logger.Warn(ctx, "admin_tenant_pool_replenish_get_pool_failed", zap.String("pool_id", poolID), zap.Error(err))
+			result = refillRoundError
+			return nil
+		}
+		if current.Status != meta.TenantPoolActive || current.OrganizationID == "" || current.Size <= 0 {
+			result = refillRoundExit
+			return nil
+		}
+		defer s.refreshTenantPoolCapacity(ctx, current)
+		s.reapStaleTenantPoolPlaceholders(ctx, current, job)
+		// Size the refill against all free slots — active, provisioning, and
+		// placeholder (in-flight) — so concurrent dispatch (and concurrent
+		// pods) never over-provision.
+		slotSize, err := s.meta.CountTenantPoolFreeSlots(ctx, current.OrganizationID)
+		if err != nil {
+			logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", poolID), zap.Error(err))
+			result = refillRoundError
+			return nil
+		}
+		deficit := current.Size - slotSize
+		if deficit <= 0 {
+			result = refillRoundFull
+			return nil
+		}
+		if deficit > batchSize {
+			deficit = batchSize
+		}
+		now := time.Now().UTC()
+		dispatched := 0
+		for i := 0; i < deficit; i++ {
+			tenantID := token.NewID()
+			if err := s.insertPendingPoolTenant(ctx, tenantID, tenant.ProviderTiDBCloudNative, now); err != nil {
+				logger.Warn(ctx, "admin_tenant_pool_refill_insert_pending_failed", zap.String("pool_id", poolID), zap.Error(err))
+				result = refillRoundError
+				break
+			}
+			if err := s.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+				TenantID:       tenantID,
+				OrganizationID: current.OrganizationID,
+				ClusterID:      tenantPoolPlaceholderClusterIDPrefix + tenantID,
+				PoolID:         poolID,
+				PoolStatus:     meta.TenantPoolBindingFree,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}); err != nil {
+				logger.Warn(ctx, "admin_tenant_pool_refill_placeholder_failed", zap.String("pool_id", poolID), zap.Error(err))
+				s.markTenantPoolTenantFailed(ctx, tenantID, "placeholder_insert_error")
+				result = refillRoundError
+				break
+			}
+			job.inflight.Add(1)
+			cred := job.getCred()
+			orgID := current.OrganizationID
+			s.startServerWorker(ctx, func(workerCtx context.Context) {
+				s.finishAsyncPoolClusterProvision(workerCtx, poolID, orgID, tenantID, cred, job)
+			})
+			dispatched++
+		}
+		if dispatched > 0 {
+			logger.Info(ctx, "admin_tenant_pool_refill_round_dispatched",
+				zap.String("pool_id", poolID),
+				zap.String("organization_id", current.OrganizationID),
+				zap.Int("pool_size", current.Size),
+				zap.Int("slot_size", slotSize),
+				zap.Int("dispatched_count", dispatched))
+		}
+		return nil
+	}); err != nil {
+		logger.Warn(ctx, "admin_tenant_pool_replenish_lock_failed", zap.String("pool_id", poolID), zap.Error(err))
+		result = refillRoundError
 	}
-	return normalizeTenantPoolRefillFreeRatio(s.tenantPoolRefillFreeRatio)
+	return result
+}
+
+// finishAsyncPoolClusterProvision completes one placeholder-dispatched
+// cluster creation: it calls TiDB Cloud outside any lock (this can take tens
+// of seconds), then persists the result under the pool locks. If the
+// placeholder was reclaimed while the call ran (pool shrink/delete, or the
+// stale-placeholder reaper), the created cluster is deprovisioned instead of
+// resurrecting the slot.
+func (s *Server) finishAsyncPoolClusterProvision(ctx context.Context, poolID, organizationID, tenantID string, cred tenant.CredentialProvisionRequest, job *tenantPoolRefillJob) {
+	defer job.inflight.Add(-1)
+	success := false
+	defer func() {
+		if success {
+			job.consecutiveFailures.Store(0)
+		} else {
+			job.consecutiveFailures.Add(1)
+		}
+	}()
+	clusters, batchCloudCfg, err := s.batchProvisionFreePoolClusters(ctx, poolID, []string{tenantID}, cred, nil)
+	if err != nil && len(clusters) == 0 {
+		// The batch helper already marked the tenant failed, which frees the
+		// placeholder slot for a later dispatch round.
+		return
+	}
+	reclaimed := false
+	persistRan := false
+	lock := s.tenantPoolLock(poolID)
+	lock.Lock()
+	persistErr := s.meta.WithTenantPoolLock(ctx, poolID, func(ctx context.Context) error {
+		t, lookupErr := s.meta.GetTenant(ctx, tenantID)
+		if lookupErr != nil {
+			if errors.Is(lookupErr, meta.ErrNotFound) {
+				reclaimed = true
+				return nil
+			}
+			return lookupErr
+		}
+		if t.Status != meta.TenantPending {
+			reclaimed = true
+			return nil
+		}
+		persistRan = true
+		results, err := s.persistFreePoolClusters(ctx, poolID, []string{tenantID}, clusters, batchCloudCfg, cred, nil)
+		if err != nil {
+			return err
+		}
+		for _, res := range results {
+			s.startProvisionedTenantSchemaInit(ctx, res)
+		}
+		success = len(results) > 0
+		return nil
+	})
+	lock.Unlock()
+	if reclaimed {
+		logger.Info(ctx, "admin_tenant_pool_async_provision_reclaimed",
+			zap.String("pool_id", poolID),
+			zap.String("organization_id", organizationID),
+			zap.String("tenant_id", tenantID))
+		s.cleanupPoolProvisionedClusters(ctx, clusters, cred, []string{tenantID}, "placeholder_reclaimed")
+		return
+	}
+	if persistErr != nil {
+		logger.Warn(ctx, "admin_tenant_pool_async_provision_persist_failed",
+			zap.String("pool_id", poolID),
+			zap.String("organization_id", organizationID),
+			zap.String("tenant_id", tenantID),
+			zap.Error(persistErr))
+		if !persistRan {
+			// The lock or the tenant lookup failed before persistence could
+			// run; nothing has cleaned up the created clusters yet.
+			s.cleanupPoolProvisionedClusters(ctx, clusters, cred, []string{tenantID}, "persist_lock_error")
+			s.markTenantPoolTenantFailed(ctx, tenantID, "persist_lock_error")
+		}
+	}
+}
+
+// reapStaleTenantPoolPlaceholders fails pool tenants whose placeholder
+// binding is older than tenantPoolPlaceholderMaxAge, freeing slots whose
+// cluster creation was abandoned (e.g. by a crashed pod). Runs at most once
+// per tenantPoolPlaceholderReapInterval; callers must hold the pool locks.
+func (s *Server) reapStaleTenantPoolPlaceholders(ctx context.Context, pool *meta.TenantPool, job *tenantPoolRefillJob) {
+	now := time.Now()
+	if now.UnixNano()-job.lastReapNanos.Load() < int64(tenantPoolPlaceholderReapInterval) {
+		return
+	}
+	job.lastReapNanos.Store(now.UnixNano())
+	failed, err := s.meta.FailStalePlaceholderTenantPoolTenants(ctx, pool.OrganizationID, tenantPoolPlaceholderClusterIDPrefix, now.Add(-tenantPoolPlaceholderMaxAge), 100)
+	if err != nil {
+		logger.Warn(ctx, "admin_tenant_pool_placeholder_reap_failed",
+			zap.String("pool_id", pool.PoolID),
+			zap.String("organization_id", pool.OrganizationID),
+			zap.Error(err))
+		return
+	}
+	if failed > 0 {
+		logger.Info(ctx, "admin_tenant_pool_placeholders_reaped",
+			zap.String("pool_id", pool.PoolID),
+			zap.String("organization_id", pool.OrganizationID),
+			zap.Int("failed_count", failed))
+	}
 }
 
 func (s *Server) resumePendingTenantPoolAsync(ctx context.Context, pool *meta.TenantPool, cred tenant.CredentialProvisionRequest) {
@@ -1605,6 +1876,11 @@ func (s *Server) pendingTenantPoolResumeClusters(ctx context.Context, poolID str
 	}
 	clusters := make([]*tenant.ClusterInfo, 0, len(rows))
 	for _, row := range rows {
+		if isTenantPoolPlaceholderClusterID(row.Binding.ClusterID) {
+			// Placeholder bindings have no real cluster or credentials yet;
+			// their async creator owns them.
+			continue
+		}
 		plainPass, err := s.pool.Decrypt(ctx, row.Tenant.DBPasswordCipher)
 		if err != nil || strings.TrimSpace(string(plainPass)) == "" {
 			logger.Warn(ctx, "admin_tenant_pool_pending_resume_password_failed",
