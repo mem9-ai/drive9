@@ -681,15 +681,15 @@ func (s *Server) refreshTenantPoolCapacity(ctx context.Context, pool *meta.Tenan
 }
 
 func (s *Server) firstManagedOrganization(ctx context.Context, cred tenant.CredentialProvisionRequest) (string, error) {
-	lister, ok := s.provisioner.(tenant.ManagedClusterLister)
-	if !ok {
-		return "", fmt.Errorf("managed cluster list not enabled")
-	}
-	page, err := lister.ListManagedClusters(ctx, cred, tenant.ManagedClusterListOptions{PageSize: 1})
-	if err != nil || page == nil || len(page.Clusters) == 0 {
+	// Resolve through the RBAC list cache so repeated org lookups on the same
+	// request path (warm-pool claim + shared-pool check) and across
+	// consecutive provisions do not each cost a TiDB Cloud list call. The
+	// cache is invalidated on tenant mutations (forgetTiDBCloudRBACList).
+	clusters, _, err := s.listAllManagedClustersCached(ctx, cred, "", true, "provision_org_resolve")
+	if err != nil || len(clusters) == 0 {
 		return "", err
 	}
-	return strings.TrimSpace(page.Clusters[0].OrganizationID), nil
+	return strings.TrimSpace(clusters[0].OrganizationID), nil
 }
 
 func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count int, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) ([]*provisionTenantResult, error) {
