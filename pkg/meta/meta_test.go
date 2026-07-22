@@ -256,6 +256,55 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 	}
 }
 
+func TestResolveByAPIKeyHashUsesSharedDBOrganization(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	tenantID := "shared-api-key-org"
+	if err := s.InsertTenant(ctx, &Tenant{
+		ID: tenantID, Status: TenantActive, Kind: TenantKindLive,
+		Provider: tidbCloudNativeSharedProvider, DBPasswordCipher: []byte{}, DBTLS: true,
+		SchemaVersion: 1, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fsID, err := s.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-shared-api-key", Host: "shared.example.com", Port: 4000,
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertTenantPlacement(ctx, &TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertAPIKey(ctx, &APIKey{
+		ID: "shared-api-key", TenantID: tenantID, KeyName: "default",
+		JWTCiphertext: []byte("jwt-cipher"), JWTHash: "shared-api-key-hash", TokenVersion: 1,
+		Status: APIKeyActive, ScopeKind: APIKeyScopeKindOwner,
+		IssuedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.ResolveByAPIKeyHash(ctx, "shared-api-key-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TiDBCloudOrgID != "org-shared-api-key" {
+		t.Fatalf("resolved org = %q, want org-shared-api-key", got.TiDBCloudOrgID)
+	}
+	if got.Tenant.TiDBCloudOrgID != "org-shared-api-key" {
+		t.Fatalf("tenant org = %q, want org-shared-api-key", got.Tenant.TiDBCloudOrgID)
+	}
+}
+
 func TestInsertAndGetExternalBinding(t *testing.T) {
 	s := newControlStore(t)
 	now := time.Now().UTC()

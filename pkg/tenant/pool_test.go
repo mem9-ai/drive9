@@ -440,6 +440,51 @@ func TestTenantMetricTiDBCloudOrgIDUsesPreResolvedTenantOrg(t *testing.T) {
 	}
 }
 
+func TestTenantMetricTiDBCloudOrgIDUsesSharedDBPool(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	ctx := context.Background()
+	now := time.Now().UTC()
+	tenantID := "tenant-shared-metric-org"
+	if err := metaStore.InsertTenant(ctx, &meta.Tenant{
+		ID: tenantID, Status: meta.TenantActive, Kind: meta.TenantKindLive,
+		Provider: ProviderTiDBCloudNativeShared, DBPasswordCipher: []byte{}, DBTLS: true,
+		SchemaVersion: 1, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fsID, err := metaStore.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbID, err := metaStore.RegisterSharedDB(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-shared-metric", Host: "shared.example.com", Port: 4000,
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pool := NewPool(PoolConfig{}, nil)
+	pool.SetMetaStore(metaStore)
+	t.Cleanup(pool.Close)
+
+	got := pool.tenantMetricTiDBCloudOrgID(ctx, &meta.Tenant{
+		ID: tenantID, Status: meta.TenantActive, Provider: ProviderTiDBCloudNativeShared,
+	})
+	if got != "org-shared-metric" {
+		t.Fatalf("org = %q, want org-shared-metric", got)
+	}
+}
+
 func TestPoolAcquireInvalidateDefersCloseUntilRelease(t *testing.T) {
 	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-a")
 	ctx := context.Background()

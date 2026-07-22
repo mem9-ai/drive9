@@ -2888,11 +2888,15 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
 			k.id, k.tenant_id, k.key_name, k.jwt_ciphertext, k.jwt_hash, k.token_version, k.status, k.scope_kind,
 			k.issued_by_provider, k.issued_by_subject_key, k.issued_by_metadata_json, k.issued_at,
-			k.revoked_at, k.created_at, k.updated_at, COALESCE(b.organization_id, '')
+			k.revoked_at, k.created_at, k.updated_at,
+			COALESCE(CASE WHEN t.provider = ? THEN d.org_id ELSE b.organization_id END, '')
 		FROM tenant_api_keys k
 		JOIN tenants t ON t.id = k.tenant_id
 		LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = t.id
-		WHERE k.jwt_hash = ?`, hash)
+		LEFT JOIN fs_registry f ON f.tenant_id = t.id
+		LEFT JOIN tenant_placements p ON p.fs_id = f.fs_id
+		LEFT JOIN db_pool d ON d.db_id = p.db_id
+		WHERE k.jwt_hash = ?`, tidbCloudNativeSharedProvider, hash)
 
 	var rec TenantWithAPIKey
 	var dbTLS int

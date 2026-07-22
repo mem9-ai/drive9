@@ -154,6 +154,9 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 	if res.Provider != tenant.ProviderTiDBCloudNativeShared || res.Status != meta.TenantProvisioning {
 		t.Fatalf("result = provider %q status %q, want shared/provisioning", res.Provider, res.Status)
 	}
+	if res.OrganizationID != "org-shared" {
+		t.Fatalf("organization ID = %q, want org-shared", res.OrganizationID)
+	}
 	tenantRow, err := metaStore.GetTenant(context.Background(), res.TenantID)
 	if err != nil {
 		t.Fatalf("GetTenant: %v", err)

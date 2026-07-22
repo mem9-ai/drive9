@@ -98,10 +98,16 @@ func generateManagedSharedDBRootPassword(length int) (string, error) {
 
 func (s *Server) materializeSharedTenantQuota(ctx context.Context, tenantID string, opts provisionTenantOptions) error {
 	virtualLimit := s.sharedTenantVirtualSpendingLimit(opts)
+	var patch meta.QuotaConfigPatch
 	if opts.Quota != nil {
 		req := *opts.Quota
 		req.TenantID = tenantID
 		if err := s.validateQuotaSetRequest(req); err != nil {
+			return err
+		}
+		var err error
+		patch, err = quotaConfigPatchFromRequest(req)
+		if err != nil {
 			return err
 		}
 	}
@@ -114,16 +120,14 @@ func (s *Server) materializeSharedTenantQuota(ctx context.Context, tenantID stri
 		MaxVideoLLMFiles:       meta.DefaultMaxVideoLLMFiles(),
 		TiDBCloudSpendingLimit: &virtualLimit,
 	}
-	if opts.Quota != nil {
-		if opts.Quota.MaxStorageSize != nil {
-			cfg.MaxStorageBytes = *opts.Quota.MaxStorageSize
-		}
-		if opts.Quota.MaxFileSize != nil {
-			cfg.MaxFileSizeBytes = *opts.Quota.MaxFileSize
-		}
-		if opts.Quota.MaxFileCount != nil {
-			cfg.MaxFileCount = *opts.Quota.MaxFileCount
-		}
+	if patch.MaxStorageBytes != nil {
+		cfg.MaxStorageBytes = *patch.MaxStorageBytes
+	}
+	if patch.MaxFileSizeBytes != nil {
+		cfg.MaxFileSizeBytes = *patch.MaxFileSizeBytes
+	}
+	if patch.MaxFileCount != nil {
+		cfg.MaxFileCount = *patch.MaxFileCount
 	}
 	if err := s.meta.SetQuotaConfig(ctx, cfg); err != nil {
 		return fmt.Errorf("materialize shared tenant quota: %w", err)
