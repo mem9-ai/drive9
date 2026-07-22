@@ -1382,6 +1382,83 @@ func TestAdminTenantListFiltersByAuthorizedClusters(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	sharedTenantID := "tenant-shared-authorized"
+	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+		ID: sharedTenantID, Status: meta.TenantActive, Kind: meta.TenantKindLive,
+		Provider: tenant.ProviderTiDBCloudNativeShared, SchemaVersion: 1, DBPasswordCipher: []byte{},
+		CreatedAt: now.Add(3 * time.Second), UpdatedAt: now.Add(3 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sharedFsID, err := rt.meta.ResolveFsID(ctx, sharedTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedDBID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-1", Host: "shared-list.example.com", Port: 4000,
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE db_pool SET cluster_id = ? WHERE db_id = ?", "cluster-allowed", sharedDBID); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: sharedFsID, DbID: sharedDBID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wildcardTenantID := "tenant-shared-wildcard-authorized"
+	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+		ID: wildcardTenantID, Status: meta.TenantActive, Kind: meta.TenantKindLive,
+		Provider: tenant.ProviderTiDBCloudNativeShared, SchemaVersion: 1, DBPasswordCipher: []byte{},
+		CreatedAt: now.Add(4 * time.Second), UpdatedAt: now.Add(4 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wildcardFsID, err := rt.meta.ResolveFsID(ctx, wildcardTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wildcardDBID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: meta.SharedDBOrgWildcard, Host: "shared-wildcard-list.example.com", Port: 4000,
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE db_pool SET cluster_id = ? WHERE db_id = ?", "cluster-allowed", wildcardDBID); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: wildcardFsID, DbID: wildcardDBID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	freeSharedTenantID := "tenant-shared-free-member"
+	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+		ID: freeSharedTenantID, Status: meta.TenantActive, Kind: meta.TenantKindLive,
+		Provider: tenant.ProviderTiDBCloudNativeShared, SchemaVersion: 1, DBPasswordCipher: []byte{},
+		CreatedAt: now.Add(5 * time.Second), UpdatedAt: now.Add(5 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	freeSharedFsID, err := rt.meta.ResolveFsID(ctx, freeSharedTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: freeSharedFsID, DbID: sharedDBID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.UpsertTenantPoolMembership(ctx, &meta.TenantPoolMembership{
+		TenantID: freeSharedTenantID, TiDBCloudOrganizationID: "org-1", PoolID: "shared-pool-1",
+		PoolStatus: meta.TenantPoolBindingFree,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	otherTenantID := "tenant-other-cluster"
 	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               otherTenantID,
@@ -1471,8 +1548,23 @@ func TestAdminTenantListFiltersByAuthorizedClusters(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Tenants) != 1 || out.Tenants[0].TenantID != rt.tenantID {
-		t.Fatalf("tenants = %#v, want only authorized tenant %s", out.Tenants, rt.tenantID)
+	if len(out.Tenants) != 3 || out.Tenants[0].TenantID != wildcardTenantID || out.Tenants[1].TenantID != sharedTenantID || out.Tenants[2].TenantID != rt.tenantID {
+		t.Fatalf("tenants = %#v, want wildcard shared tenant %s, shared tenant %s, and dedicated tenant %s", out.Tenants, wildcardTenantID, sharedTenantID, rt.tenantID)
+	}
+	freeReq, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/admin/tenants/"+freeSharedTenantID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freeReq.Header.Set(quotaPublicKeyHeader, "public-1")
+	freeReq.Header.Set(quotaPrivateKeyHeader, "private-1")
+	freeResp, err := http.DefaultClient.Do(freeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = freeResp.Body.Close() }()
+	if freeResp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(freeResp.Body)
+		t.Fatalf("free shared member get status = %d, want 404: %s", freeResp.StatusCode, body)
 	}
 }
 

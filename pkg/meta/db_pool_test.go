@@ -1301,6 +1301,78 @@ func TestDeleteTenantPlacementAndDecrCountUsesReopenRatio(t *testing.T) {
 	}
 }
 
+func TestFinalizeSharedTenantDeleteMetadataIsAtomic(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-finalize-delete", Host: "h", Port: 4000, User: "u",
+		PasswordCipher: []byte("c"), Name: "finalize_delete_db",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedPendingTenant(t, s, "tenant-finalize-delete")
+	fsID, err := s.EnsureFsID(ctx, "tenant-finalize-delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteSharedTenantProvision(ctx, "tenant-finalize-delete", tidbCloudNativeSharedProvider, &TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}, testOwnerKey("tenant-finalize-delete")); err != nil {
+		t.Fatal(err)
+	}
+
+	err = s.FinalizeSharedTenantDeleteMetadata(ctx, "missing-tenant", fsID, dbID, 0.8, true)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("FinalizeSharedTenantDeleteMetadata error = %v, want ErrNotFound", err)
+	}
+	if _, err := s.GetTenantPlacement(ctx, fsID); err != nil {
+		t.Fatalf("placement did not roll back: %v", err)
+	}
+	pool, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pool.TenantCount != 1 {
+		t.Fatalf("tenant count after rollback = %d, want 1", pool.TenantCount)
+	}
+
+	if err := s.FinalizeSharedTenantDeleteMetadata(ctx, "tenant-finalize-delete", fsID, dbID, 0.8, true); err != nil {
+		t.Fatalf("FinalizeSharedTenantDeleteMetadata: %v", err)
+	}
+	if _, err := s.GetTenantPlacement(ctx, fsID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("placement after finalize = %v, want ErrNotFound", err)
+	}
+	tenant, err := s.GetTenant(ctx, "tenant-finalize-delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tenant.Status != TenantDeleted {
+		t.Fatalf("tenant status = %s, want %s", tenant.Status, TenantDeleted)
+	}
+
+	seedPendingTenant(t, s, "tenant-finalize-job")
+	jobFsID, err := s.EnsureFsID(ctx, "tenant-finalize-job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteSharedTenantProvision(ctx, "tenant-finalize-job", tidbCloudNativeSharedProvider, &TenantPlacement{
+		FsID: jobFsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}, testOwnerKey("tenant-finalize-job")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinalizeSharedTenantDeleteMetadata(ctx, "tenant-finalize-job", jobFsID, dbID, 0.8, false); err != nil {
+		t.Fatalf("FinalizeSharedTenantDeleteMetadata with external cleanup: %v", err)
+	}
+	placement, err := s.GetTenantPlacement(ctx, jobFsID)
+	if err != nil {
+		t.Fatalf("authorization placement missing: %v", err)
+	}
+	if placement.Status != PlacementStatusDeleting {
+		t.Fatalf("placement status = %q, want %q", placement.Status, PlacementStatusDeleting)
+	}
+}
+
 // TestCompleteSharedTenantProvisionRollsBackOnKeyFailure covers the named
 // failure class from review: the owner key insert fails (duplicate key id)
 // inside the provision transaction, so the capacity reservation, the

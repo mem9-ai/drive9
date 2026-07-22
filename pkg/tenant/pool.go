@@ -1026,6 +1026,11 @@ func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) 
 	if err != nil {
 		return nil, fmt.Errorf("shared db %d: %w", dbID, err)
 	}
+	ctx = logger.WithContext(ctx, logger.FromContext(ctx).With(
+		zap.Int64("db_pool_id", info.ID),
+		zap.String("db_pool_uuid", info.UUID),
+		zap.String("tidbcloud_org_id", info.TiDBCloudOrganizationID),
+	))
 	pass, err := p.enc.Decrypt(ctx, info.PasswordCipher)
 	if err != nil {
 		return nil, fmt.Errorf("shared db %d: decrypt password: %w", dbID, err)
