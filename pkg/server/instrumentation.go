@@ -30,6 +30,13 @@ const defaultTenantMetricTiDBCloudOrgID = "guest"
 func eventFields(ctx context.Context, event string, kv ...any) []zap.Field {
 	fields := make([]zap.Field, 0, len(kv)/2+3)
 	fields = append(fields, zap.String("event", event))
+	hasTiDBCloudOrgID := false
+	for i := 0; i+1 < len(kv); i += 2 {
+		if strings.ReplaceAll(fmt.Sprint(kv[i]), " ", "_") == "tidbcloud_org_id" {
+			hasTiDBCloudOrgID = true
+			break
+		}
+	}
 	if scope := ScopeFromContext(ctx); scope != nil {
 		if scope.TenantID != "" {
 			fields = append(fields, zap.String("tenant_id", scope.TenantID))
@@ -37,8 +44,15 @@ func eventFields(ctx context.Context, event string, kv ...any) []zap.Field {
 		if scope.APIKeyID != "" {
 			fields = append(fields, zap.String("api_key_id", scope.APIKeyID))
 		}
-		if scope.TiDBCloudOrgID != "" {
+		if scope.TiDBCloudOrgID != "" && !hasTiDBCloudOrgID {
 			fields = append(fields, zap.String("tidbcloud_org_id", scope.TiDBCloudOrgID))
+			hasTiDBCloudOrgID = true
+		}
+	}
+	if !hasTiDBCloudOrgID {
+		_, _, _, metricOrgID := requestMetricScope(ctx)
+		if metricOrgID != "" {
+			fields = append(fields, zap.String("tidbcloud_org_id", metricOrgID))
 		}
 	}
 	for i := 0; i+1 < len(kv); i += 2 {

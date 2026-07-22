@@ -222,6 +222,10 @@ func (w *MutationReplayWorker) recordPendingBacklog(ctx context.Context) {
 	current := make(map[string]string, len(observations))
 	for _, obs := range observations {
 		orgID := normalizeTenantMetricTiDBCloudOrgID(obs.TiDBCloudOrgID)
+		if previousOrgID, ok := w.observedBacklogTenants[obs.TenantID]; ok && previousOrgID != orgID {
+			metrics.RecordTenantGaugeWithOrg(obs.TenantID, previousOrgID, "mutation_replay", "pending_mutations", 0)
+			metrics.RecordTenantGaugeWithOrg(obs.TenantID, previousOrgID, "mutation_replay", "oldest_pending_age_seconds", 0)
+		}
 		current[obs.TenantID] = orgID
 		w.observedBacklogTenants[obs.TenantID] = orgID
 		metrics.RecordTenantGaugeWithOrg(obs.TenantID, orgID, "mutation_replay", "pending_mutations", float64(obs.PendingCount))

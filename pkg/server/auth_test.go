@@ -17,6 +17,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/encrypt"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 	"go.uber.org/zap"
@@ -540,6 +541,88 @@ func TestTenantStatusWithValidKey(t *testing.T) {
 	}
 	if out.MaxUploadBytes != srv.maxUploadBytes {
 		t.Fatalf("max_upload_bytes = %d, want %d", out.MaxUploadBytes, srv.maxUploadBytes)
+	}
+}
+
+func TestSharedTenantStatusLogsAndMetricsUseDBOrganization(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := rt.meta.UpdateTenantProvider(ctx, rt.tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
+		t.Fatal(err)
+	}
+	fsID, err := rt.meta.EnsureFsID(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-shared-status-output", Host: "shared-status.example.com", Port: 4000,
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_status_db",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	core, recorded := observer.New(zap.InfoLevel)
+	srv := NewWithConfig(Config{
+		Meta: rt.meta, Pool: rt.pool, TokenSecret: rt.tokenSecret, Logger: zap.New(core),
+	})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	assertOrgLog := func(message, event string) {
+		t.Helper()
+		entries := recorded.FilterMessage(message).All()
+		found := false
+		for _, entry := range entries {
+			fields := entry.ContextMap()
+			if event != "" && fields["event"] != event {
+				continue
+			}
+			if fields["tenant_id"] != rt.tenantID {
+				continue
+			}
+			found = true
+			if fields["tidbcloud_org_id"] != "org-shared-status-output" {
+				t.Fatalf("%s/%s org = %v, want org-shared-status-output", message, event, fields["tidbcloud_org_id"])
+			}
+		}
+		if !found {
+			t.Fatalf("%s/%s logs do not contain tenant %q", message, event, rt.tenantID)
+		}
+	}
+	assertOrgLog("http_request", "")
+	assertOrgLog("server_event", "tenant_status_ok")
+
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	metricsText := recorder.Body.String()
+	wantMetric := `drive9_tenant_requests_total{action="get",result="ok",status_class="2xx",surface="status",tenant_id="` + rt.tenantID + `",tidbcloud_org_id="org-shared-status-output"}`
+	if !strings.Contains(metricsText, wantMetric) {
+		t.Fatalf("missing shared status request metric %q", wantMetric)
+	}
+	wrongMetric := `drive9_tenant_requests_total{action="get",result="ok",status_class="2xx",surface="status",tenant_id="` + rt.tenantID + `",tidbcloud_org_id="guest"}`
+	if strings.Contains(metricsText, wrongMetric) {
+		t.Fatalf("shared status request metric used guest org %q", wrongMetric)
 	}
 }
 
