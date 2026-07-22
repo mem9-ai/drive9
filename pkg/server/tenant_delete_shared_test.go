@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -341,21 +342,27 @@ func TestSharedTenantDeletePlacementRemovalFailureStaysRetryable(t *testing.T) {
 		"fs_layer_checkpoints", "fs_layer_events", "fs_layer_tags", "fs_layer_entries", "fs_layers",
 		"fs_events", "semantic_tasks", "file_gc_tasks", "uploads", "file_tags", "file_nodes", "semantic", "contents", "inodes",
 	}
-	dropSharedTables := func() {
+	dropSharedTables := func(t *testing.T) error {
+		t.Helper()
 		for _, tbl := range sharedTables {
 			if _, err := rt.meta.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
-				t.Errorf("drop %s: %v", tbl, err)
+				return fmt.Errorf("drop %s: %w", tbl, err)
 			}
 		}
+		return nil
 	}
-	dropSharedTables()
 	t.Cleanup(func() {
 		if err := rt.pool.InvalidateSharedDB(dbID); err != nil {
 			t.Errorf("invalidate shared database: %v", err)
 		}
-		dropSharedTables()
+		if err := dropSharedTables(t); err != nil {
+			t.Errorf("cleanup shared tables: %v", err)
+		}
 		initServerTenantSchema(t, testDSN)
 	})
+	if err := dropSharedTables(t); err != nil {
+		t.Fatalf("prepare missing shared tables: %v", err)
+	}
 	if err := rt.pool.PurgeSharedTenant(ctx, fsID, dbID); err != nil {
 		t.Fatalf("pre-warm purge: %v", err)
 	}
