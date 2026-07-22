@@ -589,7 +589,7 @@ func TestSharedTenantStatusLogsAndMetricsUseDBOrganization(t *testing.T) {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 
-	assertOrgLog := func(message, event string) {
+	assertOrgLog := func(t *testing.T, message, event string) {
 		t.Helper()
 		entries := recorded.FilterMessage(message).All()
 		found := false
@@ -610,8 +610,8 @@ func TestSharedTenantStatusLogsAndMetricsUseDBOrganization(t *testing.T) {
 			t.Fatalf("%s/%s logs do not contain tenant %q", message, event, rt.tenantID)
 		}
 	}
-	assertOrgLog("http_request", "")
-	assertOrgLog("server_event", "tenant_status_ok")
+	assertOrgLog(t, "http_request", "")
+	assertOrgLog(t, "server_event", "tenant_status_ok")
 
 	recorder := httptest.NewRecorder()
 	metrics.WritePrometheus(recorder)

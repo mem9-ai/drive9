@@ -29,6 +29,9 @@ func newControlStore(t *testing.T) *Store {
 
 func insertSharedTenantPlacementForOrgTest(t *testing.T, s *Store, tenantID, organizationID string) {
 	t.Helper()
+	t.Cleanup(func() {
+		testmysql.ResetMetaDB(t, s.DB())
+	})
 	ctx := context.Background()
 	now := time.Now().UTC()
 	if err := s.InsertTenant(ctx, &Tenant{
