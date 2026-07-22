@@ -4477,13 +4477,19 @@ func (s *Store) ListTenantNotifySince(ctx context.Context, afterID uint64, limit
 		limit = 1000
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT o.id, o.tenant_id, COALESCE(b.organization_id, ''), o.work_mask, o.created_at
+		`SELECT o.id, o.tenant_id,
+		        COALESCE(CASE WHEN t.provider = ? THEN d.org_id ELSE b.organization_id END, ''),
+		        o.work_mask, o.created_at
 		 FROM tenant_notify_outbox o
+		 LEFT JOIN tenants t ON t.id = o.tenant_id
 		 LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = o.tenant_id
+		 LEFT JOIN fs_registry f ON f.tenant_id = o.tenant_id
+		 LEFT JOIN tenant_placements p ON p.fs_id = f.fs_id
+		 LEFT JOIN db_pool d ON d.db_id = p.db_id
 		 WHERE o.id > ?
 		 ORDER BY o.id
 		 LIMIT ?`,
-		afterID, limit)
+		tidbCloudNativeSharedProvider, afterID, limit)
 	if err != nil {
 		return nil, err
 	}

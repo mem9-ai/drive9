@@ -383,6 +383,16 @@ func TestAdminTenantGetAuthorizesSharedProviderThroughPhysicalPool(t *testing.T)
 	}); err != nil {
 		t.Fatalf("UpsertTenantPlacement: %v", err)
 	}
+	metricReq := httptest.NewRequest(http.MethodGet, "/v1/admin/tenants/"+rt.tenantID, nil)
+	metricReq = metricReq.WithContext(withRequestMetricState(metricReq.Context(), &requestMetricState{}))
+	if _, _, ok := rt.server.authorizedAdminTenant(httptest.NewRecorder(), metricReq, rt.tenantID,
+		tenant.CredentialProvisionRequest{PublicKey: "pk", PrivateKey: "sk"}, true, false); !ok {
+		t.Fatal("shared admin tenant authorization failed")
+	}
+	metricTenantID, _, metricProvider, metricOrgID := requestMetricScope(metricReq.Context())
+	if metricTenantID != rt.tenantID || metricProvider != tenant.ProviderTiDBCloudNativeShared || metricOrgID != "org-shared-admin" {
+		t.Fatalf("request metric scope = tenant %q provider %q org %q", metricTenantID, metricProvider, metricOrgID)
+	}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 

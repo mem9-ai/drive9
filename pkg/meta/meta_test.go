@@ -27,6 +27,35 @@ func newControlStore(t *testing.T) *Store {
 	return s
 }
 
+func insertSharedTenantPlacementForOrgTest(t *testing.T, s *Store, tenantID, organizationID string) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := s.InsertTenant(ctx, &Tenant{
+		ID: tenantID, Status: TenantActive, Kind: TenantKindLive,
+		Provider: tidbCloudNativeSharedProvider, DBPasswordCipher: []byte{}, DBTLS: true,
+		SchemaVersion: 1, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fsID, err := s.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		TiDBCloudOrganizationID: organizationID, Host: "shared.example.com", Port: 4000,
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertTenantPlacement(ctx, &TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMetaDBMetrics(t *testing.T) {
 	s := newControlStore(t)
 	now := time.Now().UTC()
@@ -261,29 +290,7 @@ func TestResolveByAPIKeyHashUsesSharedDBOrganization(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 	tenantID := "shared-api-key-org"
-	if err := s.InsertTenant(ctx, &Tenant{
-		ID: tenantID, Status: TenantActive, Kind: TenantKindLive,
-		Provider: tidbCloudNativeSharedProvider, DBPasswordCipher: []byte{}, DBTLS: true,
-		SchemaVersion: 1, CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	fsID, err := s.EnsureFsID(ctx, tenantID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
-		TiDBCloudOrganizationID: "org-shared-api-key", Host: "shared.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.UpsertTenantPlacement(ctx, &TenantPlacement{
-		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	insertSharedTenantPlacementForOrgTest(t, s, tenantID, "org-shared-api-key")
 	if err := s.InsertAPIKey(ctx, &APIKey{
 		ID: "shared-api-key", TenantID: tenantID, KeyName: "default",
 		JWTCiphertext: []byte("jwt-cipher"), JWTHash: "shared-api-key-hash", TokenVersion: 1,
@@ -932,6 +939,89 @@ func TestListTenantNotifySinceIncludesTiDBCloudOrgBinding(t *testing.T) {
 	if rows[0].TiDBCloudOrgID != "org-notify" {
 		t.Fatalf("notify row org = %q, want org-notify", rows[0].TiDBCloudOrgID)
 	}
+}
+
+func TestListTenantNotifySinceUsesSharedDBOrganization(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM tenant_notify_outbox`); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := "notify-shared-tenant"
+	insertSharedTenantPlacementForOrgTest(t, s, tenantID, "org-notify-shared")
+	if err := s.InsertTenantNotify(ctx, tenantID, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ListTenantNotifySince(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("notify row count = %d, want 1", len(rows))
+	}
+	if rows[0].TiDBCloudOrgID != "org-notify-shared" {
+		t.Fatalf("notify row org = %q, want org-notify-shared", rows[0].TiDBCloudOrgID)
+	}
+}
+
+func TestListPendingMutationsUsesSharedDBOrganization(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM quota_mutation_log`); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := "mutation-shared-tenant"
+	insertSharedTenantPlacementForOrgTest(t, s, tenantID, "org-mutation-shared")
+	id, err := s.InsertMutationLog(ctx, &MutationLogEntry{
+		TenantID: tenantID, MutationType: "file_create", MutationData: []byte(`{"file_id":"f1"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE quota_mutation_log SET created_at = ? WHERE id = ?`, time.Now().UTC().Add(-time.Minute), id); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ListPendingMutations(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("mutation row count = %d, want 1", len(rows))
+	}
+	if rows[0].TiDBCloudOrgID != "org-mutation-shared" {
+		t.Fatalf("mutation row org = %q, want org-mutation-shared", rows[0].TiDBCloudOrgID)
+	}
+}
+
+func TestObservePendingMutationsUsesSharedDBOrganization(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM quota_mutation_log`); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := "mutation-observe-shared-tenant"
+	insertSharedTenantPlacementForOrgTest(t, s, tenantID, "org-mutation-observe-shared")
+	if _, err := s.InsertMutationLog(ctx, &MutationLogEntry{
+		TenantID: tenantID, MutationType: "file_delete", MutationData: []byte(`{"file_id":"f1"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ObservePendingMutations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.TenantID == tenantID {
+			if row.TiDBCloudOrgID != "org-mutation-observe-shared" {
+				t.Fatalf("mutation observation org = %q, want org-mutation-observe-shared", row.TiDBCloudOrgID)
+			}
+			return
+		}
+	}
+	t.Fatalf("missing mutation observation for tenant %q", tenantID)
 }
 
 func TestListTenantsByStatus(t *testing.T) {

@@ -484,10 +484,12 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 			errJSON(w, http.StatusInternalServerError, "tenant pool membership lookup failed")
 			return nil, nil, false
 		}
-		if _, err := s.authorizeSharedQuotaCredentials(r.Context(), t, cred, adminTenantMetricPath(loadQuota, allowDeletingMissingCluster)); err != nil {
+		physical, err := s.authorizeSharedQuotaCredentials(r.Context(), t, cred, adminTenantMetricPath(loadQuota, allowDeletingMissingCluster))
+		if err != nil {
 			writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
 			return nil, nil, false
 		}
+		setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, physical.TiDBCloudOrganizationID, classifyTenantRequest(r))
 		return t, nil, true
 	}
 	if t.Provider != tenant.ProviderTiDBCloudNative {
@@ -520,6 +522,7 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 		}
 		for _, cluster := range clusters {
 			if cluster.OrganizationID == binding.OrganizationID {
+				setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, binding.OrganizationID, classifyTenantRequest(r))
 				return t, binding, true
 			}
 		}
@@ -539,6 +542,7 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 		errJSON(w, http.StatusForbidden, "no permission to access tenant with TiDB Cloud API key")
 		return nil, nil, false
 	}
+	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, binding.OrganizationID, classifyTenantRequest(r))
 	return t, binding, true
 }
 
