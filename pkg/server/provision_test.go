@@ -660,6 +660,42 @@ func TestRetryManagedSharedDBContinuationRecoversAfterMoreThanTwoFailures(t *tes
 	}
 }
 
+func TestRetryManagedSharedDBContinuationsAvoidsHeadOfLineBlocking(t *testing.T) {
+	origWindow, origInitialBackoff, origMaxBackoff := schemaInitRetryWindow, schemaInitInitialBackoff, schemaInitMaxBackoff
+	schemaInitRetryWindow = time.Second
+	schemaInitInitialBackoff = time.Millisecond
+	schemaInitMaxBackoff = 2 * time.Millisecond
+	t.Cleanup(func() {
+		schemaInitRetryWindow = origWindow
+		schemaInitInitialBackoff = origInitialBackoff
+		schemaInitMaxBackoff = origMaxBackoff
+	})
+
+	var order []string
+	firstAttempts := 0
+	states := []managedSharedDBContinuation{
+		{ctx: context.Background(), continuePool: func() error {
+			order = append(order, "first")
+			firstAttempts++
+			if firstAttempts <= 3 {
+				return errors.New("first pool is not ready")
+			}
+			return nil
+		}},
+		{ctx: context.Background(), continuePool: func() error {
+			order = append(order, "second")
+			return nil
+		}},
+	}
+	retryManagedSharedDBContinuations(context.Background(), states)
+	if len(order) < 2 || order[0] != "first" || order[1] != "second" {
+		t.Fatalf("attempt order = %#v, want second pool attempted in the first round", order)
+	}
+	if !states[0].done || states[0].lastErr != nil || !states[1].done || states[1].lastErr != nil {
+		t.Fatalf("continuation states = %#v, want both complete", states)
+	}
+}
+
 func TestManagedSharedDBBatchCreateUsesAllocationLock(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

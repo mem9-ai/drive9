@@ -37,7 +37,7 @@ type sharedSchemaDiffError struct {
 
 func (e *sharedSchemaDiffError) Error() string {
 	if e == nil || len(e.diffs) == 0 {
-		return ""
+		return "shared schema contract mismatch"
 	}
 	return "shared schema contract mismatch: " + strings.Join(summarizeTiDBSchemaDiffs(e.diffs), "; ")
 }

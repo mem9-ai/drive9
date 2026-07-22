@@ -95,6 +95,33 @@ func TestCurrentSharedTiDBSchemaVersionIsDerivedFromSharedStatements(t *testing.
 	}
 }
 
+func TestSharedSchemaContractUsesSharedStatementShape(t *testing.T) {
+	spec, err := tidbSchemaSpecFromStatements(SharedTiDBSchemaStatements())
+	if err != nil {
+		t.Fatalf("tidbSchemaSpecFromStatements: %v", err)
+	}
+	foundFileNodes := false
+	foundFileGCTasks := false
+	for _, table := range spec.tables {
+		switch table.name {
+		case "file_nodes":
+			foundFileNodes = true
+			idx, ok := table.indexes["idx_path"]
+			if !ok || !equalStringSlices(idx.columns, []string{"fs_id", "path_hash"}) {
+				t.Fatalf("shared file_nodes.idx_path columns = %#v, want fs_id/path_hash", idx.columns)
+			}
+		case "file_gc_tasks":
+			foundFileGCTasks = true
+			if !equalStringSlices(table.primaryKey.columns, []string{"fs_id", "task_id"}) {
+				t.Fatalf("shared file_gc_tasks primary key = %#v, want fs_id/task_id", table.primaryKey.columns)
+			}
+		}
+	}
+	if !foundFileNodes || !foundFileGCTasks {
+		t.Fatalf("shared contract missing required core tables: file_nodes=%v file_gc_tasks=%v", foundFileNodes, foundFileGCTasks)
+	}
+}
+
 // TestSharedMySQLSchemaStatementsDialect ensures the MySQL variant carries no
 // TiDB-only constructs — no CLUSTERED keyword and no VECTOR(n) column types —
 // while keeping the same 30 tables.

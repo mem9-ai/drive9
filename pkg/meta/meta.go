@@ -2615,16 +2615,21 @@ func (s *Store) ListTenantsByTiDBCloudResources(ctx context.Context, bindings []
 	}
 	placeholders := make([]string, 0, len(bindings))
 	resourceArgs := make([]any, 0, len(bindings)*2)
+	clusterPlaceholders := make([]string, 0, len(bindings))
+	clusterArgs := make([]any, 0, len(bindings))
 	for _, binding := range bindings {
 		placeholders = append(placeholders, "(?, ?)")
 		resourceArgs = append(resourceArgs, binding.OrganizationID, binding.ClusterID)
+		clusterPlaceholders = append(clusterPlaceholders, "?")
+		clusterArgs = append(clusterArgs, binding.ClusterID)
 	}
 	resources := strings.Join(placeholders, ",")
+	clusters := strings.Join(clusterPlaceholders, ",")
 	args := []any{TenantDeleted, tidbCloudNativeProvider}
 	args = append(args, resourceArgs...)
 	args = append(args, TenantPoolBindingFree, tidbCloudNativeSharedProvider)
-	args = append(args, resourceArgs...)
-	args = append(args, limit, offset)
+	args = append(args, clusterArgs...)
+	args = append(args, TenantPoolBindingFree, limit, offset)
 	query := `SELECT
 			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
@@ -2643,7 +2648,11 @@ func (s *Store) ListTenantsByTiDBCloudResources(ctx context.Context, bindings []
 				JOIN tenant_placements p ON p.fs_id = f.fs_id
 				JOIN db_pool d ON d.db_id = p.db_id
 				WHERE f.tenant_id = t.id
-					AND (d.org_id, d.cluster_id) IN (` + resources + `)
+					AND d.cluster_id IN (` + clusters + `)
+					AND NOT EXISTS (
+						SELECT 1 FROM tenant_pool_memberships m
+						WHERE m.tenant_id = t.id AND m.pool_status = ?
+					)
 			))
 		)
 		ORDER BY t.created_at DESC, t.id DESC
@@ -3861,6 +3870,11 @@ func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID 
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE p FROM tenant_placements p
+			JOIN fs_registry f ON f.fs_id = p.fs_id
+			WHERE f.tenant_id = ? AND p.status = ?`, tenantID, PlacementStatusDeleting); err != nil {
 			return err
 		}
 		return nil

@@ -197,11 +197,29 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_create_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted))...)
 		return
 	}
-	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_missed", "provider", tenant.ProviderTiDBCloudNative, "duration_ms", durationMillis(poolClaimStarted))...)
 	provider := ""
 	if sharedPoolMatched {
+		orgID, resolveErr := s.firstManagedOrganization(r.Context(), cred)
+		if resolveErr != nil {
+			writeAdminTiDBCloudError(w, r.Context(), resolveErr, "resolve shared tenant pool")
+			return
+		}
+		sharedDB, findErr := s.meta.FindSharedDBForOrg(r.Context(), orgID)
+		if findErr != nil {
+			errJSON(w, http.StatusInternalServerError, "shared tenant pool lookup failed")
+			return
+		}
+		if strings.TrimSpace(sharedDB.ClusterID) == "" {
+			errJSON(w, http.StatusConflict, "shared tenant pool has no TiDB Cloud cluster identity")
+			return
+		}
 		provider = tenant.ProviderTiDBCloudNativeShared
 	}
+	logProvider := tenant.ProviderTiDBCloudNative
+	if provider != "" {
+		logProvider = provider
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_missed", "provider", logProvider, "duration_ms", durationMillis(poolClaimStarted))...)
 	res, err = s.provisionTenant(r.Context(), provisionTenantOptions{
 		KeyName:               "default",
 		TokenVersion:          1,

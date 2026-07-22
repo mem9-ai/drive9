@@ -2434,9 +2434,6 @@ func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMet
 			if observedIndexColumnsOK && isPathHashIndexName(table.name, name) {
 				observedColumns := observedIndexColumns[strings.ToLower(name)]
 				expectedColumns := spec.columns
-				if len(expectedColumns) == 0 {
-					expectedColumns = expectedPathHashIndexColumns(table.name, name)
-				}
 				if len(expectedColumns) > 0 && len(observedColumns) > 0 && !equalStringSlices(observedColumns, expectedColumns) {
 					diffs = append(diffs, tidbSchemaDiff{
 						kind:      tidbSchemaDiffMissingIndex,

@@ -165,12 +165,13 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 // the same S3-namespace cleanup and key revocation as the standalone path.
 //
 // The flow is safe to retry at any point: the dispatch keys on the persisted
-// provider (durable), the purge is idempotent, and the placement row is only
-// removed after the purge has succeeded — a retry that finds no placement
-// skips straight to the cleanup enqueue. Identity resolution is read-only
+// provider (durable), the purge is idempotent, and external cleanup retains a
+// deleting placement as the physical-resource authorization anchor until the
+// cleanup worker reaches the terminal state. Identity resolution is read-only
 // (ResolveFsID): a delete path must never allocate a new fs_id.
 func (s *Server) handleSharedTenantDelete(w http.ResponseWriter, r *http.Request, t *meta.Tenant) {
 	ctx := r.Context()
+	deleteJobExists := false
 	if t.StorageNamespaceID != "" {
 		hasFork, err := s.meta.NamespaceHasNonDeletedFork(ctx, t.StorageNamespaceID)
 		if err != nil {
@@ -188,11 +189,7 @@ func (s *Server) handleSharedTenantDelete(w http.ResponseWriter, r *http.Request
 			errJSON(w, http.StatusInternalServerError, "failed to check tenant delete cleanup")
 			return
 		}
-		if hasJob {
-			_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
-			writeTenantDeleteStatus(w, meta.TenantDeleting)
-			return
-		}
+		deleteJobExists = hasJob
 	}
 	if t.Status != meta.TenantDeleting {
 		updated, err := s.meta.UpdateTenantStatusIf(ctx, t.ID, t.Status, meta.TenantDeleting)
@@ -223,46 +220,50 @@ func (s *Server) handleSharedTenantDelete(w http.ResponseWriter, r *http.Request
 		errJSON(w, http.StatusInternalServerError, "failed to resolve tenant placement")
 		return
 	}
+	if deleteJobExists && placement != nil && placement.Status == meta.PlacementStatusDeleting {
+		_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
+		writeTenantDeleteStatus(w, meta.TenantDeleting)
+		return
+	}
 	if placement != nil {
-		if err := s.pool.PurgeSharedTenant(ctx, fsID, placement.DbID); err != nil {
-			// Do not roll back the deleting mark; the purge is resumable and the
-			// next delete request will continue it.
-			logger.Error(ctx, "shared_tenant_purge_failed", zap.String("tenant_id", t.ID), zap.Int64("db_id", placement.DbID), zap.Error(err))
-			errJSON(w, http.StatusInternalServerError, "failed to purge tenant data from shared db")
-			return
+		if placement.Status != meta.PlacementStatusDeleting {
+			if err := s.pool.PurgeSharedTenant(ctx, fsID, placement.DbID); err != nil {
+				// Do not roll back the deleting mark; the purge is resumable and the
+				// next delete request will continue it.
+				logger.Error(ctx, "shared_tenant_purge_failed", zap.String("tenant_id", t.ID), zap.Int64("db_id", placement.DbID), zap.Error(err))
+				errJSON(w, http.StatusInternalServerError, "failed to purge tenant data from shared db")
+				return
+			}
+
+			_ = s.meta.AbortActiveUploadReservations(ctx, t.ID)
+			markDeleted := t.StorageNamespaceID == ""
+			if err := s.meta.FinalizeSharedTenantDeleteMetadata(ctx, t.ID, fsID, placement.DbID, s.sharedDBReopenRatio, markDeleted); err != nil {
+				logger.Error(ctx, "shared_tenant_metadata_finalize_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+				errJSON(w, http.StatusInternalServerError, "failed to finalize shared tenant deletion")
+				return
+			}
+			if markDeleted {
+				_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
+				writeTenantDeleteStatus(w, meta.TenantDeleted)
+				return
+			}
 		}
-		// Placement removal and the capacity release are one durable
-		// transition: if it fails, the tenant stays deleting with the
-		// placement intact so the retry re-runs the (idempotent) purge and
-		// completes the removal — a placement row must never outlive its
-		// tenant or lose its capacity accounting.
-		if err := s.meta.DeleteTenantPlacementAndDecrCount(ctx, fsID, placement.DbID, s.sharedDBReopenRatio); err != nil {
-			logger.Error(ctx, "shared_tenant_placement_delete_failed", zap.String("tenant_id", t.ID), zap.Error(err))
-			errJSON(w, http.StatusInternalServerError, "failed to remove tenant placement")
-			return
+
+		status := meta.TenantDeleting
+		if !deleteJobExists {
+			var enqueueErr error
+			status, enqueueErr = s.enqueueTenantDeleteJob(ctx, t)
+			if enqueueErr != nil {
+				errJSON(w, http.StatusInternalServerError, "failed to enqueue tenant delete cleanup")
+				return
+			}
 		}
-	}
-	// Capacity is released before membership removal on purpose: if this
-	// delete fails, the retry-safe tenant remains deleting without hiding a
-	// slot that is already available to other allocations.
-	if err := s.meta.DeleteTenantPoolMembership(ctx, t.ID); err != nil {
-		logger.Error(ctx, "shared_tenant_pool_membership_delete_failed", zap.String("tenant_id", t.ID), zap.Error(err))
-		errJSON(w, http.StatusInternalServerError, "failed to remove shared tenant pool membership")
+		_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
+		writeTenantDeleteStatus(w, status)
 		return
 	}
-	// A missing placement here means an earlier attempt already purged and
-	// removed it but failed before enqueueing cleanup — fall through to the
-	// enqueue so the retry completes the delete.
-
-	_ = s.meta.AbortActiveUploadReservations(ctx, t.ID)
-
-	status, err := s.enqueueTenantDeleteJob(ctx, t)
-	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "failed to enqueue tenant delete cleanup")
-		return
-	}
-	_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
-	writeTenantDeleteStatus(w, status)
+	logger.Error(ctx, "shared_tenant_delete_placement_missing", zap.String("tenant_id", t.ID), zap.Int64("fs_id", fsID))
+	errJSON(w, http.StatusInternalServerError, "shared tenant placement is missing")
 }
 
 func (s *Server) enqueueTenantDeleteJob(ctx context.Context, t *meta.Tenant) (meta.TenantStatus, error) {

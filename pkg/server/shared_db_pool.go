@@ -226,6 +226,7 @@ func (s *Server) scheduleManagedSharedDBContinuations(ctx context.Context, dbIDs
 	ids := append([]int64(nil), dbIDs...)
 	slices.Sort(ids)
 	s.startServerWorker(ctx, func(workerCtx context.Context) {
+		states := make([]managedSharedDBContinuation, 0, len(ids))
 		for _, dbID := range ids {
 			if workerCtx.Err() != nil {
 				return
@@ -238,46 +239,87 @@ func (s *Server) scheduleManagedSharedDBContinuations(ctx context.Context, dbIDs
 					zap.String("tidbcloud_org_id", poolInfo.TiDBCloudOrganizationID),
 				))
 			}
-			err := retryManagedSharedDBContinuation(poolCtx, func() error {
-				poolInfo, loadErr := s.meta.GetSharedDB(poolCtx, dbID)
+			id := dbID
+			states = append(states, managedSharedDBContinuation{ctx: poolCtx, continuePool: func() error {
+				poolInfo, loadErr := s.meta.GetSharedDB(poolCtx, id)
 				if loadErr != nil {
 					return loadErr
 				}
 				if poolInfo.Status != meta.SharedDBStatusProvisioning {
 					return nil
 				}
-				return s.continueManagedSharedDBPool(poolCtx, dbID, cred)
-			})
-			if err != nil && poolCtx.Err() == nil {
-				logger.Warn(poolCtx, "managed_shared_db_pool_continue_failed", zap.Error(err))
+				return s.continueManagedSharedDBPool(poolCtx, id, cred)
+			}})
+		}
+		retryManagedSharedDBContinuations(workerCtx, states)
+		for i := range states {
+			if !states[i].done && states[i].lastErr != nil && states[i].ctx.Err() == nil {
+				logger.Warn(states[i].ctx, "managed_shared_db_pool_continue_failed", zap.Error(states[i].lastErr))
 			}
 		}
 	})
 }
 
+type managedSharedDBContinuation struct {
+	ctx          context.Context
+	continuePool func() error
+	done         bool
+	lastErr      error
+}
+
 func retryManagedSharedDBContinuation(ctx context.Context, continuePool func() error) error {
+	states := []managedSharedDBContinuation{{ctx: ctx, continuePool: continuePool}}
+	retryManagedSharedDBContinuations(ctx, states)
+	return states[0].lastErr
+}
+
+func retryManagedSharedDBContinuations(ctx context.Context, states []managedSharedDBContinuation) {
 	deadline := time.Now().Add(schemaInitRetryWindow)
 	backoff := schemaInitInitialBackoff
 	attempt := 1
 	for {
-		err := continuePool()
-		if err == nil {
-			return nil
+		pending := 0
+		for i := range states {
+			if states[i].done {
+				continue
+			}
+			if err := states[i].continuePool(); err == nil {
+				states[i].done = true
+				states[i].lastErr = nil
+				continue
+			} else {
+				states[i].lastErr = err
+				pending++
+			}
+		}
+		if pending == 0 {
+			return
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return err
+			return
 		}
-		logger.Warn(ctx, "managed_shared_db_pool_continue_retry",
-			zap.Int("attempt", attempt),
-			zap.Duration("retry_in", min(backoff, remaining)),
-			zap.Duration("remaining", remaining),
-			zap.Error(err))
-		timer := time.NewTimer(min(backoff, remaining))
+		retryIn := min(backoff, remaining)
+		for i := range states {
+			if states[i].done || states[i].lastErr == nil {
+				continue
+			}
+			logger.Warn(states[i].ctx, "managed_shared_db_pool_continue_retry",
+				zap.Int("attempt", attempt),
+				zap.Duration("retry_in", retryIn),
+				zap.Duration("remaining", remaining),
+				zap.Error(states[i].lastErr))
+		}
+		timer := time.NewTimer(retryIn)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return ctx.Err()
+			for i := range states {
+				if !states[i].done {
+					states[i].lastErr = ctx.Err()
+				}
+			}
+			return
 		case <-timer.C:
 		}
 		if backoff < schemaInitMaxBackoff {
