@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -77,6 +80,296 @@ func TestPoolInvalidateRecordsCachedBackendGauge(t *testing.T) {
 
 	pool.Invalidate(tenant.ID)
 	assertCachedBackendGauge(t, 0)
+}
+
+func TestPoolInvalidateSharedDBClosesOnlySelectedHandle(t *testing.T) {
+	pool := NewPool(PoolConfig{}, nil)
+	t.Cleanup(pool.Close)
+	db1, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db2, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db2.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	pool.sharedDBs[1] = db1
+	pool.sharedDBs[2] = db2
+
+	if err := pool.InvalidateSharedDB(1); err != nil {
+		t.Fatalf("InvalidateSharedDB: %v", err)
+	}
+	if _, ok := pool.sharedDBs[1]; ok {
+		t.Fatal("invalidated shared DB remains cached")
+	}
+	if _, ok := pool.sharedDBs[2]; !ok {
+		t.Fatal("unrelated shared DB was removed")
+	}
+	if err := db1.Ping(); err == nil {
+		t.Fatal("invalidated shared DB handle remains open")
+	}
+	if err := db2.Ping(); err != nil {
+		t.Fatalf("unrelated shared DB handle was closed: %v", err)
+	}
+	if err := pool.InvalidateSharedDB(1); err != nil {
+		t.Fatalf("second InvalidateSharedDB: %v", err)
+	}
+	pool.releaseSharedDB(1)
+	if _, ok := pool.sharedDBRefs[1]; ok {
+		t.Fatal("release recreated refs for an invalidated shared DB")
+	}
+	if _, ok := pool.sharedDBLastUsed[1]; ok {
+		t.Fatal("release recreated last-used state for an invalidated shared DB")
+	}
+}
+
+func TestSharedDBHandleIdleReapUsesLongerTTLAndSkipsReferencedHandles(t *testing.T) {
+	pool := NewPool(PoolConfig{IdleTimeout: 5 * time.Minute}, nil)
+	t.Cleanup(pool.Close)
+	now := time.Now()
+
+	openDB := func() *sql.DB {
+		t.Helper()
+		db, err := sql.Open("mysql", testDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Ping(); err != nil {
+			t.Fatal(err)
+		}
+		return db
+	}
+	expired := openDB()
+	recent := openDB()
+	referenced := openDB()
+	pool.sharedDBs[1] = expired
+	pool.sharedDBs[2] = recent
+	pool.sharedDBs[3] = referenced
+	pool.sharedDBLastUsed[1] = now.Add(-defaultSharedDBHandleIdleTTL - time.Second)
+	pool.sharedDBLastUsed[2] = now.Add(-10 * time.Minute)
+	pool.retainSharedDB(3)
+	pool.sharedDBLastUsed[3] = now.Add(-defaultSharedDBHandleIdleTTL - time.Second)
+
+	pool.reapIdleSharedDBs(now)
+
+	if _, ok := pool.sharedDBs[1]; ok {
+		t.Fatal("expired unreferenced shared handle remains cached")
+	}
+	if err := expired.Ping(); err == nil {
+		t.Fatal("expired unreferenced shared handle remains open")
+	}
+	if _, ok := pool.sharedDBs[2]; !ok {
+		t.Fatal("recent shared handle was evicted at tenant 5m TTL")
+	}
+	if _, ok := pool.sharedDBs[3]; !ok {
+		t.Fatal("referenced shared handle was evicted")
+	}
+
+	pool.releaseSharedDB(3)
+	releasedAt := pool.sharedDBLastUsed[3]
+	pool.reapIdleSharedDBs(releasedAt.Add(defaultSharedDBHandleIdleTTL + time.Second))
+	if _, ok := pool.sharedDBs[3]; ok {
+		t.Fatal("released shared handle remains cached after its no-reference TTL")
+	}
+	if err := referenced.Ping(); err == nil {
+		t.Fatal("released shared handle remains open after its no-reference TTL")
+	}
+}
+
+func TestSharedDBSchemaIsCheckedLazilyAndRetriedAfterFailure(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	dsnCfg, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portText, err := net.SplitHostPort(dsnCfg.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passwordCipher, err := enc.Encrypt(context.Background(), []byte(dsnCfg.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbID, err := metaStore.RegisterSharedDB(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-lazy-schema", Host: host, Port: port,
+		User: dsnCfg.User, PasswordCipher: passwordCipher, Name: dsnCfg.DBName,
+		MaxTenants: 100, Status: meta.SharedDBStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := NewPool(PoolConfig{}, enc)
+	pool.SetMetaStore(metaStore)
+	t.Cleanup(pool.Close)
+
+	wantErr := errors.New("schema apply failed")
+	ensureCalls := 0
+	previousEnsure := ensureSharedDBSchema
+	ensureSharedDBSchema = func(ctx context.Context, db *sql.DB) error {
+		ensureCalls++
+		if err := db.PingContext(ctx); err != nil {
+			return err
+		}
+		if ensureCalls == 1 {
+			return wantErr
+		}
+		return nil
+	}
+	t.Cleanup(func() { ensureSharedDBSchema = previousEnsure })
+
+	if err := pool.EnsureSharedDBReady(context.Background(), dbID); !errors.Is(err, wantErr) {
+		t.Fatalf("first EnsureSharedDBReady = %v, want %v", err, wantErr)
+	}
+	if _, ok := pool.sharedDBs[dbID]; ok {
+		t.Fatal("failed schema ensure cached the shared DB handle")
+	}
+	info, err := metaStore.GetSharedDB(context.Background(), dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.SchemaVersion != 0 {
+		t.Fatalf("schema version after failure = %d, want 0", info.SchemaVersion)
+	}
+
+	if err := pool.EnsureSharedDBReady(context.Background(), dbID); err != nil {
+		t.Fatalf("second EnsureSharedDBReady: %v", err)
+	}
+	if err := pool.EnsureSharedDBReady(context.Background(), dbID); err != nil {
+		t.Fatalf("cached EnsureSharedDBReady: %v", err)
+	}
+	if ensureCalls != 2 {
+		t.Fatalf("schema ensure calls = %d, want 2", ensureCalls)
+	}
+	info, err = metaStore.GetSharedDB(context.Background(), dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.SchemaVersion != schema.CurrentSharedTiDBSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", info.SchemaVersion, schema.CurrentSharedTiDBSchemaVersion)
+	}
+
+	if err := pool.InvalidateSharedDB(dbID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.EnsureSharedDBReady(context.Background(), dbID); err != nil {
+		t.Fatalf("reopen current schema: %v", err)
+	}
+	if ensureCalls != 2 {
+		t.Fatalf("schema ensure calls after current-version reopen = %d, want 2", ensureCalls)
+	}
+}
+
+func TestSharedDBColdOpensDoNotBlockDifferentDBPools(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	dsnCfg, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portText, err := net.SplitHostPort(dsnCfg.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passwordCipher, err := enc.Encrypt(context.Background(), []byte(dsnCfg.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	register := func(orgID string) int64 {
+		t.Helper()
+		dbID, err := metaStore.RegisterSharedDB(context.Background(), &meta.SharedDB{
+			TiDBCloudOrganizationID: orgID, Host: host, Port: port,
+			User: dsnCfg.User, PasswordCipher: passwordCipher, Name: dsnCfg.DBName,
+			MaxTenants: 100, Status: meta.SharedDBStatusActive,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return dbID
+	}
+	dbID1 := register("org-concurrent-open-1")
+	dbID2 := register("org-concurrent-open-2")
+	pool := NewPool(PoolConfig{}, enc)
+	pool.SetMetaStore(metaStore)
+	t.Cleanup(pool.Close)
+
+	var ensureCalls atomic.Int32
+	firstEnsureStarted := make(chan struct{})
+	releaseFirstEnsure := make(chan struct{})
+	previousEnsure := ensureSharedDBSchema
+	ensureSharedDBSchema = func(ctx context.Context, db *sql.DB) error {
+		if ensureCalls.Add(1) == 1 {
+			close(firstEnsureStarted)
+			<-releaseFirstEnsure
+		}
+		return db.PingContext(ctx)
+	}
+	t.Cleanup(func() { ensureSharedDBSchema = previousEnsure })
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- pool.EnsureSharedDBReady(context.Background(), dbID1) }()
+	<-firstEnsureStarted
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- pool.EnsureSharedDBReady(context.Background(), dbID2) }()
+
+	var secondErr error
+	secondBlocked := false
+	select {
+	case secondErr = <-secondDone:
+	case <-time.After(time.Second):
+		secondBlocked = true
+	}
+	close(releaseFirstEnsure)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first shared DB open: %v", err)
+	}
+	if secondBlocked {
+		secondErr = <-secondDone
+	}
+	if secondErr != nil {
+		t.Fatalf("second shared DB open: %v", secondErr)
+	}
+	if secondBlocked {
+		t.Fatal("cold open for one shared DB blocked an unrelated shared DB")
+	}
 }
 
 func assertCachedBackendGauge(t *testing.T, want int) {

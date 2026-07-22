@@ -560,6 +560,85 @@ func TestQuotaGetReturnsConfigStorageUsageAndSpendingLimit(t *testing.T) {
 	}
 }
 
+func TestSharedQuotaGetAndSetUseLocalVirtualValueWithoutCloudMutation(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNativeShared)
+	ctx := context.Background()
+	if _, err := rt.meta.DB().ExecContext(ctx, `UPDATE tenants SET cluster_id = '' WHERE id = ?`, rt.tenantID); err != nil {
+		t.Fatalf("clear tenant cluster id: %v", err)
+	}
+	spendingTarget := int64(10_000_000)
+	dbID, err := rt.meta.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-shared-quota", ProvisioningKey: make([]byte, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	fsID, err := rt.meta.ResolveFsID(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatalf("ResolveFsID: %v", err)
+	}
+	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+	}); err != nil {
+		t.Fatalf("UpsertTenantPlacement: %v", err)
+	}
+	if err := rt.meta.IncrSharedDBTenantCount(ctx, dbID, 1); err != nil {
+		t.Fatalf("IncrSharedDBTenantCount: %v", err)
+	}
+	if err := rt.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-shared-quota", ClusterID: "cluster-shared-quota",
+	}); err != nil {
+		t.Fatalf("UpdateManagedSharedDBPoolCloudResult: %v", err)
+	}
+	initialLimit := int64(1000)
+	if err := rt.meta.SetQuotaConfig(ctx, &meta.QuotaConfig{
+		TenantID: rt.tenantID, MaxStorageBytes: 100 * quotaStorageSizeBytes,
+		MaxFileSizeBytes: 10 * quotaStorageSizeBytes, MaxMediaLLMFiles: 1,
+		MaxVideoLLMFiles: 1, TiDBCloudSpendingLimit: &initialLimit,
+	}); err != nil {
+		t.Fatalf("SetQuotaConfig: %v", err)
+	}
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	getResp := getQuota(t, ts.URL, rt.tenantID, "", "", rt.apiKey)
+	defer func() { _ = getResp.Body.Close() }()
+	if getResp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(getResp.Body)
+		t.Fatalf("GET status = %d body=%s", getResp.StatusCode, raw)
+	}
+	var getOut quotaResponse
+	if err := json.NewDecoder(getResp.Body).Decode(&getOut); err != nil {
+		t.Fatal(err)
+	}
+	if !getOut.SupportsUpdate || getOut.Config.TiDBCloudSpendingLimit == nil || *getOut.Config.TiDBCloudSpendingLimit != initialLimit {
+		t.Fatalf("GET response = %+v", getOut)
+	}
+
+	updatedLimit := int64(2000)
+	setResp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
+		"tenant_id": rt.tenantID, "public_key": "public", "private_key": "private",
+		"tidbcloud_spending_limit": updatedLimit,
+	}, "")
+	defer func() { _ = setResp.Body.Close() }()
+	if setResp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(setResp.Body)
+		t.Fatalf("SET status = %d body=%s", setResp.StatusCode, raw)
+	}
+	cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != updatedLimit {
+		t.Fatalf("persisted shared limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, updatedLimit)
+	}
+	if rt.prov.getCalls.Load() != 1 || rt.prov.markCalls.Load() != 0 || rt.prov.updateCalls.Load() != 0 {
+		t.Fatalf("shared quota Cloud calls: get=%d mark=%d update=%d; want one read-only authorization call",
+			rt.prov.getCalls.Load(), rt.prov.markCalls.Load(), rt.prov.updateCalls.Load())
+	}
+}
+
 func TestQuotaGetUsesDrive9APIKeyWhenLocalSpendingLimitExists(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	spendingLimit := int64(10000)

@@ -52,6 +52,10 @@ var tenantPoolMetadataResumeWaitTotal = serviceMeter.Int64Counter("drive9_tenant
 var tenantPoolMetadataResumeWaitDuration = serviceMeter.Float64Histogram("drive9_tenant_pool_metadata_resume_wait_duration_seconds", "Tenant pool metadata resume wait duration by pool_id/organization_id/scope/result", tenantPoolMetadataResumeWaitDurationBounds)
 var tenantPoolCapacity = serviceMeter.Float64Gauge("drive9_tenant_pool_capacity", "Tenant pool capacity by pool_id/organization_id/state")
 var tenantPoolBindings = serviceMeter.Float64Gauge("drive9_tenant_pool_bindings", "Tenant pool binding count by pool_id/tidbcloud_org_id/status")
+var sharedDBPoolTotal = serviceMeter.Float64Gauge("drive9_shared_db_pool_total", "Physical shared DB-pool count by tidbcloud_org_id/status")
+var sharedDBPoolCapacity = serviceMeter.Float64Gauge("drive9_shared_db_pool_capacity", "Physical shared DB-pool capacity by tidbcloud_org_id/db_pool_id/type")
+var sharedDBPoolTenants = serviceMeter.Float64Gauge("drive9_shared_db_pool_tenants", "Physical shared DB-pool tenant count by tidbcloud_org_id/db_pool_id/state")
+var sharedDBPoolSpendingLimit = serviceMeter.Float64Gauge("drive9_shared_db_pool_spending_limit", "Physical shared DB-pool spending limit by tidbcloud_org_id/db_pool_id/type")
 var tidbCloudRBACCacheRequestsTotal = serviceMeter.Int64Counter("drive9_tidbcloud_rbac_cache_requests_total", "TiDB Cloud API key to cluster RBAC cache requests by path/scope/result")
 var tidbCloudOpenAPIRequestsTotal = serviceMeter.Int64Counter("drive9_tidbcloud_openapi_requests_total", "TiDB Cloud OpenAPI requests by path/operation/result")
 var tidbCloudSpendingLimitSyncTotal = serviceMeter.Int64Counter("drive9_tidbcloud_spending_limit_sync_total", "TiDB Cloud spending limit local sync outcomes by source/result")
@@ -185,6 +189,62 @@ func DeleteTenantPoolBindings(poolID, tidbCloudOrgID, poolStatus string) {
 		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
 		Attr("status", cleanMetricValue(poolStatus, "unknown")),
 	)
+}
+
+func RecordSharedDBPoolTotal(tidbCloudOrgID, status string, count int64) {
+	if count < 0 {
+		return
+	}
+	RegisterModule("shared_db_pool")
+	sharedDBPoolTotal.Set(float64(count),
+		Attr("tidbcloud_org_id", cleanMetricValue(tidbCloudOrgID, "unknown")),
+		Attr("status", cleanMetricValue(status, "unknown")),
+	)
+}
+
+func DeleteSharedDBPoolTotal(tidbCloudOrgID, status string) {
+	sharedDBPoolTotal.Delete(
+		Attr("tidbcloud_org_id", cleanMetricValue(tidbCloudOrgID, "unknown")),
+		Attr("status", cleanMetricValue(status, "unknown")),
+	)
+}
+
+func RecordSharedDBPoolCapacity(tidbCloudOrgID string, dbPoolID int64, capacityType string, value int64) {
+	RegisterModule("shared_db_pool")
+	sharedDBPoolCapacity.Set(float64(value), sharedDBPoolAttrs(tidbCloudOrgID, dbPoolID, "type", capacityType)...)
+}
+
+func DeleteSharedDBPoolCapacity(tidbCloudOrgID string, dbPoolID int64, capacityType string) {
+	sharedDBPoolCapacity.Delete(sharedDBPoolAttrs(tidbCloudOrgID, dbPoolID, "type", capacityType)...)
+}
+
+func RecordSharedDBPoolTenants(tidbCloudOrgID string, dbPoolID int64, state string, count int64) {
+	if count < 0 {
+		return
+	}
+	RegisterModule("shared_db_pool")
+	sharedDBPoolTenants.Set(float64(count), sharedDBPoolAttrs(tidbCloudOrgID, dbPoolID, "state", state)...)
+}
+
+func DeleteSharedDBPoolTenants(tidbCloudOrgID string, dbPoolID int64, state string) {
+	sharedDBPoolTenants.Delete(sharedDBPoolAttrs(tidbCloudOrgID, dbPoolID, "state", state)...)
+}
+
+func RecordSharedDBPoolSpendingLimit(tidbCloudOrgID string, dbPoolID int64, limitType string, value int64) {
+	RegisterModule("shared_db_pool")
+	sharedDBPoolSpendingLimit.Set(float64(value), sharedDBPoolAttrs(tidbCloudOrgID, dbPoolID, "type", limitType)...)
+}
+
+func DeleteSharedDBPoolSpendingLimit(tidbCloudOrgID string, dbPoolID int64, limitType string) {
+	sharedDBPoolSpendingLimit.Delete(sharedDBPoolAttrs(tidbCloudOrgID, dbPoolID, "type", limitType)...)
+}
+
+func sharedDBPoolAttrs(tidbCloudOrgID string, dbPoolID int64, dimension, value string) []Attribute {
+	return []Attribute{
+		Attr("tidbcloud_org_id", cleanMetricValue(tidbCloudOrgID, "unknown")),
+		Attr("db_pool_id", strconv.FormatInt(dbPoolID, 10)),
+		Attr(dimension, cleanMetricValue(value, "unknown")),
+	}
 }
 
 func DeleteTenantCounters(tenantID string) {

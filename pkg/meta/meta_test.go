@@ -1098,13 +1098,6 @@ func TestMetaSchemaSpecTracksPrimaryKeyConstraint(t *testing.T) {
 	if spendingLimit.addSQL != "ALTER TABLE tenant_quota_config ADD COLUMN tidbcloud_spending_limit BIGINT NULL" {
 		t.Fatalf("tidbcloud_spending_limit addSQL = %q", spendingLimit.addSQL)
 	}
-	quotaOverride, ok := table.columns["quota_limits_overridden"]
-	if !ok {
-		t.Fatal("tenant_quota_config schema missing quota_limits_overridden")
-	}
-	if quotaOverride.addSQL != "ALTER TABLE tenant_quota_config ADD COLUMN quota_limits_overridden TINYINT(1) NOT NULL DEFAULT 1" {
-		t.Fatalf("quota_limits_overridden addSQL = %q", quotaOverride.addSQL)
-	}
 	checkedAt, ok := table.columns["tidbcloud_spending_limit_checked_at"]
 	if !ok {
 		t.Fatal("tenant_quota_config schema missing tidbcloud_spending_limit_checked_at")
@@ -1364,6 +1357,124 @@ func TestMetaSchemaSpecIncludesTiDBCloudOrgBindings(t *testing.T) {
 	}
 }
 
+func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
+	dbPool := mustMetaTableSpec(t, mustMetaSpec(t), "db_pool")
+	for _, column := range []string{
+		"db_id", "org_id", "cluster_id", "provisioning_key", "cloud_provider", "region",
+		"role", "db_host", "db_port", "db_user", "db_password", "db_name", "db_tls",
+		"max_tenants", "tenant_count", "soft_cap_reached", "spending_limit", "schema_version", "status",
+		"created_at", "updated_at",
+	} {
+		if _, ok := dbPool.columns[column]; !ok {
+			t.Fatalf("db_pool schema missing %s", column)
+		}
+	}
+	for _, index := range []string{
+		"primary", "uk_db_pool_cloud_resource", "uk_db_pool_endpoint",
+		"idx_db_pool_allocate", "idx_db_pool_provisioning_key",
+	} {
+		if _, ok := dbPool.indexes[index]; !ok {
+			t.Fatalf("db_pool schema missing index %s", index)
+		}
+	}
+
+	memberships := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_pool_memberships")
+	for _, column := range []string{
+		"tenant_id", "tidbcloud_organization_id", "pool_id", "pool_status", "used_at", "created_at", "updated_at",
+	} {
+		if _, ok := memberships.columns[column]; !ok {
+			t.Fatalf("tenant_pool_memberships schema missing %s", column)
+		}
+	}
+	if _, ok := memberships.columns["organization_id"]; ok {
+		t.Fatal("tenant_pool_memberships must not use ambiguous organization_id column")
+	}
+	for _, index := range []string{"primary", "idx_tenant_pool_claim", "idx_tenant_pool_org_status"} {
+		if _, ok := memberships.indexes[index]; !ok {
+			t.Fatalf("tenant_pool_memberships schema missing index %s", index)
+		}
+	}
+}
+
+func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	if _, err := s.DB().ExecContext(ctx, `DROP TABLE db_pool`); err != nil {
+		t.Fatalf("drop current db_pool: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.DB().ExecContext(context.Background(), `DROP TABLE IF EXISTS db_pool`)
+		if err := s.migrate(); err != nil {
+			t.Errorf("restore current db_pool schema: %v", err)
+		}
+	})
+	if _, err := s.DB().ExecContext(ctx, `CREATE TABLE db_pool (
+		db_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+		org_id VARCHAR(64) NOT NULL DEFAULT '',
+		`+"`role`"+` VARCHAR(20) NOT NULL,
+		db_host VARCHAR(255) NOT NULL,
+		db_port INT NOT NULL,
+		db_user VARCHAR(255) NOT NULL,
+		db_password VARBINARY(2048) NOT NULL,
+		db_name VARCHAR(255) NOT NULL,
+		db_tls VARCHAR(32) NOT NULL DEFAULT '',
+		max_tenants INT NOT NULL DEFAULT 0,
+		tenant_count INT NOT NULL DEFAULT 0,
+		status VARCHAR(20) NOT NULL DEFAULT 'active',
+		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+		updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+		UNIQUE INDEX uk_db_pool_endpoint (org_id, db_host, db_name),
+		INDEX idx_db_pool_org (org_id, status)
+	)`); err != nil {
+		t.Fatalf("create legacy db_pool: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO db_pool
+		(org_id, `+"`role`"+`, db_host, db_port, db_user, db_password, db_name, max_tenants)
+		VALUES ('org-legacy', 'shared', 'legacy.example.com', 4000, 'root', X'01', 'legacy_db', 2)`); err != nil {
+		t.Fatalf("insert legacy db_pool row: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET tenant_count = 2 WHERE org_id = 'org-legacy'`); err != nil {
+		t.Fatalf("fill legacy db_pool row: %v", err)
+	}
+
+	if err := s.migrate(); err != nil {
+		t.Fatalf("migrate legacy db_pool: %v", err)
+	}
+
+	for _, column := range []string{"org_id", "db_host", "db_port", "db_user", "db_password", "db_name"} {
+		var nullable string
+		if err := s.DB().QueryRowContext(ctx, `SELECT is_nullable
+			FROM information_schema.columns
+			WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = ?`, column).Scan(&nullable); err != nil {
+			t.Fatalf("load db_pool.%s nullability: %v", column, err)
+		}
+		if nullable != "YES" {
+			t.Fatalf("db_pool.%s is_nullable = %q, want YES", column, nullable)
+		}
+	}
+	for _, index := range []string{"uk_db_pool_cloud_resource", "idx_db_pool_allocate", "idx_db_pool_provisioning_key"} {
+		exists, err := metaIndexExists(ctx, s.DB(), "db_pool", index)
+		if err != nil {
+			t.Fatalf("check %s: %v", index, err)
+		}
+		if !exists {
+			t.Fatalf("db_pool index %s was not created", index)
+		}
+	}
+	var status string
+	var softCapReached bool
+	var spendingLimit *int64
+	if err := s.DB().QueryRowContext(ctx, `SELECT status, spending_limit, soft_cap_reached FROM db_pool WHERE org_id = 'org-legacy'`).Scan(&status, &spendingLimit, &softCapReached); err != nil {
+		t.Fatalf("load migrated legacy row: %v", err)
+	}
+	if status != "active" || spendingLimit != nil {
+		t.Fatalf("legacy row status/spending_limit = %q/%v, want active/NULL", status, spendingLimit)
+	}
+	if !softCapReached {
+		t.Fatal("legacy row at max_tenants must be backfilled with soft_cap_reached=true")
+	}
+}
+
 func TestUpsertTenantTiDBCloudOrgBindingRejectsDuplicateLiveClusterBranch(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
@@ -1388,6 +1499,23 @@ func TestUpsertTenantTiDBCloudOrgBindingRejectsDuplicateLiveClusterBranch(t *tes
 	})
 	if !errors.Is(err, ErrDuplicate) {
 		t.Fatalf("duplicate cluster branch upsert err = %v, want ErrDuplicate", err)
+	}
+}
+
+func TestUpsertTenantTiDBCloudOrgBindingRejectsSharedTenant(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	insertTiDBCloudBindingTenant(t, s, "binding-shared-tenant", TenantKindLive, TenantActive, "", "", now)
+	if err := s.UpdateTenantProvider(ctx, "binding-shared-tenant", "tidb_cloud_native_shared"); err != nil {
+		t.Fatalf("mark tenant shared: %v", err)
+	}
+	err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+		TenantID: "binding-shared-tenant", OrganizationID: "org-shared",
+		ClusterID: "cluster-shared", CreatedAt: now, UpdatedAt: now,
+	})
+	if err == nil || !strings.Contains(err.Error(), "shared tenant") {
+		t.Fatalf("shared binding error = %v, want shared tenant rejection", err)
 	}
 }
 
@@ -1713,7 +1841,6 @@ func TestDiffMetaTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
 			"max_media_llm_files":                 {columnType: "bigint"},
 			"max_video_llm_files":                 {columnType: "bigint"},
 			"max_monthly_cost_mc":                 {columnType: "bigint"},
-			"quota_limits_overridden":             {columnType: "tinyint(1)"},
 			"tidbcloud_spending_limit":            {columnType: "bigint"},
 			"tidbcloud_spending_limit_checked_at": {columnType: "datetime(3)"},
 			"created_at":                          {columnType: "datetime(3)"},
@@ -1728,7 +1855,6 @@ func TestDiffMetaTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
 		max_media_llm_files BIGINT NOT NULL,
 		max_video_llm_files BIGINT NOT NULL,
 		max_monthly_cost_mc BIGINT NOT NULL,
-		quota_limits_overridden TINYINT(1) NOT NULL DEFAULT 1,
 		tidbcloud_spending_limit BIGINT NULL,
 		tidbcloud_spending_limit_checked_at DATETIME(3) NULL,
 		created_at DATETIME(3) NOT NULL,

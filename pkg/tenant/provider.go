@@ -9,9 +9,8 @@ const (
 
 	// ProviderTiDBCloudNativeShared is the persisted provider of a tenant
 	// placed on a shared-schema (multi-tenant) TiDB database. It is assigned
-	// by the server at provision time when the tenant's org matches a
-	// registered shared pool — never selected directly by a provisioner —
-	// and lets provider-driven capability checks distinguish shared tenants
+	// as the independent new-tenant default while reusing the native TiDB
+	// Cloud provisioner, and lets provider-driven capability checks distinguish shared tenants
 	// from dedicated-cluster ones without an extra placement lookup:
 	// TiDB-backed, but no per-tenant cluster to delete or fork, and no
 	// database auto-embedding (the shared schema has no generated columns).
@@ -36,6 +35,12 @@ func NormalizeProvider(provider string) (string, error) {
 // of a tenant placed on a shared-schema database.
 func IsSharedSchemaProvider(provider string) bool {
 	return provider == ProviderTiDBCloudNativeShared
+}
+
+// UsesTiDBCloudNativeCredentials reports whether provider uses the TiDB Cloud
+// Native public/private-key request and default-credential contract.
+func UsesTiDBCloudNativeCredentials(provider string) bool {
+	return provider == ProviderTiDBCloudNative || provider == ProviderTiDBCloudNativeShared
 }
 
 func SmallInDB(provider string) bool {

@@ -93,7 +93,7 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if strings.TrimSpace(t.ClusterID) == "" {
+	if !tenant.IsSharedSchemaProvider(t.Provider) && strings.TrimSpace(t.ClusterID) == "" {
 		errJSON(w, http.StatusNotFound, quotaBackendNotFoundMessage)
 		return
 	}
@@ -109,6 +109,21 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		errJSON(w, http.StatusForbidden, "API key tenant does not match requested tenant")
+		return
+	}
+	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
+		cred, err := quotaCredentials(req)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		physical, err := s.authorizeSharedQuotaCredentials(r.Context(), t, cred, "quota_get")
+		if err != nil {
+			writeQuotaCredentialError(w, r.Context(), err, "query")
+			return
+		}
+		setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, physical.TiDBCloudOrganizationID, classifyTenantRequest(r))
+		s.writeQuotaResponse(w, r, t)
 		return
 	}
 	if t.Provider != tenant.ProviderTiDBCloudNative {
@@ -237,7 +252,7 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if t.Provider != tenant.ProviderTiDBCloudNative {
+	if t.Provider != tenant.ProviderTiDBCloudNative && t.Provider != tenant.ProviderTiDBCloudNativeShared {
 		errJSON(w, http.StatusConflict, "quota setting is only supported for tidb_cloud_native tenants")
 		return
 	}
@@ -245,12 +260,72 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusConflict, err.Error())
 		return
 	}
-	if err := s.applyQuotaSet(r.Context(), "quota_set", t, cred, req); err != nil {
+	var sharedPhysical *meta.SharedDB
+	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
+		physical, err := s.authorizeSharedQuotaCredentials(r.Context(), t, cred, "quota_set")
+		if err != nil {
+			writeQuotaSetError(w, r.Context(), err, "authorize")
+			return
+		}
+		if err := s.applySharedQuotaSet(r.Context(), t, req); err != nil {
+			writeQuotaSetError(w, r.Context(), err, "update")
+			return
+		}
+		sharedPhysical = physical
+	} else if err := s.applyQuotaSet(r.Context(), "quota_set", t, cred, req); err != nil {
 		writeQuotaSetError(w, r.Context(), err, "update")
 		return
 	}
-	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, s.tenantMetricTiDBCloudOrgID(r.Context(), t), classifyTenantRequest(r))
+	metricOrgID := ""
+	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
+		// The shared authorization path already resolved the physical pool;
+		// reuse its organization label instead of issuing another meta query.
+		metricOrgID = sharedPhysical.TiDBCloudOrganizationID
+	} else {
+		metricOrgID = s.tenantMetricTiDBCloudOrgID(r.Context(), t)
+	}
+	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, metricOrgID, classifyTenantRequest(r))
 	s.writeQuotaResponse(w, r, t)
+}
+
+func (s *Server) authorizeSharedQuotaCredentials(ctx context.Context, t *meta.Tenant, cred tenant.CredentialProvisionRequest, metricPath string) (*meta.SharedDB, error) {
+	physical, err := s.meta.GetSharedDBForTenant(ctx, t.ID)
+	if err != nil || strings.TrimSpace(physical.ClusterID) == "" {
+		return nil, tenant.ErrQuotaBackendNotFound
+	}
+	if s.tidbCloudRBACAllowed(cred, physical.ClusterID, metricPath) {
+		return physical, nil
+	}
+	getter, ok := s.provisioner.(tenant.QuotaGetter)
+	if !ok {
+		return nil, errQuotaSettingNotEnabled
+	}
+	if _, err := getter.GetQuota(ctx, &tenant.ClusterInfo{
+		ClusterID:      physical.ClusterID,
+		OrganizationID: physical.TiDBCloudOrganizationID,
+		Provider:       tenant.ProviderTiDBCloudNative,
+	}, cred); err != nil {
+		return nil, err
+	}
+	s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{
+		ClusterID:      physical.ClusterID,
+		OrganizationID: physical.TiDBCloudOrganizationID,
+	})
+	return physical, nil
+}
+
+func (s *Server) applySharedQuotaSet(ctx context.Context, t *meta.Tenant, req quotaRequest) error {
+	patch, err := quotaConfigPatchFromRequest(req)
+	if err != nil {
+		return err
+	}
+	if err := s.meta.UpdateSharedTenantQuotaConfig(ctx, t.ID, patch); err != nil {
+		return err
+	}
+	if err := s.meta.EnsureQuotaUsageRow(ctx, t.ID); err != nil {
+		return fmt.Errorf("%w: quota usage initialization failed: %w", errQuotaLocalUpdateFailed, err)
+	}
+	return nil
 }
 
 func decodeQuotaRequest(w http.ResponseWriter, r *http.Request) (quotaRequest, error) {
@@ -500,7 +575,7 @@ func (s *Server) writeQuotaResponse(w http.ResponseWriter, r *http.Request, t *m
 		TenantID:       t.ID,
 		Provider:       t.Provider,
 		Status:         string(t.Status),
-		SupportsUpdate: t.Provider == tenant.ProviderTiDBCloudNative,
+		SupportsUpdate: tenant.UsesTiDBCloudNativeCredentials(t.Provider),
 		Config: quotaConfigResponse{
 			MaxStorageSize:         quotaStorageBytesToSize(cfg.MaxStorageBytes),
 			MaxFileSize:            quotaStorageBytesToSize(cfg.MaxFileSizeBytes),
@@ -565,6 +640,8 @@ func writeQuotaSetError(w http.ResponseWriter, ctx context.Context, err error, a
 
 func quotaSetErrorStatusMessage(err error, action string) (int, string, bool) {
 	switch {
+	case errors.Is(err, meta.ErrSharedDBSpendingLimitExceeded):
+		return http.StatusConflict, "shared database spending limit capacity exceeded", true
 	case errors.Is(err, errQuotaSettingNotEnabled):
 		return http.StatusNotFound, "quota setting not enabled", true
 	case errors.Is(err, errQuotaLocalUpdateFailed):

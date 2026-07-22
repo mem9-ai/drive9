@@ -58,6 +58,8 @@ const (
 	Drive9PoolStatusLabel      = "drive9.ai/status"
 	Drive9PoolIDLabel          = "drive9.ai/pool_id"
 	Drive9PoolUsedAtLabel      = "drive9.ai/used_at"
+	Drive9ProviderLabel        = "drive9.ai/provider"
+	Drive9DBPoolIDLabel        = "drive9.ai/db_pool_id"
 	Drive9QuotaUpdateAtLabel   = "drive9.ai/update_quota_at"
 	TiDBCloudOrganizationLabel = "tidb.cloud/organization"
 
@@ -161,6 +163,17 @@ func (p *Provisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, b
 }
 
 func (p *Provisioner) ProvisioningRegion() string { return p.region }
+
+// DefaultTiDBCloudSpendingLimit returns the effective native create default so
+// shared tenants can persist the same value as local compatibility metadata.
+func (p *Provisioner) DefaultTiDBCloudSpendingLimit() int64 {
+	if p.defaultSpendLimit == nil {
+		return 0
+	}
+	return int64(*p.defaultSpendLimit)
+}
+
+func (p *Provisioner) DefaultSharedDatabaseName() string { return p.defaultDatabaseName }
 
 func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
 	// Direct callers still need database creation; the server auto-embedding
@@ -472,6 +485,207 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(*spendingLimit)
 	}
 	return out, cloudCfg, nil
+}
+
+func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Context, inputs []tenant.SharedDBPoolCreateRequest, req tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	if len(inputs) == 0 {
+		return []*tenant.SharedDBPoolInfo{}, nil
+	}
+	if len(inputs) > 10 {
+		return nil, fmt.Errorf("shared db pool batch size %d exceeds 10", len(inputs))
+	}
+	requests := make([]map[string]any, 0, len(inputs))
+	passwords := make(map[int64]string, len(inputs))
+	databaseNames := make(map[int64]string, len(inputs))
+	for _, input := range inputs {
+		if input.DBPoolID <= 0 {
+			return nil, fmt.Errorf("db pool id must be positive")
+		}
+		if _, exists := passwords[input.DBPoolID]; exists {
+			return nil, fmt.Errorf("duplicate db pool id %d", input.DBPoolID)
+		}
+		if err := validateTiDBCloudSpendingLimit(input.SpendingLimitMonthly); err != nil {
+			return nil, err
+		}
+		dbName, err := p.resolveDatabaseName(input.DatabaseName)
+		if err != nil {
+			return nil, err
+		}
+		password := strings.TrimSpace(input.RootPassword)
+		if password == "" {
+			return nil, fmt.Errorf("root password is required for db pool %d", input.DBPoolID)
+		}
+		passwords[input.DBPoolID] = password
+		databaseNames[input.DBPoolID] = dbName
+		id := strconv.FormatInt(input.DBPoolID, 10)
+		requests = append(requests, map[string]any{"cluster": map[string]any{
+			"displayName":  clusterDisplayName(id),
+			"rootPassword": password,
+			"region":       map[string]string{"name": p.regionName()},
+			"labels": map[string]string{
+				Drive9ManagedLabel:  "true",
+				Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+				Drive9DBPoolIDLabel: id,
+			},
+			"spendingLimit": map[string]int32{"monthly": int32(input.SpendingLimitMonthly)},
+		}})
+	}
+	body, err := json.Marshal(map[string]any{"requests": requests})
+	if err != nil {
+		return nil, err
+	}
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPost, p.apiURL+"/v1beta1/clusters:batchCreate", body)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, readErr
+		}
+		return nil, fmt.Errorf("%s", statusError("batch provision shared db pools", resp.StatusCode, sanitizeUpstreamBody(raw)))
+	}
+	raw, err := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
+	if err != nil {
+		return nil, err
+	}
+	var created clusterListResponse
+	if err := json.Unmarshal(raw, &created); err != nil {
+		return nil, err
+	}
+	var partialErr error
+	if len(created.Clusters) != len(inputs) {
+		partialErr = fmt.Errorf("tidbcloud native shared batch provision returned %d clusters, want %d", len(created.Clusters), len(inputs))
+	}
+	out := make([]*tenant.SharedDBPoolInfo, 0, len(created.Clusters))
+	for i := range created.Clusters {
+		info := &created.Clusters[i]
+		id, err := strconv.ParseInt(strings.TrimSpace(info.Labels[Drive9DBPoolIDLabel]), 10, 64)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("tidbcloud native shared batch response has invalid %s label for cluster %q", Drive9DBPoolIDLabel, info.ClusterID)
+		}
+		password, ok := passwords[id]
+		if !ok {
+			return nil, fmt.Errorf("tidbcloud native shared batch response returned unknown db pool id %d", id)
+		}
+		result := &tenant.SharedDBPoolInfo{
+			DBPoolID: id, ClusterID: strings.TrimSpace(info.ClusterID),
+			OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
+			Password:       password, DBName: databaseNames[id],
+		}
+		if result.ClusterID == "" {
+			return nil, fmt.Errorf("tidbcloud native shared batch response missing cluster id for db pool %d", id)
+		}
+		if !p.clusterProvisionMetadataIncomplete(info) {
+			result.Host, result.Port, err = p.resolveClusterEndpoint(info)
+			if err != nil {
+				return nil, err
+			}
+			result.Username = strings.TrimSpace(info.UserPrefix) + ".root"
+		}
+		out = append(out, result)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].DBPoolID < out[j].DBPoolID })
+	// Preserve decoded successes with partialErr as required by the
+	// SharedDBPoolProvisioner contract; callers persist these before retrying
+	// omitted DB pools through the continuation path.
+	return out, partialErr
+}
+
+// LoadSharedDBPoolWithCredentials finds an existing managed shared cluster by
+// its durable db-pool label, or refreshes a known cluster by ID. A nil result
+// means no matching cluster exists yet. Multiple label matches fail closed.
+func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoolID int64, clusterID string, req tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	if dbPoolID <= 0 {
+		return nil, fmt.Errorf("db pool id must be positive")
+	}
+	wantID := strconv.FormatInt(dbPoolID, 10)
+	var matches []clusterInfo
+	if strings.TrimSpace(clusterID) != "" {
+		info, err := p.getClusterBasicInfoWithCredentials(ctx, publicKey, privateKey, strings.TrimSpace(clusterID))
+		if err != nil {
+			return nil, err
+		}
+		matches = append(matches, *info)
+	} else {
+		infos, err := p.listClusterInfosWithCredentials(ctx, publicKey, privateKey, nil, 100)
+		if err != nil {
+			return nil, err
+		}
+		for _, info := range infos {
+			if strings.TrimSpace(info.Labels[Drive9DBPoolIDLabel]) == wantID &&
+				strings.TrimSpace(info.Labels[Drive9ManagedLabel]) == "true" &&
+				strings.TrimSpace(info.Labels[Drive9ProviderLabel]) == tenant.ProviderTiDBCloudNativeShared {
+				matches = append(matches, info)
+			}
+		}
+	}
+	if len(matches) == 0 {
+		return nil, nil
+	}
+	if len(matches) != 1 {
+		return nil, fmt.Errorf("%w: found %d managed shared clusters for db pool %d", tenant.ErrSharedDBPoolAmbiguous, len(matches), dbPoolID)
+	}
+	return p.sharedDBPoolInfoFromCluster(dbPoolID, &matches[0])
+}
+
+func (p *Provisioner) sharedDBPoolInfoFromCluster(dbPoolID int64, info *clusterInfo) (*tenant.SharedDBPoolInfo, error) {
+	wantID := strconv.FormatInt(dbPoolID, 10)
+	if got := strings.TrimSpace(info.Labels[Drive9ManagedLabel]); got != "true" {
+		return nil, fmt.Errorf("cluster %q has %s label %q, want %q", info.ClusterID, Drive9ManagedLabel, got, "true")
+	}
+	if got := strings.TrimSpace(info.Labels[Drive9ProviderLabel]); got != tenant.ProviderTiDBCloudNativeShared {
+		return nil, fmt.Errorf("cluster %q has %s label %q, want %q", info.ClusterID, Drive9ProviderLabel, got, tenant.ProviderTiDBCloudNativeShared)
+	}
+	if got := strings.TrimSpace(info.Labels[Drive9DBPoolIDLabel]); got != wantID {
+		return nil, fmt.Errorf("cluster %q has db pool label %q, want %q", info.ClusterID, got, wantID)
+	}
+	result := &tenant.SharedDBPoolInfo{
+		DBPoolID: dbPoolID, ClusterID: strings.TrimSpace(info.ClusterID),
+		OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
+	}
+	if !p.clusterProvisionMetadataIncomplete(info) {
+		var err error
+		result.Host, result.Port, err = p.resolveClusterEndpoint(info)
+		if err != nil {
+			return nil, err
+		}
+		result.Username = strings.TrimSpace(info.UserPrefix) + ".root"
+	}
+	return result, nil
+}
+
+// WaitForSharedDBPoolMetadataWithCredentials reuses the existing TiDB Cloud
+// Native endpoint/user/org readiness poll for a managed shared DB pool.
+func (p *Provisioner) WaitForSharedDBPoolMetadataWithCredentials(ctx context.Context, dbPoolID int64, clusterID string, req tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	if dbPoolID <= 0 {
+		return nil, fmt.Errorf("db pool id must be positive")
+	}
+	clusterID = strings.TrimSpace(clusterID)
+	if clusterID == "" {
+		return nil, fmt.Errorf("cluster id is required")
+	}
+	info, err := p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	return p.sharedDBPoolInfoFromCluster(dbPoolID, info)
 }
 
 type batchClusterMetadataTarget struct {

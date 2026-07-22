@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -35,6 +36,12 @@ func TestSharedTenantDeleteRetriesAfterPlacementRemoval(t *testing.T) {
 	if err := rt.meta.UpdateTenantStatus(ctx, rt.tenantID, meta.TenantDeleting); err != nil {
 		t.Fatal(err)
 	}
+	if err := rt.meta.UpsertTenantPoolMembership(ctx, &meta.TenantPoolMembership{
+		TenantID: rt.tenantID, TiDBCloudOrganizationID: "org-shared-delete", PoolID: "pool-shared-delete",
+		PoolStatus: meta.TenantPoolBindingUsed,
+	}); err != nil {
+		t.Fatalf("UpsertTenantPoolMembership: %v", err)
+	}
 
 	resp := rt.deleteTenant(t, nil)
 	defer func() { _ = resp.Body.Close() }()
@@ -53,6 +60,9 @@ func TestSharedTenantDeleteRetriesAfterPlacementRemoval(t *testing.T) {
 	if status != string(meta.TenantDeleted) {
 		t.Fatalf("tenant status = %s, want %s", status, meta.TenantDeleted)
 	}
+	if _, err := rt.meta.GetTenantPoolMembership(ctx, rt.tenantID); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("shared membership after delete = %v, want ErrNotFound", err)
+	}
 }
 
 // TestSharedTenantDeleteWithCleanupJobShortCircuits mirrors the standalone
@@ -67,12 +77,12 @@ func TestSharedTenantDeleteWithCleanupJobShortCircuits(t *testing.T) {
 		t.Fatalf("EnsureFsID: %v", err)
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID:          "org-shared-delete",
-		Host:           "shared.example.com",
-		Port:           4000,
-		User:           "root",
-		PasswordCipher: []byte("cipher"),
-		Name:           "shared_db",
+		TiDBCloudOrganizationID: "org-shared-delete",
+		Host:                    "shared.example.com",
+		Port:                    4000,
+		User:                    "root",
+		PasswordCipher:          []byte("cipher"),
+		Name:                    "shared_db",
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -165,12 +175,12 @@ func TestSharedTenantDeleteFullPurgePath(t *testing.T) {
 		t.Fatalf("EnsureFsID: %v", err)
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID:          "org-shared-delete",
-		Host:           "shared.example.com",
-		Port:           4000,
-		User:           "root",
-		PasswordCipher: []byte("cipher"),
-		Name:           "shared_db",
+		TiDBCloudOrganizationID: "org-shared-delete",
+		Host:                    "shared.example.com",
+		Port:                    4000,
+		User:                    "root",
+		PasswordCipher:          []byte("cipher"),
+		Name:                    "shared_db",
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -220,12 +230,12 @@ func TestAdminTenantCreateRejectsSharedPoolOrg(t *testing.T) {
 		{Clusters: []tenant.CloudClusterInfo{{OrganizationID: "org-shared-1"}}},
 	}
 	if _, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID:          "org-shared-1",
-		Host:           "shared.example.com",
-		Port:           4000,
-		User:           "root",
-		PasswordCipher: []byte("cipher"),
-		Name:           "shared_db",
+		TiDBCloudOrganizationID: "org-shared-1",
+		Host:                    "shared.example.com",
+		Port:                    4000,
+		User:                    "root",
+		PasswordCipher:          []byte("cipher"),
+		Name:                    "shared_db",
 	}); err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
 	}
@@ -308,7 +318,7 @@ func TestSharedTenantDeletePlacementRemovalFailureStaysRetryable(t *testing.T) {
 		t.Fatal(err)
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID: "org-shared-delete", Host: db.DBHost, Port: db.DBPort, User: db.DBUser,
+		TiDBCloudOrganizationID: "org-shared-delete", Host: db.DBHost, Port: db.DBPort, User: db.DBUser,
 		PasswordCipher: passCipher, Name: db.DBName,
 	})
 	if err != nil {
@@ -319,23 +329,39 @@ func TestSharedTenantDeletePlacementRemovalFailureStaysRetryable(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertTenantPlacement: %v", err)
 	}
-	// Pre-warm the shared handle with a scratch database in which every
-	// shared-schema table is absent: the purge in the delete below reuses
-	// the cached handle and succeeds trivially, but the placement removal
-	// transaction cannot release capacity on a missing pool row and must
-	// roll back. (The test DB carries standalone-shape tables of the same
-	// names, so drop them first — the next test's schema init recreates
-	// them.)
-	for _, tbl := range []string{
+	// Pre-warm the shared handle with a database in which every shared-schema
+	// table is absent: the purge in the delete below reuses the cached handle and
+	// succeeds trivially, but the placement removal transaction cannot release
+	// capacity on a missing pool row and must roll back. Restore the standalone
+	// shape in cleanup so this shared-schema test cannot pollute later tests in
+	// the package-wide database.
+	sharedTables := []string{
 		"journal_entry_subjects", "journal_entries", "journal_append_requests", "journal_labels", "journals",
 		"vault_audit_log", "vault_grants", "vault_tokens", "vault_secret_fields", "vault_secrets", "vault_deks",
 		"git_workspace_object_packs", "git_workspace_overlay", "git_workspace_git_state", "git_workspace_tree_nodes", "git_workspaces",
 		"fs_layer_checkpoints", "fs_layer_events", "fs_layer_tags", "fs_layer_entries", "fs_layers",
 		"fs_events", "semantic_tasks", "file_gc_tasks", "uploads", "file_tags", "file_nodes", "semantic", "contents", "inodes",
-	} {
-		if _, err := rt.meta.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
-			t.Fatalf("drop %s: %v", tbl, err)
+	}
+	dropSharedTables := func(t *testing.T) error {
+		t.Helper()
+		for _, tbl := range sharedTables {
+			if _, err := rt.meta.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
+				return fmt.Errorf("drop %s: %w", tbl, err)
+			}
 		}
+		return nil
+	}
+	t.Cleanup(func() {
+		if err := rt.pool.InvalidateSharedDB(dbID); err != nil {
+			t.Errorf("invalidate shared database: %v", err)
+		}
+		if err := dropSharedTables(t); err != nil {
+			t.Errorf("cleanup shared tables: %v", err)
+		}
+		initServerTenantSchema(t, testDSN)
+	})
+	if err := dropSharedTables(t); err != nil {
+		t.Fatalf("prepare missing shared tables: %v", err)
 	}
 	if err := rt.pool.PurgeSharedTenant(ctx, fsID, dbID); err != nil {
 		t.Fatalf("pre-warm purge: %v", err)
@@ -377,7 +403,7 @@ func TestFindSharedDBForProvisionSkipsNonTiDBProviders(t *testing.T) {
 	testmysql.ResetMetaDB(t, db.Meta.DB())
 	ctx := context.Background()
 	if _, err := db.Meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID: meta.SharedDBOrgWildcard, Host: "shared.example.com", Port: 4000, User: "root",
+		TiDBCloudOrganizationID: meta.SharedDBOrgWildcard, Host: "shared.example.com", Port: 4000, User: "root",
 		PasswordCipher: []byte("cipher"), Name: "shared_db",
 	}); err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -409,7 +435,7 @@ func TestProvisionTenantOnSharedDBCommitsAtomically(t *testing.T) {
 	testmysql.ResetMetaDB(t, db.Meta.DB())
 	ctx := context.Background()
 	dbID, err := db.Meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID: "org-provision-ok", Host: "shared.example.com", Port: 4000, User: "root",
+		TiDBCloudOrganizationID: "org-provision-ok", Host: "shared.example.com", Port: 4000, User: "root",
 		PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 10,
 	})
 	if err != nil {
@@ -485,7 +511,7 @@ func TestProvisionTenantOnSharedDBFailureLeavesNoPartialState(t *testing.T) {
 	testmysql.ResetMetaDB(t, db.Meta.DB())
 	ctx := context.Background()
 	dbID, err := db.Meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID: "org-provision-fail", Host: "shared.example.com", Port: 4000, User: "root",
+		TiDBCloudOrganizationID: "org-provision-fail", Host: "shared.example.com", Port: 4000, User: "root",
 		PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 10,
 	})
 	if err != nil {
