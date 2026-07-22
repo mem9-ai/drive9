@@ -147,7 +147,7 @@ func TestRegisterSharedDBRoundTrip(t *testing.T) {
 func TestCreateManagedSharedDBPoolPersistsDurableProvisioningPlan(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	spendingLimit := int64(10_000_000)
+	spendingLimit := MaxTiDBCloudSpendingLimit
 	provisioningKey := make([]byte, 32)
 	for i := range provisioningKey {
 		provisioningKey[i] = byte(i + 1)
@@ -195,7 +195,7 @@ func TestCreateManagedSharedDBPoolRejectsUnboundedOrInvalidPolicy(t *testing.T) 
 	s := newControlStore(t)
 	ctx := context.Background()
 	valid := func() *SharedDB {
-		spendingLimit := int64(10_000_000)
+		spendingLimit := MaxTiDBCloudSpendingLimit
 		return &SharedDB{
 			TiDBCloudOrganizationID: "org-managed", ProvisioningKey: make([]byte, 32),
 			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
@@ -207,8 +207,8 @@ func TestCreateManagedSharedDBPoolRejectsUnboundedOrInvalidPolicy(t *testing.T) 
 		"missing cloud":       func(in *SharedDB) { in.CloudProvider = "" },
 		"missing region":      func(in *SharedDB) { in.Region = "" },
 		"missing spending":    func(in *SharedDB) { in.SpendingLimit = nil },
-		"int32 overflow": func(in *SharedDB) {
-			value := int64(1 << 31)
+		"physical limit below fixed maximum": func(in *SharedDB) {
+			value := MaxTiDBCloudSpendingLimit - 1
 			in.SpendingLimit = &value
 		},
 	}
@@ -226,7 +226,7 @@ func TestCreateManagedSharedDBPoolRejectsUnboundedOrInvalidPolicy(t *testing.T) 
 func TestMarkSharedDBPoolFailedRejectsPoolWithTenants(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	spendingLimit := int64(10_000)
+	spendingLimit := MaxTiDBCloudSpendingLimit
 	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-failed-with-tenants", ProvisioningKey: bytes.Repeat([]byte{7}, 32),
 		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 10, SpendingLimit: &spendingLimit,
@@ -643,7 +643,7 @@ func completeTestSharedTenant(t *testing.T, s *Store, dbID int64, tenantID strin
 func TestCompleteSharedTenantProvisionSoftHardCapacityAndHysteresis(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	spendingLimit := int64(10_000)
+	spendingLimit := MaxTiDBCloudSpendingLimit
 	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-hysteresis", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
 		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 2, SpendingLimit: &spendingLimit,
@@ -711,7 +711,7 @@ func TestCompleteSharedTenantProvisionSoftHardCapacityAndHysteresis(t *testing.T
 func TestCompleteSharedTenantProvisionDoesNotUpdateOtherProvisioningPools(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	spendingLimit := int64(100_000)
+	spendingLimit := MaxTiDBCloudSpendingLimit
 	targetID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-target", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
 		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 10, SpendingLimit: &spendingLimit,
@@ -808,7 +808,7 @@ func TestCompleteSharedTenantProvisionCommitsAtomically(t *testing.T) {
 func TestCompleteSharedTenantProvisionKeepsTenantProvisioningUntilDBPoolIsActive(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	spendingLimit := int64(10_000_000)
+	spendingLimit := MaxTiDBCloudSpendingLimit
 	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-provisioning", ProvisioningKey: make([]byte, 32),
 		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
@@ -852,7 +852,7 @@ func TestCompleteSharedTenantProvisionKeepsTenantProvisioningUntilDBPoolIsActive
 func TestManagedSharedDBPoolCloudResultSchemaAndActivation(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	spendingLimit := int64(10_000_000)
+	spendingLimit := MaxTiDBCloudSpendingLimit
 	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
 		ProvisioningKey: make([]byte, 32), CloudProvider: "aws", Region: "us-east-1",
 		MaxTenants: 100, SpendingLimit: &spendingLimit,
@@ -910,7 +910,7 @@ func TestManagedSharedDBPoolCloudResultSchemaAndActivation(t *testing.T) {
 func TestActivateSharedTenantsBatchRequiresReadyPoolPlacementAndOwnerKey(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	spendingLimit := int64(10_000_000)
+	spendingLimit := MaxTiDBCloudSpendingLimit
 	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-activation", ProvisioningKey: make([]byte, 32),
 		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
@@ -959,10 +959,10 @@ func TestActivateSharedTenantsBatchRequiresReadyPoolPlacementAndOwnerKey(t *test
 	}
 }
 
-func TestFindSharedDBForAllocationPrefersActiveAndChecksManagedHeadroom(t *testing.T) {
+func TestFindSharedDBForAllocationPrefersActiveWithoutVirtualSpendingHeadroom(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	spendingLimit := int64(2_001)
+	spendingLimit := MaxTiDBCloudSpendingLimit
 	provisioningID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-allocate", ProvisioningKey: make([]byte, 32),
 		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
@@ -985,7 +985,7 @@ func TestFindSharedDBForAllocationPrefersActiveAndChecksManagedHeadroom(t *testi
 		t.Fatalf("activate second pool: %v", err)
 	}
 
-	got, err := s.FindSharedDBForAllocation(ctx, "org-allocate", nil, 1000)
+	got, err := s.FindSharedDBForAllocation(ctx, "org-allocate", nil)
 	if err != nil {
 		t.Fatalf("FindSharedDBForAllocation active: %v", err)
 	}
@@ -994,7 +994,7 @@ func TestFindSharedDBForAllocationPrefersActiveAndChecksManagedHeadroom(t *testi
 	}
 
 	seedPendingTenant(t, s, "tenant-headroom")
-	limit := int64(1500)
+	limit := MaxTiDBCloudSpendingLimit
 	if err := s.SetQuotaConfigPatch(ctx, "tenant-headroom", QuotaConfigPatch{TiDBCloudSpendingLimit: &limit}); err != nil {
 		t.Fatalf("SetQuotaConfigPatch: %v", err)
 	}
@@ -1004,19 +1004,19 @@ func TestFindSharedDBForAllocationPrefersActiveAndChecksManagedHeadroom(t *testi
 	}, testOwnerKey("tenant-headroom")); err != nil {
 		t.Fatalf("CompleteSharedTenantProvision: %v", err)
 	}
-	got, err = s.FindSharedDBForAllocation(ctx, "org-allocate", nil, 1000)
+	got, err = s.FindSharedDBForAllocation(ctx, "org-allocate", nil)
 	if err != nil {
 		t.Fatalf("FindSharedDBForAllocation fallback: %v", err)
 	}
-	if got.ID != provisioningID {
-		t.Fatalf("allocation with exhausted active headroom chose %d, want provisioning %d", got.ID, provisioningID)
+	if got.ID != activeID {
+		t.Fatalf("allocation after maximum virtual value chose %d, want active pool %d", got.ID, activeID)
 	}
 }
 
-func TestUpdateSharedTenantQuotaConfigChecksManagedHeadroomAtomically(t *testing.T) {
+func TestUpdateSharedTenantQuotaConfigTreatsSpendingLimitAsVirtualValue(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	spendingTarget := int64(3_001)
+	spendingTarget := MaxTiDBCloudSpendingLimit
 	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-quota", ProvisioningKey: make([]byte, 32),
 		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
@@ -1059,20 +1059,20 @@ func TestUpdateSharedTenantQuotaConfigChecksManagedHeadroomAtomically(t *testing
 		t.Fatalf("updated quota = %+v", cfg)
 	}
 
-	noHeadroom := int64(2001)
-	storageOnFailure := int64(300)
+	maximumVirtualValue := MaxTiDBCloudSpendingLimit
+	updatedStorage := int64(300)
 	err = s.UpdateSharedTenantQuotaConfig(ctx, "tenant-shared-quota-1", QuotaConfigPatch{
-		MaxStorageBytes: &storageOnFailure, TiDBCloudSpendingLimit: &noHeadroom,
+		MaxStorageBytes: &updatedStorage, TiDBCloudSpendingLimit: &maximumVirtualValue,
 	})
-	if !errors.Is(err, ErrSharedDBSpendingLimitExceeded) {
-		t.Fatalf("headroom error = %v, want ErrSharedDBSpendingLimitExceeded", err)
+	if err != nil {
+		t.Fatalf("UpdateSharedTenantQuotaConfig maximum virtual value: %v", err)
 	}
 	cfg, err = s.GetQuotaConfig(ctx, "tenant-shared-quota-1")
 	if err != nil {
-		t.Fatalf("GetQuotaConfig after rejected update: %v", err)
+		t.Fatalf("GetQuotaConfig after maximum virtual value: %v", err)
 	}
-	if cfg.MaxStorageBytes != storage || cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != withinHeadroom {
-		t.Fatalf("rejected update changed quota: %+v", cfg)
+	if cfg.MaxStorageBytes != updatedStorage || cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != maximumVirtualValue {
+		t.Fatalf("maximum virtual value update = %+v", cfg)
 	}
 }
 

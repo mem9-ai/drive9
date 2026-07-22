@@ -457,8 +457,8 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 		defaultDatabaseName: DefaultDatabaseName, client: ts.Client(),
 	}
 	got, err := p.BatchProvisionSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolCreateRequest{
-		{DBPoolID: 41, DBPoolUUID: poolUUIDs[0], RootPassword: "durable-password-41", SpendingLimitMonthly: 10_000_000},
-		{DBPoolID: 42, DBPoolUUID: poolUUIDs[1], RootPassword: "durable-password-42", SpendingLimitMonthly: 10_000_000},
+		{DBPoolID: 41, DBPoolUUID: poolUUIDs[0], RootPassword: "durable-password-41", SpendingLimitMonthly: 1_000_000},
+		{DBPoolID: 42, DBPoolUUID: poolUUIDs[1], RootPassword: "durable-password-42", SpendingLimitMonthly: 1_000_000},
 	}, tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
 	if err != nil {
 		t.Fatalf("BatchProvisionSharedDBPoolsWithCredentials: %v", err)
@@ -471,7 +471,7 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 		if request.Cluster.DisplayName != "tidbcloud-fs-"+poolUUIDs[i] {
 			t.Fatalf("request %d displayName = %q", i, request.Cluster.DisplayName)
 		}
-		if request.Cluster.RootPassword != "durable-password-"+id || request.Cluster.SpendingLimit.Monthly != 10_000_000 {
+		if request.Cluster.RootPassword != "durable-password-"+id || request.Cluster.SpendingLimit.Monthly != 1_000_000 {
 			t.Fatalf("request %d password/spending invalid: %+v", i, request.Cluster)
 		}
 		wantLabels := map[string]string{
@@ -1583,8 +1583,10 @@ func TestUpdateQuotaRejectsInvalidSpendingLimitBeforeRequest(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		monthly int64
+		wantErr string
 	}{
-		{name: "negative", monthly: -1},
+		{name: "negative", monthly: -1, wantErr: "tidbcloud_spending_limit must be non-negative"},
+		{name: "above cloud maximum", monthly: 1_000_001, wantErr: "tidbcloud_spending_limit is too large"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var hit bool
@@ -1610,7 +1612,7 @@ func TestUpdateQuotaRejectsInvalidSpendingLimitBeforeRequest(t *testing.T) {
 			if err == nil {
 				t.Fatal("UpdateQuota error = nil, want spending limit validation error")
 			}
-			if !strings.Contains(err.Error(), "tidbcloud_spending_limit must be non-negative") {
+			if !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("error = %q", err)
 			}
 			if hit {

@@ -134,17 +134,11 @@ func (s *Server) observeSharedDBPoolMetrics(ctx context.Context) {
 			}] = struct{}{}
 		}
 		if snapshot.SpendingLimit != nil {
-			for limitType, value := range map[string]int64{
-				"target":     *snapshot.SpendingLimit,
-				"tenant_sum": snapshot.TenantSpendingLimitSum,
-				"headroom":   *snapshot.SpendingLimit - snapshot.TenantSpendingLimitSum,
-			} {
-				metrics.RecordSharedDBPoolSpendingLimit(orgID, snapshot.ID, snapshot.UUID, limitType, value)
-				next[sharedDBPoolMetricKey{
-					kind: sharedDBPoolMetricSpending, dbPoolID: snapshot.ID, dbPoolUUID: snapshot.UUID,
-					tidbCloudOrgID: orgID, dimension: limitType,
-				}] = struct{}{}
-			}
+			metrics.RecordSharedDBPoolSpendingLimit(orgID, snapshot.ID, snapshot.UUID, "target", *snapshot.SpendingLimit)
+			next[sharedDBPoolMetricKey{
+				kind: sharedDBPoolMetricSpending, dbPoolID: snapshot.ID, dbPoolUUID: snapshot.UUID,
+				tidbCloudOrgID: orgID, dimension: "target",
+			}] = struct{}{}
 		}
 	}
 	if s.metrics != nil {

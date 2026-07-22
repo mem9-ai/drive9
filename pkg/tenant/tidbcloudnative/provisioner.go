@@ -27,6 +27,7 @@ import (
 	mysql "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
@@ -1490,14 +1491,13 @@ func (p *Provisioner) updateSpendingLimitWithCredentials(ctx context.Context, pu
 }
 
 func validateTiDBCloudSpendingLimit(monthly int64) error {
-	const maxInt32 = int64(1<<31 - 1)
 	if monthly < 0 {
 		return fmt.Errorf("tidbcloud_spending_limit must be non-negative")
 	}
 	if monthly > 0 && monthly < 10 {
 		return fmt.Errorf("tidbcloud_spending_limit must be 0 or at least 10 RMB")
 	}
-	if monthly > maxInt32 {
+	if monthly > meta.MaxTiDBCloudSpendingLimit {
 		return fmt.Errorf("tidbcloud_spending_limit is too large")
 	}
 	return nil

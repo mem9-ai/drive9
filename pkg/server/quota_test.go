@@ -566,7 +566,7 @@ func TestSharedQuotaGetAndSetUseLocalVirtualValueWithoutCloudMutation(t *testing
 	if _, err := rt.meta.DB().ExecContext(ctx, `UPDATE tenants SET cluster_id = '' WHERE id = ?`, rt.tenantID); err != nil {
 		t.Fatalf("clear tenant cluster id: %v", err)
 	}
-	spendingTarget := int64(10_000_000)
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
 	dbID, err := rt.meta.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-quota", ProvisioningKey: make([]byte, 32),
 		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
@@ -1174,6 +1174,7 @@ func TestQuotaSetRejectsInvalidQuotaValues(t *testing.T) {
 		{name: "negative_file_count", field: "max_file_count", value: -1, wantErr: "max_file_count must be non-negative"},
 		{name: "negative_spending_limit", field: "tidbcloud_spending_limit", value: -1, wantErr: "tidbcloud_spending_limit must be non-negative"},
 		{name: "small_spending_limit", field: "tidbcloud_spending_limit", value: 9, wantErr: "tidbcloud_spending_limit must be 0 or at least 10 RMB"},
+		{name: "spending_limit_above_cloud_maximum", field: "tidbcloud_spending_limit", value: meta.MaxTiDBCloudSpendingLimit + 1, wantErr: "tidbcloud_spending_limit is too large"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)

@@ -460,6 +460,15 @@ func expandManagedDBPoolSchema(ctx context.Context, db *sql.DB) error {
 		WHERE max_tenants > 0 AND tenant_count >= max_tenants AND soft_cap_reached = 0`); err != nil {
 		return fmt.Errorf("backfill db_pool.soft_cap_reached: %w", err)
 	}
+	// A non-NULL spending limit identifies a Drive9-managed shared pool. Older
+	// builds persisted a configurable target that could exceed the TiDB Cloud
+	// API maximum; normalize it before provisioning/recovery resumes. The
+	// predicate makes this safe to rerun on every server startup.
+	if _, err := db.ExecContext(ctx, `UPDATE db_pool SET spending_limit = ?
+		WHERE spending_limit IS NOT NULL AND spending_limit <> ?`,
+		MaxTiDBCloudSpendingLimit, MaxTiDBCloudSpendingLimit); err != nil {
+		return fmt.Errorf("normalize managed db_pool spending limit: %w", err)
+	}
 
 	exists, err := metaIndexExists(ctx, db, "db_pool", "uk_db_pool_cloud_resource")
 	if err != nil {

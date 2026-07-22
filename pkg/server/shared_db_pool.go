@@ -18,10 +18,9 @@ import (
 )
 
 const (
-	defaultManagedSharedDBMaxTenants    = 100
-	defaultManagedSharedDBSpendingLimit = int64(10_000_000)
-	defaultSharedTenantSpendingLimit    = int64(1000)
-	sharedTenantActivationBatchSize     = 100
+	defaultManagedSharedDBMaxTenants = 100
+	defaultSharedTenantSpendingLimit = int64(1000)
+	sharedTenantActivationBatchSize  = 100
 )
 
 var errSharedDBConnectionMetadataNotReady = errors.New("shared DB pool connection metadata is not ready")
@@ -34,16 +33,12 @@ type defaultSharedDatabaseNameProvider interface {
 	DefaultSharedDatabaseName() string
 }
 
-func (s *Server) managedSharedDBPolicy() (maxTenants int, spendingLimit int64) {
-	maxTenants = s.sharedDBMaxTenants
+func (s *Server) managedSharedDBPolicy() int {
+	maxTenants := s.sharedDBMaxTenants
 	if maxTenants <= 0 {
 		maxTenants = defaultManagedSharedDBMaxTenants
 	}
-	spendingLimit = s.sharedDBDefaultSpendingLimit
-	if spendingLimit <= 0 {
-		spendingLimit = defaultManagedSharedDBSpendingLimit
-	}
-	return maxTenants, spendingLimit
+	return maxTenants
 }
 
 func (s *Server) managedSharedDBHardCap(softCap int) (int, error) {
@@ -136,7 +131,7 @@ func (s *Server) materializeSharedTenantQuota(ctx context.Context, tenantID stri
 	return nil
 }
 
-func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.CredentialProvisionRequest, tenantSpendingLimit int64, reserve func(*meta.SharedDB) error) (sharedDB *meta.SharedDB, created bool, err error) {
+func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.CredentialProvisionRequest, reserve func(*meta.SharedDB) error) (sharedDB *meta.SharedDB, created bool, err error) {
 	organizationID, resolveErr := s.firstManagedOrganization(ctx, cred)
 	if resolveErr != nil {
 		return nil, false, fmt.Errorf("resolve tidbcloud organization: %w", resolveErr)
@@ -145,7 +140,7 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 	identity := sharedDBAllocationIdentity(organizationID, provisioningKey)
 	err = s.meta.WithSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
 		for attempt := 0; attempt < 2; attempt++ {
-			candidate, findErr := s.meta.FindSharedDBForAllocation(lockCtx, organizationID, provisioningKey, tenantSpendingLimit)
+			candidate, findErr := s.meta.FindSharedDBForAllocation(lockCtx, organizationID, provisioningKey)
 			if findErr == nil {
 				sharedDB = candidate
 			} else if !errors.Is(findErr, meta.ErrNotFound) {
@@ -159,14 +154,8 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 				}
 			}
 			if sharedDB == nil {
-				maxTenants, configuredFloor := s.managedSharedDBPolicy()
-				fixedTarget := configuredFloor
-				if tenantSpendingLimit >= maxInt32 {
-					return meta.ErrSharedDBSpendingLimitExceeded
-				}
-				if tenantSpendingLimit+1 > fixedTarget {
-					fixedTarget = tenantSpendingLimit + 1
-				}
+				maxTenants := s.managedSharedDBPolicy()
+				fixedTarget := meta.MaxTiDBCloudSpendingLimit
 				cloudProvider, region := provisioningCloudRegion(s.provisioner)
 				rootPassword, passwordErr := generateManagedSharedDBRootPassword(24)
 				if passwordErr != nil {
@@ -202,7 +191,7 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 			if reserveErr == nil {
 				return nil
 			}
-			if !errors.Is(reserveErr, meta.ErrSharedDBCapacityExhausted) && !errors.Is(reserveErr, meta.ErrSharedDBSpendingLimitExceeded) {
+			if !errors.Is(reserveErr, meta.ErrSharedDBCapacityExhausted) {
 				return reserveErr
 			}
 			sharedDB = nil

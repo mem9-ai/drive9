@@ -1512,6 +1512,37 @@ func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 	}
 }
 
+func TestMigrateNormalizesManagedSharedDBSpendingLimitToCloudMaximum(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	limit := MaxTiDBCloudSpendingLimit
+	id, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-spending-migration", ProvisioningKey: make([]byte, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &limit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET spending_limit = 10000000 WHERE db_id = ?`, id); err != nil {
+		t.Fatalf("seed legacy spending limit: %v", err)
+	}
+
+	if err := s.migrate(); err != nil {
+		t.Fatalf("migrate legacy spending limit: %v", err)
+	}
+	got, err := s.GetSharedDB(ctx, id)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if got.SpendingLimit == nil || *got.SpendingLimit != MaxTiDBCloudSpendingLimit {
+		t.Fatalf("spending limit = %v, want %d", got.SpendingLimit, MaxTiDBCloudSpendingLimit)
+	}
+
+	if err := s.migrate(); err != nil {
+		t.Fatalf("repeat spending-limit migration: %v", err)
+	}
+}
+
 func TestUpsertTenantTiDBCloudOrgBindingRejectsDuplicateLiveClusterBranch(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()

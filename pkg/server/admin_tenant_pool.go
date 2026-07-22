@@ -970,9 +970,8 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 			return results, err
 		}
-		virtualLimit := s.sharedTenantVirtualSpendingLimit(opts)
 		var selected *meta.SharedDB
-		selected, created, err := s.allocateManagedSharedDB(ctx, cred, virtualLimit, func(db *meta.SharedDB) error {
+		selected, created, err := s.allocateManagedSharedDB(ctx, cred, func(db *meta.SharedDB) error {
 			return s.meta.CompleteSharedTenantPoolMember(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared,
 				&meta.TenantPlacement{FsID: fsID, DbID: db.ID, Placement: meta.PlacementShared,
 					SchemaShape: meta.SchemaShapeShared, Status: meta.SharedDBStatusActive},

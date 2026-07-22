@@ -148,7 +148,7 @@ func TestObserveSharedDBPoolMetricsRecordsCapacityTenantsAndSpending(t *testing.
 	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	ctx := context.Background()
-	spendingLimit := int64(10_000)
+	spendingLimit := meta.MaxTiDBCloudSpendingLimit
 	const activePoolUUID = "11111111-1111-4111-8111-111111111111"
 	const provisioningPoolUUID = "22222222-2222-4222-8222-222222222222"
 	dbID, err := metaStore.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
@@ -224,9 +224,7 @@ func TestObserveSharedDBPoolMetricsRecordsCapacityTenantsAndSpending(t *testing.
 		`drive9_shared_db_pool_capacity{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="free"} 3`,
 		`drive9_shared_db_pool_tenants{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",state="active",tidbcloud_org_id="org-shared-db-metrics"} 1`,
 		`drive9_shared_db_pool_tenants{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",state="provisioning",tidbcloud_org_id="org-shared-db-metrics"} 1`,
-		`drive9_shared_db_pool_spending_limit{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="target"} 10000`,
-		`drive9_shared_db_pool_spending_limit{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="tenant_sum"} 3000`,
-		`drive9_shared_db_pool_spending_limit{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="headroom"} 7000`,
+		`drive9_shared_db_pool_spending_limit{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="target"} 1000000`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing shared DB-pool metric %q:\n%s", want, text)
@@ -235,6 +233,10 @@ func TestObserveSharedDBPoolMetricsRecordsCapacityTenantsAndSpending(t *testing.
 	for _, line := range strings.Split(text, "\n") {
 		if strings.HasPrefix(line, "drive9_shared_db_pool_") && strings.Contains(line, "organization_id=") {
 			t.Fatalf("shared DB-pool metrics must use tidbcloud_org_id:\n%s", text)
+		}
+		if strings.HasPrefix(line, "drive9_shared_db_pool_spending_limit") &&
+			(strings.Contains(line, `type="tenant_sum"`) || strings.Contains(line, `type="headroom"`)) {
+			t.Fatalf("shared DB-pool metrics must not sum virtual tenant spending limits:\n%s", text)
 		}
 	}
 
