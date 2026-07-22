@@ -641,7 +641,8 @@ func (s *Server) handleVaultGrantIssue(w http.ResponseWriter, r *http.Request, v
 	if err != nil {
 		// IssueGrant returns user-visible validation errors (bad scope /
 		// enum / agent / issuer); map them to 400. Internal DB errors
-		// surface the same way but prefixed "insert grant:" — map to 500.
+		// surface the same way but prefixed "insert grant:" — map to
+		// backend error status.
 		if strings.HasPrefix(err.Error(), "insert grant") {
 			result = "error"
 			errJSON(w, backendErrorStatus(r.Context(), err), "failed to issue grant")

@@ -2937,7 +2937,7 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(backendResults) != len(allowedIndexes) {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "batch_write_result_count_mismatch", "expected", len(allowedIndexes), "got", len(backendResults))...)
-		errJSONInternalStorage(w, r, err)
+		errJSONInternalStorage(w, r, fmt.Errorf("batch write result count mismatch: expected %d, got %d", len(allowedIndexes), len(backendResults)))
 		return
 	}
 

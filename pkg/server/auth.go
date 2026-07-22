@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
@@ -55,6 +56,10 @@ const statusClientClosedRequest = 499
 func isQuotaError(err error) bool {
 	if err == nil {
 		return false
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1105 {
+		return strings.Contains(strings.ToLower(mysqlErr.Message), "quota")
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "error 1105") && strings.Contains(msg, "quota")
