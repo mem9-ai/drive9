@@ -46,7 +46,7 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusNotFound, "tenant not found")
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, "tenant lookup failed")
+		errJSON(w, backendErrorStatus(r.Context(), err), "tenant lookup failed")
 		return
 	}
 	if t.Kind != meta.TenantKindLive {
@@ -77,7 +77,7 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 	if t.StorageNamespaceID != "" {
 		hasFork, err := s.meta.NamespaceHasNonDeletedFork(r.Context(), t.StorageNamespaceID)
 		if err != nil {
-			errJSON(w, http.StatusInternalServerError, "failed to check tenant forks")
+			errJSON(w, backendErrorStatus(r.Context(), err), "failed to check tenant forks")
 			return
 		}
 		if hasFork {
@@ -90,7 +90,7 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 	if t.Status == meta.TenantDeleting {
 		hasJob, err := s.meta.TenantDeleteJobExists(r.Context(), t.ID)
 		if err != nil {
-			errJSON(w, http.StatusInternalServerError, "failed to check tenant delete cleanup")
+			errJSON(w, backendErrorStatus(r.Context(), err), "failed to check tenant delete cleanup")
 			return
 		}
 		if hasJob {
@@ -119,7 +119,7 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 	if t.Status != meta.TenantDeleting {
 		updated, err := s.meta.UpdateTenantStatusIf(r.Context(), t.ID, t.Status, meta.TenantDeleting)
 		if err != nil {
-			errJSON(w, http.StatusInternalServerError, "failed to mark tenant deleting")
+			errJSON(w, backendErrorStatus(r.Context(), err), "failed to mark tenant deleting")
 			return
 		}
 		if !updated {
@@ -132,7 +132,7 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 		if t.Status != meta.TenantDeleting {
 			_, _ = s.meta.UpdateTenantStatusIf(r.Context(), t.ID, meta.TenantDeleting, t.Status)
 		}
-		errJSON(w, http.StatusInternalServerError, "failed to drain tenant backend")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to drain tenant backend")
 		return
 	}
 	if err := s.deprovisionTenantCluster(r.Context(), t, req); err != nil {
@@ -152,7 +152,7 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 		// cleanup is durably enqueued so the same owner can retry the delete
 		// request. This matters for tidb_cloud_native because customer TiDB Cloud
 		// credentials are accepted per request and are not stored server-side.
-		errJSON(w, http.StatusInternalServerError, "failed to enqueue tenant delete cleanup")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to enqueue tenant delete cleanup")
 		return
 	}
 	_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
@@ -184,7 +184,7 @@ func (s *Server) handleSharedTenantDeleteWithStatusWriter(
 	if t.StorageNamespaceID != "" {
 		hasFork, err := s.meta.NamespaceHasNonDeletedFork(ctx, t.StorageNamespaceID)
 		if err != nil {
-			errJSON(w, http.StatusInternalServerError, "failed to check tenant forks")
+			errJSON(w, backendErrorStatus(r.Context(), err), "failed to check tenant forks")
 			return
 		}
 		if hasFork {
@@ -195,7 +195,7 @@ func (s *Server) handleSharedTenantDeleteWithStatusWriter(
 	if t.Status == meta.TenantDeleting {
 		hasJob, err := s.meta.TenantDeleteJobExists(ctx, t.ID)
 		if err != nil {
-			errJSON(w, http.StatusInternalServerError, "failed to check tenant delete cleanup")
+			errJSON(w, backendErrorStatus(r.Context(), err), "failed to check tenant delete cleanup")
 			return
 		}
 		deleteJobExists = hasJob
@@ -203,7 +203,7 @@ func (s *Server) handleSharedTenantDeleteWithStatusWriter(
 	if t.Status != meta.TenantDeleting {
 		updated, err := s.meta.UpdateTenantStatusIf(ctx, t.ID, t.Status, meta.TenantDeleting)
 		if err != nil {
-			errJSON(w, http.StatusInternalServerError, "failed to mark tenant deleting")
+			errJSON(w, backendErrorStatus(r.Context(), err), "failed to mark tenant deleting")
 			return
 		}
 		if !updated {
@@ -213,7 +213,7 @@ func (s *Server) handleSharedTenantDeleteWithStatusWriter(
 	}
 	if err := s.pool.InvalidateAndWait(ctx, t.ID); err != nil {
 		_, _ = s.meta.UpdateTenantStatusIf(ctx, t.ID, meta.TenantDeleting, t.Status)
-		errJSON(w, http.StatusInternalServerError, "failed to drain tenant backend")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to drain tenant backend")
 		return
 	}
 	fsID, err := s.meta.ResolveFsID(ctx, t.ID)
@@ -221,12 +221,12 @@ func (s *Server) handleSharedTenantDeleteWithStatusWriter(
 		// A shared-schema tenant without an fs_registry row is a data
 		// integrity problem; never allocate one on a delete path.
 		logger.Error(ctx, "shared_tenant_delete_fsid_unresolvable", zap.String("tenant_id", t.ID), zap.Error(err))
-		errJSON(w, http.StatusInternalServerError, "failed to resolve tenant fs_id")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to resolve tenant fs_id")
 		return
 	}
 	placement, err := s.meta.GetTenantPlacement(ctx, fsID)
 	if err != nil && !errors.Is(err, meta.ErrNotFound) {
-		errJSON(w, http.StatusInternalServerError, "failed to resolve tenant placement")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to resolve tenant placement")
 		return
 	}
 	if deleteJobExists && placement != nil && placement.Status == meta.PlacementStatusDeleting {
@@ -240,7 +240,7 @@ func (s *Server) handleSharedTenantDeleteWithStatusWriter(
 				// Do not roll back the deleting mark; the purge is resumable and the
 				// next delete request will continue it.
 				logger.Error(ctx, "shared_tenant_purge_failed", zap.String("tenant_id", t.ID), zap.Int64("db_id", placement.DbID), zap.Error(err))
-				errJSON(w, http.StatusInternalServerError, "failed to purge tenant data from shared db")
+				errJSON(w, backendErrorStatus(r.Context(), err), "failed to purge tenant data from shared db")
 				return
 			}
 
@@ -248,12 +248,12 @@ func (s *Server) handleSharedTenantDeleteWithStatusWriter(
 			markDeleted := t.StorageNamespaceID == ""
 			if err := s.meta.FinalizeSharedTenantDeleteMetadata(ctx, t.ID, fsID, placement.DbID, s.sharedDBReopenRatio, markDeleted); err != nil {
 				logger.Error(ctx, "shared_tenant_metadata_finalize_failed", zap.String("tenant_id", t.ID), zap.Error(err))
-				errJSON(w, http.StatusInternalServerError, "failed to finalize shared tenant deletion")
+				errJSON(w, backendErrorStatus(r.Context(), err), "failed to finalize shared tenant deletion")
 				return
 			}
 			if markDeleted {
 				_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
-				writeStatus(w, meta.TenantDeleted)
+				writeTenantDeleteStatus(w, meta.TenantDeleted)
 				return
 			}
 		}
@@ -263,12 +263,12 @@ func (s *Server) handleSharedTenantDeleteWithStatusWriter(
 			var enqueueErr error
 			status, enqueueErr = s.enqueueTenantDeleteJob(ctx, t)
 			if enqueueErr != nil {
-				errJSON(w, http.StatusInternalServerError, "failed to enqueue tenant delete cleanup")
+				errJSON(w, backendErrorStatus(r.Context(), err), "failed to enqueue tenant delete cleanup")
 				return
 			}
 		}
 		_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
-		writeStatus(w, status)
+		writeTenantDeleteStatus(w, status)
 		return
 	}
 	logger.Error(ctx, "shared_tenant_delete_placement_missing", zap.String("tenant_id", t.ID), zap.Int64("fs_id", fsID))

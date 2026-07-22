@@ -52,21 +52,56 @@ const (
 
 const statusClientClosedRequest = 499
 
+func isQuotaError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error 1105") && strings.Contains(msg, "quota")
+}
+
+func isSchemaMigrationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "ensure tidb auto-embedding schema") ||
+		strings.Contains(msg, "validate tidb auto-embedding schema") ||
+		strings.Contains(msg, "migrate split tables") ||
+		strings.Contains(msg, "detect legacy files table")
+}
+
 func sanitizeClientError(err error) string {
 	if err == nil {
 		return "backend unavailable"
 	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "error 1105") && strings.Contains(msg, "quota") {
+	if isQuotaError(err) {
 		return "tenant usage quota exceeded"
 	}
-	if strings.Contains(msg, "ensure tidb auto-embedding schema") ||
-		strings.Contains(msg, "validate tidb auto-embedding schema") ||
-		strings.Contains(msg, "migrate split tables") ||
-		strings.Contains(msg, "detect legacy files table") {
+	if isSchemaMigrationError(err) {
 		return "tenant metadata error"
 	}
 	return "backend unavailable"
+}
+
+func backendErrorStatus(ctx context.Context, err error) int {
+	if isClientCanceled(ctx, err) {
+		return statusClientClosedRequest
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+	if isQuotaError(err) {
+		return http.StatusPaymentRequired
+	}
+	if isSchemaMigrationError(err) {
+		return http.StatusBadGateway
+	}
+	return http.StatusInternalServerError
+}
+
+func writeBackendError(w http.ResponseWriter, r *http.Request, err error) {
+	errJSON(w, backendErrorStatus(r.Context(), err), sanitizeClientError(err))
 }
 
 func ScopeFromContext(ctx context.Context) *TenantScope {
@@ -195,7 +230,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "auth_backend_unavailable", "error", err)...)
 			metricEvent(r.Context(), "auth", "result", "meta_backend_error")
-			errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
+			errJSON(w, backendErrorStatus(r.Context(), err), "auth backend unavailable")
 			return
 		}
 
@@ -225,7 +260,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "auth_decrypt_failed", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 			metricEvent(r.Context(), "auth", "result", "decrypt_failed")
-			errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
+			errJSON(w, backendErrorStatus(r.Context(), err), "auth backend unavailable")
 			return
 		}
 		if subtle.ConstantTimeCompare([]byte(tok), plain) != 1 {
@@ -305,14 +340,14 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 				}
 				logger.Error(r.Context(), "server_event", eventFields(r.Context(), "auth_fs_scope_load_failed", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 				metricEvent(r.Context(), "auth", "result", "fs_scope_load_failed")
-				errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
+				errJSON(w, backendErrorStatus(r.Context(), err), "auth backend unavailable")
 				return
 			}
 			fsScopes, err = fsScopesFromMeta(rows)
 			if err != nil {
 				logger.Error(r.Context(), "server_event", eventFields(r.Context(), "auth_fs_scope_invalid", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 				metricEvent(r.Context(), "auth", "result", "fs_scope_invalid")
-				errJSON(w, http.StatusInternalServerError, "invalid API key scope policy")
+				errJSON(w, backendErrorStatus(r.Context(), err), "invalid API key scope policy")
 				return
 			}
 		default:
@@ -337,7 +372,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "backend_load_failed", "tenant_id", resolved.Tenant.ID, "error", err)...)
 			metricEvent(r.Context(), "tenant_backend", "result", "load_failed")
-			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+			writeBackendError(w, r, err)
 			return
 		}
 		defer release()
@@ -479,7 +514,7 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 		metrics.RecordTenantOperationWithOrg(tenantID, authAcquireOrgID, "user_db_access", "auth_acquire", metrics.ResultForError(err), time.Since(capAcquireStart))
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "capability_backend_load_failed", "tenant_id", tenantID, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, "backend unavailable")
+			errJSON(w, backendErrorStatus(r.Context(), err), "backend unavailable")
 			return
 		}
 		defer release()

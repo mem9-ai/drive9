@@ -459,7 +459,7 @@ func (s *Server) handleSlockCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "slock_tenant_provision_failed", "error", err)...)
 		if wantsJSON(r) {
-			errJSON(w, http.StatusInternalServerError, "slock tenant provision failed")
+			errJSON(w, backendErrorStatus(r.Context(), err), "slock tenant provision failed")
 			return
 		}
 		setSlockCallbackNoStoreHeaders(w)
