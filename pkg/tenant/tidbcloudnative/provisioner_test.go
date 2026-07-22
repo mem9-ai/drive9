@@ -545,6 +545,24 @@ func TestLoadSharedDBPoolWithClusterIDRejectsNonSharedLabels(t *testing.T) {
 	}
 }
 
+func TestSharedDBPoolInfoFromKnownClusterRejectsLegacyLocalIDLabel(t *testing.T) {
+	const poolUUID = "11111111-1111-4111-8111-111111111111"
+	p := &Provisioner{}
+	got, err := p.sharedDBPoolInfoFromCluster(41, poolUUID, &clusterInfo{
+		ClusterID: "cluster-pool-41",
+		Labels: map[string]string{
+			Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+			"drive9.ai/db_pool_id": "41", TiDBCloudOrganizationLabel: "org-1",
+		},
+	})
+	if err == nil {
+		t.Fatalf("sharedDBPoolInfoFromCluster accepted legacy local ID label: %+v", got)
+	}
+	if !strings.Contains(err.Error(), Drive9DBPoolUUIDLabel) {
+		t.Fatalf("sharedDBPoolInfoFromCluster error = %q, want missing UUID label", err)
+	}
+}
+
 func TestLoadSharedDBPoolWithoutClusterIDMatchesUUID(t *testing.T) {
 	const wantUUID = "22222222-2222-4222-8222-222222222222"
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
