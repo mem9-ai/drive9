@@ -56,6 +56,10 @@ type fakeProvisioner struct {
 	managedClusters        []tenant.CloudClusterInfo
 	sharedPoolResults      []*tenant.SharedDBPoolInfo
 	sharedPoolBatchErr     error
+	sharedPoolBatchStarted chan struct{}
+	sharedPoolBatchRelease <-chan struct{}
+	sharedPoolWaitCalls    atomic.Int32
+	sharedPoolWaitErr      error
 }
 
 type failingEncryptor struct {
@@ -340,6 +344,233 @@ func TestProvisionTiDBCloudNativeSharedResumesExistingProvisioningPool(t *testin
 	}
 }
 
+func TestProvisionTiDBCloudNativeSharedUsesRegisteredManualDBPool(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	_, _ = rand.Read(master)
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("manual-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbID, err := metaStore.RegisterSharedDB(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-manual-shared", Host: "manual.example.com", Port: 4000,
+		User: "root", PasswordCipher: passwordCipher, Name: "manual_shared", MaxTenants: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative,
+		managedClusters: []tenant.CloudClusterInfo{{OrganizationID: "org-manual-shared"}}}
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: make([]byte, 32)})
+	defer srv.Close()
+	virtualLimit := int64(4321)
+	res, err := srv.provisionTenant(context.Background(), provisionTenantOptions{
+		CredentialProvisioner: &tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"},
+		Quota:                 &quotaRequest{quotaFields: quotaFields{TiDBCloudSpendingLimit: &virtualLimit}},
+	})
+	if err != nil {
+		t.Fatalf("provisionTenant: %v", err)
+	}
+	placement, err := metaStore.GetTenantPlacement(context.Background(), mustResolveFsID(t, metaStore, res.TenantID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if placement.DbID != dbID {
+		t.Fatalf("placement db = %d, want manual db pool %d", placement.DbID, dbID)
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 0 {
+		t.Fatalf("managed physical create calls = %d, want 0", got)
+	}
+	quota, err := metaStore.GetQuotaConfig(context.Background(), res.TenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quota.TiDBCloudSpendingLimit == nil || *quota.TiDBCloudSpendingLimit != virtualLimit {
+		t.Fatalf("virtual spending limit = %#v, want %d", quota.TiDBCloudSpendingLimit, virtualLimit)
+	}
+}
+
+func TestProvisionTiDBCloudNativeRejectsSpendingLimitOnRegisteredSharedDBPool(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	_, _ = rand.Read(master)
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("manual-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metaStore.RegisterSharedDB(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-native-manual", Host: "manual.example.com", Port: 4000,
+		User: "root", PasswordCipher: passwordCipher, Name: "manual_shared", MaxTenants: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative,
+		managedClusters: []tenant.CloudClusterInfo{{OrganizationID: "org-native-manual"}}}
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNative, TokenSecret: make([]byte, 32),
+		DisableDatabaseAutoEmbedding: true})
+	defer srv.Close()
+	spendingLimit := int64(4321)
+	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{
+		CredentialProvisioner: &tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"},
+		Quota:                 &quotaRequest{quotaFields: quotaFields{TiDBCloudSpendingLimit: &spendingLimit}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "spending limit requested for shared-pool tenant") {
+		t.Fatalf("provisionTenant error = %v, want registered shared DB spending-limit rejection", err)
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 0 {
+		t.Fatalf("shared DB physical create calls = %d, want 0", got)
+	}
+}
+
+func TestManagedSharedDBContinuationWaitsForConnectionMetadata(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	_, _ = rand.Read(master)
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := int64(10_000_000)
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-metadata-wait", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1",
+		MaxTenants: 100, SpendingLimit: &spendingTarget, PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.UpdateManagedSharedDBPoolCloudResult(context.Background(), &meta.SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-metadata-wait", ClusterID: "cluster-metadata-wait",
+		PasswordCipher: passwordCipher, Name: "tidbcloud_fs", TLSMode: "true",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitErr := errors.New("metadata wait stopped")
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative,
+		sharedPoolResults: []*tenant.SharedDBPoolInfo{{DBPoolID: dbID, ClusterID: "cluster-metadata-wait", OrganizationID: "org-metadata-wait"}},
+		sharedPoolWaitErr: waitErr}
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: make([]byte, 32)})
+	defer srv.Close()
+	err = srv.continueManagedSharedDBPool(context.Background(), dbID,
+		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
+	if !errors.Is(err, waitErr) {
+		t.Fatalf("continueManagedSharedDBPool error = %v, want %v", err, waitErr)
+	}
+	if got := prov.sharedPoolWaitCalls.Load(); got != 1 {
+		t.Fatalf("shared metadata wait calls = %d, want 1", got)
+	}
+}
+
+func TestManagedSharedDBBatchCreateUsesAllocationLock(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	_, _ = rand.Read(master)
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := int64(10_000_000)
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-batch-lock", ProvisioningKey: bytes.Repeat([]byte{2}, 32),
+		CloudProvider: "aws", Region: "us-east-1",
+		MaxTenants: 100, SpendingLimit: &spendingTarget, PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative,
+		sharedPoolBatchStarted: started, sharedPoolBatchRelease: release,
+		sharedPoolResults: []*tenant.SharedDBPoolInfo{{ClusterID: "cluster-batch-lock", OrganizationID: "org-batch-lock",
+			Host: "db.example.com", Port: 4000, Username: "u.root", DBName: "tidbcloud_fs"}}}
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: make([]byte, 32)})
+	defer srv.Close()
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}
+	batchDone := make(chan error, 1)
+	go func() {
+		_, err := srv.provisionManagedSharedDBPoolsBatch(context.Background(), []int64{dbID}, cred)
+		batchDone <- err
+	}()
+	<-started
+	ensureDone := make(chan error, 1)
+	go func() {
+		_, err := srv.ensureManagedSharedDBPhysical(context.Background(), dbID, cred)
+		ensureDone <- err
+	}()
+	secondCreateStarted := false
+	select {
+	case <-started:
+		secondCreateStarted = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(release)
+	if err := <-batchDone; err != nil {
+		t.Fatalf("batch create: %v", err)
+	}
+	if err := <-ensureDone; err != nil {
+		t.Fatalf("concurrent ensure: %v", err)
+	}
+	if secondCreateStarted {
+		t.Fatal("concurrent ensure issued a duplicate physical create while batch create was in flight")
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 1 {
+		t.Fatalf("physical create calls = %d, want 1", got)
+	}
+}
+
 func mustResolveFsID(t *testing.T, store *meta.Store, tenantID string) int64 {
 	t.Helper()
 	fsID, err := store.ResolveFsID(context.Background(), tenantID)
@@ -359,9 +590,22 @@ func (f *fakeProvisioner) ListManagedClusters(_ context.Context, _ tenant.Creden
 	return &tenant.ManagedClusterListResult{Clusters: append([]tenant.CloudClusterInfo(nil), f.managedClusters...)}, nil
 }
 
-func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(_ context.Context, requests []tenant.SharedDBPoolCreateRequest, _ tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
+func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Context, requests []tenant.SharedDBPoolCreateRequest, _ tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
 	f.sharedPoolBatchCalls.Add(1)
 	f.sharedPoolBatchMembers.Add(int32(len(requests)))
+	if f.sharedPoolBatchStarted != nil {
+		select {
+		case f.sharedPoolBatchStarted <- struct{}{}:
+		default:
+		}
+	}
+	if f.sharedPoolBatchRelease != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-f.sharedPoolBatchRelease:
+		}
+	}
 	if f.sharedPoolBatchErr != nil {
 		return nil, f.sharedPoolBatchErr
 	}
@@ -393,6 +637,21 @@ func (f *fakeProvisioner) LoadSharedDBPoolWithCredentials(_ context.Context, _ i
 	for _, row := range f.sharedPoolResults {
 		if row != nil && row.ClusterID == clusterID {
 			copyRow := *row
+			return &copyRow, nil
+		}
+	}
+	return nil, nil
+}
+
+func (f *fakeProvisioner) WaitForSharedDBPoolMetadataWithCredentials(_ context.Context, dbPoolID int64, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+	f.sharedPoolWaitCalls.Add(1)
+	if f.sharedPoolWaitErr != nil {
+		return nil, f.sharedPoolWaitErr
+	}
+	for _, row := range f.sharedPoolResults {
+		if row != nil && row.ClusterID == clusterID {
+			copyRow := *row
+			copyRow.DBPoolID = dbPoolID
 			return &copyRow, nil
 		}
 	}

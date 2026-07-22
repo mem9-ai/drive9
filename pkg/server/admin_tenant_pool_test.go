@@ -229,6 +229,134 @@ func TestSharedTenantPoolRefillOneThousandPlansTenPoolsInOneBatch(t *testing.T) 
 	}
 }
 
+func TestAdminTenantPoolCreateCleansPartialSharedMembersOnBatchFailure(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer poolManager.Close()
+	poolManager.SetMetaStore(metaStore)
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1",
+		managedClusters:   []tenant.CloudClusterInfo{{OrganizationID: "org-shared-cleanup"}},
+		sharedPoolResults: []*tenant.SharedDBPoolInfo{{DBPoolID: 999999, ClusterID: "cluster-unknown", OrganizationID: "org-shared-cleanup"}}}
+	secret := make([]byte, 32)
+	_, _ = rand.Read(secret)
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: secret})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp := postJSON(t, ts.URL+"/v1/admin/tenant-pool", map[string]any{
+		"public_key": "public", "private_key": "private", "pool_size": 1,
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadGateway {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d: %s", resp.StatusCode, http.StatusBadGateway, body)
+	}
+	var memberships, placements, tenantCount int
+	if err := metaStore.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM tenant_pool_memberships
+		WHERE tidbcloud_organization_id = ?`, "org-shared-cleanup").Scan(&memberships); err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM tenant_placements p
+		JOIN db_pool d ON d.db_id = p.db_id WHERE d.org_id = ?`, "org-shared-cleanup").Scan(&placements); err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.DB().QueryRowContext(context.Background(), `SELECT COALESCE(SUM(tenant_count), 0)
+		FROM db_pool WHERE org_id = ?`, "org-shared-cleanup").Scan(&tenantCount); err != nil {
+		t.Fatal(err)
+	}
+	if memberships != 0 || placements != 0 || tenantCount != 0 {
+		t.Fatalf("partial shared cleanup left memberships=%d placements=%d tenant_count=%d", memberships, placements, tenantCount)
+	}
+}
+
+func TestDeleteFreeSharedPoolTenantSkipsPurgeWhenDBPoolIsUnready(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.server.defaultTenantProvider = tenant.ProviderTiDBCloudNativeShared
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
+		PoolID: "pool-unready-delete", OrganizationID: "org-unready-delete", Size: 1,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := "shared-unready-delete"
+	if err := rt.server.insertPendingPoolTenant(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.server.materializeSharedTenantQuota(ctx, tenantID, provisionTenantOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	passwordCipher, err := rt.server.pool.Encrypt(ctx, []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := int64(10_000_000)
+	dbID, err := rt.meta.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-unready-delete", ProvisioningKey: make([]byte, 32),
+		CloudProvider: "aws", Region: "us-east-1",
+		MaxTenants: 100, SpendingLimit: &spendingTarget, PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-unready-delete", ClusterID: "cluster-unready-delete",
+		PasswordCipher: passwordCipher, Name: "tidbcloud_fs", TLSMode: "true",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fsID, err := rt.meta.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.CompleteSharedTenantPoolMember(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared,
+		&meta.TenantPlacement{FsID: fsID, DbID: dbID, Placement: meta.PlacementShared,
+			SchemaShape: meta.SchemaShapeShared, Status: meta.SharedDBStatusActive},
+		&meta.TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: "org-unready-delete",
+			PoolID: "pool-unready-delete", PoolStatus: meta.TenantPoolBindingFree, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	tenantRow, err := rt.meta.GetTenant(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.meta.MarkFreeSharedTenantPoolTenantDeleting(ctx, tenantID, tenantRow.Status); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.server.deleteFreeSharedPoolTenant(ctx, tenantRow); err != nil {
+		t.Fatalf("deleteFreeSharedPoolTenant: %v", err)
+	}
+	if _, err := rt.meta.GetTenantPlacement(ctx, fsID); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("placement lookup error = %v, want ErrNotFound", err)
+	}
+	if _, err := rt.meta.GetTenantPoolMembership(ctx, tenantID); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("membership lookup error = %v, want ErrNotFound", err)
+	}
+	dbPool, err := rt.meta.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dbPool.TenantCount != 0 {
+		t.Fatalf("db pool tenant_count = %d, want 0", dbPool.TenantCount)
+	}
+}
+
 func TestAdminTenantPoolMetadataResumeResultRank(t *testing.T) {
 	ordered := []string{"ok", "canceled", "deadline_exceeded", "bad_conn", "error", "unknown"}
 	for i := 1; i < len(ordered); i++ {

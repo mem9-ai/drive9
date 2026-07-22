@@ -156,6 +156,8 @@ type Pool struct {
 	sharedDBs        map[int64]*sql.DB
 	sharedDBRefs     map[int64]int
 	sharedDBLastUsed map[int64]time.Time
+	sharedDBOpenMu   map[int64]*sync.Mutex
+	sharedDBClosed   bool
 }
 
 type tenantAutoEmbeddingProfile struct {
@@ -245,6 +247,7 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 		sharedDBs:        map[int64]*sql.DB{},
 		sharedDBRefs:     map[int64]int{},
 		sharedDBLastUsed: map[int64]time.Time{},
+		sharedDBOpenMu:   map[int64]*sync.Mutex{},
 		// No LeaderChecker means single-pod mode: FileGC runs unconditionally.
 		fileGCEnabled: cfg.LeaderChecker == nil,
 		idleTimeout:   idleTimeout,
@@ -753,6 +756,7 @@ func (p *Pool) Close() {
 		db *sql.DB
 	}
 	p.sharedMu.Lock()
+	p.sharedDBClosed = true
 	sharedToClose := make([]sharedDBToClose, 0, len(p.sharedDBs))
 	for dbID, db := range p.sharedDBs {
 		sharedToClose = append(sharedToClose, sharedDBToClose{id: dbID, db: db})
@@ -986,11 +990,35 @@ func (p *Pool) reapIdleSharedDBs(now time.Time) {
 // for defaultSharedDBHandleIdleTTL and is then closed by the existing reaper.
 func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) {
 	p.sharedMu.Lock()
-	defer p.sharedMu.Unlock()
 	if db, ok := p.sharedDBs[dbID]; ok {
 		p.sharedDBLastUsed[dbID] = time.Now()
+		p.sharedMu.Unlock()
 		return db, nil
 	}
+	if p.sharedDBClosed {
+		p.sharedMu.Unlock()
+		return nil, fmt.Errorf("shared db pool is closed")
+	}
+	openMu := p.sharedDBOpenMu[dbID]
+	if openMu == nil {
+		openMu = &sync.Mutex{}
+		p.sharedDBOpenMu[dbID] = openMu
+	}
+	p.sharedMu.Unlock()
+
+	openMu.Lock()
+	defer openMu.Unlock()
+	p.sharedMu.Lock()
+	if db, ok := p.sharedDBs[dbID]; ok {
+		p.sharedDBLastUsed[dbID] = time.Now()
+		p.sharedMu.Unlock()
+		return db, nil
+	}
+	if p.sharedDBClosed {
+		p.sharedMu.Unlock()
+		return nil, fmt.Errorf("shared db pool is closed")
+	}
+	p.sharedMu.Unlock()
 	if p.metaStore == nil {
 		return nil, fmt.Errorf("shared db %d: no meta store", dbID)
 	}
@@ -1024,8 +1052,15 @@ func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) 
 			return nil, fmt.Errorf("shared db %d: persist schema version: %w", dbID, err)
 		}
 	}
+	p.sharedMu.Lock()
+	if p.sharedDBClosed {
+		p.sharedMu.Unlock()
+		_ = mysqlutil.CloseInstrumented(db)
+		return nil, fmt.Errorf("shared db pool is closed")
+	}
 	p.sharedDBs[dbID] = db
 	p.sharedDBLastUsed[dbID] = time.Now()
+	p.sharedMu.Unlock()
 	return db, nil
 }
 
@@ -1042,6 +1077,15 @@ func (p *Pool) InvalidateSharedDB(dbID int64) error {
 	if dbID <= 0 {
 		return fmt.Errorf("shared db id must be positive")
 	}
+	p.sharedMu.Lock()
+	openMu := p.sharedDBOpenMu[dbID]
+	if openMu == nil {
+		openMu = &sync.Mutex{}
+		p.sharedDBOpenMu[dbID] = openMu
+	}
+	p.sharedMu.Unlock()
+	openMu.Lock()
+	defer openMu.Unlock()
 	p.sharedMu.Lock()
 	db := p.sharedDBs[dbID]
 	delete(p.sharedDBs, dbID)

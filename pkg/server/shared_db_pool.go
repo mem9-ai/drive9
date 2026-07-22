@@ -23,6 +23,8 @@ const (
 	sharedTenantActivationBatchSize     = 100
 )
 
+var errSharedDBConnectionMetadataNotReady = errors.New("shared DB pool connection metadata is not ready")
+
 type defaultTiDBCloudSpendingLimitProvider interface {
 	DefaultTiDBCloudSpendingLimit() int64
 }
@@ -268,6 +270,30 @@ func (s *Server) resumeManagedSharedDBPoolsWithCtx(ctx context.Context) {
 }
 
 func (s *Server) continueManagedSharedDBPool(ctx context.Context, dbID int64, cred tenant.CredentialProvisionRequest) error {
+	for metadataAttempt := 0; metadataAttempt < 2; metadataAttempt++ {
+		err := s.continueManagedSharedDBPoolOnce(ctx, dbID, cred)
+		if !errors.Is(err, errSharedDBConnectionMetadataNotReady) {
+			return err
+		}
+		waiter, ok := s.provisioner.(tenant.SharedDBPoolMetadataWaiter)
+		if !ok {
+			return err
+		}
+		poolInfo, loadErr := s.meta.GetSharedDB(ctx, dbID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if poolInfo.ClusterID == "" {
+			return err
+		}
+		if _, waitErr := waiter.WaitForSharedDBPoolMetadataWithCredentials(ctx, dbID, poolInfo.ClusterID, cred); waitErr != nil {
+			return waitErr
+		}
+	}
+	return fmt.Errorf("%w: db pool %d", errSharedDBConnectionMetadataNotReady, dbID)
+}
+
+func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64, cred tenant.CredentialProvisionRequest) error {
 	for attempt := 0; attempt < 2; attempt++ {
 		poolInfo, err := s.meta.GetSharedDB(ctx, dbID)
 		if err != nil {
@@ -497,7 +523,7 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 		}
 	}
 	if poolInfo.Host == "" || poolInfo.Port <= 0 || poolInfo.User == "" || len(poolInfo.PasswordCipher) == 0 || poolInfo.Name == "" {
-		return fmt.Errorf("shared db pool %d connection metadata is not ready", dbID)
+		return fmt.Errorf("%w: db pool %d", errSharedDBConnectionMetadataNotReady, dbID)
 	}
 	plain, err := s.pool.Decrypt(ctx, poolInfo.PasswordCipher)
 	if err != nil {

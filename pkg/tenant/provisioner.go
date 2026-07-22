@@ -92,8 +92,15 @@ type SharedDBPoolInfo struct {
 
 type SharedDBPoolProvisioner interface {
 	Provisioner
+	// BatchProvisionSharedDBPoolsWithCredentials may return the successfully
+	// decoded subset together with a non-nil error. Callers must persist/process
+	// every returned result before handling the error.
 	BatchProvisionSharedDBPoolsWithCredentials(ctx context.Context, requests []SharedDBPoolCreateRequest, req CredentialProvisionRequest) ([]*SharedDBPoolInfo, error)
 	LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoolID int64, clusterID string, req CredentialProvisionRequest) (*SharedDBPoolInfo, error)
+}
+
+type SharedDBPoolMetadataWaiter interface {
+	WaitForSharedDBPoolMetadataWithCredentials(ctx context.Context, dbPoolID int64, clusterID string, req CredentialProvisionRequest) (*SharedDBPoolInfo, error)
 }
 
 var ErrSharedDBPoolAmbiguous = errors.New("multiple shared db pool cloud resources found")

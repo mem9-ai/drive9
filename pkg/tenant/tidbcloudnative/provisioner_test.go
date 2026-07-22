@@ -536,6 +536,52 @@ func TestLoadSharedDBPoolWithClusterIDRejectsNonSharedLabels(t *testing.T) {
 	}
 }
 
+func TestWaitForSharedDBPoolMetadataUsesNativeReadinessPoll(t *testing.T) {
+	origPoll := tidbCloudNativePollInterval
+	tidbCloudNativePollInterval = time.Millisecond
+	t.Cleanup(func() { tidbCloudNativePollInterval = origPoll })
+
+	var authorizedGets atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-shared-wait", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodGet || r.URL.Path != "/v1beta1/clusters/cluster-pool-41" {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		response := map[string]any{
+			"clusterId": "cluster-pool-41", "state": "ACTIVE",
+			"labels": map[string]string{
+				Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+				Drive9DBPoolIDLabel: "41", TiDBCloudOrganizationLabel: "org-1",
+			},
+		}
+		if authorizedGets.Add(1) > 1 {
+			response["userPrefix"] = "u1"
+			response["endpoints"] = map[string]any{"public": map[string]any{"host": "shared.example", "port": 4000}}
+		}
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+	got, err := p.WaitForSharedDBPoolMetadataWithCredentials(context.Background(), 41, "cluster-pool-41",
+		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
+	if err != nil {
+		t.Fatalf("WaitForSharedDBPoolMetadataWithCredentials: %v", err)
+	}
+	if authorizedGets.Load() != 2 {
+		t.Fatalf("authorized GETs = %d, want 2", authorizedGets.Load())
+	}
+	if got.DBPoolID != 41 || got.ClusterID != "cluster-pool-41" || got.OrganizationID != "org-1" ||
+		got.Host != "shared.example" || got.Port != 4000 || got.Username != "u1.root" {
+		t.Fatalf("shared DB pool metadata = %+v", got)
+	}
+}
+
 func TestBatchProvisionFreeClustersDefersIncompletePublicHostWithoutMetadataWait(t *testing.T) {
 	var listCalls atomic.Int32
 	handlerErrs := make(chan error, 2)

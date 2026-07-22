@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -278,6 +279,96 @@ func TestSharedDBSchemaIsCheckedLazilyAndRetriedAfterFailure(t *testing.T) {
 	}
 	if ensureCalls != 2 {
 		t.Fatalf("schema ensure calls after current-version reopen = %d, want 2", ensureCalls)
+	}
+}
+
+func TestSharedDBColdOpensDoNotBlockDifferentDBPools(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	dsnCfg, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portText, err := net.SplitHostPort(dsnCfg.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passwordCipher, err := enc.Encrypt(context.Background(), []byte(dsnCfg.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	register := func(orgID string) int64 {
+		t.Helper()
+		dbID, err := metaStore.RegisterSharedDB(context.Background(), &meta.SharedDB{
+			TiDBCloudOrganizationID: orgID, Host: host, Port: port,
+			User: dsnCfg.User, PasswordCipher: passwordCipher, Name: dsnCfg.DBName,
+			MaxTenants: 100, Status: meta.SharedDBStatusActive,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return dbID
+	}
+	dbID1 := register("org-concurrent-open-1")
+	dbID2 := register("org-concurrent-open-2")
+	pool := NewPool(PoolConfig{}, enc)
+	pool.SetMetaStore(metaStore)
+	t.Cleanup(pool.Close)
+
+	var ensureCalls atomic.Int32
+	firstEnsureStarted := make(chan struct{})
+	releaseFirstEnsure := make(chan struct{})
+	previousEnsure := ensureSharedDBSchema
+	ensureSharedDBSchema = func(ctx context.Context, db *sql.DB) error {
+		if ensureCalls.Add(1) == 1 {
+			close(firstEnsureStarted)
+			<-releaseFirstEnsure
+		}
+		return db.PingContext(ctx)
+	}
+	t.Cleanup(func() { ensureSharedDBSchema = previousEnsure })
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- pool.EnsureSharedDBReady(context.Background(), dbID1) }()
+	<-firstEnsureStarted
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- pool.EnsureSharedDBReady(context.Background(), dbID2) }()
+
+	var secondErr error
+	secondBlocked := false
+	select {
+	case secondErr = <-secondDone:
+	case <-time.After(time.Second):
+		secondBlocked = true
+	}
+	close(releaseFirstEnsure)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first shared DB open: %v", err)
+	}
+	if secondBlocked {
+		secondErr = <-secondDone
+	}
+	if secondErr != nil {
+		t.Fatalf("second shared DB open: %v", secondErr)
+	}
+	if secondBlocked {
+		t.Fatal("cold open for one shared DB blocked an unrelated shared DB")
 	}
 }
 

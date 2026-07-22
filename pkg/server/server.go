@@ -5150,6 +5150,15 @@ func (s *Server) provisionTenantOnSharedDBMode(ctx context.Context, tenantID str
 		}
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to place tenant on shared pool", err)
 	}
+	// Only the managed shared provider materializes a per-tenant virtual
+	// spending limit. Legacy native/zero routing to a manually registered shared
+	// DB pool must keep failing closed instead of silently dropping the request.
+	if provider != tenant.ProviderTiDBCloudNativeShared && opts.Quota != nil && opts.Quota.TiDBCloudSpendingLimit != nil {
+		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+		return nil, newProvisionTenantError(http.StatusBadRequest,
+			"tidbcloud spending limit is not supported for shared-pool tenants",
+			fmt.Errorf("spending limit requested for shared-pool tenant"))
+	}
 	fsID, err := s.meta.EnsureFsID(ctx, tenantID)
 	if err != nil {
 		return fail(err)
@@ -5275,7 +5284,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 			return nil, newProvisionTenantError(http.StatusBadGateway, "failed to allocate shared database", err)
 		}
-		if created || sharedDB.ClusterID == "" || sharedDB.Host == "" || sharedDB.Port <= 0 || sharedDB.User == "" {
+		if sharedDB.SpendingLimit != nil && (created || sharedDB.ClusterID == "" || sharedDB.Host == "" || sharedDB.Port <= 0 || sharedDB.User == "") {
 			plannedDB := sharedDB
 			sharedDB, err = s.ensureManagedSharedDBPhysical(ctx, plannedDB.ID, *opts.CredentialProvisioner)
 			if err != nil {

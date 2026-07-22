@@ -595,6 +595,9 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 		out = append(out, result)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].DBPoolID < out[j].DBPoolID })
+	// Preserve decoded successes with partialErr as required by the
+	// SharedDBPoolProvisioner contract; callers persist these before retrying
+	// omitted DB pools through the continuation path.
 	return out, partialErr
 }
 
@@ -637,7 +640,11 @@ func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoo
 	if len(matches) != 1 {
 		return nil, fmt.Errorf("%w: found %d managed shared clusters for db pool %d", tenant.ErrSharedDBPoolAmbiguous, len(matches), dbPoolID)
 	}
-	info := &matches[0]
+	return p.sharedDBPoolInfoFromCluster(dbPoolID, &matches[0])
+}
+
+func (p *Provisioner) sharedDBPoolInfoFromCluster(dbPoolID int64, info *clusterInfo) (*tenant.SharedDBPoolInfo, error) {
+	wantID := strconv.FormatInt(dbPoolID, 10)
 	if got := strings.TrimSpace(info.Labels[Drive9ManagedLabel]); got != "true" {
 		return nil, fmt.Errorf("cluster %q has %s label %q, want %q", info.ClusterID, Drive9ManagedLabel, got, "true")
 	}
@@ -660,6 +667,28 @@ func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoo
 		result.Username = strings.TrimSpace(info.UserPrefix) + ".root"
 	}
 	return result, nil
+}
+
+// WaitForSharedDBPoolMetadataWithCredentials reuses the existing TiDB Cloud
+// Native endpoint/user/org readiness poll for a managed shared DB pool.
+func (p *Provisioner) WaitForSharedDBPoolMetadataWithCredentials(ctx context.Context, dbPoolID int64, clusterID string, req tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	if dbPoolID <= 0 {
+		return nil, fmt.Errorf("db pool id must be positive")
+	}
+	clusterID = strings.TrimSpace(clusterID)
+	if clusterID == "" {
+		return nil, fmt.Errorf("cluster id is required")
+	}
+	info, err := p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	return p.sharedDBPoolInfoFromCluster(dbPoolID, info)
 }
 
 type batchClusterMetadataTarget struct {
