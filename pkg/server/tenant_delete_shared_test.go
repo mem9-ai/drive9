@@ -498,6 +498,13 @@ func TestAdminTenantDeleteSharedNeverDeprovisionsPhysicalPool(t *testing.T) {
 	if retryResp.StatusCode != http.StatusAccepted {
 		t.Fatalf("retry status = %d, want %d", retryResp.StatusCode, http.StatusAccepted)
 	}
+	var deleteResponse adminTenantDeleteResponse
+	if err := json.NewDecoder(retryResp.Body).Decode(&deleteResponse); err != nil {
+		t.Fatalf("decode shared admin delete response: %v", err)
+	}
+	if deleteResponse.TenantID != rt.tenantID || deleteResponse.Status != string(meta.TenantDeleting) {
+		t.Fatalf("shared admin delete response = %+v, want tenant_id %s and status %s", deleteResponse, rt.tenantID, meta.TenantDeleting)
+	}
 }
 
 // TestSharedTenantDeletePlacementRemovalFailureStaysRetryable injects a

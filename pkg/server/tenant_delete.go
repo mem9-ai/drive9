@@ -170,6 +170,15 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 // cleanup worker reaches the terminal state. Identity resolution is read-only
 // (ResolveFsID): a delete path must never allocate a new fs_id.
 func (s *Server) handleSharedTenantDelete(w http.ResponseWriter, r *http.Request, t *meta.Tenant) {
+	s.handleSharedTenantDeleteWithStatusWriter(w, r, t, writeTenantDeleteStatus)
+}
+
+func (s *Server) handleSharedTenantDeleteWithStatusWriter(
+	w http.ResponseWriter,
+	r *http.Request,
+	t *meta.Tenant,
+	writeStatus func(http.ResponseWriter, meta.TenantStatus),
+) {
 	ctx := r.Context()
 	deleteJobExists := false
 	if t.StorageNamespaceID != "" {
@@ -198,7 +207,7 @@ func (s *Server) handleSharedTenantDelete(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if !updated {
-			writeTenantDeleteStatus(w, meta.TenantDeleting)
+			writeStatus(w, meta.TenantDeleting)
 			return
 		}
 	}
@@ -222,7 +231,7 @@ func (s *Server) handleSharedTenantDelete(w http.ResponseWriter, r *http.Request
 	}
 	if deleteJobExists && placement != nil && placement.Status == meta.PlacementStatusDeleting {
 		_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
-		writeTenantDeleteStatus(w, meta.TenantDeleting)
+		writeStatus(w, meta.TenantDeleting)
 		return
 	}
 	if placement != nil {
@@ -244,7 +253,7 @@ func (s *Server) handleSharedTenantDelete(w http.ResponseWriter, r *http.Request
 			}
 			if markDeleted {
 				_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
-				writeTenantDeleteStatus(w, meta.TenantDeleted)
+				writeStatus(w, meta.TenantDeleted)
 				return
 			}
 		}
@@ -259,7 +268,7 @@ func (s *Server) handleSharedTenantDelete(w http.ResponseWriter, r *http.Request
 			}
 		}
 		_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
-		writeTenantDeleteStatus(w, status)
+		writeStatus(w, status)
 		return
 	}
 	logger.Error(ctx, "shared_tenant_delete_placement_missing", zap.String("tenant_id", t.ID), zap.Int64("fs_id", fsID))

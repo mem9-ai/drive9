@@ -60,6 +60,8 @@ type fakeProvisioner struct {
 	sharedPoolBatchRelease <-chan struct{}
 	sharedPoolWaitCalls    atomic.Int32
 	sharedPoolWaitErr      error
+	sharedPoolLoadIDs      chan int64
+	sharedPoolWaitRelease  <-chan struct{}
 }
 
 type failingEncryptor struct {
@@ -696,6 +698,143 @@ func TestRetryManagedSharedDBContinuationsAvoidsHeadOfLineBlocking(t *testing.T)
 	}
 }
 
+func TestManagedSharedDBContinuationBatchesDoNotEnterBlockingMetadataWait(t *testing.T) {
+	origWindow, origInitialBackoff, origMaxBackoff := schemaInitRetryWindow, schemaInitInitialBackoff, schemaInitMaxBackoff
+	schemaInitRetryWindow = 100 * time.Millisecond
+	schemaInitInitialBackoff = 5 * time.Millisecond
+	schemaInitMaxBackoff = 10 * time.Millisecond
+	t.Cleanup(func() {
+		schemaInitRetryWindow = origWindow
+		schemaInitInitialBackoff = origInitialBackoff
+		schemaInitMaxBackoff = origMaxBackoff
+	})
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(pool.Close)
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	createPool := func(clusterID string, provisioningByte byte) int64 {
+		t.Helper()
+		dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+			TiDBCloudOrganizationID: "org-scheduled-metadata", ProvisioningKey: bytes.Repeat([]byte{provisioningByte}, 32),
+			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+			PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := metaStore.UpdateManagedSharedDBPoolCloudResult(context.Background(), &meta.SharedDB{
+			ID: dbID, TiDBCloudOrganizationID: "org-scheduled-metadata", ClusterID: clusterID,
+			PasswordCipher: passwordCipher, Name: "tidbcloud_fs", TLSMode: "true",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return dbID
+	}
+	firstID := createPool("cluster-scheduled-first", 1)
+	secondID := createPool("cluster-scheduled-second", 2)
+	waitRelease := make(chan struct{})
+	loadIDs := make(chan int64, 8)
+	prov := &fakeProvisioner{
+		provider:          tenant.ProviderTiDBCloudNative,
+		defaultPublicKey:  "public",
+		defaultPrivateKey: "private",
+		sharedPoolResults: []*tenant.SharedDBPoolInfo{
+			{DBPoolID: firstID, ClusterID: "cluster-scheduled-first", OrganizationID: "org-scheduled-metadata"},
+			{DBPoolID: secondID, ClusterID: "cluster-scheduled-second", OrganizationID: "org-scheduled-metadata"},
+		},
+		sharedPoolLoadIDs:     loadIDs,
+		sharedPoolWaitRelease: waitRelease,
+	}
+	workerCtx, cancel := context.WithCancel(context.Background())
+	srv := &Server{meta: metaStore, pool: pool, provisioner: prov, forkWorkerCtx: workerCtx}
+	t.Cleanup(func() {
+		cancel()
+		srv.forkWorkerWG.Wait()
+	})
+	srv.scheduleManagedSharedDBContinuations(context.Background(), []int64{firstID, secondID}, tenant.CredentialProvisionRequest{
+		PublicKey: "public", PrivateKey: "private",
+	})
+
+	select {
+	case got := <-loadIDs:
+		if got != firstID {
+			t.Fatalf("first continuation = %d, want %d", got, firstID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first continuation was not attempted")
+	}
+	select {
+	case got := <-loadIDs:
+		if got != secondID {
+			t.Fatalf("second continuation = %d, want %d", got, secondID)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("second continuation was blocked behind the first pool metadata waiter")
+	}
+	if got := prov.sharedPoolWaitCalls.Load(); got != 0 {
+		t.Fatalf("scheduled continuation metadata waiter calls = %d, want 0", got)
+	}
+	scheduledDone := make(chan struct{})
+	go func() {
+		srv.forkWorkerWG.Wait()
+		close(scheduledDone)
+	}()
+	select {
+	case <-scheduledDone:
+	case <-time.After(time.Second):
+		t.Fatal("scheduled continuation batch did not finish within its retry window")
+	}
+
+	resumeLoadIDs := make(chan int64, 8)
+	prov.sharedPoolLoadIDs = resumeLoadIDs
+	resumeCtx, cancelResume := context.WithCancel(context.Background())
+	resumeDone := make(chan struct{})
+	t.Cleanup(func() {
+		cancelResume()
+		<-resumeDone
+	})
+	go func() {
+		defer close(resumeDone)
+		srv.resumeManagedSharedDBPoolsWithCtx(resumeCtx)
+	}()
+	select {
+	case got := <-resumeLoadIDs:
+		if got != firstID {
+			t.Fatalf("first resumed continuation = %d, want %d", got, firstID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first resumed continuation was not attempted")
+	}
+	select {
+	case got := <-resumeLoadIDs:
+		if got != secondID {
+			t.Fatalf("second resumed continuation = %d, want %d", got, secondID)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("second resumed continuation was blocked behind the first pool metadata waiter")
+	}
+	cancelResume()
+	<-resumeDone
+}
+
 func TestManagedSharedDBBatchCreateUsesAllocationLock(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -871,7 +1010,13 @@ func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context
 	return out, nil
 }
 
-func (f *fakeProvisioner) LoadSharedDBPoolWithCredentials(_ context.Context, _ int64, dbPoolUUID, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+func (f *fakeProvisioner) LoadSharedDBPoolWithCredentials(_ context.Context, dbPoolID int64, dbPoolUUID, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+	if f.sharedPoolLoadIDs != nil {
+		select {
+		case f.sharedPoolLoadIDs <- dbPoolID:
+		default:
+		}
+	}
 	if clusterID == "" {
 		return nil, nil
 	}
@@ -885,8 +1030,15 @@ func (f *fakeProvisioner) LoadSharedDBPoolWithCredentials(_ context.Context, _ i
 	return nil, nil
 }
 
-func (f *fakeProvisioner) WaitForSharedDBPoolMetadataWithCredentials(_ context.Context, dbPoolID int64, dbPoolUUID, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+func (f *fakeProvisioner) WaitForSharedDBPoolMetadataWithCredentials(ctx context.Context, dbPoolID int64, dbPoolUUID, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
 	f.sharedPoolWaitCalls.Add(1)
+	if f.sharedPoolWaitRelease != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-f.sharedPoolWaitRelease:
+		}
+	}
 	if f.sharedPoolWaitErr != nil {
 		return nil, f.sharedPoolWaitErr
 	}

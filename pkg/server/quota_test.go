@@ -1551,6 +1551,21 @@ func TestAdminTenantListFiltersByAuthorizedClusters(t *testing.T) {
 	if len(out.Tenants) != 3 || out.Tenants[0].TenantID != wildcardTenantID || out.Tenants[1].TenantID != sharedTenantID || out.Tenants[2].TenantID != rt.tenantID {
 		t.Fatalf("tenants = %#v, want wildcard shared tenant %s, shared tenant %s, and dedicated tenant %s", out.Tenants, wildcardTenantID, sharedTenantID, rt.tenantID)
 	}
+	freeReq, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/admin/tenants/"+freeSharedTenantID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freeReq.Header.Set(quotaPublicKeyHeader, "public-1")
+	freeReq.Header.Set(quotaPrivateKeyHeader, "private-1")
+	freeResp, err := http.DefaultClient.Do(freeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = freeResp.Body.Close() }()
+	if freeResp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(freeResp.Body)
+		t.Fatalf("free shared member get status = %d, want 404: %s", freeResp.StatusCode, body)
+	}
 }
 
 func TestAdminTenantListIncludeQuotaDoesNotBackfillSpendingLimit(t *testing.T) {

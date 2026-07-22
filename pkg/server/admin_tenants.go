@@ -385,7 +385,9 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
-		s.handleSharedTenantDelete(w, r, t)
+		s.handleSharedTenantDeleteWithStatusWriter(w, r, t, func(w http.ResponseWriter, status meta.TenantStatus) {
+			writeJSON(w, http.StatusAccepted, adminTenantDeleteResponse{TenantID: t.ID, Status: string(status)})
+		})
 		s.forgetTiDBCloudRBACList(cred)
 		return
 	}
@@ -473,6 +475,15 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 		return nil, nil, false
 	}
 	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
+		membership, membershipErr := s.meta.GetTenantPoolMembership(r.Context(), tenantID)
+		if membershipErr == nil && membership.PoolStatus == meta.TenantPoolBindingFree {
+			errJSON(w, http.StatusNotFound, "tenant not found")
+			return nil, nil, false
+		}
+		if membershipErr != nil && !errors.Is(membershipErr, meta.ErrNotFound) {
+			errJSON(w, http.StatusInternalServerError, "tenant pool membership lookup failed")
+			return nil, nil, false
+		}
 		if _, err := s.authorizeSharedQuotaCredentials(r.Context(), t, cred, adminTenantMetricPath(loadQuota, allowDeletingMissingCluster)); err != nil {
 			writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
 			return nil, nil, false
