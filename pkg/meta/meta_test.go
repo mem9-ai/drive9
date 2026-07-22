@@ -787,6 +787,25 @@ func TestFinalizeTenantDeleteUpdatesJobNamespaceAndTenant(t *testing.T) {
 	if !updated {
 		t.Fatal("MarkTenantDeleteJobRunning updated = false, want true")
 	}
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-delete-finalize", Host: "shared.example.com", Port: 4000,
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_delete_finalize",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fsID, err := s.EnsureFsID(ctx, "delete-finalize-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertTenantPlacement(ctx, &TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, "UPDATE tenant_placements SET status = ? WHERE fs_id = ?", PlacementStatusDeleting, fsID); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.FinalizeTenantDelete(ctx, "delete-finalize-tenant", "delete-finalize-ns", 11, 2); err != nil {
 		t.Fatal(err)
 	}
@@ -813,6 +832,9 @@ func TestFinalizeTenantDeleteUpdatesJobNamespaceAndTenant(t *testing.T) {
 	}
 	if _, err := s.GetTenantTiDBCloudOrgBinding(ctx, "delete-finalize-tenant"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("org binding err = %v, want %v", err, ErrNotFound)
+	}
+	if _, err := s.GetTenantPlacement(ctx, fsID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleting placement after finalization = %v, want %v", err, ErrNotFound)
 	}
 }
 

@@ -37,6 +37,11 @@ const (
 	SchemaShapeShared     = "shared"
 )
 
+// PlacementStatusDeleting retains the physical resource identity while a
+// durable tenant cleanup job is still running. Capacity has already been
+// released, so allocators must not treat this row as active inventory.
+const PlacementStatusDeleting = "deleting"
+
 const (
 	SharedDBStatusProvisioning = "provisioning"
 	SharedDBStatusActive       = "active"
@@ -1191,50 +1196,108 @@ func (s *Store) DeleteTenantPlacementAndDecrCount(ctx context.Context, fsID, dbI
 		return err
 	}
 	return s.InTx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `DELETE FROM tenant_placements WHERE fs_id = ?`, fsID)
-		if err != nil {
-			return fmt.Errorf("delete tenant placement for fs_id %d: %w", fsID, err)
+		return releaseTenantPlacementAndDecrCountTx(ctx, tx, fsID, dbID, reopenRatio, true)
+	})
+}
+
+// FinalizeSharedTenantDeleteMetadata atomically releases shared DB capacity
+// and logical-pool membership. Tenants requiring external cleanup retain a
+// deleting placement as their authorization anchor until job finalization;
+// tenants without external cleanup remove placement and become deleted in the
+// same transaction. A failed transition always retains the active placement.
+func (s *Store) FinalizeSharedTenantDeleteMetadata(ctx context.Context, tenantID string, fsID, dbID int64, reopenRatio float64, markDeleted bool) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "finalize_shared_tenant_delete_metadata", start, &err)
+	if strings.TrimSpace(tenantID) == "" {
+		return fmt.Errorf("tenant id is required")
+	}
+	if fsID <= 0 {
+		return fmt.Errorf("fs_id must be positive")
+	}
+	if dbID <= 0 {
+		return fmt.Errorf("db_id must be positive")
+	}
+	if _, err := SharedDBReopenThresholdForRatio(1, reopenRatio); err != nil {
+		return err
+	}
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		if err := releaseTenantPlacementAndDecrCountTx(ctx, tx, fsID, dbID, reopenRatio, markDeleted); err != nil {
+			return err
 		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("delete tenant placement rows affected for fs_id %d: %w", fsID, err)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_pool_memberships WHERE tenant_id = ?`, tenantID); err != nil {
+			return fmt.Errorf("delete tenant pool membership for %s: %w", tenantID, err)
 		}
-		if affected == 0 {
-			return ErrNotFound
+		if !markDeleted {
+			return nil
 		}
-		var maxTenants, tenantCount int
-		var softCapReached bool
-		if err := tx.QueryRowContext(ctx, `SELECT max_tenants, tenant_count, soft_cap_reached FROM db_pool WHERE db_id = ? FOR UPDATE`, dbID).
-			Scan(&maxTenants, &tenantCount, &softCapReached); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return ErrNotFound
-			}
-			return fmt.Errorf("lock capacity for db %d: %w", dbID, err)
-		}
-		reopenThreshold, err := SharedDBReopenThresholdForRatio(maxTenants, reopenRatio)
+		now := time.Now().UTC()
+		res, err := tx.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`, TenantDeleted, now, tenantID)
 		if err != nil {
 			return err
 		}
-		newTenantCount := tenantCount - 1
-		if newTenantCount < 0 {
-			newTenantCount = 0
+		if err := requireAffected(res); err != nil {
+			return err
 		}
-		nextSoftCapReached := softCapReached
-		if maxTenants > 0 && newTenantCount <= reopenThreshold {
-			nextSoftCapReached = false
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE db_pool
-			SET soft_cap_reached = ?, tenant_count = ?
-			WHERE db_id = ?`, nextSoftCapReached, newTenantCount, dbID)
-		if err != nil {
-			return fmt.Errorf("release capacity on db %d: %w", dbID, err)
-		}
-		// The SELECT ... FOR UPDATE above already established that the pool
-		// exists. RowsAffected may be zero when the delete leaves both values
-		// unchanged (for example an already-zero counter), which is still a
-		// valid atomic placement release.
 		return nil
 	})
+}
+
+func releaseTenantPlacementAndDecrCountTx(ctx context.Context, tx *sql.Tx, fsID, dbID int64, reopenRatio float64, deletePlacement bool) error {
+	var (
+		res sql.Result
+		err error
+	)
+	if deletePlacement {
+		res, err = tx.ExecContext(ctx, `DELETE FROM tenant_placements WHERE fs_id = ? AND db_id = ?`, fsID, dbID)
+	} else {
+		res, err = tx.ExecContext(ctx, `UPDATE tenant_placements SET status = ?
+			WHERE fs_id = ? AND db_id = ? AND status <> ?`, PlacementStatusDeleting, fsID, dbID, PlacementStatusDeleting)
+	}
+	if err != nil {
+		return fmt.Errorf("release tenant placement for fs_id %d: %w", fsID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete tenant placement rows affected for fs_id %d: %w", fsID, err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	var maxTenants, tenantCount int
+	var softCapReached bool
+	if err := tx.QueryRowContext(ctx, `SELECT max_tenants, tenant_count, soft_cap_reached FROM db_pool WHERE db_id = ? FOR UPDATE`, dbID).
+		Scan(&maxTenants, &tenantCount, &softCapReached); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("lock capacity for db %d: %w", dbID, err)
+	}
+	reopenThreshold, err := SharedDBReopenThresholdForRatio(maxTenants, reopenRatio)
+	if err != nil {
+		return err
+	}
+	newTenantCount := tenantCount - 1
+	if newTenantCount < 0 {
+		newTenantCount = 0
+	}
+	nextSoftCapReached := softCapReached
+	if maxTenants > 0 && newTenantCount <= reopenThreshold {
+		nextSoftCapReached = false
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE db_pool
+			SET soft_cap_reached = ?, tenant_count = ?
+			WHERE db_id = ?`, nextSoftCapReached, newTenantCount, dbID)
+	if err != nil {
+		return fmt.Errorf("release capacity on db %d: %w", dbID, err)
+	}
+	// The SELECT ... FOR UPDATE above already established that the pool
+	// exists. RowsAffected may be zero when the delete leaves both values
+	// unchanged (for example an already-zero counter), which is still a
+	// valid atomic placement release.
+	return nil
 }
 
 // scanSharedDBRow scans one db_pool row selected with sharedDBSelectColumns.
