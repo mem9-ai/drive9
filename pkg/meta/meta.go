@@ -393,9 +393,6 @@ func (s *Store) migrate() (err error) {
 	if err := expandManagedDBPoolSchema(ctx, s.db); err != nil {
 		return err
 	}
-	if err := removeQuotaLimitsOverriddenColumn(ctx, s.db); err != nil {
-		return err
-	}
 	if err := backfillTiDBCloudOrgBindingBranchIDs(ctx, s.db); err != nil {
 		return err
 	}
@@ -411,23 +408,6 @@ func (s *Store) migrate() (err error) {
 	}
 	if len(diffs) > 0 {
 		return &metaSchemaDiffError{diffs: diffs}
-	}
-	return nil
-}
-
-func removeQuotaLimitsOverriddenColumn(ctx context.Context, db *sql.DB) error {
-	var exists int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
-		FROM information_schema.columns
-		WHERE table_schema = DATABASE() AND table_name = 'tenant_quota_config'
-		  AND column_name = 'quota_limits_overridden'`).Scan(&exists); err != nil {
-		return fmt.Errorf("inspect tenant_quota_config.quota_limits_overridden: %w", err)
-	}
-	if exists == 0 {
-		return nil
-	}
-	if _, err := db.ExecContext(ctx, `ALTER TABLE tenant_quota_config DROP COLUMN quota_limits_overridden`); err != nil && !isIgnorableMetaSchemaError(err) {
-		return fmt.Errorf("drop tenant_quota_config.quota_limits_overridden: %w", err)
 	}
 	return nil
 }
@@ -846,6 +826,7 @@ func metaInitSchemaStatements() []string {
 			max_media_llm_files   BIGINT NOT NULL DEFAULT 500,
 			max_video_llm_files   BIGINT NOT NULL DEFAULT 50,
 			max_monthly_cost_mc   BIGINT NOT NULL DEFAULT 0,
+			quota_limits_overridden TINYINT(1) NOT NULL DEFAULT 1,
 			tidbcloud_spending_limit BIGINT NULL,
 			tidbcloud_spending_limit_checked_at DATETIME(3) NULL,
 			created_at            DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),

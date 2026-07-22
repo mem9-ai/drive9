@@ -472,12 +472,15 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 		}
 		wantLabels := map[string]string{
 			Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
-			Drive9DBPoolIDLabel: id, Drive9PoolStatusLabel: SharedDBPoolStatusProvisioning,
+			Drive9DBPoolIDLabel: id,
 		}
 		for key, want := range wantLabels {
 			if request.Cluster.Labels[key] != want {
 				t.Fatalf("request %d label %s = %q, want %q", i, key, request.Cluster.Labels[key], want)
 			}
+		}
+		if _, ok := request.Cluster.Labels[Drive9PoolStatusLabel]; ok {
+			t.Fatalf("request %d unexpectedly has shared lifecycle label %s", i, Drive9PoolStatusLabel)
 		}
 	}
 	if len(got) != 2 || got[0].DBPoolID != 41 || got[0].ClusterID != "cluster-pool-41" || got[1].DBPoolID != 42 || got[1].ClusterID != "cluster-pool-42" {

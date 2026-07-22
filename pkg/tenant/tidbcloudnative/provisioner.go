@@ -67,8 +67,6 @@ const (
 	upstreamClusterBodyLimit = 1 << 20
 )
 
-const SharedDBPoolStatusProvisioning = "provisioning"
-
 var (
 	immutableLabelKeys = []string{
 		"tidb.cloud/project",
@@ -530,10 +528,9 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 			"rootPassword": password,
 			"region":       map[string]string{"name": p.regionName()},
 			"labels": map[string]string{
-				Drive9ManagedLabel:    "true",
-				Drive9ProviderLabel:   tenant.ProviderTiDBCloudNativeShared,
-				Drive9DBPoolIDLabel:   id,
-				Drive9PoolStatusLabel: SharedDBPoolStatusProvisioning,
+				Drive9ManagedLabel:  "true",
+				Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+				Drive9DBPoolIDLabel: id,
 			},
 			"spendingLimit": map[string]int32{"monthly": int32(input.SpendingLimitMonthly)},
 		}})

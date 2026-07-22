@@ -837,6 +837,7 @@ func (s *Server) startLeaderWorkers() {
 						return
 					case <-ticker.C:
 						s.resumePendingTenantsWithCtx(workerCtx)
+						s.resumeManagedSharedDBPoolsWithCtx(workerCtx)
 					}
 				}
 			})
@@ -5309,7 +5310,8 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				return nil, newProvisionTenantError(http.StatusBadGateway, "failed to allocate shared database", allocateErr)
 			}
 			if sharedDB.SpendingLimit != nil && (created || sharedDB.ClusterID == "" || sharedDB.Host == "" || sharedDB.Port <= 0 || sharedDB.User == "") {
-				sharedDB, err = s.ensureManagedSharedDBPhysical(ctx, sharedDB.ID, *opts.CredentialProvisioner)
+				plannedDB := sharedDB
+				sharedDB, err = s.ensureManagedSharedDBPhysical(ctx, plannedDB.ID, *opts.CredentialProvisioner)
 				if err != nil {
 					orgID, orgErr := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner)
 					if orgErr == nil {
@@ -5319,6 +5321,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 							if hardErr == nil {
 								res, reserveErr := s.provisionTenantOnSharedDBEmergency(ctx, tenantID, fallback, provider, keyName, opts, now, hardCap)
 								if reserveErr == nil {
+									s.scheduleManagedSharedDBContinuation(ctx, plannedDB.ID, *opts.CredentialProvisioner)
 									return res, nil
 								}
 								if isSharedDBReservationConflict(reserveErr) {

@@ -240,9 +240,23 @@ func (s *Server) scheduleManagedSharedDBContinuations(ctx context.Context, dbIDs
 			if workerCtx.Err() != nil {
 				return
 			}
-			if err := s.continueManagedSharedDBPool(workerCtx, dbID, cred); err != nil {
-				logger.Warn(workerCtx, "managed_shared_db_pool_continue_failed",
-					zap.Int64("db_pool_id", dbID), zap.Error(err))
+			for attempt := 0; attempt < 2; attempt++ {
+				err := s.continueManagedSharedDBPool(workerCtx, dbID, cred)
+				if err == nil {
+					break
+				}
+				if attempt == 1 {
+					logger.Warn(workerCtx, "managed_shared_db_pool_continue_failed",
+						zap.Int64("db_pool_id", dbID), zap.Error(err))
+					break
+				}
+				timer := time.NewTimer(time.Second)
+				select {
+				case <-workerCtx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
 			}
 		}
 	})

@@ -2069,6 +2069,21 @@ func (s *Server) claimSharedTenantPoolMember(ctx context.Context, pool *meta.Ten
 	if pool == nil || row == nil {
 		return nil, meta.ErrNotFound
 	}
+	// Resolve immutable free-member routing metadata before the claim commits.
+	// A transient read failure must not strand a used member whose owner token
+	// was committed but never returned to the caller.
+	fsID, err := s.meta.ResolveFsID(ctx, row.Tenant.ID)
+	if err != nil {
+		return nil, err
+	}
+	placement, err := s.meta.GetTenantPlacement(ctx, fsID)
+	if err != nil {
+		return nil, err
+	}
+	dbPool, err := s.meta.GetSharedDB(ctx, placement.DbID)
+	if err != nil {
+		return nil, err
+	}
 	var patch meta.QuotaConfigPatch
 	if quotaOpt != nil {
 		var err error
@@ -2082,18 +2097,6 @@ func (s *Server) claimSharedTenantPoolMember(ctx context.Context, pool *meta.Ten
 		return nil, err
 	}
 	if err := s.meta.ClaimSharedTenantPoolMembership(ctx, row.Tenant.ID, pool.PoolID, patch, key); err != nil {
-		return nil, err
-	}
-	fsID, err := s.meta.ResolveFsID(ctx, row.Tenant.ID)
-	if err != nil {
-		return nil, err
-	}
-	placement, err := s.meta.GetTenantPlacement(ctx, fsID)
-	if err != nil {
-		return nil, err
-	}
-	dbPool, err := s.meta.GetSharedDB(ctx, placement.DbID)
-	if err != nil {
 		return nil, err
 	}
 	return &provisionTenantResult{TenantID: row.Tenant.ID, APIKey: rawToken, APIKeyID: apiKeyID,
