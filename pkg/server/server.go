@@ -4812,6 +4812,7 @@ type provisionTenantOptions struct {
 	APIKeySource          apiKeyIssueSource
 	CredentialProvisioner *tenant.CredentialProvisionRequest
 	Quota                 *quotaRequest
+	Provider              string
 }
 
 type provisionTenantResult struct {
@@ -5218,7 +5219,7 @@ func (s *Server) provisionTenantOnSharedDBMode(ctx context.Context, tenantID str
 		return fail(provisionErr)
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_api_key", "result", "ok")
-	logger.Info(ctx, "server_event", eventFields(ctx, "provision_shared_pool_placed", "tenant_id", tenantID, "provider", tenant.ProviderTiDBCloudNativeShared, "db_id", sharedDB.ID, "org_id", sharedDB.TiDBCloudOrganizationID)...)
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_shared_pool_placed", "tenant_id", tenantID, "provider", tenant.ProviderTiDBCloudNativeShared, "db_pool_id", sharedDB.ID, "db_pool_uuid", sharedDB.UUID, "tidbcloud_org_id", sharedDB.TiDBCloudOrganizationID)...)
 	metricEvent(ctx, "tenant_provision", "provider", tenant.ProviderTiDBCloudNativeShared, "result", "shared_pool")
 	status := meta.TenantActive
 	if sharedDB.Status == meta.SharedDBStatusProvisioning {
@@ -5235,6 +5236,9 @@ func (s *Server) provisionTenantOnSharedDBMode(ctx context.Context, tenantID str
 
 func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOptions) (*provisionTenantResult, error) {
 	rawProvider := s.defaultTenantProvider
+	if opts.Provider != "" {
+		rawProvider = opts.Provider
+	}
 	provider, err := tenant.NormalizeProvider(rawProvider)
 	if err != nil {
 		logger.Warn(ctx, "server_event", eventFields(ctx, "provision_provider_invalid", "provider", rawProvider, "error", err)...)

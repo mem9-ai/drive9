@@ -1898,9 +1898,8 @@ func tenantPoolCreateDatabaseLockKey(cred tenant.CredentialProvisionRequest) str
 
 // claimAdminTenantFromPool tries to hand out a pre-warmed tenant from the
 // caller org's tenant pool. sharedPoolMatched reports that the org has a
-// registered shared-schema pool instead — callers decide what that means
-// (admin create fails closed; the owner provision path falls through to
-// provisionTenant, which routes the tenant onto the shared pool).
+// registered shared-schema pool instead, so callers can route provisioning
+// through the shared provider.
 func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) (*provisionTenantResult, *meta.TenantPool, bool, bool, error) {
 	claimStarted := time.Now()
 	manager, ok := s.provisioner.(tenant.TenantPoolClusterManager)

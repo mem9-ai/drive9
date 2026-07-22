@@ -197,22 +197,17 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_create_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted))...)
 		return
 	}
-	// The admin tenant API is cluster-centric (org binding, cluster existence
-	// checks, per-cluster quota): a tenant placed on a shared-schema DB has no
-	// per-tenant cluster and would be unmanageable through this surface. Fail
-	// closed when the caller's org matches a shared pool instead of creating
-	// a tenant with no valid admin lifecycle. (The owner provision API below
-	// routes the same org onto the shared pool instead.)
-	if sharedPoolMatched {
-		errJSON(w, http.StatusConflict, "tenant org is registered for shared-pool placement, which the admin tenant API does not support")
-		return
-	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_missed", "provider", tenant.ProviderTiDBCloudNative, "duration_ms", durationMillis(poolClaimStarted))...)
+	provider := ""
+	if sharedPoolMatched {
+		provider = tenant.ProviderTiDBCloudNativeShared
+	}
 	res, err = s.provisionTenant(r.Context(), provisionTenantOptions{
 		KeyName:               "default",
 		TokenVersion:          1,
 		CredentialProvisioner: &cred,
 		Quota:                 quotaOpt,
+		Provider:              provider,
 	})
 	if err != nil {
 		var pe *provisionTenantError
@@ -264,7 +259,7 @@ func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	includeQuota := parseBoolQuery(r, "include_quota")
-	rows, err := s.meta.ListTenantsByTiDBCloudOrgClusterBindings(r.Context(), authorizedBindings, offset, pageSize+1)
+	rows, err := s.meta.ListTenantsByTiDBCloudResources(r.Context(), authorizedBindings, offset, pageSize+1)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "tenant list failed")
 		return
@@ -275,12 +270,13 @@ func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {
 		nextPage = page + 1
 	}
 	out := make([]adminTenantResponse, 0, len(rows))
-	for _, row := range rows {
+	for i := range rows {
+		row := &rows[i]
 		var quota *adminTenantQuotaSummary
 		if includeQuota {
-			quota = s.adminTenantQuotaSummary(r.Context(), &row.Tenant)
+			quota = s.adminTenantQuotaSummary(r.Context(), row)
 		}
-		out = append(out, s.adminTenantResponse(&row.Tenant, &row.Binding, quota))
+		out = append(out, s.adminTenantResponse(row, nil, quota))
 	}
 	writeJSON(w, http.StatusOK, adminTenantListResponse{Tenants: out, Page: page, PageSize: pageSize, NextPage: nextPage})
 }
@@ -331,8 +327,14 @@ func (s *Server) handleAdminTenantQuotaSet(w http.ResponseWriter, r *http.Reques
 		errJSON(w, http.StatusConflict, err.Error())
 		return
 	}
-	if err := s.applyQuotaSet(r.Context(), "admin_tenant_quota_set", t, cred, quotaReq); err != nil {
-		writeQuotaSetError(w, r.Context(), err, "update")
+	var applyErr error
+	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
+		applyErr = s.applySharedQuotaSet(r.Context(), t, quotaReq)
+	} else {
+		applyErr = s.applyQuotaSet(r.Context(), "admin_tenant_quota_set", t, cred, quotaReq)
+	}
+	if applyErr != nil {
+		writeQuotaSetError(w, r.Context(), applyErr, "update")
 		return
 	}
 	s.writeAdminQuotaResponse(w, r, t)
@@ -362,6 +364,11 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 	}
 	if t.Status == meta.TenantDeleted {
 		errJSON(w, http.StatusNotFound, "tenant not found")
+		return
+	}
+	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
+		s.handleSharedTenantDelete(w, r, t)
+		s.forgetTiDBCloudRBACList(cred)
 		return
 	}
 	if t.StorageNamespaceID != "" {
@@ -443,12 +450,19 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 		errJSON(w, http.StatusInternalServerError, "tenant lookup failed")
 		return nil, nil, false
 	}
-	if t.Provider != tenant.ProviderTiDBCloudNative {
-		errJSON(w, http.StatusConflict, "admin tenant API is only supported for tidb_cloud_native tenants")
-		return nil, nil, false
-	}
 	if t.Status == meta.TenantDeleted {
 		errJSON(w, http.StatusNotFound, "tenant not found")
+		return nil, nil, false
+	}
+	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
+		if _, err := s.authorizeSharedQuotaCredentials(r.Context(), t, cred, adminTenantMetricPath(loadQuota, allowDeletingMissingCluster)); err != nil {
+			writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
+			return nil, nil, false
+		}
+		return t, nil, true
+	}
+	if t.Provider != tenant.ProviderTiDBCloudNative {
+		errJSON(w, http.StatusConflict, "admin tenant API is only supported for tidb_cloud_native or tidb_cloud_native_shared tenants")
 		return nil, nil, false
 	}
 	binding, err := s.meta.GetTenantTiDBCloudOrgBinding(r.Context(), tenantID)

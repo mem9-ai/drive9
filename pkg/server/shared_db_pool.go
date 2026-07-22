@@ -230,26 +230,61 @@ func (s *Server) scheduleManagedSharedDBContinuations(ctx context.Context, dbIDs
 			if workerCtx.Err() != nil {
 				return
 			}
-			for attempt := 0; attempt < 2; attempt++ {
-				err := s.continueManagedSharedDBPool(workerCtx, dbID, cred)
-				if err == nil {
-					break
+			poolCtx := workerCtx
+			if poolInfo, err := s.meta.GetSharedDB(workerCtx, dbID); err == nil {
+				poolCtx = logger.WithContext(workerCtx, logger.FromContext(workerCtx).With(
+					zap.Int64("db_pool_id", poolInfo.ID),
+					zap.String("db_pool_uuid", poolInfo.UUID),
+					zap.String("tidbcloud_org_id", poolInfo.TiDBCloudOrganizationID),
+				))
+			}
+			err := retryManagedSharedDBContinuation(poolCtx, func() error {
+				poolInfo, loadErr := s.meta.GetSharedDB(poolCtx, dbID)
+				if loadErr != nil {
+					return loadErr
 				}
-				if attempt == 1 {
-					logger.Warn(workerCtx, "managed_shared_db_pool_continue_failed",
-						zap.Int64("db_pool_id", dbID), zap.Error(err))
-					break
+				if poolInfo.Status != meta.SharedDBStatusProvisioning {
+					return nil
 				}
-				timer := time.NewTimer(time.Second)
-				select {
-				case <-workerCtx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
-				}
+				return s.continueManagedSharedDBPool(poolCtx, dbID, cred)
+			})
+			if err != nil && poolCtx.Err() == nil {
+				logger.Warn(poolCtx, "managed_shared_db_pool_continue_failed", zap.Error(err))
 			}
 		}
 	})
+}
+
+func retryManagedSharedDBContinuation(ctx context.Context, continuePool func() error) error {
+	deadline := time.Now().Add(schemaInitRetryWindow)
+	backoff := schemaInitInitialBackoff
+	attempt := 1
+	for {
+		err := continuePool()
+		if err == nil {
+			return nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return err
+		}
+		logger.Warn(ctx, "managed_shared_db_pool_continue_retry",
+			zap.Int("attempt", attempt),
+			zap.Duration("retry_in", min(backoff, remaining)),
+			zap.Duration("remaining", remaining),
+			zap.Error(err))
+		timer := time.NewTimer(min(backoff, remaining))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if backoff < schemaInitMaxBackoff {
+			backoff = min(backoff*2, schemaInitMaxBackoff)
+		}
+		attempt++
+	}
 }
 
 func (s *Server) resumeManagedSharedDBPoolsWithCtx(ctx context.Context) {
@@ -268,7 +303,10 @@ func (s *Server) resumeManagedSharedDBPoolsWithCtx(ctx context.Context) {
 		}
 		if err := s.continueManagedSharedDBPool(ctx, row.ID, *cred); err != nil {
 			logger.Warn(ctx, "managed_shared_db_pool_resume_failed",
-				zap.Int64("db_pool_id", row.ID), zap.Error(err))
+				zap.Int64("db_pool_id", row.ID),
+				zap.String("db_pool_uuid", row.UUID),
+				zap.String("tidbcloud_org_id", row.TiDBCloudOrganizationID),
+				zap.Error(err))
 		}
 	}
 }
@@ -572,7 +610,10 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 		}, cred, tenant.QuotaUpdateOptions{TiDBCloudSpendingLimitMonthly: poolInfo.SpendingLimit})
 		if patchErr != nil {
 			logger.Warn(ctx, "managed_shared_db_spending_limit_sync_failed",
-				zap.Int64("db_pool_id", dbID), zap.Error(patchErr))
+				zap.Int64("db_pool_id", dbID),
+				zap.String("db_pool_uuid", poolInfo.UUID),
+				zap.String("tidbcloud_org_id", poolInfo.TiDBCloudOrganizationID),
+				zap.Error(patchErr))
 		}
 	}
 	if err := s.meta.ActivateSharedDBPool(ctx, dbID); err != nil {

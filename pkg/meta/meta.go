@@ -2597,6 +2597,65 @@ func (s *Store) ListTenantsByTiDBCloudOrgClusterBindings(ctx context.Context, bi
 	return scanTenantBindingRows(rows)
 }
 
+// ListTenantsByTiDBCloudResources lists dedicated tenants through their
+// tenant binding and shared tenants through the physical db_pool resource.
+// Pagination is applied after both provider sources are combined.
+func (s *Store) ListTenantsByTiDBCloudResources(ctx context.Context, bindings []TenantTiDBCloudOrgBinding, offset, limit int) (out []Tenant, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_tenants_by_tidbcloud_resources", start, &err)
+	bindings = compactTiDBCloudOrgClusterBindings(bindings)
+	if len(bindings) == 0 {
+		return []Tenant{}, nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	placeholders := make([]string, 0, len(bindings))
+	resourceArgs := make([]any, 0, len(bindings)*2)
+	for _, binding := range bindings {
+		placeholders = append(placeholders, "(?, ?)")
+		resourceArgs = append(resourceArgs, binding.OrganizationID, binding.ClusterID)
+	}
+	resources := strings.Join(placeholders, ",")
+	args := []any{TenantDeleted, tidbCloudNativeProvider}
+	args = append(args, resourceArgs...)
+	args = append(args, TenantPoolBindingFree, tidbCloudNativeSharedProvider)
+	args = append(args, resourceArgs...)
+	args = append(args, limit, offset)
+	query := `SELECT
+			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
+			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
+			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
+			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at
+		FROM tenants t
+		WHERE t.status <> ? AND (
+			(t.provider = ? AND EXISTS (
+				SELECT 1 FROM tenant_tidbcloud_org_bindings b
+				WHERE b.tenant_id = t.id
+					AND (b.organization_id, b.cluster_id) IN (` + resources + `)
+					AND b.pool_status <> ?
+			)) OR
+			(t.provider = ? AND EXISTS (
+				SELECT 1 FROM fs_registry f
+				JOIN tenant_placements p ON p.fs_id = f.fs_id
+				JOIN db_pool d ON d.db_id = p.db_id
+				WHERE f.tenant_id = t.id
+					AND (d.org_id, d.cluster_id) IN (` + resources + `)
+			))
+		)
+		ORDER BY t.created_at DESC, t.id DESC
+		LIMIT ? OFFSET ?`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanTenantRows(rows)
+}
+
 func compactStrings(values []string) []string {
 	out := make([]string, 0, len(values))
 	seen := make(map[string]bool, len(values))

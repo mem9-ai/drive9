@@ -633,6 +633,33 @@ func TestManagedSharedDBContinuationWaitsForConnectionMetadata(t *testing.T) {
 	}
 }
 
+func TestRetryManagedSharedDBContinuationRecoversAfterMoreThanTwoFailures(t *testing.T) {
+	origWindow, origInitialBackoff, origMaxBackoff := schemaInitRetryWindow, schemaInitInitialBackoff, schemaInitMaxBackoff
+	schemaInitRetryWindow = time.Second
+	schemaInitInitialBackoff = time.Millisecond
+	schemaInitMaxBackoff = 2 * time.Millisecond
+	t.Cleanup(func() {
+		schemaInitRetryWindow = origWindow
+		schemaInitInitialBackoff = origInitialBackoff
+		schemaInitMaxBackoff = origMaxBackoff
+	})
+
+	attempts := 0
+	err := retryManagedSharedDBContinuation(context.Background(), func() error {
+		attempts++
+		if attempts <= 3 {
+			return errors.New("root authentication is not ready")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryManagedSharedDBContinuation error = %v", err)
+	}
+	if attempts != 4 {
+		t.Fatalf("attempts = %d, want 4", attempts)
+	}
+}
+
 func TestManagedSharedDBBatchCreateUsesAllocationLock(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

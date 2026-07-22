@@ -219,15 +219,11 @@ func TestSharedTenantDeleteFullPurgePath(t *testing.T) {
 	}
 }
 
-// TestAdminTenantCreateRejectsSharedPoolOrg proves the admin tenant API fails
-// closed when the caller's org matches a registered shared pool: no claim, no
-// provision, no tenant row — instead of creating a shared tenant with no
-// valid admin lifecycle.
-func TestAdminTenantCreateRejectsSharedPoolOrg(t *testing.T) {
+func TestAdminTenantCreateUsesRegisteredSharedPool(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
 	rt.prov.listPages = []*tenant.ManagedClusterListResult{
-		{Clusters: []tenant.CloudClusterInfo{{OrganizationID: "org-shared-1"}}},
+		{Clusters: []tenant.CloudClusterInfo{{ClusterID: "cluster-org-probe", OrganizationID: "org-shared-1"}}},
 	}
 	if _, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-1",
@@ -256,29 +252,42 @@ func TestAdminTenantCreateRejectsSharedPoolOrg(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
 	}
 	var tenantCount int
 	if err := rt.meta.DB().QueryRow("SELECT COUNT(*) FROM tenants").Scan(&tenantCount); err != nil {
 		t.Fatal(err)
 	}
-	// Only the pre-existing quota runtime tenant may exist.
-	if tenantCount != 1 {
-		t.Fatalf("tenants = %d, want 1 (no admin-created tenant)", tenantCount)
+	if tenantCount != 2 {
+		t.Fatalf("tenants = %d, want 2", tenantCount)
 	}
 }
 
-// TestAdminTenantGetRejectsSharedProvider documents the admin/shared
-// ownership contract from the other side: a shared-schema tenant (provider
-// tidb_cloud_native_shared) is rejected by admin authorization instead of
-// being managed as a dedicated cluster.
-func TestAdminTenantGetRejectsSharedProvider(t *testing.T) {
+func TestAdminTenantGetAuthorizesSharedProviderThroughPhysicalPool(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	// The server runs the cloud-native provisioner; this tenant is placed on
-	// a shared pool, so its persisted provider is the shared one.
-	if err := rt.meta.UpdateTenantProvider(context.Background(), rt.tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
+	ctx := context.Background()
+	if err := rt.meta.UpdateTenantProvider(ctx, rt.tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
 		t.Fatalf("UpdateTenantProvider: %v", err)
+	}
+	fsID, err := rt.meta.EnsureFsID(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-shared-admin", ClusterID: "cluster-shared-admin",
+		Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE db_pool SET cluster_id = ? WHERE db_id = ?", "cluster-shared-admin", dbID); err != nil {
+		t.Fatalf("set shared cluster_id: %v", err)
+	}
+	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+	}); err != nil {
+		t.Fatalf("UpsertTenantPlacement: %v", err)
 	}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
@@ -294,8 +303,131 @@ func TestAdminTenantGetRejectsSharedProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := rt.prov.getCalls.Load(); got != 1 {
+		t.Fatalf("physical pool authorization calls = %d, want 1", got)
+	}
+	cluster := rt.prov.lastClusterSnapshot()
+	if cluster == nil || cluster.ClusterID != "cluster-shared-admin" || cluster.OrganizationID != "org-shared-admin" {
+		t.Fatalf("authorized physical cluster = %#v", cluster)
+	}
+}
+
+func TestAdminTenantQuotaSetSharedUpdatesVirtualQuotaOnly(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ctx := context.Background()
+	if err := rt.meta.UpdateTenantProvider(ctx, rt.tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
+		t.Fatalf("UpdateTenantProvider: %v", err)
+	}
+	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE tenants SET cluster_id = NULL WHERE id = ?", rt.tenantID); err != nil {
+		t.Fatalf("clear tenant cluster_id: %v", err)
+	}
+	fsID, err := rt.meta.EnsureFsID(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-shared-admin", Host: "shared.example.com", Port: 4000,
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE db_pool SET cluster_id = ? WHERE db_id = ?", "cluster-shared-admin", dbID); err != nil {
+		t.Fatalf("set shared cluster_id: %v", err)
+	}
+	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+	}); err != nil {
+		t.Fatalf("UpsertTenantPlacement: %v", err)
+	}
+	if err := rt.meta.EnsureQuotaUsageRow(ctx, rt.tenantID); err != nil {
+		t.Fatalf("EnsureQuotaUsageRow: %v", err)
+	}
+	virtualSpendingLimit := int64(100000)
+	if err := rt.meta.SetQuotaConfig(ctx, &meta.QuotaConfig{
+		TenantID: rt.tenantID, MaxStorageBytes: meta.DefaultMaxStorageBytes(),
+		MaxFileSizeBytes: meta.DefaultMaxFileSizeBytes(), TiDBCloudSpendingLimit: &virtualSpendingLimit,
+	}); err != nil {
+		t.Fatalf("SetQuotaConfig: %v", err)
+	}
+
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+	resp := postJSON(t, ts.URL+"/v1/admin/tenants/"+rt.tenantID+"/quota", map[string]any{
+		"public_key": "pk", "private_key": "sk", "max_storage_size": int64(200),
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := rt.prov.markCalls.Load(); got != 0 {
+		t.Fatalf("physical quota mark calls = %d, want 0", got)
+	}
+	if got := rt.prov.updateCalls.Load(); got != 0 {
+		t.Fatalf("physical quota update calls = %d, want 0", got)
+	}
+	cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatalf("GetQuotaConfig: %v", err)
+	}
+	if cfg.MaxStorageBytes != 200*quotaStorageSizeBytes {
+		t.Fatalf("MaxStorageBytes = %d, want %d", cfg.MaxStorageBytes, 200*quotaStorageSizeBytes)
+	}
+}
+
+func TestAdminTenantDeleteSharedNeverDeprovisionsPhysicalPool(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ctx := context.Background()
+	if err := rt.meta.UpdateTenantProvider(ctx, rt.tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
+		t.Fatalf("UpdateTenantProvider: %v", err)
+	}
+	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE tenants SET cluster_id = NULL WHERE id = ?", rt.tenantID); err != nil {
+		t.Fatalf("clear tenant cluster_id: %v", err)
+	}
+	fsID, err := rt.meta.EnsureFsID(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-shared-admin-delete", Host: "127.0.0.1", Port: 1,
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE db_pool SET cluster_id = ? WHERE db_id = ?", "cluster-shared-admin-delete", dbID); err != nil {
+		t.Fatalf("set shared cluster_id: %v", err)
+	}
+	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+	}); err != nil {
+		t.Fatalf("UpsertTenantPlacement: %v", err)
+	}
+
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+	req, err := http.NewRequest(http.MethodDelete, ts.URL+"/v1/admin/tenants/"+rt.tenantID,
+		bytes.NewBufferString(`{"public_key":"pk","private_key":"sk"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d for unreachable shared DB purge", resp.StatusCode, http.StatusInternalServerError)
+	}
+	if got := rt.prov.markCalls.Load(); got != 0 {
+		t.Fatalf("physical quota mark calls = %d, want 0", got)
+	}
+	if got := rt.prov.deprovisionCalls.Load(); got != 0 {
+		t.Fatalf("physical cluster deprovision calls = %d, want 0", got)
 	}
 }
 

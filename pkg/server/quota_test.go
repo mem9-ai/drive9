@@ -1382,6 +1382,33 @@ func TestAdminTenantListFiltersByAuthorizedClusters(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	sharedTenantID := "tenant-shared-authorized"
+	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+		ID: sharedTenantID, Status: meta.TenantActive, Kind: meta.TenantKindLive,
+		Provider: tenant.ProviderTiDBCloudNativeShared, SchemaVersion: 1, DBPasswordCipher: []byte{},
+		CreatedAt: now.Add(3 * time.Second), UpdatedAt: now.Add(3 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sharedFsID, err := rt.meta.ResolveFsID(ctx, sharedTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedDBID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-1", Host: "shared-list.example.com", Port: 4000,
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE db_pool SET cluster_id = ? WHERE db_id = ?", "cluster-allowed", sharedDBID); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: sharedFsID, DbID: sharedDBID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	otherTenantID := "tenant-other-cluster"
 	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               otherTenantID,
@@ -1471,8 +1498,8 @@ func TestAdminTenantListFiltersByAuthorizedClusters(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Tenants) != 1 || out.Tenants[0].TenantID != rt.tenantID {
-		t.Fatalf("tenants = %#v, want only authorized tenant %s", out.Tenants, rt.tenantID)
+	if len(out.Tenants) != 2 || out.Tenants[0].TenantID != sharedTenantID || out.Tenants[1].TenantID != rt.tenantID {
+		t.Fatalf("tenants = %#v, want authorized shared tenant %s and dedicated tenant %s", out.Tenants, sharedTenantID, rt.tenantID)
 	}
 }
 

@@ -3,6 +3,8 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"go.uber.org/zap"
@@ -28,6 +30,17 @@ func SharedTiDBSchemaStatements() []string {
 // SQL. A physical DB pool stores this value only after its idempotent ensure
 // succeeds, so normal opens can skip repeated DDL work.
 var CurrentSharedTiDBSchemaVersion = currentTiDBTenantSchemaVersion(SharedTiDBSchemaStatements())
+
+type sharedSchemaDiffError struct {
+	diffs []tidbSchemaDiff
+}
+
+func (e *sharedSchemaDiffError) Error() string {
+	if e == nil || len(e.diffs) == 0 {
+		return ""
+	}
+	return "shared schema contract mismatch: " + strings.Join(summarizeTiDBSchemaDiffs(e.diffs), "; ")
+}
 
 // SharedMySQLSchemaStatements is the plain-MySQL variant of
 // SharedTiDBSchemaStatements, derived by removing TiDB-only keywords. Use it
@@ -80,6 +93,9 @@ func EnsureSharedSchema(ctx context.Context, db *sql.DB) error {
 	if err := ExecSchemaStatementsParallelByTableContext(ctx, db, stmts); err != nil {
 		return err
 	}
+	if err := ensureSharedSchemaContract(ctx, db, stmts); err != nil {
+		return err
+	}
 	if !IsTiDBCluster(ctx, db) {
 		return nil
 	}
@@ -90,6 +106,43 @@ func EnsureSharedSchema(ctx context.Context, db *sql.DB) error {
 		logger.Warn(ctx, "shared_schema_optional_indexes_skipped",
 			zap.Int("skipped_count", skipped),
 			zap.String("reason", "unsupported_tidb_features"))
+	}
+	return nil
+}
+
+func ensureSharedSchemaContract(ctx context.Context, db *sql.DB, stmts []string) error {
+	spec, err := tidbSchemaSpecFromStatements(stmts)
+	if err != nil {
+		return fmt.Errorf("build shared schema contract: %w", err)
+	}
+	const maxRepairPasses = 6
+	for range maxRepairPasses {
+		diffs, _, err := diffTiDBTables(ctx, db, spec.tables)
+		if err != nil {
+			return err
+		}
+		if len(diffs) == 0 {
+			return nil
+		}
+		for _, diff := range diffs {
+			if diff.repairSQL == "" || !isSafeTiDBRepairDiff(diff) {
+				return &sharedSchemaDiffError{diffs: diffs}
+			}
+		}
+		repairs := plannedTiDBSchemaRepairs(diffs)
+		if len(repairs) == 0 {
+			return &sharedSchemaDiffError{diffs: diffs}
+		}
+		if err := applyTiDBSchemaRepairs(ctx, db, repairs); err != nil {
+			return err
+		}
+	}
+	diffs, _, err := diffTiDBTables(ctx, db, spec.tables)
+	if err != nil {
+		return err
+	}
+	if len(diffs) > 0 {
+		return &sharedSchemaDiffError{diffs: diffs}
 	}
 	return nil
 }

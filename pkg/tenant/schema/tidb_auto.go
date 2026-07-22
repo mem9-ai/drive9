@@ -712,6 +712,7 @@ type tidbColumnSpec struct {
 
 type tidbIndexSpec struct {
 	createSQL string
+	columns   []string
 }
 
 type tidbPrimaryKeySpec struct {
@@ -1957,7 +1958,10 @@ func tidbSchemaSpecFromStatements(stmts []string) (tidbSchemaSpec, error) {
 		if tables[tableIndex].indexes == nil {
 			tables[tableIndex].indexes = make(map[string]tidbIndexSpec)
 		}
-		tables[tableIndex].indexes[indexName] = tidbIndexSpec{createSQL: strings.TrimSpace(createSQL)}
+		tables[tableIndex].indexes[indexName] = tidbIndexSpec{
+			createSQL: strings.TrimSpace(createSQL),
+			columns:   parseIndexColumnList(createSQL),
+		}
 	}
 	return tidbSchemaSpec{tables: tables}, nil
 }
@@ -1983,7 +1987,10 @@ func parseCreateTableSpec(stmt string) (tidbTableSpec, bool, error) {
 			continue
 		}
 		if indexName, createSQL, ok := parseInlineIndexDefinition(tableName, def); ok {
-			indexes[indexName] = tidbIndexSpec{createSQL: createSQL}
+			indexes[indexName] = tidbIndexSpec{
+				createSQL: createSQL,
+				columns:   parseIndexColumnList(createSQL),
+			}
 			continue
 		}
 		if isConstraintDefinition(def) {
@@ -2426,7 +2433,10 @@ func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMet
 			}
 			if observedIndexColumnsOK && isPathHashIndexName(table.name, name) {
 				observedColumns := observedIndexColumns[strings.ToLower(name)]
-				expectedColumns := expectedPathHashIndexColumns(table.name, name)
+				expectedColumns := spec.columns
+				if len(expectedColumns) == 0 {
+					expectedColumns = expectedPathHashIndexColumns(table.name, name)
+				}
 				if len(expectedColumns) > 0 && len(observedColumns) > 0 && !equalStringSlices(observedColumns, expectedColumns) {
 					diffs = append(diffs, tidbSchemaDiff{
 						kind:      tidbSchemaDiffMissingIndex,

@@ -2,6 +2,8 @@ package schema
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 
@@ -139,6 +141,53 @@ func TestSharedSchemaStatementsForDBSelectsMySQL(t *testing.T) {
 	for i := range want {
 		if schemaspec.NormalizeSQLFragment(got[i]) != schemaspec.NormalizeSQLFragment(want[i]) {
 			t.Errorf("statement %d differs from the MySQL variant:\nForDB: %s\nMySQL: %s", i, got[i], want[i])
+		}
+	}
+}
+
+func TestEnsureSharedSchemaRejectsExistingStandaloneTableShape(t *testing.T) {
+	db := testmysql.OpenDB(t, testDSN)
+	testmysql.ResetDB(t, db)
+	dropSharedSchemaTables(t, db)
+	t.Cleanup(func() { dropSharedSchemaTables(t, db) })
+	if _, err := db.ExecContext(context.Background(), `CREATE TABLE file_gc_tasks (
+		task_id VARCHAR(64) PRIMARY KEY,
+		file_id VARCHAR(64) NOT NULL,
+		storage_type VARCHAR(32) NOT NULL
+	)`); err != nil {
+		t.Fatalf("create standalone file_gc_tasks: %v", err)
+	}
+
+	err := EnsureSharedSchema(context.Background(), db)
+	if err == nil {
+		t.Fatal("EnsureSharedSchema succeeded with standalone file_gc_tasks shape")
+	}
+	var diffErr *sharedSchemaDiffError
+	if !errors.As(err, &diffErr) {
+		t.Fatalf("EnsureSharedSchema error = %v, want sharedSchemaDiffError", err)
+	}
+	if !strings.Contains(err.Error(), "file_gc_tasks") || !strings.Contains(err.Error(), "primary key") {
+		t.Fatalf("EnsureSharedSchema error = %v, want file_gc_tasks primary-key mismatch", err)
+	}
+}
+
+func TestEnsureSharedSchemaValidatesFreshSchema(t *testing.T) {
+	db := testmysql.OpenDB(t, testDSN)
+	testmysql.ResetDB(t, db)
+	dropSharedSchemaTables(t, db)
+	t.Cleanup(func() { dropSharedSchemaTables(t, db) })
+	if err := EnsureSharedSchema(context.Background(), db); err != nil {
+		t.Fatalf("EnsureSharedSchema fresh database: %v", err)
+	}
+}
+
+func dropSharedSchemaTables(t *testing.T, db interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}) {
+	t.Helper()
+	for _, tableName := range sharedSchemaTables {
+		if _, err := db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+tableName); err != nil {
+			t.Fatalf("drop shared table %s: %v", tableName, err)
 		}
 	}
 }
