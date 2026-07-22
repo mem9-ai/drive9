@@ -215,6 +215,33 @@ func TestCreateManagedSharedDBPoolRejectsUnboundedOrInvalidPolicy(t *testing.T) 
 	}
 }
 
+func TestMarkSharedDBPoolFailedRejectsPoolWithTenants(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := int64(10_000)
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-failed-with-tenants", ProvisioningKey: bytes.Repeat([]byte{7}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 10, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE db_pool SET tenant_count = 1 WHERE db_id = ?`, dbID); err != nil {
+		t.Fatalf("seed tenant count: %v", err)
+	}
+
+	if err := s.MarkSharedDBPoolFailed(ctx, dbID); err == nil {
+		t.Fatal("MarkSharedDBPoolFailed succeeded for a pool with tenants")
+	}
+	got, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if got.Status != SharedDBStatusProvisioning {
+		t.Fatalf("status = %q, want provisioning", got.Status)
+	}
+}
+
 func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()

@@ -389,12 +389,25 @@ func (s *Store) ActivateSharedDBPool(ctx context.Context, dbID int64) (err error
 }
 
 func (s *Store) MarkSharedDBPoolFailed(ctx context.Context, dbID int64) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE db_pool SET status = ? WHERE db_id = ? AND status = ?`,
+	res, err := s.db.ExecContext(ctx, `UPDATE db_pool SET status = ?
+		WHERE db_id = ? AND status = ? AND tenant_count = 0`,
 		SharedDBStatusFailed, dbID, SharedDBStatusProvisioning)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
+		var status string
+		var tenantCount int
+		if err := s.db.QueryRowContext(ctx, `SELECT status, tenant_count FROM db_pool WHERE db_id = ?`, dbID).
+			Scan(&status, &tenantCount); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if status == SharedDBStatusProvisioning && tenantCount > 0 {
+			return fmt.Errorf("db pool %d has %d placed tenants and cannot be marked failed", dbID, tenantCount)
+		}
 		return ErrNotFound
 	}
 	return nil
@@ -471,18 +484,18 @@ func (s *Store) FindSharedDBForAllocation(ctx context.Context, organizationID st
 }
 
 // FindSharedDBForEmergency selects the least-loaded active managed pool below
-// the caller-computed hard cap. It is used only after a physical create failure
-// on a direct request; refill and prewarm must never call it.
-func (s *Store) FindSharedDBForEmergency(ctx context.Context, organizationID string, hardCap int, tenantSpendingLimit int64) (*SharedDB, error) {
+// its own runtime-derived hard cap. It is used only after a physical create
+// failure on a direct request; refill and prewarm must never call it.
+func (s *Store) FindSharedDBForEmergency(ctx context.Context, organizationID string, hardCapRatio float64, tenantSpendingLimit int64) (*SharedDB, error) {
 	if organizationID == "" {
 		return nil, fmt.Errorf("organization id is required")
 	}
-	if hardCap <= 0 || tenantSpendingLimit < 0 {
+	if hardCapRatio <= 1 || tenantSpendingLimit < 0 {
 		return nil, fmt.Errorf("invalid emergency capacity arguments")
 	}
 	query := "SELECT " + sharedDBSelectColumns + " FROM db_pool d " +
 		"WHERE d.org_id = ? AND d.`role` = ? AND d.status = ? " +
-		"AND d.max_tenants > 0 AND d.tenant_count < ? AND d.spending_limit IS NOT NULL " +
+		"AND d.max_tenants > 0 AND d.tenant_count < CEIL(d.max_tenants * ?) AND d.spending_limit IS NOT NULL " +
 		`AND COALESCE((SELECT SUM(q.tidbcloud_spending_limit)
 			FROM tenant_placements p
 			JOIN fs_registry f ON f.fs_id = p.fs_id
@@ -490,7 +503,7 @@ func (s *Store) FindSharedDBForEmergency(ctx context.Context, organizationID str
 			WHERE p.db_id = d.db_id), 0) + ? < d.spending_limit
 		ORDER BY d.tenant_count ASC, d.db_id ASC LIMIT 1`
 	db, err := scanSharedDBRow(s.db.QueryRowContext(ctx, query, organizationID, SharedDBRoleShared,
-		SharedDBStatusActive, hardCap, tenantSpendingLimit))
+		SharedDBStatusActive, hardCapRatio, tenantSpendingLimit))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -1007,6 +1020,8 @@ func (s *Store) completeSharedTenantProvision(ctx context.Context, tenantID, pro
 				return fmt.Errorf("sum tenant spending limits for db pool %d: %w", p.DbID, err)
 			}
 			prospective := currentSum + tenantSpendingLimit.Int64
+			// Keep strict headroom: the physical pool spending limit must remain
+			// greater than, never merely equal to, the sum of tenant virtual limits.
 			if prospective < currentSum || prospective > int64(1<<31-1) || prospective >= poolSpendingLimit.Int64 {
 				return ErrSharedDBSpendingLimitExceeded
 			}

@@ -242,6 +242,9 @@ func (s *Server) handleSharedTenantDelete(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
+	// Capacity is released before membership removal on purpose: if this
+	// delete fails, the retry-safe tenant remains deleting without hiding a
+	// slot that is already available to other allocations.
 	if err := s.meta.DeleteTenantPoolMembership(ctx, t.ID); err != nil {
 		logger.Error(ctx, "shared_tenant_pool_membership_delete_failed", zap.String("tenant_id", t.ID), zap.Error(err))
 		errJSON(w, http.StatusInternalServerError, "failed to remove shared tenant pool membership")

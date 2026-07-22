@@ -434,6 +434,12 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64, 
 	return result, err
 }
 
+// continueManagedSharedDBPoolLocked intentionally keeps the organization
+// allocation lock through physical ensure, system-user setup, schema ensure,
+// and activation. Continuations are dispatched sequentially and are not a
+// request-QPS path; the wider lock preserves the existing single-owner Cloud
+// mutation model and prevents another allocator from observing half-ready
+// connection metadata. The readiness poll is the one long wait kept outside.
 func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo *meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
 	dbID := poolInfo.ID
 	var err error

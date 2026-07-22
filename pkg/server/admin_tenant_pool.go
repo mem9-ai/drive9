@@ -1114,9 +1114,9 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 	}
 	created, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, requests, cred)
 	if createErr != nil && len(created) == 0 {
-		logger.Warn(ctx, "managed_shared_db_batch_create_ambiguous",
+		logger.Warn(ctx, "managed_shared_db_batch_create_failed",
 			zap.Int("db_pool_count", len(requests)), zap.Error(createErr))
-		return resolvedOrg, nil
+		return resolvedOrg, createErr
 	}
 	for _, info := range created {
 		if info == nil || rows[info.DBPoolID] == nil {

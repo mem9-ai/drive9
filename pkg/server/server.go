@@ -5143,6 +5143,29 @@ func (s *Server) provisionTenantOnSharedDBEmergency(ctx context.Context, tenantI
 	return s.provisionTenantOnSharedDBMode(ctx, tenantID, sharedDB, provider, keyName, opts, now, meta.SharedDBCapacityEmergency, hardCap)
 }
 
+func (s *Server) provisionTenantOnManagedSharedDB(ctx context.Context, tenantID string, sharedDB *meta.SharedDB, provider, keyName string, opts provisionTenantOptions, now time.Time) (*provisionTenantResult, error) {
+	current, err := s.meta.GetSharedDB(ctx, sharedDB.ID)
+	if err != nil {
+		return nil, err
+	}
+	identity := sharedDBAllocationIdentity(current.TiDBCloudOrganizationID, current.ProvisioningKey)
+	var result *provisionTenantResult
+	err = s.meta.WithSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
+		locked, loadErr := s.meta.GetSharedDB(lockCtx, current.ID)
+		if loadErr != nil {
+			return loadErr
+		}
+		var provisionErr error
+		result, provisionErr = s.provisionTenantOnSharedDB(lockCtx, tenantID, locked, provider, keyName, opts, now)
+		return provisionErr
+	})
+	return result, err
+}
+
+func isSharedDBReservationConflict(err error) bool {
+	return errors.Is(err, meta.ErrSharedDBCapacityExhausted) || errors.Is(err, meta.ErrSharedDBSpendingLimitExceeded)
+}
+
 func (s *Server) provisionTenantOnSharedDBMode(ctx context.Context, tenantID string, sharedDB *meta.SharedDB, provider, keyName string, opts provisionTenantOptions, now time.Time, capacityMode meta.SharedDBCapacityMode, hardCap int) (*provisionTenantResult, error) {
 	fail := func(err error) (*provisionTenantResult, error) {
 		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
@@ -5277,43 +5300,53 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 			return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
 		}
-		var res *provisionTenantResult
 		virtualLimit := s.sharedTenantVirtualSpendingLimit(opts)
-		sharedDB, created, err := s.allocateManagedSharedDB(ctx, *opts.CredentialProvisioner, virtualLimit, nil)
-		if err != nil {
-			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
-			return nil, newProvisionTenantError(http.StatusBadGateway, "failed to allocate shared database", err)
-		}
-		if sharedDB.SpendingLimit != nil && (created || sharedDB.ClusterID == "" || sharedDB.Host == "" || sharedDB.Port <= 0 || sharedDB.User == "") {
-			plannedDB := sharedDB
-			sharedDB, err = s.ensureManagedSharedDBPhysical(ctx, plannedDB.ID, *opts.CredentialProvisioner)
-			if err != nil {
-				orgID, orgErr := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner)
-				if orgErr == nil {
-					hardCap, hardErr := s.managedSharedDBHardCap(plannedDB.MaxTenants)
-					if hardErr == nil {
-						fallback, findErr := s.meta.FindSharedDBForEmergency(ctx, orgID, hardCap, virtualLimit)
+		var lastConflict error
+		for attempt := 0; attempt < 2; attempt++ {
+			sharedDB, created, allocateErr := s.allocateManagedSharedDB(ctx, *opts.CredentialProvisioner, virtualLimit, nil)
+			if allocateErr != nil {
+				_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+				return nil, newProvisionTenantError(http.StatusBadGateway, "failed to allocate shared database", allocateErr)
+			}
+			if sharedDB.SpendingLimit != nil && (created || sharedDB.ClusterID == "" || sharedDB.Host == "" || sharedDB.Port <= 0 || sharedDB.User == "") {
+				sharedDB, err = s.ensureManagedSharedDBPhysical(ctx, sharedDB.ID, *opts.CredentialProvisioner)
+				if err != nil {
+					orgID, orgErr := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner)
+					if orgErr == nil {
+						fallback, findErr := s.meta.FindSharedDBForEmergency(ctx, orgID, s.sharedDBHardCapRatio, virtualLimit)
 						if findErr == nil {
-							res, findErr = s.provisionTenantOnSharedDBEmergency(ctx, tenantID, fallback, provider, keyName, opts, now, hardCap)
-							if findErr == nil {
-								return res, nil
+							hardCap, hardErr := s.managedSharedDBHardCap(fallback.MaxTenants)
+							if hardErr == nil {
+								res, reserveErr := s.provisionTenantOnSharedDBEmergency(ctx, tenantID, fallback, provider, keyName, opts, now, hardCap)
+								if reserveErr == nil {
+									return res, nil
+								}
+								if isSharedDBReservationConflict(reserveErr) {
+									lastConflict = reserveErr
+									continue
+								}
 							}
 						}
 					}
+					_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+					return nil, newProvisionTenantError(http.StatusBadGateway, "failed to create shared database", err)
+				}
+			}
+			res, reserveErr := s.provisionTenantOnManagedSharedDB(ctx, tenantID, sharedDB, provider, keyName, opts, now)
+			if reserveErr != nil {
+				if isSharedDBReservationConflict(reserveErr) {
+					lastConflict = reserveErr
+					continue
 				}
 				_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
-				return nil, newProvisionTenantError(http.StatusBadGateway, "failed to create shared database", err)
+				return nil, reserveErr
 			}
+			if created || sharedDB.Status == meta.SharedDBStatusProvisioning {
+				s.scheduleManagedSharedDBContinuation(ctx, sharedDB.ID, *opts.CredentialProvisioner)
+			}
+			return res, nil
 		}
-		res, err = s.provisionTenantOnSharedDB(ctx, tenantID, sharedDB, provider, keyName, opts, now)
-		if err != nil {
-			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
-			return nil, err
-		}
-		if created || sharedDB.Status == meta.SharedDBStatusProvisioning {
-			s.scheduleManagedSharedDBContinuation(ctx, sharedDB.ID, *opts.CredentialProvisioner)
-		}
-		return res, nil
+		return nil, lastConflict
 	}
 
 	// Shared-pool placement: when a shared-schema database is registered for
