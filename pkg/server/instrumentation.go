@@ -301,6 +301,8 @@ type serverMetrics struct {
 	tenantInFlight    map[string]int64
 	tenantPoolBindMu  sync.Mutex
 	tenantPoolBinding map[tenantPoolBindingMetricKey]struct{}
+	sharedDBPoolMu    sync.Mutex
+	sharedDBPool      map[sharedDBPoolMetricKey]struct{}
 }
 
 func newServerMetrics() *serverMetrics {
@@ -310,6 +312,7 @@ func newServerMetrics() *serverMetrics {
 		routes:            map[string]int64{},
 		tenantInFlight:    map[string]int64{},
 		tenantPoolBinding: map[tenantPoolBindingMetricKey]struct{}{},
+		sharedDBPool:      map[sharedDBPoolMetricKey]struct{}{},
 	}
 }
 
@@ -849,8 +852,18 @@ func (s *Server) tenantMetricTiDBCloudOrgID(ctx context.Context, t *meta.Tenant)
 }
 
 func tenantMetricTiDBCloudOrgIDFromMeta(ctx context.Context, metaStore *meta.Store, t *meta.Tenant) string {
-	if metaStore == nil || t == nil || strings.TrimSpace(t.ID) == "" || t.Provider != tenant.ProviderTiDBCloudNative {
+	if metaStore == nil || t == nil || strings.TrimSpace(t.ID) == "" || !tenant.UsesTiDBCloudNativeCredentials(t.Provider) {
 		return defaultTenantMetricTiDBCloudOrgID
+	}
+	if tenant.IsSharedSchemaProvider(t.Provider) {
+		pool, err := metaStore.GetSharedDBForTenant(ctx, t.ID)
+		if err != nil {
+			if !errors.Is(err, meta.ErrNotFound) {
+				logger.Warn(ctx, "server_metric_shared_org_lookup_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+			}
+			return defaultTenantMetricTiDBCloudOrgID
+		}
+		return normalizeTenantMetricTiDBCloudOrgID(pool.TiDBCloudOrganizationID)
 	}
 	if orgID := strings.TrimSpace(t.TiDBCloudOrgID); orgID != "" {
 		return normalizeTenantMetricTiDBCloudOrgID(orgID)

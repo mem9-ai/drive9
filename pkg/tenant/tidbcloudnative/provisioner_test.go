@@ -404,6 +404,187 @@ func TestBatchProvisionFreeClustersUsesBatchCreateAndFreeLabel(t *testing.T) {
 	}
 }
 
+func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
+	var gotBody struct {
+		Requests []struct {
+			Cluster struct {
+				DisplayName   string            `json:"displayName"`
+				RootPassword  string            `json:"rootPassword"`
+				Labels        map[string]string `json:"labels"`
+				SpendingLimit struct {
+					Monthly int32 `json:"monthly"`
+				} `json:"spendingLimit"`
+			} `json:"cluster"`
+		} `json:"requests"`
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-shared", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/v1beta1/clusters:batchCreate" {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"clusters": []map[string]any{
+			{
+				"clusterId": "cluster-pool-41", "state": "CREATING",
+				"labels": map[string]string{
+					TiDBCloudOrganizationLabel: "org-1", Drive9DBPoolIDLabel: "41",
+				},
+			},
+			{
+				"clusterId": "cluster-pool-42", "state": "CREATING",
+				"labels": map[string]string{
+					TiDBCloudOrganizationLabel: "org-1", Drive9DBPoolIDLabel: "42",
+				},
+			},
+		}})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL, cloudProvider: "aws", region: "us-east-1",
+		defaultDatabaseName: DefaultDatabaseName, client: ts.Client(),
+	}
+	got, err := p.BatchProvisionSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolCreateRequest{
+		{DBPoolID: 41, RootPassword: "durable-password-41", SpendingLimitMonthly: 10_000_000},
+		{DBPoolID: 42, RootPassword: "durable-password-42", SpendingLimitMonthly: 10_000_000},
+	}, tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
+	if err != nil {
+		t.Fatalf("BatchProvisionSharedDBPoolsWithCredentials: %v", err)
+	}
+	if len(gotBody.Requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(gotBody.Requests))
+	}
+	for i, request := range gotBody.Requests {
+		id := fmt.Sprintf("%d", 41+i)
+		if request.Cluster.DisplayName != "tidbcloud-fs-"+id {
+			t.Fatalf("request %d displayName = %q", i, request.Cluster.DisplayName)
+		}
+		if request.Cluster.RootPassword != "durable-password-"+id || request.Cluster.SpendingLimit.Monthly != 10_000_000 {
+			t.Fatalf("request %d password/spending invalid: %+v", i, request.Cluster)
+		}
+		wantLabels := map[string]string{
+			Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+			Drive9DBPoolIDLabel: id,
+		}
+		for key, want := range wantLabels {
+			if request.Cluster.Labels[key] != want {
+				t.Fatalf("request %d label %s = %q, want %q", i, key, request.Cluster.Labels[key], want)
+			}
+		}
+		if _, ok := request.Cluster.Labels[Drive9PoolStatusLabel]; ok {
+			t.Fatalf("request %d unexpectedly has shared lifecycle label %s", i, Drive9PoolStatusLabel)
+		}
+	}
+	if len(got) != 2 || got[0].DBPoolID != 41 || got[0].ClusterID != "cluster-pool-41" || got[1].DBPoolID != 42 || got[1].ClusterID != "cluster-pool-42" {
+		t.Fatalf("shared pool results = %#v", got)
+	}
+}
+
+func TestLoadSharedDBPoolWithClusterIDRejectsNonSharedLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		labels    map[string]string
+		wantLabel string
+	}{
+		{
+			name: "wrong provider",
+			labels: map[string]string{
+				Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNative,
+				Drive9DBPoolIDLabel: "41",
+			},
+			wantLabel: Drive9ProviderLabel,
+		},
+		{
+			name: "not managed",
+			labels: map[string]string{
+				Drive9ManagedLabel: "false", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+				Drive9DBPoolIDLabel: "41",
+			},
+			wantLabel: Drive9ManagedLabel,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") == "" {
+					w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-shared-load", qop="auth"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if r.Method != http.MethodGet || r.URL.Path != "/v1beta1/clusters/cluster-pool-41" {
+					http.Error(w, "unexpected request", http.StatusInternalServerError)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"clusterId": "cluster-pool-41", "state": "ACTIVE", "labels": tc.labels,
+				})
+			}))
+			defer ts.Close()
+
+			p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+			_, err := p.LoadSharedDBPoolWithCredentials(context.Background(), 41, "cluster-pool-41", tenant.CredentialProvisionRequest{
+				PublicKey: "public", PrivateKey: "private",
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.wantLabel) {
+				t.Fatalf("LoadSharedDBPoolWithCredentials error = %v, want %s label rejection", err, tc.wantLabel)
+			}
+		})
+	}
+}
+
+func TestWaitForSharedDBPoolMetadataUsesNativeReadinessPoll(t *testing.T) {
+	origPoll := tidbCloudNativePollInterval
+	tidbCloudNativePollInterval = time.Millisecond
+	t.Cleanup(func() { tidbCloudNativePollInterval = origPoll })
+
+	var authorizedGets atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-shared-wait", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodGet || r.URL.Path != "/v1beta1/clusters/cluster-pool-41" {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		response := map[string]any{
+			"clusterId": "cluster-pool-41", "state": "ACTIVE",
+			"labels": map[string]string{
+				Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+				Drive9DBPoolIDLabel: "41", TiDBCloudOrganizationLabel: "org-1",
+			},
+		}
+		if authorizedGets.Add(1) > 1 {
+			response["userPrefix"] = "u1"
+			response["endpoints"] = map[string]any{"public": map[string]any{"host": "shared.example", "port": 4000}}
+		}
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+	got, err := p.WaitForSharedDBPoolMetadataWithCredentials(context.Background(), 41, "cluster-pool-41",
+		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
+	if err != nil {
+		t.Fatalf("WaitForSharedDBPoolMetadataWithCredentials: %v", err)
+	}
+	if authorizedGets.Load() != 2 {
+		t.Fatalf("authorized GETs = %d, want 2", authorizedGets.Load())
+	}
+	if got.DBPoolID != 41 || got.ClusterID != "cluster-pool-41" || got.OrganizationID != "org-1" ||
+		got.Host != "shared.example" || got.Port != 4000 || got.Username != "u1.root" {
+		t.Fatalf("shared DB pool metadata = %+v", got)
+	}
+}
+
 func TestBatchProvisionFreeClustersDefersIncompletePublicHostWithoutMetadataWait(t *testing.T) {
 	var listCalls atomic.Int32
 	handlerErrs := make(chan error, 2)

@@ -15,10 +15,6 @@ import (
 // authoritative in multi-tenant deployments — see
 // CoreFSTiDBSharedSchemaStatements). There are no foreign keys, so statement
 // order is informational only. For plain MySQL use SharedMySQLSchemaStatements.
-//
-// Schema versioning for shared databases is intentionally not wired up yet:
-// per-physical-DB versioning arrives with the routing phase, so init is a
-// plain idempotent apply of this statement list for now.
 func SharedTiDBSchemaStatements() []string {
 	stmts := CoreFSTiDBSharedSchemaStatements()
 	stmts = append(stmts, JournalTiDBSharedSchemaStatements()...)
@@ -27,6 +23,11 @@ func SharedTiDBSchemaStatements() []string {
 	stmts = append(stmts, FSLayerTiDBSharedSchemaStatements()...)
 	return stmts
 }
+
+// CurrentSharedTiDBSchemaVersion is derived from the checked-in shared schema
+// SQL. A physical DB pool stores this value only after its idempotent ensure
+// succeeds, so normal opens can skip repeated DDL work.
+var CurrentSharedTiDBSchemaVersion = currentTiDBTenantSchemaVersion(SharedTiDBSchemaStatements())
 
 // SharedMySQLSchemaStatements is the plain-MySQL variant of
 // SharedTiDBSchemaStatements, derived by removing TiDB-only keywords. Use it
@@ -65,6 +66,13 @@ func InitSharedSchema(ctx context.Context, dsn string) error {
 		return err
 	}
 	defer func() { _ = closeTiDBSchemaDB(db) }()
+	return EnsureSharedSchema(ctx, db)
+}
+
+// EnsureSharedSchema applies the shared schema through an already-open
+// physical DB handle. This is used by the shared connection cache so schema
+// comparison and initialization happen once at DB-pool open time.
+func EnsureSharedSchema(ctx context.Context, db *sql.DB) error {
 	stmts, err := SharedSchemaStatementsForDB(ctx, db)
 	if err != nil {
 		return err
