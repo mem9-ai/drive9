@@ -73,7 +73,9 @@ func isSchemaMigrationError(err error) bool {
 	return strings.Contains(msg, "ensure tidb auto-embedding schema") ||
 		strings.Contains(msg, "validate tidb auto-embedding schema") ||
 		strings.Contains(msg, "migrate split tables") ||
-		strings.Contains(msg, "detect legacy files table")
+		strings.Contains(msg, "detect legacy files table") ||
+		strings.Contains(msg, "meta schema contract mismatch") ||
+		strings.Contains(msg, "tidb schema contract mismatch")
 }
 
 func sanitizeClientError(err error) string {

@@ -789,7 +789,7 @@ func TestBackendErrorStatus(t *testing.T) {
 				ctx = c
 			}
 			if got := backendErrorStatus(ctx, tt.err); got != tt.want {
-				t.Fatalf("backendErrorStatus() = %d, want %d", got, tt.want)
+				t.Errorf("backendErrorStatus() = %d, want %d", got, tt.want)
 			}
 		})
 	}
