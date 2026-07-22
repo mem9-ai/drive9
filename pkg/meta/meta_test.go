@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/mem9-ai/drive9/internal/testmysql"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 )
@@ -1360,7 +1362,7 @@ func TestMetaSchemaSpecIncludesTiDBCloudOrgBindings(t *testing.T) {
 func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
 	dbPool := mustMetaTableSpec(t, mustMetaSpec(t), "db_pool")
 	for _, column := range []string{
-		"db_id", "org_id", "cluster_id", "provisioning_key", "cloud_provider", "region",
+		"db_id", "uuid", "org_id", "cluster_id", "provisioning_key", "cloud_provider", "region",
 		"role", "db_host", "db_port", "db_user", "db_password", "db_name", "db_tls",
 		"max_tenants", "tenant_count", "soft_cap_reached", "spending_limit", "schema_version", "status",
 		"created_at", "updated_at",
@@ -1370,7 +1372,7 @@ func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
 		}
 	}
 	for _, index := range []string{
-		"primary", "uk_db_pool_cloud_resource", "uk_db_pool_endpoint",
+		"primary", "uk_db_pool_uuid", "uk_db_pool_cloud_resource", "uk_db_pool_endpoint",
 		"idx_db_pool_allocate", "idx_db_pool_provisioning_key",
 	} {
 		if _, ok := dbPool.indexes[index]; !ok {
@@ -1452,7 +1454,7 @@ func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 			t.Fatalf("db_pool.%s is_nullable = %q, want YES", column, nullable)
 		}
 	}
-	for _, index := range []string{"uk_db_pool_cloud_resource", "idx_db_pool_allocate", "idx_db_pool_provisioning_key"} {
+	for _, index := range []string{"uk_db_pool_uuid", "uk_db_pool_cloud_resource", "idx_db_pool_allocate", "idx_db_pool_provisioning_key"} {
 		exists, err := metaIndexExists(ctx, s.DB(), "db_pool", index)
 		if err != nil {
 			t.Fatalf("check %s: %v", index, err)
@@ -1461,17 +1463,83 @@ func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 			t.Fatalf("db_pool index %s was not created", index)
 		}
 	}
-	var status string
+	var dbPoolUUID, status string
 	var softCapReached bool
 	var spendingLimit *int64
-	if err := s.DB().QueryRowContext(ctx, `SELECT status, spending_limit, soft_cap_reached FROM db_pool WHERE org_id = 'org-legacy'`).Scan(&status, &spendingLimit, &softCapReached); err != nil {
+	if err := s.DB().QueryRowContext(ctx, `SELECT uuid, status, spending_limit, soft_cap_reached FROM db_pool WHERE org_id = 'org-legacy'`).Scan(&dbPoolUUID, &status, &spendingLimit, &softCapReached); err != nil {
 		t.Fatalf("load migrated legacy row: %v", err)
+	}
+	if _, err := uuid.Parse(dbPoolUUID); err != nil {
+		t.Fatalf("migrated db_pool uuid = %q: %v", dbPoolUUID, err)
+	}
+	var uuidNullable string
+	if err := s.DB().QueryRowContext(ctx, `SELECT is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = 'uuid'`).Scan(&uuidNullable); err != nil {
+		t.Fatalf("load db_pool.uuid nullability: %v", err)
+	}
+	if uuidNullable != "NO" {
+		t.Fatalf("db_pool.uuid is_nullable = %q, want NO", uuidNullable)
 	}
 	if status != "active" || spendingLimit != nil {
 		t.Fatalf("legacy row status/spending_limit = %q/%v, want active/NULL", status, spendingLimit)
 	}
 	if !softCapReached {
 		t.Fatal("legacy row at max_tenants must be backfilled with soft_cap_reached=true")
+	}
+
+	if _, err := s.DB().ExecContext(ctx, `DROP INDEX uk_db_pool_uuid ON db_pool`); err != nil {
+		t.Fatalf("drop db_pool uuid index to simulate partial migration: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET uuid = UPPER(uuid) WHERE org_id = 'org-legacy'`); err != nil {
+		t.Fatalf("uppercase db_pool uuid to simulate partial migration: %v", err)
+	}
+	if err := s.migrate(); err != nil {
+		t.Fatalf("resume partial db_pool uuid migration: %v", err)
+	}
+	if err := s.migrate(); err != nil {
+		t.Fatalf("repeat completed db_pool uuid migration: %v", err)
+	}
+	var uuidAfterRetries string
+	if err := s.DB().QueryRowContext(ctx, `SELECT uuid FROM db_pool WHERE org_id = 'org-legacy'`).Scan(&uuidAfterRetries); err != nil {
+		t.Fatalf("load db_pool uuid after repeated migration: %v", err)
+	}
+	if uuidAfterRetries != dbPoolUUID {
+		t.Fatalf("db_pool uuid after repeated migration = %q, want stable %q", uuidAfterRetries, dbPoolUUID)
+	}
+	if exists, err := metaIndexExists(ctx, s.DB(), "db_pool", "uk_db_pool_uuid"); err != nil || !exists {
+		t.Fatalf("db_pool uuid index after repeated migration = %t/%v, want true/nil", exists, err)
+	}
+}
+
+func TestMigrateNormalizesManagedSharedDBSpendingLimitToCloudMaximum(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	limit := MaxTiDBCloudSpendingLimit
+	id, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-spending-migration", ProvisioningKey: make([]byte, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &limit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET spending_limit = 10000000 WHERE db_id = ?`, id); err != nil {
+		t.Fatalf("seed legacy spending limit: %v", err)
+	}
+
+	if err := s.migrate(); err != nil {
+		t.Fatalf("migrate legacy spending limit: %v", err)
+	}
+	got, err := s.GetSharedDB(ctx, id)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if got.SpendingLimit == nil || *got.SpendingLimit != MaxTiDBCloudSpendingLimit {
+		t.Fatalf("spending limit = %v, want %d", got.SpendingLimit, MaxTiDBCloudSpendingLimit)
+	}
+
+	if err := s.migrate(); err != nil {
+		t.Fatalf("repeat spending-limit migration: %v", err)
 	}
 }
 

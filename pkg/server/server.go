@@ -48,13 +48,11 @@ type Config struct {
 	Pool                  *tenant.Pool
 	Provisioner           tenant.Provisioner
 	DefaultTenantProvider string
-	// SharedDBMaxTenants and SharedDBDefaultSpendingLimit apply only to new
-	// managed tidb_cloud_native_shared pools. Zero values use the documented
-	// defaults (100 tenants and 10,000,000 monthly units).
-	SharedDBMaxTenants           int
-	SharedDBHardCapRatio         float64
-	SharedDBReopenRatio          float64
-	SharedDBDefaultSpendingLimit int64
+	// SharedDBMaxTenants applies only to new managed
+	// tidb_cloud_native_shared pools. Zero uses the default of 100 tenants.
+	SharedDBMaxTenants   int
+	SharedDBHardCapRatio float64
+	SharedDBReopenRatio  float64
 	// LegacyStarterProvisioner is only used for delete/fork compatibility on
 	// persisted tidb_cloud_starter tenants. New starter provisioning remains
 	// disabled and NormalizeProvider does not accept tidb_cloud_starter.
@@ -182,47 +180,46 @@ func (s *Server) provisionerForTenantProvider(provider string) tenant.Provisione
 }
 
 type Server struct {
-	fallback                     *backend.Dat9Backend
-	meta                         *meta.Store
-	pool                         *tenant.Pool
-	provisioner                  tenant.Provisioner
-	defaultTenantProvider        string
-	sharedDBMaxTenants           int
-	sharedDBHardCapRatio         float64
-	sharedDBReopenRatio          float64
-	sharedDBDefaultSpendingLimit int64
-	legacyStarterProvisioner     tenant.Provisioner
-	tokenSecret                  []byte
-	localTenantAPIKey            string
-	vaultMK                      *vault.MasterKey
-	vaultIssuerURL               string
-	publicURL                    string
-	maxUploadBytes               int64
-	tenantPoolMaxSize            int
-	tenantPoolRefillFreeRatio    float64
-	inlineThreshold              int64
-	metrics                      *serverMetrics
-	logger                       *zap.Logger
-	mux                          *http.ServeMux
-	events                       *eventBuses
-	tenantWorker                 *tenantWorkerManager
-	shardResolver                *semanticShardResolver
-	journalCursorSecret          []byte
-	objectGCWorker               *objectGCWorker
-	slockOAuth                   SlockOAuthClient
-	tidbAutoEmbedding            tenantAutoEmbeddingDefault
-	disableDBAutoEmbed           bool
-	forkWorkerCtx                context.Context
-	forkWorkerCancel             context.CancelFunc
-	forkWorkerWG                 sync.WaitGroup
-	forkWorkerMu                 sync.Mutex
-	forkWorkerClosed             bool
-	tenantPoolLocks              sync.Map
-	tenantPoolCreateLocks        sync.Map
-	tenantPoolResumeJobs         sync.Map
-	tidbCloudRBACCache           *tidbCloudRBACCache
-	schemaInitErrors             sync.Map
-	leader                       *leader.Manager
+	fallback                  *backend.Dat9Backend
+	meta                      *meta.Store
+	pool                      *tenant.Pool
+	provisioner               tenant.Provisioner
+	defaultTenantProvider     string
+	sharedDBMaxTenants        int
+	sharedDBHardCapRatio      float64
+	sharedDBReopenRatio       float64
+	legacyStarterProvisioner  tenant.Provisioner
+	tokenSecret               []byte
+	localTenantAPIKey         string
+	vaultMK                   *vault.MasterKey
+	vaultIssuerURL            string
+	publicURL                 string
+	maxUploadBytes            int64
+	tenantPoolMaxSize         int
+	tenantPoolRefillFreeRatio float64
+	inlineThreshold           int64
+	metrics                   *serverMetrics
+	logger                    *zap.Logger
+	mux                       *http.ServeMux
+	events                    *eventBuses
+	tenantWorker              *tenantWorkerManager
+	shardResolver             *semanticShardResolver
+	journalCursorSecret       []byte
+	objectGCWorker            *objectGCWorker
+	slockOAuth                SlockOAuthClient
+	tidbAutoEmbedding         tenantAutoEmbeddingDefault
+	disableDBAutoEmbed        bool
+	forkWorkerCtx             context.Context
+	forkWorkerCancel          context.CancelFunc
+	forkWorkerWG              sync.WaitGroup
+	forkWorkerMu              sync.Mutex
+	forkWorkerClosed          bool
+	tenantPoolLocks           sync.Map
+	tenantPoolCreateLocks     sync.Map
+	tenantPoolResumeJobs      sync.Map
+	tidbCloudRBACCache        *tidbCloudRBACCache
+	schemaInitErrors          sync.Map
+	leader                    *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
 	// changes, this context is cancelled and recreated. Workers that use it
 	// (pending tenant reconciler, tenant delete cleanup, one-time resume tasks)
@@ -378,29 +375,28 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
-		fallback:                     cfg.Backend,
-		meta:                         cfg.Meta,
-		pool:                         cfg.Pool,
-		tokenSecret:                  cfg.TokenSecret,
-		localTenantAPIKey:            strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:                      vaultMK,
-		vaultIssuerURL:               strings.TrimSpace(cfg.VaultIssuerURL),
-		publicURL:                    strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
-		provisioner:                  cfg.Provisioner,
-		defaultTenantProvider:        defaultTenantProvider,
-		sharedDBMaxTenants:           cfg.SharedDBMaxTenants,
-		sharedDBHardCapRatio:         sharedDBHardCapRatio,
-		sharedDBReopenRatio:          sharedDBReopenRatio,
-		sharedDBDefaultSpendingLimit: cfg.SharedDBDefaultSpendingLimit,
-		legacyStarterProvisioner:     cfg.LegacyStarterProvisioner,
-		maxUploadBytes:               maxUpload,
-		tenantPoolMaxSize:            tenantPoolMaxSize,
-		tenantPoolRefillFreeRatio:    tenantPoolRefillFreeRatio,
-		inlineThreshold:              inlineThreshold,
-		metrics:                      newServerMetrics(),
-		logger:                       logger,
-		events:                       newEventBuses(),
-		slockOAuth:                   cfg.SlockOAuth,
+		fallback:                  cfg.Backend,
+		meta:                      cfg.Meta,
+		pool:                      cfg.Pool,
+		tokenSecret:               cfg.TokenSecret,
+		localTenantAPIKey:         strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:                   vaultMK,
+		vaultIssuerURL:            strings.TrimSpace(cfg.VaultIssuerURL),
+		publicURL:                 strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
+		provisioner:               cfg.Provisioner,
+		defaultTenantProvider:     defaultTenantProvider,
+		sharedDBMaxTenants:        cfg.SharedDBMaxTenants,
+		sharedDBHardCapRatio:      sharedDBHardCapRatio,
+		sharedDBReopenRatio:       sharedDBReopenRatio,
+		legacyStarterProvisioner:  cfg.LegacyStarterProvisioner,
+		maxUploadBytes:            maxUpload,
+		tenantPoolMaxSize:         tenantPoolMaxSize,
+		tenantPoolRefillFreeRatio: tenantPoolRefillFreeRatio,
+		inlineThreshold:           inlineThreshold,
+		metrics:                   newServerMetrics(),
+		logger:                    logger,
+		events:                    newEventBuses(),
+		slockOAuth:                cfg.SlockOAuth,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
 			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
@@ -5164,7 +5160,7 @@ func (s *Server) provisionTenantOnManagedSharedDB(ctx context.Context, tenantID 
 }
 
 func isSharedDBReservationConflict(err error) bool {
-	return errors.Is(err, meta.ErrSharedDBCapacityExhausted) || errors.Is(err, meta.ErrSharedDBSpendingLimitExceeded)
+	return errors.Is(err, meta.ErrSharedDBCapacityExhausted)
 }
 
 func (s *Server) provisionTenantOnSharedDBMode(ctx context.Context, tenantID string, sharedDB *meta.SharedDB, provider, keyName string, opts provisionTenantOptions, now time.Time, capacityMode meta.SharedDBCapacityMode, hardCap int) (*provisionTenantResult, error) {
@@ -5216,7 +5212,7 @@ func (s *Server) provisionTenantOnSharedDBMode(ctx context.Context, tenantID str
 		provisionErr = s.meta.CompleteSharedTenantProvision(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared, placement, keyRec)
 	}
 	if provisionErr != nil {
-		if errors.Is(provisionErr, meta.ErrSharedDBCapacityExhausted) || errors.Is(provisionErr, meta.ErrSharedDBSpendingLimitExceeded) {
+		if errors.Is(provisionErr, meta.ErrSharedDBCapacityExhausted) {
 			return nil, newProvisionTenantError(http.StatusConflict, "shared pool is at capacity", provisionErr)
 		}
 		return fail(provisionErr)
@@ -5301,10 +5297,9 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 			return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
 		}
-		virtualLimit := s.sharedTenantVirtualSpendingLimit(opts)
 		var lastConflict error
 		for attempt := 0; attempt < 2; attempt++ {
-			sharedDB, created, allocateErr := s.allocateManagedSharedDB(ctx, *opts.CredentialProvisioner, virtualLimit, nil)
+			sharedDB, created, allocateErr := s.allocateManagedSharedDB(ctx, *opts.CredentialProvisioner, nil)
 			if allocateErr != nil {
 				_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 				return nil, newProvisionTenantError(http.StatusBadGateway, "failed to allocate shared database", allocateErr)
@@ -5315,7 +5310,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				if err != nil {
 					orgID, orgErr := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner)
 					if orgErr == nil {
-						fallback, findErr := s.meta.FindSharedDBForEmergency(ctx, orgID, s.sharedDBHardCapRatio, virtualLimit)
+						fallback, findErr := s.meta.FindSharedDBForEmergency(ctx, orgID, s.sharedDBHardCapRatio)
 						if findErr == nil {
 							hardCap, hardErr := s.managedSharedDBHardCap(fallback.MaxTenants)
 							if hardErr == nil {

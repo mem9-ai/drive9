@@ -239,6 +239,39 @@ func TestDBPoolConnectionsIncludesTenantPoolsWithOpenConnections(t *testing.T) {
 	}
 }
 
+func TestSharedDBPoolMetricsUseUUIDWithoutTenantLabel(t *testing.T) {
+	const (
+		dbPoolUUID = "11111111-1111-4111-8111-111111111111"
+		orgID      = "org-shared-db-metrics-test"
+	)
+
+	healthy := &atomic.Bool{}
+	healthy.Store(true)
+	db := sql.OpenDB(fakeConnector{healthy: healthy})
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		_ = db.Close()
+	})
+
+	RegisterSharedDBWithOrg(dbPoolUUID, orgID, db)
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatalf("ping shared db: %v", err)
+	}
+
+	out := renderDB(t)
+	want := `drive9_db_pool_connections{role="shared",db_pool_uuid="` + dbPoolUUID + `",tidbcloud_org_id="` + orgID + `",state="open"} 1`
+	if !strings.Contains(out, want) {
+		t.Fatalf("expected shared DB pool UUID labels, got:\n%s", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, `role="shared"`) && strings.Contains(line, "tenant_id=") {
+			t.Fatalf("shared DB pool metrics must not use tenant_id: %s", line)
+		}
+	}
+}
+
 func TestStartDBHealthProbeDisabledDoesNotStart(t *testing.T) {
 	globalDB.mu.Lock()
 	origStarted := globalDB.started

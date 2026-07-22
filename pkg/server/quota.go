@@ -391,13 +391,11 @@ func (s *Server) validateQuotaSetRequest(req quotaRequest) error {
 	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit > 0 && *req.TiDBCloudSpendingLimit < 10 {
 		return fmt.Errorf("tidbcloud_spending_limit must be 0 or at least 10 RMB")
 	}
-	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit > maxInt32 {
+	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit > meta.MaxTiDBCloudSpendingLimit {
 		return fmt.Errorf("tidbcloud_spending_limit is too large")
 	}
 	return nil
 }
-
-const maxInt32 = int64(1<<31 - 1)
 
 var (
 	errQuotaSettingNotEnabled = errors.New("quota setting not enabled")
@@ -640,8 +638,6 @@ func writeQuotaSetError(w http.ResponseWriter, ctx context.Context, err error, a
 
 func quotaSetErrorStatusMessage(err error, action string) (int, string, bool) {
 	switch {
-	case errors.Is(err, meta.ErrSharedDBSpendingLimitExceeded):
-		return http.StatusConflict, "shared database spending limit capacity exceeded", true
 	case errors.Is(err, errQuotaSettingNotEnabled):
 		return http.StatusNotFound, "quota setting not enabled", true
 	case errors.Is(err, errQuotaLocalUpdateFailed):

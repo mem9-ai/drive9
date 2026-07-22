@@ -74,6 +74,7 @@ type TenantPoolClusterManager interface {
 
 type SharedDBPoolCreateRequest struct {
 	DBPoolID             int64
+	DBPoolUUID           string
 	DatabaseName         string
 	RootPassword         string
 	SpendingLimitMonthly int64
@@ -81,6 +82,7 @@ type SharedDBPoolCreateRequest struct {
 
 type SharedDBPoolInfo struct {
 	DBPoolID       int64
+	DBPoolUUID     string
 	ClusterID      string
 	OrganizationID string
 	Host           string
@@ -96,11 +98,11 @@ type SharedDBPoolProvisioner interface {
 	// decoded subset together with a non-nil error. Callers must persist/process
 	// every returned result before handling the error.
 	BatchProvisionSharedDBPoolsWithCredentials(ctx context.Context, requests []SharedDBPoolCreateRequest, req CredentialProvisionRequest) ([]*SharedDBPoolInfo, error)
-	LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoolID int64, clusterID string, req CredentialProvisionRequest) (*SharedDBPoolInfo, error)
+	LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoolID int64, dbPoolUUID, clusterID string, req CredentialProvisionRequest) (*SharedDBPoolInfo, error)
 }
 
 type SharedDBPoolMetadataWaiter interface {
-	WaitForSharedDBPoolMetadataWithCredentials(ctx context.Context, dbPoolID int64, clusterID string, req CredentialProvisionRequest) (*SharedDBPoolInfo, error)
+	WaitForSharedDBPoolMetadataWithCredentials(ctx context.Context, dbPoolID int64, dbPoolUUID, clusterID string, req CredentialProvisionRequest) (*SharedDBPoolInfo, error)
 }
 
 var ErrSharedDBPoolAmbiguous = errors.New("multiple shared db pool cloud resources found")

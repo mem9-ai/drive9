@@ -304,9 +304,8 @@ func (s *Store) SetQuotaConfigPatch(ctx context.Context, tenantID string, patch 
 }
 
 // UpdateSharedTenantQuotaConfig atomically applies the externally writable
-// quota fields for a placed shared tenant. For a managed DB pool it locks the
-// physical pool, computes the exact prospective virtual spending-limit sum,
-// and rejects the entire patch when the fixed target has no headroom.
+// quota fields for a placed shared tenant. TiDB Cloud spending limit remains a
+// compatibility-only virtual value and does not affect physical pool capacity.
 func (s *Store) UpdateSharedTenantQuotaConfig(ctx context.Context, tenantID string, patch QuotaConfigPatch) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_shared_tenant_quota_config", start, &err)
@@ -318,15 +317,13 @@ func (s *Store) UpdateSharedTenantQuotaConfig(ctx context.Context, tenantID stri
 	}
 	return s.InTx(ctx, func(tx *sql.Tx) error {
 		var dbID int64
-		var poolSpendingLimit sql.NullInt64
-		if scanErr := tx.QueryRowContext(ctx, `SELECT d.db_id, d.spending_limit
+		if scanErr := tx.QueryRowContext(ctx, `SELECT p.db_id
 			FROM tenants t
 			JOIN fs_registry f ON f.tenant_id = t.id
 			JOIN tenant_placements p ON p.fs_id = f.fs_id
-			JOIN db_pool d ON d.db_id = p.db_id
 			WHERE t.id = ? AND t.provider = ? AND p.status = ?
 			FOR UPDATE`, tenantID, "tidb_cloud_native_shared", SharedDBStatusActive).
-			Scan(&dbID, &poolSpendingLimit); scanErr != nil {
+			Scan(&dbID); scanErr != nil {
 			if errors.Is(scanErr, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -350,20 +347,6 @@ func (s *Store) UpdateSharedTenantQuotaConfig(ctx context.Context, tenantID stri
 		nextSpending := currentSpending.Int64
 		if patch.TiDBCloudSpendingLimit != nil {
 			nextSpending = *patch.TiDBCloudSpendingLimit
-		}
-		if poolSpendingLimit.Valid && nextSpending > currentSpending.Int64 {
-			var currentSum int64
-			if sumErr := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(q.tidbcloud_spending_limit), 0)
-				FROM tenant_placements p
-				JOIN fs_registry f ON f.fs_id = p.fs_id
-				JOIN tenant_quota_config q ON q.tenant_id = f.tenant_id
-				WHERE p.db_id = ?`, dbID).Scan(&currentSum); sumErr != nil {
-				return fmt.Errorf("sum shared tenant spending limits: %w", sumErr)
-			}
-			prospective := currentSum - currentSpending.Int64 + nextSpending
-			if prospective < 0 || prospective > int64(1<<31-1) || prospective >= poolSpendingLimit.Int64 {
-				return ErrSharedDBSpendingLimitExceeded
-			}
 		}
 		if patch.MaxStorageBytes != nil {
 			maxStorage = *patch.MaxStorageBytes

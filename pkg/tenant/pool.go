@@ -1037,8 +1037,7 @@ func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) 
 	// An empty TLSMode means a plain connection (local/self-hosted databases);
 	// shared DBs on TiDB Cloud are registered with tls=skip-verify or tls=true.
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", info.User, string(pass), info.Host, info.Port, info.Name, query)
-	db, err := mysqlutil.OpenInstrumentedForTenantWithOrg(ctx, dsn, mysqlutil.RoleShared,
-		fmt.Sprintf("shared:%d", dbID), info.TiDBCloudOrganizationID)
+	db, err := mysqlutil.OpenInstrumentedForSharedDB(ctx, dsn, info.UUID, info.TiDBCloudOrganizationID)
 	if err != nil {
 		return nil, fmt.Errorf("shared db %d: open: %w", dbID, err)
 	}
