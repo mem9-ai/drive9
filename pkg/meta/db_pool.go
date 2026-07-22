@@ -8,6 +8,8 @@ import (
 	"math"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // SharedDBOrgWildcard is the org_id sentinel matching any TiDB Cloud
@@ -77,6 +79,17 @@ func SharedDBReopenThresholdForRatio(softCap int, ratio float64) (int, error) {
 	return int(math.Floor(float64(softCap) * ratio)), nil
 }
 
+func sharedDBUUID(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return uuid.NewString(), nil
+	}
+	parsed, err := uuid.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", fmt.Errorf("invalid shared db pool uuid %q: %w", raw, err)
+	}
+	return parsed.String(), nil
+}
+
 // SharedDB is one physical database registered in db_pool. PasswordCipher
 // holds the same encrypted envelope as tenants.db_password; the plaintext
 // never crosses this layer. TLSMode is the go-sql-driver tls DSN parameter
@@ -85,6 +98,7 @@ func SharedDBReopenThresholdForRatio(softCap int, ratio float64) (int, error) {
 // mode it was registered with. MaxTenants of 0 means unlimited.
 type SharedDB struct {
 	ID                      int64
+	UUID                    string
 	TiDBCloudOrganizationID string
 	ClusterID               string
 	ProvisioningKey         []byte
@@ -127,6 +141,7 @@ type TenantPlacement struct {
 // from placements so counter drift remains visible in exported metrics.
 type SharedDBPoolMetricSnapshot struct {
 	ID                      int64
+	UUID                    string
 	TiDBCloudOrganizationID string
 	Status                  string
 	MaxTenants              int
@@ -146,7 +161,7 @@ type SharedDBPoolTenantStateCount struct {
 
 // sharedDBSelectColumns lists the db_pool columns read into SharedDB. The
 // `role` column is backtick-quoted because ROLE is reserved in MySQL 8.0.
-const sharedDBSelectColumns = "db_id, org_id, cluster_id, provisioning_key, cloud_provider, region, " +
+const sharedDBSelectColumns = "db_id, uuid, org_id, cluster_id, provisioning_key, cloud_provider, region, " +
 	"`role`, db_host, db_port, db_user, db_password, db_name, db_tls, max_tenants, tenant_count, " +
 	"soft_cap_reached, spending_limit, schema_version, status, created_at, updated_at"
 
@@ -158,6 +173,10 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 	defer observeMeta(ctx, "create_managed_shared_db_pool", start, &err)
 	if in == nil {
 		return 0, fmt.Errorf("shared db pool is required")
+	}
+	poolUUID, err := sharedDBUUID(in.UUID)
+	if err != nil {
+		return 0, err
 	}
 	if len(in.ProvisioningKey) != 32 {
 		return 0, fmt.Errorf("provisioning key must be a 32-byte SHA-256 fingerprint")
@@ -190,9 +209,9 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 		databaseName = in.Name
 	}
 	res, err := s.db.ExecContext(ctx, `INSERT INTO db_pool
-		(org_id, provisioning_key, cloud_provider, region, `+"`role`"+`, db_tls,
+		(uuid, org_id, provisioning_key, cloud_provider, region, `+"`role`"+`, db_tls,
 		 db_password, db_name, max_tenants, tenant_count, soft_cap_reached, spending_limit, schema_version, status)
-		VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, 0, 0, ?, 0, ?)`, organizationID, in.ProvisioningKey,
+		VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, 0, 0, ?, 0, ?)`, poolUUID, organizationID, in.ProvisioningKey,
 		in.CloudProvider, in.Region, SharedDBRoleShared, passwordCipher, databaseName,
 		in.MaxTenants, *in.SpendingLimit,
 		SharedDBStatusProvisioning)
@@ -523,6 +542,10 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 	if in == nil {
 		return 0, fmt.Errorf("shared db is required")
 	}
+	poolUUID, err := sharedDBUUID(in.UUID)
+	if err != nil {
+		return 0, err
+	}
 	if in.Host == "" {
 		return 0, fmt.Errorf("db host is required")
 	}
@@ -556,12 +579,12 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 		status = sharedDBStatusActive
 	}
 	if _, err := s.db.ExecContext(ctx,
-		"INSERT INTO db_pool (org_id, `role`, db_host, db_port, db_user, db_password, db_name, "+
-			"db_tls, max_tenants, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "+
+		"INSERT INTO db_pool (uuid, org_id, `role`, db_host, db_port, db_user, db_password, db_name, "+
+			"db_tls, max_tenants, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "+
 			"ON DUPLICATE KEY UPDATE db_port = VALUES(db_port), db_user = VALUES(db_user), "+
 			"db_password = VALUES(db_password), db_tls = VALUES(db_tls), "+
 			"max_tenants = VALUES(max_tenants), status = VALUES(status)",
-		in.TiDBCloudOrganizationID, role, in.Host, in.Port, in.User, in.PasswordCipher, in.Name,
+		poolUUID, in.TiDBCloudOrganizationID, role, in.Host, in.Port, in.User, in.PasswordCipher, in.Name,
 		in.TLSMode, in.MaxTenants, status); err != nil {
 		return 0, fmt.Errorf("upsert db_pool row: %w", err)
 	}
@@ -682,7 +705,7 @@ func (s *Store) ListSharedDBPoolMetricSnapshots(ctx context.Context) (out []Shar
 	start := time.Now()
 	defer observeMeta(ctx, "list_shared_db_pool_metric_snapshots", start, &err)
 	rows, err := s.db.QueryContext(ctx, `SELECT
-			d.db_id, COALESCE(d.org_id, ''), d.status, d.max_tenants, d.tenant_count, d.soft_cap_reached,
+			d.db_id, d.uuid, COALESCE(d.org_id, ''), d.status, d.max_tenants, d.tenant_count, d.soft_cap_reached,
 			d.spending_limit, COALESCE(quota.tenant_sum, 0),
 			COALESCE(states.tenant_status, ''), COALESCE(states.tenant_count, 0)
 		FROM db_pool d
@@ -709,19 +732,19 @@ func (s *Store) ListSharedDBPoolMetricSnapshots(ctx context.Context) (out []Shar
 	byID := make(map[int64]int)
 	for rows.Next() {
 		var id int64
-		var organizationID, status, tenantStatus string
+		var dbPoolUUID, organizationID, status, tenantStatus string
 		var maxTenants, tenantCount int
 		var softCapReached bool
 		var spendingLimit sql.NullInt64
 		var tenantSpendingLimitSum, stateCount int64
-		if err := rows.Scan(&id, &organizationID, &status, &maxTenants, &tenantCount, &softCapReached,
+		if err := rows.Scan(&id, &dbPoolUUID, &organizationID, &status, &maxTenants, &tenantCount, &softCapReached,
 			&spendingLimit, &tenantSpendingLimitSum, &tenantStatus, &stateCount); err != nil {
 			return nil, fmt.Errorf("scan shared db pool metric snapshot: %w", err)
 		}
 		index, ok := byID[id]
 		if !ok {
 			snapshot := SharedDBPoolMetricSnapshot{
-				ID: id, TiDBCloudOrganizationID: organizationID, Status: status,
+				ID: id, UUID: dbPoolUUID, TiDBCloudOrganizationID: organizationID, Status: status,
 				MaxTenants: maxTenants, TenantCount: tenantCount, SoftCapReached: softCapReached,
 				TenantSpendingLimitSum: tenantSpendingLimitSum,
 			}
@@ -1282,7 +1305,7 @@ func scanSharedDBScanner(row sharedDBScanner) (*SharedDB, error) {
 	var organizationID, clusterID, cloudProvider, region sql.NullString
 	var host, user, name sql.NullString
 	var port, spendingLimit sql.NullInt64
-	if err := row.Scan(&rec.ID, &organizationID, &clusterID, &rec.ProvisioningKey, &cloudProvider, &region,
+	if err := row.Scan(&rec.ID, &rec.UUID, &organizationID, &clusterID, &rec.ProvisioningKey, &cloudProvider, &region,
 		&rec.Role, &host, &port, &user, &rec.PasswordCipher, &name, &rec.TLSMode,
 		&rec.MaxTenants, &rec.TenantCount, &rec.SoftCapReached, &spendingLimit, &rec.SchemaVersion, &rec.Status,
 		&rec.CreatedAt, &rec.UpdatedAt); err != nil {

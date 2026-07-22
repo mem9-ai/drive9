@@ -383,6 +383,9 @@ func (s *Store) migrate() (err error) {
 	if err := dropObsoleteMetaIndexes(ctx, s.db); err != nil {
 		return err
 	}
+	if err := ensureDBPoolUUID(ctx, s.db); err != nil {
+		return err
+	}
 	diffs, err := diffMetaSchema(ctx, s.db, spec)
 	if err != nil {
 		return fmt.Errorf("diff meta schema: %w", err)
@@ -478,6 +481,99 @@ func expandManagedDBPoolSchema(ctx context.Context, db *sql.DB) error {
 		}
 		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX uk_db_pool_cloud_resource ON db_pool(org_id, cluster_id)`); err != nil && !isIgnorableMetaSchemaError(err) {
 			return fmt.Errorf("create db_pool cloud resource unique index: %w", err)
+		}
+	}
+	return nil
+}
+
+func ensureDBPoolUUID(ctx context.Context, db *sql.DB) error {
+	var tableExists int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM information_schema.tables
+		WHERE table_schema = DATABASE() AND table_name = 'db_pool'`).Scan(&tableExists); err != nil {
+		return fmt.Errorf("inspect db_pool table for uuid migration: %w", err)
+	}
+	if tableExists == 0 {
+		return nil
+	}
+
+	var columnExists int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = 'uuid'`).Scan(&columnExists); err != nil {
+		return fmt.Errorf("inspect db_pool.uuid: %w", err)
+	}
+	if columnExists == 0 {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE db_pool ADD COLUMN uuid CHAR(36) NULL AFTER db_id`); err != nil {
+			return fmt.Errorf("add db_pool.uuid: %w", err)
+		}
+	}
+
+	type dbPoolUUIDRow struct {
+		id   int64
+		uuid sql.NullString
+	}
+	rows, err := db.QueryContext(ctx, `SELECT db_id, uuid FROM db_pool ORDER BY db_id`)
+	if err != nil {
+		return fmt.Errorf("list db_pool rows for uuid migration: %w", err)
+	}
+	var existing []dbPoolUUIDRow
+	for rows.Next() {
+		var row dbPoolUUIDRow
+		if err := rows.Scan(&row.id, &row.uuid); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan db_pool uuid migration row: %w", err)
+		}
+		existing = append(existing, row)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate db_pool uuid migration rows: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close db_pool uuid migration rows: %w", err)
+	}
+	for _, row := range existing {
+		raw := strings.TrimSpace(row.uuid.String)
+		if raw != "" {
+			value, valueErr := sharedDBUUID(raw)
+			if valueErr != nil {
+				return fmt.Errorf("db_pool %d uuid migration: %w", row.id, valueErr)
+			}
+			if value != raw {
+				if _, err := db.ExecContext(ctx, `UPDATE db_pool SET uuid = ? WHERE db_id = ?`, value, row.id); err != nil {
+					return fmt.Errorf("canonicalize db_pool %d uuid: %w", row.id, err)
+				}
+			}
+			continue
+		}
+		value, valueErr := sharedDBUUID("")
+		if valueErr != nil {
+			return fmt.Errorf("db_pool %d uuid migration: %w", row.id, valueErr)
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE db_pool SET uuid = ?
+			WHERE db_id = ? AND (uuid IS NULL OR uuid = '')`, value, row.id); err != nil {
+			return fmt.Errorf("backfill db_pool %d uuid: %w", row.id, err)
+		}
+	}
+	var isNullable string
+	if err := db.QueryRowContext(ctx, `SELECT is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = 'uuid'`).Scan(&isNullable); err != nil {
+		return fmt.Errorf("inspect db_pool.uuid nullability: %w", err)
+	}
+	if isNullable != "NO" {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE db_pool MODIFY COLUMN uuid CHAR(36) NOT NULL`); err != nil {
+			return fmt.Errorf("make db_pool.uuid non-null: %w", err)
+		}
+	}
+	exists, err := metaIndexExists(ctx, db, "db_pool", "uk_db_pool_uuid")
+	if err != nil {
+		return fmt.Errorf("check db_pool uuid unique index: %w", err)
+	}
+	if !exists {
+		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX uk_db_pool_uuid ON db_pool(uuid)`); err != nil && !isIgnorableMetaSchemaError(err) {
+			return fmt.Errorf("create db_pool uuid unique index: %w", err)
 		}
 	}
 	return nil
@@ -639,6 +735,7 @@ func metaInitSchemaStatements() []string {
 		// word in MySQL 8.0.
 		`CREATE TABLE IF NOT EXISTS db_pool (
 			db_id        BIGINT AUTO_INCREMENT PRIMARY KEY,
+			uuid         CHAR(36) NOT NULL,
 			org_id       VARCHAR(64) NULL,
 			cluster_id   VARCHAR(255) NULL,
 			provisioning_key VARBINARY(32) NULL,
@@ -659,6 +756,7 @@ func metaInitSchemaStatements() []string {
 			status       VARCHAR(20) NOT NULL DEFAULT 'active',
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			UNIQUE INDEX uk_db_pool_uuid (uuid),
 			UNIQUE INDEX uk_db_pool_cloud_resource (org_id, cluster_id),
 			UNIQUE INDEX uk_db_pool_endpoint (org_id, db_host, db_name),
 			INDEX idx_db_pool_allocate (org_id, status, db_id),

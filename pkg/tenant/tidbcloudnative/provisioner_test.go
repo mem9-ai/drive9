@@ -405,6 +405,10 @@ func TestBatchProvisionFreeClustersUsesBatchCreateAndFreeLabel(t *testing.T) {
 }
 
 func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
+	poolUUIDs := []string{
+		"11111111-1111-4111-8111-111111111111",
+		"22222222-2222-4222-8222-222222222222",
+	}
 	var gotBody struct {
 		Requests []struct {
 			Cluster struct {
@@ -435,13 +439,13 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 			{
 				"clusterId": "cluster-pool-41", "state": "CREATING",
 				"labels": map[string]string{
-					TiDBCloudOrganizationLabel: "org-1", Drive9DBPoolIDLabel: "41",
+					TiDBCloudOrganizationLabel: "org-1", Drive9DBPoolUUIDLabel: poolUUIDs[0],
 				},
 			},
 			{
 				"clusterId": "cluster-pool-42", "state": "CREATING",
 				"labels": map[string]string{
-					TiDBCloudOrganizationLabel: "org-1", Drive9DBPoolIDLabel: "42",
+					TiDBCloudOrganizationLabel: "org-1", Drive9DBPoolUUIDLabel: poolUUIDs[1],
 				},
 			},
 		}})
@@ -453,8 +457,8 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 		defaultDatabaseName: DefaultDatabaseName, client: ts.Client(),
 	}
 	got, err := p.BatchProvisionSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolCreateRequest{
-		{DBPoolID: 41, RootPassword: "durable-password-41", SpendingLimitMonthly: 10_000_000},
-		{DBPoolID: 42, RootPassword: "durable-password-42", SpendingLimitMonthly: 10_000_000},
+		{DBPoolID: 41, DBPoolUUID: poolUUIDs[0], RootPassword: "durable-password-41", SpendingLimitMonthly: 10_000_000},
+		{DBPoolID: 42, DBPoolUUID: poolUUIDs[1], RootPassword: "durable-password-42", SpendingLimitMonthly: 10_000_000},
 	}, tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
 	if err != nil {
 		t.Fatalf("BatchProvisionSharedDBPoolsWithCredentials: %v", err)
@@ -464,7 +468,7 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 	}
 	for i, request := range gotBody.Requests {
 		id := fmt.Sprintf("%d", 41+i)
-		if request.Cluster.DisplayName != "tidbcloud-fs-"+id {
+		if request.Cluster.DisplayName != "tidbcloud-fs-"+poolUUIDs[i] {
 			t.Fatalf("request %d displayName = %q", i, request.Cluster.DisplayName)
 		}
 		if request.Cluster.RootPassword != "durable-password-"+id || request.Cluster.SpendingLimit.Monthly != 10_000_000 {
@@ -472,7 +476,7 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 		}
 		wantLabels := map[string]string{
 			Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
-			Drive9DBPoolIDLabel: id,
+			Drive9DBPoolUUIDLabel: poolUUIDs[i],
 		}
 		for key, want := range wantLabels {
 			if request.Cluster.Labels[key] != want {
@@ -483,12 +487,14 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 			t.Fatalf("request %d unexpectedly has shared lifecycle label %s", i, Drive9PoolStatusLabel)
 		}
 	}
-	if len(got) != 2 || got[0].DBPoolID != 41 || got[0].ClusterID != "cluster-pool-41" || got[1].DBPoolID != 42 || got[1].ClusterID != "cluster-pool-42" {
+	if len(got) != 2 || got[0].DBPoolID != 41 || got[0].DBPoolUUID != poolUUIDs[0] || got[0].ClusterID != "cluster-pool-41" ||
+		got[1].DBPoolID != 42 || got[1].DBPoolUUID != poolUUIDs[1] || got[1].ClusterID != "cluster-pool-42" {
 		t.Fatalf("shared pool results = %#v", got)
 	}
 }
 
 func TestLoadSharedDBPoolWithClusterIDRejectsNonSharedLabels(t *testing.T) {
+	const poolUUID = "11111111-1111-4111-8111-111111111111"
 	for _, tc := range []struct {
 		name      string
 		labels    map[string]string
@@ -498,7 +504,7 @@ func TestLoadSharedDBPoolWithClusterIDRejectsNonSharedLabels(t *testing.T) {
 			name: "wrong provider",
 			labels: map[string]string{
 				Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNative,
-				Drive9DBPoolIDLabel: "41",
+				Drive9DBPoolUUIDLabel: poolUUID,
 			},
 			wantLabel: Drive9ProviderLabel,
 		},
@@ -506,7 +512,7 @@ func TestLoadSharedDBPoolWithClusterIDRejectsNonSharedLabels(t *testing.T) {
 			name: "not managed",
 			labels: map[string]string{
 				Drive9ManagedLabel: "false", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
-				Drive9DBPoolIDLabel: "41",
+				Drive9DBPoolUUIDLabel: poolUUID,
 			},
 			wantLabel: Drive9ManagedLabel,
 		},
@@ -529,7 +535,7 @@ func TestLoadSharedDBPoolWithClusterIDRejectsNonSharedLabels(t *testing.T) {
 			defer ts.Close()
 
 			p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
-			_, err := p.LoadSharedDBPoolWithCredentials(context.Background(), 41, "cluster-pool-41", tenant.CredentialProvisionRequest{
+			_, err := p.LoadSharedDBPoolWithCredentials(context.Background(), 41, poolUUID, "cluster-pool-41", tenant.CredentialProvisionRequest{
 				PublicKey: "public", PrivateKey: "private",
 			})
 			if err == nil || !strings.Contains(err.Error(), tc.wantLabel) {
@@ -539,7 +545,47 @@ func TestLoadSharedDBPoolWithClusterIDRejectsNonSharedLabels(t *testing.T) {
 	}
 }
 
+func TestLoadSharedDBPoolWithoutClusterIDMatchesUUID(t *testing.T) {
+	const wantUUID = "22222222-2222-4222-8222-222222222222"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-shared-list", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"clusters": []map[string]any{
+			{
+				"clusterId": "cluster-other", "state": "ACTIVE",
+				"labels": map[string]string{
+					Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+					Drive9DBPoolUUIDLabel: "11111111-1111-4111-8111-111111111111",
+				},
+			},
+			{
+				"clusterId": "cluster-wanted", "state": "ACTIVE",
+				"labels": map[string]string{
+					Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+					Drive9DBPoolUUIDLabel: wantUUID, TiDBCloudOrganizationLabel: "org-1",
+				},
+			},
+		}})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+	got, err := p.LoadSharedDBPoolWithCredentials(context.Background(), 41, wantUUID, "", tenant.CredentialProvisionRequest{
+		PublicKey: "public", PrivateKey: "private",
+	})
+	if err != nil {
+		t.Fatalf("LoadSharedDBPoolWithCredentials: %v", err)
+	}
+	if got == nil || got.DBPoolID != 41 || got.DBPoolUUID != wantUUID || got.ClusterID != "cluster-wanted" {
+		t.Fatalf("shared DB pool = %+v", got)
+	}
+}
+
 func TestWaitForSharedDBPoolMetadataUsesNativeReadinessPoll(t *testing.T) {
+	const poolUUID = "11111111-1111-4111-8111-111111111111"
 	origPoll := tidbCloudNativePollInterval
 	tidbCloudNativePollInterval = time.Millisecond
 	t.Cleanup(func() { tidbCloudNativePollInterval = origPoll })
@@ -559,7 +605,7 @@ func TestWaitForSharedDBPoolMetadataUsesNativeReadinessPoll(t *testing.T) {
 			"clusterId": "cluster-pool-41", "state": "ACTIVE",
 			"labels": map[string]string{
 				Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
-				Drive9DBPoolIDLabel: "41", TiDBCloudOrganizationLabel: "org-1",
+				Drive9DBPoolUUIDLabel: poolUUID, TiDBCloudOrganizationLabel: "org-1",
 			},
 		}
 		if authorizedGets.Add(1) > 1 {
@@ -571,7 +617,7 @@ func TestWaitForSharedDBPoolMetadataUsesNativeReadinessPoll(t *testing.T) {
 	defer ts.Close()
 
 	p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
-	got, err := p.WaitForSharedDBPoolMetadataWithCredentials(context.Background(), 41, "cluster-pool-41",
+	got, err := p.WaitForSharedDBPoolMetadataWithCredentials(context.Background(), 41, poolUUID, "cluster-pool-41",
 		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
 	if err != nil {
 		t.Fatalf("WaitForSharedDBPoolMetadataWithCredentials: %v", err)
@@ -579,7 +625,7 @@ func TestWaitForSharedDBPoolMetadataUsesNativeReadinessPoll(t *testing.T) {
 	if authorizedGets.Load() != 2 {
 		t.Fatalf("authorized GETs = %d, want 2", authorizedGets.Load())
 	}
-	if got.DBPoolID != 41 || got.ClusterID != "cluster-pool-41" || got.OrganizationID != "org-1" ||
+	if got.DBPoolID != 41 || got.DBPoolUUID != poolUUID || got.ClusterID != "cluster-pool-41" || got.OrganizationID != "org-1" ||
 		got.Host != "shared.example" || got.Port != 4000 || got.Username != "u1.root" {
 		t.Fatalf("shared DB pool metadata = %+v", got)
 	}

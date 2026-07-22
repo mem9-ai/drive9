@@ -301,7 +301,7 @@ func (s *Server) continueManagedSharedDBPool(ctx context.Context, dbID int64, cr
 		if poolInfo.ClusterID == "" {
 			return err
 		}
-		if _, waitErr := waiter.WaitForSharedDBPoolMetadataWithCredentials(ctx, dbID, poolInfo.ClusterID, cred); waitErr != nil {
+		if _, waitErr := waiter.WaitForSharedDBPoolMetadataWithCredentials(ctx, dbID, poolInfo.UUID, poolInfo.ClusterID, cred); waitErr != nil {
 			return waitErr
 		}
 	}
@@ -376,7 +376,7 @@ func (s *Server) ensureManagedSharedDBPhysicalLocked(ctx context.Context, poolIn
 	if poolInfo.SpendingLimit == nil {
 		return nil, fmt.Errorf("managed db pool %d has no spending target", poolInfo.ID)
 	}
-	result, err := provisioner.LoadSharedDBPoolWithCredentials(ctx, poolInfo.ID, poolInfo.ClusterID, cred)
+	result, err := provisioner.LoadSharedDBPoolWithCredentials(ctx, poolInfo.ID, poolInfo.UUID, poolInfo.ClusterID, cred)
 	if err != nil {
 		if errors.Is(err, tenant.ErrSharedDBPoolAmbiguous) {
 			if markErr := s.meta.MarkSharedDBPoolFailed(ctx, poolInfo.ID); markErr != nil {
@@ -391,14 +391,14 @@ func (s *Server) ensureManagedSharedDBPhysicalLocked(ctx context.Context, poolIn
 			return nil, fmt.Errorf("managed shared cluster %q was not found", poolInfo.ClusterID)
 		}
 		results, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, []tenant.SharedDBPoolCreateRequest{{
-			DBPoolID: poolInfo.ID, DatabaseName: poolInfo.Name, RootPassword: string(plainRootPassword),
+			DBPoolID: poolInfo.ID, DBPoolUUID: poolInfo.UUID, DatabaseName: poolInfo.Name, RootPassword: string(plainRootPassword),
 			SpendingLimitMonthly: *poolInfo.SpendingLimit,
 		}}, cred)
 		provisionErr = createErr
 		if createErr != nil && len(results) == 0 {
 			return nil, createErr
 		}
-		if len(results) != 1 || results[0] == nil || results[0].DBPoolID != poolInfo.ID {
+		if len(results) != 1 || results[0] == nil || results[0].DBPoolID != poolInfo.ID || results[0].DBPoolUUID != poolInfo.UUID {
 			return nil, fmt.Errorf("shared db pool create returned no unique result for %d", poolInfo.ID)
 		}
 		result = results[0]
@@ -491,7 +491,7 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 		if poolInfo.SpendingLimit == nil {
 			return fmt.Errorf("managed db pool %d has no spending target", dbID)
 		}
-		result, loadErr := provisioner.LoadSharedDBPoolWithCredentials(ctx, dbID, poolInfo.ClusterID, cred)
+		result, loadErr := provisioner.LoadSharedDBPoolWithCredentials(ctx, dbID, poolInfo.UUID, poolInfo.ClusterID, cred)
 		if loadErr != nil {
 			if errors.Is(loadErr, tenant.ErrSharedDBPoolAmbiguous) {
 				if markErr := s.meta.MarkSharedDBPoolFailed(ctx, dbID); markErr != nil {
@@ -506,14 +506,14 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 				return fmt.Errorf("managed shared cluster %q was not found", poolInfo.ClusterID)
 			}
 			results, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, []tenant.SharedDBPoolCreateRequest{{
-				DBPoolID: dbID, DatabaseName: poolInfo.Name, RootPassword: string(plainRootPassword),
+				DBPoolID: dbID, DBPoolUUID: poolInfo.UUID, DatabaseName: poolInfo.Name, RootPassword: string(plainRootPassword),
 				SpendingLimitMonthly: *poolInfo.SpendingLimit,
 			}}, cred)
 			provisionErr = createErr
 			if createErr != nil && len(results) == 0 {
 				return createErr
 			}
-			if len(results) != 1 || results[0] == nil || results[0].DBPoolID != dbID {
+			if len(results) != 1 || results[0] == nil || results[0].DBPoolID != dbID || results[0].DBPoolUUID != poolInfo.UUID {
 				return fmt.Errorf("shared db pool create returned no unique result for %d", dbID)
 			}
 			result = results[0]

@@ -791,6 +791,9 @@ func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context
 			if copyRow.DBPoolID == 0 && i < len(requests) {
 				copyRow.DBPoolID = requests[i].DBPoolID
 			}
+			if copyRow.DBPoolUUID == "" && i < len(requests) {
+				copyRow.DBPoolUUID = requests[i].DBPoolUUID
+			}
 			out[i] = &copyRow
 		}
 		return out, nil
@@ -798,27 +801,28 @@ func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context
 	out := make([]*tenant.SharedDBPoolInfo, 0, len(requests))
 	for _, req := range requests {
 		out = append(out, &tenant.SharedDBPoolInfo{
-			DBPoolID: req.DBPoolID, ClusterID: fmt.Sprintf("cluster-%d", req.DBPoolID),
+			DBPoolID: req.DBPoolID, DBPoolUUID: req.DBPoolUUID, ClusterID: fmt.Sprintf("cluster-%d", req.DBPoolID),
 			OrganizationID: "org-shared", Password: "root-pass", DBName: req.DatabaseName,
 		})
 	}
 	return out, nil
 }
 
-func (f *fakeProvisioner) LoadSharedDBPoolWithCredentials(_ context.Context, _ int64, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+func (f *fakeProvisioner) LoadSharedDBPoolWithCredentials(_ context.Context, _ int64, dbPoolUUID, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
 	if clusterID == "" {
 		return nil, nil
 	}
 	for _, row := range f.sharedPoolResults {
 		if row != nil && row.ClusterID == clusterID {
 			copyRow := *row
+			copyRow.DBPoolUUID = dbPoolUUID
 			return &copyRow, nil
 		}
 	}
 	return nil, nil
 }
 
-func (f *fakeProvisioner) WaitForSharedDBPoolMetadataWithCredentials(_ context.Context, dbPoolID int64, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+func (f *fakeProvisioner) WaitForSharedDBPoolMetadataWithCredentials(_ context.Context, dbPoolID int64, dbPoolUUID, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
 	f.sharedPoolWaitCalls.Add(1)
 	if f.sharedPoolWaitErr != nil {
 		return nil, f.sharedPoolWaitErr
@@ -827,6 +831,7 @@ func (f *fakeProvisioner) WaitForSharedDBPoolMetadataWithCredentials(_ context.C
 		if row != nil && row.ClusterID == clusterID {
 			copyRow := *row
 			copyRow.DBPoolID = dbPoolID
+			copyRow.DBPoolUUID = dbPoolUUID
 			return &copyRow, nil
 		}
 	}

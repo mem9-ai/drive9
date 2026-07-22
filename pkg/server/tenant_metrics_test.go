@@ -149,7 +149,10 @@ func TestObserveSharedDBPoolMetricsRecordsCapacityTenantsAndSpending(t *testing.
 
 	ctx := context.Background()
 	spendingLimit := int64(10_000)
+	const activePoolUUID = "11111111-1111-4111-8111-111111111111"
+	const provisioningPoolUUID = "22222222-2222-4222-8222-222222222222"
 	dbID, err := metaStore.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+		UUID:                    activePoolUUID,
 		TiDBCloudOrganizationID: "org-shared-db-metrics",
 		ProvisioningKey:         make([]byte, 32),
 		CloudProvider:           "aws",
@@ -163,14 +166,16 @@ func TestObserveSharedDBPoolMetricsRecordsCapacityTenantsAndSpending(t *testing.
 	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE db_pool SET status = ? WHERE db_id = ?`, meta.SharedDBStatusActive, dbID); err != nil {
 		t.Fatalf("activate db pool: %v", err)
 	}
-	if _, err := metaStore.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+	provisioningDBID, err := metaStore.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+		UUID:                    provisioningPoolUUID,
 		TiDBCloudOrganizationID: "org-shared-db-metrics",
 		ProvisioningKey:         []byte("12345678901234567890123456789012"),
 		CloudProvider:           "aws",
 		Region:                  "us-east-1",
 		MaxTenants:              5,
 		SpendingLimit:           &spendingLimit,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("CreateManagedSharedDBPool provisioning: %v", err)
 	}
 
@@ -209,18 +214,19 @@ func TestObserveSharedDBPoolMetricsRecordsCapacityTenantsAndSpending(t *testing.
 	s.metrics.writePrometheus(rec)
 	text := rec.Body.String()
 	dbPoolID := fmt.Sprint(dbID)
+	provisioningDBPoolID := fmt.Sprint(provisioningDBID)
 	for _, want := range []string{
-		`drive9_shared_db_pool_total{status="active",tidbcloud_org_id="org-shared-db-metrics"} 1`,
-		`drive9_shared_db_pool_total{status="provisioning",tidbcloud_org_id="org-shared-db-metrics"} 1`,
-		`drive9_shared_db_pool_capacity{db_pool_id="` + dbPoolID + `",tidbcloud_org_id="org-shared-db-metrics",type="soft_max"} 5`,
-		`drive9_shared_db_pool_capacity{db_pool_id="` + dbPoolID + `",tidbcloud_org_id="org-shared-db-metrics",type="hard_max"} 6`,
-		`drive9_shared_db_pool_capacity{db_pool_id="` + dbPoolID + `",tidbcloud_org_id="org-shared-db-metrics",type="used"} 2`,
-		`drive9_shared_db_pool_capacity{db_pool_id="` + dbPoolID + `",tidbcloud_org_id="org-shared-db-metrics",type="free"} 3`,
-		`drive9_shared_db_pool_tenants{db_pool_id="` + dbPoolID + `",state="active",tidbcloud_org_id="org-shared-db-metrics"} 1`,
-		`drive9_shared_db_pool_tenants{db_pool_id="` + dbPoolID + `",state="provisioning",tidbcloud_org_id="org-shared-db-metrics"} 1`,
-		`drive9_shared_db_pool_spending_limit{db_pool_id="` + dbPoolID + `",tidbcloud_org_id="org-shared-db-metrics",type="target"} 10000`,
-		`drive9_shared_db_pool_spending_limit{db_pool_id="` + dbPoolID + `",tidbcloud_org_id="org-shared-db-metrics",type="tenant_sum"} 3000`,
-		`drive9_shared_db_pool_spending_limit{db_pool_id="` + dbPoolID + `",tidbcloud_org_id="org-shared-db-metrics",type="headroom"} 7000`,
+		`drive9_shared_db_pool_total{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",status="active",tidbcloud_org_id="org-shared-db-metrics"} 1`,
+		`drive9_shared_db_pool_total{db_pool_id="` + provisioningDBPoolID + `",db_pool_uuid="` + provisioningPoolUUID + `",status="provisioning",tidbcloud_org_id="org-shared-db-metrics"} 1`,
+		`drive9_shared_db_pool_capacity{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="soft_max"} 5`,
+		`drive9_shared_db_pool_capacity{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="hard_max"} 6`,
+		`drive9_shared_db_pool_capacity{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="used"} 2`,
+		`drive9_shared_db_pool_capacity{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="free"} 3`,
+		`drive9_shared_db_pool_tenants{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",state="active",tidbcloud_org_id="org-shared-db-metrics"} 1`,
+		`drive9_shared_db_pool_tenants{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",state="provisioning",tidbcloud_org_id="org-shared-db-metrics"} 1`,
+		`drive9_shared_db_pool_spending_limit{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="target"} 10000`,
+		`drive9_shared_db_pool_spending_limit{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="tenant_sum"} 3000`,
+		`drive9_shared_db_pool_spending_limit{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="headroom"} 7000`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing shared DB-pool metric %q:\n%s", want, text)
@@ -253,13 +259,13 @@ func TestStopLeaderWorkersClearsMetricSnapshots(t *testing.T) {
 		status:         string(meta.TenantPoolBindingUsed),
 	}
 	sharedDBKey := sharedDBPoolMetricKey{
-		kind: sharedDBPoolMetricCapacity, dbPoolID: 987654,
+		kind: sharedDBPoolMetricCapacity, dbPoolID: 987654, dbPoolUUID: "33333333-3333-4333-8333-333333333333",
 		tidbCloudOrgID: "org-shared-leader-loss-clear", dimension: "used",
 	}
 	s := &Server{metrics: newServerMetrics(), leaderWorkersStarted: true}
 	metrics.RecordTenantPoolBindings(tenantPoolKey.poolID, tenantPoolKey.tidbCloudOrgID, tenantPoolKey.status, 1)
 	s.metrics.syncTenantPoolBindingSnapshot(map[tenantPoolBindingMetricKey]struct{}{tenantPoolKey: {}})
-	metrics.RecordSharedDBPoolCapacity(sharedDBKey.tidbCloudOrgID, sharedDBKey.dbPoolID, sharedDBKey.dimension, 1)
+	metrics.RecordSharedDBPoolCapacity(sharedDBKey.tidbCloudOrgID, sharedDBKey.dbPoolID, sharedDBKey.dbPoolUUID, sharedDBKey.dimension, 1)
 	s.metrics.syncSharedDBPoolSnapshot(map[sharedDBPoolMetricKey]struct{}{sharedDBKey: {}})
 
 	rec := httptest.NewRecorder()
@@ -267,7 +273,7 @@ func TestStopLeaderWorkersClearsMetricSnapshots(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `drive9_tenant_pool_bindings{pool_id="pool-leader-loss-clear",status="used",tidbcloud_org_id="org-leader-loss-clear"} 1`) {
 		t.Fatalf("missing tenant pool binding metric before leadership loss:\n%s", rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `drive9_shared_db_pool_capacity{db_pool_id="987654",tidbcloud_org_id="org-shared-leader-loss-clear",type="used"} 1`) {
+	if !strings.Contains(rec.Body.String(), `drive9_shared_db_pool_capacity{db_pool_id="987654",db_pool_uuid="33333333-3333-4333-8333-333333333333",tidbcloud_org_id="org-shared-leader-loss-clear",type="used"} 1`) {
 		t.Fatalf("missing shared DB-pool metric before leadership loss:\n%s", rec.Body.String())
 	}
 

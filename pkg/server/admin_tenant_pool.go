@@ -1106,7 +1106,7 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 			return resolvedOrg, fmt.Errorf("managed db pool %d has no spending target", dbID)
 		}
 		rows[dbID] = row
-		requests = append(requests, tenant.SharedDBPoolCreateRequest{DBPoolID: dbID,
+		requests = append(requests, tenant.SharedDBPoolCreateRequest{DBPoolID: dbID, DBPoolUUID: row.UUID,
 			DatabaseName: row.Name, RootPassword: string(plain), SpendingLimitMonthly: *row.SpendingLimit})
 	}
 	if len(requests) == 0 {
@@ -1119,7 +1119,7 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 		return resolvedOrg, createErr
 	}
 	for _, info := range created {
-		if info == nil || rows[info.DBPoolID] == nil {
+		if info == nil || rows[info.DBPoolID] == nil || rows[info.DBPoolID].UUID != info.DBPoolUUID {
 			return resolvedOrg, fmt.Errorf("shared db batch returned an unknown db pool")
 		}
 		row := rows[info.DBPoolID]

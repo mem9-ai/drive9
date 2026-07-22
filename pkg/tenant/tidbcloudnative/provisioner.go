@@ -25,6 +25,7 @@ import (
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
+	"github.com/google/uuid"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
@@ -59,7 +60,7 @@ const (
 	Drive9PoolIDLabel          = "drive9.ai/pool_id"
 	Drive9PoolUsedAtLabel      = "drive9.ai/used_at"
 	Drive9ProviderLabel        = "drive9.ai/provider"
-	Drive9DBPoolIDLabel        = "drive9.ai/db_pool_id"
+	Drive9DBPoolUUIDLabel      = "drive9.ai/db_pool_uuid"
 	Drive9QuotaUpdateAtLabel   = "drive9.ai/update_quota_at"
 	TiDBCloudOrganizationLabel = "tidb.cloud/organization"
 
@@ -500,14 +501,19 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 		return nil, fmt.Errorf("shared db pool batch size %d exceeds 10", len(inputs))
 	}
 	requests := make([]map[string]any, 0, len(inputs))
-	passwords := make(map[int64]string, len(inputs))
-	databaseNames := make(map[int64]string, len(inputs))
+	inputsByUUID := make(map[string]tenant.SharedDBPoolCreateRequest, len(inputs))
+	databaseNames := make(map[string]string, len(inputs))
 	for _, input := range inputs {
 		if input.DBPoolID <= 0 {
 			return nil, fmt.Errorf("db pool id must be positive")
 		}
-		if _, exists := passwords[input.DBPoolID]; exists {
-			return nil, fmt.Errorf("duplicate db pool id %d", input.DBPoolID)
+		parsedUUID, err := uuid.Parse(strings.TrimSpace(input.DBPoolUUID))
+		if err != nil {
+			return nil, fmt.Errorf("db pool %d has invalid uuid %q: %w", input.DBPoolID, input.DBPoolUUID, err)
+		}
+		poolUUID := parsedUUID.String()
+		if _, exists := inputsByUUID[poolUUID]; exists {
+			return nil, fmt.Errorf("duplicate db pool uuid %s", poolUUID)
 		}
 		if err := validateTiDBCloudSpendingLimit(input.SpendingLimitMonthly); err != nil {
 			return nil, err
@@ -520,17 +526,18 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 		if password == "" {
 			return nil, fmt.Errorf("root password is required for db pool %d", input.DBPoolID)
 		}
-		passwords[input.DBPoolID] = password
-		databaseNames[input.DBPoolID] = dbName
-		id := strconv.FormatInt(input.DBPoolID, 10)
+		input.DBPoolUUID = poolUUID
+		input.RootPassword = password
+		inputsByUUID[poolUUID] = input
+		databaseNames[poolUUID] = dbName
 		requests = append(requests, map[string]any{"cluster": map[string]any{
-			"displayName":  clusterDisplayName(id),
+			"displayName":  clusterDisplayName(poolUUID),
 			"rootPassword": password,
 			"region":       map[string]string{"name": p.regionName()},
 			"labels": map[string]string{
-				Drive9ManagedLabel:  "true",
-				Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
-				Drive9DBPoolIDLabel: id,
+				Drive9ManagedLabel:    "true",
+				Drive9ProviderLabel:   tenant.ProviderTiDBCloudNativeShared,
+				Drive9DBPoolUUIDLabel: poolUUID,
 			},
 			"spendingLimit": map[string]int32{"monthly": int32(input.SpendingLimitMonthly)},
 		}})
@@ -566,21 +573,22 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 	out := make([]*tenant.SharedDBPoolInfo, 0, len(created.Clusters))
 	for i := range created.Clusters {
 		info := &created.Clusters[i]
-		id, err := strconv.ParseInt(strings.TrimSpace(info.Labels[Drive9DBPoolIDLabel]), 10, 64)
-		if err != nil || id <= 0 {
-			return nil, fmt.Errorf("tidbcloud native shared batch response has invalid %s label for cluster %q", Drive9DBPoolIDLabel, info.ClusterID)
+		parsedUUID, err := uuid.Parse(strings.TrimSpace(info.Labels[Drive9DBPoolUUIDLabel]))
+		if err != nil {
+			return nil, fmt.Errorf("tidbcloud native shared batch response has invalid %s label for cluster %q", Drive9DBPoolUUIDLabel, info.ClusterID)
 		}
-		password, ok := passwords[id]
+		poolUUID := parsedUUID.String()
+		input, ok := inputsByUUID[poolUUID]
 		if !ok {
-			return nil, fmt.Errorf("tidbcloud native shared batch response returned unknown db pool id %d", id)
+			return nil, fmt.Errorf("tidbcloud native shared batch response returned unknown db pool uuid %s", poolUUID)
 		}
 		result := &tenant.SharedDBPoolInfo{
-			DBPoolID: id, ClusterID: strings.TrimSpace(info.ClusterID),
+			DBPoolID: input.DBPoolID, DBPoolUUID: poolUUID, ClusterID: strings.TrimSpace(info.ClusterID),
 			OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
-			Password:       password, DBName: databaseNames[id],
+			Password:       input.RootPassword, DBName: databaseNames[poolUUID],
 		}
 		if result.ClusterID == "" {
-			return nil, fmt.Errorf("tidbcloud native shared batch response missing cluster id for db pool %d", id)
+			return nil, fmt.Errorf("tidbcloud native shared batch response missing cluster id for db pool %s", poolUUID)
 		}
 		if !p.clusterProvisionMetadataIncomplete(info) {
 			result.Host, result.Port, err = p.resolveClusterEndpoint(info)
@@ -601,7 +609,7 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 // LoadSharedDBPoolWithCredentials finds an existing managed shared cluster by
 // its durable db-pool label, or refreshes a known cluster by ID. A nil result
 // means no matching cluster exists yet. Multiple label matches fail closed.
-func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoolID int64, clusterID string, req tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoolID int64, dbPoolUUID, clusterID string, req tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
 	publicKey := strings.TrimSpace(req.PublicKey)
 	privateKey := strings.TrimSpace(req.PrivateKey)
 	if publicKey == "" || privateKey == "" {
@@ -610,7 +618,11 @@ func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoo
 	if dbPoolID <= 0 {
 		return nil, fmt.Errorf("db pool id must be positive")
 	}
-	wantID := strconv.FormatInt(dbPoolID, 10)
+	parsedUUID, err := uuid.Parse(strings.TrimSpace(dbPoolUUID))
+	if err != nil {
+		return nil, fmt.Errorf("db pool %d has invalid uuid %q: %w", dbPoolID, dbPoolUUID, err)
+	}
+	wantUUID := parsedUUID.String()
 	var matches []clusterInfo
 	if strings.TrimSpace(clusterID) != "" {
 		info, err := p.getClusterBasicInfoWithCredentials(ctx, publicKey, privateKey, strings.TrimSpace(clusterID))
@@ -624,7 +636,7 @@ func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoo
 			return nil, err
 		}
 		for _, info := range infos {
-			if strings.TrimSpace(info.Labels[Drive9DBPoolIDLabel]) == wantID &&
+			if strings.EqualFold(strings.TrimSpace(info.Labels[Drive9DBPoolUUIDLabel]), wantUUID) &&
 				strings.TrimSpace(info.Labels[Drive9ManagedLabel]) == "true" &&
 				strings.TrimSpace(info.Labels[Drive9ProviderLabel]) == tenant.ProviderTiDBCloudNativeShared {
 				matches = append(matches, info)
@@ -635,24 +647,25 @@ func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoo
 		return nil, nil
 	}
 	if len(matches) != 1 {
-		return nil, fmt.Errorf("%w: found %d managed shared clusters for db pool %d", tenant.ErrSharedDBPoolAmbiguous, len(matches), dbPoolID)
+		return nil, fmt.Errorf("%w: found %d managed shared clusters for db pool %s", tenant.ErrSharedDBPoolAmbiguous, len(matches), wantUUID)
 	}
-	return p.sharedDBPoolInfoFromCluster(dbPoolID, &matches[0])
+	return p.sharedDBPoolInfoFromCluster(dbPoolID, wantUUID, &matches[0])
 }
 
-func (p *Provisioner) sharedDBPoolInfoFromCluster(dbPoolID int64, info *clusterInfo) (*tenant.SharedDBPoolInfo, error) {
-	wantID := strconv.FormatInt(dbPoolID, 10)
+func (p *Provisioner) sharedDBPoolInfoFromCluster(dbPoolID int64, dbPoolUUID string, info *clusterInfo) (*tenant.SharedDBPoolInfo, error) {
 	if got := strings.TrimSpace(info.Labels[Drive9ManagedLabel]); got != "true" {
 		return nil, fmt.Errorf("cluster %q has %s label %q, want %q", info.ClusterID, Drive9ManagedLabel, got, "true")
 	}
 	if got := strings.TrimSpace(info.Labels[Drive9ProviderLabel]); got != tenant.ProviderTiDBCloudNativeShared {
 		return nil, fmt.Errorf("cluster %q has %s label %q, want %q", info.ClusterID, Drive9ProviderLabel, got, tenant.ProviderTiDBCloudNativeShared)
 	}
-	if got := strings.TrimSpace(info.Labels[Drive9DBPoolIDLabel]); got != wantID {
-		return nil, fmt.Errorf("cluster %q has db pool label %q, want %q", info.ClusterID, got, wantID)
+	gotUUID, err := uuid.Parse(strings.TrimSpace(info.Labels[Drive9DBPoolUUIDLabel]))
+	if err != nil || gotUUID.String() != dbPoolUUID {
+		return nil, fmt.Errorf("cluster %q has %s label %q, want %q", info.ClusterID, Drive9DBPoolUUIDLabel,
+			info.Labels[Drive9DBPoolUUIDLabel], dbPoolUUID)
 	}
 	result := &tenant.SharedDBPoolInfo{
-		DBPoolID: dbPoolID, ClusterID: strings.TrimSpace(info.ClusterID),
+		DBPoolID: dbPoolID, DBPoolUUID: dbPoolUUID, ClusterID: strings.TrimSpace(info.ClusterID),
 		OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
 	}
 	if !p.clusterProvisionMetadataIncomplete(info) {
@@ -668,7 +681,7 @@ func (p *Provisioner) sharedDBPoolInfoFromCluster(dbPoolID int64, info *clusterI
 
 // WaitForSharedDBPoolMetadataWithCredentials reuses the existing TiDB Cloud
 // Native endpoint/user/org readiness poll for a managed shared DB pool.
-func (p *Provisioner) WaitForSharedDBPoolMetadataWithCredentials(ctx context.Context, dbPoolID int64, clusterID string, req tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+func (p *Provisioner) WaitForSharedDBPoolMetadataWithCredentials(ctx context.Context, dbPoolID int64, dbPoolUUID, clusterID string, req tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
 	publicKey := strings.TrimSpace(req.PublicKey)
 	privateKey := strings.TrimSpace(req.PrivateKey)
 	if publicKey == "" || privateKey == "" {
@@ -676,6 +689,10 @@ func (p *Provisioner) WaitForSharedDBPoolMetadataWithCredentials(ctx context.Con
 	}
 	if dbPoolID <= 0 {
 		return nil, fmt.Errorf("db pool id must be positive")
+	}
+	parsedUUID, err := uuid.Parse(strings.TrimSpace(dbPoolUUID))
+	if err != nil {
+		return nil, fmt.Errorf("db pool %d has invalid uuid %q: %w", dbPoolID, dbPoolUUID, err)
 	}
 	clusterID = strings.TrimSpace(clusterID)
 	if clusterID == "" {
@@ -685,7 +702,7 @@ func (p *Provisioner) WaitForSharedDBPoolMetadataWithCredentials(ctx context.Con
 	if err != nil {
 		return nil, err
 	}
-	return p.sharedDBPoolInfoFromCluster(dbPoolID, info)
+	return p.sharedDBPoolInfoFromCluster(dbPoolID, parsedUUID.String(), info)
 }
 
 type batchClusterMetadataTarget struct {

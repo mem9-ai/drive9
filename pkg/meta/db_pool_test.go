@@ -7,6 +7,8 @@ import (
 	"math"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func TestSharedDBCapacityBounds(t *testing.T) {
@@ -100,6 +102,9 @@ func TestRegisterSharedDBRoundTrip(t *testing.T) {
 	if got.ID != id {
 		t.Fatalf("ID = %d, want %d", got.ID, id)
 	}
+	if _, err := uuid.Parse(got.UUID); err != nil {
+		t.Fatalf("UUID = %q: %v", got.UUID, err)
+	}
 	if got.TiDBCloudOrganizationID != "org-a" {
 		t.Fatalf("TiDBCloudOrganizationID = %q, want org-a", got.TiDBCloudOrganizationID)
 	}
@@ -171,6 +176,9 @@ func TestCreateManagedSharedDBPoolPersistsDurableProvisioningPlan(t *testing.T) 
 	}
 	if got.ID != id || got.TiDBCloudOrganizationID != "org-managed" || got.CloudProvider != "aws" || got.Region != "us-east-1" {
 		t.Fatalf("managed db pool identity = %+v", got)
+	}
+	if _, err := uuid.Parse(got.UUID); err != nil {
+		t.Fatalf("managed db pool UUID = %q: %v", got.UUID, err)
 	}
 	if got.Status != SharedDBStatusProvisioning || got.MaxTenants != 100 || got.SpendingLimit == nil || *got.SpendingLimit != spendingLimit {
 		t.Fatalf("managed db pool policy = %+v", got)
@@ -247,6 +255,10 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 	ctx := context.Background()
 
 	first := registerTestSharedDB(t, s, "org-a", "shared-a.example.com", "shared_db_a")
+	firstRecord, err := s.GetSharedDB(ctx, first)
+	if err != nil {
+		t.Fatalf("GetSharedDB before upsert: %v", err)
+	}
 	if err := s.IncrSharedDBTenantCount(ctx, first, 3); err != nil {
 		t.Fatalf("IncrSharedDBTenantCount: %v", err)
 	}
@@ -278,6 +290,9 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 	}
 	if got.TenantCount != 3 {
 		t.Fatalf("TenantCount = %d, want preserved 3", got.TenantCount)
+	}
+	if got.UUID != firstRecord.UUID {
+		t.Fatalf("UUID = %q after upsert, want preserved %q", got.UUID, firstRecord.UUID)
 	}
 }
 
