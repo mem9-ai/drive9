@@ -168,7 +168,7 @@ func TestSharedDBHardCapRatioFromEnv(t *testing.T) {
 		t.Fatalf("hard cap ratio = %f, want 1.1", got)
 	}
 
-	for _, raw := range []string{"0.9", "NaN", "+Inf", "bad"} {
+	for _, raw := range []string{"0.9", "1", "NaN", "+Inf", "bad"} {
 		setEnv(t, key, raw)
 		if _, err := sharedDBHardCapRatioFromEnv(); err == nil {
 			t.Fatalf("sharedDBHardCapRatioFromEnv(%q) error = nil, want error", raw)

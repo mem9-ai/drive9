@@ -679,7 +679,7 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY optional default TiDB Cloud API private key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT true|false to use TiDB Cloud private endpoint hosts for tidb_cloud_native
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_MAX_TENANTS soft capacity for new managed shared DB pools (default: 100)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO emergency hard-cap ratio after physical create failure (default: 1.2)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO emergency hard-cap ratio > 1 after physical create failure (default: 1.2)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_REOPEN_RATIO reopen ratio for a latched shared pool (default: 0.8)
   DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT default managed shared DB-pool spending target (default: 10000000)
   DRIVE9_TIDBCLOUD_PRIVATE_ENDPOINT_HOST_MAP comma-separated public_host=private_host mappings (also accepts public_host:private_host);
@@ -1192,8 +1192,8 @@ func sharedDBHardCapRatioFromEnv() (float64, error) {
 		return server.DefaultSharedDBHardCapRatio, nil
 	}
 	v, err := strconv.ParseFloat(raw, 64)
-	if err != nil || v < 1 || math.IsNaN(v) || math.IsInf(v, 0) {
-		return 0, fmt.Errorf("invalid DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO=%q: must be a finite number >= 1", raw)
+	if err != nil || v <= 1 || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("invalid DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO=%q: must be a finite number > 1", raw)
 	}
 	return v, nil
 }
