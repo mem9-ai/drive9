@@ -119,6 +119,13 @@ func TestPoolInvalidateSharedDBClosesOnlySelectedHandle(t *testing.T) {
 	if err := pool.InvalidateSharedDB(1); err != nil {
 		t.Fatalf("second InvalidateSharedDB: %v", err)
 	}
+	pool.releaseSharedDB(1)
+	if _, ok := pool.sharedDBRefs[1]; ok {
+		t.Fatal("release recreated refs for an invalidated shared DB")
+	}
+	if _, ok := pool.sharedDBLastUsed[1]; ok {
+		t.Fatal("release recreated last-used state for an invalidated shared DB")
+	}
 }
 
 func TestSharedDBHandleIdleReapUsesLongerTTLAndSkipsReferencedHandles(t *testing.T) {

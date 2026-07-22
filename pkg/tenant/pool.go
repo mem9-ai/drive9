@@ -936,6 +936,10 @@ func (p *Pool) releaseSharedDB(dbID int64) {
 		return
 	}
 	p.sharedMu.Lock()
+	if _, ok := p.sharedDBs[dbID]; !ok {
+		p.sharedMu.Unlock()
+		return
+	}
 	if refs := p.sharedDBRefs[dbID]; refs > 1 {
 		p.sharedDBRefs[dbID] = refs - 1
 	} else {

@@ -328,24 +328,34 @@ func TestSharedTenantDeletePlacementRemovalFailureStaysRetryable(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertTenantPlacement: %v", err)
 	}
-	// Pre-warm the shared handle with a scratch database in which every
-	// shared-schema table is absent: the purge in the delete below reuses
-	// the cached handle and succeeds trivially, but the placement removal
-	// transaction cannot release capacity on a missing pool row and must
-	// roll back. (The test DB carries standalone-shape tables of the same
-	// names, so drop them first — the next test's schema init recreates
-	// them.)
-	for _, tbl := range []string{
+	// Pre-warm the shared handle with a database in which every shared-schema
+	// table is absent: the purge in the delete below reuses the cached handle and
+	// succeeds trivially, but the placement removal transaction cannot release
+	// capacity on a missing pool row and must roll back. Restore the standalone
+	// shape in cleanup so this shared-schema test cannot pollute later tests in
+	// the package-wide database.
+	sharedTables := []string{
 		"journal_entry_subjects", "journal_entries", "journal_append_requests", "journal_labels", "journals",
 		"vault_audit_log", "vault_grants", "vault_tokens", "vault_secret_fields", "vault_secrets", "vault_deks",
 		"git_workspace_object_packs", "git_workspace_overlay", "git_workspace_git_state", "git_workspace_tree_nodes", "git_workspaces",
 		"fs_layer_checkpoints", "fs_layer_events", "fs_layer_tags", "fs_layer_entries", "fs_layers",
 		"fs_events", "semantic_tasks", "file_gc_tasks", "uploads", "file_tags", "file_nodes", "semantic", "contents", "inodes",
-	} {
-		if _, err := rt.meta.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
-			t.Fatalf("drop %s: %v", tbl, err)
+	}
+	dropSharedTables := func() {
+		for _, tbl := range sharedTables {
+			if _, err := rt.meta.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
+				t.Errorf("drop %s: %v", tbl, err)
+			}
 		}
 	}
+	dropSharedTables()
+	t.Cleanup(func() {
+		if err := rt.pool.InvalidateSharedDB(dbID); err != nil {
+			t.Errorf("invalidate shared database: %v", err)
+		}
+		dropSharedTables()
+		initServerTenantSchema(t, testDSN)
+	})
 	if err := rt.pool.PurgeSharedTenant(ctx, fsID, dbID); err != nil {
 		t.Fatalf("pre-warm purge: %v", err)
 	}

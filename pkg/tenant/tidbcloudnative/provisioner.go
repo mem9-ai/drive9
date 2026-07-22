@@ -625,6 +625,7 @@ func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoo
 		}
 		for _, info := range infos {
 			if strings.TrimSpace(info.Labels[Drive9DBPoolIDLabel]) == wantID &&
+				strings.TrimSpace(info.Labels[Drive9ManagedLabel]) == "true" &&
 				strings.TrimSpace(info.Labels[Drive9ProviderLabel]) == tenant.ProviderTiDBCloudNativeShared {
 				matches = append(matches, info)
 			}
@@ -637,6 +638,12 @@ func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoo
 		return nil, fmt.Errorf("%w: found %d managed shared clusters for db pool %d", tenant.ErrSharedDBPoolAmbiguous, len(matches), dbPoolID)
 	}
 	info := &matches[0]
+	if got := strings.TrimSpace(info.Labels[Drive9ManagedLabel]); got != "true" {
+		return nil, fmt.Errorf("cluster %q has %s label %q, want %q", info.ClusterID, Drive9ManagedLabel, got, "true")
+	}
+	if got := strings.TrimSpace(info.Labels[Drive9ProviderLabel]); got != tenant.ProviderTiDBCloudNativeShared {
+		return nil, fmt.Errorf("cluster %q has %s label %q, want %q", info.ClusterID, Drive9ProviderLabel, got, tenant.ProviderTiDBCloudNativeShared)
+	}
 	if got := strings.TrimSpace(info.Labels[Drive9DBPoolIDLabel]); got != wantID {
 		return nil, fmt.Errorf("cluster %q has db pool label %q, want %q", info.ClusterID, got, wantID)
 	}

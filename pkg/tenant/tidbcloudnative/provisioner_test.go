@@ -485,6 +485,57 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 	}
 }
 
+func TestLoadSharedDBPoolWithClusterIDRejectsNonSharedLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		labels    map[string]string
+		wantLabel string
+	}{
+		{
+			name: "wrong provider",
+			labels: map[string]string{
+				Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNative,
+				Drive9DBPoolIDLabel: "41",
+			},
+			wantLabel: Drive9ProviderLabel,
+		},
+		{
+			name: "not managed",
+			labels: map[string]string{
+				Drive9ManagedLabel: "false", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+				Drive9DBPoolIDLabel: "41",
+			},
+			wantLabel: Drive9ManagedLabel,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") == "" {
+					w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-shared-load", qop="auth"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if r.Method != http.MethodGet || r.URL.Path != "/v1beta1/clusters/cluster-pool-41" {
+					http.Error(w, "unexpected request", http.StatusInternalServerError)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"clusterId": "cluster-pool-41", "state": "ACTIVE", "labels": tc.labels,
+				})
+			}))
+			defer ts.Close()
+
+			p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+			_, err := p.LoadSharedDBPoolWithCredentials(context.Background(), 41, "cluster-pool-41", tenant.CredentialProvisionRequest{
+				PublicKey: "public", PrivateKey: "private",
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.wantLabel) {
+				t.Fatalf("LoadSharedDBPoolWithCredentials error = %v, want %s label rejection", err, tc.wantLabel)
+			}
+		})
+	}
+}
+
 func TestBatchProvisionFreeClustersDefersIncompletePublicHostWithoutMetadataWait(t *testing.T) {
 	var listCalls atomic.Int32
 	handlerErrs := make(chan error, 2)
