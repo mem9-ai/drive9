@@ -505,6 +505,7 @@ func (s *Store) FindSharedDBForEmergency(ctx context.Context, organizationID str
 	}
 	query := "SELECT " + sharedDBSelectColumns + " FROM db_pool d " +
 		"WHERE d.org_id = ? AND d.`role` = ? AND d.status = ? " +
+		"AND d.spending_limit IS NOT NULL " +
 		"AND d.max_tenants > 0 AND d.tenant_count < CEIL(d.max_tenants * ?) " +
 		"ORDER BY d.tenant_count ASC, d.db_id ASC LIMIT 1"
 	db, err := scanSharedDBRow(s.db.QueryRowContext(ctx, query, organizationID, SharedDBRoleShared,

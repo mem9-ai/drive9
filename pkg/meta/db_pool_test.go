@@ -708,6 +708,39 @@ func TestCompleteSharedTenantProvisionSoftHardCapacityAndHysteresis(t *testing.T
 	}
 }
 
+func TestFindSharedDBForEmergencyExcludesManuallyRegisteredPools(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	if _, err := s.RegisterSharedDB(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-emergency", Host: "manual.example.com", Port: 4000,
+		User: "root", PasswordCipher: []byte("cipher"), Name: "manual_db", MaxTenants: 100,
+	}); err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	managedID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-emergency", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE db_pool SET status = ?, cluster_id = 'cluster-emergency',
+		db_host = 'managed.example.com', db_port = 4000, db_user = 'root', db_password = 'cipher',
+		db_name = 'managed_db' WHERE db_id = ?`, SharedDBStatusActive, managedID); err != nil {
+		t.Fatalf("activate managed pool: %v", err)
+	}
+
+	got, err := s.FindSharedDBForEmergency(ctx, "org-emergency", 1.2)
+	if err != nil {
+		t.Fatalf("FindSharedDBForEmergency: %v", err)
+	}
+	if got.ID != managedID {
+		t.Fatalf("emergency pool = %d, want managed pool %d", got.ID, managedID)
+	}
+}
+
 func TestCompleteSharedTenantProvisionDoesNotUpdateOtherProvisioningPools(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
