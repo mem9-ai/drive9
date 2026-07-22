@@ -970,9 +970,8 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 			return results, err
 		}
-		virtualLimit := s.sharedTenantVirtualSpendingLimit(opts)
 		var selected *meta.SharedDB
-		selected, created, err := s.allocateManagedSharedDB(ctx, cred, virtualLimit, func(db *meta.SharedDB) error {
+		selected, created, err := s.allocateManagedSharedDB(ctx, cred, func(db *meta.SharedDB) error {
 			return s.meta.CompleteSharedTenantPoolMember(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared,
 				&meta.TenantPlacement{FsID: fsID, DbID: db.ID, Placement: meta.PlacementShared,
 					SchemaShape: meta.SchemaShapeShared, Status: meta.SharedDBStatusActive},
@@ -1106,7 +1105,7 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 			return resolvedOrg, fmt.Errorf("managed db pool %d has no spending target", dbID)
 		}
 		rows[dbID] = row
-		requests = append(requests, tenant.SharedDBPoolCreateRequest{DBPoolID: dbID,
+		requests = append(requests, tenant.SharedDBPoolCreateRequest{DBPoolID: dbID, DBPoolUUID: row.UUID,
 			DatabaseName: row.Name, RootPassword: string(plain), SpendingLimitMonthly: *row.SpendingLimit})
 	}
 	if len(requests) == 0 {
@@ -1119,7 +1118,7 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 		return resolvedOrg, createErr
 	}
 	for _, info := range created {
-		if info == nil || rows[info.DBPoolID] == nil {
+		if info == nil || rows[info.DBPoolID] == nil || rows[info.DBPoolID].UUID != info.DBPoolUUID {
 			return resolvedOrg, fmt.Errorf("shared db batch returned an unknown db pool")
 		}
 		row := rows[info.DBPoolID]

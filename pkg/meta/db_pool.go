@@ -8,11 +8,17 @@ import (
 	"math"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // SharedDBOrgWildcard is the org_id sentinel matching any TiDB Cloud
 // organization that has no exact db_pool row.
 const SharedDBOrgWildcard = "*"
+
+// MaxTiDBCloudSpendingLimit is the spendingLimit.monthly API maximum. In the
+// TiDB Cloud unit, 1,000,000 represents $10,000.
+const MaxTiDBCloudSpendingLimit = int64(1_000_000)
 
 // SharedDBRoleShared marks a db_pool row as a multi-tenant shared-schema
 // database. A "dedicated" role is reserved for future use and rejected for
@@ -77,6 +83,17 @@ func SharedDBReopenThresholdForRatio(softCap int, ratio float64) (int, error) {
 	return int(math.Floor(float64(softCap) * ratio)), nil
 }
 
+func sharedDBUUID(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return uuid.NewString(), nil
+	}
+	parsed, err := uuid.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", fmt.Errorf("invalid shared db pool uuid %q: %w", raw, err)
+	}
+	return parsed.String(), nil
+}
+
 // SharedDB is one physical database registered in db_pool. PasswordCipher
 // holds the same encrypted envelope as tenants.db_password; the plaintext
 // never crosses this layer. TLSMode is the go-sql-driver tls DSN parameter
@@ -85,6 +102,7 @@ func SharedDBReopenThresholdForRatio(softCap int, ratio float64) (int, error) {
 // mode it was registered with. MaxTenants of 0 means unlimited.
 type SharedDB struct {
 	ID                      int64
+	UUID                    string
 	TiDBCloudOrganizationID string
 	ClusterID               string
 	ProvisioningKey         []byte
@@ -123,17 +141,17 @@ type TenantPlacement struct {
 
 // SharedDBPoolMetricSnapshot is the central-meta view used by the existing
 // tenant metrics pass. TenantCount is the capacity counter maintained with
-// placement writes; TenantStates and TenantSpendingLimitSum are recomputed
-// from placements so counter drift remains visible in exported metrics.
+// placement writes; TenantStates is recomputed from placements so counter
+// drift remains visible in exported metrics.
 type SharedDBPoolMetricSnapshot struct {
 	ID                      int64
+	UUID                    string
 	TiDBCloudOrganizationID string
 	Status                  string
 	MaxTenants              int
 	TenantCount             int
 	SoftCapReached          bool
 	SpendingLimit           *int64
-	TenantSpendingLimitSum  int64
 	TenantStates            []SharedDBPoolTenantStateCount
 }
 
@@ -146,7 +164,7 @@ type SharedDBPoolTenantStateCount struct {
 
 // sharedDBSelectColumns lists the db_pool columns read into SharedDB. The
 // `role` column is backtick-quoted because ROLE is reserved in MySQL 8.0.
-const sharedDBSelectColumns = "db_id, org_id, cluster_id, provisioning_key, cloud_provider, region, " +
+const sharedDBSelectColumns = "db_id, uuid, org_id, cluster_id, provisioning_key, cloud_provider, region, " +
 	"`role`, db_host, db_port, db_user, db_password, db_name, db_tls, max_tenants, tenant_count, " +
 	"soft_cap_reached, spending_limit, schema_version, status, created_at, updated_at"
 
@@ -158,6 +176,10 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 	defer observeMeta(ctx, "create_managed_shared_db_pool", start, &err)
 	if in == nil {
 		return 0, fmt.Errorf("shared db pool is required")
+	}
+	poolUUID, err := sharedDBUUID(in.UUID)
+	if err != nil {
+		return 0, err
 	}
 	if len(in.ProvisioningKey) != 32 {
 		return 0, fmt.Errorf("provisioning key must be a 32-byte SHA-256 fingerprint")
@@ -171,11 +193,8 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 	if in.MaxTenants <= 0 {
 		return 0, fmt.Errorf("managed max tenants must be positive")
 	}
-	if in.SpendingLimit == nil || *in.SpendingLimit <= 0 {
-		return 0, fmt.Errorf("managed spending limit must be positive")
-	}
-	if *in.SpendingLimit > int64(1<<31-1) {
-		return 0, fmt.Errorf("managed spending limit exceeds TiDB Cloud int32 maximum")
+	if in.SpendingLimit == nil || *in.SpendingLimit != MaxTiDBCloudSpendingLimit {
+		return 0, fmt.Errorf("managed spending limit must equal TiDB Cloud maximum %d", MaxTiDBCloudSpendingLimit)
 	}
 	var organizationID any
 	if in.TiDBCloudOrganizationID != "" {
@@ -190,9 +209,9 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 		databaseName = in.Name
 	}
 	res, err := s.db.ExecContext(ctx, `INSERT INTO db_pool
-		(org_id, provisioning_key, cloud_provider, region, `+"`role`"+`, db_tls,
+		(uuid, org_id, provisioning_key, cloud_provider, region, `+"`role`"+`, db_tls,
 		 db_password, db_name, max_tenants, tenant_count, soft_cap_reached, spending_limit, schema_version, status)
-		VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, 0, 0, ?, 0, ?)`, organizationID, in.ProvisioningKey,
+		VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, 0, 0, ?, 0, ?)`, poolUUID, organizationID, in.ProvisioningKey,
 		in.CloudProvider, in.Region, SharedDBRoleShared, passwordCipher, databaseName,
 		in.MaxTenants, *in.SpendingLimit,
 		SharedDBStatusProvisioning)
@@ -444,14 +463,11 @@ func (s *Store) ListSharedDBsByStatus(ctx context.Context, status string, limit 
 // FindSharedDBForAllocation selects the oldest eligible exact-organization
 // pool, preferring active over provisioning. Before organization resolution,
 // callers may instead supply the 32-byte provisioning fingerprint. Managed
-// rows enforce exact virtual spending-limit headroom; manual rows with a NULL
-// spending target retain their compatibility behavior.
-func (s *Store) FindSharedDBForAllocation(ctx context.Context, organizationID string, provisioningKey []byte, tenantSpendingLimit int64) (db *SharedDB, err error) {
+// rows use one fixed physical spending limit, so tenant virtual values do not
+// participate in allocation.
+func (s *Store) FindSharedDBForAllocation(ctx context.Context, organizationID string, provisioningKey []byte) (db *SharedDB, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "find_shared_db_for_allocation", start, &err)
-	if tenantSpendingLimit < 0 {
-		return nil, fmt.Errorf("tenant spending limit must not be negative")
-	}
 	identityColumn := "org_id"
 	var identity any = organizationID
 	if organizationID == "" {
@@ -465,15 +481,9 @@ func (s *Store) FindSharedDBForAllocation(ctx context.Context, organizationID st
 		"WHERE d." + identityColumn + " = ? AND d.`role` = ? " +
 		"AND d.status IN (?, ?) " +
 		"AND (d.max_tenants = 0 OR (d.soft_cap_reached = 0 AND d.tenant_count < d.max_tenants)) " +
-		`AND (d.spending_limit IS NULL OR
-			COALESCE((SELECT SUM(q.tidbcloud_spending_limit)
-				FROM tenant_placements p
-				JOIN fs_registry f ON f.fs_id = p.fs_id
-				JOIN tenant_quota_config q ON q.tenant_id = f.tenant_id
-				WHERE p.db_id = d.db_id), 0) + ? < d.spending_limit)
-		ORDER BY CASE d.status WHEN 'active' THEN 0 ELSE 1 END, d.db_id LIMIT 1`
+		"ORDER BY CASE d.status WHEN 'active' THEN 0 ELSE 1 END, d.db_id LIMIT 1"
 	db, err = scanSharedDBRow(s.db.QueryRowContext(ctx, query, identity, SharedDBRoleShared,
-		SharedDBStatusActive, SharedDBStatusProvisioning, tenantSpendingLimit))
+		SharedDBStatusActive, SharedDBStatusProvisioning))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -486,24 +496,20 @@ func (s *Store) FindSharedDBForAllocation(ctx context.Context, organizationID st
 // FindSharedDBForEmergency selects the least-loaded active managed pool below
 // its own runtime-derived hard cap. It is used only after a physical create
 // failure on a direct request; refill and prewarm must never call it.
-func (s *Store) FindSharedDBForEmergency(ctx context.Context, organizationID string, hardCapRatio float64, tenantSpendingLimit int64) (*SharedDB, error) {
+func (s *Store) FindSharedDBForEmergency(ctx context.Context, organizationID string, hardCapRatio float64) (*SharedDB, error) {
 	if organizationID == "" {
 		return nil, fmt.Errorf("organization id is required")
 	}
-	if hardCapRatio <= 1 || tenantSpendingLimit < 0 {
+	if hardCapRatio <= 1 {
 		return nil, fmt.Errorf("invalid emergency capacity arguments")
 	}
 	query := "SELECT " + sharedDBSelectColumns + " FROM db_pool d " +
 		"WHERE d.org_id = ? AND d.`role` = ? AND d.status = ? " +
-		"AND d.max_tenants > 0 AND d.tenant_count < CEIL(d.max_tenants * ?) AND d.spending_limit IS NOT NULL " +
-		`AND COALESCE((SELECT SUM(q.tidbcloud_spending_limit)
-			FROM tenant_placements p
-			JOIN fs_registry f ON f.fs_id = p.fs_id
-			JOIN tenant_quota_config q ON q.tenant_id = f.tenant_id
-			WHERE p.db_id = d.db_id), 0) + ? < d.spending_limit
-		ORDER BY d.tenant_count ASC, d.db_id ASC LIMIT 1`
+		"AND d.spending_limit IS NOT NULL " +
+		"AND d.max_tenants > 0 AND d.tenant_count < CEIL(d.max_tenants * ?) " +
+		"ORDER BY d.tenant_count ASC, d.db_id ASC LIMIT 1"
 	db, err := scanSharedDBRow(s.db.QueryRowContext(ctx, query, organizationID, SharedDBRoleShared,
-		SharedDBStatusActive, hardCapRatio, tenantSpendingLimit))
+		SharedDBStatusActive, hardCapRatio))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -522,6 +528,10 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 	defer observeMeta(ctx, "register_shared_db", start, &err)
 	if in == nil {
 		return 0, fmt.Errorf("shared db is required")
+	}
+	poolUUID, err := sharedDBUUID(in.UUID)
+	if err != nil {
+		return 0, err
 	}
 	if in.Host == "" {
 		return 0, fmt.Errorf("db host is required")
@@ -556,12 +566,12 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 		status = sharedDBStatusActive
 	}
 	if _, err := s.db.ExecContext(ctx,
-		"INSERT INTO db_pool (org_id, `role`, db_host, db_port, db_user, db_password, db_name, "+
-			"db_tls, max_tenants, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "+
+		"INSERT INTO db_pool (uuid, org_id, `role`, db_host, db_port, db_user, db_password, db_name, "+
+			"db_tls, max_tenants, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "+
 			"ON DUPLICATE KEY UPDATE db_port = VALUES(db_port), db_user = VALUES(db_user), "+
 			"db_password = VALUES(db_password), db_tls = VALUES(db_tls), "+
 			"max_tenants = VALUES(max_tenants), status = VALUES(status)",
-		in.TiDBCloudOrganizationID, role, in.Host, in.Port, in.User, in.PasswordCipher, in.Name,
+		poolUUID, in.TiDBCloudOrganizationID, role, in.Host, in.Port, in.User, in.PasswordCipher, in.Name,
 		in.TLSMode, in.MaxTenants, status); err != nil {
 		return 0, fmt.Errorf("upsert db_pool row: %w", err)
 	}
@@ -682,17 +692,10 @@ func (s *Store) ListSharedDBPoolMetricSnapshots(ctx context.Context) (out []Shar
 	start := time.Now()
 	defer observeMeta(ctx, "list_shared_db_pool_metric_snapshots", start, &err)
 	rows, err := s.db.QueryContext(ctx, `SELECT
-			d.db_id, COALESCE(d.org_id, ''), d.status, d.max_tenants, d.tenant_count, d.soft_cap_reached,
-			d.spending_limit, COALESCE(quota.tenant_sum, 0),
+			d.db_id, d.uuid, COALESCE(d.org_id, ''), d.status, d.max_tenants, d.tenant_count, d.soft_cap_reached,
+			d.spending_limit,
 			COALESCE(states.tenant_status, ''), COALESCE(states.tenant_count, 0)
 		FROM db_pool d
-		LEFT JOIN (
-			SELECT p.db_id, COALESCE(SUM(q.tidbcloud_spending_limit), 0) AS tenant_sum
-			FROM tenant_placements p
-			JOIN fs_registry f ON f.fs_id = p.fs_id
-			JOIN tenant_quota_config q ON q.tenant_id = f.tenant_id
-			GROUP BY p.db_id
-		) quota ON quota.db_id = d.db_id
 		LEFT JOIN (
 			SELECT p.db_id, t.status AS tenant_status, COUNT(*) AS tenant_count
 			FROM tenant_placements p
@@ -709,21 +712,20 @@ func (s *Store) ListSharedDBPoolMetricSnapshots(ctx context.Context) (out []Shar
 	byID := make(map[int64]int)
 	for rows.Next() {
 		var id int64
-		var organizationID, status, tenantStatus string
+		var dbPoolUUID, organizationID, status, tenantStatus string
 		var maxTenants, tenantCount int
 		var softCapReached bool
 		var spendingLimit sql.NullInt64
-		var tenantSpendingLimitSum, stateCount int64
-		if err := rows.Scan(&id, &organizationID, &status, &maxTenants, &tenantCount, &softCapReached,
-			&spendingLimit, &tenantSpendingLimitSum, &tenantStatus, &stateCount); err != nil {
+		var stateCount int64
+		if err := rows.Scan(&id, &dbPoolUUID, &organizationID, &status, &maxTenants, &tenantCount, &softCapReached,
+			&spendingLimit, &tenantStatus, &stateCount); err != nil {
 			return nil, fmt.Errorf("scan shared db pool metric snapshot: %w", err)
 		}
 		index, ok := byID[id]
 		if !ok {
 			snapshot := SharedDBPoolMetricSnapshot{
-				ID: id, TiDBCloudOrganizationID: organizationID, Status: status,
+				ID: id, UUID: dbPoolUUID, TiDBCloudOrganizationID: organizationID, Status: status,
 				MaxTenants: maxTenants, TenantCount: tenantCount, SoftCapReached: softCapReached,
-				TenantSpendingLimitSum: tenantSpendingLimitSum,
 			}
 			if spendingLimit.Valid {
 				value := spendingLimit.Int64
@@ -876,12 +878,8 @@ func (s *Store) DeleteTenantPlacement(ctx context.Context, fsID int64) (err erro
 // (max_tenants reached).
 var ErrSharedDBCapacityExhausted = errors.New("shared db capacity exhausted")
 
-// ErrSharedDBSpendingLimitExceeded is returned when a managed pool's fixed
-// spending target cannot accommodate a new or increased tenant virtual limit.
-var ErrSharedDBSpendingLimitExceeded = errors.New("shared db spending limit exceeded")
-
-// ErrSharedDBQuotaNotMaterialized is returned when a managed-pool reservation
-// is attempted before the tenant's effective quota row has been persisted.
+// ErrSharedDBQuotaNotMaterialized is returned when a shared tenant quota
+// mutation is attempted before the compatibility row has been persisted.
 var ErrSharedDBQuotaNotMaterialized = errors.New("shared tenant quota is not materialized")
 
 // CompleteSharedTenantProvision atomically performs every meta write that
@@ -976,10 +974,9 @@ func (s *Store) completeSharedTenantProvision(ctx context.Context, tenantID, pro
 		var clusterID sql.NullString
 		var maxTenants, tenantCount int
 		var softCapReached bool
-		var poolSpendingLimit sql.NullInt64
-		if err := tx.QueryRowContext(ctx, `SELECT status, cluster_id, max_tenants, tenant_count, soft_cap_reached, spending_limit
+		if err := tx.QueryRowContext(ctx, `SELECT status, cluster_id, max_tenants, tenant_count, soft_cap_reached
 			FROM db_pool WHERE db_id = ? FOR UPDATE`, p.DbID).
-			Scan(&dbPoolStatus, &clusterID, &maxTenants, &tenantCount, &softCapReached, &poolSpendingLimit); err != nil {
+			Scan(&dbPoolStatus, &clusterID, &maxTenants, &tenantCount, &softCapReached); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -994,43 +991,15 @@ func (s *Store) completeSharedTenantProvision(ctx context.Context, tenantID, pro
 				return fmt.Errorf("db pool %d soft capacity exhausted: count=%d max=%d latch=%t: %w", p.DbID, tenantCount, maxTenants, softCapReached, ErrSharedDBCapacityExhausted)
 			}
 		case SharedDBCapacityEmergency:
-			if dbPoolStatus != SharedDBStatusActive || maxTenants <= 0 || hardCap < maxTenants || tenantCount >= hardCap || !poolSpendingLimit.Valid {
+			if dbPoolStatus != SharedDBStatusActive || maxTenants <= 0 || hardCap < maxTenants || tenantCount >= hardCap {
 				return ErrSharedDBCapacityExhausted
-			}
-		}
-		if poolSpendingLimit.Valid {
-			var tenantSpendingLimit sql.NullInt64
-			if err := tx.QueryRowContext(ctx, `SELECT tidbcloud_spending_limit
-				FROM tenant_quota_config WHERE tenant_id = ? FOR UPDATE`, tenantID).
-				Scan(&tenantSpendingLimit); err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return ErrSharedDBQuotaNotMaterialized
-				}
-				return fmt.Errorf("load quota for tenant %s: %w", tenantID, err)
-			}
-			if !tenantSpendingLimit.Valid {
-				return ErrSharedDBQuotaNotMaterialized
-			}
-			var currentSum int64
-			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(q.tidbcloud_spending_limit), 0)
-				FROM tenant_placements p
-				JOIN fs_registry f ON f.fs_id = p.fs_id
-				JOIN tenant_quota_config q ON q.tenant_id = f.tenant_id
-				WHERE p.db_id = ?`, p.DbID).Scan(&currentSum); err != nil {
-				return fmt.Errorf("sum tenant spending limits for db pool %d: %w", p.DbID, err)
-			}
-			prospective := currentSum + tenantSpendingLimit.Int64
-			// Keep strict headroom: the physical pool spending limit must remain
-			// greater than, never merely equal to, the sum of tenant virtual limits.
-			if prospective < currentSum || prospective > int64(1<<31-1) || prospective >= poolSpendingLimit.Int64 {
-				return ErrSharedDBSpendingLimitExceeded
 			}
 		}
 		var res sql.Result
 		if capacityMode == SharedDBCapacityEmergency {
 			res, err = tx.ExecContext(ctx, `UPDATE db_pool
 				SET tenant_count = tenant_count + 1, soft_cap_reached = 1
-				WHERE db_id = ? AND status = ? AND spending_limit IS NOT NULL
+				WHERE db_id = ? AND status = ?
 					AND max_tenants > 0 AND tenant_count + 1 <= ?`,
 				p.DbID, SharedDBStatusActive, hardCap)
 		} else {
@@ -1282,7 +1251,7 @@ func scanSharedDBScanner(row sharedDBScanner) (*SharedDB, error) {
 	var organizationID, clusterID, cloudProvider, region sql.NullString
 	var host, user, name sql.NullString
 	var port, spendingLimit sql.NullInt64
-	if err := row.Scan(&rec.ID, &organizationID, &clusterID, &rec.ProvisioningKey, &cloudProvider, &region,
+	if err := row.Scan(&rec.ID, &rec.UUID, &organizationID, &clusterID, &rec.ProvisioningKey, &cloudProvider, &region,
 		&rec.Role, &host, &port, &user, &rec.PasswordCipher, &name, &rec.TLSMode,
 		&rec.MaxTenants, &rec.TenantCount, &rec.SoftCapReached, &spendingLimit, &rec.SchemaVersion, &rec.Status,
 		&rec.CreatedAt, &rec.UpdatedAt); err != nil {

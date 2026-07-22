@@ -200,10 +200,6 @@ func main() {
 	if err != nil {
 		die(err)
 	}
-	sharedDBDefaultSpendingLimit, err := sharedDBDefaultSpendingLimitFromEnv()
-	if err != nil {
-		die(err)
-	}
 	maxUploadBytes := server.DefaultMaxUploadBytes
 	if raw := os.Getenv("DRIVE9_MAX_UPLOAD_BYTES"); raw != "" {
 		maxUploadBytes, err = strconv.ParseInt(raw, 10, 64)
@@ -449,7 +445,6 @@ func main() {
 		SharedDBMaxTenants:              sharedDBMaxTenants,
 		SharedDBHardCapRatio:            sharedDBHardCapRatio,
 		SharedDBReopenRatio:             sharedDBReopenRatio,
-		SharedDBDefaultSpendingLimit:    sharedDBDefaultSpendingLimit,
 		LegacyStarterProvisioner:        legacyStarterProvisioner,
 		TokenSecret:                     tokenSecret,
 		VaultMasterKey:                  vaultMasterKey,
@@ -681,7 +676,6 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_MAX_TENANTS soft capacity for new managed shared DB pools (default: 100)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO emergency hard-cap ratio > 1 after physical create failure (default: 1.2)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_REOPEN_RATIO reopen ratio for a latched shared pool (default: 0.8)
-  DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT default managed shared DB-pool spending target (default: 10000000)
   DRIVE9_TIDBCLOUD_PRIVATE_ENDPOINT_HOST_MAP comma-separated public_host=private_host mappings (also accepts public_host:private_host);
                                              when set, disables legacy single-host private endpoint overrides
   DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST legacy tencentcloud private endpoint fallback host, used only when host map is unset
@@ -1218,18 +1212,6 @@ func sharedDBMaxTenantsFromEnv() (int, error) {
 	v, err := strconv.Atoi(raw)
 	if err != nil || v <= 0 {
 		return 0, fmt.Errorf("invalid DRIVE9_TIDBCLOUD_NATIVE_SHARED_MAX_TENANTS=%q: must be a positive integer", raw)
-	}
-	return v, nil
-}
-
-func sharedDBDefaultSpendingLimitFromEnv() (int64, error) {
-	raw := strings.TrimSpace(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT"))
-	if raw == "" {
-		return 10_000_000, nil
-	}
-	v, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || v <= 0 || v > int64(1<<31-1) {
-		return 0, fmt.Errorf("invalid DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT=%q: must be in (0,%d]", raw, int64(1<<31-1))
 	}
 	return v, nil
 }

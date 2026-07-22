@@ -41,13 +41,25 @@ func OpenInstrumentedForTenant(ctx context.Context, dsn, role, tenantID string) 
 }
 
 func OpenInstrumentedForTenantWithOrg(ctx context.Context, dsn, role, tenantID, tidbCloudOrgID string) (*sql.DB, error) {
+	return openInstrumented(ctx, dsn, role, func(db *sql.DB) {
+		metrics.RegisterTenantDBWithOrg(role, tenantID, tidbCloudOrgID, db)
+	})
+}
+
+func OpenInstrumentedForSharedDB(ctx context.Context, dsn, dbPoolUUID, tidbCloudOrgID string) (*sql.DB, error) {
+	return openInstrumented(ctx, dsn, RoleShared, func(db *sql.DB) {
+		metrics.RegisterSharedDBWithOrg(dbPoolUUID, tidbCloudOrgID, db)
+	})
+}
+
+func openInstrumented(ctx context.Context, dsn, role string, register func(*sql.DB)) (*sql.DB, error) {
 	connector, err := (&mysql.MySQLDriver{}).OpenConnector(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open mysql connector: %w", err)
 	}
 	db := sql.OpenDB(instrumentedConnector{base: connector, role: role})
 	ApplyPoolDefaults(db, role)
-	metrics.RegisterTenantDBWithOrg(role, tenantID, tidbCloudOrgID, db)
+	register(db)
 	if err := db.PingContext(ctx); err != nil {
 		metrics.UnregisterDB(db)
 		_ = db.Close()

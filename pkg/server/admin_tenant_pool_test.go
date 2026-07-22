@@ -306,7 +306,7 @@ func TestDeleteFreeSharedPoolTenantSkipsPurgeWhenDBPoolIsUnready(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	spendingTarget := int64(10_000_000)
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
 	dbID, err := rt.meta.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-unready-delete", ProvisioningKey: make([]byte, 32),
 		CloudProvider: "aws", Region: "us-east-1",

@@ -27,6 +27,7 @@ const (
 type sharedDBPoolMetricKey struct {
 	kind           string
 	dbPoolID       int64
+	dbPoolUUID     string
 	tidbCloudOrgID string
 	dimension      string
 }
@@ -96,13 +97,14 @@ func (s *Server) observeSharedDBPoolMetrics(ctx context.Context) {
 	}
 
 	next := make(map[sharedDBPoolMetricKey]struct{})
-	totals := make(map[sharedDBPoolMetricKey]int64)
 	for _, snapshot := range snapshots {
 		orgID := snapshot.TiDBCloudOrganizationID
 		totalKey := sharedDBPoolMetricKey{
-			kind: sharedDBPoolMetricTotal, tidbCloudOrgID: orgID, dimension: snapshot.Status,
+			kind: sharedDBPoolMetricTotal, dbPoolID: snapshot.ID, dbPoolUUID: snapshot.UUID,
+			tidbCloudOrgID: orgID, dimension: snapshot.Status,
 		}
-		totals[totalKey]++
+		metrics.RecordSharedDBPoolTotal(orgID, snapshot.ID, snapshot.UUID, snapshot.Status, 1)
+		next[totalKey] = struct{}{}
 
 		free := int64(0)
 		if snapshot.MaxTenants > snapshot.TenantCount && !snapshot.SoftCapReached {
@@ -118,36 +120,26 @@ func (s *Server) observeSharedDBPoolMetrics(ctx context.Context) {
 			"soft_max": int64(snapshot.MaxTenants), "hard_max": hardMax,
 			"used": int64(snapshot.TenantCount), "free": free,
 		} {
-			metrics.RecordSharedDBPoolCapacity(orgID, snapshot.ID, capacityType, value)
+			metrics.RecordSharedDBPoolCapacity(orgID, snapshot.ID, snapshot.UUID, capacityType, value)
 			next[sharedDBPoolMetricKey{
-				kind: sharedDBPoolMetricCapacity, dbPoolID: snapshot.ID,
+				kind: sharedDBPoolMetricCapacity, dbPoolID: snapshot.ID, dbPoolUUID: snapshot.UUID,
 				tidbCloudOrgID: orgID, dimension: capacityType,
 			}] = struct{}{}
 		}
 		for _, state := range snapshot.TenantStates {
-			metrics.RecordSharedDBPoolTenants(orgID, snapshot.ID, string(state.State), state.Count)
+			metrics.RecordSharedDBPoolTenants(orgID, snapshot.ID, snapshot.UUID, string(state.State), state.Count)
 			next[sharedDBPoolMetricKey{
-				kind: sharedDBPoolMetricTenants, dbPoolID: snapshot.ID,
+				kind: sharedDBPoolMetricTenants, dbPoolID: snapshot.ID, dbPoolUUID: snapshot.UUID,
 				tidbCloudOrgID: orgID, dimension: string(state.State),
 			}] = struct{}{}
 		}
 		if snapshot.SpendingLimit != nil {
-			for limitType, value := range map[string]int64{
-				"target":     *snapshot.SpendingLimit,
-				"tenant_sum": snapshot.TenantSpendingLimitSum,
-				"headroom":   *snapshot.SpendingLimit - snapshot.TenantSpendingLimitSum,
-			} {
-				metrics.RecordSharedDBPoolSpendingLimit(orgID, snapshot.ID, limitType, value)
-				next[sharedDBPoolMetricKey{
-					kind: sharedDBPoolMetricSpending, dbPoolID: snapshot.ID,
-					tidbCloudOrgID: orgID, dimension: limitType,
-				}] = struct{}{}
-			}
+			metrics.RecordSharedDBPoolSpendingLimit(orgID, snapshot.ID, snapshot.UUID, "target", *snapshot.SpendingLimit)
+			next[sharedDBPoolMetricKey{
+				kind: sharedDBPoolMetricSpending, dbPoolID: snapshot.ID, dbPoolUUID: snapshot.UUID,
+				tidbCloudOrgID: orgID, dimension: "target",
+			}] = struct{}{}
 		}
-	}
-	for key, count := range totals {
-		metrics.RecordSharedDBPoolTotal(key.tidbCloudOrgID, key.dimension, count)
-		next[key] = struct{}{}
 	}
 	if s.metrics != nil {
 		s.metrics.syncSharedDBPoolSnapshot(next)
@@ -211,12 +203,12 @@ func (m *serverMetrics) clearSharedDBPoolSnapshot() {
 func deleteSharedDBPoolMetric(key sharedDBPoolMetricKey) {
 	switch key.kind {
 	case sharedDBPoolMetricTotal:
-		metrics.DeleteSharedDBPoolTotal(key.tidbCloudOrgID, key.dimension)
+		metrics.DeleteSharedDBPoolTotal(key.tidbCloudOrgID, key.dbPoolID, key.dbPoolUUID, key.dimension)
 	case sharedDBPoolMetricCapacity:
-		metrics.DeleteSharedDBPoolCapacity(key.tidbCloudOrgID, key.dbPoolID, key.dimension)
+		metrics.DeleteSharedDBPoolCapacity(key.tidbCloudOrgID, key.dbPoolID, key.dbPoolUUID, key.dimension)
 	case sharedDBPoolMetricTenants:
-		metrics.DeleteSharedDBPoolTenants(key.tidbCloudOrgID, key.dbPoolID, key.dimension)
+		metrics.DeleteSharedDBPoolTenants(key.tidbCloudOrgID, key.dbPoolID, key.dbPoolUUID, key.dimension)
 	case sharedDBPoolMetricSpending:
-		metrics.DeleteSharedDBPoolSpendingLimit(key.tidbCloudOrgID, key.dbPoolID, key.dimension)
+		metrics.DeleteSharedDBPoolSpendingLimit(key.tidbCloudOrgID, key.dbPoolID, key.dbPoolUUID, key.dimension)
 	}
 }

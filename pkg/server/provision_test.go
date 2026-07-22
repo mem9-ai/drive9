@@ -171,7 +171,7 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 	if err != nil {
 		t.Fatalf("GetSharedDB: %v", err)
 	}
-	if dbPool.MaxTenants != 100 || dbPool.TenantCount != 1 || dbPool.SpendingLimit == nil || *dbPool.SpendingLimit != 10_000_000 {
+	if dbPool.MaxTenants != 100 || dbPool.TenantCount != 1 || dbPool.SpendingLimit == nil || *dbPool.SpendingLimit != meta.MaxTiDBCloudSpendingLimit {
 		t.Fatalf("managed pool policy = %+v", dbPool)
 	}
 	quota, err := metaStore.GetQuotaConfig(context.Background(), res.TenantID)
@@ -213,7 +213,7 @@ func TestProvisionTiDBCloudNativeSharedFallsBackToHardCapacityAfterCreateFailure
 		sharedPoolBatchErr: provisionErr,
 		managedClusters:    []tenant.CloudClusterInfo{{OrganizationID: "org-emergency", ClusterID: "cluster-existing"}},
 	}
-	spendingTarget := int64(10_000)
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
 	activeID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-emergency", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
 		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 2, SpendingLimit: &spendingTarget,
@@ -297,7 +297,7 @@ func TestProvisionTiDBCloudNativeSharedEmergencyUsesCandidateHardCap(t *testing.
 		sharedPoolBatchErr: provisionErr,
 		managedClusters:    []tenant.CloudClusterInfo{{OrganizationID: "org-candidate-hard-cap", ClusterID: "cluster-existing"}},
 	}
-	spendingTarget := int64(10_000_000)
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
 	createActive := func(maxTenants, tenantCount int, clusterID string) int64 {
 		t.Helper()
 		dbID, createErr := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
@@ -356,7 +356,7 @@ func TestProvisionTiDBCloudNativeSharedRetriesCapacityRace(t *testing.T) {
 	p.SetMetaStore(metaStore)
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1",
 		managedClusters: []tenant.CloudClusterInfo{{OrganizationID: "org-direct-race", ClusterID: "cluster-existing"}}}
-	spendingTarget := int64(10_000_000)
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
 	for i := 0; i < 2; i++ {
 		dbID, createErr := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
 			TiDBCloudOrganizationID: "org-direct-race", ProvisioningKey: bytes.Repeat([]byte{byte(i + 1)}, 32),
@@ -429,7 +429,7 @@ func TestProvisionTiDBCloudNativeSharedResumesExistingProvisioningPool(t *testin
 			ClusterID: "cluster-existing", OrganizationID: "org-shared", Password: "root-pass", DBName: "tidbcloud_fs",
 		}},
 	}
-	spendingTarget := int64(10_000_000)
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
 	provisioningKey := sharedDBProvisioningKey(tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
 	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
 		ProvisioningKey: provisioningKey, CloudProvider: "aws", Region: "us-east-1",
@@ -601,7 +601,7 @@ func TestManagedSharedDBContinuationWaitsForConnectionMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	spendingTarget := int64(10_000_000)
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
 	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-metadata-wait", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
 		CloudProvider: "aws", Region: "us-east-1",
@@ -653,7 +653,7 @@ func TestManagedSharedDBBatchCreateUsesAllocationLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	spendingTarget := int64(10_000_000)
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
 	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-batch-lock", ProvisioningKey: bytes.Repeat([]byte{2}, 32),
 		CloudProvider: "aws", Region: "us-east-1",
@@ -724,7 +724,7 @@ func TestManagedSharedDBBatchCreateReturnsTotalFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	spendingTarget := int64(10_000_000)
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
 	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-batch-failure", ProvisioningKey: bytes.Repeat([]byte{9}, 32),
 		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
@@ -791,6 +791,9 @@ func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context
 			if copyRow.DBPoolID == 0 && i < len(requests) {
 				copyRow.DBPoolID = requests[i].DBPoolID
 			}
+			if copyRow.DBPoolUUID == "" && i < len(requests) {
+				copyRow.DBPoolUUID = requests[i].DBPoolUUID
+			}
 			out[i] = &copyRow
 		}
 		return out, nil
@@ -798,27 +801,28 @@ func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context
 	out := make([]*tenant.SharedDBPoolInfo, 0, len(requests))
 	for _, req := range requests {
 		out = append(out, &tenant.SharedDBPoolInfo{
-			DBPoolID: req.DBPoolID, ClusterID: fmt.Sprintf("cluster-%d", req.DBPoolID),
+			DBPoolID: req.DBPoolID, DBPoolUUID: req.DBPoolUUID, ClusterID: fmt.Sprintf("cluster-%d", req.DBPoolID),
 			OrganizationID: "org-shared", Password: "root-pass", DBName: req.DatabaseName,
 		})
 	}
 	return out, nil
 }
 
-func (f *fakeProvisioner) LoadSharedDBPoolWithCredentials(_ context.Context, _ int64, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+func (f *fakeProvisioner) LoadSharedDBPoolWithCredentials(_ context.Context, _ int64, dbPoolUUID, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
 	if clusterID == "" {
 		return nil, nil
 	}
 	for _, row := range f.sharedPoolResults {
 		if row != nil && row.ClusterID == clusterID {
 			copyRow := *row
+			copyRow.DBPoolUUID = dbPoolUUID
 			return &copyRow, nil
 		}
 	}
 	return nil, nil
 }
 
-func (f *fakeProvisioner) WaitForSharedDBPoolMetadataWithCredentials(_ context.Context, dbPoolID int64, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+func (f *fakeProvisioner) WaitForSharedDBPoolMetadataWithCredentials(_ context.Context, dbPoolID int64, dbPoolUUID, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
 	f.sharedPoolWaitCalls.Add(1)
 	if f.sharedPoolWaitErr != nil {
 		return nil, f.sharedPoolWaitErr
@@ -827,6 +831,7 @@ func (f *fakeProvisioner) WaitForSharedDBPoolMetadataWithCredentials(_ context.C
 		if row != nil && row.ClusterID == clusterID {
 			copyRow := *row
 			copyRow.DBPoolID = dbPoolID
+			copyRow.DBPoolUUID = dbPoolUUID
 			return &copyRow, nil
 		}
 	}

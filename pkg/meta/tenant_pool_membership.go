@@ -321,7 +321,7 @@ func (s *Store) DetachUsedTenantPoolMemberships(ctx context.Context, poolID stri
 }
 
 // ClaimSharedTenantPoolMembership atomically finalizes a free shared member:
-// quota patch, capacity-headroom validation, membership CAS, and owner key.
+// virtual quota patch, membership CAS, and owner key.
 func (s *Store) ClaimSharedTenantPoolMembership(ctx context.Context, tenantID, poolID string, patch QuotaConfigPatch, k *APIKey) (err error) {
 	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(poolID) == "" || k == nil {
 		return fmt.Errorf("tenant id, pool id, and api key are required")
@@ -332,16 +332,14 @@ func (s *Store) ClaimSharedTenantPoolMembership(ctx context.Context, tenantID, p
 	}
 	return s.InTx(ctx, func(tx *sql.Tx) error {
 		var dbID int64
-		var poolLimit sql.NullInt64
-		if err := tx.QueryRowContext(ctx, `SELECT p.db_id, d.spending_limit
+		if err := tx.QueryRowContext(ctx, `SELECT p.db_id
 			FROM tenant_pool_memberships m
 			JOIN tenants t ON t.id = m.tenant_id
 			JOIN fs_registry f ON f.tenant_id = t.id
 			JOIN tenant_placements p ON p.fs_id = f.fs_id
-			JOIN db_pool d ON d.db_id = p.db_id
 			WHERE m.tenant_id = ? AND m.pool_id = ? AND m.pool_status = ?
 				AND t.provider = ? AND t.status = ? FOR UPDATE`, tenantID, poolID,
-			TenantPoolBindingFree, tidbCloudNativeSharedProvider, TenantActive).Scan(&dbID, &poolLimit); err != nil {
+			TenantPoolBindingFree, tidbCloudNativeSharedProvider, TenantActive).Scan(&dbID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -365,18 +363,6 @@ func (s *Store) ClaimSharedTenantPoolMembership(ctx context.Context, tenantID, p
 		nextSpending := spending.Int64
 		if patch.TiDBCloudSpendingLimit != nil {
 			nextSpending = *patch.TiDBCloudSpendingLimit
-		}
-		if poolLimit.Valid && nextSpending > spending.Int64 {
-			var currentSum int64
-			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(q.tidbcloud_spending_limit), 0)
-				FROM tenant_placements p JOIN fs_registry f ON f.fs_id = p.fs_id
-				JOIN tenant_quota_config q ON q.tenant_id = f.tenant_id WHERE p.db_id = ?`, dbID).Scan(&currentSum); err != nil {
-				return err
-			}
-			prospective := currentSum - spending.Int64 + nextSpending
-			if prospective < 0 || prospective > int64(1<<31-1) || prospective >= poolLimit.Int64 {
-				return ErrSharedDBSpendingLimitExceeded
-			}
 		}
 		if patch.MaxStorageBytes != nil {
 			storage = *patch.MaxStorageBytes

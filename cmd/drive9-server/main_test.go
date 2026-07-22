@@ -208,10 +208,7 @@ func TestSharedDBReopenRatioFromEnv(t *testing.T) {
 }
 
 func TestSharedDBCapacityConfigFromEnv(t *testing.T) {
-	keys := []string{
-		"DRIVE9_TIDBCLOUD_NATIVE_SHARED_MAX_TENANTS",
-		"DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT",
-	}
+	keys := []string{"DRIVE9_TIDBCLOUD_NATIVE_SHARED_MAX_TENANTS"}
 	restore := snapshotEnv(t, keys)
 	t.Cleanup(func() { restoreEnv(t, restore) })
 
@@ -223,35 +220,15 @@ func TestSharedDBCapacityConfigFromEnv(t *testing.T) {
 	if maxTenants != 100 {
 		t.Fatalf("empty max tenants = %d, want 100", maxTenants)
 	}
-	spendingLimit, err := sharedDBDefaultSpendingLimitFromEnv()
-	if err != nil {
-		t.Fatalf("sharedDBDefaultSpendingLimitFromEnv empty: %v", err)
-	}
-	if spendingLimit != 10_000_000 {
-		t.Fatalf("empty spending limit = %d, want 10000000", spendingLimit)
-	}
-
 	setEnv(t, keys[0], "250")
 	maxTenants, err = sharedDBMaxTenantsFromEnv()
 	if err != nil || maxTenants != 250 {
 		t.Fatalf("valid max tenants = %d/%v, want 250/nil", maxTenants, err)
 	}
-	setEnv(t, keys[1], "20000000")
-	spendingLimit, err = sharedDBDefaultSpendingLimitFromEnv()
-	if err != nil || spendingLimit != 20_000_000 {
-		t.Fatalf("valid spending limit = %d/%v, want 20000000/nil", spendingLimit, err)
-	}
-
 	for _, raw := range []string{"0", "-1", "bad"} {
 		setEnv(t, keys[0], raw)
 		if _, err := sharedDBMaxTenantsFromEnv(); err == nil {
 			t.Fatalf("max tenants %q error = nil, want error", raw)
-		}
-	}
-	for _, raw := range []string{"0", "-1", "2147483648", "bad"} {
-		setEnv(t, keys[1], raw)
-		if _, err := sharedDBDefaultSpendingLimitFromEnv(); err == nil {
-			t.Fatalf("spending limit %q error = nil, want error", raw)
 		}
 	}
 }
