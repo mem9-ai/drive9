@@ -263,7 +263,7 @@ func (s *Server) handleSharedTenantDeleteWithStatusWriter(
 			var enqueueErr error
 			status, enqueueErr = s.enqueueTenantDeleteJob(ctx, t)
 			if enqueueErr != nil {
-				errJSON(w, backendErrorStatus(r.Context(), err), "failed to enqueue tenant delete cleanup")
+				errJSON(w, backendErrorStatus(r.Context(), enqueueErr), "failed to enqueue tenant delete cleanup")
 				return
 			}
 		}
