@@ -35,6 +35,12 @@ func TestSharedTenantDeleteRetriesAfterPlacementRemoval(t *testing.T) {
 	if err := rt.meta.UpdateTenantStatus(ctx, rt.tenantID, meta.TenantDeleting); err != nil {
 		t.Fatal(err)
 	}
+	if err := rt.meta.UpsertTenantPoolMembership(ctx, &meta.TenantPoolMembership{
+		TenantID: rt.tenantID, TiDBCloudOrganizationID: "org-shared-delete", PoolID: "pool-shared-delete",
+		PoolStatus: meta.TenantPoolBindingUsed,
+	}); err != nil {
+		t.Fatalf("UpsertTenantPoolMembership: %v", err)
+	}
 
 	resp := rt.deleteTenant(t, nil)
 	defer func() { _ = resp.Body.Close() }()
@@ -53,6 +59,9 @@ func TestSharedTenantDeleteRetriesAfterPlacementRemoval(t *testing.T) {
 	if status != string(meta.TenantDeleted) {
 		t.Fatalf("tenant status = %s, want %s", status, meta.TenantDeleted)
 	}
+	if _, err := rt.meta.GetTenantPoolMembership(ctx, rt.tenantID); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("shared membership after delete = %v, want ErrNotFound", err)
+	}
 }
 
 // TestSharedTenantDeleteWithCleanupJobShortCircuits mirrors the standalone
@@ -67,12 +76,12 @@ func TestSharedTenantDeleteWithCleanupJobShortCircuits(t *testing.T) {
 		t.Fatalf("EnsureFsID: %v", err)
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID:          "org-shared-delete",
-		Host:           "shared.example.com",
-		Port:           4000,
-		User:           "root",
-		PasswordCipher: []byte("cipher"),
-		Name:           "shared_db",
+		TiDBCloudOrganizationID: "org-shared-delete",
+		Host:                    "shared.example.com",
+		Port:                    4000,
+		User:                    "root",
+		PasswordCipher:          []byte("cipher"),
+		Name:                    "shared_db",
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -165,12 +174,12 @@ func TestSharedTenantDeleteFullPurgePath(t *testing.T) {
 		t.Fatalf("EnsureFsID: %v", err)
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID:          "org-shared-delete",
-		Host:           "shared.example.com",
-		Port:           4000,
-		User:           "root",
-		PasswordCipher: []byte("cipher"),
-		Name:           "shared_db",
+		TiDBCloudOrganizationID: "org-shared-delete",
+		Host:                    "shared.example.com",
+		Port:                    4000,
+		User:                    "root",
+		PasswordCipher:          []byte("cipher"),
+		Name:                    "shared_db",
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -220,12 +229,12 @@ func TestAdminTenantCreateRejectsSharedPoolOrg(t *testing.T) {
 		{Clusters: []tenant.CloudClusterInfo{{OrganizationID: "org-shared-1"}}},
 	}
 	if _, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID:          "org-shared-1",
-		Host:           "shared.example.com",
-		Port:           4000,
-		User:           "root",
-		PasswordCipher: []byte("cipher"),
-		Name:           "shared_db",
+		TiDBCloudOrganizationID: "org-shared-1",
+		Host:                    "shared.example.com",
+		Port:                    4000,
+		User:                    "root",
+		PasswordCipher:          []byte("cipher"),
+		Name:                    "shared_db",
 	}); err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
 	}
@@ -308,7 +317,7 @@ func TestSharedTenantDeletePlacementRemovalFailureStaysRetryable(t *testing.T) {
 		t.Fatal(err)
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID: "org-shared-delete", Host: db.DBHost, Port: db.DBPort, User: db.DBUser,
+		TiDBCloudOrganizationID: "org-shared-delete", Host: db.DBHost, Port: db.DBPort, User: db.DBUser,
 		PasswordCipher: passCipher, Name: db.DBName,
 	})
 	if err != nil {
@@ -377,7 +386,7 @@ func TestFindSharedDBForProvisionSkipsNonTiDBProviders(t *testing.T) {
 	testmysql.ResetMetaDB(t, db.Meta.DB())
 	ctx := context.Background()
 	if _, err := db.Meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID: meta.SharedDBOrgWildcard, Host: "shared.example.com", Port: 4000, User: "root",
+		TiDBCloudOrganizationID: meta.SharedDBOrgWildcard, Host: "shared.example.com", Port: 4000, User: "root",
 		PasswordCipher: []byte("cipher"), Name: "shared_db",
 	}); err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -409,7 +418,7 @@ func TestProvisionTenantOnSharedDBCommitsAtomically(t *testing.T) {
 	testmysql.ResetMetaDB(t, db.Meta.DB())
 	ctx := context.Background()
 	dbID, err := db.Meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID: "org-provision-ok", Host: "shared.example.com", Port: 4000, User: "root",
+		TiDBCloudOrganizationID: "org-provision-ok", Host: "shared.example.com", Port: 4000, User: "root",
 		PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 10,
 	})
 	if err != nil {
@@ -485,7 +494,7 @@ func TestProvisionTenantOnSharedDBFailureLeavesNoPartialState(t *testing.T) {
 	testmysql.ResetMetaDB(t, db.Meta.DB())
 	ctx := context.Background()
 	dbID, err := db.Meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		OrgID: "org-provision-fail", Host: "shared.example.com", Port: 4000, User: "root",
+		TiDBCloudOrganizationID: "org-provision-fail", Host: "shared.example.com", Port: 4000, User: "root",
 		PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 10,
 	})
 	if err != nil {

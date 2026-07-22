@@ -1530,6 +1530,29 @@ func TestNewWithConfigRejectsNaNTenantPoolRefillFreeRatio(t *testing.T) {
 	}
 }
 
+func TestNewWithConfigUsesSharedDBReopenRatio(t *testing.T) {
+	s := NewWithConfig(Config{SharedDBReopenRatio: 0.65})
+	if s.sharedDBReopenRatio != 0.65 {
+		t.Fatalf("sharedDBReopenRatio = %f, want 0.65", s.sharedDBReopenRatio)
+	}
+}
+
+func TestNewWithConfigUsesDefaultSharedDBReopenRatio(t *testing.T) {
+	s := NewWithConfig(Config{})
+	if s.sharedDBReopenRatio != DefaultSharedDBReopenRatio {
+		t.Fatalf("default sharedDBReopenRatio = %f, want %f", s.sharedDBReopenRatio, DefaultSharedDBReopenRatio)
+	}
+}
+
+func TestNewWithConfigRejectsInvalidSharedDBReopenRatio(t *testing.T) {
+	for _, ratio := range []float64{0, 1, math.NaN(), math.Inf(1)} {
+		s := NewWithConfig(Config{SharedDBReopenRatio: ratio})
+		if s.sharedDBReopenRatio != DefaultSharedDBReopenRatio {
+			t.Fatalf("invalid sharedDBReopenRatio %v = %f, want %f", ratio, s.sharedDBReopenRatio, DefaultSharedDBReopenRatio)
+		}
+	}
+}
+
 func TestDeclaredContentLengthOverMaxRejected(t *testing.T) {
 	base, _ := newTestServerWithS3(t)
 	s := NewWithConfig(Config{Backend: base.fallback, MaxUploadBytes: 10})

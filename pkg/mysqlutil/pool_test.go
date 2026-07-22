@@ -1,6 +1,9 @@
 package mysqlutil
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestPoolEnvIntUsesRoleSpecificValue(t *testing.T) {
 	t.Setenv("DRIVE9_META_DB_MAX_OPEN_CONNS", "20")
@@ -59,6 +62,14 @@ func TestDefaultPoolLifetime(t *testing.T) {
 	if idleTime != defaultUserSchemaConnMaxIdleTime {
 		t.Fatalf("user schema idle time = %s, want %s", idleTime, defaultUserSchemaConnMaxIdleTime)
 	}
+
+	lifetime, idleTime = defaultPoolLifetime(RoleShared)
+	if lifetime != 30*time.Minute {
+		t.Fatalf("shared lifetime = %s, want 30m", lifetime)
+	}
+	if idleTime != 5*time.Minute {
+		t.Fatalf("shared idle time = %s, want 5m", idleTime)
+	}
 }
 
 func TestDefaultPoolLimits(t *testing.T) {
@@ -84,5 +95,19 @@ func TestDefaultPoolLimits(t *testing.T) {
 	}
 	if maxIdle != defaultUserSchemaMaxIdleConns {
 		t.Fatalf("user schema max idle = %d, want %d", maxIdle, defaultUserSchemaMaxIdleConns)
+	}
+
+	maxOpen, maxIdle = defaultPoolLimits(RoleShared)
+	if maxOpen != 300 || maxIdle != 50 {
+		t.Fatalf("shared limits = %d/%d, want 300/50", maxOpen, maxIdle)
+	}
+}
+
+func TestSharedPoolDurationEnv(t *testing.T) {
+	t.Setenv("DRIVE9_SHARED_DB_CONN_MAX_LIFETIME", "45m")
+	t.Setenv("DRIVE9_SHARED_DB_CONN_MAX_IDLE_TIME", "12m")
+	lifetime, idleTime := poolLifetime(RoleShared)
+	if lifetime != 45*time.Minute || idleTime != 12*time.Minute {
+		t.Fatalf("shared env durations = %s/%s, want 45m/12m", lifetime, idleTime)
 	}
 }

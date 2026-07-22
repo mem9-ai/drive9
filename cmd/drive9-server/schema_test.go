@@ -38,6 +38,30 @@ func TestSchemaDumpInitSQLByProvider(t *testing.T) {
 	}
 }
 
+func TestSchemaDumpInitSQLByProviderShared(t *testing.T) {
+	out := captureSchemaStdout(t, func() {
+		if err := runSchemaCommand([]string{"dump-init-sql", "--provider", "tidb_cloud_native_shared"}); err != nil {
+			t.Fatalf("dump shared provider schema: %v", err)
+		}
+	})
+
+	if got := strings.Count(out, "CREATE TABLE IF NOT EXISTS"); got != 30 {
+		t.Fatalf("shared schema table count = %d, want 30", got)
+	}
+	if !strings.Contains(out, "fs_id") || !strings.Contains(out, "PRIMARY KEY (fs_id, node_id) CLUSTERED") {
+		t.Fatalf("shared dump is missing fs_id-scoped schema: %q", out)
+	}
+	if !strings.Contains(out, "VECTOR") {
+		t.Fatalf("shared dump is missing vector columns: %q", out)
+	}
+	if strings.Contains(out, "GENERATED ALWAYS AS (EMBED_TEXT") {
+		t.Fatalf("shared dump contains database auto embedding: %q", out)
+	}
+	if !strings.Contains(out, "CREATE TABLE IF NOT EXISTS vault_deks") {
+		t.Fatalf("shared dump missing vault schema: %q", out)
+	}
+}
+
 func TestSchemaDumpInitSQLByProviderIncludesVault(t *testing.T) {
 	for _, provider := range []string{"tidb_zero", "tidb_cloud_native"} {
 		t.Run(provider, func(t *testing.T) {

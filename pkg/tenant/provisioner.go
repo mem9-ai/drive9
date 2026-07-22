@@ -72,6 +72,32 @@ type TenantPoolClusterManager interface {
 	MarkClusterPoolFree(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
 }
 
+type SharedDBPoolCreateRequest struct {
+	DBPoolID             int64
+	DatabaseName         string
+	RootPassword         string
+	SpendingLimitMonthly int64
+}
+
+type SharedDBPoolInfo struct {
+	DBPoolID       int64
+	ClusterID      string
+	OrganizationID string
+	Host           string
+	Port           int
+	Username       string
+	Password       string
+	DBName         string
+}
+
+type SharedDBPoolProvisioner interface {
+	Provisioner
+	BatchProvisionSharedDBPoolsWithCredentials(ctx context.Context, requests []SharedDBPoolCreateRequest, req CredentialProvisionRequest) ([]*SharedDBPoolInfo, error)
+	LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoolID int64, clusterID string, req CredentialProvisionRequest) (*SharedDBPoolInfo, error)
+}
+
+var ErrSharedDBPoolAmbiguous = errors.New("multiple shared db pool cloud resources found")
+
 type TenantPoolClusterMetadataWaiter interface {
 	Provisioner
 	WaitForPoolClusterMetadata(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) (*ClusterInfo, error)

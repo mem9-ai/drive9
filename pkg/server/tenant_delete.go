@@ -236,11 +236,16 @@ func (s *Server) handleSharedTenantDelete(w http.ResponseWriter, r *http.Request
 		// placement intact so the retry re-runs the (idempotent) purge and
 		// completes the removal — a placement row must never outlive its
 		// tenant or lose its capacity accounting.
-		if err := s.meta.DeleteTenantPlacementAndDecrCount(ctx, fsID, placement.DbID); err != nil {
+		if err := s.meta.DeleteTenantPlacementAndDecrCount(ctx, fsID, placement.DbID, s.sharedDBReopenRatio); err != nil {
 			logger.Error(ctx, "shared_tenant_placement_delete_failed", zap.String("tenant_id", t.ID), zap.Error(err))
 			errJSON(w, http.StatusInternalServerError, "failed to remove tenant placement")
 			return
 		}
+	}
+	if err := s.meta.DeleteTenantPoolMembership(ctx, t.ID); err != nil {
+		logger.Error(ctx, "shared_tenant_pool_membership_delete_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+		errJSON(w, http.StatusInternalServerError, "failed to remove shared tenant pool membership")
+		return
 	}
 	// A missing placement here means an earlier attempt already purged and
 	// removed it but failed before enqueueing cleanup — fall through to the

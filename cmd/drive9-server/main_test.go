@@ -145,6 +145,117 @@ func TestTenantPoolRefillFreeRatioFromEnv(t *testing.T) {
 	}
 }
 
+func TestSharedDBHardCapRatioFromEnv(t *testing.T) {
+	const key = "DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	unsetEnv(t, []string{key})
+	got, err := sharedDBHardCapRatioFromEnv()
+	if err != nil {
+		t.Fatalf("sharedDBHardCapRatioFromEnv empty: %v", err)
+	}
+	if got != server.DefaultSharedDBHardCapRatio {
+		t.Fatalf("empty hard cap ratio = %f, want %f", got, server.DefaultSharedDBHardCapRatio)
+	}
+
+	setEnv(t, key, "1.1")
+	got, err = sharedDBHardCapRatioFromEnv()
+	if err != nil {
+		t.Fatalf("sharedDBHardCapRatioFromEnv valid: %v", err)
+	}
+	if got != 1.1 {
+		t.Fatalf("hard cap ratio = %f, want 1.1", got)
+	}
+
+	for _, raw := range []string{"0.9", "NaN", "+Inf", "bad"} {
+		setEnv(t, key, raw)
+		if _, err := sharedDBHardCapRatioFromEnv(); err == nil {
+			t.Fatalf("sharedDBHardCapRatioFromEnv(%q) error = nil, want error", raw)
+		}
+	}
+}
+
+func TestSharedDBReopenRatioFromEnv(t *testing.T) {
+	const key = "DRIVE9_TIDBCLOUD_NATIVE_SHARED_REOPEN_RATIO"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	unsetEnv(t, []string{key})
+	got, err := sharedDBReopenRatioFromEnv()
+	if err != nil {
+		t.Fatalf("sharedDBReopenRatioFromEnv empty: %v", err)
+	}
+	if got != server.DefaultSharedDBReopenRatio {
+		t.Fatalf("empty reopen ratio = %f, want %f", got, server.DefaultSharedDBReopenRatio)
+	}
+
+	setEnv(t, key, "0.65")
+	got, err = sharedDBReopenRatioFromEnv()
+	if err != nil {
+		t.Fatalf("sharedDBReopenRatioFromEnv valid: %v", err)
+	}
+	if got != 0.65 {
+		t.Fatalf("reopen ratio = %f, want 0.65", got)
+	}
+
+	for _, raw := range []string{"0", "-0.1", "1", "NaN", "+Inf", "bad"} {
+		setEnv(t, key, raw)
+		if _, err := sharedDBReopenRatioFromEnv(); err == nil {
+			t.Fatalf("sharedDBReopenRatioFromEnv(%q) error = nil, want error", raw)
+		}
+	}
+}
+
+func TestSharedDBCapacityConfigFromEnv(t *testing.T) {
+	keys := []string{
+		"DRIVE9_TIDBCLOUD_NATIVE_SHARED_MAX_TENANTS",
+		"DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	unsetEnv(t, keys)
+	maxTenants, err := sharedDBMaxTenantsFromEnv()
+	if err != nil {
+		t.Fatalf("sharedDBMaxTenantsFromEnv empty: %v", err)
+	}
+	if maxTenants != 100 {
+		t.Fatalf("empty max tenants = %d, want 100", maxTenants)
+	}
+	spendingLimit, err := sharedDBDefaultSpendingLimitFromEnv()
+	if err != nil {
+		t.Fatalf("sharedDBDefaultSpendingLimitFromEnv empty: %v", err)
+	}
+	if spendingLimit != 10_000_000 {
+		t.Fatalf("empty spending limit = %d, want 10000000", spendingLimit)
+	}
+
+	setEnv(t, keys[0], "250")
+	maxTenants, err = sharedDBMaxTenantsFromEnv()
+	if err != nil || maxTenants != 250 {
+		t.Fatalf("valid max tenants = %d/%v, want 250/nil", maxTenants, err)
+	}
+	setEnv(t, keys[1], "20000000")
+	spendingLimit, err = sharedDBDefaultSpendingLimitFromEnv()
+	if err != nil || spendingLimit != 20_000_000 {
+		t.Fatalf("valid spending limit = %d/%v, want 20000000/nil", spendingLimit, err)
+	}
+
+	for _, raw := range []string{"0", "-1", "bad"} {
+		setEnv(t, keys[0], raw)
+		if _, err := sharedDBMaxTenantsFromEnv(); err == nil {
+			t.Fatalf("max tenants %q error = nil, want error", raw)
+		}
+	}
+	for _, raw := range []string{"0", "-1", "2147483648", "bad"} {
+		setEnv(t, keys[1], raw)
+		if _, err := sharedDBDefaultSpendingLimitFromEnv(); err == nil {
+			t.Fatalf("spending limit %q error = nil, want error", raw)
+		}
+	}
+}
+
 func TestDBHealthProbeOptionsFromEnvDefaults(t *testing.T) {
 	keys := []string{
 		"DRIVE9_DB_HEALTH_PROBE_META_ENABLED",

@@ -79,6 +79,20 @@ func TestSharedTiDBSchemaStatementsContainsAllTables(t *testing.T) {
 	}
 }
 
+func TestCurrentSharedTiDBSchemaVersionIsDerivedFromSharedStatements(t *testing.T) {
+	if CurrentSharedTiDBSchemaVersion <= 0 {
+		t.Fatalf("CurrentSharedTiDBSchemaVersion = %d, want positive", CurrentSharedTiDBSchemaVersion)
+	}
+	if got, want := CurrentSharedTiDBSchemaVersion, currentTiDBTenantSchemaVersion(SharedTiDBSchemaStatements()); got != want {
+		t.Fatalf("CurrentSharedTiDBSchemaVersion = %d, want derived value %d", got, want)
+	}
+	changed := append([]string(nil), SharedTiDBSchemaStatements()...)
+	changed[0] += "\nCREATE INDEX idx_version_probe ON file_nodes (fs_id)"
+	if got := currentTiDBTenantSchemaVersion(changed); got == CurrentSharedTiDBSchemaVersion {
+		t.Fatalf("derived version did not change after schema content change: %d", got)
+	}
+}
+
 // TestSharedMySQLSchemaStatementsDialect ensures the MySQL variant carries no
 // TiDB-only constructs — no CLUSTERED keyword and no VECTOR(n) column types —
 // while keeping the same 30 tables.

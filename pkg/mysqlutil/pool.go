@@ -24,10 +24,10 @@ const (
 	// Shared-schema handles serve many tenants through one *sql.DB, so they
 	// get meta-like lifetimes and a much larger connection budget than
 	// per-tenant user pools.
-	defaultSharedConnMaxLifetime = 5 * time.Minute
-	defaultSharedConnMaxIdleTime = 1 * time.Minute
-	defaultSharedMaxOpenConns    = 50
-	defaultSharedMaxIdleConns    = 10
+	defaultSharedConnMaxLifetime = 30 * time.Minute
+	defaultSharedConnMaxIdleTime = 5 * time.Minute
+	defaultSharedMaxOpenConns    = 300
+	defaultSharedMaxIdleConns    = 50
 )
 
 // ApplyPoolDefaults rotates and prunes idle connections before common LB/NAT
@@ -38,12 +38,13 @@ const (
 //   - DRIVE9_META_DB_MAX_OPEN_CONNS / DRIVE9_META_DB_MAX_IDLE_CONNS
 //   - DRIVE9_USER_DB_MAX_OPEN_CONNS / DRIVE9_USER_DB_MAX_IDLE_CONNS
 //   - DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS / DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS
+//   - DRIVE9_SHARED_DB_MAX_OPEN_CONNS / DRIVE9_SHARED_DB_MAX_IDLE_CONNS
+//   - DRIVE9_SHARED_DB_CONN_MAX_LIFETIME / DRIVE9_SHARED_DB_CONN_MAX_IDLE_TIME
 //
-// The limits apply to each *sql.DB pool, not to all pools in the process. In a
-// multi-pod deployment, set these so pod_count * pools_per_pod * maxOpenConns
-// stays within TiDB max_connections.
+// The limits apply to each *sql.DB pool. In a multi-pod deployment, size them
+// against TiDB max_connections and the expected number of active shared pools.
 func ApplyPoolDefaults(db *sql.DB, role string) {
-	lifetime, idleTime := defaultPoolLifetime(role)
+	lifetime, idleTime := poolLifetime(role)
 	db.SetConnMaxLifetime(lifetime)
 	db.SetConnMaxIdleTime(idleTime)
 	maxOpen, maxIdle := defaultPoolLimits(role)
@@ -53,6 +54,15 @@ func ApplyPoolDefaults(db *sql.DB, role string) {
 	if v := poolEnvInt(role, "MAX_IDLE_CONNS", maxIdle); v >= 0 {
 		db.SetMaxIdleConns(v)
 	}
+}
+
+func poolLifetime(role string) (time.Duration, time.Duration) {
+	lifetime, idleTime := defaultPoolLifetime(role)
+	if role != RoleShared {
+		return lifetime, idleTime
+	}
+	return poolEnvDuration(role, "CONN_MAX_LIFETIME", lifetime),
+		poolEnvDuration(role, "CONN_MAX_IDLE_TIME", idleTime)
 }
 
 func defaultPoolLifetime(role string) (time.Duration, time.Duration) {
@@ -90,6 +100,22 @@ func poolEnvInt(role, suffix string, def int) int {
 		}
 	}
 	return def
+}
+
+func poolEnvDuration(role, suffix string, def time.Duration) time.Duration {
+	key := rolePoolEnvKey(role, suffix)
+	if key == "" {
+		return def
+	}
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return def
+	}
+	return value
 }
 
 func rolePoolEnvKey(role, suffix string) string {
