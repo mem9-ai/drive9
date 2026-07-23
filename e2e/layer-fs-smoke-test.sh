@@ -328,6 +328,7 @@ prepare_cli_binary() {
       script_dir="$(cd "$(dirname "$0")" && pwd)"
       repo_root="$(git -C "$script_dir/.." rev-parse --show-toplevel 2>/dev/null || (cd "$script_dir/.." && pwd))"
       make -C "$repo_root" build-cli CLI_BIN="$CLI_BIN"
+      chmod +x "$CLI_BIN"
       ;;
     official)
       download_official_cli

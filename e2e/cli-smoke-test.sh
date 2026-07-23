@@ -125,6 +125,7 @@ prepare_cli_binary() {
   case "$CLI_SOURCE" in
     build)
       make build-cli CLI_BIN="$CLI_BIN"
+      chmod +x "$CLI_BIN"
       ;;
     official)
       download_official_cli
