@@ -287,7 +287,10 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authorizeSharedQuotaCredentials(ctx context.Context, t *meta.Tenant, cred tenant.CredentialProvisionRequest, metricPath string) (*meta.SharedDB, error) {
 	physical, err := s.meta.GetSharedDBForTenant(ctx, t.ID)
 	if err != nil {
-		return nil, tenant.ErrQuotaBackendNotFound
+		if errors.Is(err, meta.ErrNotFound) {
+			return nil, tenant.ErrQuotaBackendNotFound
+		}
+		return nil, fmt.Errorf("get shared DB for tenant: %w", err)
 	}
 	if _, err := s.authorizeTiDBCloudOrganization(ctx, cred, physical.TiDBCloudOrganizationID, metricPath); err != nil {
 		return nil, err

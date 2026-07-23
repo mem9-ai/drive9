@@ -461,7 +461,15 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 			return nil, nil, false
 		}
 		physical, physicalErr := s.meta.GetSharedDBForTenant(r.Context(), t.ID)
-		if physicalErr != nil || physical == nil {
+		if errors.Is(physicalErr, meta.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "tenant shared DB pool not found")
+			return nil, nil, false
+		}
+		if physicalErr != nil {
+			errJSON(w, backendErrorStatus(r.Context(), physicalErr), "tenant shared DB pool lookup failed")
+			return nil, nil, false
+		}
+		if physical == nil {
 			errJSON(w, http.StatusNotFound, "tenant shared DB pool not found")
 			return nil, nil, false
 		}

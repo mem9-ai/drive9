@@ -2409,6 +2409,7 @@ func (p *Provisioner) doDigestAuthRequest(ctx context.Context, publicKey, privat
 	start := time.Now()
 	resp, err := p.client.Do(req)
 	if err != nil {
+		err = redactRequestError(err, uri)
 		logger.Error(ctx, "tidbcloud_api_request",
 			zap.String("method", method),
 			zap.String("path", requestPath(uri)),
@@ -2445,6 +2446,7 @@ func (p *Provisioner) doDigestAuthRequest(ctx context.Context, publicKey, privat
 	start2 := time.Now()
 	resp2, err := p.client.Do(req2)
 	if err != nil {
+		err = redactRequestError(err, uri)
 		logger.Error(ctx, "tidbcloud_api_request",
 			zap.String("method", method),
 			zap.String("path", requestPath(uri)),
@@ -2459,6 +2461,14 @@ func (p *Provisioner) doDigestAuthRequest(ctx context.Context, publicKey, privat
 		zap.Int("status", resp2.StatusCode),
 		zap.Int64("duration_ms", time.Since(start2).Milliseconds()))
 	return resp2, nil
+}
+
+func redactRequestError(err error, uri string) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	return &url.Error{Op: urlErr.Op, URL: requestPath(uri), Err: urlErr.Err}
 }
 
 func requestPath(uri string) string {

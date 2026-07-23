@@ -14,8 +14,19 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/traceid"
 )
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 func setRequiredNativeProvisionerEnv(t *testing.T) {
 	t.Helper()
@@ -89,8 +100,12 @@ func TestResolveAPIKeyIdentityUsesIAMAPI(t *testing.T) {
 	}))
 	defer ts.Close()
 
+	wantTraceID := "iam-success-trace"
+	core, recorded := observer.New(zap.InfoLevel)
+	ctx := traceid.With(context.Background(), wantTraceID)
+	ctx = logger.WithContext(ctx, zap.New(core).With(zap.String("trace_id", wantTraceID)))
 	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
-	identity, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+	identity, err := p.ResolveAPIKeyIdentity(ctx, tenant.CredentialProvisionRequest{
 		PublicKey: "PROJECTOWNER1", PrivateKey: "test-private",
 	})
 	if err != nil {
@@ -101,6 +116,16 @@ func TestResolveAPIKeyIdentityUsesIAMAPI(t *testing.T) {
 	}
 	if identity.OrganizationID != "1234567890123456789" || identity.Role != tenant.TiDBCloudRoleProjectOwner {
 		t.Fatalf("identity = %+v", identity)
+	}
+	loggedTrace := false
+	for _, entry := range recorded.AllUntimed() {
+		if entry.Message == "tidbcloud_api_request" && entry.ContextMap()["trace_id"] == wantTraceID {
+			loggedTrace = true
+			break
+		}
+	}
+	if !loggedTrace {
+		t.Fatalf("IAM success access log missing trace_id %q", wantTraceID)
 	}
 }
 
@@ -248,6 +273,43 @@ func TestRequestPathRedactsIAMAccessKey(t *testing.T) {
 	got := requestPath("https://iam.tidbapi.com/v1beta1/apikeys/PROJECTOWNER1")
 	if got != "/v1beta1/apikeys/***" {
 		t.Fatalf("request path = %q, want redacted IAM access key", got)
+	}
+}
+
+func TestResolveAPIKeyIdentityRedactsAccessKeyFromTransportErrorsAndLogs(t *testing.T) {
+	accessKey := "TRANSPORTSECRET1"
+	transportErr := errors.New("network unavailable")
+	wantTraceID := "iam-transport-trace"
+	core, recorded := observer.New(zap.ErrorLevel)
+	ctx := traceid.With(context.Background(), wantTraceID)
+	ctx = logger.WithContext(ctx, zap.New(core).With(zap.String("trace_id", wantTraceID)))
+	p := &Provisioner{
+		iamURL: "https://iam.tidbapi.com",
+		client: &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return nil, transportErr
+		})},
+	}
+
+	_, err := p.ResolveAPIKeyIdentity(ctx, tenant.CredentialProvisionRequest{
+		PublicKey: accessKey, PrivateKey: "test-private",
+	})
+	if !errors.Is(err, transportErr) {
+		t.Fatalf("error = %v, want transport error", err)
+	}
+	if strings.Contains(err.Error(), accessKey) {
+		t.Fatalf("returned error leaked IAM access key: %v", err)
+	}
+	entries := recorded.AllUntimed()
+	if len(entries) == 0 {
+		t.Fatal("expected IAM transport error log entry")
+	}
+	for _, entry := range entries {
+		if strings.Contains(fmt.Sprint(entry.ContextMap()), accessKey) {
+			t.Fatalf("log entry leaked IAM access key: %+v", entry.ContextMap())
+		}
+		if got := entry.ContextMap()["trace_id"]; got != wantTraceID {
+			t.Fatalf("IAM log trace_id = %v, want %q", got, wantTraceID)
+		}
 	}
 }
 

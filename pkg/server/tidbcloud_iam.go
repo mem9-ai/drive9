@@ -62,7 +62,10 @@ func (s *Server) authorizeNativeTenantCredentials(ctx context.Context, t *meta.T
 	}
 	binding, err := s.meta.GetTenantTiDBCloudOrgBinding(ctx, t.ID)
 	if err != nil {
-		return nil, tenant.ErrQuotaBackendNotFound
+		if errors.Is(err, meta.ErrNotFound) {
+			return nil, tenant.ErrQuotaBackendNotFound
+		}
+		return nil, fmt.Errorf("get tenant TiDB Cloud organization binding: %w", err)
 	}
 	if _, err := s.authorizeTiDBCloudOrganization(ctx, cred, binding.OrganizationID, metricPath); err != nil {
 		return nil, err
