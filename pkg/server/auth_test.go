@@ -734,7 +734,7 @@ func TestSanitizeClientError_Fallback(t *testing.T) {
 	// Non-quota 1105 wrapped with "quota" in prefix should not be classified as quota error.
 	err := fmt.Errorf("set quota config for tenant: Error 1105 (HY000): connection refused")
 	if got := sanitizeClientError(err); got != "backend unavailable" {
-		t.Fatalf("non-quota 1105 with quota prefix: got %q, want %q", got, "backend unavailable")
+		t.Errorf("non-quota 1105 with quota prefix: got %q, want %q", got, "backend unavailable")
 	}
 }
 
