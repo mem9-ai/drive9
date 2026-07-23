@@ -707,15 +707,11 @@ func (s *Server) refreshTenantPoolCapacity(ctx context.Context, pool *meta.Tenan
 }
 
 func (s *Server) firstManagedOrganization(ctx context.Context, cred tenant.CredentialProvisionRequest) (string, error) {
-	// Resolve through the RBAC list cache so repeated org lookups on the same
-	// request path (warm-pool claim + shared-pool check) and across
-	// consecutive provisions do not each cost a TiDB Cloud list call. The
-	// cache is invalidated on tenant mutations (forgetTiDBCloudRBACList).
-	clusters, err := s.listAllManagedClusters(ctx, cred, "", "provision_org_resolve")
-	if err != nil || len(clusters) == 0 {
+	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, "provision_org_resolve")
+	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(clusters[0].OrganizationID), nil
+	return identity.OrganizationID, nil
 }
 
 func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count int, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) ([]*provisionTenantResult, error) {
@@ -1002,7 +998,7 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 		createdIDs = append(createdIDs, id)
 	}
 	sort.Slice(createdIDs, func(i, j int) bool { return createdIDs[i] < createdIDs[j] })
-	resolvedOrg, err := s.provisionManagedSharedDBPoolsBatch(ctx, createdIDs, cred)
+	resolvedOrg, err := s.provisionManagedSharedDBPoolsBatch(ctx, createdIDs)
 	if err != nil {
 		return results, err
 	}
@@ -1021,11 +1017,11 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 	for dbID := range provisioningPoolIDs {
 		provisioningIDs = append(provisioningIDs, dbID)
 	}
-	s.scheduleManagedSharedDBContinuations(ctx, provisioningIDs, cred)
+	s.scheduleManagedSharedDBContinuations(ctx, provisioningIDs)
 	return results, nil
 }
 
-func (s *Server) provisionManagedSharedDBPoolsBatch(ctx context.Context, dbIDs []int64, cred tenant.CredentialProvisionRequest) (string, error) {
+func (s *Server) provisionManagedSharedDBPoolsBatch(ctx context.Context, dbIDs []int64) (string, error) {
 	if len(dbIDs) == 0 {
 		return "", nil
 	}
@@ -1036,7 +1032,7 @@ func (s *Server) provisionManagedSharedDBPoolsBatch(ctx context.Context, dbIDs [
 		if end > len(dbIDs) {
 			end = len(dbIDs)
 		}
-		chunkOrg, err := s.provisionManagedSharedDBPoolsBatchChunk(ctx, provisioner, dbIDs[start:end], cred)
+		chunkOrg, err := s.provisionManagedSharedDBPoolsBatchChunk(ctx, provisioner, dbIDs[start:end])
 		if err != nil {
 			return resolvedOrg, err
 		}
@@ -1047,9 +1043,13 @@ func (s *Server) provisionManagedSharedDBPoolsBatch(ctx context.Context, dbIDs [
 	return resolvedOrg, nil
 }
 
-func (s *Server) provisionManagedSharedDBPoolsBatchChunk(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) (string, error) {
+func (s *Server) provisionManagedSharedDBPoolsBatchChunk(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64) (string, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		first, err := s.meta.GetSharedDB(ctx, dbIDs[0])
+		if err != nil {
+			return "", err
+		}
+		cred, err := s.sharedDBCloudCredentials()
 		if err != nil {
 			return "", err
 		}
@@ -1061,7 +1061,7 @@ func (s *Server) provisionManagedSharedDBPoolsBatchChunk(ctx context.Context, pr
 			if err != nil {
 				return err
 			}
-			if first.TiDBCloudOrganizationID == "" && current.TiDBCloudOrganizationID != "" {
+			if strings.TrimSpace(first.TiDBCloudOrganizationID) != strings.TrimSpace(current.TiDBCloudOrganizationID) {
 				restartWithOrganization = true
 				return nil
 			}
@@ -1122,20 +1122,21 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 			return resolvedOrg, fmt.Errorf("shared db batch returned an unknown db pool")
 		}
 		row := rows[info.DBPoolID]
-		if info.OrganizationID == "" {
-			info.OrganizationID = row.TiDBCloudOrganizationID
+		logicalOrganizationID := strings.TrimSpace(row.TiDBCloudOrganizationID)
+		if logicalOrganizationID == "" {
+			return resolvedOrg, fmt.Errorf("managed shared db pool customer organization is required")
 		}
 		if info.DBName == "" {
 			info.DBName = row.Name
 		}
 		if err := s.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{ID: info.DBPoolID,
-			TiDBCloudOrganizationID: info.OrganizationID, ClusterID: info.ClusterID, Host: info.Host,
+			TiDBCloudOrganizationID: logicalOrganizationID, ClusterID: info.ClusterID, Host: info.Host,
 			Port: info.Port, User: info.Username, PasswordCipher: row.PasswordCipher, Name: info.DBName,
 			TLSMode: map[bool]string{true: "true", false: "skip-verify"}[dbTLSForProvisionedTenant(tenant.ProviderTiDBCloudNativeShared)]}); err != nil {
 			return resolvedOrg, err
 		}
 		if resolvedOrg == "" {
-			resolvedOrg = info.OrganizationID
+			resolvedOrg = logicalOrganizationID
 		}
 	}
 	if createErr != nil {

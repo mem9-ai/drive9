@@ -1676,7 +1676,7 @@ func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 	}
 }
 
-func TestMigrateNormalizesManagedSharedDBSpendingLimitToCloudMaximum(t *testing.T) {
+func TestMigratePreservesManagedSharedDBSpendingLimit(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 	limit := MaxTiDBCloudSpendingLimit
@@ -1687,19 +1687,20 @@ func TestMigrateNormalizesManagedSharedDBSpendingLimitToCloudMaximum(t *testing.
 	if err != nil {
 		t.Fatalf("CreateManagedSharedDBPool: %v", err)
 	}
-	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET spending_limit = 10000000 WHERE db_id = ?`, id); err != nil {
-		t.Fatalf("seed legacy spending limit: %v", err)
+	const configuredLimit = int64(2_000_000)
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET spending_limit = ? WHERE db_id = ?`, configuredLimit, id); err != nil {
+		t.Fatalf("seed configured spending limit: %v", err)
 	}
 
 	if err := s.migrate(); err != nil {
-		t.Fatalf("migrate legacy spending limit: %v", err)
+		t.Fatalf("migrate configured spending limit: %v", err)
 	}
 	got, err := s.GetSharedDB(ctx, id)
 	if err != nil {
 		t.Fatalf("GetSharedDB: %v", err)
 	}
-	if got.SpendingLimit == nil || *got.SpendingLimit != MaxTiDBCloudSpendingLimit {
-		t.Fatalf("spending limit = %v, want %d", got.SpendingLimit, MaxTiDBCloudSpendingLimit)
+	if got.SpendingLimit == nil || *got.SpendingLimit != configuredLimit {
+		t.Fatalf("spending limit = %v, want %d", got.SpendingLimit, configuredLimit)
 	}
 
 	if err := s.migrate(); err != nil {

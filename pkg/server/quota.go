@@ -28,9 +28,12 @@ type quotaRequest struct {
 }
 
 type quotaFields struct {
-	MaxStorageSize         *int64 `json:"max_storage_size,omitempty"`
-	MaxFileSize            *int64 `json:"max_file_size,omitempty"`
-	MaxFileCount           *int64 `json:"max_file_count,omitempty"`
+	MaxStorageSize *int64 `json:"max_storage_size,omitempty"`
+	MaxFileSize    *int64 `json:"max_file_size,omitempty"`
+	MaxFileCount   *int64 `json:"max_file_count,omitempty"`
+	// TiDBCloudSpendingLimit is physical for native tenants. For shared tenants,
+	// it is virtual compatibility metadata and does not affect allocation,
+	// capacity, or the shared cluster's physical TiDB Cloud spending limit.
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
 }
 
@@ -51,9 +54,11 @@ type quotaResponse struct {
 }
 
 type quotaConfigResponse struct {
-	MaxStorageSize         int64  `json:"max_storage_size"`
-	MaxFileSize            int64  `json:"max_file_size"`
-	MaxFileCount           int64  `json:"max_file_count"`
+	MaxStorageSize int64 `json:"max_storage_size"`
+	MaxFileSize    int64 `json:"max_file_size"`
+	MaxFileCount   int64 `json:"max_file_count"`
+	// TiDBCloudSpendingLimit is returned for API compatibility. For shared
+	// tenants, it is a virtual value and is not physically enforced.
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
 }
 
@@ -135,22 +140,12 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if !s.tidbCloudRBACAllowed(cred, t.ClusterID, "quota_get") {
-		getter, ok := s.provisioner.(tenant.QuotaGetter)
-		if !ok {
-			errJSON(w, http.StatusNotFound, "quota query not enabled")
-			return
-		}
-		_, err := getter.GetQuota(r.Context(), clusterInfoFromTenant(t), cred)
-		if err != nil {
-			metrics.RecordTiDBCloudOpenAPIRequest("quota_get", "get_quota", "error")
-			writeQuotaCredentialError(w, r.Context(), err, "query")
-			return
-		}
-		metrics.RecordTiDBCloudOpenAPIRequest("quota_get", "get_quota", "ok")
-		s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{ClusterID: t.ClusterID})
+	binding, err := s.authorizeNativeTenantCredentials(r.Context(), t, cred, "quota_get")
+	if err != nil {
+		writeQuotaCredentialError(w, r.Context(), err, "query")
+		return
 	}
-	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, s.tenantMetricTiDBCloudOrgID(r.Context(), t), classifyTenantRequest(r))
+	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, binding.OrganizationID, classifyTenantRequest(r))
 	s.writeQuotaResponse(w, r, t)
 }
 
@@ -272,9 +267,15 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sharedPhysical = physical
-	} else if err := s.applyQuotaSet(r.Context(), "quota_set", t, cred, req); err != nil {
-		writeQuotaSetError(w, r.Context(), err, "update")
-		return
+	} else {
+		if _, err := s.authorizeNativeTenantCredentials(r.Context(), t, cred, "quota_set"); err != nil {
+			writeQuotaSetError(w, r.Context(), err, "authorize")
+			return
+		}
+		if err := s.applyQuotaSet(r.Context(), "quota_set", t, cred, req); err != nil {
+			writeQuotaSetError(w, r.Context(), err, "update")
+			return
+		}
 	}
 	metricOrgID := ""
 	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
@@ -290,27 +291,15 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) authorizeSharedQuotaCredentials(ctx context.Context, t *meta.Tenant, cred tenant.CredentialProvisionRequest, metricPath string) (*meta.SharedDB, error) {
 	physical, err := s.meta.GetSharedDBForTenant(ctx, t.ID)
-	if err != nil || strings.TrimSpace(physical.ClusterID) == "" {
-		return nil, tenant.ErrQuotaBackendNotFound
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			return nil, tenant.ErrQuotaBackendNotFound
+		}
+		return nil, fmt.Errorf("get shared DB for tenant: %w", err)
 	}
-	if s.tidbCloudRBACAllowed(cred, physical.ClusterID, metricPath) {
-		return physical, nil
-	}
-	getter, ok := s.provisioner.(tenant.QuotaGetter)
-	if !ok {
-		return nil, errQuotaSettingNotEnabled
-	}
-	if _, err := getter.GetQuota(ctx, &tenant.ClusterInfo{
-		ClusterID:      physical.ClusterID,
-		OrganizationID: physical.TiDBCloudOrganizationID,
-		Provider:       tenant.ProviderTiDBCloudNative,
-	}, cred); err != nil {
+	if _, err := s.authorizeTiDBCloudOrganization(ctx, cred, physical.TiDBCloudOrganizationID, metricPath); err != nil {
 		return nil, err
 	}
-	s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{
-		ClusterID:      physical.ClusterID,
-		OrganizationID: physical.TiDBCloudOrganizationID,
-	})
 	return physical, nil
 }
 
@@ -433,7 +422,6 @@ func (s *Server) applyQuotaSet(ctx context.Context, metricPath string, t *meta.T
 		return err
 	}
 	metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "mark_quota_update_started", "ok")
-	s.rememberTiDBCloudRBAC(cred, tenant.CloudClusterInfo{ClusterID: t.ClusterID})
 	if req.TiDBCloudSpendingLimit != nil {
 		updatedCloudCfg, err := updater.UpdateQuota(ctx, clusterInfoFromTenant(t), cred, tenant.QuotaUpdateOptions{
 			TiDBCloudSpendingLimitMonthly: req.TiDBCloudSpendingLimit,
@@ -645,24 +633,6 @@ func quotaSetErrorStatusMessage(err error, action string) (int, string, bool) {
 	default:
 		return 0, "", false
 	}
-}
-
-func (s *Server) tidbCloudRBACAllowed(cred tenant.CredentialProvisionRequest, clusterID, metricPath string) bool {
-	_, ok := s.tidbCloudRBACCache.getCluster(cred, clusterID)
-	result := "miss"
-	if ok {
-		result = "hit"
-	}
-	metrics.RecordTiDBCloudRBACCacheRequest(metricPath, "cluster", result)
-	return ok
-}
-
-func (s *Server) rememberTiDBCloudRBAC(cred tenant.CredentialProvisionRequest, cluster tenant.CloudClusterInfo) {
-	s.tidbCloudRBACCache.rememberCluster(cred, cluster)
-}
-
-func (s *Server) forgetTiDBCloudRBACList(cred tenant.CredentialProvisionRequest) {
-	s.tidbCloudRBACCache.forgetClusterList(cred)
 }
 
 func tidbCloudSpendingLimitFromCloud(cloudCfg *tenant.QuotaCloudConfig) *int64 {

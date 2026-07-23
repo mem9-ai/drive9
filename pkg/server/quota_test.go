@@ -39,6 +39,7 @@ type quotaTestProvisioner struct {
 	markCalls                   atomic.Int32
 	getCalls                    atomic.Int32
 	listCalls                   atomic.Int32
+	iamCalls                    atomic.Int32
 	deprovisionCalls            atomic.Int32
 	batchPoolCalls              atomic.Int32
 	markPoolUsedCalls           atomic.Int32
@@ -47,11 +48,14 @@ type quotaTestProvisioner struct {
 	mu                          sync.Mutex
 	lastCluster                 *tenant.ClusterInfo
 	lastCredentials             tenant.CredentialProvisionRequest
+	lastIAMCredentials          tenant.CredentialProvisionRequest
 	lastOptions                 tenant.QuotaUpdateOptions
 	lastListOptions             tenant.ManagedClusterListOptions
 	lastDeprovision             *tenant.ClusterInfo
 	listErr                     error
 	listPages                   []*tenant.ManagedClusterListResult
+	iamIdentities               []*tenant.TiDBCloudAPIKeyIdentity
+	iamErr                      error
 	batchPoolErr                error
 	batchPoolOmitConnectionInfo bool
 	batchPoolEmptyPassword      bool
@@ -109,16 +113,16 @@ func (p *quotaTestProvisioner) lastCredentialsSnapshot() tenant.CredentialProvis
 	return p.lastCredentials
 }
 
+func (p *quotaTestProvisioner) lastIAMCredentialsSnapshot() tenant.CredentialProvisionRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastIAMCredentials
+}
+
 func (p *quotaTestProvisioner) lastOptionsSnapshot() tenant.QuotaUpdateOptions {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.lastOptions
-}
-
-func (p *quotaTestProvisioner) lastListOptionsSnapshot() tenant.ManagedClusterListOptions {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.lastListOptions
 }
 
 func (p *quotaTestProvisioner) lastClusterSnapshot() *tenant.ClusterInfo {
@@ -151,6 +155,25 @@ func (p *quotaTestProvisioner) DefaultCredentials() (tenant.CredentialProvisionR
 		PublicKey:  p.defaultPublicKey,
 		PrivateKey: p.defaultPrivateKey,
 	}, true
+}
+
+func (p *quotaTestProvisioner) ResolveAPIKeyIdentity(_ context.Context, req tenant.CredentialProvisionRequest) (*tenant.TiDBCloudAPIKeyIdentity, error) {
+	call := int(p.iamCalls.Add(1)) - 1
+	p.mu.Lock()
+	p.lastIAMCredentials = req
+	p.mu.Unlock()
+	if p.iamErr != nil {
+		return nil, p.iamErr
+	}
+	if call >= 0 && call < len(p.iamIdentities) && p.iamIdentities[call] != nil {
+		out := *p.iamIdentities[call]
+		return &out, nil
+	}
+	return &tenant.TiDBCloudAPIKeyIdentity{OrganizationID: "org-1", Role: tenant.TiDBCloudRoleOrgOwner}, nil
+}
+
+func (p *quotaTestProvisioner) DefaultSharedCredentials() (tenant.CredentialProvisionRequest, bool) {
+	return tenant.CredentialProvisionRequest{PublicKey: "shared-public", PrivateKey: "shared-private"}, true
 }
 
 func (p *quotaTestProvisioner) Provision(context.Context, string) (*tenant.ClusterInfo, error) {
@@ -397,6 +420,14 @@ func newQuotaRuntime(t *testing.T, provider string) *quotaRuntime {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if provider == tenant.ProviderTiDBCloudNative {
+		if err := db.Meta.UpsertTenantTiDBCloudOrgBinding(context.Background(), &meta.TenantTiDBCloudOrgBinding{
+			TenantID: tenantID, OrganizationID: "org-1", ClusterID: "cluster-quota-1",
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := db.Meta.InsertAPIKey(context.Background(), &meta.APIKey{
 		ID:            token.NewID(),
 		TenantID:      tenantID,
@@ -484,10 +515,13 @@ func TestQuotaGetAllowsExplicitDefaultTiDBCloudCredentials(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("get calls = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
 	}
-	lastCredentials := rt.prov.lastCredentialsSnapshot()
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("quota get calls = %d, want 0", got)
+	}
+	lastCredentials := rt.prov.lastIAMCredentialsSnapshot()
 	if lastCredentials.PublicKey != "default-pk" || lastCredentials.PrivateKey != "default-sk" {
 		t.Fatalf("last credentials = %#v", lastCredentials)
 	}
@@ -562,6 +596,9 @@ func TestQuotaGetReturnsConfigStorageUsageAndSpendingLimit(t *testing.T) {
 
 func TestSharedQuotaGetAndSetUseLocalVirtualValueWithoutCloudMutation(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNativeShared)
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-shared-quota", Role: tenant.TiDBCloudRoleOrgOwner,
+	}}
 	ctx := context.Background()
 	if _, err := rt.meta.DB().ExecContext(ctx, `UPDATE tenants SET cluster_id = '' WHERE id = ?`, rt.tenantID); err != nil {
 		t.Fatalf("clear tenant cluster id: %v", err)
@@ -585,11 +622,6 @@ func TestSharedQuotaGetAndSetUseLocalVirtualValueWithoutCloudMutation(t *testing
 	}
 	if err := rt.meta.IncrSharedDBTenantCount(ctx, dbID, 1); err != nil {
 		t.Fatalf("IncrSharedDBTenantCount: %v", err)
-	}
-	if err := rt.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{
-		ID: dbID, TiDBCloudOrganizationID: "org-shared-quota", ClusterID: "cluster-shared-quota",
-	}); err != nil {
-		t.Fatalf("UpdateManagedSharedDBPoolCloudResult: %v", err)
 	}
 	initialLimit := int64(1000)
 	if err := rt.meta.SetQuotaConfig(ctx, &meta.QuotaConfig{
@@ -633,9 +665,9 @@ func TestSharedQuotaGetAndSetUseLocalVirtualValueWithoutCloudMutation(t *testing
 	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != updatedLimit {
 		t.Fatalf("persisted shared limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, updatedLimit)
 	}
-	if rt.prov.getCalls.Load() != 1 || rt.prov.markCalls.Load() != 0 || rt.prov.updateCalls.Load() != 0 {
-		t.Fatalf("shared quota Cloud calls: get=%d mark=%d update=%d; want one read-only authorization call",
-			rt.prov.getCalls.Load(), rt.prov.markCalls.Load(), rt.prov.updateCalls.Load())
+	if rt.prov.iamCalls.Load() != 1 || rt.prov.getCalls.Load() != 0 || rt.prov.markCalls.Load() != 0 || rt.prov.updateCalls.Load() != 0 {
+		t.Fatalf("shared quota calls: iam=%d get=%d mark=%d update=%d; want IAM authorization only",
+			rt.prov.iamCalls.Load(), rt.prov.getCalls.Load(), rt.prov.markCalls.Load(), rt.prov.updateCalls.Load())
 	}
 }
 
@@ -718,26 +750,23 @@ func TestQuotaGetUsesTiDBCloudAuthorization(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("get calls = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
+	}
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("quota get calls = %d, want 0", got)
 	}
 	if got := rt.prov.updateCalls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)
 	}
-	lastCluster := rt.prov.lastClusterSnapshot()
-	if lastCluster == nil || lastCluster.ClusterID != "cluster-quota-1" || lastCluster.TenantID != rt.tenantID {
-		t.Fatalf("last cluster = %#v", lastCluster)
-	}
-	lastCredentials := rt.prov.lastCredentialsSnapshot()
+	lastCredentials := rt.prov.lastIAMCredentialsSnapshot()
 	if lastCredentials.PublicKey != "public-1" || lastCredentials.PrivateKey != "private-1" {
 		t.Fatalf("last credentials = %#v", lastCredentials)
 	}
 }
 
-func TestQuotaGetCachesTiDBCloudRBACWithoutBackfillingSpendingLimit(t *testing.T) {
+func TestQuotaGetCachesTiDBCloudIAMRoleWithoutBackfillingSpendingLimit(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	spendingLimit := int64(222)
-	rt.prov.cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: &spendingLimit}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -748,8 +777,11 @@ func TestQuotaGetCachesTiDBCloudRBACWithoutBackfillingSpendingLimit(t *testing.T
 		t.Fatalf("first status = %d, want 200: %s", resp.StatusCode, body)
 	}
 	_ = resp.Body.Close()
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("get calls after first request = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls after first request = %d, want 1", got)
+	}
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("quota get calls after first request = %d, want 0", got)
 	}
 	cfg, err := rt.meta.GetQuotaConfig(context.Background(), rt.tenantID)
 	if err != nil {
@@ -762,7 +794,7 @@ func TestQuotaGetCachesTiDBCloudRBACWithoutBackfillingSpendingLimit(t *testing.T
 		t.Fatalf("checked_at = %v, want nil after GET", cfg.TiDBCloudSpendingLimitCheckedAt)
 	}
 
-	rt.prov.getErr = errors.New("should not call TiDB Cloud while RBAC cache and local spending limit are present")
+	rt.prov.iamErr = errors.New("should not call TiDB Cloud IAM while role cache is present")
 	resp2 := getQuota(t, ts.URL, rt.tenantID, "public-1", "private-1", "")
 	defer func() { _ = resp2.Body.Close() }()
 	if resp2.StatusCode != http.StatusOK {
@@ -776,21 +808,25 @@ func TestQuotaGetCachesTiDBCloudRBACWithoutBackfillingSpendingLimit(t *testing.T
 	if out.Config.TiDBCloudSpendingLimit != nil {
 		t.Fatalf("response spending limit = %#v, want nil", out.Config.TiDBCloudSpendingLimit)
 	}
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("get calls after cached request = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls after cached request = %d, want 1", got)
+	}
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("quota get calls after cached request = %d, want 0", got)
 	}
 
-	rt.prov.getErr = nil
-	updatedLimit := int64(333)
-	rt.prov.cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: &updatedLimit}
+	rt.prov.iamErr = nil
 	resp3 := getQuota(t, ts.URL, rt.tenantID, "public-1", "private-2", "")
 	defer func() { _ = resp3.Body.Close() }()
 	if resp3.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp3.Body)
 		t.Fatalf("third status = %d, want 200: %s", resp3.StatusCode, body)
 	}
-	if got := rt.prov.getCalls.Load(); got != 2 {
-		t.Fatalf("get calls after new credential = %d, want 2", got)
+	if got := rt.prov.iamCalls.Load(); got != 2 {
+		t.Fatalf("IAM calls after new credential = %d, want 2", got)
+	}
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("quota get calls after new credential = %d, want 0", got)
 	}
 	cfg, err = rt.meta.GetQuotaConfig(context.Background(), rt.tenantID)
 	if err != nil {
@@ -804,19 +840,25 @@ func TestQuotaGetCachesTiDBCloudRBACWithoutBackfillingSpendingLimit(t *testing.T
 	}
 }
 
-func TestDeprecatedQuotaGetWorksWithoutTiDBCloudOrgBinding(t *testing.T) {
+func TestQuotaGetWithoutTiDBCloudOrgBindingReturnsNotFound(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	if _, err := rt.meta.DB().Exec("DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?", rt.tenantID); err != nil {
+		t.Fatal(err)
+	}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
 	resp := getQuota(t, ts.URL, rt.tenantID, "public-1", "private-1", "")
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusNotFound {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("status = %d, want 200 without tenant-org binding: %s", resp.StatusCode, body)
+		t.Fatalf("status = %d, want 404 without tenant-org binding: %s", resp.StatusCode, body)
 	}
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("get calls = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 0 {
+		t.Fatalf("IAM calls = %d, want 0", got)
+	}
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("get calls = %d, want 0", got)
 	}
 	if got := rt.prov.listCalls.Load(); got != 0 {
 		t.Fatalf("list calls = %d, want 0", got)
@@ -1174,7 +1216,7 @@ func TestQuotaSetRejectsInvalidQuotaValues(t *testing.T) {
 		{name: "negative_file_count", field: "max_file_count", value: -1, wantErr: "max_file_count must be non-negative"},
 		{name: "negative_spending_limit", field: "tidbcloud_spending_limit", value: -1, wantErr: "tidbcloud_spending_limit must be non-negative"},
 		{name: "small_spending_limit", field: "tidbcloud_spending_limit", value: 9, wantErr: "tidbcloud_spending_limit must be 0 or at least 10 RMB"},
-		{name: "spending_limit_above_cloud_maximum", field: "tidbcloud_spending_limit", value: meta.MaxTiDBCloudSpendingLimit + 1, wantErr: "tidbcloud_spending_limit is too large"},
+		{name: "spending_limit_above_tenant_api_maximum", field: "tidbcloud_spending_limit", value: meta.MaxTiDBCloudSpendingLimit + 1, wantErr: "tidbcloud_spending_limit is too large"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
@@ -1232,15 +1274,21 @@ func TestQuotaSetRejectsNonCloudNativeTenant(t *testing.T) {
 func TestQuotaGetMapsTiDBCloudCredentialErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
-		err        error
 		wantStatus int
+		setup      func(*testing.T, *quotaRuntime)
 	}{
-		{name: "forbidden", err: tenant.ErrQuotaPermissionDenied, wantStatus: http.StatusForbidden},
-		{name: "not_found", err: tenant.ErrQuotaBackendNotFound, wantStatus: http.StatusNotFound},
+		{name: "forbidden", wantStatus: http.StatusForbidden, setup: func(_ *testing.T, rt *quotaRuntime) {
+			rt.prov.iamErr = tenant.ErrQuotaPermissionDenied
+		}},
+		{name: "not_found", wantStatus: http.StatusNotFound, setup: func(t *testing.T, rt *quotaRuntime) {
+			if _, err := rt.meta.DB().Exec("DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?", rt.tenantID); err != nil {
+				t.Fatal(err)
+			}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-			rt.prov.getErr = tc.err
+			tc.setup(t, rt)
 			ts := httptest.NewServer(rt.server)
 			defer ts.Close()
 
@@ -1249,8 +1297,8 @@ func TestQuotaGetMapsTiDBCloudCredentialErrors(t *testing.T) {
 			if resp.StatusCode != tc.wantStatus {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
 			}
-			if got := rt.prov.getCalls.Load(); got != 1 {
-				t.Fatalf("get calls = %d, want 1", got)
+			if got := rt.prov.getCalls.Load(); got != 0 {
+				t.Fatalf("quota get calls = %d, want 0", got)
 			}
 		})
 	}
@@ -1332,9 +1380,11 @@ func TestQuotaSetHidesGenericTiDBCloudQuotaError(t *testing.T) {
 	}
 }
 
-func TestAdminTenantListReturnsEmptyWithoutDBLookupWhenNoManagedClusters(t *testing.T) {
+func TestAdminTenantListReturnsEmptyForIAMOrganizationWithoutTenants(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{}}
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-empty", Role: tenant.TiDBCloudRoleOrgOwner,
+	}}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -1360,16 +1410,15 @@ func TestAdminTenantListReturnsEmptyWithoutDBLookupWhenNoManagedClusters(t *test
 	if len(out.Tenants) != 0 {
 		t.Fatalf("tenants = %#v, want empty", out.Tenants)
 	}
-	if got := rt.prov.listCalls.Load(); got != 1 {
-		t.Fatalf("list calls = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
 	}
-	lastListOptions := rt.prov.lastListOptionsSnapshot()
-	if lastListOptions.ClusterID != "" {
-		t.Fatalf("cluster filter = %q, want empty", lastListOptions.ClusterID)
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("cluster list calls = %d, want 0", got)
 	}
 }
 
-func TestAdminTenantListFiltersByAuthorizedClusters(t *testing.T) {
+func TestAdminTenantListFiltersByIAMOrganization(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -1396,7 +1445,7 @@ func TestAdminTenantListFiltersByAuthorizedClusters(t *testing.T) {
 	}
 	sharedDBID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-1", Host: "shared-list.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1406,33 +1455,6 @@ func TestAdminTenantListFiltersByAuthorizedClusters(t *testing.T) {
 	}
 	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
 		FsID: sharedFsID, DbID: sharedDBID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	wildcardTenantID := "tenant-shared-wildcard-authorized"
-	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
-		ID: wildcardTenantID, Status: meta.TenantActive, Kind: meta.TenantKindLive,
-		Provider: tenant.ProviderTiDBCloudNativeShared, SchemaVersion: 1, DBPasswordCipher: []byte{},
-		CreatedAt: now.Add(4 * time.Second), UpdatedAt: now.Add(4 * time.Second),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	wildcardFsID, err := rt.meta.ResolveFsID(ctx, wildcardTenantID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wildcardDBID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		TiDBCloudOrganizationID: meta.SharedDBOrgWildcard, Host: "shared-wildcard-list.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE db_pool SET cluster_id = ? WHERE db_id = ?", "cluster-allowed", wildcardDBID); err != nil {
-		t.Fatal(err)
-	}
-	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
-		FsID: wildcardFsID, DbID: wildcardDBID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1487,6 +1509,20 @@ func TestAdminTenantListFiltersByAuthorizedClusters(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	foreignTenantID := "tenant-foreign-organization"
+	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+		ID: foreignTenantID, Status: meta.TenantActive, Kind: meta.TenantKindLive,
+		Provider: tenant.ProviderTiDBCloudNative, ClusterID: "cluster-foreign", SchemaVersion: 1,
+		DBPasswordCipher: []byte("cipher"), CreatedAt: now.Add(6 * time.Second), UpdatedAt: now.Add(6 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+		TenantID: foreignTenantID, OrganizationID: "org-2", ClusterID: "cluster-foreign",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	freeTenantID := "tenant-free-pool"
 	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               freeTenantID,
@@ -1517,14 +1553,8 @@ func TestAdminTenantListFiltersByAuthorizedClusters(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{
-			ClusterID:      "cluster-allowed",
-			OrganizationID: "org-1",
-		}, {
-			ClusterID:      "cluster-free",
-			OrganizationID: "org-1",
-		}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-1", Role: tenant.TiDBCloudRoleProjectOwner,
 	}}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
@@ -1548,8 +1578,14 @@ func TestAdminTenantListFiltersByAuthorizedClusters(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Tenants) != 3 || out.Tenants[0].TenantID != wildcardTenantID || out.Tenants[1].TenantID != sharedTenantID || out.Tenants[2].TenantID != rt.tenantID {
-		t.Fatalf("tenants = %#v, want wildcard shared tenant %s, shared tenant %s, and dedicated tenant %s", out.Tenants, wildcardTenantID, sharedTenantID, rt.tenantID)
+	if len(out.Tenants) != 3 || out.Tenants[0].TenantID != sharedTenantID || out.Tenants[1].TenantID != otherTenantID || out.Tenants[2].TenantID != rt.tenantID {
+		t.Fatalf("tenants = %#v, want non-free tenants explicitly owned by the IAM organization", out.Tenants)
+	}
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
+	}
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("cluster list calls = %d, want 0", got)
 	}
 	freeReq, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/admin/tenants/"+freeSharedTenantID, nil)
 	if err != nil {
@@ -1592,13 +1628,8 @@ func TestAdminTenantListIncludeQuotaDoesNotBackfillSpendingLimit(t *testing.T) {
 	if err := rt.meta.EnsureQuotaUsageRow(ctx, rt.tenantID); err != nil {
 		t.Fatal(err)
 	}
-	cloudSpendingLimit := int64(12345)
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{
-			ClusterID:                     "cluster-quota-1",
-			OrganizationID:                "org-1",
-			TiDBCloudSpendingLimitMonthly: &cloudSpendingLimit,
-		}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-1", Role: tenant.TiDBCloudRoleOrgOwner,
 	}}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
@@ -1635,8 +1666,11 @@ func TestAdminTenantListIncludeQuotaDoesNotBackfillSpendingLimit(t *testing.T) {
 	if cfg.TiDBCloudSpendingLimit != nil || cfg.TiDBCloudSpendingLimitCheckedAt != nil {
 		t.Fatalf("quota config mutated by GET: %#v", cfg)
 	}
-	if got := rt.prov.listCalls.Load(); got != 1 {
-		t.Fatalf("list calls = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
+	}
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("cluster list calls = %d, want 0", got)
 	}
 }
 
@@ -1705,6 +1739,9 @@ func TestAdminTenantGetHidesFreePoolTenant(t *testing.T) {
 
 func TestAdminTenantGetWithoutOrgBindingReturnsNotFound(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	if _, err := rt.meta.DB().Exec("DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?", rt.tenantID); err != nil {
+		t.Fatal(err)
+	}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -1728,7 +1765,7 @@ func TestAdminTenantGetWithoutOrgBindingReturnsNotFound(t *testing.T) {
 	}
 }
 
-func TestAdminTenantGetRejectsUnauthorizedCluster(t *testing.T) {
+func TestAdminTenantGetRejectsUnauthorizedOrganization(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
 	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
@@ -1740,11 +1777,8 @@ func TestAdminTenantGetRejectsUnauthorizedCluster(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{
-			ClusterID:      "cluster-other",
-			OrganizationID: "org-1",
-		}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-2", Role: tenant.TiDBCloudRoleOrgOwner,
 	}}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
@@ -1762,11 +1796,17 @@ func TestAdminTenantGetRejectsUnauthorizedCluster(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusForbidden {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("status = %d, want 403 for unauthorized cluster: %s", resp.StatusCode, body)
+		t.Fatalf("status = %d, want 403 for unauthorized organization: %s", resp.StatusCode, body)
+	}
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
+	}
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("cluster list calls = %d, want 0", got)
 	}
 }
 
-func TestAdminTenantGetUsesListClusterAuthorizationAndReturnsQuota(t *testing.T) {
+func TestAdminTenantGetUsesIAMOrganizationAuthorizationAndReturnsQuota(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
 	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
@@ -1791,13 +1831,8 @@ func TestAdminTenantGetUsesListClusterAuthorizationAndReturnsQuota(t *testing.T)
 	if err := rt.meta.EnsureQuotaUsageRow(ctx, rt.tenantID); err != nil {
 		t.Fatal(err)
 	}
-	cloudSpendingLimit := int64(12345)
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{
-			ClusterID:                     "cluster-quota-1",
-			OrganizationID:                "org-1",
-			TiDBCloudSpendingLimitMonthly: &cloudSpendingLimit,
-		}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-1", Role: tenant.TiDBCloudRoleProjectOwner,
 	}}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
@@ -1850,18 +1885,17 @@ func TestAdminTenantGetUsesListClusterAuthorizationAndReturnsQuota(t *testing.T)
 	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != localSpendingLimit || cfg.TiDBCloudSpendingLimitCheckedAt != nil {
 		t.Fatalf("quota config mutated by GET: %#v", cfg)
 	}
-	if got := rt.prov.listCalls.Load(); got != 1 {
-		t.Fatalf("list calls = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
 	}
-	lastListOptions := rt.prov.lastListOptionsSnapshot()
-	if lastListOptions.ClusterID != "cluster-quota-1" {
-		t.Fatalf("cluster filter = %q, want cluster-quota-1", lastListOptions.ClusterID)
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("cluster list calls = %d, want 0", got)
 	}
 	if got := rt.prov.markCalls.Load(); got != 0 {
 		t.Fatalf("mark calls = %d, want 0", got)
 	}
 
-	rt.prov.listErr = errors.New("should not call TiDB Cloud while admin RBAC cache and local spending limit are present")
+	rt.prov.iamErr = errors.New("should not call TiDB Cloud IAM while role cache is present")
 	req, err = http.NewRequest(http.MethodGet, ts.URL+"/v1/admin/tenants/"+rt.tenantID, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1877,8 +1911,11 @@ func TestAdminTenantGetUsesListClusterAuthorizationAndReturnsQuota(t *testing.T)
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("cached status = %d, want 200: %s", resp.StatusCode, body)
 	}
-	if got := rt.prov.listCalls.Load(); got != 1 {
-		t.Fatalf("list calls after cached request = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls after cached request = %d, want 1", got)
+	}
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("cluster list calls after cached request = %d, want 0", got)
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
@@ -2183,9 +2220,11 @@ func TestAdminTenantPoolCreatePersistsClustersWhenMetadataWaitFails(t *testing.T
 	}
 }
 
-func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneOrganizationMissing(t *testing.T) {
+func TestAdminTenantPoolCreateUsesIAMOrganizationWhenClusterResponseOmitsIt(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{}}
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-1", Role: tenant.TiDBCloudRoleOrgOwner,
+	}}
 	rt.prov.batchPoolErr = errors.New("tidbcloud native cluster get status 429")
 	rt.prov.batchPoolOmitConnectionInfo = true
 	rt.prov.batchPoolMissingOrg = map[int]bool{1: true}
@@ -2224,15 +2263,17 @@ func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneOrganizationMissi
 	if err != nil {
 		t.Fatalf("list pending bindings: %v", err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("pending bindings = %d, want 1", len(rows))
+	if len(rows) != 2 {
+		t.Fatalf("pending bindings = %d, want 2", len(rows))
 	}
-	if got := rt.prov.deprovisionCalls.Load(); got != 1 {
-		t.Fatalf("deprovision calls = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
 	}
-	lastDeprovision := rt.prov.lastDeprovisionSnapshot()
-	if lastDeprovision == nil || lastDeprovision.ClusterID != "pool-cluster-2" {
-		t.Fatalf("last deprovision = %#v, want pool-cluster-2", lastDeprovision)
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("cluster list calls = %d, want 0", got)
+	}
+	if got := rt.prov.deprovisionCalls.Load(); got != 0 {
+		t.Fatalf("deprovision calls = %d, want 0", got)
 	}
 }
 
@@ -2666,9 +2707,11 @@ func TestAdminTenantPoolUpdateRejectsAboveMaxSize(t *testing.T) {
 	}
 }
 
-func TestAdminTenantPoolCreateCleansUpWhenOrganizationBackfillConflicts(t *testing.T) {
+func TestAdminTenantPoolCreateRejectsExistingIAMOrganizationPoolBeforeCloudCreate(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{}}
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-1", Role: tenant.TiDBCloudRoleOrgOwner,
+	}}
 	ctx := context.Background()
 	now := time.Now().UTC()
 	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
@@ -2694,11 +2737,17 @@ func TestAdminTenantPoolCreateCleansUpWhenOrganizationBackfillConflicts(t *testi
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 409: %s", resp.StatusCode, body)
 	}
-	if got := rt.prov.batchPoolCalls.Load(); got != 1 {
-		t.Fatalf("batch pool calls = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
 	}
-	if got := rt.prov.deprovisionCalls.Load(); got != 2 {
-		t.Fatalf("deprovision calls = %d, want 2", got)
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("cluster list calls = %d, want 0", got)
+	}
+	if got := rt.prov.batchPoolCalls.Load(); got != 0 {
+		t.Fatalf("batch pool calls = %d, want 0", got)
+	}
+	if got := rt.prov.deprovisionCalls.Load(); got != 0 {
+		t.Fatalf("deprovision calls = %d, want 0", got)
 	}
 	free, err := rt.meta.CountFreeTenantPoolBindings(ctx, "org-1")
 	if err != nil {
@@ -3301,7 +3350,7 @@ func TestProvisionFallsBackWhenTenantPoolClaimCannotListManagedClusters(t *testi
 	}
 }
 
-func TestAdminTenantQuotaSetRequiresPatchLabelAuthorization(t *testing.T) {
+func TestAdminTenantQuotaSetRequiresIAMOrganizationAuthorization(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
 	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
@@ -3323,11 +3372,8 @@ func TestAdminTenantQuotaSetRequiresPatchLabelAuthorization(t *testing.T) {
 	if err := rt.meta.EnsureQuotaUsageRow(ctx, rt.tenantID); err != nil {
 		t.Fatal(err)
 	}
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{
-			ClusterID:      "cluster-quota-1",
-			OrganizationID: "org-1",
-		}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-1", Role: tenant.TiDBCloudRoleOrgOwner,
 	}}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
@@ -3355,8 +3401,11 @@ func TestAdminTenantQuotaSetRequiresPatchLabelAuthorization(t *testing.T) {
 			t.Fatalf("admin quota response exposed field %q: %s", field, raw)
 		}
 	}
-	if got := rt.prov.listCalls.Load(); got != 1 {
-		t.Fatalf("list calls = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
+	}
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("cluster list calls = %d, want 0", got)
 	}
 	if got := rt.prov.markCalls.Load(); got != 1 {
 		t.Fatalf("mark calls = %d, want 1", got)
@@ -3372,8 +3421,8 @@ func TestAdminTenantQuotaSetRequiresPatchLabelAuthorization(t *testing.T) {
 		t.Fatalf("max storage bytes = %d, want %d", cfg.MaxStorageBytes, 200*quotaStorageSizeBytes)
 	}
 	calls := rt.prov.callsSnapshot()
-	if len(calls) < 2 || calls[0] != "list" || calls[1] != "mark" {
-		t.Fatalf("calls = %#v, want list then mark", calls)
+	if len(calls) != 1 || calls[0] != "mark" {
+		t.Fatalf("calls = %#v, want mark only after IAM authorization", calls)
 	}
 }
 
@@ -3392,11 +3441,8 @@ func TestAdminTenantQuotaSetRejectsProvisioningTenant(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{
-			ClusterID:      "cluster-quota-1",
-			OrganizationID: "org-1",
-		}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-1", Role: tenant.TiDBCloudRoleProjectOwner,
 	}}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
@@ -3411,8 +3457,11 @@ func TestAdminTenantQuotaSetRejectsProvisioningTenant(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 409: %s", resp.StatusCode, body)
 	}
-	if got := rt.prov.listCalls.Load(); got != 1 {
-		t.Fatalf("list calls = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
+	}
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("cluster list calls = %d, want 0", got)
 	}
 	if got := rt.prov.markCalls.Load(); got != 0 {
 		t.Fatalf("mark calls = %d, want 0", got)
@@ -3446,13 +3495,7 @@ func TestAdminTenantDeleteRetryWithCleanupJobSkipsPatchAfterClusterGone(t *testi
 		t.Fatal(err)
 	}
 	rt.prov.markErr = tenant.ErrQuotaBackendNotFound
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{
-		{},
-		{Clusters: []tenant.CloudClusterInfo{{
-			ClusterID:      "cluster-other-in-org",
-			OrganizationID: "org-1",
-		}}},
-	}
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{OrganizationID: "org-1", Role: tenant.TiDBCloudRoleOrgOwner}}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
@@ -3470,8 +3513,8 @@ func TestAdminTenantDeleteRetryWithCleanupJobSkipsPatchAfterClusterGone(t *testi
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 202: %s", resp.StatusCode, body)
 	}
-	if got := rt.prov.listCalls.Load(); got != 2 {
-		t.Fatalf("list calls = %d, want cluster lookup then org fallback", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
 	}
 	if got := rt.prov.markCalls.Load(); got != 0 {
 		t.Fatalf("mark calls = %d, want 0 for already-enqueued delete retry", got)

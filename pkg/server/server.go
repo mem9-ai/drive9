@@ -48,11 +48,12 @@ type Config struct {
 	Pool                  *tenant.Pool
 	Provisioner           tenant.Provisioner
 	DefaultTenantProvider string
-	// SharedDBMaxTenants applies only to new managed
-	// tidb_cloud_native_shared pools. Zero uses the default of 100 tenants.
-	SharedDBMaxTenants   int
-	SharedDBHardCapRatio float64
-	SharedDBReopenRatio  float64
+	// SharedDBMaxTenants and SharedDBSpendingLimit apply only to new
+	// managed tidb_cloud_native_shared pools. Zero values use their defaults.
+	SharedDBMaxTenants    int
+	SharedDBHardCapRatio  float64
+	SharedDBReopenRatio   float64
+	SharedDBSpendingLimit int64
 	// LegacyStarterProvisioner is only used for delete/fork compatibility on
 	// persisted tidb_cloud_starter tenants. New starter provisioning remains
 	// disabled and NormalizeProvider does not accept tidb_cloud_starter.
@@ -188,6 +189,7 @@ type Server struct {
 	sharedDBMaxTenants        int
 	sharedDBHardCapRatio      float64
 	sharedDBReopenRatio       float64
+	sharedDBSpendingLimit     int64
 	legacyStarterProvisioner  tenant.Provisioner
 	tokenSecret               []byte
 	localTenantAPIKey         string
@@ -297,6 +299,10 @@ const DefaultSharedDBHardCapRatio = 1.2
 // to 80% of its persisted soft capacity.
 const DefaultSharedDBReopenRatio = 0.8
 
+// DefaultManagedSharedDBSpendingLimit is the physical spending-limit target
+// persisted for a new managed shared DB pool when no override is configured.
+const DefaultManagedSharedDBSpendingLimit = int64(1_000_000)
+
 // TenantStatusResponse is the JSON body of GET /v1/status. Fields are filled
 // per authenticated tenant so callers can discover their effective limits
 // before initiating uploads. MaxUploadBytes is currently process-wide but the
@@ -371,6 +377,10 @@ func NewWithConfig(cfg Config) *Server {
 	if sharedDBReopenRatio <= 0 || sharedDBReopenRatio >= 1 || sharedDBReopenRatio != sharedDBReopenRatio || math.IsInf(sharedDBReopenRatio, 0) {
 		sharedDBReopenRatio = DefaultSharedDBReopenRatio
 	}
+	sharedDBSpendingLimit := cfg.SharedDBSpendingLimit
+	if sharedDBSpendingLimit <= 0 {
+		sharedDBSpendingLimit = DefaultManagedSharedDBSpendingLimit
+	}
 	defaultTenantProvider := strings.TrimSpace(cfg.DefaultTenantProvider)
 	if defaultTenantProvider == "" && cfg.Provisioner != nil {
 		defaultTenantProvider = cfg.Provisioner.ProviderType()
@@ -390,6 +400,7 @@ func NewWithConfig(cfg Config) *Server {
 		sharedDBMaxTenants:        cfg.SharedDBMaxTenants,
 		sharedDBHardCapRatio:      sharedDBHardCapRatio,
 		sharedDBReopenRatio:       sharedDBReopenRatio,
+		sharedDBSpendingLimit:     sharedDBSpendingLimit,
 		legacyStarterProvisioner:  cfg.LegacyStarterProvisioner,
 		maxUploadBytes:            maxUpload,
 		tenantPoolMaxSize:         tenantPoolMaxSize,
@@ -4524,7 +4535,6 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		} else if claimed {
 			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
 			setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
-			s.forgetTiDBCloudRBACList(*credentialReq)
 			if res.Status == meta.TenantProvisioning {
 				s.startProvisionedTenantSchemaInit(r.Context(), res)
 			}
@@ -4555,9 +4565,6 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
-	if credentialReq != nil {
-		s.forgetTiDBCloudRBACList(*credentialReq)
-	}
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
 	writeProvisionTenantAccepted(w, res)
 }
@@ -4593,7 +4600,7 @@ func clientFacingErrorResponse(defaultStatus int, defaultMessage string, err err
 		return http.StatusBadRequest, msg
 	case isTiDBCloudStatusError(err, http.StatusUnauthorized):
 		return http.StatusUnauthorized, msg
-	case errors.Is(err, tenant.ErrQuotaPermissionDenied), isTiDBCloudStatusError(err, http.StatusForbidden):
+	case errors.Is(err, tenant.ErrQuotaPermissionDenied), errors.Is(err, tenant.ErrTiDBCloudRoleInsufficient), isTiDBCloudStatusError(err, http.StatusForbidden):
 		return http.StatusForbidden, msg
 	default:
 		return defaultStatus, msg
@@ -4626,6 +4633,8 @@ func clientFacingErrorDetail(err error) string {
 		return tenant.ErrPartialCredentials.Error()
 	case errors.Is(err, tenant.ErrQuotaPermissionDenied):
 		return tenant.ErrQuotaPermissionDenied.Error()
+	case errors.Is(err, tenant.ErrTiDBCloudRoleInsufficient):
+		return tenant.ErrTiDBCloudRoleInsufficient.Error()
 	case errors.Is(err, tenant.ErrQuotaBackendNotFound):
 		return tenant.ErrQuotaBackendNotFound.Error()
 	default:
@@ -5074,45 +5083,36 @@ func (s *Server) updateTenantSchemaVersionForProfile(ctx context.Context, tenant
 }
 
 // findSharedDBForProvision resolves whether the tenant being provisioned
-// should be placed on a shared-schema database: a registered shared pool for
-// the request's org, or the wildcard pool. It returns (nil, nil) when the
+// should be placed on a shared-schema database registered for the request's
+// exact TiDB Cloud organization. It returns (nil, nil) when the
 // tenant should follow the normal per-tenant provisioning path. Lookup
 // failures are returned as errors — never silently treated as "no pool",
 // which would provision the wrong tenant shape on a transient meta outage.
 //
-// Only TiDB-dialect providers may route to a shared pool (the shared schema
-// is TiDB/MySQL DDL): db9 tenants are PostgreSQL-backed and engine-
-// incompatible, so a wildcard pool must never capture them.
+// Only TiDB Cloud providers carry an IAM-resolved organization and may route
+// to an organization-bound shared pool.
 func (s *Server) findSharedDBForProvision(ctx context.Context, provider string, opts provisionTenantOptions) (*meta.SharedDB, error) {
 	if s.meta == nil {
 		return nil, nil
 	}
 	switch provider {
-	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBCloudNativeShared, tenant.ProviderTiDBZero:
+	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBCloudNativeShared:
 	default:
 		return nil, nil
 	}
 	orgID := ""
-	if provider == tenant.ProviderTiDBCloudNative || provider == tenant.ProviderTiDBCloudNativeShared {
-		if opts.CredentialProvisioner != nil {
-			if id, err := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner); err == nil {
-				orgID = id
-			} else {
-				logger.Warn(ctx, "server_event", eventFields(ctx, "provision_org_resolve_failed", "error", err)...)
-			}
+	if opts.CredentialProvisioner != nil {
+		if id, err := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner); err == nil {
+			orgID = id
+		} else {
+			logger.Warn(ctx, "server_event", eventFields(ctx, "provision_org_resolve_failed", "error", err)...)
 		}
-		if orgID == "" {
-			if provider == tenant.ProviderTiDBCloudNativeShared {
-				// An explicit shared placement request must fail closed: an
-				// unresolvable org can never silently become a dedicated
-				// cluster (nor match the wildcard pool).
-				return nil, fmt.Errorf("cannot resolve tidbcloud organization for shared-pool placement")
-			}
-			// Never fall back to the wildcard pool when the tenant's org cannot
-			// be resolved: an unresolved org must stay on the dedicated path
-			// even if a wildcard pool exists.
-			return nil, nil
+	}
+	if orgID == "" {
+		if provider == tenant.ProviderTiDBCloudNativeShared {
+			return nil, fmt.Errorf("cannot resolve tidbcloud organization for shared-pool placement")
 		}
+		return nil, nil
 	}
 	sharedDB, err := s.meta.FindSharedDBForOrg(ctx, orgID)
 	if err != nil {
@@ -5256,6 +5256,12 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			opts.CredentialProvisioner = defaultReq
 		}
 	}
+	if tenant.UsesTiDBCloudNativeCredentials(provider) {
+		if _, err := s.resolveTiDBCloudIdentity(ctx, *opts.CredentialProvisioner, "provision"); err != nil {
+			status, message := clientFacingErrorResponse(http.StatusBadGateway, "TiDB Cloud API key authorization failed", err)
+			return nil, newProvisionTenantError(status, message, err)
+		}
+	}
 	tenantID := token.NewID()
 	provisionStarted := time.Now()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
@@ -5314,7 +5320,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			}
 			if sharedDB.SpendingLimit != nil && (created || sharedDB.ClusterID == "" || sharedDB.Host == "" || sharedDB.Port <= 0 || sharedDB.User == "") {
 				plannedDB := sharedDB
-				sharedDB, err = s.ensureManagedSharedDBPhysical(ctx, plannedDB.ID, *opts.CredentialProvisioner)
+				sharedDB, err = s.ensureManagedSharedDBPhysical(ctx, plannedDB.ID)
 				if err != nil {
 					orgID, orgErr := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner)
 					if orgErr == nil {
@@ -5324,7 +5330,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 							if hardErr == nil {
 								res, reserveErr := s.provisionTenantOnSharedDBEmergency(ctx, tenantID, fallback, provider, keyName, opts, now, hardCap)
 								if reserveErr == nil {
-									s.scheduleManagedSharedDBContinuation(ctx, plannedDB.ID, *opts.CredentialProvisioner)
+									s.scheduleManagedSharedDBContinuation(ctx, plannedDB.ID)
 									return res, nil
 								}
 								if isSharedDBReservationConflict(reserveErr) {
@@ -5348,7 +5354,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				return nil, reserveErr
 			}
 			if created || sharedDB.Status == meta.SharedDBStatusProvisioning {
-				s.scheduleManagedSharedDBContinuation(ctx, sharedDB.ID, *opts.CredentialProvisioner)
+				s.scheduleManagedSharedDBContinuation(ctx, sharedDB.ID)
 			}
 			return res, nil
 		}
@@ -5356,7 +5362,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 
 	// Shared-pool placement: when a shared-schema database is registered for
-	// this tenant's org (or a wildcard pool exists), the tenant is placed on
+	// this tenant's exact TiDB Cloud organization, the tenant is placed on
 	// it directly — no cluster is created and the schema already exists there.
 	sharedDB, err := s.findSharedDBForProvision(ctx, provider, opts)
 	if err != nil {

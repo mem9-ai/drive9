@@ -15,7 +15,6 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
-	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
@@ -139,10 +138,10 @@ func (s *Server) adminTenantAPIEnabled() bool {
 		return false
 	}
 	provider, err := tenant.NormalizeProvider(s.provisioner.ProviderType())
-	if err != nil || provider != tenant.ProviderTiDBCloudNative {
+	if err != nil || (provider != tenant.ProviderTiDBCloudNative && provider != tenant.ProviderTiDBCloudNativeShared) {
 		return false
 	}
-	_, ok := s.provisioner.(tenant.ManagedClusterLister)
+	_, ok := s.provisioner.(tenant.TiDBCloudAPIKeyIdentityResolver)
 	return ok
 }
 
@@ -180,7 +179,6 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 	} else if claimed {
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
 		setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
-		s.forgetTiDBCloudRBACList(cred)
 		if res.Status == meta.TenantProvisioning {
 			s.startProvisionedTenantSchemaInit(r.Context(), res)
 		}
@@ -199,20 +197,6 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 	}
 	provider := ""
 	if sharedPoolMatched {
-		orgID, resolveErr := s.firstManagedOrganization(r.Context(), cred)
-		if resolveErr != nil {
-			writeAdminTiDBCloudError(w, r.Context(), resolveErr, "resolve shared tenant pool")
-			return
-		}
-		sharedDB, findErr := s.meta.FindSharedDBForOrg(r.Context(), orgID)
-		if findErr != nil {
-			errJSON(w, http.StatusInternalServerError, "shared tenant pool lookup failed")
-			return
-		}
-		if strings.TrimSpace(sharedDB.ClusterID) == "" {
-			errJSON(w, http.StatusConflict, "shared tenant pool has no TiDB Cloud cluster identity")
-			return
-		}
 		provider = tenant.ProviderTiDBCloudNativeShared
 	}
 	logProvider := tenant.ProviderTiDBCloudNative
@@ -237,7 +221,6 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
-	s.forgetTiDBCloudRBACList(cred)
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -256,19 +239,9 @@ func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	clusters, err := s.listAllManagedClusters(r.Context(), cred, "", "admin_tenant_list")
+	identity, err := s.resolveTiDBCloudIdentity(r.Context(), cred, "admin_tenant_list")
 	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "list tenants")
-		return
-	}
-	authorizedBindings := authorizedTiDBCloudOrgClusterBindings(clusters)
-	if len(authorizedBindings) == 0 {
-		pageSize, page, _, err := adminPagination(r)
-		if err != nil {
-			errJSON(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, adminTenantListResponse{Tenants: []adminTenantResponse{}, Page: page, PageSize: pageSize})
 		return
 	}
 	pageSize, page, offset, err := adminPagination(r)
@@ -277,7 +250,7 @@ func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	includeQuota := parseBoolQuery(r, "include_quota")
-	rows, err := s.meta.ListTenantsByTiDBCloudResources(r.Context(), authorizedBindings, offset, pageSize+1)
+	rows, err := s.meta.ListTenantsByTiDBCloudOrganization(r.Context(), identity.OrganizationID, offset, pageSize+1)
 	if err != nil {
 		errJSON(w, backendErrorStatus(r.Context(), err), "tenant list failed")
 		return
@@ -388,7 +361,6 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 		s.handleSharedTenantDeleteWithStatusWriter(w, r, t, func(w http.ResponseWriter, status meta.TenantStatus) {
 			writeJSON(w, http.StatusAccepted, adminTenantDeleteResponse{TenantID: t.ID, Status: string(status)})
 		})
-		s.forgetTiDBCloudRBACList(cred)
 		return
 	}
 	if t.StorageNamespaceID != "" {
@@ -456,11 +428,15 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
-	s.forgetTiDBCloudRBACList(cred)
 	writeJSON(w, http.StatusAccepted, adminTenantDeleteResponse{TenantID: t.ID, Status: string(status)})
 }
 
 func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, tenantID string, cred tenant.CredentialProvisionRequest, loadQuota bool, allowDeletingMissingCluster bool) (*meta.Tenant, *meta.TenantTiDBCloudOrgBinding, bool) {
+	identity, err := s.resolveTiDBCloudIdentity(r.Context(), cred, adminTenantMetricPath(loadQuota, allowDeletingMissingCluster))
+	if err != nil {
+		writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
+		return nil, nil, false
+	}
 	t, err := s.meta.GetTenant(r.Context(), tenantID)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
@@ -484,9 +460,21 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 			errJSON(w, http.StatusInternalServerError, "tenant pool membership lookup failed")
 			return nil, nil, false
 		}
-		physical, err := s.authorizeSharedQuotaCredentials(r.Context(), t, cred, adminTenantMetricPath(loadQuota, allowDeletingMissingCluster))
-		if err != nil {
-			writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
+		physical, physicalErr := s.meta.GetSharedDBForTenant(r.Context(), t.ID)
+		if errors.Is(physicalErr, meta.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "tenant shared DB pool not found")
+			return nil, nil, false
+		}
+		if physicalErr != nil {
+			errJSON(w, backendErrorStatus(r.Context(), physicalErr), "tenant shared DB pool lookup failed")
+			return nil, nil, false
+		}
+		if physical == nil {
+			errJSON(w, http.StatusNotFound, "tenant shared DB pool not found")
+			return nil, nil, false
+		}
+		if !tiDBCloudOrganizationMatches(identity.OrganizationID, physical.TiDBCloudOrganizationID) {
+			errJSON(w, http.StatusForbidden, "TiDB Cloud API key organization does not match tenant")
 			return nil, nil, false
 		}
 		setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, physical.TiDBCloudOrganizationID, classifyTenantRequest(r))
@@ -509,37 +497,8 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 		errJSON(w, http.StatusNotFound, "tenant not found")
 		return nil, nil, false
 	}
-	clusters, err := s.listAllManagedClusters(r.Context(), cred, binding.ClusterID, adminTenantMetricPath(loadQuota, allowDeletingMissingCluster))
-	if err != nil {
-		writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
-		return nil, nil, false
-	}
-	if len(clusters) == 0 && allowDeletingMissingCluster && t.Status == meta.TenantDeleting {
-		clusters, err = s.listAllManagedClusters(r.Context(), cred, "", adminTenantMetricPath(loadQuota, allowDeletingMissingCluster))
-		if err != nil {
-			writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
-			return nil, nil, false
-		}
-		for _, cluster := range clusters {
-			if cluster.OrganizationID == binding.OrganizationID {
-				setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, binding.OrganizationID, classifyTenantRequest(r))
-				return t, binding, true
-			}
-		}
-	}
-	if len(clusters) == 0 {
-		errJSON(w, http.StatusForbidden, "no permission to access tenant with TiDB Cloud API key")
-		return nil, nil, false
-	}
-	authorized := false
-	for _, cluster := range clusters {
-		if cluster.ClusterID == binding.ClusterID && cluster.OrganizationID == binding.OrganizationID {
-			authorized = true
-			break
-		}
-	}
-	if !authorized {
-		errJSON(w, http.StatusForbidden, "no permission to access tenant with TiDB Cloud API key")
+	if !tiDBCloudOrganizationMatches(identity.OrganizationID, binding.OrganizationID) {
+		errJSON(w, http.StatusForbidden, "TiDB Cloud API key organization does not match tenant")
 		return nil, nil, false
 	}
 	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, binding.OrganizationID, classifyTenantRequest(r))
@@ -554,62 +513,6 @@ func adminTenantMetricPath(loadQuota bool, allowDeletingMissingCluster bool) str
 		return "admin_tenant_delete"
 	default:
 		return "admin_tenant_quota_set"
-	}
-}
-
-func (s *Server) listAllManagedClusters(ctx context.Context, cred tenant.CredentialProvisionRequest, clusterID, metricPath string) ([]tenant.CloudClusterInfo, error) {
-	clusterID = strings.TrimSpace(clusterID)
-	scope := "list"
-	if clusterID != "" {
-		scope = "cluster"
-	}
-	if clusterID != "" {
-		if cluster, ok := s.tidbCloudRBACCache.getCluster(cred, clusterID); ok {
-			if cluster.OrganizationID != "" {
-				metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "hit")
-				return []tenant.CloudClusterInfo{cluster}, nil
-			}
-		}
-	} else if clusters, ok := s.tidbCloudRBACCache.getClusterList(cred); ok {
-		metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "hit")
-		return clusters, nil
-	}
-	metrics.RecordTiDBCloudRBACCacheRequest(metricPath, scope, "miss")
-	lister, ok := s.provisioner.(tenant.ManagedClusterLister)
-	if !ok {
-		return nil, fmt.Errorf("managed cluster list not enabled")
-	}
-	var out []tenant.CloudClusterInfo
-	pageToken := ""
-	for {
-		page, err := lister.ListManagedClusters(ctx, cred, tenant.ManagedClusterListOptions{
-			PageSize:  100,
-			PageToken: pageToken,
-			ClusterID: clusterID,
-		})
-		if err != nil {
-			metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "list_managed_clusters", "error")
-			return nil, err
-		}
-		metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "list_managed_clusters", "ok")
-		if page == nil {
-			if clusterID == "" {
-				s.tidbCloudRBACCache.rememberClusterList(cred, out)
-			}
-			return out, nil
-		}
-		out = append(out, page.Clusters...)
-		pageToken = strings.TrimSpace(page.NextPageToken)
-		if pageToken == "" || clusterID != "" {
-			if clusterID == "" {
-				s.tidbCloudRBACCache.rememberClusterList(cred, out)
-			} else {
-				for _, cluster := range out {
-					s.rememberTiDBCloudRBAC(cred, cluster)
-				}
-			}
-			return out, nil
-		}
 	}
 }
 
@@ -668,25 +571,6 @@ func (s *Server) writeAdminQuotaResponse(w http.ResponseWriter, r *http.Request,
 		Config:   quota.Config,
 		Usage:    quota.Usage,
 	})
-}
-
-func authorizedTiDBCloudOrgClusterBindings(clusters []tenant.CloudClusterInfo) []meta.TenantTiDBCloudOrgBinding {
-	out := make([]meta.TenantTiDBCloudOrgBinding, 0, len(clusters))
-	seen := make(map[string]bool, len(clusters))
-	for _, cluster := range clusters {
-		orgID := strings.TrimSpace(cluster.OrganizationID)
-		clusterID := strings.TrimSpace(cluster.ClusterID)
-		if orgID == "" || clusterID == "" {
-			continue
-		}
-		key := orgID + "\x00" + clusterID
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		out = append(out, meta.TenantTiDBCloudOrgBinding{OrganizationID: orgID, ClusterID: clusterID})
-	}
-	return out
 }
 
 func adminCredentialsFromHeaders(r *http.Request) (tenant.CredentialProvisionRequest, error) {

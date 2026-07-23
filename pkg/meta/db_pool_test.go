@@ -147,7 +147,7 @@ func TestRegisterSharedDBRoundTrip(t *testing.T) {
 func TestCreateManagedSharedDBPoolPersistsDurableProvisioningPlan(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	spendingLimit := MaxTiDBCloudSpendingLimit
+	spendingLimit := int64(2_000_000)
 	provisioningKey := make([]byte, 32)
 	for i := range provisioningKey {
 		provisioningKey[i] = byte(i + 1)
@@ -207,8 +207,16 @@ func TestCreateManagedSharedDBPoolRejectsUnboundedOrInvalidPolicy(t *testing.T) 
 		"missing cloud":       func(in *SharedDB) { in.CloudProvider = "" },
 		"missing region":      func(in *SharedDB) { in.Region = "" },
 		"missing spending":    func(in *SharedDB) { in.SpendingLimit = nil },
-		"physical limit below fixed maximum": func(in *SharedDB) {
-			value := MaxTiDBCloudSpendingLimit - 1
+		"zero spending": func(in *SharedDB) {
+			value := int64(0)
+			in.SpendingLimit = &value
+		},
+		"negative spending": func(in *SharedDB) {
+			value := int64(-1)
+			in.SpendingLimit = &value
+		},
+		"spending exceeds wire range": func(in *SharedDB) {
+			value := int64(math.MaxInt32) + 1
 			in.SpendingLimit = &value
 		},
 	}
@@ -311,13 +319,17 @@ func TestRegisterSharedDBValidation(t *testing.T) {
 		}
 	}
 	cases := map[string]func(*SharedDB){
-		"missing host":      func(d *SharedDB) { d.Host = "" },
-		"non-positive port": func(d *SharedDB) { d.Port = 0 },
-		"missing user":      func(d *SharedDB) { d.User = "" },
-		"missing password":  func(d *SharedDB) { d.PasswordCipher = nil },
-		"missing name":      func(d *SharedDB) { d.Name = "" },
-		"negative max":      func(d *SharedDB) { d.MaxTenants = -1 },
-		"reserved role":     func(d *SharedDB) { d.Role = "dedicated" },
+		"missing organization":  func(d *SharedDB) { d.TiDBCloudOrganizationID = "" },
+		"wildcard organization": func(d *SharedDB) { d.TiDBCloudOrganizationID = "*" },
+		"glob organization":     func(d *SharedDB) { d.TiDBCloudOrganizationID = "org-*" },
+		"sql wildcard org":      func(d *SharedDB) { d.TiDBCloudOrganizationID = "org-%" },
+		"missing host":          func(d *SharedDB) { d.Host = "" },
+		"non-positive port":     func(d *SharedDB) { d.Port = 0 },
+		"missing user":          func(d *SharedDB) { d.User = "" },
+		"missing password":      func(d *SharedDB) { d.PasswordCipher = nil },
+		"missing name":          func(d *SharedDB) { d.Name = "" },
+		"negative max":          func(d *SharedDB) { d.MaxTenants = -1 },
+		"reserved role":         func(d *SharedDB) { d.Role = "dedicated" },
 	}
 	for name, mutate := range cases {
 		in := valid()
@@ -328,12 +340,11 @@ func TestRegisterSharedDBValidation(t *testing.T) {
 	}
 }
 
-func TestFindSharedDBForOrgExactThenWildcard(t *testing.T) {
+func TestFindSharedDBForOrgRequiresExactOrganization(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 
 	orgID := registerTestSharedDB(t, s, "org-exact", "shared-exact.example.com", "shared_db_exact")
-	wildID := registerTestSharedDB(t, s, SharedDBOrgWildcard, "shared-wild.example.com", "shared_db_wild")
 
 	got, err := s.FindSharedDBForOrg(ctx, "org-exact")
 	if err != nil {
@@ -343,20 +354,11 @@ func TestFindSharedDBForOrgExactThenWildcard(t *testing.T) {
 		t.Fatalf("exact match db_id = %d, want %d", got.ID, orgID)
 	}
 
-	got, err = s.FindSharedDBForOrg(ctx, "org-other")
-	if err != nil {
-		t.Fatalf("FindSharedDBForOrg fallback: %v", err)
+	if _, err := s.FindSharedDBForOrg(ctx, "org-other"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("FindSharedDBForOrg other org error = %v, want ErrNotFound", err)
 	}
-	if got.ID != wildID {
-		t.Fatalf("wildcard fallback db_id = %d, want %d", got.ID, wildID)
-	}
-
-	got, err = s.FindSharedDBForOrg(ctx, "")
-	if err != nil {
-		t.Fatalf("FindSharedDBForOrg empty org: %v", err)
-	}
-	if got.ID != wildID {
-		t.Fatalf("empty org db_id = %d, want wildcard %d", got.ID, wildID)
+	if _, err := s.FindSharedDBForOrg(ctx, ""); err == nil {
+		t.Fatal("FindSharedDBForOrg empty organization succeeded")
 	}
 }
 
@@ -369,8 +371,8 @@ func TestFindSharedDBForOrgNotFound(t *testing.T) {
 	if _, err := s.FindSharedDBForOrg(ctx, "org-missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("FindSharedDBForOrg miss error = %v, want ErrNotFound", err)
 	}
-	if _, err := s.FindSharedDBForOrg(ctx, ""); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("FindSharedDBForOrg empty org error = %v, want ErrNotFound", err)
+	if _, err := s.FindSharedDBForOrg(ctx, ""); err == nil {
+		t.Fatal("FindSharedDBForOrg empty organization succeeded")
 	}
 }
 
@@ -379,7 +381,7 @@ func TestListSharedDBs(t *testing.T) {
 	ctx := context.Background()
 
 	first := registerTestSharedDB(t, s, "org-a", "shared-a.example.com", "shared_db_a")
-	second := registerTestSharedDB(t, s, SharedDBOrgWildcard, "shared-wild.example.com", "shared_db_wild")
+	second := registerTestSharedDB(t, s, "org-b", "shared-b.example.com", "shared_db_b")
 	// A non-active row must not appear in the list.
 	if _, err := s.RegisterSharedDB(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-b",
@@ -543,7 +545,7 @@ func TestFindSharedDBForOrgSkipsFullPools(t *testing.T) {
 	ctx := context.Background()
 
 	// The exact-org pool is capped at 1 tenant; once full, selection must
-	// fall through to the wildcard pool rather than overfill it.
+	// return not found rather than overfill it.
 	fullID := registerTestSharedDB(t, s, "org-capped", "shared-capped.example.com", "shared_db_capped")
 	if _, err := s.RegisterSharedDB(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-capped",
@@ -556,8 +558,6 @@ func TestFindSharedDBForOrgSkipsFullPools(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("cap pool at 1: %v", err)
 	}
-	wildID := registerTestSharedDB(t, s, SharedDBOrgWildcard, "shared-wild.example.com", "shared_db_wild")
-
 	got, err := s.FindSharedDBForOrg(ctx, "org-capped")
 	if err != nil {
 		t.Fatalf("FindSharedDBForOrg before full: %v", err)
@@ -569,20 +569,43 @@ func TestFindSharedDBForOrgSkipsFullPools(t *testing.T) {
 	if err := s.IncrSharedDBTenantCount(ctx, fullID, 1); err != nil {
 		t.Fatalf("fill pool: %v", err)
 	}
-	got, err = s.FindSharedDBForOrg(ctx, "org-capped")
-	if err != nil {
-		t.Fatalf("FindSharedDBForOrg after full: %v", err)
+	if _, err := s.FindSharedDBForOrg(ctx, "org-capped"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("full pool error = %v, want ErrNotFound", err)
 	}
-	if got.ID != wildID {
-		t.Fatalf("after full db_id = %d, want wildcard %d", got.ID, wildID)
+}
+
+func TestSharedDBMaxTenantsZeroIsDrainOnly(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	dbID := registerTestSharedDB(t, s, "org-drain-only", "shared-drain.example.com", "shared_db_drain")
+	if _, err := s.db.ExecContext(ctx, `UPDATE db_pool SET max_tenants = 0 WHERE db_id = ?`, dbID); err != nil {
+		t.Fatal(err)
 	}
 
-	// With no wildcard fallback, a full pool reads as not found.
-	if _, err := s.db.Exec(`DELETE FROM db_pool WHERE db_id = ?`, wildID); err != nil {
-		t.Fatalf("remove wildcard: %v", err)
+	if _, err := s.FindSharedDBForOrg(ctx, "org-drain-only"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("FindSharedDBForOrg drain-only error = %v, want ErrNotFound", err)
 	}
-	if _, err := s.FindSharedDBForOrg(ctx, "org-capped"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("full pool without fallback error = %v, want ErrNotFound", err)
+	if _, err := s.FindSharedDBForAllocation(ctx, "org-drain-only"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("FindSharedDBForAllocation drain-only error = %v, want ErrNotFound", err)
+	}
+
+	seedPendingTenant(t, s, "tenant-drain-only")
+	fsID, err := s.EnsureFsID(ctx, "tenant-drain-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.CompleteSharedTenantProvision(ctx, "tenant-drain-only", "tidb_cloud_native_shared", &TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}, testOwnerKey("tenant-drain-only"))
+	if !errors.Is(err, ErrSharedDBCapacityExhausted) {
+		t.Fatalf("CompleteSharedTenantProvision error = %v, want capacity exhausted", err)
+	}
+	db, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.TenantCount != 0 {
+		t.Fatalf("drain-only tenant_count = %d, want 0", db.TenantCount)
 	}
 }
 
@@ -887,7 +910,7 @@ func TestManagedSharedDBPoolCloudResultSchemaAndActivation(t *testing.T) {
 	ctx := context.Background()
 	spendingLimit := MaxTiDBCloudSpendingLimit
 	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
-		ProvisioningKey: make([]byte, 32), CloudProvider: "aws", Region: "us-east-1",
+		TiDBCloudOrganizationID: "org-managed", ProvisioningKey: make([]byte, 32), CloudProvider: "aws", Region: "us-east-1",
 		MaxTenants: 100, SpendingLimit: &spendingLimit,
 	})
 	if err != nil {
@@ -1018,7 +1041,7 @@ func TestFindSharedDBForAllocationPrefersActiveWithoutVirtualSpendingHeadroom(t 
 		t.Fatalf("activate second pool: %v", err)
 	}
 
-	got, err := s.FindSharedDBForAllocation(ctx, "org-allocate", nil)
+	got, err := s.FindSharedDBForAllocation(ctx, "org-allocate")
 	if err != nil {
 		t.Fatalf("FindSharedDBForAllocation active: %v", err)
 	}
@@ -1037,7 +1060,7 @@ func TestFindSharedDBForAllocationPrefersActiveWithoutVirtualSpendingHeadroom(t 
 	}, testOwnerKey("tenant-headroom")); err != nil {
 		t.Fatalf("CompleteSharedTenantProvision: %v", err)
 	}
-	got, err = s.FindSharedDBForAllocation(ctx, "org-allocate", nil)
+	got, err = s.FindSharedDBForAllocation(ctx, "org-allocate")
 	if err != nil {
 		t.Fatalf("FindSharedDBForAllocation fallback: %v", err)
 	}
@@ -1169,7 +1192,7 @@ func TestCompleteSharedTenantProvisionRollsBackOnMissingTenant(t *testing.T) {
 
 	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-rollback", Host: "h", Port: 4000, User: "u",
-		PasswordCipher: []byte("c"), Name: "rollback_db",
+		PasswordCipher: []byte("c"), Name: "rollback_db", MaxTenants: 10,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -1211,7 +1234,7 @@ func TestDeleteTenantPlacementAndDecrCountIsAtomic(t *testing.T) {
 
 	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-release", Host: "h", Port: 4000, User: "u",
-		PasswordCipher: []byte("c"), Name: "release_db",
+		PasswordCipher: []byte("c"), Name: "release_db", MaxTenants: 10,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -1241,7 +1264,7 @@ func TestDeleteTenantPlacementAndDecrCountIsAtomic(t *testing.T) {
 		t.Fatalf("TenantCount = %d, want 0", got.TenantCount)
 	}
 	if got.SoftCapReached {
-		t.Fatal("unlimited pool soft-cap latch = true, want false")
+		t.Fatal("released pool soft-cap latch = true, want false")
 	}
 
 	// Missing placement: ErrNotFound.
@@ -1261,6 +1284,42 @@ func TestDeleteTenantPlacementAndDecrCountIsAtomic(t *testing.T) {
 	}
 	if _, err := s.GetTenantPlacement(ctx, 301); err != nil {
 		t.Fatalf("placement must survive rolled-back delete: %v", err)
+	}
+}
+
+func TestDrainOnlySharedDBAllowsExistingTenantRelease(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-drain-release", Host: "h", Port: 4000, User: "u",
+		PasswordCipher: []byte("c"), Name: "drain_release_db", MaxTenants: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedPendingTenant(t, s, "tenant-drain-release")
+	fsID, err := s.EnsureFsID(ctx, "tenant-drain-release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteSharedTenantProvision(ctx, "tenant-drain-release", "tidb_cloud_native_shared", &TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}, testOwnerKey("tenant-drain-release")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE db_pool SET max_tenants = 0 WHERE db_id = ?`, dbID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteTenantPlacementAndDecrCount(ctx, fsID, dbID, 0.8); err != nil {
+		t.Fatalf("DeleteTenantPlacementAndDecrCount: %v", err)
+	}
+	db, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.TenantCount != 0 || !db.SoftCapReached {
+		t.Fatalf("drain-only pool after release = count %d soft_cap_reached %t, want 0/true", db.TenantCount, db.SoftCapReached)
 	}
 }
 
@@ -1306,7 +1365,7 @@ func TestFinalizeSharedTenantDeleteMetadataIsAtomic(t *testing.T) {
 	ctx := context.Background()
 	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-finalize-delete", Host: "h", Port: 4000, User: "u",
-		PasswordCipher: []byte("c"), Name: "finalize_delete_db",
+		PasswordCipher: []byte("c"), Name: "finalize_delete_db", MaxTenants: 10,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1384,7 +1443,7 @@ func TestCompleteSharedTenantProvisionRollsBackOnKeyFailure(t *testing.T) {
 
 	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
 		TiDBCloudOrganizationID: "org-keyfail", Host: "h", Port: 4000, User: "u",
-		PasswordCipher: []byte("c"), Name: "keyfail_db",
+		PasswordCipher: []byte("c"), Name: "keyfail_db", MaxTenants: 10,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
