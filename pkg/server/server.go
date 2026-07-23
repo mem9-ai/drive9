@@ -217,6 +217,8 @@ type Server struct {
 	tenantPoolLocks           sync.Map
 	tenantPoolCreateLocks     sync.Map
 	tenantPoolResumeJobs      sync.Map
+	tenantFailedCleanupJobs   sync.Map
+	tenantFailedCleanupRunner tenantFailedCleanupRunner
 	tidbCloudRBACCache        *tidbCloudRBACCache
 	schemaInitErrors          sync.Map
 	leader                    *leader.Manager
@@ -1257,7 +1259,7 @@ func backgroundWithTrace(ctx context.Context) context.Context {
 	return contextWithTrace(context.Background(), ctx)
 }
 
-func (s *Server) startServerWorker(ctx context.Context, fn func(context.Context)) {
+func (s *Server) startServerWorker(ctx context.Context, fn func(context.Context)) bool {
 	workerCtx := backgroundWithTrace(ctx)
 	if s.forkWorkerCtx != nil {
 		workerCtx = contextWithTrace(s.forkWorkerCtx, ctx)
@@ -1267,7 +1269,7 @@ func (s *Server) startServerWorker(ctx context.Context, fn func(context.Context)
 	if s.forkWorkerClosed {
 		s.forkWorkerMu.Unlock()
 		logger.Warn(workerCtx, "server_worker_start_after_close")
-		return
+		return false
 	}
 	s.forkWorkerWG.Add(1)
 	s.forkWorkerMu.Unlock()
@@ -1276,6 +1278,7 @@ func (s *Server) startServerWorker(ctx context.Context, fn func(context.Context)
 		defer s.forkWorkerWG.Done()
 		fn(workerCtx)
 	}()
+	return true
 }
 
 func ensureTrace(ctx context.Context) context.Context {
