@@ -558,7 +558,7 @@ func TestSharedTenantStatusLogsAndMetricsUseDBOrganization(t *testing.T) {
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-status-output", Host: "shared-status.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_status_db",
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_status_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatal(err)

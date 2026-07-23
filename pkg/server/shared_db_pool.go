@@ -40,12 +40,16 @@ type defaultSharedDatabaseNameProvider interface {
 	DefaultSharedDatabaseName() string
 }
 
-func (s *Server) managedSharedDBPolicy() int {
-	maxTenants := s.sharedDBMaxTenants
+func (s *Server) managedSharedDBPolicy() (maxTenants int, spendingLimit int64) {
+	maxTenants = s.sharedDBMaxTenants
 	if maxTenants <= 0 {
 		maxTenants = defaultManagedSharedDBMaxTenants
 	}
-	return maxTenants
+	spendingLimit = s.sharedDBSpendingLimit
+	if spendingLimit <= 0 {
+		spendingLimit = DefaultManagedSharedDBSpendingLimit
+	}
+	return maxTenants, spendingLimit
 }
 
 func (s *Server) managedSharedDBHardCap(softCap int) (int, error) {
@@ -84,6 +88,18 @@ func managedSharedDBDSN(info *meta.SharedDB, password string) string {
 		query += "&tls=" + info.TLSMode
 	}
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", info.User, password, info.Host, info.Port, info.Name, query)
+}
+
+func (s *Server) sharedDBCloudCredentials() (tenant.CredentialProvisionRequest, error) {
+	provider, ok := s.provisioner.(tenant.SharedCredentialProvider)
+	if !ok {
+		return tenant.CredentialProvisionRequest{}, fmt.Errorf("shared TiDB Cloud credentials are not configured")
+	}
+	cred, ok := provider.DefaultSharedCredentials()
+	if !ok {
+		return tenant.CredentialProvisionRequest{}, fmt.Errorf("shared TiDB Cloud credentials are not configured")
+	}
+	return cred, nil
 }
 
 func generateManagedSharedDBRootPassword(length int) (string, error) {
@@ -151,7 +167,7 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 	identity := sharedDBAllocationIdentity(organizationID, provisioningKey)
 	err = s.meta.WithSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
 		for attempt := 0; attempt < 2; attempt++ {
-			candidate, findErr := s.meta.FindSharedDBForAllocation(lockCtx, organizationID, provisioningKey)
+			candidate, findErr := s.meta.FindSharedDBForAllocation(lockCtx, organizationID)
 			if findErr == nil {
 				sharedDB = candidate
 			} else if !errors.Is(findErr, meta.ErrNotFound) {
@@ -165,8 +181,7 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 				}
 			}
 			if sharedDB == nil {
-				maxTenants := s.managedSharedDBPolicy()
-				fixedTarget := meta.MaxTiDBCloudSpendingLimit
+				maxTenants, fixedTarget := s.managedSharedDBPolicy()
 				cloudProvider, region := provisioningCloudRegion(s.provisioner)
 				rootPassword, passwordErr := generateManagedSharedDBRootPassword(24)
 				if passwordErr != nil {
@@ -222,8 +237,8 @@ func (s *Server) defaultSharedDatabaseName() string {
 	return "tidbcloud_fs"
 }
 
-func (s *Server) scheduleManagedSharedDBContinuation(ctx context.Context, dbID int64, cred tenant.CredentialProvisionRequest) {
-	s.scheduleManagedSharedDBContinuations(ctx, []int64{dbID}, cred)
+func (s *Server) scheduleManagedSharedDBContinuation(ctx context.Context, dbID int64) {
+	s.scheduleManagedSharedDBContinuations(ctx, []int64{dbID})
 }
 
 // scheduleManagedSharedDBContinuations retries one request batch in rounds.
@@ -232,7 +247,7 @@ func (s *Server) scheduleManagedSharedDBContinuation(ctx context.Context, dbID i
 // the provider's long waiter. Starting one goroutine per DB pool would let all
 // waiters pin dedicated meta *sql.Conn values and can exhaust the connection
 // pool before the lock holder finishes.
-func (s *Server) scheduleManagedSharedDBContinuations(ctx context.Context, dbIDs []int64, cred tenant.CredentialProvisionRequest) {
+func (s *Server) scheduleManagedSharedDBContinuations(ctx context.Context, dbIDs []int64) {
 	if len(dbIDs) == 0 {
 		return
 	}
@@ -244,7 +259,7 @@ func (s *Server) scheduleManagedSharedDBContinuations(ctx context.Context, dbIDs
 			if workerCtx.Err() != nil {
 				return
 			}
-			states = append(states, s.managedSharedDBContinuation(workerCtx, dbID, cred))
+			states = append(states, s.managedSharedDBContinuation(workerCtx, dbID))
 		}
 		retryManagedSharedDBContinuations(workerCtx, states)
 		for i := range states {
@@ -262,7 +277,7 @@ type managedSharedDBContinuation struct {
 	lastErr      error
 }
 
-func (s *Server) managedSharedDBContinuation(ctx context.Context, dbID int64, cred tenant.CredentialProvisionRequest) managedSharedDBContinuation {
+func (s *Server) managedSharedDBContinuation(ctx context.Context, dbID int64) managedSharedDBContinuation {
 	poolCtx := ctx
 	if poolInfo, err := s.meta.GetSharedDB(ctx, dbID); err == nil {
 		poolCtx = logger.WithContext(ctx, logger.FromContext(ctx).With(
@@ -279,7 +294,7 @@ func (s *Server) managedSharedDBContinuation(ctx context.Context, dbID int64, cr
 		if poolInfo.Status != meta.SharedDBStatusProvisioning {
 			return nil
 		}
-		return s.continueManagedSharedDBPoolOnce(poolCtx, dbID, cred)
+		return s.continueManagedSharedDBPoolOnce(poolCtx, dbID)
 	}}
 }
 
@@ -346,10 +361,6 @@ func retryManagedSharedDBContinuations(ctx context.Context, states []managedShar
 }
 
 func (s *Server) resumeManagedSharedDBPoolsWithCtx(ctx context.Context) {
-	cred := resolveDefaultCredentials(s.provisioner)
-	if cred == nil {
-		return
-	}
 	rows, err := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusProvisioning, 1000)
 	if err != nil {
 		logger.Warn(ctx, "managed_shared_db_pool_resume_list_failed", zap.Error(err))
@@ -360,7 +371,7 @@ func (s *Server) resumeManagedSharedDBPoolsWithCtx(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		states = append(states, s.managedSharedDBContinuation(ctx, row.ID, *cred))
+		states = append(states, s.managedSharedDBContinuation(ctx, row.ID))
 	}
 	retryManagedSharedDBContinuations(ctx, states)
 	for i := range states {
@@ -370,9 +381,9 @@ func (s *Server) resumeManagedSharedDBPoolsWithCtx(ctx context.Context) {
 	}
 }
 
-func (s *Server) continueManagedSharedDBPool(ctx context.Context, dbID int64, cred tenant.CredentialProvisionRequest) error {
+func (s *Server) continueManagedSharedDBPool(ctx context.Context, dbID int64) error {
 	for metadataAttempt := 0; metadataAttempt < 2; metadataAttempt++ {
-		err := s.continueManagedSharedDBPoolOnce(ctx, dbID, cred)
+		err := s.continueManagedSharedDBPoolOnce(ctx, dbID)
 		if !errors.Is(err, errSharedDBConnectionMetadataNotReady) {
 			return err
 		}
@@ -387,6 +398,10 @@ func (s *Server) continueManagedSharedDBPool(ctx context.Context, dbID int64, cr
 		if poolInfo.ClusterID == "" {
 			return err
 		}
+		cred, credErr := s.sharedDBCloudCredentials()
+		if credErr != nil {
+			return credErr
+		}
 		if _, waitErr := waiter.WaitForSharedDBPoolMetadataWithCredentials(ctx, dbID, poolInfo.UUID, poolInfo.ClusterID, cred); waitErr != nil {
 			return waitErr
 		}
@@ -394,9 +409,13 @@ func (s *Server) continueManagedSharedDBPool(ctx context.Context, dbID int64, cr
 	return fmt.Errorf("%w: db pool %d", errSharedDBConnectionMetadataNotReady, dbID)
 }
 
-func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64, cred tenant.CredentialProvisionRequest) error {
+func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64) error {
 	for attempt := 0; attempt < 2; attempt++ {
 		poolInfo, err := s.meta.GetSharedDB(ctx, dbID)
+		if err != nil {
+			return err
+		}
+		cred, err := s.sharedDBCloudCredentials()
 		if err != nil {
 			return err
 		}
@@ -407,7 +426,7 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 			if loadErr != nil {
 				return loadErr
 			}
-			if poolInfo.TiDBCloudOrganizationID == "" && current.TiDBCloudOrganizationID != "" {
+			if strings.TrimSpace(poolInfo.TiDBCloudOrganizationID) != strings.TrimSpace(current.TiDBCloudOrganizationID) {
 				restartWithOrganization = true
 				return nil
 			}
@@ -489,8 +508,9 @@ func (s *Server) ensureManagedSharedDBPhysicalLocked(ctx context.Context, poolIn
 		}
 		result = results[0]
 	}
-	if result.OrganizationID == "" {
-		result.OrganizationID = poolInfo.TiDBCloudOrganizationID
+	logicalOrganizationID := strings.TrimSpace(poolInfo.TiDBCloudOrganizationID)
+	if logicalOrganizationID == "" {
+		return nil, fmt.Errorf("managed shared db pool customer organization is required")
 	}
 	if result.DBName == "" {
 		result.DBName = poolInfo.Name
@@ -500,7 +520,7 @@ func (s *Server) ensureManagedSharedDBPhysicalLocked(ctx context.Context, poolIn
 		tlsMode = "skip-verify"
 	}
 	if err := s.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{
-		ID: poolInfo.ID, TiDBCloudOrganizationID: result.OrganizationID, ClusterID: result.ClusterID,
+		ID: poolInfo.ID, TiDBCloudOrganizationID: logicalOrganizationID, ClusterID: result.ClusterID,
 		Host: result.Host, Port: result.Port, User: result.Username, PasswordCipher: poolInfo.PasswordCipher,
 		Name: result.DBName, TLSMode: tlsMode,
 	}); err != nil {
@@ -516,28 +536,45 @@ func (s *Server) ensureManagedSharedDBPhysicalLocked(ctx context.Context, poolIn
 	return poolInfo, nil
 }
 
-func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64, cred tenant.CredentialProvisionRequest) (*meta.SharedDB, error) {
-	poolInfo, err := s.meta.GetSharedDB(ctx, dbID)
-	if err != nil {
-		return nil, err
-	}
-	identity := sharedDBAllocationIdentity(poolInfo.TiDBCloudOrganizationID, poolInfo.ProvisioningKey)
-	var result *meta.SharedDB
-	err = s.meta.WithSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
-		current, err := s.meta.GetSharedDB(lockCtx, dbID)
+func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) (*meta.SharedDB, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		poolInfo, err := s.meta.GetSharedDB(ctx, dbID)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		var ensureErr error
-		result, ensureErr = s.ensureManagedSharedDBPhysicalLocked(lockCtx, current, cred)
-		return ensureErr
-	})
-	return result, err
+		cred, err := s.sharedDBCloudCredentials()
+		if err != nil {
+			return nil, err
+		}
+		identity := sharedDBAllocationIdentity(poolInfo.TiDBCloudOrganizationID, poolInfo.ProvisioningKey)
+		var result *meta.SharedDB
+		restartWithOrganization := false
+		err = s.meta.WithSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
+			current, loadErr := s.meta.GetSharedDB(lockCtx, dbID)
+			if loadErr != nil {
+				return loadErr
+			}
+			if strings.TrimSpace(poolInfo.TiDBCloudOrganizationID) != strings.TrimSpace(current.TiDBCloudOrganizationID) {
+				restartWithOrganization = true
+				return nil
+			}
+			var ensureErr error
+			result, ensureErr = s.ensureManagedSharedDBPhysicalLocked(lockCtx, current, cred)
+			return ensureErr
+		})
+		if err != nil {
+			return nil, err
+		}
+		if !restartWithOrganization {
+			return result, nil
+		}
+	}
+	return nil, fmt.Errorf("db pool %d allocation identity kept changing", dbID)
 }
 
 // continueManagedSharedDBPoolLocked intentionally keeps the organization
-// allocation lock through physical ensure, system-user setup, schema ensure,
-// and activation. Continuations are dispatched sequentially and are not a
+// allocation lock through physical ensure, schema ensure, and activation.
+// Continuations are dispatched sequentially and are not a
 // request-QPS path; the wider lock preserves the existing single-owner Cloud
 // mutation model and prevents another allocator from observing half-ready
 // connection metadata. The readiness poll is the one long wait kept outside.
@@ -604,8 +641,9 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 			}
 			result = results[0]
 		}
-		if result.OrganizationID == "" {
-			result.OrganizationID = poolInfo.TiDBCloudOrganizationID
+		logicalOrganizationID := strings.TrimSpace(poolInfo.TiDBCloudOrganizationID)
+		if logicalOrganizationID == "" {
+			return fmt.Errorf("managed shared db pool customer organization is required")
 		}
 		if result.DBName == "" {
 			result.DBName = poolInfo.Name
@@ -615,7 +653,7 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 			tlsMode = "skip-verify"
 		}
 		if err := s.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{
-			ID: dbID, TiDBCloudOrganizationID: result.OrganizationID, ClusterID: result.ClusterID,
+			ID: dbID, TiDBCloudOrganizationID: logicalOrganizationID, ClusterID: result.ClusterID,
 			Host: result.Host, Port: result.Port, User: result.Username, PasswordCipher: poolInfo.PasswordCipher,
 			Name: result.DBName, TLSMode: tlsMode,
 		}); err != nil {
@@ -639,23 +677,6 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 	dsn := managedSharedDBDSN(poolInfo, string(plain))
 	if ensurer, ok := s.provisioner.(tenantDatabaseEnsurer); ok {
 		if err := ensurer.EnsureDatabase(ctx, dsn); err != nil {
-			return err
-		}
-	}
-	if userProvisioner, ok := s.provisioner.(nativeSystemUserProvisioner); ok {
-		username, password, ensureErr := userProvisioner.EnsureSystemUser(ctx, dsn, fmt.Sprintf("db-pool-%d", dbID))
-		if ensureErr != nil {
-			return ensureErr
-		}
-		passwordCipher, encryptErr := s.pool.Encrypt(ctx, []byte(password))
-		if encryptErr != nil {
-			return encryptErr
-		}
-		if err := s.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{
-			ID: dbID, TiDBCloudOrganizationID: poolInfo.TiDBCloudOrganizationID, ClusterID: poolInfo.ClusterID,
-			Host: poolInfo.Host, Port: poolInfo.Port, User: username, PasswordCipher: passwordCipher,
-			Name: poolInfo.Name, TLSMode: poolInfo.TLSMode,
-		}); err != nil {
 			return err
 		}
 	}

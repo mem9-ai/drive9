@@ -35,7 +35,7 @@ func TestSharedTenantDeleteRetriesFromDeletingPlacement(t *testing.T) {
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-delete", Host: "shared.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -105,6 +105,7 @@ func TestSharedTenantDeleteWithCleanupJobShortCircuits(t *testing.T) {
 		User:                    "root",
 		PasswordCipher:          []byte("cipher"),
 		Name:                    "shared_db",
+		MaxTenants:              100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -206,6 +207,7 @@ func TestSharedTenantDeleteFullPurgePath(t *testing.T) {
 		User:                    "root",
 		PasswordCipher:          []byte("cipher"),
 		Name:                    "shared_db",
+		MaxTenants:              100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -244,21 +246,21 @@ func TestSharedTenantDeleteFullPurgePath(t *testing.T) {
 	}
 }
 
-func TestAdminTenantCreateRejectsSharedPoolWithoutCloudIdentity(t *testing.T) {
+func TestAdminTenantCreateAllowsSharedPoolWithoutCloudClusterIdentity(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{
-		{Clusters: []tenant.CloudClusterInfo{{ClusterID: "cluster-org-probe", OrganizationID: "org-shared-1"}}},
-	}
-	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-shared-1", Role: tenant.TiDBCloudRoleOrgOwner,
+	}}
+	if _, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-1",
 		Host:                    "shared.example.com",
 		Port:                    4000,
 		User:                    "root",
 		PasswordCipher:          []byte("cipher"),
 		Name:                    "shared_db",
-	})
-	if err != nil {
+		MaxTenants:              100,
+	}); err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
 	}
 
@@ -278,49 +280,34 @@ func TestAdminTenantCreateRejectsSharedPoolWithoutCloudIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
+	if resp.StatusCode != http.StatusAccepted {
+		responseBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d: %s", resp.StatusCode, http.StatusAccepted, responseBody)
 	}
 	var tenantCount int
 	if err := rt.meta.DB().QueryRow("SELECT COUNT(*) FROM tenants").Scan(&tenantCount); err != nil {
 		t.Fatal(err)
 	}
-	if tenantCount != 1 {
-		t.Fatalf("tenants = %d, want 1", tenantCount)
-	}
-	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE db_pool SET cluster_id = ? WHERE db_id = ?", "cluster-shared-admin-create", dbID); err != nil {
-		t.Fatalf("set shared cluster identity: %v", err)
-	}
-	manageableReq, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/admin/tenants", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	manageableReq.Header.Set("Content-Type", "application/json")
-	manageableResp, err := http.DefaultClient.Do(manageableReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = manageableResp.Body.Close() }()
-	if manageableResp.StatusCode != http.StatusAccepted {
-		t.Fatalf("manageable shared pool status = %d, want %d", manageableResp.StatusCode, http.StatusAccepted)
-	}
-	if err := rt.meta.DB().QueryRow("SELECT COUNT(*) FROM tenants").Scan(&tenantCount); err != nil {
-		t.Fatal(err)
-	}
 	if tenantCount != 2 {
-		t.Fatalf("tenants after manageable create = %d, want 2", tenantCount)
+		t.Fatalf("tenants = %d, want 2", tenantCount)
+	}
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("cluster list calls = %d, want 0", got)
+	}
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
 	}
 }
 
 func TestAdminTenantCreatePersistsSharedQuotaSizesInBytes(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{ClusterID: "cluster-shared-quota", OrganizationID: "org-shared-quota"}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-shared-quota", Role: tenant.TiDBCloudRoleProjectOwner,
 	}}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-quota", Host: "shared.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -360,6 +347,7 @@ func TestAdminTenantCreatePersistsSharedQuotaSizesInBytes(t *testing.T) {
 
 func TestAdminTenantGetAuthorizesSharedProviderThroughPhysicalPool(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{OrganizationID: "org-shared-admin", Role: tenant.TiDBCloudRoleOrgOwner}}
 	ctx := context.Background()
 	if err := rt.meta.UpdateTenantProvider(ctx, rt.tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
 		t.Fatalf("UpdateTenantProvider: %v", err)
@@ -370,7 +358,7 @@ func TestAdminTenantGetAuthorizesSharedProviderThroughPhysicalPool(t *testing.T)
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-admin", ClusterID: "cluster-shared-admin",
-		Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -410,17 +398,14 @@ func TestAdminTenantGetAuthorizesSharedProviderThroughPhysicalPool(t *testing.T)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("physical pool authorization calls = %d, want 1", got)
-	}
-	cluster := rt.prov.lastClusterSnapshot()
-	if cluster == nil || cluster.ClusterID != "cluster-shared-admin" || cluster.OrganizationID != "org-shared-admin" {
-		t.Fatalf("authorized physical cluster = %#v", cluster)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM authorization calls = %d, want 1", got)
 	}
 }
 
 func TestAdminTenantQuotaSetSharedUpdatesVirtualQuotaOnly(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{OrganizationID: "org-shared-admin", Role: tenant.TiDBCloudRoleProjectOwner}}
 	ctx := context.Background()
 	if err := rt.meta.UpdateTenantProvider(ctx, rt.tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
 		t.Fatalf("UpdateTenantProvider: %v", err)
@@ -434,7 +419,7 @@ func TestAdminTenantQuotaSetSharedUpdatesVirtualQuotaOnly(t *testing.T) {
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-admin", Host: "shared.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -484,6 +469,7 @@ func TestAdminTenantQuotaSetSharedUpdatesVirtualQuotaOnly(t *testing.T) {
 
 func TestAdminTenantDeleteSharedNeverDeprovisionsPhysicalPool(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{OrganizationID: "org-shared-admin-delete", Role: tenant.TiDBCloudRoleOrgOwner}}
 	ctx := context.Background()
 	if err := rt.meta.UpdateTenantProvider(ctx, rt.tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
 		t.Fatalf("UpdateTenantProvider: %v", err)
@@ -497,7 +483,7 @@ func TestAdminTenantDeleteSharedNeverDeprovisionsPhysicalPool(t *testing.T) {
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-admin-delete", Host: "127.0.0.1", Port: 1,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -584,7 +570,7 @@ func TestSharedTenantDeletePlacementRemovalFailureStaysRetryable(t *testing.T) {
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-delete", Host: db.DBHost, Port: db.DBPort, User: db.DBUser,
-		PasswordCipher: passCipher, Name: db.DBName,
+		PasswordCipher: passCipher, Name: db.DBName, MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -659,17 +645,16 @@ func TestSharedTenantDeletePlacementRemovalFailureStaysRetryable(t *testing.T) {
 	}
 }
 
-// TestFindSharedDBForProvisionSkipsNonTiDBProviders proves a wildcard shared
-// pool only ever captures TiDB-dialect tenants: db9 (PostgreSQL) tenants must
-// never be placed on the TiDB shared schema and relabeled
-// tidb_cloud_native_shared.
+// TestFindSharedDBForProvisionRequiresCloudOrganization proves that shared
+// placement requires an exact customer organization and never captures
+// providers without TiDB Cloud IAM organization data.
 func TestFindSharedDBForProvisionSkipsNonTiDBProviders(t *testing.T) {
 	db := newTenantDeleteDBInfo(t)
 	testmysql.ResetMetaDB(t, db.Meta.DB())
 	ctx := context.Background()
 	if _, err := db.Meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		TiDBCloudOrganizationID: meta.SharedDBOrgWildcard, Host: "shared.example.com", Port: 4000, User: "root",
-		PasswordCipher: []byte("cipher"), Name: "shared_db",
+		TiDBCloudOrganizationID: "org-exact", Host: "shared.example.com", Port: 4000, User: "root",
+		PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	}); err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
 	}
@@ -682,13 +667,14 @@ func TestFindSharedDBForProvisionSkipsNonTiDBProviders(t *testing.T) {
 	if got != nil {
 		t.Fatalf("db9 matched shared pool %v, want no match", got)
 	}
-	// TiDB-dialect providers still route: tidb_zero matches the wildcard.
+	// tidb_zero has no IAM organization and therefore cannot match an exact
+	// organization-bound shared pool.
 	got, err = s.findSharedDBForProvision(ctx, tenant.ProviderTiDBZero, provisionTenantOptions{})
 	if err != nil {
 		t.Fatalf("tidb_zero lookup: %v", err)
 	}
-	if got == nil {
-		t.Fatal("tidb_zero did not match the wildcard pool, want match")
+	if got != nil {
+		t.Fatalf("tidb_zero matched shared pool %v, want no match", got)
 	}
 }
 

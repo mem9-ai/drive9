@@ -2,20 +2,21 @@ package server
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
-// TestFirstManagedOrganizationUsesRBACCache proves org resolution for
-// provisioning reuses the RBAC cluster-list cache: repeated lookups for the
-// same credential cost one TiDB Cloud list call, and forgetting the cache
-// forces a fresh fetch.
-func TestFirstManagedOrganizationUsesRBACCache(t *testing.T) {
+func TestFirstManagedOrganizationUsesIAMIdentityCache(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{
-		{Clusters: []tenant.CloudClusterInfo{{ClusterID: "c1", OrganizationID: "org-cached-1"}}},
-		{Clusters: []tenant.CloudClusterInfo{{ClusterID: "c2", OrganizationID: "org-cached-2"}}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{
+		{OrganizationID: "org-cached-1", Role: tenant.TiDBCloudRoleOrgOwner},
+		{OrganizationID: "org-cached-2", Role: tenant.TiDBCloudRoleProjectOwner},
 	}
 	ctx := context.Background()
 	cred := tenant.CredentialProvisionRequest{PublicKey: "pk", PrivateKey: "sk"}
@@ -27,9 +28,6 @@ func TestFirstManagedOrganizationUsesRBACCache(t *testing.T) {
 	if org != "org-cached-1" {
 		t.Fatalf("org = %q, want org-cached-1", org)
 	}
-	// The second lookup for the same credential must hit the cache: no
-	// additional list call, and the org from the cached page is returned
-	// (not the second scripted page).
 	org, err = rt.server.firstManagedOrganization(ctx, cred)
 	if err != nil {
 		t.Fatalf("second lookup: %v", err)
@@ -37,48 +35,71 @@ func TestFirstManagedOrganizationUsesRBACCache(t *testing.T) {
 	if org != "org-cached-1" {
 		t.Fatalf("cached org = %q, want org-cached-1", org)
 	}
-	if got := rt.prov.listCalls.Load(); got != 1 {
-		t.Fatalf("list calls = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
 	}
 
-	// Forgetting the list forces a fresh API fetch (second scripted page).
-	rt.server.forgetTiDBCloudRBACList(cred)
-	org, err = rt.server.firstManagedOrganization(ctx, cred)
+	secondCred := tenant.CredentialProvisionRequest{PublicKey: "pk-2", PrivateKey: "sk-2"}
+	org, err = rt.server.firstManagedOrganization(ctx, secondCred)
 	if err != nil {
-		t.Fatalf("lookup after forget: %v", err)
+		t.Fatalf("lookup with second credentials: %v", err)
 	}
 	if org != "org-cached-2" {
-		t.Fatalf("org after forget = %q, want org-cached-2", org)
+		t.Fatalf("org with second credentials = %q, want org-cached-2", org)
 	}
-	if got := rt.prov.listCalls.Load(); got != 2 {
-		t.Fatalf("list calls after forget = %d, want 2", got)
+	if got := rt.prov.iamCalls.Load(); got != 2 {
+		t.Fatalf("IAM calls after second credentials = %d, want 2", got)
 	}
 }
 
-func TestListAllManagedClustersUsesRBACCache(t *testing.T) {
+func TestResolveTiDBCloudIdentityRejectsInsufficientRole(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{ClusterID: "c1", OrganizationID: "org-1"}},
-	}}
-	ctx := context.Background()
-	cred := tenant.CredentialProvisionRequest{PublicKey: "pk", PrivateKey: "sk"}
+	rt.prov.iamErr = tenant.ErrTiDBCloudRoleInsufficient
+	_, err := rt.server.resolveTiDBCloudIdentity(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "pk", PrivateKey: "sk",
+	}, "test_role")
+	if err == nil || !isTiDBCloudRoleInsufficient(err) {
+		t.Fatalf("error = %v, want insufficient role", err)
+	}
+}
 
-	clusters, err := rt.server.listAllManagedClusters(ctx, cred, "", "test_managed_cluster_list")
-	if err != nil {
-		t.Fatalf("first list: %v", err)
+func TestAdminTenantAPIEnabledForSharedProvider(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNativeShared)
+	if !rt.server.adminTenantAPIEnabled() {
+		t.Fatal("admin tenant API must be enabled for tidb_cloud_native_shared")
 	}
-	if len(clusters) != 1 || clusters[0].ClusterID != "c1" || clusters[0].OrganizationID != "org-1" {
-		t.Fatalf("first clusters = %#v", clusters)
-	}
+}
 
-	clusters, err = rt.server.listAllManagedClusters(ctx, cred, "", "test_managed_cluster_list")
+func TestAdminTenantHTTPRejectsInsufficientIAMRoleWithoutLeakingDetails(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.iamErr = fmt.Errorf("%w: org:viewer SENSITIVE_IAM_DETAIL", tenant.ErrTiDBCloudRoleInsufficient)
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/admin/tenants", nil)
 	if err != nil {
-		t.Fatalf("cached list: %v", err)
+		t.Fatal(err)
 	}
-	if len(clusters) != 1 || clusters[0].ClusterID != "c1" || clusters[0].OrganizationID != "org-1" {
-		t.Fatalf("cached clusters = %#v", clusters)
+	req.Header.Set(quotaPublicKeyHeader, "VIEWERFIXTURE1")
+	req.Header.Set(quotaPrivateKeyHeader, "fixture-private")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := rt.prov.listCalls.Load(); got != 1 {
-		t.Fatalf("list calls = %d, want 1", got)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403: %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), tenant.ErrTiDBCloudRoleInsufficient.Error()) {
+		t.Fatalf("body = %q, want stable insufficient-role error", body)
+	}
+	for _, sensitive := range []string{"SENSITIVE_IAM_DETAIL", "VIEWERFIXTURE1", "fixture-private"} {
+		if strings.Contains(string(body), sensitive) {
+			t.Fatalf("body leaked %q: %s", sensitive, body)
+		}
 	}
 }

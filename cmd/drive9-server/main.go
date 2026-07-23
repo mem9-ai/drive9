@@ -200,6 +200,10 @@ func main() {
 	if err != nil {
 		die(err)
 	}
+	sharedDBDefaultSpendingLimit, err := sharedDBDefaultSpendingLimitFromEnv()
+	if err != nil {
+		die(err)
+	}
 	maxUploadBytes := server.DefaultMaxUploadBytes
 	if raw := os.Getenv("DRIVE9_MAX_UPLOAD_BYTES"); raw != "" {
 		maxUploadBytes, err = strconv.ParseInt(raw, 10, 64)
@@ -232,16 +236,20 @@ func main() {
 	case tenant.ProviderTiDBZero:
 		provisioner, provisionerErr = tidbzero.NewProvisionerFromEnv()
 	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBCloudNativeShared:
-		provisioner, provisionerErr = tidbcloudnative.NewProvisionerFromEnv()
+		provisioner, provisionerErr = tidbcloudnative.NewProvisionerFromEnv(providerType)
 	case tenant.ProviderDB9:
 		provisioner, provisionerErr = db9.NewProvisionerFromEnv()
 	}
-	if provisionerErr != nil {
-		isWanted := false
-		if tenant.UsesTiDBCloudNativeCredentials(providerType) && os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_API_URL") != "" {
-			isWanted = true
+	if provisionerErr == nil && providerType == tenant.ProviderTiDBCloudNativeShared {
+		validator, ok := provisioner.(interface{ ValidateSharedCredentials(context.Context) error })
+		if !ok {
+			provisionerErr = fmt.Errorf("shared TiDB Cloud credential validation is not supported")
+		} else if err := validator.ValidateSharedCredentials(context.Background()); err != nil {
+			provisionerErr = err
 		}
-		if isWanted {
+	}
+	if provisionerErr != nil {
+		if tenant.UsesTiDBCloudNativeCredentials(providerType) {
 			logger.Error(context.Background(), "provisioner_failed", zap.String("provider", providerType), zap.Error(provisionerErr))
 			os.Exit(1)
 		}
@@ -345,21 +353,16 @@ func main() {
 
 		// Optional shared-schema pool: when DRIVE9_SHARED_POOL_DSN is set,
 		// initialize the shared schema on that database and register it in
-		// db_pool so tenants in the matching org are provisioned onto it
-		// instead of getting a dedicated cluster. The org binding is always
-		// explicit — DRIVE9_SHARED_POOL_ORG has no default, and the '*' wildcard
-		// (which places ALL new tenants on the shared pool) is opt-in and loud.
+		// db_pool so tenants in the matching organization are provisioned onto
+		// it instead of getting a dedicated cluster. The organization binding is
+		// always explicit and has no wildcard behavior.
 		if sharedDSN := strings.TrimSpace(os.Getenv("DRIVE9_SHARED_POOL_DSN")); sharedDSN != "" {
 			sharedOrg := strings.TrimSpace(os.Getenv("DRIVE9_SHARED_POOL_ORG"))
 			if sharedOrg == "" {
-				die(fmt.Errorf("DRIVE9_SHARED_POOL_ORG is required when DRIVE9_SHARED_POOL_DSN is set (set an explicit org id; use '*' only to intentionally place ALL new tenants on the shared pool)"))
+				die(fmt.Errorf("DRIVE9_SHARED_POOL_ORG is required when DRIVE9_SHARED_POOL_DSN is set (set one exact TiDB Cloud organization id)"))
 			}
-			if err := registerSharedPoolFromEnv(context.Background(), store, pool, sharedDSN, sharedOrg); err != nil {
+			if err := registerSharedPoolFromEnv(context.Background(), store, pool, sharedDSN, sharedOrg, sharedDBMaxTenants); err != nil {
 				die(fmt.Errorf("register shared pool: %w", err))
-			}
-			if sharedOrg == meta.SharedDBOrgWildcard {
-				logger.Warn(context.Background(), "shared_pool_wildcard_all_new_tenants",
-					zap.String("warning", "ALL new tenants will be provisioned onto the shared pool"))
 			}
 			logger.Info(context.Background(), "shared_pool_registered",
 				zap.String("org", sharedOrg))
@@ -445,6 +448,7 @@ func main() {
 		SharedDBMaxTenants:              sharedDBMaxTenants,
 		SharedDBHardCapRatio:            sharedDBHardCapRatio,
 		SharedDBReopenRatio:             sharedDBReopenRatio,
+		SharedDBSpendingLimit:           sharedDBDefaultSpendingLimit,
 		LegacyStarterProvisioner:        legacyStarterProvisioner,
 		TokenSecret:                     tokenSecret,
 		VaultMasterKey:                  vaultMasterKey,
@@ -487,7 +491,7 @@ func envOr(key, fallback string) string {
 // dsn and upserts it into db_pool with the given org binding. The DSN carries
 // a plaintext password (local/dev convenience); it is encrypted with the
 // pool's encryptor before persistence, like tenant DB passwords.
-func registerSharedPoolFromEnv(ctx context.Context, metaStore *meta.Store, pool *tenant.Pool, dsn, orgID string) error {
+func registerSharedPoolFromEnv(ctx context.Context, metaStore *meta.Store, pool *tenant.Pool, dsn, orgID string, maxTenants int) error {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return fmt.Errorf("parse DRIVE9_SHARED_POOL_DSN: %w", err)
@@ -523,6 +527,7 @@ func registerSharedPoolFromEnv(ctx context.Context, metaStore *meta.Store, pool 
 		PasswordCipher:          passCipher,
 		Name:                    cfg.DBName,
 		TLSMode:                 tlsMode,
+		MaxTenants:              maxTenants,
 	})
 	return err
 }
@@ -667,15 +672,19 @@ environment:
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_native|tidb_cloud_native_shared (default for provisioning)
   DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default TiDB Cloud Cluster spendingLimit.monthly; native defaults to 1000 when unset
   DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Cluster API base URL for tidb_cloud_native
+  DRIVE9_TIDBCLOUD_IAM_API_URL TiDB Cloud IAM API base URL; required for tidb_cloud_native and tidb_cloud_native_shared
   DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER cloud provider for tidb_cloud_native cluster creation, e.g. aws
   DRIVE9_TIDBCLOUD_NATIVE_REGION region for tidb_cloud_native cluster creation, e.g. us-east-1
   DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidb_cloud_native database name (default: tidbcloud_fs)
   DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY optional default TiDB Cloud API public key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY optional default TiDB Cloud API private key for tidb_cloud_native create/delete when caller omits it
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_PUBLIC_KEY server-managed TiDB Cloud API public key for shared DB pool operations; required for tidb_cloud_native_shared
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_PRIVATE_KEY server-managed TiDB Cloud API private key for shared DB pool operations; required for tidb_cloud_native_shared
   DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT true|false to use TiDB Cloud private endpoint hosts for tidb_cloud_native
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_MAX_TENANTS soft capacity for new managed shared DB pools (default: 100)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO emergency hard-cap ratio > 1 after physical create failure (default: 1.2)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_REOPEN_RATIO reopen ratio for a latched shared pool (default: 0.8)
+  DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT physical spending-limit target for new managed shared DB pools (default: 1000000)
   DRIVE9_TIDBCLOUD_PRIVATE_ENDPOINT_HOST_MAP comma-separated public_host=private_host mappings (also accepts public_host:private_host);
                                              when set, disables legacy single-host private endpoint overrides
   DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST legacy tencentcloud private endpoint fallback host, used only when host map is unset
@@ -1212,6 +1221,18 @@ func sharedDBMaxTenantsFromEnv() (int, error) {
 	v, err := strconv.Atoi(raw)
 	if err != nil || v <= 0 {
 		return 0, fmt.Errorf("invalid DRIVE9_TIDBCLOUD_NATIVE_SHARED_MAX_TENANTS=%q: must be a positive integer", raw)
+	}
+	return v, nil
+}
+
+func sharedDBDefaultSpendingLimitFromEnv() (int64, error) {
+	raw := strings.TrimSpace(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT"))
+	if raw == "" {
+		return server.DefaultManagedSharedDBSpendingLimit, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || v <= 0 || v > int64(math.MaxInt32) {
+		return 0, fmt.Errorf("invalid DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT=%q: must be in (0,%d]", raw, int64(math.MaxInt32))
 	}
 	return v, nil
 }

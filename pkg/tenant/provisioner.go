@@ -11,6 +11,12 @@ var ErrCredentialsRequired = errors.New("public_key and private_key are required
 var ErrPartialCredentials = errors.New("both public_key and private_key must be provided together")
 var ErrQuotaPermissionDenied = errors.New("tidbcloud quota update permission denied")
 var ErrQuotaBackendNotFound = errors.New("tidbcloud quota backend not found")
+var ErrTiDBCloudRoleInsufficient = errors.New("tidbcloud API key role has insufficient permission")
+
+const (
+	TiDBCloudRoleOrgOwner     = "org:owner"
+	TiDBCloudRoleProjectOwner = "project:owner"
+)
 
 type ClusterInfo struct {
 	TenantID       string
@@ -41,6 +47,19 @@ type Deprovisioner interface {
 type CredentialProvisionRequest struct {
 	PublicKey  string
 	PrivateKey string
+}
+
+type TiDBCloudAPIKeyIdentity struct {
+	OrganizationID string
+	Role           string
+}
+
+type TiDBCloudAPIKeyIdentityResolver interface {
+	ResolveAPIKeyIdentity(ctx context.Context, req CredentialProvisionRequest) (*TiDBCloudAPIKeyIdentity, error)
+}
+
+type SharedCredentialProvider interface {
+	DefaultSharedCredentials() (CredentialProvisionRequest, bool)
 }
 
 type QuotaCloudConfig struct {

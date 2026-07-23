@@ -601,6 +601,12 @@ func TestCleanupFailedOrganizationTenantsNativeListFailureContinuesShared(t *tes
 
 func setFailedCleanupTenant(t *testing.T, rt *quotaRuntime, tenantID, provider, clusterID, namespaceID string, updatedAt time.Time) {
 	t.Helper()
+	if provider == tenant.ProviderTiDBCloudNativeShared {
+		if _, err := rt.meta.DB().ExecContext(context.Background(),
+			"DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?", tenantID); err != nil {
+			t.Fatalf("remove dedicated binding for shared cleanup tenant %s: %v", tenantID, err)
+		}
+	}
 	if _, err := rt.meta.DB().ExecContext(context.Background(), `UPDATE tenants
 		SET status = ?, provider = ?, cluster_id = NULLIF(?, ''), storage_namespace_id = ?, updated_at = ?
 		WHERE id = ?`, meta.TenantFailed, provider, clusterID, namespaceID, updatedAt.UTC(), tenantID); err != nil {

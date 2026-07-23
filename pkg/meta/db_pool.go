@@ -12,12 +12,9 @@ import (
 	"github.com/google/uuid"
 )
 
-// SharedDBOrgWildcard is the org_id sentinel matching any TiDB Cloud
-// organization that has no exact db_pool row.
-const SharedDBOrgWildcard = "*"
-
-// MaxTiDBCloudSpendingLimit is the spendingLimit.monthly API maximum. In the
-// TiDB Cloud unit, 1,000,000 represents $10,000.
+// MaxTiDBCloudSpendingLimit is the tenant-facing quota API maximum. Physical
+// shared DB pools use a separately configured persisted target. In the TiDB
+// Cloud unit, 1,000,000 represents $10,000.
 const MaxTiDBCloudSpendingLimit = int64(1_000_000)
 
 // SharedDBRoleShared marks a db_pool row as a multi-tenant shared-schema
@@ -99,12 +96,24 @@ func sharedDBUUID(raw string) (string, error) {
 	return parsed.String(), nil
 }
 
+func validateSharedDBOrganizationID(raw string) (string, error) {
+	organizationID := strings.TrimSpace(raw)
+	if organizationID == "" {
+		return "", fmt.Errorf("tidbcloud organization id is required")
+	}
+	if organizationID != raw || strings.ContainsAny(organizationID, "*%?") {
+		return "", fmt.Errorf("tidbcloud organization id must be an exact value")
+	}
+	return organizationID, nil
+}
+
 // SharedDB is one physical database registered in db_pool. PasswordCipher
 // holds the same encrypted envelope as tenants.db_password; the plaintext
 // never crosses this layer. TLSMode is the go-sql-driver tls DSN parameter
 // verbatim ("true", "skip-verify", a custom registered config name, or ""
 // for plaintext) so the runtime handle reopens the DB with exactly the TLS
-// mode it was registered with. MaxTenants of 0 means unlimited.
+// mode it was registered with. MaxTenants of 0 makes the pool drain-only:
+// existing tenants may leave, but no new tenant may enter.
 type SharedDB struct {
 	ID                      int64
 	UUID                    string
@@ -182,6 +191,10 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 	if in == nil {
 		return 0, fmt.Errorf("shared db pool is required")
 	}
+	organizationID, err := validateSharedDBOrganizationID(in.TiDBCloudOrganizationID)
+	if err != nil {
+		return 0, err
+	}
 	poolUUID, err := sharedDBUUID(in.UUID)
 	if err != nil {
 		return 0, err
@@ -198,12 +211,8 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 	if in.MaxTenants <= 0 {
 		return 0, fmt.Errorf("managed max tenants must be positive")
 	}
-	if in.SpendingLimit == nil || *in.SpendingLimit != MaxTiDBCloudSpendingLimit {
-		return 0, fmt.Errorf("managed spending limit must equal TiDB Cloud maximum %d", MaxTiDBCloudSpendingLimit)
-	}
-	var organizationID any
-	if in.TiDBCloudOrganizationID != "" {
-		organizationID = in.TiDBCloudOrganizationID
+	if in.SpendingLimit == nil || *in.SpendingLimit <= 0 || *in.SpendingLimit > int64(math.MaxInt32) {
+		return 0, fmt.Errorf("managed spending limit must be in (0,%d]", int64(math.MaxInt32))
 	}
 	var passwordCipher any
 	if len(in.PasswordCipher) != 0 {
@@ -466,28 +475,22 @@ func (s *Store) ListSharedDBsByStatus(ctx context.Context, status string, limit 
 }
 
 // FindSharedDBForAllocation selects the oldest eligible exact-organization
-// pool, preferring active over provisioning. Before organization resolution,
-// callers may instead supply the 32-byte provisioning fingerprint. Managed
-// rows use one fixed physical spending limit, so tenant virtual values do not
-// participate in allocation.
-func (s *Store) FindSharedDBForAllocation(ctx context.Context, organizationID string, provisioningKey []byte) (db *SharedDB, err error) {
+// pool, preferring active over provisioning. Managed rows use one fixed
+// physical spending limit, so tenant virtual values do not participate in
+// allocation.
+func (s *Store) FindSharedDBForAllocation(ctx context.Context, organizationID string) (db *SharedDB, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "find_shared_db_for_allocation", start, &err)
-	identityColumn := "org_id"
-	var identity any = organizationID
-	if organizationID == "" {
-		if len(provisioningKey) != 32 {
-			return nil, fmt.Errorf("organization id or 32-byte provisioning key is required")
-		}
-		identityColumn = "provisioning_key"
-		identity = provisioningKey
+	organizationID, err = validateSharedDBOrganizationID(organizationID)
+	if err != nil {
+		return nil, err
 	}
 	query := "SELECT " + sharedDBSelectColumns + " FROM db_pool d " +
-		"WHERE d." + identityColumn + " = ? AND d.`role` = ? " +
+		"WHERE d.org_id = ? AND d.`role` = ? " +
 		"AND d.status IN (?, ?) " +
-		"AND (d.max_tenants = 0 OR (d.soft_cap_reached = 0 AND d.tenant_count < d.max_tenants)) " +
+		"AND d.max_tenants > 0 AND d.soft_cap_reached = 0 AND d.tenant_count < d.max_tenants " +
 		"ORDER BY CASE d.status WHEN 'active' THEN 0 ELSE 1 END, d.db_id LIMIT 1"
-	db, err = scanSharedDBRow(s.db.QueryRowContext(ctx, query, identity, SharedDBRoleShared,
+	db, err = scanSharedDBRow(s.db.QueryRowContext(ctx, query, organizationID, SharedDBRoleShared,
 		SharedDBStatusActive, SharedDBStatusProvisioning))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -534,6 +537,10 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 	if in == nil {
 		return 0, fmt.Errorf("shared db is required")
 	}
+	organizationID, err := validateSharedDBOrganizationID(in.TiDBCloudOrganizationID)
+	if err != nil {
+		return 0, err
+	}
 	poolUUID, err := sharedDBUUID(in.UUID)
 	if err != nil {
 		return 0, err
@@ -576,7 +583,7 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 			"ON DUPLICATE KEY UPDATE db_port = VALUES(db_port), db_user = VALUES(db_user), "+
 			"db_password = VALUES(db_password), db_tls = VALUES(db_tls), "+
 			"max_tenants = VALUES(max_tenants), status = VALUES(status)",
-		poolUUID, in.TiDBCloudOrganizationID, role, in.Host, in.Port, in.User, in.PasswordCipher, in.Name,
+		poolUUID, organizationID, role, in.Host, in.Port, in.User, in.PasswordCipher, in.Name,
 		in.TLSMode, in.MaxTenants, status); err != nil {
 		return 0, fmt.Errorf("upsert db_pool row: %w", err)
 	}
@@ -584,7 +591,7 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 	// auto-increment id via LastInsertId, so re-fetch by endpoint.
 	err = s.db.QueryRowContext(ctx,
 		`SELECT db_id FROM db_pool WHERE org_id = ? AND db_host = ? AND db_name = ?`,
-		in.TiDBCloudOrganizationID, in.Host, in.Name).Scan(&dbID)
+		organizationID, in.Host, in.Name).Scan(&dbID)
 	if err != nil {
 		return 0, fmt.Errorf("resolve db_id after upsert: %w", err)
 	}
@@ -625,39 +632,26 @@ func (s *Store) GetSharedDBForTenant(ctx context.Context, tenantID string) (*Sha
 	return db, nil
 }
 
-// FindSharedDBForOrg returns the active shared database serving orgID: an
-// exact org_id match wins over the '*' wildcard row. An empty orgID matches
-// only the wildcard row. Returns ErrNotFound when neither exists.
+// FindSharedDBForOrg returns the oldest open active shared database serving
+// exactly orgID. Shared DB pools never match across organizations.
 func (s *Store) FindSharedDBForOrg(ctx context.Context, orgID string) (db *SharedDB, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "find_shared_db_for_org", start, &err)
-	if orgID != "" && orgID != SharedDBOrgWildcard {
-		db, err = s.findActiveSharedDB(ctx, orgID)
-		if err == nil {
-			return db, nil
-		}
-		if !errors.Is(err, ErrNotFound) {
-			return nil, err
-		}
-	}
-	db, err = s.findActiveSharedDB(ctx, SharedDBOrgWildcard)
+	orgID, err = validateSharedDBOrganizationID(orgID)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return nil, ErrNotFound
-		}
 		return nil, err
 	}
-	return db, nil
+	return s.findActiveSharedDB(ctx, orgID)
 }
 
 func (s *Store) findActiveSharedDB(ctx context.Context, orgID string) (*SharedDB, error) {
 	// Capacity is enforced at selection time: normal allocation only sees open
-	// soft-cap pools (0 means unlimited); the transactional reserve remains the
-	// final guard against races.
+	// positive-capacity pools; the transactional reserve remains the final
+	// guard against races.
 	db, err := scanSharedDBRow(s.db.QueryRowContext(ctx,
 		"SELECT "+sharedDBSelectColumns+" FROM db_pool "+
 			"WHERE org_id = ? AND `role` = ? AND status = ? "+
-			"AND (max_tenants = 0 OR (soft_cap_reached = 0 AND tenant_count < max_tenants)) ORDER BY db_id LIMIT 1",
+			"AND max_tenants > 0 AND soft_cap_reached = 0 AND tenant_count < max_tenants ORDER BY db_id LIMIT 1",
 		orgID, SharedDBRoleShared, sharedDBStatusActive))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -992,7 +986,7 @@ func (s *Store) completeSharedTenantProvision(ctx context.Context, tenantID, pro
 			if dbPoolStatus != SharedDBStatusActive && (dbPoolStatus != SharedDBStatusProvisioning || (membership == nil && (!clusterID.Valid || clusterID.String == ""))) {
 				return fmt.Errorf("db pool %d is not physically ready: status=%s cluster=%q membership=%t: %w", p.DbID, dbPoolStatus, clusterID.String, membership != nil, ErrSharedDBCapacityExhausted)
 			}
-			if maxTenants > 0 && (softCapReached || tenantCount >= maxTenants) {
+			if maxTenants <= 0 || softCapReached || tenantCount >= maxTenants {
 				return fmt.Errorf("db pool %d soft capacity exhausted: count=%d max=%d latch=%t: %w", p.DbID, tenantCount, maxTenants, softCapReached, ErrSharedDBCapacityExhausted)
 			}
 		case SharedDBCapacityEmergency:
@@ -1014,7 +1008,7 @@ func (s *Store) completeSharedTenantProvision(ctx context.Context, tenantID, pro
 					ELSE soft_cap_reached END,
 					tenant_count = tenant_count + 1
 				WHERE db_id = ? AND (%s)
-					AND (max_tenants = 0 OR (soft_cap_reached = 0 AND tenant_count + 1 <= max_tenants))`
+					AND max_tenants > 0 AND soft_cap_reached = 0 AND tenant_count + 1 <= max_tenants`
 			if membership != nil {
 				normalQuery = fmt.Sprintf(normalQuery, "status IN (?, ?)")
 				res, err = tx.ExecContext(ctx, normalQuery, p.DbID, SharedDBStatusActive, SharedDBStatusProvisioning)
@@ -1284,7 +1278,9 @@ func releaseTenantPlacementAndDecrCountTx(ctx context.Context, tx *sql.Tx, fsID,
 		newTenantCount = 0
 	}
 	nextSoftCapReached := softCapReached
-	if maxTenants > 0 && newTenantCount <= reopenThreshold {
+	if maxTenants == 0 {
+		nextSoftCapReached = true
+	} else if newTenantCount <= reopenThreshold {
 		nextSoftCapReached = false
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE db_pool
