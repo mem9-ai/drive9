@@ -207,7 +207,7 @@ func writeQuotaAPIKeyError(w http.ResponseWriter, ctx context.Context, err error
 		errJSON(w, http.StatusNotFound, "quota query not enabled")
 	default:
 		logger.Warn(ctx, "quota_api_key_auth_failed", zap.Error(err))
-		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
+		errJSON(w, backendErrorStatus(ctx, err), "auth backend unavailable")
 	}
 }
 
@@ -547,7 +547,7 @@ func (s *Server) quotaTenant(w http.ResponseWriter, ctx context.Context, tenantI
 			errJSON(w, http.StatusNotFound, "tenant not found")
 			return nil, false
 		}
-		errJSON(w, http.StatusInternalServerError, "tenant lookup failed")
+		errJSON(w, backendErrorStatus(ctx, err), "tenant lookup failed")
 		return nil, false
 	}
 	if t.Status == meta.TenantDeleted {
@@ -560,12 +560,12 @@ func (s *Server) quotaTenant(w http.ResponseWriter, ctx context.Context, tenantI
 func (s *Server) writeQuotaResponse(w http.ResponseWriter, r *http.Request, t *meta.Tenant) {
 	cfg, err := s.meta.GetQuotaConfig(r.Context(), t.ID)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "quota config lookup failed")
+		errJSON(w, backendErrorStatus(r.Context(), err), "quota config lookup failed")
 		return
 	}
 	usage, err := s.meta.GetQuotaUsage(r.Context(), t.ID)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "quota usage lookup failed")
+		errJSON(w, backendErrorStatus(r.Context(), err), "quota usage lookup failed")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

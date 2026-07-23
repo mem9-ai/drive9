@@ -254,7 +254,7 @@ func authorizeUploadSession(ctx context.Context, w http.ResponseWriter, scope *T
 			errJSON(w, http.StatusGone, "upload expired")
 			return nil, err
 		}
-		errJSON(w, http.StatusInternalServerError, "upload session lookup failed")
+		errJSON(w, backendErrorStatus(ctx, err), "upload session lookup failed")
 		return nil, err
 	}
 	if authErr := scope.AuthorizeFS(op, upload.TargetPath); authErr != nil {

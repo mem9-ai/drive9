@@ -129,18 +129,18 @@ func (s *Server) handleScopedTokenIssue(w http.ResponseWriter, r *http.Request, 
 
 	tokenVersion, err := newScopedTokenVersion()
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "failed to issue token")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to issue token")
 		return
 	}
 	expiresAt := time.Now().UTC().Add(time.Duration(req.TTLSeconds) * time.Second)
 	rawToken, err := token.IssueTokenWithExpiry(s.tokenSecret, scope.TenantID, tokenVersion, expiresAt)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "failed to issue token")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to issue token")
 		return
 	}
 	cipherToken, err := s.pool.Encrypt(r.Context(), []byte(rawToken))
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "failed to encrypt token")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to encrypt token")
 		return
 	}
 
@@ -163,7 +163,7 @@ func (s *Server) handleScopedTokenIssue(w http.ResponseWriter, r *http.Request, 
 			errJSON(w, http.StatusConflict, "token already exists")
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, "failed to persist token")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to persist token")
 		return
 	}
 
@@ -188,7 +188,7 @@ func (s *Server) handleScopedTokenIssue(w http.ResponseWriter, r *http.Request, 
 
 	rows, err := s.meta.ListAPIKeyFSScopes(r.Context(), scope.TenantID, apiKeyID)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "failed to load token scopes")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to load token scopes")
 		return
 	}
 	resp := scopedTokenResponse{
@@ -210,7 +210,7 @@ func (s *Server) handleScopedTokenRevoke(w http.ResponseWriter, r *http.Request,
 			errJSON(w, http.StatusNotFound, "token not found or already revoked")
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, "failed to revoke token")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to revoke token")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -234,7 +234,7 @@ func (s *Server) handleScopedTokenRevokeByAPIKey(w http.ResponseWriter, r *http.
 			errJSON(w, http.StatusNotFound, "token not found or already revoked")
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, "failed to revoke token")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to revoke token")
 		return
 	}
 	if resolved.APIKey.TenantID != scope.TenantID || resolved.APIKey.ScopeKind != meta.APIKeyScopeKindFS {
@@ -246,7 +246,7 @@ func (s *Server) handleScopedTokenRevokeByAPIKey(w http.ResponseWriter, r *http.
 			errJSON(w, http.StatusNotFound, "token not found or already revoked")
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, "failed to revoke token")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to revoke token")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

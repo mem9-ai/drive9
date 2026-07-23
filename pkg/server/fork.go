@@ -932,7 +932,7 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusNotFound, "tenant not found")
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, "tenant lookup failed")
+		errJSON(w, backendErrorStatus(r.Context(), err), "tenant lookup failed")
 		return
 	}
 	if t.Kind != meta.TenantKindFork {
@@ -959,7 +959,7 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	updated, err := s.meta.UpdateTenantStatusIf(r.Context(), t.ID, t.Status, meta.TenantDeleting)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "failed to mark tenant deleting")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to mark tenant deleting")
 		return
 	}
 	if !updated {
