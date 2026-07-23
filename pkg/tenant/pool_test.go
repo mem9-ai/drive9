@@ -182,6 +182,121 @@ func TestSharedDBHandleIdleReapUsesLongerTTLAndSkipsReferencedHandles(t *testing
 	}
 }
 
+func registerSharedDBForCacheMetrics(t *testing.T, orgID string) (*meta.Store, *Pool, int64, string) {
+	t.Helper()
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	dsnCfg, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portText, err := net.SplitHostPort(dsnCfg.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passwordCipher, err := enc.Encrypt(context.Background(), []byte(dsnCfg.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbID, err := metaStore.RegisterSharedDB(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: orgID, Host: host, Port: port,
+		User: dsnCfg.User, PasswordCipher: passwordCipher, Name: dsnCfg.DBName,
+		MaxTenants: 100, Status: meta.SharedDBStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousEnsure := ensureSharedDBSchema
+	ensureSharedDBSchema = func(ctx context.Context, db *sql.DB) error {
+		return db.PingContext(ctx)
+	}
+	t.Cleanup(func() { ensureSharedDBSchema = previousEnsure })
+	pool := NewPool(PoolConfig{}, enc)
+	pool.SetMetaStore(metaStore)
+	t.Cleanup(pool.Close)
+	if err := pool.EnsureSharedDBReady(context.Background(), dbID); err != nil {
+		t.Fatal(err)
+	}
+	info, err := metaStore.GetSharedDB(context.Background(), dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return metaStore, pool, dbID, info.UUID
+}
+
+func assertSharedDBCacheMetric(t *testing.T, series string, wantPresent bool) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	text := rec.Body.String()
+	if wantPresent && !strings.Contains(text, series) {
+		t.Fatalf("missing shared DB cache metric %q:\n%s", series, text)
+	}
+	if !wantPresent && strings.Contains(text, series) {
+		t.Fatalf("stale shared DB cache metric %q:\n%s", series, text)
+	}
+}
+
+func TestSharedDBCacheMetricsTrackHandleLifecycle(t *testing.T) {
+	_, pool, dbID, uuid := registerSharedDBForCacheMetrics(t, "org-cache-metrics")
+	dbPoolID := strconv.FormatInt(dbID, 10)
+	labels := `db_pool_id="` + dbPoolID + `",db_pool_uuid="` + uuid + `",tidbcloud_org_id="org-cache-metrics"`
+	handleSeries := `drive9_shared_db_pool_cache_handles{` + labels + `}`
+	tenantsSeries := func(value string) string {
+		return `drive9_shared_db_pool_cache_tenants{` + labels + `} ` + value
+	}
+
+	assertSharedDBCacheMetric(t, handleSeries+` 1.000000`, true)
+	assertSharedDBCacheMetric(t, tenantsSeries(`0.000000`), true)
+
+	pool.retainSharedDB(dbID)
+	assertSharedDBCacheMetric(t, tenantsSeries(`1.000000`), true)
+	pool.retainSharedDB(dbID)
+	assertSharedDBCacheMetric(t, tenantsSeries(`2.000000`), true)
+	pool.releaseSharedDB(dbID)
+	assertSharedDBCacheMetric(t, tenantsSeries(`1.000000`), true)
+	pool.releaseSharedDB(dbID)
+	assertSharedDBCacheMetric(t, tenantsSeries(`0.000000`), true)
+
+	if err := pool.InvalidateSharedDB(dbID); err != nil {
+		t.Fatal(err)
+	}
+	assertSharedDBCacheMetric(t, handleSeries, false)
+	assertSharedDBCacheMetric(t, `drive9_shared_db_pool_cache_tenants{`+labels+`}`, false)
+}
+
+func TestSharedDBCacheMetricsDeletedOnIdleReap(t *testing.T) {
+	_, pool, dbID, uuid := registerSharedDBForCacheMetrics(t, "org-cache-reap")
+	dbPoolID := strconv.FormatInt(dbID, 10)
+	labels := `db_pool_id="` + dbPoolID + `",db_pool_uuid="` + uuid + `",tidbcloud_org_id="org-cache-reap"`
+	handleSeries := `drive9_shared_db_pool_cache_handles{` + labels + `}`
+	assertSharedDBCacheMetric(t, handleSeries+` 1.000000`, true)
+
+	pool.sharedMu.Lock()
+	pool.sharedDBLastUsed[dbID] = time.Now().Add(-defaultSharedDBHandleIdleTTL - time.Second)
+	pool.sharedMu.Unlock()
+	pool.reapIdleSharedDBs(time.Now())
+
+	assertSharedDBCacheMetric(t, handleSeries, false)
+	assertSharedDBCacheMetric(t, `drive9_shared_db_pool_cache_tenants{`+labels+`}`, false)
+}
+
 func TestSharedDBSchemaIsCheckedLazilyAndRetriedAfterFailure(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

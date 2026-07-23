@@ -156,8 +156,16 @@ type Pool struct {
 	sharedDBs        map[int64]*sql.DB
 	sharedDBRefs     map[int64]int
 	sharedDBLastUsed map[int64]time.Time
+	sharedDBLabels   map[int64]sharedDBMetricLabels
 	sharedDBOpenMu   map[int64]*sync.Mutex
 	sharedDBClosed   bool
+}
+
+// sharedDBMetricLabels remembers the metric identity of a cached shared DB
+// handle so ref-count gauges and series cleanup do not need a meta lookup.
+type sharedDBMetricLabels struct {
+	orgID string
+	uuid  string
 }
 
 type tenantAutoEmbeddingProfile struct {
@@ -247,6 +255,7 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 		sharedDBs:        map[int64]*sql.DB{},
 		sharedDBRefs:     map[int64]int{},
 		sharedDBLastUsed: map[int64]time.Time{},
+		sharedDBLabels:   map[int64]sharedDBMetricLabels{},
 		sharedDBOpenMu:   map[int64]*sync.Mutex{},
 		// No LeaderChecker means single-pod mode: FileGC runs unconditionally.
 		fileGCEnabled: cfg.LeaderChecker == nil,
@@ -763,6 +772,7 @@ func (p *Pool) Close() {
 		delete(p.sharedDBs, dbID)
 		delete(p.sharedDBRefs, dbID)
 		delete(p.sharedDBLastUsed, dbID)
+		p.deleteSharedDBCacheMetricsLocked(dbID)
 	}
 	p.sharedMu.Unlock()
 	for _, item := range sharedToClose {
@@ -948,6 +958,7 @@ func (p *Pool) retainSharedDB(dbID int64) {
 	p.sharedMu.Lock()
 	p.sharedDBRefs[dbID]++
 	p.sharedDBLastUsed[dbID] = time.Now()
+	p.recordSharedDBCacheTenantsLocked(dbID)
 	p.sharedMu.Unlock()
 }
 
@@ -966,7 +977,30 @@ func (p *Pool) releaseSharedDB(dbID int64) {
 		delete(p.sharedDBRefs, dbID)
 	}
 	p.sharedDBLastUsed[dbID] = time.Now()
+	p.recordSharedDBCacheTenantsLocked(dbID)
 	p.sharedMu.Unlock()
+}
+
+// recordSharedDBCacheTenantsLocked emits the per-handle active-tenant gauge.
+// Caller must hold p.sharedMu.
+func (p *Pool) recordSharedDBCacheTenantsLocked(dbID int64) {
+	labels, ok := p.sharedDBLabels[dbID]
+	if !ok {
+		return
+	}
+	metrics.RecordSharedDBPoolCacheTenants(labels.orgID, dbID, labels.uuid, int64(p.sharedDBRefs[dbID]))
+}
+
+// deleteSharedDBCacheMetricsLocked removes both cache series for a handle that
+// is leaving the cache. Caller must hold p.sharedMu.
+func (p *Pool) deleteSharedDBCacheMetricsLocked(dbID int64) {
+	labels, ok := p.sharedDBLabels[dbID]
+	if !ok {
+		return
+	}
+	metrics.DeleteSharedDBPoolCacheHandles(labels.orgID, dbID, labels.uuid)
+	metrics.DeleteSharedDBPoolCacheTenants(labels.orgID, dbID, labels.uuid)
+	delete(p.sharedDBLabels, dbID)
 }
 
 // reapIdleSharedDBs closes physical shared-DB handles only after no cached or
@@ -992,6 +1026,7 @@ func (p *Pool) reapIdleSharedDBs(now time.Time) {
 		delete(p.sharedDBs, dbID)
 		delete(p.sharedDBRefs, dbID)
 		delete(p.sharedDBLastUsed, dbID)
+		p.deleteSharedDBCacheMetricsLocked(dbID)
 	}
 	p.sharedMu.Unlock()
 	for _, item := range toClose {
@@ -1080,6 +1115,9 @@ func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) 
 	}
 	p.sharedDBs[dbID] = db
 	p.sharedDBLastUsed[dbID] = time.Now()
+	p.sharedDBLabels[dbID] = sharedDBMetricLabels{orgID: info.TiDBCloudOrganizationID, uuid: info.UUID}
+	metrics.RecordSharedDBPoolCacheHandles(info.TiDBCloudOrganizationID, dbID, info.UUID, 1)
+	metrics.RecordSharedDBPoolCacheTenants(info.TiDBCloudOrganizationID, dbID, info.UUID, int64(p.sharedDBRefs[dbID]))
 	p.sharedMu.Unlock()
 	return db, nil
 }
@@ -1111,6 +1149,7 @@ func (p *Pool) InvalidateSharedDB(dbID int64) error {
 	delete(p.sharedDBs, dbID)
 	delete(p.sharedDBRefs, dbID)
 	delete(p.sharedDBLastUsed, dbID)
+	p.deleteSharedDBCacheMetricsLocked(dbID)
 	p.sharedMu.Unlock()
 	if db == nil {
 		return nil
