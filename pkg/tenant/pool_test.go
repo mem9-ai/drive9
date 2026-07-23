@@ -298,6 +298,20 @@ func TestSharedDBCacheMetricsDeletedOnIdleReap(t *testing.T) {
 	assertSharedDBCacheMetric(t, `drive9_shared_db_pool_cache_tenants{`+labels+`}`, false)
 }
 
+func TestSharedDBCacheMetricsDeletedOnPoolClose(t *testing.T) {
+	_, pool, dbID, uuid := registerSharedDBForCacheMetrics(t, "org-cache-close")
+	dbPoolID := strconv.FormatInt(dbID, 10)
+	labels := `db_pool_id="` + dbPoolID + `",db_pool_uuid="` + uuid + `",tidbcloud_org_id="org-cache-close"`
+	handleSeries := `drive9_shared_db_pool_cache_handles{` + labels + `}`
+	assertSharedDBCacheMetric(t, handleSeries+` 1.000000`, true)
+	assertSharedDBCacheMetric(t, `drive9_shared_db_pool_cache_tenants{`+labels+`} 0.000000`, true)
+
+	pool.Close()
+
+	assertSharedDBCacheMetric(t, handleSeries, false)
+	assertSharedDBCacheMetric(t, `drive9_shared_db_pool_cache_tenants{`+labels+`}`, false)
+}
+
 func TestSharedDBSchemaIsCheckedLazilyAndRetriedAfterFailure(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
