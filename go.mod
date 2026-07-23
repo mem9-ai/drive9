@@ -122,4 +122,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/hanwen/go-fuse/v2 => github.com/mornyx/go-fuse/v2 v2.9.1-0.20260707042005-213f4c78d30a
+replace github.com/hanwen/go-fuse/v2 => github.com/mornyx/go-fuse/v2 v2.9.1-0.20260709131052-42a9f512653e
