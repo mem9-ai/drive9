@@ -245,6 +245,9 @@ func sharedDBPoolAttrs(tidbCloudOrgID string, dbPoolID int64, dbPoolUUID, dimens
 }
 
 func RecordSharedDBPoolCacheHandles(tidbCloudOrgID string, dbPoolID int64, dbPoolUUID string, count int64) {
+	if count < 0 {
+		return
+	}
 	RegisterModule("shared_db_pool")
 	sharedDBPoolCacheHandles.Set(float64(count), sharedDBPoolCacheAttrs(tidbCloudOrgID, dbPoolID, dbPoolUUID)...)
 }

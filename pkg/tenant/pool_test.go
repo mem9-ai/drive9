@@ -184,7 +184,7 @@ func TestSharedDBHandleIdleReapUsesLongerTTLAndSkipsReferencedHandles(t *testing
 
 func registerSharedDBForCacheMetrics(t *testing.T, orgID string) (*meta.Store, *Pool, int64, string) {
 	t.Helper()
-	metaStore, err := meta.Open(testDSN)
+	metaStore, err := meta.OpenContext(context.Background(), testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,6 +287,7 @@ func TestSharedDBCacheMetricsDeletedOnIdleReap(t *testing.T) {
 	labels := `db_pool_id="` + dbPoolID + `",db_pool_uuid="` + uuid + `",tidbcloud_org_id="org-cache-reap"`
 	handleSeries := `drive9_shared_db_pool_cache_handles{` + labels + `}`
 	assertSharedDBCacheMetric(t, handleSeries+` 1.000000`, true)
+	assertSharedDBCacheMetric(t, `drive9_shared_db_pool_cache_tenants{`+labels+`} 0.000000`, true)
 
 	pool.sharedMu.Lock()
 	pool.sharedDBLastUsed[dbID] = time.Now().Add(-defaultSharedDBHandleIdleTTL - time.Second)
