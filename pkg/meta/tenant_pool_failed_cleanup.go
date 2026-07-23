@@ -55,6 +55,8 @@ func (s *Store) ListFailedSharedTenantCleanupCandidates(ctx context.Context, org
 	if limit <= 0 {
 		limit = 10
 	}
+	// Direct placement attribution intentionally requires an exact organization-owned pool.
+	// Wildcard pools cannot prove a tenant's resolved organization until that identity is persisted per tenant.
 	rows, err := s.db.QueryContext(ctx, `SELECT
 			c.id, c.status, c.kind, c.parent_tenant_id, c.storage_namespace_id,
 			c.db_host, c.db_port, c.db_user, c.db_password, c.db_name,

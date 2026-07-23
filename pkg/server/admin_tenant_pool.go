@@ -1657,9 +1657,7 @@ func (s *Server) deleteFreeSharedPoolTenant(ctx context.Context, t *meta.Tenant)
 		if err != nil {
 			return err
 		}
-		connectionReady := dbPool.Status == meta.SharedDBStatusActive && dbPool.Host != "" &&
-			dbPool.Port > 0 && dbPool.User != "" && len(dbPool.PasswordCipher) > 0 && dbPool.Name != ""
-		if connectionReady {
+		if sharedDBConnectionReady(dbPool) {
 			if err := s.pool.PurgeSharedTenant(ctx, fsID, placement.DbID); err != nil {
 				return err
 			}

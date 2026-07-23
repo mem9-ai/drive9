@@ -18,6 +18,40 @@ import (
 
 const failedCleanupTestOrganizationID = "org-failed-cleanup"
 
+func TestSharedDBConnectionReady(t *testing.T) {
+	complete := func() *meta.SharedDB {
+		return &meta.SharedDB{
+			Status:         meta.SharedDBStatusActive,
+			Host:           "shared.example.com",
+			Port:           4000,
+			User:           "root",
+			PasswordCipher: []byte("cipher"),
+			Name:           "shared_db",
+		}
+	}
+	tests := []struct {
+		name  string
+		build func() *meta.SharedDB
+		want  bool
+	}{
+		{name: "nil", build: func() *meta.SharedDB { return nil }},
+		{name: "complete", build: complete, want: true},
+		{name: "provisioning", build: func() *meta.SharedDB { db := complete(); db.Status = meta.SharedDBStatusProvisioning; return db }},
+		{name: "blank host", build: func() *meta.SharedDB { db := complete(); db.Host = " \t"; return db }},
+		{name: "zero port", build: func() *meta.SharedDB { db := complete(); db.Port = 0; return db }},
+		{name: "blank user", build: func() *meta.SharedDB { db := complete(); db.User = " \t"; return db }},
+		{name: "missing password", build: func() *meta.SharedDB { db := complete(); db.PasswordCipher = nil; return db }},
+		{name: "blank database", build: func() *meta.SharedDB { db := complete(); db.Name = " \t"; return db }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sharedDBConnectionReady(tt.build()); got != tt.want {
+				t.Fatalf("sharedDBConnectionReady() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCleanupFailedOrganizationTenantsNativePoolFree(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()

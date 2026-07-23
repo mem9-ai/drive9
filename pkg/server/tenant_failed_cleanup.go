@@ -325,11 +325,7 @@ func (s *Server) cleanupFailedSharedTenant(
 	if err != nil {
 		return true, fmt.Errorf("resolve_shared_db: %w", err)
 	}
-	connectionReady := dbPool.Status == meta.SharedDBStatusActive &&
-		strings.TrimSpace(dbPool.Host) != "" && dbPool.Port > 0 &&
-		strings.TrimSpace(dbPool.User) != "" && len(dbPool.PasswordCipher) > 0 &&
-		strings.TrimSpace(dbPool.Name) != ""
-	if connectionReady {
+	if sharedDBConnectionReady(dbPool) {
 		if err := s.pool.PurgeSharedTenant(ctx, fsID, placement.DbID); err != nil {
 			return true, fmt.Errorf("purge_shared_tenant: %w", err)
 		}
