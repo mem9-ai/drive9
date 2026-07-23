@@ -1918,6 +1918,8 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		return nil, nil, false, false, err
 	}
 	logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_org_lookup_done", "provider", tenant.ProviderTiDBCloudNative, "organization_id", orgID, "duration_ms", durationMillis(stageStarted))...)
+	cleanupCred := cred
+	defer s.startTenantFailedCleanupAsync(ctx, orgID, cleanupCred)
 	stageStarted = time.Now()
 	pool, err := s.meta.GetTenantPoolByOrganization(ctx, orgID)
 	if err != nil {
