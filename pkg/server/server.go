@@ -5226,11 +5226,12 @@ func (s *Server) provisionTenantOnSharedDBMode(ctx context.Context, tenantID str
 		status = meta.TenantProvisioning
 	}
 	return &provisionTenantResult{
-		TenantID: tenantID,
-		APIKey:   apiToken,
-		APIKeyID: apiKeyID,
-		Status:   status,
-		Provider: tenant.ProviderTiDBCloudNativeShared,
+		TenantID:       tenantID,
+		APIKey:         apiToken,
+		APIKeyID:       apiKeyID,
+		Status:         status,
+		Provider:       tenant.ProviderTiDBCloudNativeShared,
+		OrganizationID: strings.TrimSpace(sharedDB.TiDBCloudOrganizationID),
 	}, nil
 }
 

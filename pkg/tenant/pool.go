@@ -864,7 +864,7 @@ func (p *Pool) fsIDForTenant(ctx context.Context, t *meta.Tenant) (int64, error)
 }
 
 func (p *Pool) tenantMetricTiDBCloudOrgID(ctx context.Context, t *meta.Tenant) string {
-	if t == nil || strings.TrimSpace(t.ID) == "" || t.Provider != ProviderTiDBCloudNative {
+	if t == nil || strings.TrimSpace(t.ID) == "" || !UsesTiDBCloudNativeCredentials(t.Provider) {
 		return defaultTenantMetricTiDBCloudOrgID
 	}
 	if orgID := strings.TrimSpace(t.TiDBCloudOrgID); orgID != "" {
@@ -872,6 +872,22 @@ func (p *Pool) tenantMetricTiDBCloudOrgID(ctx context.Context, t *meta.Tenant) s
 	}
 	if p == nil || p.metaStore == nil {
 		return defaultTenantMetricTiDBCloudOrgID
+	}
+	if IsSharedSchemaProvider(t.Provider) {
+		sharedDB, err := p.metaStore.GetSharedDBForTenant(ctx, t.ID)
+		if err != nil {
+			if !errors.Is(err, meta.ErrNotFound) {
+				logger.Warn(ctx, "tenant_pool_metric_shared_org_lookup_failed",
+					zap.String("tenant_id", t.ID),
+					zap.Error(err))
+			}
+			return defaultTenantMetricTiDBCloudOrgID
+		}
+		orgID := strings.TrimSpace(sharedDB.TiDBCloudOrganizationID)
+		if orgID == "" {
+			return defaultTenantMetricTiDBCloudOrgID
+		}
+		return orgID
 	}
 	binding, err := p.metaStore.GetTenantTiDBCloudOrgBinding(ctx, t.ID)
 	if err != nil {

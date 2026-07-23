@@ -19,13 +19,14 @@ import (
 var errFakeMutationAlreadyApplied = errors.New("mutation already applied")
 
 type fakeMutationRecord struct {
-	tenantID   string
-	id         int64
-	typ        string
-	status     string
-	retryCount int
-	data       []byte
-	createdAt  time.Time
+	tenantID       string
+	tidbCloudOrgID string
+	id             int64
+	typ            string
+	status         string
+	retryCount     int
+	data           []byte
+	createdAt      time.Time
 }
 
 type fakeMetaQuotaStore struct {
@@ -391,12 +392,13 @@ func (f *fakeMetaQuotaStore) InsertMutationLog(ctx context.Context, entry *Mutat
 	id := f.nextID
 	f.nextID++
 	f.mutations = append(f.mutations, fakeMutationRecord{
-		tenantID:  entry.TenantID,
-		id:        id,
-		typ:       entry.MutationType,
-		status:    "pending",
-		data:      append([]byte(nil), entry.MutationData...),
-		createdAt: time.Now().UTC(),
+		tenantID:       entry.TenantID,
+		tidbCloudOrgID: entry.TiDBCloudOrgID,
+		id:             id,
+		typ:            entry.MutationType,
+		status:         "pending",
+		data:           append([]byte(nil), entry.MutationData...),
+		createdAt:      time.Now().UTC(),
 	})
 	return id, nil
 }
@@ -413,11 +415,12 @@ func (f *fakeMetaQuotaStore) ListPendingMutations(ctx context.Context, minAge ti
 			continue
 		}
 		out = append(out, MutationLogView{
-			ID:           m.id,
-			TenantID:     m.tenantID,
-			MutationType: m.typ,
-			MutationData: append([]byte(nil), m.data...),
-			RetryCount:   m.retryCount,
+			ID:             m.id,
+			TenantID:       m.tenantID,
+			TiDBCloudOrgID: m.tidbCloudOrgID,
+			MutationType:   m.typ,
+			MutationData:   append([]byte(nil), m.data...),
+			RetryCount:     m.retryCount,
 		})
 		if len(out) >= limit {
 			break
@@ -439,7 +442,7 @@ func (f *fakeMetaQuotaStore) ObservePendingMutations(ctx context.Context) ([]Mut
 		}
 		obs := byTenant[m.tenantID]
 		if obs == nil {
-			obs = &MutationBacklogView{TenantID: m.tenantID}
+			obs = &MutationBacklogView{TenantID: m.tenantID, TiDBCloudOrgID: m.tidbCloudOrgID}
 			byTenant[m.tenantID] = obs
 		}
 		obs.PendingCount++
