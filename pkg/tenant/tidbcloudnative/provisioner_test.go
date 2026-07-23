@@ -112,10 +112,10 @@ func TestResolveAPIKeyIdentityUsesIAMAPI(t *testing.T) {
 		t.Fatalf("ResolveAPIKeyIdentity: %v", err)
 	}
 	if gotPath != "/v1beta1/apikeys/PROJECTOWNER1" || !strings.Contains(gotAuth, `username="PROJECTOWNER1"`) {
-		t.Fatalf("request path/auth = %q / %q", gotPath, gotAuth)
+		t.Errorf("request path/auth = %q / %q", gotPath, gotAuth)
 	}
 	if identity.OrganizationID != "1234567890123456789" || identity.Role != tenant.TiDBCloudRoleProjectOwner {
-		t.Fatalf("identity = %+v", identity)
+		t.Errorf("identity = %+v", identity)
 	}
 	loggedTrace := false
 	for _, entry := range recorded.AllUntimed() {
@@ -125,7 +125,7 @@ func TestResolveAPIKeyIdentityUsesIAMAPI(t *testing.T) {
 		}
 	}
 	if !loggedTrace {
-		t.Fatalf("IAM success access log missing trace_id %q", wantTraceID)
+		t.Errorf("IAM success access log missing trace_id %q", wantTraceID)
 	}
 }
 
@@ -294,10 +294,10 @@ func TestResolveAPIKeyIdentityRedactsAccessKeyFromTransportErrorsAndLogs(t *test
 		PublicKey: accessKey, PrivateKey: "test-private",
 	})
 	if !errors.Is(err, transportErr) {
-		t.Fatalf("error = %v, want transport error", err)
+		t.Errorf("error = %v, want transport error", err)
 	}
-	if strings.Contains(err.Error(), accessKey) {
-		t.Fatalf("returned error leaked IAM access key: %v", err)
+	if err != nil && strings.Contains(err.Error(), accessKey) {
+		t.Errorf("returned error leaked IAM access key: %v", err)
 	}
 	entries := recorded.AllUntimed()
 	if len(entries) == 0 {
@@ -305,10 +305,10 @@ func TestResolveAPIKeyIdentityRedactsAccessKeyFromTransportErrorsAndLogs(t *test
 	}
 	for _, entry := range entries {
 		if strings.Contains(fmt.Sprint(entry.ContextMap()), accessKey) {
-			t.Fatalf("log entry leaked IAM access key: %+v", entry.ContextMap())
+			t.Errorf("log entry leaked IAM access key: %+v", entry.ContextMap())
 		}
 		if got := entry.ContextMap()["trace_id"]; got != wantTraceID {
-			t.Fatalf("IAM log trace_id = %v, want %q", got, wantTraceID)
+			t.Errorf("IAM log trace_id = %v, want %q", got, wantTraceID)
 		}
 	}
 }

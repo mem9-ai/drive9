@@ -11,6 +11,10 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
+var errSharedDBCredentialOrganizationMismatch = errors.New("shared TiDB Cloud credential organization mismatch")
+
+const sharedDBCredentialOrganizationMismatchMessage = "shared mode requires the TiDB Cloud API key organization to match the configured shared credential organization"
+
 func (s *Server) resolveTiDBCloudIdentity(ctx context.Context, cred tenant.CredentialProvisionRequest, metricPath string) (*tenant.TiDBCloudAPIKeyIdentity, error) {
 	if identity, ok := s.tidbCloudRBACCache.getIdentity(cred); ok {
 		metrics.RecordTiDBCloudRBACCacheRequest(metricPath, "role", "hit")
@@ -88,7 +92,7 @@ func (s *Server) sharedDBCloudCredentials(ctx context.Context, organizationID st
 	}
 	if strings.TrimSpace(organizationID) != "" && strings.TrimSpace(organizationID) != meta.SharedDBOrgWildcard &&
 		identity.OrganizationID != strings.TrimSpace(organizationID) {
-		return tenant.CredentialProvisionRequest{}, fmt.Errorf("shared TiDB Cloud credential organization %q does not match pool organization %q", identity.OrganizationID, organizationID)
+		return tenant.CredentialProvisionRequest{}, errSharedDBCredentialOrganizationMismatch
 	}
 	return cred, nil
 }

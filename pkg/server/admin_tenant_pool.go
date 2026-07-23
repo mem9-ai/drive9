@@ -157,6 +157,17 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 			"provider", tenant.ProviderTiDBCloudNative,
 			"organization_id", orgID,
 			"duration_ms", durationMillis(stageStarted))...)
+		if s.defaultTenantProvider == tenant.ProviderTiDBCloudNativeShared {
+			if _, err := s.sharedDBCloudCredentials(ctx, orgID); err != nil {
+				metricResult = "cluster_error"
+				if errors.Is(err, errSharedDBCredentialOrganizationMismatch) {
+					errJSON(w, http.StatusForbidden, sharedDBCredentialOrganizationMismatchMessage)
+				} else {
+					writeAdminTiDBCloudError(w, ctx, err, "authorize shared tenant pool")
+				}
+				return nil
+			}
+		}
 		if orgID != "" {
 			if _, err := s.meta.GetTenantPoolByOrganization(ctx, orgID); err == nil {
 				metricResult = "conflict"

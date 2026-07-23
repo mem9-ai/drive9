@@ -60,6 +60,7 @@ type fakeProvisioner struct {
 	iamMu                   sync.Mutex
 	iamCredentials          []tenant.CredentialProvisionRequest
 	identityOrg             string
+	identityOrgs            map[string]string
 	identityRole            string
 	managedClusters         []tenant.CloudClusterInfo
 	sharedPoolResults       []*tenant.SharedDBPoolInfo
@@ -116,6 +117,11 @@ func (f *fakeProvisioner) ResolveAPIKeyIdentity(_ context.Context, req tenant.Cr
 	f.iamCredentials = append(f.iamCredentials, req)
 	f.iamMu.Unlock()
 	orgID := f.identityOrg
+	if f.identityOrgs != nil {
+		if mapped, ok := f.identityOrgs[req.PublicKey]; ok {
+			orgID = mapped
+		}
+	}
 	if orgID == "" && f.cluster != nil {
 		orgID = f.cluster.OrganizationID
 	}
@@ -251,6 +257,78 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 		iamCredentials[0].PublicKey != "public" || iamCredentials[0].PrivateKey != "private" ||
 		iamCredentials[1].PublicKey != "shared-public" || iamCredentials[1].PrivateKey != "shared-private" {
 		t.Fatalf("IAM credentials = %+v, want customer authorization followed by shared physical authorization", iamCredentials)
+	}
+}
+
+func TestProvisionTiDBCloudNativeSharedRejectsDifferentCustomerAndSharedOrganizations(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+	pool.SetMetaStore(metaStore)
+	prov := &fakeProvisioner{
+		provider:                tenant.ProviderTiDBCloudNative,
+		defaultPublicKey:        "customer-public",
+		defaultPrivateKey:       "customer-private",
+		defaultSharedPublicKey:  "shared-public",
+		defaultSharedPrivateKey: "shared-private",
+		identityOrgs: map[string]string{
+			"customer-public": "org-customer",
+			"shared-public":   "org-shared",
+		},
+	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewWithConfig(Config{
+		Meta: metaStore, Pool: pool, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: secret,
+	})
+	defer srv.Close()
+
+	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{
+		CredentialProvisioner: &tenant.CredentialProvisionRequest{PublicKey: "customer-public", PrivateKey: "customer-private"},
+	})
+	if err == nil {
+		t.Fatal("provisionTenant succeeded, want organization mismatch rejection")
+	}
+	var provisionErr *provisionTenantError
+	if !errors.As(err, &provisionErr) {
+		t.Fatalf("error = %T %v, want provisionTenantError", err, err)
+	}
+	if provisionErr.status != http.StatusForbidden || provisionErr.message != sharedDBCredentialOrganizationMismatchMessage {
+		t.Errorf("provision error = status %d message %q, want 403 and stable mismatch message", provisionErr.status, provisionErr.message)
+	}
+	if strings.Contains(err.Error(), "org-customer") || strings.Contains(err.Error(), "org-shared") {
+		t.Errorf("organization IDs leaked in error: %v", err)
+	}
+	var tenants int
+	if err := metaStore.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM tenants").Scan(&tenants); err != nil {
+		t.Fatalf("count tenants: %v", err)
+	}
+	if tenants != 0 {
+		t.Errorf("tenant rows = %d, want 0 after fail-fast rejection", tenants)
+	}
+	var pools int
+	if err := metaStore.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM db_pool").Scan(&pools); err != nil {
+		t.Fatalf("count db_pool rows: %v", err)
+	}
+	if pools != 0 {
+		t.Errorf("db_pool rows = %d, want 0 after fail-fast rejection", pools)
 	}
 }
 
