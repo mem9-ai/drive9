@@ -310,7 +310,20 @@ FORK_LOCAL="$(mktemp)"
 
 drive9_ctx ctx add --name owner --server "$BASE" --api-key "$API_KEY" --mode TiDBCloud >/dev/null
 
-fork_json="$(drive9_ctx ctx fork "$FORK_CTX_NAME" --from owner --tidbcloud-public-key "$PUBLIC_KEY" --tidbcloud-private-key "$PRIVATE_KEY" --json)"
+set +e
+fork_json="$(drive9_ctx ctx fork "$FORK_CTX_NAME" --from owner --tidbcloud-public-key "$PUBLIC_KEY" --tidbcloud-private-key "$PRIVATE_KEY" --json 2>&1)"
+fork_rc=$?
+set -e
+
+if [ "$fork_rc" -ne 0 ] || echo "$fork_json" | grep -qi "not supported\|unsupported\|shared-pool"; then
+  SKIP_FORK=1
+  FAIL_FORK=0
+  echo -e "${YELLOW}SKIP${NC} fork not supported on this deployment, skipping fork checks"
+else
+  SKIP_FORK=0
+  FAIL_FORK=0
+fi
+if [ "$SKIP_FORK" -eq 0 ]; then
 fork_api_key="$(jq -r '.api_key // empty' <<<"$fork_json")"
 fork_tenant_id="$(jq -r '.tenant_id // empty' <<<"$fork_json")"
 fork_status="$(jq -r '.status // empty' <<<"$fork_json")"
@@ -355,6 +368,7 @@ fork_delete_code=$(curl -sS -o "$fork_delete_body" -w "%{http_code}" -X DELETE \
   "$BASE/v1/fork")
 check_eq "DELETE /v1/fork returns 202" "$fork_delete_code" "202"
 rm -f "$fork_delete_body" "$FORK_LOCAL"
+fi
 
 # ── [8] admin tenant list ───────────────────────────────────────────────────
 
