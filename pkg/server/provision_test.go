@@ -180,8 +180,9 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 		provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1",
 		defaultPublicKey: "public", defaultPrivateKey: "private",
 		defaultSharedPublicKey: "shared-public", defaultSharedPrivateKey: "shared-private",
+		identityOrg: "customer-org",
 		sharedPoolResults: []*tenant.SharedDBPoolInfo{{
-			ClusterID: "cluster-shared", OrganizationID: "org-shared", Password: "root-pass", DBName: "tidbcloud_fs",
+			ClusterID: "cluster-shared", OrganizationID: "physical-org", Password: "root-pass", DBName: "tidbcloud_fs",
 		}},
 	}
 	tokenSecret := make([]byte, 32)
@@ -204,8 +205,8 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 	if res.Provider != tenant.ProviderTiDBCloudNativeShared || res.Status != meta.TenantProvisioning {
 		t.Fatalf("result = provider %q status %q, want shared/provisioning", res.Provider, res.Status)
 	}
-	if res.OrganizationID != "org-shared" {
-		t.Fatalf("organization ID = %q, want org-shared", res.OrganizationID)
+	if res.OrganizationID != "customer-org" {
+		t.Fatalf("organization ID = %q, want customer-org", res.OrganizationID)
 	}
 	tenantRow, err := metaStore.GetTenant(context.Background(), res.TenantID)
 	if err != nil {
@@ -228,6 +229,9 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 	}
 	if dbPool.MaxTenants != 100 || dbPool.TenantCount != 1 || dbPool.SpendingLimit == nil || *dbPool.SpendingLimit != meta.MaxTiDBCloudSpendingLimit {
 		t.Fatalf("managed pool policy = %+v", dbPool)
+	}
+	if dbPool.TiDBCloudOrganizationID != "customer-org" {
+		t.Fatalf("managed pool organization ID = %q, want customer-org", dbPool.TiDBCloudOrganizationID)
 	}
 	quota, err := metaStore.GetQuotaConfig(context.Background(), res.TenantID)
 	if err != nil {
