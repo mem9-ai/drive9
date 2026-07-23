@@ -454,7 +454,7 @@ func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request,
 	rc, err := b.OpenFSLayerEntryData(r.Context(), entry)
 	if err != nil {
 		logger.Error(r.Context(), "fs_layer_object_read_failed", eventFields(r.Context(), "fs_layer_object_read_failed", "path", entry.Path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	defer func() { _ = rc.Close() }()
@@ -520,7 +520,7 @@ func (s *Server) handleFSLayerObjectUpload(w http.ResponseWriter, r *http.Reques
 	entry, err := b.PutFSLayerObject(r.Context(), layer.LayerID, prepared.Path, body, size)
 	if err != nil {
 		logger.Error(r.Context(), "fs_layer_object_upload_failed", eventFields(r.Context(), "fs_layer_object_upload_failed", "path", prepared.Path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	entry.LayerID = layer.LayerID
@@ -731,7 +731,7 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	if err := validateFSLayerCommitSnapshots(snapshots); err != nil {
 		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		logger.Error(r.Context(), "fs_layer_commit_validate_failed", eventFields(r.Context(), "fs_layer_commit_validate_failed", "layer_id", layer.LayerID, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(r.Context()), fsLayerRollbackTimeout)
@@ -744,11 +744,11 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 			_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 			if rollbackErr != nil {
 				logger.Error(r.Context(), "fs_layer_commit_apply_failed", eventFields(r.Context(), "fs_layer_commit_apply_failed", "path", entries[i].Path, "error", err, "rollback_error", rollbackErr)...)
-				errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+				writeBackendError(w, r, err)
 				return
 			}
 			logger.Error(r.Context(), "fs_layer_commit_apply_failed", eventFields(r.Context(), "fs_layer_commit_apply_failed", "path", entries[i].Path, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+			writeBackendError(w, r, err)
 			return
 		}
 		markFSLayerEntryTouched(touchedPaths, &entries[i])
@@ -758,11 +758,11 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		if rollbackErr != nil {
 			logger.Error(r.Context(), "fs_layer_commit_finalize_failed", eventFields(r.Context(), "fs_layer_commit_finalize_failed", "layer_id", layer.LayerID, "error", err, "rollback_error", rollbackErr)...)
-			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+			writeBackendError(w, r, err)
 			return
 		}
 		logger.Error(r.Context(), "fs_layer_commit_finalize_failed", eventFields(r.Context(), "fs_layer_commit_finalize_failed", "layer_id", layer.LayerID, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1683,7 +1683,7 @@ func writeFSLayerStoreError(w http.ResponseWriter, r *http.Request, err error) {
 		return
 	}
 	logger.Error(r.Context(), "fs_layer_store_error", eventFields(r.Context(), "fs_layer_store_error", "error", err)...)
-	errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+	writeBackendError(w, r, err)
 }
 
 func toFSLayerResponse(layer *datastore.FSLayer) fsLayerResponse {

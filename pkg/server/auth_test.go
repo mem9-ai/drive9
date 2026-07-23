@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -729,6 +730,78 @@ func TestSanitizeClientError_Fallback(t *testing.T) {
 		if got != "backend unavailable" {
 			t.Fatalf("input=%q: got %q, want %q", tc, got, "backend unavailable")
 		}
+	}
+	// Non-quota 1105 wrapped with "quota" in prefix should not be classified as quota error.
+	err := fmt.Errorf("set quota config for tenant: Error 1105 (HY000): connection refused")
+	if got := sanitizeClientError(err); got != "backend unavailable" {
+		t.Errorf("non-quota 1105 with quota prefix: got %q, want %q", got, "backend unavailable")
+	}
+}
+
+func TestBackendErrorStatus(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{
+			name: "client canceled context",
+			err:  context.Canceled,
+			want: statusClientClosedRequest,
+		},
+		{
+			name: "deadline exceeded",
+			err:  context.DeadlineExceeded,
+			want: http.StatusGatewayTimeout,
+		},
+		{
+			name: "tidb quota error 1105",
+			err:  fmt.Errorf("open db: Error 1105 (HY000): Due to the usage quota being exhausted"),
+			want: http.StatusPaymentRequired,
+		},
+		{
+			name: "tidb quota error lower case",
+			err:  fmt.Errorf("error 1105 (hy000): quota limit reached"),
+			want: http.StatusPaymentRequired,
+		},
+		{
+			name: "non-quota 1105 wrapped with quota prefix",
+			err:  fmt.Errorf("set quota config for tenant: Error 1105 (HY000): connection refused"),
+			want: http.StatusInternalServerError,
+		},
+		{
+			name: "schema migration error",
+			err:  fmt.Errorf("migrate split tables: Error 1146: Table doesn't exist"),
+			want: http.StatusBadGateway,
+		},
+		{
+			name: "unknown error",
+			err:  fmt.Errorf("some random error"),
+			want: http.StatusInternalServerError,
+		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: http.StatusInternalServerError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			switch {
+			case errors.Is(tt.err, context.Canceled):
+				c, cancel := context.WithCancel(context.Background())
+				cancel()
+				ctx = c
+			case errors.Is(tt.err, context.DeadlineExceeded):
+				c, cancel := context.WithTimeout(context.Background(), 0)
+				cancel()
+				ctx = c
+			}
+			if got := backendErrorStatus(ctx, tt.err); got != tt.want {
+				t.Errorf("backendErrorStatus() = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }
 

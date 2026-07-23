@@ -458,13 +458,14 @@ func (s *Server) handleSlockCallback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "slock_tenant_provision_failed", "error", err)...)
+		status := backendErrorStatus(r.Context(), err)
 		if wantsJSON(r) {
-			errJSON(w, http.StatusInternalServerError, "slock tenant provision failed")
+			errJSON(w, status, "slock tenant provision failed")
 			return
 		}
 		setSlockCallbackNoStoreHeaders(w)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(status)
 		_, _ = fmt.Fprint(w, "<!doctype html><html><body style='font-family:sans-serif;padding:40px;text-align:center;background:#0a0908;color:#ede8e0'><h1>Provisioning Error</h1><p style='color:#c75050'>slock tenant provision failed</p></body></html>")
 		return
 	}

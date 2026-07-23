@@ -93,7 +93,7 @@ func (s *Server) handleVaultSecrets(w http.ResponseWriter, r *http.Request, sub 
 			return
 		}
 		logger.Error(r.Context(), "vault_secrets_store_failed", eventFields(r.Context(), "vault_secrets_store_failed", "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	scope := ScopeFromContext(r.Context())
@@ -200,7 +200,7 @@ func (s *Server) handleVaultSecretCreate(w http.ResponseWriter, r *http.Request,
 				"tenant_id", tenantID,
 				"secret_name", req.Name,
 				"error", err.Error())...)
-		errJSON(w, http.StatusInternalServerError, "failed to create secret")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to create secret")
 		return
 	}
 
@@ -223,7 +223,7 @@ func (s *Server) handleVaultSecretList(w http.ResponseWriter, r *http.Request, v
 	secrets, err := vs.ListSecrets(r.Context(), tenantID)
 	if err != nil {
 		result = "error"
-		errJSON(w, http.StatusInternalServerError, "failed to list secrets")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to list secrets")
 		return
 	}
 	if secrets == nil {
@@ -246,7 +246,7 @@ func (s *Server) handleVaultSecretGet(w http.ResponseWriter, r *http.Request, vs
 			return
 		}
 		result = "error"
-		errJSON(w, http.StatusInternalServerError, "failed to get secret")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to get secret")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -268,7 +268,7 @@ func (s *Server) handleVaultSecretReadValue(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		result = "error"
-		errJSON(w, http.StatusInternalServerError, "failed to read secret")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to read secret")
 		return
 	}
 
@@ -316,7 +316,7 @@ func (s *Server) handleVaultSecretReadField(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		result = "error"
-		errJSON(w, http.StatusInternalServerError, "failed to read field")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to read field")
 		return
 	}
 
@@ -375,7 +375,7 @@ func (s *Server) handleVaultSecretUpdate(w http.ResponseWriter, r *http.Request,
 				"tenant_id", tenantID,
 				"secret_name", name,
 				"error", err.Error())...)
-		errJSON(w, http.StatusInternalServerError, "failed to update secret")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to update secret")
 		return
 	}
 
@@ -402,7 +402,7 @@ func (s *Server) handleVaultSecretDelete(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		result = "error"
-		errJSON(w, http.StatusInternalServerError, "failed to delete secret")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to delete secret")
 		return
 	}
 
@@ -426,7 +426,7 @@ func (s *Server) handleVaultTokens(w http.ResponseWriter, r *http.Request, sub s
 			return
 		}
 		logger.Error(r.Context(), "vault_tokens_store_failed", eventFields(r.Context(), "vault_tokens_store_failed", "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	scope := ScopeFromContext(r.Context())
@@ -489,7 +489,7 @@ func (s *Server) handleVaultTokenIssue(w http.ResponseWriter, r *http.Request, v
 	tokenStr, capToken, err := vs.IssueCapToken(r.Context(), tenantID, req.AgentID, req.TaskID, req.Scope, ttl)
 	if err != nil {
 		result = "error"
-		errJSON(w, http.StatusInternalServerError, "failed to issue token")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to issue token")
 		return
 	}
 
@@ -533,7 +533,7 @@ func (s *Server) handleVaultTokenRevoke(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		result = "error"
-		errJSON(w, http.StatusInternalServerError, "failed to revoke token")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to revoke token")
 		return
 	}
 
@@ -568,7 +568,7 @@ func (s *Server) handleVaultGrants(w http.ResponseWriter, r *http.Request, sub s
 			return
 		}
 		logger.Error(r.Context(), "vault_grants_store_failed", eventFields(r.Context(), "vault_grants_store_failed", "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	scope := ScopeFromContext(r.Context())
@@ -641,10 +641,11 @@ func (s *Server) handleVaultGrantIssue(w http.ResponseWriter, r *http.Request, v
 	if err != nil {
 		// IssueGrant returns user-visible validation errors (bad scope /
 		// enum / agent / issuer); map them to 400. Internal DB errors
-		// surface the same way but prefixed "insert grant:" — map to 500.
+		// surface the same way but prefixed "insert grant:" — map to
+		// backend error status.
 		if strings.HasPrefix(err.Error(), "insert grant") {
 			result = "error"
-			errJSON(w, http.StatusInternalServerError, "failed to issue grant")
+			errJSON(w, backendErrorStatus(r.Context(), err), "failed to issue grant")
 			return
 		}
 		result = "invalid_argument"
@@ -702,7 +703,7 @@ func (s *Server) handleVaultGrantRevoke(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		result = "error"
-		errJSON(w, http.StatusInternalServerError, "failed to revoke grant")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to revoke grant")
 		return
 	}
 
@@ -753,7 +754,7 @@ func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
 		}
 		result = "error"
 		logger.Error(r.Context(), "vault_audit_store_failed", eventFields(r.Context(), "vault_audit_store_failed", "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 
@@ -768,7 +769,7 @@ func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
 	events, err := vs.QueryAuditLog(r.Context(), auditTenantID, secretName, limit)
 	if err != nil {
 		result = "error"
-		errJSON(w, http.StatusInternalServerError, "failed to query audit log")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to query audit log")
 		return
 	}
 	if events == nil {
@@ -971,7 +972,7 @@ func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, v
 			return
 		}
 		result = "error"
-		errJSON(w, http.StatusInternalServerError, "failed to read secret")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to read secret")
 		return
 	}
 
@@ -1047,7 +1048,7 @@ func (s *Server) handleVaultReadField(w http.ResponseWriter, r *http.Request, vs
 			return
 		}
 		result = "error"
-		errJSON(w, http.StatusInternalServerError, "failed to read field")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to read field")
 		return
 	}
 

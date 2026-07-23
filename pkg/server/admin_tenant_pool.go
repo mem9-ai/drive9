@@ -81,13 +81,13 @@ func adminTenantPoolError(status int, message string) error {
 	return &adminTenantPoolHTTPError{status: status, message: message}
 }
 
-func writeAdminTenantPoolError(w http.ResponseWriter, err error) {
+func writeAdminTenantPoolError(w http.ResponseWriter, r *http.Request, err error) {
 	var httpErr *adminTenantPoolHTTPError
 	if errors.As(err, &httpErr) {
 		errJSON(w, httpErr.status, httpErr.message)
 		return
 	}
-	errJSON(w, http.StatusInternalServerError, err.Error())
+	writeBackendError(w, r, err)
 }
 
 func (s *Server) adminTenantPoolHandler() http.Handler {
@@ -164,7 +164,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 				return nil
 			} else if !errors.Is(err, meta.ErrNotFound) {
 				metricResult = "error"
-				errJSON(w, http.StatusInternalServerError, "tenant pool lookup failed")
+				errJSON(w, backendErrorStatus(r.Context(), err), "tenant pool lookup failed")
 				return nil
 			}
 		}
@@ -185,7 +185,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 				return nil
 			}
 			metricResult = "error"
-			errJSON(w, http.StatusInternalServerError, "failed to persist tenant pool")
+			errJSON(w, backendErrorStatus(r.Context(), err), "failed to persist tenant pool")
 			return nil
 		}
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_create_pool_persisted",
@@ -237,7 +237,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 						return nil
 					}
 					metricResult = "error"
-					errJSON(w, http.StatusInternalServerError, "failed to update tenant pool organization")
+					errJSON(w, backendErrorStatus(r.Context(), err), "failed to update tenant pool organization")
 					return nil
 				}
 				logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_create_org_persisted",
@@ -287,7 +287,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 			"duration_ms", durationMillis(createStarted),
 			"error", err)...)
 		metricResult = adminTenantPoolMetricResult(err)
-		writeAdminTenantPoolError(w, err)
+		writeAdminTenantPoolError(w, r, err)
 		return
 	}
 }
@@ -304,7 +304,7 @@ func (s *Server) handleAdminTenantPoolGet(w http.ResponseWriter, r *http.Request
 	}
 	freeSize, slotSize, err := s.tenantPoolSizes(r.Context(), pool.OrganizationID)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		writeBackendError(w, r, err)
 		return
 	}
 	s.recordTenantPoolCapacity(pool.PoolID, pool.OrganizationID, pool.Size, freeSize)
@@ -499,7 +499,7 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 			"target_pool_size", *req.PoolSize,
 			"duration_ms", durationMillis(updateStarted),
 			"error", err)...)
-		writeAdminTenantPoolError(w, err)
+		writeAdminTenantPoolError(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_update_done",
@@ -628,7 +628,7 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 			"duration_ms", durationMillis(deleteStarted),
 			"error", err)...)
 		metricResult = adminTenantPoolMetricResult(err)
-		writeAdminTenantPoolError(w, err)
+		writeAdminTenantPoolError(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_delete_done",
@@ -659,7 +659,7 @@ func (s *Server) authorizedTenantPool(w http.ResponseWriter, r *http.Request, cr
 			errJSON(w, http.StatusNotFound, "tenant pool not found")
 			return nil, false
 		}
-		errJSON(w, http.StatusInternalServerError, "tenant pool lookup failed")
+		errJSON(w, backendErrorStatus(r.Context(), err), "tenant pool lookup failed")
 		return nil, false
 	}
 	return pool, true

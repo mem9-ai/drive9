@@ -1740,7 +1740,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		metricEvent(r.Context(), "auth", "result", "meta_backend_error")
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_meta_unavailable", "error", err)...)
-		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
+		errJSON(w, backendErrorStatus(r.Context(), err), "auth backend unavailable")
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(token.HashToken(tok)), []byte(resolved.APIKey.JWTHash)) != 1 {
@@ -1760,7 +1760,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		metricEvent(r.Context(), "auth", "result", "decrypt_failed")
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_decrypt_failed", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
+		errJSON(w, backendErrorStatus(r.Context(), err), "auth backend unavailable")
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(tok), plain) != 1 {
@@ -1951,7 +1951,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "read_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_read", "result", "error")
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 
@@ -2012,7 +2012,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "list_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "list", "result", "error")
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	metricEvent(r.Context(), "userdb_query", "api", "list", "result", "ok")
@@ -2111,7 +2111,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 
@@ -2125,7 +2125,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	nlink, err := nodeLinkCount(r.Context(), b, nf)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_refcount_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	if nf.File != nil {
@@ -2145,7 +2145,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 		tags, err = b.Store().GetFileTags(r.Context(), nf.File.FileID)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_load_tags_failed", "path", path, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+			writeBackendError(w, r, err)
 			return
 		}
 	} else {
@@ -2297,7 +2297,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_upload_initiate_failed", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
-			errJSONInternalStorage(w)
+			errJSONInternalStorage(w, r, err)
 			return
 		}
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_upload_initiated", "path", path, "parts", len(plan.Parts))...)
@@ -2374,7 +2374,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_ok", "path", path, "bytes", len(data))...)
@@ -2553,7 +2553,7 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_patch", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 
@@ -2651,7 +2651,7 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "append_upload_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_append", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 
@@ -2932,12 +2932,12 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 	backendResults, err := b.BatchWriteCtx(r.Context(), backendItems)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "batch_write_failed", "error", err)...)
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 	if len(backendResults) != len(allowedIndexes) {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "batch_write_result_count_mismatch", "expected", len(allowedIndexes), "got", len(backendResults))...)
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, fmt.Errorf("batch write result count mismatch: expected %d, got %d", len(allowedIndexes), len(backendResults)))
 		return
 	}
 
@@ -3236,7 +3236,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "kind", kind, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive, "kind", kind)...)
@@ -3276,7 +3276,7 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "copy_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "copy_ok", "src_path", srcPath, "dst_path", dstPath)...)
@@ -3320,7 +3320,7 @@ func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath 
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "hardlink_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "hardlink_ok", "src_path", srcPath, "dst_path", dstPath)...)
@@ -3364,7 +3364,7 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "rename_failed", "old_path", oldPath, "new_path", newPath, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "rename_ok", "old_path", oldPath, "new_path", newPath)...)
@@ -3398,7 +3398,7 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "mkdir_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "mkdir_ok", "path", path)...)
@@ -3440,7 +3440,7 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "chmod_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "chmod_ok", "path", path)...)
@@ -3467,7 +3467,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "create_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "create_ok", "path", path)...)
@@ -3529,7 +3529,7 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "symlink_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "symlink_ok", "path", path)...)
@@ -3581,7 +3581,7 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	metricEvent(r.Context(), "metadb_query", "api", "uploads_list", "result", "ok")
@@ -3714,7 +3714,7 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_failed", "path", req.Path, "error", err)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_ok", "path", req.Path, "parts", len(plan.Parts))...)
@@ -3788,7 +3788,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_failed", "upload_id", uploadID, "error", err)...)
 			metricEvent(r.Context(), "upload_complete", "result", "error")
-			errJSONInternalStorage(w)
+			errJSONInternalStorage(w, r, err)
 			return
 		}
 	}
@@ -3829,7 +3829,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_failed", "upload_id", uploadID, "error", err)...)
 		metricEvent(r.Context(), "upload_complete", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_ok", "upload_id", uploadID)...)
@@ -3886,7 +3886,7 @@ func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uplo
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_failed", "upload_id", uploadID, "error", err)...)
 		metricEvent(r.Context(), "upload_resume", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_ok", "upload_id", uploadID, "parts", len(plan.Parts))...)
@@ -4058,7 +4058,7 @@ func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploa
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_abort_failed", "upload_id", uploadID, "error", err)...)
 		metricEvent(r.Context(), "upload_abort", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_abort_ok", "upload_id", uploadID)...)
@@ -4180,7 +4180,7 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_failed", "path", req.Path, "error", err)...)
 		metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_ok", "path", req.Path, "part_size", plan.PartSize, "total_parts", plan.TotalParts)...)
@@ -4241,7 +4241,7 @@ func (s *Server) handleV2PresignPart(w http.ResponseWriter, r *http.Request, upl
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_part_failed", "upload_id", uploadID, "part_number", req.PartNumber, "error", err)...)
 		metricEvent(r.Context(), "v2_presign_part", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_part_ok", "upload_id", uploadID, "part_number", req.PartNumber)...)
@@ -4297,7 +4297,7 @@ func (s *Server) handleV2PresignBatch(w http.ResponseWriter, r *http.Request, up
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_failed", "upload_id", uploadID, "error", err)...)
 		metricEvent(r.Context(), "v2_presign_batch", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_ok", "upload_id", uploadID, "count", len(urls))...)
@@ -4353,7 +4353,7 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_failed", "upload_id", uploadID, "error", err)...)
 		metricEvent(r.Context(), "v2_upload_complete", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 	if err := b.ConfirmUploadV2WithTags(r.Context(), uploadID, req.Parts, req.Tags); err != nil {
@@ -4394,7 +4394,7 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_failed", "upload_id", uploadID, "error", err)...)
 		metricEvent(r.Context(), "v2_upload_complete", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_ok", "upload_id", uploadID)...)
@@ -4420,7 +4420,7 @@ func (s *Server) handleV2UploadAbort(w http.ResponseWriter, r *http.Request, upl
 	if err := b.AbortUploadV2(r.Context(), uploadID); err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_abort_failed", "upload_id", uploadID, "error", err)...)
 		metricEvent(r.Context(), "v2_upload_abort", "result", "error")
-		errJSONInternalStorage(w)
+		errJSONInternalStorage(w, r, err)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_abort_ok", "upload_id", uploadID)...)
@@ -4548,7 +4548,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, pe.status, pe.message)
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, "failed to provision tenant")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to provision tenant")
 		return
 	}
 	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
@@ -5938,8 +5938,8 @@ func errJSONInvalidRootDentry(w http.ResponseWriter, err error) bool {
 
 const internalStorageErrorMessage = "storage backend unavailable; contact support"
 
-func errJSONInternalStorage(w http.ResponseWriter) {
-	errJSON(w, http.StatusInternalServerError, internalStorageErrorMessage)
+func errJSONInternalStorage(w http.ResponseWriter, r *http.Request, err error) {
+	errJSON(w, backendErrorStatus(r.Context(), err), internalStorageErrorMessage)
 }
 
 func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request) {
@@ -6014,14 +6014,14 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_failed", "path", path, "query_len", len(query), "limit", limit, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "grep", "result", "error")
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	if layerRef := strings.TrimSpace(r.URL.Query().Get("layer")); layerRef != "" {
 		results, err = overlayFSLayerGrep(r.Context(), b, layerRef, query, path, limit, results)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_layer_failed", "path", path, "query_len", len(query), "limit", limit, "layer", layerRef, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+			writeBackendError(w, r, err)
 			return
 		}
 	}
@@ -6098,14 +6098,14 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "find_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "find", "result", "error")
-		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+		writeBackendError(w, r, err)
 		return
 	}
 	if layerRef := strings.TrimSpace(q.Get("layer")); layerRef != "" {
 		results, err = overlayFSLayerFind(r.Context(), b, layerRef, f, results)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "find_layer_failed", "path", path, "layer", layerRef, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+			writeBackendError(w, r, err)
 			return
 		}
 	}

@@ -834,7 +834,7 @@ func writeGitWorkspaceStoreError(w http.ResponseWriter, r *http.Request, err err
 		return
 	}
 	logger.Error(r.Context(), "git_workspace_store_error", eventFields(r.Context(), "git_workspace_store_error", "error", err)...)
-	errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+	writeBackendError(w, r, err)
 }
 
 func toGitWorkspaceResponse(ws *datastore.GitWorkspace) gitWorkspaceResponse {

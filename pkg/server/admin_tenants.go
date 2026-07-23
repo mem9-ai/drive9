@@ -233,7 +233,7 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 			errJSON(w, pe.status, pe.message)
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, "failed to provision tenant")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to provision tenant")
 		return
 	}
 	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
@@ -279,7 +279,7 @@ func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {
 	includeQuota := parseBoolQuery(r, "include_quota")
 	rows, err := s.meta.ListTenantsByTiDBCloudResources(r.Context(), authorizedBindings, offset, pageSize+1)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "tenant list failed")
+		errJSON(w, backendErrorStatus(r.Context(), err), "tenant list failed")
 		return
 	}
 	nextPage := 0
@@ -312,7 +312,7 @@ func (s *Server) handleAdminTenantGet(w http.ResponseWriter, r *http.Request, te
 	quota, err := s.loadAdminTenantQuotaSummary(r.Context(), t)
 	if err != nil {
 		logger.Warn(r.Context(), "admin_tenant_quota_lookup_failed", zap.String("tenant_id", t.ID), zap.Error(err))
-		errJSON(w, http.StatusInternalServerError, "quota lookup failed")
+		errJSON(w, backendErrorStatus(r.Context(), err), "quota lookup failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, s.adminTenantResponse(t, binding, quota))
@@ -394,7 +394,7 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 	if t.StorageNamespaceID != "" {
 		hasFork, err := s.meta.NamespaceHasNonDeletedFork(r.Context(), t.StorageNamespaceID)
 		if err != nil {
-			errJSON(w, http.StatusInternalServerError, "failed to check tenant forks")
+			errJSON(w, backendErrorStatus(r.Context(), err), "failed to check tenant forks")
 			return
 		}
 		if hasFork {
@@ -405,7 +405,7 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 	if t.Status == meta.TenantDeleting {
 		hasJob, err := s.meta.TenantDeleteJobExists(r.Context(), t.ID)
 		if err != nil {
-			errJSON(w, http.StatusInternalServerError, "failed to check tenant delete cleanup")
+			errJSON(w, backendErrorStatus(r.Context(), err), "failed to check tenant delete cleanup")
 			return
 		}
 		if hasJob {
@@ -426,7 +426,7 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 	if t.Status != meta.TenantDeleting {
 		updated, err := s.meta.UpdateTenantStatusIf(r.Context(), t.ID, t.Status, meta.TenantDeleting)
 		if err != nil {
-			errJSON(w, http.StatusInternalServerError, "failed to mark tenant deleting")
+			errJSON(w, backendErrorStatus(r.Context(), err), "failed to mark tenant deleting")
 			return
 		}
 		if !updated {
@@ -438,7 +438,7 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 		if t.Status != meta.TenantDeleting {
 			_, _ = s.meta.UpdateTenantStatusIf(r.Context(), t.ID, meta.TenantDeleting, t.Status)
 		}
-		errJSON(w, http.StatusInternalServerError, "failed to drain tenant backend")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to drain tenant backend")
 		return
 	}
 	if err := s.deprovisionTenantCluster(r.Context(), t, cred); err != nil {
@@ -452,7 +452,7 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 	_ = s.meta.AbortActiveUploadReservations(r.Context(), t.ID)
 	status, err := s.enqueueTenantDeleteJob(r.Context(), t)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "failed to enqueue tenant delete cleanup")
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to enqueue tenant delete cleanup")
 		return
 	}
 	_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
@@ -467,7 +467,7 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 			errJSON(w, http.StatusNotFound, "tenant not found")
 			return nil, nil, false
 		}
-		errJSON(w, http.StatusInternalServerError, "tenant lookup failed")
+		errJSON(w, backendErrorStatus(r.Context(), err), "tenant lookup failed")
 		return nil, nil, false
 	}
 	if t.Status == meta.TenantDeleted {
@@ -500,7 +500,7 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 			errJSON(w, http.StatusNotFound, "tenant tidbcloud organization binding not found")
 			return nil, nil, false
 		}
-		errJSON(w, http.StatusInternalServerError, "tenant organization binding lookup failed")
+		errJSON(w, backendErrorStatus(r.Context(), err), "tenant organization binding lookup failed")
 		return nil, nil, false
 	}
 	if binding.PoolStatus == meta.TenantPoolBindingFree {
@@ -655,7 +655,7 @@ func (s *Server) writeAdminQuotaResponse(w http.ResponseWriter, r *http.Request,
 	quota, err := s.loadAdminTenantQuotaSummary(r.Context(), t)
 	if err != nil {
 		logger.Warn(r.Context(), "admin_tenant_quota_lookup_failed", zap.String("tenant_id", t.ID), zap.Error(err))
-		errJSON(w, http.StatusInternalServerError, "quota lookup failed")
+		errJSON(w, backendErrorStatus(r.Context(), err), "quota lookup failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, adminQuotaResponse{
