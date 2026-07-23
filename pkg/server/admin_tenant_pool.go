@@ -1657,9 +1657,7 @@ func (s *Server) deleteFreeSharedPoolTenant(ctx context.Context, t *meta.Tenant)
 		if err != nil {
 			return err
 		}
-		connectionReady := dbPool.Status == meta.SharedDBStatusActive && dbPool.Host != "" &&
-			dbPool.Port > 0 && dbPool.User != "" && len(dbPool.PasswordCipher) > 0 && dbPool.Name != ""
-		if connectionReady {
+		if sharedDBConnectionReady(dbPool) {
 			if err := s.pool.PurgeSharedTenant(ctx, fsID, placement.DbID); err != nil {
 				return err
 			}
@@ -1918,6 +1916,8 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		return nil, nil, false, false, err
 	}
 	logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_org_lookup_done", "provider", tenant.ProviderTiDBCloudNative, "organization_id", orgID, "duration_ms", durationMillis(stageStarted))...)
+	cleanupCred := cred
+	defer s.startTenantFailedCleanupAsync(ctx, orgID, cleanupCred)
 	stageStarted = time.Now()
 	pool, err := s.meta.GetTenantPoolByOrganization(ctx, orgID)
 	if err != nil {

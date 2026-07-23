@@ -25,6 +25,13 @@ const (
 
 var errSharedDBConnectionMetadataNotReady = errors.New("shared DB pool connection metadata is not ready")
 
+func sharedDBConnectionReady(db *meta.SharedDB) bool {
+	return db != nil && db.Status == meta.SharedDBStatusActive &&
+		strings.TrimSpace(db.Host) != "" && db.Port > 0 &&
+		strings.TrimSpace(db.User) != "" && len(db.PasswordCipher) > 0 &&
+		strings.TrimSpace(db.Name) != ""
+}
+
 type defaultTiDBCloudSpendingLimitProvider interface {
 	DefaultTiDBCloudSpendingLimit() int64
 }
