@@ -28,6 +28,10 @@ func (s *Server) resolveTiDBCloudIdentity(ctx context.Context, cred tenant.Crede
 	if identity == nil || strings.TrimSpace(identity.OrganizationID) == "" {
 		return nil, fmt.Errorf("TiDB Cloud IAM identity is missing organization")
 	}
+	// Drive9's TiDB Cloud policy intentionally treats both owner roles as
+	// organization-scoped operators. The IAM lookup replaces the old
+	// cluster-list authorization path; project resource membership is not part
+	// of the local tenant ownership model.
 	if identity.Role != tenant.TiDBCloudRoleOrgOwner && identity.Role != tenant.TiDBCloudRoleProjectOwner {
 		return nil, fmt.Errorf("%w: role %q; org:owner or project:owner is required", tenant.ErrTiDBCloudRoleInsufficient, identity.Role)
 	}
@@ -38,7 +42,7 @@ func (s *Server) resolveTiDBCloudIdentity(ctx context.Context, cred tenant.Crede
 func tiDBCloudOrganizationMatches(identityOrganizationID, resourceOrganizationID string) bool {
 	identityOrganizationID = strings.TrimSpace(identityOrganizationID)
 	resourceOrganizationID = strings.TrimSpace(resourceOrganizationID)
-	return identityOrganizationID != "" && (resourceOrganizationID == identityOrganizationID || resourceOrganizationID == "*")
+	return identityOrganizationID != "" && resourceOrganizationID == identityOrganizationID
 }
 
 func (s *Server) authorizeTiDBCloudOrganization(ctx context.Context, cred tenant.CredentialProvisionRequest, resourceOrganizationID, metricPath string) (*tenant.TiDBCloudAPIKeyIdentity, error) {

@@ -1083,9 +1083,9 @@ func (f *fakeProvisioner) ListManagedClusters(_ context.Context, _ tenant.Creden
 }
 
 func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Context, requests []tenant.SharedDBPoolCreateRequest, cred tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
+	f.lastSharedCredentialReq = cred
 	f.sharedPoolBatchCalls.Add(1)
 	f.sharedPoolBatchMembers.Add(int32(len(requests)))
-	f.lastSharedCredentialReq = cred
 	if f.sharedPoolBatchStarted != nil {
 		select {
 		case f.sharedPoolBatchStarted <- struct{}{}:

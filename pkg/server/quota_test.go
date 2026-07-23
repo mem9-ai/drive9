@@ -840,19 +840,25 @@ func TestQuotaGetCachesTiDBCloudIAMRoleWithoutBackfillingSpendingLimit(t *testin
 	}
 }
 
-func TestDeprecatedQuotaGetWorksWithoutTiDBCloudOrgBinding(t *testing.T) {
+func TestQuotaGetWithoutTiDBCloudOrgBindingReturnsNotFound(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	if _, err := rt.meta.DB().Exec("DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?", rt.tenantID); err != nil {
+		t.Fatal(err)
+	}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
 	resp := getQuota(t, ts.URL, rt.tenantID, "public-1", "private-1", "")
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusNotFound {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("status = %d, want 200 without tenant-org binding: %s", resp.StatusCode, body)
+		t.Fatalf("status = %d, want 404 without tenant-org binding: %s", resp.StatusCode, body)
 	}
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("get calls = %d, want 1", got)
+	if got := rt.prov.iamCalls.Load(); got != 0 {
+		t.Fatalf("IAM calls = %d, want 0", got)
+	}
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("get calls = %d, want 0", got)
 	}
 	if got := rt.prov.listCalls.Load(); got != 0 {
 		t.Fatalf("list calls = %d, want 0", got)
@@ -1599,8 +1605,8 @@ func TestAdminTenantListFiltersByIAMOrganization(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Tenants) != 4 || out.Tenants[0].TenantID != wildcardTenantID || out.Tenants[1].TenantID != sharedTenantID || out.Tenants[2].TenantID != otherTenantID || out.Tenants[3].TenantID != rt.tenantID {
-		t.Fatalf("tenants = %#v, want all non-free tenants in IAM organization", out.Tenants)
+	if len(out.Tenants) != 3 || out.Tenants[0].TenantID != sharedTenantID || out.Tenants[1].TenantID != otherTenantID || out.Tenants[2].TenantID != rt.tenantID {
+		t.Fatalf("tenants = %#v, want non-free tenants explicitly owned by the IAM organization", out.Tenants)
 	}
 	if got := rt.prov.iamCalls.Load(); got != 1 {
 		t.Fatalf("IAM calls = %d, want 1", got)

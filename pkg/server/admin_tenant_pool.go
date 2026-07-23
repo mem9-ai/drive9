@@ -1026,21 +1026,13 @@ func (s *Server) provisionManagedSharedDBPoolsBatch(ctx context.Context, dbIDs [
 		return "", nil
 	}
 	provisioner := s.provisioner.(tenant.SharedDBPoolProvisioner)
-	first, err := s.meta.GetSharedDB(ctx, dbIDs[0])
-	if err != nil {
-		return "", err
-	}
-	cred, err := s.sharedDBCloudCredentials(ctx, first.TiDBCloudOrganizationID)
-	if err != nil {
-		return "", err
-	}
 	resolvedOrg := ""
 	for start := 0; start < len(dbIDs); start += 10 {
 		end := start + 10
 		if end > len(dbIDs) {
 			end = len(dbIDs)
 		}
-		chunkOrg, err := s.provisionManagedSharedDBPoolsBatchChunk(ctx, provisioner, dbIDs[start:end], cred)
+		chunkOrg, err := s.provisionManagedSharedDBPoolsBatchChunk(ctx, provisioner, dbIDs[start:end])
 		if err != nil {
 			return resolvedOrg, err
 		}
@@ -1051,9 +1043,13 @@ func (s *Server) provisionManagedSharedDBPoolsBatch(ctx context.Context, dbIDs [
 	return resolvedOrg, nil
 }
 
-func (s *Server) provisionManagedSharedDBPoolsBatchChunk(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) (string, error) {
+func (s *Server) provisionManagedSharedDBPoolsBatchChunk(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64) (string, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		first, err := s.meta.GetSharedDB(ctx, dbIDs[0])
+		if err != nil {
+			return "", err
+		}
+		cred, err := s.sharedDBCloudCredentials(ctx, first.TiDBCloudOrganizationID)
 		if err != nil {
 			return "", err
 		}
@@ -1065,7 +1061,7 @@ func (s *Server) provisionManagedSharedDBPoolsBatchChunk(ctx context.Context, pr
 			if err != nil {
 				return err
 			}
-			if first.TiDBCloudOrganizationID == "" && current.TiDBCloudOrganizationID != "" {
+			if strings.TrimSpace(first.TiDBCloudOrganizationID) != strings.TrimSpace(current.TiDBCloudOrganizationID) {
 				restartWithOrganization = true
 				return nil
 			}

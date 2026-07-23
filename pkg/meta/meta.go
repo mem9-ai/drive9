@@ -2614,7 +2614,7 @@ func (s *Store) ListTenantsByTiDBCloudOrganization(ctx context.Context, organiza
 		limit = 10
 	}
 	args := []any{TenantDeleted, tidbCloudNativeProvider, organizationID, TenantPoolBindingFree,
-		tidbCloudNativeSharedProvider, organizationID, SharedDBOrgWildcard, TenantPoolBindingFree, limit, offset}
+		tidbCloudNativeSharedProvider, organizationID, TenantPoolBindingFree, limit, offset}
 	query := `SELECT
 			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
@@ -2633,7 +2633,7 @@ func (s *Store) ListTenantsByTiDBCloudOrganization(ctx context.Context, organiza
 				JOIN tenant_placements p ON p.fs_id = f.fs_id
 				JOIN db_pool d ON d.db_id = p.db_id
 				WHERE f.tenant_id = t.id
-					AND d.org_id IN (?, ?)
+					AND d.org_id = ?
 					AND NOT EXISTS (
 						SELECT 1 FROM tenant_pool_memberships m
 						WHERE m.tenant_id = t.id AND m.pool_status = ?
