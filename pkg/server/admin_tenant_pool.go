@@ -1049,7 +1049,7 @@ func (s *Server) provisionManagedSharedDBPoolsBatchChunk(ctx context.Context, pr
 		if err != nil {
 			return "", err
 		}
-		cred, err := s.sharedDBCloudCredentials(ctx)
+		cred, err := s.sharedDBCloudCredentials()
 		if err != nil {
 			return "", err
 		}

@@ -192,6 +192,20 @@ func (p *Provisioner) DefaultSharedCredentials() (tenant.CredentialProvisionRequ
 	}, true
 }
 
+// ValidateSharedCredentials verifies the server-owned shared credential once
+// during startup. Shared credentials are independent from customer IAM
+// authorization and are never placed in the server's customer RBAC cache.
+func (p *Provisioner) ValidateSharedCredentials(ctx context.Context) error {
+	cred, ok := p.DefaultSharedCredentials()
+	if !ok {
+		return fmt.Errorf("shared TiDB Cloud credentials are not configured")
+	}
+	if _, err := p.ResolveAPIKeyIdentity(ctx, cred); err != nil {
+		return fmt.Errorf("validate shared TiDB Cloud credentials: %w", err)
+	}
+	return nil
+}
+
 func (p *Provisioner) ResolveAPIKeyIdentity(ctx context.Context, req tenant.CredentialProvisionRequest) (*tenant.TiDBCloudAPIKeyIdentity, error) {
 	publicKey := strings.TrimSpace(req.PublicKey)
 	privateKey := strings.TrimSpace(req.PrivateKey)

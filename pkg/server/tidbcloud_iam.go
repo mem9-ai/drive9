@@ -73,21 +73,6 @@ func (s *Server) authorizeNativeTenantCredentials(ctx context.Context, t *meta.T
 	return binding, nil
 }
 
-func (s *Server) sharedDBCloudCredentials(ctx context.Context) (tenant.CredentialProvisionRequest, error) {
-	provider, ok := s.provisioner.(tenant.SharedCredentialProvider)
-	if !ok {
-		return tenant.CredentialProvisionRequest{}, fmt.Errorf("shared TiDB Cloud credentials are not configured")
-	}
-	cred, ok := provider.DefaultSharedCredentials()
-	if !ok {
-		return tenant.CredentialProvisionRequest{}, fmt.Errorf("shared TiDB Cloud credentials are not configured")
-	}
-	if _, err := s.resolveTiDBCloudIdentity(ctx, cred, "shared_pool_role"); err != nil {
-		return tenant.CredentialProvisionRequest{}, err
-	}
-	return cred, nil
-}
-
 func isTiDBCloudRoleInsufficient(err error) bool {
 	return errors.Is(err, tenant.ErrTiDBCloudRoleInsufficient)
 }

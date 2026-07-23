@@ -86,6 +86,18 @@ func managedSharedDBDSN(info *meta.SharedDB, password string) string {
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", info.User, password, info.Host, info.Port, info.Name, query)
 }
 
+func (s *Server) sharedDBCloudCredentials() (tenant.CredentialProvisionRequest, error) {
+	provider, ok := s.provisioner.(tenant.SharedCredentialProvider)
+	if !ok {
+		return tenant.CredentialProvisionRequest{}, fmt.Errorf("shared TiDB Cloud credentials are not configured")
+	}
+	cred, ok := provider.DefaultSharedCredentials()
+	if !ok {
+		return tenant.CredentialProvisionRequest{}, fmt.Errorf("shared TiDB Cloud credentials are not configured")
+	}
+	return cred, nil
+}
+
 func generateManagedSharedDBRootPassword(length int) (string, error) {
 	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	if length <= 0 {
@@ -383,7 +395,7 @@ func (s *Server) continueManagedSharedDBPool(ctx context.Context, dbID int64) er
 		if poolInfo.ClusterID == "" {
 			return err
 		}
-		cred, credErr := s.sharedDBCloudCredentials(ctx)
+		cred, credErr := s.sharedDBCloudCredentials()
 		if credErr != nil {
 			return credErr
 		}
@@ -400,7 +412,7 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 		if err != nil {
 			return err
 		}
-		cred, err := s.sharedDBCloudCredentials(ctx)
+		cred, err := s.sharedDBCloudCredentials()
 		if err != nil {
 			return err
 		}
@@ -527,7 +539,7 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) 
 		if err != nil {
 			return nil, err
 		}
-		cred, err := s.sharedDBCloudCredentials(ctx)
+		cred, err := s.sharedDBCloudCredentials()
 		if err != nil {
 			return nil, err
 		}

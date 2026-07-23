@@ -251,10 +251,8 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 		t.Fatalf("shared physical credential = %+v, want configured shared credential", got)
 	}
 	iamCredentials := prov.iamCredentialsSnapshot()
-	if len(iamCredentials) != 2 ||
-		iamCredentials[0].PublicKey != "public" || iamCredentials[0].PrivateKey != "private" ||
-		iamCredentials[1].PublicKey != "shared-public" || iamCredentials[1].PrivateKey != "shared-private" {
-		t.Fatalf("IAM credentials = %+v, want customer authorization followed by shared physical authorization", iamCredentials)
+	if len(iamCredentials) != 1 || iamCredentials[0].PublicKey != "public" || iamCredentials[0].PrivateKey != "private" {
+		t.Fatalf("IAM credentials = %+v, want customer authorization only", iamCredentials)
 	}
 }
 

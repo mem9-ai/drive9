@@ -129,6 +129,52 @@ func TestResolveAPIKeyIdentityUsesIAMAPI(t *testing.T) {
 	}
 }
 
+func TestValidateSharedCredentialsUsesConfiguredKeyAtStartup(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		role    string
+		wantErr bool
+	}{
+		{name: "organization owner", role: tenant.TiDBCloudRoleOrgOwner},
+		{name: "project owner", role: tenant.TiDBCloudRoleProjectOwner},
+		{name: "viewer rejected", role: "org:viewer", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") == "" {
+					w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-shared-startup", qop="auth"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				gotPath = r.URL.Path
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"name": "orgs/1234567890123456789/apiKeys/111111", "accessKey": "SHAREDOWNER1", "role": tc.role,
+				})
+			}))
+			defer ts.Close()
+
+			p := &Provisioner{
+				iamURL: ts.URL, client: ts.Client(),
+				defaultSharedPublicKey: "SHAREDOWNER1", defaultSharedPrivateKey: "test-shared-private",
+			}
+			err := p.ValidateSharedCredentials(context.Background())
+			if tc.wantErr {
+				if !errors.Is(err, tenant.ErrTiDBCloudRoleInsufficient) {
+					t.Errorf("ValidateSharedCredentials error = %v, want insufficient role", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ValidateSharedCredentials: %v", err)
+			}
+			if gotPath != "/v1beta1/apikeys/SHAREDOWNER1" {
+				t.Errorf("IAM path = %q, want configured shared key", gotPath)
+			}
+		})
+	}
+}
+
 func TestResolveAPIKeyIdentityRejectsInsufficientRole(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
