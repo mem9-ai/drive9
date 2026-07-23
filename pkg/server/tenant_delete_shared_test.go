@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -311,6 +312,52 @@ func TestAdminTenantCreateRejectsSharedPoolWithoutCloudIdentity(t *testing.T) {
 	}
 }
 
+func TestAdminTenantCreatePersistsSharedQuotaSizesInBytes(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ctx := context.Background()
+	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
+		Clusters: []tenant.CloudClusterInfo{{ClusterID: "cluster-shared-quota", OrganizationID: "org-shared-quota"}},
+	}}
+	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-shared-quota", Host: "shared.example.com", Port: 4000,
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE db_pool SET cluster_id = ? WHERE db_id = ?", "cluster-shared-quota", dbID); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(rt.server)
+	t.Cleanup(ts.Close)
+	resp := postJSON(t, ts.URL+"/v1/admin/tenants", map[string]any{
+		"public_key": "pk", "private_key": "sk",
+		"max_storage_size": int64(500), "max_file_size": int64(10), "max_file_count": int64(100),
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d: %s", resp.StatusCode, http.StatusAccepted, body)
+	}
+	var out adminTenantCreateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := rt.meta.GetQuotaConfig(ctx, out.TenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxStorageBytes != 500*quotaStorageSizeBytes {
+		t.Fatalf("max storage bytes = %d, want %d", cfg.MaxStorageBytes, 500*quotaStorageSizeBytes)
+	}
+	if cfg.MaxFileSizeBytes != 10*quotaStorageSizeBytes {
+		t.Fatalf("max file size bytes = %d, want %d", cfg.MaxFileSizeBytes, 10*quotaStorageSizeBytes)
+	}
+	if cfg.MaxFileCount != 100 {
+		t.Fatalf("max file count = %d, want 100", cfg.MaxFileCount)
+	}
+}
+
 func TestAdminTenantGetAuthorizesSharedProviderThroughPhysicalPool(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
@@ -335,6 +382,16 @@ func TestAdminTenantGetAuthorizesSharedProviderThroughPhysicalPool(t *testing.T)
 		FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
 	}); err != nil {
 		t.Fatalf("UpsertTenantPlacement: %v", err)
+	}
+	metricReq := httptest.NewRequest(http.MethodGet, "/v1/admin/tenants/"+rt.tenantID, nil)
+	metricReq = metricReq.WithContext(withRequestMetricState(metricReq.Context(), &requestMetricState{}))
+	if _, _, ok := rt.server.authorizedAdminTenant(httptest.NewRecorder(), metricReq, rt.tenantID,
+		tenant.CredentialProvisionRequest{PublicKey: "pk", PrivateKey: "sk"}, true, false); !ok {
+		t.Fatal("shared admin tenant authorization failed")
+	}
+	metricTenantID, _, metricProvider, metricOrgID := requestMetricScope(metricReq.Context())
+	if metricTenantID != rt.tenantID || metricProvider != tenant.ProviderTiDBCloudNativeShared || metricOrgID != "org-shared-admin" {
+		t.Fatalf("request metric scope = tenant %q provider %q org %q", metricTenantID, metricProvider, metricOrgID)
 	}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()

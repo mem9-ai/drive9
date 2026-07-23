@@ -153,6 +153,26 @@ func TestSetRequestMetricTenantMovesInFlightLabel(t *testing.T) {
 	}
 }
 
+func TestEventFieldsDoesNotDuplicateExplicitTiDBCloudOrgID(t *testing.T) {
+	ctx := withRequestMetricState(context.Background(), &requestMetricState{})
+	setRequestMetricTenant(ctx, "tenant-a", "", "", "org-request", tenantRequestClass{surface: "status", action: "get"})
+
+	fields := eventFields(ctx, "test_event", "tidbcloud_org_id", "org-explicit")
+	count := 0
+	for _, field := range fields {
+		if field.Key != "tidbcloud_org_id" {
+			continue
+		}
+		count++
+		if field.String != "org-explicit" {
+			t.Fatalf("tidbcloud_org_id = %q, want org-explicit", field.String)
+		}
+	}
+	if count != 1 {
+		t.Fatalf("tidbcloud_org_id field count = %d, want 1", count)
+	}
+}
+
 func TestRequestTenantMetricScopeFallbackLeavesOrgEmpty(t *testing.T) {
 	req, err := http.NewRequest(http.MethodGet, "http://example.test/s3/objects/blob", nil)
 	if err != nil {

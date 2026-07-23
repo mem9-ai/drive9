@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // mockKicker records kicks for deterministic testing of the poller.
@@ -34,17 +37,22 @@ func TestTenantOutboxPollerShardFilter(t *testing.T) {
 }
 
 func TestTenantOutboxPollerPassesOrgToWorker(t *testing.T) {
-	t.Parallel()
 	buses := newEventBuses()
 	k := &mockKicker{}
 	p := newTenantOutboxPoller(nil, buses, k, nil, "pod1", 0, 0)
-	row := meta.TenantNotifyRow{ID: 1, TenantID: "t1", TiDBCloudOrgID: "org-t1", WorkMask: WorkFileGC, CreatedAt: time.Now()}
+	row := meta.TenantNotifyRow{ID: 1, TenantID: "tenant-outbox-org-metric", TiDBCloudOrgID: "org-outbox-metric", WorkMask: WorkFileGC, CreatedAt: time.Now()}
 	p.dispatch(context.Background(), row)
 	if len(k.kicks) != 1 {
 		t.Fatalf("expected 1 kick, got %d", len(k.kicks))
 	}
-	if k.kicks[0].tidbCloudOrgID != "org-t1" {
-		t.Fatalf("kick org = %q, want org-t1", k.kicks[0].tidbCloudOrgID)
+	if k.kicks[0].tidbCloudOrgID != "org-outbox-metric" {
+		t.Fatalf("kick org = %q, want org-outbox-metric", k.kicks[0].tidbCloudOrgID)
+	}
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	want := `drive9_service_operations_total{component="user_db_access",operation="outbox_dispatch_kick",result="ok",tenant_id="tenant-outbox-org-metric",tidbcloud_org_id="org-outbox-metric"}`
+	if !strings.Contains(recorder.Body.String(), want) {
+		t.Fatalf("missing org-scoped outbox dispatch metric %q", want)
 	}
 }
 

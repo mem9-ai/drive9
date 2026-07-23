@@ -1312,12 +1312,18 @@ func (s *Store) ListPendingMutations(ctx context.Context, minAge time.Duration, 
 	}
 	cutoff := time.Now().UTC().Add(-minAge)
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT q.id, q.tenant_id, COALESCE(b.organization_id, ''), q.mutation_type, q.mutation_data, q.status, q.retry_count, q.created_at, q.applied_at
+		`SELECT q.id, q.tenant_id,
+		        COALESCE(CASE WHEN t.provider = ? THEN d.org_id ELSE b.organization_id END, ''),
+		        q.mutation_type, q.mutation_data, q.status, q.retry_count, q.created_at, q.applied_at
 		 FROM quota_mutation_log q
+		 LEFT JOIN tenants t ON t.id = q.tenant_id
 		 LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = q.tenant_id
+		 LEFT JOIN fs_registry f ON f.tenant_id = q.tenant_id
+		 LEFT JOIN tenant_placements p ON p.fs_id = f.fs_id
+		 LEFT JOIN db_pool d ON d.db_id = p.db_id
 		 WHERE q.status = 'pending' AND q.created_at < ?
 		 ORDER BY q.tenant_id, q.id ASC
-		 LIMIT ?`, cutoff, limit)
+		 LIMIT ?`, tidbCloudNativeSharedProvider, cutoff, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1341,12 +1347,18 @@ func (s *Store) ObservePendingMutations(ctx context.Context) ([]MutationBacklogO
 	defer observeMeta(ctx, "observe_pending_mutations", start, &err)
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT q.tenant_id, COALESCE(b.organization_id, ''), COUNT(*), MIN(q.created_at)
+		`SELECT q.tenant_id,
+		        COALESCE(CASE WHEN t.provider = ? THEN d.org_id ELSE b.organization_id END, ''),
+		        COUNT(*), MIN(q.created_at)
 		 FROM quota_mutation_log q FORCE INDEX (idx_pending_tenant_age)
+		 LEFT JOIN tenants t ON t.id = q.tenant_id
 		 LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = q.tenant_id
+		 LEFT JOIN fs_registry f ON f.tenant_id = q.tenant_id
+		 LEFT JOIN tenant_placements p ON p.fs_id = f.fs_id
+		 LEFT JOIN db_pool d ON d.db_id = p.db_id
 		 WHERE q.status = 'pending'
-		 GROUP BY q.tenant_id, b.organization_id
-		 ORDER BY q.tenant_id`)
+		 GROUP BY q.tenant_id, t.provider, d.org_id, b.organization_id
+		 ORDER BY q.tenant_id`, tidbCloudNativeSharedProvider)
 	if err != nil {
 		return nil, err
 	}
