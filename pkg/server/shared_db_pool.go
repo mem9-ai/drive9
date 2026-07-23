@@ -383,7 +383,7 @@ func (s *Server) continueManagedSharedDBPool(ctx context.Context, dbID int64) er
 		if poolInfo.ClusterID == "" {
 			return err
 		}
-		cred, credErr := s.sharedDBCloudCredentials(ctx, poolInfo.TiDBCloudOrganizationID)
+		cred, credErr := s.sharedDBCloudCredentials(ctx)
 		if credErr != nil {
 			return credErr
 		}
@@ -400,7 +400,7 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 		if err != nil {
 			return err
 		}
-		cred, err := s.sharedDBCloudCredentials(ctx, poolInfo.TiDBCloudOrganizationID)
+		cred, err := s.sharedDBCloudCredentials(ctx)
 		if err != nil {
 			return err
 		}
@@ -493,8 +493,9 @@ func (s *Server) ensureManagedSharedDBPhysicalLocked(ctx context.Context, poolIn
 		}
 		result = results[0]
 	}
-	if result.OrganizationID == "" {
-		result.OrganizationID = poolInfo.TiDBCloudOrganizationID
+	logicalOrganizationID := strings.TrimSpace(poolInfo.TiDBCloudOrganizationID)
+	if logicalOrganizationID == "" {
+		return nil, fmt.Errorf("managed shared db pool customer organization is required")
 	}
 	if result.DBName == "" {
 		result.DBName = poolInfo.Name
@@ -504,7 +505,7 @@ func (s *Server) ensureManagedSharedDBPhysicalLocked(ctx context.Context, poolIn
 		tlsMode = "skip-verify"
 	}
 	if err := s.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{
-		ID: poolInfo.ID, TiDBCloudOrganizationID: result.OrganizationID, ClusterID: result.ClusterID,
+		ID: poolInfo.ID, TiDBCloudOrganizationID: logicalOrganizationID, ClusterID: result.ClusterID,
 		Host: result.Host, Port: result.Port, User: result.Username, PasswordCipher: poolInfo.PasswordCipher,
 		Name: result.DBName, TLSMode: tlsMode,
 	}); err != nil {
@@ -526,7 +527,7 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) 
 		if err != nil {
 			return nil, err
 		}
-		cred, err := s.sharedDBCloudCredentials(ctx, poolInfo.TiDBCloudOrganizationID)
+		cred, err := s.sharedDBCloudCredentials(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -625,8 +626,9 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 			}
 			result = results[0]
 		}
-		if result.OrganizationID == "" {
-			result.OrganizationID = poolInfo.TiDBCloudOrganizationID
+		logicalOrganizationID := strings.TrimSpace(poolInfo.TiDBCloudOrganizationID)
+		if logicalOrganizationID == "" {
+			return fmt.Errorf("managed shared db pool customer organization is required")
 		}
 		if result.DBName == "" {
 			result.DBName = poolInfo.Name
@@ -636,7 +638,7 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 			tlsMode = "skip-verify"
 		}
 		if err := s.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{
-			ID: dbID, TiDBCloudOrganizationID: result.OrganizationID, ClusterID: result.ClusterID,
+			ID: dbID, TiDBCloudOrganizationID: logicalOrganizationID, ClusterID: result.ClusterID,
 			Host: result.Host, Port: result.Port, User: result.Username, PasswordCipher: poolInfo.PasswordCipher,
 			Name: result.DBName, TLSMode: tlsMode,
 		}); err != nil {

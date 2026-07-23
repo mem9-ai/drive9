@@ -283,45 +283,6 @@ func TestAdminTenantPoolCreateCleansPartialSharedMembersOnBatchFailure(t *testin
 	}
 }
 
-func TestAdminTenantPoolCreateSharedRejectsDifferentCustomerAndSharedOrganizations(t *testing.T) {
-	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	rt.server.defaultTenantProvider = tenant.ProviderTiDBCloudNativeShared
-	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{
-		{OrganizationID: "org-customer", Role: tenant.TiDBCloudRoleOrgOwner},
-		{OrganizationID: "org-shared", Role: tenant.TiDBCloudRoleOrgOwner},
-	}
-	ts := httptest.NewServer(rt.server)
-	t.Cleanup(ts.Close)
-
-	resp := postJSON(t, ts.URL+"/v1/admin/tenant-pool", map[string]any{
-		"public_key": "customer-public", "private_key": "customer-private", "pool_size": 1,
-	}, "")
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("status = %d, want %d: %s", resp.StatusCode, http.StatusForbidden, body)
-	}
-	if !strings.Contains(string(body), sharedDBCredentialOrganizationMismatchMessage) {
-		t.Errorf("body = %s, want stable organization mismatch message", body)
-	}
-	if strings.Contains(string(body), "org-customer") || strings.Contains(string(body), "org-shared") {
-		t.Errorf("organization IDs leaked in response: %s", body)
-	}
-	if _, err := rt.meta.GetTenantPoolByOrganization(context.Background(), "org-customer"); !errors.Is(err, meta.ErrNotFound) {
-		t.Errorf("tenant pool lookup error = %v, want ErrNotFound after fail-fast rejection", err)
-	}
-	var pools int
-	if err := rt.meta.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM db_pool").Scan(&pools); err != nil {
-		t.Fatal(err)
-	}
-	if pools != 0 {
-		t.Errorf("db_pool rows = %d, want 0 after fail-fast rejection", pools)
-	}
-}
-
 func TestDeleteFreeSharedPoolTenantSkipsPurgeWhenDBPoolIsUnready(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.server.defaultTenantProvider = tenant.ProviderTiDBCloudNativeShared

@@ -157,17 +157,6 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 			"provider", tenant.ProviderTiDBCloudNative,
 			"organization_id", orgID,
 			"duration_ms", durationMillis(stageStarted))...)
-		if s.defaultTenantProvider == tenant.ProviderTiDBCloudNativeShared {
-			if _, err := s.sharedDBCloudCredentials(ctx, orgID); err != nil {
-				metricResult = "cluster_error"
-				if errors.Is(err, errSharedDBCredentialOrganizationMismatch) {
-					errJSON(w, http.StatusForbidden, sharedDBCredentialOrganizationMismatchMessage)
-				} else {
-					writeAdminTiDBCloudError(w, ctx, err, "authorize shared tenant pool")
-				}
-				return nil
-			}
-		}
 		if orgID != "" {
 			if _, err := s.meta.GetTenantPoolByOrganization(ctx, orgID); err == nil {
 				metricResult = "conflict"
@@ -1060,7 +1049,7 @@ func (s *Server) provisionManagedSharedDBPoolsBatchChunk(ctx context.Context, pr
 		if err != nil {
 			return "", err
 		}
-		cred, err := s.sharedDBCloudCredentials(ctx, first.TiDBCloudOrganizationID)
+		cred, err := s.sharedDBCloudCredentials(ctx)
 		if err != nil {
 			return "", err
 		}
@@ -1133,20 +1122,21 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 			return resolvedOrg, fmt.Errorf("shared db batch returned an unknown db pool")
 		}
 		row := rows[info.DBPoolID]
-		if info.OrganizationID == "" {
-			info.OrganizationID = row.TiDBCloudOrganizationID
+		logicalOrganizationID := strings.TrimSpace(row.TiDBCloudOrganizationID)
+		if logicalOrganizationID == "" {
+			return resolvedOrg, fmt.Errorf("managed shared db pool customer organization is required")
 		}
 		if info.DBName == "" {
 			info.DBName = row.Name
 		}
 		if err := s.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{ID: info.DBPoolID,
-			TiDBCloudOrganizationID: info.OrganizationID, ClusterID: info.ClusterID, Host: info.Host,
+			TiDBCloudOrganizationID: logicalOrganizationID, ClusterID: info.ClusterID, Host: info.Host,
 			Port: info.Port, User: info.Username, PasswordCipher: row.PasswordCipher, Name: info.DBName,
 			TLSMode: map[bool]string{true: "true", false: "skip-verify"}[dbTLSForProvisionedTenant(tenant.ProviderTiDBCloudNativeShared)]}); err != nil {
 			return resolvedOrg, err
 		}
 		if resolvedOrg == "" {
-			resolvedOrg = info.OrganizationID
+			resolvedOrg = logicalOrganizationID
 		}
 	}
 	if createErr != nil {

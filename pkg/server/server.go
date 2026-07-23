@@ -4591,8 +4591,6 @@ func clientFacingErrorResponse(defaultStatus int, defaultMessage string, err err
 		return http.StatusUnauthorized, msg
 	case errors.Is(err, tenant.ErrQuotaPermissionDenied), errors.Is(err, tenant.ErrTiDBCloudRoleInsufficient), isTiDBCloudStatusError(err, http.StatusForbidden):
 		return http.StatusForbidden, msg
-	case errors.Is(err, errSharedDBCredentialOrganizationMismatch):
-		return http.StatusForbidden, msg
 	default:
 		return defaultStatus, msg
 	}
@@ -4626,8 +4624,6 @@ func clientFacingErrorDetail(err error) string {
 		return tenant.ErrQuotaPermissionDenied.Error()
 	case errors.Is(err, tenant.ErrTiDBCloudRoleInsufficient):
 		return tenant.ErrTiDBCloudRoleInsufficient.Error()
-	case errors.Is(err, errSharedDBCredentialOrganizationMismatch):
-		return sharedDBCredentialOrganizationMismatchMessage
 	case errors.Is(err, tenant.ErrQuotaBackendNotFound):
 		return tenant.ErrQuotaBackendNotFound.Error()
 	default:
@@ -5258,21 +5254,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			opts.CredentialProvisioner = defaultReq
 		}
 	}
-	var customerIdentity *tenant.TiDBCloudAPIKeyIdentity
 	if tenant.UsesTiDBCloudNativeCredentials(provider) {
-		customerIdentity, err = s.resolveTiDBCloudIdentity(ctx, *opts.CredentialProvisioner, "provision")
-		if err != nil {
+		if _, err := s.resolveTiDBCloudIdentity(ctx, *opts.CredentialProvisioner, "provision"); err != nil {
 			status, message := clientFacingErrorResponse(http.StatusBadGateway, "TiDB Cloud API key authorization failed", err)
 			return nil, newProvisionTenantError(status, message, err)
-		}
-		if provider == tenant.ProviderTiDBCloudNativeShared {
-			if _, err := s.sharedDBCloudCredentials(ctx, customerIdentity.OrganizationID); err != nil {
-				if errors.Is(err, errSharedDBCredentialOrganizationMismatch) {
-					return nil, newProvisionTenantError(http.StatusForbidden, sharedDBCredentialOrganizationMismatchMessage, err)
-				}
-				status, message := clientFacingErrorResponse(http.StatusBadGateway, "shared TiDB Cloud credential authorization failed", err)
-				return nil, newProvisionTenantError(status, message, err)
-			}
 		}
 	}
 	tenantID := token.NewID()

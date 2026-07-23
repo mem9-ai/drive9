@@ -11,10 +11,6 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
-var errSharedDBCredentialOrganizationMismatch = errors.New("shared TiDB Cloud credential organization mismatch")
-
-const sharedDBCredentialOrganizationMismatchMessage = "shared mode requires the TiDB Cloud API key organization to match the configured shared credential organization"
-
 func (s *Server) resolveTiDBCloudIdentity(ctx context.Context, cred tenant.CredentialProvisionRequest, metricPath string) (*tenant.TiDBCloudAPIKeyIdentity, error) {
 	if identity, ok := s.tidbCloudRBACCache.getIdentity(cred); ok {
 		metrics.RecordTiDBCloudRBACCacheRequest(metricPath, "role", "hit")
@@ -77,7 +73,7 @@ func (s *Server) authorizeNativeTenantCredentials(ctx context.Context, t *meta.T
 	return binding, nil
 }
 
-func (s *Server) sharedDBCloudCredentials(ctx context.Context, organizationID string) (tenant.CredentialProvisionRequest, error) {
+func (s *Server) sharedDBCloudCredentials(ctx context.Context) (tenant.CredentialProvisionRequest, error) {
 	provider, ok := s.provisioner.(tenant.SharedCredentialProvider)
 	if !ok {
 		return tenant.CredentialProvisionRequest{}, fmt.Errorf("shared TiDB Cloud credentials are not configured")
@@ -86,13 +82,8 @@ func (s *Server) sharedDBCloudCredentials(ctx context.Context, organizationID st
 	if !ok {
 		return tenant.CredentialProvisionRequest{}, fmt.Errorf("shared TiDB Cloud credentials are not configured")
 	}
-	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, "shared_pool_role")
-	if err != nil {
+	if _, err := s.resolveTiDBCloudIdentity(ctx, cred, "shared_pool_role"); err != nil {
 		return tenant.CredentialProvisionRequest{}, err
-	}
-	if strings.TrimSpace(organizationID) != "" && strings.TrimSpace(organizationID) != meta.SharedDBOrgWildcard &&
-		identity.OrganizationID != strings.TrimSpace(organizationID) {
-		return tenant.CredentialProvisionRequest{}, errSharedDBCredentialOrganizationMismatch
 	}
 	return cred, nil
 }
