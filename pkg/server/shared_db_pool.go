@@ -40,12 +40,16 @@ type defaultSharedDatabaseNameProvider interface {
 	DefaultSharedDatabaseName() string
 }
 
-func (s *Server) managedSharedDBPolicy() int {
-	maxTenants := s.sharedDBMaxTenants
+func (s *Server) managedSharedDBPolicy() (maxTenants int, spendingLimit int64) {
+	maxTenants = s.sharedDBMaxTenants
 	if maxTenants <= 0 {
 		maxTenants = defaultManagedSharedDBMaxTenants
 	}
-	return maxTenants
+	spendingLimit = s.sharedDBSpendingLimit
+	if spendingLimit <= 0 {
+		spendingLimit = DefaultManagedSharedDBSpendingLimit
+	}
+	return maxTenants, spendingLimit
 }
 
 func (s *Server) managedSharedDBHardCap(softCap int) (int, error) {
@@ -177,8 +181,7 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 				}
 			}
 			if sharedDB == nil {
-				maxTenants := s.managedSharedDBPolicy()
-				fixedTarget := meta.MaxTiDBCloudSpendingLimit
+				maxTenants, fixedTarget := s.managedSharedDBPolicy()
 				cloudProvider, region := provisioningCloudRegion(s.provisioner)
 				rootPassword, passwordErr := generateManagedSharedDBRootPassword(24)
 				if passwordErr != nil {

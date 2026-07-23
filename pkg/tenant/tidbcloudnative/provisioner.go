@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -27,7 +28,6 @@ import (
 	mysql "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/mem9-ai/drive9/pkg/logger"
-	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
@@ -1580,7 +1580,7 @@ func validateTiDBCloudSpendingLimit(monthly int64) error {
 	if monthly > 0 && monthly < 10 {
 		return fmt.Errorf("tidbcloud_spending_limit must be 0 or at least 10 RMB")
 	}
-	if monthly > meta.MaxTiDBCloudSpendingLimit {
+	if monthly > int64(math.MaxInt32) {
 		return fmt.Errorf("tidbcloud_spending_limit is too large")
 	}
 	return nil

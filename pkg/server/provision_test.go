@@ -191,7 +191,9 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 	}
 	srv := NewWithConfig(Config{
 		Meta: metaStore, Pool: pool, Provisioner: prov,
-		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: tokenSecret,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared,
+		SharedDBSpendingLimit: 2_000_000,
+		TokenSecret:           tokenSecret,
 	})
 	defer srv.Close()
 	virtualLimit := int64(2000)
@@ -227,7 +229,7 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 	if err != nil {
 		t.Fatalf("GetSharedDB: %v", err)
 	}
-	if dbPool.MaxTenants != 100 || dbPool.TenantCount != 1 || dbPool.SpendingLimit == nil || *dbPool.SpendingLimit != meta.MaxTiDBCloudSpendingLimit {
+	if dbPool.MaxTenants != 100 || dbPool.TenantCount != 1 || dbPool.SpendingLimit == nil || *dbPool.SpendingLimit != 2_000_000 {
 		t.Fatalf("managed pool policy = %+v", dbPool)
 	}
 	if dbPool.TiDBCloudOrganizationID != "customer-org" {

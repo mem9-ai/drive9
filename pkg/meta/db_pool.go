@@ -12,8 +12,9 @@ import (
 	"github.com/google/uuid"
 )
 
-// MaxTiDBCloudSpendingLimit is the spendingLimit.monthly API maximum. In the
-// TiDB Cloud unit, 1,000,000 represents $10,000.
+// MaxTiDBCloudSpendingLimit is the tenant-facing quota API maximum. Physical
+// shared DB pools use a separately configured persisted target. In the TiDB
+// Cloud unit, 1,000,000 represents $10,000.
 const MaxTiDBCloudSpendingLimit = int64(1_000_000)
 
 // SharedDBRoleShared marks a db_pool row as a multi-tenant shared-schema
@@ -210,8 +211,8 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 	if in.MaxTenants <= 0 {
 		return 0, fmt.Errorf("managed max tenants must be positive")
 	}
-	if in.SpendingLimit == nil || *in.SpendingLimit != MaxTiDBCloudSpendingLimit {
-		return 0, fmt.Errorf("managed spending limit must equal TiDB Cloud maximum %d", MaxTiDBCloudSpendingLimit)
+	if in.SpendingLimit == nil || *in.SpendingLimit <= 0 || *in.SpendingLimit > int64(math.MaxInt32) {
+		return 0, fmt.Errorf("managed spending limit must be in (0,%d]", int64(math.MaxInt32))
 	}
 	var passwordCipher any
 	if len(in.PasswordCipher) != 0 {

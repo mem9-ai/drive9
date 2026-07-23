@@ -48,11 +48,12 @@ type Config struct {
 	Pool                  *tenant.Pool
 	Provisioner           tenant.Provisioner
 	DefaultTenantProvider string
-	// SharedDBMaxTenants applies only to new managed
-	// tidb_cloud_native_shared pools. Zero uses the default of 100 tenants.
-	SharedDBMaxTenants   int
-	SharedDBHardCapRatio float64
-	SharedDBReopenRatio  float64
+	// SharedDBMaxTenants and SharedDBSpendingLimit apply only to new
+	// managed tidb_cloud_native_shared pools. Zero values use their defaults.
+	SharedDBMaxTenants    int
+	SharedDBHardCapRatio  float64
+	SharedDBReopenRatio   float64
+	SharedDBSpendingLimit int64
 	// LegacyStarterProvisioner is only used for delete/fork compatibility on
 	// persisted tidb_cloud_starter tenants. New starter provisioning remains
 	// disabled and NormalizeProvider does not accept tidb_cloud_starter.
@@ -188,6 +189,7 @@ type Server struct {
 	sharedDBMaxTenants        int
 	sharedDBHardCapRatio      float64
 	sharedDBReopenRatio       float64
+	sharedDBSpendingLimit     int64
 	legacyStarterProvisioner  tenant.Provisioner
 	tokenSecret               []byte
 	localTenantAPIKey         string
@@ -297,6 +299,10 @@ const DefaultSharedDBHardCapRatio = 1.2
 // to 80% of its persisted soft capacity.
 const DefaultSharedDBReopenRatio = 0.8
 
+// DefaultManagedSharedDBSpendingLimit is the physical spending-limit target
+// persisted for a new managed shared DB pool when no override is configured.
+const DefaultManagedSharedDBSpendingLimit = int64(1_000_000)
+
 // TenantStatusResponse is the JSON body of GET /v1/status. Fields are filled
 // per authenticated tenant so callers can discover their effective limits
 // before initiating uploads. MaxUploadBytes is currently process-wide but the
@@ -371,6 +377,10 @@ func NewWithConfig(cfg Config) *Server {
 	if sharedDBReopenRatio <= 0 || sharedDBReopenRatio >= 1 || sharedDBReopenRatio != sharedDBReopenRatio || math.IsInf(sharedDBReopenRatio, 0) {
 		sharedDBReopenRatio = DefaultSharedDBReopenRatio
 	}
+	sharedDBSpendingLimit := cfg.SharedDBSpendingLimit
+	if sharedDBSpendingLimit <= 0 {
+		sharedDBSpendingLimit = DefaultManagedSharedDBSpendingLimit
+	}
 	defaultTenantProvider := strings.TrimSpace(cfg.DefaultTenantProvider)
 	if defaultTenantProvider == "" && cfg.Provisioner != nil {
 		defaultTenantProvider = cfg.Provisioner.ProviderType()
@@ -390,6 +400,7 @@ func NewWithConfig(cfg Config) *Server {
 		sharedDBMaxTenants:        cfg.SharedDBMaxTenants,
 		sharedDBHardCapRatio:      sharedDBHardCapRatio,
 		sharedDBReopenRatio:       sharedDBReopenRatio,
+		sharedDBSpendingLimit:     sharedDBSpendingLimit,
 		legacyStarterProvisioner:  cfg.LegacyStarterProvisioner,
 		maxUploadBytes:            maxUpload,
 		tenantPoolMaxSize:         tenantPoolMaxSize,

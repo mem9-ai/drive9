@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -1828,7 +1829,7 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 }
 
 func TestUpdateQuotaPatchesSpendingLimitWithoutLabels(t *testing.T) {
-	monthly := int64(0)
+	monthly := int64(2_000_000)
 	var patchCalls int
 	var gotSpendingPatch struct {
 		Cluster struct {
@@ -1953,7 +1954,7 @@ func TestUpdateQuotaRejectsInvalidSpendingLimitBeforeRequest(t *testing.T) {
 		wantErr string
 	}{
 		{name: "negative", monthly: -1, wantErr: "tidbcloud_spending_limit must be non-negative"},
-		{name: "above cloud maximum", monthly: 1_000_001, wantErr: "tidbcloud_spending_limit is too large"},
+		{name: "above wire maximum", monthly: int64(math.MaxInt32) + 1, wantErr: "tidbcloud_spending_limit is too large"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var hit bool

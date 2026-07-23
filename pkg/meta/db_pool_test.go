@@ -147,7 +147,7 @@ func TestRegisterSharedDBRoundTrip(t *testing.T) {
 func TestCreateManagedSharedDBPoolPersistsDurableProvisioningPlan(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	spendingLimit := MaxTiDBCloudSpendingLimit
+	spendingLimit := int64(2_000_000)
 	provisioningKey := make([]byte, 32)
 	for i := range provisioningKey {
 		provisioningKey[i] = byte(i + 1)
@@ -207,8 +207,16 @@ func TestCreateManagedSharedDBPoolRejectsUnboundedOrInvalidPolicy(t *testing.T) 
 		"missing cloud":       func(in *SharedDB) { in.CloudProvider = "" },
 		"missing region":      func(in *SharedDB) { in.Region = "" },
 		"missing spending":    func(in *SharedDB) { in.SpendingLimit = nil },
-		"physical limit below fixed maximum": func(in *SharedDB) {
-			value := MaxTiDBCloudSpendingLimit - 1
+		"zero spending": func(in *SharedDB) {
+			value := int64(0)
+			in.SpendingLimit = &value
+		},
+		"negative spending": func(in *SharedDB) {
+			value := int64(-1)
+			in.SpendingLimit = &value
+		},
+		"spending exceeds wire range": func(in *SharedDB) {
+			value := int64(math.MaxInt32) + 1
 			in.SpendingLimit = &value
 		},
 	}
