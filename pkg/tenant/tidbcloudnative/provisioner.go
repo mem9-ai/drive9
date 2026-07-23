@@ -36,12 +36,15 @@ import (
 
 const (
 	EnvTiDBCloudNativeAPIURL                  = "DRIVE9_TIDBCLOUD_NATIVE_API_URL"
+	EnvTiDBCloudIAMAPIURL                     = "DRIVE9_TIDBCLOUD_IAM_API_URL"
 	EnvTiDBCloudNativeCloudProvider           = "DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER"
 	EnvTiDBCloudNativeRegion                  = "DRIVE9_TIDBCLOUD_NATIVE_REGION"
 	EnvTiDBCloudNativeDefaultDatabaseName     = "DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME"
 	EnvTiDBCloudDefaultSpendingLimit          = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
 	EnvTiDBCloudNativePublicKey               = "DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY"
 	EnvTiDBCloudNativePrivateKey              = "DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY"
+	EnvTiDBCloudNativeSharedPublicKey         = "DRIVE9_TIDBCLOUD_NATIVE_SHARED_PUBLIC_KEY"
+	EnvTiDBCloudNativeSharedPrivateKey        = "DRIVE9_TIDBCLOUD_NATIVE_SHARED_PRIVATE_KEY"
 	EnvTiDBCloudNativeUsePrivateEndpoint      = "DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT"
 	EnvTiDBCloudPrivateEndpointHostMap        = "DRIVE9_TIDBCLOUD_PRIVATE_ENDPOINT_HOST_MAP"
 	EnvTiDBCloudTencentPrivateEndpointHost    = "DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST"
@@ -89,12 +92,15 @@ var (
 
 type Provisioner struct {
 	apiURL                      string
+	iamURL                      string
 	cloudProvider               string
 	region                      string
 	defaultDatabaseName         string
 	defaultSpendLimit           *int32
 	defaultPublicKey            string
 	defaultPrivateKey           string
+	defaultSharedPublicKey      string
+	defaultSharedPrivateKey     string
 	usePrivateEndpoint          bool
 	privateEndpointHostMap      map[string]string
 	tencentPrivateEndpointHost  string
@@ -102,8 +108,9 @@ type Provisioner struct {
 	client                      *http.Client
 }
 
-func NewProvisionerFromEnv() (*Provisioner, error) {
+func NewProvisionerFromEnv(providerType string) (*Provisioner, error) {
 	apiURL := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeAPIURL))
+	iamURL := strings.TrimSpace(os.Getenv(EnvTiDBCloudIAMAPIURL))
 	cloudProvider := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeCloudProvider))
 	region := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeRegion))
 	defaultDB := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeDefaultDatabaseName))
@@ -114,12 +121,21 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 	if defaultDB == "" {
 		defaultDB = DefaultDatabaseName
 	}
-	if apiURL == "" || cloudProvider == "" || region == "" {
-		return nil, fmt.Errorf("%s, %s and %s are required", EnvTiDBCloudNativeAPIURL, EnvTiDBCloudNativeCloudProvider, EnvTiDBCloudNativeRegion)
+	if apiURL == "" || iamURL == "" || cloudProvider == "" || region == "" {
+		return nil, fmt.Errorf("%s, %s, %s and %s are required", EnvTiDBCloudNativeAPIURL, EnvTiDBCloudIAMAPIURL, EnvTiDBCloudNativeCloudProvider, EnvTiDBCloudNativeRegion)
 	}
 	parsedAPIURL, err := url.Parse(apiURL)
 	if err != nil || parsedAPIURL.Scheme != "https" || parsedAPIURL.Host == "" {
 		return nil, fmt.Errorf("%s must be a valid https URL", EnvTiDBCloudNativeAPIURL)
+	}
+	parsedIAMURL, err := url.Parse(iamURL)
+	if err != nil || parsedIAMURL.Scheme != "https" || parsedIAMURL.Host == "" {
+		return nil, fmt.Errorf("%s must be a valid https URL", EnvTiDBCloudIAMAPIURL)
+	}
+	sharedPublicKey := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeSharedPublicKey))
+	sharedPrivateKey := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeSharedPrivateKey))
+	if providerType == tenant.ProviderTiDBCloudNativeShared && (sharedPublicKey == "" || sharedPrivateKey == "") {
+		return nil, fmt.Errorf("%s and %s are required for %s", EnvTiDBCloudNativeSharedPublicKey, EnvTiDBCloudNativeSharedPrivateKey, tenant.ProviderTiDBCloudNativeShared)
 	}
 	if _, err := normalizeDatabaseName(defaultDB); err != nil {
 		return nil, fmt.Errorf("invalid %s: %w", EnvTiDBCloudNativeDefaultDatabaseName, err)
@@ -136,12 +152,15 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 	}
 	return &Provisioner{
 		apiURL:                      strings.TrimRight(apiURL, "/"),
+		iamURL:                      strings.TrimRight(iamURL, "/"),
 		cloudProvider:               cloudProvider,
 		region:                      region,
 		defaultDatabaseName:         defaultDB,
 		defaultSpendLimit:           defaultSpendLimit,
 		defaultPublicKey:            strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePublicKey)),
 		defaultPrivateKey:           strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePrivateKey)),
+		defaultSharedPublicKey:      sharedPublicKey,
+		defaultSharedPrivateKey:     sharedPrivateKey,
 		usePrivateEndpoint:          usePrivate,
 		privateEndpointHostMap:      hostMap,
 		tencentPrivateEndpointHost:  tencentPrivateHost,
@@ -162,6 +181,56 @@ func (p *Provisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, b
 		PublicKey:  p.defaultPublicKey,
 		PrivateKey: p.defaultPrivateKey,
 	}, true
+}
+
+func (p *Provisioner) DefaultSharedCredentials() (tenant.CredentialProvisionRequest, bool) {
+	if p.defaultSharedPublicKey == "" || p.defaultSharedPrivateKey == "" {
+		return tenant.CredentialProvisionRequest{}, false
+	}
+	return tenant.CredentialProvisionRequest{
+		PublicKey: p.defaultSharedPublicKey, PrivateKey: p.defaultSharedPrivateKey,
+	}, true
+}
+
+func (p *Provisioner) ResolveAPIKeyIdentity(ctx context.Context, req tenant.CredentialProvisionRequest) (*tenant.TiDBCloudAPIKeyIdentity, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	endpoint := fmt.Sprintf("%s/v1beta1/apikeys/%s", p.iamURL, url.PathEscape(publicKey))
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		_, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, readErr
+		}
+		return nil, fmt.Errorf("%s", statusError("IAM API key lookup", resp.StatusCode, ""))
+	}
+	var info struct {
+		Name      string `json:"name"`
+		AccessKey string `json:"accessKey"`
+		Role      string `json:"role"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, upstreamClusterBodyLimit)).Decode(&info); err != nil {
+		return nil, fmt.Errorf("decode IAM API key response: %w", err)
+	}
+	if strings.TrimSpace(info.AccessKey) != publicKey {
+		return nil, fmt.Errorf("IAM API key response does not match request credentials")
+	}
+	parts := strings.Split(strings.Trim(strings.TrimSpace(info.Name), "/"), "/")
+	if len(parts) < 2 || parts[0] != "orgs" || strings.TrimSpace(parts[1]) == "" {
+		return nil, fmt.Errorf("IAM API key response is missing organization")
+	}
+	role := strings.TrimSpace(info.Role)
+	if role != tenant.TiDBCloudRoleOrgOwner && role != tenant.TiDBCloudRoleProjectOwner {
+		return nil, fmt.Errorf("%w: role %q; org:owner or project:owner is required", tenant.ErrTiDBCloudRoleInsufficient, role)
+	}
+	return &tenant.TiDBCloudAPIKeyIdentity{OrganizationID: strings.TrimSpace(parts[1]), Role: role}, nil
 }
 
 func (p *Provisioner) ProvisioningRegion() string { return p.region }
@@ -532,7 +601,7 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 		inputsByUUID[poolUUID] = input
 		databaseNames[poolUUID] = dbName
 		requests = append(requests, map[string]any{"cluster": map[string]any{
-			"displayName":  clusterDisplayName(poolUUID),
+			"displayName":  sharedDBPoolDisplayName(poolUUID),
 			"rootPassword": password,
 			"region":       map[string]string{"name": p.regionName()},
 			"labels": map[string]string{
@@ -1604,6 +1673,15 @@ func clusterDisplayName(tenantID string) string {
 	return strings.TrimRight(name, "-")
 }
 
+func sharedDBPoolDisplayName(poolUUID string) string {
+	const maxDisplayNameLen = 64
+	name := displayNameCharPattern.ReplaceAllString("fs-shared-pool-"+poolUUID, "-")
+	if len(name) <= maxDisplayNameLen {
+		return name
+	}
+	return strings.TrimRight(name[:maxDisplayNameLen], "-")
+}
+
 func (p *Provisioner) resolveDatabaseName(raw string) (string, error) {
 	name := strings.TrimSpace(raw)
 	if name == "" {
@@ -2387,6 +2465,10 @@ func requestPath(uri string) string {
 	u, err := url.Parse(uri)
 	if err != nil {
 		return uri
+	}
+	const iamAPIKeyPath = "/v1beta1/apikeys/"
+	if strings.HasPrefix(u.Path, iamAPIKeyPath) {
+		return iamAPIKeyPath + "***"
 	}
 	return u.Path
 }

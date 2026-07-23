@@ -4524,7 +4524,6 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		} else if claimed {
 			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
 			setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
-			s.forgetTiDBCloudRBACList(*credentialReq)
 			if res.Status == meta.TenantProvisioning {
 				s.startProvisionedTenantSchemaInit(r.Context(), res)
 			}
@@ -4555,9 +4554,6 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
-	if credentialReq != nil {
-		s.forgetTiDBCloudRBACList(*credentialReq)
-	}
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
 	writeProvisionTenantAccepted(w, res)
 }
@@ -4593,7 +4589,7 @@ func clientFacingErrorResponse(defaultStatus int, defaultMessage string, err err
 		return http.StatusBadRequest, msg
 	case isTiDBCloudStatusError(err, http.StatusUnauthorized):
 		return http.StatusUnauthorized, msg
-	case errors.Is(err, tenant.ErrQuotaPermissionDenied), isTiDBCloudStatusError(err, http.StatusForbidden):
+	case errors.Is(err, tenant.ErrQuotaPermissionDenied), errors.Is(err, tenant.ErrTiDBCloudRoleInsufficient), isTiDBCloudStatusError(err, http.StatusForbidden):
 		return http.StatusForbidden, msg
 	default:
 		return defaultStatus, msg
@@ -4626,6 +4622,8 @@ func clientFacingErrorDetail(err error) string {
 		return tenant.ErrPartialCredentials.Error()
 	case errors.Is(err, tenant.ErrQuotaPermissionDenied):
 		return tenant.ErrQuotaPermissionDenied.Error()
+	case errors.Is(err, tenant.ErrTiDBCloudRoleInsufficient):
+		return tenant.ErrTiDBCloudRoleInsufficient.Error()
 	case errors.Is(err, tenant.ErrQuotaBackendNotFound):
 		return tenant.ErrQuotaBackendNotFound.Error()
 	default:
@@ -5256,6 +5254,12 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			opts.CredentialProvisioner = defaultReq
 		}
 	}
+	if tenant.UsesTiDBCloudNativeCredentials(provider) {
+		if _, err := s.resolveTiDBCloudIdentity(ctx, *opts.CredentialProvisioner, "provision"); err != nil {
+			status, message := clientFacingErrorResponse(http.StatusBadGateway, "TiDB Cloud API key authorization failed", err)
+			return nil, newProvisionTenantError(status, message, err)
+		}
+	}
 	tenantID := token.NewID()
 	provisionStarted := time.Now()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
@@ -5314,7 +5318,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			}
 			if sharedDB.SpendingLimit != nil && (created || sharedDB.ClusterID == "" || sharedDB.Host == "" || sharedDB.Port <= 0 || sharedDB.User == "") {
 				plannedDB := sharedDB
-				sharedDB, err = s.ensureManagedSharedDBPhysical(ctx, plannedDB.ID, *opts.CredentialProvisioner)
+				sharedDB, err = s.ensureManagedSharedDBPhysical(ctx, plannedDB.ID)
 				if err != nil {
 					orgID, orgErr := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner)
 					if orgErr == nil {
@@ -5324,7 +5328,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 							if hardErr == nil {
 								res, reserveErr := s.provisionTenantOnSharedDBEmergency(ctx, tenantID, fallback, provider, keyName, opts, now, hardCap)
 								if reserveErr == nil {
-									s.scheduleManagedSharedDBContinuation(ctx, plannedDB.ID, *opts.CredentialProvisioner)
+									s.scheduleManagedSharedDBContinuation(ctx, plannedDB.ID)
 									return res, nil
 								}
 								if isSharedDBReservationConflict(reserveErr) {
@@ -5348,7 +5352,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				return nil, reserveErr
 			}
 			if created || sharedDB.Status == meta.SharedDBStatusProvisioning {
-				s.scheduleManagedSharedDBContinuation(ctx, sharedDB.ID, *opts.CredentialProvisioner)
+				s.scheduleManagedSharedDBContinuation(ctx, sharedDB.ID)
 			}
 			return res, nil
 		}

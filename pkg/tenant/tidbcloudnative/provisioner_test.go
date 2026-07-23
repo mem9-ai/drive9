@@ -17,7 +17,242 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
+func setRequiredNativeProvisionerEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
+	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
+	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
+}
+
+func TestNewProvisionerFromEnvRequiresIAMURLForNative(t *testing.T) {
+	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
+	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
+	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "")
+
+	_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
+	if err == nil || !strings.Contains(err.Error(), EnvTiDBCloudIAMAPIURL) {
+		t.Fatalf("error = %v, want missing %s", err, EnvTiDBCloudIAMAPIURL)
+	}
+}
+
+func TestNewProvisionerFromEnvRequiresSharedCredentialsForSharedProvider(t *testing.T) {
+	setRequiredNativeProvisionerEnv(t)
+	t.Setenv(EnvTiDBCloudNativeSharedPublicKey, "")
+	t.Setenv(EnvTiDBCloudNativeSharedPrivateKey, "")
+
+	_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNativeShared)
+	if err == nil || !strings.Contains(err.Error(), EnvTiDBCloudNativeSharedPublicKey) || !strings.Contains(err.Error(), EnvTiDBCloudNativeSharedPrivateKey) {
+		t.Fatalf("error = %v, want missing shared credential names", err)
+	}
+}
+
+func TestNewProvisionerFromEnvKeepsNativeDefaultsSeparateFromSharedCredentials(t *testing.T) {
+	setRequiredNativeProvisionerEnv(t)
+	t.Setenv(EnvTiDBCloudNativePublicKey, "native-public")
+	t.Setenv(EnvTiDBCloudNativePrivateKey, "native-private")
+	t.Setenv(EnvTiDBCloudNativeSharedPublicKey, "shared-public")
+	t.Setenv(EnvTiDBCloudNativeSharedPrivateKey, "shared-private")
+
+	p, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNativeShared)
+	if err != nil {
+		t.Fatalf("NewProvisionerFromEnv: %v", err)
+	}
+	defaults, ok := p.DefaultCredentials()
+	if !ok || defaults.PublicKey != "native-public" || defaults.PrivateKey != "native-private" {
+		t.Fatalf("native defaults = %+v, ok=%v", defaults, ok)
+	}
+	shared, ok := p.DefaultSharedCredentials()
+	if !ok || shared.PublicKey != "shared-public" || shared.PrivateKey != "shared-private" {
+		t.Fatalf("shared defaults = %+v, ok=%v", shared, ok)
+	}
+}
+
+func TestResolveAPIKeyIdentityUsesIAMAPI(t *testing.T) {
+	var gotPath, gotAuth string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-iam", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":        "orgs/1234567890123456789/projects/9876543210987654321/apiKeys/111111",
+			"accessKey":   "PROJECTOWNER1",
+			"secretKey":   "************************SENSITIVE_PROJECT_SUFFIX",
+			"displayName": "fixture-project-owner",
+			"role":        "project:owner",
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	identity, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "PROJECTOWNER1", PrivateKey: "test-private",
+	})
+	if err != nil {
+		t.Fatalf("ResolveAPIKeyIdentity: %v", err)
+	}
+	if gotPath != "/v1beta1/apikeys/PROJECTOWNER1" || !strings.Contains(gotAuth, `username="PROJECTOWNER1"`) {
+		t.Fatalf("request path/auth = %q / %q", gotPath, gotAuth)
+	}
+	if identity.OrganizationID != "1234567890123456789" || identity.Role != tenant.TiDBCloudRoleProjectOwner {
+		t.Fatalf("identity = %+v", identity)
+	}
+}
+
+func TestResolveAPIKeyIdentityRejectsInsufficientRole(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-iam", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":      "orgs/1234567890123456789/apiKeys/222222",
+			"accessKey": "VIEWER1",
+			"secretKey": "************************SENSITIVE_VIEWER_SUFFIX",
+			"role":      "org:viewer",
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "VIEWER1", PrivateKey: "test-private",
+	})
+	if !errors.Is(err, tenant.ErrTiDBCloudRoleInsufficient) || !strings.Contains(err.Error(), "org:viewer") {
+		t.Fatalf("error = %v, want insufficient-role error", err)
+	}
+	if strings.Contains(err.Error(), "SENSITIVE_VIEWER_SUFFIX") || strings.Contains(err.Error(), "test-private") {
+		t.Fatalf("error leaked secret material: %v", err)
+	}
+}
+
+func TestResolveAPIKeyIdentityAcceptsOrganizationOwnerResponse(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-org-owner", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":        "orgs/1234567890123456789/apiKeys/222222",
+			"accessKey":   "ORGOWNER1",
+			"secretKey":   "************************SENSITIVE_ORG_SUFFIX",
+			"displayName": "fixture-org-owner",
+			"role":        "org:owner",
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	identity, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "ORGOWNER1", PrivateKey: "test-private",
+	})
+	if err != nil {
+		t.Fatalf("ResolveAPIKeyIdentity: %v", err)
+	}
+	if identity.OrganizationID != "1234567890123456789" || identity.Role != tenant.TiDBCloudRoleOrgOwner {
+		t.Fatalf("identity = %+v", identity)
+	}
+	if strings.Contains(fmt.Sprintf("%+v", identity), "SENSITIVE_ORG_SUFFIX") || strings.Contains(fmt.Sprintf("%+v", identity), "fixture-org-owner") {
+		t.Fatalf("identity retained sensitive IAM response fields: %+v", identity)
+	}
+}
+
+func TestResolveAPIKeyIdentityDoesNotExposeAccessKeysOnMismatch(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-mismatch", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":      "orgs/1234567890123456789/apiKeys/333333",
+			"accessKey": "UNEXPECTEDKEY1",
+			"role":      "org:owner",
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "REQUESTEDKEY1", PrivateKey: "test-private",
+	})
+	if err == nil {
+		t.Fatal("expected access-key mismatch error")
+	}
+	for _, sensitive := range []string{"UNEXPECTEDKEY1", "REQUESTEDKEY1", "test-private"} {
+		if strings.Contains(err.Error(), sensitive) {
+			t.Fatalf("error leaked credential %q: %v", sensitive, err)
+		}
+	}
+}
+
+func TestResolveAPIKeyIdentityDoesNotExposeIAMErrorBody(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-error", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"accessKey":"RESPONSEKEY1","secretKey":"SENSITIVE_SECRET","displayName":"SENSITIVE_DISPLAY"}`))
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "REQUESTKEY1", PrivateKey: "request-private",
+	})
+	if err == nil {
+		t.Fatal("expected IAM status error")
+	}
+	for _, sensitive := range []string{"RESPONSEKEY1", "SENSITIVE_SECRET", "SENSITIVE_DISPLAY", "REQUESTKEY1", "request-private"} {
+		if strings.Contains(err.Error(), sensitive) {
+			t.Fatalf("error leaked IAM response material %q: %v", sensitive, err)
+		}
+	}
+}
+
+func TestResolveAPIKeyIdentityDoesNotExposeMalformedResourceName(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-name", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name": "SENSITIVE_MALFORMED_RESOURCE", "accessKey": "NAMEFIXTURE1", "role": "org:owner",
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "NAMEFIXTURE1", PrivateKey: "request-private",
+	})
+	if err == nil {
+		t.Fatal("expected malformed resource-name error")
+	}
+	if strings.Contains(err.Error(), "SENSITIVE_MALFORMED_RESOURCE") || strings.Contains(err.Error(), "NAMEFIXTURE1") || strings.Contains(err.Error(), "request-private") {
+		t.Fatalf("error leaked IAM resource data: %v", err)
+	}
+}
+
+func TestRequestPathRedactsIAMAccessKey(t *testing.T) {
+	got := requestPath("https://iam.tidbapi.com/v1beta1/apikeys/PROJECTOWNER1")
+	if got != "/v1beta1/apikeys/***" {
+		t.Fatalf("request path = %q, want redacted IAM access key", got)
+	}
+}
+
 func TestNewProvisionerFromEnvReadsServerSideConfigOnly(t *testing.T) {
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
 	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
@@ -26,7 +261,7 @@ func TestNewProvisionerFromEnvReadsServerSideConfigOnly(t *testing.T) {
 	t.Setenv("DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY", "must-not-be-read")
 	t.Setenv("DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY", "must-not-be-read")
 
-	p, err := NewProvisionerFromEnv()
+	p, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 	if err != nil {
 		t.Fatalf("NewProvisionerFromEnv: %v", err)
 	}
@@ -45,12 +280,13 @@ func TestNewProvisionerFromEnvReadsServerSideConfigOnly(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvUsesBuiltinDefaultSpendingLimit(t *testing.T) {
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
 	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
 	t.Setenv(EnvTiDBCloudDefaultSpendingLimit, "")
 
-	p, err := NewProvisionerFromEnv()
+	p, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 	if err != nil {
 		t.Fatalf("NewProvisionerFromEnv: %v", err)
 	}
@@ -60,12 +296,13 @@ func TestNewProvisionerFromEnvUsesBuiltinDefaultSpendingLimit(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvRejectsTooSmallDefaultSpendingLimit(t *testing.T) {
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
 	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
 	t.Setenv(EnvTiDBCloudDefaultSpendingLimit, "5")
 
-	_, err := NewProvisionerFromEnv()
+	_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 	if err == nil {
 		t.Fatal("expected invalid default spending limit error")
 	}
@@ -78,11 +315,12 @@ func TestNewProvisionerFromEnvRejectsTooSmallDefaultSpendingLimit(t *testing.T) 
 }
 
 func TestNewProvisionerFromEnvRequiresCloudProviderAndRegion(t *testing.T) {
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "")
 	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
 
-	_, err := NewProvisionerFromEnv()
+	_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 	if err == nil {
 		t.Fatal("expected missing cloud provider error")
 	}
@@ -92,11 +330,12 @@ func TestNewProvisionerFromEnvRequiresCloudProviderAndRegion(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvRejectsNonHTTPSAPIURL(t *testing.T) {
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "http://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
 	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
 
-	_, err := NewProvisionerFromEnv()
+	_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 	if err == nil {
 		t.Fatal("expected invalid api URL error")
 	}
@@ -106,12 +345,13 @@ func TestNewProvisionerFromEnvRejectsNonHTTPSAPIURL(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvRejectsInvalidDefaultDatabaseName(t *testing.T) {
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
 	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
 	t.Setenv(EnvTiDBCloudNativeDefaultDatabaseName, "test")
 
-	_, err := NewProvisionerFromEnv()
+	_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 	if err == nil {
 		t.Fatal("expected invalid database name error")
 	}
@@ -121,12 +361,13 @@ func TestNewProvisionerFromEnvRejectsInvalidDefaultDatabaseName(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvRejectsInvalidDefaultSpendingLimit(t *testing.T) {
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
 	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
 	t.Setenv(EnvTiDBCloudDefaultSpendingLimit, "-1")
 
-	_, err := NewProvisionerFromEnv()
+	_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 	if err == nil {
 		t.Fatal("expected invalid default spending limit error")
 	}
@@ -468,7 +709,7 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 	}
 	for i, request := range gotBody.Requests {
 		id := fmt.Sprintf("%d", 41+i)
-		if request.Cluster.DisplayName != "tidbcloud-fs-"+poolUUIDs[i] {
+		if request.Cluster.DisplayName != "fs-shared-pool-"+poolUUIDs[i] {
 			t.Fatalf("request %d displayName = %q", i, request.Cluster.DisplayName)
 		}
 		if request.Cluster.RootPassword != "durable-password-"+id || request.Cluster.SpendingLimit.Monthly != 1_000_000 {
@@ -1929,12 +2170,13 @@ func TestWaitForBranchUserWithCredentialsUsesUserPrefix(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvReadsPrivateEndpointFlag(t *testing.T) {
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
 	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
 
 	defaultUse := false
-	p, err := NewProvisionerFromEnv()
+	p, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 	if err != nil {
 		t.Fatalf("NewProvisionerFromEnv: %v", err)
 	}
@@ -1943,7 +2185,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointFlag(t *testing.T) {
 	}
 
 	t.Setenv(EnvTiDBCloudNativeUsePrivateEndpoint, "true")
-	p, err = NewProvisionerFromEnv()
+	p, err = NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 	if err != nil {
 		t.Fatalf("NewProvisionerFromEnv with true: %v", err)
 	}
@@ -1952,7 +2194,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointFlag(t *testing.T) {
 	}
 
 	t.Setenv(EnvTiDBCloudNativeUsePrivateEndpoint, "1")
-	p, err = NewProvisionerFromEnv()
+	p, err = NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 	if err != nil {
 		t.Fatalf("NewProvisionerFromEnv with 1: %v", err)
 	}
@@ -1961,7 +2203,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointFlag(t *testing.T) {
 	}
 
 	t.Setenv(EnvTiDBCloudNativeUsePrivateEndpoint, "no")
-	p, err = NewProvisionerFromEnv()
+	p, err = NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 	if err != nil {
 		t.Fatalf("NewProvisionerFromEnv with no: %v", err)
 	}
@@ -1971,13 +2213,14 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointFlag(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvRejectsMalformedPrivateEndpointFlag(t *testing.T) {
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
 	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
 
 	for _, v := range []string{"on", "Y", "ture", "enabled", "2", "enable"} {
 		t.Setenv(EnvTiDBCloudNativeUsePrivateEndpoint, v)
-		_, err := NewProvisionerFromEnv()
+		_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 		if err == nil {
 			t.Fatalf("expected error for %q, got nil", v)
 		}
@@ -1987,6 +2230,7 @@ func TestNewProvisionerFromEnvRejectsMalformedPrivateEndpointFlag(t *testing.T) 
 func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 	setPrivateEnv := func(t *testing.T, provider string) {
 		t.Helper()
+		t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 		t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 		t.Setenv(EnvTiDBCloudNativeCloudProvider, provider)
 		t.Setenv(EnvTiDBCloudNativeRegion, "ap-southeast-1")
@@ -1998,7 +2242,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 
 	t.Run("alicloud no startup override required", func(t *testing.T) {
 		setPrivateEnv(t, "alicloud")
-		p, err := NewProvisionerFromEnv()
+		p, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 		if err != nil {
 			t.Fatalf("NewProvisionerFromEnv without alicloud host override: %v", err)
 		}
@@ -2010,7 +2254,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 	t.Run("alicloud legacy domain fallback", func(t *testing.T) {
 		setPrivateEnv(t, "alicloud")
 		t.Setenv(EnvTiDBCloudAlicloudPrivateEndpointDomain, "alicloud.internal")
-		p, err := NewProvisionerFromEnv()
+		p, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 		if err != nil {
 			t.Fatalf("NewProvisionerFromEnv with alicloud domain: %v", err)
 		}
@@ -2021,7 +2265,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 
 	t.Run("tencentcloud no startup override required", func(t *testing.T) {
 		setPrivateEnv(t, "tencentcloud")
-		p, err := NewProvisionerFromEnv()
+		p, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 		if err != nil {
 			t.Fatalf("NewProvisionerFromEnv without tencentcloud host override: %v", err)
 		}
@@ -2033,7 +2277,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 	t.Run("tencentcloud legacy host fallback", func(t *testing.T) {
 		setPrivateEnv(t, "tencentcloud")
 		t.Setenv(EnvTiDBCloudTencentPrivateEndpointHost, "tencent.internal")
-		p, err := NewProvisionerFromEnv()
+		p, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 		if err != nil {
 			t.Fatalf("NewProvisionerFromEnv with tencentcloud host: %v", err)
 		}
@@ -2044,7 +2288,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 
 	t.Run("aws no override required", func(t *testing.T) {
 		setPrivateEnv(t, "aws")
-		p, err := NewProvisionerFromEnv()
+		p, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 		if err != nil {
 			t.Fatalf("NewProvisionerFromEnv with aws and no override: %v", err)
 		}
@@ -2056,7 +2300,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 	t.Run("host map", func(t *testing.T) {
 		setPrivateEnv(t, "tencentcloud")
 		t.Setenv(EnvTiDBCloudPrivateEndpointHostMap, "public-a.example=private-a.internal, public-b.example:private-b.internal")
-		p, err := NewProvisionerFromEnv()
+		p, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
 		if err != nil {
 			t.Fatalf("NewProvisionerFromEnv with host map: %v", err)
 		}

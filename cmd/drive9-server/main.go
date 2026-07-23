@@ -232,16 +232,12 @@ func main() {
 	case tenant.ProviderTiDBZero:
 		provisioner, provisionerErr = tidbzero.NewProvisionerFromEnv()
 	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBCloudNativeShared:
-		provisioner, provisionerErr = tidbcloudnative.NewProvisionerFromEnv()
+		provisioner, provisionerErr = tidbcloudnative.NewProvisionerFromEnv(providerType)
 	case tenant.ProviderDB9:
 		provisioner, provisionerErr = db9.NewProvisionerFromEnv()
 	}
 	if provisionerErr != nil {
-		isWanted := false
-		if tenant.UsesTiDBCloudNativeCredentials(providerType) && os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_API_URL") != "" {
-			isWanted = true
-		}
-		if isWanted {
+		if tenant.UsesTiDBCloudNativeCredentials(providerType) {
 			logger.Error(context.Background(), "provisioner_failed", zap.String("provider", providerType), zap.Error(provisionerErr))
 			os.Exit(1)
 		}
@@ -667,11 +663,14 @@ environment:
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_native|tidb_cloud_native_shared (default for provisioning)
   DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default TiDB Cloud Cluster spendingLimit.monthly; native defaults to 1000 when unset
   DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Cluster API base URL for tidb_cloud_native
+  DRIVE9_TIDBCLOUD_IAM_API_URL TiDB Cloud IAM API base URL; required for tidb_cloud_native and tidb_cloud_native_shared
   DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER cloud provider for tidb_cloud_native cluster creation, e.g. aws
   DRIVE9_TIDBCLOUD_NATIVE_REGION region for tidb_cloud_native cluster creation, e.g. us-east-1
   DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidb_cloud_native database name (default: tidbcloud_fs)
   DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY optional default TiDB Cloud API public key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY optional default TiDB Cloud API private key for tidb_cloud_native create/delete when caller omits it
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_PUBLIC_KEY server-managed TiDB Cloud API public key for shared DB pool operations; required for tidb_cloud_native_shared
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_PRIVATE_KEY server-managed TiDB Cloud API private key for shared DB pool operations; required for tidb_cloud_native_shared
   DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT true|false to use TiDB Cloud private endpoint hosts for tidb_cloud_native
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_MAX_TENANTS soft capacity for new managed shared DB pools (default: 100)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO emergency hard-cap ratio > 1 after physical create failure (default: 1.2)

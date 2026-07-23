@@ -2597,14 +2597,14 @@ func (s *Store) ListTenantsByTiDBCloudOrgClusterBindings(ctx context.Context, bi
 	return scanTenantBindingRows(rows)
 }
 
-// ListTenantsByTiDBCloudResources lists dedicated tenants through their
-// tenant binding and shared tenants through the physical db_pool resource.
-// Pagination is applied after both provider sources are combined.
-func (s *Store) ListTenantsByTiDBCloudResources(ctx context.Context, bindings []TenantTiDBCloudOrgBinding, offset, limit int) (out []Tenant, err error) {
+// ListTenantsByTiDBCloudOrganization lists dedicated and shared tenants owned
+// by one IAM-authenticated TiDB Cloud organization. Pagination is applied
+// after both provider sources are combined.
+func (s *Store) ListTenantsByTiDBCloudOrganization(ctx context.Context, organizationID string, offset, limit int) (out []Tenant, err error) {
 	start := time.Now()
-	defer observeMeta(ctx, "list_tenants_by_tidbcloud_resources", start, &err)
-	bindings = compactTiDBCloudOrgClusterBindings(bindings)
-	if len(bindings) == 0 {
+	defer observeMeta(ctx, "list_tenants_by_tidbcloud_organization", start, &err)
+	organizationID = strings.TrimSpace(organizationID)
+	if organizationID == "" {
 		return []Tenant{}, nil
 	}
 	if offset < 0 {
@@ -2613,23 +2613,8 @@ func (s *Store) ListTenantsByTiDBCloudResources(ctx context.Context, bindings []
 	if limit <= 0 {
 		limit = 10
 	}
-	placeholders := make([]string, 0, len(bindings))
-	resourceArgs := make([]any, 0, len(bindings)*2)
-	clusterPlaceholders := make([]string, 0, len(bindings))
-	clusterArgs := make([]any, 0, len(bindings))
-	for _, binding := range bindings {
-		placeholders = append(placeholders, "(?, ?)")
-		resourceArgs = append(resourceArgs, binding.OrganizationID, binding.ClusterID)
-		clusterPlaceholders = append(clusterPlaceholders, "?")
-		clusterArgs = append(clusterArgs, binding.ClusterID)
-	}
-	resources := strings.Join(placeholders, ",")
-	clusters := strings.Join(clusterPlaceholders, ",")
-	args := []any{TenantDeleted, tidbCloudNativeProvider}
-	args = append(args, resourceArgs...)
-	args = append(args, TenantPoolBindingFree, tidbCloudNativeSharedProvider)
-	args = append(args, clusterArgs...)
-	args = append(args, TenantPoolBindingFree, limit, offset)
+	args := []any{TenantDeleted, tidbCloudNativeProvider, organizationID, TenantPoolBindingFree,
+		tidbCloudNativeSharedProvider, organizationID, SharedDBOrgWildcard, TenantPoolBindingFree, limit, offset}
 	query := `SELECT
 			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
@@ -2640,7 +2625,7 @@ func (s *Store) ListTenantsByTiDBCloudResources(ctx context.Context, bindings []
 			(t.provider = ? AND EXISTS (
 				SELECT 1 FROM tenant_tidbcloud_org_bindings b
 				WHERE b.tenant_id = t.id
-					AND (b.organization_id, b.cluster_id) IN (` + resources + `)
+					AND b.organization_id = ?
 					AND b.pool_status <> ?
 			)) OR
 			(t.provider = ? AND EXISTS (
@@ -2648,7 +2633,7 @@ func (s *Store) ListTenantsByTiDBCloudResources(ctx context.Context, bindings []
 				JOIN tenant_placements p ON p.fs_id = f.fs_id
 				JOIN db_pool d ON d.db_id = p.db_id
 				WHERE f.tenant_id = t.id
-					AND d.cluster_id IN (` + clusters + `)
+					AND d.org_id IN (?, ?)
 					AND NOT EXISTS (
 						SELECT 1 FROM tenant_pool_memberships m
 						WHERE m.tenant_id = t.id AND m.pool_status = ?

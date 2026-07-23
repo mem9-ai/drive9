@@ -707,15 +707,11 @@ func (s *Server) refreshTenantPoolCapacity(ctx context.Context, pool *meta.Tenan
 }
 
 func (s *Server) firstManagedOrganization(ctx context.Context, cred tenant.CredentialProvisionRequest) (string, error) {
-	// Resolve through the RBAC list cache so repeated org lookups on the same
-	// request path (warm-pool claim + shared-pool check) and across
-	// consecutive provisions do not each cost a TiDB Cloud list call. The
-	// cache is invalidated on tenant mutations (forgetTiDBCloudRBACList).
-	clusters, err := s.listAllManagedClusters(ctx, cred, "", "provision_org_resolve")
-	if err != nil || len(clusters) == 0 {
+	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, "provision_org_resolve")
+	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(clusters[0].OrganizationID), nil
+	return identity.OrganizationID, nil
 }
 
 func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count int, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) ([]*provisionTenantResult, error) {
@@ -1002,7 +998,7 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 		createdIDs = append(createdIDs, id)
 	}
 	sort.Slice(createdIDs, func(i, j int) bool { return createdIDs[i] < createdIDs[j] })
-	resolvedOrg, err := s.provisionManagedSharedDBPoolsBatch(ctx, createdIDs, cred)
+	resolvedOrg, err := s.provisionManagedSharedDBPoolsBatch(ctx, createdIDs)
 	if err != nil {
 		return results, err
 	}
@@ -1021,15 +1017,23 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 	for dbID := range provisioningPoolIDs {
 		provisioningIDs = append(provisioningIDs, dbID)
 	}
-	s.scheduleManagedSharedDBContinuations(ctx, provisioningIDs, cred)
+	s.scheduleManagedSharedDBContinuations(ctx, provisioningIDs)
 	return results, nil
 }
 
-func (s *Server) provisionManagedSharedDBPoolsBatch(ctx context.Context, dbIDs []int64, cred tenant.CredentialProvisionRequest) (string, error) {
+func (s *Server) provisionManagedSharedDBPoolsBatch(ctx context.Context, dbIDs []int64) (string, error) {
 	if len(dbIDs) == 0 {
 		return "", nil
 	}
 	provisioner := s.provisioner.(tenant.SharedDBPoolProvisioner)
+	first, err := s.meta.GetSharedDB(ctx, dbIDs[0])
+	if err != nil {
+		return "", err
+	}
+	cred, err := s.sharedDBCloudCredentials(ctx, first.TiDBCloudOrganizationID)
+	if err != nil {
+		return "", err
+	}
 	resolvedOrg := ""
 	for start := 0; start < len(dbIDs); start += 10 {
 		end := start + 10

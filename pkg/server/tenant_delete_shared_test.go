@@ -244,21 +244,20 @@ func TestSharedTenantDeleteFullPurgePath(t *testing.T) {
 	}
 }
 
-func TestAdminTenantCreateRejectsSharedPoolWithoutCloudIdentity(t *testing.T) {
+func TestAdminTenantCreateAllowsSharedPoolWithoutCloudClusterIdentity(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{
-		{Clusters: []tenant.CloudClusterInfo{{ClusterID: "cluster-org-probe", OrganizationID: "org-shared-1"}}},
-	}
-	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-shared-1", Role: tenant.TiDBCloudRoleOrgOwner,
+	}}
+	if _, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-1",
 		Host:                    "shared.example.com",
 		Port:                    4000,
 		User:                    "root",
 		PasswordCipher:          []byte("cipher"),
 		Name:                    "shared_db",
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
 	}
 
@@ -278,45 +277,30 @@ func TestAdminTenantCreateRejectsSharedPoolWithoutCloudIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
+	if resp.StatusCode != http.StatusAccepted {
+		responseBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d: %s", resp.StatusCode, http.StatusAccepted, responseBody)
 	}
 	var tenantCount int
 	if err := rt.meta.DB().QueryRow("SELECT COUNT(*) FROM tenants").Scan(&tenantCount); err != nil {
 		t.Fatal(err)
 	}
-	if tenantCount != 1 {
-		t.Fatalf("tenants = %d, want 1", tenantCount)
-	}
-	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE db_pool SET cluster_id = ? WHERE db_id = ?", "cluster-shared-admin-create", dbID); err != nil {
-		t.Fatalf("set shared cluster identity: %v", err)
-	}
-	manageableReq, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/admin/tenants", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	manageableReq.Header.Set("Content-Type", "application/json")
-	manageableResp, err := http.DefaultClient.Do(manageableReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = manageableResp.Body.Close() }()
-	if manageableResp.StatusCode != http.StatusAccepted {
-		t.Fatalf("manageable shared pool status = %d, want %d", manageableResp.StatusCode, http.StatusAccepted)
-	}
-	if err := rt.meta.DB().QueryRow("SELECT COUNT(*) FROM tenants").Scan(&tenantCount); err != nil {
-		t.Fatal(err)
-	}
 	if tenantCount != 2 {
-		t.Fatalf("tenants after manageable create = %d, want 2", tenantCount)
+		t.Fatalf("tenants = %d, want 2", tenantCount)
+	}
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("cluster list calls = %d, want 0", got)
+	}
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM calls = %d, want 1", got)
 	}
 }
 
 func TestAdminTenantCreatePersistsSharedQuotaSizesInBytes(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{ClusterID: "cluster-shared-quota", OrganizationID: "org-shared-quota"}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-shared-quota", Role: tenant.TiDBCloudRoleProjectOwner,
 	}}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-quota", Host: "shared.example.com", Port: 4000,
@@ -360,6 +344,7 @@ func TestAdminTenantCreatePersistsSharedQuotaSizesInBytes(t *testing.T) {
 
 func TestAdminTenantGetAuthorizesSharedProviderThroughPhysicalPool(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{OrganizationID: "org-shared-admin", Role: tenant.TiDBCloudRoleOrgOwner}}
 	ctx := context.Background()
 	if err := rt.meta.UpdateTenantProvider(ctx, rt.tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
 		t.Fatalf("UpdateTenantProvider: %v", err)
@@ -410,17 +395,14 @@ func TestAdminTenantGetAuthorizesSharedProviderThroughPhysicalPool(t *testing.T)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
-	if got := rt.prov.getCalls.Load(); got != 1 {
-		t.Fatalf("physical pool authorization calls = %d, want 1", got)
-	}
-	cluster := rt.prov.lastClusterSnapshot()
-	if cluster == nil || cluster.ClusterID != "cluster-shared-admin" || cluster.OrganizationID != "org-shared-admin" {
-		t.Fatalf("authorized physical cluster = %#v", cluster)
+	if got := rt.prov.iamCalls.Load(); got != 1 {
+		t.Fatalf("IAM authorization calls = %d, want 1", got)
 	}
 }
 
 func TestAdminTenantQuotaSetSharedUpdatesVirtualQuotaOnly(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{OrganizationID: "org-shared-admin", Role: tenant.TiDBCloudRoleProjectOwner}}
 	ctx := context.Background()
 	if err := rt.meta.UpdateTenantProvider(ctx, rt.tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
 		t.Fatalf("UpdateTenantProvider: %v", err)
@@ -484,6 +466,7 @@ func TestAdminTenantQuotaSetSharedUpdatesVirtualQuotaOnly(t *testing.T) {
 
 func TestAdminTenantDeleteSharedNeverDeprovisionsPhysicalPool(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{OrganizationID: "org-shared-admin-delete", Role: tenant.TiDBCloudRoleOrgOwner}}
 	ctx := context.Background()
 	if err := rt.meta.UpdateTenantProvider(ctx, rt.tenantID, tenant.ProviderTiDBCloudNativeShared); err != nil {
 		t.Fatalf("UpdateTenantProvider: %v", err)

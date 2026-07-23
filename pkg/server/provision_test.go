@@ -25,43 +25,51 @@ import (
 )
 
 type fakeProvisioner struct {
-	provider               string
-	cloudProvider          string
-	region                 string
-	cluster                *tenant.ClusterInfo
-	initErr                error
-	provisionErr           error
-	systemUserErr          error
-	systemUsername         string
-	systemPassword         string
-	deprovisionErr         error
-	quotaMarkErr           error
-	quotaUpdateErr         error
-	provisionCalls         atomic.Int32
-	credentialCalls        atomic.Int32
-	credentialQuotaCalls   atomic.Int32
-	systemUserCalls        atomic.Int32
-	deprovisionCalls       atomic.Int32
-	quotaMarkCalls         atomic.Int32
-	quotaUpdateCalls       atomic.Int32
-	sharedPoolBatchCalls   atomic.Int32
-	sharedPoolBatchMembers atomic.Int32
-	lastCredentialReq      tenant.CredentialProvisionRequest
-	lastDeprovision        *tenant.ClusterInfo
-	lastQuotaCluster       *tenant.ClusterInfo
-	lastQuotaOptions       tenant.QuotaUpdateOptions
-	lastCreateQuotaOptions tenant.QuotaUpdateOptions
-	defaultPublicKey       string
-	defaultPrivateKey      string
-	managedClusters        []tenant.CloudClusterInfo
-	sharedPoolResults      []*tenant.SharedDBPoolInfo
-	sharedPoolBatchErr     error
-	sharedPoolBatchStarted chan struct{}
-	sharedPoolBatchRelease <-chan struct{}
-	sharedPoolWaitCalls    atomic.Int32
-	sharedPoolWaitErr      error
-	sharedPoolLoadIDs      chan int64
-	sharedPoolWaitRelease  <-chan struct{}
+	provider                string
+	cloudProvider           string
+	region                  string
+	cluster                 *tenant.ClusterInfo
+	initErr                 error
+	provisionErr            error
+	systemUserErr           error
+	systemUsername          string
+	systemPassword          string
+	deprovisionErr          error
+	quotaMarkErr            error
+	quotaUpdateErr          error
+	provisionCalls          atomic.Int32
+	credentialCalls         atomic.Int32
+	credentialQuotaCalls    atomic.Int32
+	systemUserCalls         atomic.Int32
+	deprovisionCalls        atomic.Int32
+	quotaMarkCalls          atomic.Int32
+	quotaUpdateCalls        atomic.Int32
+	sharedPoolBatchCalls    atomic.Int32
+	sharedPoolBatchMembers  atomic.Int32
+	lastCredentialReq       tenant.CredentialProvisionRequest
+	lastDeprovision         *tenant.ClusterInfo
+	lastQuotaCluster        *tenant.ClusterInfo
+	lastQuotaOptions        tenant.QuotaUpdateOptions
+	lastCreateQuotaOptions  tenant.QuotaUpdateOptions
+	defaultPublicKey        string
+	defaultPrivateKey       string
+	defaultSharedPublicKey  string
+	defaultSharedPrivateKey string
+	lastSharedCredentialReq tenant.CredentialProvisionRequest
+	iamCalls                atomic.Int32
+	iamMu                   sync.Mutex
+	iamCredentials          []tenant.CredentialProvisionRequest
+	identityOrg             string
+	identityRole            string
+	managedClusters         []tenant.CloudClusterInfo
+	sharedPoolResults       []*tenant.SharedDBPoolInfo
+	sharedPoolBatchErr      error
+	sharedPoolBatchStarted  chan struct{}
+	sharedPoolBatchRelease  <-chan struct{}
+	sharedPoolWaitCalls     atomic.Int32
+	sharedPoolWaitErr       error
+	sharedPoolLoadIDs       chan int64
+	sharedPoolWaitRelease   <-chan struct{}
 }
 
 type failingEncryptor struct {
@@ -90,6 +98,47 @@ func (f *fakeProvisioner) DefaultCredentials() (tenant.CredentialProvisionReques
 		PublicKey:  f.defaultPublicKey,
 		PrivateKey: f.defaultPrivateKey,
 	}, true
+}
+
+func (f *fakeProvisioner) DefaultSharedCredentials() (tenant.CredentialProvisionRequest, bool) {
+	if f.defaultSharedPublicKey == "" && f.defaultSharedPrivateKey == "" {
+		return tenant.CredentialProvisionRequest{PublicKey: "shared-public", PrivateKey: "shared-private"}, true
+	}
+	if f.defaultSharedPublicKey == "" || f.defaultSharedPrivateKey == "" {
+		return tenant.CredentialProvisionRequest{}, false
+	}
+	return tenant.CredentialProvisionRequest{PublicKey: f.defaultSharedPublicKey, PrivateKey: f.defaultSharedPrivateKey}, true
+}
+
+func (f *fakeProvisioner) ResolveAPIKeyIdentity(_ context.Context, req tenant.CredentialProvisionRequest) (*tenant.TiDBCloudAPIKeyIdentity, error) {
+	f.iamCalls.Add(1)
+	f.iamMu.Lock()
+	f.iamCredentials = append(f.iamCredentials, req)
+	f.iamMu.Unlock()
+	orgID := f.identityOrg
+	if orgID == "" && f.cluster != nil {
+		orgID = f.cluster.OrganizationID
+	}
+	if orgID == "" && len(f.managedClusters) > 0 {
+		orgID = f.managedClusters[0].OrganizationID
+	}
+	if orgID == "" && len(f.sharedPoolResults) > 0 {
+		orgID = f.sharedPoolResults[0].OrganizationID
+	}
+	if orgID == "" {
+		orgID = "org-shared"
+	}
+	role := f.identityRole
+	if role == "" {
+		role = tenant.TiDBCloudRoleOrgOwner
+	}
+	return &tenant.TiDBCloudAPIKeyIdentity{OrganizationID: orgID, Role: role}, nil
+}
+
+func (f *fakeProvisioner) iamCredentialsSnapshot() []tenant.CredentialProvisionRequest {
+	f.iamMu.Lock()
+	defer f.iamMu.Unlock()
+	return append([]tenant.CredentialProvisionRequest(nil), f.iamCredentials...)
 }
 
 func (f *fakeProvisioner) ProviderType() string { return f.provider }
@@ -130,6 +179,7 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 	prov := &fakeProvisioner{
 		provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1",
 		defaultPublicKey: "public", defaultPrivateKey: "private",
+		defaultSharedPublicKey: "shared-public", defaultSharedPrivateKey: "shared-private",
 		sharedPoolResults: []*tenant.SharedDBPoolInfo{{
 			ClusterID: "cluster-shared", OrganizationID: "org-shared", Password: "root-pass", DBName: "tidbcloud_fs",
 		}},
@@ -192,6 +242,15 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 	}
 	if prov.sharedPoolBatchCalls.Load() != 1 {
 		t.Fatalf("shared pool batch calls = %d, want 1", prov.sharedPoolBatchCalls.Load())
+	}
+	if got := prov.lastSharedCredentialReq; got.PublicKey != "shared-public" || got.PrivateKey != "shared-private" {
+		t.Fatalf("shared physical credential = %+v, want configured shared credential", got)
+	}
+	iamCredentials := prov.iamCredentialsSnapshot()
+	if len(iamCredentials) != 2 ||
+		iamCredentials[0].PublicKey != "public" || iamCredentials[0].PrivateKey != "private" ||
+		iamCredentials[1].PublicKey != "shared-public" || iamCredentials[1].PrivateKey != "shared-private" {
+		t.Fatalf("IAM credentials = %+v, want customer authorization followed by shared physical authorization", iamCredentials)
 	}
 }
 
@@ -437,7 +496,7 @@ func TestProvisionTiDBCloudNativeSharedResumesExistingProvisioningPool(t *testin
 	spendingTarget := meta.MaxTiDBCloudSpendingLimit
 	provisioningKey := sharedDBProvisioningKey(tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
 	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
-		ProvisioningKey: provisioningKey, CloudProvider: "aws", Region: "us-east-1",
+		TiDBCloudOrganizationID: "org-shared", ProvisioningKey: provisioningKey, CloudProvider: "aws", Region: "us-east-1",
 		MaxTenants: 100, SpendingLimit: &spendingTarget,
 	})
 	if err != nil {
@@ -628,8 +687,7 @@ func TestManagedSharedDBContinuationWaitsForConnectionMetadata(t *testing.T) {
 	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov,
 		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: make([]byte, 32)})
 	defer srv.Close()
-	err = srv.continueManagedSharedDBPool(context.Background(), dbID,
-		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
+	err = srv.continueManagedSharedDBPool(context.Background(), dbID)
 	if !errors.Is(err, waitErr) {
 		t.Fatalf("continueManagedSharedDBPool error = %v, want %v", err, waitErr)
 	}
@@ -772,9 +830,7 @@ func TestManagedSharedDBContinuationBatchesDoNotEnterBlockingMetadataWait(t *tes
 		cancel()
 		srv.forkWorkerWG.Wait()
 	})
-	srv.scheduleManagedSharedDBContinuations(context.Background(), []int64{firstID, secondID}, tenant.CredentialProvisionRequest{
-		PublicKey: "public", PrivateKey: "private",
-	})
+	srv.scheduleManagedSharedDBContinuations(context.Background(), []int64{firstID, secondID})
 
 	select {
 	case got := <-loadIDs:
@@ -838,6 +894,62 @@ func TestManagedSharedDBContinuationBatchesDoNotEnterBlockingMetadataWait(t *tes
 	<-resumeDone
 }
 
+func TestManagedSharedDBContinuationKeepsRootAndSkipsSystemUser(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-root", ProvisioningKey: bytes.Repeat([]byte{9}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+		PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.UpdateManagedSharedDBPoolCloudResult(context.Background(), &meta.SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-root", ClusterID: "cluster-root",
+		Host: "127.0.0.1", Port: 1, User: "prefix.root", PasswordCipher: passwordCipher,
+		Name: "tidbcloud_fs", TLSMode: "true",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := metaStore.GetSharedDB(context.Background(), dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	systemUserErr := errors.New("system user creation must not run for shared DB")
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, systemUserErr: systemUserErr}
+	srv := &Server{meta: metaStore, pool: pool, provisioner: prov, tidbCloudRBACCache: newTiDBCloudRBACCache(time.Hour)}
+	err = srv.continueManagedSharedDBPoolLocked(context.Background(), row, tenant.CredentialProvisionRequest{
+		PublicKey: "shared-public", PrivateKey: "shared-private",
+	})
+	if errors.Is(err, systemUserErr) {
+		t.Fatalf("shared continuation attempted system-user creation: %v", err)
+	}
+	if got := prov.systemUserCalls.Load(); got != 0 {
+		t.Fatalf("shared system-user calls = %d, want 0", got)
+	}
+}
+
 func TestManagedSharedDBBatchCreateUsesAllocationLock(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -876,16 +988,15 @@ func TestManagedSharedDBBatchCreateUsesAllocationLock(t *testing.T) {
 	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov,
 		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: make([]byte, 32)})
 	defer srv.Close()
-	cred := tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}
 	batchDone := make(chan error, 1)
 	go func() {
-		_, err := srv.provisionManagedSharedDBPoolsBatch(context.Background(), []int64{dbID}, cred)
+		_, err := srv.provisionManagedSharedDBPoolsBatch(context.Background(), []int64{dbID})
 		batchDone <- err
 	}()
 	<-started
 	ensureDone := make(chan error, 1)
 	go func() {
-		_, err := srv.ensureManagedSharedDBPhysical(context.Background(), dbID, cred)
+		_, err := srv.ensureManagedSharedDBPhysical(context.Background(), dbID)
 		ensureDone <- err
 	}()
 	secondCreateStarted := false
@@ -939,13 +1050,14 @@ func TestManagedSharedDBBatchCreateReturnsTotalFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantErr := errors.New("cloud batch rejected")
-	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, sharedPoolBatchErr: wantErr}
+	prov := &fakeProvisioner{
+		provider: tenant.ProviderTiDBCloudNative, identityOrg: "org-batch-failure", sharedPoolBatchErr: wantErr,
+	}
 	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov,
 		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: make([]byte, 32)})
 	defer srv.Close()
 
-	_, err = srv.provisionManagedSharedDBPoolsBatch(context.Background(), []int64{dbID},
-		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
+	_, err = srv.provisionManagedSharedDBPoolsBatch(context.Background(), []int64{dbID})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("batch error = %v, want %v", err, wantErr)
 	}
@@ -970,9 +1082,10 @@ func (f *fakeProvisioner) ListManagedClusters(_ context.Context, _ tenant.Creden
 	return &tenant.ManagedClusterListResult{Clusters: append([]tenant.CloudClusterInfo(nil), f.managedClusters...)}, nil
 }
 
-func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Context, requests []tenant.SharedDBPoolCreateRequest, _ tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
+func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Context, requests []tenant.SharedDBPoolCreateRequest, cred tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
 	f.sharedPoolBatchCalls.Add(1)
 	f.sharedPoolBatchMembers.Add(int32(len(requests)))
+	f.lastSharedCredentialReq = cred
 	if f.sharedPoolBatchStarted != nil {
 		select {
 		case f.sharedPoolBatchStarted <- struct{}{}:
@@ -1216,6 +1329,12 @@ func TestClientFacingErrorResponseMapsTiDBCloudClientErrors(t *testing.T) {
 			wantBody:   "access denied",
 		},
 		{
+			name:       "insufficient IAM role hides resolver detail",
+			err:        fmt.Errorf("%w: org:viewer SENSITIVE_RESOLVER_DETAIL", tenant.ErrTiDBCloudRoleInsufficient),
+			wantStatus: http.StatusForbidden,
+			wantBody:   tenant.ErrTiDBCloudRoleInsufficient.Error(),
+		},
+		{
 			name:       "generic error hides detail",
 			err:        errors.New("internal upstream detail"),
 			wantStatus: http.StatusBadGateway,
@@ -1235,6 +1354,9 @@ func TestClientFacingErrorResponseMapsTiDBCloudClientErrors(t *testing.T) {
 			}
 			if strings.Contains(gotMsg, "internal upstream detail") {
 				t.Fatalf("msg = %q, should not expose generic upstream details", gotMsg)
+			}
+			if strings.Contains(gotMsg, "SENSITIVE_RESOLVER_DETAIL") {
+				t.Fatalf("msg = %q, should not expose IAM resolver details", gotMsg)
 			}
 		})
 	}
@@ -1297,6 +1419,13 @@ type credentialOnlyProvisioner struct {
 }
 
 func (f *credentialOnlyProvisioner) ProviderType() string { return f.provider }
+
+func (f *credentialOnlyProvisioner) ResolveAPIKeyIdentity(context.Context, tenant.CredentialProvisionRequest) (*tenant.TiDBCloudAPIKeyIdentity, error) {
+	return &tenant.TiDBCloudAPIKeyIdentity{
+		OrganizationID: f.cluster.OrganizationID,
+		Role:           tenant.TiDBCloudRoleOrgOwner,
+	}, nil
+}
 
 func (f *credentialOnlyProvisioner) InitSchema(_ context.Context, _ string) error { return nil }
 

@@ -70,8 +70,8 @@ func TestRetryTenantPoolClaimCASDoesNotRetryBusinessError(t *testing.T) {
 func TestTenantPoolClaimUsesNativeInventoryBeforeExternalSharedPool(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{OrganizationID: "org-mixed-inventory"}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-mixed-inventory", Role: tenant.TiDBCloudRoleOrgOwner,
 	}}
 	now := time.Now().UTC()
 	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
@@ -105,10 +105,9 @@ func TestTenantPoolClaimConsumesMixedInventoryInGlobalAgeOrder(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.server.defaultTenantProvider = tenant.ProviderTiDBCloudNativeShared
 	ctx := context.Background()
-	orgPage := &tenant.ManagedClusterListResult{
-		Clusters: []tenant.CloudClusterInfo{{OrganizationID: "org-mixed-age"}},
-	}
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{orgPage, orgPage}
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-mixed-age", Role: tenant.TiDBCloudRoleProjectOwner,
+	}}
 	now := time.Now().UTC()
 	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
 		PoolID: "pool-mixed-age", OrganizationID: "org-mixed-age", Size: 2,

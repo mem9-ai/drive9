@@ -165,8 +165,8 @@ func TestTenantFailedCleanupAsyncRollsBackStateWhenServerRejectsWorker(t *testin
 func TestTenantPoolClaimReturnsWithoutWaitingForFailedCleanupAndPassesCredentials(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{OrganizationID: failedCleanupTestOrganizationID}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: failedCleanupTestOrganizationID, Role: tenant.TiDBCloudRoleOrgOwner,
 	}}
 	started := make(chan tenant.CredentialProvisionRequest, 1)
 	release := make(chan struct{})
@@ -222,8 +222,8 @@ func TestTenantPoolClaimReturnsWithoutWaitingForFailedCleanupAndPassesCredential
 func TestTenantPoolClaimTriggersDirectFailedCleanupWithoutLogicalPool(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{OrganizationID: failedCleanupTestOrganizationID}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: failedCleanupTestOrganizationID, Role: tenant.TiDBCloudRoleOrgOwner,
 	}}
 	old := time.Now().UTC().Add(-time.Hour)
 	directTenantID := rt.tenantID
@@ -253,8 +253,8 @@ func TestTenantPoolClaimTriggersDirectFailedCleanupWithoutLogicalPool(t *testing
 func TestTenantPoolClaimResultUnaffectedByFailedCleanupError(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
-		Clusters: []tenant.CloudClusterInfo{{OrganizationID: failedCleanupTestOrganizationID}},
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: failedCleanupTestOrganizationID, Role: tenant.TiDBCloudRoleOrgOwner,
 	}}
 	old := time.Now().UTC().Add(-time.Hour)
 	setFailedCleanupTenant(t, rt, rt.tenantID, tenant.ProviderTiDBCloudNative, "cluster-cleanup-fails", "", old)
