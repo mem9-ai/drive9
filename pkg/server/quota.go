@@ -28,9 +28,12 @@ type quotaRequest struct {
 }
 
 type quotaFields struct {
-	MaxStorageSize         *int64 `json:"max_storage_size,omitempty"`
-	MaxFileSize            *int64 `json:"max_file_size,omitempty"`
-	MaxFileCount           *int64 `json:"max_file_count,omitempty"`
+	MaxStorageSize *int64 `json:"max_storage_size,omitempty"`
+	MaxFileSize    *int64 `json:"max_file_size,omitempty"`
+	MaxFileCount   *int64 `json:"max_file_count,omitempty"`
+	// TiDBCloudSpendingLimit is physical for native tenants. For shared tenants,
+	// it is virtual compatibility metadata and does not affect allocation,
+	// capacity, or the shared cluster's physical TiDB Cloud spending limit.
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
 }
 
@@ -51,9 +54,11 @@ type quotaResponse struct {
 }
 
 type quotaConfigResponse struct {
-	MaxStorageSize         int64  `json:"max_storage_size"`
-	MaxFileSize            int64  `json:"max_file_size"`
-	MaxFileCount           int64  `json:"max_file_count"`
+	MaxStorageSize int64 `json:"max_storage_size"`
+	MaxFileSize    int64 `json:"max_file_size"`
+	MaxFileCount   int64 `json:"max_file_count"`
+	// TiDBCloudSpendingLimit is returned for API compatibility. For shared
+	// tenants, it is a virtual value and is not physically enforced.
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
 }
 
