@@ -163,7 +163,7 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 	identity := sharedDBAllocationIdentity(organizationID, provisioningKey)
 	err = s.meta.WithSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
 		for attempt := 0; attempt < 2; attempt++ {
-			candidate, findErr := s.meta.FindSharedDBForAllocation(lockCtx, organizationID, provisioningKey)
+			candidate, findErr := s.meta.FindSharedDBForAllocation(lockCtx, organizationID)
 			if findErr == nil {
 				sharedDB = candidate
 			} else if !errors.Is(findErr, meta.ErrNotFound) {

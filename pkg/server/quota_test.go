@@ -1458,33 +1458,6 @@ func TestAdminTenantListFiltersByIAMOrganization(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	wildcardTenantID := "tenant-shared-wildcard-authorized"
-	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
-		ID: wildcardTenantID, Status: meta.TenantActive, Kind: meta.TenantKindLive,
-		Provider: tenant.ProviderTiDBCloudNativeShared, SchemaVersion: 1, DBPasswordCipher: []byte{},
-		CreatedAt: now.Add(4 * time.Second), UpdatedAt: now.Add(4 * time.Second),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	wildcardFsID, err := rt.meta.ResolveFsID(ctx, wildcardTenantID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wildcardDBID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		TiDBCloudOrganizationID: meta.SharedDBOrgWildcard, Host: "shared-wildcard-list.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := rt.meta.DB().ExecContext(ctx, "UPDATE db_pool SET cluster_id = ? WHERE db_id = ?", "cluster-allowed", wildcardDBID); err != nil {
-		t.Fatal(err)
-	}
-	if err := rt.meta.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
-		FsID: wildcardFsID, DbID: wildcardDBID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
-	}); err != nil {
-		t.Fatal(err)
-	}
 	freeSharedTenantID := "tenant-shared-free-member"
 	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
 		ID: freeSharedTenantID, Status: meta.TenantActive, Kind: meta.TenantKindLive,

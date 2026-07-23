@@ -5072,45 +5072,36 @@ func (s *Server) updateTenantSchemaVersionForProfile(ctx context.Context, tenant
 }
 
 // findSharedDBForProvision resolves whether the tenant being provisioned
-// should be placed on a shared-schema database: a registered shared pool for
-// the request's org, or the wildcard pool. It returns (nil, nil) when the
+// should be placed on a shared-schema database registered for the request's
+// exact TiDB Cloud organization. It returns (nil, nil) when the
 // tenant should follow the normal per-tenant provisioning path. Lookup
 // failures are returned as errors — never silently treated as "no pool",
 // which would provision the wrong tenant shape on a transient meta outage.
 //
-// Only TiDB-dialect providers may route to a shared pool (the shared schema
-// is TiDB/MySQL DDL): db9 tenants are PostgreSQL-backed and engine-
-// incompatible, so a wildcard pool must never capture them.
+// Only TiDB Cloud providers carry an IAM-resolved organization and may route
+// to an organization-bound shared pool.
 func (s *Server) findSharedDBForProvision(ctx context.Context, provider string, opts provisionTenantOptions) (*meta.SharedDB, error) {
 	if s.meta == nil {
 		return nil, nil
 	}
 	switch provider {
-	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBCloudNativeShared, tenant.ProviderTiDBZero:
+	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBCloudNativeShared:
 	default:
 		return nil, nil
 	}
 	orgID := ""
-	if provider == tenant.ProviderTiDBCloudNative || provider == tenant.ProviderTiDBCloudNativeShared {
-		if opts.CredentialProvisioner != nil {
-			if id, err := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner); err == nil {
-				orgID = id
-			} else {
-				logger.Warn(ctx, "server_event", eventFields(ctx, "provision_org_resolve_failed", "error", err)...)
-			}
+	if opts.CredentialProvisioner != nil {
+		if id, err := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner); err == nil {
+			orgID = id
+		} else {
+			logger.Warn(ctx, "server_event", eventFields(ctx, "provision_org_resolve_failed", "error", err)...)
 		}
-		if orgID == "" {
-			if provider == tenant.ProviderTiDBCloudNativeShared {
-				// An explicit shared placement request must fail closed: an
-				// unresolvable org can never silently become a dedicated
-				// cluster (nor match the wildcard pool).
-				return nil, fmt.Errorf("cannot resolve tidbcloud organization for shared-pool placement")
-			}
-			// Never fall back to the wildcard pool when the tenant's org cannot
-			// be resolved: an unresolved org must stay on the dedicated path
-			// even if a wildcard pool exists.
-			return nil, nil
+	}
+	if orgID == "" {
+		if provider == tenant.ProviderTiDBCloudNativeShared {
+			return nil, fmt.Errorf("cannot resolve tidbcloud organization for shared-pool placement")
 		}
+		return nil, nil
 	}
 	sharedDB, err := s.meta.FindSharedDBForOrg(ctx, orgID)
 	if err != nil {
@@ -5360,7 +5351,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 
 	// Shared-pool placement: when a shared-schema database is registered for
-	// this tenant's org (or a wildcard pool exists), the tenant is placed on
+	// this tenant's exact TiDB Cloud organization, the tenant is placed on
 	// it directly — no cluster is created and the schema already exists there.
 	sharedDB, err := s.findSharedDBForProvision(ctx, provider, opts)
 	if err != nil {

@@ -642,16 +642,15 @@ func TestSharedTenantDeletePlacementRemovalFailureStaysRetryable(t *testing.T) {
 	}
 }
 
-// TestFindSharedDBForProvisionSkipsNonTiDBProviders proves a wildcard shared
-// pool only ever captures TiDB-dialect tenants: db9 (PostgreSQL) tenants must
-// never be placed on the TiDB shared schema and relabeled
-// tidb_cloud_native_shared.
+// TestFindSharedDBForProvisionRequiresCloudOrganization proves that shared
+// placement requires an exact customer organization and never captures
+// providers without TiDB Cloud IAM organization data.
 func TestFindSharedDBForProvisionSkipsNonTiDBProviders(t *testing.T) {
 	db := newTenantDeleteDBInfo(t)
 	testmysql.ResetMetaDB(t, db.Meta.DB())
 	ctx := context.Background()
 	if _, err := db.Meta.RegisterSharedDB(ctx, &meta.SharedDB{
-		TiDBCloudOrganizationID: meta.SharedDBOrgWildcard, Host: "shared.example.com", Port: 4000, User: "root",
+		TiDBCloudOrganizationID: "org-exact", Host: "shared.example.com", Port: 4000, User: "root",
 		PasswordCipher: []byte("cipher"), Name: "shared_db",
 	}); err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -665,13 +664,14 @@ func TestFindSharedDBForProvisionSkipsNonTiDBProviders(t *testing.T) {
 	if got != nil {
 		t.Fatalf("db9 matched shared pool %v, want no match", got)
 	}
-	// TiDB-dialect providers still route: tidb_zero matches the wildcard.
+	// tidb_zero has no IAM organization and therefore cannot match an exact
+	// organization-bound shared pool.
 	got, err = s.findSharedDBForProvision(ctx, tenant.ProviderTiDBZero, provisionTenantOptions{})
 	if err != nil {
 		t.Fatalf("tidb_zero lookup: %v", err)
 	}
-	if got == nil {
-		t.Fatal("tidb_zero did not match the wildcard pool, want match")
+	if got != nil {
+		t.Fatalf("tidb_zero matched shared pool %v, want no match", got)
 	}
 }
 

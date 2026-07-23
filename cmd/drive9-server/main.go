@@ -349,21 +349,16 @@ func main() {
 
 		// Optional shared-schema pool: when DRIVE9_SHARED_POOL_DSN is set,
 		// initialize the shared schema on that database and register it in
-		// db_pool so tenants in the matching org are provisioned onto it
-		// instead of getting a dedicated cluster. The org binding is always
-		// explicit — DRIVE9_SHARED_POOL_ORG has no default, and the '*' wildcard
-		// (which places ALL new tenants on the shared pool) is opt-in and loud.
+		// db_pool so tenants in the matching organization are provisioned onto
+		// it instead of getting a dedicated cluster. The organization binding is
+		// always explicit and has no wildcard behavior.
 		if sharedDSN := strings.TrimSpace(os.Getenv("DRIVE9_SHARED_POOL_DSN")); sharedDSN != "" {
 			sharedOrg := strings.TrimSpace(os.Getenv("DRIVE9_SHARED_POOL_ORG"))
 			if sharedOrg == "" {
-				die(fmt.Errorf("DRIVE9_SHARED_POOL_ORG is required when DRIVE9_SHARED_POOL_DSN is set (set an explicit org id; use '*' only to intentionally place ALL new tenants on the shared pool)"))
+				die(fmt.Errorf("DRIVE9_SHARED_POOL_ORG is required when DRIVE9_SHARED_POOL_DSN is set (set one exact TiDB Cloud organization id)"))
 			}
-			if err := registerSharedPoolFromEnv(context.Background(), store, pool, sharedDSN, sharedOrg); err != nil {
+			if err := registerSharedPoolFromEnv(context.Background(), store, pool, sharedDSN, sharedOrg, sharedDBMaxTenants); err != nil {
 				die(fmt.Errorf("register shared pool: %w", err))
-			}
-			if sharedOrg == meta.SharedDBOrgWildcard {
-				logger.Warn(context.Background(), "shared_pool_wildcard_all_new_tenants",
-					zap.String("warning", "ALL new tenants will be provisioned onto the shared pool"))
 			}
 			logger.Info(context.Background(), "shared_pool_registered",
 				zap.String("org", sharedOrg))
@@ -491,7 +486,7 @@ func envOr(key, fallback string) string {
 // dsn and upserts it into db_pool with the given org binding. The DSN carries
 // a plaintext password (local/dev convenience); it is encrypted with the
 // pool's encryptor before persistence, like tenant DB passwords.
-func registerSharedPoolFromEnv(ctx context.Context, metaStore *meta.Store, pool *tenant.Pool, dsn, orgID string) error {
+func registerSharedPoolFromEnv(ctx context.Context, metaStore *meta.Store, pool *tenant.Pool, dsn, orgID string, maxTenants int) error {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return fmt.Errorf("parse DRIVE9_SHARED_POOL_DSN: %w", err)
@@ -527,6 +522,7 @@ func registerSharedPoolFromEnv(ctx context.Context, metaStore *meta.Store, pool 
 		PasswordCipher:          passCipher,
 		Name:                    cfg.DBName,
 		TLSMode:                 tlsMode,
+		MaxTenants:              maxTenants,
 	})
 	return err
 }

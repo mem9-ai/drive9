@@ -735,8 +735,7 @@ func metaInitSchemaStatements() []string {
 		)`,
 		// db_pool is the fleet-wide registry of physical databases available
 		// for tenant placement under the shared-schema layout. org_id scopes a
-		// database to a TiDB Cloud organization; the '*' wildcard row serves
-		// organizations without an exact entry. db_password holds the same
+		// database to one exact TiDB Cloud organization. db_password holds the same
 		// encrypted envelope as tenants.db_password. tenant_count is maintained
 		// atomically with placement writes via CompleteSharedTenantProvision and
 		// DeleteTenantPlacementAndDecrCount.
