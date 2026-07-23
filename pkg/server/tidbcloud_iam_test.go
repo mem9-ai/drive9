@@ -62,7 +62,7 @@ func TestAuthorizedAdminSharedTenantMapsPhysicalLookupBackendErrorToServerError(
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-1", Host: "shared.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatal(err)

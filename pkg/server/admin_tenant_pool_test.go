@@ -83,7 +83,7 @@ func TestTenantPoolClaimUsesNativeInventoryBeforeExternalSharedPool(t *testing.T
 	nativeTenantID := insertAdminPoolFreeTenant(t, rt, "pool-mixed-inventory", "org-mixed-inventory", 1)
 	if _, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-mixed-inventory", Host: "shared.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	}); err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
 	}

@@ -35,7 +35,7 @@ func TestSharedTenantDeleteRetriesFromDeletingPlacement(t *testing.T) {
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-delete", Host: "shared.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -105,6 +105,7 @@ func TestSharedTenantDeleteWithCleanupJobShortCircuits(t *testing.T) {
 		User:                    "root",
 		PasswordCipher:          []byte("cipher"),
 		Name:                    "shared_db",
+		MaxTenants:              100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -206,6 +207,7 @@ func TestSharedTenantDeleteFullPurgePath(t *testing.T) {
 		User:                    "root",
 		PasswordCipher:          []byte("cipher"),
 		Name:                    "shared_db",
+		MaxTenants:              100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -257,6 +259,7 @@ func TestAdminTenantCreateAllowsSharedPoolWithoutCloudClusterIdentity(t *testing
 		User:                    "root",
 		PasswordCipher:          []byte("cipher"),
 		Name:                    "shared_db",
+		MaxTenants:              100,
 	}); err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
 	}
@@ -304,7 +307,7 @@ func TestAdminTenantCreatePersistsSharedQuotaSizesInBytes(t *testing.T) {
 	}}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-quota", Host: "shared.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -355,7 +358,7 @@ func TestAdminTenantGetAuthorizesSharedProviderThroughPhysicalPool(t *testing.T)
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-admin", ClusterID: "cluster-shared-admin",
-		Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -416,7 +419,7 @@ func TestAdminTenantQuotaSetSharedUpdatesVirtualQuotaOnly(t *testing.T) {
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-admin", Host: "shared.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -480,7 +483,7 @@ func TestAdminTenantDeleteSharedNeverDeprovisionsPhysicalPool(t *testing.T) {
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-admin-delete", Host: "127.0.0.1", Port: 1,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
+		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -567,7 +570,7 @@ func TestSharedTenantDeletePlacementRemovalFailureStaysRetryable(t *testing.T) {
 	}
 	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-delete", Host: db.DBHost, Port: db.DBPort, User: db.DBUser,
-		PasswordCipher: passCipher, Name: db.DBName,
+		PasswordCipher: passCipher, Name: db.DBName, MaxTenants: 100,
 	})
 	if err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
@@ -651,7 +654,7 @@ func TestFindSharedDBForProvisionSkipsNonTiDBProviders(t *testing.T) {
 	ctx := context.Background()
 	if _, err := db.Meta.RegisterSharedDB(ctx, &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-exact", Host: "shared.example.com", Port: 4000, User: "root",
-		PasswordCipher: []byte("cipher"), Name: "shared_db",
+		PasswordCipher: []byte("cipher"), Name: "shared_db", MaxTenants: 100,
 	}); err != nil {
 		t.Fatalf("RegisterSharedDB: %v", err)
 	}
