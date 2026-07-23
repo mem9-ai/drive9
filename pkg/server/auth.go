@@ -62,7 +62,8 @@ func isQuotaError(err error) bool {
 		return strings.Contains(strings.ToLower(mysqlErr.Message), "quota")
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "error 1105") && strings.Contains(msg, "quota")
+	idx := strings.Index(msg, "error 1105")
+	return idx >= 0 && strings.Contains(msg[idx:], "quota")
 }
 
 func isSchemaMigrationError(err error) bool {

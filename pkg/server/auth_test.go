@@ -731,6 +731,11 @@ func TestSanitizeClientError_Fallback(t *testing.T) {
 			t.Fatalf("input=%q: got %q, want %q", tc, got, "backend unavailable")
 		}
 	}
+	// Non-quota 1105 wrapped with "quota" in prefix should not be classified as quota error.
+	err := fmt.Errorf("set quota config for tenant: Error 1105 (HY000): connection refused")
+	if got := sanitizeClientError(err); got != "backend unavailable" {
+		t.Fatalf("non-quota 1105 with quota prefix: got %q, want %q", got, "backend unavailable")
+	}
 }
 
 func TestBackendErrorStatus(t *testing.T) {
@@ -758,6 +763,11 @@ func TestBackendErrorStatus(t *testing.T) {
 			name: "tidb quota error lower case",
 			err:  fmt.Errorf("error 1105 (hy000): quota limit reached"),
 			want: http.StatusPaymentRequired,
+		},
+		{
+			name: "non-quota 1105 wrapped with quota prefix",
+			err:  fmt.Errorf("set quota config for tenant: Error 1105 (HY000): connection refused"),
+			want: http.StatusInternalServerError,
 		},
 		{
 			name: "schema migration error",
