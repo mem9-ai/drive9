@@ -951,6 +951,7 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 	createdPoolIDs := make(map[int64]struct{})
 	continuationPoolIDs := make(map[int64]struct{})
 	results := make([]*provisionTenantResult, 0, count)
+	resultPoolIDs := make([]int64, 0, count)
 	for i := 0; i < count; i++ {
 		tenantID := token.NewID()
 		if err := s.insertPendingPoolTenant(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared, now); err != nil {
@@ -995,6 +996,7 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 			Status: resultStatus, Provider: tenant.ProviderTiDBCloudNativeShared,
 			CloudProvider: selected.CloudProvider, Region: selected.Region,
 			OrganizationID: selected.TiDBCloudOrganizationID})
+		resultPoolIDs = append(resultPoolIDs, selected.ID)
 	}
 	createdIDs := make([]int64, 0, len(createdPoolIDs))
 	for id := range createdPoolIDs {
@@ -1014,6 +1016,26 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 		}
 		for _, result := range results {
 			result.OrganizationID = resolvedOrg
+		}
+	}
+	createdPoolStatuses := make(map[int64]meta.TenantStatus, len(createdIDs))
+	for _, dbID := range createdIDs {
+		sharedDB, err := s.meta.GetSharedDB(ctx, dbID)
+		if err != nil {
+			return results, err
+		}
+		status := meta.TenantPending
+		switch sharedDB.Status {
+		case meta.SharedDBStatusProvisioning:
+			status = meta.TenantProvisioning
+		case meta.SharedDBStatusActive:
+			status = meta.TenantActive
+		}
+		createdPoolStatuses[dbID] = status
+	}
+	for i, dbID := range resultPoolIDs {
+		if status, ok := createdPoolStatuses[dbID]; ok {
+			results[i].Status = status
 		}
 	}
 	continuationIDs := make([]int64, 0, len(continuationPoolIDs))
