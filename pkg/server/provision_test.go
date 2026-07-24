@@ -46,6 +46,8 @@ type fakeProvisioner struct {
 	quotaUpdateCalls        atomic.Int32
 	sharedPoolBatchCalls    atomic.Int32
 	sharedPoolBatchMembers  atomic.Int32
+	sharedPoolBatchMu       sync.Mutex
+	sharedPoolBatchRequests []tenant.SharedDBPoolCreateRequest
 	lastCredentialReq       tenant.CredentialProvisionRequest
 	lastDeprovision         *tenant.ClusterInfo
 	lastQuotaCluster        *tenant.ClusterInfo
@@ -64,6 +66,7 @@ type fakeProvisioner struct {
 	managedClusters         []tenant.CloudClusterInfo
 	sharedPoolResults       []*tenant.SharedDBPoolInfo
 	sharedPoolBatchErr      error
+	sharedPoolPartialErr    error
 	sharedPoolBatchStarted  chan struct{}
 	sharedPoolBatchRelease  <-chan struct{}
 	sharedPoolWaitCalls     atomic.Int32
@@ -139,6 +142,12 @@ func (f *fakeProvisioner) iamCredentialsSnapshot() []tenant.CredentialProvisionR
 	f.iamMu.Lock()
 	defer f.iamMu.Unlock()
 	return append([]tenant.CredentialProvisionRequest(nil), f.iamCredentials...)
+}
+
+func (f *fakeProvisioner) sharedPoolBatchRequestsSnapshot() []tenant.SharedDBPoolCreateRequest {
+	f.sharedPoolBatchMu.Lock()
+	defer f.sharedPoolBatchMu.Unlock()
+	return append([]tenant.SharedDBPoolCreateRequest(nil), f.sharedPoolBatchRequests...)
 }
 
 func (f *fakeProvisioner) ProviderType() string { return f.provider }
@@ -251,6 +260,10 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 	}
 	if got := prov.lastSharedCredentialReq; got.PublicKey != "shared-public" || got.PrivateKey != "shared-private" {
 		t.Fatalf("shared physical credential = %+v, want configured shared credential", got)
+	}
+	requests := prov.sharedPoolBatchRequestsSnapshot()
+	if len(requests) != 1 || requests[0].CustomerOrganizationID != "customer-org" {
+		t.Fatalf("shared physical create requests = %+v, want customer organization customer-org", requests)
 	}
 	iamCredentials := prov.iamCredentialsSnapshot()
 	if len(iamCredentials) != 1 || iamCredentials[0].PublicKey != "public" || iamCredentials[0].PrivateKey != "private" {
@@ -700,6 +713,63 @@ func TestManagedSharedDBContinuationWaitsForConnectionMetadata(t *testing.T) {
 	}
 }
 
+func TestManagedSharedDBContinuationPassesCustomerOrganizationToPhysicalCreate(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(pool.Close)
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-continuation-label", ProvisioningKey: bytes.Repeat([]byte{7}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+		PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := metaStore.GetSharedDB(context.Background(), dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("stop after physical create")
+	prov := &fakeProvisioner{
+		provider: tenant.ProviderTiDBCloudNative,
+		sharedPoolResults: []*tenant.SharedDBPoolInfo{{
+			DBPoolID: dbID, DBPoolUUID: row.UUID, ClusterID: "cluster-continuation-label", DBName: "tidbcloud_fs",
+		}},
+		sharedPoolPartialErr: wantErr,
+	}
+	srv := &Server{meta: metaStore, pool: pool, provisioner: prov}
+	err = srv.continueManagedSharedDBPoolLocked(context.Background(), row, tenant.CredentialProvisionRequest{
+		PublicKey: "shared-public", PrivateKey: "shared-private",
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("continueManagedSharedDBPoolLocked error = %v, want %v", err, wantErr)
+	}
+	requests := prov.sharedPoolBatchRequestsSnapshot()
+	if len(requests) != 1 || requests[0].CustomerOrganizationID != "org-continuation-label" {
+		t.Fatalf("continuation physical create requests = %+v, want customer organization org-continuation-label", requests)
+	}
+}
+
 func TestRetryManagedSharedDBContinuationRecoversAfterMoreThanTwoFailures(t *testing.T) {
 	origWindow, origInitialBackoff, origMaxBackoff := schemaInitRetryWindow, schemaInitInitialBackoff, schemaInitMaxBackoff
 	schemaInitRetryWindow = time.Second
@@ -1022,6 +1092,10 @@ func TestManagedSharedDBBatchCreateUsesAllocationLock(t *testing.T) {
 	if got := prov.sharedPoolBatchCalls.Load(); got != 1 {
 		t.Fatalf("physical create calls = %d, want 1", got)
 	}
+	requests := prov.sharedPoolBatchRequestsSnapshot()
+	if len(requests) != 1 || requests[0].CustomerOrganizationID != "org-batch-lock" {
+		t.Fatalf("batch physical create requests = %+v, want customer organization org-batch-lock", requests)
+	}
 }
 
 func TestManagedSharedDBBatchCreateReturnsTotalFailure(t *testing.T) {
@@ -1088,6 +1162,9 @@ func (f *fakeProvisioner) ListManagedClusters(_ context.Context, _ tenant.Creden
 
 func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Context, requests []tenant.SharedDBPoolCreateRequest, cred tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
 	f.lastSharedCredentialReq = cred
+	f.sharedPoolBatchMu.Lock()
+	f.sharedPoolBatchRequests = append(f.sharedPoolBatchRequests, requests...)
+	f.sharedPoolBatchMu.Unlock()
 	f.sharedPoolBatchCalls.Add(1)
 	f.sharedPoolBatchMembers.Add(int32(len(requests)))
 	if f.sharedPoolBatchStarted != nil {
@@ -1118,7 +1195,7 @@ func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context
 			}
 			out[i] = &copyRow
 		}
-		return out, nil
+		return out, f.sharedPoolPartialErr
 	}
 	out := make([]*tenant.SharedDBPoolInfo, 0, len(requests))
 	for _, req := range requests {

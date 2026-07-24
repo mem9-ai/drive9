@@ -807,8 +807,8 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 		defaultDatabaseName: DefaultDatabaseName, client: ts.Client(),
 	}
 	got, err := p.BatchProvisionSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolCreateRequest{
-		{DBPoolID: 41, DBPoolUUID: poolUUIDs[0], RootPassword: "durable-password-41", SpendingLimitMonthly: 1_000_000},
-		{DBPoolID: 42, DBPoolUUID: poolUUIDs[1], RootPassword: "durable-password-42", SpendingLimitMonthly: 1_000_000},
+		{DBPoolID: 41, DBPoolUUID: poolUUIDs[0], CustomerOrganizationID: "customer-org-41", RootPassword: "durable-password-41", SpendingLimitMonthly: 1_000_000},
+		{DBPoolID: 42, DBPoolUUID: poolUUIDs[1], CustomerOrganizationID: "customer-org-42", RootPassword: "durable-password-42", SpendingLimitMonthly: 1_000_000},
 	}, tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
 	if err != nil {
 		t.Fatalf("BatchProvisionSharedDBPoolsWithCredentials: %v", err)
@@ -826,7 +826,7 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 		}
 		wantLabels := map[string]string{
 			Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
-			Drive9DBPoolUUIDLabel: poolUUIDs[i],
+			Drive9DBPoolUUIDLabel: poolUUIDs[i], Drive9CustomerOrganizationLabel: "customer-org-" + id,
 		}
 		for key, want := range wantLabels {
 			if request.Cluster.Labels[key] != want {
@@ -840,6 +840,30 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 	if len(got) != 2 || got[0].DBPoolID != 41 || got[0].DBPoolUUID != poolUUIDs[0] || got[0].ClusterID != "cluster-pool-41" ||
 		got[1].DBPoolID != 42 || got[1].DBPoolUUID != poolUUIDs[1] || got[1].ClusterID != "cluster-pool-42" {
 		t.Fatalf("shared pool results = %#v", got)
+	}
+}
+
+func TestBatchProvisionSharedDBPoolsRejectsMissingCustomerOrganizationBeforeRequest(t *testing.T) {
+	var calls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL, cloudProvider: "aws", region: "us-east-1",
+		defaultDatabaseName: DefaultDatabaseName, client: ts.Client(),
+	}
+	_, err := p.BatchProvisionSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolCreateRequest{{
+		DBPoolID: 41, DBPoolUUID: "11111111-1111-4111-8111-111111111111",
+		RootPassword: "durable-password-41", SpendingLimitMonthly: 1_000_000,
+	}}, tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
+	if err == nil || !strings.Contains(err.Error(), "customer organization") {
+		t.Fatalf("BatchProvisionSharedDBPoolsWithCredentials error = %v, want missing customer organization", err)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("TiDB Cloud request calls = %d, want 0", got)
 	}
 }
 

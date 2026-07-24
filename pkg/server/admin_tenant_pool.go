@@ -1106,7 +1106,8 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 		}
 		rows[dbID] = row
 		requests = append(requests, tenant.SharedDBPoolCreateRequest{DBPoolID: dbID, DBPoolUUID: row.UUID,
-			DatabaseName: row.Name, RootPassword: string(plain), SpendingLimitMonthly: *row.SpendingLimit})
+			CustomerOrganizationID: strings.TrimSpace(row.TiDBCloudOrganizationID), DatabaseName: row.Name,
+			RootPassword: string(plain), SpendingLimitMonthly: *row.SpendingLimit})
 	}
 	if len(requests) == 0 {
 		return resolvedOrg, nil
