@@ -3,6 +3,8 @@ package tenant
 import (
 	"context"
 	"errors"
+
+	"github.com/mem9-ai/drive9/pkg/meta"
 )
 
 var (
@@ -13,7 +15,7 @@ var (
 	ErrTiDBCloudFreeSpendingLimitForbidden = errors.New("positive spending limit is not available for free TiDB Cloud organizations")
 	ErrTiDBCloudFreeQuotaExceeded          = errors.New("requested quota exceeds the free TiDB Cloud organization limit")
 	ErrTiDBCloudFreeTenantLimitReached     = errors.New("free TiDB Cloud tenant limit reached")
-	ErrTiDBCloudFreeQuotaBusy              = errors.New("free tenant quota check is busy; retry later")
+	ErrTiDBCloudFreeQuotaBusy              = meta.ErrTiDBCloudFreeQuotaBusy
 )
 
 type TiDBCloudOrganizationPlan struct {

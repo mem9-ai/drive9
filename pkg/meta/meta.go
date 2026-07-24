@@ -27,6 +27,7 @@ var (
 	ErrFileCountQuotaExceeded   = errors.New("tenant file count quota exceeded")
 	ErrReservationAlreadyExists = errors.New("upload reservation already exists")
 	ErrQuotaReservationBusy     = errors.New("quota reservation busy")
+	ErrTiDBCloudFreeQuotaBusy   = errors.New("free tenant quota check is busy; retry later")
 )
 
 type TenantStatus string
@@ -363,6 +364,10 @@ const tidbCloudOrgBindingReleaseLockTimeout = 5 * time.Second
 const tenantPoolLockTimeoutSeconds = 300
 const tenantPoolReleaseLockTimeout = 5 * time.Second
 
+var tidbCloudFreeQuotaLockTimeoutSeconds = 5
+
+const tidbCloudFreeQuotaReleaseLockTimeout = 5 * time.Second
+
 func (s *Store) migrate() (err error) {
 	ctx := context.Background()
 	releaseLock, err := acquireMetaSchemaMigrationLock(ctx, s.db)
@@ -394,6 +399,9 @@ func (s *Store) migrate() (err error) {
 		return err
 	}
 	if err := expandManagedDBPoolSchema(ctx, s.db); err != nil {
+		return err
+	}
+	if err := backfillTenantBillingOrgBindings(ctx, s.db); err != nil {
 		return err
 	}
 	if err := backfillTiDBCloudOrgBindingBranchIDs(ctx, s.db); err != nil {
@@ -880,6 +888,13 @@ func metaInitSchemaStatements() []string {
 				INDEX idx_tidbcloud_org_created (organization_id, created_at, tenant_id),
 				INDEX idx_tidbcloud_pool_free (organization_id, pool_status, created_at, tenant_id)
 			)`,
+		`CREATE TABLE IF NOT EXISTS tenant_billing_org_bindings (
+			tenant_id                  VARCHAR(64) PRIMARY KEY,
+			tidbcloud_organization_id VARCHAR(64) NOT NULL,
+			created_at                 DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at                 DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			INDEX idx_billing_org_tenant (tidbcloud_organization_id, tenant_id)
+		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_tidbcloud_pools (
 			pool_id         VARCHAR(64) PRIMARY KEY,
 			organization_id VARCHAR(64) NULL,
