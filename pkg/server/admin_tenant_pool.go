@@ -949,7 +949,7 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 	}
 	now := time.Now().UTC()
 	createdPoolIDs := make(map[int64]struct{})
-	provisioningPoolIDs := make(map[int64]struct{})
+	continuationPoolIDs := make(map[int64]struct{})
 	results := make([]*provisionTenantResult, 0, count)
 	for i := 0; i < count; i++ {
 		tenantID := token.NewID()
@@ -981,11 +981,14 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 		if created {
 			createdPoolIDs[selected.ID] = struct{}{}
 		}
-		if selected.Status == meta.SharedDBStatusProvisioning {
-			provisioningPoolIDs[selected.ID] = struct{}{}
+		if selected.Status == meta.SharedDBStatusPending || selected.Status == meta.SharedDBStatusProvisioning {
+			continuationPoolIDs[selected.ID] = struct{}{}
 		}
-		resultStatus := meta.TenantProvisioning
-		if selected.Status == meta.SharedDBStatusActive {
+		resultStatus := meta.TenantPending
+		switch selected.Status {
+		case meta.SharedDBStatusProvisioning:
+			resultStatus = meta.TenantProvisioning
+		case meta.SharedDBStatusActive:
 			resultStatus = meta.TenantActive
 		}
 		results = append(results, &provisionTenantResult{TenantID: tenantID,
@@ -1013,11 +1016,11 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 			result.OrganizationID = resolvedOrg
 		}
 	}
-	provisioningIDs := make([]int64, 0, len(provisioningPoolIDs))
-	for dbID := range provisioningPoolIDs {
-		provisioningIDs = append(provisioningIDs, dbID)
+	continuationIDs := make([]int64, 0, len(continuationPoolIDs))
+	for dbID := range continuationPoolIDs {
+		continuationIDs = append(continuationIDs, dbID)
 	}
-	s.scheduleManagedSharedDBContinuations(ctx, provisioningIDs)
+	s.scheduleManagedSharedDBContinuations(ctx, continuationIDs)
 	return results, nil
 }
 
