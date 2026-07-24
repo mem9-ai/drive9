@@ -19,9 +19,10 @@ import (
 )
 
 const (
-	defaultManagedSharedDBMaxTenants = 100
-	defaultSharedTenantSpendingLimit = int64(1000)
-	sharedTenantActivationBatchSize  = 100
+	defaultManagedSharedDBMaxTenants      = 100
+	defaultSharedTenantSpendingLimit      = int64(1000)
+	sharedTenantActivationBatchSize       = 100
+	managedSharedDBProvisioningMaxBackoff = 15 * time.Second
 )
 
 var errSharedDBConnectionMetadataNotReady = errors.New("shared DB pool connection metadata is not ready")
@@ -385,7 +386,7 @@ func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int
 		workers = DefaultManagedSharedDBProvisioningWorkers
 	}
 	failed := runManagedSharedDBProvisioningQueue(ctx, workers, s.managedSharedDBProvisioningSlots, owned,
-		schemaInitRetryWindow, schemaInitInitialBackoff, schemaInitMaxBackoff,
+		schemaInitRetryWindow, schemaInitInitialBackoff, managedSharedDBProvisioningMaxBackoff,
 		func(jobCtx context.Context, dbID int64) error {
 			err := s.continueManagedSharedDBPoolOnce(jobCtx, dbID)
 			if errors.Is(err, meta.ErrNotFound) {

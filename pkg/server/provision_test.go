@@ -269,6 +269,12 @@ func TestRunManagedSharedDBProvisioningQueueRequeuesWithoutBlockingWorker(t *tes
 	}
 }
 
+func TestManagedSharedDBProvisioningBackoffCapsAtFifteenSeconds(t *testing.T) {
+	if managedSharedDBProvisioningMaxBackoff != 15*time.Second {
+		t.Fatalf("shared provisioning max backoff = %s, want 15s", managedSharedDBProvisioningMaxBackoff)
+	}
+}
+
 func TestManagedSharedDBMetadataWorkerRefillsReadySlots(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
