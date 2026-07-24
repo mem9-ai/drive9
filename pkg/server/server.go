@@ -5278,17 +5278,19 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 	}
 	if tenant.UsesTiDBCloudNativeCredentials(provider) {
-		profile, err := s.resolveTiDBCloudAccessProfile(ctx, *opts.CredentialProvisioner, "provision")
-		if err != nil {
-			status, message := http.StatusBadGateway, "TiDB Cloud API key authorization failed"
-			if isTiDBCloudBillingLookupError(err) {
-				status, message = tiDBCloudBillingErrorResponse(err)
-			} else {
-				status, message = clientFacingErrorResponse(status, message, err)
+		if opts.TiDBCloudAccess == nil {
+			profile, err := s.resolveTiDBCloudAccessProfile(ctx, *opts.CredentialProvisioner, "provision")
+			if err != nil {
+				status, message := http.StatusBadGateway, "TiDB Cloud API key authorization failed"
+				if isTiDBCloudBillingLookupError(err) {
+					status, message = tiDBCloudBillingErrorResponse(err)
+				} else {
+					status, message = clientFacingErrorResponse(status, message, err)
+				}
+				return nil, newProvisionTenantError(status, message, err)
 			}
-			return nil, newProvisionTenantError(status, message, err)
+			opts.TiDBCloudAccess = profile
 		}
-		opts.TiDBCloudAccess = profile
 	}
 	tenantID := token.NewID()
 	provisionStarted := time.Now()

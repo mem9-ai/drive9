@@ -168,6 +168,11 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		}
 		quotaOpt = &quotaReq
 	}
+	access, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_create")
+	if err != nil {
+		writeAdminTiDBCloudError(w, r.Context(), err, "create tenant")
+		return
+	}
 	poolClaimStarted := time.Now()
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_started", "provider", tenant.ProviderTiDBCloudNative, "quota_requested", quotaOpt != nil)...)
 	res, pool, claimed, sharedPoolMatched, err := s.claimAdminTenantFromPool(r.Context(), cred, quotaOpt)
@@ -208,6 +213,7 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		KeyName:               "default",
 		TokenVersion:          1,
 		CredentialProvisioner: &cred,
+		TiDBCloudAccess:       access,
 		Quota:                 quotaOpt,
 		Provider:              provider,
 	})
@@ -239,7 +245,7 @@ func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	identity, err := s.resolveTiDBCloudIdentity(r.Context(), cred, "admin_tenant_list")
+	access, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_list")
 	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "list tenants")
 		return
@@ -250,7 +256,7 @@ func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	includeQuota := parseBoolQuery(r, "include_quota")
-	rows, err := s.meta.ListTenantsByTiDBCloudOrganization(r.Context(), identity.OrganizationID, offset, pageSize+1)
+	rows, err := s.meta.ListTenantsByTiDBCloudOrganization(r.Context(), access.OrganizationID, offset, pageSize+1)
 	if err != nil {
 		errJSON(w, backendErrorStatus(r.Context(), err), "tenant list failed")
 		return
@@ -276,6 +282,10 @@ func (s *Server) handleAdminTenantGet(w http.ResponseWriter, r *http.Request, te
 	cred, err := adminCredentialsFromHeaders(r)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_get"); err != nil {
+		writeAdminTiDBCloudError(w, r.Context(), err, "get tenant")
 		return
 	}
 	t, binding, ok := s.authorizedAdminTenant(w, r, tenantID, cred, true, false)
@@ -308,6 +318,10 @@ func (s *Server) handleAdminTenantQuotaSet(w http.ResponseWriter, r *http.Reques
 	}
 	if err := s.validateQuotaSetRequest(quotaReq); err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_quota_set"); err != nil {
+		writeAdminTiDBCloudError(w, r.Context(), err, "update tenant quota")
 		return
 	}
 	t, _, ok := s.authorizedAdminTenant(w, r, tenantID, cred, false, false)
@@ -343,6 +357,10 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 	cred, err := adminCredentials(raw.PublicKey, raw.PrivateKey, r)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_delete"); err != nil {
+		writeAdminTiDBCloudError(w, r.Context(), err, "delete tenant")
 		return
 	}
 	t, _, ok := s.authorizedAdminTenant(w, r, tenantID, cred, false, true)
@@ -654,6 +672,15 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func writeAdminTiDBCloudError(w http.ResponseWriter, ctx context.Context, err error, action string) {
+	if errors.Is(err, tenant.ErrTiDBCloudFreeAdminForbidden) {
+		errJSON(w, http.StatusForbidden, tenant.ErrTiDBCloudFreeAdminForbidden.Error())
+		return
+	}
+	if isTiDBCloudBillingLookupError(err) {
+		status, msg := tiDBCloudBillingErrorResponse(err)
+		errJSON(w, status, msg)
+		return
+	}
 	if errors.Is(err, tenant.ErrQuotaBackendNotFound) {
 		errJSON(w, http.StatusNotFound, quotaBackendNotFoundMessage)
 		return

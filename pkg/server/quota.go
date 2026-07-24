@@ -243,6 +243,10 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := s.rejectFreeQuotaMutation(r.Context(), cred, "quota_set"); err != nil {
+		writeQuotaSetError(w, r.Context(), err, "authorize")
+		return
+	}
 	t, ok := s.quotaTenant(w, r.Context(), req.TenantID)
 	if !ok {
 		return
@@ -610,6 +614,11 @@ func writeQuotaCredentialError(w http.ResponseWriter, ctx context.Context, err e
 }
 
 func writeQuotaSetError(w http.ResponseWriter, ctx context.Context, err error, action string) {
+	if isTiDBCloudBillingLookupError(err) {
+		status, msg := tiDBCloudBillingErrorResponse(err)
+		errJSON(w, status, msg)
+		return
+	}
 	if status, msg, ok := quotaSetErrorStatusMessage(err, action); ok {
 		if errors.Is(err, errQuotaLocalUpdateFailed) {
 			logger.Warn(ctx, "drive9_quota_update_failed", zap.String("action", action), zap.Error(err))
@@ -622,6 +631,8 @@ func writeQuotaSetError(w http.ResponseWriter, ctx context.Context, err error, a
 
 func quotaSetErrorStatusMessage(err error, action string) (int, string, bool) {
 	switch {
+	case errors.Is(err, tenant.ErrTiDBCloudFreeQuotaMutationForbidden):
+		return http.StatusForbidden, tenant.ErrTiDBCloudFreeQuotaMutationForbidden.Error(), true
 	case errors.Is(err, errQuotaSettingNotEnabled):
 		return http.StatusNotFound, "quota setting not enabled", true
 	case errors.Is(err, errQuotaLocalUpdateFailed):

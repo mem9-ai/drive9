@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -149,5 +151,41 @@ func TestTiDBCloudBillingErrorResponse(t *testing.T) {
 		if status != tt.wantStatus || message != tt.want {
 			t.Fatalf("response for %v = %d %q, want %d %q", tt.err, status, message, tt.wantStatus, tt.want)
 		}
+	}
+}
+
+func TestTiDBCloudAccessGateWritersPreserveBillingErrorContract(t *testing.T) {
+	err := &tenant.TiDBCloudAPIError{
+		Operation:  "Billing plan lookup",
+		StatusCode: http.StatusUnauthorized,
+	}
+	tests := []struct {
+		name  string
+		write func(http.ResponseWriter)
+	}{
+		{
+			name: "admin",
+			write: func(w http.ResponseWriter) {
+				writeAdminTiDBCloudError(w, context.Background(), err, "list tenants")
+			},
+		},
+		{
+			name: "quota mutation",
+			write: func(w http.ResponseWriter) {
+				writeQuotaSetError(w, context.Background(), err, "authorize")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			tt.write(recorder)
+			if recorder.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", recorder.Code)
+			}
+			if got, want := strings.TrimSpace(recorder.Body.String()), `{"error":"TiDB Cloud billing API authentication failed"}`; got != want {
+				t.Fatalf("body = %s, want %s", got, want)
+			}
+		})
 	}
 }

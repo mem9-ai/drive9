@@ -17,6 +17,28 @@ type tiDBCloudAccessProfile struct {
 	IsFree         bool
 }
 
+func (s *Server) authorizeTiDBCloudAdminAccess(ctx context.Context, cred tenant.CredentialProvisionRequest, metricPath string) (*tiDBCloudAccessProfile, error) {
+	profile, err := s.resolveTiDBCloudAccessProfile(ctx, cred, metricPath)
+	if err != nil {
+		return nil, err
+	}
+	if profile.IsFree {
+		return nil, tenant.ErrTiDBCloudFreeAdminForbidden
+	}
+	return profile, nil
+}
+
+func (s *Server) rejectFreeQuotaMutation(ctx context.Context, cred tenant.CredentialProvisionRequest, metricPath string) error {
+	profile, err := s.resolveTiDBCloudAccessProfile(ctx, cred, metricPath)
+	if err != nil {
+		return err
+	}
+	if profile.IsFree {
+		return tenant.ErrTiDBCloudFreeQuotaMutationForbidden
+	}
+	return nil
+}
+
 func (s *Server) resolveTiDBCloudAccessProfile(ctx context.Context, cred tenant.CredentialProvisionRequest, metricPath string) (*tiDBCloudAccessProfile, error) {
 	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, metricPath)
 	if err != nil {

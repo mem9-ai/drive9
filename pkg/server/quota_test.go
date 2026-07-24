@@ -41,6 +41,7 @@ type quotaTestProvisioner struct {
 	getCalls                    atomic.Int32
 	listCalls                   atomic.Int32
 	iamCalls                    atomic.Int32
+	billingCalls                atomic.Int32
 	deprovisionCalls            atomic.Int32
 	batchPoolCalls              atomic.Int32
 	markPoolUsedCalls           atomic.Int32
@@ -57,6 +58,8 @@ type quotaTestProvisioner struct {
 	listPages                   []*tenant.ManagedClusterListResult
 	iamIdentities               []*tenant.TiDBCloudAPIKeyIdentity
 	iamErr                      error
+	billingErr                  error
+	billingFree                 bool
 	batchPoolErr                error
 	batchPoolOmitConnectionInfo bool
 	batchPoolEmptyPassword      bool
@@ -171,6 +174,18 @@ func (p *quotaTestProvisioner) ResolveAPIKeyIdentity(_ context.Context, req tena
 		return &out, nil
 	}
 	return &tenant.TiDBCloudAPIKeyIdentity{OrganizationID: "org-1", Role: tenant.TiDBCloudRoleOrgOwner}, nil
+}
+
+func (p *quotaTestProvisioner) ResolveOrganizationPlan(_ context.Context, organizationID string, _ tenant.CredentialProvisionRequest) (*tenant.TiDBCloudOrganizationPlan, error) {
+	p.billingCalls.Add(1)
+	if p.billingErr != nil {
+		return nil, p.billingErr
+	}
+	return &tenant.TiDBCloudOrganizationPlan{
+		OrganizationID: organizationID,
+		EffectivePlan:  "on_demand",
+		IsFree:         p.billingFree,
+	}, nil
 }
 
 func (p *quotaTestProvisioner) DefaultSharedCredentials() (tenant.CredentialProvisionRequest, bool) {
@@ -1439,6 +1454,78 @@ func TestAdminTenantListReturnsEmptyForIAMOrganizationWithoutTenants(t *testing.
 	}
 	if got := rt.prov.listCalls.Load(); got != 0 {
 		t.Fatalf("cluster list calls = %d, want 0", got)
+	}
+}
+
+func TestFreeTiDBCloudOrganizationRejectsEveryAdminAndQuotaMutation(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.billingFree = true
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	tests := []struct {
+		name        string
+		method      string
+		path        string
+		body        string
+		headers     bool
+		wantMessage string
+	}{
+		{name: "admin create", method: http.MethodPost, path: "/v1/admin/tenants", body: `{"public_key":"public-1","private_key":"private-1"}`, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "admin list", method: http.MethodGet, path: "/v1/admin/tenants", headers: true, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "admin get", method: http.MethodGet, path: "/v1/admin/tenants/" + rt.tenantID, headers: true, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "admin delete", method: http.MethodDelete, path: "/v1/admin/tenants/" + rt.tenantID, body: `{"public_key":"public-1","private_key":"private-1"}`, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "admin quota", method: http.MethodPost, path: "/v1/admin/tenants/" + rt.tenantID + "/quota", body: `{"public_key":"public-1","private_key":"private-1","max_file_count":10}`, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "pool create", method: http.MethodPost, path: "/v1/admin/tenant-pool", body: `{"public_key":"public-1","private_key":"private-1","pool_size":1}`, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "pool get", method: http.MethodGet, path: "/v1/admin/tenant-pool", headers: true, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "pool update", method: http.MethodPatch, path: "/v1/admin/tenant-pool", body: `{"public_key":"public-1","private_key":"private-1","pool_size":1}`, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "pool delete", method: http.MethodDelete, path: "/v1/admin/tenant-pool", body: `{"public_key":"public-1","private_key":"private-1"}`, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "quota mutation", method: http.MethodPost, path: "/v1/quota", body: fmt.Sprintf(`{"tenant_id":%q,"public_key":"public-1","private_key":"private-1","max_file_count":10}`, rt.tenantID), wantMessage: tenant.ErrTiDBCloudFreeQuotaMutationForbidden.Error()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(tt.method, ts.URL+tt.path, strings.NewReader(tt.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.headers {
+				req.Header.Set(quotaPublicKeyHeader, "public-1")
+				req.Header.Set(quotaPrivateKeyHeader, "private-1")
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusForbidden || strings.TrimSpace(string(body)) != fmt.Sprintf(`{"error":%q}`, tt.wantMessage) {
+				t.Fatalf("response = %d %s, want 403 %q", resp.StatusCode, body, tt.wantMessage)
+			}
+		})
+	}
+	if got := rt.prov.billingCalls.Load(); got != int32(len(tests)) {
+		t.Fatalf("Billing calls = %d, want one uncached free lookup per request (%d)", got, len(tests))
+	}
+	if got := rt.prov.updateCalls.Load() + rt.prov.markCalls.Load() + rt.prov.batchPoolCalls.Load(); got != 0 {
+		t.Fatalf("cloud mutation calls after free rejection = %d, want 0", got)
+	}
+}
+
+func TestFreeTiDBCloudOrganizationCanReadQuota(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.billingFree = true
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := getQuota(t, ts.URL, rt.tenantID, "", "", rt.apiKey)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("quota read status = %d, want 200: %s", resp.StatusCode, body)
 	}
 }
 

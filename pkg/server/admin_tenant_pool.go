@@ -130,6 +130,11 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	access, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_pool_create")
+	if err != nil {
+		writeAdminTiDBCloudError(w, r.Context(), err, "create tenant pool")
+		return
+	}
 	createStarted := time.Now()
 	metricResult := "ok"
 	defer func() {
@@ -143,16 +148,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 	defer createLock.Unlock()
 	if err := s.meta.WithTenantPoolLock(r.Context(), tenantPoolCreateDatabaseLockKey(cred), func(ctx context.Context) error {
 		stageStarted := time.Now()
-		orgID, err := s.firstManagedOrganization(ctx, cred)
-		if err != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_create_org_lookup_failed",
-				"provider", tenant.ProviderTiDBCloudNative,
-				"duration_ms", durationMillis(stageStarted),
-				"error", err)...)
-			metricResult = "cluster_error"
-			writeAdminTiDBCloudError(w, ctx, err, "create tenant pool")
-			return nil
-		}
+		orgID := access.OrganizationID
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_create_org_lookup_done",
 			"provider", tenant.ProviderTiDBCloudNative,
 			"organization_id", orgID,
@@ -298,6 +294,10 @@ func (s *Server) handleAdminTenantPoolGet(w http.ResponseWriter, r *http.Request
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if _, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_pool_get"); err != nil {
+		writeAdminTiDBCloudError(w, r.Context(), err, "get tenant pool")
+		return
+	}
 	pool, ok := s.authorizedTenantPool(w, r, cred)
 	if !ok {
 		return
@@ -338,6 +338,10 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 	cred, err := adminCredentials(req.PublicKey, req.PrivateKey, r)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_pool_update"); err != nil {
+		writeAdminTiDBCloudError(w, r.Context(), err, "update tenant pool")
 		return
 	}
 	pool, ok := s.authorizedTenantPool(w, r, cred)
@@ -554,6 +558,10 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 	cred, err := adminCredentials(raw.PublicKey, raw.PrivateKey, r)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_pool_delete"); err != nil {
+		writeAdminTiDBCloudError(w, r.Context(), err, "delete tenant pool")
 		return
 	}
 	pool, ok := s.authorizedTenantPool(w, r, cred)
