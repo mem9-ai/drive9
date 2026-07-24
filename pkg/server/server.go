@@ -1201,6 +1201,22 @@ func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
 		}
 		return
 	}
+	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
+		_, err := s.meta.GetSharedDBForTenant(ctx, t.ID)
+		if err == nil {
+			logger.Info(ctx, "resume_pending_shared_pool_tenant_skipped",
+				zap.String("tenant_id", t.ID),
+				zap.String("provider", t.Provider),
+				zap.String("reason", "managed_by_shared_pool"))
+			return
+		}
+		if !errors.Is(err, meta.ErrNotFound) {
+			logger.Error(ctx, "resume_pending_shared_pool_tenant_lookup_error",
+				zap.String("tenant_id", t.ID),
+				zap.Error(err))
+			return
+		}
+	}
 	if !isStalePendingTenant(time.Now().UTC(), t) {
 		return
 	}

@@ -3604,6 +3604,58 @@ func TestReconcilePendingNativePoolTenantWithoutConnectionStaysPending(t *testin
 	}
 }
 
+func TestReconcilePendingSharedPoolTenantWithoutConnectionStaysPending(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	ctx := context.Background()
+	spendingLimit := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-pending-shared", ProvisioningKey: make([]byte, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+		PasswordCipher: []byte("cipher"), Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	tenantID := token.NewID()
+	now := time.Now().UTC().Add(-2 * time.Minute)
+	origStaleAfter := pendingTenantStaleAfter
+	pendingTenantStaleAfter = time.Minute
+	defer func() { pendingTenantStaleAfter = origStaleAfter }()
+	pendingTenant := meta.Tenant{
+		ID: tenantID, Status: meta.TenantPending, Provider: tenant.ProviderTiDBCloudNativeShared,
+		DBPasswordCipher: []byte{}, DBTLS: true, SchemaVersion: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := metaStore.InsertTenant(ctx, &pendingTenant); err != nil {
+		t.Fatal(err)
+	}
+	fsID, err := metaStore.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	if err := metaStore.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+		Status: meta.SharedDBStatusActive,
+	}); err != nil {
+		t.Fatalf("UpsertTenantPlacement: %v", err)
+	}
+
+	srv := &Server{meta: metaStore}
+	srv.reconcilePendingTenant(ctx, pendingTenant)
+	got, err := metaStore.GetTenant(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantPending {
+		t.Fatalf("shared pool tenant status after reconcile = %s, want %s", got.Status, meta.TenantPending)
+	}
+}
+
 func TestReconcilePendingNativeTenantWithConnectionResumesSchemaInit(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
