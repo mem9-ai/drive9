@@ -56,6 +56,7 @@ type Config struct {
 	// TiDBCloudNonFreePlanCacheTTL controls the positive-only Billing plan
 	// cache. A non-positive value uses the 30-minute default.
 	TiDBCloudNonFreePlanCacheTTL time.Duration
+	TiDBCloudFreePlanLimits      TiDBCloudFreePlanLimits
 	// LegacyStarterProvisioner is only used for delete/fork compatibility on
 	// persisted tidb_cloud_starter tenants. New starter provisioning remains
 	// disabled and NormalizeProvider does not accept tidb_cloud_starter.
@@ -225,6 +226,7 @@ type Server struct {
 	tenantFailedCleanupRunner tenantFailedCleanupRunner
 	tidbCloudRBACCache        *tidbCloudRBACCache
 	tidbCloudPlanCache        *tidbCloudNonFreePlanCache
+	tidbCloudFreePlanLimits   TiDBCloudFreePlanLimits
 	schemaInitErrors          sync.Map
 	leader                    *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
@@ -418,16 +420,17 @@ func NewWithConfig(cfg Config) *Server {
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
 			apiBase: strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIBase),
 		},
-		disableDBAutoEmbed:    cfg.DisableDatabaseAutoEmbedding,
-		journalCursorSecret:   newJournalCursorSecret(cfg.TokenSecret),
-		forkWorkerCtx:         forkWorkerCtx,
-		forkWorkerCancel:      forkWorkerCancel,
-		tidbCloudRBACCache:    newTiDBCloudRBACCache(tidbCloudRBACCacheTTL),
-		tidbCloudPlanCache:    newTiDBCloudNonFreePlanCache(cfg.TiDBCloudNonFreePlanCacheTTL),
-		leader:                cfg.Leader,
-		podNotifySecret:       cfg.PodNotifySecret,
-		sseNotifyRetention:    cfg.SSENotifyRetention,
-		safetyNetScanInterval: cfg.SafetyNetScanInterval,
+		disableDBAutoEmbed:      cfg.DisableDatabaseAutoEmbedding,
+		journalCursorSecret:     newJournalCursorSecret(cfg.TokenSecret),
+		forkWorkerCtx:           forkWorkerCtx,
+		forkWorkerCancel:        forkWorkerCancel,
+		tidbCloudRBACCache:      newTiDBCloudRBACCache(tidbCloudRBACCacheTTL),
+		tidbCloudPlanCache:      newTiDBCloudNonFreePlanCache(cfg.TiDBCloudNonFreePlanCacheTTL),
+		tidbCloudFreePlanLimits: normalizeTiDBCloudFreePlanLimits(cfg.TiDBCloudFreePlanLimits),
+		leader:                  cfg.Leader,
+		podNotifySecret:         cfg.PodNotifySecret,
+		sseNotifyRetention:      cfg.SSENotifyRetention,
+		safetyNetScanInterval:   cfg.SafetyNetScanInterval,
 	}
 	// Default SSE notify retention.
 	if s.sseNotifyRetention <= 0 {

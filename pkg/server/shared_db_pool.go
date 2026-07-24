@@ -138,7 +138,7 @@ func (s *Server) materializeSharedTenantQuota(ctx context.Context, tenantID stri
 		TenantID:               tenantID,
 		MaxStorageBytes:        meta.DefaultMaxStorageBytes(),
 		MaxFileSizeBytes:       meta.DefaultMaxFileSizeBytes(),
-		MaxFileCount:           0,
+		MaxFileCount:           meta.DefaultMaxFileCount(),
 		MaxMediaLLMFiles:       meta.DefaultMaxMediaLLMFiles(),
 		MaxVideoLLMFiles:       meta.DefaultMaxVideoLLMFiles(),
 		TiDBCloudSpendingLimit: &virtualLimit,

@@ -277,6 +277,73 @@ func TestTiDBCloudNonFreePlanCacheTTLFromEnv(t *testing.T) {
 	}
 }
 
+func TestTiDBCloudFreePlanLimitsFromEnv(t *testing.T) {
+	keys := []string{
+		"DRIVE9_TIDBCLOUD_FREE_TENANT_COUNT",
+		"DRIVE9_TIDBCLOUD_FREE_MAX_STORAGE_BYTES",
+		"DRIVE9_TIDBCLOUD_FREE_MAX_FILE_SIZE_BYTES",
+		"DRIVE9_TIDBCLOUD_FREE_MAX_FILE_COUNT",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	unsetEnv(t, keys)
+	got, err := tiDBCloudFreePlanLimitsFromEnv(server.DefaultMaxUploadBytes)
+	if err != nil {
+		t.Fatalf("default free limits: %v", err)
+	}
+	want := server.TiDBCloudFreePlanLimits{
+		TenantCount: 3, MaxStorageBytes: 3221225472,
+		MaxFileSizeBytes: 314572800, MaxFileCount: 1000,
+	}
+	if got != want {
+		t.Fatalf("default free limits = %+v, want %+v", got, want)
+	}
+
+	setEnv(t, keys[0], "5")
+	setEnv(t, keys[1], "4096")
+	setEnv(t, keys[2], "1024")
+	setEnv(t, keys[3], "2000")
+	got, err = tiDBCloudFreePlanLimitsFromEnv(server.DefaultMaxUploadBytes)
+	if err != nil || got.TenantCount != 5 || got.MaxStorageBytes != 4096 || got.MaxFileSizeBytes != 1024 || got.MaxFileCount != 2000 {
+		t.Fatalf("configured free limits = %+v/%v", got, err)
+	}
+
+	for i, key := range keys {
+		unsetEnv(t, keys)
+		setEnv(t, key, "0")
+		if _, err := tiDBCloudFreePlanLimitsFromEnv(server.DefaultMaxUploadBytes); err == nil {
+			t.Fatalf("zero %s (index %d) error = nil", key, i)
+		}
+	}
+	unsetEnv(t, keys)
+	setEnv(t, keys[2], "1048577")
+	if _, err := tiDBCloudFreePlanLimitsFromEnv(1048576); err == nil {
+		t.Fatal("free max file size above upload limit error = nil")
+	}
+}
+
+func TestGlobalMaxTenantFileCountFromEnv(t *testing.T) {
+	const key = "DRIVE9_MAX_TENANT_FILE_COUNT"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	unsetEnv(t, []string{key})
+	if got, err := maxTenantFileCountFromEnv(); err != nil || got != 0 {
+		t.Fatalf("default max file count = %d/%v, want 0/nil", got, err)
+	}
+	setEnv(t, key, "2500")
+	if got, err := maxTenantFileCountFromEnv(); err != nil || got != 2500 {
+		t.Fatalf("configured max file count = %d/%v, want 2500/nil", got, err)
+	}
+	for _, raw := range []string{"-1", "bad"} {
+		setEnv(t, key, raw)
+		if _, err := maxTenantFileCountFromEnv(); err == nil {
+			t.Fatalf("max file count %q error = nil", raw)
+		}
+	}
+}
+
 func TestDBHealthProbeOptionsFromEnvDefaults(t *testing.T) {
 	keys := []string{
 		"DRIVE9_DB_HEALTH_PROBE_META_ENABLED",

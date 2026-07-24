@@ -46,6 +46,24 @@ func TestDefaultMaxFileSizeBytesDefault(t *testing.T) {
 	}
 }
 
+func TestDefaultMaxFileCountDefaultAndOverride(t *testing.T) {
+	original := DefaultMaxFileCount()
+	defer SetDefaultMaxFileCount(original)
+
+	SetDefaultMaxFileCount(0)
+	if got := DefaultMaxFileCount(); got != 0 {
+		t.Fatalf("default max file count = %d, want unlimited 0", got)
+	}
+	SetDefaultMaxFileCount(1234)
+	if got := DefaultMaxFileCount(); got != 1234 {
+		t.Fatalf("default max file count = %d, want 1234", got)
+	}
+	SetDefaultMaxFileCount(-1)
+	if got := DefaultMaxFileCount(); got != 1234 {
+		t.Fatalf("negative override changed max file count to %d", got)
+	}
+}
+
 func TestSetDefaultMaxFileSizeBytes(t *testing.T) {
 	orig := DefaultMaxFileSizeBytes()
 	defer func() { SetDefaultMaxFileSizeBytes(orig) }()
@@ -73,8 +91,8 @@ func TestGetQuotaConfigUsesConfiguredDefaultStorageBytes(t *testing.T) {
 	if cfg.MaxFileSizeBytes != DefaultMaxFileSizeBytes() {
 		t.Errorf("MaxFileSizeBytes = %d, want default %d", cfg.MaxFileSizeBytes, DefaultMaxFileSizeBytes())
 	}
-	if cfg.MaxFileCount != 0 {
-		t.Errorf("MaxFileCount = %d, want default 0", cfg.MaxFileCount)
+	if cfg.MaxFileCount != DefaultMaxFileCount() {
+		t.Errorf("MaxFileCount = %d, want default %d", cfg.MaxFileCount, DefaultMaxFileCount())
 	}
 	if cfg.MaxMediaLLMFiles != 500 {
 		t.Errorf("MaxMediaLLMFiles = %d, want default 500", cfg.MaxMediaLLMFiles)
@@ -113,7 +131,7 @@ func TestQuotaConfigStoresTiDBCloudSpendingLimitWithoutStorageVersion(t *testing
 	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != 0 {
 		t.Fatalf("spending limit = %#v, want 0", cfg.TiDBCloudSpendingLimit)
 	}
-	if cfg.MaxStorageBytes != DefaultMaxStorageBytes() || cfg.MaxFileSizeBytes != DefaultMaxFileSizeBytes() || cfg.MaxFileCount != 0 {
+	if cfg.MaxStorageBytes != DefaultMaxStorageBytes() || cfg.MaxFileSizeBytes != DefaultMaxFileSizeBytes() || cfg.MaxFileCount != DefaultMaxFileCount() {
 		t.Fatalf("storage quota fields = %#v, want defaults", cfg)
 	}
 	SetDefaultMaxFileSizeBytes(originalFileSizeDefault + 1)

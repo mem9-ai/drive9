@@ -220,6 +220,15 @@ func main() {
 	}
 	backendOptions.MaxUploadBytes = maxUploadBytes
 	meta.SetDefaultMaxFileSizeBytes(maxUploadBytes)
+	maxTenantFileCount, err := maxTenantFileCountFromEnv()
+	if err != nil {
+		die(err)
+	}
+	meta.SetDefaultMaxFileCount(maxTenantFileCount)
+	tidbCloudFreePlanLimits, err := tiDBCloudFreePlanLimitsFromEnv(maxUploadBytes)
+	if err != nil {
+		die(err)
+	}
 	providerType, err = tenant.NormalizeProvider(providerType)
 	if err != nil {
 		die(err)
@@ -454,6 +463,7 @@ func main() {
 		SharedDBReopenRatio:             sharedDBReopenRatio,
 		SharedDBSpendingLimit:           sharedDBDefaultSpendingLimit,
 		TiDBCloudNonFreePlanCacheTTL:    tidbCloudNonFreePlanCacheTTL,
+		TiDBCloudFreePlanLimits:         tidbCloudFreePlanLimits,
 		LegacyStarterProvisioner:        legacyStarterProvisioner,
 		TokenSecret:                     tokenSecret,
 		VaultMasterKey:                  vaultMasterKey,
@@ -1253,6 +1263,64 @@ func tiDBCloudNonFreePlanCacheTTLFromEnv() (time.Duration, error) {
 		return 0, fmt.Errorf("invalid %s=%q: must be a positive duration", key, raw)
 	}
 	return ttl, nil
+}
+
+func tiDBCloudFreePlanLimitsFromEnv(maxUploadBytes int64) (server.TiDBCloudFreePlanLimits, error) {
+	limits := server.DefaultTiDBCloudFreePlanLimits()
+	var err error
+	if limits.TenantCount, err = positiveIntEnv("DRIVE9_TIDBCLOUD_FREE_TENANT_COUNT", limits.TenantCount); err != nil {
+		return server.TiDBCloudFreePlanLimits{}, err
+	}
+	if limits.MaxStorageBytes, err = positiveInt64Env("DRIVE9_TIDBCLOUD_FREE_MAX_STORAGE_BYTES", limits.MaxStorageBytes); err != nil {
+		return server.TiDBCloudFreePlanLimits{}, err
+	}
+	if limits.MaxFileSizeBytes, err = positiveInt64Env("DRIVE9_TIDBCLOUD_FREE_MAX_FILE_SIZE_BYTES", limits.MaxFileSizeBytes); err != nil {
+		return server.TiDBCloudFreePlanLimits{}, err
+	}
+	if limits.MaxFileCount, err = positiveInt64Env("DRIVE9_TIDBCLOUD_FREE_MAX_FILE_COUNT", limits.MaxFileCount); err != nil {
+		return server.TiDBCloudFreePlanLimits{}, err
+	}
+	if limits.MaxFileSizeBytes > maxUploadBytes {
+		return server.TiDBCloudFreePlanLimits{}, fmt.Errorf("DRIVE9_TIDBCLOUD_FREE_MAX_FILE_SIZE_BYTES must not exceed DRIVE9_MAX_UPLOAD_BYTES")
+	}
+	return limits, nil
+}
+
+func maxTenantFileCountFromEnv() (int64, error) {
+	const key = "DRIVE9_MAX_TENANT_FILE_COUNT"
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("invalid %s=%q: must be a non-negative integer", key, raw)
+	}
+	return value, nil
+}
+
+func positiveIntEnv(key string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("invalid %s=%q: must be a positive integer", key, raw)
+	}
+	return value, nil
+}
+
+func positiveInt64Env(key string, fallback int64) (int64, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("invalid %s=%q: must be a positive integer", key, raw)
+	}
+	return value, nil
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {
