@@ -19,6 +19,7 @@ import (
 
 	"github.com/mem9-ai/drive9/internal/testmysql"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
@@ -447,6 +448,29 @@ func newQuotaRuntime(t *testing.T, provider string) *quotaRuntime {
 	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: prov, TokenSecret: tokenSecret})
 	t.Cleanup(server.Close)
 	return &quotaRuntime{meta: db.Meta, tenantID: tenantID, apiKey: apiKey, prov: prov, server: server}
+}
+
+func TestApplyQuotaSetDoesNotRecordHandlerLevelTiDBCloudOpenAPIMetrics(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	tenantRow, err := rt.meta.GetTenant(context.Background(), rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingLimit := int64(0)
+	err = rt.server.applyQuotaSet(context.Background(), "metric_duplicate_test", tenantRow, tenant.CredentialProvisionRequest{
+		PublicKey: "public-1", PrivateKey: "private-1",
+	}, quotaRequest{quotaFields: quotaFields{TiDBCloudSpendingLimit: &spendingLimit}})
+	if err != nil {
+		t.Fatalf("applyQuotaSet: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	for _, operation := range []string{"mark_quota_update_started", "update_quota"} {
+		if strings.Contains(rec.Body.String(), `api="metric_duplicate_test",operation="`+operation+`"`) {
+			t.Fatalf("quota handler double-counted TiDB Cloud OpenAPI operation %q:\n%s", operation, rec.Body.String())
+		}
+	}
 }
 
 func TestQuotaGetRejectsDrive9Key(t *testing.T) {

@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/traceid"
 )
@@ -35,6 +36,168 @@ func setRequiredNativeProvisionerEnv(t *testing.T) {
 	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
 	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
+}
+
+func TestTiDBCloudOpenAPIRequestErrorsAreClassified(t *testing.T) {
+	tests := []struct {
+		name       string
+		transport  http.RoundTripper
+		wantResult string
+	}{
+		{
+			name: "digest challenge",
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusUnauthorized,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			}),
+			wantResult: "digest_error",
+		},
+		{
+			name: "canceled",
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return nil, context.Canceled
+			}),
+			wantResult: "canceled",
+		},
+		{
+			name: "timeout",
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return nil, context.DeadlineExceeded
+			}),
+			wantResult: "timeout",
+		},
+		{
+			name: "transport",
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("network unavailable")
+			}),
+			wantResult: "transport_error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &Provisioner{
+				iamURL: "https://iam.tidbapi.com",
+				client: &http.Client{Transport: tt.transport},
+			}
+			_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+				PublicKey: "METRICKEY1", PrivateKey: "metric-private",
+			})
+			if err == nil {
+				t.Fatal("expected request error")
+			}
+
+			assertTiDBCloudOpenAPIMetric(t, "iam", "resolve_api_key_identity", tt.wantResult, 1)
+		})
+	}
+}
+
+func TestTiDBCloudOpenAPIDigestChallengeRecordsOneLogicalRequest(t *testing.T) {
+	var calls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="metric-nonce", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"name":      "orgs/123/projects/456/apiKeys/789",
+			"accessKey": "METRICKEY2",
+			"role":      tenant.TiDBCloudRoleOrgOwner,
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "METRICKEY2", PrivateKey: "metric-private",
+	})
+	if err != nil {
+		t.Fatalf("ResolveAPIKeyIdentity: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("HTTP calls = %d, want challenge plus authenticated retry", got)
+	}
+	assertTiDBCloudOpenAPIMetric(t, "iam", "resolve_api_key_identity", "ok", 1)
+}
+
+func TestTiDBCloudOpenAPIHTTPResponsesAreClassified(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		wantResult string
+		wantCount  int
+	}{
+		{name: "client error", statusCode: http.StatusForbidden, wantResult: "client_error", wantCount: 1},
+		{name: "rate limited", statusCode: http.StatusTooManyRequests, wantResult: "rate_limited", wantCount: 1},
+		{name: "upstream error", statusCode: http.StatusBadGateway, wantResult: "upstream_error", wantCount: 1},
+		{name: "redirect", statusCode: http.StatusTemporaryRedirect, wantResult: "protocol_error", wantCount: 1},
+		{name: "malformed success", statusCode: http.StatusOK, body: `{`, wantResult: "protocol_error", wantCount: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &Provisioner{
+				iamURL: "https://iam.tidbapi.com",
+				client: &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: tt.statusCode,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(tt.body)),
+					}, nil
+				})},
+			}
+			_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+				PublicKey: "METRICKEY3", PrivateKey: "metric-private",
+			})
+			if err == nil {
+				t.Fatal("expected IAM response error")
+			}
+			assertTiDBCloudOpenAPIMetric(t, "iam", "resolve_api_key_identity", tt.wantResult, tt.wantCount)
+		})
+	}
+}
+
+func TestTiDBCloudOpenAPIClusterListUsesBoundedLabels(t *testing.T) {
+	var calls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="cluster-metric-nonce", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, `{"clusters":[]}`)
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+	_, err := p.ListManagedClusters(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "METRICKEY4", PrivateKey: "metric-private",
+	}, tenant.ManagedClusterListOptions{})
+	if err != nil {
+		t.Fatalf("ListManagedClusters: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("HTTP calls = %d, want challenge plus authenticated retry", got)
+	}
+	assertTiDBCloudOpenAPIMetric(t, "cluster", "list_clusters", "ok", 1)
+}
+
+func assertTiDBCloudOpenAPIMetric(t *testing.T, api, operation, result string, count int) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	want := fmt.Sprintf(`drive9_tidbcloud_openapi_requests_total{api=%q,operation=%q,result=%q} %d`, api, operation, result, count)
+	if !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("missing metric %q:\n%s", want, rec.Body.String())
+	}
 }
 
 func TestNewProvisionerFromEnvRequiresIAMURLForNative(t *testing.T) {

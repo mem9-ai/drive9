@@ -429,7 +429,7 @@ func TestRecordTenantPoolBindingsIncludesPoolTiDBCloudOrgAndStatus(t *testing.T)
 
 func TestTiDBCloudQuotaMetricsOmitTenantID(t *testing.T) {
 	RecordTiDBCloudRBACCacheRequest("quota_get", "cluster", "hit")
-	RecordTiDBCloudOpenAPIRequest("admin_tenant_get", "list_managed_clusters", "ok")
+	RecordTiDBCloudOpenAPIRequest("cluster", "list_clusters", "ok")
 	RecordTiDBCloudSpendingLimitSync("quota_get", "updated")
 	RecordTiDBCloudSpendingLimitMissing("admin_tenant_list")
 
@@ -438,7 +438,7 @@ func TestTiDBCloudQuotaMetricsOmitTenantID(t *testing.T) {
 	text := rec.Body.String()
 	for _, want := range []string{
 		`drive9_tidbcloud_rbac_cache_requests_total{path="quota_get",result="hit",scope="cluster"} 1`,
-		`drive9_tidbcloud_openapi_requests_total{operation="list_managed_clusters",path="admin_tenant_get",result="ok"} 1`,
+		`drive9_tidbcloud_openapi_requests_total{api="cluster",operation="list_clusters",result="ok"} 1`,
 		`drive9_tidbcloud_spending_limit_sync_total{result="updated",source="quota_get"} 1`,
 		`drive9_tidbcloud_spending_limit_missing_total{path="admin_tenant_list"} 1`,
 	} {
@@ -449,6 +449,9 @@ func TestTiDBCloudQuotaMetricsOmitTenantID(t *testing.T) {
 	for _, line := range strings.Split(text, "\n") {
 		if strings.HasPrefix(line, "drive9_tidbcloud_") && strings.Contains(line, `tenant_id=`) {
 			t.Fatalf("TiDB Cloud quota metrics must not carry tenant_id:\n%s", text)
+		}
+		if strings.HasPrefix(line, "drive9_tidbcloud_openapi_requests_total") && strings.Contains(line, `path=`) {
+			t.Fatalf("TiDB Cloud OpenAPI metrics must use api, not path:\n%s", text)
 		}
 	}
 }
