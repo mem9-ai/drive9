@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 )
 
@@ -52,6 +53,30 @@ type CredentialProvisionRequest struct {
 type TiDBCloudAPIKeyIdentity struct {
 	OrganizationID string
 	Role           string
+}
+
+type TiDBCloudAPIError struct {
+	Operation    string
+	StatusCode   int
+	UpstreamBody string
+}
+
+func (e *TiDBCloudAPIError) Error() string {
+	if e == nil {
+		return ""
+	}
+	msg := fmt.Sprintf("tidbcloud native %s status %d", e.Operation, e.StatusCode)
+	if e.UpstreamBody != "" {
+		return msg + ": " + e.UpstreamBody
+	}
+	switch e.StatusCode {
+	case http.StatusUnauthorized:
+		return msg + ": invalid TiDB Cloud API key"
+	case http.StatusForbidden:
+		return msg + ": access denied"
+	default:
+		return msg + ": upstream error"
+	}
 }
 
 type TiDBCloudAPIKeyIdentityResolver interface {
