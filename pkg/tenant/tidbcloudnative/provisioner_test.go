@@ -284,10 +284,28 @@ func TestResolveAPIKeyIdentityDoesNotExposeIAMErrorBody(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected IAM status error")
 	}
+	var apiErr *tenant.TiDBCloudAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *tenant.TiDBCloudAPIError", err)
+	}
+	if apiErr.Operation != "IAM API key lookup" || apiErr.StatusCode != http.StatusForbidden || apiErr.UpstreamBody != "" {
+		t.Fatalf("IAM error = %#v", apiErr)
+	}
 	for _, sensitive := range []string{"RESPONSEKEY1", "SENSITIVE_SECRET", "SENSITIVE_DISPLAY", "REQUESTKEY1", "request-private"} {
 		if strings.Contains(err.Error(), sensitive) {
 			t.Fatalf("error leaked IAM response material %q: %v", sensitive, err)
 		}
+	}
+}
+
+func TestStatusErrorReturnsTypedError(t *testing.T) {
+	err := statusError("cluster list", http.StatusTooManyRequests, `{"message":"slow down"}`)
+	var apiErr *tenant.TiDBCloudAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *tenant.TiDBCloudAPIError", err)
+	}
+	if apiErr.Operation != "cluster list" || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.UpstreamBody != `{"message":"slow down"}` {
+		t.Fatalf("status error = %#v", apiErr)
 	}
 }
 

@@ -224,7 +224,7 @@ func (p *Provisioner) ResolveAPIKeyIdentity(ctx context.Context, req tenant.Cred
 		if readErr != nil {
 			return nil, readErr
 		}
-		return nil, fmt.Errorf("%s", statusError("IAM API key lookup", resp.StatusCode, ""))
+		return nil, statusError("IAM API key lookup", resp.StatusCode, "")
 	}
 	var info struct {
 		Name      string `json:"name"`
@@ -385,7 +385,7 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 		if readErr != nil {
 			return nil, nil, readErr
 		}
-		return nil, nil, fmt.Errorf("%s", statusError("provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
+		return nil, nil, statusError("provision", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
@@ -506,7 +506,7 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 		if readErr != nil {
 			return nil, nil, readErr
 		}
-		return nil, nil, fmt.Errorf("%s", statusError("batch provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
+		return nil, nil, statusError("batch provision", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
@@ -647,7 +647,7 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 		if readErr != nil {
 			return nil, readErr
 		}
-		return nil, fmt.Errorf("%s", statusError("batch provision shared db pools", resp.StatusCode, sanitizeUpstreamBody(raw)))
+		return nil, statusError("batch provision shared db pools", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	raw, err := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if err != nil {
@@ -1214,7 +1214,7 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 		if readErr != nil {
 			return nil, readErr
 		}
-		return nil, fmt.Errorf("%s", statusError("branch provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
+		return nil, statusError("branch provision", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
@@ -1311,7 +1311,7 @@ func (p *Provisioner) DeleteBranchWithCredentials(ctx context.Context, clusterID
 		if readErr != nil {
 			return readErr
 		}
-		return fmt.Errorf("%s", statusError("branch delete", resp.StatusCode, sanitizeUpstreamBody(raw)))
+		return statusError("branch delete", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	return nil
 }
@@ -1336,7 +1336,7 @@ func (p *Provisioner) DeprovisionWithCredentials(ctx context.Context, cluster *t
 		if readErr != nil {
 			return readErr
 		}
-		return fmt.Errorf("%s", statusError("cluster delete", resp.StatusCode, sanitizeUpstreamBody(raw)))
+		return statusError("cluster delete", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	return nil
 }
@@ -1510,7 +1510,7 @@ func (p *Provisioner) listClusterInfosPageWithCredentials(ctx context.Context, p
 		if readErr != nil {
 			return nil, "", fmt.Errorf("read cluster list error body: %w", readErr)
 		}
-		return nil, "", &tidbCloudStatusError{operation: "cluster list", code: resp.StatusCode, upstreamBody: sanitizeUpstreamBody(raw)}
+		return nil, "", statusError("cluster list", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
@@ -1968,52 +1968,30 @@ func readUpstreamBody(r io.Reader, limit int64) ([]byte, error) {
 	return raw, nil
 }
 
-type tidbCloudStatusError struct {
-	operation    string
-	code         int
-	upstreamBody string
-}
-
-func (e *tidbCloudStatusError) Error() string {
-	if e == nil {
-		return ""
-	}
-	return statusError(e.operation, e.code, e.upstreamBody)
-}
-
 func isTiDBCloudStatus(err error, code int) bool {
-	var statusErr *tidbCloudStatusError
-	return errors.As(err, &statusErr) && statusErr.code == code
+	var statusErr *tenant.TiDBCloudAPIError
+	return errors.As(err, &statusErr) && statusErr != nil && statusErr.StatusCode == code
 }
 
-func statusError(operation string, code int, upstreamBody string) string {
-	msg := fmt.Sprintf("tidbcloud native %s status %d", operation, code)
-	if upstreamBody != "" {
-		msg += ": " + upstreamBody
-	} else {
-		switch code {
-		case http.StatusUnauthorized:
-			msg += ": invalid TiDB Cloud API key"
-		case http.StatusForbidden:
-			msg += ": access denied"
-		default:
-			msg += ": upstream error"
-		}
+func statusError(operation string, code int, upstreamBody string) error {
+	return &tenant.TiDBCloudAPIError{
+		Operation:    strings.TrimSpace(operation),
+		StatusCode:   code,
+		UpstreamBody: strings.TrimSpace(upstreamBody),
 	}
-	return msg
 }
 
 func quotaStatusError(operation string, code int, upstreamBody string) error {
-	msg := statusError(operation, code, upstreamBody)
+	apiErr := statusError(operation, code, upstreamBody)
 	switch code {
 	case http.StatusUnauthorized:
-		return fmt.Errorf("%w: %s", tenant.ErrQuotaPermissionDenied, msg)
+		return fmt.Errorf("%w: %w", tenant.ErrQuotaPermissionDenied, apiErr)
 	case http.StatusForbidden:
-		return fmt.Errorf("%w: %s", tenant.ErrQuotaPermissionDenied, msg)
+		return fmt.Errorf("%w: %w", tenant.ErrQuotaPermissionDenied, apiErr)
 	case http.StatusNotFound:
-		return fmt.Errorf("%w: %s", tenant.ErrQuotaBackendNotFound, msg)
+		return fmt.Errorf("%w: %w", tenant.ErrQuotaBackendNotFound, apiErr)
 	default:
-		return fmt.Errorf("%s", msg)
+		return apiErr
 	}
 }
 
@@ -2301,7 +2279,7 @@ func (p *Provisioner) waitForClusterProvisionMetadata(ctx context.Context, publi
 		}
 		if resp.StatusCode != http.StatusOK {
 			if resp.StatusCode != http.StatusTooManyRequests || time.Now().After(deadline) {
-				return nil, fmt.Errorf("%s", statusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw)))
+				return nil, statusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw))
 			}
 			select {
 			case <-ctx.Done():
@@ -2349,7 +2327,7 @@ func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privat
 			return nil, readErr
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("%s", statusError("branch get", resp.StatusCode, sanitizeUpstreamBody(raw)))
+			return nil, statusError("branch get", resp.StatusCode, sanitizeUpstreamBody(raw))
 		}
 		info, err := parseBranchInfo(raw)
 		if err != nil {
@@ -2399,7 +2377,7 @@ func (p *Provisioner) WaitForBranchUserWithCredentials(ctx context.Context, clus
 			return "", readErr
 		}
 		if resp.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("%s", statusError("branch get", resp.StatusCode, sanitizeUpstreamBody(raw)))
+			return "", statusError("branch get", resp.StatusCode, sanitizeUpstreamBody(raw))
 		}
 		info, err := parseBranchInfo(raw)
 		if err != nil {
