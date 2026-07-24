@@ -1016,23 +1016,15 @@ func TestAdminTenantPoolReplenishBatchesBelowFreeWatermark(t *testing.T) {
 	}
 }
 
-func TestAdminTenantPoolReplenishCapsOneWaveAtFifty(t *testing.T) {
-	rt, _ := newAdminTenantPoolRuntime(t)
-	ctx := context.Background()
-	now := time.Now().UTC()
-	pool := &meta.TenantPool{PoolID: "pool-refill-cap", OrganizationID: "org-1", Size: 100,
-		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now}
-	if err := rt.meta.CreateTenantPool(ctx, pool); err != nil {
-		t.Fatalf("create pool: %v", err)
+func TestManagedSharedDBRefillCapsOneWaveAtFiftyPhysicalPools(t *testing.T) {
+	if got := managedSharedDBRefillTenantCount(10_000, 100); got != 5_000 {
+		t.Fatalf("refill tenant count = %d, want capacity of 50 physical pools", got)
 	}
-	rt.server.replenishTenantPoolAsync(ctx, pool, tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
-	rt.server.forkWorkerWG.Wait()
-	free, err := rt.meta.CountTenantPoolFreeSlots(ctx, pool.OrganizationID)
-	if err != nil {
-		t.Fatalf("count free slots: %v", err)
+	if got := managedSharedDBRefillTenantCount(1_600, 100); got != 1_600 {
+		t.Fatalf("refill tenant count = %d, want all 1600 tenants across 16 physical pools", got)
 	}
-	if free != tenantPoolRefillWaveLimit {
-		t.Fatalf("free slots = %d, want one refill wave capped at %d", free, tenantPoolRefillWaveLimit)
+	if got := managedSharedDBRefillTenantCount(100, 1); got != 50 {
+		t.Fatalf("refill tenant count with one tenant per DB = %d, want 50", got)
 	}
 }
 
