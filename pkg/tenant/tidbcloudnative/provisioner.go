@@ -37,6 +37,7 @@ import (
 const (
 	EnvTiDBCloudNativeAPIURL                  = "DRIVE9_TIDBCLOUD_NATIVE_API_URL"
 	EnvTiDBCloudIAMAPIURL                     = "DRIVE9_TIDBCLOUD_IAM_API_URL"
+	EnvTiDBCloudBillingAPIURL                 = "DRIVE9_TIDBCLOUD_BILLING_API_URL"
 	EnvTiDBCloudNativeCloudProvider           = "DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER"
 	EnvTiDBCloudNativeRegion                  = "DRIVE9_TIDBCLOUD_NATIVE_REGION"
 	EnvTiDBCloudNativeDefaultDatabaseName     = "DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME"
@@ -74,6 +75,7 @@ const (
 
 	tidbCloudAPICluster = "cluster"
 	tidbCloudAPIIAM     = "iam"
+	tidbCloudAPIBilling = "billing"
 
 	tidbCloudOperationCreateCluster         = "create_cluster"
 	tidbCloudOperationBatchCreateClusters   = "batch_create_clusters"
@@ -85,6 +87,7 @@ const (
 	tidbCloudOperationGetBranch             = "get_branch"
 	tidbCloudOperationDeleteBranch          = "delete_branch"
 	tidbCloudOperationResolveAPIKeyIdentity = "resolve_api_key_identity"
+	tidbCloudOperationGetOrganizationPlan   = "get_organization_plan"
 
 	tidbCloudResultOK             = "ok"
 	tidbCloudResultClientError    = "client_error"
@@ -106,6 +109,7 @@ var (
 
 var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 var displayNameCharPattern = regexp.MustCompile(`[^A-Za-z0-9-]`)
+var decimalPattern = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$`)
 
 var (
 	ensureDatabaseFunc                        = ensureDatabase
@@ -118,6 +122,7 @@ var (
 type Provisioner struct {
 	apiURL                      string
 	iamURL                      string
+	billingURL                  string
 	cloudProvider               string
 	region                      string
 	defaultDatabaseName         string
@@ -136,6 +141,7 @@ type Provisioner struct {
 func NewProvisionerFromEnv(providerType string) (*Provisioner, error) {
 	apiURL := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeAPIURL))
 	iamURL := strings.TrimSpace(os.Getenv(EnvTiDBCloudIAMAPIURL))
+	billingURL := strings.TrimSpace(os.Getenv(EnvTiDBCloudBillingAPIURL))
 	cloudProvider := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeCloudProvider))
 	region := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeRegion))
 	defaultDB := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeDefaultDatabaseName))
@@ -146,8 +152,8 @@ func NewProvisionerFromEnv(providerType string) (*Provisioner, error) {
 	if defaultDB == "" {
 		defaultDB = DefaultDatabaseName
 	}
-	if apiURL == "" || iamURL == "" || cloudProvider == "" || region == "" {
-		return nil, fmt.Errorf("%s, %s, %s and %s are required", EnvTiDBCloudNativeAPIURL, EnvTiDBCloudIAMAPIURL, EnvTiDBCloudNativeCloudProvider, EnvTiDBCloudNativeRegion)
+	if apiURL == "" || iamURL == "" || billingURL == "" || cloudProvider == "" || region == "" {
+		return nil, fmt.Errorf("%s, %s, %s, %s and %s are required", EnvTiDBCloudNativeAPIURL, EnvTiDBCloudIAMAPIURL, EnvTiDBCloudBillingAPIURL, EnvTiDBCloudNativeCloudProvider, EnvTiDBCloudNativeRegion)
 	}
 	parsedAPIURL, err := url.Parse(apiURL)
 	if err != nil || parsedAPIURL.Scheme != "https" || parsedAPIURL.Host == "" {
@@ -156,6 +162,10 @@ func NewProvisionerFromEnv(providerType string) (*Provisioner, error) {
 	parsedIAMURL, err := url.Parse(iamURL)
 	if err != nil || parsedIAMURL.Scheme != "https" || parsedIAMURL.Host == "" {
 		return nil, fmt.Errorf("%s must be a valid https URL", EnvTiDBCloudIAMAPIURL)
+	}
+	parsedBillingURL, err := url.Parse(billingURL)
+	if err != nil || parsedBillingURL.Scheme != "https" || parsedBillingURL.Host == "" {
+		return nil, fmt.Errorf("%s must be a valid https URL", EnvTiDBCloudBillingAPIURL)
 	}
 	sharedPublicKey := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeSharedPublicKey))
 	sharedPrivateKey := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeSharedPrivateKey))
@@ -178,6 +188,7 @@ func NewProvisionerFromEnv(providerType string) (*Provisioner, error) {
 	return &Provisioner{
 		apiURL:                      strings.TrimRight(apiURL, "/"),
 		iamURL:                      strings.TrimRight(iamURL, "/"),
+		billingURL:                  strings.TrimRight(billingURL, "/"),
 		cloudProvider:               cloudProvider,
 		region:                      region,
 		defaultDatabaseName:         defaultDB,
@@ -275,6 +286,104 @@ func (p *Provisioner) ResolveAPIKeyIdentity(ctx context.Context, req tenant.Cred
 		return nil, fmt.Errorf("%w: role %q; org:owner or project:owner is required", tenant.ErrTiDBCloudRoleInsufficient, role)
 	}
 	return &tenant.TiDBCloudAPIKeyIdentity{OrganizationID: strings.TrimSpace(parts[1]), Role: role}, nil
+}
+
+func (p *Provisioner) ResolveOrganizationPlan(ctx context.Context, organizationID string, req tenant.CredentialProvisionRequest) (*tenant.TiDBCloudOrganizationPlan, error) {
+	organizationID = strings.TrimSpace(organizationID)
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	if organizationID == "" {
+		return nil, fmt.Errorf("%w: organization is required", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+	endpoint := fmt.Sprintf("%s/v1beta1/tenants/%s/plans", p.billingURL, url.PathEscape(organizationID))
+	resp, err := p.doObservedDigestAuthRequest(ctx, tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, publicKey, privateKey, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", tenant.ErrTiDBCloudBillingUnavailable, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		recordTiDBCloudHTTPResponse(tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, resp.StatusCode, true)
+		_, _ = readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		return nil, statusError("Billing plan lookup", resp.StatusCode, "")
+	}
+	raw, err := readUpstreamBody(resp.Body, upstreamClusterBodyLimit+1)
+	if err != nil {
+		recordTiDBCloudHTTPResponse(tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, resp.StatusCode, false)
+		return nil, fmt.Errorf("%w: read response", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+	if len(raw) > upstreamClusterBodyLimit {
+		recordTiDBCloudHTTPResponse(tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, resp.StatusCode, false)
+		return nil, fmt.Errorf("%w: response too large", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+	plan, err := parseOrganizationPlanResponse(raw, organizationID)
+	if err != nil {
+		recordTiDBCloudHTTPResponse(tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, resp.StatusCode, false)
+		return nil, err
+	}
+	recordTiDBCloudHTTPResponse(tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, resp.StatusCode, true)
+	return plan, nil
+}
+
+func parseOrganizationPlanResponse(raw []byte, organizationID string) (*tenant.TiDBCloudOrganizationPlan, error) {
+	var response struct {
+		TenantID      json.RawMessage `json:"tenant_id"`
+		TenantIDStr   string          `json:"tenant_id_str"`
+		EffectivePlan string          `json:"effective_plan"`
+		POCCredits    string          `json:"poc_credits"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&response); err != nil {
+		return nil, fmt.Errorf("%w: malformed JSON", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return nil, fmt.Errorf("%w: trailing JSON", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+
+	identities := make([]string, 0, 2)
+	if value := strings.TrimSpace(response.TenantIDStr); value != "" {
+		identities = append(identities, value)
+	}
+	if len(response.TenantID) > 0 && string(response.TenantID) != "null" {
+		var number json.Number
+		if err := json.Unmarshal(response.TenantID, &number); err != nil || strings.TrimSpace(number.String()) == "" {
+			return nil, fmt.Errorf("%w: invalid numeric organization", tenant.ErrTiDBCloudBillingResponseInvalid)
+		}
+		identities = append(identities, number.String())
+	}
+	if len(identities) == 0 {
+		return nil, fmt.Errorf("%w: organization is missing", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+	for _, identity := range identities {
+		if identity != organizationID {
+			return nil, fmt.Errorf("%w: organization mismatch", tenant.ErrTiDBCloudBillingResponseInvalid)
+		}
+	}
+
+	effectivePlan := strings.TrimSpace(response.EffectivePlan)
+	isFree := true
+	switch effectivePlan {
+	case "on_demand":
+		isFree = false
+	case "poc":
+		credits := strings.TrimSpace(response.POCCredits)
+		if !decimalPattern.MatchString(credits) {
+			return nil, fmt.Errorf("%w: invalid POC credits", tenant.ErrTiDBCloudBillingResponseInvalid)
+		}
+		value, ok := new(big.Rat).SetString(credits)
+		if !ok {
+			return nil, fmt.Errorf("%w: invalid POC credits", tenant.ErrTiDBCloudBillingResponseInvalid)
+		}
+		isFree = value.Sign() <= 0
+	}
+	return &tenant.TiDBCloudOrganizationPlan{
+		OrganizationID: organizationID,
+		EffectivePlan:  effectivePlan,
+		IsFree:         isFree,
+	}, nil
 }
 
 func (p *Provisioner) ProvisioningRegion() string { return p.region }
@@ -2623,6 +2732,10 @@ func requestPath(uri string) string {
 	const iamAPIKeyPath = "/v1beta1/apikeys/"
 	if strings.HasPrefix(u.Path, iamAPIKeyPath) {
 		return iamAPIKeyPath + "***"
+	}
+	const billingTenantPath = "/v1beta1/tenants/"
+	if strings.HasPrefix(u.Path, billingTenantPath) && strings.HasSuffix(u.Path, "/plans") {
+		return billingTenantPath + "***/plans"
 	}
 	return u.Path
 }
