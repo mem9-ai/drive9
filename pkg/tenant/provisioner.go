@@ -109,6 +109,12 @@ type CredentialQuotaProvisioner interface {
 	ProvisionWithCredentialsAndQuota(ctx context.Context, tenantID string, req CredentialProvisionRequest, opts QuotaUpdateOptions) (*ClusterInfo, *QuotaCloudConfig, error)
 }
 
+type CredentialEarlyBindingProvisioner interface {
+	Provisioner
+	CreateClusterWithCredentialsAndQuota(ctx context.Context, tenantID string, req CredentialProvisionRequest, opts QuotaUpdateOptions) (*ClusterInfo, *QuotaCloudConfig, error)
+	WaitForClusterMetadataWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) (*ClusterInfo, error)
+}
+
 type TenantPoolClusterManager interface {
 	Provisioner
 	BatchProvisionFreeClustersWithCredentialsAndQuota(ctx context.Context, tenantIDs []string, req CredentialProvisionRequest, opts QuotaUpdateOptions) ([]*ClusterInfo, *QuotaCloudConfig, error)

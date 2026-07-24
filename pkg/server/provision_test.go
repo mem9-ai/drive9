@@ -78,6 +78,50 @@ type fakeProvisioner struct {
 	sharedPoolWaitRelease   <-chan struct{}
 }
 
+type earlyBindingProvisioner struct {
+	*fakeProvisioner
+	created     *tenant.ClusterInfo
+	ready       *tenant.ClusterInfo
+	waitStarted chan struct{}
+	waitRelease <-chan struct{}
+	waitErr     error
+}
+
+func (p *earlyBindingProvisioner) ProvisionWithCredentials(context.Context, string, tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	return nil, fmt.Errorf("legacy credential provision path used")
+}
+
+func (p *earlyBindingProvisioner) ProvisionWithCredentialsAndQuota(context.Context, string, tenant.CredentialProvisionRequest, tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
+	return nil, nil, fmt.Errorf("legacy credential quota provision path used")
+}
+
+func (p *earlyBindingProvisioner) CreateClusterWithCredentialsAndQuota(_ context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
+	p.lastCredentialReq = req
+	p.lastCreateQuotaOptions = opts
+	out := *p.created
+	out.TenantID = tenantID
+	out.Provider = tenant.ProviderTiDBCloudNative
+	return &out, nil, nil
+}
+
+func (p *earlyBindingProvisioner) WaitForClusterMetadataWithCredentials(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	p.lastCredentialReq = req
+	close(p.waitStarted)
+	if p.waitRelease != nil {
+		<-p.waitRelease
+	}
+	if p.waitErr != nil {
+		return cluster, p.waitErr
+	}
+	out := *p.ready
+	out.TenantID = cluster.TenantID
+	out.ClusterID = cluster.ClusterID
+	out.Password = cluster.Password
+	out.DBName = cluster.DBName
+	out.Provider = tenant.ProviderTiDBCloudNative
+	return &out, nil
+}
+
 type failingEncryptor struct {
 	err error
 }
@@ -1405,6 +1449,42 @@ func (f *fakeProvisioner) ProvisionWithCredentialsAndQuota(_ context.Context, te
 	return &out, cloudCfg, nil
 }
 
+func (f *fakeProvisioner) CreateClusterWithCredentialsAndQuota(_ context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		f.credentialQuotaCalls.Add(1)
+	} else {
+		f.credentialCalls.Add(1)
+	}
+	f.lastCredentialReq = req
+	f.lastCreateQuotaOptions = opts
+	if f.provisionErr != nil {
+		if f.cluster == nil {
+			return nil, nil, f.provisionErr
+		}
+		out := *f.cluster
+		out.TenantID = tenantID
+		out.Provider = f.provider
+		return &out, nil, f.provisionErr
+	}
+	out := *f.cluster
+	out.TenantID = tenantID
+	out.Provider = f.provider
+	var cloudCfg *tenant.QuotaCloudConfig
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: opts.TiDBCloudSpendingLimitMonthly}
+	}
+	return &out, cloudCfg, nil
+}
+
+func (f *fakeProvisioner) WaitForClusterMetadataWithCredentials(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	f.lastCredentialReq = req
+	if cluster == nil {
+		return nil, fmt.Errorf("cluster is required")
+	}
+	out := *cluster
+	return &out, nil
+}
+
 func (f *fakeProvisioner) Deprovision(_ context.Context, cluster *tenant.ClusterInfo) error {
 	if cluster != nil {
 		out := *cluster
@@ -2091,6 +2171,198 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	}
 	if string(plain) != "system-pass" {
 		t.Fatalf("tenant db password = %q, want system password", plain)
+	}
+}
+
+func TestProvisionTiDBCloudNativePersistsEarlyClusterBindingBeforeMetadataWait(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	release := make(chan struct{})
+	prov := &earlyBindingProvisioner{
+		fakeProvisioner: &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
+		created: &tenant.ClusterInfo{
+			ClusterID: "cluster-early-server", Password: "db-pass", DBName: "customer_db",
+		},
+		ready: &tenant.ClusterInfo{
+			OrganizationID: "org-early-server", Host: "db.example", Port: 4000, Username: "u1.root",
+		},
+		waitStarted: make(chan struct{}),
+		waitRelease: release,
+	}
+	rt.server.provisioner = prov
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	type provisionOutcome struct {
+		result *provisionTenantResult
+		err    error
+	}
+	outcomes := make(chan provisionOutcome, 1)
+	go func() {
+		result, err := rt.server.provisionTenant(context.Background(), provisionTenantOptions{
+			KeyName: "default", TokenVersion: 1, CredentialProvisioner: &cred,
+			TiDBCloudAccess: &tiDBCloudAccessProfile{OrganizationID: "org-early-server"},
+		})
+		outcomes <- provisionOutcome{result: result, err: err}
+	}()
+
+	select {
+	case <-prov.waitStarted:
+	case outcome := <-outcomes:
+		t.Fatalf("provision returned before metadata wait: result=%+v err=%v", outcome.result, outcome.err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("metadata wait did not start")
+	}
+	var tenantID, status, dbUser string
+	if err := rt.meta.DB().QueryRow(`SELECT id, status, db_user FROM tenants WHERE cluster_id = ?`, "cluster-early-server").Scan(&tenantID, &status, &dbUser); err != nil {
+		t.Fatalf("query early-bound tenant: %v", err)
+	}
+	if status != string(meta.TenantPending) || dbUser != "" {
+		t.Fatalf("early-bound tenant status/user = %s/%q, want pending/empty", status, dbUser)
+	}
+	binding, err := rt.meta.GetTenantTiDBCloudOrgBinding(context.Background(), tenantID)
+	if err != nil || binding.OrganizationID != "org-early-server" || binding.ClusterID != "cluster-early-server" {
+		t.Fatalf("early org binding = %+v, err=%v", binding, err)
+	}
+
+	close(release)
+	outcome := <-outcomes
+	if outcome.err != nil || outcome.result == nil || outcome.result.Status != meta.TenantProvisioning {
+		t.Fatalf("provision outcome = %+v err=%v", outcome.result, outcome.err)
+	}
+	row, err := rt.meta.GetTenant(context.Background(), tenantID)
+	if err != nil || row.Status != meta.TenantProvisioning || row.DBUser != "u1.root" || row.DBHost != "db.example" {
+		t.Fatalf("final tenant = %+v, err=%v", row, err)
+	}
+}
+
+func TestProvisionTiDBCloudNativeRejectsMetadataOrganizationMismatchAndCleansCluster(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	prov := &earlyBindingProvisioner{
+		fakeProvisioner: &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
+		created: &tenant.ClusterInfo{
+			ClusterID: "cluster-org-mismatch", Password: "db-pass", DBName: "customer_db",
+		},
+		ready: &tenant.ClusterInfo{
+			OrganizationID: "org-actual", Host: "db.example", Port: 4000, Username: "u1.root",
+		},
+		waitStarted: make(chan struct{}),
+	}
+	rt.server.provisioner = prov
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	result, err := rt.server.provisionTenant(context.Background(), provisionTenantOptions{
+		KeyName: "default", TokenVersion: 1, CredentialProvisioner: &cred,
+		TiDBCloudAccess: &tiDBCloudAccessProfile{OrganizationID: "org-expected"},
+	})
+	if result != nil || err == nil {
+		t.Fatalf("provision result=%+v err=%v, want organization mismatch", result, err)
+	}
+	var provisionErr *provisionTenantError
+	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusBadGateway {
+		t.Fatalf("provision error = %#v, want 502", err)
+	}
+	waitForDeprovisionCalls(t, prov.fakeProvisioner, 1)
+	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "cluster-org-mismatch" {
+		t.Fatalf("deprovision cluster = %+v", prov.lastDeprovision)
+	}
+	if prov.lastCredentialReq != cred {
+		t.Fatalf("cleanup credentials = %+v, want %+v", prov.lastCredentialReq, cred)
+	}
+	var tenantID, status string
+	if err := rt.meta.DB().QueryRow(`SELECT id, status FROM tenants WHERE id <> ? ORDER BY created_at DESC LIMIT 1`, rt.tenantID).Scan(&tenantID, &status); err != nil {
+		t.Fatalf("query failed tenant: %v", err)
+	}
+	if status != string(meta.TenantFailed) {
+		t.Fatalf("tenant status = %s, want failed", status)
+	}
+}
+
+func TestProvisionTiDBCloudNativeCleansClusterWhenEarlyBindingPersistenceFails(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	prov := &earlyBindingProvisioner{
+		fakeProvisioner: &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
+		created: &tenant.ClusterInfo{
+			ClusterID: "cluster-quota-1", Password: "db-pass", DBName: "customer_db",
+		},
+		ready:       &tenant.ClusterInfo{OrganizationID: "org-1", Host: "db.example", Port: 4000, Username: "u1.root"},
+		waitStarted: make(chan struct{}),
+	}
+	rt.server.provisioner = prov
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	result, err := rt.server.provisionTenant(context.Background(), provisionTenantOptions{
+		KeyName: "default", TokenVersion: 1, CredentialProvisioner: &cred,
+		TiDBCloudAccess: &tiDBCloudAccessProfile{OrganizationID: "org-1"},
+	})
+	if result != nil || err == nil {
+		t.Fatalf("provision result=%+v err=%v, want early binding failure", result, err)
+	}
+	var provisionErr *provisionTenantError
+	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusInternalServerError {
+		t.Fatalf("provision error = %#v, want 500", err)
+	}
+	waitForDeprovisionCalls(t, prov.fakeProvisioner, 1)
+	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "cluster-quota-1" {
+		t.Fatalf("deprovision cluster = %+v", prov.lastDeprovision)
+	}
+	if prov.lastCredentialReq != cred {
+		t.Fatalf("cleanup credentials = %+v, want %+v", prov.lastCredentialReq, cred)
+	}
+	var status string
+	if err := rt.meta.DB().QueryRow(`SELECT status FROM tenants WHERE id <> ? ORDER BY created_at DESC LIMIT 1`, rt.tenantID).Scan(&status); err != nil {
+		t.Fatalf("query failed tenant: %v", err)
+	}
+	if status != string(meta.TenantFailed) {
+		t.Fatalf("tenant status = %s, want failed", status)
+	}
+}
+
+func TestProvisionTiDBCloudNativeFinalizationDoesNotOverwriteChangedStatus(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	release := make(chan struct{})
+	prov := &earlyBindingProvisioner{
+		fakeProvisioner: &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
+		created: &tenant.ClusterInfo{
+			ClusterID: "cluster-finalize-cas", Password: "db-pass", DBName: "customer_db",
+		},
+		ready: &tenant.ClusterInfo{
+			OrganizationID: "org-finalize-cas", Host: "db.example", Port: 4000, Username: "u1.root",
+		},
+		waitStarted: make(chan struct{}),
+		waitRelease: release,
+	}
+	rt.server.provisioner = prov
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	type provisionOutcome struct {
+		result *provisionTenantResult
+		err    error
+	}
+	outcomes := make(chan provisionOutcome, 1)
+	go func() {
+		result, err := rt.server.provisionTenant(context.Background(), provisionTenantOptions{
+			KeyName: "default", TokenVersion: 1, CredentialProvisioner: &cred,
+			TiDBCloudAccess: &tiDBCloudAccessProfile{OrganizationID: "org-finalize-cas"},
+		})
+		outcomes <- provisionOutcome{result: result, err: err}
+	}()
+	select {
+	case <-prov.waitStarted:
+	case outcome := <-outcomes:
+		t.Fatalf("provision returned before metadata wait: result=%+v err=%v", outcome.result, outcome.err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("metadata wait did not start")
+	}
+	var tenantID string
+	if err := rt.meta.DB().QueryRow(`SELECT id FROM tenants WHERE cluster_id = ?`, "cluster-finalize-cas").Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	outcome := <-outcomes
+	if outcome.result != nil || outcome.err == nil {
+		t.Fatalf("provision outcome result=%+v err=%v, want lost-CAS failure", outcome.result, outcome.err)
+	}
+	row, err := rt.meta.GetTenant(context.Background(), tenantID)
+	if err != nil || row.Status != meta.TenantFailed {
+		t.Fatalf("tenant after lost CAS = %+v, err=%v", row, err)
 	}
 }
 

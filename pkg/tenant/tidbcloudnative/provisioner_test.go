@@ -1158,6 +1158,72 @@ func TestProvisionWithCredentialsAndQuotaSendsCreateTimeSpendingLimit(t *testing
 	}
 }
 
+func TestCreateClusterWithCredentialsReturnsBeforeMetadataAndWaitPreservesCreateState(t *testing.T) {
+	var authorizedPosts atomic.Int32
+	var authorizedGets atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1beta1/clusters":
+			authorizedPosts.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId": "cluster-early-1",
+				"state":     "CREATING",
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters/cluster-early-1":
+			authorizedGets.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId":  "cluster-early-1",
+				"state":      "CREATING",
+				"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-early-1"},
+				"userPrefix": "u1",
+				"endpoints":  map[string]any{"public": map[string]any{"host": "db.example", "port": 4000}},
+			})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		cloudProvider:       "aws",
+		region:              "us-east-1",
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	created, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-early-1", tenant.CredentialProvisionRequest{
+		PublicKey: "public-1", PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{})
+	if err != nil {
+		t.Fatalf("CreateClusterWithCredentialsAndQuota: %v", err)
+	}
+	if created.ClusterID != "cluster-early-1" || created.Password == "" || created.DBName != DefaultDatabaseName {
+		t.Fatalf("created cluster = %+v", created)
+	}
+	if authorizedPosts.Load() != 1 || authorizedGets.Load() != 0 {
+		t.Fatalf("create calls post/get = %d/%d, want 1/0", authorizedPosts.Load(), authorizedGets.Load())
+	}
+
+	ready, err := p.WaitForClusterMetadataWithCredentials(context.Background(), created, tenant.CredentialProvisionRequest{
+		PublicKey: "public-1", PrivateKey: "private-1",
+	})
+	if err != nil {
+		t.Fatalf("WaitForClusterMetadataWithCredentials: %v", err)
+	}
+	if authorizedGets.Load() != 1 {
+		t.Fatalf("metadata GET calls = %d, want 1", authorizedGets.Load())
+	}
+	if ready.ClusterID != created.ClusterID || ready.Password != created.Password || ready.DBName != created.DBName ||
+		ready.OrganizationID != "org-early-1" || ready.Host != "db.example" || ready.Port != 4000 || ready.Username != "u1.root" {
+		t.Fatalf("ready cluster = %+v, created = %+v", ready, created)
+	}
+}
+
 func TestBatchProvisionFreeClustersUsesBatchCreateAndFreeLabel(t *testing.T) {
 	handlerErrs := make(chan error, 2)
 	var gotBody struct {

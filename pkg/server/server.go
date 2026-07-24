@@ -5479,9 +5479,11 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 
 	var cluster *tenant.ClusterInfo
 	var provisionCloudCfg *tenant.QuotaCloudConfig
+	earlyBoundNative := false
 	stageStarted = time.Now()
 	provisionMode := "default"
 	if provider == tenant.ProviderTiDBCloudNative {
+		var createOpts tenant.QuotaUpdateOptions
 		if opts.Quota != nil {
 			provisionMode = "tidb_cloud_native_credentials_quota"
 			quotaReq := *opts.Quota
@@ -5494,26 +5496,45 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 				return nil, newProvisionTenantError(http.StatusBadRequest, tenant.ErrCredentialsRequired.Error(), tenant.ErrCredentialsRequired)
 			}
-			if quotaProvisioner, ok := s.provisioner.(tenant.CredentialQuotaProvisioner); ok {
-				logProvisionStage(ctx, "provision_cluster_provision_started", tenantID, provider, stageStarted, "mode", provisionMode)
-				cluster, provisionCloudCfg, err = quotaProvisioner.ProvisionWithCredentialsAndQuota(ctx, tenantID, *opts.CredentialProvisioner, tenant.QuotaUpdateOptions{
-					TiDBCloudSpendingLimitMonthly: quotaReq.TiDBCloudSpendingLimit,
-				})
-			} else {
-				err = fmt.Errorf("provisioner does not support create-time quota")
-				logger.Error(ctx, "server_event", eventFields(ctx, "provision_create_time_quota_not_supported", "tenant_id", tenantID, "provider", provider, "error", err)...)
-				metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-				if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
-					logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
-				}
-				return nil, newProvisionTenantError(http.StatusInternalServerError, "provisioner does not support create-time quota", err)
-			}
-		} else if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
+			createOpts.TiDBCloudSpendingLimitMonthly = quotaReq.TiDBCloudSpendingLimit
+		}
+		earlyProvisioner, ok := s.provisioner.(tenant.CredentialEarlyBindingProvisioner)
+		if !ok {
+			err = fmt.Errorf("provisioner does not support early cluster binding")
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_early_cluster_binding_not_supported", "tenant_id", tenantID, "provider", provider, "error", err)...)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			return nil, newProvisionTenantError(http.StatusInternalServerError, err.Error(), err)
+		}
+		if opts.Quota == nil {
 			provisionMode = "tidb_cloud_native_credentials"
-			logProvisionStage(ctx, "provision_cluster_provision_started", tenantID, provider, stageStarted, "mode", provisionMode)
-			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
-		} else {
-			err = fmt.Errorf("provisioner does not support request credentials")
+		}
+		logProvisionStage(ctx, "provision_cluster_create_started", tenantID, provider, stageStarted, "mode", provisionMode)
+		cluster, provisionCloudCfg, err = earlyProvisioner.CreateClusterWithCredentialsAndQuota(ctx, tenantID, *opts.CredentialProvisioner, createOpts)
+		if err == nil {
+			cluster.Provider = provider
+			expectedOrganizationID := ""
+			if opts.TiDBCloudAccess != nil {
+				expectedOrganizationID = strings.TrimSpace(opts.TiDBCloudAccess.OrganizationID)
+			}
+			if expectedOrganizationID == "" {
+				err = fmt.Errorf("expected tidbcloud organization is missing")
+			} else if persistErr := s.meta.PersistTiDBCloudTenantClusterReference(ctx, tenantID, expectedOrganizationID, &meta.Tenant{
+				Provider: provider, ClusterID: cluster.ClusterID, BranchID: cluster.BranchID,
+				ClaimURL: cluster.ClaimURL, ClaimExpiresAt: cluster.ClaimExpiresAt,
+			}); persistErr != nil {
+				logger.Error(ctx, "server_event", eventFields(ctx, "provision_early_cluster_binding_failed", "tenant_id", tenantID, "provider", provider, "organization_id", expectedOrganizationID, "cluster_id", cluster.ClusterID, "error", persistErr)...)
+				metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+				s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "early_cluster_binding_error")
+				return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tidbcloud cluster reference", persistErr)
+			} else {
+				earlyBoundNative = true
+				logProvisionStage(ctx, "provision_early_cluster_binding_persisted", tenantID, provider, stageStarted, "cluster_id", cluster.ClusterID, "organization_id", expectedOrganizationID)
+				cluster, err = earlyProvisioner.WaitForClusterMetadataWithCredentials(ctx, cluster, *opts.CredentialProvisioner)
+				if err == nil && strings.TrimSpace(cluster.OrganizationID) != expectedOrganizationID {
+					err = fmt.Errorf("tidbcloud organization mismatch: expected %s, got %s", expectedOrganizationID, strings.TrimSpace(cluster.OrganizationID))
+				}
+			}
 		}
 	} else {
 		provisionMode = "provisioner_default"
@@ -5540,29 +5561,6 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	logProvisionStage(ctx, "provision_cluster_provisioned", tenantID, provider, stageStarted, "mode", provisionMode, "cluster_id", cluster.ClusterID, "organization_id", cluster.OrganizationID)
 	cluster.Provider = provider
-	if provider == tenant.ProviderTiDBCloudNative {
-		stageStarted = time.Now()
-		if strings.TrimSpace(cluster.OrganizationID) == "" {
-			err := fmt.Errorf("tidbcloud organization label is missing")
-			logger.Error(ctx, "server_event", eventFields(ctx, "provision_tidbcloud_org_binding_missing", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
-			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "org_binding_missing")
-			return nil, newProvisionTenantError(http.StatusBadGateway, "failed to read tidbcloud organization binding", err)
-		}
-		if err := s.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
-			TenantID:       tenantID,
-			OrganizationID: cluster.OrganizationID,
-			ClusterID:      cluster.ClusterID,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		}); err != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "provision_tidbcloud_org_binding_failed", "tenant_id", tenantID, "provider", provider, "organization_id", cluster.OrganizationID, "cluster_id", cluster.ClusterID, "error", err)...)
-			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "org_binding_error")
-			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tidbcloud organization binding", err)
-		}
-		logProvisionStage(ctx, "provision_tidbcloud_org_binding_persisted", tenantID, provider, stageStarted, "cluster_id", cluster.ClusterID, "organization_id", cluster.OrganizationID)
-	}
 
 	stageStarted = time.Now()
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
@@ -5575,7 +5573,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	logProvisionStage(ctx, "provision_db_password_encrypted", tenantID, provider, stageStarted)
 	dbtls := dbTLSForProvisionedTenant(provider)
 	stageStarted = time.Now()
-	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
+	connection := &meta.Tenant{
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
 		DBUser:           cluster.Username,
@@ -5586,19 +5584,31 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		ClusterID:        cluster.ClusterID,
 		ClaimURL:         cluster.ClaimURL,
 		ClaimExpiresAt:   cluster.ClaimExpiresAt,
-	}); err != nil {
+	}
+	if earlyBoundNative {
+		var updated bool
+		updated, err = s.meta.FinalizeTenantConnection(ctx, tenantID, meta.TenantPending, meta.TenantProvisioning, connection)
+		if err == nil && !updated {
+			err = fmt.Errorf("tenant status changed before connection finalization")
+		}
+	} else {
+		err = s.meta.UpdateTenantConnection(ctx, tenantID, connection)
+	}
+	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_update_tenant_connection_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
 		s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "connection_persist_error")
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant connection", err)
 	}
 	logProvisionStage(ctx, "provision_tenant_connection_persisted", tenantID, provider, stageStarted, "cluster_id", cluster.ClusterID, "db_tls", dbtls)
-	stageStarted = time.Now()
-	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); err != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "provision_update_tenant_status_failed", "tenant_id", tenantID, "provider", provider, "status", meta.TenantProvisioning, "error", err)...)
-		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "status_update_error")
-		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to update tenant status", err)
+	if !earlyBoundNative {
+		stageStarted = time.Now()
+		if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); err != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_update_tenant_status_failed", "tenant_id", tenantID, "provider", provider, "status", meta.TenantProvisioning, "error", err)...)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "status_update_error")
+			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to update tenant status", err)
+		}
 	}
 	logProvisionStage(ctx, "provision_tenant_status_updated", tenantID, provider, stageStarted, "status", meta.TenantProvisioning)
 

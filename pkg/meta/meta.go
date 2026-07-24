@@ -3417,6 +3417,26 @@ func (s *Store) UpdateTenantStatusIf(ctx context.Context, id string, from, to Te
 	return n > 0, nil
 }
 
+func (s *Store) FinalizeTenantConnection(ctx context.Context, id string, from, to TenantStatus, cluster *Tenant) (updated bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "finalize_tenant_connection", start, &err)
+	if cluster == nil {
+		return false, fmt.Errorf("tenant connection is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants
+		SET status = ?, db_host = ?, db_port = ?, db_user = ?, db_password = ?, db_name = ?, db_tls = ?,
+			provider = ?, cluster_id = ?, branch_id = ?, claim_url = ?, claim_expires_at = ?, updated_at = ?
+		WHERE id = ? AND status = ?`,
+		to, cluster.DBHost, cluster.DBPort, cluster.DBUser, cluster.DBPasswordCipher, cluster.DBName, boolToInt(cluster.DBTLS),
+		cluster.Provider, nullStr(cluster.ClusterID), cluster.BranchID, nullStr(cluster.ClaimURL), cluster.ClaimExpiresAt,
+		time.Now().UTC(), id, from)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *Tenant) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_connection", start, &err)
@@ -3438,6 +3458,60 @@ func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (s *Store) PersistTiDBCloudTenantClusterReference(ctx context.Context, id, organizationID string, cluster *Tenant) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "persist_tidbcloud_tenant_cluster_reference", start, &err)
+	id = strings.TrimSpace(id)
+	organizationID = strings.TrimSpace(organizationID)
+	if id == "" || organizationID == "" {
+		return fmt.Errorf("tenant id and tidbcloud organization id are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return fmt.Errorf("tenant cluster reference is required")
+	}
+	clusterID := strings.TrimSpace(cluster.ClusterID)
+	branchID := strings.TrimSpace(cluster.BranchID)
+	return s.withTiDBCloudOrgBindingLock(ctx, organizationID, clusterID, branchID, func(ctx context.Context, q metaQueryExecer) error {
+		conn, ok := q.(*sql.Conn)
+		if !ok {
+			return fmt.Errorf("tidbcloud org binding lock connection is unavailable")
+		}
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := deleteStaleTiDBCloudOrgBindingConflicts(ctx, tx, id, organizationID, clusterID, branchID); err != nil {
+			return err
+		}
+		if err := ensureTiDBCloudOrgBindingAvailable(ctx, tx, id, organizationID, clusterID, branchID); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		res, err := tx.ExecContext(ctx, `UPDATE tenants
+			SET provider = ?, cluster_id = ?, branch_id = ?, claim_url = ?, claim_expires_at = ?, updated_at = ?
+			WHERE id = ? AND status = ?`,
+			cluster.Provider, clusterID, branchID, nullStr(cluster.ClaimURL), cluster.ClaimExpiresAt, now, id, TenantPending)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(res); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO tenant_tidbcloud_org_bindings
+			(tenant_id, organization_id, cluster_id, branch_id, pool_id, pool_status, used_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, '', ?, NULL, ?, ?)
+			ON DUPLICATE KEY UPDATE
+				organization_id = VALUES(organization_id), cluster_id = VALUES(cluster_id), branch_id = VALUES(branch_id),
+				pool_id = '', pool_status = VALUES(pool_status), used_at = NULL, updated_at = VALUES(updated_at)`,
+			id, organizationID, clusterID, branchID, TenantPoolBindingUsed, now, now)
+		if err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 }
 
 func (s *Store) UpdateTenantClusterReference(ctx context.Context, id string, cluster *Tenant) (err error) {

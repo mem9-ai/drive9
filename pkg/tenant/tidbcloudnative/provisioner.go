@@ -481,6 +481,15 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 }
 
 func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
+	created, cloudCfg, err := p.CreateClusterWithCredentialsAndQuota(ctx, tenantID, req, opts)
+	if err != nil {
+		return created, cloudCfg, err
+	}
+	ready, err := p.WaitForClusterMetadataWithCredentials(ctx, created, req)
+	return ready, cloudCfg, err
+}
+
+func (p *Provisioner) CreateClusterWithCredentialsAndQuota(ctx context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
 	publicKey := strings.TrimSpace(req.PublicKey)
 	privateKey := strings.TrimSpace(req.PrivateKey)
 	if publicKey == "" || privateKey == "" {
@@ -551,31 +560,21 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 		recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationCreateCluster, resp.StatusCode, false)
 		return nil, nil, fmt.Errorf("tidbcloud native response missing cluster id")
 	}
-	if p.clusterProvisionMetadataIncomplete(info) {
-		recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationCreateCluster, resp.StatusCode, true)
-		clusterID := info.ClusterID
-		info, err = p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, clusterID)
-		if err != nil {
-			return &tenant.ClusterInfo{
-				TenantID:  tenantID,
-				ClusterID: clusterID,
-				Password:  password,
-				DBName:    dbName,
-				Provider:  tenant.ProviderTiDBCloudNative,
-			}, nil, err
-		}
+	out := &tenant.ClusterInfo{
+		TenantID:       tenantID,
+		ClusterID:      strings.TrimSpace(info.ClusterID),
+		OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
+		Password:       password,
+		DBName:         dbName,
+		Provider:       tenant.ProviderTiDBCloudNative,
 	}
-	out, err := p.clusterInfoFromResponse(tenantID, dbName, password, info)
-	if err != nil {
-		recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationCreateCluster, resp.StatusCode, false)
-		return &tenant.ClusterInfo{
-			TenantID:       tenantID,
-			ClusterID:      info.ClusterID,
-			OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
-			Password:       password,
-			DBName:         dbName,
-			Provider:       tenant.ProviderTiDBCloudNative,
-		}, nil, err
+	if !p.clusterProvisionMetadataIncomplete(info) {
+		ready, convertErr := p.clusterInfoFromResponse(tenantID, dbName, password, info)
+		if convertErr != nil {
+			recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationCreateCluster, resp.StatusCode, false)
+			return out, nil, convertErr
+		}
+		out = ready
 	}
 	recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationCreateCluster, resp.StatusCode, true)
 	cloudCfg := &tenant.QuotaCloudConfig{
@@ -588,6 +587,30 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(*spendingLimit)
 	}
 	return out, cloudCfg, nil
+}
+
+func (p *Provisioner) WaitForClusterMetadataWithCredentials(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return cluster, fmt.Errorf("public_key and private_key are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return cluster, fmt.Errorf("tidbcloud native cluster id is required")
+	}
+	if strings.TrimSpace(cluster.Host) != "" && cluster.Port > 0 && strings.TrimSpace(cluster.Username) != "" && strings.TrimSpace(cluster.OrganizationID) != "" {
+		out := *cluster
+		return &out, nil
+	}
+	info, err := p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, strings.TrimSpace(cluster.ClusterID))
+	if err != nil {
+		return cluster, err
+	}
+	out, err := p.clusterInfoFromResponse(cluster.TenantID, cluster.DBName, cluster.Password, info)
+	if err != nil {
+		return cluster, err
+	}
+	return out, nil
 }
 
 func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx context.Context, tenantIDs []string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) ([]*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
