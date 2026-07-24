@@ -584,7 +584,8 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 	}
 	poolUUID := strings.TrimSpace(in.UUID)
 	if poolUUID == "" {
-		poolUUID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(organizationID+"\x00"+in.User)).String()
+		poolUUID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(strings.Join(
+			[]string{organizationID, in.Host, in.Name, in.User}, "\x00"))).String()
 	} else {
 		poolUUID, err = sharedDBUUID(poolUUID)
 		if err != nil {
