@@ -756,7 +756,6 @@ func metaInitSchemaStatements() []string {
 			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			UNIQUE INDEX uk_db_pool_uuid (uuid),
 			UNIQUE INDEX uk_db_pool_cloud_resource (cluster_id),
-			UNIQUE INDEX uk_db_pool_endpoint (org_id, db_host(191), db_name, db_user),
 			INDEX idx_db_pool_allocate (org_id, status, db_id),
 			INDEX idx_db_pool_provisioning_key (provisioning_key, status, db_id)
 		)`,
@@ -1048,8 +1047,8 @@ func dropObsoleteMetaIndexes(ctx context.Context, db *sql.DB) error {
 		[]string{"organization_id", "cluster_id", "created_at", "tenant_id"}); err != nil {
 		return fmt.Errorf("drop obsolete meta index idx_tidbcloud_org_cluster: %w", err)
 	}
-	if err := replaceLegacyDBPoolEndpointUniqueIndex(ctx, db); err != nil {
-		return err
+	if err := dropMetaIndexIfExists(ctx, db, "db_pool", "uk_db_pool_endpoint"); err != nil {
+		return fmt.Errorf("drop obsolete meta index uk_db_pool_endpoint: %w", err)
 	}
 	if err := replaceLegacyDBPoolCloudResourceUniqueIndex(ctx, db); err != nil {
 		return err
@@ -1070,23 +1069,6 @@ func replaceLegacyDBPoolCloudResourceUniqueIndex(ctx context.Context, db *sql.DB
 		ADD UNIQUE INDEX uk_db_pool_cloud_resource (cluster_id)`)
 	if err != nil {
 		return fmt.Errorf("replace db_pool.uk_db_pool_cloud_resource: %w", err)
-	}
-	return nil
-}
-
-func replaceLegacyDBPoolEndpointUniqueIndex(ctx context.Context, db *sql.DB) error {
-	columns, err := loadMetaIndexColumns(ctx, db, "db_pool", "uk_db_pool_endpoint")
-	if err != nil {
-		return fmt.Errorf("inspect db_pool.uk_db_pool_endpoint: %w", err)
-	}
-	if !sameStringSlice(columns, []string{"org_id", "db_host", "db_name"}) {
-		return nil
-	}
-	_, err = db.ExecContext(ctx, `ALTER TABLE db_pool
-		DROP INDEX uk_db_pool_endpoint,
-		ADD UNIQUE INDEX uk_db_pool_endpoint (org_id, db_host(191), db_name, db_user)`)
-	if err != nil {
-		return fmt.Errorf("replace db_pool.uk_db_pool_endpoint: %w", err)
 	}
 	return nil
 }

@@ -1536,12 +1536,15 @@ func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
 		}
 	}
 	for _, index := range []string{
-		"primary", "uk_db_pool_uuid", "uk_db_pool_cloud_resource", "uk_db_pool_endpoint",
+		"primary", "uk_db_pool_uuid", "uk_db_pool_cloud_resource",
 		"idx_db_pool_allocate", "idx_db_pool_provisioning_key",
 	} {
 		if _, ok := dbPool.indexes[index]; !ok {
 			t.Fatalf("db_pool schema missing index %s", index)
 		}
+	}
+	if _, ok := dbPool.indexes["uk_db_pool_endpoint"]; ok {
+		t.Fatal("db_pool schema must not define endpoint uniqueness")
 	}
 
 	memberships := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_pool_memberships")
@@ -1629,7 +1632,7 @@ func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 			t.Fatalf("db_pool.%s is_nullable = %q, want YES", column, nullable)
 		}
 	}
-	for _, index := range []string{"uk_db_pool_uuid", "uk_db_pool_cloud_resource", "uk_db_pool_endpoint", "idx_db_pool_allocate", "idx_db_pool_provisioning_key"} {
+	for _, index := range []string{"uk_db_pool_uuid", "uk_db_pool_cloud_resource", "idx_db_pool_allocate", "idx_db_pool_provisioning_key"} {
 		exists, err := metaIndexExists(ctx, s.DB(), "db_pool", index)
 		if err != nil {
 			t.Fatalf("check %s: %v", index, err)
@@ -1638,12 +1641,12 @@ func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 			t.Fatalf("db_pool index %s was not created", index)
 		}
 	}
-	endpointColumns, err := loadMetaIndexColumns(ctx, s.DB(), "db_pool", "uk_db_pool_endpoint")
+	endpointIndexExists, err := metaIndexExists(ctx, s.DB(), "db_pool", "uk_db_pool_endpoint")
 	if err != nil {
-		t.Fatalf("load uk_db_pool_endpoint columns: %v", err)
+		t.Fatalf("check uk_db_pool_endpoint: %v", err)
 	}
-	if want := []string{"org_id", "db_host", "db_name", "db_user"}; !sameStringSlice(endpointColumns, want) {
-		t.Fatalf("uk_db_pool_endpoint columns = %v, want %v", endpointColumns, want)
+	if endpointIndexExists {
+		t.Fatal("legacy uk_db_pool_endpoint was not dropped")
 	}
 	var dbPoolUUID, status string
 	var softCapReached bool
