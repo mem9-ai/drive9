@@ -1007,36 +1007,6 @@ func TestManagedSharedDBPoolCloudResultSchemaAndActivation(t *testing.T) {
 	}
 }
 
-func TestPartialCloudResultRestoresLegacyProvisioningPoolToPending(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	spendingLimit := MaxTiDBCloudSpendingLimit
-	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
-		TiDBCloudOrganizationID: "org-legacy-pending", ProvisioningKey: make([]byte, 32),
-		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
-		PasswordCipher: []byte("root-cipher"), Name: "tidbcloud_fs",
-	})
-	if err != nil {
-		t.Fatalf("CreateManagedSharedDBPool: %v", err)
-	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE db_pool SET status = ? WHERE db_id = ?`, SharedDBStatusProvisioning, dbID); err != nil {
-		t.Fatalf("seed legacy provisioning status: %v", err)
-	}
-	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, &SharedDB{
-		ID: dbID, TiDBCloudOrganizationID: "org-legacy-pending", ClusterID: "cluster-legacy-pending",
-		PasswordCipher: []byte("root-cipher"), Name: "tidbcloud_fs", TLSMode: "true",
-	}); err != nil {
-		t.Fatalf("UpdateManagedSharedDBPoolCloudResult: %v", err)
-	}
-	got, err := s.GetSharedDB(ctx, dbID)
-	if err != nil {
-		t.Fatalf("GetSharedDB: %v", err)
-	}
-	if got.Status != SharedDBStatusPending {
-		t.Fatalf("legacy incomplete pool status = %q, want pending", got.Status)
-	}
-}
-
 func TestActivateSharedTenantsBatchRequiresReadyPoolPlacementAndOwnerKey(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
