@@ -241,10 +241,10 @@ func main() {
 		provisioner, provisionerErr = db9.NewProvisionerFromEnv()
 	}
 	if provisionerErr == nil && providerType == tenant.ProviderTiDBCloudNativeShared {
-		validator, ok := provisioner.(interface{ ValidateSharedCredentials(context.Context) error })
+		validator, ok := provisioner.(interface{ ValidateSharedAccess(context.Context) error })
 		if !ok {
-			provisionerErr = fmt.Errorf("shared TiDB Cloud credential validation is not supported")
-		} else if err := validator.ValidateSharedCredentials(context.Background()); err != nil {
+			provisionerErr = fmt.Errorf("shared TiDB Cloud access validation is not supported")
+		} else if err := validator.ValidateSharedAccess(context.Background()); err != nil {
 			provisionerErr = err
 		}
 	}

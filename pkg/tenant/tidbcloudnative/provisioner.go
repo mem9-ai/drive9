@@ -228,16 +228,27 @@ func (p *Provisioner) DefaultSharedCredentials() (tenant.CredentialProvisionRequ
 	}, true
 }
 
-// ValidateSharedCredentials verifies the server-owned shared credential once
-// during startup. Shared credentials are independent from customer IAM
-// authorization and are never placed in the server's customer RBAC cache.
-func (p *Provisioner) ValidateSharedCredentials(ctx context.Context) error {
+// ValidateSharedAccess verifies the server-owned shared credential and its
+// non-free Billing plan once during startup. This direct validation is
+// independent from customer request caches, which do not exist yet.
+func (p *Provisioner) ValidateSharedAccess(ctx context.Context) error {
 	cred, ok := p.DefaultSharedCredentials()
 	if !ok {
 		return fmt.Errorf("shared TiDB Cloud credentials are not configured")
 	}
-	if _, err := p.ResolveAPIKeyIdentity(ctx, cred); err != nil {
+	identity, err := p.ResolveAPIKeyIdentity(ctx, cred)
+	if err != nil {
 		return fmt.Errorf("validate shared TiDB Cloud credentials: %w", err)
+	}
+	plan, err := p.ResolveOrganizationPlan(ctx, identity.OrganizationID, cred)
+	if err != nil {
+		return fmt.Errorf("validate shared TiDB Cloud Billing access: %w", err)
+	}
+	if plan.OrganizationID != identity.OrganizationID {
+		return fmt.Errorf("validate shared TiDB Cloud Billing access: %w", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+	if plan.IsFree {
+		return fmt.Errorf("shared TiDB Cloud organization must be non-free")
 	}
 	return nil
 }

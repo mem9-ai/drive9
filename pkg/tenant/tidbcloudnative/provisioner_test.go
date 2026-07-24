@@ -546,47 +546,109 @@ func TestResolveAPIKeyIdentityUsesIAMAPI(t *testing.T) {
 	}
 }
 
-func TestValidateSharedCredentialsUsesConfiguredKeyAtStartup(t *testing.T) {
+func TestValidateSharedAccessUsesConfiguredKeyAtStartup(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		role    string
-		wantErr bool
+		name            string
+		role            string
+		iamOrganization string
+		billingBody     string
+		billingStatus   int
+		wantErrIs       error
+		wantErrContains string
 	}{
-		{name: "organization owner", role: tenant.TiDBCloudRoleOrgOwner},
-		{name: "project owner", role: tenant.TiDBCloudRoleProjectOwner},
-		{name: "viewer rejected", role: "org:viewer", wantErr: true},
+		{
+			name: "organization owner on demand", role: tenant.TiDBCloudRoleOrgOwner,
+			iamOrganization: "1234567890123456789",
+			billingBody:     `{"tenant_id_str":"1234567890123456789","effective_plan":"on_demand"}`,
+		},
+		{
+			name: "project owner positive POC", role: tenant.TiDBCloudRoleProjectOwner,
+			iamOrganization: "1234567890123456789",
+			billingBody:     `{"tenant_id_str":"1234567890123456789","effective_plan":"poc","poc_credits":"1.25"}`,
+		},
+		{
+			name: "viewer rejected", role: "org:viewer",
+			iamOrganization: "1234567890123456789",
+			billingBody:     `{"tenant_id_str":"1234567890123456789","effective_plan":"on_demand"}`,
+			wantErrIs:       tenant.ErrTiDBCloudRoleInsufficient,
+		},
+		{
+			name: "free organization rejected", role: tenant.TiDBCloudRoleOrgOwner,
+			iamOrganization: "1234567890123456789",
+			billingBody:     `{"tenant_id_str":"1234567890123456789","effective_plan":"poc","poc_credits":"0"}`,
+			wantErrContains: "must be non-free",
+		},
+		{
+			name: "billing organization mismatch", role: tenant.TiDBCloudRoleOrgOwner,
+			iamOrganization: "1234567890123456789",
+			billingBody:     `{"tenant_id_str":"999","effective_plan":"on_demand"}`,
+			wantErrIs:       tenant.ErrTiDBCloudBillingResponseInvalid,
+		},
+		{
+			name: "billing response invalid", role: tenant.TiDBCloudRoleOrgOwner,
+			iamOrganization: "1234567890123456789",
+			billingBody:     `{"tenant_id_str":"1234567890123456789","effective_plan":"poc","poc_credits":"NaN"}`,
+			wantErrIs:       tenant.ErrTiDBCloudBillingResponseInvalid,
+		},
+		{
+			name: "billing unavailable", role: tenant.TiDBCloudRoleOrgOwner,
+			iamOrganization: "1234567890123456789",
+			billingStatus:   http.StatusBadGateway,
+			billingBody:     `{"message":"unavailable"}`,
+			wantErrContains: "Billing plan lookup",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var gotPath string
+			var gotIAMPath, gotBillingPath string
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Header.Get("Authorization") == "" {
 					w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-shared-startup", qop="auth"`)
 					w.WriteHeader(http.StatusUnauthorized)
 					return
 				}
-				gotPath = r.URL.Path
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"name": "orgs/1234567890123456789/apiKeys/111111", "accessKey": "SHAREDOWNER1", "role": tc.role,
-				})
+				switch {
+				case strings.HasPrefix(r.URL.Path, "/v1beta1/apikeys/"):
+					gotIAMPath = r.URL.Path
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"name": "orgs/" + tc.iamOrganization + "/apiKeys/111111", "accessKey": "SHAREDOWNER1", "role": tc.role,
+					})
+				case strings.HasSuffix(r.URL.Path, "/plans"):
+					gotBillingPath = r.URL.Path
+					if tc.billingStatus != 0 {
+						w.WriteHeader(tc.billingStatus)
+					}
+					_, _ = io.WriteString(w, tc.billingBody)
+				default:
+					http.NotFound(w, r)
+				}
 			}))
 			defer ts.Close()
 
 			p := &Provisioner{
-				iamURL: ts.URL, client: ts.Client(),
+				iamURL: ts.URL, billingURL: ts.URL, client: ts.Client(),
 				defaultSharedPublicKey: "SHAREDOWNER1", defaultSharedPrivateKey: "test-shared-private",
 			}
-			err := p.ValidateSharedCredentials(context.Background())
-			if tc.wantErr {
-				if !errors.Is(err, tenant.ErrTiDBCloudRoleInsufficient) {
-					t.Errorf("ValidateSharedCredentials error = %v, want insufficient role", err)
+			err := p.ValidateSharedAccess(context.Background())
+			if tc.wantErrIs != nil {
+				if !errors.Is(err, tc.wantErrIs) {
+					t.Errorf("ValidateSharedAccess error = %v, want %v", err, tc.wantErrIs)
+				}
+				return
+			}
+			if tc.wantErrContains != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrContains) {
+					t.Errorf("ValidateSharedAccess error = %v, want %q", err, tc.wantErrContains)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("ValidateSharedCredentials: %v", err)
+				t.Fatalf("ValidateSharedAccess: %v", err)
 			}
-			if gotPath != "/v1beta1/apikeys/SHAREDOWNER1" {
-				t.Errorf("IAM path = %q, want configured shared key", gotPath)
+			if gotIAMPath != "/v1beta1/apikeys/SHAREDOWNER1" {
+				t.Errorf("IAM path = %q, want configured shared key", gotIAMPath)
+			}
+			if gotBillingPath != "/v1beta1/tenants/1234567890123456789/plans" {
+				t.Errorf("Billing path = %q, want IAM organization", gotBillingPath)
 			}
 		})
 	}
