@@ -305,6 +305,43 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 	}
 }
 
+func TestRegisterSharedDBReusesLegacyRandomUUIDRow(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	result, err := s.db.ExecContext(ctx, `INSERT INTO db_pool
+		(uuid, org_id, `+"`role`"+`, db_host, db_port, db_user, db_password, db_name, db_tls, max_tenants, status)
+		VALUES ('6f5d93ac-e897-4e92-8489-01a24ac0fd2c', 'org-legacy-manual', 'shared',
+			'legacy.example.com', 4000, 'root', X'01', 'legacy_db', 'skip-verify', 100, 'active')`)
+	if err != nil {
+		t.Fatalf("insert legacy manual pool: %v", err)
+	}
+	legacyID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("legacy manual pool id: %v", err)
+	}
+
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-legacy-manual", Host: "legacy.example.com", Port: 5000,
+		User: "root", PasswordCipher: []byte("rotated"), Name: "legacy_db",
+		TLSMode: "true", MaxTenants: 200,
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	if dbID != legacyID {
+		t.Fatalf("RegisterSharedDB db_id = %d, want legacy row %d", dbID, legacyID)
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM db_pool
+		WHERE org_id = 'org-legacy-manual' AND db_host = 'legacy.example.com'
+			AND db_name = 'legacy_db' AND db_user = 'root'`).Scan(&count); err != nil {
+		t.Fatalf("count legacy manual pools: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("legacy manual pool rows = %d, want 1", count)
+	}
+}
+
 func TestRegisterSharedDBValidation(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
