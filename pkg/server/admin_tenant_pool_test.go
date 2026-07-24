@@ -206,13 +206,18 @@ func TestSharedTenantPoolRefillOneThousandPlansTenPoolsInOneBatch(t *testing.T) 
 	if len(results) != 1000 {
 		t.Fatalf("results = %d, want 1000", len(results))
 	}
+	for _, result := range results {
+		if result.Status != meta.TenantPending {
+			t.Fatalf("tenant %s status = %q, want pending while connection metadata is incomplete", result.TenantID, result.Status)
+		}
+	}
 	if got := prov.sharedPoolBatchCalls.Load(); got != 1 {
 		t.Fatalf("shared batch calls = %d, want 1", got)
 	}
 	if got := prov.sharedPoolBatchMembers.Load(); got != 10 {
 		t.Fatalf("shared batch members = %d, want 10", got)
 	}
-	rows, err := metaStore.ListSharedDBsByStatus(context.Background(), meta.SharedDBStatusProvisioning, 20)
+	rows, err := metaStore.ListSharedDBsByStatus(context.Background(), meta.SharedDBStatusPending, 20)
 	if err != nil {
 		t.Fatal(err)
 	}

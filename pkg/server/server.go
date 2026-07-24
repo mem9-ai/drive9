@@ -5225,7 +5225,10 @@ func (s *Server) provisionTenantOnSharedDBMode(ctx context.Context, tenantID str
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_shared_pool_placed", "tenant_id", tenantID, "provider", tenant.ProviderTiDBCloudNativeShared, "db_pool_id", sharedDB.ID, "db_pool_uuid", sharedDB.UUID, "tidbcloud_org_id", sharedDB.TiDBCloudOrganizationID)...)
 	metricEvent(ctx, "tenant_provision", "provider", tenant.ProviderTiDBCloudNativeShared, "result", "shared_pool")
 	status := meta.TenantActive
-	if sharedDB.Status == meta.SharedDBStatusProvisioning {
+	switch sharedDB.Status {
+	case meta.SharedDBStatusPending:
+		status = meta.TenantPending
+	case meta.SharedDBStatusProvisioning:
 		status = meta.TenantProvisioning
 	}
 	return &provisionTenantResult{
@@ -5353,7 +5356,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 				return nil, reserveErr
 			}
-			if created || sharedDB.Status == meta.SharedDBStatusProvisioning {
+			if created || sharedDB.Status == meta.SharedDBStatusPending || sharedDB.Status == meta.SharedDBStatusProvisioning {
 				s.scheduleManagedSharedDBContinuation(ctx, sharedDB.ID)
 			}
 			return res, nil

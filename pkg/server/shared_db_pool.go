@@ -291,7 +291,7 @@ func (s *Server) managedSharedDBContinuation(ctx context.Context, dbID int64) ma
 		if err != nil {
 			return err
 		}
-		if poolInfo.Status != meta.SharedDBStatusProvisioning {
+		if poolInfo.Status != meta.SharedDBStatusPending && poolInfo.Status != meta.SharedDBStatusProvisioning {
 			return nil
 		}
 		return s.continueManagedSharedDBPoolOnce(poolCtx, dbID)
@@ -361,10 +361,14 @@ func retryManagedSharedDBContinuations(ctx context.Context, states []managedShar
 }
 
 func (s *Server) resumeManagedSharedDBPoolsWithCtx(ctx context.Context) {
-	rows, err := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusProvisioning, 1000)
-	if err != nil {
-		logger.Warn(ctx, "managed_shared_db_pool_resume_list_failed", zap.Error(err))
-		return
+	var rows []*meta.SharedDB
+	for _, status := range []string{meta.SharedDBStatusPending, meta.SharedDBStatusProvisioning} {
+		statusRows, err := s.meta.ListSharedDBsByStatus(ctx, status, 1000)
+		if err != nil {
+			logger.Warn(ctx, "managed_shared_db_pool_resume_list_failed", zap.String("status", status), zap.Error(err))
+			return
+		}
+		rows = append(rows, statusRows...)
 	}
 	states := make([]managedSharedDBContinuation, 0, len(rows))
 	for _, row := range rows {
