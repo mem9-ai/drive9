@@ -1536,7 +1536,7 @@ func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
 		}
 	}
 	for _, index := range []string{
-		"primary", "uk_db_pool_uuid", "uk_db_pool_cloud_resource",
+		"primary", "uk_db_pool_uuid", "uk_db_pool_cluster_id",
 		"idx_db_pool_allocate", "idx_db_pool_provisioning_key",
 	} {
 		if _, ok := dbPool.indexes[index]; !ok {
@@ -1565,14 +1565,14 @@ func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
 	}
 }
 
-func TestDBPoolCloudResourceIndexUsesGloballyUniqueClusterID(t *testing.T) {
+func TestDBPoolClusterIDIndexIsGloballyUnique(t *testing.T) {
 	s := newControlStore(t)
-	columns, err := loadMetaIndexColumns(context.Background(), s.DB(), "db_pool", "uk_db_pool_cloud_resource")
+	columns, err := loadMetaIndexColumns(context.Background(), s.DB(), "db_pool", "uk_db_pool_cluster_id")
 	if err != nil {
-		t.Fatalf("load uk_db_pool_cloud_resource columns: %v", err)
+		t.Fatalf("load uk_db_pool_cluster_id columns: %v", err)
 	}
 	if want := []string{"cluster_id"}; !sameStringSlice(columns, want) {
-		t.Fatalf("uk_db_pool_cloud_resource columns = %v, want %v", columns, want)
+		t.Fatalf("uk_db_pool_cluster_id columns = %v, want %v", columns, want)
 	}
 }
 
@@ -1591,6 +1591,7 @@ func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 	if _, err := s.DB().ExecContext(ctx, `CREATE TABLE db_pool (
 		db_id BIGINT AUTO_INCREMENT PRIMARY KEY,
 		org_id VARCHAR(64) NOT NULL DEFAULT '',
+		cluster_id VARCHAR(255) NULL,
 		`+"`role`"+` VARCHAR(20) NOT NULL,
 		db_host VARCHAR(255) NOT NULL,
 		db_port INT NOT NULL,
@@ -1604,6 +1605,7 @@ func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 		updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 		UNIQUE INDEX uk_db_pool_endpoint (org_id, db_host, db_name),
+		UNIQUE INDEX uk_db_pool_cloud_resource (org_id, cluster_id),
 		INDEX idx_db_pool_org (org_id, status)
 	)`); err != nil {
 		t.Fatalf("create legacy db_pool: %v", err)
@@ -1632,7 +1634,7 @@ func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 			t.Fatalf("db_pool.%s is_nullable = %q, want YES", column, nullable)
 		}
 	}
-	for _, index := range []string{"uk_db_pool_uuid", "uk_db_pool_cloud_resource", "idx_db_pool_allocate", "idx_db_pool_provisioning_key"} {
+	for _, index := range []string{"uk_db_pool_uuid", "uk_db_pool_cluster_id", "idx_db_pool_allocate", "idx_db_pool_provisioning_key"} {
 		exists, err := metaIndexExists(ctx, s.DB(), "db_pool", index)
 		if err != nil {
 			t.Fatalf("check %s: %v", index, err)
@@ -1647,6 +1649,13 @@ func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 	}
 	if endpointIndexExists {
 		t.Fatal("legacy uk_db_pool_endpoint was not dropped")
+	}
+	legacyCloudIndexExists, err := metaIndexExists(ctx, s.DB(), "db_pool", "uk_db_pool_cloud_resource")
+	if err != nil {
+		t.Fatalf("check uk_db_pool_cloud_resource: %v", err)
+	}
+	if legacyCloudIndexExists {
+		t.Fatal("legacy uk_db_pool_cloud_resource was not dropped")
 	}
 	var dbPoolUUID, status string
 	var softCapReached bool

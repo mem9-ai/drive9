@@ -460,7 +460,7 @@ func expandManagedDBPoolSchema(ctx context.Context, db *sql.DB) error {
 		WHERE max_tenants > 0 AND tenant_count >= max_tenants AND soft_cap_reached = 0`); err != nil {
 		return fmt.Errorf("backfill db_pool.soft_cap_reached: %w", err)
 	}
-	exists, err := metaIndexExists(ctx, db, "db_pool", "uk_db_pool_cloud_resource")
+	exists, err := metaIndexExists(ctx, db, "db_pool", "uk_db_pool_cluster_id")
 	if err != nil {
 		return fmt.Errorf("check db_pool cloud resource unique index: %w", err)
 	}
@@ -478,7 +478,7 @@ func expandManagedDBPoolSchema(ctx context.Context, db *sql.DB) error {
 		if duplicateCount > 0 {
 			return fmt.Errorf("preflight db_pool cloud resource unique index: found %d duplicate cluster ids", duplicateCount)
 		}
-		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX uk_db_pool_cloud_resource ON db_pool(cluster_id)`); err != nil && !isIgnorableMetaSchemaError(err) {
+		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX uk_db_pool_cluster_id ON db_pool(cluster_id)`); err != nil && !isIgnorableMetaSchemaError(err) {
 			return fmt.Errorf("create db_pool cloud resource unique index: %w", err)
 		}
 	}
@@ -755,7 +755,7 @@ func metaInitSchemaStatements() []string {
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			UNIQUE INDEX uk_db_pool_uuid (uuid),
-			UNIQUE INDEX uk_db_pool_cloud_resource (cluster_id),
+			UNIQUE INDEX uk_db_pool_cluster_id (cluster_id),
 			INDEX idx_db_pool_allocate (org_id, status, db_id),
 			INDEX idx_db_pool_provisioning_key (provisioning_key, status, db_id)
 		)`,
@@ -1050,8 +1050,7 @@ func dropObsoleteMetaIndexes(ctx context.Context, db *sql.DB) error {
 	if err := dropMetaIndexIfExists(ctx, db, "db_pool", "uk_db_pool_endpoint"); err != nil {
 		return fmt.Errorf("drop obsolete meta index uk_db_pool_endpoint: %w", err)
 	}
-	if err := dropMetaIndexIfColumns(ctx, db, "db_pool", "uk_db_pool_cloud_resource",
-		[]string{"org_id", "cluster_id"}); err != nil {
+	if err := dropMetaIndexIfExists(ctx, db, "db_pool", "uk_db_pool_cloud_resource"); err != nil {
 		return fmt.Errorf("drop obsolete meta index uk_db_pool_cloud_resource: %w", err)
 	}
 	return nil
