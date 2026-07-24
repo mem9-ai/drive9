@@ -206,13 +206,18 @@ func TestSharedTenantPoolRefillOneThousandPlansTenPoolsInOneBatch(t *testing.T) 
 	if len(results) != 1000 {
 		t.Fatalf("results = %d, want 1000", len(results))
 	}
+	for _, result := range results {
+		if result.Status != meta.TenantPending {
+			t.Fatalf("tenant %s status = %q, want pending while connection metadata is incomplete", result.TenantID, result.Status)
+		}
+	}
 	if got := prov.sharedPoolBatchCalls.Load(); got != 1 {
 		t.Fatalf("shared batch calls = %d, want 1", got)
 	}
 	if got := prov.sharedPoolBatchMembers.Load(); got != 10 {
 		t.Fatalf("shared batch members = %d, want 10", got)
 	}
-	rows, err := metaStore.ListSharedDBsByStatus(context.Background(), meta.SharedDBStatusProvisioning, 20)
+	rows, err := metaStore.ListSharedDBsByStatus(context.Background(), meta.SharedDBStatusPending, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,6 +230,71 @@ func TestSharedTenantPoolRefillOneThousandPlansTenPoolsInOneBatch(t *testing.T) 
 	}
 	if slots != 1000 {
 		t.Fatalf("free slots = %d, want 1000", slots)
+	}
+}
+
+func TestSharedTenantPoolDefensivelyReportsProvisioningWhenBatchMetadataComplete(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer poolManager.Close()
+	poolManager.SetMetaStore(metaStore)
+	prov := &fakeProvisioner{
+		provider:      tenant.ProviderTiDBCloudNative,
+		cloudProvider: "aws",
+		region:        "us-east-1",
+		managedClusters: []tenant.CloudClusterInfo{{
+			OrganizationID: "org-shared-defensive",
+		}},
+		sharedPoolResults: []*tenant.SharedDBPoolInfo{{
+			ClusterID: "cluster-ready", Host: "127.0.0.1", Port: 4000,
+			Username: "root", DBName: "tidbcloud_fs",
+		}},
+	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: secret})
+	defer srv.Close()
+	now := time.Now().UTC()
+	if err := metaStore.CreateTenantPool(context.Background(), &meta.TenantPool{
+		PoolID: "pool-shared-defensive", OrganizationID: "org-shared-defensive", Size: 1,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := srv.createFreePoolTenants(context.Background(), "pool-shared-defensive", 1,
+		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}, nil)
+	if err != nil {
+		t.Fatalf("createFreePoolTenants: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	if results[0].Status != meta.TenantProvisioning {
+		t.Fatalf("result status = %q, want provisioning", results[0].Status)
+	}
+	got, err := metaStore.GetTenant(context.Background(), results[0].TenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantProvisioning {
+		t.Fatalf("persisted tenant status = %q, want provisioning", got.Status)
 	}
 }
 

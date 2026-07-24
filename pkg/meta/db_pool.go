@@ -40,6 +40,7 @@ const (
 const PlacementStatusDeleting = "deleting"
 
 const (
+	SharedDBStatusPending      = "pending"
 	SharedDBStatusProvisioning = "provisioning"
 	SharedDBStatusActive       = "active"
 	SharedDBStatusFailed       = "failed"
@@ -228,7 +229,7 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 		VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, 0, 0, ?, 0, ?)`, poolUUID, organizationID, in.ProvisioningKey,
 		in.CloudProvider, in.Region, SharedDBRoleShared, passwordCipher, databaseName,
 		in.MaxTenants, *in.SpendingLimit,
-		SharedDBStatusProvisioning)
+		SharedDBStatusPending)
 	if err != nil {
 		return 0, fmt.Errorf("insert managed db_pool row: %w", err)
 	}
@@ -240,9 +241,10 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 }
 
 // UpdateManagedSharedDBPoolCloudResult persists the cloud identity and any
-// connection metadata currently available for a provisional managed pool. It
-// clears provisioning_key only after the organization identity is durable.
-// The pool remains provisioning until its shared schema is ready.
+// connection metadata currently available for a managed pool. A pool stays
+// pending while connection metadata is incomplete, transitions to
+// provisioning once the metadata is ready, and remains provisioning until its
+// shared schema is ready.
 func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *SharedDB) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_managed_shared_db_pool_cloud_result", start, &err)
@@ -279,44 +281,74 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 		}
 		return value
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE db_pool
-		SET org_id = ?, cluster_id = ?, provisioning_key = NULL,
-			db_host = COALESCE(?, db_host), db_port = COALESCE(?, db_port),
-			db_user = COALESCE(?, db_user), db_password = COALESCE(?, db_password),
-			db_name = COALESCE(?, db_name), db_tls = ?
-		WHERE db_id = ? AND status = ?`,
-		in.TiDBCloudOrganizationID, in.ClusterID, nullString(in.Host), nullInt(in.Port),
-		nullString(in.User), nullBytes(in.PasswordCipher), nullString(in.Name), in.TLSMode,
-		in.ID, SharedDBStatusProvisioning)
-	if err != nil {
-		return fmt.Errorf("persist cloud result for db pool %d: %w", in.ID, err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("cloud result rows affected for db pool %d: %w", in.ID, err)
-	}
-	if affected == 0 {
-		var organizationID, clusterID sql.NullString
-		checkErr := s.db.QueryRowContext(ctx, `SELECT org_id, cluster_id FROM db_pool
-			WHERE db_id = ? AND status = ?`, in.ID, SharedDBStatusProvisioning).
-			Scan(&organizationID, &clusterID)
-		if errors.Is(checkErr, sql.ErrNoRows) {
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		var currentHost, currentUser, currentName sql.NullString
+		var currentPort sql.NullInt64
+		var currentPassword []byte
+		var currentStatus string
+		if err := tx.QueryRowContext(ctx, `SELECT db_host, db_port, db_user, db_password, db_name, status
+			FROM db_pool WHERE db_id = ? FOR UPDATE`, in.ID).
+			Scan(&currentHost, &currentPort, &currentUser, &currentPassword, &currentName, &currentStatus); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return fmt.Errorf("lock cloud result for db pool %d: %w", in.ID, err)
+		}
+		if currentStatus != SharedDBStatusPending && currentStatus != SharedDBStatusProvisioning {
 			return ErrNotFound
 		}
-		if checkErr != nil {
-			return fmt.Errorf("confirm cloud result for db pool %d: %w", in.ID, checkErr)
+		host := currentHost.String
+		if in.Host != "" {
+			host = in.Host
 		}
-		if organizationID.String != in.TiDBCloudOrganizationID || clusterID.String != in.ClusterID {
-			return fmt.Errorf("db pool %d cloud identity is %q/%q, not %q/%q", in.ID,
-				organizationID.String, clusterID.String, in.TiDBCloudOrganizationID, in.ClusterID)
+		port := int(currentPort.Int64)
+		if in.Port > 0 {
+			port = in.Port
 		}
-	}
-	return nil
+		user := currentUser.String
+		if in.User != "" {
+			user = in.User
+		}
+		password := currentPassword
+		if len(in.PasswordCipher) > 0 {
+			password = in.PasswordCipher
+		}
+		name := currentName.String
+		if in.Name != "" {
+			name = in.Name
+		}
+		nextStatus := currentStatus
+		metadataReady := host != "" && port > 0 && user != "" && len(password) > 0 && name != ""
+		if currentStatus == SharedDBStatusPending && metadataReady {
+			nextStatus = SharedDBStatusProvisioning
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE db_pool
+			SET org_id = ?, cluster_id = ?, provisioning_key = NULL,
+				db_host = COALESCE(?, db_host), db_port = COALESCE(?, db_port),
+				db_user = COALESCE(?, db_user), db_password = COALESCE(?, db_password),
+				db_name = COALESCE(?, db_name), db_tls = ?, status = ?
+			WHERE db_id = ?`, in.TiDBCloudOrganizationID, in.ClusterID,
+			nullString(in.Host), nullInt(in.Port), nullString(in.User), nullBytes(in.PasswordCipher),
+			nullString(in.Name), in.TLSMode, nextStatus, in.ID); err != nil {
+			return fmt.Errorf("persist cloud result for db pool %d: %w", in.ID, err)
+		}
+		if nextStatus == SharedDBStatusProvisioning && metadataReady {
+			if _, err := tx.ExecContext(ctx, `UPDATE tenants t
+				JOIN fs_registry f ON f.tenant_id = t.id
+				JOIN tenant_placements p ON p.fs_id = f.fs_id
+				SET t.status = ?, t.updated_at = ?
+				WHERE p.db_id = ? AND t.provider = ? AND t.status = ?`, TenantProvisioning, time.Now().UTC(),
+				in.ID, tidbCloudNativeSharedProvider, TenantPending); err != nil {
+				return fmt.Errorf("advance tenants for db pool %d: %w", in.ID, err)
+			}
+		}
+		return nil
+	})
 }
 
 // PrepareManagedSharedDBPoolRoot durably stores the root credential and
 // database name before the first Cloud create call. It is idempotent for a
-// provisioning row that has not yet acquired a cluster identity.
+// pending row that has not yet acquired a cluster identity.
 func (s *Store) PrepareManagedSharedDBPoolRoot(ctx context.Context, dbID int64, passwordCipher []byte, databaseName string) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "prepare_managed_shared_db_pool_root", start, &err)
@@ -332,7 +364,7 @@ func (s *Store) PrepareManagedSharedDBPoolRoot(ctx context.Context, dbID int64, 
 	res, err := s.db.ExecContext(ctx, `UPDATE db_pool
 		SET db_password = COALESCE(db_password, ?), db_name = COALESCE(db_name, ?)
 		WHERE db_id = ? AND status = ? AND cluster_id IS NULL`,
-		passwordCipher, databaseName, dbID, SharedDBStatusProvisioning)
+		passwordCipher, databaseName, dbID, SharedDBStatusPending)
 	if err != nil {
 		return fmt.Errorf("prepare managed db pool %d root credential: %w", dbID, err)
 	}
@@ -345,7 +377,7 @@ func (s *Store) PrepareManagedSharedDBPoolRoot(ctx context.Context, dbID int64, 
 	}
 	var exists int
 	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM db_pool WHERE db_id = ? AND status = ? AND cluster_id IS NULL
-		AND db_password IS NOT NULL AND db_name IS NOT NULL`, dbID, SharedDBStatusProvisioning).Scan(&exists); err != nil {
+		AND db_password IS NOT NULL AND db_name IS NOT NULL`, dbID, SharedDBStatusPending).Scan(&exists); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -423,8 +455,8 @@ func (s *Store) ActivateSharedDBPool(ctx context.Context, dbID int64) (err error
 
 func (s *Store) MarkSharedDBPoolFailed(ctx context.Context, dbID int64) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE db_pool SET status = ?
-		WHERE db_id = ? AND status = ? AND tenant_count = 0`,
-		SharedDBStatusFailed, dbID, SharedDBStatusProvisioning)
+		WHERE db_id = ? AND status IN (?, ?) AND tenant_count = 0`,
+		SharedDBStatusFailed, dbID, SharedDBStatusPending, SharedDBStatusProvisioning)
 	if err != nil {
 		return err
 	}
@@ -438,7 +470,7 @@ func (s *Store) MarkSharedDBPoolFailed(ctx context.Context, dbID int64) error {
 			}
 			return err
 		}
-		if status == SharedDBStatusProvisioning && tenantCount > 0 {
+		if (status == SharedDBStatusPending || status == SharedDBStatusProvisioning) && tenantCount > 0 {
 			return fmt.Errorf("db pool %d has %d placed tenants and cannot be marked failed", dbID, tenantCount)
 		}
 		return ErrNotFound
@@ -451,7 +483,7 @@ func (s *Store) ListSharedDBsByStatus(ctx context.Context, status string, limit 
 	start := time.Now()
 	defer observeMeta(ctx, "list_shared_dbs_by_status", start, &err)
 	switch status {
-	case SharedDBStatusProvisioning, SharedDBStatusActive, SharedDBStatusFailed, SharedDBStatusDraining:
+	case SharedDBStatusPending, SharedDBStatusProvisioning, SharedDBStatusActive, SharedDBStatusFailed, SharedDBStatusDraining:
 	default:
 		return nil, fmt.Errorf("unsupported shared db status %q", status)
 	}
@@ -475,7 +507,7 @@ func (s *Store) ListSharedDBsByStatus(ctx context.Context, status string, limit 
 }
 
 // FindSharedDBForAllocation selects the oldest eligible exact-organization
-// pool, preferring active over provisioning. Managed rows use one fixed
+// pool, preferring active over provisioning over pending. Managed rows use one fixed
 // physical spending limit, so tenant virtual values do not participate in
 // allocation.
 func (s *Store) FindSharedDBForAllocation(ctx context.Context, organizationID string) (db *SharedDB, err error) {
@@ -487,11 +519,11 @@ func (s *Store) FindSharedDBForAllocation(ctx context.Context, organizationID st
 	}
 	query := "SELECT " + sharedDBSelectColumns + " FROM db_pool d " +
 		"WHERE d.org_id = ? AND d.`role` = ? " +
-		"AND d.status IN (?, ?) " +
+		"AND d.status IN (?, ?, ?) " +
 		"AND d.max_tenants > 0 AND d.soft_cap_reached = 0 AND d.tenant_count < d.max_tenants " +
-		"ORDER BY CASE d.status WHEN 'active' THEN 0 ELSE 1 END, d.db_id LIMIT 1"
+		"ORDER BY CASE d.status WHEN 'active' THEN 0 WHEN 'provisioning' THEN 1 ELSE 2 END, d.db_id LIMIT 1"
 	db, err = scanSharedDBRow(s.db.QueryRowContext(ctx, query, organizationID, SharedDBRoleShared,
-		SharedDBStatusActive, SharedDBStatusProvisioning))
+		SharedDBStatusActive, SharedDBStatusProvisioning, SharedDBStatusPending))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -882,14 +914,15 @@ var ErrSharedDBCapacityExhausted = errors.New("shared db capacity exhausted")
 var ErrSharedDBQuotaNotMaterialized = errors.New("shared tenant quota is not materialized")
 
 // CompleteSharedTenantProvision atomically performs every meta write that
-// turns a pending tenant into a live shared-pool tenant, in one transaction:
+// places a pending tenant into a shared pool, in one transaction:
 //
 //  1. the conditional capacity reservation (two concurrent provisions
 //     cannot take the same last slot — the loser gets
 //     ErrSharedDBCapacityExhausted),
 //  2. the placement insert,
 //  3. the provider re-label and readiness transition on the tenant row
-//     (active only when the DB pool is active; otherwise provisioning), and
+//     (pending while connection metadata is incomplete, provisioning while
+//     schema init is running, and active only when the DB pool is active), and
 //  4. the owner API key insert (ErrDuplicate on key id collision).
 //
 // Either all of it commits or none does: a shared tenant can never become
@@ -983,7 +1016,9 @@ func (s *Store) completeSharedTenantProvision(ctx context.Context, tenantID, pro
 		}
 		switch capacityMode {
 		case SharedDBCapacityNormal:
-			if dbPoolStatus != SharedDBStatusActive && (dbPoolStatus != SharedDBStatusProvisioning || (membership == nil && (!clusterID.Valid || clusterID.String == ""))) {
+			if dbPoolStatus != SharedDBStatusActive &&
+				((dbPoolStatus != SharedDBStatusProvisioning && dbPoolStatus != SharedDBStatusPending) ||
+					(membership == nil && (!clusterID.Valid || clusterID.String == ""))) {
 				return fmt.Errorf("db pool %d is not physically ready: status=%s cluster=%q membership=%t: %w", p.DbID, dbPoolStatus, clusterID.String, membership != nil, ErrSharedDBCapacityExhausted)
 			}
 			if maxTenants <= 0 || softCapReached || tenantCount >= maxTenants {
@@ -1010,11 +1045,11 @@ func (s *Store) completeSharedTenantProvision(ctx context.Context, tenantID, pro
 				WHERE db_id = ? AND (%s)
 					AND max_tenants > 0 AND soft_cap_reached = 0 AND tenant_count + 1 <= max_tenants`
 			if membership != nil {
-				normalQuery = fmt.Sprintf(normalQuery, "status IN (?, ?)")
-				res, err = tx.ExecContext(ctx, normalQuery, p.DbID, SharedDBStatusActive, SharedDBStatusProvisioning)
+				normalQuery = fmt.Sprintf(normalQuery, "status IN (?, ?, ?)")
+				res, err = tx.ExecContext(ctx, normalQuery, p.DbID, SharedDBStatusActive, SharedDBStatusProvisioning, SharedDBStatusPending)
 			} else {
-				normalQuery = fmt.Sprintf(normalQuery, "status = ? OR (status = ? AND cluster_id IS NOT NULL)")
-				res, err = tx.ExecContext(ctx, normalQuery, p.DbID, SharedDBStatusActive, SharedDBStatusProvisioning)
+				normalQuery = fmt.Sprintf(normalQuery, "status = ? OR (status IN (?, ?) AND cluster_id IS NOT NULL)")
+				res, err = tx.ExecContext(ctx, normalQuery, p.DbID, SharedDBStatusActive, SharedDBStatusProvisioning, SharedDBStatusPending)
 			}
 		}
 		if err != nil {
@@ -1033,6 +1068,8 @@ func (s *Store) completeSharedTenantProvision(ctx context.Context, tenantID, pro
 			tenantStatus = TenantActive
 		case SharedDBStatusProvisioning:
 			tenantStatus = TenantProvisioning
+		case SharedDBStatusPending:
+			tenantStatus = TenantPending
 		default:
 			return fmt.Errorf("db pool %d is not allocatable in status %q", p.DbID, dbPoolStatus)
 		}

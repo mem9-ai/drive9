@@ -158,7 +158,7 @@ func TestDefaultTenantProviderIsIndependentFromProvisionerType(t *testing.T) {
 	}
 }
 
-func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t *testing.T) {
+func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsPending(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -207,8 +207,8 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 	if err != nil {
 		t.Fatalf("provisionTenant: %v", err)
 	}
-	if res.Provider != tenant.ProviderTiDBCloudNativeShared || res.Status != meta.TenantProvisioning {
-		t.Fatalf("result = provider %q status %q, want shared/provisioning", res.Provider, res.Status)
+	if res.Provider != tenant.ProviderTiDBCloudNativeShared || res.Status != meta.TenantPending {
+		t.Fatalf("result = provider %q status %q, want shared/pending", res.Provider, res.Status)
 	}
 	if res.OrganizationID != "customer-org" {
 		t.Fatalf("organization ID = %q, want customer-org", res.OrganizationID)
@@ -217,7 +217,7 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsProvisioning(t 
 	if err != nil {
 		t.Fatalf("GetTenant: %v", err)
 	}
-	if tenantRow.Status != meta.TenantProvisioning || tenantRow.Provider != tenant.ProviderTiDBCloudNativeShared {
+	if tenantRow.Status != meta.TenantPending || tenantRow.Provider != tenant.ProviderTiDBCloudNativeShared {
 		t.Fatalf("tenant = provider %q status %q", tenantRow.Provider, tenantRow.Status)
 	}
 	fsID, err := metaStore.ResolveFsID(context.Background(), res.TenantID)
@@ -340,7 +340,7 @@ func TestProvisionTiDBCloudNativeSharedFallsBackToHardCapacityAfterCreateFailure
 	if prov.sharedPoolBatchCalls.Load() != 1 {
 		t.Fatalf("physical create calls = %d, want 1", prov.sharedPoolBatchCalls.Load())
 	}
-	rows, err := metaStore.ListSharedDBsByStatus(context.Background(), meta.SharedDBStatusProvisioning, 10)
+	rows, err := metaStore.ListSharedDBsByStatus(context.Background(), meta.SharedDBStatusPending, 10)
 	if err != nil {
 		t.Fatalf("ListSharedDBsByStatus: %v", err)
 	}
@@ -482,7 +482,7 @@ func TestProvisionTiDBCloudNativeSharedRetriesCapacityRace(t *testing.T) {
 	}
 }
 
-func TestProvisionTiDBCloudNativeSharedResumesExistingProvisioningPool(t *testing.T) {
+func TestProvisionTiDBCloudNativeSharedResumesExistingPendingPool(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -526,8 +526,8 @@ func TestProvisionTiDBCloudNativeSharedResumesExistingProvisioningPool(t *testin
 	if err != nil {
 		t.Fatalf("provisionTenant: %v", err)
 	}
-	if res.Status != meta.TenantProvisioning {
-		t.Fatalf("status = %q, want provisioning", res.Status)
+	if res.Status != meta.TenantPending {
+		t.Fatalf("status = %q, want pending", res.Status)
 	}
 	placement, err := metaStore.GetTenantPlacement(context.Background(), mustResolveFsID(t, metaStore, res.TenantID))
 	if err != nil {
@@ -543,12 +543,12 @@ func TestProvisionTiDBCloudNativeSharedResumesExistingProvisioningPool(t *testin
 	if prov.sharedPoolBatchCalls.Load() != 1 {
 		t.Fatalf("shared pool batch calls = %d, want resume call", prov.sharedPoolBatchCalls.Load())
 	}
-	rows, err := metaStore.ListSharedDBsByStatus(context.Background(), meta.SharedDBStatusProvisioning, 10)
+	rows, err := metaStore.ListSharedDBsByStatus(context.Background(), meta.SharedDBStatusPending, 10)
 	if err != nil {
 		t.Fatalf("ListSharedDBsByStatus: %v", err)
 	}
 	if len(rows) != 1 || rows[0].ID != dbID {
-		t.Fatalf("provisioning pools = %+v, want only %d", rows, dbID)
+		t.Fatalf("pending pools = %+v, want only %d", rows, dbID)
 	}
 }
 
@@ -704,6 +704,62 @@ func TestManagedSharedDBContinuationWaitsForConnectionMetadata(t *testing.T) {
 	}
 	if got := prov.sharedPoolWaitCalls.Load(); got != 1 {
 		t.Fatalf("shared metadata wait calls = %d, want 1", got)
+	}
+}
+
+func TestManagedSharedDBContinuationRejectsProvisioningPoolWithoutConnectionMetadata(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(pool.Close)
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-provisioning-invariant", ProvisioningKey: bytes.Repeat([]byte{8}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+		PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metaStore.DB().ExecContext(context.Background(),
+		`UPDATE db_pool SET status = ? WHERE db_id = ?`, meta.SharedDBStatusProvisioning, dbID); err != nil {
+		t.Fatal(err)
+	}
+	row, err := metaStore.GetSharedDB(context.Background(), dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative}
+	srv := &Server{meta: metaStore, pool: pool, provisioner: prov}
+	err = srv.continueManagedSharedDBPoolLocked(context.Background(), row, tenant.CredentialProvisionRequest{
+		PublicKey: "shared-public", PrivateKey: "shared-private",
+	})
+	if err == nil || !strings.Contains(err.Error(), "incomplete connection metadata") {
+		t.Fatalf("continueManagedSharedDBPoolLocked error = %v, want incomplete connection metadata", err)
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 0 {
+		t.Fatalf("shared batch calls = %d, want 0", got)
+	}
+	if got := prov.sharedPoolWaitCalls.Load(); got != 0 {
+		t.Fatalf("shared metadata wait calls = %d, want 0", got)
 	}
 }
 
@@ -941,7 +997,7 @@ func TestManagedSharedDBContinuationBatchesDoNotEnterBlockingMetadataWait(t *tes
 	})
 	go func() {
 		defer close(resumeDone)
-		srv.resumeManagedSharedDBPoolsWithCtx(resumeCtx)
+		srv.resumePendingManagedSharedDBPoolsWithCtx(resumeCtx)
 	}()
 	select {
 	case got := <-resumeLoadIDs:
@@ -3601,6 +3657,58 @@ func TestReconcilePendingNativePoolTenantWithoutConnectionStaysPending(t *testin
 	}
 	if status != string(meta.TenantPending) {
 		t.Fatalf("status after reconcile = %s, want %s", status, meta.TenantPending)
+	}
+}
+
+func TestReconcilePendingSharedPoolTenantWithoutConnectionStaysPending(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	ctx := context.Background()
+	spendingLimit := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-pending-shared", ProvisioningKey: make([]byte, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+		PasswordCipher: []byte("cipher"), Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	tenantID := token.NewID()
+	now := time.Now().UTC().Add(-2 * time.Minute)
+	origStaleAfter := pendingTenantStaleAfter
+	pendingTenantStaleAfter = time.Minute
+	defer func() { pendingTenantStaleAfter = origStaleAfter }()
+	pendingTenant := meta.Tenant{
+		ID: tenantID, Status: meta.TenantPending, Provider: tenant.ProviderTiDBCloudNativeShared,
+		DBPasswordCipher: []byte{}, DBTLS: true, SchemaVersion: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := metaStore.InsertTenant(ctx, &pendingTenant); err != nil {
+		t.Fatal(err)
+	}
+	fsID, err := metaStore.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	if err := metaStore.UpsertTenantPlacement(ctx, &meta.TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared,
+		Status: meta.SharedDBStatusActive,
+	}); err != nil {
+		t.Fatalf("UpsertTenantPlacement: %v", err)
+	}
+
+	srv := &Server{meta: metaStore}
+	srv.reconcilePendingTenant(ctx, pendingTenant)
+	got, err := metaStore.GetTenant(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantPending {
+		t.Fatalf("shared pool tenant status after reconcile = %s, want %s", got.Status, meta.TenantPending)
 	}
 }
 
