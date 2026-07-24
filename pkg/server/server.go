@@ -15,7 +15,6 @@ import (
 	"net/url"
 	"os"
 	pathpkg "path"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -4596,8 +4595,6 @@ func provisionTenantPoolClaimMetricResult(err error) string {
 	return "error"
 }
 
-var tidbCloudStatusErrorPattern = regexp.MustCompile(`tidbcloud native ([A-Za-z0-9 _-]+) status ([0-9]{3})(?:: (.*))?`)
-
 func clientFacingErrorResponse(defaultStatus int, defaultMessage string, err error) (int, string) {
 	msg := strings.TrimSpace(defaultMessage)
 	if err != nil {
@@ -4628,15 +4625,23 @@ func clientFacingErrorResponse(defaultStatus int, defaultMessage string, err err
 }
 
 func isTiDBCloudStatusError(err error, code int) bool {
-	_, got, ok := parseTiDBCloudStatusError(err)
-	return ok && got == code
+	apiErr, ok := tiDBCloudAPIError(err)
+	return ok && apiErr.StatusCode == code
 }
 
 func clientFacingErrorDetail(err error) string {
-	if operation, code, ok := parseTiDBCloudStatusError(err); ok {
-		body := strings.TrimSpace(tidbCloudStatusBody(err))
+	if apiErr, ok := tiDBCloudAPIError(err); ok {
+		operation := strings.TrimSpace(apiErr.Operation)
+		code := apiErr.StatusCode
+		body := strings.TrimSpace(apiErr.UpstreamBody)
 		if msg := tidbCloudStatusMessage(body); msg != "" {
 			return msg
+		}
+		switch code {
+		case http.StatusUnauthorized:
+			return "invalid TiDB Cloud API key"
+		case http.StatusForbidden:
+			return "access denied"
 		}
 		if body != "" {
 			return fmt.Sprintf("TiDB Cloud %s failed with status %d: %s", operation, code, body)
@@ -4662,30 +4667,12 @@ func clientFacingErrorDetail(err error) string {
 	}
 }
 
-func parseTiDBCloudStatusError(err error) (operation string, code int, ok bool) {
-	if err == nil {
-		return "", 0, false
+func tiDBCloudAPIError(err error) (*tenant.TiDBCloudAPIError, bool) {
+	var apiErr *tenant.TiDBCloudAPIError
+	if !errors.As(err, &apiErr) || apiErr == nil {
+		return nil, false
 	}
-	matches := tidbCloudStatusErrorPattern.FindStringSubmatch(err.Error())
-	if len(matches) == 0 {
-		return "", 0, false
-	}
-	code, convErr := strconv.Atoi(matches[2])
-	if convErr != nil {
-		return "", 0, false
-	}
-	return strings.TrimSpace(matches[1]), code, true
-}
-
-func tidbCloudStatusBody(err error) string {
-	if err == nil {
-		return ""
-	}
-	matches := tidbCloudStatusErrorPattern.FindStringSubmatch(err.Error())
-	if len(matches) < 4 {
-		return ""
-	}
-	return strings.TrimSpace(matches[3])
+	return apiErr, true
 }
 
 func tidbCloudStatusMessage(body string) string {

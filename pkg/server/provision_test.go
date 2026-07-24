@@ -1444,22 +1444,38 @@ func TestClientFacingErrorResponseMapsTiDBCloudClientErrors(t *testing.T) {
 		wantBody   string
 	}{
 		{
-			name:       "invalid request",
-			err:        errors.New(`update cluster spending limit: tidbcloud native cluster spending limit update status 400: {"code":400,"message":"Scalable cluster can not set spending limit to 0.","details":[{"requestId":"202607090625337c3caba58b2eb378ca"}]}`),
+			name: "invalid request",
+			err: fmt.Errorf("update cluster spending limit: %w", &tenant.TiDBCloudAPIError{
+				Operation:    "cluster spending limit update",
+				StatusCode:   http.StatusBadRequest,
+				UpstreamBody: `{"code":400,"message":"Scalable cluster can not set spending limit to 0.","details":[{"requestId":"202607090625337c3caba58b2eb378ca"}]}`,
+			}),
 			wantStatus: http.StatusBadRequest,
 			wantBody:   "Scalable cluster can not set spending limit to 0",
 		},
 		{
-			name:       "invalid api key",
-			err:        errors.New("list managed clusters: tidbcloud native cluster list status 401: invalid TiDB Cloud API key"),
+			name: "invalid api key",
+			err: fmt.Errorf("list managed clusters: %w", &tenant.TiDBCloudAPIError{
+				Operation:  "cluster list",
+				StatusCode: http.StatusUnauthorized,
+			}),
 			wantStatus: http.StatusUnauthorized,
 			wantBody:   "invalid TiDB Cloud API key",
 		},
 		{
-			name:       "forbidden",
-			err:        errors.New("update quota: tidbcloud native cluster spending limit update status 403: access denied"),
+			name: "forbidden",
+			err: fmt.Errorf("update quota: %w", &tenant.TiDBCloudAPIError{
+				Operation:  "cluster spending limit update",
+				StatusCode: http.StatusForbidden,
+			}),
 			wantStatus: http.StatusForbidden,
 			wantBody:   "access denied",
+		},
+		{
+			name:       "status-shaped generic error is not parsed",
+			err:        errors.New("tidbcloud native cluster list status 401: attacker-controlled"),
+			wantStatus: http.StatusBadGateway,
+			wantBody:   "claim tenant pool tenant failed",
 		},
 		{
 			name:       "insufficient IAM role hides resolver detail",
