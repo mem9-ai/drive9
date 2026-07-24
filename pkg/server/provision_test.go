@@ -87,14 +87,6 @@ type earlyBindingProvisioner struct {
 	waitErr     error
 }
 
-func (p *earlyBindingProvisioner) ProvisionWithCredentials(context.Context, string, tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
-	return nil, fmt.Errorf("legacy credential provision path used")
-}
-
-func (p *earlyBindingProvisioner) ProvisionWithCredentialsAndQuota(context.Context, string, tenant.CredentialProvisionRequest, tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
-	return nil, nil, fmt.Errorf("legacy credential quota provision path used")
-}
-
 func (p *earlyBindingProvisioner) CreateClusterWithCredentialsAndQuota(_ context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
 	p.lastCredentialReq = req
 	p.lastCreateQuotaOptions = opts
@@ -1408,47 +1400,6 @@ func (f *fakeProvisioner) Provision(_ context.Context, tenantID string) (*tenant
 	return &out, nil
 }
 
-func (f *fakeProvisioner) ProvisionWithCredentials(_ context.Context, tenantID string, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
-	f.credentialCalls.Add(1)
-	f.lastCredentialReq = req
-	if f.provisionErr != nil {
-		if f.cluster == nil {
-			return nil, f.provisionErr
-		}
-		out := *f.cluster
-		out.TenantID = tenantID
-		out.Provider = f.provider
-		return &out, f.provisionErr
-	}
-	out := *f.cluster
-	out.TenantID = tenantID
-	out.Provider = f.provider
-	return &out, nil
-}
-
-func (f *fakeProvisioner) ProvisionWithCredentialsAndQuota(_ context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
-	f.credentialQuotaCalls.Add(1)
-	f.lastCredentialReq = req
-	f.lastCreateQuotaOptions = opts
-	if f.provisionErr != nil {
-		if f.cluster == nil {
-			return nil, nil, f.provisionErr
-		}
-		out := *f.cluster
-		out.TenantID = tenantID
-		out.Provider = f.provider
-		return &out, nil, f.provisionErr
-	}
-	out := *f.cluster
-	out.TenantID = tenantID
-	out.Provider = f.provider
-	var cloudCfg *tenant.QuotaCloudConfig
-	if opts.TiDBCloudSpendingLimitMonthly != nil {
-		cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: opts.TiDBCloudSpendingLimitMonthly}
-	}
-	return &out, cloudCfg, nil
-}
-
 func (f *fakeProvisioner) CreateClusterWithCredentialsAndQuota(_ context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
 	if opts.TiDBCloudSpendingLimitMonthly != nil {
 		f.credentialQuotaCalls.Add(1)
@@ -1664,34 +1615,27 @@ func waitForTenantClusterReference(t *testing.T, metaStore *meta.Store, tenantID
 	}
 }
 
-type credentialOnlyProvisioner struct {
+type nonEarlyBindingProvisioner struct {
 	provider string
 	cluster  *tenant.ClusterInfo
 }
 
-func (f *credentialOnlyProvisioner) ProviderType() string { return f.provider }
+func (f *nonEarlyBindingProvisioner) ProviderType() string { return f.provider }
 
-func (f *credentialOnlyProvisioner) ResolveAPIKeyIdentity(context.Context, tenant.CredentialProvisionRequest) (*tenant.TiDBCloudAPIKeyIdentity, error) {
+func (f *nonEarlyBindingProvisioner) ResolveAPIKeyIdentity(context.Context, tenant.CredentialProvisionRequest) (*tenant.TiDBCloudAPIKeyIdentity, error) {
 	return &tenant.TiDBCloudAPIKeyIdentity{
 		OrganizationID: f.cluster.OrganizationID,
 		Role:           tenant.TiDBCloudRoleOrgOwner,
 	}, nil
 }
 
-func (f *credentialOnlyProvisioner) ResolveOrganizationPlan(_ context.Context, organizationID string, _ tenant.CredentialProvisionRequest) (*tenant.TiDBCloudOrganizationPlan, error) {
+func (f *nonEarlyBindingProvisioner) ResolveOrganizationPlan(_ context.Context, organizationID string, _ tenant.CredentialProvisionRequest) (*tenant.TiDBCloudOrganizationPlan, error) {
 	return &tenant.TiDBCloudOrganizationPlan{OrganizationID: organizationID, EffectivePlan: "on_demand"}, nil
 }
 
-func (f *credentialOnlyProvisioner) InitSchema(_ context.Context, _ string) error { return nil }
+func (f *nonEarlyBindingProvisioner) InitSchema(_ context.Context, _ string) error { return nil }
 
-func (f *credentialOnlyProvisioner) Provision(_ context.Context, tenantID string) (*tenant.ClusterInfo, error) {
-	out := *f.cluster
-	out.TenantID = tenantID
-	out.Provider = f.provider
-	return &out, nil
-}
-
-func (f *credentialOnlyProvisioner) ProvisionWithCredentials(_ context.Context, tenantID string, _ tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+func (f *nonEarlyBindingProvisioner) Provision(_ context.Context, tenantID string) (*tenant.ClusterInfo, error) {
 	out := *f.cluster
 	out.TenantID = tenantID
 	out.Provider = f.provider
@@ -2796,7 +2740,7 @@ func TestProvisionSeedsQuotaConfigWithoutExplicitQuota(t *testing.T) {
 	}
 }
 
-func TestProvisionTiDBCloudNativeCreateTimeQuotaRequiresQuotaProvisioner(t *testing.T) {
+func TestProvisionTiDBCloudNativeRequiresEarlyBindingProvisioner(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -2819,7 +2763,7 @@ func TestProvisionTiDBCloudNativeCreateTimeQuotaRequiresQuotaProvisioner(t *test
 	if _, err := rand.Read(tokenSecret); err != nil {
 		t.Fatal(err)
 	}
-	prov := &credentialOnlyProvisioner{
+	prov := &nonEarlyBindingProvisioner{
 		provider: tenant.ProviderTiDBCloudNative,
 		cluster: &tenant.ClusterInfo{
 			ClusterID:      "native-cluster-no-quota-provisioner",
@@ -2840,18 +2784,14 @@ func TestProvisionTiDBCloudNativeCreateTimeQuotaRequiresQuotaProvisioner(t *test
 	})
 	defer srv.Close()
 
-	spendingLimit := int64(10000)
 	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
 	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{
 		KeyName:               "default",
 		TokenVersion:          1,
 		CredentialProvisioner: &cred,
-		Quota: &quotaRequest{quotaFields: quotaFields{
-			TiDBCloudSpendingLimit: &spendingLimit,
-		}},
 	})
 	if err == nil {
-		t.Fatal("provisionTenant error = nil, want unsupported create-time quota error")
+		t.Fatal("provisionTenant error = nil, want unsupported early-binding provisioner error")
 	}
 	var provisionErr *provisionTenantError
 	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusInternalServerError {

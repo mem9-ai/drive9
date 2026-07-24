@@ -99,16 +99,6 @@ type CloudClusterInfo struct {
 	TiDBCloudSpendingLimitMonthly *int64
 }
 
-type CredentialProvisioner interface {
-	Provisioner
-	ProvisionWithCredentials(ctx context.Context, tenantID string, req CredentialProvisionRequest) (*ClusterInfo, error)
-}
-
-type CredentialQuotaProvisioner interface {
-	Provisioner
-	ProvisionWithCredentialsAndQuota(ctx context.Context, tenantID string, req CredentialProvisionRequest, opts QuotaUpdateOptions) (*ClusterInfo, *QuotaCloudConfig, error)
-}
-
 type CredentialEarlyBindingProvisioner interface {
 	Provisioner
 	CreateClusterWithCredentialsAndQuota(ctx context.Context, tenantID string, req CredentialProvisionRequest, opts QuotaUpdateOptions) (*ClusterInfo, *QuotaCloudConfig, error)

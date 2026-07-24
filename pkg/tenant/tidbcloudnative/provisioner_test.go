@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -29,6 +30,15 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func TestProvisionerDoesNotExposeLegacyCredentialProvisionMethods(t *testing.T) {
+	typ := reflect.TypeOf((*Provisioner)(nil))
+	for _, name := range []string{"ProvisionWithCredentials", "ProvisionWithCredentialsAndQuota"} {
+		if _, ok := typ.MethodByName(name); ok {
+			t.Fatalf("legacy compatibility method %s is still exported", name)
+		}
+	}
 }
 
 func setRequiredNativeProvisionerEnv(t *testing.T) {
@@ -988,7 +998,7 @@ func TestNewProvisionerFromEnvRejectsInvalidDefaultSpendingLimit(t *testing.T) {
 	}
 }
 
-func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testing.T) {
+func TestCreateAndWaitForClusterMetadataUseRequestCredentialsAndServerConfig(t *testing.T) {
 	var pollCount int
 	origEnsureDatabase := ensureDatabaseFunc
 	ensureDatabaseFunc = func(context.Context, string, string, string, int, string) error {
@@ -1060,12 +1070,17 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 		defaultSpendLimit:   int32Ptr(5000),
 		client:              ts.Client(),
 	}
-	out, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	req := tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
-	})
+	}
+	created, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", req, tenant.QuotaUpdateOptions{})
 	if err != nil {
-		t.Fatalf("ProvisionWithCredentials: %v", err)
+		t.Fatalf("CreateClusterWithCredentialsAndQuota: %v", err)
+	}
+	out, err := p.WaitForClusterMetadataWithCredentials(context.Background(), created, req)
+	if err != nil {
+		t.Fatalf("WaitForClusterMetadataWithCredentials: %v", err)
 	}
 	if !strings.Contains(gotAuth, `username="public-1"`) {
 		t.Fatalf("Authorization header did not use request public key: %q", gotAuth)
@@ -1099,7 +1114,7 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	}
 }
 
-func TestProvisionWithCredentialsAndQuotaSendsCreateTimeSpendingLimit(t *testing.T) {
+func TestCreateClusterWithCredentialsAndQuotaSendsCreateTimeSpendingLimit(t *testing.T) {
 	var gotBody struct {
 		Labels        map[string]string `json:"labels"`
 		SpendingLimit struct {
@@ -1137,12 +1152,12 @@ func TestProvisionWithCredentialsAndQuotaSendsCreateTimeSpendingLimit(t *testing
 		client:              ts.Client(),
 	}
 	monthly := int64(10000)
-	_, cloudCfg, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	_, cloudCfg, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	}, tenant.QuotaUpdateOptions{TiDBCloudSpendingLimitMonthly: &monthly})
 	if err != nil {
-		t.Fatalf("ProvisionWithCredentialsAndQuota: %v", err)
+		t.Fatalf("CreateClusterWithCredentialsAndQuota: %v", err)
 	}
 	if gotBody.SpendingLimit.Monthly != int32(monthly) {
 		t.Fatalf("spendingLimit.monthly = %d, want %d", gotBody.SpendingLimit.Monthly, monthly)
@@ -1918,7 +1933,7 @@ func int32Ptr(v int32) *int32 {
 	return &v
 }
 
-func TestProvisionWithCredentialsDefaultsDatabaseName(t *testing.T) {
+func TestCreateClusterWithCredentialsAndQuotaDefaultsDatabaseName(t *testing.T) {
 	origEnsureDatabase := ensureDatabaseFunc
 	ensureDatabaseFunc = func(context.Context, string, string, string, int, string) error {
 		t.Fatal("ensure database should not run during provision")
@@ -1949,12 +1964,12 @@ func TestProvisionWithCredentialsDefaultsDatabaseName(t *testing.T) {
 		defaultDatabaseName: DefaultDatabaseName,
 		client:              ts.Client(),
 	}
-	out, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	out, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
-	})
+	}, tenant.QuotaUpdateOptions{})
 	if err != nil {
-		t.Fatalf("ProvisionWithCredentials: %v", err)
+		t.Fatalf("CreateClusterWithCredentialsAndQuota: %v", err)
 	}
 	if out.DBName != DefaultDatabaseName {
 		t.Fatalf("database name = %q, want %q", out.DBName, DefaultDatabaseName)
@@ -2027,7 +2042,7 @@ func TestEnsureDatabaseFromDSNRejectsNonPositivePort(t *testing.T) {
 	}
 }
 
-func TestProvisionWithCredentialsIncludesUpstreamBodyOnError(t *testing.T) {
+func TestCreateClusterWithCredentialsAndQuotaIncludesUpstreamBodyOnError(t *testing.T) {
 	longBody := strings.Repeat("x", upstreamErrorBodyLimit+100)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
@@ -2046,10 +2061,10 @@ func TestProvisionWithCredentialsIncludesUpstreamBodyOnError(t *testing.T) {
 		defaultDatabaseName: DefaultDatabaseName,
 		client:              ts.Client(),
 	}
-	_, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	_, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
-	})
+	}, tenant.QuotaUpdateOptions{})
 	if err == nil {
 		t.Fatal("expected upstream error")
 	}
@@ -3042,7 +3057,7 @@ func TestClusterConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	}
 }
 
-func TestProvisionWithCredentialsUsesPrivateEndpoint(t *testing.T) {
+func TestCreateClusterWithCredentialsAndQuotaUsesPrivateEndpoint(t *testing.T) {
 	var pollCount int
 	origEnsureDatabase := ensureDatabaseFunc
 	ensureDatabaseFunc = func(context.Context, string, string, string, int, string) error {
@@ -3083,11 +3098,11 @@ func TestProvisionWithCredentialsUsesPrivateEndpoint(t *testing.T) {
 		usePrivateEndpoint:  true,
 		client:              ts.Client(),
 	}
-	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	res, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey: "public-1", PrivateKey: "private-1",
 	}, tenant.QuotaUpdateOptions{})
 	if err != nil {
-		t.Fatalf("ProvisionWithCredentialsAndQuota: %v", err)
+		t.Fatalf("CreateClusterWithCredentialsAndQuota: %v", err)
 	}
 	if res.Host != "private.internal" {
 		t.Fatalf("Host = %q, want private.internal", res.Host)
@@ -3097,7 +3112,7 @@ func TestProvisionWithCredentialsUsesPrivateEndpoint(t *testing.T) {
 	}
 }
 
-func TestProvisionWithCredentialsMapsPublicHostToPrivateEndpoint(t *testing.T) {
+func TestCreateClusterWithCredentialsAndQuotaMapsPublicHostToPrivateEndpoint(t *testing.T) {
 	origEnsureDatabase := ensureDatabaseFunc
 	ensureDatabaseFunc = func(context.Context, string, string, string, int, string) error {
 		return nil
@@ -3132,11 +3147,11 @@ func TestProvisionWithCredentialsMapsPublicHostToPrivateEndpoint(t *testing.T) {
 		privateEndpointHostMap:      map[string]string{"public-a.example": "private-a.internal"},
 		client:                      ts.Client(),
 	}
-	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	res, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey: "public-1", PrivateKey: "private-1",
 	}, tenant.QuotaUpdateOptions{})
 	if err != nil {
-		t.Fatalf("ProvisionWithCredentialsAndQuota: %v", err)
+		t.Fatalf("CreateClusterWithCredentialsAndQuota: %v", err)
 	}
 	if res.Host != "private-a.internal" {
 		t.Fatalf("Host = %q, want private-a.internal", res.Host)
@@ -3146,7 +3161,7 @@ func TestProvisionWithCredentialsMapsPublicHostToPrivateEndpoint(t *testing.T) {
 	}
 }
 
-func TestProvisionWithCredentialsErrorsWhenPrivateHostMappingMissing(t *testing.T) {
+func TestCreateClusterWithCredentialsAndQuotaErrorsWhenPrivateHostMappingMissing(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
 			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
@@ -3175,11 +3190,11 @@ func TestProvisionWithCredentialsErrorsWhenPrivateHostMappingMissing(t *testing.
 		privateEndpointHostMap:      map[string]string{"public-a.example": "private-a.internal"},
 		client:                      ts.Client(),
 	}
-	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	res, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey: "public-1", PrivateKey: "private-1",
 	}, tenant.QuotaUpdateOptions{})
 	if err == nil {
-		t.Fatalf("ProvisionWithCredentialsAndQuota error = nil, want missing mapping error")
+		t.Fatalf("CreateClusterWithCredentialsAndQuota error = nil, want missing mapping error")
 	}
 	if !strings.Contains(err.Error(), EnvTiDBCloudPrivateEndpointHostMap) || !strings.Contains(err.Error(), "unmapped.example") {
 		t.Fatalf("error = %v, want mapping miss with public host", err)

@@ -475,20 +475,6 @@ func (p *Provisioner) ValidateCredentialProvisionRequest(req tenant.CredentialPr
 	return err
 }
 
-func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID string, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
-	out, _, err := p.ProvisionWithCredentialsAndQuota(ctx, tenantID, req, tenant.QuotaUpdateOptions{})
-	return out, err
-}
-
-func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
-	created, cloudCfg, err := p.CreateClusterWithCredentialsAndQuota(ctx, tenantID, req, opts)
-	if err != nil {
-		return created, cloudCfg, err
-	}
-	ready, err := p.WaitForClusterMetadataWithCredentials(ctx, created, req)
-	return ready, cloudCfg, err
-}
-
 func (p *Provisioner) CreateClusterWithCredentialsAndQuota(ctx context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
 	publicKey := strings.TrimSpace(req.PublicKey)
 	privateKey := strings.TrimSpace(req.PrivateKey)
