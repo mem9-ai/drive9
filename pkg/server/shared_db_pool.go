@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -21,6 +22,7 @@ const (
 	defaultManagedSharedDBMaxTenants = 100
 	defaultSharedTenantSpendingLimit = int64(1000)
 	sharedTenantActivationBatchSize  = 100
+	managedSharedDBContinuationLimit = 100
 )
 
 var errSharedDBConnectionMetadataNotReady = errors.New("shared DB pool connection metadata is not ready")
@@ -80,6 +82,14 @@ func sharedDBAllocationIdentity(organizationID string, provisioningKey []byte) s
 		return "org:" + organizationID
 	}
 	return fmt.Sprintf("credential:%x", provisioningKey)
+}
+
+func (s *Server) withSharedDBAllocationLock(ctx context.Context, identity string, fn func(context.Context) error) error {
+	value, _ := s.sharedDBAllocationLocks.LoadOrStore(identity, &sync.Mutex{})
+	localLock := value.(*sync.Mutex)
+	localLock.Lock()
+	defer localLock.Unlock()
+	return s.meta.WithSharedDBAllocationLock(ctx, identity, fn)
 }
 
 func managedSharedDBDSN(info *meta.SharedDB, password string) string {
@@ -163,9 +173,35 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 	if resolveErr != nil {
 		return nil, false, fmt.Errorf("resolve tidbcloud organization: %w", resolveErr)
 	}
+	return s.allocateManagedSharedDBForOrganization(ctx, organizationID, cred, reserve)
+}
+
+func (s *Server) allocateManagedSharedDBForOrganization(ctx context.Context, organizationID string, cred tenant.CredentialProvisionRequest, reserve func(*meta.SharedDB) error) (sharedDB *meta.SharedDB, created bool, err error) {
+	// Capacity reservation is transactional in CompleteSharedTenant* and does
+	// not need the organization-wide planning lock. This fast path lets tenant
+	// pool refill consume existing capacity concurrently; the lock below is
+	// reserved for planning a new physical pool.
+	if reserve != nil {
+		for attempt := 0; attempt < 2; attempt++ {
+			candidate, findErr := s.meta.FindSharedDBForAllocation(ctx, organizationID)
+			if errors.Is(findErr, meta.ErrNotFound) {
+				break
+			}
+			if findErr != nil {
+				return nil, false, findErr
+			}
+			reserveErr := reserve(candidate)
+			if reserveErr == nil {
+				return candidate, false, nil
+			}
+			if !errors.Is(reserveErr, meta.ErrSharedDBCapacityExhausted) {
+				return nil, false, reserveErr
+			}
+		}
+	}
 	provisioningKey := sharedDBProvisioningKey(cred)
 	identity := sharedDBAllocationIdentity(organizationID, provisioningKey)
-	err = s.meta.WithSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
+	err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
 		for attempt := 0; attempt < 2; attempt++ {
 			candidate, findErr := s.meta.FindSharedDBForAllocation(lockCtx, organizationID)
 			if findErr == nil {
@@ -242,11 +278,8 @@ func (s *Server) scheduleManagedSharedDBContinuation(ctx context.Context, dbID i
 }
 
 // scheduleManagedSharedDBContinuations retries one request batch in rounds.
-// Each pool gets one non-blocking continuation attempt per round; metadata
-// readiness is polled by the outer backoff so one pool cannot hold the batch in
-// the provider's long waiter. Starting one goroutine per DB pool would let all
-// waiters pin dedicated meta *sql.Conn values and can exhaust the connection
-// pool before the lock holder finishes.
+// Each pool gets one concurrent, non-blocking continuation attempt per round;
+// metadata readiness is polled every 15 seconds with bounded concurrency.
 func (s *Server) scheduleManagedSharedDBContinuations(ctx context.Context, dbIDs []int64) {
 	if len(dbIDs) == 0 {
 		return
@@ -306,20 +339,42 @@ func retryManagedSharedDBContinuation(ctx context.Context, continuePool func() e
 
 func retryManagedSharedDBContinuations(ctx context.Context, states []managedSharedDBContinuation) {
 	deadline := time.Now().Add(schemaInitRetryWindow)
-	backoff := schemaInitInitialBackoff
 	attempt := 1
 	for {
+		pendingIndexes := make([]int, 0, len(states))
+		for i := range states {
+			if !states[i].done {
+				pendingIndexes = append(pendingIndexes, i)
+			}
+		}
+		var wg sync.WaitGroup
+		jobs := make(chan int)
+		for range min(len(pendingIndexes), managedSharedDBContinuationLimit) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range jobs {
+					if err := ctx.Err(); err != nil {
+						states[i].lastErr = err
+						continue
+					}
+					if err := states[i].continuePool(); err == nil {
+						states[i].done = true
+						states[i].lastErr = nil
+					} else {
+						states[i].lastErr = err
+					}
+				}
+			}()
+		}
+		for _, i := range pendingIndexes {
+			jobs <- i
+		}
+		close(jobs)
+		wg.Wait()
 		pending := 0
 		for i := range states {
-			if states[i].done {
-				continue
-			}
-			if err := states[i].continuePool(); err == nil {
-				states[i].done = true
-				states[i].lastErr = nil
-				continue
-			} else {
-				states[i].lastErr = err
+			if !states[i].done {
 				pending++
 			}
 		}
@@ -330,7 +385,7 @@ func retryManagedSharedDBContinuations(ctx context.Context, states []managedShar
 		if remaining <= 0 {
 			return
 		}
-		retryIn := min(backoff, remaining)
+		retryIn := min(managedSharedDBContinuationInterval, remaining)
 		for i := range states {
 			if states[i].done || states[i].lastErr == nil {
 				continue
@@ -352,9 +407,6 @@ func retryManagedSharedDBContinuations(ctx context.Context, states []managedShar
 			}
 			return
 		case <-timer.C:
-		}
-		if backoff < schemaInitMaxBackoff {
-			backoff = min(backoff*2, schemaInitMaxBackoff)
 		}
 		attempt++
 	}
@@ -428,8 +480,11 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 			return err
 		}
 		identity := sharedDBAllocationIdentity(poolInfo.TiDBCloudOrganizationID, poolInfo.ProvisioningKey)
+		if strings.TrimSpace(poolInfo.ClusterID) != "" {
+			identity = fmt.Sprintf("%s:db_pool:%d", identity, poolInfo.ID)
+		}
 		restartWithOrganization := false
-		err = s.meta.WithSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
+		err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
 			current, loadErr := s.meta.GetSharedDB(lockCtx, dbID)
 			if loadErr != nil {
 				return loadErr
@@ -558,7 +613,7 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) 
 		identity := sharedDBAllocationIdentity(poolInfo.TiDBCloudOrganizationID, poolInfo.ProvisioningKey)
 		var result *meta.SharedDB
 		restartWithOrganization := false
-		err = s.meta.WithSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
+		err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
 			current, loadErr := s.meta.GetSharedDB(lockCtx, dbID)
 			if loadErr != nil {
 				return loadErr
@@ -581,12 +636,11 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) 
 	return nil, fmt.Errorf("db pool %d allocation identity kept changing", dbID)
 }
 
-// continueManagedSharedDBPoolLocked intentionally keeps the organization
-// allocation lock through physical ensure, schema ensure, and activation.
-// Continuations are dispatched sequentially and are not a
-// request-QPS path; the wider lock preserves the existing single-owner Cloud
-// mutation model and prevents another allocator from observing half-ready
-// connection metadata. The readiness poll is the one long wait kept outside.
+// continueManagedSharedDBPoolLocked keeps one durable allocation lock through
+// physical ensure, schema ensure, and activation. Pools with a known cluster
+// ID use a per-pool lock so metadata and schema work can advance concurrently;
+// pools without a cluster ID retain the organization lock to prevent duplicate
+// physical creation.
 func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo *meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
 	dbID := poolInfo.ID
 	var err error

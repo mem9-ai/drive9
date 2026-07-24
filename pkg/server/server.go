@@ -218,6 +218,7 @@ type Server struct {
 	forkWorkerClosed          bool
 	tenantPoolLocks           sync.Map
 	tenantPoolCreateLocks     sync.Map
+	sharedDBAllocationLocks   sync.Map
 	tenantPoolResumeJobs      sync.Map
 	tenantFailedCleanupJobs   sync.Map
 	tenantFailedCleanupRunner tenantFailedCleanupRunner
@@ -270,6 +271,7 @@ var (
 	schemaInitRetryWindow                     = 10 * time.Minute
 	schemaInitInitialBackoff                  = 2 * time.Second
 	schemaInitMaxBackoff                      = 30 * time.Second
+	managedSharedDBContinuationInterval       = 15 * time.Second
 	tenantPoolMetadataResumeWaitTimeout       = 10 * time.Minute
 	tenantPoolMetadataResumePersistTimeout    = 2 * time.Minute
 	tenantPoolMetadataResumeGroupSize         = 10
@@ -5171,7 +5173,7 @@ func (s *Server) provisionTenantOnManagedSharedDB(ctx context.Context, tenantID 
 	}
 	identity := sharedDBAllocationIdentity(current.TiDBCloudOrganizationID, current.ProvisioningKey)
 	var result *provisionTenantResult
-	err = s.meta.WithSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
+	err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
 		locked, loadErr := s.meta.GetSharedDB(lockCtx, current.ID)
 		if loadErr != nil {
 			return loadErr

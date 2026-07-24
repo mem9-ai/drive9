@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +57,7 @@ type fakeProvisioner struct {
 	defaultPrivateKey       string
 	defaultSharedPublicKey  string
 	defaultSharedPrivateKey string
+	sharedPoolMu            sync.Mutex
 	lastSharedCredentialReq tenant.CredentialProvisionRequest
 	iamCalls                atomic.Int32
 	iamMu                   sync.Mutex
@@ -252,7 +254,7 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsPending(t *test
 	if prov.sharedPoolBatchCalls.Load() != 1 {
 		t.Fatalf("shared pool batch calls = %d, want 1", prov.sharedPoolBatchCalls.Load())
 	}
-	if got := prov.lastSharedCredentialReq; got.PublicKey != "shared-public" || got.PrivateKey != "shared-private" {
+	if got := prov.lastSharedCredentialRequest(); got.PublicKey != "shared-public" || got.PrivateKey != "shared-private" {
 		t.Fatalf("shared physical credential = %+v, want configured shared credential", got)
 	}
 	requests := <-prov.sharedPoolBatchRequests
@@ -822,14 +824,12 @@ func TestManagedSharedDBContinuationPassesCustomerOrganizationToPhysicalCreate(t
 }
 
 func TestRetryManagedSharedDBContinuationRecoversAfterMoreThanTwoFailures(t *testing.T) {
-	origWindow, origInitialBackoff, origMaxBackoff := schemaInitRetryWindow, schemaInitInitialBackoff, schemaInitMaxBackoff
+	origWindow, origInterval := schemaInitRetryWindow, managedSharedDBContinuationInterval
 	schemaInitRetryWindow = time.Second
-	schemaInitInitialBackoff = time.Millisecond
-	schemaInitMaxBackoff = 2 * time.Millisecond
+	managedSharedDBContinuationInterval = time.Millisecond
 	t.Cleanup(func() {
 		schemaInitRetryWindow = origWindow
-		schemaInitInitialBackoff = origInitialBackoff
-		schemaInitMaxBackoff = origMaxBackoff
+		managedSharedDBContinuationInterval = origInterval
 	})
 
 	attempts := 0
@@ -848,51 +848,88 @@ func TestRetryManagedSharedDBContinuationRecoversAfterMoreThanTwoFailures(t *tes
 	}
 }
 
-func TestRetryManagedSharedDBContinuationsAvoidsHeadOfLineBlocking(t *testing.T) {
-	origWindow, origInitialBackoff, origMaxBackoff := schemaInitRetryWindow, schemaInitInitialBackoff, schemaInitMaxBackoff
-	schemaInitRetryWindow = time.Second
-	schemaInitInitialBackoff = time.Millisecond
-	schemaInitMaxBackoff = 2 * time.Millisecond
-	t.Cleanup(func() {
-		schemaInitRetryWindow = origWindow
-		schemaInitInitialBackoff = origInitialBackoff
-		schemaInitMaxBackoff = origMaxBackoff
-	})
+func TestRetryManagedSharedDBContinuationsStartsEveryPoolConcurrently(t *testing.T) {
+	started := make(chan int, 3)
+	release := make(chan struct{})
+	states := make([]managedSharedDBContinuation, 3)
+	for i := range states {
+		poolIndex := i
+		states[i] = managedSharedDBContinuation{ctx: context.Background(), continuePool: func() error {
+			started <- poolIndex
+			<-release
+			return nil
+		}}
+	}
+	done := make(chan struct{})
+	go func() {
+		retryManagedSharedDBContinuations(context.Background(), states)
+		close(done)
+	}()
 
-	var order []string
-	firstAttempts := 0
-	states := []managedSharedDBContinuation{
-		{ctx: context.Background(), continuePool: func() error {
-			order = append(order, "first")
-			firstAttempts++
-			if firstAttempts <= 3 {
-				return errors.New("first pool is not ready")
-			}
-			return nil
-		}},
-		{ctx: context.Background(), continuePool: func() error {
-			order = append(order, "second")
-			return nil
-		}},
+	for i := 0; i < len(states); i++ {
+		select {
+		case <-started:
+		case <-time.After(500 * time.Millisecond):
+			close(release)
+			<-done
+			t.Fatalf("started %d/%d continuation attempts before release", i, len(states))
+		}
 	}
-	retryManagedSharedDBContinuations(context.Background(), states)
-	if len(order) < 2 || order[0] != "first" || order[1] != "second" {
-		t.Fatalf("attempt order = %#v, want second pool attempted in the first round", order)
+	close(release)
+	<-done
+	for i := range states {
+		if !states[i].done || states[i].lastErr != nil {
+			t.Fatalf("continuation state %d = %#v, want complete", i, states[i])
+		}
 	}
-	if !states[0].done || states[0].lastErr != nil || !states[1].done || states[1].lastErr != nil {
-		t.Fatalf("continuation states = %#v, want both complete", states)
+}
+
+func TestRetryManagedSharedDBContinuationsLimitsConcurrentPoolsToOneHundred(t *testing.T) {
+	started := make(chan struct{}, managedSharedDBContinuationLimit+1)
+	release := make(chan struct{})
+	states := make([]managedSharedDBContinuation, managedSharedDBContinuationLimit+1)
+	for i := range states {
+		states[i] = managedSharedDBContinuation{ctx: context.Background(), continuePool: func() error {
+			started <- struct{}{}
+			<-release
+			return nil
+		}}
+	}
+	done := make(chan struct{})
+	go func() {
+		retryManagedSharedDBContinuations(context.Background(), states)
+		close(done)
+	}()
+	for i := 0; i < managedSharedDBContinuationLimit; i++ {
+		select {
+		case <-started:
+		case <-time.After(500 * time.Millisecond):
+			close(release)
+			<-done
+			t.Fatalf("started %d/%d continuation attempts before release", i, managedSharedDBContinuationLimit)
+		}
+	}
+	select {
+	case <-started:
+		close(release)
+		<-done
+		t.Fatal("started a 101st continuation while 100 were still in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	<-done
+	if len(started) != 1 {
+		t.Fatalf("continuations started after release = %d, want 1", len(started))
 	}
 }
 
 func TestManagedSharedDBContinuationBatchesDoNotEnterBlockingMetadataWait(t *testing.T) {
-	origWindow, origInitialBackoff, origMaxBackoff := schemaInitRetryWindow, schemaInitInitialBackoff, schemaInitMaxBackoff
+	origWindow, origInterval := schemaInitRetryWindow, managedSharedDBContinuationInterval
 	schemaInitRetryWindow = 100 * time.Millisecond
-	schemaInitInitialBackoff = 5 * time.Millisecond
-	schemaInitMaxBackoff = 10 * time.Millisecond
+	managedSharedDBContinuationInterval = 5 * time.Millisecond
 	t.Cleanup(func() {
 		schemaInitRetryWindow = origWindow
-		schemaInitInitialBackoff = origInitialBackoff
-		schemaInitMaxBackoff = origMaxBackoff
+		managedSharedDBContinuationInterval = origInterval
 	})
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -957,22 +994,22 @@ func TestManagedSharedDBContinuationBatchesDoNotEnterBlockingMetadataWait(t *tes
 	})
 	srv.scheduleManagedSharedDBContinuations(context.Background(), []int64{firstID, secondID})
 
-	select {
-	case got := <-loadIDs:
-		if got != firstID {
-			t.Fatalf("first continuation = %d, want %d", got, firstID)
+	expectConcurrentIDs := func(ids <-chan int64, phase string) {
+		t.Helper()
+		seen := make(map[int64]bool, 2)
+		for i := 0; i < 2; i++ {
+			select {
+			case got := <-ids:
+				seen[got] = true
+			case <-time.After(time.Second):
+				t.Fatalf("%s continuation %d/2 was not attempted concurrently", phase, i+1)
+			}
 		}
-	case <-time.After(time.Second):
-		t.Fatal("first continuation was not attempted")
-	}
-	select {
-	case got := <-loadIDs:
-		if got != secondID {
-			t.Fatalf("second continuation = %d, want %d", got, secondID)
+		if !seen[firstID] || !seen[secondID] {
+			t.Fatalf("%s continuation IDs = %v, want %d and %d", phase, seen, firstID, secondID)
 		}
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("second continuation was blocked behind the first pool metadata waiter")
 	}
+	expectConcurrentIDs(loadIDs, "scheduled")
 	if got := prov.sharedPoolWaitCalls.Load(); got != 0 {
 		t.Fatalf("scheduled continuation metadata waiter calls = %d, want 0", got)
 	}
@@ -999,22 +1036,7 @@ func TestManagedSharedDBContinuationBatchesDoNotEnterBlockingMetadataWait(t *tes
 		defer close(resumeDone)
 		srv.resumePendingManagedSharedDBPoolsWithCtx(resumeCtx)
 	}()
-	select {
-	case got := <-resumeLoadIDs:
-		if got != firstID {
-			t.Fatalf("first resumed continuation = %d, want %d", got, firstID)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("first resumed continuation was not attempted")
-	}
-	select {
-	case got := <-resumeLoadIDs:
-		if got != secondID {
-			t.Fatalf("second resumed continuation = %d, want %d", got, secondID)
-		}
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("second resumed continuation was blocked behind the first pool metadata waiter")
-	}
+	expectConcurrentIDs(resumeLoadIDs, "resumed")
 	cancelResume()
 	<-resumeDone
 }
@@ -1150,6 +1172,89 @@ func TestManagedSharedDBBatchCreateUsesAllocationLock(t *testing.T) {
 	}
 }
 
+func TestManagedSharedDBBatchCreateRunsAllChunksConcurrently(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	_, _ = rand.Read(master)
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	dbIDs := make([]int64, 0, 101)
+	for i := 0; i < 101; i++ {
+		dbID, createErr := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+			TiDBCloudOrganizationID: "org-parallel-batches", ProvisioningKey: bytes.Repeat([]byte{3}, 32),
+			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+			PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		dbIDs = append(dbIDs, dbID)
+	}
+	started := make(chan struct{}, 11)
+	release := make(chan struct{})
+	requests := make(chan []tenant.SharedDBPoolCreateRequest, 11)
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, identityOrg: "org-parallel-batches",
+		sharedPoolBatchStarted: started, sharedPoolBatchRelease: release, sharedPoolBatchRequests: requests}
+	srv := &Server{meta: metaStore, pool: pool, provisioner: prov,
+		tidbCloudRBACCache: newTiDBCloudRBACCache(time.Hour)}
+	done := make(chan error, 1)
+	go func() {
+		_, batchErr := srv.provisionManagedSharedDBPoolsBatch(context.Background(), dbIDs)
+		done <- batchErr
+	}()
+
+	for i := 0; i < managedSharedDBCloudBatchConcurrency; i++ {
+		select {
+		case <-started:
+		case <-time.After(500 * time.Millisecond):
+			close(release)
+			<-done
+			t.Fatalf("started %d/%d Cloud batch requests before release", i, managedSharedDBCloudBatchConcurrency)
+		}
+	}
+	select {
+	case <-started:
+		close(release)
+		<-done
+		t.Fatal("started an eleventh Cloud batch while ten were still in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("batch create: %v", err)
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 11 {
+		t.Fatalf("batch calls = %d, want 11", got)
+	}
+	if got := prov.sharedPoolBatchMembers.Load(); got != 101 {
+		t.Fatalf("batch members = %d, want 101", got)
+	}
+	sizes := make([]int, 0, 11)
+	for i := 0; i < 11; i++ {
+		sizes = append(sizes, len(<-requests))
+	}
+	slices.Sort(sizes)
+	wantSizes := []int{1, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10}
+	if !slices.Equal(sizes, wantSizes) {
+		t.Fatalf("batch sizes = %v, want %v", sizes, wantSizes)
+	}
+}
+
 func TestManagedSharedDBBatchCreateReturnsTotalFailure(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -1213,7 +1318,9 @@ func (f *fakeProvisioner) ListManagedClusters(_ context.Context, _ tenant.Creden
 }
 
 func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Context, requests []tenant.SharedDBPoolCreateRequest, cred tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
+	f.sharedPoolMu.Lock()
 	f.lastSharedCredentialReq = cred
+	f.sharedPoolMu.Unlock()
 	if f.sharedPoolBatchRequests != nil {
 		f.sharedPoolBatchRequests <- append([]tenant.SharedDBPoolCreateRequest(nil), requests...)
 	}
@@ -1257,6 +1364,12 @@ func (f *fakeProvisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context
 		})
 	}
 	return out, nil
+}
+
+func (f *fakeProvisioner) lastSharedCredentialRequest() tenant.CredentialProvisionRequest {
+	f.sharedPoolMu.Lock()
+	defer f.sharedPoolMu.Unlock()
+	return f.lastSharedCredentialReq
 }
 
 func (f *fakeProvisioner) LoadSharedDBPoolWithCredentials(_ context.Context, dbPoolID int64, dbPoolUUID, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
