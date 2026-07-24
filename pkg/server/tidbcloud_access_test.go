@@ -140,9 +140,9 @@ func TestTiDBCloudBillingErrorResponse(t *testing.T) {
 		wantStatus int
 		want       string
 	}{
-		{err: &tenant.TiDBCloudAPIError{Operation: "Billing plan lookup", StatusCode: http.StatusUnauthorized}, wantStatus: http.StatusUnauthorized, want: "TiDB Cloud billing API authentication failed"},
-		{err: &tenant.TiDBCloudAPIError{Operation: "Billing plan lookup", StatusCode: http.StatusForbidden}, wantStatus: http.StatusForbidden, want: "TiDB Cloud billing plan access denied"},
-		{err: &tenant.TiDBCloudAPIError{Operation: "Billing plan lookup", StatusCode: http.StatusBadRequest}, wantStatus: http.StatusBadGateway, want: "TiDB Cloud billing plan lookup failed"},
+		{err: &tenant.TiDBCloudAPIError{Service: tenant.TiDBCloudAPIServiceBilling, Operation: "Billing plan lookup", StatusCode: http.StatusUnauthorized}, wantStatus: http.StatusUnauthorized, want: "TiDB Cloud billing API authentication failed"},
+		{err: &tenant.TiDBCloudAPIError{Service: tenant.TiDBCloudAPIServiceBilling, Operation: "Billing plan lookup", StatusCode: http.StatusForbidden}, wantStatus: http.StatusForbidden, want: "TiDB Cloud billing plan access denied"},
+		{err: &tenant.TiDBCloudAPIError{Service: tenant.TiDBCloudAPIServiceBilling, Operation: "Billing plan lookup", StatusCode: http.StatusBadRequest}, wantStatus: http.StatusBadGateway, want: "TiDB Cloud billing plan lookup failed"},
 		{err: tenant.ErrTiDBCloudBillingResponseInvalid, wantStatus: http.StatusBadGateway, want: "TiDB Cloud billing plan lookup failed"},
 		{err: tenant.ErrTiDBCloudBillingUnavailable, wantStatus: http.StatusBadGateway, want: "TiDB Cloud billing plan lookup failed"},
 	}
@@ -156,6 +156,7 @@ func TestTiDBCloudBillingErrorResponse(t *testing.T) {
 
 func TestTiDBCloudAccessGateWritersPreserveBillingErrorContract(t *testing.T) {
 	err := &tenant.TiDBCloudAPIError{
+		Service:    tenant.TiDBCloudAPIServiceBilling,
 		Operation:  "Billing plan lookup",
 		StatusCode: http.StatusUnauthorized,
 	}
@@ -187,5 +188,18 @@ func TestTiDBCloudAccessGateWritersPreserveBillingErrorContract(t *testing.T) {
 				t.Fatalf("body = %s, want %s", got, want)
 			}
 		})
+	}
+}
+
+func TestIsTiDBCloudBillingLookupErrorUsesTypedService(t *testing.T) {
+	if !isTiDBCloudBillingLookupError(&tenant.TiDBCloudAPIError{
+		Service: tenant.TiDBCloudAPIServiceBilling, Operation: "renamed operation", StatusCode: http.StatusForbidden,
+	}) {
+		t.Fatal("typed Billing error was not classified as Billing")
+	}
+	if isTiDBCloudBillingLookupError(&tenant.TiDBCloudAPIError{
+		Service: tenant.TiDBCloudAPIServiceCluster, Operation: "Billing plan lookup", StatusCode: http.StatusForbidden,
+	}) {
+		t.Fatal("Cluster error was classified as Billing by operation text")
 	}
 }

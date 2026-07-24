@@ -141,6 +141,47 @@ func (s *Store) IsTiDBCloudFreeTenantCounted(ctx context.Context, tenantID, orga
 	return counted, err
 }
 
+// DeleteTiDBCloudFreeReservation releases a pending or failed free reservation
+// only when it has no provisioned resource or pool ownership metadata.
+func (s *Store) DeleteTiDBCloudFreeReservation(ctx context.Context, tenantID string) (deleted bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_tidbcloud_free_reservation", start, &err)
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return false, fmt.Errorf("tenant id is required")
+	}
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants t
+		SET t.status = ?, t.updated_at = ?
+		WHERE t.id = ? AND t.status IN (?, ?)
+			AND COALESCE(t.storage_namespace_id, '') = ''
+			AND COALESCE(t.cluster_id, '') = ''
+			AND EXISTS (
+				SELECT 1 FROM tenant_billing_org_bindings b WHERE b.tenant_id = t.id)
+			AND EXISTS (
+				SELECT 1 FROM tenant_quota_config q
+				WHERE q.tenant_id = t.id AND q.tidbcloud_spending_limit = 0)
+			AND NOT EXISTS (
+				SELECT 1 FROM tenant_api_keys k WHERE k.tenant_id = t.id)
+			AND NOT EXISTS (
+				SELECT 1 FROM tenant_tidbcloud_org_bindings b WHERE b.tenant_id = t.id)
+			AND NOT EXISTS (
+				SELECT 1 FROM tenant_pool_memberships m WHERE m.tenant_id = t.id)
+			AND NOT EXISTS (
+				SELECT 1 FROM fs_registry f
+				JOIN tenant_placements p ON p.fs_id = f.fs_id
+				WHERE f.tenant_id = t.id)`,
+		TenantDeleted, now, tenantID, TenantPending, TenantFailed)
+	if err != nil {
+		return false, fmt.Errorf("delete tidbcloud free reservation %s: %w", tenantID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("delete tidbcloud free reservation rows affected %s: %w", tenantID, err)
+	}
+	return affected == 1, nil
+}
+
 // DeleteStaleTiDBCloudFreeReservation atomically deletes a stale pending row
 // only when it still contains reservation metadata and no provisioned resource
 // or pool-ownership metadata.
@@ -338,16 +379,20 @@ func backfillTenantBillingOrgBindings(ctx context.Context, db *sql.DB) error {
 		SELECT tenant_id, organization_id AS organization_id
 		FROM tenant_tidbcloud_org_bindings
 		WHERE TRIM(organization_id) <> ''
+			AND (TRIM(COALESCE(pool_id, '')) = '' OR COALESCE(pool_status, '') <> 'free')
 		UNION ALL
 		SELECT f.tenant_id, d.org_id AS organization_id
 		FROM fs_registry f
 		JOIN tenant_placements p ON p.fs_id = f.fs_id
 		JOIN db_pool d ON d.db_id = p.db_id
+		LEFT JOIN tenant_pool_memberships m ON m.tenant_id = f.tenant_id
 		WHERE d.org_id IS NOT NULL AND TRIM(d.org_id) <> ''
+			AND (m.tenant_id IS NULL OR COALESCE(m.pool_status, '') <> 'free')
 		UNION ALL
 		SELECT tenant_id, tidbcloud_organization_id AS organization_id
 		FROM tenant_pool_memberships
-		WHERE tidbcloud_organization_id IS NOT NULL AND TRIM(tidbcloud_organization_id) <> ''`
+		WHERE tidbcloud_organization_id IS NOT NULL AND TRIM(tidbcloud_organization_id) <> ''
+			AND COALESCE(pool_status, '') <> 'free'`
 
 	var conflictingTenantID, conflictingOrganizations string
 	err := db.QueryRowContext(ctx, `SELECT tenant_id,
@@ -366,14 +411,11 @@ func backfillTenantBillingOrgBindings(ctx context.Context, db *sql.DB) error {
 	if err == nil {
 		return fmt.Errorf("tenant billing organization backfill conflict for tenant %q: %s", conflictingTenantID, conflictingOrganizations)
 	}
-	_, err = db.ExecContext(ctx, `INSERT INTO tenant_billing_org_bindings
+	_, err = db.ExecContext(ctx, `INSERT IGNORE INTO tenant_billing_org_bindings
 		(tenant_id, tidbcloud_organization_id)
 		SELECT tenant_id, MIN(organization_id)
 		FROM (`+sources+`) reliable_sources
-		GROUP BY tenant_id
-		ON DUPLICATE KEY UPDATE
-			tidbcloud_organization_id = VALUES(tidbcloud_organization_id),
-			updated_at = CURRENT_TIMESTAMP(3)`)
+		GROUP BY tenant_id`)
 	if err != nil {
 		return fmt.Errorf("backfill tenant billing organization bindings: %w", err)
 	}

@@ -2541,6 +2541,34 @@ func (s *Store) UpdateTenantPoolBindingStatus(ctx context.Context, tenantID stri
 	return nil
 }
 
+func (s *Store) ReleaseTenantPoolClaim(ctx context.Context, tenantID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "release_tidbcloud_pool_claim", start, &err)
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return fmt.Errorf("tenant_id is required")
+	}
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE tenant_tidbcloud_org_bindings
+			SET pool_status = ?, used_at = NULL, updated_at = ?
+			WHERE tenant_id = ? AND pool_status = ?`,
+			TenantPoolBindingFree, time.Now().UTC(), tenantID, TenantPoolBindingUsed)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(res); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_billing_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_quota_config WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 func (s *Store) MarkFreeTenantPoolTenantDeleting(ctx context.Context, tenantID string, from TenantStatus) (updated bool, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "mark_free_tidbcloud_pool_tenant_deleting", start, &err)

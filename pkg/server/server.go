@@ -4578,13 +4578,6 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		}
 		credentialReq = decoded.Credential
 		quotaReq = decoded.Quota
-		if quotaReq != nil {
-			if err := s.validateQuotaSetRequest(*quotaReq); err != nil {
-				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-				errJSON(w, http.StatusBadRequest, err.Error())
-				return
-			}
-		}
 		tiDBCloudAccess, err = s.resolveTiDBCloudAccessProfile(r.Context(), *credentialReq, "provision")
 		if err != nil {
 			status, message := http.StatusBadGateway, "TiDB Cloud API key authorization failed"
@@ -4600,6 +4593,12 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			quotaReq, err = s.normalizeTiDBCloudFreeProvisionQuota(quotaReq)
 			if err != nil {
 				errJSON(w, http.StatusForbidden, err.Error())
+				return
+			}
+		} else if quotaReq != nil {
+			if err := s.validateQuotaSetRequest(*quotaReq); err != nil {
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+				errJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 		}
@@ -4618,7 +4617,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_failed", "provider", provider, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", provisionTenantPoolClaimMetricResult(err))
 			status, msg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", err)
-			errJSON(w, status, msg)
+			writeProvisionTenantError(w, newProvisionTenantError(status, msg, err))
 			return
 		} else if claimed {
 			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
@@ -4681,6 +4680,10 @@ func clientFacingErrorResponse(defaultStatus int, defaultMessage string, err err
 		msg = http.StatusText(defaultStatus)
 	}
 	switch {
+	case errors.Is(err, tenant.ErrTiDBCloudFreeTenantLimitReached):
+		return http.StatusForbidden, tenant.ErrTiDBCloudFreeTenantLimitReached.Error()
+	case errors.Is(err, tenant.ErrTiDBCloudFreeQuotaBusy):
+		return http.StatusServiceUnavailable, tenant.ErrTiDBCloudFreeQuotaBusy.Error()
 	case errors.Is(err, tenant.ErrCredentialsRequired), errors.Is(err, tenant.ErrPartialCredentials):
 		return http.StatusBadRequest, msg
 	case isTiDBCloudStatusError(err, http.StatusBadRequest):
@@ -5256,16 +5259,15 @@ func isSharedDBReservationConflict(err error) bool {
 
 func (s *Server) provisionTenantOnSharedDBMode(ctx context.Context, tenantID string, sharedDB *meta.SharedDB, provider, keyName string, opts provisionTenantOptions, now time.Time, capacityMode meta.SharedDBCapacityMode, hardCap int) (*provisionTenantResult, error) {
 	fail := func(err error) (*provisionTenantResult, error) {
-		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
-		}
+		s.failTenantProvision(ctx, tenantID, provider)
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to place tenant on shared pool", err)
 	}
 	// Only the managed shared provider materializes a per-tenant virtual
 	// spending limit. Legacy native/zero routing to a manually registered shared
 	// DB pool must keep failing closed instead of silently dropping the request.
-	if provider != tenant.ProviderTiDBCloudNativeShared && opts.Quota != nil && opts.Quota.TiDBCloudSpendingLimit != nil {
-		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+	if provider != tenant.ProviderTiDBCloudNativeShared && opts.Quota != nil &&
+		opts.Quota.TiDBCloudSpendingLimit != nil && *opts.Quota.TiDBCloudSpendingLimit != 0 {
+		s.failTenantProvision(ctx, tenantID, provider)
 		return nil, newProvisionTenantError(http.StatusBadRequest,
 			"tidbcloud spending limit is not supported for shared-pool tenants",
 			fmt.Errorf("spending limit requested for shared-pool tenant"))
@@ -5433,18 +5435,18 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	logProvisionStage(ctx, "provision_tenant_inserted", tenantID, provider, stageStarted, "status", meta.TenantPending)
 	if provider == tenant.ProviderTiDBCloudNativeShared {
 		if opts.CredentialProvisioner == nil {
-			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			s.failTenantProvision(ctx, tenantID, provider)
 			return nil, newProvisionTenantError(http.StatusBadRequest, tenant.ErrCredentialsRequired.Error(), tenant.ErrCredentialsRequired)
 		}
 		if err := s.materializeSharedTenantQuota(ctx, tenantID, opts); err != nil {
-			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			s.failTenantProvision(ctx, tenantID, provider)
 			return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
 		}
 		var lastConflict error
 		for attempt := 0; attempt < 2; attempt++ {
 			sharedDB, created, allocateErr := s.allocateManagedSharedDB(ctx, *opts.CredentialProvisioner, nil)
 			if allocateErr != nil {
-				_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+				s.failTenantProvision(ctx, tenantID, provider)
 				return nil, newProvisionTenantError(http.StatusBadGateway, "failed to allocate shared database", allocateErr)
 			}
 			if sharedDB.SpendingLimit != nil && (created || sharedDB.ClusterID == "" || sharedDB.Host == "" || sharedDB.Port <= 0 || sharedDB.User == "") {
@@ -5469,7 +5471,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 							}
 						}
 					}
-					_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+					s.failTenantProvision(ctx, tenantID, provider)
 					return nil, newProvisionTenantError(http.StatusBadGateway, "failed to create shared database", err)
 				}
 			}
@@ -5479,7 +5481,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 					lastConflict = reserveErr
 					continue
 				}
-				_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+				s.failTenantProvision(ctx, tenantID, provider)
 				return nil, reserveErr
 			}
 			if created || sharedDB.Status == meta.SharedDBStatusPending || sharedDB.Status == meta.SharedDBStatusProvisioning {
@@ -5487,6 +5489,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			}
 			return res, nil
 		}
+		s.failTenantProvision(ctx, tenantID, provider)
 		return nil, lastConflict
 	}
 
@@ -5497,13 +5500,15 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_shared_pool_resolve_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
-		}
+		s.failTenantProvision(ctx, tenantID, provider)
 		return nil, newProvisionTenantError(http.StatusBadGateway, "failed to resolve shared-schema pool", err)
 	}
 	if sharedDB != nil {
-		return s.provisionTenantOnSharedDB(ctx, tenantID, sharedDB, provider, keyName, opts, now)
+		res, provisionErr := s.provisionTenantOnSharedDB(ctx, tenantID, sharedDB, provider, keyName, opts, now)
+		if provisionErr != nil {
+			s.failTenantProvision(ctx, tenantID, provider)
+		}
+		return res, provisionErr
 	}
 
 	if autoProfile != nil {
@@ -5511,9 +5516,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		if err := s.meta.UpsertTenantAutoEmbeddingProfile(ctx, autoProfile); err != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_auto_embedding_profile_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-			if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
-				logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
-			}
+			s.failTenantProvision(ctx, tenantID, provider)
 			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant auto-embedding profile", err)
 		}
 		logProvisionStage(ctx, "provision_auto_embedding_profile_inserted", tenantID, provider, stageStarted)
@@ -5531,11 +5534,11 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			quotaReq := *opts.Quota
 			quotaReq.TenantID = tenantID
 			if err := s.validateQuotaSetRequest(quotaReq); err != nil {
-				_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+				s.failTenantProvision(ctx, tenantID, provider)
 				return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
 			}
 			if opts.CredentialProvisioner == nil {
-				_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+				s.failTenantProvision(ctx, tenantID, provider)
 				return nil, newProvisionTenantError(http.StatusBadRequest, tenant.ErrCredentialsRequired.Error(), tenant.ErrCredentialsRequired)
 			}
 			createOpts.TiDBCloudSpendingLimitMonthly = quotaReq.TiDBCloudSpendingLimit
@@ -5545,7 +5548,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			err = fmt.Errorf("provisioner does not support early cluster binding")
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_early_cluster_binding_not_supported", "tenant_id", tenantID, "provider", provider, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			s.failTenantProvision(ctx, tenantID, provider)
 			return nil, newProvisionTenantError(http.StatusInternalServerError, err.Error(), err)
 		}
 		if opts.Quota == nil {
@@ -5725,12 +5728,34 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}, nil
 }
 
+func (s *Server) releaseFreeTenantReservation(ctx context.Context, tenantID, provider string) {
+	deleted, err := s.meta.DeleteTiDBCloudFreeReservation(ctx, tenantID)
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_free_reservation_release_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		return
+	}
+	if deleted {
+		logger.Info(ctx, "server_event", eventFields(ctx, "provision_free_reservation_released", "tenant_id", tenantID, "provider", provider)...)
+	}
+}
+
+func (s *Server) markTenantProvisionFailed(ctx context.Context, tenantID, provider string) {
+	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", err)...)
+	}
+}
+
+func (s *Server) failTenantProvision(ctx context.Context, tenantID, provider string) {
+	cleanupCtx := backgroundWithTrace(ctx)
+	s.markTenantProvisionFailed(cleanupCtx, tenantID, provider)
+	s.releaseFreeTenantReservation(cleanupCtx, tenantID, provider)
+}
+
 func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Context, tenantID, provider string, cluster *tenant.ClusterInfo, cred *tenant.CredentialProvisionRequest, reason string) {
 	cleanupCtx := backgroundWithTrace(ctx)
-	if uerr := s.meta.UpdateTenantStatus(cleanupCtx, tenantID, meta.TenantFailed); uerr != nil {
-		logger.Error(cleanupCtx, "server_event", eventFields(cleanupCtx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
-	}
+	s.markTenantProvisionFailed(cleanupCtx, tenantID, provider)
 	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		s.releaseFreeTenantReservation(cleanupCtx, tenantID, provider)
 		return
 	}
 	t := &meta.Tenant{
@@ -5769,7 +5794,9 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 		}
 		if err := s.meta.ClearTenantProvisionMetadata(workerCtx, tenantID); err != nil {
 			logger.Error(workerCtx, "server_event", eventFields(workerCtx, "provision_metadata_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
+			return
 		}
+		s.releaseFreeTenantReservation(workerCtx, tenantID, provider)
 	})
 }
 

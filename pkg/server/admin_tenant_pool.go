@@ -2212,7 +2212,7 @@ func (s *Server) releaseClaimedPoolTenant(ctx context.Context, manager tenant.Te
 		tenantID = strings.TrimSpace(cluster.TenantID)
 	}
 	if tenantID != "" {
-		if err := s.meta.UpdateTenantPoolBindingStatus(releaseCtx, tenantID, meta.TenantPoolBindingFree, nil); err != nil {
+		if err := s.meta.ReleaseTenantPoolClaim(releaseCtx, tenantID); err != nil {
 			logger.Warn(releaseCtx, "admin_tenant_pool_release_binding_failed", zap.String("tenant_id", tenantID), zap.String("reason", reason), zap.Error(err))
 		}
 	}

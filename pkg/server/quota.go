@@ -239,12 +239,12 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.validateQuotaSetRequest(req); err != nil {
-		errJSON(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	if err := s.rejectFreeQuotaMutation(r.Context(), cred, "quota_set"); err != nil {
 		writeQuotaSetError(w, r.Context(), err, "authorize")
+		return
+	}
+	if err := s.validateQuotaSetRequest(req); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	t, ok := s.quotaTenant(w, r.Context(), req.TenantID)

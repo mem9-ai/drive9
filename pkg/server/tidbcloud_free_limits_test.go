@@ -102,6 +102,25 @@ func TestNormalizeTiDBCloudFreeProvisionQuota(t *testing.T) {
 	}
 }
 
+func TestNormalizeTiDBCloudFreeProvisionQuotaRoundsPositiveByteLimitsUp(t *testing.T) {
+	s := &Server{tidbCloudFreePlanLimits: TiDBCloudFreePlanLimits{
+		TenantCount:      1,
+		MaxStorageBytes:  1,
+		MaxFileSizeBytes: 1,
+		MaxFileCount:     1,
+	}}
+	got, err := s.normalizeTiDBCloudFreeProvisionQuota(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MaxStorageSize == nil || *got.MaxStorageSize != 1 {
+		t.Fatalf("max storage size = %v, want 1 MiB unit", got.MaxStorageSize)
+	}
+	if got.MaxFileSize == nil || *got.MaxFileSize != 1 {
+		t.Fatalf("max file size = %v, want 1 MiB unit", got.MaxFileSize)
+	}
+}
+
 func int64Ptr(v int64) *int64 { return &v }
 
 func assertInt64PtrEqual(t *testing.T, name string, got, want *int64) {

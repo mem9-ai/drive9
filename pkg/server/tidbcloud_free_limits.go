@@ -48,12 +48,12 @@ func (s *Server) normalizeTiDBCloudFreeProvisionQuota(req *quotaRequest) (*quota
 	if req != nil {
 		*out = *req
 	}
-	maxStorageSize := limits.MaxStorageBytes / quotaStorageSizeBytes
-	maxFileSize := limits.MaxFileSizeBytes / quotaStorageSizeBytes
+	maxStorageSize := quotaStorageBytesToSize(limits.MaxStorageBytes)
+	maxFileSize := quotaStorageBytesToSize(limits.MaxFileSizeBytes)
 	maxFileCount := limits.MaxFileCount
 	zero := int64(0)
 
-	if out.TiDBCloudSpendingLimit != nil && *out.TiDBCloudSpendingLimit > 0 {
+	if out.TiDBCloudSpendingLimit != nil && *out.TiDBCloudSpendingLimit != 0 {
 		return nil, tenant.ErrTiDBCloudFreeSpendingLimitForbidden
 	}
 	if out.MaxStorageSize != nil && (*out.MaxStorageSize <= 0 || *out.MaxStorageSize > maxStorageSize) {

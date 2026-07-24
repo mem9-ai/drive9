@@ -55,7 +55,14 @@ type TiDBCloudAPIKeyIdentity struct {
 	Role           string
 }
 
+const (
+	TiDBCloudAPIServiceIAM     = "iam"
+	TiDBCloudAPIServiceBilling = "billing"
+	TiDBCloudAPIServiceCluster = "cluster"
+)
+
 type TiDBCloudAPIError struct {
+	Service      string
 	Operation    string
 	StatusCode   int
 	UpstreamBody string

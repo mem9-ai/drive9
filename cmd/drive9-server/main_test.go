@@ -300,6 +300,14 @@ func TestTiDBCloudFreePlanLimitsFromEnv(t *testing.T) {
 		t.Fatalf("default free limits = %+v, want %+v", got, want)
 	}
 
+	got, err = tiDBCloudFreePlanLimitsFromEnv(1 << 20)
+	if err != nil {
+		t.Fatalf("default free max file size with smaller upload cap: %v", err)
+	}
+	if got.MaxFileSizeBytes != 1<<20 {
+		t.Fatalf("default free max file size = %d, want upload cap %d", got.MaxFileSizeBytes, 1<<20)
+	}
+
 	setEnv(t, keys[0], "5")
 	setEnv(t, keys[1], "4096")
 	setEnv(t, keys[2], "1024")

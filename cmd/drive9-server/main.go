@@ -1274,7 +1274,12 @@ func tiDBCloudFreePlanLimitsFromEnv(maxUploadBytes int64) (server.TiDBCloudFreeP
 	if limits.MaxStorageBytes, err = positiveInt64Env("DRIVE9_TIDBCLOUD_FREE_MAX_STORAGE_BYTES", limits.MaxStorageBytes); err != nil {
 		return server.TiDBCloudFreePlanLimits{}, err
 	}
-	if limits.MaxFileSizeBytes, err = positiveInt64Env("DRIVE9_TIDBCLOUD_FREE_MAX_FILE_SIZE_BYTES", limits.MaxFileSizeBytes); err != nil {
+	const freeMaxFileSizeKey = "DRIVE9_TIDBCLOUD_FREE_MAX_FILE_SIZE_BYTES"
+	if strings.TrimSpace(os.Getenv(freeMaxFileSizeKey)) == "" {
+		if limits.MaxFileSizeBytes > maxUploadBytes {
+			limits.MaxFileSizeBytes = maxUploadBytes
+		}
+	} else if limits.MaxFileSizeBytes, err = positiveInt64Env(freeMaxFileSizeKey, limits.MaxFileSizeBytes); err != nil {
 		return server.TiDBCloudFreePlanLimits{}, err
 	}
 	if limits.MaxFileCount, err = positiveInt64Env("DRIVE9_TIDBCLOUD_FREE_MAX_FILE_COUNT", limits.MaxFileCount); err != nil {

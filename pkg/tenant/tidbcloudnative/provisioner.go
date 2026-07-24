@@ -271,7 +271,7 @@ func (p *Provisioner) ResolveAPIKeyIdentity(ctx context.Context, req tenant.Cred
 		if readErr != nil {
 			return nil, readErr
 		}
-		return nil, statusError("IAM API key lookup", resp.StatusCode, "")
+		return nil, statusError(tenant.TiDBCloudAPIServiceIAM, "IAM API key lookup", resp.StatusCode, "")
 	}
 	var info struct {
 		Name      string `json:"name"`
@@ -318,7 +318,7 @@ func (p *Provisioner) ResolveOrganizationPlan(ctx context.Context, organizationI
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		recordTiDBCloudHTTPResponse(tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, resp.StatusCode, true)
 		_, _ = readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
-		return nil, statusError("Billing plan lookup", resp.StatusCode, "")
+		return nil, statusError(tenant.TiDBCloudAPIServiceBilling, "Billing plan lookup", resp.StatusCode, "")
 	}
 	raw, err := readUpstreamBody(resp.Body, upstreamClusterBodyLimit+1)
 	if err != nil {
@@ -530,7 +530,7 @@ func (p *Provisioner) CreateClusterWithCredentialsAndQuota(ctx context.Context, 
 		if readErr != nil {
 			return nil, nil, readErr
 		}
-		return nil, nil, statusError("provision", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return nil, nil, statusError(tenant.TiDBCloudAPIServiceCluster, "provision", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
@@ -672,7 +672,7 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 		if readErr != nil {
 			return nil, nil, readErr
 		}
-		return nil, nil, statusError("batch provision", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return nil, nil, statusError(tenant.TiDBCloudAPIServiceCluster, "batch provision", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
@@ -819,7 +819,7 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 		if readErr != nil {
 			return nil, readErr
 		}
-		return nil, statusError("batch provision shared db pools", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return nil, statusError(tenant.TiDBCloudAPIServiceCluster, "batch provision shared db pools", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	raw, err := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if err != nil {
@@ -1394,7 +1394,7 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 		if readErr != nil {
 			return nil, readErr
 		}
-		return nil, statusError("branch provision", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return nil, statusError(tenant.TiDBCloudAPIServiceCluster, "branch provision", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
@@ -1493,13 +1493,17 @@ func (p *Provisioner) DeleteBranchWithCredentials(ctx context.Context, clusterID
 		return fmt.Errorf("delete branch request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationDeleteBranch, resp.StatusCode, true)
+	if resp.StatusCode == http.StatusNotFound {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationDeleteBranch, tidbCloudResultOK)
+	} else {
+		recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationDeleteBranch, resp.StatusCode, true)
+	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
 			return readErr
 		}
-		return statusError("branch delete", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return statusError(tenant.TiDBCloudAPIServiceCluster, "branch delete", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	return nil
 }
@@ -1519,13 +1523,17 @@ func (p *Provisioner) DeprovisionWithCredentials(ctx context.Context, cluster *t
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationDeleteCluster, resp.StatusCode, true)
+	if resp.StatusCode == http.StatusNotFound {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationDeleteCluster, tidbCloudResultOK)
+	} else {
+		recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationDeleteCluster, resp.StatusCode, true)
+	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
 			return readErr
 		}
-		return statusError("cluster delete", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return statusError(tenant.TiDBCloudAPIServiceCluster, "cluster delete", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	return nil
 }
@@ -1702,7 +1710,7 @@ func (p *Provisioner) listClusterInfosPageWithCredentials(ctx context.Context, p
 		if readErr != nil {
 			return nil, "", fmt.Errorf("read cluster list error body: %w", readErr)
 		}
-		return nil, "", statusError("cluster list", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return nil, "", statusError(tenant.TiDBCloudAPIServiceCluster, "cluster list", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
@@ -2174,8 +2182,9 @@ func isTiDBCloudStatus(err error, code int) bool {
 	return errors.As(err, &statusErr) && statusErr != nil && statusErr.StatusCode == code
 }
 
-func statusError(operation string, code int, upstreamBody string) error {
+func statusError(service, operation string, code int, upstreamBody string) error {
 	return &tenant.TiDBCloudAPIError{
+		Service:      strings.TrimSpace(service),
 		Operation:    strings.TrimSpace(operation),
 		StatusCode:   code,
 		UpstreamBody: strings.TrimSpace(upstreamBody),
@@ -2183,7 +2192,7 @@ func statusError(operation string, code int, upstreamBody string) error {
 }
 
 func quotaStatusError(operation string, code int, upstreamBody string) error {
-	apiErr := statusError(operation, code, upstreamBody)
+	apiErr := statusError(tenant.TiDBCloudAPIServiceCluster, operation, code, upstreamBody)
 	switch code {
 	case http.StatusUnauthorized:
 		return fmt.Errorf("%w: %w", tenant.ErrQuotaPermissionDenied, apiErr)
@@ -2484,7 +2493,7 @@ func (p *Provisioner) waitForClusterProvisionMetadata(ctx context.Context, publi
 		}
 		if resp.StatusCode != http.StatusOK {
 			if resp.StatusCode != http.StatusTooManyRequests || time.Now().After(deadline) {
-				return nil, statusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw))
+				return nil, statusError(tenant.TiDBCloudAPIServiceCluster, "cluster get", resp.StatusCode, sanitizeUpstreamBody(raw))
 			}
 			select {
 			case <-ctx.Done():
@@ -2538,7 +2547,7 @@ func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privat
 			return nil, readErr
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, statusError("branch get", resp.StatusCode, sanitizeUpstreamBody(raw))
+			return nil, statusError(tenant.TiDBCloudAPIServiceCluster, "branch get", resp.StatusCode, sanitizeUpstreamBody(raw))
 		}
 		info, err := parseBranchInfo(raw)
 		if err != nil {
@@ -2594,7 +2603,7 @@ func (p *Provisioner) WaitForBranchUserWithCredentials(ctx context.Context, clus
 			return "", readErr
 		}
 		if resp.StatusCode != http.StatusOK {
-			return "", statusError("branch get", resp.StatusCode, sanitizeUpstreamBody(raw))
+			return "", statusError(tenant.TiDBCloudAPIServiceCluster, "branch get", resp.StatusCode, sanitizeUpstreamBody(raw))
 		}
 		info, err := parseBranchInfo(raw)
 		if err != nil {

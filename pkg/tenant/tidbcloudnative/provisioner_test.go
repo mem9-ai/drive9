@@ -231,7 +231,8 @@ func TestResolveOrganizationPlanReturnsSanitizedTypedStatusErrors(t *testing.T) 
 				PublicKey: "SENSITIVE_BILLING_PUBLIC", PrivateKey: "SENSITIVE_BILLING_PRIVATE",
 			})
 			var apiErr *tenant.TiDBCloudAPIError
-			if !errors.As(err, &apiErr) || apiErr.StatusCode != statusCode || apiErr.UpstreamBody != "" {
+			if !errors.As(err, &apiErr) || apiErr.Service != tenant.TiDBCloudAPIServiceBilling ||
+				apiErr.StatusCode != statusCode || apiErr.UpstreamBody != "" {
 				t.Fatalf("error = %#v, want sanitized typed status %d", err, statusCode)
 			}
 			for _, secret := range []string{"SENSITIVE_BILLING_BODY", "SENSITIVE_BILLING_PUBLIC", "SENSITIVE_BILLING_PRIVATE"} {
@@ -776,7 +777,8 @@ func TestResolveAPIKeyIdentityDoesNotExposeIAMErrorBody(t *testing.T) {
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("error type = %T, want *tenant.TiDBCloudAPIError", err)
 	}
-	if apiErr.Operation != "IAM API key lookup" || apiErr.StatusCode != http.StatusForbidden || apiErr.UpstreamBody != "" {
+	if apiErr.Service != tenant.TiDBCloudAPIServiceIAM || apiErr.Operation != "IAM API key lookup" ||
+		apiErr.StatusCode != http.StatusForbidden || apiErr.UpstreamBody != "" {
 		t.Fatalf("IAM error = %#v", apiErr)
 	}
 	for _, sensitive := range []string{"RESPONSEKEY1", "SENSITIVE_SECRET", "SENSITIVE_DISPLAY", "REQUESTKEY1", "request-private"} {
@@ -787,13 +789,69 @@ func TestResolveAPIKeyIdentityDoesNotExposeIAMErrorBody(t *testing.T) {
 }
 
 func TestStatusErrorReturnsTypedError(t *testing.T) {
-	err := statusError("cluster list", http.StatusTooManyRequests, `{"message":"slow down"}`)
+	err := statusError(tenant.TiDBCloudAPIServiceCluster, "cluster list", http.StatusTooManyRequests, `{"message":"slow down"}`)
 	var apiErr *tenant.TiDBCloudAPIError
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("error type = %T, want *tenant.TiDBCloudAPIError", err)
 	}
-	if apiErr.Operation != "cluster list" || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.UpstreamBody != `{"message":"slow down"}` {
+	if apiErr.Service != tenant.TiDBCloudAPIServiceCluster || apiErr.Operation != "cluster list" ||
+		apiErr.StatusCode != http.StatusTooManyRequests || apiErr.UpstreamBody != `{"message":"slow down"}` {
 		t.Fatalf("status error = %#v", apiErr)
+	}
+}
+
+func TestIdempotentDeleteNotFoundRecordsOK(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation string
+		path      string
+		delete    func(*Provisioner, tenant.CredentialProvisionRequest) error
+	}{
+		{
+			name: "branch", operation: tidbCloudOperationDeleteBranch,
+			path: "/v1beta1/clusters/cluster-1/branches/branch-1",
+			delete: func(p *Provisioner, req tenant.CredentialProvisionRequest) error {
+				return p.DeleteBranchWithCredentials(context.Background(), "cluster-1", "branch-1", req)
+			},
+		},
+		{
+			name: "cluster", operation: tidbCloudOperationDeleteCluster,
+			path: "/v1beta1/clusters/cluster-1",
+			delete: func(p *Provisioner, req tenant.CredentialProvisionRequest) error {
+				return p.DeprovisionWithCredentials(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, req)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") == "" {
+					w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="delete-404", qop="auth"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if r.Method != http.MethodDelete || r.URL.Path != tt.path {
+					t.Fatalf("request = %s %s, want DELETE %s", r.Method, r.URL.Path, tt.path)
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			defer ts.Close()
+			p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+			req := tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}
+			beforeOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tt.operation, tidbCloudResultOK)
+			beforeClientError := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tt.operation, tidbCloudResultClientError)
+			if err := tt.delete(p, req); err != nil {
+				t.Fatal(err)
+			}
+			afterOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tt.operation, tidbCloudResultOK)
+			afterClientError := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tt.operation, tidbCloudResultClientError)
+			if afterOK != beforeOK+1 {
+				t.Fatalf("ok metric delta = %v, want 1", afterOK-beforeOK)
+			}
+			if afterClientError != beforeClientError {
+				t.Fatalf("client_error metric delta = %v, want 0", afterClientError-beforeClientError)
+			}
+		})
 	}
 }
 

@@ -714,6 +714,61 @@ func TestProvisionTiDBCloudNativeRejectsSpendingLimitOnRegisteredSharedDBPool(t 
 	}
 }
 
+func TestProvisionFreeTiDBCloudNativeAllowsZeroSpendingLimitOnRegisteredSharedDBPool(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	_, _ = rand.Read(master)
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("manual-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbID, err := metaStore.RegisterSharedDB(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-native-manual-free", Host: "manual.example.com", Port: 4000,
+		User: "root", PasswordCipher: passwordCipher, Name: "manual_shared", MaxTenants: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative}
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNative, TokenSecret: make([]byte, 32),
+		DisableDatabaseAutoEmbedding: true})
+	defer srv.Close()
+	res, err := srv.provisionTenant(context.Background(), provisionTenantOptions{
+		CredentialProvisioner: &tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"},
+		TiDBCloudAccess:       &tiDBCloudAccessProfile{OrganizationID: "org-native-manual-free", IsFree: true},
+	})
+	if err != nil {
+		t.Fatalf("provisionTenant: %v", err)
+	}
+	placement, err := metaStore.GetTenantPlacement(context.Background(), mustResolveFsID(t, metaStore, res.TenantID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if placement.DbID != dbID {
+		t.Fatalf("placement db = %d, want %d", placement.DbID, dbID)
+	}
+	cfg, err := metaStore.GetQuotaConfig(context.Background(), res.TenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != 0 {
+		t.Fatalf("spending limit = %v, want 0", cfg.TiDBCloudSpendingLimit)
+	}
+}
+
 func TestManagedSharedDBContinuationWaitsForConnectionMetadata(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -1535,6 +1590,18 @@ func TestClientFacingErrorResponseMapsTiDBCloudClientErrors(t *testing.T) {
 			err:        fmt.Errorf("%w: org:viewer SENSITIVE_RESOLVER_DETAIL", tenant.ErrTiDBCloudRoleInsufficient),
 			wantStatus: http.StatusForbidden,
 			wantBody:   tenant.ErrTiDBCloudRoleInsufficient.Error(),
+		},
+		{
+			name:       "free tenant limit",
+			err:        tenant.ErrTiDBCloudFreeTenantLimitReached,
+			wantStatus: http.StatusForbidden,
+			wantBody:   tenant.ErrTiDBCloudFreeTenantLimitReached.Error(),
+		},
+		{
+			name:       "free quota lock busy",
+			err:        tenant.ErrTiDBCloudFreeQuotaBusy,
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   tenant.ErrTiDBCloudFreeQuotaBusy.Error(),
 		},
 		{
 			name:       "generic error hides detail",
@@ -2412,6 +2479,87 @@ func TestProvisionFreeTiDBCloudTenantEnforcesConfiguredTenantLimit(t *testing.T)
 	count, err := rt.meta.CountTiDBCloudFreeTenants(context.Background(), "org-free")
 	if err != nil || count != 1 {
 		t.Fatalf("free count = %d, err=%v, want 1", count, err)
+	}
+}
+
+func TestProvisionFreeTiDBCloudTenantRejectsEveryNonZeroSpendingLimitWith403(t *testing.T) {
+	for _, spendingLimit := range []int64{-1, 1, meta.MaxTiDBCloudSpendingLimit + 1} {
+		t.Run(fmt.Sprintf("spending_%d", spendingLimit), func(t *testing.T) {
+			rt := newTiDBCloudFreeProvisionRuntime(t, 3)
+			resp := rt.postProvision(t, map[string]any{
+				"public_key": "public-1", "private_key": "private-1",
+				"tidbcloud_spending_limit": spendingLimit,
+			})
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusForbidden {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 403: %s", resp.StatusCode, body)
+			}
+		})
+	}
+}
+
+func TestProvisionFreeTiDBCloudTenantReleasesReservationWhenClusterCreateFails(t *testing.T) {
+	rt := newTiDBCloudFreeProvisionRuntime(t, 1)
+	rt.provisioner.cluster = nil
+	rt.provisioner.provisionErr = errors.New("cluster create unavailable")
+	resp := rt.postProvision(t, map[string]any{"public_key": "public-1", "private_key": "private-1"})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadGateway {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 502: %s", resp.StatusCode, body)
+	}
+	var status meta.TenantStatus
+	if err := rt.meta.DB().QueryRowContext(context.Background(), "SELECT status FROM tenants").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != meta.TenantDeleted {
+		t.Fatalf("tenant status = %s, want %s", status, meta.TenantDeleted)
+	}
+	count, err := rt.meta.CountTiDBCloudFreeTenants(context.Background(), "org-free")
+	if err != nil || count != 0 {
+		t.Fatalf("free tenant count = %d, err=%v, want 0", count, err)
+	}
+}
+
+func TestProvisionFreeTiDBCloudTenantReleasesReservationAfterClusterCleanup(t *testing.T) {
+	rt := newTiDBCloudFreeProvisionRuntime(t, 1)
+	waitErr := errors.New("metadata unavailable")
+	prov := &earlyBindingProvisioner{
+		fakeProvisioner: rt.provisioner,
+		created: &tenant.ClusterInfo{
+			ClusterID: "cluster-cleanup", OrganizationID: "org-free", Password: "db-pass", DBName: "customer_db",
+		},
+		waitStarted: make(chan struct{}),
+		waitErr:     waitErr,
+	}
+	rt.server.provisioner = prov
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	_, err := rt.server.provisionTenant(context.Background(), provisionTenantOptions{
+		CredentialProvisioner: &cred,
+		TiDBCloudAccess:       &tiDBCloudAccessProfile{OrganizationID: "org-free", IsFree: true},
+	})
+	if !errors.Is(err, waitErr) {
+		t.Fatalf("provision error = %v, want %v", err, waitErr)
+	}
+	waitForDeprovisionCalls(t, rt.provisioner, 1)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var status meta.TenantStatus
+		if err := rt.meta.DB().QueryRowContext(context.Background(), "SELECT status FROM tenants").Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == meta.TenantDeleted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tenant status = %s, want %s after cleanup", status, meta.TenantDeleted)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	count, err := rt.meta.CountTiDBCloudFreeTenants(context.Background(), "org-free")
+	if err != nil || count != 0 {
+		t.Fatalf("free tenant count = %d, err=%v, want 0", count, err)
 	}
 }
 

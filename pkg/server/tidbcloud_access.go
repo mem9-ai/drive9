@@ -94,5 +94,5 @@ func isTiDBCloudBillingLookupError(err error) bool {
 		return true
 	}
 	apiErr, ok := tiDBCloudAPIError(err)
-	return ok && strings.EqualFold(strings.TrimSpace(apiErr.Operation), "Billing plan lookup")
+	return ok && apiErr.Service == tenant.TiDBCloudAPIServiceBilling
 }

@@ -61,6 +61,7 @@ type quotaTestProvisioner struct {
 	billingErr                  error
 	billingFree                 bool
 	batchPoolErr                error
+	markPoolUsedErr             error
 	batchPoolOmitConnectionInfo bool
 	batchPoolEmptyPassword      bool
 	batchPoolMissingOrg         map[int]bool
@@ -347,6 +348,9 @@ func (p *quotaTestProvisioner) WaitForPoolClustersMetadata(_ context.Context, cl
 func (p *quotaTestProvisioner) MarkClusterPoolUsed(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, _ time.Time, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
 	p.markPoolUsedCalls.Add(1)
 	p.recordCall("mark_pool_used", req, cluster, &opts)
+	if p.markPoolUsedErr != nil {
+		return nil, p.markPoolUsedErr
+	}
 	if p.cloudCfg != nil {
 		return p.cloudCfg, nil
 	}

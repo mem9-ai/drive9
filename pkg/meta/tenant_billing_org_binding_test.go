@@ -110,6 +110,10 @@ func TestBackfillTenantBillingOrgBindingsFromReliableSources(t *testing.T) {
 	if err := backfillTenantBillingOrgBindings(ctx, s.DB()); err != nil {
 		t.Fatal(err)
 	}
+	fixedUpdatedAt := time.Date(2024, time.January, 2, 3, 4, 5, 123000000, time.UTC)
+	if _, err := s.DB().ExecContext(ctx, `UPDATE tenant_billing_org_bindings SET updated_at = ?`, fixedUpdatedAt); err != nil {
+		t.Fatal(err)
+	}
 	if err := backfillTenantBillingOrgBindings(ctx, s.DB()); err != nil {
 		t.Fatalf("idempotent backfill: %v", err)
 	}
@@ -121,6 +125,40 @@ func TestBackfillTenantBillingOrgBindingsFromReliableSources(t *testing.T) {
 		binding, err := s.GetTenantBillingOrgBinding(ctx, tenantID)
 		if err != nil || binding.TiDBCloudOrganizationID != wantOrg {
 			t.Fatalf("binding %s = %+v/%v, want %s", tenantID, binding, err, wantOrg)
+		}
+		if !binding.UpdatedAt.Equal(fixedUpdatedAt) {
+			t.Fatalf("binding %s updated_at = %v, want unchanged %v", tenantID, binding.UpdatedAt, fixedUpdatedAt)
+		}
+	}
+}
+
+func TestBackfillTenantBillingOrgBindingsExcludesFreePoolInventory(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	insertBillingTestTenant(t, s, "backfill-native-free", TenantActive, tidbCloudNativeProvider)
+	if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+		TenantID: "backfill-native-free", OrganizationID: "org-native-free", ClusterID: "cluster-native-free",
+		PoolID: "pool-native-free", PoolStatus: TenantPoolBindingFree, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	insertSharedTenantPlacementForOrgTest(t, s, "backfill-shared-free", "org-shared-free")
+	if err := s.UpsertTenantPoolMembership(ctx, &TenantPoolMembership{
+		TenantID: "backfill-shared-free", PoolID: "pool-shared-free",
+		TiDBCloudOrganizationID: "org-shared-free", PoolStatus: TenantPoolBindingFree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := backfillTenantBillingOrgBindings(ctx, s.DB()); err != nil {
+		t.Fatal(err)
+	}
+	for _, tenantID := range []string{"backfill-native-free", "backfill-shared-free"} {
+		if _, err := s.GetTenantBillingOrgBinding(ctx, tenantID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("free pool inventory %s billing binding error = %v, want not found", tenantID, err)
 		}
 	}
 }
