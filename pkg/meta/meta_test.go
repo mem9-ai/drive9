@@ -1576,6 +1576,58 @@ func TestDBPoolClusterIDIndexIsGloballyUnique(t *testing.T) {
 	}
 }
 
+func TestMigrateKeepsLegacyClusterIDIndexWhenReplacementCannotBeCreated(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	if _, err := s.DB().ExecContext(ctx, `DROP TABLE db_pool`); err != nil {
+		t.Fatalf("drop current db_pool: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.DB().ExecContext(context.Background(), `DROP TABLE IF EXISTS db_pool`)
+		if err := s.migrate(); err != nil {
+			t.Errorf("restore current db_pool schema: %v", err)
+		}
+	})
+	if _, err := s.DB().ExecContext(ctx, `CREATE TABLE db_pool (
+		db_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+		org_id VARCHAR(64) NOT NULL DEFAULT '',
+		cluster_id VARCHAR(255) NULL,
+		`+"`role`"+` VARCHAR(20) NOT NULL,
+		db_host VARCHAR(255) NOT NULL,
+		db_port INT NOT NULL,
+		db_user VARCHAR(255) NOT NULL,
+		db_password VARBINARY(2048) NOT NULL,
+		db_name VARCHAR(255) NOT NULL,
+		db_tls VARCHAR(32) NOT NULL DEFAULT '',
+		max_tenants INT NOT NULL DEFAULT 0,
+		tenant_count INT NOT NULL DEFAULT 0,
+		status VARCHAR(20) NOT NULL DEFAULT 'active',
+		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+		updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+		UNIQUE INDEX uk_db_pool_cloud_resource (org_id, cluster_id)
+	)`); err != nil {
+		t.Fatalf("create legacy db_pool: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO db_pool
+		(org_id, cluster_id, `+"`role`"+`, db_host, db_port, db_user, db_password, db_name)
+		VALUES
+		('org-a', 'duplicate-cluster', 'shared', 'shared.example.com', 4000, 'user-a', X'01', 'shared_db'),
+		('org-b', 'duplicate-cluster', 'shared', 'shared.example.com', 4000, 'user-b', X'02', 'shared_db')`); err != nil {
+		t.Fatalf("insert duplicate legacy cluster ids: %v", err)
+	}
+
+	if err := s.migrate(); err == nil {
+		t.Fatal("migrate duplicate legacy cluster ids error = nil, want error")
+	}
+	legacyIndexExists, err := metaIndexExists(ctx, s.DB(), "db_pool", "uk_db_pool_cloud_resource")
+	if err != nil {
+		t.Fatalf("check uk_db_pool_cloud_resource: %v", err)
+	}
+	if !legacyIndexExists {
+		t.Fatal("legacy uk_db_pool_cloud_resource was dropped before its replacement was created")
+	}
+}
+
 func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
