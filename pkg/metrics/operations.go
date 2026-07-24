@@ -59,6 +59,7 @@ var sharedDBPoolSpendingLimit = serviceMeter.Float64Gauge("drive9_shared_db_pool
 var sharedDBPoolCacheHandles = serviceMeter.Float64Gauge("drive9_shared_db_pool_cache_handles", "Per-pod cached physical shared DB handles by tidbcloud_org_id/db_pool_id/db_pool_uuid")
 var sharedDBPoolCacheTenants = serviceMeter.Float64Gauge("drive9_shared_db_pool_cache_tenants", "Per-pod active tenant backend refs on a cached shared DB handle by tidbcloud_org_id/db_pool_id/db_pool_uuid")
 var tidbCloudRBACCacheRequestsTotal = serviceMeter.Int64Counter("drive9_tidbcloud_rbac_cache_requests_total", "TiDB Cloud API key to cluster RBAC cache requests by path/scope/result")
+var tidbCloudBillingCacheRequestsTotal = serviceMeter.Int64Counter("drive9_tidbcloud_billing_cache_requests_total", "TiDB Cloud non-free Billing plan cache requests by path/result")
 var tidbCloudOpenAPIRequestsTotal = serviceMeter.Int64Counter("drive9_tidbcloud_openapi_requests_total", "TiDB Cloud OpenAPI requests by api/operation/result")
 var tidbCloudSpendingLimitSyncTotal = serviceMeter.Int64Counter("drive9_tidbcloud_spending_limit_sync_total", "TiDB Cloud spending limit local sync outcomes by source/result")
 var tidbCloudSpendingLimitMissingTotal = serviceMeter.Int64Counter("drive9_tidbcloud_spending_limit_missing_total", "TiDB Cloud spending limit missing local config observations by path")
@@ -291,6 +292,14 @@ func RecordTiDBCloudRBACCacheRequest(path, scope, result string) {
 	tidbCloudRBACCacheRequestsTotal.Add(1,
 		Attr("path", cleanMetricValue(path, "unknown")),
 		Attr("scope", cleanMetricValue(scope, "unknown")),
+		Attr("result", cleanMetricValue(result, "unknown")),
+	)
+}
+
+func RecordTiDBCloudBillingCacheRequest(path, result string) {
+	RegisterModule("tidbcloud_billing")
+	tidbCloudBillingCacheRequestsTotal.Add(1,
+		Attr("path", cleanMetricValue(path, "unknown")),
 		Attr("result", cleanMetricValue(result, "unknown")),
 	)
 }

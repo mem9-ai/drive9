@@ -53,6 +53,9 @@ type Config struct {
 	SharedDBHardCapRatio  float64
 	SharedDBReopenRatio   float64
 	SharedDBSpendingLimit int64
+	// TiDBCloudNonFreePlanCacheTTL controls the positive-only Billing plan
+	// cache. A non-positive value uses the 30-minute default.
+	TiDBCloudNonFreePlanCacheTTL time.Duration
 	// LegacyStarterProvisioner is only used for delete/fork compatibility on
 	// persisted tidb_cloud_starter tenants. New starter provisioning remains
 	// disabled and NormalizeProvider does not accept tidb_cloud_starter.
@@ -221,6 +224,7 @@ type Server struct {
 	tenantFailedCleanupJobs   sync.Map
 	tenantFailedCleanupRunner tenantFailedCleanupRunner
 	tidbCloudRBACCache        *tidbCloudRBACCache
+	tidbCloudPlanCache        *tidbCloudNonFreePlanCache
 	schemaInitErrors          sync.Map
 	leader                    *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
@@ -419,6 +423,7 @@ func NewWithConfig(cfg Config) *Server {
 		forkWorkerCtx:         forkWorkerCtx,
 		forkWorkerCancel:      forkWorkerCancel,
 		tidbCloudRBACCache:    newTiDBCloudRBACCache(tidbCloudRBACCacheTTL),
+		tidbCloudPlanCache:    newTiDBCloudNonFreePlanCache(cfg.TiDBCloudNonFreePlanCacheTTL),
 		leader:                cfg.Leader,
 		podNotifySecret:       cfg.PodNotifySecret,
 		sseNotifyRetention:    cfg.SSENotifyRetention,

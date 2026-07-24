@@ -429,6 +429,7 @@ func TestRecordTenantPoolBindingsIncludesPoolTiDBCloudOrgAndStatus(t *testing.T)
 
 func TestTiDBCloudQuotaMetricsOmitTenantID(t *testing.T) {
 	RecordTiDBCloudRBACCacheRequest("quota_get", "cluster", "hit")
+	RecordTiDBCloudBillingCacheRequest("provision_cache_test", "miss")
 	RecordTiDBCloudOpenAPIRequest("cluster", "list_clusters", "ok")
 	RecordTiDBCloudSpendingLimitSync("quota_get", "updated")
 	RecordTiDBCloudSpendingLimitMissing("admin_tenant_list")
@@ -438,6 +439,7 @@ func TestTiDBCloudQuotaMetricsOmitTenantID(t *testing.T) {
 	text := rec.Body.String()
 	for _, want := range []string{
 		`drive9_tidbcloud_rbac_cache_requests_total{path="quota_get",result="hit",scope="cluster"} 1`,
+		`drive9_tidbcloud_billing_cache_requests_total{path="provision_cache_test",result="miss"} 1`,
 		`drive9_tidbcloud_openapi_requests_total{api="cluster",operation="list_clusters",result="ok"} 1`,
 		`drive9_tidbcloud_spending_limit_sync_total{result="updated",source="quota_get"} 1`,
 		`drive9_tidbcloud_spending_limit_missing_total{path="admin_tenant_list"} 1`,

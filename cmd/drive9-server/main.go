@@ -204,6 +204,10 @@ func main() {
 	if err != nil {
 		die(err)
 	}
+	tidbCloudNonFreePlanCacheTTL, err := tiDBCloudNonFreePlanCacheTTLFromEnv()
+	if err != nil {
+		die(err)
+	}
 	maxUploadBytes := server.DefaultMaxUploadBytes
 	if raw := os.Getenv("DRIVE9_MAX_UPLOAD_BYTES"); raw != "" {
 		maxUploadBytes, err = strconv.ParseInt(raw, 10, 64)
@@ -449,6 +453,7 @@ func main() {
 		SharedDBHardCapRatio:            sharedDBHardCapRatio,
 		SharedDBReopenRatio:             sharedDBReopenRatio,
 		SharedDBSpendingLimit:           sharedDBDefaultSpendingLimit,
+		TiDBCloudNonFreePlanCacheTTL:    tidbCloudNonFreePlanCacheTTL,
 		LegacyStarterProvisioner:        legacyStarterProvisioner,
 		TokenSecret:                     tokenSecret,
 		VaultMasterKey:                  vaultMasterKey,
@@ -1235,6 +1240,19 @@ func sharedDBDefaultSpendingLimitFromEnv() (int64, error) {
 		return 0, fmt.Errorf("invalid DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT=%q: must be in (0,%d]", raw, int64(math.MaxInt32))
 	}
 	return v, nil
+}
+
+func tiDBCloudNonFreePlanCacheTTLFromEnv() (time.Duration, error) {
+	const key = "DRIVE9_TIDBCLOUD_NON_FREE_PLAN_CACHE_TTL"
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return 30 * time.Minute, nil
+	}
+	ttl, err := time.ParseDuration(raw)
+	if err != nil || ttl <= 0 {
+		return 0, fmt.Errorf("invalid %s=%q: must be a positive duration", key, raw)
+	}
+	return ttl, nil
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {

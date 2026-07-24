@@ -254,6 +254,29 @@ func TestSharedDBCapacityConfigFromEnv(t *testing.T) {
 	}
 }
 
+func TestTiDBCloudNonFreePlanCacheTTLFromEnv(t *testing.T) {
+	const key = "DRIVE9_TIDBCLOUD_NON_FREE_PLAN_CACHE_TTL"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	unsetEnv(t, []string{key})
+	got, err := tiDBCloudNonFreePlanCacheTTLFromEnv()
+	if err != nil || got != 30*time.Minute {
+		t.Fatalf("default cache TTL = %v/%v, want 30m/nil", got, err)
+	}
+	setEnv(t, key, "45m")
+	got, err = tiDBCloudNonFreePlanCacheTTLFromEnv()
+	if err != nil || got != 45*time.Minute {
+		t.Fatalf("configured cache TTL = %v/%v, want 45m/nil", got, err)
+	}
+	for _, raw := range []string{"0", "-1s", "bad"} {
+		setEnv(t, key, raw)
+		if _, err := tiDBCloudNonFreePlanCacheTTLFromEnv(); err == nil {
+			t.Fatalf("cache TTL %q error = nil, want error", raw)
+		}
+	}
+}
+
 func TestDBHealthProbeOptionsFromEnvDefaults(t *testing.T) {
 	keys := []string{
 		"DRIVE9_DB_HEALTH_PROBE_META_ENABLED",
