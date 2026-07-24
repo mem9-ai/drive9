@@ -1562,6 +1562,17 @@ func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
 	}
 }
 
+func TestDBPoolCloudResourceIndexUsesGloballyUniqueClusterID(t *testing.T) {
+	s := newControlStore(t)
+	columns, err := loadMetaIndexColumns(context.Background(), s.DB(), "db_pool", "uk_db_pool_cloud_resource")
+	if err != nil {
+		t.Fatalf("load uk_db_pool_cloud_resource columns: %v", err)
+	}
+	if want := []string{"cluster_id"}; !sameStringSlice(columns, want) {
+		t.Fatalf("uk_db_pool_cloud_resource columns = %v, want %v", columns, want)
+	}
+}
+
 func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()

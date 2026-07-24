@@ -467,18 +467,18 @@ func expandManagedDBPoolSchema(ctx context.Context, db *sql.DB) error {
 	if !exists {
 		var duplicateCount int
 		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM (
-			SELECT org_id, cluster_id
+			SELECT cluster_id
 			FROM db_pool
-			WHERE org_id IS NOT NULL AND cluster_id IS NOT NULL
-			GROUP BY org_id, cluster_id
+			WHERE cluster_id IS NOT NULL
+			GROUP BY cluster_id
 			HAVING COUNT(*) > 1
 		) duplicates`).Scan(&duplicateCount); err != nil {
 			return fmt.Errorf("preflight db_pool cloud resource unique index: %w", err)
 		}
 		if duplicateCount > 0 {
-			return fmt.Errorf("preflight db_pool cloud resource unique index: found %d duplicate cloud resource tuples", duplicateCount)
+			return fmt.Errorf("preflight db_pool cloud resource unique index: found %d duplicate cluster ids", duplicateCount)
 		}
-		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX uk_db_pool_cloud_resource ON db_pool(org_id, cluster_id)`); err != nil && !isIgnorableMetaSchemaError(err) {
+		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX uk_db_pool_cloud_resource ON db_pool(cluster_id)`); err != nil && !isIgnorableMetaSchemaError(err) {
 			return fmt.Errorf("create db_pool cloud resource unique index: %w", err)
 		}
 	}
@@ -755,7 +755,7 @@ func metaInitSchemaStatements() []string {
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			UNIQUE INDEX uk_db_pool_uuid (uuid),
-			UNIQUE INDEX uk_db_pool_cloud_resource (org_id, cluster_id),
+			UNIQUE INDEX uk_db_pool_cloud_resource (cluster_id),
 			UNIQUE INDEX uk_db_pool_endpoint (org_id, db_host(191), db_name, db_user),
 			INDEX idx_db_pool_allocate (org_id, status, db_id),
 			INDEX idx_db_pool_provisioning_key (provisioning_key, status, db_id)
@@ -1050,6 +1050,26 @@ func dropObsoleteMetaIndexes(ctx context.Context, db *sql.DB) error {
 	}
 	if err := replaceLegacyDBPoolEndpointUniqueIndex(ctx, db); err != nil {
 		return err
+	}
+	if err := replaceLegacyDBPoolCloudResourceUniqueIndex(ctx, db); err != nil {
+		return err
+	}
+	return nil
+}
+
+func replaceLegacyDBPoolCloudResourceUniqueIndex(ctx context.Context, db *sql.DB) error {
+	columns, err := loadMetaIndexColumns(ctx, db, "db_pool", "uk_db_pool_cloud_resource")
+	if err != nil {
+		return fmt.Errorf("inspect db_pool.uk_db_pool_cloud_resource: %w", err)
+	}
+	if !sameStringSlice(columns, []string{"org_id", "cluster_id"}) {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, `ALTER TABLE db_pool
+		DROP INDEX uk_db_pool_cloud_resource,
+		ADD UNIQUE INDEX uk_db_pool_cloud_resource (cluster_id)`)
+	if err != nil {
+		return fmt.Errorf("replace db_pool.uk_db_pool_cloud_resource: %w", err)
 	}
 	return nil
 }
