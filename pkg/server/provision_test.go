@@ -418,6 +418,52 @@ func TestManagedSharedDBMetadataWorkerRefillsReadySlots(t *testing.T) {
 	}
 }
 
+func TestManagedSharedDBMetadataRefillSlotSerializesAndRespectsContext(t *testing.T) {
+	slot := make(chan struct{}, 1)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- withManagedSharedDBMetadataRefillSlot(context.Background(), slot, func() {
+			close(firstStarted)
+			<-releaseFirst
+		})
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first metadata refill did not acquire the slot")
+	}
+
+	waiterCtx, cancel := context.WithCancel(context.Background())
+	waiterDone := make(chan error, 1)
+	go func() {
+		waiterDone <- withManagedSharedDBMetadataRefillSlot(waiterCtx, slot, func() {
+			t.Error("cancelled metadata refill entered the critical section")
+		})
+	}()
+	cancel()
+	select {
+	case err := <-waiterDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("cancelled metadata refill error = %v, want context.Canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Error("cancelled metadata refill remained blocked on the slot")
+	}
+
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first metadata refill: %v", err)
+	}
+	select {
+	case slot <- struct{}{}:
+		<-slot
+	default:
+		t.Fatal("metadata refill slot was not released")
+	}
+}
+
 func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsPending(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

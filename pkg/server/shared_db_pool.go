@@ -600,6 +600,17 @@ func runManagedSharedDBProvisioningQueue(
 	return failed
 }
 
+func withManagedSharedDBMetadataRefillSlot(ctx context.Context, slot chan struct{}, refill func()) error {
+	select {
+	case slot <- struct{}{}:
+		defer func() { <-slot }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	refill()
+	return nil
+}
+
 func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows []*meta.SharedDB, onReady func([]int64)) {
 	owned := make([]*meta.SharedDB, 0, len(rows))
 	for _, row := range rows {
@@ -646,14 +657,44 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 		known[row.ID] = struct{}{}
 	}
 	var queueMu sync.Mutex
+	refillSlot := make(chan struct{}, 1)
+	takeLocked := func(limit int) []*meta.SharedDB {
+		limit = min(limit, len(queue))
+		out := append([]*meta.SharedDB(nil), queue[:limit]...)
+		queue = queue[limit:]
+		return out
+	}
 	take := func(limit int) []*meta.SharedDB {
+		if limit <= 0 {
+			return nil
+		}
 		queueMu.Lock()
-		defer queueMu.Unlock()
-		if len(queue) < limit {
+		if len(queue) >= limit {
+			out := takeLocked(limit)
+			queueMu.Unlock()
+			return out
+		}
+		queueMu.Unlock()
+
+		var out []*meta.SharedDB
+		if err := withManagedSharedDBMetadataRefillSlot(ctx, refillSlot, func() {
+			// Another worker may have refilled the queue while this worker was
+			// waiting for the single refill slot.
+			queueMu.Lock()
+			if len(queue) >= limit {
+				out = takeLocked(limit)
+				queueMu.Unlock()
+				return
+			}
+			queueMu.Unlock()
+
 			fresh, listErr := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusPending, 1000)
 			if listErr != nil {
 				logger.Warn(ctx, "managed_shared_db_pool_metadata_refill_failed", zap.Error(listErr))
-			} else {
+			}
+			queueMu.Lock()
+			defer queueMu.Unlock()
+			if listErr == nil {
 				for _, row := range fresh {
 					if strings.TrimSpace(row.ClusterID) == "" {
 						continue
@@ -669,10 +710,10 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 					queue = append(queue, row)
 				}
 			}
+			out = takeLocked(limit)
+		}); err != nil {
+			return nil
 		}
-		limit = min(limit, len(queue))
-		out := append([]*meta.SharedDB(nil), queue[:limit]...)
-		queue = queue[limit:]
 		return out
 	}
 	workerCount := min(workers, (len(owned)+batchSize-1)/batchSize)
