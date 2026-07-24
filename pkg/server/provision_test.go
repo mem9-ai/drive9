@@ -707,6 +707,62 @@ func TestManagedSharedDBContinuationWaitsForConnectionMetadata(t *testing.T) {
 	}
 }
 
+func TestManagedSharedDBContinuationRejectsProvisioningPoolWithoutConnectionMetadata(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(pool.Close)
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-provisioning-invariant", ProvisioningKey: bytes.Repeat([]byte{8}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+		PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metaStore.DB().ExecContext(context.Background(),
+		`UPDATE db_pool SET status = ? WHERE db_id = ?`, meta.SharedDBStatusProvisioning, dbID); err != nil {
+		t.Fatal(err)
+	}
+	row, err := metaStore.GetSharedDB(context.Background(), dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative}
+	srv := &Server{meta: metaStore, pool: pool, provisioner: prov}
+	err = srv.continueManagedSharedDBPoolLocked(context.Background(), row, tenant.CredentialProvisionRequest{
+		PublicKey: "shared-public", PrivateKey: "shared-private",
+	})
+	if err == nil || !strings.Contains(err.Error(), "incomplete connection metadata") {
+		t.Fatalf("continueManagedSharedDBPoolLocked error = %v, want incomplete connection metadata", err)
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 0 {
+		t.Fatalf("shared batch calls = %d, want 0", got)
+	}
+	if got := prov.sharedPoolWaitCalls.Load(); got != 0 {
+		t.Fatalf("shared metadata wait calls = %d, want 0", got)
+	}
+}
+
 func TestManagedSharedDBContinuationPassesCustomerOrganizationToPhysicalCreate(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
