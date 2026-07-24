@@ -941,7 +941,7 @@ func TestManagedSharedDBContinuationBatchesDoNotEnterBlockingMetadataWait(t *tes
 	})
 	go func() {
 		defer close(resumeDone)
-		srv.resumeManagedSharedDBPoolsWithCtx(resumeCtx)
+		srv.resumePendingManagedSharedDBPoolsWithCtx(resumeCtx)
 	}()
 	select {
 	case got := <-resumeLoadIDs:

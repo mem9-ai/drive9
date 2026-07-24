@@ -317,8 +317,9 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 		if in.Name != "" {
 			name = in.Name
 		}
-		nextStatus := SharedDBStatusPending
-		if host != "" && port > 0 && user != "" && len(password) > 0 && name != "" {
+		nextStatus := currentStatus
+		metadataReady := host != "" && port > 0 && user != "" && len(password) > 0 && name != ""
+		if currentStatus == SharedDBStatusPending && metadataReady {
 			nextStatus = SharedDBStatusProvisioning
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE db_pool
@@ -331,17 +332,15 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 			nullString(in.Name), in.TLSMode, nextStatus, in.ID); err != nil {
 			return fmt.Errorf("persist cloud result for db pool %d: %w", in.ID, err)
 		}
-		tenantStatus := TenantPending
-		if nextStatus == SharedDBStatusProvisioning {
-			tenantStatus = TenantProvisioning
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE tenants t
-			JOIN fs_registry f ON f.tenant_id = t.id
-			JOIN tenant_placements p ON p.fs_id = f.fs_id
-			SET t.status = ?, t.updated_at = ?
-			WHERE p.db_id = ? AND t.provider = ? AND t.status IN (?, ?)`, tenantStatus, time.Now().UTC(),
-			in.ID, tidbCloudNativeSharedProvider, TenantPending, TenantProvisioning); err != nil {
-			return fmt.Errorf("advance tenants for db pool %d: %w", in.ID, err)
+		if nextStatus == SharedDBStatusProvisioning && metadataReady {
+			if _, err := tx.ExecContext(ctx, `UPDATE tenants t
+				JOIN fs_registry f ON f.tenant_id = t.id
+				JOIN tenant_placements p ON p.fs_id = f.fs_id
+				SET t.status = ?, t.updated_at = ?
+				WHERE p.db_id = ? AND t.provider = ? AND t.status = ?`, TenantProvisioning, time.Now().UTC(),
+				in.ID, tidbCloudNativeSharedProvider, TenantPending); err != nil {
+				return fmt.Errorf("advance tenants for db pool %d: %w", in.ID, err)
+			}
 		}
 		return nil
 	})
@@ -349,8 +348,7 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 
 // PrepareManagedSharedDBPoolRoot durably stores the root credential and
 // database name before the first Cloud create call. It is idempotent for a
-// pending or legacy provisioning row that has not yet acquired a cluster
-// identity.
+// pending row that has not yet acquired a cluster identity.
 func (s *Store) PrepareManagedSharedDBPoolRoot(ctx context.Context, dbID int64, passwordCipher []byte, databaseName string) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "prepare_managed_shared_db_pool_root", start, &err)
@@ -365,8 +363,8 @@ func (s *Store) PrepareManagedSharedDBPoolRoot(ctx context.Context, dbID int64, 
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE db_pool
 		SET db_password = COALESCE(db_password, ?), db_name = COALESCE(db_name, ?)
-		WHERE db_id = ? AND status IN (?, ?) AND cluster_id IS NULL`,
-		passwordCipher, databaseName, dbID, SharedDBStatusPending, SharedDBStatusProvisioning)
+		WHERE db_id = ? AND status = ? AND cluster_id IS NULL`,
+		passwordCipher, databaseName, dbID, SharedDBStatusPending)
 	if err != nil {
 		return fmt.Errorf("prepare managed db pool %d root credential: %w", dbID, err)
 	}
@@ -378,8 +376,8 @@ func (s *Store) PrepareManagedSharedDBPoolRoot(ctx context.Context, dbID int64, 
 		return nil
 	}
 	var exists int
-	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM db_pool WHERE db_id = ? AND status IN (?, ?) AND cluster_id IS NULL
-		AND db_password IS NOT NULL AND db_name IS NOT NULL`, dbID, SharedDBStatusPending, SharedDBStatusProvisioning).Scan(&exists); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM db_pool WHERE db_id = ? AND status = ? AND cluster_id IS NULL
+		AND db_password IS NOT NULL AND db_name IS NOT NULL`, dbID, SharedDBStatusPending).Scan(&exists); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}

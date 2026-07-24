@@ -816,7 +816,10 @@ func (s *Server) startLeaderWorkers() {
 			s.resumeProvisioningTenantsWithCtx(workerCtx)
 		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			s.resumeManagedSharedDBPoolsWithCtx(workerCtx)
+			s.resumePendingManagedSharedDBPoolsWithCtx(workerCtx)
+		})
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			s.resumeProvisioningManagedSharedDBPoolsWithCtx(workerCtx)
 		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			s.resumeDeletingForkTenantsWithCtx(workerCtx)
@@ -846,7 +849,8 @@ func (s *Server) startLeaderWorkers() {
 						return
 					case <-ticker.C:
 						s.resumePendingTenantsWithCtx(workerCtx)
-						s.resumeManagedSharedDBPoolsWithCtx(workerCtx)
+						s.resumePendingManagedSharedDBPoolsWithCtx(workerCtx)
+						s.resumeProvisioningManagedSharedDBPoolsWithCtx(workerCtx)
 					}
 				}
 			})
