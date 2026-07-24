@@ -57,6 +57,7 @@ type Config struct {
 	// Managed shared-pool concurrency and polling controls. Zero values use
 	// the exported defaults below.
 	ManagedSharedDBCloudBatchSize       int
+	ManagedSharedDBRefillPoolLimit      int
 	ManagedSharedDBMetadataWorkers      int
 	ManagedSharedDBMetadataBatchSize    int
 	ManagedSharedDBMetadataPollInterval time.Duration
@@ -198,6 +199,7 @@ type Server struct {
 	sharedDBReopenRatio                 float64
 	sharedDBSpendingLimit               int64
 	managedSharedDBCloudBatchSize       int
+	managedSharedDBRefillPoolLimit      int
 	managedSharedDBMetadataWorkers      int
 	managedSharedDBMetadataBatchSize    int
 	managedSharedDBMetadataPollInterval time.Duration
@@ -322,6 +324,7 @@ const DefaultManagedSharedDBSpendingLimit = int64(1_000_000)
 
 const (
 	DefaultManagedSharedDBCloudBatchSize       = 10
+	DefaultManagedSharedDBRefillPoolLimit      = 50
 	DefaultManagedSharedDBMetadataWorkers      = 15
 	DefaultManagedSharedDBMetadataBatchSize    = 30
 	DefaultManagedSharedDBMetadataPollInterval = 15 * time.Second
@@ -411,6 +414,10 @@ func NewWithConfig(cfg Config) *Server {
 		managedSharedDBCloudBatchSize = DefaultManagedSharedDBCloudBatchSize
 	}
 	managedSharedDBCloudBatchSize = min(managedSharedDBCloudBatchSize, DefaultManagedSharedDBCloudBatchSize)
+	managedSharedDBRefillPoolLimit := cfg.ManagedSharedDBRefillPoolLimit
+	if managedSharedDBRefillPoolLimit <= 0 {
+		managedSharedDBRefillPoolLimit = DefaultManagedSharedDBRefillPoolLimit
+	}
 	managedSharedDBMetadataWorkers := cfg.ManagedSharedDBMetadataWorkers
 	if managedSharedDBMetadataWorkers <= 0 {
 		managedSharedDBMetadataWorkers = DefaultManagedSharedDBMetadataWorkers
@@ -450,6 +457,7 @@ func NewWithConfig(cfg Config) *Server {
 		sharedDBReopenRatio:                 sharedDBReopenRatio,
 		sharedDBSpendingLimit:               sharedDBSpendingLimit,
 		managedSharedDBCloudBatchSize:       managedSharedDBCloudBatchSize,
+		managedSharedDBRefillPoolLimit:      managedSharedDBRefillPoolLimit,
 		managedSharedDBMetadataWorkers:      managedSharedDBMetadataWorkers,
 		managedSharedDBMetadataBatchSize:    managedSharedDBMetadataBatchSize,
 		managedSharedDBMetadataPollInterval: managedSharedDBMetadataPollInterval,

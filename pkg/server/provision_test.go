@@ -168,21 +168,21 @@ func TestDefaultTenantProviderIsIndependentFromProvisionerType(t *testing.T) {
 func TestManagedSharedDBWorkerConfigDefaultsAndOverrides(t *testing.T) {
 	defaults := NewWithConfig(Config{})
 	t.Cleanup(defaults.Close)
-	if defaults.managedSharedDBCloudBatchSize != 10 ||
+	if defaults.managedSharedDBCloudBatchSize != 10 || defaults.managedSharedDBRefillPoolLimit != 50 ||
 		defaults.managedSharedDBMetadataWorkers != 15 || defaults.managedSharedDBMetadataBatchSize != 30 ||
 		defaults.managedSharedDBMetadataPollInterval != 15*time.Second || defaults.managedSharedDBProvisioningWorkers != 100 {
-		t.Fatalf("managed shared defaults = cloud_batch(%d) metadata(%d,%d,%s) provisioning(%d)",
-			defaults.managedSharedDBCloudBatchSize,
+		t.Fatalf("managed shared defaults = cloud_batch(%d) refill_pool_limit(%d) metadata(%d,%d,%s) provisioning(%d)",
+			defaults.managedSharedDBCloudBatchSize, defaults.managedSharedDBRefillPoolLimit,
 			defaults.managedSharedDBMetadataWorkers, defaults.managedSharedDBMetadataBatchSize, defaults.managedSharedDBMetadataPollInterval,
 			defaults.managedSharedDBProvisioningWorkers)
 	}
 	overrides := NewWithConfig(Config{
-		ManagedSharedDBCloudBatchSize:  3,
+		ManagedSharedDBCloudBatchSize: 3, ManagedSharedDBRefillPoolLimit: 12,
 		ManagedSharedDBMetadataWorkers: 5, ManagedSharedDBMetadataBatchSize: 6, ManagedSharedDBMetadataPollInterval: 7 * time.Second,
 		ManagedSharedDBProvisioningWorkers: 8,
 	})
 	t.Cleanup(overrides.Close)
-	if overrides.managedSharedDBCloudBatchSize != 3 ||
+	if overrides.managedSharedDBCloudBatchSize != 3 || overrides.managedSharedDBRefillPoolLimit != 12 ||
 		overrides.managedSharedDBMetadataWorkers != 5 || overrides.managedSharedDBMetadataBatchSize != 6 ||
 		overrides.managedSharedDBMetadataPollInterval != 7*time.Second || overrides.managedSharedDBProvisioningWorkers != 8 {
 		t.Fatalf("managed shared overrides were not retained")

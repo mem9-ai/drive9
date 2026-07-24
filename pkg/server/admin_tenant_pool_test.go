@@ -1017,14 +1017,17 @@ func TestAdminTenantPoolReplenishBatchesBelowFreeWatermark(t *testing.T) {
 }
 
 func TestManagedSharedDBRefillCapsOneWaveAtFiftyPhysicalPools(t *testing.T) {
-	if got := managedSharedDBRefillTenantCount(10_000, 100); got != 5_000 {
+	if got := managedSharedDBRefillTenantCount(10_000, 100, 50); got != 5_000 {
 		t.Fatalf("refill tenant count = %d, want capacity of 50 physical pools", got)
 	}
-	if got := managedSharedDBRefillTenantCount(1_600, 100); got != 1_600 {
+	if got := managedSharedDBRefillTenantCount(1_600, 100, 50); got != 1_600 {
 		t.Fatalf("refill tenant count = %d, want all 1600 tenants across 16 physical pools", got)
 	}
-	if got := managedSharedDBRefillTenantCount(100, 1); got != 50 {
+	if got := managedSharedDBRefillTenantCount(100, 1, 50); got != 50 {
 		t.Fatalf("refill tenant count with one tenant per DB = %d, want 50", got)
+	}
+	if got := managedSharedDBRefillTenantCount(10_000, 100, 12); got != 1_200 {
+		t.Fatalf("refill tenant count with configured 12-DB limit = %d, want 1200", got)
 	}
 }
 

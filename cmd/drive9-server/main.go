@@ -451,6 +451,8 @@ func main() {
 		SharedDBSpendingLimit: sharedDBDefaultSpendingLimit,
 		ManagedSharedDBCloudBatchSize: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_CLOUD_BATCH_SIZE",
 			server.DefaultManagedSharedDBCloudBatchSize),
+		ManagedSharedDBRefillPoolLimit: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_REFILL_POOL_LIMIT",
+			server.DefaultManagedSharedDBRefillPoolLimit),
 		ManagedSharedDBMetadataWorkers: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_WORKERS",
 			server.DefaultManagedSharedDBMetadataWorkers),
 		ManagedSharedDBMetadataBatchSize: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_BATCH_SIZE",
@@ -696,6 +698,7 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_REOPEN_RATIO reopen ratio for a latched shared pool (default: 0.8)
   DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT physical spending-limit target for new managed shared DB pools (default: 1000000)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_CLOUD_BATCH_SIZE physical pools per Cloud create request (default: 10)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_REFILL_POOL_LIMIT maximum physical shared DBs added by one refill wave (default: 50)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_WORKERS concurrent pending metadata workers (default: 15)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_BATCH_SIZE physical pools per metadata list request (default: 30)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_POLL_INTERVAL delay between metadata list rounds (default: 15s)

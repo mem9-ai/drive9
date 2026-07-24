@@ -53,9 +53,7 @@ const tenantPoolClaimCASRetryLimit = 8
 
 const sharedTenantPoolCreateConcurrency = 50
 
-const managedSharedDBRefillPoolLimit = 50
-
-func managedSharedDBRefillTenantCount(missing, maxTenants int) int {
+func managedSharedDBRefillTenantCount(missing, maxTenants, poolLimit int) int {
 	if missing <= 0 {
 		return 0
 	}
@@ -64,8 +62,11 @@ func managedSharedDBRefillTenantCount(missing, maxTenants int) int {
 	}
 	maxInt := int(^uint(0) >> 1)
 	limit := maxInt
-	if maxTenants <= maxInt/managedSharedDBRefillPoolLimit {
-		limit = maxTenants * managedSharedDBRefillPoolLimit
+	if poolLimit <= 0 {
+		poolLimit = DefaultManagedSharedDBRefillPoolLimit
+	}
+	if maxTenants <= maxInt/poolLimit {
+		limit = maxTenants * poolLimit
 	}
 	return min(missing, limit)
 }
@@ -1889,7 +1890,7 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 			}
 			if s.defaultTenantProvider == tenant.ProviderTiDBCloudNativeShared {
 				maxTenants, _ := s.managedSharedDBPolicy()
-				missing = managedSharedDBRefillTenantCount(missing, maxTenants)
+				missing = managedSharedDBRefillTenantCount(missing, maxTenants, s.managedSharedDBRefillPoolLimit)
 			}
 			results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
 			if err != nil {
