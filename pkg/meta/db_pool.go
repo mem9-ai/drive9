@@ -559,10 +559,10 @@ func (s *Store) FindSharedDBForEmergency(ctx context.Context, organizationID str
 	return db, nil
 }
 
-// RegisterSharedDB registers a physical database in db_pool, upserting on the
-// uk_db_pool_endpoint (org_id, db_host, db_name) natural key. On a duplicate
-// endpoint the connection fields are refreshed and tenant_count is preserved;
-// the existing db_id is re-fetched and returned.
+// RegisterSharedDB registers a manually configured physical database in
+// db_pool. Its stable UUID is derived from the full manual connection identity
+// when omitted; managed cloud pools use CreateManagedSharedDBPool and global
+// cluster_id uniqueness instead.
 func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "register_shared_db", start, &err)
@@ -570,10 +570,6 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 		return 0, fmt.Errorf("shared db is required")
 	}
 	organizationID, err := validateSharedDBOrganizationID(in.TiDBCloudOrganizationID)
-	if err != nil {
-		return 0, err
-	}
-	poolUUID, err := sharedDBUUID(in.UUID)
 	if err != nil {
 		return 0, err
 	}
@@ -585,6 +581,16 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 	}
 	if in.User == "" {
 		return 0, fmt.Errorf("db user is required")
+	}
+	poolUUID := strings.TrimSpace(in.UUID)
+	if poolUUID == "" {
+		poolUUID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(strings.Join(
+			[]string{organizationID, in.Host, in.Name, in.User}, "\x00"))).String()
+	} else {
+		poolUUID, err = sharedDBUUID(poolUUID)
+		if err != nil {
+			return 0, err
+		}
 	}
 	if len(in.PasswordCipher) == 0 {
 		return 0, fmt.Errorf("db password cipher is required")
@@ -609,23 +615,39 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 	if status == "" {
 		status = sharedDBStatusActive
 	}
-	if _, err := s.db.ExecContext(ctx,
-		"INSERT INTO db_pool (uuid, org_id, `role`, db_host, db_port, db_user, db_password, db_name, "+
-			"db_tls, max_tenants, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "+
-			"ON DUPLICATE KEY UPDATE db_port = VALUES(db_port), db_user = VALUES(db_user), "+
-			"db_password = VALUES(db_password), db_tls = VALUES(db_tls), "+
-			"max_tenants = VALUES(max_tenants), status = VALUES(status)",
-		poolUUID, organizationID, role, in.Host, in.Port, in.User, in.PasswordCipher, in.Name,
-		in.TLSMode, in.MaxTenants, status); err != nil {
-		return 0, fmt.Errorf("upsert db_pool row: %w", err)
-	}
-	// ON DUPLICATE KEY UPDATE does not reliably report the existing
-	// auto-increment id via LastInsertId, so re-fetch by endpoint.
-	err = s.db.QueryRowContext(ctx,
-		`SELECT db_id FROM db_pool WHERE org_id = ? AND db_host = ? AND db_name = ?`,
-		organizationID, in.Host, in.Name).Scan(&dbID)
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, `SELECT db_id FROM db_pool
+			WHERE org_id = ? AND db_host = ? AND db_name = ? AND db_user = ?
+			ORDER BY db_id LIMIT 1 FOR UPDATE`, organizationID, in.Host, in.Name, in.User).Scan(&dbID)
+		if err == nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE db_pool
+				SET db_port = ?, db_password = ?, db_tls = ?, max_tenants = ?, status = ?
+				WHERE db_id = ?`, in.Port, in.PasswordCipher, in.TLSMode, in.MaxTenants, status, dbID); err != nil {
+				return fmt.Errorf("update existing manual db_pool row: %w", err)
+			}
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("find existing manual db_pool row: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			"INSERT INTO db_pool (uuid, org_id, `role`, db_host, db_port, db_user, db_password, db_name, "+
+				"db_tls, max_tenants, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "+
+				"ON DUPLICATE KEY UPDATE org_id = VALUES(org_id), db_host = VALUES(db_host), "+
+				"db_port = VALUES(db_port), db_user = VALUES(db_user), db_name = VALUES(db_name), "+
+				"db_password = VALUES(db_password), db_tls = VALUES(db_tls), "+
+				"max_tenants = VALUES(max_tenants), status = VALUES(status)",
+			poolUUID, organizationID, role, in.Host, in.Port, in.User, in.PasswordCipher, in.Name,
+			in.TLSMode, in.MaxTenants, status); err != nil {
+			return fmt.Errorf("upsert manual db_pool row: %w", err)
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT db_id FROM db_pool WHERE uuid = ?`, poolUUID).Scan(&dbID); err != nil {
+			return fmt.Errorf("resolve db_id after upsert: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
-		return 0, fmt.Errorf("resolve db_id after upsert: %w", err)
+		return 0, err
 	}
 	return dbID, nil
 }

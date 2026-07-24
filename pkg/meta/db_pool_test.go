@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -275,7 +276,7 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 		TiDBCloudOrganizationID: "org-a",
 		Host:                    "shared-a.example.com",
 		Port:                    5000,
-		User:                    "app",
+		User:                    "root",
 		PasswordCipher:          []byte("rotated-cipher"),
 		Name:                    "shared_db_a",
 		TLSMode:                 "true",
@@ -292,7 +293,7 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSharedDB: %v", err)
 	}
-	if got.Port != 5000 || got.User != "app" || string(got.PasswordCipher) != "rotated-cipher" ||
+	if got.Port != 5000 || got.User != "root" || string(got.PasswordCipher) != "rotated-cipher" ||
 		got.MaxTenants != 200 || got.TLSMode != "true" {
 		t.Fatalf("upsert did not refresh connection fields: %+v", got)
 	}
@@ -301,6 +302,43 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 	}
 	if got.UUID != firstRecord.UUID {
 		t.Fatalf("UUID = %q after upsert, want preserved %q", got.UUID, firstRecord.UUID)
+	}
+}
+
+func TestRegisterSharedDBReusesLegacyRandomUUIDRow(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	result, err := s.db.ExecContext(ctx, `INSERT INTO db_pool
+		(uuid, org_id, `+"`role`"+`, db_host, db_port, db_user, db_password, db_name, db_tls, max_tenants, status)
+		VALUES ('6f5d93ac-e897-4e92-8489-01a24ac0fd2c', 'org-legacy-manual', 'shared',
+			'legacy.example.com', 4000, 'root', X'01', 'legacy_db', 'skip-verify', 100, 'active')`)
+	if err != nil {
+		t.Fatalf("insert legacy manual pool: %v", err)
+	}
+	legacyID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("legacy manual pool id: %v", err)
+	}
+
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-legacy-manual", Host: "legacy.example.com", Port: 5000,
+		User: "root", PasswordCipher: []byte("rotated"), Name: "legacy_db",
+		TLSMode: "true", MaxTenants: 200,
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	if dbID != legacyID {
+		t.Fatalf("RegisterSharedDB db_id = %d, want legacy row %d", dbID, legacyID)
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM db_pool
+		WHERE org_id = 'org-legacy-manual' AND db_host = 'legacy.example.com'
+			AND db_name = 'legacy_db' AND db_user = 'root'`).Scan(&count); err != nil {
+		t.Fatalf("count legacy manual pools: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("legacy manual pool rows = %d, want 1", count)
 	}
 }
 
@@ -1004,6 +1042,42 @@ func TestManagedSharedDBPoolCloudResultSchemaAndActivation(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].ID != dbID {
 		t.Fatalf("active rows = %+v, want db %d", rows, dbID)
+	}
+}
+
+func TestManagedSharedDBPoolsAllowSameEndpointWithDifferentUsers(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	ids := make([]int64, 0, 2)
+	for i := 0; i < 2; i++ {
+		dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+			TiDBCloudOrganizationID: "org-shared-endpoint", ProvisioningKey: make([]byte, 32),
+			CloudProvider: "tencentcloud", Region: "ap-beijing", MaxTenants: 100,
+			SpendingLimit: &spendingLimit, PasswordCipher: []byte("root-cipher"), Name: "tidbcloud_fs",
+		})
+		if err != nil {
+			t.Fatalf("CreateManagedSharedDBPool %d: %v", i, err)
+		}
+		ids = append(ids, dbID)
+	}
+	for i, dbID := range ids {
+		if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, &SharedDB{
+			ID: dbID, TiDBCloudOrganizationID: "org-shared-endpoint", ClusterID: fmt.Sprintf("cluster-%d", i),
+			Host: "10.4.48.2", Port: 4000, User: fmt.Sprintf("prefix-%d.root", i),
+			PasswordCipher: []byte("root-cipher"), Name: "tidbcloud_fs", TLSMode: "skip-verify",
+		}); err != nil {
+			t.Fatalf("UpdateManagedSharedDBPoolCloudResult %d: %v", i, err)
+		}
+	}
+	for i, dbID := range ids {
+		got, err := s.GetSharedDB(ctx, dbID)
+		if err != nil {
+			t.Fatalf("GetSharedDB %d: %v", i, err)
+		}
+		if got.Status != SharedDBStatusProvisioning || got.User != fmt.Sprintf("prefix-%d.root", i) {
+			t.Fatalf("shared db %d = status %q user %q, want provisioning/prefix-%d.root", i, got.Status, got.User, i)
+		}
 	}
 }
 

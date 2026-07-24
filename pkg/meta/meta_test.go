@@ -1536,12 +1536,15 @@ func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
 		}
 	}
 	for _, index := range []string{
-		"primary", "uk_db_pool_uuid", "uk_db_pool_cloud_resource", "uk_db_pool_endpoint",
+		"primary", "uk_db_pool_uuid", "uk_db_pool_cloud_resource",
 		"idx_db_pool_allocate", "idx_db_pool_provisioning_key",
 	} {
 		if _, ok := dbPool.indexes[index]; !ok {
 			t.Fatalf("db_pool schema missing index %s", index)
 		}
+	}
+	if _, ok := dbPool.indexes["uk_db_pool_endpoint"]; ok {
+		t.Fatal("db_pool schema must not define endpoint uniqueness")
 	}
 
 	memberships := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_pool_memberships")
@@ -1559,6 +1562,17 @@ func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
 		if _, ok := memberships.indexes[index]; !ok {
 			t.Fatalf("tenant_pool_memberships schema missing index %s", index)
 		}
+	}
+}
+
+func TestDBPoolCloudResourceIndexUsesGloballyUniqueClusterID(t *testing.T) {
+	s := newControlStore(t)
+	columns, err := loadMetaIndexColumns(context.Background(), s.DB(), "db_pool", "uk_db_pool_cloud_resource")
+	if err != nil {
+		t.Fatalf("load uk_db_pool_cloud_resource columns: %v", err)
+	}
+	if want := []string{"cluster_id"}; !sameStringSlice(columns, want) {
+		t.Fatalf("uk_db_pool_cloud_resource columns = %v, want %v", columns, want)
 	}
 }
 
@@ -1626,6 +1640,13 @@ func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
 		if !exists {
 			t.Fatalf("db_pool index %s was not created", index)
 		}
+	}
+	endpointIndexExists, err := metaIndexExists(ctx, s.DB(), "db_pool", "uk_db_pool_endpoint")
+	if err != nil {
+		t.Fatalf("check uk_db_pool_endpoint: %v", err)
+	}
+	if endpointIndexExists {
+		t.Fatal("legacy uk_db_pool_endpoint was not dropped")
 	}
 	var dbPoolUUID, status string
 	var softCapReached bool
