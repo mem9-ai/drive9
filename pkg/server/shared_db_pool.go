@@ -496,8 +496,9 @@ func (s *Server) ensureManagedSharedDBPhysicalLocked(ctx context.Context, poolIn
 			return nil, fmt.Errorf("managed shared cluster %q was not found", poolInfo.ClusterID)
 		}
 		results, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, []tenant.SharedDBPoolCreateRequest{{
-			DBPoolID: poolInfo.ID, DBPoolUUID: poolInfo.UUID, DatabaseName: poolInfo.Name, RootPassword: string(plainRootPassword),
-			SpendingLimitMonthly: *poolInfo.SpendingLimit,
+			DBPoolID: poolInfo.ID, DBPoolUUID: poolInfo.UUID,
+			CustomerOrganizationID: strings.TrimSpace(poolInfo.TiDBCloudOrganizationID), DatabaseName: poolInfo.Name,
+			RootPassword: string(plainRootPassword), SpendingLimitMonthly: *poolInfo.SpendingLimit,
 		}}, cred)
 		provisionErr = createErr
 		if createErr != nil && len(results) == 0 {
@@ -629,8 +630,9 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 				return fmt.Errorf("managed shared cluster %q was not found", poolInfo.ClusterID)
 			}
 			results, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, []tenant.SharedDBPoolCreateRequest{{
-				DBPoolID: dbID, DBPoolUUID: poolInfo.UUID, DatabaseName: poolInfo.Name, RootPassword: string(plainRootPassword),
-				SpendingLimitMonthly: *poolInfo.SpendingLimit,
+				DBPoolID: dbID, DBPoolUUID: poolInfo.UUID,
+				CustomerOrganizationID: strings.TrimSpace(poolInfo.TiDBCloudOrganizationID), DatabaseName: poolInfo.Name,
+				RootPassword: string(plainRootPassword), SpendingLimitMonthly: *poolInfo.SpendingLimit,
 			}}, cred)
 			provisionErr = createErr
 			if createErr != nil && len(results) == 0 {

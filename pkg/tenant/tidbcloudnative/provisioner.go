@@ -58,15 +58,16 @@ const (
 	cloudProviderAliCloud     = "alicloud"
 	cloudProviderAWS          = "aws"
 
-	Drive9ManagedLabel         = "drive9.ai/managed"
-	Drive9TenantIDLabel        = "drive9.ai/tenant_id"
-	Drive9PoolStatusLabel      = "drive9.ai/status"
-	Drive9PoolIDLabel          = "drive9.ai/pool_id"
-	Drive9PoolUsedAtLabel      = "drive9.ai/used_at"
-	Drive9ProviderLabel        = "drive9.ai/provider"
-	Drive9DBPoolUUIDLabel      = "drive9.ai/db_pool_uuid"
-	Drive9QuotaUpdateAtLabel   = "drive9.ai/update_quota_at"
-	TiDBCloudOrganizationLabel = "tidb.cloud/organization"
+	Drive9ManagedLabel              = "drive9.ai/managed"
+	Drive9TenantIDLabel             = "drive9.ai/tenant_id"
+	Drive9PoolStatusLabel           = "drive9.ai/status"
+	Drive9PoolIDLabel               = "drive9.ai/pool_id"
+	Drive9PoolUsedAtLabel           = "drive9.ai/used_at"
+	Drive9ProviderLabel             = "drive9.ai/provider"
+	Drive9DBPoolUUIDLabel           = "drive9.ai/db_pool_uuid"
+	Drive9CustomerOrganizationLabel = "drive9.ai/customer_organization"
+	Drive9QuotaUpdateAtLabel        = "drive9.ai/update_quota_at"
+	TiDBCloudOrganizationLabel      = "tidb.cloud/organization"
 
 	upstreamErrorBodyLimit   = 2048
 	upstreamClusterBodyLimit = 1 << 20
@@ -599,6 +600,10 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 		if _, exists := inputsByUUID[poolUUID]; exists {
 			return nil, fmt.Errorf("duplicate db pool uuid %s", poolUUID)
 		}
+		customerOrganizationID := strings.TrimSpace(input.CustomerOrganizationID)
+		if customerOrganizationID == "" {
+			return nil, fmt.Errorf("customer organization is required for db pool %d", input.DBPoolID)
+		}
 		if err := validateTiDBCloudSpendingLimit(input.SpendingLimitMonthly); err != nil {
 			return nil, err
 		}
@@ -611,6 +616,7 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 			return nil, fmt.Errorf("root password is required for db pool %d", input.DBPoolID)
 		}
 		input.DBPoolUUID = poolUUID
+		input.CustomerOrganizationID = customerOrganizationID
 		input.RootPassword = password
 		inputsByUUID[poolUUID] = input
 		databaseNames[poolUUID] = dbName
@@ -619,9 +625,10 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 			"rootPassword": password,
 			"region":       map[string]string{"name": p.regionName()},
 			"labels": map[string]string{
-				Drive9ManagedLabel:    "true",
-				Drive9ProviderLabel:   tenant.ProviderTiDBCloudNativeShared,
-				Drive9DBPoolUUIDLabel: poolUUID,
+				Drive9ManagedLabel:              "true",
+				Drive9ProviderLabel:             tenant.ProviderTiDBCloudNativeShared,
+				Drive9DBPoolUUIDLabel:           poolUUID,
+				Drive9CustomerOrganizationLabel: input.CustomerOrganizationID,
 			},
 			"spendingLimit": map[string]int32{"monthly": int32(input.SpendingLimitMonthly)},
 		}})

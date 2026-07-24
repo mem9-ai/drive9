@@ -92,11 +92,12 @@ type TenantPoolClusterManager interface {
 }
 
 type SharedDBPoolCreateRequest struct {
-	DBPoolID             int64
-	DBPoolUUID           string
-	DatabaseName         string
-	RootPassword         string
-	SpendingLimitMonthly int64
+	DBPoolID               int64
+	DBPoolUUID             string
+	CustomerOrganizationID string
+	DatabaseName           string
+	RootPassword           string
+	SpendingLimitMonthly   int64
 }
 
 type SharedDBPoolInfo struct {
