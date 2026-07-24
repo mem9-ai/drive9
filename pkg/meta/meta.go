@@ -1050,25 +1050,9 @@ func dropObsoleteMetaIndexes(ctx context.Context, db *sql.DB) error {
 	if err := dropMetaIndexIfExists(ctx, db, "db_pool", "uk_db_pool_endpoint"); err != nil {
 		return fmt.Errorf("drop obsolete meta index uk_db_pool_endpoint: %w", err)
 	}
-	if err := replaceLegacyDBPoolCloudResourceUniqueIndex(ctx, db); err != nil {
-		return err
-	}
-	return nil
-}
-
-func replaceLegacyDBPoolCloudResourceUniqueIndex(ctx context.Context, db *sql.DB) error {
-	columns, err := loadMetaIndexColumns(ctx, db, "db_pool", "uk_db_pool_cloud_resource")
-	if err != nil {
-		return fmt.Errorf("inspect db_pool.uk_db_pool_cloud_resource: %w", err)
-	}
-	if !sameStringSlice(columns, []string{"org_id", "cluster_id"}) {
-		return nil
-	}
-	_, err = db.ExecContext(ctx, `ALTER TABLE db_pool
-		DROP INDEX uk_db_pool_cloud_resource,
-		ADD UNIQUE INDEX uk_db_pool_cloud_resource (cluster_id)`)
-	if err != nil {
-		return fmt.Errorf("replace db_pool.uk_db_pool_cloud_resource: %w", err)
+	if err := dropMetaIndexIfColumns(ctx, db, "db_pool", "uk_db_pool_cloud_resource",
+		[]string{"org_id", "cluster_id"}); err != nil {
+		return fmt.Errorf("drop obsolete meta index uk_db_pool_cloud_resource: %w", err)
 	}
 	return nil
 }
