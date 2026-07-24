@@ -3,7 +3,9 @@ package meta
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -172,6 +174,117 @@ func TestWithTiDBCloudFreeQuotaLockSerializesAndReturnsBusy(t *testing.T) {
 	}
 }
 
+func TestReserveTiDBCloudFreeTenantPersistsAtomicReservationAndEnforcesLimit(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	zero := int64(0)
+	storage, fileSize, fileCount := int64(3<<30), int64(300<<20), int64(1000)
+	quota := QuotaConfigPatch{
+		MaxStorageBytes:        &storage,
+		MaxFileSizeBytes:       &fileSize,
+		MaxFileCount:           &fileCount,
+		TiDBCloudSpendingLimit: &zero,
+	}
+	for _, tenantID := range []string{"free-reservation-1", "free-reservation-2"} {
+		if err := s.ReserveTiDBCloudFreeTenant(ctx, newBillingTestTenant(tenantID), "org-reservation", 2, quota); err != nil {
+			t.Fatalf("ReserveTiDBCloudFreeTenant(%s): %v", tenantID, err)
+		}
+	}
+	if err := s.ReserveTiDBCloudFreeTenant(ctx, newBillingTestTenant("free-reservation-3"), "org-reservation", 2, quota); !errors.Is(err, ErrTiDBCloudFreeTenantLimitReached) {
+		t.Fatalf("third reservation error = %v, want tenant limit", err)
+	}
+	if _, err := s.GetTenant(ctx, "free-reservation-3"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("third tenant lookup = %v, want not found", err)
+	}
+	binding, err := s.GetTenantBillingOrgBinding(ctx, "free-reservation-1")
+	if err != nil || binding.TiDBCloudOrganizationID != "org-reservation" {
+		t.Fatalf("binding = %+v, err=%v", binding, err)
+	}
+	cfg, err := s.GetQuotaConfig(ctx, "free-reservation-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxStorageBytes != storage || cfg.MaxFileSizeBytes != fileSize || cfg.MaxFileCount != fileCount || cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != 0 {
+		t.Fatalf("quota = %+v", cfg)
+	}
+}
+
+func TestInsertTiDBCloudTenantReservationRollsBackEveryRow(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	const tenantID = "reservation-rollback"
+	if err := s.UpsertTenantBillingOrgBinding(ctx, tenantID, "preexisting-org"); err != nil {
+		t.Fatal(err)
+	}
+	zero := int64(0)
+	storage, fileSize, fileCount := int64(3<<30), int64(300<<20), int64(1000)
+	err := s.InsertTiDBCloudTenantReservation(ctx, newBillingTestTenant(tenantID), "new-org", &QuotaConfigPatch{
+		MaxStorageBytes:        &storage,
+		MaxFileSizeBytes:       &fileSize,
+		MaxFileCount:           &fileCount,
+		TiDBCloudSpendingLimit: &zero,
+	})
+	if err == nil {
+		t.Fatal("reservation with duplicate binding succeeded")
+	}
+	if _, err := s.GetTenant(ctx, tenantID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("tenant lookup after rollback = %v, want not found", err)
+	}
+	var quotaRows int
+	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM tenant_quota_config WHERE tenant_id = ?`, tenantID).Scan(&quotaRows); err != nil {
+		t.Fatal(err)
+	}
+	if quotaRows != 0 {
+		t.Fatalf("quota rows after rollback = %d, want 0", quotaRows)
+	}
+}
+
+func TestReserveTiDBCloudFreeTenantSerializesAcrossStores(t *testing.T) {
+	s1 := newControlStore(t)
+	s2, err := Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	zero := int64(0)
+	storage, fileSize, fileCount := int64(3<<30), int64(300<<20), int64(1000)
+	quota := QuotaConfigPatch{
+		MaxStorageBytes:        &storage,
+		MaxFileSizeBytes:       &fileSize,
+		MaxFileCount:           &fileCount,
+		TiDBCloudSpendingLimit: &zero,
+	}
+	stores := []*Store{s1, s2}
+	var successes atomic.Int32
+	errs := make(chan error, len(stores))
+	var wg sync.WaitGroup
+	for i, store := range stores {
+		wg.Add(1)
+		go func(i int, store *Store) {
+			defer wg.Done()
+			err := store.ReserveTiDBCloudFreeTenant(context.Background(), newBillingTestTenant(fmt.Sprintf("concurrent-free-%d", i)), "org-concurrent", 1, quota)
+			if err == nil {
+				successes.Add(1)
+			}
+			errs <- err
+		}(i, store)
+	}
+	wg.Wait()
+	close(errs)
+	limits := 0
+	for err := range errs {
+		if errors.Is(err, ErrTiDBCloudFreeTenantLimitReached) {
+			limits++
+		} else if err != nil {
+			t.Fatalf("reservation error = %v", err)
+		}
+	}
+	if successes.Load() != 1 || limits != 1 {
+		t.Fatalf("successes/limits = %d/%d, want 1/1", successes.Load(), limits)
+	}
+}
+
 func insertBillingTestTenant(t *testing.T, s *Store, tenantID string, status TenantStatus, provider string) {
 	t.Helper()
 	now := time.Now().UTC()
@@ -181,5 +294,14 @@ func insertBillingTestTenant(t *testing.T, s *Store, tenantID string, status Ten
 		CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func newBillingTestTenant(tenantID string) *Tenant {
+	now := time.Now().UTC()
+	return &Tenant{
+		ID: tenantID, Status: TenantPending, Kind: TenantKindLive, Provider: tidbCloudNativeProvider,
+		DBPasswordCipher: []byte{}, DBTLS: true, SchemaVersion: 1,
+		CreatedAt: now, UpdatedAt: now,
 	}
 }

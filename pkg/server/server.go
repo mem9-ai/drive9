@@ -4502,6 +4502,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	}
 	var credentialReq *tenant.CredentialProvisionRequest
 	var quotaReq *quotaRequest
+	var tiDBCloudAccess *tiDBCloudAccessProfile
 	if tenant.UsesTiDBCloudNativeCredentials(provider) {
 		decoded, err := decodeCredentialProvisionRequest(w, r)
 		if err != nil {
@@ -4539,6 +4540,24 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			if err := s.validateQuotaSetRequest(*quotaReq); err != nil {
 				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 				errJSON(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		tiDBCloudAccess, err = s.resolveTiDBCloudAccessProfile(r.Context(), *credentialReq, "provision")
+		if err != nil {
+			status, message := http.StatusBadGateway, "TiDB Cloud API key authorization failed"
+			if isTiDBCloudBillingLookupError(err) {
+				status, message = tiDBCloudBillingErrorResponse(err)
+			} else {
+				status, message = clientFacingErrorResponse(status, message, err)
+			}
+			errJSON(w, status, message)
+			return
+		}
+		if tiDBCloudAccess.IsFree {
+			quotaReq, err = s.normalizeTiDBCloudFreeProvisionQuota(quotaReq)
+			if err != nil {
+				errJSON(w, http.StatusForbidden, err.Error())
 				return
 			}
 		}
@@ -4580,12 +4599,13 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		KeyName:               "default",
 		TokenVersion:          1,
 		CredentialProvisioner: credentialReq,
+		TiDBCloudAccess:       tiDBCloudAccess,
 		Quota:                 quotaReq,
 	})
 	if err != nil {
 		var pe *provisionTenantError
 		if errors.As(err, &pe) {
-			errJSON(w, pe.status, pe.message)
+			writeProvisionTenantError(w, pe)
 			return
 		}
 		errJSON(w, backendErrorStatus(r.Context(), err), "failed to provision tenant")
@@ -4872,6 +4892,13 @@ func (e *provisionTenantError) Unwrap() error { return e.err }
 
 func newProvisionTenantError(status int, message string, err error) *provisionTenantError {
 	return &provisionTenantError{status: status, message: message, err: err}
+}
+
+func writeProvisionTenantError(w http.ResponseWriter, err *provisionTenantError) {
+	if errors.Is(err, tenant.ErrTiDBCloudFreeQuotaBusy) {
+		w.Header().Set("Retry-After", "1")
+	}
+	errJSON(w, err.status, err.message)
 }
 
 func durationMillis(started time.Time) float64 {
@@ -5291,6 +5318,13 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			}
 			opts.TiDBCloudAccess = profile
 		}
+		if opts.TiDBCloudAccess.IsFree {
+			normalizedQuota, err := s.normalizeTiDBCloudFreeProvisionQuota(opts.Quota)
+			if err != nil {
+				return nil, newProvisionTenantError(http.StatusForbidden, err.Error(), err)
+			}
+			opts.Quota = normalizedQuota
+		}
 	}
 	tenantID := token.NewID()
 	provisionStarted := time.Now()
@@ -5311,7 +5345,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	logProvisionStage(ctx, "provision_auto_embedding_profile_built", tenantID, provider, stageStarted, "enabled", autoProfile != nil)
 	stageStarted = time.Now()
-	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
+	pendingTenant := &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantPending,
 		DBHost:           "",
@@ -5324,11 +5358,34 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		SchemaVersion:    1,
 		CreatedAt:        now,
 		UpdatedAt:        now,
-	}); err != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_tenant_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+	}
+	var reservationErr error
+	if opts.TiDBCloudAccess != nil {
+		organizationID := opts.TiDBCloudAccess.OrganizationID
+		if opts.TiDBCloudAccess.IsFree {
+			quotaPatch, err := quotaConfigPatchFromRequest(*opts.Quota)
+			if err != nil {
+				return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to build free tenant quota", err)
+			}
+			reservationErr = s.meta.ReserveTiDBCloudFreeTenant(ctx, pendingTenant, organizationID, s.tidbCloudFreePlanLimits.TenantCount, quotaPatch)
+		} else {
+			reservationErr = s.meta.InsertTiDBCloudTenantReservation(ctx, pendingTenant, organizationID, nil)
+		}
+	} else {
+		reservationErr = s.meta.InsertTenant(ctx, pendingTenant)
+	}
+	if reservationErr != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_tenant_failed", "tenant_id", tenantID, "provider", provider, "error", reservationErr)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
 		metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "error")
-		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant", err)
+		switch {
+		case errors.Is(reservationErr, tenant.ErrTiDBCloudFreeTenantLimitReached):
+			return nil, newProvisionTenantError(http.StatusForbidden, tenant.ErrTiDBCloudFreeTenantLimitReached.Error(), reservationErr)
+		case errors.Is(reservationErr, tenant.ErrTiDBCloudFreeQuotaBusy):
+			return nil, newProvisionTenantError(http.StatusServiceUnavailable, tenant.ErrTiDBCloudFreeQuotaBusy.Error(), reservationErr)
+		default:
+			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant", reservationErr)
+		}
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "ok")
 	logProvisionStage(ctx, "provision_tenant_inserted", tenantID, provider, stageStarted, "status", meta.TenantPending)

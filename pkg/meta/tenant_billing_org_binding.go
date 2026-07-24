@@ -18,6 +18,64 @@ type TenantBillingOrgBinding struct {
 	UpdatedAt               time.Time
 }
 
+func (s *Store) InsertTiDBCloudTenantReservation(ctx context.Context, t *Tenant, organizationID string, quota *QuotaConfigPatch) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "insert_tidbcloud_tenant_reservation", start, &err)
+	if t == nil {
+		return fmt.Errorf("tenant is required")
+	}
+	organizationID = strings.TrimSpace(organizationID)
+	if organizationID == "" {
+		return fmt.Errorf("tidbcloud organization id is required")
+	}
+	if quota != nil {
+		if quota.MaxStorageBytes == nil || quota.MaxFileSizeBytes == nil || quota.MaxFileCount == nil || quota.TiDBCloudSpendingLimit == nil {
+			return fmt.Errorf("explicit tenant quota reservation is incomplete")
+		}
+	}
+	return withMetaLockConflictRetry(ctx, "insert_tidbcloud_tenant_reservation", func() error {
+		return s.InTx(ctx, func(tx *sql.Tx) error {
+			if err := insertTenantTx(ctx, tx, t); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO tenant_billing_org_bindings
+				(tenant_id, tidbcloud_organization_id) VALUES (?, ?)`, t.ID, organizationID); err != nil {
+				return err
+			}
+			if quota == nil {
+				return nil
+			}
+			_, err := tx.ExecContext(ctx, `INSERT INTO tenant_quota_config
+				(tenant_id, max_storage_bytes, max_file_size_bytes, max_file_count, tidbcloud_spending_limit)
+				VALUES (?, ?, ?, ?, ?)`, t.ID, *quota.MaxStorageBytes, *quota.MaxFileSizeBytes,
+				*quota.MaxFileCount, *quota.TiDBCloudSpendingLimit)
+			return err
+		})
+	})
+}
+
+func (s *Store) ReserveTiDBCloudFreeTenant(ctx context.Context, t *Tenant, organizationID string, maxTenants int, quota QuotaConfigPatch) error {
+	if maxTenants <= 0 {
+		return fmt.Errorf("free TiDB Cloud tenant limit must be positive")
+	}
+	if quota.MaxStorageBytes == nil || *quota.MaxStorageBytes <= 0 ||
+		quota.MaxFileSizeBytes == nil || *quota.MaxFileSizeBytes <= 0 ||
+		quota.MaxFileCount == nil || *quota.MaxFileCount <= 0 ||
+		quota.TiDBCloudSpendingLimit == nil || *quota.TiDBCloudSpendingLimit != 0 {
+		return fmt.Errorf("free TiDB Cloud tenant reservation requires explicit positive quotas and zero spending limit")
+	}
+	return s.WithTiDBCloudFreeQuotaLock(ctx, organizationID, func(ctx context.Context) error {
+		count, err := s.CountTiDBCloudFreeTenants(ctx, organizationID)
+		if err != nil {
+			return err
+		}
+		if count >= maxTenants {
+			return ErrTiDBCloudFreeTenantLimitReached
+		}
+		return s.InsertTiDBCloudTenantReservation(ctx, t, organizationID, &quota)
+	})
+}
+
 func (s *Store) UpsertTenantBillingOrgBinding(ctx context.Context, tenantID, organizationID string) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "upsert_tenant_billing_org_binding", start, &err)

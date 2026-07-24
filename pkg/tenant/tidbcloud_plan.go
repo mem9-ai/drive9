@@ -14,7 +14,7 @@ var (
 	ErrTiDBCloudFreeQuotaMutationForbidden = errors.New("quota updates are not available for free TiDB Cloud organizations")
 	ErrTiDBCloudFreeSpendingLimitForbidden = errors.New("positive spending limit is not available for free TiDB Cloud organizations")
 	ErrTiDBCloudFreeQuotaExceeded          = errors.New("requested quota exceeds the free TiDB Cloud organization limit")
-	ErrTiDBCloudFreeTenantLimitReached     = errors.New("free TiDB Cloud tenant limit reached")
+	ErrTiDBCloudFreeTenantLimitReached     = meta.ErrTiDBCloudFreeTenantLimitReached
 	ErrTiDBCloudFreeQuotaBusy              = meta.ErrTiDBCloudFreeQuotaBusy
 )
 

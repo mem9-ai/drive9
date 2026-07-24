@@ -21,13 +21,14 @@ import (
 )
 
 var (
-	ErrNotFound                 = errors.New("not found")
-	ErrDuplicate                = errors.New("duplicate entry")
-	ErrStorageQuotaExceeded     = errors.New("tenant storage quota exceeded")
-	ErrFileCountQuotaExceeded   = errors.New("tenant file count quota exceeded")
-	ErrReservationAlreadyExists = errors.New("upload reservation already exists")
-	ErrQuotaReservationBusy     = errors.New("quota reservation busy")
-	ErrTiDBCloudFreeQuotaBusy   = errors.New("free tenant quota check is busy; retry later")
+	ErrNotFound                        = errors.New("not found")
+	ErrDuplicate                       = errors.New("duplicate entry")
+	ErrStorageQuotaExceeded            = errors.New("tenant storage quota exceeded")
+	ErrFileCountQuotaExceeded          = errors.New("tenant file count quota exceeded")
+	ErrReservationAlreadyExists        = errors.New("upload reservation already exists")
+	ErrQuotaReservationBusy            = errors.New("quota reservation busy")
+	ErrTiDBCloudFreeQuotaBusy          = errors.New("free tenant quota check is busy; retry later")
+	ErrTiDBCloudFreeTenantLimitReached = errors.New("free TiDB Cloud tenant limit reached")
 )
 
 type TenantStatus string
@@ -1724,29 +1725,33 @@ func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
 	// fs_registry.tenant_id. The deadlock victim retries cleanly.
 	return withMetaLockConflictRetry(ctx, "insert_tenant", func() error {
 		return s.InTx(ctx, func(tx *sql.Tx) error {
-			_, err := tx.ExecContext(ctx, `INSERT INTO tenants
-			(id, status, kind, parent_tenant_id, storage_namespace_id, db_host, db_port, db_user, db_password, db_name, db_tls,
-			 provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
-			 s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				t.ID, t.Status, tenantKindForInsert(t), t.ParentTenantID, t.StorageNamespaceID,
-				t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
-				t.Provider, nullStr(t.ClusterID), t.BranchID, nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
-				tenantS3EncryptionModeForInsert(t), t.S3KMSKeyID, boolToInt(tenantS3BucketKeyEnabledForInsert(t)),
-				t.CreatedAt.UTC(), t.UpdatedAt.UTC())
-			if isDuplicateEntry(err) {
-				return ErrDuplicate
-			}
-			if err != nil {
-				return err
-			}
-			// Every tenant gets a stable internal fs_id at creation time (see
-			// fs_registry). INSERT IGNORE keeps this idempotent for tenants that
-			// were pre-registered by BackfillFsRegistry.
-			_, err = tx.ExecContext(ctx, `INSERT IGNORE INTO fs_registry (tenant_id) VALUES (?)`, t.ID)
-			return err
+			return insertTenantTx(ctx, tx, t)
 		})
 	})
+}
+
+func insertTenantTx(ctx context.Context, tx *sql.Tx, t *Tenant) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO tenants
+		(id, status, kind, parent_tenant_id, storage_namespace_id, db_host, db_port, db_user, db_password, db_name, db_tls,
+		 provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
+		 s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Status, tenantKindForInsert(t), t.ParentTenantID, t.StorageNamespaceID,
+		t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
+		t.Provider, nullStr(t.ClusterID), t.BranchID, nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
+		tenantS3EncryptionModeForInsert(t), t.S3KMSKeyID, boolToInt(tenantS3BucketKeyEnabledForInsert(t)),
+		t.CreatedAt.UTC(), t.UpdatedAt.UTC())
+	if isDuplicateEntry(err) {
+		return ErrDuplicate
+	}
+	if err != nil {
+		return err
+	}
+	// Every tenant gets a stable internal fs_id at creation time (see
+	// fs_registry). INSERT IGNORE keeps this idempotent for tenants that were
+	// pre-registered by BackfillFsRegistry.
+	_, err = tx.ExecContext(ctx, `INSERT IGNORE INTO fs_registry (tenant_id) VALUES (?)`, t.ID)
+	return err
 }
 
 func (s *Store) UpsertTenantAutoEmbeddingProfile(ctx context.Context, p *TenantAutoEmbeddingProfile) (err error) {

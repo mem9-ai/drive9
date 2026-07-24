@@ -220,7 +220,7 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		var pe *provisionTenantError
 		if errors.As(err, &pe) {
-			errJSON(w, pe.status, pe.message)
+			writeProvisionTenantError(w, pe)
 			return
 		}
 		errJSON(w, backendErrorStatus(r.Context(), err), "failed to provision tenant")

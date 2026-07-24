@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -2085,6 +2086,249 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	if string(plain) != "system-pass" {
 		t.Fatalf("tenant db password = %q, want system password", plain)
 	}
+}
+
+func TestProvisionFreeTiDBCloudTenantPersistsBindingAndExplicitQuota(t *testing.T) {
+	rt := newTiDBCloudFreeProvisionRuntime(t, 3)
+	resp := rt.postProvision(t, map[string]any{
+		"public_key":  "public-1",
+		"private_key": "private-1",
+	})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 202: %s", resp.StatusCode, body)
+	}
+	var out map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := out["tenant_id"]
+	binding, err := rt.meta.GetTenantBillingOrgBinding(context.Background(), tenantID)
+	if err != nil || binding.TiDBCloudOrganizationID != "org-free" {
+		t.Fatalf("billing binding = %+v, err=%v", binding, err)
+	}
+	cfg, err := rt.meta.GetQuotaConfig(context.Background(), tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxStorageBytes != DefaultTiDBCloudFreeMaxStorageBytes ||
+		cfg.MaxFileSizeBytes != DefaultTiDBCloudFreeMaxFileSizeBytes ||
+		cfg.MaxFileCount != DefaultTiDBCloudFreeMaxFileCount ||
+		cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != 0 {
+		t.Fatalf("free quota = %+v", cfg)
+	}
+	if rt.provisioner.lastCreateQuotaOptions.TiDBCloudSpendingLimitMonthly == nil || *rt.provisioner.lastCreateQuotaOptions.TiDBCloudSpendingLimitMonthly != 0 {
+		t.Fatalf("create spending limit = %+v, want explicit zero", rt.provisioner.lastCreateQuotaOptions.TiDBCloudSpendingLimitMonthly)
+	}
+}
+
+func TestProvisionFreeTiDBCloudTenantRejectsDisallowedQuotaBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name string
+		body map[string]any
+		want string
+	}{
+		{
+			name: "positive spending",
+			body: map[string]any{"tidbcloud_spending_limit": int64(10)},
+			want: tenant.ErrTiDBCloudFreeSpendingLimitForbidden.Error(),
+		},
+		{
+			name: "storage over cap",
+			body: map[string]any{"max_storage_size": int64(3073)},
+			want: tenant.ErrTiDBCloudFreeQuotaExceeded.Error(),
+		},
+		{
+			name: "unlimited file count",
+			body: map[string]any{"max_file_count": int64(0)},
+			want: tenant.ErrTiDBCloudFreeQuotaExceeded.Error(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := newTiDBCloudFreeProvisionRuntime(t, 3)
+			tt.body["public_key"] = "public-1"
+			tt.body["private_key"] = "private-1"
+			resp := rt.postProvision(t, tt.body)
+			defer func() { _ = resp.Body.Close() }()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusForbidden || strings.TrimSpace(string(body)) != fmt.Sprintf(`{"error":%q}`, tt.want) {
+				t.Fatalf("response = %d %s, want 403 %q", resp.StatusCode, body, tt.want)
+			}
+			var tenantRows int
+			if err := rt.meta.DB().QueryRow(`SELECT COUNT(*) FROM tenants`).Scan(&tenantRows); err != nil {
+				t.Fatal(err)
+			}
+			if tenantRows != 0 || rt.provisioner.credentialCalls.Load() != 0 || rt.provisioner.credentialQuotaCalls.Load() != 0 {
+				t.Fatalf("mutation after rejection: tenants=%d credential=%d quota=%d", tenantRows, rt.provisioner.credentialCalls.Load(), rt.provisioner.credentialQuotaCalls.Load())
+			}
+		})
+	}
+}
+
+func TestProvisionFreeTiDBCloudTenantEnforcesConfiguredTenantLimit(t *testing.T) {
+	rt := newTiDBCloudFreeProvisionRuntime(t, 1)
+	first := rt.postProvision(t, map[string]any{"public_key": "public-1", "private_key": "private-1"})
+	defer func() { _ = first.Body.Close() }()
+	if first.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(first.Body)
+		t.Fatalf("first status = %d, want 202: %s", first.StatusCode, body)
+	}
+	second := rt.postProvision(t, map[string]any{"public_key": "public-1", "private_key": "private-1"})
+	defer func() { _ = second.Body.Close() }()
+	body, err := io.ReadAll(second.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.StatusCode != http.StatusForbidden || strings.TrimSpace(string(body)) != fmt.Sprintf(`{"error":%q}`, tenant.ErrTiDBCloudFreeTenantLimitReached.Error()) {
+		t.Fatalf("second response = %d %s", second.StatusCode, body)
+	}
+	count, err := rt.meta.CountTiDBCloudFreeTenants(context.Background(), "org-free")
+	if err != nil || count != 1 {
+		t.Fatalf("free count = %d, err=%v, want 1", count, err)
+	}
+}
+
+func TestProvisionNonFreeTiDBCloudTenantPersistsBillingBinding(t *testing.T) {
+	rt := newTiDBCloudFreeProvisionRuntime(t, 3)
+	rt.provisioner.billingFree = false
+	resp := rt.postProvision(t, map[string]any{"public_key": "public-1", "private_key": "private-1"})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 202: %s", resp.StatusCode, body)
+	}
+	var out map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := rt.meta.GetTenantBillingOrgBinding(context.Background(), out["tenant_id"])
+	if err != nil || binding.TiDBCloudOrganizationID != "org-free" {
+		t.Fatalf("billing binding = %+v, err=%v", binding, err)
+	}
+}
+
+func TestProvisionTiDBCloudBillingFailurePrecedesTenantMutation(t *testing.T) {
+	rt := newTiDBCloudFreeProvisionRuntime(t, 3)
+	rt.provisioner.billingErr = tenant.ErrTiDBCloudBillingUnavailable
+	resp := rt.postProvision(t, map[string]any{"public_key": "public-1", "private_key": "private-1"})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadGateway {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 502: %s", resp.StatusCode, body)
+	}
+	var tenantRows int
+	if err := rt.meta.DB().QueryRow(`SELECT COUNT(*) FROM tenants`).Scan(&tenantRows); err != nil {
+		t.Fatal(err)
+	}
+	if tenantRows != 0 || rt.provisioner.credentialCalls.Load() != 0 || rt.provisioner.credentialQuotaCalls.Load() != 0 {
+		t.Fatalf("mutation after Billing failure: tenants=%d credential=%d quota=%d", tenantRows, rt.provisioner.credentialCalls.Load(), rt.provisioner.credentialQuotaCalls.Load())
+	}
+}
+
+func TestWriteProvisionTenantErrorMapsFreeQuotaBusyToRetryable503(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeProvisionTenantError(recorder, newProvisionTenantError(
+		http.StatusServiceUnavailable,
+		tenant.ErrTiDBCloudFreeQuotaBusy.Error(),
+		tenant.ErrTiDBCloudFreeQuotaBusy,
+	))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+	if recorder.Header().Get("Retry-After") != "1" {
+		t.Fatalf("Retry-After = %q, want 1", recorder.Header().Get("Retry-After"))
+	}
+	if got, want := strings.TrimSpace(recorder.Body.String()), fmt.Sprintf(`{"error":%q}`, tenant.ErrTiDBCloudFreeQuotaBusy.Error()); got != want {
+		t.Fatalf("body = %s, want %s", got, want)
+	}
+}
+
+type tiDBCloudFreeProvisionRuntime struct {
+	meta        *meta.Store
+	provisioner *fakeProvisioner
+	server      *Server
+	httpServer  *httptest.Server
+}
+
+func newTiDBCloudFreeProvisionRuntime(t *testing.T, tenantLimit int) *tiDBCloudFreeProvisionRuntime {
+	t.Helper()
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(pool.Close)
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	provisioner := &fakeProvisioner{
+		provider:      tenant.ProviderTiDBCloudNative,
+		cloudProvider: "aws",
+		region:        "us-east-1",
+		identityOrg:   "org-free",
+		billingFree:   true,
+		cluster: &tenant.ClusterInfo{
+			ClusterID:      "native-free-cluster",
+			OrganizationID: "org-free",
+			Host:           "db.example",
+			Port:           4000,
+			Username:       "u1.root",
+			Password:       "db-pass",
+			DBName:         "customer_db",
+		},
+	}
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  provisioner,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+		TiDBCloudFreePlanLimits: TiDBCloudFreePlanLimits{
+			TenantCount:      tenantLimit,
+			MaxStorageBytes:  DefaultTiDBCloudFreeMaxStorageBytes,
+			MaxFileSizeBytes: DefaultTiDBCloudFreeMaxFileSizeBytes,
+			MaxFileCount:     DefaultTiDBCloudFreeMaxFileCount,
+		},
+	})
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+	return &tiDBCloudFreeProvisionRuntime{meta: metaStore, provisioner: provisioner, server: srv, httpServer: ts}
+}
+
+func (rt *tiDBCloudFreeProvisionRuntime) postProvision(t *testing.T, body map[string]any) *http.Response {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, rt.httpServer.URL+"/v1/provision", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
 }
 
 func TestProvisionTiDBCloudNativeCreateQuotaSkipsQuotaPatch(t *testing.T) {
