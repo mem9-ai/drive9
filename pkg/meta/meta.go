@@ -2323,6 +2323,22 @@ func (s *Store) listFreeTenantPoolBindings(ctx context.Context, organizationID s
 }
 
 func (s *Store) ClaimOldestFreeTenantPoolBinding(ctx context.Context, organizationID string) (out *TenantWithTiDBCloudOrgBinding, err error) {
+	return s.ClaimOldestFreeTenantPoolBindingForCustomer(ctx, organizationID, "", QuotaConfigPatch{})
+}
+
+func (s *Store) ClaimOldestFreeTenantPoolBindingForCustomer(ctx context.Context, organizationID, billingOrganizationID string, quota QuotaConfigPatch) (out *TenantWithTiDBCloudOrgBinding, err error) {
+	return s.claimFreeTenantPoolBindingForCustomer(ctx, organizationID, "", billingOrganizationID, quota)
+}
+
+func (s *Store) ClaimFreeTenantPoolBindingForCustomer(ctx context.Context, organizationID, tenantID, billingOrganizationID string, quota QuotaConfigPatch) (out *TenantWithTiDBCloudOrgBinding, err error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant_id is required")
+	}
+	return s.claimFreeTenantPoolBindingForCustomer(ctx, organizationID, tenantID, billingOrganizationID, quota)
+}
+
+func (s *Store) claimFreeTenantPoolBindingForCustomer(ctx context.Context, organizationID, tenantID, billingOrganizationID string, quota QuotaConfigPatch) (out *TenantWithTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "claim_free_tidbcloud_pool_binding", start, &err)
 	organizationID = strings.TrimSpace(organizationID)
@@ -2339,13 +2355,29 @@ func (s *Store) ClaimOldestFreeTenantPoolBinding(ctx context.Context, organizati
 			FROM tenant_tidbcloud_org_bindings b
 			JOIN tenants t ON t.id = b.tenant_id
 				WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
-					AND t.status = ?
+					AND t.status = ?`
+		args := []any{organizationID, TenantPoolBindingFree, tidbCloudNativeProvider, TenantActive}
+		if tenantID != "" {
+			query += ` AND t.id = ?`
+			args = append(args, tenantID)
+		}
+		query += `
 				ORDER BY b.created_at ASC, b.tenant_id ASC
 				LIMIT 1 FOR UPDATE`
-		row := tx.QueryRowContext(ctx, query, organizationID, TenantPoolBindingFree, tidbCloudNativeProvider, TenantActive)
+		row := tx.QueryRowContext(ctx, query, args...)
 		rec, scanErr := scanTenantBindingRow(row)
 		if scanErr != nil {
 			return scanErr
+		}
+		if strings.TrimSpace(billingOrganizationID) != "" {
+			if err := ensureTenantBillingOrgBindingTx(ctx, tx, rec.Tenant.ID, billingOrganizationID); err != nil {
+				return err
+			}
+		}
+		if quota.AnySet() {
+			if err := upsertTenantQuotaPatchTx(ctx, tx, rec.Tenant.ID, quota); err != nil {
+				return err
+			}
 		}
 		now := time.Now().UTC()
 		res, execErr := tx.ExecContext(ctx, `UPDATE tenant_tidbcloud_org_bindings

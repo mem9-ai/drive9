@@ -174,7 +174,7 @@ func TestDefaultTenantProviderIsIndependentFromProvisionerType(t *testing.T) {
 	}
 }
 
-func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsPending(t *testing.T) {
+func TestProvisionFreeTiDBCloudNativeSharedUsesCustomerQuotaAndSharedPhysicalSpending(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -199,6 +199,7 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsPending(t *test
 		defaultPublicKey: "public", defaultPrivateKey: "private",
 		defaultSharedPublicKey: "shared-public", defaultSharedPrivateKey: "shared-private",
 		identityOrg:             "customer-org",
+		billingFree:             true,
 		sharedPoolBatchRequests: make(chan []tenant.SharedDBPoolCreateRequest, 1),
 		sharedPoolResults: []*tenant.SharedDBPoolInfo{{
 			ClusterID: "cluster-shared", OrganizationID: "physical-org", Password: "root-pass", DBName: "tidbcloud_fs",
@@ -215,10 +216,8 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsPending(t *test
 		TokenSecret:           tokenSecret,
 	})
 	defer srv.Close()
-	virtualLimit := int64(2000)
 	res, err := srv.provisionTenant(context.Background(), provisionTenantOptions{
 		CredentialProvisioner: &tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"},
-		Quota:                 &quotaRequest{quotaFields: quotaFields{TiDBCloudSpendingLimit: &virtualLimit}},
 	})
 	if err != nil {
 		t.Fatalf("provisionTenant: %v", err)
@@ -254,12 +253,19 @@ func TestProvisionTiDBCloudNativeSharedPlansManagedPoolAndReturnsPending(t *test
 	if dbPool.TiDBCloudOrganizationID != "customer-org" {
 		t.Fatalf("managed pool organization ID = %q, want customer-org", dbPool.TiDBCloudOrganizationID)
 	}
+	billingBinding, err := metaStore.GetTenantBillingOrgBinding(context.Background(), res.TenantID)
+	if err != nil || billingBinding.TiDBCloudOrganizationID != "customer-org" {
+		t.Fatalf("customer billing binding = %+v, err=%v", billingBinding, err)
+	}
 	quota, err := metaStore.GetQuotaConfig(context.Background(), res.TenantID)
 	if err != nil {
 		t.Fatalf("GetQuotaConfig: %v", err)
 	}
-	if quota.TiDBCloudSpendingLimit == nil || *quota.TiDBCloudSpendingLimit != virtualLimit {
-		t.Fatalf("virtual spending limit = %#v, want %d", quota.TiDBCloudSpendingLimit, virtualLimit)
+	if quota.MaxStorageBytes != DefaultTiDBCloudFreeMaxStorageBytes ||
+		quota.MaxFileSizeBytes != DefaultTiDBCloudFreeMaxFileSizeBytes ||
+		quota.MaxFileCount != DefaultTiDBCloudFreeMaxFileCount ||
+		quota.TiDBCloudSpendingLimit == nil || *quota.TiDBCloudSpendingLimit != 0 {
+		t.Fatalf("free logical tenant quota = %+v", quota)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for prov.sharedPoolBatchCalls.Load() == 0 && time.Now().Before(deadline) {

@@ -128,6 +128,86 @@ func (s *Store) CountTiDBCloudFreeTenants(ctx context.Context, organizationID st
 	return count, err
 }
 
+func (s *Store) IsTiDBCloudFreeTenantCounted(ctx context.Context, tenantID, organizationID string) (counted bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "is_tidbcloud_free_tenant_counted", start, &err)
+	err = s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM tenant_billing_org_bindings b
+		JOIN tenants t ON t.id = b.tenant_id
+		JOIN tenant_quota_config q ON q.tenant_id = t.id
+		WHERE b.tenant_id = ? AND b.tidbcloud_organization_id = ?
+			AND t.status <> ? AND q.tidbcloud_spending_limit = 0)`,
+		strings.TrimSpace(tenantID), strings.TrimSpace(organizationID), TenantDeleted).Scan(&counted)
+	return counted, err
+}
+
+func ensureTenantBillingOrgBindingTx(ctx context.Context, tx *sql.Tx, tenantID, organizationID string) error {
+	tenantID = strings.TrimSpace(tenantID)
+	organizationID = strings.TrimSpace(organizationID)
+	if tenantID == "" || organizationID == "" {
+		return fmt.Errorf("tenant id and tidbcloud organization id are required")
+	}
+	var existing string
+	err := tx.QueryRowContext(ctx, `SELECT tidbcloud_organization_id
+		FROM tenant_billing_org_bindings WHERE tenant_id = ? FOR UPDATE`, tenantID).Scan(&existing)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = tx.ExecContext(ctx, `INSERT INTO tenant_billing_org_bindings
+			(tenant_id, tidbcloud_organization_id) VALUES (?, ?)`, tenantID, organizationID)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(existing) != organizationID {
+		return fmt.Errorf("tenant billing organization is immutable: have %q, got %q", existing, organizationID)
+	}
+	return nil
+}
+
+func upsertTenantQuotaPatchTx(ctx context.Context, tx *sql.Tx, tenantID string, patch QuotaConfigPatch) error {
+	insertStorage := DefaultMaxStorageBytes()
+	if patch.MaxStorageBytes != nil {
+		insertStorage = *patch.MaxStorageBytes
+	}
+	insertFileSize := DefaultMaxFileSizeBytes()
+	if patch.MaxFileSizeBytes != nil {
+		insertFileSize = *patch.MaxFileSizeBytes
+	}
+	insertFileCount := DefaultMaxFileCount()
+	if patch.MaxFileCount != nil {
+		insertFileCount = *patch.MaxFileCount
+	}
+	updateStorage := sql.NullInt64{}
+	if patch.MaxStorageBytes != nil {
+		updateStorage = sql.NullInt64{Int64: *patch.MaxStorageBytes, Valid: true}
+	}
+	updateFileSize := sql.NullInt64{}
+	if patch.MaxFileSizeBytes != nil {
+		updateFileSize = sql.NullInt64{Int64: *patch.MaxFileSizeBytes, Valid: true}
+	}
+	updateFileCount := sql.NullInt64{}
+	if patch.MaxFileCount != nil {
+		updateFileCount = sql.NullInt64{Int64: *patch.MaxFileCount, Valid: true}
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO tenant_quota_config
+		(tenant_id, max_storage_bytes, max_file_size_bytes, max_file_count,
+		 tidbcloud_spending_limit, tidbcloud_spending_limit_checked_at,
+		 max_media_llm_files, max_video_llm_files)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+		 max_storage_bytes = COALESCE(?, max_storage_bytes),
+		 max_file_size_bytes = COALESCE(?, max_file_size_bytes),
+		 max_file_count = COALESCE(?, max_file_count),
+		 tidbcloud_spending_limit = COALESCE(?, tidbcloud_spending_limit),
+		 tidbcloud_spending_limit_checked_at = COALESCE(?, tidbcloud_spending_limit_checked_at)`,
+		tenantID, insertStorage, insertFileSize, insertFileCount,
+		nullInt64FromPtr(patch.TiDBCloudSpendingLimit), nullTimeFromPtr(patch.TiDBCloudSpendingLimitCheckedAt),
+		DefaultMaxMediaLLMFiles(), DefaultMaxVideoLLMFiles(),
+		updateStorage, updateFileSize, updateFileCount,
+		nullInt64FromPtr(patch.TiDBCloudSpendingLimit), nullTimeFromPtr(patch.TiDBCloudSpendingLimitCheckedAt))
+	return err
+}
+
 func (s *Store) WithTiDBCloudFreeQuotaLock(ctx context.Context, organizationID string, fn func(context.Context) error) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "tidbcloud_free_quota_lock", start, &err)

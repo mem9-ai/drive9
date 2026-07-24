@@ -67,6 +67,175 @@ func TestRetryTenantPoolClaimCASDoesNotRetryBusinessError(t *testing.T) {
 	}
 }
 
+func TestFreeTenantPoolClaimRejectsUncountedCandidateAtLimit(t *testing.T) {
+	rt, candidateID := newFreeNativePoolClaimRuntime(t, "org-free-claim-limit")
+	ctx := context.Background()
+	zero := int64(0)
+	if err := rt.meta.UpsertTenantBillingOrgBinding(ctx, rt.tenantID, "org-free-claim-limit"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.SetQuotaConfigPatch(ctx, rt.tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimit: &zero}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, _, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx,
+		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}, nil)
+	if !errors.Is(err, tenant.ErrTiDBCloudFreeTenantLimitReached) {
+		t.Fatalf("claim error = %v, want tenant limit", err)
+	}
+	if res != nil || claimed {
+		t.Fatalf("claim result = %+v claimed=%v, want rejection", res, claimed)
+	}
+	if _, err := rt.meta.GetTenantBillingOrgBinding(ctx, candidateID); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("candidate billing binding error = %v, want not found", err)
+	}
+	binding, err := rt.meta.GetTenantTiDBCloudOrgBinding(ctx, candidateID)
+	if err != nil || binding.PoolStatus != meta.TenantPoolBindingFree {
+		t.Fatalf("candidate pool binding = %+v, err=%v, want free", binding, err)
+	}
+}
+
+func TestFreeTenantPoolClaimAllowsCandidateAlreadyCountedAtLimitAndClampsQuota(t *testing.T) {
+	rt, candidateID := newFreeNativePoolClaimRuntime(t, "org-free-claim-counted")
+	ctx := context.Background()
+	zero := int64(0)
+	historicalStorage := int64(50 << 30)
+	if err := rt.meta.UpsertTenantBillingOrgBinding(ctx, candidateID, "org-free-claim-counted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.SetQuotaConfigPatch(ctx, candidateID, meta.QuotaConfigPatch{
+		MaxStorageBytes: &historicalStorage, TiDBCloudSpendingLimit: &zero,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, _, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx,
+		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}, nil)
+	if err != nil || !claimed || res == nil || res.TenantID != candidateID {
+		t.Fatalf("claim result = %+v claimed=%v err=%v", res, claimed, err)
+	}
+	cfg, err := rt.meta.GetQuotaConfig(ctx, candidateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxStorageBytes != DefaultTiDBCloudFreeMaxStorageBytes ||
+		cfg.MaxFileSizeBytes != DefaultTiDBCloudFreeMaxFileSizeBytes ||
+		cfg.MaxFileCount != DefaultTiDBCloudFreeMaxFileCount ||
+		cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != 0 {
+		t.Fatalf("claimed free quota = %+v", cfg)
+	}
+}
+
+func TestFreeTenantPoolClaimWithHeadroomEstablishesBillingBinding(t *testing.T) {
+	rt, candidateID := newFreeNativePoolClaimRuntime(t, "org-free-claim-headroom")
+	ctx := context.Background()
+	res, _, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx,
+		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}, nil)
+	if err != nil || !claimed || res == nil || res.TenantID != candidateID {
+		t.Fatalf("claim result = %+v claimed=%v err=%v", res, claimed, err)
+	}
+	binding, err := rt.meta.GetTenantBillingOrgBinding(ctx, candidateID)
+	if err != nil || binding.TiDBCloudOrganizationID != "org-free-claim-headroom" {
+		t.Fatalf("billing binding = %+v, err=%v", binding, err)
+	}
+	count, err := rt.meta.CountTiDBCloudFreeTenants(ctx, "org-free-claim-headroom")
+	if err != nil || count != 1 {
+		t.Fatalf("free count = %d, err=%v, want 1", count, err)
+	}
+}
+
+func TestFreeSharedTenantPoolClaimEstablishesBillingBindingAndQuota(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.server.defaultTenantProvider = tenant.ProviderTiDBCloudNativeShared
+	rt.prov.billingFree = true
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: "org-free-shared-claim", Role: tenant.TiDBCloudRoleOrgOwner,
+	}}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const poolID = "pool-free-shared-claim"
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
+		PoolID: poolID, OrganizationID: "org-free-shared-claim", Size: 1,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	passwordCipher, err := rt.server.pool.Encrypt(ctx, []byte("shared-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbID, err := rt.meta.RegisterSharedDB(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-free-shared-claim", Host: "shared.example.com", Port: 4000,
+		User: "root", PasswordCipher: passwordCipher, Name: "shared_db", MaxTenants: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const tenantID = "free-shared-claim-tenant"
+	if err := rt.server.insertPendingPoolTenant(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.server.materializeSharedTenantQuota(ctx, tenantID, provisionTenantOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	fsID, err := rt.meta.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.CompleteSharedTenantPoolMember(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared,
+		&meta.TenantPlacement{FsID: fsID, DbID: dbID, Placement: meta.PlacementShared,
+			SchemaShape: meta.SchemaShapeShared, Status: meta.SharedDBStatusActive},
+		&meta.TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: "org-free-shared-claim",
+			PoolID: poolID, PoolStatus: meta.TenantPoolBindingFree, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, _, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx,
+		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}, nil)
+	if err != nil || !claimed || res == nil || res.TenantID != tenantID {
+		t.Fatalf("claim result = %+v claimed=%v err=%v", res, claimed, err)
+	}
+	binding, err := rt.meta.GetTenantBillingOrgBinding(ctx, tenantID)
+	if err != nil || binding.TiDBCloudOrganizationID != "org-free-shared-claim" {
+		t.Fatalf("billing binding = %+v, err=%v", binding, err)
+	}
+	cfg, err := rt.meta.GetQuotaConfig(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxStorageBytes != DefaultTiDBCloudFreeMaxStorageBytes ||
+		cfg.MaxFileSizeBytes != DefaultTiDBCloudFreeMaxFileSizeBytes ||
+		cfg.MaxFileCount != DefaultTiDBCloudFreeMaxFileCount ||
+		cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != 0 {
+		t.Fatalf("free shared claim quota = %+v", cfg)
+	}
+}
+
+func newFreeNativePoolClaimRuntime(t *testing.T, organizationID string) (*quotaRuntime, string) {
+	t.Helper()
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.billingFree = true
+	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
+		OrganizationID: organizationID, Role: tenant.TiDBCloudRoleOrgOwner,
+	}}
+	rt.server.tidbCloudFreePlanLimits = TiDBCloudFreePlanLimits{
+		TenantCount:      1,
+		MaxStorageBytes:  DefaultTiDBCloudFreeMaxStorageBytes,
+		MaxFileSizeBytes: DefaultTiDBCloudFreeMaxFileSizeBytes,
+		MaxFileCount:     DefaultTiDBCloudFreeMaxFileCount,
+	}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	poolID := "pool-" + organizationID
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
+		PoolID: poolID, OrganizationID: organizationID, Size: 1,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return rt, insertAdminPoolFreeTenant(t, rt, poolID, organizationID, 1)
+}
+
 func TestTenantPoolClaimUsesNativeInventoryBeforeExternalSharedPool(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()

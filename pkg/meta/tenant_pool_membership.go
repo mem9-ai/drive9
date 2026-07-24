@@ -323,6 +323,10 @@ func (s *Store) DetachUsedTenantPoolMemberships(ctx context.Context, poolID stri
 // ClaimSharedTenantPoolMembership atomically finalizes a free shared member:
 // virtual quota patch, membership CAS, and owner key.
 func (s *Store) ClaimSharedTenantPoolMembership(ctx context.Context, tenantID, poolID string, patch QuotaConfigPatch, k *APIKey) (err error) {
+	return s.ClaimSharedTenantPoolMembershipForCustomer(ctx, tenantID, poolID, "", patch, k)
+}
+
+func (s *Store) ClaimSharedTenantPoolMembershipForCustomer(ctx context.Context, tenantID, poolID, billingOrganizationID string, patch QuotaConfigPatch, k *APIKey) (err error) {
 	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(poolID) == "" || k == nil {
 		return fmt.Errorf("tenant id, pool id, and api key are required")
 	}
@@ -344,6 +348,11 @@ func (s *Store) ClaimSharedTenantPoolMembership(ctx context.Context, tenantID, p
 				return ErrNotFound
 			}
 			return err
+		}
+		if strings.TrimSpace(billingOrganizationID) != "" {
+			if err := ensureTenantBillingOrgBindingTx(ctx, tx, tenantID, billingOrganizationID); err != nil {
+				return err
+			}
 		}
 		var storage, fileSize, fileCount int64
 		var spending sql.NullInt64
