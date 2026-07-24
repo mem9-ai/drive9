@@ -560,7 +560,7 @@ func (s *Store) FindSharedDBForEmergency(ctx context.Context, organizationID str
 }
 
 // RegisterSharedDB registers a physical database in db_pool, upserting on the
-// uk_db_pool_endpoint (org_id, db_host, db_name) natural key. On a duplicate
+// uk_db_pool_endpoint (org_id, db_host, db_name, db_user) natural key. On a duplicate
 // endpoint the connection fields are refreshed and tenant_count is preserved;
 // the existing db_id is re-fetched and returned.
 func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64, err error) {
@@ -622,8 +622,8 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 	// ON DUPLICATE KEY UPDATE does not reliably report the existing
 	// auto-increment id via LastInsertId, so re-fetch by endpoint.
 	err = s.db.QueryRowContext(ctx,
-		`SELECT db_id FROM db_pool WHERE org_id = ? AND db_host = ? AND db_name = ?`,
-		organizationID, in.Host, in.Name).Scan(&dbID)
+		`SELECT db_id FROM db_pool WHERE org_id = ? AND db_host = ? AND db_name = ? AND db_user = ?`,
+		organizationID, in.Host, in.Name, in.User).Scan(&dbID)
 	if err != nil {
 		return 0, fmt.Errorf("resolve db_id after upsert: %w", err)
 	}

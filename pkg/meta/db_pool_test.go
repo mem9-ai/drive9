@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -275,7 +276,7 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 		TiDBCloudOrganizationID: "org-a",
 		Host:                    "shared-a.example.com",
 		Port:                    5000,
-		User:                    "app",
+		User:                    "root",
 		PasswordCipher:          []byte("rotated-cipher"),
 		Name:                    "shared_db_a",
 		TLSMode:                 "true",
@@ -292,7 +293,7 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSharedDB: %v", err)
 	}
-	if got.Port != 5000 || got.User != "app" || string(got.PasswordCipher) != "rotated-cipher" ||
+	if got.Port != 5000 || got.User != "root" || string(got.PasswordCipher) != "rotated-cipher" ||
 		got.MaxTenants != 200 || got.TLSMode != "true" {
 		t.Fatalf("upsert did not refresh connection fields: %+v", got)
 	}
@@ -1004,6 +1005,42 @@ func TestManagedSharedDBPoolCloudResultSchemaAndActivation(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].ID != dbID {
 		t.Fatalf("active rows = %+v, want db %d", rows, dbID)
+	}
+}
+
+func TestManagedSharedDBPoolsAllowSameEndpointWithDifferentUsers(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	ids := make([]int64, 0, 2)
+	for i := 0; i < 2; i++ {
+		dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+			TiDBCloudOrganizationID: "org-shared-endpoint", ProvisioningKey: make([]byte, 32),
+			CloudProvider: "tencentcloud", Region: "ap-beijing", MaxTenants: 100,
+			SpendingLimit: &spendingLimit, PasswordCipher: []byte("root-cipher"), Name: "tidbcloud_fs",
+		})
+		if err != nil {
+			t.Fatalf("CreateManagedSharedDBPool %d: %v", i, err)
+		}
+		ids = append(ids, dbID)
+	}
+	for i, dbID := range ids {
+		if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, &SharedDB{
+			ID: dbID, TiDBCloudOrganizationID: "org-shared-endpoint", ClusterID: fmt.Sprintf("cluster-%d", i),
+			Host: "10.4.48.2", Port: 4000, User: fmt.Sprintf("prefix-%d.root", i),
+			PasswordCipher: []byte("root-cipher"), Name: "tidbcloud_fs", TLSMode: "skip-verify",
+		}); err != nil {
+			t.Fatalf("UpdateManagedSharedDBPoolCloudResult %d: %v", i, err)
+		}
+	}
+	for i, dbID := range ids {
+		got, err := s.GetSharedDB(ctx, dbID)
+		if err != nil {
+			t.Fatalf("GetSharedDB %d: %v", i, err)
+		}
+		if got.Status != SharedDBStatusProvisioning || got.User != fmt.Sprintf("prefix-%d.root", i) {
+			t.Fatalf("shared db %d = status %q user %q, want provisioning/prefix-%d.root", i, got.Status, got.User, i)
+		}
 	}
 }
 
