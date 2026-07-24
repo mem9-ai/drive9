@@ -22,7 +22,6 @@ const (
 	defaultManagedSharedDBMaxTenants = 100
 	defaultSharedTenantSpendingLimit = int64(1000)
 	sharedTenantActivationBatchSize  = 100
-	managedSharedDBContinuationLimit = 100
 )
 
 var errSharedDBConnectionMetadataNotReady = errors.New("shared DB pool connection metadata is not ready")
@@ -277,168 +276,473 @@ func (s *Server) scheduleManagedSharedDBContinuation(ctx context.Context, dbID i
 	s.scheduleManagedSharedDBContinuations(ctx, []int64{dbID})
 }
 
-// scheduleManagedSharedDBContinuations retries one request batch in rounds.
-// Each pool gets one concurrent, non-blocking continuation attempt per round;
-// metadata readiness is polled every 15 seconds with bounded concurrency.
 func (s *Server) scheduleManagedSharedDBContinuations(ctx context.Context, dbIDs []int64) {
 	if len(dbIDs) == 0 {
 		return
 	}
 	ids := append([]int64(nil), dbIDs...)
 	slices.Sort(ids)
-	s.startServerWorker(ctx, func(workerCtx context.Context) {
-		states := make([]managedSharedDBContinuation, 0, len(ids))
-		for _, dbID := range ids {
-			if workerCtx.Err() != nil {
-				return
-			}
-			states = append(states, s.managedSharedDBContinuation(workerCtx, dbID))
-		}
-		retryManagedSharedDBContinuations(workerCtx, states)
-		for i := range states {
-			if !states[i].done && states[i].lastErr != nil && states[i].ctx.Err() == nil {
-				logger.Warn(states[i].ctx, "managed_shared_db_pool_continue_failed", zap.Error(states[i].lastErr))
-			}
-		}
+	s.startManagedSharedDBWorker(ctx, func(workerCtx context.Context) {
+		s.runManagedSharedDBContinuations(workerCtx, ids)
 	})
 }
 
-type managedSharedDBContinuation struct {
-	ctx          context.Context
-	continuePool func() error
-	done         bool
-	lastErr      error
-}
-
-func (s *Server) managedSharedDBContinuation(ctx context.Context, dbID int64) managedSharedDBContinuation {
-	poolCtx := ctx
-	if poolInfo, err := s.meta.GetSharedDB(ctx, dbID); err == nil {
-		poolCtx = logger.WithContext(ctx, logger.FromContext(ctx).With(
-			zap.Int64("db_pool_id", poolInfo.ID),
-			zap.String("db_pool_uuid", poolInfo.UUID),
-			zap.String("tidbcloud_org_id", poolInfo.TiDBCloudOrganizationID),
-		))
+func (s *Server) startManagedSharedDBWorker(ctx context.Context, fn func(context.Context)) bool {
+	if s.leader == nil {
+		return s.startServerWorker(ctx, fn)
 	}
-	return managedSharedDBContinuation{ctx: poolCtx, continuePool: func() error {
-		poolInfo, err := s.meta.GetSharedDB(poolCtx, dbID)
+	s.leaderWorkerMu.Lock()
+	if !s.leaderWorkersStarted || !s.leader.IsLeader() || s.leaderWorkerCtx == nil {
+		s.leaderWorkerMu.Unlock()
+		return false
+	}
+	workerCtx := contextWithTrace(s.leaderWorkerCtx, ctx)
+	s.leaderWorkerWG.Add(1)
+	s.leaderWorkerMu.Unlock()
+	go func() {
+		defer s.leaderWorkerWG.Done()
+		fn(workerCtx)
+	}()
+	return true
+}
+
+func (s *Server) runManagedSharedDBContinuations(ctx context.Context, dbIDs []int64) {
+	pendingWithoutCluster := make([]int64, 0, len(dbIDs))
+	for _, dbID := range dbIDs {
+		row, err := s.meta.GetSharedDB(ctx, dbID)
 		if err != nil {
-			return err
+			logger.Warn(ctx, "managed_shared_db_pool_continue_load_failed", zap.Int64("db_pool_id", dbID), zap.Error(err))
+			continue
 		}
-		if poolInfo.Status != meta.SharedDBStatusPending && poolInfo.Status != meta.SharedDBStatusProvisioning {
-			return nil
+		if row.Status == meta.SharedDBStatusPending && strings.TrimSpace(row.ClusterID) == "" {
+			pendingWithoutCluster = append(pendingWithoutCluster, dbID)
 		}
-		return s.continueManagedSharedDBPoolOnce(poolCtx, dbID)
-	}}
-}
+	}
+	if len(pendingWithoutCluster) > 0 {
+		cred, err := s.sharedDBCloudCredentials()
+		if err != nil {
+			logger.Warn(ctx, "managed_shared_db_pool_create_credentials_failed", zap.Error(err))
+		} else if _, err := s.provisionManagedSharedDBPoolsBatchWithCredentials(ctx, pendingWithoutCluster, cred); err != nil {
+			logger.Warn(ctx, "managed_shared_db_pool_batch_create_failed", zap.Int("db_pool_count", len(pendingWithoutCluster)), zap.Error(err))
+		}
+	}
 
-func retryManagedSharedDBContinuation(ctx context.Context, continuePool func() error) error {
-	states := []managedSharedDBContinuation{{ctx: ctx, continuePool: continuePool}}
-	retryManagedSharedDBContinuations(ctx, states)
-	return states[0].lastErr
-}
-
-func retryManagedSharedDBContinuations(ctx context.Context, states []managedSharedDBContinuation) {
-	deadline := time.Now().Add(schemaInitRetryWindow)
-	attempt := 1
-	for {
-		pendingIndexes := make([]int, 0, len(states))
-		for i := range states {
-			if !states[i].done {
-				pendingIndexes = append(pendingIndexes, i)
+	pending := make([]*meta.SharedDB, 0, len(dbIDs))
+	provisioning := make([]int64, 0, len(dbIDs))
+	for _, dbID := range dbIDs {
+		row, err := s.meta.GetSharedDB(ctx, dbID)
+		if err != nil {
+			continue
+		}
+		switch row.Status {
+		case meta.SharedDBStatusPending:
+			if strings.TrimSpace(row.ClusterID) != "" {
+				pending = append(pending, row)
 			}
+		case meta.SharedDBStatusProvisioning:
+			provisioning = append(provisioning, row.ID)
 		}
-		var wg sync.WaitGroup
-		jobs := make(chan int)
-		for range min(len(pendingIndexes), managedSharedDBContinuationLimit) {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for i := range jobs {
-					if err := ctx.Err(); err != nil {
-						states[i].lastErr = err
-						continue
-					}
-					if err := states[i].continuePool(); err == nil {
-						states[i].done = true
-						states[i].lastErr = nil
-					} else {
-						states[i].lastErr = err
+	}
+	var provisioningWG sync.WaitGroup
+	startProvisioning := func(ids []int64) {
+		if len(ids) == 0 {
+			return
+		}
+		ids = append([]int64(nil), ids...)
+		provisioningWG.Add(1)
+		go func() {
+			defer provisioningWG.Done()
+			s.runManagedSharedDBProvisioning(ctx, ids)
+		}()
+	}
+	startProvisioning(provisioning)
+	if len(pending) > 0 {
+		s.pollManagedSharedDBMetadataWithReady(ctx, pending, startProvisioning)
+	}
+	provisioningWG.Wait()
+}
+
+func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int64) {
+	owned := make([]int64, 0, len(dbIDs))
+	for _, dbID := range dbIDs {
+		if dbID <= 0 {
+			continue
+		}
+		if _, loaded := s.managedSharedDBProvisioningJobs.LoadOrStore(dbID, struct{}{}); !loaded {
+			owned = append(owned, dbID)
+		}
+	}
+	if len(owned) == 0 {
+		return
+	}
+	defer func() {
+		for _, dbID := range owned {
+			s.managedSharedDBProvisioningJobs.Delete(dbID)
+		}
+	}()
+	workers := s.managedSharedDBProvisioningWorkers
+	if workers <= 0 {
+		workers = DefaultManagedSharedDBProvisioningWorkers
+	}
+	failed := runManagedSharedDBProvisioningQueue(ctx, workers, s.managedSharedDBProvisioningSlots, owned,
+		schemaInitRetryWindow, schemaInitInitialBackoff, schemaInitMaxBackoff,
+		func(jobCtx context.Context, dbID int64) error {
+			err := s.continueManagedSharedDBPoolOnce(jobCtx, dbID)
+			if errors.Is(err, meta.ErrNotFound) {
+				return nil
+			}
+			return err
+		}, func(dbID int64, attempt int, retryIn time.Duration, err error) {
+			logger.Warn(ctx, "managed_shared_db_pool_provisioning_retry", zap.Int64("db_pool_id", dbID),
+				zap.Int("attempt", attempt), zap.Duration("retry_in", retryIn), zap.Error(err))
+		})
+	for dbID, err := range failed {
+		logger.Warn(ctx, "managed_shared_db_pool_provisioning_failed", zap.Int64("db_pool_id", dbID), zap.Error(err))
+	}
+}
+
+type managedSharedDBProvisioningJob struct {
+	dbID     int64
+	attempt  int
+	backoff  time.Duration
+	deadline time.Time
+}
+
+type managedSharedDBProvisioningResult struct {
+	job *managedSharedDBProvisioningJob
+	err error
+}
+
+func runManagedSharedDBProvisioningQueue(
+	ctx context.Context,
+	workers int,
+	slots chan struct{},
+	dbIDs []int64,
+	retryWindow, initialBackoff, maxBackoff time.Duration,
+	run func(context.Context, int64) error,
+	onRetry func(int64, int, time.Duration, error),
+) map[int64]error {
+	failed := make(map[int64]error)
+	if workers <= 0 || len(dbIDs) == 0 {
+		return failed
+	}
+	if retryWindow <= 0 {
+		retryWindow = schemaInitRetryWindow
+	}
+	if initialBackoff <= 0 {
+		initialBackoff = schemaInitInitialBackoff
+	}
+	if maxBackoff < initialBackoff {
+		maxBackoff = initialBackoff
+	}
+	deadline := time.Now().Add(retryWindow)
+	jobs := make(chan *managedSharedDBProvisioningJob, len(dbIDs))
+	results := make(chan managedSharedDBProvisioningResult, workers)
+	retries := make(chan *managedSharedDBProvisioningJob, len(dbIDs))
+	seen := make(map[int64]struct{}, len(dbIDs))
+	remaining := 0
+	for _, dbID := range dbIDs {
+		if dbID <= 0 {
+			continue
+		}
+		if _, ok := seen[dbID]; ok {
+			continue
+		}
+		seen[dbID] = struct{}{}
+		jobs <- &managedSharedDBProvisioningJob{dbID: dbID, attempt: 1, backoff: initialBackoff, deadline: deadline}
+		remaining++
+	}
+	var wg sync.WaitGroup
+	for range min(workers, remaining) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				if slots != nil {
+					select {
+					case slots <- struct{}{}:
+					case <-ctx.Done():
+						return
 					}
 				}
-			}()
-		}
-		for _, i := range pendingIndexes {
-			jobs <- i
-		}
-		close(jobs)
-		wg.Wait()
-		pending := 0
-		for i := range states {
-			if !states[i].done {
-				pending++
+				err := run(ctx, job.dbID)
+				if slots != nil {
+					<-slots
+				}
+				select {
+				case results <- managedSharedDBProvisioningResult{job: job, err: err}:
+				case <-ctx.Done():
+					return
+				}
 			}
-		}
-		if pending == 0 {
-			return
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return
-		}
-		retryIn := min(managedSharedDBContinuationInterval, remaining)
-		for i := range states {
-			if states[i].done || states[i].lastErr == nil {
-				continue
-			}
-			logger.Warn(states[i].ctx, "managed_shared_db_pool_continue_retry",
-				zap.Int("attempt", attempt),
-				zap.Duration("retry_in", retryIn),
-				zap.Duration("remaining", remaining),
-				zap.Error(states[i].lastErr))
-		}
-		timer := time.NewTimer(retryIn)
+		}()
+	}
+	for remaining > 0 {
 		select {
 		case <-ctx.Done():
-			timer.Stop()
-			for i := range states {
-				if !states[i].done {
-					states[i].lastErr = ctx.Err()
+			close(jobs)
+			wg.Wait()
+			return failed
+		case job := <-retries:
+			select {
+			case jobs <- job:
+			case <-ctx.Done():
+				close(jobs)
+				wg.Wait()
+				return failed
+			}
+		case result := <-results:
+			if result.err == nil {
+				remaining--
+				continue
+			}
+			job := result.job
+			retryIn := min(job.backoff, time.Until(job.deadline))
+			if retryIn <= 0 {
+				failed[job.dbID] = result.err
+				remaining--
+				continue
+			}
+			if onRetry != nil {
+				onRetry(job.dbID, job.attempt, retryIn, result.err)
+			}
+			job.attempt++
+			job.backoff = min(job.backoff*2, maxBackoff)
+			go func(job *managedSharedDBProvisioningJob, delay time.Duration) {
+				timer := time.NewTimer(delay)
+				defer timer.Stop()
+				select {
+				case <-ctx.Done():
+				case <-timer.C:
+					select {
+					case retries <- job:
+					case <-ctx.Done():
+					}
+				}
+			}(job, retryIn)
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	return failed
+}
+
+func runManagedSharedDBProvisioningJobs(ctx context.Context, workers int, slots chan struct{}, dbIDs []int64, run func(context.Context, int64)) {
+	if workers <= 0 || len(dbIDs) == 0 {
+		return
+	}
+	jobs := make(chan int64)
+	var wg sync.WaitGroup
+	for range min(workers, len(dbIDs)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for dbID := range jobs {
+				if slots != nil {
+					select {
+					case slots <- struct{}{}:
+					case <-ctx.Done():
+						return
+					}
+				}
+				run(ctx, dbID)
+				if slots != nil {
+					<-slots
 				}
 			}
-			return
-		case <-timer.C:
-		}
-		attempt++
+		}()
 	}
+	for _, dbID := range dbIDs {
+		select {
+		case jobs <- dbID:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return
+		}
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows []*meta.SharedDB, onReady func([]int64)) {
+	owned := make([]*meta.SharedDB, 0, len(rows))
+	for _, row := range rows {
+		if row == nil || row.ID <= 0 {
+			continue
+		}
+		if _, loaded := s.managedSharedDBMetadataJobs.LoadOrStore(row.ID, struct{}{}); !loaded {
+			owned = append(owned, row)
+		}
+	}
+	if len(owned) == 0 {
+		return
+	}
+	defer func() {
+		for _, row := range owned {
+			s.managedSharedDBMetadataJobs.Delete(row.ID)
+		}
+	}()
+	loader, ok := s.provisioner.(tenant.SharedDBPoolBatchLoader)
+	if !ok {
+		logger.Warn(ctx, "managed_shared_db_pool_metadata_batch_unsupported")
+		return
+	}
+	cred, err := s.sharedDBCloudCredentials()
+	if err != nil {
+		logger.Warn(ctx, "managed_shared_db_pool_metadata_credentials_failed", zap.Error(err))
+		return
+	}
+	batchSize := s.managedSharedDBMetadataBatchSize
+	if batchSize <= 0 {
+		batchSize = DefaultManagedSharedDBMetadataBatchSize
+	}
+	workers := s.managedSharedDBMetadataWorkers
+	if workers <= 0 {
+		workers = DefaultManagedSharedDBMetadataWorkers
+	}
+	pollInterval := s.managedSharedDBMetadataPollInterval
+	if pollInterval <= 0 {
+		pollInterval = DefaultManagedSharedDBMetadataPollInterval
+	}
+	queue := append([]*meta.SharedDB(nil), owned...)
+	known := make(map[int64]struct{}, len(owned))
+	for _, row := range owned {
+		known[row.ID] = struct{}{}
+	}
+	var queueMu sync.Mutex
+	take := func(limit int) []*meta.SharedDB {
+		queueMu.Lock()
+		defer queueMu.Unlock()
+		if len(queue) < limit {
+			fresh, listErr := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusPending, 1000)
+			if listErr != nil {
+				logger.Warn(ctx, "managed_shared_db_pool_metadata_refill_failed", zap.Error(listErr))
+			} else {
+				for _, row := range fresh {
+					if strings.TrimSpace(row.ClusterID) == "" {
+						continue
+					}
+					if _, ok := known[row.ID]; ok {
+						continue
+					}
+					if _, loaded := s.managedSharedDBMetadataJobs.LoadOrStore(row.ID, struct{}{}); loaded {
+						continue
+					}
+					known[row.ID] = struct{}{}
+					owned = append(owned, row)
+					queue = append(queue, row)
+				}
+			}
+		}
+		limit = min(limit, len(queue))
+		out := append([]*meta.SharedDB(nil), queue[:limit]...)
+		queue = queue[limit:]
+		return out
+	}
+	workerCount := min(workers, (len(owned)+batchSize-1)/batchSize)
+	deadline := time.Now().Add(schemaInitRetryWindow)
+	var wg sync.WaitGroup
+	for range workerCount {
+		group := take(batchSize)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if s.managedSharedDBMetadataSlots != nil {
+				select {
+				case s.managedSharedDBMetadataSlots <- struct{}{}:
+					defer func() { <-s.managedSharedDBMetadataSlots }()
+				case <-ctx.Done():
+					return
+				}
+			}
+			attempt := 1
+			for len(group) > 0 && time.Now().Before(deadline) {
+				requests := make([]tenant.SharedDBPoolLoadRequest, 0, len(group))
+				byID := make(map[int64]*meta.SharedDB, len(group))
+				for _, row := range group {
+					requests = append(requests, tenant.SharedDBPoolLoadRequest{DBPoolID: row.ID, DBPoolUUID: row.UUID, ClusterID: row.ClusterID})
+					byID[row.ID] = row
+				}
+				infos, loadErr := loader.BatchLoadSharedDBPoolsWithCredentials(ctx, requests, cred)
+				ready := make(map[int64]struct{}, len(infos))
+				readyIDs := make([]int64, 0, len(infos))
+				for _, info := range infos {
+					if info == nil {
+						continue
+					}
+					row := byID[info.DBPoolID]
+					if row == nil || strings.TrimSpace(info.Host) == "" || info.Port <= 0 || strings.TrimSpace(info.Username) == "" {
+						continue
+					}
+					name := info.DBName
+					if name == "" {
+						name = row.Name
+					}
+					if err := s.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{ID: row.ID, TiDBCloudOrganizationID: row.TiDBCloudOrganizationID, ClusterID: info.ClusterID, Host: info.Host, Port: info.Port, User: info.Username, PasswordCipher: row.PasswordCipher, Name: name, TLSMode: row.TLSMode}); err != nil {
+						logger.Warn(ctx, "managed_shared_db_pool_metadata_persist_failed", zap.Int64("db_pool_id", row.ID), zap.Error(err))
+						continue
+					}
+					ready[row.ID] = struct{}{}
+					readyIDs = append(readyIDs, row.ID)
+				}
+				if loadErr != nil {
+					logger.Warn(ctx, "managed_shared_db_pool_metadata_retry", zap.Int("attempt", attempt), zap.Int("db_pool_count", len(group)), zap.Duration("retry_in", pollInterval), zap.Error(loadErr))
+				}
+				if len(ready) > 0 {
+					remaining := group[:0]
+					for _, row := range group {
+						if _, ok := ready[row.ID]; !ok {
+							remaining = append(remaining, row)
+						}
+					}
+					group = remaining
+					group = append(group, take(len(ready))...)
+					if onReady != nil {
+						onReady(readyIDs)
+					}
+				}
+				if len(group) == 0 {
+					return
+				}
+				timer := time.NewTimer(min(pollInterval, time.Until(deadline)))
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				attempt++
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func (s *Server) resumeProvisioningManagedSharedDBPoolsWithCtx(ctx context.Context) {
-	s.resumeManagedSharedDBPoolsByStatus(ctx, meta.SharedDBStatusProvisioning)
+	rows, err := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusProvisioning, 1000)
+	if err != nil {
+		logger.Warn(ctx, "managed_shared_db_pool_resume_list_failed", zap.String("status", meta.SharedDBStatusProvisioning), zap.Error(err))
+		return
+	}
+	ids := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	s.runManagedSharedDBProvisioning(ctx, ids)
 }
 
 func (s *Server) resumePendingManagedSharedDBPoolsWithCtx(ctx context.Context) {
-	s.resumeManagedSharedDBPoolsByStatus(ctx, meta.SharedDBStatusPending)
-}
-
-func (s *Server) resumeManagedSharedDBPoolsByStatus(ctx context.Context, status string) {
-	rows, err := s.meta.ListSharedDBsByStatus(ctx, status, 1000)
+	rows, err := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusPending, 1000)
 	if err != nil {
-		logger.Warn(ctx, "managed_shared_db_pool_resume_list_failed", zap.String("status", status), zap.Error(err))
+		logger.Warn(ctx, "managed_shared_db_pool_resume_list_failed", zap.String("status", meta.SharedDBStatusPending), zap.Error(err))
 		return
 	}
-	states := make([]managedSharedDBContinuation, 0, len(rows))
+	ids := make([]int64, 0, len(rows))
 	for _, row := range rows {
-		if ctx.Err() != nil {
-			return
-		}
-		states = append(states, s.managedSharedDBContinuation(ctx, row.ID))
+		ids = append(ids, row.ID)
 	}
-	retryManagedSharedDBContinuations(ctx, states)
-	for i := range states {
-		if !states[i].done && states[i].lastErr != nil && states[i].ctx.Err() == nil {
-			logger.Warn(states[i].ctx, "managed_shared_db_pool_resume_failed", zap.Error(states[i].lastErr))
-		}
-	}
+	s.runManagedSharedDBContinuations(ctx, ids)
 }
 
 func (s *Server) continueManagedSharedDBPool(ctx context.Context, dbID int64) error {

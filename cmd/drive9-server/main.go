@@ -441,14 +441,24 @@ func main() {
 	}
 
 	die(server.NewWithConfig(server.Config{
-		Meta:                            store,
-		Pool:                            pool,
-		Provisioner:                     provisioner,
-		DefaultTenantProvider:           providerType,
-		SharedDBMaxTenants:              sharedDBMaxTenants,
-		SharedDBHardCapRatio:            sharedDBHardCapRatio,
-		SharedDBReopenRatio:             sharedDBReopenRatio,
-		SharedDBSpendingLimit:           sharedDBDefaultSpendingLimit,
+		Meta:                  store,
+		Pool:                  pool,
+		Provisioner:           provisioner,
+		DefaultTenantProvider: providerType,
+		SharedDBMaxTenants:    sharedDBMaxTenants,
+		SharedDBHardCapRatio:  sharedDBHardCapRatio,
+		SharedDBReopenRatio:   sharedDBReopenRatio,
+		SharedDBSpendingLimit: sharedDBDefaultSpendingLimit,
+		ManagedSharedDBCloudBatchSize: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_CLOUD_BATCH_SIZE",
+			server.DefaultManagedSharedDBCloudBatchSize),
+		ManagedSharedDBMetadataWorkers: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_WORKERS",
+			server.DefaultManagedSharedDBMetadataWorkers),
+		ManagedSharedDBMetadataBatchSize: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_BATCH_SIZE",
+			server.DefaultManagedSharedDBMetadataBatchSize),
+		ManagedSharedDBMetadataPollInterval: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_POLL_INTERVAL",
+			server.DefaultManagedSharedDBMetadataPollInterval),
+		ManagedSharedDBProvisioningWorkers: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_PROVISIONING_WORKERS",
+			server.DefaultManagedSharedDBProvisioningWorkers),
 		LegacyStarterProvisioner:        legacyStarterProvisioner,
 		TokenSecret:                     tokenSecret,
 		VaultMasterKey:                  vaultMasterKey,
@@ -685,6 +695,11 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO emergency hard-cap ratio > 1 after physical create failure (default: 1.2)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_REOPEN_RATIO reopen ratio for a latched shared pool (default: 0.8)
   DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT physical spending-limit target for new managed shared DB pools (default: 1000000)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_CLOUD_BATCH_SIZE physical pools per Cloud create request (default: 10)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_WORKERS concurrent pending metadata workers (default: 15)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_BATCH_SIZE physical pools per metadata list request (default: 30)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_POLL_INTERVAL delay between metadata list rounds (default: 15s)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_PROVISIONING_WORKERS concurrent shared schema-init workers (default: 100)
   DRIVE9_TIDBCLOUD_PRIVATE_ENDPOINT_HOST_MAP comma-separated public_host=private_host mappings (also accepts public_host:private_host);
                                              when set, disables legacy single-host private endpoint overrides
   DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST legacy tencentcloud private endpoint fallback host, used only when host map is unset

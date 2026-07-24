@@ -53,10 +53,7 @@ const tenantPoolClaimCASRetryLimit = 8
 
 const sharedTenantPoolCreateConcurrency = 50
 
-const (
-	managedSharedDBCloudBatchSize        = 10
-	managedSharedDBCloudBatchConcurrency = 10
-)
+const tenantPoolRefillWaveLimit = 50
 
 func retryTenantPoolClaimCAS[T any](attempt func() (T, error)) (T, error) {
 	var zero T
@@ -1171,25 +1168,28 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 	type batchResult struct {
 		err error
 	}
-	batchCount := (len(requests) + managedSharedDBCloudBatchSize - 1) / managedSharedDBCloudBatchSize
+	batchSize := s.managedSharedDBCloudBatchSize
+	if batchSize <= 0 {
+		batchSize = DefaultManagedSharedDBCloudBatchSize
+	}
+	batchCount := (len(requests) + batchSize - 1) / batchSize
 	batchResults := make([]batchResult, batchCount)
-	batchSlots := make(chan struct{}, min(batchCount, managedSharedDBCloudBatchConcurrency))
+	batches := make([][]tenant.SharedDBPoolCreateRequest, 0, batchCount)
+	for start := 0; start < len(requests); start += batchSize {
+		end := min(start+batchSize, len(requests))
+		batches = append(batches, append([]tenant.SharedDBPoolCreateRequest(nil), requests[start:end]...))
+	}
 	var wg sync.WaitGroup
-	for batchIndex, start := 0, 0; start < len(requests); batchIndex, start = batchIndex+1, start+managedSharedDBCloudBatchSize {
-		end := min(start+managedSharedDBCloudBatchSize, len(requests))
-		chunk := append([]tenant.SharedDBPoolCreateRequest(nil), requests[start:end]...)
+	for batchIndex := range batches {
 		wg.Add(1)
-		go func(batchIndex int, chunk []tenant.SharedDBPoolCreateRequest) {
+		go func() {
 			defer wg.Done()
-			select {
-			case batchSlots <- struct{}{}:
-				defer func() { <-batchSlots }()
-			case <-ctx.Done():
-				batchResults[batchIndex].err = ctx.Err()
+			if err := ctx.Err(); err != nil {
+				batchResults[batchIndex].err = err
 				return
 			}
-			batchResults[batchIndex].err = s.provisionManagedSharedDBPoolsBatchChunkLocked(ctx, provisioner, chunk, rows, cred)
-		}(batchIndex, chunk)
+			batchResults[batchIndex].err = s.provisionManagedSharedDBPoolsBatchChunkLocked(ctx, provisioner, batches[batchIndex], rows, cred)
+		}()
 	}
 	wg.Wait()
 	var batchErr error
@@ -1872,6 +1872,7 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 				metricResult = "noop"
 				return nil
 			}
+			missing = min(missing, tenantPoolRefillWaveLimit)
 			results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
 			if err != nil {
 				logger.Warn(ctx, "admin_tenant_pool_replenish_failed", zap.String("pool_id", current.PoolID), zap.Error(err))

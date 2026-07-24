@@ -1016,6 +1016,26 @@ func TestAdminTenantPoolReplenishBatchesBelowFreeWatermark(t *testing.T) {
 	}
 }
 
+func TestAdminTenantPoolReplenishCapsOneWaveAtFifty(t *testing.T) {
+	rt, _ := newAdminTenantPoolRuntime(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	pool := &meta.TenantPool{PoolID: "pool-refill-cap", OrganizationID: "org-1", Size: 100,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now}
+	if err := rt.meta.CreateTenantPool(ctx, pool); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	rt.server.replenishTenantPoolAsync(ctx, pool, tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
+	rt.server.forkWorkerWG.Wait()
+	free, err := rt.meta.CountTenantPoolFreeSlots(ctx, pool.OrganizationID)
+	if err != nil {
+		t.Fatalf("count free slots: %v", err)
+	}
+	if free != tenantPoolRefillWaveLimit {
+		t.Fatalf("free slots = %d, want one refill wave capped at %d", free, tenantPoolRefillWaveLimit)
+	}
+}
+
 func TestTenantPoolEffectiveRefillRatioRejectsNaN(t *testing.T) {
 	s := &Server{tenantPoolRefillFreeRatio: math.NaN()}
 	if got := s.effectiveTenantPoolRefillFreeRatio(); got != DefaultTenantPoolRefillFreeRatio {
