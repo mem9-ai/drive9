@@ -141,6 +141,76 @@ func (s *Store) IsTiDBCloudFreeTenantCounted(ctx context.Context, tenantID, orga
 	return counted, err
 }
 
+// DeleteStaleTiDBCloudFreeReservation atomically deletes a stale pending row
+// only when it still contains reservation metadata and no provisioned resource
+// or pool-ownership metadata.
+func (s *Store) DeleteStaleTiDBCloudFreeReservation(ctx context.Context, tenantID string, updatedBefore time.Time) (deleted bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_stale_tidbcloud_free_reservation", start, &err)
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return false, fmt.Errorf("tenant id is required")
+	}
+	if updatedBefore.IsZero() {
+		return false, fmt.Errorf("reservation stale cutoff is required")
+	}
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants t
+		SET t.status = ?, t.updated_at = ?
+		WHERE t.id = ? AND t.status = ? AND t.updated_at <= ?
+			AND COALESCE(t.storage_namespace_id, '') = ''
+			AND COALESCE(t.cluster_id, '') = ''
+			AND EXISTS (
+				SELECT 1 FROM tenant_billing_org_bindings b WHERE b.tenant_id = t.id)
+			AND EXISTS (
+				SELECT 1 FROM tenant_quota_config q
+				WHERE q.tenant_id = t.id AND q.tidbcloud_spending_limit = 0)
+			AND NOT EXISTS (
+				SELECT 1 FROM tenant_api_keys k WHERE k.tenant_id = t.id)
+			AND NOT EXISTS (
+				SELECT 1 FROM tenant_tidbcloud_org_bindings b WHERE b.tenant_id = t.id)
+			AND NOT EXISTS (
+				SELECT 1 FROM tenant_pool_memberships m WHERE m.tenant_id = t.id)
+			AND NOT EXISTS (
+				SELECT 1 FROM fs_registry f
+				JOIN tenant_placements p ON p.fs_id = f.fs_id
+				WHERE f.tenant_id = t.id)`,
+		TenantDeleted, now, tenantID, TenantPending, updatedBefore.UTC())
+	if err != nil {
+		return false, fmt.Errorf("delete stale tidbcloud free reservation %s: %w", tenantID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("delete stale tidbcloud free reservation rows affected %s: %w", tenantID, err)
+	}
+	return affected == 1, nil
+}
+
+// HasTenantPoolOwnership reports whether a tenant is explicitly associated
+// with a native pool binding, logical pool membership, or shared DB placement.
+func (s *Store) HasTenantPoolOwnership(ctx context.Context, tenantID string) (owned bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "has_tenant_pool_ownership", start, &err)
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return false, fmt.Errorf("tenant id is required")
+	}
+	err = s.db.QueryRowContext(ctx, `SELECT
+		EXISTS (
+			SELECT 1 FROM tenant_tidbcloud_org_bindings b
+			WHERE b.tenant_id = ? AND TRIM(b.pool_id) <> '')
+		OR EXISTS (
+			SELECT 1 FROM tenant_pool_memberships m WHERE m.tenant_id = ?)
+		OR EXISTS (
+			SELECT 1 FROM fs_registry f
+			JOIN tenant_placements p ON p.fs_id = f.fs_id
+			WHERE f.tenant_id = ?)`, tenantID, tenantID, tenantID).Scan(&owned)
+	if err != nil {
+		return false, fmt.Errorf("check tenant pool ownership %s: %w", tenantID, err)
+	}
+	return owned, nil
+}
+
 func ensureTenantBillingOrgBindingTx(ctx context.Context, tx *sql.Tx, tenantID, organizationID string) error {
 	tenantID = strings.TrimSpace(tenantID)
 	organizationID = strings.TrimSpace(organizationID)

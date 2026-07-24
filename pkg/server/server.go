@@ -1194,18 +1194,38 @@ func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant)
 }
 
 func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
-	if t.Provider == tenant.ProviderTiDBCloudNative && strings.TrimSpace(t.ClusterID) != "" && strings.TrimSpace(t.DBUser) == "" {
-		logger.Info(ctx, "resume_pending_pool_tenant_skipped",
+	now := time.Now().UTC()
+	if !isStalePendingTenant(now, t) {
+		return
+	}
+	updatedBefore := now
+	if pendingTenantStaleAfter > 0 {
+		updatedBefore = now.Add(-pendingTenantStaleAfter)
+	}
+	deleted, err := s.meta.DeleteStaleTiDBCloudFreeReservation(ctx, t.ID, updatedBefore)
+	if err != nil {
+		logger.Error(ctx, "resume_pending_free_reservation_cleanup_error",
 			zap.String("tenant_id", t.ID),
 			zap.String("provider", t.Provider),
-			zap.String("cluster_id", t.ClusterID),
-			zap.String("reason", "tidbcloud_credentials_unavailable"))
-		if s.metrics != nil {
-			s.metrics.recordEvent(t.ID, "tenant_pool_pending_resume",
-				"provider", t.Provider,
-				"result", "skipped",
-				"reason", "tidbcloud_credentials_unavailable")
-		}
+			zap.Error(err))
+		return
+	}
+	if deleted {
+		logger.Info(ctx, "resume_pending_free_reservation_deleted",
+			zap.String("tenant_id", t.ID),
+			zap.String("provider", t.Provider))
+		return
+	}
+	current, err := s.meta.GetTenant(ctx, t.ID)
+	if err != nil {
+		logger.Error(ctx, "resume_pending_tenant_reload_error",
+			zap.String("tenant_id", t.ID),
+			zap.String("provider", t.Provider),
+			zap.Error(err))
+		return
+	}
+	t = *current
+	if t.Status != meta.TenantPending || !isStalePendingTenant(now, t) {
 		return
 	}
 	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
@@ -1224,8 +1244,30 @@ func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
 			return
 		}
 	}
-	if !isStalePendingTenant(time.Now().UTC(), t) {
-		return
+	if t.Provider == tenant.ProviderTiDBCloudNative && strings.TrimSpace(t.ClusterID) != "" && strings.TrimSpace(t.DBUser) == "" {
+		poolOwned, ownershipErr := s.meta.HasTenantPoolOwnership(ctx, t.ID)
+		if ownershipErr != nil {
+			logger.Error(ctx, "resume_pending_pool_ownership_lookup_error",
+				zap.String("tenant_id", t.ID),
+				zap.String("provider", t.Provider),
+				zap.String("cluster_id", t.ClusterID),
+				zap.Error(ownershipErr))
+			return
+		}
+		if poolOwned {
+			logger.Info(ctx, "resume_pending_pool_tenant_skipped",
+				zap.String("tenant_id", t.ID),
+				zap.String("provider", t.Provider),
+				zap.String("cluster_id", t.ClusterID),
+				zap.String("reason", "explicit_pool_ownership"))
+			if s.metrics != nil {
+				s.metrics.recordEvent(t.ID, "tenant_pool_pending_resume",
+					"provider", t.Provider,
+					"result", "skipped",
+					"reason", "explicit_pool_ownership")
+			}
+			return
+		}
 	}
 	if pendingTenantConnectionReady(t) {
 		updated, err := s.meta.UpdateTenantStatusIf(ctx, t.ID, meta.TenantPending, meta.TenantProvisioning)

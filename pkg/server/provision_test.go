@@ -4116,7 +4116,7 @@ func TestStartupKeepsFreshPendingTenant(t *testing.T) {
 	}
 }
 
-func TestReconcilePendingNativePoolTenantWithoutConnectionStaysPending(t *testing.T) {
+func TestReconcilePendingDirectNativeClusterWithoutPoolOwnershipBecomesFailed(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -4141,6 +4141,53 @@ func TestReconcilePendingNativePoolTenantWithoutConnectionStaysPending(t *testin
 		UpdatedAt:        now,
 	}
 	if err := metaStore.InsertTenant(context.Background(), &pendingTenant); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{meta: metaStore}
+	srv.reconcilePendingTenant(context.Background(), pendingTenant)
+
+	row := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID)
+	var status string
+	if err := row.Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantFailed) {
+		t.Fatalf("status after reconcile = %s, want %s", status, meta.TenantFailed)
+	}
+}
+
+func TestReconcilePendingNativePoolBindingWithoutConnectionStaysPending(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	tenantID := token.NewID()
+	now := time.Now().UTC().Add(-2 * time.Minute)
+	origStaleAfter := pendingTenantStaleAfter
+	pendingTenantStaleAfter = time.Minute
+	defer func() { pendingTenantStaleAfter = origStaleAfter }()
+	pendingTenant := meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantPending,
+		DBPasswordCipher: []byte{},
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		ClusterID:        "cluster-pool-1",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := metaStore.InsertTenant(context.Background(), &pendingTenant); err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.UpsertTenantTiDBCloudOrgBinding(context.Background(), &meta.TenantTiDBCloudOrgBinding{
+		TenantID: tenantID, OrganizationID: "org-pool-1", ClusterID: "cluster-pool-1",
+		PoolID: "pool-1", PoolStatus: meta.TenantPoolBindingFree, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4206,6 +4253,99 @@ func TestReconcilePendingSharedPoolTenantWithoutConnectionStaysPending(t *testin
 	}
 	if got.Status != meta.TenantPending {
 		t.Fatalf("shared pool tenant status after reconcile = %s, want %s", got.Status, meta.TenantPending)
+	}
+}
+
+func TestReconcilePendingReservationOnlyFreeTenantBecomesDeleted(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	tenantID := token.NewID()
+	now := time.Now().UTC().Add(-2 * time.Minute)
+	origStaleAfter := pendingTenantStaleAfter
+	pendingTenantStaleAfter = time.Minute
+	defer func() { pendingTenantStaleAfter = origStaleAfter }()
+	pendingTenant := meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantPending,
+		DBPasswordCipher: []byte{},
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := metaStore.InsertTenant(context.Background(), &pendingTenant); err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.UpsertTenantBillingOrgBinding(context.Background(), tenantID, "org-reservation-only"); err != nil {
+		t.Fatal(err)
+	}
+	zero := int64(0)
+	if err := metaStore.SetQuotaConfigPatch(context.Background(), tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimit: &zero}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{meta: metaStore}
+	srv.reconcilePendingTenant(context.Background(), pendingTenant)
+
+	row := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID)
+	var status string
+	if err := row.Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantDeleted) {
+		t.Fatalf("status after reconcile = %s, want %s", status, meta.TenantDeleted)
+	}
+}
+
+func TestReconcilePendingReloadsTenantAfterConcurrentEarlyBinding(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	tenantID := token.NewID()
+	staleAt := time.Now().UTC().Add(-2 * time.Minute)
+	origStaleAfter := pendingTenantStaleAfter
+	pendingTenantStaleAfter = time.Minute
+	defer func() { pendingTenantStaleAfter = origStaleAfter }()
+	staleSnapshot := meta.Tenant{
+		ID: tenantID, Status: meta.TenantPending, Kind: meta.TenantKindLive,
+		DBPasswordCipher: []byte{}, DBTLS: true, Provider: tenant.ProviderTiDBCloudNative,
+		SchemaVersion: 1, CreatedAt: staleAt, UpdatedAt: staleAt,
+	}
+	if err := metaStore.InsertTenant(context.Background(), &staleSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.UpsertTenantBillingOrgBinding(context.Background(), tenantID, "org-concurrent-binding"); err != nil {
+		t.Fatal(err)
+	}
+	zero := int64(0)
+	if err := metaStore.SetQuotaConfigPatch(context.Background(), tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimit: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.PersistTiDBCloudTenantClusterReference(context.Background(), tenantID, "org-concurrent-binding", &meta.Tenant{
+		Provider: tenant.ProviderTiDBCloudNative, ClusterID: "cluster-concurrent-binding",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{meta: metaStore}
+	srv.reconcilePendingTenant(context.Background(), staleSnapshot)
+
+	got, err := metaStore.GetTenant(context.Background(), tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantPending || got.ClusterID != "cluster-concurrent-binding" {
+		t.Fatalf("tenant after reconcile = status:%s cluster:%q, want pending early binding", got.Status, got.ClusterID)
 	}
 }
 
