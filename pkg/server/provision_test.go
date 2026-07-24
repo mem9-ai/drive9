@@ -250,7 +250,7 @@ func TestRunManagedSharedDBProvisioningQueueRequeuesWithoutBlockingWorker(t *tes
 	order := make([]int64, 0, 3)
 	attempts := make(map[int64]int)
 	failed := runManagedSharedDBProvisioningQueue(context.Background(), 1, nil, []int64{1, 2},
-		time.Second, 20*time.Millisecond, 20*time.Millisecond,
+		time.Second, 20*time.Millisecond, 20*time.Millisecond, 0,
 		func(_ context.Context, dbID int64) error {
 			mu.Lock()
 			defer mu.Unlock()
@@ -272,6 +272,32 @@ func TestRunManagedSharedDBProvisioningQueueRequeuesWithoutBlockingWorker(t *tes
 func TestManagedSharedDBProvisioningBackoffCapsAtFifteenSeconds(t *testing.T) {
 	if managedSharedDBProvisioningMaxBackoff != 15*time.Second {
 		t.Fatalf("shared provisioning max backoff = %s, want 15s", managedSharedDBProvisioningMaxBackoff)
+	}
+	if managedSharedDBProvisioningCooldown != 10*time.Second {
+		t.Fatalf("shared provisioning worker cooldown = %s, want 10s", managedSharedDBProvisioningCooldown)
+	}
+}
+
+func TestManagedSharedDBProvisioningWorkerRestsBetweenJobs(t *testing.T) {
+	const cooldown = 25 * time.Millisecond
+	started := make([]time.Time, 0, 2)
+	var mu sync.Mutex
+	failed := runManagedSharedDBProvisioningQueue(context.Background(), 1, nil, []int64{1, 2},
+		time.Second, time.Millisecond, time.Millisecond, cooldown,
+		func(_ context.Context, _ int64) error {
+			mu.Lock()
+			started = append(started, time.Now())
+			mu.Unlock()
+			return nil
+		}, nil)
+	if len(failed) != 0 {
+		t.Fatalf("failed jobs = %v", failed)
+	}
+	if len(started) != 2 {
+		t.Fatalf("started jobs = %d, want 2", len(started))
+	}
+	if gap := started[1].Sub(started[0]); gap < cooldown {
+		t.Fatalf("worker started next job after %s, want at least %s", gap, cooldown)
 	}
 }
 

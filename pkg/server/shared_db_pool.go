@@ -23,6 +23,7 @@ const (
 	defaultSharedTenantSpendingLimit      = int64(1000)
 	sharedTenantActivationBatchSize       = 100
 	managedSharedDBProvisioningMaxBackoff = 15 * time.Second
+	managedSharedDBProvisioningCooldown   = 10 * time.Second
 )
 
 var errSharedDBConnectionMetadataNotReady = errors.New("shared DB pool connection metadata is not ready")
@@ -387,6 +388,7 @@ func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int
 	}
 	failed := runManagedSharedDBProvisioningQueue(ctx, workers, s.managedSharedDBProvisioningSlots, owned,
 		schemaInitRetryWindow, schemaInitInitialBackoff, managedSharedDBProvisioningMaxBackoff,
+		managedSharedDBProvisioningCooldown,
 		func(jobCtx context.Context, dbID int64) error {
 			err := s.continueManagedSharedDBPoolOnce(jobCtx, dbID)
 			if errors.Is(err, meta.ErrNotFound) {
@@ -419,7 +421,7 @@ func runManagedSharedDBProvisioningQueue(
 	workers int,
 	slots chan struct{},
 	dbIDs []int64,
-	retryWindow, initialBackoff, maxBackoff time.Duration,
+	retryWindow, initialBackoff, maxBackoff, workerCooldown time.Duration,
 	run func(context.Context, int64) error,
 	onRetry func(int64, int, time.Duration, error),
 ) map[int64]error {
@@ -440,6 +442,9 @@ func runManagedSharedDBProvisioningQueue(
 	jobs := make(chan *managedSharedDBProvisioningJob, len(dbIDs))
 	results := make(chan managedSharedDBProvisioningResult, workers)
 	retries := make(chan *managedSharedDBProvisioningJob, len(dbIDs))
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	stopWorkers := func() { stopOnce.Do(func() { close(done) }) }
 	seen := make(map[int64]struct{}, len(dbIDs))
 	remaining := 0
 	for _, dbID := range dbIDs {
@@ -458,7 +463,28 @@ func runManagedSharedDBProvisioningQueue(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for job := range jobs {
+			first := true
+			for {
+				if !first && workerCooldown > 0 {
+					timer := time.NewTimer(workerCooldown)
+					select {
+					case <-done:
+						timer.Stop()
+						return
+					case <-ctx.Done():
+						timer.Stop()
+						return
+					case <-timer.C:
+					}
+				}
+				var job *managedSharedDBProvisioningJob
+				select {
+				case <-done:
+					return
+				case <-ctx.Done():
+					return
+				case job = <-jobs:
+				}
 				if slots != nil {
 					select {
 					case slots <- struct{}{}:
@@ -475,20 +501,21 @@ func runManagedSharedDBProvisioningQueue(
 				case <-ctx.Done():
 					return
 				}
+				first = false
 			}
 		}()
 	}
 	for remaining > 0 {
 		select {
 		case <-ctx.Done():
-			close(jobs)
+			stopWorkers()
 			wg.Wait()
 			return failed
 		case job := <-retries:
 			select {
 			case jobs <- job:
 			case <-ctx.Done():
-				close(jobs)
+				stopWorkers()
 				wg.Wait()
 				return failed
 			}
@@ -513,17 +540,19 @@ func runManagedSharedDBProvisioningQueue(
 				timer := time.NewTimer(delay)
 				defer timer.Stop()
 				select {
+				case <-done:
 				case <-ctx.Done():
 				case <-timer.C:
 					select {
 					case retries <- job:
+					case <-done:
 					case <-ctx.Done():
 					}
 				}
 			}(job, retryIn)
 		}
 	}
-	close(jobs)
+	stopWorkers()
 	wg.Wait()
 	return failed
 }
