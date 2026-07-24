@@ -3,7 +3,7 @@ package server
 import "github.com/mem9-ai/drive9/pkg/tenant"
 
 const (
-	DefaultTiDBCloudFreeTenantCount      = 3
+	DefaultTiDBCloudFreeTenantCount      = 5
 	DefaultTiDBCloudFreeMaxStorageBytes  = int64(3 * (1 << 30))
 	DefaultTiDBCloudFreeMaxFileSizeBytes = int64(300 * (1 << 20))
 	DefaultTiDBCloudFreeMaxFileCount     = int64(1000)

@@ -293,7 +293,7 @@ func TestTiDBCloudFreePlanLimitsFromEnv(t *testing.T) {
 		t.Fatalf("default free limits: %v", err)
 	}
 	want := server.TiDBCloudFreePlanLimits{
-		TenantCount: 3, MaxStorageBytes: 3221225472,
+		TenantCount: 5, MaxStorageBytes: 3221225472,
 		MaxFileSizeBytes: 314572800, MaxFileCount: 1000,
 	}
 	if got != want {
