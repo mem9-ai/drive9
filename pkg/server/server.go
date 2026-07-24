@@ -4838,6 +4838,7 @@ type provisionTenantOptions struct {
 	TokenVersion          int
 	APIKeySource          apiKeyIssueSource
 	CredentialProvisioner *tenant.CredentialProvisionRequest
+	TiDBCloudAccess       *tiDBCloudAccessProfile
 	Quota                 *quotaRequest
 	Provider              string
 }
@@ -5116,7 +5117,9 @@ func (s *Server) findSharedDBForProvision(ctx context.Context, provider string, 
 		return nil, nil
 	}
 	orgID := ""
-	if opts.CredentialProvisioner != nil {
+	if opts.TiDBCloudAccess != nil {
+		orgID = strings.TrimSpace(opts.TiDBCloudAccess.OrganizationID)
+	} else if opts.CredentialProvisioner != nil {
 		if id, err := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner); err == nil {
 			orgID = id
 		} else {
@@ -5275,10 +5278,17 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 	}
 	if tenant.UsesTiDBCloudNativeCredentials(provider) {
-		if _, err := s.resolveTiDBCloudIdentity(ctx, *opts.CredentialProvisioner, "provision"); err != nil {
-			status, message := clientFacingErrorResponse(http.StatusBadGateway, "TiDB Cloud API key authorization failed", err)
+		profile, err := s.resolveTiDBCloudAccessProfile(ctx, *opts.CredentialProvisioner, "provision")
+		if err != nil {
+			status, message := http.StatusBadGateway, "TiDB Cloud API key authorization failed"
+			if isTiDBCloudBillingLookupError(err) {
+				status, message = tiDBCloudBillingErrorResponse(err)
+			} else {
+				status, message = clientFacingErrorResponse(status, message, err)
+			}
 			return nil, newProvisionTenantError(status, message, err)
 		}
+		opts.TiDBCloudAccess = profile
 	}
 	tenantID := token.NewID()
 	provisionStarted := time.Now()

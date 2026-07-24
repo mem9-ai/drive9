@@ -58,6 +58,9 @@ type fakeProvisioner struct {
 	defaultSharedPrivateKey string
 	lastSharedCredentialReq tenant.CredentialProvisionRequest
 	iamCalls                atomic.Int32
+	billingCalls            atomic.Int32
+	billingErr              error
+	billingFree             bool
 	iamMu                   sync.Mutex
 	iamCredentials          []tenant.CredentialProvisionRequest
 	identityOrg             string
@@ -135,6 +138,18 @@ func (f *fakeProvisioner) ResolveAPIKeyIdentity(_ context.Context, req tenant.Cr
 		role = tenant.TiDBCloudRoleOrgOwner
 	}
 	return &tenant.TiDBCloudAPIKeyIdentity{OrganizationID: orgID, Role: role}, nil
+}
+
+func (f *fakeProvisioner) ResolveOrganizationPlan(_ context.Context, organizationID string, _ tenant.CredentialProvisionRequest) (*tenant.TiDBCloudOrganizationPlan, error) {
+	f.billingCalls.Add(1)
+	if f.billingErr != nil {
+		return nil, f.billingErr
+	}
+	return &tenant.TiDBCloudOrganizationPlan{
+		OrganizationID: organizationID,
+		EffectivePlan:  "on_demand",
+		IsFree:         f.billingFree,
+	}, nil
 }
 
 func (f *fakeProvisioner) iamCredentialsSnapshot() []tenant.CredentialProvisionRequest {
@@ -1574,6 +1589,10 @@ func (f *credentialOnlyProvisioner) ResolveAPIKeyIdentity(context.Context, tenan
 		OrganizationID: f.cluster.OrganizationID,
 		Role:           tenant.TiDBCloudRoleOrgOwner,
 	}, nil
+}
+
+func (f *credentialOnlyProvisioner) ResolveOrganizationPlan(_ context.Context, organizationID string, _ tenant.CredentialProvisionRequest) (*tenant.TiDBCloudOrganizationPlan, error) {
+	return &tenant.TiDBCloudOrganizationPlan{OrganizationID: organizationID, EffectivePlan: "on_demand"}, nil
 }
 
 func (f *credentialOnlyProvisioner) InitSchema(_ context.Context, _ string) error { return nil }
