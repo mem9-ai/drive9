@@ -55,7 +55,9 @@ type Config struct {
 	SharedDBReopenRatio   float64
 	SharedDBSpendingLimit int64
 	// Managed shared-pool concurrency and polling controls. Zero values use
-	// the exported defaults below.
+	// the exported defaults below. CloudBatchSize, MetadataWorkers, and
+	// MetadataBatchSize are safety-capped at their defaults; RefillPoolLimit
+	// and ProvisioningWorkers accept larger configured values.
 	ManagedSharedDBCloudBatchSize       int
 	ManagedSharedDBRefillPoolLimit      int
 	ManagedSharedDBMetadataWorkers      int
@@ -847,6 +849,20 @@ func (s *Server) Close() {
 	s.stopNotifyInfrastructure()
 }
 
+func runManagedSharedDBResumeLoop(ctx context.Context, interval time.Duration, resume func(context.Context)) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	resume(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			resume(ctx)
+		}
+	}
+}
+
 // startLeaderWorkers launches the background schedulers that should run only
 // on the leader pod: the fork-worker group (pending tenant reconciler, tenant
 // delete cleanup, one-time resume tasks), the semantic and object GC workers,
@@ -882,50 +898,13 @@ func (s *Server) startLeaderWorkers() {
 		if sharedPollInterval <= 0 {
 			sharedPollInterval = DefaultManagedSharedDBMetadataPollInterval
 		}
-		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			ticker := time.NewTicker(sharedPollInterval)
-			defer ticker.Stop()
-			var wg sync.WaitGroup
-			defer wg.Wait()
-			run := func() {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					s.resumePendingManagedSharedDBPoolsWithCtx(workerCtx)
-				}()
-			}
-			run()
-			for {
-				select {
-				case <-workerCtx.Done():
-					return
-				case <-ticker.C:
-					run()
-				}
-			}
-		})
-		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			ticker := time.NewTicker(sharedPollInterval)
-			defer ticker.Stop()
-			var wg sync.WaitGroup
-			defer wg.Wait()
-			run := func() {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					s.resumeProvisioningManagedSharedDBPoolsWithCtx(workerCtx)
-				}()
-			}
-			run()
-			for {
-				select {
-				case <-workerCtx.Done():
-					return
-				case <-ticker.C:
-					run()
-				}
-			}
-		})
+		startManagedSharedDBResumeLoop := func(resume func(context.Context)) {
+			s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+				runManagedSharedDBResumeLoop(workerCtx, sharedPollInterval, resume)
+			})
+		}
+		startManagedSharedDBResumeLoop(s.resumePendingManagedSharedDBPoolsWithCtx)
+		startManagedSharedDBResumeLoop(s.resumeProvisioningManagedSharedDBPoolsWithCtx)
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			s.resumeDeletingForkTenantsWithCtx(workerCtx)
 		})

@@ -1116,7 +1116,10 @@ func (s *Server) provisionManagedSharedDBPoolsBatchWithCredentials(ctx context.C
 	if len(dbIDs) == 0 {
 		return "", nil
 	}
-	provisioner := s.provisioner.(tenant.SharedDBPoolProvisioner)
+	provisioner, ok := s.provisioner.(tenant.SharedDBPoolProvisioner)
+	if !ok {
+		return "", fmt.Errorf("provisioner does not support managed shared db pools")
+	}
 	for attempt := 0; attempt < 2; attempt++ {
 		first, err := s.meta.GetSharedDB(ctx, dbIDs[0])
 		if err != nil {
@@ -1222,14 +1225,18 @@ func (s *Server) provisionManagedSharedDBPoolsBatchChunkLocked(ctx context.Conte
 			zap.Int("db_pool_count", len(requests)), zap.Error(createErr))
 		return createErr
 	}
+	var persistErr error
+	persisted := 0
 	for _, info := range created {
 		if info == nil || rows[info.DBPoolID] == nil || rows[info.DBPoolID].UUID != info.DBPoolUUID {
-			return fmt.Errorf("shared db batch returned an unknown db pool")
+			persistErr = errors.Join(persistErr, fmt.Errorf("shared db batch returned an unknown db pool"))
+			continue
 		}
 		row := rows[info.DBPoolID]
 		logicalOrganizationID := strings.TrimSpace(row.TiDBCloudOrganizationID)
 		if logicalOrganizationID == "" {
-			return fmt.Errorf("managed shared db pool customer organization is required")
+			persistErr = errors.Join(persistErr, fmt.Errorf("managed shared db pool %d customer organization is required", info.DBPoolID))
+			continue
 		}
 		if info.DBName == "" {
 			info.DBName = row.Name
@@ -1238,14 +1245,16 @@ func (s *Server) provisionManagedSharedDBPoolsBatchChunkLocked(ctx context.Conte
 			TiDBCloudOrganizationID: logicalOrganizationID, ClusterID: info.ClusterID, Host: info.Host,
 			Port: info.Port, User: info.Username, PasswordCipher: row.PasswordCipher, Name: info.DBName,
 			TLSMode: map[bool]string{true: "true", false: "skip-verify"}[dbTLSForProvisionedTenant(tenant.ProviderTiDBCloudNativeShared)]}); err != nil {
-			return err
+			persistErr = errors.Join(persistErr, err)
+			continue
 		}
+		persisted++
 	}
 	if createErr != nil {
 		logger.Warn(ctx, "managed_shared_db_batch_create_partial",
-			zap.Int("requested", len(requests)), zap.Int("persisted", len(created)), zap.Error(createErr))
+			zap.Int("requested", len(requests)), zap.Int("persisted", persisted), zap.Error(createErr))
 	}
-	return nil
+	return errors.Join(createErr, persistErr)
 }
 
 func (s *Server) markTenantPoolTenantFailed(ctx context.Context, tenantID, reason string) {

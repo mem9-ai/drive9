@@ -195,37 +195,6 @@ func TestManagedSharedDBWorkerConfigDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
-func TestRunManagedSharedDBProvisioningJobsHonorsWorkerLimit(t *testing.T) {
-	started := make(chan int64, 3)
-	release := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		runManagedSharedDBProvisioningJobs(context.Background(), 2, nil, []int64{1, 2, 3}, func(_ context.Context, dbID int64) {
-			started <- dbID
-			<-release
-		})
-		close(done)
-	}()
-	for i := 0; i < 2; i++ {
-		select {
-		case <-started:
-		case <-time.After(time.Second):
-			t.Fatalf("started %d/2 provisioning workers", i)
-		}
-	}
-	select {
-	case <-started:
-		t.Fatal("started a third provisioning job while two workers were busy")
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(release)
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("provisioning jobs did not finish")
-	}
-}
-
 func TestManagedSharedDBContinuationDoesNotStartOnFollower(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -242,6 +211,58 @@ func TestManagedSharedDBContinuationDoesNotStartOnFollower(t *testing.T) {
 	case <-called:
 		t.Fatal("follower ran managed shared DB continuation")
 	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestManagedSharedDBResumeLoopDoesNotOverlapPasses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{}, 2)
+	release := make(chan struct{}, 2)
+	done := make(chan struct{})
+	var running atomic.Int32
+	var maxRunning atomic.Int32
+	go func() {
+		runManagedSharedDBResumeLoop(ctx, 10*time.Millisecond, func(context.Context) {
+			current := running.Add(1)
+			for {
+				observed := maxRunning.Load()
+				if current <= observed || maxRunning.CompareAndSwap(observed, current) {
+					break
+				}
+			}
+			started <- struct{}{}
+			<-release
+			running.Add(-1)
+		})
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("initial managed shared DB resume pass did not start")
+	}
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-started:
+		t.Fatal("managed shared DB resume loop started an overlapping pass")
+	default:
+	}
+	release <- struct{}{}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("managed shared DB resume loop did not run after the first pass completed")
+	}
+	cancel()
+	release <- struct{}{}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("managed shared DB resume loop did not stop after cancellation")
+	}
+	if got := maxRunning.Load(); got != 1 {
+		t.Fatalf("maximum concurrent resume passes = %d, want 1", got)
 	}
 }
 
@@ -1307,6 +1328,115 @@ func TestManagedSharedDBBatchCreateUsesAllocationLock(t *testing.T) {
 	}
 }
 
+func TestSharedDBAllocationLockWaitRespectsContextAndCleansUp(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	srv := &Server{meta: metaStore}
+
+	holderStarted := make(chan struct{})
+	releaseHolder := make(chan struct{})
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- srv.withSharedDBAllocationLock(context.Background(), "org:cancel-lock", func(context.Context) error {
+			close(holderStarted)
+			<-releaseHolder
+			return nil
+		})
+	}()
+	select {
+	case <-holderStarted:
+	case <-time.After(time.Second):
+		t.Fatal("allocation lock holder did not start")
+	}
+
+	waiterCtx, cancel := context.WithCancel(context.Background())
+	waiterDone := make(chan error, 1)
+	go func() {
+		waiterDone <- srv.withSharedDBAllocationLock(waiterCtx, "org:cancel-lock", func(context.Context) error {
+			return errors.New("cancelled waiter entered critical section")
+		})
+	}()
+	cancel()
+	select {
+	case waitErr := <-waiterDone:
+		if !errors.Is(waitErr, context.Canceled) {
+			t.Errorf("cancelled waiter error = %v, want context.Canceled", waitErr)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Error("cancelled waiter remained blocked on the local allocation lock")
+	}
+	close(releaseHolder)
+	if err := <-holderDone; err != nil {
+		t.Fatalf("allocation lock holder: %v", err)
+	}
+	select {
+	case waitErr := <-waiterDone:
+		if !errors.Is(waitErr, context.Canceled) {
+			t.Errorf("eventual cancelled waiter error = %v, want context.Canceled", waitErr)
+		}
+	default:
+	}
+	entries := 0
+	srv.sharedDBAllocationLocks.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	if entries != 0 {
+		t.Fatalf("allocation lock entries after all users finished = %d, want 0", entries)
+	}
+}
+
+func TestEnsureManagedSharedDBPhysicalUsesPoolLockForKnownCluster(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-known-cluster", ProvisioningKey: bytes.Repeat([]byte{7}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+		PasswordCipher: []byte("cipher"), Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.UpdateManagedSharedDBPoolCloudResult(context.Background(), &meta.SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-known-cluster", ClusterID: "cluster-known",
+		Host: "db.example.com", Port: 4000, User: "prefix.root", PasswordCipher: []byte("cipher"), Name: "tidbcloud_fs", TLSMode: "true",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{meta: metaStore, provisioner: &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative}}
+	identity := fmt.Sprintf("org:org-known-cluster:db_pool:%d", dbID)
+	holderStarted := make(chan struct{})
+	releaseHolder := make(chan struct{})
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- srv.withSharedDBAllocationLock(context.Background(), identity, func(context.Context) error {
+			close(holderStarted)
+			<-releaseHolder
+			return nil
+		})
+	}()
+	<-holderStarted
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err = srv.ensureManagedSharedDBPhysical(ctx, dbID)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("known-cluster ensure error = %v, want context deadline while pool lock is held", err)
+	}
+	close(releaseHolder)
+	if err := <-holderDone; err != nil {
+		t.Fatalf("pool lock holder: %v", err)
+	}
+}
+
 func TestManagedSharedDBBatchCreateRunsAllChunksConcurrently(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -1423,6 +1553,67 @@ func TestManagedSharedDBBatchCreateReturnsTotalFailure(t *testing.T) {
 	_, err = srv.provisionManagedSharedDBPoolsBatch(context.Background(), []int64{dbID})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("batch error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestManagedSharedDBBatchCreateRejectsUnsupportedProvisioner(t *testing.T) {
+	srv := &Server{provisioner: nonBranchOnlyProvisioner{}}
+	_, err := srv.provisionManagedSharedDBPoolsBatchWithCredentials(context.Background(), []int64{1}, tenant.CredentialProvisionRequest{})
+	if err == nil || !strings.Contains(err.Error(), "does not support managed shared db pools") {
+		t.Fatalf("batch create error = %v, want unsupported provisioner", err)
+	}
+}
+
+func TestManagedSharedDBBatchCreatePersistsResultsAfterInvalidEntry(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	rows := make(map[int64]*meta.SharedDB, 2)
+	requests := make([]tenant.SharedDBPoolCreateRequest, 0, 2)
+	for i := 0; i < 2; i++ {
+		dbID, createErr := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+			TiDBCloudOrganizationID: "org-partial-persist", ProvisioningKey: bytes.Repeat([]byte{byte(i + 1)}, 32),
+			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+			PasswordCipher: []byte("cipher"), Name: "tidbcloud_fs",
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		row, loadErr := metaStore.GetSharedDB(context.Background(), dbID)
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		rows[dbID] = row
+		requests = append(requests, tenant.SharedDBPoolCreateRequest{DBPoolID: dbID, DBPoolUUID: row.UUID})
+	}
+	partialErr := errors.New("partial cloud response")
+	second := rows[requests[1].DBPoolID]
+	prov := &fakeProvisioner{
+		provider: tenant.ProviderTiDBCloudNative,
+		sharedPoolResults: []*tenant.SharedDBPoolInfo{
+			{DBPoolID: 999999, DBPoolUUID: "unknown", ClusterID: "cluster-unknown"},
+			{DBPoolID: second.ID, DBPoolUUID: second.UUID, ClusterID: "cluster-persisted", Host: "db.example.com", Port: 4000, Username: "prefix.root", DBName: second.Name},
+		},
+		sharedPoolPartialErr: partialErr,
+	}
+	srv := &Server{meta: metaStore}
+	err = srv.provisionManagedSharedDBPoolsBatchChunkLocked(context.Background(), prov, requests, rows, tenant.CredentialProvisionRequest{})
+	if !errors.Is(err, partialErr) {
+		t.Fatalf("batch create error = %v, want partial cloud error", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "unknown db pool") {
+		t.Fatalf("batch create error = %v, want invalid result error", err)
+	}
+	persisted, err := metaStore.GetSharedDB(context.Background(), second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ClusterID != "cluster-persisted" {
+		t.Fatalf("later cloud result cluster_id = %q, want cluster-persisted", persisted.ClusterID)
 	}
 }
 

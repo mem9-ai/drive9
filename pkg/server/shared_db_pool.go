@@ -85,11 +85,54 @@ func sharedDBAllocationIdentity(organizationID string, provisioningKey []byte) s
 	return fmt.Sprintf("credential:%x", provisioningKey)
 }
 
+type sharedDBAllocationLocalLock struct {
+	mu        sync.Mutex
+	semaphore chan struct{}
+	refs      int
+}
+
+func (s *Server) acquireSharedDBAllocationLocalLock(ctx context.Context, identity string) (*sharedDBAllocationLocalLock, error) {
+	for {
+		candidate := &sharedDBAllocationLocalLock{semaphore: make(chan struct{}, 1)}
+		value, _ := s.sharedDBAllocationLocks.LoadOrStore(identity, candidate)
+		localLock := value.(*sharedDBAllocationLocalLock)
+		localLock.mu.Lock()
+		current, loaded := s.sharedDBAllocationLocks.Load(identity)
+		if !loaded || current != localLock {
+			localLock.mu.Unlock()
+			continue
+		}
+		localLock.refs++
+		localLock.mu.Unlock()
+
+		select {
+		case localLock.semaphore <- struct{}{}:
+			return localLock, nil
+		case <-ctx.Done():
+			s.releaseSharedDBAllocationLocalLock(identity, localLock, false)
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (s *Server) releaseSharedDBAllocationLocalLock(identity string, localLock *sharedDBAllocationLocalLock, held bool) {
+	if held {
+		<-localLock.semaphore
+	}
+	localLock.mu.Lock()
+	localLock.refs--
+	if localLock.refs == 0 {
+		s.sharedDBAllocationLocks.CompareAndDelete(identity, localLock)
+	}
+	localLock.mu.Unlock()
+}
+
 func (s *Server) withSharedDBAllocationLock(ctx context.Context, identity string, fn func(context.Context) error) error {
-	value, _ := s.sharedDBAllocationLocks.LoadOrStore(identity, &sync.Mutex{})
-	localLock := value.(*sync.Mutex)
-	localLock.Lock()
-	defer localLock.Unlock()
+	localLock, err := s.acquireSharedDBAllocationLocalLock(ctx, identity)
+	if err != nil {
+		return err
+	}
+	defer s.releaseSharedDBAllocationLocalLock(identity, localLock, true)
 	return s.meta.WithSharedDBAllocationLock(ctx, identity, fn)
 }
 
@@ -557,44 +600,6 @@ func runManagedSharedDBProvisioningQueue(
 	return failed
 }
 
-func runManagedSharedDBProvisioningJobs(ctx context.Context, workers int, slots chan struct{}, dbIDs []int64, run func(context.Context, int64)) {
-	if workers <= 0 || len(dbIDs) == 0 {
-		return
-	}
-	jobs := make(chan int64)
-	var wg sync.WaitGroup
-	for range min(workers, len(dbIDs)) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for dbID := range jobs {
-				if slots != nil {
-					select {
-					case slots <- struct{}{}:
-					case <-ctx.Done():
-						return
-					}
-				}
-				run(ctx, dbID)
-				if slots != nil {
-					<-slots
-				}
-			}
-		}()
-	}
-	for _, dbID := range dbIDs {
-		select {
-		case jobs <- dbID:
-		case <-ctx.Done():
-			close(jobs)
-			wg.Wait()
-			return
-		}
-	}
-	close(jobs)
-	wg.Wait()
-}
-
 func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows []*meta.SharedDB, onReady func([]int64)) {
 	owned := make([]*meta.SharedDB, 0, len(rows))
 	for _, row := range rows {
@@ -945,6 +950,9 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) 
 			return nil, err
 		}
 		identity := sharedDBAllocationIdentity(poolInfo.TiDBCloudOrganizationID, poolInfo.ProvisioningKey)
+		if strings.TrimSpace(poolInfo.ClusterID) != "" {
+			identity = fmt.Sprintf("%s:db_pool:%d", identity, poolInfo.ID)
+		}
 		var result *meta.SharedDB
 		restartWithOrganization := false
 		err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
