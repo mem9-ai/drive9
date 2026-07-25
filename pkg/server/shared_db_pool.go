@@ -146,6 +146,16 @@ func (s *Server) withSharedDBAllocationLock(ctx context.Context, identity string
 	return s.meta.WithSharedDBAllocationLock(ctx, identity, fn)
 }
 
+func (s *Server) withSharedDBPoolWorkLock(ctx context.Context, dbID int64, fn func(context.Context) error) error {
+	identity := fmt.Sprintf("pool-work:%d", dbID)
+	localLock, err := acquireSharedDBLocalLock(ctx, &s.sharedDBAllocationLocks, identity)
+	if err != nil {
+		return err
+	}
+	defer releaseSharedDBLocalLock(&s.sharedDBAllocationLocks, identity, localLock, true)
+	return s.meta.WithSharedDBPoolWorkLock(ctx, dbID, fn)
+}
+
 func (s *Server) withSharedDBReservationLock(ctx context.Context, identity string, fn func() error) error {
 	localLock, err := acquireSharedDBLocalLock(ctx, &s.sharedDBReservationLocks, identity)
 	if err != nil {
@@ -941,12 +951,8 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 		if err != nil {
 			return err
 		}
-		identity := sharedDBAllocationIdentity(poolInfo.TiDBCloudOrganizationID, poolInfo.ProvisioningKey)
-		if strings.TrimSpace(poolInfo.ClusterID) != "" {
-			identity = fmt.Sprintf("%s:db_pool:%d", identity, poolInfo.ID)
-		}
 		restartWithOrganization := false
-		err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
+		continuePool := func(lockCtx context.Context) error {
 			current, loadErr := s.meta.GetSharedDB(lockCtx, dbID)
 			if loadErr != nil {
 				return loadErr
@@ -956,7 +962,8 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 				return nil
 			}
 			return s.continueManagedSharedDBPoolLocked(lockCtx, current, cred)
-		})
+		}
+		err = s.withSharedDBPoolWorkLock(ctx, dbID, continuePool)
 		if err != nil {
 			return err
 		}
@@ -1069,13 +1076,9 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) 
 		if err != nil {
 			return nil, err
 		}
-		identity := sharedDBAllocationIdentity(poolInfo.TiDBCloudOrganizationID, poolInfo.ProvisioningKey)
-		if strings.TrimSpace(poolInfo.ClusterID) != "" {
-			identity = fmt.Sprintf("%s:db_pool:%d", identity, poolInfo.ID)
-		}
 		var result *meta.SharedDB
 		restartWithOrganization := false
-		err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
+		ensurePool := func(lockCtx context.Context) error {
 			current, loadErr := s.meta.GetSharedDB(lockCtx, dbID)
 			if loadErr != nil {
 				return loadErr
@@ -1087,7 +1090,8 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) 
 			var ensureErr error
 			result, ensureErr = s.ensureManagedSharedDBPhysicalLocked(lockCtx, current, cred)
 			return ensureErr
-		})
+		}
+		err = s.withSharedDBPoolWorkLock(ctx, dbID, ensurePool)
 		if err != nil {
 			return nil, err
 		}
@@ -1098,11 +1102,10 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) 
 	return nil, fmt.Errorf("db pool %d allocation identity kept changing", dbID)
 }
 
-// continueManagedSharedDBPoolLocked keeps one durable allocation lock through
-// physical ensure, schema ensure, and activation. Pools with a known cluster
-// ID use a per-pool lock so metadata and schema work can advance concurrently;
-// pools without a cluster ID retain the organization lock to prevent duplicate
-// physical creation.
+// continueManagedSharedDBPoolLocked keeps one per-pool lock through physical
+// ensure, schema ensure, and activation. It is the same work lock used by the
+// batch create path, preventing duplicate physical creation and overlapping
+// schema attempts without serializing unrelated pools in one organization.
 func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo *meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
 	dbID := poolInfo.ID
 	var err error

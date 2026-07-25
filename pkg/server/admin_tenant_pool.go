@@ -1214,70 +1214,15 @@ func (s *Server) provisionManagedSharedDBPoolsBatchWithCredentials(ctx context.C
 }
 
 func (s *Server) provisionManagedSharedDBPoolAllocationGroup(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) (string, error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		first, err := s.meta.GetSharedDB(ctx, dbIDs[0])
-		if err != nil {
-			return "", err
-		}
-		identity := sharedDBAllocationIdentity(first.TiDBCloudOrganizationID, first.ProvisioningKey)
-		restartWithOrganization := false
-		resolvedOrg := ""
-		err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
-			current, err := s.meta.GetSharedDB(lockCtx, dbIDs[0])
-			if err != nil {
-				return err
-			}
-			if strings.TrimSpace(first.TiDBCloudOrganizationID) != strings.TrimSpace(current.TiDBCloudOrganizationID) {
-				restartWithOrganization = true
-				return nil
-			}
-			var createErr error
-			resolvedOrg, createErr = s.provisionManagedSharedDBPoolsBatchLocked(lockCtx, provisioner, dbIDs, cred)
-			return createErr
-		})
-		if err != nil {
-			return resolvedOrg, err
-		}
-		if !restartWithOrganization {
-			return resolvedOrg, nil
-		}
+	first, err := s.meta.GetSharedDB(ctx, dbIDs[0])
+	if err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("shared DB pool batch allocation identity kept changing")
+	resolvedOrg := strings.TrimSpace(first.TiDBCloudOrganizationID)
+	return resolvedOrg, s.provisionManagedSharedDBPoolsBatchForGroup(ctx, provisioner, dbIDs, cred)
 }
 
-func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) (string, error) {
-	requests := make([]tenant.SharedDBPoolCreateRequest, 0, len(dbIDs))
-	rows := make(map[int64]*meta.SharedDB, len(dbIDs))
-	resolvedOrg := ""
-	for _, dbID := range dbIDs {
-		row, err := s.meta.GetSharedDB(ctx, dbID)
-		if err != nil {
-			return resolvedOrg, err
-		}
-		if resolvedOrg == "" {
-			resolvedOrg = row.TiDBCloudOrganizationID
-		}
-		// A concurrent direct continuation may have completed physical creation
-		// before this batch acquired the organization lock. Its cluster must be
-		// adopted/refreshed by the normal continuation, never created again.
-		if row.ClusterID != "" {
-			continue
-		}
-		plain, err := s.pool.Decrypt(ctx, row.PasswordCipher)
-		if err != nil {
-			return resolvedOrg, err
-		}
-		if row.SpendingLimit == nil {
-			return resolvedOrg, fmt.Errorf("managed db pool %d has no spending target", dbID)
-		}
-		rows[dbID] = row
-		requests = append(requests, tenant.SharedDBPoolCreateRequest{DBPoolID: dbID, DBPoolUUID: row.UUID,
-			CustomerOrganizationID: strings.TrimSpace(row.TiDBCloudOrganizationID), DatabaseName: row.Name,
-			RootPassword: string(plain), SpendingLimitMonthly: *row.SpendingLimit})
-	}
-	if len(requests) == 0 {
-		return resolvedOrg, nil
-	}
+func (s *Server) provisionManagedSharedDBPoolsBatchForGroup(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) error {
 	type batchResult struct {
 		err error
 	}
@@ -1285,23 +1230,35 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 	if batchSize <= 0 {
 		batchSize = DefaultManagedSharedDBCloudBatchSize
 	}
-	batchCount := (len(requests) + batchSize - 1) / batchSize
+	batchCount := (len(dbIDs) + batchSize - 1) / batchSize
 	batchResults := make([]batchResult, batchCount)
-	batches := make([][]tenant.SharedDBPoolCreateRequest, 0, batchCount)
-	for start := 0; start < len(requests); start += batchSize {
-		end := min(start+batchSize, len(requests))
-		batches = append(batches, append([]tenant.SharedDBPoolCreateRequest(nil), requests[start:end]...))
+	batches := make([][]int64, 0, batchCount)
+	for start := 0; start < len(dbIDs); start += batchSize {
+		end := min(start+batchSize, len(dbIDs))
+		batches = append(batches, append([]int64(nil), dbIDs[start:end]...))
 	}
+	poolLimit := s.managedSharedDBRefillPoolLimit
+	if poolLimit <= 0 {
+		poolLimit = DefaultManagedSharedDBRefillPoolLimit
+	}
+	batchSlots := make(chan struct{}, max(1, (poolLimit+batchSize-1)/batchSize))
 	var wg sync.WaitGroup
 	for batchIndex := range batches {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			select {
+			case batchSlots <- struct{}{}:
+				defer func() { <-batchSlots }()
+			case <-ctx.Done():
+				batchResults[batchIndex].err = ctx.Err()
+				return
+			}
 			if err := ctx.Err(); err != nil {
 				batchResults[batchIndex].err = err
 				return
 			}
-			batchResults[batchIndex].err = s.provisionManagedSharedDBPoolsBatchChunkLocked(ctx, provisioner, batches[batchIndex], rows, cred)
+			batchResults[batchIndex].err = s.provisionManagedSharedDBPoolsBatchChunk(ctx, provisioner, batches[batchIndex], cred)
 		}()
 	}
 	wg.Wait()
@@ -1309,10 +1266,44 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 	for _, result := range batchResults {
 		batchErr = errors.Join(batchErr, result.err)
 	}
-	return resolvedOrg, batchErr
+	return batchErr
 }
 
-func (s *Server) provisionManagedSharedDBPoolsBatchChunkLocked(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, requests []tenant.SharedDBPoolCreateRequest, rows map[int64]*meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
+func (s *Server) provisionManagedSharedDBPoolsBatchChunk(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) error {
+	return s.meta.WithSharedDBPoolWorkClaims(ctx, dbIDs, func(claimCtx context.Context, ownedIDs []int64) error {
+		requests := make([]tenant.SharedDBPoolCreateRequest, 0, len(ownedIDs))
+		rows := make(map[int64]*meta.SharedDB, len(ownedIDs))
+		for _, dbID := range ownedIDs {
+			row, err := s.meta.GetSharedDB(claimCtx, dbID)
+			if err != nil {
+				return err
+			}
+			// Re-read after taking per-pool ownership. A concurrent direct
+			// continuation may have persisted the cluster before this batch
+			// acquired its claim; such rows continue through metadata polling.
+			if row.Status != meta.SharedDBStatusPending || strings.TrimSpace(row.ClusterID) != "" {
+				continue
+			}
+			plain, err := s.pool.Decrypt(claimCtx, row.PasswordCipher)
+			if err != nil {
+				return err
+			}
+			if row.SpendingLimit == nil {
+				return fmt.Errorf("managed db pool %d has no spending target", dbID)
+			}
+			rows[dbID] = row
+			requests = append(requests, tenant.SharedDBPoolCreateRequest{DBPoolID: dbID, DBPoolUUID: row.UUID,
+				CustomerOrganizationID: strings.TrimSpace(row.TiDBCloudOrganizationID), DatabaseName: row.Name,
+				RootPassword: string(plain), SpendingLimitMonthly: *row.SpendingLimit})
+		}
+		if len(requests) == 0 {
+			return nil
+		}
+		return s.provisionManagedSharedDBPoolsBatchChunkClaimed(claimCtx, provisioner, requests, rows, cred)
+	})
+}
+
+func (s *Server) provisionManagedSharedDBPoolsBatchChunkClaimed(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, requests []tenant.SharedDBPoolCreateRequest, rows map[int64]*meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
 	created, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, requests, cred)
 	if createErr != nil && len(created) == 0 {
 		logger.Warn(ctx, "managed_shared_db_batch_create_failed",
