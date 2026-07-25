@@ -264,6 +264,11 @@ type Server struct {
 	// safetyNetScanInterval is how often each pod runs the safety-net scan.
 	// Non-positive disables it.
 	safetyNetScanInterval time.Duration
+
+	// httpSrv is the running HTTP server, stored by ListenAndServe so
+	// Shutdown can drain it on SIGINT/SIGTERM. Guarded by httpSrvMu.
+	httpSrvMu sync.Mutex
+	httpSrv   *http.Server
 }
 
 type tenantAutoEmbeddingDefault struct {
@@ -619,9 +624,11 @@ func normalizeTenantPoolRefillFreeRatio(ratio float64) float64 {
 // OR-merges them per tenant and flushes one multi-row INSERT per 200ms
 // window (adding ≤200ms cross-pod latency on top of the poller tick; the
 // same-pod kick above is unaffected). Without a coalescer (single-tenant
-// mode) it falls back to a direct single-row insert. Failures are logged and
-// are safe: the safety-net scan recovers any missed work. The direct path
-// uses a non-cancelable background context so a client disconnect after the
+// mode) it falls back to a direct single-row insert. Flush failures retry
+// once and then fall back to per-row inserts; the safety-net scan backstops
+// semantic/file_gc work only, so SSE cross-pod delivery relies on that
+// retry/fallback (see notify_coalescer.go). The direct path uses a
+// non-cancelable background context so a client disconnect after the
 // commit doesn't abort the outbox pointer.
 func (s *Server) insertTenantNotify(tenantID string, workMask int) {
 	if s.meta == nil || tenantID == "" || workMask == 0 {
@@ -671,7 +678,7 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 	// flushes them in one multi-row INSERT per 200ms window, replacing the
 	// per-event single-row INSERTs that dominated metadb write load. Stopped
 	// (with a final flush) in stopNotifyInfrastructure.
-	s.notifyCoalescer = newTenantNotifyCoalescer(s.meta.InsertTenantNotifyBatch, defaultTenantNotifyFlushInterval)
+	s.notifyCoalescer = newTenantNotifyCoalescer(s.meta.InsertTenantNotifyBatch, s.meta.InsertTenantNotify, defaultTenantNotifyFlushInterval)
 	s.notifyCoalescer.start(notifyCtx)
 
 	// Shard resolver: refresh the active pod ring synchronously before the
@@ -762,10 +769,12 @@ func (s *Server) stopNotifyInfrastructure() {
 	// Stop the coalescer right after cancel: its flush loop exits on the
 	// cancelled context, then stop() performs a final flush of pending
 	// signals on a fresh context (the meta store is still open at this
-	// point; it is closed later by the server binary).
+	// point; it is closed later by the server binary). The field is NOT
+	// cleared afterwards: insertTenantNotify reads it unsynchronized from
+	// the write path, and the coalescer's stopped flag makes post-stop adds
+	// a no-op, so keeping the pointer removes the field data race.
 	if s.notifyCoalescer != nil {
 		s.notifyCoalescer.stop()
-		s.notifyCoalescer = nil
 	}
 	s.notifyWG.Wait()
 	if s.shardResolver != nil {
@@ -1395,7 +1404,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) ListenAndServe(addr string) error {
 	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes))
-	return http.ListenAndServe(addr, s)
+	httpSrv := &http.Server{Addr: addr, Handler: s}
+	s.httpSrvMu.Lock()
+	s.httpSrv = httpSrv
+	s.httpSrvMu.Unlock()
+	err := httpSrv.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		// Shutdown (SIGINT/SIGTERM) drained the server; not an error.
+		return nil
+	}
+	return err
+}
+
+// Shutdown gracefully stops the HTTP server started by ListenAndServe,
+// draining in-flight requests until ctx expires. It is a no-op before
+// ListenAndServe runs. The server binaries call it on SIGINT/SIGTERM so
+// ListenAndServe returns and Close (final coalescer flush, worker teardown)
+// can run in the main flow.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.httpSrvMu.Lock()
+	httpSrv := s.httpSrv
+	s.httpSrvMu.Unlock()
+	if httpSrv == nil {
+		return nil
+	}
+	return httpSrv.Shutdown(ctx)
 }
 
 func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {

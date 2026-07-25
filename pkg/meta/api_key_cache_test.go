@@ -190,6 +190,76 @@ func TestResolveByAPIKeyHashRevokeByIssuerEvictsCache(t *testing.T) {
 	}
 }
 
+func TestResolveByAPIKeyHashTenantStatusUpdateEvictsCache(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	insertCacheTestTenant(t, s, "cache-t8")
+	insertCacheTestKey(t, s, "cache-t8", "cache-k8", "cache-hash8")
+
+	// Populate the cache; the second resolve must be served from it.
+	if _, err := s.ResolveByAPIKeyHash(ctx, "cache-hash8"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResolveByAPIKeyHash(ctx, "cache-hash8"); err != nil {
+		t.Fatal(err)
+	}
+	if hits := s.apiKeys.hits.Load(); hits != 1 {
+		t.Fatalf("cache hits = %d, want 1", hits)
+	}
+
+	if err := s.UpdateTenantStatus(ctx, "cache-t8", TenantSuspended); err != nil {
+		t.Fatal(err)
+	}
+	missesBefore := s.apiKeys.misses.Load()
+	got, err := s.ResolveByAPIKeyHash(ctx, "cache-hash8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.apiKeys.misses.Load(); got != missesBefore+1 {
+		t.Fatalf("cache misses after status update = %d, want %d (entry evicted)", got, missesBefore+1)
+	}
+	if got.Tenant.Status != TenantSuspended {
+		t.Fatalf("tenant status after update = %s, want %s (no TTL wait)", got.Tenant.Status, TenantSuspended)
+	}
+}
+
+func TestResolveByAPIKeyHashDBCredentialUpdateEvictsCache(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	insertCacheTestTenant(t, s, "cache-t9")
+	insertCacheTestKey(t, s, "cache-t9", "cache-k9", "cache-hash9")
+
+	if _, err := s.ResolveByAPIKeyHash(ctx, "cache-hash9"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResolveByAPIKeyHash(ctx, "cache-hash9"); err != nil {
+		t.Fatal(err)
+	}
+	if hits := s.apiKeys.hits.Load(); hits != 1 {
+		t.Fatalf("cache hits = %d, want 1", hits)
+	}
+
+	updated, err := s.UpdateTenantDBCredentialIf(ctx, "cache-t9", "root", "app_user", []byte("new-cipher"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated {
+		t.Fatal("UpdateTenantDBCredentialIf updated = false, want true")
+	}
+	missesBefore := s.apiKeys.misses.Load()
+	got, err := s.ResolveByAPIKeyHash(ctx, "cache-hash9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.apiKeys.misses.Load(); got != missesBefore+1 {
+		t.Fatalf("cache misses after credential update = %d, want %d (entry evicted)", got, missesBefore+1)
+	}
+	if got.Tenant.DBUser != "app_user" || string(got.Tenant.DBPasswordCipher) != "new-cipher" {
+		t.Fatalf("credentials after update = %q/%q, want app_user/new-cipher (no TTL wait)",
+			got.Tenant.DBUser, got.Tenant.DBPasswordCipher)
+	}
+}
+
 func TestResolveByAPIKeyHashTTLExpiryRefetches(t *testing.T) {
 	s := newControlStore(t)
 	s.apiKeys.ttl = 20 * time.Millisecond

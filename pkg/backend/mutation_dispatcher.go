@@ -53,8 +53,8 @@ type quotaMutationItem struct {
 // apply engine. K shard workers each own a buffered channel; a shard worker
 // blocks on the first item, then non-blockingly drains up to
 // mutationDispatcherMaxBatchExtra more and applies the whole batch in a
-// single metadb transaction (per store), collapsing what used to be one
-// begin+commit pair per file mutation.
+// single metadb transaction (per underlying store identity), collapsing
+// what used to be one begin+commit pair per file mutation.
 type mutationDispatcher struct {
 	shards [mutationDispatcherShards]chan quotaMutationItem
 	cancel context.CancelFunc
@@ -170,13 +170,13 @@ func collectMutationBatch(ch chan quotaMutationItem, first quotaMutationItem) []
 
 // processMutationBatch applies one shard batch. Raw items (legacy
 // enqueueMutation closures, test-only) run individually in received order.
-// Batchable items are grouped by store — preserving received order within
-// each group — because one transaction can only run on one store; groups
-// with a single item take the legacy per-item path, larger groups share one
-// transaction.
+// Batchable items are grouped by store identity (QuotaStoreIdentity) —
+// preserving received order within each group — because one transaction can
+// only run on one underlying store; groups with a single item take the
+// legacy per-item path, larger groups share one transaction.
 func processMutationBatch(ctx context.Context, batch []quotaMutationItem) {
 	groups := make([]mutationStoreGroup, 0, 1)
-	groupIndexByStore := make(map[MetaQuotaStore]int)
+	groupIndexByIdentity := make(map[any]int)
 	for i := range batch {
 		item := &batch[i]
 		if item.raw != nil {
@@ -184,10 +184,11 @@ func processMutationBatch(ctx context.Context, batch []quotaMutationItem) {
 			item.backend.mutationWG.Done()
 			continue
 		}
-		idx, ok := groupIndexByStore[item.store]
+		identity := item.store.QuotaStoreIdentity()
+		idx, ok := groupIndexByIdentity[identity]
 		if !ok {
 			idx = len(groups)
-			groupIndexByStore[item.store] = idx
+			groupIndexByIdentity[identity] = idx
 			groups = append(groups, mutationStoreGroup{store: item.store})
 		}
 		groups[idx].items = append(groups[idx].items, item)
@@ -197,15 +198,20 @@ func processMutationBatch(ctx context.Context, batch []quotaMutationItem) {
 	}
 }
 
+// mutationStoreGroup is one identity group's share of a shard batch. store
+// is the first item's handle: adapters over the same underlying store are
+// interchangeable because item apply closures receive the tx and delegate,
+// so any handle of the group can host the transaction.
 type mutationStoreGroup struct {
 	store MetaQuotaStore
 	items []*quotaMutationItem
 }
 
-// processMutationStoreGroup applies one store's share of a shard batch in a
-// single transaction: every item's apply in received order (create/overwrite
-// mutations on the same file are non-commutative; per-tenant FIFO is
-// guaranteed by mutationMu plus one shard per tenant), then one batch mark.
+// processMutationStoreGroup applies one store-identity group's share of a
+// shard batch in a single transaction: every item's apply in received order
+// (create/overwrite mutations on the same file are non-commutative;
+// per-tenant FIFO is guaranteed by mutationMu plus one shard per tenant),
+// then one batch mark.
 //
 // On any failure — including InnoDB killing the batch as a cross-pod
 // deadlock victim (two pods' batch transactions lock tenant_file_meta rows

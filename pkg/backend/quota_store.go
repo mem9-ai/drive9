@@ -79,6 +79,15 @@ type MetaQuotaStore interface {
 
 	// Transaction support
 	InTx(ctx context.Context, fn func(tx *sql.Tx) error) error
+
+	// QuotaStoreIdentity returns a stable, comparable identity of the
+	// underlying store behind this handle. tenant.Pool wraps one *meta.Store
+	// in a per-backend adapter, so the mutation dispatcher must group batch
+	// items by this identity rather than by interface value — otherwise every
+	// adapter forms its own singleton group and cross-tenant batching never
+	// happens. Handles backed by the same underlying store must return equal
+	// identities.
+	QuotaStoreIdentity() any
 }
 
 // QuotaConfigView is the backend-side view of per-tenant quota configuration.

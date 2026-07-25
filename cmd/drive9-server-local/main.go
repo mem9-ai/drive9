@@ -6,13 +6,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -345,7 +348,25 @@ func main() {
 		zap.Duration("startup_elapsed", time.Since(startupStart)))
 	defer func() { _ = ln.Close() }()
 
-	die(http.Serve(ln, srv))
+	// Graceful shutdown: on SIGINT/SIGTERM drain in-flight requests so Serve
+	// returns and the deferred srv.Close() above runs the worker teardown.
+	httpSrv := &http.Server{Handler: srv}
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-stopCtx.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(ctx); err != nil {
+			logger.Warn(context.Background(), "server_shutdown_failed", zap.Error(err))
+		}
+	}()
+
+	err = httpSrv.Serve(ln)
+	if errors.Is(err, http.ErrServerClosed) {
+		err = nil
+	}
+	die(err)
 }
 
 func usage() {

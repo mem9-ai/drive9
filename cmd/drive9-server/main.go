@@ -15,8 +15,10 @@ import (
 	"math"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
@@ -448,7 +450,7 @@ func main() {
 			zap.Bool("push_enabled", podNotifySecret != nil))
 	}
 
-	die(server.NewWithConfig(server.Config{
+	srv := server.NewWithConfig(server.Config{
 		Meta:                            store,
 		Pool:                            pool,
 		Provisioner:                     provisioner,
@@ -485,7 +487,28 @@ func main() {
 		PodID:                           podID,
 		PodAddr:                         podAddr,
 		PodNotifySecret:                 podNotifySecret,
-	}).ListenAndServe(addr))
+	})
+
+	// Graceful shutdown: on SIGINT/SIGTERM drain in-flight requests so
+	// ListenAndServe returns and srv.Close() below can run the final notify
+	// coalescer flush (and worker teardown) BEFORE the deferred pool.Close,
+	// StopMutationDispatcher, and store close registered above tear down the
+	// stores the flush still needs.
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-stopCtx.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			logger.Warn(context.Background(), "server_shutdown_failed", zap.Error(err))
+		}
+	}()
+
+	die(srv.ListenAndServe(addr))
+	// Direct call, not a defer: defers run only after main returns, and this
+	// must precede the deferred teardown registered above.
+	srv.Close()
 }
 
 func envOr(key, fallback string) string {

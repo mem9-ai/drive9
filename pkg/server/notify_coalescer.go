@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -14,6 +15,10 @@ import (
 // defaultTenantNotifyFlushInterval is how often the coalescer flushes merged
 // work signals to tenant_notify_outbox.
 const defaultTenantNotifyFlushInterval = 200 * time.Millisecond
+
+// tenantNotifyFlushRetryBackoff is the delay before a failed batch flush is
+// retried once.
+const tenantNotifyFlushRetryBackoff = 100 * time.Millisecond
 
 // tenantNotifyCoalescer merges per-tenant tenant_notify_outbox signals in
 // process and flushes them in one multi-row INSERT per flush window, instead
@@ -31,12 +36,23 @@ const defaultTenantNotifyFlushInterval = 200 * time.Millisecond
 //     tenant worker synchronously.
 //   - Poller cursor semantics (id > cursor ORDER BY id) are unaffected
 //     because each batch INSERT commits all of its rows atomically.
-//   - Flush failures are logged and the batch is DROPPED: the outbox is
-//     already best-effort and the 5-minute safety-net scan is the backstop
-//     for any lost signal.
+//   - A failed flush retries the batch once, then falls back to independent
+//     per-row inserts; a row that still fails is logged and dropped. The
+//     5-minute safety-net scan backstops only semantic/file_gc work — it
+//     never reads tenant_notify_outbox — so SSE cross-pod delivery relies on
+//     this retry → per-row fallback. Residual signal loss occurs only under
+//     sustained metadb failure, the same failure class in which the
+//     pre-coalescer single-row path lost events too.
 type tenantNotifyCoalescer struct {
-	insert        func(ctx context.Context, entries []meta.TenantNotifyEntry) error
+	insertBatch   func(ctx context.Context, entries []meta.TenantNotifyEntry) error
+	insertSingle  func(ctx context.Context, tenantID string, workMask int) error
 	flushInterval time.Duration
+
+	// stopped is set by stop; add becomes a no-op afterwards. insertTenantNotify
+	// reads the Server's coalescer field unsynchronized from the write path,
+	// so the field is never cleared — this flag is what keeps post-stop
+	// signals from being accepted into a batch that will never flush.
+	stopped atomic.Bool
 
 	mu      sync.Mutex
 	pending map[string]int // tenantID → OR-merged work_mask
@@ -45,12 +61,13 @@ type tenantNotifyCoalescer struct {
 	wg     sync.WaitGroup
 }
 
-func newTenantNotifyCoalescer(insert func(ctx context.Context, entries []meta.TenantNotifyEntry) error, flushInterval time.Duration) *tenantNotifyCoalescer {
+func newTenantNotifyCoalescer(insertBatch func(ctx context.Context, entries []meta.TenantNotifyEntry) error, insertSingle func(ctx context.Context, tenantID string, workMask int) error, flushInterval time.Duration) *tenantNotifyCoalescer {
 	if flushInterval <= 0 {
 		flushInterval = defaultTenantNotifyFlushInterval
 	}
 	return &tenantNotifyCoalescer{
-		insert:        insert,
+		insertBatch:   insertBatch,
+		insertSingle:  insertSingle,
 		flushInterval: flushInterval,
 		pending:       make(map[string]int),
 	}
@@ -64,9 +81,11 @@ func (c *tenantNotifyCoalescer) start(ctx context.Context) {
 	go c.run(runCtx)
 }
 
-// add OR-merges one work signal into the pending batch.
+// add OR-merges one work signal into the pending batch. After stop it is a
+// no-op: the flush loop is gone, so accepting the signal would drop it
+// silently anyway.
 func (c *tenantNotifyCoalescer) add(tenantID string, workMask int) {
-	if tenantID == "" || workMask == 0 {
+	if tenantID == "" || workMask == 0 || c.stopped.Load() {
 		return
 	}
 	c.mu.Lock()
@@ -88,10 +107,11 @@ func (c *tenantNotifyCoalescer) run(ctx context.Context) {
 	}
 }
 
-// stop cancels the flush loop, waits for it to exit, then performs a final
-// flush on a non-cancelled context so pending signals are not dropped at
-// shutdown.
+// stop marks the coalescer stopped (further adds are dropped), cancels the
+// flush loop, waits for it to exit, then performs a final flush on a
+// non-cancelled context so pending signals are not dropped at shutdown.
 func (c *tenantNotifyCoalescer) stop() {
+	c.stopped.Store(true)
 	if c.cancel != nil {
 		c.cancel()
 	}
@@ -102,8 +122,10 @@ func (c *tenantNotifyCoalescer) stop() {
 }
 
 // flush swaps out the pending map and writes it as one batch INSERT. An
-// empty map is a no-op (no statement issued). Failures are logged and the
-// batch is dropped — the safety-net scan recovers the work.
+// empty map is a no-op (no statement issued). On batch failure the batch is
+// retried once after a short backoff; if that also fails, each row is
+// inserted individually, so a metadb hiccup degrades to roughly the
+// pre-coalescer per-event behavior instead of dropping the whole window.
 func (c *tenantNotifyCoalescer) flush(ctx context.Context) {
 	c.mu.Lock()
 	if len(c.pending) == 0 {
@@ -118,9 +140,38 @@ func (c *tenantNotifyCoalescer) flush(ctx context.Context) {
 	for tenantID, workMask := range batch {
 		entries = append(entries, meta.TenantNotifyEntry{TenantID: tenantID, WorkMask: workMask})
 	}
-	if err := c.insert(ctx, entries); err != nil {
+	if err := c.insertBatch(ctx, entries); err == nil {
+		return
+	} else {
 		logger.Warn(ctx, "tenant_notify_coalescer_flush_failed",
 			zap.Int("tenants", len(entries)),
 			zap.Error(err))
+	}
+	select {
+	case <-ctx.Done():
+		// No room for the batch retry; go straight to per-row inserts (they
+		// fail fast on the cancelled context and are dropped per row).
+	case <-time.After(tenantNotifyFlushRetryBackoff):
+		if err := c.insertBatch(ctx, entries); err == nil {
+			return
+		} else {
+			logger.Warn(ctx, "tenant_notify_coalescer_flush_retry_failed",
+				zap.Int("tenants", len(entries)),
+				zap.Error(err))
+		}
+	}
+	c.insertPerRow(ctx, entries)
+}
+
+// insertPerRow delivers each entry independently; a failing row is logged
+// and dropped without affecting the rest.
+func (c *tenantNotifyCoalescer) insertPerRow(ctx context.Context, entries []meta.TenantNotifyEntry) {
+	for _, e := range entries {
+		if err := c.insertSingle(ctx, e.TenantID, e.WorkMask); err != nil {
+			logger.Warn(ctx, "tenant_notify_coalescer_row_insert_failed",
+				zap.String("tenant_id", e.TenantID),
+				zap.Int("work_mask", e.WorkMask),
+				zap.Error(err))
+		}
 	}
 }

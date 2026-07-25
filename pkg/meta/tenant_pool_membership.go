@@ -250,7 +250,13 @@ func (s *Store) MarkFreeSharedTenantPoolTenantDeleting(ctx context.Context, tena
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
-	return updated, err
+	if err != nil {
+		return false, err
+	}
+	if updated {
+		s.apiKeys.evictTenant(tenantID)
+	}
+	return updated, nil
 }
 
 func (s *Store) CountFreeTenantPoolMemberships(ctx context.Context, organizationID string, statuses []TenantStatus) (int, error) {

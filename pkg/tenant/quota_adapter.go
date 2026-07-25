@@ -343,6 +343,10 @@ func (a *metaQuotaAdapter) InTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 	return a.s.InTx(ctx, fn)
 }
 
+// QuotaStoreIdentity returns the wrapped *meta.Store: every per-backend
+// adapter over the same underlying store shares one dispatcher batch group.
+func (a *metaQuotaAdapter) QuotaStoreIdentity() any { return a.s }
+
 func (a *metaQuotaAdapter) EnqueueObjectGCCandidate(ctx context.Context, c *meta.ObjectGCCandidateInput) error {
 	return a.s.EnqueueObjectGCCandidate(ctx, c)
 }

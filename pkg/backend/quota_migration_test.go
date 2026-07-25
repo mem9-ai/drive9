@@ -598,6 +598,10 @@ func (f *fakeMetaQuotaStore) InTx(ctx context.Context, fn func(tx *sql.Tx) error
 	return fn(nil)
 }
 
+// QuotaStoreIdentity returns the fake itself: one fake models one underlying
+// store, so two fakes never share a dispatcher batch group.
+func (f *fakeMetaQuotaStore) QuotaStoreIdentity() any { return f }
+
 func (f *fakeMetaQuotaStore) ExpireActiveReservations(ctx context.Context) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

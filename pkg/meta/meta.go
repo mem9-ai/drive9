@@ -2527,6 +2527,9 @@ func (s *Store) MarkFreeTenantPoolTenantDeleting(ctx context.Context, tenantID s
 	if err != nil {
 		return false, err
 	}
+	if updated {
+		s.apiKeys.evictTenant(tenantID)
+	}
 	return updated, nil
 }
 
@@ -2880,6 +2883,11 @@ func tenantPoolDatabaseLockName(baseLockName, databaseName string) string {
 	return baseLockName + ":" + hex.EncodeToString(sum[:4])
 }
 
+// apiKeyResolveDBTimeout bounds the detached context used for the shared DB
+// query inside the resolve singleflight (see ResolveByAPIKeyHash), so a slow
+// metadb cannot park flight waiters forever.
+const apiKeyResolveDBTimeout = 10 * time.Second
+
 // ResolveByAPIKeyHash resolves a tenant and its API key by jwt_hash. Results
 // are cached in-process for a short TTL (see api_key_cache.go) because the
 // auth middleware calls this on every authenticated request; ErrNotFound is
@@ -2896,7 +2904,13 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 		if cached, ok := s.apiKeys.lookup(hash); ok {
 			return cached, nil
 		}
-		rec, dberr := s.resolveByAPIKeyHashDB(ctx, hash)
+		// Detach the shared query from the flight leader's request context:
+		// every waiter shares this one query, so a leader's client disconnect
+		// must not cancel it for all of them. It is bounded by its own
+		// timeout instead.
+		dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), apiKeyResolveDBTimeout)
+		defer cancel()
+		rec, dberr := s.resolveByAPIKeyHashDB(dbCtx, hash)
 		if dberr != nil {
 			return nil, dberr
 		}
@@ -2904,6 +2918,13 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 		return rec, nil
 	})
 	if err != nil {
+		return nil, err
+	}
+	// The detached query protects the OTHER flight waiters from one caller's
+	// disconnect; this caller itself keeps the pre-fix prompt-cancellation
+	// behavior (the auth middleware maps it to 499 client-canceled).
+	if ctx.Err() != nil {
+		err = ctx.Err()
 		return nil, err
 	}
 	// Clone per caller: flight waiters share the fetched record, but callers
@@ -3368,6 +3389,7 @@ func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status Tenant
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.apiKeys.evictTenant(id)
 	return nil
 }
 
@@ -3387,6 +3409,7 @@ func (s *Store) UpdateTenantProvider(ctx context.Context, id, provider string) (
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.apiKeys.evictTenant(id)
 	return nil
 }
 
@@ -3399,7 +3422,11 @@ func (s *Store) UpdateTenantStatusIf(ctx context.Context, id string, from, to Te
 		return false, err
 	}
 	n, _ := res.RowsAffected()
-	return n > 0, nil
+	updated = n > 0
+	if updated {
+		s.apiKeys.evictTenant(id)
+	}
+	return updated, nil
 }
 
 func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *Tenant) (err error) {
@@ -3422,6 +3449,7 @@ func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.apiKeys.evictTenant(id)
 	return nil
 }
 
@@ -3445,6 +3473,7 @@ func (s *Store) UpdateTenantClusterReference(ctx context.Context, id string, clu
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.apiKeys.evictTenant(id)
 	return nil
 }
 
@@ -3452,7 +3481,7 @@ func (s *Store) ClearTenantProvisionMetadata(ctx context.Context, tenantID strin
 	start := time.Now()
 	defer observeMeta(ctx, "clear_tenant_provision_metadata", start, &err)
 	now := time.Now().UTC()
-	return s.InTx(ctx, func(tx *sql.Tx) error {
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE tenants
 			SET db_host = '', db_port = 0, db_user = '', db_password = ?, db_name = '', db_tls = 1,
 				cluster_id = NULL, branch_id = '', claim_url = NULL, claim_expires_at = NULL, updated_at = ?
@@ -3469,6 +3498,11 @@ func (s *Store) ClearTenantProvisionMetadata(ctx context.Context, tenantID strin
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.apiKeys.evictTenant(tenantID)
+	return nil
 }
 
 func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, dbUser string, dbPasswordCipher []byte) (updated bool, err error) {
@@ -3480,7 +3514,11 @@ func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, 
 		return false, err
 	}
 	n, _ := res.RowsAffected()
-	return n > 0, nil
+	updated = n > 0
+	if updated {
+		s.apiKeys.evictTenant(id)
+	}
+	return updated, nil
 }
 
 func (s *Store) UpdateTenantBranch(ctx context.Context, id string, cluster *Tenant) (err error) {
@@ -3501,6 +3539,7 @@ func (s *Store) UpdateTenantBranch(ctx context.Context, id string, cluster *Tena
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.apiKeys.evictTenant(id)
 	return nil
 }
 
@@ -3716,6 +3755,7 @@ func (s *Store) EnsureTenantStorageNamespace(ctx context.Context, tenantID, back
 	if err != nil {
 		return nil, err
 	}
+	s.apiKeys.evictTenant(tenantID)
 	return ns, nil
 }
 
@@ -3855,7 +3895,7 @@ func (s *Store) MarkTenantDeleted(ctx context.Context, tenantID string) (err err
 	start := time.Now()
 	defer observeMeta(ctx, "mark_tenant_deleted", start, &err)
 	now := time.Now().UTC()
-	return s.InTx(ctx, func(tx *sql.Tx) error {
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`,
 			TenantDeleted, now, tenantID)
 		if err != nil {
@@ -3869,6 +3909,11 @@ func (s *Store) MarkTenantDeleted(ctx context.Context, tenantID string) (err err
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.apiKeys.evictTenant(tenantID)
+	return nil
 }
 
 func (s *Store) MarkTenantDeleteJobDeleted(ctx context.Context, tenantID string, deletedObjects, abortedMultipartUploads int64) (err error) {
@@ -3887,7 +3932,7 @@ func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID 
 	start := time.Now()
 	defer observeMeta(ctx, "finalize_tenant_delete", start, &err)
 	now := time.Now().UTC()
-	return s.InTx(ctx, func(tx *sql.Tx) error {
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE tenant_delete_jobs
 			SET state = ?, deleted_objects = ?, aborted_multipart_uploads = ?, completed_at = ?,
 				last_error = NULL, updated_at = ?
@@ -3927,6 +3972,11 @@ func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID 
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.apiKeys.evictTenant(tenantID)
+	return nil
 }
 
 func requireAffected(res sql.Result) error {
@@ -4117,6 +4167,7 @@ func (s *Store) UpdateTenantSchemaVersion(ctx context.Context, id string, versio
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.apiKeys.evictTenant(id)
 	return nil
 }
 

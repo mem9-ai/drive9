@@ -128,8 +128,9 @@ func TestMutationBatchSingleTxForSameStore(t *testing.T) {
 	}
 }
 
-// TestMutationBatchGroupsByStore verifies that items for different stores are
-// never mixed into one transaction: each store gets its own batch.
+// TestMutationBatchGroupsByStore verifies that items for different store
+// identities are never mixed into one transaction: each store gets its own
+// batch.
 func TestMutationBatchGroupsByStore(t *testing.T) {
 	fakeA := newFakeMetaQuotaStore()
 	fakeB := newFakeMetaQuotaStore()
@@ -162,9 +163,95 @@ func TestMutationBatchGroupsByStore(t *testing.T) {
 	}
 }
 
+// adapterFakeStore wraps a shared *fakeMetaQuotaStore as a distinct
+// MetaQuotaStore value — the way tenant.metaQuotaAdapter wraps one
+// *meta.Store per backend — and reports the wrapped store as its identity.
+type adapterFakeStore struct {
+	*fakeMetaQuotaStore
+}
+
+func (a *adapterFakeStore) QuotaStoreIdentity() any { return a.fakeMetaQuotaStore }
+
+// TestMutationBatchGroupsByStoreIdentity proves the production grouping key:
+// two DIFFERENT MetaQuotaStore values (per-tenant adapters) over the SAME
+// underlying store must batch into ONE transaction. Grouping by interface
+// value instead would produce singleton groups and take the legacy per-item
+// path for each item — which is exactly what happened in production before
+// QuotaStoreIdentity existed.
+func TestMutationBatchGroupsByStoreIdentity(t *testing.T) {
+	shared := newFakeMetaQuotaStore()
+	storeA := &adapterFakeStore{shared}
+	storeB := &adapterFakeStore{shared}
+
+	bA := &Dat9Backend{}
+	bA.SetMetaQuotaStore(context.Background(), "identity-tenant-a", storeA)
+	bB := &Dat9Backend{}
+	bB.SetMetaQuotaStore(context.Background(), "identity-tenant-b", storeB)
+
+	items := []quotaMutationItem{
+		newDispatcherTestItem(t, bA, storeA, func(context.Context, *sql.Tx) error { return nil }),
+		newDispatcherTestItem(t, bB, storeB, func(context.Context, *sql.Tx) error { return nil }),
+	}
+
+	processMutationBatch(context.Background(), items)
+
+	if shared.markBatchAppliedCalls != 1 {
+		t.Fatalf("batch mark calls = %d, want 1 (one transaction across adapters of the same store)", shared.markBatchAppliedCalls)
+	}
+	if shared.markAppliedCalls != 0 {
+		t.Fatalf("per-item mark calls = %d, want 0 on the batch path", shared.markAppliedCalls)
+	}
+	for _, item := range items {
+		if got := shared.mutationStatus(item.logID); got != "applied" {
+			t.Fatalf("mutation %d status = %q, want applied", item.logID, got)
+		}
+	}
+}
+
+// TestMutationBatchAlreadyAppliedMarkFallsBackToPerItem drives the batch
+// rollback path where the batch mark detects an already-applied row (e.g. a
+// sibling pod applied it first): the batch transaction fails and every item
+// must fall back to the per-item path — each item is per-item marked and
+// sibling items still get applied.
+func TestMutationBatchAlreadyAppliedMarkFallsBackToPerItem(t *testing.T) {
+	fake := newFakeMetaQuotaStore()
+
+	b1 := &Dat9Backend{}
+	b1.SetMetaQuotaStore(context.Background(), "aa-tenant-1", fake)
+	b2 := &Dat9Backend{}
+	b2.SetMetaQuotaStore(context.Background(), "aa-tenant-2", fake)
+
+	items := []quotaMutationItem{
+		newDispatcherTestItem(t, b1, fake, func(context.Context, *sql.Tx) error { return nil }),
+		newDispatcherTestItem(t, b2, fake, func(context.Context, *sql.Tx) error { return nil }),
+	}
+	// Pre-apply the first item outside the dispatcher so the batch mark fails
+	// with an already-applied-wrapping error on the whole batch.
+	if err := fake.MarkMutationAppliedTx(nil, items[0].logID); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	perItemMarksBefore := fake.markAppliedCalls
+	fake.mu.Unlock()
+
+	processMutationBatch(context.Background(), items)
+
+	if fake.markBatchAppliedCalls != 1 {
+		t.Fatalf("batch mark calls = %d, want 1 (attempted before the fallback)", fake.markBatchAppliedCalls)
+	}
+	if got := fake.markAppliedCalls - perItemMarksBefore; got != len(items) {
+		t.Fatalf("per-item mark calls during fallback = %d, want %d (one per item)", got, len(items))
+	}
+	for _, item := range items {
+		if got := fake.mutationStatus(item.logID); got != "applied" {
+			t.Fatalf("mutation %d status = %q, want applied (sibling items applied via per-item path)", item.logID, got)
+		}
+	}
+}
+
 // TestMutationBatchPoisonItemFallsBackToPerItem verifies that one item whose
 // apply always fails does not take down the rest of the batch: the batch
-// transaction fails at the poison item, every item falls back to the legacy
+// transaction fails at the poison apply, every item falls back to the legacy
 // per-item path, the good items are applied and marked, and the poison item
 // stays pending for MutationReplayWorker.
 func TestMutationBatchPoisonItemFallsBackToPerItem(t *testing.T) {

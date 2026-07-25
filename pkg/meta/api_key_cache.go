@@ -11,9 +11,9 @@ import (
 )
 
 // defaultAPIKeyResolveCacheTTL bounds how long a resolved API key entry may be
-// served from the in-process cache. Revocations are evicted precisely via the
-// tenant index, but tenant status transitions (suspend/delete) are NOT hooked
-// into invalidation, so they become visible to callers only after this TTL.
+// served from the in-process cache. Tenant-row and tenant_api_keys mutations
+// made through this Store evict precisely via the tenant index; the TTL is the
+// backstop for changes made by other processes (each pod caches independently).
 const defaultAPIKeyResolveCacheTTL = 10 * time.Second
 
 // envAPIKeyResolveCacheTTLMS overrides defaultAPIKeyResolveCacheTTL (in
@@ -117,7 +117,9 @@ func (c *apiKeyResolveCache) fill(hash string, rec TenantWithAPIKey) {
 }
 
 // evictTenant drops every cached hash known to belong to tenantID. Called
-// after successful tenant_api_keys mutations (revocations); unknown tenants
+// after successful tenant_api_keys mutations (revocations) and tenants row
+// mutations (status/provider/credential/connection/branch/schema updates —
+// for tx-wrapped ones, only after the transaction commits); unknown tenants
 // are a no-op.
 func (c *apiKeyResolveCache) evictTenant(tenantID string) {
 	c.mu.Lock()
