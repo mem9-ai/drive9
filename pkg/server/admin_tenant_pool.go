@@ -1115,6 +1115,52 @@ func (s *Server) provisionManagedSharedDBPoolsBatchWithCredentials(ctx context.C
 	if !ok {
 		return "", fmt.Errorf("provisioner does not support managed shared db pools")
 	}
+	type allocationGroup struct {
+		dbIDs []int64
+	}
+	groupsByIdentity := make(map[string]*allocationGroup)
+	groups := make([]*allocationGroup, 0)
+	for _, dbID := range dbIDs {
+		row, err := s.meta.GetSharedDB(ctx, dbID)
+		if err != nil {
+			return "", err
+		}
+		identity := sharedDBAllocationIdentity(row.TiDBCloudOrganizationID, row.ProvisioningKey)
+		group := groupsByIdentity[identity]
+		if group == nil {
+			group = &allocationGroup{}
+			groupsByIdentity[identity] = group
+			groups = append(groups, group)
+		}
+		group.dbIDs = append(group.dbIDs, dbID)
+	}
+	type groupResult struct {
+		organizationID string
+		err            error
+	}
+	results := make([]groupResult, len(groups))
+	var wg sync.WaitGroup
+	for groupIndex := range groups {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[groupIndex].organizationID, results[groupIndex].err = s.provisionManagedSharedDBPoolAllocationGroup(
+				ctx, provisioner, groups[groupIndex].dbIDs, cred)
+		}()
+	}
+	wg.Wait()
+	resolvedOrg := ""
+	var groupErr error
+	for _, result := range results {
+		if resolvedOrg == "" {
+			resolvedOrg = result.organizationID
+		}
+		groupErr = errors.Join(groupErr, result.err)
+	}
+	return resolvedOrg, groupErr
+}
+
+func (s *Server) provisionManagedSharedDBPoolAllocationGroup(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) (string, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		first, err := s.meta.GetSharedDB(ctx, dbIDs[0])
 		if err != nil {
