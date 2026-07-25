@@ -113,19 +113,26 @@ type Dat9Backend struct {
 	quotaUsageCache    *quotaUsageCache
 	quotaPendingCache  *quotaPendingDeltasCache
 
-	// mutationQueue decouples central quota mutations
-	// (recordCentralFileCreateMutation, recordCentralFileOverwriteMutation) from
-	// the fsync critical path. Mutations are
-	// enqueued here and drained by a background worker. The mutation log
-	// provides crash recovery via the existing MutationReplayWorker.
+	// Async central quota mutation apply (recordCentralFileCreateMutation,
+	// recordCentralFileOverwriteMutation) decouples quota accounting from
+	// the fsync critical path. Mutations are durably logged, then handed to
+	// the process-global mutation dispatcher (mutation_dispatcher.go), which
+	// applies cross-tenant batches in single metadb transactions. The
+	// mutation log provides crash recovery via MutationReplayWorker. When
+	// the dispatcher is not running (unit tests, single-tenant binaries),
+	// mutations apply inline.
 	//
-	// mutationMu serializes logQuotaMutation + enqueueMutation so that
-	// durable log_id order and channel enqueue order cannot diverge under
-	// concurrent same-tenant writes.
-	mutationMu    sync.Mutex
-	mutationQueue chan func(context.Context)
-	mutationWG    sync.WaitGroup
-	mutationStop  context.CancelFunc
+	// mutationMu serializes logQuotaMutation + enqueueMutationItem so that
+	// durable log_id order and dispatcher enqueue order cannot diverge under
+	// concurrent same-tenant writes. It also guards mutationWorkerOn and
+	// mutationClosed so mutationWG.Add cannot race stopMutationWorker's
+	// Wait. mutationWG tracks items handed to the dispatcher; the worker
+	// calls Done only after the item is fully processed (batch apply,
+	// per-item fallback, plus bookkeeping).
+	mutationMu       sync.Mutex
+	mutationWG       sync.WaitGroup
+	mutationWorkerOn bool
+	mutationClosed   bool
 
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
 

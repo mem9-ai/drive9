@@ -70,6 +70,10 @@ type MetaQuotaStore interface {
 	ObservePendingMutations(ctx context.Context) ([]MutationBacklogView, error)
 	HasPendingFileMutation(ctx context.Context, tenantID, fileID string) (bool, error)
 	MarkMutationAppliedTx(tx *sql.Tx, id int64) error
+	// MarkMutationsAppliedTx marks a whole dispatcher batch applied in one
+	// statement; see meta.Store.MarkMutationsAppliedTx for the exact-apply
+	// (RowsAffected == len(ids)) semantics.
+	MarkMutationsAppliedTx(tx *sql.Tx, ids []int64) error
 	IsMutationAlreadyAppliedError(err error) bool
 	IncrMutationRetry(ctx context.Context, id int64, maxRetries int) error
 

@@ -639,6 +639,14 @@ func (s *Server) insertTenantNotify(tenantID string, workMask int) {
 // Only called in multi-tenant mode (Meta != nil). In single-tenant mode the
 // fallback EventBus + tenantWorker workerLoop ticker handle delivery.
 func (s *Server) startNotifyInfrastructure(cfg Config) {
+	// Cross-tenant quota mutation batching: the process-global dispatcher's
+	// shard workers aggregate async quota applies into single metadb
+	// transactions. Started on every multi-tenant pod (not leader-gated) and
+	// stopped from the server binary after the tenant pool closes
+	// (cmd/drive9-server/main.go), because backend.Close drains queued items
+	// through the dispatcher first.
+	backend.StartMutationDispatcher()
+
 	// Create a single context for all notify components. We store only the
 	// cancel func (not the context itself) on Server, per coding guidelines.
 	notifyCtx, notifyCancel := context.WithCancel(backgroundWithTrace(context.Background()))

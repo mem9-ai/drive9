@@ -346,6 +346,14 @@ func main() {
 			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 			LeaderChecker:                leaderManager,
 		}, enc)
+		// The cross-tenant quota mutation dispatcher (started in
+		// server.startNotifyInfrastructure) must outlive every backend:
+		// backend.Close waits for its queued items to be processed through
+		// the dispatcher. Defers run LIFO, so registering this before
+		// pool.Close makes it run after the pool (and all backends) closed.
+		// On process kill neither defer runs; MutationReplayWorker recovers
+		// any items still pending in the durable quota_mutation_log.
+		defer backend.StopMutationDispatcher()
 		defer pool.Close()
 
 		pool.SetMetaStore(store)

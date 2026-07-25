@@ -41,6 +41,7 @@ type fakeMetaQuotaStore struct {
 	mutations               []fakeMutationRecord
 	nextID                  int64
 	markAppliedCalls        int // Finding B invariant: count MarkMutationAppliedTx calls (pre-guard, on-entry)
+	markBatchAppliedCalls   int // count MarkMutationsAppliedTx (dispatcher batch) calls
 	observePendingCalls     int
 	monthlyCostErr          error
 	insertMutationErr       error
@@ -518,6 +519,40 @@ func (f *fakeMetaQuotaStore) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
 
 func (f *fakeMetaQuotaStore) IsMutationAlreadyAppliedError(err error) bool {
 	return errors.Is(err, errFakeMutationAlreadyApplied)
+}
+
+// MarkMutationsAppliedTx mirrors the real store's batch mark: it refuses to
+// mark anything unless every id exists and is still pending, matching the
+// RowsAffected == len(ids) guard (the real implementation rolls the whole
+// batch transaction back on mismatch; the fake simply errors before marking).
+func (f *fakeMetaQuotaStore) MarkMutationsAppliedTx(tx *sql.Tx, ids []int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.markBatchAppliedCalls++
+	for _, id := range ids {
+		found := false
+		for i := range f.mutations {
+			if f.mutations[i].id == id {
+				if f.mutations[i].status != "pending" {
+					return fmt.Errorf("mutation %d: %w", id, errFakeMutationAlreadyApplied)
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("mutation %d not found", id)
+		}
+	}
+	for _, id := range ids {
+		for i := range f.mutations {
+			if f.mutations[i].id == id {
+				f.mutations[i].status = "applied"
+				break
+			}
+		}
+	}
+	return nil
 }
 
 // mutationStatus is a test-only helper for reading mutation row status by id
