@@ -17,9 +17,13 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
 	"github.com/mem9-ai/drive9/internal/testmysql"
 	"github.com/mem9-ai/drive9/pkg/encrypt"
 	"github.com/mem9-ai/drive9/pkg/leader"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	tenantschema "github.com/mem9-ai/drive9/pkg/tenant/schema"
@@ -211,6 +215,19 @@ func TestManagedSharedDBContinuationDoesNotStartOnFollower(t *testing.T) {
 	case <-called:
 		t.Fatal("follower ran managed shared DB continuation")
 	case <-time.After(20 * time.Millisecond):
+	}
+
+	core, observed := observer.New(zap.InfoLevel)
+	ctx := logger.WithContext(context.Background(), zap.New(core))
+	srv.scheduleManagedSharedDBContinuations(ctx, []int64{22, 11})
+	entries := observed.FilterMessage("managed_shared_db_continuation_deferred").All()
+	if len(entries) != 1 {
+		t.Fatalf("deferred continuation logs = %d, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["reason"] != "not_leader" || fields["db_pool_count"] != int64(2) ||
+		fields["first_db_pool_id"] != int64(11) || fields["last_db_pool_id"] != int64(22) {
+		t.Fatalf("deferred continuation fields = %#v", fields)
 	}
 }
 

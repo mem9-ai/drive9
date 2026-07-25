@@ -327,9 +327,20 @@ func (s *Server) scheduleManagedSharedDBContinuations(ctx context.Context, dbIDs
 	}
 	ids := append([]int64(nil), dbIDs...)
 	slices.Sort(ids)
-	s.startManagedSharedDBWorker(ctx, func(workerCtx context.Context) {
+	if s.startManagedSharedDBWorker(ctx, func(workerCtx context.Context) {
 		s.runManagedSharedDBContinuations(workerCtx, ids)
-	})
+	}) {
+		return
+	}
+	reason := "server_stopping"
+	if s.leader != nil {
+		reason = "not_leader"
+	}
+	logger.Info(ctx, "managed_shared_db_continuation_deferred",
+		zap.String("reason", reason),
+		zap.Int("db_pool_count", len(ids)),
+		zap.Int64("first_db_pool_id", ids[0]),
+		zap.Int64("last_db_pool_id", ids[len(ids)-1]))
 }
 
 func (s *Server) startManagedSharedDBWorker(ctx context.Context, fn func(context.Context)) bool {
