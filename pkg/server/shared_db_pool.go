@@ -492,9 +492,22 @@ func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int
 			s.managedSharedDBProvisioningJobs.Delete(dbID)
 		}
 	}()
-	workers := s.managedSharedDBProvisioningWorkers
+	workers := s.managedSharedDBProvisioningConcurrency
 	if workers <= 0 {
-		workers = DefaultManagedSharedDBProvisioningWorkers
+		if s.managedSharedDBProvisioningSlots != nil {
+			maxOpen := 0
+			if s.meta != nil && s.meta.DB() != nil {
+				maxOpen = s.meta.DB().Stats().MaxOpenConnections
+			}
+			logger.Error(ctx, "managed_shared_db_pool_provisioning_disabled",
+				zap.Int("configured_workers", s.managedSharedDBProvisioningWorkers),
+				zap.Int("meta_max_open_connections", maxOpen))
+			return
+		}
+		workers = s.managedSharedDBProvisioningWorkers
+		if workers <= 0 {
+			workers = DefaultManagedSharedDBProvisioningWorkers
+		}
 	}
 	failed := runManagedSharedDBProvisioningQueue(ctx, workers, s.managedSharedDBProvisioningSlots, owned,
 		schemaInitRetryWindow, schemaInitInitialBackoff, managedSharedDBProvisioningMaxBackoff,

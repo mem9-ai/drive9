@@ -133,8 +133,9 @@ func TestTenantPoolClaimUsesNativeInventoryBeforeExternalSharedPool(t *testing.T
 }
 
 func TestTenantPoolClaimConsumesMixedInventoryInGlobalAgeOrder(t *testing.T) {
-	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	rt.server.defaultTenantProvider = tenant.ProviderTiDBCloudNativeShared
+	rt := newQuotaRuntimeWithOptions(t, tenant.ProviderTiDBCloudNative, quotaRuntimeOptions{
+		defaultTenantProvider: tenant.ProviderTiDBCloudNativeShared,
+	})
 	ctx := context.Background()
 	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
 		OrganizationID: "org-mixed-age", Role: tenant.TiDBCloudRoleProjectOwner,
@@ -636,8 +637,9 @@ func TestAdminTenantPoolCreateCleansPartialSharedMembersOnBatchFailure(t *testin
 }
 
 func TestDeleteFreeSharedPoolTenantSkipsPurgeWhenDBPoolIsUnready(t *testing.T) {
-	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	rt.server.defaultTenantProvider = tenant.ProviderTiDBCloudNativeShared
+	rt := newQuotaRuntimeWithOptions(t, tenant.ProviderTiDBCloudNative, quotaRuntimeOptions{
+		defaultTenantProvider: tenant.ProviderTiDBCloudNativeShared,
+	})
 	ctx := context.Background()
 	now := time.Now().UTC()
 	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
@@ -851,12 +853,14 @@ func TestTenantPoolMetadataResumePersistsAfterWaitDeadline(t *testing.T) {
 		tenantPoolMetadataResumeWaitTimeout = oldWaitTimeout
 	})
 
-	rt, schemaInitRecorder := newAdminTenantPoolRuntime(t)
-	waiter := &deadlineMetadataResumeProvisioner{
-		adminTenantPoolSchemaInitRecorder: schemaInitRecorder,
-		waitStarted:                       make(chan struct{}),
-	}
-	rt.server.provisioner = waiter
+	var waiter *deadlineMetadataResumeProvisioner
+	rt, schemaInitRecorder := newAdminTenantPoolRuntimeWithProvisioner(t, func(recorder *adminTenantPoolSchemaInitRecorder) tenant.Provisioner {
+		waiter = &deadlineMetadataResumeProvisioner{
+			adminTenantPoolSchemaInitRecorder: recorder,
+			waitStarted:                       make(chan struct{}),
+		}
+		return waiter
+	})
 
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -943,19 +947,20 @@ func TestTenantPoolMetadataResumePersistsReadyGroupBeforeSlowGroup(t *testing.T)
 		tenantPoolMetadataResumeGroupSize = oldGroupSize
 	})
 
-	rt, schemaInitRecorder := newAdminTenantPoolRuntime(t)
-	waiter := &groupStreamingMetadataResumeProvisioner{
-		adminTenantPoolSchemaInitRecorder: schemaInitRecorder,
-		slowTenantID:                      "pool-stream-resume-slow",
-		slowStarted:                       make(chan struct{}),
-		releaseSlow:                       make(chan struct{}),
-	}
+	var waiter *groupStreamingMetadataResumeProvisioner
+	rt, _ := newAdminTenantPoolRuntimeWithProvisioner(t, func(recorder *adminTenantPoolSchemaInitRecorder) tenant.Provisioner {
+		waiter = &groupStreamingMetadataResumeProvisioner{
+			adminTenantPoolSchemaInitRecorder: recorder,
+			slowTenantID:                      "pool-stream-resume-slow",
+			slowStarted:                       make(chan struct{}),
+			releaseSlow:                       make(chan struct{}),
+		}
+		return waiter
+	})
 	var releaseSlowOnce sync.Once
 	t.Cleanup(func() {
 		releaseSlowOnce.Do(func() { close(waiter.releaseSlow) })
 	})
-	rt.server.provisioner = waiter
-
 	ctx := context.Background()
 	now := time.Now().UTC()
 	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
@@ -1700,6 +1705,62 @@ func TestManagedSharedDBStuckReconcilerFailsPoolAndPlacedTenant(t *testing.T) {
 	}
 }
 
+func TestManagedSharedDBStuckReconcilerSkipsPoolWithActiveRecoveryClaim(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	ctx := context.Background()
+	spendingLimit := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-stuck-active", ProvisioningKey: bytes.Repeat([]byte{8}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, time.Now().UTC().Add(-20*time.Minute), dbID); err != nil {
+		t.Fatalf("age db pool: %v", err)
+	}
+
+	srv := &Server{meta: metaStore, managedSharedDBStuckTimeout: 15 * time.Minute}
+	holderStarted := make(chan struct{})
+	releaseHolder := make(chan struct{})
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- srv.withSharedDBPoolWorkLock(ctx, dbID, func(context.Context) error {
+			close(holderStarted)
+			<-releaseHolder
+			return nil
+		})
+	}()
+	<-holderStarted
+
+	srv.reconcileStuckManagedSharedDBPoolsWithCtx(ctx)
+	row, err := metaStore.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != meta.SharedDBStatusPending {
+		t.Fatalf("busy recovery pool status = %q, want pending", row.Status)
+	}
+
+	close(releaseHolder)
+	if err := <-holderDone; err != nil {
+		t.Fatalf("recovery claim holder: %v", err)
+	}
+	srv.reconcileStuckManagedSharedDBPoolsWithCtx(ctx)
+	row, err = metaStore.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != meta.SharedDBStatusFailed {
+		t.Fatalf("idle stuck pool status = %q, want failed", row.Status)
+	}
+}
+
 func TestManagedSharedDBRefillCapsOneWaveAtFiftyPhysicalPools(t *testing.T) {
 	if got := managedSharedDBRefillTenantCount(10_000, 100, 50); got != 5_000 {
 		t.Fatalf("refill tenant count = %d, want capacity of 50 physical pools", got)
@@ -1824,10 +1885,19 @@ type adminTenantPoolSchemaInitRecorder struct {
 }
 
 func newAdminTenantPoolRuntime(t *testing.T) (*quotaRuntime, *adminTenantPoolSchemaInitRecorder) {
+	return newAdminTenantPoolRuntimeWithProvisioner(t, nil)
+}
+
+func newAdminTenantPoolRuntimeWithProvisioner(t *testing.T, wrap func(*adminTenantPoolSchemaInitRecorder) tenant.Provisioner) (*quotaRuntime, *adminTenantPoolSchemaInitRecorder) {
 	t.Helper()
-	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	recorder := &adminTenantPoolSchemaInitRecorder{quotaTestProvisioner: rt.prov}
-	rt.server.provisioner = recorder
+	var recorder *adminTenantPoolSchemaInitRecorder
+	rt := newQuotaRuntimeWithOptions(t, tenant.ProviderTiDBCloudNative, quotaRuntimeOptions{provisioner: func(prov *quotaTestProvisioner) tenant.Provisioner {
+		recorder = &adminTenantPoolSchemaInitRecorder{quotaTestProvisioner: prov}
+		if wrap != nil {
+			return wrap(recorder)
+		}
+		return recorder
+	}})
 	return rt, recorder
 }
 

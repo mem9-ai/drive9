@@ -206,6 +206,46 @@ func TestManagedSharedDBWorkerConfigDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestManagedSharedDBProvisioningWorkerLimitReservesMetaConnections(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured int
+		maxOpen    int
+		want       int
+	}{
+		{name: "unlimited", configured: 100, maxOpen: 0, want: 100},
+		{name: "default meta pool", configured: 100, maxOpen: 100, want: 50},
+		{name: "configured below safe limit", configured: 8, maxOpen: 100, want: 8},
+		{name: "odd pool size", configured: 10, maxOpen: 3, want: 1},
+		{name: "no spare callback connection", configured: 1, maxOpen: 1, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := limitManagedSharedDBProvisioningWorkers(tt.configured, tt.maxOpen); got != tt.want {
+				t.Fatalf("worker limit = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestManagedSharedDBProvisioningSlotsUseEffectiveMetaConnectionBudget(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	metaStore.DB().SetMaxOpenConns(20)
+
+	srv := NewWithConfig(Config{Meta: metaStore, ManagedSharedDBProvisioningWorkers: 100})
+	t.Cleanup(srv.Close)
+	if got := srv.managedSharedDBProvisioningConcurrency; got != 10 {
+		t.Fatalf("effective provisioning concurrency = %d, want 10", got)
+	}
+	if got := cap(srv.managedSharedDBProvisioningSlots); got != 10 {
+		t.Fatalf("provisioning slot capacity = %d, want 10", got)
+	}
+}
+
 func TestNextManagedSharedDBStatusPageAdvancesAndWrapsKeysetCursor(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -1846,6 +1886,9 @@ func TestManagedSharedDBBatchCreateRunsAllChunksConcurrently(t *testing.T) {
 	if got := prov.sharedPoolBatchMembers.Load(); got != 50 {
 		t.Fatalf("batch members = %d, want 50", got)
 	}
+	if got := prov.sharedPoolBatchLoadCalls.Load(); got != 1 {
+		t.Fatalf("batch adoption list calls = %d, want 1 for the whole physical wave", got)
+	}
 	sizes := make([]int, 0, 5)
 	for i := 0; i < 5; i++ {
 		sizes = append(sizes, len(<-requests))
@@ -2069,6 +2112,71 @@ func TestManagedSharedDBBatchCreateReturnsTotalFailure(t *testing.T) {
 	_, err = srv.provisionManagedSharedDBPoolsBatch(context.Background(), []int64{dbID})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("batch error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestManagedSharedDBBatchCreateAdoptsExistingCloudPoolBeforeRetry(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	_, _ = rand.Read(master)
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-adopt-before-retry", ProvisioningKey: bytes.Repeat([]byte{7}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+		PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := metaStore.GetSharedDB(context.Background(), dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative}
+	prov.sharedPoolBatchLoadFunc = func(requests []tenant.SharedDBPoolLoadRequest) ([]*tenant.SharedDBPoolInfo, error) {
+		if len(requests) != 1 || requests[0].DBPoolID != dbID || requests[0].DBPoolUUID != row.UUID || requests[0].ClusterID != "" {
+			t.Fatalf("adoption requests = %+v", requests)
+		}
+		return []*tenant.SharedDBPoolInfo{{
+			DBPoolID: dbID, DBPoolUUID: row.UUID, ClusterID: "cluster-adopted",
+			OrganizationID: "org-adopt-before-retry", DBName: "tidbcloud_fs",
+		}}, nil
+	}
+	srv := &Server{meta: metaStore, pool: pool, provisioner: prov,
+		tidbCloudRBACCache: newTiDBCloudRBACCache(time.Hour), managedSharedDBCloudBatchSize: 10,
+		managedSharedDBRefillPoolLimit: 50}
+	_, err = srv.provisionManagedSharedDBPoolsBatchWithCredentials(context.Background(), []int64{dbID}, tenant.CredentialProvisionRequest{})
+	if err != nil {
+		t.Fatalf("batch create adoption: %v", err)
+	}
+	if got := prov.sharedPoolBatchLoadCalls.Load(); got != 1 {
+		t.Fatalf("batch adoption list calls = %d, want 1", got)
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 0 {
+		t.Fatalf("Cloud create calls = %d, want 0 after adoption", got)
+	}
+	persisted, err := metaStore.GetSharedDB(context.Background(), dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ClusterID != "cluster-adopted" {
+		t.Fatalf("persisted cluster_id = %q, want cluster-adopted", persisted.ClusterID)
 	}
 }
 
@@ -4456,7 +4564,8 @@ func TestStartupResumesProvisioningTenantInit(t *testing.T) {
 	}
 
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{}}
-	_ = NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("abc")})
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("abc")})
+	defer srv.Close()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -4521,7 +4630,8 @@ func TestStartupMarksPendingTenantFailed(t *testing.T) {
 	}
 
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{}}
-	_ = NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("abc")})
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("abc")})
+	defer srv.Close()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -4587,7 +4697,7 @@ func TestStartupKeepsFreshPendingTenant(t *testing.T) {
 
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{}}
 	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("abc")})
-	t.Cleanup(srv.Close)
+	defer srv.Close()
 
 	time.Sleep(100 * time.Millisecond)
 	row := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID)

@@ -717,10 +717,10 @@ func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoo
 	return p.sharedDBPoolInfoFromCluster(dbPoolID, wantUUID, &matches[0])
 }
 
-// BatchLoadSharedDBPoolsWithCredentials refreshes multiple known managed
-// shared clusters with one TiDB Cloud list request. Incomplete endpoint/user
-// metadata is returned as an info with empty connection fields so callers can
-// keep the pool pending and poll it again later.
+// BatchLoadSharedDBPoolsWithCredentials refreshes known managed clusters and
+// discovers requests without a cluster ID by durable DB-pool UUID. Incomplete
+// endpoint/user metadata is returned with empty connection fields so callers
+// can keep the pool pending and poll it again later.
 func (p *Provisioner) BatchLoadSharedDBPoolsWithCredentials(ctx context.Context, requests []tenant.SharedDBPoolLoadRequest, req tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
 	publicKey := strings.TrimSpace(req.PublicKey)
 	privateKey := strings.TrimSpace(req.PrivateKey)
@@ -730,8 +730,9 @@ func (p *Provisioner) BatchLoadSharedDBPoolsWithCredentials(ctx context.Context,
 	if len(requests) == 0 {
 		return nil, nil
 	}
-	targets := make(map[string]tenant.SharedDBPoolLoadRequest, len(requests))
+	targetsByUUID := make(map[string]tenant.SharedDBPoolLoadRequest, len(requests))
 	clusterIDs := make([]string, 0, len(requests))
+	discoverByUUID := false
 	for _, request := range requests {
 		if request.DBPoolID <= 0 {
 			return nil, fmt.Errorf("db pool id must be positive")
@@ -741,26 +742,57 @@ func (p *Provisioner) BatchLoadSharedDBPoolsWithCredentials(ctx context.Context,
 			return nil, fmt.Errorf("db pool %d has invalid uuid %q: %w", request.DBPoolID, request.DBPoolUUID, err)
 		}
 		clusterID := strings.TrimSpace(request.ClusterID)
-		if clusterID == "" {
-			return nil, fmt.Errorf("db pool %d cluster id is required", request.DBPoolID)
-		}
 		request.DBPoolUUID = parsedUUID.String()
 		request.ClusterID = clusterID
-		targets[clusterID] = request
+		if _, exists := targetsByUUID[request.DBPoolUUID]; exists {
+			return nil, fmt.Errorf("duplicate db pool uuid %s", request.DBPoolUUID)
+		}
+		targetsByUUID[request.DBPoolUUID] = request
+		if clusterID == "" {
+			discoverByUUID = true
+			continue
+		}
 		clusterIDs = append(clusterIDs, clusterID)
+	}
+	if discoverByUUID {
+		clusterIDs = nil
 	}
 	infos, err := p.listClusterInfosWithCredentials(ctx, publicKey, privateKey, clusterIDs, len(clusterIDs))
 	if err != nil {
 		return nil, err
 	}
-	out := make([]*tenant.SharedDBPoolInfo, 0, len(infos))
-	var partialErr error
+	infosByClusterID := make(map[string][]clusterInfo, len(infos))
+	infosByUUID := make(map[string][]clusterInfo, len(infos))
 	for i := range infos {
-		target, ok := targets[strings.TrimSpace(infos[i].ClusterID)]
-		if !ok {
+		clusterID := strings.TrimSpace(infos[i].ClusterID)
+		infosByClusterID[clusterID] = append(infosByClusterID[clusterID], infos[i])
+		if strings.TrimSpace(infos[i].Labels[Drive9ManagedLabel]) != "true" ||
+			strings.TrimSpace(infos[i].Labels[Drive9ProviderLabel]) != tenant.ProviderTiDBCloudNativeShared {
 			continue
 		}
-		result, convertErr := p.sharedDBPoolInfoFromCluster(target.DBPoolID, target.DBPoolUUID, &infos[i])
+		poolUUID, parseErr := uuid.Parse(strings.TrimSpace(infos[i].Labels[Drive9DBPoolUUIDLabel]))
+		if parseErr == nil {
+			infosByUUID[poolUUID.String()] = append(infosByUUID[poolUUID.String()], infos[i])
+		}
+	}
+	out := make([]*tenant.SharedDBPoolInfo, 0, len(requests))
+	var partialErr error
+	for _, target := range targetsByUUID {
+		var matches []clusterInfo
+		if clusterID := strings.TrimSpace(target.ClusterID); clusterID != "" {
+			matches = infosByClusterID[clusterID]
+		} else {
+			matches = infosByUUID[target.DBPoolUUID]
+		}
+		if len(matches) == 0 {
+			continue
+		}
+		if len(matches) != 1 {
+			partialErr = errors.Join(partialErr, fmt.Errorf("%w: found %d managed shared clusters for db pool %s",
+				tenant.ErrSharedDBPoolAmbiguous, len(matches), target.DBPoolUUID))
+			continue
+		}
+		result, convertErr := p.sharedDBPoolInfoFromCluster(target.DBPoolID, target.DBPoolUUID, &matches[0])
 		if convertErr != nil {
 			partialErr = errors.Join(partialErr, convertErr)
 			continue

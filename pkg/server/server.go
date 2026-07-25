@@ -215,6 +215,7 @@ type Server struct {
 	managedSharedDBMetadataBatchSize        int
 	managedSharedDBMetadataPollInterval     time.Duration
 	managedSharedDBProvisioningWorkers      int
+	managedSharedDBProvisioningConcurrency  int
 	tenantPoolReconcileInterval             time.Duration
 	tenantPoolReconcileWorkers              int
 	tenantPoolReconcileSlots                chan struct{}
@@ -476,6 +477,11 @@ func NewWithConfig(cfg Config) *Server {
 	if managedSharedDBProvisioningWorkers <= 0 {
 		managedSharedDBProvisioningWorkers = DefaultManagedSharedDBProvisioningWorkers
 	}
+	managedSharedDBProvisioningConcurrency := managedSharedDBProvisioningWorkers
+	if cfg.Meta != nil && cfg.Meta.DB() != nil {
+		managedSharedDBProvisioningConcurrency = limitManagedSharedDBProvisioningWorkers(
+			managedSharedDBProvisioningWorkers, cfg.Meta.DB().Stats().MaxOpenConnections)
+	}
 	tenantPoolReconcileInterval := cfg.TenantPoolReconcileInterval
 	if tenantPoolReconcileInterval <= 0 {
 		tenantPoolReconcileInterval = DefaultTenantPoolReconcileInterval
@@ -517,20 +523,21 @@ func NewWithConfig(cfg Config) *Server {
 		sharedDBReopenRatio:   sharedDBReopenRatio,
 		sharedDBSpendingLimit: sharedDBSpendingLimit,
 
-		managedSharedDBCloudBatchSize:         managedSharedDBCloudBatchSize,
-		managedSharedDBRefillPoolLimit:        managedSharedDBRefillPoolLimit,
-		managedSharedDBMetadataWorkers:        managedSharedDBMetadataWorkers,
-		managedSharedDBMetadataBatchSize:      managedSharedDBMetadataBatchSize,
-		managedSharedDBMetadataPollInterval:   managedSharedDBMetadataPollInterval,
-		managedSharedDBProvisioningWorkers:    managedSharedDBProvisioningWorkers,
-		tenantPoolReconcileInterval:           tenantPoolReconcileInterval,
-		tenantPoolReconcileWorkers:            tenantPoolReconcileWorkers,
-		tenantPoolReconcileSlots:              make(chan struct{}, tenantPoolReconcileWorkers),
-		managedSharedDBStuckTimeout:           managedSharedDBStuckTimeout,
-		managedSharedDBFailedCleanupInterval:  managedSharedDBFailedCleanupInterval,
-		managedSharedDBFailedCleanupBatchSize: managedSharedDBFailedCleanupBatchSize,
-		managedSharedDBMetadataSlots:          make(chan struct{}, managedSharedDBMetadataWorkers),
-		managedSharedDBProvisioningSlots:      make(chan struct{}, managedSharedDBProvisioningWorkers),
+		managedSharedDBCloudBatchSize:          managedSharedDBCloudBatchSize,
+		managedSharedDBRefillPoolLimit:         managedSharedDBRefillPoolLimit,
+		managedSharedDBMetadataWorkers:         managedSharedDBMetadataWorkers,
+		managedSharedDBMetadataBatchSize:       managedSharedDBMetadataBatchSize,
+		managedSharedDBMetadataPollInterval:    managedSharedDBMetadataPollInterval,
+		managedSharedDBProvisioningWorkers:     managedSharedDBProvisioningWorkers,
+		managedSharedDBProvisioningConcurrency: managedSharedDBProvisioningConcurrency,
+		tenantPoolReconcileInterval:            tenantPoolReconcileInterval,
+		tenantPoolReconcileWorkers:             tenantPoolReconcileWorkers,
+		tenantPoolReconcileSlots:               make(chan struct{}, tenantPoolReconcileWorkers),
+		managedSharedDBStuckTimeout:            managedSharedDBStuckTimeout,
+		managedSharedDBFailedCleanupInterval:   managedSharedDBFailedCleanupInterval,
+		managedSharedDBFailedCleanupBatchSize:  managedSharedDBFailedCleanupBatchSize,
+		managedSharedDBMetadataSlots:           make(chan struct{}, managedSharedDBMetadataWorkers),
+		managedSharedDBProvisioningSlots:       make(chan struct{}, managedSharedDBProvisioningConcurrency),
 
 		legacyStarterProvisioner:  cfg.LegacyStarterProvisioner,
 		maxUploadBytes:            maxUpload,
@@ -736,6 +743,20 @@ func normalizeTenantPoolRefillFreeRatio(ratio float64) float64 {
 		return DefaultTenantPoolRefillFreeRatio
 	}
 	return ratio
+}
+
+// limitManagedSharedDBProvisioningWorkers reserves half of the metadb pool for
+// callback queries and unrelated control-plane traffic. Each active schema
+// worker holds one session connection for GET_LOCK while its callback performs
+// ordinary Store operations through another connection from the same pool.
+func limitManagedSharedDBProvisioningWorkers(configured, maxOpen int) int {
+	if configured <= 0 {
+		return 0
+	}
+	if maxOpen <= 0 {
+		return configured
+	}
+	return min(configured, maxOpen/2)
 }
 
 // insertTenantNotify records a best-effort unified outbox signal so other
