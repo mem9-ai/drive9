@@ -21,7 +21,6 @@ import (
 	"syscall"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 
 	"github.com/mem9-ai/drive9/pkg/backend"
@@ -347,6 +346,9 @@ func main() {
 			IdleReapInterval:             envDuration("DRIVE9_POOL_IDLE_REAP_INTERVAL", 2*time.Minute),
 			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 			LeaderChecker:                leaderManager,
+			// Capture once at startup: LocalClustersAPI TiDB is plaintext.
+			// Do not re-read DRIVE9_TIDBCLOUD_CLUSTERS_BACKEND on each open.
+			SharedDBForcePlaintext: tidbcloudnative.IsLocalClustersBackend(),
 		}, enc)
 		// The cross-tenant quota mutation dispatcher (started in
 		// server.startNotifyInfrastructure) must outlive every backend:
@@ -360,23 +362,6 @@ func main() {
 
 		pool.SetMetaStore(store)
 		pool.Start(context.Background())
-
-		// Optional shared-schema pool: when DRIVE9_SHARED_POOL_DSN is set,
-		// initialize the shared schema on that database and register it in
-		// db_pool so tenants in the matching organization are provisioned onto
-		// it instead of getting a dedicated cluster. The organization binding is
-		// always explicit and has no wildcard behavior.
-		if sharedDSN := strings.TrimSpace(os.Getenv("DRIVE9_SHARED_POOL_DSN")); sharedDSN != "" {
-			sharedOrg := strings.TrimSpace(os.Getenv("DRIVE9_SHARED_POOL_ORG"))
-			if sharedOrg == "" {
-				die(fmt.Errorf("DRIVE9_SHARED_POOL_ORG is required when DRIVE9_SHARED_POOL_DSN is set (set one exact TiDB Cloud organization id)"))
-			}
-			if err := registerSharedPoolFromEnv(context.Background(), store, pool, sharedDSN, sharedOrg, sharedDBMaxTenants); err != nil {
-				die(fmt.Errorf("register shared pool: %w", err))
-			}
-			logger.Info(context.Background(), "shared_pool_registered",
-				zap.String("org", sharedOrg))
-		}
 
 		// The mutation replay and expiry sweep workers are owned by the server
 		// (started/stopped in its leader-gated startLeaderWorkers/stopLeaderWorkers),
@@ -451,14 +436,26 @@ func main() {
 	}
 
 	srv := server.NewWithConfig(server.Config{
-		Meta:                            store,
-		Pool:                            pool,
-		Provisioner:                     provisioner,
-		DefaultTenantProvider:           providerType,
-		SharedDBMaxTenants:              sharedDBMaxTenants,
-		SharedDBHardCapRatio:            sharedDBHardCapRatio,
-		SharedDBReopenRatio:             sharedDBReopenRatio,
-		SharedDBSpendingLimit:           sharedDBDefaultSpendingLimit,
+		Meta:                  store,
+		Pool:                  pool,
+		Provisioner:           provisioner,
+		DefaultTenantProvider: providerType,
+		SharedDBMaxTenants:    sharedDBMaxTenants,
+		SharedDBHardCapRatio:  sharedDBHardCapRatio,
+		SharedDBReopenRatio:   sharedDBReopenRatio,
+		SharedDBSpendingLimit: sharedDBDefaultSpendingLimit,
+		ManagedSharedDBCloudBatchSize: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_CLOUD_BATCH_SIZE",
+			server.DefaultManagedSharedDBCloudBatchSize),
+		ManagedSharedDBRefillPoolLimit: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_REFILL_POOL_LIMIT",
+			server.DefaultManagedSharedDBRefillPoolLimit),
+		ManagedSharedDBMetadataWorkers: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_WORKERS",
+			server.DefaultManagedSharedDBMetadataWorkers),
+		ManagedSharedDBMetadataBatchSize: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_BATCH_SIZE",
+			server.DefaultManagedSharedDBMetadataBatchSize),
+		ManagedSharedDBMetadataPollInterval: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_POLL_INTERVAL",
+			server.DefaultManagedSharedDBMetadataPollInterval),
+		ManagedSharedDBProvisioningWorkers: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_PROVISIONING_WORKERS",
+			server.DefaultManagedSharedDBProvisioningWorkers),
 		LegacyStarterProvisioner:        legacyStarterProvisioner,
 		TokenSecret:                     tokenSecret,
 		VaultMasterKey:                  vaultMasterKey,
@@ -516,51 +513,6 @@ func envOr(key, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-// registerSharedPoolFromEnv initializes the shared schema on the database at
-// dsn and upserts it into db_pool with the given org binding. The DSN carries
-// a plaintext password (local/dev convenience); it is encrypted with the
-// pool's encryptor before persistence, like tenant DB passwords.
-func registerSharedPoolFromEnv(ctx context.Context, metaStore *meta.Store, pool *tenant.Pool, dsn, orgID string, maxTenants int) error {
-	cfg, err := mysql.ParseDSN(dsn)
-	if err != nil {
-		return fmt.Errorf("parse DRIVE9_SHARED_POOL_DSN: %w", err)
-	}
-	if err := schema.InitSharedSchema(ctx, dsn); err != nil {
-		return fmt.Errorf("init shared schema: %w", err)
-	}
-	passCipher, err := pool.Encrypt(ctx, []byte(cfg.Passwd))
-	if err != nil {
-		return fmt.Errorf("encrypt shared db password: %w", err)
-	}
-	host, portStr, err := net.SplitHostPort(cfg.Addr)
-	if err != nil {
-		return fmt.Errorf("parse DRIVE9_SHARED_POOL_DSN address %q: %w", cfg.Addr, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return fmt.Errorf("parse DRIVE9_SHARED_POOL_DSN port %q: %w", portStr, err)
-	}
-	// Persist the driver TLS mode verbatim ("true", "skip-verify", a custom
-	// registered config name; "" for plaintext) so the runtime handle reopens
-	// the DB with exactly the mode the schema init DSN used.
-	tlsMode := cfg.TLSConfig
-	if tlsMode == "false" {
-		tlsMode = ""
-	}
-	_, err = metaStore.RegisterSharedDB(ctx, &meta.SharedDB{
-		TiDBCloudOrganizationID: orgID,
-		Role:                    meta.SharedDBRoleShared,
-		Host:                    host,
-		Port:                    port,
-		User:                    cfg.User,
-		PasswordCipher:          passCipher,
-		Name:                    cfg.DBName,
-		TLSMode:                 tlsMode,
-		MaxTenants:              maxTenants,
-	})
-	return err
 }
 
 func slockOAuthFromEnv() (*slockoauth.Client, error) {
@@ -658,8 +610,7 @@ environment:
   DRIVE9_USER_DB_MAX_IDLE_CONNS max idle connections for each cached tenant user DB pool (default: 2)
   DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS max open connections for tenant schema-init DB pools (default: 8)
   DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS max idle connections for tenant schema-init DB pools (default: 2)
-  DRIVE9_SHARED_POOL_DSN register a shared-schema DB at startup and place matching tenants on it (empty = disabled)
-  DRIVE9_SHARED_POOL_ORG TiDB Cloud org the shared pool serves (required when DSN is set; '*' = all orgs, loud warn)
+  DRIVE9_TIDBCLOUD_CLUSTERS_BACKEND http|local TiDB Cloud control-plane backend (default: http; local = Docker TiDB per cluster)
   DRIVE9_SHARED_DB_MAX_OPEN_CONNS max open connections for each shared-schema DB handle (default: 300)
   DRIVE9_SHARED_DB_MAX_IDLE_CONNS max idle connections for each shared-schema DB handle (default: 50)
   DRIVE9_SHARED_DB_CONN_MAX_LIFETIME maximum shared connection lifetime (default: 30m)
@@ -716,6 +667,12 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO emergency hard-cap ratio > 1 after physical create failure (default: 1.2)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_REOPEN_RATIO reopen ratio for a latched shared pool (default: 0.8)
   DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT physical spending-limit target for new managed shared DB pools (default: 1000000)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_CLOUD_BATCH_SIZE physical pools per Cloud create request (default and maximum: 10)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_REFILL_POOL_LIMIT maximum physical shared DBs added by one refill wave (default: 50)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_WORKERS concurrent pending metadata workers (default and maximum: 15)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_BATCH_SIZE physical pools per metadata list request (default and maximum: 30)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_POLL_INTERVAL delay between metadata list rounds (default: 15s)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_PROVISIONING_WORKERS concurrent shared schema-init workers (default: 100)
   DRIVE9_TIDBCLOUD_PRIVATE_ENDPOINT_HOST_MAP comma-separated public_host=private_host mappings (also accepts public_host:private_host);
                                              when set, disables legacy single-host private endpoint overrides
   DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST legacy tencentcloud private endpoint fallback host, used only when host map is unset

@@ -51,12 +51,39 @@ func TestNewProvisionerFromEnvRequiresIAMURLForNative(t *testing.T) {
 
 func TestNewProvisionerFromEnvRequiresSharedCredentialsForSharedProvider(t *testing.T) {
 	setRequiredNativeProvisionerEnv(t)
+	t.Setenv(EnvTiDBCloudClustersBackend, "http")
 	t.Setenv(EnvTiDBCloudNativeSharedPublicKey, "")
 	t.Setenv(EnvTiDBCloudNativeSharedPrivateKey, "")
 
 	_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNativeShared)
 	if err == nil || !strings.Contains(err.Error(), EnvTiDBCloudNativeSharedPublicKey) || !strings.Contains(err.Error(), EnvTiDBCloudNativeSharedPrivateKey) {
 		t.Fatalf("error = %v, want missing shared credential names", err)
+	}
+}
+
+func TestNewProvisionerFromEnvLocalUsesBuiltinSharedCredentials(t *testing.T) {
+	// Local does not require Cloud URL/keys; only a container runtime on PATH.
+	t.Setenv(EnvTiDBCloudClustersBackend, "local")
+	t.Setenv(EnvTiDBCloudNativeAPIURL, "")
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "")
+	t.Setenv(EnvTiDBCloudNativeCloudProvider, "")
+	t.Setenv(EnvTiDBCloudNativeRegion, "")
+	t.Setenv(EnvTiDBCloudNativeSharedPublicKey, "")
+	t.Setenv(EnvTiDBCloudNativeSharedPrivateKey, "")
+	// Avoid depending on docker in unit tests: if neither runtime exists, expect that error.
+	p, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNativeShared)
+	if err != nil {
+		if !strings.Contains(err.Error(), "docker") && !strings.Contains(err.Error(), "podman") && !strings.Contains(err.Error(), EnvTiDBCloudLocalRuntime) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return
+	}
+	shared, ok := p.DefaultSharedCredentials()
+	if !ok || shared.PublicKey != localSharedPublicKey || shared.PrivateKey != localSharedPrivateKey {
+		t.Fatalf("local shared credentials = %+v ok=%v", shared, ok)
+	}
+	if p.cloudProvider == "" || p.region == "" {
+		t.Fatalf("local defaults cloud/region empty: %q %q", p.cloudProvider, p.region)
 	}
 }
 
@@ -105,7 +132,7 @@ func TestResolveAPIKeyIdentityUsesIAMAPI(t *testing.T) {
 	core, recorded := observer.New(zap.InfoLevel)
 	ctx := traceid.With(context.Background(), wantTraceID)
 	ctx = logger.WithContext(ctx, zap.New(core).With(zap.String("trace_id", wantTraceID)))
-	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	p := &Provisioner{iamURL: ts.URL}
 	identity, err := p.ResolveAPIKeyIdentity(ctx, tenant.CredentialProvisionRequest{
 		PublicKey: "PROJECTOWNER1", PrivateKey: "test-private",
 	})
@@ -156,7 +183,7 @@ func TestValidateSharedCredentialsUsesConfiguredKeyAtStartup(t *testing.T) {
 			defer ts.Close()
 
 			p := &Provisioner{
-				iamURL: ts.URL, client: ts.Client(),
+				iamURL: ts.URL,
 				defaultSharedPublicKey: "SHAREDOWNER1", defaultSharedPrivateKey: "test-shared-private",
 			}
 			err := p.ValidateSharedCredentials(context.Background())
@@ -192,7 +219,7 @@ func TestResolveAPIKeyIdentityRejectsInsufficientRole(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	p := &Provisioner{iamURL: ts.URL}
 	_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
 		PublicKey: "VIEWER1", PrivateKey: "test-private",
 	})
@@ -221,7 +248,7 @@ func TestResolveAPIKeyIdentityAcceptsOrganizationOwnerResponse(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	p := &Provisioner{iamURL: ts.URL}
 	identity, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
 		PublicKey: "ORGOWNER1", PrivateKey: "test-private",
 	})
@@ -251,7 +278,7 @@ func TestResolveAPIKeyIdentityDoesNotExposeAccessKeysOnMismatch(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	p := &Provisioner{iamURL: ts.URL}
 	_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
 		PublicKey: "REQUESTEDKEY1", PrivateKey: "test-private",
 	})
@@ -277,7 +304,7 @@ func TestResolveAPIKeyIdentityDoesNotExposeIAMErrorBody(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	p := &Provisioner{iamURL: ts.URL}
 	_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
 		PublicKey: "REQUESTKEY1", PrivateKey: "request-private",
 	})
@@ -304,7 +331,7 @@ func TestResolveAPIKeyIdentityDoesNotExposeMalformedResourceName(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	p := &Provisioner{iamURL: ts.URL}
 	_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
 		PublicKey: "NAMEFIXTURE1", PrivateKey: "request-private",
 	})
@@ -330,11 +357,12 @@ func TestResolveAPIKeyIdentityRedactsAccessKeyFromTransportErrorsAndLogs(t *test
 	core, recorded := observer.New(zap.ErrorLevel)
 	ctx := traceid.With(context.Background(), wantTraceID)
 	ctx = logger.WithContext(ctx, zap.New(core).With(zap.String("trace_id", wantTraceID)))
+	customClient := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, transportErr
+	})}
 	p := &Provisioner{
-		iamURL: "https://iam.tidbapi.com",
-		client: &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
-			return nil, transportErr
-		})},
+		iamURL:   "https://iam.tidbapi.com",
+		clusters: NewHTTPClustersAPI("", "https://iam.tidbapi.com", customClient),
 	}
 
 	_, err := p.ResolveAPIKeyIdentity(ctx, tenant.CredentialProvisionRequest{
@@ -555,7 +583,6 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
 		defaultSpendLimit:   int32Ptr(5000),
-		client:              ts.Client(),
 	}
 	out, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
@@ -631,7 +658,6 @@ func TestProvisionWithCredentialsAndQuotaSendsCreateTimeSpendingLimit(t *testing
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
 		defaultSpendLimit:   int32Ptr(5000),
-		client:              ts.Client(),
 	}
 	monthly := int64(10000)
 	_, cloudCfg, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
@@ -714,7 +740,6 @@ func TestBatchProvisionFreeClustersUsesBatchCreateAndFreeLabel(t *testing.T) {
 		cloudProvider:       "aws",
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	monthly := int64(10000)
 	out, cloudCfg, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(context.Background(), []string{"tenant-1", "tenant-2"}, tenant.CredentialProvisionRequest{
@@ -804,7 +829,7 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 
 	p := &Provisioner{
 		apiURL: ts.URL, cloudProvider: "aws", region: "us-east-1",
-		defaultDatabaseName: DefaultDatabaseName, client: ts.Client(),
+		defaultDatabaseName: DefaultDatabaseName,
 	}
 	got, err := p.BatchProvisionSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolCreateRequest{
 		{DBPoolID: 41, DBPoolUUID: poolUUIDs[0], CustomerOrganizationID: "customer-org-41", RootPassword: "durable-password-41", SpendingLimitMonthly: 1_000_000},
@@ -853,7 +878,7 @@ func TestBatchProvisionSharedDBPoolsRejectsMissingCustomerOrganizationBeforeRequ
 
 	p := &Provisioner{
 		apiURL: ts.URL, cloudProvider: "aws", region: "us-east-1",
-		defaultDatabaseName: DefaultDatabaseName, client: ts.Client(),
+		defaultDatabaseName: DefaultDatabaseName,
 	}
 	_, err := p.BatchProvisionSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolCreateRequest{{
 		DBPoolID: 41, DBPoolUUID: "11111111-1111-4111-8111-111111111111",
@@ -908,7 +933,7 @@ func TestLoadSharedDBPoolWithClusterIDRejectsNonSharedLabels(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+			p := &Provisioner{apiURL: ts.URL}
 			_, err := p.LoadSharedDBPoolWithCredentials(context.Background(), 41, poolUUID, "cluster-pool-41", tenant.CredentialProvisionRequest{
 				PublicKey: "public", PrivateKey: "private",
 			})
@@ -964,7 +989,7 @@ func TestLoadSharedDBPoolWithoutClusterIDMatchesUUID(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+	p := &Provisioner{apiURL: ts.URL}
 	got, err := p.LoadSharedDBPoolWithCredentials(context.Background(), 41, wantUUID, "", tenant.CredentialProvisionRequest{
 		PublicKey: "public", PrivateKey: "private",
 	})
@@ -973,6 +998,54 @@ func TestLoadSharedDBPoolWithoutClusterIDMatchesUUID(t *testing.T) {
 	}
 	if got == nil || got.DBPoolID != 41 || got.DBPoolUUID != wantUUID || got.ClusterID != "cluster-wanted" {
 		t.Fatalf("shared DB pool = %+v", got)
+	}
+}
+
+func TestBatchLoadSharedDBPoolsUsesOneClusterListRequest(t *testing.T) {
+	const firstUUID = "11111111-1111-4111-8111-111111111111"
+	const secondUUID = "22222222-2222-4222-8222-222222222222"
+	var authorizedCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-shared-batch-load", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		authorizedCalls.Add(1)
+		if r.Method != http.MethodGet || r.URL.Path != "/v1beta1/clusters" {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		if filter := r.URL.Query().Get("filter"); !strings.Contains(filter, `clusterId = "cluster-1,cluster-2"`) {
+			http.Error(w, "missing batched cluster filter: "+filter, http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"clusters": []map[string]any{
+			{"clusterId": "cluster-1", "state": "ACTIVE", "userPrefix": "u1",
+				"endpoints": map[string]any{"public": map[string]any{"host": "shared.example", "port": 4000}},
+				"labels": map[string]string{Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+					Drive9DBPoolUUIDLabel: firstUUID, TiDBCloudOrganizationLabel: "org-1"}},
+			{"clusterId": "cluster-2", "state": "CREATING",
+				"labels": map[string]string{Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+					Drive9DBPoolUUIDLabel: secondUUID, TiDBCloudOrganizationLabel: "org-1"}},
+		}})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{apiURL: ts.URL}
+	got, err := p.BatchLoadSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolLoadRequest{
+		{DBPoolID: 1, DBPoolUUID: firstUUID, ClusterID: "cluster-1"},
+		{DBPoolID: 2, DBPoolUUID: secondUUID, ClusterID: "cluster-2"},
+	}, tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
+	if err != nil {
+		t.Fatalf("BatchLoadSharedDBPoolsWithCredentials: %v", err)
+	}
+	if authorizedCalls.Load() != 1 {
+		t.Fatalf("authorized list calls = %d, want 1", authorizedCalls.Load())
+	}
+	if len(got) != 2 || got[0].Host != "shared.example" || got[0].Port != 4000 || got[0].Username != "u1.root" ||
+		got[1].Host != "" || got[1].Port != 0 || got[1].Username != "" {
+		t.Fatalf("batch loaded shared pools = %+v", got)
 	}
 }
 
@@ -1008,7 +1081,7 @@ func TestWaitForSharedDBPoolMetadataUsesNativeReadinessPoll(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+	p := &Provisioner{apiURL: ts.URL}
 	got, err := p.WaitForSharedDBPoolMetadataWithCredentials(context.Background(), 41, poolUUID, "cluster-pool-41",
 		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
 	if err != nil {
@@ -1067,7 +1140,6 @@ func TestBatchProvisionFreeClustersDefersIncompletePublicHostWithoutMetadataWait
 		cloudProvider:       "aws",
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(context.Background(), []string{"tenant-1", "tenant-2"}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
@@ -1134,7 +1206,6 @@ func TestBatchProvisionFreeClustersDefersPrivateEndpointPublicHostWithoutMapping
 		defaultDatabaseName:    DefaultDatabaseName,
 		usePrivateEndpoint:     true,
 		privateEndpointHostMap: map[string]string{"public-a.example": "private-a.internal"},
-		client:                 ts.Client(),
 	}
 	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(context.Background(), []string{"tenant-1"}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
@@ -1214,7 +1285,6 @@ func TestWaitForPoolClustersMetadataUsesList(t *testing.T) {
 		cloudProvider:       "aws",
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	out, err := p.WaitForPoolClustersMetadata(context.Background(), []*tenant.ClusterInfo{
 		{TenantID: "tenant-1", ClusterID: "cluster-1", Password: "pass-1", DBName: DefaultDatabaseName},
@@ -1274,7 +1344,6 @@ func TestWaitForClusterProvisionMetadataRetriesRateLimit(t *testing.T) {
 		cloudProvider:       "aws",
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	out, err := p.waitForClusterProvisionMetadata(context.Background(), "public-1", "private-1", "cluster-1")
 	if err != nil {
@@ -1321,7 +1390,6 @@ func TestBatchProvisionFreeClustersRequiresTenantIDLabel(t *testing.T) {
 		cloudProvider:       "aws",
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(context.Background(), []string{"tenant-1"}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
@@ -1378,7 +1446,6 @@ func TestProvisionWithCredentialsDefaultsDatabaseName(t *testing.T) {
 		cloudProvider:       "aws",
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	out, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
@@ -1475,7 +1542,6 @@ func TestProvisionWithCredentialsIncludesUpstreamBodyOnError(t *testing.T) {
 		cloudProvider:       "aws",
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	_, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
@@ -1533,7 +1599,6 @@ func TestBranchWithCredentialsUsesRequestCredentials(t *testing.T) {
 	p := &Provisioner{
 		apiURL:              ts.URL,
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	req := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
 	out, err := p.ProvisionBranchWithCredentials(context.Background(), "fork-tenant", &tenant.ClusterInfo{
@@ -1581,7 +1646,6 @@ func TestCreateBranchWithCredentialsRejectsMissingStateAndEndpoint(t *testing.T)
 	p := &Provisioner{
 		apiURL:              ts.URL,
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	_, err := p.CreateBranchWithCredentials(context.Background(), "fork-tenant", &tenant.ClusterInfo{
 		ClusterID: "cluster-1",
@@ -1615,7 +1679,6 @@ func TestCreateBranchWithCredentialsReturnsEndpointWhenPOSTIncludesIt(t *testing
 	p := &Provisioner{
 		apiURL:              ts.URL,
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	out, err := p.CreateBranchWithCredentials(context.Background(), "fork-tenant", &tenant.ClusterInfo{
 		ClusterID: "cluster-1",
@@ -1650,7 +1713,6 @@ func TestCreateBranchWithCredentialsDefersToWaitWhenPOSTMissingEndpoint(t *testi
 	p := &Provisioner{
 		apiURL:              ts.URL,
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	out, err := p.CreateBranchWithCredentials(context.Background(), "fork-tenant", &tenant.ClusterInfo{
 		ClusterID: "cluster-1",
@@ -1701,7 +1763,6 @@ func TestWaitForBranchActiveRequiresConnectionInfo(t *testing.T) {
 
 	p := &Provisioner{
 		apiURL: ts.URL,
-		client: ts.Client(),
 	}
 	out, err := p.WaitForBranchActiveWithCredentials(context.Background(), &tenant.ClusterInfo{
 		ClusterID: "cluster-1",
@@ -1738,7 +1799,6 @@ func TestDeprovisionWithCredentialsDeletesCluster(t *testing.T) {
 
 	p := &Provisioner{
 		apiURL: ts.URL,
-		client: ts.Client(),
 	}
 	if err := p.DeprovisionWithCredentials(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
@@ -1804,7 +1864,6 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 
 	p := &Provisioner{
 		apiURL: ts.URL,
-		client: ts.Client(),
 	}
 	cfg, err := p.MarkQuotaUpdateStarted(context.Background(), &tenant.ClusterInfo{
 		TenantID:  "tenant-1",
@@ -1894,7 +1953,6 @@ func TestUpdateQuotaPatchesSpendingLimitWithoutLabels(t *testing.T) {
 
 	p := &Provisioner{
 		apiURL: ts.URL,
-		client: ts.Client(),
 	}
 	cfg, err := p.UpdateQuota(context.Background(), &tenant.ClusterInfo{
 		TenantID:  "tenant-1",
@@ -1952,7 +2010,6 @@ func TestUpdateQuotaReturnsSpendingLimitPatchFailure(t *testing.T) {
 
 	p := &Provisioner{
 		apiURL: ts.URL,
-		client: ts.Client(),
 	}
 	_, err := p.UpdateQuota(context.Background(), &tenant.ClusterInfo{
 		TenantID:  "tenant-1",
@@ -1990,7 +2047,6 @@ func TestUpdateQuotaRejectsInvalidSpendingLimitBeforeRequest(t *testing.T) {
 
 			p := &Provisioner{
 				apiURL: ts.URL,
-				client: ts.Client(),
 			}
 			_, err := p.UpdateQuota(context.Background(), &tenant.ClusterInfo{
 				TenantID:  "tenant-1",
@@ -2042,7 +2098,6 @@ func TestGetQuotaUsesBasicClusterInfoForAuthorization(t *testing.T) {
 
 	p := &Provisioner{
 		apiURL: ts.URL,
-		client: ts.Client(),
 	}
 	_, err := p.GetQuota(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
@@ -2089,7 +2144,6 @@ func TestGetQuotaDoesNotReadSpendingLimit(t *testing.T) {
 
 	p := &Provisioner{
 		apiURL: ts.URL,
-		client: ts.Client(),
 	}
 	cfg, err := p.GetQuota(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
@@ -2135,7 +2189,6 @@ func TestQuotaCredentialErrorsMapForbiddenAndNotFound(t *testing.T) {
 
 			p := &Provisioner{
 				apiURL: ts.URL,
-				client: ts.Client(),
 			}
 			_, err := p.GetQuota(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
 				PublicKey:  "public-1",
@@ -2256,7 +2309,6 @@ func TestWaitForBranchUserWithCredentialsPollsUserPrefix(t *testing.T) {
 	p := &Provisioner{
 		apiURL:              ts.URL,
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	username, err := p.WaitForBranchUserWithCredentials(context.Background(), "cluster-1", "branch-1", tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
 	if err != nil {
@@ -2291,7 +2343,6 @@ func TestWaitForBranchUserWithCredentialsUsesUserPrefix(t *testing.T) {
 	p := &Provisioner{
 		apiURL:              ts.URL,
 		defaultDatabaseName: DefaultDatabaseName,
-		client:              ts.Client(),
 	}
 	username, err := p.WaitForBranchUserWithCredentials(context.Background(), "cluster-1", "branch-1", tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
 	if err != nil {
@@ -2509,7 +2560,6 @@ func TestProvisionWithCredentialsUsesPrivateEndpoint(t *testing.T) {
 		apiURL:              ts.URL,
 		defaultDatabaseName: DefaultDatabaseName,
 		usePrivateEndpoint:  true,
-		client:              ts.Client(),
 	}
 	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey: "public-1", PrivateKey: "private-1",
@@ -2558,7 +2608,6 @@ func TestProvisionWithCredentialsMapsPublicHostToPrivateEndpoint(t *testing.T) {
 		cloudProvider:               cloudProviderAliCloud,
 		alicloudPrivateEndpointHost: "legacy-alicloud.internal",
 		privateEndpointHostMap:      map[string]string{"public-a.example": "private-a.internal"},
-		client:                      ts.Client(),
 	}
 	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey: "public-1", PrivateKey: "private-1",
@@ -2601,7 +2650,6 @@ func TestProvisionWithCredentialsErrorsWhenPrivateHostMappingMissing(t *testing.
 		cloudProvider:               cloudProviderAliCloud,
 		alicloudPrivateEndpointHost: "legacy-alicloud.internal",
 		privateEndpointHostMap:      map[string]string{"public-a.example": "private-a.internal"},
-		client:                      ts.Client(),
 	}
 	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey: "public-1", PrivateKey: "private-1",
@@ -2775,7 +2823,6 @@ func TestBatchProvisionFreeClustersReturnsSpendingLimitOnPartialFailure(t *testi
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
 		defaultSpendLimit:   &defaultLimit,
-		client:              ts.Client(),
 	}
 	clusters, cloudCfg, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(
 		context.Background(),

@@ -50,7 +50,8 @@ GIT_TEST_REF=v2.49.0                      # git tag/branch to fetch and build
 ```
 
 `prove` and `perl` are required system tools; the harness auto-installs them
-via `apt-get` on Linux when `AUTO_INSTALL_SYSTEM_DEPS` is enabled.
+via `apt-get` (Debian/Ubuntu) or `pacman` (Arch) on Linux when
+`AUTO_INSTALL_SYSTEM_DEPS` is enabled.
 
 ## Notices / Third-party
 

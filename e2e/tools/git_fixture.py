@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a local Git fixture remote for drive9 Git matrix E2E tests."""
+"""Generate a local Git fixture remote for drive9 Git e2e smokes."""
 
 from __future__ import annotations
 
