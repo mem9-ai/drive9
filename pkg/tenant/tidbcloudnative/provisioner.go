@@ -267,10 +267,7 @@ func (p *Provisioner) ResolveAPIKeyIdentity(ctx context.Context, req tenant.Cred
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		recordTiDBCloudHTTPResponse(tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, resp.StatusCode, true)
-		_, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
-		if readErr != nil {
-			return nil, readErr
-		}
+		_, _ = readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		return nil, statusError(tenant.TiDBCloudAPIServiceIAM, "IAM API key lookup", resp.StatusCode, "")
 	}
 	var info struct {

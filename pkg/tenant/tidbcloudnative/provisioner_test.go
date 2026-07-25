@@ -32,6 +32,18 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+type readErrorBody struct {
+	err error
+}
+
+func (b readErrorBody) Read([]byte) (int, error) {
+	return 0, b.err
+}
+
+func (readErrorBody) Close() error {
+	return nil
+}
+
 func TestProvisionerDoesNotExposeLegacyCredentialProvisionMethods(t *testing.T) {
 	typ := reflect.TypeOf((*Provisioner)(nil))
 	for _, name := range []string{"ProvisionWithCredentials", "ProvisionWithCredentialsAndQuota"} {
@@ -785,6 +797,31 @@ func TestResolveAPIKeyIdentityDoesNotExposeIAMErrorBody(t *testing.T) {
 		if strings.Contains(err.Error(), sensitive) {
 			t.Fatalf("error leaked IAM response material %q: %v", sensitive, err)
 		}
+	}
+}
+
+func TestResolveAPIKeyIdentityPreservesTypedStatusWhenErrorBodyDrainFails(t *testing.T) {
+	drainErr := errors.New("drain IAM error body")
+	p := &Provisioner{
+		iamURL: "https://iam.tidbapi.com",
+		client: &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     make(http.Header),
+				Body:       readErrorBody{err: drainErr},
+			}, nil
+		})},
+	}
+
+	_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "IAMKEY-DRAIN", PrivateKey: "iam-private",
+	})
+	var apiErr *tenant.TiDBCloudAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want typed TiDB Cloud API error", err)
+	}
+	if apiErr.Service != tenant.TiDBCloudAPIServiceIAM || apiErr.StatusCode != http.StatusForbidden {
+		t.Fatalf("typed error = %+v, want IAM status 403", apiErr)
 	}
 }
 
