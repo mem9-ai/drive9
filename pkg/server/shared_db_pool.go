@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
@@ -244,6 +246,38 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 	return s.allocateManagedSharedDBForOrganization(ctx, organizationID, cred, reserve)
 }
 
+func (s *Server) createManagedSharedDBPlan(ctx context.Context, organizationID string, provisioningKey []byte) (*meta.SharedDB, error) {
+	maxTenants, fixedTarget := s.managedSharedDBPolicy()
+	cloudProvider, region := provisioningCloudRegion(s.provisioner)
+	rootPassword, err := generateManagedSharedDBRootPassword(24)
+	if err != nil {
+		return nil, err
+	}
+	passwordCipher, err := s.pool.Encrypt(ctx, []byte(rootPassword))
+	if err != nil {
+		return nil, fmt.Errorf("encrypt shared db root password: %w", err)
+	}
+	row := &meta.SharedDB{
+		UUID:                    uuid.NewString(),
+		TiDBCloudOrganizationID: organizationID,
+		ProvisioningKey:         append([]byte(nil), provisioningKey...),
+		CloudProvider:           cloudProvider,
+		Region:                  region,
+		Role:                    meta.SharedDBRoleShared,
+		MaxTenants:              maxTenants,
+		SpendingLimit:           &fixedTarget,
+		PasswordCipher:          passwordCipher,
+		Name:                    s.defaultSharedDatabaseName(),
+		Status:                  meta.SharedDBStatusPending,
+	}
+	id, err := s.meta.CreateManagedSharedDBPool(ctx, row)
+	if err != nil {
+		return nil, err
+	}
+	row.ID = id
+	return row, nil
+}
+
 func (s *Server) allocateManagedSharedDBForOrganization(ctx context.Context, organizationID string, cred tenant.CredentialProvisionRequest, reserve func(*meta.SharedDB) error) (sharedDB *meta.SharedDB, created bool, err error) {
 	provisioningKey := sharedDBProvisioningKey(cred)
 	identity := sharedDBAllocationIdentity(organizationID, provisioningKey)
@@ -264,30 +298,8 @@ func (s *Server) allocateManagedSharedDBForOrganization(ctx context.Context, org
 					}
 				}
 				if sharedDB == nil {
-					maxTenants, fixedTarget := s.managedSharedDBPolicy()
-					cloudProvider, region := provisioningCloudRegion(s.provisioner)
-					rootPassword, passwordErr := generateManagedSharedDBRootPassword(24)
-					if passwordErr != nil {
-						return passwordErr
-					}
-					passwordCipher, encryptErr := s.pool.Encrypt(lockCtx, []byte(rootPassword))
-					if encryptErr != nil {
-						return fmt.Errorf("encrypt shared db root password: %w", encryptErr)
-					}
-					id, createErr := s.meta.CreateManagedSharedDBPool(lockCtx, &meta.SharedDB{
-						TiDBCloudOrganizationID: organizationID,
-						ProvisioningKey:         provisioningKey,
-						CloudProvider:           cloudProvider,
-						Region:                  region,
-						MaxTenants:              maxTenants,
-						SpendingLimit:           &fixedTarget,
-						PasswordCipher:          passwordCipher,
-						Name:                    s.defaultSharedDatabaseName(),
-					})
-					if createErr != nil {
-						return createErr
-					}
-					sharedDB, createErr = s.meta.GetSharedDB(lockCtx, id)
+					var createErr error
+					sharedDB, createErr = s.createManagedSharedDBPlan(lockCtx, organizationID, provisioningKey)
 					if createErr != nil {
 						return createErr
 					}
