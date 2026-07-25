@@ -329,6 +329,8 @@ type TenantPoolBindingStatusCount struct {
 
 type Store struct {
 	db *sql.DB
+	// apiKeys caches ResolveByAPIKeyHash results (see api_key_cache.go).
+	apiKeys *apiKeyResolveCache
 }
 
 func Open(dsn string) (*Store, error) {
@@ -343,7 +345,7 @@ func OpenContext(ctx context.Context, dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, apiKeys: newAPIKeyResolveCache()}
 	if err := s.migrate(); err != nil {
 		_ = mysqlutil.CloseInstrumented(db)
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -2878,9 +2880,40 @@ func tenantPoolDatabaseLockName(baseLockName, databaseName string) string {
 	return baseLockName + ":" + hex.EncodeToString(sum[:4])
 }
 
+// ResolveByAPIKeyHash resolves a tenant and its API key by jwt_hash. Results
+// are cached in-process for a short TTL (see api_key_cache.go) because the
+// auth middleware calls this on every authenticated request; ErrNotFound is
+// never cached so newly created keys are visible immediately.
 func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *TenantWithAPIKey, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "resolve_api_key_hash", start, &err)
+	if cached, ok := s.apiKeys.get(hash); ok {
+		return cached, nil
+	}
+	v, err, _ := s.apiKeys.flight.Do(hash, func() (any, error) {
+		// Double-check under the flight window: a concurrent caller may have
+		// filled the entry while this one waited.
+		if cached, ok := s.apiKeys.lookup(hash); ok {
+			return cached, nil
+		}
+		rec, dberr := s.resolveByAPIKeyHashDB(ctx, hash)
+		if dberr != nil {
+			return nil, dberr
+		}
+		s.apiKeys.fill(hash, cloneTenantWithAPIKey(*rec))
+		return rec, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Clone per caller: flight waiters share the fetched record, but callers
+	// may mutate it (tenant.Pool writes Tenant.StorageNamespaceID on a cold
+	// open), so every caller must get a private copy — same as the hit path.
+	rec := cloneTenantWithAPIKey(*v.(*TenantWithAPIKey))
+	return &rec, nil
+}
+
+func (s *Store) resolveByAPIKeyHashDB(ctx context.Context, hash string) (out *TenantWithAPIKey, err error) {
 	row := s.db.QueryRowContext(ctx, `SELECT
 			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name, t.db_tls,
@@ -3479,7 +3512,11 @@ func (s *Store) RevokeTenantAPIKeys(ctx context.Context, tenantID string) (err e
 		SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
 		WHERE tenant_id = ? AND status = ?`,
 		APIKeyRevoked, now, now, tenantID, APIKeyActive)
-	return err
+	if err != nil {
+		return err
+	}
+	s.apiKeys.evictTenant(tenantID)
+	return nil
 }
 
 func (s *Store) RevokeAPIKey(ctx context.Context, tenantID, apiKeyID string) (err error) {
@@ -3493,6 +3530,9 @@ func (s *Store) RevokeAPIKey(ctx context.Context, tenantID, apiKeyID string) (er
 	if err != nil {
 		return err
 	}
+	// Evict even when the row was already revoked (n == 0): a cached active
+	// entry would be stale in that case.
+	s.apiKeys.evictTenant(tenantID)
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return ErrNotFound
@@ -3509,7 +3549,11 @@ func (s *Store) RevokeAPIKeysByIssuer(ctx context.Context, tenantID, provider, s
 		WHERE tenant_id = ? AND issued_by_provider = ? AND issued_by_subject_key = ? AND status = ?
 			AND (? = '' OR id <> ?)`,
 		APIKeyRevoked, now, now, tenantID, provider, subjectKey, APIKeyActive, exceptAPIKeyID, exceptAPIKeyID)
-	return err
+	if err != nil {
+		return err
+	}
+	s.apiKeys.evictTenant(tenantID)
+	return nil
 }
 
 func (s *Store) GetActiveAPIKeyByIssuer(ctx context.Context, tenantID, provider, subjectKey string) (out *APIKey, err error) {
