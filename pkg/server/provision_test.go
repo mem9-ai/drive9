@@ -1434,6 +1434,142 @@ func TestManagedSharedDBBatchCreateUsesAllocationLock(t *testing.T) {
 	}
 }
 
+func createActiveManagedSharedDBForAllocationTest(t *testing.T, metaStore *meta.Store, organizationID string) int64 {
+	t.Helper()
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: organizationID, ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metaStore.DB().ExecContext(context.Background(), `UPDATE db_pool SET status = ?,
+		db_host = 'h', db_port = 4000, db_user = 'u', db_password = 'c', db_name = 'shared_db'
+		WHERE db_id = ?`, meta.SharedDBStatusActive, dbID); err != nil {
+		t.Fatal(err)
+	}
+	return dbID
+}
+
+func TestManagedSharedDBReservationSerializesSameOrganizationLocally(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	createActiveManagedSharedDBForAllocationTest(t, metaStore, "org-reservation-serial")
+	srv := &Server{meta: metaStore}
+
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() {
+		_, _, err := srv.allocateManagedSharedDBForOrganization(context.Background(), "org-reservation-serial",
+			tenant.CredentialProvisionRequest{}, func(*meta.SharedDB) error {
+				close(firstStarted)
+				<-releaseFirst
+				return nil
+			})
+		firstDone <- err
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first reservation did not start")
+	}
+	go func() {
+		_, _, err := srv.allocateManagedSharedDBForOrganization(context.Background(), "org-reservation-serial",
+			tenant.CredentialProvisionRequest{}, func(*meta.SharedDB) error {
+				close(secondStarted)
+				return nil
+			})
+		secondDone <- err
+	}()
+	select {
+	case <-secondStarted:
+		t.Error("same-organization reservation entered concurrently")
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first reservation: %v", err)
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second reservation did not resume")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second reservation: %v", err)
+	}
+	entries := 0
+	srv.sharedDBReservationLocks.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	if entries != 0 {
+		t.Fatalf("reservation lock entries after all users finished = %d, want 0", entries)
+	}
+}
+
+func TestManagedSharedDBReservationKeepsOrganizationsParallel(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	createActiveManagedSharedDBForAllocationTest(t, metaStore, "org-reservation-a")
+	createActiveManagedSharedDBForAllocationTest(t, metaStore, "org-reservation-b")
+	srv := &Server{meta: metaStore}
+
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() {
+		_, _, err := srv.allocateManagedSharedDBForOrganization(context.Background(), "org-reservation-a",
+			tenant.CredentialProvisionRequest{}, func(*meta.SharedDB) error {
+				close(firstStarted)
+				<-release
+				return nil
+			})
+		firstDone <- err
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first organization reservation did not start")
+	}
+	go func() {
+		_, _, err := srv.allocateManagedSharedDBForOrganization(context.Background(), "org-reservation-b",
+			tenant.CredentialProvisionRequest{}, func(*meta.SharedDB) error {
+				close(secondStarted)
+				<-release
+				return nil
+			})
+		secondDone <- err
+	}()
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("different-organization reservation was serialized")
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first organization reservation: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second organization reservation: %v", err)
+	}
+}
+
 func TestSharedDBAllocationLockWaitRespectsContextAndCleansUp(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

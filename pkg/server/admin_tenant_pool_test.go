@@ -1521,6 +1521,99 @@ func TestManagedSharedDBRefillCapsOneWaveAtFiftyPhysicalPools(t *testing.T) {
 	}
 }
 
+func TestManagedSharedDBReplenishSubmitsWholePhysicalPoolWaveConcurrently(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer poolManager.Close()
+	poolManager.SetMetaStore(metaStore)
+	batchStarted := make(chan struct{}, 5)
+	batchRelease := make(chan struct{})
+	prov := &fakeProvisioner{
+		provider:               tenant.ProviderTiDBCloudNative,
+		cloudProvider:          "aws",
+		region:                 "us-east-1",
+		sharedPoolBatchStarted: batchStarted,
+		sharedPoolBatchRelease: batchRelease,
+	}
+	workerCtx, cancel := context.WithCancel(context.Background())
+	srv := &Server{
+		meta: metaStore, pool: poolManager, provisioner: prov,
+		defaultTenantProvider: tenant.ProviderTiDBCloudNativeShared,
+		sharedDBMaxTenants:    1, managedSharedDBRefillPoolLimit: 50, managedSharedDBCloudBatchSize: 10,
+		tenantPoolRefillFreeRatio: DefaultTenantPoolRefillFreeRatio,
+		forkWorkerCtx:             workerCtx, forkWorkerCancel: cancel,
+	}
+	defer srv.Close()
+	now := time.Now().UTC()
+	logicalPool := &meta.TenantPool{PoolID: "pool-whole-wave", OrganizationID: "org-whole-wave",
+		Size: 50, Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now}
+	if err := metaStore.CreateTenantPool(context.Background(), logicalPool); err != nil {
+		t.Fatal(err)
+	}
+
+	workerDone := make(chan struct{})
+	workStarter := func(ctx context.Context, fn func(context.Context)) bool {
+		go func() {
+			defer close(workerDone)
+			fn(ctx)
+		}()
+		return true
+	}
+	var unexpectedTimer atomic.Bool
+	timerStarter := func(context.Context, func(context.Context)) bool {
+		unexpectedTimer.Store(true)
+		return false
+	}
+	var releaseOnce sync.Once
+	releaseBatches := func() { releaseOnce.Do(func() { close(batchRelease) }) }
+	defer func() {
+		releaseBatches()
+		select {
+		case <-workerDone:
+		case <-time.After(10 * time.Second):
+			t.Error("replenish worker did not stop during test cleanup")
+		}
+	}()
+
+	srv.replenishTenantPoolAsyncWithStarters(context.Background(), logicalPool,
+		tenant.CredentialProvisionRequest{}, workStarter, timerStarter)
+	for i := 0; i < 5; i++ {
+		select {
+		case <-batchStarted:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("started %d/5 Cloud batches before release", i)
+		}
+	}
+	releaseBatches()
+	select {
+	case <-workerDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("whole-wave replenish did not finish")
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 5 {
+		t.Fatalf("Cloud batch calls = %d, want 5", got)
+	}
+	if got := prov.sharedPoolBatchMembers.Load(); got != 50 {
+		t.Fatalf("Cloud batch members = %d, want 50", got)
+	}
+	if unexpectedTimer.Load() {
+		t.Fatal("unexpected replenish rerun timer")
+	}
+}
+
 func TestTenantPoolEffectiveRefillRatioRejectsNaN(t *testing.T) {
 	s := &Server{tenantPoolRefillFreeRatio: math.NaN()}
 	if got := s.effectiveTenantPoolRefillFreeRatio(); got != DefaultTenantPoolRefillFreeRatio {

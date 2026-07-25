@@ -259,6 +259,7 @@ type Server struct {
 	tenantPoolReplenishJobs   sync.Map
 	tenantPoolCreateLocks     sync.Map
 	sharedDBAllocationLocks   sync.Map
+	sharedDBReservationLocks  sync.Map
 	tenantPoolResumeJobs      sync.Map
 	tenantPoolResumeScans     sync.Map
 	tenantFailedCleanupJobs   sync.Map

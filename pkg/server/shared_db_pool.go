@@ -93,19 +93,19 @@ func sharedDBAllocationIdentity(organizationID string, provisioningKey []byte) s
 	return fmt.Sprintf("credential:%x", provisioningKey)
 }
 
-type sharedDBAllocationLocalLock struct {
+type sharedDBLocalLock struct {
 	mu        sync.Mutex
 	semaphore chan struct{}
 	refs      int
 }
 
-func (s *Server) acquireSharedDBAllocationLocalLock(ctx context.Context, identity string) (*sharedDBAllocationLocalLock, error) {
+func acquireSharedDBLocalLock(ctx context.Context, locks *sync.Map, identity string) (*sharedDBLocalLock, error) {
 	for {
-		candidate := &sharedDBAllocationLocalLock{semaphore: make(chan struct{}, 1)}
-		value, _ := s.sharedDBAllocationLocks.LoadOrStore(identity, candidate)
-		localLock := value.(*sharedDBAllocationLocalLock)
+		candidate := &sharedDBLocalLock{semaphore: make(chan struct{}, 1)}
+		value, _ := locks.LoadOrStore(identity, candidate)
+		localLock := value.(*sharedDBLocalLock)
 		localLock.mu.Lock()
-		current, loaded := s.sharedDBAllocationLocks.Load(identity)
+		current, loaded := locks.Load(identity)
 		if !loaded || current != localLock {
 			localLock.mu.Unlock()
 			continue
@@ -117,31 +117,40 @@ func (s *Server) acquireSharedDBAllocationLocalLock(ctx context.Context, identit
 		case localLock.semaphore <- struct{}{}:
 			return localLock, nil
 		case <-ctx.Done():
-			s.releaseSharedDBAllocationLocalLock(identity, localLock, false)
+			releaseSharedDBLocalLock(locks, identity, localLock, false)
 			return nil, ctx.Err()
 		}
 	}
 }
 
-func (s *Server) releaseSharedDBAllocationLocalLock(identity string, localLock *sharedDBAllocationLocalLock, held bool) {
+func releaseSharedDBLocalLock(locks *sync.Map, identity string, localLock *sharedDBLocalLock, held bool) {
 	if held {
 		<-localLock.semaphore
 	}
 	localLock.mu.Lock()
 	localLock.refs--
 	if localLock.refs == 0 {
-		s.sharedDBAllocationLocks.CompareAndDelete(identity, localLock)
+		locks.CompareAndDelete(identity, localLock)
 	}
 	localLock.mu.Unlock()
 }
 
 func (s *Server) withSharedDBAllocationLock(ctx context.Context, identity string, fn func(context.Context) error) error {
-	localLock, err := s.acquireSharedDBAllocationLocalLock(ctx, identity)
+	localLock, err := acquireSharedDBLocalLock(ctx, &s.sharedDBAllocationLocks, identity)
 	if err != nil {
 		return err
 	}
-	defer s.releaseSharedDBAllocationLocalLock(identity, localLock, true)
+	defer releaseSharedDBLocalLock(&s.sharedDBAllocationLocks, identity, localLock, true)
 	return s.meta.WithSharedDBAllocationLock(ctx, identity, fn)
+}
+
+func (s *Server) withSharedDBReservationLock(ctx context.Context, identity string, fn func() error) error {
+	localLock, err := acquireSharedDBLocalLock(ctx, &s.sharedDBReservationLocks, identity)
+	if err != nil {
+		return err
+	}
+	defer releaseSharedDBLocalLock(&s.sharedDBReservationLocks, identity, localLock, true)
+	return fn()
 }
 
 func managedSharedDBDSN(info *meta.SharedDB, password string) string {
@@ -236,30 +245,42 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 }
 
 func (s *Server) allocateManagedSharedDBForOrganization(ctx context.Context, organizationID string, cred tenant.CredentialProvisionRequest, reserve func(*meta.SharedDB) error) (sharedDB *meta.SharedDB, created bool, err error) {
-	// Capacity reservation is transactional in CompleteSharedTenant* and does
-	// not need the organization-wide planning lock. This fast path lets tenant
-	// pool refill consume existing capacity concurrently; the lock below is
-	// reserved for planning a new physical pool.
-	if reserve != nil {
-		for attempt := 0; attempt < 2; attempt++ {
-			candidate, findErr := s.meta.FindSharedDBForAllocation(ctx, organizationID)
-			if errors.Is(findErr, meta.ErrNotFound) {
-				break
-			}
-			if findErr != nil {
-				return nil, false, findErr
-			}
-			reserveErr := reserve(candidate)
-			if reserveErr == nil {
-				return candidate, false, nil
-			}
-			if !errors.Is(reserveErr, meta.ErrSharedDBCapacityExhausted) {
-				return nil, false, reserveErr
-			}
-		}
-	}
 	provisioningKey := sharedDBProvisioningKey(cred)
 	identity := sharedDBAllocationIdentity(organizationID, provisioningKey)
+	// Capacity reservation is transactional in CompleteSharedTenant* and does
+	// not need the cross-pod organization-wide planning lock. Serialize only
+	// this Pod's same-organization lookup plus reservation so a refill wave does
+	// not send every tenant worker into the same nearly-full db_pool row. Other
+	// organizations and Pods remain independent; the lock below is reserved for
+	// planning a new physical pool.
+	if reserve != nil {
+		var reserved *meta.SharedDB
+		if err := s.withSharedDBReservationLock(ctx, identity, func() error {
+			for attempt := 0; attempt < 2; attempt++ {
+				candidate, findErr := s.meta.FindSharedDBForAllocation(ctx, organizationID)
+				if errors.Is(findErr, meta.ErrNotFound) {
+					return nil
+				}
+				if findErr != nil {
+					return findErr
+				}
+				reserveErr := reserve(candidate)
+				if reserveErr == nil {
+					reserved = candidate
+					return nil
+				}
+				if !errors.Is(reserveErr, meta.ErrSharedDBCapacityExhausted) {
+					return reserveErr
+				}
+			}
+			return nil
+		}); err != nil {
+			return nil, false, err
+		}
+		if reserved != nil {
+			return reserved, false, nil
+		}
+	}
 	err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
 		for attempt := 0; attempt < 2; attempt++ {
 			candidate, findErr := s.meta.FindSharedDBForAllocation(lockCtx, organizationID)
