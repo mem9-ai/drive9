@@ -4511,6 +4511,55 @@ func (s *Store) InsertTenantNotify(ctx context.Context, tenantID string, workMas
 	return err
 }
 
+// TenantNotifyEntry is one tenant's pending work signal for
+// InsertTenantNotifyBatch.
+type TenantNotifyEntry struct {
+	TenantID string
+	WorkMask int
+}
+
+// insertTenantNotifyBatchChunkSize caps the number of rows per multi-row
+// INSERT statement.
+const insertTenantNotifyBatchChunkSize = 1000
+
+// InsertTenantNotifyBatch writes many unified work signals as multi-row
+// INSERTs (chunked at insertTenantNotifyBatchChunkSize rows per statement).
+// It exists because single-row InsertTenantNotify calls dominated metadb
+// write load under stress: the server's notify coalescer OR-merges signals
+// per tenant and flushes them here in one statement per flush window.
+// Same best-effort semantics as InsertTenantNotify; each chunk commits
+// atomically, so poller cursor semantics (id > cursor ORDER BY id) are
+// unaffected.
+func (s *Store) InsertTenantNotifyBatch(ctx context.Context, entries []TenantNotifyEntry) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "insert_tenant_notify_batch", start, &err)
+	for from := 0; from < len(entries); from += insertTenantNotifyBatchChunkSize {
+		to := from + insertTenantNotifyBatchChunkSize
+		if to > len(entries) {
+			to = len(entries)
+		}
+		if err := s.insertTenantNotifyChunk(ctx, entries[from:to]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) insertTenantNotifyChunk(ctx context.Context, entries []TenantNotifyEntry) error {
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO tenant_notify_outbox (tenant_id, work_mask) VALUES `)
+	args := make([]any, 0, len(entries)*2)
+	for i, e := range entries {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("(?,?)")
+		args = append(args, e.TenantID, e.WorkMask)
+	}
+	_, err := s.db.ExecContext(ctx, sb.String(), args...)
+	return err
+}
+
 // ListTenantNotifySince returns outbox rows with id > afterID, ordered by id,
 // up to limit. The consumer advances its cursor to the last row's id so
 // subsequent calls do not re-read the same rows.

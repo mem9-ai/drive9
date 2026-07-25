@@ -253,6 +253,12 @@ type Server struct {
 	podNotifySecret []byte
 	notifyCancel    context.CancelFunc
 	notifyWG        sync.WaitGroup
+	// notifyCoalescer OR-merges per-tenant outbox signals and flushes them
+	// in one multi-row INSERT per 200ms window (see notify_coalescer.go).
+	// Created in startNotifyInfrastructure (multi-tenant mode only); nil in
+	// single-tenant mode, where insertTenantNotify falls back to direct
+	// single-row inserts.
+	notifyCoalescer *tenantNotifyCoalescer
 	// sseNotifyRetention is how long outbox rows are kept before leader pruning.
 	sseNotifyRetention time.Duration
 	// safetyNetScanInterval is how often each pod runs the safety-net scan.
@@ -607,13 +613,22 @@ func normalizeTenantPoolRefillFreeRatio(ratio float64) float64 {
 	return ratio
 }
 
-// insertTenantNotify writes a best-effort unified outbox row so other pods
-// discover the work via the 200ms poller. Called from the write path after
-// the in-process kick. Failures are logged and are safe: the safety-net scan
-// recovers any missed work. Uses a non-cancelable background context so a
-// client disconnect after the commit doesn't abort the outbox pointer.
+// insertTenantNotify records a best-effort unified outbox signal so other
+// pods discover the work via the 200ms poller. Called from the write path
+// after the in-process kick. Signals go through the notify coalescer, which
+// OR-merges them per tenant and flushes one multi-row INSERT per 200ms
+// window (adding ≤200ms cross-pod latency on top of the poller tick; the
+// same-pod kick above is unaffected). Without a coalescer (single-tenant
+// mode) it falls back to a direct single-row insert. Failures are logged and
+// are safe: the safety-net scan recovers any missed work. The direct path
+// uses a non-cancelable background context so a client disconnect after the
+// commit doesn't abort the outbox pointer.
 func (s *Server) insertTenantNotify(tenantID string, workMask int) {
 	if s.meta == nil || tenantID == "" || workMask == 0 {
+		return
+	}
+	if c := s.notifyCoalescer; c != nil {
+		c.add(tenantID, workMask)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -651,6 +666,13 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 	// cancel func (not the context itself) on Server, per coding guidelines.
 	notifyCtx, notifyCancel := context.WithCancel(backgroundWithTrace(context.Background()))
 	s.notifyCancel = notifyCancel
+
+	// Tenant notify outbox coalescer: OR-merges per-tenant work signals and
+	// flushes them in one multi-row INSERT per 200ms window, replacing the
+	// per-event single-row INSERTs that dominated metadb write load. Stopped
+	// (with a final flush) in stopNotifyInfrastructure.
+	s.notifyCoalescer = newTenantNotifyCoalescer(s.meta.InsertTenantNotifyBatch, defaultTenantNotifyFlushInterval)
+	s.notifyCoalescer.start(notifyCtx)
 
 	// Shard resolver: refresh the active pod ring synchronously before the
 	// poller starts so ownsTenant has a valid ring on startup.
@@ -736,6 +758,14 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 func (s *Server) stopNotifyInfrastructure() {
 	if s.notifyCancel != nil {
 		s.notifyCancel()
+	}
+	// Stop the coalescer right after cancel: its flush loop exits on the
+	// cancelled context, then stop() performs a final flush of pending
+	// signals on a fresh context (the meta store is still open at this
+	// point; it is closed later by the server binary).
+	if s.notifyCoalescer != nil {
+		s.notifyCoalescer.stop()
+		s.notifyCoalescer = nil
 	}
 	s.notifyWG.Wait()
 	if s.shardResolver != nil {
