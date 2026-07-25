@@ -493,6 +493,7 @@ func main() {
 	// stores the flush still needs.
 	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-stopCtx.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -500,9 +501,18 @@ func main() {
 		if err := srv.Shutdown(ctx); err != nil {
 			logger.Warn(context.Background(), "server_shutdown_failed", zap.Error(err))
 		}
+		close(shutdownDone)
 	}()
 
 	die(srv.ListenAndServe(addr))
+	// ListenAndServe returns as soon as Shutdown closes the listener, which can
+	// be BEFORE in-flight requests have drained. When the return was
+	// signal-driven, join the shutdown goroutine first so srv.Close() (final
+	// notify flush, worker teardown) and the deferred pool/dispatcher/store
+	// teardown never run while handlers are still writing.
+	if stopCtx.Err() != nil {
+		<-shutdownDone
+	}
 	// Direct call, not a defer: defers run only after main returns, and this
 	// must precede the deferred teardown registered above.
 	srv.Close()

@@ -353,6 +353,7 @@ func main() {
 	httpSrv := &http.Server{Handler: srv}
 	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-stopCtx.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -360,11 +361,19 @@ func main() {
 		if err := httpSrv.Shutdown(ctx); err != nil {
 			logger.Warn(context.Background(), "server_shutdown_failed", zap.Error(err))
 		}
+		close(shutdownDone)
 	}()
 
 	err = httpSrv.Serve(ln)
 	if errors.Is(err, http.ErrServerClosed) {
 		err = nil
+	}
+	// Serve returns as soon as Shutdown closes the listener, which can be
+	// before in-flight requests have drained. When the return was
+	// signal-driven, join the shutdown goroutine so the deferred srv.Close()
+	// does not tear down workers while handlers are still active.
+	if stopCtx.Err() != nil {
+		<-shutdownDone
 	}
 	die(err)
 }

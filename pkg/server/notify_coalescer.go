@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -48,11 +47,14 @@ type tenantNotifyCoalescer struct {
 	insertSingle  func(ctx context.Context, tenantID string, workMask int) error
 	flushInterval time.Duration
 
-	// stopped is set by stop; add becomes a no-op afterwards. insertTenantNotify
-	// reads the Server's coalescer field unsynchronized from the write path,
-	// so the field is never cleared — this flag is what keeps post-stop
-	// signals from being accepted into a batch that will never flush.
-	stopped atomic.Bool
+	// stopped is set by stop under mu; add checks it under the same mu, so a
+	// signal can never slip into pending between stop's final flush and its
+	// stopped-store (an entry added after the last flush would never be
+	// flushed). insertTenantNotify reads the Server's coalescer field
+	// unsynchronized from the write path, so the field is never cleared —
+	// this flag is what keeps post-stop signals from being accepted into a
+	// batch that will never flush.
+	stopped bool
 
 	mu      sync.Mutex
 	pending map[string]int // tenantID → OR-merged work_mask
@@ -83,12 +85,17 @@ func (c *tenantNotifyCoalescer) start(ctx context.Context) {
 
 // add OR-merges one work signal into the pending batch. After stop it is a
 // no-op: the flush loop is gone, so accepting the signal would drop it
-// silently anyway.
+// silently anyway. The stopped check runs under mu so it is serialized
+// against stop's stopped-store and the final flush's map swap.
 func (c *tenantNotifyCoalescer) add(tenantID string, workMask int) {
-	if tenantID == "" || workMask == 0 || c.stopped.Load() {
+	if tenantID == "" || workMask == 0 {
 		return
 	}
 	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		return
+	}
 	c.pending[tenantID] |= workMask
 	c.mu.Unlock()
 }
@@ -107,11 +114,14 @@ func (c *tenantNotifyCoalescer) run(ctx context.Context) {
 	}
 }
 
-// stop marks the coalescer stopped (further adds are dropped), cancels the
-// flush loop, waits for it to exit, then performs a final flush on a
+// stop marks the coalescer stopped (under mu, so racing adds either land in
+// the pending map before the final flush or are rejected after it), cancels
+// the flush loop, waits for it to exit, then performs a final flush on a
 // non-cancelled context so pending signals are not dropped at shutdown.
 func (c *tenantNotifyCoalescer) stop() {
-	c.stopped.Store(true)
+	c.mu.Lock()
+	c.stopped = true
+	c.mu.Unlock()
 	if c.cancel != nil {
 		c.cancel()
 	}

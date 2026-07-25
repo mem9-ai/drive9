@@ -12,8 +12,11 @@ import (
 
 // defaultAPIKeyResolveCacheTTL bounds how long a resolved API key entry may be
 // served from the in-process cache. Tenant-row and tenant_api_keys mutations
-// made through this Store evict precisely via the tenant index; the TTL is the
-// backstop for changes made by other processes (each pod caches independently).
+// made through this Store evict the tenant's cached entries via the tenant
+// index; the TTL backstops changes made by other processes (each pod caches
+// independently) and the residual fill-after-evict race (a resolve reading
+// pre-mutation state concurrently with the mutation, then filling after the
+// eviction — that window has no version check and closes only at TTL expiry).
 const defaultAPIKeyResolveCacheTTL = 10 * time.Second
 
 // envAPIKeyResolveCacheTTLMS overrides defaultAPIKeyResolveCacheTTL (in
@@ -34,9 +37,12 @@ type apiKeyResolveCacheEntry struct {
 // Only successful resolutions are cached: ErrNotFound is never stored, so a
 // newly created key is visible immediately. Misses on the same hash are
 // collapsed with singleflight so a cold key costs one DB query per TTL window.
-// Revocations evict precisely through a tenant→hashes secondary index; expired
-// entries are removed lazily on access (there is no background sweeper, the
-// number of distinct API keys is small).
+// Mutations made through this Store evict the tenant's cached entries through
+// a tenant→hashes secondary index; expired entries are removed lazily on
+// access (there is no background sweeper, the number of distinct API keys is
+// small). Eviction is exact for entries already cached when the mutation
+// commits; a resolve racing the mutation can still fill a pre-mutation record
+// just after the evict, which only the TTL reaps (see the TTL comment).
 type apiKeyResolveCache struct {
 	ttl time.Duration
 

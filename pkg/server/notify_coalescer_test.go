@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -243,4 +244,37 @@ func TestTenantNotifyCoalescerPeriodicFlush(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("periodic flush did not fire within 2s")
+}
+
+// TestTenantNotifyCoalescerConcurrentAddStop hammers add from several
+// goroutines while stop runs. After stop returns, no signal may sit in
+// pending unflushed — a signal accepted after the final flush would be
+// dropped silently, which is exactly the add/stop race the mutex-ordered
+// stopped check closes.
+func TestTenantNotifyCoalescerConcurrentAddStop(t *testing.T) {
+	rec := &recordingNotifyInserter{}
+	c := newTenantNotifyCoalescer(rec.insert, rec.insertSingle, time.Millisecond)
+	c.start(context.Background())
+
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			tenantID := fmt.Sprintf("tenant-%d", g)
+			for i := 0; i < 500; i++ {
+				c.add(tenantID, WorkSSE)
+			}
+		}(g)
+	}
+	time.Sleep(5 * time.Millisecond) // let the stream race the stop
+	c.stop()
+	wg.Wait()
+
+	c.mu.Lock()
+	remaining := len(c.pending)
+	c.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("pending not empty after stop: %d entries would have been silently dropped", remaining)
+	}
 }
