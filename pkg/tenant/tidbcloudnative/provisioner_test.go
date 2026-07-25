@@ -1001,6 +1001,54 @@ func TestLoadSharedDBPoolWithoutClusterIDMatchesUUID(t *testing.T) {
 	}
 }
 
+func TestBatchLoadSharedDBPoolsUsesOneClusterListRequest(t *testing.T) {
+	const firstUUID = "11111111-1111-4111-8111-111111111111"
+	const secondUUID = "22222222-2222-4222-8222-222222222222"
+	var authorizedCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-shared-batch-load", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		authorizedCalls.Add(1)
+		if r.Method != http.MethodGet || r.URL.Path != "/v1beta1/clusters" {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		if filter := r.URL.Query().Get("filter"); !strings.Contains(filter, `clusterId = "cluster-1,cluster-2"`) {
+			http.Error(w, "missing batched cluster filter: "+filter, http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"clusters": []map[string]any{
+			{"clusterId": "cluster-1", "state": "ACTIVE", "userPrefix": "u1",
+				"endpoints": map[string]any{"public": map[string]any{"host": "shared.example", "port": 4000}},
+				"labels": map[string]string{Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+					Drive9DBPoolUUIDLabel: firstUUID, TiDBCloudOrganizationLabel: "org-1"}},
+			{"clusterId": "cluster-2", "state": "CREATING",
+				"labels": map[string]string{Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+					Drive9DBPoolUUIDLabel: secondUUID, TiDBCloudOrganizationLabel: "org-1"}},
+		}})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+	got, err := p.BatchLoadSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolLoadRequest{
+		{DBPoolID: 1, DBPoolUUID: firstUUID, ClusterID: "cluster-1"},
+		{DBPoolID: 2, DBPoolUUID: secondUUID, ClusterID: "cluster-2"},
+	}, tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
+	if err != nil {
+		t.Fatalf("BatchLoadSharedDBPoolsWithCredentials: %v", err)
+	}
+	if authorizedCalls.Load() != 1 {
+		t.Fatalf("authorized list calls = %d, want 1", authorizedCalls.Load())
+	}
+	if len(got) != 2 || got[0].Host != "shared.example" || got[0].Port != 4000 || got[0].Username != "u1.root" ||
+		got[1].Host != "" || got[1].Port != 0 || got[1].Username != "" {
+		t.Fatalf("batch loaded shared pools = %+v", got)
+	}
+}
+
 func TestWaitForSharedDBPoolMetadataUsesNativeReadinessPoll(t *testing.T) {
 	const poolUUID = "11111111-1111-4111-8111-111111111111"
 	origPoll := tidbCloudNativePollInterval
