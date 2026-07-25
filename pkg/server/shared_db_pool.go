@@ -247,99 +247,97 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 func (s *Server) allocateManagedSharedDBForOrganization(ctx context.Context, organizationID string, cred tenant.CredentialProvisionRequest, reserve func(*meta.SharedDB) error) (sharedDB *meta.SharedDB, created bool, err error) {
 	provisioningKey := sharedDBProvisioningKey(cred)
 	identity := sharedDBAllocationIdentity(organizationID, provisioningKey)
-	// Capacity reservation is transactional in CompleteSharedTenant* and does
-	// not need the cross-pod organization-wide planning lock. Serialize only
-	// this Pod's same-organization lookup plus reservation so a refill wave does
-	// not send every tenant worker into the same nearly-full db_pool row. Other
-	// organizations and Pods remain independent; the lock below is reserved for
-	// planning a new physical pool.
-	if reserve != nil {
-		var reserved *meta.SharedDB
-		if err := s.withSharedDBReservationLock(ctx, identity, func() error {
+	planAndReserve := func() error {
+		return s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
 			for attempt := 0; attempt < 2; attempt++ {
-				candidate, findErr := s.meta.FindSharedDBForAllocation(ctx, organizationID)
-				if errors.Is(findErr, meta.ErrNotFound) {
+				candidate, findErr := s.meta.FindSharedDBForAllocation(lockCtx, organizationID)
+				if findErr == nil {
+					sharedDB = candidate
+				} else if !errors.Is(findErr, meta.ErrNotFound) {
+					return findErr
+				} else if organizationID != "" {
+					manual, manualErr := s.meta.FindSharedDBForOrg(lockCtx, organizationID)
+					if manualErr == nil && manual.SpendingLimit == nil {
+						sharedDB = manual
+					} else if manualErr != nil && !errors.Is(manualErr, meta.ErrNotFound) {
+						return manualErr
+					}
+				}
+				if sharedDB == nil {
+					maxTenants, fixedTarget := s.managedSharedDBPolicy()
+					cloudProvider, region := provisioningCloudRegion(s.provisioner)
+					rootPassword, passwordErr := generateManagedSharedDBRootPassword(24)
+					if passwordErr != nil {
+						return passwordErr
+					}
+					passwordCipher, encryptErr := s.pool.Encrypt(lockCtx, []byte(rootPassword))
+					if encryptErr != nil {
+						return fmt.Errorf("encrypt shared db root password: %w", encryptErr)
+					}
+					id, createErr := s.meta.CreateManagedSharedDBPool(lockCtx, &meta.SharedDB{
+						TiDBCloudOrganizationID: organizationID,
+						ProvisioningKey:         provisioningKey,
+						CloudProvider:           cloudProvider,
+						Region:                  region,
+						MaxTenants:              maxTenants,
+						SpendingLimit:           &fixedTarget,
+						PasswordCipher:          passwordCipher,
+						Name:                    s.defaultSharedDatabaseName(),
+					})
+					if createErr != nil {
+						return createErr
+					}
+					sharedDB, createErr = s.meta.GetSharedDB(lockCtx, id)
+					if createErr != nil {
+						return createErr
+					}
+					created = true
+				}
+				if reserve == nil {
 					return nil
 				}
-				if findErr != nil {
-					return findErr
-				}
-				reserveErr := reserve(candidate)
+				reserveErr := reserve(sharedDB)
 				if reserveErr == nil {
-					reserved = candidate
 					return nil
 				}
 				if !errors.Is(reserveErr, meta.ErrSharedDBCapacityExhausted) {
 					return reserveErr
 				}
+				sharedDB = nil
+				created = false
 			}
-			return nil
-		}); err != nil {
-			return nil, false, err
-		}
-		if reserved != nil {
-			return reserved, false, nil
-		}
+			return meta.ErrSharedDBCapacityExhausted
+		})
 	}
-	err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
+	if reserve == nil {
+		err = planAndReserve()
+		return sharedDB, created, err
+	}
+	// Capacity reservation is transactional in CompleteSharedTenant* and does
+	// not need a cross-pod lock while existing capacity is available. Serialize
+	// this Pod's complete same-organization lookup, optional physical planning,
+	// and reservation transition so a fast-path worker cannot steal a pool that
+	// another local worker just created but has not reserved yet. Different
+	// organizations and Pods remain independent.
+	err = s.withSharedDBReservationLock(ctx, identity, func() error {
 		for attempt := 0; attempt < 2; attempt++ {
-			candidate, findErr := s.meta.FindSharedDBForAllocation(lockCtx, organizationID)
-			if findErr == nil {
-				sharedDB = candidate
-			} else if !errors.Is(findErr, meta.ErrNotFound) {
+			candidate, findErr := s.meta.FindSharedDBForAllocation(ctx, organizationID)
+			if errors.Is(findErr, meta.ErrNotFound) {
+				break
+			}
+			if findErr != nil {
 				return findErr
-			} else if organizationID != "" {
-				manual, manualErr := s.meta.FindSharedDBForOrg(lockCtx, organizationID)
-				if manualErr == nil && manual.SpendingLimit == nil {
-					sharedDB = manual
-				} else if manualErr != nil && !errors.Is(manualErr, meta.ErrNotFound) {
-					return manualErr
-				}
 			}
-			if sharedDB == nil {
-				maxTenants, fixedTarget := s.managedSharedDBPolicy()
-				cloudProvider, region := provisioningCloudRegion(s.provisioner)
-				rootPassword, passwordErr := generateManagedSharedDBRootPassword(24)
-				if passwordErr != nil {
-					return passwordErr
-				}
-				passwordCipher, encryptErr := s.pool.Encrypt(lockCtx, []byte(rootPassword))
-				if encryptErr != nil {
-					return fmt.Errorf("encrypt shared db root password: %w", encryptErr)
-				}
-				id, createErr := s.meta.CreateManagedSharedDBPool(lockCtx, &meta.SharedDB{
-					TiDBCloudOrganizationID: organizationID,
-					ProvisioningKey:         provisioningKey,
-					CloudProvider:           cloudProvider,
-					Region:                  region,
-					MaxTenants:              maxTenants,
-					SpendingLimit:           &fixedTarget,
-					PasswordCipher:          passwordCipher,
-					Name:                    s.defaultSharedDatabaseName(),
-				})
-				if createErr != nil {
-					return createErr
-				}
-				sharedDB, createErr = s.meta.GetSharedDB(lockCtx, id)
-				if createErr != nil {
-					return createErr
-				}
-				created = true
-			}
-			if reserve == nil {
-				return nil
-			}
-			reserveErr := reserve(sharedDB)
+			reserveErr := reserve(candidate)
 			if reserveErr == nil {
+				sharedDB = candidate
 				return nil
 			}
 			if !errors.Is(reserveErr, meta.ErrSharedDBCapacityExhausted) {
 				return reserveErr
 			}
-			sharedDB = nil
-			created = false
 		}
-		return meta.ErrSharedDBCapacityExhausted
+		return planAndReserve()
 	})
 	return sharedDB, created, err
 }
