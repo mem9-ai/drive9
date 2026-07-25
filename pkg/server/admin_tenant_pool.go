@@ -81,21 +81,6 @@ func managedSharedDBRefillTenantCount(missing, maxTenants, poolLimit int) int {
 	return min(missing, limit)
 }
 
-// managedSharedDBRefillBatchTenantCount bounds one refill attempt to a single
-// physical shared database capacity. The larger pool limit remains a defensive
-// cap for planning, while the tenant-pool named lock is released between these
-// batches so a large refill cannot hold it across multiple cloud requests.
-func managedSharedDBRefillBatchTenantCount(missing, maxTenants, poolLimit int) int {
-	missing = managedSharedDBRefillTenantCount(missing, maxTenants, poolLimit)
-	if missing <= 0 {
-		return 0
-	}
-	if maxTenants <= 0 {
-		maxTenants = defaultManagedSharedDBMaxTenants
-	}
-	return min(missing, maxTenants)
-}
-
 func retryTenantPoolClaimCAS[T any](attempt func() (T, error)) (T, error) {
 	var zero T
 	for range tenantPoolClaimCASRetryLimit {
@@ -1911,6 +1896,8 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 			metrics.RecordOperation(adminTenantPoolMetricsComponent, "replenish", metricResult, time.Since(replenishStarted))
 		}()
 		sharedProvider := s.defaultTenantProvider == tenant.ProviderTiDBCloudNativeShared
+		createdAny := false
+		sharedWaveRemaining := 0
 		for {
 			if err := ctx.Err(); err != nil {
 				metricResult = adminTenantPoolMetricResult(err)
@@ -1937,7 +1924,7 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 				return
 			}
 			s.recordTenantPoolCapacity(current.PoolID, current.OrganizationID, current.Size, freeSize)
-			if !s.tenantPoolBelowRefillWatermark(freeSize, current.Size) {
+			if !createdAny && !s.tenantPoolBelowRefillWatermark(freeSize, current.Size) {
 				logger.Info(ctx, "admin_tenant_pool_replenish_skipped",
 					zap.String("pool_id", current.PoolID),
 					zap.String("organization_id", current.OrganizationID),
@@ -1960,12 +1947,20 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 			}
 			missing := current.Size - slotSize
 			if missing <= 0 {
-				metricResult = "noop"
+				if !createdAny {
+					metricResult = "noop"
+				}
 				return
 			}
 			if sharedProvider {
 				maxTenants, _ := s.managedSharedDBPolicy()
-				missing = managedSharedDBRefillBatchTenantCount(missing, maxTenants, s.managedSharedDBRefillPoolLimit)
+				if !createdAny {
+					sharedWaveRemaining = managedSharedDBRefillTenantCount(missing, maxTenants, s.managedSharedDBRefillPoolLimit)
+				}
+				if sharedWaveRemaining <= 0 {
+					return
+				}
+				missing = min(missing, sharedWaveRemaining, maxTenants)
 			}
 			results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
 			if err != nil {
@@ -1976,7 +1971,17 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 			for _, res := range results {
 				s.startProvisionedTenantSchemaInit(ctx, res)
 			}
+			if len(results) > 0 {
+				createdAny = true
+				metricResult = "ok"
+				if sharedProvider {
+					sharedWaveRemaining -= len(results)
+				}
+			}
 			if !sharedProvider || len(results) == 0 {
+				return
+			}
+			if sharedWaveRemaining <= 0 {
 				return
 			}
 		}
