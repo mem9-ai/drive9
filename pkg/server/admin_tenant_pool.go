@@ -1997,7 +1997,7 @@ func (s *Server) replenishTenantPoolAsyncWithStarters(
 				if sharedWaveRemaining <= 0 {
 					return
 				}
-				missing = min(missing, sharedWaveRemaining, maxTenants)
+				missing = min(missing, sharedWaveRemaining)
 			}
 			results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
 			if err != nil {
