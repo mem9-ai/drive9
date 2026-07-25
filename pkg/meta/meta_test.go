@@ -2011,7 +2011,7 @@ func TestClaimOldestFreeTenantPoolBindingRequiresActiveTenant(t *testing.T) {
 	}
 }
 
-func TestClaimFreeTenantPoolBindingForCustomerDoesNotFallThroughToNextCandidate(t *testing.T) {
+func TestClaimFreeTenantPoolBindingDoesNotFallThroughToNextCandidate(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -2038,7 +2038,7 @@ func TestClaimFreeTenantPoolBindingForCustomerDoesNotFallThroughToNextCandidate(
 		t.Fatalf("claim candidate A = %+v, err=%v", claimed, err)
 	}
 	zero := int64(0)
-	_, err = s.ClaimFreeTenantPoolBindingForCustomer(ctx, "org-exact-claim", "exact-claim-a", "customer-org", QuotaConfigPatch{
+	_, err = s.ClaimFreeTenantPoolBinding(ctx, "org-exact-claim", "exact-claim-a", QuotaConfigPatch{
 		TiDBCloudSpendingLimit: &zero,
 	})
 	if !errors.Is(err, ErrNotFound) {
@@ -2047,9 +2047,6 @@ func TestClaimFreeTenantPoolBindingForCustomerDoesNotFallThroughToNextCandidate(
 	binding, err := s.GetTenantTiDBCloudOrgBinding(ctx, "exact-claim-b")
 	if err != nil || binding.PoolStatus != TenantPoolBindingFree {
 		t.Fatalf("candidate B binding = %+v, err=%v, want free", binding, err)
-	}
-	if _, err := s.GetTenantBillingOrgBinding(ctx, "exact-claim-b"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("candidate B billing binding error = %v, want ErrNotFound", err)
 	}
 }
 

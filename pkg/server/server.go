@@ -5404,6 +5404,21 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		UpdatedAt:        now,
 	}
 	var reservationErr error
+	var freeQuotaRelease func() error
+	releaseFreeQuotaLock := func() error {
+		if freeQuotaRelease == nil {
+			return nil
+		}
+		release := freeQuotaRelease
+		freeQuotaRelease = nil
+		return release()
+	}
+	defer func() {
+		if releaseErr := releaseFreeQuotaLock(); releaseErr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_free_quota_lock_release_failed",
+				"tenant_id", tenantID, "provider", provider, "error", releaseErr)...)
+		}
+	}()
 	if opts.TiDBCloudAccess != nil {
 		organizationID := opts.TiDBCloudAccess.OrganizationID
 		if opts.TiDBCloudAccess.IsFree {
@@ -5411,9 +5426,19 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			if err != nil {
 				return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to build free tenant quota", err)
 			}
-			reservationErr = s.meta.ReserveTiDBCloudFreeTenant(ctx, pendingTenant, organizationID, s.tidbCloudFreePlanLimits.TenantCount, quotaPatch)
+			freeQuotaRelease, reservationErr = s.meta.AcquireTiDBCloudFreeQuotaLock(ctx, organizationID)
+			if reservationErr == nil {
+				var count int
+				count, reservationErr = s.meta.CountTiDBCloudFreeTenants(ctx, organizationID)
+				if reservationErr == nil && count >= s.tidbCloudFreePlanLimits.TenantCount {
+					reservationErr = tenant.ErrTiDBCloudFreeTenantLimitReached
+				}
+			}
+			if reservationErr == nil {
+				reservationErr = s.meta.InsertTiDBCloudFreeTenantReservation(ctx, pendingTenant, quotaPatch)
+			}
 		} else {
-			reservationErr = s.meta.InsertTiDBCloudTenantReservation(ctx, pendingTenant, organizationID, nil)
+			reservationErr = s.meta.InsertTenant(ctx, pendingTenant)
 		}
 	} else {
 		reservationErr = s.meta.InsertTenant(ctx, pendingTenant)
@@ -5461,6 +5486,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 							if hardErr == nil {
 								res, reserveErr := s.provisionTenantOnSharedDBEmergency(ctx, tenantID, fallback, provider, keyName, opts, now, hardCap)
 								if reserveErr == nil {
+									if releaseErr := releaseFreeQuotaLock(); releaseErr != nil {
+										s.failTenantProvision(ctx, tenantID, provider)
+										return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to release free tenant quota lock", releaseErr)
+									}
 									s.scheduleManagedSharedDBContinuation(ctx, plannedDB.ID)
 									return res, nil
 								}
@@ -5483,6 +5512,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				}
 				s.failTenantProvision(ctx, tenantID, provider)
 				return nil, reserveErr
+			}
+			if releaseErr := releaseFreeQuotaLock(); releaseErr != nil {
+				s.failTenantProvision(ctx, tenantID, provider)
+				return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to release free tenant quota lock", releaseErr)
 			}
 			if created || sharedDB.Status == meta.SharedDBStatusPending || sharedDB.Status == meta.SharedDBStatusProvisioning {
 				s.scheduleManagedSharedDBContinuation(ctx, sharedDB.ID)
@@ -5507,8 +5540,13 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		res, provisionErr := s.provisionTenantOnSharedDB(ctx, tenantID, sharedDB, provider, keyName, opts, now)
 		if provisionErr != nil {
 			s.failTenantProvision(ctx, tenantID, provider)
+			return res, provisionErr
 		}
-		return res, provisionErr
+		if releaseErr := releaseFreeQuotaLock(); releaseErr != nil {
+			s.failTenantProvision(ctx, tenantID, provider)
+			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to release free tenant quota lock", releaseErr)
+		}
+		return res, nil
 	}
 
 	if autoProfile != nil {
@@ -5575,6 +5613,12 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			} else {
 				earlyBoundNative = true
 				logProvisionStage(ctx, "provision_early_cluster_binding_persisted", tenantID, provider, stageStarted, "cluster_id", cluster.ClusterID, "organization_id", expectedOrganizationID)
+				if releaseErr := releaseFreeQuotaLock(); releaseErr != nil {
+					logger.Error(ctx, "server_event", eventFields(ctx, "provision_free_quota_lock_release_failed", "tenant_id", tenantID, "provider", provider, "error", releaseErr)...)
+					metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+					s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "free_quota_lock_release_error")
+					return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to release free tenant quota lock", releaseErr)
+				}
 				cluster, err = earlyProvisioner.WaitForClusterMetadataWithCredentials(ctx, cluster, *opts.CredentialProvisioner)
 				if err == nil && strings.TrimSpace(cluster.OrganizationID) != expectedOrganizationID {
 					err = fmt.Errorf("tidbcloud organization mismatch: expected %s, got %s", expectedOrganizationID, strings.TrimSpace(cluster.OrganizationID))

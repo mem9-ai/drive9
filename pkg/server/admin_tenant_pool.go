@@ -2021,11 +2021,11 @@ func (s *Server) claimAdminTenantFromPoolWithAccess(ctx context.Context, cred te
 		if sharedCandidate != nil && (nativeCandidate == nil || sharedCandidate.Membership.CreatedAt.Before(nativeCandidate.Binding.CreatedAt) ||
 			(sharedCandidate.Membership.CreatedAt.Equal(nativeCandidate.Binding.CreatedAt) && sharedCandidate.Tenant.ID < nativeCandidate.Tenant.ID)) {
 			if access.IsFree {
-				if headroomErr := s.checkFreePoolClaimHeadroom(claimCtx, sharedCandidate.Tenant.ID, orgID); headroomErr != nil {
+				if headroomErr := s.checkFreePoolClaimHeadroom(claimCtx, orgID); headroomErr != nil {
 					return tenantPoolClaimSelection{}, headroomErr
 				}
 			}
-			result, claimErr := s.claimSharedTenantPoolMember(claimCtx, pool, sharedCandidate, quotaOpt, orgID)
+			result, claimErr := s.claimSharedTenantPoolMember(claimCtx, pool, sharedCandidate, quotaOpt)
 			if claimErr != nil {
 				return tenantPoolClaimSelection{}, claimErr
 			}
@@ -2035,11 +2035,11 @@ func (s *Server) claimAdminTenantFromPoolWithAccess(ctx context.Context, cred te
 			return tenantPoolClaimSelection{}, nil
 		}
 		if access.IsFree {
-			if headroomErr := s.checkFreePoolClaimHeadroom(claimCtx, nativeCandidate.Tenant.ID, orgID); headroomErr != nil {
+			if headroomErr := s.checkFreePoolClaimHeadroom(claimCtx, orgID); headroomErr != nil {
 				return tenantPoolClaimSelection{}, headroomErr
 			}
 		}
-		row, claimErr := s.meta.ClaimFreeTenantPoolBindingForCustomer(claimCtx, orgID, nativeCandidate.Tenant.ID, orgID, claimQuotaPatch)
+		row, claimErr := s.meta.ClaimFreeTenantPoolBinding(claimCtx, orgID, nativeCandidate.Tenant.ID, claimQuotaPatch)
 		if claimErr != nil {
 			return tenantPoolClaimSelection{}, claimErr
 		}
@@ -2147,14 +2147,7 @@ func (s *Server) claimAdminTenantFromPoolWithAccess(ctx context.Context, cred te
 	}, pool, true, false, nil
 }
 
-func (s *Server) checkFreePoolClaimHeadroom(ctx context.Context, tenantID, organizationID string) error {
-	counted, err := s.meta.IsTiDBCloudFreeTenantCounted(ctx, tenantID, organizationID)
-	if err != nil {
-		return err
-	}
-	if counted {
-		return nil
-	}
+func (s *Server) checkFreePoolClaimHeadroom(ctx context.Context, organizationID string) error {
 	count, err := s.meta.CountTiDBCloudFreeTenants(ctx, organizationID)
 	if err != nil {
 		return err
@@ -2165,7 +2158,7 @@ func (s *Server) checkFreePoolClaimHeadroom(ctx context.Context, tenantID, organ
 	return nil
 }
 
-func (s *Server) claimSharedTenantPoolMember(ctx context.Context, pool *meta.TenantPool, row *meta.TenantWithPoolMembership, quotaOpt *quotaRequest, billingOrganizationID string) (*provisionTenantResult, error) {
+func (s *Server) claimSharedTenantPoolMember(ctx context.Context, pool *meta.TenantPool, row *meta.TenantWithPoolMembership, quotaOpt *quotaRequest) (*provisionTenantResult, error) {
 	if pool == nil || row == nil {
 		return nil, meta.ErrNotFound
 	}
@@ -2196,7 +2189,7 @@ func (s *Server) claimSharedTenantPoolMember(ctx context.Context, pool *meta.Ten
 	if err != nil {
 		return nil, err
 	}
-	if err := s.meta.ClaimSharedTenantPoolMembershipForCustomer(ctx, row.Tenant.ID, pool.PoolID, billingOrganizationID, patch, key); err != nil {
+	if err := s.meta.ClaimSharedTenantPoolMembership(ctx, row.Tenant.ID, pool.PoolID, patch, key); err != nil {
 		return nil, err
 	}
 	return &provisionTenantResult{TenantID: row.Tenant.ID, APIKey: rawToken, APIKeyID: apiKeyID,

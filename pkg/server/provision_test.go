@@ -80,16 +80,24 @@ type fakeProvisioner struct {
 
 type earlyBindingProvisioner struct {
 	*fakeProvisioner
-	created     *tenant.ClusterInfo
-	ready       *tenant.ClusterInfo
-	waitStarted chan struct{}
-	waitRelease <-chan struct{}
-	waitErr     error
+	createStarted chan struct{}
+	createRelease <-chan struct{}
+	created       *tenant.ClusterInfo
+	ready         *tenant.ClusterInfo
+	waitStarted   chan struct{}
+	waitRelease   <-chan struct{}
+	waitErr       error
 }
 
 func (p *earlyBindingProvisioner) CreateClusterWithCredentialsAndQuota(_ context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
 	p.lastCredentialReq = req
 	p.lastCreateQuotaOptions = opts
+	if p.createStarted != nil {
+		close(p.createStarted)
+	}
+	if p.createRelease != nil {
+		<-p.createRelease
+	}
 	out := *p.created
 	out.TenantID = tenantID
 	out.Provider = tenant.ProviderTiDBCloudNative
@@ -289,9 +297,9 @@ func TestProvisionFreeTiDBCloudNativeSharedUsesCustomerQuotaAndSharedPhysicalSpe
 	if dbPool.TiDBCloudOrganizationID != "customer-org" {
 		t.Fatalf("managed pool organization ID = %q, want customer-org", dbPool.TiDBCloudOrganizationID)
 	}
-	billingBinding, err := metaStore.GetTenantBillingOrgBinding(context.Background(), res.TenantID)
-	if err != nil || billingBinding.TiDBCloudOrganizationID != "customer-org" {
-		t.Fatalf("customer billing binding = %+v, err=%v", billingBinding, err)
+	freeCount, err := metaStore.CountTiDBCloudFreeTenants(context.Background(), "customer-org")
+	if err != nil || freeCount != 1 {
+		t.Fatalf("customer free tenant count = %d, err=%v, want 1", freeCount, err)
 	}
 	quota, err := metaStore.GetQuotaConfig(context.Background(), res.TenantID)
 	if err != nil {
@@ -2244,6 +2252,88 @@ func TestProvisionTiDBCloudNativePersistsEarlyClusterBindingBeforeMetadataWait(t
 	}
 }
 
+func TestProvisionFreeTiDBCloudNativeHoldsQuotaLockUntilEarlyBindingAndReleasesBeforeMetadataWait(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	createRelease := make(chan struct{})
+	waitRelease := make(chan struct{})
+	prov := &earlyBindingProvisioner{
+		fakeProvisioner: &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
+		createStarted:   make(chan struct{}),
+		createRelease:   createRelease,
+		created: &tenant.ClusterInfo{
+			ClusterID: "cluster-free-lock", Password: "db-pass", DBName: "customer_db",
+		},
+		ready: &tenant.ClusterInfo{
+			OrganizationID: "org-free-lock", Host: "db.example", Port: 4000, Username: "u1.root",
+		},
+		waitStarted: make(chan struct{}),
+		waitRelease: waitRelease,
+	}
+	rt.server.provisioner = prov
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	type provisionOutcome struct {
+		result *provisionTenantResult
+		err    error
+	}
+	outcomes := make(chan provisionOutcome, 1)
+	go func() {
+		result, err := rt.server.provisionTenant(context.Background(), provisionTenantOptions{
+			KeyName: "default", TokenVersion: 1, CredentialProvisioner: &cred,
+			TiDBCloudAccess: &tiDBCloudAccessProfile{OrganizationID: "org-free-lock", IsFree: true},
+		})
+		outcomes <- provisionOutcome{result: result, err: err}
+	}()
+
+	select {
+	case <-prov.createStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cluster create did not start")
+	}
+	type quotaLockOutcome struct {
+		release func() error
+		err     error
+	}
+	lockOutcomes := make(chan quotaLockOutcome, 1)
+	go func() {
+		release, err := rt.meta.AcquireTiDBCloudFreeQuotaLock(context.Background(), "org-free-lock")
+		lockOutcomes <- quotaLockOutcome{release: release, err: err}
+	}()
+	select {
+	case outcome := <-lockOutcomes:
+		if outcome.release != nil {
+			_ = outcome.release()
+		}
+		t.Fatalf("quota lock was acquirable during cluster create: %v", outcome.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(createRelease)
+	select {
+	case <-prov.waitStarted:
+	case outcome := <-outcomes:
+		t.Fatalf("provision returned before metadata wait: result=%+v err=%v", outcome.result, outcome.err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("metadata wait did not start")
+	}
+	lockResult := <-lockOutcomes
+	if lockResult.err != nil {
+		t.Fatalf("quota lock remained held during metadata wait: %v", lockResult.err)
+	}
+	if err := lockResult.release(); err != nil {
+		t.Fatalf("release verification lock: %v", err)
+	}
+	count, err := rt.meta.CountTiDBCloudFreeTenants(context.Background(), "org-free-lock")
+	if err != nil || count != 1 {
+		t.Fatalf("free count during metadata wait = %d, err=%v, want 1", count, err)
+	}
+
+	close(waitRelease)
+	outcome := <-outcomes
+	if outcome.err != nil || outcome.result == nil {
+		t.Fatalf("provision outcome = %+v err=%v", outcome.result, outcome.err)
+	}
+}
+
 func TestProvisionTiDBCloudNativeRejectsMetadataOrganizationMismatchAndCleansCluster(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	prov := &earlyBindingProvisioner{
@@ -2377,7 +2467,7 @@ func TestProvisionTiDBCloudNativeFinalizationDoesNotOverwriteChangedStatus(t *te
 	}
 }
 
-func TestProvisionFreeTiDBCloudTenantPersistsBindingAndExplicitQuota(t *testing.T) {
+func TestProvisionFreeTiDBCloudTenantPersistsNativeBindingAndExplicitQuota(t *testing.T) {
 	rt := newTiDBCloudFreeProvisionRuntime(t, 3)
 	resp := rt.postProvision(t, map[string]any{
 		"public_key":  "public-1",
@@ -2393,9 +2483,9 @@ func TestProvisionFreeTiDBCloudTenantPersistsBindingAndExplicitQuota(t *testing.
 		t.Fatal(err)
 	}
 	tenantID := out["tenant_id"]
-	binding, err := rt.meta.GetTenantBillingOrgBinding(context.Background(), tenantID)
-	if err != nil || binding.TiDBCloudOrganizationID != "org-free" {
-		t.Fatalf("billing binding = %+v, err=%v", binding, err)
+	binding, err := rt.meta.GetTenantTiDBCloudOrgBinding(context.Background(), tenantID)
+	if err != nil || binding.OrganizationID != "org-free" {
+		t.Fatalf("native binding = %+v, err=%v", binding, err)
 	}
 	cfg, err := rt.meta.GetQuotaConfig(context.Background(), tenantID)
 	if err != nil {
@@ -2409,6 +2499,10 @@ func TestProvisionFreeTiDBCloudTenantPersistsBindingAndExplicitQuota(t *testing.
 	}
 	if rt.provisioner.lastCreateQuotaOptions.TiDBCloudSpendingLimitMonthly == nil || *rt.provisioner.lastCreateQuotaOptions.TiDBCloudSpendingLimitMonthly != 0 {
 		t.Fatalf("create spending limit = %+v, want explicit zero", rt.provisioner.lastCreateQuotaOptions.TiDBCloudSpendingLimitMonthly)
+	}
+	count, err := rt.meta.CountTiDBCloudFreeTenants(context.Background(), "org-free")
+	if err != nil || count != 1 {
+		t.Fatalf("free tenant count = %d, err=%v, want 1", count, err)
 	}
 }
 
@@ -2563,7 +2657,7 @@ func TestProvisionFreeTiDBCloudTenantReleasesReservationAfterClusterCleanup(t *t
 	}
 }
 
-func TestProvisionNonFreeTiDBCloudTenantPersistsBillingBinding(t *testing.T) {
+func TestProvisionNonFreeTiDBCloudTenantDoesNotConsumeFreeQuota(t *testing.T) {
 	rt := newTiDBCloudFreeProvisionRuntime(t, 3)
 	rt.provisioner.billingFree = false
 	resp := rt.postProvision(t, map[string]any{"public_key": "public-1", "private_key": "private-1"})
@@ -2576,9 +2670,13 @@ func TestProvisionNonFreeTiDBCloudTenantPersistsBillingBinding(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	binding, err := rt.meta.GetTenantBillingOrgBinding(context.Background(), out["tenant_id"])
-	if err != nil || binding.TiDBCloudOrganizationID != "org-free" {
-		t.Fatalf("billing binding = %+v, err=%v", binding, err)
+	binding, err := rt.meta.GetTenantTiDBCloudOrgBinding(context.Background(), out["tenant_id"])
+	if err != nil || binding.OrganizationID != "org-free" {
+		t.Fatalf("native binding = %+v, err=%v", binding, err)
+	}
+	count, err := rt.meta.CountTiDBCloudFreeTenants(context.Background(), "org-free")
+	if err != nil || count != 0 {
+		t.Fatalf("free tenant count = %d, err=%v, want 0", count, err)
 	}
 }
 
@@ -4430,9 +4528,6 @@ func TestReconcilePendingReservationOnlyFreeTenantBecomesDeleted(t *testing.T) {
 	if err := metaStore.InsertTenant(context.Background(), &pendingTenant); err != nil {
 		t.Fatal(err)
 	}
-	if err := metaStore.UpsertTenantBillingOrgBinding(context.Background(), tenantID, "org-reservation-only"); err != nil {
-		t.Fatal(err)
-	}
 	zero := int64(0)
 	if err := metaStore.SetQuotaConfigPatch(context.Background(), tenantID, meta.QuotaConfigPatch{TiDBCloudSpendingLimit: &zero}); err != nil {
 		t.Fatal(err)
@@ -4470,9 +4565,6 @@ func TestReconcilePendingReloadsTenantAfterConcurrentEarlyBinding(t *testing.T) 
 		SchemaVersion: 1, CreatedAt: staleAt, UpdatedAt: staleAt,
 	}
 	if err := metaStore.InsertTenant(context.Background(), &staleSnapshot); err != nil {
-		t.Fatal(err)
-	}
-	if err := metaStore.UpsertTenantBillingOrgBinding(context.Background(), tenantID, "org-concurrent-binding"); err != nil {
 		t.Fatal(err)
 	}
 	zero := int64(0)

@@ -402,9 +402,6 @@ func (s *Store) migrate() (err error) {
 	if err := expandManagedDBPoolSchema(ctx, s.db); err != nil {
 		return err
 	}
-	if err := backfillTenantBillingOrgBindings(ctx, s.db); err != nil {
-		return err
-	}
 	if err := backfillTiDBCloudOrgBindingBranchIDs(ctx, s.db); err != nil {
 		return err
 	}
@@ -889,13 +886,6 @@ func metaInitSchemaStatements() []string {
 				INDEX idx_tidbcloud_org_created (organization_id, created_at, tenant_id),
 				INDEX idx_tidbcloud_pool_free (organization_id, pool_status, created_at, tenant_id)
 			)`,
-		`CREATE TABLE IF NOT EXISTS tenant_billing_org_bindings (
-			tenant_id                  VARCHAR(64) PRIMARY KEY,
-			tidbcloud_organization_id VARCHAR(64) NOT NULL,
-			created_at                 DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			updated_at                 DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-			INDEX idx_billing_org_tenant (tidbcloud_organization_id, tenant_id)
-		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_tidbcloud_pools (
 			pool_id         VARCHAR(64) PRIMARY KEY,
 			organization_id VARCHAR(64) NULL,
@@ -2323,22 +2313,18 @@ func (s *Store) listFreeTenantPoolBindings(ctx context.Context, organizationID s
 }
 
 func (s *Store) ClaimOldestFreeTenantPoolBinding(ctx context.Context, organizationID string) (out *TenantWithTiDBCloudOrgBinding, err error) {
-	return s.ClaimOldestFreeTenantPoolBindingForCustomer(ctx, organizationID, "", QuotaConfigPatch{})
+	return s.claimFreeTenantPoolBinding(ctx, organizationID, "", QuotaConfigPatch{})
 }
 
-func (s *Store) ClaimOldestFreeTenantPoolBindingForCustomer(ctx context.Context, organizationID, billingOrganizationID string, quota QuotaConfigPatch) (out *TenantWithTiDBCloudOrgBinding, err error) {
-	return s.claimFreeTenantPoolBindingForCustomer(ctx, organizationID, "", billingOrganizationID, quota)
-}
-
-func (s *Store) ClaimFreeTenantPoolBindingForCustomer(ctx context.Context, organizationID, tenantID, billingOrganizationID string, quota QuotaConfigPatch) (out *TenantWithTiDBCloudOrgBinding, err error) {
+func (s *Store) ClaimFreeTenantPoolBinding(ctx context.Context, organizationID, tenantID string, quota QuotaConfigPatch) (out *TenantWithTiDBCloudOrgBinding, err error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return nil, fmt.Errorf("tenant_id is required")
 	}
-	return s.claimFreeTenantPoolBindingForCustomer(ctx, organizationID, tenantID, billingOrganizationID, quota)
+	return s.claimFreeTenantPoolBinding(ctx, organizationID, tenantID, quota)
 }
 
-func (s *Store) claimFreeTenantPoolBindingForCustomer(ctx context.Context, organizationID, tenantID, billingOrganizationID string, quota QuotaConfigPatch) (out *TenantWithTiDBCloudOrgBinding, err error) {
+func (s *Store) claimFreeTenantPoolBinding(ctx context.Context, organizationID, tenantID string, quota QuotaConfigPatch) (out *TenantWithTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "claim_free_tidbcloud_pool_binding", start, &err)
 	organizationID = strings.TrimSpace(organizationID)
@@ -2368,11 +2354,6 @@ func (s *Store) claimFreeTenantPoolBindingForCustomer(ctx context.Context, organ
 		rec, scanErr := scanTenantBindingRow(row)
 		if scanErr != nil {
 			return scanErr
-		}
-		if strings.TrimSpace(billingOrganizationID) != "" {
-			if err := ensureTenantBillingOrgBindingTx(ctx, tx, rec.Tenant.ID, billingOrganizationID); err != nil {
-				return err
-			}
 		}
 		if quota.AnySet() {
 			if err := upsertTenantQuotaPatchTx(ctx, tx, rec.Tenant.ID, quota); err != nil {
@@ -2557,9 +2538,6 @@ func (s *Store) ReleaseTenantPoolClaim(ctx context.Context, tenantID string) (er
 			return err
 		}
 		if err := requireAffected(res); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_billing_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_quota_config WHERE tenant_id = ?`, tenantID); err != nil {
