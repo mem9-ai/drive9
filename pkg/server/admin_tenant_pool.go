@@ -1898,6 +1898,8 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 		sharedProvider := s.defaultTenantProvider == tenant.ProviderTiDBCloudNativeShared
 		createdAny := false
 		sharedWaveRemaining := 0
+		// A started shared wave accounts for in-flight pending/provisioning slots;
+		// sharedWaveRemaining is the hard cap that guarantees termination.
 		for {
 			if err := ctx.Err(); err != nil {
 				metricResult = adminTenantPoolMetricResult(err)
