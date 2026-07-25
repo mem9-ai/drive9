@@ -2157,6 +2157,20 @@ func (s *Store) CountTenantPoolFreeSlots(ctx context.Context, organizationID str
 	return s.countFreeTenantPoolBindingsByStatus(ctx, organizationID, []TenantStatus{TenantPending, TenantProvisioning, TenantActive})
 }
 
+const countFreeTenantPoolBindingsSQL = `SELECT COALESCE(SUM(slot_count), 0) FROM (
+	SELECT COUNT(*) AS slot_count
+		FROM tenant_tidbcloud_org_bindings b
+		STRAIGHT_JOIN tenants t ON t.id = b.tenant_id
+		WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
+			AND t.status IN (%s)
+	UNION ALL
+	SELECT COUNT(*) AS slot_count
+		FROM tenant_pool_memberships m
+		STRAIGHT_JOIN tenants t ON t.id = m.tenant_id
+		WHERE m.tidbcloud_organization_id = ? AND m.pool_status = ? AND t.provider = ?
+			AND t.status IN (%s)
+) inventory`
+
 func (s *Store) countFreeTenantPoolBindingsByStatus(ctx context.Context, organizationID string, statuses []TenantStatus) (out int, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "count_free_tidbcloud_pool_bindings", start, &err)
@@ -2168,24 +2182,19 @@ func (s *Store) countFreeTenantPoolBindingsByStatus(ctx context.Context, organiz
 		return 0, fmt.Errorf("tenant statuses are required")
 	}
 	placeholders := strings.TrimRight(strings.Repeat("?,", len(statuses)), ",")
-	args := make([]any, 0, 3+len(statuses))
+	args := make([]any, 0, 6+2*len(statuses))
 	args = append(args, organizationID, TenantPoolBindingFree, tidbCloudNativeProvider)
 	for _, status := range statuses {
 		args = append(args, status)
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*)
-		FROM tenant_tidbcloud_org_bindings b
-		JOIN tenants t ON t.id = b.tenant_id
-		WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
-			AND t.status IN (`+placeholders+`)`, args...)
+	args = append(args, organizationID, TenantPoolBindingFree, tidbCloudNativeSharedProvider)
+	for _, status := range statuses {
+		args = append(args, status)
+	}
+	row := s.db.QueryRowContext(ctx, fmt.Sprintf(countFreeTenantPoolBindingsSQL, placeholders, placeholders), args...)
 	if err = row.Scan(&out); err != nil {
 		return 0, err
 	}
-	shared, err := s.CountFreeTenantPoolMemberships(ctx, organizationID, statuses)
-	if err != nil {
-		return 0, err
-	}
-	out += shared
 	return out, nil
 }
 
