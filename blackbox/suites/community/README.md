@@ -51,10 +51,18 @@ selectors unless `INCLUDE_MANUAL=1` is set or it is selected explicitly with
 ## Dependencies
 
 The harness prefers already-installed tools, then `*_BIN` / `*_DIR` environment
-overrides, then auto-fetch under the work-dir cache. On Linux hosts with
-`apt-get` and passwordless `sudo`, it can also bootstrap the system packages
-needed to build these suites (build-essential, autotools, Perl/prove, MPICH,
-Python headers). Disable that with `AUTO_INSTALL_SYSTEM_DEPS=0`.
+overrides, then auto-fetch under the work-dir cache. On a clean Linux host with
+passwordless `sudo`, it also auto-installs OS packages needed to *build* those
+tools:
+
+| Package manager | Distros | Notes |
+|---|---|---|
+| `apt-get` | Debian / Ubuntu | Installs Debian package names as written in deps |
+| `pacman` | Arch Linux / Arch-based (incl. Orb Arch) | Maps Debian-style names (`build-essential` → `base-devel`, `pkg-config` → `pkgconf`, `mpich` → `openmpi`, …) |
+
+Disable OS package install with `AUTO_INSTALL_SYSTEM_DEPS=0`. Without passwordless
+`sudo`, install build deps yourself and re-run (tools may still auto-fetch/build
+from source when compilers are present).
 
 Direct environment overrides (read without prefix):
 
@@ -132,10 +140,12 @@ syscall coverage against a full LTP install.
 
 `community.fio` auto-fetches and builds fio when `fio` is not already available.
 `community.mdtest` auto-fetches and builds IOR/mdtest when `mdtest` is not
-already available; IOR requires an MPI compiler, so on Linux with `apt-get` and
-passwordless `sudo` the harness installs `mpich libmpich-dev` when `mpicc` is
-missing. The IOR source is patched in-cache for newer compiler compatibility
-before building mdtest. `community.fsx` fetches and builds `secfs.test` to obtain the `fsx` binary.
+already available; IOR requires an MPI compiler, so with auto system-deps the
+harness installs `mpich`/`libmpich-dev` (Debian) or `openmpi` (Arch) when
+`mpicc` is missing. The IOR source is patched in-cache for newer compiler
+compatibility before building mdtest. `community.fsx` fetches and builds
+`secfs.test` to obtain the `fsx` binary, and patches `fsx.c` for glibc builds
+that already provide `strlcpy`/`strlcat` (common on Arch).
 
 Dependency metadata (name, source, license, ref) is embedded in each
 module's own `deps.py` and written as `.drive9-blackbox-dependency.json`

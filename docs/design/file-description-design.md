@@ -549,7 +549,7 @@ Local TiDB (tiup playground / Docker) does **not** support `VEC_COSINE_DISTANCE`
 
 ### CI Integration
 
-For automated CI, point `e2e/verify-description-e2e.sh` at a TiDB Cloud test instance:
+For automated CI, point `e2e/description-smoke-test.sh` at a TiDB Cloud test instance:
 
 ```bash
 export DRIVE9_BASE="https://drive9-e2e.example.com/v1"
@@ -559,7 +559,7 @@ export DRIVE9_EMBED_API_BASE="https://api.openai.com/v1"
 export DRIVE9_EMBED_API_KEY="<openai-key>"
 export DRIVE9_EMBED_MODEL="text-embedding-3-small"
 export DRIVE9_EMBED_DIMENSIONS=1024
-bash e2e/verify-description-e2e.sh
+bash e2e/description-smoke-test.sh
 ```
 
 > Note: Remove or adjust the "known limitation" skip in the Grep test section when running against TiDB Cloud.

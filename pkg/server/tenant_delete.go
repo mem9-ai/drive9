@@ -107,7 +107,7 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 				errJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			defaultReq := resolveDefaultCredentials(s.provisioner)
+			defaultReq := resolveDefaultCredentials(s.provisioner, t.Provider)
 			if defaultReq == nil {
 				errJSON(w, http.StatusBadRequest, tenant.ErrCredentialsRequired.Error())
 				return

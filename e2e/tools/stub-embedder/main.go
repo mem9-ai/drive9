@@ -1,3 +1,7 @@
+// Command stub-embedder is a minimal OpenAI-compatible embeddings HTTP server
+// for local e2e (random fixed-dim vectors; no real model).
+//
+//	PORT=11435 go run ./e2e/tools/stub-embedder
 package main
 
 import (

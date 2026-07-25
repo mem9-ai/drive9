@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Portable profile pack/unpack e2e against a live deployment.
+# pack-smoke-test: portable profile pack/unpack against a live deployment.
 
 set -euo pipefail
 
@@ -12,7 +12,7 @@ CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
 CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
-PORTABLE_PACK_E2E_KEEP_WORK="${PORTABLE_PACK_E2E_KEEP_WORK:-0}"
+PACK_SMOKE_KEEP_WORK="${PACK_SMOKE_KEEP_WORK:-0}"
 
 PASS=0
 FAIL=0
@@ -196,7 +196,7 @@ cleanup() {
   if [ -n "${PACK_REMOTE_ARCHIVE:-}" ] && [ -n "${CLI_BIN:-}" ] && [ -n "${API_KEY:-}" ]; then
     drive9_retry fs rm "$PACK_REMOTE_ARCHIVE" >/dev/null 2>&1 || true
   fi
-  if [ "${PORTABLE_PACK_E2E_KEEP_WORK:-0}" != "1" ] && [ -n "${WORK_ROOT:-}" ]; then
+  if [ "${PACK_SMOKE_KEEP_WORK:-0}" != "1" ] && [ -n "${WORK_ROOT:-}" ]; then
     rm -rf "$WORK_ROOT"
   elif [ -n "${WORK_ROOT:-}" ]; then
     echo "kept work root: $WORK_ROOT"
@@ -204,7 +204,7 @@ cleanup() {
   exit "$rc"
 }
 
-echo "=== drive9 portable pack/unpack e2e ==="
+echo "=== drive9 pack-smoke-test ==="
 echo "BASE=$BASE"
 echo "CLI_SOURCE=$CLI_SOURCE"
 
@@ -257,13 +257,13 @@ prepare_cli_binary
 check_cmd "drive9 binary ready" test -x "$CLI_BIN"
 
 TS="$(date +%s)-$$"
-WORK_ROOT="$(mktemp -d "/tmp/drive9-portable-pack-e2e-${TS}.XXXXXX")"
+WORK_ROOT="$(mktemp -d "/tmp/drive9-pack-smoke-${TS}.XXXXXX")"
 CLI_ENV_HOME="$WORK_ROOT/home"
 SRC_LOCAL_ROOT="$WORK_ROOT/source-local"
 RESTORE_LOCAL_ROOT="$WORK_ROOT/restore-local"
 SRC_REPO="$SRC_LOCAL_ROOT/overlay/workspace/app"
 RESTORE_REPO="$RESTORE_LOCAL_ROOT/overlay/workspace/app"
-REMOTE_ROOT="/portable-pack-e2e-${TS}"
+REMOTE_ROOT="/pack-smoke-${TS}"
 PACK_PROFILE="portable"
 PACK_REMOTE_ARCHIVE="$(default_pack_archive_path "$REMOTE_ROOT" "$PACK_PROFILE")"
 trap cleanup EXIT
@@ -381,9 +381,7 @@ check_eq "restored README content matches" "$(cat "$RESTORE_REPO/README.md")" "$
 check_eq "restored untracked note matches" "$(cat "$RESTORE_REPO/notes/todo.txt")" "$(cat "$SRC_REPO/notes/todo.txt")"
 
 echo
-echo "=== portable pack/unpack e2e result ==="
-echo "PASS=$PASS FAIL=$FAIL TOTAL=$TOTAL"
-
+echo "RESULT: $PASS passed, $FAIL failed, $TOTAL total"
 if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
