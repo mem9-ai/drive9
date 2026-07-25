@@ -237,6 +237,7 @@ type Server struct {
 	forkWorkerMu                        sync.Mutex
 	forkWorkerClosed                    bool
 	tenantPoolLocks                     sync.Map
+	tenantPoolReplenishJobs             sync.Map
 	tenantPoolCreateLocks               sync.Map
 	sharedDBAllocationLocks             sync.Map
 	tenantPoolResumeJobs                sync.Map

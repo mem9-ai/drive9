@@ -1838,11 +1838,15 @@ func firstResultOrganizationID(results []*provisionTenantResult) string {
 }
 
 func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.TenantPool, cred tenant.CredentialProvisionRequest) {
-	if pool == nil || pool.OrganizationID == "" || pool.Size <= 0 {
+	if pool == nil || pool.PoolID == "" || pool.OrganizationID == "" || pool.Size <= 0 {
+		return
+	}
+	if !s.beginTenantPoolReplenishment(pool.PoolID) {
 		return
 	}
 	workerCtx := backgroundWithTrace(ctx)
-	s.startServerWorker(workerCtx, func(ctx context.Context) {
+	if !s.startServerWorker(workerCtx, func(ctx context.Context) {
+		defer s.finishTenantPoolReplenishment(pool.PoolID)
 		replenishStarted := time.Now()
 		metricResult := "ok"
 		defer func() {
@@ -1866,13 +1870,13 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 				metricResult = "skipped"
 				return nil
 			}
-			defer s.refreshTenantPoolCapacity(ctx, current)
 			freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
 			if err != nil {
 				logger.Warn(ctx, "admin_tenant_pool_replenish_free_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
 				metricResult = "error"
 				return nil
 			}
+			s.recordTenantPoolCapacity(current.PoolID, current.OrganizationID, current.Size, freeSize)
 			if !s.tenantPoolBelowRefillWatermark(freeSize, current.Size) {
 				logger.Info(ctx, "admin_tenant_pool_replenish_skipped",
 					zap.String("pool_id", current.PoolID),
@@ -1897,6 +1901,7 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 				metricResult = "noop"
 				return nil
 			}
+			defer s.refreshTenantPoolCapacity(ctx, current)
 			if s.defaultTenantProvider == tenant.ProviderTiDBCloudNativeShared {
 				maxTenants, _ := s.managedSharedDBPolicy()
 				missing = managedSharedDBRefillTenantCount(missing, maxTenants, s.managedSharedDBRefillPoolLimit)
@@ -1915,7 +1920,9 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 			logger.Warn(ctx, "admin_tenant_pool_replenish_lock_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
 			metricResult = adminTenantPoolMetricResult(err)
 		}
-	})
+	}) {
+		s.finishTenantPoolReplenishment(pool.PoolID)
+	}
 }
 
 func (s *Server) tenantPoolBelowRefillWatermark(freeSize, poolSize int) bool {
@@ -1989,6 +1996,18 @@ func (s *Server) tenantPoolLock(poolID string) *sync.Mutex {
 	}
 	v, _ := s.tenantPoolLocks.LoadOrStore(poolID, &sync.Mutex{})
 	return v.(*sync.Mutex)
+}
+
+func (s *Server) beginTenantPoolReplenishment(poolID string) bool {
+	if strings.TrimSpace(poolID) == "" {
+		return false
+	}
+	_, loaded := s.tenantPoolReplenishJobs.LoadOrStore(poolID, struct{}{})
+	return !loaded
+}
+
+func (s *Server) finishTenantPoolReplenishment(poolID string) {
+	s.tenantPoolReplenishJobs.Delete(poolID)
 }
 
 func (s *Server) tenantPoolCreateLock(cred tenant.CredentialProvisionRequest) *sync.Mutex {

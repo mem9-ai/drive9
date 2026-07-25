@@ -972,6 +972,25 @@ func TestAdminTenantPoolReplenishSkipsAtFreeWatermark(t *testing.T) {
 	}
 }
 
+func TestTenantPoolReplenishmentCoalescesConcurrentTriggersByPool(t *testing.T) {
+	s := &Server{}
+
+	if !s.beginTenantPoolReplenishment("pool-1") {
+		t.Fatal("first trigger was not accepted")
+	}
+	if s.beginTenantPoolReplenishment("pool-1") {
+		t.Fatal("concurrent trigger for the same pool was accepted")
+	}
+	if !s.beginTenantPoolReplenishment("pool-2") {
+		t.Fatal("trigger for a different pool was not accepted")
+	}
+
+	s.finishTenantPoolReplenishment("pool-1")
+	if !s.beginTenantPoolReplenishment("pool-1") {
+		t.Fatal("trigger was not accepted after the previous job finished")
+	}
+}
+
 func TestAdminTenantPoolReplenishBatchesBelowFreeWatermark(t *testing.T) {
 	rt, _ := newAdminTenantPoolRuntime(t)
 	ctx := context.Background()

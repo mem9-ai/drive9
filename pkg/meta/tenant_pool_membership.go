@@ -27,6 +27,11 @@ type TenantWithPoolMembership struct {
 	Membership TenantPoolMembership
 }
 
+const countFreeTenantPoolMembershipsSQL = `SELECT COUNT(*) FROM tenant_pool_memberships m
+	STRAIGHT_JOIN tenants t ON t.id = m.tenant_id
+	WHERE m.tidbcloud_organization_id = ? AND m.pool_status = ? AND t.provider = ?
+		AND t.status IN (%s)`
+
 func (s *Store) UpsertTenantPoolMembership(ctx context.Context, membership *TenantPoolMembership) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "upsert_tenant_pool_membership", start, &err)
@@ -264,10 +269,7 @@ func (s *Store) CountFreeTenantPoolMemberships(ctx context.Context, organization
 		args = append(args, status)
 	}
 	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tenant_pool_memberships m
-		JOIN tenants t ON t.id = m.tenant_id
-		WHERE m.tidbcloud_organization_id = ? AND m.pool_status = ? AND t.provider = ?
-			AND t.status IN (`+placeholders+`)`, args...).Scan(&count)
+	err := s.db.QueryRowContext(ctx, fmt.Sprintf(countFreeTenantPoolMembershipsSQL, placeholders), args...).Scan(&count)
 	return count, err
 }
 

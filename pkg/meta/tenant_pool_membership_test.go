@@ -3,9 +3,16 @@ package meta
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestFreeTenantPoolMembershipCountPinsMembershipTableFirst(t *testing.T) {
+	if !strings.Contains(countFreeTenantPoolMembershipsSQL, "FROM tenant_pool_memberships m\n\tSTRAIGHT_JOIN tenants t") {
+		t.Fatalf("count query does not pin tenant_pool_memberships as the driving table: %s", countFreeTenantPoolMembershipsSQL)
+	}
+}
 
 func TestTenantPoolMembershipRoundTripAndClaimCAS(t *testing.T) {
 	s := newControlStore(t)
