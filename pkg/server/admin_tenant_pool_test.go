@@ -1198,6 +1198,7 @@ func TestAdminTenantPoolReplenishChunksLargeRefill(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	deadline = time.Now().Add(10 * time.Second)
 	for {
 		free, err := metaStore.CountTenantPoolFreeSlots(ctx, pool.OrganizationID)
 		if err != nil {
