@@ -85,6 +85,11 @@ python3 blackbox/run.py --all --work-dir /tmp/bb
 # Prepare dependencies only (no setup/run)
 python3 blackbox/run.py --all --deps-only --work-dir /tmp/bb
 
+# Clean Linux (Debian/Ubuntu/Arch): auto-install OS packages + fetch/build tools.
+# Requires passwordless sudo. Disable with AUTO_INSTALL_SYSTEM_DEPS=0.
+# Arch uses pacman and maps Debian-style package names automatically.
+python3 blackbox/run.py --group community --bootstrap --work-dir /tmp/bb
+
 # Performance runs
 python3 blackbox/run.py --module community.fio --runs 3
 

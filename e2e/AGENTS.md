@@ -46,14 +46,14 @@ Use the dev value unless the environment owner announces a new endpoint.
 # Full smoke (provision -> status poll -> nested dirs -> file ops)
 bash e2e/api-smoke-test.sh
 
-# Existing key regression
-DRIVE9_API_KEY=drive9_xxx bash e2e/api-smoke-test-existing-key.sh
+# Reuse an existing tenant (skip provision)
+DRIVE9_API_KEY=drive9_xxx bash e2e/api-smoke-test.sh
 
 # CLI smoke (provision + drive9 fs workflows + large file cp)
 bash e2e/cli-smoke-test.sh
 
 # Portable profile pack/unpack over a deterministic local Git/npm fixture
-bash e2e/portable-pack-unpack-e2e.sh
+bash e2e/pack-smoke-test.sh
 
 # Journal smoke (provision + journal create/append/find/verify)
 bash e2e/journal-smoke-test.sh
@@ -93,7 +93,7 @@ bash e2e/smoke-all.sh
 RUN_GIT_OPS_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
 
 # Include portable profile pack/unpack coverage in smoke-all when desired.
-RUN_PORTABLE_PACK_E2E=1 bash e2e/smoke-all.sh
+RUN_PACK_SMOKE=1 bash e2e/smoke-all.sh
 
 # TiDB Cloud Native (tidbcloud-native) tenant lifecycle smoke
 # Requires credentials, not wired into CI. Set DRIVE9_BASE from Deployment
@@ -209,7 +209,7 @@ export DRIVE9_BASE=http://127.0.0.1:9009
 curl "$DRIVE9_BASE/healthz"
 
 bash e2e/api-smoke-test.sh
-DRIVE9_API_KEY='local-dev-key' bash e2e/api-smoke-test-existing-key.sh
+DRIVE9_API_KEY='local-dev-key' bash e2e/api-smoke-test.sh
 bash e2e/cli-smoke-test.sh
 bash e2e/fuse-smoke-test.sh
 bash e2e/git-ops-smoke-test.sh
@@ -228,9 +228,7 @@ use the same value as `DRIVE9_API_KEY` here.
 
 - `drive9-server-local` exposes a built-in single tenant key via
   `DRIVE9_LOCAL_API_KEY`; the default is `local-dev-key` when the env var is
-  not overridden.
-- `api-smoke-test-existing-key.sh` should use that built-in key instead of
-  provisioning a new tenant.
+  not overridden. Reuse it with `DRIVE9_API_KEY=local-dev-key bash e2e/api-smoke-test.sh`.
 - Upload-limit boundary failures (`507` on the `limit-1g.bin` initiate step)
   can be caused by stale multipart reservations in the tenant `uploads` table,
   not by current file-tree contents.
@@ -262,12 +260,6 @@ use the same value as `DRIVE9_API_KEY` here.
 16. Cleanup test tree (existing-tenant mode only): `DELETE /v1/fs/team-${TS}?recursive`
     removes the timestamped test tree so an existing tenant is not polluted
 
-### `api-smoke-test-existing-key.sh`
-
-1. Existing API key auth on `GET /v1/status`
-2. Optional poll from `provisioning` to `active`
-3. `GET /v1/fs/?list` baseline read check
-
 ### `cli-smoke-test.sh`
 
 1. Provision + readiness polling — honors `DRIVE9_API_KEY`: when set, step 1
@@ -284,7 +276,7 @@ use the same value as `DRIVE9_API_KEY` here.
 11. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
 12. CLI upload-limit boundary (`10GiB` initiate accepted, `10GiB+1` rejected)
 
-### `portable-pack-unpack-e2e.sh`
+### `pack-smoke-test.sh`
 
 This script is intentionally separate from the broad CLI smoke so it can cover
 portable profile semantics without making the default suite slower. It does not
@@ -367,7 +359,7 @@ deterministic read-correctness coverage, not a write/concurrency/Git workload.
 ### `git-ops-smoke-test.sh`
 
 This is the lightweight Git gate for local PR e2e. It creates a small local
-bare Git remote with `git_fixture.py`, so it does not require GitHub, dev/prod
+bare Git remote with `tools/git_fixture.py`, so it does not require GitHub, dev/prod
 deployments, or externally published tenant schema.
 
 For both `coding-agent` and a test-local `portable` overlay profile, it runs
@@ -488,33 +480,19 @@ developer machines or EC2-style validation rather than the default smoke path.
 7. Platform-aware `stat` for macOS (`stat -f %Lp`) and Linux (`stat -c %a`)
 8. Cleanup of remote permission test trees
 
-### On-demand matrix scripts
+### `git-feature-smoke-test.sh`
 
-These are not part of the normal E2E smoke entry points. Run them only when a
-task explicitly asks for a broad compatibility matrix or Git feature matrix.
-They use the same live endpoint conventions as the smoke scripts and mount real
-FUSE. `pjdfstest-suite.sh` uses pjdfstest as the sole POSIX compatibility
-baseline; `posix-feature-matrix.sh` is a compatibility alias for that suite.
-Setup/provisioning is only test harness plumbing and is not counted as POSIX
-feature coverage. `git-feature-matrix.sh` generates a local bare Git remote
-fixture for deterministic Git coverage. Reports are written to
-`$FEATURE_MATRIX_REPORT_DIR/<report-name>-<timestamp>.md`; by default that is a
-flat path such as `e2e/reports/posix-feature-report-<timestamp>.md` or
-`e2e/reports/git-feature-report-<timestamp>.md`. If
-`FEATURE_MATRIX_REPORT_DIR` is set to a run-specific directory, reports are
-nested under that directory instead, and checked-in samples should be read using
-the layout captured by that run.
+Broader Git feature smoke on a coding-agent FUSE mount (clone modes, readiness,
+ops, merge/rebase/stash, remount restore). PASS/FAIL like other smokes — not a
+Markdown matrix. Complements lighter `git-ops-smoke-test.sh` and
+`git-workspace-smoke-test.sh`.
 
-1. Provision tenant unless `DRIVE9_API_KEY` is already set
-2. Prepare `drive9` CLI binary (`CLI_SOURCE=build` or `official`)
-3. Validate FUSE prerequisites only enough to mount a writable test target for pjdfstest
-4. Run pjdfstest for POSIX syscall compatibility; skip this row when pjdfstest/prove/root prerequisites are missing
-5. For POSIX reports, summarize total/pass/failed counts from pjdfstest/prove cases and render pjdfstest `.t` files as the checkbox matrix
-6. Generate a local Git fixture repo with executable files, symlinks, binary files, ignore rules, branches, tags, and merge/rebase/conflict graphs
-7. Validate `drive9 git clone --fast`, blobless hydrate-off, hydrate-sync, and explicit `drive9 git hydrate`
-8. Run Git readiness, working-tree, index, diff/patch, commit, branch, merge, conflict, rebase, stash, fetch, pull, push branch, and push tag probes
-9. Validate Drive9 Git workspace behavior: tree manifest registration, `.git` checkpoint restore, overlay upsert/whiteout/chmod/symlink/dir entries across remount, committed local state, staged-object restore, and ignored-file non-durability
-10. Emit a Markdown checkbox matrix: `- [x]` for passed feature probes; unchecked entries for `UNSUPPORTED`, `SKIP`, and `FAIL` with observed errno or command-output summaries
+```bash
+bash e2e/git-feature-smoke-test.sh
+```
+
+POSIX pjdfstest lives in blackbox (`community.pjdfstest`), not under `e2e/`.
+
 
 ### `fuse-release-gate.sh`
 
@@ -549,7 +527,7 @@ enabled.
 2. Runs `cli-smoke-test.sh`
 3. Runs `journal-smoke-test.sh`
 4. Runs `fuse-smoke-test.sh`
-5. Runs `portable-pack-unpack-e2e.sh` when `RUN_PORTABLE_PACK_E2E=1`
+5. Runs `pack-smoke-test.sh` when `RUN_PACK_SMOKE=1`
 6. Aggregates pass/fail at script level for quick regression checks
 
 Re-exports `DRIVE9_API_KEY` when set so every sub-suite that honors it (api,
@@ -582,50 +560,24 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 17. Delete main tenant via `drive9 delete` and verify removal (401/403/404 on `GET /v1/status`)
 18. Trap-based cleanup: attempts to delete both admin and main tenants on script failure unless `SKIP_CLEANUP=1`
 
-### `shared-mode-smoke-test.sh`
+### `shared-smoke-test.sh` (multi-tenant / shared-schema)
 
-Shared-schema (fs_id) mode end-to-end smoke against real engines: a MySQL
-container for the meta DB and a TiDB (`pingcap/tidb:v8.5.6`) container holding
-both the shared DB and a standalone tenant DB, then boots `drive9-server`
-with `DRIVE9_SHARED_POOL_DSN` registered as a wildcard shared pool.
+**Canonical** smoke for everything multi-tenant / shared-schema:
 
-1. Two tenants provision — both placed on the shared DB and `active` immediately (no cluster creation)
-2. File CRUD + mkdir + directory listing on tenant A
-3. Cross-tenant isolation:
-   - same path under A/B holds different content; B cannot read A's nested file
-   - root `?list`: B does not see A's `/docs`; B listing A's dir is 404 or 200+empty (no A children)
-   - `?grep` / `?find`: B does not return A's marker file or `note.txt`
-   - B `copy` / `hardlink` / `rename` / `delete` against A's paths returns 404; A's content intact
-   - B delete of own `/a.txt` leaves A's same-path file intact
-   - concurrent same-path writes: each tenant still reads only its own bytes
-4. Raw SQL on TiDB: rows share tables with distinct `fs_id`s; `file_nodes` is `TIDB_PK_TYPE=CLUSTERED`; no `llm_usage` table
-5. SSE `/v1/events`: B stream delivers reset + file event; A stream gets reset but does **not** receive B's file event
-6. Multipart upload (v2 initiate/parts/complete) on a shared tenant, served via redirect; A cannot read B's completed object; A cannot complete B's in-flight `upload_id`
-7. `POST /v1/fork` on a shared tenant is rejected (409)
-8. Standalone tenant coexistence (registered directly via `e2e/harness/standalone-tenant` with `-skip-ensure`): standalone CRUD, no `fs_id` column in its tables, no row leakage either direction
-9. Server restart persistence: both shared and standalone backends keep working
-10. `DELETE /v1/tenant` on A: shared rows purged (`file_nodes`/`inodes` empty for A's fs_id), A's key revoked (401/403), B and standalone fully intact
-11. Full `api-smoke-test.sh` then `cli-smoke-test.sh` against the same shared
-    server: each suite provisions its own fresh tenant (`DRIVE9_API_KEY` is
-    cleared). Semantic checks are forced off (`RUN_SEMANTIC_CHECKS=0`,
-    `RUN_CLI_SEMANTIC_CHECKS=0`) because the server boots with
-    `DRIVE9_DISABLE_AUTO_EMBEDDING=true`. CLI fork is forced off
-    (`RUN_CLI_FORK_CHECKS=0`) because shared tenants reject `/v1/fork` with 409.
-    SQL checks are forced off (`RUN_SQL_CHECKS=0`) because `POST /v1/sql` is
-    unsupported on shared-schema stores (`ErrExecSQLNotSupportedShared` → 400).
+- control: placement, soft-cap, delete/count, fork/sql gates, metrics  
+- multi-tenant data plane: cross-tenant isolation (same path, list/grep/find, mutations)
 
-Knobs: `META_DSN` / `SHARED_DSN` / `STANDALONE_DSN` (skip the containers),
-`KEEP_DB=1`, `RUN_SHARED_API_CLI_SMOKE=0` (skip nested api/cli suites),
-`DRIVE9_SHARED_E2E_DB_RUNTIME`, `DRIVE9_SHARED_E2E_MYSQL_IMAGE`,
-`DRIVE9_SHARED_E2E_TIDB_IMAGE`, `DRIVE9_SHARED_E2E_DB_PASSWORD`.
+Default **self-contained** via `scripts/run-drive9-server-local-shared.sh`.  
+Does **not** replace single-tenant `api-smoke` / `cli-smoke` / `fuse-*`.  
+Cases under `e2e/shared-smoke-test/cases/` are independent (no cross-case order).
 
-### `harness/standalone-tenant`
+```bash
+bash e2e/shared-smoke-test.sh                      # all cases, clean env
+bash e2e/shared-smoke-test.sh multi-tenant-isolation
+bash e2e/shared-smoke-test.sh attach               # reuse existing stack
+```
 
-Go helper that registers a pre-existing standalone tenant directly in the meta
-DB (tenant row + owner API key), bypassing cluster provisioning. `-skip-ensure`
-initializes the standalone DB with the base (no FTS/vector) schema and stamps
-`tenants.schema_version` so the Acquire-time ensure is skipped — required for
-engines without FTS/vector support such as self-hosted TiDB.
+See `e2e/shared-smoke-test/README.md`.
 
 ## Environment variables
 
@@ -633,12 +585,11 @@ engines without FTS/vector support such as self-hosted TiDB.
 |----------|---------|---------|
 | `DRIVE9_BASE` | `http://127.0.0.1:9009` | all scripts |
 | `DRIVE9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh` |
-| `DRIVE9_API_KEY` | - | `api-smoke-test-existing-key.sh` |
 | `DRIVE9_API_KEY` | - | `api-smoke-test.sh` (optional; when set, skip provision and reuse the tenant; cleanup test tree at end) |
 | `DRIVE9_API_KEY` | - | `cli-smoke-test.sh` (optional; when set, skip provision and reuse the tenant) |
 | `DRIVE9_API_KEY` | - | `fuse-smoke-test.sh` (optional; skip provision when set) |
 | `DRIVE9_API_KEY` | - | `posix-permission-smoke-test.sh` (optional; skip provision when set) |
-| `POLL_TIMEOUT_S` | `300` (api smoke), `120` (other smoke), `60` (existing-key) | polling scripts |
+| `POLL_TIMEOUT_S` | `300` (api smoke), `120` (other smoke) | polling scripts |
 | `POLL_INTERVAL_S` | `5` | polling scripts |
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
 | `LARGE_FILE_MB` | `100` | `api-smoke-test.sh` |
@@ -714,8 +665,7 @@ engines without FTS/vector support such as self-hosted TiDB.
 | `RUN_FUSE_LOG_AUDIT` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `RUN_GIT_WORKSPACE_SMOKE` | `0` | `smoke-all.sh` |
 | `RUN_API_ONLY` | `0` | `smoke-all.sh` (run only api + cli, skip the rest) |
-| `RUN_SHARED_API_CLI_SMOKE` | `1` | `shared-mode-smoke-test.sh` (run nested api + cli suites after shared-mode checks; each suite fresh-provisions; fork/semantic forced off) |
-| `RUN_PORTABLE_PACK_E2E` | `0` | `smoke-all.sh`; `portable-pack-unpack-e2e.sh` is required separately by `local-e2e.yml` |
+| `RUN_PACK_SMOKE` | `0` | `smoke-all.sh`; `pack-smoke-test.sh` is required separately by `local-e2e.yml` |
 | `GIT_WORKSPACE_REPOS` | `drive9=...,kimi-cli=...,kimi-code=...` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_SCENARIOS` | `agent_edit_add_commit,agent_patch_apply,sandbox_restore,fast_worktree` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_EXISTING_FILES` | `20` | `git-workspace-smoke-test.sh` |
@@ -723,17 +673,9 @@ engines without FTS/vector support such as self-hosted TiDB.
 | `GIT_WORKSPACE_PATCH_FILES` | `20` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_CLONE_TIMEOUT_S` | `600` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_GIT_TIMEOUT_S` | `120` | `git-workspace-smoke-test.sh` |
+| `GIT_FEATURE_TIMEOUT_S` | `240` | `git-feature-smoke-test.sh` |
+| `GIT_FEATURE_RUN_OVERSIZED` | `1` | `git-feature-smoke-test.sh` |
 | `GIT_WORKSPACE_HYDRATE` | `sync` | `git-workspace-smoke-test.sh` |
-| `FEATURE_MATRIX_REPORT_DIR` | `e2e/reports` | on-demand matrix scripts |
-| `FEATURE_MATRIX_STRICT_ALL` | `0` | on-demand matrix scripts |
-| `PJDFSTEST_DIR` | - | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
-| `PJDFSTEST_TESTS` | - | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
-| `PJDFSTEST_BIN` | auto-detected from `PJDFSTEST_DIR` or `PATH` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
-| `PJDFSTEST_TIMEOUT_S` | `900` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
-| `PJDFSTEST_ALLOW_NONROOT` | `0` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
-| `PJDFSTEST_MOUNT_ALLOW_OTHER` | `auto` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh`; Linux auto-adds `--allow-other`, Darwin does not |
-| `GIT_MATRIX_TIMEOUT_S` | `240` | on-demand `git-feature-matrix.sh` |
-| `GIT_MATRIX_RUN_OVERSIZED` | `1` | on-demand `git-feature-matrix.sh` |
 | `DRIVE9_TIDBCLOUD_PUBLIC_KEY` | *(required)* | `native-smoke-test.sh` |
 | `DRIVE9_TIDBCLOUD_PRIVATE_KEY` | *(required)* | `native-smoke-test.sh` |
 | `SKIP_CLEANUP` | `0` | `native-smoke-test.sh` |

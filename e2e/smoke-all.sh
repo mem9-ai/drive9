@@ -5,16 +5,16 @@
 #  - Fresh (default): each suite provisions its own tenant.
 #  - Existing (DRIVE9_API_KEY set in the environment): every suite that honors
 #    DRIVE9_API_KEY (api, cli, journal, layer-fs, fuse, posix-permission, git
-#    suites, portable pack) skips provision and reuses the tenant the key
-#    belongs to. The key is explicitly re-exported below so a future `env -u`
-#    in run_case cannot silently drop it.
+#    suites, pack) skips provision and reuses the tenant the key belongs to.
+#    The key is explicitly re-exported below so a future `env -u` in run_case
+#    cannot silently drop it.
 #
 # Subset knobs:
 #  - RUN_API_ONLY=1 runs only api + cli (the core two). Useful for a quick
 #    existing-tenant regression without pulling in journal/layer-fs/fuse.
 #  - RUN_FUSE_SMOKE=0 skips the FUSE suite (and derives RUN_LAYER_FUSE_SMOKE
 #    from it). macOS WebDAV fallback cannot satisfy symlink/hardlink asserts.
-#  - RUN_GIT_OPS_SMOKE=1 / RUN_GIT_WORKSPACE_SMOKE=1 / RUN_PORTABLE_PACK_E2E=1
+#  - RUN_GIT_OPS_SMOKE=1 / RUN_GIT_WORKSPACE_SMOKE=1 / RUN_PACK_SMOKE=1
 #    opt into the heavier optional suites.
 
 set -euo pipefail
@@ -31,7 +31,7 @@ RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
 RUN_FUSE_SMOKE="${RUN_FUSE_SMOKE:-1}"
 RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-$RUN_FUSE_SMOKE}"
 export RUN_LAYER_FUSE_SMOKE
-RUN_PORTABLE_PACK_E2E="${RUN_PORTABLE_PACK_E2E:-0}"
+RUN_PACK_SMOKE="${RUN_PACK_SMOKE:-0}"
 
 PASS=0
 FAIL=0
@@ -88,7 +88,7 @@ if [ "$RUN_API_ONLY" = "1" ]; then
   skip_case "posix-permission" "e2e/posix-permission-smoke-test.sh" "set RUN_API_ONLY=0 to run posix-permission coverage"
   skip_case "git-ops" "e2e/git-ops-smoke-test.sh" "set RUN_API_ONLY=0 to run Git ops coverage"
   skip_case "git-workspace" "e2e/git-workspace-smoke-test.sh" "set RUN_API_ONLY=0 to run Git workspace coverage"
-  skip_case "portable-pack-unpack" "e2e/portable-pack-unpack-e2e.sh" "set RUN_API_ONLY=0 to run portable pack/unpack coverage"
+  skip_case "pack" "e2e/pack-smoke-test.sh" "set RUN_API_ONLY=0 to run pack coverage"
 else
   run_case "journal" "e2e/journal-smoke-test.sh"
   run_case "layer-fs" "e2e/layer-fs-smoke-test.sh"
@@ -108,16 +108,15 @@ else
   else
     skip_case "git-workspace" "e2e/git-workspace-smoke-test.sh" "set RUN_GIT_WORKSPACE_SMOKE=1 to run fast-clone Git workspace coverage"
   fi
-  if [ "$RUN_PORTABLE_PACK_E2E" = "1" ]; then
-    run_case "portable-pack-unpack" "e2e/portable-pack-unpack-e2e.sh"
+  if [ "$RUN_PACK_SMOKE" = "1" ]; then
+    run_case "pack" "e2e/pack-smoke-test.sh"
   else
-    skip_case "portable-pack-unpack" "e2e/portable-pack-unpack-e2e.sh" "set RUN_PORTABLE_PACK_E2E=1 to run portable profile pack/unpack coverage"
+    skip_case "pack" "e2e/pack-smoke-test.sh" "set RUN_PACK_SMOKE=1 to run portable profile pack/unpack coverage"
   fi
 fi
 
 echo
-echo "=== smoke-all result ==="
-echo "PASS=$PASS FAIL=$FAIL"
+echo "RESULT: $PASS passed, $FAIL failed"
 
 if [ "$FAIL" -ne 0 ]; then
   exit 1

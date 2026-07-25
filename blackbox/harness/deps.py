@@ -5,11 +5,32 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .core import CACHE_ROOT, DependencyUnavailable, REPO_ROOT, env_value, progress, write_json
 
-APT_AUTO_INSTALL_TRUTHY = {"1", "true", "yes", "on"}
+AUTO_INSTALL_SYSTEM_DEPS_TRUTHY = {"1", "true", "yes", "on"}
+
+# Logical / Debian-style names used by suite deps.py files → Arch Linux packages.
+# Unlisted names are passed through unchanged (same name on both distros).
+_DEBIAN_TO_ARCH: dict[str, str] = {
+    "build-essential": "base-devel",
+    "pkg-config": "pkgconf",
+    "libacl1-dev": "acl",
+    "libcurl4-openssl-dev": "curl",
+    "libssl-dev": "openssl",
+    "zlib1g-dev": "zlib",
+    "python3-pip": "python-pip",
+    "python3-dev": "python",
+    "python3-xattr": "python-xattr",
+    "python3": "python",
+    "mpich": "openmpi",
+    "libmpich-dev": "openmpi",
+    "libopenmpi-dev": "openmpi",
+    "openmpi-bin": "openmpi",
+}
+
+PackageManager = Literal["apt", "pacman"]
 
 
 class DependencyManager:
@@ -86,32 +107,138 @@ class Drive9DependencyManager(DependencyManager):
     module's own ``deps.py`` and call the shared methods here.
     """
 
+    def detect_package_manager(self) -> PackageManager | None:
+        """Return the supported package manager for this host, if any."""
+        if not sys.platform.startswith("linux"):
+            return None
+        if shutil.which("apt-get"):
+            return "apt"
+        if shutil.which("pacman"):
+            return "pacman"
+        return None
+
+    def map_system_packages(self, packages: tuple[str, ...], manager: PackageManager) -> list[str]:
+        """Map logical/Debian package names to the active package manager."""
+        if manager == "apt":
+            # Suites already pass Debian/Ubuntu names.
+            return list(dict.fromkeys(packages))
+        mapped: list[str] = []
+        for package in packages:
+            mapped.append(_DEBIAN_TO_ARCH.get(package, package))
+        return list(dict.fromkeys(mapped))
+
+    def _package_installed(self, manager: PackageManager, package: str) -> bool:
+        if manager == "apt":
+            proc = subprocess.run(
+                ["dpkg-query", "-W", "-f=${Status}", package],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+            return proc.returncode == 0 and "install ok installed" in (proc.stdout or "")
+        # pacman: package or group member
+        proc = subprocess.run(
+            ["pacman", "-Q", package],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True
+        proc = subprocess.run(
+            ["pacman", "-Qg", package],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return proc.returncode == 0
+
+    def _passwordless_sudo(self) -> bool:
+        if not shutil.which("sudo"):
+            return False
+        probe = subprocess.run(
+            ["sudo", "-n", "true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return probe.returncode == 0
+
     def ensure_system_packages(self, *packages: str) -> None:
+        """Install missing OS packages via apt (Debian/Ubuntu) or pacman (Arch).
+
+        Suite modules pass Debian-style names (``build-essential``,
+        ``pkg-config``, …). On Arch those names are mapped automatically.
+
+        Controlled by ``AUTO_INSTALL_SYSTEM_DEPS`` (default on). Requires
+        passwordless ``sudo`` on Linux. No-ops when offline install is disabled
+        or the host package manager is unsupported.
+        """
         requested = tuple(dict.fromkeys(package for package in packages if package))
         if not requested:
             return
-        if env_value("AUTO_INSTALL_SYSTEM_DEPS", "1").lower() not in APT_AUTO_INSTALL_TRUTHY:
+        if env_value("AUTO_INSTALL_SYSTEM_DEPS", "1").lower() not in AUTO_INSTALL_SYSTEM_DEPS_TRUTHY:
+            progress("dependency system packages: AUTO_INSTALL_SYSTEM_DEPS disabled; skipping install")
             return
         if not sys.platform.startswith("linux"):
             return
-        if not shutil.which("apt-get") or not shutil.which("sudo"):
+
+        manager = self.detect_package_manager()
+        if manager is None:
+            progress(
+                "dependency system packages: no supported package manager "
+                "(need apt-get or pacman); install build deps manually"
+            )
             return
-        probe = subprocess.run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        if probe.returncode != 0:
+        if not self._passwordless_sudo():
+            progress(
+                "dependency system packages: passwordless sudo is required to auto-install "
+                f"({manager}); install packages manually or enable sudo -n"
+            )
             return
+
+        native = self.map_system_packages(requested, manager)
         attempted: set[str] = getattr(self, "_system_packages_attempted", set())
-        missing = [package for package in requested if package not in attempted]
+        missing = [package for package in native if package not in attempted and not self._package_installed(manager, package)]
         if not missing:
+            progress(f"dependency system packages: already present ({manager}): {', '.join(native)}")
+            attempted.update(native)
+            self._system_packages_attempted = attempted
             return
-        if not getattr(self, "_apt_updated", False):
-            self.run("system-apt-update", ["sudo", "apt-get", "update"], timeout=1800)
-            self._apt_updated = True
-        command_name = "system-apt-install-" + "-".join(missing)
-        if len(command_name) > 120:
-            command_name = "system-apt-install-" + str(abs(hash(tuple(missing))))
-        self.run(command_name, ["sudo", "apt-get", "install", "-y", *missing], timeout=1800)
+
+        progress(f"dependency system packages: installing via {manager}: {', '.join(missing)}")
+        if manager == "apt":
+            if not getattr(self, "_apt_updated", False):
+                self.run("system-apt-update", ["sudo", "apt-get", "update"], timeout=1800)
+                self._apt_updated = True
+            command_name = "system-apt-install-" + "-".join(missing)
+            if len(command_name) > 120:
+                command_name = "system-apt-install-" + str(abs(hash(tuple(missing))))
+            self.run(command_name, ["sudo", "apt-get", "install", "-y", *missing], timeout=1800)
+        else:
+            if not getattr(self, "_pacman_synced", False):
+                # Refresh package DB once per process (equivalent to apt-get update).
+                self.run("system-pacman-sy", ["sudo", "pacman", "-Sy", "--noconfirm"], timeout=1800)
+                self._pacman_synced = True
+            command_name = "system-pacman-install-" + "-".join(missing)
+            if len(command_name) > 120:
+                command_name = "system-pacman-install-" + str(abs(hash(tuple(missing))))
+            # --needed: skip already-installed members of groups like base-devel.
+            self.run(
+                command_name,
+                ["sudo", "pacman", "-S", "--needed", "--noconfirm", *missing],
+                timeout=1800,
+            )
+
+        still_missing = [package for package in missing if not self._package_installed(manager, package)]
         attempted.update(missing)
         self._system_packages_attempted = attempted
+        if still_missing:
+            raise DependencyUnavailable(
+                f"failed to install system packages via {manager}: {', '.join(still_missing)}"
+            )
+        progress(f"dependency system packages: installed ({manager}): {', '.join(missing)}")
 
     def ensure_node_version(self, required: str = ">=24.15.0") -> str:
         """Return a Node binary path that satisfies ``required``.
@@ -179,11 +306,28 @@ class Drive9DependencyManager(DependencyManager):
         if found:
             progress(f"dependency tool: prove -> {found}")
             return found
+        # Arch often ships prove under /usr/bin/core_perl (may be off PATH).
+        for candidate in (
+            Path("/usr/bin/core_perl/prove"),
+            Path("/usr/bin/vendor_perl/prove"),
+            Path("/usr/bin/site_perl/prove"),
+        ):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                progress(f"dependency tool: prove -> {candidate}")
+                return str(candidate)
         self.ensure_system_packages("perl")
         found = shutil.which("prove")
         if found:
             progress(f"dependency tool: prove -> {found}")
             return found
+        for candidate in (
+            Path("/usr/bin/core_perl/prove"),
+            Path("/usr/bin/vendor_perl/prove"),
+            Path("/usr/bin/site_perl/prove"),
+        ):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                progress(f"dependency tool: prove -> {candidate}")
+                return str(candidate)
         raise DependencyUnavailable("prove is required")
 
 

@@ -441,7 +441,7 @@ EOF
 prepare_fixture() {
   FIXTURE_ROOT="$RUN_ROOT/fixture"
   local json
-  json="$(python3 "$SCRIPT_DIR/git_fixture.py" "$FIXTURE_ROOT" --force --tree-files "$GIT_OPS_FIXTURE_TREE_FILES")"
+  json="$(python3 "$SCRIPT_DIR/tools/git_fixture.py" "$FIXTURE_ROOT" --force --tree-files "$GIT_OPS_FIXTURE_TREE_FILES")"
   FIXTURE_URL="$(jq -r '.file_url' <<<"$json")"
   test -n "$FIXTURE_URL"
 }

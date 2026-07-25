@@ -1236,10 +1236,12 @@ func (s *Server) provisionManagedSharedDBPoolsBatchChunkLocked(ctx context.Conte
 		if info.DBName == "" {
 			info.DBName = row.Name
 		}
+		// Use sharedDBTLSMode (not public-cloud "true") so LocalClustersAPI
+		// plaintext TiDB can complete schema ensure + free-tenant activation.
 		if err := s.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{ID: info.DBPoolID,
 			TiDBCloudOrganizationID: logicalOrganizationID, ClusterID: info.ClusterID, Host: info.Host,
 			Port: info.Port, User: info.Username, PasswordCipher: row.PasswordCipher, Name: info.DBName,
-			TLSMode: map[bool]string{true: "true", false: "skip-verify"}[dbTLSForProvisionedTenant(tenant.ProviderTiDBCloudNativeShared)]}); err != nil {
+			TLSMode: sharedDBTLSMode()}); err != nil {
 			persistErr = errors.Join(persistErr, err)
 			continue
 		}

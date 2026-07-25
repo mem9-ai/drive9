@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
-# Internal Drive9 feature-matrix runner.
+# git-feature-smoke-test: Drive9 Git feature coverage over a FUSE coding-agent mount.
+# Covers clone modes, readiness, ops (add/commit/diff/remote), merge/rebase/stash,
+# and remount restore. Naming aligns with other e2e/*-smoke-test.sh scripts.
 #
-# Public entrypoints are pjdfstest-suite.sh, posix-feature-matrix.sh, and
-# git-feature-matrix.sh.
-# Keep this file shared so the two live E2E matrices use the same provisioning,
-# FUSE, CLI, and reporting machinery without exposing a combined runner.
-#
-# This script is intentionally correctness-oriented. It probes supported
-# features and records stable unsupported behavior in a Markdown matrix rather
-# than treating every unsupported POSIX/Git edge as a performance/regression
-# issue. The POSIX suite itself is pjdfstest-based; Drive9-specific FUSE
-# integration checks belong in the FUSE smoke/release scripts.
+# Not a Markdown "feature matrix". PASS/FAIL like other smokes.
+# POSIX pjdfstest lives in blackbox (community.pjdfstest), not e2e.
 
 set -euo pipefail
 
@@ -30,28 +24,21 @@ CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
 CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
-FEATURE_MATRIX_STRICT_ALL="${FEATURE_MATRIX_STRICT_ALL:-0}"
-FEATURE_MATRIX_REPORT_DIR="${FEATURE_MATRIX_REPORT_DIR:-}"
-GIT_MATRIX_TIMEOUT_S="${GIT_MATRIX_TIMEOUT_S:-240}"
-GIT_MATRIX_RUN_OVERSIZED="${GIT_MATRIX_RUN_OVERSIZED:-1}"
-FEATURE_MATRIX_SUITE="${FEATURE_MATRIX_SUITE:-}"
-PJDFSTEST_DIR="${PJDFSTEST_DIR:-}"
-PJDFSTEST_TESTS="${PJDFSTEST_TESTS:-}"
-PJDFSTEST_BIN="${PJDFSTEST_BIN:-}"
-PJDFSTEST_TIMEOUT_S="${PJDFSTEST_TIMEOUT_S:-900}"
-PJDFSTEST_ALLOW_NONROOT="${PJDFSTEST_ALLOW_NONROOT:-0}"
-PJDFSTEST_MOUNT_ALLOW_OTHER="${PJDFSTEST_MOUNT_ALLOW_OTHER:-auto}"
+GIT_FEATURE_TIMEOUT_S="${GIT_FEATURE_TIMEOUT_S:-240}"
+GIT_FEATURE_RUN_OVERSIZED="${GIT_FEATURE_RUN_OVERSIZED:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-FEATURE_MATRIX_REPORT_DIR="${FEATURE_MATRIX_REPORT_DIR:-$REPO_ROOT/e2e/reports}"
-TS="$(date +%Y%m%d-%H%M%S)"
-RUN_ROOT=""
-RESULTS_TSV=""
-REPORT_PATH=""
-CLI_BIN=""
+
+PASS=0
+FAIL=0
+SKIP=0
+TOTAL=0
 API_KEY=""
+CLI_BIN=""
 MOUNT_POINTS=()
+RUN_ROOT=""
+TS="$(date +%Y%m%d-%H%M%S)"
 
 if [ "$(uname -s)" = "Darwin" ] && ! command -v mount_macfuse >/dev/null 2>&1 && ! command -v mount_fusefs >/dev/null 2>&1; then
   for macfuse_dir in "/Library/Filesystems/macfuse.fs/Contents/Resources" "/usr/local/bin" "/opt/homebrew/bin"; do
@@ -69,135 +56,45 @@ sanitize_tsv_field() {
 
 record() {
   local status="$1" category="$2" feature="$3" detail="${4:-}"
-  printf '%s\t%s\t%s\t%s\n' \
-    "$(sanitize_tsv_field "$status")" \
-    "$(sanitize_tsv_field "$category")" \
-    "$(sanitize_tsv_field "$feature")" \
-    "$(sanitize_tsv_field "$detail")" >>"$RESULTS_TSV"
+  TOTAL=$((TOTAL + 1))
+  case "$status" in
+    PASS)
+      PASS=$((PASS + 1))
+      echo "PASS [$category] $feature${detail:+ ($detail)}"
+      ;;
+    FAIL)
+      FAIL=$((FAIL + 1))
+      echo "FAIL [$category] $feature${detail:+ ($detail)}" >&2
+      ;;
+    SKIP|UNSUPPORTED)
+      SKIP=$((SKIP + 1))
+      echo "SKIP [$category] $feature${detail:+ ($detail)}"
+      ;;
+    META)
+      TOTAL=$((TOTAL - 1))
+      ;;
+    *)
+      FAIL=$((FAIL + 1))
+      echo "FAIL [$category] $feature unexpected status=$status${detail:+ ($detail)}" >&2
+      ;;
+  esac
 }
 
-write_report() {
-  mkdir -p "$FEATURE_MATRIX_REPORT_DIR"
-  python3 - "$RESULTS_TSV" "$REPORT_PATH" "$BASE" "$CLI_SOURCE" "$FEATURE_MATRIX_STRICT_ALL" "$FEATURE_MATRIX_SUITE" <<'PY'
-import collections
-import datetime as dt
-import json
-import platform
-import sys
-
-results_path, report_path, base, cli_source, strict_all, suite = sys.argv[1:7]
-rows = []
-pjdfstest_summary = None
-with open(results_path, encoding="utf-8") as fh:
-    for raw in fh:
-        raw = raw.rstrip("\n")
-        if not raw:
-            continue
-        parts = raw.split("\t", 3)
-        while len(parts) < 4:
-            parts.append("")
-        row = tuple(parts)
-        if row[0] == "META" and row[1] == "pjdfstest" and row[2] == "summary":
-            try:
-                pjdfstest_summary = json.loads(row[3])
-            except json.JSONDecodeError:
-                pjdfstest_summary = None
-            continue
-        rows.append(row)
-
-def is_pjdfstest_row(row):
-    return row[1] == "pjdfstest" or row[1].startswith("pjdfstest/")
-
-def is_posix_infra_failure(row):
-    if row[0] == "PASS":
-        return False
-    haystack = " ".join(row[1:]).lower()
-    markers = ("provision", "prereq", "prerequisite", "mount")
-    return any(marker in haystack for marker in markers)
-
-if suite == "posix":
-    rows = [row for row in rows if is_pjdfstest_row(row) or is_posix_infra_failure(row)]
-
-counts = collections.Counter(row[0] for row in rows)
-categories = collections.defaultdict(list)
-for row in rows:
-    categories[row[1]].append(row)
-
-def checkbox(status):
-    return "- [x]" if status == "PASS" else "- [ ]"
-
-titles = {
-    "posix": "Drive9 POSIX pjdfstest Matrix Report",
-    "git": "Drive9 Git Feature Matrix Report",
-}
-
-with open(report_path, "w", encoding="utf-8") as out:
-    out.write(f"# {titles.get(suite, 'Drive9 Feature Matrix Report')}\n\n")
-    out.write(f"**Date:** {dt.datetime.utcnow().replace(microsecond=0).isoformat()}Z\n")
-    out.write(f"**Suite:** `{suite}`\n")
-    out.write(f"**Base:** `{base}`\n")
-    out.write(f"**CLI source:** `{cli_source}`\n")
-    out.write(f"**Host:** `{platform.platform()}`\n")
-    out.write(f"**Strict unchecked mode:** `{strict_all}`\n\n")
-    out.write("## Summary\n\n")
-    if suite == "posix" and pjdfstest_summary:
-        out.write("| Metric | Count |\n|---|---:|\n")
-        out.write(f"| Total cases | {pjdfstest_summary.get('total_cases', 0)} |\n")
-        out.write(f"| Passed cases | {pjdfstest_summary.get('passed_cases', 0)} |\n")
-        out.write(f"| Failed cases | {pjdfstest_summary.get('failed_cases', 0)} |\n")
-        out.write(f"| Total files | {pjdfstest_summary.get('total_files', 0)} |\n")
-        out.write(f"| Passed files | {pjdfstest_summary.get('passed_files', 0)} |\n")
-        out.write(f"| Failed files | {pjdfstest_summary.get('failed_files', 0)} |\n")
-        out.write(f"| Result | {pjdfstest_summary.get('result', 'UNKNOWN')} |\n\n")
-        if pjdfstest_summary.get("log"):
-            out.write(f"**pjdfstest log:** `{pjdfstest_summary['log']}`\n\n")
-    else:
-        out.write("| Status | Count |\n|---|---:|\n")
-        for status in ("PASS", "FAIL", "UNSUPPORTED", "SKIP"):
-            out.write(f"| {status} | {counts.get(status, 0)} |\n")
-        out.write(f"| TOTAL | {len(rows)} |\n\n")
-    out.write("## Matrix\n\n")
-    for category in sorted(categories):
-        out.write(f"### {category}\n\n")
-        for status, _, feature, detail in categories[category]:
-            suffix = f" - {status}: {detail}" if detail else f" - {status}"
-            out.write(f"{checkbox(status)} {feature}{suffix}\n")
-        out.write("\n")
-PY
-}
 
 finish() {
   local rc=$?
-  local report_rc=0
-  local mounts_still_attached=0
-  set +e
-  for mp in "${MOUNT_POINTS[@]:-}"; do
-    stop_mount "$mp" >/dev/null 2>&1 || true
-    if [ -n "$mp" ] && is_mounted "$mp"; then
-      mounts_still_attached=1
-      echo "MOUNT_STILL_ATTACHED=$mp"
-    fi
-  done
-  if [ -n "${CLI_BIN:-}" ]; then
-    rm -f "$CLI_BIN" >/dev/null 2>&1 || true
-  fi
-  if [ -n "${REPORT_PATH:-}" ] && [ -n "${RESULTS_TSV:-}" ] && [ -f "$RESULTS_TSV" ]; then
-    write_report || report_rc=$?
-    echo "REPORT=$REPORT_PATH"
-    if [ -f "$REPORT_PATH" ]; then
-      awk '
-        /^## Summary/ {in_summary=1; next}
-        /^## / && in_summary {exit}
-        in_summary {print}
-      ' "$REPORT_PATH"
-    fi
-  fi
+  stop_mount "${MOUNT_POINTS[@]:-}" >/dev/null 2>&1 || true
   if [ -n "${RUN_ROOT:-}" ] && [ -d "$RUN_ROOT" ]; then
-    if [ "$rc" -eq 0 ] && [ "$report_rc" -eq 0 ] && [ "$mounts_still_attached" -eq 0 ]; then
-      rm -rf "$RUN_ROOT" >/dev/null 2>&1 || true
+    if [ "$rc" -eq 0 ] && [ "${FAIL:-0}" -eq 0 ]; then
+      rm -rf "$RUN_ROOT" 2>/dev/null || true
     else
-      echo "RUN_ROOT=$RUN_ROOT"
+      echo "Artifacts preserved at $RUN_ROOT" >&2
     fi
+  fi
+  echo ""
+  echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
+  if [ "$FAIL" -gt 0 ]; then
+    exit 1
   fi
   exit "$rc"
 }
@@ -369,199 +266,9 @@ record_cmd() {
   return 0
 }
 
-resolve_pjdfstest_tests() {
-  if [ -n "$PJDFSTEST_TESTS" ] && [ -d "$PJDFSTEST_TESTS" ]; then
-    (cd "$PJDFSTEST_TESTS" && pwd -P)
-    return 0
-  fi
-  if [ -n "$PJDFSTEST_DIR" ] && [ -d "$PJDFSTEST_DIR/tests" ]; then
-    (cd "$PJDFSTEST_DIR/tests" && pwd -P)
-    return 0
-  fi
-  local candidate
-  for candidate in \
-    "$REPO_ROOT/third_party/pjdfstest/tests" \
-    "$REPO_ROOT/pjdfstest/tests" \
-    "/usr/local/share/pjdfstest/tests" \
-    "/opt/pjdfstest/tests"; do
-    if [ -d "$candidate" ]; then
-      (cd "$candidate" && pwd -P)
-      return 0
-    fi
-  done
-  return 1
-}
 
-resolve_pjdfstest_bin() {
-  local tests_dir="$1" suite_root
-  suite_root="$(cd "$tests_dir/.." && pwd -P)"
-  if [ -n "$PJDFSTEST_BIN" ] && [ -x "$PJDFSTEST_BIN" ]; then
-    printf '%s/%s\n' "$(cd "$(dirname "$PJDFSTEST_BIN")" && pwd -P)" "$(basename "$PJDFSTEST_BIN")"
-    return 0
-  fi
-  if [ -x "$suite_root/pjdfstest" ]; then
-    printf '%s\n' "$suite_root/pjdfstest"
-    return 0
-  fi
-  if command -v pjdfstest >/dev/null 2>&1; then
-    command -v pjdfstest
-    return 0
-  fi
-  return 1
-}
 
-record_pjdfstest_result() {
-  local status="$1" log_file="$2" rc="${3:-0}"
-  python3 - "$status" "$log_file" "$RESULTS_TSV" "$rc" "$PJDFSTEST_TIMEOUT_S" <<'PY'
-import json
-import re
-import sys
-from pathlib import Path
 
-status, log_path, results_path, rc, timeout_s = sys.argv[1:6]
-text = Path(log_path).read_text(encoding="utf-8", errors="replace")
-
-def clean(value: str) -> str:
-    return " ".join(value.replace("\t", " ").split())[:1200]
-
-def emit(row_status: str, category: str, feature: str, detail: str) -> None:
-    with open(results_path, "a", encoding="utf-8") as out:
-        out.write("\t".join([clean(row_status), clean(category), clean(feature), clean(detail)]) + "\n")
-
-total_files = total_cases = None
-files_line = re.search(r"Files=(\d+),\s*Tests=(\d+),[^\n]*", text)
-if files_line:
-    total_files = int(files_line.group(1))
-    total_cases = int(files_line.group(2))
-
-result_match = re.search(r"Result:\s*(\S+)", text)
-result = result_match.group(1) if result_match else ("PASS" if status == "PASS" else "FAIL")
-
-plans = {}
-order = []
-current = None
-file_start_re = re.compile(r"^(?P<path>\S+/tests/(?P<rel>[^ ]+?\.t))\s+\.*\s*$")
-plan_re = re.compile(r"^1\.\.(\d+)\s*$")
-not_ok_re = re.compile(r"^not ok\s+\d+(?:\b|\s|$)", re.IGNORECASE)
-todo_re = re.compile(r"#\s*TODO\b", re.IGNORECASE)
-failed_file_re = re.compile(r"^\S+/tests/(?P<rel>[^ ]+?\.t)\s+\(Wstat:\s*\d+\s+Tests:\s*(?P<tests>\d+)\s+Failed:\s*(?P<failed>\d+)\)")
-
-for line in text.splitlines():
-    start = file_start_re.match(line)
-    if start:
-        current = start.group("rel")
-        if current not in plans:
-            order.append(current)
-        continue
-    if current:
-        plan = plan_re.match(line)
-        if plan:
-            plans[current] = int(plan.group(1))
-
-failed_files = {}
-for line in text.splitlines():
-    match = failed_file_re.match(line)
-    if match:
-        rel = match.group("rel")
-        failed_files[rel] = (int(match.group("tests")), int(match.group("failed")))
-        if rel not in plans:
-            plans[rel] = int(match.group("tests"))
-        if rel not in order:
-            order.append(rel)
-
-failed_cases = sum(failed for _, failed in failed_files.values())
-if status != "PASS" and failed_cases == 0:
-    failed_cases = sum(1 for line in text.splitlines() if not_ok_re.match(line) and not todo_re.search(line))
-if total_cases is None:
-    total_cases = sum(plans.values())
-if status == "PASS":
-    failed_cases = 0
-passed_cases = max(total_cases - failed_cases, 0)
-
-if total_files is None:
-    total_files = len(order)
-failed_file_count = sum(1 for _, failed in failed_files.values() if failed > 0) if status != "PASS" else 0
-passed_file_count = max(total_files - failed_file_count, 0)
-
-summary = {
-    "total_cases": total_cases,
-    "passed_cases": passed_cases,
-    "failed_cases": failed_cases,
-    "total_files": total_files,
-    "passed_files": passed_file_count,
-    "failed_files": failed_file_count,
-    "result": "TIMEOUT" if rc == "124" else result,
-    "rc": int(rc) if rc.isdigit() else rc,
-    "log": log_path,
-}
-emit("META", "pjdfstest", "summary", json.dumps(summary, sort_keys=True, separators=(",", ":")))
-
-if not order:
-    tail = clean("\n".join(text.splitlines()[-20:])) or "no prove summary found"
-    if rc == "124":
-        tail = f"timeout after {timeout_s}s; {tail}"
-    emit("FAIL" if status != "PASS" else "PASS", "pjdfstest", "pjdfstest run", f"rc={rc}; {tail}; log={log_path}")
-    raise SystemExit(0)
-
-if status != "PASS":
-    detail = (
-        f"rc={rc}; Result={summary['result']}; "
-        f"Tests={total_cases} Passed={passed_cases} Failed={failed_cases}; log={log_path}"
-    )
-    if rc == "124":
-        detail = f"timeout after {timeout_s}s; {detail}"
-    emit("FAIL", "pjdfstest", "pjdfstest run result", detail)
-
-for rel in order:
-    tests = plans.get(rel)
-    failed = 0
-    if rel in failed_files:
-        tests, failed = failed_files[rel]
-    tests = tests if tests is not None else 0
-    passed = max(tests - failed, 0)
-    row_status = "FAIL" if failed else "PASS"
-    group = rel.split("/", 1)[0] if "/" in rel else "misc"
-    detail = f"Tests={tests} Passed={passed} Failed={failed}; log={log_path}"
-    emit(row_status, f"pjdfstest/{group}", rel, detail)
-PY
-}
-
-run_pjdfstest_suite() {
-  local mount_point="$1" root_rel="$2"
-  local tests_dir bin suite_root work_dir log_file rc
-  if ! command -v prove >/dev/null 2>&1; then
-    record "SKIP" "pjdfstest" "pjdfstest full suite" "prove not found"
-    return 0
-  fi
-  if ! tests_dir="$(resolve_pjdfstest_tests)"; then
-    record "SKIP" "pjdfstest" "pjdfstest full suite" "PJDFSTEST_TESTS/PJDFSTEST_DIR not set and no local pjdfstest tests found"
-    return 0
-  fi
-  if ! bin="$(resolve_pjdfstest_bin "$tests_dir")"; then
-    record "SKIP" "pjdfstest" "pjdfstest full suite" "pjdfstest binary not found or not executable"
-    return 0
-  fi
-  if [ "$PJDFSTEST_ALLOW_NONROOT" != "1" ] && [ "$(id -u)" -ne 0 ]; then
-    record "SKIP" "pjdfstest" "pjdfstest full suite" "pjdfstest requires root; rerun as root or set PJDFSTEST_ALLOW_NONROOT=1"
-    return 0
-  fi
-  suite_root="$(cd "$tests_dir/.." && pwd -P)"
-  work_dir="$mount_point/$root_rel/pjdfstest"
-  mkdir -p "$work_dir"
-  log_file="$FEATURE_MATRIX_REPORT_DIR/pjdfstest-$TS.log"
-  set +e
-  run_with_timeout_capture "$PJDFSTEST_TIMEOUT_S" "$log_file" bash -c \
-    'cd "$1" && PATH="$2:$3:$PATH" prove --recurse --verbose "$4"' \
-    bash "$work_dir" "$(dirname "$bin")" "$suite_root" "$tests_dir"
-  rc=$?
-  set -e
-  if [ "$rc" -eq 0 ]; then
-    record_pjdfstest_result "PASS" "$log_file" "$rc"
-  else
-    record_pjdfstest_result "FAIL" "$log_file" "$rc"
-  fi
-  return 0
-}
 
 record_drive9_cmd() {
   local category="$1" feature="$2" timeout_s="$3"
@@ -650,24 +357,6 @@ stop_mount() {
   return "$umount_rc"
 }
 
-pjdfstest_mount_args() {
-  local mount_point="$1"
-  local allow_other="$PJDFSTEST_MOUNT_ALLOW_OTHER"
-  local args=(--mode=fuse --durability=write-sync)
-
-  if [ "$allow_other" = "auto" ]; then
-    case "$(uname -s)" in
-      Linux) allow_other=1 ;;
-      Darwin) allow_other=0 ;;
-      *) allow_other=0 ;;
-    esac
-  fi
-  if [ "$allow_other" = "1" ]; then
-    args+=(--allow-other)
-  fi
-  args+=(":/" "$mount_point")
-  printf '%s\n' "${args[@]}"
-}
 
 wait_file_content() {
   local path="$1" want="$2"
@@ -819,7 +508,7 @@ head_mode() {
 git_cmd_record() {
   local repo="$1" category="$2" feature="$3"
   shift 3
-  record_cmd "$category" "$feature" "$GIT_MATRIX_TIMEOUT_S" git -C "$repo" "$@"
+  record_cmd "$category" "$feature" "$GIT_FEATURE_TIMEOUT_S" git -C "$repo" "$@"
 }
 
 git_output() {
@@ -877,7 +566,7 @@ make_remote_ahead_commit() {
 clone_drive9_repo() {
   local feature="$1" repo_url="$2" target="$3"
   shift 3
-  record_drive9_cmd "Git Clone Modes" "$feature" "$GIT_MATRIX_TIMEOUT_S" git clone --fast "$@" "$repo_url" "$target"
+  record_drive9_cmd "Git Clone Modes" "$feature" "$GIT_FEATURE_TIMEOUT_S" git clone --fast "$@" "$repo_url" "$target"
 }
 
 run_git_readiness_checks() {
@@ -1040,26 +729,31 @@ PY
   git_cmd_record "$repo" "Git Remote Operations" "pull from local bare remote" pull --ff-only origin "$branch"
 }
 
+# Sets FLOW_REPO to the cloned path. Do not capture stdout: record() prints PASS/FAIL there.
 clone_for_flow() {
   local name="$1" file_url="$2" mount_point="$3"
   local target="$mount_point/$name"
-  record_drive9_cmd "Git Clone Modes" "$name clone for flow" "$GIT_MATRIX_TIMEOUT_S" git clone --fast --blobless --hydrate=sync "$file_url" "$target"
+  FLOW_REPO=""
+  record_drive9_cmd "Git Clone Modes" "$name clone for flow" "$GIT_FEATURE_TIMEOUT_S" git clone --fast --blobless --hydrate=sync "$file_url" "$target"
   if ! configure_git_identity "$target"; then
     record "FAIL" "Git Prerequisites" "$name git identity configured" "git config failed"
+    return 1
   fi
-  printf '%s' "$target"
+  FLOW_REPO="$target"
 }
 
 run_git_flow_suite() {
   local mount_point="$1" file_url="$2"
   local repo
 
-  repo="$(clone_for_flow merge-flow "$file_url" "$mount_point")"
+  clone_for_flow merge-flow "$file_url" "$mount_point"
+  repo="$FLOW_REPO"
   if repo_ready "$repo" "Git Merge/Rebase/Stash" "merge-flow repo ready"; then
     git_cmd_record "$repo" "Git Merge/Rebase/Stash" "clean merge" merge origin/feature/clean-merge --no-edit
   fi
 
-  repo="$(clone_for_flow conflict-flow "$file_url" "$mount_point")"
+  clone_for_flow conflict-flow "$file_url" "$mount_point"
+  repo="$FLOW_REPO"
   if repo_ready "$repo" "Git Merge/Rebase/Stash" "conflict-flow repo ready"; then
     printf 'local conflict\n' > "$repo/README.md"
     git_cmd_record "$repo" "Git Merge/Rebase/Stash" "conflict fixture stage local edit" add README.md
@@ -1072,7 +766,8 @@ run_git_flow_suite() {
     fi
   fi
 
-  repo="$(clone_for_flow rebase-flow "$file_url" "$mount_point")"
+  clone_for_flow rebase-flow "$file_url" "$mount_point"
+  repo="$FLOW_REPO"
   if repo_ready "$repo" "Git Merge/Rebase/Stash" "rebase-flow repo ready"; then
     git_cmd_record "$repo" "Git Merge/Rebase/Stash" "rebase fixture branch create" switch -c local-rebase
     mkdir -p "$repo/docs"
@@ -1082,7 +777,8 @@ run_git_flow_suite() {
     git_cmd_record "$repo" "Git Merge/Rebase/Stash" "simple rebase" rebase origin/feature/rebase
   fi
 
-  repo="$(clone_for_flow stash-flow "$file_url" "$mount_point")"
+  clone_for_flow stash-flow "$file_url" "$mount_point"
+  repo="$FLOW_REPO"
   if repo_ready "$repo" "Git Merge/Rebase/Stash" "stash-flow repo ready"; then
     printf 'stash edit\n' >> "$repo/README.md"
     printf 'stash untracked\n' > "$repo/stash-new.txt"
@@ -1097,7 +793,7 @@ run_git_flow_suite() {
 run_restore_suite() {
   local git_root_rel="$1" file_url="$2" mount_point="$3" local_root_a="$4" log_file_a="$5"
   local restore_repo="$mount_point/restore-workspace"
-  record_drive9_cmd "Git Clone Modes" "restore workspace clone" "$GIT_MATRIX_TIMEOUT_S" git clone --fast --blobless --hydrate=sync "$file_url" "$restore_repo"
+  record_drive9_cmd "Git Clone Modes" "restore workspace clone" "$GIT_FEATURE_TIMEOUT_S" git clone --fast --blobless --hydrate=sync "$file_url" "$restore_repo"
   if ! repo_ready "$restore_repo" "Sandbox Restore" "restore workspace repo ready"; then
     return
   fi
@@ -1131,7 +827,7 @@ run_restore_suite() {
   fi
   printf 'small staged object\n' > "$restore_repo/small-staged.txt"
   git_cmd_record "$restore_repo" "Sandbox Restore" "stage small local object before remount" add small-staged.txt
-  if [ "$GIT_MATRIX_RUN_OVERSIZED" = "1" ]; then
+  if [ "$GIT_FEATURE_RUN_OVERSIZED" = "1" ]; then
     python3 - "$restore_repo/oversized-staged.bin" <<'PY'
 import sys
 from pathlib import Path
@@ -1139,7 +835,7 @@ Path(sys.argv[1]).write_bytes(b"D" * (5 * 1024 * 1024 + 1))
 PY
     git_cmd_record "$restore_repo" "Drive9 Git Workspace Behavior" "stage oversized object before remount" add oversized-staged.bin
   else
-    record "SKIP" "Drive9 Git Workspace Behavior" "oversized staged object downgrade" "GIT_MATRIX_RUN_OVERSIZED=0"
+    record "SKIP" "Drive9 Git Workspace Behavior" "oversized staged object downgrade" "GIT_FEATURE_RUN_OVERSIZED=0"
   fi
   record_status_contains "$restore_repo" "Sandbox Restore" "dirty status before remount" 'README\.md'
 
@@ -1193,7 +889,7 @@ PY
   fi
   record_status_contains "$restore_repo" "Sandbox Restore" "unstaged edits survive fresh local-root remount" 'README\.md'
   record_status_contains "$restore_repo" "Sandbox Restore" "small staged object preserved" '^A  small-staged\.txt$'
-  if [ "$GIT_MATRIX_RUN_OVERSIZED" = "1" ]; then
+  if [ "$GIT_FEATURE_RUN_OVERSIZED" = "1" ]; then
     local status
     status="$(git_output "$restore_repo" status --porcelain=v1 || true)"
     if grep -Eq '^(\?\?| A|AM| M) oversized-staged\.bin$' <<<"$status" && ! grep -q '^A  oversized-staged\.bin$' <<<"$status"; then
@@ -1220,169 +916,72 @@ PY
   [ -n "$local_root_a" ] && [ -d "$local_root_a" ] && : >"$local_root_a/.keep" 2>/dev/null || true
 }
 
-record_fuse_prereq_skips() {
-  local reason="$1"
-  if [ "$FEATURE_MATRIX_SUITE" != "git" ]; then
-    record "SKIP" "pjdfstest" "pjdfstest full suite" "$reason"
-  fi
-  if [ "$FEATURE_MATRIX_SUITE" != "posix" ]; then
-    record "SKIP" "Git Clone Modes" "all drive9 git clone modes" "$reason"
-    record "SKIP" "Drive9 Git Workspace Behavior" "sandbox restore" "$reason"
-  fi
-}
 
 main() {
-  mkdir -p "$FEATURE_MATRIX_REPORT_DIR"
-  local report_prefix
-  case "$FEATURE_MATRIX_SUITE" in
-    posix) report_prefix="posix-feature-report" ;;
-    git) report_prefix="git-feature-report" ;;
-    *) report_prefix="feature-matrix-report" ;;
-  esac
-  REPORT_PATH="$FEATURE_MATRIX_REPORT_DIR/$report_prefix-$TS.md"
-  RUN_ROOT="$(mktemp -d "$FUSE_MOUNT_ROOT/drive9-feature-matrix.XXXXXX")"
+  RUN_ROOT="$(mktemp -d "$FUSE_MOUNT_ROOT/drive9-git-feature.XXXXXX")"
   RUN_ROOT="$(cd "$RUN_ROOT" && pwd -P)"
-  RESULTS_TSV="$RUN_ROOT/results.tsv"
-  : >"$RESULTS_TSV"
 
-  case "$FEATURE_MATRIX_SUITE" in
-    posix|git) ;;
-    *) fail_fast "Prerequisites" "FEATURE_MATRIX_SUITE valid" "got ${FEATURE_MATRIX_SUITE:-<empty>}, want posix|git; use e2e/pjdfstest-suite.sh or e2e/git-feature-matrix.sh" ;;
-  esac
-
-  echo "=== drive9 $FEATURE_MATRIX_SUITE feature matrix ==="
-  echo "SUITE=$FEATURE_MATRIX_SUITE"
+  echo "=== drive9 git-feature-smoke-test ==="
   echo "BASE=$BASE"
   echo "CLI_SOURCE=$CLI_SOURCE"
-  echo "REPORT_PATH=$REPORT_PATH"
+  echo "RUN_ROOT=$RUN_ROOT"
 
-  record "PASS" "Prerequisites" "feature matrix suite selected" "$FEATURE_MATRIX_SUITE"
-
-  command -v python3 >/dev/null 2>&1 || fail_fast "Prerequisites" "python3 available" "python3 not found"
-  record "PASS" "Prerequisites" "python3 available" "ok"
-  command -v curl >/dev/null 2>&1 || fail_fast "Prerequisites" "curl available" "curl not found"
-  record "PASS" "Prerequisites" "curl available" "ok"
-  command -v jq >/dev/null 2>&1 || fail_fast "Prerequisites" "jq available" "jq not found"
-  record "PASS" "Prerequisites" "jq available" "ok"
-  if [ "$FEATURE_MATRIX_SUITE" != "posix" ]; then
-    command -v git >/dev/null 2>&1 || fail_fast "Prerequisites" "git available" "git not found"
-    record "PASS" "Prerequisites" "git available" "ok"
-  fi
-  if [ "$CLI_SOURCE" = "build" ]; then
-    command -v go >/dev/null 2>&1 || fail_fast "Prerequisites" "go available for CLI build" "go not found"
-    record "PASS" "Prerequisites" "go available for CLI build" "ok"
-  fi
-
-  if prepare_cli_binary; then
-    record "PASS" "Prerequisites" "drive9 CLI ready" "$CLI_BIN"
-  else
-    fail_fast "Prerequisites" "drive9 CLI ready" "failed to prepare CLI"
-  fi
+  prepare_cli_binary
+  record "PASS" "Prerequisites" "CLI binary ready" "$CLI_BIN"
 
   if [ -n "$DRIVE9_API_KEY" ]; then
     API_KEY="$DRIVE9_API_KEY"
-    record "PASS" "Provisioning" "use provided DRIVE9_API_KEY" "provided"
+    record "PASS" "Prerequisites" "use provided DRIVE9_API_KEY" "ok"
   else
-    local resp code body
-    resp=$(curl_body_code POST "$BASE/v1/provision")
-    code=$(http_code "$resp")
-    body=$(json_body "$resp")
-    if [ "$code" = "202" ]; then
-      record "PASS" "Provisioning" "POST /v1/provision returns 202" "ok"
-    else
-      fail_fast "Provisioning" "POST /v1/provision returns 202" "code=$code body=$body"
+    local prov body code
+    prov="$(curl_body_code POST "$BASE/v1/provision")"
+    code="$(http_code "$prov")"
+    body="$(json_body "$prov")"
+    if [ "$code" != "202" ] && [ "$code" != "200" ]; then
+      fail_fast "Prerequisites" "POST /v1/provision" "http=$code body=$body"
     fi
-    API_KEY=$(printf '%s' "$body" | jq -r '.api_key // empty' 2>/dev/null || true)
-    [ -n "$API_KEY" ] || fail_fast "Provisioning" "provision returns api_key" "$body"
-    record "PASS" "Provisioning" "provision returns api_key" "ok"
+    API_KEY="$(printf '%s' "$body" | jq -r '.api_key // empty')"
+    if [ -z "$API_KEY" ]; then
+      fail_fast "Prerequisites" "provision returns api_key" "missing api_key"
+    fi
+    record "PASS" "Prerequisites" "provision tenant" "ok"
   fi
 
-  local deadline state scode sbody sresp
-  deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
-  state=""
+  # Wait active
+  local deadline st
+  deadline=$(($(date +%s) + POLL_TIMEOUT_S))
   while :; do
-    sresp=$(curl_body_code GET "$BASE/v1/status" "$API_KEY")
-    scode=$(http_code "$sresp")
-    sbody=$(json_body "$sresp")
-    state=$(printf '%s' "$sbody" | jq -r '.status // empty' 2>/dev/null || true)
-    if [ "$scode" = "200" ] && [ "$state" = "active" ]; then
+    st="$(curl -sS -H "Authorization: Bearer $API_KEY" "$BASE/v1/status" | jq -r '.status // empty' 2>/dev/null || true)"
+    if [ "$st" = "active" ]; then
+      record "PASS" "Prerequisites" "tenant active" "ok"
       break
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      break
+      fail_fast "Prerequisites" "tenant becomes active" "last_status=$st"
     fi
     sleep "$POLL_INTERVAL_S"
   done
-  if [ "$state" = "active" ]; then
-    record "PASS" "Provisioning" "tenant becomes active" "active"
-  else
-    fail_fast "Provisioning" "tenant becomes active" "status=$scode:$state body=$sbody"
-  fi
 
-  if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
-    record_fuse_prereq_skips "unsupported OS $(uname -s)"
-    if [ "$FUSE_STRICT_PREREQS" = "1" ] || [ "$FEATURE_MATRIX_STRICT_ALL" = "1" ]; then
-      exit 1
-    fi
-    return
-  fi
+  # FUSE prereqs (soft)
   if [ "$(uname -s)" = "Linux" ]; then
-    if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
-      record_fuse_prereq_skips "fusermount/fusermount3 missing"
-      if [ "$FUSE_STRICT_PREREQS" = "1" ] || [ "$FEATURE_MATRIX_STRICT_ALL" = "1" ]; then
-        exit 1
-      fi
-      return
-    fi
     if [ ! -e /dev/fuse ]; then
-      record_fuse_prereq_skips "/dev/fuse missing"
-      if [ "$FUSE_STRICT_PREREQS" = "1" ] || [ "$FEATURE_MATRIX_STRICT_ALL" = "1" ]; then
-        exit 1
+      if [ "$FUSE_STRICT_PREREQS" = "1" ]; then
+        fail_fast "Prerequisites" "FUSE host prerequisites" "/dev/fuse missing"
       fi
-      return
-    fi
-  fi
-  if [ "$(uname -s)" = "Darwin" ]; then
-    if ! command -v mount_macfuse >/dev/null 2>&1 && ! command -v mount_fusefs >/dev/null 2>&1; then
-      record_fuse_prereq_skips "macFUSE/FUSE-T mount helper missing"
-      if [ "$FUSE_STRICT_PREREQS" = "1" ] || [ "$FEATURE_MATRIX_STRICT_ALL" = "1" ]; then
-        exit 1
-      fi
-      return
+      record "SKIP" "Prerequisites" "FUSE host prerequisites" "/dev/fuse missing"
+      return 0
     fi
   fi
   record "PASS" "Prerequisites" "FUSE host prerequisites" "ok"
 
-  if [ "$FEATURE_MATRIX_SUITE" != "git" ]; then
-  local root_rel="feature-matrix-$TS"
-  drive9_retry fs mkdir ":/$root_rel" >/dev/null
-
-  local rw_mount="$RUN_ROOT/mount-rw"
-  local rw_log="$RUN_ROOT/mount-rw.log"
-  local mount_args=()
-  while IFS= read -r arg; do
-    mount_args+=("$arg")
-  done < <(pjdfstest_mount_args "$rw_mount")
-  if start_mount "$rw_mount" "$rw_log" "${mount_args[@]}"; then
-    :
-  else
-    record "FAIL" "pjdfstest" "pjdfstest setup mount" "rw mount failed; see $rw_log"
-    return
-  fi
-
-  run_pjdfstest_suite "$rw_mount" "$root_rel"
-  stop_mount "$rw_mount" >/dev/null 2>&1 || true
-  fi
-
-  if [ "$FEATURE_MATRIX_SUITE" != "posix" ]; then
   local fixture_json fixture_root bare_repo file_url
   fixture_root="$RUN_ROOT/git-fixture"
-  fixture_json="$(python3 "$SCRIPT_DIR/git_fixture.py" "$fixture_root")"
+  fixture_json="$(python3 "$SCRIPT_DIR/tools/git_fixture.py" "$fixture_root")"
   bare_repo="$(printf '%s' "$fixture_json" | jq -r '.bare_repo')"
   file_url="$(printf '%s' "$fixture_json" | jq -r '.file_url')"
   record "PASS" "Git Fixture" "local bare fixture repo generated" "$bare_repo"
 
-  local git_root_rel="git-feature-matrix-$TS"
+  local git_root_rel="git-feature-smoke-$TS"
   drive9_retry fs mkdir ":/$git_root_rel" >/dev/null
   local git_mount="$RUN_ROOT/git-mount-a"
   local git_local="$RUN_ROOT/git-local-a"
@@ -1391,17 +990,17 @@ main() {
     record "PASS" "Drive9 Git Workspace Behavior" "coding-agent mount starts" "mounted"
   else
     record "FAIL" "Drive9 Git Workspace Behavior" "coding-agent mount starts" "mount failed"
-    return
+    return 1
   fi
 
   clone_drive9_repo "drive9 git clone --fast" "$bare_repo" "$git_mount/fast-full"
   clone_drive9_repo "drive9 git clone --fast --blobless --hydrate=off" "$file_url" "$git_mount/blobless-off" --blobless --hydrate=off
   clone_drive9_repo "drive9 git clone --fast --blobless --hydrate=sync" "$file_url" "$git_mount/blobless-sync" --blobless --hydrate=sync
   clone_drive9_repo "drive9 git clone --fast --blobless then explicit hydrate" "$file_url" "$git_mount/explicit-hydrate" --blobless --hydrate=off
-  record_drive9_cmd "Git Clone Modes" "drive9 git hydrate explicit" "$GIT_MATRIX_TIMEOUT_S" git hydrate "$git_mount/explicit-hydrate"
+  record_drive9_cmd "Git Clone Modes" "drive9 git hydrate explicit" "$GIT_FEATURE_TIMEOUT_S" git hydrate "$git_mount/explicit-hydrate"
 
   local ops_repo="$git_mount/ops"
-  record_drive9_cmd "Git Clone Modes" "ops clone for full Git operation suite" "$GIT_MATRIX_TIMEOUT_S" git clone --fast --blobless --hydrate=sync "$file_url" "$ops_repo"
+  record_drive9_cmd "Git Clone Modes" "ops clone for full Git operation suite" "$GIT_FEATURE_TIMEOUT_S" git clone --fast --blobless --hydrate=sync "$file_url" "$ops_repo"
   run_git_readiness_checks "$ops_repo"
   run_git_ops_suite "$ops_repo" "$bare_repo" "$TS"
   run_git_flow_suite "$git_mount" "$file_url"
@@ -1416,18 +1015,12 @@ main() {
   fi
 
   run_restore_suite "$git_root_rel" "$file_url" "$git_mount" "$git_local" "$RUN_ROOT/git-mount-a.log"
-  fi
 
-  local fail_count unchecked_count
-  fail_count="$(awk -F'\t' '$1=="FAIL"{c++} END{print c+0}' "$RESULTS_TSV")"
-  unchecked_count="$(awk -F'\t' '$1!="PASS" && $1!="META"{c++} END{print c+0}' "$RESULTS_TSV")"
-  if [ "$fail_count" -ne 0 ]; then
-    return 1
-  fi
-  if [ "$FEATURE_MATRIX_STRICT_ALL" = "1" ] && [ "$unchecked_count" -ne 0 ]; then
+  if [ "$FAIL" -ne 0 ]; then
     return 1
   fi
   return 0
 }
 
 main "$@"
+

@@ -4592,7 +4592,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 				errJSON(w, http.StatusBadRequest, "TiDBCloud Mode requires public_key and private_key when quota settings are provided")
 				return
 			}
-			defaultReq := resolveDefaultCredentials(s.provisioner)
+			defaultReq := resolveDefaultCredentials(s.provisioner, provider)
 			if defaultReq == nil {
 				errJSON(w, http.StatusBadRequest, tenant.ErrCredentialsRequired.Error())
 				return
@@ -4805,13 +4805,25 @@ func writeProvisionTenantAccepted(w http.ResponseWriter, res *provisionTenantRes
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-func resolveDefaultCredentials(p tenant.Provisioner) *tenant.CredentialProvisionRequest {
+func resolveDefaultCredentials(p tenant.Provisioner, provider string) *tenant.CredentialProvisionRequest {
 	type defaultCredentialProvider interface {
 		DefaultCredentials() (tenant.CredentialProvisionRequest, bool)
+	}
+	type defaultSharedCredentialProvider interface {
+		DefaultSharedCredentials() (tenant.CredentialProvisionRequest, bool)
 	}
 	if dp, ok := p.(defaultCredentialProvider); ok {
 		if req, ok := dp.DefaultCredentials(); ok {
 			return &req
+		}
+	}
+	// Shared deployments commonly only set server-owned shared keys. Empty-body
+	// /v1/provision (api-smoke, local shared) falls back to those.
+	if tenant.IsSharedSchemaProvider(provider) {
+		if sp, ok := p.(defaultSharedCredentialProvider); ok {
+			if req, ok := sp.DefaultSharedCredentials(); ok {
+				return &req
+			}
 		}
 	}
 	return nil
@@ -5357,7 +5369,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
 	}
 	if tenant.UsesTiDBCloudNativeCredentials(provider) && opts.CredentialProvisioner == nil {
-		if defaultReq := resolveDefaultCredentials(s.provisioner); defaultReq == nil {
+		if defaultReq := resolveDefaultCredentials(s.provisioner, provider); defaultReq == nil {
 			return nil, newProvisionTenantError(http.StatusBadRequest, "public_key and private_key are required", fmt.Errorf("public_key and private_key are required"))
 		} else {
 			opts.CredentialProvisioner = defaultReq

@@ -220,7 +220,7 @@ func (s *Server) resolveForkCredentialRequest(provider string, req *tenant.Crede
 		return nil, nil
 	}
 	if req == nil {
-		req = resolveDefaultCredentials(s.provisioner)
+		req = resolveDefaultCredentials(s.provisioner, provider)
 		if req == nil {
 			return nil, tenant.ErrCredentialsRequired
 		}
