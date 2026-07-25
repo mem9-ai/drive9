@@ -2058,7 +2058,10 @@ func (s *Server) replenishTenantPoolAsyncWithStarters(
 			}
 		}
 	}) {
-		_ = s.finishTenantPoolReplenishmentAt(pool.PoolID, time.Now())
+		finished := s.finishTenantPoolReplenishmentAt(pool.PoolID, time.Now())
+		if finished.scheduleAfter > 0 {
+			s.scheduleTenantPoolReplenishment(ctx, pool, cred, finished.scheduleAfter, workStarter, timerStarter)
+		}
 	}
 }
 
@@ -2071,7 +2074,7 @@ func (s *Server) scheduleTenantPoolReplenishment(
 	timerStarter tenantPoolWorkerStarter,
 ) {
 	workerCtx := backgroundWithTrace(ctx)
-	_ = timerStarter(workerCtx, func(ctx context.Context) {
+	if timerStarter(workerCtx, func(ctx context.Context) {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		select {
@@ -2080,7 +2083,10 @@ func (s *Server) scheduleTenantPoolReplenishment(
 		case <-timer.C:
 			s.replenishTenantPoolAsyncWithStarters(ctx, pool, cred, workStarter, timerStarter)
 		}
-	})
+	}) {
+		return
+	}
+	s.clearTenantPoolReplenishmentScheduled(pool.PoolID)
 }
 
 func (s *Server) tenantPoolBelowRefillWatermark(freeSize, poolSize int) bool {
@@ -2215,6 +2221,17 @@ func (s *Server) finishTenantPoolReplenishmentAt(poolID string, now time.Time) t
 	}
 	gate.scheduled = true
 	return tenantPoolReplenishDecision{scheduleAfter: tenantPoolReplenishMinInterval}
+}
+
+func (s *Server) clearTenantPoolReplenishmentScheduled(poolID string) {
+	value, ok := s.tenantPoolReplenishJobs.Load(poolID)
+	if !ok {
+		return
+	}
+	gate := value.(*tenantPoolWorkGate)
+	gate.mu.Lock()
+	gate.scheduled = false
+	gate.mu.Unlock()
 }
 
 func (s *Server) beginTenantPoolResumeScan(poolID string) bool {

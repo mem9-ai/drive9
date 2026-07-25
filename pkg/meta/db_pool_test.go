@@ -3,6 +3,7 @@ package meta
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
@@ -354,6 +355,97 @@ func TestMarkStuckSharedDBPoolFailedUsesStatusAndUpdatedAtCAS(t *testing.T) {
 	}
 	if result, changed, err := s.MarkStuckSharedDBPoolFailed(ctx, dbID, SharedDBStatusProvisioning, cutoff); err != nil || changed || result != nil {
 		t.Fatalf("wrong-status result=%+v changed=%v err=%v, want unchanged", result, changed, err)
+	}
+}
+
+func TestMarkStuckSharedDBPoolFailedReturnsOnlyTransitionedTenantIDs(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-stuck-race", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	tenantID := "tenant-stuck-race"
+	seedPendingTenant(t, s, tenantID)
+	fsID, err := s.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	if err := s.CompleteSharedTenantPoolMember(ctx, tenantID, tidbCloudNativeSharedProvider,
+		&TenantPlacement{FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared},
+		&TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: "org-stuck-race",
+			PoolID: "logical-stuck-race", PoolStatus: TenantPoolBindingFree}); err != nil {
+		t.Fatalf("CompleteSharedTenantPoolMember: %v", err)
+	}
+	stuckAt := time.Now().UTC().Add(-20 * time.Minute).Truncate(time.Millisecond)
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, stuckAt, dbID); err != nil {
+		t.Fatalf("age db pool: %v", err)
+	}
+
+	tenantTx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tenant transition: %v", err)
+	}
+	t.Cleanup(func() { _ = tenantTx.Rollback() })
+	var status TenantStatus
+	if err := tenantTx.QueryRowContext(ctx, `SELECT status FROM tenants WHERE id = ? FOR UPDATE`, tenantID).Scan(&status); err != nil {
+		t.Fatalf("lock tenant: %v", err)
+	}
+	resultCh := make(chan struct {
+		result  *StuckSharedDBPoolFailure
+		changed bool
+		err     error
+	}, 1)
+	go func() {
+		result, changed, failErr := s.MarkStuckSharedDBPoolFailed(ctx, dbID, SharedDBStatusPending, time.Now().UTC().Add(-15*time.Minute))
+		resultCh <- struct {
+			result  *StuckSharedDBPoolFailure
+			changed bool
+			err     error
+		}{result: result, changed: changed, err: failErr}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		probeTx, beginErr := s.DB().BeginTx(ctx, nil)
+		if beginErr != nil {
+			t.Fatalf("begin db pool lock probe: %v", beginErr)
+		}
+		var lockedID int64
+		probeErr := probeTx.QueryRowContext(ctx, `SELECT db_id FROM db_pool WHERE db_id = ? FOR UPDATE SKIP LOCKED`, dbID).Scan(&lockedID)
+		_ = probeTx.Rollback()
+		if errors.Is(probeErr, sql.ErrNoRows) {
+			break
+		}
+		if probeErr != nil {
+			t.Fatalf("probe db pool lock: %v", probeErr)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stuck-pool watchdog did not acquire the db_pool row")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := tenantTx.ExecContext(ctx, `UPDATE tenants SET status = ? WHERE id = ?`, TenantDeleting, tenantID); err != nil {
+		t.Fatalf("advance tenant status: %v", err)
+	}
+	if err := tenantTx.Commit(); err != nil {
+		t.Fatalf("commit tenant transition: %v", err)
+	}
+
+	got := <-resultCh
+	if got.err != nil || !got.changed || got.result == nil {
+		t.Fatalf("failure result=%+v changed=%v err=%v", got.result, got.changed, got.err)
+	}
+	if len(got.result.TenantIDs) != 0 {
+		t.Fatalf("failed tenant IDs = %v, want none for tenant that advanced to deleting", got.result.TenantIDs)
+	}
+	tenantRow, err := s.GetTenant(ctx, tenantID)
+	if err != nil || tenantRow.Status != TenantDeleting {
+		t.Fatalf("tenant after watchdog = %+v, %v; want deleting", tenantRow, err)
 	}
 }
 
