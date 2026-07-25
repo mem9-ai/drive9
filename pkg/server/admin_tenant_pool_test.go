@@ -1169,6 +1169,56 @@ func TestTenantPoolReplenishmentRerunsCoalescedTriggerAfterWorkerFinishes(t *tes
 	}
 }
 
+func TestTenantPoolReplenishmentSchedulesCoalescedRerunWhenWorkStartFails(t *testing.T) {
+	s := &Server{}
+	pool := &meta.TenantPool{PoolID: "pool-work-start-failed", OrganizationID: "org-1", Size: 1}
+	timerStarts := 0
+	workStarter := func(context.Context, func(context.Context)) bool {
+		decision := s.requestTenantPoolReplenishmentAt(pool.PoolID, time.Now())
+		if decision.start || decision.scheduleAfter != 0 {
+			t.Fatalf("coalesced decision = %+v, want no immediate or delayed start", decision)
+		}
+		return false
+	}
+	timerStarter := func(context.Context, func(context.Context)) bool {
+		timerStarts++
+		return true
+	}
+
+	s.replenishTenantPoolAsyncWithStarters(context.Background(), pool, tenant.CredentialProvisionRequest{}, workStarter, timerStarter)
+
+	if timerStarts != 1 {
+		t.Fatalf("delayed rerun starts = %d, want 1 after work start failure", timerStarts)
+	}
+}
+
+func TestTenantPoolReplenishmentRetriesSchedulingWhenTimerStartFails(t *testing.T) {
+	s := &Server{}
+	pool := &meta.TenantPool{PoolID: "pool-timer-start-failed", OrganizationID: "org-1", Size: 1}
+	value, _ := s.tenantPoolReplenishJobs.LoadOrStore(pool.PoolID, &tenantPoolWorkGate{})
+	gate := value.(*tenantPoolWorkGate)
+	gate.mu.Lock()
+	gate.rerun = true
+	gate.nextAllowed = time.Now().Add(time.Minute)
+	gate.mu.Unlock()
+	timerStarts := 0
+	timerStarter := func(context.Context, func(context.Context)) bool {
+		timerStarts++
+		return false
+	}
+	workStarter := func(context.Context, func(context.Context)) bool {
+		t.Fatal("cooldown trigger unexpectedly started replenish work")
+		return false
+	}
+
+	s.replenishTenantPoolAsyncWithStarters(context.Background(), pool, tenant.CredentialProvisionRequest{}, workStarter, timerStarter)
+	s.replenishTenantPoolAsyncWithStarters(context.Background(), pool, tenant.CredentialProvisionRequest{}, workStarter, timerStarter)
+
+	if timerStarts != 2 {
+		t.Fatalf("timer start attempts = %d, want 2 after the first start failed", timerStarts)
+	}
+}
+
 func TestLeaderTenantPoolReplenishmentTimerDoesNotConsumeWorkSlot(t *testing.T) {
 	s := &Server{}
 	pool := &meta.TenantPool{PoolID: "pool-leader-rerun", OrganizationID: "org-leader-rerun", Size: 1}
@@ -1505,8 +1555,16 @@ func TestSharedTenantPoolLeaderReconcilerRefillsZeroInventory(t *testing.T) {
 }
 
 func TestLeaderTenantPoolReplenishmentDoesNotStartOnFollower(t *testing.T) {
-	mgr := leader.NewManager(nil)
-	srv := &Server{leader: mgr, tenantPoolReconcileSlots: make(chan struct{}, 1)}
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	mgr := leader.NewManager(metaStore.DB())
+	srv := &Server{
+		leader: mgr, tenantPoolReconcileSlots: make(chan struct{}, 1),
+		leaderWorkersStarted: true, leaderWorkerCtx: context.Background(),
+	}
 	srv.replenishTenantPoolLeaderAsync(context.Background(), &meta.TenantPool{
 		PoolID: "pool-follower", OrganizationID: "org-follower", Size: 1, Status: meta.TenantPoolActive,
 	}, tenant.CredentialProvisionRequest{})

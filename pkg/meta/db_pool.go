@@ -549,12 +549,14 @@ func (s *Store) MarkStuckSharedDBPoolFailed(ctx context.Context, dbID int64, exp
 		if status != expectedStatus || updatedAt.After(cutoff) {
 			return nil
 		}
+		// Lock the matching tenant rows so the IDs returned to cache eviction and
+		// logs are exactly the rows the conditional failure update can transition.
 		rows, err := tx.QueryContext(ctx, `SELECT t.id
 			FROM tenant_placements p
 			JOIN fs_registry f ON f.fs_id = p.fs_id
 			JOIN tenants t ON t.id = f.tenant_id
 			WHERE p.db_id = ? AND t.provider = ? AND t.status IN (?, ?)
-			ORDER BY t.id`, dbID, tidbCloudNativeSharedProvider, TenantPending, TenantProvisioning)
+			ORDER BY t.id FOR UPDATE`, dbID, tidbCloudNativeSharedProvider, TenantPending, TenantProvisioning)
 		if err != nil {
 			return fmt.Errorf("list stuck shared tenants for db pool %d: %w", dbID, err)
 		}
