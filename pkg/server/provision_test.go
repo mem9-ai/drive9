@@ -1570,6 +1570,109 @@ func TestManagedSharedDBReservationKeepsOrganizationsParallel(t *testing.T) {
 	}
 }
 
+func TestManagedSharedDBReservationCoversPhysicalPlanningTransition(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	srv := &Server{meta: metaStore}
+	const organizationID = "org-reservation-planning"
+	const identity = "org:" + organizationID
+
+	holderStarted := make(chan struct{})
+	releaseHolder := make(chan struct{})
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- metaStore.WithSharedDBAllocationLock(context.Background(), identity, func(context.Context) error {
+			close(holderStarted)
+			<-releaseHolder
+			return nil
+		})
+	}()
+	select {
+	case <-holderStarted:
+	case <-time.After(time.Second):
+		t.Fatal("physical planning lock holder did not start")
+	}
+	var releaseOnce sync.Once
+	releasePlanning := func() { releaseOnce.Do(func() { close(releaseHolder) }) }
+	defer func() {
+		releasePlanning()
+		select {
+		case err := <-holderDone:
+			if err != nil {
+				t.Errorf("release physical planning lock: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("physical planning lock holder did not stop")
+		}
+	}()
+
+	firstReserveEntered := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, _, err := srv.allocateManagedSharedDBForOrganization(context.Background(), organizationID,
+			tenant.CredentialProvisionRequest{}, func(*meta.SharedDB) error {
+				close(firstReserveEntered)
+				return nil
+			})
+		firstDone <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, waiting := srv.sharedDBAllocationLocks.Load(identity); waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first allocation did not reach physical planning")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	if _, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: organizationID, ProvisioningKey: bytes.Repeat([]byte{2}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	secondReserveEntered := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		_, _, err := srv.allocateManagedSharedDBForOrganization(context.Background(), organizationID,
+			tenant.CredentialProvisionRequest{}, func(*meta.SharedDB) error {
+				close(secondReserveEntered)
+				return nil
+			})
+		secondDone <- err
+	}()
+	select {
+	case <-secondReserveEntered:
+		t.Error("same-organization reservation bypassed admission during physical planning")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	releasePlanning()
+	select {
+	case <-firstReserveEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first reservation did not finish physical planning")
+	}
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first allocation: %v", err)
+	}
+	select {
+	case <-secondReserveEntered:
+	case <-time.After(time.Second):
+		t.Fatal("second reservation did not resume after physical planning")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second allocation: %v", err)
+	}
+}
+
 func TestSharedDBAllocationLockWaitRespectsContextAndCleansUp(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
