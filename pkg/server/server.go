@@ -241,6 +241,7 @@ type Server struct {
 	tenantPoolCreateLocks               sync.Map
 	sharedDBAllocationLocks             sync.Map
 	tenantPoolResumeJobs                sync.Map
+	tenantPoolResumeScans               sync.Map
 	tenantFailedCleanupJobs             sync.Map
 	tenantFailedCleanupRunner           tenantFailedCleanupRunner
 	tidbCloudRBACCache                  *tidbCloudRBACCache

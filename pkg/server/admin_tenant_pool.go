@@ -43,6 +43,12 @@ type tenantPoolResumeJob struct {
 	rerun atomic.Bool
 }
 
+type tenantPoolWorkGate struct {
+	mu          sync.Mutex
+	running     bool
+	nextAllowed time.Time
+}
+
 type adminTenantPoolStatus string
 
 const adminTenantPoolStatusCreating adminTenantPoolStatus = "creating"
@@ -51,7 +57,11 @@ const adminTenantPoolMetricsComponent = "admin_tenant_pool"
 
 const tenantPoolClaimCASRetryLimit = 8
 
-const sharedTenantPoolCreateConcurrency = 50
+const (
+	sharedTenantPoolCreateConcurrency    = 10
+	tenantPoolReplenishMinInterval       = time.Second
+	tenantPoolPendingResumeEmptyInterval = 15 * time.Second
+)
 
 func managedSharedDBRefillTenantCount(missing, maxTenants, poolLimit int) int {
 	if missing <= 0 {
@@ -706,21 +716,6 @@ func (s *Server) recordTenantPoolCapacity(poolID, organizationID string, size, f
 	}
 	metrics.RecordTenantPoolCapacity(poolID, organizationID, "size", float64(size))
 	metrics.RecordTenantPoolCapacity(poolID, organizationID, "free", float64(freeSize))
-}
-
-func (s *Server) refreshTenantPoolCapacity(ctx context.Context, pool *meta.TenantPool) {
-	if s == nil || s.meta == nil || pool == nil || pool.OrganizationID == "" {
-		return
-	}
-	freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, pool.OrganizationID)
-	if err != nil {
-		logger.Warn(ctx, "admin_tenant_pool_capacity_refresh_failed",
-			zap.String("pool_id", pool.PoolID),
-			zap.String("organization_id", pool.OrganizationID),
-			zap.Error(err))
-		return
-	}
-	s.recordTenantPoolCapacity(pool.PoolID, pool.OrganizationID, pool.Size, freeSize)
 }
 
 func (s *Server) firstManagedOrganization(ctx context.Context, cred tenant.CredentialProvisionRequest) (string, error) {
@@ -1852,11 +1847,45 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 		defer func() {
 			metrics.RecordOperation(adminTenantPoolMetricsComponent, "replenish", metricResult, time.Since(replenishStarted))
 		}()
+		current, err := s.meta.GetTenantPoolByID(ctx, pool.PoolID)
+		if err != nil {
+			if !errors.Is(err, meta.ErrNotFound) {
+				logger.Warn(ctx, "admin_tenant_pool_replenish_get_pool_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
+				metricResult = "error"
+			} else {
+				metricResult = "not_found"
+			}
+			return
+		}
+		if current.Status != meta.TenantPoolActive || current.OrganizationID == "" || current.Size <= 0 {
+			metricResult = "skipped"
+			return
+		}
+		freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
+		if err != nil {
+			logger.Warn(ctx, "admin_tenant_pool_replenish_free_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+			metricResult = "error"
+			return
+		}
+		s.recordTenantPoolCapacity(current.PoolID, current.OrganizationID, current.Size, freeSize)
+		if !s.tenantPoolBelowRefillWatermark(freeSize, current.Size) {
+			logger.Info(ctx, "admin_tenant_pool_replenish_skipped",
+				zap.String("pool_id", current.PoolID),
+				zap.String("organization_id", current.OrganizationID),
+				zap.Int("pool_size", current.Size),
+				zap.Int("free_size", freeSize),
+				zap.Float64("refill_free_ratio", s.effectiveTenantPoolRefillFreeRatio()))
+			metricResult = "noop"
+			return
+		}
+
+		// The common no-op path returns before taking either lock. Re-check all
+		// capacity state under the distributed lock before provisioning.
 		lock := s.tenantPoolLock(pool.PoolID)
 		lock.Lock()
 		defer lock.Unlock()
 		if err := s.meta.WithTenantPoolLock(ctx, pool.PoolID, func(ctx context.Context) error {
-			current, err := s.meta.GetTenantPoolByID(ctx, pool.PoolID)
+			current, err = s.meta.GetTenantPoolByID(ctx, pool.PoolID)
 			if err != nil {
 				if !errors.Is(err, meta.ErrNotFound) {
 					logger.Warn(ctx, "admin_tenant_pool_replenish_get_pool_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
@@ -1870,7 +1899,7 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 				metricResult = "skipped"
 				return nil
 			}
-			freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
+			freeSize, err = s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
 			if err != nil {
 				logger.Warn(ctx, "admin_tenant_pool_replenish_free_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
 				metricResult = "error"
@@ -1901,7 +1930,6 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 				metricResult = "noop"
 				return nil
 			}
-			defer s.refreshTenantPoolCapacity(ctx, current)
 			if s.defaultTenantProvider == tenant.ProviderTiDBCloudNativeShared {
 				maxTenants, _ := s.managedSharedDBPolicy()
 				missing = managedSharedDBRefillTenantCount(missing, maxTenants, s.managedSharedDBRefillPoolLimit)
@@ -1946,15 +1974,29 @@ func (s *Server) resumePendingTenantPoolAsync(ctx context.Context, pool *meta.Te
 	if pool == nil || pool.OrganizationID == "" || pool.PoolID == "" {
 		return
 	}
+	if actual, ok := s.tenantPoolResumeJobs.Load(pool.PoolID); ok {
+		if existing, typeOK := actual.(*tenantPoolResumeJob); typeOK {
+			existing.rerun.Store(true)
+		}
+		return
+	}
+	if !s.beginTenantPoolResumeScan(pool.PoolID) {
+		return
+	}
 	workerCtx := backgroundWithTrace(ctx)
-	s.startServerWorker(workerCtx, func(ctx context.Context) {
+	if !s.startServerWorker(workerCtx, func(ctx context.Context) {
+		empty := false
+		defer func() { s.finishTenantPoolResumeScan(pool.PoolID, empty) }()
 		clusters, err := s.pendingTenantPoolResumeClusters(ctx, pool.PoolID, pool.Size)
 		if err != nil {
 			logger.Warn(ctx, "admin_tenant_pool_pending_resume_list_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
 			return
 		}
+		empty = len(clusters) == 0
 		s.startPoolClustersMetadataResume(ctx, pool.PoolID, clusters, cred)
-	})
+	}) {
+		s.finishTenantPoolResumeScan(pool.PoolID, false)
+	}
 }
 
 func (s *Server) pendingTenantPoolResumeClusters(ctx context.Context, poolID string, limit int) ([]*tenant.ClusterInfo, error) {
@@ -1999,15 +2041,77 @@ func (s *Server) tenantPoolLock(poolID string) *sync.Mutex {
 }
 
 func (s *Server) beginTenantPoolReplenishment(poolID string) bool {
+	return s.beginTenantPoolReplenishmentAt(poolID, time.Now())
+}
+
+func (s *Server) beginTenantPoolReplenishmentAt(poolID string, now time.Time) bool {
 	if strings.TrimSpace(poolID) == "" {
 		return false
 	}
-	_, loaded := s.tenantPoolReplenishJobs.LoadOrStore(poolID, struct{}{})
-	return !loaded
+	value, _ := s.tenantPoolReplenishJobs.LoadOrStore(poolID, &tenantPoolWorkGate{})
+	gate := value.(*tenantPoolWorkGate)
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.running || now.Before(gate.nextAllowed) {
+		return false
+	}
+	gate.running = true
+	return true
 }
 
 func (s *Server) finishTenantPoolReplenishment(poolID string) {
-	s.tenantPoolReplenishJobs.Delete(poolID)
+	s.finishTenantPoolReplenishmentAt(poolID, time.Now())
+}
+
+func (s *Server) finishTenantPoolReplenishmentAt(poolID string, now time.Time) {
+	value, ok := s.tenantPoolReplenishJobs.Load(poolID)
+	if !ok {
+		return
+	}
+	gate := value.(*tenantPoolWorkGate)
+	gate.mu.Lock()
+	gate.running = false
+	gate.nextAllowed = now.Add(tenantPoolReplenishMinInterval)
+	gate.mu.Unlock()
+}
+
+func (s *Server) beginTenantPoolResumeScan(poolID string) bool {
+	return s.beginTenantPoolResumeScanAt(poolID, time.Now())
+}
+
+func (s *Server) beginTenantPoolResumeScanAt(poolID string, now time.Time) bool {
+	if strings.TrimSpace(poolID) == "" {
+		return false
+	}
+	value, _ := s.tenantPoolResumeScans.LoadOrStore(poolID, &tenantPoolWorkGate{})
+	gate := value.(*tenantPoolWorkGate)
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.running || now.Before(gate.nextAllowed) {
+		return false
+	}
+	gate.running = true
+	return true
+}
+
+func (s *Server) finishTenantPoolResumeScan(poolID string, empty bool) {
+	s.finishTenantPoolResumeScanAt(poolID, time.Now(), empty)
+}
+
+func (s *Server) finishTenantPoolResumeScanAt(poolID string, now time.Time, empty bool) {
+	value, ok := s.tenantPoolResumeScans.Load(poolID)
+	if !ok {
+		return
+	}
+	gate := value.(*tenantPoolWorkGate)
+	gate.mu.Lock()
+	gate.running = false
+	if empty {
+		gate.nextAllowed = now.Add(tenantPoolPendingResumeEmptyInterval)
+	} else {
+		gate.nextAllowed = time.Time{}
+	}
+	gate.mu.Unlock()
 }
 
 func (s *Server) tenantPoolCreateLock(cred tenant.CredentialProvisionRequest) *sync.Mutex {
@@ -2078,7 +2182,6 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_skipped", "provider", tenant.ProviderTiDBCloudNative, "pool_id", pool.PoolID, "organization_id", orgID, "reason", "pool_inactive", "pool_status", pool.Status, "duration_ms", durationMillis(claimStarted))...)
 		return nil, nil, false, false, nil
 	}
-	defer s.refreshTenantPoolCapacity(ctx, pool)
 	s.resumePendingTenantPoolAsync(ctx, pool, cred)
 	stageStarted = time.Now()
 	selection, err := retryTenantPoolClaimCAS(func() (tenantPoolClaimSelection, error) {

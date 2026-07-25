@@ -151,6 +151,13 @@ func TestTenantPoolClaimConsumesMixedInventoryInGlobalAgeOrder(t *testing.T) {
 			CreatedAt: sharedCreatedAt, UpdatedAt: sharedCreatedAt}); err != nil {
 		t.Fatalf("CompleteSharedTenantPoolMember: %v", err)
 	}
+	free, err := rt.meta.CountFreeTenantPoolBindings(ctx, "org-mixed-age")
+	if err != nil {
+		t.Fatalf("CountFreeTenantPoolBindings: %v", err)
+	}
+	if free != 2 {
+		t.Fatalf("mixed native/shared free inventory = %d, want 2", free)
+	}
 
 	cred := tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}
 	first, _, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx, cred, nil)
@@ -287,37 +294,38 @@ func TestSharedTenantPoolRefillPlansWithServerOwnedSharedCredential(t *testing.T
 	}
 }
 
-func TestSharedTenantPoolRefillRunsFiftyTenantWorkers(t *testing.T) {
-	started := make(chan struct{}, sharedTenantPoolCreateConcurrency+1)
+func TestSharedTenantPoolRefillLimitsTenantWorkersToTen(t *testing.T) {
+	const wantConcurrency = 10
+	started := make(chan struct{}, wantConcurrency+1)
 	release := make(chan struct{})
 	done := make(chan []sharedPoolTenantCreateOutcome, 1)
 	go func() {
-		done <- runSharedPoolTenantCreateWorkers(context.Background(), sharedTenantPoolCreateConcurrency+1, func() sharedPoolTenantCreateOutcome {
+		done <- runSharedPoolTenantCreateWorkers(context.Background(), wantConcurrency+1, func() sharedPoolTenantCreateOutcome {
 			started <- struct{}{}
 			<-release
 			return sharedPoolTenantCreateOutcome{}
 		})
 	}()
-	for i := 0; i < sharedTenantPoolCreateConcurrency; i++ {
+	for i := 0; i < wantConcurrency; i++ {
 		select {
 		case <-started:
 		case <-time.After(500 * time.Millisecond):
 			close(release)
 			<-done
-			t.Fatalf("started %d/%d tenant workers before release", i, sharedTenantPoolCreateConcurrency)
+			t.Fatalf("started %d/%d tenant workers before release", i, wantConcurrency)
 		}
 	}
 	select {
 	case <-started:
 		close(release)
 		<-done
-		t.Fatal("started a 51st tenant worker while 50 were still in flight")
+		t.Fatal("started an 11th tenant worker while 10 were still in flight")
 	case <-time.After(100 * time.Millisecond):
 	}
 	close(release)
 	outcomes := <-done
-	if len(outcomes) != sharedTenantPoolCreateConcurrency+1 {
-		t.Fatalf("outcomes = %d, want %d", len(outcomes), sharedTenantPoolCreateConcurrency+1)
+	if len(outcomes) != wantConcurrency+1 {
+		t.Fatalf("outcomes = %d, want %d", len(outcomes), wantConcurrency+1)
 	}
 }
 
@@ -953,12 +961,47 @@ func TestAdminTenantPoolReplenishSkipsAtFreeWatermark(t *testing.T) {
 	for i := 1; i <= 8; i++ {
 		insertAdminPoolFreeTenant(t, rt, pool.PoolID, pool.OrganizationID, i)
 	}
+	lockHeld := make(chan struct{})
+	releaseLock := make(chan struct{})
+	lockDone := make(chan error, 1)
+	go func() {
+		lockDone <- rt.meta.WithTenantPoolLock(ctx, pool.PoolID, func(context.Context) error {
+			close(lockHeld)
+			<-releaseLock
+			return nil
+		})
+	}()
+	select {
+	case <-lockHeld:
+	case err := <-lockDone:
+		t.Fatalf("hold tenant pool lock: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out acquiring tenant pool lock for test")
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseLock) }) }
+	t.Cleanup(func() {
+		release()
+		<-lockDone
+	})
 
 	rt.server.replenishTenantPoolAsync(ctx, pool, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	})
-	rt.server.forkWorkerWG.Wait()
+	workerDone := make(chan struct{})
+	go func() {
+		rt.server.forkWorkerWG.Wait()
+		close(workerDone)
+	}()
+	select {
+	case <-workerDone:
+	case <-time.After(time.Second):
+		release()
+		<-workerDone
+		t.Fatal("above-watermark replenish waited for the MySQL tenant pool lock")
+	}
+	release()
 
 	if got := rt.prov.batchPoolCalls.Load(); got != 0 {
 		t.Fatalf("batch pool calls = %d, want 0", got)
@@ -974,20 +1017,59 @@ func TestAdminTenantPoolReplenishSkipsAtFreeWatermark(t *testing.T) {
 
 func TestTenantPoolReplenishmentCoalescesConcurrentTriggersByPool(t *testing.T) {
 	s := &Server{}
+	now := time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC)
 
-	if !s.beginTenantPoolReplenishment("pool-1") {
+	if !s.beginTenantPoolReplenishmentAt("pool-1", now) {
 		t.Fatal("first trigger was not accepted")
 	}
-	if s.beginTenantPoolReplenishment("pool-1") {
+	if s.beginTenantPoolReplenishmentAt("pool-1", now) {
 		t.Fatal("concurrent trigger for the same pool was accepted")
 	}
-	if !s.beginTenantPoolReplenishment("pool-2") {
+	if !s.beginTenantPoolReplenishmentAt("pool-2", now) {
 		t.Fatal("trigger for a different pool was not accepted")
 	}
 
-	s.finishTenantPoolReplenishment("pool-1")
-	if !s.beginTenantPoolReplenishment("pool-1") {
-		t.Fatal("trigger was not accepted after the previous job finished")
+	s.finishTenantPoolReplenishmentAt("pool-1", now)
+	if s.beginTenantPoolReplenishmentAt("pool-1", now.Add(tenantPoolReplenishMinInterval-time.Nanosecond)) {
+		t.Fatal("trigger was accepted during the per-pool minimum interval")
+	}
+	if !s.beginTenantPoolReplenishmentAt("pool-1", now.Add(tenantPoolReplenishMinInterval)) {
+		t.Fatal("trigger was not accepted after the per-pool minimum interval")
+	}
+}
+
+func TestTenantPoolPendingResumeScanCooldownAfterEmptyResult(t *testing.T) {
+	s := &Server{}
+	now := time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC)
+
+	if !s.beginTenantPoolResumeScanAt("pool-1", now) {
+		t.Fatal("first pending resume scan was not accepted")
+	}
+	if s.beginTenantPoolResumeScanAt("pool-1", now) {
+		t.Fatal("concurrent pending resume scan was accepted")
+	}
+	s.finishTenantPoolResumeScanAt("pool-1", now, true)
+	if s.beginTenantPoolResumeScanAt("pool-1", now.Add(tenantPoolPendingResumeEmptyInterval-time.Nanosecond)) {
+		t.Fatal("empty pending resume scan was retried during cooldown")
+	}
+	if !s.beginTenantPoolResumeScanAt("pool-1", now.Add(tenantPoolPendingResumeEmptyInterval)) {
+		t.Fatal("pending resume scan was not accepted after cooldown")
+	}
+}
+
+func TestTenantPoolPendingResumeRequestsRerunBeforeListing(t *testing.T) {
+	s := &Server{}
+	job := &tenantPoolResumeJob{}
+	s.tenantPoolResumeJobs.Store("pool-1", job)
+
+	s.resumePendingTenantPoolAsync(context.Background(), &meta.TenantPool{
+		PoolID:         "pool-1",
+		OrganizationID: "org-1",
+		Size:           10,
+	}, tenant.CredentialProvisionRequest{})
+
+	if !job.rerun.Load() {
+		t.Fatal("active metadata resume job did not receive a rerun request")
 	}
 }
 

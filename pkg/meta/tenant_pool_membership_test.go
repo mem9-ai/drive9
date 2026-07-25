@@ -14,6 +14,20 @@ func TestFreeTenantPoolMembershipCountPinsMembershipTableFirst(t *testing.T) {
 	}
 }
 
+func TestFreeTenantPoolBindingCountCombinesNativeAndSharedInventory(t *testing.T) {
+	if strings.Count(countFreeTenantPoolBindingsSQL, "UNION ALL") != 1 {
+		t.Fatalf("count query must combine native and shared inventory in one statement: %s", countFreeTenantPoolBindingsSQL)
+	}
+	for _, want := range []string{
+		"FROM tenant_tidbcloud_org_bindings b\n\t\tSTRAIGHT_JOIN tenants t",
+		"FROM tenant_pool_memberships m\n\t\tSTRAIGHT_JOIN tenants t",
+	} {
+		if !strings.Contains(countFreeTenantPoolBindingsSQL, want) {
+			t.Fatalf("count query missing pinned branch %q: %s", want, countFreeTenantPoolBindingsSQL)
+		}
+	}
+}
+
 func TestTenantPoolMembershipRoundTripAndClaimCAS(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
