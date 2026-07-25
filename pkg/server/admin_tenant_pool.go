@@ -1223,6 +1223,64 @@ func (s *Server) provisionManagedSharedDBPoolAllocationGroup(ctx context.Context
 }
 
 func (s *Server) provisionManagedSharedDBPoolsBatchForGroup(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) error {
+	return s.meta.WithSharedDBPoolWorkClaims(ctx, dbIDs, func(claimCtx context.Context, ownedIDs []int64) error {
+		return s.provisionManagedSharedDBPoolsBatchGroupClaimed(claimCtx, provisioner, ownedIDs, cred)
+	})
+}
+
+func (s *Server) provisionManagedSharedDBPoolsBatchGroupClaimed(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) error {
+	rows := make(map[int64]*meta.SharedDB, len(dbIDs))
+	loadRequests := make([]tenant.SharedDBPoolLoadRequest, 0, len(dbIDs))
+	for _, dbID := range dbIDs {
+		row, err := s.meta.GetSharedDB(ctx, dbID)
+		if err != nil {
+			return err
+		}
+		// Re-read after taking per-pool ownership. A concurrent direct
+		// continuation may have persisted the cluster before this group
+		// acquired its claim; such rows continue through metadata polling.
+		if row.Status != meta.SharedDBStatusPending || strings.TrimSpace(row.ClusterID) != "" {
+			continue
+		}
+		rows[dbID] = row
+		loadRequests = append(loadRequests, tenant.SharedDBPoolLoadRequest{DBPoolID: dbID, DBPoolUUID: row.UUID})
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	discovered, loadErr := loadManagedSharedDBPoolsBeforeCreate(ctx, provisioner, loadRequests, cred)
+	adopted, persistErr := s.persistManagedSharedDBPoolCloudResults(ctx, discovered, rows)
+	if loadErr != nil || persistErr != nil {
+		// A failed lookup cannot prove that the Cloud POST did not already
+		// succeed, so retry discovery instead of issuing another create.
+		return errors.Join(loadErr, persistErr)
+	}
+
+	requests := make([]tenant.SharedDBPoolCreateRequest, 0, len(rows)-len(adopted))
+	for _, dbID := range dbIDs {
+		row := rows[dbID]
+		if row == nil {
+			continue
+		}
+		if _, ok := adopted[dbID]; ok {
+			continue
+		}
+		plain, err := s.pool.Decrypt(ctx, row.PasswordCipher)
+		if err != nil {
+			return err
+		}
+		if row.SpendingLimit == nil {
+			return fmt.Errorf("managed db pool %d has no spending target", dbID)
+		}
+		requests = append(requests, tenant.SharedDBPoolCreateRequest{DBPoolID: dbID, DBPoolUUID: row.UUID,
+			CustomerOrganizationID: strings.TrimSpace(row.TiDBCloudOrganizationID), DatabaseName: row.Name,
+			RootPassword: string(plain), SpendingLimitMonthly: *row.SpendingLimit})
+	}
+	if len(requests) == 0 {
+		return nil
+	}
+
 	type batchResult struct {
 		err error
 	}
@@ -1230,12 +1288,12 @@ func (s *Server) provisionManagedSharedDBPoolsBatchForGroup(ctx context.Context,
 	if batchSize <= 0 {
 		batchSize = DefaultManagedSharedDBCloudBatchSize
 	}
-	batchCount := (len(dbIDs) + batchSize - 1) / batchSize
+	batchCount := (len(requests) + batchSize - 1) / batchSize
 	batchResults := make([]batchResult, batchCount)
-	batches := make([][]int64, 0, batchCount)
-	for start := 0; start < len(dbIDs); start += batchSize {
-		end := min(start+batchSize, len(dbIDs))
-		batches = append(batches, append([]int64(nil), dbIDs[start:end]...))
+	batches := make([][]tenant.SharedDBPoolCreateRequest, 0, batchCount)
+	for start := 0; start < len(requests); start += batchSize {
+		end := min(start+batchSize, len(requests))
+		batches = append(batches, append([]tenant.SharedDBPoolCreateRequest(nil), requests[start:end]...))
 	}
 	poolLimit := s.managedSharedDBRefillPoolLimit
 	if poolLimit <= 0 {
@@ -1258,7 +1316,7 @@ func (s *Server) provisionManagedSharedDBPoolsBatchForGroup(ctx context.Context,
 				batchResults[batchIndex].err = err
 				return
 			}
-			batchResults[batchIndex].err = s.provisionManagedSharedDBPoolsBatchChunk(ctx, provisioner, batches[batchIndex], cred)
+			batchResults[batchIndex].err = s.provisionManagedSharedDBPoolsBatchChunkClaimed(ctx, provisioner, batches[batchIndex], rows, cred)
 		}()
 	}
 	wg.Wait()
@@ -1269,50 +1327,27 @@ func (s *Server) provisionManagedSharedDBPoolsBatchForGroup(ctx context.Context,
 	return batchErr
 }
 
-func (s *Server) provisionManagedSharedDBPoolsBatchChunk(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) error {
-	return s.meta.WithSharedDBPoolWorkClaims(ctx, dbIDs, func(claimCtx context.Context, ownedIDs []int64) error {
-		requests := make([]tenant.SharedDBPoolCreateRequest, 0, len(ownedIDs))
-		rows := make(map[int64]*meta.SharedDB, len(ownedIDs))
-		for _, dbID := range ownedIDs {
-			row, err := s.meta.GetSharedDB(claimCtx, dbID)
-			if err != nil {
-				return err
-			}
-			// Re-read after taking per-pool ownership. A concurrent direct
-			// continuation may have persisted the cluster before this batch
-			// acquired its claim; such rows continue through metadata polling.
-			if row.Status != meta.SharedDBStatusPending || strings.TrimSpace(row.ClusterID) != "" {
-				continue
-			}
-			plain, err := s.pool.Decrypt(claimCtx, row.PasswordCipher)
-			if err != nil {
-				return err
-			}
-			if row.SpendingLimit == nil {
-				return fmt.Errorf("managed db pool %d has no spending target", dbID)
-			}
-			rows[dbID] = row
-			requests = append(requests, tenant.SharedDBPoolCreateRequest{DBPoolID: dbID, DBPoolUUID: row.UUID,
-				CustomerOrganizationID: strings.TrimSpace(row.TiDBCloudOrganizationID), DatabaseName: row.Name,
-				RootPassword: string(plain), SpendingLimitMonthly: *row.SpendingLimit})
+func loadManagedSharedDBPoolsBeforeCreate(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, requests []tenant.SharedDBPoolLoadRequest, cred tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
+	if loader, ok := provisioner.(tenant.SharedDBPoolBatchLoader); ok {
+		return loader.BatchLoadSharedDBPoolsWithCredentials(ctx, requests, cred)
+	}
+	loaded := make([]*tenant.SharedDBPoolInfo, 0, len(requests))
+	for _, request := range requests {
+		info, err := provisioner.LoadSharedDBPoolWithCredentials(ctx, request.DBPoolID, request.DBPoolUUID, request.ClusterID, cred)
+		if err != nil {
+			return loaded, err
 		}
-		if len(requests) == 0 {
-			return nil
+		if info != nil {
+			loaded = append(loaded, info)
 		}
-		return s.provisionManagedSharedDBPoolsBatchChunkClaimed(claimCtx, provisioner, requests, rows, cred)
-	})
+	}
+	return loaded, nil
 }
 
-func (s *Server) provisionManagedSharedDBPoolsBatchChunkClaimed(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, requests []tenant.SharedDBPoolCreateRequest, rows map[int64]*meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
-	created, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, requests, cred)
-	if createErr != nil && len(created) == 0 {
-		logger.Warn(ctx, "managed_shared_db_batch_create_failed",
-			zap.Int("db_pool_count", len(requests)), zap.Error(createErr))
-		return createErr
-	}
+func (s *Server) persistManagedSharedDBPoolCloudResults(ctx context.Context, results []*tenant.SharedDBPoolInfo, rows map[int64]*meta.SharedDB) (map[int64]struct{}, error) {
+	persisted := make(map[int64]struct{}, len(results))
 	var persistErr error
-	persisted := 0
-	for _, info := range created {
+	for _, info := range results {
 		if info == nil || rows[info.DBPoolID] == nil || rows[info.DBPoolID].UUID != info.DBPoolUUID {
 			persistErr = errors.Join(persistErr, fmt.Errorf("shared db batch returned an unknown db pool"))
 			continue
@@ -1335,11 +1370,22 @@ func (s *Server) provisionManagedSharedDBPoolsBatchChunkClaimed(ctx context.Cont
 			persistErr = errors.Join(persistErr, err)
 			continue
 		}
-		persisted++
+		persisted[info.DBPoolID] = struct{}{}
 	}
+	return persisted, persistErr
+}
+
+func (s *Server) provisionManagedSharedDBPoolsBatchChunkClaimed(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, requests []tenant.SharedDBPoolCreateRequest, rows map[int64]*meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
+	created, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, requests, cred)
+	if createErr != nil && len(created) == 0 {
+		logger.Warn(ctx, "managed_shared_db_batch_create_failed",
+			zap.Int("db_pool_count", len(requests)), zap.Error(createErr))
+		return createErr
+	}
+	persistedIDs, persistErr := s.persistManagedSharedDBPoolCloudResults(ctx, created, rows)
 	if createErr != nil {
 		logger.Warn(ctx, "managed_shared_db_batch_create_partial",
-			zap.Int("requested", len(requests)), zap.Int("persisted", persisted), zap.Error(createErr))
+			zap.Int("requested", len(requests)), zap.Int("persisted", len(persistedIDs)), zap.Error(createErr))
 	}
 	return errors.Join(createErr, persistErr)
 }

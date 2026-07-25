@@ -119,6 +119,8 @@ type SharedDBPoolLoadRequest struct {
 }
 
 type SharedDBPoolBatchLoader interface {
+	// BatchLoadSharedDBPoolsWithCredentials refreshes known cluster IDs and
+	// discovers requests without a cluster ID by their durable DB-pool UUID.
 	BatchLoadSharedDBPoolsWithCredentials(ctx context.Context, requests []SharedDBPoolLoadRequest, req CredentialProvisionRequest) ([]*SharedDBPoolInfo, error)
 }
 

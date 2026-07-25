@@ -33,15 +33,23 @@ func (s *Server) reconcileStuckManagedSharedDBPoolsWithCtx(ctx context.Context) 
 				if row.UpdatedAt.After(cutoff) {
 					continue
 				}
-				failed, changed, failErr := s.meta.MarkStuckSharedDBPoolFailed(ctx, row.ID, status, cutoff)
-				if failErr != nil {
-					logger.Warn(ctx, "managed_shared_db_pool_stuck_fail_failed", zap.Int64("db_pool_id", row.ID), zap.String("status", status), zap.Error(failErr))
-					continue
-				}
-				if changed {
-					logger.Warn(ctx, "managed_shared_db_pool_stuck_failed", zap.Int64("db_pool_id", row.ID),
-						zap.String("db_pool_uuid", row.UUID), zap.String("status", status),
-						zap.Int("tenant_count", len(failed.TenantIDs)), zap.Duration("stuck_timeout", timeout))
+				claimErr := s.meta.WithSharedDBPoolWorkClaims(ctx, []int64{row.ID}, func(claimCtx context.Context, ownedIDs []int64) error {
+					if len(ownedIDs) == 0 {
+						return nil
+					}
+					failed, changed, failErr := s.meta.MarkStuckSharedDBPoolFailed(claimCtx, row.ID, status, cutoff)
+					if failErr != nil {
+						return failErr
+					}
+					if changed {
+						logger.Warn(claimCtx, "managed_shared_db_pool_stuck_failed", zap.Int64("db_pool_id", row.ID),
+							zap.String("db_pool_uuid", row.UUID), zap.String("status", status),
+							zap.Int("tenant_count", len(failed.TenantIDs)), zap.Duration("stuck_timeout", timeout))
+					}
+					return nil
+				})
+				if claimErr != nil {
+					logger.Warn(ctx, "managed_shared_db_pool_stuck_fail_failed", zap.Int64("db_pool_id", row.ID), zap.String("status", status), zap.Error(claimErr))
 				}
 			}
 			if len(rows) < tenantPoolReconcilePageSize {

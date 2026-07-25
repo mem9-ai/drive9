@@ -595,7 +595,7 @@ func (s *Store) MarkStuckSharedDBPoolFailed(ctx context.Context, dbID int64, exp
 			return err
 		}
 		if affected != 1 {
-			return nil
+			return fmt.Errorf("fail stuck shared db pool %d affected %d rows, want 1", dbID, affected)
 		}
 		changed = true
 		result = &StuckSharedDBPoolFailure{

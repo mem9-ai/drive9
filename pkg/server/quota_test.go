@@ -384,7 +384,16 @@ func (p *tenantPoolNoListProvisioner) MarkClusterPoolFree(context.Context, *tena
 	return nil
 }
 
+type quotaRuntimeOptions struct {
+	defaultTenantProvider string
+	provisioner           func(*quotaTestProvisioner) tenant.Provisioner
+}
+
 func newQuotaRuntime(t *testing.T, provider string) *quotaRuntime {
+	return newQuotaRuntimeWithOptions(t, provider, quotaRuntimeOptions{})
+}
+
+func newQuotaRuntimeWithOptions(t *testing.T, provider string, opts quotaRuntimeOptions) *quotaRuntime {
 	t.Helper()
 	db := newTenantDeleteDBInfo(t)
 	testmysql.ResetMetaDB(t, db.Meta.DB())
@@ -452,7 +461,12 @@ func newQuotaRuntime(t *testing.T, provider string) *quotaRuntime {
 		t.Fatal(err)
 	}
 	prov := &quotaTestProvisioner{provider: provider}
-	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: prov, TokenSecret: tokenSecret})
+	configuredProvisioner := tenant.Provisioner(prov)
+	if opts.provisioner != nil {
+		configuredProvisioner = opts.provisioner(prov)
+	}
+	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: configuredProvisioner,
+		DefaultTenantProvider: opts.defaultTenantProvider, TokenSecret: tokenSecret})
 	t.Cleanup(server.Close)
 	return &quotaRuntime{meta: db.Meta, tenantID: tenantID, apiKey: apiKey, prov: prov, server: server}
 }
@@ -3352,7 +3366,6 @@ func TestProvisionClaimsFreePoolTenant(t *testing.T) {
 }
 
 func TestProvisionFallsBackWhenTenantPoolClaimCannotListManagedClusters(t *testing.T) {
-	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	prov := &tenantPoolNoListProvisioner{
 		fakeProvisioner: fakeProvisioner{
 			provider:      tenant.ProviderTiDBCloudNative,
@@ -3369,7 +3382,9 @@ func TestProvisionFallsBackWhenTenantPoolClaimCannotListManagedClusters(t *testi
 			},
 		},
 	}
-	rt.server.provisioner = prov
+	rt := newQuotaRuntimeWithOptions(t, tenant.ProviderTiDBCloudNative, quotaRuntimeOptions{
+		provisioner: func(*quotaTestProvisioner) tenant.Provisioner { return prov },
+	})
 
 	ts := httptest.NewServer(rt.server)
 	t.Cleanup(ts.Close)
