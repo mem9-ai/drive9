@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,31 @@ import (
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
+
+func newFollowerLeaderManager(t *testing.T, metaStore *meta.Store) *leader.Manager {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := metaStore.DB().Conn(ctx)
+	if err != nil {
+		t.Fatalf("open leader lock connection: %v", err)
+	}
+	lockName := fmt.Sprintf("d9:test-follower:%d", time.Now().UnixNano())
+	var acquired sql.NullInt64
+	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?, 0)`, lockName).Scan(&acquired); err != nil {
+		_ = conn.Close()
+		t.Fatalf("hold leader lock: %v", err)
+	}
+	if !acquired.Valid || acquired.Int64 != 1 {
+		_ = conn.Close()
+		t.Fatalf("hold leader lock result = %+v, want 1", acquired)
+	}
+	t.Cleanup(func() {
+		var released sql.NullInt64
+		_ = conn.QueryRowContext(context.Background(), `SELECT RELEASE_LOCK(?)`, lockName).Scan(&released)
+		_ = conn.Close()
+	})
+	return leader.NewManager(metaStore.DB(), leader.WithLockName(lockName))
+}
 
 func TestRetryTenantPoolClaimCASSucceedsOnEighthAttempt(t *testing.T) {
 	attempts := 0
@@ -351,7 +377,8 @@ func TestSharedTenantPoolRefillPlansWithServerOwnedSharedCredential(t *testing.T
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1",
 		sharedPoolBatchErr: errors.New("stop after managed pool planning")}
 	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
-		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: make([]byte, 32)})
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: make([]byte, 32),
+		Leader: newFollowerLeaderManager(t, metaStore)})
 	defer srv.Close()
 	now := time.Now().UTC()
 	if err := metaStore.CreateTenantPool(context.Background(), &meta.TenantPool{PoolID: "pool-shared-credential",
@@ -1457,7 +1484,7 @@ func TestAdminTenantPoolReplenishContinuesPastWatermarkToFillSlots(t *testing.T)
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1"}
 	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
 		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, SharedDBMaxTenants: 200,
-		TokenSecret: make([]byte, 32)})
+		TokenSecret: make([]byte, 32), Leader: newFollowerLeaderManager(t, metaStore)})
 	defer srv.Close()
 	ctx := context.Background()
 	now := time.Now().UTC()
