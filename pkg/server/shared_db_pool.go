@@ -637,6 +637,27 @@ func withManagedSharedDBMetadataRefillSlot(ctx context.Context, slot chan struct
 	return nil
 }
 
+func (s *Server) nextManagedSharedDBStatusPage(ctx context.Context, status string, cursor *int64, limit int) ([]*meta.SharedDB, error) {
+	if cursor == nil {
+		return nil, fmt.Errorf("shared db status cursor is required")
+	}
+	rows, err := s.meta.ListSharedDBsByStatusAfter(ctx, status, *cursor, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 && *cursor > 0 {
+		*cursor = 0
+		rows, err = s.meta.ListSharedDBsByStatusAfter(ctx, status, 0, limit)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(rows) > 0 {
+		*cursor = rows[len(rows)-1].ID
+	}
+	return rows, nil
+}
+
 func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows []*meta.SharedDB, onReady func([]int64)) {
 	owned := make([]*meta.SharedDB, 0, len(rows))
 	for _, row := range rows {
@@ -682,6 +703,10 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 	for _, row := range owned {
 		known[row.ID] = struct{}{}
 	}
+	var refillAfterID int64
+	for _, row := range owned {
+		refillAfterID = max(refillAfterID, row.ID)
+	}
 	var queueMu sync.Mutex
 	refillSlot := make(chan struct{}, 1)
 	takeLocked := func(limit int) []*meta.SharedDB {
@@ -714,7 +739,7 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 			}
 			queueMu.Unlock()
 
-			fresh, listErr := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusPending, 1000)
+			fresh, listErr := s.nextManagedSharedDBStatusPage(ctx, meta.SharedDBStatusPending, &refillAfterID, 1000)
 			if listErr != nil {
 				logger.Warn(ctx, "managed_shared_db_pool_metadata_refill_failed", zap.Error(listErr))
 			}
@@ -822,7 +847,7 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 }
 
 func (s *Server) resumeProvisioningManagedSharedDBPoolsWithCtx(ctx context.Context) {
-	rows, err := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusProvisioning, 1000)
+	rows, err := s.nextManagedSharedDBStatusPage(ctx, meta.SharedDBStatusProvisioning, &s.managedSharedDBProvisioningResumeCursor, 1000)
 	if err != nil {
 		logger.Warn(ctx, "managed_shared_db_pool_resume_list_failed", zap.String("status", meta.SharedDBStatusProvisioning), zap.Error(err))
 		return
@@ -835,7 +860,7 @@ func (s *Server) resumeProvisioningManagedSharedDBPoolsWithCtx(ctx context.Conte
 }
 
 func (s *Server) resumePendingManagedSharedDBPoolsWithCtx(ctx context.Context) {
-	rows, err := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusPending, 1000)
+	rows, err := s.nextManagedSharedDBStatusPage(ctx, meta.SharedDBStatusPending, &s.managedSharedDBPendingResumeCursor, 1000)
 	if err != nil {
 		logger.Warn(ctx, "managed_shared_db_pool_resume_list_failed", zap.String("status", meta.SharedDBStatusPending), zap.Error(err))
 		return

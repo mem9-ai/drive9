@@ -140,6 +140,14 @@ type SharedDB struct {
 	UpdatedAt               time.Time
 }
 
+// StuckSharedDBPoolFailure identifies the durable work released when a
+// pending or provisioning physical shared DB makes no progress before a
+// caller-provided cutoff.
+type StuckSharedDBPoolFailure struct {
+	DBID      int64
+	TenantIDs []string
+}
+
 // TenantPlacement maps one filesystem (fs_id) to the physical database that
 // hosts it. TargetDbID is reserved for future migrations; Epoch is reserved
 // for optimistic concurrency during migrations and stays 1 unless a migration
@@ -512,10 +520,156 @@ func (s *Store) MarkSharedDBPoolFailed(ctx context.Context, dbID int64) error {
 	return nil
 }
 
+// MarkStuckSharedDBPoolFailed atomically fails a stale physical pool and its
+// still-pending/provisioning shared tenants. The expected status and
+// updatedBefore cutoff form a CAS guard so concurrent metadata/schema progress
+// wins over the watchdog.
+func (s *Store) MarkStuckSharedDBPoolFailed(ctx context.Context, dbID int64, expectedStatus string, updatedBefore time.Time) (result *StuckSharedDBPoolFailure, changed bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "mark_stuck_shared_db_pool_failed", start, &err)
+	if dbID <= 0 {
+		return nil, false, fmt.Errorf("db_id must be positive")
+	}
+	if expectedStatus != SharedDBStatusPending && expectedStatus != SharedDBStatusProvisioning {
+		return nil, false, fmt.Errorf("unsupported stuck shared db status %q", expectedStatus)
+	}
+	cutoff := updatedBefore.UTC()
+	var tenantIDs []string
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		var status string
+		var updatedAt time.Time
+		if err := tx.QueryRowContext(ctx, `SELECT status, updated_at
+			FROM db_pool WHERE db_id = ? AND role = ? FOR UPDATE`, dbID, SharedDBRoleShared).
+			Scan(&status, &updatedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if status != expectedStatus || updatedAt.After(cutoff) {
+			return nil
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT t.id
+			FROM tenant_placements p
+			JOIN fs_registry f ON f.fs_id = p.fs_id
+			JOIN tenants t ON t.id = f.tenant_id
+			WHERE p.db_id = ? AND t.provider = ? AND t.status IN (?, ?)
+			ORDER BY t.id`, dbID, tidbCloudNativeSharedProvider, TenantPending, TenantProvisioning)
+		if err != nil {
+			return fmt.Errorf("list stuck shared tenants for db pool %d: %w", dbID, err)
+		}
+		for rows.Next() {
+			var tenantID string
+			if err := rows.Scan(&tenantID); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			tenantIDs = append(tenantIDs, tenantID)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		if _, err := tx.ExecContext(ctx, `UPDATE tenants t
+			JOIN fs_registry f ON f.tenant_id = t.id
+			JOIN tenant_placements p ON p.fs_id = f.fs_id
+			SET t.status = ?, t.updated_at = ?
+			WHERE p.db_id = ? AND t.provider = ? AND t.status IN (?, ?)`,
+			TenantFailed, now, dbID, tidbCloudNativeSharedProvider, TenantPending, TenantProvisioning); err != nil {
+			return fmt.Errorf("fail stuck shared tenants for db pool %d: %w", dbID, err)
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE db_pool SET status = ?, updated_at = ?
+			WHERE db_id = ? AND role = ? AND status = ? AND updated_at <= ?`,
+			SharedDBStatusFailed, now, dbID, SharedDBRoleShared, expectedStatus, cutoff)
+		if err != nil {
+			return fmt.Errorf("fail stuck shared db pool %d: %w", dbID, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected != 1 {
+			return nil
+		}
+		changed = true
+		result = &StuckSharedDBPoolFailure{
+			DBID: dbID, TenantIDs: append([]string(nil), tenantIDs...),
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if changed {
+		for _, tenantID := range tenantIDs {
+			s.apiKeys.evictTenant(tenantID)
+		}
+	}
+	return result, changed, nil
+}
+
+// ClearFailedSharedDBPoolClusterID durably records successful Cloud deletion
+// before the local failed pool row is removed. The expected cluster ID makes
+// retries safe if the row changed concurrently.
+func (s *Store) ClearFailedSharedDBPoolClusterID(ctx context.Context, dbID int64, clusterID string) (cleared bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "clear_failed_shared_db_pool_cluster_id", start, &err)
+	if dbID <= 0 {
+		return false, fmt.Errorf("db_id must be positive")
+	}
+	clusterID = strings.TrimSpace(clusterID)
+	if clusterID == "" {
+		return false, fmt.Errorf("cluster_id is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE db_pool
+		SET cluster_id = NULL, updated_at = ?
+		WHERE db_id = ? AND role = ? AND status = ? AND tenant_count = 0 AND cluster_id = ?`,
+		time.Now().UTC(), dbID, SharedDBRoleShared, SharedDBStatusFailed, clusterID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	return affected == 1, err
+}
+
+// DeleteFailedSharedDBPoolIfEmpty removes only a locally empty failed pool
+// whose Cloud identity has already been cleared (or never existed).
+func (s *Store) DeleteFailedSharedDBPoolIfEmpty(ctx context.Context, dbID int64) (deleted bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_failed_shared_db_pool_if_empty", start, &err)
+	if dbID <= 0 {
+		return false, fmt.Errorf("db_id must be positive")
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM db_pool
+		WHERE db_id = ? AND role = ? AND status = ? AND tenant_count = 0 AND cluster_id IS NULL
+			AND NOT EXISTS (SELECT 1 FROM tenant_placements p WHERE p.db_id = db_pool.db_id)`,
+		dbID, SharedDBRoleShared, SharedDBStatusFailed)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	return affected == 1, err
+}
+
 // ListSharedDBsByStatus returns shared DB-pool rows in stable ID order.
 func (s *Store) ListSharedDBsByStatus(ctx context.Context, status string, limit int) (out []*SharedDB, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_shared_dbs_by_status", start, &err)
+	return s.listSharedDBsByStatusAfter(ctx, status, 0, limit)
+}
+
+// ListSharedDBsByStatusAfter returns one stable keyset page ordered by db_id.
+func (s *Store) ListSharedDBsByStatusAfter(ctx context.Context, status string, afterID int64, limit int) (out []*SharedDB, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_shared_dbs_by_status_after", start, &err)
+	return s.listSharedDBsByStatusAfter(ctx, status, afterID, limit)
+}
+
+func (s *Store) listSharedDBsByStatusAfter(ctx context.Context, status string, afterID int64, limit int) (out []*SharedDB, err error) {
 	switch status {
 	case SharedDBStatusPending, SharedDBStatusProvisioning, SharedDBStatusActive, SharedDBStatusFailed, SharedDBStatusDraining:
 	default:
@@ -525,7 +679,7 @@ func (s *Store) ListSharedDBsByStatus(ctx context.Context, status string, limit 
 		limit = 1000
 	}
 	rows, err := s.db.QueryContext(ctx, "SELECT "+sharedDBSelectColumns+" FROM db_pool "+
-		"WHERE `role` = ? AND status = ? ORDER BY db_id LIMIT ?", SharedDBRoleShared, status, limit)
+		"WHERE `role` = ? AND status = ? AND db_id > ? ORDER BY db_id LIMIT ?", SharedDBRoleShared, status, afterID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list shared dbs in status %q: %w", status, err)
 	}

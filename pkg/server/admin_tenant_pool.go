@@ -46,8 +46,17 @@ type tenantPoolResumeJob struct {
 type tenantPoolWorkGate struct {
 	mu          sync.Mutex
 	running     bool
+	rerun       bool
+	scheduled   bool
 	nextAllowed time.Time
 }
+
+type tenantPoolReplenishDecision struct {
+	start         bool
+	scheduleAfter time.Duration
+}
+
+type tenantPoolWorkerStarter func(context.Context, func(context.Context)) bool
 
 type adminTenantPoolStatus string
 
@@ -1881,15 +1890,41 @@ func firstResultOrganizationID(results []*provisionTenantResult) string {
 }
 
 func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.TenantPool, cred tenant.CredentialProvisionRequest) {
+	s.replenishTenantPoolAsyncWithStarters(ctx, pool, cred, s.startServerWorker, s.startServerWorker)
+}
+
+func (s *Server) replenishTenantPoolLeaderAsync(ctx context.Context, pool *meta.TenantPool, cred tenant.CredentialProvisionRequest) {
+	s.replenishTenantPoolAsyncWithStarters(ctx, pool, cred, s.startTenantPoolLeaderReconcileWorker, s.startManagedSharedDBWorker)
+}
+
+func (s *Server) replenishTenantPoolAsyncWithStarters(
+	ctx context.Context,
+	pool *meta.TenantPool,
+	cred tenant.CredentialProvisionRequest,
+	workStarter tenantPoolWorkerStarter,
+	timerStarter tenantPoolWorkerStarter,
+) {
 	if pool == nil || pool.PoolID == "" || pool.OrganizationID == "" || pool.Size <= 0 {
 		return
 	}
-	if !s.beginTenantPoolReplenishment(pool.PoolID) {
+	if workStarter == nil || timerStarter == nil {
+		return
+	}
+	decision := s.requestTenantPoolReplenishmentAt(pool.PoolID, time.Now())
+	if !decision.start {
+		if decision.scheduleAfter > 0 {
+			s.scheduleTenantPoolReplenishment(ctx, pool, cred, decision.scheduleAfter, workStarter, timerStarter)
+		}
 		return
 	}
 	workerCtx := backgroundWithTrace(ctx)
-	if !s.startServerWorker(workerCtx, func(ctx context.Context) {
-		defer s.finishTenantPoolReplenishment(pool.PoolID)
+	if !workStarter(workerCtx, func(ctx context.Context) {
+		defer func() {
+			finished := s.finishTenantPoolReplenishmentAt(pool.PoolID, time.Now())
+			if finished.scheduleAfter > 0 {
+				s.scheduleTenantPoolReplenishment(ctx, pool, cred, finished.scheduleAfter, workStarter, timerStarter)
+			}
+		}()
 		replenishStarted := time.Now()
 		metricResult := "ok"
 		defer func() {
@@ -1988,8 +2023,29 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 			}
 		}
 	}) {
-		s.finishTenantPoolReplenishment(pool.PoolID)
+		_ = s.finishTenantPoolReplenishmentAt(pool.PoolID, time.Now())
 	}
+}
+
+func (s *Server) scheduleTenantPoolReplenishment(
+	ctx context.Context,
+	pool *meta.TenantPool,
+	cred tenant.CredentialProvisionRequest,
+	delay time.Duration,
+	workStarter tenantPoolWorkerStarter,
+	timerStarter tenantPoolWorkerStarter,
+) {
+	workerCtx := backgroundWithTrace(ctx)
+	_ = timerStarter(workerCtx, func(ctx context.Context) {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			s.replenishTenantPoolAsyncWithStarters(ctx, pool, cred, workStarter, timerStarter)
+		}
+	})
 }
 
 func (s *Server) tenantPoolBelowRefillWatermark(freeSize, poolSize int) bool {
@@ -2079,39 +2135,51 @@ func (s *Server) tenantPoolLock(poolID string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
-func (s *Server) beginTenantPoolReplenishment(poolID string) bool {
-	return s.beginTenantPoolReplenishmentAt(poolID, time.Now())
+func (s *Server) beginTenantPoolReplenishmentAt(poolID string, now time.Time) bool {
+	return s.requestTenantPoolReplenishmentAt(poolID, now).start
 }
 
-func (s *Server) beginTenantPoolReplenishmentAt(poolID string, now time.Time) bool {
+func (s *Server) requestTenantPoolReplenishmentAt(poolID string, now time.Time) tenantPoolReplenishDecision {
 	if strings.TrimSpace(poolID) == "" {
-		return false
+		return tenantPoolReplenishDecision{}
 	}
 	value, _ := s.tenantPoolReplenishJobs.LoadOrStore(poolID, &tenantPoolWorkGate{})
 	gate := value.(*tenantPoolWorkGate)
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
-	if gate.running || now.Before(gate.nextAllowed) {
-		return false
+	if gate.running {
+		gate.rerun = true
+		return tenantPoolReplenishDecision{}
+	}
+	if now.Before(gate.nextAllowed) {
+		gate.rerun = true
+		if gate.scheduled {
+			return tenantPoolReplenishDecision{}
+		}
+		gate.scheduled = true
+		return tenantPoolReplenishDecision{scheduleAfter: gate.nextAllowed.Sub(now)}
 	}
 	gate.running = true
-	return true
+	gate.rerun = false
+	gate.scheduled = false
+	return tenantPoolReplenishDecision{start: true}
 }
 
-func (s *Server) finishTenantPoolReplenishment(poolID string) {
-	s.finishTenantPoolReplenishmentAt(poolID, time.Now())
-}
-
-func (s *Server) finishTenantPoolReplenishmentAt(poolID string, now time.Time) {
+func (s *Server) finishTenantPoolReplenishmentAt(poolID string, now time.Time) tenantPoolReplenishDecision {
 	value, ok := s.tenantPoolReplenishJobs.Load(poolID)
 	if !ok {
-		return
+		return tenantPoolReplenishDecision{}
 	}
 	gate := value.(*tenantPoolWorkGate)
 	gate.mu.Lock()
+	defer gate.mu.Unlock()
 	gate.running = false
 	gate.nextAllowed = now.Add(tenantPoolReplenishMinInterval)
-	gate.mu.Unlock()
+	if !gate.rerun || gate.scheduled {
+		return tenantPoolReplenishDecision{}
+	}
+	gate.scheduled = true
+	return tenantPoolReplenishDecision{scheduleAfter: tenantPoolReplenishMinInterval}
 }
 
 func (s *Server) beginTenantPoolResumeScan(poolID string) bool {
@@ -2221,6 +2289,7 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_skipped", "provider", tenant.ProviderTiDBCloudNative, "pool_id", pool.PoolID, "organization_id", orgID, "reason", "pool_inactive", "pool_status", pool.Status, "duration_ms", durationMillis(claimStarted))...)
 		return nil, nil, false, false, nil
 	}
+	defer s.replenishTenantPoolAsync(ctx, pool, cred)
 	s.resumePendingTenantPoolAsync(ctx, pool, cred)
 	stageStarted = time.Now()
 	selection, err := retryTenantPoolClaimCAS(func() (tenantPoolClaimSelection, error) {

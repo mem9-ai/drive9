@@ -456,6 +456,16 @@ func main() {
 			server.DefaultManagedSharedDBMetadataPollInterval),
 		ManagedSharedDBProvisioningWorkers: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_PROVISIONING_WORKERS",
 			server.DefaultManagedSharedDBProvisioningWorkers),
+		TenantPoolReconcileInterval: envDuration("DRIVE9_TENANT_POOL_RECONCILE_INTERVAL",
+			server.DefaultTenantPoolReconcileInterval),
+		TenantPoolReconcileWorkers: envInt("DRIVE9_TENANT_POOL_RECONCILE_WORKERS",
+			server.DefaultTenantPoolReconcileWorkers),
+		ManagedSharedDBStuckTimeout: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_STUCK_TIMEOUT",
+			server.DefaultManagedSharedDBStuckTimeout),
+		ManagedSharedDBFailedCleanupInterval: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_INTERVAL",
+			server.DefaultManagedSharedDBFailedCleanupInterval),
+		ManagedSharedDBFailedCleanupBatchSize: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_BATCH_SIZE",
+			server.DefaultManagedSharedDBFailedCleanupBatchSize),
 		LegacyStarterProvisioner:        legacyStarterProvisioner,
 		TokenSecret:                     tokenSecret,
 		VaultMasterKey:                  vaultMasterKey,
@@ -683,6 +693,11 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_BATCH_SIZE physical pools per metadata list request (default and maximum: 30)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_POLL_INTERVAL delay between metadata list rounds (default: 15s)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_PROVISIONING_WORKERS concurrent shared schema-init workers (default: 100)
+  DRIVE9_TENANT_POOL_RECONCILE_INTERVAL leader logical-pool refill scan interval (default: 15s)
+  DRIVE9_TENANT_POOL_RECONCILE_WORKERS maximum concurrent leader logical-pool refills (default: 10)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_STUCK_TIMEOUT pending/provisioning no-progress timeout (default: 15m)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_INTERVAL failed physical-pool cleanup interval (default: 1m)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_BATCH_SIZE failed physical pools processed per cleanup pass (default: 5)
   DRIVE9_TIDBCLOUD_PRIVATE_ENDPOINT_HOST_MAP comma-separated public_host=private_host mappings (also accepts public_host:private_host);
                                              when set, disables legacy single-host private endpoint overrides
   DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST legacy tencentcloud private endpoint fallback host, used only when host map is unset

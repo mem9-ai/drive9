@@ -65,7 +65,15 @@ type quotaTestProvisioner struct {
 	metadataBatchWaitCalls      atomic.Int32
 	metadataBatchWaitHook       func(call int, clusters []*tenant.ClusterInfo)
 	metadataWaitErr             error
+	sharedPoolLoadFunc          func(int64, string, string) (*tenant.SharedDBPoolInfo, error)
 	calls                       []string
+}
+
+func (p *quotaTestProvisioner) LoadSharedDBPoolWithCredentials(_ context.Context, dbPoolID int64, dbPoolUUID, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+	if p.sharedPoolLoadFunc == nil {
+		return nil, nil
+	}
+	return p.sharedPoolLoadFunc(dbPoolID, dbPoolUUID, clusterID)
 }
 
 func (p *quotaTestProvisioner) recordCall(name string, req tenant.CredentialProvisionRequest, cluster *tenant.ClusterInfo, opts *tenant.QuotaUpdateOptions) {
@@ -2475,6 +2483,48 @@ func TestTenantPoolClaimMissTriggersPendingMetadataResume(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("tenant after pending resume = status %s host %q user %q, metadata batch waits=%d", tnt.Status, tnt.DBHost, tnt.DBUser, rt.prov.metadataBatchWaitCalls.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestTenantPoolClaimMissReplenishesZeroInventory(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	oldRetryWindow := schemaInitRetryWindow
+	schemaInitRetryWindow = 100 * time.Millisecond
+	t.Cleanup(func() { schemaInitRetryWindow = oldRetryWindow })
+	ctx := context.Background()
+	now := time.Now().UTC()
+	pool := &meta.TenantPool{
+		PoolID: "pool-zero-inventory", OrganizationID: "org-1", Size: 1,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := rt.meta.CreateTenantPool(ctx, pool); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+
+	res, gotPool, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
+		PublicKey: "public-1", PrivateKey: "private-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("claim from empty pool: %v", err)
+	}
+	if claimed || res != nil || gotPool == nil || gotPool.PoolID != pool.PoolID {
+		t.Fatalf("claim result res=%+v pool=%+v claimed=%v, want pool miss", res, gotPool, claimed)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		slots, countErr := rt.meta.CountTenantPoolFreeSlots(ctx, pool.OrganizationID)
+		if countErr != nil {
+			t.Fatalf("count free slots: %v", countErr)
+		}
+		if slots == pool.Size {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("durable free slots = %d, want %d after claim miss; batch calls=%d",
+				slots, pool.Size, rt.prov.batchPoolCalls.Load())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

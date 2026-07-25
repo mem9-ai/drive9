@@ -182,7 +182,6 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		if res.Status == meta.TenantProvisioning {
 			s.startProvisionedTenantSchemaInit(r.Context(), res)
 		}
-		s.replenishTenantPoolAsync(r.Context(), pool, cred)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(adminTenantCreateResponse{
