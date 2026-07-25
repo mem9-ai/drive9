@@ -58,7 +58,7 @@ const adminTenantPoolMetricsComponent = "admin_tenant_pool"
 const tenantPoolClaimCASRetryLimit = 8
 
 const (
-	sharedTenantPoolCreateConcurrency    = 10
+	sharedTenantPoolCreateConcurrency    = 30
 	tenantPoolReplenishMinInterval       = time.Second
 	tenantPoolPendingResumeEmptyInterval = 15 * time.Second
 )

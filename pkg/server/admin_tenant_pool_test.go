@@ -294,8 +294,8 @@ func TestSharedTenantPoolRefillPlansWithServerOwnedSharedCredential(t *testing.T
 	}
 }
 
-func TestSharedTenantPoolRefillLimitsTenantWorkersToTen(t *testing.T) {
-	const wantConcurrency = 10
+func TestSharedTenantPoolRefillLimitsTenantWorkersToThirty(t *testing.T) {
+	const wantConcurrency = 30
 	started := make(chan struct{}, wantConcurrency+1)
 	release := make(chan struct{})
 	done := make(chan []sharedPoolTenantCreateOutcome, 1)
@@ -319,7 +319,7 @@ func TestSharedTenantPoolRefillLimitsTenantWorkersToTen(t *testing.T) {
 	case <-started:
 		close(release)
 		<-done
-		t.Fatal("started an 11th tenant worker while 10 were still in flight")
+		t.Fatal("started a 31st tenant worker while 30 were still in flight")
 	case <-time.After(100 * time.Millisecond):
 	}
 	close(release)
