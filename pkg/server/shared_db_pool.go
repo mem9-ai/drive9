@@ -94,9 +94,10 @@ func managedSharedDBDSN(info *meta.SharedDB, password string) string {
 	query := "parseTime=true"
 	// Prefer backend-correct TLS. Local Docker TiDB is plaintext; a previously
 	// persisted "true"/"skip-verify" (warm-pool batch bug) would hang activation.
+	// IsLocalClustersBackend already implies sharedDBTLSMode() == "".
 	tlsMode := info.TLSMode
-	if backendMode := sharedDBTLSMode(); backendMode == "" || tidbcloudnative.IsLocalClustersBackend() {
-		tlsMode = backendMode
+	if tidbcloudnative.IsLocalClustersBackend() {
+		tlsMode = ""
 	}
 	if tlsMode != "" {
 		query += "&tls=" + tlsMode

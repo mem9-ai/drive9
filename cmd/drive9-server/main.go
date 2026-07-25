@@ -344,6 +344,9 @@ func main() {
 			IdleReapInterval:             envDuration("DRIVE9_POOL_IDLE_REAP_INTERVAL", 2*time.Minute),
 			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 			LeaderChecker:                leaderManager,
+			// Capture once at startup: LocalClustersAPI TiDB is plaintext.
+			// Do not re-read DRIVE9_TIDBCLOUD_CLUSTERS_BACKEND on each open.
+			SharedDBForcePlaintext: tidbcloudnative.IsLocalClustersBackend(),
 		}, enc)
 		defer pool.Close()
 

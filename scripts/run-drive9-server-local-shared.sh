@@ -61,7 +61,16 @@ KEEP_CONTAINERS="${KEEP_CONTAINERS:-0}"
 POST_CMD="${POST_CMD:-}"
 
 SESSION_ID="${DRIVE9_TIDBCLOUD_LOCAL_SESSION_ID:-drive9-local-shared-$$-$(date +%s)}"
-RUN_DIR="${DRIVE9_LOCAL_SHARED_RUN_DIR:-$(mktemp -d -t drive9-local-shared.XXXXXX)}"
+# Only auto-rm RUN_DIR on success when this script created it via mktemp.
+# A user-supplied DRIVE9_LOCAL_SHARED_RUN_DIR is never wiped (substring match
+# alone is unsafe for persistent paths that happen to contain the token).
+RUN_DIR_OWNED=0
+if [ -n "${DRIVE9_LOCAL_SHARED_RUN_DIR:-}" ]; then
+  RUN_DIR="$DRIVE9_LOCAL_SHARED_RUN_DIR"
+else
+  RUN_DIR="$(mktemp -d -t drive9-local-shared.XXXXXX)"
+  RUN_DIR_OWNED=1
+fi
 SERVER_BIN="${DRIVE9_LOCAL_SHARED_SERVER_BIN:-$RUN_DIR/drive9-server}"
 SERVER_LOG="${DRIVE9_LOCAL_SHARED_SERVER_LOG:-$RUN_DIR/drive9-server.log}"
 S3_DIR="${DRIVE9_S3_DIR:-$RUN_DIR/s3}"
@@ -251,12 +260,14 @@ cleanup() {
     "$DB_RUNTIME" network rm "$NETWORK" >/dev/null 2>&1 || true
   fi
 
-  if [ -d "$RUN_DIR" ] && [[ "$RUN_DIR" == *drive9-local-shared* ]]; then
+  if [ "$RUN_DIR_OWNED" = "1" ] && [ -d "$RUN_DIR" ]; then
     if [ "$rc" -eq 0 ]; then
       rm -rf "$RUN_DIR" 2>/dev/null || true
     else
       log "failed (rc=$rc); artifacts kept at $RUN_DIR (server log: $SERVER_LOG)"
     fi
+  elif [ "$rc" -ne 0 ]; then
+    log "failed (rc=$rc); artifacts at $RUN_DIR (server log: $SERVER_LOG; not auto-removed)"
   fi
 
   log "cleanup done"

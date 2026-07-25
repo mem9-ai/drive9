@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -87,6 +86,13 @@ type PoolConfig struct {
 	// IdleReapInterval is how often the idle reaper scans for idle backends.
 	// Defaults to defaultTenantPoolIdleReapInterval when IdleTimeout > 0.
 	IdleReapInterval time.Duration
+
+	// SharedDBForcePlaintext, when true, opens shared-schema DB handles without
+	// TLS regardless of the meta-persisted SharedDB.TLSMode. Set once at Pool
+	// construction for LocalClustersAPI (Docker/Podman TiDB has no TLS). Do not
+	// re-read process env on each open — a leaked DRIVE9_TIDBCLOUD_CLUSTERS_BACKEND
+	// must not silently strip TLS from production connections.
+	SharedDBForcePlaintext bool
 }
 
 // LeaderChecker reports whether the current process is the leader. Used by
@@ -1089,10 +1095,10 @@ func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) 
 	}
 	query := "parseTime=true"
 	// LocalClustersAPI TiDB has no TLS. Warm-pool batch once persisted tls=true and
-	// blocked schema ensure / free-tenant activation; force plaintext for local backend.
+	// blocked schema ensure / free-tenant activation; force plaintext when the
+	// pool was constructed for the local backend (not via a live env re-read).
 	tlsMode := info.TLSMode
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_TIDBCLOUD_CLUSTERS_BACKEND"))) {
-	case "local", "docker":
+	if p.cfg.SharedDBForcePlaintext {
 		tlsMode = ""
 	}
 	if tlsMode != "" {
