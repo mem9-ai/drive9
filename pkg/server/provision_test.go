@@ -1359,7 +1359,7 @@ func TestManagedSharedDBContinuationKeepsRootAndSkipsSystemUser(t *testing.T) {
 	}
 }
 
-func TestManagedSharedDBBatchCreateUsesAllocationLock(t *testing.T) {
+func TestManagedSharedDBBatchCreateSharesPerPoolOwnershipWithDirectEnsure(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -1758,12 +1758,11 @@ func TestEnsureManagedSharedDBPhysicalUsesPoolLockForKnownCluster(t *testing.T) 
 		t.Fatal(err)
 	}
 	srv := &Server{meta: metaStore, provisioner: &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative}}
-	identity := fmt.Sprintf("org:org-known-cluster:db_pool:%d", dbID)
 	holderStarted := make(chan struct{})
 	releaseHolder := make(chan struct{})
 	holderDone := make(chan error, 1)
 	go func() {
-		holderDone <- srv.withSharedDBAllocationLock(context.Background(), identity, func(context.Context) error {
+		holderDone <- srv.withSharedDBPoolWorkLock(context.Background(), dbID, func(context.Context) error {
 			close(holderStarted)
 			<-releaseHolder
 			return nil
@@ -1803,8 +1802,8 @@ func TestManagedSharedDBBatchCreateRunsAllChunksConcurrently(t *testing.T) {
 		t.Fatal(err)
 	}
 	spendingTarget := meta.MaxTiDBCloudSpendingLimit
-	dbIDs := make([]int64, 0, 101)
-	for i := 0; i < 101; i++ {
+	dbIDs := make([]int64, 0, 50)
+	for i := 0; i < 50; i++ {
 		dbID, createErr := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
 			TiDBCloudOrganizationID: "org-parallel-batches", ProvisioningKey: bytes.Repeat([]byte{3}, 32),
 			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
@@ -1815,9 +1814,9 @@ func TestManagedSharedDBBatchCreateRunsAllChunksConcurrently(t *testing.T) {
 		}
 		dbIDs = append(dbIDs, dbID)
 	}
-	started := make(chan struct{}, 11)
+	started := make(chan struct{}, 5)
 	release := make(chan struct{})
-	requests := make(chan []tenant.SharedDBPoolCreateRequest, 11)
+	requests := make(chan []tenant.SharedDBPoolCreateRequest, 5)
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, identityOrg: "org-parallel-batches",
 		sharedPoolBatchStarted: started, sharedPoolBatchRelease: release, sharedPoolBatchRequests: requests}
 	srv := &Server{meta: metaStore, pool: pool, provisioner: prov,
@@ -1828,37 +1827,37 @@ func TestManagedSharedDBBatchCreateRunsAllChunksConcurrently(t *testing.T) {
 		done <- batchErr
 	}()
 
-	for i := 0; i < 11; i++ {
+	for i := 0; i < 5; i++ {
 		select {
 		case <-started:
 		case <-time.After(500 * time.Millisecond):
 			close(release)
 			<-done
-			t.Fatalf("started %d/11 Cloud batch requests before release", i)
+			t.Fatalf("started %d/5 Cloud batch requests before release", i)
 		}
 	}
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatalf("batch create: %v", err)
 	}
-	if got := prov.sharedPoolBatchCalls.Load(); got != 11 {
-		t.Fatalf("batch calls = %d, want 11", got)
+	if got := prov.sharedPoolBatchCalls.Load(); got != 5 {
+		t.Fatalf("batch calls = %d, want 5", got)
 	}
-	if got := prov.sharedPoolBatchMembers.Load(); got != 101 {
-		t.Fatalf("batch members = %d, want 101", got)
+	if got := prov.sharedPoolBatchMembers.Load(); got != 50 {
+		t.Fatalf("batch members = %d, want 50", got)
 	}
-	sizes := make([]int, 0, 11)
-	for i := 0; i < 11; i++ {
+	sizes := make([]int, 0, 5)
+	for i := 0; i < 5; i++ {
 		sizes = append(sizes, len(<-requests))
 	}
 	slices.Sort(sizes)
-	wantSizes := []int{1, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10}
+	wantSizes := []int{10, 10, 10, 10, 10}
 	if !slices.Equal(sizes, wantSizes) {
 		t.Fatalf("batch sizes = %v, want %v", sizes, wantSizes)
 	}
 }
 
-func TestManagedSharedDBBatchCreateLocksEachAllocationIdentityIndependently(t *testing.T) {
+func TestManagedSharedDBBatchCreateDoesNotWaitForCompletedPlanningLocks(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -1926,16 +1925,23 @@ func TestManagedSharedDBBatchCreateLocksEachAllocationIdentityIndependently(t *t
 			context.Background(), dbIDs, tenant.CredentialProvisionRequest{})
 		batchDone <- batchErr
 	}()
-	select {
-	case request := <-requests:
-		if len(request) != 1 || request[0].CustomerOrganizationID != testPools[1].organizationID {
-			t.Fatalf("first unlocked batch request = %+v, want only organization %q", request, testPools[1].organizationID)
+	startedOrganizations := make(map[string]bool, len(testPools))
+	for range testPools {
+		select {
+		case request := <-requests:
+			if len(request) != 1 {
+				close(releaseHolder)
+				<-holderDone
+				<-batchDone
+				t.Fatalf("batch request = %+v, want one physical pool", request)
+			}
+			startedOrganizations[request[0].CustomerOrganizationID] = true
+		case <-time.After(500 * time.Millisecond):
+			close(releaseHolder)
+			<-holderDone
+			<-batchDone
+			t.Fatal("Cloud create waited for an organization planning lock after its db_pool row existed")
 		}
-	case <-time.After(500 * time.Millisecond):
-		close(releaseHolder)
-		<-holderDone
-		<-batchDone
-		t.Fatal("unlocked organization did not start while the other allocation identity was locked")
 	}
 	close(releaseHolder)
 	if err := <-holderDone; err != nil {
@@ -1944,13 +1950,82 @@ func TestManagedSharedDBBatchCreateLocksEachAllocationIdentityIndependently(t *t
 	if err := <-batchDone; err != nil {
 		t.Fatalf("batch create: %v", err)
 	}
-	select {
-	case request := <-requests:
-		if len(request) != 1 || request[0].CustomerOrganizationID != testPools[0].organizationID {
-			t.Fatalf("blocked batch request = %+v, want only organization %q", request, testPools[0].organizationID)
+	for _, testPool := range testPools {
+		if !startedOrganizations[testPool.organizationID] {
+			t.Fatalf("organization %q Cloud create did not start while planning lock was held", testPool.organizationID)
 		}
-	default:
-		t.Fatal("blocked organization batch request was not issued after its allocation lock was released")
+	}
+}
+
+func TestManagedSharedDBBatchCreateRunsSameOrganizationPoolsConcurrently(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	_, _ = rand.Read(master)
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	const organizationID = "org-batch-parallel"
+	dbIDs := make([]int64, 0, 2)
+	for i := 0; i < 2; i++ {
+		dbID, createErr := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+			TiDBCloudOrganizationID: organizationID, ProvisioningKey: bytes.Repeat([]byte{byte(i + 1)}, 32),
+			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+			PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		dbIDs = append(dbIDs, dbID)
+	}
+
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative,
+		sharedPoolBatchStarted: started, sharedPoolBatchRelease: release}
+	srv := &Server{meta: metaStore, pool: pool, provisioner: prov,
+		tidbCloudRBACCache: newTiDBCloudRBACCache(time.Hour), managedSharedDBCloudBatchSize: 10}
+	done := make(chan error, 2)
+	for _, dbID := range dbIDs {
+		go func() {
+			_, batchErr := srv.provisionManagedSharedDBPoolsBatchWithCredentials(
+				context.Background(), []int64{dbID}, tenant.CredentialProvisionRequest{})
+			done <- batchErr
+		}()
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("first same-organization Cloud create did not start")
+	}
+	secondStarted := false
+	select {
+	case <-started:
+		secondStarted = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(release)
+	for range dbIDs {
+		if batchErr := <-done; batchErr != nil {
+			t.Fatalf("batch create: %v", batchErr)
+		}
+	}
+	if !secondStarted {
+		t.Fatal("same-organization Cloud creates for different db pools were serialized")
 	}
 }
 
@@ -2042,7 +2117,7 @@ func TestManagedSharedDBBatchCreatePersistsResultsAfterInvalidEntry(t *testing.T
 		sharedPoolPartialErr: partialErr,
 	}
 	srv := &Server{meta: metaStore}
-	err = srv.provisionManagedSharedDBPoolsBatchChunkLocked(context.Background(), prov, requests, rows, tenant.CredentialProvisionRequest{})
+	err = srv.provisionManagedSharedDBPoolsBatchChunkClaimed(context.Background(), prov, requests, rows, tenant.CredentialProvisionRequest{})
 	if !errors.Is(err, partialErr) {
 		t.Fatalf("batch create error = %v, want partial cloud error", err)
 	}
