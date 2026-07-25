@@ -878,7 +878,7 @@ func TestBatchProvisionSharedDBPoolsRejectsMissingCustomerOrganizationBeforeRequ
 
 	p := &Provisioner{
 		apiURL: ts.URL, cloudProvider: "aws", region: "us-east-1",
-		defaultDatabaseName: DefaultDatabaseName, client: ts.Client(),
+		defaultDatabaseName: DefaultDatabaseName,
 	}
 	_, err := p.BatchProvisionSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolCreateRequest{{
 		DBPoolID: 41, DBPoolUUID: "11111111-1111-4111-8111-111111111111",
