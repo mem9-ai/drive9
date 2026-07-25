@@ -1160,6 +1160,30 @@ func TestAdminTenantPoolReplenishChunksLargeRefill(t *testing.T) {
 		t.Fatalf("create pool: %v", err)
 	}
 
+	lockHeld := make(chan struct{})
+	releaseLock := make(chan struct{})
+	lockDone := make(chan error, 1)
+	go func() {
+		lockDone <- metaStore.WithTenantPoolLock(ctx, pool.PoolID, func(context.Context) error {
+			close(lockHeld)
+			<-releaseLock
+			return nil
+		})
+	}()
+	select {
+	case <-lockHeld:
+	case err := <-lockDone:
+		t.Fatalf("hold tenant pool lock: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out acquiring tenant pool lock for test")
+	}
+	t.Cleanup(func() {
+		close(releaseLock)
+		if err := <-lockDone; err != nil {
+			t.Errorf("release tenant pool lock: %v", err)
+		}
+	})
+
 	srv.replenishTenantPoolAsync(ctx, pool, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",

@@ -1948,82 +1948,35 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 				return
 			}
 
-			// The common no-op path returns before taking either lock. Re-check all
-			// capacity state under the distributed lock before provisioning. Shared
-			// refills do one physical-DB-sized batch per lock hold; the loop below
-			// reacquires it only after this batch has been persisted.
-			batchCreated := 0
-			lock := s.tenantPoolLock(pool.PoolID)
-			lock.Lock()
-			lockErr := s.meta.WithTenantPoolLock(ctx, pool.PoolID, func(ctx context.Context) error {
-				current, err = s.meta.GetTenantPoolByID(ctx, pool.PoolID)
-				if err != nil {
-					if !errors.Is(err, meta.ErrNotFound) {
-						logger.Warn(ctx, "admin_tenant_pool_replenish_get_pool_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
-						metricResult = "error"
-					} else {
-						metricResult = "not_found"
-					}
-					return nil
-				}
-				if current.Status != meta.TenantPoolActive || current.OrganizationID == "" || current.Size <= 0 {
-					metricResult = "skipped"
-					return nil
-				}
-				freeSize, err = s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
-				if err != nil {
-					logger.Warn(ctx, "admin_tenant_pool_replenish_free_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
-					metricResult = "error"
-					return nil
-				}
-				s.recordTenantPoolCapacity(current.PoolID, current.OrganizationID, current.Size, freeSize)
-				if !s.tenantPoolBelowRefillWatermark(freeSize, current.Size) {
-					logger.Info(ctx, "admin_tenant_pool_replenish_skipped",
-						zap.String("pool_id", current.PoolID),
-						zap.String("organization_id", current.OrganizationID),
-						zap.Int("pool_size", current.Size),
-						zap.Int("free_size", freeSize),
-						zap.Float64("refill_free_ratio", s.effectiveTenantPoolRefillFreeRatio()))
-					metricResult = "noop"
-					return nil
-				}
-				// Trigger on active free tenants, but size refill against all free
-				// slots, including in-flight pending/provisioning tenants, so
-				// concurrent replenishment does not double-provision.
-				slotSize, err := s.meta.CountTenantPoolFreeSlots(ctx, current.OrganizationID)
-				if err != nil {
-					logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
-					metricResult = "error"
-					return nil
-				}
-				missing := current.Size - slotSize
-				if missing <= 0 {
-					metricResult = "noop"
-					return nil
-				}
-				if sharedProvider {
-					maxTenants, _ := s.managedSharedDBPolicy()
-					missing = managedSharedDBRefillBatchTenantCount(missing, maxTenants, s.managedSharedDBRefillPoolLimit)
-				}
-				results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
-				if err != nil {
-					logger.Warn(ctx, "admin_tenant_pool_replenish_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
-					metricResult = "cluster_error"
-					return nil
-				}
-				batchCreated = len(results)
-				for _, res := range results {
-					s.startProvisionedTenantSchemaInit(ctx, res)
-				}
-				return nil
-			})
-			lock.Unlock()
-			if lockErr != nil {
-				logger.Warn(ctx, "admin_tenant_pool_replenish_lock_failed", zap.String("pool_id", pool.PoolID), zap.Error(lockErr))
-				metricResult = adminTenantPoolMetricResult(lockErr)
+			// The initial watermark check above avoids a slot COUNT on the common
+			// no-op path. Re-read durable slots before every batch because other
+			// Pods may replenish this pool concurrently; over-create is bounded and
+			// acceptable, while pending/provisioning slots prevent under-counting.
+			slotSize, err := s.meta.CountTenantPoolFreeSlots(ctx, current.OrganizationID)
+			if err != nil {
+				logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+				metricResult = "error"
 				return
 			}
-			if !sharedProvider || batchCreated == 0 {
+			missing := current.Size - slotSize
+			if missing <= 0 {
+				metricResult = "noop"
+				return
+			}
+			if sharedProvider {
+				maxTenants, _ := s.managedSharedDBPolicy()
+				missing = managedSharedDBRefillBatchTenantCount(missing, maxTenants, s.managedSharedDBRefillPoolLimit)
+			}
+			results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
+			if err != nil {
+				logger.Warn(ctx, "admin_tenant_pool_replenish_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+				metricResult = "cluster_error"
+				return
+			}
+			for _, res := range results {
+				s.startProvisionedTenantSchemaInit(ctx, res)
+			}
+			if !sharedProvider || len(results) == 0 {
 				return
 			}
 		}
