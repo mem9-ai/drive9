@@ -1032,7 +1032,7 @@ func TestBatchLoadSharedDBPoolsUsesOneClusterListRequest(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+	p := &Provisioner{apiURL: ts.URL}
 	got, err := p.BatchLoadSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolLoadRequest{
 		{DBPoolID: 1, DBPoolUUID: firstUUID, ClusterID: "cluster-1"},
 		{DBPoolID: 2, DBPoolUUID: secondUUID, ClusterID: "cluster-2"},
