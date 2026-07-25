@@ -919,6 +919,60 @@ func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoo
 	return p.sharedDBPoolInfoFromCluster(dbPoolID, wantUUID, &matches[0])
 }
 
+// BatchLoadSharedDBPoolsWithCredentials refreshes multiple known managed
+// shared clusters with one TiDB Cloud list request. Incomplete endpoint/user
+// metadata is returned as an info with empty connection fields so callers can
+// keep the pool pending and poll it again later.
+func (p *Provisioner) BatchLoadSharedDBPoolsWithCredentials(ctx context.Context, requests []tenant.SharedDBPoolLoadRequest, req tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	if len(requests) == 0 {
+		return nil, nil
+	}
+	targets := make(map[string]tenant.SharedDBPoolLoadRequest, len(requests))
+	clusterIDs := make([]string, 0, len(requests))
+	for _, request := range requests {
+		if request.DBPoolID <= 0 {
+			return nil, fmt.Errorf("db pool id must be positive")
+		}
+		parsedUUID, err := uuid.Parse(strings.TrimSpace(request.DBPoolUUID))
+		if err != nil {
+			return nil, fmt.Errorf("db pool %d has invalid uuid %q: %w", request.DBPoolID, request.DBPoolUUID, err)
+		}
+		clusterID := strings.TrimSpace(request.ClusterID)
+		if clusterID == "" {
+			return nil, fmt.Errorf("db pool %d cluster id is required", request.DBPoolID)
+		}
+		request.DBPoolUUID = parsedUUID.String()
+		request.ClusterID = clusterID
+		targets[clusterID] = request
+		clusterIDs = append(clusterIDs, clusterID)
+	}
+	infos, err := p.listClusterInfosWithCredentials(ctx, publicKey, privateKey, clusterIDs, len(clusterIDs))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*tenant.SharedDBPoolInfo, 0, len(infos))
+	var partialErr error
+	for i := range infos {
+		target, ok := targets[strings.TrimSpace(infos[i].ClusterID)]
+		if !ok {
+			continue
+		}
+		result, convertErr := p.sharedDBPoolInfoFromCluster(target.DBPoolID, target.DBPoolUUID, &infos[i])
+		if convertErr != nil {
+			partialErr = errors.Join(partialErr, convertErr)
+			continue
+		}
+		out = append(out, result)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].DBPoolID < out[j].DBPoolID })
+	return out, partialErr
+}
+
 func (p *Provisioner) sharedDBPoolInfoFromCluster(dbPoolID int64, dbPoolUUID string, info *clusterInfo) (*tenant.SharedDBPoolInfo, error) {
 	if got := strings.TrimSpace(info.Labels[Drive9ManagedLabel]); got != "true" {
 		return nil, fmt.Errorf("cluster %q has %s label %q, want %q", info.ClusterID, Drive9ManagedLabel, got, "true")

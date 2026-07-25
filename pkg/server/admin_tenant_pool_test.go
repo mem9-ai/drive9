@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -38,14 +39,17 @@ func TestRetryTenantPoolClaimCASSucceedsOnEighthAttempt(t *testing.T) {
 	}
 }
 
-func TestRetryTenantPoolClaimCASStopsAfterLimit(t *testing.T) {
+func TestRetryTenantPoolClaimCASReturnsMissAfterLimit(t *testing.T) {
 	attempts := 0
-	_, err := retryTenantPoolClaimCAS(func() (int, error) {
+	got, err := retryTenantPoolClaimCAS(func() (int, error) {
 		attempts++
 		return 0, meta.ErrNotFound
 	})
-	if err == nil || !errors.Is(err, meta.ErrNotFound) {
-		t.Fatalf("err = %v, want wrapped ErrNotFound", err)
+	if err != nil {
+		t.Fatalf("err = %v, want nil for exhausted claim miss", err)
+	}
+	if got != 0 {
+		t.Fatalf("result = %d, want zero value", got)
 	}
 	if attempts != tenantPoolClaimCASRetryLimit {
 		t.Fatalf("attempts=%d, want %d", attempts, tenantPoolClaimCASRetryLimit)
@@ -312,6 +316,13 @@ func TestTenantPoolClaimConsumesMixedInventoryInGlobalAgeOrder(t *testing.T) {
 			CreatedAt: sharedCreatedAt, UpdatedAt: sharedCreatedAt}); err != nil {
 		t.Fatalf("CompleteSharedTenantPoolMember: %v", err)
 	}
+	free, err := rt.meta.CountFreeTenantPoolBindings(ctx, "org-mixed-age")
+	if err != nil {
+		t.Fatalf("CountFreeTenantPoolBindings: %v", err)
+	}
+	if free != 2 {
+		t.Fatalf("mixed native/shared free inventory = %d, want 2", free)
+	}
 
 	cred := tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}
 	first, _, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx, cred, nil)
@@ -333,7 +344,72 @@ func TestTenantPoolClaimConsumesMixedInventoryInGlobalAgeOrder(t *testing.T) {
 	}
 }
 
-func TestSharedTenantPoolRefillOneThousandPlansTenPoolsInOneBatch(t *testing.T) {
+func TestSharedTenantPoolRefillPlansTenPoolsInOneBatch(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer poolManager.Close()
+	poolManager.SetMetaStore(metaStore)
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1"}
+	secret := make([]byte, 32)
+	_, _ = rand.Read(secret)
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, SharedDBMaxTenants: 1, TokenSecret: secret})
+	defer srv.Close()
+	now := time.Now().UTC()
+	if err := metaStore.CreateTenantPool(context.Background(), &meta.TenantPool{PoolID: "pool-shared-10",
+		OrganizationID: "org-shared-ten-pools", Size: 10, Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	results, err := srv.createFreePoolTenants(context.Background(), "pool-shared-10", 10,
+		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}, nil)
+	if err != nil {
+		t.Fatalf("createFreePoolTenants: %v", err)
+	}
+	if len(results) != 10 {
+		t.Fatalf("results = %d, want 10", len(results))
+	}
+	for _, result := range results {
+		if result.Status != meta.TenantPending {
+			t.Fatalf("tenant %s status = %q, want pending while connection metadata is incomplete", result.TenantID, result.Status)
+		}
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 1 {
+		t.Fatalf("shared batch calls = %d, want 1", got)
+	}
+	if got := prov.sharedPoolBatchMembers.Load(); got != 10 {
+		t.Fatalf("shared batch members = %d, want 10", got)
+	}
+	var managedPools int
+	if err := metaStore.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM db_pool
+		WHERE org_id = ? AND status = ?`, "org-shared-ten-pools", meta.SharedDBStatusPending).Scan(&managedPools); err != nil {
+		t.Fatal(err)
+	}
+	if managedPools != 10 {
+		t.Fatalf("managed pools = %d, want 10", managedPools)
+	}
+	slots, err := metaStore.CountTenantPoolFreeSlots(context.Background(), "org-shared-ten-pools")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slots != 10 {
+		t.Fatalf("free slots = %d, want 10", slots)
+	}
+}
+
+func TestSharedTenantPoolRefillPlansWithServerOwnedSharedCredential(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -352,49 +428,123 @@ func TestSharedTenantPoolRefillOneThousandPlansTenPoolsInOneBatch(t *testing.T) 
 	defer poolManager.Close()
 	poolManager.SetMetaStore(metaStore)
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1",
-		managedClusters: []tenant.CloudClusterInfo{{OrganizationID: "org-shared"}}}
-	secret := make([]byte, 32)
-	_, _ = rand.Read(secret)
+		sharedPoolBatchErr: errors.New("stop after managed pool planning")}
 	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
-		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: secret})
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: make([]byte, 32)})
 	defer srv.Close()
 	now := time.Now().UTC()
-	if err := metaStore.CreateTenantPool(context.Background(), &meta.TenantPool{PoolID: "pool-shared-1000",
-		OrganizationID: "org-shared", Size: 1000, Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := metaStore.CreateTenantPool(context.Background(), &meta.TenantPool{PoolID: "pool-shared-credential",
+		OrganizationID: "org-shared", Size: 1, Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	results, err := srv.createFreePoolTenants(context.Background(), "pool-shared-1000", 1000,
-		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}, nil)
+	_, err = srv.createFreeSharedPoolTenants(context.Background(), "pool-shared-credential", 1,
+		tenant.CredentialProvisionRequest{PublicKey: "customer-public", PrivateKey: "customer-private"}, nil)
+	if err == nil {
+		t.Fatal("createFreeSharedPoolTenants succeeded, want forced batch failure")
+	}
+	rows, err := metaStore.ListSharedDBsByStatus(context.Background(), meta.SharedDBStatusPending, 10)
 	if err != nil {
-		t.Fatalf("createFreePoolTenants: %v", err)
+		t.Fatal(err)
 	}
-	if len(results) != 1000 {
-		t.Fatalf("results = %d, want 1000", len(results))
+	if len(rows) != 1 {
+		t.Fatalf("managed pools = %d, want 1", len(rows))
 	}
-	for _, result := range results {
-		if result.Status != meta.TenantPending {
-			t.Fatalf("tenant %s status = %q, want pending while connection metadata is incomplete", result.TenantID, result.Status)
+	wantProvisioningKey := sharedDBProvisioningKey(tenant.CredentialProvisionRequest{PublicKey: "shared-public"})
+	if !bytes.Equal(rows[0].ProvisioningKey, wantProvisioningKey) {
+		t.Fatalf("managed pool provisioning key = %x, want server-owned shared credential key %x",
+			rows[0].ProvisioningKey, wantProvisioningKey)
+	}
+	if got := prov.iamCalls.Load(); got != 0 {
+		t.Fatalf("identity lookups = %d, want 0", got)
+	}
+}
+
+func TestSharedTenantPoolRefillLimitsTenantWorkersToThirty(t *testing.T) {
+	const wantConcurrency = 30
+	started := make(chan struct{}, wantConcurrency+1)
+	release := make(chan struct{})
+	done := make(chan []sharedPoolTenantCreateOutcome, 1)
+	go func() {
+		done <- runSharedPoolTenantCreateWorkers(context.Background(), wantConcurrency+1, func() sharedPoolTenantCreateOutcome {
+			started <- struct{}{}
+			<-release
+			return sharedPoolTenantCreateOutcome{}
+		})
+	}()
+	for i := 0; i < wantConcurrency; i++ {
+		select {
+		case <-started:
+		case <-time.After(500 * time.Millisecond):
+			close(release)
+			<-done
+			t.Fatalf("started %d/%d tenant workers before release", i, wantConcurrency)
 		}
 	}
-	if got := prov.sharedPoolBatchCalls.Load(); got != 1 {
-		t.Fatalf("shared batch calls = %d, want 1", got)
+	select {
+	case <-started:
+		close(release)
+		<-done
+		t.Fatal("started a 31st tenant worker while 30 were still in flight")
+	case <-time.After(100 * time.Millisecond):
 	}
-	if got := prov.sharedPoolBatchMembers.Load(); got != 10 {
-		t.Fatalf("shared batch members = %d, want 10", got)
+	close(release)
+	outcomes := <-done
+	if len(outcomes) != wantConcurrency+1 {
+		t.Fatalf("outcomes = %d, want %d", len(outcomes), wantConcurrency+1)
 	}
-	rows, err := metaStore.ListSharedDBsByStatus(context.Background(), meta.SharedDBStatusPending, 20)
+}
+
+func TestSharedTenantPoolRefillUsesExistingCapacityWithoutIdentityLookup(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 10 {
-		t.Fatalf("managed pools = %d, want 10", len(rows))
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
 	}
-	slots, err := metaStore.CountTenantPoolFreeSlots(context.Background(), "org-shared")
+	enc, err := encrypt.NewLocalAESEncryptor(master)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if slots != 1000 {
-		t.Fatalf("free slots = %d, want 1000", slots)
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer poolManager.Close()
+	poolManager.SetMetaStore(metaStore)
+	passwordCipher, err := poolManager.Encrypt(context.Background(), []byte("shared-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metaStore.RegisterSharedDB(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-shared-existing", Host: "shared.example.com", Port: 4000,
+		User: "root", PasswordCipher: passwordCipher, Name: "tidbcloud_fs", MaxTenants: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := metaStore.CreateTenantPool(context.Background(), &meta.TenantPool{
+		PoolID: "pool-shared-existing", OrganizationID: "org-shared-existing", Size: 50,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, identityOrg: "org-shared-existing"}
+	srv := &Server{meta: metaStore, pool: poolManager, provisioner: prov,
+		tidbCloudRBACCache: newTiDBCloudRBACCache(time.Hour)}
+	results, err := srv.createFreeSharedPoolTenants(context.Background(), "pool-shared-existing", 50,
+		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}, nil)
+	if err != nil {
+		t.Fatalf("createFreeSharedPoolTenants: %v", err)
+	}
+	if len(results) != 50 {
+		t.Fatalf("results = %d, want 50", len(results))
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 0 {
+		t.Fatalf("physical batch calls = %d, want 0 for existing capacity", got)
+	}
+	if got := prov.iamCalls.Load(); got != 0 {
+		t.Fatalf("identity lookups = %d, want 0 when tenant pool organization is known", got)
 	}
 }
 
@@ -976,12 +1126,47 @@ func TestAdminTenantPoolReplenishSkipsAtFreeWatermark(t *testing.T) {
 	for i := 1; i <= 8; i++ {
 		insertAdminPoolFreeTenant(t, rt, pool.PoolID, pool.OrganizationID, i)
 	}
+	lockHeld := make(chan struct{})
+	releaseLock := make(chan struct{})
+	lockDone := make(chan error, 1)
+	go func() {
+		lockDone <- rt.meta.WithTenantPoolLock(ctx, pool.PoolID, func(context.Context) error {
+			close(lockHeld)
+			<-releaseLock
+			return nil
+		})
+	}()
+	select {
+	case <-lockHeld:
+	case err := <-lockDone:
+		t.Fatalf("hold tenant pool lock: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out acquiring tenant pool lock for test")
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseLock) }) }
+	t.Cleanup(func() {
+		release()
+		<-lockDone
+	})
 
 	rt.server.replenishTenantPoolAsync(ctx, pool, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	})
-	rt.server.forkWorkerWG.Wait()
+	workerDone := make(chan struct{})
+	go func() {
+		rt.server.forkWorkerWG.Wait()
+		close(workerDone)
+	}()
+	select {
+	case <-workerDone:
+	case <-time.After(time.Second):
+		release()
+		<-workerDone
+		t.Fatal("above-watermark replenish waited for the MySQL tenant pool lock")
+	}
+	release()
 
 	if got := rt.prov.batchPoolCalls.Load(); got != 0 {
 		t.Fatalf("batch pool calls = %d, want 0", got)
@@ -992,6 +1177,64 @@ func TestAdminTenantPoolReplenishSkipsAtFreeWatermark(t *testing.T) {
 	}
 	if free != 8 {
 		t.Fatalf("free size = %d, want 8", free)
+	}
+}
+
+func TestTenantPoolReplenishmentCoalescesConcurrentTriggersByPool(t *testing.T) {
+	s := &Server{}
+	now := time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC)
+
+	if !s.beginTenantPoolReplenishmentAt("pool-1", now) {
+		t.Fatal("first trigger was not accepted")
+	}
+	if s.beginTenantPoolReplenishmentAt("pool-1", now) {
+		t.Fatal("concurrent trigger for the same pool was accepted")
+	}
+	if !s.beginTenantPoolReplenishmentAt("pool-2", now) {
+		t.Fatal("trigger for a different pool was not accepted")
+	}
+
+	s.finishTenantPoolReplenishmentAt("pool-1", now)
+	if s.beginTenantPoolReplenishmentAt("pool-1", now.Add(tenantPoolReplenishMinInterval-time.Nanosecond)) {
+		t.Fatal("trigger was accepted during the per-pool minimum interval")
+	}
+	if !s.beginTenantPoolReplenishmentAt("pool-1", now.Add(tenantPoolReplenishMinInterval)) {
+		t.Fatal("trigger was not accepted after the per-pool minimum interval")
+	}
+}
+
+func TestTenantPoolPendingResumeScanCooldownAfterEmptyResult(t *testing.T) {
+	s := &Server{}
+	now := time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC)
+
+	if !s.beginTenantPoolResumeScanAt("pool-1", now) {
+		t.Fatal("first pending resume scan was not accepted")
+	}
+	if s.beginTenantPoolResumeScanAt("pool-1", now) {
+		t.Fatal("concurrent pending resume scan was accepted")
+	}
+	s.finishTenantPoolResumeScanAt("pool-1", now, true)
+	if s.beginTenantPoolResumeScanAt("pool-1", now.Add(tenantPoolPendingResumeEmptyInterval-time.Nanosecond)) {
+		t.Fatal("empty pending resume scan was retried during cooldown")
+	}
+	if !s.beginTenantPoolResumeScanAt("pool-1", now.Add(tenantPoolPendingResumeEmptyInterval)) {
+		t.Fatal("pending resume scan was not accepted after cooldown")
+	}
+}
+
+func TestTenantPoolPendingResumeRequestsRerunBeforeListing(t *testing.T) {
+	s := &Server{}
+	job := &tenantPoolResumeJob{}
+	s.tenantPoolResumeJobs.Store("pool-1", job)
+
+	s.resumePendingTenantPoolAsync(context.Background(), &meta.TenantPool{
+		PoolID:         "pool-1",
+		OrganizationID: "org-1",
+		Size:           10,
+	}, tenant.CredentialProvisionRequest{})
+
+	if !job.rerun.Load() {
+		t.Fatal("active metadata resume job did not receive a rerun request")
 	}
 }
 
@@ -1036,6 +1279,21 @@ func TestAdminTenantPoolReplenishBatchesBelowFreeWatermark(t *testing.T) {
 			t.Fatalf("free size = %d, want 10 after refill", free)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestManagedSharedDBRefillCapsOneWaveAtFiftyPhysicalPools(t *testing.T) {
+	if got := managedSharedDBRefillTenantCount(10_000, 100, 50); got != 5_000 {
+		t.Fatalf("refill tenant count = %d, want capacity of 50 physical pools", got)
+	}
+	if got := managedSharedDBRefillTenantCount(1_600, 100, 50); got != 1_600 {
+		t.Fatalf("refill tenant count = %d, want all 1600 tenants across 16 physical pools", got)
+	}
+	if got := managedSharedDBRefillTenantCount(100, 1, 50); got != 50 {
+		t.Fatalf("refill tenant count with one tenant per DB = %d, want 50", got)
+	}
+	if got := managedSharedDBRefillTenantCount(10_000, 100, 12); got != 1_200 {
+		t.Fatalf("refill tenant count with configured 12-DB limit = %d, want 1200", got)
 	}
 }
 

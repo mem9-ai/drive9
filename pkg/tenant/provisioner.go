@@ -140,6 +140,16 @@ type SharedDBPoolInfo struct {
 	DBName         string
 }
 
+type SharedDBPoolLoadRequest struct {
+	DBPoolID   int64
+	DBPoolUUID string
+	ClusterID  string
+}
+
+type SharedDBPoolBatchLoader interface {
+	BatchLoadSharedDBPoolsWithCredentials(ctx context.Context, requests []SharedDBPoolLoadRequest, req CredentialProvisionRequest) ([]*SharedDBPoolInfo, error)
+}
+
 type SharedDBPoolProvisioner interface {
 	Provisioner
 	// BatchProvisionSharedDBPoolsWithCredentials may return the successfully
