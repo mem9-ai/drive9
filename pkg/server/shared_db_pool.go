@@ -305,7 +305,7 @@ func (s *Server) managedSharedDBContinuation(ctx context.Context, dbID int64) ma
 		if err != nil {
 			return err
 		}
-		if poolInfo.Status != meta.SharedDBStatusProvisioning {
+		if poolInfo.Status != meta.SharedDBStatusPending && poolInfo.Status != meta.SharedDBStatusProvisioning {
 			return nil
 		}
 		return s.continueManagedSharedDBPoolOnce(poolCtx, dbID)
@@ -374,10 +374,18 @@ func retryManagedSharedDBContinuations(ctx context.Context, states []managedShar
 	}
 }
 
-func (s *Server) resumeManagedSharedDBPoolsWithCtx(ctx context.Context) {
-	rows, err := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusProvisioning, 1000)
+func (s *Server) resumeProvisioningManagedSharedDBPoolsWithCtx(ctx context.Context) {
+	s.resumeManagedSharedDBPoolsByStatus(ctx, meta.SharedDBStatusProvisioning)
+}
+
+func (s *Server) resumePendingManagedSharedDBPoolsWithCtx(ctx context.Context) {
+	s.resumeManagedSharedDBPoolsByStatus(ctx, meta.SharedDBStatusPending)
+}
+
+func (s *Server) resumeManagedSharedDBPoolsByStatus(ctx context.Context, status string) {
+	rows, err := s.meta.ListSharedDBsByStatus(ctx, status, 1000)
 	if err != nil {
-		logger.Warn(ctx, "managed_shared_db_pool_resume_list_failed", zap.Error(err))
+		logger.Warn(ctx, "managed_shared_db_pool_resume_list_failed", zap.String("status", status), zap.Error(err))
 		return
 	}
 	states := make([]managedSharedDBContinuation, 0, len(rows))
@@ -510,8 +518,9 @@ func (s *Server) ensureManagedSharedDBPhysicalLocked(ctx context.Context, poolIn
 			return nil, fmt.Errorf("managed shared cluster %q was not found", poolInfo.ClusterID)
 		}
 		results, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, []tenant.SharedDBPoolCreateRequest{{
-			DBPoolID: poolInfo.ID, DBPoolUUID: poolInfo.UUID, DatabaseName: poolInfo.Name, RootPassword: string(plainRootPassword),
-			SpendingLimitMonthly: *poolInfo.SpendingLimit,
+			DBPoolID: poolInfo.ID, DBPoolUUID: poolInfo.UUID,
+			CustomerOrganizationID: strings.TrimSpace(poolInfo.TiDBCloudOrganizationID), DatabaseName: poolInfo.Name,
+			RootPassword: string(plainRootPassword), SpendingLimitMonthly: *poolInfo.SpendingLimit,
 		}}, cred)
 		provisionErr = createErr
 		if createErr != nil && len(results) == 0 {
@@ -621,6 +630,9 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 		return fmt.Errorf("decrypt shared db root password: %w", err)
 	}
 	needsMetadata := poolInfo.ClusterID == "" || poolInfo.Host == "" || poolInfo.Port <= 0 || poolInfo.User == ""
+	if poolInfo.Status == meta.SharedDBStatusProvisioning && needsMetadata {
+		return fmt.Errorf("provisioning db pool %d has incomplete connection metadata", dbID)
+	}
 	if needsMetadata {
 		if poolInfo.SpendingLimit == nil {
 			return fmt.Errorf("managed db pool %d has no spending target", dbID)
@@ -640,8 +652,9 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 				return fmt.Errorf("managed shared cluster %q was not found", poolInfo.ClusterID)
 			}
 			results, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, []tenant.SharedDBPoolCreateRequest{{
-				DBPoolID: dbID, DBPoolUUID: poolInfo.UUID, DatabaseName: poolInfo.Name, RootPassword: string(plainRootPassword),
-				SpendingLimitMonthly: *poolInfo.SpendingLimit,
+				DBPoolID: dbID, DBPoolUUID: poolInfo.UUID,
+				CustomerOrganizationID: strings.TrimSpace(poolInfo.TiDBCloudOrganizationID), DatabaseName: poolInfo.Name,
+				RootPassword: string(plainRootPassword), SpendingLimitMonthly: *poolInfo.SpendingLimit,
 			}}, cred)
 			provisionErr = createErr
 			if createErr != nil && len(results) == 0 {

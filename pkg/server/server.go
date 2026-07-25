@@ -816,7 +816,10 @@ func (s *Server) startLeaderWorkers() {
 			s.resumeProvisioningTenantsWithCtx(workerCtx)
 		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			s.resumeManagedSharedDBPoolsWithCtx(workerCtx)
+			s.resumePendingManagedSharedDBPoolsWithCtx(workerCtx)
+		})
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			s.resumeProvisioningManagedSharedDBPoolsWithCtx(workerCtx)
 		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			s.resumeDeletingForkTenantsWithCtx(workerCtx)
@@ -846,7 +849,8 @@ func (s *Server) startLeaderWorkers() {
 						return
 					case <-ticker.C:
 						s.resumePendingTenantsWithCtx(workerCtx)
-						s.resumeManagedSharedDBPoolsWithCtx(workerCtx)
+						s.resumePendingManagedSharedDBPoolsWithCtx(workerCtx)
+						s.resumeProvisioningManagedSharedDBPoolsWithCtx(workerCtx)
 					}
 				}
 			})
@@ -1196,6 +1200,22 @@ func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
 				"reason", "tidbcloud_credentials_unavailable")
 		}
 		return
+	}
+	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
+		_, err := s.meta.GetSharedDBForTenant(ctx, t.ID)
+		if err == nil {
+			logger.Info(ctx, "resume_pending_shared_pool_tenant_skipped",
+				zap.String("tenant_id", t.ID),
+				zap.String("provider", t.Provider),
+				zap.String("reason", "managed_by_shared_pool"))
+			return
+		}
+		if !errors.Is(err, meta.ErrNotFound) {
+			logger.Error(ctx, "resume_pending_shared_pool_tenant_lookup_error",
+				zap.String("tenant_id", t.ID),
+				zap.Error(err))
+			return
+		}
 	}
 	if !isStalePendingTenant(time.Now().UTC(), t) {
 		return
@@ -5237,7 +5257,10 @@ func (s *Server) provisionTenantOnSharedDBMode(ctx context.Context, tenantID str
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_shared_pool_placed", "tenant_id", tenantID, "provider", tenant.ProviderTiDBCloudNativeShared, "db_pool_id", sharedDB.ID, "db_pool_uuid", sharedDB.UUID, "tidbcloud_org_id", sharedDB.TiDBCloudOrganizationID)...)
 	metricEvent(ctx, "tenant_provision", "provider", tenant.ProviderTiDBCloudNativeShared, "result", "shared_pool")
 	status := meta.TenantActive
-	if sharedDB.Status == meta.SharedDBStatusProvisioning {
+	switch sharedDB.Status {
+	case meta.SharedDBStatusPending:
+		status = meta.TenantPending
+	case meta.SharedDBStatusProvisioning:
 		status = meta.TenantProvisioning
 	}
 	return &provisionTenantResult{
@@ -5365,7 +5388,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 				return nil, reserveErr
 			}
-			if created || sharedDB.Status == meta.SharedDBStatusProvisioning {
+			if created || sharedDB.Status == meta.SharedDBStatusPending || sharedDB.Status == meta.SharedDBStatusProvisioning {
 				s.scheduleManagedSharedDBContinuation(ctx, sharedDB.ID)
 			}
 			return res, nil

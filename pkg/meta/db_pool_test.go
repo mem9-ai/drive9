@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -144,7 +145,7 @@ func TestRegisterSharedDBRoundTrip(t *testing.T) {
 	}
 }
 
-func TestCreateManagedSharedDBPoolPersistsDurableProvisioningPlan(t *testing.T) {
+func TestCreateManagedSharedDBPoolPersistsDurablePendingPlan(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 	spendingLimit := int64(2_000_000)
@@ -180,7 +181,7 @@ func TestCreateManagedSharedDBPoolPersistsDurableProvisioningPlan(t *testing.T) 
 	if _, err := uuid.Parse(got.UUID); err != nil {
 		t.Fatalf("managed db pool UUID = %q: %v", got.UUID, err)
 	}
-	if got.Status != SharedDBStatusProvisioning || got.MaxTenants != 100 || got.SpendingLimit == nil || *got.SpendingLimit != spendingLimit {
+	if got.Status != SharedDBStatusPending || got.MaxTenants != 100 || got.SpendingLimit == nil || *got.SpendingLimit != spendingLimit {
 		t.Fatalf("managed db pool policy = %+v", got)
 	}
 	if got.Host != "" || got.Port != 0 || got.User != "" || got.Name != "tidbcloud_fs" || string(got.PasswordCipher) != "durable-root-cipher" {
@@ -253,8 +254,8 @@ func TestMarkSharedDBPoolFailedRejectsPoolWithTenants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSharedDB: %v", err)
 	}
-	if got.Status != SharedDBStatusProvisioning {
-		t.Fatalf("status = %q, want provisioning", got.Status)
+	if got.Status != SharedDBStatusPending {
+		t.Fatalf("status = %q, want pending", got.Status)
 	}
 }
 
@@ -275,7 +276,7 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 		TiDBCloudOrganizationID: "org-a",
 		Host:                    "shared-a.example.com",
 		Port:                    5000,
-		User:                    "app",
+		User:                    "root",
 		PasswordCipher:          []byte("rotated-cipher"),
 		Name:                    "shared_db_a",
 		TLSMode:                 "true",
@@ -292,7 +293,7 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSharedDB: %v", err)
 	}
-	if got.Port != 5000 || got.User != "app" || string(got.PasswordCipher) != "rotated-cipher" ||
+	if got.Port != 5000 || got.User != "root" || string(got.PasswordCipher) != "rotated-cipher" ||
 		got.MaxTenants != 200 || got.TLSMode != "true" {
 		t.Fatalf("upsert did not refresh connection fields: %+v", got)
 	}
@@ -301,6 +302,43 @@ func TestRegisterSharedDBUpsertKeepsIDAndTenantCount(t *testing.T) {
 	}
 	if got.UUID != firstRecord.UUID {
 		t.Fatalf("UUID = %q after upsert, want preserved %q", got.UUID, firstRecord.UUID)
+	}
+}
+
+func TestRegisterSharedDBReusesLegacyRandomUUIDRow(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	result, err := s.db.ExecContext(ctx, `INSERT INTO db_pool
+		(uuid, org_id, `+"`role`"+`, db_host, db_port, db_user, db_password, db_name, db_tls, max_tenants, status)
+		VALUES ('6f5d93ac-e897-4e92-8489-01a24ac0fd2c', 'org-legacy-manual', 'shared',
+			'legacy.example.com', 4000, 'root', X'01', 'legacy_db', 'skip-verify', 100, 'active')`)
+	if err != nil {
+		t.Fatalf("insert legacy manual pool: %v", err)
+	}
+	legacyID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("legacy manual pool id: %v", err)
+	}
+
+	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-legacy-manual", Host: "legacy.example.com", Port: 5000,
+		User: "root", PasswordCipher: []byte("rotated"), Name: "legacy_db",
+		TLSMode: "true", MaxTenants: 200,
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	if dbID != legacyID {
+		t.Fatalf("RegisterSharedDB db_id = %d, want legacy row %d", dbID, legacyID)
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM db_pool
+		WHERE org_id = 'org-legacy-manual' AND db_host = 'legacy.example.com'
+			AND db_name = 'legacy_db' AND db_user = 'root'`).Scan(&count); err != nil {
+		t.Fatalf("count legacy manual pools: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("legacy manual pool rows = %d, want 1", count)
 	}
 }
 
@@ -861,7 +899,7 @@ func TestCompleteSharedTenantProvisionCommitsAtomically(t *testing.T) {
 	}
 }
 
-func TestCompleteSharedTenantProvisionKeepsTenantProvisioningUntilDBPoolIsActive(t *testing.T) {
+func TestCompleteSharedTenantProvisionKeepsTenantPendingUntilConnectionMetadataIsReady(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 	spendingLimit := MaxTiDBCloudSpendingLimit
@@ -893,8 +931,8 @@ func TestCompleteSharedTenantProvisionKeepsTenantProvisioningUntilDBPoolIsActive
 	if err != nil {
 		t.Fatalf("GetTenant: %v", err)
 	}
-	if tenant.Status != TenantProvisioning || tenant.Provider != "tidb_cloud_native_shared" {
-		t.Fatalf("tenant = provider %q status %q, want shared/provisioning", tenant.Provider, tenant.Status)
+	if tenant.Status != TenantPending || tenant.Provider != "tidb_cloud_native_shared" {
+		t.Fatalf("tenant = provider %q status %q, want shared/pending", tenant.Provider, tenant.Status)
 	}
 	placement, err := s.GetTenantPlacement(ctx, fsID)
 	if err != nil {
@@ -916,20 +954,57 @@ func TestManagedSharedDBPoolCloudResultSchemaAndActivation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateManagedSharedDBPool: %v", err)
 	}
+	partialCloudResult := &SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-managed", ClusterID: "cluster-managed",
+		PasswordCipher: []byte("root-cipher"), Name: "tidbcloud_fs", TLSMode: "true",
+	}
+	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, partialCloudResult); err != nil {
+		t.Fatalf("UpdateManagedSharedDBPoolCloudResult partial: %v", err)
+	}
+	got, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB after partial cloud result: %v", err)
+	}
+	if got.Status != SharedDBStatusPending || got.ClusterID != "cluster-managed" || got.Host != "" || got.Port != 0 || got.User != "" {
+		t.Fatalf("partial cloud result = %+v, want pending without connection metadata", got)
+	}
+
+	seedPendingTenant(t, s, "tenant-managed-pending")
+	virtualLimit := int64(1000)
+	if err := s.SetQuotaConfigPatch(ctx, "tenant-managed-pending", QuotaConfigPatch{TiDBCloudSpendingLimit: &virtualLimit}); err != nil {
+		t.Fatalf("SetQuotaConfigPatch: %v", err)
+	}
+	fsID, err := s.EnsureFsID(ctx, "tenant-managed-pending")
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	if err := s.CompleteSharedTenantProvision(ctx, "tenant-managed-pending", "tidb_cloud_native_shared", &TenantPlacement{
+		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
+	}, testOwnerKey("tenant-managed-pending")); err != nil {
+		t.Fatalf("CompleteSharedTenantProvision: %v", err)
+	}
+	pendingTenant, err := s.GetTenant(ctx, "tenant-managed-pending")
+	if err != nil {
+		t.Fatalf("GetTenant pending: %v", err)
+	}
+	if pendingTenant.Status != TenantPending {
+		t.Fatalf("tenant before connection metadata = %q, want pending", pendingTenant.Status)
+	}
+
 	cloudResult := &SharedDB{
 		ID: dbID, TiDBCloudOrganizationID: "org-managed", ClusterID: "cluster-managed",
 		Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("root-cipher"),
 		Name: "tidbcloud_fs", TLSMode: "true",
 	}
 	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, cloudResult); err != nil {
-		t.Fatalf("UpdateManagedSharedDBPoolCloudResult: %v", err)
+		t.Fatalf("UpdateManagedSharedDBPoolCloudResult complete: %v", err)
 	}
 	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, cloudResult); err != nil {
 		t.Fatalf("idempotent UpdateManagedSharedDBPoolCloudResult: %v", err)
 	}
-	got, err := s.GetSharedDB(ctx, dbID)
+	got, err = s.GetSharedDB(ctx, dbID)
 	if err != nil {
-		t.Fatalf("GetSharedDB after cloud result: %v", err)
+		t.Fatalf("GetSharedDB after complete cloud result: %v", err)
 	}
 	if got.TiDBCloudOrganizationID != "org-managed" || got.ClusterID != "cluster-managed" || got.Host != "shared.example.com" || got.Port != 4000 {
 		t.Fatalf("cloud result not persisted: %+v", got)
@@ -939,6 +1014,13 @@ func TestManagedSharedDBPoolCloudResultSchemaAndActivation(t *testing.T) {
 	}
 	if got.Status != SharedDBStatusProvisioning {
 		t.Fatalf("status after cloud result = %q, want provisioning", got.Status)
+	}
+	provisioningTenant, err := s.GetTenant(ctx, "tenant-managed-pending")
+	if err != nil {
+		t.Fatalf("GetTenant provisioning: %v", err)
+	}
+	if provisioningTenant.Status != TenantProvisioning {
+		t.Fatalf("tenant after connection metadata = %q, want provisioning", provisioningTenant.Status)
 	}
 
 	if err := s.UpdateSharedDBSchemaVersion(ctx, dbID, 17); err != nil {
@@ -960,6 +1042,42 @@ func TestManagedSharedDBPoolCloudResultSchemaAndActivation(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].ID != dbID {
 		t.Fatalf("active rows = %+v, want db %d", rows, dbID)
+	}
+}
+
+func TestManagedSharedDBPoolsAllowSameEndpointWithDifferentUsers(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	ids := make([]int64, 0, 2)
+	for i := 0; i < 2; i++ {
+		dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+			TiDBCloudOrganizationID: "org-shared-endpoint", ProvisioningKey: make([]byte, 32),
+			CloudProvider: "tencentcloud", Region: "ap-beijing", MaxTenants: 100,
+			SpendingLimit: &spendingLimit, PasswordCipher: []byte("root-cipher"), Name: "tidbcloud_fs",
+		})
+		if err != nil {
+			t.Fatalf("CreateManagedSharedDBPool %d: %v", i, err)
+		}
+		ids = append(ids, dbID)
+	}
+	for i, dbID := range ids {
+		if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, &SharedDB{
+			ID: dbID, TiDBCloudOrganizationID: "org-shared-endpoint", ClusterID: fmt.Sprintf("cluster-%d", i),
+			Host: "10.4.48.2", Port: 4000, User: fmt.Sprintf("prefix-%d.root", i),
+			PasswordCipher: []byte("root-cipher"), Name: "tidbcloud_fs", TLSMode: "skip-verify",
+		}); err != nil {
+			t.Fatalf("UpdateManagedSharedDBPoolCloudResult %d: %v", i, err)
+		}
+	}
+	for i, dbID := range ids {
+		got, err := s.GetSharedDB(ctx, dbID)
+		if err != nil {
+			t.Fatalf("GetSharedDB %d: %v", i, err)
+		}
+		if got.Status != SharedDBStatusProvisioning || got.User != fmt.Sprintf("prefix-%d.root", i) {
+			t.Fatalf("shared db %d = status %q user %q, want provisioning/prefix-%d.root", i, got.Status, got.User, i)
+		}
 	}
 }
 
@@ -996,9 +1114,16 @@ func TestActivateSharedTenantsBatchRequiresReadyPoolPlacementAndOwnerKey(t *test
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM tenant_api_keys WHERE tenant_id = ?`, "tenant-activate-2"); err != nil {
 		t.Fatalf("remove second owner key: %v", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE db_pool SET status = ?, db_host = 'h', db_port = 4000,
-		db_user = 'u', db_password = 'c', db_name = 'n', schema_version = 1 WHERE db_id = ?`, SharedDBStatusActive, dbID); err != nil {
-		t.Fatalf("mark pool active: %v", err)
+	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, &SharedDB{ID: dbID,
+		TiDBCloudOrganizationID: "org-activation", ClusterID: "cluster-activation", Host: "h", Port: 4000,
+		User: "u", PasswordCipher: []byte("c"), Name: "n"}); err != nil {
+		t.Fatalf("complete pool connection metadata: %v", err)
+	}
+	if err := s.UpdateSharedDBSchemaVersion(ctx, dbID, 1); err != nil {
+		t.Fatalf("mark pool schema ready: %v", err)
+	}
+	if err := s.ActivateSharedDBPool(ctx, dbID); err != nil {
+		t.Fatalf("activate pool: %v", err)
 	}
 
 	activated, err := s.ActivateSharedTenantsBatch(ctx, dbID, 100)
