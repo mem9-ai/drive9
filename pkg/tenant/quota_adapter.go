@@ -327,6 +327,10 @@ func (a *metaQuotaAdapter) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
 	return a.s.MarkMutationAppliedTx(tx, id)
 }
 
+func (a *metaQuotaAdapter) MarkMutationsAppliedTx(tx *sql.Tx, ids []int64) error {
+	return a.s.MarkMutationsAppliedTx(tx, ids)
+}
+
 func (a *metaQuotaAdapter) IsMutationAlreadyAppliedError(err error) bool {
 	return meta.IsMutationAlreadyAppliedError(err)
 }
@@ -338,6 +342,10 @@ func (a *metaQuotaAdapter) IncrMutationRetry(ctx context.Context, id int64, maxR
 func (a *metaQuotaAdapter) InTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	return a.s.InTx(ctx, fn)
 }
+
+// QuotaStoreIdentity returns the wrapped *meta.Store: every per-backend
+// adapter over the same underlying store shares one dispatcher batch group.
+func (a *metaQuotaAdapter) QuotaStoreIdentity() any { return a.s }
 
 func (a *metaQuotaAdapter) EnqueueObjectGCCandidate(ctx context.Context, c *meta.ObjectGCCandidateInput) error {
 	return a.s.EnqueueObjectGCCandidate(ctx, c)

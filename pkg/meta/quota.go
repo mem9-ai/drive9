@@ -1448,6 +1448,36 @@ func (s *Store) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
 	return nil
 }
 
+// MarkMutationsAppliedTx marks a batch of mutation log entries as applied
+// within a transaction. It mirrors MarkMutationAppliedTx: the WHERE clause
+// includes status = 'pending' and the update must affect exactly len(ids)
+// rows, so a concurrent replay worker flipping any row to applied first makes
+// the whole batch transaction roll back instead of double-applying counter
+// mutations. ids is bounded by the dispatcher batch size (<= 128).
+func (s *Store) MarkMutationsAppliedTx(tx *sql.Tx, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, time.Now().UTC())
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	res, err := tx.Exec(
+		`UPDATE quota_mutation_log SET status = 'applied', applied_at = ? WHERE id IN (`+strings.Join(placeholders, ",")+`) AND status = 'pending'`,
+		args...)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if int(n) != len(ids) {
+		return fmt.Errorf("batch mark applied affected %d of %d mutations: %w", n, len(ids), errMutationAlreadyApplied)
+	}
+	return nil
+}
+
 // IncrMutationRetry increments the retry count for a pending mutation.
 // The WHERE status='pending' guard mirrors MarkMutationAppliedTx and prevents
 // any caller (test fakes, backfill CLI, future refactors) from silently flipping

@@ -189,7 +189,9 @@ func (a *HTTPClustersAPI) DeleteCluster(ctx context.Context, publicKey, privateK
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
-		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationDeleteCluster, tidbCloudResultOK)
+		if resp.StatusCode == http.StatusNotFound {
+			recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationDeleteCluster, tidbCloudResultOK)
+		}
 		return nil
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
@@ -258,7 +260,9 @@ func (a *HTTPClustersAPI) DeleteBranch(ctx context.Context, publicKey, privateKe
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
-		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationDeleteBranch, tidbCloudResultOK)
+		if resp.StatusCode == http.StatusNotFound {
+			recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationDeleteBranch, tidbCloudResultOK)
+		}
 		return nil
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)

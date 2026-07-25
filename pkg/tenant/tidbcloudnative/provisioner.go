@@ -900,12 +900,14 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 		info := &createdClusters[i]
 		parsedUUID, err := uuid.Parse(strings.TrimSpace(info.Labels[Drive9DBPoolUUIDLabel]))
 		if err != nil {
-			return nil, fmt.Errorf("tidbcloud native shared batch response has invalid %s label for cluster %q", Drive9DBPoolUUIDLabel, info.ClusterID)
+			partialErr = errors.Join(partialErr, fmt.Errorf("tidbcloud native shared batch response has invalid %s label for cluster %q", Drive9DBPoolUUIDLabel, info.ClusterID))
+			continue
 		}
 		poolUUID := parsedUUID.String()
 		input, ok := inputsByUUID[poolUUID]
 		if !ok {
-			return nil, fmt.Errorf("tidbcloud native shared batch response returned unknown db pool uuid %s", poolUUID)
+			partialErr = errors.Join(partialErr, fmt.Errorf("tidbcloud native shared batch response returned unknown db pool uuid %s", poolUUID))
+			continue
 		}
 		result := &tenant.SharedDBPoolInfo{
 			DBPoolID: input.DBPoolID, DBPoolUUID: poolUUID, ClusterID: strings.TrimSpace(info.ClusterID),
@@ -913,12 +915,14 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 			Password:       input.RootPassword, DBName: databaseNames[poolUUID],
 		}
 		if result.ClusterID == "" {
-			return nil, fmt.Errorf("tidbcloud native shared batch response missing cluster id for db pool %s", poolUUID)
+			partialErr = errors.Join(partialErr, fmt.Errorf("tidbcloud native shared batch response missing cluster id for db pool %s", poolUUID))
+			continue
 		}
 		if !p.clusterProvisionMetadataIncomplete(info) {
 			result.Host, result.Port, err = p.resolveClusterEndpoint(info)
 			if err != nil {
-				return nil, err
+				partialErr = errors.Join(partialErr, err)
+				continue
 			}
 			result.Username = strings.TrimSpace(info.UserPrefix) + ".root"
 		}

@@ -1282,6 +1282,173 @@ func TestAdminTenantPoolReplenishBatchesBelowFreeWatermark(t *testing.T) {
 	}
 }
 
+func TestAdminTenantPoolReplenishChunksLargeRefill(t *testing.T) {
+	oldRetryWindow := schemaInitRetryWindow
+	schemaInitRetryWindow = 100 * time.Millisecond
+	t.Cleanup(func() { schemaInitRetryWindow = oldRetryWindow })
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer poolManager.Close()
+	poolManager.SetMetaStore(metaStore)
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1"}
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, SharedDBMaxTenants: 100,
+		TokenSecret: make([]byte, 32)})
+	defer srv.Close()
+	// Make each refill batch visible as one cloud batch. The production default
+	// is smaller, but the physical pool count is independent of this test knob.
+	srv.managedSharedDBCloudBatchSize = 250
+	ctx := context.Background()
+	now := time.Now().UTC()
+	pool := &meta.TenantPool{
+		PoolID:         "pool-large-refill",
+		OrganizationID: "org-1",
+		Size:           250,
+		Status:         meta.TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := metaStore.CreateTenantPool(ctx, pool); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+
+	lockHeld := make(chan struct{})
+	releaseLock := make(chan struct{})
+	lockDone := make(chan error, 1)
+	go func() {
+		lockDone <- metaStore.WithTenantPoolLock(ctx, pool.PoolID, func(context.Context) error {
+			close(lockHeld)
+			<-releaseLock
+			return nil
+		})
+	}()
+	select {
+	case <-lockHeld:
+	case err := <-lockDone:
+		t.Fatalf("hold tenant pool lock: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out acquiring tenant pool lock for test")
+	}
+	t.Cleanup(func() {
+		close(releaseLock)
+		if err := <-lockDone; err != nil {
+			t.Errorf("release tenant pool lock: %v", err)
+		}
+	})
+
+	srv.replenishTenantPoolAsync(ctx, pool, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if got := prov.sharedPoolBatchCalls.Load(); got >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("shared cloud batch calls = %d, want three bounded refill batches", prov.sharedPoolBatchCalls.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		free, err := metaStore.CountTenantPoolFreeSlots(ctx, pool.OrganizationID)
+		if err != nil {
+			t.Fatalf("count free: %v", err)
+		}
+		if free == pool.Size {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("free size = %d, want %d after refill", free, pool.Size)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestAdminTenantPoolReplenishContinuesPastWatermarkToFillSlots(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer poolManager.Close()
+	poolManager.SetMetaStore(metaStore)
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1"}
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, SharedDBMaxTenants: 200,
+		TokenSecret: make([]byte, 32)})
+	defer srv.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	pool := &meta.TenantPool{PoolID: "pool-watermark-shared", OrganizationID: "org-watermark-shared",
+		Size: 250, Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now}
+	if err := metaStore.CreateTenantPool(ctx, pool); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	passwordCipher, err := poolManager.Encrypt(ctx, []byte("shared-pass"))
+	if err != nil {
+		t.Fatalf("encrypt shared password: %v", err)
+	}
+	if _, err := metaStore.RegisterSharedDB(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: pool.OrganizationID,
+		Host:                    "shared.example.com",
+		Port:                    4000,
+		User:                    "root",
+		PasswordCipher:          passwordCipher,
+		Name:                    "tidbcloud_fs",
+		MaxTenants:              200,
+	}); err != nil {
+		t.Fatalf("register shared db: %v", err)
+	}
+	if _, err := srv.createFreeSharedPoolTenants(ctx, pool.PoolID, 100,
+		tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}, nil); err != nil {
+		t.Fatalf("seed shared pool: %v", err)
+	}
+
+	srv.replenishTenantPoolAsync(ctx, pool, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		free, err := metaStore.CountTenantPoolFreeSlots(ctx, pool.OrganizationID)
+		if err != nil {
+			t.Fatalf("count free slots: %v", err)
+		}
+		if free == pool.Size {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("free slots = %d, want %d after refill", free, pool.Size)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestManagedSharedDBRefillCapsOneWaveAtFiftyPhysicalPools(t *testing.T) {
 	if got := managedSharedDBRefillTenantCount(10_000, 100, 50); got != 5_000 {
 		t.Fatalf("refill tenant count = %d, want capacity of 50 physical pools", got)

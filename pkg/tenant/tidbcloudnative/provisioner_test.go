@@ -1547,6 +1547,38 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 	}
 }
 
+func TestBatchProvisionSharedDBPoolsPreservesValidResultsWhenResponseHasMalformedCluster(t *testing.T) {
+	const validUUID = "11111111-1111-4111-8111-111111111111"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-partial", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"clusters": []map[string]any{
+			{"clusterId": "cluster-valid", "state": "CREATING", "labels": map[string]string{
+				TiDBCloudOrganizationLabel: "org-1", Drive9DBPoolUUIDLabel: validUUID,
+			}},
+			{"clusterId": "cluster-malformed", "state": "CREATING", "labels": map[string]string{
+				TiDBCloudOrganizationLabel: "org-1", Drive9DBPoolUUIDLabel: "not-a-uuid",
+			}},
+		}})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{apiURL: ts.URL, cloudProvider: "aws", region: "us-east-1", defaultDatabaseName: DefaultDatabaseName}
+	got, err := p.BatchProvisionSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolCreateRequest{
+		{DBPoolID: 41, DBPoolUUID: validUUID, CustomerOrganizationID: "customer-org", RootPassword: "password", SpendingLimitMonthly: 1_000_000},
+		{DBPoolID: 42, DBPoolUUID: "22222222-2222-4222-8222-222222222222", CustomerOrganizationID: "customer-org", RootPassword: "password", SpendingLimitMonthly: 1_000_000},
+	}, tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
+	if err == nil || !strings.Contains(err.Error(), Drive9DBPoolUUIDLabel) {
+		t.Fatalf("error = %v, want malformed cluster validation error", err)
+	}
+	if len(got) != 1 || got[0].DBPoolID != 41 || got[0].ClusterID != "cluster-valid" {
+		t.Fatalf("valid results = %#v, want the valid cluster preserved", got)
+	}
+}
+
 func TestBatchProvisionSharedDBPoolsRejectsMissingCustomerOrganizationBeforeRequest(t *testing.T) {
 	var calls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

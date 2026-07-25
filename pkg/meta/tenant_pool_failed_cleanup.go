@@ -149,6 +149,9 @@ func (s *Store) MarkFailedNativeTenantDeleting(ctx context.Context, tenantID, or
 	if err != nil {
 		return false, fmt.Errorf("mark failed native tenant %s deleting: %w", tenantID, err)
 	}
+	if updated {
+		s.apiKeys.evictTenant(tenantID)
+	}
 	return updated, nil
 }
 
@@ -234,6 +237,9 @@ func (s *Store) MarkFailedSharedTenantDeleting(ctx context.Context, tenantID, or
 	}
 	if err != nil {
 		return false, fmt.Errorf("mark failed shared tenant %s deleting: %w", tenantID, err)
+	}
+	if updated {
+		s.apiKeys.evictTenant(tenantID)
 	}
 	return updated, nil
 }
