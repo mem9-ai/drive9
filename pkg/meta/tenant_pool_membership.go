@@ -27,6 +27,7 @@ type TenantWithPoolMembership struct {
 	Membership TenantPoolMembership
 }
 
+// Pin the join order because one organization's free memberships are much more selective than all shared tenants.
 const countFreeTenantPoolMembershipsSQL = `SELECT COUNT(*) FROM tenant_pool_memberships m
 	STRAIGHT_JOIN tenants t ON t.id = m.tenant_id
 	WHERE m.tidbcloud_organization_id = ? AND m.pool_status = ? AND t.provider = ?
