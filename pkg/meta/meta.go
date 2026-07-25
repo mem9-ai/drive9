@@ -386,6 +386,9 @@ func (s *Store) migrate() (err error) {
 	if err != nil {
 		return fmt.Errorf("parse meta schema statements: %w", err)
 	}
+	if err := migrateLegacyDBPoolClusterIDIndex(ctx, s.db); err != nil {
+		return err
+	}
 	if err := dropObsoleteMetaIndexes(ctx, s.db); err != nil {
 		return err
 	}
@@ -466,9 +469,13 @@ func expandManagedDBPoolSchema(ctx context.Context, db *sql.DB) error {
 		WHERE max_tenants > 0 AND tenant_count >= max_tenants AND soft_cap_reached = 0`); err != nil {
 		return fmt.Errorf("backfill db_pool.soft_cap_reached: %w", err)
 	}
-	exists, err := metaIndexExists(ctx, db, "db_pool", "uk_db_pool_cloud_resource")
+	return ensureDBPoolClusterIDUniqueIndex(ctx, db)
+}
+
+func ensureDBPoolClusterIDUniqueIndex(ctx context.Context, db *sql.DB) error {
+	exists, err := metaIndexExists(ctx, db, "db_pool", "uk_db_pool_cluster_id")
 	if err != nil {
-		return fmt.Errorf("check db_pool cloud resource unique index: %w", err)
+		return fmt.Errorf("check db_pool cluster id unique index: %w", err)
 	}
 	if !exists {
 		var duplicateCount int
@@ -479,14 +486,31 @@ func expandManagedDBPoolSchema(ctx context.Context, db *sql.DB) error {
 			GROUP BY cluster_id
 			HAVING COUNT(*) > 1
 		) duplicates`).Scan(&duplicateCount); err != nil {
-			return fmt.Errorf("preflight db_pool cloud resource unique index: %w", err)
+			return fmt.Errorf("preflight db_pool cluster id unique index: %w", err)
 		}
 		if duplicateCount > 0 {
-			return fmt.Errorf("preflight db_pool cloud resource unique index: found %d duplicate cluster ids", duplicateCount)
+			return fmt.Errorf("preflight db_pool cluster id unique index: found %d duplicate cluster ids", duplicateCount)
 		}
-		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX uk_db_pool_cloud_resource ON db_pool(cluster_id)`); err != nil && !isIgnorableMetaSchemaError(err) {
-			return fmt.Errorf("create db_pool cloud resource unique index: %w", err)
+		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX uk_db_pool_cluster_id ON db_pool(cluster_id)`); err != nil && !isIgnorableMetaSchemaError(err) {
+			return fmt.Errorf("create db_pool cluster id unique index: %w", err)
 		}
+	}
+	return nil
+}
+
+func migrateLegacyDBPoolClusterIDIndex(ctx context.Context, db *sql.DB) error {
+	exists, err := metaIndexExists(ctx, db, "db_pool", "uk_db_pool_cloud_resource")
+	if err != nil {
+		return fmt.Errorf("check legacy db_pool cluster id unique index: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+	if err := ensureDBPoolClusterIDUniqueIndex(ctx, db); err != nil {
+		return err
+	}
+	if err := dropMetaIndexIfExists(ctx, db, "db_pool", "uk_db_pool_cloud_resource"); err != nil {
+		return fmt.Errorf("drop legacy db_pool cluster id unique index: %w", err)
 	}
 	return nil
 }
@@ -761,7 +785,7 @@ func metaInitSchemaStatements() []string {
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			UNIQUE INDEX uk_db_pool_uuid (uuid),
-			UNIQUE INDEX uk_db_pool_cloud_resource (cluster_id),
+			UNIQUE INDEX uk_db_pool_cluster_id (cluster_id),
 			INDEX idx_db_pool_allocate (org_id, status, db_id),
 			INDEX idx_db_pool_provisioning_key (provisioning_key, status, db_id)
 		)`,
@@ -1055,26 +1079,6 @@ func dropObsoleteMetaIndexes(ctx context.Context, db *sql.DB) error {
 	}
 	if err := dropMetaIndexIfExists(ctx, db, "db_pool", "uk_db_pool_endpoint"); err != nil {
 		return fmt.Errorf("drop obsolete meta index uk_db_pool_endpoint: %w", err)
-	}
-	if err := replaceLegacyDBPoolCloudResourceUniqueIndex(ctx, db); err != nil {
-		return err
-	}
-	return nil
-}
-
-func replaceLegacyDBPoolCloudResourceUniqueIndex(ctx context.Context, db *sql.DB) error {
-	columns, err := loadMetaIndexColumns(ctx, db, "db_pool", "uk_db_pool_cloud_resource")
-	if err != nil {
-		return fmt.Errorf("inspect db_pool.uk_db_pool_cloud_resource: %w", err)
-	}
-	if !sameStringSlice(columns, []string{"org_id", "cluster_id"}) {
-		return nil
-	}
-	_, err = db.ExecContext(ctx, `ALTER TABLE db_pool
-		DROP INDEX uk_db_pool_cloud_resource,
-		ADD UNIQUE INDEX uk_db_pool_cloud_resource (cluster_id)`)
-	if err != nil {
-		return fmt.Errorf("replace db_pool.uk_db_pool_cloud_resource: %w", err)
 	}
 	return nil
 }
