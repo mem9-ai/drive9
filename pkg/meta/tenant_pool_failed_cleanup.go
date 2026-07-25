@@ -99,6 +99,39 @@ func (s *Store) ListFailedSharedTenantCleanupCandidates(ctx context.Context, org
 	return scanTenantRows(rows)
 }
 
+// ListFailedSharedTenantCleanupCandidatesByDB scopes one cleanup pass to an
+// exact failed physical pool while reusing the same tenant cleanup state
+// machine as request-triggered organization cleanup.
+func (s *Store) ListFailedSharedTenantCleanupCandidatesByDB(ctx context.Context, dbID int64, updatedBefore time.Time, limit int) (out []Tenant, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_failed_shared_tenant_cleanup_candidates_by_db", start, &err)
+	if dbID <= 0 {
+		return nil, fmt.Errorf("db_id must be positive")
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT
+			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
+			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
+			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
+			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at
+		FROM tenant_placements p
+		JOIN fs_registry f ON f.fs_id = p.fs_id
+		JOIN tenants t ON t.id = f.tenant_id
+		JOIN db_pool d ON d.db_id = p.db_id
+		WHERE p.db_id = ? AND d.role = ? AND d.status = ?
+			AND t.provider = ? AND t.status = ? AND t.updated_at <= ?
+		ORDER BY t.updated_at ASC, t.id ASC
+		LIMIT ?`, dbID, SharedDBRoleShared, SharedDBStatusFailed,
+		tidbCloudNativeSharedProvider, TenantFailed, updatedBefore.UTC(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list failed shared tenant cleanup candidates for db pool %d: %w", dbID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	return scanTenantRows(rows)
+}
+
 // MarkFailedNativeTenantDeleting claims an eligible native cleanup row. The
 // locked read and update both repeat the organization and pool-claim boundary.
 func (s *Store) MarkFailedNativeTenantDeleting(ctx context.Context, tenantID, organizationID string, updatedBefore time.Time) (updated bool, err error) {

@@ -174,21 +174,28 @@ func TestManagedSharedDBWorkerConfigDefaultsAndOverrides(t *testing.T) {
 	t.Cleanup(defaults.Close)
 	if defaults.managedSharedDBCloudBatchSize != 10 || defaults.managedSharedDBRefillPoolLimit != 50 ||
 		defaults.managedSharedDBMetadataWorkers != 15 || defaults.managedSharedDBMetadataBatchSize != 30 ||
-		defaults.managedSharedDBMetadataPollInterval != 15*time.Second || defaults.managedSharedDBProvisioningWorkers != 100 {
-		t.Fatalf("managed shared defaults = cloud_batch(%d) refill_pool_limit(%d) metadata(%d,%d,%s) provisioning(%d)",
+		defaults.managedSharedDBMetadataPollInterval != 15*time.Second || defaults.managedSharedDBProvisioningWorkers != 100 ||
+		defaults.tenantPoolReconcileInterval != 15*time.Second || defaults.managedSharedDBStuckTimeout != 15*time.Minute ||
+		defaults.tenantPoolReconcileWorkers != 10 || defaults.managedSharedDBFailedCleanupInterval != time.Minute || defaults.managedSharedDBFailedCleanupBatchSize != 5 {
+		t.Fatalf("managed shared defaults = cloud_batch(%d) refill_pool_limit(%d) metadata(%d,%d,%s) provisioning(%d) reconcile(%s) stuck(%s) failed_cleanup(%s,%d)",
 			defaults.managedSharedDBCloudBatchSize, defaults.managedSharedDBRefillPoolLimit,
 			defaults.managedSharedDBMetadataWorkers, defaults.managedSharedDBMetadataBatchSize, defaults.managedSharedDBMetadataPollInterval,
-			defaults.managedSharedDBProvisioningWorkers)
+			defaults.managedSharedDBProvisioningWorkers, defaults.tenantPoolReconcileInterval, defaults.managedSharedDBStuckTimeout,
+			defaults.managedSharedDBFailedCleanupInterval, defaults.managedSharedDBFailedCleanupBatchSize)
 	}
 	overrides := NewWithConfig(Config{
 		ManagedSharedDBCloudBatchSize: 3, ManagedSharedDBRefillPoolLimit: 12,
 		ManagedSharedDBMetadataWorkers: 5, ManagedSharedDBMetadataBatchSize: 6, ManagedSharedDBMetadataPollInterval: 7 * time.Second,
-		ManagedSharedDBProvisioningWorkers: 8,
+		ManagedSharedDBProvisioningWorkers: 8, TenantPoolReconcileInterval: 9 * time.Second, ManagedSharedDBStuckTimeout: 11 * time.Minute,
+		TenantPoolReconcileWorkers:           4,
+		ManagedSharedDBFailedCleanupInterval: 2 * time.Minute, ManagedSharedDBFailedCleanupBatchSize: 3,
 	})
 	t.Cleanup(overrides.Close)
 	if overrides.managedSharedDBCloudBatchSize != 3 || overrides.managedSharedDBRefillPoolLimit != 12 ||
 		overrides.managedSharedDBMetadataWorkers != 5 || overrides.managedSharedDBMetadataBatchSize != 6 ||
-		overrides.managedSharedDBMetadataPollInterval != 7*time.Second || overrides.managedSharedDBProvisioningWorkers != 8 {
+		overrides.managedSharedDBMetadataPollInterval != 7*time.Second || overrides.managedSharedDBProvisioningWorkers != 8 ||
+		overrides.tenantPoolReconcileInterval != 9*time.Second || overrides.tenantPoolReconcileWorkers != 4 || overrides.managedSharedDBStuckTimeout != 11*time.Minute ||
+		overrides.managedSharedDBFailedCleanupInterval != 2*time.Minute || overrides.managedSharedDBFailedCleanupBatchSize != 3 {
 		t.Fatalf("managed shared overrides were not retained")
 	}
 	capped := NewWithConfig(Config{ManagedSharedDBCloudBatchSize: 11, ManagedSharedDBMetadataWorkers: 16, ManagedSharedDBMetadataBatchSize: 31})
@@ -196,6 +203,42 @@ func TestManagedSharedDBWorkerConfigDefaultsAndOverrides(t *testing.T) {
 	if capped.managedSharedDBCloudBatchSize != 10 || capped.managedSharedDBMetadataWorkers != 15 || capped.managedSharedDBMetadataBatchSize != 30 {
 		t.Fatalf("managed shared safety caps = cloud batch %d, metadata workers %d, metadata batch %d",
 			capped.managedSharedDBCloudBatchSize, capped.managedSharedDBMetadataWorkers, capped.managedSharedDBMetadataBatchSize)
+	}
+}
+
+func TestNextManagedSharedDBStatusPageAdvancesAndWrapsKeysetCursor(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	ctx := context.Background()
+	spendingLimit := meta.MaxTiDBCloudSpendingLimit
+	ids := make([]int64, 0, 3)
+	for i := 0; i < 3; i++ {
+		id, err := metaStore.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+			TiDBCloudOrganizationID: fmt.Sprintf("org-keyset-%d", i), ProvisioningKey: bytes.Repeat([]byte{byte(i + 1)}, 32),
+			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+		})
+		if err != nil {
+			t.Fatalf("CreateManagedSharedDBPool %d: %v", i, err)
+		}
+		ids = append(ids, id)
+	}
+	srv := &Server{meta: metaStore}
+	var cursor int64
+	first, err := srv.nextManagedSharedDBStatusPage(ctx, meta.SharedDBStatusPending, &cursor, 2)
+	if err != nil || len(first) != 2 || first[0].ID != ids[0] || first[1].ID != ids[1] {
+		t.Fatalf("first page = %+v, cursor=%d, err=%v", first, cursor, err)
+	}
+	second, err := srv.nextManagedSharedDBStatusPage(ctx, meta.SharedDBStatusPending, &cursor, 2)
+	if err != nil || len(second) != 1 || second[0].ID != ids[2] {
+		t.Fatalf("second page = %+v, cursor=%d, err=%v", second, cursor, err)
+	}
+	third, err := srv.nextManagedSharedDBStatusPage(ctx, meta.SharedDBStatusPending, &cursor, 2)
+	if err != nil || len(third) != 2 || third[0].ID != ids[0] || third[1].ID != ids[1] {
+		t.Fatalf("wrapped page = %+v, cursor=%d, err=%v", third, cursor, err)
 	}
 }
 

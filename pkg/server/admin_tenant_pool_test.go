@@ -18,6 +18,7 @@ import (
 
 	"github.com/mem9-ai/drive9/internal/testmysql"
 	"github.com/mem9-ai/drive9/pkg/encrypt"
+	"github.com/mem9-ai/drive9/pkg/leader"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
@@ -1038,6 +1039,68 @@ func TestTenantPoolReplenishmentCoalescesConcurrentTriggersByPool(t *testing.T) 
 	}
 }
 
+func TestTenantPoolReplenishmentRerunsCoalescedTriggerAfterWorkerFinishes(t *testing.T) {
+	s := &Server{}
+	now := time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC)
+
+	first := s.requestTenantPoolReplenishmentAt("pool-1", now)
+	if !first.start || first.scheduleAfter != 0 {
+		t.Fatalf("first decision = %+v, want immediate start", first)
+	}
+	coalesced := s.requestTenantPoolReplenishmentAt("pool-1", now)
+	if coalesced.start || coalesced.scheduleAfter != 0 {
+		t.Fatalf("running decision = %+v, want coalesced trigger", coalesced)
+	}
+	finished := s.finishTenantPoolReplenishmentAt("pool-1", now)
+	if finished.start || finished.scheduleAfter != tenantPoolReplenishMinInterval {
+		t.Fatalf("finish decision = %+v, want one delayed rerun", finished)
+	}
+	cooldown := s.requestTenantPoolReplenishmentAt("pool-1", now.Add(tenantPoolReplenishMinInterval/2))
+	if cooldown.start || cooldown.scheduleAfter != 0 {
+		t.Fatalf("cooldown decision = %+v, want existing delayed rerun to absorb trigger", cooldown)
+	}
+	rerun := s.requestTenantPoolReplenishmentAt("pool-1", now.Add(tenantPoolReplenishMinInterval))
+	if !rerun.start || rerun.scheduleAfter != 0 {
+		t.Fatalf("rerun decision = %+v, want immediate start after cooldown", rerun)
+	}
+}
+
+func TestLeaderTenantPoolReplenishmentTimerDoesNotConsumeWorkSlot(t *testing.T) {
+	s := &Server{}
+	pool := &meta.TenantPool{PoolID: "pool-leader-rerun", OrganizationID: "org-leader-rerun", Size: 1}
+	value, _ := s.tenantPoolReplenishJobs.LoadOrStore(pool.PoolID, &tenantPoolWorkGate{})
+	gate := value.(*tenantPoolWorkGate)
+	gate.mu.Lock()
+	gate.rerun = true
+	gate.scheduled = true
+	gate.nextAllowed = time.Now()
+	gate.mu.Unlock()
+
+	workStarted := make(chan struct{}, 1)
+	workStarter := func(context.Context, func(context.Context)) bool {
+		workStarted <- struct{}{}
+		return true
+	}
+	timerStarted := make(chan struct{}, 1)
+	timerStarter := func(ctx context.Context, fn func(context.Context)) bool {
+		timerStarted <- struct{}{}
+		go fn(ctx)
+		return true
+	}
+
+	s.scheduleTenantPoolReplenishment(context.Background(), pool, tenant.CredentialProvisionRequest{}, 0, workStarter, timerStarter)
+	select {
+	case <-timerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("leader rerun timer did not start")
+	}
+	select {
+	case <-workStarted:
+	case <-time.After(time.Second):
+		t.Fatal("leader rerun did not reacquire a refill work slot")
+	}
+}
+
 func TestTenantPoolPendingResumeScanCooldownAfterEmptyResult(t *testing.T) {
 	s := &Server{}
 	now := time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC)
@@ -1281,6 +1344,165 @@ func TestAdminTenantPoolReplenishContinuesPastWatermarkToFillSlots(t *testing.T)
 			t.Fatalf("free slots = %d, want %d after refill", free, pool.Size)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestSharedTenantPoolLeaderReconcilerRefillsZeroInventory(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer poolManager.Close()
+	poolManager.SetMetaStore(metaStore)
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1"}
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, SharedDBMaxTenants: 100,
+		TokenSecret: make([]byte, 32)})
+	defer srv.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	pool := &meta.TenantPool{PoolID: "pool-leader-reconcile", OrganizationID: "org-leader-reconcile",
+		Size: 1, Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now}
+	if err := metaStore.CreateTenantPool(ctx, pool); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+
+	srv.reconcileSharedTenantPoolsWithCtx(ctx)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		slots, countErr := metaStore.CountTenantPoolFreeSlots(ctx, pool.OrganizationID)
+		if countErr != nil {
+			t.Fatalf("count free slots: %v", countErr)
+		}
+		if slots == pool.Size {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("free slots = %d, want %d after leader reconcile", slots, pool.Size)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestLeaderTenantPoolReplenishmentDoesNotStartOnFollower(t *testing.T) {
+	mgr := leader.NewManager(nil)
+	srv := &Server{leader: mgr, tenantPoolReconcileSlots: make(chan struct{}, 1)}
+	srv.replenishTenantPoolLeaderAsync(context.Background(), &meta.TenantPool{
+		PoolID: "pool-follower", OrganizationID: "org-follower", Size: 1, Status: meta.TenantPoolActive,
+	}, tenant.CredentialProvisionRequest{})
+	value, ok := srv.tenantPoolReplenishJobs.Load("pool-follower")
+	if !ok {
+		t.Fatal("follower trigger did not initialize its local coalescing gate")
+	}
+	gate := value.(*tenantPoolWorkGate)
+	gate.mu.Lock()
+	running := gate.running
+	gate.mu.Unlock()
+	if running || len(srv.tenantPoolReconcileSlots) != 0 {
+		t.Fatalf("follower refill running=%v slots=%d, want no leader-owned work", running, len(srv.tenantPoolReconcileSlots))
+	}
+}
+
+func TestTenantPoolLeaderReconcileWorkersBoundConcurrency(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := &Server{forkWorkerCtx: ctx, tenantPoolReconcileSlots: make(chan struct{}, 1)}
+	firstStarted := make(chan struct{}, 1)
+	release := make(chan struct{})
+	if !srv.startTenantPoolLeaderReconcileWorker(ctx, func(context.Context) {
+		firstStarted <- struct{}{}
+		<-release
+	}) {
+		t.Fatal("first leader reconcile worker did not start")
+	}
+	<-firstStarted
+	secondStarted := make(chan struct{}, 1)
+	secondResult := make(chan bool, 1)
+	go func() {
+		secondResult <- srv.startTenantPoolLeaderReconcileWorker(ctx, func(context.Context) {
+			secondStarted <- struct{}{}
+		})
+	}()
+	select {
+	case result := <-secondResult:
+		t.Fatalf("second leader reconcile returned %v while the only slot was occupied", result)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case result := <-secondResult:
+		if !result {
+			t.Fatal("second leader reconcile did not start after a slot was released")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second leader reconcile remained blocked after a slot was released")
+	}
+	<-secondStarted
+	srv.forkWorkerWG.Wait()
+}
+
+func TestManagedSharedDBStuckReconcilerFailsPoolAndPlacedTenant(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	ctx := context.Background()
+	now := time.Now().UTC()
+	logicalPool := &meta.TenantPool{PoolID: "logical-stuck", OrganizationID: "org-stuck", Size: 1,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now}
+	if err := metaStore.CreateTenantPool(ctx, logicalPool); err != nil {
+		t.Fatalf("CreateTenantPool: %v", err)
+	}
+	spendingLimit := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-stuck", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	tenantID := "tenant-stuck-reconcile"
+	if err := metaStore.InsertTenant(ctx, &meta.Tenant{ID: tenantID, Status: meta.TenantPending,
+		Provider: tenant.ProviderTiDBCloudNative, DBPasswordCipher: []byte{}, SchemaVersion: 1,
+		CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("InsertTenant: %v", err)
+	}
+	fsID, err := metaStore.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	if err := metaStore.CompleteSharedTenantPoolMember(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared,
+		&meta.TenantPlacement{FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared},
+		&meta.TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: "org-stuck",
+			PoolID: logicalPool.PoolID, PoolStatus: meta.TenantPoolBindingFree}); err != nil {
+		t.Fatalf("CompleteSharedTenantPoolMember: %v", err)
+	}
+	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, now.Add(-20*time.Minute), dbID); err != nil {
+		t.Fatalf("age db pool: %v", err)
+	}
+
+	srv := &Server{meta: metaStore, managedSharedDBStuckTimeout: 15 * time.Minute}
+	srv.reconcileStuckManagedSharedDBPoolsWithCtx(ctx)
+	pool, err := metaStore.GetSharedDB(ctx, dbID)
+	if err != nil || pool.Status != meta.SharedDBStatusFailed {
+		t.Fatalf("pool after stuck reconcile = %+v, %v", pool, err)
+	}
+	gotTenant, err := metaStore.GetTenant(ctx, tenantID)
+	if err != nil || gotTenant.Status != meta.TenantFailed {
+		t.Fatalf("tenant after stuck reconcile = %+v, %v", gotTenant, err)
 	}
 }
 

@@ -783,7 +783,8 @@ func metaInitSchemaStatements() []string {
 			UNIQUE INDEX uk_db_pool_uuid (uuid),
 			UNIQUE INDEX uk_db_pool_cluster_id (cluster_id),
 			INDEX idx_db_pool_allocate (org_id, status, db_id),
-			INDEX idx_db_pool_provisioning_key (provisioning_key, status, db_id)
+			INDEX idx_db_pool_provisioning_key (provisioning_key, status, db_id),
+			INDEX idx_db_pool_role_status_id (` + "`role`" + `, status, db_id)
 		)`,
 		// tenant_placements records which physical database (db_pool row) hosts
 		// each filesystem (fs_registry row). A missing row means the tenant
@@ -914,7 +915,8 @@ func metaInitSchemaStatements() []string {
 			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			UNIQUE INDEX uk_tidbcloud_pool_org (organization_id),
-			INDEX idx_tidbcloud_pool_status (status, created_at)
+			INDEX idx_tidbcloud_pool_status (status, created_at),
+			INDEX idx_tidbcloud_pool_status_id (status, pool_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_pool_memberships (
 			tenant_id                    VARCHAR(64) PRIMARY KEY,
@@ -2126,6 +2128,37 @@ func (s *Store) GetTenantPoolByID(ctx context.Context, poolID string) (out *Tena
 	row := s.db.QueryRowContext(ctx, `SELECT pool_id, organization_id, size, status, created_at, updated_at
 		FROM tenant_tidbcloud_pools WHERE pool_id = ?`, poolID)
 	return scanTenantPoolRow(row)
+}
+
+// ListTenantPoolsByStatusAfter returns one stable keyset page ordered by pool ID.
+func (s *Store) ListTenantPoolsByStatusAfter(ctx context.Context, status TenantPoolStatus, afterPoolID string, limit int) (out []*TenantPool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_tidbcloud_pools_by_status_after", start, &err)
+	switch status {
+	case TenantPoolActive, TenantPoolDeleting:
+	default:
+		return nil, fmt.Errorf("unsupported tenant pool status %q", status)
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT pool_id, organization_id, size, status, created_at, updated_at
+		FROM tenant_tidbcloud_pools
+		WHERE status = ? AND pool_id > ?
+		ORDER BY pool_id
+		LIMIT ?`, status, strings.TrimSpace(afterPoolID), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list tenant pools in status %q: %w", status, err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		rec, scanErr := scanTenantPoolRow(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) UpdateTenantPoolOrganization(ctx context.Context, poolID, organizationID string) (err error) {
