@@ -248,6 +248,88 @@ func TestSharedTenantPoolRefillPlansTenPoolsInOneBatch(t *testing.T) {
 	}
 }
 
+func TestSharedTenantPoolRefillStagesWholePhysicalWaveBeforePlacement(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer poolManager.Close()
+	poolManager.SetMetaStore(metaStore)
+	now := time.Now().UTC()
+	if err := metaStore.CreateTenantPool(context.Background(), &meta.TenantPool{
+		PoolID: "pool-stage-wave", OrganizationID: "org-stage-wave", Size: 6,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	batchStarted := make(chan struct{}, 1)
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1",
+		sharedPoolBatchStarted: batchStarted}
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	srv := &Server{meta: metaStore, pool: poolManager, provisioner: prov,
+		defaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, sharedDBMaxTenants: 2,
+		managedSharedDBCloudBatchSize: 10, forkWorkerCtx: workerCtx, forkWorkerCancel: workerCancel}
+
+	lockConn, err := metaStore.DB().Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockConn.ExecContext(context.Background(), `LOCK TABLES tenant_quota_config WRITE`); err != nil {
+		_ = lockConn.Close()
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := srv.createFreeSharedPoolTenants(ctx, "pool-stage-wave", 6,
+			tenant.CredentialProvisionRequest{}, nil)
+		done <- err
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_, _ = lockConn.ExecContext(context.Background(), `UNLOCK TABLES`)
+		_ = lockConn.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("shared refill did not stop after releasing quota table lock")
+		}
+		srv.Close()
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var managedPools int
+		if err := metaStore.DB().QueryRowContext(context.Background(),
+			`SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, "org-stage-wave").Scan(&managedPools); err != nil {
+			t.Fatal(err)
+		}
+		if managedPools == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("physical pools staged before placement = %d, want complete three-pool wave", managedPools)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-batchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Cloud batch did not start while tenant quota writes were still blocked")
+	}
+}
+
 func TestSharedTenantPoolRefillPlansWithServerOwnedSharedCredential(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -298,13 +380,17 @@ func TestSharedTenantPoolRefillPlansWithServerOwnedSharedCredential(t *testing.T
 	}
 }
 
-func TestSharedTenantPoolRefillLimitsTenantWorkersToThirty(t *testing.T) {
+func TestSharedTenantPoolRefillLimitsPhysicalPartitionWorkersToThirty(t *testing.T) {
 	const wantConcurrency = 30
 	started := make(chan struct{}, wantConcurrency+1)
 	release := make(chan struct{})
 	done := make(chan []sharedPoolTenantCreateOutcome, 1)
+	partitions := make([]sharedPoolTenantPartition, wantConcurrency+1)
+	for i := range partitions {
+		partitions[i] = sharedPoolTenantPartition{db: &meta.SharedDB{ID: int64(i + 1)}, tenantCount: 1}
+	}
 	go func() {
-		done <- runSharedPoolTenantCreateWorkers(context.Background(), wantConcurrency+1, func() sharedPoolTenantCreateOutcome {
+		done <- runSharedPoolTenantPartitionWorkers(context.Background(), partitions, func(sharedPoolTenantPartition) sharedPoolTenantCreateOutcome {
 			started <- struct{}{}
 			<-release
 			return sharedPoolTenantCreateOutcome{}
@@ -333,7 +419,7 @@ func TestSharedTenantPoolRefillLimitsTenantWorkersToThirty(t *testing.T) {
 	}
 }
 
-func TestSharedTenantPoolRefillUsesExistingCapacityWithoutIdentityLookup(t *testing.T) {
+func TestSharedTenantPoolRefillStagesDedicatedCapacityWithoutIdentityLookup(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -355,10 +441,11 @@ func TestSharedTenantPoolRefillUsesExistingCapacityWithoutIdentityLookup(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := metaStore.RegisterSharedDB(context.Background(), &meta.SharedDB{
+	existingDBID, err := metaStore.RegisterSharedDB(context.Background(), &meta.SharedDB{
 		TiDBCloudOrganizationID: "org-shared-existing", Host: "shared.example.com", Port: 4000,
 		User: "root", PasswordCipher: passwordCipher, Name: "tidbcloud_fs", MaxTenants: 100,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
@@ -368,7 +455,8 @@ func TestSharedTenantPoolRefillUsesExistingCapacityWithoutIdentityLookup(t *test
 	}); err != nil {
 		t.Fatal(err)
 	}
-	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, identityOrg: "org-shared-existing"}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1",
+		identityOrg: "org-shared-existing"}
 	srv := &Server{meta: metaStore, pool: poolManager, provisioner: prov,
 		tidbCloudRBACCache: newTiDBCloudRBACCache(time.Hour)}
 	results, err := srv.createFreeSharedPoolTenants(context.Background(), "pool-shared-existing", 50,
@@ -379,11 +467,24 @@ func TestSharedTenantPoolRefillUsesExistingCapacityWithoutIdentityLookup(t *test
 	if len(results) != 50 {
 		t.Fatalf("results = %d, want 50", len(results))
 	}
-	if got := prov.sharedPoolBatchCalls.Load(); got != 0 {
-		t.Fatalf("physical batch calls = %d, want 0 for existing capacity", got)
+	if got := prov.sharedPoolBatchCalls.Load(); got != 1 {
+		t.Fatalf("physical batch calls = %d, want one dedicated refill wave", got)
 	}
 	if got := prov.iamCalls.Load(); got != 0 {
 		t.Fatalf("identity lookups = %d, want 0 when tenant pool organization is known", got)
+	}
+	var existingTenantCount, physicalPoolCount int
+	if err := metaStore.DB().QueryRowContext(context.Background(),
+		`SELECT tenant_count FROM db_pool WHERE db_id = ?`, existingDBID).Scan(&existingTenantCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.DB().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, "org-shared-existing").Scan(&physicalPoolCount); err != nil {
+		t.Fatal(err)
+	}
+	if existingTenantCount != 0 || physicalPoolCount != 2 {
+		t.Fatalf("existing tenant_count=%d physical pools=%d, want dedicated staged pool and untouched existing capacity",
+			existingTenantCount, physicalPoolCount)
 	}
 }
 

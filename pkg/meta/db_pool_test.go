@@ -10,6 +10,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/mem9-ai/drive9/pkg/logger"
 )
 
 func TestSharedDBCapacityBounds(t *testing.T) {
@@ -943,6 +947,40 @@ func TestCompleteSharedTenantProvisionSoftHardCapacityAndHysteresis(t *testing.T
 	}
 	if _, err := s.GetTenantPlacement(ctx, fs1); err != nil {
 		t.Fatalf("remaining placement: %v", err)
+	}
+}
+
+func TestCompleteSharedTenantProvisionCapacityMissDoesNotLogError(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-capacity-log", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 1, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE db_pool SET status = ?, cluster_id = 'cluster-capacity-log'
+		WHERE db_id = ?`, SharedDBStatusActive, dbID); err != nil {
+		t.Fatal(err)
+	}
+	completeTestSharedTenant(t, s, dbID, "tenant-capacity-log-full", 0)
+	seedPendingTenant(t, s, "tenant-capacity-log-rejected")
+	fsID, err := s.EnsureFsID(ctx, "tenant-capacity-log-rejected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, logs := observer.New(zap.ErrorLevel)
+	logCtx := logger.WithContext(ctx, zap.New(core))
+	err = s.CompleteSharedTenantProvision(logCtx, "tenant-capacity-log-rejected", "tidb_cloud_native_shared",
+		&TenantPlacement{FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared},
+		testOwnerKey("tenant-capacity-log-rejected"))
+	if !errors.Is(err, ErrSharedDBCapacityExhausted) {
+		t.Fatalf("capacity error = %v, want ErrSharedDBCapacityExhausted", err)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("capacity miss emitted %d error logs, want none: %+v", logs.Len(), logs.All())
 	}
 }
 

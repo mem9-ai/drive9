@@ -976,11 +976,27 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 	if organizationID == "" {
 		return nil, fmt.Errorf("shared tenant pool organization is required")
 	}
+	partitions, err := s.stageSharedPoolTenantWave(ctx, organizationID, sharedCred, count)
+	if err != nil {
+		return nil, err
+	}
+	continuationIDs := make([]int64, 0, len(partitions))
+	for _, partition := range partitions {
+		continuationIDs = append(continuationIDs, partition.db.ID)
+	}
+	sort.Slice(continuationIDs, func(i, j int) bool { return continuationIDs[i] < continuationIDs[j] })
+	provisionDone := make(chan error, 1)
+	go func() {
+		_, provisionErr := s.provisionManagedSharedDBPoolsBatchWithCredentials(ctx, continuationIDs, sharedCred)
+		// Start metadata/schema continuation as soon as Cloud accepts the wave;
+		// logical tenant placement continues independently below.
+		s.scheduleManagedSharedDBContinuations(ctx, continuationIDs)
+		provisionDone <- provisionErr
+	}()
 	now := time.Now().UTC()
-	outcomes := runSharedPoolTenantCreateWorkers(ctx, count, func() sharedPoolTenantCreateOutcome {
-		return s.createFreeSharedPoolTenant(ctx, poolID, organizationID, sharedCred, quotaOpt, now)
+	outcomes := runSharedPoolTenantPartitionWorkers(ctx, partitions, func(partition sharedPoolTenantPartition) sharedPoolTenantCreateOutcome {
+		return s.createFreeSharedPoolTenantOnDB(ctx, poolID, organizationID, quotaOpt, now, partition.db)
 	})
-	continuationPoolIDs := make(map[int64]struct{})
 	results := make([]*provisionTenantResult, 0, count)
 	resultPoolIDs := make([]int64, 0, count)
 	var createErr error
@@ -991,27 +1007,14 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 		}
 		results = append(results, outcome.result)
 		resultPoolIDs = append(resultPoolIDs, outcome.dbID)
-		if outcome.needsContinuation {
-			continuationPoolIDs[outcome.dbID] = struct{}{}
-		}
 	}
-	if createErr != nil {
-		return results, createErr
-	}
-	continuationIDs := make([]int64, 0, len(continuationPoolIDs))
-	for id := range continuationPoolIDs {
-		continuationIDs = append(continuationIDs, id)
-	}
-	sort.Slice(continuationIDs, func(i, j int) bool { return continuationIDs[i] < continuationIDs[j] })
-	_, err = s.provisionManagedSharedDBPoolsBatchWithCredentials(ctx, continuationIDs, sharedCred)
-	if err != nil {
-		return results, err
-	}
+	provisionErr := <-provisionDone
 	continuationPoolStatuses := make(map[int64]meta.TenantStatus, len(continuationIDs))
 	for _, dbID := range continuationIDs {
 		sharedDB, err := s.meta.GetSharedDB(ctx, dbID)
 		if err != nil {
-			return results, err
+			provisionErr = errors.Join(provisionErr, err)
+			continue
 		}
 		status := meta.TenantPending
 		switch sharedDB.Status {
@@ -1027,43 +1030,84 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 			results[i].Status = status
 		}
 	}
-	s.scheduleManagedSharedDBContinuations(ctx, continuationIDs)
-	return results, nil
+	return results, errors.Join(createErr, provisionErr)
 }
 
-func runSharedPoolTenantCreateWorkers(ctx context.Context, count int, create func() sharedPoolTenantCreateOutcome) []sharedPoolTenantCreateOutcome {
-	outcomes := make([]sharedPoolTenantCreateOutcome, count)
-	jobs := make(chan int)
+type sharedPoolTenantPartition struct {
+	db          *meta.SharedDB
+	tenantCount int
+}
+
+func (s *Server) stageSharedPoolTenantWave(ctx context.Context, organizationID string, cred tenant.CredentialProvisionRequest, count int) ([]sharedPoolTenantPartition, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+	// Refill deliberately stages dedicated physical capacity instead of
+	// reusing a globally visible oldest candidate. Otherwise multiple Pods can
+	// plan against the same capacity snapshot and recreate the hot-row storm
+	// this partitioned wave is meant to avoid. The caller already caps count by
+	// managedSharedDBRefillPoolLimit, so lock-free over-creation stays bounded.
+	remaining := count
+	provisioningKey := sharedDBProvisioningKey(cred)
+	maxTenants, _ := s.managedSharedDBPolicy()
+	partitions := make([]sharedPoolTenantPartition, 0, (count+maxTenants-1)/maxTenants)
+	for remaining > 0 {
+		row, err := s.createManagedSharedDBPlan(ctx, organizationID, provisioningKey)
+		if err != nil {
+			return nil, err
+		}
+		assigned := min(remaining, maxTenants)
+		partitions = append(partitions, sharedPoolTenantPartition{db: row, tenantCount: assigned})
+		remaining -= assigned
+	}
+	return partitions, nil
+}
+
+func runSharedPoolTenantPartitionWorkers(ctx context.Context, partitions []sharedPoolTenantPartition, create func(sharedPoolTenantPartition) sharedPoolTenantCreateOutcome) []sharedPoolTenantCreateOutcome {
+	total := 0
+	for _, partition := range partitions {
+		total += partition.tenantCount
+	}
+	outcomes := make([]sharedPoolTenantCreateOutcome, total)
+	type partitionJob struct {
+		partition sharedPoolTenantPartition
+		offset    int
+	}
+	jobs := make(chan partitionJob, len(partitions))
+	offset := 0
+	for _, partition := range partitions {
+		jobs <- partitionJob{partition: partition, offset: offset}
+		offset += partition.tenantCount
+	}
+	close(jobs)
 	var wg sync.WaitGroup
-	for range min(count, sharedTenantPoolCreateConcurrency) {
+	for range min(len(partitions), sharedTenantPoolCreateConcurrency) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := range jobs {
-				if ctx.Err() != nil {
-					outcomes[i].err = ctx.Err()
-					continue
+			for job := range jobs {
+				for i := range job.partition.tenantCount {
+					index := job.offset + i
+					if ctx.Err() != nil {
+						outcomes[index].err = ctx.Err()
+						continue
+					}
+					outcomes[index] = create(job.partition)
 				}
-				outcomes[i] = create()
 			}
 		}()
 	}
-	for i := range count {
-		jobs <- i
-	}
-	close(jobs)
 	wg.Wait()
 	return outcomes
 }
 
 type sharedPoolTenantCreateOutcome struct {
-	result            *provisionTenantResult
-	dbID              int64
-	needsContinuation bool
-	err               error
+	result *provisionTenantResult
+	dbID   int64
+	err    error
 }
 
-func (s *Server) createFreeSharedPoolTenant(ctx context.Context, poolID, organizationID string, sharedCred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest, now time.Time) sharedPoolTenantCreateOutcome {
+func (s *Server) createFreeSharedPoolTenantOnDB(ctx context.Context, poolID, organizationID string, quotaOpt *quotaRequest, now time.Time, selected *meta.SharedDB) sharedPoolTenantCreateOutcome {
 	tenantID := token.NewID()
 	fail := func(err error) sharedPoolTenantCreateOutcome {
 		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
@@ -1079,13 +1123,14 @@ func (s *Server) createFreeSharedPoolTenant(ctx context.Context, poolID, organiz
 	if err := s.materializeSharedTenantQuota(ctx, tenantID, provisionTenantOptions{Quota: quotaOpt}); err != nil {
 		return fail(err)
 	}
-	selected, _, err := s.allocateManagedSharedDBForOrganization(ctx, organizationID, sharedCred, func(db *meta.SharedDB) error {
+	reserve := func(db *meta.SharedDB) error {
 		return s.meta.CompleteSharedTenantPoolMember(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared,
 			&meta.TenantPlacement{FsID: fsID, DbID: db.ID, Placement: meta.PlacementShared,
 				SchemaShape: meta.SchemaShapeShared, Status: meta.SharedDBStatusActive},
 			&meta.TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: organizationID,
 				PoolID: poolID, PoolStatus: meta.TenantPoolBindingFree, CreatedAt: now, UpdatedAt: now})
-	})
+	}
+	err = reserve(selected)
 	if err != nil {
 		return fail(err)
 	}
@@ -1100,8 +1145,7 @@ func (s *Server) createFreeSharedPoolTenant(ctx context.Context, poolID, organiz
 		result: &provisionTenantResult{TenantID: tenantID, Status: resultStatus,
 			Provider: tenant.ProviderTiDBCloudNativeShared, CloudProvider: selected.CloudProvider,
 			Region: selected.Region, OrganizationID: selected.TiDBCloudOrganizationID},
-		dbID:              selected.ID,
-		needsContinuation: selected.Status == meta.SharedDBStatusPending || selected.Status == meta.SharedDBStatusProvisioning,
+		dbID: selected.ID,
 	}
 }
 

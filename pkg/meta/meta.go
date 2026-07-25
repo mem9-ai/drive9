@@ -4221,6 +4221,10 @@ func observeMeta(ctx context.Context, op string, start time.Time, errp *error) {
 			result = "not_found"
 		case errors.Is(*errp, ErrDuplicate):
 			result = "duplicate"
+		case errors.Is(*errp, ErrSharedDBCapacityExhausted):
+			// Capacity races are an expected allocator miss. The caller either
+			// selects another pool or reports the unrecovered wave failure.
+			result = "capacity_exhausted"
 		case errors.Is(*errp, sql.ErrConnDone):
 			// Connection closed during shutdown — not an unexpected failure.
 			result = "conn_closed"
@@ -4235,6 +4239,9 @@ func observeMeta(ctx context.Context, op string, start time.Time, errp *error) {
 		case "conn_closed":
 			// Connection closed during shutdown — suppress the noisy log and
 			// only record the metric below.
+		case "capacity_exhausted":
+			// Expected allocator outcome; the caller retries another candidate
+			// or reports an unrecovered wave failure.
 		case "not_found", "duplicate":
 			logger.Warn(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.String("detail", (*errp).Error()))
 		case "error":
