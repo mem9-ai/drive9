@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1087,8 +1088,15 @@ func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) 
 		return nil, fmt.Errorf("shared db %d: decrypt password: %w", dbID, err)
 	}
 	query := "parseTime=true"
-	if info.TLSMode != "" {
-		query += "&tls=" + info.TLSMode
+	// LocalClustersAPI TiDB has no TLS. Warm-pool batch once persisted tls=true and
+	// blocked schema ensure / free-tenant activation; force plaintext for local backend.
+	tlsMode := info.TLSMode
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_TIDBCLOUD_CLUSTERS_BACKEND"))) {
+	case "local", "docker":
+		tlsMode = ""
+	}
+	if tlsMode != "" {
+		query += "&tls=" + tlsMode
 	}
 	// An empty TLSMode means a plain connection (local/self-hosted databases);
 	// shared DBs on TiDB Cloud are registered with tls=skip-verify or tls=true.

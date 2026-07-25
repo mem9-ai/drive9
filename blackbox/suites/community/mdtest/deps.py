@@ -8,8 +8,6 @@ from harness.core import Context, DependencyUnavailable, env_value, progress, wr
 
 DEFAULT_IOR_REF = "4.0.0"
 
-APT_AUTO_INSTALL_TRUTHY = {"1", "true", "yes", "on"}
-
 
 def ensure_dependencies(ctx: Context) -> None:
     ensure_mdtest(ctx)
@@ -80,11 +78,13 @@ def _ensure_mpi_compiler(ctx: Context) -> str:
     if found:
         progress(f"dependency tool: mpicc -> {found}")
         return found
-    if env_value("AUTO_INSTALL_SYSTEM_DEPS", "1").lower() not in APT_AUTO_INSTALL_TRUTHY:
-        raise DependencyUnavailable("mpicc is required to build IOR/mdtest; install MPICH/OpenMPI or set MPICC")
+    # Debian/Ubuntu: mpich + headers. Arch: mapped to openmpi (provides mpicc).
     ctx.deps.ensure_system_packages("mpich", "libmpich-dev")
     found = shutil.which("mpicc")
     if found:
         progress(f"dependency tool: mpicc -> {found}")
         return found
-    raise DependencyUnavailable("mpicc is required to build IOR/mdtest; install MPICH/OpenMPI or set MPICC")
+    raise DependencyUnavailable(
+        "mpicc is required to build IOR/mdtest; install MPICH/OpenMPI, set MPICC, "
+        "or enable AUTO_INSTALL_SYSTEM_DEPS with passwordless sudo"
+    )

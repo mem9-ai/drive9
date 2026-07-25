@@ -125,8 +125,8 @@ on:
         options:
           - "0"
           - "1"
-      run_git_feature_matrix:
-        description: "Run Git feature matrix against a live FUSE mount"
+      run_git_feature_smoke:
+        description: "Run Git feature smoke against a live FUSE mount"
         required: false
         default: "0"
         type: choice
@@ -169,8 +169,7 @@ env:
   ARCHIVE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.archive_fuse_performance_metrics || '0') }}
   COMPARE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.compare_fuse_performance_metrics || '0') }}
   RUN_E2E_SMOKE_ALL: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_e2e_smoke_all) || '0') }}
-  RUN_GIT_FEATURE_MATRIX: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_git_feature_matrix) || '0') }}
-  RUN_POSIX_FEATURE_MATRIX: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.run_all_e2e == '1' && '1' || '0' }}
+  RUN_GIT_FEATURE_SMOKE: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_git_feature_smoke) || '0') }}
   # Report-only: hosted-runner FUSE numbers are too noisy for a hard
   # day-over-day gate (the first two nightly runs both false-failed here).
   # Deterministic perf gating lives in e2e/fuse-write-perf-budget-test.sh.
@@ -179,7 +178,6 @@ env:
   FEISHU_PROOF: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.feishu_proof == '1' && '1' || '0' }}
   FUSE_PERF_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-performance
   FUSE_CONCURRENCY_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-concurrency
-  FEATURE_MATRIX_REPORT_DIR: ${{ github.workspace }}/e2e-artifacts/feature-matrix
 
 jobs:
   local-e2e:
@@ -272,13 +270,6 @@ jobs:
         continue-on-error: true
         run: bash e2e/api-smoke-test.sh
 
-      - name: Run existing-key smoke
-        id: existing-key-smoke
-        continue-on-error: true
-        env:
-          DRIVE9_API_KEY: local-dev-key
-        run: bash e2e/api-smoke-test-existing-key.sh
-
       - name: Run CLI smoke
         id: cli-smoke
         continue-on-error: true
@@ -307,10 +298,10 @@ jobs:
           FUSE_STRICT_PREREQS: "1"
         run: bash e2e/git-ops-smoke-test.sh
 
-      - name: Run portable pack/unpack e2e
-        id: portable-pack-unpack-e2e
+      - name: Run pack smoke
+        id: pack-smoke
         continue-on-error: true
-        run: bash e2e/portable-pack-unpack-e2e.sh
+        run: bash e2e/pack-smoke-test.sh
 
       - name: Run FUSE crash recovery e2e
         id: fuse-crash-recovery
@@ -416,42 +407,13 @@ jobs:
           GIT_WORKSPACE_CLONE_TIMEOUT_S: "1800"
         run: bash e2e/smoke-all.sh
 
-      - name: Run Git feature matrix
-        id: git-feature-matrix
-        if: always() && env.RUN_GIT_FEATURE_MATRIX == '1'
+      - name: Run Git feature smoke
+        id: git-feature-smoke
+        if: always() && env.RUN_GIT_FEATURE_SMOKE == '1'
         continue-on-error: true
         env:
           FUSE_STRICT_PREREQS: "1"
-        run: bash e2e/git-feature-matrix.sh
-
-      - name: Build pjdfstest
-        if: always() && env.RUN_POSIX_FEATURE_MATRIX == '1'
-        continue-on-error: true
-        run: |
-          sudo apt-get install -y autoconf automake libtool
-          git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest
-          cd /tmp/pjdfstest
-          autoreconf -ifs
-          ./configure
-          make pjdfstest
-
-      - name: Run pjdfstest POSIX suite
-        id: pjdfstest-suite
-        if: always() && env.RUN_POSIX_FEATURE_MATRIX == '1'
-        continue-on-error: true
-        env:
-          PJDFSTEST_DIR: /tmp/pjdfstest
-          PJDFSTEST_ALLOW_NONROOT: "1"
-          FUSE_STRICT_PREREQS: "1"
-        run: bash e2e/pjdfstest-suite.sh
-
-      - name: Upload feature matrix artifacts
-        if: always() && (env.RUN_GIT_FEATURE_MATRIX == '1' || env.RUN_POSIX_FEATURE_MATRIX == '1')
-        uses: actions/upload-artifact@v4
-        with:
-          name: feature-matrix
-          path: e2e-artifacts/feature-matrix
-          if-no-files-found: warn
+        run: bash e2e/git-feature-smoke-test.sh
 
       - name: Publish local e2e summary
         if: always()
@@ -462,20 +424,18 @@ jobs:
             echo "| Check | Outcome |"
             echo "| --- | --- |"
             echo "| API smoke | ${{ steps.api-smoke.outcome || 'skipped' }} |"
-            echo "| Existing-key smoke | ${{ steps.existing-key-smoke.outcome || 'skipped' }} |"
             echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
             echo "| Layer FS smoke | ${{ steps.layer-fs-smoke.outcome || 'skipped' }} |"
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
             echo "| Git operations smoke | ${{ steps.git-ops-smoke.outcome || 'skipped' }} |"
-            echo "| Portable pack/unpack e2e | ${{ steps.portable-pack-unpack-e2e.outcome || 'skipped' }} |"
+            echo "| Pack smoke | ${{ steps.pack-smoke.outcome || 'skipped' }} |"
             echo "| FUSE crash recovery e2e | ${{ steps.fuse-crash-recovery.outcome || 'skipped' }} |"
             echo "| FUSE write perf budget e2e | ${{ steps.fuse-write-perf-budget.outcome || 'skipped' }} |"
             echo "| FUSE performance compare | ${{ steps.fuse_performance_compare.outcome || 'skipped' }} |"
             echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.outcome || 'skipped' }} |"
             echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.outcome || 'skipped' }} |"
             echo "| Full smoke-all suite | ${{ steps.smoke-all.outcome || 'skipped' }} |"
-            echo "| Git feature matrix | ${{ steps.git-feature-matrix.outcome || 'skipped' }} |"
-            echo "| pjdfstest POSIX suite | ${{ steps.pjdfstest-suite.outcome || 'skipped' }} |"
+            echo "| Git feature smoke | ${{ steps.git-feature-smoke.outcome || 'skipped' }} |"
             echo
             echo "FUSE concurrency stress: \`RUN_FUSE_CONCURRENCY_STRESS=${RUN_FUSE_CONCURRENCY_STRESS}\`"
             echo "FUSE concurrency stress required: \`FUSE_CONCURRENCY_STRESS_REQUIRED=${FUSE_CONCURRENCY_STRESS_REQUIRED}\`"
@@ -487,8 +447,7 @@ jobs:
             echo "Archive FUSE performance metrics: \`ARCHIVE_FUSE_PERFORMANCE_METRICS=${ARCHIVE_FUSE_PERFORMANCE_METRICS}\`"
             echo "Compare FUSE performance metrics: \`COMPARE_FUSE_PERFORMANCE_METRICS=${COMPARE_FUSE_PERFORMANCE_METRICS}\`"
             echo "Full smoke-all suite: \`RUN_E2E_SMOKE_ALL=${RUN_E2E_SMOKE_ALL}\`"
-            echo "Git feature matrix: \`RUN_GIT_FEATURE_MATRIX=${RUN_GIT_FEATURE_MATRIX}\`"
-            echo "pjdfstest POSIX suite: \`RUN_POSIX_FEATURE_MATRIX=${RUN_POSIX_FEATURE_MATRIX}\`"
+            echo "Git feature smoke: \`RUN_GIT_FEATURE_SMOKE=${RUN_GIT_FEATURE_SMOKE}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Turn the raw per-suite outcomes into one product-quality report: a richer
@@ -507,20 +466,18 @@ jobs:
           cat > /tmp/e2e-outcomes.json <<JSON
           {
             "api-smoke": "${{ steps.api-smoke.outcome }}",
-            "existing-key-smoke": "${{ steps.existing-key-smoke.outcome }}",
             "cli-smoke": "${{ steps.cli-smoke.outcome }}",
             "layer-fs-smoke": "${{ steps.layer-fs-smoke.outcome }}",
             "fuse-smoke": "${{ steps.fuse-smoke.outcome }}",
             "git-ops-smoke": "${{ steps.git-ops-smoke.outcome }}",
-            "portable-pack-unpack-e2e": "${{ steps.portable-pack-unpack-e2e.outcome }}",
+            "pack-smoke": "${{ steps.pack-smoke.outcome }}",
             "fuse-crash-recovery": "${{ steps.fuse-crash-recovery.outcome }}",
             "fuse-write-perf-budget": "${{ steps.fuse-write-perf-budget.outcome }}",
             "fuse_performance_compare": "${{ steps.fuse_performance_compare.outcome }}",
             "fuse-concurrency-stress": "${{ steps.fuse-concurrency-stress.outcome }}",
             "fuse-posix-fsx": "${{ steps.fuse-posix-fsx.outcome }}",
             "smoke-all": "${{ steps.smoke-all.outcome }}",
-            "git-feature-matrix": "${{ steps.git-feature-matrix.outcome }}",
-            "pjdfstest-suite": "${{ steps.pjdfstest-suite.outcome }}"
+            "git-feature-smoke": "${{ steps.git-feature-smoke.outcome }}"
           }
           JSON
           args=()
@@ -606,12 +563,11 @@ jobs:
           }
 
           check_required "API smoke" "${{ steps.api-smoke.outcome }}"
-          check_required "Existing-key smoke" "${{ steps.existing-key-smoke.outcome }}"
           check_required "CLI smoke" "${{ steps.cli-smoke.outcome }}"
           check_required "Layer FS smoke" "${{ steps.layer-fs-smoke.outcome }}"
           check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
           check_required "Git operations smoke" "${{ steps.git-ops-smoke.outcome }}"
-          check_required "Portable pack/unpack e2e" "${{ steps.portable-pack-unpack-e2e.outcome }}"
+          check_required "Pack smoke" "${{ steps.pack-smoke.outcome }}"
           check_required "FUSE crash recovery e2e" "${{ steps.fuse-crash-recovery.outcome }}"
           check_required "FUSE write perf budget e2e" "${{ steps.fuse-write-perf-budget.outcome }}"
           if [ "${COMPARE_FUSE_PERFORMANCE_METRICS}" = "1" ]; then
@@ -626,8 +582,8 @@ jobs:
           if [ "${RUN_E2E_SMOKE_ALL}" = "1" ]; then
             check_required "Full smoke-all suite" "${{ steps.smoke-all.outcome }}"
           fi
-          if [ "${RUN_GIT_FEATURE_MATRIX}" = "1" ]; then
-            check_required "Git feature matrix" "${{ steps.git-feature-matrix.outcome }}"
+          if [ "${RUN_GIT_FEATURE_SMOKE}" = "1" ]; then
+            check_required "Git feature smoke" "${{ steps.git-feature-smoke.outcome }}"
           fi
 
           exit "$failed"

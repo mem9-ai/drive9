@@ -14,8 +14,16 @@ import (
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/tenant/tidbcloudnative"
 	"go.uber.org/zap"
 )
+
+// sharedDBTLSMode is the mysql driver TLS mode persisted on managed shared DB
+// pool rows. Local Docker TiDB has no TLS; Cloud public uses verified TLS;
+// private endpoint uses skip-verify.
+func sharedDBTLSMode() string {
+	return tidbcloudnative.DBTLSModeForBackend()
+}
 
 const (
 	defaultManagedSharedDBMaxTenants = 100
@@ -84,8 +92,14 @@ func sharedDBAllocationIdentity(organizationID string, provisioningKey []byte) s
 
 func managedSharedDBDSN(info *meta.SharedDB, password string) string {
 	query := "parseTime=true"
-	if info.TLSMode != "" {
-		query += "&tls=" + info.TLSMode
+	// Prefer backend-correct TLS. Local Docker TiDB is plaintext; a previously
+	// persisted "true"/"skip-verify" (warm-pool batch bug) would hang activation.
+	tlsMode := info.TLSMode
+	if backendMode := sharedDBTLSMode(); backendMode == "" || tidbcloudnative.IsLocalClustersBackend() {
+		tlsMode = backendMode
+	}
+	if tlsMode != "" {
+		query += "&tls=" + tlsMode
 	}
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", info.User, password, info.Host, info.Port, info.Name, query)
 }
@@ -515,10 +529,7 @@ func (s *Server) ensureManagedSharedDBPhysicalLocked(ctx context.Context, poolIn
 	if result.DBName == "" {
 		result.DBName = poolInfo.Name
 	}
-	tlsMode := "true"
-	if !dbTLSForProvisionedTenant(tenant.ProviderTiDBCloudNativeShared) {
-		tlsMode = "skip-verify"
-	}
+	tlsMode := sharedDBTLSMode()
 	if err := s.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{
 		ID: poolInfo.ID, TiDBCloudOrganizationID: logicalOrganizationID, ClusterID: result.ClusterID,
 		Host: result.Host, Port: result.Port, User: result.Username, PasswordCipher: poolInfo.PasswordCipher,
@@ -648,10 +659,7 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 		if result.DBName == "" {
 			result.DBName = poolInfo.Name
 		}
-		tlsMode := "true"
-		if !dbTLSForProvisionedTenant(tenant.ProviderTiDBCloudNativeShared) {
-			tlsMode = "skip-verify"
-		}
+		tlsMode := sharedDBTLSMode()
 		if err := s.meta.UpdateManagedSharedDBPoolCloudResult(ctx, &meta.SharedDB{
 			ID: dbID, TiDBCloudOrganizationID: logicalOrganizationID, ClusterID: result.ClusterID,
 			Host: result.Host, Port: result.Port, User: result.Username, PasswordCipher: poolInfo.PasswordCipher,

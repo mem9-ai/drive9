@@ -2,9 +2,8 @@ name: e2e-all
 
 # Manual one-click run of every e2e suite in e2e/ that can execute against the
 # self-contained TiDB + drive9-server-local stack. Excluded by design (need
-# external infra): layer-fs-smoke-test-realdev.sh (shared dev endpoint),
-# verify-description-e2e.sh (Docker compose + Ollama), and
-# verify-description-tidb-zero-e2e.sh (TiDB Cloud Zero account).
+# external infra): description-smoke-test.sh (Docker + Ollama/stub embedder).
+# Full pjdfstest lives under blackbox (community.pjdfstest), not this workflow.
 on:
   workflow_dispatch:
 
