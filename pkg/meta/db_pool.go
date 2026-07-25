@@ -281,7 +281,8 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 		}
 		return value
 	}
-	return s.InTx(ctx, func(tx *sql.Tx) error {
+	var advancedTenants []string
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
 		var currentHost, currentUser, currentName sql.NullString
 		var currentPort sql.NullInt64
 		var currentPassword []byte
@@ -333,6 +334,32 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 			return fmt.Errorf("persist cloud result for db pool %d: %w", in.ID, err)
 		}
 		if nextStatus == SharedDBStatusProvisioning && metadataReady {
+			// Collect the tenant ids before the bulk UPDATE so the API-key
+			// resolve cache can be evicted precisely after commit.
+			rows, err := tx.QueryContext(ctx, `SELECT t.id
+				FROM tenants t
+				JOIN fs_registry f ON f.tenant_id = t.id
+				JOIN tenant_placements p ON p.fs_id = f.fs_id
+				WHERE p.db_id = ? AND t.provider = ? AND t.status = ?`,
+				in.ID, tidbCloudNativeSharedProvider, TenantPending)
+			if err != nil {
+				return fmt.Errorf("list advancing tenants for db pool %d: %w", in.ID, err)
+			}
+			for rows.Next() {
+				var tenantID string
+				if err := rows.Scan(&tenantID); err != nil {
+					_ = rows.Close()
+					return fmt.Errorf("scan advancing tenant for db pool %d: %w", in.ID, err)
+				}
+				advancedTenants = append(advancedTenants, tenantID)
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("list advancing tenants for db pool %d: %w", in.ID, err)
+			}
+			if err := rows.Close(); err != nil {
+				return fmt.Errorf("list advancing tenants for db pool %d: %w", in.ID, err)
+			}
 			if _, err := tx.ExecContext(ctx, `UPDATE tenants t
 				JOIN fs_registry f ON f.tenant_id = t.id
 				JOIN tenant_placements p ON p.fs_id = f.fs_id
@@ -344,6 +371,13 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	for _, tenantID := range advancedTenants {
+		s.apiKeys.evictTenant(tenantID)
+	}
+	return nil
 }
 
 // PrepareManagedSharedDBPoolRoot durably stores the root credential and
@@ -1015,7 +1049,7 @@ func (s *Store) completeSharedTenantProvision(ctx context.Context, tenantID, pro
 		status = sharedDBStatusActive
 	}
 	now := time.Now().UTC()
-	return s.InTx(ctx, func(tx *sql.Tx) error {
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
 		var dedicatedBindingCount int
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tenant_tidbcloud_org_bindings
 			WHERE tenant_id = ?`, tenantID).Scan(&dedicatedBindingCount); err != nil {
@@ -1154,6 +1188,11 @@ func (s *Store) completeSharedTenantProvision(ctx context.Context, tenantID, pro
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.apiKeys.evictTenant(tenantID)
+	return nil
 }
 
 // ActivateSharedTenantsBatch activates ready shared tenants after their
@@ -1168,6 +1207,7 @@ func (s *Store) ActivateSharedTenantsBatch(ctx context.Context, dbID int64, limi
 	if limit <= 0 {
 		return 0, fmt.Errorf("activation limit must be positive")
 	}
+	var tenantIDs []string
 	err = s.InTx(ctx, func(tx *sql.Tx) error {
 		var poolStatus string
 		if scanErr := tx.QueryRowContext(ctx, `SELECT status FROM db_pool WHERE db_id = ? FOR UPDATE`, dbID).Scan(&poolStatus); scanErr != nil {
@@ -1194,7 +1234,6 @@ func (s *Store) ActivateSharedTenantsBatch(ctx context.Context, dbID int64, limi
 		if queryErr != nil {
 			return queryErr
 		}
-		var tenantIDs []string
 		for rows.Next() {
 			var tenantID string
 			if scanErr := rows.Scan(&tenantID); scanErr != nil {
@@ -1226,7 +1265,13 @@ func (s *Store) ActivateSharedTenantsBatch(ctx context.Context, dbID int64, limi
 		}
 		return nil
 	})
-	return activated, err
+	if err != nil {
+		return activated, err
+	}
+	for _, tenantID := range tenantIDs {
+		s.apiKeys.evictTenant(tenantID)
+	}
+	return activated, nil
 }
 
 // DeleteTenantPlacementAndDecrCount atomically removes a tenant's placement
@@ -1273,7 +1318,7 @@ func (s *Store) FinalizeSharedTenantDeleteMetadata(ctx context.Context, tenantID
 	if _, err := SharedDBReopenThresholdForRatio(1, reopenRatio); err != nil {
 		return err
 	}
-	return s.InTx(ctx, func(tx *sql.Tx) error {
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
 		if err := releaseTenantPlacementAndDecrCountTx(ctx, tx, fsID, dbID, reopenRatio, markDeleted); err != nil {
 			return err
 		}
@@ -1296,6 +1341,11 @@ func (s *Store) FinalizeSharedTenantDeleteMetadata(ctx context.Context, tenantID
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.apiKeys.evictTenant(tenantID)
+	return nil
 }
 
 func releaseTenantPlacementAndDecrCountTx(ctx context.Context, tx *sql.Tx, fsID, dbID int64, reopenRatio float64, deletePlacement bool) error {

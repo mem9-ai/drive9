@@ -329,6 +329,8 @@ type TenantPoolBindingStatusCount struct {
 
 type Store struct {
 	db *sql.DB
+	// apiKeys caches ResolveByAPIKeyHash results (see api_key_cache.go).
+	apiKeys *apiKeyResolveCache
 }
 
 func Open(dsn string) (*Store, error) {
@@ -343,7 +345,7 @@ func OpenContext(ctx context.Context, dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, apiKeys: newAPIKeyResolveCache()}
 	if err := s.migrate(); err != nil {
 		_ = mysqlutil.CloseInstrumented(db)
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -2534,6 +2536,9 @@ func (s *Store) MarkFreeTenantPoolTenantDeleting(ctx context.Context, tenantID s
 	if err != nil {
 		return false, err
 	}
+	if updated {
+		s.apiKeys.evictTenant(tenantID)
+	}
 	return updated, nil
 }
 
@@ -2887,9 +2892,58 @@ func tenantPoolDatabaseLockName(baseLockName, databaseName string) string {
 	return baseLockName + ":" + hex.EncodeToString(sum[:4])
 }
 
+// apiKeyResolveDBTimeout bounds the detached context used for the shared DB
+// query inside the resolve singleflight (see ResolveByAPIKeyHash), so a slow
+// metadb cannot park flight waiters forever.
+const apiKeyResolveDBTimeout = 10 * time.Second
+
+// ResolveByAPIKeyHash resolves a tenant and its API key by jwt_hash. Results
+// are cached in-process for a short TTL (see api_key_cache.go) because the
+// auth middleware calls this on every authenticated request; ErrNotFound is
+// never cached so newly created keys are visible immediately.
 func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *TenantWithAPIKey, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "resolve_api_key_hash", start, &err)
+	if cached, ok := s.apiKeys.get(hash); ok {
+		return cached, nil
+	}
+	v, err, _ := s.apiKeys.flight.Do(hash, func() (any, error) {
+		// Double-check under the flight window: a concurrent caller may have
+		// filled the entry while this one waited.
+		if cached, ok := s.apiKeys.lookup(hash); ok {
+			return cached, nil
+		}
+		// Detach the shared query from the flight leader's request context:
+		// every waiter shares this one query, so a leader's client disconnect
+		// must not cancel it for all of them. It is bounded by its own
+		// timeout instead.
+		dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), apiKeyResolveDBTimeout)
+		defer cancel()
+		rec, dberr := s.resolveByAPIKeyHashDB(dbCtx, hash)
+		if dberr != nil {
+			return nil, dberr
+		}
+		s.apiKeys.fill(hash, cloneTenantWithAPIKey(*rec))
+		return rec, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// The detached query protects the OTHER flight waiters from one caller's
+	// disconnect; this caller itself keeps the pre-fix prompt-cancellation
+	// behavior (the auth middleware maps it to 499 client-canceled).
+	if ctx.Err() != nil {
+		err = ctx.Err()
+		return nil, err
+	}
+	// Clone per caller: flight waiters share the fetched record, but callers
+	// may mutate it (tenant.Pool writes Tenant.StorageNamespaceID on a cold
+	// open), so every caller must get a private copy — same as the hit path.
+	rec := cloneTenantWithAPIKey(*v.(*TenantWithAPIKey))
+	return &rec, nil
+}
+
+func (s *Store) resolveByAPIKeyHashDB(ctx context.Context, hash string) (out *TenantWithAPIKey, err error) {
 	row := s.db.QueryRowContext(ctx, `SELECT
 			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name, t.db_tls,
@@ -3344,6 +3398,7 @@ func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status Tenant
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.apiKeys.evictTenant(id)
 	return nil
 }
 
@@ -3363,6 +3418,7 @@ func (s *Store) UpdateTenantProvider(ctx context.Context, id, provider string) (
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.apiKeys.evictTenant(id)
 	return nil
 }
 
@@ -3375,7 +3431,11 @@ func (s *Store) UpdateTenantStatusIf(ctx context.Context, id string, from, to Te
 		return false, err
 	}
 	n, _ := res.RowsAffected()
-	return n > 0, nil
+	updated = n > 0
+	if updated {
+		s.apiKeys.evictTenant(id)
+	}
+	return updated, nil
 }
 
 func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *Tenant) (err error) {
@@ -3398,6 +3458,7 @@ func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.apiKeys.evictTenant(id)
 	return nil
 }
 
@@ -3421,6 +3482,7 @@ func (s *Store) UpdateTenantClusterReference(ctx context.Context, id string, clu
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.apiKeys.evictTenant(id)
 	return nil
 }
 
@@ -3428,7 +3490,7 @@ func (s *Store) ClearTenantProvisionMetadata(ctx context.Context, tenantID strin
 	start := time.Now()
 	defer observeMeta(ctx, "clear_tenant_provision_metadata", start, &err)
 	now := time.Now().UTC()
-	return s.InTx(ctx, func(tx *sql.Tx) error {
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE tenants
 			SET db_host = '', db_port = 0, db_user = '', db_password = ?, db_name = '', db_tls = 1,
 				cluster_id = NULL, branch_id = '', claim_url = NULL, claim_expires_at = NULL, updated_at = ?
@@ -3445,6 +3507,11 @@ func (s *Store) ClearTenantProvisionMetadata(ctx context.Context, tenantID strin
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.apiKeys.evictTenant(tenantID)
+	return nil
 }
 
 func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, dbUser string, dbPasswordCipher []byte) (updated bool, err error) {
@@ -3456,7 +3523,11 @@ func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, 
 		return false, err
 	}
 	n, _ := res.RowsAffected()
-	return n > 0, nil
+	updated = n > 0
+	if updated {
+		s.apiKeys.evictTenant(id)
+	}
+	return updated, nil
 }
 
 func (s *Store) UpdateTenantBranch(ctx context.Context, id string, cluster *Tenant) (err error) {
@@ -3477,6 +3548,7 @@ func (s *Store) UpdateTenantBranch(ctx context.Context, id string, cluster *Tena
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.apiKeys.evictTenant(id)
 	return nil
 }
 
@@ -3488,7 +3560,11 @@ func (s *Store) RevokeTenantAPIKeys(ctx context.Context, tenantID string) (err e
 		SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
 		WHERE tenant_id = ? AND status = ?`,
 		APIKeyRevoked, now, now, tenantID, APIKeyActive)
-	return err
+	if err != nil {
+		return err
+	}
+	s.apiKeys.evictTenant(tenantID)
+	return nil
 }
 
 func (s *Store) RevokeAPIKey(ctx context.Context, tenantID, apiKeyID string) (err error) {
@@ -3502,6 +3578,9 @@ func (s *Store) RevokeAPIKey(ctx context.Context, tenantID, apiKeyID string) (er
 	if err != nil {
 		return err
 	}
+	// Evict even when the row was already revoked (n == 0): a cached active
+	// entry would be stale in that case.
+	s.apiKeys.evictTenant(tenantID)
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return ErrNotFound
@@ -3518,7 +3597,11 @@ func (s *Store) RevokeAPIKeysByIssuer(ctx context.Context, tenantID, provider, s
 		WHERE tenant_id = ? AND issued_by_provider = ? AND issued_by_subject_key = ? AND status = ?
 			AND (? = '' OR id <> ?)`,
 		APIKeyRevoked, now, now, tenantID, provider, subjectKey, APIKeyActive, exceptAPIKeyID, exceptAPIKeyID)
-	return err
+	if err != nil {
+		return err
+	}
+	s.apiKeys.evictTenant(tenantID)
+	return nil
 }
 
 func (s *Store) GetActiveAPIKeyByIssuer(ctx context.Context, tenantID, provider, subjectKey string) (out *APIKey, err error) {
@@ -3681,6 +3764,7 @@ func (s *Store) EnsureTenantStorageNamespace(ctx context.Context, tenantID, back
 	if err != nil {
 		return nil, err
 	}
+	s.apiKeys.evictTenant(tenantID)
 	return ns, nil
 }
 
@@ -3820,7 +3904,7 @@ func (s *Store) MarkTenantDeleted(ctx context.Context, tenantID string) (err err
 	start := time.Now()
 	defer observeMeta(ctx, "mark_tenant_deleted", start, &err)
 	now := time.Now().UTC()
-	return s.InTx(ctx, func(tx *sql.Tx) error {
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`,
 			TenantDeleted, now, tenantID)
 		if err != nil {
@@ -3834,6 +3918,11 @@ func (s *Store) MarkTenantDeleted(ctx context.Context, tenantID string) (err err
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.apiKeys.evictTenant(tenantID)
+	return nil
 }
 
 func (s *Store) MarkTenantDeleteJobDeleted(ctx context.Context, tenantID string, deletedObjects, abortedMultipartUploads int64) (err error) {
@@ -3852,7 +3941,7 @@ func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID 
 	start := time.Now()
 	defer observeMeta(ctx, "finalize_tenant_delete", start, &err)
 	now := time.Now().UTC()
-	return s.InTx(ctx, func(tx *sql.Tx) error {
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE tenant_delete_jobs
 			SET state = ?, deleted_objects = ?, aborted_multipart_uploads = ?, completed_at = ?,
 				last_error = NULL, updated_at = ?
@@ -3892,6 +3981,11 @@ func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID 
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.apiKeys.evictTenant(tenantID)
+	return nil
 }
 
 func requireAffected(res sql.Result) error {
@@ -4082,6 +4176,7 @@ func (s *Store) UpdateTenantSchemaVersion(ctx context.Context, id string, versio
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.apiKeys.evictTenant(id)
 	return nil
 }
 
@@ -4473,6 +4568,55 @@ func (s *Store) InsertTenantNotify(ctx context.Context, tenantID string, workMas
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO tenant_notify_outbox (tenant_id, work_mask) VALUES (?, ?)`,
 		tenantID, workMask)
+	return err
+}
+
+// TenantNotifyEntry is one tenant's pending work signal for
+// InsertTenantNotifyBatch.
+type TenantNotifyEntry struct {
+	TenantID string
+	WorkMask int
+}
+
+// insertTenantNotifyBatchChunkSize caps the number of rows per multi-row
+// INSERT statement.
+const insertTenantNotifyBatchChunkSize = 1000
+
+// InsertTenantNotifyBatch writes many unified work signals as multi-row
+// INSERTs (chunked at insertTenantNotifyBatchChunkSize rows per statement).
+// It exists because single-row InsertTenantNotify calls dominated metadb
+// write load under stress: the server's notify coalescer OR-merges signals
+// per tenant and flushes them here in one statement per flush window.
+// Same best-effort semantics as InsertTenantNotify; each chunk commits
+// atomically, so poller cursor semantics (id > cursor ORDER BY id) are
+// unaffected.
+func (s *Store) InsertTenantNotifyBatch(ctx context.Context, entries []TenantNotifyEntry) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "insert_tenant_notify_batch", start, &err)
+	for from := 0; from < len(entries); from += insertTenantNotifyBatchChunkSize {
+		to := from + insertTenantNotifyBatchChunkSize
+		if to > len(entries) {
+			to = len(entries)
+		}
+		if err := s.insertTenantNotifyChunk(ctx, entries[from:to]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) insertTenantNotifyChunk(ctx context.Context, entries []TenantNotifyEntry) error {
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO tenant_notify_outbox (tenant_id, work_mask) VALUES `)
+	args := make([]any, 0, len(entries)*2)
+	for i, e := range entries {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("(?,?)")
+		args = append(args, e.TenantID, e.WorkMask)
+	}
+	_, err := s.db.ExecContext(ctx, sb.String(), args...)
 	return err
 }
 

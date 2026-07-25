@@ -6,13 +6,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -345,7 +348,34 @@ func main() {
 		zap.Duration("startup_elapsed", time.Since(startupStart)))
 	defer func() { _ = ln.Close() }()
 
-	die(http.Serve(ln, srv))
+	// Graceful shutdown: on SIGINT/SIGTERM drain in-flight requests so Serve
+	// returns and the deferred srv.Close() above runs the worker teardown.
+	httpSrv := &http.Server{Handler: srv}
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	shutdownDone := make(chan struct{})
+	go func() {
+		<-stopCtx.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(ctx); err != nil {
+			logger.Warn(context.Background(), "server_shutdown_failed", zap.Error(err))
+		}
+		close(shutdownDone)
+	}()
+
+	err = httpSrv.Serve(ln)
+	if errors.Is(err, http.ErrServerClosed) {
+		err = nil
+	}
+	// Serve returns as soon as Shutdown closes the listener, which can be
+	// before in-flight requests have drained. When the return was
+	// signal-driven, join the shutdown goroutine so the deferred srv.Close()
+	// does not tear down workers while handlers are still active.
+	if stopCtx.Err() != nil {
+		<-shutdownDone
+	}
+	die(err)
 }
 
 func usage() {

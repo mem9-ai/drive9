@@ -135,13 +135,14 @@ func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType strin
 
 // logAndEnqueueMutation atomically logs a mutation and enqueues its apply
 // function under mutationMu. This ensures that within a single backend
-// instance, durable log_id order and channel enqueue order are identical,
+// instance, durable log_id order and dispatcher enqueue order are identical,
 // preventing reordering between concurrent same-tenant writes on this
 // process. The mutex scope is kept minimal: just the log insert (~1ms) +
-// channel send (non-blocking into 256-slot buffer).
+// shard channel send (non-blocking while the 4096-slot shard buffer has
+// capacity; a full buffer applies backpressure).
 //
 // Cross-instance ordering: in a multi-pod deployment, each pod has its own
-// mutationMu and worker queue. Two pods can apply mutations for the same
+// mutationMu and dispatcher. Two pods can apply mutations for the same
 // tenant in different log_id order. This is a pre-existing condition — the
 // the old synchronous log+apply path also had no cross-pod ordering.
 // UpsertFileMetaTx is last-writer-wins; MutationReplayWorker replays
@@ -161,8 +162,15 @@ func (b *Dat9Backend) logAndEnqueueMutation(ctx context.Context, mutationType st
 		return err
 	}
 	b.addPendingCentralMutationDeltas(pending.storageDelta, pending.fileDelta, pending.mediaDelta)
-	b.enqueueMutation(ctx, func(applyCtx context.Context) {
-		b.applyQuotaMutation(applyCtx, mutationType, logID, pending, apply)
+	b.enqueueMutationItem(ctx, quotaMutationItem{
+		backend:        b,
+		store:          b.metaStore,
+		tenantID:       b.tenantID,
+		tidbCloudOrgID: b.tidbCloudOrgID,
+		mutationType:   mutationType,
+		logID:          logID,
+		pending:        pending,
+		apply:          apply,
 	})
 	b.mutationMu.Unlock()
 

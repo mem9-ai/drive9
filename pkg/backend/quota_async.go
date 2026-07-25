@@ -4,82 +4,80 @@ import (
 	"context"
 )
 
-const (
-	// mutationQueueSize is the buffer size for the async mutation channel.
-	// Sized to absorb short bursts without blocking the write path. A single
-	// worker drains the channel to preserve per-tenant FIFO ordering
-	// (UpsertFileMetaTx is not commutative across create/overwrite).
-	//
-	// The in-process mutation queue provides per-tenant FIFO ordering only
-	// within a single backend instance. In multi-pod deployments, cross-pod
-	// ordering is not guaranteed (see logAndEnqueueMutation comment). The
-	// durable quota_mutation_log plus MutationReplayWorker provides the
-	// convergence backstop.
-	mutationQueueSize = 256
-)
-
-// startMutationWorker initializes the async mutation queue and a single
-// sequencing worker. A single worker guarantees that within this backend
-// instance, per-tenant mutation apply order matches the log insertion order
-// (which is serialized by the caller's mutationMu + logQuotaMutation).
+// startMutationWorker enrolls the backend in async central quota mutation
+// apply. Enqueued mutations are handed to the process-global mutation
+// dispatcher (mutation_dispatcher.go), which batches applies cross-tenant
+// into single metadb transactions while preserving per-tenant FIFO (one
+// shard per tenant). When the dispatcher is not running (unit tests,
+// drive9-server-local) or the backend is closing, items apply inline,
+// exactly like the pre-dispatcher per-backend queue fallback did.
+//
 // Cross-instance ordering is not guaranteed; see logAndEnqueueMutation.
+// The durable quota_mutation_log plus MutationReplayWorker provides the
+// convergence backstop.
 //
 // Called once from SetMetaQuotaStore when server quota is active.
 func (b *Dat9Backend) startMutationWorker() {
-	if b.mutationQueue != nil {
-		return // already started
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	b.mutationStop = cancel
-	b.mutationQueue = make(chan func(context.Context), mutationQueueSize)
-	b.mutationWG.Add(1)
-	go b.drainMutations(ctx)
+	b.mutationMu.Lock()
+	defer b.mutationMu.Unlock()
+	b.mutationWorkerOn = true
+	b.mutationClosed = false
 }
 
-func (b *Dat9Backend) drainMutations(ctx context.Context) {
-	defer b.mutationWG.Done()
-	for {
-		select {
-		case <-ctx.Done():
-			// Drain remaining items before exiting.
-			for {
-				select {
-				case fn := <-b.mutationQueue:
-					fn(ctx)
-				default:
-					return
-				}
-			}
-		case fn := <-b.mutationQueue:
-			fn(ctx)
-		}
-	}
-}
-
-// enqueueMutation submits a mutation apply function to the async queue.
-// The mutation log entry has already been durably written by the caller
-// (logQuotaMutation), so if this enqueue blocks or the process crashes
-// before the worker runs, MutationReplayWorker recovers the pending entry.
+// enqueueMutation submits a raw mutation apply closure. This is the
+// pre-dispatcher per-backend queue API kept for existing unit tests;
+// production code enqueues structured items via logAndEnqueueMutation.
 //
-// If the queue is not wired (tests), the function runs inline.
-// The channel send blocks if the buffer is full, preserving FIFO ordering;
-// the 256-slot buffer makes blocking extremely unlikely in practice.
+// Callers hold mutationMu (or are otherwise serialized), so the closed check
+// and mutationWG.Add stay ordered against stopMutationWorker's Wait.
 func (b *Dat9Backend) enqueueMutation(ctx context.Context, fn func(context.Context)) {
-	if b.mutationQueue == nil {
-		// No async queue — run inline (test/fallback path).
-		fn(ctx)
+	b.enqueueMutationItem(ctx, quotaMutationItem{backend: b, tenantID: b.tenantID, raw: fn})
+}
+
+// enqueueMutationItem routes the item to the tenant's dispatcher shard, or
+// applies it inline when async apply is unavailable (dispatcher not started,
+// backend closing, or worker never started). The mutation log entry has
+// already been durably written by the caller (logQuotaMutation), so if the
+// process crashes before the item is applied, MutationReplayWorker recovers
+// it.
+//
+// Callers must hold mutationMu: mutationWG.Add must not start once
+// stopMutationWorker has set mutationClosed and entered Wait.
+func (b *Dat9Backend) enqueueMutationItem(ctx context.Context, item quotaMutationItem) {
+	d := currentMutationDispatcher()
+	if !b.mutationWorkerOn || b.mutationClosed || d == nil {
+		b.applyQuotaMutationItem(ctx, &item)
 		return
 	}
-	b.mutationQueue <- fn
+	b.mutationWG.Add(1)
+	d.enqueue(item)
 }
 
-// stopMutationWorker shuts down the async mutation queue and waits for
-// all pending mutations to drain.
-func (b *Dat9Backend) stopMutationWorker() {
-	if b.mutationStop != nil {
-		b.mutationStop()
-		b.mutationWG.Wait()
-		b.mutationStop = nil
-		b.mutationQueue = nil
+// applyQuotaMutationItem applies an item synchronously (the inline fallback).
+func (b *Dat9Backend) applyQuotaMutationItem(ctx context.Context, item *quotaMutationItem) {
+	if item.raw != nil {
+		item.raw(ctx)
+		return
 	}
+	b.applyQuotaMutation(ctx, item.mutationType, item.logID, item.pending, item.apply)
+}
+
+// stopMutationWorker blocks new async enqueues (they fall back to inline
+// apply) and waits for already-enqueued items to be fully processed by the
+// dispatcher — including post-apply bookkeeping — so Close never abandons
+// in-flight quota mutations. Idempotent.
+func (b *Dat9Backend) stopMutationWorker() {
+	b.mutationMu.Lock()
+	if !b.mutationWorkerOn {
+		b.mutationMu.Unlock()
+		return
+	}
+	// Set under mutationMu: enqueueMutationItem checks mutationClosed under
+	// the same mutex, so no mutationWG.Add can start once Wait begins.
+	b.mutationClosed = true
+	b.mutationMu.Unlock()
+	b.mutationWG.Wait()
+	b.mutationMu.Lock()
+	b.mutationWorkerOn = false
+	b.mutationMu.Unlock()
 }

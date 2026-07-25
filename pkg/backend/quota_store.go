@@ -70,11 +70,24 @@ type MetaQuotaStore interface {
 	ObservePendingMutations(ctx context.Context) ([]MutationBacklogView, error)
 	HasPendingFileMutation(ctx context.Context, tenantID, fileID string) (bool, error)
 	MarkMutationAppliedTx(tx *sql.Tx, id int64) error
+	// MarkMutationsAppliedTx marks a whole dispatcher batch applied in one
+	// statement; see meta.Store.MarkMutationsAppliedTx for the exact-apply
+	// (RowsAffected == len(ids)) semantics.
+	MarkMutationsAppliedTx(tx *sql.Tx, ids []int64) error
 	IsMutationAlreadyAppliedError(err error) bool
 	IncrMutationRetry(ctx context.Context, id int64, maxRetries int) error
 
 	// Transaction support
 	InTx(ctx context.Context, fn func(tx *sql.Tx) error) error
+
+	// QuotaStoreIdentity returns a stable, comparable identity of the
+	// underlying store behind this handle. tenant.Pool wraps one *meta.Store
+	// in a per-backend adapter, so the mutation dispatcher must group batch
+	// items by this identity rather than by interface value — otherwise every
+	// adapter forms its own singleton group and cross-tenant batching never
+	// happens. Handles backed by the same underlying store must return equal
+	// identities.
+	QuotaStoreIdentity() any
 }
 
 // QuotaConfigView is the backend-side view of per-tenant quota configuration.

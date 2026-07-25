@@ -15,8 +15,10 @@ import (
 	"math"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -348,6 +350,14 @@ func main() {
 			// Do not re-read DRIVE9_TIDBCLOUD_CLUSTERS_BACKEND on each open.
 			SharedDBForcePlaintext: tidbcloudnative.IsLocalClustersBackend(),
 		}, enc)
+		// The cross-tenant quota mutation dispatcher (started in
+		// server.startNotifyInfrastructure) must outlive every backend:
+		// backend.Close waits for its queued items to be processed through
+		// the dispatcher. Defers run LIFO, so registering this before
+		// pool.Close makes it run after the pool (and all backends) closed.
+		// On process kill neither defer runs; MutationReplayWorker recovers
+		// any items still pending in the durable quota_mutation_log.
+		defer backend.StopMutationDispatcher()
 		defer pool.Close()
 
 		pool.SetMetaStore(store)
@@ -425,7 +435,7 @@ func main() {
 			zap.Bool("push_enabled", podNotifySecret != nil))
 	}
 
-	die(server.NewWithConfig(server.Config{
+	srv := server.NewWithConfig(server.Config{
 		Meta:                  store,
 		Pool:                  pool,
 		Provisioner:           provisioner,
@@ -474,7 +484,38 @@ func main() {
 		PodID:                           podID,
 		PodAddr:                         podAddr,
 		PodNotifySecret:                 podNotifySecret,
-	}).ListenAndServe(addr))
+	})
+
+	// Graceful shutdown: on SIGINT/SIGTERM drain in-flight requests so
+	// ListenAndServe returns and srv.Close() below can run the final notify
+	// coalescer flush (and worker teardown) BEFORE the deferred pool.Close,
+	// StopMutationDispatcher, and store close registered above tear down the
+	// stores the flush still needs.
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	shutdownDone := make(chan struct{})
+	go func() {
+		<-stopCtx.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			logger.Warn(context.Background(), "server_shutdown_failed", zap.Error(err))
+		}
+		close(shutdownDone)
+	}()
+
+	die(srv.ListenAndServe(addr))
+	// ListenAndServe returns as soon as Shutdown closes the listener, which can
+	// be BEFORE in-flight requests have drained. When the return was
+	// signal-driven, join the shutdown goroutine first so srv.Close() (final
+	// notify flush, worker teardown) and the deferred pool/dispatcher/store
+	// teardown never run while handlers are still writing.
+	if stopCtx.Err() != nil {
+		<-shutdownDone
+	}
+	// Direct call, not a defer: defers run only after main returns, and this
+	// must precede the deferred teardown registered above.
+	srv.Close()
 }
 
 func envOr(key, fallback string) string {
