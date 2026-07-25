@@ -199,10 +199,13 @@ func TestSharedTenantPoolRefillPlansTenPoolsInOneBatch(t *testing.T) {
 	defer poolManager.Close()
 	poolManager.SetMetaStore(metaStore)
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1"}
-	secret := make([]byte, 32)
-	_, _ = rand.Read(secret)
-	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
-		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, SharedDBMaxTenants: 1, TokenSecret: secret})
+	workerCtx, cancel := context.WithCancel(context.Background())
+	srv := &Server{
+		meta: metaStore, pool: poolManager, provisioner: prov,
+		defaultTenantProvider: tenant.ProviderTiDBCloudNativeShared,
+		sharedDBMaxTenants:    1, managedSharedDBCloudBatchSize: 10,
+		forkWorkerCtx: workerCtx, forkWorkerCancel: cancel,
+	}
 	defer srv.Close()
 	now := time.Now().UTC()
 	if err := metaStore.CreateTenantPool(context.Background(), &meta.TenantPool{PoolID: "pool-shared-10",
@@ -1180,7 +1183,7 @@ func TestAdminTenantPoolReplenishBatchesBelowFreeWatermark(t *testing.T) {
 	}
 }
 
-func TestAdminTenantPoolReplenishChunksLargeRefill(t *testing.T) {
+func TestAdminTenantPoolReplenishSubmitsLargeRefillAsSingleWave(t *testing.T) {
 	oldRetryWindow := schemaInitRetryWindow
 	schemaInitRetryWindow = 100 * time.Millisecond
 	t.Cleanup(func() { schemaInitRetryWindow = oldRetryWindow })
@@ -1206,8 +1209,7 @@ func TestAdminTenantPoolReplenishChunksLargeRefill(t *testing.T) {
 		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, SharedDBMaxTenants: 100,
 		TokenSecret: make([]byte, 32)})
 	defer srv.Close()
-	// Make each refill batch visible as one cloud batch. The production default
-	// is smaller, but the physical pool count is independent of this test knob.
+	// Make the complete three-pool refill wave visible as one Cloud batch.
 	srv.managedSharedDBCloudBatchSize = 250
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -1253,11 +1255,11 @@ func TestAdminTenantPoolReplenishChunksLargeRefill(t *testing.T) {
 	})
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if got := prov.sharedPoolBatchCalls.Load(); got >= 3 {
+		if got := prov.sharedPoolBatchCalls.Load(); got >= 1 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("shared cloud batch calls = %d, want three bounded refill batches", prov.sharedPoolBatchCalls.Load())
+			t.Fatalf("shared cloud batch calls = %d, want one complete refill wave", prov.sharedPoolBatchCalls.Load())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1274,6 +1276,12 @@ func TestAdminTenantPoolReplenishChunksLargeRefill(t *testing.T) {
 			t.Fatalf("free size = %d, want %d after refill", free, pool.Size)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 1 {
+		t.Fatalf("shared cloud batch calls = %d, want 1", got)
+	}
+	if got := prov.sharedPoolBatchMembers.Load(); got != 3 {
+		t.Fatalf("shared cloud batch members = %d, want 3 physical pools", got)
 	}
 }
 
