@@ -252,64 +252,64 @@ func (w *MutationReplayWorker) clearPendingBacklogGauges() {
 
 func (w *MutationReplayWorker) replayOne(ctx context.Context, entry MutationLogView) error {
 	return w.store.InTx(ctx, func(tx *sql.Tx) error {
-		if err := w.applyMutation(ctx, tx, entry); err != nil {
+		deltas, err := w.applyMutation(ctx, tx, entry)
+		if err != nil {
+			return err
+		}
+		// Flush the counter deltas before the mark so the tenant_quota_usage
+		// hot row is touched once, at the end of the tx ("hot row last").
+		if err := applyQuotaCounterDeltasTx(w.store, tx, entry.TenantID, deltas); err != nil {
 			return err
 		}
 		return w.store.MarkMutationAppliedTx(tx, entry.ID)
 	})
 }
 
-func (w *MutationReplayWorker) applyMutation(ctx context.Context, tx *sql.Tx, entry MutationLogView) error {
+func (w *MutationReplayWorker) applyMutation(ctx context.Context, tx *sql.Tx, entry MutationLogView) (quotaCounterDeltas, error) {
 	return applyCentralQuotaMutationTx(ctx, w.store, tx, entry.TenantID, entry.MutationType, entry.MutationData, entry.ID)
 }
 
-func applyCentralQuotaMutationTx(ctx context.Context, store MetaQuotaStore, tx *sql.Tx, tenantID, mutationType string, mutationData json.RawMessage, logID int64) error {
+func applyCentralQuotaMutationTx(ctx context.Context, store MetaQuotaStore, tx *sql.Tx, tenantID, mutationType string, mutationData json.RawMessage, logID int64) (quotaCounterDeltas, error) {
 	switch mutationType {
 	case "file_create":
 		var data fileCreateMutationData
 		if err := json.Unmarshal(mutationData, &data); err != nil {
-			return err
+			return quotaCounterDeltas{}, err
 		}
 		return applyCentralFileCreateTx(store, tx, tenantID, data)
 
 	case "file_overwrite":
 		var data fileOverwriteMutationData
 		if err := json.Unmarshal(mutationData, &data); err != nil {
-			return err
+			return quotaCounterDeltas{}, err
 		}
 		return applyCentralFileOverwriteTx(store, tx, tenantID, data)
 
 	case "file_delete":
 		var data fileDeleteMutationData
 		if err := json.Unmarshal(mutationData, &data); err != nil {
-			return err
+			return quotaCounterDeltas{}, err
 		}
 		deleted, err := store.DeleteFileMetaIfExistsTx(tx, tenantID, data.FileID)
 		if err != nil {
-			return err
+			return quotaCounterDeltas{}, err
 		}
 		if !deleted {
-			return nil
+			return quotaCounterDeltas{}, nil
 		}
-		if data.SizeBytes != 0 {
-			if err := store.IncrStorageBytesTx(tx, tenantID, -data.SizeBytes); err != nil {
-				return err
-			}
-		}
-		if err := store.IncrFileCountTx(tx, tenantID, -1); err != nil {
-			return err
+		deltas := quotaCounterDeltas{
+			storageBytes: -data.SizeBytes,
+			fileCount:    -1,
 		}
 		if data.IsMedia {
-			if err := store.IncrMediaFileCountTx(tx, tenantID, -1); err != nil {
-				return err
-			}
+			deltas.mediaFileCount = -1
 		}
-		return nil
+		return deltas, nil
 
 	case "upload_complete":
 		var data uploadCompleteMutationData
 		if err := json.Unmarshal(mutationData, &data); err != nil {
-			return err
+			return quotaCounterDeltas{}, err
 		}
 		// Real shared helper — same body as the inline fast path in
 		// completeUploadReservation. MarkMutationAppliedTx stays with the
@@ -321,8 +321,11 @@ func applyCentralQuotaMutationTx(ctx context.Context, store MetaQuotaStore, tx *
 	case "llm_cost_record":
 		var data llmCostMutationData
 		if err := json.Unmarshal(mutationData, &data); err != nil {
-			return err
+			return quotaCounterDeltas{}, err
 		}
+		// LLM cost writes go to tenant_llm_usage and tenant_monthly_llm_cost
+		// — different tables than the tenant_quota_usage hot row, and rare —
+		// so they stay inline and this apply returns zero counter deltas.
 		if err := store.InsertCentralLLMUsageTx(tx, &LLMUsageView{
 			TenantID:       tenantID,
 			TaskType:       data.TaskType,
@@ -331,15 +334,18 @@ func applyCentralQuotaMutationTx(ctx context.Context, store MetaQuotaStore, tx *
 			RawUnits:       data.RawUnits,
 			RawUnitType:    data.RawUnitType,
 		}); err != nil {
-			return err
+			return quotaCounterDeltas{}, err
 		}
-		return store.IncrMonthlyLLMCostTx(tx, tenantID, data.CostMillicents)
+		if err := store.IncrMonthlyLLMCostTx(tx, tenantID, data.CostMillicents); err != nil {
+			return quotaCounterDeltas{}, err
+		}
+		return quotaCounterDeltas{}, nil
 
 	default:
 		logger.Warn(context.Background(), "mutation_replay_unknown_type",
 			zap.String("tenant_id", tenantID),
 			zap.String("mutation_type", mutationType),
 			zap.Int64("log_id", logID))
-		return nil // skip unknown types gracefully
+		return quotaCounterDeltas{}, nil // skip unknown types gracefully
 	}
 }

@@ -56,6 +56,9 @@ func (m *mockQuotaStore) IncrVideoFileCountTx(_ *sql.Tx, _ string, _ int64) erro
 func (m *mockQuotaStore) TransferReservedToConfirmedTx(_ *sql.Tx, _ string, _, _ int64) error {
 	return nil
 }
+func (m *mockQuotaStore) IncrQuotaUsageCountersTx(_ *sql.Tx, _ string, _, _, _, _ int64) error {
+	return nil
+}
 
 func (m *mockQuotaStore) UpsertFileMeta(_ context.Context, _ *FileMetaView) error { return nil }
 func (m *mockQuotaStore) GetFileMeta(_ context.Context, _, _ string) (*FileMetaView, error) {

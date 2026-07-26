@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"hash/fnv"
+	"sort"
 	"sync"
 
 	"go.uber.org/zap"
@@ -43,7 +44,7 @@ type quotaMutationItem struct {
 	mutationType   string
 	logID          int64
 	pending        quotaPendingDeltas
-	apply          func(context.Context, *sql.Tx) error
+	apply          func(context.Context, *sql.Tx) (quotaCounterDeltas, error)
 	// raw is a pre-built closure submitted through the legacy enqueueMutation
 	// API (unit tests). Raw items bypass batching and run one by one.
 	raw func(context.Context)
@@ -213,6 +214,16 @@ type mutationStoreGroup struct {
 // per-tenant FIFO is guaranteed by mutationMu plus one shard per tenant),
 // then one batch mark.
 //
+// Applies return their tenant_quota_usage counter deltas instead of
+// executing them inline; the runner aggregates them per tenant (items are
+// cross-tenant) and flushes them after the last apply in SORTED tenant_id
+// order — a deterministic global lock order so two pods' batch transactions
+// cannot deadlock each other by locking the per-tenant hot rows in different
+// orders. Deferring the counter updates to the end of the tx ("hot row
+// last") shrinks the lock-hold window on the single per-tenant
+// tenant_quota_usage row from the whole batch to just before commit, and N
+// mutations for one tenant collapse into one UPDATE.
+//
 // On any failure — including InnoDB killing the batch as a cross-pod
 // deadlock victim (two pods' batch transactions lock tenant_file_meta rows
 // in different orders) or the batch mark detecting an already-applied row —
@@ -232,8 +243,23 @@ func processMutationStoreGroup(ctx context.Context, store MetaQuotaStore, items 
 		ids[i] = item.logID
 	}
 	err := store.InTx(ctx, func(tx *sql.Tx) error {
+		deltasByTenant := make(map[string]quotaCounterDeltas)
 		for _, item := range items {
-			if err := item.apply(ctx, tx); err != nil {
+			deltas, err := item.apply(ctx, tx)
+			if err != nil {
+				return err
+			}
+			agg := deltasByTenant[item.tenantID]
+			agg.add(deltas)
+			deltasByTenant[item.tenantID] = agg
+		}
+		tenantIDs := make([]string, 0, len(deltasByTenant))
+		for tenantID := range deltasByTenant {
+			tenantIDs = append(tenantIDs, tenantID)
+		}
+		sort.Strings(tenantIDs)
+		for _, tenantID := range tenantIDs {
+			if err := applyQuotaCounterDeltasTx(store, tx, tenantID, deltasByTenant[tenantID]); err != nil {
 				return err
 			}
 		}
