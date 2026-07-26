@@ -210,18 +210,29 @@ func generateManagedSharedDBRootPassword(length int) (string, error) {
 }
 
 func (s *Server) materializeSharedTenantQuota(ctx context.Context, tenantID string, opts provisionTenantOptions) error {
+	cfg, err := s.sharedTenantQuotaConfig(tenantID, opts)
+	if err != nil {
+		return err
+	}
+	if err := s.meta.SetQuotaConfig(ctx, cfg); err != nil {
+		return fmt.Errorf("materialize shared tenant quota: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) sharedTenantQuotaConfig(tenantID string, opts provisionTenantOptions) (*meta.QuotaConfig, error) {
 	virtualLimit := s.sharedTenantVirtualSpendingLimit(opts)
 	var patch meta.QuotaConfigPatch
 	if opts.Quota != nil {
 		req := *opts.Quota
 		req.TenantID = tenantID
 		if err := s.validateQuotaSetRequest(req); err != nil {
-			return err
+			return nil, err
 		}
 		var err error
 		patch, err = quotaConfigPatchFromRequest(req)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	cfg := &meta.QuotaConfig{
@@ -242,10 +253,7 @@ func (s *Server) materializeSharedTenantQuota(ctx context.Context, tenantID stri
 	if patch.MaxFileCount != nil {
 		cfg.MaxFileCount = *patch.MaxFileCount
 	}
-	if err := s.meta.SetQuotaConfig(ctx, cfg); err != nil {
-		return fmt.Errorf("materialize shared tenant quota: %w", err)
-	}
-	return nil
+	return cfg, nil
 }
 
 func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.CredentialProvisionRequest, reserve func(*meta.SharedDB) error) (sharedDB *meta.SharedDB, created bool, err error) {
@@ -927,6 +935,40 @@ func (s *Server) resumeProvisioningManagedSharedDBPoolsWithCtx(ctx context.Conte
 		ids = append(ids, row.ID)
 	}
 	s.runManagedSharedDBProvisioning(ctx, ids)
+}
+
+func (s *Server) resumeActiveManagedSharedDBTenantsWithCtx(ctx context.Context) {
+	rows, err := s.meta.ListActiveSharedDBsWithProvisioningTenantsAfter(ctx, s.managedSharedDBActivationResumeCursor, 1000)
+	if err != nil {
+		logger.Warn(ctx, "managed_shared_db_pool_activation_resume_list_failed", zap.Error(err))
+		return
+	}
+	if len(rows) == 0 && s.managedSharedDBActivationResumeCursor > 0 {
+		s.managedSharedDBActivationResumeCursor = 0
+		rows, err = s.meta.ListActiveSharedDBsWithProvisioningTenantsAfter(ctx, 0, 1000)
+		if err != nil {
+			logger.Warn(ctx, "managed_shared_db_pool_activation_resume_list_failed", zap.Error(err))
+			return
+		}
+	}
+	if len(rows) > 0 && len(rows) < 1000 {
+		s.managedSharedDBActivationResumeCursor = 0
+	} else if len(rows) > 0 {
+		s.managedSharedDBActivationResumeCursor = rows[len(rows)-1].ID
+	}
+	for _, row := range rows {
+		for {
+			activated, activateErr := s.meta.ActivateSharedTenantsBatch(ctx, row.ID, sharedTenantActivationBatchSize)
+			if activateErr != nil {
+				logger.Warn(ctx, "managed_shared_db_pool_activation_resume_failed",
+					zap.Int64("db_pool_id", row.ID), zap.String("db_pool_uuid", row.UUID), zap.Error(activateErr))
+				break
+			}
+			if activated < sharedTenantActivationBatchSize {
+				break
+			}
+		}
+	}
 }
 
 func (s *Server) resumePendingManagedSharedDBPoolsWithCtx(ctx context.Context) {

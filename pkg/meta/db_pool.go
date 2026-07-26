@@ -782,6 +782,45 @@ func (s *Store) listSharedDBsByStatusAfter(ctx context.Context, status string, a
 	return out, rows.Err()
 }
 
+// ListActiveSharedDBsWithProvisioningTenantsAfter returns active physical
+// pools that still have an eligible shared tenant awaiting final activation.
+// This is the durable recovery path for a crash after physical activation but
+// before ActivateSharedTenantsBatch finishes.
+func (s *Store) ListActiveSharedDBsWithProvisioningTenantsAfter(ctx context.Context, afterID int64, limit int) (out []*SharedDB, err error) {
+	if afterID < 0 {
+		return nil, fmt.Errorf("after db id must not be negative")
+	}
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx, "SELECT "+sharedDBSelectColumns+` FROM db_pool d
+		WHERE d.`+"`role`"+` = ? AND d.status = ? AND d.db_id > ?
+			AND EXISTS (
+				SELECT 1 FROM tenant_placements p
+				JOIN fs_registry f ON f.fs_id = p.fs_id
+				JOIN tenants t ON t.id = f.tenant_id
+				WHERE p.db_id = d.db_id AND p.status = ? AND t.provider = ? AND t.status = ?
+					AND (EXISTS (SELECT 1 FROM tenant_api_keys k
+						WHERE k.tenant_id = t.id AND k.scope_kind = ? AND k.status = ?)
+						OR EXISTS (SELECT 1 FROM tenant_pool_memberships m
+							WHERE m.tenant_id = t.id AND m.pool_status = ?)))
+		ORDER BY d.db_id LIMIT ?`, SharedDBRoleShared, SharedDBStatusActive, afterID,
+		SharedDBStatusActive, tidbCloudNativeSharedProvider, TenantProvisioning,
+		APIKeyScopeKindOwner, APIKeyActive, TenantPoolBindingFree, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list active shared dbs with provisioning tenants: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		rec, scanErr := scanSharedDBScanner(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
 // FindSharedDBForAllocation selects the oldest eligible exact-organization
 // pool, preferring active over provisioning over pending. Managed rows use one fixed
 // physical spending limit, so tenant virtual values do not participate in
