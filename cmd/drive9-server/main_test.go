@@ -9,12 +9,55 @@ import (
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/server"
+	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
 func TestVersionTextUsesDrive9ServerComponent(t *testing.T) {
 	got := versionText()
 	if !strings.Contains(got, "component: drive9-server\n") {
 		t.Fatalf("versionText() missing drive9-server component line: %q", got)
+	}
+}
+
+func TestTenantBackendCacheMaxTenantsUsesProviderDefault(t *testing.T) {
+	const key = "DRIVE9_POOL_MAX_TENANTS"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, []string{key})
+
+	tests := []struct {
+		provider string
+		want     int
+	}{
+		{provider: tenant.ProviderTiDBCloudNativeShared, want: 20480},
+		{provider: tenant.ProviderTiDBCloudNative, want: 1024},
+		{provider: tenant.ProviderTiDBZero, want: 1024},
+		{provider: tenant.ProviderDB9, want: 1024},
+	}
+	for _, tt := range tests {
+		t.Run(tt.provider, func(t *testing.T) {
+			if got := tenantBackendCacheMaxTenants(tt.provider); got != tt.want {
+				t.Fatalf("tenantBackendCacheMaxTenants(%q) = %d, want %d", tt.provider, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTenantBackendCacheMaxTenantsExplicitOverrideWins(t *testing.T) {
+	const key = "DRIVE9_POOL_MAX_TENANTS"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	setEnv(t, key, "4096")
+
+	for _, provider := range []string{
+		tenant.ProviderTiDBCloudNativeShared,
+		tenant.ProviderTiDBCloudNative,
+		tenant.ProviderTiDBZero,
+		tenant.ProviderDB9,
+	} {
+		if got := tenantBackendCacheMaxTenants(provider); got != 4096 {
+			t.Fatalf("tenantBackendCacheMaxTenants(%q) = %d, want explicit 4096", provider, got)
+		}
 	}
 }
 

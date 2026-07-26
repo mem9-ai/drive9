@@ -735,6 +735,13 @@ func (p *Pool) reapOnce(ctx context.Context) {
 		if e.retired || e.refs > 0 {
 			continue
 		}
+		// Shared tenant backends are lightweight fs_id-scoped views over a
+		// separately managed physical DB handle. Keep them warm until the
+		// capacity LRU evicts them; applying the standalone idle TTL here turns
+		// stable high-cardinality shared traffic into continuous cold opens.
+		if e.sharedDBID > 0 {
+			continue
+		}
 		if now.Sub(e.lastUsed) > p.idleTimeout {
 			if removed := p.removeLocked(e.elem, "idle"); removed != nil {
 				toClose = append(toClose, removed)
