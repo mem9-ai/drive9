@@ -460,8 +460,6 @@ func main() {
 			server.DefaultTenantPoolReconcileWorkers),
 		TenantPoolReconcileWorkerRest: envDuration("DRIVE9_TENANT_POOL_RECONCILE_WORKER_REST",
 			server.DefaultTenantPoolReconcileWorkerRest),
-		ManagedSharedDBPlannedCapacityLease: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_PLANNED_CAPACITY_LEASE",
-			server.DefaultManagedSharedDBPlannedCapacityLease),
 		ManagedSharedDBStuckTimeout: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_STUCK_TIMEOUT",
 			server.DefaultManagedSharedDBStuckTimeout),
 		ManagedSharedDBFailedCleanupInterval: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_INTERVAL",
@@ -697,7 +695,6 @@ environment:
   DRIVE9_TENANT_POOL_RECONCILE_INTERVAL leader logical-pool refill scan interval (default: 5s)
   DRIVE9_TENANT_POOL_RECONCILE_WORKERS concurrent queued leader logical-pool refill workers (default: 15)
   DRIVE9_TENANT_POOL_RECONCILE_WORKER_REST delay before a completed refill worker takes another task (default: 5s)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_PLANNED_CAPACITY_LEASE maximum age for pending/provisioning capacity to offset refill (default: 1m)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_STUCK_TIMEOUT pending/provisioning no-progress timeout (default: 15m)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_INTERVAL failed physical-pool cleanup interval (default: 1m)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_BATCH_SIZE failed physical pools processed per cleanup pass (default: 5)

@@ -353,6 +353,16 @@ func TestMarkStuckSharedDBPoolFailedAtomicallyFailsPlacedPoolTenants(t *testing.
 			if err != nil || slots != 0 {
 				t.Fatalf("free slots after failure = %d, %v; want 0", slots, err)
 			}
+			lateResult := &SharedDB{ID: dbID, TiDBCloudOrganizationID: "org-stuck",
+				ClusterID: "cluster-late-" + tt.name, Host: "late.example.com", Port: 4000, User: "root",
+				PasswordCipher: []byte("cipher"), Name: "tidbcloud_fs", TLSMode: "true"}
+			if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, lateResult); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("late cloud result after terminal failure = %v, want ErrNotFound", err)
+			}
+			pool, err = s.GetSharedDB(ctx, dbID)
+			if err != nil || pool.Status != SharedDBStatusFailed {
+				t.Fatalf("late cloud result revived failed pool = %+v, %v", pool, err)
+			}
 		})
 	}
 }
@@ -381,13 +391,12 @@ func TestMarkStuckSharedDBPoolFailedUsesStatusAndUpdatedAtCAS(t *testing.T) {
 	}
 }
 
-func TestCountTenantPoolPlannedSlotsUsesSharedPoolProgressLease(t *testing.T) {
+func TestCountTenantPoolPlannedSlotsUsesTerminalState(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 	spendingLimit := MaxTiDBCloudSpendingLimit
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	cutoff := now.Add(-time.Minute)
-	for i, updatedAt := range []time.Time{cutoff.Add(time.Second), cutoff.Add(-time.Second)} {
+	for i, updatedAt := range []time.Time{now.Add(-time.Second), now.Add(-24 * time.Hour)} {
 		dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
 			TiDBCloudOrganizationID: "org-planned-lease", ProvisioningKey: bytes.Repeat([]byte{byte(i + 1)}, 32),
 			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
@@ -412,16 +421,27 @@ func TestCountTenantPoolPlannedSlotsUsesSharedPoolProgressLease(t *testing.T) {
 		}
 	}
 
-	planned, err := s.CountTenantPoolPlannedSlots(ctx, "org-planned-lease", cutoff)
+	planned, err := s.CountTenantPoolPlannedSlots(ctx, "org-planned-lease")
 	if err != nil {
 		t.Fatalf("CountTenantPoolPlannedSlots: %v", err)
 	}
+	if planned != 2 {
+		t.Fatalf("planned slots = %d, want both non-terminal assigned tenants regardless of age", planned)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ? WHERE org_id = ? ORDER BY db_id LIMIT 1`,
+		SharedDBStatusFailed, "org-planned-lease"); err != nil {
+		t.Fatalf("fail one physical plan: %v", err)
+	}
+	planned, err = s.CountTenantPoolPlannedSlots(ctx, "org-planned-lease")
+	if err != nil {
+		t.Fatalf("CountTenantPoolPlannedSlots after terminal transition: %v", err)
+	}
 	if planned != 1 {
-		t.Fatalf("planned slots = %d, want only the assigned tenant in the unexpired shared plan", planned)
+		t.Fatalf("planned slots after one physical plan failed = %d, want 1", planned)
 	}
 }
 
-func TestCountTenantPoolPlannedSlotsIncludesRecentUnstartedPhysicalPool(t *testing.T) {
+func TestCountTenantPoolPlannedSlotsIncludesUnstartedPhysicalPool(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 	spendingLimit := MaxTiDBCloudSpendingLimit
@@ -431,7 +451,7 @@ func TestCountTenantPoolPlannedSlotsIncludesRecentUnstartedPhysicalPool(t *testi
 	}); err != nil {
 		t.Fatalf("CreateManagedSharedDBPool: %v", err)
 	}
-	planned, err := s.CountTenantPoolPlannedSlots(ctx, "org-unstarted-physical-plan", time.Now().UTC().Add(-time.Minute))
+	planned, err := s.CountTenantPoolPlannedSlots(ctx, "org-unstarted-physical-plan")
 	if err != nil {
 		t.Fatalf("CountTenantPoolPlannedSlots: %v", err)
 	}
@@ -440,7 +460,7 @@ func TestCountTenantPoolPlannedSlotsIncludesRecentUnstartedPhysicalPool(t *testi
 	}
 }
 
-func TestCountTenantPoolPlannedSlotsIncludesRecentActivePoolPlacementGap(t *testing.T) {
+func TestCountTenantPoolPlannedSlotsIncludesActivePoolPlacementGap(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 	spendingLimit := MaxTiDBCloudSpendingLimit
@@ -478,7 +498,7 @@ func TestCountTenantPoolPlannedSlotsIncludesRecentActivePoolPlacementGap(t *test
 	if err != nil {
 		t.Fatalf("CountFreeTenantPoolBindings: %v", err)
 	}
-	planned, err := s.CountTenantPoolPlannedSlots(ctx, "org-active-placement-gap", now.Add(-time.Minute))
+	planned, err := s.CountTenantPoolPlannedSlots(ctx, "org-active-placement-gap")
 	if err != nil {
 		t.Fatalf("CountTenantPoolPlannedSlots: %v", err)
 	}

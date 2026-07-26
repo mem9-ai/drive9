@@ -177,12 +177,12 @@ func TestManagedSharedDBWorkerConfigDefaultsAndOverrides(t *testing.T) {
 		defaults.managedSharedDBMetadataPollInterval != 15*time.Second || defaults.managedSharedDBProvisioningWorkers != 100 ||
 		defaults.tenantPoolReconcileInterval != 5*time.Second || defaults.tenantPoolReconcileWorkerRest != 5*time.Second ||
 		defaults.managedSharedDBStuckTimeout != 15*time.Minute || defaults.tenantPoolReconcileWorkers != 15 ||
-		defaults.managedSharedDBPlannedCapacityLease != time.Minute || defaults.managedSharedDBFailedCleanupInterval != time.Minute || defaults.managedSharedDBFailedCleanupBatchSize != 5 {
-		t.Fatalf("managed shared defaults = cloud_batch(%d) metadata(%d,%d,%s) provisioning(%d) reconcile(%s,%d,%s) planned_lease(%s) stuck(%s) failed_cleanup(%s,%d)",
+		defaults.managedSharedDBFailedCleanupInterval != time.Minute || defaults.managedSharedDBFailedCleanupBatchSize != 5 {
+		t.Fatalf("managed shared defaults = cloud_batch(%d) metadata(%d,%d,%s) provisioning(%d) reconcile(%s,%d,%s) stuck(%s) failed_cleanup(%s,%d)",
 			defaults.managedSharedDBCloudBatchSize,
 			defaults.managedSharedDBMetadataWorkers, defaults.managedSharedDBMetadataBatchSize, defaults.managedSharedDBMetadataPollInterval,
 			defaults.managedSharedDBProvisioningWorkers, defaults.tenantPoolReconcileInterval, defaults.tenantPoolReconcileWorkers,
-			defaults.tenantPoolReconcileWorkerRest, defaults.managedSharedDBPlannedCapacityLease, defaults.managedSharedDBStuckTimeout,
+			defaults.tenantPoolReconcileWorkerRest, defaults.managedSharedDBStuckTimeout,
 			defaults.managedSharedDBFailedCleanupInterval, defaults.managedSharedDBFailedCleanupBatchSize)
 	}
 	overrides := NewWithConfig(Config{
@@ -190,7 +190,6 @@ func TestManagedSharedDBWorkerConfigDefaultsAndOverrides(t *testing.T) {
 		ManagedSharedDBMetadataWorkers: 5, ManagedSharedDBMetadataBatchSize: 6, ManagedSharedDBMetadataPollInterval: 7 * time.Second,
 		ManagedSharedDBProvisioningWorkers: 8, TenantPoolReconcileInterval: 9 * time.Second, ManagedSharedDBStuckTimeout: 11 * time.Minute,
 		TenantPoolReconcileWorkers: 4, TenantPoolReconcileWorkerRest: 3 * time.Second,
-		ManagedSharedDBPlannedCapacityLease:  2 * time.Minute,
 		ManagedSharedDBFailedCleanupInterval: 2 * time.Minute, ManagedSharedDBFailedCleanupBatchSize: 3,
 	})
 	t.Cleanup(overrides.Close)
@@ -198,7 +197,7 @@ func TestManagedSharedDBWorkerConfigDefaultsAndOverrides(t *testing.T) {
 		overrides.managedSharedDBMetadataWorkers != 5 || overrides.managedSharedDBMetadataBatchSize != 6 ||
 		overrides.managedSharedDBMetadataPollInterval != 7*time.Second || overrides.managedSharedDBProvisioningWorkers != 8 ||
 		overrides.tenantPoolReconcileInterval != 9*time.Second || overrides.tenantPoolReconcileWorkers != 4 ||
-		overrides.tenantPoolReconcileWorkerRest != 3*time.Second || overrides.managedSharedDBPlannedCapacityLease != 2*time.Minute ||
+		overrides.tenantPoolReconcileWorkerRest != 3*time.Second ||
 		overrides.managedSharedDBStuckTimeout != 11*time.Minute ||
 		overrides.managedSharedDBFailedCleanupInterval != 2*time.Minute || overrides.managedSharedDBFailedCleanupBatchSize != 3 {
 		t.Fatalf("managed shared overrides were not retained")

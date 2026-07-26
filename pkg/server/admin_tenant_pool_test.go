@@ -288,7 +288,7 @@ func TestSharedTenantPoolRefillPlansTenPoolsInOneBatch(t *testing.T) {
 	}
 }
 
-func TestSharedTenantPoolRefillStagesWholePhysicalWaveBeforePlacement(t *testing.T) {
+func TestSharedTenantPoolRefillMakesWaveVisibleOnlyAfterMembershipReservation(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -331,6 +331,7 @@ func TestSharedTenantPoolRefillStagesWholePhysicalWaveBeforePlacement(t *testing
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	finished := false
 	go func() {
 		_, err := srv.createFreeSharedPoolTenants(ctx, "pool-stage-wave", 6,
 			tenant.CredentialProvisionRequest{}, nil)
@@ -340,33 +341,61 @@ func TestSharedTenantPoolRefillStagesWholePhysicalWaveBeforePlacement(t *testing
 		cancel()
 		_, _ = lockConn.ExecContext(context.Background(), `UNLOCK TABLES`)
 		_ = lockConn.Close()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Error("shared refill did not stop after releasing quota table lock")
+		if !finished {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Error("shared refill did not stop after releasing quota table lock")
+			}
 		}
 		srv.Close()
 	})
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		var managedPools int
-		if err := metaStore.DB().QueryRowContext(context.Background(),
-			`SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, "org-stage-wave").Scan(&managedPools); err != nil {
-			t.Fatal(err)
-		}
-		if managedPools == 3 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("physical pools staged before placement = %d, want complete three-pool wave", managedPools)
-		}
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case <-batchStarted:
+		t.Fatal("Cloud batch started before tenant membership reservations committed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := metaStore.FindSharedDBForAllocation(context.Background(), "org-stage-wave"); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("direct allocation saw refill-staged capacity before membership commit: %v", err)
+	}
+	if _, err := lockConn.ExecContext(context.Background(), `UNLOCK TABLES`); err != nil {
+		t.Fatal(err)
 	}
 	select {
 	case <-batchStarted:
-	case <-time.After(time.Second):
-		t.Fatal("Cloud batch did not start while tenant quota writes were still blocked")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cloud batch did not start after durable wave staging committed")
+	}
+	select {
+	case err := <-done:
+		finished = true
+		if err != nil {
+			t.Fatalf("createFreeSharedPoolTenants: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shared refill did not finish after durable wave staging")
+	}
+	free, err := metaStore.CountTenantPoolFreeSlots(context.Background(), "org-stage-wave")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if free != 6 {
+		t.Fatalf("durably reserved free slots = %d, want 6", free)
+	}
+	if _, err := metaStore.FindSharedDBForAllocation(context.Background(), "org-stage-wave"); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("direct allocation saw capacity already reserved by the completed refill wave: %v", err)
+	}
+	active, err := metaStore.CountFreeTenantPoolBindings(context.Background(), "org-stage-wave")
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned, err := metaStore.CountTenantPoolPlannedSlots(context.Background(), "org-stage-wave")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active+planned != 6 {
+		t.Fatalf("active + planned slots after atomic wave commit = %d + %d, want 6", active, planned)
 	}
 }
 
@@ -418,52 +447,6 @@ func TestSharedTenantPoolRefillPlansWithServerOwnedSharedCredential(t *testing.T
 	}
 	if got := prov.iamCalls.Load(); got != 0 {
 		t.Fatalf("identity lookups = %d, want 0", got)
-	}
-}
-
-func TestSharedTenantPoolRefillLimitsPhysicalPartitionWorkersGlobally(t *testing.T) {
-	const wantConcurrency = 30
-	started := make(chan struct{}, 2*(wantConcurrency+1))
-	release := make(chan struct{})
-	done := make(chan []sharedPoolTenantCreateOutcome, 2)
-	globalSlots := make(chan struct{}, wantConcurrency)
-	for wave := 0; wave < 2; wave++ {
-		partitions := make([]sharedPoolTenantPartition, wantConcurrency+1)
-		for i := range partitions {
-			partitions[i] = sharedPoolTenantPartition{db: &meta.SharedDB{ID: int64(wave*100 + i + 1)}, tenantCount: 1}
-		}
-		go func() {
-			done <- runSharedPoolTenantPartitionWorkers(context.Background(), globalSlots, partitions, func(sharedPoolTenantPartition) sharedPoolTenantCreateOutcome {
-				started <- struct{}{}
-				<-release
-				return sharedPoolTenantCreateOutcome{}
-			})
-		}()
-	}
-	for i := 0; i < wantConcurrency; i++ {
-		select {
-		case <-started:
-		case <-time.After(500 * time.Millisecond):
-			close(release)
-			<-done
-			<-done
-			t.Fatalf("started %d/%d tenant workers before release", i, wantConcurrency)
-		}
-	}
-	select {
-	case <-started:
-		close(release)
-		<-done
-		<-done
-		t.Fatal("started a 31st tenant writer across concurrent refill waves")
-	case <-time.After(100 * time.Millisecond):
-	}
-	close(release)
-	for wave := 0; wave < 2; wave++ {
-		outcomes := <-done
-		if len(outcomes) != wantConcurrency+1 {
-			t.Fatalf("wave %d outcomes = %d, want %d", wave, len(outcomes), wantConcurrency+1)
-		}
 	}
 }
 
@@ -1605,7 +1588,7 @@ func TestSharedTenantPoolLeaderReconcilerRefillsZeroInventory(t *testing.T) {
 	}
 }
 
-func TestSharedTenantPoolRefillReplacesExpiredPlannedCapacity(t *testing.T) {
+func TestSharedTenantPoolRefillDoesNotReplaceRecoverablePlannedCapacity(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -1626,8 +1609,8 @@ func TestSharedTenantPoolRefillReplacesExpiredPlannedCapacity(t *testing.T) {
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1"}
 	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
 		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, SharedDBMaxTenants: 1,
-		ManagedSharedDBPlannedCapacityLease: time.Minute, TokenSecret: make([]byte, 32),
-		Leader: newFollowerLeaderManager(t, metaStore)})
+		TokenSecret: make([]byte, 32),
+		Leader:      newFollowerLeaderManager(t, metaStore)})
 	t.Cleanup(func() { srv.Close() })
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -1662,20 +1645,27 @@ func TestSharedTenantPoolRefillReplacesExpiredPlannedCapacity(t *testing.T) {
 		t.Fatalf("age planned pool: %v", err)
 	}
 
-	srv.replenishTenantPoolAsync(ctx, logicalPool, tenant.CredentialProvisionRequest{})
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var physicalPools int
-		if err := metaStore.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, logicalPool.OrganizationID).Scan(&physicalPools); err != nil {
-			t.Fatalf("count physical pools: %v", err)
-		}
-		if physicalPools >= 2 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("physical pools = %d, want replacement for expired planned capacity", physicalPools)
-		}
-		time.Sleep(10 * time.Millisecond)
+	srv.replenishTenantPool(ctx, logicalPool, tenant.CredentialProvisionRequest{})
+	var physicalPools int
+	if err := metaStore.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, logicalPool.OrganizationID).Scan(&physicalPools); err != nil {
+		t.Fatalf("count pending physical pools: %v", err)
+	}
+	if physicalPools != 1 {
+		t.Fatalf("pending recoverable physical pools = %d, want no replacement", physicalPools)
+	}
+	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE db_pool SET status = ?, updated_at = ? WHERE db_id = ?`,
+		meta.SharedDBStatusActive, now.Add(-20*time.Minute), dbID); err != nil {
+		t.Fatalf("activate and age physical pool: %v", err)
+	}
+	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE tenants SET status = ? WHERE id = ?`, meta.TenantProvisioning, tenantID); err != nil {
+		t.Fatalf("leave tenant activation pending: %v", err)
+	}
+	srv.replenishTenantPool(ctx, logicalPool, tenant.CredentialProvisionRequest{})
+	if err := metaStore.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, logicalPool.OrganizationID).Scan(&physicalPools); err != nil {
+		t.Fatalf("count active physical pools: %v", err)
+	}
+	if physicalPools != 1 {
+		t.Fatalf("active pool with provisioning tenant produced %d physical pools, want no replacement", physicalPools)
 	}
 }
 
@@ -1899,6 +1889,57 @@ func TestManagedSharedDBStuckReconcilerFailsPoolAndPlacedTenant(t *testing.T) {
 	gotTenant, err := metaStore.GetTenant(ctx, tenantID)
 	if err != nil || gotTenant.Status != meta.TenantFailed {
 		t.Fatalf("tenant after stuck reconcile = %+v, %v", gotTenant, err)
+	}
+}
+
+func TestManagedSharedDBActiveTenantReconcilerFinalizesStrandedTenant(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	ctx := context.Background()
+	now := time.Now().UTC()
+	spendingLimit := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-active-recovery", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID := "tenant-active-recovery"
+	if err := metaStore.InsertTenant(ctx, &meta.Tenant{ID: tenantID, Status: meta.TenantPending,
+		Provider: tenant.ProviderTiDBCloudNativeShared, DBPasswordCipher: []byte{}, SchemaVersion: 1,
+		CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	fsID, err := metaStore.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.CompleteSharedTenantPoolMember(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared,
+		&meta.TenantPlacement{FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared},
+		&meta.TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: "org-active-recovery",
+			PoolID: "logical-active-recovery", PoolStatus: meta.TenantPoolBindingFree}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE db_pool SET status = ? WHERE db_id = ?`, meta.SharedDBStatusActive, dbID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE tenants SET status = ? WHERE id = ?`, meta.TenantProvisioning, tenantID); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{meta: metaStore}
+	srv.resumeActiveManagedSharedDBTenantsWithCtx(ctx)
+	got, err := metaStore.GetTenant(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantActive {
+		t.Fatalf("stranded tenant status = %q, want active", got.Status)
 	}
 }
 

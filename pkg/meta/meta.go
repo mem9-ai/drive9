@@ -2192,30 +2192,20 @@ func (s *Store) CountTenantPoolFreeSlots(ctx context.Context, organizationID str
 	return s.countFreeTenantPoolBindingsByStatus(ctx, organizationID, []TenantStatus{TenantPending, TenantProvisioning, TenantActive})
 }
 
-// CountTenantPoolPlannedSlots counts free pending/provisioning inventory that
-// still has recent durable progress. Native plans use tenant progress. Shared
-// plans include assigned free tenants plus recently staged managed physical
-// pools whose tenant placement has not started. Once tenant_count is non-zero,
-// only durable memberships count: db_pool does not persist a wave's intended
-// partial fill, so treating all remaining physical capacity as planned could
-// suppress required tenant-pool replenishment.
-func (s *Store) CountTenantPoolPlannedSlots(ctx context.Context, organizationID string, progressCutoff time.Time) (out int, err error) {
+// CountTenantPoolPlannedSlots counts shared free pending/provisioning inventory
+// whose durable physical attempt remains non-terminal. The stuck-pool watchdog
+// is the sole authority that expires a pending/provisioning physical attempt;
+// active physical pools are finalized by the activation reconciler. Native
+// pending tenants are intentionally excluded because leader refill has no
+// request-scoped customer credential with which to advance them.
+func (s *Store) CountTenantPoolPlannedSlots(ctx context.Context, organizationID string) (out int, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "count_tidbcloud_pool_planned_slots", start, &err)
 	organizationID = strings.TrimSpace(organizationID)
 	if organizationID == "" {
 		return 0, fmt.Errorf("organization_id is required")
 	}
-	if progressCutoff.IsZero() {
-		return 0, fmt.Errorf("progress cutoff is required")
-	}
 	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(slot_count), 0) FROM (
-		SELECT COUNT(*) AS slot_count
-			FROM tenant_tidbcloud_org_bindings b
-			STRAIGHT_JOIN tenants t ON t.id = b.tenant_id
-			WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
-				AND t.status IN (?, ?) AND t.updated_at >= ?
-		UNION ALL
 		SELECT COUNT(*) AS slot_count
 			FROM tenant_pool_memberships m
 			STRAIGHT_JOIN tenants t ON t.id = m.tenant_id
@@ -2223,19 +2213,16 @@ func (s *Store) CountTenantPoolPlannedSlots(ctx context.Context, organizationID 
 			STRAIGHT_JOIN tenant_placements p ON p.fs_id = f.fs_id
 			STRAIGHT_JOIN db_pool d ON d.db_id = p.db_id
 			WHERE m.tidbcloud_organization_id = ? AND m.pool_status = ? AND t.provider = ?
-				AND t.status IN (?, ?) AND d.status IN (?, ?, ?) AND d.updated_at >= ?
+				AND t.status IN (?, ?) AND d.status IN (?, ?, ?)
 		UNION ALL
 		SELECT COALESCE(SUM(GREATEST(d.max_tenants - d.tenant_count, 0)), 0) AS slot_count
 			FROM db_pool d
 			WHERE d.org_id = ? AND d.`+"`role`"+` = ? AND d.provisioning_key IS NOT NULL
-				AND d.status IN (?, ?) AND d.tenant_count = 0
-				AND d.updated_at >= ? AND d.max_tenants > 0
+				AND d.status IN (?, ?) AND d.tenant_count = 0 AND d.max_tenants > 0
 	) inventory`,
-		organizationID, TenantPoolBindingFree, tidbCloudNativeProvider,
-		TenantPending, TenantProvisioning, progressCutoff.UTC(),
 		organizationID, TenantPoolBindingFree, tidbCloudNativeSharedProvider,
-		TenantPending, TenantProvisioning, SharedDBStatusPending, SharedDBStatusProvisioning, SharedDBStatusActive, progressCutoff.UTC(),
-		organizationID, SharedDBRoleShared, SharedDBStatusPending, SharedDBStatusProvisioning, progressCutoff.UTC())
+		TenantPending, TenantProvisioning, SharedDBStatusPending, SharedDBStatusProvisioning, SharedDBStatusActive,
+		organizationID, SharedDBRoleShared, SharedDBStatusPending, SharedDBStatusProvisioning)
 	if err = row.Scan(&out); err != nil {
 		return 0, err
 	}

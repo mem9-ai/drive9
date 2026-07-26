@@ -69,7 +69,6 @@ type Config struct {
 	TenantPoolReconcileInterval           time.Duration
 	TenantPoolReconcileWorkers            int
 	TenantPoolReconcileWorkerRest         time.Duration
-	ManagedSharedDBPlannedCapacityLease   time.Duration
 	ManagedSharedDBStuckTimeout           time.Duration
 	ManagedSharedDBFailedCleanupInterval  time.Duration
 	ManagedSharedDBFailedCleanupBatchSize int
@@ -221,8 +220,6 @@ type Server struct {
 	tenantPoolReconcileQueue                chan tenantPoolReconcileJob
 	tenantPoolReconcileWorkerRest           time.Duration
 	tenantPoolLeaderReconcileJobs           sync.Map
-	sharedTenantPoolCreateSlots             chan struct{}
-	managedSharedDBPlannedCapacityLease     time.Duration
 	managedSharedDBStuckTimeout             time.Duration
 	managedSharedDBMetadataSlots            chan struct{}
 	managedSharedDBProvisioningSlots        chan struct{}
@@ -233,6 +230,7 @@ type Server struct {
 	managedSharedDBFailedCleanupCursor      int64
 	managedSharedDBPendingResumeCursor      int64
 	managedSharedDBProvisioningResumeCursor int64
+	managedSharedDBActivationResumeCursor   int64
 
 	legacyStarterProvisioner  tenant.Provisioner
 	tokenSecret               []byte
@@ -372,7 +370,6 @@ const (
 	DefaultTenantPoolReconcileInterval           = 5 * time.Second
 	DefaultTenantPoolReconcileWorkers            = 15
 	DefaultTenantPoolReconcileWorkerRest         = 5 * time.Second
-	DefaultManagedSharedDBPlannedCapacityLease   = time.Minute
 	DefaultManagedSharedDBStuckTimeout           = 15 * time.Minute
 	DefaultManagedSharedDBFailedCleanupInterval  = time.Minute
 	DefaultManagedSharedDBFailedCleanupBatchSize = 5
@@ -495,10 +492,6 @@ func NewWithConfig(cfg Config) *Server {
 	if tenantPoolReconcileWorkerRest <= 0 {
 		tenantPoolReconcileWorkerRest = DefaultTenantPoolReconcileWorkerRest
 	}
-	managedSharedDBPlannedCapacityLease := cfg.ManagedSharedDBPlannedCapacityLease
-	if managedSharedDBPlannedCapacityLease <= 0 {
-		managedSharedDBPlannedCapacityLease = DefaultManagedSharedDBPlannedCapacityLease
-	}
 	managedSharedDBStuckTimeout := cfg.ManagedSharedDBStuckTimeout
 	if managedSharedDBStuckTimeout <= 0 {
 		managedSharedDBStuckTimeout = DefaultManagedSharedDBStuckTimeout
@@ -542,8 +535,6 @@ func NewWithConfig(cfg Config) *Server {
 		tenantPoolReconcileWorkers:             tenantPoolReconcileWorkers,
 		tenantPoolReconcileQueue:               make(chan tenantPoolReconcileJob),
 		tenantPoolReconcileWorkerRest:          tenantPoolReconcileWorkerRest,
-		sharedTenantPoolCreateSlots:            make(chan struct{}, sharedTenantPoolCreateConcurrency),
-		managedSharedDBPlannedCapacityLease:    managedSharedDBPlannedCapacityLease,
 		managedSharedDBStuckTimeout:            managedSharedDBStuckTimeout,
 		managedSharedDBFailedCleanupInterval:   managedSharedDBFailedCleanupInterval,
 		managedSharedDBFailedCleanupBatchSize:  managedSharedDBFailedCleanupBatchSize,
@@ -1048,6 +1039,7 @@ func (s *Server) startLeaderWorkers() {
 		}
 		startManagedSharedDBResumeLoop(s.resumePendingManagedSharedDBPoolsWithCtx)
 		startManagedSharedDBResumeLoop(s.resumeProvisioningManagedSharedDBPoolsWithCtx)
+		startManagedSharedDBResumeLoop(s.resumeActiveManagedSharedDBTenantsWithCtx)
 		for range s.tenantPoolReconcileWorkers {
 			s.startLeaderGoroutine(leaderCtx, s.runTenantPoolReconcileWorker)
 		}
