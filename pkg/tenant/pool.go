@@ -568,7 +568,6 @@ func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release fu
 		return nil, nil, false
 	}
 	e.refs++
-	p.order.MoveToFront(e.elem)
 	p.mu.Unlock()
 	metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
 	metrics.RecordTenantOperationWithOrg(t.ID, e.backend.TiDBCloudOrgID(), "user_db_access", "acquire_cached", "hit", 0)

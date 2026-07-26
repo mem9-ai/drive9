@@ -1243,6 +1243,62 @@ func TestCapacityEvictionStillRemovesSharedTenantEntry(t *testing.T) {
 	}
 }
 
+func TestAcquireCachedDoesNotRefreshSharedCapacityLRU(t *testing.T) {
+	pool, busy := newTestPoolAndTenant(t, 2, "tenant-shared-lru-busy")
+	ctx := context.Background()
+
+	busyBackend, releaseBusy, err := pool.Acquire(ctx, busy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busyStore := busyBackend.Store()
+	releaseBusy()
+
+	idle := cloneTenantForID(t, pool, busy, "tenant-shared-lru-idle")
+	idleBackend, releaseIdle, err := pool.Acquire(ctx, idle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idleStore := idleBackend.Store()
+	releaseIdle()
+
+	pool.mu.Lock()
+	pool.items[busy.ID].sharedDBID = 123
+	pool.items[idle.ID].sharedDBID = 123
+	pool.mu.Unlock()
+
+	// Foreground traffic makes busy the most recently used entry.
+	_, releaseBusy, err = pool.Acquire(ctx, busy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseBusy()
+
+	// The safety-net scan may pin idle, but must not rewrite capacity LRU order.
+	_, releaseCached, ok := pool.AcquireCached(idle)
+	if !ok {
+		t.Fatal("expected AcquireCached to hit idle shared tenant")
+	}
+	releaseCached()
+
+	third := cloneTenantForID(t, pool, busy, "tenant-shared-lru-third")
+	_, releaseThird, err := pool.Acquire(ctx, third)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseThird()
+
+	pool.mu.Lock()
+	_, busyCached := pool.items[busy.ID]
+	_, idleCached := pool.items[idle.ID]
+	pool.mu.Unlock()
+	if !busyCached || idleCached {
+		t.Errorf("capacity LRU after safety-net scan: busy cached=%t idle cached=%t, want true false", busyCached, idleCached)
+	}
+	assertStoreOpen(t, busyStore)
+	assertStoreClosed(t, idleStore)
+}
+
 func TestIdleEvictionSkippedByRecentAcquire(t *testing.T) {
 	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
 		MaxTenants:       2,
