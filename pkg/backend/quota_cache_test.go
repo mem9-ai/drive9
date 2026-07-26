@@ -13,9 +13,7 @@ import (
 type cacheTestStore struct {
 	*fakeMetaQuotaStore
 	configCalls   atomic.Int64
-	versionCalls  atomic.Int64
 	usageCalls    atomic.Int64
-	versionErr    error
 	configErr     error
 	configHook    func()
 	configCtxHook func(context.Context)
@@ -59,7 +57,6 @@ func TestQuotaConfigCacheCanceledCallerDoesNotPoisonSharedRefresh(t *testing.T) 
 		_, loadHasDeadline = ctx.Deadline()
 	}
 	c := newQuotaConfigCache("t1", "", store)
-	t.Cleanup(c.stop)
 
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -93,7 +90,6 @@ func TestQuotaConfigCacheFailureCooldownIsFiveSeconds(t *testing.T) {
 	store := newCacheTestStore()
 	store.configErr = errors.New("temporary metadb failure")
 	c := newQuotaConfigCache("t1", "", store)
-	t.Cleanup(c.stop)
 
 	before := time.Now()
 	if cfg := c.get(context.Background()); cfg != nil {
@@ -121,7 +117,6 @@ func TestQuotaConfigCacheColdWaiterHonorsOwnDeadline(t *testing.T) {
 		<-release
 	}
 	c := newQuotaConfigCache("t1", "", store)
-	t.Cleanup(c.stop)
 
 	leaderDone := make(chan *QuotaConfigView, 1)
 	go func() { leaderDone <- c.get(context.Background()) }()
@@ -151,7 +146,6 @@ func TestQuotaConfigCacheWarmWaiterReturnsStaleWithoutWaiting(t *testing.T) {
 	store := newCacheTestStore()
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
 	c := newQuotaConfigCache("t1", "", store)
-	t.Cleanup(c.stop)
 	if cfg := c.get(context.Background()); cfg == nil || cfg.MaxStorageBytes != 1000 {
 		t.Fatalf("initial config = %+v, want storage 1000", cfg)
 	}
@@ -194,14 +188,6 @@ func TestQuotaConfigCacheWarmWaiterReturnsStaleWithoutWaiting(t *testing.T) {
 	}
 }
 
-func (m *cacheTestStore) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
-	m.versionCalls.Add(1)
-	if m.versionErr != nil {
-		return "", m.versionErr
-	}
-	return m.fakeMetaQuotaStore.GetQuotaConfigVersion(ctx, tenantID)
-}
-
 func TestQuotaConfigCacheIsPassiveUntilFirstAccess(t *testing.T) {
 	previousRefreshInterval := quotaConfigCacheRefreshInterval
 	quotaConfigCacheRefreshInterval = 5 * time.Millisecond
@@ -210,13 +196,9 @@ func TestQuotaConfigCacheIsPassiveUntilFirstAccess(t *testing.T) {
 	store := newCacheTestStore()
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
 	c := newQuotaConfigCache("t1", "", store)
-	t.Cleanup(c.stop)
 
 	// Construction must not start a polling loop or touch the store.
 	time.Sleep(20 * time.Millisecond)
-	if got := store.versionCalls.Load(); got != 0 {
-		t.Errorf("versionCalls = %d, want 0", got)
-	}
 	if got := store.configCalls.Load(); got != 0 {
 		t.Errorf("configCalls = %d, want 0", got)
 	}
@@ -227,9 +209,6 @@ func TestQuotaConfigCacheIsPassiveUntilFirstAccess(t *testing.T) {
 	}
 	if cfg.MaxStorageBytes != 1000 {
 		t.Errorf("MaxStorageBytes = %d, want 1000", cfg.MaxStorageBytes)
-	}
-	if got := store.versionCalls.Load(); got != 0 {
-		t.Errorf("versionCalls = %d, want 0", got)
 	}
 	if got := store.configCalls.Load(); got != 1 {
 		t.Errorf("configCalls = %d, want 1", got)
@@ -243,7 +222,6 @@ func TestQuotaConfigCacheReturnsDefensiveCopy(t *testing.T) {
 	store := newCacheTestStore()
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
 	c := newQuotaConfigCache("t1", "", store)
-	t.Cleanup(c.stop)
 
 	cfg := c.get(context.Background())
 	if cfg == nil {
@@ -261,7 +239,6 @@ func TestQuotaConfigCacheReusesSnapshotUntilTTLExpires(t *testing.T) {
 	store := newCacheTestStore()
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
 	c := newQuotaConfigCache("t1", "", store)
-	t.Cleanup(c.stop)
 
 	if cfg := c.get(context.Background()); cfg == nil || cfg.MaxStorageBytes != 1000 {
 		t.Errorf("first config = %+v, want storage 1000", cfg)
@@ -285,16 +262,12 @@ func TestQuotaConfigCacheReusesSnapshotUntilTTLExpires(t *testing.T) {
 	if got := store.configCalls.Load(); got != 2 {
 		t.Errorf("configCalls after expiry = %d, want 2", got)
 	}
-	if got := store.versionCalls.Load(); got != 0 {
-		t.Errorf("versionCalls = %d, want 0", got)
-	}
 }
 
 func TestQuotaConfigCacheCoalescesConcurrentExpiredAccess(t *testing.T) {
 	store := newCacheTestStore()
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
 	c := newQuotaConfigCache("t1", "", store)
-	t.Cleanup(c.stop)
 	if cfg := c.get(context.Background()); cfg == nil {
 		t.Fatal("initial config is nil")
 	}
@@ -324,16 +297,12 @@ func TestQuotaConfigCacheCoalescesConcurrentExpiredAccess(t *testing.T) {
 	if got := store.configCalls.Load(); got != 2 {
 		t.Errorf("configCalls = %d, want initial load plus one coalesced refresh", got)
 	}
-	if got := store.versionCalls.Load(); got != 0 {
-		t.Errorf("versionCalls = %d, want 0", got)
-	}
 }
 
 func TestQuotaConfigCacheRefreshFailureReturnsStaleAndUsesRetryCooldown(t *testing.T) {
 	store := newCacheTestStore()
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
 	c := newQuotaConfigCache("t1", "", store)
-	t.Cleanup(c.stop)
 
 	first := c.get(context.Background())
 	if first == nil {
@@ -358,16 +327,12 @@ func TestQuotaConfigCacheRefreshFailureReturnsStaleAndUsesRetryCooldown(t *testi
 	if got := store.configCalls.Load(); got != 2 {
 		t.Errorf("configCalls during failure cooldown = %d, want 2", got)
 	}
-	if got := store.versionCalls.Load(); got != 0 {
-		t.Errorf("versionCalls = %d, want 0", got)
-	}
 }
 
 func TestQuotaConfigCacheInitialFailureUsesRetryCooldown(t *testing.T) {
 	store := newCacheTestStore()
 	store.configErr = errors.New("temporary metadb failure")
 	c := newQuotaConfigCache("t1", "", store)
-	t.Cleanup(c.stop)
 
 	if cfg := c.get(context.Background()); cfg != nil {
 		t.Errorf("config = %+v, want nil on initial failure", cfg)
@@ -377,9 +342,6 @@ func TestQuotaConfigCacheInitialFailureUsesRetryCooldown(t *testing.T) {
 	}
 	if got := store.configCalls.Load(); got != 1 {
 		t.Errorf("configCalls during failure cooldown = %d, want 1", got)
-	}
-	if got := store.versionCalls.Load(); got != 0 {
-		t.Errorf("versionCalls = %d, want 0", got)
 	}
 	if got := store.usageCalls.Load(); got != 0 {
 		t.Errorf("usageCalls = %d, want 0", got)
@@ -678,11 +640,4 @@ func TestQuotaPendingDeltasCacheRemovesPositiveRaceDeltasOnClearAndExpire(t *tes
 	if got := c.localPositiveDeltas; got.storageDelta != 0 || got.fileDelta != 0 || got.mediaDelta != 0 {
 		t.Fatalf("positive deltas after expire = %+v, want zero", got)
 	}
-}
-
-func TestQuotaConfigCacheStop(t *testing.T) {
-	store := newCacheTestStore()
-	c := newQuotaConfigCache("t1", "", store)
-	c.stop()
-	// Should not panic or block.
 }

@@ -121,15 +121,6 @@ func (f *fakeMetaQuotaStore) GetQuotaConfig(ctx context.Context, tenantID string
 	}, nil
 }
 
-func (f *fakeMetaQuotaStore) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if cfg, ok := f.config[tenantID]; ok {
-		return fmt.Sprintf("v3:%d:%d:%d:%d:%d:%d", cfg.MaxStorageBytes, cfg.MaxFileSizeBytes, cfg.MaxFileCount, cfg.MaxMediaLLMFiles, cfg.MaxVideoLLMFiles, cfg.MaxMonthlyCostMC), nil
-	}
-	return "", nil
-}
-
 func (f *fakeMetaQuotaStore) GetQuotaUsage(ctx context.Context, tenantID string) (*QuotaUsageView, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

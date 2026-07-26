@@ -21,7 +21,6 @@ const defaultTenantMetricTiDBCloudOrgID = "guest"
 type MetaQuotaStore interface {
 	// Config
 	GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConfigView, error)
-	GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error)
 
 	// Counters
 	GetQuotaUsage(ctx context.Context, tenantID string) (*QuotaUsageView, error)

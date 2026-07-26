@@ -28,10 +28,6 @@ func (m *mockQuotaStore) GetQuotaConfig(_ context.Context, _ string) (*QuotaConf
 	return &QuotaConfigView{}, nil
 }
 
-func (m *mockQuotaStore) GetQuotaConfigVersion(_ context.Context, _ string) (string, error) {
-	return "", nil
-}
-
 func (m *mockQuotaStore) GetQuotaUsage(_ context.Context, _ string) (*QuotaUsageView, error) {
 	return &QuotaUsageView{}, nil
 }

@@ -205,10 +205,6 @@ func (c *quotaConfigCache) finishConfigLoadLocked() {
 	close(done)
 }
 
-// stop remains for backend-close call-site compatibility. The cache owns no
-// goroutine or other lifecycle resource.
-func (c *quotaConfigCache) stop() {}
-
 type quotaUsageSnapshot struct {
 	usage     *QuotaUsageView
 	expiresAt time.Time
