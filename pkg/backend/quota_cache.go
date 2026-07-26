@@ -17,8 +17,11 @@ const (
 	// loaded tenant quota config. Override with DRIVE9_QUOTA_CACHE_REFRESH_SECONDS.
 	defaultQuotaConfigCacheRefreshInterval = 30 * time.Second
 	// quotaConfigCacheLoadTimeout bounds a coalesced refresh independently of
-	// the request that happened to win the load lock.
+	// the request that happened to claim load ownership.
 	quotaConfigCacheLoadTimeout = 5 * time.Second
+	// quotaConfigCacheFailureRetryInterval keeps quota changes responsive after
+	// a transient MetaDB failure. Successful refreshes retain the normal TTL.
+	quotaConfigCacheFailureRetryInterval = 5 * time.Second
 	// quotaUsageCacheTTL bounds how long soft small-write quota checks may
 	// reuse central usage counters. Strict upload reservations still read
 	// central usage directly.
@@ -96,7 +99,7 @@ type quotaConfigCache struct {
 	mu          sync.RWMutex
 	snapshot    *QuotaConfigView
 	nextRefresh time.Time
-	loadMu      sync.Mutex
+	loadDone    chan struct{}
 }
 
 // newQuotaConfigCache creates an empty request-driven config cache. Backend
@@ -125,18 +128,40 @@ func (c *quotaConfigCache) cached(now time.Time) (*QuotaConfigView, bool) {
 }
 
 // get returns a defensive copy of the cached config, refreshing it once when
-// its TTL has expired. Concurrent expired requests coalesce on loadMu.
+// its TTL has expired. Warm callers serve stale config while a refresh is in
+// flight; cold callers wait only until their own context is done.
 func (c *quotaConfigCache) get(ctx context.Context) *QuotaConfigView {
 	now := time.Now()
 	if cfg, current := c.cached(now); current {
 		return cfg
 	}
-	c.loadMu.Lock()
-	defer c.loadMu.Unlock()
+
+	c.mu.Lock()
 	now = time.Now()
-	if cfg, current := c.cached(now); current {
+	if now.Before(c.nextRefresh) {
+		cfg := cloneQuotaConfigView(c.snapshot)
+		c.mu.Unlock()
 		return cfg
 	}
+	if c.loadDone != nil {
+		done := c.loadDone
+		stale := cloneQuotaConfigView(c.snapshot)
+		c.mu.Unlock()
+		if stale != nil {
+			return stale
+		}
+		select {
+		case <-done:
+			c.mu.RLock()
+			cfg := cloneQuotaConfigView(c.snapshot)
+			c.mu.RUnlock()
+			return cfg
+		case <-ctx.Done():
+			return nil
+		}
+	}
+	c.loadDone = make(chan struct{})
+	c.mu.Unlock()
 
 	start := now
 	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quotaConfigCacheLoadTimeout)
@@ -153,25 +178,31 @@ func (c *quotaConfigCache) get(ctx context.Context) *QuotaConfigView {
 	c.mu.Lock()
 	c.snapshot = cloneQuotaConfigView(cfg)
 	c.nextRefresh = time.Now().Add(quotaConfigCacheRefreshDelay(quotaConfigCacheRefreshInterval))
+	c.finishConfigLoadLocked()
 	c.mu.Unlock()
 	metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "load", "ok", time.Since(start))
 	return cloneQuotaConfigView(cfg)
 }
 
 func (c *quotaConfigCache) finishFailedLoad(start time.Time, result string) *QuotaConfigView {
-	retryTTL := quotaConfigCacheRefreshInterval
-	if retryTTL < defaultQuotaConfigCacheRefreshInterval {
-		retryTTL = defaultQuotaConfigCacheRefreshInterval
-	}
 	c.mu.Lock()
-	c.nextRefresh = time.Now().Add(quotaConfigCacheRefreshDelay(retryTTL))
+	c.nextRefresh = time.Now().Add(quotaConfigCacheFailureRetryInterval)
 	var stale *QuotaConfigView
 	if c.snapshot != nil {
 		stale = cloneQuotaConfigView(c.snapshot)
 	}
+	c.finishConfigLoadLocked()
 	c.mu.Unlock()
 	metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "load", result, time.Since(start))
 	return stale
+}
+
+// finishConfigLoadLocked publishes the completed load before waking cold
+// waiters. c.mu must be held.
+func (c *quotaConfigCache) finishConfigLoadLocked() {
+	done := c.loadDone
+	c.loadDone = nil
+	close(done)
 }
 
 // stop remains for backend-close call-site compatibility. The cache owns no

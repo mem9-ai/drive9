@@ -89,11 +89,7 @@ func TestQuotaConfigCacheRefreshDelayStaysWithinTTL(t *testing.T) {
 	}
 }
 
-func TestQuotaConfigCacheFailureCooldownUsesNormalTTLMinimum(t *testing.T) {
-	previousRefreshInterval := quotaConfigCacheRefreshInterval
-	quotaConfigCacheRefreshInterval = 5 * time.Second
-	t.Cleanup(func() { quotaConfigCacheRefreshInterval = previousRefreshInterval })
-
+func TestQuotaConfigCacheFailureCooldownIsFiveSeconds(t *testing.T) {
 	store := newCacheTestStore()
 	store.configErr = errors.New("temporary metadb failure")
 	c := newQuotaConfigCache("t1", "", store)
@@ -106,8 +102,95 @@ func TestQuotaConfigCacheFailureCooldownUsesNormalTTLMinimum(t *testing.T) {
 	c.mu.RLock()
 	nextRefresh := c.nextRefresh
 	c.mu.RUnlock()
-	if delay := nextRefresh.Sub(before); delay < 27*time.Second || delay > 31*time.Second {
-		t.Errorf("failure cooldown = %s, want approximately [27s, 30s]", delay)
+	if delay := nextRefresh.Sub(before); delay < 5*time.Second || delay > 6*time.Second {
+		t.Errorf("failure cooldown = %s, want approximately 5s", delay)
+	}
+}
+
+func TestQuotaConfigCacheColdWaiterHonorsOwnDeadline(t *testing.T) {
+	store := newCacheTestStore()
+	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	store.configHook = func() {
+		startedOnce.Do(func() { close(started) })
+		<-release
+	}
+	c := newQuotaConfigCache("t1", "", store)
+	t.Cleanup(c.stop)
+
+	leaderDone := make(chan *QuotaConfigView, 1)
+	go func() { leaderDone <- c.get(context.Background()) }()
+	<-started
+
+	waiterCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	waiterDone := make(chan *QuotaConfigView, 1)
+	go func() { waiterDone <- c.get(waiterCtx) }()
+
+	select {
+	case cfg := <-waiterDone:
+		if cfg != nil {
+			t.Errorf("waiter config = %+v, want nil before cold load completes", cfg)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Error("cold waiter remained blocked after its context deadline")
+	}
+
+	unblock()
+	if cfg := <-leaderDone; cfg == nil || cfg.MaxStorageBytes != 1000 {
+		t.Errorf("leader config = %+v, want storage 1000", cfg)
+	}
+}
+
+func TestQuotaConfigCacheWarmWaiterReturnsStaleWithoutWaiting(t *testing.T) {
+	store := newCacheTestStore()
+	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
+	c := newQuotaConfigCache("t1", "", store)
+	t.Cleanup(c.stop)
+	if cfg := c.get(context.Background()); cfg == nil || cfg.MaxStorageBytes != 1000 {
+		t.Fatalf("initial config = %+v, want storage 1000", cfg)
+	}
+
+	c.mu.Lock()
+	c.nextRefresh = time.Time{}
+	c.mu.Unlock()
+	store.mu.Lock()
+	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 2000}
+	store.mu.Unlock()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	store.configHook = func() {
+		startedOnce.Do(func() { close(started) })
+		<-release
+	}
+
+	leaderDone := make(chan *QuotaConfigView, 1)
+	go func() { leaderDone <- c.get(context.Background()) }()
+	<-started
+	waiterDone := make(chan *QuotaConfigView, 1)
+	go func() { waiterDone <- c.get(context.Background()) }()
+
+	select {
+	case cfg := <-waiterDone:
+		if cfg == nil || cfg.MaxStorageBytes != 1000 {
+			t.Errorf("waiter config = %+v, want stale storage 1000", cfg)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Error("warm waiter blocked behind the in-flight refresh")
+	}
+
+	unblock()
+	if cfg := <-leaderDone; cfg == nil || cfg.MaxStorageBytes != 2000 {
+		t.Errorf("leader config = %+v, want refreshed storage 2000", cfg)
 	}
 }
 
