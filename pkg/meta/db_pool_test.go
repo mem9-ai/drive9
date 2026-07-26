@@ -487,45 +487,6 @@ func TestCountTenantPoolPlannedSlotsIncludesRecentActivePoolPlacementGap(t *test
 	}
 }
 
-func TestTouchManagedSharedDBPoolsHeartbeatsOnlyExpectedStatus(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	spendingLimit := MaxTiDBCloudSpendingLimit
-	ids := make([]int64, 0, 2)
-	for i := 0; i < 2; i++ {
-		dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
-			TiDBCloudOrganizationID: fmt.Sprintf("org-heartbeat-%d", i), ProvisioningKey: bytes.Repeat([]byte{byte(i + 1)}, 32),
-			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		ids = append(ids, dbID)
-	}
-	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ? WHERE db_id = ?`, SharedDBStatusFailed, ids[1]); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
-	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id IN (?, ?)`, old, ids[0], ids[1]); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.TouchManagedSharedDBPools(ctx, ids, SharedDBStatusPending); err != nil {
-		t.Fatalf("TouchManagedSharedDBPools: %v", err)
-	}
-	for i, dbID := range ids {
-		row, err := s.GetSharedDB(ctx, dbID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if i == 0 && !row.UpdatedAt.After(old) {
-			t.Fatalf("pending pool updated_at = %s, want heartbeat after %s", row.UpdatedAt, old)
-		}
-		if i == 1 && !row.UpdatedAt.Equal(old) {
-			t.Fatalf("failed pool updated_at = %s, want unchanged %s", row.UpdatedAt, old)
-		}
-	}
-}
-
 func TestRepairFailedSharedDBPoolTenantCountUsesPlacementsAsTruth(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()

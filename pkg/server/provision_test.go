@@ -542,7 +542,7 @@ func TestManagedSharedDBMetadataWorkerRefillsReadySlots(t *testing.T) {
 	}
 }
 
-func TestManagedSharedDBMetadataWorkerHeartbeatsVisibleIncompletePool(t *testing.T) {
+func TestManagedSharedDBMetadataWorkerDoesNotKeepIncompletePoolAlive(t *testing.T) {
 	origWindow := schemaInitRetryWindow
 	schemaInitRetryWindow = 25 * time.Millisecond
 	t.Cleanup(func() { schemaInitRetryWindow = origWindow })
@@ -567,7 +567,7 @@ func TestManagedSharedDBMetadataWorkerHeartbeatsVisibleIncompletePool(t *testing
 	}); err != nil {
 		t.Fatal(err)
 	}
-	old := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Millisecond)
+	old := time.Now().UTC().Add(-20 * time.Minute).Truncate(time.Millisecond)
 	if _, err := metaStore.DB().ExecContext(context.Background(), `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, old, dbID); err != nil {
 		t.Fatal(err)
 	}
@@ -591,8 +591,17 @@ func TestManagedSharedDBMetadataWorkerHeartbeatsVisibleIncompletePool(t *testing
 	if got.Status != meta.SharedDBStatusPending {
 		t.Fatalf("status = %q, want pending while endpoint metadata is incomplete", got.Status)
 	}
-	if !got.UpdatedAt.After(old) {
-		t.Fatalf("updated_at = %s, want heartbeat after %s", got.UpdatedAt, old)
+	if !got.UpdatedAt.Equal(old) {
+		t.Fatalf("updated_at = %s, want unchanged incomplete-metadata timestamp %s", got.UpdatedAt, old)
+	}
+	srv.managedSharedDBStuckTimeout = 15 * time.Minute
+	srv.reconcileStuckManagedSharedDBPoolsWithCtx(context.Background())
+	got, err = metaStore.GetSharedDB(context.Background(), dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.SharedDBStatusFailed {
+		t.Fatalf("status after stuck reconciliation = %q, want failed", got.Status)
 	}
 }
 

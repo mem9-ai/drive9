@@ -569,9 +569,6 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 	if len(inputs) == 0 {
 		return []*tenant.SharedDBPoolInfo{}, nil
 	}
-	if len(inputs) > 10 {
-		return nil, fmt.Errorf("shared db pool batch size %d exceeds 10", len(inputs))
-	}
 	requests := make([]map[string]any, 0, len(inputs))
 	inputsByUUID := make(map[string]tenant.SharedDBPoolCreateRequest, len(inputs))
 	databaseNames := make(map[string]string, len(inputs))
