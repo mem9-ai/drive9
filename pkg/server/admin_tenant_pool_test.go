@@ -1403,7 +1403,7 @@ func TestAdminTenantPoolReplenishSubmitsLargeRefillAsSingleWave(t *testing.T) {
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1"}
 	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
 		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, SharedDBMaxTenants: 100,
-		TokenSecret: make([]byte, 32)})
+		TokenSecret: make([]byte, 32), Leader: newFollowerLeaderManager(t, metaStore)})
 	defer srv.Close()
 	// Make the complete three-pool refill wave visible as one Cloud batch.
 	srv.managedSharedDBCloudBatchSize = 250
@@ -1582,7 +1582,6 @@ func TestSharedTenantPoolLeaderReconcilerRefillsZeroInventory(t *testing.T) {
 		t.Fatalf("create pool: %v", err)
 	}
 
-	srv.reconcileSharedTenantPoolsWithCtx(ctx)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		slots, countErr := metaStore.CountTenantPoolFreeSlots(ctx, pool.OrganizationID)
