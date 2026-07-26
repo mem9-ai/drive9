@@ -994,7 +994,7 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 		provisionDone <- provisionErr
 	}()
 	now := time.Now().UTC()
-	outcomes := runSharedPoolTenantPartitionWorkers(ctx, partitions, func(partition sharedPoolTenantPartition) sharedPoolTenantCreateOutcome {
+	outcomes := runSharedPoolTenantPartitionWorkers(ctx, s.sharedTenantPoolCreateSlots, partitions, func(partition sharedPoolTenantPartition) sharedPoolTenantCreateOutcome {
 		return s.createFreeSharedPoolTenantOnDB(ctx, poolID, organizationID, quotaOpt, now, partition.db)
 	})
 	results := make([]*provisionTenantResult, 0, count)
@@ -1078,7 +1078,10 @@ func (s *Server) stageSharedPoolTenantWave(ctx context.Context, organizationID s
 	return partitions, nil
 }
 
-func runSharedPoolTenantPartitionWorkers(ctx context.Context, partitions []sharedPoolTenantPartition, create func(sharedPoolTenantPartition) sharedPoolTenantCreateOutcome) []sharedPoolTenantCreateOutcome {
+func runSharedPoolTenantPartitionWorkers(ctx context.Context, globalSlots chan struct{}, partitions []sharedPoolTenantPartition, create func(sharedPoolTenantPartition) sharedPoolTenantCreateOutcome) []sharedPoolTenantCreateOutcome {
+	if globalSlots == nil {
+		globalSlots = make(chan struct{}, sharedTenantPoolCreateConcurrency)
+	}
 	total := 0
 	for _, partition := range partitions {
 		total += partition.tenantCount
@@ -1101,6 +1104,14 @@ func runSharedPoolTenantPartitionWorkers(ctx context.Context, partitions []share
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
+				select {
+				case globalSlots <- struct{}{}:
+				case <-ctx.Done():
+					for i := range job.partition.tenantCount {
+						outcomes[job.offset+i].err = ctx.Err()
+					}
+					continue
+				}
 				for i := range job.partition.tenantCount {
 					index := job.offset + i
 					if ctx.Err() != nil {
@@ -1109,6 +1120,7 @@ func runSharedPoolTenantPartitionWorkers(ctx context.Context, partitions []share
 					}
 					outcomes[index] = create(job.partition)
 				}
+				<-globalSlots
 			}
 		}()
 	}
@@ -1984,10 +1996,7 @@ func (s *Server) enqueueTenantPoolLeaderReplenishment(ctx context.Context, pool 
 	if s.leader != nil && !s.leader.IsLeader() {
 		return false
 	}
-	// The durable scan visits each logical pool once per pass. Do not use the
-	// request-side per-pool gate here: a later scan may queue another bounded
-	// wave for the same pool while an earlier Cloud request is still running.
-	return s.enqueueTenantPoolReconcileWork(ctx, func(workerCtx context.Context) {
+	return s.enqueueTenantPoolLeaderReconcile(ctx, pool.PoolID, func(workerCtx context.Context) {
 		s.replenishTenantPool(workerCtx, pool, cred)
 	})
 }

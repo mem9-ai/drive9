@@ -220,6 +220,8 @@ type Server struct {
 	tenantPoolReconcileWorkers              int
 	tenantPoolReconcileQueue                chan tenantPoolReconcileJob
 	tenantPoolReconcileWorkerRest           time.Duration
+	tenantPoolLeaderReconcileJobs           sync.Map
+	sharedTenantPoolCreateSlots             chan struct{}
 	managedSharedDBPlannedCapacityLease     time.Duration
 	managedSharedDBStuckTimeout             time.Duration
 	managedSharedDBMetadataSlots            chan struct{}
@@ -540,6 +542,7 @@ func NewWithConfig(cfg Config) *Server {
 		tenantPoolReconcileWorkers:             tenantPoolReconcileWorkers,
 		tenantPoolReconcileQueue:               make(chan tenantPoolReconcileJob),
 		tenantPoolReconcileWorkerRest:          tenantPoolReconcileWorkerRest,
+		sharedTenantPoolCreateSlots:            make(chan struct{}, sharedTenantPoolCreateConcurrency),
 		managedSharedDBPlannedCapacityLease:    managedSharedDBPlannedCapacityLease,
 		managedSharedDBStuckTimeout:            managedSharedDBStuckTimeout,
 		managedSharedDBFailedCleanupInterval:   managedSharedDBFailedCleanupInterval,
@@ -981,16 +984,16 @@ func (s *Server) Close() {
 }
 
 func runManagedSharedDBResumeLoop(ctx context.Context, interval time.Duration, resume func(context.Context)) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	resume(ctx)
 	for {
+		resume(ctx)
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			resume(ctx)
+		case <-timer.C:
 		}
+		timer.Stop()
 	}
 }
 
