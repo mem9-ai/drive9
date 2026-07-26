@@ -421,6 +421,7 @@ func NewWithConfig(cfg Config) *Server {
 	if logger == nil {
 		logger, _ = zap.NewProduction()
 	}
+	metrics.SetFeatureEnabled("vault", len(cfg.VaultMasterKey) > 0)
 	metrics.SetModuleAvailability("vault", false)
 	var vaultMK *vault.MasterKey
 	if len(cfg.VaultMasterKey) > 0 {
@@ -792,6 +793,18 @@ func (s *Server) insertTenantNotify(tenantID string, workMask int) {
 			zap.Int("work_mask", workMask),
 			zap.Error(err))
 	}
+}
+
+// broadcastTenantMetricsCleanup immediately clears this process and emits a
+// durable lifecycle signal so every pod clears historical tenant-scoped
+// series. Callers must invoke this only after a deleting/deleted transition or
+// cleanup job has been durably committed.
+func (s *Server) broadcastTenantMetricsCleanup(tenantID string) {
+	if tenantID == "" {
+		return
+	}
+	metrics.DeleteTenantCounters(tenantID)
+	s.insertTenantNotify(tenantID, WorkMetricsCleanup)
 }
 
 // startNotifyInfrastructure launches the unified tenant outbox components

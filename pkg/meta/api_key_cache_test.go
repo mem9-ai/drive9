@@ -2,9 +2,37 @@ package meta
 
 import (
 	"context"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
+
+func TestAPIKeyResolveCacheExportsHitMissAndEntries(t *testing.T) {
+	c := newAPIKeyResolveCache()
+	if _, ok := c.get("metrics-miss"); ok {
+		t.Fatal("unexpected cache hit")
+	}
+	c.fill("metrics-hit", TenantWithAPIKey{Tenant: Tenant{ID: "cache-metrics-tenant"}})
+	if _, ok := c.get("metrics-hit"); !ok {
+		t.Fatal("expected cache hit")
+	}
+
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	text := rec.Body.String()
+	for _, want := range []string{
+		`drive9_api_key_resolve_cache_requests_total{result="miss"}`,
+		`drive9_api_key_resolve_cache_requests_total{result="hit"}`,
+		`drive9_api_key_resolve_cache_entries 1.000000`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing API key cache metric %q:\n%s", want, text)
+		}
+	}
+}
 
 func insertCacheTestTenant(t *testing.T, s *Store, tenantID string) {
 	t.Helper()

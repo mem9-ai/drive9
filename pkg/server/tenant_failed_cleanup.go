@@ -271,6 +271,7 @@ func (s *Server) cleanupFailedNativeTenantWithDependencies(
 	if err := s.meta.MarkTenantDeleted(ctx, tenantID); err != nil {
 		return true, fmt.Errorf("finalize_metadata: %w", err)
 	}
+	s.broadcastTenantMetricsCleanup(tenantID)
 	logger.Info(ctx, "server_event", eventFields(ctx, "tenant_failed_cleanup_candidate_done",
 		"organization_id", organizationID,
 		"tenant_id", tenantID,
@@ -351,6 +352,7 @@ func (s *Server) cleanupFailedSharedTenant(
 		ctx, tenantID, fsID, placement.DbID, s.sharedDBReopenRatio, true); err != nil {
 		return true, fmt.Errorf("finalize_metadata: %w", err)
 	}
+	s.broadcastTenantMetricsCleanup(tenantID)
 	if err := s.meta.RevokeTenantAPIKeys(ctx, tenantID); err != nil {
 		logger.Warn(ctx, "server_event", eventFields(ctx, "tenant_failed_cleanup_revoke_keys_failed",
 			"organization_id", organizationID,

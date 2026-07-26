@@ -237,6 +237,17 @@ func TestDBPoolConnectionsIncludesTenantPoolsWithOpenConnections(t *testing.T) {
 	if !strings.Contains(out, `drive9_db_pool_connections{role="user",tenant_id="`+tenantID+`",tidbcloud_org_id="guest",state="open"} 1`) {
 		t.Fatalf("expected tenant pool with open connections to emit pool connection series, got:\n%s", out)
 	}
+	if !strings.Contains(out, `drive9_db_pool_connections{role="user",tenant_id="`+tenantID+`",tidbcloud_org_id="guest",state="in_use"} 0`) {
+		t.Fatalf("expected tenant pool to retain in-use connection visibility, got:\n%s", out)
+	}
+	for _, state := range []string{"idle", "max_open"} {
+		if strings.Contains(out, `drive9_db_pool_connections{role="user",tenant_id="`+tenantID+`",tidbcloud_org_id="guest",state="`+state+`"}`) {
+			t.Fatalf("tenant pool unexpectedly exported per-tenant %s configuration series:\n%s", state, out)
+		}
+	}
+	if !strings.Contains(out, `drive9_db_pool_connections{role="user",state="max_open"} 1`) {
+		t.Fatalf("expected one role-level max_open series, got:\n%s", out)
+	}
 }
 
 func TestSharedDBPoolMetricsUseUUIDWithoutTenantLabel(t *testing.T) {

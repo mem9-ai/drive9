@@ -274,6 +274,7 @@ func recordTenantQuotaSnapshot(tenantID, tidbCloudOrgID string, usage *QuotaUsag
 	if tenantID == "" || usage == nil {
 		return
 	}
+	metrics.DeleteTenantQuotaSnapshot(tenantID)
 	metrics.RecordTenantStorageBytesWithOrg(tenantID, tidbCloudOrgID, "confirmed", usage.StorageBytes)
 	metrics.RecordTenantStorageBytesWithOrg(tenantID, tidbCloudOrgID, "reserved", usage.ReservedBytes)
 	metrics.RecordTenantMediaFilesWithOrg(tenantID, tidbCloudOrgID, "confirmed", usage.MediaFileCount)

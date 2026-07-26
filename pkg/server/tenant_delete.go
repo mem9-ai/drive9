@@ -94,6 +94,7 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if hasJob {
+			s.broadcastTenantMetricsCleanup(t.ID)
 			_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
 			writeTenantDeleteStatus(w, meta.TenantDeleting)
 			return
@@ -230,6 +231,7 @@ func (s *Server) handleSharedTenantDeleteWithStatusWriter(
 		return
 	}
 	if deleteJobExists && placement != nil && placement.Status == meta.PlacementStatusDeleting {
+		s.broadcastTenantMetricsCleanup(t.ID)
 		_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
 		writeStatus(w, meta.TenantDeleting)
 		return
@@ -252,6 +254,7 @@ func (s *Server) handleSharedTenantDeleteWithStatusWriter(
 				return
 			}
 			if markDeleted {
+				s.broadcastTenantMetricsCleanup(t.ID)
 				_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
 				writeTenantDeleteStatus(w, meta.TenantDeleted)
 				return
@@ -280,6 +283,7 @@ func (s *Server) enqueueTenantDeleteJob(ctx context.Context, t *meta.Tenant) (me
 		if err := s.meta.MarkTenantDeleted(ctx, t.ID); err != nil {
 			return "", err
 		}
+		s.broadcastTenantMetricsCleanup(t.ID)
 		return meta.TenantDeleted, nil
 	}
 	ns, err := s.meta.GetStorageNamespace(ctx, t.StorageNamespaceID)
@@ -298,6 +302,7 @@ func (s *Server) enqueueTenantDeleteJob(ctx context.Context, t *meta.Tenant) (me
 	}); err != nil {
 		return "", err
 	}
+	s.broadcastTenantMetricsCleanup(t.ID)
 	return meta.TenantDeleting, nil
 }
 
@@ -390,5 +395,9 @@ func (s *Server) processTenantDeleteJob(ctx context.Context, job meta.TenantDele
 	if err != nil {
 		return err
 	}
-	return s.meta.FinalizeTenantDelete(ctx, job.TenantID, job.NamespaceID, res.DeletedObjects, res.AbortedMultipartUploads)
+	if err := s.meta.FinalizeTenantDelete(ctx, job.TenantID, job.NamespaceID, res.DeletedObjects, res.AbortedMultipartUploads); err != nil {
+		return err
+	}
+	s.broadcastTenantMetricsCleanup(job.TenantID)
+	return nil
 }

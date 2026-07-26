@@ -18,10 +18,11 @@ type tenantPoolBindingMetricKey struct {
 }
 
 const (
-	sharedDBPoolMetricTotal    = "total"
-	sharedDBPoolMetricCapacity = "capacity"
-	sharedDBPoolMetricTenants  = "tenants"
-	sharedDBPoolMetricSpending = "spending_limit"
+	sharedDBPoolMetricTotal     = "total"
+	sharedDBPoolMetricCapacity  = "capacity"
+	sharedDBPoolMetricTenants   = "tenants"
+	sharedDBPoolMetricSpending  = "spending_limit"
+	sharedDBPoolMetricStatusAge = "status_age"
 )
 
 type sharedDBPoolMetricKey struct {
@@ -105,6 +106,17 @@ func (s *Server) observeSharedDBPoolMetrics(ctx context.Context) {
 		}
 		metrics.RecordSharedDBPoolTotal(orgID, snapshot.ID, snapshot.UUID, snapshot.Status, 1)
 		next[totalKey] = struct{}{}
+		if snapshot.Status != meta.SharedDBStatusActive && !snapshot.UpdatedAt.IsZero() {
+			age := time.Since(snapshot.UpdatedAt)
+			if age < 0 {
+				age = 0
+			}
+			metrics.RecordSharedDBPoolStatusAge(orgID, snapshot.UUID, snapshot.Status, age)
+			next[sharedDBPoolMetricKey{
+				kind: sharedDBPoolMetricStatusAge, dbPoolID: snapshot.ID, dbPoolUUID: snapshot.UUID,
+				tidbCloudOrgID: orgID, dimension: snapshot.Status,
+			}] = struct{}{}
+		}
 
 		free := int64(0)
 		if snapshot.MaxTenants > snapshot.TenantCount && !snapshot.SoftCapReached {
@@ -210,5 +222,7 @@ func deleteSharedDBPoolMetric(key sharedDBPoolMetricKey) {
 		metrics.DeleteSharedDBPoolTenants(key.tidbCloudOrgID, key.dbPoolID, key.dbPoolUUID, key.dimension)
 	case sharedDBPoolMetricSpending:
 		metrics.DeleteSharedDBPoolSpendingLimit(key.tidbCloudOrgID, key.dbPoolID, key.dbPoolUUID, key.dimension)
+	case sharedDBPoolMetricStatusAge:
+		metrics.DeleteSharedDBPoolStatusAge(key.tidbCloudOrgID, key.dbPoolUUID, key.dimension)
 	}
 }

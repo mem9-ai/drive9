@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 type recordingNotifyInserter struct {
@@ -186,6 +189,19 @@ func TestTenantNotifyCoalescerFlushFailureFallsBackToPerRow(t *testing.T) {
 	}
 	if calls := rec.recorded(); len(calls) != 2 {
 		t.Fatalf("batch insert calls after fallback = %d, want 2 (dropped rows are not replayed)", len(calls))
+	}
+	metricRec := httptest.NewRecorder()
+	metrics.WritePrometheus(metricRec)
+	metricText := metricRec.Body.String()
+	for _, want := range []string{
+		`drive9_notify_coalescer_flush_total{result="fallback"}`,
+		`drive9_notify_coalescer_per_row_fallback_total{result="ok"}`,
+		`drive9_notify_coalescer_per_row_fallback_total{result="error"}`,
+		`drive9_notify_coalescer_pending 0.000000`,
+	} {
+		if !strings.Contains(metricText, want) {
+			t.Fatalf("missing notify coalescer metric %q: %s", want, metricText)
+		}
 	}
 }
 

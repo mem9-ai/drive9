@@ -9,6 +9,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // defaultTenantNotifyFlushInterval is how often the coalescer flushes merged
@@ -97,7 +98,9 @@ func (c *tenantNotifyCoalescer) add(tenantID string, workMask int) {
 		return
 	}
 	c.pending[tenantID] |= workMask
+	pending := len(c.pending)
 	c.mu.Unlock()
+	metrics.RecordNotifyCoalescerPending(pending)
 }
 
 func (c *tenantNotifyCoalescer) run(ctx context.Context) {
@@ -145,12 +148,14 @@ func (c *tenantNotifyCoalescer) flush(ctx context.Context) {
 	batch := c.pending
 	c.pending = make(map[string]int)
 	c.mu.Unlock()
+	metrics.RecordNotifyCoalescerPending(0)
 
 	entries := make([]meta.TenantNotifyEntry, 0, len(batch))
 	for tenantID, workMask := range batch {
 		entries = append(entries, meta.TenantNotifyEntry{TenantID: tenantID, WorkMask: workMask})
 	}
 	if err := c.insertBatch(ctx, entries); err == nil {
+		metrics.RecordNotifyCoalescerFlush("ok", len(entries))
 		return
 	} else {
 		logger.Warn(ctx, "tenant_notify_coalescer_flush_failed",
@@ -163,6 +168,7 @@ func (c *tenantNotifyCoalescer) flush(ctx context.Context) {
 		// fail fast on the cancelled context and are dropped per row).
 	case <-time.After(tenantNotifyFlushRetryBackoff):
 		if err := c.insertBatch(ctx, entries); err == nil {
+			metrics.RecordNotifyCoalescerFlush("retry_ok", len(entries))
 			return
 		} else {
 			logger.Warn(ctx, "tenant_notify_coalescer_flush_retry_failed",
@@ -170,6 +176,7 @@ func (c *tenantNotifyCoalescer) flush(ctx context.Context) {
 				zap.Error(err))
 		}
 	}
+	metrics.RecordNotifyCoalescerFlush("fallback", len(entries))
 	c.insertPerRow(ctx, entries)
 }
 
@@ -178,10 +185,13 @@ func (c *tenantNotifyCoalescer) flush(ctx context.Context) {
 func (c *tenantNotifyCoalescer) insertPerRow(ctx context.Context, entries []meta.TenantNotifyEntry) {
 	for _, e := range entries {
 		if err := c.insertSingle(ctx, e.TenantID, e.WorkMask); err != nil {
+			metrics.RecordNotifyCoalescerPerRowFallback("error")
 			logger.Warn(ctx, "tenant_notify_coalescer_row_insert_failed",
 				zap.String("tenant_id", e.TenantID),
 				zap.Int("work_mask", e.WorkMask),
 				zap.Error(err))
+		} else {
+			metrics.RecordNotifyCoalescerPerRowFallback("ok")
 		}
 	}
 }

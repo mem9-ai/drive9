@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mem9-ai/drive9/pkg/metrics"
+
 	"golang.org/x/sync/singleflight"
 )
 
@@ -82,9 +84,11 @@ func (c *apiKeyResolveCache) get(hash string) (*TenantWithAPIKey, bool) {
 	rec, ok := c.lookup(hash)
 	if !ok {
 		c.misses.Add(1)
+		metrics.RecordAPIKeyResolveCache("miss", c.entryCount())
 		return nil, false
 	}
 	c.hits.Add(1)
+	metrics.RecordAPIKeyResolveCache("hit", c.entryCount())
 	return rec, true
 }
 
@@ -109,7 +113,6 @@ func (c *apiKeyResolveCache) lookup(hash string) (*TenantWithAPIKey, bool) {
 // its tenant so revocations can evict precisely.
 func (c *apiKeyResolveCache) fill(hash string, rec TenantWithAPIKey) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if old, ok := c.byHash[hash]; ok {
 		c.removeTenantIndexLocked(old.rec.Tenant.ID, hash)
 	}
@@ -120,6 +123,9 @@ func (c *apiKeyResolveCache) fill(hash string, rec TenantWithAPIKey) {
 		c.hashesByTenant[rec.Tenant.ID] = set
 	}
 	set[hash] = struct{}{}
+	entries := len(c.byHash)
+	c.mu.Unlock()
+	metrics.RecordAPIKeyResolveCacheEntries(entries)
 }
 
 // evictTenant drops every cached hash known to belong to tenantID. Called
@@ -129,11 +135,19 @@ func (c *apiKeyResolveCache) fill(hash string, rec TenantWithAPIKey) {
 // are a no-op.
 func (c *apiKeyResolveCache) evictTenant(tenantID string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	for hash := range c.hashesByTenant[tenantID] {
 		delete(c.byHash, hash)
 	}
 	delete(c.hashesByTenant, tenantID)
+	entries := len(c.byHash)
+	c.mu.Unlock()
+	metrics.RecordAPIKeyResolveCacheEntries(entries)
+}
+
+func (c *apiKeyResolveCache) entryCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.byHash)
 }
 
 func (c *apiKeyResolveCache) deleteLocked(hash string) {

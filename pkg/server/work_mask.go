@@ -7,6 +7,7 @@ import "github.com/mem9-ai/drive9/pkg/backend"
 //
 //	SSE bit  → wake local SSE bus (broadcast: all pods with subscribers)
 //	Semantic/GC/Quota bits → kick unified worker (sharded: shard owner only)
+//	Metrics cleanup bit → delete local tenant series (broadcast: every pod)
 //
 // These mirror the backend.Work* constants in pkg/backend/dat9.go. The
 // compile-time assertions below ensure the values stay in sync.
@@ -21,6 +22,10 @@ const (
 	// WorkFileGC (bit 2) kicks the unified worker to drain file_gc tasks.
 	// Sharded: only the shard-owner pod processes it.
 	WorkFileGC = 4
+	// WorkMetricsCleanup (bit 3) removes all tenant-scoped metric series from
+	// the local process. It is server-only because it is emitted by durable
+	// tenant lifecycle transitions, not by a tenant DB write path.
+	WorkMetricsCleanup = 8
 )
 
 // Compile-time assertions that the server-side work mask constants match the

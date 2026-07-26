@@ -50,9 +50,12 @@ func TestTenantOutboxPollerPassesOrgToWorker(t *testing.T) {
 	}
 	recorder := httptest.NewRecorder()
 	metrics.WritePrometheus(recorder)
-	want := `drive9_service_operations_total{component="user_db_access",operation="outbox_dispatch_kick",result="ok",tenant_id="tenant-outbox-org-metric",tidbcloud_org_id="org-outbox-metric"}`
+	want := `drive9_service_operations_total{component="user_db_access",operation="outbox_dispatch_kick",result="ok"}`
 	if !strings.Contains(recorder.Body.String(), want) {
-		t.Fatalf("missing org-scoped outbox dispatch metric %q", want)
+		t.Fatalf("missing aggregate outbox dispatch metric %q", want)
+	}
+	if strings.Contains(recorder.Body.String(), `drive9_service_operations_total{component="user_db_access",operation="outbox_dispatch_kick",result="ok",tenant_id=`) {
+		t.Fatalf("successful outbox dispatch metric unexpectedly carries tenant labels: %s", recorder.Body.String())
 	}
 }
 
@@ -66,6 +69,34 @@ func TestTenantOutboxPollerSSEOnlyNoKick(t *testing.T) {
 	p.dispatch(context.Background(), row)
 	if len(k.kicks) != 0 {
 		t.Fatalf("SSE-only row should not kick worker, got %d kicks", len(k.kicks))
+	}
+}
+
+func TestTenantOutboxPollerMetricsCleanupIsBroadcast(t *testing.T) {
+	tenantID := "tenant-outbox-metrics-cleanup"
+	orgID := "org-outbox-metrics-cleanup"
+	metrics.RecordTenantOperationWithOrg(tenantID, orgID, "event_bus", "publish", "error", 0)
+	metrics.RecordTenantGaugeWithOrg(tenantID, orgID, "semantic_worker", "queue_lag_seconds", 10)
+
+	buses := newEventBuses()
+	k := &mockKicker{}
+	// A shard-rejected pod must still clean its local metric registry because
+	// cleanup is broadcast, unlike semantic and file-GC work.
+	p := newTenantOutboxPoller(nil, buses, k, func(string) bool { return false }, "pod1", 0, 0)
+	p.dispatch(context.Background(), meta.TenantNotifyRow{
+		ID:        1,
+		TenantID:  tenantID,
+		WorkMask:  WorkMetricsCleanup,
+		CreatedAt: time.Now(),
+	})
+
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	if strings.Contains(recorder.Body.String(), tenantID) {
+		t.Fatalf("tenant metrics remain after broadcast cleanup: %s", recorder.Body.String())
+	}
+	if len(k.kicks) != 0 {
+		t.Fatalf("metrics cleanup should not kick sharded work, got %d kicks", len(k.kicks))
 	}
 }
 

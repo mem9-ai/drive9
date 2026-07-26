@@ -6,10 +6,12 @@ import (
 	"hash/fnv"
 	"sort"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 const (
@@ -84,8 +86,9 @@ func StartMutationDispatcher() {
 	d := &mutationDispatcher{cancel: cancel}
 	for i := range d.shards {
 		d.shards[i] = make(chan quotaMutationItem, mutationDispatcherShardQueueSize)
+		metrics.RecordMutationDispatcherQueue(i, 0, mutationDispatcherShardQueueSize)
 		d.wg.Add(1)
-		go d.runShard(ctx, d.shards[i])
+		go d.runShard(ctx, i, d.shards[i])
 	}
 	mutationDispatcherInst = d
 }
@@ -119,7 +122,11 @@ func currentMutationDispatcher() *mutationDispatcher {
 // the intended backpressure point (callers hold mutationMu, so per-tenant
 // FIFO matches durable log_id order).
 func (d *mutationDispatcher) enqueue(item quotaMutationItem) {
-	d.shards[mutationDispatcherShardIndex(item.tenantID)] <- item
+	shard := int(mutationDispatcherShardIndex(item.tenantID))
+	start := time.Now()
+	d.shards[shard] <- item
+	metrics.RecordMutationDispatcherEnqueueBlocked(shard, time.Since(start))
+	metrics.RecordMutationDispatcherQueue(shard, len(d.shards[shard]), cap(d.shards[shard]))
 }
 
 func mutationDispatcherShardIndex(tenantID string) uint32 {
@@ -128,15 +135,18 @@ func mutationDispatcherShardIndex(tenantID string) uint32 {
 	return h.Sum32() % mutationDispatcherShards
 }
 
-func (d *mutationDispatcher) runShard(ctx context.Context, ch chan quotaMutationItem) {
+func (d *mutationDispatcher) runShard(ctx context.Context, shard int, ch chan quotaMutationItem) {
 	defer d.wg.Done()
 	for {
 		select {
 		case <-ctx.Done():
 			d.drainShard(ch)
+			metrics.RecordMutationDispatcherQueue(shard, 0, cap(ch))
 			return
 		case first := <-ch:
-			processMutationBatch(ctx, collectMutationBatch(ch, first))
+			batch := collectMutationBatch(ch, first)
+			metrics.RecordMutationDispatcherQueue(shard, len(ch), cap(ch))
+			processMutationBatch(ctx, batch)
 		}
 	}
 }
@@ -176,6 +186,7 @@ func collectMutationBatch(ch chan quotaMutationItem, first quotaMutationItem) []
 // only run on one underlying store; groups with a single item take the
 // legacy per-item path, larger groups share one transaction.
 func processMutationBatch(ctx context.Context, batch []quotaMutationItem) {
+	metrics.RecordMutationDispatcherBatch(len(batch), false)
 	groups := make([]mutationStoreGroup, 0, 1)
 	groupIndexByIdentity := make(map[any]int)
 	for i := range batch {
@@ -274,6 +285,7 @@ func processMutationStoreGroup(ctx context.Context, store MetaQuotaStore, items 
 	logger.Warn(ctx, "central_quota_mutation_batch_apply_failed",
 		zap.Int("batch_size", len(items)),
 		zap.Error(err))
+	metrics.RecordMutationDispatcherBatch(0, true)
 	for _, item := range items {
 		item.backend.applyQuotaMutation(ctx, item.mutationType, item.logID, item.pending, item.apply)
 		item.backend.mutationWG.Done()

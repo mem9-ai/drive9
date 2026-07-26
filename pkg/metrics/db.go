@@ -358,6 +358,17 @@ func writeDBPrometheus(w http.ResponseWriter) {
 		poolTotals[key] = totals
 	}
 	keys := sortedDBMetricKeys(poolTotals)
+	tenantRoleTotals := make(map[string]dbPoolTotals)
+	for key, totals := range poolTotals {
+		if !key.hasTenantID() {
+			continue
+		}
+		aggregate := tenantRoleTotals[key.role]
+		aggregate.inUseConnections += totals.inUseConnections
+		aggregate.maxOpenConnections += totals.maxOpenConnections
+		tenantRoleTotals[key.role] = aggregate
+	}
+	tenantRoles := SortedKeys(tenantRoleTotals)
 
 	globalDB.mu.RLock()
 	probeByRole := make(map[string]dbProbeState, len(globalDB.probe))
@@ -407,7 +418,21 @@ func writeDBPrometheus(w http.ResponseWriter) {
 		labels := dbLabels(key)
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"open\"} %d\n", labels, totals.openConnections)
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"in_use\"} %d\n", labels, totals.inUseConnections)
+		if key.hasTenantID() {
+			continue
+		}
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"idle\"} %d\n", labels, totals.idleConnections)
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"max_open\"} %d\n", labels, totals.maxOpenConnections)
+	}
+	for _, role := range tenantRoles {
+		// Avoid duplicate role-only label sets if a caller registers both scoped
+		// and unscoped pools under the same role.
+		if _, exists := poolTotals[dbMetricKey{role: role}]; exists {
+			continue
+		}
+		totals := tenantRoleTotals[role]
+		labels := fmt.Sprintf("role=\"%s\"", EscapePromLabel(role))
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"in_use\"} %d\n", labels, totals.inUseConnections)
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"max_open\"} %d\n", labels, totals.maxOpenConnections)
 	}
 

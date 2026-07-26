@@ -358,6 +358,21 @@ func (r *Registry) DeleteGaugesByLabel(labelKey, labelValue string) {
 	}
 }
 
+func (r *Registry) deleteGaugeByLabel(name, labelKey, labelValue string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	inst := r.gauges[name]
+	if inst == nil {
+		return
+	}
+	match := labelKey + `="` + EscapePromLabel(labelValue) + `"`
+	for labels := range inst.values {
+		if labelHasKeyValue(labels, match) {
+			delete(inst.values, labels)
+		}
+	}
+}
+
 func (r *Registry) observeHistogram(name, labels string, value float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

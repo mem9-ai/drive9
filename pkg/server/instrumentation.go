@@ -392,7 +392,8 @@ func (m *serverMetrics) adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, 
 }
 
 func tenantInFlightKey(tenantID, tidbCloudOrgID, surface, action string) string {
-	return tenantID + "\x00" + tidbCloudOrgID + "\x00" + surface + "\x00" + action
+	_ = action
+	return tenantID + "\x00" + tidbCloudOrgID + "\x00" + surface
 }
 
 type observedResponseWriter struct {

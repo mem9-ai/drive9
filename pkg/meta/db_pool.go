@@ -175,6 +175,7 @@ type SharedDBPoolMetricSnapshot struct {
 	TenantCount             int
 	SoftCapReached          bool
 	SpendingLimit           *int64
+	UpdatedAt               time.Time
 	TenantStates            []SharedDBPoolTenantStateCount
 }
 
@@ -1055,7 +1056,7 @@ const listSharedDBPoolMetricSnapshotsSQL = `WITH non_active_tenant_states AS (
 )
 SELECT
 	d.db_id, d.uuid, COALESCE(d.org_id, ''), d.status, d.max_tenants, d.tenant_count, d.soft_cap_reached,
-	d.spending_limit,
+	d.spending_limit, d.updated_at,
 	COALESCE(tenant_states.tenant_status, ''), COALESCE(tenant_states.tenant_count, 0)
 	FROM db_pool d
 	LEFT JOIN tenant_states ON tenant_states.db_id = d.db_id
@@ -1078,16 +1079,17 @@ func (s *Store) ListSharedDBPoolMetricSnapshots(ctx context.Context) (out []Shar
 		var maxTenants, tenantCount int
 		var softCapReached bool
 		var spendingLimit sql.NullInt64
+		var updatedAt time.Time
 		var stateCount int64
 		if err := rows.Scan(&id, &dbPoolUUID, &organizationID, &status, &maxTenants, &tenantCount, &softCapReached,
-			&spendingLimit, &tenantStatus, &stateCount); err != nil {
+			&spendingLimit, &updatedAt, &tenantStatus, &stateCount); err != nil {
 			return nil, fmt.Errorf("scan shared db pool metric snapshot: %w", err)
 		}
 		index, ok := byID[id]
 		if !ok {
 			snapshot := SharedDBPoolMetricSnapshot{
 				ID: id, UUID: dbPoolUUID, TiDBCloudOrganizationID: organizationID, Status: status,
-				MaxTenants: maxTenants, TenantCount: tenantCount, SoftCapReached: softCapReached,
+				MaxTenants: maxTenants, TenantCount: tenantCount, SoftCapReached: softCapReached, UpdatedAt: updatedAt,
 			}
 			if spendingLimit.Valid {
 				value := spendingLimit.Int64

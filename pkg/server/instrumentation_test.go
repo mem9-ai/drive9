@@ -153,6 +153,22 @@ func TestSetRequestMetricTenantMovesInFlightLabel(t *testing.T) {
 	}
 }
 
+func TestAdjustTenantInFlightAggregatesActionsForSameSurface(t *testing.T) {
+	m := newServerMetrics()
+	if got := m.adjustTenantInFlight("tenant-inflight-actions", "org-inflight-actions", "fs", "read", 1); got != 1 {
+		t.Fatalf("read increment = %d, want 1", got)
+	}
+	if got := m.adjustTenantInFlight("tenant-inflight-actions", "org-inflight-actions", "fs", "write", 1); got != 2 {
+		t.Fatalf("write increment = %d, want aggregate 2", got)
+	}
+	if got := m.adjustTenantInFlight("tenant-inflight-actions", "org-inflight-actions", "fs", "read", -1); got != 1 {
+		t.Fatalf("read decrement = %d, want aggregate 1", got)
+	}
+	if got := m.adjustTenantInFlight("tenant-inflight-actions", "org-inflight-actions", "fs", "write", -1); got != 0 {
+		t.Fatalf("write decrement = %d, want 0", got)
+	}
+}
+
 func TestEventFieldsDoesNotDuplicateExplicitTiDBCloudOrgID(t *testing.T) {
 	ctx := withRequestMetricState(context.Background(), &requestMetricState{})
 	setRequestMetricTenant(ctx, "tenant-a", "", "", "org-request", tenantRequestClass{surface: "status", action: "get"})
