@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -15,9 +16,9 @@ const (
 	// defaultQuotaConfigCacheRefreshInterval is the default TTL for lazily
 	// loaded tenant quota config. Override with DRIVE9_QUOTA_CACHE_REFRESH_SECONDS.
 	defaultQuotaConfigCacheRefreshInterval = 30 * time.Second
-	// quotaConfigCacheFailureRetryInterval prevents a central DB outage from
-	// turning every tenant request into another config query.
-	quotaConfigCacheFailureRetryInterval = 5 * time.Second
+	// quotaConfigCacheLoadTimeout bounds a coalesced refresh independently of
+	// the request that happened to win the load lock.
+	quotaConfigCacheLoadTimeout = 5 * time.Second
 	// quotaUsageCacheTTL bounds how long soft small-write quota checks may
 	// reuse central usage counters. Strict upload reservations still read
 	// central usage directly.
@@ -70,6 +71,20 @@ func cloneQuotaConfigView(cfg *QuotaConfigView) *QuotaConfigView {
 	return &cp
 }
 
+// quotaConfigCacheRefreshDelay spreads refreshes over the last 10% of the
+// configured TTL. The delay never exceeds the configured value, preserving
+// the maximum quota-config convergence window.
+func quotaConfigCacheRefreshDelay(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return 0
+	}
+	maxJitter := ttl / 10
+	if maxJitter <= 0 {
+		return ttl
+	}
+	return ttl - time.Duration(rand.Int64N(int64(maxJitter)+1))
+}
+
 // quotaConfigCache is a passive per-tenant cache for low-frequency quota
 // config. Requests refresh an expired snapshot; idle tenants create no
 // goroutines and issue no quota queries.
@@ -112,10 +127,6 @@ func (c *quotaConfigCache) cached(now time.Time) (*QuotaConfigView, bool) {
 // get returns a defensive copy of the cached config, refreshing it once when
 // its TTL has expired. Concurrent expired requests coalesce on loadMu.
 func (c *quotaConfigCache) get(ctx context.Context) *QuotaConfigView {
-	return c.load(ctx)
-}
-
-func (c *quotaConfigCache) load(ctx context.Context) *QuotaConfigView {
 	now := time.Now()
 	if cfg, current := c.cached(now); current {
 		return cfg
@@ -128,9 +139,11 @@ func (c *quotaConfigCache) load(ctx context.Context) *QuotaConfigView {
 	}
 
 	start := now
-	cfg, err := c.store.GetQuotaConfig(ctx, c.tenantID)
+	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quotaConfigCacheLoadTimeout)
+	defer cancel()
+	cfg, err := c.store.GetQuotaConfig(loadCtx, c.tenantID)
 	if err != nil {
-		logger.Warn(ctx, "quota_config_cache_config_failed",
+		logger.Warn(loadCtx, "quota_config_cache_config_failed",
 			zap.String("tenant_id", c.tenantID), zap.Error(err))
 		return c.finishFailedLoad(start, "config_error")
 	}
@@ -139,15 +152,19 @@ func (c *quotaConfigCache) load(ctx context.Context) *QuotaConfigView {
 	}
 	c.mu.Lock()
 	c.snapshot = cloneQuotaConfigView(cfg)
-	c.nextRefresh = time.Now().Add(quotaConfigCacheRefreshInterval)
+	c.nextRefresh = time.Now().Add(quotaConfigCacheRefreshDelay(quotaConfigCacheRefreshInterval))
 	c.mu.Unlock()
 	metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "load", "ok", time.Since(start))
 	return cloneQuotaConfigView(cfg)
 }
 
 func (c *quotaConfigCache) finishFailedLoad(start time.Time, result string) *QuotaConfigView {
+	retryTTL := quotaConfigCacheRefreshInterval
+	if retryTTL < defaultQuotaConfigCacheRefreshInterval {
+		retryTTL = defaultQuotaConfigCacheRefreshInterval
+	}
 	c.mu.Lock()
-	c.nextRefresh = time.Now().Add(quotaConfigCacheFailureRetryInterval)
+	c.nextRefresh = time.Now().Add(quotaConfigCacheRefreshDelay(retryTTL))
 	var stale *QuotaConfigView
 	if c.snapshot != nil {
 		stale = cloneQuotaConfigView(c.snapshot)

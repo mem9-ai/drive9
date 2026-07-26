@@ -12,13 +12,14 @@ import (
 // cacheTestStore wraps fakeMetaQuotaStore with error injection for cache tests.
 type cacheTestStore struct {
 	*fakeMetaQuotaStore
-	configCalls  atomic.Int64
-	versionCalls atomic.Int64
-	usageCalls   atomic.Int64
-	versionErr   error
-	configErr    error
-	configHook   func()
-	usageHook    func()
+	configCalls   atomic.Int64
+	versionCalls  atomic.Int64
+	usageCalls    atomic.Int64
+	versionErr    error
+	configErr     error
+	configHook    func()
+	configCtxHook func(context.Context)
+	usageHook     func()
 }
 
 func newCacheTestStore() *cacheTestStore {
@@ -35,6 +36,12 @@ func (m *cacheTestStore) GetQuotaUsage(ctx context.Context, tenantID string) (*Q
 
 func (m *cacheTestStore) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConfigView, error) {
 	m.configCalls.Add(1)
+	if m.configCtxHook != nil {
+		m.configCtxHook(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if m.configErr != nil {
 		return nil, m.configErr
 	}
@@ -42,6 +49,66 @@ func (m *cacheTestStore) GetQuotaConfig(ctx context.Context, tenantID string) (*
 		m.configHook()
 	}
 	return m.fakeMetaQuotaStore.GetQuotaConfig(ctx, tenantID)
+}
+
+func TestQuotaConfigCacheCanceledCallerDoesNotPoisonSharedRefresh(t *testing.T) {
+	store := newCacheTestStore()
+	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
+	loadHasDeadline := false
+	store.configCtxHook = func(ctx context.Context) {
+		_, loadHasDeadline = ctx.Deadline()
+	}
+	c := newQuotaConfigCache("t1", "", store)
+	t.Cleanup(c.stop)
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	first := c.get(canceledCtx)
+	if first == nil || first.MaxStorageBytes != 1000 {
+		t.Errorf("first config = %+v, want storage 1000", first)
+	}
+	if !loadHasDeadline {
+		t.Error("shared load context has no deadline")
+	}
+	second := c.get(context.Background())
+	if second == nil || second.MaxStorageBytes != 1000 {
+		t.Errorf("second config = %+v, want storage 1000", second)
+	}
+	if got := store.configCalls.Load(); got != 1 {
+		t.Errorf("configCalls = %d, want 1 shared load", got)
+	}
+}
+
+func TestQuotaConfigCacheRefreshDelayStaysWithinTTL(t *testing.T) {
+	const ttl = 30 * time.Second
+	for range 1000 {
+		delay := quotaConfigCacheRefreshDelay(ttl)
+		if delay < 27*time.Second || delay > ttl {
+			t.Errorf("refresh delay = %s, want [27s, 30s]", delay)
+		}
+	}
+}
+
+func TestQuotaConfigCacheFailureCooldownUsesNormalTTLMinimum(t *testing.T) {
+	previousRefreshInterval := quotaConfigCacheRefreshInterval
+	quotaConfigCacheRefreshInterval = 5 * time.Second
+	t.Cleanup(func() { quotaConfigCacheRefreshInterval = previousRefreshInterval })
+
+	store := newCacheTestStore()
+	store.configErr = errors.New("temporary metadb failure")
+	c := newQuotaConfigCache("t1", "", store)
+	t.Cleanup(c.stop)
+
+	before := time.Now()
+	if cfg := c.get(context.Background()); cfg != nil {
+		t.Errorf("config = %+v, want nil", cfg)
+	}
+	c.mu.RLock()
+	nextRefresh := c.nextRefresh
+	c.mu.RUnlock()
+	if delay := nextRefresh.Sub(before); delay < 27*time.Second || delay > 31*time.Second {
+		t.Errorf("failure cooldown = %s, want approximately [27s, 30s]", delay)
+	}
 }
 
 func (m *cacheTestStore) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
@@ -65,10 +132,10 @@ func TestQuotaConfigCacheIsPassiveUntilFirstAccess(t *testing.T) {
 	// Construction must not start a polling loop or touch the store.
 	time.Sleep(20 * time.Millisecond)
 	if got := store.versionCalls.Load(); got != 0 {
-		t.Fatalf("versionCalls = %d, want 0", got)
+		t.Errorf("versionCalls = %d, want 0", got)
 	}
 	if got := store.configCalls.Load(); got != 0 {
-		t.Fatalf("configCalls = %d, want 0", got)
+		t.Errorf("configCalls = %d, want 0", got)
 	}
 
 	cfg := c.get(context.Background())
@@ -76,16 +143,16 @@ func TestQuotaConfigCacheIsPassiveUntilFirstAccess(t *testing.T) {
 		t.Fatal("config is nil after first access")
 	}
 	if cfg.MaxStorageBytes != 1000 {
-		t.Fatalf("MaxStorageBytes = %d, want 1000", cfg.MaxStorageBytes)
+		t.Errorf("MaxStorageBytes = %d, want 1000", cfg.MaxStorageBytes)
 	}
 	if got := store.versionCalls.Load(); got != 0 {
-		t.Fatalf("versionCalls = %d, want 0", got)
+		t.Errorf("versionCalls = %d, want 0", got)
 	}
 	if got := store.configCalls.Load(); got != 1 {
-		t.Fatalf("configCalls = %d, want 1", got)
+		t.Errorf("configCalls = %d, want 1", got)
 	}
 	if got := store.usageCalls.Load(); got != 0 {
-		t.Fatalf("usageCalls = %d, want 0", got)
+		t.Errorf("usageCalls = %d, want 0", got)
 	}
 }
 
@@ -103,7 +170,7 @@ func TestQuotaConfigCacheReturnsDefensiveCopy(t *testing.T) {
 
 	cached := c.get(context.Background())
 	if cached == nil || cached.MaxStorageBytes != 1000 {
-		t.Fatalf("cached config = %+v, want storage 1000", cached)
+		t.Errorf("cached config = %+v, want storage 1000", cached)
 	}
 }
 
@@ -114,29 +181,29 @@ func TestQuotaConfigCacheReusesSnapshotUntilTTLExpires(t *testing.T) {
 	t.Cleanup(c.stop)
 
 	if cfg := c.get(context.Background()); cfg == nil || cfg.MaxStorageBytes != 1000 {
-		t.Fatalf("first config = %+v, want storage 1000", cfg)
+		t.Errorf("first config = %+v, want storage 1000", cfg)
 	}
 	store.mu.Lock()
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 2000}
 	store.mu.Unlock()
 	if cfg := c.get(context.Background()); cfg == nil || cfg.MaxStorageBytes != 1000 {
-		t.Fatalf("cached config = %+v, want storage 1000", cfg)
+		t.Errorf("cached config = %+v, want storage 1000", cfg)
 	}
 	if got := store.configCalls.Load(); got != 1 {
-		t.Fatalf("configCalls before expiry = %d, want 1", got)
+		t.Errorf("configCalls before expiry = %d, want 1", got)
 	}
 
 	c.mu.Lock()
 	c.nextRefresh = time.Time{}
 	c.mu.Unlock()
 	if cfg := c.get(context.Background()); cfg == nil || cfg.MaxStorageBytes != 2000 {
-		t.Fatalf("refreshed config = %+v, want storage 2000", cfg)
+		t.Errorf("refreshed config = %+v, want storage 2000", cfg)
 	}
 	if got := store.configCalls.Load(); got != 2 {
-		t.Fatalf("configCalls after expiry = %d, want 2", got)
+		t.Errorf("configCalls after expiry = %d, want 2", got)
 	}
 	if got := store.versionCalls.Load(); got != 0 {
-		t.Fatalf("versionCalls = %d, want 0", got)
+		t.Errorf("versionCalls = %d, want 0", got)
 	}
 }
 
@@ -168,14 +235,14 @@ func TestQuotaConfigCacheCoalescesConcurrentExpiredAccess(t *testing.T) {
 	close(release)
 	for range callers {
 		if cfg := <-results; cfg == nil || cfg.MaxStorageBytes != 1000 {
-			t.Fatalf("concurrent config = %+v, want storage 1000", cfg)
+			t.Errorf("concurrent config = %+v, want storage 1000", cfg)
 		}
 	}
 	if got := store.configCalls.Load(); got != 2 {
-		t.Fatalf("configCalls = %d, want initial load plus one coalesced refresh", got)
+		t.Errorf("configCalls = %d, want initial load plus one coalesced refresh", got)
 	}
 	if got := store.versionCalls.Load(); got != 0 {
-		t.Fatalf("versionCalls = %d, want 0", got)
+		t.Errorf("versionCalls = %d, want 0", got)
 	}
 }
 
@@ -196,20 +263,20 @@ func TestQuotaConfigCacheRefreshFailureReturnsStaleAndUsesRetryCooldown(t *testi
 
 	stale := c.get(context.Background())
 	if stale == nil || stale.MaxStorageBytes != 1000 {
-		t.Fatalf("stale config = %+v, want storage 1000", stale)
+		t.Errorf("stale config = %+v, want storage 1000", stale)
 	}
 	if got := store.configCalls.Load(); got != 2 {
-		t.Fatalf("configCalls after failed refresh = %d, want 2", got)
+		t.Errorf("configCalls after failed refresh = %d, want 2", got)
 	}
 	stale = c.get(context.Background())
 	if stale == nil || stale.MaxStorageBytes != 1000 {
-		t.Fatalf("cooldown config = %+v, want storage 1000", stale)
+		t.Errorf("cooldown config = %+v, want storage 1000", stale)
 	}
 	if got := store.configCalls.Load(); got != 2 {
-		t.Fatalf("configCalls during failure cooldown = %d, want 2", got)
+		t.Errorf("configCalls during failure cooldown = %d, want 2", got)
 	}
 	if got := store.versionCalls.Load(); got != 0 {
-		t.Fatalf("versionCalls = %d, want 0", got)
+		t.Errorf("versionCalls = %d, want 0", got)
 	}
 }
 
@@ -220,19 +287,19 @@ func TestQuotaConfigCacheInitialFailureUsesRetryCooldown(t *testing.T) {
 	t.Cleanup(c.stop)
 
 	if cfg := c.get(context.Background()); cfg != nil {
-		t.Fatalf("config = %+v, want nil on initial failure", cfg)
+		t.Errorf("config = %+v, want nil on initial failure", cfg)
 	}
 	if cfg := c.get(context.Background()); cfg != nil {
-		t.Fatalf("config during cooldown = %+v, want nil", cfg)
+		t.Errorf("config during cooldown = %+v, want nil", cfg)
 	}
 	if got := store.configCalls.Load(); got != 1 {
-		t.Fatalf("configCalls during failure cooldown = %d, want 1", got)
+		t.Errorf("configCalls during failure cooldown = %d, want 1", got)
 	}
 	if got := store.versionCalls.Load(); got != 0 {
-		t.Fatalf("versionCalls = %d, want 0", got)
+		t.Errorf("versionCalls = %d, want 0", got)
 	}
 	if got := store.usageCalls.Load(); got != 0 {
-		t.Fatalf("usageCalls = %d, want 0", got)
+		t.Errorf("usageCalls = %d, want 0", got)
 	}
 }
 
