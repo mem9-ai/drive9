@@ -408,6 +408,17 @@ func newQuotaRuntime(t *testing.T, provider string) *quotaRuntime {
 	return newQuotaRuntimeWithOptions(t, provider, quotaRuntimeOptions{})
 }
 
+func quotaConfigRowExists(t *testing.T, rt *quotaRuntime) bool {
+	t.Helper()
+	var exists bool
+	if err := rt.meta.DB().QueryRowContext(context.Background(),
+		`SELECT EXISTS(SELECT 1 FROM tenant_quota_config WHERE tenant_id = ?)`, rt.tenantID,
+	).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	return exists
+}
+
 func newQuotaRuntimeWithOptions(t *testing.T, provider string, opts quotaRuntimeOptions) *quotaRuntime {
 	t.Helper()
 	db := newTenantDeleteDBInfo(t)
@@ -1105,12 +1116,8 @@ func TestQuotaSetSpendingLimitOnlyPersistsSpendingLimitConfig(t *testing.T) {
 	if cfg.MaxStorageBytes != meta.DefaultMaxStorageBytes() || cfg.MaxFileSizeBytes != meta.DefaultMaxFileSizeBytes() || cfg.MaxFileCount != 0 {
 		t.Fatalf("storage quota fields = %#v, want defaults", cfg)
 	}
-	version, err := rt.meta.GetQuotaConfigVersion(context.Background(), rt.tenantID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if version == "" {
-		t.Fatalf("storage quota config version should be non-empty when config row exists")
+	if !quotaConfigRowExists(t, rt) {
+		t.Fatal("quota config row was not persisted")
 	}
 	var out quotaResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -1140,12 +1147,8 @@ func TestQuotaSetRejectsDrive9KeyWithoutTiDBCloudCredentials(t *testing.T) {
 	if got := rt.prov.markCalls.Load(); got != 0 {
 		t.Fatalf("mark calls = %d, want 0", got)
 	}
-	version, err := rt.meta.GetQuotaConfigVersion(context.Background(), rt.tenantID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if version != "" {
-		t.Fatalf("quota config version = %q, want empty", version)
+	if quotaConfigRowExists(t, rt) {
+		t.Fatal("quota config row was written for a rejected request")
 	}
 }
 
@@ -1366,12 +1369,8 @@ func TestQuotaSetMapsTiDBCloudCredentialErrorsWithoutWritingConfig(t *testing.T)
 			if resp.StatusCode != tc.wantStatus {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
 			}
-			version, err := rt.meta.GetQuotaConfigVersion(context.Background(), rt.tenantID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if version != "" {
-				t.Fatalf("quota config version = %q, want empty", version)
+			if quotaConfigRowExists(t, rt) {
+				t.Fatal("quota config row was written after TiDB Cloud credential failure")
 			}
 			if got := rt.prov.markCalls.Load(); got != 1 {
 				t.Fatalf("mark calls = %d, want 1", got)

@@ -21,10 +21,10 @@ const (
 	defaultMaxExtractedTextBytes      = DefaultImageExtractMaxTextBytes
 	defaultAudioExtractMaxSize        = int64(32 << 20) // 32 MiB
 	defaultAudioExtractTimeout        = 2 * time.Minute
-	defaultMaxAudioExtractedTextBytes = 8 << 10               // 8 KiB
+	defaultMaxAudioExtractedTextBytes = 8 << 10          // 8 KiB
 	defaultVideoExtractMaxSize        = int64(200 << 20) // 200 MiB
 	defaultVideoExtractTimeout        = 5 * time.Minute
-	defaultMaxVideoExtractedTextBytes = 32 << 10 // 32 KiB
+	defaultMaxVideoExtractedTextBytes = 32 << 10              // 32 KiB
 	defaultMaxUploadBytes             = int64(10 * (1 << 30)) // 10 GiB
 	defaultMaxTenantStorageBytes      = int64(50 * (1 << 30)) // 50 GiB
 	defaultMaxMediaLLMFiles           = int64(500)            // 500 media files per tenant
@@ -393,7 +393,6 @@ func (b *Dat9Backend) Close() {
 	}
 	b.stopMutationWorker()
 	if b.quotaConfigCache != nil {
-		b.quotaConfigCache.stop()
 		b.quotaConfigCache = nil
 	}
 }
