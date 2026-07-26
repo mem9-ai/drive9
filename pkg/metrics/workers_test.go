@@ -11,7 +11,8 @@ func TestCriticalWorkerMetricsUseBoundedLabels(t *testing.T) {
 	RecordMutationDispatcherQueue(2, 10, 4096)
 	RecordMutationDispatcherEnqueueBlocked(2, 25*time.Millisecond)
 	RecordMutationDispatcherBatch(17, true)
-	RecordAPIKeyResolveCache("hit", 8)
+	RecordAPIKeyResolveCacheEntries(8)
+	RecordAPIKeyResolveCacheRequest("hit")
 	RecordNotifyCoalescerPending(3)
 	RecordNotifyCoalescerFlush("retry_ok", 3)
 	RecordNotifyCoalescerPerRowFallback("error")
@@ -69,5 +70,45 @@ func TestCriticalWorkerMetricsUseBoundedLabels(t *testing.T) {
 				t.Errorf("bounded worker metric contains forbidden label %q: %s", forbidden, line)
 			}
 		}
+	}
+}
+
+func TestTenantOutboxBacklogAgeTracksObservedRowsAndSurvivesPollErrors(t *testing.T) {
+	RecordTenantOutboxPoll("ok", time.Millisecond, 1000, 2*time.Minute, true)
+	RecordTenantOutboxPoll("error", time.Millisecond, 0, 0, false)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	if !strings.Contains(rec.Body.String(), `drive9_tenant_outbox_backlog_oldest_age_seconds 120.000000`) {
+		t.Fatalf("poll error cleared last observed backlog age:\n%s", rec.Body.String())
+	}
+
+	RecordTenantOutboxPoll("ok", time.Millisecond, 1, 45*time.Second, false)
+	rec = httptest.NewRecorder()
+	WritePrometheus(rec)
+	if !strings.Contains(rec.Body.String(), `drive9_tenant_outbox_backlog_oldest_age_seconds 45.000000`) {
+		t.Fatalf("non-full batch did not report its oldest row age:\n%s", rec.Body.String())
+	}
+
+	RecordTenantOutboxPoll("ok", time.Millisecond, 0, 0, false)
+	rec = httptest.NewRecorder()
+	WritePrometheus(rec)
+	if !strings.Contains(rec.Body.String(), `drive9_tenant_outbox_backlog_oldest_age_seconds 0.000000`) {
+		t.Fatalf("empty successful poll did not clear backlog age:\n%s", rec.Body.String())
+	}
+}
+
+func TestAPIKeyResolveCacheRequestDoesNotRewriteEntryGauge(t *testing.T) {
+	RecordAPIKeyResolveCacheEntries(7)
+	RecordAPIKeyResolveCacheRequest("hit")
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_api_key_resolve_cache_requests_total{result="hit"}`) {
+		t.Fatalf("missing API key cache request counter:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_api_key_resolve_cache_entries 7.000000`) {
+		t.Fatalf("request path rewrote API key cache entry gauge:\n%s", text)
 	}
 }

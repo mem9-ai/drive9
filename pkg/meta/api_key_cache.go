@@ -4,7 +4,6 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/metrics"
@@ -53,9 +52,6 @@ type apiKeyResolveCache struct {
 	hashesByTenant map[string]map[string]struct{}
 
 	flight singleflight.Group
-
-	hits   atomic.Int64
-	misses atomic.Int64
 }
 
 func newAPIKeyResolveCache() *apiKeyResolveCache {
@@ -83,12 +79,10 @@ func apiKeyResolveCacheTTLFromEnv() time.Duration {
 func (c *apiKeyResolveCache) get(hash string) (*TenantWithAPIKey, bool) {
 	rec, ok := c.lookup(hash)
 	if !ok {
-		c.misses.Add(1)
-		metrics.RecordAPIKeyResolveCache("miss", c.entryCount())
+		metrics.RecordAPIKeyResolveCacheRequest("miss")
 		return nil, false
 	}
-	c.hits.Add(1)
-	metrics.RecordAPIKeyResolveCache("hit", c.entryCount())
+	metrics.RecordAPIKeyResolveCacheRequest("hit")
 	return rec, true
 }
 
@@ -97,11 +91,16 @@ func (c *apiKeyResolveCache) get(hash string) (*TenantWithAPIKey, bool) {
 func (c *apiKeyResolveCache) lookup(hash string) (*TenantWithAPIKey, bool) {
 	c.mu.Lock()
 	entry, ok := c.byHash[hash]
+	entriesAfterExpiry := -1
 	if ok && !time.Now().Before(entry.expiresAt) {
 		c.deleteLocked(hash)
+		entriesAfterExpiry = len(c.byHash)
 		ok = false
 	}
 	c.mu.Unlock()
+	if entriesAfterExpiry >= 0 {
+		metrics.RecordAPIKeyResolveCacheEntries(entriesAfterExpiry)
+	}
 	if !ok {
 		return nil, false
 	}
@@ -142,12 +141,6 @@ func (c *apiKeyResolveCache) evictTenant(tenantID string) {
 	entries := len(c.byHash)
 	c.mu.Unlock()
 	metrics.RecordAPIKeyResolveCacheEntries(entries)
-}
-
-func (c *apiKeyResolveCache) entryCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.byHash)
 }
 
 func (c *apiKeyResolveCache) deleteLocked(hash string) {

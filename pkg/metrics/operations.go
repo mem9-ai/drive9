@@ -655,27 +655,89 @@ func RecordTenantVideoFilesWithOrg(tenantID, tidbCloudOrgID, state string, count
 	)
 }
 
-// DeleteTenantQuotaLimitsWithOrg removes the three optional quota-limit
-// series without touching current usage. Call it before exporting a fresh
-// snapshot so removed, zeroed, or relabeled limits cannot remain stale.
-func DeleteTenantQuotaLimitsWithOrg(tenantID, tidbCloudOrgID string) {
-	attrs := []Attribute{
-		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
-		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
-		Attr("state", "limit"),
-	}
-	tenantStorageBytes.Delete(attrs...)
-	tenantMediaFiles.Delete(attrs...)
-	tenantVideoFiles.Delete(attrs...)
-}
-
-func DeleteTenantQuotaSnapshot(tenantID string) {
+// ReplaceTenantQuotaSnapshotWithOrg atomically replaces one tenant's quota
+// gauges under the registry lock. It performs only exact label lookups, so the
+// write path is O(1) in the number of tenants and a scrape cannot observe a
+// delete/re-add gap. When replaceLimits is false, the last known limits are
+// preserved while current usage is refreshed.
+func ReplaceTenantQuotaSnapshotWithOrg(
+	tenantID, tidbCloudOrgID string,
+	storageBytes, reservedBytes, mediaFiles, videoFiles int64,
+	storageLimitBytes, mediaLimitFiles, videoLimitFiles int64,
+	replaceLimits bool,
+) {
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	if tenantID == "unknown" {
 		return
 	}
-	for _, name := range []string{tenantStorageBytes.name, tenantMediaFiles.name, tenantVideoFiles.name} {
-		globalRegistry.deleteGaugeByLabel(name, "tenant_id", tenantID)
+	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
+	RegisterModule("tenant_usage")
+
+	globalRegistry.mu.Lock()
+	defer globalRegistry.mu.Unlock()
+	previous := globalRegistry.tenantQuotaSnapshots[tenantID]
+	if replaceLimits {
+		previous.storageLimitBytes = storageLimitBytes
+		previous.mediaLimitFiles = mediaLimitFiles
+		previous.videoLimitFiles = videoLimitFiles
+	}
+	if previous.orgID != "" && previous.orgID != tidbCloudOrgID {
+		deleteTenantQuotaSnapshotLabelsLocked(globalRegistry, tenantID, previous.orgID)
+	}
+	previous.orgID = tidbCloudOrgID
+	globalRegistry.tenantQuotaSnapshots[tenantID] = previous
+
+	setTenantQuotaGaugeLocked(globalRegistry, tenantStorageBytes.name, tenantID, tidbCloudOrgID, "confirmed", storageBytes)
+	setTenantQuotaGaugeLocked(globalRegistry, tenantStorageBytes.name, tenantID, tidbCloudOrgID, "reserved", reservedBytes)
+	setTenantQuotaGaugeLocked(globalRegistry, tenantMediaFiles.name, tenantID, tidbCloudOrgID, "confirmed", mediaFiles)
+	setTenantQuotaGaugeLocked(globalRegistry, tenantVideoFiles.name, tenantID, tidbCloudOrgID, "confirmed", videoFiles)
+	setOrDeleteTenantQuotaLimitLocked(globalRegistry, tenantStorageBytes.name, tenantID, tidbCloudOrgID, previous.storageLimitBytes)
+	setOrDeleteTenantQuotaLimitLocked(globalRegistry, tenantMediaFiles.name, tenantID, tidbCloudOrgID, previous.mediaLimitFiles)
+	setOrDeleteTenantQuotaLimitLocked(globalRegistry, tenantVideoFiles.name, tenantID, tidbCloudOrgID, previous.videoLimitFiles)
+}
+
+func setTenantQuotaGaugeLocked(r *Registry, name, tenantID, tidbCloudOrgID, state string, value int64) {
+	if value < 0 {
+		return
+	}
+	labels := labelsKey([]Attribute{
+		Attr("tenant_id", tenantID),
+		Attr("tidbcloud_org_id", tidbCloudOrgID),
+		Attr("state", state),
+	})
+	r.gauges[name].values[labels] = float64(value)
+}
+
+func setOrDeleteTenantQuotaLimitLocked(r *Registry, name, tenantID, tidbCloudOrgID string, value int64) {
+	labels := labelsKey([]Attribute{
+		Attr("tenant_id", tenantID),
+		Attr("tidbcloud_org_id", tidbCloudOrgID),
+		Attr("state", "limit"),
+	})
+	if value > 0 {
+		r.gauges[name].values[labels] = float64(value)
+		return
+	}
+	delete(r.gauges[name].values, labels)
+}
+
+func deleteTenantQuotaSnapshotLabelsLocked(r *Registry, tenantID, tidbCloudOrgID string) {
+	for _, metric := range []struct {
+		name   string
+		states []string
+	}{
+		{name: tenantStorageBytes.name, states: []string{"confirmed", "reserved", "limit"}},
+		{name: tenantMediaFiles.name, states: []string{"confirmed", "limit"}},
+		{name: tenantVideoFiles.name, states: []string{"confirmed", "limit"}},
+	} {
+		for _, state := range metric.states {
+			labels := labelsKey([]Attribute{
+				Attr("tenant_id", tenantID),
+				Attr("tidbcloud_org_id", tidbCloudOrgID),
+				Attr("state", state),
+			})
+			delete(r.gauges[metric.name].values, labels)
+		}
 	}
 }
 

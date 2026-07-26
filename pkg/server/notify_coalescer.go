@@ -37,7 +37,7 @@ const tenantNotifyFlushRetryBackoff = 100 * time.Millisecond
 //   - Poller cursor semantics (id > cursor ORDER BY id) are unaffected
 //     because each batch INSERT commits all of its rows atomically.
 //   - A failed flush retries the batch once, then falls back to independent
-//     per-row inserts; a row that still fails is logged and dropped. The
+//     per-row inserts; a row that still fails is logged and re-queued. The
 //     5-minute safety-net scan backstops only semantic/file_gc work — it
 //     never reads tenant_notify_outbox — so SSE cross-pod delivery relies on
 //     this retry → per-row fallback. Residual signal loss occurs only under
@@ -57,8 +57,10 @@ type tenantNotifyCoalescer struct {
 	// batch that will never flush.
 	stopped bool
 
-	mu      sync.Mutex
-	pending map[string]int // tenantID → OR-merged work_mask
+	flushMu  sync.Mutex // serializes periodic, shutdown, and test-triggered flushes
+	mu       sync.Mutex
+	pending  map[string]int // tenantID → OR-merged work_mask
+	inFlight map[string]int // batch swapped out but not yet durably inserted
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -98,7 +100,7 @@ func (c *tenantNotifyCoalescer) add(tenantID string, workMask int) {
 		return
 	}
 	c.pending[tenantID] |= workMask
-	pending := len(c.pending)
+	pending := c.pendingCountLocked()
 	c.mu.Unlock()
 	metrics.RecordNotifyCoalescerPending(pending)
 }
@@ -140,6 +142,8 @@ func (c *tenantNotifyCoalescer) stop() {
 // inserted individually, so a metadb hiccup degrades to roughly the
 // pre-coalescer per-event behavior instead of dropping the whole window.
 func (c *tenantNotifyCoalescer) flush(ctx context.Context) {
+	c.flushMu.Lock()
+	defer c.flushMu.Unlock()
 	c.mu.Lock()
 	if len(c.pending) == 0 {
 		c.mu.Unlock()
@@ -147,8 +151,10 @@ func (c *tenantNotifyCoalescer) flush(ctx context.Context) {
 	}
 	batch := c.pending
 	c.pending = make(map[string]int)
+	c.inFlight = batch
+	pending := c.pendingCountLocked()
 	c.mu.Unlock()
-	metrics.RecordNotifyCoalescerPending(0)
+	metrics.RecordNotifyCoalescerPending(pending)
 
 	entries := make([]meta.TenantNotifyEntry, 0, len(batch))
 	for tenantID, workMask := range batch {
@@ -156,6 +162,7 @@ func (c *tenantNotifyCoalescer) flush(ctx context.Context) {
 	}
 	if err := c.insertBatch(ctx, entries); err == nil {
 		metrics.RecordNotifyCoalescerFlush("ok", len(entries))
+		c.finishFlush(nil)
 		return
 	} else {
 		logger.Warn(ctx, "tenant_notify_coalescer_flush_failed",
@@ -165,10 +172,11 @@ func (c *tenantNotifyCoalescer) flush(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		// No room for the batch retry; go straight to per-row inserts (they
-		// fail fast on the cancelled context and are dropped per row).
+		// fail fast on the cancelled context and are re-queued per row).
 	case <-time.After(tenantNotifyFlushRetryBackoff):
 		if err := c.insertBatch(ctx, entries); err == nil {
 			metrics.RecordNotifyCoalescerFlush("retry_ok", len(entries))
+			c.finishFlush(nil)
 			return
 		} else {
 			logger.Warn(ctx, "tenant_notify_coalescer_flush_retry_failed",
@@ -177,15 +185,17 @@ func (c *tenantNotifyCoalescer) flush(ctx context.Context) {
 		}
 	}
 	metrics.RecordNotifyCoalescerFlush("fallback", len(entries))
-	c.insertPerRow(ctx, entries)
+	c.finishFlush(c.insertPerRow(ctx, entries))
 }
 
-// insertPerRow delivers each entry independently; a failing row is logged
-// and dropped without affecting the rest.
-func (c *tenantNotifyCoalescer) insertPerRow(ctx context.Context, entries []meta.TenantNotifyEntry) {
+// insertPerRow delivers each entry independently and returns rows that still
+// failed so the caller can merge them back into the next pending batch.
+func (c *tenantNotifyCoalescer) insertPerRow(ctx context.Context, entries []meta.TenantNotifyEntry) []meta.TenantNotifyEntry {
+	failed := make([]meta.TenantNotifyEntry, 0)
 	for _, e := range entries {
 		if err := c.insertSingle(ctx, e.TenantID, e.WorkMask); err != nil {
 			metrics.RecordNotifyCoalescerPerRowFallback("error")
+			failed = append(failed, e)
 			logger.Warn(ctx, "tenant_notify_coalescer_row_insert_failed",
 				zap.String("tenant_id", e.TenantID),
 				zap.Int("work_mask", e.WorkMask),
@@ -194,4 +204,26 @@ func (c *tenantNotifyCoalescer) insertPerRow(ctx context.Context, entries []meta
 			metrics.RecordNotifyCoalescerPerRowFallback("ok")
 		}
 	}
+	return failed
+}
+
+func (c *tenantNotifyCoalescer) finishFlush(failed []meta.TenantNotifyEntry) {
+	c.mu.Lock()
+	for _, e := range failed {
+		c.pending[e.TenantID] |= e.WorkMask
+	}
+	c.inFlight = nil
+	pending := c.pendingCountLocked()
+	c.mu.Unlock()
+	metrics.RecordNotifyCoalescerPending(pending)
+}
+
+func (c *tenantNotifyCoalescer) pendingCountLocked() int {
+	count := len(c.inFlight)
+	for tenantID := range c.pending {
+		if _, exists := c.inFlight[tenantID]; !exists {
+			count++
+		}
+	}
+	return count
 }

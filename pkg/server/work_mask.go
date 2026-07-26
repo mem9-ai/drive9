@@ -1,31 +1,34 @@
 package server
 
-import "github.com/mem9-ai/drive9/pkg/backend"
+import (
+	"github.com/mem9-ai/drive9/pkg/backend"
+	"github.com/mem9-ai/drive9/pkg/meta"
+)
 
 // Work mask constants for the unified tenant notify outbox. Each bit in
 // work_mask selects one work type. The poller dispatches by testing bits:
 //
 //	SSE bit  → wake local SSE bus (broadcast: all pods with subscribers)
-//	Semantic/GC/Quota bits → kick unified worker (sharded: shard owner only)
+//	Semantic/GC bits → kick unified worker (sharded: shard owner only)
 //	Metrics cleanup bit → delete local tenant series (broadcast: every pod)
 //
-// These mirror the backend.Work* constants in pkg/backend/dat9.go. The
-// compile-time assertions below ensure the values stay in sync.
+// The persisted allocation lives in pkg/meta. Backend and server aliases plus
+// the compile-time assertions below keep both producer paths in sync.
 const (
 	// WorkSSE (bit 0) wakes the local SSE EventBus so SSE handlers re-read
 	// fs_events. Broadcast to all pods (not sharded) — any pod with subscribers
 	// for the tenant must wake.
-	WorkSSE = 1
+	WorkSSE = meta.TenantNotifyWorkSSE
 	// WorkSemantic (bit 1) kicks the unified worker to drain semantic tasks
 	// for this tenant. Sharded: only the shard-owner pod processes it.
-	WorkSemantic = 2
+	WorkSemantic = meta.TenantNotifyWorkSemantic
 	// WorkFileGC (bit 2) kicks the unified worker to drain file_gc tasks.
 	// Sharded: only the shard-owner pod processes it.
-	WorkFileGC = 4
+	WorkFileGC = meta.TenantNotifyWorkFileGC
 	// WorkMetricsCleanup (bit 3) removes all tenant-scoped metric series from
 	// the local process. It is server-only because it is emitted by durable
 	// tenant lifecycle transitions, not by a tenant DB write path.
-	WorkMetricsCleanup = 8
+	WorkMetricsCleanup = meta.TenantNotifyWorkMetricsCleanup
 )
 
 // Compile-time assertions that the server-side work mask constants match the
@@ -35,4 +38,5 @@ var (
 	_ = [1]byte{}[backend.BackendWorkSSE^WorkSSE]
 	_ = [1]byte{}[backend.BackendWorkSemantic^WorkSemantic]
 	_ = [1]byte{}[backend.BackendWorkFileGC^WorkFileGC]
+	_ = [1]byte{}[backend.BackendWorkMetricsCleanup^WorkMetricsCleanup]
 )

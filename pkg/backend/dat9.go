@@ -69,14 +69,14 @@ const (
 	symlinkContentType        = "application/x-symlink"
 )
 
-// Work mask constants for the unified tenant notify outbox. These mirror the
-// constants in pkg/server/work_mask.go but are defined here in the backend
-// package so the write path can signal which work types were enqueued without
-// importing the server package (which would be a circular dependency).
+// Work mask aliases for the unified tenant notify outbox. The persisted bit
+// allocation lives in pkg/meta; backend aliases let tenant write paths signal
+// work without importing the server package (which would be a cycle).
 const (
-	BackendWorkSSE      = 1 // wake local SSE bus
-	BackendWorkSemantic = 2 // kick semantic worker
-	BackendWorkFileGC   = 4 // kick file GC worker
+	BackendWorkSSE            = meta.TenantNotifyWorkSSE            // wake local SSE bus
+	BackendWorkSemantic       = meta.TenantNotifyWorkSemantic       // kick semantic worker
+	BackendWorkFileGC         = meta.TenantNotifyWorkFileGC         // kick file GC worker
+	BackendWorkMetricsCleanup = meta.TenantNotifyWorkMetricsCleanup // reserved for lifecycle cleanup; backend does not emit it
 )
 
 // Dat9Backend implements filesystem.FileSystem with the inode model.

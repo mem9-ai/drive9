@@ -269,21 +269,18 @@ func TestDeleteTenantGaugeAndSSEInFlightRemoveSeries(t *testing.T) {
 	}
 }
 
-func TestDeleteTenantQuotaLimitsRemovesOnlyLimitSeries(t *testing.T) {
+func TestReplaceTenantQuotaSnapshotRemovesOnlyAbsentLimitSeries(t *testing.T) {
 	const tenantID = "tenant-quota-limit-delete"
 	const orgID = "org-quota-limit-delete"
 
-	RecordTenantStorageBytesWithOrg(tenantID, orgID, "confirmed", 10)
-	RecordTenantStorageBytesWithOrg(tenantID, orgID, "limit", 100)
-	RecordTenantMediaFilesWithOrg(tenantID, orgID, "limit", 20)
-	RecordTenantVideoFilesWithOrg(tenantID, orgID, "limit", 30)
-	DeleteTenantQuotaLimitsWithOrg(tenantID, orgID)
+	ReplaceTenantQuotaSnapshotWithOrg(tenantID, orgID, 10, 1, 2, 3, 100, 20, 30, true)
+	ReplaceTenantQuotaSnapshotWithOrg(tenantID, orgID, 11, 1, 2, 3, 0, 0, 0, true)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
 	if !hasMetricLineWith(text, "drive9_tenant_storage_bytes", `tenant_id="`+tenantID+`"`, `state="confirmed"`) {
-		t.Fatalf("confirmed usage was deleted with limits:\n%s", text)
+		t.Fatalf("confirmed usage was deleted while limits were replaced:\n%s", text)
 	}
 	for _, metric := range []string{"drive9_tenant_storage_bytes", "drive9_tenant_media_files", "drive9_tenant_video_files"} {
 		if hasMetricLineWith(text, metric, `tenant_id="`+tenantID+`"`, `state="limit"`) {

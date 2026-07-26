@@ -250,6 +250,32 @@ func TestDBPoolConnectionsIncludesTenantPoolsWithOpenConnections(t *testing.T) {
 	}
 }
 
+func TestDBPoolConnectionsDoesNotDuplicateRoleAggregateForMixedPools(t *testing.T) {
+	const role = "mixed-db-aggregate"
+	healthy := &atomic.Bool{}
+	healthy.Store(true)
+	unscoped := sql.OpenDB(fakeConnector{healthy: healthy})
+	tenantScoped := sql.OpenDB(fakeConnector{healthy: healthy})
+	unscoped.SetMaxOpenConns(2)
+	tenantScoped.SetMaxOpenConns(3)
+	t.Cleanup(func() {
+		UnregisterDB(unscoped)
+		UnregisterDB(tenantScoped)
+		_ = unscoped.Close()
+		_ = tenantScoped.Close()
+	})
+
+	RegisterDB(role, unscoped)
+	RegisterTenantDB(role, "mixed-db-aggregate-tenant", tenantScoped)
+	out := renderDB(t)
+	for _, state := range []string{"in_use", "max_open"} {
+		line := `drive9_db_pool_connections{role="` + role + `",state="` + state + `"}`
+		if got := strings.Count(out, line); got != 1 {
+			t.Fatalf("role aggregate %s count = %d, want 1:\n%s", state, got, out)
+		}
+	}
+}
+
 func TestSharedDBPoolMetricsUseUUIDWithoutTenantLabel(t *testing.T) {
 	const (
 		dbPoolUUID = "11111111-1111-4111-8111-111111111111"

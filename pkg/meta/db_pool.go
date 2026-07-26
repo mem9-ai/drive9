@@ -1616,7 +1616,7 @@ func (s *Store) FinalizeSharedTenantDeleteMetadata(ctx context.Context, tenantID
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
 			return err
 		}
-		return nil
+		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)
 	})
 	if err != nil {
 		return err

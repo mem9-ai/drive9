@@ -81,6 +81,13 @@ type moduleState struct {
 	up           float64
 }
 
+type tenantQuotaSnapshotState struct {
+	orgID             string
+	storageLimitBytes int64
+	mediaLimitFiles   int64
+	videoLimitFiles   int64
+}
+
 type Registry struct {
 	mu sync.RWMutex
 
@@ -88,6 +95,8 @@ type Registry struct {
 	gauges     map[string]*gaugeInstrument
 	histograms map[string]*histogramInstrument
 	modules    map[string]moduleState
+
+	tenantQuotaSnapshots map[string]tenantQuotaSnapshotState
 }
 
 type MeterProvider struct {
@@ -116,10 +125,11 @@ type Float64Histogram struct {
 
 func NewRegistry() *Registry {
 	return &Registry{
-		counters:   map[string]*counterInstrument{},
-		gauges:     map[string]*gaugeInstrument{},
-		histograms: map[string]*histogramInstrument{},
-		modules:    map[string]moduleState{},
+		counters:             map[string]*counterInstrument{},
+		gauges:               map[string]*gaugeInstrument{},
+		histograms:           map[string]*histogramInstrument{},
+		modules:              map[string]moduleState{},
+		tenantQuotaSnapshots: map[string]tenantQuotaSnapshotState{},
 	}
 }
 
@@ -356,20 +366,8 @@ func (r *Registry) DeleteGaugesByLabel(labelKey, labelValue string) {
 			}
 		}
 	}
-}
-
-func (r *Registry) deleteGaugeByLabel(name, labelKey, labelValue string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	inst := r.gauges[name]
-	if inst == nil {
-		return
-	}
-	match := labelKey + `="` + EscapePromLabel(labelValue) + `"`
-	for labels := range inst.values {
-		if labelHasKeyValue(labels, match) {
-			delete(inst.values, labels)
-		}
+	if labelKey == "tenant_id" {
+		delete(r.tenantQuotaSnapshots, labelValue)
 	}
 }
 

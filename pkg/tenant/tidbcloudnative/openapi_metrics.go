@@ -129,6 +129,9 @@ func tidbCloudOperationForRequest(method, uri string) string {
 			return tidbCloudOperationGetCluster
 		}
 	default:
+		// All production callers use one of the fixed IAM/cluster paths above;
+		// this bounded fallback is for malformed or newly introduced paths and
+		// must never be replaced with the raw URI as a metric label.
 		return "unknown"
 	}
 }

@@ -81,8 +81,8 @@ func TestResolveByAPIKeyHashCachesWithinTTL(t *testing.T) {
 	if _, err := s.ResolveByAPIKeyHash(context.Background(), "cache-hash1"); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.apiKeys.hits.Load(); got != 0 {
-		t.Fatalf("cache hits after first resolve = %d, want 0", got)
+	if _, ok := s.apiKeys.lookup("cache-hash1"); !ok {
+		t.Fatal("first resolve did not populate cache")
 	}
 	got, err := s.ResolveByAPIKeyHash(context.Background(), "cache-hash1")
 	if err != nil {
@@ -90,9 +90,6 @@ func TestResolveByAPIKeyHashCachesWithinTTL(t *testing.T) {
 	}
 	if got.Tenant.ID != "cache-t1" || got.APIKey.ID != "cache-k1" {
 		t.Fatalf("cached resolve = tenant %s key %s, want cache-t1/cache-k1", got.Tenant.ID, got.APIKey.ID)
-	}
-	if hits := s.apiKeys.hits.Load(); hits != 1 {
-		t.Fatalf("cache hits after second resolve = %d, want 1", hits)
 	}
 }
 
@@ -129,20 +126,15 @@ func TestResolveByAPIKeyHashRevokeAPIKeyEvictsCache(t *testing.T) {
 	if _, err := s.ResolveByAPIKeyHash(ctx, "cache-hash3"); err != nil {
 		t.Fatal(err)
 	}
-	if hits := s.apiKeys.hits.Load(); hits != 1 {
-		t.Fatalf("cache hits = %d, want 1", hits)
-	}
-
 	if err := s.RevokeAPIKey(ctx, "cache-t3", "cache-k3"); err != nil {
 		t.Fatal(err)
 	}
-	missesBefore := s.apiKeys.misses.Load()
+	if _, ok := s.apiKeys.lookup("cache-hash3"); ok {
+		t.Fatal("revoked API key remained cached")
+	}
 	revoked, err := s.ResolveByAPIKeyHash(ctx, "cache-hash3")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if got := s.apiKeys.misses.Load(); got != missesBefore+1 {
-		t.Fatalf("cache misses after revoke = %d, want %d (entry evicted)", got, missesBefore+1)
 	}
 	if revoked.APIKey.Status != APIKeyRevoked {
 		t.Fatalf("revoked key status = %s, want %s", revoked.APIKey.Status, APIKeyRevoked)
@@ -161,20 +153,15 @@ func TestResolveByAPIKeyHashRevokeTenantAPIKeysEvictsCache(t *testing.T) {
 	if _, err := s.ResolveByAPIKeyHash(ctx, "cache-hash4"); err != nil {
 		t.Fatal(err)
 	}
-	if hits := s.apiKeys.hits.Load(); hits != 1 {
-		t.Fatalf("cache hits = %d, want 1", hits)
-	}
-
 	if err := s.RevokeTenantAPIKeys(ctx, "cache-t4"); err != nil {
 		t.Fatal(err)
 	}
-	missesBefore := s.apiKeys.misses.Load()
+	if _, ok := s.apiKeys.lookup("cache-hash4"); ok {
+		t.Fatal("tenant-revoked API key remained cached")
+	}
 	revoked, err := s.ResolveByAPIKeyHash(ctx, "cache-hash4")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if got := s.apiKeys.misses.Load(); got != missesBefore+1 {
-		t.Fatalf("cache misses after RevokeTenantAPIKeys = %d, want %d", got, missesBefore+1)
 	}
 	if revoked.APIKey.Status != APIKeyRevoked {
 		t.Fatalf("tenant-revoked key status = %s, want %s", revoked.APIKey.Status, APIKeyRevoked)
@@ -198,20 +185,15 @@ func TestResolveByAPIKeyHashRevokeByIssuerEvictsCache(t *testing.T) {
 	if _, err := s.ResolveByAPIKeyHash(ctx, "cache-hash5"); err != nil {
 		t.Fatal(err)
 	}
-	if hits := s.apiKeys.hits.Load(); hits != 1 {
-		t.Fatalf("cache hits = %d, want 1", hits)
-	}
-
 	if err := s.RevokeAPIKeysByIssuer(ctx, "cache-t5", "slock", "subject-1", ""); err != nil {
 		t.Fatal(err)
 	}
-	missesBefore := s.apiKeys.misses.Load()
+	if _, ok := s.apiKeys.lookup("cache-hash5"); ok {
+		t.Fatal("issuer-revoked API key remained cached")
+	}
 	revoked, err := s.ResolveByAPIKeyHash(ctx, "cache-hash5")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if got := s.apiKeys.misses.Load(); got != missesBefore+1 {
-		t.Fatalf("cache misses after issuer revoke = %d, want %d", got, missesBefore+1)
 	}
 	if revoked.APIKey.Status != APIKeyRevoked {
 		t.Fatalf("issuer-revoked key status = %s, want %s", revoked.APIKey.Status, APIKeyRevoked)
@@ -231,20 +213,15 @@ func TestResolveByAPIKeyHashTenantStatusUpdateEvictsCache(t *testing.T) {
 	if _, err := s.ResolveByAPIKeyHash(ctx, "cache-hash8"); err != nil {
 		t.Fatal(err)
 	}
-	if hits := s.apiKeys.hits.Load(); hits != 1 {
-		t.Fatalf("cache hits = %d, want 1", hits)
-	}
-
 	if err := s.UpdateTenantStatus(ctx, "cache-t8", TenantSuspended); err != nil {
 		t.Fatal(err)
 	}
-	missesBefore := s.apiKeys.misses.Load()
+	if _, ok := s.apiKeys.lookup("cache-hash8"); ok {
+		t.Fatal("tenant status update left stale API key resolution cached")
+	}
 	got, err := s.ResolveByAPIKeyHash(ctx, "cache-hash8")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if got := s.apiKeys.misses.Load(); got != missesBefore+1 {
-		t.Fatalf("cache misses after status update = %d, want %d (entry evicted)", got, missesBefore+1)
 	}
 	if got.Tenant.Status != TenantSuspended {
 		t.Fatalf("tenant status after update = %s, want %s (no TTL wait)", got.Tenant.Status, TenantSuspended)
@@ -263,10 +240,6 @@ func TestResolveByAPIKeyHashDBCredentialUpdateEvictsCache(t *testing.T) {
 	if _, err := s.ResolveByAPIKeyHash(ctx, "cache-hash9"); err != nil {
 		t.Fatal(err)
 	}
-	if hits := s.apiKeys.hits.Load(); hits != 1 {
-		t.Fatalf("cache hits = %d, want 1", hits)
-	}
-
 	updated, err := s.UpdateTenantDBCredentialIf(ctx, "cache-t9", "root", "app_user", []byte("new-cipher"))
 	if err != nil {
 		t.Fatal(err)
@@ -274,13 +247,12 @@ func TestResolveByAPIKeyHashDBCredentialUpdateEvictsCache(t *testing.T) {
 	if !updated {
 		t.Fatal("UpdateTenantDBCredentialIf updated = false, want true")
 	}
-	missesBefore := s.apiKeys.misses.Load()
+	if _, ok := s.apiKeys.lookup("cache-hash9"); ok {
+		t.Fatal("credential update left stale API key resolution cached")
+	}
 	got, err := s.ResolveByAPIKeyHash(ctx, "cache-hash9")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if got := s.apiKeys.misses.Load(); got != missesBefore+1 {
-		t.Fatalf("cache misses after credential update = %d, want %d (entry evicted)", got, missesBefore+1)
 	}
 	if got.Tenant.DBUser != "app_user" || string(got.Tenant.DBPasswordCipher) != "new-cipher" {
 		t.Fatalf("credentials after update = %q/%q, want app_user/new-cipher (no TTL wait)",
@@ -297,13 +269,12 @@ func TestResolveByAPIKeyHashTTLExpiryRefetches(t *testing.T) {
 	if _, err := s.ResolveByAPIKeyHash(context.Background(), "cache-hash6"); err != nil {
 		t.Fatal(err)
 	}
-	missesBefore := s.apiKeys.misses.Load()
 	time.Sleep(40 * time.Millisecond)
+	if _, ok := s.apiKeys.lookup("cache-hash6"); ok {
+		t.Fatal("expired API key resolution remained cached")
+	}
 	if _, err := s.ResolveByAPIKeyHash(context.Background(), "cache-hash6"); err != nil {
 		t.Fatal(err)
-	}
-	if got := s.apiKeys.misses.Load(); got != missesBefore+1 {
-		t.Fatalf("cache misses after TTL expiry = %d, want %d (entry re-fetched)", got, missesBefore+1)
 	}
 }
 
@@ -328,9 +299,6 @@ func TestResolveByAPIKeyHashCachedEntryIsIsolatedPerCaller(t *testing.T) {
 	again, err := s.ResolveByAPIKeyHash(context.Background(), "cache-hash7")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if hits := s.apiKeys.hits.Load(); hits != 2 {
-		t.Fatalf("cache hits = %d, want 2", hits)
 	}
 	if string(again.APIKey.JWTCiphertext) != "jwt-cipher" {
 		t.Fatalf("cached jwt ciphertext mutated: %q", again.APIKey.JWTCiphertext)

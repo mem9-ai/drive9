@@ -38,3 +38,31 @@ func TestRecordTenantQuotaSnapshotReplacesOldLimitsAndOrgLabels(t *testing.T) {
 		t.Fatalf("new quota usage snapshot missing:\n%s", text)
 	}
 }
+
+func TestRecordTenantQuotaSnapshotPreservesKnownLimitsWhenConfigUnavailable(t *testing.T) {
+	const (
+		tenantID = "tenant-quota-snapshot-config-unavailable"
+		orgID    = "org-quota-snapshot-config-unavailable"
+	)
+	recordTenantQuotaSnapshot(tenantID, orgID, &QuotaUsageView{
+		StorageBytes: 10, MediaFileCount: 2, VideoFileCount: 1,
+	}, &QuotaConfigView{
+		MaxStorageBytes: 100, MaxMediaLLMFiles: 20, MaxVideoLLMFiles: 10,
+	})
+	recordTenantQuotaSnapshot(tenantID, orgID, &QuotaUsageView{
+		StorageBytes: 11, MediaFileCount: 3, VideoFileCount: 2,
+	}, nil)
+
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	text := rec.Body.String()
+	for _, want := range []string{
+		`drive9_tenant_storage_bytes{state="limit",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 100.000000`,
+		`drive9_tenant_media_files{state="limit",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 20.000000`,
+		`drive9_tenant_video_files{state="limit",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 10.000000`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("known quota limit disappeared while config was unavailable; missing %q:\n%s", want, text)
+		}
+	}
+}

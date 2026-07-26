@@ -292,7 +292,7 @@ type Server struct {
 	// Unified tenant outbox components. The tenantOutboxPoller reads the
 	// central tenant_notify_outbox table (in the always-provisioned meta DB)
 	// on every pod and dispatches by work_mask: SSE bits wake the local bus;
-	// semantic/file_gc/quota bits kick the tenantWorker on the shard owner.
+	// semantic/file_gc bits kick the tenantWorker on the shard owner.
 	// The shardResolver determines shard ownership via jump consistent hashing
 	// over the active pod ring. The podRegistry maintains this pod's presence
 	// and subscriber set in the central DB. All run on every pod (not
@@ -795,25 +795,24 @@ func (s *Server) insertTenantNotify(tenantID string, workMask int) {
 	}
 }
 
-// broadcastTenantMetricsCleanup immediately clears this process and emits a
-// durable lifecycle signal so every pod clears historical tenant-scoped
-// series. Callers must invoke this only after a deleting/deleted transition or
-// cleanup job has been durably committed.
+// broadcastTenantMetricsCleanup immediately clears this process after a
+// deleting/deleted lifecycle transition. The meta-store transition writes the
+// WorkMetricsCleanup outbox row in the same transaction, so this helper must
+// not enqueue a second best-effort signal through the coalescer.
 func (s *Server) broadcastTenantMetricsCleanup(tenantID string) {
 	if tenantID == "" {
 		return
 	}
 	metrics.DeleteTenantCounters(tenantID)
-	s.insertTenantNotify(tenantID, WorkMetricsCleanup)
 }
 
 // startNotifyInfrastructure launches the unified tenant outbox components
 // that run on every pod (not leader-gated):
 //   - shardResolver: refreshes the active pod ring for jump-consistent-hash
-//     shard ownership of semantic/file_gc/quota work.
+//     shard ownership of semantic/file_gc work.
 //   - tenantOutboxPoller: reads the central tenant_notify_outbox table at
 //     200ms intervals and dispatches by work_mask (SSE → wake local bus;
-//     semantic/file_gc/quota → kick tenantWorker on shard owner).
+//     semantic/file_gc → kick tenantWorker on shard owner).
 //   - podRegistry: maintains this pod's presence in pod_registry and reports
 //     its SSE subscriber tenant set to pod_subscriptions.
 //

@@ -18,7 +18,7 @@ var apiKeyResolveCacheEntries = serviceMeter.Float64Gauge("drive9_api_key_resolv
 
 var notifyCoalescerFlushTotal = serviceMeter.Int64Counter("drive9_notify_coalescer_flush_total", "Tenant notify coalescer flushes by final result")
 var notifyCoalescerPerRowFallbackTotal = serviceMeter.Int64Counter("drive9_notify_coalescer_per_row_fallback_total", "Tenant notify coalescer per-row fallback inserts by result")
-var notifyCoalescerPending = serviceMeter.Float64Gauge("drive9_notify_coalescer_pending", "Tenant notify coalescer tenants awaiting flush")
+var notifyCoalescerPending = serviceMeter.Float64Gauge("drive9_notify_coalescer_pending", "Tenant notify coalescer tenants pending or awaiting durable flush")
 var notifyCoalescerBatchSize = serviceMeter.Float64Histogram("drive9_notify_coalescer_batch_size", "Tenants in a notify coalescer flush batch", batchSizeBounds)
 
 var tenantOutboxPollDuration = serviceMeter.Float64Histogram("drive9_tenant_outbox_poll_duration_seconds", "Tenant outbox poll cycle duration by result", operationDurationBounds)
@@ -56,10 +56,9 @@ func RecordMutationDispatcherBatch(size int, fallback bool) {
 	}
 }
 
-func RecordAPIKeyResolveCache(result string, entries int) {
+func RecordAPIKeyResolveCacheRequest(result string) {
 	RegisterModule("api_key_resolve_cache")
 	apiKeyResolveCacheRequestsTotal.Add(1, Attr("result", cleanMetricValue(result, "unknown")))
-	apiKeyResolveCacheEntries.Set(float64(max(entries, 0)))
 }
 
 func RecordAPIKeyResolveCacheEntries(entries int) {
@@ -87,13 +86,19 @@ func RecordNotifyCoalescerPerRowFallback(result string) {
 
 func RecordTenantOutboxPoll(result string, d time.Duration, size int, oldestAge time.Duration, full bool) {
 	RegisterModule("tenant_outbox_poller")
-	tenantOutboxPollDuration.Observe(max(d.Seconds(), 0), Attr("result", cleanMetricValue(result, "unknown")))
+	result = cleanMetricValue(result, "unknown")
+	tenantOutboxPollDuration.Observe(max(d.Seconds(), 0), Attr("result", result))
 	tenantOutboxBatchSize.Observe(float64(max(size, 0)))
-	if full {
+	if result != "ok" {
+		return
+	}
+	if size > 0 {
 		tenantOutboxBacklogOldestAge.Set(max(oldestAge.Seconds(), 0))
-		tenantOutboxFullBatchesTotal.Add(1)
 	} else {
 		tenantOutboxBacklogOldestAge.Set(0)
+	}
+	if full {
+		tenantOutboxFullBatchesTotal.Add(1)
 	}
 }
 

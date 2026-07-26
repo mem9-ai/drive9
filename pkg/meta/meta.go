@@ -41,6 +41,16 @@ const (
 	TenantDeleted      TenantStatus = "deleted"
 )
 
+// Tenant notify work-mask bits are defined in the meta package because the
+// outbox is persisted here. Server and backend aliases reference these
+// constants instead of allocating bits independently.
+const (
+	TenantNotifyWorkSSE = 1 << iota
+	TenantNotifyWorkSemantic
+	TenantNotifyWorkFileGC
+	TenantNotifyWorkMetricsCleanup
+)
+
 var allTenantStatuses = []TenantStatus{
 	TenantPending,
 	TenantProvisioning,
@@ -2627,6 +2637,9 @@ func (s *Store) MarkFreeTenantPoolTenantDeleting(ctx context.Context, tenantID s
 		}
 		n, _ := res.RowsAffected()
 		updated = n > 0
+		if updated {
+			return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)
+		}
 		return nil
 	})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -3579,6 +3592,23 @@ func scanTenantBindingScanner(row tenantBindingScanner) (*TenantWithTiDBCloudOrg
 func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status TenantStatus) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_status", start, &err)
+	if tenantStatusNeedsMetricsCleanup(status) {
+		err = s.InTx(ctx, func(tx *sql.Tx) error {
+			res, err := tx.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`, status, time.Now().UTC(), id)
+			if err != nil {
+				return err
+			}
+			if err := requireAffected(res); err != nil {
+				return err
+			}
+			return insertTenantNotifyTx(ctx, tx, id, TenantNotifyWorkMetricsCleanup)
+		})
+		if err != nil {
+			return err
+		}
+		s.apiKeys.evictTenant(id)
+		return nil
+	}
 	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`, status, time.Now().UTC(), id)
 	if err != nil {
 		return err
@@ -3589,6 +3619,10 @@ func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status Tenant
 	}
 	s.apiKeys.evictTenant(id)
 	return nil
+}
+
+func tenantStatusNeedsMetricsCleanup(status TenantStatus) bool {
+	return status == TenantDeleting || status == TenantDeleted
 }
 
 // UpdateTenantProvider rewrites a tenant's persisted provider. It exists for
@@ -3614,6 +3648,28 @@ func (s *Store) UpdateTenantProvider(ctx context.Context, id, provider string) (
 func (s *Store) UpdateTenantStatusIf(ctx context.Context, id string, from, to TenantStatus) (updated bool, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_status_if", start, &err)
+	if tenantStatusNeedsMetricsCleanup(to) {
+		err = s.InTx(ctx, func(tx *sql.Tx) error {
+			res, err := tx.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+				to, time.Now().UTC(), id, from)
+			if err != nil {
+				return err
+			}
+			n, _ := res.RowsAffected()
+			updated = n > 0
+			if !updated {
+				return nil
+			}
+			return insertTenantNotifyTx(ctx, tx, id, TenantNotifyWorkMetricsCleanup)
+		})
+		if err != nil {
+			return false, err
+		}
+		if updated {
+			s.apiKeys.evictTenant(id)
+		}
+		return updated, nil
+	}
 	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
 		to, time.Now().UTC(), id, from)
 	if err != nil {
@@ -4105,7 +4161,7 @@ func (s *Store) MarkTenantDeleted(ctx context.Context, tenantID string) (err err
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
 			return err
 		}
-		return nil
+		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)
 	})
 	if err != nil {
 		return err
@@ -4168,7 +4224,7 @@ func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID 
 			WHERE f.tenant_id = ? AND p.status = ?`, tenantID, PlacementStatusDeleting); err != nil {
 			return err
 		}
-		return nil
+		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)
 	})
 	if err != nil {
 		return err
@@ -4745,7 +4801,7 @@ func (s *Store) DeleteSubscriptionsForStalePods(ctx context.Context) (n int64, e
 
 // TenantNotifyRow mirrors a row in tenant_notify_outbox. Each row is a
 // lightweight work signal: tenant_id identifies the tenant and work_mask is a
-// bitmask of work types to dispatch (SSE, semantic, file_gc, quota).
+// bitmask of work types to dispatch (SSE, semantic, file_gc, metrics cleanup).
 type TenantNotifyRow struct {
 	ID             uint64
 	TenantID       string
@@ -4762,6 +4818,13 @@ func (s *Store) InsertTenantNotify(ctx context.Context, tenantID string, workMas
 	start := time.Now()
 	defer observeMeta(ctx, "insert_tenant_notify", start, &err)
 	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO tenant_notify_outbox (tenant_id, work_mask) VALUES (?, ?)`,
+		tenantID, workMask)
+	return err
+}
+
+func insertTenantNotifyTx(ctx context.Context, tx *sql.Tx, tenantID string, workMask int) error {
+	_, err := tx.ExecContext(ctx,
 		`INSERT INTO tenant_notify_outbox (tenant_id, work_mask) VALUES (?, ?)`,
 		tenantID, workMask)
 	return err

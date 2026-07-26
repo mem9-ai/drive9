@@ -427,7 +427,8 @@ func writeDBPrometheus(w http.ResponseWriter) {
 	for _, role := range tenantRoles {
 		// Avoid duplicate role-only label sets if a caller registers both scoped
 		// and unscoped pools under the same role.
-		if _, exists := poolTotals[dbMetricKey{role: role}]; exists {
+		unscopedKey := (registeredDB{role: role}).metricKey()
+		if _, exists := poolTotals[unscopedKey]; exists {
 			continue
 		}
 		totals := tenantRoleTotals[role]
