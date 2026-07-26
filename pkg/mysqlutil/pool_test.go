@@ -111,3 +111,13 @@ func TestSharedPoolDurationEnv(t *testing.T) {
 		t.Fatalf("shared env durations = %s/%s, want 45m/12m", lifetime, idleTime)
 	}
 }
+
+func TestMetaPoolDurationEnvAllowsZeroIdleTime(t *testing.T) {
+	t.Setenv("DRIVE9_META_DB_CONN_MAX_LIFETIME", "1h")
+	t.Setenv("DRIVE9_META_DB_CONN_MAX_IDLE_TIME", "0s")
+
+	lifetime, idleTime := poolLifetime(RoleMeta)
+	if lifetime != time.Hour || idleTime != 0 {
+		t.Fatalf("meta env durations = %s/%s, want 1h/0s", lifetime, idleTime)
+	}
+}

@@ -36,6 +36,7 @@ const (
 //
 // Supported role-specific env vars:
 //   - DRIVE9_META_DB_MAX_OPEN_CONNS / DRIVE9_META_DB_MAX_IDLE_CONNS
+//   - DRIVE9_META_DB_CONN_MAX_LIFETIME / DRIVE9_META_DB_CONN_MAX_IDLE_TIME
 //   - DRIVE9_USER_DB_MAX_OPEN_CONNS / DRIVE9_USER_DB_MAX_IDLE_CONNS
 //   - DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS / DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS
 //   - DRIVE9_SHARED_DB_MAX_OPEN_CONNS / DRIVE9_SHARED_DB_MAX_IDLE_CONNS
@@ -58,11 +59,11 @@ func ApplyPoolDefaults(db *sql.DB, role string) {
 
 func poolLifetime(role string) (time.Duration, time.Duration) {
 	lifetime, idleTime := defaultPoolLifetime(role)
-	if role != RoleShared {
+	if role != RoleMeta && role != RoleShared {
 		return lifetime, idleTime
 	}
-	return poolEnvDuration(role, "CONN_MAX_LIFETIME", lifetime),
-		poolEnvDuration(role, "CONN_MAX_IDLE_TIME", idleTime)
+	return poolEnvDuration(role, "CONN_MAX_LIFETIME", lifetime, false),
+		poolEnvDuration(role, "CONN_MAX_IDLE_TIME", idleTime, true)
 }
 
 func defaultPoolLifetime(role string) (time.Duration, time.Duration) {
@@ -102,7 +103,7 @@ func poolEnvInt(role, suffix string, def int) int {
 	return def
 }
 
-func poolEnvDuration(role, suffix string, def time.Duration) time.Duration {
+func poolEnvDuration(role, suffix string, def time.Duration, allowZero bool) time.Duration {
 	key := rolePoolEnvKey(role, suffix)
 	if key == "" {
 		return def
@@ -112,7 +113,7 @@ func poolEnvDuration(role, suffix string, def time.Duration) time.Duration {
 		return def
 	}
 	value, err := time.ParseDuration(raw)
-	if err != nil || value <= 0 {
+	if err != nil || value < 0 || value == 0 && !allowZero {
 		return def
 	}
 	return value
