@@ -37,7 +37,7 @@ func TestTenantBackendCacheMaxTenantsUsesProviderDefault(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.provider, func(t *testing.T) {
 			if got := tenantBackendCacheMaxTenants(tt.provider); got != tt.want {
-				t.Fatalf("tenantBackendCacheMaxTenants(%q) = %d, want %d", tt.provider, got, tt.want)
+				t.Errorf("tenantBackendCacheMaxTenants(%q) = %d, want %d", tt.provider, got, tt.want)
 			}
 		})
 	}
@@ -56,8 +56,29 @@ func TestTenantBackendCacheMaxTenantsExplicitOverrideWins(t *testing.T) {
 		tenant.ProviderDB9,
 	} {
 		if got := tenantBackendCacheMaxTenants(provider); got != 4096 {
-			t.Fatalf("tenantBackendCacheMaxTenants(%q) = %d, want explicit 4096", provider, got)
+			t.Errorf("tenantBackendCacheMaxTenants(%q) = %d, want explicit 4096", provider, got)
 		}
+	}
+}
+
+func TestTenantBackendCacheMaxTenantsFallsBackForInvalidOverrides(t *testing.T) {
+	const key = "DRIVE9_POOL_MAX_TENANTS"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	for _, raw := range []string{"0", "-1", "bad"} {
+		setEnv(t, key, raw)
+		if got := tenantBackendCacheMaxTenants(tenant.ProviderTiDBCloudNativeShared); got != 20480 {
+			t.Errorf("tenantBackendCacheMaxTenants(shared) with %q = %d, want 20480", raw, got)
+		}
+		if got := tenantBackendCacheMaxTenants(tenant.ProviderTiDBCloudNative); got != 1024 {
+			t.Errorf("tenantBackendCacheMaxTenants(native) with %q = %d, want 1024", raw, got)
+		}
+	}
+
+	unsetEnv(t, []string{key})
+	if got := tenantBackendCacheMaxTenants("unknown-provider"); got != 1024 {
+		t.Errorf("tenantBackendCacheMaxTenants(unknown-provider) = %d, want 1024", got)
 	}
 }
 
