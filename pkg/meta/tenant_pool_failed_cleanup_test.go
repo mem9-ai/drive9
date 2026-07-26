@@ -97,6 +97,63 @@ func TestListFailedSharedTenantCleanupCandidatesUsesMembershipOrPlacementOrganiz
 	}
 }
 
+func TestListFailedSharedTenantCleanupCandidatesByDBScopesPhysicalPool(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	firstDBID := seedSharedCleanupPlacement(t, s, "shared-db-first", "org-shared", tidbCloudNativeSharedProvider,
+		TenantFailed, now.Add(-2*time.Hour))
+	seedSharedCleanupPlacement(t, s, "shared-db-second", "org-shared", tidbCloudNativeSharedProvider,
+		TenantFailed, now.Add(-3*time.Hour))
+	seedSharedCleanupPlacement(t, s, "shared-db-recent", "org-shared", tidbCloudNativeSharedProvider,
+		TenantFailed, now.Add(-5*time.Minute))
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ? WHERE db_id = ?`, SharedDBStatusFailed, firstDBID); err != nil {
+		t.Fatalf("mark first physical pool failed: %v", err)
+	}
+
+	got, err := s.ListFailedSharedTenantCleanupCandidatesByDB(ctx, firstDBID, now.Add(-30*time.Minute), 10)
+	if err != nil {
+		t.Fatalf("ListFailedSharedTenantCleanupCandidatesByDB: %v", err)
+	}
+	if ids := cleanupTenantIDs(got); fmt.Sprint(ids) != "[shared-db-first]" {
+		t.Fatalf("physical DB candidates = %v, want only first DB tenant", ids)
+	}
+}
+
+func TestFailedSharedTenantCleanupReclaimsStaleDeletingCandidate(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	old := now.Add(-2 * time.Hour)
+	dbID := seedSharedCleanupPlacement(t, s, "shared-stale-deleting", "org-stale-deleting",
+		tidbCloudNativeSharedProvider, TenantFailed, old)
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ? WHERE db_id = ?`, SharedDBStatusFailed, dbID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`,
+		TenantDeleting, old, "shared-stale-deleting"); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := s.ListFailedSharedTenantCleanupCandidatesByDB(ctx, dbID, now.Add(-30*time.Minute), 10)
+	if err != nil {
+		t.Fatalf("ListFailedSharedTenantCleanupCandidatesByDB: %v", err)
+	}
+	if ids := cleanupTenantIDs(candidates); fmt.Sprint(ids) != "[shared-stale-deleting]" {
+		t.Fatalf("stale deleting candidates = %v, want reclaimed tenant", ids)
+	}
+	owned, err := s.MarkFailedSharedTenantDeleting(ctx, "shared-stale-deleting", "org-stale-deleting", now.Add(-30*time.Minute))
+	if err != nil || !owned {
+		t.Fatalf("MarkFailedSharedTenantDeleting owned=%v err=%v", owned, err)
+	}
+	tenant, err := s.GetTenant(ctx, "shared-stale-deleting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tenant.Status != TenantDeleting || !tenant.UpdatedAt.After(old) {
+		t.Fatalf("reclaimed tenant = status %q updated_at %s", tenant.Status, tenant.UpdatedAt)
+	}
+}
+
 func TestFailedTenantCleanupCooldownRestartsAfterTenantUpdate(t *testing.T) {
 	tests := []struct {
 		name string
@@ -372,13 +429,13 @@ func seedSharedCleanupMembership(t *testing.T, s *Store, tenantID, organizationI
 	}
 }
 
-func seedSharedCleanupPlacement(t *testing.T, s *Store, tenantID, organizationID, provider string, status TenantStatus, updatedAt time.Time) {
+func seedSharedCleanupPlacement(t *testing.T, s *Store, tenantID, organizationID, provider string, status TenantStatus, updatedAt time.Time) int64 {
 	t.Helper()
 	insertCleanupTenant(t, s, tenantID, provider, status, updatedAt)
-	seedSharedCleanupPlacementForExistingTenant(t, s, tenantID, organizationID)
+	return seedSharedCleanupPlacementForExistingTenant(t, s, tenantID, organizationID)
 }
 
-func seedSharedCleanupPlacementForExistingTenant(t *testing.T, s *Store, tenantID, organizationID string) {
+func seedSharedCleanupPlacementForExistingTenant(t *testing.T, s *Store, tenantID, organizationID string) int64 {
 	t.Helper()
 	dbID, err := s.RegisterSharedDB(context.Background(), &SharedDB{
 		TiDBCloudOrganizationID: organizationID, Host: "host-" + tenantID, Port: 4000,
@@ -396,6 +453,7 @@ func seedSharedCleanupPlacementForExistingTenant(t *testing.T, s *Store, tenantI
 	}); err != nil {
 		t.Fatalf("UpsertTenantPlacement(%s): %v", tenantID, err)
 	}
+	return dbID
 }
 
 func insertCleanupTenant(t *testing.T, s *Store, tenantID, provider string, status TenantStatus, updatedAt time.Time) {

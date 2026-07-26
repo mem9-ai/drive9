@@ -65,7 +65,30 @@ type quotaTestProvisioner struct {
 	metadataBatchWaitCalls      atomic.Int32
 	metadataBatchWaitHook       func(call int, clusters []*tenant.ClusterInfo)
 	metadataWaitErr             error
+	sharedPoolLoadFunc          func(int64, string, string) (*tenant.SharedDBPoolInfo, error)
+	sharedPoolListFunc          func(int64, string) ([]*tenant.SharedDBPoolInfo, error)
 	calls                       []string
+}
+
+func (p *quotaTestProvisioner) LoadSharedDBPoolWithCredentials(_ context.Context, dbPoolID int64, dbPoolUUID, clusterID string, _ tenant.CredentialProvisionRequest) (*tenant.SharedDBPoolInfo, error) {
+	if p.sharedPoolLoadFunc == nil {
+		return nil, nil
+	}
+	return p.sharedPoolLoadFunc(dbPoolID, dbPoolUUID, clusterID)
+}
+
+func (p *quotaTestProvisioner) ListSharedDBPoolsWithCredentials(_ context.Context, dbPoolID int64, dbPoolUUID string, _ tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
+	if p.sharedPoolListFunc != nil {
+		return p.sharedPoolListFunc(dbPoolID, dbPoolUUID)
+	}
+	if p.sharedPoolLoadFunc == nil {
+		return nil, nil
+	}
+	row, err := p.sharedPoolLoadFunc(dbPoolID, dbPoolUUID, "")
+	if err != nil || row == nil {
+		return nil, err
+	}
+	return []*tenant.SharedDBPoolInfo{row}, nil
 }
 
 func (p *quotaTestProvisioner) recordCall(name string, req tenant.CredentialProvisionRequest, cluster *tenant.ClusterInfo, opts *tenant.QuotaUpdateOptions) {
@@ -376,7 +399,16 @@ func (p *tenantPoolNoListProvisioner) MarkClusterPoolFree(context.Context, *tena
 	return nil
 }
 
+type quotaRuntimeOptions struct {
+	defaultTenantProvider string
+	provisioner           func(*quotaTestProvisioner) tenant.Provisioner
+}
+
 func newQuotaRuntime(t *testing.T, provider string) *quotaRuntime {
+	return newQuotaRuntimeWithOptions(t, provider, quotaRuntimeOptions{})
+}
+
+func newQuotaRuntimeWithOptions(t *testing.T, provider string, opts quotaRuntimeOptions) *quotaRuntime {
 	t.Helper()
 	db := newTenantDeleteDBInfo(t)
 	testmysql.ResetMetaDB(t, db.Meta.DB())
@@ -444,7 +476,12 @@ func newQuotaRuntime(t *testing.T, provider string) *quotaRuntime {
 		t.Fatal(err)
 	}
 	prov := &quotaTestProvisioner{provider: provider}
-	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: prov, TokenSecret: tokenSecret})
+	configuredProvisioner := tenant.Provisioner(prov)
+	if opts.provisioner != nil {
+		configuredProvisioner = opts.provisioner(prov)
+	}
+	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: configuredProvisioner,
+		DefaultTenantProvider: opts.defaultTenantProvider, TokenSecret: tokenSecret})
 	t.Cleanup(server.Close)
 	return &quotaRuntime{meta: db.Meta, tenantID: tenantID, apiKey: apiKey, prov: prov, server: server}
 }
@@ -2480,6 +2517,48 @@ func TestTenantPoolClaimMissTriggersPendingMetadataResume(t *testing.T) {
 	}
 }
 
+func TestTenantPoolClaimMissReplenishesZeroInventory(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	oldRetryWindow := schemaInitRetryWindow
+	schemaInitRetryWindow = 100 * time.Millisecond
+	t.Cleanup(func() { schemaInitRetryWindow = oldRetryWindow })
+	ctx := context.Background()
+	now := time.Now().UTC()
+	pool := &meta.TenantPool{
+		PoolID: "pool-zero-inventory", OrganizationID: "org-1", Size: 1,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := rt.meta.CreateTenantPool(ctx, pool); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+
+	res, gotPool, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
+		PublicKey: "public-1", PrivateKey: "private-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("claim from empty pool: %v", err)
+	}
+	if claimed || res != nil || gotPool == nil || gotPool.PoolID != pool.PoolID {
+		t.Fatalf("claim result res=%+v pool=%+v claimed=%v, want pool miss", res, gotPool, claimed)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		slots, countErr := rt.meta.CountTenantPoolFreeSlots(ctx, pool.OrganizationID)
+		if countErr != nil {
+			t.Fatalf("count free slots: %v", countErr)
+		}
+		if slots == pool.Size {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("durable free slots = %d, want %d after claim miss; batch calls=%d",
+				slots, pool.Size, rt.prov.batchPoolCalls.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestTenantPoolClaimSeedsQuotaConfigWithoutExplicitQuota(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
@@ -2704,6 +2783,207 @@ func TestAdminTenantPoolUpdateRejectsAboveMaxSize(t *testing.T) {
 	}
 	if got := rt.prov.listCalls.Load(); got != 0 {
 		t.Fatalf("list calls = %d, want 0", got)
+	}
+}
+
+func TestAdminTenantPoolUpdateGrowsSharedPoolAtomically(t *testing.T) {
+	sharedProvisioner := &fakeProvisioner{
+		provider:      tenant.ProviderTiDBCloudNative,
+		cloudProvider: "aws",
+		region:        "us-east-1",
+		identityOrg:   "org-1",
+	}
+	rt := newQuotaRuntimeWithOptions(t, tenant.ProviderTiDBCloudNative, quotaRuntimeOptions{
+		defaultTenantProvider: tenant.ProviderTiDBCloudNativeShared,
+		provisioner: func(*quotaTestProvisioner) tenant.Provisioner {
+			return sharedProvisioner
+		},
+	})
+	rt.server.sharedDBMaxTenants = 1
+	ctx := context.Background()
+	now := time.Now().UTC()
+	pool := &meta.TenantPool{
+		PoolID: "pool-shared-grow", OrganizationID: "org-1", Size: 2,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := rt.meta.CreateTenantPool(ctx, pool); err != nil {
+		t.Fatalf("CreateTenantPool: %v", err)
+	}
+	if _, err := rt.server.createFreeSharedPoolTenants(ctx, pool.PoolID, pool.Size,
+		tenant.CredentialProvisionRequest{}, nil); err != nil {
+		t.Fatalf("seed shared tenant pool: %v", err)
+	}
+	baselineMembers := sharedProvisioner.sharedPoolBatchMembers.Load()
+
+	ts := httptest.NewServer(rt.server)
+	t.Cleanup(ts.Close)
+	resp := patchJSON(t, ts.URL+"/v1/admin/tenant-pool", map[string]any{
+		"public_key": "public-1", "private_key": "private-1", "pool_size": 4,
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", resp.StatusCode, http.StatusAccepted, body)
+	}
+	gotPool, err := rt.meta.GetTenantPoolByID(ctx, pool.PoolID)
+	if err != nil {
+		t.Fatalf("GetTenantPoolByID: %v", err)
+	}
+	if gotPool.Size != 4 {
+		t.Fatalf("pool size = %d, want 4", gotPool.Size)
+	}
+	if slots, err := rt.meta.CountTenantPoolFreeSlots(ctx, pool.OrganizationID); err != nil || slots != 4 {
+		t.Fatalf("durable slots = %d, err=%v, want 4", slots, err)
+	}
+	if added := sharedProvisioner.sharedPoolBatchMembers.Load() - baselineMembers; added != 2 {
+		t.Fatalf("additional physical Cloud creates = %d, want 2", added)
+	}
+}
+
+func TestAdminTenantPoolUpdateRejectsStaleSharedGrowWithoutWaveSideEffects(t *testing.T) {
+	sharedProvisioner := &fakeProvisioner{
+		provider:      tenant.ProviderTiDBCloudNative,
+		cloudProvider: "aws",
+		region:        "us-east-1",
+		identityOrg:   "org-1",
+	}
+	rt := newQuotaRuntimeWithOptions(t, tenant.ProviderTiDBCloudNative, quotaRuntimeOptions{
+		defaultTenantProvider: tenant.ProviderTiDBCloudNativeShared,
+		provisioner: func(*quotaTestProvisioner) tenant.Provisioner {
+			return sharedProvisioner
+		},
+	})
+	rt.server.sharedDBMaxTenants = 1
+	ctx := context.Background()
+	now := time.Now().UTC()
+	pool := &meta.TenantPool{
+		PoolID: "pool-shared-stale-grow", OrganizationID: "org-1", Size: 2,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := rt.meta.CreateTenantPool(ctx, pool); err != nil {
+		t.Fatalf("CreateTenantPool: %v", err)
+	}
+	if _, err := rt.server.createFreeSharedPoolTenants(ctx, pool.PoolID, pool.Size,
+		tenant.CredentialProvisionRequest{}, nil); err != nil {
+		t.Fatalf("seed shared tenant pool: %v", err)
+	}
+
+	countRows := func(query string, args ...any) int {
+		t.Helper()
+		var count int
+		if err := rt.meta.DB().QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+			t.Fatalf("count rows: %v", err)
+		}
+		return count
+	}
+	baselinePhysical := countRows(`SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, pool.OrganizationID)
+	baselineTenants := countRows(`SELECT COUNT(*) FROM tenants`)
+	baselinePlacements := countRows(`SELECT COUNT(*) FROM tenant_placements`)
+	baselineMemberships := countRows(`SELECT COUNT(*) FROM tenant_pool_memberships WHERE pool_id = ?`, pool.PoolID)
+	baselineCloudCalls := sharedProvisioner.sharedPoolBatchCalls.Load()
+	baselineCloudMembers := sharedProvisioner.sharedPoolBatchMembers.Load()
+
+	lockConn, err := rt.meta.DB().Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockConn.ExecContext(ctx, `LOCK TABLES tenant_quota_config WRITE`); err != nil {
+		_ = lockConn.Close()
+		t.Fatal(err)
+	}
+	locked := true
+	t.Cleanup(func() {
+		if locked {
+			_, _ = lockConn.ExecContext(context.Background(), `UNLOCK TABLES`)
+		}
+		_ = lockConn.Close()
+	})
+
+	ts := httptest.NewServer(rt.server)
+	t.Cleanup(ts.Close)
+	raw, err := json.Marshal(map[string]any{
+		"public_key": "public-1", "private_key": "private-1", "pool_size": 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPatch, ts.URL+"/v1/admin/tenant-pool", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	type responseResult struct {
+		resp *http.Response
+		err  error
+	}
+	responseDone := make(chan responseResult, 1)
+	go func() {
+		resp, requestErr := http.DefaultClient.Do(req)
+		responseDone <- responseResult{resp: resp, err: requestErr}
+	}()
+	select {
+	case result := <-responseDone:
+		if result.resp != nil {
+			_ = result.resp.Body.Close()
+		}
+		t.Fatalf("PATCH returned before quota lock release: %v", result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := sharedProvisioner.sharedPoolBatchCalls.Load(); got != baselineCloudCalls {
+		t.Fatalf("Cloud calls while wave staging is blocked = %d, want %d", got, baselineCloudCalls)
+	}
+	if err := rt.meta.UpdateTenantPoolSize(ctx, pool.PoolID, 4); err != nil {
+		t.Fatalf("persist competing pool size: %v", err)
+	}
+	if _, err := lockConn.ExecContext(ctx, `UNLOCK TABLES`); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+
+	var result responseResult
+	select {
+	case result = <-responseDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("PATCH did not finish after quota lock release")
+	}
+	if result.err != nil {
+		t.Fatalf("PATCH request: %v", result.err)
+	}
+	defer func() { _ = result.resp.Body.Close() }()
+	body, err := io.ReadAll(result.resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d: %s", result.resp.StatusCode, http.StatusBadGateway, body)
+	}
+	gotPool, err := rt.meta.GetTenantPoolByID(ctx, pool.PoolID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPool.Size != 4 {
+		t.Fatalf("competing pool size = %d, want 4", gotPool.Size)
+	}
+	if got := countRows(`SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, pool.OrganizationID); got != baselinePhysical {
+		t.Fatalf("physical rows = %d, want baseline %d", got, baselinePhysical)
+	}
+	if got := countRows(`SELECT COUNT(*) FROM tenants`); got != baselineTenants {
+		t.Fatalf("tenant rows = %d, want baseline %d", got, baselineTenants)
+	}
+	if got := countRows(`SELECT COUNT(*) FROM tenant_placements`); got != baselinePlacements {
+		t.Fatalf("placement rows = %d, want baseline %d", got, baselinePlacements)
+	}
+	if got := countRows(`SELECT COUNT(*) FROM tenant_pool_memberships WHERE pool_id = ?`, pool.PoolID); got != baselineMemberships {
+		t.Fatalf("membership rows = %d, want baseline %d", got, baselineMemberships)
+	}
+	if got := sharedProvisioner.sharedPoolBatchCalls.Load(); got != baselineCloudCalls {
+		t.Fatalf("Cloud calls = %d, want baseline %d", got, baselineCloudCalls)
+	}
+	if got := sharedProvisioner.sharedPoolBatchMembers.Load(); got != baselineCloudMembers {
+		t.Fatalf("Cloud members = %d, want baseline %d", got, baselineCloudMembers)
 	}
 }
 
@@ -3302,7 +3582,6 @@ func TestProvisionClaimsFreePoolTenant(t *testing.T) {
 }
 
 func TestProvisionFallsBackWhenTenantPoolClaimCannotListManagedClusters(t *testing.T) {
-	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	prov := &tenantPoolNoListProvisioner{
 		fakeProvisioner: fakeProvisioner{
 			provider:      tenant.ProviderTiDBCloudNative,
@@ -3319,7 +3598,9 @@ func TestProvisionFallsBackWhenTenantPoolClaimCannotListManagedClusters(t *testi
 			},
 		},
 	}
-	rt.server.provisioner = prov
+	rt := newQuotaRuntimeWithOptions(t, tenant.ProviderTiDBCloudNative, quotaRuntimeOptions{
+		provisioner: func(*quotaTestProvisioner) tenant.Provisioner { return prov },
+	})
 
 	ts := httptest.NewServer(rt.server)
 	t.Cleanup(ts.Close)

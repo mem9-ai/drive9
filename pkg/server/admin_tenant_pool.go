@@ -46,8 +46,17 @@ type tenantPoolResumeJob struct {
 type tenantPoolWorkGate struct {
 	mu          sync.Mutex
 	running     bool
+	rerun       bool
+	scheduled   bool
 	nextAllowed time.Time
 }
+
+type tenantPoolReplenishDecision struct {
+	start         bool
+	scheduleAfter time.Duration
+}
+
+type tenantPoolWorkerStarter func(context.Context, func(context.Context)) bool
 
 type adminTenantPoolStatus string
 
@@ -58,12 +67,11 @@ const adminTenantPoolMetricsComponent = "admin_tenant_pool"
 const tenantPoolClaimCASRetryLimit = 8
 
 const (
-	sharedTenantPoolCreateConcurrency    = 30
 	tenantPoolReplenishMinInterval       = time.Second
 	tenantPoolPendingResumeEmptyInterval = 15 * time.Second
 )
 
-func managedSharedDBRefillTenantCount(missing, maxTenants, poolLimit int) int {
+func managedSharedDBRefillTenantCount(missing, maxTenants, batchSize int) int {
 	if missing <= 0 {
 		return 0
 	}
@@ -72,11 +80,11 @@ func managedSharedDBRefillTenantCount(missing, maxTenants, poolLimit int) int {
 	}
 	maxInt := int(^uint(0) >> 1)
 	limit := maxInt
-	if poolLimit <= 0 {
-		poolLimit = DefaultManagedSharedDBRefillPoolLimit
+	if batchSize <= 0 {
+		batchSize = DefaultManagedSharedDBCloudBatchSize
 	}
-	if maxTenants <= maxInt/poolLimit {
-		limit = maxTenants * poolLimit
+	if maxTenants <= maxInt/batchSize {
+		limit = maxTenants * batchSize
 	}
 	return min(missing, limit)
 }
@@ -416,7 +424,13 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 				"free_size", freeSize,
 				"slot_size", slotSize,
 				"grow_count", growCount)...)
-			results, err := s.createFreePoolTenants(ctx, pool.PoolID, growCount, cred, nil)
+			var results []*provisionTenantResult
+			if s.defaultTenantProvider == tenant.ProviderTiDBCloudNativeShared && targetSize > pool.Size {
+				results, err = s.createFreeSharedPoolTenantsWithResize(ctx, pool.PoolID, growCount, cred, nil,
+					&meta.ManagedSharedDBPoolWaveResize{ExpectedSize: pool.Size, TargetSize: targetSize})
+			} else {
+				results, err = s.createFreePoolTenants(ctx, pool.PoolID, growCount, cred, nil)
+			}
 			if err != nil {
 				logger.Error(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_update_grow_failed",
 					"provider", tenant.ProviderTiDBCloudNative,
@@ -949,6 +963,10 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 }
 
 func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string, count int, _ tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) ([]*provisionTenantResult, error) {
+	return s.createFreeSharedPoolTenantsWithResize(ctx, poolID, count, tenant.CredentialProvisionRequest{}, quotaOpt, nil)
+}
+
+func (s *Server) createFreeSharedPoolTenantsWithResize(ctx context.Context, poolID string, count int, _ tenant.CredentialProvisionRequest, quotaOpt *quotaRequest, resize *meta.ManagedSharedDBPoolWaveResize) ([]*provisionTenantResult, error) {
 	if count <= 0 {
 		return []*provisionTenantResult{}, nil
 	}
@@ -967,42 +985,35 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 	if organizationID == "" {
 		return nil, fmt.Errorf("shared tenant pool organization is required")
 	}
-	now := time.Now().UTC()
-	outcomes := runSharedPoolTenantCreateWorkers(ctx, count, func() sharedPoolTenantCreateOutcome {
-		return s.createFreeSharedPoolTenant(ctx, poolID, organizationID, sharedCred, quotaOpt, now)
-	})
-	continuationPoolIDs := make(map[int64]struct{})
-	results := make([]*provisionTenantResult, 0, count)
-	resultPoolIDs := make([]int64, 0, count)
-	var createErr error
-	for _, outcome := range outcomes {
-		if outcome.err != nil {
-			createErr = errors.Join(createErr, outcome.err)
-			continue
-		}
-		results = append(results, outcome.result)
-		resultPoolIDs = append(resultPoolIDs, outcome.dbID)
-		if outcome.needsContinuation {
-			continuationPoolIDs[outcome.dbID] = struct{}{}
-		}
+	partitions, err := s.stageSharedPoolTenantWave(ctx, poolID, organizationID, sharedCred, count, quotaOpt, resize)
+	if err != nil {
+		return nil, err
 	}
-	if createErr != nil {
-		return results, createErr
-	}
-	continuationIDs := make([]int64, 0, len(continuationPoolIDs))
-	for id := range continuationPoolIDs {
-		continuationIDs = append(continuationIDs, id)
+	continuationIDs := make([]int64, 0, len(partitions))
+	for _, partition := range partitions {
+		continuationIDs = append(continuationIDs, partition.db.ID)
 	}
 	sort.Slice(continuationIDs, func(i, j int) bool { return continuationIDs[i] < continuationIDs[j] })
-	_, err = s.provisionManagedSharedDBPoolsBatchWithCredentials(ctx, continuationIDs, sharedCred)
-	if err != nil {
-		return results, err
+	_, provisionErr := s.provisionManagedSharedDBPoolsBatchWithCredentials(ctx, continuationIDs, sharedCred)
+	// The whole logical reservation wave is durable before Cloud creation
+	// starts, so allocators can only consume genuinely unreserved tail capacity.
+	s.scheduleManagedSharedDBContinuations(ctx, continuationIDs)
+	results := make([]*provisionTenantResult, 0, count)
+	resultPoolIDs := make([]int64, 0, count)
+	for _, partition := range partitions {
+		for _, tenantID := range partition.tenantIDs {
+			results = append(results, &provisionTenantResult{TenantID: tenantID, Status: meta.TenantPending,
+				Provider: tenant.ProviderTiDBCloudNativeShared, CloudProvider: partition.db.CloudProvider,
+				Region: partition.db.Region, OrganizationID: organizationID})
+			resultPoolIDs = append(resultPoolIDs, partition.db.ID)
+		}
 	}
 	continuationPoolStatuses := make(map[int64]meta.TenantStatus, len(continuationIDs))
 	for _, dbID := range continuationIDs {
 		sharedDB, err := s.meta.GetSharedDB(ctx, dbID)
 		if err != nil {
-			return results, err
+			provisionErr = errors.Join(provisionErr, err)
+			continue
 		}
 		status := meta.TenantPending
 		switch sharedDB.Status {
@@ -1018,82 +1029,70 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 			results[i].Status = status
 		}
 	}
-	s.scheduleManagedSharedDBContinuations(ctx, continuationIDs)
-	return results, nil
+	return results, provisionErr
 }
 
-func runSharedPoolTenantCreateWorkers(ctx context.Context, count int, create func() sharedPoolTenantCreateOutcome) []sharedPoolTenantCreateOutcome {
-	outcomes := make([]sharedPoolTenantCreateOutcome, count)
-	jobs := make(chan int)
-	var wg sync.WaitGroup
-	for range min(count, sharedTenantPoolCreateConcurrency) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range jobs {
-				if ctx.Err() != nil {
-					outcomes[i].err = ctx.Err()
-					continue
-				}
-				outcomes[i] = create()
+type sharedPoolTenantPartition struct {
+	db        *meta.SharedDB
+	tenantIDs []string
+}
+
+func (s *Server) stageSharedPoolTenantWave(ctx context.Context, poolID, organizationID string, cred tenant.CredentialProvisionRequest, count int, quotaOpt *quotaRequest, resize *meta.ManagedSharedDBPoolWaveResize) ([]sharedPoolTenantPartition, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+	// Refill deliberately stages dedicated physical capacity instead of
+	// reusing a globally visible oldest candidate. Otherwise multiple Pods can
+	// plan against the same capacity snapshot and recreate the hot-row storm
+	// this partitioned wave is meant to avoid. The caller already caps count by
+	// managedSharedDBCloudBatchSize, so lock-free over-creation stays bounded.
+	remaining := count
+	provisioningKey := sharedDBProvisioningKey(cred)
+	maxTenants, _ := s.managedSharedDBPolicy()
+	physicalCount := (count + maxTenants - 1) / maxTenants
+	plans := make([]meta.ManagedSharedDBPoolWavePlan, 0, physicalCount)
+	now := time.Now().UTC()
+	for remaining > 0 {
+		row, err := s.newManagedSharedDBPlan(ctx, organizationID, provisioningKey)
+		if err != nil {
+			return nil, err
+		}
+		assigned := min(remaining, maxTenants)
+		members := make([]meta.ManagedSharedDBPoolWaveMember, 0, assigned)
+		for range assigned {
+			tenantID := token.NewID()
+			autoProfile, profileErr := s.defaultAutoEmbeddingProfileForTenant(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared, now)
+			if profileErr != nil {
+				return nil, fmt.Errorf("build tenant auto-embedding profile: %w", profileErr)
 			}
-		}()
+			quota, quotaErr := s.sharedTenantQuotaConfig(tenantID, provisionTenantOptions{Quota: quotaOpt})
+			if quotaErr != nil {
+				return nil, quotaErr
+			}
+			members = append(members, meta.ManagedSharedDBPoolWaveMember{
+				Tenant: &meta.Tenant{ID: tenantID, Status: meta.TenantPending, DBPasswordCipher: []byte{}, DBTLS: true,
+					Provider: tenant.ProviderTiDBCloudNativeShared, SchemaVersion: 1, CreatedAt: now, UpdatedAt: now},
+				Membership: &meta.TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: organizationID,
+					PoolID: poolID, PoolStatus: meta.TenantPoolBindingFree, CreatedAt: now, UpdatedAt: now},
+				Quota: quota, AutoEmbeddingProfile: autoProfile,
+			})
+		}
+		plans = append(plans, meta.ManagedSharedDBPoolWavePlan{DB: row, Members: members})
+		remaining -= assigned
 	}
-	for i := range count {
-		jobs <- i
-	}
-	close(jobs)
-	wg.Wait()
-	return outcomes
-}
-
-type sharedPoolTenantCreateOutcome struct {
-	result            *provisionTenantResult
-	dbID              int64
-	needsContinuation bool
-	err               error
-}
-
-func (s *Server) createFreeSharedPoolTenant(ctx context.Context, poolID, organizationID string, sharedCred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest, now time.Time) sharedPoolTenantCreateOutcome {
-	tenantID := token.NewID()
-	fail := func(err error) sharedPoolTenantCreateOutcome {
-		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
-		return sharedPoolTenantCreateOutcome{err: err}
-	}
-	if err := s.insertPendingPoolTenant(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared, now); err != nil {
-		return sharedPoolTenantCreateOutcome{err: err}
-	}
-	fsID, err := s.meta.EnsureFsID(ctx, tenantID)
+	created, err := s.meta.CreateManagedSharedDBPoolTenantWaveWithResize(ctx, plans, resize)
 	if err != nil {
-		return fail(err)
+		return nil, err
 	}
-	if err := s.materializeSharedTenantQuota(ctx, tenantID, provisionTenantOptions{Quota: quotaOpt}); err != nil {
-		return fail(err)
+	partitions := make([]sharedPoolTenantPartition, 0, len(created))
+	for _, result := range created {
+		row, loadErr := s.meta.GetSharedDB(ctx, result.DBID)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		partitions = append(partitions, sharedPoolTenantPartition{db: row, tenantIDs: result.TenantIDs})
 	}
-	selected, _, err := s.allocateManagedSharedDBForOrganization(ctx, organizationID, sharedCred, func(db *meta.SharedDB) error {
-		return s.meta.CompleteSharedTenantPoolMember(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared,
-			&meta.TenantPlacement{FsID: fsID, DbID: db.ID, Placement: meta.PlacementShared,
-				SchemaShape: meta.SchemaShapeShared, Status: meta.SharedDBStatusActive},
-			&meta.TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: organizationID,
-				PoolID: poolID, PoolStatus: meta.TenantPoolBindingFree, CreatedAt: now, UpdatedAt: now})
-	})
-	if err != nil {
-		return fail(err)
-	}
-	resultStatus := meta.TenantPending
-	switch selected.Status {
-	case meta.SharedDBStatusProvisioning:
-		resultStatus = meta.TenantProvisioning
-	case meta.SharedDBStatusActive:
-		resultStatus = meta.TenantActive
-	}
-	return sharedPoolTenantCreateOutcome{
-		result: &provisionTenantResult{TenantID: tenantID, Status: resultStatus,
-			Provider: tenant.ProviderTiDBCloudNativeShared, CloudProvider: selected.CloudProvider,
-			Region: selected.Region, OrganizationID: selected.TiDBCloudOrganizationID},
-		dbID:              selected.ID,
-		needsContinuation: selected.Status == meta.SharedDBStatusPending || selected.Status == meta.SharedDBStatusProvisioning,
-	}
+	return partitions, nil
 }
 
 func (s *Server) provisionManagedSharedDBPoolsBatch(ctx context.Context, dbIDs []int64) (string, error) {
@@ -1161,70 +1160,73 @@ func (s *Server) provisionManagedSharedDBPoolsBatchWithCredentials(ctx context.C
 }
 
 func (s *Server) provisionManagedSharedDBPoolAllocationGroup(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) (string, error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		first, err := s.meta.GetSharedDB(ctx, dbIDs[0])
-		if err != nil {
-			return "", err
-		}
-		identity := sharedDBAllocationIdentity(first.TiDBCloudOrganizationID, first.ProvisioningKey)
-		restartWithOrganization := false
-		resolvedOrg := ""
-		err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
-			current, err := s.meta.GetSharedDB(lockCtx, dbIDs[0])
-			if err != nil {
-				return err
-			}
-			if strings.TrimSpace(first.TiDBCloudOrganizationID) != strings.TrimSpace(current.TiDBCloudOrganizationID) {
-				restartWithOrganization = true
-				return nil
-			}
-			var createErr error
-			resolvedOrg, createErr = s.provisionManagedSharedDBPoolsBatchLocked(lockCtx, provisioner, dbIDs, cred)
-			return createErr
-		})
-		if err != nil {
-			return resolvedOrg, err
-		}
-		if !restartWithOrganization {
-			return resolvedOrg, nil
-		}
+	first, err := s.meta.GetSharedDB(ctx, dbIDs[0])
+	if err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("shared DB pool batch allocation identity kept changing")
+	resolvedOrg := strings.TrimSpace(first.TiDBCloudOrganizationID)
+	return resolvedOrg, s.provisionManagedSharedDBPoolsBatchForGroup(ctx, provisioner, dbIDs, cred)
 }
 
-func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) (string, error) {
-	requests := make([]tenant.SharedDBPoolCreateRequest, 0, len(dbIDs))
+func (s *Server) provisionManagedSharedDBPoolsBatchForGroup(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) error {
+	return s.meta.WithSharedDBPoolWorkClaims(ctx, dbIDs, func(claimCtx context.Context, ownedIDs []int64) error {
+		return s.provisionManagedSharedDBPoolsBatchGroupClaimed(claimCtx, provisioner, ownedIDs, cred)
+	})
+}
+
+func (s *Server) provisionManagedSharedDBPoolsBatchGroupClaimed(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, dbIDs []int64, cred tenant.CredentialProvisionRequest) error {
 	rows := make(map[int64]*meta.SharedDB, len(dbIDs))
-	resolvedOrg := ""
+	loadRequests := make([]tenant.SharedDBPoolLoadRequest, 0, len(dbIDs))
 	for _, dbID := range dbIDs {
 		row, err := s.meta.GetSharedDB(ctx, dbID)
 		if err != nil {
-			return resolvedOrg, err
+			return err
 		}
-		if resolvedOrg == "" {
-			resolvedOrg = row.TiDBCloudOrganizationID
+		// Re-read after taking per-pool ownership. A concurrent direct
+		// continuation may have persisted the cluster before this group
+		// acquired its claim; such rows continue through metadata polling.
+		if row.Status != meta.SharedDBStatusPending || strings.TrimSpace(row.ClusterID) != "" {
+			continue
 		}
-		// A concurrent direct continuation may have completed physical creation
-		// before this batch acquired the organization lock. Its cluster must be
-		// adopted/refreshed by the normal continuation, never created again.
-		if row.ClusterID != "" {
+		rows[dbID] = row
+		loadRequests = append(loadRequests, tenant.SharedDBPoolLoadRequest{DBPoolID: dbID, DBPoolUUID: row.UUID})
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	discovered, loadErr := loadManagedSharedDBPoolsBeforeCreate(ctx, provisioner, loadRequests, cred)
+	adopted, persistErr := s.persistManagedSharedDBPoolCloudResults(ctx, discovered, rows)
+	if loadErr != nil || persistErr != nil {
+		// A failed lookup cannot prove that the Cloud POST did not already
+		// succeed, so retry discovery instead of issuing another create.
+		return errors.Join(loadErr, persistErr)
+	}
+
+	requests := make([]tenant.SharedDBPoolCreateRequest, 0, len(rows)-len(adopted))
+	for _, dbID := range dbIDs {
+		row := rows[dbID]
+		if row == nil {
+			continue
+		}
+		if _, ok := adopted[dbID]; ok {
 			continue
 		}
 		plain, err := s.pool.Decrypt(ctx, row.PasswordCipher)
 		if err != nil {
-			return resolvedOrg, err
+			return err
 		}
 		if row.SpendingLimit == nil {
-			return resolvedOrg, fmt.Errorf("managed db pool %d has no spending target", dbID)
+			return fmt.Errorf("managed db pool %d has no spending target", dbID)
 		}
-		rows[dbID] = row
 		requests = append(requests, tenant.SharedDBPoolCreateRequest{DBPoolID: dbID, DBPoolUUID: row.UUID,
 			CustomerOrganizationID: strings.TrimSpace(row.TiDBCloudOrganizationID), DatabaseName: row.Name,
 			RootPassword: string(plain), SpendingLimitMonthly: *row.SpendingLimit})
 	}
 	if len(requests) == 0 {
-		return resolvedOrg, nil
+		return nil
 	}
+
 	type batchResult struct {
 		err error
 	}
@@ -1248,7 +1250,7 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 				batchResults[batchIndex].err = err
 				return
 			}
-			batchResults[batchIndex].err = s.provisionManagedSharedDBPoolsBatchChunkLocked(ctx, provisioner, batches[batchIndex], rows, cred)
+			batchResults[batchIndex].err = s.provisionManagedSharedDBPoolsBatchChunkClaimed(ctx, provisioner, batches[batchIndex], rows, cred)
 		}()
 	}
 	wg.Wait()
@@ -1256,19 +1258,30 @@ func (s *Server) provisionManagedSharedDBPoolsBatchLocked(ctx context.Context, p
 	for _, result := range batchResults {
 		batchErr = errors.Join(batchErr, result.err)
 	}
-	return resolvedOrg, batchErr
+	return batchErr
 }
 
-func (s *Server) provisionManagedSharedDBPoolsBatchChunkLocked(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, requests []tenant.SharedDBPoolCreateRequest, rows map[int64]*meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
-	created, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, requests, cred)
-	if createErr != nil && len(created) == 0 {
-		logger.Warn(ctx, "managed_shared_db_batch_create_failed",
-			zap.Int("db_pool_count", len(requests)), zap.Error(createErr))
-		return createErr
+func loadManagedSharedDBPoolsBeforeCreate(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, requests []tenant.SharedDBPoolLoadRequest, cred tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
+	if loader, ok := provisioner.(tenant.SharedDBPoolBatchLoader); ok {
+		return loader.BatchLoadSharedDBPoolsWithCredentials(ctx, requests, cred)
 	}
+	loaded := make([]*tenant.SharedDBPoolInfo, 0, len(requests))
+	for _, request := range requests {
+		info, err := provisioner.LoadSharedDBPoolWithCredentials(ctx, request.DBPoolID, request.DBPoolUUID, request.ClusterID, cred)
+		if err != nil {
+			return loaded, err
+		}
+		if info != nil {
+			loaded = append(loaded, info)
+		}
+	}
+	return loaded, nil
+}
+
+func (s *Server) persistManagedSharedDBPoolCloudResults(ctx context.Context, results []*tenant.SharedDBPoolInfo, rows map[int64]*meta.SharedDB) (map[int64]struct{}, error) {
+	persisted := make(map[int64]struct{}, len(results))
 	var persistErr error
-	persisted := 0
-	for _, info := range created {
+	for _, info := range results {
 		if info == nil || rows[info.DBPoolID] == nil || rows[info.DBPoolID].UUID != info.DBPoolUUID {
 			persistErr = errors.Join(persistErr, fmt.Errorf("shared db batch returned an unknown db pool"))
 			continue
@@ -1291,13 +1304,48 @@ func (s *Server) provisionManagedSharedDBPoolsBatchChunkLocked(ctx context.Conte
 			persistErr = errors.Join(persistErr, err)
 			continue
 		}
-		persisted++
+		persisted[info.DBPoolID] = struct{}{}
 	}
+	return persisted, persistErr
+}
+
+func (s *Server) provisionManagedSharedDBPoolsBatchChunkClaimed(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, requests []tenant.SharedDBPoolCreateRequest, rows map[int64]*meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
+	if err := s.acquireManagedSharedDBCloudBatchSlot(ctx); err != nil {
+		return err
+	}
+	created, createErr := func() ([]*tenant.SharedDBPoolInfo, error) {
+		defer s.releaseManagedSharedDBCloudBatchSlot()
+		return provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, requests, cred)
+	}()
+	if createErr != nil && len(created) == 0 {
+		logger.Warn(ctx, "managed_shared_db_batch_create_failed",
+			zap.Int("db_pool_count", len(requests)), zap.Error(createErr))
+		return createErr
+	}
+	persistedIDs, persistErr := s.persistManagedSharedDBPoolCloudResults(ctx, created, rows)
 	if createErr != nil {
 		logger.Warn(ctx, "managed_shared_db_batch_create_partial",
-			zap.Int("requested", len(requests)), zap.Int("persisted", persisted), zap.Error(createErr))
+			zap.Int("requested", len(requests)), zap.Int("persisted", len(persistedIDs)), zap.Error(createErr))
 	}
 	return errors.Join(createErr, persistErr)
+}
+
+func (s *Server) acquireManagedSharedDBCloudBatchSlot(ctx context.Context) error {
+	s.managedSharedDBCloudBatchSlotsOnce.Do(func() {
+		if s.managedSharedDBCloudBatchSlots == nil {
+			s.managedSharedDBCloudBatchSlots = make(chan struct{}, defaultManagedSharedDBCloudBatchConcurrency)
+		}
+	})
+	select {
+	case s.managedSharedDBCloudBatchSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) releaseManagedSharedDBCloudBatchSlot() {
+	<-s.managedSharedDBCloudBatchSlots
 }
 
 func (s *Server) markTenantPoolTenantFailed(ctx context.Context, tenantID, reason string) {
@@ -1881,115 +1929,189 @@ func firstResultOrganizationID(results []*provisionTenantResult) string {
 }
 
 func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.TenantPool, cred tenant.CredentialProvisionRequest) {
+	s.replenishTenantPoolAsyncWithStarters(ctx, pool, cred, s.startServerWorker, s.startServerWorker)
+}
+
+func (s *Server) enqueueTenantPoolLeaderReplenishment(ctx context.Context, pool *meta.TenantPool, cred tenant.CredentialProvisionRequest) bool {
+	if pool == nil || pool.PoolID == "" || pool.OrganizationID == "" || pool.Size <= 0 {
+		return false
+	}
+	if s.leader != nil && !s.leader.IsLeader() {
+		return false
+	}
+	return s.enqueueTenantPoolLeaderReconcile(ctx, pool.PoolID, func(workerCtx context.Context) {
+		s.replenishTenantPool(workerCtx, pool, cred)
+	})
+}
+
+func (s *Server) replenishTenantPoolAsyncWithStarters(
+	ctx context.Context,
+	pool *meta.TenantPool,
+	cred tenant.CredentialProvisionRequest,
+	workStarter tenantPoolWorkerStarter,
+	timerStarter tenantPoolWorkerStarter,
+) {
 	if pool == nil || pool.PoolID == "" || pool.OrganizationID == "" || pool.Size <= 0 {
 		return
 	}
-	if !s.beginTenantPoolReplenishment(pool.PoolID) {
+	if workStarter == nil || timerStarter == nil {
+		return
+	}
+	decision := s.requestTenantPoolReplenishmentAt(pool.PoolID, time.Now())
+	if !decision.start {
+		if decision.scheduleAfter > 0 {
+			s.scheduleTenantPoolReplenishment(ctx, pool, cred, decision.scheduleAfter, workStarter, timerStarter)
+		}
 		return
 	}
 	workerCtx := backgroundWithTrace(ctx)
-	if !s.startServerWorker(workerCtx, func(ctx context.Context) {
-		defer s.finishTenantPoolReplenishment(pool.PoolID)
-		replenishStarted := time.Now()
-		metricResult := "ok"
+	if !workStarter(workerCtx, func(ctx context.Context) {
 		defer func() {
-			metrics.RecordOperation(adminTenantPoolMetricsComponent, "replenish", metricResult, time.Since(replenishStarted))
+			finished := s.finishTenantPoolReplenishmentAt(pool.PoolID, time.Now())
+			if finished.scheduleAfter > 0 {
+				s.scheduleTenantPoolReplenishment(ctx, pool, cred, finished.scheduleAfter, workStarter, timerStarter)
+			}
 		}()
-		sharedProvider := s.defaultTenantProvider == tenant.ProviderTiDBCloudNativeShared
-		createdAny := false
-		sharedWaveRemaining := 0
-		// A started shared wave accounts for in-flight pending/provisioning slots;
-		// sharedWaveRemaining is the hard cap that guarantees termination.
-		for {
-			if err := ctx.Err(); err != nil {
-				metricResult = adminTenantPoolMetricResult(err)
-				return
-			}
-			current, err := s.meta.GetTenantPoolByID(ctx, pool.PoolID)
-			if err != nil {
-				if !errors.Is(err, meta.ErrNotFound) {
-					logger.Warn(ctx, "admin_tenant_pool_replenish_get_pool_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
-					metricResult = "error"
-				} else {
-					metricResult = "not_found"
-				}
-				return
-			}
-			if current.Status != meta.TenantPoolActive || current.OrganizationID == "" || current.Size <= 0 {
-				metricResult = "skipped"
-				return
-			}
-			freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
-			if err != nil {
-				logger.Warn(ctx, "admin_tenant_pool_replenish_free_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
-				metricResult = "error"
-				return
-			}
-			s.recordTenantPoolCapacity(current.PoolID, current.OrganizationID, current.Size, freeSize)
-			if !createdAny && !s.tenantPoolBelowRefillWatermark(freeSize, current.Size) {
-				logger.Info(ctx, "admin_tenant_pool_replenish_skipped",
-					zap.String("pool_id", current.PoolID),
-					zap.String("organization_id", current.OrganizationID),
-					zap.Int("pool_size", current.Size),
-					zap.Int("free_size", freeSize),
-					zap.Float64("refill_free_ratio", s.effectiveTenantPoolRefillFreeRatio()))
-				metricResult = "noop"
-				return
-			}
+		s.replenishTenantPool(ctx, pool, cred)
+	}) {
+		finished := s.finishTenantPoolReplenishmentAt(pool.PoolID, time.Now())
+		if finished.scheduleAfter > 0 {
+			s.scheduleTenantPoolReplenishment(ctx, pool, cred, finished.scheduleAfter, workStarter, timerStarter)
+		}
+	}
+}
 
-			// The initial watermark check above avoids a slot COUNT on the common
-			// no-op path. Re-read durable slots before every batch because other
-			// Pods may replenish this pool concurrently; over-create is bounded and
-			// acceptable, while pending/provisioning slots prevent under-counting.
-			slotSize, err := s.meta.CountTenantPoolFreeSlots(ctx, current.OrganizationID)
-			if err != nil {
-				logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+func (s *Server) replenishTenantPool(ctx context.Context, pool *meta.TenantPool, cred tenant.CredentialProvisionRequest) {
+	replenishStarted := time.Now()
+	metricResult := "ok"
+	defer func() {
+		metrics.RecordOperation(adminTenantPoolMetricsComponent, "replenish", metricResult, time.Since(replenishStarted))
+	}()
+	sharedProvider := s.defaultTenantProvider == tenant.ProviderTiDBCloudNativeShared
+	createdAny := false
+	sharedWaveRemaining := 0
+	// A started shared wave accounts for in-flight pending/provisioning slots;
+	// sharedWaveRemaining is the hard cap that guarantees termination.
+	for {
+		if err := ctx.Err(); err != nil {
+			metricResult = adminTenantPoolMetricResult(err)
+			return
+		}
+		current, err := s.meta.GetTenantPoolByID(ctx, pool.PoolID)
+		if err != nil {
+			if !errors.Is(err, meta.ErrNotFound) {
+				logger.Warn(ctx, "admin_tenant_pool_replenish_get_pool_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
+				metricResult = "error"
+			} else {
+				metricResult = "not_found"
+			}
+			return
+		}
+		if current.Status != meta.TenantPoolActive || current.OrganizationID == "" || current.Size <= 0 {
+			metricResult = "skipped"
+			return
+		}
+		freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
+		if err != nil {
+			logger.Warn(ctx, "admin_tenant_pool_replenish_free_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+			metricResult = "error"
+			return
+		}
+		s.recordTenantPoolCapacity(current.PoolID, current.OrganizationID, current.Size, freeSize)
+		if !createdAny && !s.tenantPoolBelowRefillWatermark(freeSize, current.Size) {
+			logger.Info(ctx, "admin_tenant_pool_replenish_skipped",
+				zap.String("pool_id", current.PoolID),
+				zap.String("organization_id", current.OrganizationID),
+				zap.Int("pool_size", current.Size),
+				zap.Int("free_size", freeSize),
+				zap.Float64("refill_free_ratio", s.effectiveTenantPoolRefillFreeRatio()))
+			metricResult = "noop"
+			return
+		}
+
+		// Active inventory is immediately usable. Shared pending/provisioning
+		// inventory offsets missing capacity until the stuck-pool watchdog makes
+		// the physical attempt terminal. This avoids a refill/watchdog race at an
+		// independent time-based lease boundary.
+		slotSize := 0
+		if sharedProvider {
+			plannedSize, countErr := s.meta.CountTenantPoolPlannedSlots(ctx, current.OrganizationID)
+			if countErr != nil {
+				logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(countErr))
 				metricResult = "error"
 				return
 			}
-			missing := current.Size - slotSize
-			if missing <= 0 {
-				if !createdAny {
-					metricResult = "noop"
-				}
+			slotSize = freeSize + plannedSize
+		} else {
+			var countErr error
+			slotSize, countErr = s.meta.CountTenantPoolFreeSlots(ctx, current.OrganizationID)
+			if countErr != nil {
+				logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(countErr))
+				metricResult = "error"
 				return
 			}
-			if sharedProvider {
-				maxTenants, _ := s.managedSharedDBPolicy()
-				if !createdAny {
-					sharedWaveRemaining = managedSharedDBRefillTenantCount(missing, maxTenants, s.managedSharedDBRefillPoolLimit)
-				}
-				if sharedWaveRemaining <= 0 {
-					return
-				}
-				missing = min(missing, sharedWaveRemaining, maxTenants)
+		}
+		missing := current.Size - slotSize
+		if missing <= 0 {
+			if !createdAny {
+				metricResult = "noop"
 			}
-			results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
-			if err != nil {
-				logger.Warn(ctx, "admin_tenant_pool_replenish_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
-				metricResult = "cluster_error"
-				return
-			}
-			for _, res := range results {
-				s.startProvisionedTenantSchemaInit(ctx, res)
-			}
-			if len(results) > 0 {
-				createdAny = true
-				metricResult = "ok"
-				if sharedProvider {
-					sharedWaveRemaining -= len(results)
-				}
-			}
-			if !sharedProvider || len(results) == 0 {
-				return
+			return
+		}
+		if sharedProvider {
+			maxTenants, _ := s.managedSharedDBPolicy()
+			if !createdAny {
+				sharedWaveRemaining = managedSharedDBRefillTenantCount(missing, maxTenants, s.managedSharedDBCloudBatchSize)
 			}
 			if sharedWaveRemaining <= 0 {
 				return
 			}
+			missing = min(missing, sharedWaveRemaining)
+		}
+		results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
+		if err != nil {
+			logger.Warn(ctx, "admin_tenant_pool_replenish_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+			metricResult = "cluster_error"
+			return
+		}
+		for _, res := range results {
+			s.startProvisionedTenantSchemaInit(ctx, res)
+		}
+		if len(results) > 0 {
+			createdAny = true
+			metricResult = "ok"
+			if sharedProvider {
+				sharedWaveRemaining -= len(results)
+			}
+		}
+		if !sharedProvider || len(results) == 0 || sharedWaveRemaining <= 0 {
+			return
+		}
+	}
+}
+
+func (s *Server) scheduleTenantPoolReplenishment(
+	ctx context.Context,
+	pool *meta.TenantPool,
+	cred tenant.CredentialProvisionRequest,
+	delay time.Duration,
+	workStarter tenantPoolWorkerStarter,
+	timerStarter tenantPoolWorkerStarter,
+) {
+	workerCtx := backgroundWithTrace(ctx)
+	if timerStarter(workerCtx, func(ctx context.Context) {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			s.replenishTenantPoolAsyncWithStarters(ctx, pool, cred, workStarter, timerStarter)
 		}
 	}) {
-		s.finishTenantPoolReplenishment(pool.PoolID)
+		return
 	}
+	s.clearTenantPoolReplenishmentScheduled(pool.PoolID)
 }
 
 func (s *Server) tenantPoolBelowRefillWatermark(freeSize, poolSize int) bool {
@@ -2079,38 +2201,61 @@ func (s *Server) tenantPoolLock(poolID string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
-func (s *Server) beginTenantPoolReplenishment(poolID string) bool {
-	return s.beginTenantPoolReplenishmentAt(poolID, time.Now())
+func (s *Server) beginTenantPoolReplenishmentAt(poolID string, now time.Time) bool {
+	return s.requestTenantPoolReplenishmentAt(poolID, now).start
 }
 
-func (s *Server) beginTenantPoolReplenishmentAt(poolID string, now time.Time) bool {
+func (s *Server) requestTenantPoolReplenishmentAt(poolID string, now time.Time) tenantPoolReplenishDecision {
 	if strings.TrimSpace(poolID) == "" {
-		return false
+		return tenantPoolReplenishDecision{}
 	}
 	value, _ := s.tenantPoolReplenishJobs.LoadOrStore(poolID, &tenantPoolWorkGate{})
 	gate := value.(*tenantPoolWorkGate)
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
-	if gate.running || now.Before(gate.nextAllowed) {
-		return false
+	if gate.running {
+		gate.rerun = true
+		return tenantPoolReplenishDecision{}
+	}
+	if now.Before(gate.nextAllowed) {
+		gate.rerun = true
+		if gate.scheduled {
+			return tenantPoolReplenishDecision{}
+		}
+		gate.scheduled = true
+		return tenantPoolReplenishDecision{scheduleAfter: gate.nextAllowed.Sub(now)}
 	}
 	gate.running = true
-	return true
+	gate.rerun = false
+	gate.scheduled = false
+	return tenantPoolReplenishDecision{start: true}
 }
 
-func (s *Server) finishTenantPoolReplenishment(poolID string) {
-	s.finishTenantPoolReplenishmentAt(poolID, time.Now())
+func (s *Server) finishTenantPoolReplenishmentAt(poolID string, now time.Time) tenantPoolReplenishDecision {
+	value, ok := s.tenantPoolReplenishJobs.Load(poolID)
+	if !ok {
+		return tenantPoolReplenishDecision{}
+	}
+	gate := value.(*tenantPoolWorkGate)
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	gate.running = false
+	gate.nextAllowed = now.Add(tenantPoolReplenishMinInterval)
+	if !gate.rerun || gate.scheduled {
+		return tenantPoolReplenishDecision{}
+	}
+	gate.scheduled = true
+	return tenantPoolReplenishDecision{scheduleAfter: tenantPoolReplenishMinInterval}
 }
 
-func (s *Server) finishTenantPoolReplenishmentAt(poolID string, now time.Time) {
+func (s *Server) clearTenantPoolReplenishmentScheduled(poolID string) {
 	value, ok := s.tenantPoolReplenishJobs.Load(poolID)
 	if !ok {
 		return
 	}
 	gate := value.(*tenantPoolWorkGate)
 	gate.mu.Lock()
-	gate.running = false
-	gate.nextAllowed = now.Add(tenantPoolReplenishMinInterval)
+	gate.scheduled = false
 	gate.mu.Unlock()
 }
 
@@ -2220,6 +2365,12 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 	if pool.Status != meta.TenantPoolActive {
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_skipped", "provider", tenant.ProviderTiDBCloudNative, "pool_id", pool.PoolID, "organization_id", orgID, "reason", "pool_inactive", "pool_status", pool.Status, "duration_ms", durationMillis(claimStarted))...)
 		return nil, nil, false, false, nil
+	}
+	// Native replenishment needs the request-scoped customer credential. Shared
+	// bulk replenishment uses server-owned credentials and is exclusively driven
+	// by the leader reconciler; requests retain only their direct miss fallback.
+	if s.defaultTenantProvider != tenant.ProviderTiDBCloudNativeShared {
+		defer s.replenishTenantPoolAsync(ctx, pool, cred)
 	}
 	s.resumePendingTenantPoolAsync(ctx, pool, cred)
 	stageStarted = time.Now()

@@ -140,6 +140,14 @@ type SharedDB struct {
 	UpdatedAt               time.Time
 }
 
+// StuckSharedDBPoolFailure identifies the durable work released when a
+// pending or provisioning physical shared DB makes no progress before a
+// caller-provided cutoff.
+type StuckSharedDBPoolFailure struct {
+	DBID      int64
+	TenantIDs []string
+}
+
 // TenantPlacement maps one filesystem (fs_id) to the physical database that
 // hosts it. TargetDbID is reserved for future migrations; Epoch is reserved
 // for optimistic concurrency during migrations and stays 1 unless a migration
@@ -189,31 +197,51 @@ const sharedDBSelectColumns = "db_id, uuid, org_id, cluster_id, provisioning_key
 func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id int64, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "create_managed_shared_db_pool", start, &err)
+	values, err := managedSharedDBInsertValuesFor(in)
+	if err != nil {
+		return 0, err
+	}
+	return insertManagedSharedDBPool(ctx, s.db, values)
+}
+
+type managedSharedDBInsertValues struct {
+	poolUUID        string
+	organizationID  string
+	provisioningKey []byte
+	cloudProvider   string
+	region          string
+	passwordCipher  any
+	databaseName    any
+	maxTenants      int
+	spendingLimit   int64
+}
+
+func managedSharedDBInsertValuesFor(in *SharedDB) (managedSharedDBInsertValues, error) {
 	if in == nil {
-		return 0, fmt.Errorf("shared db pool is required")
+		return managedSharedDBInsertValues{}, fmt.Errorf("shared db pool is required")
 	}
 	organizationID, err := validateSharedDBOrganizationID(in.TiDBCloudOrganizationID)
 	if err != nil {
-		return 0, err
+		return managedSharedDBInsertValues{}, err
 	}
 	poolUUID, err := sharedDBUUID(in.UUID)
 	if err != nil {
-		return 0, err
+		return managedSharedDBInsertValues{}, err
 	}
 	if len(in.ProvisioningKey) != 32 {
-		return 0, fmt.Errorf("provisioning key must be a 32-byte SHA-256 fingerprint")
+		return managedSharedDBInsertValues{}, fmt.Errorf("provisioning key must be a 32-byte SHA-256 fingerprint")
 	}
 	if in.CloudProvider == "" {
-		return 0, fmt.Errorf("cloud provider is required")
+		return managedSharedDBInsertValues{}, fmt.Errorf("cloud provider is required")
 	}
 	if in.Region == "" {
-		return 0, fmt.Errorf("region is required")
+		return managedSharedDBInsertValues{}, fmt.Errorf("region is required")
 	}
 	if in.MaxTenants <= 0 {
-		return 0, fmt.Errorf("managed max tenants must be positive")
+		return managedSharedDBInsertValues{}, fmt.Errorf("managed max tenants must be positive")
 	}
 	if in.SpendingLimit == nil || *in.SpendingLimit <= 0 || *in.SpendingLimit > int64(math.MaxInt32) {
-		return 0, fmt.Errorf("managed spending limit must be in (0,%d]", int64(math.MaxInt32))
+		return managedSharedDBInsertValues{}, fmt.Errorf("managed spending limit must be in (0,%d]", int64(math.MaxInt32))
 	}
 	var passwordCipher any
 	if len(in.PasswordCipher) != 0 {
@@ -223,17 +251,28 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 	if in.Name != "" {
 		databaseName = in.Name
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO db_pool
+	return managedSharedDBInsertValues{poolUUID: poolUUID, organizationID: organizationID,
+		provisioningKey: append([]byte(nil), in.ProvisioningKey...), cloudProvider: in.CloudProvider,
+		region: in.Region, passwordCipher: passwordCipher, databaseName: databaseName,
+		maxTenants: in.MaxTenants, spendingLimit: *in.SpendingLimit}, nil
+}
+
+type managedSharedDBExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertManagedSharedDBPool(ctx context.Context, execer managedSharedDBExecer, values managedSharedDBInsertValues) (int64, error) {
+	res, err := execer.ExecContext(ctx, `INSERT INTO db_pool
 		(uuid, org_id, provisioning_key, cloud_provider, region, `+"`role`"+`, db_tls,
 		 db_password, db_name, max_tenants, tenant_count, soft_cap_reached, spending_limit, schema_version, status)
-		VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, 0, 0, ?, 0, ?)`, poolUUID, organizationID, in.ProvisioningKey,
-		in.CloudProvider, in.Region, SharedDBRoleShared, passwordCipher, databaseName,
-		in.MaxTenants, *in.SpendingLimit,
+		VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, 0, 0, ?, 0, ?)`, values.poolUUID, values.organizationID, values.provisioningKey,
+		values.cloudProvider, values.region, SharedDBRoleShared, values.passwordCipher, values.databaseName,
+		values.maxTenants, values.spendingLimit,
 		SharedDBStatusPending)
 	if err != nil {
 		return 0, fmt.Errorf("insert managed db_pool row: %w", err)
 	}
-	id, err = res.LastInsertId()
+	id, err := res.LastInsertId()
 	if err != nil {
 		return 0, fmt.Errorf("resolve managed db_pool id: %w", err)
 	}
@@ -512,10 +551,181 @@ func (s *Store) MarkSharedDBPoolFailed(ctx context.Context, dbID int64) error {
 	return nil
 }
 
+// MarkStuckSharedDBPoolFailed atomically fails a stale physical pool and its
+// still-pending/provisioning shared tenants. The expected status and
+// updatedBefore cutoff form a CAS guard so concurrent metadata/schema progress
+// wins over the watchdog.
+func (s *Store) MarkStuckSharedDBPoolFailed(ctx context.Context, dbID int64, expectedStatus string, updatedBefore time.Time) (result *StuckSharedDBPoolFailure, changed bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "mark_stuck_shared_db_pool_failed", start, &err)
+	if dbID <= 0 {
+		return nil, false, fmt.Errorf("db_id must be positive")
+	}
+	if expectedStatus != SharedDBStatusPending && expectedStatus != SharedDBStatusProvisioning {
+		return nil, false, fmt.Errorf("unsupported stuck shared db status %q", expectedStatus)
+	}
+	cutoff := updatedBefore.UTC()
+	var tenantIDs []string
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		var status string
+		var updatedAt time.Time
+		if err := tx.QueryRowContext(ctx, `SELECT status, updated_at
+			FROM db_pool WHERE db_id = ? AND role = ? FOR UPDATE`, dbID, SharedDBRoleShared).
+			Scan(&status, &updatedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if status != expectedStatus || updatedAt.After(cutoff) {
+			return nil
+		}
+		// Lock the matching tenant rows so the IDs returned to cache eviction and
+		// logs are exactly the rows the conditional failure update can transition.
+		rows, err := tx.QueryContext(ctx, `SELECT t.id
+			FROM tenant_placements p
+			JOIN fs_registry f ON f.fs_id = p.fs_id
+			JOIN tenants t ON t.id = f.tenant_id
+			WHERE p.db_id = ? AND t.provider = ? AND t.status IN (?, ?)
+			ORDER BY t.id FOR UPDATE`, dbID, tidbCloudNativeSharedProvider, TenantPending, TenantProvisioning)
+		if err != nil {
+			return fmt.Errorf("list stuck shared tenants for db pool %d: %w", dbID, err)
+		}
+		for rows.Next() {
+			var tenantID string
+			if err := rows.Scan(&tenantID); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			tenantIDs = append(tenantIDs, tenantID)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		if _, err := tx.ExecContext(ctx, `UPDATE tenants t
+			JOIN fs_registry f ON f.tenant_id = t.id
+			JOIN tenant_placements p ON p.fs_id = f.fs_id
+			SET t.status = ?, t.updated_at = ?
+			WHERE p.db_id = ? AND t.provider = ? AND t.status IN (?, ?)`,
+			TenantFailed, now, dbID, tidbCloudNativeSharedProvider, TenantPending, TenantProvisioning); err != nil {
+			return fmt.Errorf("fail stuck shared tenants for db pool %d: %w", dbID, err)
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE db_pool SET status = ?, updated_at = ?
+			WHERE db_id = ? AND role = ? AND status = ? AND updated_at <= ?`,
+			SharedDBStatusFailed, now, dbID, SharedDBRoleShared, expectedStatus, cutoff)
+		if err != nil {
+			return fmt.Errorf("fail stuck shared db pool %d: %w", dbID, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected != 1 {
+			return fmt.Errorf("fail stuck shared db pool %d affected %d rows, want 1", dbID, affected)
+		}
+		changed = true
+		result = &StuckSharedDBPoolFailure{
+			DBID: dbID, TenantIDs: append([]string(nil), tenantIDs...),
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if changed {
+		for _, tenantID := range tenantIDs {
+			s.apiKeys.evictTenant(tenantID)
+		}
+	}
+	return result, changed, nil
+}
+
+// ClearFailedSharedDBPoolClusterID durably records successful Cloud deletion
+// before the local failed pool row is removed. The expected cluster ID makes
+// retries safe if the row changed concurrently.
+func (s *Store) ClearFailedSharedDBPoolClusterID(ctx context.Context, dbID int64, clusterID string) (cleared bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "clear_failed_shared_db_pool_cluster_id", start, &err)
+	if dbID <= 0 {
+		return false, fmt.Errorf("db_id must be positive")
+	}
+	clusterID = strings.TrimSpace(clusterID)
+	if clusterID == "" {
+		return false, fmt.Errorf("cluster_id is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE db_pool
+		SET cluster_id = NULL, updated_at = ?
+		WHERE db_id = ? AND role = ? AND status = ? AND tenant_count = 0 AND cluster_id = ?`,
+		time.Now().UTC(), dbID, SharedDBRoleShared, SharedDBStatusFailed, clusterID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	return affected == 1, err
+}
+
+// RepairFailedSharedDBPoolTenantCountIfEmpty repairs denormalized positive
+// drift only when the authoritative placement set is empty.
+func (s *Store) RepairFailedSharedDBPoolTenantCountIfEmpty(ctx context.Context, dbID int64) (repaired bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "repair_failed_shared_db_pool_tenant_count", start, &err)
+	if dbID <= 0 {
+		return false, fmt.Errorf("db_id must be positive")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE db_pool
+		SET tenant_count = 0, soft_cap_reached = 0, updated_at = ?
+		WHERE db_id = ? AND role = ? AND status = ? AND tenant_count <> 0
+			AND NOT EXISTS (SELECT 1 FROM tenant_placements p WHERE p.db_id = db_pool.db_id)`,
+		time.Now().UTC(), dbID, SharedDBRoleShared, SharedDBStatusFailed)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
+// DeleteFailedSharedDBPoolIfEmpty removes only a locally empty failed pool
+// whose Cloud identity has already been cleared (or never existed).
+func (s *Store) DeleteFailedSharedDBPoolIfEmpty(ctx context.Context, dbID int64) (deleted bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_failed_shared_db_pool_if_empty", start, &err)
+	if dbID <= 0 {
+		return false, fmt.Errorf("db_id must be positive")
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM db_pool
+		WHERE db_id = ? AND role = ? AND status = ? AND tenant_count = 0 AND cluster_id IS NULL
+			AND NOT EXISTS (SELECT 1 FROM tenant_placements p WHERE p.db_id = db_pool.db_id)`,
+		dbID, SharedDBRoleShared, SharedDBStatusFailed)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	return affected == 1, err
+}
+
 // ListSharedDBsByStatus returns shared DB-pool rows in stable ID order.
 func (s *Store) ListSharedDBsByStatus(ctx context.Context, status string, limit int) (out []*SharedDB, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_shared_dbs_by_status", start, &err)
+	return s.listSharedDBsByStatusAfter(ctx, status, 0, limit)
+}
+
+// ListSharedDBsByStatusAfter returns one stable keyset page ordered by db_id.
+func (s *Store) ListSharedDBsByStatusAfter(ctx context.Context, status string, afterID int64, limit int) (out []*SharedDB, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_shared_dbs_by_status_after", start, &err)
+	return s.listSharedDBsByStatusAfter(ctx, status, afterID, limit)
+}
+
+func (s *Store) listSharedDBsByStatusAfter(ctx context.Context, status string, afterID int64, limit int) (out []*SharedDB, err error) {
 	switch status {
 	case SharedDBStatusPending, SharedDBStatusProvisioning, SharedDBStatusActive, SharedDBStatusFailed, SharedDBStatusDraining:
 	default:
@@ -525,9 +735,50 @@ func (s *Store) ListSharedDBsByStatus(ctx context.Context, status string, limit 
 		limit = 1000
 	}
 	rows, err := s.db.QueryContext(ctx, "SELECT "+sharedDBSelectColumns+" FROM db_pool "+
-		"WHERE `role` = ? AND status = ? ORDER BY db_id LIMIT ?", SharedDBRoleShared, status, limit)
+		"WHERE `role` = ? AND status = ? AND db_id > ? ORDER BY db_id LIMIT ?", SharedDBRoleShared, status, afterID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list shared dbs in status %q: %w", status, err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		rec, scanErr := scanSharedDBScanner(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// ListActiveSharedDBsWithProvisioningTenantsAfter returns active physical
+// pools that still have an eligible shared tenant awaiting final activation.
+// This is the durable recovery path for a crash after physical activation but
+// before ActivateSharedTenantsBatch finishes.
+func (s *Store) ListActiveSharedDBsWithProvisioningTenantsAfter(ctx context.Context, afterID int64, limit int) (out []*SharedDB, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_active_shared_dbs_with_provisioning_tenants_after", start, &err)
+	if afterID < 0 {
+		return nil, fmt.Errorf("after db id must not be negative")
+	}
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx, "SELECT "+sharedDBSelectColumns+` FROM db_pool d
+		WHERE d.`+"`role`"+` = ? AND d.status = ? AND d.db_id > ?
+			AND EXISTS (
+				SELECT 1 FROM tenant_placements p
+				JOIN fs_registry f ON f.fs_id = p.fs_id
+				JOIN tenants t ON t.id = f.tenant_id
+				WHERE p.db_id = d.db_id AND p.status = ? AND t.provider = ? AND t.status = ?
+					AND (EXISTS (SELECT 1 FROM tenant_api_keys k
+						WHERE k.tenant_id = t.id AND k.scope_kind = ? AND k.status = ?)
+						OR EXISTS (SELECT 1 FROM tenant_pool_memberships m
+							WHERE m.tenant_id = t.id AND m.pool_status = ?)))
+		ORDER BY d.db_id LIMIT ?`, SharedDBRoleShared, SharedDBStatusActive, afterID,
+		SharedDBStatusActive, tidbCloudNativeSharedProvider, TenantProvisioning,
+		APIKeyScopeKindOwner, APIKeyActive, TenantPoolBindingFree, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list active shared dbs with provisioning tenants: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {

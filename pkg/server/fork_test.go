@@ -223,6 +223,10 @@ type forkCleanupTestRuntime struct {
 }
 
 func newForkCleanupTestRuntime(t *testing.T) *forkCleanupTestRuntime {
+	return newForkCleanupTestRuntimeWithProvisioner(t, nil)
+}
+
+func newForkCleanupTestRuntimeWithProvisioner(t *testing.T, override tenant.Provisioner) *forkCleanupTestRuntime {
 	t.Helper()
 	db := newTestDBInfo(t)
 	cleanupForkTestTables(t, db.Meta)
@@ -230,10 +234,12 @@ func newForkCleanupTestRuntime(t *testing.T) *forkCleanupTestRuntime {
 		defaultPublicKey:  "default-public",
 		defaultPrivateKey: "default-private",
 	}
-	server := NewWithConfig(Config{TokenSecret: []byte("ctx-fork-test-secret")})
-	server.meta = db.Meta
-	server.pool = db.Pool
-	server.provisioner = prov
+	configuredProvisioner := tenant.Provisioner(prov)
+	if override != nil {
+		configuredProvisioner = override
+	}
+	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: configuredProvisioner,
+		TokenSecret: []byte("ctx-fork-test-secret")})
 	t.Cleanup(server.Close)
 	return &forkCleanupTestRuntime{server: server, meta: db.Meta, pool: db.Pool, prov: prov, dbHost: db.DBHost, dbPort: db.DBPort, dbUser: db.DBUser, dbPass: db.DBPass, dbName: db.DBName}
 }
@@ -793,8 +799,7 @@ func TestCleanupNativeFailedForkWithoutBranchIDDoesNotRequireCredentials(t *test
 }
 
 func TestCleanupBranchBackedForkWithoutProvisionerDoesNotMarkDeleted(t *testing.T) {
-	rt := newForkCleanupTestRuntime(t)
-	rt.server.provisioner = nonBranchOnlyProvisioner{}
+	rt := newForkCleanupTestRuntimeWithProvisioner(t, nonBranchOnlyProvisioner{})
 	rt.insertForkTenant(t, "fork-no-provisioner", meta.TenantDeleting, "branch-a")
 
 	rt.server.cleanupForkTenant(context.Background(), "fork-no-provisioner")

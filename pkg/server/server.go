@@ -55,15 +55,23 @@ type Config struct {
 	SharedDBReopenRatio   float64
 	SharedDBSpendingLimit int64
 	// Managed shared-pool concurrency and polling controls. Zero values use
-	// the exported defaults below. CloudBatchSize, MetadataWorkers, and
-	// MetadataBatchSize are safety-capped at their defaults; RefillPoolLimit
-	// and ProvisioningWorkers accept larger configured values.
+	// the exported defaults below. MetadataWorkers and MetadataBatchSize are
+	// safety-capped at their defaults; CloudBatchSize and ProvisioningWorkers
+	// accept larger configured values.
 	ManagedSharedDBCloudBatchSize       int
-	ManagedSharedDBRefillPoolLimit      int
 	ManagedSharedDBMetadataWorkers      int
 	ManagedSharedDBMetadataBatchSize    int
 	ManagedSharedDBMetadataPollInterval time.Duration
 	ManagedSharedDBProvisioningWorkers  int
+	// TenantPoolReconcileInterval drives the leader-only durable logical-pool
+	// scan. ManagedSharedDBStuckTimeout measures no-progress time in one physical
+	// pending/provisioning status. Failed cleanup has its own low-rate worker.
+	TenantPoolReconcileInterval           time.Duration
+	TenantPoolReconcileWorkers            int
+	TenantPoolReconcileWorkerRest         time.Duration
+	ManagedSharedDBStuckTimeout           time.Duration
+	ManagedSharedDBFailedCleanupInterval  time.Duration
+	ManagedSharedDBFailedCleanupBatchSize int
 	// LegacyStarterProvisioner is only used for delete/fork compatibility on
 	// persisted tidb_cloud_starter tenants. New starter provisioning remains
 	// disabled and NormalizeProvider does not accept tidb_cloud_starter.
@@ -191,62 +199,79 @@ func (s *Server) provisionerForTenantProvider(provider string) tenant.Provisione
 }
 
 type Server struct {
-	fallback                            *backend.Dat9Backend
-	meta                                *meta.Store
-	pool                                *tenant.Pool
-	provisioner                         tenant.Provisioner
-	defaultTenantProvider               string
-	sharedDBMaxTenants                  int
-	sharedDBHardCapRatio                float64
-	sharedDBReopenRatio                 float64
-	sharedDBSpendingLimit               int64
-	managedSharedDBCloudBatchSize       int
-	managedSharedDBRefillPoolLimit      int
-	managedSharedDBMetadataWorkers      int
-	managedSharedDBMetadataBatchSize    int
-	managedSharedDBMetadataPollInterval time.Duration
-	managedSharedDBProvisioningWorkers  int
-	managedSharedDBMetadataSlots        chan struct{}
-	managedSharedDBProvisioningSlots    chan struct{}
-	managedSharedDBMetadataJobs         sync.Map
-	managedSharedDBProvisioningJobs     sync.Map
-	legacyStarterProvisioner            tenant.Provisioner
-	tokenSecret                         []byte
-	localTenantAPIKey                   string
-	vaultMK                             *vault.MasterKey
-	vaultIssuerURL                      string
-	publicURL                           string
-	maxUploadBytes                      int64
-	tenantPoolMaxSize                   int
-	tenantPoolRefillFreeRatio           float64
-	inlineThreshold                     int64
-	metrics                             *serverMetrics
-	logger                              *zap.Logger
-	mux                                 *http.ServeMux
-	events                              *eventBuses
-	tenantWorker                        *tenantWorkerManager
-	shardResolver                       *semanticShardResolver
-	journalCursorSecret                 []byte
-	objectGCWorker                      *objectGCWorker
-	slockOAuth                          SlockOAuthClient
-	tidbAutoEmbedding                   tenantAutoEmbeddingDefault
-	disableDBAutoEmbed                  bool
-	forkWorkerCtx                       context.Context
-	forkWorkerCancel                    context.CancelFunc
-	forkWorkerWG                        sync.WaitGroup
-	forkWorkerMu                        sync.Mutex
-	forkWorkerClosed                    bool
-	tenantPoolLocks                     sync.Map
-	tenantPoolReplenishJobs             sync.Map
-	tenantPoolCreateLocks               sync.Map
-	sharedDBAllocationLocks             sync.Map
-	tenantPoolResumeJobs                sync.Map
-	tenantPoolResumeScans               sync.Map
-	tenantFailedCleanupJobs             sync.Map
-	tenantFailedCleanupRunner           tenantFailedCleanupRunner
-	tidbCloudRBACCache                  *tidbCloudRBACCache
-	schemaInitErrors                    sync.Map
-	leader                              *leader.Manager
+	fallback              *backend.Dat9Backend
+	meta                  *meta.Store
+	pool                  *tenant.Pool
+	provisioner           tenant.Provisioner
+	defaultTenantProvider string
+	sharedDBMaxTenants    int
+	sharedDBHardCapRatio  float64
+	sharedDBReopenRatio   float64
+	sharedDBSpendingLimit int64
+
+	managedSharedDBCloudBatchSize           int
+	managedSharedDBCloudBatchSlots          chan struct{}
+	managedSharedDBCloudBatchSlotsOnce      sync.Once
+	managedSharedDBMetadataWorkers          int
+	managedSharedDBMetadataBatchSize        int
+	managedSharedDBMetadataPollInterval     time.Duration
+	managedSharedDBProvisioningWorkers      int
+	managedSharedDBProvisioningConcurrency  int
+	tenantPoolReconcileInterval             time.Duration
+	tenantPoolReconcileWorkers              int
+	tenantPoolReconcileQueue                chan tenantPoolReconcileJob
+	tenantPoolReconcileWorkerRest           time.Duration
+	tenantPoolLeaderReconcileJobs           sync.Map
+	managedSharedDBStuckTimeout             time.Duration
+	managedSharedDBMetadataSlots            chan struct{}
+	managedSharedDBProvisioningSlots        chan struct{}
+	managedSharedDBMetadataJobs             sync.Map
+	managedSharedDBProvisioningJobs         sync.Map
+	managedSharedDBFailedCleanupBatchSize   int
+	managedSharedDBFailedCleanupInterval    time.Duration
+	managedSharedDBFailedCleanupCursor      int64
+	managedSharedDBPendingResumeCursor      int64
+	managedSharedDBProvisioningResumeCursor int64
+	managedSharedDBActivationResumeCursor   int64
+
+	legacyStarterProvisioner  tenant.Provisioner
+	tokenSecret               []byte
+	localTenantAPIKey         string
+	vaultMK                   *vault.MasterKey
+	vaultIssuerURL            string
+	publicURL                 string
+	maxUploadBytes            int64
+	tenantPoolMaxSize         int
+	tenantPoolRefillFreeRatio float64
+	inlineThreshold           int64
+	metrics                   *serverMetrics
+	logger                    *zap.Logger
+	mux                       *http.ServeMux
+	events                    *eventBuses
+	tenantWorker              *tenantWorkerManager
+	shardResolver             *semanticShardResolver
+	journalCursorSecret       []byte
+	objectGCWorker            *objectGCWorker
+	slockOAuth                SlockOAuthClient
+	tidbAutoEmbedding         tenantAutoEmbeddingDefault
+	disableDBAutoEmbed        bool
+	forkWorkerCtx             context.Context
+	forkWorkerCancel          context.CancelFunc
+	forkWorkerWG              sync.WaitGroup
+	forkWorkerMu              sync.Mutex
+	forkWorkerClosed          bool
+	tenantPoolLocks           sync.Map
+	tenantPoolReplenishJobs   sync.Map
+	tenantPoolCreateLocks     sync.Map
+	sharedDBAllocationLocks   sync.Map
+	sharedDBReservationLocks  sync.Map
+	tenantPoolResumeJobs      sync.Map
+	tenantPoolResumeScans     sync.Map
+	tenantFailedCleanupJobs   sync.Map
+	tenantFailedCleanupRunner tenantFailedCleanupRunner
+	tidbCloudRBACCache        *tidbCloudRBACCache
+	schemaInitErrors          sync.Map
+	leader                    *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
 	// changes, this context is cancelled and recreated. Workers that use it
 	// (pending tenant reconciler, tenant delete cleanup, one-time resume tasks)
@@ -256,6 +281,7 @@ type Server struct {
 	leaderWorkerWG       sync.WaitGroup
 	leaderWorkerMu       sync.Mutex
 	leaderWorkersStarted bool
+	leaderWorkerStopDone chan struct{}
 	// replayWorker and expirySweepWorker are leader-gated central quota
 	// workers owned by the server (single callback owner). Started in
 	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
@@ -338,12 +364,18 @@ const DefaultSharedDBReopenRatio = 0.8
 const DefaultManagedSharedDBSpendingLimit = int64(1_000_000)
 
 const (
-	DefaultManagedSharedDBCloudBatchSize       = 10
-	DefaultManagedSharedDBRefillPoolLimit      = 50
-	DefaultManagedSharedDBMetadataWorkers      = 15
-	DefaultManagedSharedDBMetadataBatchSize    = 30
-	DefaultManagedSharedDBMetadataPollInterval = 15 * time.Second
-	DefaultManagedSharedDBProvisioningWorkers  = 100
+	DefaultManagedSharedDBCloudBatchSize         = 50
+	defaultManagedSharedDBCloudBatchConcurrency  = 5
+	DefaultManagedSharedDBMetadataWorkers        = 15
+	DefaultManagedSharedDBMetadataBatchSize      = 30
+	DefaultManagedSharedDBMetadataPollInterval   = 15 * time.Second
+	DefaultManagedSharedDBProvisioningWorkers    = 100
+	DefaultTenantPoolReconcileInterval           = 5 * time.Second
+	DefaultTenantPoolReconcileWorkers            = 15
+	DefaultTenantPoolReconcileWorkerRest         = 5 * time.Second
+	DefaultManagedSharedDBStuckTimeout           = 15 * time.Minute
+	DefaultManagedSharedDBFailedCleanupInterval  = time.Minute
+	DefaultManagedSharedDBFailedCleanupBatchSize = 5
 )
 
 // TenantStatusResponse is the JSON body of GET /v1/status. Fields are filled
@@ -428,11 +460,6 @@ func NewWithConfig(cfg Config) *Server {
 	if managedSharedDBCloudBatchSize <= 0 {
 		managedSharedDBCloudBatchSize = DefaultManagedSharedDBCloudBatchSize
 	}
-	managedSharedDBCloudBatchSize = min(managedSharedDBCloudBatchSize, DefaultManagedSharedDBCloudBatchSize)
-	managedSharedDBRefillPoolLimit := cfg.ManagedSharedDBRefillPoolLimit
-	if managedSharedDBRefillPoolLimit <= 0 {
-		managedSharedDBRefillPoolLimit = DefaultManagedSharedDBRefillPoolLimit
-	}
 	managedSharedDBMetadataWorkers := cfg.ManagedSharedDBMetadataWorkers
 	if managedSharedDBMetadataWorkers <= 0 {
 		managedSharedDBMetadataWorkers = DefaultManagedSharedDBMetadataWorkers
@@ -451,43 +478,81 @@ func NewWithConfig(cfg Config) *Server {
 	if managedSharedDBProvisioningWorkers <= 0 {
 		managedSharedDBProvisioningWorkers = DefaultManagedSharedDBProvisioningWorkers
 	}
+	managedSharedDBProvisioningConcurrency := managedSharedDBProvisioningWorkers
+	if cfg.Meta != nil && cfg.Meta.DB() != nil {
+		managedSharedDBProvisioningConcurrency = limitManagedSharedDBProvisioningWorkers(
+			managedSharedDBProvisioningWorkers, cfg.Meta.DB().Stats().MaxOpenConnections)
+	}
+	tenantPoolReconcileInterval := cfg.TenantPoolReconcileInterval
+	if tenantPoolReconcileInterval <= 0 {
+		tenantPoolReconcileInterval = DefaultTenantPoolReconcileInterval
+	}
+	tenantPoolReconcileWorkers := cfg.TenantPoolReconcileWorkers
+	if tenantPoolReconcileWorkers <= 0 {
+		tenantPoolReconcileWorkers = DefaultTenantPoolReconcileWorkers
+	}
+	tenantPoolReconcileWorkerRest := cfg.TenantPoolReconcileWorkerRest
+	if tenantPoolReconcileWorkerRest <= 0 {
+		tenantPoolReconcileWorkerRest = DefaultTenantPoolReconcileWorkerRest
+	}
+	managedSharedDBStuckTimeout := cfg.ManagedSharedDBStuckTimeout
+	if managedSharedDBStuckTimeout <= 0 {
+		managedSharedDBStuckTimeout = DefaultManagedSharedDBStuckTimeout
+	}
+	managedSharedDBFailedCleanupInterval := cfg.ManagedSharedDBFailedCleanupInterval
+	if managedSharedDBFailedCleanupInterval <= 0 {
+		managedSharedDBFailedCleanupInterval = DefaultManagedSharedDBFailedCleanupInterval
+	}
+	managedSharedDBFailedCleanupBatchSize := cfg.ManagedSharedDBFailedCleanupBatchSize
+	if managedSharedDBFailedCleanupBatchSize <= 0 {
+		managedSharedDBFailedCleanupBatchSize = DefaultManagedSharedDBFailedCleanupBatchSize
+	}
 	defaultTenantProvider := strings.TrimSpace(cfg.DefaultTenantProvider)
 	if defaultTenantProvider == "" && cfg.Provisioner != nil {
 		defaultTenantProvider = cfg.Provisioner.ProviderType()
 	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
-		fallback:                            cfg.Backend,
-		meta:                                cfg.Meta,
-		pool:                                cfg.Pool,
-		tokenSecret:                         cfg.TokenSecret,
-		localTenantAPIKey:                   strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:                             vaultMK,
-		vaultIssuerURL:                      strings.TrimSpace(cfg.VaultIssuerURL),
-		publicURL:                           strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
-		provisioner:                         cfg.Provisioner,
-		defaultTenantProvider:               defaultTenantProvider,
-		sharedDBMaxTenants:                  cfg.SharedDBMaxTenants,
-		sharedDBHardCapRatio:                sharedDBHardCapRatio,
-		sharedDBReopenRatio:                 sharedDBReopenRatio,
-		sharedDBSpendingLimit:               sharedDBSpendingLimit,
-		managedSharedDBCloudBatchSize:       managedSharedDBCloudBatchSize,
-		managedSharedDBRefillPoolLimit:      managedSharedDBRefillPoolLimit,
-		managedSharedDBMetadataWorkers:      managedSharedDBMetadataWorkers,
-		managedSharedDBMetadataBatchSize:    managedSharedDBMetadataBatchSize,
-		managedSharedDBMetadataPollInterval: managedSharedDBMetadataPollInterval,
-		managedSharedDBProvisioningWorkers:  managedSharedDBProvisioningWorkers,
-		managedSharedDBMetadataSlots:        make(chan struct{}, managedSharedDBMetadataWorkers),
-		managedSharedDBProvisioningSlots:    make(chan struct{}, managedSharedDBProvisioningWorkers),
-		legacyStarterProvisioner:            cfg.LegacyStarterProvisioner,
-		maxUploadBytes:                      maxUpload,
-		tenantPoolMaxSize:                   tenantPoolMaxSize,
-		tenantPoolRefillFreeRatio:           tenantPoolRefillFreeRatio,
-		inlineThreshold:                     inlineThreshold,
-		metrics:                             newServerMetrics(),
-		logger:                              logger,
-		events:                              newEventBuses(),
-		slockOAuth:                          cfg.SlockOAuth,
+		fallback:              cfg.Backend,
+		meta:                  cfg.Meta,
+		pool:                  cfg.Pool,
+		tokenSecret:           cfg.TokenSecret,
+		localTenantAPIKey:     strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:               vaultMK,
+		vaultIssuerURL:        strings.TrimSpace(cfg.VaultIssuerURL),
+		publicURL:             strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
+		provisioner:           cfg.Provisioner,
+		defaultTenantProvider: defaultTenantProvider,
+		sharedDBMaxTenants:    cfg.SharedDBMaxTenants,
+		sharedDBHardCapRatio:  sharedDBHardCapRatio,
+		sharedDBReopenRatio:   sharedDBReopenRatio,
+		sharedDBSpendingLimit: sharedDBSpendingLimit,
+
+		managedSharedDBCloudBatchSize:          managedSharedDBCloudBatchSize,
+		managedSharedDBMetadataWorkers:         managedSharedDBMetadataWorkers,
+		managedSharedDBMetadataBatchSize:       managedSharedDBMetadataBatchSize,
+		managedSharedDBMetadataPollInterval:    managedSharedDBMetadataPollInterval,
+		managedSharedDBProvisioningWorkers:     managedSharedDBProvisioningWorkers,
+		managedSharedDBProvisioningConcurrency: managedSharedDBProvisioningConcurrency,
+		tenantPoolReconcileInterval:            tenantPoolReconcileInterval,
+		tenantPoolReconcileWorkers:             tenantPoolReconcileWorkers,
+		tenantPoolReconcileQueue:               make(chan tenantPoolReconcileJob),
+		tenantPoolReconcileWorkerRest:          tenantPoolReconcileWorkerRest,
+		managedSharedDBStuckTimeout:            managedSharedDBStuckTimeout,
+		managedSharedDBFailedCleanupInterval:   managedSharedDBFailedCleanupInterval,
+		managedSharedDBFailedCleanupBatchSize:  managedSharedDBFailedCleanupBatchSize,
+		managedSharedDBMetadataSlots:           make(chan struct{}, managedSharedDBMetadataWorkers),
+		managedSharedDBProvisioningSlots:       make(chan struct{}, managedSharedDBProvisioningConcurrency),
+
+		legacyStarterProvisioner:  cfg.LegacyStarterProvisioner,
+		maxUploadBytes:            maxUpload,
+		tenantPoolMaxSize:         tenantPoolMaxSize,
+		tenantPoolRefillFreeRatio: tenantPoolRefillFreeRatio,
+		inlineThreshold:           inlineThreshold,
+		metrics:                   newServerMetrics(),
+		logger:                    logger,
+		events:                    newEventBuses(),
+		slockOAuth:                cfg.SlockOAuth,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
 			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
@@ -683,6 +748,20 @@ func normalizeTenantPoolRefillFreeRatio(ratio float64) float64 {
 		return DefaultTenantPoolRefillFreeRatio
 	}
 	return ratio
+}
+
+// limitManagedSharedDBProvisioningWorkers reserves half of the metadb pool for
+// callback queries and unrelated control-plane traffic. Each active schema
+// worker holds one session connection for GET_LOCK while its callback performs
+// ordinary Store operations through another connection from the same pool.
+func limitManagedSharedDBProvisioningWorkers(configured, maxOpen int) int {
+	if configured <= 0 {
+		return 0
+	}
+	if maxOpen <= 0 {
+		return configured
+	}
+	return min(configured, maxOpen/2)
 }
 
 // insertTenantNotify records a best-effort unified outbox signal so other
@@ -899,16 +978,16 @@ func (s *Server) Close() {
 }
 
 func runManagedSharedDBResumeLoop(ctx context.Context, interval time.Duration, resume func(context.Context)) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	resume(ctx)
 	for {
+		resume(ctx)
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			resume(ctx)
+		case <-timer.C:
 		}
+		timer.Stop()
 	}
 }
 
@@ -922,11 +1001,20 @@ func runManagedSharedDBResumeLoop(ctx context.Context, interval time.Duration, r
 // running. The mutex is held for the entire transition so that a concurrent
 // stopLeaderWorkers observes the fully-started worker set (not a partial one).
 func (s *Server) startLeaderWorkers() {
-	s.leaderWorkerMu.Lock()
-	defer s.leaderWorkerMu.Unlock()
-	if s.leaderWorkersStarted {
-		return
+	for {
+		s.leaderWorkerMu.Lock()
+		if s.leaderWorkersStarted {
+			s.leaderWorkerMu.Unlock()
+			return
+		}
+		if stopDone := s.leaderWorkerStopDone; stopDone != nil {
+			s.leaderWorkerMu.Unlock()
+			<-stopDone
+			continue
+		}
+		break
 	}
+	defer s.leaderWorkerMu.Unlock()
 	s.leaderWorkersStarted = true
 	// Create a fresh leaderWorkerCtx for the fork-worker group and one-time
 	// resume tasks. These use leaderWorkerCtx (not forkWorkerCtx, which is
@@ -954,6 +1042,19 @@ func (s *Server) startLeaderWorkers() {
 		}
 		startManagedSharedDBResumeLoop(s.resumePendingManagedSharedDBPoolsWithCtx)
 		startManagedSharedDBResumeLoop(s.resumeProvisioningManagedSharedDBPoolsWithCtx)
+		startManagedSharedDBResumeLoop(s.resumeActiveManagedSharedDBTenantsWithCtx)
+		for range s.tenantPoolReconcileWorkers {
+			s.startLeaderGoroutine(leaderCtx, s.runTenantPoolReconcileWorker)
+		}
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			runManagedSharedDBResumeLoop(workerCtx, s.tenantPoolReconcileInterval, s.reconcileStuckManagedSharedDBPoolsWithCtx)
+		})
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			runManagedSharedDBResumeLoop(workerCtx, s.tenantPoolReconcileInterval, s.reconcileSharedTenantPoolsWithCtx)
+		})
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			runManagedSharedDBResumeLoop(workerCtx, s.managedSharedDBFailedCleanupInterval, s.cleanupFailedManagedSharedDBPoolsWithCtx)
+		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			s.resumeDeletingForkTenantsWithCtx(workerCtx)
 		})
@@ -1115,27 +1216,33 @@ func (s *Server) cleanupTenantNotifyOutbox(ctx context.Context) {
 }
 
 // stopLeaderWorkers stops the background schedulers started by startLeaderWorkers.
-// Called when the pod loses leadership or the server shuts down. The whole stop
-// (including the worker Stop/wait calls and clearing the worker fields) is
-// serialized under leaderWorkerMu and guarded by leaderWorkersStarted, so
-// onLose (heartbeat goroutine), Close() (main goroutine), and a concurrent
-// startLeaderWorkers cannot interleave. Holding the mutex for the entire
-// transition guarantees a concurrent startLeaderWorkers observes the
-// fully-stopped state (leaderWorkersStarted == false) and does not leave
-// orphan workers that a stop already ran past.
+// Called when the pod loses leadership or the server shuts down. Lifecycle
+// state is detached under leaderWorkerMu, but cancellation and Wait happen
+// outside it so an exiting worker can safely check leader admission. A
+// concurrent start waits on leaderWorkerStopDone before creating a new worker
+// generation, so old teardown cannot stop newly-started singleton workers.
 func (s *Server) stopLeaderWorkers() {
 	s.leaderWorkerMu.Lock()
-	defer s.leaderWorkerMu.Unlock()
+	if stopDone := s.leaderWorkerStopDone; stopDone != nil {
+		s.leaderWorkerMu.Unlock()
+		<-stopDone
+		return
+	}
 	if !s.leaderWorkersStarted {
+		s.leaderWorkerMu.Unlock()
 		return
 	}
 	s.leaderWorkersStarted = false
+	stopDone := make(chan struct{})
+	s.leaderWorkerStopDone = stopDone
 	cancel := s.leaderWorkerCancel
 	s.leaderWorkerCancel = nil
+	s.leaderWorkerCtx = nil
 	replayWorker := s.replayWorker
 	s.replayWorker = nil
 	expirySweepWorker := s.expirySweepWorker
 	s.expirySweepWorker = nil
+	s.leaderWorkerMu.Unlock()
 
 	if cancel != nil {
 		cancel()
@@ -1160,6 +1267,12 @@ func (s *Server) stopLeaderWorkers() {
 	if s.objectGCWorker != nil {
 		s.objectGCWorker.Stop()
 	}
+	s.leaderWorkerMu.Lock()
+	if s.leaderWorkerStopDone == stopDone {
+		s.leaderWorkerStopDone = nil
+		close(stopDone)
+	}
+	s.leaderWorkerMu.Unlock()
 }
 
 // startLeaderGoroutine launches a goroutine that runs fn under the leader
@@ -4720,7 +4833,6 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			if res.Status == meta.TenantProvisioning {
 				s.startProvisionedTenantSchemaInit(r.Context(), res)
 			}
-			s.replenishTenantPoolAsync(r.Context(), pool, *credentialReq)
 			if quotaReq != nil && quotaReq.TiDBCloudSpendingLimit != nil {
 				metricEvent(r.Context(), "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
 			}
