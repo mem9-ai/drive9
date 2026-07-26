@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/encrypt"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
@@ -821,6 +822,14 @@ func TestSanitizeClientError_Fallback(t *testing.T) {
 	}
 }
 
+func TestSanitizeClientError_DirectoryNotEmpty(t *testing.T) {
+	err := fmt.Errorf("%w: /projects/a/b/", datastore.ErrDirectoryNotEmpty)
+	got := sanitizeClientError(err)
+	if got != err.Error() {
+		t.Fatalf("got %q, want %q", got, err.Error())
+	}
+}
+
 func TestBackendErrorStatus(t *testing.T) {
 	tests := []struct {
 		name string
@@ -856,6 +865,16 @@ func TestBackendErrorStatus(t *testing.T) {
 			name: "schema migration error",
 			err:  fmt.Errorf("migrate split tables: Error 1146: Table doesn't exist"),
 			want: http.StatusBadGateway,
+		},
+		{
+			name: "directory not empty",
+			err:  datastore.ErrDirectoryNotEmpty,
+			want: http.StatusConflict,
+		},
+		{
+			name: "directory not empty wrapped",
+			err:  fmt.Errorf("%w: /projects/a/b/", datastore.ErrDirectoryNotEmpty),
+			want: http.StatusConflict,
 		},
 		{
 			name: "unknown error",

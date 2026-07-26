@@ -1560,6 +1560,72 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+func TestDeleteNonEmptyDirectoryReturnsConflict(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/nonempty?mkdir", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir status = %d, want 200", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/nonempty/child.txt", strings.NewReader("data"))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write status = %d, want 200", resp.StatusCode)
+	}
+
+	// Non-recursive delete of a non-empty directory is an expected client
+	// conflict (POSIX ENOTEMPTY), not a 5xx server fault.
+	for _, rawQuery := range []string{"", "kind=dir"} {
+		req, _ = http.NewRequest(http.MethodDelete, ts.URL+"/v1/fs/nonempty?"+rawQuery, nil)
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("delete non-empty dir (?%s) status = %d, want 409, body=%s", rawQuery, resp.StatusCode, body)
+		}
+		if !strings.Contains(string(body), "directory not empty") {
+			t.Fatalf("delete non-empty dir (?%s) body = %s, want directory not empty", rawQuery, body)
+		}
+	}
+
+	// Still present after conflict.
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/nonempty/", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("dir still present status = %d, want 200", resp.StatusCode)
+	}
+
+	// Recursive delete succeeds.
+	req, _ = http.NewRequest(http.MethodDelete, ts.URL+"/v1/fs/nonempty?recursive", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("recursive delete status = %d, want 200", resp.StatusCode)
+	}
+}
+
 func TestDeleteKindHint(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

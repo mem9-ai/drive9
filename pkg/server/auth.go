@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/drive9/pkg/backend"
+	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
@@ -83,6 +84,9 @@ func sanitizeClientError(err error) string {
 	if err == nil {
 		return "backend unavailable"
 	}
+	if errors.Is(err, datastore.ErrDirectoryNotEmpty) {
+		return err.Error()
+	}
 	if isQuotaError(err) {
 		return "tenant usage quota exceeded"
 	}
@@ -98,6 +102,9 @@ func backendErrorStatus(ctx context.Context, err error) int {
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return http.StatusGatewayTimeout
+	}
+	if errors.Is(err, datastore.ErrDirectoryNotEmpty) {
+		return http.StatusConflict
 	}
 	if isQuotaError(err) {
 		return http.StatusPaymentRequired
