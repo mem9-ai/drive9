@@ -417,7 +417,73 @@ func TestCountTenantPoolPlannedSlotsUsesSharedPoolProgressLease(t *testing.T) {
 		t.Fatalf("CountTenantPoolPlannedSlots: %v", err)
 	}
 	if planned != 1 {
-		t.Fatalf("planned slots = %d, want only the unexpired shared plan", planned)
+		t.Fatalf("planned slots = %d, want only the assigned tenant in the unexpired shared plan", planned)
+	}
+}
+
+func TestCountTenantPoolPlannedSlotsIncludesRecentUnstartedPhysicalPool(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	if _, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-unstarted-physical-plan", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	}); err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	planned, err := s.CountTenantPoolPlannedSlots(ctx, "org-unstarted-physical-plan", time.Now().UTC().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("CountTenantPoolPlannedSlots: %v", err)
+	}
+	if planned != 100 {
+		t.Fatalf("planned slots = %d, want the full capacity of the unstarted staged pool", planned)
+	}
+}
+
+func TestCountTenantPoolPlannedSlotsIncludesRecentActivePoolPlacementGap(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-active-placement-gap", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		tenantID := fmt.Sprintf("tenant-active-placement-gap-%d", i)
+		seedPendingTenant(t, s, tenantID)
+		fsID, err := s.EnsureFsID(ctx, tenantID)
+		if err != nil {
+			t.Fatalf("EnsureFsID %d: %v", i, err)
+		}
+		if err := s.CompleteSharedTenantPoolMember(ctx, tenantID, tidbCloudNativeSharedProvider,
+			&TenantPlacement{FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared},
+			&TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: "org-active-placement-gap",
+				PoolID: "logical-active-placement-gap", PoolStatus: TenantPoolBindingFree}); err != nil {
+			t.Fatalf("CompleteSharedTenantPoolMember %d: %v", i, err)
+		}
+	}
+	if err := s.UpdateTenantStatus(ctx, "tenant-active-placement-gap-0", TenantActive); err != nil {
+		t.Fatalf("activate tenant: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ?, updated_at = ? WHERE db_id = ?`,
+		SharedDBStatusActive, now, dbID); err != nil {
+		t.Fatalf("activate db pool: %v", err)
+	}
+
+	active, err := s.CountFreeTenantPoolBindings(ctx, "org-active-placement-gap")
+	if err != nil {
+		t.Fatalf("CountFreeTenantPoolBindings: %v", err)
+	}
+	planned, err := s.CountTenantPoolPlannedSlots(ctx, "org-active-placement-gap", now.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("CountTenantPoolPlannedSlots: %v", err)
+	}
+	if active != 1 || planned != 1 || active+planned != 2 {
+		t.Fatalf("active=%d planned=%d total=%d, want only assigned inventory: active=1 planned=1 total=2", active, planned, active+planned)
 	}
 }
 

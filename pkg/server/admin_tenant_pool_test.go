@@ -421,27 +421,31 @@ func TestSharedTenantPoolRefillPlansWithServerOwnedSharedCredential(t *testing.T
 	}
 }
 
-func TestSharedTenantPoolRefillLimitsPhysicalPartitionWorkersToThirty(t *testing.T) {
+func TestSharedTenantPoolRefillLimitsPhysicalPartitionWorkersGlobally(t *testing.T) {
 	const wantConcurrency = 30
-	started := make(chan struct{}, wantConcurrency+1)
+	started := make(chan struct{}, 2*(wantConcurrency+1))
 	release := make(chan struct{})
-	done := make(chan []sharedPoolTenantCreateOutcome, 1)
-	partitions := make([]sharedPoolTenantPartition, wantConcurrency+1)
-	for i := range partitions {
-		partitions[i] = sharedPoolTenantPartition{db: &meta.SharedDB{ID: int64(i + 1)}, tenantCount: 1}
+	done := make(chan []sharedPoolTenantCreateOutcome, 2)
+	globalSlots := make(chan struct{}, wantConcurrency)
+	for wave := 0; wave < 2; wave++ {
+		partitions := make([]sharedPoolTenantPartition, wantConcurrency+1)
+		for i := range partitions {
+			partitions[i] = sharedPoolTenantPartition{db: &meta.SharedDB{ID: int64(wave*100 + i + 1)}, tenantCount: 1}
+		}
+		go func() {
+			done <- runSharedPoolTenantPartitionWorkers(context.Background(), globalSlots, partitions, func(sharedPoolTenantPartition) sharedPoolTenantCreateOutcome {
+				started <- struct{}{}
+				<-release
+				return sharedPoolTenantCreateOutcome{}
+			})
+		}()
 	}
-	go func() {
-		done <- runSharedPoolTenantPartitionWorkers(context.Background(), partitions, func(sharedPoolTenantPartition) sharedPoolTenantCreateOutcome {
-			started <- struct{}{}
-			<-release
-			return sharedPoolTenantCreateOutcome{}
-		})
-	}()
 	for i := 0; i < wantConcurrency; i++ {
 		select {
 		case <-started:
 		case <-time.After(500 * time.Millisecond):
 			close(release)
+			<-done
 			<-done
 			t.Fatalf("started %d/%d tenant workers before release", i, wantConcurrency)
 		}
@@ -450,13 +454,16 @@ func TestSharedTenantPoolRefillLimitsPhysicalPartitionWorkersToThirty(t *testing
 	case <-started:
 		close(release)
 		<-done
-		t.Fatal("started a 31st tenant worker while 30 were still in flight")
+		<-done
+		t.Fatal("started a 31st tenant writer across concurrent refill waves")
 	case <-time.After(100 * time.Millisecond):
 	}
 	close(release)
-	outcomes := <-done
-	if len(outcomes) != wantConcurrency+1 {
-		t.Fatalf("outcomes = %d, want %d", len(outcomes), wantConcurrency+1)
+	for wave := 0; wave < 2; wave++ {
+		outcomes := <-done
+		if len(outcomes) != wantConcurrency+1 {
+			t.Fatalf("wave %d outcomes = %d, want %d", wave, len(outcomes), wantConcurrency+1)
+		}
 	}
 }
 
@@ -1698,6 +1705,14 @@ func TestTenantPoolLeaderReconcileWorkersQueueAndRestBetweenTasks(t *testing.T) 
 	defer cancel()
 	rest := 40 * time.Millisecond
 	srv := &Server{tenantPoolReconcileQueue: make(chan tenantPoolReconcileJob), tenantPoolReconcileWorkerRest: rest}
+	enqueue := func(fn func(context.Context)) bool {
+		select {
+		case srv.tenantPoolReconcileQueue <- tenantPoolReconcileJob{run: fn}:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
@@ -1705,7 +1720,7 @@ func TestTenantPoolLeaderReconcileWorkersQueueAndRestBetweenTasks(t *testing.T) 
 	}()
 	firstStarted := make(chan struct{}, 1)
 	release := make(chan struct{})
-	if !srv.enqueueTenantPoolReconcileWork(ctx, func(context.Context) {
+	if !enqueue(func(context.Context) {
 		firstStarted <- struct{}{}
 		<-release
 	}) {
@@ -1715,7 +1730,7 @@ func TestTenantPoolLeaderReconcileWorkersQueueAndRestBetweenTasks(t *testing.T) 
 	secondStarted := make(chan struct{}, 1)
 	secondQueued := make(chan bool, 1)
 	go func() {
-		secondQueued <- srv.enqueueTenantPoolReconcileWork(ctx, func(context.Context) {
+		secondQueued <- enqueue(func(context.Context) {
 			secondStarted <- struct{}{}
 		})
 	}()
@@ -1745,32 +1760,91 @@ func TestTenantPoolLeaderReconcileWorkersQueueAndRestBetweenTasks(t *testing.T) 
 	}
 }
 
-func TestTenantPoolLeaderReconcileAllowsSamePoolAcrossScans(t *testing.T) {
-	srv := &Server{tenantPoolReconcileQueue: make(chan tenantPoolReconcileJob)}
-	pool := &meta.TenantPool{PoolID: "pool-repeated-scan", OrganizationID: "org-repeated-scan", Size: 100}
-	queued := make(chan bool, 2)
-	for range 2 {
-		go func() {
-			queued <- srv.enqueueTenantPoolLeaderReplenishment(context.Background(), pool, tenant.CredentialProvisionRequest{})
-		}()
+func TestTenantPoolLeaderReconcileCoalescesSamePoolIntoOneRerun(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := &Server{
+		tenantPoolReconcileQueue:      make(chan tenantPoolReconcileJob),
+		tenantPoolReconcileWorkerRest: 20 * time.Millisecond,
 	}
-	for range 2 {
-		select {
-		case job := <-srv.tenantPoolReconcileQueue:
-			if job.run == nil {
-				t.Fatal("queued leader refill has no work")
-			}
-		case <-time.After(time.Second):
-			t.Fatal("same pool was coalesced across leader scans")
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		srv.runTenantPoolReconcileWorker(ctx)
+	}()
+
+	started := make(chan int, 2)
+	releaseFirst := make(chan struct{})
+	var attempts atomic.Int32
+	run := func(context.Context) {
+		attempt := int(attempts.Add(1))
+		started <- attempt
+		if attempt == 1 {
+			<-releaseFirst
 		}
 	}
-	for range 2 {
-		if ok := <-queued; !ok {
-			t.Fatal("same-pool leader refill was not queued")
+	if !srv.enqueueTenantPoolLeaderReconcile(ctx, "pool-repeated-scan", run) {
+		t.Fatal("initial leader reconcile task was not queued")
+	}
+	select {
+	case attempt := <-started:
+		if attempt != 1 {
+			t.Fatalf("first attempt = %d, want 1", attempt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial leader reconcile task did not start")
+	}
+
+	for i := 0; i < 3; i++ {
+		if !srv.enqueueTenantPoolLeaderReconcile(ctx, "pool-repeated-scan", run) {
+			t.Fatalf("coalesced trigger %d was rejected", i+1)
 		}
 	}
-	if _, ok := srv.tenantPoolReplenishJobs.Load(pool.PoolID); ok {
+	select {
+	case attempt := <-started:
+		t.Fatalf("attempt %d started while the first attempt was still running", attempt)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(releaseFirst)
+	select {
+	case attempt := <-started:
+		if attempt != 2 {
+			t.Fatalf("rerun attempt = %d, want 2", attempt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("coalesced rerun did not start")
+	}
+	select {
+	case attempt := <-started:
+		t.Fatalf("unexpected extra coalesced attempt %d", attempt)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("leader reconcile attempts = %d, want 2", got)
+	}
+	if _, ok := srv.tenantPoolReplenishJobs.Load("pool-repeated-scan"); ok {
 		t.Fatal("leader refill unexpectedly used the request-side per-pool gate")
+	}
+
+	cancel()
+	select {
+	case <-workerDone:
+	case <-time.After(time.Second):
+		t.Fatal("tenant-pool reconcile worker did not stop")
+	}
+}
+
+func TestTenantPoolLeaderReconcileDoesNotRerunForDuplicateQueuedScan(t *testing.T) {
+	state := &tenantPoolLeaderReconcileState{}
+	if !state.request() {
+		t.Fatal("initial scan was not accepted")
+	}
+	if state.request() {
+		t.Fatal("duplicate queued scan was accepted as a second job")
+	}
+	state.start()
+	if state.next() {
+		t.Fatal("duplicate scan received before work started requested an unnecessary rerun")
 	}
 }
 

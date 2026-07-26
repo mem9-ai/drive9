@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -13,7 +15,58 @@ import (
 const tenantPoolReconcilePageSize = 100
 
 type tenantPoolReconcileJob struct {
-	run func(context.Context)
+	run   func(context.Context)
+	start func()
+	next  func() bool
+	abort func()
+}
+
+type tenantPoolLeaderReconcileState struct {
+	mu      sync.Mutex
+	queued  bool
+	running bool
+	rerun   bool
+}
+
+func (state *tenantPoolLeaderReconcileState) request() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.queued {
+		return false
+	}
+	if state.running {
+		state.rerun = true
+		return false
+	}
+	state.queued = true
+	state.rerun = false
+	return true
+}
+
+func (state *tenantPoolLeaderReconcileState) start() {
+	state.mu.Lock()
+	state.queued = false
+	state.running = true
+	state.mu.Unlock()
+}
+
+func (state *tenantPoolLeaderReconcileState) next() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.rerun {
+		state.rerun = false
+		return true
+	}
+	state.running = false
+	return false
+}
+
+func (state *tenantPoolLeaderReconcileState) abort() {
+	state.mu.Lock()
+	state.queued = false
+	state.running = false
+	state.rerun = false
+	state.mu.Unlock()
 }
 
 func (s *Server) reconcileStuckManagedSharedDBPoolsWithCtx(ctx context.Context) {
@@ -90,14 +143,21 @@ func (s *Server) reconcileSharedTenantPoolsWithCtx(ctx context.Context) {
 	}
 }
 
-func (s *Server) enqueueTenantPoolReconcileWork(ctx context.Context, fn func(context.Context)) bool {
-	if s.tenantPoolReconcileQueue == nil || fn == nil {
+func (s *Server) enqueueTenantPoolLeaderReconcile(ctx context.Context, poolID string, run func(context.Context)) bool {
+	if s.tenantPoolReconcileQueue == nil || strings.TrimSpace(poolID) == "" || run == nil {
 		return false
 	}
+	value, _ := s.tenantPoolLeaderReconcileJobs.LoadOrStore(poolID, &tenantPoolLeaderReconcileState{})
+	state := value.(*tenantPoolLeaderReconcileState)
+	if !state.request() {
+		return true
+	}
+	job := tenantPoolReconcileJob{run: run, start: state.start, next: state.next, abort: state.abort}
 	select {
-	case s.tenantPoolReconcileQueue <- tenantPoolReconcileJob{run: fn}:
+	case s.tenantPoolReconcileQueue <- job:
 		return true
 	case <-ctx.Done():
+		state.abort()
 		return false
 	}
 }
@@ -110,20 +170,36 @@ func (s *Server) runTenantPoolReconcileWorker(ctx context.Context) {
 			return
 		case job = <-s.tenantPoolReconcileQueue:
 		}
-		if job.run != nil {
-			job.run(ctx)
-		}
-		rest := s.tenantPoolReconcileWorkerRest
-		if rest <= 0 {
-			rest = DefaultTenantPoolReconcileWorkerRest
-		}
-		timer := time.NewTimer(rest)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		func() {
+			if job.start != nil {
+				job.start()
+			}
+			for {
+				if job.run != nil {
+					job.run(ctx)
+				}
+				rest := s.tenantPoolReconcileWorkerRest
+				if rest <= 0 {
+					rest = DefaultTenantPoolReconcileWorkerRest
+				}
+				timer := time.NewTimer(rest)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					if job.abort != nil {
+						job.abort()
+					}
+					return
+				case <-timer.C:
+				}
+				timer.Stop()
+				if job.next == nil || !job.next() {
+					return
+				}
+			}
+		}()
+		if ctx.Err() != nil {
 			return
-		case <-timer.C:
 		}
-		timer.Stop()
 	}
 }

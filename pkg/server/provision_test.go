@@ -325,13 +325,17 @@ func TestManagedSharedDBContinuationDoesNotStartOnFollower(t *testing.T) {
 func TestManagedSharedDBResumeLoopDoesNotOverlapPasses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	started := make(chan struct{}, 2)
+	interval := 40 * time.Millisecond
+	started := make(chan time.Time, 2)
 	release := make(chan struct{}, 2)
+	completed := make(chan time.Time, 1)
 	done := make(chan struct{})
 	var running atomic.Int32
 	var maxRunning atomic.Int32
+	var attempts atomic.Int32
 	go func() {
-		runManagedSharedDBResumeLoop(ctx, 10*time.Millisecond, func(context.Context) {
+		runManagedSharedDBResumeLoop(ctx, interval, func(context.Context) {
+			attempt := attempts.Add(1)
 			current := running.Add(1)
 			for {
 				observed := maxRunning.Load()
@@ -339,8 +343,11 @@ func TestManagedSharedDBResumeLoopDoesNotOverlapPasses(t *testing.T) {
 					break
 				}
 			}
-			started <- struct{}{}
+			started <- time.Now()
 			<-release
+			if attempt == 1 {
+				completed <- time.Now()
+			}
 			running.Add(-1)
 		})
 		close(done)
@@ -350,15 +357,24 @@ func TestManagedSharedDBResumeLoopDoesNotOverlapPasses(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("initial managed shared DB resume pass did not start")
 	}
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(2 * interval)
 	select {
 	case <-started:
 		t.Fatal("managed shared DB resume loop started an overlapping pass")
 	default:
 	}
 	release <- struct{}{}
+	var firstCompletedAt time.Time
 	select {
-	case <-started:
+	case firstCompletedAt = <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("initial managed shared DB resume pass did not complete")
+	}
+	select {
+	case secondStartedAt := <-started:
+		if elapsed := secondStartedAt.Sub(firstCompletedAt); elapsed < interval {
+			t.Fatalf("second resume pass started %s after completion, want at least %s", elapsed, interval)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("managed shared DB resume loop did not run after the first pass completed")
 	}

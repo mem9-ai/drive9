@@ -2193,9 +2193,12 @@ func (s *Store) CountTenantPoolFreeSlots(ctx context.Context, organizationID str
 }
 
 // CountTenantPoolPlannedSlots counts free pending/provisioning inventory that
-// still has recent durable progress. Native plans use tenant progress; shared
-// plans use their physical db_pool heartbeat so metadata polling can renew the
-// whole partition without rewriting every tenant row.
+// still has recent durable progress. Native plans use tenant progress. Shared
+// plans include assigned free tenants plus recently staged managed physical
+// pools whose tenant placement has not started. Once tenant_count is non-zero,
+// only durable memberships count: db_pool does not persist a wave's intended
+// partial fill, so treating all remaining physical capacity as planned could
+// suppress required tenant-pool replenishment.
 func (s *Store) CountTenantPoolPlannedSlots(ctx context.Context, organizationID string, progressCutoff time.Time) (out int, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "count_tidbcloud_pool_planned_slots", start, &err)
@@ -2220,12 +2223,19 @@ func (s *Store) CountTenantPoolPlannedSlots(ctx context.Context, organizationID 
 			STRAIGHT_JOIN tenant_placements p ON p.fs_id = f.fs_id
 			STRAIGHT_JOIN db_pool d ON d.db_id = p.db_id
 			WHERE m.tidbcloud_organization_id = ? AND m.pool_status = ? AND t.provider = ?
-				AND t.status IN (?, ?) AND d.status IN (?, ?) AND d.updated_at >= ?
+				AND t.status IN (?, ?) AND d.status IN (?, ?, ?) AND d.updated_at >= ?
+		UNION ALL
+		SELECT COALESCE(SUM(GREATEST(d.max_tenants - d.tenant_count, 0)), 0) AS slot_count
+			FROM db_pool d
+			WHERE d.org_id = ? AND d.`+"`role`"+` = ? AND d.provisioning_key IS NOT NULL
+				AND d.status IN (?, ?) AND d.tenant_count = 0
+				AND d.updated_at >= ? AND d.max_tenants > 0
 	) inventory`,
 		organizationID, TenantPoolBindingFree, tidbCloudNativeProvider,
 		TenantPending, TenantProvisioning, progressCutoff.UTC(),
 		organizationID, TenantPoolBindingFree, tidbCloudNativeSharedProvider,
-		TenantPending, TenantProvisioning, SharedDBStatusPending, SharedDBStatusProvisioning, progressCutoff.UTC())
+		TenantPending, TenantProvisioning, SharedDBStatusPending, SharedDBStatusProvisioning, SharedDBStatusActive, progressCutoff.UTC(),
+		organizationID, SharedDBRoleShared, SharedDBStatusPending, SharedDBStatusProvisioning, progressCutoff.UTC())
 	if err = row.Scan(&out); err != nil {
 		return 0, err
 	}
