@@ -197,31 +197,83 @@ const sharedDBSelectColumns = "db_id, uuid, org_id, cluster_id, provisioning_key
 func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id int64, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "create_managed_shared_db_pool", start, &err)
+	values, err := managedSharedDBInsertValuesFor(in)
+	if err != nil {
+		return 0, err
+	}
+	return insertManagedSharedDBPool(ctx, s.db, values)
+}
+
+// CreateManagedSharedDBPools atomically persists one complete physical refill
+// wave. A failure in any partition rolls back every plan in the wave.
+func (s *Store) CreateManagedSharedDBPools(ctx context.Context, inputs []*SharedDB) (ids []int64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "create_managed_shared_db_pools", start, &err)
+	if len(inputs) == 0 {
+		return []int64{}, nil
+	}
+	values := make([]managedSharedDBInsertValues, len(inputs))
+	for i, in := range inputs {
+		values[i], err = managedSharedDBInsertValuesFor(in)
+		if err != nil {
+			return nil, fmt.Errorf("validate managed db pool %d: %w", i, err)
+		}
+	}
+	ids = make([]int64, len(values))
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		for i := range values {
+			id, insertErr := insertManagedSharedDBPool(ctx, tx, values[i])
+			if insertErr != nil {
+				return fmt.Errorf("insert managed db pool %d: %w", i, insertErr)
+			}
+			ids[i] = id
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+type managedSharedDBInsertValues struct {
+	poolUUID        string
+	organizationID  string
+	provisioningKey []byte
+	cloudProvider   string
+	region          string
+	passwordCipher  any
+	databaseName    any
+	maxTenants      int
+	spendingLimit   int64
+}
+
+func managedSharedDBInsertValuesFor(in *SharedDB) (managedSharedDBInsertValues, error) {
 	if in == nil {
-		return 0, fmt.Errorf("shared db pool is required")
+		return managedSharedDBInsertValues{}, fmt.Errorf("shared db pool is required")
 	}
 	organizationID, err := validateSharedDBOrganizationID(in.TiDBCloudOrganizationID)
 	if err != nil {
-		return 0, err
+		return managedSharedDBInsertValues{}, err
 	}
 	poolUUID, err := sharedDBUUID(in.UUID)
 	if err != nil {
-		return 0, err
+		return managedSharedDBInsertValues{}, err
 	}
 	if len(in.ProvisioningKey) != 32 {
-		return 0, fmt.Errorf("provisioning key must be a 32-byte SHA-256 fingerprint")
+		return managedSharedDBInsertValues{}, fmt.Errorf("provisioning key must be a 32-byte SHA-256 fingerprint")
 	}
 	if in.CloudProvider == "" {
-		return 0, fmt.Errorf("cloud provider is required")
+		return managedSharedDBInsertValues{}, fmt.Errorf("cloud provider is required")
 	}
 	if in.Region == "" {
-		return 0, fmt.Errorf("region is required")
+		return managedSharedDBInsertValues{}, fmt.Errorf("region is required")
 	}
 	if in.MaxTenants <= 0 {
-		return 0, fmt.Errorf("managed max tenants must be positive")
+		return managedSharedDBInsertValues{}, fmt.Errorf("managed max tenants must be positive")
 	}
 	if in.SpendingLimit == nil || *in.SpendingLimit <= 0 || *in.SpendingLimit > int64(math.MaxInt32) {
-		return 0, fmt.Errorf("managed spending limit must be in (0,%d]", int64(math.MaxInt32))
+		return managedSharedDBInsertValues{}, fmt.Errorf("managed spending limit must be in (0,%d]", int64(math.MaxInt32))
 	}
 	var passwordCipher any
 	if len(in.PasswordCipher) != 0 {
@@ -231,17 +283,28 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 	if in.Name != "" {
 		databaseName = in.Name
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO db_pool
+	return managedSharedDBInsertValues{poolUUID: poolUUID, organizationID: organizationID,
+		provisioningKey: append([]byte(nil), in.ProvisioningKey...), cloudProvider: in.CloudProvider,
+		region: in.Region, passwordCipher: passwordCipher, databaseName: databaseName,
+		maxTenants: in.MaxTenants, spendingLimit: *in.SpendingLimit}, nil
+}
+
+type managedSharedDBExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertManagedSharedDBPool(ctx context.Context, execer managedSharedDBExecer, values managedSharedDBInsertValues) (int64, error) {
+	res, err := execer.ExecContext(ctx, `INSERT INTO db_pool
 		(uuid, org_id, provisioning_key, cloud_provider, region, `+"`role`"+`, db_tls,
 		 db_password, db_name, max_tenants, tenant_count, soft_cap_reached, spending_limit, schema_version, status)
-		VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, 0, 0, ?, 0, ?)`, poolUUID, organizationID, in.ProvisioningKey,
-		in.CloudProvider, in.Region, SharedDBRoleShared, passwordCipher, databaseName,
-		in.MaxTenants, *in.SpendingLimit,
+		VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, 0, 0, ?, 0, ?)`, values.poolUUID, values.organizationID, values.provisioningKey,
+		values.cloudProvider, values.region, SharedDBRoleShared, values.passwordCipher, values.databaseName,
+		values.maxTenants, values.spendingLimit,
 		SharedDBStatusPending)
 	if err != nil {
 		return 0, fmt.Errorf("insert managed db_pool row: %w", err)
 	}
-	id, err = res.LastInsertId()
+	id, err := res.LastInsertId()
 	if err != nil {
 		return 0, fmt.Errorf("resolve managed db_pool id: %w", err)
 	}
@@ -386,6 +449,41 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 		s.apiKeys.evictTenant(tenantID)
 	}
 	return nil
+}
+
+// TouchManagedSharedDBPools records observed Cloud progress without changing
+// lifecycle state. The expected-status guard prevents a late metadata poll
+// from refreshing a pool already failed by the watchdog.
+func (s *Store) TouchManagedSharedDBPools(ctx context.Context, dbIDs []int64, expectedStatus string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "touch_managed_shared_db_pools", start, &err)
+	if expectedStatus != SharedDBStatusPending && expectedStatus != SharedDBStatusProvisioning {
+		return fmt.Errorf("unsupported shared db heartbeat status %q", expectedStatus)
+	}
+	ids := make([]int64, 0, len(dbIDs))
+	seen := make(map[int64]struct{}, len(dbIDs))
+	for _, dbID := range dbIDs {
+		if dbID <= 0 {
+			continue
+		}
+		if _, ok := seen[dbID]; ok {
+			continue
+		}
+		seen[dbID] = struct{}{}
+		ids = append(ids, dbID)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, 0, 3+len(ids))
+	args = append(args, time.Now().UTC(), SharedDBRoleShared, expectedStatus)
+	for _, dbID := range ids {
+		args = append(args, dbID)
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE db_pool SET updated_at = ?
+		WHERE `+"`role`"+` = ? AND status = ? AND db_id IN (`+placeholders+`)`, args...)
+	return err
 }
 
 // PrepareManagedSharedDBPoolRoot durably stores the root credential and
@@ -636,6 +734,29 @@ func (s *Store) ClearFailedSharedDBPoolClusterID(ctx context.Context, dbID int64
 	}
 	affected, err := res.RowsAffected()
 	return affected == 1, err
+}
+
+// RepairFailedSharedDBPoolTenantCountIfEmpty repairs denormalized positive
+// drift only when the authoritative placement set is empty.
+func (s *Store) RepairFailedSharedDBPoolTenantCountIfEmpty(ctx context.Context, dbID int64) (repaired bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "repair_failed_shared_db_pool_tenant_count", start, &err)
+	if dbID <= 0 {
+		return false, fmt.Errorf("db_id must be positive")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE db_pool
+		SET tenant_count = 0, soft_cap_reached = 0, updated_at = ?
+		WHERE db_id = ? AND role = ? AND status = ? AND tenant_count <> 0
+			AND NOT EXISTS (SELECT 1 FROM tenant_placements p WHERE p.db_id = db_pool.db_id)`,
+		time.Now().UTC(), dbID, SharedDBRoleShared, SharedDBStatusFailed)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
 }
 
 // DeleteFailedSharedDBPoolIfEmpty removes only a locally empty failed pool

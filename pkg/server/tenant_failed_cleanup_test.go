@@ -488,6 +488,77 @@ func TestCleanupFailedManagedSharedDBPoolsDiscoversUnpersistedCloudCluster(t *te
 	}
 }
 
+func TestCleanupFailedManagedSharedDBPoolsRepairsPositiveTenantCountDrift(t *testing.T) {
+	rt, _ := newFailedCleanupRuntimeWithoutWorkers(t)
+	ctx := context.Background()
+	spendingLimit := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := rt.meta.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: failedCleanupTestOrganizationID,
+		ProvisioningKey:         bytes.Repeat([]byte{4}, 32),
+		CloudProvider:           "aws", Region: "us-east-1", MaxTenants: 100,
+		SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.meta.DB().ExecContext(ctx, `UPDATE db_pool SET status = ?, tenant_count = 7 WHERE db_id = ?`,
+		meta.SharedDBStatusFailed, dbID); err != nil {
+		t.Fatal(err)
+	}
+
+	rt.server.cleanupFailedManagedSharedDBPoolsWithCtx(ctx)
+	if _, err := rt.meta.GetSharedDB(ctx, dbID); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("GetSharedDB after drift repair cleanup error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestCleanupFailedManagedSharedDBPoolsDeletesEveryAmbiguousUUIDMatch(t *testing.T) {
+	rt, _ := newFailedCleanupRuntimeWithoutWorkers(t)
+	ctx := context.Background()
+	spendingLimit := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := rt.meta.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: failedCleanupTestOrganizationID,
+		ProvisioningKey:         bytes.Repeat([]byte{5}, 32),
+		CloudProvider:           "aws", Region: "us-east-1", MaxTenants: 100,
+		SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := rt.meta.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.MarkSharedDBPoolFailed(ctx, dbID); err != nil {
+		t.Fatal(err)
+	}
+	rt.prov.sharedPoolListFunc = func(gotDBID int64, gotUUID string) ([]*tenant.SharedDBPoolInfo, error) {
+		if gotDBID != dbID || gotUUID != pool.UUID {
+			t.Fatalf("list request = (%d,%q), want (%d,%q)", gotDBID, gotUUID, dbID, pool.UUID)
+		}
+		return []*tenant.SharedDBPoolInfo{
+			{DBPoolID: dbID, DBPoolUUID: pool.UUID, ClusterID: "cluster-duplicate-a"},
+			{DBPoolID: dbID, DBPoolUUID: pool.UUID, ClusterID: "cluster-duplicate-b"},
+		}, nil
+	}
+	seen := make(map[string]bool)
+	rt.prov.deprovisionHook = func(_ int, cluster *tenant.ClusterInfo) error {
+		seen[cluster.ClusterID] = true
+		return nil
+	}
+
+	rt.server.cleanupFailedManagedSharedDBPoolsWithCtx(ctx)
+	if got := rt.prov.deprovisionCalls.Load(); got != 2 {
+		t.Fatalf("deprovision calls = %d, want both ambiguous matches", got)
+	}
+	if !seen["cluster-duplicate-a"] || !seen["cluster-duplicate-b"] {
+		t.Fatalf("deprovisioned clusters = %v", seen)
+	}
+	if _, err := rt.meta.GetSharedDB(ctx, dbID); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("GetSharedDB after ambiguous cleanup error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestCleanupFailedOrganizationTenantsSharedActiveDBPurgesScopedData(t *testing.T) {
 	rt, db := newFailedCleanupRuntimeWithoutWorkers(t)
 	ctx := context.Background()

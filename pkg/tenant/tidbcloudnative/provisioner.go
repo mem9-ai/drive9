@@ -717,6 +717,44 @@ func (p *Provisioner) LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoo
 	return p.sharedDBPoolInfoFromCluster(dbPoolID, wantUUID, &matches[0])
 }
 
+// ListSharedDBPoolsWithCredentials returns all exact managed label matches for
+// one durable pool UUID, including resources whose endpoint metadata is still
+// incomplete.
+func (p *Provisioner) ListSharedDBPoolsWithCredentials(ctx context.Context, dbPoolID int64, dbPoolUUID string, req tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	if dbPoolID <= 0 {
+		return nil, fmt.Errorf("db pool id must be positive")
+	}
+	parsedUUID, err := uuid.Parse(strings.TrimSpace(dbPoolUUID))
+	if err != nil {
+		return nil, fmt.Errorf("db pool %d has invalid uuid %q: %w", dbPoolID, dbPoolUUID, err)
+	}
+	wantUUID := parsedUUID.String()
+	infos, err := p.listClusterInfosWithCredentials(ctx, publicKey, privateKey, nil, 100)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*tenant.SharedDBPoolInfo, 0)
+	for i := range infos {
+		if !strings.EqualFold(strings.TrimSpace(infos[i].Labels[Drive9DBPoolUUIDLabel]), wantUUID) ||
+			strings.TrimSpace(infos[i].Labels[Drive9ManagedLabel]) != "true" ||
+			strings.TrimSpace(infos[i].Labels[Drive9ProviderLabel]) != tenant.ProviderTiDBCloudNativeShared {
+			continue
+		}
+		row, convertErr := p.sharedDBPoolInfoFromCluster(dbPoolID, wantUUID, &infos[i])
+		if convertErr != nil {
+			return nil, convertErr
+		}
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ClusterID < out[j].ClusterID })
+	return out, nil
+}
+
 // BatchLoadSharedDBPoolsWithCredentials refreshes known managed clusters and
 // discovers requests without a cluster ID by durable DB-pool UUID. Incomplete
 // endpoint/user metadata is returned with empty connection fields so callers

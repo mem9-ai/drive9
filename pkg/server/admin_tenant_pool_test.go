@@ -130,6 +130,16 @@ func TestTenantPoolClaimUsesNativeInventoryBeforeExternalSharedPool(t *testing.T
 	if res.TenantID != nativeTenantID || res.Provider != tenant.ProviderTiDBCloudNative {
 		t.Fatalf("claimed result = %+v, want native tenant %s", res, nativeTenantID)
 	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, ok := rt.server.tenantPoolReplenishJobs.Load("pool-mixed-inventory"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("native request did not trigger request-scoped tenant-pool replenishment")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestTenantPoolClaimConsumesMixedInventoryInGlobalAgeOrder(t *testing.T) {
@@ -194,6 +204,9 @@ func TestTenantPoolClaimConsumesMixedInventoryInGlobalAgeOrder(t *testing.T) {
 	}
 	if first.TenantID != nativeTenantID || first.Provider != tenant.ProviderTiDBCloudNative {
 		t.Fatalf("first claim = %+v, want older native tenant %s", first, nativeTenantID)
+	}
+	if _, ok := rt.server.tenantPoolReplenishJobs.Load("pool-mixed-age"); ok {
+		t.Fatal("shared-default request unexpectedly triggered bulk tenant-pool replenishment")
 	}
 	second, _, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx, cred, nil)
 	if err != nil || !claimed {
@@ -1586,6 +1599,80 @@ func TestSharedTenantPoolLeaderReconcilerRefillsZeroInventory(t *testing.T) {
 	}
 }
 
+func TestSharedTenantPoolRefillReplacesExpiredPlannedCapacity(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(func() { poolManager.Close() })
+	poolManager.SetMetaStore(metaStore)
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1"}
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, SharedDBMaxTenants: 1,
+		ManagedSharedDBPlannedCapacityLease: time.Minute, TokenSecret: make([]byte, 32),
+		Leader: newFollowerLeaderManager(t, metaStore)})
+	t.Cleanup(func() { srv.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC()
+	logicalPool := &meta.TenantPool{PoolID: "pool-expired-plan", OrganizationID: "org-expired-plan",
+		Size: 1, Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now}
+	if err := metaStore.CreateTenantPool(ctx, logicalPool); err != nil {
+		t.Fatalf("CreateTenantPool: %v", err)
+	}
+	spendingLimit := int64(meta.MaxTiDBCloudSpendingLimit)
+	dbID, err := metaStore.CreateManagedSharedDBPool(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: logicalPool.OrganizationID, ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 1, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	tenantID := "tenant-expired-plan"
+	if err := srv.insertPendingPoolTenant(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared, now); err != nil {
+		t.Fatalf("insertPendingPoolTenant: %v", err)
+	}
+	fsID, err := metaStore.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	if err := metaStore.CompleteSharedTenantPoolMember(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared,
+		&meta.TenantPlacement{FsID: fsID, DbID: dbID, Placement: meta.PlacementShared, SchemaShape: meta.SchemaShapeShared},
+		&meta.TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: logicalPool.OrganizationID,
+			PoolID: logicalPool.PoolID, PoolStatus: meta.TenantPoolBindingFree}); err != nil {
+		t.Fatalf("CompleteSharedTenantPoolMember: %v", err)
+	}
+	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, now.Add(-2*time.Minute), dbID); err != nil {
+		t.Fatalf("age planned pool: %v", err)
+	}
+
+	srv.replenishTenantPoolAsync(ctx, logicalPool, tenant.CredentialProvisionRequest{})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var physicalPools int
+		if err := metaStore.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, logicalPool.OrganizationID).Scan(&physicalPools); err != nil {
+			t.Fatalf("count physical pools: %v", err)
+		}
+		if physicalPools >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("physical pools = %d, want replacement for expired planned capacity", physicalPools)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestLeaderTenantPoolReplenishmentDoesNotStartOnFollower(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -1594,61 +1681,98 @@ func TestLeaderTenantPoolReplenishmentDoesNotStartOnFollower(t *testing.T) {
 	t.Cleanup(func() { _ = metaStore.Close() })
 	mgr := leader.NewManager(metaStore.DB())
 	srv := &Server{
-		leader: mgr, tenantPoolReconcileSlots: make(chan struct{}, 1),
+		leader: mgr, tenantPoolReconcileQueue: make(chan tenantPoolReconcileJob),
 		leaderWorkersStarted: true, leaderWorkerCtx: context.Background(),
 	}
-	srv.replenishTenantPoolLeaderAsync(context.Background(), &meta.TenantPool{
+	if srv.enqueueTenantPoolLeaderReplenishment(context.Background(), &meta.TenantPool{
 		PoolID: "pool-follower", OrganizationID: "org-follower", Size: 1, Status: meta.TenantPoolActive,
-	}, tenant.CredentialProvisionRequest{})
-	value, ok := srv.tenantPoolReplenishJobs.Load("pool-follower")
-	if !ok {
-		t.Fatal("follower trigger did not initialize its local coalescing gate")
+	}, tenant.CredentialProvisionRequest{}) {
+		t.Fatal("follower unexpectedly queued leader refill work")
 	}
-	gate := value.(*tenantPoolWorkGate)
-	gate.mu.Lock()
-	running := gate.running
-	gate.mu.Unlock()
-	if running || len(srv.tenantPoolReconcileSlots) != 0 {
-		t.Fatalf("follower refill running=%v slots=%d, want no leader-owned work", running, len(srv.tenantPoolReconcileSlots))
+	if _, ok := srv.tenantPoolReplenishJobs.Load("pool-follower"); ok {
+		t.Fatal("leader refill unexpectedly initialized the request-side per-pool gate")
 	}
 }
 
-func TestTenantPoolLeaderReconcileWorkersBoundConcurrency(t *testing.T) {
+func TestTenantPoolLeaderReconcileWorkersQueueAndRestBetweenTasks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	srv := &Server{forkWorkerCtx: ctx, tenantPoolReconcileSlots: make(chan struct{}, 1)}
+	rest := 40 * time.Millisecond
+	srv := &Server{tenantPoolReconcileQueue: make(chan tenantPoolReconcileJob), tenantPoolReconcileWorkerRest: rest}
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		srv.runTenantPoolReconcileWorker(ctx)
+	}()
 	firstStarted := make(chan struct{}, 1)
 	release := make(chan struct{})
-	if !srv.startTenantPoolLeaderReconcileWorker(ctx, func(context.Context) {
+	if !srv.enqueueTenantPoolReconcileWork(ctx, func(context.Context) {
 		firstStarted <- struct{}{}
 		<-release
 	}) {
-		t.Fatal("first leader reconcile worker did not start")
+		t.Fatal("first leader reconcile task was not queued")
 	}
 	<-firstStarted
 	secondStarted := make(chan struct{}, 1)
-	secondResult := make(chan bool, 1)
+	secondQueued := make(chan bool, 1)
 	go func() {
-		secondResult <- srv.startTenantPoolLeaderReconcileWorker(ctx, func(context.Context) {
+		secondQueued <- srv.enqueueTenantPoolReconcileWork(ctx, func(context.Context) {
 			secondStarted <- struct{}{}
 		})
 	}()
 	select {
-	case result := <-secondResult:
-		t.Fatalf("second leader reconcile returned %v while the only slot was occupied", result)
-	case <-time.After(50 * time.Millisecond):
+	case <-secondQueued:
+		t.Fatal("second task left the queue while the only worker was occupied")
+	case <-time.After(20 * time.Millisecond):
 	}
+	releasedAt := time.Now()
 	close(release)
 	select {
-	case result := <-secondResult:
-		if !result {
-			t.Fatal("second leader reconcile did not start after a slot was released")
+	case <-secondStarted:
+		if elapsed := time.Since(releasedAt); elapsed < rest {
+			t.Fatalf("queued task started after %s, want worker rest of at least %s", elapsed, rest)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("second leader reconcile remained blocked after a slot was released")
+		t.Fatal("queued task did not start after the first worker rested")
 	}
-	<-secondStarted
-	srv.forkWorkerWG.Wait()
+	if queued := <-secondQueued; !queued {
+		t.Fatal("second leader reconcile task was not queued")
+	}
+	cancel()
+	select {
+	case <-workerDone:
+	case <-time.After(time.Second):
+		t.Fatal("tenant-pool reconcile worker did not stop")
+	}
+}
+
+func TestTenantPoolLeaderReconcileAllowsSamePoolAcrossScans(t *testing.T) {
+	srv := &Server{tenantPoolReconcileQueue: make(chan tenantPoolReconcileJob)}
+	pool := &meta.TenantPool{PoolID: "pool-repeated-scan", OrganizationID: "org-repeated-scan", Size: 100}
+	queued := make(chan bool, 2)
+	for range 2 {
+		go func() {
+			queued <- srv.enqueueTenantPoolLeaderReplenishment(context.Background(), pool, tenant.CredentialProvisionRequest{})
+		}()
+	}
+	for range 2 {
+		select {
+		case job := <-srv.tenantPoolReconcileQueue:
+			if job.run == nil {
+				t.Fatal("queued leader refill has no work")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("same pool was coalesced across leader scans")
+		}
+	}
+	for range 2 {
+		if ok := <-queued; !ok {
+			t.Fatal("same-pool leader refill was not queued")
+		}
+	}
+	if _, ok := srv.tenantPoolReplenishJobs.Load(pool.PoolID); ok {
+		t.Fatal("leader refill unexpectedly used the request-side per-pool gate")
+	}
 }
 
 func TestManagedSharedDBStuckReconcilerFailsPoolAndPlacedTenant(t *testing.T) {
@@ -1794,7 +1918,7 @@ func TestManagedSharedDBReplenishSubmitsWholePhysicalPoolWaveConcurrently(t *tes
 	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
 	defer poolManager.Close()
 	poolManager.SetMetaStore(metaStore)
-	batchStarted := make(chan struct{}, 5)
+	batchStarted := make(chan struct{}, 1)
 	batchRelease := make(chan struct{})
 	prov := &fakeProvisioner{
 		provider:               tenant.ProviderTiDBCloudNative,
@@ -1807,7 +1931,7 @@ func TestManagedSharedDBReplenishSubmitsWholePhysicalPoolWaveConcurrently(t *tes
 	srv := &Server{
 		meta: metaStore, pool: poolManager, provisioner: prov,
 		defaultTenantProvider: tenant.ProviderTiDBCloudNativeShared,
-		sharedDBMaxTenants:    1, managedSharedDBRefillPoolLimit: 50, managedSharedDBCloudBatchSize: 10,
+		sharedDBMaxTenants:    1, managedSharedDBCloudBatchSize: 50,
 		tenantPoolRefillFreeRatio: DefaultTenantPoolRefillFreeRatio,
 		forkWorkerCtx:             workerCtx, forkWorkerCancel: cancel,
 	}
@@ -1845,12 +1969,10 @@ func TestManagedSharedDBReplenishSubmitsWholePhysicalPoolWaveConcurrently(t *tes
 
 	srv.replenishTenantPoolAsyncWithStarters(context.Background(), logicalPool,
 		tenant.CredentialProvisionRequest{}, workStarter, timerStarter)
-	for i := 0; i < 5; i++ {
-		select {
-		case <-batchStarted:
-		case <-time.After(3 * time.Second):
-			t.Fatalf("started %d/5 Cloud batches before release", i)
-		}
+	select {
+	case <-batchStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Cloud batch did not start")
 	}
 	releaseBatches()
 	select {
@@ -1858,8 +1980,8 @@ func TestManagedSharedDBReplenishSubmitsWholePhysicalPoolWaveConcurrently(t *tes
 	case <-time.After(10 * time.Second):
 		t.Fatal("whole-wave replenish did not finish")
 	}
-	if got := prov.sharedPoolBatchCalls.Load(); got != 5 {
-		t.Fatalf("Cloud batch calls = %d, want 5", got)
+	if got := prov.sharedPoolBatchCalls.Load(); got != 1 {
+		t.Fatalf("Cloud batch calls = %d, want 1", got)
 	}
 	if got := prov.sharedPoolBatchMembers.Load(); got != 50 {
 		t.Fatalf("Cloud batch members = %d, want 50", got)

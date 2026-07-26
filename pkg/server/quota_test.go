@@ -66,6 +66,7 @@ type quotaTestProvisioner struct {
 	metadataBatchWaitHook       func(call int, clusters []*tenant.ClusterInfo)
 	metadataWaitErr             error
 	sharedPoolLoadFunc          func(int64, string, string) (*tenant.SharedDBPoolInfo, error)
+	sharedPoolListFunc          func(int64, string) ([]*tenant.SharedDBPoolInfo, error)
 	calls                       []string
 }
 
@@ -74,6 +75,20 @@ func (p *quotaTestProvisioner) LoadSharedDBPoolWithCredentials(_ context.Context
 		return nil, nil
 	}
 	return p.sharedPoolLoadFunc(dbPoolID, dbPoolUUID, clusterID)
+}
+
+func (p *quotaTestProvisioner) ListSharedDBPoolsWithCredentials(_ context.Context, dbPoolID int64, dbPoolUUID string, _ tenant.CredentialProvisionRequest) ([]*tenant.SharedDBPoolInfo, error) {
+	if p.sharedPoolListFunc != nil {
+		return p.sharedPoolListFunc(dbPoolID, dbPoolUUID)
+	}
+	if p.sharedPoolLoadFunc == nil {
+		return nil, nil
+	}
+	row, err := p.sharedPoolLoadFunc(dbPoolID, dbPoolUUID, "")
+	if err != nil || row == nil {
+		return nil, err
+	}
+	return []*tenant.SharedDBPoolInfo{row}, nil
 }
 
 func (p *quotaTestProvisioner) recordCall(name string, req tenant.CredentialProvisionRequest, cluster *tenant.ClusterInfo, opts *tenant.QuotaUpdateOptions) {

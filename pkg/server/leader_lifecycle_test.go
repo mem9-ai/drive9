@@ -314,3 +314,39 @@ func TestLeaderGatedWorkersOnLoseRacesOnLead(t *testing.T) {
 		srv.Close()
 	}
 }
+
+func TestStopLeaderWorkersDoesNotHoldLifecycleLockWhileWaiting(t *testing.T) {
+	mgr := leader.NewManager(nil, leader.WithDisabled())
+	mgr.Start(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := &Server{
+		leader:               mgr,
+		leaderWorkersStarted: true,
+		leaderWorkerCtx:      ctx,
+		leaderWorkerCancel:   cancel,
+	}
+	srv.leaderWorkerWG.Add(1)
+	workerExiting := make(chan struct{})
+	go func() {
+		defer srv.leaderWorkerWG.Done()
+		<-ctx.Done()
+		close(workerExiting)
+		_ = srv.startManagedSharedDBWorker(ctx, func(context.Context) {})
+	}()
+
+	stopped := make(chan struct{})
+	go func() {
+		srv.stopLeaderWorkers()
+		close(stopped)
+	}()
+	select {
+	case <-workerExiting:
+	case <-time.After(time.Second):
+		t.Fatal("leader worker was not cancelled")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("stopLeaderWorkers deadlocked while an exiting worker checked leader admission")
+	}
+}

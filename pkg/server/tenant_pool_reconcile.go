@@ -12,6 +12,10 @@ import (
 
 const tenantPoolReconcilePageSize = 100
 
+type tenantPoolReconcileJob struct {
+	run func(context.Context)
+}
+
 func (s *Server) reconcileStuckManagedSharedDBPoolsWithCtx(ctx context.Context) {
 	if s.meta == nil {
 		return
@@ -75,7 +79,9 @@ func (s *Server) reconcileSharedTenantPoolsWithCtx(ctx context.Context) {
 			return
 		}
 		for _, pool := range pools {
-			s.replenishTenantPoolLeaderAsync(ctx, pool, tenant.CredentialProvisionRequest{})
+			if !s.enqueueTenantPoolLeaderReplenishment(ctx, pool, tenant.CredentialProvisionRequest{}) {
+				return
+			}
 		}
 		if len(pools) < tenantPoolReconcilePageSize {
 			return
@@ -84,21 +90,40 @@ func (s *Server) reconcileSharedTenantPoolsWithCtx(ctx context.Context) {
 	}
 }
 
-func (s *Server) startTenantPoolLeaderReconcileWorker(ctx context.Context, fn func(context.Context)) bool {
-	if s.tenantPoolReconcileSlots == nil {
+func (s *Server) enqueueTenantPoolReconcileWork(ctx context.Context, fn func(context.Context)) bool {
+	if s.tenantPoolReconcileQueue == nil || fn == nil {
 		return false
 	}
 	select {
-	case s.tenantPoolReconcileSlots <- struct{}{}:
+	case s.tenantPoolReconcileQueue <- tenantPoolReconcileJob{run: fn}:
+		return true
 	case <-ctx.Done():
 		return false
 	}
-	started := s.startManagedSharedDBWorker(ctx, func(workerCtx context.Context) {
-		defer func() { <-s.tenantPoolReconcileSlots }()
-		fn(workerCtx)
-	})
-	if !started {
-		<-s.tenantPoolReconcileSlots
+}
+
+func (s *Server) runTenantPoolReconcileWorker(ctx context.Context) {
+	for {
+		var job tenantPoolReconcileJob
+		select {
+		case <-ctx.Done():
+			return
+		case job = <-s.tenantPoolReconcileQueue:
+		}
+		if job.run != nil {
+			job.run(ctx)
+		}
+		rest := s.tenantPoolReconcileWorkerRest
+		if rest <= 0 {
+			rest = DefaultTenantPoolReconcileWorkerRest
+		}
+		timer := time.NewTimer(rest)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		timer.Stop()
 	}
-	return started
 }

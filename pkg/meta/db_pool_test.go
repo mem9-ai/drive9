@@ -59,6 +59,29 @@ func TestSharedDBCapacityBounds(t *testing.T) {
 	}
 }
 
+func TestCreateManagedSharedDBPoolsRollsBackWholeWave(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	duplicateUUID := "8a347c9f-6f08-49e9-a459-25bef73cbf2f"
+	inputs := []*SharedDB{
+		{UUID: duplicateUUID, TiDBCloudOrganizationID: "org-atomic-wave", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit},
+		{UUID: duplicateUUID, TiDBCloudOrganizationID: "org-atomic-wave", ProvisioningKey: bytes.Repeat([]byte{2}, 32),
+			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit},
+	}
+	if _, err := s.CreateManagedSharedDBPools(ctx, inputs); err == nil {
+		t.Fatal("CreateManagedSharedDBPools succeeded with a duplicate UUID inside the wave")
+	}
+	var rows int
+	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, "org-atomic-wave").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("physical plans after failed wave = %d, want atomic rollback", rows)
+	}
+}
+
 func TestSharedDBReopenThresholdForRatio(t *testing.T) {
 	got, err := SharedDBReopenThresholdForRatio(10, 0.65)
 	if err != nil {
@@ -355,6 +378,112 @@ func TestMarkStuckSharedDBPoolFailedUsesStatusAndUpdatedAtCAS(t *testing.T) {
 	}
 	if result, changed, err := s.MarkStuckSharedDBPoolFailed(ctx, dbID, SharedDBStatusProvisioning, cutoff); err != nil || changed || result != nil {
 		t.Fatalf("wrong-status result=%+v changed=%v err=%v, want unchanged", result, changed, err)
+	}
+}
+
+func TestCountTenantPoolPlannedSlotsUsesSharedPoolProgressLease(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	cutoff := now.Add(-time.Minute)
+	for i, updatedAt := range []time.Time{cutoff.Add(time.Second), cutoff.Add(-time.Second)} {
+		dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+			TiDBCloudOrganizationID: "org-planned-lease", ProvisioningKey: bytes.Repeat([]byte{byte(i + 1)}, 32),
+			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+		})
+		if err != nil {
+			t.Fatalf("CreateManagedSharedDBPool %d: %v", i, err)
+		}
+		tenantID := fmt.Sprintf("tenant-planned-lease-%d", i)
+		seedPendingTenant(t, s, tenantID)
+		fsID, err := s.EnsureFsID(ctx, tenantID)
+		if err != nil {
+			t.Fatalf("EnsureFsID %d: %v", i, err)
+		}
+		if err := s.CompleteSharedTenantPoolMember(ctx, tenantID, tidbCloudNativeSharedProvider,
+			&TenantPlacement{FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared},
+			&TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: "org-planned-lease",
+				PoolID: "logical-planned-lease", PoolStatus: TenantPoolBindingFree}); err != nil {
+			t.Fatalf("CompleteSharedTenantPoolMember %d: %v", i, err)
+		}
+		if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, updatedAt, dbID); err != nil {
+			t.Fatalf("set db_pool updated_at %d: %v", i, err)
+		}
+	}
+
+	planned, err := s.CountTenantPoolPlannedSlots(ctx, "org-planned-lease", cutoff)
+	if err != nil {
+		t.Fatalf("CountTenantPoolPlannedSlots: %v", err)
+	}
+	if planned != 1 {
+		t.Fatalf("planned slots = %d, want only the unexpired shared plan", planned)
+	}
+}
+
+func TestTouchManagedSharedDBPoolsHeartbeatsOnlyExpectedStatus(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	ids := make([]int64, 0, 2)
+	for i := 0; i < 2; i++ {
+		dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+			TiDBCloudOrganizationID: fmt.Sprintf("org-heartbeat-%d", i), ProvisioningKey: bytes.Repeat([]byte{byte(i + 1)}, 32),
+			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, dbID)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ? WHERE db_id = ?`, SharedDBStatusFailed, ids[1]); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id IN (?, ?)`, old, ids[0], ids[1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TouchManagedSharedDBPools(ctx, ids, SharedDBStatusPending); err != nil {
+		t.Fatalf("TouchManagedSharedDBPools: %v", err)
+	}
+	for i, dbID := range ids {
+		row, err := s.GetSharedDB(ctx, dbID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 && !row.UpdatedAt.After(old) {
+			t.Fatalf("pending pool updated_at = %s, want heartbeat after %s", row.UpdatedAt, old)
+		}
+		if i == 1 && !row.UpdatedAt.Equal(old) {
+			t.Fatalf("failed pool updated_at = %s, want unchanged %s", row.UpdatedAt, old)
+		}
+	}
+}
+
+func TestRepairFailedSharedDBPoolTenantCountUsesPlacementsAsTruth(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-count-repair", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ?, tenant_count = 7 WHERE db_id = ?`, SharedDBStatusFailed, dbID); err != nil {
+		t.Fatal(err)
+	}
+	repaired, err := s.RepairFailedSharedDBPoolTenantCountIfEmpty(ctx, dbID)
+	if err != nil || !repaired {
+		t.Fatalf("RepairFailedSharedDBPoolTenantCountIfEmpty repaired=%v err=%v", repaired, err)
+	}
+	row, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.TenantCount != 0 {
+		t.Fatalf("tenant_count = %d, want repaired to zero", row.TenantCount)
 	}
 }
 

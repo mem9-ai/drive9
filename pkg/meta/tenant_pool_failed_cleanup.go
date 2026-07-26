@@ -71,7 +71,7 @@ func (s *Store) ListFailedSharedTenantCleanupCandidates(ctx context.Context, org
 			FROM tenant_pool_memberships m
 			JOIN tenants t ON t.id = m.tenant_id
 			WHERE m.tidbcloud_organization_id = ? AND m.pool_status = ?
-				AND t.provider = ? AND t.status = ? AND t.updated_at <= ?
+				AND t.provider = ? AND t.status IN (?, ?) AND t.updated_at <= ?
 
 			UNION ALL
 
@@ -86,12 +86,12 @@ func (s *Store) ListFailedSharedTenantCleanupCandidates(ctx context.Context, org
 			JOIN tenants t ON t.id = f.tenant_id
 			LEFT JOIN tenant_pool_memberships m ON m.tenant_id = t.id
 			WHERE d.org_id = ? AND m.tenant_id IS NULL
-				AND t.provider = ? AND t.status = ? AND t.updated_at <= ?
+				AND t.provider = ? AND t.status IN (?, ?) AND t.updated_at <= ?
 		) c
 		ORDER BY c.updated_at ASC, c.id ASC
 		LIMIT ?`, organizationID, TenantPoolBindingFree, tidbCloudNativeSharedProvider,
-		TenantFailed, updatedBefore.UTC(), organizationID, tidbCloudNativeSharedProvider,
-		TenantFailed, updatedBefore.UTC(), limit)
+		TenantFailed, TenantDeleting, updatedBefore.UTC(), organizationID, tidbCloudNativeSharedProvider,
+		TenantFailed, TenantDeleting, updatedBefore.UTC(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list failed shared tenant cleanup candidates: %w", err)
 	}
@@ -121,10 +121,10 @@ func (s *Store) ListFailedSharedTenantCleanupCandidatesByDB(ctx context.Context,
 		JOIN tenants t ON t.id = f.tenant_id
 		JOIN db_pool d ON d.db_id = p.db_id
 		WHERE p.db_id = ? AND d.role = ? AND d.status = ?
-			AND t.provider = ? AND t.status = ? AND t.updated_at <= ?
+			AND t.provider = ? AND t.status IN (?, ?) AND t.updated_at <= ?
 		ORDER BY t.updated_at ASC, t.id ASC
 		LIMIT ?`, dbID, SharedDBRoleShared, SharedDBStatusFailed,
-		tidbCloudNativeSharedProvider, TenantFailed, updatedBefore.UTC(), limit)
+		tidbCloudNativeSharedProvider, TenantFailed, TenantDeleting, updatedBefore.UTC(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list failed shared tenant cleanup candidates for db pool %d: %w", dbID, err)
 	}
@@ -205,7 +205,7 @@ func (s *Store) MarkFailedSharedTenantDeleting(ctx context.Context, tenantID, or
 		var lockedTenantID string
 		if err := tx.QueryRowContext(ctx, `SELECT t.id
 			FROM tenants t
-			WHERE t.id = ? AND t.provider = ? AND t.status = ? AND t.updated_at <= ?
+			WHERE t.id = ? AND t.provider = ? AND t.status IN (?, ?) AND t.updated_at <= ?
 				AND (
 					EXISTS (
 						SELECT 1 FROM tenant_pool_memberships m
@@ -226,13 +226,13 @@ func (s *Store) MarkFailedSharedTenantDeleting(ctx context.Context, tenantID, or
 						)
 					)
 				)
-			LIMIT 1 FOR UPDATE`, tenantID, tidbCloudNativeSharedProvider, TenantFailed,
+			LIMIT 1 FOR UPDATE`, tenantID, tidbCloudNativeSharedProvider, TenantFailed, TenantDeleting,
 			updatedBefore.UTC(), TenantPoolBindingFree, organizationID, organizationID).Scan(&lockedTenantID); err != nil {
 			return err
 		}
 		res, err := tx.ExecContext(ctx, `UPDATE tenants t
 			SET t.status = ?, t.updated_at = ?
-			WHERE t.id = ? AND t.provider = ? AND t.status = ? AND t.updated_at <= ?
+			WHERE t.id = ? AND t.provider = ? AND t.status IN (?, ?) AND t.updated_at <= ?
 				AND (
 					EXISTS (
 						SELECT 1 FROM tenant_pool_memberships m
@@ -253,7 +253,7 @@ func (s *Store) MarkFailedSharedTenantDeleting(ctx context.Context, tenantID, or
 						)
 					)
 				)`, TenantDeleting, time.Now().UTC(), lockedTenantID,
-			tidbCloudNativeSharedProvider, TenantFailed, updatedBefore.UTC(), TenantPoolBindingFree,
+			tidbCloudNativeSharedProvider, TenantFailed, TenantDeleting, updatedBefore.UTC(), TenantPoolBindingFree,
 			organizationID, organizationID)
 		if err != nil {
 			return err

@@ -2192,6 +2192,46 @@ func (s *Store) CountTenantPoolFreeSlots(ctx context.Context, organizationID str
 	return s.countFreeTenantPoolBindingsByStatus(ctx, organizationID, []TenantStatus{TenantPending, TenantProvisioning, TenantActive})
 }
 
+// CountTenantPoolPlannedSlots counts free pending/provisioning inventory that
+// still has recent durable progress. Native plans use tenant progress; shared
+// plans use their physical db_pool heartbeat so metadata polling can renew the
+// whole partition without rewriting every tenant row.
+func (s *Store) CountTenantPoolPlannedSlots(ctx context.Context, organizationID string, progressCutoff time.Time) (out int, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "count_tidbcloud_pool_planned_slots", start, &err)
+	organizationID = strings.TrimSpace(organizationID)
+	if organizationID == "" {
+		return 0, fmt.Errorf("organization_id is required")
+	}
+	if progressCutoff.IsZero() {
+		return 0, fmt.Errorf("progress cutoff is required")
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(slot_count), 0) FROM (
+		SELECT COUNT(*) AS slot_count
+			FROM tenant_tidbcloud_org_bindings b
+			STRAIGHT_JOIN tenants t ON t.id = b.tenant_id
+			WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
+				AND t.status IN (?, ?) AND t.updated_at >= ?
+		UNION ALL
+		SELECT COUNT(*) AS slot_count
+			FROM tenant_pool_memberships m
+			STRAIGHT_JOIN tenants t ON t.id = m.tenant_id
+			STRAIGHT_JOIN fs_registry f ON f.tenant_id = t.id
+			STRAIGHT_JOIN tenant_placements p ON p.fs_id = f.fs_id
+			STRAIGHT_JOIN db_pool d ON d.db_id = p.db_id
+			WHERE m.tidbcloud_organization_id = ? AND m.pool_status = ? AND t.provider = ?
+				AND t.status IN (?, ?) AND d.status IN (?, ?) AND d.updated_at >= ?
+	) inventory`,
+		organizationID, TenantPoolBindingFree, tidbCloudNativeProvider,
+		TenantPending, TenantProvisioning, progressCutoff.UTC(),
+		organizationID, TenantPoolBindingFree, tidbCloudNativeSharedProvider,
+		TenantPending, TenantProvisioning, SharedDBStatusPending, SharedDBStatusProvisioning, progressCutoff.UTC())
+	if err = row.Scan(&out); err != nil {
+		return 0, err
+	}
+	return out, nil
+}
+
 const countFreeTenantPoolBindingsSQL = `SELECT COALESCE(SUM(slot_count), 0) FROM (
 	SELECT COUNT(*) AS slot_count
 		FROM tenant_tidbcloud_org_bindings b

@@ -55,11 +55,10 @@ type Config struct {
 	SharedDBReopenRatio   float64
 	SharedDBSpendingLimit int64
 	// Managed shared-pool concurrency and polling controls. Zero values use
-	// the exported defaults below. CloudBatchSize, MetadataWorkers, and
-	// MetadataBatchSize are safety-capped at their defaults; RefillPoolLimit
-	// and ProvisioningWorkers accept larger configured values.
+	// the exported defaults below. MetadataWorkers and MetadataBatchSize are
+	// safety-capped at their defaults; CloudBatchSize and ProvisioningWorkers
+	// accept larger configured values.
 	ManagedSharedDBCloudBatchSize       int
-	ManagedSharedDBRefillPoolLimit      int
 	ManagedSharedDBMetadataWorkers      int
 	ManagedSharedDBMetadataBatchSize    int
 	ManagedSharedDBMetadataPollInterval time.Duration
@@ -69,6 +68,8 @@ type Config struct {
 	// pending/provisioning status. Failed cleanup has its own low-rate worker.
 	TenantPoolReconcileInterval           time.Duration
 	TenantPoolReconcileWorkers            int
+	TenantPoolReconcileWorkerRest         time.Duration
+	ManagedSharedDBPlannedCapacityLease   time.Duration
 	ManagedSharedDBStuckTimeout           time.Duration
 	ManagedSharedDBFailedCleanupInterval  time.Duration
 	ManagedSharedDBFailedCleanupBatchSize int
@@ -210,7 +211,6 @@ type Server struct {
 	sharedDBSpendingLimit int64
 
 	managedSharedDBCloudBatchSize           int
-	managedSharedDBRefillPoolLimit          int
 	managedSharedDBMetadataWorkers          int
 	managedSharedDBMetadataBatchSize        int
 	managedSharedDBMetadataPollInterval     time.Duration
@@ -218,7 +218,9 @@ type Server struct {
 	managedSharedDBProvisioningConcurrency  int
 	tenantPoolReconcileInterval             time.Duration
 	tenantPoolReconcileWorkers              int
-	tenantPoolReconcileSlots                chan struct{}
+	tenantPoolReconcileQueue                chan tenantPoolReconcileJob
+	tenantPoolReconcileWorkerRest           time.Duration
+	managedSharedDBPlannedCapacityLease     time.Duration
 	managedSharedDBStuckTimeout             time.Duration
 	managedSharedDBMetadataSlots            chan struct{}
 	managedSharedDBProvisioningSlots        chan struct{}
@@ -277,6 +279,7 @@ type Server struct {
 	leaderWorkerWG       sync.WaitGroup
 	leaderWorkerMu       sync.Mutex
 	leaderWorkersStarted bool
+	leaderWorkerStopDone chan struct{}
 	// replayWorker and expirySweepWorker are leader-gated central quota
 	// workers owned by the server (single callback owner). Started in
 	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
@@ -359,14 +362,15 @@ const DefaultSharedDBReopenRatio = 0.8
 const DefaultManagedSharedDBSpendingLimit = int64(1_000_000)
 
 const (
-	DefaultManagedSharedDBCloudBatchSize         = 10
-	DefaultManagedSharedDBRefillPoolLimit        = 50
+	DefaultManagedSharedDBCloudBatchSize         = 50
 	DefaultManagedSharedDBMetadataWorkers        = 15
 	DefaultManagedSharedDBMetadataBatchSize      = 30
 	DefaultManagedSharedDBMetadataPollInterval   = 15 * time.Second
 	DefaultManagedSharedDBProvisioningWorkers    = 100
-	DefaultTenantPoolReconcileInterval           = 15 * time.Second
-	DefaultTenantPoolReconcileWorkers            = 10
+	DefaultTenantPoolReconcileInterval           = 5 * time.Second
+	DefaultTenantPoolReconcileWorkers            = 15
+	DefaultTenantPoolReconcileWorkerRest         = 5 * time.Second
+	DefaultManagedSharedDBPlannedCapacityLease   = time.Minute
 	DefaultManagedSharedDBStuckTimeout           = 15 * time.Minute
 	DefaultManagedSharedDBFailedCleanupInterval  = time.Minute
 	DefaultManagedSharedDBFailedCleanupBatchSize = 5
@@ -454,11 +458,6 @@ func NewWithConfig(cfg Config) *Server {
 	if managedSharedDBCloudBatchSize <= 0 {
 		managedSharedDBCloudBatchSize = DefaultManagedSharedDBCloudBatchSize
 	}
-	managedSharedDBCloudBatchSize = min(managedSharedDBCloudBatchSize, DefaultManagedSharedDBCloudBatchSize)
-	managedSharedDBRefillPoolLimit := cfg.ManagedSharedDBRefillPoolLimit
-	if managedSharedDBRefillPoolLimit <= 0 {
-		managedSharedDBRefillPoolLimit = DefaultManagedSharedDBRefillPoolLimit
-	}
 	managedSharedDBMetadataWorkers := cfg.ManagedSharedDBMetadataWorkers
 	if managedSharedDBMetadataWorkers <= 0 {
 		managedSharedDBMetadataWorkers = DefaultManagedSharedDBMetadataWorkers
@@ -489,6 +488,14 @@ func NewWithConfig(cfg Config) *Server {
 	tenantPoolReconcileWorkers := cfg.TenantPoolReconcileWorkers
 	if tenantPoolReconcileWorkers <= 0 {
 		tenantPoolReconcileWorkers = DefaultTenantPoolReconcileWorkers
+	}
+	tenantPoolReconcileWorkerRest := cfg.TenantPoolReconcileWorkerRest
+	if tenantPoolReconcileWorkerRest <= 0 {
+		tenantPoolReconcileWorkerRest = DefaultTenantPoolReconcileWorkerRest
+	}
+	managedSharedDBPlannedCapacityLease := cfg.ManagedSharedDBPlannedCapacityLease
+	if managedSharedDBPlannedCapacityLease <= 0 {
+		managedSharedDBPlannedCapacityLease = DefaultManagedSharedDBPlannedCapacityLease
 	}
 	managedSharedDBStuckTimeout := cfg.ManagedSharedDBStuckTimeout
 	if managedSharedDBStuckTimeout <= 0 {
@@ -524,7 +531,6 @@ func NewWithConfig(cfg Config) *Server {
 		sharedDBSpendingLimit: sharedDBSpendingLimit,
 
 		managedSharedDBCloudBatchSize:          managedSharedDBCloudBatchSize,
-		managedSharedDBRefillPoolLimit:         managedSharedDBRefillPoolLimit,
 		managedSharedDBMetadataWorkers:         managedSharedDBMetadataWorkers,
 		managedSharedDBMetadataBatchSize:       managedSharedDBMetadataBatchSize,
 		managedSharedDBMetadataPollInterval:    managedSharedDBMetadataPollInterval,
@@ -532,7 +538,9 @@ func NewWithConfig(cfg Config) *Server {
 		managedSharedDBProvisioningConcurrency: managedSharedDBProvisioningConcurrency,
 		tenantPoolReconcileInterval:            tenantPoolReconcileInterval,
 		tenantPoolReconcileWorkers:             tenantPoolReconcileWorkers,
-		tenantPoolReconcileSlots:               make(chan struct{}, tenantPoolReconcileWorkers),
+		tenantPoolReconcileQueue:               make(chan tenantPoolReconcileJob),
+		tenantPoolReconcileWorkerRest:          tenantPoolReconcileWorkerRest,
+		managedSharedDBPlannedCapacityLease:    managedSharedDBPlannedCapacityLease,
 		managedSharedDBStuckTimeout:            managedSharedDBStuckTimeout,
 		managedSharedDBFailedCleanupInterval:   managedSharedDBFailedCleanupInterval,
 		managedSharedDBFailedCleanupBatchSize:  managedSharedDBFailedCleanupBatchSize,
@@ -996,11 +1004,20 @@ func runManagedSharedDBResumeLoop(ctx context.Context, interval time.Duration, r
 // running. The mutex is held for the entire transition so that a concurrent
 // stopLeaderWorkers observes the fully-started worker set (not a partial one).
 func (s *Server) startLeaderWorkers() {
-	s.leaderWorkerMu.Lock()
-	defer s.leaderWorkerMu.Unlock()
-	if s.leaderWorkersStarted {
-		return
+	for {
+		s.leaderWorkerMu.Lock()
+		if s.leaderWorkersStarted {
+			s.leaderWorkerMu.Unlock()
+			return
+		}
+		if stopDone := s.leaderWorkerStopDone; stopDone != nil {
+			s.leaderWorkerMu.Unlock()
+			<-stopDone
+			continue
+		}
+		break
 	}
+	defer s.leaderWorkerMu.Unlock()
 	s.leaderWorkersStarted = true
 	// Create a fresh leaderWorkerCtx for the fork-worker group and one-time
 	// resume tasks. These use leaderWorkerCtx (not forkWorkerCtx, which is
@@ -1028,6 +1045,9 @@ func (s *Server) startLeaderWorkers() {
 		}
 		startManagedSharedDBResumeLoop(s.resumePendingManagedSharedDBPoolsWithCtx)
 		startManagedSharedDBResumeLoop(s.resumeProvisioningManagedSharedDBPoolsWithCtx)
+		for range s.tenantPoolReconcileWorkers {
+			s.startLeaderGoroutine(leaderCtx, s.runTenantPoolReconcileWorker)
+		}
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			runManagedSharedDBResumeLoop(workerCtx, s.tenantPoolReconcileInterval, s.reconcileStuckManagedSharedDBPoolsWithCtx)
 		})
@@ -1198,27 +1218,33 @@ func (s *Server) cleanupTenantNotifyOutbox(ctx context.Context) {
 }
 
 // stopLeaderWorkers stops the background schedulers started by startLeaderWorkers.
-// Called when the pod loses leadership or the server shuts down. The whole stop
-// (including the worker Stop/wait calls and clearing the worker fields) is
-// serialized under leaderWorkerMu and guarded by leaderWorkersStarted, so
-// onLose (heartbeat goroutine), Close() (main goroutine), and a concurrent
-// startLeaderWorkers cannot interleave. Holding the mutex for the entire
-// transition guarantees a concurrent startLeaderWorkers observes the
-// fully-stopped state (leaderWorkersStarted == false) and does not leave
-// orphan workers that a stop already ran past.
+// Called when the pod loses leadership or the server shuts down. Lifecycle
+// state is detached under leaderWorkerMu, but cancellation and Wait happen
+// outside it so an exiting worker can safely check leader admission. A
+// concurrent start waits on leaderWorkerStopDone before creating a new worker
+// generation, so old teardown cannot stop newly-started singleton workers.
 func (s *Server) stopLeaderWorkers() {
 	s.leaderWorkerMu.Lock()
-	defer s.leaderWorkerMu.Unlock()
+	if stopDone := s.leaderWorkerStopDone; stopDone != nil {
+		s.leaderWorkerMu.Unlock()
+		<-stopDone
+		return
+	}
 	if !s.leaderWorkersStarted {
+		s.leaderWorkerMu.Unlock()
 		return
 	}
 	s.leaderWorkersStarted = false
+	stopDone := make(chan struct{})
+	s.leaderWorkerStopDone = stopDone
 	cancel := s.leaderWorkerCancel
 	s.leaderWorkerCancel = nil
+	s.leaderWorkerCtx = nil
 	replayWorker := s.replayWorker
 	s.replayWorker = nil
 	expirySweepWorker := s.expirySweepWorker
 	s.expirySweepWorker = nil
+	s.leaderWorkerMu.Unlock()
 
 	if cancel != nil {
 		cancel()
@@ -1243,6 +1269,12 @@ func (s *Server) stopLeaderWorkers() {
 	if s.objectGCWorker != nil {
 		s.objectGCWorker.Stop()
 	}
+	s.leaderWorkerMu.Lock()
+	if s.leaderWorkerStopDone == stopDone {
+		s.leaderWorkerStopDone = nil
+		close(stopDone)
+	}
+	s.leaderWorkerMu.Unlock()
 }
 
 // startLeaderGoroutine launches a goroutine that runs fn under the leader
