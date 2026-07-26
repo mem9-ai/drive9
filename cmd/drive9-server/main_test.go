@@ -82,6 +82,19 @@ func TestTenantBackendCacheMaxTenantsFallsBackForInvalidOverrides(t *testing.T) 
 	}
 }
 
+func TestRestoreEnvPreservesPresentEmptyValue(t *testing.T) {
+	const key = "DRIVE9_TEST_PRESENT_EMPTY_ENV"
+	t.Setenv(key, "")
+	snapshot := snapshotEnv(t, []string{key})
+	unsetEnv(t, []string{key})
+
+	restoreEnv(t, snapshot)
+	value, present := os.LookupEnv(key)
+	if !present || value != "" {
+		t.Errorf("restored env = (%q, %t), want present empty value", value, present)
+	}
+}
+
 func TestSlockOAuthFromEnvDisabledByDefault(t *testing.T) {
 	keys := []string{
 		"DRIVE9_SLOCK_ORIGIN",
@@ -746,25 +759,31 @@ func TestS3ConfigValidateRejectsInvalidStaticCredentialCombinations(t *testing.T
 	}
 }
 
-func snapshotEnv(t *testing.T, keys []string) map[string]string {
+type envSnapshotValue struct {
+	value   string
+	present bool
+}
+
+func snapshotEnv(t *testing.T, keys []string) map[string]envSnapshotValue {
 	t.Helper()
-	out := make(map[string]string, len(keys))
+	out := make(map[string]envSnapshotValue, len(keys))
 	for _, key := range keys {
-		out[key] = os.Getenv(key)
+		value, present := os.LookupEnv(key)
+		out[key] = envSnapshotValue{value: value, present: present}
 	}
 	return out
 }
 
-func restoreEnv(t *testing.T, snapshot map[string]string) {
+func restoreEnv(t *testing.T, snapshot map[string]envSnapshotValue) {
 	t.Helper()
-	for key, value := range snapshot {
-		if value == "" {
+	for key, entry := range snapshot {
+		if !entry.present {
 			if err := os.Unsetenv(key); err != nil {
 				t.Fatalf("unset %s: %v", key, err)
 			}
 			continue
 		}
-		if err := os.Setenv(key, value); err != nil {
+		if err := os.Setenv(key, entry.value); err != nil {
 			t.Fatalf("restore %s: %v", key, err)
 		}
 	}
