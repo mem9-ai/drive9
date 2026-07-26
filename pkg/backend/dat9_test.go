@@ -556,6 +556,25 @@ func TestRemoveFileAndDirCtxUseTypedPaths(t *testing.T) {
 	}
 }
 
+func TestRemoveNonEmptyDirectoryReturnsErrDirectoryNotEmpty(t *testing.T) {
+	b := newTestBackend(t)
+	ctx := context.Background()
+
+	if err := b.Mkdir("/tree", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/tree/child.txt", []byte("data"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.RemoveCtx(ctx, "/tree/"); !errors.Is(err, datastore.ErrDirectoryNotEmpty) {
+		t.Fatalf("RemoveCtx non-empty dir err = %v, want ErrDirectoryNotEmpty", err)
+	}
+	if err := b.RemoveDirCtx(ctx, "/tree/"); !errors.Is(err, datastore.ErrDirectoryNotEmpty) {
+		t.Fatalf("RemoveDirCtx non-empty dir err = %v, want ErrDirectoryNotEmpty", err)
+	}
+}
+
 func TestRemoveAll(t *testing.T) {
 	b := newTestBackend(t)
 	if err := b.Mkdir("/data", 0o755); err != nil {

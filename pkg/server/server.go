@@ -3421,6 +3421,13 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		if errors.Is(err, datastore.ErrDirectoryNotEmpty) {
+			// Non-recursive rmdir of a non-empty directory is an expected
+			// client conflict (POSIX ENOTEMPTY), not a server fault.
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "delete_not_empty", "path", path, "recursive", recursive, "kind", kind, "error", err)...)
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
 		if errJSONInvalidRootDentry(w, err) {
 			return
 		}

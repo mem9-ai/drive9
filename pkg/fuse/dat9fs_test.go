@@ -7582,6 +7582,16 @@ func TestHTTPToFuseStatus_MapsConflictToEEXIST(t *testing.T) {
 	}
 }
 
+func TestHTTPToFuseStatus_MapsDirectoryNotEmptyToENOTEMPTY(t *testing.T) {
+	want := gofuse.Status(syscall.ENOTEMPTY)
+	if got := httpToFuseStatus(&client.StatusError{StatusCode: http.StatusConflict, Message: "directory not empty: /dir/"}); got != want {
+		t.Fatalf("status error 409 directory not empty = %v, want %v", got, want)
+	}
+	if got := httpToFuseStatus(fmt.Errorf("directory not empty: /dir/")); got != want {
+		t.Fatalf("string directory not empty = %v, want %v", got, want)
+	}
+}
+
 func TestHTTPToFuseStatus_PreservesRevisionConflictAsEIO(t *testing.T) {
 	if got := httpToFuseStatus(&client.StatusError{StatusCode: http.StatusConflict, Message: "revision conflict"}); got != gofuse.EIO {
 		t.Fatalf("revision conflict status = %v, want %v", got, gofuse.EIO)

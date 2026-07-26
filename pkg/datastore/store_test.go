@@ -61,6 +61,8 @@ func TestStoreOpResultForErrorClassifiesExpectedConflicts(t *testing.T) {
 		{name: "nil", err: nil, want: "ok"},
 		{name: "not found", err: ErrNotFound, want: "not_found"},
 		{name: "path conflict", err: ErrPathConflict, want: "conflict"},
+		{name: "directory not empty", err: ErrDirectoryNotEmpty, want: "conflict"},
+		{name: "directory not empty wrapped", err: fmt.Errorf("%w: /dir/", ErrDirectoryNotEmpty), want: "conflict"},
 		{name: "revision conflict", err: ErrRevisionConflict, want: "conflict"},
 		{name: "upload conflict", err: ErrUploadConflict, want: "conflict"},
 		{name: "upload not active", err: ErrUploadNotActive, want: "conflict"},

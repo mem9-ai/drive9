@@ -3960,8 +3960,12 @@ func httpToFuseStatus(err error) gofuse.Status {
 		case http.StatusNotFound:
 			return gofuse.ENOENT
 		case http.StatusConflict:
-			if strings.Contains(strings.ToLower(se.Message), "revision conflict") {
+			lower := strings.ToLower(se.Message)
+			if strings.Contains(lower, "revision conflict") {
 				return gofuse.EIO
+			}
+			if strings.Contains(lower, "directory not empty") {
+				return gofuse.Status(syscall.ENOTEMPTY)
 			}
 			return gofuse.Status(syscall.EEXIST)
 		case http.StatusForbidden:
@@ -3991,6 +3995,8 @@ func httpToFuseStatus(err error) gofuse.Status {
 	switch {
 	case strings.Contains(lowerMsg, "not found") || strings.Contains(msg, "HTTP 404"):
 		return gofuse.ENOENT
+	case strings.Contains(lowerMsg, "directory not empty"):
+		return gofuse.Status(syscall.ENOTEMPTY)
 	case strings.Contains(lowerMsg, "already exists") || strings.Contains(msg, "HTTP 409"):
 		return gofuse.Status(syscall.EEXIST)
 	case strings.Contains(msg, "HTTP 403"):

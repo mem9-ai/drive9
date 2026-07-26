@@ -26,6 +26,7 @@ var (
 	ErrUploadNotActive         = errors.New("upload is not in UPLOADING state")
 	ErrUploadExpired           = errors.New("upload has expired")
 	ErrPathConflict            = errors.New("path already exists")
+	ErrDirectoryNotEmpty       = errors.New("directory not empty")
 	ErrInvalidLinkTarget       = errors.New("invalid link target")
 	ErrInvalidRootDentry       = errors.New("root path is implicit and cannot be mutated as a file node")
 	ErrUploadConflict          = errors.New("active upload already exists for this path")
@@ -382,7 +383,7 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 		return err
 	}
 	if hasChildren {
-		return fmt.Errorf("directory not empty: %s", path)
+		return fmt.Errorf("%w: %s", ErrDirectoryNotEmpty, path)
 	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ? AND is_directory = 1`),
 		s.scope.Args(fileNodePathHash(path), path)...)
@@ -3115,6 +3116,7 @@ func storeOpResultForError(err error) string {
 	case errors.Is(err, ErrNotFound):
 		return "not_found"
 	case errors.Is(err, ErrPathConflict),
+		errors.Is(err, ErrDirectoryNotEmpty),
 		errors.Is(err, ErrRevisionConflict),
 		errors.Is(err, ErrUploadConflict),
 		errors.Is(err, ErrUploadNotActive),
