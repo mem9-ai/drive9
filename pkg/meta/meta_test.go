@@ -1006,9 +1006,19 @@ func TestObservePendingMutationsUsesSharedDBOrganization(t *testing.T) {
 	}
 	tenantID := "mutation-observe-shared-tenant"
 	insertSharedTenantPlacementForOrgTest(t, s, tenantID, "org-mutation-observe-shared")
-	if _, err := s.InsertMutationLog(ctx, &MutationLogEntry{
+	oldest := time.Now().UTC().Add(-5 * time.Minute)
+	firstID, err := s.InsertMutationLog(ctx, &MutationLogEntry{
 		TenantID: tenantID, MutationType: "file_delete", MutationData: []byte(`{"file_id":"f1"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InsertMutationLog(ctx, &MutationLogEntry{
+		TenantID: tenantID, MutationType: "file_delete", MutationData: []byte(`{"file_id":"f2"}`),
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE quota_mutation_log SET created_at = ? WHERE id = ?`, oldest, firstID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1020,6 +1030,12 @@ func TestObservePendingMutationsUsesSharedDBOrganization(t *testing.T) {
 		if row.TenantID == tenantID {
 			if row.TiDBCloudOrgID != "org-mutation-observe-shared" {
 				t.Fatalf("mutation observation org = %q, want org-mutation-observe-shared", row.TiDBCloudOrgID)
+			}
+			if row.PendingCount != 2 {
+				t.Fatalf("mutation observation pending count = %d, want 2", row.PendingCount)
+			}
+			if row.OldestPendingAgeSeconds < 4*60 || row.OldestPendingAgeSeconds > 6*60 {
+				t.Fatalf("mutation observation oldest age = %.3fs, want about 5m", row.OldestPendingAgeSeconds)
 			}
 			return
 		}
@@ -2147,6 +2163,26 @@ func TestCountTenantPoolBindingsByStatusGroupsByPoolOrganizationAndStatus(t *tes
 			t.Fatalf("upsert binding %s: %v", tc.tenantID, err)
 		}
 	}
+	for _, tc := range []struct {
+		tenantID string
+		status   TenantStatus
+		pool     TenantPoolBindingStatus
+	}{
+		{tenantID: "binding-counts-shared-free", status: TenantActive, pool: TenantPoolBindingFree},
+		{tenantID: "binding-counts-shared-deleted", status: TenantDeleted, pool: TenantPoolBindingUsed},
+	} {
+		insertTenantForPoolMembershipTest(t, s, tc.tenantID, tc.status, now)
+		if err := s.UpsertTenantPoolMembership(ctx, &TenantPoolMembership{
+			TenantID:                tc.tenantID,
+			TiDBCloudOrganizationID: "org-binding-counts-a",
+			PoolID:                  "pool-binding-counts-a",
+			PoolStatus:              tc.pool,
+			CreatedAt:               now,
+			UpdatedAt:               now,
+		}); err != nil {
+			t.Fatalf("upsert shared membership %s: %v", tc.tenantID, err)
+		}
+	}
 
 	counts, err := s.CountTenantPoolBindingsByStatus(ctx)
 	if err != nil {
@@ -2157,7 +2193,7 @@ func TestCountTenantPoolBindingsByStatusGroupsByPoolOrganizationAndStatus(t *tes
 		got[count.PoolID+"|"+count.OrganizationID+"|"+string(count.Status)] = count.Count
 	}
 	want := map[string]int64{
-		"pool-binding-counts-a|org-binding-counts-a|free":         2,
+		"pool-binding-counts-a|org-binding-counts-a|free":         3,
 		"pool-binding-counts-a|org-binding-counts-a|used":         1,
 		"pool-binding-counts-empty|org-binding-counts-empty|free": 0,
 		"pool-binding-counts-empty|org-binding-counts-empty|used": 0,

@@ -1368,25 +1368,32 @@ func (s *Store) ListPendingMutations(ctx context.Context, minAge time.Duration, 
 	return entries, rows.Err()
 }
 
+// Aggregate the mutation log before resolving tenant organization metadata so
+// each pending tenant, rather than each pending mutation, performs the joins.
+const observePendingMutationsSQL = `WITH pending_mutations AS (
+	SELECT tenant_id, COUNT(*) AS pending_count, MIN(created_at) AS oldest_created_at
+		FROM quota_mutation_log FORCE INDEX (idx_pending_tenant_age)
+		WHERE status = 'pending'
+		GROUP BY tenant_id
+)
+SELECT pending.tenant_id,
+	COALESCE(CASE WHEN t.provider = ? THEN d.org_id ELSE b.organization_id END, ''),
+	pending.pending_count, pending.oldest_created_at
+	FROM pending_mutations pending
+	LEFT JOIN tenants t ON t.id = pending.tenant_id
+	LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = pending.tenant_id
+	LEFT JOIN fs_registry f ON f.tenant_id = pending.tenant_id
+	LEFT JOIN tenant_placements p ON p.fs_id = f.fs_id
+	LEFT JOIN db_pool d ON d.db_id = p.db_id
+	ORDER BY pending.tenant_id`
+
 // ObservePendingMutations returns per-tenant pending mutation backlog and age.
 func (s *Store) ObservePendingMutations(ctx context.Context) ([]MutationBacklogObservation, error) {
 	start := time.Now()
 	var err error
 	defer observeMeta(ctx, "observe_pending_mutations", start, &err)
 
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT q.tenant_id,
-		        COALESCE(CASE WHEN t.provider = ? THEN d.org_id ELSE b.organization_id END, ''),
-		        COUNT(*), MIN(q.created_at)
-		 FROM quota_mutation_log q FORCE INDEX (idx_pending_tenant_age)
-		 LEFT JOIN tenants t ON t.id = q.tenant_id
-		 LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = q.tenant_id
-		 LEFT JOIN fs_registry f ON f.tenant_id = q.tenant_id
-		 LEFT JOIN tenant_placements p ON p.fs_id = f.fs_id
-		 LEFT JOIN db_pool d ON d.db_id = p.db_id
-		 WHERE q.status = 'pending'
-		 GROUP BY q.tenant_id, t.provider, d.org_id, b.organization_id
-		 ORDER BY q.tenant_id`, tidbCloudNativeSharedProvider)
+	rows, err := s.db.QueryContext(ctx, observePendingMutationsSQL, tidbCloudNativeSharedProvider)
 	if err != nil {
 		return nil, err
 	}
