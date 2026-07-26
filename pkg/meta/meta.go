@@ -2270,40 +2270,62 @@ func (s *Store) countFreeTenantPoolBindingsByStatus(ctx context.Context, organiz
 	return out, nil
 }
 
+// Count raw durable bindings first, then subtract deleted-tenant cleanup debt by
+// driving from the selective tenant status index. Tenant rows are durable control-
+// plane records; production deletion marks them deleted instead of hard-deleting
+// them, so this avoids a tenant lookup for every live binding without counting debt.
+const countTenantPoolBindingsByStatusSQL = `WITH binding_deltas AS (
+	SELECT organization_id, pool_id, pool_status, COUNT(*) AS delta
+		FROM tenant_tidbcloud_org_bindings
+		WHERE pool_id <> ''
+		GROUP BY organization_id, pool_id, pool_status
+	UNION ALL
+	SELECT tidbcloud_organization_id AS organization_id, pool_id, pool_status, COUNT(*) AS delta
+		FROM tenant_pool_memberships
+		WHERE pool_id <> ''
+		GROUP BY tidbcloud_organization_id, pool_id, pool_status
+	UNION ALL
+	SELECT b.organization_id, b.pool_id, b.pool_status, -COUNT(*) AS delta
+		FROM tenants t
+		STRAIGHT_JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = t.id
+		WHERE t.status = ? AND b.pool_id <> ''
+		GROUP BY b.organization_id, b.pool_id, b.pool_status
+	UNION ALL
+	SELECT m.tidbcloud_organization_id AS organization_id, m.pool_id, m.pool_status, -COUNT(*) AS delta
+		FROM tenants t
+		STRAIGHT_JOIN tenant_pool_memberships m ON m.tenant_id = t.id
+		WHERE t.status = ? AND m.pool_id <> ''
+		GROUP BY m.tidbcloud_organization_id, m.pool_id, m.pool_status
+), binding_counts AS (
+	SELECT organization_id, pool_id, pool_status, SUM(delta) AS binding_count
+		FROM binding_deltas
+		GROUP BY organization_id, pool_id, pool_status
+)
+SELECT
+	p.pool_id,
+	p.organization_id,
+	statuses.pool_status,
+	COALESCE(binding_counts.binding_count, 0)
+	FROM tenant_tidbcloud_pools p
+	CROSS JOIN (
+		SELECT ? AS pool_status
+		UNION ALL
+		SELECT ? AS pool_status
+	) statuses
+	LEFT JOIN binding_counts
+		ON binding_counts.pool_id = p.pool_id
+		AND binding_counts.organization_id = p.organization_id
+		AND binding_counts.pool_status = statuses.pool_status
+	WHERE p.pool_id <> ''
+		AND p.organization_id IS NOT NULL
+		AND p.organization_id <> ''
+	ORDER BY p.pool_id, p.organization_id, statuses.pool_status`
+
 func (s *Store) CountTenantPoolBindingsByStatus(ctx context.Context) (out []TenantPoolBindingStatusCount, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "count_tidbcloud_pool_bindings_by_status", start, &err)
-	rows, err := s.db.QueryContext(ctx, `SELECT
-			p.pool_id,
-			p.organization_id,
-			statuses.pool_status,
-			/* Count only live tenant slots; deleted-tenant bindings are cleanup debt, not usable capacity. */
-			COUNT(t.id)
-		FROM tenant_tidbcloud_pools p
-		JOIN (
-			SELECT ? AS pool_status
-			UNION ALL
-			SELECT ? AS pool_status
-		) statuses
-		LEFT JOIN (
-			SELECT tenant_id, organization_id, pool_id, pool_status
-			FROM tenant_tidbcloud_org_bindings
-			UNION ALL
-			SELECT tenant_id, tidbcloud_organization_id AS organization_id, pool_id, pool_status
-			FROM tenant_pool_memberships
-		) b
-			ON b.pool_id = p.pool_id
-			AND b.organization_id = p.organization_id
-			AND b.pool_status = statuses.pool_status
-		LEFT JOIN tenants t
-			ON t.id = b.tenant_id
-			AND t.status <> ?
-		WHERE p.pool_id <> ''
-			AND p.organization_id IS NOT NULL
-			AND p.organization_id <> ''
-		GROUP BY p.pool_id, p.organization_id, statuses.pool_status
-		ORDER BY p.pool_id, p.organization_id, statuses.pool_status`,
-		TenantPoolBindingFree, TenantPoolBindingUsed, TenantDeleted)
+	rows, err := s.db.QueryContext(ctx, countTenantPoolBindingsByStatusSQL,
+		TenantDeleted, TenantDeleted, TenantPoolBindingFree, TenantPoolBindingUsed)
 	if err != nil {
 		return nil, fmt.Errorf("count tenant pool bindings by status query: %w", err)
 	}

@@ -1026,23 +1026,47 @@ func (s *Store) ListSharedDBs(ctx context.Context) (out []*SharedDB, err error) 
 // ListSharedDBPoolMetricSnapshots returns one snapshot per physical shared
 // database. It is intentionally a read-only aggregate used by the existing
 // tenant metrics pass; it does not reconcile or mutate capacity counters.
+// The query counts durable placements as an active baseline, then reclassifies
+// only non-active tenants. This keeps the common path index-only and avoids two
+// point lookups for every active placement.
+const listSharedDBPoolMetricSnapshotsSQL = `WITH non_active_tenant_states AS (
+	SELECT p.db_id, t.status AS tenant_status, COUNT(*) AS tenant_count
+		FROM tenants t FORCE INDEX (idx_tenant_status)
+		STRAIGHT_JOIN fs_registry f ON f.tenant_id = t.id
+		STRAIGHT_JOIN tenant_placements p ON p.fs_id = f.fs_id
+		WHERE t.status <> ?
+		GROUP BY p.db_id, t.status
+), tenant_state_deltas AS (
+	SELECT db_id, ? AS tenant_status, COUNT(*) AS tenant_count
+		FROM tenant_placements
+		GROUP BY db_id
+	UNION ALL
+	SELECT db_id, tenant_status, tenant_count
+		FROM non_active_tenant_states
+	UNION ALL
+	SELECT db_id, ? AS tenant_status, -SUM(tenant_count) AS tenant_count
+		FROM non_active_tenant_states
+		GROUP BY db_id
+), tenant_states AS (
+	SELECT db_id, tenant_status, SUM(tenant_count) AS tenant_count
+		FROM tenant_state_deltas
+		GROUP BY db_id, tenant_status
+		HAVING SUM(tenant_count) > 0
+)
+SELECT
+	d.db_id, d.uuid, COALESCE(d.org_id, ''), d.status, d.max_tenants, d.tenant_count, d.soft_cap_reached,
+	d.spending_limit,
+	COALESCE(tenant_states.tenant_status, ''), COALESCE(tenant_states.tenant_count, 0)
+	FROM db_pool d
+	LEFT JOIN tenant_states ON tenant_states.db_id = d.db_id
+	WHERE d.` + "`role`" + ` = ?
+	ORDER BY d.db_id, tenant_states.tenant_status`
+
 func (s *Store) ListSharedDBPoolMetricSnapshots(ctx context.Context) (out []SharedDBPoolMetricSnapshot, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_shared_db_pool_metric_snapshots", start, &err)
-	rows, err := s.db.QueryContext(ctx, `SELECT
-			d.db_id, d.uuid, COALESCE(d.org_id, ''), d.status, d.max_tenants, d.tenant_count, d.soft_cap_reached,
-			d.spending_limit,
-			COALESCE(states.tenant_status, ''), COALESCE(states.tenant_count, 0)
-		FROM db_pool d
-		LEFT JOIN (
-			SELECT p.db_id, t.status AS tenant_status, COUNT(*) AS tenant_count
-			FROM tenant_placements p
-			JOIN fs_registry f ON f.fs_id = p.fs_id
-			JOIN tenants t ON t.id = f.tenant_id
-			GROUP BY p.db_id, t.status
-		) states ON states.db_id = d.db_id
-		WHERE d.`+"`role`"+` = ?
-		ORDER BY d.db_id, states.tenant_status`, SharedDBRoleShared)
+	rows, err := s.db.QueryContext(ctx, listSharedDBPoolMetricSnapshotsSQL,
+		TenantActive, TenantActive, TenantActive, SharedDBRoleShared)
 	if err != nil {
 		return nil, fmt.Errorf("list shared db pool metric snapshots: %w", err)
 	}
