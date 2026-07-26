@@ -5,7 +5,6 @@ import (
 	"time"
 )
 
-var queueDepthBounds = []float64{1, 4, 16, 64, 128, 256, 512, 1024, 2048, 3072, 4096}
 var batchSizeBounds = []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1000}
 
 var mutationDispatcherQueueDepth = serviceMeter.Float64Gauge("drive9_mutation_dispatcher_queue_depth", "Queued central quota mutations by dispatcher shard")
