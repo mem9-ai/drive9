@@ -1187,6 +1187,62 @@ func TestIdleEviction(t *testing.T) {
 	}
 }
 
+func TestIdleEvictionSkipsSharedTenantEntry(t *testing.T) {
+	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
+		MaxTenants:  2,
+		IdleTimeout: time.Minute,
+	}, "tenant-shared-idle")
+	ctx := context.Background()
+
+	b, release, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := b.Store()
+	release()
+
+	pool.mu.Lock()
+	e := pool.items[tenant.ID]
+	e.sharedDBID = 123
+	e.lastUsed = time.Now().Add(-2 * time.Minute)
+	pool.mu.Unlock()
+
+	pool.reapOnce(ctx)
+
+	assertStoreOpen(t, store)
+	if _, ok := pool.items[tenant.ID]; !ok {
+		t.Fatal("shared tenant entry was removed by idle reaper")
+	}
+}
+
+func TestCapacityEvictionStillRemovesSharedTenantEntry(t *testing.T) {
+	pool, first := newTestPoolAndTenant(t, 1, "tenant-shared-capacity-first")
+	ctx := context.Background()
+
+	b, release, err := pool.Acquire(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstStore := b.Store()
+	release()
+
+	pool.mu.Lock()
+	pool.items[first.ID].sharedDBID = 123
+	pool.mu.Unlock()
+
+	second := cloneTenantForID(t, pool, first, "tenant-shared-capacity-second")
+	_, releaseSecond, err := pool.Acquire(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseSecond()
+
+	assertStoreClosed(t, firstStore)
+	if _, ok := pool.items[first.ID]; ok {
+		t.Fatal("shared tenant entry remained after capacity eviction")
+	}
+}
+
 func TestIdleEvictionSkippedByRecentAcquire(t *testing.T) {
 	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
 		MaxTenants:       2,
