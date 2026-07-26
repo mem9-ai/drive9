@@ -451,41 +451,6 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 	return nil
 }
 
-// TouchManagedSharedDBPools records observed Cloud progress without changing
-// lifecycle state. The expected-status guard prevents a late metadata poll
-// from refreshing a pool already failed by the watchdog.
-func (s *Store) TouchManagedSharedDBPools(ctx context.Context, dbIDs []int64, expectedStatus string) (err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "touch_managed_shared_db_pools", start, &err)
-	if expectedStatus != SharedDBStatusPending && expectedStatus != SharedDBStatusProvisioning {
-		return fmt.Errorf("unsupported shared db heartbeat status %q", expectedStatus)
-	}
-	ids := make([]int64, 0, len(dbIDs))
-	seen := make(map[int64]struct{}, len(dbIDs))
-	for _, dbID := range dbIDs {
-		if dbID <= 0 {
-			continue
-		}
-		if _, ok := seen[dbID]; ok {
-			continue
-		}
-		seen[dbID] = struct{}{}
-		ids = append(ids, dbID)
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
-	args := make([]any, 0, 3+len(ids))
-	args = append(args, time.Now().UTC(), SharedDBRoleShared, expectedStatus)
-	for _, dbID := range ids {
-		args = append(args, dbID)
-	}
-	_, err = s.db.ExecContext(ctx, `UPDATE db_pool SET updated_at = ?
-		WHERE `+"`role`"+` = ? AND status = ? AND db_id IN (`+placeholders+`)`, args...)
-	return err
-}
-
 // PrepareManagedSharedDBPoolRoot durably stores the root credential and
 // database name before the first Cloud create call. It is idempotent for a
 // pending row that has not yet acquired a cluster identity.

@@ -858,7 +858,6 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 				infos, loadErr := loader.BatchLoadSharedDBPoolsWithCredentials(ctx, requests, cred)
 				ready := make(map[int64]struct{}, len(infos))
 				readyIDs := make([]int64, 0, len(infos))
-				heartbeatIDs := make([]int64, 0, len(infos))
 				for _, info := range infos {
 					if info == nil {
 						continue
@@ -868,9 +867,9 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 						continue
 					}
 					if strings.TrimSpace(info.Host) == "" || info.Port <= 0 || strings.TrimSpace(info.Username) == "" {
-						if strings.TrimSpace(info.ClusterID) != "" {
-							heartbeatIDs = append(heartbeatIDs, row.ID)
-						}
+						// Seeing the same incomplete Cloud object is not durable
+						// lifecycle progress. Preserve updated_at so the stuck
+						// watchdog can expire a pool whose metadata never becomes ready.
 						continue
 					}
 					name := info.DBName
@@ -883,12 +882,6 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 					}
 					ready[row.ID] = struct{}{}
 					readyIDs = append(readyIDs, row.ID)
-				}
-				if len(heartbeatIDs) > 0 {
-					if err := s.meta.TouchManagedSharedDBPools(ctx, heartbeatIDs, meta.SharedDBStatusPending); err != nil {
-						logger.Warn(ctx, "managed_shared_db_pool_metadata_heartbeat_failed",
-							zap.Int("db_pool_count", len(heartbeatIDs)), zap.Error(err))
-					}
 				}
 				if loadErr != nil {
 					logger.Warn(ctx, "managed_shared_db_pool_metadata_retry", zap.Int("attempt", attempt), zap.Int("db_pool_count", len(group)), zap.Duration("retry_in", pollInterval), zap.Error(loadErr))
