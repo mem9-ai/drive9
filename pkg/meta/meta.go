@@ -2514,6 +2514,13 @@ func (s *Store) DeleteTenantPoolAndDetachUsedMembers(ctx context.Context, poolID
 		return fmt.Errorf("pool_id is required")
 	}
 	return s.InTx(ctx, func(tx *sql.Tx) error {
+		var lockedPoolID string
+		if err := tx.QueryRowContext(ctx, `SELECT pool_id FROM tenant_tidbcloud_pools
+			WHERE pool_id = ? FOR UPDATE`, poolID).Scan(&lockedPoolID); errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		} else if err != nil {
+			return err
+		}
 		var freeTenantID string
 		if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM tenant_tidbcloud_org_bindings
 			WHERE pool_id = ? AND pool_status = ? LIMIT 1 FOR UPDATE`,

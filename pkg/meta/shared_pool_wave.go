@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -36,6 +37,13 @@ type preparedManagedSharedDBPoolWavePlan struct {
 	members []ManagedSharedDBPoolWaveMember
 }
 
+type stagedManagedSharedDBPoolWavePlan struct {
+	dbID           int64
+	tenantIDs      []string
+	placementArgs  []any
+	membershipArgs []any
+}
+
 func multiRowPlaceholders(rows, columns int) string {
 	row := "(" + strings.TrimRight(strings.Repeat("?,", columns), ",") + ")"
 	return strings.TrimRight(strings.Repeat(row+",", rows), ",")
@@ -53,6 +61,9 @@ func (s *Store) CreateManagedSharedDBPoolTenantWave(ctx context.Context, plans [
 	}
 	prepared := make([]preparedManagedSharedDBPoolWavePlan, len(plans))
 	seenTenants := make(map[string]struct{})
+	wavePoolID := ""
+	waveOrganizationID := ""
+	waveMemberCount := 0
 	for i := range plans {
 		values, prepErr := managedSharedDBInsertValuesFor(plans[i].DB)
 		if prepErr != nil {
@@ -74,11 +85,21 @@ func (s *Store) CreateManagedSharedDBPoolTenantWave(ctx context.Context, plans [
 			if member.Tenant.Provider != tidbCloudNativeSharedProvider || member.Tenant.Status != TenantPending {
 				return nil, fmt.Errorf("managed shared DB wave tenant %q must be pending shared provider", tenantID)
 			}
-			if member.Membership == nil || member.Membership.TenantID != tenantID || strings.TrimSpace(member.Membership.PoolID) == "" || member.Membership.PoolStatus != TenantPoolBindingFree {
+			memberPoolID := ""
+			if member.Membership != nil {
+				memberPoolID = strings.TrimSpace(member.Membership.PoolID)
+			}
+			if member.Membership == nil || member.Membership.TenantID != tenantID || memberPoolID == "" || member.Membership.PoolStatus != TenantPoolBindingFree {
 				return nil, fmt.Errorf("managed shared DB wave tenant %q has invalid free membership", tenantID)
 			}
 			if strings.TrimSpace(member.Membership.TiDBCloudOrganizationID) != values.organizationID {
 				return nil, fmt.Errorf("managed shared DB wave tenant %q organization does not match physical pool", tenantID)
+			}
+			if wavePoolID == "" {
+				wavePoolID = memberPoolID
+				waveOrganizationID = values.organizationID
+			} else if memberPoolID != wavePoolID || values.organizationID != waveOrganizationID {
+				return nil, fmt.Errorf("managed shared DB wave must belong to one logical pool and organization")
 			}
 			if member.Quota == nil || member.Quota.TenantID != tenantID {
 				return nil, fmt.Errorf("managed shared DB wave tenant %q has invalid quota", tenantID)
@@ -88,22 +109,42 @@ func (s *Store) CreateManagedSharedDBPoolTenantWave(ctx context.Context, plans [
 			}
 		}
 		prepared[i] = preparedManagedSharedDBPoolWavePlan{values: values, members: plans[i].Members}
+		waveMemberCount += len(plans[i].Members)
 	}
 
-	err = s.InTx(ctx, func(tx *sql.Tx) error {
-		out = make([]ManagedSharedDBPoolWaveResult, len(prepared))
-		for i := range prepared {
-			dbID, insertErr := insertManagedSharedDBPool(ctx, tx, prepared[i].values)
-			if insertErr != nil {
-				return insertErr
+	err = withMetaLockConflictRetry(ctx, "create_managed_shared_db_pool_tenant_wave", func() error {
+		attemptOut := make([]ManagedSharedDBPoolWaveResult, len(prepared))
+		staged := make([]stagedManagedSharedDBPoolWavePlan, len(prepared))
+		txErr := s.InTx(ctx, func(tx *sql.Tx) error {
+			for i := range prepared {
+				dbID, insertErr := insertManagedSharedDBPool(ctx, tx, prepared[i].values)
+				if insertErr != nil {
+					return insertErr
+				}
+				staged[i], insertErr = stageManagedSharedDBPoolWaveMembers(ctx, tx, dbID, prepared[i])
+				if insertErr != nil {
+					return fmt.Errorf("stage managed shared DB pool %d: %w", dbID, insertErr)
+				}
+				attemptOut[i] = ManagedSharedDBPoolWaveResult{DBID: dbID, TenantIDs: staged[i].tenantIDs}
 			}
-			result, insertErr := createManagedSharedDBPoolWaveMembers(ctx, tx, dbID, prepared[i])
-			if insertErr != nil {
-				return fmt.Errorf("stage managed shared DB pool %d: %w", dbID, insertErr)
+			// Take logical-pool ownership only after the expensive independent
+			// tenant/quota/profile staging. If delete or shrink committed first,
+			// the complete uncommitted wave rolls back before any membership is
+			// published or Cloud request can start.
+			if validateErr := validateManagedSharedDBPoolWaveOwnership(ctx, tx, wavePoolID, waveOrganizationID, waveMemberCount); validateErr != nil {
+				return validateErr
 			}
-			out[i] = result
+			for i := range staged {
+				if finalizeErr := finalizeManagedSharedDBPoolWaveMembers(ctx, tx, staged[i]); finalizeErr != nil {
+					return fmt.Errorf("finalize managed shared DB pool %d: %w", staged[i].dbID, finalizeErr)
+				}
+			}
+			return nil
+		})
+		if txErr == nil {
+			out = attemptOut
 		}
-		return nil
+		return txErr
 	})
 	if err != nil {
 		return nil, err
@@ -111,7 +152,7 @@ func (s *Store) CreateManagedSharedDBPoolTenantWave(ctx context.Context, plans [
 	return out, nil
 }
 
-func createManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, dbID int64, plan preparedManagedSharedDBPoolWavePlan) (ManagedSharedDBPoolWaveResult, error) {
+func stageManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, dbID int64, plan preparedManagedSharedDBPoolWavePlan) (stagedManagedSharedDBPoolWavePlan, error) {
 	now := time.Now().UTC()
 	tenantArgs := make([]any, 0, len(plan.members)*22)
 	tenantIDs := make([]string, 0, len(plan.members))
@@ -131,9 +172,9 @@ func createManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, dbID 
 		 s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at) VALUES `+
 		multiRowPlaceholders(len(plan.members), 22), tenantArgs...); err != nil {
 		if isDuplicateEntry(err) {
-			return ManagedSharedDBPoolWaveResult{}, ErrDuplicate
+			return stagedManagedSharedDBPoolWavePlan{}, ErrDuplicate
 		}
-		return ManagedSharedDBPoolWaveResult{}, fmt.Errorf("insert wave tenants: %w", err)
+		return stagedManagedSharedDBPoolWavePlan{}, fmt.Errorf("insert wave tenants: %w", err)
 	}
 
 	fsArgs := make([]any, len(tenantIDs))
@@ -141,14 +182,14 @@ func createManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, dbID 
 		fsArgs[i] = tenantIDs[i]
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO fs_registry (tenant_id) VALUES `+multiRowPlaceholders(len(tenantIDs), 1), fsArgs...); err != nil {
-		return ManagedSharedDBPoolWaveResult{}, fmt.Errorf("insert wave fs registry: %w", err)
+		return stagedManagedSharedDBPoolWavePlan{}, fmt.Errorf("insert wave fs registry: %w", err)
 	}
 	selectArgs := make([]any, len(tenantIDs))
 	copy(selectArgs, fsArgs)
 	rows, err := tx.QueryContext(ctx, `SELECT tenant_id, fs_id FROM fs_registry WHERE tenant_id IN (`+
 		strings.TrimRight(strings.Repeat("?,", len(tenantIDs)), ",")+`)`, selectArgs...)
 	if err != nil {
-		return ManagedSharedDBPoolWaveResult{}, fmt.Errorf("load wave fs registry: %w", err)
+		return stagedManagedSharedDBPoolWavePlan{}, fmt.Errorf("load wave fs registry: %w", err)
 	}
 	fsIDs := make(map[string]int64, len(tenantIDs))
 	for rows.Next() {
@@ -156,19 +197,19 @@ func createManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, dbID 
 		var fsID int64
 		if err := rows.Scan(&tenantID, &fsID); err != nil {
 			_ = rows.Close()
-			return ManagedSharedDBPoolWaveResult{}, err
+			return stagedManagedSharedDBPoolWavePlan{}, err
 		}
 		fsIDs[tenantID] = fsID
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return ManagedSharedDBPoolWaveResult{}, err
+		return stagedManagedSharedDBPoolWavePlan{}, err
 	}
 	if err := rows.Close(); err != nil {
-		return ManagedSharedDBPoolWaveResult{}, err
+		return stagedManagedSharedDBPoolWavePlan{}, err
 	}
 	if len(fsIDs) != len(tenantIDs) {
-		return ManagedSharedDBPoolWaveResult{}, fmt.Errorf("resolved %d fs IDs for %d wave tenants", len(fsIDs), len(tenantIDs))
+		return stagedManagedSharedDBPoolWavePlan{}, fmt.Errorf("resolved %d fs IDs for %d wave tenants", len(fsIDs), len(tenantIDs))
 	}
 
 	quotaArgs := make([]any, 0, len(plan.members)*9)
@@ -204,36 +245,89 @@ func createManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, dbID 
 		(tenant_id, max_storage_bytes, max_file_size_bytes, max_file_count, max_media_llm_files, max_video_llm_files,
 		 max_monthly_cost_mc, tidbcloud_spending_limit, tidbcloud_spending_limit_checked_at) VALUES `+
 		multiRowPlaceholders(len(plan.members), 9), quotaArgs...); err != nil {
-		return ManagedSharedDBPoolWaveResult{}, fmt.Errorf("insert wave quota configs: %w", err)
+		return stagedManagedSharedDBPoolWavePlan{}, fmt.Errorf("insert wave quota configs: %w", err)
 	}
 	if profileCount > 0 {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO tenant_auto_embedding_profiles
 			(tenant_id, embedding_mode, model, dimensions, options_json, api_base, api_key_cipher, created_at, updated_at) VALUES `+
 			multiRowPlaceholders(profileCount, 9), profileArgs...); err != nil {
-			return ManagedSharedDBPoolWaveResult{}, fmt.Errorf("insert wave auto-embedding profiles: %w", err)
+			return stagedManagedSharedDBPoolWavePlan{}, fmt.Errorf("insert wave auto-embedding profiles: %w", err)
 		}
 	}
+	return stagedManagedSharedDBPoolWavePlan{dbID: dbID, tenantIDs: tenantIDs,
+		placementArgs: placementArgs, membershipArgs: membershipArgs}, nil
+}
+
+func validateManagedSharedDBPoolWaveOwnership(ctx context.Context, tx *sql.Tx, poolID, organizationID string, incoming int) error {
+	var currentOrganizationID sql.NullString
+	var size int
+	var status TenantPoolStatus
+	err := tx.QueryRowContext(ctx, `SELECT organization_id, size, status
+		FROM tenant_tidbcloud_pools WHERE pool_id = ? FOR UPDATE`, poolID).Scan(&currentOrganizationID, &size, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("lock logical tenant pool %q: %w", poolID, err)
+	}
+	if status != TenantPoolActive {
+		return fmt.Errorf("logical tenant pool %q is %s, want active", poolID, status)
+	}
+	if !currentOrganizationID.Valid || strings.TrimSpace(currentOrganizationID.String) != organizationID {
+		return fmt.Errorf("logical tenant pool %q organization does not match refill wave", poolID)
+	}
+	var nativeSlots, sharedSlots int
+	// Match leader refill accounting: native work is request-credential-owned,
+	// so only active native inventory offsets a leader-owned shared wave.
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM tenant_tidbcloud_org_bindings b
+		STRAIGHT_JOIN tenants t ON t.id = b.tenant_id
+		WHERE b.pool_id = ? AND b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
+			AND t.status = ? FOR UPDATE`,
+		poolID, organizationID, TenantPoolBindingFree, tidbCloudNativeProvider,
+		TenantActive).Scan(&nativeSlots)
+	if err != nil {
+		return fmt.Errorf("count logical tenant pool %q native slots: %w", poolID, err)
+	}
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM tenant_pool_memberships m
+		STRAIGHT_JOIN tenants t ON t.id = m.tenant_id
+		WHERE m.pool_id = ? AND m.tidbcloud_organization_id = ? AND m.pool_status = ? AND t.provider = ?
+			AND t.status IN (?, ?, ?) FOR UPDATE`,
+		poolID, organizationID, TenantPoolBindingFree, tidbCloudNativeSharedProvider,
+		TenantPending, TenantProvisioning, TenantActive).Scan(&sharedSlots)
+	if err != nil {
+		return fmt.Errorf("count logical tenant pool %q shared slots: %w", poolID, err)
+	}
+	current := nativeSlots + sharedSlots
+	if current+incoming > size {
+		return fmt.Errorf("logical tenant pool %q capacity changed: durable=%d incoming=%d size=%d", poolID, current, incoming, size)
+	}
+	return nil
+}
+
+func finalizeManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, staged stagedManagedSharedDBPoolWavePlan) error {
 	if _, err := tx.ExecContext(ctx, `INSERT INTO tenant_placements
 		(fs_id, db_id, placement, schema_shape, status, target_db_id) VALUES `+
-		multiRowPlaceholders(len(plan.members), 6), placementArgs...); err != nil {
-		return ManagedSharedDBPoolWaveResult{}, fmt.Errorf("insert wave placements: %w", err)
+		multiRowPlaceholders(len(staged.tenantIDs), 6), staged.placementArgs...); err != nil {
+		return fmt.Errorf("insert wave placements: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO tenant_pool_memberships
 		(tenant_id, tidbcloud_organization_id, pool_id, pool_status, created_at, updated_at) VALUES `+
-		multiRowPlaceholders(len(plan.members), 6), membershipArgs...); err != nil {
-		return ManagedSharedDBPoolWaveResult{}, fmt.Errorf("insert wave memberships: %w", err)
+		multiRowPlaceholders(len(staged.tenantIDs), 6), staged.membershipArgs...); err != nil {
+		return fmt.Errorf("insert wave memberships: %w", err)
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE db_pool SET tenant_count = ?, soft_cap_reached = CASE WHEN ? >= max_tenants THEN 1 ELSE 0 END
-		WHERE db_id = ? AND status = ?`, len(plan.members), len(plan.members), dbID, SharedDBStatusPending)
+		WHERE db_id = ? AND status = ?`, len(staged.tenantIDs), len(staged.tenantIDs), staged.dbID, SharedDBStatusPending)
 	if err != nil {
-		return ManagedSharedDBPoolWaveResult{}, fmt.Errorf("reserve wave physical capacity: %w", err)
+		return fmt.Errorf("reserve wave physical capacity: %w", err)
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
-		return ManagedSharedDBPoolWaveResult{}, fmt.Errorf("reserve wave physical capacity rows affected: %w", err)
+		return fmt.Errorf("reserve wave physical capacity rows affected: %w", err)
 	}
 	if affected != 1 {
-		return ManagedSharedDBPoolWaveResult{}, fmt.Errorf("reserve wave physical capacity changed %d rows for db pool %d", affected, dbID)
+		return fmt.Errorf("reserve wave physical capacity changed %d rows for db pool %d", affected, staged.dbID)
 	}
-	return ManagedSharedDBPoolWaveResult{DBID: dbID, TenantIDs: tenantIDs}, nil
+	return nil
 }

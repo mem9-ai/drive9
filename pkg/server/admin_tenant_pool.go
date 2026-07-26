@@ -1300,7 +1300,13 @@ func (s *Server) persistManagedSharedDBPoolCloudResults(ctx context.Context, res
 }
 
 func (s *Server) provisionManagedSharedDBPoolsBatchChunkClaimed(ctx context.Context, provisioner tenant.SharedDBPoolProvisioner, requests []tenant.SharedDBPoolCreateRequest, rows map[int64]*meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
-	created, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, requests, cred)
+	if err := s.acquireManagedSharedDBCloudBatchSlot(ctx); err != nil {
+		return err
+	}
+	created, createErr := func() ([]*tenant.SharedDBPoolInfo, error) {
+		defer s.releaseManagedSharedDBCloudBatchSlot()
+		return provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, requests, cred)
+	}()
 	if createErr != nil && len(created) == 0 {
 		logger.Warn(ctx, "managed_shared_db_batch_create_failed",
 			zap.Int("db_pool_count", len(requests)), zap.Error(createErr))
@@ -1312,6 +1318,24 @@ func (s *Server) provisionManagedSharedDBPoolsBatchChunkClaimed(ctx context.Cont
 			zap.Int("requested", len(requests)), zap.Int("persisted", len(persistedIDs)), zap.Error(createErr))
 	}
 	return errors.Join(createErr, persistErr)
+}
+
+func (s *Server) acquireManagedSharedDBCloudBatchSlot(ctx context.Context) error {
+	s.managedSharedDBCloudBatchSlotsOnce.Do(func() {
+		if s.managedSharedDBCloudBatchSlots == nil {
+			s.managedSharedDBCloudBatchSlots = make(chan struct{}, defaultManagedSharedDBCloudBatchConcurrency)
+		}
+	})
+	select {
+	case s.managedSharedDBCloudBatchSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) releaseManagedSharedDBCloudBatchSlot() {
+	<-s.managedSharedDBCloudBatchSlots
 }
 
 func (s *Server) markTenantPoolTenantFailed(ctx context.Context, tenantID, reason string) {

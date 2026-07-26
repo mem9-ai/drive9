@@ -399,6 +399,206 @@ func TestSharedTenantPoolRefillMakesWaveVisibleOnlyAfterMembershipReservation(t 
 	}
 }
 
+func TestSharedTenantPoolRefillDoesNotCommitAfterLogicalPoolDelete(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(poolManager.Close)
+	poolManager.SetMetaStore(metaStore)
+	ctx := context.Background()
+	logicalPool := &meta.TenantPool{PoolID: "pool-delete-during-wave", OrganizationID: "org-delete-during-wave",
+		Size: 2, Status: meta.TenantPoolActive, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := metaStore.CreateTenantPool(ctx, logicalPool); err != nil {
+		t.Fatal(err)
+	}
+	batchStarted := make(chan struct{}, 1)
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1",
+		sharedPoolBatchStarted: batchStarted}
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	srv := &Server{meta: metaStore, pool: poolManager, provisioner: prov,
+		defaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, sharedDBMaxTenants: 1,
+		managedSharedDBCloudBatchSize: 10, forkWorkerCtx: workerCtx, forkWorkerCancel: workerCancel}
+	t.Cleanup(srv.Close)
+
+	lockConn, err := metaStore.DB().Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockConn.ExecContext(ctx, `LOCK TABLES tenant_quota_config WRITE`); err != nil {
+		_ = lockConn.Close()
+		t.Fatal(err)
+	}
+	locked := true
+	t.Cleanup(func() {
+		if locked {
+			_, _ = lockConn.ExecContext(context.Background(), `UNLOCK TABLES`)
+		}
+		_ = lockConn.Close()
+	})
+	waveDone := make(chan error, 1)
+	go func() {
+		_, createErr := srv.createFreeSharedPoolTenants(ctx, logicalPool.PoolID, logicalPool.Size,
+			tenant.CredentialProvisionRequest{}, nil)
+		waveDone <- createErr
+	}()
+	select {
+	case err := <-waveDone:
+		t.Fatalf("refill returned before quota lock was released: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := metaStore.UpdateTenantPoolStatus(ctx, logicalPool.PoolID, meta.TenantPoolDeleting); err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.DeleteTenantPoolAndDetachUsedMembers(ctx, logicalPool.PoolID); err != nil {
+		t.Fatalf("delete logical pool while refill is blocked: %v", err)
+	}
+	if _, err := lockConn.ExecContext(ctx, `UNLOCK TABLES`); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+	select {
+	case err := <-waveDone:
+		if err == nil {
+			t.Fatal("refill committed after logical pool deletion")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("refill did not stop after logical pool deletion")
+	}
+	select {
+	case <-batchStarted:
+		t.Fatal("Cloud batch started after logical pool deletion won")
+	default:
+	}
+	if _, err := metaStore.GetTenantPoolByID(ctx, logicalPool.PoolID); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("logical pool after delete = %v, want not found", err)
+	}
+	var physicalRows, memberships int
+	if err := metaStore.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, logicalPool.OrganizationID).Scan(&physicalRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM tenant_pool_memberships WHERE pool_id = ?`, logicalPool.PoolID).Scan(&memberships); err != nil {
+		t.Fatal(err)
+	}
+	if physicalRows != 0 || memberships != 0 {
+		t.Fatalf("durable refill residue after delete: physical=%d memberships=%d", physicalRows, memberships)
+	}
+}
+
+func TestSharedTenantPoolRefillDoesNotOverfillAfterLogicalPoolShrink(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(poolManager.Close)
+	poolManager.SetMetaStore(metaStore)
+	ctx := context.Background()
+	logicalPool := &meta.TenantPool{PoolID: "pool-shrink-during-wave", OrganizationID: "org-shrink-during-wave",
+		Size: 2, Status: meta.TenantPoolActive, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := metaStore.CreateTenantPool(ctx, logicalPool); err != nil {
+		t.Fatal(err)
+	}
+	batchStarted := make(chan struct{}, 2)
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1",
+		sharedPoolBatchStarted: batchStarted}
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	srv := &Server{meta: metaStore, pool: poolManager, provisioner: prov,
+		defaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, sharedDBMaxTenants: 1,
+		managedSharedDBCloudBatchSize: 10, forkWorkerCtx: workerCtx, forkWorkerCancel: workerCancel}
+	t.Cleanup(srv.Close)
+
+	lockConn, err := metaStore.DB().Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockConn.ExecContext(ctx, `LOCK TABLES tenant_quota_config WRITE`); err != nil {
+		_ = lockConn.Close()
+		t.Fatal(err)
+	}
+	locked := true
+	t.Cleanup(func() {
+		if locked {
+			_, _ = lockConn.ExecContext(context.Background(), `UNLOCK TABLES`)
+		}
+		_ = lockConn.Close()
+	})
+	waveDone := make(chan error, 1)
+	go func() {
+		_, createErr := srv.createFreeSharedPoolTenants(ctx, logicalPool.PoolID, logicalPool.Size,
+			tenant.CredentialProvisionRequest{}, nil)
+		waveDone <- createErr
+	}()
+	select {
+	case err := <-waveDone:
+		t.Fatalf("refill returned before quota lock was released: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := metaStore.UpdateTenantPoolSize(ctx, logicalPool.PoolID, 1); err != nil {
+		t.Fatalf("shrink logical pool while refill is blocked: %v", err)
+	}
+	if _, err := lockConn.ExecContext(ctx, `UNLOCK TABLES`); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+	select {
+	case err := <-waveDone:
+		if err == nil {
+			t.Fatal("stale refill committed after logical pool shrink")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale refill did not stop after logical pool shrink")
+	}
+	select {
+	case <-batchStarted:
+		t.Fatal("Cloud batch started for stale oversized refill")
+	default:
+	}
+	gotPool, err := metaStore.GetTenantPoolByID(ctx, logicalPool.PoolID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPool.Size != 1 {
+		t.Fatalf("logical pool size = %d, want 1", gotPool.Size)
+	}
+	if free, err := metaStore.CountTenantPoolFreeSlots(ctx, logicalPool.OrganizationID); err != nil || free != 0 {
+		t.Fatalf("free slots after rejected stale refill = %d, err=%v", free, err)
+	}
+	if _, err := srv.createFreeSharedPoolTenants(ctx, logicalPool.PoolID, 1,
+		tenant.CredentialProvisionRequest{}, nil); err != nil {
+		t.Fatalf("correctly sized refill after shrink: %v", err)
+	}
+	select {
+	case <-batchStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cloud batch did not start for correctly sized refill")
+	}
+	if free, err := metaStore.CountTenantPoolFreeSlots(ctx, logicalPool.OrganizationID); err != nil || free != 1 {
+		t.Fatalf("free slots after correctly sized refill = %d, err=%v", free, err)
+	}
+}
+
 func TestSharedTenantPoolRefillPlansWithServerOwnedSharedCredential(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -1468,6 +1668,75 @@ func TestAdminTenantPoolReplenishSubmitsLargeRefillAsSingleWave(t *testing.T) {
 	}
 	if got := prov.sharedPoolBatchMembers.Load(); got != 3 {
 		t.Fatalf("shared cloud batch members = %d, want 3 physical pools", got)
+	}
+}
+
+func TestManagedSharedDBCloudBatchRequestsAreGloballyBounded(t *testing.T) {
+	const wantMaxConcurrentBatches = 5
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(poolManager.Close)
+	poolManager.SetMetaStore(metaStore)
+	batchStarted := make(chan struct{}, 7)
+	batchRelease := make(chan struct{}, 7)
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1",
+		sharedPoolBatchStarted: batchStarted, sharedPoolBatchRelease: batchRelease}
+	srv := &Server{meta: metaStore, pool: poolManager, provisioner: prov, sharedDBMaxTenants: 1,
+		managedSharedDBCloudBatchSize: 1}
+	ctx := context.Background()
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}
+	dbIDs := make([]int64, 0, 7)
+	for range 7 {
+		row, err := srv.createManagedSharedDBPlan(ctx, "org-cloud-batch-bound", sharedDBProvisioningKey(cred))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dbIDs = append(dbIDs, row.ID)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, createErr := srv.provisionManagedSharedDBPoolsBatchWithCredentials(ctx, dbIDs, cred)
+		done <- createErr
+	}()
+	for i := 0; i < wantMaxConcurrentBatches; i++ {
+		select {
+		case <-batchStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Cloud batch %d did not start", i+1)
+		}
+	}
+	select {
+	case <-batchStarted:
+		t.Fatalf("more than %d Cloud batch requests started concurrently", wantMaxConcurrentBatches)
+	case <-time.After(150 * time.Millisecond):
+	}
+	batchRelease <- struct{}{}
+	select {
+	case <-batchStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("next Cloud batch did not start after a request slot was released")
+	}
+	close(batchRelease)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("provision managed shared DB batches: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Cloud batch provisioning did not finish")
 	}
 }
 

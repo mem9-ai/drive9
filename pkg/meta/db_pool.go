@@ -204,38 +204,6 @@ func (s *Store) CreateManagedSharedDBPool(ctx context.Context, in *SharedDB) (id
 	return insertManagedSharedDBPool(ctx, s.db, values)
 }
 
-// CreateManagedSharedDBPools atomically persists one complete physical refill
-// wave. A failure in any partition rolls back every plan in the wave.
-func (s *Store) CreateManagedSharedDBPools(ctx context.Context, inputs []*SharedDB) (ids []int64, err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "create_managed_shared_db_pools", start, &err)
-	if len(inputs) == 0 {
-		return []int64{}, nil
-	}
-	values := make([]managedSharedDBInsertValues, len(inputs))
-	for i, in := range inputs {
-		values[i], err = managedSharedDBInsertValuesFor(in)
-		if err != nil {
-			return nil, fmt.Errorf("validate managed db pool %d: %w", i, err)
-		}
-	}
-	ids = make([]int64, len(values))
-	err = s.InTx(ctx, func(tx *sql.Tx) error {
-		for i := range values {
-			id, insertErr := insertManagedSharedDBPool(ctx, tx, values[i])
-			if insertErr != nil {
-				return fmt.Errorf("insert managed db pool %d: %w", i, insertErr)
-			}
-			ids[i] = id
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return ids, nil
-}
-
 type managedSharedDBInsertValues struct {
 	poolUUID        string
 	organizationID  string
@@ -787,6 +755,8 @@ func (s *Store) listSharedDBsByStatusAfter(ctx context.Context, status string, a
 // This is the durable recovery path for a crash after physical activation but
 // before ActivateSharedTenantsBatch finishes.
 func (s *Store) ListActiveSharedDBsWithProvisioningTenantsAfter(ctx context.Context, afterID int64, limit int) (out []*SharedDB, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_active_shared_dbs_with_provisioning_tenants_after", start, &err)
 	if afterID < 0 {
 		return nil, fmt.Errorf("after db id must not be negative")
 	}

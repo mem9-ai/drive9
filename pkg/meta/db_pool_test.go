@@ -59,29 +59,6 @@ func TestSharedDBCapacityBounds(t *testing.T) {
 	}
 }
 
-func TestCreateManagedSharedDBPoolsRollsBackWholeWave(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	spendingLimit := MaxTiDBCloudSpendingLimit
-	duplicateUUID := "8a347c9f-6f08-49e9-a459-25bef73cbf2f"
-	inputs := []*SharedDB{
-		{UUID: duplicateUUID, TiDBCloudOrganizationID: "org-atomic-wave", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
-			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit},
-		{UUID: duplicateUUID, TiDBCloudOrganizationID: "org-atomic-wave", ProvisioningKey: bytes.Repeat([]byte{2}, 32),
-			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit},
-	}
-	if _, err := s.CreateManagedSharedDBPools(ctx, inputs); err == nil {
-		t.Fatal("CreateManagedSharedDBPools succeeded with a duplicate UUID inside the wave")
-	}
-	var rows int
-	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, "org-atomic-wave").Scan(&rows); err != nil {
-		t.Fatal(err)
-	}
-	if rows != 0 {
-		t.Fatalf("physical plans after failed wave = %d, want atomic rollback", rows)
-	}
-}
-
 func TestSharedDBReopenThresholdForRatio(t *testing.T) {
 	got, err := SharedDBReopenThresholdForRatio(10, 0.65)
 	if err != nil {

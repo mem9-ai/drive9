@@ -210,6 +210,8 @@ type Server struct {
 	sharedDBSpendingLimit int64
 
 	managedSharedDBCloudBatchSize           int
+	managedSharedDBCloudBatchSlots          chan struct{}
+	managedSharedDBCloudBatchSlotsOnce      sync.Once
 	managedSharedDBMetadataWorkers          int
 	managedSharedDBMetadataBatchSize        int
 	managedSharedDBMetadataPollInterval     time.Duration
@@ -363,6 +365,7 @@ const DefaultManagedSharedDBSpendingLimit = int64(1_000_000)
 
 const (
 	DefaultManagedSharedDBCloudBatchSize         = 50
+	defaultManagedSharedDBCloudBatchConcurrency  = 5
 	DefaultManagedSharedDBMetadataWorkers        = 15
 	DefaultManagedSharedDBMetadataBatchSize      = 30
 	DefaultManagedSharedDBMetadataPollInterval   = 15 * time.Second
