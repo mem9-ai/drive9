@@ -29,27 +29,40 @@ type fakeMutationRecord struct {
 	createdAt      time.Time
 }
 
+// incrQuotaUsageCountersCall records one non-no-op IncrQuotaUsageCountersTx
+// call for batch counter-aggregation assertions.
+type incrQuotaUsageCountersCall struct {
+	tenantID      string
+	storageDelta  int64
+	fileDelta     int64
+	mediaDelta    int64
+	reservedDelta int64
+}
+
 type fakeMetaQuotaStore struct {
-	mu                      sync.Mutex
-	usage                   map[string]*QuotaUsageView
-	config                  map[string]*QuotaConfigView
-	fileMeta                map[string]*FileMetaView
-	reservations            map[string]*UploadReservationView
-	monthly                 map[string]int64
-	llmUsage                []LLMUsageView
-	objectGCCandidates      []meta.ObjectGCCandidateInput
-	mutations               []fakeMutationRecord
-	nextID                  int64
-	markAppliedCalls        int // Finding B invariant: count MarkMutationAppliedTx calls (pre-guard, on-entry)
-	markBatchAppliedCalls   int // count MarkMutationsAppliedTx (dispatcher batch) calls
-	observePendingCalls     int
-	monthlyCostErr          error
-	insertMutationErr       error
-	objectGCCandidateErr    error
-	insertReservationErr    error // injected into AtomicReserveAndInsertUpload to simulate INSERT failure inside the tx
-	getReservationErr       error // injected into GetUploadReservation to simulate transient DB error
-	inTxHook                func(context.Context) error
-	alreadyAppliedOnMarkErr map[int64]bool
+	mu                          sync.Mutex
+	usage                       map[string]*QuotaUsageView
+	config                      map[string]*QuotaConfigView
+	fileMeta                    map[string]*FileMetaView
+	reservations                map[string]*UploadReservationView
+	monthly                     map[string]int64
+	llmUsage                    []LLMUsageView
+	objectGCCandidates          []meta.ObjectGCCandidateInput
+	mutations                   []fakeMutationRecord
+	nextID                      int64
+	markAppliedCalls            int // Finding B invariant: count MarkMutationAppliedTx calls (pre-guard, on-entry)
+	markBatchAppliedCalls       int // count MarkMutationsAppliedTx (dispatcher batch) calls
+	observePendingCalls         int
+	upsertFileMetaCalls         int // count UpsertFileMetaTx calls (no-op-skip assertions)
+	incrQuotaUsageCountersCalls []incrQuotaUsageCountersCall
+	counterMarkEvents           []string // "counters" / "mark" ordering probe for hot-row-last assertions
+	monthlyCostErr              error
+	insertMutationErr           error
+	objectGCCandidateErr        error
+	insertReservationErr        error // injected into AtomicReserveAndInsertUpload to simulate INSERT failure inside the tx
+	getReservationErr           error // injected into GetUploadReservation to simulate transient DB error
+	inTxHook                    func(context.Context) error
+	alreadyAppliedOnMarkErr     map[int64]bool
 }
 
 func (f *fakeMetaQuotaStore) EnqueueObjectGCCandidate(_ context.Context, c *meta.ObjectGCCandidateInput) error {
@@ -199,6 +212,30 @@ func (f *fakeMetaQuotaStore) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID 
 	return f.TransferReservedToConfirmed(context.Background(), tenantID, reservedDelta, storageDelta)
 }
 
+// IncrQuotaUsageCountersTx mirrors the real Store contract: one combined
+// counter update, skipping entirely (no recorded call) on all-zero deltas.
+func (f *fakeMetaQuotaStore) IncrQuotaUsageCountersTx(tx *sql.Tx, tenantID string, storageDelta, fileDelta, mediaDelta, reservedDelta int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if storageDelta == 0 && fileDelta == 0 && mediaDelta == 0 && reservedDelta == 0 {
+		return nil
+	}
+	f.incrQuotaUsageCountersCalls = append(f.incrQuotaUsageCountersCalls, incrQuotaUsageCountersCall{
+		tenantID:      tenantID,
+		storageDelta:  storageDelta,
+		fileDelta:     fileDelta,
+		mediaDelta:    mediaDelta,
+		reservedDelta: reservedDelta,
+	})
+	f.counterMarkEvents = append(f.counterMarkEvents, "counters")
+	u := f.ensureUsageLocked(tenantID)
+	u.StorageBytes += storageDelta
+	u.FileCount += fileDelta
+	u.MediaFileCount += mediaDelta
+	u.ReservedBytes += reservedDelta
+	return nil
+}
+
 // AtomicReserveAndInsertUpload models the real Store contract: claim
 // reserved_bytes and insert the reservation row inside a single (fake) tx.
 // If either step fails the state is fully rolled back — reserved_bytes is
@@ -246,7 +283,12 @@ func (f *fakeMetaQuotaStore) UpsertFileMeta(ctx context.Context, fm *FileMetaVie
 }
 
 func (f *fakeMetaQuotaStore) UpsertFileMetaTx(tx *sql.Tx, fm *FileMetaView) error {
-	return f.UpsertFileMeta(context.Background(), fm)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.upsertFileMetaCalls++
+	cp := *fm
+	f.fileMeta[metaKey(fm.TenantID, fm.FileID)] = &cp
+	return nil
 }
 
 func (f *fakeMetaQuotaStore) GetFileMeta(ctx context.Context, tenantID, fileID string) (*FileMetaView, error) {
@@ -498,6 +540,7 @@ func (f *fakeMetaQuotaStore) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
 	// MarkAppliedCalledExactlyOnce test even when the second call is a silent
 	// no-op on an already-applied row.
 	f.markAppliedCalls++
+	f.counterMarkEvents = append(f.counterMarkEvents, "mark")
 	for i := range f.mutations {
 		if f.mutations[i].id == id {
 			if f.alreadyAppliedOnMarkErr[id] {
@@ -818,8 +861,8 @@ func TestCentralQuotaPendingDeltaRetainedThenExpiresAfterInlineApplyFailure(t *t
 	}, quotaPendingDeltas{
 		storageDelta: 128,
 		fileDelta:    1,
-	}, func(context.Context, *sql.Tx) error {
-		return applyErr
+	}, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) {
+		return quotaCounterDeltas{}, applyErr
 	}); err != nil {
 		t.Fatalf("log and enqueue mutation: %v", err)
 	}

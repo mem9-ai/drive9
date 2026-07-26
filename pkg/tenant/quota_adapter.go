@@ -125,6 +125,10 @@ func (a *metaQuotaAdapter) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID st
 	return a.s.TransferReservedToConfirmedTx(tx, tenantID, reservedDelta, storageDelta)
 }
 
+func (a *metaQuotaAdapter) IncrQuotaUsageCountersTx(tx *sql.Tx, tenantID string, storageDelta, fileDelta, mediaDelta, reservedDelta int64) error {
+	return a.s.IncrQuotaUsageCountersTx(tx, tenantID, storageDelta, fileDelta, mediaDelta, reservedDelta)
+}
+
 // AtomicReserveAndInsertUpload is the preferred single-transaction API for the
 // upload-initiate path. See meta.Store.AtomicReserveAndInsertUpload for
 // invariants. Translates meta sentinels to backend sentinels for the caller.

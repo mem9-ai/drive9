@@ -230,7 +230,7 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 		NewSizeBytes:  newSizeBytes,
 		NewIsMedia:    newIsMedia,
 	}
-	return b.logAndEnqueueMutation(ctx, "upload_complete", data, quotaPendingDeltas{}, func(applyCtx context.Context, tx *sql.Tx) error {
+	return b.logAndEnqueueMutation(ctx, "upload_complete", data, quotaPendingDeltas{}, func(applyCtx context.Context, tx *sql.Tx) (quotaCounterDeltas, error) {
 		return applyUploadCompleteTx(applyCtx, b.metaStore, tx, b.tenantID, data)
 	})
 }
@@ -274,7 +274,13 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 // replay path calls it inside replayOne. Keeping the mark-applied call out
 // of this helper prevents a double-mark rollback trap if any future caller
 // also marks applied in the outer tx.
-func applyUploadCompleteTx(ctx context.Context, store MetaQuotaStore, tx *sql.Tx, tenantID string, data uploadCompleteMutationData) error {
+//
+// Counter updates are NOT executed inline: the reservation settle and the
+// file_meta upsert stay inline, but every tenant_quota_usage adjustment
+// (including the reserved_bytes decrement of the reserved→storage transfer)
+// is returned as quotaCounterDeltas for the caller to flush at the end of
+// the transaction ("hot row last" — see quotaCounterDeltas).
+func applyUploadCompleteTx(ctx context.Context, store MetaQuotaStore, tx *sql.Tx, tenantID string, data uploadCompleteMutationData) (quotaCounterDeltas, error) {
 	mediaDelta := int64(0)
 	switch {
 	case !data.OldIsMedia && data.NewIsMedia:
@@ -286,7 +292,7 @@ func applyUploadCompleteTx(ctx context.Context, store MetaQuotaStore, tx *sql.Tx
 	var oldMeta *FileMetaView
 	if old, err := store.GetFileMetaForUpdateTx(tx, tenantID, data.FileID); err != nil {
 		if !errors.Is(err, meta.ErrNotFound) {
-			return err
+			return quotaCounterDeltas{}, err
 		}
 	} else if old != nil {
 		oldExists = true
@@ -294,46 +300,33 @@ func applyUploadCompleteTx(ctx context.Context, store MetaQuotaStore, tx *sql.Tx
 	}
 	settled, reservedFileCountDelta, err := store.SettleActiveReservationTx(ctx, tx, tenantID, data.UploadID, "completed")
 	if err != nil {
-		return err
+		return quotaCounterDeltas{}, err
 	}
 	if !settled && oldMeta != nil && oldMeta.SizeBytes == data.NewSizeBytes && oldMeta.IsMedia == data.NewIsMedia {
-		return nil
+		return quotaCounterDeltas{}, nil
 	}
+	var deltas quotaCounterDeltas
 	if settled {
-		if err := store.TransferReservedToConfirmedTx(tx, tenantID, -data.ReservedBytes, data.ReservedBytes); err != nil {
-			return err
-		}
+		// Transfer reserved → storage as returned counter deltas.
+		deltas.reservedBytes -= data.ReservedBytes
+		deltas.storageBytes += data.ReservedBytes
 	} else {
 		// settled=false: fail-open initiate / already-settled / expiry sweep
 		// race. reserved_bytes is already balanced; charge storage directly.
-		if data.NewSizeBytes != 0 {
-			if err := store.IncrStorageBytesTx(tx, tenantID, data.NewSizeBytes); err != nil {
-				return err
-			}
-		}
+		deltas.storageBytes += data.NewSizeBytes
 	}
-	if data.OldSizeBytes != 0 {
-		if err := store.IncrStorageBytesTx(tx, tenantID, -data.OldSizeBytes); err != nil {
-			return err
-		}
-	}
+	deltas.storageBytes -= data.OldSizeBytes
 	if err := store.UpsertFileMetaTx(tx, &FileMetaView{
 		TenantID:  tenantID,
 		FileID:    data.FileID,
 		SizeBytes: data.NewSizeBytes,
 		IsMedia:   data.NewIsMedia,
 	}); err != nil {
-		return err
+		return quotaCounterDeltas{}, err
 	}
 	if !oldExists && (!settled || reservedFileCountDelta <= 0) {
-		if err := store.IncrFileCountTx(tx, tenantID, 1); err != nil {
-			return err
-		}
+		deltas.fileCount = 1
 	}
-	if mediaDelta != 0 {
-		if err := store.IncrMediaFileCountTx(tx, tenantID, mediaDelta); err != nil {
-			return err
-		}
-	}
-	return nil
+	deltas.mediaFileCount = mediaDelta
+	return deltas, nil
 }

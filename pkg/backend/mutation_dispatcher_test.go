@@ -37,11 +37,11 @@ func TestMutationDispatcherAppliesAcrossTenantsPreservingOrder(t *testing.T) {
 			tenantID := b.TenantID()
 			err := b.logAndEnqueueMutation(context.Background(), "file_create",
 				fileCreateMutationData{FileID: fmt.Sprintf("file-%d", n), SizeBytes: 1},
-				quotaPendingDeltas{}, func(context.Context, *sql.Tx) error {
+				quotaPendingDeltas{}, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) {
 					orderMu.Lock()
 					appliedOrder[tenantID] = append(appliedOrder[tenantID], n)
 					orderMu.Unlock()
-					return nil
+					return quotaCounterDeltas{}, nil
 				})
 			if err != nil {
 				t.Fatal(err)
@@ -97,11 +97,11 @@ func TestMutationBatchSingleTxForSameStore(t *testing.T) {
 		tenantID := fmt.Sprintf("batch-tenant-%d", i)
 		b := &Dat9Backend{}
 		b.SetMetaQuotaStore(context.Background(), tenantID, fake)
-		items = append(items, newDispatcherTestItem(t, b, fake, func(context.Context, *sql.Tx) error {
+		items = append(items, newDispatcherTestItem(t, b, fake, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) {
 			orderMu.Lock()
 			received = append(received, tenantID)
 			orderMu.Unlock()
-			return nil
+			return quotaCounterDeltas{}, nil
 		}))
 	}
 
@@ -141,10 +141,10 @@ func TestMutationBatchGroupsByStore(t *testing.T) {
 	bB.SetMetaQuotaStore(context.Background(), "store-b-tenant", fakeB)
 
 	items := []quotaMutationItem{
-		newDispatcherTestItem(t, bA, fakeA, func(context.Context, *sql.Tx) error { return nil }),
-		newDispatcherTestItem(t, bB, fakeB, func(context.Context, *sql.Tx) error { return nil }),
-		newDispatcherTestItem(t, bA, fakeA, func(context.Context, *sql.Tx) error { return nil }),
-		newDispatcherTestItem(t, bB, fakeB, func(context.Context, *sql.Tx) error { return nil }),
+		newDispatcherTestItem(t, bA, fakeA, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) { return quotaCounterDeltas{}, nil }),
+		newDispatcherTestItem(t, bB, fakeB, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) { return quotaCounterDeltas{}, nil }),
+		newDispatcherTestItem(t, bA, fakeA, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) { return quotaCounterDeltas{}, nil }),
+		newDispatcherTestItem(t, bB, fakeB, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) { return quotaCounterDeltas{}, nil }),
 	}
 
 	processMutationBatch(context.Background(), items)
@@ -189,8 +189,8 @@ func TestMutationBatchGroupsByStoreIdentity(t *testing.T) {
 	bB.SetMetaQuotaStore(context.Background(), "identity-tenant-b", storeB)
 
 	items := []quotaMutationItem{
-		newDispatcherTestItem(t, bA, storeA, func(context.Context, *sql.Tx) error { return nil }),
-		newDispatcherTestItem(t, bB, storeB, func(context.Context, *sql.Tx) error { return nil }),
+		newDispatcherTestItem(t, bA, storeA, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) { return quotaCounterDeltas{}, nil }),
+		newDispatcherTestItem(t, bB, storeB, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) { return quotaCounterDeltas{}, nil }),
 	}
 
 	processMutationBatch(context.Background(), items)
@@ -222,8 +222,8 @@ func TestMutationBatchAlreadyAppliedMarkFallsBackToPerItem(t *testing.T) {
 	b2.SetMetaQuotaStore(context.Background(), "aa-tenant-2", fake)
 
 	items := []quotaMutationItem{
-		newDispatcherTestItem(t, b1, fake, func(context.Context, *sql.Tx) error { return nil }),
-		newDispatcherTestItem(t, b2, fake, func(context.Context, *sql.Tx) error { return nil }),
+		newDispatcherTestItem(t, b1, fake, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) { return quotaCounterDeltas{}, nil }),
+		newDispatcherTestItem(t, b2, fake, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) { return quotaCounterDeltas{}, nil }),
 	}
 	// Pre-apply the first item outside the dispatcher so the batch mark fails
 	// with an already-applied-wrapping error on the whole batch.
@@ -265,10 +265,10 @@ func TestMutationBatchPoisonItemFallsBackToPerItem(t *testing.T) {
 	good2 := &Dat9Backend{}
 	good2.SetMetaQuotaStore(context.Background(), "good-tenant-2", fake)
 
-	goodApply := func(context.Context, *sql.Tx) error { return nil }
+	goodApply := func(context.Context, *sql.Tx) (quotaCounterDeltas, error) { return quotaCounterDeltas{}, nil }
 	items := []quotaMutationItem{
 		newDispatcherTestItem(t, good1, fake, goodApply),
-		newDispatcherTestItem(t, poison, fake, func(context.Context, *sql.Tx) error { return poisonErr }),
+		newDispatcherTestItem(t, poison, fake, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) { return quotaCounterDeltas{}, poisonErr }),
 		newDispatcherTestItem(t, good2, fake, goodApply),
 	}
 
@@ -307,9 +307,9 @@ func TestEnqueueMutationItemInlineWhenDispatcherNotStarted(t *testing.T) {
 	var applied atomic.Int64
 	err := b.logAndEnqueueMutation(context.Background(), "file_create",
 		fileCreateMutationData{FileID: "inline-file", SizeBytes: 1},
-		quotaPendingDeltas{}, func(context.Context, *sql.Tx) error {
+		quotaPendingDeltas{}, func(context.Context, *sql.Tx) (quotaCounterDeltas, error) {
 			applied.Add(1)
-			return nil
+			return quotaCounterDeltas{}, nil
 		})
 	if err != nil {
 		t.Fatal(err)
@@ -330,7 +330,7 @@ func TestEnqueueMutationItemInlineWhenDispatcherNotStarted(t *testing.T) {
 // newDispatcherTestItem durably logs a mutation through the backend and
 // builds the dispatcher item exactly the way logAndEnqueueMutation does,
 // including the mutationWG slot the worker releases after processing.
-func newDispatcherTestItem(t *testing.T, b *Dat9Backend, store MetaQuotaStore, apply func(context.Context, *sql.Tx) error) quotaMutationItem {
+func newDispatcherTestItem(t *testing.T, b *Dat9Backend, store MetaQuotaStore, apply func(context.Context, *sql.Tx) (quotaCounterDeltas, error)) quotaMutationItem {
 	t.Helper()
 	logID, err := b.logQuotaMutation(context.Background(), "file_create", fileCreateMutationData{FileID: "f", SizeBytes: 1})
 	if err != nil {

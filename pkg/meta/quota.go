@@ -664,6 +664,34 @@ func (s *Store) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID string, reser
 	return ensureRowsAffected(res, tenantID)
 }
 
+// IncrQuotaUsageCountersTx atomically adjusts all four quota usage counters
+// with a single UPDATE inside a transaction. It mirrors the per-counter
+// Incr*Tx semantics exactly (plain additive deltas, no clamping, and the
+// tenant row must already exist), but collapses what used to be one
+// statement per touched counter into one statement for the whole batch.
+// The batched mutation apply paths call this at the END of their
+// transaction ("hot row last") so the per-tenant tenant_quota_usage row is
+// locked only just before commit instead of from the first mutation apply.
+// It is a no-op when every delta is zero, so callers may invoke it
+// unconditionally.
+func (s *Store) IncrQuotaUsageCountersTx(tx *sql.Tx, tenantID string, storageDelta, fileDelta, mediaDelta, reservedDelta int64) error {
+	if storageDelta == 0 && fileDelta == 0 && mediaDelta == 0 && reservedDelta == 0 {
+		return nil
+	}
+	res, err := tx.Exec(
+		`UPDATE tenant_quota_usage
+		 SET storage_bytes = storage_bytes + ?,
+		     file_count = file_count + ?,
+		     media_file_count = media_file_count + ?,
+		     reserved_bytes = reserved_bytes + ?
+		 WHERE tenant_id = ?`,
+		storageDelta, fileDelta, mediaDelta, reservedDelta, tenantID)
+	if err != nil {
+		return err
+	}
+	return ensureRowsAffected(res, tenantID)
+}
+
 // defaultMaxStorageBytes is the fallback limit when no per-tenant config row exists.
 var defaultMaxStorageBytes atomic.Int64
 var defaultMaxFileSizeBytes atomic.Int64
