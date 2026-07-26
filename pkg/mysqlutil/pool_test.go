@@ -112,6 +112,15 @@ func TestSharedPoolDurationEnv(t *testing.T) {
 	}
 }
 
+func TestSharedPoolDurationEnvRejectsZeroIdleTime(t *testing.T) {
+	t.Setenv("DRIVE9_SHARED_DB_CONN_MAX_IDLE_TIME", "0s")
+
+	_, idleTime := poolLifetime(RoleShared)
+	if idleTime != defaultSharedConnMaxIdleTime {
+		t.Fatalf("shared idle time = %s, want default %s", idleTime, defaultSharedConnMaxIdleTime)
+	}
+}
+
 func TestMetaPoolDurationEnvAllowsZeroIdleTime(t *testing.T) {
 	t.Setenv("DRIVE9_META_DB_CONN_MAX_LIFETIME", "1h")
 	t.Setenv("DRIVE9_META_DB_CONN_MAX_IDLE_TIME", "0s")
@@ -119,5 +128,15 @@ func TestMetaPoolDurationEnvAllowsZeroIdleTime(t *testing.T) {
 	lifetime, idleTime := poolLifetime(RoleMeta)
 	if lifetime != time.Hour || idleTime != 0 {
 		t.Fatalf("meta env durations = %s/%s, want 1h/0s", lifetime, idleTime)
+	}
+}
+
+func TestMetaPoolDurationEnvRejectsZeroLifetime(t *testing.T) {
+	t.Setenv("DRIVE9_META_DB_CONN_MAX_LIFETIME", "0s")
+	t.Setenv("DRIVE9_META_DB_CONN_MAX_IDLE_TIME", "0s")
+
+	lifetime, idleTime := poolLifetime(RoleMeta)
+	if lifetime != defaultMetaConnMaxLifetime || idleTime != 0 {
+		t.Fatalf("meta env durations = %s/%s, want default %s/0s", lifetime, idleTime, defaultMetaConnMaxLifetime)
 	}
 }

@@ -63,7 +63,7 @@ func poolLifetime(role string) (time.Duration, time.Duration) {
 		return lifetime, idleTime
 	}
 	return poolEnvDuration(role, "CONN_MAX_LIFETIME", lifetime, false),
-		poolEnvDuration(role, "CONN_MAX_IDLE_TIME", idleTime, true)
+		poolEnvDuration(role, "CONN_MAX_IDLE_TIME", idleTime, role == RoleMeta)
 }
 
 func defaultPoolLifetime(role string) (time.Duration, time.Duration) {
