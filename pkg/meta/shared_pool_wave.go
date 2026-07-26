@@ -32,6 +32,14 @@ type ManagedSharedDBPoolWaveResult struct {
 	TenantIDs []string
 }
 
+// ManagedSharedDBPoolWaveResize atomically grows the logical tenant pool with
+// a shared physical-pool reservation wave. ExpectedSize fences stale admin
+// decisions; TargetSize is the capacity limit published with the wave.
+type ManagedSharedDBPoolWaveResize struct {
+	ExpectedSize int
+	TargetSize   int
+}
+
 type preparedManagedSharedDBPoolWavePlan struct {
 	values  managedSharedDBInsertValues
 	members []ManagedSharedDBPoolWaveMember
@@ -53,7 +61,13 @@ func multiRowPlaceholders(rows, columns int) string {
 // together with all logical tenant reservations assigned to it. A direct
 // allocator therefore cannot observe refill-staged physical capacity before
 // tenant_count, placements, and pool memberships account for the wave.
-func (s *Store) CreateManagedSharedDBPoolTenantWave(ctx context.Context, plans []ManagedSharedDBPoolWavePlan) (out []ManagedSharedDBPoolWaveResult, err error) {
+func (s *Store) CreateManagedSharedDBPoolTenantWave(ctx context.Context, plans []ManagedSharedDBPoolWavePlan) ([]ManagedSharedDBPoolWaveResult, error) {
+	return s.CreateManagedSharedDBPoolTenantWaveWithResize(ctx, plans, nil)
+}
+
+// CreateManagedSharedDBPoolTenantWaveWithResize stages a wave and optionally
+// grows its logical pool in the same transaction.
+func (s *Store) CreateManagedSharedDBPoolTenantWaveWithResize(ctx context.Context, plans []ManagedSharedDBPoolWavePlan, resize *ManagedSharedDBPoolWaveResize) (out []ManagedSharedDBPoolWaveResult, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "create_managed_shared_db_pool_tenant_wave", start, &err)
 	if len(plans) == 0 {
@@ -131,7 +145,7 @@ func (s *Store) CreateManagedSharedDBPoolTenantWave(ctx context.Context, plans [
 			// tenant/quota/profile staging. If delete or shrink committed first,
 			// the complete uncommitted wave rolls back before any membership is
 			// published or Cloud request can start.
-			if validateErr := validateManagedSharedDBPoolWaveOwnership(ctx, tx, wavePoolID, waveOrganizationID, waveMemberCount); validateErr != nil {
+			if validateErr := validateManagedSharedDBPoolWaveOwnership(ctx, tx, wavePoolID, waveOrganizationID, waveMemberCount, resize); validateErr != nil {
 				return validateErr
 			}
 			for i := range staged {
@@ -258,7 +272,7 @@ func stageManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, dbID i
 		placementArgs: placementArgs, membershipArgs: membershipArgs}, nil
 }
 
-func validateManagedSharedDBPoolWaveOwnership(ctx context.Context, tx *sql.Tx, poolID, organizationID string, incoming int) error {
+func validateManagedSharedDBPoolWaveOwnership(ctx context.Context, tx *sql.Tx, poolID, organizationID string, incoming int, resize *ManagedSharedDBPoolWaveResize) error {
 	var currentOrganizationID sql.NullString
 	var size int
 	var status TenantPoolStatus
@@ -276,7 +290,18 @@ func validateManagedSharedDBPoolWaveOwnership(ctx context.Context, tx *sql.Tx, p
 	if !currentOrganizationID.Valid || strings.TrimSpace(currentOrganizationID.String) != organizationID {
 		return fmt.Errorf("logical tenant pool %q organization does not match refill wave", poolID)
 	}
-	var nativeSlots, sharedSlots int
+	capacityLimit := size
+	if resize != nil {
+		if resize.ExpectedSize <= 0 || resize.TargetSize <= resize.ExpectedSize {
+			return fmt.Errorf("invalid logical tenant pool grow contract")
+		}
+		if size != resize.ExpectedSize {
+			return fmt.Errorf("logical tenant pool %q size changed: have=%d expected=%d", poolID, size, resize.ExpectedSize)
+		}
+		capacityLimit = resize.TargetSize
+	}
+
+	var nativeSlots, sharedActiveSlots, sharedPlannedSlots int
 	// Match leader refill accounting: native work is request-credential-owned,
 	// so only active native inventory offsets a leader-owned shared wave.
 	err = tx.QueryRowContext(ctx, `SELECT COUNT(*)
@@ -293,15 +318,48 @@ func validateManagedSharedDBPoolWaveOwnership(ctx context.Context, tx *sql.Tx, p
 		FROM tenant_pool_memberships m
 		STRAIGHT_JOIN tenants t ON t.id = m.tenant_id
 		WHERE m.pool_id = ? AND m.tidbcloud_organization_id = ? AND m.pool_status = ? AND t.provider = ?
-			AND t.status IN (?, ?, ?) FOR UPDATE`,
+			AND t.status = ? FOR UPDATE`,
 		poolID, organizationID, TenantPoolBindingFree, tidbCloudNativeSharedProvider,
-		TenantPending, TenantProvisioning, TenantActive).Scan(&sharedSlots)
+		TenantActive).Scan(&sharedActiveSlots)
 	if err != nil {
-		return fmt.Errorf("count logical tenant pool %q shared slots: %w", poolID, err)
+		return fmt.Errorf("count logical tenant pool %q active shared slots: %w", poolID, err)
 	}
-	current := nativeSlots + sharedSlots
-	if current+incoming > size {
-		return fmt.Errorf("logical tenant pool %q capacity changed: durable=%d incoming=%d size=%d", poolID, current, incoming, size)
+	// A pending/provisioning membership is planned capacity only while its fs,
+	// placement, and non-terminal physical DB attempt still exist. This matches
+	// CountTenantPoolPlannedSlots and prevents orphan memberships from fencing
+	// otherwise valid replacement waves.
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM tenant_pool_memberships m
+		STRAIGHT_JOIN tenants t ON t.id = m.tenant_id
+		STRAIGHT_JOIN fs_registry f ON f.tenant_id = t.id
+		STRAIGHT_JOIN tenant_placements p ON p.fs_id = f.fs_id
+		STRAIGHT_JOIN db_pool d ON d.db_id = p.db_id
+		WHERE m.pool_id = ? AND m.tidbcloud_organization_id = ? AND m.pool_status = ? AND t.provider = ?
+			AND t.status IN (?, ?) AND d.status IN (?, ?, ?) FOR UPDATE`,
+		poolID, organizationID, TenantPoolBindingFree, tidbCloudNativeSharedProvider,
+		TenantPending, TenantProvisioning, SharedDBStatusPending, SharedDBStatusProvisioning, SharedDBStatusActive).
+		Scan(&sharedPlannedSlots)
+	if err != nil {
+		return fmt.Errorf("count logical tenant pool %q planned shared slots: %w", poolID, err)
+	}
+	current := nativeSlots + sharedActiveSlots + sharedPlannedSlots
+	if current+incoming > capacityLimit {
+		return fmt.Errorf("logical tenant pool %q capacity changed: durable=%d incoming=%d size=%d", poolID, current, incoming, capacityLimit)
+	}
+	if resize != nil {
+		res, updateErr := tx.ExecContext(ctx, `UPDATE tenant_tidbcloud_pools
+			SET size = ?, updated_at = ? WHERE pool_id = ? AND size = ? AND status = ?`,
+			resize.TargetSize, time.Now().UTC(), poolID, resize.ExpectedSize, TenantPoolActive)
+		if updateErr != nil {
+			return fmt.Errorf("grow logical tenant pool %q: %w", poolID, updateErr)
+		}
+		updated, rowsErr := res.RowsAffected()
+		if rowsErr != nil {
+			return fmt.Errorf("grow logical tenant pool %q rows affected: %w", poolID, rowsErr)
+		}
+		if updated != 1 {
+			return fmt.Errorf("grow logical tenant pool %q affected %d rows, want 1", poolID, updated)
+		}
 	}
 	return nil
 }

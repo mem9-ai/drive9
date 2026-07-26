@@ -424,7 +424,13 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 				"free_size", freeSize,
 				"slot_size", slotSize,
 				"grow_count", growCount)...)
-			results, err := s.createFreePoolTenants(ctx, pool.PoolID, growCount, cred, nil)
+			var results []*provisionTenantResult
+			if s.defaultTenantProvider == tenant.ProviderTiDBCloudNativeShared && targetSize > pool.Size {
+				results, err = s.createFreeSharedPoolTenantsWithResize(ctx, pool.PoolID, growCount, cred, nil,
+					&meta.ManagedSharedDBPoolWaveResize{ExpectedSize: pool.Size, TargetSize: targetSize})
+			} else {
+				results, err = s.createFreePoolTenants(ctx, pool.PoolID, growCount, cred, nil)
+			}
 			if err != nil {
 				logger.Error(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_update_grow_failed",
 					"provider", tenant.ProviderTiDBCloudNative,
@@ -957,6 +963,10 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 }
 
 func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string, count int, _ tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) ([]*provisionTenantResult, error) {
+	return s.createFreeSharedPoolTenantsWithResize(ctx, poolID, count, tenant.CredentialProvisionRequest{}, quotaOpt, nil)
+}
+
+func (s *Server) createFreeSharedPoolTenantsWithResize(ctx context.Context, poolID string, count int, _ tenant.CredentialProvisionRequest, quotaOpt *quotaRequest, resize *meta.ManagedSharedDBPoolWaveResize) ([]*provisionTenantResult, error) {
 	if count <= 0 {
 		return []*provisionTenantResult{}, nil
 	}
@@ -975,7 +985,7 @@ func (s *Server) createFreeSharedPoolTenants(ctx context.Context, poolID string,
 	if organizationID == "" {
 		return nil, fmt.Errorf("shared tenant pool organization is required")
 	}
-	partitions, err := s.stageSharedPoolTenantWave(ctx, poolID, organizationID, sharedCred, count, quotaOpt)
+	partitions, err := s.stageSharedPoolTenantWave(ctx, poolID, organizationID, sharedCred, count, quotaOpt, resize)
 	if err != nil {
 		return nil, err
 	}
@@ -1027,7 +1037,7 @@ type sharedPoolTenantPartition struct {
 	tenantIDs []string
 }
 
-func (s *Server) stageSharedPoolTenantWave(ctx context.Context, poolID, organizationID string, cred tenant.CredentialProvisionRequest, count int, quotaOpt *quotaRequest) ([]sharedPoolTenantPartition, error) {
+func (s *Server) stageSharedPoolTenantWave(ctx context.Context, poolID, organizationID string, cred tenant.CredentialProvisionRequest, count int, quotaOpt *quotaRequest, resize *meta.ManagedSharedDBPoolWaveResize) ([]sharedPoolTenantPartition, error) {
 	if count <= 0 {
 		return nil, nil
 	}
@@ -1070,7 +1080,7 @@ func (s *Server) stageSharedPoolTenantWave(ctx context.Context, poolID, organiza
 		plans = append(plans, meta.ManagedSharedDBPoolWavePlan{DB: row, Members: members})
 		remaining -= assigned
 	}
-	created, err := s.meta.CreateManagedSharedDBPoolTenantWave(ctx, plans)
+	created, err := s.meta.CreateManagedSharedDBPoolTenantWaveWithResize(ctx, plans, resize)
 	if err != nil {
 		return nil, err
 	}

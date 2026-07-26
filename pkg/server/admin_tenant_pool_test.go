@@ -599,6 +599,77 @@ func TestSharedTenantPoolRefillDoesNotOverfillAfterLogicalPoolShrink(t *testing.
 	}
 }
 
+func TestSharedTenantPoolWaveIgnoresOrphanPendingMembershipCapacity(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(poolManager.Close)
+	poolManager.SetMetaStore(metaStore)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	logicalPool := &meta.TenantPool{
+		PoolID: "pool-orphan-pending", OrganizationID: "org-orphan-pending", Size: 2,
+		Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := metaStore.CreateTenantPool(ctx, logicalPool); err != nil {
+		t.Fatalf("CreateTenantPool: %v", err)
+	}
+	prov := &fakeProvisioner{
+		provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1",
+		identityOrg: logicalPool.OrganizationID,
+	}
+	srv := NewWithConfig(Config{
+		Meta: metaStore, Pool: poolManager, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, SharedDBMaxTenants: 1,
+		TokenSecret: make([]byte, 32), Leader: newFollowerLeaderManager(t, metaStore),
+	})
+	t.Cleanup(srv.Close)
+
+	const orphanTenantID = "tenant-orphan-pending-membership"
+	if err := srv.insertPendingPoolTenant(ctx, orphanTenantID, tenant.ProviderTiDBCloudNativeShared, now); err != nil {
+		t.Fatalf("insert orphan tenant: %v", err)
+	}
+	if err := metaStore.UpsertTenantPoolMembership(ctx, &meta.TenantPoolMembership{
+		TenantID: orphanTenantID, TiDBCloudOrganizationID: logicalPool.OrganizationID,
+		PoolID: logicalPool.PoolID, PoolStatus: meta.TenantPoolBindingFree,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("insert orphan membership: %v", err)
+	}
+
+	results, err := srv.createFreeSharedPoolTenants(ctx, logicalPool.PoolID, logicalPool.Size,
+		tenant.CredentialProvisionRequest{}, nil)
+	if err != nil {
+		t.Fatalf("create valid shared wave: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("valid wave members = %d, want 2", len(results))
+	}
+	if got := prov.sharedPoolBatchMembers.Load(); got != 2 {
+		t.Fatalf("physical Cloud creates = %d, want 2", got)
+	}
+	var memberships int
+	if err := metaStore.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM tenant_pool_memberships WHERE pool_id = ?`, logicalPool.PoolID).Scan(&memberships); err != nil {
+		t.Fatal(err)
+	}
+	if memberships != 3 {
+		t.Fatalf("memberships = %d, want orphan plus two valid members", memberships)
+	}
+}
+
 func TestSharedTenantPoolRefillPlansWithServerOwnedSharedCredential(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
