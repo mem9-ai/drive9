@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
@@ -93,19 +95,19 @@ func sharedDBAllocationIdentity(organizationID string, provisioningKey []byte) s
 	return fmt.Sprintf("credential:%x", provisioningKey)
 }
 
-type sharedDBAllocationLocalLock struct {
+type sharedDBLocalLock struct {
 	mu        sync.Mutex
 	semaphore chan struct{}
 	refs      int
 }
 
-func (s *Server) acquireSharedDBAllocationLocalLock(ctx context.Context, identity string) (*sharedDBAllocationLocalLock, error) {
+func acquireSharedDBLocalLock(ctx context.Context, locks *sync.Map, identity string) (*sharedDBLocalLock, error) {
 	for {
-		candidate := &sharedDBAllocationLocalLock{semaphore: make(chan struct{}, 1)}
-		value, _ := s.sharedDBAllocationLocks.LoadOrStore(identity, candidate)
-		localLock := value.(*sharedDBAllocationLocalLock)
+		candidate := &sharedDBLocalLock{semaphore: make(chan struct{}, 1)}
+		value, _ := locks.LoadOrStore(identity, candidate)
+		localLock := value.(*sharedDBLocalLock)
 		localLock.mu.Lock()
-		current, loaded := s.sharedDBAllocationLocks.Load(identity)
+		current, loaded := locks.Load(identity)
 		if !loaded || current != localLock {
 			localLock.mu.Unlock()
 			continue
@@ -117,31 +119,50 @@ func (s *Server) acquireSharedDBAllocationLocalLock(ctx context.Context, identit
 		case localLock.semaphore <- struct{}{}:
 			return localLock, nil
 		case <-ctx.Done():
-			s.releaseSharedDBAllocationLocalLock(identity, localLock, false)
+			releaseSharedDBLocalLock(locks, identity, localLock, false)
 			return nil, ctx.Err()
 		}
 	}
 }
 
-func (s *Server) releaseSharedDBAllocationLocalLock(identity string, localLock *sharedDBAllocationLocalLock, held bool) {
+func releaseSharedDBLocalLock(locks *sync.Map, identity string, localLock *sharedDBLocalLock, held bool) {
 	if held {
 		<-localLock.semaphore
 	}
 	localLock.mu.Lock()
 	localLock.refs--
 	if localLock.refs == 0 {
-		s.sharedDBAllocationLocks.CompareAndDelete(identity, localLock)
+		locks.CompareAndDelete(identity, localLock)
 	}
 	localLock.mu.Unlock()
 }
 
 func (s *Server) withSharedDBAllocationLock(ctx context.Context, identity string, fn func(context.Context) error) error {
-	localLock, err := s.acquireSharedDBAllocationLocalLock(ctx, identity)
+	localLock, err := acquireSharedDBLocalLock(ctx, &s.sharedDBAllocationLocks, identity)
 	if err != nil {
 		return err
 	}
-	defer s.releaseSharedDBAllocationLocalLock(identity, localLock, true)
+	defer releaseSharedDBLocalLock(&s.sharedDBAllocationLocks, identity, localLock, true)
 	return s.meta.WithSharedDBAllocationLock(ctx, identity, fn)
+}
+
+func (s *Server) withSharedDBPoolWorkLock(ctx context.Context, dbID int64, fn func(context.Context) error) error {
+	identity := fmt.Sprintf("pool-work:%d", dbID)
+	localLock, err := acquireSharedDBLocalLock(ctx, &s.sharedDBAllocationLocks, identity)
+	if err != nil {
+		return err
+	}
+	defer releaseSharedDBLocalLock(&s.sharedDBAllocationLocks, identity, localLock, true)
+	return s.meta.WithSharedDBPoolWorkLock(ctx, dbID, fn)
+}
+
+func (s *Server) withSharedDBReservationLock(ctx context.Context, identity string, fn func() error) error {
+	localLock, err := acquireSharedDBLocalLock(ctx, &s.sharedDBReservationLocks, identity)
+	if err != nil {
+		return err
+	}
+	defer releaseSharedDBLocalLock(&s.sharedDBReservationLocks, identity, localLock, true)
+	return fn()
 }
 
 func managedSharedDBDSN(info *meta.SharedDB, password string) string {
@@ -189,18 +210,29 @@ func generateManagedSharedDBRootPassword(length int) (string, error) {
 }
 
 func (s *Server) materializeSharedTenantQuota(ctx context.Context, tenantID string, opts provisionTenantOptions) error {
+	cfg, err := s.sharedTenantQuotaConfig(tenantID, opts)
+	if err != nil {
+		return err
+	}
+	if err := s.meta.SetQuotaConfig(ctx, cfg); err != nil {
+		return fmt.Errorf("materialize shared tenant quota: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) sharedTenantQuotaConfig(tenantID string, opts provisionTenantOptions) (*meta.QuotaConfig, error) {
 	virtualLimit := s.sharedTenantVirtualSpendingLimit(opts)
 	var patch meta.QuotaConfigPatch
 	if opts.Quota != nil {
 		req := *opts.Quota
 		req.TenantID = tenantID
 		if err := s.validateQuotaSetRequest(req); err != nil {
-			return err
+			return nil, err
 		}
 		var err error
 		patch, err = quotaConfigPatchFromRequest(req)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	cfg := &meta.QuotaConfig{
@@ -221,10 +253,7 @@ func (s *Server) materializeSharedTenantQuota(ctx context.Context, tenantID stri
 	if patch.MaxFileCount != nil {
 		cfg.MaxFileCount = *patch.MaxFileCount
 	}
-	if err := s.meta.SetQuotaConfig(ctx, cfg); err != nil {
-		return fmt.Errorf("materialize shared tenant quota: %w", err)
-	}
-	return nil
+	return cfg, nil
 }
 
 func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.CredentialProvisionRequest, reserve func(*meta.SharedDB) error) (sharedDB *meta.SharedDB, created bool, err error) {
@@ -235,90 +264,118 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 	return s.allocateManagedSharedDBForOrganization(ctx, organizationID, cred, reserve)
 }
 
+func (s *Server) createManagedSharedDBPlan(ctx context.Context, organizationID string, provisioningKey []byte) (*meta.SharedDB, error) {
+	row, err := s.newManagedSharedDBPlan(ctx, organizationID, provisioningKey)
+	if err != nil {
+		return nil, err
+	}
+	id, err := s.meta.CreateManagedSharedDBPool(ctx, row)
+	if err != nil {
+		return nil, err
+	}
+	row.ID = id
+	return row, nil
+}
+
+func (s *Server) newManagedSharedDBPlan(ctx context.Context, organizationID string, provisioningKey []byte) (*meta.SharedDB, error) {
+	maxTenants, fixedTarget := s.managedSharedDBPolicy()
+	cloudProvider, region := provisioningCloudRegion(s.provisioner)
+	rootPassword, err := generateManagedSharedDBRootPassword(24)
+	if err != nil {
+		return nil, err
+	}
+	passwordCipher, err := s.pool.Encrypt(ctx, []byte(rootPassword))
+	if err != nil {
+		return nil, fmt.Errorf("encrypt shared db root password: %w", err)
+	}
+	row := &meta.SharedDB{
+		UUID:                    uuid.NewString(),
+		TiDBCloudOrganizationID: organizationID,
+		ProvisioningKey:         append([]byte(nil), provisioningKey...),
+		CloudProvider:           cloudProvider,
+		Region:                  region,
+		Role:                    meta.SharedDBRoleShared,
+		MaxTenants:              maxTenants,
+		SpendingLimit:           &fixedTarget,
+		PasswordCipher:          passwordCipher,
+		Name:                    s.defaultSharedDatabaseName(),
+		Status:                  meta.SharedDBStatusPending,
+	}
+	return row, nil
+}
+
 func (s *Server) allocateManagedSharedDBForOrganization(ctx context.Context, organizationID string, cred tenant.CredentialProvisionRequest, reserve func(*meta.SharedDB) error) (sharedDB *meta.SharedDB, created bool, err error) {
+	provisioningKey := sharedDBProvisioningKey(cred)
+	identity := sharedDBAllocationIdentity(organizationID, provisioningKey)
+	planAndReserve := func() error {
+		return s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
+			for attempt := 0; attempt < 2; attempt++ {
+				candidate, findErr := s.meta.FindSharedDBForAllocation(lockCtx, organizationID)
+				if findErr == nil {
+					sharedDB = candidate
+				} else if !errors.Is(findErr, meta.ErrNotFound) {
+					return findErr
+				} else if organizationID != "" {
+					manual, manualErr := s.meta.FindSharedDBForOrg(lockCtx, organizationID)
+					if manualErr == nil && manual.SpendingLimit == nil {
+						sharedDB = manual
+					} else if manualErr != nil && !errors.Is(manualErr, meta.ErrNotFound) {
+						return manualErr
+					}
+				}
+				if sharedDB == nil {
+					var createErr error
+					sharedDB, createErr = s.createManagedSharedDBPlan(lockCtx, organizationID, provisioningKey)
+					if createErr != nil {
+						return createErr
+					}
+					created = true
+				}
+				if reserve == nil {
+					return nil
+				}
+				reserveErr := reserve(sharedDB)
+				if reserveErr == nil {
+					return nil
+				}
+				if !errors.Is(reserveErr, meta.ErrSharedDBCapacityExhausted) {
+					return reserveErr
+				}
+				sharedDB = nil
+				created = false
+			}
+			return meta.ErrSharedDBCapacityExhausted
+		})
+	}
+	if reserve == nil {
+		err = planAndReserve()
+		return sharedDB, created, err
+	}
 	// Capacity reservation is transactional in CompleteSharedTenant* and does
-	// not need the organization-wide planning lock. This fast path lets tenant
-	// pool refill consume existing capacity concurrently; the lock below is
-	// reserved for planning a new physical pool.
-	if reserve != nil {
+	// not need a cross-pod lock while existing capacity is available. Serialize
+	// this Pod's complete same-organization lookup, optional physical planning,
+	// and reservation transition so a fast-path worker cannot steal a pool that
+	// another local worker just created but has not reserved yet. Different
+	// organizations and Pods remain independent.
+	err = s.withSharedDBReservationLock(ctx, identity, func() error {
 		for attempt := 0; attempt < 2; attempt++ {
 			candidate, findErr := s.meta.FindSharedDBForAllocation(ctx, organizationID)
 			if errors.Is(findErr, meta.ErrNotFound) {
 				break
 			}
 			if findErr != nil {
-				return nil, false, findErr
+				return findErr
 			}
 			reserveErr := reserve(candidate)
 			if reserveErr == nil {
-				return candidate, false, nil
-			}
-			if !errors.Is(reserveErr, meta.ErrSharedDBCapacityExhausted) {
-				return nil, false, reserveErr
-			}
-		}
-	}
-	provisioningKey := sharedDBProvisioningKey(cred)
-	identity := sharedDBAllocationIdentity(organizationID, provisioningKey)
-	err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
-		for attempt := 0; attempt < 2; attempt++ {
-			candidate, findErr := s.meta.FindSharedDBForAllocation(lockCtx, organizationID)
-			if findErr == nil {
 				sharedDB = candidate
-			} else if !errors.Is(findErr, meta.ErrNotFound) {
-				return findErr
-			} else if organizationID != "" {
-				manual, manualErr := s.meta.FindSharedDBForOrg(lockCtx, organizationID)
-				if manualErr == nil && manual.SpendingLimit == nil {
-					sharedDB = manual
-				} else if manualErr != nil && !errors.Is(manualErr, meta.ErrNotFound) {
-					return manualErr
-				}
-			}
-			if sharedDB == nil {
-				maxTenants, fixedTarget := s.managedSharedDBPolicy()
-				cloudProvider, region := provisioningCloudRegion(s.provisioner)
-				rootPassword, passwordErr := generateManagedSharedDBRootPassword(24)
-				if passwordErr != nil {
-					return passwordErr
-				}
-				passwordCipher, encryptErr := s.pool.Encrypt(lockCtx, []byte(rootPassword))
-				if encryptErr != nil {
-					return fmt.Errorf("encrypt shared db root password: %w", encryptErr)
-				}
-				id, createErr := s.meta.CreateManagedSharedDBPool(lockCtx, &meta.SharedDB{
-					TiDBCloudOrganizationID: organizationID,
-					ProvisioningKey:         provisioningKey,
-					CloudProvider:           cloudProvider,
-					Region:                  region,
-					MaxTenants:              maxTenants,
-					SpendingLimit:           &fixedTarget,
-					PasswordCipher:          passwordCipher,
-					Name:                    s.defaultSharedDatabaseName(),
-				})
-				if createErr != nil {
-					return createErr
-				}
-				sharedDB, createErr = s.meta.GetSharedDB(lockCtx, id)
-				if createErr != nil {
-					return createErr
-				}
-				created = true
-			}
-			if reserve == nil {
-				return nil
-			}
-			reserveErr := reserve(sharedDB)
-			if reserveErr == nil {
 				return nil
 			}
 			if !errors.Is(reserveErr, meta.ErrSharedDBCapacityExhausted) {
 				return reserveErr
 			}
-			sharedDB = nil
-			created = false
 		}
-		return meta.ErrSharedDBCapacityExhausted
+		return planAndReserve()
 	})
 	return sharedDB, created, err
 }
@@ -451,9 +508,22 @@ func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int
 			s.managedSharedDBProvisioningJobs.Delete(dbID)
 		}
 	}()
-	workers := s.managedSharedDBProvisioningWorkers
+	workers := s.managedSharedDBProvisioningConcurrency
 	if workers <= 0 {
-		workers = DefaultManagedSharedDBProvisioningWorkers
+		if s.managedSharedDBProvisioningSlots != nil {
+			maxOpen := 0
+			if s.meta != nil && s.meta.DB() != nil {
+				maxOpen = s.meta.DB().Stats().MaxOpenConnections
+			}
+			logger.Error(ctx, "managed_shared_db_pool_provisioning_disabled",
+				zap.Int("configured_workers", s.managedSharedDBProvisioningWorkers),
+				zap.Int("meta_max_open_connections", maxOpen))
+			return
+		}
+		workers = s.managedSharedDBProvisioningWorkers
+		if workers <= 0 {
+			workers = DefaultManagedSharedDBProvisioningWorkers
+		}
 	}
 	failed := runManagedSharedDBProvisioningQueue(ctx, workers, s.managedSharedDBProvisioningSlots, owned,
 		schemaInitRetryWindow, schemaInitInitialBackoff, managedSharedDBProvisioningMaxBackoff,
@@ -637,6 +707,29 @@ func withManagedSharedDBMetadataRefillSlot(ctx context.Context, slot chan struct
 	return nil
 }
 
+func (s *Server) nextManagedSharedDBStatusPage(ctx context.Context, status string, cursor *int64, limit int) ([]*meta.SharedDB, error) {
+	if cursor == nil {
+		return nil, fmt.Errorf("shared db status cursor is required")
+	}
+	rows, err := s.meta.ListSharedDBsByStatusAfter(ctx, status, *cursor, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 && *cursor > 0 {
+		*cursor = 0
+		rows, err = s.meta.ListSharedDBsByStatusAfter(ctx, status, 0, limit)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(rows) > 0 && len(rows) < limit {
+		*cursor = 0
+	} else if len(rows) > 0 {
+		*cursor = rows[len(rows)-1].ID
+	}
+	return rows, nil
+}
+
 func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows []*meta.SharedDB, onReady func([]int64)) {
 	owned := make([]*meta.SharedDB, 0, len(rows))
 	for _, row := range rows {
@@ -682,6 +775,10 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 	for _, row := range owned {
 		known[row.ID] = struct{}{}
 	}
+	var refillAfterID int64
+	for _, row := range owned {
+		refillAfterID = max(refillAfterID, row.ID)
+	}
 	var queueMu sync.Mutex
 	refillSlot := make(chan struct{}, 1)
 	takeLocked := func(limit int) []*meta.SharedDB {
@@ -714,7 +811,7 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 			}
 			queueMu.Unlock()
 
-			fresh, listErr := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusPending, 1000)
+			fresh, listErr := s.nextManagedSharedDBStatusPage(ctx, meta.SharedDBStatusPending, &refillAfterID, 1000)
 			if listErr != nil {
 				logger.Warn(ctx, "managed_shared_db_pool_metadata_refill_failed", zap.Error(listErr))
 			}
@@ -774,7 +871,13 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 						continue
 					}
 					row := byID[info.DBPoolID]
-					if row == nil || strings.TrimSpace(info.Host) == "" || info.Port <= 0 || strings.TrimSpace(info.Username) == "" {
+					if row == nil {
+						continue
+					}
+					if strings.TrimSpace(info.Host) == "" || info.Port <= 0 || strings.TrimSpace(info.Username) == "" {
+						// Seeing the same incomplete Cloud object is not durable
+						// lifecycle progress. Preserve updated_at so the stuck
+						// watchdog can expire a pool whose metadata never becomes ready.
 						continue
 					}
 					name := info.DBName
@@ -822,7 +925,7 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 }
 
 func (s *Server) resumeProvisioningManagedSharedDBPoolsWithCtx(ctx context.Context) {
-	rows, err := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusProvisioning, 1000)
+	rows, err := s.nextManagedSharedDBStatusPage(ctx, meta.SharedDBStatusProvisioning, &s.managedSharedDBProvisioningResumeCursor, 1000)
 	if err != nil {
 		logger.Warn(ctx, "managed_shared_db_pool_resume_list_failed", zap.String("status", meta.SharedDBStatusProvisioning), zap.Error(err))
 		return
@@ -834,8 +937,42 @@ func (s *Server) resumeProvisioningManagedSharedDBPoolsWithCtx(ctx context.Conte
 	s.runManagedSharedDBProvisioning(ctx, ids)
 }
 
+func (s *Server) resumeActiveManagedSharedDBTenantsWithCtx(ctx context.Context) {
+	rows, err := s.meta.ListActiveSharedDBsWithProvisioningTenantsAfter(ctx, s.managedSharedDBActivationResumeCursor, 1000)
+	if err != nil {
+		logger.Warn(ctx, "managed_shared_db_pool_activation_resume_list_failed", zap.Error(err))
+		return
+	}
+	if len(rows) == 0 && s.managedSharedDBActivationResumeCursor > 0 {
+		s.managedSharedDBActivationResumeCursor = 0
+		rows, err = s.meta.ListActiveSharedDBsWithProvisioningTenantsAfter(ctx, 0, 1000)
+		if err != nil {
+			logger.Warn(ctx, "managed_shared_db_pool_activation_resume_list_failed", zap.Error(err))
+			return
+		}
+	}
+	if len(rows) > 0 && len(rows) < 1000 {
+		s.managedSharedDBActivationResumeCursor = 0
+	} else if len(rows) > 0 {
+		s.managedSharedDBActivationResumeCursor = rows[len(rows)-1].ID
+	}
+	for _, row := range rows {
+		for {
+			activated, activateErr := s.meta.ActivateSharedTenantsBatch(ctx, row.ID, sharedTenantActivationBatchSize)
+			if activateErr != nil {
+				logger.Warn(ctx, "managed_shared_db_pool_activation_resume_failed",
+					zap.Int64("db_pool_id", row.ID), zap.String("db_pool_uuid", row.UUID), zap.Error(activateErr))
+				break
+			}
+			if activated < sharedTenantActivationBatchSize {
+				break
+			}
+		}
+	}
+}
+
 func (s *Server) resumePendingManagedSharedDBPoolsWithCtx(ctx context.Context) {
-	rows, err := s.meta.ListSharedDBsByStatus(ctx, meta.SharedDBStatusPending, 1000)
+	rows, err := s.nextManagedSharedDBStatusPage(ctx, meta.SharedDBStatusPending, &s.managedSharedDBPendingResumeCursor, 1000)
 	if err != nil {
 		logger.Warn(ctx, "managed_shared_db_pool_resume_list_failed", zap.String("status", meta.SharedDBStatusPending), zap.Error(err))
 		return
@@ -885,12 +1022,8 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 		if err != nil {
 			return err
 		}
-		identity := sharedDBAllocationIdentity(poolInfo.TiDBCloudOrganizationID, poolInfo.ProvisioningKey)
-		if strings.TrimSpace(poolInfo.ClusterID) != "" {
-			identity = fmt.Sprintf("%s:db_pool:%d", identity, poolInfo.ID)
-		}
 		restartWithOrganization := false
-		err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
+		continuePool := func(lockCtx context.Context) error {
 			current, loadErr := s.meta.GetSharedDB(lockCtx, dbID)
 			if loadErr != nil {
 				return loadErr
@@ -900,7 +1033,8 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 				return nil
 			}
 			return s.continueManagedSharedDBPoolLocked(lockCtx, current, cred)
-		})
+		}
+		err = s.withSharedDBPoolWorkLock(ctx, dbID, continuePool)
 		if err != nil {
 			return err
 		}
@@ -918,6 +1052,13 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 func (s *Server) ensureManagedSharedDBPhysicalLocked(ctx context.Context, poolInfo *meta.SharedDB, cred tenant.CredentialProvisionRequest) (*meta.SharedDB, error) {
 	if poolInfo == nil {
 		return nil, fmt.Errorf("managed shared db pool is required")
+	}
+	switch poolInfo.Status {
+	case meta.SharedDBStatusFailed, meta.SharedDBStatusDraining:
+		return nil, fmt.Errorf("managed db pool %d is not creatable in status %q: %w", poolInfo.ID, poolInfo.Status, meta.ErrNotFound)
+	case meta.SharedDBStatusPending, meta.SharedDBStatusProvisioning, meta.SharedDBStatusActive:
+	default:
+		return nil, fmt.Errorf("managed db pool %d has unsupported status %q", poolInfo.ID, poolInfo.Status)
 	}
 	if poolInfo.ClusterID != "" && poolInfo.Host != "" && poolInfo.Port > 0 && poolInfo.User != "" {
 		return poolInfo, nil
@@ -1013,13 +1154,9 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) 
 		if err != nil {
 			return nil, err
 		}
-		identity := sharedDBAllocationIdentity(poolInfo.TiDBCloudOrganizationID, poolInfo.ProvisioningKey)
-		if strings.TrimSpace(poolInfo.ClusterID) != "" {
-			identity = fmt.Sprintf("%s:db_pool:%d", identity, poolInfo.ID)
-		}
 		var result *meta.SharedDB
 		restartWithOrganization := false
-		err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
+		ensurePool := func(lockCtx context.Context) error {
 			current, loadErr := s.meta.GetSharedDB(lockCtx, dbID)
 			if loadErr != nil {
 				return loadErr
@@ -1031,7 +1168,8 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) 
 			var ensureErr error
 			result, ensureErr = s.ensureManagedSharedDBPhysicalLocked(lockCtx, current, cred)
 			return ensureErr
-		})
+		}
+		err = s.withSharedDBPoolWorkLock(ctx, dbID, ensurePool)
 		if err != nil {
 			return nil, err
 		}
@@ -1042,16 +1180,19 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) 
 	return nil, fmt.Errorf("db pool %d allocation identity kept changing", dbID)
 }
 
-// continueManagedSharedDBPoolLocked keeps one durable allocation lock through
-// physical ensure, schema ensure, and activation. Pools with a known cluster
-// ID use a per-pool lock so metadata and schema work can advance concurrently;
-// pools without a cluster ID retain the organization lock to prevent duplicate
-// physical creation.
+// continueManagedSharedDBPoolLocked keeps one per-pool lock through physical
+// ensure, schema ensure, and activation. It is the same work lock used by the
+// batch create path, preventing duplicate physical creation and overlapping
+// schema attempts without serializing unrelated pools in one organization.
 func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo *meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
 	dbID := poolInfo.ID
 	var err error
-	if poolInfo.Status == meta.SharedDBStatusActive {
+	switch poolInfo.Status {
+	case meta.SharedDBStatusActive, meta.SharedDBStatusFailed, meta.SharedDBStatusDraining:
 		return nil
+	case meta.SharedDBStatusPending, meta.SharedDBStatusProvisioning:
+	default:
+		return fmt.Errorf("managed db pool %d has unsupported status %q", dbID, poolInfo.Status)
 	}
 	provisioner, ok := s.provisioner.(tenant.SharedDBPoolProvisioner)
 	if !ok {

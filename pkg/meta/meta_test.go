@@ -1006,9 +1006,19 @@ func TestObservePendingMutationsUsesSharedDBOrganization(t *testing.T) {
 	}
 	tenantID := "mutation-observe-shared-tenant"
 	insertSharedTenantPlacementForOrgTest(t, s, tenantID, "org-mutation-observe-shared")
-	if _, err := s.InsertMutationLog(ctx, &MutationLogEntry{
+	oldest := time.Now().UTC().Add(-5 * time.Minute)
+	firstID, err := s.InsertMutationLog(ctx, &MutationLogEntry{
 		TenantID: tenantID, MutationType: "file_delete", MutationData: []byte(`{"file_id":"f1"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InsertMutationLog(ctx, &MutationLogEntry{
+		TenantID: tenantID, MutationType: "file_delete", MutationData: []byte(`{"file_id":"f2"}`),
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE quota_mutation_log SET created_at = ? WHERE id = ?`, oldest, firstID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1020,6 +1030,12 @@ func TestObservePendingMutationsUsesSharedDBOrganization(t *testing.T) {
 		if row.TenantID == tenantID {
 			if row.TiDBCloudOrgID != "org-mutation-observe-shared" {
 				t.Fatalf("mutation observation org = %q, want org-mutation-observe-shared", row.TiDBCloudOrgID)
+			}
+			if row.PendingCount != 2 {
+				t.Fatalf("mutation observation pending count = %d, want 2", row.PendingCount)
+			}
+			if row.OldestPendingAgeSeconds < 4*60 || row.OldestPendingAgeSeconds > 6*60 {
+				t.Fatalf("mutation observation oldest age = %.3fs, want about 5m", row.OldestPendingAgeSeconds)
 			}
 			return
 		}
@@ -1537,11 +1553,15 @@ func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
 	}
 	for _, index := range []string{
 		"primary", "uk_db_pool_uuid", "uk_db_pool_cluster_id",
-		"idx_db_pool_allocate", "idx_db_pool_provisioning_key",
+		"idx_db_pool_allocate", "idx_db_pool_provisioning_key", "idx_db_pool_role_status_id",
 	} {
 		if _, ok := dbPool.indexes[index]; !ok {
 			t.Fatalf("db_pool schema missing index %s", index)
 		}
+	}
+	pools := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_tidbcloud_pools")
+	if _, ok := pools.indexes["idx_tidbcloud_pool_status_id"]; !ok {
+		t.Fatal("tenant_tidbcloud_pools schema missing idx_tidbcloud_pool_status_id")
 	}
 	if _, ok := dbPool.indexes["uk_db_pool_endpoint"]; ok {
 		t.Fatal("db_pool schema must not define endpoint uniqueness")
@@ -1573,6 +1593,27 @@ func TestDBPoolClusterIDIndexIsGloballyUnique(t *testing.T) {
 	}
 	if want := []string{"cluster_id"}; !sameStringSlice(columns, want) {
 		t.Fatalf("uk_db_pool_cluster_id columns = %v, want %v", columns, want)
+	}
+}
+
+func TestManagedSharedDBPeriodicScanIndexesMatchKeysetQueries(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		table string
+		index string
+		want  []string
+	}{
+		{table: "db_pool", index: "idx_db_pool_role_status_id", want: []string{"role", "status", "db_id"}},
+		{table: "tenant_tidbcloud_pools", index: "idx_tidbcloud_pool_status_id", want: []string{"status", "pool_id"}},
+	} {
+		columns, err := loadMetaIndexColumns(ctx, s.DB(), tc.table, tc.index)
+		if err != nil {
+			t.Fatalf("load %s columns: %v", tc.index, err)
+		}
+		if !sameStringSlice(columns, tc.want) {
+			t.Fatalf("%s columns = %v, want %v", tc.index, columns, tc.want)
+		}
 	}
 }
 
@@ -2247,6 +2288,26 @@ func TestCountTenantPoolBindingsByStatusGroupsByPoolOrganizationAndStatus(t *tes
 			t.Fatalf("upsert binding %s: %v", tc.tenantID, err)
 		}
 	}
+	for _, tc := range []struct {
+		tenantID string
+		status   TenantStatus
+		pool     TenantPoolBindingStatus
+	}{
+		{tenantID: "binding-counts-shared-free", status: TenantActive, pool: TenantPoolBindingFree},
+		{tenantID: "binding-counts-shared-deleted", status: TenantDeleted, pool: TenantPoolBindingUsed},
+	} {
+		insertTenantForPoolMembershipTest(t, s, tc.tenantID, tc.status, now)
+		if err := s.UpsertTenantPoolMembership(ctx, &TenantPoolMembership{
+			TenantID:                tc.tenantID,
+			TiDBCloudOrganizationID: "org-binding-counts-a",
+			PoolID:                  "pool-binding-counts-a",
+			PoolStatus:              tc.pool,
+			CreatedAt:               now,
+			UpdatedAt:               now,
+		}); err != nil {
+			t.Fatalf("upsert shared membership %s: %v", tc.tenantID, err)
+		}
+	}
 
 	counts, err := s.CountTenantPoolBindingsByStatus(ctx)
 	if err != nil {
@@ -2257,7 +2318,7 @@ func TestCountTenantPoolBindingsByStatusGroupsByPoolOrganizationAndStatus(t *tes
 		got[count.PoolID+"|"+count.OrganizationID+"|"+string(count.Status)] = count.Count
 	}
 	want := map[string]int64{
-		"pool-binding-counts-a|org-binding-counts-a|free":         2,
+		"pool-binding-counts-a|org-binding-counts-a|free":         3,
 		"pool-binding-counts-a|org-binding-counts-a|used":         1,
 		"pool-binding-counts-empty|org-binding-counts-empty|free": 0,
 		"pool-binding-counts-empty|org-binding-counts-empty|used": 0,
@@ -2266,6 +2327,36 @@ func TestCountTenantPoolBindingsByStatusGroupsByPoolOrganizationAndStatus(t *tes
 		if got[key] != wantCount {
 			t.Errorf("count %s = %d, want %d; all counts=%v", key, got[key], wantCount, got)
 		}
+	}
+}
+
+func TestListTenantPoolsByStatusAfterUsesStableKeysetPagination(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for _, pool := range []TenantPool{
+		{PoolID: "pool-a", OrganizationID: "org-a", Size: 1, Status: TenantPoolActive, CreatedAt: now, UpdatedAt: now},
+		{PoolID: "pool-b", OrganizationID: "org-b", Size: 2, Status: TenantPoolDeleting, CreatedAt: now, UpdatedAt: now},
+		{PoolID: "pool-c", OrganizationID: "org-c", Size: 3, Status: TenantPoolActive, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := s.CreateTenantPool(ctx, &pool); err != nil {
+			t.Fatalf("create tenant pool %s: %v", pool.PoolID, err)
+		}
+	}
+
+	first, err := s.ListTenantPoolsByStatusAfter(ctx, TenantPoolActive, "", 1)
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if len(first) != 1 || first[0].PoolID != "pool-a" {
+		t.Fatalf("first page = %+v, want pool-a", first)
+	}
+	second, err := s.ListTenantPoolsByStatusAfter(ctx, TenantPoolActive, first[0].PoolID, 10)
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if len(second) != 1 || second[0].PoolID != "pool-c" {
+		t.Fatalf("second page = %+v, want pool-c", second)
 	}
 }
 

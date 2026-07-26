@@ -39,6 +39,11 @@ type MetaQuotaStore interface {
 	IncrMediaFileCountTx(tx *sql.Tx, tenantID string, delta int64) error
 	IncrVideoFileCountTx(tx *sql.Tx, tenantID string, delta int64) error
 	TransferReservedToConfirmedTx(tx *sql.Tx, tenantID string, reservedDelta, storageDelta int64) error
+	// IncrQuotaUsageCountersTx applies all four counter deltas with one
+	// UPDATE on tenant_quota_usage. The batched mutation apply paths call
+	// it once per tenant at the end of the transaction ("hot row last")
+	// instead of touching the single per-tenant hot row from every apply.
+	IncrQuotaUsageCountersTx(tx *sql.Tx, tenantID string, storageDelta, fileDelta, mediaDelta, reservedDelta int64) error
 
 	// File meta (server-authored shadow state)
 	UpsertFileMeta(ctx context.Context, fm *FileMetaView) error

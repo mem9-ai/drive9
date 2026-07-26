@@ -664,6 +664,34 @@ func (s *Store) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID string, reser
 	return ensureRowsAffected(res, tenantID)
 }
 
+// IncrQuotaUsageCountersTx atomically adjusts all four quota usage counters
+// with a single UPDATE inside a transaction. It mirrors the per-counter
+// Incr*Tx semantics exactly (plain additive deltas, no clamping, and the
+// tenant row must already exist), but collapses what used to be one
+// statement per touched counter into one statement for the whole batch.
+// The batched mutation apply paths call this at the END of their
+// transaction ("hot row last") so the per-tenant tenant_quota_usage row is
+// locked only just before commit instead of from the first mutation apply.
+// It is a no-op when every delta is zero, so callers may invoke it
+// unconditionally.
+func (s *Store) IncrQuotaUsageCountersTx(tx *sql.Tx, tenantID string, storageDelta, fileDelta, mediaDelta, reservedDelta int64) error {
+	if storageDelta == 0 && fileDelta == 0 && mediaDelta == 0 && reservedDelta == 0 {
+		return nil
+	}
+	res, err := tx.Exec(
+		`UPDATE tenant_quota_usage
+		 SET storage_bytes = storage_bytes + ?,
+		     file_count = file_count + ?,
+		     media_file_count = media_file_count + ?,
+		     reserved_bytes = reserved_bytes + ?
+		 WHERE tenant_id = ?`,
+		storageDelta, fileDelta, mediaDelta, reservedDelta, tenantID)
+	if err != nil {
+		return err
+	}
+	return ensureRowsAffected(res, tenantID)
+}
+
 // defaultMaxStorageBytes is the fallback limit when no per-tenant config row exists.
 var defaultMaxStorageBytes atomic.Int64
 var defaultMaxFileSizeBytes atomic.Int64
@@ -1354,25 +1382,32 @@ func (s *Store) ListPendingMutations(ctx context.Context, minAge time.Duration, 
 	return entries, rows.Err()
 }
 
+// Aggregate the mutation log before resolving tenant organization metadata so
+// each pending tenant, rather than each pending mutation, performs the joins.
+const observePendingMutationsSQL = `WITH pending_mutations AS (
+	SELECT tenant_id, COUNT(*) AS pending_count, MIN(created_at) AS oldest_created_at
+		FROM quota_mutation_log FORCE INDEX (idx_pending_tenant_age)
+		WHERE status = 'pending'
+		GROUP BY tenant_id
+)
+SELECT pending.tenant_id,
+	COALESCE(CASE WHEN t.provider = ? THEN d.org_id ELSE b.organization_id END, ''),
+	pending.pending_count, pending.oldest_created_at
+	FROM pending_mutations pending
+	LEFT JOIN tenants t ON t.id = pending.tenant_id
+	LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = pending.tenant_id
+	LEFT JOIN fs_registry f ON f.tenant_id = pending.tenant_id
+	LEFT JOIN tenant_placements p ON p.fs_id = f.fs_id
+	LEFT JOIN db_pool d ON d.db_id = p.db_id
+	ORDER BY pending.tenant_id`
+
 // ObservePendingMutations returns per-tenant pending mutation backlog and age.
 func (s *Store) ObservePendingMutations(ctx context.Context) ([]MutationBacklogObservation, error) {
 	start := time.Now()
 	var err error
 	defer observeMeta(ctx, "observe_pending_mutations", start, &err)
 
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT q.tenant_id,
-		        COALESCE(CASE WHEN t.provider = ? THEN d.org_id ELSE b.organization_id END, ''),
-		        COUNT(*), MIN(q.created_at)
-		 FROM quota_mutation_log q FORCE INDEX (idx_pending_tenant_age)
-		 LEFT JOIN tenants t ON t.id = q.tenant_id
-		 LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = q.tenant_id
-		 LEFT JOIN fs_registry f ON f.tenant_id = q.tenant_id
-		 LEFT JOIN tenant_placements p ON p.fs_id = f.fs_id
-		 LEFT JOIN db_pool d ON d.db_id = p.db_id
-		 WHERE q.status = 'pending'
-		 GROUP BY q.tenant_id, t.provider, d.org_id, b.organization_id
-		 ORDER BY q.tenant_id`, tidbCloudNativeSharedProvider)
+	rows, err := s.db.QueryContext(ctx, observePendingMutationsSQL, tidbCloudNativeSharedProvider)
 	if err != nil {
 		return nil, err
 	}

@@ -653,7 +653,7 @@ func TestRoundA_Fix4_CompleteUpload_MarkAppliedCalledExactlyOnce(t *testing.T) {
 		if err != nil {
 			t.Fatalf("insert: %v", err)
 		}
-		if err := applyUploadCompleteTx(context.Background(), fake, nil, "tenant-a", uploadCompleteMutationData{
+		if _, err := applyUploadCompleteTx(context.Background(), fake, nil, "tenant-a", uploadCompleteMutationData{
 			UploadID:     "u1",
 			FileID:       "file-1",
 			NewSizeBytes: 40,

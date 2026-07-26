@@ -3,6 +3,7 @@ package meta
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
@@ -10,6 +11,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/mem9-ai/drive9/pkg/logger"
 )
 
 func TestSharedDBCapacityBounds(t *testing.T) {
@@ -256,6 +261,427 @@ func TestMarkSharedDBPoolFailedRejectsPoolWithTenants(t *testing.T) {
 	}
 	if got.Status != SharedDBStatusPending {
 		t.Fatalf("status = %q, want pending", got.Status)
+	}
+}
+
+func TestMarkStuckSharedDBPoolFailedAtomicallyFailsPlacedPoolTenants(t *testing.T) {
+	tests := []struct {
+		name          string
+		poolStatus    string
+		tenantStatus  TenantStatus
+		completeCloud bool
+	}{
+		{name: "pending", poolStatus: SharedDBStatusPending, tenantStatus: TenantPending},
+		{name: "provisioning", poolStatus: SharedDBStatusProvisioning, tenantStatus: TenantProvisioning, completeCloud: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newControlStore(t)
+			ctx := context.Background()
+			spendingLimit := MaxTiDBCloudSpendingLimit
+			dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+				TiDBCloudOrganizationID: "org-stuck", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+				CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+			})
+			if err != nil {
+				t.Fatalf("CreateManagedSharedDBPool: %v", err)
+			}
+			seedPendingTenant(t, s, "tenant-stuck-"+tt.name)
+			fsID, err := s.EnsureFsID(ctx, "tenant-stuck-"+tt.name)
+			if err != nil {
+				t.Fatalf("EnsureFsID: %v", err)
+			}
+			if err := s.CompleteSharedTenantPoolMember(ctx, "tenant-stuck-"+tt.name, tidbCloudNativeSharedProvider,
+				&TenantPlacement{FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared},
+				&TenantPoolMembership{TenantID: "tenant-stuck-" + tt.name, TiDBCloudOrganizationID: "org-stuck",
+					PoolID: "logical-stuck", PoolStatus: TenantPoolBindingFree}); err != nil {
+				t.Fatalf("CompleteSharedTenantPoolMember: %v", err)
+			}
+			if tt.completeCloud {
+				if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, &SharedDB{
+					ID: dbID, TiDBCloudOrganizationID: "org-stuck", ClusterID: "cluster-stuck-" + tt.name,
+					Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("cipher"),
+					Name: "tidbcloud_fs", TLSMode: "true",
+				}); err != nil {
+					t.Fatalf("UpdateManagedSharedDBPoolCloudResult: %v", err)
+				}
+			}
+			stuckAt := time.Now().UTC().Add(-20 * time.Minute).Truncate(time.Millisecond)
+			if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, stuckAt, dbID); err != nil {
+				t.Fatalf("age db pool: %v", err)
+			}
+
+			result, changed, err := s.MarkStuckSharedDBPoolFailed(ctx, dbID, tt.poolStatus, time.Now().UTC().Add(-15*time.Minute))
+			if err != nil {
+				t.Fatalf("MarkStuckSharedDBPoolFailed: %v", err)
+			}
+			if !changed || result == nil || result.DBID != dbID || fmt.Sprint(result.TenantIDs) != "[tenant-stuck-"+tt.name+"]" {
+				t.Fatalf("failure result = %+v changed=%v", result, changed)
+			}
+			pool, err := s.GetSharedDB(ctx, dbID)
+			if err != nil || pool.Status != SharedDBStatusFailed {
+				t.Fatalf("failed pool = %+v, %v", pool, err)
+			}
+			tenant, err := s.GetTenant(ctx, "tenant-stuck-"+tt.name)
+			if err != nil || tenant.Status != TenantFailed {
+				t.Fatalf("failed tenant = %+v, %v; previous status %q", tenant, err, tt.tenantStatus)
+			}
+			slots, err := s.CountTenantPoolFreeSlots(ctx, "org-stuck")
+			if err != nil || slots != 0 {
+				t.Fatalf("free slots after failure = %d, %v; want 0", slots, err)
+			}
+			lateResult := &SharedDB{ID: dbID, TiDBCloudOrganizationID: "org-stuck",
+				ClusterID: "cluster-late-" + tt.name, Host: "late.example.com", Port: 4000, User: "root",
+				PasswordCipher: []byte("cipher"), Name: "tidbcloud_fs", TLSMode: "true"}
+			if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, lateResult); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("late cloud result after terminal failure = %v, want ErrNotFound", err)
+			}
+			pool, err = s.GetSharedDB(ctx, dbID)
+			if err != nil || pool.Status != SharedDBStatusFailed {
+				t.Fatalf("late cloud result revived failed pool = %+v, %v", pool, err)
+			}
+		})
+	}
+}
+
+func TestMarkStuckSharedDBPoolFailedUsesStatusAndUpdatedAtCAS(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-not-stuck", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	cutoff := time.Now().UTC().Add(-15 * time.Minute)
+	if result, changed, err := s.MarkStuckSharedDBPoolFailed(ctx, dbID, SharedDBStatusPending, cutoff); err != nil || changed || result != nil {
+		t.Fatalf("recent pool result=%+v changed=%v err=%v, want unchanged", result, changed, err)
+	}
+	old := cutoff.Add(-time.Minute)
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, old, dbID); err != nil {
+		t.Fatalf("age db pool: %v", err)
+	}
+	if result, changed, err := s.MarkStuckSharedDBPoolFailed(ctx, dbID, SharedDBStatusProvisioning, cutoff); err != nil || changed || result != nil {
+		t.Fatalf("wrong-status result=%+v changed=%v err=%v, want unchanged", result, changed, err)
+	}
+}
+
+func TestCountTenantPoolPlannedSlotsUsesTerminalState(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	for i, updatedAt := range []time.Time{now.Add(-time.Second), now.Add(-24 * time.Hour)} {
+		dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+			TiDBCloudOrganizationID: "org-planned-lease", ProvisioningKey: bytes.Repeat([]byte{byte(i + 1)}, 32),
+			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+		})
+		if err != nil {
+			t.Fatalf("CreateManagedSharedDBPool %d: %v", i, err)
+		}
+		tenantID := fmt.Sprintf("tenant-planned-lease-%d", i)
+		seedPendingTenant(t, s, tenantID)
+		fsID, err := s.EnsureFsID(ctx, tenantID)
+		if err != nil {
+			t.Fatalf("EnsureFsID %d: %v", i, err)
+		}
+		if err := s.CompleteSharedTenantPoolMember(ctx, tenantID, tidbCloudNativeSharedProvider,
+			&TenantPlacement{FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared},
+			&TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: "org-planned-lease",
+				PoolID: "logical-planned-lease", PoolStatus: TenantPoolBindingFree}); err != nil {
+			t.Fatalf("CompleteSharedTenantPoolMember %d: %v", i, err)
+		}
+		if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, updatedAt, dbID); err != nil {
+			t.Fatalf("set db_pool updated_at %d: %v", i, err)
+		}
+	}
+
+	planned, err := s.CountTenantPoolPlannedSlots(ctx, "org-planned-lease")
+	if err != nil {
+		t.Fatalf("CountTenantPoolPlannedSlots: %v", err)
+	}
+	if planned != 2 {
+		t.Fatalf("planned slots = %d, want both non-terminal assigned tenants regardless of age", planned)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ? WHERE org_id = ? ORDER BY db_id LIMIT 1`,
+		SharedDBStatusFailed, "org-planned-lease"); err != nil {
+		t.Fatalf("fail one physical plan: %v", err)
+	}
+	planned, err = s.CountTenantPoolPlannedSlots(ctx, "org-planned-lease")
+	if err != nil {
+		t.Fatalf("CountTenantPoolPlannedSlots after terminal transition: %v", err)
+	}
+	if planned != 1 {
+		t.Fatalf("planned slots after one physical plan failed = %d, want 1", planned)
+	}
+}
+
+func TestCountTenantPoolPlannedSlotsIncludesUnstartedPhysicalPool(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	if _, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-unstarted-physical-plan", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	}); err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	planned, err := s.CountTenantPoolPlannedSlots(ctx, "org-unstarted-physical-plan")
+	if err != nil {
+		t.Fatalf("CountTenantPoolPlannedSlots: %v", err)
+	}
+	if planned != 100 {
+		t.Fatalf("planned slots = %d, want the full capacity of the unstarted staged pool", planned)
+	}
+}
+
+func TestCountTenantPoolPlannedSlotsIncludesActivePoolPlacementGap(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-active-placement-gap", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		tenantID := fmt.Sprintf("tenant-active-placement-gap-%d", i)
+		seedPendingTenant(t, s, tenantID)
+		fsID, err := s.EnsureFsID(ctx, tenantID)
+		if err != nil {
+			t.Fatalf("EnsureFsID %d: %v", i, err)
+		}
+		if err := s.CompleteSharedTenantPoolMember(ctx, tenantID, tidbCloudNativeSharedProvider,
+			&TenantPlacement{FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared},
+			&TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: "org-active-placement-gap",
+				PoolID: "logical-active-placement-gap", PoolStatus: TenantPoolBindingFree}); err != nil {
+			t.Fatalf("CompleteSharedTenantPoolMember %d: %v", i, err)
+		}
+	}
+	if err := s.UpdateTenantStatus(ctx, "tenant-active-placement-gap-0", TenantActive); err != nil {
+		t.Fatalf("activate tenant: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ?, updated_at = ? WHERE db_id = ?`,
+		SharedDBStatusActive, now, dbID); err != nil {
+		t.Fatalf("activate db pool: %v", err)
+	}
+
+	active, err := s.CountFreeTenantPoolBindings(ctx, "org-active-placement-gap")
+	if err != nil {
+		t.Fatalf("CountFreeTenantPoolBindings: %v", err)
+	}
+	planned, err := s.CountTenantPoolPlannedSlots(ctx, "org-active-placement-gap")
+	if err != nil {
+		t.Fatalf("CountTenantPoolPlannedSlots: %v", err)
+	}
+	if active != 1 || planned != 1 || active+planned != 2 {
+		t.Fatalf("active=%d planned=%d total=%d, want only assigned inventory: active=1 planned=1 total=2", active, planned, active+planned)
+	}
+}
+
+func TestRepairFailedSharedDBPoolTenantCountUsesPlacementsAsTruth(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-count-repair", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ?, tenant_count = 7 WHERE db_id = ?`, SharedDBStatusFailed, dbID); err != nil {
+		t.Fatal(err)
+	}
+	repaired, err := s.RepairFailedSharedDBPoolTenantCountIfEmpty(ctx, dbID)
+	if err != nil || !repaired {
+		t.Fatalf("RepairFailedSharedDBPoolTenantCountIfEmpty repaired=%v err=%v", repaired, err)
+	}
+	row, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.TenantCount != 0 {
+		t.Fatalf("tenant_count = %d, want repaired to zero", row.TenantCount)
+	}
+}
+
+func TestMarkStuckSharedDBPoolFailedReturnsOnlyTransitionedTenantIDs(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-stuck-race", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	tenantID := "tenant-stuck-race"
+	seedPendingTenant(t, s, tenantID)
+	fsID, err := s.EnsureFsID(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("EnsureFsID: %v", err)
+	}
+	if err := s.CompleteSharedTenantPoolMember(ctx, tenantID, tidbCloudNativeSharedProvider,
+		&TenantPlacement{FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared},
+		&TenantPoolMembership{TenantID: tenantID, TiDBCloudOrganizationID: "org-stuck-race",
+			PoolID: "logical-stuck-race", PoolStatus: TenantPoolBindingFree}); err != nil {
+		t.Fatalf("CompleteSharedTenantPoolMember: %v", err)
+	}
+	stuckAt := time.Now().UTC().Add(-20 * time.Minute).Truncate(time.Millisecond)
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, stuckAt, dbID); err != nil {
+		t.Fatalf("age db pool: %v", err)
+	}
+
+	tenantTx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tenant transition: %v", err)
+	}
+	t.Cleanup(func() { _ = tenantTx.Rollback() })
+	var status TenantStatus
+	if err := tenantTx.QueryRowContext(ctx, `SELECT status FROM tenants WHERE id = ? FOR UPDATE`, tenantID).Scan(&status); err != nil {
+		t.Fatalf("lock tenant: %v", err)
+	}
+	resultCh := make(chan struct {
+		result  *StuckSharedDBPoolFailure
+		changed bool
+		err     error
+	}, 1)
+	go func() {
+		result, changed, failErr := s.MarkStuckSharedDBPoolFailed(ctx, dbID, SharedDBStatusPending, time.Now().UTC().Add(-15*time.Minute))
+		resultCh <- struct {
+			result  *StuckSharedDBPoolFailure
+			changed bool
+			err     error
+		}{result: result, changed: changed, err: failErr}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		probeTx, beginErr := s.DB().BeginTx(ctx, nil)
+		if beginErr != nil {
+			t.Fatalf("begin db pool lock probe: %v", beginErr)
+		}
+		var lockedID int64
+		probeErr := probeTx.QueryRowContext(ctx, `SELECT db_id FROM db_pool WHERE db_id = ? FOR UPDATE SKIP LOCKED`, dbID).Scan(&lockedID)
+		_ = probeTx.Rollback()
+		if errors.Is(probeErr, sql.ErrNoRows) {
+			break
+		}
+		if probeErr != nil {
+			t.Fatalf("probe db pool lock: %v", probeErr)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stuck-pool watchdog did not acquire the db_pool row")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := tenantTx.ExecContext(ctx, `UPDATE tenants SET status = ? WHERE id = ?`, TenantDeleting, tenantID); err != nil {
+		t.Fatalf("advance tenant status: %v", err)
+	}
+	if err := tenantTx.Commit(); err != nil {
+		t.Fatalf("commit tenant transition: %v", err)
+	}
+
+	got := <-resultCh
+	if got.err != nil || !got.changed || got.result == nil {
+		t.Fatalf("failure result=%+v changed=%v err=%v", got.result, got.changed, got.err)
+	}
+	if len(got.result.TenantIDs) != 0 {
+		t.Fatalf("failed tenant IDs = %v, want none for tenant that advanced to deleting", got.result.TenantIDs)
+	}
+	tenantRow, err := s.GetTenant(ctx, tenantID)
+	if err != nil || tenantRow.Status != TenantDeleting {
+		t.Fatalf("tenant after watchdog = %+v, %v; want deleting", tenantRow, err)
+	}
+}
+
+func TestManagedSharedDBUpdatedAtTracksProgressNotNoOpPolls(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-progress", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	passwordCipher := []byte("cipher")
+	if err := s.PrepareManagedSharedDBPoolRoot(ctx, dbID, passwordCipher, "tidbcloud_fs"); err != nil {
+		t.Fatalf("PrepareManagedSharedDBPoolRoot: %v", err)
+	}
+	partial := &SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-progress", ClusterID: "cluster-progress",
+		PasswordCipher: passwordCipher, Name: "tidbcloud_fs", TLSMode: "skip-verify",
+	}
+	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, partial); err != nil {
+		t.Fatalf("persist initial partial metadata: %v", err)
+	}
+	stuckAt := time.Now().UTC().Add(-20 * time.Minute).Truncate(time.Millisecond)
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, stuckAt, dbID); err != nil {
+		t.Fatalf("age pending pool: %v", err)
+	}
+	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, partial); err != nil {
+		t.Fatalf("repeat identical partial metadata: %v", err)
+	}
+	unchanged, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB after no-op poll: %v", err)
+	}
+	if !unchanged.UpdatedAt.Equal(stuckAt) || unchanged.Status != SharedDBStatusPending {
+		t.Fatalf("no-op poll updated pool to status=%s updated_at=%s, want pending at %s",
+			unchanged.Status, unchanged.UpdatedAt, stuckAt)
+	}
+	ready := *partial
+	ready.Host = "shared.example.com"
+	ready.Port = 4000
+	ready.User = "root"
+	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, &ready); err != nil {
+		t.Fatalf("persist ready metadata: %v", err)
+	}
+	progressed, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB after metadata progress: %v", err)
+	}
+	if progressed.Status != SharedDBStatusProvisioning || !progressed.UpdatedAt.After(stuckAt) {
+		t.Fatalf("metadata progress left pool status=%s updated_at=%s, want provisioning after %s",
+			progressed.Status, progressed.UpdatedAt, stuckAt)
+	}
+}
+
+func TestFinalizeFailedSharedDBPoolCleanupClearsCloudIdentityBeforeDelete(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-cleanup", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ?, cluster_id = ? WHERE db_id = ?`,
+		SharedDBStatusFailed, "cluster-cleanup", dbID); err != nil {
+		t.Fatalf("prepare failed pool: %v", err)
+	}
+	if cleared, err := s.ClearFailedSharedDBPoolClusterID(ctx, dbID, "wrong-cluster"); err != nil || cleared {
+		t.Fatalf("wrong cluster clear = %v, %v; want false", cleared, err)
+	}
+	if cleared, err := s.ClearFailedSharedDBPoolClusterID(ctx, dbID, "cluster-cleanup"); err != nil || !cleared {
+		t.Fatalf("cluster clear = %v, %v; want true", cleared, err)
+	}
+	if deleted, err := s.DeleteFailedSharedDBPoolIfEmpty(ctx, dbID); err != nil || !deleted {
+		t.Fatalf("failed pool delete = %v, %v; want true", deleted, err)
+	}
+	if _, err := s.GetSharedDB(ctx, dbID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetSharedDB after delete error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -769,6 +1195,40 @@ func TestCompleteSharedTenantProvisionSoftHardCapacityAndHysteresis(t *testing.T
 	}
 }
 
+func TestCompleteSharedTenantProvisionCapacityMissDoesNotLogError(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-capacity-log", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 1, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE db_pool SET status = ?, cluster_id = 'cluster-capacity-log'
+		WHERE db_id = ?`, SharedDBStatusActive, dbID); err != nil {
+		t.Fatal(err)
+	}
+	completeTestSharedTenant(t, s, dbID, "tenant-capacity-log-full", 0)
+	seedPendingTenant(t, s, "tenant-capacity-log-rejected")
+	fsID, err := s.EnsureFsID(ctx, "tenant-capacity-log-rejected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, logs := observer.New(zap.ErrorLevel)
+	logCtx := logger.WithContext(ctx, zap.New(core))
+	err = s.CompleteSharedTenantProvision(logCtx, "tenant-capacity-log-rejected", "tidb_cloud_native_shared",
+		&TenantPlacement{FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared},
+		testOwnerKey("tenant-capacity-log-rejected"))
+	if !errors.Is(err, ErrSharedDBCapacityExhausted) {
+		t.Fatalf("capacity error = %v, want ErrSharedDBCapacityExhausted", err)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("capacity miss emitted %d error logs, want none: %+v", logs.Len(), logs.All())
+	}
+}
+
 func TestFindSharedDBForEmergencyExcludesManuallyRegisteredPools(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
@@ -1078,6 +1538,40 @@ func TestManagedSharedDBPoolsAllowSameEndpointWithDifferentUsers(t *testing.T) {
 		if got.Status != SharedDBStatusProvisioning || got.User != fmt.Sprintf("prefix-%d.root", i) {
 			t.Fatalf("shared db %d = status %q user %q, want provisioning/prefix-%d.root", i, got.Status, got.User, i)
 		}
+	}
+}
+
+func TestListSharedDBsByStatusAfterUsesStableKeysetPagination(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	ids := make([]int64, 0, 3)
+	for i := 0; i < 3; i++ {
+		dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+			TiDBCloudOrganizationID: fmt.Sprintf("org-page-%d", i), ProvisioningKey: bytes.Repeat([]byte{byte(i + 1)}, 32),
+			CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+		})
+		if err != nil {
+			t.Fatalf("CreateManagedSharedDBPool %d: %v", i, err)
+		}
+		ids = append(ids, dbID)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ? WHERE db_id = ?`, SharedDBStatusFailed, ids[1]); err != nil {
+		t.Fatalf("change middle pool status: %v", err)
+	}
+	first, err := s.ListSharedDBsByStatusAfter(ctx, SharedDBStatusPending, 0, 1)
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if len(first) != 1 || first[0].ID != ids[0] {
+		t.Fatalf("first page = %+v, want db %d", first, ids[0])
+	}
+	second, err := s.ListSharedDBsByStatusAfter(ctx, SharedDBStatusPending, first[0].ID, 10)
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if len(second) != 1 || second[0].ID != ids[2] {
+		t.Fatalf("second page = %+v, want db %d", second, ids[2])
 	}
 }
 
