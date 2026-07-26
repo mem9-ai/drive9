@@ -795,11 +795,11 @@ func (s *Server) insertTenantNotify(tenantID string, workMask int) {
 	}
 }
 
-// broadcastTenantMetricsCleanup immediately clears this process after a
+// clearLocalTenantMetrics immediately clears this process after a
 // deleting/deleted lifecycle transition. The meta-store transition writes the
 // WorkMetricsCleanup outbox row in the same transaction, so this helper must
 // not enqueue a second best-effort signal through the coalescer.
-func (s *Server) broadcastTenantMetricsCleanup(tenantID string) {
+func (s *Server) clearLocalTenantMetrics(tenantID string) {
 	if tenantID == "" {
 		return
 	}

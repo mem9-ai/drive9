@@ -1021,7 +1021,7 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 			if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantDeleted); err != nil {
 				return fmt.Errorf("mark fork deleted: %w", err)
 			}
-			s.broadcastTenantMetricsCleanup(tenantID)
+			s.clearLocalTenantMetrics(tenantID)
 		}
 		return nil
 	}
@@ -1057,7 +1057,7 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantDeleted); err != nil {
 		return fmt.Errorf("mark fork deleted: %w", err)
 	}
-	s.broadcastTenantMetricsCleanup(tenantID)
+	s.clearLocalTenantMetrics(tenantID)
 	return nil
 }
 
@@ -1068,7 +1068,7 @@ func (s *Server) cleanupFailedForkBranch(ctx context.Context, t *meta.Tenant, cr
 	if err := s.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted); err != nil {
 		return fmt.Errorf("mark failed fork deleted: %w", err)
 	}
-	s.broadcastTenantMetricsCleanup(t.ID)
+	s.clearLocalTenantMetrics(t.ID)
 	return nil
 }
 

@@ -128,7 +128,7 @@ func TestRecordTenantRequestOmitsHighCardinalityLabels(t *testing.T) {
 		action   = "request_duration_action"
 	)
 
-	RecordTenantRequestWithOrg(tenantID, "org-request-duration", surface, action, "ok", 201, time.Second)
+	RecordTenantRequestWithOrg(tenantID, "org-request-duration", surface, action, 201, time.Second)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
@@ -160,7 +160,7 @@ func TestRecordTenantRequestOmitsHighCardinalityLabels(t *testing.T) {
 func TestRecordTenantRequestZeroDurationDoesNotRecordDuration(t *testing.T) {
 	const tenantID = "tenant-zero-request"
 
-	RecordTenantRequest(tenantID, "zero_surface", "zero_action", "ok", 200, 0)
+	RecordTenantRequest(tenantID, "zero_surface", "zero_action", 200, 0)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
@@ -232,7 +232,7 @@ func TestRecordTenantInFlightDeletesZeroValue(t *testing.T) {
 		action   = "inflight_delete_action"
 	)
 
-	RecordTenantInFlightWithOrg(tenantID, "org-inflight-delete", surface, action, 1)
+	RecordTenantInFlightWithOrg(tenantID, "org-inflight-delete", surface, 1)
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
@@ -240,7 +240,7 @@ func TestRecordTenantInFlightDeletesZeroValue(t *testing.T) {
 		t.Errorf("missing tenant in-flight gauge:\n%s", text)
 	}
 
-	RecordTenantInFlightWithOrg(tenantID, "org-inflight-delete", surface, action, 0)
+	RecordTenantInFlightWithOrg(tenantID, "org-inflight-delete", surface, 0)
 	rec = httptest.NewRecorder()
 	WritePrometheus(rec)
 	text = rec.Body.String()
@@ -297,9 +297,9 @@ func TestTenantIDMetricsIncludeTiDBCloudOrgID(t *testing.T) {
 
 	RecordTenantGaugeWithOrg(tenantID, orgID, "component_org_label_test", "gauge", 1)
 	RecordTenantEventWithOrg(tenantID, orgID, "event_org_label_test", "result", "ok")
-	RecordTenantRequestCountWithOrg(tenantID, orgID, "surface_org_label_test", "action", "ok", 200)
-	RecordTenantHTTPBytesWithOrg(tenantID, orgID, "surface_org_label_test", "ignored", "request", 10)
-	RecordTenantFileBytesWithOrg(tenantID, orgID, "surface_org_label_test", "write", "out", 20)
+	RecordTenantRequestCountWithOrg(tenantID, orgID, "surface_org_label_test", "action", 200)
+	RecordTenantHTTPBytesWithOrg(tenantID, orgID, "request", 10)
+	RecordTenantFileBytesWithOrg(tenantID, orgID, "out", 20)
 	RecordTenantStorageBytesWithOrg(tenantID, orgID, "confirmed", 30)
 	RecordTenantMediaFilesWithOrg(tenantID, orgID, "confirmed", 40)
 	RecordTenantVideoFilesWithOrg(tenantID, orgID, "limit", 50)
@@ -309,7 +309,7 @@ func TestTenantIDMetricsIncludeTiDBCloudOrgID(t *testing.T) {
 	RecordSSEResetSentWithOrg(tenantID, orgID, "seq_too_old")
 	RecordSSEHeartbeatSentWithOrg(tenantID, orgID)
 	RecordFSEventsRowsWithOrg(tenantID, orgID, 50)
-	RecordFSEventsPrunedWithOrg(tenantID, orgID, 60)
+	RecordFSEventsPruned(60)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
@@ -591,11 +591,11 @@ func TestDeleteTenantCounters(t *testing.T) {
 	const tidbCloudOrgID = "org-delete-counter"
 
 	RecordTenantOperationCountWithOrg(tenantID, tidbCloudOrgID, "cmp", "op", "ok")
-	RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, "api", "read", "ok", 200)
-	RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, "api", "", "upload", 1024)
+	RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, "api", "read", 200)
+	RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, "upload", 1024)
 	RecordSSEConnectionWithOrg(tenantID, tidbCloudOrgID, "mount", time.Second)
 	RecordSSEEventSentWithOrg(tenantID, tidbCloudOrgID, "write")
-	RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, "api", "read", 3)
+	RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, "api", 3)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)

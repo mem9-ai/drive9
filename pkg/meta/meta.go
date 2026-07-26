@@ -3589,6 +3589,11 @@ func scanTenantBindingScanner(row tenantBindingScanner) (*TenantWithTiDBCloudOrg
 	return &rec, nil
 }
 
+// UpdateTenantStatus uses a per-tenant transaction for deleting/deleted
+// transitions so the status change and metrics-cleanup outbox row commit
+// atomically. Batch cleanup callers intentionally keep one transaction per
+// tenant: their loops include external cleanup work, and one large transaction
+// would extend lock lifetimes and couple otherwise independent tenant failures.
 func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status TenantStatus) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_status", start, &err)
@@ -3645,6 +3650,10 @@ func (s *Store) UpdateTenantProvider(ctx context.Context, id, provider string) (
 	return nil
 }
 
+// UpdateTenantStatusIf has the same per-tenant transaction boundary as
+// UpdateTenantStatus when moving to deleting/deleted, while preserving the
+// conditional update and per-tenant failure isolation expected by cleanup
+// loops.
 func (s *Store) UpdateTenantStatusIf(ctx context.Context, id string, from, to TenantStatus) (updated bool, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_status_if", start, &err)

@@ -465,16 +465,15 @@ func RecordHTTPRequestCount(method, route string, status int) {
 
 // RecordTenantRequestCount records only the tenant request counter, not the
 // duration histogram. Companion to RecordHTTPRequestCount for SSE routes.
-func RecordTenantRequestCount(tenantID, surface, action, result string, status int) {
-	RecordTenantRequestCountWithOrg(tenantID, "", surface, action, result, status)
+func RecordTenantRequestCount(tenantID, surface, action string, status int) {
+	RecordTenantRequestCountWithOrg(tenantID, "", surface, action, status)
 }
 
-func RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, surface, action, result string, status int) {
+func RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, surface, action string, status int) {
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
 	surface = cleanMetricValue(surface, "other")
 	action = cleanMetricValue(action, "other")
-	_ = result
 	RegisterModule("tenant_usage")
 	attrs := []Attribute{
 		Attr("tenant_id", tenantID),
@@ -528,16 +527,15 @@ func tenantAttributedBusinessEvent(event string) bool {
 	}
 }
 
-func RecordTenantRequest(tenantID, surface, action, result string, status int, d time.Duration) {
-	RecordTenantRequestWithOrg(tenantID, "", surface, action, result, status, d)
+func RecordTenantRequest(tenantID, surface, action string, status int, d time.Duration) {
+	RecordTenantRequestWithOrg(tenantID, "", surface, action, status, d)
 }
 
-func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action, result string, status int, d time.Duration) {
+func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action string, status int, d time.Duration) {
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
 	surface = cleanMetricValue(surface, "other")
 	action = cleanMetricValue(action, "other")
-	_ = result
 	statusClass := "unknown"
 	if status > 0 {
 		statusClass = strconv.Itoa(status/100) + "xx"
@@ -560,30 +558,27 @@ func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action, resul
 	)
 }
 
-func RecordTenantHTTPBytes(tenantID, surface, _, direction string, bytes int64) {
-	RecordTenantHTTPBytesWithOrg(tenantID, "", surface, "", direction, bytes)
+func RecordTenantHTTPBytes(tenantID, direction string, bytes int64) {
+	RecordTenantHTTPBytesWithOrg(tenantID, "", direction, bytes)
 }
 
-func RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, surface, _, direction string, bytes int64) {
-	_ = surface
+func RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, direction string, bytes int64) {
 	recordTenantHTTPBytes(tenantID, tidbCloudOrgID, direction, bytes)
 }
 
-func RecordTenantFileBytes(tenantID, surface, action, direction string, bytes int64) {
-	RecordTenantFileBytesWithOrg(tenantID, "", surface, action, direction, bytes)
+func RecordTenantFileBytes(tenantID, direction string, bytes int64) {
+	RecordTenantFileBytesWithOrg(tenantID, "", direction, bytes)
 }
 
-func RecordTenantFileBytesWithOrg(tenantID, tidbCloudOrgID, surface, action, direction string, bytes int64) {
-	_, _ = surface, action
+func RecordTenantFileBytesWithOrg(tenantID, tidbCloudOrgID, direction string, bytes int64) {
 	recordTenantBytes(tenantFileBytes, tenantID, tidbCloudOrgID, direction, bytes)
 }
 
-func RecordTenantInFlight(tenantID, surface, action string, value float64) {
-	RecordTenantInFlightWithOrg(tenantID, "", surface, action, value)
+func RecordTenantInFlight(tenantID, surface string, value float64) {
+	RecordTenantInFlightWithOrg(tenantID, "", surface, value)
 }
 
-func RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, surface, action string, value float64) {
-	_ = action
+func RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, surface string, value float64) {
 	RegisterModule("tenant_usage")
 	attrs := []Attribute{
 		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
@@ -938,15 +933,10 @@ func DeleteFSEventsRowsWithOrg(tenantID, tidbCloudOrgID string) {
 
 // RecordFSEventsPruned records the number of fs_events rows deleted by
 // retention cleanup.
-func RecordFSEventsPruned(tenantID string, count int64) {
-	RecordFSEventsPrunedWithOrg(tenantID, "", count)
-}
-
-func RecordFSEventsPrunedWithOrg(tenantID, tidbCloudOrgID string, count int64) {
+func RecordFSEventsPruned(count int64) {
 	if count <= 0 {
 		return
 	}
-	_, _ = tenantID, tidbCloudOrgID
 	RegisterModule("sse")
 	fsEventsPrunedTotal.Add(count)
 }

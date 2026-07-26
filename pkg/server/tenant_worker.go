@@ -602,7 +602,7 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 		}
 	} else {
 		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "event_bus", "retention_sweep", "ok", 0)
-		metrics.RecordFSEventsPrunedWithOrg(target.tenantID, target.metricOrgID(), n)
+		metrics.RecordFSEventsPruned(n)
 	}
 
 	// Observation metrics: sample queue depth + dead-letter count.

@@ -1737,7 +1737,7 @@ func (s *Server) cleanupPoolProvisionedClusters(ctx context.Context, clusters []
 			logger.Warn(cleanupCtx, "admin_tenant_pool_cleanup_mark_deleted_failed", zap.String("tenant_id", tenantID), zap.String("reason", reason), zap.Error(err))
 			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 		} else {
-			s.broadcastTenantMetricsCleanup(tenantID)
+			s.clearLocalTenantMetrics(tenantID)
 		}
 	}
 }
@@ -1835,7 +1835,7 @@ func (s *Server) deleteNewestFreePoolTenants(ctx context.Context, poolID, organi
 				_ = s.meta.UpdateTenantStatus(context.Background(), t.ID, meta.TenantFailed)
 				return deleted, err
 			}
-			s.broadcastTenantMetricsCleanup(t.ID)
+			s.clearLocalTenantMetrics(t.ID)
 		}
 		deleted++
 		if !deleteAll {
@@ -1911,7 +1911,7 @@ func (s *Server) cleanupCreatedPoolTenants(ctx context.Context, results []*provi
 		if err := s.meta.MarkTenantDeleted(cleanupCtx, tenantID); err != nil {
 			logger.Warn(cleanupCtx, "admin_tenant_pool_cleanup_mark_deleted_failed", zap.String("tenant_id", tenantID), zap.String("reason", reason), zap.Error(err))
 		} else {
-			s.broadcastTenantMetricsCleanup(tenantID)
+			s.clearLocalTenantMetrics(tenantID)
 		}
 	}
 }
