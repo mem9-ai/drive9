@@ -124,6 +124,13 @@ type SharedDBPoolBatchLoader interface {
 	BatchLoadSharedDBPoolsWithCredentials(ctx context.Context, requests []SharedDBPoolLoadRequest, req CredentialProvisionRequest) ([]*SharedDBPoolInfo, error)
 }
 
+type SharedDBPoolLister interface {
+	// ListSharedDBPoolsWithCredentials returns every exact managed cluster
+	// carrying one durable DB-pool UUID. Cleanup uses it to converge duplicate
+	// Cloud resources instead of failing forever on ambiguity.
+	ListSharedDBPoolsWithCredentials(ctx context.Context, dbPoolID int64, dbPoolUUID string, req CredentialProvisionRequest) ([]*SharedDBPoolInfo, error)
+}
+
 type SharedDBPoolProvisioner interface {
 	Provisioner
 	// BatchProvisionSharedDBPoolsWithCredentials may return the successfully

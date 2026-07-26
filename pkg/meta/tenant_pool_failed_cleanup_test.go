@@ -120,6 +120,40 @@ func TestListFailedSharedTenantCleanupCandidatesByDBScopesPhysicalPool(t *testin
 	}
 }
 
+func TestFailedSharedTenantCleanupReclaimsStaleDeletingCandidate(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	old := now.Add(-2 * time.Hour)
+	dbID := seedSharedCleanupPlacement(t, s, "shared-stale-deleting", "org-stale-deleting",
+		tidbCloudNativeSharedProvider, TenantFailed, old)
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET status = ? WHERE db_id = ?`, SharedDBStatusFailed, dbID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`,
+		TenantDeleting, old, "shared-stale-deleting"); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := s.ListFailedSharedTenantCleanupCandidatesByDB(ctx, dbID, now.Add(-30*time.Minute), 10)
+	if err != nil {
+		t.Fatalf("ListFailedSharedTenantCleanupCandidatesByDB: %v", err)
+	}
+	if ids := cleanupTenantIDs(candidates); fmt.Sprint(ids) != "[shared-stale-deleting]" {
+		t.Fatalf("stale deleting candidates = %v, want reclaimed tenant", ids)
+	}
+	owned, err := s.MarkFailedSharedTenantDeleting(ctx, "shared-stale-deleting", "org-stale-deleting", now.Add(-30*time.Minute))
+	if err != nil || !owned {
+		t.Fatalf("MarkFailedSharedTenantDeleting owned=%v err=%v", owned, err)
+	}
+	tenant, err := s.GetTenant(ctx, "shared-stale-deleting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tenant.Status != TenantDeleting || !tenant.UpdatedAt.After(old) {
+		t.Fatalf("reclaimed tenant = status %q updated_at %s", tenant.Status, tenant.UpdatedAt)
+	}
+}
+
 func TestFailedTenantCleanupCooldownRestartsAfterTenantUpdate(t *testing.T) {
 	tests := []struct {
 		name string

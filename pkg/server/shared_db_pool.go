@@ -257,6 +257,19 @@ func (s *Server) allocateManagedSharedDB(ctx context.Context, cred tenant.Creden
 }
 
 func (s *Server) createManagedSharedDBPlan(ctx context.Context, organizationID string, provisioningKey []byte) (*meta.SharedDB, error) {
+	row, err := s.newManagedSharedDBPlan(ctx, organizationID, provisioningKey)
+	if err != nil {
+		return nil, err
+	}
+	id, err := s.meta.CreateManagedSharedDBPool(ctx, row)
+	if err != nil {
+		return nil, err
+	}
+	row.ID = id
+	return row, nil
+}
+
+func (s *Server) newManagedSharedDBPlan(ctx context.Context, organizationID string, provisioningKey []byte) (*meta.SharedDB, error) {
 	maxTenants, fixedTarget := s.managedSharedDBPolicy()
 	cloudProvider, region := provisioningCloudRegion(s.provisioner)
 	rootPassword, err := generateManagedSharedDBRootPassword(24)
@@ -280,11 +293,6 @@ func (s *Server) createManagedSharedDBPlan(ctx context.Context, organizationID s
 		Name:                    s.defaultSharedDatabaseName(),
 		Status:                  meta.SharedDBStatusPending,
 	}
-	id, err := s.meta.CreateManagedSharedDBPool(ctx, row)
-	if err != nil {
-		return nil, err
-	}
-	row.ID = id
 	return row, nil
 }
 
@@ -706,7 +714,9 @@ func (s *Server) nextManagedSharedDBStatusPage(ctx context.Context, status strin
 			return nil, err
 		}
 	}
-	if len(rows) > 0 {
+	if len(rows) > 0 && len(rows) < limit {
+		*cursor = 0
+	} else if len(rows) > 0 {
 		*cursor = rows[len(rows)-1].ID
 	}
 	return rows, nil
@@ -848,12 +858,19 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 				infos, loadErr := loader.BatchLoadSharedDBPoolsWithCredentials(ctx, requests, cred)
 				ready := make(map[int64]struct{}, len(infos))
 				readyIDs := make([]int64, 0, len(infos))
+				heartbeatIDs := make([]int64, 0, len(infos))
 				for _, info := range infos {
 					if info == nil {
 						continue
 					}
 					row := byID[info.DBPoolID]
-					if row == nil || strings.TrimSpace(info.Host) == "" || info.Port <= 0 || strings.TrimSpace(info.Username) == "" {
+					if row == nil {
+						continue
+					}
+					if strings.TrimSpace(info.Host) == "" || info.Port <= 0 || strings.TrimSpace(info.Username) == "" {
+						if strings.TrimSpace(info.ClusterID) != "" {
+							heartbeatIDs = append(heartbeatIDs, row.ID)
+						}
 						continue
 					}
 					name := info.DBName
@@ -866,6 +883,12 @@ func (s *Server) pollManagedSharedDBMetadataWithReady(ctx context.Context, rows 
 					}
 					ready[row.ID] = struct{}{}
 					readyIDs = append(readyIDs, row.ID)
+				}
+				if len(heartbeatIDs) > 0 {
+					if err := s.meta.TouchManagedSharedDBPools(ctx, heartbeatIDs, meta.SharedDBStatusPending); err != nil {
+						logger.Warn(ctx, "managed_shared_db_pool_metadata_heartbeat_failed",
+							zap.Int("db_pool_count", len(heartbeatIDs)), zap.Error(err))
+					}
 				}
 				if loadErr != nil {
 					logger.Warn(ctx, "managed_shared_db_pool_metadata_retry", zap.Int("attempt", attempt), zap.Int("db_pool_count", len(group)), zap.Duration("retry_in", pollInterval), zap.Error(loadErr))
@@ -995,6 +1018,13 @@ func (s *Server) ensureManagedSharedDBPhysicalLocked(ctx context.Context, poolIn
 	if poolInfo == nil {
 		return nil, fmt.Errorf("managed shared db pool is required")
 	}
+	switch poolInfo.Status {
+	case meta.SharedDBStatusFailed, meta.SharedDBStatusDraining:
+		return nil, fmt.Errorf("managed db pool %d is not creatable in status %q: %w", poolInfo.ID, poolInfo.Status, meta.ErrNotFound)
+	case meta.SharedDBStatusPending, meta.SharedDBStatusProvisioning, meta.SharedDBStatusActive:
+	default:
+		return nil, fmt.Errorf("managed db pool %d has unsupported status %q", poolInfo.ID, poolInfo.Status)
+	}
 	if poolInfo.ClusterID != "" && poolInfo.Host != "" && poolInfo.Port > 0 && poolInfo.User != "" {
 		return poolInfo, nil
 	}
@@ -1122,8 +1152,12 @@ func (s *Server) ensureManagedSharedDBPhysical(ctx context.Context, dbID int64) 
 func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo *meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
 	dbID := poolInfo.ID
 	var err error
-	if poolInfo.Status == meta.SharedDBStatusActive {
+	switch poolInfo.Status {
+	case meta.SharedDBStatusActive, meta.SharedDBStatusFailed, meta.SharedDBStatusDraining:
 		return nil
+	case meta.SharedDBStatusPending, meta.SharedDBStatusProvisioning:
+	default:
+		return fmt.Errorf("managed db pool %d has unsupported status %q", dbID, poolInfo.Status)
 	}
 	provisioner, ok := s.provisioner.(tenant.SharedDBPoolProvisioner)
 	if !ok {

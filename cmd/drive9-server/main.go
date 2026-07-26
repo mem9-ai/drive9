@@ -446,8 +446,6 @@ func main() {
 		SharedDBSpendingLimit: sharedDBDefaultSpendingLimit,
 		ManagedSharedDBCloudBatchSize: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_CLOUD_BATCH_SIZE",
 			server.DefaultManagedSharedDBCloudBatchSize),
-		ManagedSharedDBRefillPoolLimit: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_REFILL_POOL_LIMIT",
-			server.DefaultManagedSharedDBRefillPoolLimit),
 		ManagedSharedDBMetadataWorkers: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_WORKERS",
 			server.DefaultManagedSharedDBMetadataWorkers),
 		ManagedSharedDBMetadataBatchSize: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_BATCH_SIZE",
@@ -460,6 +458,10 @@ func main() {
 			server.DefaultTenantPoolReconcileInterval),
 		TenantPoolReconcileWorkers: envInt("DRIVE9_TENANT_POOL_RECONCILE_WORKERS",
 			server.DefaultTenantPoolReconcileWorkers),
+		TenantPoolReconcileWorkerRest: envDuration("DRIVE9_TENANT_POOL_RECONCILE_WORKER_REST",
+			server.DefaultTenantPoolReconcileWorkerRest),
+		ManagedSharedDBPlannedCapacityLease: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_PLANNED_CAPACITY_LEASE",
+			server.DefaultManagedSharedDBPlannedCapacityLease),
 		ManagedSharedDBStuckTimeout: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_STUCK_TIMEOUT",
 			server.DefaultManagedSharedDBStuckTimeout),
 		ManagedSharedDBFailedCleanupInterval: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_INTERVAL",
@@ -687,14 +689,15 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO emergency hard-cap ratio > 1 after physical create failure (default: 1.2)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_REOPEN_RATIO reopen ratio for a latched shared pool (default: 0.8)
   DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT physical spending-limit target for new managed shared DB pools (default: 1000000)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_CLOUD_BATCH_SIZE physical pools per Cloud create request (default and maximum: 10)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_REFILL_POOL_LIMIT maximum physical shared DBs added by one refill wave (default: 50)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_CLOUD_BATCH_SIZE maximum physical pools in one refill Cloud request (default: 50)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_WORKERS concurrent pending metadata workers (default and maximum: 15)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_BATCH_SIZE physical pools per metadata list request (default and maximum: 30)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_POLL_INTERVAL delay between metadata list rounds (default: 15s)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_PROVISIONING_WORKERS concurrent shared schema-init workers (default: 100)
-  DRIVE9_TENANT_POOL_RECONCILE_INTERVAL leader logical-pool refill scan interval (default: 15s)
-  DRIVE9_TENANT_POOL_RECONCILE_WORKERS maximum concurrent leader logical-pool refills (default: 10)
+  DRIVE9_TENANT_POOL_RECONCILE_INTERVAL leader logical-pool refill scan interval (default: 5s)
+  DRIVE9_TENANT_POOL_RECONCILE_WORKERS concurrent queued leader logical-pool refill workers (default: 15)
+  DRIVE9_TENANT_POOL_RECONCILE_WORKER_REST delay before a completed refill worker takes another task (default: 5s)
+  DRIVE9_TIDBCLOUD_NATIVE_SHARED_PLANNED_CAPACITY_LEASE maximum age for pending/provisioning capacity to offset refill (default: 1m)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_STUCK_TIMEOUT pending/provisioning no-progress timeout (default: 15m)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_INTERVAL failed physical-pool cleanup interval (default: 1m)
   DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_BATCH_SIZE failed physical pools processed per cleanup pass (default: 5)

@@ -1001,6 +1001,73 @@ func TestLoadSharedDBPoolWithoutClusterIDMatchesUUID(t *testing.T) {
 	}
 }
 
+func TestListSharedDBPoolsWithCredentialsReturnsAllExactManagedUUIDMatches(t *testing.T) {
+	const wantUUID = "22222222-2222-4222-8222-222222222222"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-shared-list-all", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodGet || r.URL.Path != "/v1beta1/clusters" {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"clusters": []map[string]any{
+			{
+				"clusterId": "cluster-z", "state": "CREATING",
+				"labels": map[string]string{
+					Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+					Drive9DBPoolUUIDLabel: wantUUID,
+				},
+			},
+			{
+				"clusterId": "cluster-a", "state": "ACTIVE", "userPrefix": "shared-user",
+				"endpoints": map[string]any{"public": map[string]any{"host": "shared.example", "port": 4000}},
+				"labels": map[string]string{
+					Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+					Drive9DBPoolUUIDLabel: wantUUID, TiDBCloudOrganizationLabel: "org-1",
+				},
+			},
+			{
+				"clusterId": "cluster-wrong-provider", "state": "ACTIVE",
+				"labels": map[string]string{
+					Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNative,
+					Drive9DBPoolUUIDLabel: wantUUID,
+				},
+			},
+			{
+				"clusterId": "cluster-other-uuid", "state": "ACTIVE",
+				"labels": map[string]string{
+					Drive9ManagedLabel: "true", Drive9ProviderLabel: tenant.ProviderTiDBCloudNativeShared,
+					Drive9DBPoolUUIDLabel: "11111111-1111-4111-8111-111111111111",
+				},
+			},
+		}})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{apiURL: ts.URL, defaultDatabaseName: DefaultDatabaseName}
+	got, err := p.ListSharedDBPoolsWithCredentials(context.Background(), 41, wantUUID, tenant.CredentialProvisionRequest{
+		PublicKey: "public", PrivateKey: "private",
+	})
+	if err != nil {
+		t.Fatalf("ListSharedDBPoolsWithCredentials: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("shared DB pools = %#v, want two exact managed UUID matches", got)
+	}
+	if got[0].ClusterID != "cluster-a" || got[1].ClusterID != "cluster-z" {
+		t.Fatalf("sorted cluster IDs = %q, %q", got[0].ClusterID, got[1].ClusterID)
+	}
+	if got[0].DBPoolID != 41 || got[0].DBPoolUUID != wantUUID || got[1].DBPoolID != 41 || got[1].DBPoolUUID != wantUUID {
+		t.Fatalf("durable pool identity was not preserved: %#v", got)
+	}
+	if got[1].Host != "" || got[1].Port != 0 || got[1].Username != "" {
+		t.Fatalf("incomplete creating cluster unexpectedly has endpoint metadata: %#v", got[1])
+	}
+}
+
 func TestBatchLoadSharedDBPoolsUsesOneClusterListRequest(t *testing.T) {
 	const firstUUID = "11111111-1111-4111-8111-111111111111"
 	const secondUUID = "22222222-2222-4222-8222-222222222222"
