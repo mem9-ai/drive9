@@ -122,6 +122,25 @@ func (s Scope) InsVals(vals string) string {
 	return vals
 }
 
+// SelCols prefixes a SELECT column list with "fs_id, " in shared shape and
+// returns it unchanged in standalone shape. It exists ONLY to work around a
+// TiDB planner bug: with FOR UPDATE SKIP LOCKED, TiDB builds the table
+// schema from the projection only, so a WHERE predicate over an unprojected
+// column is rejected with planner error "Can't find column" — even though
+// the SQL is perfectly valid (it works on MySQL, PostgreSQL, and on TiDB
+// itself with plain FOR UPDATE). Observed on v8.5.3-serverless
+// (2026-06-25 build). Projecting fs_id avoids the bug; callers must scan
+// the extra leading column and may discard it. This can be reverted once
+// upstream fixes the planner. Use it only where the fs_id predicate is
+// present (i.e. queries built with And/Args), otherwise the extra
+// projection is wasted bytes on the wire.
+func (s Scope) SelCols(cols string) string {
+	if s.shared {
+		return "fs_id, " + cols
+	}
+	return cols
+}
+
 // tenantCol returns the tenant-discriminator column name for journal/vault
 // tables under this Store's schema shape.
 func (s *Store) tenantCol() string { return s.scope.TenantCol() }
