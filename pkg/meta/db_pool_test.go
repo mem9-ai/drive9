@@ -737,6 +737,68 @@ func TestManagedSharedDBCloudResultRejectsIdentityChangeAfterProvisioning(t *tes
 	}
 }
 
+func TestManagedSharedDBCloudResultRejectsBlankClusterIdentity(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-blank-cluster", ProvisioningKey: bytes.Repeat([]byte{3}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	err = s.UpdateManagedSharedDBPoolCloudResult(ctx, &SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-blank-cluster", ClusterID: "   ",
+		Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("cipher"),
+		Name: "tidbcloud_fs", TLSMode: "skip-verify",
+	})
+	if err == nil {
+		t.Fatal("blank cluster identity error = nil, want rejection")
+	}
+	got, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if got.Status != SharedDBStatusPending || got.ClusterID != "" {
+		t.Fatalf("pool after blank cluster identity = status %q cluster %q, want pending with no cluster", got.Status, got.ClusterID)
+	}
+}
+
+func TestManagedSharedDBCloudResultRepairsMissingProvisioningIdentity(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-repair-identity", ProvisioningKey: bytes.Repeat([]byte{4}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	ready := &SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-repair-identity", ClusterID: "cluster-repair-identity",
+		Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("cipher"),
+		Name: "tidbcloud_fs", TLSMode: "skip-verify",
+	}
+	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, ready); err != nil {
+		t.Fatalf("persist ready cloud result: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET cluster_id = NULL WHERE db_id = ?`, dbID); err != nil {
+		t.Fatalf("simulate legacy missing provisioning identity: %v", err)
+	}
+	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, ready); err != nil {
+		t.Fatalf("repair missing provisioning identity: %v", err)
+	}
+	got, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if got.Status != SharedDBStatusProvisioning || got.ClusterID != ready.ClusterID {
+		t.Fatalf("repaired pool = status %q cluster %q, want provisioning cluster %q", got.Status, got.ClusterID, ready.ClusterID)
+	}
+}
+
 func TestRefreshManagedSharedDBProvisioningProgressDistinguishesTerminalStatus(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()

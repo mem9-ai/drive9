@@ -295,8 +295,12 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 	if in.TiDBCloudOrganizationID == "" {
 		return fmt.Errorf("tidbcloud organization id is required")
 	}
-	if in.ClusterID == "" {
+	clusterID := strings.TrimSpace(in.ClusterID)
+	if clusterID == "" {
 		return fmt.Errorf("cluster id is required")
+	}
+	if clusterID != in.ClusterID {
+		return fmt.Errorf("cluster id must be an exact value")
 	}
 	if in.Port < 0 {
 		return fmt.Errorf("db port must not be negative")
@@ -345,7 +349,8 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 		// allocation identity cannot be reassigned underneath them. Connection
 		// metadata remains refreshable for endpoint and credential rotation.
 		if currentStatus == SharedDBStatusProvisioning &&
-			(currentOrganizationID != in.TiDBCloudOrganizationID || currentClusterID.String != in.ClusterID) {
+			((strings.TrimSpace(currentOrganizationID) != "" && currentOrganizationID != in.TiDBCloudOrganizationID) ||
+				(strings.TrimSpace(currentClusterID.String) != "" && currentClusterID.String != clusterID)) {
 			return fmt.Errorf("%w: db pool %d", ErrSharedDBPoolIdentityConflict, in.ID)
 		}
 		host := currentHost.String
@@ -369,7 +374,7 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 			name = in.Name
 		}
 		nextStatus := currentStatus
-		metadataReady := host != "" && port > 0 && user != "" && len(password) > 0 && name != ""
+		metadataReady := clusterID != "" && host != "" && port > 0 && user != "" && len(password) > 0 && name != ""
 		if currentStatus == SharedDBStatusPending && metadataReady {
 			nextStatus = SharedDBStatusProvisioning
 		}
@@ -380,7 +385,7 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 				db_name = COALESCE(?, db_name), db_tls = ?,
 				status_updated_at = CASE WHEN status <> ? THEN CURRENT_TIMESTAMP(3) ELSE status_updated_at END,
 				status = ?
-			WHERE db_id = ?`, in.TiDBCloudOrganizationID, in.ClusterID,
+			WHERE db_id = ?`, in.TiDBCloudOrganizationID, clusterID,
 			nullString(in.Host), nullInt(in.Port), nullString(in.User), nullBytes(in.PasswordCipher),
 			nullString(in.Name), in.TLSMode, nextStatus, nextStatus, in.ID); err != nil {
 			return fmt.Errorf("persist cloud result for db pool %d: %w", in.ID, err)
