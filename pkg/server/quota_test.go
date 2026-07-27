@@ -1100,31 +1100,31 @@ func TestQuotaSetSpendingLimitOnlyPersistsSpendingLimitConfig(t *testing.T) {
 	}
 	calls := rt.prov.callsSnapshot()
 	if len(calls) != 2 || calls[0] != "mark" || calls[1] != "update" {
-		t.Fatalf("calls = %#v, want mark before update", calls)
+		t.Errorf("calls = %#v, want mark before update", calls)
 	}
 	lastOptions := rt.prov.lastOptionsSnapshot()
 	if lastOptions.TiDBCloudSpendingLimitMonthly == nil || *lastOptions.TiDBCloudSpendingLimitMonthly != spendingLimit {
-		t.Fatalf("spending limit option = %#v, want %d", lastOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
+		t.Errorf("spending limit option = %#v, want %d", lastOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
 	}
 	cfg, err := rt.meta.GetQuotaConfig(context.Background(), rt.tenantID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != spendingLimit {
-		t.Fatalf("persisted spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, spendingLimit)
+		t.Errorf("persisted spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, spendingLimit)
 	}
 	if cfg.MaxStorageBytes != meta.DefaultMaxStorageBytes() || cfg.MaxFileSizeBytes != meta.DefaultMaxFileSizeBytes() || cfg.MaxFileCount != 0 {
-		t.Fatalf("storage quota fields = %#v, want defaults", cfg)
+		t.Errorf("storage quota fields = %#v, want defaults", cfg)
 	}
 	if !quotaConfigRowExists(t, rt) {
-		t.Fatal("quota config row was not persisted")
+		t.Error("quota config row was not persisted")
 	}
 	var out quotaResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
 	if out.Config.TiDBCloudSpendingLimit == nil || *out.Config.TiDBCloudSpendingLimit != spendingLimit {
-		t.Fatalf("config = %#v", out.Config)
+		t.Errorf("config = %#v", out.Config)
 	}
 }
 
@@ -1148,7 +1148,7 @@ func TestQuotaSetRejectsDrive9KeyWithoutTiDBCloudCredentials(t *testing.T) {
 		t.Fatalf("mark calls = %d, want 0", got)
 	}
 	if quotaConfigRowExists(t, rt) {
-		t.Fatal("quota config row was written for a rejected request")
+		t.Error("quota config row was written for a rejected request")
 	}
 }
 
@@ -1370,7 +1370,7 @@ func TestQuotaSetMapsTiDBCloudCredentialErrorsWithoutWritingConfig(t *testing.T)
 				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
 			}
 			if quotaConfigRowExists(t, rt) {
-				t.Fatal("quota config row was written after TiDB Cloud credential failure")
+				t.Error("quota config row was written after TiDB Cloud credential failure")
 			}
 			if got := rt.prov.markCalls.Load(); got != 1 {
 				t.Fatalf("mark calls = %d, want 1", got)

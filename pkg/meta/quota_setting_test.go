@@ -99,7 +99,7 @@ func TestQuotaConfigSpendingLimitPatchMaterializesStorageDefaults(t *testing.T) 
 		t.Fatal(err)
 	}
 	if cfg.TiDBCloudSpendingLimit != nil {
-		t.Fatalf("default spending limit = %#v, want nil", cfg.TiDBCloudSpendingLimit)
+		t.Errorf("default spending limit = %#v, want nil", cfg.TiDBCloudSpendingLimit)
 	}
 
 	zero := int64(0)
@@ -111,10 +111,10 @@ func TestQuotaConfigSpendingLimitPatchMaterializesStorageDefaults(t *testing.T) 
 		t.Fatal(err)
 	}
 	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != 0 {
-		t.Fatalf("spending limit = %#v, want 0", cfg.TiDBCloudSpendingLimit)
+		t.Errorf("spending limit = %#v, want 0", cfg.TiDBCloudSpendingLimit)
 	}
 	if cfg.MaxStorageBytes != DefaultMaxStorageBytes() || cfg.MaxFileSizeBytes != DefaultMaxFileSizeBytes() || cfg.MaxFileCount != 0 {
-		t.Fatalf("storage quota fields = %#v, want defaults", cfg)
+		t.Errorf("storage quota fields = %#v, want defaults", cfg)
 	}
 	SetDefaultMaxFileSizeBytes(originalFileSizeDefault + 1)
 	cfg, err = s.GetQuotaConfig(ctx, "tenant-spending-only")
@@ -122,7 +122,7 @@ func TestQuotaConfigSpendingLimitPatchMaterializesStorageDefaults(t *testing.T) 
 		t.Fatal(err)
 	}
 	if cfg.MaxFileSizeBytes != originalFileSizeDefault {
-		t.Fatalf("materialized MaxFileSizeBytes = %d after default changed, want %d", cfg.MaxFileSizeBytes, originalFileSizeDefault)
+		t.Errorf("materialized MaxFileSizeBytes = %d after default changed, want %d", cfg.MaxFileSizeBytes, originalFileSizeDefault)
 	}
 	updated := int64(123)
 	if err := s.SetQuotaConfigPatch(ctx, "tenant-spending-only", QuotaConfigPatch{TiDBCloudSpendingLimit: &updated}); err != nil {
@@ -133,7 +133,7 @@ func TestQuotaConfigSpendingLimitPatchMaterializesStorageDefaults(t *testing.T) 
 		t.Fatal(err)
 	}
 	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != updated {
-		t.Fatalf("updated spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, updated)
+		t.Errorf("updated spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, updated)
 	}
 	checkedAt := time.Now().UTC()
 	if err := s.SetQuotaConfigPatch(ctx, "tenant-spending-only", QuotaConfigPatch{TiDBCloudSpendingLimitCheckedAt: &checkedAt}); err != nil {
@@ -144,7 +144,7 @@ func TestQuotaConfigSpendingLimitPatchMaterializesStorageDefaults(t *testing.T) 
 		t.Fatal(err)
 	}
 	if cfg.TiDBCloudSpendingLimitCheckedAt == nil {
-		t.Fatal("spending limit checked_at = nil, want timestamp")
+		t.Error("spending limit checked_at = nil, want timestamp")
 	}
 }
 
