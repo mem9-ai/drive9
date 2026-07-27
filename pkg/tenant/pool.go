@@ -235,6 +235,9 @@ func withSharedDBSchemaAdvisoryLock(
 	}
 	defer func() { _ = conn.Close() }()
 	lockName := fmt.Sprintf("drive9:shared-schema:%d", dbID)
+	// MySQL honors a zero GET_LOCK timeout as non-blocking. TiDB clamps its
+	// minimum timeout to one second, so the provisioning path is fail-fast but
+	// can wait for approximately one second when the same physical DB is busy.
 	waitSeconds := 0
 	if waitForLock {
 		waitSeconds = sharedDBSchemaForegroundLockWaitSeconds

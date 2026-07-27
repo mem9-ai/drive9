@@ -324,13 +324,14 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 	}
 	var advancedTenants []string
 	err = s.InTx(ctx, func(tx *sql.Tx) error {
-		var currentHost, currentUser, currentName sql.NullString
+		var currentOrganizationID string
+		var currentClusterID, currentHost, currentUser, currentName sql.NullString
 		var currentPort sql.NullInt64
 		var currentPassword []byte
 		var currentStatus string
-		if err := tx.QueryRowContext(ctx, `SELECT db_host, db_port, db_user, db_password, db_name, status
+		if err := tx.QueryRowContext(ctx, `SELECT org_id, cluster_id, db_host, db_port, db_user, db_password, db_name, status
 			FROM db_pool WHERE db_id = ? FOR UPDATE`, in.ID).
-			Scan(&currentHost, &currentPort, &currentUser, &currentPassword, &currentName, &currentStatus); err != nil {
+			Scan(&currentOrganizationID, &currentClusterID, &currentHost, &currentPort, &currentUser, &currentPassword, &currentName, &currentStatus); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -338,6 +339,14 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 		}
 		if currentStatus != SharedDBStatusPending && currentStatus != SharedDBStatusProvisioning {
 			return ErrNotFound
+		}
+		// Once complete metadata advances the pool to provisioning, finishers may
+		// safely run without retaining this MetaDB row lock only if the Cloud
+		// allocation identity cannot be reassigned underneath them. Connection
+		// metadata remains refreshable for endpoint and credential rotation.
+		if currentStatus == SharedDBStatusProvisioning &&
+			(currentOrganizationID != in.TiDBCloudOrganizationID || currentClusterID.String != in.ClusterID) {
+			return fmt.Errorf("%w: db pool %d", ErrSharedDBPoolIdentityConflict, in.ID)
 		}
 		host := currentHost.String
 		if in.Host != "" {
@@ -521,7 +530,7 @@ func (s *Store) RefreshManagedSharedDBProvisioningProgress(ctx context.Context, 
 			return err
 		}
 		if status != SharedDBStatusProvisioning {
-			return ErrNotFound
+			return fmt.Errorf("%w: db pool %d has status %q", ErrSharedDBPoolNotProvisioning, dbID, status)
 		}
 	}
 	return nil
