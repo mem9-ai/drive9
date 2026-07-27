@@ -234,7 +234,9 @@ func lockManagedSharedDBPoolWaveCandidates(ctx context.Context, tx *sql.Tx, orga
 	// Acquire every reusable row for the organization in immutable primary-key
 	// order. Status can advance concurrently, so using it in the locking order
 	// can invert acquisition between overlapping refill waves. The result is
-	// sorted by readiness only after the complete stable lock set is held.
+	// sorted by readiness only after the complete stable lock set is held. This
+	// deliberately serializes same-organization refill waves for the duration
+	// of this short transaction; no Cloud or schema work runs while it is held.
 	rows, err := tx.QueryContext(ctx, lockManagedSharedDBPoolWaveCandidatesSQL, organizationID, SharedDBRoleShared,
 		SharedDBStatusActive, SharedDBStatusProvisioning, SharedDBStatusPending)
 	if err != nil {
@@ -500,6 +502,8 @@ func finalizeManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, sta
 		multiRowPlaceholders(len(staged.tenantIDs), 6), staged.membershipArgs...); err != nil {
 		return fmt.Errorf("insert wave memberships: %w", err)
 	}
+	// MySQL evaluates single-table SET assignments from left to right. Keep
+	// soft_cap_reached first so both calculations use the pre-increment count.
 	res, err := tx.ExecContext(ctx, `UPDATE db_pool
 		SET soft_cap_reached = CASE WHEN tenant_count + ? >= max_tenants THEN 1 ELSE 0 END,
 			tenant_count = tenant_count + ?
