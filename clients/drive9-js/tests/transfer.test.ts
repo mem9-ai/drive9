@@ -46,6 +46,60 @@ describe("Transfer", () => {
     expect(initiateCalled).toBe(false);
   });
 
+  it("routes a small Uint8Array through direct PUT even when size is omitted", async () => {
+    // Regression: callers routinely omit the size argument for an in-memory
+    // buffer. An undefined size used to fail every `size < threshold` check
+    // and silently push a small file through multipart/S3 instead of inline.
+    let putCalled = false;
+    let initiateCalled = false;
+    server.use(
+      http.get("http://localhost:9009/v1/status", () => HttpResponse.json({ inline_threshold: 50000 })),
+      http.put("http://localhost:9009/v1/fs/no-size-small.bin", () => {
+        putCalled = true;
+        return HttpResponse.text("ok");
+      }),
+      http.post("http://localhost:9009/v2/uploads/initiate", () => {
+        initiateCalled = true;
+        return HttpResponse.text("unexpected multipart initiate", { status: 500 });
+      })
+    );
+    const client = new Client("http://localhost:9009", "test-key");
+    await client.warm();
+    const data = new TextEncoder().encode("x".repeat(7000));
+    // size argument intentionally omitted
+    const summary = await (client.writeStreamWithSummary as unknown as (
+      p: string,
+      s: Uint8Array
+    ) => Promise<{ mode: string; total_bytes: number }>)("/no-size-small.bin", data);
+    expect(summary.mode).toBe("direct_put");
+    expect(summary.total_bytes).toBe(7000);
+    expect(putCalled).toBe(true);
+    expect(initiateCalled).toBe(false);
+  });
+
+  it("throws for a ReadableStream with a missing or non-finite size", async () => {
+    const client = new Client("http://localhost:9009", "test-key");
+    const makeStream = () =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("tiny"));
+          controller.close();
+        },
+      });
+    await expect(
+      (client.writeStreamWithSummary as unknown as (p: string, s: ReadableStream<Uint8Array>) => Promise<unknown>)(
+        "/stream-no-size.bin",
+        makeStream()
+      )
+    ).rejects.toThrow(/finite non-negative size/);
+    await expect(
+      client.writeStreamWithSummary("/stream-nan-size.bin", makeStream(), Number.NaN)
+    ).rejects.toThrow(/finite non-negative size/);
+    await expect(
+      client.writeStreamWithSummary("/stream-neg-size.bin", makeStream(), -1)
+    ).rejects.toThrow(/finite non-negative size/);
+  });
+
   it("readStream handles 302 redirect", async () => {
     server.use(
       http.get("http://localhost:9009/v1/fs/large.bin", ({ request }) => {

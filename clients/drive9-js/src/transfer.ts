@@ -184,23 +184,35 @@ export async function writeStreamWithSummaryImpl(
   const started = new Date();
   const threshold = client["smallFileThreshold"];
   let data: Uint8Array;
+  let effectiveSize: number;
   if (stream instanceof Uint8Array) {
+    // The byte length is authoritative for an in-memory buffer, so ignore a
+    // missing/incorrect `size` argument: JS callers routinely omit it, and
+    // an `undefined` size otherwise fails every `size < threshold` check and
+    // silently routes a small file through multipart/S3 instead of inline.
     data = stream;
+    effectiveSize = data.length;
   } else {
+    if (typeof size !== "number" || !Number.isFinite(size) || size < 0) {
+      throw new Error(
+        `writeStreamWithSummary requires a finite non-negative size for a ReadableStream, got ${String(size)}`
+      );
+    }
     data = await streamToUint8Array(stream, size);
+    effectiveSize = data.length;
   }
-  if (size === 0 || size < threshold) {
+  if (effectiveSize === 0 || effectiveSize < threshold) {
     await client.write(path, data, opts);
-    return uploadSummary(path, size, "direct_put", started);
+    return uploadSummary(path, effectiveSize, "direct_put", started);
   }
   try {
     const plan = await writeStreamV2(client, path, data, opts);
-    return uploadSummary(path, size, "multipart_v2", started, plan.part_size, plan.total_parts, plan.total_parts);
+    return uploadSummary(path, effectiveSize, "multipart_v2", started, plan.part_size, plan.total_parts, plan.total_parts);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("v2 upload API not available")) {
       const plan = await writeStreamV1(client, path, data, opts);
-      return uploadSummary(path, size, "multipart_v1", started, plan.part_size, plan.parts.length, plan.parts.length);
+      return uploadSummary(path, effectiveSize, "multipart_v1", started, plan.part_size, plan.parts.length, plan.parts.length);
     } else {
       throw err;
     }
