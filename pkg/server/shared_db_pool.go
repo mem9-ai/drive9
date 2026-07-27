@@ -1022,6 +1022,14 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 		if err != nil {
 			return err
 		}
+		// Provisioning rows have already durably committed their physical
+		// identity and connection metadata. Schema ensure and activation are
+		// idempotent, so leader recovery can run them without holding a MetaDB
+		// session lock for the entire remote DDL operation. Pending rows still
+		// use the work lock below to prevent duplicate physical creation.
+		if poolInfo.Status == meta.SharedDBStatusProvisioning && managedSharedDBConnectionMetadataComplete(poolInfo) {
+			return s.finishManagedSharedDBProvisioning(ctx, poolInfo, cred)
+		}
 		restartWithOrganization := false
 		continuePool := func(lockCtx context.Context) error {
 			current, loadErr := s.meta.GetSharedDB(lockCtx, dbID)
@@ -1043,6 +1051,12 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 		}
 	}
 	return fmt.Errorf("db pool %d allocation identity kept changing", dbID)
+}
+
+func managedSharedDBConnectionMetadataComplete(poolInfo *meta.SharedDB) bool {
+	return poolInfo != nil && strings.TrimSpace(poolInfo.ClusterID) != "" && strings.TrimSpace(poolInfo.Host) != "" &&
+		poolInfo.Port > 0 && strings.TrimSpace(poolInfo.User) != "" && len(poolInfo.PasswordCipher) > 0 &&
+		strings.TrimSpace(poolInfo.Name) != ""
 }
 
 // ensureManagedSharedDBPhysicalLocked performs only the physical create/adopt
@@ -1279,6 +1293,30 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 		}
 	}
 	if poolInfo.Host == "" || poolInfo.Port <= 0 || poolInfo.User == "" || len(poolInfo.PasswordCipher) == 0 || poolInfo.Name == "" {
+		return fmt.Errorf("%w: db pool %d", errSharedDBConnectionMetadataNotReady, dbID)
+	}
+	return s.finishManagedSharedDBProvisioning(ctx, poolInfo, cred)
+}
+
+// finishManagedSharedDBProvisioning performs idempotent remote schema ensure
+// and activation after physical identity and connection metadata are durable.
+// It intentionally does not hold the MetaDB pool-work session lock: remote DDL
+// can take minutes, while leader-only consumption and per-process job dedup
+// prevent normal overlap and the operations below are safe to retry after a
+// leader handoff.
+func (s *Server) finishManagedSharedDBProvisioning(ctx context.Context, poolInfo *meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
+	if poolInfo == nil {
+		return fmt.Errorf("managed shared db pool is required")
+	}
+	dbID := poolInfo.ID
+	switch poolInfo.Status {
+	case meta.SharedDBStatusActive, meta.SharedDBStatusFailed, meta.SharedDBStatusDraining:
+		return nil
+	case meta.SharedDBStatusPending, meta.SharedDBStatusProvisioning:
+	default:
+		return fmt.Errorf("managed db pool %d has unsupported status %q", dbID, poolInfo.Status)
+	}
+	if !managedSharedDBConnectionMetadataComplete(poolInfo) {
 		return fmt.Errorf("%w: db pool %d", errSharedDBConnectionMetadataNotReady, dbID)
 	}
 	plain, err := s.pool.Decrypt(ctx, poolInfo.PasswordCipher)

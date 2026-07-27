@@ -210,29 +210,7 @@ func TestManagedSharedDBWorkerConfigDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
-func TestManagedSharedDBProvisioningWorkerLimitReservesMetaConnections(t *testing.T) {
-	tests := []struct {
-		name       string
-		configured int
-		maxOpen    int
-		want       int
-	}{
-		{name: "unlimited", configured: 100, maxOpen: 0, want: 100},
-		{name: "default meta pool", configured: 100, maxOpen: 100, want: 50},
-		{name: "configured below safe limit", configured: 8, maxOpen: 100, want: 8},
-		{name: "odd pool size", configured: 10, maxOpen: 3, want: 1},
-		{name: "no spare callback connection", configured: 1, maxOpen: 1, want: 0},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := limitManagedSharedDBProvisioningWorkers(tt.configured, tt.maxOpen); got != tt.want {
-				t.Fatalf("worker limit = %d, want %d", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestManagedSharedDBProvisioningSlotsUseEffectiveMetaConnectionBudget(t *testing.T) {
+func TestManagedSharedDBProvisioningSlotsIgnoreMetaConnectionBudget(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -242,11 +220,11 @@ func TestManagedSharedDBProvisioningSlotsUseEffectiveMetaConnectionBudget(t *tes
 
 	srv := NewWithConfig(Config{Meta: metaStore, ManagedSharedDBProvisioningWorkers: 100})
 	t.Cleanup(srv.Close)
-	if got := srv.managedSharedDBProvisioningConcurrency; got != 10 {
-		t.Fatalf("effective provisioning concurrency = %d, want 10", got)
+	if got := srv.managedSharedDBProvisioningConcurrency; got != 100 {
+		t.Fatalf("effective provisioning concurrency = %d, want 100", got)
 	}
-	if got := cap(srv.managedSharedDBProvisioningSlots); got != 10 {
-		t.Fatalf("provisioning slot capacity = %d, want 10", got)
+	if got := cap(srv.managedSharedDBProvisioningSlots); got != 100 {
+		t.Fatalf("provisioning slot capacity = %d, want 100", got)
 	}
 }
 
@@ -1944,6 +1922,83 @@ func TestEnsureManagedSharedDBPhysicalUsesPoolLockForKnownCluster(t *testing.T) 
 	close(releaseHolder)
 	if err := <-holderDone; err != nil {
 		t.Fatalf("pool lock holder: %v", err)
+	}
+}
+
+func TestManagedSharedDBProvisioningDoesNotWaitForPoolWorkLock(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(pool.Close)
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-lock-free-provisioning", ProvisioningKey: bytes.Repeat([]byte{6}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+		PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.UpdateManagedSharedDBPoolCloudResult(context.Background(), &meta.SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-lock-free-provisioning", ClusterID: "cluster-lock-free-provisioning",
+		Host: "127.0.0.1", Port: 1, User: "prefix.root", PasswordCipher: passwordCipher,
+		Name: "tidbcloud_fs", TLSMode: "true",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{meta: metaStore, pool: pool, provisioner: &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative}}
+	holderStarted := make(chan struct{})
+	releaseHolder := make(chan struct{})
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- srv.withSharedDBPoolWorkLock(context.Background(), dbID, func(context.Context) error {
+			close(holderStarted)
+			<-releaseHolder
+			return nil
+		})
+	}()
+	<-holderStarted
+
+	continuationDone := make(chan error, 1)
+	go func() {
+		continuationDone <- srv.continueManagedSharedDBPoolOnce(context.Background(), dbID)
+	}()
+	var continuationErr error
+	waitedForPoolLock := false
+	select {
+	case continuationErr = <-continuationDone:
+	case <-time.After(time.Second):
+		waitedForPoolLock = true
+	}
+	close(releaseHolder)
+	if err := <-holderDone; err != nil {
+		t.Fatalf("pool lock holder: %v", err)
+	}
+	if waitedForPoolLock {
+		continuationErr = <-continuationDone
+		t.Fatalf("provisioning continuation waited for the MetaDB pool-work lock: %v", continuationErr)
+	}
+	if continuationErr == nil {
+		t.Fatal("provisioning continuation unexpectedly connected to the invalid shared DB endpoint")
 	}
 }
 
