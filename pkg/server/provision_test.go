@@ -1981,7 +1981,12 @@ func TestManagedSharedDBProvisioningDoesNotWaitForPoolWorkLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := &Server{meta: metaStore, pool: pool, provisioner: &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative}}
+	wantErr := errors.New("schema provisioning reached without waiting for MetaDB pool-work lock")
+	provisioner := &profileAwareFakeProvisioner{
+		fakeProvisioner: fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
+		ensureDBErr:     wantErr,
+	}
+	srv := &Server{meta: metaStore, pool: pool, provisioner: provisioner}
 	holderStarted := make(chan struct{})
 	releaseHolder := make(chan struct{})
 	holderDone := make(chan error, 1)
@@ -1994,27 +1999,50 @@ func TestManagedSharedDBProvisioningDoesNotWaitForPoolWorkLock(t *testing.T) {
 	}()
 	<-holderStarted
 
-	continuationDone := make(chan error, 1)
-	go func() {
-		continuationDone <- srv.continueManagedSharedDBPoolOnce(context.Background(), dbID)
-	}()
-	var continuationErr error
-	waitedForPoolLock := false
-	select {
-	case continuationErr = <-continuationDone:
-	case <-time.After(time.Second):
-		waitedForPoolLock = true
-	}
+	continuationCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	continuationErr := srv.continueManagedSharedDBPoolOnce(continuationCtx, dbID)
+	cancel()
 	close(releaseHolder)
 	if err := <-holderDone; err != nil {
 		t.Fatalf("pool lock holder: %v", err)
 	}
-	if waitedForPoolLock {
-		continuationErr = <-continuationDone
-		t.Fatalf("provisioning continuation waited for the MetaDB pool-work lock: %v", continuationErr)
+	if !errors.Is(continuationErr, wantErr) {
+		t.Fatalf("provisioning continuation error = %v, want EnsureDatabase sentinel without waiting for pool-work lock", continuationErr)
 	}
-	if continuationErr == nil {
-		t.Fatal("provisioning continuation unexpectedly connected to the invalid shared DB endpoint")
+}
+
+func TestManagedSharedDBProvisioningWorkerSkipsPendingCloudWork(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-provisioning-skips-pending",
+		ProvisioningKey:         bytes.Repeat([]byte{8}, 32),
+		CloudProvider:           "aws",
+		Region:                  "us-east-1",
+		MaxTenants:              100,
+		SpendingLimit:           &spendingTarget,
+		Name:                    "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative}
+	srv := &Server{meta: metaStore, provisioner: provisioner}
+
+	if err := srv.continueManagedSharedDBProvisioningOnce(context.Background(), dbID); err != nil {
+		t.Fatalf("provisioning-only continuation for pending row: %v", err)
+	}
+	if got := provisioner.iamCalls.Load(); got != 0 {
+		t.Fatalf("pending row IAM calls = %d, want 0", got)
+	}
+	if got := provisioner.sharedPoolBatchCalls.Load(); got != 0 {
+		t.Fatalf("pending row Cloud create calls = %d, want 0", got)
 	}
 }
 

@@ -435,6 +435,96 @@ func TestSharedDBSchemaIsCheckedLazilyAndRetriedAfterFailure(t *testing.T) {
 	}
 }
 
+func TestSharedDBSchemaEnsureUsesCrossPoolAdvisoryLock(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	dsnCfg, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portText, err := net.SplitHostPort(dsnCfg.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passwordCipher, err := enc.Encrypt(context.Background(), []byte(dsnCfg.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbID, err := metaStore.RegisterSharedDB(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-schema-advisory-lock", Host: host, Port: port,
+		User: dsnCfg.User, PasswordCipher: passwordCipher, Name: dsnCfg.DBName,
+		MaxTenants: 100, Status: meta.SharedDBStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPool := NewPool(PoolConfig{}, enc)
+	firstPool.SetMetaStore(metaStore)
+	t.Cleanup(firstPool.Close)
+	secondPool := NewPool(PoolConfig{}, enc)
+	secondPool.SetMetaStore(metaStore)
+	t.Cleanup(secondPool.Close)
+
+	var ensureCalls atomic.Int32
+	firstEnsureStarted := make(chan struct{})
+	releaseFirstEnsure := make(chan struct{})
+	previousEnsure := ensureSharedDBSchema
+	ensureSharedDBSchema = func(ctx context.Context, db *sql.DB) error {
+		if ensureCalls.Add(1) == 1 {
+			close(firstEnsureStarted)
+			<-releaseFirstEnsure
+		}
+		return db.PingContext(ctx)
+	}
+	t.Cleanup(func() { ensureSharedDBSchema = previousEnsure })
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- firstPool.EnsureSharedDBReady(context.Background(), dbID) }()
+	<-firstEnsureStarted
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- secondPool.EnsureSharedDBReady(context.Background(), dbID) }()
+	var secondErr error
+	select {
+	case secondErr = <-secondDone:
+	case <-time.After(time.Second):
+		close(releaseFirstEnsure)
+		<-firstDone
+		t.Fatal("second shared schema ensure waited instead of returning a non-blocking lock conflict")
+	}
+	close(releaseFirstEnsure)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first shared schema ensure: %v", err)
+	}
+	if !errors.Is(secondErr, errSharedDBSchemaEnsureBusy) {
+		t.Fatalf("second shared schema ensure error = %v, want non-blocking advisory lock conflict", secondErr)
+	}
+	if got := ensureCalls.Load(); got != 1 {
+		t.Fatalf("concurrent schema ensure calls = %d, want 1", got)
+	}
+	if err := secondPool.EnsureSharedDBReady(context.Background(), dbID); err != nil {
+		t.Fatalf("retry after first schema ensure completed: %v", err)
+	}
+	if got := ensureCalls.Load(); got != 1 {
+		t.Fatalf("schema ensure calls after current-version retry = %d, want 1", got)
+	}
+}
+
 func TestSharedDBColdOpensDoNotBlockDifferentDBPools(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
