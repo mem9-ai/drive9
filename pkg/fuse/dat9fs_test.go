@@ -19997,10 +19997,6 @@ func TestRmdirAfterOpenUnlinkDirtyFlush(t *testing.T) {
 	listDir := func(dir string) []map[string]any {
 		mu.Lock()
 		defer mu.Unlock()
-		prefix := dir
-		if !strings.HasSuffix(prefix, "/") {
-			prefix += "/"
-		}
 		var entries []map[string]any
 		for p := range dirs {
 			if p == "/" || p == dir {
