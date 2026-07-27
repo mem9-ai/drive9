@@ -1453,14 +1453,15 @@ func TestIdleEvictionDisabled(t *testing.T) {
 	}
 }
 
-func TestIdleEvictionStartNoOpWhenDisabled(t *testing.T) {
+func TestIdleEvictionStartKeepsSharedHandleReaperWhenDisabled(t *testing.T) {
 	pool := NewPool(PoolConfig{
 		MaxTenants:  2,
 		IdleTimeout: 0,
 	}, nil)
 	pool.Start(context.Background())
-	if pool.reapStop != nil {
-		t.Fatal("expected reapStop to be nil when IdleTimeout=0")
+	t.Cleanup(pool.Close)
+	if pool.reapStop == nil {
+		t.Fatal("expected shared handle reaper to run when IdleTimeout=0")
 	}
 }
 
