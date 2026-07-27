@@ -1039,10 +1039,10 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 			return err
 		}
 		// Provisioning rows have already durably committed their physical
-		// identity and connection metadata. Schema ensure and activation are
-		// idempotent, so leader recovery can run them without holding a MetaDB
-		// session lock for the entire remote DDL operation. Pending rows still
-		// use the work lock below to prevent duplicate physical creation.
+		// identity and connection metadata. Schema ensure is serialized across
+		// pods by an advisory lock on the target TiDB, so leader recovery does
+		// not need to retain a MetaDB session across remote DDL. Pending rows
+		// still use the work lock below to prevent duplicate physical creation.
 		if poolInfo.Status == meta.SharedDBStatusProvisioning && managedSharedDBConnectionMetadataComplete(poolInfo) {
 			return s.finishManagedSharedDBProvisioning(ctx, poolInfo, cred)
 		}
