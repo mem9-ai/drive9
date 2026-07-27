@@ -63,8 +63,14 @@ func TestRecordTenantOperationCountDoesNotRecordDuration(t *testing.T) {
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `drive9_service_operations_total{component="`+component+`",operation="`+operation+`",result="ok",tenant_id="tenant-a",tidbcloud_org_id="org-counter-only"} 1`) {
-		t.Fatalf("missing counter-only operation total:\n%s", text)
+	if !strings.Contains(text, `drive9_service_operations_total{component="`+component+`",operation="`+operation+`",result="ok"} 1`) {
+		t.Fatalf("missing aggregate counter-only operation total:\n%s", text)
+	}
+	if hasMetricLineWith(text, "drive9_service_operations_total", `tenant_id="tenant-a"`) {
+		t.Fatalf("aggregate operation total unexpectedly carried tenant labels:\n%s", text)
+	}
+	if hasMetricLineWith(text, "drive9_tenant_operation_failures_total", `tenant_id="tenant-a"`) {
+		t.Fatalf("successful operation unexpectedly created a tenant failure series:\n%s", text)
 	}
 	if strings.Contains(text, `drive9_service_operation_duration_seconds_count{component="`+component+`",operation="`+operation+`",result="ok",tenant_id="tenant-a"}`) {
 		t.Fatalf("counter-only operation unexpectedly recorded a duration:\n%s", text)
@@ -80,7 +86,7 @@ func TestRecordTenantOperationZeroDurationDoesNotRecordDuration(t *testing.T) {
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `drive9_service_operations_total{component="`+component+`",operation="`+operation+`",result="ok",tenant_id="tenant-zero",tidbcloud_org_id="org-zero-duration"} 1`) {
+	if !strings.Contains(text, `drive9_service_operations_total{component="`+component+`",operation="`+operation+`",result="ok"} 1`) {
 		t.Fatalf("missing zero-duration operation total:\n%s", text)
 	}
 	if strings.Contains(text, `drive9_service_operation_duration_seconds_count{component="`+component+`",operation="`+operation+`",result="ok",tenant_id="tenant-zero"}`) {
@@ -99,8 +105,11 @@ func TestRecordTenantOperationOmitsTenantFromDurationHistograms(t *testing.T) {
 			rec := httptest.NewRecorder()
 			WritePrometheus(rec)
 			text := rec.Body.String()
-			if !strings.Contains(text, `drive9_service_operations_total{component="`+component+`",operation="`+operation+`",result="ok",tenant_id="`+tenantID+`",tidbcloud_org_id="org-`+component+`"} 1`) {
-				t.Fatalf("missing tenant-scoped operation total:\n%s", text)
+			if !strings.Contains(text, `drive9_service_operations_total{component="`+component+`",operation="`+operation+`",result="ok"} 1`) {
+				t.Fatalf("missing aggregate operation total:\n%s", text)
+			}
+			if hasMetricLineWith(text, "drive9_service_operations_total", `tenant_id="`+tenantID+`"`) {
+				t.Fatalf("aggregate operation total unexpectedly carried tenant labels:\n%s", text)
 			}
 			if !strings.Contains(text, `drive9_service_operation_duration_seconds_count{component="`+component+`",operation="`+operation+`",result="ok"} 1`) {
 				t.Fatalf("missing tenant-omitted duration histogram:\n%s", text)
@@ -119,12 +128,12 @@ func TestRecordTenantRequestOmitsHighCardinalityLabels(t *testing.T) {
 		action   = "request_duration_action"
 	)
 
-	RecordTenantRequestWithOrg(tenantID, "org-request-duration", surface, action, "ok", 201, time.Second)
+	RecordTenantRequestWithOrg(tenantID, "org-request-duration", surface, action, 201, time.Second)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `drive9_tenant_requests_total{action="`+action+`",result="ok",status_class="2xx",surface="`+surface+`",tenant_id="`+tenantID+`",tidbcloud_org_id="org-request-duration"} 1`) {
+	if !strings.Contains(text, `drive9_tenant_requests_total{action="`+action+`",status_class="2xx",surface="`+surface+`",tenant_id="`+tenantID+`",tidbcloud_org_id="org-request-duration"} 1`) {
 		t.Errorf("missing tenant-scoped request total:\n%s", text)
 	}
 	if !strings.Contains(text, `drive9_tenant_request_duration_seconds_count{status_class="2xx",surface="`+surface+`"} 1`) {
@@ -132,6 +141,9 @@ func TestRecordTenantRequestOmitsHighCardinalityLabels(t *testing.T) {
 	}
 	if hasMetricLineWith(text, "drive9_tenant_requests_total", `status="201"`) {
 		t.Errorf("tenant request total unexpectedly carried raw status label:\n%s", text)
+	}
+	if hasMetricLineWith(text, "drive9_tenant_requests_total", `result=`) {
+		t.Errorf("tenant request total unexpectedly carried derived result label:\n%s", text)
 	}
 	for _, unexpected := range []string{
 		`action="` + action + `"`,
@@ -148,12 +160,12 @@ func TestRecordTenantRequestOmitsHighCardinalityLabels(t *testing.T) {
 func TestRecordTenantRequestZeroDurationDoesNotRecordDuration(t *testing.T) {
 	const tenantID = "tenant-zero-request"
 
-	RecordTenantRequest(tenantID, "zero_surface", "zero_action", "ok", 200, 0)
+	RecordTenantRequest(tenantID, "zero_surface", "zero_action", 200, 0)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `drive9_tenant_requests_total{action="zero_action",result="ok",status_class="2xx",surface="zero_surface",tenant_id="`+tenantID+`",tidbcloud_org_id="guest"} 1`) {
+	if !strings.Contains(text, `drive9_tenant_requests_total{action="zero_action",status_class="2xx",surface="zero_surface",tenant_id="`+tenantID+`",tidbcloud_org_id="guest"} 1`) {
 		t.Errorf("missing zero-duration tenant request total:\n%s", text)
 	}
 	if hasMetricLineWith(text, "drive9_tenant_request_duration_seconds_count", `surface="zero_surface"`) {
@@ -220,20 +232,60 @@ func TestRecordTenantInFlightDeletesZeroValue(t *testing.T) {
 		action   = "inflight_delete_action"
 	)
 
-	RecordTenantInFlightWithOrg(tenantID, "org-inflight-delete", surface, action, 1)
+	RecordTenantInFlightWithOrg(tenantID, "org-inflight-delete", surface, 1)
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `drive9_tenant_inflight_requests{action="`+action+`",surface="`+surface+`",tenant_id="`+tenantID+`",tidbcloud_org_id="org-inflight-delete"} 1.000000`) {
+	if !strings.Contains(text, `drive9_tenant_inflight_requests{surface="`+surface+`",tenant_id="`+tenantID+`",tidbcloud_org_id="org-inflight-delete"} 1.000000`) {
 		t.Errorf("missing tenant in-flight gauge:\n%s", text)
 	}
 
-	RecordTenantInFlightWithOrg(tenantID, "org-inflight-delete", surface, action, 0)
+	RecordTenantInFlightWithOrg(tenantID, "org-inflight-delete", surface, 0)
 	rec = httptest.NewRecorder()
 	WritePrometheus(rec)
 	text = rec.Body.String()
-	if strings.Contains(text, `drive9_tenant_inflight_requests{action="`+action+`",surface="`+surface+`",tenant_id="`+tenantID+`",tidbcloud_org_id="org-inflight-delete"}`) {
+	if strings.Contains(text, `drive9_tenant_inflight_requests{surface="`+surface+`",tenant_id="`+tenantID+`",tidbcloud_org_id="org-inflight-delete"}`) {
 		t.Errorf("tenant in-flight gauge should be deleted at zero:\n%s", text)
+	}
+}
+
+func TestDeleteTenantGaugeAndSSEInFlightRemoveSeries(t *testing.T) {
+	const tenantID = "tenant-gauge-delete"
+	const orgID = "org-gauge-delete"
+
+	RecordTenantGaugeWithOrg(tenantID, orgID, "semantic_worker", "queue_lag_seconds", 12)
+	RecordSSEInFlightWithOrg(tenantID, orgID, 2)
+	DeleteTenantGaugeWithOrg(tenantID, orgID, "semantic_worker", "queue_lag_seconds")
+	RecordSSEInFlightWithOrg(tenantID, orgID, 0)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if hasMetricLineWith(text, "drive9_service_gauge", `tenant_id="`+tenantID+`"`, `name="queue_lag_seconds"`) {
+		t.Fatalf("deleted tenant gauge remains exported:\n%s", text)
+	}
+	if hasMetricLineWith(text, "drive9_sse_inflight_connections", `tenant_id="`+tenantID+`"`) {
+		t.Fatalf("zero SSE in-flight series remains exported:\n%s", text)
+	}
+}
+
+func TestReplaceTenantQuotaSnapshotRemovesOnlyAbsentLimitSeries(t *testing.T) {
+	const tenantID = "tenant-quota-limit-delete"
+	const orgID = "org-quota-limit-delete"
+
+	ReplaceTenantQuotaSnapshotWithOrg(tenantID, orgID, 10, 1, 2, 3, 100, 20, 30, true)
+	ReplaceTenantQuotaSnapshotWithOrg(tenantID, orgID, 11, 1, 2, 3, 0, 0, 0, true)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !hasMetricLineWith(text, "drive9_tenant_storage_bytes", `tenant_id="`+tenantID+`"`, `state="confirmed"`) {
+		t.Fatalf("confirmed usage was deleted while limits were replaced:\n%s", text)
+	}
+	for _, metric := range []string{"drive9_tenant_storage_bytes", "drive9_tenant_media_files", "drive9_tenant_video_files"} {
+		if hasMetricLineWith(text, metric, `tenant_id="`+tenantID+`"`, `state="limit"`) {
+			t.Fatalf("stale limit remains for %s:\n%s", metric, text)
+		}
 	}
 }
 
@@ -245,9 +297,9 @@ func TestTenantIDMetricsIncludeTiDBCloudOrgID(t *testing.T) {
 
 	RecordTenantGaugeWithOrg(tenantID, orgID, "component_org_label_test", "gauge", 1)
 	RecordTenantEventWithOrg(tenantID, orgID, "event_org_label_test", "result", "ok")
-	RecordTenantRequestCountWithOrg(tenantID, orgID, "surface_org_label_test", "action", "ok", 200)
-	RecordTenantHTTPBytesWithOrg(tenantID, orgID, "surface_org_label_test", "ignored", "request", 10)
-	RecordTenantFileBytesWithOrg(tenantID, orgID, "surface_org_label_test", "write", "out", 20)
+	RecordTenantRequestCountWithOrg(tenantID, orgID, "surface_org_label_test", "action", 200)
+	RecordTenantHTTPBytesWithOrg(tenantID, orgID, "request", 10)
+	RecordTenantFileBytesWithOrg(tenantID, orgID, "out", 20)
 	RecordTenantStorageBytesWithOrg(tenantID, orgID, "confirmed", 30)
 	RecordTenantMediaFilesWithOrg(tenantID, orgID, "confirmed", 40)
 	RecordTenantVideoFilesWithOrg(tenantID, orgID, "limit", 50)
@@ -256,20 +308,18 @@ func TestTenantIDMetricsIncludeTiDBCloudOrgID(t *testing.T) {
 	RecordSSEEventSentWithOrg(tenantID, orgID, "write")
 	RecordSSEResetSentWithOrg(tenantID, orgID, "seq_too_old")
 	RecordSSEHeartbeatSentWithOrg(tenantID, orgID)
-	RecordEventBusPollFailureWithOrg(tenantID, orgID)
-	RecordEventBusPublishErrorWithOrg(tenantID, orgID)
 	RecordFSEventsRowsWithOrg(tenantID, orgID, 50)
-	RecordFSEventsPrunedWithOrg(tenantID, orgID, 60)
+	RecordFSEventsPruned(60)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
 	for _, want := range []string{
 		`drive9_service_gauge{component="component_org_label_test",name="gauge",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1.000000`,
-		`drive9_business_events_total{event="event_org_label_test",result="ok",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
-		`drive9_tenant_requests_total{action="action",result="ok",status_class="2xx",surface="surface_org_label_test",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
-		`drive9_tenant_http_bytes_total{direction="request",surface="surface_org_label_test",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 10`,
-		`drive9_tenant_file_bytes_total{action="write",direction="out",surface="surface_org_label_test",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 20`,
+		`drive9_business_events_total{event="event_org_label_test",result="ok"} 1`,
+		`drive9_tenant_requests_total{action="action",status_class="2xx",surface="surface_org_label_test",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
+		`drive9_tenant_http_bytes_total{direction="request",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 10`,
+		`drive9_tenant_file_bytes_total{direction="out",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 20`,
 		`drive9_tenant_storage_bytes{state="confirmed",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 30.000000`,
 		`drive9_tenant_media_files{state="confirmed",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 40.000000`,
 		`drive9_tenant_video_files{state="limit",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 50.000000`,
@@ -278,14 +328,78 @@ func TestTenantIDMetricsIncludeTiDBCloudOrgID(t *testing.T) {
 		`drive9_sse_events_sent_total{op="write",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
 		`drive9_sse_resets_sent_total{reason="seq_too_old",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
 		`drive9_sse_heartbeats_sent_total{tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
-		`drive9_event_bus_poll_failures_total{tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
-		`drive9_event_bus_publish_errors_total{tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
 		`drive9_fs_events_rows{tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 50.000000`,
-		`drive9_fs_events_pruned_total{tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 60`,
+		`drive9_fs_events_pruned_total 60`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing org-scoped tenant metric %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestDeleteFSEventsRowsRemovesHealthySeries(t *testing.T) {
+	const tenantID = "tenant-fs-events-rows-delete"
+	const orgID = "org-fs-events-rows-delete"
+	RecordFSEventsRowsWithOrg(tenantID, orgID, 12)
+	DeleteFSEventsRowsWithOrg(tenantID, orgID)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	if hasMetricLineWith(rec.Body.String(), "drive9_fs_events_rows", `tenant_id="`+tenantID+`"`) {
+		t.Fatalf("deleted fs_events row gauge remains exported:\n%s", rec.Body.String())
+	}
+}
+
+func TestTenantOperationFailuresUseSeparateFailureOnlyMetric(t *testing.T) {
+	const tenantID = "tenant-operation-failure-contract"
+	const orgID = "org-operation-failure-contract"
+
+	RecordTenantOperationCountWithOrg(tenantID, orgID, "contract", "work", "queued")
+	RecordTenantOperationCountWithOrg(tenantID, orgID, "contract", "work", "write_error")
+	RecordTenantOperationCountWithOrg(tenantID, orgID, "contract", "quota", "fail_open")
+	RecordTenantOperationCountWithOrg(tenantID, orgID, "contract", "extract", "runtime_not_configured")
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_service_operations_total{component="contract",operation="work",result="queued"} 1`) ||
+		!strings.Contains(text, `drive9_service_operations_total{component="contract",operation="work",result="write_error"} 1`) {
+		t.Fatalf("missing aggregate operation totals:\n%s", text)
+	}
+	if hasMetricLineWith(text, "drive9_service_operations_total", `tenant_id="`+tenantID+`"`) {
+		t.Fatalf("aggregate operation total carried tenant labels:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_operation_failures_total{component="contract",operation="work",result="write_error",tenant_id="`+tenantID+`",tidbcloud_org_id="`+orgID+`"} 1`) {
+		t.Fatalf("missing tenant failure attribution metric:\n%s", text)
+	}
+	for _, want := range []string{
+		`drive9_tenant_operation_failures_total{component="contract",operation="quota",result="fail_open",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
+		`drive9_tenant_operation_failures_total{component="contract",operation="extract",result="runtime_not_configured",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing explicit tenant failure attribution %q:\n%s", want, text)
+		}
+	}
+	if hasMetricLineWith(text, "drive9_tenant_operation_failures_total", `result="queued"`) {
+		t.Fatalf("non-failure result created tenant failure series:\n%s", text)
+	}
+}
+
+func TestBusinessEventTenantLabelsAreLimitedToLifecycleEvents(t *testing.T) {
+	RecordTenantEventWithOrg("tenant-event-contract", "org-event-contract", "fs_write", "result", "ok")
+	RecordTenantEventWithOrg("tenant-event-contract", "org-event-contract", "tenant_provision", "provider", "local", "result", "ok")
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_business_events_total{event="fs_write",result="ok"} 1`) {
+		t.Fatalf("hot-path event was not aggregated:\n%s", text)
+	}
+	if hasMetricLineWith(text, "drive9_business_events_total", `event="fs_write"`, `tenant_id=`) {
+		t.Fatalf("hot-path event carried tenant labels:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_business_events_total{event="tenant_provision",provider="local",result="ok",tenant_id="tenant-event-contract",tidbcloud_org_id="org-event-contract"} 1`) {
+		t.Fatalf("lifecycle event lost tenant attribution:\n%s", text)
 	}
 }
 
@@ -479,11 +593,11 @@ func TestDeleteTenantCounters(t *testing.T) {
 	const tidbCloudOrgID = "org-delete-counter"
 
 	RecordTenantOperationCountWithOrg(tenantID, tidbCloudOrgID, "cmp", "op", "ok")
-	RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, "api", "read", "ok", 200)
-	RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, "api", "", "upload", 1024)
+	RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, "api", "read", 200)
+	RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, "upload", 1024)
 	RecordSSEConnectionWithOrg(tenantID, tidbCloudOrgID, "mount", time.Second)
 	RecordSSEEventSentWithOrg(tenantID, tidbCloudOrgID, "write")
-	RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, "api", "read", 3)
+	RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, "api", 3)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)

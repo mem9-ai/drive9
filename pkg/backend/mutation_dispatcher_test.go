@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,9 @@ import (
 func TestMutationDispatcherAppliesAcrossTenantsPreservingOrder(t *testing.T) {
 	StartMutationDispatcher()
 	t.Cleanup(StopMutationDispatcher)
+	if metricsText := readBackendMetrics(); !strings.Contains(metricsText, `drive9_mutation_dispatcher_queue_capacity{shard="0"} 4096`) {
+		t.Fatalf("dispatcher queue capacity metric missing after start: %s", metricsText)
+	}
 
 	fake := newFakeMetaQuotaStore()
 	const tenantCount = 3
@@ -273,6 +277,10 @@ func TestMutationBatchPoisonItemFallsBackToPerItem(t *testing.T) {
 	}
 
 	processMutationBatch(context.Background(), items)
+	metricsText := readBackendMetrics()
+	if !strings.Contains(metricsText, "drive9_mutation_dispatcher_batch_fallback_total ") {
+		t.Fatalf("dispatcher fallback metric missing: %s", metricsText)
+	}
 
 	// The batch transaction aborted at the poison apply, so the batch mark
 	// was never attempted and every item went through the per-item path.

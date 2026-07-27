@@ -174,6 +174,9 @@ func (s *Store) MarkFailedNativeTenantDeleting(ctx context.Context, tenantID, or
 			return err
 		}
 		updated = affected == 1
+		if updated {
+			return insertTenantNotifyTx(ctx, tx, lockedTenantID, TenantNotifyWorkMetricsCleanup)
+		}
 		return nil
 	})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -263,6 +266,9 @@ func (s *Store) MarkFailedSharedTenantDeleting(ctx context.Context, tenantID, or
 			return err
 		}
 		updated = affected == 1
+		if updated {
+			return insertTenantNotifyTx(ctx, tx, lockedTenantID, TenantNotifyWorkMetricsCleanup)
+		}
 		return nil
 	})
 	if errors.Is(err, sql.ErrNoRows) {

@@ -251,6 +251,9 @@ func (s *Store) MarkFreeSharedTenantPoolTenantDeleting(ctx context.Context, tena
 		}
 		n, _ := res.RowsAffected()
 		updated = n == 1
+		if updated {
+			return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)
+		}
 		return nil
 	})
 	if errors.Is(err, sql.ErrNoRows) {

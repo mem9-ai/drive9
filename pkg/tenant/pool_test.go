@@ -1187,6 +1187,29 @@ func TestIdleEviction(t *testing.T) {
 	}
 }
 
+func TestCloseEntryPreservesLiveTenantCounters(t *testing.T) {
+	const tenantID = "tenant-live-counter-close-entry"
+	metrics.DeleteTenantCounters(tenantID)
+	t.Cleanup(func() { metrics.DeleteTenantCounters(tenantID) })
+
+	metrics.RecordTenantRequestCountWithOrg(tenantID, "org-live-counter", "api", "read", 200)
+	assertTenantMetricPresent := func() {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		metrics.WritePrometheus(recorder)
+		if !strings.Contains(recorder.Body.String(), `drive9_tenant_requests_total{`) ||
+			!strings.Contains(recorder.Body.String(), `tenant_id="`+tenantID+`"`) {
+			t.Fatalf("live tenant counter disappeared from metrics:\n%s", recorder.Body.String())
+		}
+	}
+	assertTenantMetricPresent()
+
+	pool := NewPool(PoolConfig{}, nil)
+	pool.closeEntry(&entry{tenantID: tenantID})
+
+	assertTenantMetricPresent()
+}
+
 func TestIdleEvictionSkippedByRecentAcquire(t *testing.T) {
 	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
 		MaxTenants:       2,

@@ -21,11 +21,34 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 	"github.com/mem9-ai/drive9/pkg/s3client"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
+
+func TestVaultMetricsDistinguishDisabledInvalidAndAvailable(t *testing.T) {
+	assertMetric := func(want string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		metrics.WritePrometheus(rec)
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("missing metric %q:\n%s", want, rec.Body.String())
+		}
+	}
+
+	_ = NewWithConfig(Config{})
+	assertMetric(`drive9_feature_enabled{feature="vault"} 0.000000`)
+
+	_ = NewWithConfig(Config{VaultMasterKey: []byte("invalid")})
+	assertMetric(`drive9_feature_enabled{feature="vault"} 1.000000`)
+	assertMetric(`drive9_module_up{module="vault"} 0.000000`)
+
+	_ = NewWithConfig(Config{VaultMasterKey: make([]byte, 32)})
+	assertMetric(`drive9_feature_enabled{feature="vault"} 1.000000`)
+	assertMetric(`drive9_module_up{module="vault"} 1.000000`)
+}
 
 func newTestServer(t *testing.T) *Server {
 	return newTestServerWithLogger(t, nil)
@@ -2302,32 +2325,35 @@ func TestMetricsEndpoint(t *testing.T) {
 	if !strings.Contains(text, `drive9_db_pool_registered{role="user"`) {
 		t.Fatalf("expected user db pool metric in response: %s", text)
 	}
-	if !strings.Contains(text, `drive9_tenant_requests_total{action="write",result="ok",status_class="2xx",surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
+	if !strings.Contains(text, `drive9_tenant_requests_total{action="write",status_class="2xx",surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Errorf("expected tenant request usage metric in response: %s", text)
 	}
 	if !strings.Contains(text, `drive9_tenant_request_duration_seconds_bucket{status_class="2xx",surface="fs",le="0.1"}`) {
 		t.Errorf("expected tenant request duration usage metric in response: %s", text)
 	}
-	if strings.Contains(text, `drive9_tenant_inflight_requests{action="read",surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
+	if strings.Contains(text, `drive9_tenant_inflight_requests{surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Errorf("completed tenant in-flight usage metric should be removed: %s", text)
 	}
-	if !strings.Contains(text, `drive9_tenant_http_bytes_total{direction="request",surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
+	if !strings.Contains(text, `drive9_tenant_http_bytes_total{direction="request",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Errorf("expected tenant HTTP byte metric in response: %s", text)
 	}
 	if strings.Contains(text, `drive9_tenant_http_bytes_total{action="`) {
 		t.Errorf("tenant HTTP byte metric should not carry action: %s", text)
 	}
-	if !strings.Contains(text, `drive9_tenant_file_bytes_total{action="write",direction="write",surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
+	if !strings.Contains(text, `drive9_tenant_file_bytes_total{direction="write",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Fatalf("expected tenant file write byte metric in response: %s", text)
 	}
-	if !strings.Contains(text, `drive9_tenant_file_bytes_total{action="read",direction="read",surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
+	if !strings.Contains(text, `drive9_tenant_file_bytes_total{direction="read",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Fatalf("expected tenant file read byte metric in response: %s", text)
 	}
-	if !strings.Contains(text, `drive9_business_events_total{event="fs_write",result="ok",tenant_id="local",tidbcloud_org_id="guest"}`) {
-		t.Fatalf("expected fs_write tenant event metric in response: %s", text)
+	if !strings.Contains(text, `drive9_business_events_total{event="fs_write",result="ok"}`) {
+		t.Fatalf("expected aggregate fs_write event metric in response: %s", text)
 	}
-	if !strings.Contains(text, `drive9_business_events_total{event="fs_read",result="ok",tenant_id="local",tidbcloud_org_id="guest"}`) {
-		t.Fatalf("expected fs_read tenant event metric in response: %s", text)
+	if !strings.Contains(text, `drive9_business_events_total{event="fs_read",result="ok"}`) {
+		t.Fatalf("expected aggregate fs_read event metric in response: %s", text)
+	}
+	if strings.Contains(text, `drive9_business_events_total{event="fs_write",result="ok",tenant_id=`) {
+		t.Fatalf("fs_write event metric unexpectedly carries tenant labels: %s", text)
 	}
 	if !strings.Contains(text, `drive9_business_events_total{event="tenant_provision",result="error"}`) {
 		t.Fatalf("expected tenant_provision error metric in response: %s", text)
@@ -2425,13 +2451,13 @@ func TestUploadActionMetrics(t *testing.T) {
 	body, _ := io.ReadAll(metricsResp.Body)
 	text := string(body)
 
-	if !strings.Contains(text, `drive9_business_events_total{event="upload_complete",result="error",tenant_id="local",tidbcloud_org_id="guest"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="upload_complete",result="error"}`) {
 		t.Fatalf("expected upload_complete metric, got: %s", text)
 	}
-	if !strings.Contains(text, `drive9_business_events_total{event="upload_resume",result="error",tenant_id="local",tidbcloud_org_id="guest"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="upload_resume",result="error"}`) {
 		t.Fatalf("expected upload_resume metric, got: %s", text)
 	}
-	if !strings.Contains(text, `drive9_business_events_total{event="upload_abort",result="error",tenant_id="local",tidbcloud_org_id="guest"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="upload_abort",result="error"}`) {
 		t.Fatalf("expected upload_abort metric, got: %s", text)
 	}
 }

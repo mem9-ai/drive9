@@ -358,6 +358,31 @@ func writeDBPrometheus(w http.ResponseWriter) {
 		poolTotals[key] = totals
 	}
 	keys := sortedDBMetricKeys(poolTotals)
+	tenantRoleTotals := make(map[string]dbPoolTotals)
+	for key, totals := range poolTotals {
+		if !key.hasTenantID() {
+			continue
+		}
+		aggregate := tenantRoleTotals[key.role]
+		aggregate.inUseConnections += totals.inUseConnections
+		aggregate.maxOpenConnections += totals.maxOpenConnections
+		tenantRoleTotals[key.role] = aggregate
+	}
+	// If a role has both scoped and unscoped pools, fold the unscoped pool's
+	// saturation totals into the same role-level aggregate. Emitting the
+	// unscoped key alone would hide tenant-scoped capacity while the pool is
+	// open (fork/delete paths are one such source of transient pools).
+	for key, totals := range poolTotals {
+		if key.hasTenantID() {
+			continue
+		}
+		if aggregate, ok := tenantRoleTotals[key.role]; ok {
+			aggregate.inUseConnections += totals.inUseConnections
+			aggregate.maxOpenConnections += totals.maxOpenConnections
+			tenantRoleTotals[key.role] = aggregate
+		}
+	}
+	tenantRoles := SortedKeys(tenantRoleTotals)
 
 	globalDB.mu.RLock()
 	probeByRole := make(map[string]dbProbeState, len(globalDB.probe))
@@ -401,13 +426,27 @@ func writeDBPrometheus(w http.ResponseWriter) {
 	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_pool_connections gauge")
 	for _, key := range keys {
 		totals := poolTotals[key]
+		if !key.hasTenantID() {
+			if _, hasScopedPool := tenantRoleTotals[key.role]; hasScopedPool {
+				continue
+			}
+		}
 		if key.hasScopedIdentity() && totals.openConnections == 0 {
 			continue
 		}
 		labels := dbLabels(key)
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"open\"} %d\n", labels, totals.openConnections)
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"in_use\"} %d\n", labels, totals.inUseConnections)
+		if key.hasTenantID() {
+			continue
+		}
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"idle\"} %d\n", labels, totals.idleConnections)
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"max_open\"} %d\n", labels, totals.maxOpenConnections)
+	}
+	for _, role := range tenantRoles {
+		totals := tenantRoleTotals[role]
+		labels := fmt.Sprintf("role=\"%s\"", EscapePromLabel(role))
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"in_use\"} %d\n", labels, totals.inUseConnections)
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"max_open\"} %d\n", labels, totals.maxOpenConnections)
 	}
 

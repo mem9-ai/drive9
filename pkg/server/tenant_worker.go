@@ -164,7 +164,8 @@ type tenantWorkerManager struct {
 
 	kicks chan kickMsg
 
-	lastMaintenance map[string]time.Time
+	lastMaintenance   map[string]time.Time
+	semanticMetricOrg map[string]string // tenantID -> org used by the last semantic gauge observation
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -214,6 +215,7 @@ func newTenantWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store
 	m.inflight = make(map[string]int)
 	m.kickPending = make(map[string]pendingKick)
 	m.lastMaintenance = make(map[string]time.Time)
+	m.semanticMetricOrg = make(map[string]string)
 	m.kicks = make(chan kickMsg, tenantKickQueueCapacity)
 	return m
 }
@@ -256,6 +258,21 @@ func (m *tenantWorkerManager) KickWithOrg(tenantID, tidbCloudOrgID string, workM
 		// already recorded in kickPending above; do NOT clear it.
 		metrics.RecordTenantOperationWithOrg(tenantID, tidbCloudOrgID, "tenant_worker", "kick", "delayed", 0)
 	}
+}
+
+// ForgetTenant drops process-local scheduler bookkeeping after the tenant
+// lifecycle has durably entered deletion. A queued kick may still be present
+// in the channel, but processKicked will reject it against the persisted
+// non-active status and clear it again.
+func (m *tenantWorkerManager) ForgetTenant(tenantID string) {
+	if m == nil || tenantID == "" {
+		return
+	}
+	m.mu.Lock()
+	delete(m.kickPending, tenantID)
+	delete(m.lastMaintenance, tenantID)
+	delete(m.semanticMetricOrg, tenantID)
+	m.mu.Unlock()
 }
 
 func mergeKickOrgID(current, next string) string {
@@ -327,10 +344,6 @@ func (m *tenantWorkerManager) Start(ctx context.Context) {
 	metrics.SetModuleAvailability("semantic_worker", true)
 	metrics.RecordGauge("semantic_worker", "workers", float64(m.opts.Workers))
 	metrics.RecordGauge("semantic_worker", "inflight", 0)
-	metrics.RecordGauge("semantic_worker", "queued", 0)
-	metrics.RecordGauge("semantic_worker", "processing", 0)
-	metrics.RecordGauge("semantic_worker", "dead_lettered", 0)
-	metrics.RecordGauge("semantic_worker", "queue_lag_seconds", 0)
 	for i := 0; i < m.opts.Workers; i++ {
 		m.wg.Add(1)
 		go m.workerLoop(workerCtx, i+1)
@@ -574,16 +587,22 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 	m.mu.Unlock()
 
 	// fs_events cleanup: prune rows older than fsEventsRetention.
-	if count, err := target.store.CountFSEvents(ctx); err == nil {
+	if count, err := target.store.CountFSEvents(ctx); err != nil {
+		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "event_bus", "fs_events_count", metrics.ResultForError(err), 0)
+	} else if count > 0 {
 		metrics.RecordFSEventsRowsWithOrg(target.tenantID, target.metricOrgID(), count)
+	} else {
+		metrics.DeleteFSEventsRowsWithOrg(target.tenantID, target.metricOrgID())
 	}
 	if n, err := target.store.DeleteFSEventsBefore(ctx, now.Add(-fsEventsRetention)); err != nil {
+		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "event_bus", "retention_sweep", metrics.ResultForError(err), 0)
 		if ctx.Err() == nil {
 			logger.Warn(ctx, "tenant_worker_fs_events_cleanup_failed",
 				zap.String("tenant_id", target.tenantID), zap.Error(err))
 		}
 	} else {
-		metrics.RecordFSEventsPrunedWithOrg(target.tenantID, target.metricOrgID(), n)
+		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "event_bus", "retention_sweep", "ok", 0)
+		metrics.RecordFSEventsPruned(n)
 	}
 
 	// Observation metrics: sample queue depth + dead-letter count.
@@ -599,7 +618,34 @@ func (m *tenantWorkerManager) observeTenant(ctx context.Context, target *tenantT
 		}
 		return
 	}
-	metrics.RecordTenantGaugeWithOrg(target.tenantID, target.metricOrgID(), "semantic_worker", "dead_lettered", float64(obs.DeadLettered))
+	m.recordSemanticWorkerObservation(target.tenantID, target.metricOrgID(), obs, now)
+}
+
+func (m *tenantWorkerManager) recordSemanticWorkerObservation(tenantID, tidbCloudOrgID string, obs *datastore.SemanticTaskObservation, now time.Time) {
+	tidbCloudOrgID = normalizeTenantMetricTiDBCloudOrgID(tidbCloudOrgID)
+	m.mu.Lock()
+	previousOrgID := m.semanticMetricOrg[tenantID]
+	if m.semanticMetricOrg == nil {
+		m.semanticMetricOrg = make(map[string]string)
+	}
+	m.semanticMetricOrg[tenantID] = tidbCloudOrgID
+	m.mu.Unlock()
+	if previousOrgID != "" && previousOrgID != tidbCloudOrgID {
+		metrics.DeleteTenantGaugeWithOrg(tenantID, previousOrgID, "semantic_worker", "dead_lettered")
+		metrics.DeleteTenantGaugeWithOrg(tenantID, previousOrgID, "semantic_worker", "queue_lag_seconds")
+	}
+	recordSemanticWorkerObservation(tenantID, tidbCloudOrgID, obs, now)
+}
+
+func recordSemanticWorkerObservation(tenantID, tidbCloudOrgID string, obs *datastore.SemanticTaskObservation, now time.Time) {
+	if obs == nil {
+		return
+	}
+	if obs.DeadLettered > 0 {
+		metrics.RecordTenantGaugeWithOrg(tenantID, tidbCloudOrgID, "semantic_worker", "dead_lettered", float64(obs.DeadLettered))
+	} else {
+		metrics.DeleteTenantGaugeWithOrg(tenantID, tidbCloudOrgID, "semantic_worker", "dead_lettered")
+	}
 	tenantLag := float64(0)
 	if obs.OldestClaimableAvailableAt != nil {
 		tenantLag = now.UTC().Sub(obs.OldestClaimableAvailableAt.UTC()).Seconds()
@@ -607,7 +653,11 @@ func (m *tenantWorkerManager) observeTenant(ctx context.Context, target *tenantT
 			tenantLag = 0
 		}
 	}
-	metrics.RecordTenantGaugeWithOrg(target.tenantID, target.metricOrgID(), "semantic_worker", "queue_lag_seconds", tenantLag)
+	if tenantLag > 0 {
+		metrics.RecordTenantGaugeWithOrg(tenantID, tidbCloudOrgID, "semantic_worker", "queue_lag_seconds", tenantLag)
+	} else {
+		metrics.DeleteTenantGaugeWithOrg(tenantID, tidbCloudOrgID, "semantic_worker", "queue_lag_seconds")
+	}
 }
 
 // kickRef resolves a kicked tenant ID to a schedulable ref, applying the same

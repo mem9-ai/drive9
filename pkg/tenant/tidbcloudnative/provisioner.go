@@ -78,31 +78,8 @@ const (
 	upstreamErrorBodyLimit   = 2048
 	upstreamClusterBodyLimit = 1 << 20
 
-	tidbCloudAPICluster = "cluster"
-	tidbCloudAPIIAM     = "iam"
-	tidbCloudAPIBilling = "billing"
-
-	tidbCloudOperationCreateCluster         = "create_cluster"
-	tidbCloudOperationBatchCreateClusters   = "batch_create_clusters"
-	tidbCloudOperationGetCluster            = "get_cluster"
-	tidbCloudOperationListClusters          = "list_clusters"
-	tidbCloudOperationUpdateCluster         = "update_cluster"
-	tidbCloudOperationDeleteCluster         = "delete_cluster"
-	tidbCloudOperationCreateBranch          = "create_branch"
-	tidbCloudOperationGetBranch             = "get_branch"
-	tidbCloudOperationDeleteBranch          = "delete_branch"
-	tidbCloudOperationResolveAPIKeyIdentity = "resolve_api_key_identity"
-	tidbCloudOperationGetOrganizationPlan   = "get_organization_plan"
-
-	tidbCloudResultOK             = "ok"
-	tidbCloudResultClientError    = "client_error"
-	tidbCloudResultRateLimited    = "rate_limited"
-	tidbCloudResultUpstreamError  = "upstream_error"
-	tidbCloudResultProtocolError  = "protocol_error"
-	tidbCloudResultDigestError    = "digest_error"
-	tidbCloudResultTimeout        = "timeout"
-	tidbCloudResultTransportError = "transport_error"
-	tidbCloudResultCanceled       = "canceled"
+	tidbCloudAPIBilling                   = "billing"
+	tidbCloudOperationGetOrganizationPlan = "get_organization_plan"
 )
 
 var (
@@ -368,51 +345,6 @@ func (p *Provisioner) doObservedDigestAuthRequest(ctx context.Context, api, oper
 		return nil, err
 	}
 	return resp, nil
-}
-
-func recordTiDBCloudOpenAPIRequest(api, operation, result string) {
-	if api != "" && operation != "" {
-		metrics.RecordTiDBCloudOpenAPIRequest(api, operation, result)
-	}
-}
-
-func recordTiDBCloudHTTPResponse(api, operation string, statusCode int, responseValid bool) {
-	recordTiDBCloudOpenAPIRequest(api, operation, tiDBCloudHTTPResult(statusCode, responseValid))
-}
-
-func tiDBCloudHTTPResult(statusCode int, responseValid bool) string {
-	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
-		if responseValid {
-			return tidbCloudResultOK
-
-		}
-		return tidbCloudResultProtocolError
-	}
-	if statusCode == http.StatusTooManyRequests {
-		return tidbCloudResultRateLimited
-	}
-	if statusCode >= http.StatusBadRequest && statusCode < http.StatusInternalServerError {
-		return tidbCloudResultClientError
-	}
-	if statusCode >= http.StatusInternalServerError && statusCode <= 599 {
-		return tidbCloudResultUpstreamError
-	}
-	return tidbCloudResultProtocolError
-}
-
-func tiDBCloudRequestErrorResult(err error) string {
-	switch {
-	case errors.Is(err, context.Canceled):
-		return tidbCloudResultCanceled
-	case errors.Is(err, context.DeadlineExceeded):
-		return tidbCloudResultTimeout
-	default:
-		var netErr net.Error
-		if errors.As(err, &netErr) && netErr.Timeout() {
-			return tidbCloudResultTimeout
-		}
-		return tidbCloudResultTransportError
-	}
 }
 
 func (p *Provisioner) ResolveOrganizationPlan(ctx context.Context, organizationID string, req tenant.CredentialProvisionRequest) (*tenant.TiDBCloudOrganizationPlan, error) {

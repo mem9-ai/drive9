@@ -4,19 +4,21 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/metrics"
 
 	"golang.org/x/sync/singleflight"
 )
 
 // defaultAPIKeyResolveCacheTTL bounds how long a resolved API key entry may be
 // served from the in-process cache. Tenant-row and tenant_api_keys mutations
-// made through this Store evict the tenant's cached entries via the tenant
-// index; the TTL backstops changes made by other processes (each pod caches
-// independently) and the residual fill-after-evict race (a resolve reading
-// pre-mutation state concurrently with the mutation, then filling after the
-// eviction — that window has no version check and closes only at TTL expiry).
+// made through this Store evict the local tenant entries via the tenant index;
+// revocations also enqueue a durable cross-pod cache-cleanup signal. The TTL
+// backstops changes made by other processes and the residual fill-after-evict
+// race (a resolve reading pre-mutation state concurrently with the mutation,
+// then filling after the eviction — that window has no version check and closes
+// only at TTL expiry).
 const defaultAPIKeyResolveCacheTTL = 10 * time.Second
 
 // envAPIKeyResolveCacheTTLMS overrides defaultAPIKeyResolveCacheTTL (in
@@ -51,9 +53,6 @@ type apiKeyResolveCache struct {
 	hashesByTenant map[string]map[string]struct{}
 
 	flight singleflight.Group
-
-	hits   atomic.Int64
-	misses atomic.Int64
 }
 
 func newAPIKeyResolveCache() *apiKeyResolveCache {
@@ -81,10 +80,10 @@ func apiKeyResolveCacheTTLFromEnv() time.Duration {
 func (c *apiKeyResolveCache) get(hash string) (*TenantWithAPIKey, bool) {
 	rec, ok := c.lookup(hash)
 	if !ok {
-		c.misses.Add(1)
+		metrics.RecordAPIKeyResolveCacheRequest("miss")
 		return nil, false
 	}
-	c.hits.Add(1)
+	metrics.RecordAPIKeyResolveCacheRequest("hit")
 	return rec, true
 }
 
@@ -93,11 +92,16 @@ func (c *apiKeyResolveCache) get(hash string) (*TenantWithAPIKey, bool) {
 func (c *apiKeyResolveCache) lookup(hash string) (*TenantWithAPIKey, bool) {
 	c.mu.Lock()
 	entry, ok := c.byHash[hash]
+	entriesAfterExpiry := -1
 	if ok && !time.Now().Before(entry.expiresAt) {
 		c.deleteLocked(hash)
+		entriesAfterExpiry = len(c.byHash)
 		ok = false
 	}
 	c.mu.Unlock()
+	if entriesAfterExpiry >= 0 {
+		metrics.RecordAPIKeyResolveCacheEntries(entriesAfterExpiry)
+	}
 	if !ok {
 		return nil, false
 	}
@@ -109,7 +113,6 @@ func (c *apiKeyResolveCache) lookup(hash string) (*TenantWithAPIKey, bool) {
 // its tenant so revocations can evict precisely.
 func (c *apiKeyResolveCache) fill(hash string, rec TenantWithAPIKey) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if old, ok := c.byHash[hash]; ok {
 		c.removeTenantIndexLocked(old.rec.Tenant.ID, hash)
 	}
@@ -120,6 +123,9 @@ func (c *apiKeyResolveCache) fill(hash string, rec TenantWithAPIKey) {
 		c.hashesByTenant[rec.Tenant.ID] = set
 	}
 	set[hash] = struct{}{}
+	entries := len(c.byHash)
+	c.mu.Unlock()
+	metrics.RecordAPIKeyResolveCacheEntries(entries)
 }
 
 // evictTenant drops every cached hash known to belong to tenantID. Called
@@ -129,11 +135,23 @@ func (c *apiKeyResolveCache) fill(hash string, rec TenantWithAPIKey) {
 // are a no-op.
 func (c *apiKeyResolveCache) evictTenant(tenantID string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	for hash := range c.hashesByTenant[tenantID] {
 		delete(c.byHash, hash)
 	}
 	delete(c.hashesByTenant, tenantID)
+	entries := len(c.byHash)
+	c.mu.Unlock()
+	metrics.RecordAPIKeyResolveCacheEntries(entries)
+}
+
+// InvalidateAPIKeyResolveCacheForTenant drops all locally cached API-key
+// resolutions for tenantID. Lifecycle outbox consumers use this to invalidate
+// peer-pod caches after a deleting/deleted transition commits.
+func (s *Store) InvalidateAPIKeyResolveCacheForTenant(tenantID string) {
+	if s == nil || s.apiKeys == nil {
+		return
+	}
+	s.apiKeys.evictTenant(tenantID)
 }
 
 func (c *apiKeyResolveCache) deleteLocked(hash string) {

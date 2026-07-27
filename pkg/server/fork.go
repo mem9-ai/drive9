@@ -644,7 +644,7 @@ func (s *Server) provisionForkTenantOnceWithCredentials(ctx context.Context, for
 	if err := s.finalizeTenantSchemaInit(ctx, forkID, dsn, forkTenant.Provider); err != nil {
 		return err
 	}
-	store, err := datastore.Open(dsn)
+	store, err := datastore.OpenForTenant(ctx, dsn, forkID)
 	if err != nil {
 		return err
 	}
@@ -1021,6 +1021,7 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 			if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantDeleted); err != nil {
 				return fmt.Errorf("mark fork deleted: %w", err)
 			}
+			s.clearLocalTenantMetrics(tenantID)
 		}
 		return nil
 	}
@@ -1056,6 +1057,7 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantDeleted); err != nil {
 		return fmt.Errorf("mark fork deleted: %w", err)
 	}
+	s.clearLocalTenantMetrics(tenantID)
 	return nil
 }
 
@@ -1066,6 +1068,7 @@ func (s *Server) cleanupFailedForkBranch(ctx context.Context, t *meta.Tenant, cr
 	if err := s.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted); err != nil {
 		return fmt.Errorf("mark failed fork deleted: %w", err)
 	}
+	s.clearLocalTenantMetrics(t.ID)
 	return nil
 }
 
@@ -1074,7 +1077,7 @@ func (s *Server) openTenantStore(ctx context.Context, t *meta.Tenant) (*datastor
 	if err != nil {
 		return nil, err
 	}
-	return datastore.Open(tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS, t.Provider))
+	return datastore.OpenForTenant(ctx, tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS, t.Provider), t.ID)
 }
 
 func (s *Server) enqueueForkFileGCTaskRefs(ctx context.Context, t *meta.Tenant, store *datastore.Store) error {
