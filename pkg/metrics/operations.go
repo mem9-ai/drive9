@@ -46,8 +46,10 @@ var sseMeter = globalMeterProvider.Meter("sse")
 var tenantMeter = globalMeterProvider.Meter("tenant")
 
 var serviceOperationsTotal = serviceMeter.Int64Counter("drive9_service_operations_total", "Service operations by component/operation/result")
+var tenantOperationFailuresTotal = serviceMeter.Int64Counter("drive9_tenant_operation_failures_total", "Tenant-scoped service operation failures by component/operation/result/tenant/tidbcloud_org")
 var serviceOperationDuration = serviceMeter.Float64Histogram("drive9_service_operation_duration_seconds", "Service operation duration histogram by component/operation/result", operationDurationBounds)
 var serviceGauge = serviceMeter.Float64Gauge("drive9_service_gauge", "Service gauges by component/name")
+var featureEnabled = serviceMeter.Float64Gauge("drive9_feature_enabled", "Configured Drive9 feature state")
 var tenantPoolMetadataResumeWaitTotal = serviceMeter.Int64Counter("drive9_tenant_pool_metadata_resume_wait_total", "Tenant pool metadata resume wait attempts by pool_id/organization_id/scope/result")
 var tenantPoolMetadataResumeWaitDuration = serviceMeter.Float64Histogram("drive9_tenant_pool_metadata_resume_wait_duration_seconds", "Tenant pool metadata resume wait duration by pool_id/organization_id/scope/result", tenantPoolMetadataResumeWaitDurationBounds)
 var tenantPoolCapacity = serviceMeter.Float64Gauge("drive9_tenant_pool_capacity", "Tenant pool capacity by pool_id/organization_id/state")
@@ -59,7 +61,7 @@ var sharedDBPoolSpendingLimit = serviceMeter.Float64Gauge("drive9_shared_db_pool
 var sharedDBPoolCacheHandles = serviceMeter.Float64Gauge("drive9_shared_db_pool_cache_handles", "Per-pod cached physical shared DB handles by tidbcloud_org_id/db_pool_id/db_pool_uuid")
 var sharedDBPoolCacheTenants = serviceMeter.Float64Gauge("drive9_shared_db_pool_cache_tenants", "Per-pod active tenant backend refs on a cached shared DB handle by tidbcloud_org_id/db_pool_id/db_pool_uuid")
 var tidbCloudRBACCacheRequestsTotal = serviceMeter.Int64Counter("drive9_tidbcloud_rbac_cache_requests_total", "TiDB Cloud API key to cluster RBAC cache requests by path/scope/result")
-var tidbCloudOpenAPIRequestsTotal = serviceMeter.Int64Counter("drive9_tidbcloud_openapi_requests_total", "TiDB Cloud OpenAPI requests by path/operation/result")
+var tidbCloudOpenAPIRequestsTotal = serviceMeter.Int64Counter("drive9_tidbcloud_openapi_requests_total", "TiDB Cloud OpenAPI requests by api/operation/result")
 var tidbCloudSpendingLimitSyncTotal = serviceMeter.Int64Counter("drive9_tidbcloud_spending_limit_sync_total", "TiDB Cloud spending limit local sync outcomes by source/result")
 var tidbCloudSpendingLimitMissingTotal = serviceMeter.Int64Counter("drive9_tidbcloud_spending_limit_missing_total", "TiDB Cloud spending limit missing local config observations by path")
 
@@ -77,11 +79,11 @@ var fuseRemoteOperationsTotal = fuseMeter.Int64Counter("drive9_fuse_remote_opera
 var fuseRemoteOperationDuration = fuseMeter.Float64Histogram("drive9_fuse_remote_operation_duration_seconds", "Remote FUSE operation duration histogram", operationDurationBounds)
 var fuseRemoteOperationBytes = fuseMeter.Int64Counter("drive9_fuse_remote_operation_bytes_total", "Bytes processed by remote FUSE operation/result")
 
-var tenantRequestsTotal = tenantMeter.Int64Counter("drive9_tenant_requests_total", "Tenant-scoped requests by tenant/tidbcloud_org/surface/action/result/status_class")
+var tenantRequestsTotal = tenantMeter.Int64Counter("drive9_tenant_requests_total", "Tenant-scoped requests by tenant/tidbcloud_org/surface/action/status_class")
 var tenantRequestDuration = tenantMeter.Float64Histogram("drive9_tenant_request_duration_seconds", "Tenant request duration histogram by surface/status_class", httpDurationBounds)
-var tenantInflight = tenantMeter.Float64Gauge("drive9_tenant_inflight_requests", "Current in-flight tenant-scoped requests by tenant/tidbcloud_org/surface/action")
-var tenantHTTPBytes = tenantMeter.Int64Counter("drive9_tenant_http_bytes_total", "Tenant-scoped HTTP transport bytes by tenant/tidbcloud_org/surface/direction")
-var tenantFileBytes = tenantMeter.Int64Counter("drive9_tenant_file_bytes_total", "Tenant-scoped logical file bytes by tenant/tidbcloud_org/surface/action/direction")
+var tenantInflight = tenantMeter.Float64Gauge("drive9_tenant_inflight_requests", "Current in-flight tenant-scoped requests by tenant/tidbcloud_org/surface")
+var tenantHTTPBytes = tenantMeter.Int64Counter("drive9_tenant_http_bytes_total", "Tenant-scoped HTTP transport bytes by tenant/tidbcloud_org/direction")
+var tenantFileBytes = tenantMeter.Int64Counter("drive9_tenant_file_bytes_total", "Tenant-scoped logical file bytes by tenant/tidbcloud_org/direction")
 var tenantCount = tenantMeter.Float64Gauge("drive9_tenant_count", "Tenant count by status")
 var tenantStorageBytes = tenantMeter.Float64Gauge("drive9_tenant_storage_bytes", "Tenant storage bytes by tenant/tidbcloud_org/state")
 var tenantMediaFiles = tenantMeter.Float64Gauge("drive9_tenant_media_files", "Tenant media file count by tenant/tidbcloud_org/state")
@@ -102,13 +104,11 @@ var sseHeartbeatsSentTotal = sseMeter.Int64Counter("drive9_sse_heartbeats_sent_t
 // poll, latest, oldest) so DB pressure and table growth on the events path
 // are observable without direct DB access.
 var eventBusQueryDuration = serviceMeter.Float64Histogram("drive9_event_bus_query_duration_seconds", "Event-bus fs_events query duration by operation/result", eventBusQueryDurationBounds)
-var eventBusPollFailuresTotal = sseMeter.Int64Counter("drive9_event_bus_poll_failures_total", "Event-bus cross-pod poll query failures by tenant_id/tidbcloud_org_id")
-var eventBusPublishErrorsTotal = sseMeter.Int64Counter("drive9_event_bus_publish_errors_total", "Event-bus fs_events INSERT failures by tenant_id/tidbcloud_org_id")
 
 // fs_events table instruments. Compensates for the lack of direct TiDB
 // access: row count and prune volume are reported by the server itself.
 var fsEventsRows = sseMeter.Float64Gauge("drive9_fs_events_rows", "fs_events table row count by tenant_id/tidbcloud_org_id")
-var fsEventsPrunedTotal = sseMeter.Int64Counter("drive9_fs_events_pruned_total", "fs_events rows pruned by retention cleanup by tenant_id/tidbcloud_org_id")
+var fsEventsPrunedTotal = sseMeter.Int64Counter("drive9_fs_events_pruned_total", "fs_events rows pruned by retention cleanup")
 
 func RegisterModule(module string) {
 	globalRegistry.RegisterModule(module)
@@ -116,6 +116,14 @@ func RegisterModule(module string) {
 
 func SetModuleAvailability(module string, up bool) {
 	globalRegistry.SetModuleAvailability(module, up)
+}
+
+func SetFeatureEnabled(feature string, enabled bool) {
+	value := float64(0)
+	if enabled {
+		value = 1
+	}
+	featureEnabled.Set(value, Attr("feature", cleanMetricValue(feature, "unknown")))
 }
 
 func RecordOperation(component, operation, result string, d time.Duration) {
@@ -133,20 +141,17 @@ func RecordTenantOperationWithOrg(tenantID, tidbCloudOrgID, component, operation
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
 	RegisterModule(component)
-	baseAttrs := []Attribute{
+	attrs := []Attribute{
 		Attr("component", component),
 		Attr("operation", operation),
 		Attr("result", result),
 	}
-	counterAttrs := baseAttrs
-	if tenantID != "unknown" {
-		counterAttrs = append(counterAttrs, Attr("tenant_id", tenantID), Attr("tidbcloud_org_id", tidbCloudOrgID))
-	}
-	serviceOperationsTotal.Add(1, counterAttrs...)
+	serviceOperationsTotal.Add(1, attrs...)
+	recordTenantOperationFailure(tenantID, tidbCloudOrgID, result, attrs)
 	if d <= 0 {
 		return
 	}
-	serviceOperationDuration.Observe(d.Seconds(), baseAttrs...)
+	serviceOperationDuration.Observe(d.Seconds(), attrs...)
 }
 
 func RecordTenantPoolMetadataResumeWait(poolID, organizationID, scope, result string, d time.Duration) {
@@ -295,10 +300,10 @@ func RecordTiDBCloudRBACCacheRequest(path, scope, result string) {
 	)
 }
 
-func RecordTiDBCloudOpenAPIRequest(path, operation, result string) {
-	RegisterModule("tidbcloud_quota")
+func RecordTiDBCloudOpenAPIRequest(api, operation, result string) {
+	RegisterModule("tidbcloud_openapi")
 	tidbCloudOpenAPIRequestsTotal.Add(1,
-		Attr("path", cleanMetricValue(path, "unknown")),
+		Attr("api", cleanMetricValue(api, "unknown")),
 		Attr("operation", cleanMetricValue(operation, "unknown")),
 		Attr("result", cleanMetricValue(result, "unknown")),
 	)
@@ -359,10 +364,32 @@ func RecordTenantOperationCountWithOrg(tenantID, tidbCloudOrgID, component, oper
 		Attr("operation", operation),
 		Attr("result", result),
 	}
-	if tenantID != "unknown" {
-		attrs = append(attrs, Attr("tenant_id", tenantID), Attr("tidbcloud_org_id", tidbCloudOrgID))
-	}
 	serviceOperationsTotal.Add(1, attrs...)
+	recordTenantOperationFailure(tenantID, tidbCloudOrgID, result, attrs)
+}
+
+func recordTenantOperationFailure(tenantID, tidbCloudOrgID, result string, attrs []Attribute) {
+	if tenantID == "unknown" || !isOperationFailureResult(result) {
+		return
+	}
+	failureAttrs := append([]Attribute(nil), attrs...)
+	failureAttrs = append(failureAttrs,
+		Attr("tenant_id", tenantID),
+		Attr("tidbcloud_org_id", tidbCloudOrgID),
+	)
+	tenantOperationFailuresTotal.Add(1, failureAttrs...)
+}
+
+func isOperationFailureResult(result string) bool {
+	switch result {
+	case "error", "bad_conn", "deadline_exceeded", "failed",
+		"fail_open", "busy_fail_open",
+		"runtime_not_configured", "handler_missing", "unsupported",
+		"lease_lost", "dead_lettered":
+		return true
+	default:
+		return strings.HasSuffix(result, "_error")
+	}
 }
 
 func RecordGauge(component, name string, value float64) {
@@ -384,6 +411,19 @@ func RecordTenantGaugeWithOrg(tenantID, tidbCloudOrgID, component, name string, 
 		Attr("name", name),
 		Attr("tenant_id", tenantID),
 		Attr("tidbcloud_org_id", tidbCloudOrgID),
+	)
+}
+
+func DeleteTenantGauge(tenantID, component, name string) {
+	DeleteTenantGaugeWithOrg(tenantID, "", component, name)
+}
+
+func DeleteTenantGaugeWithOrg(tenantID, tidbCloudOrgID, component, name string) {
+	serviceGauge.Delete(
+		Attr("component", cleanMetricValue(component, "unknown")),
+		Attr("name", cleanMetricValue(name, "unknown")),
+		Attr("tenant_id", strings.TrimSpace(tenantID)),
+		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
 	)
 }
 
@@ -425,23 +465,21 @@ func RecordHTTPRequestCount(method, route string, status int) {
 
 // RecordTenantRequestCount records only the tenant request counter, not the
 // duration histogram. Companion to RecordHTTPRequestCount for SSE routes.
-func RecordTenantRequestCount(tenantID, surface, action, result string, status int) {
-	RecordTenantRequestCountWithOrg(tenantID, "", surface, action, result, status)
+func RecordTenantRequestCount(tenantID, surface, action string, status int) {
+	RecordTenantRequestCountWithOrg(tenantID, "", surface, action, status)
 }
 
-func RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, surface, action, result string, status int) {
+func RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, surface, action string, status int) {
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
 	surface = cleanMetricValue(surface, "other")
 	action = cleanMetricValue(action, "other")
-	result = cleanMetricValue(result, "unknown")
 	RegisterModule("tenant_usage")
 	attrs := []Attribute{
 		Attr("tenant_id", tenantID),
 		Attr("tidbcloud_org_id", tidbCloudOrgID),
 		Attr("surface", surface),
 		Attr("action", action),
-		Attr("result", result),
 		Attr("status_class", statusClass(status)),
 	}
 	tenantRequestsTotal.Add(1, attrs...)
@@ -471,7 +509,7 @@ func RecordTenantEventWithOrg(tenantID, tidbCloudOrgID, event string, labels ...
 	attrs = append(attrs, Attr("event", cleanMetricValue(event, "unknown")))
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
-	if tenantID != "unknown" {
+	if tenantID != "unknown" && tenantAttributedBusinessEvent(event) {
 		attrs = append(attrs, Attr("tenant_id", tenantID), Attr("tidbcloud_org_id", tidbCloudOrgID))
 	}
 	for i := 0; i+1 < len(labels); i += 2 {
@@ -480,16 +518,24 @@ func RecordTenantEventWithOrg(tenantID, tidbCloudOrgID, event string, labels ...
 	businessEventsTotal.Add(1, attrs...)
 }
 
-func RecordTenantRequest(tenantID, surface, action, result string, status int, d time.Duration) {
-	RecordTenantRequestWithOrg(tenantID, "", surface, action, result, status, d)
+func tenantAttributedBusinessEvent(event string) bool {
+	switch event {
+	case "auth", "tenant_provision", "tenant_schema_init", "tenant_status":
+		return true
+	default:
+		return false
+	}
 }
 
-func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action, result string, status int, d time.Duration) {
+func RecordTenantRequest(tenantID, surface, action string, status int, d time.Duration) {
+	RecordTenantRequestWithOrg(tenantID, "", surface, action, status, d)
+}
+
+func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action string, status int, d time.Duration) {
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
 	surface = cleanMetricValue(surface, "other")
 	action = cleanMetricValue(action, "other")
-	result = cleanMetricValue(result, "unknown")
 	statusClass := "unknown"
 	if status > 0 {
 		statusClass = strconv.Itoa(status/100) + "xx"
@@ -500,7 +546,6 @@ func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action, resul
 		Attr("tidbcloud_org_id", tidbCloudOrgID),
 		Attr("surface", surface),
 		Attr("action", action),
-		Attr("result", result),
 		Attr("status_class", statusClass),
 	}
 	tenantRequestsTotal.Add(1, attrs...)
@@ -513,33 +558,32 @@ func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action, resul
 	)
 }
 
-func RecordTenantHTTPBytes(tenantID, surface, _, direction string, bytes int64) {
-	RecordTenantHTTPBytesWithOrg(tenantID, "", surface, "", direction, bytes)
+func RecordTenantHTTPBytes(tenantID, direction string, bytes int64) {
+	RecordTenantHTTPBytesWithOrg(tenantID, "", direction, bytes)
 }
 
-func RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, surface, _, direction string, bytes int64) {
-	recordTenantHTTPBytes(tenantID, tidbCloudOrgID, surface, direction, bytes)
+func RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, direction string, bytes int64) {
+	recordTenantHTTPBytes(tenantID, tidbCloudOrgID, direction, bytes)
 }
 
-func RecordTenantFileBytes(tenantID, surface, action, direction string, bytes int64) {
-	RecordTenantFileBytesWithOrg(tenantID, "", surface, action, direction, bytes)
+func RecordTenantFileBytes(tenantID, direction string, bytes int64) {
+	RecordTenantFileBytesWithOrg(tenantID, "", direction, bytes)
 }
 
-func RecordTenantFileBytesWithOrg(tenantID, tidbCloudOrgID, surface, action, direction string, bytes int64) {
-	recordTenantBytes(tenantFileBytes, tenantID, tidbCloudOrgID, surface, action, direction, bytes)
+func RecordTenantFileBytesWithOrg(tenantID, tidbCloudOrgID, direction string, bytes int64) {
+	recordTenantBytes(tenantFileBytes, tenantID, tidbCloudOrgID, direction, bytes)
 }
 
-func RecordTenantInFlight(tenantID, surface, action string, value float64) {
-	RecordTenantInFlightWithOrg(tenantID, "", surface, action, value)
+func RecordTenantInFlight(tenantID, surface string, value float64) {
+	RecordTenantInFlightWithOrg(tenantID, "", surface, value)
 }
 
-func RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, surface, action string, value float64) {
+func RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, surface string, value float64) {
 	RegisterModule("tenant_usage")
 	attrs := []Attribute{
 		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
 		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
 		Attr("surface", cleanMetricValue(surface, "other")),
-		Attr("action", cleanMetricValue(action, "other")),
 	}
 	if value <= 0 {
 		tenantInflight.Delete(attrs...)
@@ -606,7 +650,93 @@ func RecordTenantVideoFilesWithOrg(tenantID, tidbCloudOrgID, state string, count
 	)
 }
 
-func recordTenantBytes(counter *Int64Counter, tenantID, tidbCloudOrgID, surface, action, direction string, bytes int64) {
+// ReplaceTenantQuotaSnapshotWithOrg atomically replaces one tenant's quota
+// gauges under the registry lock. It performs only exact label lookups, so the
+// write path is O(1) in the number of tenants and a scrape cannot observe a
+// delete/re-add gap. When replaceLimits is false, the last known limits are
+// preserved while current usage is refreshed.
+func ReplaceTenantQuotaSnapshotWithOrg(
+	tenantID, tidbCloudOrgID string,
+	storageBytes, reservedBytes, mediaFiles, videoFiles int64,
+	storageLimitBytes, mediaLimitFiles, videoLimitFiles int64,
+	replaceLimits bool,
+) {
+	tenantID = cleanMetricValue(tenantID, "unknown")
+	if tenantID == "unknown" {
+		return
+	}
+	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
+	RegisterModule("tenant_usage")
+
+	globalRegistry.mu.Lock()
+	defer globalRegistry.mu.Unlock()
+	previous := globalRegistry.tenantQuotaSnapshots[tenantID]
+	if replaceLimits {
+		previous.storageLimitBytes = storageLimitBytes
+		previous.mediaLimitFiles = mediaLimitFiles
+		previous.videoLimitFiles = videoLimitFiles
+	}
+	if previous.orgID != "" && previous.orgID != tidbCloudOrgID {
+		deleteTenantQuotaSnapshotLabelsLocked(globalRegistry, tenantID, previous.orgID)
+	}
+	previous.orgID = tidbCloudOrgID
+	globalRegistry.tenantQuotaSnapshots[tenantID] = previous
+
+	setTenantQuotaGaugeLocked(globalRegistry, tenantStorageBytes.name, tenantID, tidbCloudOrgID, "confirmed", storageBytes)
+	setTenantQuotaGaugeLocked(globalRegistry, tenantStorageBytes.name, tenantID, tidbCloudOrgID, "reserved", reservedBytes)
+	setTenantQuotaGaugeLocked(globalRegistry, tenantMediaFiles.name, tenantID, tidbCloudOrgID, "confirmed", mediaFiles)
+	setTenantQuotaGaugeLocked(globalRegistry, tenantVideoFiles.name, tenantID, tidbCloudOrgID, "confirmed", videoFiles)
+	setOrDeleteTenantQuotaLimitLocked(globalRegistry, tenantStorageBytes.name, tenantID, tidbCloudOrgID, previous.storageLimitBytes)
+	setOrDeleteTenantQuotaLimitLocked(globalRegistry, tenantMediaFiles.name, tenantID, tidbCloudOrgID, previous.mediaLimitFiles)
+	setOrDeleteTenantQuotaLimitLocked(globalRegistry, tenantVideoFiles.name, tenantID, tidbCloudOrgID, previous.videoLimitFiles)
+}
+
+func setTenantQuotaGaugeLocked(r *Registry, name, tenantID, tidbCloudOrgID, state string, value int64) {
+	if value < 0 {
+		return
+	}
+	labels := labelsKey([]Attribute{
+		Attr("tenant_id", tenantID),
+		Attr("tidbcloud_org_id", tidbCloudOrgID),
+		Attr("state", state),
+	})
+	r.gauges[name].values[labels] = float64(value)
+}
+
+func setOrDeleteTenantQuotaLimitLocked(r *Registry, name, tenantID, tidbCloudOrgID string, value int64) {
+	labels := labelsKey([]Attribute{
+		Attr("tenant_id", tenantID),
+		Attr("tidbcloud_org_id", tidbCloudOrgID),
+		Attr("state", "limit"),
+	})
+	if value > 0 {
+		r.gauges[name].values[labels] = float64(value)
+		return
+	}
+	delete(r.gauges[name].values, labels)
+}
+
+func deleteTenantQuotaSnapshotLabelsLocked(r *Registry, tenantID, tidbCloudOrgID string) {
+	for _, metric := range []struct {
+		name   string
+		states []string
+	}{
+		{name: tenantStorageBytes.name, states: []string{"confirmed", "reserved", "limit"}},
+		{name: tenantMediaFiles.name, states: []string{"confirmed", "limit"}},
+		{name: tenantVideoFiles.name, states: []string{"confirmed", "limit"}},
+	} {
+		for _, state := range metric.states {
+			labels := labelsKey([]Attribute{
+				Attr("tenant_id", tenantID),
+				Attr("tidbcloud_org_id", tidbCloudOrgID),
+				Attr("state", state),
+			})
+			delete(r.gauges[metric.name].values, labels)
+		}
+	}
+}
+
+func recordTenantBytes(counter *Int64Counter, tenantID, tidbCloudOrgID, direction string, bytes int64) {
 	if bytes <= 0 {
 		return
 	}
@@ -614,13 +744,11 @@ func recordTenantBytes(counter *Int64Counter, tenantID, tidbCloudOrgID, surface,
 	counter.Add(bytes,
 		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
 		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
-		Attr("surface", cleanMetricValue(surface, "other")),
-		Attr("action", cleanMetricValue(action, "other")),
 		Attr("direction", cleanMetricValue(direction, "unknown")),
 	)
 }
 
-func recordTenantHTTPBytes(tenantID, tidbCloudOrgID, surface, direction string, bytes int64) {
+func recordTenantHTTPBytes(tenantID, tidbCloudOrgID, direction string, bytes int64) {
 	if bytes <= 0 {
 		return
 	}
@@ -628,7 +756,6 @@ func recordTenantHTTPBytes(tenantID, tidbCloudOrgID, surface, direction string, 
 	tenantHTTPBytes.Add(bytes,
 		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
 		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
-		Attr("surface", cleanMetricValue(surface, "other")),
 		Attr("direction", cleanMetricValue(direction, "unknown")),
 	)
 }
@@ -696,14 +823,16 @@ func RecordSSEInFlight(tenantID string, count float64) {
 }
 
 func RecordSSEInFlightWithOrg(tenantID, tidbCloudOrgID string, count float64) {
-	if count < 0 {
-		count = 0
-	}
 	RegisterModule("sse")
-	sseInflight.Set(count,
+	attrs := []Attribute{
 		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
 		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
-	)
+	}
+	if count <= 0 {
+		sseInflight.Delete(attrs...)
+		return
+	}
+	sseInflight.Set(count, attrs...)
 }
 
 // RecordSSEPhase1 records the duration of the SSE Phase-1 replay/reset stage.
@@ -777,33 +906,6 @@ func RecordEventBusQuery(tenantID, operation, result string, d time.Duration) {
 	)
 }
 
-// RecordEventBusPollFailure records a cross-pod poll query failure (previously
-// only logged, not metriced).
-func RecordEventBusPollFailure(tenantID string) {
-	RecordEventBusPollFailureWithOrg(tenantID, "")
-}
-
-func RecordEventBusPollFailureWithOrg(tenantID, tidbCloudOrgID string) {
-	RegisterModule("sse")
-	eventBusPollFailuresTotal.Add(1,
-		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
-		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
-	)
-}
-
-// RecordEventBusPublishError records an fs_events INSERT failure.
-func RecordEventBusPublishError(tenantID string) {
-	RecordEventBusPublishErrorWithOrg(tenantID, "")
-}
-
-func RecordEventBusPublishErrorWithOrg(tenantID, tidbCloudOrgID string) {
-	RegisterModule("sse")
-	eventBusPublishErrorsTotal.Add(1,
-		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
-		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
-	)
-}
-
 // RecordFSEventsRows records the current fs_events row count for a tenant.
 // This compensates for the lack of direct TiDB access: the leader cleanup
 // goroutine samples the count and reports it here.
@@ -822,21 +924,21 @@ func RecordFSEventsRowsWithOrg(tenantID, tidbCloudOrgID string, count int64) {
 	)
 }
 
-// RecordFSEventsPruned records the number of fs_events rows deleted by
-// retention cleanup.
-func RecordFSEventsPruned(tenantID string, count int64) {
-	RecordFSEventsPrunedWithOrg(tenantID, "", count)
+func DeleteFSEventsRowsWithOrg(tenantID, tidbCloudOrgID string) {
+	fsEventsRows.Delete(
+		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
+		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
+	)
 }
 
-func RecordFSEventsPrunedWithOrg(tenantID, tidbCloudOrgID string, count int64) {
+// RecordFSEventsPruned records the number of fs_events rows deleted by
+// retention cleanup.
+func RecordFSEventsPruned(count int64) {
 	if count <= 0 {
 		return
 	}
 	RegisterModule("sse")
-	fsEventsPrunedTotal.Add(count,
-		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
-		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
-	)
+	fsEventsPrunedTotal.Add(count)
 }
 
 func WritePrometheus(w http.ResponseWriter) {

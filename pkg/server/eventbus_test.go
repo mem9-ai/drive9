@@ -81,8 +81,8 @@ func TestEventBusSetMetricOrgIDMovesInFlightGauge(t *testing.T) {
 	rec := httptest.NewRecorder()
 	metrics.WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `drive9_sse_inflight_connections{tenant_id="`+tenantID+`",tidbcloud_org_id="guest"} 0.000000`) {
-		t.Fatalf("old guest in-flight series was not zeroed:\n%s", text)
+	if strings.Contains(text, `drive9_sse_inflight_connections{tenant_id="`+tenantID+`",tidbcloud_org_id="guest"}`) {
+		t.Fatalf("old guest in-flight series was not deleted:\n%s", text)
 	}
 	if !strings.Contains(text, `drive9_sse_inflight_connections{tenant_id="`+tenantID+`",tidbcloud_org_id="org-eventbus-relabel"} 1.000000`) {
 		t.Fatalf("new org in-flight series was not recorded:\n%s", text)

@@ -41,6 +41,17 @@ const (
 	TenantDeleted      TenantStatus = "deleted"
 )
 
+// Tenant notify work-mask bits are defined in the meta package because the
+// outbox is persisted here. Server and backend aliases reference these
+// constants instead of allocating bits independently.
+const (
+	TenantNotifyWorkSSE = 1 << iota
+	TenantNotifyWorkSemantic
+	TenantNotifyWorkFileGC
+	TenantNotifyWorkMetricsCleanup
+	TenantNotifyWorkAPIKeyCacheCleanup
+)
+
 var allTenantStatuses = []TenantStatus{
 	TenantPending,
 	TenantProvisioning,
@@ -458,6 +469,23 @@ func expandManagedDBPoolSchema(ctx context.Context, db *sql.DB) error {
 			return fmt.Errorf("add db_pool.soft_cap_reached: %w", err)
 		}
 	}
+	var statusUpdatedAtColumnExists int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = 'status_updated_at'`).Scan(&statusUpdatedAtColumnExists); err != nil {
+		return fmt.Errorf("inspect db_pool.status_updated_at: %w", err)
+	}
+	if statusUpdatedAtColumnExists == 0 {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE db_pool ADD COLUMN status_updated_at DATETIME(3) NULL AFTER status`); err != nil {
+			return fmt.Errorf("add db_pool.status_updated_at: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE db_pool SET status_updated_at = updated_at WHERE status_updated_at IS NULL`); err != nil {
+			return fmt.Errorf("backfill db_pool.status_updated_at: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, `ALTER TABLE db_pool MODIFY COLUMN status_updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)`); err != nil {
+			return fmt.Errorf("make db_pool.status_updated_at non-null: %w", err)
+		}
+	}
 	// Only ever open the latch during migration. Do not clear a latched pool
 	// below the soft cap here; deletion owns the hysteresis transition.
 	if _, err := db.ExecContext(ctx, `UPDATE db_pool
@@ -778,6 +806,7 @@ func metaInitSchemaStatements() []string {
 			spending_limit BIGINT NULL,
 			schema_version INT UNSIGNED NOT NULL DEFAULT 0,
 			status       VARCHAR(20) NOT NULL DEFAULT 'active',
+			status_updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			UNIQUE INDEX uk_db_pool_uuid (uuid),
@@ -2627,6 +2656,9 @@ func (s *Store) MarkFreeTenantPoolTenantDeleting(ctx context.Context, tenantID s
 		}
 		n, _ := res.RowsAffected()
 		updated = n > 0
+		if updated {
+			return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)
+		}
 		return nil
 	})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -3576,9 +3608,31 @@ func scanTenantBindingScanner(row tenantBindingScanner) (*TenantWithTiDBCloudOrg
 	return &rec, nil
 }
 
+// UpdateTenantStatus uses a per-tenant transaction for deleting/deleted
+// transitions so the status change and metrics-cleanup outbox row commit
+// atomically. Batch cleanup callers intentionally keep one transaction per
+// tenant: their loops include external cleanup work, and one large transaction
+// would extend lock lifetimes and couple otherwise independent tenant failures.
 func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status TenantStatus) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_status", start, &err)
+	if tenantStatusNeedsMetricsCleanup(status) {
+		err = s.InTx(ctx, func(tx *sql.Tx) error {
+			res, err := tx.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`, status, time.Now().UTC(), id)
+			if err != nil {
+				return err
+			}
+			if err := requireAffected(res); err != nil {
+				return err
+			}
+			return insertTenantNotifyTx(ctx, tx, id, TenantNotifyWorkMetricsCleanup)
+		})
+		if err != nil {
+			return err
+		}
+		s.apiKeys.evictTenant(id)
+		return nil
+	}
 	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`, status, time.Now().UTC(), id)
 	if err != nil {
 		return err
@@ -3589,6 +3643,10 @@ func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status Tenant
 	}
 	s.apiKeys.evictTenant(id)
 	return nil
+}
+
+func tenantStatusNeedsMetricsCleanup(status TenantStatus) bool {
+	return status == TenantDeleting || status == TenantDeleted
 }
 
 // UpdateTenantProvider rewrites a tenant's persisted provider. It exists for
@@ -3611,9 +3669,35 @@ func (s *Store) UpdateTenantProvider(ctx context.Context, id, provider string) (
 	return nil
 }
 
+// UpdateTenantStatusIf has the same per-tenant transaction boundary as
+// UpdateTenantStatus when moving to deleting/deleted, while preserving the
+// conditional update and per-tenant failure isolation expected by cleanup
+// loops.
 func (s *Store) UpdateTenantStatusIf(ctx context.Context, id string, from, to TenantStatus) (updated bool, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_status_if", start, &err)
+	if tenantStatusNeedsMetricsCleanup(to) {
+		err = s.InTx(ctx, func(tx *sql.Tx) error {
+			res, err := tx.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+				to, time.Now().UTC(), id, from)
+			if err != nil {
+				return err
+			}
+			n, _ := res.RowsAffected()
+			updated = n > 0
+			if !updated {
+				return nil
+			}
+			return insertTenantNotifyTx(ctx, tx, id, TenantNotifyWorkMetricsCleanup)
+		})
+		if err != nil {
+			return false, err
+		}
+		if updated {
+			s.apiKeys.evictTenant(id)
+		}
+		return updated, nil
+	}
 	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
 		to, time.Now().UTC(), id, from)
 	if err != nil {
@@ -3745,10 +3829,23 @@ func (s *Store) RevokeTenantAPIKeys(ctx context.Context, tenantID string) (err e
 	start := time.Now()
 	defer observeMeta(ctx, "revoke_tenant_api_keys", start, &err)
 	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `UPDATE tenant_api_keys
-		SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
-		WHERE tenant_id = ? AND status = ?`,
-		APIKeyRevoked, now, now, tenantID, APIKeyActive)
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE tenant_api_keys
+			SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+			WHERE tenant_id = ? AND status = ?`,
+			APIKeyRevoked, now, now, tenantID, APIKeyActive)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkAPIKeyCacheCleanup)
+	})
 	if err != nil {
 		return err
 	}
@@ -3760,18 +3857,30 @@ func (s *Store) RevokeAPIKey(ctx context.Context, tenantID, apiKeyID string) (er
 	start := time.Now()
 	defer observeMeta(ctx, "revoke_api_key", start, &err)
 	now := time.Now().UTC()
-	res, err := s.db.ExecContext(ctx, `UPDATE tenant_api_keys
-		SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
-		WHERE tenant_id = ? AND id = ? AND status = ?`,
-		APIKeyRevoked, now, now, tenantID, apiKeyID, APIKeyActive)
+	updated := false
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE tenant_api_keys
+			SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+			WHERE tenant_id = ? AND id = ? AND status = ?`,
+			APIKeyRevoked, now, now, tenantID, apiKeyID, APIKeyActive)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		updated = n > 0
+		if !updated {
+			return nil
+		}
+		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkAPIKeyCacheCleanup)
+	})
 	if err != nil {
 		return err
 	}
-	// Evict even when the row was already revoked (n == 0): a cached active
-	// entry would be stale in that case.
 	s.apiKeys.evictTenant(tenantID)
-	n, _ := res.RowsAffected()
-	if n == 0 {
+	if !updated {
 		return ErrNotFound
 	}
 	return nil
@@ -3781,11 +3890,24 @@ func (s *Store) RevokeAPIKeysByIssuer(ctx context.Context, tenantID, provider, s
 	start := time.Now()
 	defer observeMeta(ctx, "revoke_api_keys_by_issuer", start, &err)
 	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `UPDATE tenant_api_keys
-		SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
-		WHERE tenant_id = ? AND issued_by_provider = ? AND issued_by_subject_key = ? AND status = ?
-			AND (? = '' OR id <> ?)`,
-		APIKeyRevoked, now, now, tenantID, provider, subjectKey, APIKeyActive, exceptAPIKeyID, exceptAPIKeyID)
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE tenant_api_keys
+			SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+			WHERE tenant_id = ? AND issued_by_provider = ? AND issued_by_subject_key = ? AND status = ?
+				AND (? = '' OR id <> ?)`,
+			APIKeyRevoked, now, now, tenantID, provider, subjectKey, APIKeyActive, exceptAPIKeyID, exceptAPIKeyID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkAPIKeyCacheCleanup)
+	})
 	if err != nil {
 		return err
 	}
@@ -4105,7 +4227,7 @@ func (s *Store) MarkTenantDeleted(ctx context.Context, tenantID string) (err err
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
 			return err
 		}
-		return nil
+		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)
 	})
 	if err != nil {
 		return err
@@ -4168,7 +4290,7 @@ func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID 
 			WHERE f.tenant_id = ? AND p.status = ?`, tenantID, PlacementStatusDeleting); err != nil {
 			return err
 		}
-		return nil
+		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)
 	})
 	if err != nil {
 		return err
@@ -4745,7 +4867,8 @@ func (s *Store) DeleteSubscriptionsForStalePods(ctx context.Context) (n int64, e
 
 // TenantNotifyRow mirrors a row in tenant_notify_outbox. Each row is a
 // lightweight work signal: tenant_id identifies the tenant and work_mask is a
-// bitmask of work types to dispatch (SSE, semantic, file_gc, quota).
+// bitmask of work types to dispatch (SSE, semantic, file_gc, metrics cleanup,
+// or API-key cache cleanup).
 type TenantNotifyRow struct {
 	ID             uint64
 	TenantID       string
@@ -4762,6 +4885,13 @@ func (s *Store) InsertTenantNotify(ctx context.Context, tenantID string, workMas
 	start := time.Now()
 	defer observeMeta(ctx, "insert_tenant_notify", start, &err)
 	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO tenant_notify_outbox (tenant_id, work_mask) VALUES (?, ?)`,
+		tenantID, workMask)
+	return err
+}
+
+func insertTenantNotifyTx(ctx context.Context, tx *sql.Tx, tenantID string, workMask int) error {
+	_, err := tx.ExecContext(ctx,
 		`INSERT INTO tenant_notify_outbox (tenant_id, work_mask) VALUES (?, ?)`,
 		tenantID, workMask)
 	return err

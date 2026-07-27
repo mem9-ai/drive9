@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/traceid"
 )
@@ -27,6 +29,156 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func tiDBCloudOpenAPIMetricValue(t *testing.T, api, operation, result string) float64 {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	prefix := fmt.Sprintf(`drive9_tidbcloud_openapi_requests_total{api=%q,operation=%q,result=%q} `, api, operation, result)
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		value, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, prefix)), 64)
+		if err != nil {
+			t.Fatalf("parse metric line %q: %v", line, err)
+		}
+		return value
+	}
+	return 0
+}
+
+func TestTiDBCloudOpenAPIRequestErrorsAreClassified(t *testing.T) {
+	tests := []struct {
+		name       string
+		transport  http.RoundTripper
+		wantResult string
+	}{
+		{name: "digest challenge", transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusUnauthorized, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+		}), wantResult: tidbCloudResultDigestError},
+		{name: "canceled", transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return nil, context.Canceled
+		}), wantResult: tidbCloudResultCanceled},
+		{name: "timeout", transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return nil, context.DeadlineExceeded
+		}), wantResult: tidbCloudResultTimeout},
+		{name: "transport", transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("network unavailable")
+		}), wantResult: tidbCloudResultTransportError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tt.wantResult)
+			api := NewHTTPClustersAPI("", "https://iam.tidbapi.com", &http.Client{Transport: tt.transport})
+			if _, err := api.ResolveAPIKey(context.Background(), "METRICKEY1", "metric-private"); err == nil {
+				t.Fatal("expected request error")
+			}
+			after := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tt.wantResult)
+			if after != before+1 {
+				t.Fatalf("metric delta = %v, want 1", after-before)
+			}
+		})
+	}
+}
+
+func TestTiDBCloudOpenAPIDigestRetryRecordsOneLogicalRequest(t *testing.T) {
+	var calls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="metric-nonce", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"name": "orgs/123/projects/456/apiKeys/789", "accessKey": "METRICKEY2", "role": tenant.TiDBCloudRoleOrgOwner,
+		})
+	}))
+	defer ts.Close()
+
+	before := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultOK)
+	api := NewHTTPClustersAPI("", ts.URL, ts.Client())
+	if _, err := api.ResolveAPIKey(context.Background(), "METRICKEY2", "metric-private"); err != nil {
+		t.Fatal(err)
+	}
+	after := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultOK)
+	if calls.Load() != 2 || after != before+1 {
+		t.Fatalf("HTTP calls=%d metric delta=%v, want 2 calls and one logical request", calls.Load(), after-before)
+	}
+}
+
+func TestTiDBCloudOpenAPIProtocolFailureReplacesHTTPSuccess(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{not-json`)
+	}))
+	defer ts.Close()
+
+	beforeOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultOK)
+	beforeProtocol := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultProtocolError)
+	api := NewHTTPClustersAPI("", ts.URL, ts.Client())
+	if _, err := api.ResolveAPIKey(context.Background(), "METRICKEY3", "metric-private"); err == nil {
+		t.Fatal("ResolveAPIKey unexpectedly accepted a malformed response")
+	}
+	afterOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultOK)
+	afterProtocol := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultProtocolError)
+	if afterOK != beforeOK || afterProtocol != beforeProtocol+1 {
+		t.Fatalf("ok delta=%v protocol_error delta=%v, want 0 and 1", afterOK-beforeOK, afterProtocol-beforeProtocol)
+	}
+}
+
+func TestTiDBCloudOpenAPIDeleteUnexpectedSuccessIsProtocolError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(*HTTPClustersAPI) error
+		op   string
+	}{
+		{name: "cluster", call: func(api *HTTPClustersAPI) error {
+			return api.DeleteCluster(context.Background(), "public", "private", "cluster-202")
+		}, op: tidbCloudOperationDeleteCluster},
+		{name: "branch", call: func(api *HTTPClustersAPI) error {
+			return api.DeleteBranch(context.Background(), "public", "private", "cluster-202", "branch-202")
+		}, op: tidbCloudOperationDeleteBranch},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusAccepted,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("accepted")),
+				}, nil
+			})}
+			beforeOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tc.op, tidbCloudResultOK)
+			beforeProtocol := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tc.op, tidbCloudResultProtocolError)
+			api := NewHTTPClustersAPI("https://cluster.tidbapi.com", "", client)
+			if err := tc.call(api); err == nil {
+				t.Fatal("unexpected 2xx delete response was accepted")
+			}
+			afterOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tc.op, tidbCloudResultOK)
+			afterProtocol := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tc.op, tidbCloudResultProtocolError)
+			if afterOK != beforeOK || afterProtocol != beforeProtocol+1 {
+				t.Fatalf("ok delta=%v protocol_error delta=%v, want 0 and 1", afterOK-beforeOK, afterProtocol-beforeProtocol)
+			}
+		})
+	}
+}
+
+func TestTiDBCloudOpenAPIClusterListWithoutQueryUsesListOperation(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"clusters":[]}`)
+	}))
+	defer ts.Close()
+	before := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tidbCloudOperationListClusters, tidbCloudResultOK)
+	api := NewHTTPClustersAPI(ts.URL, "", ts.Client())
+	if _, _, err := api.ListClusters(context.Background(), "public", "private", nil); err != nil {
+		t.Fatal(err)
+	}
+	after := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tidbCloudOperationListClusters, tidbCloudResultOK)
+	if after != before+1 {
+		t.Fatalf("list_clusters metric delta = %v, want 1", after-before)
+	}
 }
 
 func setRequiredNativeProvisionerEnv(t *testing.T) {

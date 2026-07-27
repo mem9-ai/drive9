@@ -184,29 +184,28 @@ func setRequestMetricTenant(ctx context.Context, tenantID, apiKeyID, provider, t
 		action = "other"
 	}
 
-	var oldTenantID, oldTiDBCloudOrgID, oldSurface, oldAction string
+	var oldTenantID, oldTiDBCloudOrgID, oldSurface string
 	var shouldMove bool
 	state.mu.Lock()
 	if state.tenantInFlight {
-		shouldMove = state.tenantID != tenantID || state.tidbCloudOrgID != tidbCloudOrgID || state.surface != surface || state.action != action
+		shouldMove = state.tenantID != tenantID || state.tidbCloudOrgID != tidbCloudOrgID || state.surface != surface
 		if shouldMove {
 			oldTenantID = state.tenantID
 			oldTiDBCloudOrgID = state.tidbCloudOrgID
 			oldSurface = state.surface
-			oldAction = state.action
 			state.tidbCloudOrgID = tidbCloudOrgID
 			state.surface = surface
-			state.action = action
 		}
 		state.tenantID = tenantID
 		state.tidbCloudOrgID = tidbCloudOrgID
 		state.apiKeyID = apiKeyID
 		state.provider = provider
+		state.action = action
 		state.mu.Unlock()
 		if shouldMove {
 			if m := metricsFromContext(ctx); m != nil {
-				m.adjustTenantInFlight(oldTenantID, oldTiDBCloudOrgID, oldSurface, oldAction, -1)
-				m.adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, action, 1)
+				m.adjustTenantInFlight(oldTenantID, oldTiDBCloudOrgID, oldSurface, -1)
+				m.adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, 1)
 			}
 		}
 		return
@@ -221,8 +220,19 @@ func setRequestMetricTenant(ctx context.Context, tenantID, apiKeyID, provider, t
 	state.mu.Unlock()
 
 	if m := metricsFromContext(ctx); m != nil {
-		m.adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, action, 1)
+		m.adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, 1)
 	}
+}
+
+// setRequestMetricTenantForAuthStatus scopes tenant request metrics only after
+// the auth path has established that the tenant is active. Rejected
+// deleting/deleted requests must not recreate series removed by lifecycle
+// cleanup outbox delivery.
+func setRequestMetricTenantForAuthStatus(ctx context.Context, tenantID, apiKeyID, provider, tidbCloudOrgID string, status meta.TenantStatus, class tenantRequestClass) {
+	if status != meta.TenantActive {
+		return
+	}
+	setRequestMetricTenant(ctx, tenantID, apiKeyID, provider, tidbCloudOrgID, class)
 }
 
 func requestMetricScope(ctx context.Context) (tenantID, apiKeyID, provider, tidbCloudOrgID string) {
@@ -288,12 +298,11 @@ func finishRequestMetricTenant(ctx context.Context) {
 	tenantID := state.tenantID
 	tidbCloudOrgID := state.tidbCloudOrgID
 	surface := state.surface
-	action := state.action
 	state.tenantInFlight = false
 	state.mu.Unlock()
 
 	if m := metricsFromContext(ctx); m != nil {
-		m.adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, action, -1)
+		m.adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, -1)
 	}
 }
 
@@ -362,7 +371,7 @@ func (m *serverMetrics) adjustRouteInFlight(route string, delta int64) int64 {
 	return next
 }
 
-func (m *serverMetrics) adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, action string, delta int64) int64 {
+func (m *serverMetrics) adjustTenantInFlight(tenantID, tidbCloudOrgID, surface string, delta int64) int64 {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return 0
@@ -372,27 +381,23 @@ func (m *serverMetrics) adjustTenantInFlight(tenantID, tidbCloudOrgID, surface, 
 	if surface == "" {
 		surface = "other"
 	}
-	action = strings.TrimSpace(action)
-	if action == "" {
-		action = "other"
-	}
-	key := tenantInFlightKey(tenantID, tidbCloudOrgID, surface, action)
+	key := tenantInFlightKey(tenantID, tidbCloudOrgID, surface)
 
 	m.tenantMu.Lock()
 	defer m.tenantMu.Unlock()
 	next := m.tenantInFlight[key] + delta
 	if next <= 0 {
 		delete(m.tenantInFlight, key)
-		metrics.RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, surface, action, 0)
+		metrics.RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, surface, 0)
 		return 0
 	}
 	m.tenantInFlight[key] = next
-	metrics.RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, surface, action, float64(next))
+	metrics.RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, surface, float64(next))
 	return next
 }
 
-func tenantInFlightKey(tenantID, tidbCloudOrgID, surface, action string) string {
-	return tenantID + "\x00" + tidbCloudOrgID + "\x00" + surface + "\x00" + action
+func tenantInFlightKey(tenantID, tidbCloudOrgID, surface string) string {
+	return tenantID + "\x00" + tidbCloudOrgID + "\x00" + surface
 }
 
 type observedResponseWriter struct {
@@ -666,29 +671,6 @@ func classifyS3Action(r *http.Request) string {
 	return strings.ToLower(r.Method)
 }
 
-func tenantRequestResult(status int) string {
-	switch {
-	case status >= 200 && status < 400:
-		return "ok"
-	case status == http.StatusUnauthorized:
-		return "unauthorized"
-	case status == http.StatusForbidden:
-		return "denied"
-	case status == http.StatusNotFound:
-		return "not_found"
-	case status == http.StatusConflict:
-		return "conflict"
-	case status == http.StatusInsufficientStorage || status == http.StatusTooManyRequests:
-		return "quota_or_rate_limited"
-	case status >= 400 && status < 500:
-		return "client_error"
-	case status >= 500:
-		return "server_error"
-	default:
-		return "unknown"
-	}
-}
-
 func requestTenantID(r *http.Request) string {
 	tenantID, _, _, _ := requestMetricScope(r.Context())
 	if tenantID != "" {
@@ -725,12 +707,12 @@ func recordTenantHTTPRequest(r *http.Request, status int, d time.Duration, respo
 	if scopedClass, ok := requestMetricClass(r.Context()); ok {
 		class = scopedClass
 	}
-	metrics.RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, class.surface, class.action, tenantRequestResult(status), status, d)
+	metrics.RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, class.surface, class.action, status, d)
 	if r.ContentLength > 0 {
-		metrics.RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, class.surface, class.action, "request", r.ContentLength)
+		metrics.RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, "request", r.ContentLength)
 	}
 	if responseBytes > 0 {
-		metrics.RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, class.surface, class.action, "response", int64(responseBytes))
+		metrics.RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, "response", int64(responseBytes))
 	}
 }
 
@@ -739,7 +721,7 @@ func recordTenantFileBytes(ctx context.Context, surface, action, direction strin
 	if tenantID == "" || bytes <= 0 {
 		return
 	}
-	metrics.RecordTenantFileBytesWithOrg(tenantID, tidbCloudOrgID, surface, action, direction, bytes)
+	metrics.RecordTenantFileBytesWithOrg(tenantID, tidbCloudOrgID, direction, bytes)
 }
 
 func generateTraceID() string { return traceid.Generate() }

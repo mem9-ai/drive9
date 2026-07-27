@@ -264,7 +264,25 @@ func TestTenantDeleteNativeSucceedsWithCredentials(t *testing.T) {
 	if rt.prov.lastDeprovision == nil || rt.prov.lastDeprovision.ClusterID != "cluster-delete-1" {
 		t.Fatalf("deprovision cluster = %+v", rt.prov.lastDeprovision)
 	}
+	assertTenantMetricsCleanupNotify(t, rt)
 	assertTenantDeletedAndKeysRevoked(t, rt)
+}
+
+func assertTenantMetricsCleanupNotify(t *testing.T, rt *tenantDeleteRuntime) {
+	t.Helper()
+	if rt.server.notifyCoalescer != nil {
+		rt.server.notifyCoalescer.flush(context.Background())
+	}
+	rows, err := rt.meta.ListTenantNotifySince(context.Background(), 0, 100)
+	if err != nil {
+		t.Fatalf("list tenant cleanup notifications: %v", err)
+	}
+	for _, row := range rows {
+		if row.TenantID == rt.tenantID && row.WorkMask&WorkMetricsCleanup != 0 {
+			return
+		}
+	}
+	t.Fatalf("tenant %s has no metrics-cleanup outbox notification: %+v", rt.tenantID, rows)
 }
 
 func TestTenantDeleteNativeUsesServerDefaultCredentials(t *testing.T) {

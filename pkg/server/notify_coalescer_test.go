@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 type recordingNotifyInserter struct {
@@ -52,6 +55,17 @@ type flakyBatchInserter struct {
 	mu    sync.Mutex
 	errs  []error
 	calls [][]meta.TenantNotifyEntry
+}
+
+type blockingBatchInserter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingBatchInserter) insert(context.Context, []meta.TenantNotifyEntry) error {
+	close(b.started)
+	<-b.release
+	return nil
 }
 
 func (f *flakyBatchInserter) insert(ctx context.Context, entries []meta.TenantNotifyEntry) error {
@@ -155,7 +169,7 @@ func TestTenantNotifyCoalescerFlushRetriesBatchOnce(t *testing.T) {
 }
 
 // The batch path fails twice: every entry is delivered through independent
-// per-row inserts, and a failing row is dropped without affecting the rest.
+// per-row inserts, and a failing row remains pending for the next flush.
 func TestTenantNotifyCoalescerFlushFailureFallsBackToPerRow(t *testing.T) {
 	rec := &recordingNotifyInserter{
 		err:       errors.New("meta down"),
@@ -166,8 +180,6 @@ func TestTenantNotifyCoalescerFlushFailureFallsBackToPerRow(t *testing.T) {
 	c.add("tenant-a", 1)
 	c.add("tenant-b", 2)
 	c.flush(context.Background()) // batch fails twice -> per-row fallback
-	rec.err = nil
-	c.flush(context.Background()) // nothing pending anymore
 
 	calls := rec.recorded()
 	if len(calls) != 2 {
@@ -184,9 +196,53 @@ func TestTenantNotifyCoalescerFlushFailureFallsBackToPerRow(t *testing.T) {
 	if got["tenant-a"] != 1 || got["tenant-b"] != 2 {
 		t.Fatalf("per-row entries = %v, want tenant-a=1 and tenant-b=2", got)
 	}
-	if calls := rec.recorded(); len(calls) != 2 {
-		t.Fatalf("batch insert calls after fallback = %d, want 2 (dropped rows are not replayed)", len(calls))
+	metricRec := httptest.NewRecorder()
+	metrics.WritePrometheus(metricRec)
+	metricText := metricRec.Body.String()
+	for _, want := range []string{
+		`drive9_notify_coalescer_flush_total{result="fallback"}`,
+		`drive9_notify_coalescer_per_row_fallback_total{result="ok"}`,
+		`drive9_notify_coalescer_per_row_fallback_total{result="error"}`,
+		`drive9_notify_coalescer_pending 1.000000`,
+	} {
+		if !strings.Contains(metricText, want) {
+			t.Fatalf("missing notify coalescer metric %q: %s", want, metricText)
+		}
 	}
+
+	rec.err = nil
+	rec.singleErr = nil
+	c.flush(context.Background())
+	calls = rec.recorded()
+	if len(calls) != 3 || len(calls[2]) != 1 || calls[2][0].TenantID != "tenant-b" || calls[2][0].WorkMask != 2 {
+		t.Fatalf("retried batch calls = %+v, want third batch with tenant-b mask 2", calls)
+	}
+	metricRec = httptest.NewRecorder()
+	metrics.WritePrometheus(metricRec)
+	if !strings.Contains(metricRec.Body.String(), `drive9_notify_coalescer_pending 0.000000`) {
+		t.Fatalf("pending gauge did not clear after retry success: %s", metricRec.Body.String())
+	}
+}
+
+func TestTenantNotifyCoalescerPendingIncludesInflightFlush(t *testing.T) {
+	blocker := &blockingBatchInserter{started: make(chan struct{}), release: make(chan struct{})}
+	rec := &recordingNotifyInserter{}
+	c := newTenantNotifyCoalescer(blocker.insert, rec.insertSingle, time.Minute)
+	c.add("tenant-inflight", 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.flush(context.Background())
+	}()
+	<-blocker.started
+
+	metricRec := httptest.NewRecorder()
+	metrics.WritePrometheus(metricRec)
+	if !strings.Contains(metricRec.Body.String(), `drive9_notify_coalescer_pending 1.000000`) {
+		t.Fatalf("in-flight flush disappeared from pending gauge: %s", metricRec.Body.String())
+	}
+	close(blocker.release)
+	<-done
 }
 
 func TestTenantNotifyCoalescerStopFlushesPending(t *testing.T) {
