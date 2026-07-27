@@ -373,7 +373,7 @@ const (
 	DefaultTenantPoolReconcileInterval           = 5 * time.Second
 	DefaultTenantPoolReconcileWorkers            = 15
 	DefaultTenantPoolReconcileWorkerRest         = 5 * time.Second
-	DefaultManagedSharedDBStuckTimeout           = 15 * time.Minute
+	DefaultManagedSharedDBStuckTimeout           = 30 * time.Minute
 	DefaultManagedSharedDBFailedCleanupInterval  = time.Minute
 	DefaultManagedSharedDBFailedCleanupBatchSize = 5
 )

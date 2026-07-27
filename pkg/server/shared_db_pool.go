@@ -1059,6 +1059,47 @@ func managedSharedDBConnectionMetadataComplete(poolInfo *meta.SharedDB) bool {
 		strings.TrimSpace(poolInfo.Name) != ""
 }
 
+// withManagedSharedDBProvisioningHeartbeat renews durable progress only when a
+// single remote provisioning attempt runs for a meaningful fraction of the
+// stuck timeout. Fast failures therefore remain eligible for normal stuck
+// cleanup instead of being kept alive by frequent retries.
+func (s *Server) withManagedSharedDBProvisioningHeartbeat(ctx context.Context, dbID int64, fn func(context.Context) error) error {
+	timeout := s.managedSharedDBStuckTimeout
+	if timeout <= 0 {
+		timeout = DefaultManagedSharedDBStuckTimeout
+	}
+	interval := timeout / 4
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	heartbeatCtx, cancel := context.WithCancel(ctx)
+	heartbeatDone := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				heartbeatDone <- nil
+				return
+			case <-ticker.C:
+				if err := s.meta.RefreshManagedSharedDBProvisioningProgress(heartbeatCtx, dbID); err != nil {
+					heartbeatDone <- err
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	workErr := fn(heartbeatCtx)
+	cancel()
+	heartbeatErr := <-heartbeatDone
+	if heartbeatErr != nil {
+		return errors.Join(workErr, fmt.Errorf("refresh managed shared db provisioning progress: %w", heartbeatErr))
+	}
+	return workErr
+}
+
 // ensureManagedSharedDBPhysicalLocked performs only the physical create/adopt
 // stage. It deliberately does not wait for endpoint readiness, system-user
 // setup, schema initialization, or activation so direct requests can fall back
@@ -1303,7 +1344,8 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 // It intentionally does not hold the MetaDB pool-work session lock: remote DDL
 // can take minutes, while leader-only consumption and per-process job dedup
 // prevent normal overlap and the operations below are safe to retry after a
-// leader handoff.
+// leader handoff. A low-rate durable heartbeat prevents the stuck watchdog
+// from failing a pool while one of those long remote DDL operations is active.
 func (s *Server) finishManagedSharedDBProvisioning(ctx context.Context, poolInfo *meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
 	if poolInfo == nil {
 		return fmt.Errorf("managed shared db pool is required")
@@ -1324,26 +1366,31 @@ func (s *Server) finishManagedSharedDBProvisioning(ctx context.Context, poolInfo
 		return fmt.Errorf("decrypt shared db root password: %w", err)
 	}
 	dsn := managedSharedDBDSN(poolInfo, string(plain))
-	if ensurer, ok := s.provisioner.(tenantDatabaseEnsurer); ok {
-		if err := ensurer.EnsureDatabase(ctx, dsn); err != nil {
+	if err := s.withManagedSharedDBProvisioningHeartbeat(ctx, dbID, func(provisioningCtx context.Context) error {
+		if ensurer, ok := s.provisioner.(tenantDatabaseEnsurer); ok {
+			if err := ensurer.EnsureDatabase(provisioningCtx, dsn); err != nil {
+				return err
+			}
+		}
+		if err := s.pool.EnsureSharedDBReady(provisioningCtx, dbID); err != nil {
 			return err
 		}
-	}
-	if err := s.pool.EnsureSharedDBReady(ctx, dbID); err != nil {
-		return err
-	}
-	if updater, ok := s.provisioner.(tenant.QuotaUpdater); ok && poolInfo.SpendingLimit != nil {
-		_, patchErr := updater.UpdateQuota(ctx, &tenant.ClusterInfo{
-			ClusterID: poolInfo.ClusterID, OrganizationID: poolInfo.TiDBCloudOrganizationID,
-			Provider: tenant.ProviderTiDBCloudNative,
-		}, cred, tenant.QuotaUpdateOptions{TiDBCloudSpendingLimitMonthly: poolInfo.SpendingLimit})
-		if patchErr != nil {
-			logger.Warn(ctx, "managed_shared_db_spending_limit_sync_failed",
-				zap.Int64("db_pool_id", dbID),
-				zap.String("db_pool_uuid", poolInfo.UUID),
-				zap.String("tidbcloud_org_id", poolInfo.TiDBCloudOrganizationID),
-				zap.Error(patchErr))
+		if updater, ok := s.provisioner.(tenant.QuotaUpdater); ok && poolInfo.SpendingLimit != nil {
+			_, patchErr := updater.UpdateQuota(provisioningCtx, &tenant.ClusterInfo{
+				ClusterID: poolInfo.ClusterID, OrganizationID: poolInfo.TiDBCloudOrganizationID,
+				Provider: tenant.ProviderTiDBCloudNative,
+			}, cred, tenant.QuotaUpdateOptions{TiDBCloudSpendingLimitMonthly: poolInfo.SpendingLimit})
+			if patchErr != nil {
+				logger.Warn(provisioningCtx, "managed_shared_db_spending_limit_sync_failed",
+					zap.Int64("db_pool_id", dbID),
+					zap.String("db_pool_uuid", poolInfo.UUID),
+					zap.String("tidbcloud_org_id", poolInfo.TiDBCloudOrganizationID),
+					zap.Error(patchErr))
+			}
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if err := s.meta.ActivateSharedDBPool(ctx, dbID); err != nil {
 		return err

@@ -85,6 +85,22 @@ type fakeProvisioner struct {
 	sharedPoolWaitRelease       <-chan struct{}
 }
 
+type blockingDatabaseEnsurer struct {
+	fakeProvisioner
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (f *blockingDatabaseEnsurer) EnsureDatabase(ctx context.Context, _ string) error {
+	close(f.started)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-f.release:
+		return errors.New("stop after provisioning heartbeat test")
+	}
+}
+
 type failingEncryptor struct {
 	err error
 }
@@ -176,7 +192,7 @@ func TestManagedSharedDBWorkerConfigDefaultsAndOverrides(t *testing.T) {
 		defaults.managedSharedDBMetadataWorkers != 15 || defaults.managedSharedDBMetadataBatchSize != 30 ||
 		defaults.managedSharedDBMetadataPollInterval != 15*time.Second || defaults.managedSharedDBProvisioningWorkers != 100 ||
 		defaults.tenantPoolReconcileInterval != 5*time.Second || defaults.tenantPoolReconcileWorkerRest != 5*time.Second ||
-		defaults.managedSharedDBStuckTimeout != 15*time.Minute || defaults.tenantPoolReconcileWorkers != 15 ||
+		defaults.managedSharedDBStuckTimeout != 30*time.Minute || defaults.tenantPoolReconcileWorkers != 15 ||
 		defaults.managedSharedDBFailedCleanupInterval != time.Minute || defaults.managedSharedDBFailedCleanupBatchSize != 5 {
 		t.Fatalf("managed shared defaults = cloud_batch(%d) metadata(%d,%d,%s) provisioning(%d) reconcile(%s,%d,%s) stuck(%s) failed_cleanup(%s,%d)",
 			defaults.managedSharedDBCloudBatchSize,
@@ -1999,6 +2015,100 @@ func TestManagedSharedDBProvisioningDoesNotWaitForPoolWorkLock(t *testing.T) {
 	}
 	if continuationErr == nil {
 		t.Fatal("provisioning continuation unexpectedly connected to the invalid shared DB endpoint")
+	}
+}
+
+func TestManagedSharedDBProvisioningHeartbeatPreventsStuckFailure(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(pool.Close)
+	pool.SetMetaStore(metaStore)
+	passwordCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-provisioning-heartbeat", ProvisioningKey: bytes.Repeat([]byte{5}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+		PasswordCipher: passwordCipher, Name: "tidbcloud_fs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.UpdateManagedSharedDBPoolCloudResult(context.Background(), &meta.SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-provisioning-heartbeat", ClusterID: "cluster-provisioning-heartbeat",
+		Host: "127.0.0.1", Port: 1, User: "prefix.root", PasswordCipher: passwordCipher,
+		Name: "tidbcloud_fs", TLSMode: "true",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	staleAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
+	if _, err := metaStore.DB().ExecContext(context.Background(), `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, staleAt, dbID); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	provisioner := &blockingDatabaseEnsurer{
+		fakeProvisioner: fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
+		started:         started,
+		release:         release,
+	}
+	const stuckTimeout = 120 * time.Millisecond
+	srv := &Server{
+		meta: metaStore, pool: pool, provisioner: provisioner,
+		managedSharedDBStuckTimeout: stuckTimeout,
+	}
+	continuationDone := make(chan error, 1)
+	go func() {
+		continuationDone <- srv.continueManagedSharedDBPoolOnce(context.Background(), dbID)
+	}()
+	<-started
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		row, err := metaStore.GetSharedDB(context.Background(), dbID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.UpdatedAt.After(staleAt) {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(release)
+			<-continuationDone
+			t.Fatal("provisioning heartbeat did not refresh db_pool.updated_at")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	srv.reconcileStuckManagedSharedDBPoolsWithCtx(context.Background())
+	row, err := metaStore.GetSharedDB(context.Background(), dbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != meta.SharedDBStatusProvisioning {
+		t.Fatalf("actively provisioning pool status = %q, want provisioning", row.Status)
+	}
+
+	close(release)
+	if err := <-continuationDone; err == nil {
+		t.Fatal("provisioning continuation unexpectedly succeeded")
 	}
 }
 
