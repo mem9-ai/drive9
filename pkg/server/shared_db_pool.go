@@ -511,13 +511,8 @@ func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int
 	workers := s.managedSharedDBProvisioningConcurrency
 	if workers <= 0 {
 		if s.managedSharedDBProvisioningSlots != nil {
-			maxOpen := 0
-			if s.meta != nil && s.meta.DB() != nil {
-				maxOpen = s.meta.DB().Stats().MaxOpenConnections
-			}
 			logger.Error(ctx, "managed_shared_db_pool_provisioning_disabled",
-				zap.Int("configured_workers", s.managedSharedDBProvisioningWorkers),
-				zap.Int("meta_max_open_connections", maxOpen))
+				zap.Int("configured_workers", s.managedSharedDBProvisioningWorkers))
 			return
 		}
 		workers = s.managedSharedDBProvisioningWorkers
@@ -529,7 +524,7 @@ func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int
 		schemaInitRetryWindow, schemaInitInitialBackoff, managedSharedDBProvisioningMaxBackoff,
 		managedSharedDBProvisioningCooldown,
 		func(jobCtx context.Context, dbID int64) error {
-			err := s.continueManagedSharedDBPoolOnce(jobCtx, dbID)
+			err := s.continueManagedSharedDBProvisioningOnce(jobCtx, dbID)
 			if errors.Is(err, meta.ErrNotFound) {
 				return nil
 			}
@@ -541,6 +536,27 @@ func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int
 	for dbID, err := range failed {
 		logger.Warn(ctx, "managed_shared_db_pool_provisioning_failed", zap.Int64("db_pool_id", dbID), zap.Error(err))
 	}
+}
+
+// continueManagedSharedDBProvisioningOnce is the only operation run by the
+// high-concurrency schema worker pool. Pending metadata and Cloud create work
+// stay in their separately bounded workers and never fall back to a MetaDB
+// pool-work session lock here.
+func (s *Server) continueManagedSharedDBProvisioningOnce(ctx context.Context, dbID int64) error {
+	poolInfo, err := s.meta.GetSharedDB(ctx, dbID)
+	if err != nil {
+		return err
+	}
+	if poolInfo.Status != meta.SharedDBStatusProvisioning {
+		logger.Debug(ctx, "managed_shared_db_pool_provisioning_skipped_status",
+			zap.Int64("db_pool_id", dbID), zap.String("status", poolInfo.Status))
+		return nil
+	}
+	cred, err := s.sharedDBCloudCredentials()
+	if err != nil {
+		return err
+	}
+	return s.finishManagedSharedDBProvisioning(ctx, poolInfo, cred)
 }
 
 type managedSharedDBProvisioningJob struct {
@@ -1243,7 +1259,11 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 	dbID := poolInfo.ID
 	var err error
 	switch poolInfo.Status {
-	case meta.SharedDBStatusActive, meta.SharedDBStatusFailed, meta.SharedDBStatusDraining:
+	case meta.SharedDBStatusActive:
+		return nil
+	case meta.SharedDBStatusFailed, meta.SharedDBStatusDraining:
+		logger.Debug(ctx, "managed_shared_db_pool_provisioning_terminal_status",
+			zap.Int64("db_pool_id", dbID), zap.String("status", poolInfo.Status))
 		return nil
 	case meta.SharedDBStatusPending, meta.SharedDBStatusProvisioning:
 	default:
