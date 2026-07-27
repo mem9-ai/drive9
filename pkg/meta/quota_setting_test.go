@@ -105,7 +105,7 @@ func TestGetQuotaConfigUsesConfiguredDefaultStorageBytes(t *testing.T) {
 	}
 }
 
-func TestQuotaConfigStoresTiDBCloudSpendingLimitWithoutStorageVersion(t *testing.T) {
+func TestQuotaConfigSpendingLimitPatchMaterializesStorageDefaults(t *testing.T) {
 	originalFileSizeDefault := DefaultMaxFileSizeBytes()
 	defer SetDefaultMaxFileSizeBytes(originalFileSizeDefault)
 
@@ -142,14 +142,6 @@ func TestQuotaConfigStoresTiDBCloudSpendingLimitWithoutStorageVersion(t *testing
 	if cfg.MaxFileSizeBytes != originalFileSizeDefault {
 		t.Fatalf("materialized MaxFileSizeBytes = %d after default changed, want %d", cfg.MaxFileSizeBytes, originalFileSizeDefault)
 	}
-	version, err := s.GetQuotaConfigVersion(ctx, "tenant-spending-only")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if version == "" {
-		t.Fatalf("storage quota version should be non-empty when config row exists")
-	}
-
 	updated := int64(123)
 	if err := s.SetQuotaConfigPatch(ctx, "tenant-spending-only", QuotaConfigPatch{TiDBCloudSpendingLimit: &updated}); err != nil {
 		t.Fatal(err)
@@ -191,48 +183,6 @@ func TestGetQuotaConfigUsesDefaultFileSizeForExistingZeroRow(t *testing.T) {
 	}
 	if cfg.MaxFileSizeBytes != DefaultMaxFileSizeBytes() {
 		t.Fatalf("MaxFileSizeBytes = %d, want default %d", cfg.MaxFileSizeBytes, DefaultMaxFileSizeBytes())
-	}
-}
-
-func TestGetQuotaConfigVersion(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-
-	version, err := s.GetQuotaConfigVersion(ctx, "tenant-without-config")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if version != "" {
-		t.Fatalf("version for missing config = %q, want empty", version)
-	}
-
-	if err := s.SetQuotaConfig(ctx, &QuotaConfig{
-		TenantID:         "tenant-with-config",
-		MaxStorageBytes:  123,
-		MaxFileSizeBytes: 234,
-		MaxFileCount:     345,
-		MaxMediaLLMFiles: 456,
-		MaxVideoLLMFiles: 567,
-		MaxMonthlyCostMC: 789,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	version, err = s.GetQuotaConfigVersion(ctx, "tenant-with-config")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if version == "" {
-		t.Fatal("version for explicit config is empty")
-	}
-	if err := s.SetQuotaStorageBytes(ctx, "tenant-with-config", 321); err != nil {
-		t.Fatal(err)
-	}
-	nextVersion, err := s.GetQuotaConfigVersion(ctx, "tenant-with-config")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if nextVersion == version {
-		t.Fatalf("version after config value change = %q, want different from %q", nextVersion, version)
 	}
 }
 

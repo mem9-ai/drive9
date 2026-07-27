@@ -41,10 +41,6 @@ func (a *metaQuotaAdapter) GetQuotaConfig(ctx context.Context, tenantID string) 
 	}, nil
 }
 
-func (a *metaQuotaAdapter) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
-	return a.s.GetQuotaConfigVersion(ctx, tenantID)
-}
-
 func (a *metaQuotaAdapter) GetQuotaUsage(ctx context.Context, tenantID string) (*backend.QuotaUsageView, error) {
 	u, err := a.s.GetQuotaUsage(ctx, tenantID)
 	if err != nil {

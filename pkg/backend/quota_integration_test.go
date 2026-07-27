@@ -29,6 +29,19 @@ func newServerQuotaBackend(t *testing.T, opts Options) (*Dat9Backend, *fakeMetaQ
 	return b, fake
 }
 
+func reloadQuotaConfigForTest(t *testing.T, b *Dat9Backend, ctx context.Context) {
+	t.Helper()
+	if b.quotaConfigCache == nil {
+		t.Fatal("quota config cache is nil")
+	}
+	b.quotaConfigCache.mu.Lock()
+	b.quotaConfigCache.nextRefresh = time.Time{}
+	b.quotaConfigCache.mu.Unlock()
+	if cfg := b.quotaConfigCache.get(ctx); cfg == nil {
+		t.Fatal("reload quota config returned nil")
+	}
+}
+
 func waitForFakeCentralLLMUsage(t *testing.T, fake *fakeMetaQuotaStore, tenantID string, wantMonthly int64, wantUsageLen int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -117,7 +130,7 @@ func TestServerQuotaRejectsOverFileSizeLimit(t *testing.T) {
 	fake.mu.Lock()
 	fake.config["tenant-a"].MaxFileSizeBytes = 4
 	fake.mu.Unlock()
-	b.quotaConfigCache.refresh(ctx)
+	reloadQuotaConfigForTest(t, b, ctx)
 
 	if _, err := b.WriteCtx(ctx, "/too-large.txt", []byte("12345"), 0, filesystem.WriteFlagCreate); !errors.Is(err, ErrFileSizeQuotaExceeded) {
 		t.Fatalf("write error = %v, want ErrFileSizeQuotaExceeded", err)
@@ -141,7 +154,7 @@ func TestCreateIfAbsentExistingPathReturnsConflictBeforeFileSizeQuota(t *testing
 	fake.mu.Lock()
 	fake.config["tenant-a"].MaxFileSizeBytes = 4
 	fake.mu.Unlock()
-	b.quotaConfigCache.refresh(ctx)
+	reloadQuotaConfigForTest(t, b, ctx)
 
 	if _, _, err := b.WriteCtxIfRevisionWithTagsResult(ctx, "/size-exists.txt", []byte("12345"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, 0, nil, ""); !errors.Is(err, datastore.ErrRevisionConflict) {
 		t.Fatalf("duplicate create-if-absent error = %v, want ErrRevisionConflict", err)
@@ -161,7 +174,7 @@ func TestServerModeBudgetGateWritesCentralOnly(t *testing.T) {
 	fake.mu.Lock()
 	fake.config["tenant-a"].MaxMonthlyCostMC = 100
 	fake.mu.Unlock()
-	b.quotaConfigCache.refresh(context.Background())
+	reloadQuotaConfigForTest(t, b, context.Background())
 
 	b.recordImageExtractUsage("task-server-budget", ImageExtractUsage{
 		PromptTokens:     120,

@@ -228,10 +228,7 @@ func (b *Dat9Backend) checkStorageQuotaServerTx(ctx context.Context, tx *sql.Tx,
 // falling back to a synchronous DB query when the cache is unavailable.
 func (b *Dat9Backend) cachedQuotaConfig(ctx context.Context) *QuotaConfigView {
 	if b.quotaConfigCache != nil {
-		if cfg := b.quotaConfigCache.get(); cfg != nil {
-			return cfg
-		}
-		return b.quotaConfigCache.load(ctx)
+		return b.quotaConfigCache.get(ctx)
 	}
 	if b.metaStore == nil {
 		return nil

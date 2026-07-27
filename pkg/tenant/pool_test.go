@@ -182,6 +182,29 @@ func TestSharedDBHandleIdleReapUsesLongerTTLAndSkipsReferencedHandles(t *testing
 	}
 }
 
+func TestSharedDBHandleIdleReapRunsWhenTenantIdleEvictionDisabled(t *testing.T) {
+	p := NewPool(PoolConfig{IdleTimeout: 0}, nil)
+	t.Cleanup(p.Close)
+	db, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	p.sharedDBs[1] = db
+	p.sharedDBLastUsed[1] = time.Now().Add(-defaultSharedDBHandleIdleTTL - time.Second)
+
+	p.reapOnce(context.Background())
+
+	if _, ok := p.sharedDBs[1]; ok {
+		t.Fatal("expired unreferenced shared handle remains cached when tenant idle eviction is disabled")
+	}
+	if err := db.Ping(); err == nil {
+		t.Fatal("expired unreferenced shared handle remains open when tenant idle eviction is disabled")
+	}
+}
+
 func registerSharedDBForCacheMetrics(t *testing.T, orgID string) (*meta.Store, *Pool, int64, string) {
 	t.Helper()
 	metaStore, err := meta.OpenContext(context.Background(), testDSN)
@@ -1187,6 +1210,118 @@ func TestIdleEviction(t *testing.T) {
 	}
 }
 
+func TestIdleEvictionSkipsSharedTenantEntry(t *testing.T) {
+	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
+		MaxTenants:  2,
+		IdleTimeout: time.Minute,
+	}, "tenant-shared-idle")
+	ctx := context.Background()
+
+	b, release, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := b.Store()
+	release()
+
+	pool.mu.Lock()
+	e := pool.items[tenant.ID]
+	e.sharedDBID = 123
+	e.lastUsed = time.Now().Add(-2 * time.Minute)
+	pool.mu.Unlock()
+
+	pool.reapOnce(ctx)
+
+	assertStoreOpen(t, store)
+	if _, ok := pool.items[tenant.ID]; !ok {
+		t.Fatal("shared tenant entry was removed by idle reaper")
+	}
+}
+
+func TestCapacityEvictionStillRemovesSharedTenantEntry(t *testing.T) {
+	pool, first := newTestPoolAndTenant(t, 1, "tenant-shared-capacity-first")
+	ctx := context.Background()
+
+	b, release, err := pool.Acquire(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstStore := b.Store()
+	release()
+
+	pool.mu.Lock()
+	pool.items[first.ID].sharedDBID = 123
+	pool.mu.Unlock()
+
+	second := cloneTenantForID(t, pool, first, "tenant-shared-capacity-second")
+	_, releaseSecond, err := pool.Acquire(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseSecond()
+
+	assertStoreClosed(t, firstStore)
+	if _, ok := pool.items[first.ID]; ok {
+		t.Fatal("shared tenant entry remained after capacity eviction")
+	}
+}
+
+func TestAcquireCachedDoesNotRefreshSharedCapacityLRU(t *testing.T) {
+	pool, busy := newTestPoolAndTenant(t, 2, "tenant-shared-lru-busy")
+	ctx := context.Background()
+
+	busyBackend, releaseBusy, err := pool.Acquire(ctx, busy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busyStore := busyBackend.Store()
+	releaseBusy()
+
+	idle := cloneTenantForID(t, pool, busy, "tenant-shared-lru-idle")
+	idleBackend, releaseIdle, err := pool.Acquire(ctx, idle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idleStore := idleBackend.Store()
+	releaseIdle()
+
+	pool.mu.Lock()
+	pool.items[busy.ID].sharedDBID = 123
+	pool.items[idle.ID].sharedDBID = 123
+	pool.mu.Unlock()
+
+	// Foreground traffic makes busy the most recently used entry.
+	_, releaseBusy, err = pool.Acquire(ctx, busy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseBusy()
+
+	// The safety-net scan may pin idle, but must not rewrite capacity LRU order.
+	_, releaseCached, ok := pool.AcquireCached(idle)
+	if !ok {
+		t.Fatal("expected AcquireCached to hit idle shared tenant")
+	}
+	releaseCached()
+
+	third := cloneTenantForID(t, pool, busy, "tenant-shared-lru-third")
+	_, releaseThird, err := pool.Acquire(ctx, third)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseThird()
+
+	pool.mu.Lock()
+	_, busyCached := pool.items[busy.ID]
+	_, idleCached := pool.items[idle.ID]
+	pool.mu.Unlock()
+	if !busyCached || idleCached {
+		t.Errorf("capacity LRU after safety-net scan: busy cached=%t idle cached=%t, want true false", busyCached, idleCached)
+	}
+	assertStoreOpen(t, busyStore)
+	assertStoreClosed(t, idleStore)
+}
+
 func TestCloseEntryPreservesLiveTenantCounters(t *testing.T) {
 	const tenantID = "tenant-live-counter-close-entry"
 	metrics.DeleteTenantCounters(tenantID)
@@ -1341,14 +1476,15 @@ func TestIdleEvictionDisabled(t *testing.T) {
 	}
 }
 
-func TestIdleEvictionStartNoOpWhenDisabled(t *testing.T) {
+func TestIdleEvictionStartKeepsSharedHandleReaperWhenDisabled(t *testing.T) {
 	pool := NewPool(PoolConfig{
 		MaxTenants:  2,
 		IdleTimeout: 0,
 	}, nil)
 	pool.Start(context.Background())
-	if pool.reapStop != nil {
-		t.Fatal("expected reapStop to be nil when IdleTimeout=0")
+	t.Cleanup(pool.Close)
+	if pool.reapStop == nil {
+		t.Fatal("expected shared handle reaper to run when IdleTimeout=0")
 	}
 }
 
