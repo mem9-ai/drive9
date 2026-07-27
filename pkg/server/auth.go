@@ -370,7 +370,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 		}
 
 		acquireStart := time.Now()
-		b, release, err := pool.AcquireForeground(r.Context(), &resolved.Tenant)
+		b, release, err := pool.Acquire(r.Context(), &resolved.Tenant)
 		acquireDurationMs := authPhaseMs(acquireStart)
 		// Request-path acquire: this is the expected hot-path user-DB access,
 		// driven by real traffic. Record so scan-detection alerts can compare
@@ -516,7 +516,7 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 		}
 
 		capAcquireStart := time.Now()
-		b, release, err := pool.AcquireForeground(r.Context(), tenant)
+		b, release, err := pool.Acquire(r.Context(), tenant)
 		// Capability-token request-path acquire: same baseline signal as the
 		// API-key path above, but for the /v1/vault/read surface.
 		authAcquireOrgID := ""

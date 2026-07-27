@@ -128,9 +128,11 @@ func newLeaderLifecycleServerWithLeader(t *testing.T, leaderMgr *leader.Manager)
 	t.Cleanup(func() { srv.Close() })
 
 	// Acquire a backend so a FileGC worker can be started on it by onLead.
-	if _, err := pool.Get(context.Background(), tenantMeta); err != nil {
+	_, release, err := pool.Acquire(context.Background(), tenantMeta)
+	if err != nil {
 		t.Fatal(err)
 	}
+	release()
 	return srv, pool, tenantID
 }
 
@@ -257,11 +259,7 @@ func newTestTenantPoolWithLeaderChecker(t *testing.T, opts backend.Options, chec
 // with -race to catch a data race on s.replayWorker / s.expirySweepWorker).
 func TestLeaderGatedWorkersCloseRacesOnLead(t *testing.T) {
 	for i := range 25 {
-		srv, pool, tenantID := newLeaderLifecycleServerWithRealLeader(t, 20*time.Millisecond)
-		b := pool.S3Backend(tenantID)
-		if b == nil {
-			t.Fatalf("iter %d: cached backend missing", i)
-		}
+		srv, _, _ := newLeaderLifecycleServerWithRealLeader(t, 20*time.Millisecond)
 
 		// Give the heartbeat a chance to gain leadership (onLead starts workers),
 		// then close while the loop is still running — racing onLead with Close.
@@ -289,11 +287,7 @@ func TestLeaderGatedWorkersCloseRacesOnLead(t *testing.T) {
 // racing pair settles, a final onLose guarantees the stopped state.
 func TestLeaderGatedWorkersOnLoseRacesOnLead(t *testing.T) {
 	for i := range 50 {
-		srv, pool, tenantID := newLeaderLifecycleServer(t)
-		b := pool.S3Backend(tenantID)
-		if b == nil {
-			t.Fatalf("iter %d: cached backend missing", i)
-		}
+		srv, _, _ := newLeaderLifecycleServer(t)
 
 		var wg sync.WaitGroup
 		wg.Add(2)

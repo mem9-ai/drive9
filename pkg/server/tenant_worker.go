@@ -718,7 +718,7 @@ func (m *tenantWorkerManager) targetForRef(ctx context.Context, ref semanticTena
 		return nil, fmt.Errorf("tenant metadata missing for %s", ref.id)
 	}
 	acquireStart := time.Now()
-	b, release, err := m.pool.AcquireForWork(ctx, ref.tenant)
+	b, release, err := m.pool.Acquire(ctx, ref.tenant)
 	if err != nil {
 		// Kick-driven acquire failure: a kick arrived but the tenant TiDB could
 		// not be opened. Record so the major alert can detect sustained worker
