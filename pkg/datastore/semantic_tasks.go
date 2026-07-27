@@ -259,7 +259,9 @@ func (s *Store) claimSemanticTask(ctx context.Context, now time.Time, leaseDurat
 
 	query, args := s.claimSemanticTaskQuery(now, normalizedTypes)
 	row := tx.QueryRowContext(ctx, query, args...)
-	task, scanErr := scanSemanticTask(row)
+	// The claim query projects fs_id first in shared shape (workaround for
+	// the TiDB SKIP LOCKED planner bug; see Scope.SelCols); withFsID skips it.
+	task, scanErr := scanSemanticTask(row, s.scope.Shared())
 	if scanErr != nil {
 		if errors.Is(scanErr, semantic.ErrTaskNotFound) {
 			return nil, false, nil
@@ -319,9 +321,12 @@ func normalizeClaimTaskTypes(taskTypes []semantic.TaskType) ([]semantic.TaskType
 }
 
 func (s *Store) claimSemanticTaskQuery(now time.Time, taskTypes []semantic.TaskType) (string, []any) {
-	query := `SELECT task_id, task_type, resource_id, resource_version, status,
+	// SelCols adds the fs_id projection in shared shape to work around the
+	// TiDB FOR UPDATE SKIP LOCKED planner bug that rejects WHERE predicates
+	// over unprojected columns (see Scope.SelCols).
+	query := `SELECT ` + s.scope.SelCols(`task_id, task_type, resource_id, resource_version, status,
 		attempt_count, max_attempts, receipt, leased_at, lease_until, available_at,
-		payload_json, last_error, created_at, updated_at, completed_at
+		payload_json, last_error, created_at, updated_at, completed_at`) + `
 		FROM semantic_tasks
 		WHERE ` + s.scope.And(`status = ?`)
 	args := s.scope.Args(semantic.TaskQueued)
@@ -508,7 +513,7 @@ func (s *Store) RecoverExpiredSemanticTasks(ctx context.Context, now time.Time, 
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	query := `SELECT task_id FROM semantic_tasks
+	query := `SELECT ` + s.scope.SelCols(`task_id`) + ` FROM semantic_tasks
 		WHERE ` + s.scope.And(`status = ? AND lease_until IS NOT NULL AND lease_until < ?`) + `
 		ORDER BY lease_until, created_at, task_id`
 	args := s.scope.Args(semantic.TaskProcessing, now)
@@ -525,8 +530,15 @@ func (s *Store) RecoverExpiredSemanticTasks(ctx context.Context, now time.Time, 
 
 	var taskIDs []string
 	for rows.Next() {
+		// Shared shape projects fs_id first (workaround for the TiDB SKIP
+		// LOCKED planner bug; see Scope.SelCols); scan and discard it.
+		var fsID int64
 		var taskID string
-		if err := rows.Scan(&taskID); err != nil {
+		if s.scope.Shared() {
+			if err := rows.Scan(&fsID, &taskID); err != nil {
+				return 0, err
+			}
+		} else if err := rows.Scan(&taskID); err != nil {
 			return 0, err
 		}
 		taskIDs = append(taskIDs, taskID)
@@ -596,15 +608,24 @@ func semanticTaskLeaseNow() time.Time {
 	return now
 }
 
-func scanSemanticTask(s scanner) (*semantic.Task, error) {
+func scanSemanticTask(s scanner, withFsID ...bool) (*semantic.Task, error) {
 	var task semantic.Task
 	var receipt, lastError sql.NullString
 	var leasedAt, leaseUntil, completedAt sql.NullTime
 	var payload []byte
-	err := s.Scan(&task.TaskID, &task.TaskType, &task.ResourceID, &task.ResourceVersion,
+	// withFsID[0] is set by the SKIP LOCKED claim paths: in shared shape those
+	// queries project fs_id first (workaround for the TiDB SKIP LOCKED
+	// planner bug; see Scope.SelCols), so scan and discard the leading column.
+	dest := make([]any, 0, 17)
+	if len(withFsID) > 0 && withFsID[0] {
+		var fsID int64
+		dest = append(dest, &fsID)
+	}
+	dest = append(dest, &task.TaskID, &task.TaskType, &task.ResourceID, &task.ResourceVersion,
 		&task.Status, &task.AttemptCount, &task.MaxAttempts, &receipt, &leasedAt,
 		&leaseUntil, &task.AvailableAt, &payload, &lastError, &task.CreatedAt,
 		&task.UpdatedAt, &completedAt)
+	err := s.Scan(dest...)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, semantic.ErrTaskNotFound
