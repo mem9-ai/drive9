@@ -87,18 +87,46 @@ type fakeProvisioner struct {
 
 type blockingDatabaseEnsurer struct {
 	fakeProvisioner
-	started chan struct{}
-	release <-chan struct{}
+	started     chan struct{}
+	startedOnce sync.Once
+	release     <-chan struct{}
 }
 
 func (f *blockingDatabaseEnsurer) EnsureDatabase(ctx context.Context, _ string) error {
-	close(f.started)
+	f.startedOnce.Do(func() { close(f.started) })
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-f.release:
 		return errors.New("stop after provisioning heartbeat test")
 	}
+}
+
+func TestBlockingDatabaseEnsurerSignalsStartedOnceAcrossRetries(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	close(release)
+	ensurer := &blockingDatabaseEnsurer{started: started, release: release}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := ensurer.EnsureDatabase(context.Background(), ""); err == nil {
+			t.Fatalf("EnsureDatabase attempt %d unexpectedly succeeded", attempt+1)
+		}
+	}
+	select {
+	case <-started:
+	default:
+		t.Fatal("EnsureDatabase did not signal started")
+	}
+}
+
+type countingEncryptor struct {
+	encrypt.Encryptor
+	decryptCalls atomic.Int32
+}
+
+func (e *countingEncryptor) Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error) {
+	e.decryptCalls.Add(1)
+	return e.Encryptor.Decrypt(ctx, ciphertext)
 }
 
 type failingEncryptor struct {
@@ -241,6 +269,21 @@ func TestManagedSharedDBProvisioningSlotsIgnoreMetaConnectionBudget(t *testing.T
 	}
 	if got := cap(srv.managedSharedDBProvisioningSlots); got != 100 {
 		t.Fatalf("provisioning slot capacity = %d, want 100", got)
+	}
+}
+
+func TestManagedSharedDBProvisioningQueueErrorSkipsExpectedContention(t *testing.T) {
+	for _, err := range []error{
+		meta.ErrNotFound,
+		fmt.Errorf("target lock: %w", tenant.ErrSharedDBSchemaEnsureBusy),
+	} {
+		if got := managedSharedDBProvisioningQueueError(err); got != nil {
+			t.Fatalf("managedSharedDBProvisioningQueueError(%v) = %v, want nil", err, got)
+		}
+	}
+	wantErr := errors.New("schema apply failed")
+	if got := managedSharedDBProvisioningQueueError(wantErr); !errors.Is(got, wantErr) {
+		t.Fatalf("managedSharedDBProvisioningQueueError(%v) = %v, want original error", wantErr, got)
 	}
 }
 
@@ -2008,6 +2051,50 @@ func TestManagedSharedDBProvisioningDoesNotWaitForPoolWorkLock(t *testing.T) {
 	}
 	if !errors.Is(continuationErr, wantErr) {
 		t.Fatalf("provisioning continuation error = %v, want EnsureDatabase sentinel without waiting for pool-work lock", continuationErr)
+	}
+}
+
+func TestManagedSharedDBLockedContinuationDecryptsRootPasswordOnce(t *testing.T) {
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	localEncryptor, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passwordCipher, err := localEncryptor.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	countedEncryptor := &countingEncryptor{Encryptor: localEncryptor}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, countedEncryptor)
+	t.Cleanup(pool.Close)
+
+	wantErr := errors.New("stop after EnsureDatabase")
+	provisioner := &profileAwareFakeProvisioner{
+		fakeProvisioner: fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
+		ensureDBErr:     wantErr,
+	}
+	srv := &Server{pool: pool, provisioner: provisioner}
+	err = srv.continueManagedSharedDBPoolLocked(context.Background(), &meta.SharedDB{
+		ID:                      1,
+		UUID:                    "uuid",
+		TiDBCloudOrganizationID: "org",
+		ClusterID:               "cluster",
+		Host:                    "127.0.0.1",
+		Port:                    4000,
+		User:                    "prefix.root",
+		PasswordCipher:          passwordCipher,
+		Name:                    "tidbcloud_fs",
+		TLSMode:                 "true",
+		Status:                  meta.SharedDBStatusProvisioning,
+	}, tenant.CredentialProvisionRequest{})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("locked continuation error = %v, want %v", err, wantErr)
+	}
+	if got := countedEncryptor.decryptCalls.Load(); got != 1 {
+		t.Fatalf("root password decrypt calls = %d, want 1", got)
 	}
 }
 

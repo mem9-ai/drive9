@@ -190,7 +190,7 @@ var (
 	ensureTiDBSchemaForAutoEmbeddingProfile = schema.EnsureTiDBSchemaForAutoEmbeddingProfile
 	ensureTiDBSchemaForFTSOnlyProfile       = schema.EnsureTiDBSchemaForFTSOnlyProfile
 	ensureSharedDBSchema                    = schema.EnsureSharedSchema
-	errSharedDBSchemaEnsureBusy             = errors.New("shared schema ensure already running")
+	ErrSharedDBSchemaEnsureBusy             = errors.New("shared schema ensure already running")
 	defaultTenantPoolDrainTimeout           = 30 * time.Second
 	defaultTenantPoolMaxTenants             = 1024
 	defaultTenantPoolIdleReapInterval       = 2 * time.Minute
@@ -251,7 +251,7 @@ func withSharedDBSchemaAdvisoryLock(
 			break
 		}
 		if !waitForLock {
-			return fmt.Errorf("%w for db pool %d", errSharedDBSchemaEnsureBusy, dbID)
+			return fmt.Errorf("%w for db pool %d", ErrSharedDBSchemaEnsureBusy, dbID)
 		}
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("wait for shared schema advisory lock for db pool %d: %w", dbID, err)
