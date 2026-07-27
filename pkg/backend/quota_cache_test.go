@@ -24,6 +24,21 @@ func newCacheTestStore() *cacheTestStore {
 	return &cacheTestStore{fakeMetaQuotaStore: newFakeMetaQuotaStore()}
 }
 
+func waitForQuotaConfigLoad(t *testing.T, c *quotaConfigCache) {
+	t.Helper()
+	c.mu.RLock()
+	done := c.loadDone
+	c.mu.RUnlock()
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("quota config load did not finish")
+	}
+}
+
 func (m *cacheTestStore) GetQuotaUsage(ctx context.Context, tenantID string) (*QuotaUsageView, error) {
 	m.usageCalls.Add(1)
 	if m.usageHook != nil {
@@ -315,6 +330,10 @@ func TestQuotaConfigCacheReusesSnapshotUntilTTLExpires(t *testing.T) {
 	c.mu.Lock()
 	c.nextRefresh = time.Time{}
 	c.mu.Unlock()
+	if cfg := c.get(context.Background()); cfg == nil || cfg.MaxStorageBytes != 1000 {
+		t.Errorf("expired config = %+v, want stale storage 1000", cfg)
+	}
+	waitForQuotaConfigLoad(t, c)
 	if cfg := c.get(context.Background()); cfg == nil || cfg.MaxStorageBytes != 2000 {
 		t.Errorf("refreshed config = %+v, want storage 2000", cfg)
 	}
@@ -376,6 +395,7 @@ func TestQuotaConfigCacheRefreshFailureReturnsStaleAndUsesRetryCooldown(t *testi
 	if stale == nil || stale.MaxStorageBytes != 1000 {
 		t.Errorf("stale config = %+v, want storage 1000", stale)
 	}
+	waitForQuotaConfigLoad(t, c)
 	if got := store.configCalls.Load(); got != 2 {
 		t.Errorf("configCalls after failed refresh = %d, want 2", got)
 	}
