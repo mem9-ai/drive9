@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -144,7 +145,7 @@ func (s *Store) CreateManagedSharedDBPoolTenantWaveWithResize(ctx context.Contex
 		staged := make([]stagedManagedSharedDBPoolWavePlan, 0, len(prepared))
 		txErr := s.InTx(ctx, func(tx *sql.Tx) error {
 			memberOffset := 0
-			candidates, candidateErr := lockManagedSharedDBPoolWaveCandidates(ctx, tx, waveOrganizationID, len(waveMembers))
+			candidates, candidateErr := lockManagedSharedDBPoolWaveCandidates(ctx, tx, waveOrganizationID)
 			if candidateErr != nil {
 				return candidateErr
 			}
@@ -222,13 +223,20 @@ func (s *Store) CreateManagedSharedDBPoolTenantWaveWithResize(ctx context.Contex
 	return out, nil
 }
 
-func lockManagedSharedDBPoolWaveCandidates(ctx context.Context, tx *sql.Tx, organizationID string, limit int) ([]managedSharedDBPoolWaveCandidate, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT db_id, status, max_tenants, tenant_count
+const lockManagedSharedDBPoolWaveCandidatesSQL = `SELECT db_id, status, max_tenants, tenant_count
 		FROM db_pool
 		WHERE org_id = ? AND role = ? AND status IN (?, ?, ?)
 			AND max_tenants > 0 AND soft_cap_reached = 0 AND tenant_count < max_tenants
-		ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'provisioning' THEN 1 ELSE 2 END, db_id
-		LIMIT ? FOR UPDATE`, organizationID, SharedDBRoleShared, SharedDBStatusActive, SharedDBStatusProvisioning, SharedDBStatusPending, limit)
+		ORDER BY db_id
+		FOR UPDATE`
+
+func lockManagedSharedDBPoolWaveCandidates(ctx context.Context, tx *sql.Tx, organizationID string) ([]managedSharedDBPoolWaveCandidate, error) {
+	// Acquire every reusable row for the organization in immutable primary-key
+	// order. Status can advance concurrently, so using it in the locking order
+	// can invert acquisition between overlapping refill waves. The result is
+	// sorted by readiness only after the complete stable lock set is held.
+	rows, err := tx.QueryContext(ctx, lockManagedSharedDBPoolWaveCandidatesSQL, organizationID, SharedDBRoleShared,
+		SharedDBStatusActive, SharedDBStatusProvisioning, SharedDBStatusPending)
 	if err != nil {
 		return nil, fmt.Errorf("lock reusable managed shared DB pools: %w", err)
 	}
@@ -244,7 +252,30 @@ func lockManagedSharedDBPoolWaveCandidates(ctx context.Context, tx *sql.Tx, orga
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	sortManagedSharedDBPoolWaveCandidates(out)
 	return out, nil
+}
+
+func sortManagedSharedDBPoolWaveCandidates(candidates []managedSharedDBPoolWaveCandidate) {
+	statusRank := func(status string) int {
+		switch status {
+		case SharedDBStatusActive:
+			return 0
+		case SharedDBStatusProvisioning:
+			return 1
+		case SharedDBStatusPending:
+			return 2
+		default:
+			return 3
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left, right := statusRank(candidates[i].status), statusRank(candidates[j].status)
+		if left != right {
+			return left < right
+		}
+		return candidates[i].dbID < candidates[j].dbID
+	})
 }
 
 func tenantStatusForSharedDBPoolWave(status string) (TenantStatus, error) {
@@ -470,8 +501,8 @@ func finalizeManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, sta
 		return fmt.Errorf("insert wave memberships: %w", err)
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE db_pool
-		SET tenant_count = tenant_count + ?,
-			soft_cap_reached = CASE WHEN tenant_count + ? >= max_tenants THEN 1 ELSE 0 END
+		SET soft_cap_reached = CASE WHEN tenant_count + ? >= max_tenants THEN 1 ELSE 0 END,
+			tenant_count = tenant_count + ?
 		WHERE db_id = ? AND status = ? AND max_tenants > 0 AND soft_cap_reached = 0
 			AND tenant_count + ? <= max_tenants`,
 		len(staged.tenantIDs), len(staged.tenantIDs), staged.dbID, staged.dbStatus, len(staged.tenantIDs))
