@@ -487,8 +487,10 @@ func TestSharedDBSchemaEnsureUsesCrossPoolAdvisoryLock(t *testing.T) {
 	releaseFirstEnsure := make(chan struct{})
 	var releaseFirstEnsureOnce sync.Once
 	releaseFirst := func() { releaseFirstEnsureOnce.Do(func() { close(releaseFirstEnsure) }) }
-	t.Cleanup(releaseFirst)
 	previousEnsure := ensureSharedDBSchema
+	// Register the global-hook restore first so the later release-and-drain
+	// cleanup runs before it on every failure path.
+	t.Cleanup(func() { ensureSharedDBSchema = previousEnsure })
 	ensureSharedDBSchema = func(ctx context.Context, db *sql.DB) error {
 		if ensureCalls.Add(1) == 1 {
 			close(firstEnsureStarted)
@@ -496,10 +498,21 @@ func TestSharedDBSchemaEnsureUsesCrossPoolAdvisoryLock(t *testing.T) {
 		}
 		return db.PingContext(ctx)
 	}
-	t.Cleanup(func() { ensureSharedDBSchema = previousEnsure })
 
 	firstDone := make(chan error, 1)
-	go func() { firstDone <- firstPool.EnsureSharedDBReady(context.Background(), dbID) }()
+	firstExited := make(chan struct{})
+	t.Cleanup(func() {
+		releaseFirst()
+		select {
+		case <-firstExited:
+		case <-time.After(time.Second):
+			t.Error("first shared schema ensure did not exit during cleanup")
+		}
+	})
+	go func() {
+		defer close(firstExited)
+		firstDone <- firstPool.EnsureSharedDBReady(context.Background(), dbID)
+	}()
 	<-firstEnsureStarted
 	secondDone := make(chan error, 1)
 	go func() { secondDone <- secondPool.EnsureSharedDBReady(context.Background(), dbID) }()
@@ -511,7 +524,7 @@ func TestSharedDBSchemaEnsureUsesCrossPoolAdvisoryLock(t *testing.T) {
 		<-firstDone
 		t.Fatal("second shared schema ensure waited instead of returning a non-blocking lock conflict")
 	}
-	if !errors.Is(secondErr, errSharedDBSchemaEnsureBusy) {
+	if !errors.Is(secondErr, ErrSharedDBSchemaEnsureBusy) {
 		t.Fatalf("second shared schema ensure error = %v, want non-blocking advisory lock conflict", secondErr)
 	}
 	if got := ensureCalls.Load(); got != 1 {

@@ -524,11 +524,7 @@ func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int
 		schemaInitRetryWindow, schemaInitInitialBackoff, managedSharedDBProvisioningMaxBackoff,
 		managedSharedDBProvisioningCooldown,
 		func(jobCtx context.Context, dbID int64) error {
-			err := s.continueManagedSharedDBProvisioningOnce(jobCtx, dbID)
-			if errors.Is(err, meta.ErrNotFound) {
-				return nil
-			}
-			return err
+			return managedSharedDBProvisioningQueueError(s.continueManagedSharedDBProvisioningOnce(jobCtx, dbID))
 		}, func(dbID int64, attempt int, retryIn time.Duration, err error) {
 			logger.Warn(ctx, "managed_shared_db_pool_provisioning_retry", zap.Int64("db_pool_id", dbID),
 				zap.Int("attempt", attempt), zap.Duration("retry_in", retryIn), zap.Error(err))
@@ -536,6 +532,13 @@ func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int
 	for dbID, err := range failed {
 		logger.Warn(ctx, "managed_shared_db_pool_provisioning_failed", zap.Int64("db_pool_id", dbID), zap.Error(err))
 	}
+}
+
+func managedSharedDBProvisioningQueueError(err error) error {
+	if errors.Is(err, meta.ErrNotFound) || errors.Is(err, tenant.ErrSharedDBSchemaEnsureBusy) {
+		return nil
+	}
+	return err
 }
 
 // continueManagedSharedDBProvisioningOnce is the only operation run by the
@@ -1291,10 +1294,6 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 			return err
 		}
 	}
-	plainRootPassword, err := s.pool.Decrypt(ctx, poolInfo.PasswordCipher)
-	if err != nil {
-		return fmt.Errorf("decrypt shared db root password: %w", err)
-	}
 	needsMetadata := poolInfo.ClusterID == "" || poolInfo.Host == "" || poolInfo.Port <= 0 || poolInfo.User == ""
 	if poolInfo.Status == meta.SharedDBStatusProvisioning && needsMetadata {
 		return fmt.Errorf("provisioning db pool %d has incomplete connection metadata", dbID)
@@ -1316,6 +1315,10 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 		if result == nil {
 			if poolInfo.ClusterID != "" {
 				return fmt.Errorf("managed shared cluster %q was not found", poolInfo.ClusterID)
+			}
+			plainRootPassword, decryptErr := s.pool.Decrypt(ctx, poolInfo.PasswordCipher)
+			if decryptErr != nil {
+				return fmt.Errorf("decrypt shared db root password: %w", decryptErr)
 			}
 			results, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, []tenant.SharedDBPoolCreateRequest{{
 				DBPoolID: dbID, DBPoolUUID: poolInfo.UUID,
