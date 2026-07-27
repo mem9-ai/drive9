@@ -20173,6 +20173,208 @@ func TestRmdirAfterOpenUnlinkDirtyFlush(t *testing.T) {
 	}
 }
 
+// TestConcurrentFlushDoesNotResurrectUnlinkedPath is B4: an in-flight
+// synchronous Flush that already passed pre-upload Unlinked checks must not
+// leave a resurrected name after concurrent Unlink returns. Unlink waits on
+// the same per-path remoteCommitLock held across the PUT.
+func TestConcurrentFlushDoesNotResurrectUnlinkedPath(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		files          = map[string][]byte{}
+		dirs           = map[string]struct{}{"/": {}, "/dir": {}}
+		putStarted     = make(chan struct{})
+		putRelease     = make(chan struct{})
+		putStartedOnce sync.Once
+		putCalls       atomic.Int32
+		delDir         atomic.Int32
+	)
+	listDir := func(dir string) []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		var entries []map[string]any
+		for p, data := range files {
+			parent := path.Dir(p)
+			if parent == "." {
+				parent = "/"
+			}
+			if parent == dir {
+				entries = append(entries, map[string]any{"name": path.Base(p), "isDir": false, "size": len(data)})
+			}
+		}
+		return entries
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		if p == "" {
+			p = "/"
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": listDir(p)})
+		case r.Method == http.MethodPost && r.URL.Query().Has("mkdir"):
+			mu.Lock()
+			dirs[p] = struct{}{}
+			delete(files, p)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut || r.Method == http.MethodPost:
+			// Block after the body is fully received so Flush is in-flight.
+			body, _ := io.ReadAll(r.Body)
+			putStartedOnce.Do(func() { close(putStarted) })
+			<-putRelease
+			mu.Lock()
+			files[p] = append([]byte(nil), body...)
+			delete(dirs, p)
+			mu.Unlock()
+			putCalls.Add(1)
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			if _, isDir := dirs[p]; isDir {
+				for child := range files {
+					if path.Dir(child) == p {
+						mu.Unlock()
+						http.Error(w, "directory not empty", http.StatusConflict)
+						return
+					}
+				}
+				delete(dirs, p)
+				delDir.Add(1)
+			} else {
+				delete(files, p)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if _, ok := dirs[p]; ok {
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-IsDir", "true")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var mkdirOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     0o755,
+	}, "dir", &mkdirOut); st != gofuse.OK {
+		t.Fatalf("Mkdir: %v", st)
+	}
+	dirIno := mkdirOut.NodeId
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	// Force close-sync on this handle even if profile defaults differ.
+	if fh, ok := fs.fileHandles.Get(createOut.Fh); ok {
+		fh.WritePolicy = WritePolicyCloseSync
+	}
+	data := []byte("new")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(data)),
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		flushDone <- fs.Flush(nil, &gofuse.FlushIn{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+			Fh:       createOut.Fh,
+		})
+	}()
+
+	select {
+	case <-putStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for in-flight Flush PUT to start")
+	}
+
+	// Unlink must wait for the in-flight PUT (remoteCommitLock), then DELETE.
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: dirIno}, "file.txt")
+	}()
+
+	// Give Unlink a moment to reach remoteCommitLock wait if the race window
+	// is open; then release the PUT so Flush can finish and Unlink proceed.
+	time.Sleep(50 * time.Millisecond)
+	close(putRelease)
+
+	var unlinkSt, flushSt gofuse.Status
+	select {
+	case unlinkSt = <-unlinkDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for Unlink")
+	}
+	select {
+	case flushSt = <-flushDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for Flush")
+	}
+	if unlinkSt != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", unlinkSt)
+	}
+	if flushSt != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", flushSt)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	mu.Lock()
+	_, exists := files["/dir/file.txt"]
+	mu.Unlock()
+	if exists {
+		t.Fatal("in-flight flush resurrected path after Unlink returned")
+	}
+	if got := putCalls.Load(); got != 1 {
+		// Exactly one PUT from the in-flight Flush; Unlink must not allow a second create.
+		t.Fatalf("remote PUT calls = %d, want 1", got)
+	}
+
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	if st != gofuse.OK {
+		t.Fatalf("Rmdir after concurrent flush+unlink = %v, want OK", st)
+	}
+	if got := delDir.Load(); got != 1 {
+		t.Fatalf("remote dir DELETE calls = %d, want 1", got)
+	}
+}
+
 // TestRmdirAfterOpenUnlinkDirtyFsync is the Fsync counterpart of
 // TestRmdirAfterOpenUnlinkDirtyFlush: write → unlink while open → fsync(fd)
 // must not re-stage/enqueue/upload the deleted path.

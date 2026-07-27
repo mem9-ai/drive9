@@ -7963,6 +7963,40 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 	}
 
+	// Serialize with synchronous Flush/Fsync handle uploads that hold the
+	// per-path remoteCommitLock across the network write while releasing
+	// fh.mu. Without this lock, Unlink can DELETE and return while an
+	// in-flight PUT still recreates the name (B4 / ENOTEMPTY class).
+	//
+	// Invariant: once Unlink returns OK, every remote commit producer for
+	// this path that started before or concurrently — including sync
+	// handle uploads — has finished, and Unlink's DELETE lands after them.
+	unlockRemoteCommit := fs.lockRemoteCommitPath(childP)
+	defer unlockRemoteCommit()
+
+	// A concurrent Flush may have finished under this lock and cleared
+	// pending-new staging while uploading the path. Recompute before DELETE.
+	if fs.writeBack != nil {
+		if meta, ok := fs.writeBack.GetMeta(childP); ok && meta.Kind == PendingNew {
+			pendingNew = true
+		} else if pendingNew {
+			// writeBack gone after a successful sync flush → must DELETE.
+			pendingNew = false
+		}
+		fs.writeBack.Remove(childP)
+	}
+	if fs.pendingIndex != nil {
+		if meta, ok := fs.pendingIndex.GetMeta(childP); ok {
+			pendingNew = meta.Kind == PendingNew
+		} else if pendingNew {
+			pendingNew = false
+		}
+		fs.pendingIndex.Remove(childP)
+	}
+	if fs.shadowStore != nil {
+		fs.shadowStore.Remove(childP)
+	}
+
 	if !pendingNew {
 		ctx, cf := fuseCtx(cancel)
 		defer cf()
@@ -11002,6 +11036,10 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 			log.Printf("sync handle shadowspill upload failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
+		if fh.Unlinked {
+			fs.discardUnlinkedHandleStateLocked(fh)
+			return gofuse.OK
+		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			log.Printf("sync handle shadowspill pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
@@ -12557,6 +12595,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			log.Printf("finish streaming failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
+		if fh.Unlinked {
+			phase = "unlinked-after-streaming"
+			fs.discardUnlinkedHandleStateLocked(fh)
+			return gofuse.OK
+		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			log.Printf("finish streaming pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
@@ -12625,6 +12668,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		if err != nil {
 			log.Printf("upload all parts failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
+		}
+		if fh.Unlinked {
+			phase = "unlinked-after-upload-all"
+			fs.discardUnlinkedHandleStateLocked(fh)
+			return gofuse.OK
 		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			log.Printf("upload all pending chmod failed for %s: %v", fh.Path, err)
@@ -12867,6 +12915,14 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	if err != nil {
 		log.Printf("flush upload failed for %s: %v", handlePath, err)
 		return httpToFuseStatus(err)
+	}
+	// If Unlink completed after we released remoteCommitLock (it serializes
+	// DELETE after our PUT via the same lock), the path is already deleted.
+	// Discard local staging and do not re-publish handle committed state.
+	if fh.Unlinked {
+		phase = "unlinked-after-upload"
+		fs.discardUnlinkedHandleStateLocked(fh)
+		return gofuse.OK
 	}
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 		log.Printf("flush pending chmod failed for %s: %v", handlePath, err)
