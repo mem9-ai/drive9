@@ -5,11 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-metric_series_count() {
-  local text="$1" metric="$2"
-  printf '%s\n' "$text" | awk -v metric="$metric" '$0 ~ "^" metric "(\\{| )" { count++ } END { print count + 0 }'
-}
-
 metrics_has_tenant_labeled_control_success() {
   local text="$1"
   printf '%s\n' "$text" | grep -Eq '^drive9_tenant_requests_total\{[^}]*status_class="2xx"[^}]*surface="(provision|status|quota|tenant|tokens|vault|other)"[^}]*tenant_id='
@@ -39,15 +34,6 @@ TEXT="$(metrics_get)"
 if [ -z "$TEXT" ]; then
   skip_check "/metrics empty or not exposed"
 else
-	# Transport bytes are aggregate-only: request/response are the complete
-	# bounded label set. Control-plane 2xx request series are aggregate too;
-	# only data-plane traffic and 4xx/5xx retain tenant attribution.
-	http_bytes_series="$(metric_series_count "$TEXT" "drive9_tenant_http_bytes_total")"
-	if [ "$http_bytes_series" -le 2 ]; then
-		ok "tenant_http_bytes_total has at most request/response series ($http_bytes_series)"
-	else
-		fail "tenant_http_bytes_total has $http_bytes_series series; expected at most 2"
-	fi
 	if metrics_has_tenant_labeled_control_success "$TEXT"; then
 		fail "tenant_requests_total control-plane 2xx series unexpectedly carries tenant labels"
 	else

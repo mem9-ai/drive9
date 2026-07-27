@@ -82,7 +82,6 @@ var fuseRemoteOperationBytes = fuseMeter.Int64Counter("drive9_fuse_remote_operat
 var tenantRequestsTotal = tenantMeter.Int64Counter("drive9_tenant_requests_total", "Tenant-scoped requests by tenant/tidbcloud_org/surface/action/status_class")
 var tenantRequestDuration = tenantMeter.Float64Histogram("drive9_tenant_request_duration_seconds", "Tenant request duration histogram by surface/status_class", httpDurationBounds)
 var tenantInflight = tenantMeter.Float64Gauge("drive9_tenant_inflight_requests", "Current in-flight tenant-scoped requests by tenant/tidbcloud_org/surface")
-var tenantHTTPBytes = tenantMeter.Int64Counter("drive9_tenant_http_bytes_total", "HTTP transport bytes by direction")
 var tenantFileBytes = tenantMeter.Int64Counter("drive9_tenant_file_bytes_total", "Tenant-scoped logical file bytes by tenant/tidbcloud_org/direction")
 var tenantCount = tenantMeter.Float64Gauge("drive9_tenant_count", "Tenant count by status")
 var tenantStorageBytes = tenantMeter.Float64Gauge("drive9_tenant_storage_bytes", "Tenant storage bytes by tenant/tidbcloud_org/state")
@@ -581,10 +580,6 @@ func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action string
 	)
 }
 
-func RecordTenantHTTPBytes(direction string, bytes int64) {
-	recordTenantHTTPBytes(direction, bytes)
-}
-
 func RecordTenantFileBytes(tenantID, direction string, bytes int64) {
 	RecordTenantFileBytesWithOrg(tenantID, "", direction, bytes)
 }
@@ -763,16 +758,6 @@ func recordTenantBytes(counter *Int64Counter, tenantID, tidbCloudOrgID, directio
 	counter.Add(bytes,
 		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
 		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
-		Attr("direction", cleanMetricValue(direction, "unknown")),
-	)
-}
-
-func recordTenantHTTPBytes(direction string, bytes int64) {
-	if bytes <= 0 {
-		return
-	}
-	RegisterModule("tenant_usage")
-	tenantHTTPBytes.Add(bytes,
 		Attr("direction", cleanMetricValue(direction, "unknown")),
 	)
 }

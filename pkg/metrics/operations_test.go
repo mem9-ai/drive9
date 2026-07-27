@@ -299,7 +299,6 @@ func TestTenantIDMetricsIncludeTiDBCloudOrgID(t *testing.T) {
 	RecordTenantGaugeWithOrg(tenantID, orgID, "component_org_label_test", "gauge", 1)
 	RecordTenantEventWithOrg(tenantID, orgID, "event_org_label_test", "result", "ok")
 	RecordTenantRequestCountWithOrg(tenantID, orgID, "fs", "action", 200)
-	RecordTenantHTTPBytes("request", 10)
 	RecordTenantFileBytesWithOrg(tenantID, orgID, "out", 20)
 	RecordTenantStorageBytesWithOrg(tenantID, orgID, "confirmed", 30)
 	RecordTenantMediaFilesWithOrg(tenantID, orgID, "confirmed", 40)
@@ -319,7 +318,6 @@ func TestTenantIDMetricsIncludeTiDBCloudOrgID(t *testing.T) {
 		`drive9_service_gauge{component="component_org_label_test",name="gauge",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1.000000`,
 		`drive9_business_events_total{event="event_org_label_test",result="ok"} 1`,
 		`drive9_tenant_requests_total{action="action",status_class="2xx",surface="fs",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
-		`drive9_tenant_http_bytes_total{direction="request"} 10`,
 		`drive9_tenant_file_bytes_total{direction="out",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 20`,
 		`drive9_tenant_storage_bytes{state="confirmed",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 30.000000`,
 		`drive9_tenant_media_files{state="confirmed",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 40.000000`,
@@ -628,7 +626,6 @@ func TestDeleteTenantCounters(t *testing.T) {
 
 	RecordTenantOperationCountWithOrg(tenantID, tidbCloudOrgID, "cmp", "op", "ok")
 	RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, "api", "read", 200)
-	RecordTenantHTTPBytes("upload", 1024)
 	RecordSSEConnectionWithOrg(tenantID, tidbCloudOrgID, "mount", time.Second)
 	RecordSSEEventSentWithOrg(tenantID, tidbCloudOrgID, "write")
 	RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, "api", 3)
@@ -649,7 +646,6 @@ func TestDeleteTenantCounters(t *testing.T) {
 	counterNames := []string{
 		"drive9_service_operations_total",
 		"drive9_tenant_requests_total",
-		"drive9_tenant_http_bytes_total",
 		"drive9_sse_connections_total",
 		"drive9_sse_events_sent_total",
 	}
