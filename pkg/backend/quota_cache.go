@@ -23,7 +23,7 @@ const (
 	// refreshes so a MetaDB slowdown cannot create one in-flight query per
 	// resident tenant. Keep headroom in the shared metadata connection pool for
 	// foreground requests and other control-plane work.
-	defaultQuotaConfigCacheAsyncRefreshSlots = 32
+	defaultQuotaConfigCacheAsyncRefreshSlots = 50
 	// quotaConfigCacheSlotRetryInterval prevents a tenant that could not claim
 	// an async refresh slot from retrying on every request while the budget is
 	// exhausted.
