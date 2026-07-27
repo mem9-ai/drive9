@@ -731,7 +731,8 @@ func TestManagedSharedDBCloudResultRejectsIdentityChangeAfterProvisioning(t *tes
 		t.Fatalf("GetSharedDB after connection refresh: %v", err)
 	}
 	if got.TiDBCloudOrganizationID != ready.TiDBCloudOrganizationID || got.ClusterID != ready.ClusterID ||
-		got.Host != refreshed.Host || got.User != refreshed.User || !bytes.Equal(got.PasswordCipher, refreshed.PasswordCipher) {
+		got.Host != refreshed.Host || got.User != refreshed.User ||
+		!bytes.Equal(got.PasswordCipher, refreshed.PasswordCipher) || got.TLSMode != refreshed.TLSMode {
 		t.Fatalf("connection refresh = %+v, want stable identity with refreshed connection metadata", got)
 	}
 }
