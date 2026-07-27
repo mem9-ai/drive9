@@ -494,6 +494,39 @@ func (s *Store) UpdateSharedDBSchemaVersion(ctx context.Context, dbID int64, ver
 	return nil
 }
 
+// RefreshManagedSharedDBProvisioningProgress keeps a long-running remote
+// schema operation visible to the stuck-pool watchdog without retaining a
+// MetaDB connection or advisory lock for the duration of the DDL.
+func (s *Store) RefreshManagedSharedDBProvisioningProgress(ctx context.Context, dbID int64) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "refresh_managed_shared_db_provisioning_progress", start, &err)
+	if dbID <= 0 {
+		return fmt.Errorf("db_id must be positive")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE db_pool SET updated_at = CURRENT_TIMESTAMP(3)
+		WHERE db_id = ? AND role = ? AND status = ?`, dbID, SharedDBRoleShared, SharedDBStatusProvisioning)
+	if err != nil {
+		return fmt.Errorf("refresh provisioning progress for db pool %d: %w", dbID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("refresh provisioning progress rows affected for db pool %d: %w", dbID, err)
+	}
+	if affected == 0 {
+		var status string
+		if err := s.db.QueryRowContext(ctx, `SELECT status FROM db_pool WHERE db_id = ? AND role = ?`, dbID, SharedDBRoleShared).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if status != SharedDBStatusProvisioning {
+			return ErrNotFound
+		}
+	}
+	return nil
+}
+
 // ActivateSharedDBPool flips a managed pool to active only after the cloud
 // identity, connection fields, and shared schema version are complete.
 func (s *Store) ActivateSharedDBPool(ctx context.Context, dbID int64) (err error) {
