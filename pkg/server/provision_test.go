@@ -2140,6 +2140,45 @@ func TestManagedSharedDBProvisioningHeartbeatPreventsStuckFailure(t *testing.T) 
 	}
 }
 
+func TestManagedSharedDBProvisioningHeartbeatFailureDoesNotCancelSchemaWork(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	srv := &Server{meta: metaStore, managedSharedDBStuckTimeout: 40 * time.Millisecond}
+	core, observed := observer.New(zap.WarnLevel)
+	workCtx := logger.WithContext(context.Background(), zap.New(core))
+	workFinished := false
+	err = srv.withManagedSharedDBProvisioningHeartbeat(workCtx, 999_999, func(schemaCtx context.Context) error {
+		deadline := time.NewTimer(time.Second)
+		defer deadline.Stop()
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-schemaCtx.Done():
+				return fmt.Errorf("schema work context canceled by heartbeat: %w", schemaCtx.Err())
+			case <-ticker.C:
+				if observed.FilterMessage("managed_shared_db_pool_provisioning_heartbeat_failed").Len() > 0 {
+					workFinished = true
+					return nil
+				}
+			case <-deadline.C:
+				return fmt.Errorf("heartbeat failure was not observed")
+			}
+		}
+	})
+	if err != nil {
+		t.Fatalf("schema work after heartbeat refresh failure: %v", err)
+	}
+	if !workFinished {
+		t.Fatal("schema work did not finish after heartbeat refresh failure")
+	}
+}
+
 func TestManagedSharedDBBatchCreateSubmitsFiftyPoolsInOneRequest(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

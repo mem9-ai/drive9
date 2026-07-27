@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -484,6 +485,9 @@ func TestSharedDBSchemaEnsureUsesCrossPoolAdvisoryLock(t *testing.T) {
 	var ensureCalls atomic.Int32
 	firstEnsureStarted := make(chan struct{})
 	releaseFirstEnsure := make(chan struct{})
+	var releaseFirstEnsureOnce sync.Once
+	releaseFirst := func() { releaseFirstEnsureOnce.Do(func() { close(releaseFirstEnsure) }) }
+	t.Cleanup(releaseFirst)
 	previousEnsure := ensureSharedDBSchema
 	ensureSharedDBSchema = func(ctx context.Context, db *sql.DB) error {
 		if ensureCalls.Add(1) == 1 {
@@ -503,13 +507,9 @@ func TestSharedDBSchemaEnsureUsesCrossPoolAdvisoryLock(t *testing.T) {
 	select {
 	case secondErr = <-secondDone:
 	case <-time.After(time.Second):
-		close(releaseFirstEnsure)
+		releaseFirst()
 		<-firstDone
 		t.Fatal("second shared schema ensure waited instead of returning a non-blocking lock conflict")
-	}
-	close(releaseFirstEnsure)
-	if err := <-firstDone; err != nil {
-		t.Fatalf("first shared schema ensure: %v", err)
 	}
 	if !errors.Is(secondErr, errSharedDBSchemaEnsureBusy) {
 		t.Fatalf("second shared schema ensure error = %v, want non-blocking advisory lock conflict", secondErr)
@@ -517,11 +517,36 @@ func TestSharedDBSchemaEnsureUsesCrossPoolAdvisoryLock(t *testing.T) {
 	if got := ensureCalls.Load(); got != 1 {
 		t.Fatalf("concurrent schema ensure calls = %d, want 1", got)
 	}
-	if err := secondPool.EnsureSharedDBReady(context.Background(), dbID); err != nil {
-		t.Fatalf("retry after first schema ensure completed: %v", err)
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	_, waitErr := secondPool.sharedDBHandle(waitCtx, dbID)
+	cancelWait()
+	if !errors.Is(waitErr, context.DeadlineExceeded) {
+		t.Fatalf("foreground shared DB open deadline error = %v, want context deadline", waitErr)
+	}
+	foregroundDone := make(chan error, 1)
+	go func() {
+		_, err := secondPool.sharedDBHandle(context.Background(), dbID)
+		foregroundDone <- err
+	}()
+	select {
+	case err := <-foregroundDone:
+		t.Fatalf("foreground shared DB open returned before active schema ensure completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	releaseFirst()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first shared schema ensure: %v", err)
+	}
+	select {
+	case err := <-foregroundDone:
+		if err != nil {
+			t.Fatalf("foreground shared DB open after schema ensure: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("foreground shared DB open did not resume after schema ensure completed")
 	}
 	if got := ensureCalls.Load(); got != 1 {
-		t.Fatalf("schema ensure calls after current-version retry = %d, want 1", got)
+		t.Fatalf("schema ensure calls after foreground current-version retry = %d, want 1", got)
 	}
 }
 
