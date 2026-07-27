@@ -18,10 +18,10 @@ Tenant usage metrics intentionally allow `tenant_id` and `tidbcloud_org_id` as P
 
 - `drive9_tenant_count`: tenant count by real tenant `status`.
 - `drive9_tenant_pool_bindings`: tenant-pool binding count by `pool_id`, `tidbcloud_org_id`, and binding `status=free|used`. The binding label is `status`, not `pool_status`.
-- `drive9_tenant_requests_total`: request count by `tenant_id`, `tidbcloud_org_id`, `surface`, `action`, `result`, and `status_class`.
+- `drive9_tenant_requests_total`: request count by `surface`, `action`, and `status_class`. It includes `tenant_id` and `tidbcloud_org_id` for data-plane surfaces and 4xx/5xx control-plane requests.
 - `drive9_tenant_request_duration_seconds`: request latency histogram by `surface` and `status_class`.
 - `drive9_tenant_inflight_requests`: current in-flight request gauge by `tenant_id`, `tidbcloud_org_id`, `surface`, and `action`.
-- `drive9_tenant_file_bytes_total`: logical file bytes by `tenant_id`, `tidbcloud_org_id`, `surface`, `action`, and `direction=read|write`.
+- `drive9_tenant_file_bytes_total`: logical file bytes by `tenant_id`, `tidbcloud_org_id`, and `direction=read|write`.
 - `drive9_tenant_storage_bytes`: opportunistically published quota storage gauge by `tenant_id`, `tidbcloud_org_id`, and `state=confirmed|reserved|limit`.
 - `drive9_tenant_media_files`: opportunistically published quota media-file gauge by `tenant_id`, `tidbcloud_org_id`, and `state=confirmed|limit`.
 
