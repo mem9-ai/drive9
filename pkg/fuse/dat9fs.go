@@ -1224,7 +1224,10 @@ func (fs *Dat9FS) layerDirHasOpenChild(prefix string) bool {
 		}
 		fh.Lock()
 		path := fh.Path
-		unlinked := fh.UnlinkedData != nil
+		// fh.Unlinked is set by markOpenHandlesUnlinked for every open-unlinked
+		// handle. UnlinkedData alone is incomplete: dirty open-unlinked handles
+		// keep their Dirty buffer and may never populate UnlinkedData.
+		unlinked := fh.Unlinked || fh.UnlinkedData != nil
 		fh.Unlock()
 		if unlinked {
 			continue
@@ -1234,6 +1237,41 @@ func (fs *Dat9FS) layerDirHasOpenChild(prefix string) bool {
 		}
 	}
 	return false
+}
+
+// discardUnlinkedHandleStateLocked drops staged dirty/pending state for a
+// handle whose path was unlinked while open. Caller must hold fh.Lock.
+// Returning early from Flush/Release without this would re-stage write-back
+// and re-upload the file, leaving an orphan that makes parent rmdir ENOTEMPTY
+// (pjdfstest unlink/14.t).
+func (fs *Dat9FS) discardUnlinkedHandleStateLocked(fh *FileHandle) {
+	if fh == nil || !fh.Unlinked {
+		return
+	}
+	if fh.Dirty != nil {
+		fh.Dirty.ClearDirty()
+	}
+	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+	fh.DirtySeq = 0
+	fh.WriteBackSeq = 0
+	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
+	path := fh.Path
+	if path == "" {
+		return
+	}
+	if fs.debouncer != nil {
+		fs.debouncer.CancelNoWait(path)
+	}
+	if fs.writeBack != nil {
+		fs.writeBack.Remove(path)
+	}
+	if fs.pendingIndex != nil {
+		fs.pendingIndex.Remove(path)
+	}
+	if fs.commitQueue != nil {
+		fs.commitQueue.CancelPath(path)
+	}
 }
 
 func (fs *Dat9FS) lookupLayerNamespaceEntry(parentIno uint64, childP, name string, out *gofuse.EntryOut) (bool, gofuse.Status) {
@@ -10926,6 +10964,11 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 	if fh == nil || fh.Dirty == nil {
 		return gofuse.OK
 	}
+	if fh.Unlinked {
+		// Path was removed while open; never re-upload discarded content.
+		fs.discardUnlinkedHandleStateLocked(fh)
+		return gofuse.OK
+	}
 	if fs.clearStaleSQLitePersistentJournalEmptyCreateLocked(fh) {
 		return gofuse.OK
 	}
@@ -11139,6 +11182,15 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		flushCtx, flushCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
 		defer flushCancel()
 		return fs.flushGitHandleLockedWithPolicy(flushCtx, fh, fs.syncMode == SyncStrict)
+	}
+
+	// Unlink-while-open: never re-stage write-back or upload. Doing so
+	// resurrects the path after Unlink's remote DELETE and makes parent
+	// rmdir return ENOTEMPTY (pjdfstest unlink/14.t).
+	if fh.Unlinked {
+		phase = "unlinked-discard"
+		fs.discardUnlinkedHandleStateLocked(fh)
+		return gofuse.OK
 	}
 
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() &&
@@ -11875,6 +11927,16 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		phase = "cancel-debounce"
 		fs.debouncer.CancelNoWait(fh.Path)
 
+		// Unlink-while-open: discard dirty state and skip all remote uploads.
+		fh.Lock()
+		if fh.Unlinked {
+			phase = "unlinked-discard"
+			fs.discardUnlinkedHandleStateLocked(fh)
+			fh.Unlock()
+			return
+		}
+		fh.Unlock()
+
 		// close-sync is primarily enforced in Flush so close(2) can receive
 		// remote upload errors. Keep Release as a best-effort fallback for
 		// unusual flows where dirty staged state reaches Release directly.
@@ -12198,11 +12260,20 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 			return
 		}
 		// Skip the upload if the file has been unlinked since the debounce
-		// was scheduled. After Unlink, the inode is removed from the path
-		// map (RemoveLink). Without this check, the debounced callback
-		// would upload the file to the server after Unlink has already
-		// processed it, leaving a stale server-side file that causes
-		// rmdir to fail with ENOTEMPTY.
+		// was scheduled. RemoveLink (no open handles) drops the path map
+		// entry; RemoveLinkPreserve (open handles) keeps Path with
+		// Unlinked=true. Both must suppress re-upload — otherwise the
+		// debounced PUT resurrects a just-deleted path and parent rmdir
+		// fails with ENOTEMPTY (pjdfstest unlink/14.t).
+		if handle.Unlinked {
+			fs.discardUnlinkedHandleStateLocked(handle)
+			handle.Unlock()
+			return
+		}
+		if entry, ok := fs.inodes.GetEntry(ino); !ok || entry.Unlinked {
+			handle.Unlock()
+			return
+		}
 		if _, ok := fs.inodes.GetPath(ino); !ok {
 			handle.Unlock()
 			return
@@ -12357,6 +12428,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}()
 	if fh.Dirty == nil {
 		phase = "no-dirty-buffer"
+		return gofuse.OK
+	}
+	if fh.Unlinked {
+		phase = "unlinked-discard"
+		fs.discardUnlinkedHandleStateLocked(fh)
 		return gofuse.OK
 	}
 	if fs.clearStaleSQLitePersistentJournalEmptyCreateLocked(fh) {
