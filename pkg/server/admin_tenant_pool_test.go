@@ -360,7 +360,7 @@ func TestSharedTenantPoolRefillReusesExistingPhysicalCapacity(t *testing.T) {
 	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE db_pool SET tenant_count = 93 WHERE db_id = ?`, dbID); err != nil {
 		t.Fatalf("move existing pool below capacity: %v", err)
 	}
-	results, err = srv.createFreeSharedPoolTenants(ctx, logicalPool.PoolID, 5, tenant.CredentialProvisionRequest{}, nil)
+	_, err = srv.createFreeSharedPoolTenants(ctx, logicalPool.PoolID, 5, tenant.CredentialProvisionRequest{}, nil)
 	if err != nil {
 		t.Fatalf("createFreeSharedPoolTenants below capacity: %v", err)
 	}
