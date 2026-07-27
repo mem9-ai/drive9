@@ -408,6 +408,17 @@ func newQuotaRuntime(t *testing.T, provider string) *quotaRuntime {
 	return newQuotaRuntimeWithOptions(t, provider, quotaRuntimeOptions{})
 }
 
+func quotaConfigRowExists(t *testing.T, rt *quotaRuntime) bool {
+	t.Helper()
+	var exists bool
+	if err := rt.meta.DB().QueryRowContext(context.Background(),
+		`SELECT EXISTS(SELECT 1 FROM tenant_quota_config WHERE tenant_id = ?)`, rt.tenantID,
+	).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	return exists
+}
+
 func newQuotaRuntimeWithOptions(t *testing.T, provider string, opts quotaRuntimeOptions) *quotaRuntime {
 	t.Helper()
 	db := newTenantDeleteDBInfo(t)
@@ -1089,35 +1100,31 @@ func TestQuotaSetSpendingLimitOnlyPersistsSpendingLimitConfig(t *testing.T) {
 	}
 	calls := rt.prov.callsSnapshot()
 	if len(calls) != 2 || calls[0] != "mark" || calls[1] != "update" {
-		t.Fatalf("calls = %#v, want mark before update", calls)
+		t.Errorf("calls = %#v, want mark before update", calls)
 	}
 	lastOptions := rt.prov.lastOptionsSnapshot()
 	if lastOptions.TiDBCloudSpendingLimitMonthly == nil || *lastOptions.TiDBCloudSpendingLimitMonthly != spendingLimit {
-		t.Fatalf("spending limit option = %#v, want %d", lastOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
+		t.Errorf("spending limit option = %#v, want %d", lastOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
 	}
 	cfg, err := rt.meta.GetQuotaConfig(context.Background(), rt.tenantID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.TiDBCloudSpendingLimit == nil || *cfg.TiDBCloudSpendingLimit != spendingLimit {
-		t.Fatalf("persisted spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, spendingLimit)
+		t.Errorf("persisted spending limit = %#v, want %d", cfg.TiDBCloudSpendingLimit, spendingLimit)
 	}
 	if cfg.MaxStorageBytes != meta.DefaultMaxStorageBytes() || cfg.MaxFileSizeBytes != meta.DefaultMaxFileSizeBytes() || cfg.MaxFileCount != 0 {
-		t.Fatalf("storage quota fields = %#v, want defaults", cfg)
+		t.Errorf("storage quota fields = %#v, want defaults", cfg)
 	}
-	version, err := rt.meta.GetQuotaConfigVersion(context.Background(), rt.tenantID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if version == "" {
-		t.Fatalf("storage quota config version should be non-empty when config row exists")
+	if !quotaConfigRowExists(t, rt) {
+		t.Error("quota config row was not persisted")
 	}
 	var out quotaResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
 	if out.Config.TiDBCloudSpendingLimit == nil || *out.Config.TiDBCloudSpendingLimit != spendingLimit {
-		t.Fatalf("config = %#v", out.Config)
+		t.Errorf("config = %#v", out.Config)
 	}
 }
 
@@ -1140,12 +1147,8 @@ func TestQuotaSetRejectsDrive9KeyWithoutTiDBCloudCredentials(t *testing.T) {
 	if got := rt.prov.markCalls.Load(); got != 0 {
 		t.Fatalf("mark calls = %d, want 0", got)
 	}
-	version, err := rt.meta.GetQuotaConfigVersion(context.Background(), rt.tenantID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if version != "" {
-		t.Fatalf("quota config version = %q, want empty", version)
+	if quotaConfigRowExists(t, rt) {
+		t.Error("quota config row was written for a rejected request")
 	}
 }
 
@@ -1366,12 +1369,8 @@ func TestQuotaSetMapsTiDBCloudCredentialErrorsWithoutWritingConfig(t *testing.T)
 			if resp.StatusCode != tc.wantStatus {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
 			}
-			version, err := rt.meta.GetQuotaConfigVersion(context.Background(), rt.tenantID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if version != "" {
-				t.Fatalf("quota config version = %q, want empty", version)
+			if quotaConfigRowExists(t, rt) {
+				t.Error("quota config row was written after TiDB Cloud credential failure")
 			}
 			if got := rt.prov.markCalls.Load(); got != 1 {
 				t.Fatalf("mark calls = %d, want 1", got)

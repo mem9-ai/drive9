@@ -43,8 +43,10 @@ import (
 )
 
 const (
-	defaultListenAddr = ":9009"
-	defaultS3Dir      = "s3"
+	defaultListenAddr                   = ":9009"
+	defaultS3Dir                        = "s3"
+	defaultTenantBackendCacheMaxTenants = 1024
+	defaultSharedBackendCacheMaxTenants = 20480
 )
 
 type s3Config struct {
@@ -341,7 +343,7 @@ func main() {
 			S3SessionToken:               s3cfg.SessionToken,
 			S3EncryptionPolicy:           s3cfg.EncryptionPolicy,
 			BackendOptions:               backendOptions,
-			MaxTenants:                   envInt("DRIVE9_POOL_MAX_TENANTS", 0),
+			MaxTenants:                   tenantBackendCacheMaxTenants(providerType),
 			IdleTimeout:                  envDuration("DRIVE9_POOL_IDLE_TTL", 5*time.Minute),
 			IdleReapInterval:             envDuration("DRIVE9_POOL_IDLE_REAP_INTERVAL", 2*time.Minute),
 			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
@@ -621,8 +623,8 @@ environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
   DRIVE9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
   DRIVE9_META_DSN    control-plane MySQL DSN (required)
-  DRIVE9_POOL_MAX_TENANTS max cached tenant user DB pools per pod (default: 1024)
-  DRIVE9_POOL_IDLE_TTL  idle duration before a cached tenant backend is evicted (default: 5m, 0=disabled)
+  DRIVE9_POOL_MAX_TENANTS max cached tenant backends per pod (default: 20480 for tidb_cloud_native_shared, 1024 otherwise)
+  DRIVE9_POOL_IDLE_TTL  idle duration before a standalone tenant backend is evicted (default: 5m, 0=disabled; shared tenants use capacity LRU only)
   DRIVE9_POOL_IDLE_REAP_INTERVAL  how often the idle reaper scans (default: 2m)
   DRIVE9_META_DB_MAX_OPEN_CONNS max open connections for the per-pod meta DB pool (default: 100)
   DRIVE9_META_DB_MAX_IDLE_CONNS max idle connections for the per-pod meta DB pool (default: 20)
@@ -1154,6 +1156,18 @@ func dbHealthProbeOptionsFromEnv() metrics.DBHealthProbeOptions {
 	return metrics.DBHealthProbeOptions{
 		ProbeMeta: envBool("DRIVE9_DB_HEALTH_PROBE_META_ENABLED", true),
 	}
+}
+
+func tenantBackendCacheMaxTenants(provider string) int {
+	fallback := defaultTenantBackendCacheMaxTenants
+	if provider == tenant.ProviderTiDBCloudNativeShared {
+		fallback = defaultSharedBackendCacheMaxTenants
+	}
+	maxTenants := envInt("DRIVE9_POOL_MAX_TENANTS", fallback)
+	if maxTenants <= 0 {
+		return fallback
+	}
+	return maxTenants
 }
 
 func envInt(key string, fallback int) int {

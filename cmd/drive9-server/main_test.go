@@ -9,12 +9,89 @@ import (
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/server"
+	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
 func TestVersionTextUsesDrive9ServerComponent(t *testing.T) {
 	got := versionText()
 	if !strings.Contains(got, "component: drive9-server\n") {
 		t.Fatalf("versionText() missing drive9-server component line: %q", got)
+	}
+}
+
+func TestTenantBackendCacheMaxTenantsUsesProviderDefault(t *testing.T) {
+	const key = "DRIVE9_POOL_MAX_TENANTS"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, []string{key})
+
+	tests := []struct {
+		provider string
+		want     int
+	}{
+		{provider: tenant.ProviderTiDBCloudNativeShared, want: 20480},
+		{provider: tenant.ProviderTiDBCloudNative, want: 1024},
+		{provider: tenant.ProviderTiDBZero, want: 1024},
+		{provider: tenant.ProviderDB9, want: 1024},
+	}
+	for _, tt := range tests {
+		t.Run(tt.provider, func(t *testing.T) {
+			if got := tenantBackendCacheMaxTenants(tt.provider); got != tt.want {
+				t.Errorf("tenantBackendCacheMaxTenants(%q) = %d, want %d", tt.provider, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTenantBackendCacheMaxTenantsExplicitOverrideWins(t *testing.T) {
+	const key = "DRIVE9_POOL_MAX_TENANTS"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	setEnv(t, key, "4096")
+
+	for _, provider := range []string{
+		tenant.ProviderTiDBCloudNativeShared,
+		tenant.ProviderTiDBCloudNative,
+		tenant.ProviderTiDBZero,
+		tenant.ProviderDB9,
+	} {
+		if got := tenantBackendCacheMaxTenants(provider); got != 4096 {
+			t.Errorf("tenantBackendCacheMaxTenants(%q) = %d, want explicit 4096", provider, got)
+		}
+	}
+}
+
+func TestTenantBackendCacheMaxTenantsFallsBackForInvalidOverrides(t *testing.T) {
+	const key = "DRIVE9_POOL_MAX_TENANTS"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	for _, raw := range []string{"0", "-1", "bad"} {
+		setEnv(t, key, raw)
+		if got := tenantBackendCacheMaxTenants(tenant.ProviderTiDBCloudNativeShared); got != 20480 {
+			t.Errorf("tenantBackendCacheMaxTenants(shared) with %q = %d, want 20480", raw, got)
+		}
+		if got := tenantBackendCacheMaxTenants(tenant.ProviderTiDBCloudNative); got != 1024 {
+			t.Errorf("tenantBackendCacheMaxTenants(native) with %q = %d, want 1024", raw, got)
+		}
+	}
+
+	unsetEnv(t, []string{key})
+	if got := tenantBackendCacheMaxTenants("unknown-provider"); got != 1024 {
+		t.Errorf("tenantBackendCacheMaxTenants(unknown-provider) = %d, want 1024", got)
+	}
+}
+
+func TestRestoreEnvPreservesPresentEmptyValue(t *testing.T) {
+	const key = "DRIVE9_TEST_PRESENT_EMPTY_ENV"
+	t.Setenv(key, "")
+	snapshot := snapshotEnv(t, []string{key})
+	unsetEnv(t, []string{key})
+
+	restoreEnv(t, snapshot)
+	value, present := os.LookupEnv(key)
+	if !present || value != "" {
+		t.Errorf("restored env = (%q, %t), want present empty value", value, present)
 	}
 }
 
@@ -682,25 +759,31 @@ func TestS3ConfigValidateRejectsInvalidStaticCredentialCombinations(t *testing.T
 	}
 }
 
-func snapshotEnv(t *testing.T, keys []string) map[string]string {
+type envSnapshotValue struct {
+	value   string
+	present bool
+}
+
+func snapshotEnv(t *testing.T, keys []string) map[string]envSnapshotValue {
 	t.Helper()
-	out := make(map[string]string, len(keys))
+	out := make(map[string]envSnapshotValue, len(keys))
 	for _, key := range keys {
-		out[key] = os.Getenv(key)
+		value, present := os.LookupEnv(key)
+		out[key] = envSnapshotValue{value: value, present: present}
 	}
 	return out
 }
 
-func restoreEnv(t *testing.T, snapshot map[string]string) {
+func restoreEnv(t *testing.T, snapshot map[string]envSnapshotValue) {
 	t.Helper()
-	for key, value := range snapshot {
-		if value == "" {
+	for key, entry := range snapshot {
+		if !entry.present {
 			if err := os.Unsetenv(key); err != nil {
 				t.Fatalf("unset %s: %v", key, err)
 			}
 			continue
 		}
-		if err := os.Setenv(key, value); err != nil {
+		if err := os.Setenv(key, entry.value); err != nil {
 			t.Fatalf("restore %s: %v", key, err)
 		}
 	}

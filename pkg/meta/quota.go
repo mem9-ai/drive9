@@ -169,35 +169,6 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 	return cfg, nil
 }
 
-// GetQuotaConfigVersion returns a lightweight content token for a tenant's
-// explicit storage quota config. An empty token means no storage-relevant row
-// exists and callers should use GetQuotaConfig's default storage config. The
-// token is derived from the effective config values instead of updated_at so
-// updates inside the same timestamp tick cannot hide a real config change from
-// cache invalidation.
-func (s *Store) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
-	start := time.Now()
-	var err error
-	defer observeMeta(ctx, "get_quota_config_version", start, &err)
-
-	var maxStorageBytes, maxFileSizeBytes, maxFileCount, maxMediaLLMFiles, maxVideoLLMFiles, maxMonthlyCostMC int64
-	err = s.db.QueryRowContext(ctx,
-		`SELECT max_storage_bytes, max_file_size_bytes, max_file_count,
-		        max_media_llm_files, max_video_llm_files, max_monthly_cost_mc
-		 FROM tenant_quota_config WHERE tenant_id = ?`, tenantID,
-	).Scan(&maxStorageBytes, &maxFileSizeBytes, &maxFileCount, &maxMediaLLMFiles, &maxVideoLLMFiles, &maxMonthlyCostMC)
-	if err == sql.ErrNoRows {
-		logger.Info(ctx, "quota_config_not_found_using_defaults",
-			zap.String("tenant_id", tenantID))
-		err = nil
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("get quota config version for tenant %q: %w", tenantID, err)
-	}
-	return fmt.Sprintf("v3:%d:%d:%d:%d:%d:%d", maxStorageBytes, maxFileSizeBytes, maxFileCount, maxMediaLLMFiles, maxVideoLLMFiles, maxMonthlyCostMC), nil
-}
-
 // SetQuotaConfig upserts per-tenant quota configuration.
 func (s *Store) SetQuotaConfig(ctx context.Context, cfg *QuotaConfig) error {
 	start := time.Now()
