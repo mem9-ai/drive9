@@ -373,7 +373,7 @@ const (
 	DefaultTenantPoolReconcileInterval           = 5 * time.Second
 	DefaultTenantPoolReconcileWorkers            = 15
 	DefaultTenantPoolReconcileWorkerRest         = 5 * time.Second
-	DefaultManagedSharedDBStuckTimeout           = 15 * time.Minute
+	DefaultManagedSharedDBStuckTimeout           = 30 * time.Minute
 	DefaultManagedSharedDBFailedCleanupInterval  = time.Minute
 	DefaultManagedSharedDBFailedCleanupBatchSize = 5
 )
@@ -480,10 +480,6 @@ func NewWithConfig(cfg Config) *Server {
 		managedSharedDBProvisioningWorkers = DefaultManagedSharedDBProvisioningWorkers
 	}
 	managedSharedDBProvisioningConcurrency := managedSharedDBProvisioningWorkers
-	if cfg.Meta != nil && cfg.Meta.DB() != nil {
-		managedSharedDBProvisioningConcurrency = limitManagedSharedDBProvisioningWorkers(
-			managedSharedDBProvisioningWorkers, cfg.Meta.DB().Stats().MaxOpenConnections)
-	}
 	tenantPoolReconcileInterval := cfg.TenantPoolReconcileInterval
 	if tenantPoolReconcileInterval <= 0 {
 		tenantPoolReconcileInterval = DefaultTenantPoolReconcileInterval
@@ -749,20 +745,6 @@ func normalizeTenantPoolRefillFreeRatio(ratio float64) float64 {
 		return DefaultTenantPoolRefillFreeRatio
 	}
 	return ratio
-}
-
-// limitManagedSharedDBProvisioningWorkers reserves half of the metadb pool for
-// callback queries and unrelated control-plane traffic. Each active schema
-// worker holds one session connection for GET_LOCK while its callback performs
-// ordinary Store operations through another connection from the same pool.
-func limitManagedSharedDBProvisioningWorkers(configured, maxOpen int) int {
-	if configured <= 0 {
-		return 0
-	}
-	if maxOpen <= 0 {
-		return configured
-	}
-	return min(configured, maxOpen/2)
 }
 
 // insertTenantNotify records a best-effort unified outbox signal so other

@@ -511,13 +511,8 @@ func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int
 	workers := s.managedSharedDBProvisioningConcurrency
 	if workers <= 0 {
 		if s.managedSharedDBProvisioningSlots != nil {
-			maxOpen := 0
-			if s.meta != nil && s.meta.DB() != nil {
-				maxOpen = s.meta.DB().Stats().MaxOpenConnections
-			}
 			logger.Error(ctx, "managed_shared_db_pool_provisioning_disabled",
-				zap.Int("configured_workers", s.managedSharedDBProvisioningWorkers),
-				zap.Int("meta_max_open_connections", maxOpen))
+				zap.Int("configured_workers", s.managedSharedDBProvisioningWorkers))
 			return
 		}
 		workers = s.managedSharedDBProvisioningWorkers
@@ -529,11 +524,7 @@ func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int
 		schemaInitRetryWindow, schemaInitInitialBackoff, managedSharedDBProvisioningMaxBackoff,
 		managedSharedDBProvisioningCooldown,
 		func(jobCtx context.Context, dbID int64) error {
-			err := s.continueManagedSharedDBPoolOnce(jobCtx, dbID)
-			if errors.Is(err, meta.ErrNotFound) {
-				return nil
-			}
-			return err
+			return managedSharedDBProvisioningQueueError(s.continueManagedSharedDBProvisioningOnce(jobCtx, dbID))
 		}, func(dbID int64, attempt int, retryIn time.Duration, err error) {
 			logger.Warn(ctx, "managed_shared_db_pool_provisioning_retry", zap.Int64("db_pool_id", dbID),
 				zap.Int("attempt", attempt), zap.Duration("retry_in", retryIn), zap.Error(err))
@@ -541,6 +532,34 @@ func (s *Server) runManagedSharedDBProvisioning(ctx context.Context, dbIDs []int
 	for dbID, err := range failed {
 		logger.Warn(ctx, "managed_shared_db_pool_provisioning_failed", zap.Int64("db_pool_id", dbID), zap.Error(err))
 	}
+}
+
+func managedSharedDBProvisioningQueueError(err error) error {
+	if errors.Is(err, meta.ErrNotFound) || errors.Is(err, tenant.ErrSharedDBSchemaEnsureBusy) {
+		return nil
+	}
+	return err
+}
+
+// continueManagedSharedDBProvisioningOnce is the only operation run by the
+// high-concurrency schema worker pool. Pending metadata and Cloud create work
+// stay in their separately bounded workers and never fall back to a MetaDB
+// pool-work session lock here.
+func (s *Server) continueManagedSharedDBProvisioningOnce(ctx context.Context, dbID int64) error {
+	poolInfo, err := s.meta.GetSharedDB(ctx, dbID)
+	if err != nil {
+		return err
+	}
+	if poolInfo.Status != meta.SharedDBStatusProvisioning {
+		logger.Debug(ctx, "managed_shared_db_pool_provisioning_skipped_status",
+			zap.Int64("db_pool_id", dbID), zap.String("status", poolInfo.Status))
+		return nil
+	}
+	cred, err := s.sharedDBCloudCredentials()
+	if err != nil {
+		return err
+	}
+	return s.finishManagedSharedDBProvisioning(ctx, poolInfo, cred)
 }
 
 type managedSharedDBProvisioningJob struct {
@@ -1022,6 +1041,14 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 		if err != nil {
 			return err
 		}
+		// Provisioning rows have already durably committed their physical
+		// identity and connection metadata. Schema ensure is serialized across
+		// pods by an advisory lock on the target TiDB, so leader recovery does
+		// not need to retain a MetaDB session across remote DDL. Pending rows
+		// still use the work lock below to prevent duplicate physical creation.
+		if poolInfo.Status == meta.SharedDBStatusProvisioning && managedSharedDBConnectionMetadataComplete(poolInfo) {
+			return s.finishManagedSharedDBProvisioning(ctx, poolInfo, cred)
+		}
 		restartWithOrganization := false
 		continuePool := func(lockCtx context.Context) error {
 			current, loadErr := s.meta.GetSharedDB(lockCtx, dbID)
@@ -1043,6 +1070,59 @@ func (s *Server) continueManagedSharedDBPoolOnce(ctx context.Context, dbID int64
 		}
 	}
 	return fmt.Errorf("db pool %d allocation identity kept changing", dbID)
+}
+
+func managedSharedDBConnectionMetadataComplete(poolInfo *meta.SharedDB) bool {
+	return poolInfo != nil && strings.TrimSpace(poolInfo.ClusterID) != "" && strings.TrimSpace(poolInfo.Host) != "" &&
+		poolInfo.Port > 0 && strings.TrimSpace(poolInfo.User) != "" && len(poolInfo.PasswordCipher) > 0 &&
+		strings.TrimSpace(poolInfo.Name) != ""
+}
+
+// withManagedSharedDBProvisioningHeartbeat renews durable progress only when a
+// single remote provisioning attempt runs for a meaningful fraction of the
+// stuck timeout. Fast failures therefore remain eligible for normal stuck
+// cleanup instead of being kept alive by frequent retries. A heartbeat is
+// advisory: a transient MetaDB failure is logged but never cancels target-DB
+// schema work that is already in progress.
+func (s *Server) withManagedSharedDBProvisioningHeartbeat(ctx context.Context, dbID int64, fn func(context.Context) error) error {
+	timeout := s.managedSharedDBStuckTimeout
+	if timeout <= 0 {
+		timeout = DefaultManagedSharedDBStuckTimeout
+	}
+	interval := timeout / 4
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	heartbeatCtx, cancel := context.WithCancel(ctx)
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				if err := s.meta.RefreshManagedSharedDBProvisioningProgress(heartbeatCtx, dbID); err != nil {
+					if heartbeatCtx.Err() != nil {
+						return
+					}
+					if errors.Is(err, meta.ErrSharedDBPoolNotProvisioning) {
+						logger.Debug(ctx, "managed_shared_db_pool_provisioning_heartbeat_stopped_status_advanced",
+							zap.Int64("db_pool_id", dbID), zap.Error(err))
+						return
+					}
+					logger.Warn(ctx, "managed_shared_db_pool_provisioning_heartbeat_failed",
+						zap.Int64("db_pool_id", dbID), zap.Error(err))
+				}
+			}
+		}
+	}()
+	workErr := fn(ctx)
+	cancel()
+	<-heartbeatDone
+	return workErr
 }
 
 // ensureManagedSharedDBPhysicalLocked performs only the physical create/adopt
@@ -1188,7 +1268,11 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 	dbID := poolInfo.ID
 	var err error
 	switch poolInfo.Status {
-	case meta.SharedDBStatusActive, meta.SharedDBStatusFailed, meta.SharedDBStatusDraining:
+	case meta.SharedDBStatusActive:
+		return nil
+	case meta.SharedDBStatusFailed, meta.SharedDBStatusDraining:
+		logger.Debug(ctx, "managed_shared_db_pool_provisioning_terminal_status",
+			zap.Int64("db_pool_id", dbID), zap.String("status", poolInfo.Status))
 		return nil
 	case meta.SharedDBStatusPending, meta.SharedDBStatusProvisioning:
 	default:
@@ -1215,10 +1299,6 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 			return err
 		}
 	}
-	plainRootPassword, err := s.pool.Decrypt(ctx, poolInfo.PasswordCipher)
-	if err != nil {
-		return fmt.Errorf("decrypt shared db root password: %w", err)
-	}
 	needsMetadata := poolInfo.ClusterID == "" || poolInfo.Host == "" || poolInfo.Port <= 0 || poolInfo.User == ""
 	if poolInfo.Status == meta.SharedDBStatusProvisioning && needsMetadata {
 		return fmt.Errorf("provisioning db pool %d has incomplete connection metadata", dbID)
@@ -1240,6 +1320,10 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 		if result == nil {
 			if poolInfo.ClusterID != "" {
 				return fmt.Errorf("managed shared cluster %q was not found", poolInfo.ClusterID)
+			}
+			plainRootPassword, decryptErr := s.pool.Decrypt(ctx, poolInfo.PasswordCipher)
+			if decryptErr != nil {
+				return fmt.Errorf("decrypt shared db root password: %w", decryptErr)
 			}
 			results, createErr := provisioner.BatchProvisionSharedDBPoolsWithCredentials(ctx, []tenant.SharedDBPoolCreateRequest{{
 				DBPoolID: dbID, DBPoolUUID: poolInfo.UUID,
@@ -1278,7 +1362,28 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 			return provisionErr
 		}
 	}
-	if poolInfo.Host == "" || poolInfo.Port <= 0 || poolInfo.User == "" || len(poolInfo.PasswordCipher) == 0 || poolInfo.Name == "" {
+	return s.finishManagedSharedDBProvisioning(ctx, poolInfo, cred)
+}
+
+// finishManagedSharedDBProvisioning performs remote schema ensure and
+// activation after physical identity and connection metadata are durable. It
+// intentionally does not retain a MetaDB pool-work session across remote DDL;
+// the target TiDB advisory lock in EnsureSharedDBReady serializes schema work
+// across an overlapping leader handoff. A low-rate durable heartbeat prevents
+// the stuck watchdog from failing a pool while that work is active.
+func (s *Server) finishManagedSharedDBProvisioning(ctx context.Context, poolInfo *meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
+	if poolInfo == nil {
+		return fmt.Errorf("managed shared db pool is required")
+	}
+	dbID := poolInfo.ID
+	switch poolInfo.Status {
+	case meta.SharedDBStatusActive, meta.SharedDBStatusFailed, meta.SharedDBStatusDraining:
+		return nil
+	case meta.SharedDBStatusPending, meta.SharedDBStatusProvisioning:
+	default:
+		return fmt.Errorf("managed db pool %d has unsupported status %q", dbID, poolInfo.Status)
+	}
+	if !managedSharedDBConnectionMetadataComplete(poolInfo) {
 		return fmt.Errorf("%w: db pool %d", errSharedDBConnectionMetadataNotReady, dbID)
 	}
 	plain, err := s.pool.Decrypt(ctx, poolInfo.PasswordCipher)
@@ -1286,26 +1391,31 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 		return fmt.Errorf("decrypt shared db root password: %w", err)
 	}
 	dsn := managedSharedDBDSN(poolInfo, string(plain))
-	if ensurer, ok := s.provisioner.(tenantDatabaseEnsurer); ok {
-		if err := ensurer.EnsureDatabase(ctx, dsn); err != nil {
+	if err := s.withManagedSharedDBProvisioningHeartbeat(ctx, dbID, func(provisioningCtx context.Context) error {
+		if ensurer, ok := s.provisioner.(tenantDatabaseEnsurer); ok {
+			if err := ensurer.EnsureDatabase(provisioningCtx, dsn); err != nil {
+				return err
+			}
+		}
+		if err := s.pool.EnsureSharedDBReady(provisioningCtx, dbID); err != nil {
 			return err
 		}
-	}
-	if err := s.pool.EnsureSharedDBReady(ctx, dbID); err != nil {
-		return err
-	}
-	if updater, ok := s.provisioner.(tenant.QuotaUpdater); ok && poolInfo.SpendingLimit != nil {
-		_, patchErr := updater.UpdateQuota(ctx, &tenant.ClusterInfo{
-			ClusterID: poolInfo.ClusterID, OrganizationID: poolInfo.TiDBCloudOrganizationID,
-			Provider: tenant.ProviderTiDBCloudNative,
-		}, cred, tenant.QuotaUpdateOptions{TiDBCloudSpendingLimitMonthly: poolInfo.SpendingLimit})
-		if patchErr != nil {
-			logger.Warn(ctx, "managed_shared_db_spending_limit_sync_failed",
-				zap.Int64("db_pool_id", dbID),
-				zap.String("db_pool_uuid", poolInfo.UUID),
-				zap.String("tidbcloud_org_id", poolInfo.TiDBCloudOrganizationID),
-				zap.Error(patchErr))
+		if updater, ok := s.provisioner.(tenant.QuotaUpdater); ok && poolInfo.SpendingLimit != nil {
+			_, patchErr := updater.UpdateQuota(provisioningCtx, &tenant.ClusterInfo{
+				ClusterID: poolInfo.ClusterID, OrganizationID: poolInfo.TiDBCloudOrganizationID,
+				Provider: tenant.ProviderTiDBCloudNative,
+			}, cred, tenant.QuotaUpdateOptions{TiDBCloudSpendingLimitMonthly: poolInfo.SpendingLimit})
+			if patchErr != nil {
+				logger.Warn(provisioningCtx, "managed_shared_db_spending_limit_sync_failed",
+					zap.Int64("db_pool_id", dbID),
+					zap.String("db_pool_uuid", poolInfo.UUID),
+					zap.String("tidbcloud_org_id", poolInfo.TiDBCloudOrganizationID),
+					zap.Error(patchErr))
+			}
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if err := s.meta.ActivateSharedDBPool(ctx, dbID); err != nil {
 		return err

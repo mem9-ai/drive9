@@ -674,6 +674,165 @@ func TestManagedSharedDBUpdatedAtTracksProgressNotNoOpPolls(t *testing.T) {
 	}
 }
 
+func TestManagedSharedDBCloudResultRejectsIdentityChangeAfterProvisioning(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-identity", ProvisioningKey: bytes.Repeat([]byte{1}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	ready := &SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-identity", ClusterID: "cluster-identity",
+		Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("cipher"),
+		Name: "tidbcloud_fs", TLSMode: "skip-verify",
+	}
+	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, ready); err != nil {
+		t.Fatalf("persist ready cloud result: %v", err)
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func(*SharedDB)
+	}{
+		{name: "organization", mutate: func(in *SharedDB) { in.TiDBCloudOrganizationID = "org-other" }},
+		{name: "cluster", mutate: func(in *SharedDB) { in.ClusterID = "cluster-other" }},
+	}
+	for _, tt := range mutations {
+		t.Run(tt.name, func(t *testing.T) {
+			changed := *ready
+			tt.mutate(&changed)
+			if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, &changed); !errors.Is(err, ErrSharedDBPoolIdentityConflict) {
+				t.Fatalf("identity mutation error = %v, want ErrSharedDBPoolIdentityConflict", err)
+			}
+			got, err := s.GetSharedDB(ctx, dbID)
+			if err != nil {
+				t.Fatalf("GetSharedDB: %v", err)
+			}
+			if got.TiDBCloudOrganizationID != ready.TiDBCloudOrganizationID || got.ClusterID != ready.ClusterID {
+				t.Fatalf("identity after rejected mutation = org %q cluster %q, want org %q cluster %q",
+					got.TiDBCloudOrganizationID, got.ClusterID, ready.TiDBCloudOrganizationID, ready.ClusterID)
+			}
+		})
+	}
+	refreshed := *ready
+	refreshed.Host = "rotated.example.com"
+	refreshed.User = "rotated.root"
+	refreshed.PasswordCipher = []byte("rotated-cipher")
+	refreshed.TLSMode = "true"
+	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, &refreshed); err != nil {
+		t.Fatalf("refresh connection metadata with stable identity: %v", err)
+	}
+	got, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB after connection refresh: %v", err)
+	}
+	if got.TiDBCloudOrganizationID != ready.TiDBCloudOrganizationID || got.ClusterID != ready.ClusterID ||
+		got.Host != refreshed.Host || got.User != refreshed.User ||
+		!bytes.Equal(got.PasswordCipher, refreshed.PasswordCipher) || got.TLSMode != refreshed.TLSMode {
+		t.Fatalf("connection refresh = %+v, want stable identity with refreshed connection metadata", got)
+	}
+}
+
+func TestManagedSharedDBCloudResultRejectsBlankClusterIdentity(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-blank-cluster", ProvisioningKey: bytes.Repeat([]byte{3}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	err = s.UpdateManagedSharedDBPoolCloudResult(ctx, &SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-blank-cluster", ClusterID: "   ",
+		Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("cipher"),
+		Name: "tidbcloud_fs", TLSMode: "skip-verify",
+	})
+	if err == nil {
+		t.Fatal("blank cluster identity error = nil, want rejection")
+	}
+	got, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if got.Status != SharedDBStatusPending || got.ClusterID != "" {
+		t.Fatalf("pool after blank cluster identity = status %q cluster %q, want pending with no cluster", got.Status, got.ClusterID)
+	}
+}
+
+func TestManagedSharedDBCloudResultRepairsMissingProvisioningIdentity(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-repair-identity", ProvisioningKey: bytes.Repeat([]byte{4}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	ready := &SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-repair-identity", ClusterID: "cluster-repair-identity",
+		Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("cipher"),
+		Name: "tidbcloud_fs", TLSMode: "skip-verify",
+	}
+	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, ready); err != nil {
+		t.Fatalf("persist ready cloud result: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET cluster_id = NULL WHERE db_id = ?`, dbID); err != nil {
+		t.Fatalf("simulate legacy missing provisioning identity: %v", err)
+	}
+	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, ready); err != nil {
+		t.Fatalf("repair missing provisioning identity: %v", err)
+	}
+	got, err := s.GetSharedDB(ctx, dbID)
+	if err != nil {
+		t.Fatalf("GetSharedDB: %v", err)
+	}
+	if got.Status != SharedDBStatusProvisioning || got.ClusterID != ready.ClusterID {
+		t.Fatalf("repaired pool = status %q cluster %q, want provisioning cluster %q", got.Status, got.ClusterID, ready.ClusterID)
+	}
+}
+
+func TestRefreshManagedSharedDBProvisioningProgressDistinguishesTerminalStatus(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spendingLimit := MaxTiDBCloudSpendingLimit
+	dbID, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
+		TiDBCloudOrganizationID: "org-heartbeat-status", ProvisioningKey: bytes.Repeat([]byte{2}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingLimit,
+	})
+	if err != nil {
+		t.Fatalf("CreateManagedSharedDBPool: %v", err)
+	}
+	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, &SharedDB{
+		ID: dbID, TiDBCloudOrganizationID: "org-heartbeat-status", ClusterID: "cluster-heartbeat-status",
+		Host: "shared.example.com", Port: 4000, User: "root", PasswordCipher: []byte("cipher"),
+		Name: "tidbcloud_fs", TLSMode: "skip-verify",
+	}); err != nil {
+		t.Fatalf("persist ready cloud result: %v", err)
+	}
+	if err := s.UpdateSharedDBSchemaVersion(ctx, dbID, 1); err != nil {
+		t.Fatalf("UpdateSharedDBSchemaVersion: %v", err)
+	}
+	if err := s.ActivateSharedDBPool(ctx, dbID); err != nil {
+		t.Fatalf("ActivateSharedDBPool: %v", err)
+	}
+
+	err = s.RefreshManagedSharedDBProvisioningProgress(ctx, dbID)
+	if !errors.Is(err, ErrSharedDBPoolNotProvisioning) || errors.Is(err, ErrNotFound) {
+		t.Fatalf("refresh active pool error = %v, want ErrSharedDBPoolNotProvisioning distinct from ErrNotFound", err)
+	}
+	if err := s.RefreshManagedSharedDBProvisioningProgress(ctx, dbID+1_000_000); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("refresh missing pool error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestFinalizeFailedSharedDBPoolCleanupClearsCloudIdentityBeforeDelete(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()

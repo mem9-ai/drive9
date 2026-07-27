@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -25,11 +26,13 @@ type ManagedSharedDBPoolWavePlan struct {
 	Members []ManagedSharedDBPoolWaveMember
 }
 
-// ManagedSharedDBPoolWaveResult contains durable identifiers created for one
-// physical partition of a refill wave.
+// ManagedSharedDBPoolWaveResult contains one durable physical assignment for a
+// refill wave. Created reports whether the wave inserted the physical pool or
+// reused capacity from an existing row.
 type ManagedSharedDBPoolWaveResult struct {
 	DBID      int64
 	TenantIDs []string
+	Created   bool
 }
 
 // ManagedSharedDBPoolWaveResize atomically grows the logical tenant pool with
@@ -41,15 +44,24 @@ type ManagedSharedDBPoolWaveResize struct {
 }
 
 type preparedManagedSharedDBPoolWavePlan struct {
-	values  managedSharedDBInsertValues
-	members []ManagedSharedDBPoolWaveMember
+	values       managedSharedDBInsertValues
+	members      []ManagedSharedDBPoolWaveMember
+	tenantStatus TenantStatus
 }
 
 type stagedManagedSharedDBPoolWavePlan struct {
 	dbID           int64
+	dbStatus       string
 	tenantIDs      []string
 	placementArgs  []any
 	membershipArgs []any
+}
+
+type managedSharedDBPoolWaveCandidate struct {
+	dbID        int64
+	status      string
+	maxTenants  int
+	tenantCount int
 }
 
 func multiRowPlaceholders(rows, columns int) string {
@@ -57,10 +69,10 @@ func multiRowPlaceholders(rows, columns int) string {
 	return strings.TrimRight(strings.Repeat(row+",", rows), ",")
 }
 
-// CreateManagedSharedDBPoolTenantWave atomically creates each physical pool
-// together with all logical tenant reservations assigned to it. A direct
-// allocator therefore cannot observe refill-staged physical capacity before
-// tenant_count, placements, and pool memberships account for the wave.
+// CreateManagedSharedDBPoolTenantWave atomically fills existing physical pool
+// capacity before creating physical pools for any remaining logical tenant
+// reservations. A direct allocator therefore cannot observe refill-staged
+// capacity before tenant_count, placements, and memberships account for it.
 func (s *Store) CreateManagedSharedDBPoolTenantWave(ctx context.Context, plans []ManagedSharedDBPoolWavePlan) ([]ManagedSharedDBPoolWaveResult, error) {
 	return s.CreateManagedSharedDBPoolTenantWaveWithResize(ctx, plans, nil)
 }
@@ -74,6 +86,7 @@ func (s *Store) CreateManagedSharedDBPoolTenantWaveWithResize(ctx context.Contex
 		return nil, nil
 	}
 	prepared := make([]preparedManagedSharedDBPoolWavePlan, len(plans))
+	waveMembers := make([]ManagedSharedDBPoolWaveMember, 0)
 	seenTenants := make(map[string]struct{})
 	wavePoolID := ""
 	waveOrganizationID := ""
@@ -122,24 +135,68 @@ func (s *Store) CreateManagedSharedDBPoolTenantWaveWithResize(ctx context.Contex
 				return nil, fmt.Errorf("managed shared DB wave tenant %q has invalid auto-embedding profile", tenantID)
 			}
 		}
-		prepared[i] = preparedManagedSharedDBPoolWavePlan{values: values, members: plans[i].Members}
+		prepared[i] = preparedManagedSharedDBPoolWavePlan{values: values}
+		waveMembers = append(waveMembers, plans[i].Members...)
 		waveMemberCount += len(plans[i].Members)
 	}
 
 	err = withMetaLockConflictRetry(ctx, "create_managed_shared_db_pool_tenant_wave", func() error {
-		attemptOut := make([]ManagedSharedDBPoolWaveResult, len(prepared))
-		staged := make([]stagedManagedSharedDBPoolWavePlan, len(prepared))
+		attemptOut := make([]ManagedSharedDBPoolWaveResult, 0, len(prepared))
+		staged := make([]stagedManagedSharedDBPoolWavePlan, 0, len(prepared))
 		txErr := s.InTx(ctx, func(tx *sql.Tx) error {
+			memberOffset := 0
+			candidates, candidateErr := lockManagedSharedDBPoolWaveCandidates(ctx, tx, waveOrganizationID)
+			if candidateErr != nil {
+				return candidateErr
+			}
+			for _, candidate := range candidates {
+				if memberOffset >= len(waveMembers) {
+					break
+				}
+				assigned := min(candidate.maxTenants-candidate.tenantCount, len(waveMembers)-memberOffset)
+				if assigned <= 0 {
+					continue
+				}
+				tenantStatus, statusErr := tenantStatusForSharedDBPoolWave(candidate.status)
+				if statusErr != nil {
+					return statusErr
+				}
+				partition := preparedManagedSharedDBPoolWavePlan{
+					members:      waveMembers[memberOffset : memberOffset+assigned],
+					tenantStatus: tenantStatus,
+				}
+				stagedPartition, stageErr := stageManagedSharedDBPoolWaveMembers(ctx, tx, candidate.dbID, candidate.status, partition)
+				if stageErr != nil {
+					return fmt.Errorf("stage existing managed shared DB pool %d: %w", candidate.dbID, stageErr)
+				}
+				staged = append(staged, stagedPartition)
+				attemptOut = append(attemptOut, ManagedSharedDBPoolWaveResult{DBID: candidate.dbID, TenantIDs: stagedPartition.tenantIDs})
+				memberOffset += assigned
+			}
 			for i := range prepared {
-				dbID, insertErr := insertManagedSharedDBPool(ctx, tx, prepared[i].values)
+				if memberOffset >= len(waveMembers) {
+					break
+				}
+				assigned := min(prepared[i].values.maxTenants, len(waveMembers)-memberOffset)
+				partition := preparedManagedSharedDBPoolWavePlan{
+					values:       prepared[i].values,
+					members:      waveMembers[memberOffset : memberOffset+assigned],
+					tenantStatus: TenantPending,
+				}
+				dbID, insertErr := insertManagedSharedDBPool(ctx, tx, partition.values)
 				if insertErr != nil {
 					return insertErr
 				}
-				staged[i], insertErr = stageManagedSharedDBPoolWaveMembers(ctx, tx, dbID, prepared[i])
+				stagedPartition, insertErr := stageManagedSharedDBPoolWaveMembers(ctx, tx, dbID, SharedDBStatusPending, partition)
 				if insertErr != nil {
 					return fmt.Errorf("stage managed shared DB pool %d: %w", dbID, insertErr)
 				}
-				attemptOut[i] = ManagedSharedDBPoolWaveResult{DBID: dbID, TenantIDs: staged[i].tenantIDs}
+				staged = append(staged, stagedPartition)
+				attemptOut = append(attemptOut, ManagedSharedDBPoolWaveResult{DBID: dbID, TenantIDs: stagedPartition.tenantIDs, Created: true})
+				memberOffset += assigned
+			}
+			if memberOffset != len(waveMembers) {
+				return fmt.Errorf("managed shared DB wave assigned %d of %d members", memberOffset, len(waveMembers))
 			}
 			// Take logical-pool ownership only after the expensive independent
 			// tenant/quota/profile staging. If delete or shrink committed first,
@@ -166,7 +223,77 @@ func (s *Store) CreateManagedSharedDBPoolTenantWaveWithResize(ctx context.Contex
 	return out, nil
 }
 
-func stageManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, dbID int64, plan preparedManagedSharedDBPoolWavePlan) (stagedManagedSharedDBPoolWavePlan, error) {
+const lockManagedSharedDBPoolWaveCandidatesSQL = `SELECT db_id, status, max_tenants, tenant_count
+		FROM db_pool
+		WHERE org_id = ? AND role = ? AND status IN (?, ?, ?)
+			AND max_tenants > 0 AND soft_cap_reached = 0 AND tenant_count < max_tenants
+		ORDER BY db_id
+		FOR UPDATE`
+
+func lockManagedSharedDBPoolWaveCandidates(ctx context.Context, tx *sql.Tx, organizationID string) ([]managedSharedDBPoolWaveCandidate, error) {
+	// Acquire every reusable row for the organization in immutable primary-key
+	// order. Status can advance concurrently, so using it in the locking order
+	// can invert acquisition between overlapping refill waves. The result is
+	// sorted by readiness only after the complete stable lock set is held. This
+	// deliberately serializes same-organization refill waves for the duration
+	// of this short transaction; no Cloud or schema work runs while it is held.
+	rows, err := tx.QueryContext(ctx, lockManagedSharedDBPoolWaveCandidatesSQL, organizationID, SharedDBRoleShared,
+		SharedDBStatusActive, SharedDBStatusProvisioning, SharedDBStatusPending)
+	if err != nil {
+		return nil, fmt.Errorf("lock reusable managed shared DB pools: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []managedSharedDBPoolWaveCandidate
+	for rows.Next() {
+		var candidate managedSharedDBPoolWaveCandidate
+		if err := rows.Scan(&candidate.dbID, &candidate.status, &candidate.maxTenants, &candidate.tenantCount); err != nil {
+			return nil, err
+		}
+		out = append(out, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sortManagedSharedDBPoolWaveCandidates(out)
+	return out, nil
+}
+
+func sortManagedSharedDBPoolWaveCandidates(candidates []managedSharedDBPoolWaveCandidate) {
+	statusRank := func(status string) int {
+		switch status {
+		case SharedDBStatusActive:
+			return 0
+		case SharedDBStatusProvisioning:
+			return 1
+		case SharedDBStatusPending:
+			return 2
+		default:
+			return 3
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left, right := statusRank(candidates[i].status), statusRank(candidates[j].status)
+		if left != right {
+			return left < right
+		}
+		return candidates[i].dbID < candidates[j].dbID
+	})
+}
+
+func tenantStatusForSharedDBPoolWave(status string) (TenantStatus, error) {
+	switch status {
+	case SharedDBStatusActive:
+		return TenantActive, nil
+	case SharedDBStatusProvisioning:
+		return TenantProvisioning, nil
+	case SharedDBStatusPending:
+		return TenantPending, nil
+	default:
+		return "", fmt.Errorf("shared DB pool status %q is not reusable", status)
+	}
+}
+
+func stageManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, dbID int64, dbStatus string, plan preparedManagedSharedDBPoolWavePlan) (stagedManagedSharedDBPoolWavePlan, error) {
 	now := time.Now().UTC()
 	tenantArgs := make([]any, 0, len(plan.members)*22)
 	tenantIDs := make([]string, 0, len(plan.members))
@@ -174,7 +301,7 @@ func stageManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, dbID i
 		t := member.Tenant
 		tenantIDs = append(tenantIDs, t.ID)
 		tenantArgs = append(tenantArgs,
-			t.ID, t.Status, tenantKindForInsert(t), t.ParentTenantID, t.StorageNamespaceID,
+			t.ID, plan.tenantStatus, tenantKindForInsert(t), t.ParentTenantID, t.StorageNamespaceID,
 			t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
 			t.Provider, nullStr(t.ClusterID), t.BranchID, nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
 			tenantS3EncryptionModeForInsert(t), t.S3KMSKeyID, boolToInt(tenantS3BucketKeyEnabledForInsert(t)),
@@ -268,7 +395,7 @@ func stageManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, dbID i
 			return stagedManagedSharedDBPoolWavePlan{}, fmt.Errorf("insert wave auto-embedding profiles: %w", err)
 		}
 	}
-	return stagedManagedSharedDBPoolWavePlan{dbID: dbID, tenantIDs: tenantIDs,
+	return stagedManagedSharedDBPoolWavePlan{dbID: dbID, dbStatus: dbStatus, tenantIDs: tenantIDs,
 		placementArgs: placementArgs, membershipArgs: membershipArgs}, nil
 }
 
@@ -375,8 +502,14 @@ func finalizeManagedSharedDBPoolWaveMembers(ctx context.Context, tx *sql.Tx, sta
 		multiRowPlaceholders(len(staged.tenantIDs), 6), staged.membershipArgs...); err != nil {
 		return fmt.Errorf("insert wave memberships: %w", err)
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE db_pool SET tenant_count = ?, soft_cap_reached = CASE WHEN ? >= max_tenants THEN 1 ELSE 0 END
-		WHERE db_id = ? AND status = ?`, len(staged.tenantIDs), len(staged.tenantIDs), staged.dbID, SharedDBStatusPending)
+	// MySQL evaluates single-table SET assignments from left to right. Keep
+	// soft_cap_reached first so both calculations use the pre-increment count.
+	res, err := tx.ExecContext(ctx, `UPDATE db_pool
+		SET soft_cap_reached = CASE WHEN tenant_count + ? >= max_tenants THEN 1 ELSE 0 END,
+			tenant_count = tenant_count + ?
+		WHERE db_id = ? AND status = ? AND max_tenants > 0 AND soft_cap_reached = 0
+			AND tenant_count + ? <= max_tenants`,
+		len(staged.tenantIDs), len(staged.tenantIDs), staged.dbID, staged.dbStatus, len(staged.tenantIDs))
 	if err != nil {
 		return fmt.Errorf("reserve wave physical capacity: %w", err)
 	}
