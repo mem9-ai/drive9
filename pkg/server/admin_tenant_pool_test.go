@@ -825,7 +825,8 @@ func TestSharedTenantPoolDefensivelyReportsProvisioningWhenBatchMetadataComplete
 		t.Fatal(err)
 	}
 	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
-		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: secret})
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, TokenSecret: secret,
+		Leader: newFollowerLeaderManager(t, metaStore)})
 	defer srv.Close()
 	now := time.Now().UTC()
 	if err := metaStore.CreateTenantPool(context.Background(), &meta.TenantPool{
