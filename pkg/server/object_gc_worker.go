@@ -148,7 +148,7 @@ func (w *objectGCWorker) processCandidate(ctx context.Context, candidate meta.Ob
 	}
 
 	acquireStart := time.Now()
-	b, release, err := w.pool.Acquire(ctx, owner)
+	b, release, err := w.pool.AcquireForWork(ctx, owner)
 	if err != nil {
 		// Acquire failure: could not open the owner tenant TiDB for this GC
 		// candidate. Record so the warning alert can detect a GC path that is

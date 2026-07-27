@@ -125,12 +125,12 @@ func TestPoolInvalidateSharedDBClosesOnlySelectedHandle(t *testing.T) {
 	if _, ok := pool.sharedDBRefs[1]; ok {
 		t.Fatal("release recreated refs for an invalidated shared DB")
 	}
-	if _, ok := pool.sharedDBLastUsed[1]; ok {
+	if _, ok := pool.sharedDBLastForegroundUsed[1]; ok {
 		t.Fatal("release recreated last-used state for an invalidated shared DB")
 	}
 }
 
-func TestSharedDBHandleIdleReapUsesLongerTTLAndSkipsReferencedHandles(t *testing.T) {
+func TestSharedDBHandleIdleReapWaitsForReferencedHandlesToDrain(t *testing.T) {
 	pool := NewPool(PoolConfig{IdleTimeout: 5 * time.Minute}, nil)
 	t.Cleanup(pool.Close)
 	now := time.Now()
@@ -152,10 +152,10 @@ func TestSharedDBHandleIdleReapUsesLongerTTLAndSkipsReferencedHandles(t *testing
 	pool.sharedDBs[1] = expired
 	pool.sharedDBs[2] = recent
 	pool.sharedDBs[3] = referenced
-	pool.sharedDBLastUsed[1] = now.Add(-defaultSharedDBHandleIdleTTL - time.Second)
-	pool.sharedDBLastUsed[2] = now.Add(-10 * time.Minute)
+	pool.sharedDBLastForegroundUsed[1] = now.Add(-defaultSharedDBHandleIdleTTL - time.Second)
+	pool.sharedDBLastForegroundUsed[2] = now.Add(-10 * time.Minute)
 	pool.retainSharedDB(3)
-	pool.sharedDBLastUsed[3] = now.Add(-defaultSharedDBHandleIdleTTL - time.Second)
+	pool.sharedDBLastForegroundUsed[3] = now.Add(-defaultSharedDBHandleIdleTTL - time.Second)
 
 	pool.reapIdleSharedDBs(now)
 
@@ -173,13 +173,12 @@ func TestSharedDBHandleIdleReapUsesLongerTTLAndSkipsReferencedHandles(t *testing
 	}
 
 	pool.releaseSharedDB(3)
-	releasedAt := pool.sharedDBLastUsed[3]
-	pool.reapIdleSharedDBs(releasedAt.Add(defaultSharedDBHandleIdleTTL + time.Second))
+	pool.reapIdleSharedDBs(now)
 	if _, ok := pool.sharedDBs[3]; ok {
-		t.Fatal("released shared handle remains cached after its no-reference TTL")
+		t.Fatal("foreground-idle shared handle remains cached after references drained")
 	}
 	if err := referenced.Ping(); err == nil {
-		t.Fatal("released shared handle remains open after its no-reference TTL")
+		t.Fatal("foreground-idle shared handle remains open after references drained")
 	}
 }
 
@@ -194,7 +193,7 @@ func TestSharedDBHandleIdleReapRunsWhenTenantIdleEvictionDisabled(t *testing.T) 
 		t.Fatal(err)
 	}
 	p.sharedDBs[1] = db
-	p.sharedDBLastUsed[1] = time.Now().Add(-defaultSharedDBHandleIdleTTL - time.Second)
+	p.sharedDBLastForegroundUsed[1] = time.Now().Add(-defaultSharedDBHandleIdleTTL - time.Second)
 
 	p.reapOnce(context.Background())
 
@@ -314,7 +313,7 @@ func TestSharedDBCacheMetricsDeletedOnIdleReap(t *testing.T) {
 	assertSharedDBCacheMetric(t, `drive9_shared_db_pool_cache_tenants{`+labels+`} 0.000000`, true)
 
 	pool.sharedMu.Lock()
-	pool.sharedDBLastUsed[dbID] = time.Now().Add(-defaultSharedDBHandleIdleTTL - time.Second)
+	pool.sharedDBLastForegroundUsed[dbID] = time.Now().Add(-defaultSharedDBHandleIdleTTL - time.Second)
 	pool.sharedMu.Unlock()
 	pool.reapIdleSharedDBs(time.Now())
 
@@ -1448,6 +1447,269 @@ func TestAcquireCachedDoesNotRefreshSharedCapacityLRU(t *testing.T) {
 	}
 	assertStoreOpen(t, busyStore)
 	assertStoreClosed(t, idleStore)
+}
+
+func TestAcquireForWorkDoesNotDisplaceForegroundCapacityLRU(t *testing.T) {
+	pool, first := newTestPoolAndTenant(t, 2, "tenant-work-lru-first")
+	ctx := context.Background()
+	second := cloneTenantForID(t, pool, first, "tenant-work-lru-second")
+	third := cloneTenantForID(t, pool, first, "tenant-work-lru-third")
+
+	_, releaseFirst, err := pool.AcquireForeground(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseFirst()
+	_, releaseSecond, err := pool.AcquireForeground(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseSecond()
+
+	thirdBackend, releaseThird, err := pool.AcquireForWork(ctx, third)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdStore := thirdBackend.Store()
+	pool.mu.Lock()
+	_, firstCached := pool.items[first.ID]
+	_, secondCached := pool.items[second.ID]
+	_, thirdCached := pool.items[third.ID]
+	pool.mu.Unlock()
+	if !firstCached || !secondCached || thirdCached {
+		t.Fatalf("cache after work miss: first=%t second=%t third=%t, want true true false", firstCached, secondCached, thirdCached)
+	}
+	assertStoreOpen(t, thirdStore)
+	releaseThird()
+	assertStoreClosed(t, thirdStore)
+}
+
+func TestSharedDBIdleReapCascadesTenantEntries(t *testing.T) {
+	pool, first := newTestPoolAndTenant(t, 3, "tenant-shared-cascade-first")
+	ctx := context.Background()
+	second := cloneTenantForID(t, pool, first, "tenant-shared-cascade-second")
+	other := cloneTenantForID(t, pool, first, "tenant-shared-cascade-other")
+
+	firstBackend, releaseFirst, err := pool.AcquireForeground(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseFirst()
+	secondBackend, releaseSecond, err := pool.AcquireForeground(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseSecond()
+	otherBackend, releaseOther, err := pool.AcquireForeground(ctx, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseOther()
+
+	expiredHandle, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recentHandle, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := expiredHandle.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	if err := recentHandle.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	const expiredDBID int64 = 101
+	const recentDBID int64 = 202
+	now := time.Now()
+	pool.mu.Lock()
+	pool.items[first.ID].sharedDBID = expiredDBID
+	pool.items[second.ID].sharedDBID = expiredDBID
+	pool.items[other.ID].sharedDBID = recentDBID
+	pool.mu.Unlock()
+	pool.sharedMu.Lock()
+	pool.sharedDBs[expiredDBID] = expiredHandle
+	pool.sharedDBs[recentDBID] = recentHandle
+	pool.sharedDBRefs[expiredDBID] = 2
+	pool.sharedDBRefs[recentDBID] = 1
+	pool.sharedDBLastForegroundUsed[expiredDBID] = now.Add(-defaultSharedDBHandleIdleTTL - time.Second)
+	pool.sharedDBLastForegroundUsed[recentDBID] = now
+	pool.sharedMu.Unlock()
+
+	pool.reapOnce(ctx)
+
+	pool.mu.Lock()
+	_, firstCached := pool.items[first.ID]
+	_, secondCached := pool.items[second.ID]
+	_, otherCached := pool.items[other.ID]
+	pool.mu.Unlock()
+	if firstCached || secondCached || !otherCached {
+		t.Fatalf("cache after shared cascade: first=%t second=%t other=%t, want false false true", firstCached, secondCached, otherCached)
+	}
+	assertStoreClosed(t, firstBackend.Store())
+	assertStoreClosed(t, secondBackend.Store())
+	assertStoreOpen(t, otherBackend.Store())
+	if err := expiredHandle.Ping(); err == nil {
+		t.Fatal("expired physical shared handle remains open")
+	}
+	if err := recentHandle.Ping(); err != nil {
+		t.Fatalf("recent physical shared handle closed: %v", err)
+	}
+}
+
+func TestSharedDBIdleReapDefersActiveEntryClose(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-shared-cascade-active")
+	ctx := context.Background()
+	backend, release, err := pool.AcquireForeground(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	const dbID int64 = 303
+	now := time.Now()
+	pool.mu.Lock()
+	pool.items[tenant.ID].sharedDBID = dbID
+	pool.mu.Unlock()
+	pool.sharedMu.Lock()
+	pool.sharedDBs[dbID] = handle
+	pool.sharedDBRefs[dbID] = 1
+	pool.sharedDBLastForegroundUsed[dbID] = now.Add(-defaultSharedDBHandleIdleTTL - time.Second)
+	pool.sharedMu.Unlock()
+
+	pool.reapOnce(ctx)
+	pool.mu.Lock()
+	_, cached := pool.items[tenant.ID]
+	pool.mu.Unlock()
+	if cached {
+		t.Fatal("active shared entry remains in capacity LRU after cascade")
+	}
+	assertStoreOpen(t, backend.Store())
+	if err := handle.Ping(); err != nil {
+		t.Fatalf("physical handle closed while tenant entry is active: %v", err)
+	}
+
+	release()
+	assertStoreClosed(t, backend.Store())
+	pool.reapIdleSharedDBs(now)
+	if err := handle.Ping(); err == nil {
+		t.Fatal("physical handle remains open after active entry release")
+	}
+}
+
+func TestSharedDBForegroundActivityControlsIdleReap(t *testing.T) {
+	tests := []struct {
+		name       string
+		acquire    func(*Pool, context.Context, *meta.Tenant) (*backend.Dat9Backend, func(), error)
+		wantCached bool
+		wantDBOpen bool
+	}{
+		{
+			name: "foreground refreshes physical ttl",
+			acquire: func(pool *Pool, ctx context.Context, tenant *meta.Tenant) (*backend.Dat9Backend, func(), error) {
+				return pool.AcquireForeground(ctx, tenant)
+			},
+			wantCached: true,
+			wantDBOpen: true,
+		},
+		{
+			name: "background work does not refresh physical ttl",
+			acquire: func(pool *Pool, ctx context.Context, tenant *meta.Tenant) (*backend.Dat9Backend, func(), error) {
+				return pool.AcquireForWork(ctx, tenant)
+			},
+			wantCached: false,
+			wantDBOpen: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool, tenant := newTestPoolAndTenant(t, 2, "tenant-shared-activity-"+strings.ReplaceAll(tt.name, " ", "-"))
+			ctx := context.Background()
+			_, initialRelease, err := pool.AcquireForeground(ctx, tenant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			initialRelease()
+
+			handle, err := sql.Open("mysql", testDSN)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := handle.Ping(); err != nil {
+				t.Fatal(err)
+			}
+			const dbID int64 = 404
+			pool.mu.Lock()
+			pool.items[tenant.ID].sharedDBID = dbID
+			pool.mu.Unlock()
+			pool.sharedMu.Lock()
+			pool.sharedDBs[dbID] = handle
+			pool.sharedDBRefs[dbID] = 1
+			pool.sharedDBLastForegroundUsed[dbID] = time.Now().Add(-defaultSharedDBHandleIdleTTL - time.Second)
+			pool.sharedMu.Unlock()
+
+			_, release, err := tt.acquire(pool, ctx, tenant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			release()
+			pool.reapOnce(ctx)
+
+			pool.mu.Lock()
+			_, cached := pool.items[tenant.ID]
+			pool.mu.Unlock()
+			if cached != tt.wantCached {
+				t.Fatalf("tenant cached=%t, want %t", cached, tt.wantCached)
+			}
+			err = handle.Ping()
+			if tt.wantDBOpen && err != nil {
+				t.Fatalf("foreground-active physical handle closed: %v", err)
+			}
+			if !tt.wantDBOpen && err == nil {
+				t.Fatal("work-only physical handle remains open after foreground ttl expired")
+			}
+		})
+	}
+}
+
+func TestAcquireForWorkRefreshesStandaloneIdleTTL(t *testing.T) {
+	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
+		MaxTenants:  2,
+		IdleTimeout: 50 * time.Millisecond,
+	}, "tenant-work-standalone-idle")
+	ctx := context.Background()
+	b, release, err := pool.AcquireForeground(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+
+	pool.mu.Lock()
+	pool.items[tenant.ID].lastUsed = time.Now().Add(-time.Second)
+	pool.mu.Unlock()
+	workBackend, workRelease, err := pool.AcquireForWork(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workBackend != b {
+		t.Fatal("expected background work to reuse standalone backend")
+	}
+	workRelease()
+
+	pool.reapOnce(ctx)
+	pool.mu.Lock()
+	_, cached := pool.items[tenant.ID]
+	pool.mu.Unlock()
+	if !cached {
+		t.Fatal("standalone backend reaped immediately after background work")
+	}
+	assertStoreOpen(t, b.Store())
 }
 
 func TestCloseEntryPreservesLiveTenantCounters(t *testing.T) {
