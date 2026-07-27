@@ -292,7 +292,7 @@ type Server struct {
 	// Unified tenant outbox components. The tenantOutboxPoller reads the
 	// central tenant_notify_outbox table (in the always-provisioned meta DB)
 	// on every pod and dispatches by work_mask: SSE bits wake the local bus;
-	// semantic/file_gc/quota bits kick the tenantWorker on the shard owner.
+	// semantic/file_gc bits kick the tenantWorker on the shard owner.
 	// The shardResolver determines shard ownership via jump consistent hashing
 	// over the active pod ring. The podRegistry maintains this pod's presence
 	// and subscriber set in the central DB. All run on every pod (not
@@ -421,6 +421,7 @@ func NewWithConfig(cfg Config) *Server {
 	if logger == nil {
 		logger, _ = zap.NewProduction()
 	}
+	metrics.SetFeatureEnabled("vault", len(cfg.VaultMasterKey) > 0)
 	metrics.SetModuleAvailability("vault", false)
 	var vaultMK *vault.MasterKey
 	if len(cfg.VaultMasterKey) > 0 {
@@ -794,13 +795,24 @@ func (s *Server) insertTenantNotify(tenantID string, workMask int) {
 	}
 }
 
+// clearLocalTenantMetrics immediately clears this process after a
+// deleting/deleted lifecycle transition. The meta-store transition writes the
+// WorkMetricsCleanup outbox row in the same transaction, so this helper must
+// not enqueue a second best-effort signal through the coalescer.
+func (s *Server) clearLocalTenantMetrics(tenantID string) {
+	if tenantID == "" {
+		return
+	}
+	metrics.DeleteTenantCounters(tenantID)
+}
+
 // startNotifyInfrastructure launches the unified tenant outbox components
 // that run on every pod (not leader-gated):
 //   - shardResolver: refreshes the active pod ring for jump-consistent-hash
-//     shard ownership of semantic/file_gc/quota work.
+//     shard ownership of semantic/file_gc work.
 //   - tenantOutboxPoller: reads the central tenant_notify_outbox table at
 //     200ms intervals and dispatches by work_mask (SSE → wake local bus;
-//     semantic/file_gc/quota → kick tenantWorker on shard owner).
+//     semantic/file_gc → kick tenantWorker on shard owner).
 //   - podRegistry: maintains this pod's presence in pod_registry and reports
 //     its SSE subscriber tenant set to pod_subscriptions.
 //
@@ -2051,13 +2063,13 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
-	setRequestMetricTenant(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, resolved.TiDBCloudOrgID, classifyTenantRequest(r))
 	if resolved.APIKey.Status != meta.APIKeyActive {
 		metricEvent(r.Context(), "auth", "result", "key_inactive")
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_inactive", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "status", resolved.APIKey.Status)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
+	setRequestMetricTenantForAuthStatus(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, resolved.TiDBCloudOrgID, resolved.Tenant.Status, classifyTenantRequest(r))
 	plain, err := poolDecryptToken(r.Context(), s.pool, resolved.APIKey.JWTCiphertext)
 	if err != nil {
 		metricEvent(r.Context(), "auth", "result", "decrypt_failed")

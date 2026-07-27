@@ -8,6 +8,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"go.uber.org/zap"
 )
@@ -99,6 +100,7 @@ func (s *Server) reconcileStuckManagedSharedDBPoolsWithCtx(ctx context.Context) 
 						return failErr
 					}
 					if changed {
+						metrics.RecordSharedDBPoolStuckMarkedFailed(status)
 						logger.Warn(claimCtx, "managed_shared_db_pool_stuck_failed", zap.Int64("db_pool_id", row.ID),
 							zap.String("db_pool_uuid", row.UUID), zap.String("status", status),
 							zap.Int("tenant_count", len(failed.TenantIDs)), zap.Duration("stuck_timeout", timeout))

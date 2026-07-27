@@ -624,6 +624,10 @@ func TestManagedSharedDBUpdatedAtTracksProgressNotNoOpPolls(t *testing.T) {
 	if err := s.UpdateManagedSharedDBPoolCloudResult(ctx, partial); err != nil {
 		t.Fatalf("persist initial partial metadata: %v", err)
 	}
+	var initialStatusUpdatedAt time.Time
+	if err := s.DB().QueryRowContext(ctx, `SELECT status_updated_at FROM db_pool WHERE db_id = ?`, dbID).Scan(&initialStatusUpdatedAt); err != nil {
+		t.Fatalf("read initial status_updated_at: %v", err)
+	}
 	stuckAt := time.Now().UTC().Add(-20 * time.Minute).Truncate(time.Millisecond)
 	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, stuckAt, dbID); err != nil {
 		t.Fatalf("age pending pool: %v", err)
@@ -639,6 +643,13 @@ func TestManagedSharedDBUpdatedAtTracksProgressNotNoOpPolls(t *testing.T) {
 		t.Fatalf("no-op poll updated pool to status=%s updated_at=%s, want pending at %s",
 			unchanged.Status, unchanged.UpdatedAt, stuckAt)
 	}
+	var unchangedStatusUpdatedAt time.Time
+	if err := s.DB().QueryRowContext(ctx, `SELECT status_updated_at FROM db_pool WHERE db_id = ?`, dbID).Scan(&unchangedStatusUpdatedAt); err != nil {
+		t.Fatalf("read unchanged status_updated_at: %v", err)
+	}
+	if !unchangedStatusUpdatedAt.Equal(initialStatusUpdatedAt) {
+		t.Fatalf("no-op poll reset status_updated_at from %s to %s", initialStatusUpdatedAt, unchangedStatusUpdatedAt)
+	}
 	ready := *partial
 	ready.Host = "shared.example.com"
 	ready.Port = 4000
@@ -653,6 +664,13 @@ func TestManagedSharedDBUpdatedAtTracksProgressNotNoOpPolls(t *testing.T) {
 	if progressed.Status != SharedDBStatusProvisioning || !progressed.UpdatedAt.After(stuckAt) {
 		t.Fatalf("metadata progress left pool status=%s updated_at=%s, want provisioning after %s",
 			progressed.Status, progressed.UpdatedAt, stuckAt)
+	}
+	var progressedStatusUpdatedAt time.Time
+	if err := s.DB().QueryRowContext(ctx, `SELECT status_updated_at FROM db_pool WHERE db_id = ?`, dbID).Scan(&progressedStatusUpdatedAt); err != nil {
+		t.Fatalf("read progressed status_updated_at: %v", err)
+	}
+	if !progressedStatusUpdatedAt.After(initialStatusUpdatedAt) {
+		t.Fatalf("status transition did not advance status_updated_at: initial=%s progressed=%s", initialStatusUpdatedAt, progressedStatusUpdatedAt)
 	}
 }
 

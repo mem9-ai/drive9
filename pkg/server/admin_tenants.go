@@ -380,6 +380,7 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		if hasJob {
+			s.clearLocalTenantMetrics(t.ID)
 			_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
 			writeJSON(w, http.StatusAccepted, adminTenantDeleteResponse{TenantID: t.ID, Status: string(meta.TenantDeleting)})
 			return

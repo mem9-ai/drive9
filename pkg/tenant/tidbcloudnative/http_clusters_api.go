@@ -44,6 +44,7 @@ func (a *HTTPClustersAPI) CreateCluster(ctx context.Context, publicKey, privateK
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if !httpStatusOK(resp.StatusCode) {
+		recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationCreateCluster, resp.StatusCode, true)
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
 			return nil, readErr
@@ -52,9 +53,16 @@ func (a *HTTPClustersAPI) CreateCluster(ctx context.Context, publicKey, privateK
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationCreateCluster, tidbCloudResultProtocolError)
 		return nil, readErr
 	}
-	return parseClusterInfo(raw)
+	info, err := parseClusterInfo(raw)
+	if err != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationCreateCluster, tidbCloudResultProtocolError)
+		return nil, err
+	}
+	recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationCreateCluster, tidbCloudResultOK)
+	return info, nil
 }
 
 func (a *HTTPClustersAPI) BatchCreateClusters(ctx context.Context, publicKey, privateKey string, body []byte) ([]clusterInfo, error) {
@@ -67,6 +75,7 @@ func (a *HTTPClustersAPI) BatchCreateClusters(ctx context.Context, publicKey, pr
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if !httpStatusOK(resp.StatusCode) {
+		recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationBatchCreateClusters, resp.StatusCode, true)
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
 			return nil, readErr
@@ -75,12 +84,15 @@ func (a *HTTPClustersAPI) BatchCreateClusters(ctx context.Context, publicKey, pr
 	}
 	raw, err := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if err != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationBatchCreateClusters, tidbCloudResultProtocolError)
 		return nil, err
 	}
 	var created clusterListResponse
 	if err := json.Unmarshal(raw, &created); err != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationBatchCreateClusters, tidbCloudResultProtocolError)
 		return nil, err
 	}
+	recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationBatchCreateClusters, tidbCloudResultOK)
 	return created.Clusters, nil
 }
 
@@ -99,6 +111,7 @@ func (a *HTTPClustersAPI) GetCluster(ctx context.Context, publicKey, privateKey,
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if !httpStatusOK(resp.StatusCode) {
+		recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationGetCluster, resp.StatusCode, true)
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
 			return nil, fmt.Errorf("read cluster get error body: %w", readErr)
@@ -107,15 +120,18 @@ func (a *HTTPClustersAPI) GetCluster(ctx context.Context, publicKey, privateKey,
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationGetCluster, tidbCloudResultProtocolError)
 		return nil, fmt.Errorf("read cluster body: %w", readErr)
 	}
 	info, err := parseClusterInfo(raw)
 	if err != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationGetCluster, tidbCloudResultProtocolError)
 		return nil, fmt.Errorf("parse cluster info: %w", err)
 	}
 	if info.Labels == nil {
 		info.Labels = make(map[string]string)
 	}
+	recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationGetCluster, tidbCloudResultOK)
 	return info, nil
 }
 
@@ -133,6 +149,7 @@ func (a *HTTPClustersAPI) ListClusters(ctx context.Context, publicKey, privateKe
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if !httpStatusOK(resp.StatusCode) {
+		recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationListClusters, resp.StatusCode, true)
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
 			return nil, "", fmt.Errorf("read cluster list error body: %w", readErr)
@@ -141,12 +158,15 @@ func (a *HTTPClustersAPI) ListClusters(ctx context.Context, publicKey, privateKe
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationListClusters, tidbCloudResultProtocolError)
 		return nil, "", fmt.Errorf("read cluster list body: %w", readErr)
 	}
 	list, err := parseClusterList(raw)
 	if err != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationListClusters, tidbCloudResultProtocolError)
 		return nil, "", fmt.Errorf("parse cluster list: %w", err)
 	}
+	recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationListClusters, tidbCloudResultOK)
 	return list.Clusters, strings.TrimSpace(list.NextPageToken), nil
 }
 
@@ -165,12 +185,14 @@ func (a *HTTPClustersAPI) PatchCluster(ctx context.Context, publicKey, privateKe
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if !httpStatusOK(resp.StatusCode) {
+		recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationUpdateCluster, resp.StatusCode, true)
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
 			return fmt.Errorf("read cluster patch error body: %w", readErr)
 		}
 		return newAPIStatusError("cluster patch", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
+	recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationUpdateCluster, tidbCloudResultOK)
 	return nil
 }
 
@@ -189,8 +211,10 @@ func (a *HTTPClustersAPI) DeleteCluster(ctx context.Context, publicKey, privateK
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationDeleteCluster, tidbCloudResultOK)
 		return nil
 	}
+	recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationDeleteCluster, resp.StatusCode, false)
 	raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 	if readErr != nil {
 		return readErr
@@ -209,6 +233,7 @@ func (a *HTTPClustersAPI) CreateBranch(ctx context.Context, publicKey, privateKe
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationCreateBranch, resp.StatusCode, true)
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
 			return nil, readErr
@@ -217,9 +242,16 @@ func (a *HTTPClustersAPI) CreateBranch(ctx context.Context, publicKey, privateKe
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationCreateBranch, tidbCloudResultProtocolError)
 		return nil, readErr
 	}
-	return parseBranchInfo(raw)
+	info, err := parseBranchInfo(raw)
+	if err != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationCreateBranch, tidbCloudResultProtocolError)
+		return nil, err
+	}
+	recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationCreateBranch, tidbCloudResultOK)
+	return info, nil
 }
 
 func (a *HTTPClustersAPI) GetBranch(ctx context.Context, publicKey, privateKey, clusterID, branchID string) (*branchInfo, error) {
@@ -233,6 +265,7 @@ func (a *HTTPClustersAPI) GetBranch(ctx context.Context, publicKey, privateKey, 
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
+		recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationGetBranch, resp.StatusCode, true)
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
 			return nil, readErr
@@ -241,9 +274,16 @@ func (a *HTTPClustersAPI) GetBranch(ctx context.Context, publicKey, privateKey, 
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationGetBranch, tidbCloudResultProtocolError)
 		return nil, readErr
 	}
-	return parseBranchInfo(raw)
+	info, err := parseBranchInfo(raw)
+	if err != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationGetBranch, tidbCloudResultProtocolError)
+		return nil, err
+	}
+	recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationGetBranch, tidbCloudResultOK)
+	return info, nil
 }
 
 func (a *HTTPClustersAPI) DeleteBranch(ctx context.Context, publicKey, privateKey, clusterID, branchID string) error {
@@ -257,8 +297,10 @@ func (a *HTTPClustersAPI) DeleteBranch(ctx context.Context, publicKey, privateKe
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationDeleteBranch, tidbCloudResultOK)
 		return nil
 	}
+	recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationDeleteBranch, resp.StatusCode, false)
 	raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 	if readErr != nil {
 		return readErr
@@ -279,6 +321,7 @@ func (a *HTTPClustersAPI) ResolveAPIKey(ctx context.Context, publicKey, privateK
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if !httpStatusOK(resp.StatusCode) {
+		recordTiDBCloudHTTPResponse(tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, resp.StatusCode, true)
 		_, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
 			return nil, readErr
@@ -291,25 +334,33 @@ func (a *HTTPClustersAPI) ResolveAPIKey(ctx context.Context, publicKey, privateK
 		Role      string `json:"role"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, upstreamClusterBodyLimit)).Decode(&info); err != nil {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultProtocolError)
 		return nil, fmt.Errorf("decode IAM API key response: %w", err)
 	}
 	if strings.TrimSpace(info.AccessKey) != publicKey {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultProtocolError)
 		return nil, fmt.Errorf("IAM API key response does not match request credentials")
 	}
 	parts := strings.Split(strings.Trim(strings.TrimSpace(info.Name), "/"), "/")
 	if len(parts) < 2 || parts[0] != "orgs" || strings.TrimSpace(parts[1]) == "" {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultProtocolError)
 		return nil, fmt.Errorf("IAM API key response is missing organization")
 	}
 	role := strings.TrimSpace(info.Role)
 	if role != tenant.TiDBCloudRoleOrgOwner && role != tenant.TiDBCloudRoleProjectOwner {
+		recordTiDBCloudOpenAPIRequest(tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultProtocolError)
 		return nil, fmt.Errorf("%w: role %q; org:owner or project:owner is required", tenant.ErrTiDBCloudRoleInsufficient, role)
 	}
+	recordTiDBCloudOpenAPIRequest(tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultOK)
 	return &tenant.TiDBCloudAPIKeyIdentity{OrganizationID: strings.TrimSpace(parts[1]), Role: role}, nil
 }
 
 func (a *HTTPClustersAPI) doDigestAuthRequest(ctx context.Context, publicKey, privateKey, method, uri string, body []byte) (*http.Response, error) {
+	api := tidbCloudAPIForRequest(uri)
+	operation := tidbCloudOperationForRequest(method, uri)
 	req, err := http.NewRequestWithContext(ctx, method, uri, bytes.NewReader(body))
 	if err != nil {
+		recordTiDBCloudOpenAPIRequest(api, operation, tidbCloudResultProtocolError)
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -318,6 +369,7 @@ func (a *HTTPClustersAPI) doDigestAuthRequest(ctx context.Context, publicKey, pr
 	resp, err := a.client.Do(req)
 	if err != nil {
 		err = redactRequestError(err, uri)
+		recordTiDBCloudOpenAPIRequest(api, operation, tiDBCloudRequestErrorResult(err))
 		logger.Error(ctx, "tidbcloud_api_request",
 			zap.String("method", method),
 			zap.String("path", requestPath(uri)),
@@ -339,14 +391,17 @@ func (a *HTTPClustersAPI) doDigestAuthRequest(ctx context.Context, publicKey, pr
 	wwwAuth := resp.Header.Get("WWW-Authenticate")
 	nonce, realm, qop := parseDigestChallenge(wwwAuth)
 	if nonce == "" {
+		recordTiDBCloudOpenAPIRequest(api, operation, tidbCloudResultDigestError)
 		return nil, fmt.Errorf("invalid digest challenge")
 	}
 	auth, err := buildDigestAuth(publicKey, privateKey, method, uri, nonce, realm, qop)
 	if err != nil {
+		recordTiDBCloudOpenAPIRequest(api, operation, tidbCloudResultDigestError)
 		return nil, err
 	}
 	req2, err := http.NewRequestWithContext(ctx, method, uri, bytes.NewReader(body))
 	if err != nil {
+		recordTiDBCloudOpenAPIRequest(api, operation, tidbCloudResultProtocolError)
 		return nil, err
 	}
 	req2.Header.Set("Content-Type", "application/json")
@@ -355,6 +410,7 @@ func (a *HTTPClustersAPI) doDigestAuthRequest(ctx context.Context, publicKey, pr
 	resp2, err := a.client.Do(req2)
 	if err != nil {
 		err = redactRequestError(err, uri)
+		recordTiDBCloudOpenAPIRequest(api, operation, tiDBCloudRequestErrorResult(err))
 		logger.Error(ctx, "tidbcloud_api_request",
 			zap.String("method", method),
 			zap.String("path", requestPath(uri)),

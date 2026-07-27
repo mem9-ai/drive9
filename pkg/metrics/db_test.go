@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -236,6 +237,49 @@ func TestDBPoolConnectionsIncludesTenantPoolsWithOpenConnections(t *testing.T) {
 	out := renderDB(t)
 	if !strings.Contains(out, `drive9_db_pool_connections{role="user",tenant_id="`+tenantID+`",tidbcloud_org_id="guest",state="open"} 1`) {
 		t.Fatalf("expected tenant pool with open connections to emit pool connection series, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_pool_connections{role="user",tenant_id="`+tenantID+`",tidbcloud_org_id="guest",state="in_use"} 0`) {
+		t.Fatalf("expected tenant pool to retain in-use connection visibility, got:\n%s", out)
+	}
+	for _, state := range []string{"idle", "max_open"} {
+		if strings.Contains(out, `drive9_db_pool_connections{role="user",tenant_id="`+tenantID+`",tidbcloud_org_id="guest",state="`+state+`"}`) {
+			t.Fatalf("tenant pool unexpectedly exported per-tenant %s configuration series:\n%s", state, out)
+		}
+	}
+	if !strings.Contains(out, `drive9_db_pool_connections{role="user",state="max_open"} 1`) {
+		t.Fatalf("expected one role-level max_open series, got:\n%s", out)
+	}
+}
+
+func TestDBPoolConnectionsDoesNotDuplicateRoleAggregateForMixedPools(t *testing.T) {
+	const role = "mixed-db-aggregate"
+	healthy := &atomic.Bool{}
+	healthy.Store(true)
+	unscoped := sql.OpenDB(fakeConnector{healthy: healthy})
+	tenantScoped := sql.OpenDB(fakeConnector{healthy: healthy})
+	unscoped.SetMaxOpenConns(2)
+	tenantScoped.SetMaxOpenConns(3)
+	t.Cleanup(func() {
+		UnregisterDB(unscoped)
+		UnregisterDB(tenantScoped)
+		_ = unscoped.Close()
+		_ = tenantScoped.Close()
+	})
+
+	RegisterDB(role, unscoped)
+	RegisterTenantDB(role, "mixed-db-aggregate-tenant", tenantScoped)
+	out := renderDB(t)
+	for _, tc := range []struct {
+		state string
+		value int
+	}{
+		{state: "in_use", value: 0},
+		{state: "max_open", value: 5},
+	} {
+		line := fmt.Sprintf(`drive9_db_pool_connections{role="%s",state="%s"} %d`, role, tc.state, tc.value)
+		if got := strings.Count(out, line); got != 1 {
+			t.Fatalf("role aggregate %s = %d occurrences, want one value %d:\n%s", tc.state, got, tc.value, out)
+		}
 	}
 }
 

@@ -1082,8 +1082,10 @@ func (s *Server) stageSharedPoolTenantWave(ctx context.Context, poolID, organiza
 	}
 	created, err := s.meta.CreateManagedSharedDBPoolTenantWaveWithResize(ctx, plans, resize)
 	if err != nil {
+		metrics.RecordSharedDBPoolWave(metrics.ResultForError(err), len(plans), count)
 		return nil, err
 	}
+	metrics.RecordSharedDBPoolWave("ok", len(created), count)
 	partitions := make([]sharedPoolTenantPartition, 0, len(created))
 	for _, result := range created {
 		row, loadErr := s.meta.GetSharedDB(ctx, result.DBID)
@@ -1734,6 +1736,8 @@ func (s *Server) cleanupPoolProvisionedClusters(ctx context.Context, clusters []
 		if err := s.meta.MarkTenantDeleted(cleanupCtx, tenantID); err != nil {
 			logger.Warn(cleanupCtx, "admin_tenant_pool_cleanup_mark_deleted_failed", zap.String("tenant_id", tenantID), zap.String("reason", reason), zap.Error(err))
 			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+		} else {
+			s.clearLocalTenantMetrics(tenantID)
 		}
 	}
 }
@@ -1831,6 +1835,7 @@ func (s *Server) deleteNewestFreePoolTenants(ctx context.Context, poolID, organi
 				_ = s.meta.UpdateTenantStatus(context.Background(), t.ID, meta.TenantFailed)
 				return deleted, err
 			}
+			s.clearLocalTenantMetrics(t.ID)
 		}
 		deleted++
 		if !deleteAll {
@@ -1905,6 +1910,8 @@ func (s *Server) cleanupCreatedPoolTenants(ctx context.Context, results []*provi
 		_ = s.meta.RevokeTenantAPIKeys(cleanupCtx, tenantID)
 		if err := s.meta.MarkTenantDeleted(cleanupCtx, tenantID); err != nil {
 			logger.Warn(cleanupCtx, "admin_tenant_pool_cleanup_mark_deleted_failed", zap.String("tenant_id", tenantID), zap.String("reason", reason), zap.Error(err))
+		} else {
+			s.clearLocalTenantMetrics(tenantID)
 		}
 	}
 }
