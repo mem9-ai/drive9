@@ -578,6 +578,15 @@ func (p *Pool) WaitTenantIdle(ctx context.Context, tenantID string) error {
 // fresh Acquire with the updated policy. This is acceptable because policy
 // changes are rare and the tenant's tasks remain durable in its TiDB.
 func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release func(), ok bool) {
+	return p.acquireCached(t, false)
+}
+
+// acquireCached pins an existing tenant backend without cold-opening it. When
+// refreshActivity is true, the warm hit is real tenant activity: it promotes
+// the capacity LRU and refreshes tenant and physical shared-DB idle state.
+// AcquireCached passes false for safety-net observation; the local S3 gateway
+// passes true after resolving the tenant from a presigned URL.
+func (p *Pool) acquireCached(t *meta.Tenant, refreshActivity bool) (b *backend.Dat9Backend, release func(), ok bool) {
 	if p == nil || t == nil {
 		return nil, nil, false
 	}
@@ -590,24 +599,37 @@ func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release fu
 	e, exists := p.items[t.ID]
 	if !exists {
 		p.mu.Unlock()
-		// Cold-skip: the tenant is not cached (TiDB likely scaled to zero).
-		// This is the warm-only invariant working as designed — the safety-net
-		// must never open a cold tenant TiDB. Record so the invariant-violation
-		// alert can confirm AcquireCached is staying warm-only.
-		metrics.RecordTenantOperationWithOrg(t.ID, "", "user_db_access", "acquire_cached", "cold_skipped", 0)
+		if !refreshActivity {
+			// Cold-skip: the tenant is not cached (TiDB likely scaled to zero).
+			// This is the warm-only invariant working as designed — the safety-net
+			// must never open a cold tenant TiDB. Record so the invariant-violation
+			// alert can confirm AcquireCached is staying warm-only.
+			metrics.RecordTenantOperationWithOrg(t.ID, "", "user_db_access", "acquire_cached", "cold_skipped", 0)
+		}
 		return nil, nil, false
 	}
 	if e.s3EncryptionPolicy != s3EncryptionPolicy || (t.StorageNamespaceID != "" && e.storageNamespaceID != t.StorageNamespaceID) {
 		p.mu.Unlock()
-		// Stale-skip: the cached backend's encryption policy / storage namespace
-		// no longer matches the tenant. The safety-net defers to the next write
-		// kick. Record so this rare edge case is observable.
-		metrics.RecordTenantOperationWithOrg(t.ID, e.backend.TiDBCloudOrgID(), "user_db_access", "acquire_cached", "stale_skipped", 0)
+		if !refreshActivity {
+			// Stale-skip: the cached backend's encryption policy / storage namespace
+			// no longer matches the tenant. The safety-net defers to the next write
+			// kick. Record so this rare edge case is observable.
+			metrics.RecordTenantOperationWithOrg(t.ID, e.backend.TiDBCloudOrgID(), "user_db_access", "acquire_cached", "stale_skipped", 0)
+		}
 		return nil, nil, false
 	}
 	e.refs++
+	if refreshActivity {
+		now := time.Now()
+		p.order.MoveToFront(e.elem)
+		p.touchSharedDBActivityLocked(e.sharedDBID, now)
+		e.lastUsed = now
+	}
 	p.mu.Unlock()
 	metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
+	if refreshActivity {
+		return e.backend, p.makeRelease(e), true
+	}
 	metrics.RecordTenantOperationWithOrg(t.ID, e.backend.TiDBCloudOrgID(), "user_db_access", "acquire_cached", "hit", 0)
 	return e.backend, p.makeReleaseNoRefresh(e), true
 }
@@ -875,6 +897,10 @@ func (p *Pool) AutoSemanticTaskTypes() []semantic.TaskType {
 	return out
 }
 
+// LoadS3Backend resolves tenant metadata and pins an already-warm backend for
+// one local presigned-URL request. Local mock-S3 URLs do not carry independent
+// tenant authentication, so this path must never cold-open a tenant database.
+// A warm hit is still real activity and refreshes the normal LRU/idle state.
 func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantID string) (out *backend.Dat9Backend, release func()) {
 	start := time.Now()
 	var err error
@@ -887,9 +913,8 @@ func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantI
 		}
 		return nil, nil
 	}
-	b, release, err := p.Acquire(ctx, tenant)
-	if err != nil {
-		logger.Error(ctx, "tenant_pool_get_failed", zap.String("tenant_id", tenantID), zap.Error(err))
+	b, release, ok := p.acquireCached(tenant, true)
+	if !ok {
 		return nil, nil
 	}
 	return b, release

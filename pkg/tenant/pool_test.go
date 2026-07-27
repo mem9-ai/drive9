@@ -99,14 +99,37 @@ func TestLoadS3BackendPinsUseUntilRelease(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = metaStore.Close() })
 	testmysql.ResetMetaDB(t, metaStore.DB())
+	tenant.S3EncryptionMode = meta.S3EncryptionModeInherit
 	if err := metaStore.InsertTenant(context.Background(), tenant); err != nil {
 		t.Fatal(err)
 	}
 	pool.SetMetaStore(metaStore)
 
+	if b, release := pool.LoadS3Backend(context.Background(), metaStore, tenant.ID); b != nil || release != nil {
+		if release != nil {
+			release()
+		}
+		t.Errorf("cold LoadS3Backend returned backend=%t release=%t, want both false", b != nil, release != nil)
+	}
+	_, warmRelease, err := pool.Acquire(context.Background(), tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	warmRelease()
+	oldLastUsed := time.Now().Add(-time.Hour)
+	pool.mu.Lock()
+	pool.items[tenant.ID].lastUsed = oldLastUsed
+	pool.mu.Unlock()
+
 	b, release := pool.LoadS3Backend(context.Background(), metaStore, tenant.ID)
 	if b == nil || release == nil {
 		t.Fatal("LoadS3Backend did not return a pinned backend")
+	}
+	pool.mu.Lock()
+	lastUsed := pool.items[tenant.ID].lastUsed
+	pool.mu.Unlock()
+	if !lastUsed.After(oldLastUsed) {
+		t.Errorf("warm LoadS3Backend lastUsed=%v, want after %v", lastUsed, oldLastUsed)
 	}
 	store := b.Store()
 	pool.Invalidate(tenant.ID)
@@ -1629,7 +1652,7 @@ func TestAcquireCountsBackgroundWorkAsCapacityLRUActivity(t *testing.T) {
 	_, thirdCached := pool.items[third.ID]
 	pool.mu.Unlock()
 	if firstCached || !secondCached || !thirdCached {
-		t.Fatalf("cache after work miss: first=%t second=%t third=%t, want false true true", firstCached, secondCached, thirdCached)
+		t.Errorf("cache after work miss: first=%t second=%t third=%t, want false true true", firstCached, secondCached, thirdCached)
 	}
 	assertStoreOpen(t, thirdStore)
 	releaseThird()
@@ -1701,16 +1724,16 @@ func TestSharedDBIdleReapCascadesTenantEntries(t *testing.T) {
 	_, otherCached := pool.items[other.ID]
 	pool.mu.Unlock()
 	if firstCached || secondCached || !otherCached {
-		t.Fatalf("cache after shared cascade: first=%t second=%t other=%t, want false false true", firstCached, secondCached, otherCached)
+		t.Errorf("cache after shared cascade: first=%t second=%t other=%t, want false false true", firstCached, secondCached, otherCached)
 	}
 	assertStoreClosed(t, firstBackend.Store())
 	assertStoreClosed(t, secondBackend.Store())
 	assertStoreOpen(t, otherBackend.Store())
 	if err := expiredHandle.Ping(); err == nil {
-		t.Fatal("expired physical shared handle remains open")
+		t.Error("expired physical shared handle remains open")
 	}
 	if err := recentHandle.Ping(); err != nil {
-		t.Fatalf("recent physical shared handle closed: %v", err)
+		t.Errorf("recent physical shared handle closed: %v", err)
 	}
 }
 
@@ -1745,18 +1768,18 @@ func TestSharedDBIdleReapDefersActiveEntryClose(t *testing.T) {
 	_, cached := pool.items[tenant.ID]
 	pool.mu.Unlock()
 	if cached {
-		t.Fatal("active shared entry remains in capacity LRU after cascade")
+		t.Error("active shared entry remains in capacity LRU after cascade")
 	}
 	assertStoreOpen(t, backend.Store())
 	if err := handle.Ping(); err != nil {
-		t.Fatalf("physical handle closed while tenant entry is active: %v", err)
+		t.Errorf("physical handle closed while tenant entry is active: %v", err)
 	}
 
 	release()
 	assertStoreClosed(t, backend.Store())
 	pool.reapIdleSharedDBs(now)
 	if err := handle.Ping(); err == nil {
-		t.Fatal("physical handle remains open after active entry release")
+		t.Error("physical handle remains open after active entry release")
 	}
 }
 
@@ -1798,10 +1821,10 @@ func TestAcquireRefreshesSharedDBActivity(t *testing.T) {
 	_, cached := pool.items[tenant.ID]
 	pool.mu.Unlock()
 	if !cached {
-		t.Fatal("tenant cache entry reaped after real activity")
+		t.Error("tenant cache entry reaped after real activity")
 	}
 	if err := handle.Ping(); err != nil {
-		t.Fatalf("active physical handle closed: %v", err)
+		t.Errorf("active physical handle closed: %v", err)
 	}
 }
 
@@ -1825,7 +1848,7 @@ func TestAcquireRefreshesStandaloneIdleTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 	if workBackend != b {
-		t.Fatal("expected background work to reuse standalone backend")
+		t.Error("expected background work to reuse standalone backend")
 	}
 	workRelease()
 
@@ -1834,7 +1857,7 @@ func TestAcquireRefreshesStandaloneIdleTTL(t *testing.T) {
 	_, cached := pool.items[tenant.ID]
 	pool.mu.Unlock()
 	if !cached {
-		t.Fatal("standalone backend reaped immediately after background work")
+		t.Error("standalone backend reaped immediately after background work")
 	}
 	assertStoreOpen(t, b.Store())
 }
