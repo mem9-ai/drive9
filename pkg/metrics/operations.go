@@ -82,7 +82,7 @@ var fuseRemoteOperationBytes = fuseMeter.Int64Counter("drive9_fuse_remote_operat
 var tenantRequestsTotal = tenantMeter.Int64Counter("drive9_tenant_requests_total", "Tenant-scoped requests by tenant/tidbcloud_org/surface/action/status_class")
 var tenantRequestDuration = tenantMeter.Float64Histogram("drive9_tenant_request_duration_seconds", "Tenant request duration histogram by surface/status_class", httpDurationBounds)
 var tenantInflight = tenantMeter.Float64Gauge("drive9_tenant_inflight_requests", "Current in-flight tenant-scoped requests by tenant/tidbcloud_org/surface")
-var tenantHTTPBytes = tenantMeter.Int64Counter("drive9_tenant_http_bytes_total", "Tenant-scoped HTTP transport bytes by tenant/tidbcloud_org/direction")
+var tenantHTTPBytes = tenantMeter.Int64Counter("drive9_tenant_http_bytes_total", "HTTP transport bytes by direction")
 var tenantFileBytes = tenantMeter.Int64Counter("drive9_tenant_file_bytes_total", "Tenant-scoped logical file bytes by tenant/tidbcloud_org/direction")
 var tenantCount = tenantMeter.Float64Gauge("drive9_tenant_count", "Tenant count by status")
 var tenantStorageBytes = tenantMeter.Float64Gauge("drive9_tenant_storage_bytes", "Tenant storage bytes by tenant/tidbcloud_org/state")
@@ -392,6 +392,15 @@ func isOperationFailureResult(result string) bool {
 	}
 }
 
+func tenantAttributedSurface(surface, statusClass string) bool {
+	switch surface {
+	case "fs", "upload", "object_store", "sql", "events", "journal", "git_workspace":
+		return true
+	default:
+		return statusClass == "4xx" || statusClass == "5xx"
+	}
+}
+
 func RecordGauge(component, name string, value float64) {
 	RecordTenantGauge("", component, name, value)
 }
@@ -463,7 +472,7 @@ func RecordHTTPRequestCount(method, route string, status int) {
 	)
 }
 
-// RecordTenantRequestCount records only the tenant request counter, not the
+// RecordTenantRequestCount records only the request counter, not the
 // duration histogram. Companion to RecordHTTPRequestCount for SSE routes.
 func RecordTenantRequestCount(tenantID, surface, action string, status int) {
 	RecordTenantRequestCountWithOrg(tenantID, "", surface, action, status)
@@ -474,13 +483,15 @@ func RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, surface, action s
 	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
 	surface = cleanMetricValue(surface, "other")
 	action = cleanMetricValue(action, "other")
+	statusClass := statusClass(status)
 	RegisterModule("tenant_usage")
 	attrs := []Attribute{
-		Attr("tenant_id", tenantID),
-		Attr("tidbcloud_org_id", tidbCloudOrgID),
 		Attr("surface", surface),
 		Attr("action", action),
-		Attr("status_class", statusClass(status)),
+		Attr("status_class", statusClass),
+	}
+	if tenantAttributedSurface(surface, statusClass) {
+		attrs = append(attrs, Attr("tenant_id", tenantID), Attr("tidbcloud_org_id", tidbCloudOrgID))
 	}
 	tenantRequestsTotal.Add(1, attrs...)
 }
@@ -509,7 +520,7 @@ func RecordTenantEventWithOrg(tenantID, tidbCloudOrgID, event string, labels ...
 	attrs = append(attrs, Attr("event", cleanMetricValue(event, "unknown")))
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
-	if tenantID != "unknown" && tenantAttributedBusinessEvent(event) {
+	if tenantID != "unknown" && tenantAttributedBusinessEvent(event, metricLabelValue(labels, "result")) {
 		attrs = append(attrs, Attr("tenant_id", tenantID), Attr("tidbcloud_org_id", tidbCloudOrgID))
 	}
 	for i := 0; i+1 < len(labels); i += 2 {
@@ -518,13 +529,17 @@ func RecordTenantEventWithOrg(tenantID, tidbCloudOrgID, event string, labels ...
 	businessEventsTotal.Add(1, attrs...)
 }
 
-func tenantAttributedBusinessEvent(event string) bool {
-	switch event {
-	case "auth", "tenant_provision", "tenant_schema_init", "tenant_status":
-		return true
-	default:
-		return false
+func tenantAttributedBusinessEvent(event, result string) bool {
+	return event == "tenant_provision" && isOperationFailureResult(result)
+}
+
+func metricLabelValue(labels []string, key string) string {
+	for i := 0; i+1 < len(labels); i += 2 {
+		if labels[i] == key {
+			return cleanMetricValue(labels[i+1], "unknown")
+		}
 	}
+	return "unknown"
 }
 
 func RecordTenantRequest(tenantID, surface, action string, status int, d time.Duration) {
@@ -542,11 +557,12 @@ func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action string
 	}
 	RegisterModule("tenant_usage")
 	attrs := []Attribute{
-		Attr("tenant_id", tenantID),
-		Attr("tidbcloud_org_id", tidbCloudOrgID),
 		Attr("surface", surface),
 		Attr("action", action),
 		Attr("status_class", statusClass),
+	}
+	if tenantAttributedSurface(surface, statusClass) {
+		attrs = append(attrs, Attr("tenant_id", tenantID), Attr("tidbcloud_org_id", tidbCloudOrgID))
 	}
 	tenantRequestsTotal.Add(1, attrs...)
 	if d <= 0 {
@@ -558,12 +574,8 @@ func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action string
 	)
 }
 
-func RecordTenantHTTPBytes(tenantID, direction string, bytes int64) {
-	RecordTenantHTTPBytesWithOrg(tenantID, "", direction, bytes)
-}
-
-func RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, direction string, bytes int64) {
-	recordTenantHTTPBytes(tenantID, tidbCloudOrgID, direction, bytes)
+func RecordTenantHTTPBytes(direction string, bytes int64) {
+	recordTenantHTTPBytes(direction, bytes)
 }
 
 func RecordTenantFileBytes(tenantID, direction string, bytes int64) {
@@ -748,14 +760,12 @@ func recordTenantBytes(counter *Int64Counter, tenantID, tidbCloudOrgID, directio
 	)
 }
 
-func recordTenantHTTPBytes(tenantID, tidbCloudOrgID, direction string, bytes int64) {
+func recordTenantHTTPBytes(direction string, bytes int64) {
 	if bytes <= 0 {
 		return
 	}
 	RegisterModule("tenant_usage")
 	tenantHTTPBytes.Add(bytes,
-		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
-		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
 		Attr("direction", cleanMetricValue(direction, "unknown")),
 	)
 }

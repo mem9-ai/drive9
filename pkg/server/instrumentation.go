@@ -709,10 +709,10 @@ func recordTenantHTTPRequest(r *http.Request, status int, d time.Duration, respo
 	}
 	metrics.RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, class.surface, class.action, status, d)
 	if r.ContentLength > 0 {
-		metrics.RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, "request", r.ContentLength)
+		metrics.RecordTenantHTTPBytes("request", r.ContentLength)
 	}
 	if responseBytes > 0 {
-		metrics.RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, "response", int64(responseBytes))
+		metrics.RecordTenantHTTPBytes("response", int64(responseBytes))
 	}
 }
 
