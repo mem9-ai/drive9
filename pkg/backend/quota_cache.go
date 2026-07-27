@@ -88,6 +88,21 @@ func quotaConfigCacheRefreshDelay(ttl time.Duration) time.Duration {
 	return ttl - time.Duration(rand.Int64N(int64(maxJitter)+1))
 }
 
+// quotaConfigCacheFailureRetryDelay spreads failed loads symmetrically around
+// the five-second retry target. Unlike successful refreshes, failures may be
+// retried slightly after the target so independently warmed tenants do not
+// converge into a synchronized retry wave.
+func quotaConfigCacheFailureRetryDelay(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return 0
+	}
+	jitter := ttl / 10
+	if jitter <= 0 {
+		return ttl
+	}
+	return ttl - jitter + time.Duration(rand.Int64N(int64(2*jitter)+1))
+}
+
 // quotaConfigCache is a passive per-tenant cache for low-frequency quota
 // config. Requests refresh an expired snapshot; idle tenants create no
 // goroutines and issue no quota queries.
@@ -164,8 +179,37 @@ func (c *quotaConfigCache) get(ctx context.Context) *QuotaConfigView {
 	c.mu.Unlock()
 
 	start := now
+	if stale := c.snapshotCopy(); stale != nil {
+		go func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					logger.Error(context.Background(), "quota_config_cache_async_load_panicked",
+						zap.String("tenant_id", c.tenantID), zap.Any("panic", recovered))
+				}
+			}()
+			c.loadConfig(context.WithoutCancel(ctx), start)
+		}()
+		return stale
+	}
+	return c.loadConfig(ctx, start)
+}
+
+func (c *quotaConfigCache) snapshotCopy() *QuotaConfigView {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return cloneQuotaConfigView(c.snapshot)
+}
+
+func (c *quotaConfigCache) loadConfig(ctx context.Context, start time.Time) (result *QuotaConfigView) {
 	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quotaConfigCacheLoadTimeout)
 	defer cancel()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			c.finishPanickedLoad(start)
+			panic(recovered)
+		}
+	}()
+
 	cfg, err := c.store.GetQuotaConfig(loadCtx, c.tenantID)
 	if err != nil {
 		logger.Warn(loadCtx, "quota_config_cache_config_failed",
@@ -186,7 +230,7 @@ func (c *quotaConfigCache) get(ctx context.Context) *QuotaConfigView {
 
 func (c *quotaConfigCache) finishFailedLoad(start time.Time, result string) *QuotaConfigView {
 	c.mu.Lock()
-	c.nextRefresh = time.Now().Add(quotaConfigCacheFailureRetryInterval)
+	c.nextRefresh = time.Now().Add(quotaConfigCacheFailureRetryDelay(quotaConfigCacheFailureRetryInterval))
 	var stale *QuotaConfigView
 	if c.snapshot != nil {
 		stale = cloneQuotaConfigView(c.snapshot)
@@ -195,6 +239,18 @@ func (c *quotaConfigCache) finishFailedLoad(start time.Time, result string) *Quo
 	c.mu.Unlock()
 	metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "load", result, time.Since(start))
 	return stale
+}
+
+func (c *quotaConfigCache) finishPanickedLoad(start time.Time) {
+	c.mu.Lock()
+	if c.loadDone == nil {
+		c.mu.Unlock()
+		return
+	}
+	c.nextRefresh = time.Now().Add(quotaConfigCacheFailureRetryDelay(quotaConfigCacheFailureRetryInterval))
+	c.finishConfigLoadLocked()
+	c.mu.Unlock()
+	metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "load", "panic_error", time.Since(start))
 }
 
 // finishConfigLoadLocked publishes the completed load before waking cold
