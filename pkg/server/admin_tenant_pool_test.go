@@ -357,6 +357,25 @@ func TestSharedTenantPoolRefillReusesExistingPhysicalCapacity(t *testing.T) {
 		t.Fatalf("shared Cloud batch calls = %d, want 0 while existing capacity remains", got)
 	}
 
+	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE db_pool SET tenant_count = 93 WHERE db_id = ?`, dbID); err != nil {
+		t.Fatalf("move existing pool below capacity: %v", err)
+	}
+	results, err = srv.createFreeSharedPoolTenants(ctx, logicalPool.PoolID, 5, tenant.CredentialProvisionRequest{}, nil)
+	if err != nil {
+		t.Fatalf("createFreeSharedPoolTenants below capacity: %v", err)
+	}
+	var softCapReached bool
+	if err := metaStore.DB().QueryRowContext(ctx, `SELECT tenant_count, soft_cap_reached FROM db_pool WHERE db_id = ?`, dbID).
+		Scan(&tenantCount, &softCapReached); err != nil {
+		t.Fatalf("load remaining physical capacity: %v", err)
+	}
+	if tenantCount != 98 || softCapReached {
+		t.Fatalf("tenant count = %d, soft cap reached = %t, want 98 and false", tenantCount, softCapReached)
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 0 {
+		t.Fatalf("shared Cloud batch calls = %d, want 0 before physical capacity is full", got)
+	}
+
 	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE db_pool SET tenant_count = 99 WHERE db_id = ?`, dbID); err != nil {
 		t.Fatalf("move existing pool near capacity: %v", err)
 	}
@@ -388,6 +407,45 @@ func TestSharedTenantPoolRefillReusesExistingPhysicalCapacity(t *testing.T) {
 	}
 	if got := prov.sharedPoolBatchMembers.Load(); got != 1 {
 		t.Fatalf("shared Cloud batch physical pools = %d, want 1 for the capacity remainder", got)
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan error, 2)
+	var waveWG sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		waveWG.Add(1)
+		go func() {
+			defer waveWG.Done()
+			<-start
+			waveResults, waveErr := srv.createFreeSharedPoolTenants(ctx, logicalPool.PoolID, 3, tenant.CredentialProvisionRequest{}, nil)
+			if waveErr == nil {
+				for _, result := range waveResults {
+					if result.Status != meta.TenantPending {
+						waveErr = fmt.Errorf("concurrent wave tenant %s status = %q, want pending", result.TenantID, result.Status)
+						break
+					}
+				}
+			}
+			errCh <- waveErr
+		}()
+	}
+	close(start)
+	waveWG.Wait()
+	close(errCh)
+	for waveErr := range errCh {
+		if waveErr != nil {
+			t.Fatalf("concurrent refill wave: %v", waveErr)
+		}
+	}
+	if err := metaStore.DB().QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(tenant_count), 0)
+		FROM db_pool WHERE org_id = ?`, logicalPool.OrganizationID).Scan(&physicalPools, &tenantCount); err != nil {
+		t.Fatalf("load physical pool inventory after concurrent waves: %v", err)
+	}
+	if physicalPools != 2 || tenantCount != 108 {
+		t.Fatalf("physical pools = %d, tenant count = %d, want 2 and 108 after concurrent waves", physicalPools, tenantCount)
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 1 {
+		t.Fatalf("shared Cloud batch calls = %d, want no extra create from concurrent reuse", got)
 	}
 }
 
