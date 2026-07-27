@@ -19,6 +19,15 @@ const (
 	// quotaConfigCacheLoadTimeout bounds a coalesced refresh independently of
 	// the request that happened to claim load ownership.
 	quotaConfigCacheLoadTimeout = 5 * time.Second
+	// defaultQuotaConfigCacheAsyncRefreshSlots bounds detached warm-cache
+	// refreshes so a MetaDB slowdown cannot create one in-flight query per
+	// resident tenant. Keep headroom in the shared metadata connection pool for
+	// foreground requests and other control-plane work.
+	defaultQuotaConfigCacheAsyncRefreshSlots = 32
+	// quotaConfigCacheSlotRetryInterval prevents a tenant that could not claim
+	// an async refresh slot from retrying on every request while the budget is
+	// exhausted.
+	quotaConfigCacheSlotRetryInterval = time.Second
 	// quotaConfigCacheFailureRetryInterval keeps quota changes responsive after
 	// a transient MetaDB failure. Successful refreshes retain the normal TTL.
 	quotaConfigCacheFailureRetryInterval = 5 * time.Second
@@ -36,9 +45,10 @@ const (
 // quotaConfigCacheRefreshInterval is the resolved refresh interval (package-level
 // var so it can be set from env at startup).
 var (
-	quotaConfigCacheRefreshInterval = defaultQuotaConfigCacheRefreshInterval
-	quotaUsageCacheTTL              = defaultQuotaUsageCacheTTL
-	quotaPendingDeltasCacheTTL      = defaultQuotaPendingDeltasCacheTTL
+	quotaConfigCacheRefreshInterval   = defaultQuotaConfigCacheRefreshInterval
+	quotaUsageCacheTTL                = defaultQuotaUsageCacheTTL
+	quotaPendingDeltasCacheTTL        = defaultQuotaPendingDeltasCacheTTL
+	quotaConfigCacheAsyncRefreshSlots = make(chan struct{}, defaultQuotaConfigCacheAsyncRefreshSlots)
 )
 
 // InitQuotaConfigCacheRefreshInterval overrides the default refresh interval.
@@ -180,7 +190,12 @@ func (c *quotaConfigCache) get(ctx context.Context) *QuotaConfigView {
 
 	start := now
 	if stale := c.snapshotCopy(); stale != nil {
+		if !tryAcquireQuotaConfigAsyncRefreshSlot() {
+			c.deferAsyncRefresh(start)
+			return stale
+		}
 		go func() {
+			defer releaseQuotaConfigAsyncRefreshSlot()
 			defer func() {
 				if recovered := recover(); recovered != nil {
 					logger.Error(context.Background(), "quota_config_cache_async_load_panicked",
@@ -192,6 +207,29 @@ func (c *quotaConfigCache) get(ctx context.Context) *QuotaConfigView {
 		return stale
 	}
 	return c.loadConfig(ctx, start)
+}
+
+func tryAcquireQuotaConfigAsyncRefreshSlot() bool {
+	select {
+	case quotaConfigCacheAsyncRefreshSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseQuotaConfigAsyncRefreshSlot() {
+	<-quotaConfigCacheAsyncRefreshSlots
+}
+
+func (c *quotaConfigCache) deferAsyncRefresh(start time.Time) {
+	c.mu.Lock()
+	if c.loadDone != nil {
+		c.nextRefresh = time.Now().Add(quotaConfigCacheSlotRetryInterval)
+		c.finishConfigLoadLocked()
+	}
+	c.mu.Unlock()
+	metrics.RecordTenantOperationWithOrg(c.tenantID, c.tidbCloudOrgID, "quota_config_cache", "load", "deferred", time.Since(start))
 }
 
 func (c *quotaConfigCache) snapshotCopy() *QuotaConfigView {

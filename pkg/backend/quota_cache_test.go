@@ -262,6 +262,105 @@ func TestQuotaConfigCacheWarmWaiterReturnsStaleWithoutWaiting(t *testing.T) {
 	}
 }
 
+func TestQuotaConfigCacheAsyncRefreshHasGlobalSlotBudget(t *testing.T) {
+	const tenants = defaultQuotaConfigCacheAsyncRefreshSlots + 8
+	stores := make([]*cacheTestStore, tenants)
+	caches := make([]*quotaConfigCache, tenants)
+	refreshStarted := make(chan struct{}, tenants)
+	release := make(chan struct{})
+	for i := range tenants {
+		store := newCacheTestStore()
+		store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
+		store.configHook = func() {
+			refreshStarted <- struct{}{}
+			<-release
+		}
+		stores[i] = store
+		cache := newQuotaConfigCache("t1", "", store)
+		// The first load is cold and must not use the async refresh budget.
+		store.configHook = nil
+		if cfg := cache.get(context.Background()); cfg == nil {
+			t.Fatalf("initial config for tenant %d is nil", i)
+		}
+		store.configHook = func() {
+			refreshStarted <- struct{}{}
+			<-release
+		}
+		cache.mu.Lock()
+		cache.nextRefresh = time.Time{}
+		cache.mu.Unlock()
+		caches[i] = cache
+	}
+
+	var callers sync.WaitGroup
+	for _, cache := range caches {
+		callers.Add(1)
+		go func(c *quotaConfigCache) {
+			defer callers.Done()
+			if cfg := c.get(context.Background()); cfg == nil || cfg.MaxStorageBytes != 1000 {
+				t.Errorf("expired config = %+v, want stale storage 1000", cfg)
+			}
+		}(cache)
+	}
+	callers.Wait()
+
+	for range defaultQuotaConfigCacheAsyncRefreshSlots {
+		select {
+		case <-refreshStarted:
+		case <-time.After(300 * time.Millisecond):
+			t.Fatal("async refresh did not consume its available slots")
+		}
+	}
+	select {
+	case <-refreshStarted:
+		t.Fatal("async refresh exceeded the global slot budget")
+	default:
+	}
+
+	deferred := 0
+	for i, cache := range caches {
+		cache.mu.RLock()
+		loadInFlight := cache.loadDone != nil
+		cache.mu.RUnlock()
+		if stores[i].configCalls.Load() == 1 {
+			deferred++
+			if loadInFlight {
+				t.Errorf("deferred tenant %d retained load ownership", i)
+			}
+		}
+	}
+	if deferred == 0 {
+		t.Error("expected at least one tenant refresh to be deferred")
+	}
+
+	close(release)
+	for _, cache := range caches {
+		waitForQuotaConfigLoad(t, cache)
+	}
+	for i, store := range stores {
+		if store.configCalls.Load() > 2 {
+			t.Errorf("tenant %d configCalls = %d, want at most 2", i, store.configCalls.Load())
+		}
+	}
+
+	for i, cache := range caches {
+		if stores[i].configCalls.Load() != 1 {
+			continue
+		}
+		cache.mu.Lock()
+		cache.nextRefresh = time.Time{}
+		cache.mu.Unlock()
+		if cfg := cache.get(context.Background()); cfg == nil || cfg.MaxStorageBytes != 1000 {
+			t.Errorf("deferred tenant %d config = %+v, want stale storage 1000", i, cfg)
+		}
+		waitForQuotaConfigLoad(t, cache)
+		if got := stores[i].configCalls.Load(); got != 2 {
+			t.Errorf("deferred tenant %d configCalls = %d, want 2 after retry", i, got)
+		}
+		break
+	}
+}
+
 func TestQuotaConfigCacheIsPassiveUntilFirstAccess(t *testing.T) {
 	previousRefreshInterval := quotaConfigCacheRefreshInterval
 	quotaConfigCacheRefreshInterval = 5 * time.Millisecond
