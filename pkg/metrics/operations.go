@@ -530,7 +530,14 @@ func RecordTenantEventWithOrg(tenantID, tidbCloudOrgID, event string, labels ...
 }
 
 func tenantAttributedBusinessEvent(event, result string) bool {
-	return event == "tenant_provision" && isOperationFailureResult(result)
+	switch event {
+	case "tenant_provision":
+		return isOperationFailureResult(result)
+	case "auth", "tenant_schema_init", "tenant_status":
+		return true
+	default:
+		return false
+	}
 }
 
 func metricLabelValue(labels []string, key string) string {

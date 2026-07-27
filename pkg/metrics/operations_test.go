@@ -390,6 +390,7 @@ func TestBusinessEventTenantLabelsAreLimitedToFailures(t *testing.T) {
 	RecordTenantEventWithOrg("tenant-event-contract", "org-event-contract", "fs_write", "result", "ok")
 	RecordTenantEventWithOrg("tenant-event-contract", "org-event-contract", "tenant_provision", "provider", "local", "result", "accepted")
 	RecordTenantEventWithOrg("tenant-event-contract", "org-event-contract", "tenant_provision", "provider", "local", "result", "cluster_error")
+	RecordTenantEventWithOrg("tenant-event-contract", "org-event-contract", "tenant_schema_init", "provider", "local", "result", "error")
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
@@ -408,6 +409,9 @@ func TestBusinessEventTenantLabelsAreLimitedToFailures(t *testing.T) {
 	}
 	if !strings.Contains(text, `drive9_business_events_total{event="tenant_provision",provider="local",result="cluster_error",tenant_id="tenant-event-contract",tidbcloud_org_id="org-event-contract"} 1`) {
 		t.Fatalf("failed provisioning event lost tenant attribution:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_business_events_total{event="tenant_schema_init",provider="local",result="error",tenant_id="tenant-event-contract",tidbcloud_org_id="org-event-contract"} 1`) {
+		t.Fatalf("schema-init event lost tenant attribution:\n%s", text)
 	}
 }
 
