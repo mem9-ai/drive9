@@ -214,6 +214,9 @@ func (p *tenantOutboxPoller) pollOnce(ctx context.Context) {
 func (p *tenantOutboxPoller) dispatch(ctx context.Context, row meta.TenantNotifyRow) {
 	if row.WorkMask&WorkMetricsCleanup != 0 {
 		metrics.DeleteTenantCounters(row.TenantID)
+		if p.metaStore != nil {
+			p.metaStore.InvalidateAPIKeyResolveCacheForTenant(row.TenantID)
+		}
 		if forgetter, ok := p.worker.(outboxTenantForgetter); ok {
 			forgetter.ForgetTenant(row.TenantID)
 		}

@@ -14,7 +14,6 @@ import (
 const (
 	tidbCloudAPICluster = "cluster"
 	tidbCloudAPIIAM     = "iam"
-	tidbCloudAPIBilling = "billing"
 
 	tidbCloudOperationCreateCluster         = "create_cluster"
 	tidbCloudOperationBatchCreateClusters   = "batch_create_clusters"
@@ -26,7 +25,6 @@ const (
 	tidbCloudOperationGetBranch             = "get_branch"
 	tidbCloudOperationDeleteBranch          = "delete_branch"
 	tidbCloudOperationResolveAPIKeyIdentity = "resolve_api_key_identity"
-	tidbCloudOperationGetOrganizationPlan   = "get_organization_plan"
 
 	tidbCloudResultOK             = "ok"
 	tidbCloudResultClientError    = "client_error"

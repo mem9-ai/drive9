@@ -143,6 +143,16 @@ func (c *apiKeyResolveCache) evictTenant(tenantID string) {
 	metrics.RecordAPIKeyResolveCacheEntries(entries)
 }
 
+// InvalidateAPIKeyResolveCacheForTenant drops all locally cached API-key
+// resolutions for tenantID. Lifecycle outbox consumers use this to invalidate
+// peer-pod caches after a deleting/deleted transition commits.
+func (s *Store) InvalidateAPIKeyResolveCacheForTenant(tenantID string) {
+	if s == nil || s.apiKeys == nil {
+		return
+	}
+	s.apiKeys.evictTenant(tenantID)
+}
+
 func (c *apiKeyResolveCache) deleteLocked(hash string) {
 	entry, ok := c.byHash[hash]
 	if !ok {

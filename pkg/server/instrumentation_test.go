@@ -3,8 +3,13 @@ package server
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 func TestRequestRoute(t *testing.T) {
@@ -150,6 +155,34 @@ func TestSetRequestMetricTenantMovesInFlightLabel(t *testing.T) {
 	finishRequestMetricTenant(ctx)
 	if got := len(m.tenantInFlight); got != 0 {
 		t.Fatalf("tenant in-flight map size after finish = %d, want 0", got)
+	}
+}
+
+func TestSetRequestMetricTenantForAuthStatusOnlyScopesActiveTenants(t *testing.T) {
+	for _, status := range []meta.TenantStatus{meta.TenantDeleting, meta.TenantDeleted, meta.TenantSuspended} {
+		t.Run(string(status), func(t *testing.T) {
+			const tenantID = "tenant-auth-status-metrics"
+			metrics.DeleteTenantCounters(tenantID)
+			t.Cleanup(func() { metrics.DeleteTenantCounters(tenantID) })
+			ctx := withRequestMetricState(context.Background(), &requestMetricState{})
+			setRequestMetricTenantForAuthStatus(ctx, tenantID, "key", "db9", "org", status, tenantRequestClass{surface: "api", action: "read"})
+			if tenantID, _, _, _ := requestMetricScope(ctx); tenantID != "" {
+				t.Fatalf("tenant metric scope = %q for status %q, want empty", tenantID, status)
+			}
+			req := httptest.NewRequest(http.MethodGet, "http://example.test/v1/fs/stale", nil).WithContext(ctx)
+			recordTenantHTTPRequest(req, http.StatusForbidden, 0, 0)
+			recorder := httptest.NewRecorder()
+			metrics.WritePrometheus(recorder)
+			if strings.Contains(recorder.Body.String(), `tenant_id="`+tenantID+`"`) {
+				t.Fatalf("rejected %s request recreated tenant metrics:\n%s", status, recorder.Body.String())
+			}
+		})
+	}
+
+	ctx := withRequestMetricState(context.Background(), &requestMetricState{})
+	setRequestMetricTenantForAuthStatus(ctx, "tenant-active", "key", "db9", "org", meta.TenantActive, tenantRequestClass{surface: "api", action: "read"})
+	if tenantID, _, _, _ := requestMetricScope(ctx); tenantID != "tenant-active" {
+		t.Fatalf("tenant metric scope = %q, want tenant-active", tenantID)
 	}
 }
 

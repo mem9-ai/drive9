@@ -2063,13 +2063,13 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
-	setRequestMetricTenant(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, resolved.TiDBCloudOrgID, classifyTenantRequest(r))
 	if resolved.APIKey.Status != meta.APIKeyActive {
 		metricEvent(r.Context(), "auth", "result", "key_inactive")
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_inactive", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "status", resolved.APIKey.Status)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
+	setRequestMetricTenantForAuthStatus(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, resolved.TiDBCloudOrgID, resolved.Tenant.Status, classifyTenantRequest(r))
 	plain, err := poolDecryptToken(r.Context(), s.pool, resolved.APIKey.JWTCiphertext)
 	if err != nil {
 		metricEvent(r.Context(), "auth", "result", "decrypt_failed")

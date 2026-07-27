@@ -224,6 +224,17 @@ func setRequestMetricTenant(ctx context.Context, tenantID, apiKeyID, provider, t
 	}
 }
 
+// setRequestMetricTenantForAuthStatus scopes tenant request metrics only after
+// the auth path has established that the tenant is active. Rejected
+// deleting/deleted requests must not recreate series removed by lifecycle
+// cleanup outbox delivery.
+func setRequestMetricTenantForAuthStatus(ctx context.Context, tenantID, apiKeyID, provider, tidbCloudOrgID string, status meta.TenantStatus, class tenantRequestClass) {
+	if status != meta.TenantActive {
+		return
+	}
+	setRequestMetricTenant(ctx, tenantID, apiKeyID, provider, tidbCloudOrgID, class)
+}
+
 func requestMetricScope(ctx context.Context) (tenantID, apiKeyID, provider, tidbCloudOrgID string) {
 	state := requestMetricStateFromContext(ctx)
 	if state == nil {

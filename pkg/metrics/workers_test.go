@@ -75,10 +75,18 @@ func TestCriticalWorkerMetricsUseBoundedLabels(t *testing.T) {
 
 func TestTenantOutboxBacklogAgeTracksObservedRowsAndSurvivesPollErrors(t *testing.T) {
 	RecordTenantOutboxPoll("ok", time.Millisecond, 1000, 2*time.Minute, true)
-	RecordTenantOutboxPoll("error", time.Millisecond, 0, 0, false)
-
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
+	if !strings.Contains(rec.Body.String(), `drive9_tenant_outbox_batch_size_count 1`) {
+		t.Fatalf("successful poll did not observe one batch-size sample:\n%s", rec.Body.String())
+	}
+	RecordTenantOutboxPoll("error", time.Millisecond, 0, 0, false)
+
+	rec = httptest.NewRecorder()
+	WritePrometheus(rec)
+	if !strings.Contains(rec.Body.String(), `drive9_tenant_outbox_batch_size_count 1`) {
+		t.Fatalf("error poll injected a zero batch-size sample:\n%s", rec.Body.String())
+	}
 	if !strings.Contains(rec.Body.String(), `drive9_tenant_outbox_backlog_oldest_age_seconds 120.000000`) {
 		t.Fatalf("poll error cleared last observed backlog age:\n%s", rec.Body.String())
 	}

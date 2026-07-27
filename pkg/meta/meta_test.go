@@ -1585,7 +1585,7 @@ func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
 	for _, column := range []string{
 		"db_id", "uuid", "org_id", "cluster_id", "provisioning_key", "cloud_provider", "region",
 		"role", "db_host", "db_port", "db_user", "db_password", "db_name", "db_tls",
-		"max_tenants", "tenant_count", "soft_cap_reached", "spending_limit", "schema_version", "status",
+		"max_tenants", "tenant_count", "soft_cap_reached", "spending_limit", "schema_version", "status", "status_updated_at",
 		"created_at", "updated_at",
 	} {
 		if _, ok := dbPool.columns[column]; !ok {

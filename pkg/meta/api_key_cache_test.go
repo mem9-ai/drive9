@@ -168,6 +168,21 @@ func TestResolveByAPIKeyHashRevokeTenantAPIKeysEvictsCache(t *testing.T) {
 	}
 }
 
+func TestInvalidateAPIKeyResolveCacheForTenantEvictsCache(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	insertCacheTestTenant(t, s, "cache-t-invalidate")
+	insertCacheTestKey(t, s, "cache-t-invalidate", "cache-k-invalidate", "cache-hash-invalidate")
+	if _, err := s.ResolveByAPIKeyHash(ctx, "cache-hash-invalidate"); err != nil {
+		t.Fatal(err)
+	}
+
+	s.InvalidateAPIKeyResolveCacheForTenant("cache-t-invalidate")
+	if _, ok := s.apiKeys.lookup("cache-hash-invalidate"); ok {
+		t.Fatal("tenant API key remained cached after explicit invalidation")
+	}
+}
+
 func TestResolveByAPIKeyHashRevokeByIssuerEvictsCache(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()

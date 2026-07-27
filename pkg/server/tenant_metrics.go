@@ -106,8 +106,8 @@ func (s *Server) observeSharedDBPoolMetrics(ctx context.Context) {
 		}
 		metrics.RecordSharedDBPoolTotal(orgID, snapshot.ID, snapshot.UUID, snapshot.Status, 1)
 		next[totalKey] = struct{}{}
-		if snapshot.Status != meta.SharedDBStatusActive && !snapshot.UpdatedAt.IsZero() {
-			age := time.Since(snapshot.UpdatedAt)
+		if snapshot.Status != meta.SharedDBStatusActive && !snapshot.StatusUpdatedAt.IsZero() {
+			age := time.Since(snapshot.StatusUpdatedAt)
 			if age < 0 {
 				age = 0
 			}

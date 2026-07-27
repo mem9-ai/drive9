@@ -176,6 +176,7 @@ type SharedDBPoolMetricSnapshot struct {
 	SoftCapReached          bool
 	SpendingLimit           *int64
 	UpdatedAt               time.Time
+	StatusUpdatedAt         time.Time
 	TenantStates            []SharedDBPoolTenantStateCount
 }
 
@@ -367,10 +368,12 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 			SET org_id = ?, cluster_id = ?, provisioning_key = NULL,
 				db_host = COALESCE(?, db_host), db_port = COALESCE(?, db_port),
 				db_user = COALESCE(?, db_user), db_password = COALESCE(?, db_password),
-				db_name = COALESCE(?, db_name), db_tls = ?, status = ?
+				db_name = COALESCE(?, db_name), db_tls = ?,
+				status_updated_at = CASE WHEN status <> ? THEN CURRENT_TIMESTAMP(3) ELSE status_updated_at END,
+				status = ?
 			WHERE db_id = ?`, in.TiDBCloudOrganizationID, in.ClusterID,
 			nullString(in.Host), nullInt(in.Port), nullString(in.User), nullBytes(in.PasswordCipher),
-			nullString(in.Name), in.TLSMode, nextStatus, in.ID); err != nil {
+			nullString(in.Name), in.TLSMode, nextStatus, nextStatus, in.ID); err != nil {
 			return fmt.Errorf("persist cloud result for db pool %d: %w", in.ID, err)
 		}
 		if nextStatus == SharedDBStatusProvisioning && metadataReady {
@@ -499,7 +502,7 @@ func (s *Store) ActivateSharedDBPool(ctx context.Context, dbID int64) (err error
 	if dbID <= 0 {
 		return fmt.Errorf("db_id must be positive")
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE db_pool SET status = ?
+	res, err := s.db.ExecContext(ctx, `UPDATE db_pool SET status = ?, status_updated_at = CURRENT_TIMESTAMP(3)
 		WHERE db_id = ? AND status = ? AND org_id IS NOT NULL AND cluster_id IS NOT NULL
 			AND db_host IS NOT NULL AND db_port IS NOT NULL AND db_user IS NOT NULL
 			AND db_password IS NOT NULL AND db_name IS NOT NULL AND schema_version > 0`,
@@ -528,7 +531,7 @@ func (s *Store) ActivateSharedDBPool(ctx context.Context, dbID int64) (err error
 }
 
 func (s *Store) MarkSharedDBPoolFailed(ctx context.Context, dbID int64) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE db_pool SET status = ?
+	res, err := s.db.ExecContext(ctx, `UPDATE db_pool SET status = ?, status_updated_at = CURRENT_TIMESTAMP(3)
 		WHERE db_id = ? AND status IN (?, ?) AND tenant_count = 0`,
 		SharedDBStatusFailed, dbID, SharedDBStatusPending, SharedDBStatusProvisioning)
 	if err != nil {
@@ -616,9 +619,9 @@ func (s *Store) MarkStuckSharedDBPoolFailed(ctx context.Context, dbID int64, exp
 			TenantFailed, now, dbID, tidbCloudNativeSharedProvider, TenantPending, TenantProvisioning); err != nil {
 			return fmt.Errorf("fail stuck shared tenants for db pool %d: %w", dbID, err)
 		}
-		res, err := tx.ExecContext(ctx, `UPDATE db_pool SET status = ?, updated_at = ?
+		res, err := tx.ExecContext(ctx, `UPDATE db_pool SET status = ?, status_updated_at = ?, updated_at = ?
 			WHERE db_id = ? AND role = ? AND status = ? AND updated_at <= ?`,
-			SharedDBStatusFailed, now, dbID, SharedDBRoleShared, expectedStatus, cutoff)
+			SharedDBStatusFailed, now, now, dbID, SharedDBRoleShared, expectedStatus, cutoff)
 		if err != nil {
 			return fmt.Errorf("fail stuck shared db pool %d: %w", dbID, err)
 		}
@@ -907,8 +910,10 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 			ORDER BY db_id LIMIT 1 FOR UPDATE`, organizationID, in.Host, in.Name, in.User).Scan(&dbID)
 		if err == nil {
 			if _, err := tx.ExecContext(ctx, `UPDATE db_pool
-				SET db_port = ?, db_password = ?, db_tls = ?, max_tenants = ?, status = ?
-				WHERE db_id = ?`, in.Port, in.PasswordCipher, in.TLSMode, in.MaxTenants, status, dbID); err != nil {
+				SET db_port = ?, db_password = ?, db_tls = ?, max_tenants = ?,
+					status_updated_at = CASE WHEN status <> ? THEN CURRENT_TIMESTAMP(3) ELSE status_updated_at END,
+					status = ?
+				WHERE db_id = ?`, in.Port, in.PasswordCipher, in.TLSMode, in.MaxTenants, status, status, dbID); err != nil {
 				return fmt.Errorf("update existing manual db_pool row: %w", err)
 			}
 			return nil
@@ -922,7 +927,9 @@ func (s *Store) RegisterSharedDB(ctx context.Context, in *SharedDB) (dbID int64,
 				"ON DUPLICATE KEY UPDATE org_id = VALUES(org_id), db_host = VALUES(db_host), "+
 				"db_port = VALUES(db_port), db_user = VALUES(db_user), db_name = VALUES(db_name), "+
 				"db_password = VALUES(db_password), db_tls = VALUES(db_tls), "+
-				"max_tenants = VALUES(max_tenants), status = VALUES(status)",
+				"max_tenants = VALUES(max_tenants), "+
+				"status_updated_at = CASE WHEN status <> VALUES(status) THEN CURRENT_TIMESTAMP(3) ELSE status_updated_at END, "+
+				"status = VALUES(status)",
 			poolUUID, organizationID, role, in.Host, in.Port, in.User, in.PasswordCipher, in.Name,
 			in.TLSMode, in.MaxTenants, status); err != nil {
 			return fmt.Errorf("upsert manual db_pool row: %w", err)
@@ -1056,7 +1063,7 @@ const listSharedDBPoolMetricSnapshotsSQL = `WITH non_active_tenant_states AS (
 )
 SELECT
 	d.db_id, d.uuid, COALESCE(d.org_id, ''), d.status, d.max_tenants, d.tenant_count, d.soft_cap_reached,
-	d.spending_limit, d.updated_at,
+	d.spending_limit, d.updated_at, d.status_updated_at,
 	COALESCE(tenant_states.tenant_status, ''), COALESCE(tenant_states.tenant_count, 0)
 	FROM db_pool d
 	LEFT JOIN tenant_states ON tenant_states.db_id = d.db_id
@@ -1079,17 +1086,17 @@ func (s *Store) ListSharedDBPoolMetricSnapshots(ctx context.Context) (out []Shar
 		var maxTenants, tenantCount int
 		var softCapReached bool
 		var spendingLimit sql.NullInt64
-		var updatedAt time.Time
+		var updatedAt, statusUpdatedAt time.Time
 		var stateCount int64
 		if err := rows.Scan(&id, &dbPoolUUID, &organizationID, &status, &maxTenants, &tenantCount, &softCapReached,
-			&spendingLimit, &updatedAt, &tenantStatus, &stateCount); err != nil {
+			&spendingLimit, &updatedAt, &statusUpdatedAt, &tenantStatus, &stateCount); err != nil {
 			return nil, fmt.Errorf("scan shared db pool metric snapshot: %w", err)
 		}
 		index, ok := byID[id]
 		if !ok {
 			snapshot := SharedDBPoolMetricSnapshot{
 				ID: id, UUID: dbPoolUUID, TiDBCloudOrganizationID: organizationID, Status: status,
-				MaxTenants: maxTenants, TenantCount: tenantCount, SoftCapReached: softCapReached, UpdatedAt: updatedAt,
+				MaxTenants: maxTenants, TenantCount: tenantCount, SoftCapReached: softCapReached, UpdatedAt: updatedAt, StatusUpdatedAt: statusUpdatedAt,
 			}
 			if spendingLimit.Valid {
 				value := spendingLimit.Int64

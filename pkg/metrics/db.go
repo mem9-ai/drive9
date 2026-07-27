@@ -368,6 +368,20 @@ func writeDBPrometheus(w http.ResponseWriter) {
 		aggregate.maxOpenConnections += totals.maxOpenConnections
 		tenantRoleTotals[key.role] = aggregate
 	}
+	// If a role has both scoped and unscoped pools, fold the unscoped pool's
+	// saturation totals into the same role-level aggregate. Emitting the
+	// unscoped key alone would hide tenant-scoped capacity while the pool is
+	// open (fork/delete paths are one such source of transient pools).
+	for key, totals := range poolTotals {
+		if key.hasTenantID() {
+			continue
+		}
+		if aggregate, ok := tenantRoleTotals[key.role]; ok {
+			aggregate.inUseConnections += totals.inUseConnections
+			aggregate.maxOpenConnections += totals.maxOpenConnections
+			tenantRoleTotals[key.role] = aggregate
+		}
+	}
 	tenantRoles := SortedKeys(tenantRoleTotals)
 
 	globalDB.mu.RLock()
@@ -412,6 +426,11 @@ func writeDBPrometheus(w http.ResponseWriter) {
 	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_pool_connections gauge")
 	for _, key := range keys {
 		totals := poolTotals[key]
+		if !key.hasTenantID() {
+			if _, hasScopedPool := tenantRoleTotals[key.role]; hasScopedPool {
+				continue
+			}
+		}
 		if key.hasScopedIdentity() && totals.openConnections == 0 {
 			continue
 		}
@@ -425,12 +444,6 @@ func writeDBPrometheus(w http.ResponseWriter) {
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"max_open\"} %d\n", labels, totals.maxOpenConnections)
 	}
 	for _, role := range tenantRoles {
-		// Avoid duplicate role-only label sets if a caller registers both scoped
-		// and unscoped pools under the same role.
-		unscopedKey := (registeredDB{role: role}).metricKey()
-		if _, exists := poolTotals[unscopedKey]; exists {
-			continue
-		}
 		totals := tenantRoleTotals[role]
 		labels := fmt.Sprintf("role=\"%s\"", EscapePromLabel(role))
 		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{%s,state=\"in_use\"} %d\n", labels, totals.inUseConnections)

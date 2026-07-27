@@ -129,6 +129,42 @@ func TestTiDBCloudOpenAPIProtocolFailureReplacesHTTPSuccess(t *testing.T) {
 	}
 }
 
+func TestTiDBCloudOpenAPIDeleteUnexpectedSuccessIsProtocolError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(*HTTPClustersAPI) error
+		op   string
+	}{
+		{name: "cluster", call: func(api *HTTPClustersAPI) error {
+			return api.DeleteCluster(context.Background(), "public", "private", "cluster-202")
+		}, op: tidbCloudOperationDeleteCluster},
+		{name: "branch", call: func(api *HTTPClustersAPI) error {
+			return api.DeleteBranch(context.Background(), "public", "private", "cluster-202", "branch-202")
+		}, op: tidbCloudOperationDeleteBranch},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusAccepted,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("accepted")),
+				}, nil
+			})}
+			beforeOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tc.op, tidbCloudResultOK)
+			beforeProtocol := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tc.op, tidbCloudResultProtocolError)
+			api := NewHTTPClustersAPI("https://cluster.tidbapi.com", "", client)
+			if err := tc.call(api); err == nil {
+				t.Fatal("unexpected 2xx delete response was accepted")
+			}
+			afterOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tc.op, tidbCloudResultOK)
+			afterProtocol := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tc.op, tidbCloudResultProtocolError)
+			if afterOK != beforeOK || afterProtocol != beforeProtocol+1 {
+				t.Fatalf("ok delta=%v protocol_error delta=%v, want 0 and 1", afterOK-beforeOK, afterProtocol-beforeProtocol)
+			}
+		})
+	}
+}
+
 func TestTiDBCloudOpenAPIClusterListWithoutQueryUsesListOperation(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"clusters":[]}`)

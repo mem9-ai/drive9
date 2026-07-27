@@ -88,10 +88,10 @@ func RecordTenantOutboxPoll(result string, d time.Duration, size int, oldestAge 
 	RegisterModule("tenant_outbox_poller")
 	result = cleanMetricValue(result, "unknown")
 	tenantOutboxPollDuration.Observe(max(d.Seconds(), 0), Attr("result", result))
-	tenantOutboxBatchSize.Observe(float64(max(size, 0)))
 	if result != "ok" {
 		return
 	}
+	tenantOutboxBatchSize.Observe(float64(max(size, 0)))
 	if size > 0 {
 		tenantOutboxBacklogOldestAge.Set(max(oldestAge.Seconds(), 0))
 	} else {

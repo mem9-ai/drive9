@@ -214,7 +214,7 @@ func (a *HTTPClustersAPI) DeleteCluster(ctx context.Context, publicKey, privateK
 		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationDeleteCluster, tidbCloudResultOK)
 		return nil
 	}
-	recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationDeleteCluster, resp.StatusCode, true)
+	recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationDeleteCluster, resp.StatusCode, false)
 	raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 	if readErr != nil {
 		return readErr
@@ -300,7 +300,7 @@ func (a *HTTPClustersAPI) DeleteBranch(ctx context.Context, publicKey, privateKe
 		recordTiDBCloudOpenAPIRequest(tidbCloudAPICluster, tidbCloudOperationDeleteBranch, tidbCloudResultOK)
 		return nil
 	}
-	recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationDeleteBranch, resp.StatusCode, true)
+	recordTiDBCloudHTTPResponse(tidbCloudAPICluster, tidbCloudOperationDeleteBranch, resp.StatusCode, false)
 	raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 	if readErr != nil {
 		return readErr

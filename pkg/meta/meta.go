@@ -468,6 +468,23 @@ func expandManagedDBPoolSchema(ctx context.Context, db *sql.DB) error {
 			return fmt.Errorf("add db_pool.soft_cap_reached: %w", err)
 		}
 	}
+	var statusUpdatedAtColumnExists int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = 'status_updated_at'`).Scan(&statusUpdatedAtColumnExists); err != nil {
+		return fmt.Errorf("inspect db_pool.status_updated_at: %w", err)
+	}
+	if statusUpdatedAtColumnExists == 0 {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE db_pool ADD COLUMN status_updated_at DATETIME(3) NULL AFTER status`); err != nil {
+			return fmt.Errorf("add db_pool.status_updated_at: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE db_pool SET status_updated_at = updated_at WHERE status_updated_at IS NULL`); err != nil {
+			return fmt.Errorf("backfill db_pool.status_updated_at: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, `ALTER TABLE db_pool MODIFY COLUMN status_updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)`); err != nil {
+			return fmt.Errorf("make db_pool.status_updated_at non-null: %w", err)
+		}
+	}
 	// Only ever open the latch during migration. Do not clear a latched pool
 	// below the soft cap here; deletion owns the hysteresis transition.
 	if _, err := db.ExecContext(ctx, `UPDATE db_pool
@@ -788,6 +805,7 @@ func metaInitSchemaStatements() []string {
 			spending_limit BIGINT NULL,
 			schema_version INT UNSIGNED NOT NULL DEFAULT 0,
 			status       VARCHAR(20) NOT NULL DEFAULT 'active',
+			status_updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			UNIQUE INDEX uk_db_pool_uuid (uuid),

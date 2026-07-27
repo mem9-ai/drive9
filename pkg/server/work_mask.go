@@ -25,9 +25,10 @@ const (
 	// WorkFileGC (bit 2) kicks the unified worker to drain file_gc tasks.
 	// Sharded: only the shard-owner pod processes it.
 	WorkFileGC = meta.TenantNotifyWorkFileGC
-	// WorkMetricsCleanup (bit 3) removes all tenant-scoped metric series from
-	// the local process. It is server-only because it is emitted by durable
-	// tenant lifecycle transitions, not by a tenant DB write path.
+	// WorkMetricsCleanup (bit 3) removes all tenant-scoped metric series and
+	// invalidates the tenant API-key resolve cache in the local process. It is
+	// server-only because it is emitted by durable tenant lifecycle transitions,
+	// not by a tenant DB write path.
 	WorkMetricsCleanup = meta.TenantNotifyWorkMetricsCleanup
 )
 

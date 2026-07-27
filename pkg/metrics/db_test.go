@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -268,10 +269,16 @@ func TestDBPoolConnectionsDoesNotDuplicateRoleAggregateForMixedPools(t *testing.
 	RegisterDB(role, unscoped)
 	RegisterTenantDB(role, "mixed-db-aggregate-tenant", tenantScoped)
 	out := renderDB(t)
-	for _, state := range []string{"in_use", "max_open"} {
-		line := `drive9_db_pool_connections{role="` + role + `",state="` + state + `"}`
+	for _, tc := range []struct {
+		state string
+		value int
+	}{
+		{state: "in_use", value: 0},
+		{state: "max_open", value: 5},
+	} {
+		line := fmt.Sprintf(`drive9_db_pool_connections{role="%s",state="%s"} %d`, role, tc.state, tc.value)
 		if got := strings.Count(out, line); got != 1 {
-			t.Fatalf("role aggregate %s count = %d, want 1:\n%s", state, got, out)
+			t.Fatalf("role aggregate %s = %d occurrences, want one value %d:\n%s", tc.state, got, tc.value, out)
 		}
 	}
 }
