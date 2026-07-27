@@ -288,6 +288,109 @@ func TestSharedTenantPoolRefillPlansTenPoolsInOneBatch(t *testing.T) {
 	}
 }
 
+func TestSharedTenantPoolRefillReusesExistingPhysicalCapacity(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolManager := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(poolManager.Close)
+	poolManager.SetMetaStore(metaStore)
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1"}
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: poolManager, Provisioner: prov,
+		DefaultTenantProvider: tenant.ProviderTiDBCloudNativeShared, SharedDBMaxTenants: 100,
+		TokenSecret: make([]byte, 32), Leader: newFollowerLeaderManager(t, metaStore)})
+	t.Cleanup(srv.Close)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	logicalPool := &meta.TenantPool{PoolID: "pool-reuse-existing", OrganizationID: "org-reuse-existing",
+		Size: 15, Status: meta.TenantPoolActive, CreatedAt: now, UpdatedAt: now}
+	if err := metaStore.CreateTenantPool(ctx, logicalPool); err != nil {
+		t.Fatalf("CreateTenantPool: %v", err)
+	}
+	passwordCipher, err := poolManager.Encrypt(ctx, []byte("shared-pass"))
+	if err != nil {
+		t.Fatalf("encrypt shared password: %v", err)
+	}
+	dbID, err := metaStore.RegisterSharedDB(ctx, &meta.SharedDB{
+		TiDBCloudOrganizationID: logicalPool.OrganizationID,
+		Host:                    "shared.example.com",
+		Port:                    4000,
+		User:                    "root",
+		PasswordCipher:          passwordCipher,
+		Name:                    "tidbcloud_fs",
+		MaxTenants:              100,
+	})
+	if err != nil {
+		t.Fatalf("RegisterSharedDB: %v", err)
+	}
+	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE db_pool SET tenant_count = 9 WHERE db_id = ?`, dbID); err != nil {
+		t.Fatalf("seed tenant_count: %v", err)
+	}
+
+	results, err := srv.createFreeSharedPoolTenants(ctx, logicalPool.PoolID, 1, tenant.CredentialProvisionRequest{}, nil)
+	if err != nil {
+		t.Fatalf("createFreeSharedPoolTenants: %v", err)
+	}
+	if len(results) != 1 || results[0].Status != meta.TenantActive {
+		t.Fatalf("results = %+v, want one active tenant", results)
+	}
+	var physicalPools, tenantCount int
+	if err := metaStore.DB().QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(tenant_count), 0)
+		FROM db_pool WHERE org_id = ?`, logicalPool.OrganizationID).Scan(&physicalPools, &tenantCount); err != nil {
+		t.Fatalf("load physical pool inventory: %v", err)
+	}
+	if physicalPools != 1 || tenantCount != 10 {
+		t.Fatalf("physical pools = %d, tenant count = %d, want 1 and 10", physicalPools, tenantCount)
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 0 {
+		t.Fatalf("shared Cloud batch calls = %d, want 0 while existing capacity remains", got)
+	}
+
+	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE db_pool SET tenant_count = 99 WHERE db_id = ?`, dbID); err != nil {
+		t.Fatalf("move existing pool near capacity: %v", err)
+	}
+	results, err = srv.createFreeSharedPoolTenants(ctx, logicalPool.PoolID, 3, tenant.CredentialProvisionRequest{}, nil)
+	if err != nil {
+		t.Fatalf("createFreeSharedPoolTenants across capacity boundary: %v", err)
+	}
+	active, pending := 0, 0
+	for _, result := range results {
+		switch result.Status {
+		case meta.TenantActive:
+			active++
+		case meta.TenantPending:
+			pending++
+		}
+	}
+	if active != 1 || pending != 2 {
+		t.Fatalf("result statuses: active=%d pending=%d, want 1 and 2", active, pending)
+	}
+	if err := metaStore.DB().QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(tenant_count), 0)
+		FROM db_pool WHERE org_id = ?`, logicalPool.OrganizationID).Scan(&physicalPools, &tenantCount); err != nil {
+		t.Fatalf("load physical pool inventory after spill: %v", err)
+	}
+	if physicalPools != 2 || tenantCount != 102 {
+		t.Fatalf("physical pools = %d, tenant count = %d, want 2 and 102", physicalPools, tenantCount)
+	}
+	if got := prov.sharedPoolBatchCalls.Load(); got != 1 {
+		t.Fatalf("shared Cloud batch calls = %d, want 1 for the capacity remainder", got)
+	}
+	if got := prov.sharedPoolBatchMembers.Load(); got != 1 {
+		t.Fatalf("shared Cloud batch physical pools = %d, want 1 for the capacity remainder", got)
+	}
+}
+
 func TestSharedTenantPoolRefillMakesWaveVisibleOnlyAfterMembershipReservation(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -721,7 +824,7 @@ func TestSharedTenantPoolRefillPlansWithServerOwnedSharedCredential(t *testing.T
 	}
 }
 
-func TestSharedTenantPoolRefillStagesDedicatedCapacityWithoutIdentityLookup(t *testing.T) {
+func TestSharedTenantPoolRefillReusesCapacityWithoutIdentityLookup(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -769,8 +872,8 @@ func TestSharedTenantPoolRefillStagesDedicatedCapacityWithoutIdentityLookup(t *t
 	if len(results) != 50 {
 		t.Fatalf("results = %d, want 50", len(results))
 	}
-	if got := prov.sharedPoolBatchCalls.Load(); got != 1 {
-		t.Fatalf("physical batch calls = %d, want one dedicated refill wave", got)
+	if got := prov.sharedPoolBatchCalls.Load(); got != 0 {
+		t.Fatalf("physical batch calls = %d, want no Cloud create while existing capacity remains", got)
 	}
 	if got := prov.iamCalls.Load(); got != 0 {
 		t.Fatalf("identity lookups = %d, want 0 when tenant pool organization is known", got)
@@ -784,8 +887,8 @@ func TestSharedTenantPoolRefillStagesDedicatedCapacityWithoutIdentityLookup(t *t
 		`SELECT COUNT(*) FROM db_pool WHERE org_id = ?`, "org-shared-existing").Scan(&physicalPoolCount); err != nil {
 		t.Fatal(err)
 	}
-	if existingTenantCount != 0 || physicalPoolCount != 2 {
-		t.Fatalf("existing tenant_count=%d physical pools=%d, want dedicated staged pool and untouched existing capacity",
+	if existingTenantCount != 50 || physicalPoolCount != 1 {
+		t.Fatalf("existing tenant_count=%d physical pools=%d, want reused existing capacity without a new pool",
 			existingTenantCount, physicalPoolCount)
 	}
 }
