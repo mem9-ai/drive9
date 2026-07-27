@@ -66,9 +66,11 @@ type PoolConfig struct {
 	// IsLeader() snapshot.
 	LeaderChecker LeaderChecker
 
-	// IdleTimeout controls how long a cached backend can stay in the warm
-	// cache without any activity before the idle reaper evicts it. 0
-	// disables idle eviction (LRU capacity eviction still applies).
+	// IdleTimeout controls how long a standalone cached backend can stay in the
+	// warm cache without activity before the idle reaper evicts it. Shared
+	// tenant entries intentionally bypass this TTL and are reclaimed by the
+	// capacity LRU instead. 0 disables standalone idle eviction; the shared
+	// physical-DB handle reaper remains active.
 	//
 	// "Activity" means any access through Get, Acquire, or S3Backend —
 	// including foreground user requests (HTTP/FUSE), tenant-specific
@@ -83,8 +85,9 @@ type PoolConfig struct {
 	// per due attempt.
 	IdleTimeout time.Duration
 
-	// IdleReapInterval is how often the idle reaper scans for idle backends.
-	// Defaults to defaultTenantPoolIdleReapInterval when IdleTimeout > 0.
+	// IdleReapInterval is how often the reaper scans standalone entries and
+	// unreferenced shared physical-DB handles. It defaults to
+	// defaultTenantPoolIdleReapInterval when not set.
 	IdleReapInterval time.Duration
 
 	// SharedDBForcePlaintext, when true, opens shared-schema DB handles without
@@ -248,7 +251,7 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 	}
 	idleTimeout := cfg.IdleTimeout
 	reapInterval := cfg.IdleReapInterval
-	if reapInterval <= 0 && idleTimeout > 0 {
+	if reapInterval <= 0 {
 		reapInterval = defaultTenantPoolIdleReapInterval
 	}
 	metrics.RecordGauge("tenant_pool", "cached_backends", 0)
@@ -691,11 +694,11 @@ func withTenantPoolDrainTimeout(ctx context.Context) (context.Context, context.C
 	return context.WithTimeout(ctx, defaultTenantPoolDrainTimeout)
 }
 
-// Start launches the idle reaper goroutine if IdleTimeout is configured.
-// Safe to call on a pool with IdleTimeout=0 (no-op). The reaper is stopped
-// by Close.
+// Start launches the reaper goroutine. IdleTimeout=0 disables standalone
+// tenant eviction, but shared physical-DB handles still need this reaper.
+// The reaper is stopped by Close.
 func (p *Pool) Start(ctx context.Context) {
-	if p == nil || p.idleTimeout <= 0 {
+	if p == nil || p.reapInterval <= 0 {
 		return
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
@@ -724,31 +727,30 @@ func (p *Pool) reapLoop(ctx context.Context) {
 }
 
 func (p *Pool) reapOnce(ctx context.Context) {
-	if p.idleTimeout <= 0 {
-		return
-	}
 	now := time.Now()
 	var toClose []*entry
-	p.mu.Lock()
-	for _, e := range p.items {
-		if e.retired || e.refs > 0 {
-			continue
-		}
-		// Shared tenant backends are lightweight fs_id-scoped views over a
-		// separately managed physical DB handle. Keep them warm until the
-		// capacity LRU evicts them; applying the standalone idle TTL here turns
-		// stable high-cardinality shared traffic into continuous cold opens.
-		if e.sharedDBID > 0 {
-			continue
-		}
-		if now.Sub(e.lastUsed) > p.idleTimeout {
-			if removed := p.removeLocked(e.elem, "idle"); removed != nil {
-				toClose = append(toClose, removed)
+	if p.idleTimeout > 0 {
+		p.mu.Lock()
+		for _, e := range p.items {
+			if e.retired || e.refs > 0 {
+				continue
+			}
+			// Shared tenant backends are lightweight fs_id-scoped views over a
+			// separately managed physical DB handle. Keep them warm until the
+			// capacity LRU evicts them; applying the standalone idle TTL here turns
+			// stable high-cardinality shared traffic into continuous cold opens.
+			if e.sharedDBID > 0 {
+				continue
+			}
+			if now.Sub(e.lastUsed) > p.idleTimeout {
+				if removed := p.removeLocked(e.elem, "idle"); removed != nil {
+					toClose = append(toClose, removed)
+				}
 			}
 		}
+		p.recordCachedBackendCountLocked()
+		p.mu.Unlock()
 	}
-	p.recordCachedBackendCountLocked()
-	p.mu.Unlock()
 	for _, retired := range toClose {
 		p.closeEntry(retired)
 	}
