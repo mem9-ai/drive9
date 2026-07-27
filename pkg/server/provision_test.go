@@ -2266,6 +2266,39 @@ func TestManagedSharedDBProvisioningHeartbeatFailureDoesNotCancelSchemaWork(t *t
 	}
 }
 
+func TestManagedSharedDBProvisioningHeartbeatDoesNotWarnAfterStatusAdvance(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testmysql.ResetMetaDB(t, metaStore.DB())
+	spendingTarget := meta.MaxTiDBCloudSpendingLimit
+	dbID, err := metaStore.CreateManagedSharedDBPool(context.Background(), &meta.SharedDB{
+		TiDBCloudOrganizationID: "org-heartbeat-advanced", ProvisioningKey: bytes.Repeat([]byte{6}, 32),
+		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &spendingTarget,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metaStore.DB().ExecContext(context.Background(), `UPDATE db_pool SET status = ? WHERE db_id = ?`, meta.SharedDBStatusActive, dbID); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{meta: metaStore, managedSharedDBStuckTimeout: 40 * time.Millisecond}
+	core, observed := observer.New(zap.WarnLevel)
+	workCtx := logger.WithContext(context.Background(), zap.New(core))
+	if err := srv.withManagedSharedDBProvisioningHeartbeat(workCtx, dbID, func(context.Context) error {
+		time.Sleep(100 * time.Millisecond)
+		return nil
+	}); err != nil {
+		t.Fatalf("schema work after status advance: %v", err)
+	}
+	if got := observed.FilterMessage("managed_shared_db_pool_provisioning_heartbeat_failed").Len(); got != 0 {
+		t.Fatalf("heartbeat warnings after status advance = %d, want 0", got)
+	}
+}
+
 func TestManagedSharedDBBatchCreateSubmitsFiftyPoolsInOneRequest(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

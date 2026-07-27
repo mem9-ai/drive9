@@ -1108,6 +1108,11 @@ func (s *Server) withManagedSharedDBProvisioningHeartbeat(ctx context.Context, d
 					if heartbeatCtx.Err() != nil {
 						return
 					}
+					if errors.Is(err, meta.ErrSharedDBPoolNotProvisioning) {
+						logger.Debug(ctx, "managed_shared_db_pool_provisioning_heartbeat_stopped_status_advanced",
+							zap.Int64("db_pool_id", dbID), zap.Error(err))
+						return
+					}
 					logger.Warn(ctx, "managed_shared_db_pool_provisioning_heartbeat_failed",
 						zap.Int64("db_pool_id", dbID), zap.Error(err))
 				}
