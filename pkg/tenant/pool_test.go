@@ -1327,7 +1327,7 @@ func TestCloseEntryPreservesLiveTenantCounters(t *testing.T) {
 	metrics.DeleteTenantCounters(tenantID)
 	t.Cleanup(func() { metrics.DeleteTenantCounters(tenantID) })
 
-	metrics.RecordTenantRequestCountWithOrg(tenantID, "org-live-counter", "api", "read", 200)
+	metrics.RecordTenantRequestCountWithOrg(tenantID, "org-live-counter", "fs", "read", 200)
 	assertTenantMetricPresent := func() {
 		t.Helper()
 		recorder := httptest.NewRecorder()

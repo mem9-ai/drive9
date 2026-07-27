@@ -618,13 +618,12 @@ func TestSharedTenantStatusLogsAndMetricsUseDBOrganization(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	metrics.WritePrometheus(recorder)
 	metricsText := recorder.Body.String()
-	wantMetric := `drive9_tenant_requests_total{action="get",status_class="2xx",surface="status",tenant_id="` + rt.tenantID + `",tidbcloud_org_id="org-shared-status-output"}`
+	wantMetric := `drive9_tenant_requests_total{action="get",status_class="2xx",surface="status"}`
 	if !strings.Contains(metricsText, wantMetric) {
-		t.Fatalf("missing shared status request metric %q", wantMetric)
+		t.Fatalf("missing aggregated status request metric %q", wantMetric)
 	}
-	wrongMetric := `drive9_tenant_requests_total{action="get",status_class="2xx",surface="status",tenant_id="` + rt.tenantID + `",tidbcloud_org_id="guest"}`
-	if strings.Contains(metricsText, wrongMetric) {
-		t.Fatalf("shared status request metric used guest org %q", wrongMetric)
+	if strings.Contains(metricsText, `drive9_tenant_requests_total{action="get",status_class="2xx",surface="status",tenant_id=`) {
+		t.Fatalf("successful status request metric unexpectedly carried tenant labels")
 	}
 }
 

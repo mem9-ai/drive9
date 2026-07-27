@@ -2334,11 +2334,8 @@ func TestMetricsEndpoint(t *testing.T) {
 	if strings.Contains(text, `drive9_tenant_inflight_requests{surface="fs",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Errorf("completed tenant in-flight usage metric should be removed: %s", text)
 	}
-	if !strings.Contains(text, `drive9_tenant_http_bytes_total{direction="request",tenant_id="local",tidbcloud_org_id="guest"}`) {
-		t.Errorf("expected tenant HTTP byte metric in response: %s", text)
-	}
-	if strings.Contains(text, `drive9_tenant_http_bytes_total{action="`) {
-		t.Errorf("tenant HTTP byte metric should not carry action: %s", text)
+	if strings.Contains(text, "drive9_tenant_http_bytes_total") {
+		t.Errorf("HTTP transport byte metric should not be exported: %s", text)
 	}
 	if !strings.Contains(text, `drive9_tenant_file_bytes_total{direction="write",tenant_id="local",tidbcloud_org_id="guest"}`) {
 		t.Fatalf("expected tenant file write byte metric in response: %s", text)
