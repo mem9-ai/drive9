@@ -11484,6 +11484,15 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		return fs.flushGitHandleLockedWithPolicy(flushCtx, fh, fs.syncMode == SyncStrict)
 	}
 
+	// Unlink-while-open: never stage/enqueue/upload. Fsync can otherwise
+	// re-enter commitQueue after Unlink's ordered drain and resurrect the
+	// deleted path (write → unlink → fsync → close → rmdir ENOTEMPTY).
+	if fh.Unlinked {
+		phase = "unlinked-discard"
+		fs.discardUnlinkedHandleStateLocked(fh)
+		return gofuse.OK
+	}
+
 	// Interactive mode: Fsync = local durable only. Shadow file + journal
 	// ensure crash safety. Remote commit happens asynchronously.
 	requiresRemoteSync := isSQLitePersistentJournalPath(fh.Path)

@@ -66,6 +66,10 @@ class CommunityPjdfstest(BaseModule):
             report = self.parse(combined, str(log), result.code)
             write_json(ctx.result_dir / "pjdfstests.json", report)
             ctx.metric("community.pjdfstest.raw_pass_rate", float(report["raw_pass_rate"]), "ratio")
+            if anomaly := report.get("anomaly"):
+                raise BlackboxError(f"pjdfstest harness anomaly ({anomaly}); see {log}")
+            if report["total_cases"] <= 0:
+                raise BlackboxError(f"pjdfstest produced no test summary; see {log}")
             if report["failed_cases"] > 0:
                 raise BlackboxError(f"pjdfstest failures={report['failed_cases']}; see {log}")
             return report
@@ -99,15 +103,21 @@ class CommunityPjdfstest(BaseModule):
             # Ignore TAP TODO failures when counting raw not-ok lines.
             failed_cases = len(re.findall(r"(?m)^not ok\s+\d+(?!.*# TODO)", text))
             total_cases = failed_cases
-        # Trust prove's final Result line when present.
-        if re.search(r"(?m)^Result:\s*PASS\s*$", text) and rc == 0:
-            failed_cases = 0
-            failed_files = []
+        result_pass = re.search(r"(?m)^Result:\s*PASS\s*$", text) is not None
+        anomaly = ""
+        # Do not erase already-parsed failures just because prove printed
+        # Result: PASS — that hides parser/output inconsistencies (B2).
+        if result_pass and rc == 0 and failed_cases > 0:
+            anomaly = "result_pass_with_failed_summaries"
         if rc != 0 and failed_cases == 0:
             failed_cases = 1
             total_cases = max(total_cases, 1)
+        # No Files=/Tests= summary and no counted cases: fail-closed (B3).
+        # A successful run must produce a non-zero test count.
+        if total_cases == 0 and not anomaly:
+            anomaly = "no_test_summary"
         passed_cases = max(total_cases - failed_cases, 0)
-        return {
+        report: dict[str, Any] = {
             "schema": "drive9-fuse-pjdfstest/v2",
             "rc": rc,
             "log": log_path,
@@ -115,6 +125,10 @@ class CommunityPjdfstest(BaseModule):
             "total_cases": total_cases,
             "passed_cases": passed_cases,
             "failed_cases": failed_cases,
-            "raw_pass_rate": (passed_cases / total_cases) if total_cases else 1.0 if rc == 0 else 0.0,
+            # Zero-test runs report 0.0, never a fake perfect score.
+            "raw_pass_rate": (passed_cases / total_cases) if total_cases else 0.0,
             "failed_files": failed_files,
         }
+        if anomaly:
+            report["anomaly"] = anomaly
+        return report
