@@ -197,7 +197,10 @@ var (
 	defaultSharedDBHandleIdleTTL            = 30 * time.Minute
 )
 
-const sharedDBSchemaLockReleaseTimeout = 5 * time.Second
+const (
+	sharedDBSchemaLockReleaseTimeout        = 5 * time.Second
+	sharedDBSchemaForegroundLockWaitSeconds = 1
+)
 
 func ensureTiDBSchemaForEmbeddingMode(ctx context.Context, db *sql.DB, mode string, profile schema.TiDBAutoEmbeddingProfile) error {
 	tidbMode, err := TiDBEmbeddingModeForTenantMode(mode)
@@ -216,23 +219,43 @@ func ensureTiDBSchemaForEmbeddingMode(ctx context.Context, db *sql.DB, mode stri
 
 // withSharedDBSchemaAdvisoryLock serializes schema ensure on the target
 // physical DB itself. It does not retain a MetaDB connection, and distinct
-// db_pool rows use distinct lock names so their DDL remains concurrent.
-func withSharedDBSchemaAdvisoryLock(ctx context.Context, db *sql.DB, dbID int64, fn func(context.Context) error) (err error) {
+// db_pool rows use distinct lock names so their DDL remains concurrent. The
+// lock is session-owned; if that target connection is lost mid-DDL, TiDB
+// releases it and a later attempt can overlap the still-finishing statement.
+func withSharedDBSchemaAdvisoryLock(
+	ctx context.Context,
+	db *sql.DB,
+	dbID int64,
+	waitForLock bool,
+	fn func(context.Context) error,
+) (err error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close() }()
 	lockName := fmt.Sprintf("drive9:shared-schema:%d", dbID)
-	var acquired sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 0)", lockName).Scan(&acquired); err != nil {
-		return fmt.Errorf("acquire shared schema advisory lock for db pool %d: %w", dbID, err)
+	waitSeconds := 0
+	if waitForLock {
+		waitSeconds = sharedDBSchemaForegroundLockWaitSeconds
 	}
-	if !acquired.Valid {
-		return fmt.Errorf("acquire shared schema advisory lock for db pool %d returned NULL", dbID)
-	}
-	if acquired.Int64 != 1 {
-		return fmt.Errorf("%w for db pool %d", errSharedDBSchemaEnsureBusy, dbID)
+	for {
+		var acquired sql.NullInt64
+		if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, waitSeconds).Scan(&acquired); err != nil {
+			return fmt.Errorf("acquire shared schema advisory lock for db pool %d: %w", dbID, err)
+		}
+		if !acquired.Valid {
+			return fmt.Errorf("acquire shared schema advisory lock for db pool %d returned NULL", dbID)
+		}
+		if acquired.Int64 == 1 {
+			break
+		}
+		if !waitForLock {
+			return fmt.Errorf("%w for db pool %d", errSharedDBSchemaEnsureBusy, dbID)
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("wait for shared schema advisory lock for db pool %d: %w", dbID, err)
+		}
 	}
 	defer func() {
 		releaseCtx, cancel := context.WithTimeout(context.Background(), sharedDBSchemaLockReleaseTimeout)
@@ -1094,6 +1117,10 @@ func (p *Pool) reapIdleSharedDBs(now time.Time) {
 // (db_pool.id), opening it on first use. An unreferenced handle remains warm
 // for defaultSharedDBHandleIdleTTL and is then closed by the existing reaper.
 func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) {
+	return p.sharedDBHandleWithSchemaLockWait(ctx, dbID, true)
+}
+
+func (p *Pool) sharedDBHandleWithSchemaLockWait(ctx context.Context, dbID int64, waitForSchemaLock bool) (*sql.DB, error) {
 	p.sharedMu.Lock()
 	if db, ok := p.sharedDBs[dbID]; ok {
 		p.sharedDBLastUsed[dbID] = time.Now()
@@ -1159,9 +1186,9 @@ func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) 
 		return nil, fmt.Errorf("shared db %d: open: %w", dbID, err)
 	}
 	if info.SchemaVersion != schema.CurrentSharedTiDBSchemaVersion {
-		if err := withSharedDBSchemaAdvisoryLock(ctx, db, dbID, func(lockCtx context.Context) error {
+		if err := withSharedDBSchemaAdvisoryLock(ctx, db, dbID, waitForSchemaLock, func(lockCtx context.Context) error {
 			// Another pod may have completed the migration between the initial
-			// metadata read and this non-blocking lock acquisition.
+			// metadata read and this lock acquisition.
 			current, err := p.metaStore.GetSharedDB(lockCtx, dbID)
 			if err != nil {
 				return err
@@ -1196,7 +1223,7 @@ func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sql.DB, error) 
 // EnsureSharedDBReady opens the shared physical DB through the normal cache
 // path, which also compares and applies the checked-in shared schema version.
 func (p *Pool) EnsureSharedDBReady(ctx context.Context, dbID int64) error {
-	_, err := p.sharedDBHandle(ctx, dbID)
+	_, err := p.sharedDBHandleWithSchemaLockWait(ctx, dbID, false)
 	return err
 }
 

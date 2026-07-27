@@ -1078,7 +1078,9 @@ func managedSharedDBConnectionMetadataComplete(poolInfo *meta.SharedDB) bool {
 // withManagedSharedDBProvisioningHeartbeat renews durable progress only when a
 // single remote provisioning attempt runs for a meaningful fraction of the
 // stuck timeout. Fast failures therefore remain eligible for normal stuck
-// cleanup instead of being kept alive by frequent retries.
+// cleanup instead of being kept alive by frequent retries. A heartbeat is
+// advisory: a transient MetaDB failure is logged but never cancels target-DB
+// schema work that is already in progress.
 func (s *Server) withManagedSharedDBProvisioningHeartbeat(ctx context.Context, dbID int64, fn func(context.Context) error) error {
 	timeout := s.managedSharedDBStuckTimeout
 	if timeout <= 0 {
@@ -1089,30 +1091,29 @@ func (s *Server) withManagedSharedDBProvisioningHeartbeat(ctx context.Context, d
 		interval = time.Millisecond
 	}
 	heartbeatCtx, cancel := context.WithCancel(ctx)
-	heartbeatDone := make(chan error, 1)
+	heartbeatDone := make(chan struct{})
 	go func() {
+		defer close(heartbeatDone)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-heartbeatCtx.Done():
-				heartbeatDone <- nil
 				return
 			case <-ticker.C:
 				if err := s.meta.RefreshManagedSharedDBProvisioningProgress(heartbeatCtx, dbID); err != nil {
-					heartbeatDone <- err
-					cancel()
-					return
+					if heartbeatCtx.Err() != nil {
+						return
+					}
+					logger.Warn(ctx, "managed_shared_db_pool_provisioning_heartbeat_failed",
+						zap.Int64("db_pool_id", dbID), zap.Error(err))
 				}
 			}
 		}
 	}()
-	workErr := fn(heartbeatCtx)
+	workErr := fn(ctx)
 	cancel()
-	heartbeatErr := <-heartbeatDone
-	if heartbeatErr != nil {
-		return errors.Join(workErr, fmt.Errorf("refresh managed shared db provisioning progress: %w", heartbeatErr))
-	}
+	<-heartbeatDone
 	return workErr
 }
 
@@ -1356,13 +1357,12 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 	return s.finishManagedSharedDBProvisioning(ctx, poolInfo, cred)
 }
 
-// finishManagedSharedDBProvisioning performs idempotent remote schema ensure
-// and activation after physical identity and connection metadata are durable.
-// It intentionally does not hold the MetaDB pool-work session lock: remote DDL
-// can take minutes, while leader-only consumption and per-process job dedup
-// prevent normal overlap and the operations below are safe to retry after a
-// leader handoff. A low-rate durable heartbeat prevents the stuck watchdog
-// from failing a pool while one of those long remote DDL operations is active.
+// finishManagedSharedDBProvisioning performs remote schema ensure and
+// activation after physical identity and connection metadata are durable. It
+// intentionally does not retain a MetaDB pool-work session across remote DDL;
+// the target TiDB advisory lock in EnsureSharedDBReady serializes schema work
+// across an overlapping leader handoff. A low-rate durable heartbeat prevents
+// the stuck watchdog from failing a pool while that work is active.
 func (s *Server) finishManagedSharedDBProvisioning(ctx context.Context, poolInfo *meta.SharedDB, cred tenant.CredentialProvisionRequest) error {
 	if poolInfo == nil {
 		return fmt.Errorf("managed shared db pool is required")
