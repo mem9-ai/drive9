@@ -30,6 +30,10 @@ const (
 	// server-only because it is emitted by durable tenant lifecycle transitions,
 	// not by a tenant DB write path.
 	WorkMetricsCleanup = meta.TenantNotifyWorkMetricsCleanup
+	// WorkAPIKeyCacheCleanup (bit 4) invalidates locally cached API-key
+	// resolutions after a key revocation. It is broadcast to every pod but does
+	// not touch tenant metrics for live tenants.
+	WorkAPIKeyCacheCleanup = meta.TenantNotifyWorkAPIKeyCacheCleanup
 )
 
 // Compile-time assertions that the server-side work mask constants match the
@@ -40,4 +44,5 @@ var (
 	_ = [1]byte{}[backend.BackendWorkSemantic^WorkSemantic]
 	_ = [1]byte{}[backend.BackendWorkFileGC^WorkFileGC]
 	_ = [1]byte{}[backend.BackendWorkMetricsCleanup^WorkMetricsCleanup]
+	_ = [1]byte{}[backend.BackendWorkAPIKeyCacheCleanup^WorkAPIKeyCacheCleanup]
 )

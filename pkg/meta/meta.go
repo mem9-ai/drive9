@@ -49,6 +49,7 @@ const (
 	TenantNotifyWorkSemantic
 	TenantNotifyWorkFileGC
 	TenantNotifyWorkMetricsCleanup
+	TenantNotifyWorkAPIKeyCacheCleanup
 )
 
 var allTenantStatuses = []TenantStatus{
@@ -3828,10 +3829,23 @@ func (s *Store) RevokeTenantAPIKeys(ctx context.Context, tenantID string) (err e
 	start := time.Now()
 	defer observeMeta(ctx, "revoke_tenant_api_keys", start, &err)
 	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `UPDATE tenant_api_keys
-		SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
-		WHERE tenant_id = ? AND status = ?`,
-		APIKeyRevoked, now, now, tenantID, APIKeyActive)
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE tenant_api_keys
+			SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+			WHERE tenant_id = ? AND status = ?`,
+			APIKeyRevoked, now, now, tenantID, APIKeyActive)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkAPIKeyCacheCleanup)
+	})
 	if err != nil {
 		return err
 	}
@@ -3843,18 +3857,30 @@ func (s *Store) RevokeAPIKey(ctx context.Context, tenantID, apiKeyID string) (er
 	start := time.Now()
 	defer observeMeta(ctx, "revoke_api_key", start, &err)
 	now := time.Now().UTC()
-	res, err := s.db.ExecContext(ctx, `UPDATE tenant_api_keys
-		SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
-		WHERE tenant_id = ? AND id = ? AND status = ?`,
-		APIKeyRevoked, now, now, tenantID, apiKeyID, APIKeyActive)
+	updated := false
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE tenant_api_keys
+			SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+			WHERE tenant_id = ? AND id = ? AND status = ?`,
+			APIKeyRevoked, now, now, tenantID, apiKeyID, APIKeyActive)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		updated = n > 0
+		if !updated {
+			return nil
+		}
+		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkAPIKeyCacheCleanup)
+	})
 	if err != nil {
 		return err
 	}
-	// Evict even when the row was already revoked (n == 0): a cached active
-	// entry would be stale in that case.
 	s.apiKeys.evictTenant(tenantID)
-	n, _ := res.RowsAffected()
-	if n == 0 {
+	if !updated {
 		return ErrNotFound
 	}
 	return nil
@@ -3864,11 +3890,24 @@ func (s *Store) RevokeAPIKeysByIssuer(ctx context.Context, tenantID, provider, s
 	start := time.Now()
 	defer observeMeta(ctx, "revoke_api_keys_by_issuer", start, &err)
 	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `UPDATE tenant_api_keys
-		SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
-		WHERE tenant_id = ? AND issued_by_provider = ? AND issued_by_subject_key = ? AND status = ?
-			AND (? = '' OR id <> ?)`,
-		APIKeyRevoked, now, now, tenantID, provider, subjectKey, APIKeyActive, exceptAPIKeyID, exceptAPIKeyID)
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE tenant_api_keys
+			SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+			WHERE tenant_id = ? AND issued_by_provider = ? AND issued_by_subject_key = ? AND status = ?
+				AND (? = '' OR id <> ?)`,
+			APIKeyRevoked, now, now, tenantID, provider, subjectKey, APIKeyActive, exceptAPIKeyID, exceptAPIKeyID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkAPIKeyCacheCleanup)
+	})
 	if err != nil {
 		return err
 	}
@@ -4828,7 +4867,8 @@ func (s *Store) DeleteSubscriptionsForStalePods(ctx context.Context) (n int64, e
 
 // TenantNotifyRow mirrors a row in tenant_notify_outbox. Each row is a
 // lightweight work signal: tenant_id identifies the tenant and work_mask is a
-// bitmask of work types to dispatch (SSE, semantic, file_gc, metrics cleanup).
+// bitmask of work types to dispatch (SSE, semantic, file_gc, metrics cleanup,
+// or API-key cache cleanup).
 type TenantNotifyRow struct {
 	ID             uint64
 	TenantID       string

@@ -9,6 +9,8 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
 
 // mockKicker records kicks for deterministic testing of the poller.
@@ -97,6 +99,53 @@ func TestTenantOutboxPollerMetricsCleanupIsBroadcast(t *testing.T) {
 	}
 	if len(k.kicks) != 0 {
 		t.Fatalf("metrics cleanup should not kick sharded work, got %d kicks", len(k.kicks))
+	}
+}
+
+func TestTenantOutboxPollerAPIKeyCacheCleanupIsBroadcastWithoutDeletingMetrics(t *testing.T) {
+	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBZero, meta.APIKeyScopeKindOwner)
+	ctx := context.Background()
+	hash := token.HashToken(rt.apiKey)
+	resolved, err := rt.meta.ResolveByAPIKeyHash(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.APIKey.Status != meta.APIKeyActive {
+		t.Fatalf("initial API key status = %s, want %s", resolved.APIKey.Status, meta.APIKeyActive)
+	}
+	if _, err := rt.meta.DB().ExecContext(ctx, `UPDATE tenant_api_keys
+		SET status = ?, revoked_at = CURRENT_TIMESTAMP(3), updated_at = CURRENT_TIMESTAMP(3)
+		WHERE tenant_id = ?`, meta.APIKeyRevoked, rt.tenantID); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := rt.meta.ResolveByAPIKeyHash(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale.APIKey.Status != meta.APIKeyActive {
+		t.Fatalf("pre-dispatch cached API key status = %s, want stale %s", stale.APIKey.Status, meta.APIKeyActive)
+	}
+
+	metrics.RecordTenantOperationWithOrg(rt.tenantID, "org-live", "event_bus", "publish", "error", 0)
+	p := newTenantOutboxPoller(rt.meta, newEventBuses(), &mockKicker{}, func(string) bool { return false }, "pod1", 0, 0)
+	p.dispatch(ctx, meta.TenantNotifyRow{
+		ID:        1,
+		TenantID:  rt.tenantID,
+		WorkMask:  WorkAPIKeyCacheCleanup,
+		CreatedAt: time.Now(),
+	})
+
+	refetched, err := rt.meta.ResolveByAPIKeyHash(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refetched.APIKey.Status != meta.APIKeyRevoked {
+		t.Fatalf("post-dispatch API key status = %s, want %s", refetched.APIKey.Status, meta.APIKeyRevoked)
+	}
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	if !strings.Contains(recorder.Body.String(), rt.tenantID) {
+		t.Fatalf("API-key-only cache cleanup deleted live tenant metrics: %s", recorder.Body.String())
 	}
 }
 

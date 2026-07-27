@@ -73,10 +73,11 @@ const (
 // allocation lives in pkg/meta; backend aliases let tenant write paths signal
 // work without importing the server package (which would be a cycle).
 const (
-	BackendWorkSSE            = meta.TenantNotifyWorkSSE            // wake local SSE bus
-	BackendWorkSemantic       = meta.TenantNotifyWorkSemantic       // kick semantic worker
-	BackendWorkFileGC         = meta.TenantNotifyWorkFileGC         // kick file GC worker
-	BackendWorkMetricsCleanup = meta.TenantNotifyWorkMetricsCleanup // reserved for lifecycle cleanup; backend does not emit it
+	BackendWorkSSE                = meta.TenantNotifyWorkSSE                // wake local SSE bus
+	BackendWorkSemantic           = meta.TenantNotifyWorkSemantic           // kick semantic worker
+	BackendWorkFileGC             = meta.TenantNotifyWorkFileGC             // kick file GC worker
+	BackendWorkMetricsCleanup     = meta.TenantNotifyWorkMetricsCleanup     // reserved for lifecycle cleanup; backend does not emit it
+	BackendWorkAPIKeyCacheCleanup = meta.TenantNotifyWorkAPIKeyCacheCleanup // reserved for auth-cache invalidation; backend does not emit it
 )
 
 // Dat9Backend implements filesystem.FileSystem with the inode model.

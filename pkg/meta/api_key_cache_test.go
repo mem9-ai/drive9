@@ -141,6 +141,69 @@ func TestResolveByAPIKeyHashRevokeAPIKeyEvictsCache(t *testing.T) {
 	}
 }
 
+func TestAPIKeyRevocationsWriteCacheCleanupOutbox(t *testing.T) {
+	tests := []struct {
+		name   string
+		revoke func(context.Context, *Store, string, string) error
+	}{
+		{
+			name: "single key",
+			revoke: func(ctx context.Context, s *Store, tenantID, keyID string) error {
+				return s.RevokeAPIKey(ctx, tenantID, keyID)
+			},
+		},
+		{
+			name: "all tenant keys",
+			revoke: func(ctx context.Context, s *Store, tenantID, _ string) error {
+				return s.RevokeTenantAPIKeys(ctx, tenantID)
+			},
+		},
+		{
+			name: "issuer keys",
+			revoke: func(ctx context.Context, s *Store, tenantID, _ string) error {
+				return s.RevokeAPIKeysByIssuer(ctx, tenantID, "slock", "subject-1", "")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newControlStore(t)
+			ctx := context.Background()
+			if _, err := s.DB().ExecContext(ctx, `DELETE FROM tenant_notify_outbox`); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_, _ = s.DB().ExecContext(context.Background(), `DELETE FROM tenant_notify_outbox`)
+			})
+			tenantID := "cache-outbox-" + strings.ReplaceAll(tt.name, " ", "-")
+			keyID := tenantID + "-key"
+			insertCacheTestTenant(t, s, tenantID)
+			insertCacheTestKey(t, s, tenantID, keyID, tenantID+"-hash")
+			if tt.name == "issuer keys" {
+				if _, err := s.DB().ExecContext(ctx, `UPDATE tenant_api_keys
+					SET issued_by_provider = 'slock', issued_by_subject_key = 'subject-1'
+					WHERE id = ?`, keyID); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := tt.revoke(ctx, s, tenantID, keyID); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := s.ListTenantNotifySince(ctx, 0, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range rows {
+				if row.TenantID == tenantID && row.WorkMask&TenantNotifyWorkAPIKeyCacheCleanup != 0 {
+					return
+				}
+			}
+			t.Fatalf("missing durable API-key cache-cleanup outbox row for tenant %s: %+v", tenantID, rows)
+		})
+	}
+}
+
 func TestResolveByAPIKeyHashRevokeTenantAPIKeysEvictsCache(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()

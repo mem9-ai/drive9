@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -74,36 +75,53 @@ func TestCriticalWorkerMetricsUseBoundedLabels(t *testing.T) {
 }
 
 func TestTenantOutboxBacklogAgeTracksObservedRowsAndSurvivesPollErrors(t *testing.T) {
-	RecordTenantOutboxPoll("ok", time.Millisecond, 1000, 2*time.Minute, true)
-	rec := httptest.NewRecorder()
-	WritePrometheus(rec)
-	if !strings.Contains(rec.Body.String(), `drive9_tenant_outbox_batch_size_count 1`) {
-		t.Fatalf("successful poll did not observe one batch-size sample:\n%s", rec.Body.String())
+	histogramCount := func() float64 {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		WritePrometheus(rec)
+		for _, line := range strings.Split(rec.Body.String(), "\n") {
+			if !strings.HasPrefix(line, "drive9_tenant_outbox_batch_size_count ") {
+				continue
+			}
+			value, err := strconv.ParseFloat(strings.TrimPrefix(line, "drive9_tenant_outbox_batch_size_count "), 64)
+			if err != nil {
+				t.Fatalf("parse batch-size histogram count %q: %v", line, err)
+			}
+			return value
+		}
+		return 0
 	}
+	baseline := histogramCount()
+	RecordTenantOutboxPoll("ok", time.Millisecond, 1000, 2*time.Minute, true)
+	if got := histogramCount(); got != baseline+1 {
+		t.Fatalf("successful poll changed batch-size count from %v to %v, want %v", baseline, got, baseline+1)
+	}
+	afterSuccess := histogramCount()
 	RecordTenantOutboxPoll("error", time.Millisecond, 0, 0, false)
 
-	rec = httptest.NewRecorder()
-	WritePrometheus(rec)
-	if !strings.Contains(rec.Body.String(), `drive9_tenant_outbox_batch_size_count 1`) {
-		t.Fatalf("error poll injected a zero batch-size sample:\n%s", rec.Body.String())
+	if got := histogramCount(); got != afterSuccess {
+		t.Fatalf("error poll changed batch-size count from %v to %v", afterSuccess, got)
 	}
-	if !strings.Contains(rec.Body.String(), `drive9_tenant_outbox_backlog_oldest_age_seconds 120.000000`) {
-		t.Fatalf("poll error cleared last observed backlog age:\n%s", rec.Body.String())
+	if got := metricText(t); !strings.Contains(got, `drive9_tenant_outbox_backlog_oldest_age_seconds 120.000000`) {
+		t.Fatalf("poll error cleared last observed backlog age:\n%s", got)
 	}
 
 	RecordTenantOutboxPoll("ok", time.Millisecond, 1, 45*time.Second, false)
-	rec = httptest.NewRecorder()
-	WritePrometheus(rec)
-	if !strings.Contains(rec.Body.String(), `drive9_tenant_outbox_backlog_oldest_age_seconds 45.000000`) {
-		t.Fatalf("non-full batch did not report its oldest row age:\n%s", rec.Body.String())
+	if got := metricText(t); !strings.Contains(got, `drive9_tenant_outbox_backlog_oldest_age_seconds 45.000000`) {
+		t.Fatalf("non-full batch did not report its oldest row age:\n%s", got)
 	}
 
 	RecordTenantOutboxPoll("ok", time.Millisecond, 0, 0, false)
-	rec = httptest.NewRecorder()
-	WritePrometheus(rec)
-	if !strings.Contains(rec.Body.String(), `drive9_tenant_outbox_backlog_oldest_age_seconds 0.000000`) {
-		t.Fatalf("empty successful poll did not clear backlog age:\n%s", rec.Body.String())
+	if got := metricText(t); !strings.Contains(got, `drive9_tenant_outbox_backlog_oldest_age_seconds 0.000000`) {
+		t.Fatalf("empty successful poll did not clear backlog age:\n%s", got)
 	}
+}
+
+func metricText(t *testing.T) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	return rec.Body.String()
 }
 
 func TestAPIKeyResolveCacheRequestDoesNotRewriteEntryGauge(t *testing.T) {

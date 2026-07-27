@@ -212,6 +212,9 @@ func (p *tenantOutboxPoller) pollOnce(ctx context.Context) {
 
 // dispatch sends a single outbox row to the right consumer based on work_mask.
 func (p *tenantOutboxPoller) dispatch(ctx context.Context, row meta.TenantNotifyRow) {
+	if row.WorkMask&WorkAPIKeyCacheCleanup != 0 && p.metaStore != nil {
+		p.metaStore.InvalidateAPIKeyResolveCacheForTenant(row.TenantID)
+	}
 	if row.WorkMask&WorkMetricsCleanup != 0 {
 		metrics.DeleteTenantCounters(row.TenantID)
 		if p.metaStore != nil {

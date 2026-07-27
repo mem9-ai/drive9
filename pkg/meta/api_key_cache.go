@@ -13,11 +13,12 @@ import (
 
 // defaultAPIKeyResolveCacheTTL bounds how long a resolved API key entry may be
 // served from the in-process cache. Tenant-row and tenant_api_keys mutations
-// made through this Store evict the tenant's cached entries via the tenant
-// index; the TTL backstops changes made by other processes (each pod caches
-// independently) and the residual fill-after-evict race (a resolve reading
-// pre-mutation state concurrently with the mutation, then filling after the
-// eviction — that window has no version check and closes only at TTL expiry).
+// made through this Store evict the local tenant entries via the tenant index;
+// revocations also enqueue a durable cross-pod cache-cleanup signal. The TTL
+// backstops changes made by other processes and the residual fill-after-evict
+// race (a resolve reading pre-mutation state concurrently with the mutation,
+// then filling after the eviction — that window has no version check and closes
+// only at TTL expiry).
 const defaultAPIKeyResolveCacheTTL = 10 * time.Second
 
 // envAPIKeyResolveCacheTTLMS overrides defaultAPIKeyResolveCacheTTL (in
