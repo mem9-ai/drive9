@@ -178,6 +178,9 @@ func TestObserveSharedDBPoolMetricsRecordsCapacityTenantsAndSpending(t *testing.
 	if err != nil {
 		t.Fatalf("CreateManagedSharedDBPool pending: %v", err)
 	}
+	if _, err := metaStore.DB().ExecContext(ctx, `UPDATE db_pool SET updated_at = ? WHERE db_id = ?`, time.Now().UTC().Add(-20*time.Minute), pendingDBID); err != nil {
+		t.Fatalf("age pending db pool: %v", err)
+	}
 
 	now := time.Now().UTC()
 	for _, tc := range []struct {
@@ -218,6 +221,7 @@ func TestObserveSharedDBPoolMetricsRecordsCapacityTenantsAndSpending(t *testing.
 	for _, want := range []string{
 		`drive9_shared_db_pool_total{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",status="active",tidbcloud_org_id="org-shared-db-metrics"} 1`,
 		`drive9_shared_db_pool_total{db_pool_id="` + pendingDBPoolID + `",db_pool_uuid="` + pendingPoolUUID + `",status="pending",tidbcloud_org_id="org-shared-db-metrics"} 1`,
+		`drive9_shared_db_pool_status_age_seconds{db_pool_uuid="` + pendingPoolUUID + `",status="pending",tidbcloud_org_id="org-shared-db-metrics"}`,
 		`drive9_shared_db_pool_capacity{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="soft_max"} 5`,
 		`drive9_shared_db_pool_capacity{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="hard_max"} 6`,
 		`drive9_shared_db_pool_capacity{db_pool_id="` + dbPoolID + `",db_pool_uuid="` + activePoolUUID + `",tidbcloud_org_id="org-shared-db-metrics",type="used"} 2`,

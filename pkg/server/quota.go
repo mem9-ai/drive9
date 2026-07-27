@@ -418,19 +418,15 @@ func (s *Server) applyQuotaSet(ctx context.Context, metricPath string, t *meta.T
 	}
 	cloudCfg, err := updater.MarkQuotaUpdateStarted(ctx, clusterInfoFromTenant(t), cred)
 	if err != nil {
-		metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "mark_quota_update_started", "error")
 		return err
 	}
-	metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "mark_quota_update_started", "ok")
 	if req.TiDBCloudSpendingLimit != nil {
 		updatedCloudCfg, err := updater.UpdateQuota(ctx, clusterInfoFromTenant(t), cred, tenant.QuotaUpdateOptions{
 			TiDBCloudSpendingLimitMonthly: req.TiDBCloudSpendingLimit,
 		})
 		if err != nil {
-			metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "update_quota", "error")
 			return err
 		}
-		metrics.RecordTiDBCloudOpenAPIRequest(metricPath, "update_quota", "ok")
 		if cloudCfg == nil {
 			cloudCfg = updatedCloudCfg
 		} else if updatedCloudCfg != nil && updatedCloudCfg.TiDBCloudSpendingLimitMonthly != nil {

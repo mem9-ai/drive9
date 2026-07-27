@@ -255,8 +255,6 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			errJSON(w, http.StatusUnauthorized, "invalid API key")
 			return
 		}
-		setRequestMetricTenant(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, resolved.TiDBCloudOrgID, classifyTenantRequest(r))
-
 		if resolved.APIKey.Status != meta.APIKeyActive {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_key_inactive", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "status", resolved.APIKey.Status)...)
 			metricEvent(r.Context(), "auth", "result", "key_inactive")
@@ -335,7 +333,6 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			errJSON(w, http.StatusForbidden, "tenant is unavailable")
 			return
 		}
-
 		scopeKind := resolved.APIKey.ScopeKind
 		if scopeKind == "" {
 			scopeKind = meta.APIKeyScopeKindOwner
@@ -483,7 +480,7 @@ func handleDeleteNoAcquireAuth(w http.ResponseWriter, r *http.Request, pool *ten
 		ScopeKind:          scopeKind,
 		IsScoped:           isScoped,
 	}
-	setRequestMetricScope(r.Context(), scope, classifyTenantRequest(r))
+	setRequestMetricTenantForAuthStatus(r.Context(), scope.TenantID, scope.APIKeyID, scope.Provider, scope.TiDBCloudOrgID, resolved.Tenant.Status, classifyTenantRequest(r))
 	next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 }
 

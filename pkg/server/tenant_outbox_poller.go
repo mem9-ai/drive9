@@ -19,6 +19,10 @@ type outboxKicker interface {
 	KickWithOrg(tenantID, tidbCloudOrgID string, workMask int)
 }
 
+type outboxTenantForgetter interface {
+	ForgetTenant(tenantID string)
+}
+
 const (
 	// defaultTenantOutboxPollInterval is the poller's tick interval. At 200ms,
 	// cross-pod work delivery is bounded to ~200ms. The target is the
@@ -39,6 +43,7 @@ const (
 // tenant_notify_outbox table (in the always-provisioned meta DB) and
 // dispatches work by work_mask:
 //   - SSE bit → wake the local EventBus (broadcast: all pods with subscribers)
+//   - Metrics cleanup bit → delete this pod's tenant-scoped metrics
 //   - Semantic/FileGC/Quota bits → kick the unified worker if this pod's shard
 //     resolver owns the tenant (sharded: shard owner only)
 //
@@ -170,8 +175,10 @@ func (p *tenantOutboxPoller) pollOnce(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		pollStart := time.Now()
 		rows, err := p.metaStore.ListTenantNotifySince(ctx, p.lastID, tenantOutboxBatchSize)
 		if err != nil {
+			metrics.RecordTenantOutboxPoll(metrics.ResultForError(err), time.Since(pollStart), 0, 0, false)
 			logger.Warn(ctx, "tenant_outbox_poller_list_failed",
 				zap.Uint64("after_id", p.lastID),
 				zap.Error(err))
@@ -187,6 +194,14 @@ func (p *tenantOutboxPoller) pollOnce(ctx context.Context) {
 			p.dispatch(ctx, row)
 			p.lastID = row.ID
 		}
+		oldestAge := time.Duration(0)
+		if len(rows) > 0 {
+			oldestAge = time.Since(rows[0].CreatedAt)
+			if oldestAge < 0 {
+				oldestAge = 0
+			}
+		}
+		metrics.RecordTenantOutboxPoll("ok", time.Since(pollStart), len(rows), oldestAge, len(rows) == tenantOutboxBatchSize)
 		// If we got fewer rows than the batch size, we're caught up — wait for
 		// the next tick. Otherwise drain the remaining rows immediately.
 		if len(rows) < tenantOutboxBatchSize {
@@ -197,6 +212,18 @@ func (p *tenantOutboxPoller) pollOnce(ctx context.Context) {
 
 // dispatch sends a single outbox row to the right consumer based on work_mask.
 func (p *tenantOutboxPoller) dispatch(ctx context.Context, row meta.TenantNotifyRow) {
+	if row.WorkMask&WorkAPIKeyCacheCleanup != 0 && p.metaStore != nil {
+		p.metaStore.InvalidateAPIKeyResolveCacheForTenant(row.TenantID)
+	}
+	if row.WorkMask&WorkMetricsCleanup != 0 {
+		metrics.DeleteTenantCounters(row.TenantID)
+		if p.metaStore != nil {
+			p.metaStore.InvalidateAPIKeyResolveCacheForTenant(row.TenantID)
+		}
+		if forgetter, ok := p.worker.(outboxTenantForgetter); ok {
+			forgetter.ForgetTenant(row.TenantID)
+		}
+	}
 	if row.WorkMask&WorkSSE != 0 {
 		// SSE is broadcast: wake any local bus with subscribers for this tenant.
 		// If no bus exists, skip — we never touch the tenant's TiDB.
@@ -227,11 +254,14 @@ func (p *tenantOutboxPoller) flushCursor(ctx context.Context) {
 		return
 	}
 	if err := p.metaStore.UpsertTenantOutboxCursor(ctx, p.podID, p.lastID); err != nil {
+		metrics.RecordTenantOutboxCursorFlush(metrics.ResultForError(err))
 		if ctx.Err() == nil {
 			logger.Warn(ctx, "tenant_outbox_poller_cursor_flush_failed",
 				zap.String("pod_id", p.podID),
 				zap.Uint64("cursor", p.lastID),
 				zap.Error(err))
 		}
+		return
 	}
+	metrics.RecordTenantOutboxCursorFlush("ok")
 }

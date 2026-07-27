@@ -223,8 +223,8 @@ func (w *MutationReplayWorker) recordPendingBacklog(ctx context.Context) {
 	for _, obs := range observations {
 		orgID := normalizeTenantMetricTiDBCloudOrgID(obs.TiDBCloudOrgID)
 		if previousOrgID, ok := w.observedBacklogTenants[obs.TenantID]; ok && previousOrgID != orgID {
-			metrics.RecordTenantGaugeWithOrg(obs.TenantID, previousOrgID, "mutation_replay", "pending_mutations", 0)
-			metrics.RecordTenantGaugeWithOrg(obs.TenantID, previousOrgID, "mutation_replay", "oldest_pending_age_seconds", 0)
+			metrics.DeleteTenantGaugeWithOrg(obs.TenantID, previousOrgID, "mutation_replay", "pending_mutations")
+			metrics.DeleteTenantGaugeWithOrg(obs.TenantID, previousOrgID, "mutation_replay", "oldest_pending_age_seconds")
 		}
 		current[obs.TenantID] = orgID
 		w.observedBacklogTenants[obs.TenantID] = orgID
@@ -235,8 +235,8 @@ func (w *MutationReplayWorker) recordPendingBacklog(ctx context.Context) {
 		if _, ok := current[tenantID]; ok {
 			continue
 		}
-		metrics.RecordTenantGaugeWithOrg(tenantID, orgID, "mutation_replay", "pending_mutations", 0)
-		metrics.RecordTenantGaugeWithOrg(tenantID, orgID, "mutation_replay", "oldest_pending_age_seconds", 0)
+		metrics.DeleteTenantGaugeWithOrg(tenantID, orgID, "mutation_replay", "pending_mutations")
+		metrics.DeleteTenantGaugeWithOrg(tenantID, orgID, "mutation_replay", "oldest_pending_age_seconds")
 		delete(w.observedBacklogTenants, tenantID)
 	}
 	metrics.RecordOperation("mutation_replay", "observe_pending", "ok", time.Since(start))
@@ -244,8 +244,8 @@ func (w *MutationReplayWorker) recordPendingBacklog(ctx context.Context) {
 
 func (w *MutationReplayWorker) clearPendingBacklogGauges() {
 	for tenantID, orgID := range w.observedBacklogTenants {
-		metrics.RecordTenantGaugeWithOrg(tenantID, orgID, "mutation_replay", "pending_mutations", 0)
-		metrics.RecordTenantGaugeWithOrg(tenantID, orgID, "mutation_replay", "oldest_pending_age_seconds", 0)
+		metrics.DeleteTenantGaugeWithOrg(tenantID, orgID, "mutation_replay", "pending_mutations")
+		metrics.DeleteTenantGaugeWithOrg(tenantID, orgID, "mutation_replay", "oldest_pending_age_seconds")
 		delete(w.observedBacklogTenants, tenantID)
 	}
 }

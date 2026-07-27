@@ -788,6 +788,43 @@ func TestUpdateTenantStatus(t *testing.T) {
 	}
 }
 
+func TestUpdateTenantStatusDeletingWritesMetricsCleanupOutbox(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const tenantID = "tenant-status-cleanup-outbox"
+	if err := s.InsertTenant(ctx, &Tenant{
+		ID:               tenantID,
+		Status:           TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tenant_status_cleanup_outbox",
+		DBTLS:            true,
+		Provider:         "tidb_zero",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.UpdateTenantStatus(ctx, tenantID, TenantDeleting); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.ListTenantNotifySince(ctx, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.TenantID == tenantID && row.WorkMask&TenantNotifyWorkMetricsCleanup != 0 {
+			return
+		}
+	}
+	t.Fatalf("missing durable metrics-cleanup outbox row for tenant %s: %+v", tenantID, rows)
+}
+
 func TestFinalizeTenantDeleteUpdatesJobNamespaceAndTenant(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
@@ -936,12 +973,16 @@ func TestListTenantNotifySinceIncludesTiDBCloudOrgBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("notify row count = %d, want 1", len(rows))
+	for _, row := range rows {
+		if row.TenantID != tenantID {
+			continue
+		}
+		if row.TiDBCloudOrgID != "org-notify" {
+			t.Fatalf("notify row org = %q, want org-notify", row.TiDBCloudOrgID)
+		}
+		return
 	}
-	if rows[0].TiDBCloudOrgID != "org-notify" {
-		t.Fatalf("notify row org = %q, want org-notify", rows[0].TiDBCloudOrgID)
-	}
+	t.Fatalf("missing notify row for tenant %s: %+v", tenantID, rows)
 }
 
 func TestListTenantNotifySinceUsesSharedDBOrganization(t *testing.T) {
@@ -1544,7 +1585,7 @@ func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
 	for _, column := range []string{
 		"db_id", "uuid", "org_id", "cluster_id", "provisioning_key", "cloud_provider", "region",
 		"role", "db_host", "db_port", "db_user", "db_password", "db_name", "db_tls",
-		"max_tenants", "tenant_count", "soft_cap_reached", "spending_limit", "schema_version", "status",
+		"max_tenants", "tenant_count", "soft_cap_reached", "spending_limit", "schema_version", "status", "status_updated_at",
 		"created_at", "updated_at",
 	} {
 		if _, ok := dbPool.columns[column]; !ok {

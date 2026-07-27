@@ -274,22 +274,18 @@ func recordTenantQuotaSnapshot(tenantID, tidbCloudOrgID string, usage *QuotaUsag
 	if tenantID == "" || usage == nil {
 		return
 	}
-	metrics.RecordTenantStorageBytesWithOrg(tenantID, tidbCloudOrgID, "confirmed", usage.StorageBytes)
-	metrics.RecordTenantStorageBytesWithOrg(tenantID, tidbCloudOrgID, "reserved", usage.ReservedBytes)
-	metrics.RecordTenantMediaFilesWithOrg(tenantID, tidbCloudOrgID, "confirmed", usage.MediaFileCount)
-	metrics.RecordTenantVideoFilesWithOrg(tenantID, tidbCloudOrgID, "confirmed", usage.VideoFileCount)
-	if cfg == nil {
-		return
+	var storageLimit, mediaLimit, videoLimit int64
+	if cfg != nil {
+		storageLimit = cfg.MaxStorageBytes
+		mediaLimit = cfg.MaxMediaLLMFiles
+		videoLimit = cfg.MaxVideoLLMFiles
 	}
-	if cfg.MaxStorageBytes > 0 {
-		metrics.RecordTenantStorageBytesWithOrg(tenantID, tidbCloudOrgID, "limit", cfg.MaxStorageBytes)
-	}
-	if cfg.MaxMediaLLMFiles > 0 {
-		metrics.RecordTenantMediaFilesWithOrg(tenantID, tidbCloudOrgID, "limit", cfg.MaxMediaLLMFiles)
-	}
-	if cfg.MaxVideoLLMFiles > 0 {
-		metrics.RecordTenantVideoFilesWithOrg(tenantID, tidbCloudOrgID, "limit", cfg.MaxVideoLLMFiles)
-	}
+	metrics.ReplaceTenantQuotaSnapshotWithOrg(
+		tenantID, tidbCloudOrgID,
+		usage.StorageBytes, usage.ReservedBytes, usage.MediaFileCount, usage.VideoFileCount,
+		storageLimit, mediaLimit, videoLimit,
+		cfg != nil,
+	)
 }
 
 func quotaMediaDelta(oldIsMedia, newIsMedia bool) int64 {

@@ -1632,12 +1632,6 @@ func (p *Pool) closeEntry(e *entry) {
 		_ = e.store.Close()
 	}
 	p.releaseSharedDB(e.sharedDBID)
-	p.mu.Lock()
-	_, active := p.items[e.tenantID]
-	p.mu.Unlock()
-	if !active {
-		metrics.DeleteTenantCounters(e.tenantID)
-	}
 }
 
 type tenantPoolResult string

@@ -3,8 +3,13 @@ package server
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 func TestRequestRoute(t *testing.T) {
@@ -135,21 +140,65 @@ func TestSetRequestMetricTenantMovesInFlightLabel(t *testing.T) {
 	class := tenantRequestClass{surface: "object_store", action: "upload_part"}
 
 	setRequestMetricTenant(ctx, "local", "", "", "", class)
-	if got := m.tenantInFlight[tenantInFlightKey("local", defaultTenantMetricTiDBCloudOrgID, "object_store", "upload_part")]; got != 1 {
+	if got := m.tenantInFlight[tenantInFlightKey("local", defaultTenantMetricTiDBCloudOrgID, "object_store")]; got != 1 {
 		t.Fatalf("local in-flight = %d, want 1", got)
 	}
 
 	setRequestMetricTenant(ctx, "tenant-a", "", "", "org-a", class)
-	if got := m.tenantInFlight[tenantInFlightKey("local", defaultTenantMetricTiDBCloudOrgID, "object_store", "upload_part")]; got != 0 {
+	if got := m.tenantInFlight[tenantInFlightKey("local", defaultTenantMetricTiDBCloudOrgID, "object_store")]; got != 0 {
 		t.Fatalf("local in-flight after move = %d, want 0", got)
 	}
-	if got := m.tenantInFlight[tenantInFlightKey("tenant-a", "org-a", "object_store", "upload_part")]; got != 1 {
+	if got := m.tenantInFlight[tenantInFlightKey("tenant-a", "org-a", "object_store")]; got != 1 {
 		t.Fatalf("tenant-a in-flight = %d, want 1", got)
 	}
 
 	finishRequestMetricTenant(ctx)
 	if got := len(m.tenantInFlight); got != 0 {
 		t.Fatalf("tenant in-flight map size after finish = %d, want 0", got)
+	}
+}
+
+func TestSetRequestMetricTenantForAuthStatusOnlyScopesActiveTenants(t *testing.T) {
+	for _, status := range []meta.TenantStatus{meta.TenantDeleting, meta.TenantDeleted, meta.TenantSuspended} {
+		t.Run(string(status), func(t *testing.T) {
+			const tenantID = "tenant-auth-status-metrics"
+			metrics.DeleteTenantCounters(tenantID)
+			t.Cleanup(func() { metrics.DeleteTenantCounters(tenantID) })
+			ctx := withRequestMetricState(context.Background(), &requestMetricState{})
+			setRequestMetricTenantForAuthStatus(ctx, tenantID, "key", "db9", "org", status, tenantRequestClass{surface: "api", action: "read"})
+			if tenantID, _, _, _ := requestMetricScope(ctx); tenantID != "" {
+				t.Fatalf("tenant metric scope = %q for status %q, want empty", tenantID, status)
+			}
+			req := httptest.NewRequest(http.MethodGet, "http://example.test/v1/fs/stale", nil).WithContext(ctx)
+			recordTenantHTTPRequest(req, http.StatusForbidden, 0, 0)
+			recorder := httptest.NewRecorder()
+			metrics.WritePrometheus(recorder)
+			if strings.Contains(recorder.Body.String(), `tenant_id="`+tenantID+`"`) {
+				t.Fatalf("rejected %s request recreated tenant metrics:\n%s", status, recorder.Body.String())
+			}
+		})
+	}
+
+	ctx := withRequestMetricState(context.Background(), &requestMetricState{})
+	setRequestMetricTenantForAuthStatus(ctx, "tenant-active", "key", "db9", "org", meta.TenantActive, tenantRequestClass{surface: "api", action: "read"})
+	if tenantID, _, _, _ := requestMetricScope(ctx); tenantID != "tenant-active" {
+		t.Fatalf("tenant metric scope = %q, want tenant-active", tenantID)
+	}
+}
+
+func TestAdjustTenantInFlightAggregatesActionsForSameSurface(t *testing.T) {
+	m := newServerMetrics()
+	if got := m.adjustTenantInFlight("tenant-inflight-actions", "org-inflight-actions", "fs", 1); got != 1 {
+		t.Fatalf("read increment = %d, want 1", got)
+	}
+	if got := m.adjustTenantInFlight("tenant-inflight-actions", "org-inflight-actions", "fs", 1); got != 2 {
+		t.Fatalf("write increment = %d, want aggregate 2", got)
+	}
+	if got := m.adjustTenantInFlight("tenant-inflight-actions", "org-inflight-actions", "fs", -1); got != 1 {
+		t.Fatalf("read decrement = %d, want aggregate 1", got)
+	}
+	if got := m.adjustTenantInFlight("tenant-inflight-actions", "org-inflight-actions", "fs", -1); got != 0 {
+		t.Fatalf("write decrement = %d, want 0", got)
 	}
 }
 

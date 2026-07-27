@@ -237,7 +237,6 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 				zap.String("op", op),
 				zap.Error(err))
 			metrics.RecordTenantOperationWithOrg(bus.tenantID, bus.TiDBCloudOrgID(), "event_bus", "publish", metrics.ResultForError(err), 0)
-			metrics.RecordEventBusPublishErrorWithOrg(bus.tenantID, bus.TiDBCloudOrgID())
 		}
 	}
 
