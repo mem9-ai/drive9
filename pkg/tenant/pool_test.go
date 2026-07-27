@@ -182,6 +182,29 @@ func TestSharedDBHandleIdleReapUsesLongerTTLAndSkipsReferencedHandles(t *testing
 	}
 }
 
+func TestSharedDBHandleIdleReapRunsWhenTenantIdleEvictionDisabled(t *testing.T) {
+	p := NewPool(PoolConfig{IdleTimeout: 0}, nil)
+	t.Cleanup(p.Close)
+	db, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	p.sharedDBs[1] = db
+	p.sharedDBLastUsed[1] = time.Now().Add(-defaultSharedDBHandleIdleTTL - time.Second)
+
+	p.reapOnce(context.Background())
+
+	if _, ok := p.sharedDBs[1]; ok {
+		t.Fatal("expired unreferenced shared handle remains cached when tenant idle eviction is disabled")
+	}
+	if err := db.Ping(); err == nil {
+		t.Fatal("expired unreferenced shared handle remains open when tenant idle eviction is disabled")
+	}
+}
+
 func registerSharedDBForCacheMetrics(t *testing.T, orgID string) (*meta.Store, *Pool, int64, string) {
 	t.Helper()
 	metaStore, err := meta.OpenContext(context.Background(), testDSN)
