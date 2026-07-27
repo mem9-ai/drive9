@@ -1333,9 +1333,6 @@ func (s *Server) continueManagedSharedDBPoolLocked(ctx context.Context, poolInfo
 			return provisionErr
 		}
 	}
-	if poolInfo.Host == "" || poolInfo.Port <= 0 || poolInfo.User == "" || len(poolInfo.PasswordCipher) == 0 || poolInfo.Name == "" {
-		return fmt.Errorf("%w: db pool %d", errSharedDBConnectionMetadataNotReady, dbID)
-	}
 	return s.finishManagedSharedDBProvisioning(ctx, poolInfo, cred)
 }
 
