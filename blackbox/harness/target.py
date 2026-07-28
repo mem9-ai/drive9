@@ -173,10 +173,11 @@ class Drive9FuseTargetProvider:
         display = cmd if isinstance(cmd, str) else " ".join(cmd)
         start = time.monotonic()
         progress(f"command start: {safe_name} (timeout={timeout}s, logs={log_dir})")
-        # Truncate per invocation. Append mode caused modules that parse their
-        # own logs (e.g. community.pjdfstest) to pick up FAIL lines from older
-        # runs in the same work-dir even when the current prove exited 0.
-        with stdout.open("wb") as out, stderr.open("wb") as err:
+        # Append across invocations. Modules that parse their own logs (e.g.
+        # community.pjdfstest) locate the latest run via the per-invocation
+        # header line below; truncating here would overwrite earlier same-name
+        # logs (e.g. ltp_syscalls shard loops) that failure messages reference.
+        with stdout.open("ab") as out, stderr.open("ab") as err:
             out.write(f"# {utc_ts()} $ {display}\n".encode())
             out.flush()
             proc = subprocess.Popen(

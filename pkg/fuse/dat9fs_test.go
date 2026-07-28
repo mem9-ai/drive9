@@ -20575,6 +20575,250 @@ func TestRmdirAfterOpenUnlinkDirtyFsync(t *testing.T) {
 	}
 }
 
+// TestOldUnlinkedHandleDiscardPreservesReplacementCommit is B5: POSIX allows
+// recreating a pathname while the old unlinked fd is still open. Flush/Release
+// on the old fd must clean up only its OWN staging generation — path-global
+// removes would cancel the replacement file's queued commit and lose its data.
+func TestOldUnlinkedHandleDiscardPreservesReplacementCommit(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		files    = map[string][]byte{}
+		dirs     = map[string]struct{}{"/": {}, "/dir": {}}
+		putCalls atomic.Int32
+	)
+	listDir := func(dir string) []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		var entries []map[string]any
+		for p, data := range files {
+			parent := path.Dir(p)
+			if parent == "." {
+				parent = "/"
+			}
+			if parent == dir {
+				entries = append(entries, map[string]any{"name": path.Base(p), "isDir": false, "size": len(data)})
+			}
+		}
+		return entries
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		if p == "" {
+			p = "/"
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": listDir(p)})
+		case r.Method == http.MethodPost && r.URL.Query().Has("mkdir"):
+			mu.Lock()
+			dirs[p] = struct{}{}
+			delete(files, p)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut || r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			files[p] = append([]byte(nil), body...)
+			delete(dirs, p)
+			mu.Unlock()
+			putCalls.Add(1)
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			delete(files, p)
+			delete(dirs, p)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if _, ok := dirs[p]; ok {
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-IsDir", "true")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	wb, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.SetWriteBack(wb, nil)
+	cq := NewCommitQueue(fs.client, shadow, pending, nil, 1, 8)
+	fs.commitQueue = cq
+	defer cq.DrainAll()
+
+	var mkdirOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     0o755,
+	}, "dir", &mkdirOut); st != gofuse.OK {
+		t.Fatalf("Mkdir: %v", st)
+	}
+	dirIno := mkdirOut.NodeId
+
+	// Old handle: create + write + unlink while still open.
+	var oldCreate gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &oldCreate); st != gofuse.OK {
+		t.Fatalf("Create old: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: oldCreate.NodeId},
+		Fh:       oldCreate.Fh,
+		Size:     uint32(len("old")),
+	}, []byte("old")); st != gofuse.OK {
+		t.Fatalf("Write old: %v", st)
+	}
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: dirIno}, "file.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+
+	// Replacement: recreate the same pathname while the old fd stays open,
+	// then fsync to stage + enqueue its commit.
+	var newCreate gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &newCreate); st != gofuse.OK {
+		t.Fatalf("Create replacement: %v", st)
+	}
+	if newCreate.NodeId == oldCreate.NodeId {
+		t.Fatal("replacement reused the unlinked inode; test requires a fresh inode")
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: newCreate.NodeId},
+		Fh:       newCreate.Fh,
+		Size:     uint32(len("replacement")),
+	}, []byte("replacement")); st != gofuse.OK {
+		t.Fatalf("Write replacement: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: newCreate.NodeId},
+		Fh:       newCreate.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync replacement: %v", st)
+	}
+	if _, ok := pending.GetMeta("/dir/file.txt"); !ok {
+		t.Fatal("replacement pending entry missing after fsync")
+	}
+	if !shadow.Has("/dir/file.txt") {
+		t.Fatal("replacement shadow missing after fsync")
+	}
+	if !cq.HasPath("/dir/file.txt") {
+		t.Fatal("replacement commit missing after fsync")
+	}
+
+	// Flush + Release on the OLD unlinked fd must not touch the replacement's
+	// staged state (the B5 bug: path-global cleanup canceled it).
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: oldCreate.NodeId},
+		Fh:       oldCreate.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush old unlinked handle: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: oldCreate.NodeId},
+		Fh:       oldCreate.Fh,
+	})
+
+	if _, ok := pending.GetMeta("/dir/file.txt"); !ok {
+		t.Fatal("old unlinked handle removed the replacement's pending entry")
+	}
+	if !shadow.Has("/dir/file.txt") {
+		t.Fatal("old unlinked handle removed the replacement's shadow")
+	}
+	if !cq.HasPath("/dir/file.txt") {
+		t.Fatal("old unlinked handle canceled the replacement's queued commit")
+	}
+
+	// Close the replacement and drain: its data must reach the remote.
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: newCreate.NodeId},
+		Fh:       newCreate.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush replacement: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: newCreate.NodeId},
+		Fh:       newCreate.Fh,
+	})
+	cq.DrainAll()
+
+	mu.Lock()
+	data, ok := files["/dir/file.txt"]
+	mu.Unlock()
+	if !ok {
+		t.Fatal("replacement file never reached the remote backend")
+	}
+	if string(data) != "replacement" {
+		t.Fatalf("replacement remote content = %q, want %q", data, "replacement")
+	}
+	if got := putCalls.Load(); got == 0 {
+		t.Fatal("remote PUT calls = 0, want the replacement commit uploaded")
+	}
+}
+
+// TestDiscardUnlinkedHandleReleasesRemoteCommitLock: a handle that staged a
+// queued commit can still own the same-path commit reservation when it is
+// unlinked. The discard must release it, otherwise same-path create/write
+// blocks until the final Release (or RemoteCommitWaitTimeout).
+func TestDiscardUnlinkedHandleReleasesRemoteCommitLock(t *testing.T) {
+	fs := &Dat9FS{}
+	released := false
+	fh := &FileHandle{
+		Ino:                2,
+		Path:               "/dir/file.txt",
+		Unlinked:           true,
+		RemoteCommitUnlock: func() { released = true },
+	}
+	fh.Lock()
+	fs.discardUnlinkedHandleStateLocked(fh)
+	fh.Unlock()
+	if !released {
+		t.Fatal("discard did not release the handle-owned remote commit lock")
+	}
+	if fh.RemoteCommitUnlock != nil {
+		t.Fatal("fh.RemoteCommitUnlock not cleared by discard")
+	}
+}
+
 func TestRmdirRemoteDeleteDoesNotRetryRecreatedPathAfterInterrupt(t *testing.T) {
 	path := "/repo/emptydir"
 

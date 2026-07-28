@@ -2443,6 +2443,31 @@ func TestFlushDebouncer_Cancel(t *testing.T) {
 	}
 }
 
+func TestFlushDebouncer_CancelNoWaitIfOwner(t *testing.T) {
+	d := newFlushDebouncer(20 * time.Millisecond)
+	ownerA := &struct{}{}
+	ownerB := &struct{}{}
+
+	// A non-owner cancel must leave the pending entry alone.
+	fired := make(chan string, 1)
+	d.ScheduleWithOwner("/a", ownerA, func() { fired <- "/a" })
+	d.CancelNoWaitIfOwner("/a", ownerB)
+	select {
+	case <-fired:
+	case <-time.After(time.Second):
+		t.Fatal("non-owner CancelNoWaitIfOwner stopped the debounce")
+	}
+
+	// An owner cancel stops the pending entry.
+	d.ScheduleWithOwner("/a", ownerA, func() { fired <- "/a2" })
+	d.CancelNoWaitIfOwner("/a", ownerA)
+	select {
+	case p := <-fired:
+		t.Fatalf("owner CancelNoWaitIfOwner did not stop the debounce (fired %q)", p)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 func TestFlushDebouncer_FlushAll(t *testing.T) {
 	d := newFlushDebouncer(10 * time.Second) // long delay — won't fire naturally
 	results := make(map[string]bool)
