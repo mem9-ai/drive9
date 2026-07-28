@@ -7974,22 +7974,24 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	unlockRemoteCommit := fs.lockRemoteCommitPath(childP)
 	defer unlockRemoteCommit()
 
-	// A concurrent Flush may have finished under this lock and cleared
-	// pending-new staging while uploading the path. Recompute before DELETE.
+	// After waiting on remoteCommitLock, a concurrent sync Flush may have
+	// just uploaded and recorded a committed revision. That means the path
+	// exists remotely even if we earlier classified it as PendingNew.
+	// Do NOT clear pendingNew merely because we already removed our own
+	// writeBack/pendingIndex entries above — that would force a DELETE for
+	// true never-uploaded PendingNew files.
+	if fs.latestCommittedRevision(childP) > 0 {
+		pendingNew = false
+	}
 	if fs.writeBack != nil {
-		if meta, ok := fs.writeBack.GetMeta(childP); ok && meta.Kind == PendingNew {
-			pendingNew = true
-		} else if pendingNew {
-			// writeBack gone after a successful sync flush → must DELETE.
-			pendingNew = false
+		if meta, ok := fs.writeBack.GetMeta(childP); ok {
+			pendingNew = meta.Kind == PendingNew
 		}
 		fs.writeBack.Remove(childP)
 	}
 	if fs.pendingIndex != nil {
 		if meta, ok := fs.pendingIndex.GetMeta(childP); ok {
 			pendingNew = meta.Kind == PendingNew
-		} else if pendingNew {
-			pendingNew = false
 		}
 		fs.pendingIndex.Remove(childP)
 	}
