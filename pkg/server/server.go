@@ -656,8 +656,13 @@ func NewWithConfig(cfg Config) *Server {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			b := cfg.Pool.LoadS3Backend(r.Context(), cfg.Meta, tenantID)
-			if b == nil || b.S3() == nil {
+			b, release := cfg.Pool.LoadS3Backend(r.Context(), cfg.Meta, tenantID)
+			if b == nil || release == nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			defer release()
+			if b.S3() == nil {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
