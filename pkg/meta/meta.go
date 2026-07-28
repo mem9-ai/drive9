@@ -29,6 +29,8 @@ var (
 	ErrQuotaReservationBusy            = errors.New("quota reservation busy")
 	ErrTiDBCloudFreeQuotaBusy          = errors.New("free tenant quota check is busy; retry later")
 	ErrTiDBCloudFreeTenantLimitReached = errors.New("free TiDB Cloud tenant limit reached")
+	ErrSharedDBPoolIdentityConflict    = errors.New("shared db pool physical identity changed after provisioning started")
+	ErrSharedDBPoolNotProvisioning     = errors.New("shared db pool is not provisioning")
 )
 
 type TenantStatus string

@@ -998,11 +998,16 @@ func (s *Server) createFreeSharedPoolTenantsWithResize(ctx context.Context, pool
 		return nil, err
 	}
 	continuationIDs := make([]int64, 0, len(partitions))
+	createIDs := make([]int64, 0, len(partitions))
 	for _, partition := range partitions {
 		continuationIDs = append(continuationIDs, partition.db.ID)
+		if partition.created {
+			createIDs = append(createIDs, partition.db.ID)
+		}
 	}
 	sort.Slice(continuationIDs, func(i, j int) bool { return continuationIDs[i] < continuationIDs[j] })
-	_, provisionErr := s.provisionManagedSharedDBPoolsBatchWithCredentials(ctx, continuationIDs, sharedCred)
+	sort.Slice(createIDs, func(i, j int) bool { return createIDs[i] < createIDs[j] })
+	_, provisionErr := s.provisionManagedSharedDBPoolsBatchWithCredentials(ctx, createIDs, sharedCred)
 	// The whole logical reservation wave is durable before Cloud creation
 	// starts, so allocators can only consume genuinely unreserved tail capacity.
 	s.scheduleManagedSharedDBContinuations(ctx, continuationIDs)
@@ -1043,17 +1048,17 @@ func (s *Server) createFreeSharedPoolTenantsWithResize(ctx context.Context, pool
 type sharedPoolTenantPartition struct {
 	db        *meta.SharedDB
 	tenantIDs []string
+	created   bool
 }
 
 func (s *Server) stageSharedPoolTenantWave(ctx context.Context, poolID, organizationID string, cred tenant.CredentialProvisionRequest, count int, quotaOpt *quotaRequest, resize *meta.ManagedSharedDBPoolWaveResize) ([]sharedPoolTenantPartition, error) {
 	if count <= 0 {
 		return nil, nil
 	}
-	// Refill deliberately stages dedicated physical capacity instead of
-	// reusing a globally visible oldest candidate. Otherwise multiple Pods can
-	// plan against the same capacity snapshot and recreate the hot-row storm
-	// this partitioned wave is meant to avoid. The caller already caps count by
-	// managedSharedDBCloudBatchSize, so lock-free over-creation stays bounded.
+	// The durable wave fills existing physical capacity before inserting a new
+	// db_pool row. Capacity selection and each per-DB tenant_count increment are
+	// batched under the same transaction as placements and memberships, avoiding
+	// both one-physical-DB-per-refill fragmentation and per-tenant hot-row writes.
 	remaining := count
 	provisioningKey := sharedDBProvisioningKey(cred)
 	maxTenants, _ := s.managedSharedDBPolicy()
@@ -1093,14 +1098,20 @@ func (s *Server) stageSharedPoolTenantWave(ctx context.Context, poolID, organiza
 		metrics.RecordSharedDBPoolWave(metrics.ResultForError(err), len(plans), count)
 		return nil, err
 	}
-	metrics.RecordSharedDBPoolWave("ok", len(created), count)
+	createdPhysical := 0
+	for _, result := range created {
+		if result.Created {
+			createdPhysical++
+		}
+	}
+	metrics.RecordSharedDBPoolWave("ok", createdPhysical, count)
 	partitions := make([]sharedPoolTenantPartition, 0, len(created))
 	for _, result := range created {
 		row, loadErr := s.meta.GetSharedDB(ctx, result.DBID)
 		if loadErr != nil {
 			return nil, loadErr
 		}
-		partitions = append(partitions, sharedPoolTenantPartition{db: row, tenantIDs: result.TenantIDs})
+		partitions = append(partitions, sharedPoolTenantPartition{db: row, tenantIDs: result.TenantIDs, created: result.Created})
 	}
 	return partitions, nil
 }
