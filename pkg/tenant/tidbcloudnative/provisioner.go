@@ -209,16 +209,13 @@ func NewProvisionerFromEnv(providerType string) (*Provisioner, error) {
 		if apiURL == "" || iamURL == "" || billingURL == "" || cloudProvider == "" || region == "" {
 			return nil, fmt.Errorf("%s, %s, %s, %s and %s are required", EnvTiDBCloudNativeAPIURL, EnvTiDBCloudIAMAPIURL, EnvTiDBCloudBillingAPIURL, EnvTiDBCloudNativeCloudProvider, EnvTiDBCloudNativeRegion)
 		}
-		parsedAPIURL, err := url.Parse(apiURL)
-		if err != nil || parsedAPIURL.Scheme != "https" || parsedAPIURL.Host == "" {
+		if !validTiDBCloudBaseURL(apiURL) {
 			return nil, fmt.Errorf("%s must be a valid https URL", EnvTiDBCloudNativeAPIURL)
 		}
-		parsedIAMURL, err := url.Parse(iamURL)
-		if err != nil || parsedIAMURL.Scheme != "https" || parsedIAMURL.Host == "" {
+		if !validTiDBCloudBaseURL(iamURL) {
 			return nil, fmt.Errorf("%s must be a valid https URL", EnvTiDBCloudIAMAPIURL)
 		}
-		parsedBillingURL, err := url.Parse(billingURL)
-		if err != nil || parsedBillingURL.Scheme != "https" || parsedBillingURL.Host == "" {
+		if !validTiDBCloudBaseURL(billingURL) {
 			return nil, fmt.Errorf("%s must be a valid https URL", EnvTiDBCloudBillingAPIURL)
 		}
 		p.apiURL = strings.TrimRight(apiURL, "/")
@@ -230,6 +227,12 @@ func NewProvisionerFromEnv(providerType string) (*Provisioner, error) {
 	default:
 		return nil, unexpectedBackend(backend)
 	}
+}
+
+func validTiDBCloudBaseURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	return err == nil && !strings.ContainsAny(rawURL, "?#") && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil &&
+		parsed.RawQuery == "" && parsed.Fragment == "" && parsed.Opaque == ""
 }
 
 // api returns the control-plane backend. Tests may set apiURL/iamURL without

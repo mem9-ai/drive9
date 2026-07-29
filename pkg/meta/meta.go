@@ -3785,9 +3785,12 @@ func (s *Store) FinalizeTenantConnection(ctx context.Context, id string, from, t
 		cluster.Provider, nullStr(cluster.ClusterID), cluster.BranchID, nullStr(cluster.ClaimURL), cluster.ClaimExpiresAt,
 		time.Now().UTC(), id, from)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("finalize tenant connection: %w", err)
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read finalized tenant rows affected: %w", err)
+	}
 	return n > 0, nil
 }
 

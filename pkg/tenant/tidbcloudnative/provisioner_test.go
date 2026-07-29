@@ -82,6 +82,33 @@ func TestNewProvisionerFromEnvRejectsNonHTTPSBillingURL(t *testing.T) {
 	}
 }
 
+func TestNewProvisionerFromEnvRejectsBaseURLComponents(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		value string
+	}{
+		{name: "native API query", env: EnvTiDBCloudNativeAPIURL, value: "https://serverless.tidbapi.com?region=us-east-1"},
+		{name: "IAM fragment", env: EnvTiDBCloudIAMAPIURL, value: "https://iam.tidbapi.com#lookup"},
+		{name: "Billing query", env: EnvTiDBCloudBillingAPIURL, value: "https://billing.tidbapi.com?plan=free"},
+		{name: "Billing empty query", env: EnvTiDBCloudBillingAPIURL, value: "https://billing.tidbapi.com?"},
+		{name: "Billing fragment", env: EnvTiDBCloudBillingAPIURL, value: "https://billing.tidbapi.com#plans"},
+		{name: "Billing empty fragment", env: EnvTiDBCloudBillingAPIURL, value: "https://billing.tidbapi.com#"},
+		{name: "Billing userinfo", env: EnvTiDBCloudBillingAPIURL, value: "https://user:password@billing.tidbapi.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequiredNativeProvisionerEnv(t)
+			t.Setenv(tt.env, tt.value)
+
+			_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
+			if err == nil || !strings.Contains(err.Error(), tt.env) {
+				t.Fatalf("error = %v, want invalid %s", err, tt.env)
+			}
+		})
+	}
+}
+
 func TestResolveOrganizationPlanClassification(t *testing.T) {
 	const organizationID = "1372813089209302377"
 	tests := []struct {

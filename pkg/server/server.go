@@ -5711,6 +5711,8 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			if err != nil {
 				return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to build free tenant quota", err)
 			}
+			// A reservation becomes countable only after its native org binding or shared
+			// placement is durable, so this lock must remain held through that persist.
 			freeQuotaRelease, reservationErr = s.meta.AcquireTiDBCloudFreeQuotaLock(ctx, organizationID)
 			if reservationErr == nil {
 				var count int
