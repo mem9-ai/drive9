@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/mysqlutil"
 	"go.uber.org/zap"
 )
 
@@ -74,17 +75,29 @@ func SharedSchemaStatementsForDB(ctx context.Context, db *sql.DB) ([]string, err
 // TiDB Cloud features — plain TiDB without columnar support rejects them — so
 // their failures are tolerated with a warning instead of failing init.
 func InitSharedSchema(ctx context.Context, dsn string) error {
-	db, err := OpenTiDBSchemaDB(ctx, dsn)
+	db, err := OpenSharedSchemaDB(ctx, dsn, "", "")
 	if err != nil {
 		return err
 	}
-	defer func() { _ = closeTiDBSchemaDB(db) }()
+	defer func() { _ = mysqlutil.CloseInstrumented(db) }()
 	return EnsureSharedSchema(ctx, db)
+}
+
+// OpenSharedSchemaDB opens the dedicated shared-schema DDL handle for dsn. It
+// carries mysqlutil.RoleSharedSchema rather than the tenant RoleUserSchema, so
+// shared bootstrap work is attributable to the physical pool it targets.
+func OpenSharedSchemaDB(ctx context.Context, dsn, dbPoolUUID, tidbCloudOrgID string) (*sql.DB, error) {
+	if HasMultiStatements(dsn) {
+		return nil, fmt.Errorf("multiStatements is not allowed")
+	}
+	return mysqlutil.OpenInstrumentedForSharedSchemaDB(ctx, dsn, dbPoolUUID, tidbCloudOrgID)
 }
 
 // EnsureSharedSchema applies the shared schema through an already-open
 // physical DB handle. This is used by the shared connection cache so schema
 // comparison and initialization happen once at DB-pool open time.
+// Callers pass a handle opened with mysqlutil.RoleSharedSchema so this DDL is
+// observed apart from the role="shared" data-plane series.
 func EnsureSharedSchema(ctx context.Context, db *sql.DB) error {
 	stmts, err := SharedSchemaStatementsForDB(ctx, db)
 	if err != nil {

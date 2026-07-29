@@ -4,11 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/mem9-ai/drive9/internal/schemaspec"
 	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/mysqlutil"
 )
 
 // sharedSchemaTables lists the 30 tables of the shared (multi-tenant) schema
@@ -206,6 +210,61 @@ func TestEnsureSharedSchemaValidatesFreshSchema(t *testing.T) {
 	if err := EnsureSharedSchema(context.Background(), db); err != nil {
 		t.Fatalf("EnsureSharedSchema fresh database: %v", err)
 	}
+}
+
+// TestEnsureSharedSchemaReportsSchemaRoleMetrics pins the alerting contract for
+// Drive9SharedDBOperationP99High: init-schema DDL targets the same physical
+// shared database that serves tenant traffic, and it once ran on the
+// role="shared" data-plane handle. It now gets a handle of its own, so the DDL
+// must be observed under the shared_schema role and leave the shared
+// data-plane latency series untouched.
+func TestEnsureSharedSchemaReportsSchemaRoleMetrics(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenSharedSchemaDB(ctx, testDSN, "pool-uuid-shared-schema-metrics", "org-shared-schema-metrics")
+	if err != nil {
+		t.Fatalf("open shared schema db: %v", err)
+	}
+	t.Cleanup(func() { _ = mysqlutil.CloseInstrumented(db) })
+	dropSharedSchemaTables(t, db)
+	t.Cleanup(func() { dropSharedSchemaTables(t, db) })
+
+	sharedBefore := dbOperationCount(t, "exec", mysqlutil.RoleShared)
+	schemaBefore := dbOperationCount(t, "exec", mysqlutil.RoleSharedSchema)
+
+	if err := EnsureSharedSchema(ctx, db); err != nil {
+		t.Fatalf("EnsureSharedSchema: %v", err)
+	}
+
+	if got := dbOperationCount(t, "exec", mysqlutil.RoleSharedSchema) - schemaBefore; got <= 0 {
+		t.Fatalf("shared_schema exec operations recorded = %v, want > 0", got)
+	}
+	if got := dbOperationCount(t, "exec", mysqlutil.RoleShared) - sharedBefore; got != 0 {
+		t.Fatalf("shared exec operations recorded during schema ensure = %v, want 0", got)
+	}
+}
+
+// dbOperationCount sums drive9_db_operations_total across every result label for
+// one operation/role pair.
+func dbOperationCount(t *testing.T, operation, role string) float64 {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	total := 0.0
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "drive9_db_operations_total{") {
+			continue
+		}
+		if !strings.Contains(line, `operation="`+operation+`"`) || !strings.Contains(line, `role="`+role+`"`) {
+			continue
+		}
+		fields := strings.Fields(line)
+		value, err := strconv.ParseFloat(fields[len(fields)-1], 64)
+		if err != nil {
+			t.Fatalf("parse metric line %q: %v", line, err)
+		}
+		total += value
+	}
+	return total
 }
 
 func dropSharedSchemaTables(t *testing.T, db interface {
