@@ -1,6 +1,7 @@
 package mysqlutil
 
 import (
+	"database/sql"
 	"testing"
 	"time"
 )
@@ -126,6 +127,20 @@ func TestSharedSchemaPoolEnvOverridesLimits(t *testing.T) {
 	t.Setenv("DRIVE9_SHARED_DB_MAX_OPEN_CONNS", "77")
 	if got := poolEnvInt(RoleSharedSchema, "MAX_OPEN_CONNS", defaultSharedSchemaMaxOpenConns); got != 3 {
 		t.Fatalf("shared schema max open after shared override = %d, want 3", got)
+	}
+}
+
+func TestSharedSchemaPoolRequiresTwoConnections(t *testing.T) {
+	t.Setenv("DRIVE9_SHARED_SCHEMA_DB_MAX_OPEN_CONNS", "1")
+	db, err := sql.Open("mysql", "")
+	if err != nil {
+		t.Fatalf("open sql db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	ApplyPoolDefaults(db, RoleSharedSchema)
+	if got := db.Stats().MaxOpenConnections; got != 2 {
+		t.Fatalf("shared schema max open = %d, want 2 to reserve one connection for the advisory lock", got)
 	}
 }
 
