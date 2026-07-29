@@ -21,7 +21,7 @@ const (
 	defaultUserSchemaConnMaxIdleTime = 20 * time.Second
 	defaultUserSchemaMaxOpenConns    = 8
 	defaultUserSchemaMaxIdleConns    = 2
-	// Shared-schema handles serve many tenants through one *sql.DB, so they
+	// Shared data-plane handles serve many tenants through one *sql.DB, so they
 	// get meta-like lifetimes and a much larger connection budget than
 	// per-tenant user pools.
 	defaultSharedConnMaxLifetime = 30 * time.Minute
@@ -35,6 +35,7 @@ const (
 	defaultSharedSchemaConnMaxIdleTime = 20 * time.Second
 	defaultSharedSchemaMaxOpenConns    = 12
 	defaultSharedSchemaMaxIdleConns    = 4
+	sharedSchemaMinOpenConns           = 2 // one pinned advisory-lock connection plus schema work
 )
 
 // ApplyPoolDefaults rotates and prunes idle connections before common LB/NAT
@@ -58,6 +59,9 @@ func ApplyPoolDefaults(db *sql.DB, role string) {
 	db.SetConnMaxIdleTime(idleTime)
 	maxOpen, maxIdle := defaultPoolLimits(role)
 	if v := poolEnvInt(role, "MAX_OPEN_CONNS", maxOpen); v > 0 {
+		if role == RoleSharedSchema && v < sharedSchemaMinOpenConns {
+			v = sharedSchemaMinOpenConns
+		}
 		db.SetMaxOpenConns(v)
 	}
 	if v := poolEnvInt(role, "MAX_IDLE_CONNS", maxIdle); v >= 0 {

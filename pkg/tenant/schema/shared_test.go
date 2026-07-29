@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"strconv"
 	"strings"
@@ -243,6 +244,28 @@ func TestEnsureSharedSchemaReportsSchemaRoleMetrics(t *testing.T) {
 	}
 }
 
+func TestPrometheusSampleValueUsesTheSampleNotTimestampOrExemplar(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		line string
+		want float64
+	}{
+		{name: "plain", line: `drive9_db_operations_total{role="shared"} 3`, want: 3},
+		{name: "timestamp", line: `drive9_db_operations_total{role="shared"} 3 1722247200000`, want: 3},
+		{name: "exemplar", line: `drive9_db_operations_total{role="shared"} 3 # {trace_id="abc"} 1.5`, want: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := prometheusSampleValue(test.line)
+			if err != nil {
+				t.Fatalf("prometheusSampleValue(%q): %v", test.line, err)
+			}
+			if got != test.want {
+				t.Fatalf("prometheusSampleValue(%q) = %v, want %v", test.line, got, test.want)
+			}
+		})
+	}
+}
+
 // dbOperationCount sums drive9_db_operations_total across every result label for
 // one operation/role pair.
 func dbOperationCount(t *testing.T, operation, role string) float64 {
@@ -257,14 +280,21 @@ func dbOperationCount(t *testing.T, operation, role string) float64 {
 		if !strings.Contains(line, `operation="`+operation+`"`) || !strings.Contains(line, `role="`+role+`"`) {
 			continue
 		}
-		fields := strings.Fields(line)
-		value, err := strconv.ParseFloat(fields[len(fields)-1], 64)
+		value, err := prometheusSampleValue(line)
 		if err != nil {
 			t.Fatalf("parse metric line %q: %v", line, err)
 		}
 		total += value
 	}
 	return total
+}
+
+func prometheusSampleValue(line string) (float64, error) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return 0, fmt.Errorf("metric line has no sample value")
+	}
+	return strconv.ParseFloat(fields[1], 64)
 }
 
 func dropSharedSchemaTables(t *testing.T, db interface {
