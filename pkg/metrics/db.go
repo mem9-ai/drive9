@@ -108,6 +108,14 @@ func RegisterSharedDBWithOrg(dbPoolUUID, tidbCloudOrgID string, db *sql.DB) {
 	registerDB("shared", "", dbPoolUUID, tidbCloudOrgID, db)
 }
 
+// RegisterSharedSchemaDBWithOrg registers the short-lived handle that applies
+// shared-schema bootstrap DDL. Its series exist only while a schema ensure is
+// running, which is the point: shared schema work stays separable from the
+// role="shared" data-plane series that latency and error-rate alerts read.
+func RegisterSharedSchemaDBWithOrg(dbPoolUUID, tidbCloudOrgID string, db *sql.DB) {
+	registerDB("shared_schema", "", dbPoolUUID, tidbCloudOrgID, db)
+}
+
 func registerDB(role, tenantID, dbPoolUUID, tidbCloudOrgID string, db *sql.DB) {
 	if db == nil {
 		return
