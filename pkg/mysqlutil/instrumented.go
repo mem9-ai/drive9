@@ -25,6 +25,15 @@ const (
 	// many tenants at once (fs_id row keys). Pool limits for this role must be
 	// sized for the whole cluster, not for one tenant.
 	RoleShared = "shared"
+	// RoleSharedSchema labels the short-lived handle that applies shared-schema
+	// bootstrap DDL to a physical shared DB, mirroring the RoleUser /
+	// RoleUserSchema split. Schema work — CREATE TABLE, ADD INDEX, contract
+	// repair, and the advisory lock that serializes them across pods — routinely
+	// blocks for seconds on TiDB, so it runs on its own handle instead of the
+	// RoleShared handle that serves tenant traffic. That keeps one cold pool
+	// open out of the shared data-plane latency series while leaving schema
+	// latency and failures observable under this role.
+	RoleSharedSchema = "shared_schema"
 )
 
 const (
@@ -49,6 +58,16 @@ func OpenInstrumentedForTenantWithOrg(ctx context.Context, dsn, role, tenantID, 
 func OpenInstrumentedForSharedDB(ctx context.Context, dsn, dbPoolUUID, tidbCloudOrgID string) (*sql.DB, error) {
 	return openInstrumented(ctx, dsn, RoleShared, func(db *sql.DB) {
 		metrics.RegisterSharedDBWithOrg(dbPoolUUID, tidbCloudOrgID, db)
+	})
+}
+
+// OpenInstrumentedForSharedSchemaDB opens the dedicated handle used to apply
+// shared-schema DDL to one physical shared DB. Callers close it as soon as the
+// schema ensure finishes; see RoleSharedSchema for why this work does not share
+// the data-plane handle.
+func OpenInstrumentedForSharedSchemaDB(ctx context.Context, dsn, dbPoolUUID, tidbCloudOrgID string) (*sql.DB, error) {
+	return openInstrumented(ctx, dsn, RoleSharedSchema, func(db *sql.DB) {
+		metrics.RegisterSharedSchemaDBWithOrg(dbPoolUUID, tidbCloudOrgID, db)
 	})
 }
 
