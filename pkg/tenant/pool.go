@@ -1204,29 +1204,17 @@ func (p *Pool) sharedDBHandleWithSchemaLockWait(ctx context.Context, dbID int64,
 	// An empty TLSMode means a plain connection (local/self-hosted databases);
 	// shared DBs on TiDB Cloud are registered with tls=skip-verify or tls=true.
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", info.User, string(pass), info.Host, info.Port, info.Name, query)
+	// Bootstrap the schema before the data-plane handle exists, on a handle of
+	// its own, so multi-second DDL and lock waits never land in the
+	// role="shared" series that data-plane latency alerts read.
+	if info.SchemaVersion != schema.CurrentSharedTiDBSchemaVersion {
+		if err := p.ensureSharedDBSchemaOnce(ctx, dsn, info, dbID, waitForSchemaLock); err != nil {
+			return nil, fmt.Errorf("shared db %d: %w", dbID, err)
+		}
+	}
 	db, err := mysqlutil.OpenInstrumentedForSharedDB(ctx, dsn, info.UUID, info.TiDBCloudOrganizationID)
 	if err != nil {
 		return nil, fmt.Errorf("shared db %d: open: %w", dbID, err)
-	}
-	if info.SchemaVersion != schema.CurrentSharedTiDBSchemaVersion {
-		if err := withSharedDBSchemaAdvisoryLock(ctx, db, dbID, waitForSchemaLock, func(lockCtx context.Context) error {
-			// Another pod may have completed the migration between the initial
-			// metadata read and this lock acquisition.
-			current, err := p.metaStore.GetSharedDB(lockCtx, dbID)
-			if err != nil {
-				return err
-			}
-			if current.SchemaVersion == schema.CurrentSharedTiDBSchemaVersion {
-				return nil
-			}
-			if err := ensureSharedDBSchema(lockCtx, db); err != nil {
-				return fmt.Errorf("ensure schema: %w", err)
-			}
-			return p.metaStore.UpdateSharedDBSchemaVersion(lockCtx, dbID, schema.CurrentSharedTiDBSchemaVersion)
-		}); err != nil {
-			_ = mysqlutil.CloseInstrumented(db)
-			return nil, fmt.Errorf("shared db %d: %w", dbID, err)
-		}
 	}
 	p.sharedMu.Lock()
 	if p.sharedDBClosed {
@@ -1242,6 +1230,33 @@ func (p *Pool) sharedDBHandleWithSchemaLockWait(ctx context.Context, dbID int64,
 	lease := p.leaseSharedDBLocked(dbID, db)
 	p.sharedMu.Unlock()
 	return lease, nil
+}
+
+// ensureSharedDBSchemaOnce applies the checked-in shared schema through a
+// dedicated handle opened with mysqlutil.RoleSharedSchema and closes it before
+// the data-plane handle is opened. The advisory lock runs on the same handle, so
+// both the lock wait and the DDL are attributed to schema work.
+func (p *Pool) ensureSharedDBSchemaOnce(ctx context.Context, dsn string, info *meta.SharedDB, dbID int64, waitForSchemaLock bool) error {
+	schemaDB, err := schema.OpenSharedSchemaDB(ctx, dsn, info.UUID, info.TiDBCloudOrganizationID)
+	if err != nil {
+		return fmt.Errorf("open schema handle: %w", err)
+	}
+	defer func() { _ = mysqlutil.CloseInstrumented(schemaDB) }()
+	return withSharedDBSchemaAdvisoryLock(ctx, schemaDB, dbID, waitForSchemaLock, func(lockCtx context.Context) error {
+		// Another pod may have completed the migration between the initial
+		// metadata read and this lock acquisition.
+		current, err := p.metaStore.GetSharedDB(lockCtx, dbID)
+		if err != nil {
+			return err
+		}
+		if current.SchemaVersion == schema.CurrentSharedTiDBSchemaVersion {
+			return nil
+		}
+		if err := ensureSharedDBSchema(lockCtx, schemaDB); err != nil {
+			return fmt.Errorf("ensure schema: %w", err)
+		}
+		return p.metaStore.UpdateSharedDBSchemaVersion(lockCtx, dbID, schema.CurrentSharedTiDBSchemaVersion)
+	})
 }
 
 // EnsureSharedDBReady opens the shared physical DB through the normal cache
