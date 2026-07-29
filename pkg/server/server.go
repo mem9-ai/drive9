@@ -2480,6 +2480,33 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	})
 }
 
+const (
+	// writeResultClientCanceled is the low-cardinality metric result for a write
+	// whose backend error is a client-side cancellation (client closed the
+	// connection / cancelled the request context). It is deliberately NOT
+	// "ok"/"benign"/"info": a same-path supersede cancel can mask a lost update
+	// until durability is verified, so it is surfaced as needs-review, not
+	// silenced.
+	writeResultClientCanceled = "client_canceled"
+	// writeResultDeadlineExceeded is the metric result for a write whose backend
+	// error is a context deadline (distinct from a plain cancellation).
+	writeResultDeadlineExceeded = "deadline_exceeded"
+)
+
+// writeErrorTimingResult maps a write backend error to the server_write_timing
+// result label so timing rows are classified the same way as logs/metrics
+// (client_canceled / deadline_exceeded / error), instead of a generic "error".
+func writeErrorTimingResult(ctx context.Context, err error) string {
+	switch {
+	case isClientCanceled(ctx, err):
+		return writeResultClientCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return writeResultDeadlineExceeded
+	default:
+		return "error"
+	}
+}
+
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string) {
 	timingEnabled := logger.BenchTimingLogEnabled()
 	var timingStart time.Time
@@ -2648,8 +2675,9 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		backendWriteDuration = time.Since(backendWriteStart)
 	}
 	if err != nil {
+		timingResult := writeErrorTimingResult(r.Context(), err)
 		if timingEnabled {
-			logServerWriteTiming(r.Context(), path, len(data), expectedRevision, 0, "error", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), err)
+			logServerWriteTiming(r.Context(), path, len(data), expectedRevision, 0, timingResult, bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), err)
 		}
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large_backend", "path", path, "error", err)...)
@@ -2671,6 +2699,25 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		}
 		if errJSONInvalidRootDentry(w, err) {
 			metricEvent(r.Context(), "fs_write", "result", "error")
+			return
+		}
+		// Client-side cancellation and deadline are not server storage faults:
+		// classify them out of the generic Error-level write_failed so they stop
+		// polluting real storage-error alerts, while staying visible. A canceled
+		// write is warn + needs-review (NOT benign/info): a same-path supersede
+		// cancel could mask a lost update until durability is verified, so it must
+		// not be silenced. The response status is unchanged (backendErrorStatus
+		// already maps these to 499 / 504).
+		if isClientCanceled(r.Context(), err) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_client_canceled", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", writeResultClientCanceled)
+			errJSONInternalStorage(w, r, err)
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_deadline_exceeded", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", writeResultDeadlineExceeded)
+			errJSONInternalStorage(w, r, err)
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_failed", "path", path, "error", err)...)
@@ -3232,7 +3279,23 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 
 	backendResults, err := b.BatchWriteCtx(r.Context(), backendItems)
 	if err != nil {
+		// Same classification as handleWrite: client cancellation / deadline are
+		// not server storage faults, so keep them out of the Error-level
+		// batch_write_failed alert while staying visible (warn + needs-review).
+		if isClientCanceled(r.Context(), err) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_client_canceled", "error", err)...)
+			metricEvent(r.Context(), "fs_batch_write", "result", writeResultClientCanceled)
+			errJSONInternalStorage(w, r, err)
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_deadline_exceeded", "error", err)...)
+			metricEvent(r.Context(), "fs_batch_write", "result", writeResultDeadlineExceeded)
+			errJSONInternalStorage(w, r, err)
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "batch_write_failed", "error", err)...)
+		metricEvent(r.Context(), "fs_batch_write", "result", "error")
 		errJSONInternalStorage(w, r, err)
 		return
 	}
