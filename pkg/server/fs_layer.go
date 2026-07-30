@@ -1674,6 +1674,10 @@ func writeFSLayerStoreError(w http.ResponseWriter, r *http.Request, err error) {
 		errJSON(w, http.StatusNotFound, "not found")
 		return
 	}
+	if errors.Is(err, datastore.ErrRevisionConflict) {
+		errJSON(w, http.StatusConflict, err.Error())
+		return
+	}
 	if errors.Is(err, datastore.ErrFSLayerRefAmbiguous) {
 		errJSON(w, http.StatusConflict, err.Error())
 		return

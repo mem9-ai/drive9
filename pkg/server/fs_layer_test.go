@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
@@ -901,5 +903,61 @@ func TestValidateFSLayerCommitSnapshotsRejectsIncomplete(t *testing.T) {
 	}})
 	if err == nil {
 		t.Fatal("validateFSLayerCommitSnapshots succeeded, want error")
+	}
+}
+
+func TestFSLayerEntryUpsertBaseRevisionCAS(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	putBase := func(body string) {
+		req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/base.txt", strings.NewReader(body))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("write base: %d", resp.StatusCode)
+		}
+	}
+	upsertEntry := func(baseRevision int64) int {
+		payload := fmt.Sprintf(`{"path":"/base.txt","op":"upsert","kind":"file","base_revision":%d,"content":"bGF5ZXIgZGF0YQ=="}`, baseRevision)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/layers/layer-cas/entries", strings.NewReader(payload))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	putBase("v1")
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/layers", strings.NewReader(`{"layer_id":"layer-cas","base_root_path":"/"}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("layer create: %d", resp.StatusCode)
+	}
+
+	// Upsert against the current base revision is accepted.
+	if code := upsertEntry(1); code != http.StatusOK {
+		t.Fatalf("upsert with current base revision: %d, want 200", code)
+	}
+
+	// Base moves to revision 2; the stale base_revision=1 upsert must be
+	// rejected synchronously (no silent splice into the layer).
+	putBase("v2")
+	if code := upsertEntry(1); code != http.StatusConflict {
+		t.Fatalf("upsert with stale base revision: %d, want 409", code)
+	}
+
+	// The fresh base revision is accepted again.
+	if code := upsertEntry(2); code != http.StatusOK {
+		t.Fatalf("upsert with fresh base revision: %d, want 200", code)
 	}
 }

@@ -5,25 +5,36 @@
       "title": "API smoke",
       "product_area": "api",
       "product_promise": "HTTP API works end to end",
-      "owner_hint": "api"
+      "owner_hint": "api",
+      "failure_class": "correctness"
     },
     "cli-smoke": {
       "title": "CLI smoke",
       "product_area": "cli",
       "product_promise": "drive9 CLI works end to end",
-      "owner_hint": "cli"
+      "owner_hint": "cli",
+      "failure_class": "correctness"
     },
     "layer-fs-smoke": {
       "title": "Layer FS smoke",
       "product_area": "filesystem",
       "product_promise": "layered filesystem reads/writes are correct",
-      "owner_hint": "fs"
+      "owner_hint": "fs",
+      "failure_class": "correctness"
     },
     "fuse-smoke": {
       "title": "FUSE release gate",
       "product_area": "fuse",
       "product_promise": "FUSE mount works for release",
-      "owner_hint": "fs"
+      "owner_hint": "fs",
+      "failure_class": "correctness"
+    },
+    "fuse-patch-storage-class": {
+      "title": "FUSE patch storage-class e2e",
+      "product_area": "fuse",
+      "product_promise": "FUSE partial updates route by storage class and recover from unsupported PATCH targets",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
     },
     "git-ops-smoke": {
       "title": "Git operations smoke",
@@ -36,7 +47,8 @@
       "title": "Pack smoke",
       "product_area": "portability",
       "product_promise": "portable pack/unpack round-trips losslessly",
-      "owner_hint": "fs"
+      "owner_hint": "fs",
+      "failure_class": "correctness"
     },
     "fuse-crash-recovery": {
       "title": "FUSE crash recovery e2e",
@@ -77,7 +89,8 @@
       "title": "Full smoke-all suite",
       "product_area": "platform",
       "product_promise": "the full smoke suite passes",
-      "owner_hint": "platform"
+      "owner_hint": "platform",
+      "failure_class": "correctness"
     },
     "git-feature-smoke": {
       "title": "Git feature smoke",

@@ -588,6 +588,31 @@ func (s *Store) UpsertFSLayerEntry(ctx context.Context, entry *FSLayerEntry) err
 	if err := validateFSLayerEntryWithinBaseRoot(entry, baseRoot); err != nil {
 		return err
 	}
+	// Synchronous base-revision CAS for file content upserts. Without this
+	// gate, an upsert based on a stale base revision is persisted silently
+	// (e.g. a FUSE lazy flush that fetched retained parts after a sibling
+	// commit): the spliced bytes enter the layer, the writer's dirty state
+	// is cleared, and the mismatch only surfaces at layer-commit preflight —
+	// escalating the whole layer to Conflicted. Reject here, while the
+	// writer can still retry. base_revision <= 0 means "no base claim"
+	// (new or layer-local file) and skips the check, matching the commit
+	// preflight's semantics.
+	if entry.Op == FSLayerEntryOpUpsert && entry.Kind == FSLayerEntryKindFile && entry.BaseRevision > 0 {
+		bn, statErr := s.StatTx(ctx, tx, entry.Path)
+		if errors.Is(statErr, ErrNotFound) {
+			return fmt.Errorf("%w: base file %s missing for base_revision=%d", ErrRevisionConflict, entry.Path, entry.BaseRevision)
+		}
+		if statErr != nil {
+			return fmt.Errorf("stat base file for layer upsert %s: %w", entry.Path, statErr)
+		}
+		var currentRev int64
+		if bn.File != nil {
+			currentRev = bn.File.Revision
+		}
+		if bn.File == nil || currentRev != entry.BaseRevision {
+			return fmt.Errorf("%w: base revision changed for %s (current=%d, want=%d)", ErrRevisionConflict, entry.Path, currentRev, entry.BaseRevision)
+		}
+	}
 	if entry.EntrySeq <= 0 {
 		var seq sql.NullInt64
 		if err := tx.QueryRowContext(ctx, `SELECT MAX(entry_seq) FROM fs_layer_entries WHERE `+s.scope.And(`layer_id = ?`), s.scope.Args(entry.LayerID)...).Scan(&seq); err != nil {

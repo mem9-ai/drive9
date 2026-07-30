@@ -3412,7 +3412,37 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 	mode, hasMode := fs.modeForPendingHandle(fh)
 
 	bvStart := time.Now()
-	data := fh.Dirty.bytesView()
+	var data []byte
+	// ShadowSpill handles write through to the shadow store on every write,
+	// so the shadow — never the possibly evicted buffer — is the
+	// authoritative full content. Snapshot from it unconditionally: for
+	// newly created spill files CanMaterializeFull is vacuously true
+	// (remoteSize == 0) even after OnPartFull evicted part bytes from
+	// memory, and bytesView() would zero-fill those ranges.
+	// For non-spill buffers the shadow read is only needed when the buffer
+	// cannot materialize; any other non-materializable buffer has no
+	// authoritative secondary source and fails ENOTSUP instead of
+	// zero-filling, letting the caller fall back to a guarded upload.
+	fromShadow := fh.ShadowReady && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path) &&
+		(fh.ShadowSpill || !fh.Dirty.CanMaterializeFull())
+	switch {
+	case fromShadow:
+		shadowData, err := fs.shadowStore.ReadAll(fh.Path)
+		if err != nil {
+			return err
+		}
+		if size := fh.Dirty.Size(); int64(len(shadowData)) != size {
+			// Writes hit the shadow first and truncates are mirrored, so
+			// sizes must agree; treat any divergence as unsafe to stage.
+			return fmt.Errorf("shadow size %d != dirty size %d for %s", len(shadowData), size, fh.Path)
+		}
+		data = shadowData
+	case !fh.Dirty.CanMaterializeFull():
+		return syscall.ENOTSUP
+	}
+	if data == nil {
+		data = fh.Dirty.bytesView()
+	}
 	bvDur := time.Since(bvStart)
 
 	gen, timings, err := fs.writeBack.PutWithBaseRevAndModeTimings(
@@ -11604,11 +11634,20 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					} else {
 						phase = "small-snapshot-writeback"
 						snapWBStart := time.Now()
-						if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
+						// Advance WriteBackSeq only when the snapshot actually
+						// landed: the sequence gates the writeBack cache as an
+						// upload/read source, so claiming freshness after a
+						// skipped/failed snapshot could serve a stale .dat as
+						// current. On failure the next Flush/Release re-attempts
+						// the snapshot or falls back to the synchronous flush —
+						// the staged shadow + pendingIndex already carry the
+						// durable commit path.
+						if err := fs.snapshotWriteBackLocked(fh); err != nil {
 							log.Printf("writeback snapshot failed for %s: %v", fh.Path, err)
+						} else {
+							fh.WriteBackSeq = fh.DirtySeq
 						}
 						fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart))
-						fh.WriteBackSeq = fh.DirtySeq
 						return gofuse.OK
 					}
 				}
@@ -11783,10 +11822,13 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					log.Printf("flush: shadow stage failed for %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
 				} else {
 					phase = "large-snapshot-writeback"
-					if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
+					if err := fs.snapshotWriteBackLocked(fh); err != nil {
 						log.Printf("flush: writeback snapshot failed for %s: %v", fh.Path, err)
+					} else {
+						// See the small-snapshot-writeback path: only claim a
+						// current cache when the snapshot actually landed.
+						fh.WriteBackSeq = fh.DirtySeq
 					}
-					fh.WriteBackSeq = fh.DirtySeq
 					// If a streaming upload was already in flight, abandon it:
 					// the CommitQueue (driven by Release via the cache fast
 					// path) will read from the shadow file instead. Without
@@ -11958,10 +12000,13 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 					}
 				} else {
 					fs.releaseHandleRemoteCommitPathLocked(fh)
-					if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
+					if err := fs.snapshotWriteBackLocked(fh); err != nil {
 						log.Printf("fsync writeback snapshot failed for %s: %v", fh.Path, err)
+					} else {
+						// See the small-snapshot-writeback path: only claim a
+						// current cache when the snapshot actually landed.
+						fh.WriteBackSeq = fh.DirtySeq
 					}
-					fh.WriteBackSeq = fh.DirtySeq
 				}
 				return gofuse.OK
 			}
@@ -12915,7 +12960,15 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 
 	size := fh.Dirty.Size()
 	if fs.layerEnabled() {
-		if fh.ShadowSpill || (fh.Streamer != nil && fh.Streamer.Started()) || !fh.Dirty.CanMaterializeFull() {
+		// Freeze the upsert base BEFORE any lazy fetch. The layer branch
+		// deliberately reads the un-adopted BaseRev (expectedRevisionForHandle,
+		// not the Locked variant) and holds fh.mu for the whole branch, so a
+		// sibling commit mid-fetch cannot advance the base — the layer upsert
+		// always goes out with base M and the server-side CAS is the backstop
+		// against splicing older dirty bytes into a newer remote. Keep this
+		// capture ahead of materializeFullForUploadLocked.
+		expectedRevision := expectedRevisionForHandle(fh)
+		if fh.ShadowSpill || (fh.Streamer != nil && fh.Streamer.Started()) || !fs.materializeFullForUploadLocked(fh) {
 			if fh.ShadowSpill {
 				if err := fs.commitLayerShadowLocked(ctx, fh, true); err != nil {
 					log.Printf("layer shadowspill flush failed for %s: %v", fh.Path, err)
@@ -12928,7 +12981,6 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 		data := fh.Dirty.bytesView()
 		mode, hasMode := fs.modeForPendingHandle(fh)
-		expectedRevision := expectedRevisionForHandle(fh)
 		if err := fs.upsertLayerFile(ctx, fh.Path, data, expectedRevision, mode, hasMode); err != nil {
 			log.Printf("layer flush failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
