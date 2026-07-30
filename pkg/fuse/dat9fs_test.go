@@ -17131,6 +17131,84 @@ func TestFlushHandleDebouncedLazyBufferNoLoaderReturnsEIO(t *testing.T) {
 	}
 }
 
+// TestFlushHandleDebouncedLazyFetchNewerRevisionSkipsUpload is the
+// discriminating cross-revision regression for the debounced path (qiffang
+// adversary-1): the CAS base must be frozen BEFORE the lazy fetch. A
+// sibling commit (recorded during the fetch) must make the deferred
+// callback skip the upload — never PUT with the newer revision over this
+// handle's older dirty bytes, and never clear dirty state.
+func TestFlushHandleDebouncedLazyFetchNewerRevisionSkipsUpload(t *testing.T) {
+	var serverHit atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.debouncer = newFlushDebouncer(50 * time.Millisecond)
+
+	path := "/debounced-splice.dat"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	orig := make([][]byte, 2)
+	for p := range orig {
+		orig[p] = make([]byte, 256)
+		for i := range orig[p] {
+			orig[p][i] = byte(0xA0 + p*0x10 + i%16)
+		}
+	}
+
+	wb := NewWriteBuffer(path, maxPreloadSize, 256)
+	wb.remoteSize = 512
+	wb.totalSize = 512
+	// The loader observes the latest remote AND records the sibling's rev-9
+	// commit mid-fetch — the ordering hazard this test pins. Only the flush
+	// fetches part 2; part 1 loads during the seeding Write below, so the
+	// commit must be recorded exactly when part 2 is requested.
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		if partNum == 2 {
+			fs.recordCommittedRevision(path, 9)
+		}
+		return append([]byte(nil), orig[partNum-1]...), nil
+	}
+
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    wb,
+		BaseRev:  5,
+		OrigSize: 512,
+	}
+	if _, err := wb.Write(0, []byte("WXYZ")); err != nil {
+		t.Fatalf("seed dirty buffer: %v", err)
+	}
+	if wb.CanMaterializeFull() {
+		t.Fatal("expected CanMaterializeFull() = false for lazy two-part buffer")
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, wb.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	fh.Lock()
+	st := fs.flushHandleDebounced(context.Background(), fh, false)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandleDebounced status = %v, want OK (schedule)", st)
+	}
+	fs.debouncer.FlushAll()
+
+	if serverHit.Load() {
+		t.Fatal("debounced callback uploaded — sibling commit during fetch must skip the PUT (splice)")
+	}
+	if !fh.Dirty.HasDirtyParts() {
+		t.Fatal("dirty state cleared — must be preserved when the callback skips")
+	}
+}
+
 // TestFlushHandle_Path2_SyntheticRevRecordedBeforeUnlock verifies that when
 // a Path 2 flush succeeds without the server returning a committed revision
 // (e.g. PatchFile / WriteStreamConditional), the synthetic revision

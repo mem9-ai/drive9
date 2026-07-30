@@ -12290,6 +12290,16 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	}
 
 	// Small file: schedule a deferred upload.
+	// Freeze the CAS base BEFORE any fetch/materialization. If a sibling
+	// commits while the lazy loader is fetching (which reads latest remote
+	// bytes), adopting the committed revision here would advance the base
+	// to the sibling's revision and let the deferred PUT silently splice
+	// this handle's older dirty bytes into the newer remote — the exact
+	// lost-update class the synchronous paths defend by capturing
+	// expectedRevision before materializing. With the base frozen first,
+	// the callback's revision re-check observes the sibling commit and
+	// skips the upload instead.
+	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	// The debounced callback commits the FULL buffer and clears dirty state
 	// on success, so this snapshot must meet the same materialization
 	// contract as every other full-upload path: bytesView() zero-fills
@@ -12309,7 +12319,6 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	ino := fh.Ino
 	handle := fh               // capture for goroutine
 	snapshotSeq := fh.DirtySeq // capture current dirty sequence
-	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	// Snapshot the staging-store generations so the post-upload cleanup can be
 	// generation-guarded. A concurrent same-path write while the debounce is
 	// pending/in-flight would bump these generations, and removing the fresher
