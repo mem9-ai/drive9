@@ -6265,6 +6265,11 @@ func cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
 // data. handles must be the exact set snapshotted before the mark pass;
 // handles released in between are skipped via the inode-index liveness check
 // in RelinkPath (their Release already ran the normal lifecycle).
+//
+// Only handle state is rolled back. No staging-store restore is needed:
+// Unlink defers every destructive Remove/CancelPath to the commit point
+// after a successful DELETE, so a failed DELETE leaves writeBack /
+// pendingIndex / shadowStore / queued commits untouched.
 func (fs *Dat9FS) unmarkOpenHandlesAfterFailedUnlink(p string, handles []*FileHandle) {
 	if fs.openHandles == nil || len(handles) == 0 {
 		return
@@ -6284,23 +6289,10 @@ func (fs *Dat9FS) unmarkOpenHandlesAfterFailedUnlink(p string, handles []*FileHa
 		fh.UnlinkedSize = 0
 		if gen := fh.UnlinkedShadowGen; gen != 0 && fs.shadowStore != nil {
 			fh.UnlinkedShadowGen = 0
-			if fh.ShadowSpill && fs.shadowStore.Unretire(gen, p) {
-				// The unlink-time Remove had retired the staged shadow; it is
-				// active again. Move the mark-time pin into the handle's own
-				// slot so Release unpins it exactly once.
-				if fh.ShadowPinned {
-					fs.shadowStore.Unpin(gen)
-				} else {
-					fh.ShadowGen = gen
-					fh.ShadowPinned = true
-				}
-			} else {
-				// Clean-handle read snapshot (or an already-replaced path):
-				// drop the mark-time pin.
-				fs.shadowStore.Unpin(gen)
-			}
-		} else {
-			fh.UnlinkedShadowGen = 0
+			// The mark-time pin is simply dropped: with the deferred commit
+			// point, the staged shadow was never removed or retired, so the
+			// handle keeps reading it by path like any normal handle.
+			fs.shadowStore.Unpin(gen)
 		}
 		fh.Unlock()
 	}
@@ -6441,6 +6433,13 @@ func (fs *Dat9FS) lockWritableRemoteCommitPath(p string) func() {
 			// would delete the newer writer's staged data after it stages — a
 			// silent data-loss bug. Canceling the old entry first ensures its
 			// cleanup runs (or has already run) before the new writer stages.
+			//
+			// The cancel is intentionally path-global (not inode-scoped): the
+			// stuck commit holds this path's PathLock, and Unlink takes the
+			// same lock unbounded, so no unlink+recreate can have completed
+			// while the commit is stuck — the path still belongs to the same
+			// live inode as this writer, and the cancel cannot hit a
+			// replacement file's staged state.
 			fs.debugf("lockWritableRemoteCommitPath: timeout (%s) waiting for %s, canceling in-flight and proceeding", timeout, p)
 			if fs.commitQueue != nil {
 				fs.commitQueue.CancelPath(p)
@@ -8021,10 +8020,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	//    window). Marking here is safe: a sync upload that PUTs after this
 	//    point records its committed revision while holding remoteCommitLock,
 	//    which the re-check below turns into a DELETE.
-	// 2. The drains below remove the path's staged shadow (directly or via
-	//    commitQueue CancelPath). Dirty ShadowSpill handles must pin their
-	//    shadow backing FIRST so those removals retire (fd preserved for
-	//    read-after-unlink) instead of deleting it.
+	// 2. The commit-point cleanup below removes the path's staged shadow
+	//    (directly or via commitQueue CancelPath). Dirty ShadowSpill handles
+	//    must pin their shadow backing FIRST so those removals retire (fd
+	//    preserved for read-after-unlink) instead of deleting it.
 	//
 	// snapshotRemote is always true here because pendingNew is not computed
 	// yet; for never-uploaded paths the remote snapshot read simply misses
@@ -8045,24 +8044,26 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.debugf("unlink wait writeback start path=%s", childP)
 		fs.uploader.WaitPath(childP)
 		fs.debugDurationf(waitStart, 0, "unlink wait writeback done path=%s", childP)
-		// Check if the file was created locally and never uploaded.
+		// Check if the file was created locally and never uploaded. Read-only
+		// here: the destructive writeBack Remove is deferred to the commit
+		// point after a successful remote DELETE, so a failed DELETE leaves
+		// closed staged data intact for retry.
 		if meta, ok := fs.writeBack.GetMeta(childP); ok && meta.Kind == PendingNew {
 			pendingNew = true
 		}
-		// Remove pending cache entry to prevent future background uploads.
-		fs.writeBack.Remove(childP)
 	}
-	// Wait for any in-flight commitQueue upload and cancel it so the
-	// background commit cannot resurrect the deleted file.
+	// Wait for any in-flight commitQueue upload so the background commit
+	// cannot resurrect the deleted file. The destructive CancelPath is
+	// deferred to the commit point (see writeBack note above).
 	if fs.commitQueue != nil {
 		waitStart := time.Now()
 		fs.debugf("unlink wait commit start path=%s", childP)
 		fs.commitQueue.WaitPath(childP)
 		fs.debugDurationf(waitStart, 0, "unlink wait commit done path=%s", childP)
 
-		// Re-check pendingIndex after WaitPath but before CancelPath. On a
-		// successful commit, commitQueue removes pendingIndex before taking the
-		// entry out of inFlight/queue, so after WaitPath this distinguishes:
+		// Re-check pendingIndex after WaitPath. On a successful commit,
+		// commitQueue removes pendingIndex before taking the entry out of
+		// inFlight/queue, so after WaitPath this distinguishes:
 		// still PendingNew => never uploaded; missing => uploaded or remote file.
 		if fs.pendingIndex != nil {
 			if meta, ok := fs.pendingIndex.GetMeta(childP); ok {
@@ -8071,20 +8072,13 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 				pendingNew = false
 			}
 		}
-		fs.commitQueue.CancelPath(childP)
 	} else {
-		// Also check pendingIndex for the pending-new flag before clearing.
+		// Also check pendingIndex for the pending-new flag (read-only; the
+		// destructive Remove is deferred to the commit point).
 		if !pendingNew && fs.pendingIndex != nil {
 			if meta, ok := fs.pendingIndex.GetMeta(childP); ok && meta.Kind == PendingNew {
 				pendingNew = true
 			}
-		}
-		// Clean up shadow and pending index directly when no commit queue.
-		if fs.pendingIndex != nil {
-			fs.pendingIndex.Remove(childP)
-		}
-		if fs.shadowStore != nil {
-			fs.shadowStore.Remove(childP)
 		}
 	}
 
@@ -8101,9 +8095,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// After waiting on remoteCommitLock, a concurrent sync Flush may have
 	// just uploaded and recorded a committed revision. That means the path
 	// exists remotely even if we earlier classified it as PendingNew.
-	// Do NOT clear pendingNew merely because we already removed our own
-	// writeBack/pendingIndex entries above — that would force a DELETE for
-	// true never-uploaded PendingNew files.
+	// Re-read the staging metadata under the lock for the same reason —
+	// all of this is read-only; the destructive cleanup happens only after
+	// the commit point below.
 	if fs.latestCommittedRevision(childP) > 0 {
 		pendingNew = false
 	}
@@ -8111,16 +8105,11 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if meta, ok := fs.writeBack.GetMeta(childP); ok {
 			pendingNew = meta.Kind == PendingNew
 		}
-		fs.writeBack.Remove(childP)
 	}
 	if fs.pendingIndex != nil {
 		if meta, ok := fs.pendingIndex.GetMeta(childP); ok {
 			pendingNew = meta.Kind == PendingNew
 		}
-		fs.pendingIndex.Remove(childP)
-	}
-	if fs.shadowStore != nil {
-		fs.shadowStore.Remove(childP)
 	}
 
 	if !pendingNew {
@@ -8139,13 +8128,39 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 				// remotely, so the handles must not be treated as unlinked —
 				// otherwise their next Flush/Fsync/Release discards dirty
 				// data (silent data loss after a transient DELETE error).
+				// No staging-store rollback is needed: every destructive
+				// Remove/CancelPath is deferred to the commit point below,
+				// which a failed DELETE never reaches.
 				fs.unmarkOpenHandlesAfterFailedUnlink(childP, markedHandles)
 				status = httpToFuseStatus(err)
 				return status
 			}
 		}
 	}
-	// Release the per-path lock immediately after the remote DELETE: the B4
+
+	// Commit point passed (remote DELETE succeeded, or the path was never
+	// uploaded). NOW destroy the path's staged local state — write-back
+	// entry, queued commits, pending index, shadow — while still holding
+	// remoteCommitLock so no same-path producer (e.g. a commit-queue worker
+	// blocked on PathLock) can upload between the DELETE and this cleanup.
+	// Path-global removal is correct here: the name is being deleted, and a
+	// replacement create cannot start before Unlink returns (kernel parent
+	// serialization); straggler handles are marked unlinked in pass 2 below
+	// and their discard is ownership-scoped.
+	if fs.writeBack != nil {
+		fs.writeBack.Remove(childP)
+	}
+	if fs.commitQueue != nil {
+		fs.commitQueue.CancelPath(childP)
+	} else {
+		if fs.pendingIndex != nil {
+			fs.pendingIndex.Remove(childP)
+		}
+		if fs.shadowStore != nil {
+			fs.shadowStore.Remove(childP)
+		}
+	}
+	// Release the per-path lock immediately after the commit point: the B4
 	// invariant only covers remote commit producers, and the remaining
 	// handle/inode bookkeeping takes fh.mu (lock order is fh.mu →
 	// remoteCommitLock everywhere else).

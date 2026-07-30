@@ -1421,65 +1421,6 @@ func TestShadowStoreRemoveIfGenerationRaceStaleVsNewerWrite(t *testing.T) {
 	}
 }
 
-// TestShadowStoreUnretire covers the rollback primitive: a pinned shadow that
-// was retired by Remove must become the live shadow again after Unretire,
-// unless the path has already been re-created by a replacement write.
-func TestShadowStoreUnretire(t *testing.T) {
-	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ss.Close()
-	const p = "/dir/file.txt"
-
-	if err := ss.WriteFull(p, []byte("v1"), 0); err != nil {
-		t.Fatal(err)
-	}
-	gen := ss.Pin(p)
-	if gen == 0 {
-		t.Fatal("pin returned 0")
-	}
-	ss.Remove(p) // retires because refs > 0
-	if ss.Has(p) {
-		t.Fatal("shadow still active after retire")
-	}
-
-	// Unretire restores the live shadow with its content.
-	if !ss.Unretire(gen, p) {
-		t.Fatal("Unretire returned false")
-	}
-	if !ss.Has(p) {
-		t.Fatal("shadow not active after Unretire")
-	}
-	data, err := ss.ReadAll(p)
-	if err != nil || string(data) != "v1" {
-		t.Fatalf("ReadAll after Unretire = %q, %v — want v1", data, err)
-	}
-	ss.Unpin(gen)
-
-	// A replacement at the same path must block Unretire of the old generation.
-	if err := ss.WriteFull(p, []byte("v2"), 0); err != nil {
-		t.Fatal(err)
-	}
-	gen2 := ss.Pin(p)
-	ss.Remove(p) // retires v2 generation... actually retires current active
-	if ss.Has(p) {
-		t.Fatal("shadow still active after second retire")
-	}
-	if err := ss.WriteFull(p, []byte("replacement"), 0); err != nil {
-		t.Fatal(err)
-	}
-	if ss.Unretire(gen2, p) {
-		t.Fatal("Unretire must refuse when the path has an active replacement shadow")
-	}
-	data, err = ss.ReadAll(p)
-	if err != nil || string(data) != "replacement" {
-		t.Fatalf("ReadAll after refused Unretire = %q, %v — want replacement", data, err)
-	}
-	ss.Unpin(gen2)
-}
-
 // TestShadowStoreRemoveIfGenerationWriteFullRaceConsistency races replacement
 // WriteFulls against a stale-generation removal and asserts that whenever an
 // active shadow generation exists, its disk file is present and readable.
@@ -1533,5 +1474,71 @@ func TestShadowStoreRemoveIfGenerationWriteFullRaceConsistency(t *testing.T) {
 		if _, err := os.Stat(ss.shadowPath(p)); err != nil {
 			t.Fatalf("active generation %d present but disk file missing: %v", gen, err)
 		}
+	}
+}
+
+// TestShadowStoreTwoPathLocksReverseOrder is the ShadowStore counterpart of
+// TestPendingIndexTwoPathLocksReverseOrder: a reverse-lexicographic
+// acquire/release pair must not split one path into two live mutexes.
+func TestShadowStoreTwoPathLocksReverseOrder(t *testing.T) {
+	ss, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	pla, plb := ss.acquireTwoPathLocks("/z", "/a")
+
+	waiterHeld := make(chan *shadowPathLock, 1)
+	waiterDone := make(chan struct{})
+	go func() {
+		defer close(waiterDone)
+		pl := ss.acquirePathLock("/a")
+		waiterHeld <- pl
+		time.Sleep(150 * time.Millisecond)
+		ss.releasePathLock("/a", pl)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ss.mu.Lock()
+		pl, ok := ss.pathLocks["/a"]
+		waiters := 0
+		if ok {
+			waiters = pl.waiters
+		}
+		ss.mu.Unlock()
+		if ok && waiters >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("waiter never queued on /a path lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	ss.releaseTwoPathLocks("/z", "/a", pla, plb)
+
+	select {
+	case <-waiterHeld:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not acquire /a lock after pair release")
+	}
+
+	secondAcquired := make(chan struct{})
+	go func() {
+		pl := ss.acquirePathLock("/a")
+		close(secondAcquired)
+		ss.releasePathLock("/a", pl)
+	}()
+	select {
+	case <-secondAcquired:
+		t.Fatal("second acquirer entered /a while the waiter still held it — path split into two locks")
+	case <-time.After(50 * time.Millisecond):
+	}
+	<-waiterDone
+	select {
+	case <-secondAcquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second acquirer never entered /a after waiter released")
 	}
 }

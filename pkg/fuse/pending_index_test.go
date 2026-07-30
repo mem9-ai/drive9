@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestPendingIndexPutGetRemove(t *testing.T) {
@@ -425,4 +426,82 @@ func TestPendingIndexRemoveIfGenerationPutRaceConsistency(t *testing.T) {
 	if liveOK != recOK {
 		t.Fatalf("recovery mismatch: live=%v recovered=%v", liveOK, recOK)
 	}
+}
+
+// TestPendingIndexTwoPathLocksReverseOrder proves that a reverse-lexicographic
+// acquire/release pair cannot split one path into two live mutexes: a waiter
+// on the smaller path must hold the SAME lock instance that a later acquirer
+// blocks on. Regression for the crossed lock/path pairing in
+// releaseTwoPathLocks.
+func TestPendingIndexTwoPathLocksReverseOrder(t *testing.T) {
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pla, plb := idx.acquireTwoPathLocks("/z", "/a")
+
+	// Register a waiter on "/a" (the lexicographically smaller path, held
+	// via pla).
+	waiterHeld := make(chan *pendingPathLock, 1)
+	waiterDone := make(chan struct{})
+	go func() {
+		defer close(waiterDone)
+		pl := idx.acquirePathLock("/a")
+		waiterHeld <- pl
+		// Hold the lock briefly; a second acquirer must not enter meanwhile.
+		time.Sleep(150 * time.Millisecond)
+		idx.releasePathLock("/a", pl)
+	}()
+	// Wait until the waiter is queued on the /a lock.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		idx.mu.Lock()
+		pl, ok := idx.pathLocks["/a"]
+		waiters := 0
+		if ok {
+			waiters = pl.waiters
+		}
+		idx.mu.Unlock()
+		if ok && waiters >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("waiter never queued on /a path lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Release the pair in the original (unsorted) order. With the crossed
+	// release the /a map entry would be deleted here, letting a second
+	// acquirer create a fresh mutex and enter concurrently with the waiter.
+	idx.releaseTwoPathLocks("/z", "/a", pla, plb)
+
+	var waiterLock *pendingPathLock
+	select {
+	case waiterLock = <-waiterHeld:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not acquire /a lock after pair release")
+	}
+
+	// While the waiter holds /a, a new acquirer must block.
+	secondAcquired := make(chan struct{})
+	go func() {
+		pl := idx.acquirePathLock("/a")
+		close(secondAcquired)
+		idx.releasePathLock("/a", pl)
+	}()
+	select {
+	case <-secondAcquired:
+		t.Fatal("second acquirer entered /a while the waiter still held it — path split into two locks")
+	case <-time.After(50 * time.Millisecond):
+		// Expected: still blocked.
+	}
+	<-waiterDone
+	select {
+	case <-secondAcquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second acquirer never entered /a after waiter released")
+	}
+	_ = waiterLock
 }

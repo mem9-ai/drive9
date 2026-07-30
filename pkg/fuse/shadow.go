@@ -131,6 +131,8 @@ func (s *ShadowStore) releasePathLock(remotePath string, pl *shadowPathLock) {
 
 // acquireTwoPathLocks locks both paths in a stable (lexicographic) order so
 // Rename cannot deadlock against a concurrent opposite-direction Rename.
+// The returned locks correspond to the SORTED names: pla protects first,
+// plb protects second.
 func (s *ShadowStore) acquireTwoPathLocks(a, b string) (pla, plb *shadowPathLock) {
 	if a == b {
 		pla = s.acquirePathLock(a)
@@ -146,10 +148,19 @@ func (s *ShadowStore) acquireTwoPathLocks(a, b string) (pla, plb *shadowPathLock
 }
 
 func (s *ShadowStore) releaseTwoPathLocks(a, b string, pla, plb *shadowPathLock) {
-	if plb != nil {
-		s.releasePathLock(b, plb)
+	// Release against the same SORTED names used by acquireTwoPathLocks:
+	// pla protects the lexicographically smaller path, plb the larger one.
+	// Releasing against the original unsorted names crosses the lock/path
+	// pairing for reverse-ordered renames and can delete a live lock's map
+	// entry, splitting one path into two mutexes.
+	first, second := a, b
+	if second < first {
+		first, second = second, first
 	}
-	s.releasePathLock(a, pla)
+	if plb != nil {
+		s.releasePathLock(second, plb)
+	}
+	s.releasePathLock(first, pla)
 }
 
 // NewShadowStore creates a ShadowStore rooted at dir.
@@ -1175,48 +1186,6 @@ func (s *ShadowStore) RemoveIfGeneration(remotePath string, expectedGen uint64) 
 	}
 	s.runRemoveCleanup(cleanup)
 	s.releasePathLock(remotePath, pl)
-	return true
-}
-
-// Unretire moves a retired shadow generation back to the active map for
-// remotePath, renaming its disk file back. Used to roll back a failed Unlink:
-// the shadow was retired by the unlink-time Remove but the remote DELETE
-// failed, so the still-open handle's backing must become the live shadow
-// again. Returns false if the generation is not retired or the path already
-// has an active shadow (e.g. a replacement was created in between — rolling
-// back then would destroy it).
-func (s *ShadowStore) Unretire(gen uint64, remotePath string) bool {
-	if gen == 0 {
-		return false
-	}
-	pl := s.acquirePathLock(remotePath)
-	defer s.releasePathLock(remotePath, pl)
-
-	s.mu.Lock()
-	rt, ok := s.retired[gen]
-	if !ok {
-		s.mu.Unlock()
-		return false
-	}
-	if _, exists := s.files[remotePath]; exists {
-		s.mu.Unlock()
-		return false
-	}
-	delete(s.retired, gen)
-	sf := &ShadowFile{fd: rt.fd, size: rt.size}
-	s.files[remotePath] = sf
-	s.active[remotePath] = gen
-	s.genFile[gen] = sf
-	s.bumpWriteGenLocked(remotePath)
-	s.mu.Unlock()
-
-	if err := os.Rename(rt.diskPath, s.shadowPath(remotePath)); err != nil {
-		// The retired file is missing (e.g. swept after a crash): keep the
-		// maps consistent — the fd remains readable, so in-memory state and
-		// Has()/ReadAt() still work for the handle's lifetime.
-		_ = err
-	}
-	s.pendingBytes.Add(rt.size)
 	return true
 }
 

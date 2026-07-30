@@ -76,10 +76,19 @@ func (idx *PendingIndex) acquireTwoPathLocks(a, b string) (pla, plb *pendingPath
 }
 
 func (idx *PendingIndex) releaseTwoPathLocks(a, b string, pla, plb *pendingPathLock) {
-	if plb != nil {
-		idx.releasePathLock(b, plb)
+	// Release against the same SORTED names used by acquireTwoPathLocks:
+	// pla protects the lexicographically smaller path, plb the larger one.
+	// Releasing against the original unsorted names crosses the lock/path
+	// pairing for reverse-ordered renames and can delete a live lock's map
+	// entry, splitting one path into two mutexes.
+	first, second := a, b
+	if second < first {
+		first, second = second, first
 	}
-	idx.releasePathLock(a, pla)
+	if plb != nil {
+		idx.releasePathLock(second, plb)
+	}
+	idx.releasePathLock(first, pla)
 }
 
 // NewPendingIndex creates a PendingIndex backed by the given directory.

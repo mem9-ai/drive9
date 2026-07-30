@@ -21036,6 +21036,121 @@ func TestUnlinkDeleteFailureRollsBackOpenHandleMarks(t *testing.T) {
 	}
 }
 
+// TestUnlinkDeleteFailurePreservesClosedPendingState: a failed remote DELETE
+// must not destroy closed staged state (no live handle) — a POSIX unlink that
+// fails leaves the namespace entry in place, so an already-accepted local
+// PendingOverwrite whose only copy lives in the staging stores must remain
+// recoverable. Regression for the commit-point deferral in Unlink.
+func TestUnlinkDeleteFailurePreservesClosedPendingState(t *testing.T) {
+	const filePath = "/file.txt"
+	staged := []byte("newer-local-overwrite")
+
+	var (
+		mu       sync.Mutex
+		files    = map[string][]byte{filePath: []byte("remote-v1")}
+		headHits atomic.Int32
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		if p == "" {
+			p = "/"
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+		case r.Method == http.MethodGet:
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				mu.Unlock()
+				w.Header().Set("X-Dat9-Revision", "1")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(data)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		case r.Method == http.MethodDelete:
+			// Transient failure — the unlink does not happen remotely.
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		case r.Method == http.MethodHead:
+			headHits.Add(1)
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	wb, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.SetWriteBack(wb, nil)
+
+	// Seed a CLOSED staged overwrite for the remote file (no live handle):
+	// shadow bytes + pending index + write-back entry at remote base rev 1.
+	if err := shadow.WriteFull(filePath, staged, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(filePath, int64(len(staged)), PendingOverwrite, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.PutWithBaseRevAndMode(filePath, staged, int64(len(staged)), PendingOverwrite, 1, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	// The inode must exist for the unlink path resolution.
+	fs.inodes.Lookup(filePath, false, int64(len(files[filePath])), time.Now())
+
+	// Unlink fails (DELETE 500) and must leave every staged copy intact.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "file.txt"); st == gofuse.OK {
+		t.Fatal("Unlink unexpectedly succeeded despite remote DELETE 500")
+	}
+
+	if meta, ok := pending.GetMeta(filePath); !ok || meta.Kind != PendingOverwrite {
+		t.Fatalf("pendingIndex entry lost after failed unlink (ok=%v)", ok)
+	}
+	if !shadow.Has(filePath) {
+		t.Fatal("shadow backing lost after failed unlink")
+	}
+	if data, err := shadow.ReadAll(filePath); err != nil || string(data) != string(staged) {
+		t.Fatalf("shadow content after failed unlink = %q, %v — want staged bytes", data, err)
+	}
+	if meta, ok := wb.GetMeta(filePath); !ok || meta.Kind != PendingOverwrite {
+		t.Fatalf("writeBack entry lost after failed unlink (ok=%v)", ok)
+	}
+	// Remote file untouched: HEAD still sees it.
+	mu.Lock()
+	_, remoteOK := files[filePath]
+	mu.Unlock()
+	if !remoteOK {
+		t.Fatal("remote file must still exist after failed DELETE")
+	}
+}
+
 // TestConcurrentStrictShadowSpillFsyncDoesNotResurrectUnlinkedPath is the
 // large-file sibling of TestConcurrentFlushDoesNotResurrectUnlinkedPath: the
 // strict ShadowSpill Fsync upload must hold remoteCommitLock across the
