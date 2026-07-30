@@ -373,7 +373,7 @@ const (
 	DefaultTenantPoolReconcileInterval           = 5 * time.Second
 	DefaultTenantPoolReconcileWorkers            = 15
 	DefaultTenantPoolReconcileWorkerRest         = 5 * time.Second
-	DefaultManagedSharedDBStuckTimeout           = 15 * time.Minute
+	DefaultManagedSharedDBStuckTimeout           = 30 * time.Minute
 	DefaultManagedSharedDBFailedCleanupInterval  = time.Minute
 	DefaultManagedSharedDBFailedCleanupBatchSize = 5
 )
@@ -480,10 +480,6 @@ func NewWithConfig(cfg Config) *Server {
 		managedSharedDBProvisioningWorkers = DefaultManagedSharedDBProvisioningWorkers
 	}
 	managedSharedDBProvisioningConcurrency := managedSharedDBProvisioningWorkers
-	if cfg.Meta != nil && cfg.Meta.DB() != nil {
-		managedSharedDBProvisioningConcurrency = limitManagedSharedDBProvisioningWorkers(
-			managedSharedDBProvisioningWorkers, cfg.Meta.DB().Stats().MaxOpenConnections)
-	}
 	tenantPoolReconcileInterval := cfg.TenantPoolReconcileInterval
 	if tenantPoolReconcileInterval <= 0 {
 		tenantPoolReconcileInterval = DefaultTenantPoolReconcileInterval
@@ -660,8 +656,13 @@ func NewWithConfig(cfg Config) *Server {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			b := cfg.Pool.LoadS3Backend(r.Context(), cfg.Meta, tenantID)
-			if b == nil || b.S3() == nil {
+			b, release := cfg.Pool.LoadS3Backend(r.Context(), cfg.Meta, tenantID)
+			if b == nil || release == nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			defer release()
+			if b.S3() == nil {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
@@ -749,20 +750,6 @@ func normalizeTenantPoolRefillFreeRatio(ratio float64) float64 {
 		return DefaultTenantPoolRefillFreeRatio
 	}
 	return ratio
-}
-
-// limitManagedSharedDBProvisioningWorkers reserves half of the metadb pool for
-// callback queries and unrelated control-plane traffic. Each active schema
-// worker holds one session connection for GET_LOCK while its callback performs
-// ordinary Store operations through another connection from the same pool.
-func limitManagedSharedDBProvisioningWorkers(configured, maxOpen int) int {
-	if configured <= 0 {
-		return 0
-	}
-	if maxOpen <= 0 {
-		return configured
-	}
-	return min(configured, maxOpen/2)
 }
 
 // insertTenantNotify records a best-effort unified outbox signal so other
@@ -3497,6 +3484,12 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	}
 	if nf.File != nil {
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(nf.File.Revision, 10))
+		// Advertise the authoritative storage class so clients (notably FUSE
+		// write-sync) can route PATCH vs full-upload on fact instead of a
+		// size-based heuristic. Older clients simply ignore the header.
+		if nf.File.StorageType != "" {
+			w.Header().Set("X-Dat9-Storage-Type", string(nf.File.StorageType))
+		}
 		if nf.File.ConfirmedAt != nil {
 			w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.File.ConfirmedAt.Unix(), 10))
 		} else {

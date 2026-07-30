@@ -229,6 +229,66 @@ func (fs *Dat9FS) negotiatedInlineThreshold() int64 {
 	return 0
 }
 
+// Storage class values advertised by the server's X-Dat9-Storage-Type stat
+// header. Aliased from pkg/client (the wire-protocol owner) so the FUSE
+// routing never defines its own copy of the protocol strings.
+const (
+	storageClassDB9 = client.StorageTypeDB9
+	storageClassS3  = client.StorageTypeS3
+)
+
+// storageClassForCommittedSize derives the remote storage class produced by a
+// successful full-content commit of the given size, mirroring the server's
+// inline-vs-S3 decision (shouldStoreInDB / IsLargeFile). Returns "" when the
+// negotiated threshold is unknown, in which case callers must keep the
+// previously known class rather than guessing.
+func (fs *Dat9FS) storageClassForCommittedSize(size int64) client.StorageType {
+	threshold := fs.negotiatedInlineThreshold()
+	if threshold <= 0 {
+		return ""
+	}
+	if size >= threshold {
+		return storageClassS3
+	}
+	return storageClassDB9
+}
+
+// adoptCommittedStorageClassLocked records the storage class implied by a
+// successful commit of committedSize. A no-op when the class cannot be
+// derived (unknown threshold), so a previously observed class is never
+// downgraded to "unknown".
+func (fs *Dat9FS) adoptCommittedStorageClassLocked(fh *FileHandle, committedSize int64) {
+	if fh == nil {
+		return
+	}
+	if class := fs.storageClassForCommittedSize(committedSize); class != "" {
+		fh.StorageClass = class
+	}
+}
+
+// materializeFullForUploadLocked ensures fh.Dirty can produce the complete
+// current file contents for a full upload (direct PUT or stream). Lazy
+// remote-backed parts are fetched via the buffer's LoadPart loader when
+// available. Returns false when the full contents cannot be reconstructed
+// without zero-filling untouched remote ranges — callers must then fail the
+// flush WITHOUT clearing dirty state. Eager bytesView() without this guard
+// uploads zeros for unloaded parts and silently corrupts the remote object
+// (e.g. an S3 object with a lazily loaded buffer routed to direct PUT after
+// the negotiated inline threshold was raised above the file size).
+func (fs *Dat9FS) materializeFullForUploadLocked(fh *FileHandle) bool {
+	if fh == nil || fh.Dirty == nil {
+		return false
+	}
+	if fh.Dirty.CanMaterializeFull() {
+		return true
+	}
+	if err := fh.Dirty.LoadMissingParts(); err != nil {
+		log.Printf("materialize full file for upload failed for %s: %v", fh.Path, err)
+		return false
+	}
+	return fh.Dirty.CanMaterializeFull()
+}
+
 // warmInlineThreshold triggers a one-shot /v1/status fetch via the client
 // to populate the cached server inline_threshold. Idempotent and safe to
 // call from FUSE startup; failures (e.g. older server) cache as zero so
@@ -1737,6 +1797,7 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 	for _, fh := range matching {
 		var abortStreamer func()
 		fh.Lock()
+		fs.adoptCommittedStorageClassLocked(fh, truncateSize)
 		if shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
 			var err error
 			abortStreamer, err = fs.truncateWritableHandleLocked(fh, truncateSize)
@@ -2107,6 +2168,7 @@ func (fs *Dat9FS) rebindCleanWriteBufferToRemoteLocked(fh *FileHandle, committed
 	next.sequential = true
 	fh.Dirty = next
 	fh.OrigSize = committedSize
+	fs.adoptCommittedStorageClassLocked(fh, committedSize)
 	clearReadTargetForLockedHandle(fh)
 
 	c := fs.client
@@ -2349,6 +2411,7 @@ func (fs *Dat9FS) markHandleRevisionOnlyLocked(fh *FileHandle, revision int64, s
 	fh.IsNew = false
 	fh.BaseRev = revision
 	fh.OrigSize = snapshotSize
+	fs.adoptCommittedStorageClassLocked(fh, snapshotSize)
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, revision, fh, snapshotSize)
 	if fs.writeBack != nil {
@@ -2381,6 +2444,7 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	if fh.Dirty != nil {
 		size := fh.Dirty.Size()
 		fh.OrigSize = size
+		fs.adoptCommittedStorageClassLocked(fh, size)
 		fs.inodes.UpdateSize(fh.Ino, size)
 	}
 	fs.refreshCommittedRevisionForOpenHandles(fh.Path, revision, fh)
@@ -2425,6 +2489,7 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 	}
 	fh.OrigSize = stat.Size
 	fh.BaseRev = stat.Revision
+	fh.StorageClass = stat.StorageType
 	if stat.Size == 0 {
 		return gofuse.OK
 	}
@@ -2599,6 +2664,9 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 			fh.Unlock()
 			continue
 		}
+		// The path truncate committed a full re-upload of newSize remotely;
+		// the storage class follows from that size.
+		fs.adoptCommittedStorageClassLocked(fh, newSize)
 		curSize := fh.Dirty.Size()
 		if curSize != newSize {
 			if err := fh.Dirty.Truncate(newSize); err != nil {
@@ -3462,6 +3530,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		dirtySeq     uint64
 		isNew        bool
 		zeroBase     bool
+		storageClass client.StorageType
 		shadowSource bool
 		canMemory    bool
 	}
@@ -3490,6 +3559,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 			dirtySeq:     src.DirtySeq,
 			isNew:        src.IsNew,
 			zeroBase:     src.ZeroBase,
+			storageClass: src.StorageClass,
 			shadowSource: fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill),
 			canMemory:    src.Dirty.CanMaterializeFull(),
 		}
@@ -3536,6 +3606,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 				c.baseRev = c.src.BaseRev
 				c.isNew = c.src.IsNew
 				c.zeroBase = c.src.ZeroBase
+				c.storageClass = c.src.StorageClass
 				if size == 0 {
 					haveData = true
 				} else if c.src.Dirty.CanMaterializeFull() {
@@ -3565,8 +3636,10 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		fh.BaseRev = c.baseRev
 		if c.isNew {
 			fh.OrigSize = 0
+			fh.StorageClass = ""
 		} else {
 			fh.OrigSize = c.origSize
+			fh.StorageClass = c.storageClass
 		}
 		fs.inodes.UpdateSize(fh.Ino, size)
 		if c.baseRev > 0 {
@@ -9968,6 +10041,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
 				if err == nil && stat != nil {
 					fh.BaseRev = stat.Revision
+					fh.StorageClass = stat.StorageType
 					fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
 				}
 			}
@@ -11065,7 +11139,21 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 	threshold := fs.negotiatedInlineThreshold()
 	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
 	canPatchExisting := threshold > 0 && fh.OrigSize >= threshold && size <= fh.OrigSize
+	if fh.StorageClass == storageClassDB9 {
+		// Authoritative: the remote object is stored inline, so PATCH
+		// (S3 UploadPartCopy-based) is not applicable regardless of size.
+		// A known-S3 class needs no override: when OrigSize < threshold
+		// the direct-PUT / B11 growth guards already exclude PATCH.
+		canPatchExisting = false
+	}
 	if useDirectPUT || fh.OrigSize < threshold {
+		// Eager full-buffer materialization must prove no lazy remote-backed
+		// range is missing — bytesView() zero-fills unloaded parts and would
+		// silently corrupt the remote object (fetch them instead when the
+		// buffer has a loader; fail safe otherwise).
+		if !fs.materializeFullForUploadLocked(fh) {
+			return gofuse.EIO
+		}
 		data = fh.Dirty.bytesView()
 	}
 
@@ -11121,9 +11209,40 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 			}
 			fs.perfRecordRemote(perfRemoteWrite, patchStart, err, patchBytes)
 			fs.debugDurationf(patchStart, 0, "write-sync patch done path=%s size=%d dirty_parts=%d err=%v", fh.Path, size, len(dirtyParts), err)
+			if err != nil && client.IsUnsupportedStorageTargetErr(err) {
+				// The server rejected the patch plan: the remote object is
+				// not S3-stored, so partial updates are unsupported for it.
+				// Record the observed class (this also prevents future
+				// flushes from re-selecting PATCH) and fall back to a full
+				// conditional upload, which is valid for any storage class.
+				fh.StorageClass = storageClassDB9
+				// Fetch missing lazy remote-backed parts when a loader is
+				// available (recoverable); fail EIO without clearing dirty
+				// state otherwise — never upload zero-filled ranges.
+				if !fs.materializeFullForUploadLocked(fh) {
+					log.Printf("write-sync patch fallback cannot materialize full file for %s", fh.Path)
+					return gofuse.EIO
+				}
+				data = fh.Dirty.bytesView()
+				writeStart := time.Now()
+				fs.debugf("write-sync patch unsupported, full-upload fallback start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
+				err = fs.client.WriteStreamConditional(
+					ctx,
+					fs.remotePath(fh.Path),
+					bytes.NewReader(data),
+					size,
+					nil,
+					expectedRevision,
+				)
+				fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
+				fs.debugDurationf(writeStart, 0, "write-sync patch fallback done path=%s size=%d err=%v", fh.Path, size, err)
+			}
 		}
 	} else {
-		if data == nil && !fh.Dirty.CanMaterializeFull() {
+		if data == nil && !fs.materializeFullForUploadLocked(fh) {
+			// Same fetch-or-fail contract as flushHandle: a lazily loaded
+			// existing file that grew beyond OrigSize is recoverable when a
+			// loader exists; otherwise fail without clearing dirty state.
 			log.Printf("write-sync cannot materialize full file for %s", fh.Path)
 			return gofuse.EIO
 		}
@@ -11147,6 +11266,9 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 		log.Printf("write-sync upload failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
+	// The commit is authoritative for the storage class: direct PUT lands
+	// inline, PATCH keeps S3, and a full upload re-splits by size.
+	fs.adoptCommittedStorageClassLocked(fh, size)
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 		log.Printf("write-sync pending chmod failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
@@ -12542,6 +12664,27 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	}
 
 	// Small file: schedule a deferred upload.
+	// Freeze the CAS base BEFORE any fetch/materialization. If a sibling
+	// commits while the lazy loader is fetching (which reads latest remote
+	// bytes), adopting the committed revision here would advance the base
+	// to the sibling's revision and let the deferred PUT silently splice
+	// this handle's older dirty bytes into the newer remote — the exact
+	// lost-update class the synchronous paths defend by capturing
+	// expectedRevision before materializing. With the base frozen first,
+	// the callback's revision re-check observes the sibling commit and
+	// skips the upload instead.
+	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
+	// The debounced callback commits the FULL buffer and clears dirty state
+	// on success, so this snapshot must meet the same materialization
+	// contract as every other full-upload path: bytesView() zero-fills
+	// unloaded lazy remote-backed parts, which would silently corrupt the
+	// remote object (e.g. an S3 object lazily opened while the server inline
+	// threshold sits above the buffer's part size). Fetch missing parts via
+	// the lazy loader, or fail EIO preserving dirty state.
+	if !fs.materializeFullForUploadLocked(fh) {
+		log.Printf("debounced flush cannot materialize full file for %s", fh.Path)
+		return gofuse.EIO
+	}
 	// Snapshot the data so the deferred upload sees a consistent copy.
 	snapshot := fh.Dirty.bytesView()
 	data := make([]byte, len(snapshot))
@@ -12550,7 +12693,6 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	ino := fh.Ino
 	handle := fh               // capture for goroutine
 	snapshotSeq := fh.DirtySeq // capture current dirty sequence
-	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	// Snapshot the staging-store generations so the post-upload cleanup can be
 	// generation-guarded. A concurrent same-path write while the debounce is
 	// pending/in-flight would bump these generations, and removing the fresher
@@ -13003,6 +13145,12 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// callback cannot construct correct content. Consistent with write-sync
 	// path's canPatchExisting guard (line ~9912).
 	usePatch := !useDirectPUT && threshold > 0 && handleOrigSize >= threshold && size <= handleOrigSize
+	if fh.StorageClass == storageClassDB9 {
+		// Authoritative: remote object is stored inline; PATCH requires S3.
+		// A known-S3 class needs no override: when OrigSize < threshold the
+		// direct-PUT / B11 growth guards already exclude PATCH.
+		usePatch = false
+	}
 
 	// Prepare patch snapshots while we still hold the lock.
 	var dirtyParts []int
@@ -13034,13 +13182,15 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// (committedRev == 0) does not seed the read cache with full data.
 	var dataCopy []byte
 	if !usePatch {
-		// B12: For the WriteStreamConditional path (grown large file), check
-		// that all parts are loaded before materializing. Lazy-loaded existing
-		// files may have unloaded remote-backed parts; bytesView() would fill
-		// them with zeroes, overwriting remote data. Consistent with write-sync
-		// path's CanMaterializeFull() guard (line ~9971).
-		if !useDirectPUT && !fh.Dirty.CanMaterializeFull() {
-			log.Printf("flushHandle cannot materialize full file for %s (path2 growth)", fh.Path)
+		// B12: For full-upload paths (direct PUT and WriteStreamConditional),
+		// prove that all parts are loaded before materializing — or fetch the
+		// missing remote-backed parts via the lazy loader. Lazy-loaded
+		// existing files may have unloaded remote-backed parts; bytesView()
+		// would fill them with zeroes, overwriting remote data. This guard
+		// now covers the direct-PUT path as well (threshold raised above the
+		// file size after open), not just stream uploads.
+		if !fs.materializeFullForUploadLocked(fh) {
+			log.Printf("flushHandle cannot materialize full file for %s (path2)", fh.Path)
 			return gofuse.EIO
 		}
 		dataCopy = make([]byte, fh.Dirty.Size())
@@ -13180,6 +13330,20 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	fs.debugDurationf(uploadStart, 0, "flushHandle path2 relock after upload path=%s size=%d err=%v", handlePath, size, err)
 
 	if err != nil {
+		if usePatch && client.IsUnsupportedStorageTargetErr(err) {
+			// The server rejected the patch plan: the remote object is not
+			// S3-stored. Record the observed class so this and future
+			// flushes route away from PATCH, then retry this flush as a
+			// full upload. Dirty state is untouched by the failed patch,
+			// and the recursion depth is bounded at 1: with StorageClass
+			// set to db9 the retry cannot re-enter the patch branch.
+			fh.StorageClass = storageClassDB9
+			if fh.Path == handlePath && fh.DirtySeq == handleDirtySeq {
+				fs.debugf("flushHandle patch unsupported target, retry as full upload path=%s size=%d", handlePath, size)
+				return fs.flushHandle(ctx, fh)
+			}
+			log.Printf("flush patch unsupported for %s; will full-upload on next flush (dirty state advanced during upload)", handlePath)
+		}
 		log.Printf("flush upload failed for %s: %v", handlePath, err)
 		return httpToFuseStatus(err)
 	}
@@ -13216,6 +13380,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// must NOT be cleared — the old-path upload success does not satisfy
 	// the new path's flush obligation.
 	pathRetargeted := fh.Path != handlePath
+	if !pathRetargeted {
+		// The commit is authoritative for the storage class: direct PUT
+		// lands inline, PATCH keeps S3, and a full upload re-splits by size.
+		fs.adoptCommittedStorageClassLocked(fh, size)
+	}
 
 	// Only clear dirty state if no concurrent writes happened while the
 	// lock was released AND the handle was not retargeted. If DirtySeq

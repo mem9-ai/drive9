@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -124,7 +125,7 @@ func TestRecordTenantOperationOmitsTenantFromDurationHistograms(t *testing.T) {
 func TestRecordTenantRequestOmitsHighCardinalityLabels(t *testing.T) {
 	const (
 		tenantID = "tenant-request-duration-omit"
-		surface  = "request_duration_surface"
+		surface  = "fs"
 		action   = "request_duration_action"
 	)
 
@@ -160,15 +161,15 @@ func TestRecordTenantRequestOmitsHighCardinalityLabels(t *testing.T) {
 func TestRecordTenantRequestZeroDurationDoesNotRecordDuration(t *testing.T) {
 	const tenantID = "tenant-zero-request"
 
-	RecordTenantRequest(tenantID, "zero_surface", "zero_action", 200, 0)
+	RecordTenantRequest(tenantID, "object_store", "zero_action", 200, 0)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `drive9_tenant_requests_total{action="zero_action",status_class="2xx",surface="zero_surface",tenant_id="`+tenantID+`",tidbcloud_org_id="guest"} 1`) {
+	if !strings.Contains(text, `drive9_tenant_requests_total{action="zero_action",status_class="2xx",surface="object_store",tenant_id="`+tenantID+`",tidbcloud_org_id="guest"} 1`) {
 		t.Errorf("missing zero-duration tenant request total:\n%s", text)
 	}
-	if hasMetricLineWith(text, "drive9_tenant_request_duration_seconds_count", `surface="zero_surface"`) {
+	if hasMetricLineWith(text, "drive9_tenant_request_duration_seconds_count", `surface="object_store"`, `status_class="2xx"`) {
 		t.Errorf("zero-duration tenant request unexpectedly recorded a duration:\n%s", text)
 	}
 }
@@ -297,8 +298,7 @@ func TestTenantIDMetricsIncludeTiDBCloudOrgID(t *testing.T) {
 
 	RecordTenantGaugeWithOrg(tenantID, orgID, "component_org_label_test", "gauge", 1)
 	RecordTenantEventWithOrg(tenantID, orgID, "event_org_label_test", "result", "ok")
-	RecordTenantRequestCountWithOrg(tenantID, orgID, "surface_org_label_test", "action", 200)
-	RecordTenantHTTPBytesWithOrg(tenantID, orgID, "request", 10)
+	RecordTenantRequestCountWithOrg(tenantID, orgID, "fs", "action", 200)
 	RecordTenantFileBytesWithOrg(tenantID, orgID, "out", 20)
 	RecordTenantStorageBytesWithOrg(tenantID, orgID, "confirmed", 30)
 	RecordTenantMediaFilesWithOrg(tenantID, orgID, "confirmed", 40)
@@ -317,8 +317,7 @@ func TestTenantIDMetricsIncludeTiDBCloudOrgID(t *testing.T) {
 	for _, want := range []string{
 		`drive9_service_gauge{component="component_org_label_test",name="gauge",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1.000000`,
 		`drive9_business_events_total{event="event_org_label_test",result="ok"} 1`,
-		`drive9_tenant_requests_total{action="action",status_class="2xx",surface="surface_org_label_test",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
-		`drive9_tenant_http_bytes_total{direction="request",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 10`,
+		`drive9_tenant_requests_total{action="action",status_class="2xx",surface="fs",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 1`,
 		`drive9_tenant_file_bytes_total{direction="out",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 20`,
 		`drive9_tenant_storage_bytes{state="confirmed",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 30.000000`,
 		`drive9_tenant_media_files{state="confirmed",tenant_id="` + tenantID + `",tidbcloud_org_id="` + orgID + `"} 40.000000`,
@@ -385,9 +384,11 @@ func TestTenantOperationFailuresUseSeparateFailureOnlyMetric(t *testing.T) {
 	}
 }
 
-func TestBusinessEventTenantLabelsAreLimitedToLifecycleEvents(t *testing.T) {
+func TestBusinessEventTenantLabelsAreLimitedToFailures(t *testing.T) {
 	RecordTenantEventWithOrg("tenant-event-contract", "org-event-contract", "fs_write", "result", "ok")
-	RecordTenantEventWithOrg("tenant-event-contract", "org-event-contract", "tenant_provision", "provider", "local", "result", "ok")
+	RecordTenantEventWithOrg("tenant-event-contract", "org-event-contract", "tenant_provision", "provider", "local", "result", "accepted")
+	RecordTenantEventWithOrg("tenant-event-contract", "org-event-contract", "tenant_provision", "provider", "local", "result", "cluster_error")
+	RecordTenantEventWithOrg("tenant-event-contract", "org-event-contract", "tenant_schema_init", "provider", "local", "result", "error")
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
@@ -398,8 +399,41 @@ func TestBusinessEventTenantLabelsAreLimitedToLifecycleEvents(t *testing.T) {
 	if hasMetricLineWith(text, "drive9_business_events_total", `event="fs_write"`, `tenant_id=`) {
 		t.Fatalf("hot-path event carried tenant labels:\n%s", text)
 	}
-	if !strings.Contains(text, `drive9_business_events_total{event="tenant_provision",provider="local",result="ok",tenant_id="tenant-event-contract",tidbcloud_org_id="org-event-contract"} 1`) {
-		t.Fatalf("lifecycle event lost tenant attribution:\n%s", text)
+	if !strings.Contains(text, `drive9_business_events_total{event="tenant_provision",provider="local",result="accepted"} 1`) {
+		t.Fatalf("successful provisioning event was not aggregated:\n%s", text)
+	}
+	if hasMetricLineWith(text, "drive9_business_events_total", `event="tenant_provision"`, `result="accepted"`, `tenant_id=`) {
+		t.Fatalf("successful provisioning event carried tenant labels:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_business_events_total{event="tenant_provision",provider="local",result="cluster_error",tenant_id="tenant-event-contract",tidbcloud_org_id="org-event-contract"} 1`) {
+		t.Fatalf("failed provisioning event lost tenant attribution:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_business_events_total{event="tenant_schema_init",provider="local",result="error",tenant_id="tenant-event-contract",tidbcloud_org_id="org-event-contract"} 1`) {
+		t.Fatalf("schema-init event lost tenant attribution:\n%s", text)
+	}
+}
+
+func TestTenantRequestTenantLabelsAreLimitedToDataPlaneAndErrors(t *testing.T) {
+	RecordTenantRequestWithOrg("tenant-request-contract", "org-request-contract", "provision", "post", http.StatusAccepted, time.Second)
+	RecordTenantRequestWithOrg("tenant-request-contract", "org-request-contract", "provision", "post", http.StatusBadRequest, time.Second)
+	RecordTenantRequestWithOrg("tenant-request-contract", "org-request-contract", "fs", "write", http.StatusAccepted, time.Second)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_tenant_requests_total{action="post",status_class="2xx",surface="provision"} 1`) {
+		t.Fatalf("successful control-plane request was not aggregated:\n%s", text)
+	}
+	if hasMetricLineWith(text, "drive9_tenant_requests_total", `surface="provision"`, `status_class="2xx"`, `tenant_id=`) {
+		t.Fatalf("successful control-plane request carried tenant labels:\n%s", text)
+	}
+	for _, want := range []string{
+		`drive9_tenant_requests_total{action="post",status_class="4xx",surface="provision",tenant_id="tenant-request-contract",tidbcloud_org_id="org-request-contract"} 1`,
+		`drive9_tenant_requests_total{action="write",status_class="2xx",surface="fs",tenant_id="tenant-request-contract",tidbcloud_org_id="org-request-contract"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing tenant-scoped request metric %q:\n%s", want, text)
+		}
 	}
 }
 
@@ -592,7 +626,6 @@ func TestDeleteTenantCounters(t *testing.T) {
 
 	RecordTenantOperationCountWithOrg(tenantID, tidbCloudOrgID, "cmp", "op", "ok")
 	RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, "api", "read", 200)
-	RecordTenantHTTPBytesWithOrg(tenantID, tidbCloudOrgID, "upload", 1024)
 	RecordSSEConnectionWithOrg(tenantID, tidbCloudOrgID, "mount", time.Second)
 	RecordSSEEventSentWithOrg(tenantID, tidbCloudOrgID, "write")
 	RecordTenantInFlightWithOrg(tenantID, tidbCloudOrgID, "api", 3)
@@ -613,7 +646,6 @@ func TestDeleteTenantCounters(t *testing.T) {
 	counterNames := []string{
 		"drive9_service_operations_total",
 		"drive9_tenant_requests_total",
-		"drive9_tenant_http_bytes_total",
 		"drive9_sse_connections_total",
 		"drive9_sse_events_sent_total",
 	}

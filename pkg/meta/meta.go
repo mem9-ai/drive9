@@ -21,12 +21,14 @@ import (
 )
 
 var (
-	ErrNotFound                 = errors.New("not found")
-	ErrDuplicate                = errors.New("duplicate entry")
-	ErrStorageQuotaExceeded     = errors.New("tenant storage quota exceeded")
-	ErrFileCountQuotaExceeded   = errors.New("tenant file count quota exceeded")
-	ErrReservationAlreadyExists = errors.New("upload reservation already exists")
-	ErrQuotaReservationBusy     = errors.New("quota reservation busy")
+	ErrNotFound                     = errors.New("not found")
+	ErrDuplicate                    = errors.New("duplicate entry")
+	ErrStorageQuotaExceeded         = errors.New("tenant storage quota exceeded")
+	ErrFileCountQuotaExceeded       = errors.New("tenant file count quota exceeded")
+	ErrReservationAlreadyExists     = errors.New("upload reservation already exists")
+	ErrQuotaReservationBusy         = errors.New("quota reservation busy")
+	ErrSharedDBPoolIdentityConflict = errors.New("shared db pool physical identity changed after provisioning started")
+	ErrSharedDBPoolNotProvisioning  = errors.New("shared db pool is not provisioning")
 )
 
 type TenantStatus string

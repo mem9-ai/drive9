@@ -295,8 +295,12 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 	if in.TiDBCloudOrganizationID == "" {
 		return fmt.Errorf("tidbcloud organization id is required")
 	}
-	if in.ClusterID == "" {
+	clusterID := strings.TrimSpace(in.ClusterID)
+	if clusterID == "" {
 		return fmt.Errorf("cluster id is required")
+	}
+	if clusterID != in.ClusterID {
+		return fmt.Errorf("cluster id must be an exact value")
 	}
 	if in.Port < 0 {
 		return fmt.Errorf("db port must not be negative")
@@ -324,13 +328,14 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 	}
 	var advancedTenants []string
 	err = s.InTx(ctx, func(tx *sql.Tx) error {
-		var currentHost, currentUser, currentName sql.NullString
+		var currentOrganizationID string
+		var currentClusterID, currentHost, currentUser, currentName sql.NullString
 		var currentPort sql.NullInt64
 		var currentPassword []byte
 		var currentStatus string
-		if err := tx.QueryRowContext(ctx, `SELECT db_host, db_port, db_user, db_password, db_name, status
+		if err := tx.QueryRowContext(ctx, `SELECT org_id, cluster_id, db_host, db_port, db_user, db_password, db_name, status
 			FROM db_pool WHERE db_id = ? FOR UPDATE`, in.ID).
-			Scan(&currentHost, &currentPort, &currentUser, &currentPassword, &currentName, &currentStatus); err != nil {
+			Scan(&currentOrganizationID, &currentClusterID, &currentHost, &currentPort, &currentUser, &currentPassword, &currentName, &currentStatus); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -338,6 +343,15 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 		}
 		if currentStatus != SharedDBStatusPending && currentStatus != SharedDBStatusProvisioning {
 			return ErrNotFound
+		}
+		// Once complete metadata advances the pool to provisioning, finishers may
+		// safely run without retaining this MetaDB row lock only if the Cloud
+		// allocation identity cannot be reassigned underneath them. Connection
+		// metadata remains refreshable for endpoint and credential rotation.
+		if currentStatus == SharedDBStatusProvisioning &&
+			((strings.TrimSpace(currentOrganizationID) != "" && currentOrganizationID != in.TiDBCloudOrganizationID) ||
+				(strings.TrimSpace(currentClusterID.String) != "" && currentClusterID.String != clusterID)) {
+			return fmt.Errorf("%w: db pool %d", ErrSharedDBPoolIdentityConflict, in.ID)
 		}
 		host := currentHost.String
 		if in.Host != "" {
@@ -360,7 +374,7 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 			name = in.Name
 		}
 		nextStatus := currentStatus
-		metadataReady := host != "" && port > 0 && user != "" && len(password) > 0 && name != ""
+		metadataReady := clusterID != "" && host != "" && port > 0 && user != "" && len(password) > 0 && name != ""
 		if currentStatus == SharedDBStatusPending && metadataReady {
 			nextStatus = SharedDBStatusProvisioning
 		}
@@ -371,7 +385,7 @@ func (s *Store) UpdateManagedSharedDBPoolCloudResult(ctx context.Context, in *Sh
 				db_name = COALESCE(?, db_name), db_tls = ?,
 				status_updated_at = CASE WHEN status <> ? THEN CURRENT_TIMESTAMP(3) ELSE status_updated_at END,
 				status = ?
-			WHERE db_id = ?`, in.TiDBCloudOrganizationID, in.ClusterID,
+			WHERE db_id = ?`, in.TiDBCloudOrganizationID, clusterID,
 			nullString(in.Host), nullInt(in.Port), nullString(in.User), nullBytes(in.PasswordCipher),
 			nullString(in.Name), in.TLSMode, nextStatus, nextStatus, in.ID); err != nil {
 			return fmt.Errorf("persist cloud result for db pool %d: %w", in.ID, err)
@@ -489,6 +503,39 @@ func (s *Store) UpdateSharedDBSchemaVersion(ctx context.Context, dbID int64, ver
 				return ErrNotFound
 			}
 			return scanErr
+		}
+	}
+	return nil
+}
+
+// RefreshManagedSharedDBProvisioningProgress keeps a long-running remote
+// schema operation visible to the stuck-pool watchdog without retaining a
+// MetaDB connection or advisory lock for the duration of the DDL.
+func (s *Store) RefreshManagedSharedDBProvisioningProgress(ctx context.Context, dbID int64) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "refresh_managed_shared_db_provisioning_progress", start, &err)
+	if dbID <= 0 {
+		return fmt.Errorf("db_id must be positive")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE db_pool SET updated_at = CURRENT_TIMESTAMP(3)
+		WHERE db_id = ? AND role = ? AND status = ?`, dbID, SharedDBRoleShared, SharedDBStatusProvisioning)
+	if err != nil {
+		return fmt.Errorf("refresh provisioning progress for db pool %d: %w", dbID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("refresh provisioning progress rows affected for db pool %d: %w", dbID, err)
+	}
+	if affected == 0 {
+		var status string
+		if err := s.db.QueryRowContext(ctx, `SELECT status FROM db_pool WHERE db_id = ? AND role = ?`, dbID, SharedDBRoleShared).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if status != SharedDBStatusProvisioning {
+			return fmt.Errorf("%w: db pool %d has status %q", ErrSharedDBPoolNotProvisioning, dbID, status)
 		}
 	}
 	return nil

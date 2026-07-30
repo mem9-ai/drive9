@@ -197,6 +197,18 @@ type FileInfo struct {
 }
 
 // StatResult represents file metadata from HEAD.
+// StorageType identifies the server-side storage class of a file's content,
+// as advertised in the X-Dat9-Storage-Type stat header. It mirrors the
+// datastore storage-type enum on the wire: "db9" means the file content is
+// stored inline in the database contents table (regardless of the database
+// product), "s3" means it lives in object storage.
+type StorageType string
+
+const (
+	StorageTypeDB9 StorageType = "db9"
+	StorageTypeS3  StorageType = "s3"
+)
+
 type StatResult struct {
 	Size       int64
 	IsDir      bool
@@ -206,6 +218,11 @@ type StatResult struct {
 	HasMode    bool // true when the server returned a mode header (including 0)
 	ResourceID string
 	Nlink      uint32
+	// StorageType is the server-authoritative storage class (StorageTypeDB9
+	// or StorageTypeS3) from the X-Dat9-Storage-Type header. Empty when the
+	// server predates the header; callers must treat empty as "unknown" and
+	// fall back to local heuristics.
+	StorageType StorageType
 }
 
 // MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
@@ -905,6 +922,7 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 		}
 	}
 	s.ResourceID = resp.Header.Get("X-Dat9-Resource-ID")
+	s.StorageType = StorageType(resp.Header.Get("X-Dat9-Storage-Type"))
 	if nlink := resp.Header.Get("X-Dat9-Nlink"); nlink != "" {
 		if n, err := strconv.ParseUint(nlink, 10, 32); err == nil {
 			s.Nlink = uint32(n)
