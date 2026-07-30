@@ -27,7 +27,7 @@ type FileHandle struct {
 	// the server's X-Dat9-Storage-Type stat header when available, updated
 	// after local commits and after a PATCH rejection. Write routing prefers
 	// it over the OrigSize size-heuristic when known.
-	StorageClass       string
+	StorageClass       client.StorageType
 	ZeroBase           bool            // true when the handle has adopted an explicit empty-file baseline
 	IsNew              bool            // true if created via Create() (no prior remote existence)
 	ShadowReady        bool            // true when the local shadow file is a safe full snapshot

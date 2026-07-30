@@ -242,7 +242,7 @@ const (
 // inline-vs-S3 decision (shouldStoreInDB / IsLargeFile). Returns "" when the
 // negotiated threshold is unknown, in which case callers must keep the
 // previously known class rather than guessing.
-func (fs *Dat9FS) storageClassForCommittedSize(size int64) string {
+func (fs *Dat9FS) storageClassForCommittedSize(size int64) client.StorageType {
 	threshold := fs.negotiatedInlineThreshold()
 	if threshold <= 0 {
 		return ""
@@ -264,6 +264,29 @@ func (fs *Dat9FS) adoptCommittedStorageClassLocked(fh *FileHandle, committedSize
 	if class := fs.storageClassForCommittedSize(committedSize); class != "" {
 		fh.StorageClass = class
 	}
+}
+
+// materializeFullForUploadLocked ensures fh.Dirty can produce the complete
+// current file contents for a full upload (direct PUT or stream). Lazy
+// remote-backed parts are fetched via the buffer's LoadPart loader when
+// available. Returns false when the full contents cannot be reconstructed
+// without zero-filling untouched remote ranges — callers must then fail the
+// flush WITHOUT clearing dirty state. Eager bytesView() without this guard
+// uploads zeros for unloaded parts and silently corrupts the remote object
+// (e.g. an S3 object with a lazily loaded buffer routed to direct PUT after
+// the negotiated inline threshold was raised above the file size).
+func (fs *Dat9FS) materializeFullForUploadLocked(fh *FileHandle) bool {
+	if fh == nil || fh.Dirty == nil {
+		return false
+	}
+	if fh.Dirty.CanMaterializeFull() {
+		return true
+	}
+	if err := fh.Dirty.LoadMissingParts(); err != nil {
+		log.Printf("materialize full file for upload failed for %s: %v", fh.Path, err)
+		return false
+	}
+	return fh.Dirty.CanMaterializeFull()
 }
 
 // warmInlineThreshold triggers a one-shot /v1/status fetch via the client
@@ -3439,7 +3462,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		dirtySeq     uint64
 		isNew        bool
 		zeroBase     bool
-		storageClass string
+		storageClass client.StorageType
 		shadowSource bool
 		canMemory    bool
 	}
@@ -10867,6 +10890,13 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 		canPatchExisting = false
 	}
 	if useDirectPUT || fh.OrigSize < threshold {
+		// Eager full-buffer materialization must prove no lazy remote-backed
+		// range is missing — bytesView() zero-fills unloaded parts and would
+		// silently corrupt the remote object (fetch them instead when the
+		// buffer has a loader; fail safe otherwise).
+		if !fs.materializeFullForUploadLocked(fh) {
+			return gofuse.EIO
+		}
 		data = fh.Dirty.bytesView()
 	}
 
@@ -12726,13 +12756,15 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// (committedRev == 0) does not seed the read cache with full data.
 	var dataCopy []byte
 	if !usePatch {
-		// B12: For the WriteStreamConditional path (grown large file), check
-		// that all parts are loaded before materializing. Lazy-loaded existing
-		// files may have unloaded remote-backed parts; bytesView() would fill
-		// them with zeroes, overwriting remote data. Consistent with write-sync
-		// path's CanMaterializeFull() guard (line ~9971).
-		if !useDirectPUT && !fh.Dirty.CanMaterializeFull() {
-			log.Printf("flushHandle cannot materialize full file for %s (path2 growth)", fh.Path)
+		// B12: For full-upload paths (direct PUT and WriteStreamConditional),
+		// prove that all parts are loaded before materializing — or fetch the
+		// missing remote-backed parts via the lazy loader. Lazy-loaded
+		// existing files may have unloaded remote-backed parts; bytesView()
+		// would fill them with zeroes, overwriting remote data. This guard
+		// now covers the direct-PUT path as well (threshold raised above the
+		// file size after open), not just stream uploads.
+		if !fs.materializeFullForUploadLocked(fh) {
+			log.Printf("flushHandle cannot materialize full file for %s (path2)", fh.Path)
 			return gofuse.EIO
 		}
 		dataCopy = make([]byte, fh.Dirty.Size())

@@ -16238,7 +16238,8 @@ func newPatchUnsupportedFakeServer(t *testing.T, path string, patchCount *atomic
 	return ts
 }
 
-func newLargeDirtyHandleForPatchTest(fs *Dat9FS, path string, origSize int64, writeSize int) *FileHandle {
+func newLargeDirtyHandleForPatchTest(t *testing.T, fs *Dat9FS, path string, origSize int64, writeSize int) *FileHandle {
+	t.Helper()
 	ino := fs.inodes.Lookup(path, false, 5, time.Now())
 	fs.inodes.UpdateRevision(ino, 5)
 	fh := &FileHandle{
@@ -16253,7 +16254,7 @@ func newLargeDirtyHandleForPatchTest(fs *Dat9FS, path string, origSize int64, wr
 		data[i] = byte(i)
 	}
 	if _, err := fh.Dirty.Write(0, data); err != nil {
-		panic(err)
+		t.Fatalf("seed dirty buffer: %v", err)
 	}
 	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
 	_ = fs.fileHandles.Allocate(fh)
@@ -16279,7 +16280,7 @@ func TestFlushHandle_Path2_PatchUnsupportedTargetFallsBackToFullUpload(t *testin
 	var threshold int64 = 100
 	fs.smallFileMax.Store(threshold)
 
-	fh := newLargeDirtyHandleForPatchTest(fs, path, 200, 120)
+	fh := newLargeDirtyHandleForPatchTest(t, fs, path, 200, 120)
 
 	fh.Lock()
 	st := fs.flushHandle(context.Background(), fh)
@@ -16320,7 +16321,7 @@ func TestFlushHandle_Path2_StorageClassDB9SkipsPatch(t *testing.T) {
 	var threshold int64 = 100
 	fs.smallFileMax.Store(threshold)
 
-	fh := newLargeDirtyHandleForPatchTest(fs, path, 200, 120)
+	fh := newLargeDirtyHandleForPatchTest(t, fs, path, 200, 120)
 	fh.StorageClass = storageClassDB9
 
 	fh.Lock()
@@ -16355,7 +16356,7 @@ func TestSyncWriteHandle_PatchUnsupportedTargetFallsBackToFullUpload(t *testing.
 	var threshold int64 = 100
 	fs.smallFileMax.Store(threshold)
 
-	fh := newLargeDirtyHandleForPatchTest(fs, path, 200, 120)
+	fh := newLargeDirtyHandleForPatchTest(t, fs, path, 200, 120)
 
 	fh.Lock()
 	st := fs.syncWriteHandleToRemoteLocked(context.Background(), fh)
@@ -16409,6 +16410,415 @@ func TestPreloadWritableHandleSeedsStorageClass(t *testing.T) {
 	}
 	if fh.OrigSize != 200 || fh.BaseRev != 3 {
 		t.Fatalf("OrigSize/BaseRev = %d/%d, want 200/3", fh.OrigSize, fh.BaseRev)
+	}
+}
+
+// flushBothWays runs a handle flush through both full-upload entry points:
+// flushHandle (non-layer Path 2) and the write-sync path.
+func flushBothWays(t *testing.T) []struct {
+	name string
+	run  func(*Dat9FS, *FileHandle) gofuse.Status
+} {
+	t.Helper()
+	return []struct {
+		name string
+		run  func(*Dat9FS, *FileHandle) gofuse.Status
+	}{
+		{
+			name: "flushHandle",
+			run: func(fs *Dat9FS, fh *FileHandle) gofuse.Status {
+				fh.Lock()
+				defer fh.Unlock()
+				return fs.flushHandle(context.Background(), fh)
+			},
+		},
+		{
+			name: "write-sync",
+			run: func(fs *Dat9FS, fh *FileHandle) gofuse.Status {
+				fh.Lock()
+				defer fh.Unlock()
+				return fs.syncWriteHandleToRemoteLocked(context.Background(), fh)
+			},
+		},
+	}
+}
+
+// newLazyTwoPartHandle builds a handle whose dirty buffer simulates a
+// lazily loaded existing 512-byte S3 object with 256-byte parts: only the
+// modified part is loaded. origPart returns the canned original content of
+// 1-based part pn; withLoader=false leaves the buffer without a lazy
+// loader (CanMaterializeFull false and no way to refetch).
+func newLazyTwoPartHandle(t *testing.T, fs *Dat9FS, path string, withLoader bool, loadCalls *atomic.Int32) (fh *FileHandle, orig [2][]byte) {
+	t.Helper()
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	for p := range orig {
+		orig[p] = make([]byte, 256)
+		for i := range orig[p] {
+			orig[p][i] = byte(0xA0 + p*0x10 + i%16)
+		}
+	}
+
+	wb := NewWriteBuffer(path, maxPreloadSize, 256)
+	wb.remoteSize = 512
+	wb.totalSize = 512
+	if withLoader {
+		wb.LoadPart = func(partNum int) ([]byte, error) {
+			loadCalls.Add(1)
+			return append([]byte(nil), orig[partNum-1]...), nil
+		}
+	}
+
+	fh = &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    wb,
+		BaseRev:  5,
+		OrigSize: 512,
+	}
+	// Modify only the first 4 bytes (loads part 1; part 2 stays unloaded).
+	if _, err := wb.Write(0, []byte("WXYZ")); err != nil {
+		t.Fatalf("seed dirty buffer: %v", err)
+	}
+	if wb.CanMaterializeFull() {
+		t.Fatal("expected CanMaterializeFull() = false for lazy two-part buffer")
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, wb.Size())
+	_ = fs.fileHandles.Allocate(fh)
+	return fh, orig
+}
+
+// TestFlushDirectPUTLazyBufferFetchesMissingParts is the qiffang blocker
+// regression: an existing S3 object with a lazily loaded buffer is routed
+// to direct PUT after the negotiated inline threshold is raised above the
+// file size. Only one part is modified. The flush must fetch the unloaded
+// remote-backed part (never upload zero-filled ranges), and the committed
+// bytes must preserve the untouched original content.
+func TestFlushDirectPUTLazyBufferFetchesMissingParts(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			var loadCalls atomic.Int32
+			var gotBody []byte
+			var gotExpectedRev string
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/lazy-raised-threshold.dat" {
+					gotExpectedRev = r.Header.Get("X-Dat9-Expected-Revision")
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Errorf("read PUT body: %v", err)
+					}
+					gotBody = body
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{"revision": 42})
+					return
+				}
+				t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+				w.WriteHeader(http.StatusMethodNotAllowed)
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+			// Threshold raised above the file size (512 < 51200): the flush
+			// routes to direct PUT even though the object is S3-stored.
+			fs.smallFileMax.Store(51200)
+
+			path := "/lazy-raised-threshold.dat"
+			fh, orig := newLazyTwoPartHandle(t, fs, path, true, &loadCalls)
+
+			if st := tc.run(fs, fh); st != gofuse.OK {
+				t.Fatalf("flush status = %v, want OK (missing parts must be fetched, not zero-filled)", st)
+			}
+			if loadCalls.Load() == 0 {
+				t.Fatal("expected lazy loader to be called for the unloaded part")
+			}
+			if gotExpectedRev != "5" {
+				t.Fatalf("direct PUT X-Dat9-Expected-Revision = %q, want 5 (CAS must be preserved)", gotExpectedRev)
+			}
+			if int64(len(gotBody)) != 512 {
+				t.Fatalf("direct PUT body size = %d, want 512", len(gotBody))
+			}
+			want := make([]byte, 512)
+			copy(want, orig[0])
+			copy(want[256:], orig[1])
+			copy(want[:4], "WXYZ")
+			if !bytes.Equal(gotBody, want) {
+				t.Fatal("direct PUT body mismatch: untouched remote-backed range was not preserved")
+			}
+			if fh.DirtySeq != 0 {
+				t.Fatalf("DirtySeq = %d, want 0 after successful upload", fh.DirtySeq)
+			}
+		})
+	}
+}
+
+// TestFlushDirectPUTLazyBufferNoLoaderReturnsEIO covers the fail-safe half
+// of the qiffang blocker: without a lazy loader, a direct-PUT flush of a
+// buffer that cannot materialize must fail with EIO and preserve dirty
+// state, never uploading zero-filled ranges.
+func TestFlushDirectPUTLazyBufferNoLoaderReturnsEIO(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			var serverHit atomic.Bool
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				serverHit.Store(true)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			fs.smallFileMax.Store(51200)
+
+			path := "/lazy-no-loader.dat"
+			fh, _ := newLazyTwoPartHandle(t, fs, path, false, nil)
+			dirtySeqBefore := fh.DirtySeq
+
+			if st := tc.run(fs, fh); st != gofuse.EIO {
+				t.Fatalf("flush status = %v, want EIO (must not upload zero-filled ranges)", st)
+			}
+			if serverHit.Load() {
+				t.Fatal("server received an upload request — must fail before materializing")
+			}
+			if fh.DirtySeq != dirtySeqBefore {
+				t.Fatalf("DirtySeq = %d, want %d preserved after EIO", fh.DirtySeq, dirtySeqBefore)
+			}
+		})
+	}
+}
+
+// patchFallbackV2Fake is a PATCH-rejecting fake server that runs the real
+// v2 multipart protocol for the fallback full upload, recording the
+// expected_revision from the initiate request and the uploaded part bytes.
+type patchFallbackV2Fake struct {
+	t *testing.T
+
+	server       *httptest.Server
+	patchCount   atomic.Int32
+	gotExpected  atomic.Int64
+	gotUpload    atomic.Bool
+	gotBody      []byte
+	conflictMode atomic.Bool // when true, initiate responds 409
+}
+
+func newPatchFallbackV2Fake(t *testing.T, path string) *patchFallbackV2Fake {
+	t.Helper()
+	f := &patchFallbackV2Fake{t: t}
+	f.gotExpected.Store(-1)
+	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch:
+			f.patchCount.Add(1)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "file is not S3-stored: " + path})
+
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+			// Fallback full rewrite via direct PUT (size below the client's
+			// cached upload threshold): CAS travels in the header.
+			if f.conflictMode.Load() {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "revision conflict"})
+				return
+			}
+			if rev, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64); err == nil {
+				f.gotExpected.Store(rev)
+			}
+			f.gotUpload.Store(true)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read direct PUT body: %v", err)
+			}
+			f.gotBody = body
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 42})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			if f.conflictMode.Load() {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "revision conflict"})
+				return
+			}
+			var req struct {
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode initiate: %v", err)
+			}
+			if req.ExpectedRevision != nil {
+				f.gotExpected.Store(*req.ExpectedRevision)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "upload-1",
+				"key":         "object-key",
+				"part_size":   int64(s3client.PartSize),
+				"total_parts": 1,
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/upload-1/presign-batch":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{
+					{"number": 1, "url": f.server.URL + "/s3/upload-1/1", "size": 120},
+				},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/s3/upload-1/1":
+			f.gotUpload.Store(true)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read part body: %v", err)
+			}
+			f.gotBody = body
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/upload-1/complete":
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(f.server.Close)
+	return f
+}
+
+// TestFlushPatchFallbackCarriesExpectedRevision is the qiffang #199 CAS
+// regression: after PATCH is rejected with "file is not S3-stored", the
+// fallback full rewrite must remain revision-conditional (expected_revision
+// carries the handle BaseRev) and must upload the complete buffer content.
+func TestFlushPatchFallbackCarriesExpectedRevision(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			path := "/fallback-cas.dat"
+			fake := newPatchFallbackV2Fake(t, path)
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(fake.server.URL), opts)
+			fs.smallFileMax.Store(100)
+
+			fh := newLargeDirtyHandleForPatchTest(t, fs, path, 200, 120)
+
+			if st := tc.run(fs, fh); st != gofuse.OK {
+				t.Fatalf("flush status = %v, want OK (fallback full upload)", st)
+			}
+			if got := fake.patchCount.Load(); got != 1 {
+				t.Fatalf("PATCH attempts = %d, want exactly 1", got)
+			}
+			if got := fake.gotExpected.Load(); got != 5 {
+				t.Fatalf("fallback initiate expected_revision = %d, want 5 (BaseRev CAS)", got)
+			}
+			if !fake.gotUpload.Load() {
+				t.Fatal("expected fallback part upload")
+			}
+			if int64(len(fake.gotBody)) != 120 {
+				t.Fatalf("fallback uploaded %d bytes, want 120", len(fake.gotBody))
+			}
+			if fh.DirtySeq != 0 {
+				t.Fatalf("DirtySeq = %d, want 0 after successful fallback", fh.DirtySeq)
+			}
+		})
+	}
+}
+
+// TestFlushPatchFallbackConflictPreservesDirty is the qiffang #199
+// conflict regression: when the fallback full rewrite loses the CAS race
+// (409 revision conflict), the flush must fail without clearing dirty
+// state, while the observed storage class still heals future routing away
+// from PATCH.
+func TestFlushPatchFallbackConflictPreservesDirty(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			path := "/fallback-conflict.dat"
+			fake := newPatchFallbackV2Fake(t, path)
+			fake.conflictMode.Store(true)
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(fake.server.URL), opts)
+			fs.smallFileMax.Store(100)
+
+			fh := newLargeDirtyHandleForPatchTest(t, fs, path, 200, 120)
+			dirtySeqBefore := fh.DirtySeq
+
+			if st := tc.run(fs, fh); st == gofuse.OK {
+				t.Fatal("flush status = OK, want error on 409 revision conflict")
+			}
+			if got := fake.patchCount.Load(); got != 1 {
+				t.Fatalf("PATCH attempts = %d, want exactly 1", got)
+			}
+			if fake.gotUpload.Load() {
+				t.Fatal("part upload attempted despite initiate conflict")
+			}
+			if fh.DirtySeq != dirtySeqBefore {
+				t.Fatalf("DirtySeq = %d, want %d preserved after conflict", fh.DirtySeq, dirtySeqBefore)
+			}
+			if fh.StorageClass != storageClassDB9 {
+				t.Fatalf("StorageClass = %q, want %q (routing must heal away from PATCH)", fh.StorageClass, storageClassDB9)
+			}
+		})
+	}
+}
+
+// TestFlushPatchFallbackLazyBufferFailsWithoutUpload is the qiffang #199
+// non-materialization regression: after a rejected PATCH, a lazy buffer
+// that cannot materialize the full file must fail with EIO — never issue a
+// full upload with zero-filled ranges, never clear dirty state — while the
+// observed storage class still heals future routing away from PATCH.
+func TestFlushPatchFallbackLazyBufferFailsWithoutUpload(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			var patchCount atomic.Int32
+			var uploadHit atomic.Bool
+
+			path := "/fallback-lazy.dat"
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodPatch:
+					patchCount.Add(1)
+					_, _ = io.ReadAll(r.Body)
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "file is not S3-stored: " + path})
+				default:
+					uploadHit.Store(true)
+					w.WriteHeader(http.StatusOK)
+				}
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			fs.smallFileMax.Store(100)
+
+			fh, _ := newLazyTwoPartHandle(t, fs, path, false, nil)
+			dirtySeqBefore := fh.DirtySeq
+
+			if st := tc.run(fs, fh); st != gofuse.EIO {
+				t.Fatalf("flush status = %v, want EIO (must not upload zero-filled ranges)", st)
+			}
+			if got := patchCount.Load(); got != 1 {
+				t.Fatalf("PATCH attempts = %d, want exactly 1", got)
+			}
+			if uploadHit.Load() {
+				t.Fatal("full upload attempted for non-materializable buffer — must fail instead")
+			}
+			if fh.DirtySeq != dirtySeqBefore {
+				t.Fatalf("DirtySeq = %d, want %d preserved after EIO", fh.DirtySeq, dirtySeqBefore)
+			}
+			if fh.StorageClass != storageClassDB9 {
+				t.Fatalf("StorageClass = %q, want %q (routing must heal away from PATCH)", fh.StorageClass, storageClassDB9)
+			}
+		})
 	}
 }
 
