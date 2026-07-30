@@ -17350,6 +17350,177 @@ func TestSnapshotWriteBackShadowSpillUsesAuthoritativeShadow(t *testing.T) {
 	}
 }
 
+// TestSnapshotWriteBackNewShadowSpillFileUsesShadow covers the #816
+// follow-up blocker: a NEW ShadowSpill file has remoteSize == 0, so
+// CanMaterializeFull() is vacuously true even after OnPartFull evicted a
+// full part from memory. The write-back snapshot must still come from the
+// authoritative shadow, not zero-filled bytesView().
+func TestSnapshotWriteBackNewShadowSpillFileUsesShadow(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wbCache, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.writeBack = wbCache
+
+	path := "/spill-new-wb.bin"
+	// Two full parts of content, authoritative in the shadow (write-through).
+	full := make([]byte, 512)
+	for i := range full {
+		full[i] = byte(i % 239)
+	}
+	if err := shadow.WriteFull(path, full, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// New-file dirty buffer: remoteSize stays 0, both parts written, then
+	// part 0 is evicted (spill). CanMaterializeFull() remains true because
+	// the covered remote prefix is empty — exactly the gap the old
+	// condition missed.
+	wb := NewWriteBuffer(path, maxPreloadSize, 256)
+	if _, err := wb.Write(0, full); err != nil {
+		t.Fatal(err)
+	}
+	wb.EvictPart(0)
+	if !wb.CanMaterializeFull() {
+		t.Fatal("test premise broken: new-file buffer must report CanMaterializeFull() = true")
+	}
+
+	fh := &FileHandle{
+		Ino:         42,
+		Path:        path,
+		Dirty:       wb,
+		IsNew:       true,
+		ShadowReady: true,
+		ShadowSpill: true,
+		WritePolicy: WritePolicyWriteBack,
+	}
+	fh.DirtySeq = fs.markDirtySize(42, 512)
+
+	if err := fs.snapshotWriteBackLocked(fh); err != nil {
+		t.Fatalf("snapshotWriteBackLocked: %v", err)
+	}
+	got, ok := wbCache.Get(path)
+	if !ok {
+		t.Fatal("write-back cache has no staged content after snapshot")
+	}
+	if !bytes.Equal(got, full) {
+		t.Fatal("write-back snapshot mismatch for new spill file — must come from the authoritative shadow, not zero-filled bytesView")
+	}
+}
+
+// TestFlushHandleLayerLazyFetchNewerRevisionConflicts is the layer-mode
+// cross-revision gate demanded on #816: while the lazy loader fetches a
+// missing part (observing newer remote bytes), a sibling commit is recorded.
+// The layer upsert must still go out with the frozen base revision M (never
+// the sibling's newer revision), the server-side CAS rejects it, and dirty
+// state is preserved — no splice of newer retained bytes into the older base.
+func TestFlushHandleLayerLazyFetchNewerRevisionConflicts(t *testing.T) {
+	var loadCalls atomic.Int32
+	var upsertSeen atomic.Bool
+	var gotBaseRevision atomic.Int64
+
+	path := "/layer-splice.dat"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer_815/entries" {
+			var req struct {
+				BaseRevision int64 `json:"base_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode layer entry: %v", err)
+			}
+			upsertSeen.Store(true)
+			gotBaseRevision.Store(req.BaseRevision)
+			// Remote has advanced to revision 9: base 5 must lose the CAS race.
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "revision conflict"})
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{LayerRef: "layer_815"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	orig := make([][]byte, 2)
+	for p := range orig {
+		orig[p] = make([]byte, 256)
+		for i := range orig[p] {
+			orig[p][i] = byte(0xA0 + p*0x10 + i%16)
+		}
+	}
+
+	wb := NewWriteBuffer(path, maxPreloadSize, 256)
+	wb.remoteSize = 512
+	wb.totalSize = 512
+	// The sibling's rev-9 commit is recorded exactly when the flush fetches
+	// the missing part 2 — the ordering hazard this test pins. Part 1 loads
+	// earlier during the seeding Write and does not record.
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		loadCalls.Add(1)
+		if partNum == 2 {
+			fs.recordCommittedRevision(path, 9)
+		}
+		return append([]byte(nil), orig[partNum-1]...), nil
+	}
+
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    wb,
+		BaseRev:  5,
+		OrigSize: 512,
+	}
+	if _, err := wb.Write(0, []byte("WXYZ")); err != nil {
+		t.Fatalf("seed dirty buffer: %v", err)
+	}
+	if wb.CanMaterializeFull() {
+		t.Fatal("expected CanMaterializeFull() = false for lazy two-part buffer")
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, wb.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	if st == gofuse.OK {
+		t.Fatal("layer flush status = OK, want CAS rejection — base must stay at M and lose to the newer remote")
+	}
+	if !upsertSeen.Load() {
+		t.Fatal("expected a layer upsert attempt with the frozen base revision")
+	}
+	if got := gotBaseRevision.Load(); got != 5 {
+		t.Fatalf("layer entry base_revision = %d, want 5 (frozen base M, never the sibling's newer revision)", got)
+	}
+	if loadCalls.Load() == 0 {
+		t.Fatal("expected the lazy loader to fetch the retained range from latest remote")
+	}
+	if !fh.Dirty.HasDirtyParts() {
+		t.Fatal("dirty state cleared — must be preserved after CAS rejection")
+	}
+}
+
 // TestFlushHandle_Path2_SyntheticRevRecordedBeforeUnlock verifies that when
 // a Path 2 flush succeeds without the server returning a committed revision
 // (e.g. PatchFile / WriteStreamConditional), the synthetic revision
