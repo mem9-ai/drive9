@@ -14,11 +14,72 @@ import (
 // PendingIndex is an in-memory authoritative index for pending file metadata.
 // All metadata reads are served from memory (O(1), no disk I/O, no JSON parse).
 // Disk writes happen on Put/Remove/Rename for durability and crash recovery.
+//
+// Concurrency: mutating operations hold a per-path lock across both the disk
+// write and the in-memory publish/removal, so a same-path Put and a
+// generation-checked RemoveIfGeneration cannot interleave disk state — e.g. a
+// replacement Put's new .meta must never be deleted by a stale owner's
+// remove that already passed its generation check in memory.
 type PendingIndex struct {
-	mu      sync.RWMutex
-	items   map[string]*WriteBackMeta // path → metadata
-	dir     string                    // directory for .meta persistence
-	nextGen atomic.Uint64
+	mu        sync.RWMutex
+	items     map[string]*WriteBackMeta // path → metadata
+	dir       string                    // directory for .meta persistence
+	nextGen   atomic.Uint64
+	pathLocks map[string]*pendingPathLock
+}
+
+// pendingPathLock is a refcounted per-path mutex, mirroring WriteBackCache's
+// pathLockEntry. Lock order: path lock (outer) → idx.mu (inner).
+type pendingPathLock struct {
+	mu      sync.Mutex
+	waiters int
+}
+
+func (idx *PendingIndex) acquirePathLock(remotePath string) *pendingPathLock {
+	idx.mu.Lock()
+	pl, ok := idx.pathLocks[remotePath]
+	if !ok {
+		pl = &pendingPathLock{}
+		idx.pathLocks[remotePath] = pl
+	}
+	pl.waiters++
+	idx.mu.Unlock()
+
+	pl.mu.Lock()
+	return pl
+}
+
+func (idx *PendingIndex) releasePathLock(remotePath string, pl *pendingPathLock) {
+	idx.mu.Lock()
+	pl.waiters--
+	if pl.waiters == 0 {
+		delete(idx.pathLocks, remotePath)
+	}
+	idx.mu.Unlock()
+	pl.mu.Unlock()
+}
+
+// acquireTwoPathLocks locks both paths in a stable (lexicographic) order so
+// rename operations cannot deadlock against each other.
+func (idx *PendingIndex) acquireTwoPathLocks(a, b string) (pla, plb *pendingPathLock) {
+	if a == b {
+		pla = idx.acquirePathLock(a)
+		return pla, nil
+	}
+	first, second := a, b
+	if second < first {
+		first, second = second, first
+	}
+	pla = idx.acquirePathLock(first)
+	plb = idx.acquirePathLock(second)
+	return pla, plb
+}
+
+func (idx *PendingIndex) releaseTwoPathLocks(a, b string, pla, plb *pendingPathLock) {
+	if plb != nil {
+		idx.releasePathLock(b, plb)
+	}
+	idx.releasePathLock(a, pla)
 }
 
 // NewPendingIndex creates a PendingIndex backed by the given directory.
@@ -28,8 +89,9 @@ func NewPendingIndex(dir string) (*PendingIndex, error) {
 		return nil, fmt.Errorf("pending index dir: %w", err)
 	}
 	idx := &PendingIndex{
-		items: make(map[string]*WriteBackMeta),
-		dir:   dir,
+		items:     make(map[string]*WriteBackMeta),
+		dir:       dir,
+		pathLocks: make(map[string]*pendingPathLock),
 	}
 	return idx, nil
 }
@@ -102,6 +164,12 @@ func (idx *PendingIndex) PutShadowSpillWithMode(remotePath string, size int64, k
 }
 
 func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool, mode uint32, hasMode bool) (uint64, error) {
+	// Hold the per-path lock across the disk write AND the in-memory publish
+	// so a generation-checked removal of a stale entry cannot delete this
+	// fresh .meta after already passing its in-memory check.
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
 	gen := idx.nextGen.Add(1)
 	meta := &WriteBackMeta{
 		Path:        remotePath,
@@ -156,23 +224,31 @@ func (idx *PendingIndex) HasPending(remotePath string) bool {
 
 // Remove deletes metadata for the given path from memory and disk.
 func (idx *PendingIndex) Remove(remotePath string) {
+	pl := idx.acquirePathLock(remotePath)
 	idx.mu.Lock()
 	delete(idx.items, remotePath)
 	idx.mu.Unlock()
 
 	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
 	_ = os.Remove(metaPath)
+	idx.releasePathLock(remotePath, pl)
 }
 
 // RemoveIfGeneration atomically checks that the current generation matches
 // expectedGen before removing the entry. Returns true if the entry was
 // removed. This prevents a stale upload from removing a fresher pending entry
 // that was created (via a newer Put) while the old upload was in flight.
+//
+// The per-path lock is held across the generation check, the map removal AND
+// the disk .meta removal, so a concurrent same-path Put cannot publish its new
+// generation in between and have its fresh .meta deleted by this stale remove.
 func (idx *PendingIndex) RemoveIfGeneration(remotePath string, expectedGen uint64) bool {
+	pl := idx.acquirePathLock(remotePath)
 	idx.mu.Lock()
 	meta, ok := idx.items[remotePath]
 	if !ok || meta.Generation != expectedGen {
 		idx.mu.Unlock()
+		idx.releasePathLock(remotePath, pl)
 		return false
 	}
 	delete(idx.items, remotePath)
@@ -180,6 +256,7 @@ func (idx *PendingIndex) RemoveIfGeneration(remotePath string, expectedGen uint6
 
 	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
 	_ = os.Remove(metaPath)
+	idx.releasePathLock(remotePath, pl)
 	return true
 }
 
@@ -197,6 +274,9 @@ func (idx *PendingIndex) Generation(remotePath string) uint64 {
 // RenamePending atomically moves a pending entry from oldPath to newPath.
 // Returns true if there was a pending entry to rename.
 func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
+	pla, plb := idx.acquireTwoPathLocks(oldPath, newPath)
+	defer idx.releaseTwoPathLocks(oldPath, newPath, pla, plb)
+
 	idx.mu.RLock()
 	meta, ok := idx.items[oldPath]
 	if !ok {
@@ -246,6 +326,9 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 // (with nil error) when there is no pending entry for oldPath, and a non-nil
 // error when persisting the prepared meta fails.
 func (idx *PendingIndex) PrepareRename(oldPath, newPath string) (*WriteBackMeta, error) {
+	pla, plb := idx.acquireTwoPathLocks(oldPath, newPath)
+	defer idx.releaseTwoPathLocks(oldPath, newPath, pla, plb)
+
 	idx.mu.RLock()
 	meta, ok := idx.items[oldPath]
 	if !ok {
@@ -281,6 +364,9 @@ func (idx *PendingIndex) PrepareRename(oldPath, newPath string) (*WriteBackMeta,
 // file has moved: newPath becomes authoritative in memory, oldPath is removed
 // from memory and disk.
 func (idx *PendingIndex) CommitRename(oldPath string, newMeta *WriteBackMeta) {
+	pla, plb := idx.acquireTwoPathLocks(oldPath, newMeta.Path)
+	defer idx.releaseTwoPathLocks(oldPath, newMeta.Path, pla, plb)
+
 	idx.mu.Lock()
 	delete(idx.items, oldPath)
 	idx.items[newMeta.Path] = newMeta
@@ -293,6 +379,9 @@ func (idx *PendingIndex) CommitRename(oldPath string, newMeta *WriteBackMeta) {
 // for newPath. It refuses to touch disk when newPath is live in memory, so an
 // unrelated pending entry at the target path cannot be destroyed.
 func (idx *PendingIndex) AbortRename(newPath string) {
+	pl := idx.acquirePathLock(newPath)
+	defer idx.releasePathLock(newPath, pl)
+
 	idx.mu.RLock()
 	_, live := idx.items[newPath]
 	idx.mu.RUnlock()
@@ -366,6 +455,9 @@ func (idx *PendingIndex) UpdateSize(remotePath string, size int64) {
 
 // UpdateMode updates the pending mode metadata for an existing entry.
 func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -394,6 +486,9 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 // MarkCommitted keeps the pending entry as a local overlay data source but no
 // longer treats it as never-persisted new data.
 func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) error {
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -427,6 +522,9 @@ func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) er
 // The in-memory state is only updated after the disk write succeeds to
 // ensure crash recovery sees a consistent view.
 func (idx *PendingIndex) MarkConflict(remotePath string) error {
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
 	idx.mu.RLock()
 	meta, ok := idx.items[remotePath]
 	if !ok {

@@ -178,6 +178,17 @@ class Drive9FuseTargetProvider:
         # header line below; truncating here would overwrite earlier same-name
         # logs (e.g. ltp_syscalls shard loops) that failure messages reference.
         with stdout.open("ab") as out, stderr.open("ab") as err:
+            # The header must begin on its own line (the pjdfstest parser
+            # matches it at line starts); a previous command's output may not
+            # have ended with "\n".
+            try:
+                if stdout.stat().st_size > 0:
+                    with stdout.open("rb") as prev:
+                        prev.seek(-1, os.SEEK_END)
+                        if prev.read(1) != b"\n":
+                            out.write(b"\n")
+            except OSError:
+                pass
             out.write(f"# {utc_ts()} $ {display}\n".encode())
             out.flush()
             proc = subprocess.Popen(

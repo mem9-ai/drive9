@@ -1,8 +1,10 @@
 package fuse
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -345,5 +347,82 @@ func TestPendingIndexAbortRename(t *testing.T) {
 	}
 	if !recovered2.HasPending("/live.txt") {
 		t.Error("AbortRename deleted a live entry's meta")
+	}
+}
+
+// TestPendingIndexRemoveIfGenerationPutRaceConsistency races replacement Puts
+// against stale-generation removals and asserts the crash-durability invariant
+// at the end: recovery from disk must see exactly the live in-memory entries.
+// Without per-path serialization, a stale RemoveIfGeneration can delete the
+// replacement's fresh .meta after the replacement already passed the in-memory
+// generation check (disk lost while memory looks correct).
+func TestPendingIndexRemoveIfGenerationPutRaceConsistency(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const p = "/race/file.txt"
+
+	// Seed the stale generation the remover will target.
+	staleGen, err := idx.Put(p, 1, PendingNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const racers = 8
+	const rounds = 100
+	var wg sync.WaitGroup
+	// Remover: repeatedly try to remove the ORIGINAL generation. Only the
+	// first attempt can succeed; later ones must be no-ops because any
+	// present entry is a fresher replacement generation.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			idx.RemoveIfGeneration(p, staleGen)
+		}
+	}()
+	// Replacers: keep publishing newer generations.
+	for r := 0; r < racers; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			for i := 0; i < rounds; i++ {
+				if _, err := idx.Put(p, int64(r*rounds+i+2), PendingNew); err != nil {
+					t.Errorf("put: %v", err)
+					return
+				}
+			}
+		}(r)
+	}
+	wg.Wait()
+
+	// Invariant: whatever is in memory must be exactly what is on disk.
+	live, liveOK := idx.GetMeta(p)
+	diskRaw, diskErr := os.ReadFile(filepath.Join(dir, hashPath(p)+".meta"))
+	if liveOK {
+		if diskErr != nil {
+			t.Fatalf("live entry gen=%d present but .meta missing on disk: %v", live.Generation, diskErr)
+		}
+		var diskMeta WriteBackMeta
+		if err := json.Unmarshal(diskRaw, &diskMeta); err != nil {
+			t.Fatalf("decode .meta: %v", err)
+		}
+		if diskMeta.Generation != live.Generation {
+			t.Fatalf("memory gen=%d but disk gen=%d — stale remove deleted replacement .meta", live.Generation, diskMeta.Generation)
+		}
+	}
+	// Full recovery must reproduce the live view.
+	idx2, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx2.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	_, recOK := idx2.GetMeta(p)
+	if liveOK != recOK {
+		t.Fatalf("recovery mismatch: live=%v recovered=%v", liveOK, recOK)
 	}
 }

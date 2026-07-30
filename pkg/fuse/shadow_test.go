@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1417,5 +1418,120 @@ func TestShadowStoreRemoveIfGenerationRaceStaleVsNewerWrite(t *testing.T) {
 	}
 	if !bytes.Equal(got, newest) {
 		t.Fatalf("content = %q, want %q (newer content must survive)", got, newest)
+	}
+}
+
+// TestShadowStoreUnretire covers the rollback primitive: a pinned shadow that
+// was retired by Remove must become the live shadow again after Unretire,
+// unless the path has already been re-created by a replacement write.
+func TestShadowStoreUnretire(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	const p = "/dir/file.txt"
+
+	if err := ss.WriteFull(p, []byte("v1"), 0); err != nil {
+		t.Fatal(err)
+	}
+	gen := ss.Pin(p)
+	if gen == 0 {
+		t.Fatal("pin returned 0")
+	}
+	ss.Remove(p) // retires because refs > 0
+	if ss.Has(p) {
+		t.Fatal("shadow still active after retire")
+	}
+
+	// Unretire restores the live shadow with its content.
+	if !ss.Unretire(gen, p) {
+		t.Fatal("Unretire returned false")
+	}
+	if !ss.Has(p) {
+		t.Fatal("shadow not active after Unretire")
+	}
+	data, err := ss.ReadAll(p)
+	if err != nil || string(data) != "v1" {
+		t.Fatalf("ReadAll after Unretire = %q, %v — want v1", data, err)
+	}
+	ss.Unpin(gen)
+
+	// A replacement at the same path must block Unretire of the old generation.
+	if err := ss.WriteFull(p, []byte("v2"), 0); err != nil {
+		t.Fatal(err)
+	}
+	gen2 := ss.Pin(p)
+	ss.Remove(p) // retires v2 generation... actually retires current active
+	if ss.Has(p) {
+		t.Fatal("shadow still active after second retire")
+	}
+	if err := ss.WriteFull(p, []byte("replacement"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if ss.Unretire(gen2, p) {
+		t.Fatal("Unretire must refuse when the path has an active replacement shadow")
+	}
+	data, err = ss.ReadAll(p)
+	if err != nil || string(data) != "replacement" {
+		t.Fatalf("ReadAll after refused Unretire = %q, %v — want replacement", data, err)
+	}
+	ss.Unpin(gen2)
+}
+
+// TestShadowStoreRemoveIfGenerationWriteFullRaceConsistency races replacement
+// WriteFulls against a stale-generation removal and asserts that whenever an
+// active shadow generation exists, its disk file is present and readable.
+// Without per-path serialization, the stale remove can delete/rename the
+// replacement's fresh shadow after the in-memory generation check passed.
+func TestShadowStoreRemoveIfGenerationWriteFullRaceConsistency(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	const p = "/race/file.txt"
+
+	if err := ss.WriteFull(p, []byte("stale"), 0); err != nil {
+		t.Fatal(err)
+	}
+	staleGen := ss.ActiveGeneration(p)
+	if staleGen == 0 {
+		t.Fatal("no active generation after WriteFull")
+	}
+
+	const racers = 8
+	const rounds = 100
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			ss.RemoveIfGeneration(p, staleGen)
+		}
+	}()
+	for r := 0; r < racers; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			for i := 0; i < rounds; i++ {
+				if err := ss.WriteFull(p, []byte("gen"), 0); err != nil {
+					t.Errorf("WriteFull: %v", err)
+					return
+				}
+			}
+		}(r)
+	}
+	wg.Wait()
+
+	if gen := ss.ActiveGeneration(p); gen != 0 {
+		if _, err := ss.ReadAll(p); err != nil {
+			t.Fatalf("active generation %d present but shadow unreadable: %v", gen, err)
+		}
+		if _, err := os.Stat(ss.shadowPath(p)); err != nil {
+			t.Fatalf("active generation %d present but disk file missing: %v", gen, err)
+		}
 	}
 }

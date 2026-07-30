@@ -2445,8 +2445,10 @@ func TestFlushDebouncer_Cancel(t *testing.T) {
 
 func TestFlushDebouncer_CancelNoWaitIfOwner(t *testing.T) {
 	d := newFlushDebouncer(20 * time.Millisecond)
-	ownerA := &struct{}{}
-	ownerB := &struct{}{}
+	// Distinct non-zero-size owner tokens: pointers to zero-size values may
+	// share an address (runtime.zerobase) and compare equal.
+	ownerA := &FileHandle{Ino: 101}
+	ownerB := &FileHandle{Ino: 102}
 
 	// A non-owner cancel must leave the pending entry alone.
 	fired := make(chan string, 1)
