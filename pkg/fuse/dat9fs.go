@@ -11033,6 +11033,14 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 	if fh == nil || fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
 		return gofuse.OK
 	}
+	if fh.Unlinked {
+		// Write-after-unlink on a write-sync handle: POSIX requires the write
+		// to succeed on the anonymous fd (the data is already in the Dirty
+		// buffer and remains readable), but it must NOT recreate the deleted
+		// pathname remotely. Flush/Fsync/Release discard staged state via the
+		// unlinked guards; the write-sync Write path must not upload either.
+		return gofuse.OK
+	}
 	if fs.layerEnabled() {
 		return fs.flushHandle(ctx, fh)
 	}
