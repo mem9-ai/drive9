@@ -3481,6 +3481,14 @@ func (fs *Dat9FS) applyGitOverlayMirrorEntry(fh *FileHandle, size int64) {
 	if fs == nil || fh == nil || fh.Layer != PathLayerGitWorkspace || fh.GitWorkspaceID == "" || fh.GitRelPath == "" {
 		return
 	}
+	if fh.Unlinked {
+		// Open-unlink: the whiteout written by the gitEntry unlink path must
+		// stay authoritative in the live overlay and the pending map. An
+		// upsert mirror here would resurrect the deleted name in lookups,
+		// readdir and reads on the active mount even though the remote PUT
+		// is already suppressed by the git flush guards.
+		return
+	}
 	entry := client.GitOverlayEntry{
 		WorkspaceID:    fh.GitWorkspaceID,
 		Path:           fh.GitRelPath,

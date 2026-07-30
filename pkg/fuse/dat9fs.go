@@ -6217,13 +6217,18 @@ func (fs *Dat9FS) hasOpenHandle(ino uint64, p string) bool {
 	return fs.openHandles.Has(ino, p)
 }
 
-func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapshotRemote bool) bool {
+// markOpenHandlesUnlinked marks every currently-open handle for p as unlinked
+// and detaches them from the path index. It returns the exact set of handles
+// it marked (for rollback on a failed remote DELETE/whiteout — a separate
+// pre-snapshot would race with handles opened in between) and whether that
+// set is non-empty.
+func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapshotRemote bool) (marked []*FileHandle, anyOpen bool) {
 	if fs.openHandles == nil || p == "" {
-		return false
+		return nil, false
 	}
 	handles := fs.openHandles.SnapshotPath(p)
 	if len(handles) == 0 {
-		return false
+		return nil, false
 	}
 
 	var size int64
@@ -6318,7 +6323,7 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		fh.Unlock()
 	}
 	fs.openHandles.UnlinkPath(p)
-	return true
+	return handles, true
 }
 
 func cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
@@ -8025,7 +8030,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if info.IsDir() {
 			return gofuse.Status(syscall.EISDIR)
 		}
-		preserveOpen := fs.markOpenHandlesUnlinked(ctx, childP, false)
+		_, preserveOpen := fs.markOpenHandlesUnlinked(ctx, childP, false)
 		if err := overlay.Remove(childP); err != nil {
 			return localErrToFuseStatus(err)
 		}
@@ -8056,10 +8061,14 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// back over the whiteout — the same open-unlink invariant the
 		// remote-DELETE path enforces via markOpenHandlesUnlinked. The git
 		// unlink keeps its existing bookkeeping (no RemoveLinkPreserve;
-		// putGitWhiteout removes the inode entry as before).
-		fs.markOpenHandlesUnlinked(ctx, childP, false)
+		// putGitWhiteout removes the inode entry as before). If the whiteout
+		// write fails, the directory entry still exists authoritatively, so
+		// the marking is rolled back — otherwise every later write/flush on
+		// those handles would keep being suppressed and silently drop data.
+		markedGitHandles, _ := fs.markOpenHandlesUnlinked(ctx, childP, false)
 		st := fs.putGitWhiteout(ctx, childP)
 		if st != gofuse.OK {
+			fs.unmarkOpenHandlesAfterFailedUnlink(childP, markedGitHandles)
 			return st
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
@@ -8110,12 +8119,13 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// and handles fall back to their dirty buffer / pinned shadow, matching
 	// the old pendingNew-branch behavior.
 	//
-	// Snapshot the handle set first so a failed remote DELETE can roll the
-	// marking back (the entry still exists remotely in that case).
-	markedHandles := fs.openHandles.SnapshotPath(childP)
+	// The mark pass returns the exact handle set it marked, so a failed
+	// remote DELETE can roll precisely those handles back (the entry still
+	// exists remotely in that case).
 	markCtx, markCf := fuseCtx(cancel)
-	preserveOpen = fs.markOpenHandlesUnlinked(markCtx, childP, true)
+	markedHandles, markedAny := fs.markOpenHandlesUnlinked(markCtx, childP, true)
 	markCf()
+	preserveOpen = markedAny
 
 	if fs.writeBack != nil && fs.uploader != nil {
 		// Wait for any in-flight upload to finish so it doesn't "revive"
@@ -8250,7 +8260,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// marking; mark them now (no remote snapshot — the path is already gone)
 	// so their Flush/Fsync/Release guards see fh.Unlinked and cannot
 	// resurrect the path.
-	if fs.markOpenHandlesUnlinked(ctx, childP, false) {
+	if _, anyOpen := fs.markOpenHandlesUnlinked(ctx, childP, false); anyOpen {
 		preserveOpen = true
 	}
 

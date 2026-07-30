@@ -180,15 +180,16 @@ class Drive9FuseTargetProvider:
         with stdout.open("ab") as out, stderr.open("ab") as err:
             # The header must begin on its own line (the pjdfstest parser
             # matches it at line starts); a previous command's output may not
-            # have ended with "\n".
+            # have ended with "\n". Fail closed if the boundary check itself
+            # cannot be verified, rather than appending an unanchored header.
             try:
                 if stdout.stat().st_size > 0:
                     with stdout.open("rb") as prev:
                         prev.seek(-1, os.SEEK_END)
                         if prev.read(1) != b"\n":
                             out.write(b"\n")
-            except OSError:
-                pass
+            except OSError as exc:
+                raise BlackboxError(f"cannot verify log header boundary in {stdout}: {exc}") from exc
             out.write(f"# {utc_ts()} $ {display}\n".encode())
             out.flush()
             proc = subprocess.Popen(

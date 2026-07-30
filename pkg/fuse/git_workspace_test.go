@@ -48,6 +48,7 @@ type gitWorkspaceFixture struct {
 	readmeSize      int64
 	failTree        bool
 	failOverlay     bool
+	failOverlayPut  bool
 }
 
 type gitStateOnlyFixture struct {
@@ -380,6 +381,12 @@ func (f *gitWorkspaceFixture) handleOverlay(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		f.mu.Lock()
+		if f.failOverlayPut {
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "overlay put unavailable"})
+			return
+		}
 		wait := f.overlayPostWait
 		f.mu.Unlock()
 		if wait != nil {
@@ -4107,5 +4114,103 @@ func TestGitWorkspaceWriteSyncWriteAfterUnlinkDoesNotResurrectOverlay(t *testing
 	}
 	if !ok || entry.Op != "whiteout" {
 		t.Fatalf("overlay entry after write-after-unlink = %+v, %v — want whiteout preserved", entry, ok)
+	}
+
+	// Live mount state: the whiteout must stay authoritative — lookups and
+	// gitEntry report the name absent, and no pending upsert mirrors it back.
+	if ge, handled := fs.gitEntry(context.Background(), "/repo/sync.txt", false); !handled || ge != nil {
+		t.Fatalf("gitEntry after write-after-unlink = %+v, handled=%v — want whiteout (nil entry)", ge, handled)
+	}
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt", &lookupOut); st != gofuse.ENOENT {
+		t.Fatalf("Lookup after write-after-unlink = %v, want ENOENT", st)
+	}
+	fs.gitOverlayMu.Lock()
+	var pendingUpsert any
+	if byPath := fs.gitOverlayPending["ws1"]; byPath != nil {
+		if pe, ok := byPath["sync.txt"]; ok {
+			pendingUpsert = pe.entry
+		}
+	}
+	fs.gitOverlayMu.Unlock()
+	if pendingUpsert != nil {
+		t.Fatalf("pending overlay upsert for unlinked path = %+v", pendingUpsert)
+	}
+}
+
+// TestGitWorkspaceUnlinkWhiteoutFailureRollsBackHandleMarks: when the git
+// whiteout write fails, Unlink must roll the open-handle marking back — the
+// entry still exists authoritatively, so handles must not stay unlinked and
+// their later writes must publish normally.
+func TestGitWorkspaceUnlinkWhiteoutFailureRollsBackHandleMarks(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	v1 := []byte("git-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1 status = %v, want OK", st)
+	}
+
+	// Whiteout write fails → Unlink must error AND roll the marking back.
+	fixture.mu.Lock()
+	fixture.failOverlayPut = true
+	fixture.mu.Unlock()
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt"); st == gofuse.OK {
+		t.Fatal("Unlink unexpectedly succeeded despite failing whiteout")
+	}
+	fixture.mu.Lock()
+	fixture.failOverlayPut = false
+	fixture.mu.Unlock()
+
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("handle missing")
+	}
+	fh.Lock()
+	unlinked := fh.Unlinked
+	fh.Unlock()
+	if unlinked {
+		t.Fatal("handle left marked unlinked after failed whiteout")
+	}
+	if got := len(fs.openHandles.SnapshotPath("/repo/sync.txt")); got != 1 {
+		t.Fatalf("openHandles path index after rollback = %d handles, want 1 relinked", got)
+	}
+
+	// The handle publishes normally again.
+	v2 := []byte("git-v2-published")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write after failed whiteout status = %v, want OK", st)
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	fixture.mu.Unlock()
+	if !ok || entry.Op != "upsert" || string(entry.Content) != string(v2) {
+		t.Fatalf("overlay after failed whiteout + rewrite = %+v, %v — want upsert with v2 content", entry, ok)
+	}
+
+	// Path remains linked.
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup after failed whiteout = %v, want OK", st)
 	}
 }

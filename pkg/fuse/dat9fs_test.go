@@ -21200,6 +21200,9 @@ func TestConcurrentFlushDoesNotResurrectUnlinkedPath(t *testing.T) {
 		return entries
 	}
 
+	// abort unblocks request gates if the test fails early, so ts.Close()
+	// cannot hang on a parked handler.
+	abort := make(chan struct{})
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
 		if p == "" {
@@ -21218,7 +21221,12 @@ func TestConcurrentFlushDoesNotResurrectUnlinkedPath(t *testing.T) {
 			// Block after the body is fully received so Flush is in-flight.
 			body, _ := io.ReadAll(r.Body)
 			putStartedOnce.Do(func() { close(putStarted) })
-			<-putRelease
+			select {
+			case <-putRelease:
+			case <-abort:
+				http.Error(w, "test aborted", http.StatusInternalServerError)
+				return
+			}
 			mu.Lock()
 			files[p] = append([]byte(nil), body...)
 			delete(dirs, p)
@@ -21268,6 +21276,7 @@ func TestConcurrentFlushDoesNotResurrectUnlinkedPath(t *testing.T) {
 		}
 	}))
 	defer ts.Close()
+	defer func() { close(abort) }()
 
 	opts := &MountOptions{WritePolicy: WritePolicyCloseSync}
 	opts.setDefaults()
@@ -21584,6 +21593,9 @@ func TestOldUnlinkedHandleDiscardPreservesReplacementCommit(t *testing.T) {
 		// allowPUT gates the replacement's remote upload so the assertions on
 		// staged state are deterministic regardless of worker timing.
 		allowPUT = make(chan struct{})
+		// abort unblocks the gate if the test fails early, so ts.Close()
+		// cannot hang on a parked handler.
+		abort = make(chan struct{})
 	)
 	listDir := func(dir string) []map[string]any {
 		mu.Lock()
@@ -21617,7 +21629,12 @@ func TestOldUnlinkedHandleDiscardPreservesReplacementCommit(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPut || r.Method == http.MethodPost:
 			body, _ := io.ReadAll(r.Body)
-			<-allowPUT
+			select {
+			case <-allowPUT:
+			case <-abort:
+				http.Error(w, "test aborted", http.StatusInternalServerError)
+				return
+			}
 			mu.Lock()
 			files[p] = append([]byte(nil), body...)
 			delete(dirs, p)
@@ -21656,6 +21673,7 @@ func TestOldUnlinkedHandleDiscardPreservesReplacementCommit(t *testing.T) {
 		}
 	}))
 	defer ts.Close()
+	defer func() { close(abort) }()
 
 	opts := &MountOptions{SyncMode: SyncInteractive}
 	opts.setDefaults()
@@ -22370,6 +22388,9 @@ func TestConcurrentStrictShadowSpillFsyncDoesNotResurrectUnlinkedPath(t *testing
 		putRelease     = make(chan struct{})
 		putStartedOnce sync.Once
 		delDir         atomic.Int32
+		// abort unblocks the request gate if the test fails early, so
+		// ts.Close() cannot hang on a parked handler.
+		abort = make(chan struct{})
 	)
 	listDir := func(dir string) []map[string]any {
 		mu.Lock()
@@ -22431,7 +22452,12 @@ func TestConcurrentStrictShadowSpillFsyncDoesNotResurrectUnlinkedPath(t *testing
 			uploadID := strings.Split(strings.TrimPrefix(r.URL.Path, "/s3/"), "/")[0]
 			body, _ := io.ReadAll(r.Body)
 			putStartedOnce.Do(func() { close(putStarted) })
-			<-putRelease
+			select {
+			case <-putRelease:
+			case <-abort:
+				http.Error(w, "test aborted", http.StatusInternalServerError)
+				return
+			}
 			mu.Lock()
 			uploads[uploadID] = append([]byte(nil), body...)
 			mu.Unlock()
@@ -22487,6 +22513,7 @@ func TestConcurrentStrictShadowSpillFsyncDoesNotResurrectUnlinkedPath(t *testing
 		}
 	}))
 	defer ts.Close()
+	defer func() { close(abort) }()
 
 	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict}
 	opts.setDefaults()
