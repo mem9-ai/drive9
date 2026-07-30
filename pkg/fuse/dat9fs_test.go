@@ -20976,6 +20976,1907 @@ func TestRmdirSucceedsWithTombstoneFilteringStaleRemoteListing(t *testing.T) {
 	}
 }
 
+// TestRmdirAfterOpenUnlinkDirtyFlush mirrors pjdfstest unlink/14.t:
+// create dir, create file, write while open, unlink while still open (dirty),
+// close (Flush/Release), then rmdir the parent. Flush must not re-upload the
+// unlinked dirty buffer — that would leave an orphan remote file and make
+// rmdir return ENOTEMPTY.
+func TestRmdirAfterOpenUnlinkDirtyFlush(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		files    = map[string][]byte{}
+		dirs     = map[string]struct{}{"/": {}, "/dir": {}}
+		putCalls atomic.Int32
+		delFile  atomic.Int32
+		delDir   atomic.Int32
+	)
+	listDir := func(dir string) []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		var entries []map[string]any
+		for p := range dirs {
+			if p == "/" || p == dir {
+				continue
+			}
+			parent := path.Dir(p)
+			if parent == "." {
+				parent = "/"
+			}
+			if parent == dir {
+				entries = append(entries, map[string]any{"name": path.Base(p), "isDir": true, "size": 0})
+			}
+		}
+		for p, data := range files {
+			parent := path.Dir(p)
+			if parent == "." {
+				parent = "/"
+			}
+			if parent == dir {
+				entries = append(entries, map[string]any{"name": path.Base(p), "isDir": false, "size": len(data)})
+			}
+		}
+		return entries
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		if p == "" {
+			p = "/"
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": listDir(p)})
+		case r.Method == http.MethodPost && r.URL.Query().Has("mkdir"):
+			mu.Lock()
+			dirs[p] = struct{}{}
+			delete(files, p)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut || r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			files[p] = append([]byte(nil), body...)
+			delete(dirs, p)
+			mu.Unlock()
+			putCalls.Add(1)
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			_, isDir := dirs[p]
+			_, isFile := files[p]
+			if isDir {
+				// ENOTEMPTY if any direct child remains.
+				for child := range files {
+					if path.Dir(child) == p || (p == "/" && strings.Count(child, "/") == 1) {
+						mu.Unlock()
+						http.Error(w, "directory not empty", http.StatusConflict)
+						return
+					}
+				}
+				for child := range dirs {
+					if child != p && path.Dir(child) == p {
+						mu.Unlock()
+						http.Error(w, "directory not empty", http.StatusConflict)
+						return
+					}
+				}
+				delete(dirs, p)
+				delDir.Add(1)
+			} else if isFile {
+				delete(files, p)
+				delFile.Add(1)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if _, ok := dirs[p]; ok {
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-IsDir", "true")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	// Enable write-back so Flush can re-stage after Unlink (the bug path).
+	wb, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.SetWriteBack(wb, nil)
+
+	var mkdirOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     0o755,
+	}, "dir", &mkdirOut); st != gofuse.OK {
+		t.Fatalf("Mkdir: %v", st)
+	}
+	dirIno := mkdirOut.NodeId
+
+	// Create + write while open (dirty, never remotely durable yet).
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	data := []byte("Hello,_World!")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(data)),
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	// Unlink while still open (same as pjdfstest open:write:unlink:pread).
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: dirIno}, "file.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+
+	// Close path: Flush then Release must not resurrect the file remotely.
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush after unlink: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("remote PUT after open-unlink close = %d, want 0 (must not re-upload)", got)
+	}
+	mu.Lock()
+	if _, ok := files["/dir/file.txt"]; ok {
+		mu.Unlock()
+		t.Fatal("remote still has /dir/file.txt after open-unlink close")
+	}
+	mu.Unlock()
+
+	// Parent rmdir must succeed (pjdfstest unlink/14.t assertion 7).
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	if st != gofuse.OK {
+		t.Fatalf("Rmdir after open-unlink = %v, want OK", st)
+	}
+	if got := delDir.Load(); got != 1 {
+		t.Fatalf("remote dir DELETE calls = %d, want 1", got)
+	}
+}
+
+// TestConcurrentFlushDoesNotResurrectUnlinkedPath is B4: an in-flight
+// synchronous Flush that already passed pre-upload Unlinked checks must not
+// leave a resurrected name after concurrent Unlink returns. Unlink waits on
+// the same per-path remoteCommitLock held across the PUT.
+func TestConcurrentFlushDoesNotResurrectUnlinkedPath(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		files          = map[string][]byte{}
+		dirs           = map[string]struct{}{"/": {}, "/dir": {}}
+		putStarted     = make(chan struct{})
+		putRelease     = make(chan struct{})
+		putStartedOnce sync.Once
+		putCalls       atomic.Int32
+		delDir         atomic.Int32
+	)
+	listDir := func(dir string) []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		var entries []map[string]any
+		for p, data := range files {
+			parent := path.Dir(p)
+			if parent == "." {
+				parent = "/"
+			}
+			if parent == dir {
+				entries = append(entries, map[string]any{"name": path.Base(p), "isDir": false, "size": len(data)})
+			}
+		}
+		return entries
+	}
+
+	// abort unblocks request gates if the test fails early, so ts.Close()
+	// cannot hang on a parked handler.
+	abort := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		if p == "" {
+			p = "/"
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": listDir(p)})
+		case r.Method == http.MethodPost && r.URL.Query().Has("mkdir"):
+			mu.Lock()
+			dirs[p] = struct{}{}
+			delete(files, p)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut || r.Method == http.MethodPost:
+			// Block after the body is fully received so Flush is in-flight.
+			body, _ := io.ReadAll(r.Body)
+			putStartedOnce.Do(func() { close(putStarted) })
+			select {
+			case <-putRelease:
+			case <-abort:
+				http.Error(w, "test aborted", http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			files[p] = append([]byte(nil), body...)
+			delete(dirs, p)
+			mu.Unlock()
+			putCalls.Add(1)
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			if _, isDir := dirs[p]; isDir {
+				for child := range files {
+					if path.Dir(child) == p {
+						mu.Unlock()
+						http.Error(w, "directory not empty", http.StatusConflict)
+						return
+					}
+				}
+				delete(dirs, p)
+				delDir.Add(1)
+			} else {
+				delete(files, p)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if _, ok := dirs[p]; ok {
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-IsDir", "true")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+	defer func() { close(abort) }()
+
+	opts := &MountOptions{WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var mkdirOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     0o755,
+	}, "dir", &mkdirOut); st != gofuse.OK {
+		t.Fatalf("Mkdir: %v", st)
+	}
+	dirIno := mkdirOut.NodeId
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	// Force close-sync on this handle even if profile defaults differ.
+	if fh, ok := fs.fileHandles.Get(createOut.Fh); ok {
+		fh.WritePolicy = WritePolicyCloseSync
+	}
+	data := []byte("new")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(data)),
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		flushDone <- fs.Flush(nil, &gofuse.FlushIn{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+			Fh:       createOut.Fh,
+		})
+	}()
+
+	select {
+	case <-putStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for in-flight Flush PUT to start")
+	}
+
+	// Unlink must wait for the in-flight PUT (remoteCommitLock), then DELETE.
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: dirIno}, "file.txt")
+	}()
+
+	// Give Unlink a moment to reach remoteCommitLock wait if the race window
+	// is open; then release the PUT so Flush can finish and Unlink proceed.
+	time.Sleep(50 * time.Millisecond)
+	close(putRelease)
+
+	var unlinkSt, flushSt gofuse.Status
+	select {
+	case unlinkSt = <-unlinkDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for Unlink")
+	}
+	select {
+	case flushSt = <-flushDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for Flush")
+	}
+	if unlinkSt != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", unlinkSt)
+	}
+	if flushSt != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", flushSt)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	mu.Lock()
+	_, exists := files["/dir/file.txt"]
+	mu.Unlock()
+	if exists {
+		t.Fatal("in-flight flush resurrected path after Unlink returned")
+	}
+	if got := putCalls.Load(); got != 1 {
+		// Exactly one PUT from the in-flight Flush; Unlink must not allow a second create.
+		t.Fatalf("remote PUT calls = %d, want 1", got)
+	}
+
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	if st != gofuse.OK {
+		t.Fatalf("Rmdir after concurrent flush+unlink = %v, want OK", st)
+	}
+	if got := delDir.Load(); got != 1 {
+		t.Fatalf("remote dir DELETE calls = %d, want 1", got)
+	}
+}
+
+// TestRmdirAfterOpenUnlinkDirtyFsync is the Fsync counterpart of
+// TestRmdirAfterOpenUnlinkDirtyFlush: write → unlink while open → fsync(fd)
+// must not re-stage/enqueue/upload the deleted path.
+func TestRmdirAfterOpenUnlinkDirtyFsync(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		files    = map[string][]byte{}
+		dirs     = map[string]struct{}{"/": {}, "/dir": {}}
+		putCalls atomic.Int32
+		delDir   atomic.Int32
+	)
+	listDir := func(dir string) []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		var entries []map[string]any
+		for p := range dirs {
+			if p == "/" || p == dir {
+				continue
+			}
+			parent := path.Dir(p)
+			if parent == "." {
+				parent = "/"
+			}
+			if parent == dir {
+				entries = append(entries, map[string]any{"name": path.Base(p), "isDir": true, "size": 0})
+			}
+		}
+		for p, data := range files {
+			parent := path.Dir(p)
+			if parent == "." {
+				parent = "/"
+			}
+			if parent == dir {
+				entries = append(entries, map[string]any{"name": path.Base(p), "isDir": false, "size": len(data)})
+			}
+		}
+		return entries
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		if p == "" {
+			p = "/"
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": listDir(p)})
+		case r.Method == http.MethodPost && r.URL.Query().Has("mkdir"):
+			mu.Lock()
+			dirs[p] = struct{}{}
+			delete(files, p)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut || r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			files[p] = append([]byte(nil), body...)
+			delete(dirs, p)
+			mu.Unlock()
+			putCalls.Add(1)
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			_, isDir := dirs[p]
+			if isDir {
+				for child := range files {
+					if path.Dir(child) == p {
+						mu.Unlock()
+						http.Error(w, "directory not empty", http.StatusConflict)
+						return
+					}
+				}
+				delete(dirs, p)
+				delDir.Add(1)
+			} else {
+				delete(files, p)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if _, ok := dirs[p]; ok {
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-IsDir", "true")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	wb, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.SetWriteBack(wb, nil)
+	// Minimal commit queue so interactive Fsync can enqueue if the unlinked
+	// guard is missing (the bug path under review).
+	cq := NewCommitQueue(fs.client, shadow, pending, nil, 1, 8)
+	fs.commitQueue = cq
+	defer cq.DrainAll()
+
+	var mkdirOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     0o755,
+	}, "dir", &mkdirOut); st != gofuse.OK {
+		t.Fatalf("Mkdir: %v", st)
+	}
+	dirIno := mkdirOut.NodeId
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	data := []byte("Hello,_World!")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(data)),
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: dirIno}, "file.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+
+	// Fsync after dirty open-unlink must discard, not re-enqueue.
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync after unlink: %v", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush after unlink: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("remote PUT after open-unlink fsync = %d, want 0", got)
+	}
+	if _, ok := pending.GetMeta("/dir/file.txt"); ok {
+		t.Fatal("pendingIndex still has /dir/file.txt after open-unlink fsync")
+	}
+	mu.Lock()
+	if _, ok := files["/dir/file.txt"]; ok {
+		mu.Unlock()
+		t.Fatal("remote still has /dir/file.txt after open-unlink fsync")
+	}
+	mu.Unlock()
+
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	if st != gofuse.OK {
+		t.Fatalf("Rmdir after open-unlink fsync = %v, want OK", st)
+	}
+	if got := delDir.Load(); got != 1 {
+		t.Fatalf("remote dir DELETE calls = %d, want 1", got)
+	}
+}
+
+// TestOldUnlinkedHandleDiscardPreservesReplacementCommit is B5: POSIX allows
+// recreating a pathname while the old unlinked fd is still open. Flush/Release
+// on the old fd must clean up only its OWN staging generation — path-global
+// removes would cancel the replacement file's queued commit and lose its data.
+func TestOldUnlinkedHandleDiscardPreservesReplacementCommit(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		files    = map[string][]byte{}
+		dirs     = map[string]struct{}{"/": {}, "/dir": {}}
+		putCalls atomic.Int32
+		// allowPUT gates the replacement's remote upload so the assertions on
+		// staged state are deterministic regardless of worker timing.
+		allowPUT = make(chan struct{})
+		// abort unblocks the gate if the test fails early, so ts.Close()
+		// cannot hang on a parked handler.
+		abort = make(chan struct{})
+	)
+	listDir := func(dir string) []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		var entries []map[string]any
+		for p, data := range files {
+			parent := path.Dir(p)
+			if parent == "." {
+				parent = "/"
+			}
+			if parent == dir {
+				entries = append(entries, map[string]any{"name": path.Base(p), "isDir": false, "size": len(data)})
+			}
+		}
+		return entries
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		if p == "" {
+			p = "/"
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": listDir(p)})
+		case r.Method == http.MethodPost && r.URL.Query().Has("mkdir"):
+			mu.Lock()
+			dirs[p] = struct{}{}
+			delete(files, p)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut || r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			select {
+			case <-allowPUT:
+			case <-abort:
+				http.Error(w, "test aborted", http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			files[p] = append([]byte(nil), body...)
+			delete(dirs, p)
+			mu.Unlock()
+			putCalls.Add(1)
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			delete(files, p)
+			delete(dirs, p)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if _, ok := dirs[p]; ok {
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-IsDir", "true")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+	defer func() { close(abort) }()
+
+	opts := &MountOptions{SyncMode: SyncInteractive}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	wb, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.SetWriteBack(wb, nil)
+	cq := NewCommitQueue(fs.client, shadow, pending, nil, 1, 8)
+	fs.commitQueue = cq
+	defer cq.DrainAll()
+
+	var mkdirOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     0o755,
+	}, "dir", &mkdirOut); st != gofuse.OK {
+		t.Fatalf("Mkdir: %v", st)
+	}
+	dirIno := mkdirOut.NodeId
+
+	// Old handle: create + write + unlink while still open.
+	var oldCreate gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &oldCreate); st != gofuse.OK {
+		t.Fatalf("Create old: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: oldCreate.NodeId},
+		Fh:       oldCreate.Fh,
+		Size:     uint32(len("old")),
+	}, []byte("old")); st != gofuse.OK {
+		t.Fatalf("Write old: %v", st)
+	}
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: dirIno}, "file.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+
+	// Replacement: recreate the same pathname while the old fd stays open,
+	// then fsync to stage + enqueue its commit. The server PUT is gated on
+	// allowPUT below, so the queued commit cannot land remotely before the
+	// assertions — whether the worker is still queued or already blocked in
+	// the PUT, pending/shadow/queue state stays observable.
+	var newCreate gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &newCreate); st != gofuse.OK {
+		t.Fatalf("Create replacement: %v", st)
+	}
+	if newCreate.NodeId == oldCreate.NodeId {
+		t.Fatal("replacement reused the unlinked inode; test requires a fresh inode")
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: newCreate.NodeId},
+		Fh:       newCreate.Fh,
+		Size:     uint32(len("replacement")),
+	}, []byte("replacement")); st != gofuse.OK {
+		t.Fatalf("Write replacement: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: newCreate.NodeId},
+		Fh:       newCreate.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync replacement: %v", st)
+	}
+	if _, ok := pending.GetMeta("/dir/file.txt"); !ok {
+		t.Fatal("replacement pending entry missing after fsync")
+	}
+	if !shadow.Has("/dir/file.txt") {
+		t.Fatal("replacement shadow missing after fsync")
+	}
+	if !cq.HasPath("/dir/file.txt") {
+		t.Fatal("replacement commit missing after fsync")
+	}
+
+	// Flush + Release on the OLD unlinked fd must not touch the replacement's
+	// staged state (the B5 bug: path-global cleanup canceled it).
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: oldCreate.NodeId},
+		Fh:       oldCreate.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush old unlinked handle: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: oldCreate.NodeId},
+		Fh:       oldCreate.Fh,
+	})
+
+	if _, ok := pending.GetMeta("/dir/file.txt"); !ok {
+		t.Fatal("old unlinked handle removed the replacement's pending entry")
+	}
+	if !shadow.Has("/dir/file.txt") {
+		t.Fatal("old unlinked handle removed the replacement's shadow")
+	}
+	if !cq.HasPath("/dir/file.txt") {
+		t.Fatal("old unlinked handle canceled the replacement's queued commit")
+	}
+
+	// Close the replacement and drain: its data must reach the remote. Open
+	// the server PUT gate first so the queued commit can proceed.
+	close(allowPUT)
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: newCreate.NodeId},
+		Fh:       newCreate.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush replacement: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: newCreate.NodeId},
+		Fh:       newCreate.Fh,
+	})
+	cq.DrainAll()
+
+	mu.Lock()
+	data, ok := files["/dir/file.txt"]
+	mu.Unlock()
+	if !ok {
+		t.Fatal("replacement file never reached the remote backend")
+	}
+	if string(data) != "replacement" {
+		t.Fatalf("replacement remote content = %q, want %q", data, "replacement")
+	}
+	if got := putCalls.Load(); got == 0 {
+		t.Fatal("remote PUT calls = 0, want the replacement commit uploaded")
+	}
+}
+
+// TestDiscardUnlinkedHandleReleasesRemoteCommitLock: a handle that staged a
+// queued commit can still own the same-path commit reservation when it is
+// unlinked. The discard must release it, otherwise same-path create/write
+// blocks until the final Release (or RemoteCommitWaitTimeout).
+func TestDiscardUnlinkedHandleReleasesRemoteCommitLock(t *testing.T) {
+	fs := &Dat9FS{}
+	released := false
+	fh := &FileHandle{
+		Ino:                2,
+		Path:               "/dir/file.txt",
+		Unlinked:           true,
+		RemoteCommitUnlock: func() { released = true },
+	}
+	fh.Lock()
+	fs.discardUnlinkedHandleStateLocked(fh)
+	fh.Unlock()
+	if !released {
+		t.Fatal("discard did not release the handle-owned remote commit lock")
+	}
+	if fh.RemoteCommitUnlock != nil {
+		t.Fatal("fh.RemoteCommitUnlock not cleared by discard")
+	}
+}
+
+// TestUnlinkDeleteFailureRollsBackOpenHandleMarks: when the remote DELETE
+// fails (non-404), Unlink must roll back the pass-1 unlinked marking so the
+// still-open dirty handle is NOT treated as removed — otherwise its next
+// Flush/Release discards live data (silent data loss after an unlink that
+// returned an error).
+func TestUnlinkDeleteFailureRollsBackOpenHandleMarks(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		files        = map[string][]byte{}
+		dirs         = map[string]struct{}{"/": {}, "/dir": {}}
+		putCalls     atomic.Int32
+		failNextFile atomic.Bool
+	)
+	failNextFile.Store(true)
+	listDir := func(dir string) []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		var entries []map[string]any
+		for p, data := range files {
+			parent := path.Dir(p)
+			if parent == "." {
+				parent = "/"
+			}
+			if parent == dir {
+				entries = append(entries, map[string]any{"name": path.Base(p), "isDir": false, "size": len(data)})
+			}
+		}
+		return entries
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		if p == "" {
+			p = "/"
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": listDir(p)})
+		case r.Method == http.MethodGet:
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				mu.Unlock()
+				w.Header().Set("X-Dat9-Revision", "1")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(data)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		case r.Method == http.MethodPost && r.URL.Query().Has("mkdir"):
+			mu.Lock()
+			dirs[p] = struct{}{}
+			delete(files, p)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut || r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			files[p] = append([]byte(nil), body...)
+			delete(dirs, p)
+			mu.Unlock()
+			putCalls.Add(1)
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			if _, isDir := dirs[p]; !isDir && failNextFile.CompareAndSwap(true, false) {
+				// Transient failure on the first file DELETE.
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			delete(files, p)
+			delete(dirs, p)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if _, ok := dirs[p]; ok {
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-IsDir", "true")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var mkdirOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     0o755,
+	}, "dir", &mkdirOut); st != gofuse.OK {
+		t.Fatalf("Mkdir: %v", st)
+	}
+	dirIno := mkdirOut.NodeId
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	v1 := []byte("uploaded-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1: %v", st)
+	}
+	// Upload v1 so the path exists remotely and Unlink must issue a DELETE.
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush v1: %v", st)
+	}
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("remote PUT for v1 = %d, want 1", got)
+	}
+	data := []byte("must-survive-failed-unlink")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(data)),
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write v2: %v", st)
+	}
+
+	// First Unlink: the remote DELETE fails with 500. Unlink must report the
+	// error AND leave the handle in a normal (not unlinked) state.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: dirIno}, "file.txt"); st == gofuse.OK {
+		t.Fatal("Unlink unexpectedly succeeded despite remote DELETE 500")
+	}
+
+	// Flush must upload the dirty buffer (close-sync), NOT discard it as if
+	// the path had been unlinked.
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush after failed unlink: %v", st)
+	}
+	if got := putCalls.Load(); got != 2 {
+		t.Fatalf("remote PUT after failed unlink = %d, want 2 (dirty data must be preserved)", got)
+	}
+	mu.Lock()
+	gotData, ok := files["/dir/file.txt"]
+	mu.Unlock()
+	if !ok || string(gotData) != string(data) {
+		t.Fatalf("remote content after failed unlink = %q, %v — want %q", gotData, ok, data)
+	}
+
+	// The handle is still fully readable.
+	read := make([]byte, len(data))
+	rs, rst := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+		Size:     uint32(len(data)),
+	}, read)
+	if rst != gofuse.OK {
+		t.Fatalf("Read after failed unlink: %v", rst)
+	}
+	br, _ := rs.Bytes(read)
+	if string(br) != string(data) {
+		t.Fatalf("Read after failed unlink = %q, want %q", br, data)
+	}
+
+	// Second Unlink now succeeds; the close path then discards normally and
+	// rmdir works.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: dirIno}, "file.txt"); st != gofuse.OK {
+		t.Fatalf("second Unlink: %v", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush after real unlink: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir"); st != gofuse.OK {
+		t.Fatalf("Rmdir after successful unlink = %v, want OK", st)
+	}
+}
+
+// TestUnlinkDeleteFailurePreservesClosedPendingState: a failed remote DELETE
+// must not destroy closed staged state (no live handle) — a POSIX unlink that
+// fails leaves the namespace entry in place, so an already-accepted local
+// PendingOverwrite whose only copy lives in the staging stores must remain
+// recoverable. Regression for the commit-point deferral in Unlink.
+func TestUnlinkDeleteFailurePreservesClosedPendingState(t *testing.T) {
+	const filePath = "/file.txt"
+	staged := []byte("newer-local-overwrite")
+
+	var (
+		mu       sync.Mutex
+		files    = map[string][]byte{filePath: []byte("remote-v1")}
+		headHits atomic.Int32
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		if p == "" {
+			p = "/"
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+		case r.Method == http.MethodGet:
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				mu.Unlock()
+				w.Header().Set("X-Dat9-Revision", "1")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(data)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		case r.Method == http.MethodDelete:
+			// Transient failure — the unlink does not happen remotely.
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		case r.Method == http.MethodHead:
+			headHits.Add(1)
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	wb, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.SetWriteBack(wb, nil)
+
+	// Seed a CLOSED staged overwrite for the remote file (no live handle):
+	// shadow bytes + pending index + write-back entry at remote base rev 1.
+	if err := shadow.WriteFull(filePath, staged, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(filePath, int64(len(staged)), PendingOverwrite, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.PutWithBaseRevAndMode(filePath, staged, int64(len(staged)), PendingOverwrite, 1, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	// The inode must exist for the unlink path resolution.
+	fs.inodes.Lookup(filePath, false, int64(len(files[filePath])), time.Now())
+
+	// Unlink fails (DELETE 500) and must leave every staged copy intact.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "file.txt"); st == gofuse.OK {
+		t.Fatal("Unlink unexpectedly succeeded despite remote DELETE 500")
+	}
+
+	if meta, ok := pending.GetMeta(filePath); !ok || meta.Kind != PendingOverwrite {
+		t.Fatalf("pendingIndex entry lost after failed unlink (ok=%v)", ok)
+	}
+	if !shadow.Has(filePath) {
+		t.Fatal("shadow backing lost after failed unlink")
+	}
+	if data, err := shadow.ReadAll(filePath); err != nil || string(data) != string(staged) {
+		t.Fatalf("shadow content after failed unlink = %q, %v — want staged bytes", data, err)
+	}
+	if meta, ok := wb.GetMeta(filePath); !ok || meta.Kind != PendingOverwrite {
+		t.Fatalf("writeBack entry lost after failed unlink (ok=%v)", ok)
+	}
+	// Remote file untouched: HEAD still sees it.
+	mu.Lock()
+	_, remoteOK := files[filePath]
+	mu.Unlock()
+	if !remoteOK {
+		t.Fatal("remote file must still exist after failed DELETE")
+	}
+}
+
+// TestWriteSyncWriteAfterUnlinkDoesNotResurrectPath: POSIX permits writing to
+// an anonymous (unlinked) fd, and the write must succeed and stay readable —
+// but on a write-sync (O_SYNC/O_DSYNC / WritePolicyWriteSync) handle it must
+// NOT upload, or the deleted pathname is recreated and parent rmdir fails
+// with ENOTEMPTY again.
+func TestWriteSyncWriteAfterUnlinkDoesNotResurrectPath(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		files    = map[string][]byte{}
+		dirs     = map[string]struct{}{"/": {}, "/dir": {}}
+		putCalls atomic.Int32
+		delDir   atomic.Int32
+	)
+	listDir := func(dir string) []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		var entries []map[string]any
+		for p, data := range files {
+			parent := path.Dir(p)
+			if parent == "." {
+				parent = "/"
+			}
+			if parent == dir {
+				entries = append(entries, map[string]any{"name": path.Base(p), "isDir": false, "size": len(data)})
+			}
+		}
+		return entries
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		if p == "" {
+			p = "/"
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": listDir(p)})
+		case r.Method == http.MethodGet:
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				mu.Unlock()
+				w.Header().Set("X-Dat9-Revision", "1")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(data)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		case r.Method == http.MethodPost && r.URL.Query().Has("mkdir"):
+			mu.Lock()
+			dirs[p] = struct{}{}
+			delete(files, p)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut || r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			files[p] = append([]byte(nil), body...)
+			delete(dirs, p)
+			mu.Unlock()
+			putCalls.Add(1)
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			if _, isDir := dirs[p]; isDir {
+				for child := range files {
+					if path.Dir(child) == p {
+						mu.Unlock()
+						http.Error(w, "directory not empty", http.StatusConflict)
+						return
+					}
+				}
+				delete(dirs, p)
+				delDir.Add(1)
+			} else {
+				delete(files, p)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			mu.Lock()
+			if data, ok := files[p]; ok {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if _, ok := dirs[p]; ok {
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-IsDir", "true")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var mkdirOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     0o755,
+	}, "dir", &mkdirOut); st != gofuse.OK {
+		t.Fatalf("Mkdir: %v", st)
+	}
+	dirIno := mkdirOut.NodeId
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	// Force write-sync (O_SYNC-like) policy on this handle.
+	if fh, ok := fs.fileHandles.Get(createOut.Fh); ok {
+		fh.WritePolicy = WritePolicyWriteSync
+	}
+
+	v1 := []byte("v1-synced")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1: %v", st)
+	}
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("write-sync Write v1: remote PUT = %d, want 1 (write-sync uploads eagerly)", got)
+	}
+
+	// Unlink while the write-sync fd stays open.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: dirIno}, "file.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+
+	// Write-after-unlink must succeed (anonymous fd) but perform NO remote
+	// create/update for the deleted path.
+	v2 := []byte("v2-must-stay-local")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write after unlink: %v", st)
+	}
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("write-after-unlink issued a remote upload (PUT = %d, want still 1)", got)
+	}
+
+	// Anonymous-fd semantics: the write landed in the fd's Dirty buffer and
+	// stays readable there. (Read-path merging of the mark-time remote
+	// snapshot vs post-unlink writes is a separate pre-existing question.)
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("handle missing")
+	}
+	fh.Lock()
+	buf := make([]byte, len(v2))
+	nRead := fh.Dirty.ReadAt(0, buf)
+	fh.Unlock()
+	if nRead != len(v2) || string(buf) != string(v2) {
+		t.Fatalf("Dirty buffer content after write-after-unlink = %q (n=%d), want %q", buf[:nRead], nRead, v2)
+	}
+
+	// Close path: discard only, still no upload.
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("close after write-after-unlink issued a remote upload (PUT = %d, want still 1)", got)
+	}
+	mu.Lock()
+	_, exists := files["/dir/file.txt"]
+	mu.Unlock()
+	if exists {
+		t.Fatal("write-after-unlink resurrected the deleted path remotely")
+	}
+	if st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir"); st != gofuse.OK {
+		t.Fatalf("Rmdir after write-sync write-after-unlink = %v, want OK", st)
+	}
+	if got := delDir.Load(); got != 1 {
+		t.Fatalf("remote dir DELETE calls = %d, want 1", got)
+	}
+}
+
+// TestConcurrentStrictShadowSpillFsyncDoesNotResurrectUnlinkedPath is the
+// large-file sibling of TestConcurrentFlushDoesNotResurrectUnlinkedPath: the
+// strict ShadowSpill Fsync upload must hold remoteCommitLock across the
+// network write so Unlink's DELETE lands after it (B4 class).
+func TestConcurrentStrictShadowSpillFsyncDoesNotResurrectUnlinkedPath(t *testing.T) {
+	filePath := "/dir/file.txt"
+	data := bytes.Repeat([]byte("strict-shadowspill-0123456789\n"), 128)
+
+	var (
+		mu             sync.Mutex
+		files          = map[string][]byte{}
+		dirs           = map[string]struct{}{"/": {}, "/dir": {}}
+		uploads        = map[string][]byte{}
+		nextUploadID   int
+		putStarted     = make(chan struct{})
+		putRelease     = make(chan struct{})
+		putStartedOnce sync.Once
+		delDir         atomic.Int32
+		// abort unblocks the request gate if the test fails early, so
+		// ts.Close() cannot hang on a parked handler.
+		abort = make(chan struct{})
+	)
+	listDir := func(dir string) []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		var entries []map[string]any
+		for p, d := range files {
+			parent := path.Dir(p)
+			if parent == "." {
+				parent = "/"
+			}
+			if parent == dir {
+				entries = append(entries, map[string]any{"name": path.Base(p), "isDir": false, "size": len(d)})
+			}
+		}
+		return entries
+	}
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": listDir(p)})
+		case r.Method == http.MethodPost && r.URL.Query().Has("mkdir"):
+			mu.Lock()
+			dirs[p] = struct{}{}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path      string `json:"path"`
+				TotalSize int64  `json:"total_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			nextUploadID++
+			uploadID := fmt.Sprintf("upload-%d", nextUploadID)
+			uploads[uploadID] = nil
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   uploadID,
+				"key":         "object-key",
+				"part_size":   req.TotalSize,
+				"total_parts": 1,
+			})
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/presign-batch"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/presign-batch")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/" + uploadID + "/1",
+					"size":   len(data),
+				}},
+			})
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/"):
+			uploadID := strings.Split(strings.TrimPrefix(r.URL.Path, "/s3/"), "/")[0]
+			body, _ := io.ReadAll(r.Body)
+			putStartedOnce.Do(func() { close(putStarted) })
+			select {
+			case <-putRelease:
+			case <-abort:
+				http.Error(w, "test aborted", http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			uploads[uploadID] = append([]byte(nil), body...)
+			mu.Unlock()
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/complete"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/complete")
+			mu.Lock()
+			body := uploads[uploadID]
+			files[filePath] = append([]byte(nil), body...)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			if _, isDir := dirs[p]; isDir {
+				for child := range files {
+					if path.Dir(child) == p {
+						mu.Unlock()
+						http.Error(w, "directory not empty", http.StatusConflict)
+						return
+					}
+				}
+				delete(dirs, p)
+				delDir.Add(1)
+			} else {
+				delete(files, p)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			mu.Lock()
+			if d, ok := files[p]; ok {
+				w.Header().Set("Content-Length", strconv.Itoa(len(d)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if _, ok := dirs[p]; ok {
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-IsDir", "true")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+	defer func() { close(abort) }()
+
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var mkdirOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     0o755,
+	}, "dir", &mkdirOut); st != gofuse.OK {
+		t.Fatalf("Mkdir: %v", st)
+	}
+	dirIno := mkdirOut.NodeId
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(data)),
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("handle missing")
+	}
+	fh.Lock()
+	spill := fh.ShadowSpill
+	fh.Unlock()
+	if !spill {
+		t.Fatal("handle is not ShadowSpill; test setup broken")
+	}
+
+	fsyncDone := make(chan gofuse.Status, 1)
+	go func() {
+		fsyncDone <- fs.Fsync(nil, &gofuse.FsyncIn{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+			Fh:       createOut.Fh,
+		})
+	}()
+	select {
+	case <-putStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for in-flight strict ShadowSpill upload")
+	}
+
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: dirIno}, "file.txt")
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(putRelease)
+
+	var unlinkSt, fsyncSt gofuse.Status
+	select {
+	case unlinkSt = <-unlinkDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for Unlink (lock-order inversion?)")
+	}
+	select {
+	case fsyncSt = <-fsyncDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for Fsync")
+	}
+	if unlinkSt != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", unlinkSt)
+	}
+	if fsyncSt != gofuse.OK {
+		t.Fatalf("Fsync status = %v, want OK", fsyncSt)
+	}
+
+	mu.Lock()
+	_, exists := files[filePath]
+	mu.Unlock()
+	if exists {
+		t.Fatal("in-flight strict ShadowSpill upload resurrected path after Unlink returned")
+	}
+	if st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir"); st != gofuse.OK {
+		t.Fatalf("Rmdir after concurrent strict ShadowSpill fsync+unlink = %v, want OK", st)
+	}
+	if got := delDir.Load(); got != 1 {
+		t.Fatalf("remote dir DELETE calls = %d, want 1", got)
+	}
+}
+
+// TestOpenUnlinkedShadowSpillReadSurvivesFlushAndReplacement: a dirty
+// ShadowSpill handle's authoritative data lives in the staged shadow, not the
+// Dirty buffer. After unlink-while-open, Flush/Fsync must not destroy that
+// backing — reads from the still-open fd must return the original bytes until
+// final Release, even after a same-path replacement stages its own shadow.
+func TestOpenUnlinkedShadowSpillReadSurvivesFlushAndReplacement(t *testing.T) {
+	type uploadState struct {
+		path string
+		size int64
+		body []byte
+	}
+	var (
+		mu           sync.Mutex
+		files        = map[string][]byte{}
+		dirs         = map[string]struct{}{"/": {}, "/dir": {}}
+		uploads      = map[string]uploadState{}
+		nextUploadID int
+	)
+	listDir := func(dir string) []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		var entries []map[string]any
+		for p, d := range files {
+			if path.Dir(p) == dir {
+				entries = append(entries, map[string]any{"name": path.Base(p), "isDir": false, "size": len(d)})
+			}
+		}
+		return entries
+	}
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		if p == "" {
+			p = "/"
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": listDir(p)})
+		case r.Method == http.MethodPost && r.URL.Query().Has("mkdir"):
+			mu.Lock()
+			dirs[p] = struct{}{}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path      string `json:"path"`
+				TotalSize int64  `json:"total_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			nextUploadID++
+			uploadID := fmt.Sprintf("upload-%d", nextUploadID)
+			uploads[uploadID] = uploadState{path: req.Path, size: req.TotalSize}
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   uploadID,
+				"key":         "object-key",
+				"part_size":   req.TotalSize,
+				"total_parts": 1,
+			})
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/presign-batch"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/presign-batch")
+			mu.Lock()
+			st0 := uploads[uploadID]
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/" + uploadID + "/1",
+					"size":   st0.size,
+				}},
+			})
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/"):
+			uploadID := strings.Split(strings.TrimPrefix(r.URL.Path, "/s3/"), "/")[0]
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			st0 := uploads[uploadID]
+			st0.body = append([]byte(nil), body...)
+			uploads[uploadID] = st0
+			mu.Unlock()
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/complete"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/complete")
+			mu.Lock()
+			st0 := uploads[uploadID]
+			files[st0.path] = append([]byte(nil), st0.body...)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case r.Method == http.MethodPut || r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			files[p] = append([]byte(nil), body...)
+			mu.Unlock()
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			delete(files, p)
+			delete(dirs, p)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			mu.Lock()
+			if d, ok := files[p]; ok {
+				w.Header().Set("Content-Length", strconv.Itoa(len(d)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if _, ok := dirs[p]; ok {
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-IsDir", "true")
+				w.Header().Set("X-Dat9-Revision", "1")
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, FlushDebounce: time.Hour}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var mkdirOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     0o755,
+	}, "dir", &mkdirOut); st != gofuse.OK {
+		t.Fatalf("Mkdir: %v", st)
+	}
+	dirIno := mkdirOut.NodeId
+
+	oldData := bytes.Repeat([]byte("old-shadowspill-backing-0123456789\n"), 96)
+	var oldCreate gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &oldCreate); st != gofuse.OK {
+		t.Fatalf("Create old: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: oldCreate.NodeId},
+		Fh:       oldCreate.Fh,
+		Size:     uint32(len(oldData)),
+	}, oldData); st != gofuse.OK {
+		t.Fatalf("Write old: %v", st)
+	}
+	oldFh, ok := fs.fileHandles.Get(oldCreate.Fh)
+	if !ok {
+		t.Fatal("old handle missing")
+	}
+	oldFh.Lock()
+	if !oldFh.ShadowSpill {
+		oldFh.Unlock()
+		t.Fatal("old handle is not ShadowSpill; test setup broken")
+	}
+	oldFh.Unlock()
+
+	// Unlink while the ShadowSpill fd stays open.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: dirIno}, "file.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+	// Flush must discard staged state but PRESERVE the fd's read backing.
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: oldCreate.NodeId},
+		Fh:       oldCreate.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush old unlinked handle: %v", st)
+	}
+
+	readOld := func() string {
+		buf := make([]byte, len(oldData))
+		rs, rst := fs.Read(nil, &gofuse.ReadIn{
+			InHeader: gofuse.InHeader{NodeId: oldCreate.NodeId},
+			Fh:       oldCreate.Fh,
+			Offset:   0,
+			Size:     uint32(len(oldData)),
+		}, buf)
+		if rst != gofuse.OK {
+			t.Fatalf("Read old unlinked ShadowSpill fd: %v", rst)
+		}
+		br, _ := rs.Bytes(buf)
+		return string(br)
+	}
+	if got := readOld(); got != string(oldData) {
+		t.Fatalf("Read after unlinked Flush = %.40q..., want original ShadowSpill bytes", got)
+	}
+
+	// Recreate the pathname and stage a replacement shadow; the old fd's
+	// reads must still return the OLD content (no aliasing).
+	var newCreate gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "file.txt", &newCreate); st != gofuse.OK {
+		t.Fatalf("Create replacement: %v", st)
+	}
+	newData := bytes.Repeat([]byte("replacement-9876543210\n"), 128)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: newCreate.NodeId},
+		Fh:       newCreate.Fh,
+		Size:     uint32(len(newData)),
+	}, newData); st != gofuse.OK {
+		t.Fatalf("Write replacement: %v", st)
+	}
+	// The replacement's spill staged its own shadow at the same path. The old
+	// fd's reads must still return the OLD content (no aliasing).
+	if got := readOld(); got != string(oldData) {
+		t.Fatalf("Read after replacement staged = %.40q..., want original ShadowSpill bytes", got)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: oldCreate.NodeId},
+		Fh:       oldCreate.Fh,
+	})
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: newCreate.NodeId},
+		Fh:       newCreate.Fh,
+	})
+
+	// The replacement's own lifecycle is undisturbed by the old fd's discard.
+	mu.Lock()
+	remoteData, remoteOK := files["/dir/file.txt"]
+	mu.Unlock()
+	if !remoteOK || string(remoteData) != string(newData) {
+		t.Fatalf("replacement remote content = %.40q..., %v — want the replacement bytes", remoteData, remoteOK)
+	}
+}
+
 func TestRmdirRemoteDeleteDoesNotRetryRecreatedPathAfterInterrupt(t *testing.T) {
 	path := "/repo/emptydir"
 

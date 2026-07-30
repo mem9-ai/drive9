@@ -94,7 +94,7 @@ type CommitQueue struct {
 	// back. When true, Enqueue returns errLayerRolledBack and commitOne
 	// skips tryAutoResolveConflict, going straight to terminal failure so
 	// pending writes are preserved as PendingConflict.
-	abandoned    bool
+	abandoned bool
 
 	// OnSuccess is called after successful upload with the committed
 	// revision. Used by dat9fs to seed readCache and update inode revision.
@@ -737,6 +737,79 @@ func (cq *CommitQueue) CancelPath(path string) {
 // pending entry moves to the content-addressed final path.
 func (cq *CommitQueue) CancelPathPreserveLocal(path string) {
 	cq.cancelPath(path, true)
+}
+
+// CancelPathIfInode cancels queued or in-flight uploads for path whose entries
+// were staged by the given inode, leaving entries owned by other inodes (e.g.
+// a replacement file that reused the pathname after an unlink) untouched.
+// Local shadow/index state is always preserved — the caller performs its own
+// generation-scoped cleanup.
+func (cq *CommitQueue) CancelPathIfInode(path string, ino uint64) {
+	if cq == nil || path == "" {
+		return
+	}
+	var cancels []context.CancelFunc
+	seen := make(map[*CommitEntry]struct{})
+	markCanceled := func(e *CommitEntry) {
+		if e == nil || e.Inode != ino {
+			return
+		}
+		e.canceled = true
+		cq.stopDelayedLocked(e)
+		if _, ok := seen[e]; ok {
+			return
+		}
+		seen[e] = struct{}{}
+		if e.cancelCommit != nil {
+			cancels = append(cancels, e.cancelCommit)
+		}
+		if e.cancelUpload != nil {
+			cancels = append(cancels, e.cancelUpload)
+		}
+	}
+
+	cq.mu.Lock()
+	if e, ok := cq.inFlight[path]; ok {
+		markCanceled(e)
+	}
+	if cq.queuedByPath != nil {
+		for e := range cq.queuedByPath[path] {
+			markCanceled(e)
+		}
+		if len(seen) > 0 {
+			remaining := cq.queue[:0]
+			for _, e := range cq.queue {
+				if _, drop := seen[e]; drop {
+					continue
+				}
+				remaining = append(remaining, e)
+			}
+			cq.queue = remaining
+			for e := range seen {
+				if set, ok := cq.queuedByPath[path]; ok {
+					delete(set, e)
+					if len(set) == 0 {
+						delete(cq.queuedByPath, path)
+					}
+				}
+			}
+		}
+	} else {
+		remaining := cq.queue[:0]
+		for _, e := range cq.queue {
+			if e.Path == path && e.Inode == ino {
+				markCanceled(e)
+				continue
+			}
+			remaining = append(remaining, e)
+		}
+		cq.queue = remaining
+	}
+	cq.mu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
 }
 
 // CancelQueuedZeroTruncatePreserveLocal cancels queued, not in-flight,

@@ -239,17 +239,20 @@ type WriteBackPutTimings struct {
 // PutWithBaseRevAndMode is like PutWithBaseRev, but also persists the file
 // permission bits that should be applied once the pending data is remote.
 func (c *WriteBackCache) PutWithBaseRevAndMode(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) error {
-	_, err := c.PutWithBaseRevAndModeTimings(remotePath, data, size, kind, baseRev, mode, hasMode)
+	_, _, err := c.PutWithBaseRevAndModeTimings(remotePath, data, size, kind, baseRev, mode, hasMode)
 	return err
 }
 
 // PutWithBaseRevAndModeTimings is like PutWithBaseRevAndMode but also returns
-// sub-phase timings for diagnostic instrumentation.
+// the allocated store generation and sub-phase timings for diagnostic
+// instrumentation. The generation lets callers perform ownership-scoped
+// cleanup later (RemoveIfGeneration) so a stale owner never removes a fresher
+// same-path entry.
 //
 // File I/O (.dat/.meta atomicWrite) runs outside the global WriteBackCache.mu,
 // serialized per-path by a per-path lock. The global lock is only held briefly
 // to allocate the generation, compute file paths, and publish in-memory state.
-func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (WriteBackPutTimings, error) {
+func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, WriteBackPutTimings, error) {
 	var t WriteBackPutTimings
 
 	// Phase 1: acquire per-path lock (serializes same-path Put/Remove/etc.)
@@ -267,7 +270,7 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 	datStart := time.Now()
 	if err := atomicWrite(datPath, data); err != nil {
 		c.releasePathLock(remotePath, pl)
-		return t, fmt.Errorf("writeback put data: %w", err)
+		return 0, t, fmt.Errorf("writeback put data: %w", err)
 	}
 	t.DatWrite = time.Since(datStart)
 
@@ -286,14 +289,14 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
 		c.releasePathLock(remotePath, pl)
-		return t, fmt.Errorf("writeback marshal meta: %w", err)
+		return 0, t, fmt.Errorf("writeback marshal meta: %w", err)
 	}
 	metaStart := time.Now()
 	if err := atomicWrite(metaPath, metaBytes); err != nil {
 		// Best-effort cleanup of the .dat file if meta write fails.
 		_ = os.Remove(datPath)
 		c.releasePathLock(remotePath, pl)
-		return t, fmt.Errorf("writeback put meta: %w", err)
+		return 0, t, fmt.Errorf("writeback put meta: %w", err)
 	}
 	t.MetaWrite = time.Since(metaStart)
 
@@ -305,7 +308,7 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 	c.mu.Unlock()
 
 	c.releasePathLock(remotePath, pl)
-	return t, nil
+	return gen, t, nil
 }
 
 // Get reads the cached data for remotePath. Returns nil, false if not cached.
