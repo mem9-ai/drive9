@@ -3484,6 +3484,12 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	}
 	if nf.File != nil {
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(nf.File.Revision, 10))
+		// Advertise the authoritative storage class so clients (notably FUSE
+		// write-sync) can route PATCH vs full-upload on fact instead of a
+		// size-based heuristic. Older clients simply ignore the header.
+		if nf.File.StorageType != "" {
+			w.Header().Set("X-Dat9-Storage-Type", string(nf.File.StorageType))
+		}
 		if nf.File.ConfirmedAt != nil {
 			w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.File.ConfirmedAt.Unix(), 10))
 		} else {

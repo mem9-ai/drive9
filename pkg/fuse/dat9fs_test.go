@@ -16213,6 +16213,1002 @@ func TestFlushHandle_Path2_GrowthBypassesPatch(t *testing.T) {
 	}
 }
 
+// newPatchUnsupportedFakeServer returns a test server whose storage semantics
+// reject PATCH with the production "file is not S3-stored" 400 (the file is
+// db9-stored despite its size), while accepting full uploads.
+func newPatchUnsupportedFakeServer(t *testing.T, path string, patchCount *atomic.Int32, fullUpload *atomic.Bool) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPatch:
+			patchCount.Add(1)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "file is not S3-stored: " + path})
+		case http.MethodPut, http.MethodPost:
+			fullUpload.Store(true)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func newLargeDirtyHandleForPatchTest(t *testing.T, fs *Dat9FS, path string, origSize int64, writeSize int) *FileHandle {
+	t.Helper()
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    NewWriteBuffer(path, maxPreloadSize, 0),
+		BaseRev:  5,
+		OrigSize: origSize,
+	}
+	data := make([]byte, writeSize)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		t.Fatalf("seed dirty buffer: %v", err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+	return fh
+}
+
+// TestFlushHandle_Path2_PatchUnsupportedTargetFallsBackToFullUpload is the
+// scenario-B regression test: the size heuristic selects PATCH
+// (OrigSize >= threshold, size <= OrigSize) but the server stores the object
+// inline and rejects PATCH with 400. The flush must fall back to a full
+// upload (no EINVAL, dirty cleared, exactly one PATCH attempt), and the
+// committed upload re-derives the storage class from the uploaded size.
+func TestFlushHandle_Path2_PatchUnsupportedTargetFallsBackToFullUpload(t *testing.T) {
+	var patchCount atomic.Int32
+	var fullUpload atomic.Bool
+	path := "/patch-unsupported.dat"
+	ts := newPatchUnsupportedFakeServer(t, path, &patchCount, &fullUpload)
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var threshold int64 = 100
+	fs.smallFileMax.Store(threshold)
+
+	fh := newLargeDirtyHandleForPatchTest(t, fs, path, 200, 120)
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK (PATCH 400 must fall back to full upload, not EINVAL)", st)
+	}
+	if got := patchCount.Load(); got != 1 {
+		t.Fatalf("PATCH attempts = %d, want exactly 1 (no retry loop)", got)
+	}
+	if !fullUpload.Load() {
+		t.Fatal("expected full-upload fallback after PATCH 400")
+	}
+	if fh.DirtySeq != 0 {
+		t.Fatalf("DirtySeq = %d, want 0 after successful fallback upload", fh.DirtySeq)
+	}
+	// The fallback uploaded 120 bytes >= threshold, which the server stores
+	// as S3 — the committed state heals the storage class.
+	if fh.StorageClass != storageClassS3 {
+		t.Fatalf("StorageClass = %q, want %q after healing full upload", fh.StorageClass, storageClassS3)
+	}
+}
+
+// TestFlushHandle_Path2_StorageClassDB9SkipsPatch verifies that a known
+// db9 storage class routes the flush directly to a full upload even when
+// the size heuristic (OrigSize >= threshold) would select PATCH.
+func TestFlushHandle_Path2_StorageClassDB9SkipsPatch(t *testing.T) {
+	var patchCount atomic.Int32
+	var fullUpload atomic.Bool
+	path := "/patch-known-db9.dat"
+	ts := newPatchUnsupportedFakeServer(t, path, &patchCount, &fullUpload)
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var threshold int64 = 100
+	fs.smallFileMax.Store(threshold)
+
+	fh := newLargeDirtyHandleForPatchTest(t, fs, path, 200, 120)
+	fh.StorageClass = storageClassDB9
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+	if got := patchCount.Load(); got != 0 {
+		t.Fatalf("PATCH attempts = %d, want 0 (known db9 class must bypass PATCH)", got)
+	}
+	if !fullUpload.Load() {
+		t.Fatal("expected full upload for known db9 storage class")
+	}
+}
+
+// TestSyncWriteHandle_PatchUnsupportedTargetFallsBackToFullUpload covers the
+// write-sync flush path (syncWriteHandleToRemoteLocked): same scenario-B
+// setup, and the PATCH 400 must inline-fallback to a full upload within the
+// same flush.
+func TestSyncWriteHandle_PatchUnsupportedTargetFallsBackToFullUpload(t *testing.T) {
+	var patchCount atomic.Int32
+	var fullUpload atomic.Bool
+	path := "/patch-unsupported-ws.dat"
+	ts := newPatchUnsupportedFakeServer(t, path, &patchCount, &fullUpload)
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var threshold int64 = 100
+	fs.smallFileMax.Store(threshold)
+
+	fh := newLargeDirtyHandleForPatchTest(t, fs, path, 200, 120)
+
+	fh.Lock()
+	st := fs.syncWriteHandleToRemoteLocked(context.Background(), fh)
+	fh.Unlock()
+
+	if st != gofuse.OK {
+		t.Fatalf("syncWriteHandleToRemoteLocked status = %v, want OK (PATCH 400 must fall back to full upload)", st)
+	}
+	if got := patchCount.Load(); got != 1 {
+		t.Fatalf("PATCH attempts = %d, want exactly 1 (no retry loop)", got)
+	}
+	if !fullUpload.Load() {
+		t.Fatal("expected full-upload fallback after PATCH 400")
+	}
+	if fh.DirtySeq != 0 {
+		t.Fatalf("DirtySeq = %d, want 0 after successful fallback upload", fh.DirtySeq)
+	}
+}
+
+// TestPreloadWritableHandleSeedsStorageClass verifies that the stat response
+// storage-type header seeds the handle's storage class at preload time.
+func TestPreloadWritableHandleSeedsStorageClass(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && r.URL.Path == "/v1/fs/seed.txt" {
+			w.Header().Set("Content-Length", "200")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "3")
+			w.Header().Set("X-Dat9-Storage-Type", "db9")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/seed.txt", false, 200, time.Now())
+	fh := &FileHandle{
+		Ino:   ino,
+		Path:  "/seed.txt",
+		Dirty: NewWriteBuffer("/seed.txt", maxPreloadSize, 0),
+	}
+	if st := fs.preloadWritableHandle(context.Background(), fh); st != gofuse.OK {
+		t.Fatalf("preloadWritableHandle status = %v, want OK", st)
+	}
+	if fh.StorageClass != storageClassDB9 {
+		t.Fatalf("StorageClass = %q, want %q seeded from stat header", fh.StorageClass, storageClassDB9)
+	}
+	if fh.OrigSize != 200 || fh.BaseRev != 3 {
+		t.Fatalf("OrigSize/BaseRev = %d/%d, want 200/3", fh.OrigSize, fh.BaseRev)
+	}
+}
+
+// flushBothWays runs a handle flush through both full-upload entry points:
+// flushHandle (non-layer Path 2) and the write-sync path.
+func flushBothWays(t *testing.T) []struct {
+	name string
+	run  func(*Dat9FS, *FileHandle) gofuse.Status
+} {
+	t.Helper()
+	return []struct {
+		name string
+		run  func(*Dat9FS, *FileHandle) gofuse.Status
+	}{
+		{
+			name: "flushHandle",
+			run: func(fs *Dat9FS, fh *FileHandle) gofuse.Status {
+				fh.Lock()
+				defer fh.Unlock()
+				return fs.flushHandle(context.Background(), fh)
+			},
+		},
+		{
+			name: "write-sync",
+			run: func(fs *Dat9FS, fh *FileHandle) gofuse.Status {
+				fh.Lock()
+				defer fh.Unlock()
+				return fs.syncWriteHandleToRemoteLocked(context.Background(), fh)
+			},
+		},
+	}
+}
+
+// newLazyTwoPartHandle builds a handle whose dirty buffer simulates a
+// lazily loaded existing 512-byte S3 object with 256-byte parts: only the
+// modified part is loaded. origPart returns the canned original content of
+// 1-based part pn; withLoader=false leaves the buffer without a lazy
+// loader (CanMaterializeFull false and no way to refetch).
+func newLazyTwoPartHandle(t *testing.T, fs *Dat9FS, path string, withLoader bool, loadCalls *atomic.Int32) (fh *FileHandle, orig [2][]byte) {
+	t.Helper()
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	for p := range orig {
+		orig[p] = make([]byte, 256)
+		for i := range orig[p] {
+			orig[p][i] = byte(0xA0 + p*0x10 + i%16)
+		}
+	}
+
+	wb := NewWriteBuffer(path, maxPreloadSize, 256)
+	wb.remoteSize = 512
+	wb.totalSize = 512
+	if withLoader {
+		wb.LoadPart = func(partNum int) ([]byte, error) {
+			loadCalls.Add(1)
+			return append([]byte(nil), orig[partNum-1]...), nil
+		}
+	}
+
+	fh = &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    wb,
+		BaseRev:  5,
+		OrigSize: 512,
+	}
+	// Modify only the first 4 bytes (loads part 1; part 2 stays unloaded).
+	if _, err := wb.Write(0, []byte("WXYZ")); err != nil {
+		t.Fatalf("seed dirty buffer: %v", err)
+	}
+	if wb.CanMaterializeFull() {
+		t.Fatal("expected CanMaterializeFull() = false for lazy two-part buffer")
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, wb.Size())
+	_ = fs.fileHandles.Allocate(fh)
+	return fh, orig
+}
+
+// TestFlushDirectPUTLazyBufferFetchesMissingParts is the qiffang blocker
+// regression: an existing S3 object with a lazily loaded buffer is routed
+// to direct PUT after the negotiated inline threshold is raised above the
+// file size. Only one part is modified. The flush must fetch the unloaded
+// remote-backed part (never upload zero-filled ranges), and the committed
+// bytes must preserve the untouched original content.
+func TestFlushDirectPUTLazyBufferFetchesMissingParts(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			var loadCalls atomic.Int32
+			var gotBody []byte
+			var gotExpectedRev string
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/lazy-raised-threshold.dat" {
+					gotExpectedRev = r.Header.Get("X-Dat9-Expected-Revision")
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Errorf("read PUT body: %v", err)
+					}
+					gotBody = body
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{"revision": 42})
+					return
+				}
+				t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+				w.WriteHeader(http.StatusMethodNotAllowed)
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+			// Threshold raised above the file size (512 < 51200): the flush
+			// routes to direct PUT even though the object is S3-stored.
+			fs.smallFileMax.Store(51200)
+
+			path := "/lazy-raised-threshold.dat"
+			fh, orig := newLazyTwoPartHandle(t, fs, path, true, &loadCalls)
+
+			if st := tc.run(fs, fh); st != gofuse.OK {
+				t.Fatalf("flush status = %v, want OK (missing parts must be fetched, not zero-filled)", st)
+			}
+			if loadCalls.Load() == 0 {
+				t.Fatal("expected lazy loader to be called for the unloaded part")
+			}
+			if gotExpectedRev != "5" {
+				t.Fatalf("direct PUT X-Dat9-Expected-Revision = %q, want 5 (CAS must be preserved)", gotExpectedRev)
+			}
+			if int64(len(gotBody)) != 512 {
+				t.Fatalf("direct PUT body size = %d, want 512", len(gotBody))
+			}
+			want := make([]byte, 512)
+			copy(want, orig[0])
+			copy(want[256:], orig[1])
+			copy(want[:4], "WXYZ")
+			if !bytes.Equal(gotBody, want) {
+				t.Fatal("direct PUT body mismatch: untouched remote-backed range was not preserved")
+			}
+			if fh.DirtySeq != 0 {
+				t.Fatalf("DirtySeq = %d, want 0 after successful upload", fh.DirtySeq)
+			}
+		})
+	}
+}
+
+// TestFlushDirectPUTLazyBufferNoLoaderReturnsEIO covers the fail-safe half
+// of the qiffang blocker: without a lazy loader, a direct-PUT flush of a
+// buffer that cannot materialize must fail with EIO and preserve dirty
+// state, never uploading zero-filled ranges.
+func TestFlushDirectPUTLazyBufferNoLoaderReturnsEIO(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			var serverHit atomic.Bool
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				serverHit.Store(true)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			fs.smallFileMax.Store(51200)
+
+			path := "/lazy-no-loader.dat"
+			fh, _ := newLazyTwoPartHandle(t, fs, path, false, nil)
+			dirtySeqBefore := fh.DirtySeq
+
+			if st := tc.run(fs, fh); st != gofuse.EIO {
+				t.Fatalf("flush status = %v, want EIO (must not upload zero-filled ranges)", st)
+			}
+			if serverHit.Load() {
+				t.Fatal("server received an upload request — must fail before materializing")
+			}
+			if fh.DirtySeq != dirtySeqBefore {
+				t.Fatalf("DirtySeq = %d, want %d preserved after EIO", fh.DirtySeq, dirtySeqBefore)
+			}
+		})
+	}
+}
+
+// patchFallbackV2Fake is a PATCH-rejecting fake server that runs the real
+// v2 multipart protocol for the fallback full upload, recording the
+// expected_revision from the initiate request and the uploaded part bytes.
+type patchFallbackV2Fake struct {
+	t *testing.T
+
+	server       *httptest.Server
+	patchCount   atomic.Int32
+	gotExpected  atomic.Int64
+	gotUpload    atomic.Bool
+	gotBody      []byte
+	conflictMode atomic.Bool // when true, initiate responds 409
+}
+
+func newPatchFallbackV2Fake(t *testing.T, path string) *patchFallbackV2Fake {
+	t.Helper()
+	f := &patchFallbackV2Fake{t: t}
+	f.gotExpected.Store(-1)
+	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch:
+			f.patchCount.Add(1)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "file is not S3-stored: " + path})
+
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+			// Fallback full rewrite via direct PUT (size below the client's
+			// cached upload threshold): CAS travels in the header.
+			if f.conflictMode.Load() {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "revision conflict"})
+				return
+			}
+			if rev, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64); err == nil {
+				f.gotExpected.Store(rev)
+			}
+			f.gotUpload.Store(true)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read direct PUT body: %v", err)
+			}
+			f.gotBody = body
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 42})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			if f.conflictMode.Load() {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "revision conflict"})
+				return
+			}
+			var req struct {
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode initiate: %v", err)
+			}
+			if req.ExpectedRevision != nil {
+				f.gotExpected.Store(*req.ExpectedRevision)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "upload-1",
+				"key":         "object-key",
+				"part_size":   int64(s3client.PartSize),
+				"total_parts": 1,
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/upload-1/presign-batch":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{
+					{"number": 1, "url": f.server.URL + "/s3/upload-1/1", "size": 120},
+				},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/s3/upload-1/1":
+			f.gotUpload.Store(true)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read part body: %v", err)
+			}
+			f.gotBody = body
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/upload-1/complete":
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(f.server.Close)
+	return f
+}
+
+// TestFlushPatchFallbackCarriesExpectedRevision is the qiffang #199 CAS
+// regression: after PATCH is rejected with "file is not S3-stored", the
+// fallback full rewrite must remain revision-conditional (expected_revision
+// carries the handle BaseRev) and must upload the complete buffer content.
+func TestFlushPatchFallbackCarriesExpectedRevision(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			path := "/fallback-cas.dat"
+			fake := newPatchFallbackV2Fake(t, path)
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(fake.server.URL), opts)
+			fs.smallFileMax.Store(100)
+
+			fh := newLargeDirtyHandleForPatchTest(t, fs, path, 200, 120)
+
+			if st := tc.run(fs, fh); st != gofuse.OK {
+				t.Fatalf("flush status = %v, want OK (fallback full upload)", st)
+			}
+			if got := fake.patchCount.Load(); got != 1 {
+				t.Fatalf("PATCH attempts = %d, want exactly 1", got)
+			}
+			if got := fake.gotExpected.Load(); got != 5 {
+				t.Fatalf("fallback initiate expected_revision = %d, want 5 (BaseRev CAS)", got)
+			}
+			if !fake.gotUpload.Load() {
+				t.Fatal("expected fallback part upload")
+			}
+			if int64(len(fake.gotBody)) != 120 {
+				t.Fatalf("fallback uploaded %d bytes, want 120", len(fake.gotBody))
+			}
+			if fh.DirtySeq != 0 {
+				t.Fatalf("DirtySeq = %d, want 0 after successful fallback", fh.DirtySeq)
+			}
+		})
+	}
+}
+
+// TestFlushPatchFallbackConflictPreservesDirty is the qiffang #199
+// conflict regression: when the fallback full rewrite loses the CAS race
+// (409 revision conflict), the flush must fail without clearing dirty
+// state, while the observed storage class still heals future routing away
+// from PATCH.
+func TestFlushPatchFallbackConflictPreservesDirty(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			path := "/fallback-conflict.dat"
+			fake := newPatchFallbackV2Fake(t, path)
+			fake.conflictMode.Store(true)
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(fake.server.URL), opts)
+			fs.smallFileMax.Store(100)
+
+			fh := newLargeDirtyHandleForPatchTest(t, fs, path, 200, 120)
+			dirtySeqBefore := fh.DirtySeq
+
+			if st := tc.run(fs, fh); st == gofuse.OK {
+				t.Fatal("flush status = OK, want error on 409 revision conflict")
+			}
+			if got := fake.patchCount.Load(); got != 1 {
+				t.Fatalf("PATCH attempts = %d, want exactly 1", got)
+			}
+			if fake.gotUpload.Load() {
+				t.Fatal("part upload attempted despite initiate conflict")
+			}
+			if fh.DirtySeq != dirtySeqBefore {
+				t.Fatalf("DirtySeq = %d, want %d preserved after conflict", fh.DirtySeq, dirtySeqBefore)
+			}
+			if fh.StorageClass != storageClassDB9 {
+				t.Fatalf("StorageClass = %q, want %q (routing must heal away from PATCH)", fh.StorageClass, storageClassDB9)
+			}
+		})
+	}
+}
+
+// TestFlushPatchFallbackLazyBufferFailsWithoutUpload is the qiffang #199
+// non-materialization regression: after a rejected PATCH, a lazy buffer
+// that cannot materialize the full file must fail with EIO — never issue a
+// full upload with zero-filled ranges, never clear dirty state — while the
+// observed storage class still heals future routing away from PATCH.
+func TestFlushPatchFallbackLazyBufferFailsWithoutUpload(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			var patchCount atomic.Int32
+			var uploadHit atomic.Bool
+
+			path := "/fallback-lazy.dat"
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodPatch:
+					patchCount.Add(1)
+					_, _ = io.ReadAll(r.Body)
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "file is not S3-stored: " + path})
+				default:
+					uploadHit.Store(true)
+					w.WriteHeader(http.StatusOK)
+				}
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			fs.smallFileMax.Store(100)
+
+			fh, _ := newLazyTwoPartHandle(t, fs, path, false, nil)
+			dirtySeqBefore := fh.DirtySeq
+
+			if st := tc.run(fs, fh); st != gofuse.EIO {
+				t.Fatalf("flush status = %v, want EIO (must not upload zero-filled ranges)", st)
+			}
+			if got := patchCount.Load(); got != 1 {
+				t.Fatalf("PATCH attempts = %d, want exactly 1", got)
+			}
+			if uploadHit.Load() {
+				t.Fatal("full upload attempted for non-materializable buffer — must fail instead")
+			}
+			if fh.DirtySeq != dirtySeqBefore {
+				t.Fatalf("DirtySeq = %d, want %d preserved after EIO", fh.DirtySeq, dirtySeqBefore)
+			}
+			if fh.StorageClass != storageClassDB9 {
+				t.Fatalf("StorageClass = %q, want %q (routing must heal away from PATCH)", fh.StorageClass, storageClassDB9)
+			}
+		})
+	}
+}
+
+// TestFlushPatchFallbackLazyBufferFetchesAndRecovers covers the recoverable
+// half of the lazy-buffer fallback gate (qiffang P1): with a lazy loader
+// available, a rejected PATCH must fetch the untouched remote-backed part
+// and complete the revision-conditional full upload — not return EIO.
+func TestFlushPatchFallbackLazyBufferFetchesAndRecovers(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			var patchCount atomic.Int32
+			var loadCalls atomic.Int32
+			var gotBody []byte
+			var gotExpectedRev string
+
+			path := "/fallback-lazy-recover.dat"
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodPatch:
+					patchCount.Add(1)
+					_, _ = io.ReadAll(r.Body)
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "file is not S3-stored: " + path})
+				case http.MethodPut:
+					gotExpectedRev = r.Header.Get("X-Dat9-Expected-Revision")
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Errorf("read PUT body: %v", err)
+					}
+					gotBody = body
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{"revision": 42})
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+					w.WriteHeader(http.StatusMethodNotAllowed)
+				}
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			fs.smallFileMax.Store(100)
+
+			fh, orig := newLazyTwoPartHandle(t, fs, path, true, &loadCalls)
+
+			if st := tc.run(fs, fh); st != gofuse.OK {
+				t.Fatalf("flush status = %v, want OK (loader makes the lazy fallback recoverable)", st)
+			}
+			if got := patchCount.Load(); got != 1 {
+				t.Fatalf("PATCH attempts = %d, want exactly 1", got)
+			}
+			if loadCalls.Load() == 0 {
+				t.Fatal("expected lazy loader to fetch the untouched part during fallback")
+			}
+			if gotExpectedRev != "5" {
+				t.Fatalf("fallback X-Dat9-Expected-Revision = %q, want 5 (BaseRev CAS)", gotExpectedRev)
+			}
+			want := make([]byte, 512)
+			copy(want, orig[0])
+			copy(want[256:], orig[1])
+			copy(want[:4], "WXYZ")
+			if !bytes.Equal(gotBody, want) {
+				t.Fatal("fallback body mismatch: untouched remote-backed range was not preserved")
+			}
+			if fh.DirtySeq != 0 {
+				t.Fatalf("DirtySeq = %d, want 0 after successful fallback", fh.DirtySeq)
+			}
+		})
+	}
+}
+
+// TestFlushGrowthLazyBufferFetchesMissingParts covers the write-sync stream
+// branch fetch gap (qiffang P1): a lazily loaded existing file that grows
+// beyond OrigSize must fetch unloaded remote-backed parts and complete the
+// full upload on both flush paths, instead of returning EIO.
+func TestFlushGrowthLazyBufferFetchesMissingParts(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			var loadCalls atomic.Int32
+			var gotBody []byte
+			var gotExpectedRev string
+
+			path := "/growth-lazy-fetch.dat"
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut {
+					gotExpectedRev = r.Header.Get("X-Dat9-Expected-Revision")
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Errorf("read PUT body: %v", err)
+					}
+					gotBody = body
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{"revision": 42})
+					return
+				}
+				t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+				w.WriteHeader(http.StatusMethodNotAllowed)
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			fs.smallFileMax.Store(100)
+
+			fh, orig := newLazyTwoPartHandle(t, fs, path, true, &loadCalls)
+			// Grow beyond OrigSize: append 88 bytes at the end (size 512->600).
+			appendData := make([]byte, 88)
+			for i := range appendData {
+				appendData[i] = byte(i + 1)
+			}
+			if _, err := fh.Dirty.Write(512, appendData); err != nil {
+				t.Fatalf("append: %v", err)
+			}
+			fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+
+			if st := tc.run(fs, fh); st != gofuse.OK {
+				t.Fatalf("flush status = %v, want OK (growth with loader must fetch, not EIO)", st)
+			}
+			if loadCalls.Load() == 0 {
+				t.Fatal("expected lazy loader to fetch the untouched part before growth upload")
+			}
+			if gotExpectedRev != "5" {
+				t.Fatalf("upload X-Dat9-Expected-Revision = %q, want 5 (BaseRev CAS)", gotExpectedRev)
+			}
+			want := make([]byte, 600)
+			copy(want, orig[0])
+			copy(want[256:], orig[1])
+			copy(want[:4], "WXYZ")
+			copy(want[512:], appendData)
+			if !bytes.Equal(gotBody, want) {
+				t.Fatal("growth upload body mismatch: untouched remote-backed range not preserved")
+			}
+			if fh.DirtySeq != 0 {
+				t.Fatalf("DirtySeq = %d, want 0 after successful upload", fh.DirtySeq)
+			}
+		})
+	}
+}
+
+// TestFlushPatchFallbackLazyFetchNewerRevisionConflicts is the discriminating
+// cross-revision regression for the splice gate: the lazy loader reads the
+// retained range from the LATEST remote (revision N) while the dirty handle
+// still uploads with expected revision M<N. The CAS must reject the upload
+// with 409, dirty state must be preserved, and remote N must not be
+// overwritten — no splice of newer fetched bytes into an older base.
+func TestFlushPatchFallbackLazyFetchNewerRevisionConflicts(t *testing.T) {
+	for _, tc := range flushBothWays(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			var patchCount atomic.Int32
+			var loadCalls atomic.Int32
+			var gotExpectedRev string
+			var commitAccepted atomic.Bool
+
+			path := "/fallback-splice.dat"
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodPatch:
+					patchCount.Add(1)
+					_, _ = io.ReadAll(r.Body)
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "file is not S3-stored: " + path})
+				case http.MethodPut:
+					// The remote has advanced to revision 9 since the handle
+					// opened at revision 5: any write conditioned on 5 must
+					// lose the CAS race. Never accept the commit.
+					gotExpectedRev = r.Header.Get("X-Dat9-Expected-Revision")
+					_, _ = io.ReadAll(r.Body)
+					w.WriteHeader(http.StatusConflict)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "revision conflict"})
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+					w.WriteHeader(http.StatusMethodNotAllowed)
+				}
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			fs.smallFileMax.Store(100)
+
+			// The loader serves the latest (revision-9) remote bytes; the
+			// handle's BaseRev stays at 5.
+			fh, _ := newLazyTwoPartHandle(t, fs, path, true, &loadCalls)
+			dirtySeqBefore := fh.DirtySeq
+
+			if st := tc.run(fs, fh); st == gofuse.OK {
+				t.Fatal("flush status = OK, want CAS rejection (409) — fetched newer bytes must not splice into the older base")
+			}
+			if commitAccepted.Load() {
+				t.Fatal("remote accepted a commit — remote revision N must not be overwritten")
+			}
+			if loadCalls.Load() == 0 {
+				t.Fatal("expected the lazy loader to fetch the retained range from latest remote")
+			}
+			if gotExpectedRev != "5" {
+				t.Fatalf("upload X-Dat9-Expected-Revision = %q, want 5 (handle still uploads with base revision M)", gotExpectedRev)
+			}
+			if got := patchCount.Load(); got != 1 {
+				t.Fatalf("PATCH attempts = %d, want exactly 1", got)
+			}
+			if fh.DirtySeq != dirtySeqBefore {
+				t.Fatalf("DirtySeq = %d, want %d preserved after CAS rejection", fh.DirtySeq, dirtySeqBefore)
+			}
+			if fh.StorageClass != storageClassDB9 {
+				t.Fatalf("StorageClass = %q, want %q (routing must heal away from PATCH)", fh.StorageClass, storageClassDB9)
+			}
+		})
+	}
+}
+
+// TestFlushHandleDebouncedLazyBufferFetchesMissingParts covers the debounced
+// upload entry point (qiffang adversary-1 update): a lazy multi-part
+// existing file below the inline threshold must fetch the untouched part
+// before the deferred snapshot, so the debounced callback uploads the
+// complete original content instead of zero-filled ranges.
+func TestFlushHandleDebouncedLazyBufferFetchesMissingParts(t *testing.T) {
+	var loadCalls atomic.Int32
+	var gotBody []byte
+	var gotExpectedRev string
+
+	path := "/debounced-lazy.dat"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			gotExpectedRev = r.Header.Get("X-Dat9-Expected-Revision")
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read PUT body: %v", err)
+			}
+			gotBody = body
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 42})
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	// Small-file debounce route: size (512) < inlineThreshold (50KB default).
+	fs.debouncer = newFlushDebouncer(50 * time.Millisecond)
+
+	fh, orig := newLazyTwoPartHandle(t, fs, path, true, &loadCalls)
+
+	fh.Lock()
+	st := fs.flushHandleDebounced(context.Background(), fh, false)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandleDebounced status = %v, want OK (schedule)", st)
+	}
+	fs.debouncer.FlushAll()
+
+	if loadCalls.Load() == 0 {
+		t.Fatal("expected lazy loader to fetch the untouched part before snapshot")
+	}
+	if gotExpectedRev != "5" {
+		t.Fatalf("debounced PUT X-Dat9-Expected-Revision = %q, want 5 (BaseRev CAS)", gotExpectedRev)
+	}
+	want := make([]byte, 512)
+	copy(want, orig[0])
+	copy(want[256:], orig[1])
+	copy(want[:4], "WXYZ")
+	if !bytes.Equal(gotBody, want) {
+		t.Fatal("debounced upload body mismatch: untouched remote-backed range was zero-filled")
+	}
+	if fh.Dirty.HasDirtyParts() {
+		t.Fatal("dirty parts remain after successful debounced upload")
+	}
+}
+
+// TestFlushHandleDebouncedLazyBufferNoLoaderReturnsEIO covers the fail-safe
+// half for the debounced path: without a lazy loader, the debounce decision
+// must fail EIO synchronously without scheduling an upload and without
+// clearing dirty state.
+func TestFlushHandleDebouncedLazyBufferNoLoaderReturnsEIO(t *testing.T) {
+	var serverHit atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.debouncer = newFlushDebouncer(50 * time.Millisecond)
+
+	path := "/debounced-lazy-no-loader.dat"
+	fh, _ := newLazyTwoPartHandle(t, fs, path, false, nil)
+	dirtySeqBefore := fh.DirtySeq
+
+	fh.Lock()
+	st := fs.flushHandleDebounced(context.Background(), fh, false)
+	fh.Unlock()
+	if st != gofuse.EIO {
+		t.Fatalf("flushHandleDebounced status = %v, want EIO (must not snapshot zero-filled ranges)", st)
+	}
+	fs.debouncer.FlushAll()
+	if serverHit.Load() {
+		t.Fatal("server received an upload request — must fail before scheduling")
+	}
+	if fh.DirtySeq != dirtySeqBefore {
+		t.Fatalf("DirtySeq = %d, want %d preserved after EIO", fh.DirtySeq, dirtySeqBefore)
+	}
+}
+
+// TestFlushHandleDebouncedLazyFetchNewerRevisionSkipsUpload is the
+// discriminating cross-revision regression for the debounced path (qiffang
+// adversary-1): the CAS base must be frozen BEFORE the lazy fetch. A
+// sibling commit (recorded during the fetch) must make the deferred
+// callback skip the upload — never PUT with the newer revision over this
+// handle's older dirty bytes, and never clear dirty state.
+func TestFlushHandleDebouncedLazyFetchNewerRevisionSkipsUpload(t *testing.T) {
+	var serverHit atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.debouncer = newFlushDebouncer(50 * time.Millisecond)
+
+	path := "/debounced-splice.dat"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	orig := make([][]byte, 2)
+	for p := range orig {
+		orig[p] = make([]byte, 256)
+		for i := range orig[p] {
+			orig[p][i] = byte(0xA0 + p*0x10 + i%16)
+		}
+	}
+
+	wb := NewWriteBuffer(path, maxPreloadSize, 256)
+	wb.remoteSize = 512
+	wb.totalSize = 512
+	// The loader observes the latest remote AND records the sibling's rev-9
+	// commit mid-fetch — the ordering hazard this test pins. Only the flush
+	// fetches part 2; part 1 loads during the seeding Write below, so the
+	// commit must be recorded exactly when part 2 is requested.
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		if partNum == 2 {
+			fs.recordCommittedRevision(path, 9)
+		}
+		return append([]byte(nil), orig[partNum-1]...), nil
+	}
+
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    wb,
+		BaseRev:  5,
+		OrigSize: 512,
+	}
+	if _, err := wb.Write(0, []byte("WXYZ")); err != nil {
+		t.Fatalf("seed dirty buffer: %v", err)
+	}
+	if wb.CanMaterializeFull() {
+		t.Fatal("expected CanMaterializeFull() = false for lazy two-part buffer")
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, wb.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	fh.Lock()
+	st := fs.flushHandleDebounced(context.Background(), fh, false)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandleDebounced status = %v, want OK (schedule)", st)
+	}
+	fs.debouncer.FlushAll()
+
+	if serverHit.Load() {
+		t.Fatal("debounced callback uploaded — sibling commit during fetch must skip the PUT (splice)")
+	}
+	if !fh.Dirty.HasDirtyParts() {
+		t.Fatal("dirty state cleared — must be preserved when the callback skips")
+	}
+}
+
 // TestFlushHandle_Path2_SyntheticRevRecordedBeforeUnlock verifies that when
 // a Path 2 flush succeeds without the server returning a committed revision
 // (e.g. PatchFile / WriteStreamConditional), the synthetic revision

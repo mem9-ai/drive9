@@ -493,6 +493,39 @@ func TestStat(t *testing.T) {
 	if resp.Header.Get("X-Dat9-IsDir") != "false" {
 		t.Errorf("expected X-Dat9-IsDir false, got %s", resp.Header.Get("X-Dat9-IsDir"))
 	}
+	if got := resp.Header.Get("X-Dat9-Storage-Type"); got != "db9" {
+		t.Errorf("expected X-Dat9-Storage-Type db9 for small inline file, got %q", got)
+	}
+}
+
+func TestStatStorageTypeHeader(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Directory stat must not carry a storage type.
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/dir?mkdir", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir: %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/dir", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stat dir: %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Dat9-Storage-Type"); got != "" {
+		t.Errorf("expected no X-Dat9-Storage-Type for directory, got %q", got)
+	}
 }
 
 func TestBatchStatReturnsPerPathResults(t *testing.T) {
