@@ -519,3 +519,64 @@ func TestAppendStreamRejectsOverlappingAppendPartWithoutReadURL(t *testing.T) {
 		t.Fatal("complete endpoint should not be called")
 	}
 }
+
+func TestIsUnsupportedStorageTargetErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"not s3 stored", &StatusError{StatusCode: http.StatusBadRequest, Message: "file is not S3-stored: /a.bin"}, true},
+		{"s3 not configured", &StatusError{StatusCode: http.StatusBadRequest, Message: "S3 not configured"}, true},
+		{"wrong status", &StatusError{StatusCode: http.StatusNotFound, Message: "file is not S3-stored: /a.bin"}, false},
+		{"unrelated 400", &StatusError{StatusCode: http.StatusBadRequest, Message: "bad request"}, false},
+		{"non status error", io.EOF, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsUnsupportedStorageTargetErr(tc.err); got != tc.want {
+				t.Fatalf("IsUnsupportedStorageTargetErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStatParsesStorageType(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/s3.bin":
+			w.Header().Set("Content-Length", "200")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.Header().Set("X-Dat9-Storage-Type", "s3")
+			w.WriteHeader(http.StatusOK)
+		case "/v1/fs/legacy.txt":
+			// Older server: no storage-type header.
+			w.Header().Set("Content-Length", "5")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "3")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	s, err := c.StatCtx(context.Background(), "/s3.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.StorageType != "s3" {
+		t.Fatalf("StorageType = %q, want s3", s.StorageType)
+	}
+
+	s, err = c.StatCtx(context.Background(), "/legacy.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.StorageType != "" {
+		t.Fatalf("StorageType = %q, want empty for legacy server", s.StorageType)
+	}
+}

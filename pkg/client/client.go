@@ -206,6 +206,11 @@ type StatResult struct {
 	HasMode    bool // true when the server returned a mode header (including 0)
 	ResourceID string
 	Nlink      uint32
+	// StorageType is the server-authoritative storage class ("db9" or "s3")
+	// from the X-Dat9-Storage-Type header. Empty when the server predates the
+	// header; callers must treat empty as "unknown" and fall back to local
+	// heuristics.
+	StorageType string
 }
 
 // MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
@@ -905,6 +910,7 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 		}
 	}
 	s.ResourceID = resp.Header.Get("X-Dat9-Resource-ID")
+	s.StorageType = resp.Header.Get("X-Dat9-Storage-Type")
 	if nlink := resp.Header.Get("X-Dat9-Nlink"); nlink != "" {
 		if n, err := strconv.ParseUint(nlink, 10, 32); err == nil {
 			s.Nlink = uint32(n)

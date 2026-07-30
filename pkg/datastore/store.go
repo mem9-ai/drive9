@@ -1799,12 +1799,13 @@ func (s *Store) StatPathFallbackLite(ctx context.Context, primaryPath, fallbackP
 	defer observeStoreOp(ctx, "stat_path_fallback_lite", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
+		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at, c.storage_type
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
+		LEFT JOIN contents c ON `+s.scope.AndOn(`i.inode_id = c.inode_id`, "c")+`
 		WHERE `+s.andAsGrouped("fn", `(fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)`)+`
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
-		LIMIT 1`, scopeWhereArgs(s.scope, 1, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)...)
+		LIMIT 1`, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)...)
 	out, err = scanNodeWithFileLite(row)
 	return out, err
 }
@@ -1815,11 +1816,12 @@ func (s *Store) StatLite(ctx context.Context, path string) (out *NodeWithFile, e
 	defer observeStoreOp(ctx, "stat_lite", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
+		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at, c.storage_type
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
+		LEFT JOIN contents c ON `+s.scope.AndOn(`i.inode_id = c.inode_id`, "c")+`
 		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
-		LIMIT 1`, scopeWhereArgs(s.scope, 1, s.scope.Args(fileNodePathHash(path), path)...)...)
+		LIMIT 1`, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(path), path)...)...)
 	out, err = scanNodeWithFileLite(row)
 	return out, err
 }
@@ -2923,9 +2925,10 @@ func scanNodeWithFileLite(s scanner) (*NodeWithFile, error) {
 	var fMode sql.NullInt64
 	var fStatus sql.NullString
 	var fCreatedAt, fConfirmedAt sql.NullTime
+	var fStorageType sql.NullString
 
 	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
-		&fFileID, &fSizeBytes, &fRevision, &fMode, &fStatus, &fCreatedAt, &fConfirmedAt)
+		&fFileID, &fSizeBytes, &fRevision, &fMode, &fStatus, &fCreatedAt, &fConfirmedAt, &fStorageType)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -2940,11 +2943,12 @@ func scanNodeWithFileLite(s scanner) (*NodeWithFile, error) {
 	nf := &NodeWithFile{Node: n}
 	if fFileID.Valid {
 		nf.File = &File{
-			FileID:    fFileID.String,
-			SizeBytes: fSizeBytes.Int64,
-			Revision:  fRevision.Int64,
-			Mode:      uint32(fMode.Int64),
-			Status:    FileStatus(fStatus.String),
+			FileID:      fFileID.String,
+			SizeBytes:   fSizeBytes.Int64,
+			Revision:    fRevision.Int64,
+			Mode:        uint32(fMode.Int64),
+			Status:      FileStatus(fStatus.String),
+			StorageType: StorageType(fStorageType.String),
 		}
 		if fCreatedAt.Valid {
 			nf.File.CreatedAt = fCreatedAt.Time.UTC()

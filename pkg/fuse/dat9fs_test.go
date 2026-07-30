@@ -16213,6 +16213,205 @@ func TestFlushHandle_Path2_GrowthBypassesPatch(t *testing.T) {
 	}
 }
 
+// newPatchUnsupportedFakeServer returns a test server whose storage semantics
+// reject PATCH with the production "file is not S3-stored" 400 (the file is
+// db9-stored despite its size), while accepting full uploads.
+func newPatchUnsupportedFakeServer(t *testing.T, path string, patchCount *atomic.Int32, fullUpload *atomic.Bool) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPatch:
+			patchCount.Add(1)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "file is not S3-stored: " + path})
+		case http.MethodPut, http.MethodPost:
+			fullUpload.Store(true)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func newLargeDirtyHandleForPatchTest(fs *Dat9FS, path string, origSize int64, writeSize int) *FileHandle {
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    NewWriteBuffer(path, maxPreloadSize, 0),
+		BaseRev:  5,
+		OrigSize: origSize,
+	}
+	data := make([]byte, writeSize)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		panic(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+	return fh
+}
+
+// TestFlushHandle_Path2_PatchUnsupportedTargetFallsBackToFullUpload is the
+// scenario-B regression test: the size heuristic selects PATCH
+// (OrigSize >= threshold, size <= OrigSize) but the server stores the object
+// inline and rejects PATCH with 400. The flush must fall back to a full
+// upload (no EINVAL, dirty cleared, exactly one PATCH attempt), and the
+// committed upload re-derives the storage class from the uploaded size.
+func TestFlushHandle_Path2_PatchUnsupportedTargetFallsBackToFullUpload(t *testing.T) {
+	var patchCount atomic.Int32
+	var fullUpload atomic.Bool
+	path := "/patch-unsupported.dat"
+	ts := newPatchUnsupportedFakeServer(t, path, &patchCount, &fullUpload)
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var threshold int64 = 100
+	fs.smallFileMax.Store(threshold)
+
+	fh := newLargeDirtyHandleForPatchTest(fs, path, 200, 120)
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK (PATCH 400 must fall back to full upload, not EINVAL)", st)
+	}
+	if got := patchCount.Load(); got != 1 {
+		t.Fatalf("PATCH attempts = %d, want exactly 1 (no retry loop)", got)
+	}
+	if !fullUpload.Load() {
+		t.Fatal("expected full-upload fallback after PATCH 400")
+	}
+	if fh.DirtySeq != 0 {
+		t.Fatalf("DirtySeq = %d, want 0 after successful fallback upload", fh.DirtySeq)
+	}
+	// The fallback uploaded 120 bytes >= threshold, which the server stores
+	// as S3 — the committed state heals the storage class.
+	if fh.StorageClass != storageClassS3 {
+		t.Fatalf("StorageClass = %q, want %q after healing full upload", fh.StorageClass, storageClassS3)
+	}
+}
+
+// TestFlushHandle_Path2_StorageClassDB9SkipsPatch verifies that a known
+// db9 storage class routes the flush directly to a full upload even when
+// the size heuristic (OrigSize >= threshold) would select PATCH.
+func TestFlushHandle_Path2_StorageClassDB9SkipsPatch(t *testing.T) {
+	var patchCount atomic.Int32
+	var fullUpload atomic.Bool
+	path := "/patch-known-db9.dat"
+	ts := newPatchUnsupportedFakeServer(t, path, &patchCount, &fullUpload)
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var threshold int64 = 100
+	fs.smallFileMax.Store(threshold)
+
+	fh := newLargeDirtyHandleForPatchTest(fs, path, 200, 120)
+	fh.StorageClass = storageClassDB9
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+	if got := patchCount.Load(); got != 0 {
+		t.Fatalf("PATCH attempts = %d, want 0 (known db9 class must bypass PATCH)", got)
+	}
+	if !fullUpload.Load() {
+		t.Fatal("expected full upload for known db9 storage class")
+	}
+}
+
+// TestSyncWriteHandle_PatchUnsupportedTargetFallsBackToFullUpload covers the
+// write-sync flush path (syncWriteHandleToRemoteLocked): same scenario-B
+// setup, and the PATCH 400 must inline-fallback to a full upload within the
+// same flush.
+func TestSyncWriteHandle_PatchUnsupportedTargetFallsBackToFullUpload(t *testing.T) {
+	var patchCount atomic.Int32
+	var fullUpload atomic.Bool
+	path := "/patch-unsupported-ws.dat"
+	ts := newPatchUnsupportedFakeServer(t, path, &patchCount, &fullUpload)
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var threshold int64 = 100
+	fs.smallFileMax.Store(threshold)
+
+	fh := newLargeDirtyHandleForPatchTest(fs, path, 200, 120)
+
+	fh.Lock()
+	st := fs.syncWriteHandleToRemoteLocked(context.Background(), fh)
+	fh.Unlock()
+
+	if st != gofuse.OK {
+		t.Fatalf("syncWriteHandleToRemoteLocked status = %v, want OK (PATCH 400 must fall back to full upload)", st)
+	}
+	if got := patchCount.Load(); got != 1 {
+		t.Fatalf("PATCH attempts = %d, want exactly 1 (no retry loop)", got)
+	}
+	if !fullUpload.Load() {
+		t.Fatal("expected full-upload fallback after PATCH 400")
+	}
+	if fh.DirtySeq != 0 {
+		t.Fatalf("DirtySeq = %d, want 0 after successful fallback upload", fh.DirtySeq)
+	}
+}
+
+// TestPreloadWritableHandleSeedsStorageClass verifies that the stat response
+// storage-type header seeds the handle's storage class at preload time.
+func TestPreloadWritableHandleSeedsStorageClass(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && r.URL.Path == "/v1/fs/seed.txt" {
+			w.Header().Set("Content-Length", "200")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "3")
+			w.Header().Set("X-Dat9-Storage-Type", "db9")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/seed.txt", false, 200, time.Now())
+	fh := &FileHandle{
+		Ino:   ino,
+		Path:  "/seed.txt",
+		Dirty: NewWriteBuffer("/seed.txt", maxPreloadSize, 0),
+	}
+	if st := fs.preloadWritableHandle(context.Background(), fh); st != gofuse.OK {
+		t.Fatalf("preloadWritableHandle status = %v, want OK", st)
+	}
+	if fh.StorageClass != storageClassDB9 {
+		t.Fatalf("StorageClass = %q, want %q seeded from stat header", fh.StorageClass, storageClassDB9)
+	}
+	if fh.OrigSize != 200 || fh.BaseRev != 3 {
+		t.Fatalf("OrigSize/BaseRev = %d/%d, want 200/3", fh.OrigSize, fh.BaseRev)
+	}
+}
+
 // TestFlushHandle_Path2_SyntheticRevRecordedBeforeUnlock verifies that when
 // a Path 2 flush succeeds without the server returning a committed revision
 // (e.g. PatchFile / WriteStreamConditional), the synthetic revision

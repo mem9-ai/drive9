@@ -289,8 +289,11 @@ func TestStatLite(t *testing.T) {
 	if nf.File.Description != "" {
 		t.Fatalf("Description should be empty in lite path, got %q", nf.File.Description)
 	}
-	if nf.File.StorageType != "" {
-		t.Fatalf("StorageType should be empty in lite path, got %q", nf.File.StorageType)
+	// StorageType IS fetched by the lite path: the server's HEAD handler
+	// advertises it as X-Dat9-Storage-Type so clients can route partial
+	// updates on fact instead of a size heuristic.
+	if nf.File.StorageType != StorageDB9 {
+		t.Fatalf("StorageType = %q, want %q", nf.File.StorageType, StorageDB9)
 	}
 }
 
