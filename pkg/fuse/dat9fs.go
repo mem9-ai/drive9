@@ -7978,6 +7978,13 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 		ctx, cf := fuseCtx(cancel)
 		defer cf()
+		// Mark open handles BEFORE writing the whiteout so a flush/write on
+		// an anonymous git fd after unlink cannot upsert the overlay entry
+		// back over the whiteout — the same open-unlink invariant the
+		// remote-DELETE path enforces via markOpenHandlesUnlinked. The git
+		// unlink keeps its existing bookkeeping (no RemoveLinkPreserve;
+		// putGitWhiteout removes the inode entry as before).
+		fs.markOpenHandlesUnlinked(ctx, childP, false)
 		st := fs.putGitWhiteout(ctx, childP)
 		if st != gofuse.OK {
 			return st

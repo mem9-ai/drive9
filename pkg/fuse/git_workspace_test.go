@@ -3980,3 +3980,132 @@ func TestEnsureGitWorkspacesRecordsRefreshPerfCounters(t *testing.T) {
 		t.Fatalf("git_workspace_forced_refresh after force = %d, want 1", got)
 	}
 }
+
+// TestGitWorkspaceWriteSyncWriteAfterUnlinkDoesNotResurrectOverlay covers the
+// git quadrant of the open-unlink invariant: a write-sync git handle unlinked
+// while open must accept further writes on the anonymous fd, but neither the
+// write nor Flush/Release may upsert the overlay entry back over the whiteout.
+func TestGitWorkspaceWriteSyncWriteAfterUnlinkDoesNotResurrectOverlay(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	v1 := []byte("git-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1 status = %v, want OK", st)
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	fixture.mu.Unlock()
+	if !ok || entry.Op != "upsert" {
+		t.Fatalf("overlay entry after v1 write = %+v, %v — want upsert", entry, ok)
+	}
+
+	// Unlink while the write-sync git fd stays open: overlay becomes a
+	// whiteout, and the handle must be marked unlinked.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	fixture.mu.Lock()
+	entry, ok = fixture.overlay["sync.txt"]
+	putsAfterWhiteout := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if !ok || entry.Op != "whiteout" {
+		t.Fatalf("overlay entry after unlink = %+v, %v — want whiteout", entry, ok)
+	}
+	if fh, ok := fs.fileHandles.Get(createOut.Fh); !ok {
+		t.Fatal("handle missing")
+	} else {
+		fh.Lock()
+		unlinked := fh.Unlinked
+		fh.Unlock()
+		if !unlinked {
+			t.Fatal("git handle not marked unlinked by gitEntry unlink path")
+		}
+	}
+
+	// Write-after-unlink must succeed (anonymous fd) but NOT upsert.
+	v2 := []byte("git-v2-must-stay-local")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write after unlink status = %v, want OK", st)
+	}
+	// Anonymous-fd semantics: the post-unlink write stays readable from the
+	// fd's own backing (LocalFile for checked-out git handles, otherwise the
+	// Dirty buffer).
+	if fh, ok := fs.fileHandles.Get(createOut.Fh); ok {
+		fh.Lock()
+		localName := ""
+		if fh.LocalFile != nil {
+			localName = fh.LocalFile.Name()
+		}
+		dirty := fh.Dirty
+		fh.Unlock()
+		if localName != "" {
+			// The whiteout removed the dirty-mirror NAME, but the open
+			// *os.File keeps the inode alive — read via the fd itself.
+			fh.Lock()
+			buf := make([]byte, len(v2))
+			n, err := fh.LocalFile.ReadAt(buf, 0)
+			fh.Unlock()
+			if err != nil && n == 0 {
+				t.Fatalf("read unlinked git LocalFile fd: %v", err)
+			}
+			if string(buf[:n]) != string(v2) {
+				t.Fatalf("LocalFile fd content = %q, want %q", buf[:n], v2)
+			}
+		} else {
+			if dirty == nil {
+				t.Fatal("no readable backing on unlinked git handle")
+			}
+			buf := make([]byte, len(v2))
+			n := dirty.ReadAt(0, buf)
+			if n != len(v2) || string(buf) != string(v2) {
+				t.Fatalf("Dirty buffer content = %q (n=%d), want %q", buf[:n], n, v2)
+			}
+		}
+	} else {
+		t.Fatal("handle missing before close")
+	}
+
+	// Flush and Release must not upsert either.
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush after unlink status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	fixture.mu.Lock()
+	entry, ok = fixture.overlay["sync.txt"]
+	putsFinal := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if putsFinal != putsAfterWhiteout {
+		t.Fatalf("overlay puts after whiteout = %d, after write/flush/release = %d — unlinked git handle resurrected the entry", putsAfterWhiteout, putsFinal)
+	}
+	if !ok || entry.Op != "whiteout" {
+		t.Fatalf("overlay entry after write-after-unlink = %+v, %v — want whiteout preserved", entry, ok)
+	}
+}

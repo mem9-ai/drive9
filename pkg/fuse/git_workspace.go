@@ -3766,6 +3766,16 @@ func (fs *Dat9FS) flushGitLocalFileHandleLockedWithPolicy(ctx context.Context, f
 	if fh == nil || fh.Layer != PathLayerGitWorkspace || fh.LocalFile == nil {
 		return gofuse.OK
 	}
+	if fh.Unlinked {
+		// Open-unlink: the gitEntry unlink path marked this handle when it
+		// wrote the whiteout. Suppress the overlay upsert so the whiteout is
+		// not shadowed by a recreate from the anonymous fd. The fd's data
+		// stays in LocalFile untouched for reads (POSIX write/read
+		// after-unlink) — unlike Flush/Release on remote-DELETE handles,
+		// nothing is discarded here because a write-sync Write also routes
+		// through this function and its bytes must remain readable.
+		return gofuse.OK
+	}
 	if fh.DirtySeq == 0 && !fh.HasPendingMode {
 		return gofuse.OK
 	}
@@ -3805,6 +3815,15 @@ func (fs *Dat9FS) flushGitLocalFileHandleLockedWithPolicy(ctx context.Context, f
 
 func (fs *Dat9FS) flushGitHandleLockedWithPolicy(ctx context.Context, fh *FileHandle, forceSync bool) gofuse.Status {
 	if fh == nil || fh.Layer != PathLayerGitWorkspace {
+		return gofuse.OK
+	}
+	if fh.Unlinked {
+		// Open-unlink: suppress the overlay upsert — the whiteout written by
+		// the gitEntry unlink path must not be shadowed by a recreate from
+		// the anonymous fd. Its data stays in the Dirty buffer / LocalFile
+		// for reads (POSIX write/read-after-unlink); nothing is discarded
+		// here because write-sync Writes also route through this function
+		// and their bytes must remain readable.
 		return gofuse.OK
 	}
 	if fh.LocalFile != nil {
