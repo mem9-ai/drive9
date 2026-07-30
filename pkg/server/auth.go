@@ -306,21 +306,21 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 
 		switch resolved.Tenant.Status {
 		case meta.TenantActive:
-		case meta.TenantPending:
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_pending", "tenant_id", resolved.Tenant.ID)...)
-			metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantPending))
-			errJSON(w, http.StatusServiceUnavailable, "tenant provisioning is pending")
-			return
-		case meta.TenantProvisioning:
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_provisioning", "tenant_id", resolved.Tenant.ID)...)
-			metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantProvisioning))
-			errJSON(w, http.StatusServiceUnavailable, "tenant is provisioning")
-			return
-		case meta.TenantFailed:
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_failed", "tenant_id", resolved.Tenant.ID)...)
-			metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantFailed))
-			errJSON(w, http.StatusServiceUnavailable, "tenant provisioning failed")
-			return
+	case meta.TenantPending:
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_pending", "tenant_id", resolved.Tenant.ID)...)
+		metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantPending))
+		errJSONRetryable(w, "tenant provisioning is pending")
+		return
+	case meta.TenantProvisioning:
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_provisioning", "tenant_id", resolved.Tenant.ID)...)
+		metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantProvisioning))
+		errJSONRetryable(w, "tenant is provisioning")
+		return
+	case meta.TenantFailed:
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_failed", "tenant_id", resolved.Tenant.ID)...)
+		metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantFailed))
+		errJSON(w, http.StatusForbidden, "tenant provisioning failed")
+		return
 		case meta.TenantSuspended, meta.TenantDeleting, meta.TenantDeleted:
 			pool.Invalidate(resolved.Tenant.ID)
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_blocked", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
@@ -434,12 +434,12 @@ func handleDeleteNoAcquireAuth(w http.ResponseWriter, r *http.Request, pool *ten
 	case meta.TenantPending:
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_pending", "tenant_id", resolved.Tenant.ID)...)
 		metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantPending))
-		errJSON(w, http.StatusServiceUnavailable, "tenant provisioning is pending")
+		errJSONRetryable(w, "tenant provisioning is pending")
 		return
 	case meta.TenantProvisioning:
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_provisioning", "tenant_id", resolved.Tenant.ID)...)
 		metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantProvisioning))
-		errJSON(w, http.StatusServiceUnavailable, "tenant is provisioning")
+		errJSONRetryable(w, "tenant is provisioning")
 		return
 	case meta.TenantSuspended:
 		pool.Invalidate(resolved.Tenant.ID)
