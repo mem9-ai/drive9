@@ -8071,6 +8071,11 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 			fs.unmarkOpenHandlesAfterFailedUnlink(childP, markedGitHandles)
 			return st
 		}
+		// Pass 2 (mirrors the remote-DELETE path): handles opened while the
+		// whiteout request was in flight escaped the first mark; mark them
+		// now so their later write/flush/release is suppressed too and the
+		// overlay entry cannot be upserted back over the whiteout.
+		fs.markOpenHandlesUnlinked(ctx, childP, false)
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
 		fs.touchDirectoryChangeTime(parentPath, time.Now())

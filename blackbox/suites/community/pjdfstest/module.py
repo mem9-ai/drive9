@@ -60,10 +60,11 @@ class CommunityPjdfstest(BaseModule):
                 env=env,
                 ok_codes=(0, 1, 124),
             )
-            combined = read_text(result.stdout) + "\n" + read_text(result.stderr)
+            stdout_text = read_text(result.stdout)
+            stderr_text = read_text(result.stderr)
             log = ctx.artifact_dir(self.id) / "pjdfstest.log"
-            log.write_text(combined, encoding="utf-8")
-            report = self.parse(combined, str(log), result.code)
+            log.write_text(stdout_text + "\n" + stderr_text, encoding="utf-8")
+            report = self.parse(stdout_text, stderr_text, str(log), result.code)
             write_json(ctx.result_dir / "pjdfstests.json", report)
             ctx.metric("community.pjdfstest.raw_pass_rate", float(report["raw_pass_rate"]), "ratio")
             if anomaly := report.get("anomaly"):
@@ -76,12 +77,21 @@ class CommunityPjdfstest(BaseModule):
         finally:
             ctx.target.unmount(handle)
 
-    def parse(self, text: str, log_path: str, rc: int) -> dict[str, Any]:
-        # If command logs were ever appended across runs, only score the latest
-        # prove invocation (header line written by target.run_cmd).
+    @staticmethod
+    def _latest_section(text: str) -> str:
+        # run_cmd writes a per-invocation header line to BOTH stdout and
+        # stderr; cut each stream at its own last header so stale sections
+        # from earlier invocations (in either stream) are never scored.
         headers = list(re.finditer(r"(?m)^# \d{4}-\d{2}-\d{2}T[^$]*\$ ", text))
         if headers:
-            text = text[headers[-1].start() :]
+            return text[headers[-1].start() :]
+        return text
+
+    def parse(self, stdout_text: str, stderr_text: str, log_path: str, rc: int) -> dict[str, Any]:
+        # Score the latest prove invocation only, per stream: appending the
+        # full stderr after the latest stdout section would count stale
+        # stderr summaries (e.g. an old "Failed: 1") against the latest run.
+        text = self._latest_section(stdout_text) + "\n" + self._latest_section(stderr_text)
         files_matches = list(re.finditer(r"Files=(\d+),\s*Tests=(\d+),", text))
         files_line = files_matches[-1] if files_matches else None
         total_files = int(files_line.group(1)) if files_line else 0
