@@ -10959,7 +10959,10 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 				// flushes from re-selecting PATCH) and fall back to a full
 				// conditional upload, which is valid for any storage class.
 				fh.StorageClass = storageClassDB9
-				if !fh.Dirty.CanMaterializeFull() {
+				// Fetch missing lazy remote-backed parts when a loader is
+				// available (recoverable); fail EIO without clearing dirty
+				// state otherwise — never upload zero-filled ranges.
+				if !fs.materializeFullForUploadLocked(fh) {
 					log.Printf("write-sync patch fallback cannot materialize full file for %s", fh.Path)
 					return gofuse.EIO
 				}
@@ -10979,7 +10982,10 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 			}
 		}
 	} else {
-		if data == nil && !fh.Dirty.CanMaterializeFull() {
+		if data == nil && !fs.materializeFullForUploadLocked(fh) {
+			// Same fetch-or-fail contract as flushHandle: a lazily loaded
+			// existing file that grew beyond OrigSize is recoverable when a
+			// loader exists; otherwise fail without clearing dirty state.
 			log.Printf("write-sync cannot materialize full file for %s", fh.Path)
 			return gofuse.EIO
 		}
