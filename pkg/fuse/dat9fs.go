@@ -230,10 +230,11 @@ func (fs *Dat9FS) negotiatedInlineThreshold() int64 {
 }
 
 // Storage class values advertised by the server's X-Dat9-Storage-Type stat
-// header. They mirror the datastore storage-type enum values on the wire.
+// header. Aliased from pkg/client (the wire-protocol owner) so the FUSE
+// routing never defines its own copy of the protocol strings.
 const (
-	storageClassDB9 = "db9"
-	storageClassS3  = "s3"
+	storageClassDB9 = client.StorageTypeDB9
+	storageClassS3  = client.StorageTypeS3
 )
 
 // storageClassForCommittedSize derives the remote storage class produced by a

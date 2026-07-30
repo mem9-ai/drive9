@@ -197,6 +197,16 @@ type FileInfo struct {
 }
 
 // StatResult represents file metadata from HEAD.
+// Storage class values advertised by the server in the X-Dat9-Storage-Type
+// stat header. They mirror the datastore storage-type enum on the wire:
+// "db9" means the file content is stored inline in the database contents
+// table (regardless of the database product), "s3" means it lives in
+// object storage.
+const (
+	StorageTypeDB9 = "db9"
+	StorageTypeS3  = "s3"
+)
+
 type StatResult struct {
 	Size       int64
 	IsDir      bool
@@ -206,10 +216,10 @@ type StatResult struct {
 	HasMode    bool // true when the server returned a mode header (including 0)
 	ResourceID string
 	Nlink      uint32
-	// StorageType is the server-authoritative storage class ("db9" or "s3")
-	// from the X-Dat9-Storage-Type header. Empty when the server predates the
-	// header; callers must treat empty as "unknown" and fall back to local
-	// heuristics.
+	// StorageType is the server-authoritative storage class (StorageTypeDB9
+	// or StorageTypeS3) from the X-Dat9-Storage-Type header. Empty when the
+	// server predates the header; callers must treat empty as "unknown" and
+	// fall back to local heuristics.
 	StorageType string
 }
 
