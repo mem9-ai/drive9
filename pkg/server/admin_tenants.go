@@ -283,11 +283,12 @@ func (s *Server) handleAdminTenantGet(w http.ResponseWriter, r *http.Request, te
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if _, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_get"); err != nil {
+	access, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_get")
+	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "get tenant")
 		return
 	}
-	t, binding, ok := s.authorizedAdminTenant(w, r, tenantID, cred, true, false)
+	t, binding, ok := s.authorizedAdminTenant(w, r, tenantID, access.OrganizationID, true, false)
 	if !ok {
 		return
 	}
@@ -319,11 +320,12 @@ func (s *Server) handleAdminTenantQuotaSet(w http.ResponseWriter, r *http.Reques
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if _, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_quota_set"); err != nil {
+	access, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_quota_set")
+	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "update tenant quota")
 		return
 	}
-	t, _, ok := s.authorizedAdminTenant(w, r, tenantID, cred, false, false)
+	t, _, ok := s.authorizedAdminTenant(w, r, tenantID, access.OrganizationID, false, false)
 	if !ok {
 		return
 	}
@@ -358,11 +360,12 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if _, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_delete"); err != nil {
+	access, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_delete")
+	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "delete tenant")
 		return
 	}
-	t, _, ok := s.authorizedAdminTenant(w, r, tenantID, cred, false, true)
+	t, _, ok := s.authorizedAdminTenant(w, r, tenantID, access.OrganizationID, false, true)
 	if !ok {
 		return
 	}
@@ -449,12 +452,8 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 	writeJSON(w, http.StatusAccepted, adminTenantDeleteResponse{TenantID: t.ID, Status: string(status)})
 }
 
-func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, tenantID string, cred tenant.CredentialProvisionRequest, loadQuota bool, allowDeletingMissingCluster bool) (*meta.Tenant, *meta.TenantTiDBCloudOrgBinding, bool) {
-	identity, err := s.resolveTiDBCloudIdentity(r.Context(), cred, adminTenantMetricPath(loadQuota, allowDeletingMissingCluster))
-	if err != nil {
-		writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
-		return nil, nil, false
-	}
+func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, tenantID, organizationID string, loadQuota bool, allowDeletingMissingCluster bool) (*meta.Tenant, *meta.TenantTiDBCloudOrgBinding, bool) {
+	organizationID = strings.TrimSpace(organizationID)
 	t, err := s.meta.GetTenant(r.Context(), tenantID)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
@@ -491,7 +490,7 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 			errJSON(w, http.StatusNotFound, "tenant shared DB pool not found")
 			return nil, nil, false
 		}
-		if !tiDBCloudOrganizationMatches(identity.OrganizationID, physical.TiDBCloudOrganizationID) {
+		if !tiDBCloudOrganizationMatches(organizationID, physical.TiDBCloudOrganizationID) {
 			errJSON(w, http.StatusForbidden, "TiDB Cloud API key organization does not match tenant")
 			return nil, nil, false
 		}
@@ -515,23 +514,12 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 		errJSON(w, http.StatusNotFound, "tenant not found")
 		return nil, nil, false
 	}
-	if !tiDBCloudOrganizationMatches(identity.OrganizationID, binding.OrganizationID) {
+	if !tiDBCloudOrganizationMatches(organizationID, binding.OrganizationID) {
 		errJSON(w, http.StatusForbidden, "TiDB Cloud API key organization does not match tenant")
 		return nil, nil, false
 	}
 	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, binding.OrganizationID, classifyTenantRequest(r))
 	return t, binding, true
-}
-
-func adminTenantMetricPath(loadQuota bool, allowDeletingMissingCluster bool) string {
-	switch {
-	case loadQuota:
-		return "admin_tenant_get"
-	case allowDeletingMissingCluster:
-		return "admin_tenant_delete"
-	default:
-		return "admin_tenant_quota_set"
-	}
 }
 
 func (s *Server) adminTenantResponse(t *meta.Tenant, _ *meta.TenantTiDBCloudOrgBinding, quota *adminTenantQuotaSummary) adminTenantResponse {

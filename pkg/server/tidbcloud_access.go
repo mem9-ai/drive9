@@ -13,7 +13,6 @@ import (
 
 type tiDBCloudAccessProfile struct {
 	OrganizationID string
-	Role           string
 	IsFree         bool
 }
 
@@ -28,15 +27,15 @@ func (s *Server) authorizeTiDBCloudAdminAccess(ctx context.Context, cred tenant.
 	return profile, nil
 }
 
-func (s *Server) rejectFreeQuotaMutation(ctx context.Context, cred tenant.CredentialProvisionRequest, metricPath string) error {
+func (s *Server) authorizeTiDBCloudQuotaMutation(ctx context.Context, cred tenant.CredentialProvisionRequest, metricPath string) (*tiDBCloudAccessProfile, error) {
 	profile, err := s.resolveTiDBCloudAccessProfile(ctx, cred, metricPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if profile.IsFree {
-		return tenant.ErrTiDBCloudFreeQuotaMutationForbidden
+		return nil, tenant.ErrTiDBCloudFreeQuotaMutationForbidden
 	}
-	return nil
+	return profile, nil
 }
 
 func (s *Server) resolveTiDBCloudAccessProfile(ctx context.Context, cred tenant.CredentialProvisionRequest, metricPath string) (*tiDBCloudAccessProfile, error) {
@@ -49,7 +48,6 @@ func (s *Server) resolveTiDBCloudAccessProfile(ctx context.Context, cred tenant.
 		metrics.RecordTiDBCloudBillingCacheRequest(metricPath, "hit")
 		return &tiDBCloudAccessProfile{
 			OrganizationID: organizationID,
-			Role:           identity.Role,
 			IsFree:         false,
 		}, nil
 	}
@@ -72,7 +70,6 @@ func (s *Server) resolveTiDBCloudAccessProfile(ctx context.Context, cred tenant.
 	}
 	return &tiDBCloudAccessProfile{
 		OrganizationID: organizationID,
-		Role:           identity.Role,
 		IsFree:         plan.IsFree,
 	}, nil
 }

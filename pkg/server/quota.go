@@ -239,7 +239,8 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.rejectFreeQuotaMutation(r.Context(), cred, "quota_set"); err != nil {
+	access, err := s.authorizeTiDBCloudQuotaMutation(r.Context(), cred, "quota_set")
+	if err != nil {
 		writeQuotaSetError(w, r.Context(), err, "authorize")
 		return
 	}
@@ -261,7 +262,7 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 	}
 	var sharedPhysical *meta.SharedDB
 	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
-		physical, err := s.authorizeSharedQuotaCredentials(r.Context(), t, cred, "quota_set")
+		physical, err := s.authorizeSharedQuotaOrganization(r.Context(), t, access.OrganizationID)
 		if err != nil {
 			writeQuotaSetError(w, r.Context(), err, "authorize")
 			return
@@ -272,7 +273,7 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		}
 		sharedPhysical = physical
 	} else {
-		if _, err := s.authorizeNativeTenantCredentials(r.Context(), t, cred, "quota_set"); err != nil {
+		if _, err := s.authorizeNativeTenantOrganization(r.Context(), t, access.OrganizationID); err != nil {
 			writeQuotaSetError(w, r.Context(), err, "authorize")
 			return
 		}
@@ -301,8 +302,26 @@ func (s *Server) authorizeSharedQuotaCredentials(ctx context.Context, t *meta.Te
 		}
 		return nil, fmt.Errorf("get shared DB for tenant: %w", err)
 	}
-	if _, err := s.authorizeTiDBCloudOrganization(ctx, cred, physical.TiDBCloudOrganizationID, metricPath); err != nil {
+	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, metricPath)
+	if err != nil {
 		return nil, err
+	}
+	if !tiDBCloudOrganizationMatches(identity.OrganizationID, physical.TiDBCloudOrganizationID) {
+		return nil, tenant.ErrQuotaPermissionDenied
+	}
+	return physical, nil
+}
+
+func (s *Server) authorizeSharedQuotaOrganization(ctx context.Context, t *meta.Tenant, organizationID string) (*meta.SharedDB, error) {
+	physical, err := s.meta.GetSharedDBForTenant(ctx, t.ID)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			return nil, tenant.ErrQuotaBackendNotFound
+		}
+		return nil, fmt.Errorf("get shared DB for tenant: %w", err)
+	}
+	if !tiDBCloudOrganizationMatches(organizationID, physical.TiDBCloudOrganizationID) {
+		return nil, tenant.ErrQuotaPermissionDenied
 	}
 	return physical, nil
 }

@@ -115,38 +115,34 @@ func TestResolveOrganizationPlanClassification(t *testing.T) {
 		name      string
 		body      string
 		wantFree  bool
-		wantPlan  string
 		wantErrIs error
 	}{
 		{
-			name:     "on demand",
-			body:     `{"tenant_id_str":"1372813089209302377","effective_plan":"on_demand"}`,
-			wantPlan: "on_demand",
+			name: "on demand",
+			body: `{"tenant_id_str":"1372813089209302377","effective_plan":"on_demand"}`,
 		},
 		{
-			name:     "positive POC exact decimal",
-			body:     `{"tenant_id":1372813089209302377,"tenant_id_str":"1372813089209302377","effective_plan":"poc","poc_credits":"185610.84"}`,
-			wantPlan: "poc",
+			name: "positive POC exact decimal",
+			body: `{"tenant_id":1372813089209302377,"tenant_id_str":"1372813089209302377","effective_plan":"poc","poc_credits":"185610.84"}`,
 		},
 		{
-			name:     "positive POC leading decimal point",
-			body:     `{"tenant_id_str":"1372813089209302377","effective_plan":"poc","poc_credits":"+.0001"}`,
-			wantPlan: "poc",
+			name: "positive POC leading decimal point",
+			body: `{"tenant_id_str":"1372813089209302377","effective_plan":"poc","poc_credits":"+.0001"}`,
 		},
 		{
 			name:     "zero POC",
 			body:     `{"tenant_id_str":"1372813089209302377","effective_plan":"poc","poc_credits":"0.00"}`,
-			wantFree: true, wantPlan: "poc",
+			wantFree: true,
 		},
 		{
 			name:     "negative POC",
 			body:     `{"tenant_id_str":"1372813089209302377","effective_plan":"poc","poc_credits":"-1"}`,
-			wantFree: true, wantPlan: "poc",
+			wantFree: true,
 		},
 		{
 			name:     "unknown plan",
 			body:     `{"tenant_id_str":"1372813089209302377","effective_plan":"free_trial"}`,
-			wantFree: true, wantPlan: "free_trial",
+			wantFree: true,
 		},
 		{
 			name:     "empty plan",
@@ -210,8 +206,8 @@ func TestResolveOrganizationPlanClassification(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ResolveOrganizationPlan: %v", err)
 			}
-			if plan.OrganizationID != organizationID || plan.EffectivePlan != tt.wantPlan || plan.IsFree != tt.wantFree {
-				t.Fatalf("plan = %+v, want org=%s plan=%q free=%t", plan, organizationID, tt.wantPlan, tt.wantFree)
+			if plan.OrganizationID != organizationID || plan.IsFree != tt.wantFree {
+				t.Fatalf("plan = %+v, want org=%s free=%t", plan, organizationID, tt.wantFree)
 			}
 			if authenticatedCalls.Load() != 1 {
 				t.Fatalf("authenticated calls = %d, want 1", authenticatedCalls.Load())

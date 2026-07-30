@@ -57,7 +57,7 @@ func TestResolveTiDBCloudAccessProfileCachesOnlyNonFreeOrganizations(t *testing.
 		identities: map[string]tenant.TiDBCloudAPIKeyIdentity{
 			"key-1": {OrganizationID: "org-1", Role: tenant.TiDBCloudRoleOrgOwner},
 		},
-		plan: tenant.TiDBCloudOrganizationPlan{EffectivePlan: "on_demand", IsFree: false},
+		plan: tenant.TiDBCloudOrganizationPlan{IsFree: false},
 	}
 	s := &Server{
 		provisioner:        provisioner,
@@ -75,7 +75,7 @@ func TestResolveTiDBCloudAccessProfileCachesOnlyNonFreeOrganizations(t *testing.
 		t.Fatalf("IAM/Billing calls = %d/%d, want 1/1", provisioner.iamCalls, provisioner.billingCalls)
 	}
 
-	provisioner.plan = tenant.TiDBCloudOrganizationPlan{EffectivePlan: "free_trial", IsFree: true}
+	provisioner.plan = tenant.TiDBCloudOrganizationPlan{IsFree: true}
 	s.tidbCloudPlanCache.remove("org-1")
 	for i := 0; i < 2; i++ {
 		profile, err := s.resolveTiDBCloudAccessProfile(context.Background(), cred, "access_profile_free")
@@ -94,7 +94,7 @@ func TestResolveTiDBCloudAccessProfileSharesPositivePlanAcrossCredentials(t *tes
 			"key-a": {OrganizationID: "org-shared", Role: tenant.TiDBCloudRoleOrgOwner},
 			"key-b": {OrganizationID: "org-shared", Role: tenant.TiDBCloudRoleProjectOwner},
 		},
-		plan: tenant.TiDBCloudOrganizationPlan{EffectivePlan: "poc", IsFree: false},
+		plan: tenant.TiDBCloudOrganizationPlan{IsFree: false},
 	}
 	s := &Server{
 		provisioner:        provisioner,

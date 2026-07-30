@@ -374,7 +374,7 @@ func TestAdminTenantGetAuthorizesSharedProviderThroughPhysicalPool(t *testing.T)
 	metricReq := httptest.NewRequest(http.MethodGet, "/v1/admin/tenants/"+rt.tenantID, nil)
 	metricReq = metricReq.WithContext(withRequestMetricState(metricReq.Context(), &requestMetricState{}))
 	if _, _, ok := rt.server.authorizedAdminTenant(httptest.NewRecorder(), metricReq, rt.tenantID,
-		tenant.CredentialProvisionRequest{PublicKey: "pk", PrivateKey: "sk"}, true, false); !ok {
+		"org-shared-admin", true, false); !ok {
 		t.Fatal("shared admin tenant authorization failed")
 	}
 	metricTenantID, _, metricProvider, metricOrgID := requestMetricScope(metricReq.Context())

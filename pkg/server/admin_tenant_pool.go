@@ -329,11 +329,12 @@ func (s *Server) handleAdminTenantPoolGet(w http.ResponseWriter, r *http.Request
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if _, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_pool_get"); err != nil {
+	access, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_pool_get")
+	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "get tenant pool")
 		return
 	}
-	pool, ok := s.authorizedTenantPool(w, r, cred)
+	pool, ok := s.authorizedTenantPool(w, r, access.OrganizationID)
 	if !ok {
 		return
 	}
@@ -375,11 +376,12 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if _, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_pool_update"); err != nil {
+	access, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_pool_update")
+	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "update tenant pool")
 		return
 	}
-	pool, ok := s.authorizedTenantPool(w, r, cred)
+	pool, ok := s.authorizedTenantPool(w, r, access.OrganizationID)
 	if !ok {
 		return
 	}
@@ -601,11 +603,12 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if _, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_pool_delete"); err != nil {
+	access, err := s.authorizeTiDBCloudAdminAccess(r.Context(), cred, "admin_tenant_pool_delete")
+	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "delete tenant pool")
 		return
 	}
-	pool, ok := s.authorizedTenantPool(w, r, cred)
+	pool, ok := s.authorizedTenantPool(w, r, access.OrganizationID)
 	if !ok {
 		return
 	}
@@ -692,12 +695,8 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusAccepted, out)
 }
 
-func (s *Server) authorizedTenantPool(w http.ResponseWriter, r *http.Request, cred tenant.CredentialProvisionRequest) (*meta.TenantPool, bool) {
-	orgID, err := s.firstManagedOrganization(r.Context(), cred)
-	if err != nil {
-		writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant pool")
-		return nil, false
-	}
+func (s *Server) authorizedTenantPool(w http.ResponseWriter, r *http.Request, orgID string) (*meta.TenantPool, bool) {
+	orgID = strings.TrimSpace(orgID)
 	if orgID == "" {
 		errJSON(w, http.StatusNotFound, "tenant pool not found")
 		return nil, false

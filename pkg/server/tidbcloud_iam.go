@@ -45,17 +45,6 @@ func tiDBCloudOrganizationMatches(identityOrganizationID, resourceOrganizationID
 	return identityOrganizationID != "" && resourceOrganizationID == identityOrganizationID
 }
 
-func (s *Server) authorizeTiDBCloudOrganization(ctx context.Context, cred tenant.CredentialProvisionRequest, resourceOrganizationID, metricPath string) (*tenant.TiDBCloudAPIKeyIdentity, error) {
-	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, metricPath)
-	if err != nil {
-		return nil, err
-	}
-	if !tiDBCloudOrganizationMatches(identity.OrganizationID, resourceOrganizationID) {
-		return nil, tenant.ErrQuotaPermissionDenied
-	}
-	return identity, nil
-}
-
 func (s *Server) authorizeNativeTenantCredentials(ctx context.Context, t *meta.Tenant, cred tenant.CredentialProvisionRequest, metricPath string) (*meta.TenantTiDBCloudOrgBinding, error) {
 	if t == nil {
 		return nil, tenant.ErrQuotaBackendNotFound
@@ -67,8 +56,29 @@ func (s *Server) authorizeNativeTenantCredentials(ctx context.Context, t *meta.T
 		}
 		return nil, fmt.Errorf("get tenant TiDB Cloud organization binding: %w", err)
 	}
-	if _, err := s.authorizeTiDBCloudOrganization(ctx, cred, binding.OrganizationID, metricPath); err != nil {
+	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, metricPath)
+	if err != nil {
 		return nil, err
+	}
+	if !tiDBCloudOrganizationMatches(identity.OrganizationID, binding.OrganizationID) {
+		return nil, tenant.ErrQuotaPermissionDenied
+	}
+	return binding, nil
+}
+
+func (s *Server) authorizeNativeTenantOrganization(ctx context.Context, t *meta.Tenant, organizationID string) (*meta.TenantTiDBCloudOrgBinding, error) {
+	if t == nil {
+		return nil, tenant.ErrQuotaBackendNotFound
+	}
+	binding, err := s.meta.GetTenantTiDBCloudOrgBinding(ctx, t.ID)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			return nil, tenant.ErrQuotaBackendNotFound
+		}
+		return nil, fmt.Errorf("get tenant TiDB Cloud organization binding: %w", err)
+	}
+	if !tiDBCloudOrganizationMatches(organizationID, binding.OrganizationID) {
+		return nil, tenant.ErrQuotaPermissionDenied
 	}
 	return binding, nil
 }

@@ -247,7 +247,6 @@ func (f *fakeProvisioner) ResolveOrganizationPlan(_ context.Context, organizatio
 	}
 	return &tenant.TiDBCloudOrganizationPlan{
 		OrganizationID: organizationID,
-		EffectivePlan:  "on_demand",
 		IsFree:         f.billingFree,
 	}, nil
 }
@@ -3370,7 +3369,7 @@ func (f *nonEarlyBindingProvisioner) ResolveAPIKeyIdentity(context.Context, tena
 }
 
 func (f *nonEarlyBindingProvisioner) ResolveOrganizationPlan(_ context.Context, organizationID string, _ tenant.CredentialProvisionRequest) (*tenant.TiDBCloudOrganizationPlan, error) {
-	return &tenant.TiDBCloudOrganizationPlan{OrganizationID: organizationID, EffectivePlan: "on_demand"}, nil
+	return &tenant.TiDBCloudOrganizationPlan{OrganizationID: organizationID}, nil
 }
 
 func (f *nonEarlyBindingProvisioner) InitSchema(_ context.Context, _ string) error { return nil }

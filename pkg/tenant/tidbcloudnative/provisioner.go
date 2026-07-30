@@ -356,7 +356,7 @@ func (p *Provisioner) ResolveOrganizationPlan(ctx context.Context, organizationI
 		if organizationID != localOrgID {
 			return nil, fmt.Errorf("%w: organization mismatch", tenant.ErrTiDBCloudBillingResponseInvalid)
 		}
-		return &tenant.TiDBCloudOrganizationPlan{OrganizationID: organizationID, EffectivePlan: "on_demand", IsFree: false}, nil
+		return &tenant.TiDBCloudOrganizationPlan{OrganizationID: organizationID, IsFree: false}, nil
 	}
 	publicKey := strings.TrimSpace(req.PublicKey)
 	privateKey := strings.TrimSpace(req.PrivateKey)
@@ -449,7 +449,6 @@ func parseOrganizationPlanResponse(raw []byte, organizationID string) (*tenant.T
 	}
 	return &tenant.TiDBCloudOrganizationPlan{
 		OrganizationID: organizationID,
-		EffectivePlan:  effectivePlan,
 		IsFree:         isFree,
 	}, nil
 }

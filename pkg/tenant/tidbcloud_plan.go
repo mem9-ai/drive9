@@ -20,7 +20,6 @@ var (
 
 type TiDBCloudOrganizationPlan struct {
 	OrganizationID string
-	EffectivePlan  string
 	IsFree         bool
 }
 

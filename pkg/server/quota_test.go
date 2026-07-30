@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	neturl "net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -207,7 +208,6 @@ func (p *quotaTestProvisioner) ResolveOrganizationPlan(_ context.Context, organi
 	}
 	return &tenant.TiDBCloudOrganizationPlan{
 		OrganizationID: organizationID,
-		EffectivePlan:  "on_demand",
 		IsFree:         p.billingFree,
 	}, nil
 }
@@ -515,6 +515,79 @@ func newQuotaRuntimeWithOptions(t *testing.T, provider string, opts quotaRuntime
 		DefaultTenantProvider: opts.defaultTenantProvider, TokenSecret: tokenSecret})
 	t.Cleanup(server.Close)
 	return &quotaRuntime{meta: db.Meta, tenantID: tenantID, apiKey: apiKey, prov: prov, server: server}
+}
+
+func tiDBCloudRBACRoleRequestsForPath(t *testing.T, path string) int64 {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	var total int64
+	for _, line := range strings.Split(recorder.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "drive9_tidbcloud_rbac_cache_requests_total{") ||
+			!strings.Contains(line, `path="`+path+`"`) ||
+			!strings.Contains(line, `scope="role"`) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			t.Fatalf("unexpected RBAC metric line %q", line)
+		}
+		value, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			t.Fatalf("parse RBAC metric line %q: %v", line, err)
+		}
+		total += value
+	}
+	return total
+}
+
+func TestAdminTenantGetResolvesTiDBCloudAccessOncePerRequest(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	before := tiDBCloudRBACRoleRequestsForPath(t, "admin_tenant_get")
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/admin/tenants/"+rt.tenantID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(quotaPublicKeyHeader, "public-1")
+	req.Header.Set(quotaPrivateKeyHeader, "private-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	after := tiDBCloudRBACRoleRequestsForPath(t, "admin_tenant_get")
+	if got := after - before; got != 1 {
+		t.Fatalf("RBAC role resolutions = %d, want 1", got)
+	}
+}
+
+func TestQuotaSetResolvesTiDBCloudAccessOncePerRequest(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	before := tiDBCloudRBACRoleRequestsForPath(t, "quota_set")
+	body := fmt.Sprintf(`{"tenant_id":%q,"public_key":"public-1","private_key":"private-1","max_file_count":10}`, rt.tenantID)
+	resp, err := http.Post(ts.URL+"/v1/quota", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
+	}
+	after := tiDBCloudRBACRoleRequestsForPath(t, "quota_set")
+	if got := after - before; got != 1 {
+		t.Fatalf("RBAC role resolutions = %d, want 1", got)
+	}
 }
 
 func TestApplyQuotaSetDoesNotRecordHandlerLevelTiDBCloudOpenAPIMetrics(t *testing.T) {

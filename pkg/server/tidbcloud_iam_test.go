@@ -86,8 +86,7 @@ func TestAuthorizedAdminSharedTenantMapsPhysicalLookupBackendErrorToServerError(
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/tenants/"+rt.tenantID, nil)
 	recorder := httptest.NewRecorder()
-	_, _, ok := rt.server.authorizedAdminTenant(recorder, req, rt.tenantID,
-		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}, true, false)
+	_, _, ok := rt.server.authorizedAdminTenant(recorder, req, rt.tenantID, "org-1", true, false)
 
 	if _, err := rt.meta.DB().ExecContext(ctx, "RENAME TABLE "+unavailableTable+" TO db_pool"); err != nil {
 		t.Fatal(err)
