@@ -17209,6 +17209,147 @@ func TestFlushHandleDebouncedLazyFetchNewerRevisionSkipsUpload(t *testing.T) {
 	}
 }
 
+// TestFlushHandleLayerLazyBufferFetchesAndUpserts covers issue #815 path A:
+// in layer mode, an ordinary handle with a lazily loaded buffer must fetch
+// the missing remote-backed parts (pinned loader) and upsert the complete
+// file into the layer, instead of failing EIO and dropping the edit on
+// Release.
+func TestFlushHandleLayerLazyBufferFetchesAndUpserts(t *testing.T) {
+	var loadCalls atomic.Int32
+	var gotContent []byte
+	var gotBaseRevision int64
+
+	path := "/layer-lazy.dat"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer_815/entries" {
+			var req struct {
+				Path         string `json:"path"`
+				Content      []byte `json:"content"`
+				BaseRevision int64  `json:"base_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode layer entry: %v", err)
+			}
+			gotContent = req.Content
+			gotBaseRevision = req.BaseRevision
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "entry-1", "path": req.Path})
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{LayerRef: "layer_815"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	fh, orig := newLazyTwoPartHandle(t, fs, path, true, &loadCalls)
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	if st != gofuse.OK {
+		t.Fatalf("layer flush status = %v, want OK (lazy buffer must be fetched, not EIO)", st)
+	}
+	if loadCalls.Load() == 0 {
+		t.Fatal("expected lazy loader to fetch the untouched part before layer upsert")
+	}
+	want := make([]byte, 512)
+	copy(want, orig[0])
+	copy(want[256:], orig[1])
+	copy(want[:4], "WXYZ")
+	if !bytes.Equal(gotContent, want) {
+		t.Fatal("layer entry content mismatch: untouched remote-backed range not preserved")
+	}
+	if gotBaseRevision != 5 {
+		t.Fatalf("layer entry base_revision = %d, want 5 (pinned base revision)", gotBaseRevision)
+	}
+	if fh.Dirty.HasDirtyParts() {
+		t.Fatal("dirty parts remain after successful layer flush")
+	}
+}
+
+// TestSnapshotWriteBackShadowSpillUsesAuthoritativeShadow covers issue #815
+// path B: for a ShadowSpill handle with evicted parts, the write-back
+// snapshot must come from the shadow store (the authoritative write-through
+// copy), never from bytesView() which zero-fills evicted ranges.
+func TestSnapshotWriteBackShadowSpillUsesAuthoritativeShadow(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wbCache, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.writeBack = wbCache
+
+	const baseRev int64 = 7
+	path := "/spill-wb.bin"
+
+	// The authoritative content lives in the shadow (every real Write hits
+	// the shadow first). Include the sparse edit so the expected snapshot
+	// matches the handle's current dirty state.
+	full := make([]byte, 512)
+	for i := range full {
+		full[i] = byte(i % 251)
+	}
+	copy(full[:4], "WXYZ")
+	if err := shadow.WriteFull(path, full, baseRev); err != nil {
+		t.Fatal(err)
+	}
+
+	// Dirty buffer simulating spill eviction: part 0 loaded+dirty, part 1
+	// evicted after spill — CanMaterializeFull() is false, and bytesView()
+	// would zero-fill the second half.
+	wb := NewWriteBuffer(path, maxPreloadSize, 256)
+	wb.remoteSize = 512
+	wb.totalSize = 512
+	if _, err := wb.Write(0, []byte("WXYZ")); err != nil {
+		t.Fatal(err)
+	}
+	wb.EvictPart(1)
+	if wb.CanMaterializeFull() {
+		t.Fatal("expected CanMaterializeFull() = false for spill-evicted buffer")
+	}
+
+	fh := &FileHandle{
+		Ino:         42,
+		Path:        path,
+		Dirty:       wb,
+		BaseRev:     baseRev,
+		ShadowReady: true,
+		ShadowSpill: true,
+		WritePolicy: WritePolicyWriteBack,
+	}
+	fh.DirtySeq = fs.markDirtySize(42, 512)
+
+	if err := fs.snapshotWriteBackLocked(fh); err != nil {
+		t.Fatalf("snapshotWriteBackLocked: %v", err)
+	}
+	got, ok := wbCache.Get(path)
+	if !ok {
+		t.Fatal("write-back cache has no staged content after snapshot")
+	}
+	if !bytes.Equal(got, full) {
+		t.Fatal("write-back snapshot mismatch — must come from the authoritative shadow, not zero-filled bytesView")
+	}
+}
+
 // TestFlushHandle_Path2_SyntheticRevRecordedBeforeUnlock verifies that when
 // a Path 2 flush succeeds without the server returning a committed revision
 // (e.g. PatchFile / WriteStreamConditional), the synthetic revision

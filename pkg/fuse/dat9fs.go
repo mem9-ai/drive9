@@ -3349,7 +3349,34 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 	mode, hasMode := fs.modeForPendingHandle(fh)
 
 	bvStart := time.Now()
-	data := fh.Dirty.bytesView()
+	var data []byte
+	if !fh.Dirty.CanMaterializeFull() {
+		// The buffer has parts that are not loaded (evicted under spill or
+		// never lazily loaded): bytesView() would zero-fill those ranges and
+		// the write-back cache would persist corrupted bytes. ShadowSpill and
+		// ShadowReady handles write through to the shadow store on every
+		// write, so the shadow holds the authoritative full content —
+		// snapshot from there. Any other non-materializable buffer has no
+		// authoritative secondary source: fail instead of zero-filling, and
+		// let the caller fall back to a guarded synchronous upload.
+		if fh.ShadowReady && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path) {
+			shadowData, err := fs.shadowStore.ReadAll(fh.Path)
+			if err != nil {
+				return err
+			}
+			if size := fh.Dirty.Size(); int64(len(shadowData)) != size {
+				// Writes hit the shadow first and truncates are mirrored, so
+				// sizes must agree; treat any divergence as unsafe to stage.
+				return fmt.Errorf("shadow size %d != dirty size %d for %s", len(shadowData), size, fh.Path)
+			}
+			data = shadowData
+		} else {
+			return syscall.ENOTSUP
+		}
+	}
+	if data == nil {
+		data = fh.Dirty.bytesView()
+	}
 	bvDur := time.Since(bvStart)
 
 	timings, err := fs.writeBack.PutWithBaseRevAndModeTimings(
@@ -12512,7 +12539,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 
 	size := fh.Dirty.Size()
 	if fs.layerEnabled() {
-		if fh.ShadowSpill || (fh.Streamer != nil && fh.Streamer.Started()) || !fh.Dirty.CanMaterializeFull() {
+		if fh.ShadowSpill || (fh.Streamer != nil && fh.Streamer.Started()) || !fs.materializeFullForUploadLocked(fh) {
 			if fh.ShadowSpill {
 				if err := fs.commitLayerShadowLocked(ctx, fh, true); err != nil {
 					log.Printf("layer shadowspill flush failed for %s: %v", fh.Path, err)
