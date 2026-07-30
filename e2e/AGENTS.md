@@ -494,6 +494,28 @@ bash e2e/git-feature-smoke-test.sh
 POSIX pjdfstest lives in blackbox (`community.pjdfstest`), not under `e2e/`.
 
 
+### `fuse-patch-storage-class.sh`
+
+Host support: Linux and macOS only. This script needs real FUSE support and is
+targeted regression coverage for PATCH-vs-storage-class mismatches
+(`patch_unsupported_target`), not a general filesystem workload.
+
+1. Starts its own MySQL container and `drive9-server-local` with a high
+   `DRIVE9_INLINE_THRESHOLD`, seeds a file that lands inline (db9), then
+   restarts the server with a low threshold so the mount's cached threshold is
+   below the file size while the object stays db9-stored
+2. Mounts with `--mode=fuse --durability write-sync` and partially overwrites
+   the file at the same size
+3. Default `fixed` scenario: stat header advertises `db9`, zero PATCH attempts
+   (storage class seeded from the header), committed bytes correct, storage
+   healed to `s3`
+4. Manual cross-version scenarios: `SCENARIO=repro` replays the pre-fix EINVAL
+   loop with main-built binaries; `SCENARIO=fallback` runs the fixed client
+   against an old server binary (no storage-type header) and asserts exactly
+   one PATCH attempt before the full-upload fallback commits
+5. Override binaries with `DRIVE9_SERVER_BIN` / `DRIVE9_CLI_BIN`; default
+   binaries are built from the checkout when missing
+
 ### `fuse-release-gate.sh`
 
 1. Runs `fuse-smoke-test.sh` with `FUSE_STRICT_PREREQS=1`

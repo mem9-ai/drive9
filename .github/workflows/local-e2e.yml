@@ -290,6 +290,10 @@ jobs:
           RUN_FUSE_POSIX_FSX: "0"
         run: bash e2e/fuse-release-gate.sh
 
+      - name: Run FUSE patch storage-class e2e
+        id: fuse-patch-storage-class
+        run: bash e2e/fuse-patch-storage-class.sh
+
       - name: Run Git operations smoke
         id: git-ops-smoke
         continue-on-error: true
@@ -427,6 +431,7 @@ jobs:
             echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
             echo "| Layer FS smoke | ${{ steps.layer-fs-smoke.outcome || 'skipped' }} |"
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
+            echo "| FUSE patch storage-class e2e | ${{ steps.fuse-patch-storage-class.outcome || 'skipped' }} |"
             echo "| Git operations smoke | ${{ steps.git-ops-smoke.outcome || 'skipped' }} |"
             echo "| Pack smoke | ${{ steps.pack-smoke.outcome || 'skipped' }} |"
             echo "| FUSE crash recovery e2e | ${{ steps.fuse-crash-recovery.outcome || 'skipped' }} |"
@@ -469,6 +474,7 @@ jobs:
             "cli-smoke": "${{ steps.cli-smoke.outcome }}",
             "layer-fs-smoke": "${{ steps.layer-fs-smoke.outcome }}",
             "fuse-smoke": "${{ steps.fuse-smoke.outcome }}",
+            "fuse-patch-storage-class": "${{ steps.fuse-patch-storage-class.outcome }}",
             "git-ops-smoke": "${{ steps.git-ops-smoke.outcome }}",
             "pack-smoke": "${{ steps.pack-smoke.outcome }}",
             "fuse-crash-recovery": "${{ steps.fuse-crash-recovery.outcome }}",

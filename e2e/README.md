@@ -28,6 +28,7 @@ including local single-tenant validation via `drive9-server-local`.
 | `git-ops-smoke-test.sh` | Lightweight local Git gate using a local bare fixture: native clone, `drive9 git clone --fast`, and `drive9 git clone --fast --blobless` across `coding-agent` and `portable` profiles, followed by edit/add/commit/stash, remount into a fresh local root, and Git state/content verification |
 | `fuse-crash-recovery-test.sh` | FUSE crash-recovery gate: fsync'd small files plus a large mid-upload ShadowSpill survive `kill -9` of the mount daemon, recovered commits converge remotely, unlinked files do not resurrect, and the journal WAL compacts after a clean remount |
 | `fuse-write-perf-budget-test.sh` | FUSE write-path perf budgets: fsync-heavy workload with deterministic op-count budgets (remote writes/stats/lists/mutations, commit retries/failures) plus an fsync latency ceiling, asserted from mount perf counters |
+| `fuse-patch-storage-class.sh` | PATCH-vs-storage-class mismatch (`patch_unsupported_target`) regression: seeds a db9-stored file above the restarted server's inline threshold, then partially overwrites it through a FUSE mount. Default `fixed` scenario asserts zero PATCH attempts, correct committed bytes, and storage heal to S3; `SCENARIO=repro`/`fallback` with `DRIVE9_SERVER_BIN`/`DRIVE9_CLI_BIN` overrides replay the pre-fix EINVAL loop and the old-server fallback locally |
 | `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
 | `native-smoke-test.sh` | TiDB Cloud Native tenant lifecycle: CLI provision with credentials, status poll, basic fs ops (mkdir/cp/cat/ls/rm), delete + verification, trap cleanup on failure |
@@ -42,7 +43,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 
 | Tier | Trigger | What runs |
 |------|---------|-----------|
-| PR gate | `pull_request` to `main` (local-e2e) | api, cli, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback), git-ops, portable pack/unpack, fuse-crash-recovery, fuse-write-perf-budget |
+| PR gate | `pull_request` to `main` (local-e2e) | api, cli, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback), fuse-patch-storage-class, git-ops, portable pack/unpack, fuse-crash-recovery, fuse-write-perf-budget |
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, full `smoke-all.sh` (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | `e2e-all` workflow (`Run workflow` button) | Everything above via `run_all_e2e=1` |
