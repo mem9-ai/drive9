@@ -17032,6 +17032,105 @@ func TestFlushPatchFallbackLazyFetchNewerRevisionConflicts(t *testing.T) {
 	}
 }
 
+// TestFlushHandleDebouncedLazyBufferFetchesMissingParts covers the debounced
+// upload entry point (qiffang adversary-1 update): a lazy multi-part
+// existing file below the inline threshold must fetch the untouched part
+// before the deferred snapshot, so the debounced callback uploads the
+// complete original content instead of zero-filled ranges.
+func TestFlushHandleDebouncedLazyBufferFetchesMissingParts(t *testing.T) {
+	var loadCalls atomic.Int32
+	var gotBody []byte
+	var gotExpectedRev string
+
+	path := "/debounced-lazy.dat"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			gotExpectedRev = r.Header.Get("X-Dat9-Expected-Revision")
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read PUT body: %v", err)
+			}
+			gotBody = body
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 42})
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	// Small-file debounce route: size (512) < inlineThreshold (50KB default).
+	fs.debouncer = newFlushDebouncer(50 * time.Millisecond)
+
+	fh, orig := newLazyTwoPartHandle(t, fs, path, true, &loadCalls)
+
+	fh.Lock()
+	st := fs.flushHandleDebounced(context.Background(), fh, false)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandleDebounced status = %v, want OK (schedule)", st)
+	}
+	fs.debouncer.FlushAll()
+
+	if loadCalls.Load() == 0 {
+		t.Fatal("expected lazy loader to fetch the untouched part before snapshot")
+	}
+	if gotExpectedRev != "5" {
+		t.Fatalf("debounced PUT X-Dat9-Expected-Revision = %q, want 5 (BaseRev CAS)", gotExpectedRev)
+	}
+	want := make([]byte, 512)
+	copy(want, orig[0])
+	copy(want[256:], orig[1])
+	copy(want[:4], "WXYZ")
+	if !bytes.Equal(gotBody, want) {
+		t.Fatal("debounced upload body mismatch: untouched remote-backed range was zero-filled")
+	}
+	if fh.Dirty.HasDirtyParts() {
+		t.Fatal("dirty parts remain after successful debounced upload")
+	}
+}
+
+// TestFlushHandleDebouncedLazyBufferNoLoaderReturnsEIO covers the fail-safe
+// half for the debounced path: without a lazy loader, the debounce decision
+// must fail EIO synchronously without scheduling an upload and without
+// clearing dirty state.
+func TestFlushHandleDebouncedLazyBufferNoLoaderReturnsEIO(t *testing.T) {
+	var serverHit atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.debouncer = newFlushDebouncer(50 * time.Millisecond)
+
+	path := "/debounced-lazy-no-loader.dat"
+	fh, _ := newLazyTwoPartHandle(t, fs, path, false, nil)
+	dirtySeqBefore := fh.DirtySeq
+
+	fh.Lock()
+	st := fs.flushHandleDebounced(context.Background(), fh, false)
+	fh.Unlock()
+	if st != gofuse.EIO {
+		t.Fatalf("flushHandleDebounced status = %v, want EIO (must not snapshot zero-filled ranges)", st)
+	}
+	fs.debouncer.FlushAll()
+	if serverHit.Load() {
+		t.Fatal("server received an upload request — must fail before scheduling")
+	}
+	if fh.DirtySeq != dirtySeqBefore {
+		t.Fatalf("DirtySeq = %d, want %d preserved after EIO", fh.DirtySeq, dirtySeqBefore)
+	}
+}
+
 // TestFlushHandle_Path2_SyntheticRevRecordedBeforeUnlock verifies that when
 // a Path 2 flush succeeds without the server returning a committed revision
 // (e.g. PatchFile / WriteStreamConditional), the synthetic revision

@@ -12290,6 +12290,17 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	}
 
 	// Small file: schedule a deferred upload.
+	// The debounced callback commits the FULL buffer and clears dirty state
+	// on success, so this snapshot must meet the same materialization
+	// contract as every other full-upload path: bytesView() zero-fills
+	// unloaded lazy remote-backed parts, which would silently corrupt the
+	// remote object (e.g. an S3 object lazily opened while the server inline
+	// threshold sits above the buffer's part size). Fetch missing parts via
+	// the lazy loader, or fail EIO preserving dirty state.
+	if !fs.materializeFullForUploadLocked(fh) {
+		log.Printf("debounced flush cannot materialize full file for %s", fh.Path)
+		return gofuse.EIO
+	}
 	// Snapshot the data so the deferred upload sees a consistent copy.
 	snapshot := fh.Dirty.bytesView()
 	data := make([]byte, len(snapshot))
