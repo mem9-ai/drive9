@@ -10029,7 +10029,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		if st := fs.prepareGitOpenHandle(ctx, fh, input.Flags); st != gofuse.OK {
 			return st
 		}
-		out.Fh = fs.allocateFileHandle(fh)
+		out.Fh = fs.allocateGitWorkspaceFileHandle(fh, rt, rel)
 		out.OpenFlags = gitWorkspaceOpenFlags(rt, rel, input.Flags)
 		return gofuse.OK
 	}
