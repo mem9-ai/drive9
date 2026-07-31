@@ -45,6 +45,12 @@ type FileHandle struct {
 	GitKind           string
 	GitMode           string
 	GitBaseObjectSHA  string
+	// GitOpenSnapshot is the overlay entry content observed by a read-only
+	// prepareGitOpenHandle. It exists so a whiteout racing the rest of the
+	// open can still give the registered handle an anonymous-fd read backing
+	// (see preserveGitUnlinkedReadBacking); nil for writable opens (they
+	// preload into Dirty / the dirty mirror) and for metadata-only entries.
+	GitOpenSnapshot   []byte
 	PendingMode       uint32 // mode change deferred because a dirty handle was open
 	HasPendingMode    bool   // true when PendingMode should be applied on Release
 	PendingModeGen    uint64 // generation for PendingMode, used to avoid clearing newer chmods
