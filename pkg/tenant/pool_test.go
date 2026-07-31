@@ -1862,27 +1862,45 @@ func TestAcquireRefreshesStandaloneIdleTTL(t *testing.T) {
 	assertStoreOpen(t, b.Store())
 }
 
-func TestCloseEntryPreservesLiveTenantCounters(t *testing.T) {
-	const tenantID = "tenant-live-counter-close-entry"
+func TestCloseEntryCleansTenantRequestCounters(t *testing.T) {
+	const tenantID = "tenant-clean-counter-close-entry"
 	metrics.DeleteTenantCounters(tenantID)
 	t.Cleanup(func() { metrics.DeleteTenantCounters(tenantID) })
 
 	metrics.RecordTenantRequestCountWithOrg(tenantID, "org-live-counter", "fs", "read", 200)
-	assertTenantMetricPresent := func() {
-		t.Helper()
-		recorder := httptest.NewRecorder()
-		metrics.WritePrometheus(recorder)
-		if !strings.Contains(recorder.Body.String(), `drive9_tenant_requests_total{`) ||
-			!strings.Contains(recorder.Body.String(), `tenant_id="`+tenantID+`"`) {
-			t.Fatalf("live tenant counter disappeared from metrics:\n%s", recorder.Body.String())
-		}
+	metrics.RecordTenantInFlightWithOrg(tenantID, "org-live-counter", "fs", 2)
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	if !strings.Contains(recorder.Body.String(), `drive9_tenant_requests_total{`) ||
+		!strings.Contains(recorder.Body.String(), `tenant_id="`+tenantID+`"`) {
+		t.Fatalf("tenant request counter missing before close:\n%s", recorder.Body.String())
 	}
-	assertTenantMetricPresent()
+	if !strings.Contains(recorder.Body.String(), `drive9_tenant_inflight_requests{`) ||
+		!strings.Contains(recorder.Body.String(), `tenant_id="`+tenantID+`"`) {
+		t.Fatalf("tenant inflight gauge missing before close:\n%s", recorder.Body.String())
+	}
 
 	pool := NewPool(PoolConfig{}, nil)
 	pool.closeEntry(&entry{tenantID: tenantID})
 
-	assertTenantMetricPresent()
+	recorder = httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	if metricHasTenantID(t, recorder.Body.String(), "drive9_tenant_requests_total", tenantID) {
+		t.Fatalf("tenant request counter remained after close:\n%s", recorder.Body.String())
+	}
+	if !metricHasTenantID(t, recorder.Body.String(), "drive9_tenant_inflight_requests", tenantID) {
+		t.Fatalf("tenant inflight gauge disappeared after close:\n%s", recorder.Body.String())
+	}
+}
+
+func metricHasTenantID(t *testing.T, text, metric, tenantID string) bool {
+	t.Helper()
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, metric+"{") && strings.Contains(line, `tenant_id="`+tenantID+`"`) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestIdleEvictionSkippedByRecentAcquire(t *testing.T) {

@@ -186,6 +186,30 @@ func TestSetRequestMetricTenantForAuthStatusOnlyScopesActiveTenants(t *testing.T
 	}
 }
 
+func TestRecordTenantHTTPRequestAtCompletionDoesNotRecreateCleanedCounter(t *testing.T) {
+	const tenantID = "tenant-request-completion-cleanup"
+	metrics.DeleteTenantCounters(tenantID)
+	t.Cleanup(func() { metrics.DeleteTenantCounters(tenantID) })
+
+	ctx := withRequestMetricState(context.Background(), &requestMetricState{})
+	setRequestTenantHTTPRecorder(ctx, func() {
+		metrics.RecordTenantRequestCountWithOrg(tenantID, "org-completion-cleanup", "fs", "read", http.StatusOK)
+	})
+
+	// The auth middleware runs this before it releases the final pool reference.
+	recordTenantHTTPRequestAtCompletion(ctx)
+	metrics.DeleteTenantRequestCounters(tenantID)
+
+	// The outer observe fallback must not recreate a counter after closeEntry.
+	recordTenantHTTPRequestAtCompletion(ctx)
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	if strings.Contains(recorder.Body.String(), `drive9_tenant_requests_total{`) &&
+		strings.Contains(recorder.Body.String(), `tenant_id="`+tenantID+`"`) {
+		t.Fatalf("tenant request counter recreated after cleanup:\n%s", recorder.Body.String())
+	}
+}
+
 func TestAdjustTenantInFlightAggregatesActionsForSameSurface(t *testing.T) {
 	m := newServerMetrics()
 	if got := m.adjustTenantInFlight("tenant-inflight-actions", "org-inflight-actions", "fs", 1); got != 1 {

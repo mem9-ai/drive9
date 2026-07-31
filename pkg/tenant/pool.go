@@ -1781,6 +1781,7 @@ func (p *Pool) closeEntry(e *entry) {
 		_ = e.store.Close()
 	}
 	e.sharedDBLease.Release()
+	metrics.DeleteTenantRequestCounters(e.tenantID)
 }
 
 type tenantPoolResult string

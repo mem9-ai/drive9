@@ -388,6 +388,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			return
 		}
 		defer release()
+		defer func() { recordTenantHTTPRequestAtCompletion(r.Context()) }()
 		metricEvent(r.Context(), "auth", "result", "ok")
 		totalDuration := time.Since(authStart)
 		logger.InfoOpenPoolTiming(r.Context(), "tenant_auth_timing", totalDuration,
@@ -530,6 +531,7 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 			return
 		}
 		defer release()
+		defer func() { recordTenantHTTPRequestAtCompletion(r.Context()) }()
 
 		scope := &TenantScope{TenantID: tenantID, Provider: tenant.Provider, TiDBCloudOrgID: b.TiDBCloudOrgID(), Backend: b}
 		setRequestMetricScope(r.Context(), scope, classifyTenantRequest(r))

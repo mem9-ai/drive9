@@ -290,6 +290,18 @@ func DeleteTenantCounters(tenantID string) {
 	globalRegistry.DeleteGaugesByLabel("tenant_id", tenantID)
 }
 
+// DeleteTenantRequestCounters removes only request-counter series for a
+// tenant. Cache eviction intentionally resets request counters without
+// removing tenant gauges or histograms whose values do not share counter-reset
+// semantics.
+func DeleteTenantRequestCounters(tenantID string) {
+	tenantID = cleanMetricValue(tenantID, "unknown")
+	if tenantID == "unknown" {
+		return
+	}
+	globalRegistry.DeleteCounterByLabel("drive9_tenant_requests_total", "tenant_id", tenantID)
+}
+
 func RecordTiDBCloudRBACCacheRequest(path, scope, result string) {
 	RegisterModule("tidbcloud_quota")
 	tidbCloudRBACCacheRequestsTotal.Add(1,

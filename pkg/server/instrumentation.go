@@ -75,6 +75,9 @@ type requestMetricState struct {
 	action         string
 	tenantInFlight bool
 
+	tenantHTTPRequestRecorded bool
+	tenantHTTPRequestRecorder func()
+
 	bodyReadObserved bool
 	bodyReadMethod   string
 	bodyReadRoute    string
@@ -115,6 +118,37 @@ func metricsFromContext(ctx context.Context) *serverMetrics {
 func requestMetricStateFromContext(ctx context.Context) *requestMetricState {
 	v, _ := ctx.Value(requestMetricsKey).(*requestMetricState)
 	return v
+}
+
+func setRequestTenantHTTPRecorder(ctx context.Context, recorder func()) {
+	state := requestMetricStateFromContext(ctx)
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	state.tenantHTTPRequestRecorder = recorder
+	state.mu.Unlock()
+}
+
+// recordTenantHTTPRequestAtCompletion records tenant HTTP usage at most once.
+// Auth middleware invokes it before releasing the final backend reference so a
+// closeEntry cleanup cannot be followed by an outer observe re-creation of the
+// same tenant request counter. observe invokes it as a fallback for requests
+// that do not acquire a tenant backend through auth middleware.
+func recordTenantHTTPRequestAtCompletion(ctx context.Context) {
+	state := requestMetricStateFromContext(ctx)
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	if state.tenantHTTPRequestRecorded || state.tenantHTTPRequestRecorder == nil {
+		state.mu.Unlock()
+		return
+	}
+	state.tenantHTTPRequestRecorded = true
+	recorder := state.tenantHTTPRequestRecorder
+	state.mu.Unlock()
+	recorder()
 }
 
 // markSSEStreamEstablished signals that the SSE handler has written the
@@ -750,6 +784,19 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 	if strings.HasPrefix(r.URL.Path, "/s3/") {
 		setRequestMetricTenant(r.Context(), requestTenantID(r), "", "", "", classifyTenantRequest(r))
 	}
+	setRequestTenantHTTPRecorder(r.Context(), func() {
+		status := ow.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		dur := time.Since(start)
+		if route == sseEventsRoute && sseStreamEstablished(r.Context()) {
+			if estDur, ok := sseEstablishmentDuration(r.Context(), start); ok {
+				dur = estDur
+			}
+		}
+		recordTenantHTTPRequest(r, status, dur, ow.size)
+	})
 
 	next.ServeHTTP(rw, r)
 	if ow.status == 0 {
@@ -776,7 +823,7 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 			dur = estDur
 		}
 		s.metrics.record(r.Method, route, ow.status, dur)
-		recordTenantHTTPRequest(r, ow.status, dur, ow.size)
+		recordTenantHTTPRequestAtCompletion(r.Context())
 	} else {
 		s.metrics.record(r.Method, route, ow.status, dur)
 		if method, bodyRoute, bodyBytes, bodyReadDuration, ok := requestBodyReadMetric(r.Context()); ok {
@@ -788,7 +835,7 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 			}
 			s.metrics.recordBodyRead(method, bodyRoute, ow.status, bodyBytes, bodyReadDuration)
 		}
-		recordTenantHTTPRequest(r, ow.status, dur, ow.size)
+		recordTenantHTTPRequestAtCompletion(r.Context())
 	}
 
 	tenantID, apiKeyID, _, tidbCloudOrgID := requestMetricScope(r.Context())
