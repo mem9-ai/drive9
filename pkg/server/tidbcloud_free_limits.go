@@ -4,9 +4,9 @@ import "github.com/mem9-ai/drive9/pkg/tenant"
 
 const (
 	DefaultTiDBCloudFreeTenantCount      = 5
-	DefaultTiDBCloudFreeMaxStorageBytes  = int64(3 * (1 << 30))
-	DefaultTiDBCloudFreeMaxFileSizeBytes = int64(300 * (1 << 20))
-	DefaultTiDBCloudFreeMaxFileCount     = int64(1000)
+	DefaultTiDBCloudFreeMaxStorageBytes  = int64(5 * (1 << 30))
+	DefaultTiDBCloudFreeMaxFileSizeBytes = int64(500 * (1 << 20))
+	DefaultTiDBCloudFreeMaxFileCount     = int64(500)
 )
 
 type TiDBCloudFreePlanLimits struct {

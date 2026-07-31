@@ -11,8 +11,8 @@ func TestNormalizeTiDBCloudFreeProvisionQuota(t *testing.T) {
 	s := &Server{tidbCloudFreePlanLimits: DefaultTiDBCloudFreePlanLimits()}
 	zero := int64(0)
 	positive := int64(10)
-	storageBelow, fileSizeBelow, fileCountBelow := int64(1024), int64(100), int64(500)
-	storageAbove, fileSizeAbove, fileCountAbove := int64(3073), int64(301), int64(1001)
+	storageBelow, fileSizeBelow, fileCountBelow := int64(1024), int64(100), int64(400)
+	storageAbove, fileSizeAbove, fileCountAbove := int64(5121), int64(501), int64(501)
 	tests := []struct {
 		name    string
 		quota   *quotaRequest
@@ -22,9 +22,9 @@ func TestNormalizeTiDBCloudFreeProvisionQuota(t *testing.T) {
 		{
 			name: "omitted quota uses free defaults",
 			want: quotaFields{
-				MaxStorageSize:         int64Ptr(3072),
-				MaxFileSize:            int64Ptr(300),
-				MaxFileCount:           int64Ptr(1000),
+				MaxStorageSize:         int64Ptr(5120),
+				MaxFileSize:            int64Ptr(500),
+				MaxFileCount:           int64Ptr(500),
 				TiDBCloudSpendingLimit: int64Ptr(0),
 			},
 		},

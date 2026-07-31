@@ -4183,7 +4183,7 @@ func TestProvisionFreeTiDBCloudTenantRejectsDisallowedQuotaBeforeMutation(t *tes
 		},
 		{
 			name: "storage over cap",
-			body: map[string]any{"max_storage_size": int64(3073)},
+			body: map[string]any{"max_storage_size": int64(5121)},
 			want: tenant.ErrTiDBCloudFreeQuotaExceeded.Error(),
 		},
 		{
