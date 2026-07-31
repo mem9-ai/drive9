@@ -4575,6 +4575,132 @@ func TestApplyGitOverlayMirrorEntryUnlessWhiteout(t *testing.T) {
 	}
 }
 
+// TestGitWorkspaceOpenSpanningWhiteoutCommitMarkedUnlinked replays the exact
+// straddling schedule reproduced on the PR #804 base in
+// https://github.com/mem9-ai/drive9/issues/817#issuecomment-5138095001:
+// the whiteout POST is parked FIRST, then the open's overlay GET snapshots
+// the old upsert and parks, then the whiteout commits and Unlink returns,
+// and only then does the open resume and register. On the base this produced
+// a registered handle with Unlinked == false whose write/flush flipped the
+// fixture overlay from whiteout back to upsert; here the handle must adopt
+// the unlinked state and the whiteout must survive.
+func TestGitWorkspaceOpenSpanningWhiteoutCommitMarkedUnlinked(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.mu.Lock()
+	fixture.overlay["sync.txt"] = client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "sync.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   8,
+		// No inline content: the open's read-through does a single-entry GET,
+		// which is the park point below.
+	}
+	fixture.mu.Unlock()
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+
+	postWait := make(chan struct{})
+	postEntered := make(chan struct{})
+	getWait := make(chan struct{})
+	getEntered := make(chan struct{})
+	fixture.mu.Lock()
+	fixture.overlayPostWait = postWait
+	fixture.overlayPostEntered = postEntered
+	fixture.overlayGetWait = getWait
+	fixture.overlayGetEntered = getEntered
+	fixture.overlayGetFillContent = true
+	fixture.mu.Unlock()
+
+	// Step 1: start the whiteout unlink and park its overlay POST.
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt")
+	}()
+	select {
+	case <-postEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("whiteout POST never parked")
+	}
+
+	// Step 2: start the open; its overlay GET snapshots the old upsert (the
+	// whiteout has not committed yet) and parks before handle registration.
+	openDone := make(chan gofuse.Status, 1)
+	var openOut gofuse.OpenOut
+	go func() {
+		openDone <- fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+			Flags:    uint32(syscall.O_RDWR),
+		}, &openOut)
+	}()
+	select {
+	case <-getEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("overlay GET never parked")
+	}
+
+	// Step 3: release the whiteout and let the unlink finish — pass 1 already
+	// ran before the POST, and the post-commit pass still finds no handle.
+	close(postWait)
+	if st := <-unlinkDone; st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+
+	// Step 4: release the stale snapshot; the open resumes and registers.
+	close(getWait)
+	if st := <-openDone; st != gofuse.OK {
+		t.Fatalf("Open spanning whiteout status = %v, want OK (anonymous fd)", st)
+	}
+
+	// The straddling open adopted the unlinked state at registration.
+	fh, ok := fs.fileHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("handle missing")
+	}
+	fh.Lock()
+	unlinked := fh.Unlinked
+	fh.Unlock()
+	if !unlinked {
+		t.Fatal("handle registered after spanning the whiteout has Unlinked == false")
+	}
+
+	// Write/flush through the handle must not flip the committed whiteout
+	// back to an upsert.
+	v2 := []byte("git-v2-must-stay-local")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write after unlink on straddled handle = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: openOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush after unlink on straddled handle = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	puts := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if puts != 1 {
+		t.Fatalf("overlay puts = %d, want 1 (whiteout only) — straddled handle resurrected the entry", puts)
+	}
+	if !ok || entry.Op != "whiteout" {
+		t.Fatalf("remote overlay entry = %+v, %v — want whiteout preserved", entry, ok)
+	}
+}
+
 // TestPrepareGitOpenHandleTruncOnWhiteoutAdoptsUnlinked: an O_TRUNC open whose
 // dirty-mirror upsert races a committed whiteout must lose against the
 // whiteout (adopting the unlinked state) instead of upserting the name back
