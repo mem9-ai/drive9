@@ -6252,6 +6252,11 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+func errJSONRetryable(w http.ResponseWriter, msg string) {
+	w.Header().Set("Retry-After", "1")
+	errJSON(w, http.StatusServiceUnavailable, msg)
+}
+
 func errJSONInvalidRootDentry(w http.ResponseWriter, err error) bool {
 	if !errors.Is(err, datastore.ErrInvalidRootDentry) {
 		return false
