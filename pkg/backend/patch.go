@@ -3,9 +3,11 @@ package backend
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/mem9-ai/drive9/pkg/backend/internal/patchcopy"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
@@ -42,6 +44,8 @@ type PatchUploadPart struct {
 	ReadURL     string            `json:"read_url,omitempty"`     // presigned GET URL to download original part data (empty for parts beyond original file)
 	ReadHeaders map[string]string `json:"read_headers,omitempty"` // required headers for the GET (e.g. Range, signed into the presigned URL)
 }
+
+const patchPartCopyConcurrency = 8
 
 // InitiatePatchUpload creates a multipart upload for modifying an existing
 // large file. Only the dirty parts are uploaded by the client; unchanged parts
@@ -240,6 +244,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 		UploadID: "", // set below after DB insert
 		PartSize: partSize,
 	}
+	copyTasks := make([]patchcopy.Task, 0, len(newParts))
 
 	// Process each part
 	for _, p := range newParts {
@@ -251,20 +256,16 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 			if partEnd >= origSize {
 				partEnd = origSize - 1
 			}
-
-			_, err := b.s3.UploadPartCopy(ctx, newS3Key, mpu.UploadID, p.Number, sourceKey, partStart, partEnd)
-			if err != nil {
-				_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
-				logger.Error(ctx, "backend_patch_upload_copy_failed", zap.String("tenant_id", b.tenantID), zap.String("path", path), zap.Int("part", p.Number), zap.Error(err))
-				b.recordTenantOperation("backend", "patch_upload", "error", time.Since(start))
-				return nil, fmt.Errorf("copy part %d: %w", p.Number, err)
-			}
-			plan.CopiedParts = append(plan.CopiedParts, p.Number)
+			copyTasks = append(copyTasks, patchcopy.Task{
+				PartNumber: p.Number,
+				StartByte:  partStart,
+				EndByte:    partEnd,
+			})
 		} else {
 			// Dirty part or new part beyond original → client must upload
 			u, err := b.s3.PresignUploadPart(ctx, newS3Key, mpu.UploadID, p.Number, p.Size, s3client.ChecksumAlgoNone, "", s3client.UploadTTL)
 			if err != nil {
-				_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
+				_ = patchcopy.Abort(ctx, b.s3, newS3Key, mpu.UploadID, postS3UploadFinalizeTimeout)
 				logger.Error(ctx, "backend_patch_upload_presign_failed", zap.String("tenant_id", b.tenantID), zap.String("path", path), zap.Int("part", p.Number), zap.Error(err))
 				b.recordTenantOperation("backend", "patch_upload", "error", time.Since(start))
 				return nil, fmt.Errorf("presign part %d: %w", p.Number, err)
@@ -303,6 +304,28 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 			plan.UploadParts = append(plan.UploadParts, pup)
 		}
 	}
+	if err := patchcopy.CopyOrAbort(
+		ctx,
+		b.s3,
+		newS3Key,
+		mpu.UploadID,
+		sourceKey,
+		copyTasks,
+		patchPartCopyConcurrency,
+		postS3UploadFinalizeTimeout,
+	); err != nil {
+		var partErr *patchcopy.PartError
+		if errors.As(err, &partErr) {
+			logger.Error(ctx, "backend_patch_upload_copy_failed", zap.String("tenant_id", b.tenantID), zap.String("path", path), zap.Int("part", partErr.PartNumber), zap.Error(err))
+		} else {
+			logger.Error(ctx, "backend_patch_upload_copy_failed", zap.String("tenant_id", b.tenantID), zap.String("path", path), zap.Error(err))
+		}
+		b.recordTenantOperation("backend", "patch_upload", "error", time.Since(start))
+		return nil, fmt.Errorf("copy retained parts: %w", err)
+	}
+	for _, task := range copyTasks {
+		plan.CopiedParts = append(plan.CopiedParts, task.PartNumber)
+	}
 
 	// Insert DB records (same pattern as InitiateUploadWithChecksums)
 	now := time.Now()
@@ -312,7 +335,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	// Server-reserve-first saga (same as upload initiate).
 	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, newSize, 0)
 	if err != nil {
-		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
+		_ = patchcopy.Abort(ctx, b.s3, newS3Key, mpu.UploadID, postS3UploadFinalizeTimeout)
 		b.recordTenantOperation("backend", "patch_upload", "quota_exceeded", time.Since(start))
 		return nil, err
 	}
@@ -326,7 +349,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 		if reserved {
 			b.abortUploadReservation(ctx, uploadID, newSize)
 		}
-		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
+		_ = patchcopy.Abort(ctx, b.s3, newS3Key, mpu.UploadID, postS3UploadFinalizeTimeout)
 		b.recordTenantOperation("backend", "patch_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
 	}
@@ -335,7 +358,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 			if reserved {
 				b.abortUploadReservation(ctx, uploadID, newSize)
 			}
-			_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
+			_ = patchcopy.Abort(ctx, b.s3, newS3Key, mpu.UploadID, postS3UploadFinalizeTimeout)
 			b.recordTenantOperation("backend", "patch_upload", "error", time.Since(start))
 			return nil, fmt.Errorf("supersede active upload for %s: %w", path, err)
 		}
@@ -381,7 +404,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 		if reserved {
 			b.abortUploadReservation(ctx, uploadID, newSize)
 		}
-		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
+		_ = patchcopy.Abort(ctx, b.s3, newS3Key, mpu.UploadID, postS3UploadFinalizeTimeout)
 		logger.Error(ctx, "backend_patch_upload_insert_upload_failed", zap.String("tenant_id", b.tenantID), zap.String("path", path), zap.Error(err))
 		b.recordTenantOperation("backend", "patch_upload", "error", time.Since(start))
 		return nil, err
