@@ -611,6 +611,28 @@ func TestCopyCtxEncodesControlWhitespaceSourceHeader(t *testing.T) {
 	}
 }
 
+func TestCopyCtxEncodesDELSourceHeader(t *testing.T) {
+	const source = "/source/del\x7fname.txt"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, err := sourcePathFromRequestHeader(r, "X-Dat9-Copy-Source")
+		if err != nil {
+			t.Fatalf("decode source header: %v", err)
+		}
+		if got != source {
+			t.Fatalf("source path = %q, want %q", got, source)
+		}
+		if got := r.Header.Get("X-Dat9-Path-Encoding"); got != pathHeaderEncodingBase64URL {
+			t.Fatalf("path encoding = %q, want %q", got, pathHeaderEncodingBase64URL)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	if err := New(ts.URL, "").CopyCtx(context.Background(), source, "/destination.txt"); err != nil {
+		t.Fatalf("CopyCtx error = %v", err)
+	}
+}
+
 func TestCopyCtxPreservesEdgeSpacesInSourceHeader(t *testing.T) {
 	tests := []string{
 		" /leading.txt",
