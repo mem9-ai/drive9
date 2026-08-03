@@ -106,8 +106,14 @@ var eventBusQueryDuration = serviceMeter.Float64Histogram("drive9_event_bus_quer
 
 // fs_events table instruments. Compensates for the lack of direct TiDB
 // access: row count and prune volume are reported by the server itself.
-var fsEventsRows = sseMeter.Float64Gauge("drive9_fs_events_rows", "fs_events table row count by tenant_id/tidbcloud_org_id")
+var fsEventsRows = sseMeter.Float64Gauge("drive9_fs_events_rows", "fs_events table row count by tenant_id/tidbcloud_org_id (capped at 100000)")
 var fsEventsPrunedTotal = sseMeter.Int64Counter("drive9_fs_events_pruned_total", "fs_events rows pruned by retention cleanup")
+
+// Event retry-buffer instruments (see pkg/server/event_retry.go). The dropped
+// counter is the hard-loss SLI for the buffer: entries evicted by the
+// per-tenant or global cap, or expired before a durable insert.
+var sseEventRetryDroppedTotal = sseMeter.Int64Counter("drive9_sse_event_retry_dropped_total", "SSE event retry-buffer entries dropped before durable insert by tenant_id/tidbcloud_org_id/reason")
+var sseEventRetryBufferDepth = sseMeter.Float64Gauge("drive9_sse_event_retry_buffer_depth", "Current number of buffered SSE events awaiting retry insert")
 
 func RegisterModule(module string) {
 	globalRegistry.RegisterModule(module)
@@ -953,6 +959,27 @@ func RecordFSEventsPruned(count int64) {
 	}
 	RegisterModule("sse")
 	fsEventsPrunedTotal.Add(count)
+}
+
+// RecordSSEEventRetryDropped records one retry-buffer entry dropped before its
+// durable insert (hard event loss). reason is one of tenant_cap, global_cap,
+// or expired. Alert on any non-zero rate.
+func RecordSSEEventRetryDropped(tenantID, tidbCloudOrgID, reason string) {
+	RegisterModule("sse")
+	sseEventRetryDroppedTotal.Add(1,
+		Attr("tenant_id", cleanMetricValue(tenantID, "unknown")),
+		Attr("tidbcloud_org_id", cleanTiDBCloudOrgID(tidbCloudOrgID)),
+		Attr("reason", cleanMetricValue(reason, "unknown")),
+	)
+}
+
+// RecordSSEEventRetryBufferDepth records the current retry-buffer depth.
+func RecordSSEEventRetryBufferDepth(depth int) {
+	if depth < 0 {
+		return
+	}
+	RegisterModule("sse")
+	sseEventRetryBufferDepth.Set(float64(depth))
 }
 
 func WritePrometheus(w http.ResponseWriter) {

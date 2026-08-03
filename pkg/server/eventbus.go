@@ -23,6 +23,10 @@ type ChangeEvent struct {
 
 const (
 	eventBusListenerChanSize = 1 // signal-only channel
+	// eventPageSize is the max number of events one EventsSince call returns.
+	// Callers (SSE Phase-1 replay and Phase-2 poll) must loop on a full page:
+	// a short page signals the backlog is drained.
+	eventPageSize = 1000
 )
 
 // EventBus is a per-tenant event hub backed by the durable fs_events table.
@@ -30,7 +34,7 @@ const (
 // all pods. The local notify channel provides instant push to same-pod SSE
 // clients; cross-pod events are discovered via the central tenant_notify_outbox
 // table in the meta DB (polled by a single global notifyPoller per pod, not a
-// per-bus goroutine) and optionally via direct pod-to-pod HTTP push.
+// per-bus goroutine).
 //
 // The store field is an atomic pointer so it can be safely refreshed by
 // eventBuses.get (when the pool recreates a backend) while SSE handlers read it.
@@ -40,8 +44,8 @@ const (
 // kept every serverless tenant TiDB awake (RCU cost). Now cross-pod discovery is
 // centralized: a single notifyPoller reads the lightweight tenant_notify_outbox
 // (in the always-provisioned meta DB) and calls Publish() on matching buses.
-// A podNotifier additionally pushes notifications to peers for <10ms latency.
-// Neither path touches a tenant TiDB unless that tenant actually has new events.
+// That path never touches a tenant TiDB unless the tenant actually has new
+// events.
 type EventBus struct {
 	tenantID       string
 	tidbCloudOrgID string
@@ -49,6 +53,10 @@ type EventBus struct {
 	mu             sync.Mutex
 	listeners      map[uint64]chan struct{}
 	nextID         uint64
+	// lastSweepUnix throttles the lazy fs_events retention sweep on the write
+	// path to at most once per fsEventsSweepInterval per tenant. The bus is
+	// per-tenant, so one atomic per bus gives the per-tenant throttle.
+	lastSweepUnix atomic.Int64
 }
 
 // NewEventBus creates a new EventBus backed by the given tenant store.
@@ -106,8 +114,8 @@ func (eb *EventBus) SetMetricOrgID(tidbCloudOrgID string) {
 }
 
 // HasListeners returns true if this bus currently has at least one subscriber.
-// Used by the notify poller and pod notifier to skip tenants with no local SSE
-// connections (avoiding unnecessary wakeups).
+// Used by the notify poller to skip tenants with no local SSE connections
+// (avoiding unnecessary wakeups).
 func (eb *EventBus) HasListeners() bool {
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
@@ -117,8 +125,7 @@ func (eb *EventBus) HasListeners() bool {
 // Publish signals all local subscribers that a new event is available.
 // The actual event row is inserted into fs_events by the caller (publishEvent)
 // before calling Publish; this method only wakes same-pod SSE clients for instant
-// delivery. Cross-pod clients discover new rows via the central notifyPoller
-// or pod-to-pod HTTP push.
+// delivery. Cross-pod clients discover new rows via the central notifyPoller.
 func (eb *EventBus) Publish() {
 	eb.mu.Lock()
 	for _, ch := range eb.listeners {
@@ -132,7 +139,7 @@ func (eb *EventBus) Publish() {
 
 // Subscribe registers a new listener. Returns a unique ID and a signal channel.
 // The channel receives a signal whenever new events are published locally or
-// discovered by the central notifyPoller / received via pod-to-pod push.
+// discovered by the central notifyPoller.
 func (eb *EventBus) Subscribe() (uint64, chan struct{}) {
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
@@ -182,7 +189,7 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 		return nil, headSeq, false
 	}
 	queryStart := time.Now()
-	rows, err := store.ListFSEventsSince(ctx, int64(since), 1000)
+	rows, err := store.ListFSEventsSince(ctx, int64(since), eventPageSize)
 	metrics.RecordEventBusQuery(eb.tenantID, "events_since", queryResult(err), time.Since(queryStart))
 	if err != nil {
 		// Table missing or query failed: don't send reset on every poll —

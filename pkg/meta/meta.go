@@ -4647,8 +4647,8 @@ func (s *Store) UpsertPod(ctx context.Context, podID, addr string) (err error) {
 	return err
 }
 
-// ListActivePods returns all active pods excluding selfID. Used by the pod
-// notifier to build its peer list for cross-pod HTTP push.
+// ListActivePods returns all active pods excluding selfID. Used by the shard
+// resolver to build the active pod ring and by tests to verify registration.
 func (s *Store) ListActivePods(ctx context.Context, selfID string) (out []PodRow, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_active_pods", start, &err)
@@ -4998,21 +4998,32 @@ func (s *Store) MaxTenantNotifyID(ctx context.Context) (out uint64, err error) {
 	return out, nil
 }
 
+// tenantOutboxCursorFreshnessBound is the maximum age of a cursor's
+// updated_at for that cursor to hold back outbox pruning. A pod whose
+// heartbeat is healthy but whose outbox poller is stuck stops refreshing its
+// cursor; ignoring cursors older than this bound prevents such a stalled pod
+// from pinning MIN(last_id) forever and growing the 1-hour outbox unboundedly.
+const tenantOutboxCursorFreshnessBound = 10 * time.Minute
+
 // DeleteTenantNotifyBefore prunes outbox rows older than the given threshold.
 // Leader-gated; retention is relative to DB insert time (created_at). Rows are
-// only pruned up to the minimum last_id across all pods' cursors so a lagging
-// pod that has not yet processed a row does not lose its work signal. When no
-// cursors exist (e.g. before any pod has registered), falls back to age-only
-// pruning.
+// only pruned up to the minimum last_id across pods' cursors so a lagging pod
+// that has not yet processed a row does not lose its work signal. Cursors
+// whose updated_at is older than tenantOutboxCursorFreshnessBound are ignored
+// when computing that floor: SSE notify rows are lossy hints, and pruning past
+// a stalled pod's cursor is safe because its connected clients recover via
+// reconnect replay. When no fresh cursors remain (e.g. before any pod has
+// registered), pruning falls back to age alone.
 func (s *Store) DeleteTenantNotifyBefore(ctx context.Context, before time.Time) (n int64, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "delete_tenant_notify_before", start, &err)
+	freshSince := start.Add(-tenantOutboxCursorFreshnessBound)
 	res, err := s.db.ExecContext(ctx, `DELETE FROM tenant_notify_outbox
 WHERE created_at < ?
 AND (
-  NOT EXISTS (SELECT 1 FROM tenant_outbox_cursor)
-  OR id <= (SELECT MIN(last_id) FROM tenant_outbox_cursor)
-)`, before)
+  NOT EXISTS (SELECT 1 FROM tenant_outbox_cursor WHERE updated_at >= ?)
+  OR id <= (SELECT MIN(last_id) FROM tenant_outbox_cursor WHERE updated_at >= ?)
+)`, before, freshSince, freshSince)
 	if err != nil {
 		return 0, err
 	}

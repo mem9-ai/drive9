@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -614,7 +615,7 @@ func TestSSEResetFlushWhenSeqTooOld(t *testing.T) {
 	publishTestEvent(t, store, bus, "/a.txt", "write", "actor1")
 
 	// Delete all events to simulate cleanup pruning.
-	if _, err := store.DeleteFSEventsBefore(context.Background(), time.Now().Add(time.Hour)); err != nil {
+	if _, _, err := store.DeleteFSEventsBefore(context.Background(), time.Now().Add(time.Hour), 1000, 10); err != nil {
 		t.Fatal(err)
 	}
 
@@ -727,5 +728,135 @@ func TestSSEResetWhenFutureCursor(t *testing.T) {
 	// initial connection, EventsSince(999) returns ok=false → reset immediately.
 	if ev.Event != "reset" {
 		t.Fatalf("expected reset for future cursor, got %q", ev.Event)
+	}
+}
+
+// bulkInsertFSEvents inserts n fs_events rows directly (bypassing the bus) in
+// multi-row batches for speed. Returns nothing; seqs are assigned by the
+// table's AUTO_INCREMENT (reset to 1 by newTestStoreForSSE).
+func bulkInsertFSEvents(t *testing.T, store *datastore.Store, n int) {
+	t.Helper()
+	ctx := context.Background()
+	for start := 0; start < n; start += 200 {
+		batch := min(200, n-start)
+		var sb strings.Builder
+		sb.WriteString("INSERT INTO fs_events (path, op, actor, ts) VALUES ")
+		args := make([]any, 0, batch*2)
+		for i := 0; i < batch; i++ {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("(?, 'write', 'bulk', ?)")
+			args = append(args, fmt.Sprintf("/bulk/%d.txt", start+i), int64(start+i))
+		}
+		if _, err := store.DB().ExecContext(ctx, sb.String(), args...); err != nil {
+			t.Fatalf("bulk insert at %d: %v", start, err)
+		}
+	}
+}
+
+// TestSSEEndpointPhase1DrainsMultiPageBacklog verifies that a reconnect with a
+// backlog larger than one EventsSince page streams the entire backlog during
+// Phase 1 (loop until a short page), ending with a heartbeat at the head.
+func TestSSEEndpointPhase1DrainsMultiPageBacklog(t *testing.T) {
+	srv, store := newSSETestServer(t)
+
+	const total = eventPageSize + 50
+	bulkInsertFSEvents(t, store, total)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// since=1 → replay seq 2..total (more than one eventPageSize page).
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	events := 0
+	for {
+		ev, ok := readSSEEvent(scanner)
+		if !ok {
+			t.Fatalf("stream ended after %d events before the end-of-replay heartbeat", events)
+		}
+		switch ev.Event {
+		case "file_changed":
+			events++
+		case "heartbeat":
+			if events != total-1 {
+				t.Fatalf("replayed %d events before heartbeat, want %d (multi-page drain)", events, total-1)
+			}
+			var data map[string]uint64
+			if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
+				t.Fatalf("unmarshal heartbeat: %v", err)
+			}
+			if data["seq"] != total {
+				t.Fatalf("heartbeat seq = %d, want %d", data["seq"], total)
+			}
+			return
+		}
+	}
+}
+
+// TestSSEEndpointPhase2EventDrivenDrain verifies that a single notify wake
+// drains a backlog larger than one page: pollAndSend re-polls immediately on
+// a full page instead of waiting for the next notify signal.
+func TestSSEEndpointPhase2EventDrivenDrain(t *testing.T) {
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
+
+	// One existing event so the client can connect at head with no replay.
+	publishTestEvent(t, store, bus, "/existing.txt", "write", "")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+
+	// First event must be the end-of-Phase-1 heartbeat (caught up at head).
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial heartbeat")
+	}
+	if ev.Event != "heartbeat" {
+		t.Fatalf("first event = %q, want heartbeat", ev.Event)
+	}
+
+	// Commit a > 1 page backlog directly, then send ONE notify signal. The
+	// event-driven drain must deliver all of them on that single wake.
+	const backlog = eventPageSize + 10
+	bulkInsertFSEvents(t, store, backlog)
+	bus.Publish()
+
+	for i := 0; i < backlog; i++ {
+		ev, ok := readSSEEvent(scanner)
+		if !ok {
+			t.Fatalf("stream ended after %d/%d drained events", i, backlog)
+		}
+		if ev.Event != "file_changed" {
+			t.Fatalf("event %d = %q, want file_changed", i, ev.Event)
+		}
 	}
 }

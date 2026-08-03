@@ -77,6 +77,10 @@ type TenantWorkerOptions struct {
 	PerTenantConcurrency int
 	// MaintenanceInterval throttles piggybacked maintenance per tenant.
 	MaintenanceInterval time.Duration
+	// FSEventsRetention is how long fs_events rows are kept before the
+	// piggybacked maintenance sweep prunes them (backstop for the lazy
+	// write-path sweep). Defaults to defaultFSEventsRetention.
+	FSEventsRetention time.Duration
 }
 
 func (o *TenantWorkerOptions) normalize() {
@@ -103,6 +107,9 @@ func (o *TenantWorkerOptions) normalize() {
 	}
 	if o.MaintenanceInterval <= 0 {
 		o.MaintenanceInterval = defaultTenantMaintenanceInterval
+	}
+	if o.FSEventsRetention <= 0 {
+		o.FSEventsRetention = defaultFSEventsRetention
 	}
 }
 
@@ -586,7 +593,12 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 	m.lastMaintenance[target.tenantID] = now
 	m.mu.Unlock()
 
-	// fs_events cleanup: prune rows older than fsEventsRetention.
+	// fs_events cleanup: prune rows older than the configured retention.
+	// Deletes are batched (fsEventsSweepBatchSize rows per statement, capped at
+	// fsEventsSweepMaxBatches per sweep) so a hot tenant's first sweep after a
+	// long over-retention period cannot hit TiDB transaction size limits.
+	// hasMore means the cap was hit with leftover rows; they drain on the next
+	// maintenance cycle (or via the lazy write-path sweep).
 	if count, err := target.store.CountFSEvents(ctx); err != nil {
 		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "event_bus", "fs_events_count", metrics.ResultForError(err), 0)
 	} else if count > 0 {
@@ -594,7 +606,7 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 	} else {
 		metrics.DeleteFSEventsRowsWithOrg(target.tenantID, target.metricOrgID())
 	}
-	if n, err := target.store.DeleteFSEventsBefore(ctx, now.Add(-fsEventsRetention)); err != nil {
+	if n, hasMore, err := target.store.DeleteFSEventsBefore(ctx, now.Add(-m.opts.FSEventsRetention), fsEventsSweepBatchSize, fsEventsSweepMaxBatches); err != nil {
 		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "event_bus", "retention_sweep", metrics.ResultForError(err), 0)
 		if ctx.Err() == nil {
 			logger.Warn(ctx, "tenant_worker_fs_events_cleanup_failed",
@@ -603,6 +615,11 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 	} else {
 		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "event_bus", "retention_sweep", "ok", 0)
 		metrics.RecordFSEventsPruned(n)
+		if hasMore {
+			logger.Info(ctx, "tenant_worker_fs_events_cleanup_has_more",
+				zap.String("tenant_id", target.tenantID),
+				zap.Int64("deleted", n))
+		}
 	}
 
 	// Observation metrics: sample queue depth + dead-letter count.

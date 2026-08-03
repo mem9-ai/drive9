@@ -228,10 +228,7 @@ staleness is bounded: once reconnected, either replay or full reset eliminates
 it. Clients that cannot tolerate any staleness should re-stat on every read
 while disconnected rather than trusting cached state.
 
-The retention window for `fs_events` is controlled server-side (the leader
-periodically deletes events older than a configured age). The longer your
-client stays disconnected, the higher the chance of a `seq_too_old` reset.
-Reconnect promptly.
+The retention window for `fs_events` is controlled server-side and is operator-configurable via the `DRIVE9_FS_EVENTS_RETENTION` env var (Go duration string, default `1h`; the intended production value is `168h` = 7 days). Rows older than the retention are pruned lazily — the sweep rides the write path and runs at most once per hour per active tenant, plus a throttled backstop in the tenant worker — so over-retention can occur: a tenant that goes idle simply keeps its last rows until it becomes active again, and a consumer whose cursor is older than the retention may still get a longer replay. Never rely on data older than the configured retention being present. The longer your client stays disconnected, the higher the chance of a `seq_too_old` reset. Reconnect promptly.
 
 ## Multi-client isolation
 
@@ -255,8 +252,8 @@ Two edge cases to design for:
 
 The drive9 event bus is **per-process**. In a multi-pod deployment, each pod
 owns the SSE connections it serves and fans out events to other pods via a
-shared notification table in the central meta DB (polled at ~200 ms) plus a
-pod-to-pod push. This works, but the lowest-latency and most reliable
+shared notification table in the central meta DB (polled at ~200 ms). This
+works, but the lowest-latency and most reliable
 configuration is **tenant-sticky routing**: ensure the load balancer routes
 all of a tenant's SSE connections (and ideally its writes) to the same pod.
 
@@ -345,6 +342,8 @@ unknown `reason` as a full reset).
   paths, filter client-side on the `path` field.
 - **No ordering guarantee across tenants.** Within a single tenant, events are
   delivered in `seq` order. There is no cross-tenant ordering.
+- **`seq` is a persistence order, not a causal order.** `seq` is assigned when the event row is durably inserted; an event whose insert transiently failed is retried in the background and sequenced at flush time, so consumers can observe bounded reorder around transient insert failures (e.g. B-then-A where A's mutation happened first). Treat events as idempotent hints: on any ambiguity (a `create` for a path you thought existed, a `write` before its `mkdir`), re-fetch the current state with `GET`/`HEAD /v1/fs/<path>` instead of applying events as a strict ordered change log. Use `ts` only for loose ordering, and expect holes in `seq` (a shared `AUTO_INCREMENT` sequence interleaves tenants and burned ids).
+- **No per-consumer acks, and no webhook/MQ channel.** The server never tracks which consumer saw which event, and SSE is the only push channel — there is no webhook or message-queue delivery. A consumer that falls behind past the retention window receives `reset(seq_too_old)` on reconnect; the official recovery path is a full re-listing of the filesystem followed by a fresh stream from the new cursor. Customers that must survive week-long consumer process outages need a separate mechanism, not this stream.
 - **Event payload is metadata only.** `file_changed` tells you a path changed;
   it does not include the new content, size, or revision. To get the new state,
   issue a `GET /v1/fs/<path>` or `HEAD /v1/fs/<path>` after invalidating.

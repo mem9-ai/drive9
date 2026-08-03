@@ -99,24 +99,30 @@ func (s *Store) OldestFSEventSeq(ctx context.Context) (int64, error) {
 	return seq.Int64, nil
 }
 
-// CountFSEvents returns the total number of rows in fs_events. Used by the
-// leader cleanup goroutine to report drive9_fs_events_rows so operators can
-// monitor table growth without direct DB access.
+// fsEventsCountCap bounds the rows scanned by CountFSEvents. With 7-day
+// retention a hot tenant's fs_events table can hold millions of rows, and a
+// full-table COUNT(*) per maintenance interval would become expensive; the
+// count is an observability gauge, not a correctness input, so a capped count
+// is sufficient.
+const fsEventsCountCap = 100000
+
+// CountFSEvents returns the number of rows in fs_events, capped at
+// fsEventsCountCap: the result is exact below the cap and equal to the cap
+// when more rows exist. Used by the tenant worker's piggybacked maintenance to
+// report drive9_fs_events_rows so operators can monitor table growth without
+// direct DB access.
 //
-// Note: COUNT(*) is a full table scan on TiDB/MySQL InnoDB (unlike PostgreSQL's
-// index-only count). This runs only every fsEventsCleanupInterval (5m) on the
-// leader per tenant with a cached backend, so the cost is bounded and
-// best-effort. If the table grows to millions of rows per tenant and this
-// becomes expensive, switch to a bounded condition (e.g.
-// `WHERE created_at > NOW() - INTERVAL 2 HOUR`) or an approximate count from
-// information_schema.TABLES.
+// The cap keeps the query bounded: COUNT(*) is a full table scan on
+// TiDB/MySQL InnoDB (unlike PostgreSQL's index-only count), so the count runs
+// over a LIMIT-ed subquery instead of the whole table.
 func (s *Store) CountFSEvents(ctx context.Context) (int64, error) {
-	q := `SELECT COUNT(*) FROM fs_events`
-	var args []any
+	q := `SELECT COUNT(*) FROM (SELECT 1 FROM fs_events`
+	args := s.scope.Args()
 	if s.scope.Shared() {
 		q += ` WHERE fs_id = ?`
-		args = s.scope.Args()
 	}
+	q += ` LIMIT ?) AS t`
+	args = append(args, fsEventsCountCap)
 	var count int64
 	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count fs_events: %w", err)
@@ -124,21 +130,47 @@ func (s *Store) CountFSEvents(ctx context.Context) (int64, error) {
 	return count, nil
 }
 
-// DeleteFSEventsBefore deletes fs_events rows older than the given threshold.
+// DeleteFSEventsBefore deletes fs_events rows older than the given threshold
+// in batches of at most batchSize rows per DELETE statement, stopping after
+// maxBatches batches. It returns the total number of deleted rows; hasMore is
+// true when the batch cap was hit while (likely) more rows remain — callers
+// should let the leftover drain on the next sweep cycle.
+//
+// Batching bounds the statement cost: the price of one unbounded DELETE is
+// driven by table size, not rows matched, and a 7-day hot tenant can hold
+// millions of rows — the first sweep after a long idle over-retention period
+// (or after a retention decrease) would otherwise hit TiDB transaction size
+// limits.
+//
 // Retention is gated on created_at (DB server's clock at INSERT time), not on
 // the ts field (publisher's clock at event emission). This means the retention
 // guarantee is relative to DB insert time, not event time. If a future feature
 // lets clients reason about retention by ts, a separate index on ts and a
 // ts-based deletion path would be needed. For now, created_at is indexed and
 // sufficient because the SSE protocol uses seq (not ts) for cursor management.
-func (s *Store) DeleteFSEventsBefore(ctx context.Context, before time.Time) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM fs_events WHERE `+s.scope.And(`created_at < ?`), s.scope.Args(before)...)
-	if err != nil {
-		return 0, fmt.Errorf("delete fs_events before %s: %w", before, err)
+func (s *Store) DeleteFSEventsBefore(ctx context.Context, before time.Time, batchSize, maxBatches int) (deleted int64, hasMore bool, err error) {
+	if batchSize <= 0 {
+		return 0, false, fmt.Errorf("delete fs_events: batchSize must be positive, got %d", batchSize)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
+	if maxBatches <= 0 {
+		return 0, false, fmt.Errorf("delete fs_events: maxBatches must be positive, got %d", maxBatches)
 	}
-	return n, nil
+	stmt := `DELETE FROM fs_events WHERE ` + s.scope.And(`created_at < ?`) + ` LIMIT ?`
+	for batch := 0; batch < maxBatches; batch++ {
+		res, execErr := s.db.ExecContext(ctx, stmt, s.scope.Args(before, batchSize)...)
+		if execErr != nil {
+			return deleted, false, fmt.Errorf("delete fs_events before %s (batch %d): %w", before, batch, execErr)
+		}
+		n, rowsErr := res.RowsAffected()
+		if rowsErr != nil {
+			return deleted, false, fmt.Errorf("delete fs_events before %s rows affected: %w", before, rowsErr)
+		}
+		deleted += n
+		if n < int64(batchSize) {
+			// Short batch: no more rows older than before remain.
+			return deleted, false, nil
+		}
+	}
+	// The cap was hit after a full batch: more rows likely remain.
+	return deleted, true, nil
 }

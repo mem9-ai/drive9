@@ -483,8 +483,6 @@ func requestRoute(path string) string {
 		return "/v1/sql"
 	case path == sseEventsRoute:
 		return sseEventsRoute
-	case path == sseNotifyInternalRoute:
-		return sseNotifyInternalRoute
 	case path == "/v1/fork":
 		return "/v1/fork"
 	case path == "/v1/fs:batch-stat":

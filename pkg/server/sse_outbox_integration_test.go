@@ -1,12 +1,9 @@
 package server
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"net"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -22,22 +19,20 @@ import (
 )
 
 // sseOutboxTestCluster sets up two drive9 server instances (simulating two pods)
-// sharing the same central meta DB, each with its own eventBuses and the new SSE
-// notify infrastructure (poller + pod notifier + pod registry). A single tenant
-// is provisioned so both pods can serve SSE events for it.
+// sharing the same central meta DB, each with its own eventBuses and the SSE
+// notify infrastructure (poller + pod registry). A single tenant is
+// provisioned so both pods can serve SSE events for it.
 type sseOutboxTestCluster struct {
 	metaStore *meta.Store
 	podA      *Server
 	podB      *Server
-	podAAddr  string
-	podBAddr  string
 	tenantID  string
 	token     string
 }
 
 // newSSEOutboxTestCluster creates two server instances with SSE cross-pod
 // notification enabled. Both share the same MySQL meta DB and the same tenant
-// (whose data DB is also the test MySQL). Each pod runs its own notifyPoller
+// (whose data DB is also the test MySQL). Each pod runs its own outbox poller
 // and the pods are registered as peers of each other.
 func newSSEOutboxTestCluster(t *testing.T) *sseOutboxTestCluster {
 	t.Helper()
@@ -139,7 +134,6 @@ func newSSEOutboxTestCluster(t *testing.T) *sseOutboxTestCluster {
 	}
 
 	// Shared SSE config for both pods.
-	podNotifySecret := []byte("test-pod-secret")
 	s3Dir := t.TempDir()
 
 	// Helper to create a pool for each pod (each pool needs its own enc).
@@ -157,81 +151,40 @@ func newSSEOutboxTestCluster(t *testing.T) *sseOutboxTestCluster {
 		return pool
 	}
 
-	// Pre-allocate httptest listeners so we know the addresses before creating
-	// the servers. This lets us pass the correct PodAddr to NewWithConfig.
-	lnA, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = lnA.Close() })
-	lnB, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = lnB.Close() })
-	podAAddr := "http://" + lnA.Addr().String()
-	podBAddr := "http://" + lnB.Addr().String()
-
-	// Pod A: create server with the pre-allocated address.
+	// Pod A.
 	leaderMgrA := leader.NewManager(nil, leader.WithDisabled())
 	podA := NewWithConfig(Config{
-		Meta:            metaStore,
-		Pool:            newPool(),
-		Provisioner:     &fakeProvisioner{provider: tenant.ProviderDB9},
-		TokenSecret:     tokenSecret,
-		S3Dir:           s3Dir,
-		PodID:           "pod-a",
-		PodAddr:         podAAddr,
-		PodNotifySecret: podNotifySecret,
-		Leader:          leaderMgrA,
-		Logger:          zap.NewNop(),
+		Meta:        metaStore,
+		Pool:        newPool(),
+		Provisioner: &fakeProvisioner{provider: tenant.ProviderDB9},
+		TokenSecret: tokenSecret,
+		S3Dir:       s3Dir,
+		PodID:       "pod-a",
+		PodAddr:     "http://127.0.0.1:18001",
+		Leader:      leaderMgrA,
+		Logger:      zap.NewNop(),
 	})
 	t.Cleanup(func() { podA.Close() })
-
-	podASrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == sseNotifyInternalRoute {
-			podA.handleInternalSSENotify(w, r)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	podASrv.Listener = lnA
-	podASrv.Start()
-	t.Cleanup(podASrv.Close)
 
 	// Pod B.
 	leaderMgrB := leader.NewManager(nil, leader.WithDisabled())
 	podB := NewWithConfig(Config{
-		Meta:            metaStore,
-		Pool:            newPool(),
-		Provisioner:     &fakeProvisioner{provider: tenant.ProviderDB9},
-		TokenSecret:     tokenSecret,
-		S3Dir:           s3Dir,
-		PodID:           "pod-b",
-		PodAddr:         podBAddr,
-		PodNotifySecret: podNotifySecret,
-		Leader:          leaderMgrB,
-		Logger:          zap.NewNop(),
+		Meta:        metaStore,
+		Pool:        newPool(),
+		Provisioner: &fakeProvisioner{provider: tenant.ProviderDB9},
+		TokenSecret: tokenSecret,
+		S3Dir:       s3Dir,
+		PodID:       "pod-b",
+		PodAddr:     "http://127.0.0.1:18002",
+		Leader:      leaderMgrB,
+		Logger:      zap.NewNop(),
 	})
 	t.Cleanup(func() { podB.Close() })
-
-	podBSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == sseNotifyInternalRoute {
-			podB.handleInternalSSENotify(w, r)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	podBSrv.Listener = lnB
-	podBSrv.Start()
-	t.Cleanup(podBSrv.Close)
 
 	return &sseOutboxTestCluster{
 		metaStore: metaStore,
 		podA:      podA,
 		podB:      podB,
-		podAAddr:  podASrv.URL,
-		podBAddr:  podBSrv.URL,
 		tenantID:  tenantID,
 		token:     tok,
 	}
@@ -378,48 +331,21 @@ func TestSSEOutboxSubscriptionReporting(t *testing.T) {
 	}
 }
 
-// TestSSEOutboxInternalEndpointRejection verifies that the internal endpoint
-// rejects requests with wrong/missing auth and wrong method.
-func TestSSEOutboxInternalEndpointRejection(t *testing.T) {
-	tc := newSSEOutboxTestCluster(t)
-
-	// Wrong method.
-	req := httptest.NewRequest(http.MethodGet, sseNotifyInternalRoute, nil)
-	w := httptest.NewRecorder()
-	tc.podA.handleInternalSSENotify(w, req)
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("expected 405 for GET, got %d", w.Code)
-	}
-
-	// Missing auth.
-	body := `{"tenant_id":"x","seq":1}`
-	req2 := httptest.NewRequest(http.MethodPost, sseNotifyInternalRoute, bytes.NewReader([]byte(body)))
-	w2 := httptest.NewRecorder()
-	tc.podA.handleInternalSSENotify(w2, req2)
-	if w2.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for missing auth, got %d", w2.Code)
-	}
-
-	// Wrong auth.
-	req3 := httptest.NewRequest(http.MethodPost, sseNotifyInternalRoute, bytes.NewReader([]byte(body)))
-	req3.Header.Set("Authorization", "Bearer wrong")
-	w3 := httptest.NewRecorder()
-	tc.podA.handleInternalSSENotify(w3, req3)
-	if w3.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for wrong auth, got %d", w3.Code)
-	}
-}
-
 // TestSSEOutboxStalePodSweep verifies that the leader's SweepStalePods marks
-// pods with expired heartbeats as stale and cleans up their subscriptions.
+// pods with expired heartbeats as stale and cleans up their subscriptions and
+// outbox cursor rows.
 func TestSSEOutboxStalePodSweep(t *testing.T) {
 	tc := newSSEOutboxTestCluster(t)
 
-	// Register a "dead" pod with a stale heartbeat and a subscription.
+	// Register a "dead" pod with a stale heartbeat, a subscription, and an
+	// outbox cursor row.
 	if err := tc.metaStore.UpsertPod(context.Background(), "dead-pod", "http://127.0.0.1:1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := tc.metaStore.UpsertPodSubscriptions(context.Background(), "dead-pod", []string{tc.tenantID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tc.metaStore.UpsertTenantOutboxCursor(context.Background(), "dead-pod", 42); err != nil {
 		t.Fatal(err)
 	}
 
@@ -452,6 +378,12 @@ func TestSSEOutboxStalePodSweep(t *testing.T) {
 	}
 	if len(subs) != 0 {
 		t.Fatalf("dead-pod subscriptions should be empty after sweep; got %v", subs)
+	}
+
+	// Its tenant_outbox_cursor row should be deleted too, so the stale cursor
+	// cannot hold back outbox pruning (MIN(last_id) floor).
+	if _, err := tc.metaStore.GetTenantOutboxCursor(context.Background(), "dead-pod"); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("dead-pod cursor should be deleted after sweep; got err=%v", err)
 	}
 }
 

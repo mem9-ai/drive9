@@ -3,7 +3,6 @@ package server
 import (
 	"bufio"
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -22,19 +21,32 @@ const (
 	sseFlushBatchSize    = 10
 	sseFlushMaxDelay     = 1 * time.Millisecond
 
+	// sseReplayHeartbeatInterval bounds how long a Phase-1 backlog drain may
+	// stream without an interleaved heartbeat; LB and client idle timeouts
+	// would otherwise kill multi-minute replays.
+	sseReplayHeartbeatInterval = 5 * time.Second
+	// sseMaxFullPagesPerWake caps how many consecutive full event pages a
+	// single Phase-2 wake drains before yielding back to the select loop, so
+	// a large backlog cannot starve heartbeats and disconnect handling.
+	sseMaxFullPagesPerWake = 10
+
+	// fsEventsSweepInterval throttles the lazy fs_events retention sweep on
+	// the write path to at most once per hour per tenant.
+	fsEventsSweepInterval = 1 * time.Hour
+	// fsEventsSweepBatchSize caps rows deleted per DELETE statement in one
+	// retention sweep; fsEventsSweepMaxBatches caps statements per sweep.
+	// Leftover rows drain on the next sweep.
+	fsEventsSweepBatchSize  = 5000
+	fsEventsSweepMaxBatches = 20
+	// fsEventsLazySweepTimeout bounds one detached lazy sweep so a slow
+	// tenant DB cannot leak the goroutine.
+	fsEventsLazySweepTimeout = 5 * time.Minute
+
 	// sseEventsRoute is the SSE change-notification stream endpoint. It is the
 	// only SSE route today; observe uses this constant (plus the
 	// sseStreamEstablished context flag) to distinguish real SSE connection
 	// lifetimes from bounded error responses on the same route.
 	sseEventsRoute = "/v1/events"
-
-	// sseNotifyInternalRoute is the pod-to-pod SSE push endpoint. It receives
-	// a lightweight {tenant_id, seq} POST from a peer pod that just wrote an
-	// fs_events row, so this pod can wake its local SSE subscribers for that
-	// tenant without waiting for the 200ms notifyPoller fallback. Registered
-	// directly on the mux (not through the tenant auth middleware chain) and
-	// authenticated via a shared internal bearer secret.
-	sseNotifyInternalRoute = "/v1/internal/sse-notify"
 )
 
 // stopTimer drains a timer's channel after stopping it to prevent spurious
@@ -164,8 +176,8 @@ func (ebs *eventBuses) getWithOrg(tenantID, tidbCloudOrgID string, store *datast
 
 // getIfExists returns the EventBus for tenantID if one already exists, or nil
 // if no bus has been created for that tenant. Unlike get, it does NOT create a
-// new bus. Used by the notifyPoller and pod notifier to wake only tenants that
-// have local SSE subscribers — skipping idle tenants avoids touching their TiDB.
+// new bus. Used by the notifyPoller to wake only tenants that have local SSE
+// subscribers — skipping idle tenants avoids touching their TiDB.
 func (ebs *eventBuses) getIfExists(tenantID string) *EventBus {
 	ebs.mu.RLock()
 	defer ebs.mu.RUnlock()
@@ -215,21 +227,23 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 	ctx := r.Context()
 	// Step 1: Insert the durable event row into the per-tenant fs_events table.
 	// This is the authoritative event content (path/op/actor/ts) and the source
-	// of the monotonic seq cursor. Best-effort: if the INSERT fails (network
-	// blip, table missing pre-migration, conn pool exhaustion), the event is
-	// lost for cross-pod SSE clients — they won't see it via the outbox or push
-	// since there's no DB row. However, local SSE clients still get instant
-	// delivery via the notify channel below (their EventsSince will find no new
-	// rows but the notify signal wakes them to re-check, returning empty =
-	// caught up). FUSE correctness is maintained by HEAD revalidation regardless.
+	// of the monotonic seq cursor. Best-effort: a failed INSERT never fails the
+	// enclosing mutation — the event is enqueued into the per-pod retry buffer
+	// (event_retry.go) and flushed with backoff; the buffer's second wake then
+	// delivers it to SSE clients. Buffer overflow is counted per tenant as hard
+	// loss. Local SSE clients still get instant delivery via the notify channel
+	// below regardless (their EventsSince will find no new rows but the notify
+	// signal wakes them to re-check, returning empty = caught up). FUSE
+	// correctness is maintained by HEAD revalidation regardless.
 	// For existing tenants without the fs_events table (pre-migration), the
 	// INSERT will fail until EnsureTiDBSchemaForAutoEmbeddingProfile creates the
 	// table (triggered automatically by the CRC32 schema version bump).
+	ts := time.Now().UnixMilli()
 	var seq int64
 	store := bus.store.Load()
 	if store != nil {
 		var err error
-		seq, err = store.InsertFSEvent(ctx, path, op, actor, time.Now().UnixMilli())
+		seq, err = store.InsertFSEvent(ctx, path, op, actor, ts)
 		if err != nil {
 			logger.Warn(ctx, "sse_publish_fs_event_insert_failed",
 				zap.String("tenant_id", bus.tenantID),
@@ -237,6 +251,15 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 				zap.String("op", op),
 				zap.Error(err))
 			metrics.RecordTenantOperationWithOrg(bus.tenantID, bus.TiDBCloudOrgID(), "event_bus", "publish", metrics.ResultForError(err), 0)
+			if s.eventRetry != nil {
+				s.eventRetry.enqueue(bus, path, op, actor, ts)
+			}
+		} else {
+			// Successful insert: lazily sweep expired rows, throttled per
+			// tenant. Writes are the only operation that both creates rows and
+			// guarantees the tenant DB is already awake, so the sweep rides the
+			// write path instead of a periodic task.
+			s.maybeSweepFSEvents(ctx, bus, store)
 		}
 	}
 
@@ -256,60 +279,49 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 	bus.Publish()
 }
 
-// notifyPushRequest is the JSON body for POST /v1/internal/sse-notify. This
-// legacy pod-to-pod push endpoint is retained for backward compatibility; the
-// unified outbox poller is the primary cross-pod delivery path.
-type notifyPushRequest struct {
-	TenantID string `json:"tenant_id"`
-	Seq      uint64 `json:"seq"`
-}
-
-// handleInternalSSENotify receives a pod-to-pod push notification from a
-// peer pod. The peer just wrote an fs_events row for tenant_id and is
-// notifying this pod (which has SSE subscribers for that tenant) to wake them
-// immediately rather than waiting for the 200ms unified outbox poller.
-//
-// Authenticated via a shared internal bearer secret (PodNotifySecret) compared
-// in constant time. Registered directly on the mux, NOT through the tenant auth
-// middleware — this endpoint has no tenant scope.
-//
-// Fire-and-forget semantics: the peer does not wait for a response. If this
-// pod's bus for the tenant no longer exists (all subscribers disconnected),
-// Publish is a no-op. EventsSince on the next wake reads the actual event
-// content from the tenant's fs_events table.
-func (s *Server) handleInternalSSENotify(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+// maybeSweepFSEvents runs the fs_events retention sweep for the tenant at most
+// once per fsEventsSweepInterval, on a detached background goroutine so it
+// never adds mutation latency. Over-retention has no correctness cost (a
+// consumer whose cursor is older than the retention simply gets a longer
+// replay), so leftover rows and failures are fine: failures are metrics + warn
+// logs only, and rows beyond the batch cap drain on the next sweep.
+func (s *Server) maybeSweepFSEvents(ctx context.Context, bus *EventBus, store *datastore.Store) {
+	now := time.Now().Unix()
+	last := bus.lastSweepUnix.Load()
+	if now-last < int64(fsEventsSweepInterval/time.Second) {
 		return
 	}
-	// Validate the shared internal secret. If no secret is configured, the
-	// internal endpoint is disabled (404-equivalent: reject all requests).
-	if len(s.podNotifySecret) == 0 {
-		errJSON(w, http.StatusNotFound, "not found")
+	if !bus.lastSweepUnix.CompareAndSwap(last, now) {
 		return
 	}
-	tok := bearerToken(r)
-	if tok == "" || subtle.ConstantTimeCompare([]byte(tok), s.podNotifySecret) != 1 {
-		errJSON(w, http.StatusUnauthorized, "unauthorized")
-		return
+	retention := s.fsEventsRetention
+	if retention <= 0 {
+		// Hand-constructed servers (tests) may skip NewWithConfig defaults.
+		retention = defaultFSEventsRetention
 	}
-	var req notifyPushRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.TenantID == "" {
-		errJSON(w, http.StatusBadRequest, "missing tenant_id")
-		return
-	}
-	// Wake local SSE subscribers for this tenant. If no bus exists (no local
-	// subscribers), this is a no-op — the peer's route table was slightly stale.
-	// The tenant's TiDB is NOT queried here; the SSE handler will call
-	// EventsSince only when it actually has a subscriber to deliver to.
-	if bus := s.events.getIfExists(req.TenantID); bus != nil {
-		bus.Publish()
-	}
-	w.WriteHeader(http.StatusNoContent)
+	go func() {
+		// Detach from the request context: a client disconnect must not abort
+		// the sweep, but the sweep must not outlive a slow tenant DB either.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), fsEventsLazySweepTimeout)
+		defer cancel()
+		deleted, hasMore, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-retention), fsEventsSweepBatchSize, fsEventsSweepMaxBatches)
+		if err != nil {
+			logger.Warn(ctx, "fs_events_lazy_sweep_failed",
+				zap.String("tenant_id", bus.tenantID),
+				zap.Error(err))
+			metrics.RecordTenantOperationWithOrg(bus.tenantID, bus.TiDBCloudOrgID(), "event_bus", "retention_sweep", metrics.ResultForError(err), 0)
+			return
+		}
+		metrics.RecordTenantOperationWithOrg(bus.tenantID, bus.TiDBCloudOrgID(), "event_bus", "retention_sweep", "ok", 0)
+		metrics.RecordFSEventsPruned(deleted)
+		if hasMore {
+			// Batch cap hit with leftover rows: they drain on the next
+			// write-path sweep or tenant-worker maintenance cycle.
+			logger.Info(ctx, "fs_events_lazy_sweep_has_more",
+				zap.String("tenant_id", bus.tenantID),
+				zap.Int64("deleted", deleted))
+		}
+	}()
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -371,6 +383,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	phase1Start := time.Now()
 	events, headSeq, ok := bus.EventsSince(ctx, since)
 	lastSeen := since
+	// lastSuccessfulPoll tracks the last EventsSince that returned ok=true;
+	// the optional Phase-2 liveness poll uses it to detect signal loss.
+	lastSuccessfulPoll := time.Now()
+	lastHeartbeat := lastSuccessfulPoll
 
 	bw := newSSEBufferedWriter(w, flusher)
 
@@ -386,16 +402,46 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, reason)
 		lastSeen = headSeq
 	} else {
-		for _, ev := range events {
-			sendSSEEvent(bw, ev)
-			if isStructuralOp(ev.Op) {
-				// Structural ops are emitted as reset events (see sendSSEEvent),
-				// so count them as resets, not file_changed deliveries.
-				metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, "structural_change")
-			} else {
-				metrics.RecordSSEEventSentWithOrg(tenantID, tidbCloudOrgID, ev.Op)
+		// Drain the replay backlog: one EventsSince call returns at most
+		// eventPageSize rows, so loop until a short page signals the end.
+		// Flush after each full batch and interleave a heartbeat when the
+		// drain runs long so LB/client idle timeouts don't kill the replay.
+		for {
+			for _, ev := range events {
+				sendSSEEvent(bw, ev)
+				if isStructuralOp(ev.Op) {
+					// Structural ops are emitted as reset events (see sendSSEEvent),
+					// so count them as resets, not file_changed deliveries.
+					metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, "structural_change")
+				} else {
+					metrics.RecordSSEEventSentWithOrg(tenantID, tidbCloudOrgID, ev.Op)
+				}
+				lastSeen = ev.Seq
 			}
-			lastSeen = ev.Seq
+			if len(events) < eventPageSize {
+				break // backlog drained
+			}
+			if err := bw.Flush(); err != nil {
+				return
+			}
+			if time.Since(lastHeartbeat) > sseReplayHeartbeatInterval {
+				sendSSEHeartbeat(bw, lastSeen)
+				metrics.RecordSSEHeartbeatSentWithOrg(tenantID, tidbCloudOrgID)
+				lastHeartbeat = time.Now()
+				if err := bw.Flush(); err != nil {
+					return
+				}
+			}
+			events, headSeq, ok = bus.EventsSince(ctx, lastSeen)
+			if !ok {
+				// The cursor went stale mid-drain (a retention sweep raced the
+				// replay): same reset contract as the initial ok=false path.
+				sendSSEReset(bw, headSeq, "seq_too_old")
+				metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, "seq_too_old")
+				lastSeen = headSeq
+				break
+			}
+			lastSuccessfulPoll = time.Now()
 		}
 	}
 	// End the initial replay/reset phase with an immediate heartbeat so
@@ -412,13 +458,26 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	metrics.RecordSSEPhase1WithOrg(tenantID, tidbCloudOrgID, time.Since(phase1Start))
 
 	// Phase 2: Live stream with micro-batching.
-	// The notify channel catches same-pod events instantly. A 1s poll ticker
-	// catches cross-pod events (writes on other pods that inserted into the
-	// shared fs_events table). The EventBus's per-bus poll goroutine handles
-	// cross-pod discovery and signals via the notify channel — no per-connection
-	// poll ticker needed (P1-6 optimization).
+	// The notify channel catches same-pod events instantly; cross-pod events
+	// are discovered by the tenantOutboxPoller (meta DB only) and delivered via
+	// the same channel — no per-connection poll ticker needed. Delivery of a
+	// full event page re-polls immediately (event-driven drain) so a backlog
+	// larger than one page cannot stall until the next write.
 	heartbeat := time.NewTicker(sseHeartbeatInterval)
 	defer heartbeat.Stop()
+
+	// Optional liveness poll (default off): covers signal loss — e.g. a
+	// meta-DB outage in which outbox rows are never written — for connected
+	// clients only. When the ticker fires and no EventsSince has succeeded
+	// within the interval, poll once. It never touches tenant DBs of tenants
+	// without a live SSE connection.
+	var livenessC <-chan time.Time
+	var livenessTicker *time.Ticker
+	if s.sseLivenessPollInterval > 0 {
+		livenessTicker = time.NewTicker(s.sseLivenessPollInterval)
+		livenessC = livenessTicker.C
+		defer livenessTicker.Stop()
+	}
 
 	// Use a nil timer that we allocate on first need. Starting with
 	// time.NewTimer(0) and immediately stopping can leave a stale tick
@@ -433,30 +492,56 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// pollAndSend queries fs_events for new rows since lastSeen and streams them.
-	// Returns false if the stream should terminate (write error or reset sent).
+	// A full page (eventPageSize events) means the backlog likely continues, so
+	// it polls again immediately — up to sseMaxFullPagesPerWake consecutive full
+	// pages per wake, then flushes and yields to the select loop; a short page
+	// disarms. Returns false if the stream should terminate (write error).
 	pollAndSend := func() bool {
-		liveEvents, liveHead, liveOK := bus.EventsSince(ctx, lastSeen)
-		if !liveOK {
-			sendSSEReset(bw, liveHead, "seq_too_old")
-			metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, "seq_too_old")
-			lastSeen = liveHead
-			if err := bw.Flush(); err != nil {
-				return false
+		for fullPages := 0; ; {
+			liveEvents, liveHead, liveOK := bus.EventsSince(ctx, lastSeen)
+			if !liveOK {
+				sendSSEReset(bw, liveHead, "seq_too_old")
+				metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, "seq_too_old")
+				lastSeen = liveHead
+				if err := bw.Flush(); err != nil {
+					return false
+				}
+				if flushTimer != nil {
+					stopTimer(flushTimer)
+					flushC = nil
+				}
+				return true
 			}
-			if flushTimer != nil {
-				stopTimer(flushTimer)
-				flushC = nil
+			lastSuccessfulPoll = time.Now()
+			for _, ev := range liveEvents {
+				sendSSEEvent(bw, ev)
+				if isStructuralOp(ev.Op) {
+					metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, "structural_change")
+				} else {
+					metrics.RecordSSEEventSentWithOrg(tenantID, tidbCloudOrgID, ev.Op)
+				}
+				lastSeen = ev.Seq
 			}
-			return true
-		}
-		for _, ev := range liveEvents {
-			sendSSEEvent(bw, ev)
-			if isStructuralOp(ev.Op) {
-				metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, "structural_change")
-			} else {
-				metrics.RecordSSEEventSentWithOrg(tenantID, tidbCloudOrgID, ev.Op)
+			if len(liveEvents) == eventPageSize {
+				fullPages++
+				if fullPages < sseMaxFullPagesPerWake {
+					// More rows likely pending: flush what is buffered and poll
+					// again immediately instead of waiting for the next notify.
+					if bw.count > 0 {
+						if err := bw.Flush(); err != nil {
+							return false
+						}
+						if flushTimer != nil {
+							stopTimer(flushTimer)
+							flushC = nil
+						}
+					}
+					continue
+				}
+				// Per-wake cap reached: fall through to the normal flush path.
+				// The next notify (or liveness tick) resumes the drain.
 			}
-			lastSeen = ev.Seq
+			break
 		}
 		if bw.count > 0 {
 			if bw.shouldFlush() {
@@ -493,6 +578,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if flushTimer != nil {
 				stopTimer(flushTimer)
 				flushC = nil
+			}
+		case <-livenessC:
+			if time.Since(lastSuccessfulPoll) >= s.sseLivenessPollInterval {
+				if !pollAndSend() {
+					return
+				}
 			}
 		case <-flushC:
 			if bw.count > 0 {

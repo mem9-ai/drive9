@@ -71,12 +71,15 @@ func TestFSEventsSharedShapeParity(t *testing.T) {
 	if _, err := store.DB().Exec(`UPDATE fs_events SET created_at = ? WHERE seq = ?`, old, seq1); err != nil {
 		t.Fatalf("age row: %v", err)
 	}
-	deleted, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-time.Hour))
+	deleted, hasMore, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-time.Hour), 1000, 10)
 	if err != nil {
 		t.Fatalf("DeleteFSEventsBefore: %v", err)
 	}
 	if deleted != 1 {
 		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+	if hasMore {
+		t.Fatal("hasMore = true, want false after short final batch")
 	}
 	events, err = store.ListFSEventsSince(ctx, 0, 10)
 	if err != nil {
@@ -145,12 +148,15 @@ func TestFSEventsSharedShapeInterleaving(t *testing.T) {
 	}
 
 	// A's retention sweep must delete only A's rows.
-	deleted, err := storeA.DeleteFSEventsBefore(ctx, time.Now().Add(time.Hour))
+	deleted, hasMore, err := storeA.DeleteFSEventsBefore(ctx, time.Now().Add(time.Hour), 1000, 10)
 	if err != nil {
 		t.Fatalf("DeleteFSEventsBefore A: %v", err)
 	}
 	if deleted != 3 {
 		t.Fatalf("A deleted = %d, want 3", deleted)
+	}
+	if hasMore {
+		t.Fatal("A hasMore = true, want false")
 	}
 	eventsB, err := storeB.ListFSEventsSince(ctx, 0, 10)
 	if err != nil {
