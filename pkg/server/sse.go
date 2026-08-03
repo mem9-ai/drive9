@@ -419,6 +419,12 @@ func (s *Server) maybeSweepSharedFSEvents(store *datastore.Store, tidbCloudOrgID
 		if s.meta != nil {
 			claimed, err := s.meta.ClaimSharedMaintenanceRun(ctx, sharedFSEventsSweepClaimName, sharedFSEventsSweepInterval)
 			if err != nil {
+				// Meta-DB blip: restore the per-pod pre-filter so the NEXT
+				// trigger retries instead of waiting out the full interval.
+				// (A lost claim keeps the pre-filter set — another pod
+				// sweeping is the intended backoff; a lost race on this
+				// restore is harmless.)
+				s.lastSharedSweepUnix.CompareAndSwap(now, last)
 				logger.Warn(ctx, "shared_fs_events_sweep_claim_failed", zap.Error(err))
 				metrics.RecordTenantOperationWithOrg(sharedPoolMetricTenantID, tidbCloudOrgID, "event_bus", "retention_sweep_shared", metrics.ResultForError(err), 0)
 				return
@@ -661,6 +667,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			stopTimer(catchupTimer)
 		}
 		catchupC = nil
+		// The drain is over (short page) or abandoned (reset): clear the
+		// error-backoff counter too, so the next error starts from the base
+		// delay instead of a stale inflated one.
+		catchupErrs = 0
 	}
 
 	// pollAndSend queries fs_events for new rows since lastSeen and streams them.
@@ -693,16 +703,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if qErr != nil {
 				// Tolerated query error (EventsSinceE already logged/metriced
 				// it): deliver nothing and keep the connection — that part is
-				// deliberate. Do NOT disarm the catch-up timer: if this wake
-				// came from the timer itself, it is already spent, so re-arm
-				// it (with bounded exponential backoff on consecutive errors)
-				// or the in-progress burst drain dies here; a notify- or
-				// liveness-driven wake leaves any armed timer untouched and
-				// does not create a new one (no fresh polling against a quiet
-				// stream's failing DB). Also do NOT stamp lastSuccessfulPoll
-				// (a FAILED poll is not a success; the liveness poll must
-				// still detect the signal loss).
-				if fromCatchup {
+				// deliberate. Do NOT abandon the drain: re-arm the timer
+				// (with bounded exponential backoff on consecutive errors)
+				// whenever this wake came from the timer itself OR this wake
+				// already delivered full pages — full pages mean a backlog
+				// definitively exists, and the timer is the only thing that
+				// resumes the drain without another write. Only a quiet
+				// stream's first-poll failure (fullPages==0, not fromCatchup)
+				// starts no timer: no fresh polling against a quiet stream's
+				// failing DB. Also do NOT stamp lastSuccessfulPoll (a FAILED
+				// poll is not a success; the liveness poll must still detect
+				// the signal loss).
+				if fromCatchup || fullPages > 0 {
 					catchupErrs++
 					armCatchup(sseCatchupBackoff(catchupErrs))
 				}

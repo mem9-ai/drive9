@@ -165,7 +165,7 @@ The target is "drops ≈ 0, transient insert failures recovered by the buffer, c
 ## Deployment and observability
 
 - Config: set `DRIVE9_FS_EVENTS_RETENTION=168h`. Leave `DRIVE9_SSE_NOTIFY_RETENTION` at its 1h default. Startup logs the effective retention; production checklist verifies it.
-- Pre-production checklist: run the cursor-upsert freshness test (`TestUpsertTenantOutboxCursorRefreshesUpdatedAt`, pkg/meta) against real TiDB before enabling the freshness-bound prune floor — the `ON DUPLICATE KEY UPDATE` assignment-order semantics it depends on are covered on MySQL 8.0 only.
+- Pre-production checklist: run the cursor-upsert freshness test (`TestUpsertTenantOutboxCursorRefreshesUpdatedAt`, pkg/meta) and the maintenance-claim test (`TestClaimSharedMaintenanceRun`, pkg/meta) against real TiDB before enabling the freshness-bound prune floor and the cluster-wide sweep claim — the `ON DUPLICATE KEY UPDATE` assignment-order semantics and the `INTERVAL ?` placeholder they depend on are covered on MySQL 8.0 only.
 - Rollback: 1h → 7d needs no catch-up delete; 7d → 1h triggers a one-time large purge drained by the batched sweeper over multiple cycles (or run the manual operator sweep).
 - Alerts: the SLIs above, plus per-tenant `drive9_fs_events_rows` for capacity tracking.
 - Capacity: size tenant DB storage at peak write rate × 168 h per tenant.

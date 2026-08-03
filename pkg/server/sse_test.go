@@ -1170,3 +1170,81 @@ func TestSSEEndpointPhase2QueryErrorBackoffResumesDrain(t *testing.T) {
 		t.Fatalf("poll calls = %d, want >= 9 (3 initial + 3 errors + 3 drain)", got)
 	}
 }
+
+// TestSSEEndpointPhase2NotifyWakeQueryErrorStartsCatchup verifies the H1
+// path: a NOTIFY wake delivers a full page and its immediate inner-loop
+// re-poll fails — the backlog definitively exists (a full page was just
+// delivered), so the catch-up timer must arm even though the wake did not
+// come from the timer. With no further notify, the tail must still drain
+// once the error clears.
+func TestSSEEndpointPhase2NotifyWakeQueryErrorStartsCatchup(t *testing.T) {
+	oldPage, oldCap := eventPageSize, sseMaxFullPagesPerWake
+	eventPageSize, sseMaxFullPagesPerWake = 50, 3
+	t.Cleanup(func() { eventPageSize, sseMaxFullPagesPerWake = oldPage, oldCap })
+
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
+
+	// One existing event so the client can connect at head with no replay.
+	publishTestEvent(t, store, bus, "/existing.txt", "write", "")
+
+	// Inject exactly ONE query error on the 2nd poll: the notify wake's first
+	// poll returns a full page, its inner-loop re-poll fails.
+	realEventsSinceE := eventsSinceE
+	var pollCalls atomic.Int32
+	eventsSinceE = func(eb *EventBus, ctx context.Context, since uint64) ([]ChangeEvent, uint64, bool, error) {
+		if pollCalls.Add(1) == 2 {
+			return nil, since, true, fmt.Errorf("injected mid-wake db error")
+		}
+		return realEventsSinceE(eb, ctx, since)
+	}
+	t.Cleanup(func() { eventsSinceE = realEventsSinceE })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+
+	// First event must be the end-of-Phase-1 heartbeat (caught up at head).
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial heartbeat")
+	}
+	if ev.Event != "heartbeat" {
+		t.Fatalf("first event = %q, want heartbeat", ev.Event)
+	}
+
+	// Commit a 5-page burst (page=50, cap=3) and send ONE notify signal.
+	// The wake delivers page 1, fails on the page-2 poll, and must arm the
+	// catch-up timer; the remaining 4 pages arrive on timer fires with NO
+	// further Publish.
+	const backlog = 250
+	bulkInsertFSEvents(t, store, backlog)
+	bus.Publish()
+
+	for i := 0; i < backlog; i++ {
+		ev, ok := readSSEEvent(scanner)
+		if !ok {
+			t.Fatalf("stream ended after %d/%d events (notify-wake query error did not arm the catch-up timer)", i, backlog)
+		}
+		if ev.Event != "file_changed" {
+			t.Fatalf("event %d = %q, want file_changed", i, ev.Event)
+		}
+	}
+	if got := pollCalls.Load(); got < 7 {
+		t.Fatalf("poll calls = %d, want >= 7 (1 page + 1 error + 5 drain)", got)
+	}
+}
