@@ -14,6 +14,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 	"github.com/mem9-ai/drive9/pkg/tenantctx"
@@ -100,6 +101,9 @@ func backendErrorStatus(ctx context.Context, err error) int {
 	if isClientCanceled(ctx, err) {
 		return statusClientClosedRequest
 	}
+	if errors.Is(err, s3client.ErrCAMMetadataUnavailable) {
+		return http.StatusServiceUnavailable
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return http.StatusGatewayTimeout
 	}
@@ -116,7 +120,12 @@ func backendErrorStatus(ctx context.Context, err error) int {
 }
 
 func writeBackendError(w http.ResponseWriter, r *http.Request, err error) {
-	errJSON(w, backendErrorStatus(r.Context(), err), sanitizeClientError(err))
+	status := backendErrorStatus(r.Context(), err)
+	if status == http.StatusServiceUnavailable {
+		errJSONRetryable(w, sanitizeClientError(err))
+		return
+	}
+	errJSON(w, status, sanitizeClientError(err))
 }
 
 func ScopeFromContext(ctx context.Context) *TenantScope {

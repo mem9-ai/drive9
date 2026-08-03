@@ -3,8 +3,10 @@ package s3client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -16,6 +18,19 @@ import (
 )
 
 const camMetaBase = "http://metadata.tencentyun.com/latest/meta-data/cam/security-credentials/"
+
+var ErrCAMMetadataUnavailable = errors.New("cam metadata temporarily unavailable")
+
+const (
+	camMetadataRequestTimeout = 2 * time.Second
+	camMetadataMaxAttempts    = 3
+	camMetadataRetryBackoff   = 100 * time.Millisecond
+	camCredentialRefreshAhead = 5 * time.Minute
+	camCredentialFallbackMin  = time.Minute
+
+	camMetadataListRolesOperation      = "cam_metadata_list_roles"
+	camMetadataGetCredentialsOperation = "cam_metadata_get_credentials"
+)
 
 func isTencentEndpoint(endpoint string) bool {
 	if len(endpoint) == 0 {
@@ -50,61 +65,92 @@ func tencentSecretKey() string {
 }
 
 type camProvider struct {
-	mu        sync.Mutex
-	cached    aws.Credentials
-	expiresAt time.Time
-	client    *http.Client
+	mu           sync.Mutex
+	cached       aws.Credentials
+	expiresAt    time.Time
+	client       *http.Client
+	metadataURL  string
+	maxAttempts  int
+	retryBackoff time.Duration
+	refreshAhead time.Duration
+	fallbackMin  time.Duration
+	keepExpiry   bool
 }
 
 func newCAMProvider() *camProvider {
 	return &camProvider{
-		client: &http.Client{Timeout: 5 * time.Second},
+		client:       &http.Client{Timeout: camMetadataRequestTimeout},
+		metadataURL:  camMetaBase,
+		maxAttempts:  camMetadataMaxAttempts,
+		retryBackoff: camMetadataRetryBackoff,
+		refreshAhead: camCredentialRefreshAhead,
+		fallbackMin:  camCredentialFallbackMin,
 	}
+}
+
+func newCAMCredentialsProvider(provider *camProvider, refreshAhead time.Duration) *aws.CredentialsCache {
+	return aws.NewCredentialsCache(provider, func(options *aws.CredentialsCacheOptions) {
+		options.ExpiryWindow = refreshAhead
+	})
 }
 
 func (p *camProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if time.Now().Before(p.expiresAt.Add(-5 * time.Minute)) {
+	now := time.Now()
+	if now.Before(p.expiresAt.Add(-p.refreshAhead)) {
+		p.keepExpiry = false
 		return p.cached, nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, camMetaBase, nil)
+	creds, expiry, err := p.retrieveFresh(ctx)
 	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("cam: create list roles request: %w", err)
+		if errors.Is(err, ErrCAMMetadataUnavailable) &&
+			p.cached.AccessKeyID != "" &&
+			time.Now().Before(p.expiresAt.Add(-p.fallbackMin)) {
+			p.keepExpiry = true
+			return p.cached, nil
+		}
+		p.keepExpiry = false
+		return aws.Credentials{}, err
 	}
-	resp, err := p.client.Do(req)
+	p.cached = creds
+	p.expiresAt = expiry
+	p.keepExpiry = false
+	return p.cached, nil
+}
+
+func (p *camProvider) AdjustExpiresBy(creds aws.Credentials, duration time.Duration) (aws.Credentials, error) {
+	p.mu.Lock()
+	keepExpiry := p.keepExpiry
+	p.keepExpiry = false
+	p.mu.Unlock()
+	if keepExpiry || !creds.CanExpire {
+		return creds, nil
+	}
+	creds.Expires = creds.Expires.Add(duration)
+	return creds, nil
+}
+
+func (p *camProvider) retrieveFresh(ctx context.Context) (aws.Credentials, time.Time, error) {
+	listStart := time.Now()
+	body, err := p.fetchMetadata(ctx, p.metadataURL, "cam: list roles")
 	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("cam: list roles: %w", err)
-	}
-	body, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("cam: read list roles response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return aws.Credentials{}, fmt.Errorf("cam: list roles: status %d", resp.StatusCode)
+		recordS3Operation(camMetadataListRolesOperation, camMetadataResult(err), listStart)
+		return aws.Credentials{}, time.Time{}, err
 	}
 	roleName := strings.TrimSpace(string(body))
 	if roleName == "" {
-		return aws.Credentials{}, fmt.Errorf("cam: no role bound to instance")
+		recordS3Operation(camMetadataListRolesOperation, "role_missing", listStart)
+		return aws.Credentials{}, time.Time{}, fmt.Errorf("cam: no role bound to instance")
 	}
+	recordS3Operation(camMetadataListRolesOperation, "ok", listStart)
 
-	req, err = http.NewRequestWithContext(ctx, http.MethodGet, camMetaBase+roleName, nil)
+	credentialsStart := time.Now()
+	body, err = p.fetchMetadata(ctx, p.metadataURL+roleName, fmt.Sprintf("cam: get credentials for %s", roleName))
 	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("cam: create get credentials request: %w", err)
-	}
-	resp, err = p.client.Do(req)
-	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("cam: get credentials for %s: %w", roleName, err)
-	}
-	body, err = io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("cam: read get credentials response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return aws.Credentials{}, fmt.Errorf("cam: get credentials: status %d", resp.StatusCode)
+		recordS3Operation(camMetadataGetCredentialsOperation, camMetadataResult(err), credentialsStart)
+		return aws.Credentials{}, time.Time{}, err
 	}
 
 	var creds struct {
@@ -114,24 +160,137 @@ func (p *camProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 		Expiration   string `json:"Expiration"`
 	}
 	if err := json.Unmarshal(body, &creds); err != nil {
-		return aws.Credentials{}, fmt.Errorf("cam: parse credentials: %w", err)
+		recordS3Operation(camMetadataGetCredentialsOperation, "invalid_response", credentialsStart)
+		return aws.Credentials{}, time.Time{}, fmt.Errorf("cam: parse credentials: %w", err)
+	}
+	if creds.TmpSecretId == "" || creds.TmpSecretKey == "" {
+		recordS3Operation(camMetadataGetCredentialsOperation, "invalid_response", credentialsStart)
+		return aws.Credentials{}, time.Time{}, fmt.Errorf("cam: credentials response is missing access key fields")
 	}
 
 	expiry, err := time.Parse(time.RFC3339, creds.Expiration)
 	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("cam: parse expiration %q: %w", creds.Expiration, err)
+		recordS3Operation(camMetadataGetCredentialsOperation, "invalid_response", credentialsStart)
+		return aws.Credentials{}, time.Time{}, fmt.Errorf("cam: parse expiration %q: %w", creds.Expiration, err)
 	}
+	recordS3Operation(camMetadataGetCredentialsOperation, "ok", credentialsStart)
 
-	p.cached = aws.Credentials{
+	return aws.Credentials{
 		AccessKeyID:     creds.TmpSecretId,
 		SecretAccessKey: creds.TmpSecretKey,
 		SessionToken:    creds.Token,
 		Source:          "TencentCAMRole",
 		CanExpire:       true,
 		Expires:         expiry,
+	}, expiry, nil
+}
+
+func (p *camProvider) fetchMetadata(ctx context.Context, url, operation string) ([]byte, error) {
+	attempts := p.maxAttempts
+	if attempts < 1 {
+		attempts = 1
 	}
-	p.expiresAt = expiry
-	return p.cached, nil
+	var lastErr error
+	lastRetryable := false
+	for attempt := 1; attempt <= attempts; attempt++ {
+		body, retryable, err := p.fetchMetadataOnce(ctx, url, operation)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		lastRetryable = retryable
+		if !retryable || attempt == attempts {
+			break
+		}
+		if err := waitForCAMRetry(ctx, p.retryBackoff*time.Duration(attempt)); err != nil {
+			return nil, fmt.Errorf("%s: %w", operation, err)
+		}
+	}
+	if lastRetryable {
+		return nil, &camMetadataUnavailableError{err: lastErr}
+	}
+	return nil, lastErr
+}
+
+func (p *camProvider) fetchMetadataOnce(ctx context.Context, url, operation string) ([]byte, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("%s: create request: %w", operation, err)
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, ctx.Err() == nil, fmt.Errorf("%s: %w", operation, err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if readErr != nil {
+		return nil, ctx.Err() == nil, fmt.Errorf("%s: read response: %w", operation, readErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError
+		return nil, retryable, fmt.Errorf("%s: %w", operation, &camMetadataStatusError{statusCode: resp.StatusCode})
+	}
+	return body, false, nil
+}
+
+type camMetadataStatusError struct {
+	statusCode int
+}
+
+func (e *camMetadataStatusError) Error() string {
+	return fmt.Sprintf("metadata status %d", e.statusCode)
+}
+
+type camMetadataUnavailableError struct {
+	err error
+}
+
+func (e *camMetadataUnavailableError) Error() string {
+	return e.err.Error()
+}
+
+func (e *camMetadataUnavailableError) Unwrap() error {
+	return e.err
+}
+
+func (e *camMetadataUnavailableError) Is(target error) bool {
+	return target == ErrCAMMetadataUnavailable
+}
+
+func camMetadataResult(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && networkErr.Timeout() {
+		return "timeout"
+	}
+	var statusErr *camMetadataStatusError
+	if errors.As(err, &statusErr) {
+		switch {
+		case statusErr.statusCode == http.StatusTooManyRequests:
+			return "throttled"
+		case statusErr.statusCode >= http.StatusInternalServerError:
+			return "server_error"
+		default:
+			return "rejected"
+		}
+	}
+	return "unavailable"
+}
+
+func waitForCAMRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func credentialsForTencent(cfg AWSConfig) (aws.CredentialsProvider, error) {
@@ -148,7 +307,8 @@ func credentialsForTencent(cfg AWSConfig) (aws.CredentialsProvider, error) {
 		}
 		return credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, sessionToken), nil
 	}
-	return newCAMProvider(), nil
+	provider := newCAMProvider()
+	return newCAMCredentialsProvider(provider, provider.refreshAhead), nil
 }
 
 func newTencent(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
