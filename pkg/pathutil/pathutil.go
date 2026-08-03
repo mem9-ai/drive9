@@ -31,6 +31,11 @@ func canonicalize(raw string, isDir bool) (string, error) {
 		if b == 0x00 {
 			return "", fmt.Errorf("path contains NUL character")
 		}
+		// Preserve LF, tab, and CR in names for compatibility with existing
+		// files. All other control characters remain invalid path bytes.
+		if b == '\n' || b == '\t' || b == '\r' {
+			continue
+		}
 		if b >= 0x01 && b <= 0x1f {
 			return "", fmt.Errorf("path contains control character 0x%02x", b)
 		}
