@@ -335,7 +335,7 @@ func escapeFSPath(path string) string {
 const pathHeaderEncodingBase64URL = "base64url"
 
 func setSourcePathHeader(req *http.Request, header, path string) {
-	if !strings.ContainsAny(path, "\r\n\t") && !strings.HasPrefix(path, " ") && !strings.HasSuffix(path, " ") {
+	if !strings.ContainsAny(path, "\r\n\t\x7f") && !strings.HasPrefix(path, " ") && !strings.HasSuffix(path, " ") {
 		req.Header.Set(header, path)
 		return
 	}
