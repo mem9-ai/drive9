@@ -976,7 +976,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "",
+      "description": "Physical shared DB-pool count by lifecycle status for this organization.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -989,7 +989,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
         "y": 38
       },
@@ -1015,66 +1015,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (db_pool_uuid, type) (drive9_shared_db_pool_capacity{tidbcloud_org_id=\"$org\"})",
-          "legendFormat": "{{db_pool_uuid}} / {{type}}",
+          "expr": "sum by (status) (drive9_shared_db_pool_total{tidbcloud_org_id=\"$org\"})",
+          "legendFormat": "{{status}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Shared Physical Pool Capacity",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "description": "",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 38
-      },
-      "id": 20,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (db_pool_uuid, state) (drive9_shared_db_pool_tenants{tidbcloud_org_id=\"$org\"})",
-          "legendFormat": "{{db_pool_uuid}} / {{state}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Shared Physical Pool Tenants",
+      "title": "Shared Physical Pools by Status",
       "type": "timeseries"
     },
     {

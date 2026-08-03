@@ -40,7 +40,7 @@ dashboard is organized as:
   reserve slots, reserve depletion, total storage usage, storage usage ratio,
   request rate, 5xx ratio, and compact organization-wide trends.
 - **Pool Capacity and Supply**: free tenant bindings, configured reserve target,
-  metadata resume waits, and native-shared physical database supply.
+  metadata resume waits, and the active shared DB-pool count.
 - **Organization Database Resources**: organization-scoped dedicated
   `role="user"` handles and shared `role="shared"` / `role="shared_schema"`
   handles. Tenant DB operation latency is not shown because its histogram does
