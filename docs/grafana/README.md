@@ -100,6 +100,13 @@ in Organization Overview.
 `drive9_tenant_pool_bindings` is a gauge with labels `pool_id`,
 `tidbcloud_org_id`, and `status`. Current used tenants for an organization are:
 
+The dashboards intentionally do not display `drive9_tenant_count`. That metric
+has only a server-global `status` label, so it cannot answer an organization
+question. It is also written by the current leader without being cleared when
+leadership is lost, so multi-replica `sum` or `max` aggregation can preserve an
+overlapping or stale snapshot. Organization Overview therefore uses
+`drive9_tenant_pool_bindings` for organization-scoped tenant counts.
+
 ```promql
 sum(drive9_tenant_pool_bindings{tidbcloud_org_id="$org",status="used"})
 ```
@@ -162,11 +169,41 @@ shows no data when no positive reserve target exists.
 
 ## Validation performed for this dashboard set
 
-The dashboard files use Grafana schema version 41. Before handoff, dashboard-only
-checks were run for JSON parsing, exactly three supported JSON files, unique
-panel IDs, non-overlapping grids, variable references, PromQL metric names
-against `pkg/metrics`, and removal of superseded dashboard names. These checks
-are currently a review procedure, not a repository CI target.
+The dashboard files use Grafana schema version 41. Validation is currently a
+manual review procedure, not a repository script or CI target. Run the following
+baseline commands from the repository root:
+
+```bash
+jq empty docs/grafana/*.json
+
+expected="$(printf '%s\n' \
+  docs/grafana/drive9-organization-overview-dashboard.json \
+  docs/grafana/drive9-server-overview-dashboard.json \
+  docs/grafana/drive9-tenant-overview-dashboard.json)"
+actual="$(rg --files docs/grafana -g '*.json' | sort)"
+test "$actual" = "$expected"
+
+for dashboard in docs/grafana/*.json; do
+  jq -e '
+    ([.panels[].id] | length) == ([.panels[].id] | unique | length)
+    and all(.panels[];
+      .gridPos.x >= 0 and .gridPos.y >= 0
+      and .gridPos.w > 0 and .gridPos.h > 0
+      and (.gridPos.x + .gridPos.w <= 24))
+  ' "$dashboard"
+done
+
+rg -o --no-filename 'drive9_[A-Za-z0-9_]+' docs/grafana/*.json | sort -u
+rg -n 'drive9_[A-Za-z0-9_]+' pkg/metrics
+git diff --check -- docs/grafana
+```
+
+The two `rg` outputs are compared manually to confirm that referenced Prometheus
+metrics exist in `pkg/metrics`; histogram `_bucket`, `_count`, and `_sum` series
+come from the declared histogram base name. Reviewers also inspect panel grids
+for overlap, resolve every dashboard variable reference, verify selector labels
+against the metric declarations, and confirm that only the three supported JSON
+files remain. Do not assume these checks run automatically.
 
 These static checks do not prove that a deployed Prometheus currently has
 samples for every metric. After import, select the datasource and a time range
