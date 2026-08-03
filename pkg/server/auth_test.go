@@ -620,13 +620,13 @@ func TestSharedTenantStatusLogsAndMetricsUseDBOrganization(t *testing.T) {
 	metricsText := recorder.Body.String()
 	wantMetric := `drive9_tenant_requests_total{action="get",status_class="2xx",surface="status",tidbcloud_org_id="org-shared-status-output"}`
 	if !strings.Contains(metricsText, wantMetric) {
-		t.Fatalf("missing organization-scoped status request metric %q", wantMetric)
+		t.Errorf("missing organization-scoped status request metric %q", wantMetric)
 	}
 	for _, line := range strings.Split(metricsText, "\n") {
 		if strings.HasPrefix(line, `drive9_tenant_requests_total{`) &&
 			strings.Contains(line, `action="get"`) && strings.Contains(line, `status_class="2xx"`) &&
 			strings.Contains(line, `surface="status"`) && strings.Contains(line, `tenant_id=`) {
-			t.Fatalf("successful status request metric unexpectedly carried tenant labels: %s", line)
+			t.Errorf("successful status request metric unexpectedly carried tenant labels: %s", line)
 		}
 	}
 }

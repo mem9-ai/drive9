@@ -65,10 +65,12 @@ or `operation`. Exact tenant detail belongs in Tenant Overview.
 ## Drive9 Tenant Overview
 
 Import `drive9-tenant-overview-dashboard.json` for one exact tenant. Select the
-organization first, then enter the exact value in the **Tenant ID** textbox.
-The textbox does not run a tenant-inventory query, so it remains usable when a
-large tenant series set makes a query-backed dropdown slow or incomplete. It is
-an exact ID input, not a regular-expression filter.
+organization first, then replace the `select-a-tenant` placeholder in the
+**Tenant ID** textbox with the exact tenant ID. Panels intentionally stay empty
+while the placeholder is present. The textbox does not run a tenant-inventory
+query, so it remains usable when a large tenant series set makes a query-backed
+dropdown slow or incomplete. It is an exact ID input, not a regular-expression
+filter.
 
 Every tenant-scoped PromQL expression uses both
 `tidbcloud_org_id="$org"` and `tenant_id="$tenant"`. Its rows cover:

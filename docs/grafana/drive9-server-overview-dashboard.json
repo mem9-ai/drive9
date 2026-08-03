@@ -250,7 +250,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(drive9_http_inflight_requests)",
+          "expr": "sum(drive9_http_inflight_requests{route=\"\"})",
           "legendFormat": "in-flight",
           "range": true,
           "refId": "A"
@@ -539,7 +539,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "count(drive9_module_up == 0)",
+          "expr": "count(drive9_module_up == 0) or on() (0 * count(drive9_module_up))",
           "legendFormat": "down",
           "range": true,
           "refId": "A"

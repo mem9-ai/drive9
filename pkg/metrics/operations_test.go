@@ -423,20 +423,20 @@ func TestTenantRequestAlwaysIncludesOrgAndLimitsTenantLabel(t *testing.T) {
 	WritePrometheus(rec)
 	text := rec.Body.String()
 	if !strings.Contains(text, `drive9_tenant_requests_total{action="post",status_class="2xx",surface="provision",tidbcloud_org_id="org-request-contract"} 1`) {
-		t.Fatalf("successful control-plane request did not retain organization label:\n%s", text)
+		t.Errorf("successful control-plane request did not retain organization label:\n%s", text)
 	}
 	if hasMetricLineWith(text, "drive9_tenant_requests_total", `surface="provision"`, `status_class="2xx"`, `tenant_id=`) {
-		t.Fatalf("successful control-plane request carried tenant labels:\n%s", text)
+		t.Errorf("successful control-plane request carried tenant labels:\n%s", text)
 	}
 	if !strings.Contains(text, `drive9_tenant_requests_total{action="get",status_class="2xx",surface="status",tidbcloud_org_id="org-request-contract"} 1`) {
-		t.Fatalf("counter-only control-plane request did not retain organization label:\n%s", text)
+		t.Errorf("counter-only control-plane request did not retain organization label:\n%s", text)
 	}
 	for _, want := range []string{
 		`drive9_tenant_requests_total{action="post",status_class="4xx",surface="provision",tenant_id="tenant-request-contract",tidbcloud_org_id="org-request-contract"} 1`,
 		`drive9_tenant_requests_total{action="write",status_class="2xx",surface="fs",tenant_id="tenant-request-contract",tidbcloud_org_id="org-request-contract"} 1`,
 	} {
 		if !strings.Contains(text, want) {
-			t.Fatalf("missing tenant-scoped request metric %q:\n%s", want, text)
+			t.Errorf("missing tenant-scoped request metric %q:\n%s", want, text)
 		}
 	}
 }

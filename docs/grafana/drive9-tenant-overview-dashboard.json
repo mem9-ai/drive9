@@ -2514,10 +2514,10 @@
       {
         "current": {
           "selected": false,
-          "text": "",
-          "value": ""
+          "text": "select-a-tenant",
+          "value": "select-a-tenant"
         },
-        "description": "Enter one exact tenant ID. This variable does not run a Prometheus tenant-inventory query.",
+        "description": "Enter one exact tenant ID. Panels stay empty until you replace the placeholder. This variable does not run a Prometheus tenant-inventory query.",
         "hide": 0,
         "label": "Tenant ID",
         "name": "tenant",

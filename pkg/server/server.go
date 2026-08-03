@@ -1337,7 +1337,7 @@ func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 				zap.String("cluster_id", t.ClusterID),
 				zap.String("reason", "tidbcloud_credentials_unavailable"))
 			if s.metrics != nil {
-				s.metrics.recordEvent(t.ID, "tenant_pool_pending_resume",
+				s.metrics.recordEvent(t.ID, s.tenantMetricTiDBCloudOrgID(ctx, &t), "tenant_pool_pending_resume",
 					"provider", t.Provider,
 					"result", "skipped",
 					"reason", "tidbcloud_credentials_unavailable")
@@ -1437,7 +1437,7 @@ func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
 			zap.String("cluster_id", t.ClusterID),
 			zap.String("reason", "tidbcloud_credentials_unavailable"))
 		if s.metrics != nil {
-			s.metrics.recordEvent(t.ID, "tenant_pool_pending_resume",
+			s.metrics.recordEvent(t.ID, s.tenantMetricTiDBCloudOrgID(ctx, &t), "tenant_pool_pending_resume",
 				"provider", t.Provider,
 				"result", "skipped",
 				"reason", "tidbcloud_credentials_unavailable")
@@ -6050,6 +6050,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		zap.String("tenant_id", tenantID),
 		zap.String("provider", provider),
 	))
+	tidbCloudOrgID := s.tenantMetricTiDBCloudOrgID(ctx, &meta.Tenant{ID: tenantID, Provider: provider})
 	logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_started", "tenant_id", tenantID, "provider", provider)...)
 	deadline := time.Now().Add(schemaInitRetryWindow)
 	backoff := schemaInitInitialBackoff
@@ -6077,7 +6078,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 				if versionErr := s.updateTenantSchemaVersionForProfile(ctx, tenantID, provider); versionErr != nil {
 					logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_version_persist_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", versionErr)...)
 					if s.metrics != nil {
-						s.metrics.recordEvent(tenantID, "tenant_schema_init", "provider", provider, "result", "error", "stage", "schema_version_persist")
+						s.metrics.recordEvent(tenantID, tidbCloudOrgID, "tenant_schema_init", "provider", provider, "result", "error", "stage", "schema_version_persist")
 					}
 					err = versionErr
 				}
@@ -6087,7 +6088,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			s.schemaInitErrors.Delete(tenantID)
 			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_ok", "tenant_id", tenantID, "provider", provider, "attempt", attempt)...)
 			if s.metrics != nil {
-				s.metrics.recordEvent(tenantID, "tenant_schema_init", "provider", provider, "result", "ok")
+				s.metrics.recordEvent(tenantID, tidbCloudOrgID, "tenant_schema_init", "provider", provider, "result", "ok")
 			}
 			updated, err := s.meta.UpdateTenantStatusIf(ctx, tenantID, meta.TenantProvisioning, meta.TenantActive)
 			if err != nil {
@@ -6109,7 +6110,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 				logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", err)...)
 			}
 			if s.metrics != nil && !expectedRetryErr {
-				s.metrics.recordEvent(tenantID, "tenant_schema_init", "provider", provider, "result", "error")
+				s.metrics.recordEvent(tenantID, tidbCloudOrgID, "tenant_schema_init", "provider", provider, "result", "error")
 			}
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
