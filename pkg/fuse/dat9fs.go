@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -283,7 +282,7 @@ func (fs *Dat9FS) materializeFullForUploadLocked(fh *FileHandle) bool {
 		return true
 	}
 	if err := fh.Dirty.LoadMissingParts(); err != nil {
-		log.Printf("materialize full file for upload failed for %s: %v", fh.Path, err)
+		safeLogPrintf("materialize full file for upload failed for %s: %v", fh.Path, err)
 		return false
 	}
 	return fh.Dirty.CanMaterializeFull()
@@ -1733,7 +1732,7 @@ func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) (f
 	if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 		if fh.ShadowReady || fh.IsNew || newSize == 0 {
 			if err := fs.shadowStore.Truncate(fh.Path, newSize, fh.BaseRev); err != nil {
-				log.Printf("shadow truncate failed for %s: %v", fh.Path, err)
+				safeLogPrintf("shadow truncate failed for %s: %v", fh.Path, err)
 				fs.shadowStore.Remove(fh.Path)
 				fh.ShadowReady = false
 			} else {
@@ -1802,7 +1801,7 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 			var err error
 			abortStreamer, err = fs.truncateWritableHandleLocked(fh, truncateSize)
 			if err != nil {
-				log.Printf("handle truncate sync failed for %s: %v", fh.Path, err)
+				safeLogPrintf("handle truncate sync failed for %s: %v", fh.Path, err)
 				fh.Unlock()
 				continue
 			}
@@ -1821,7 +1820,7 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 				size = fh.Dirty.Size()
 			}
 			if err := fs.shadowStore.Ensure(fh.Path, size, revision); err != nil {
-				log.Printf("shadow base revision refresh failed for %s: %v", fh.Path, err)
+				safeLogPrintf("shadow base revision refresh failed for %s: %v", fh.Path, err)
 			}
 		}
 		fh.Unlock()
@@ -1857,7 +1856,7 @@ func (fs *Dat9FS) adoptSingleCallerPathTruncate(remotePath string, callerPID uin
 			var err error
 			abortStreamer, err = fs.truncateWritableHandleLocked(fh, 0)
 			if err != nil {
-				log.Printf("handle truncate stage failed for %s: %v", fh.Path, err)
+				safeLogPrintf("handle truncate stage failed for %s: %v", fh.Path, err)
 			} else {
 				adopted = true
 			}
@@ -1918,7 +1917,7 @@ func (fs *Dat9FS) adoptOpenHandlePathTruncate(entry *InodeEntry, ino uint64, cal
 			var err error
 			abortStreamer, err = fs.truncateWritableHandleLocked(fh, newSize)
 			if err != nil {
-				log.Printf("open-handle path truncate failed for %s: %v", fh.Path, err)
+				safeLogPrintf("open-handle path truncate failed for %s: %v", fh.Path, err)
 				fh.Unlock()
 				continue
 			}
@@ -2387,7 +2386,7 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 			size = fh.Dirty.Size()
 		}
 		if err := fs.shadowStore.Ensure(fh.Path, size, revision); err != nil {
-			log.Printf("shadow base revision adopt failed for %s: %v", fh.Path, err)
+			safeLogPrintf("shadow base revision adopt failed for %s: %v", fh.Path, err)
 		}
 	}
 }
@@ -2574,7 +2573,7 @@ func (fs *Dat9FS) preloadWritableHandleFromReadCacheLocked(fh *FileHandle) bool 
 		return false
 	}
 	if _, err := fh.Dirty.Write(0, data); err != nil {
-		log.Printf("read-cache writable preload failed for %s: %v", fh.Path, err)
+		safeLogPrintf("read-cache writable preload failed for %s: %v", fh.Path, err)
 		return false
 	}
 	fh.Dirty.ClearDirty()
@@ -2670,7 +2669,7 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 		curSize := fh.Dirty.Size()
 		if curSize != newSize {
 			if err := fh.Dirty.Truncate(newSize); err != nil {
-				log.Printf("path-truncate sync: dirty buffer truncate failed for %s: %v", fh.Path, err)
+				safeLogPrintf("path-truncate sync: dirty buffer truncate failed for %s: %v", fh.Path, err)
 				fh.Unlock()
 				continue
 			}
@@ -2691,12 +2690,12 @@ func (fs *Dat9FS) setPendingMetadataMode(path string, mode uint32) {
 	mode &= posixPermissionModeMask
 	if fs.pendingIndex != nil {
 		if err := fs.pendingIndex.UpdateMode(path, mode); err != nil {
-			log.Printf("pending index mode update failed for %s: %v", path, err)
+			safeLogPrintf("pending index mode update failed for %s: %v", path, err)
 		}
 	}
 	if fs.writeBack != nil {
 		if err := fs.writeBack.UpdateMode(path, mode); err != nil {
-			log.Printf("writeback mode update failed for %s: %v", path, err)
+			safeLogPrintf("writeback mode update failed for %s: %v", path, err)
 		}
 	}
 }
@@ -2831,7 +2830,7 @@ func (fs *Dat9FS) applyLayerLargeTruncate(ctx context.Context, entry *InodeEntry
 
 	if fs.shadowStore.Has(entry.Path) {
 		if err := fs.shadowStore.Truncate(entry.Path, newSize, expectedRevision); err != nil {
-			log.Printf("layer large truncate shadow truncate failed for %s: %v", entry.Path, err)
+			safeLogPrintf("layer large truncate shadow truncate failed for %s: %v", entry.Path, err)
 			return gofuse.EIO
 		}
 	} else {
@@ -2849,22 +2848,22 @@ func (fs *Dat9FS) applyLayerLargeTruncate(ctx context.Context, entry *InodeEntry
 		}, 0, newSize)
 		written, err := fs.shadowStore.WriteStream(entry.Path, reader, expectedRevision)
 		if err != nil {
-			log.Printf("layer large truncate shadow write failed for %s: %v", entry.Path, err)
+			safeLogPrintf("layer large truncate shadow write failed for %s: %v", entry.Path, err)
 			return gofuse.EIO
 		}
 		if written != newSize {
-			log.Printf("layer large truncate shadow size mismatch for %s: wrote=%d want=%d", entry.Path, written, newSize)
+			safeLogPrintf("layer large truncate shadow size mismatch for %s: wrote=%d want=%d", entry.Path, written, newSize)
 			return gofuse.EIO
 		}
 	}
 	fd, actualSize, err := fs.shadowStore.Open(entry.Path)
 	if err != nil {
-		log.Printf("layer large truncate shadow open failed for %s: %v", entry.Path, err)
+		safeLogPrintf("layer large truncate shadow open failed for %s: %v", entry.Path, err)
 		return gofuse.EIO
 	}
 	defer func() { _ = fd.Close() }()
 	if actualSize != newSize {
-		log.Printf("layer large truncate shadow open size mismatch for %s: size=%d want=%d", entry.Path, actualSize, newSize)
+		safeLogPrintf("layer large truncate shadow open size mismatch for %s: size=%d want=%d", entry.Path, actualSize, newSize)
 		return gofuse.EIO
 	}
 	writeStart := fs.perfStart()
@@ -2874,7 +2873,7 @@ func (fs *Dat9FS) applyLayerLargeTruncate(ctx context.Context, entry *InodeEntry
 		return httpToFuseStatus(err)
 	}
 	if _, err := fs.pendingIndex.PutShadowSpillWithMode(entry.Path, newSize, PendingOverwrite, expectedRevision, mode, hasMode); err != nil {
-		log.Printf("layer large truncate pending index update failed for %s: %v", entry.Path, err)
+		safeLogPrintf("layer large truncate pending index update failed for %s: %v", entry.Path, err)
 		return gofuse.EIO
 	}
 	fs.invalidateReadCacheAndTargets(entry.Path)
@@ -2956,7 +2955,7 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 		}
 		if fs.pendingIndex != nil {
 			if _, err := fs.pendingIndex.PutWithBaseRevAndMode(entry.Path, newSize, PendingOverwrite, expectedRevision, mode, hasMode); err != nil {
-				log.Printf("layer truncate pending index update failed for %s: %v", entry.Path, err)
+				safeLogPrintf("layer truncate pending index update failed for %s: %v", entry.Path, err)
 				return gofuse.EIO
 			}
 		}
@@ -3001,7 +3000,7 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 	stat, statErr := fs.client.StatCtx(ctx, apiPath)
 	fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
 	if statErr != nil {
-		log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, ino, statErr)
+		safeLogPrintf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, ino, statErr)
 	} else if stat != nil {
 		if stat.Revision > 0 {
 			refreshedRevision = stat.Revision
@@ -3240,17 +3239,17 @@ func (fs *Dat9FS) stagePathTruncateToZeroLocked(ctx context.Context, entry *Inod
 		hasMode = mode != defaultRegularFileMode
 	}
 	if err := fs.shadowStore.WriteFull(entry.Path, nil, expectedRevision); err != nil {
-		log.Printf("path truncate shadow stage failed for %s: %v", entry.Path, err)
+		safeLogPrintf("path truncate shadow stage failed for %s: %v", entry.Path, err)
 		return gofuse.EIO
 	}
 	if err := fs.shadowStore.Sync(entry.Path); err != nil {
 		fs.shadowStore.Remove(entry.Path)
-		log.Printf("path truncate shadow sync failed for %s: %v", entry.Path, err)
+		safeLogPrintf("path truncate shadow sync failed for %s: %v", entry.Path, err)
 		return gofuse.EIO
 	}
 	if _, err := fs.pendingIndex.PutWithBaseRevAndMode(entry.Path, 0, PendingOverwrite, expectedRevision, mode, hasMode); err != nil {
 		fs.shadowStore.Remove(entry.Path)
-		log.Printf("path truncate pending index update failed for %s: %v", entry.Path, err)
+		safeLogPrintf("path truncate pending index update failed for %s: %v", entry.Path, err)
 		return gofuse.EIO
 	}
 
@@ -3265,11 +3264,11 @@ func (fs *Dat9FS) stagePathTruncateToZeroLocked(ctx context.Context, entry *Inod
 		CoalesceZeroTruncate: true,
 	}
 	if err := fs.commitQueue.Enqueue(commit); err != nil {
-		log.Printf("path truncate async enqueue failed for %s: %v, falling back to sync commit", entry.Path, err)
+		safeLogPrintf("path truncate async enqueue failed for %s: %v, falling back to sync commit", entry.Path, err)
 		if commitErr := fs.commitQueue.commitNowPathLocked(ctx, commit); commitErr != nil {
 			fs.pendingIndex.Remove(entry.Path)
 			fs.shadowStore.Remove(entry.Path)
-			log.Printf("path truncate sync fallback failed for %s: %v", entry.Path, commitErr)
+			safeLogPrintf("path truncate sync fallback failed for %s: %v", entry.Path, commitErr)
 			return httpToFuseStatus(commitErr)
 		}
 	}
@@ -3315,13 +3314,13 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 	mode, hasMode := fs.modeForPendingHandle(fh)
 	if fh.ShadowSpill {
 		if gen, err := fs.pendingIndex.PutShadowSpillWithMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode); err != nil {
-			log.Printf("pending index put failed for %s: %v", fh.Path, err)
+			safeLogPrintf("pending index put failed for %s: %v", fh.Path, err)
 		} else {
 			fh.PendingIndexGen = gen
 		}
 	} else {
 		if gen, err := fs.pendingIndex.PutWithBaseRevAndMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode); err != nil {
-			log.Printf("pending index put failed for %s: %v", fh.Path, err)
+			safeLogPrintf("pending index put failed for %s: %v", fh.Path, err)
 		} else {
 			fh.PendingIndexGen = gen
 		}
@@ -3524,7 +3523,7 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 		return false
 	}
 	if _, err := fh.Dirty.Write(0, data); err != nil {
-		log.Printf("writeback preload failed for %s: %v", fh.Path, err)
+		safeLogPrintf("writeback preload failed for %s: %v", fh.Path, err)
 		return false
 	}
 
@@ -3621,7 +3620,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 			var err error
 			data, err = fs.shadowStore.ReadAll(fh.Path)
 			if err != nil {
-				log.Printf("open-handle preload shadow read failed for %s: %v", fh.Path, err)
+				safeLogPrintf("open-handle preload shadow read failed for %s: %v", fh.Path, err)
 			} else {
 				size = int64(len(data))
 				haveData = true
@@ -3653,11 +3652,11 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 
 		if len(data) > 0 {
 			if _, err := fh.Dirty.Write(0, data); err != nil {
-				log.Printf("open-handle preload failed for %s: %v", fh.Path, err)
+				safeLogPrintf("open-handle preload failed for %s: %v", fh.Path, err)
 				continue
 			}
 		} else if err := fh.Dirty.Truncate(size); err != nil {
-			log.Printf("open-handle preload truncate failed for %s: %v", fh.Path, err)
+			safeLogPrintf("open-handle preload truncate failed for %s: %v", fh.Path, err)
 			continue
 		}
 		fh.Dirty.ClearDirty()
@@ -3711,7 +3710,7 @@ func (fs *Dat9FS) prepareSQLitePersistentJournalLocalCreateWritableOpen(fh *File
 		return false
 	}
 	if err := fh.Dirty.Truncate(0); err != nil {
-		log.Printf("sqlite sidecar local-create open truncate failed for %s: %v", fh.Path, err)
+		safeLogPrintf("sqlite sidecar local-create open truncate failed for %s: %v", fh.Path, err)
 		return false
 	}
 	fh.Dirty.ClearDirty()
@@ -5076,7 +5075,7 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 					fs.perf.lookupRetrySuccess.add(1)
 				}
 				if successCount <= 3 || successCount%lookupRetrySuccessLogEvery == 0 {
-					log.Printf("lookup stat retry recovered for %s (success_count=%d)", localPath, successCount)
+					safeLogPrintf("lookup stat retry recovered for %s (success_count=%d)", localPath, successCount)
 				}
 			}
 			return stat, nil
@@ -5092,7 +5091,7 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 		if fs.perf != nil {
 			fs.perf.lookupRetryExhausted.add(1)
 		}
-		log.Printf("lookup stat retries exhausted for %s: %v", localPath, lastErr)
+		safeLogPrintf("lookup stat retries exhausted for %s: %v", localPath, lastErr)
 	}
 	return nil, lastErr
 }
@@ -6299,9 +6298,9 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 					snapshotOK = true
 				} else if err == nil {
 					err = io.ErrUnexpectedEOF
-					log.Printf("open-unlink snapshot short read for %s: got=%d want=%d", p, len(data), size)
+					safeLogPrintf("open-unlink snapshot short read for %s: got=%d want=%d", p, len(data), size)
 				} else {
-					log.Printf("open-unlink snapshot failed for %s: %v", p, err)
+					safeLogPrintf("open-unlink snapshot failed for %s: %v", p, err)
 				}
 				fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(data)))
 			} else {
@@ -6310,7 +6309,7 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 					snapshotShadowGen = gen
 					snapshotOK = true
 				} else {
-					log.Printf("open-unlink large snapshot failed for %s: %v", p, err)
+					safeLogPrintf("open-unlink large snapshot failed for %s: %v", p, err)
 				}
 			}
 		}
@@ -7600,7 +7599,7 @@ func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, na
 		fs.perfRecordRemote(perfRemoteMutation, chmodStart, err, 0)
 		if err != nil {
 			if rollbackErr := fs.deleteRemoteFileWithInterruptRecovery(ctx, childP); rollbackErr != nil && !isNotFoundErr(rollbackErr) {
-				log.Printf("mknod: rollback remote file %s after chmod failure failed: %v", childP, rollbackErr)
+				safeLogPrintf("mknod: rollback remote file %s after chmod failure failed: %v", childP, rollbackErr)
 			}
 			return httpToFuseStatus(err)
 		}
@@ -7785,9 +7784,9 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 			if probeErr == nil && stat != nil && stat.HasMode && isSymlinkMode(stat.Mode) {
 				err = nil
 			} else if probeErr != nil {
-				log.Printf("symlink: probe created path %s failed: %v", childP, probeErr)
+				safeLogPrintf("symlink: probe created path %s failed: %v", childP, probeErr)
 			} else if stat != nil {
-				log.Printf("symlink: recovered path %s is not a symlink (hasMode=%t mode=%o)", childP, stat.HasMode, stat.Mode)
+				safeLogPrintf("symlink: recovered path %s is not a symlink (hasMode=%t mode=%o)", childP, stat.HasMode, stat.Mode)
 			}
 		}
 	}
@@ -7813,7 +7812,7 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 			fs.inodes.UpdateMode(ino, stat.Mode)
 		}
 	} else if err != nil && !isNotFoundErr(err) {
-		log.Printf("post-symlink stat refresh failed for %s: %v", childP, err)
+		safeLogPrintf("post-symlink stat refresh failed for %s: %v", childP, err)
 	}
 
 	entry, ok := fs.inodes.GetEntry(ino)
@@ -8616,7 +8615,7 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 	targetExists, err := fs.pendingRenameTargetExists(probeCtx, newP)
 	probeCancel()
 	if err != nil {
-		log.Printf("rename: probe final pending-new target %s failed, using remote fallback: %v", newP, err)
+		safeLogPrintf("rename: probe final pending-new target %s failed, using remote fallback: %v", newP, err)
 		return pendingRenameRemoteFallback, nil
 	}
 	if targetExists {
@@ -8631,7 +8630,7 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 		// path now exists remotely and the normal server-side rename is correct.
 		oldRemoteExists, err := fs.remotePathExistsDetached(oldP)
 		if err != nil {
-			log.Printf("rename: probe old pending-new source %s failed, using remote fallback: %v", oldP, err)
+			safeLogPrintf("rename: probe old pending-new source %s failed, using remote fallback: %v", oldP, err)
 			return pendingRenameRemoteFallback, nil
 		}
 		if oldRemoteExists {
@@ -8710,7 +8709,7 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 				return pendingRenameHandled, fmt.Errorf("sync commit git loose object rename %s: %w", newP, commitErr)
 			}
 		} else if err := fs.commitQueue.Enqueue(entry); err != nil {
-			log.Printf("rename: enqueue pending-new commit for %s failed, falling back to sync commit: %v", newP, err)
+			safeLogPrintf("rename: enqueue pending-new commit for %s failed, falling back to sync commit: %v", newP, err)
 			if commitErr := fs.commitQueue.commitNowPathLocked(ctx, entry); commitErr != nil {
 				return pendingRenameHandled, fmt.Errorf("sync commit pending-new rename %s: %w", newP, commitErr)
 			}
@@ -8903,7 +8902,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 
 	pendingRename, err := fs.renamePendingNewCommit(ctx, input, oldP, newP)
 	if err != nil {
-		log.Printf("rename: pending-new local rename %s -> %s failed: %v", oldP, newP, err)
+		safeLogPrintf("rename: pending-new local rename %s -> %s failed: %v", oldP, newP, err)
 		return httpToFuseStatus(err)
 	}
 	if pendingRename == pendingRenameHandled {
@@ -8942,7 +8941,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		if !isPendingNew {
 			pendingRename, err := fs.renamePendingNewCommit(ctx, input, oldP, newP)
 			if err != nil {
-				log.Printf("rename: pending-new local rename %s -> %s failed: %v", oldP, newP, err)
+				safeLogPrintf("rename: pending-new local rename %s -> %s failed: %v", oldP, newP, err)
 				return httpToFuseStatus(err)
 			}
 			if pendingRename == pendingRenameHandled {
@@ -8961,11 +8960,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		// (existing remote file edited locally). Flush both sides first, then
 		// do a server-side rename.
 		if err := fs.flushPendingWriteBack(ctx, oldP); err != nil {
-			log.Printf("rename: flush pending write-back for %s: %v", oldP, err)
+			safeLogPrintf("rename: flush pending write-back for %s: %v", oldP, err)
 			return httpToFuseStatus(err)
 		}
 		if err := fs.flushPendingWriteBack(ctx, newP); err != nil {
-			log.Printf("rename: flush pending write-back for %s: %v", newP, err)
+			safeLogPrintf("rename: flush pending write-back for %s: %v", newP, err)
 			return httpToFuseStatus(err)
 		}
 	}
@@ -9015,7 +9014,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 			if err != nil {
 				// Leave the entry at the stale path rather than losing it;
 				// the upload will fail visibly instead of silently dropping.
-				log.Printf("rename: prepare pending child meta %s -> %s failed: %v", meta.Path, newChild, err)
+				safeLogPrintf("rename: prepare pending child meta %s -> %s failed: %v", meta.Path, newChild, err)
 				continue
 			}
 			if preparedMeta == nil {
@@ -9031,7 +9030,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 			}
 			if fs.shadowStore != nil && !fs.shadowStore.Rename(meta.Path, newChild) {
 				fs.pendingIndex.AbortRename(newChild)
-				log.Printf("rename: migrate pending child shadow %s -> %s failed", meta.Path, newChild)
+				safeLogPrintf("rename: migrate pending child shadow %s -> %s failed", meta.Path, newChild)
 				continue
 			}
 			fs.pendingIndex.CommitRename(meta.Path, preparedMeta)
@@ -9077,7 +9076,7 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	if dh.Entries == nil {
 		entries, err := fs.listDir(ctx, dh.Path)
 		if err != nil {
-			log.Printf("list dir failed for %s: %v", dh.Path, err)
+			safeLogPrintf("list dir failed for %s: %v", dh.Path, err)
 			return listDirErrToFuseStatus(err)
 		}
 		dh.Entries = entries
@@ -9130,7 +9129,7 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	if dh.Entries == nil {
 		entries, err := fs.listDir(ctx, dh.Path)
 		if err != nil {
-			log.Printf("list dir plus failed for %s: %v", dh.Path, err)
+			safeLogPrintf("list dir plus failed for %s: %v", dh.Path, err)
 			return listDirErrToFuseStatus(err)
 		}
 		dh.Entries = entries
@@ -9423,7 +9422,7 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 		}
 		results, err := fs.client.BatchStatCtx(ctx, paths)
 		if err != nil {
-			log.Printf("batch stat failed for %s (needStat batch %d-%d of %d): %v", dirPath, batchStart, batchEnd, len(needStat), err)
+			safeLogPrintf("batch stat failed for %s (needStat batch %d-%d of %d): %v", dirPath, batchStart, batchEnd, len(needStat), err)
 			return
 		}
 		for j, result := range results {
@@ -9916,7 +9915,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 		if err := fs.shadowStore.Ensure(childP, 0, 0); err != nil {
-			log.Printf("shadow ensure failed for create %s: %v", childP, err)
+			safeLogPrintf("shadow ensure failed for create %s: %v", childP, err)
 		} else {
 			fh.ShadowReady = true
 			fh.ShadowSpill = true
@@ -9936,7 +9935,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		wb.OnPartFull = func(partIdx int, data []byte) {
 			partNum := partIdx + 1
 			if err := streamer.SubmitPart(context.Background(), partNum, data, nil); err != nil {
-				log.Printf("streaming submit part %d failed for %s: %v", partNum, childP, err)
+				safeLogPrintf("streaming submit part %d failed for %s: %v", partNum, childP, err)
 			}
 		}
 	}
@@ -10067,7 +10066,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 					if err := fs.loadWritableHandleFromShadowLocked(fh, meta); err == nil {
 						preloaded = true
 					} else {
-						log.Printf("shadow preload failed for %s: %v", p, err)
+						safeLogPrintf("shadow preload failed for %s: %v", p, err)
 					}
 				}
 			}
@@ -10131,7 +10130,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			}
 			if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 				if err := fs.shadowStore.WriteFull(p, nil, fh.BaseRev); err != nil {
-					log.Printf("shadow reset failed for truncate-open %s: %v", p, err)
+					safeLogPrintf("shadow reset failed for truncate-open %s: %v", p, err)
 				} else {
 					fh.ShadowReady = true
 					// Pin shadow so commit queue cleanup doesn't delete it while
@@ -10155,7 +10154,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				fh.Dirty.OnPartFull = func(partIdx int, data []byte) {
 					partNum := partIdx + 1
 					if err := streamer.SubmitPart(context.Background(), partNum, data, nil); err != nil {
-						log.Printf("streaming submit part %d failed for %s: %v", partNum, filePath, err)
+						safeLogPrintf("streaming submit part %d failed for %s: %v", partNum, filePath, err)
 					}
 				}
 			}
@@ -11052,7 +11051,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 				source = "shadow-spill-nospace"
 				return 0, gofuse.Status(syscall.ENOSPC)
 			}
-			log.Printf("shadow write failed for ShadowSpill %s: %v", fh.Path, err)
+			safeLogPrintf("shadow write failed for ShadowSpill %s: %v", fh.Path, err)
 			source = "shadow-spill-error"
 			return 0, gofuse.EIO
 		}
@@ -11082,7 +11081,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 				source = "shadow-through-nospace"
 				return 0, gofuse.Status(syscall.ENOSPC)
 			}
-			log.Printf("shadow write-through failed for %s: %v", fh.Path, err)
+			safeLogPrintf("shadow write-through failed for %s: %v", fh.Path, err)
 			fs.shadowStore.Remove(fh.Path)
 			fh.ShadowReady = false
 			source = "shadow-through-error"
@@ -11265,7 +11264,7 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 				// available (recoverable); fail EIO without clearing dirty
 				// state otherwise — never upload zero-filled ranges.
 				if !fs.materializeFullForUploadLocked(fh) {
-					log.Printf("write-sync patch fallback cannot materialize full file for %s", fh.Path)
+					safeLogPrintf("write-sync patch fallback cannot materialize full file for %s", fh.Path)
 					return gofuse.EIO
 				}
 				data = fh.Dirty.bytesView()
@@ -11288,7 +11287,7 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 			// Same fetch-or-fail contract as flushHandle: a lazily loaded
 			// existing file that grew beyond OrigSize is recoverable when a
 			// loader exists; otherwise fail without clearing dirty state.
-			log.Printf("write-sync cannot materialize full file for %s", fh.Path)
+			safeLogPrintf("write-sync cannot materialize full file for %s", fh.Path)
 			return gofuse.EIO
 		}
 		if data == nil {
@@ -11308,14 +11307,14 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 		fs.debugDurationf(writeStart, 0, "write-sync stream done path=%s size=%d err=%v", fh.Path, size, err)
 	}
 	if err != nil {
-		log.Printf("write-sync upload failed for %s: %v", fh.Path, err)
+		safeLogPrintf("write-sync upload failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
 	// The commit is authoritative for the storage class: direct PUT lands
 	// inline, PATCH keeps S3, and a full upload re-splits by size.
 	fs.adoptCommittedStorageClassLocked(fh, size)
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-		log.Printf("write-sync pending chmod failed for %s: %v", fh.Path, err)
+		safeLogPrintf("write-sync pending chmod failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
 
@@ -11385,7 +11384,7 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 		fs.perfRecordRemote(perfRemoteWrite, uploadStart, err, uploadBytes)
 		fs.debugDurationf(uploadStart, 0, "sync handle shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 		if err != nil {
-			log.Printf("sync handle shadowspill upload failed for %s: %v", fh.Path, err)
+			safeLogPrintf("sync handle shadowspill upload failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		if fh.Unlinked {
@@ -11393,7 +11392,7 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 			return gofuse.OK
 		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-			log.Printf("sync handle shadowspill pending chmod failed for %s: %v", fh.Path, err)
+			safeLogPrintf("sync handle shadowspill pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		fh.Dirty.ClearDirty()
@@ -11432,11 +11431,11 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	if fs.layerEnabled() {
 		if err := fs.upsertLayerFile(ctx, fh.Path, nil, expectedRevision, 0, false); err != nil {
-			log.Printf("sync empty layer create failed for %s: %v", fh.Path, err)
+			safeLogPrintf("sync empty layer create failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-			log.Printf("sync empty layer create pending chmod failed for %s: %v", fh.Path, err)
+			safeLogPrintf("sync empty layer create pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		if fh.DirtySeq != 0 {
@@ -11467,11 +11466,11 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
 	fs.debugDurationf(writeStart, 0, "sync empty create done path=%s committed_rev=%d err=%v", fh.Path, committedRev, err)
 	if err != nil {
-		log.Printf("sync empty create failed for %s: %v", fh.Path, err)
+		safeLogPrintf("sync empty create failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-		log.Printf("sync empty create pending chmod failed for %s: %v", fh.Path, err)
+		safeLogPrintf("sync empty create pending chmod failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
 
@@ -11630,7 +11629,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					fs.debugDurationf(stageStart, 0, "flush stage shadow done path=%s size=%d err=%v", fh.Path, size, err)
 					fs.perf.recordFlushStageShadow(stageDur)
 					if err != nil {
-						log.Printf("shadow stage failed for %s: %v, falling through", fh.Path, err)
+						safeLogPrintf("shadow stage failed for %s: %v, falling through", fh.Path, err)
 					} else {
 						phase = "small-snapshot-writeback"
 						snapWBStart := time.Now()
@@ -11643,7 +11642,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 						// the staged shadow + pendingIndex already carry the
 						// durable commit path.
 						if err := fs.snapshotWriteBackLocked(fh); err != nil {
-							log.Printf("writeback snapshot failed for %s: %v", fh.Path, err)
+							safeLogPrintf("writeback snapshot failed for %s: %v", fh.Path, err)
 						} else {
 							fh.WriteBackSeq = fh.DirtySeq
 						}
@@ -11656,7 +11655,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				snapWBStart2 := time.Now()
 				if err := fs.snapshotWriteBackLocked(fh); err != nil {
 					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
-					log.Printf("writeback cache put failed for %s: %v, falling back to sync upload", fh.Path, err)
+					safeLogPrintf("writeback cache put failed for %s: %v, falling back to sync upload", fh.Path, err)
 				} else {
 					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
 					if fs.pendingIndex != nil {
@@ -11703,7 +11702,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			fs.debugDurationf(stageStart, 0, "flush shadowspill stage done path=%s size=%d err=%v", fh.Path, size, err)
 			fs.perf.recordFlushStageShadow(largeStageDur)
 			if err != nil {
-				log.Printf("flush: shadow stage failed for ShadowSpill %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
+				safeLogPrintf("flush: shadow stage failed for ShadowSpill %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
 			} else {
 				fh.ShadowCommitReady = true
 				fh.ShadowCommitSeq = fh.DirtySeq
@@ -11723,7 +11722,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				err := fs.commitLayerShadowLocked(uploadCtx, fh, true)
 				fs.debugDurationf(uploadStart, 0, "flush layer shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 				if err != nil {
-					log.Printf("flush: layer ShadowSpill sync upload failed for %s: %v", fh.Path, err)
+					safeLogPrintf("flush: layer ShadowSpill sync upload failed for %s: %v", fh.Path, err)
 					return httpToFuseStatus(err)
 				}
 				return gofuse.OK
@@ -11764,7 +11763,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			fs.perfRecordRemote(perfRemoteWrite, uploadStart, err, uploadBytes)
 			fs.debugDurationf(uploadStart, 0, "flush shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 			if err != nil {
-				log.Printf("flush: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
+				safeLogPrintf("flush: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
 				return gofuse.EIO
 			}
 			// If Unlink completed while remoteCommitLock was released (it
@@ -11777,7 +11776,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				return gofuse.OK
 			}
 			if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-				log.Printf("flush: ShadowSpill pending chmod failed for %s: %v", fh.Path, err)
+				safeLogPrintf("flush: ShadowSpill pending chmod failed for %s: %v", fh.Path, err)
 				return httpToFuseStatus(err)
 			}
 			fh.Dirty.ClearDirty()
@@ -11819,11 +11818,11 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				err := fs.stageShadowForQueuedCommitLocked(fh, true)
 				fs.debugDurationf(stageStart, 0, "flush stage shadow done path=%s size=%d err=%v", fh.Path, size, err)
 				if err != nil {
-					log.Printf("flush: shadow stage failed for %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
+					safeLogPrintf("flush: shadow stage failed for %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
 				} else {
 					phase = "large-snapshot-writeback"
 					if err := fs.snapshotWriteBackLocked(fh); err != nil {
-						log.Printf("flush: writeback snapshot failed for %s: %v", fh.Path, err)
+						safeLogPrintf("flush: writeback snapshot failed for %s: %v", fh.Path, err)
 					} else {
 						// See the small-snapshot-writeback path: only claim a
 						// current cache when the snapshot actually landed.
@@ -11962,7 +11961,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 				if fs.commitQueue != nil {
 					phase = "interactive-shadowspill-enqueue"
 					if err := fs.enqueueStagedShadowCommitLocked(fh); err != nil {
-						log.Printf("fsync: enqueue staged ShadowSpill commit failed for %s: %v; deferring to Release", fh.Path, err)
+						safeLogPrintf("fsync: enqueue staged ShadowSpill commit failed for %s: %v; deferring to Release", fh.Path, err)
 						fh.ShadowCommitReady = true
 						fh.ShadowCommitSeq = fh.DirtySeq
 					}
@@ -11995,13 +11994,13 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 					phase = "interactive-enqueue"
 					if err := fs.enqueueStagedShadowCommitLocked(fh); err != nil {
 						fs.releaseHandleRemoteCommitPathLocked(fh)
-						log.Printf("fsync: enqueue staged commit failed for %s: %v", fh.Path, err)
+						safeLogPrintf("fsync: enqueue staged commit failed for %s: %v", fh.Path, err)
 						return gofuse.EIO
 					}
 				} else {
 					fs.releaseHandleRemoteCommitPathLocked(fh)
 					if err := fs.snapshotWriteBackLocked(fh); err != nil {
-						log.Printf("fsync writeback snapshot failed for %s: %v", fh.Path, err)
+						safeLogPrintf("fsync writeback snapshot failed for %s: %v", fh.Path, err)
 					} else {
 						// See the small-snapshot-writeback path: only claim a
 						// current cache when the snapshot actually landed.
@@ -12026,7 +12025,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			err := fs.commitLayerShadowLocked(uploadCtx, fh, true)
 			fs.debugDurationf(uploadStart, 0, "fsync layer shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 			if err != nil {
-				log.Printf("fsync: layer ShadowSpill sync upload failed for %s: %v", fh.Path, err)
+				safeLogPrintf("fsync: layer ShadowSpill sync upload failed for %s: %v", fh.Path, err)
 				return httpToFuseStatus(err)
 			}
 			return gofuse.OK
@@ -12066,7 +12065,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		fs.perfRecordRemote(perfRemoteWrite, uploadStart, err, uploadBytes)
 		fs.debugDurationf(uploadStart, 0, "fsync shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 		if err != nil {
-			log.Printf("fsync: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
+			safeLogPrintf("fsync: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
 			return gofuse.EIO
 		}
 		// If Unlink completed while remoteCommitLock was released (it
@@ -12079,7 +12078,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			return gofuse.OK
 		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-			log.Printf("fsync: ShadowSpill pending chmod failed for %s: %v", fh.Path, err)
+			safeLogPrintf("fsync: ShadowSpill pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		if fh.Dirty != nil {
@@ -12125,7 +12124,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 		if fs.layerEnabled() {
 			if fs.commitQueue == nil || fs.shadowStore == nil || !fs.shadowStore.Has(fh.Path) {
-				log.Printf("fsync layer upload failed for %s: missing commit queue shadow", fh.Path)
+				safeLogPrintf("fsync layer upload failed for %s: missing commit queue shadow", fh.Path)
 				return gofuse.EIO
 			}
 			mode, hasMode := fs.modeForPendingHandle(fh)
@@ -12143,7 +12142,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			err := fs.commitQueue.CommitNow(ctx, entry)
 			fs.debugDurationf(uploadStart, 0, "fsync layer upload done path=%s err=%v", fh.Path, err)
 			if err != nil {
-				log.Printf("fsync layer upload failed for %s: %v", fh.Path, err)
+				safeLogPrintf("fsync layer upload failed for %s: %v", fh.Path, err)
 				return httpToFuseStatus(err)
 			}
 			if hasMode {
@@ -12164,7 +12163,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		committedRev, err := fs.uploader.UploadSyncWithRevision(ctx, fh.Path)
 		fs.debugDurationf(uploadStart, 0, "fsync writeback upload done path=%s err=%v", fh.Path, err)
 		if err != nil {
-			log.Printf("fsync writeback upload failed for %s: %v", fh.Path, err)
+			safeLogPrintf("fsync writeback upload failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		if fh.HasPendingMode {
@@ -12268,7 +12267,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				})
 				modeCancel()
 				if err != nil {
-					log.Printf("release: pending chmod failed for %s: %v", localPath, err)
+					safeLogPrintf("release: pending chmod failed for %s: %v", localPath, err)
 					fh.Lock()
 					stillCurrent := pendingModeMatchesLocked(fh, pendingMode, pendingModeGen)
 					fh.Unlock()
@@ -12496,10 +12495,10 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			if err != nil {
 				// Fallback: synchronous streaming upload from shadow.
 				// Do NOT use uploader.Submit — it reads from writeBack cache.
-				log.Printf("release: ShadowSpill commitQueue enqueue failed for %s: %v, falling back to sync upload", fh.Path, err)
+				safeLogPrintf("release: ShadowSpill commitQueue enqueue failed for %s: %v, falling back to sync upload", fh.Path, err)
 				if fs.layerEnabled() {
 					flushStatus = gofuse.EIO
-					log.Printf("release: layer mode preserves ShadowSpill pending state for %s after enqueue failure", fh.Path)
+					safeLogPrintf("release: layer mode preserves ShadowSpill pending state for %s after enqueue failure", fh.Path)
 				} else {
 					uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 					phase = "shadowspill-sync-upload"
@@ -12514,14 +12513,14 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					fs.debugDurationf(uploadStart, 0, "release shadowspill upload done path=%s size=%d err=%v", fh.Path, size, uploadErr)
 					if uploadErr != nil {
 						flushStatus = gofuse.EIO
-						log.Printf("release: ShadowSpill sync upload failed for %s: %v", fh.Path, uploadErr)
+						safeLogPrintf("release: ShadowSpill sync upload failed for %s: %v", fh.Path, uploadErr)
 					} else {
 						fallbackCommittedRev = committedRev
 						fh.Lock()
 						if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 							flushStatus = httpToFuseStatus(err)
 							preservePendingModeOnReleaseFailure = true
-							log.Printf("release: ShadowSpill pending chmod failed for %s after sync upload: %v", fh.Path, err)
+							safeLogPrintf("release: ShadowSpill pending chmod failed for %s after sync upload: %v", fh.Path, err)
 						} else {
 							clearReadTargetForLockedHandle(fh)
 							if committedRev > 0 {
@@ -12626,7 +12625,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					if err != nil {
 						if fs.layerEnabled() {
 							flushStatus = gofuse.EIO
-							log.Printf("release: layer commitQueue enqueue failed for %s: %v", fh.Path, err)
+							safeLogPrintf("release: layer commitQueue enqueue failed for %s: %v", fh.Path, err)
 							return
 						}
 						// Backpressure — fall back to legacy uploader.
@@ -12642,7 +12641,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				} else {
 					if fs.layerEnabled() {
 						flushStatus = gofuse.EIO
-						log.Printf("release: layer mode requires commitQueue for %s", fh.Path)
+						safeLogPrintf("release: layer mode requires commitQueue for %s", fh.Path)
 						return
 					}
 					// Async upload — the uploader will read from cache and upload.
@@ -12698,7 +12697,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			// multipart uploads on S3. Called without fh.mu because Abort()
 			// may perform network I/O.
 			streamer.Abort()
-			log.Printf("flush failed for %s (status %d), aborted stream upload", fh.Path, st)
+			safeLogPrintf("flush failed for %s (status %d), aborted stream upload", fh.Path, st)
 		}
 
 	}
@@ -12742,7 +12741,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	// threshold sits above the buffer's part size). Fetch missing parts via
 	// the lazy loader, or fail EIO preserving dirty state.
 	if !fs.materializeFullForUploadLocked(fh) {
-		log.Printf("debounced flush cannot materialize full file for %s", fh.Path)
+		safeLogPrintf("debounced flush cannot materialize full file for %s", fh.Path)
 		return gofuse.EIO
 	}
 	// Snapshot the data so the deferred upload sees a consistent copy.
@@ -12827,7 +12826,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		if err != nil {
 			unlockRemoteCommit()
 			handle.Unlock()
-			log.Printf("debounced flush failed for %s: %v", filePath, err)
+			safeLogPrintf("debounced flush failed for %s: %v", filePath, err)
 			return
 		}
 		modeCtx, modeCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -12836,7 +12835,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		if modeErr != nil {
 			unlockRemoteCommit()
 			handle.Unlock()
-			log.Printf("debounced flush pending chmod failed for %s: %v", filePath, modeErr)
+			safeLogPrintf("debounced flush pending chmod failed for %s: %v", filePath, modeErr)
 			return
 		}
 		// Record committed revision while holding remoteCommitLock, consistent
@@ -12971,18 +12970,18 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		if fh.ShadowSpill || (fh.Streamer != nil && fh.Streamer.Started()) || !fs.materializeFullForUploadLocked(fh) {
 			if fh.ShadowSpill {
 				if err := fs.commitLayerShadowLocked(ctx, fh, true); err != nil {
-					log.Printf("layer shadowspill flush failed for %s: %v", fh.Path, err)
+					safeLogPrintf("layer shadowspill flush failed for %s: %v", fh.Path, err)
 					return httpToFuseStatus(err)
 				}
 				return gofuse.OK
 			}
-			log.Printf("layer flush cannot materialize full file for %s", fh.Path)
+			safeLogPrintf("layer flush cannot materialize full file for %s", fh.Path)
 			return gofuse.EIO
 		}
 		data := fh.Dirty.bytesView()
 		mode, hasMode := fs.modeForPendingHandle(fh)
 		if err := fs.upsertLayerFile(ctx, fh.Path, data, expectedRevision, mode, hasMode); err != nil {
-			log.Printf("layer flush failed for %s: %v", fh.Path, err)
+			safeLogPrintf("layer flush failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		if fh.Dirty != nil {
@@ -13003,7 +13002,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		if fs.pendingIndex != nil {
 			if gen, putErr := fs.pendingIndex.PutWithBaseRevAndMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode); putErr != nil {
-				log.Printf("layer flush pending index update failed for %s: %v", fh.Path, putErr)
+				safeLogPrintf("layer flush pending index update failed for %s: %v", fh.Path, putErr)
 			} else {
 				fh.PendingIndexGen = gen
 			}
@@ -13068,7 +13067,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.debugDurationf(uploadStart, 0, "flushHandle finish streaming done path=%s size=%d err=%v", fh.Path, size, err)
 
 		if err != nil {
-			log.Printf("finish streaming failed for %s: %v", fh.Path, err)
+			safeLogPrintf("finish streaming failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		if fh.Unlinked {
@@ -13077,7 +13076,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			return gofuse.OK
 		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-			log.Printf("finish streaming pending chmod failed for %s: %v", fh.Path, err)
+			safeLogPrintf("finish streaming pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 
@@ -13142,7 +13141,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.debugDurationf(uploadStart, 0, "flushHandle upload all done path=%s size=%d parts=%d err=%v", fh.Path, size, len(partSnapshots), err)
 
 		if err != nil {
-			log.Printf("upload all parts failed for %s: %v", fh.Path, err)
+			safeLogPrintf("upload all parts failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		if fh.Unlinked {
@@ -13151,7 +13150,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			return gofuse.OK
 		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-			log.Printf("upload all pending chmod failed for %s: %v", fh.Path, err)
+			safeLogPrintf("upload all pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 
@@ -13257,7 +13256,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		// now covers the direct-PUT path as well (threshold raised above the
 		// file size after open), not just stream uploads.
 		if !fs.materializeFullForUploadLocked(fh) {
-			log.Printf("flushHandle cannot materialize full file for %s (path2)", fh.Path)
+			safeLogPrintf("flushHandle cannot materialize full file for %s (path2)", fh.Path)
 			return gofuse.EIO
 		}
 		dataCopy = make([]byte, fh.Dirty.Size())
@@ -13409,9 +13408,9 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 				fs.debugf("flushHandle patch unsupported target, retry as full upload path=%s size=%d", handlePath, size)
 				return fs.flushHandle(ctx, fh)
 			}
-			log.Printf("flush patch unsupported for %s; will full-upload on next flush (dirty state advanced during upload)", handlePath)
+			safeLogPrintf("flush patch unsupported for %s; will full-upload on next flush (dirty state advanced during upload)", handlePath)
 		}
-		log.Printf("flush upload failed for %s: %v", handlePath, err)
+		safeLogPrintf("flush upload failed for %s: %v", handlePath, err)
 		return httpToFuseStatus(err)
 	}
 	// If Unlink completed after we released remoteCommitLock (it serializes
@@ -13423,7 +13422,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		return gofuse.OK
 	}
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-		log.Printf("flush pending chmod failed for %s: %v", handlePath, err)
+		safeLogPrintf("flush pending chmod failed for %s: %v", handlePath, err)
 		return httpToFuseStatus(err)
 	}
 

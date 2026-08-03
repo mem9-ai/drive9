@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -14,6 +15,47 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 )
+
+func TestFSLayerPathQueryPreservesControlWhitespace(t *testing.T) {
+	const path = "/repo/line\nbreak\tname\r"
+	req := httptest.NewRequest(http.MethodGet, "/v1/layers/layer/entries?path="+url.QueryEscape(path), nil)
+	if got := fsLayerPathQuery(req); got != path {
+		t.Fatalf("path query = %q, want %q", got, path)
+	}
+}
+
+func TestFSLayerObjectPathPreservesTrailingControlWhitespace(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-control-whitespace",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	const path = "/repo/name\t"
+	if _, err := c.UploadFSLayerFile(ctx, "layer-control-whitespace", path, strings.NewReader("payload"), 7, 0, 0o644, true); err != nil {
+		t.Fatalf("UploadFSLayerFile: %v", err)
+	}
+	entry, err := c.GetFSLayerEntry(ctx, "layer-control-whitespace", path)
+	if err != nil {
+		t.Fatalf("GetFSLayerEntry: %v", err)
+	}
+	if entry.Path != path {
+		t.Fatalf("entry path = %q, want %q", entry.Path, path)
+	}
+	data, err := c.ReadFSLayerFile(ctx, "layer-control-whitespace", path, nil)
+	if err != nil {
+		t.Fatalf("ReadFSLayerFile: %v", err)
+	}
+	if string(data) != "payload" {
+		t.Fatalf("payload = %q, want payload", data)
+	}
+}
 
 func TestFSLayerAPIFlow(t *testing.T) {
 	s := newTestServer(t)

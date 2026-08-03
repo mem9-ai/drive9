@@ -416,8 +416,12 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 	}
 }
 
+func fsLayerPathQuery(r *http.Request) string {
+	return r.URL.Query().Get("path")
+}
+
 func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request, b *backendpkg.Dat9Backend, store *datastore.Store, layer *datastore.FSLayer) {
-	rawPath := strings.TrimSpace(r.URL.Query().Get("path"))
+	rawPath := fsLayerPathQuery(r)
 	if rawPath == "" {
 		errJSON(w, http.StatusBadRequest, "path is required")
 		return
@@ -473,7 +477,7 @@ func (s *Server) handleFSLayerObjectUpload(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	rawPath := strings.TrimSpace(r.URL.Query().Get("path"))
+	rawPath := fsLayerPathQuery(r)
 	if rawPath == "" {
 		errJSON(w, http.StatusBadRequest, "path is required")
 		return
@@ -645,7 +649,7 @@ func parseFSLayerModeQuery(r *http.Request, key string) (uint32, bool) {
 }
 
 func (s *Server) handleFSLayerEntryGet(w http.ResponseWriter, r *http.Request, store *datastore.Store, layer *datastore.FSLayer) {
-	path := strings.TrimSpace(r.URL.Query().Get("path"))
+	path := fsLayerPathQuery(r)
 	if path == "" {
 		errJSON(w, http.StatusBadRequest, "path is required")
 		return
@@ -836,9 +840,9 @@ func normalizeAndValidateFSLayerServerEntry(layer *datastore.FSLayer, entry *dat
 	}
 	entry.Path = path
 	if entry.Op == datastore.FSLayerEntryOpRename {
-		target := strings.TrimSpace(entry.ContentText)
+		target := entry.ContentText
 		if target == "" && len(entry.ContentBlob) > 0 {
-			target = strings.TrimSpace(string(entry.ContentBlob))
+			target = string(entry.ContentBlob)
 		}
 		targetPath, err := canonicalFSLayerServerPath(target, "", string(entry.Kind))
 		if err != nil {
@@ -853,7 +857,6 @@ func normalizeAndValidateFSLayerServerEntry(layer *datastore.FSLayer, entry *dat
 }
 
 func canonicalFSLayerServerPath(rawPath, op, kind string) (string, error) {
-	rawPath = strings.TrimSpace(rawPath)
 	if rawPath == "" {
 		return "", fmt.Errorf("path is required")
 	}
@@ -881,9 +884,9 @@ func validateFSLayerCommitScope(layer *datastore.FSLayer, entries []datastore.FS
 			conflicts = append(conflicts, fsLayerCommitConflict{Path: entries[i].Path, Reason: "entry outside base root"})
 		}
 		if entries[i].Op == datastore.FSLayerEntryOpRename {
-			target := strings.TrimSpace(entries[i].ContentText)
+			target := entries[i].ContentText
 			if target == "" && len(entries[i].ContentBlob) > 0 {
-				target = strings.TrimSpace(string(entries[i].ContentBlob))
+				target = string(entries[i].ContentBlob)
 			}
 			targetPath, err := canonicalFSLayerServerPath(target, "", string(entries[i].Kind))
 			if err != nil {

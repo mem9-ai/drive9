@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -1893,6 +1894,21 @@ func TestCopy(t *testing.T) {
 	_ = resp.Body.Close()
 	if string(body) != "shared" {
 		t.Errorf("got %q", body)
+	}
+}
+
+func TestSourcePathHeaderDecodesBase64URL(t *testing.T) {
+	const path = "/source\nname\twith\rwhitespace.txt"
+	req := httptest.NewRequest(http.MethodPost, "/v1/fs/destination?copy", nil)
+	req.Header.Set("X-Dat9-Copy-Source", base64.RawURLEncoding.EncodeToString([]byte(path)))
+	req.Header.Set("X-Dat9-Path-Encoding", "base64url")
+
+	got, err := sourcePathFromHeader(req, "X-Dat9-Copy-Source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != path {
+		t.Fatalf("source path = %q, want %q", got, path)
 	}
 }
 

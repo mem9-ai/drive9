@@ -1,7 +1,9 @@
 package fuse
 
 import (
+	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -18,7 +20,7 @@ func (fs *Dat9FS) debugf(format string, args ...any) {
 	if !fs.debugEnabled() {
 		return
 	}
-	log.Printf("dat9 debug: "+format, args...)
+	safeLogPrintf("dat9 debug: "+format, args...)
 }
 
 func (fs *Dat9FS) debugDurationf(start time.Time, threshold time.Duration, format string, args ...any) {
@@ -30,5 +32,23 @@ func (fs *Dat9FS) debugDurationf(start time.Time, threshold time.Duration, forma
 		return
 	}
 	args = append(args, d)
-	log.Printf("dat9 debug: "+format+" dur=%s", args...)
+	safeLogPrintf("dat9 debug: "+format+" dur=%s", args...)
+}
+
+func escapeLogControlWhitespace(value string) string {
+	return strings.NewReplacer("\n", "\\n", "\r", "\\r", "\t", "\\t").Replace(value)
+}
+
+func safeLogPrintf(format string, args ...any) {
+	for i, arg := range args {
+		switch value := arg.(type) {
+		case string:
+			args[i] = escapeLogControlWhitespace(value)
+		case error:
+			args[i] = escapeLogControlWhitespace(value.Error())
+		case fmt.Stringer:
+			args[i] = escapeLogControlWhitespace(value.String())
+		}
+	}
+	log.Printf(format, args...)
 }
