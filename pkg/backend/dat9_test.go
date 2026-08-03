@@ -421,6 +421,28 @@ func TestWriteAndRead(t *testing.T) {
 	}
 }
 
+func TestWriteAndReadPreservesControlWhitespaceInPath(t *testing.T) {
+	b := newTestBackend(t)
+	path := "/data/line\ncarriage\rtab\tname.txt"
+	if _, err := b.Write(path, []byte("hello world"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	data, err := b.Read(path, 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello world" {
+		t.Errorf("got %q", data)
+	}
+	info, err := b.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != "line\ncarriage\rtab\tname.txt" {
+		t.Errorf("name = %q, want %q", info.Name, "line\ncarriage\rtab\tname.txt")
+	}
+}
+
 func TestWriteOverwrite(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/f.txt", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {

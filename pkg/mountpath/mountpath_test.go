@@ -15,10 +15,10 @@ func TestNormalizeRoot(t *testing.T) {
 		{"/foo/bar", "/foo/bar", false},
 		{"/foo/bar/", "/foo/bar", false},
 		{"/foo//bar", "/foo/bar", false},
-		{"/foo/../bar", "", true},  // ".." rejected (not silently normalized)
-		{"/foo/./bar", "", true},   // "." rejected
-		{"/../escape", "", true},   // ".." rejected
-		{"foo", "", true},          // not absolute
+		{"/foo/../bar", "", true}, // ".." rejected (not silently normalized)
+		{"/foo/./bar", "", true},  // "." rejected
+		{"/../escape", "", true},  // ".." rejected
+		{"foo", "", true},         // not absolute
 	}
 	for _, tt := range tests {
 		got, err := NormalizeRoot(tt.in)
@@ -41,6 +41,8 @@ func TestToRemote(t *testing.T) {
 		{"/", "/a/b/c", "/a/b/c"},
 		{"/foo/bar", "/", "/foo/bar"},
 		{"/foo/bar", "/a.txt", "/foo/bar/a.txt"},
+		{"/foo/bar", "/line\nbreak.txt", "/foo/bar/line\nbreak.txt"},
+		{"/foo/bar", "/tab\tbreak.txt", "/foo/bar/tab\tbreak.txt"},
 		{"/foo/bar", "/sub/dir", "/foo/bar/sub/dir"},
 		// ".." in local path is clamped to "/"
 		{"/foo/bar", "/../escape", "/foo/bar/escape"},
@@ -69,6 +71,8 @@ func TestToLocal(t *testing.T) {
 		{"/foo/bar", "/foo/bar", "/", true},
 		{"/foo/bar", "/foo/bar/a.txt", "/a.txt", true},
 		{"/foo/bar", "/foo/bar/sub/dir", "/sub/dir", true},
+		{"/foo/bar", "/foo/bar/line\nbreak.txt", "/line\nbreak.txt", true},
+		{"/foo/bar", "/foo/bar/cr\rbreak.txt", "/cr\rbreak.txt", true},
 		// Outside scope
 		{"/foo/bar", "/foo", "", false},
 		{"/foo/bar", "/foo/baz", "", false},

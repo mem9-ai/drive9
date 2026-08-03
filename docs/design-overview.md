@@ -984,7 +984,8 @@ Single query, no second round-trip. Connection pooling with LRU eviction for idl
 
 ```
 Raw input (URL-decoded once)
-  → Reject if contains: NUL (\x00), control characters (\x01-\x1f), backslash (\)
+  → Reject if input is not valid UTF-8 or contains: NUL (\x00), control characters other than LF (\n), CR (\r), and Tab (\t), or backslash (\)
+  → Preserve ordinary spaces, including leading/trailing and space-only names
   → Reject if any segment is "." or ".."
   → Collapse consecutive slashes: "///" → "/"
   → Directory paths: MUST end with "/" (e.g., "/data/")

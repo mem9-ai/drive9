@@ -14,7 +14,7 @@ import (
 // NormalizeRoot canonicalizes a remote root path. It must be an absolute
 // path with no ".." or "." segments. An empty input defaults to "/".
 // Uses pathutil.Canonicalize for consistent validation (UTF-8, NFC,
-// control characters, traversal rejection).
+// disallowed control characters, traversal rejection).
 func NormalizeRoot(root string) (string, error) {
 	if root == "" {
 		return "/", nil
@@ -23,7 +23,7 @@ func NormalizeRoot(root string) (string, error) {
 		return "", fmt.Errorf("remote root must be an absolute path: %q", root)
 	}
 	// Use pathutil.Canonicalize for strict validation: rejects ".." and "."
-	// segments, control characters, backslashes, and normalizes to NFC.
+	// segments, disallowed control characters, backslashes, and normalizes to NFC.
 	cleaned, err := pathutil.Canonicalize(root)
 	if err != nil {
 		return "", fmt.Errorf("invalid remote root %q: %w", root, err)

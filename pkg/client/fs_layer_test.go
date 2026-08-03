@@ -44,6 +44,51 @@ func TestCommitFSLayerReturnsConflictBody(t *testing.T) {
 	}
 }
 
+func TestFSLayerFileOperationsPreserveSpaceOnlyPath(t *testing.T) {
+	const path = "  "
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("path"); got != path {
+			t.Errorf("query path = %q, want %q", got, path)
+		}
+		switch r.Method {
+		case http.MethodPost:
+			_ = json.NewEncoder(w).Encode(FSLayerEntry{Path: path})
+		case http.MethodGet:
+			if strings.HasSuffix(r.URL.Path, "/objects") {
+				_, _ = w.Write([]byte("payload"))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(FSLayerEntry{Path: path})
+		default:
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	entry, err := c.UploadFSLayerFile(context.Background(), "layer-1", path, strings.NewReader("payload"), 7, 0, 0, false)
+	if err != nil {
+		t.Fatalf("UploadFSLayerFile: %v", err)
+	}
+	if entry.Path != path {
+		t.Errorf("uploaded path = %q, want %q", entry.Path, path)
+	}
+	data, err := c.ReadFSLayerFile(context.Background(), "layer-1", path, nil)
+	if err != nil {
+		t.Fatalf("ReadFSLayerFile: %v", err)
+	}
+	if string(data) != "payload" {
+		t.Errorf("read data = %q, want payload", data)
+	}
+	entry, err = c.GetFSLayerEntry(context.Background(), "layer-1", path)
+	if err != nil {
+		t.Fatalf("GetFSLayerEntry: %v", err)
+	}
+	if entry.Path != path {
+		t.Errorf("entry path = %q, want %q", entry.Path, path)
+	}
+}
+
 func TestCommitFSLayerConflictBodyReadError(t *testing.T) {
 	c := New("http://drive9.test", "")
 	c.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {

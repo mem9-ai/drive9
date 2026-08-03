@@ -299,6 +299,56 @@ func TestUploadInitiateByBody202(t *testing.T) {
 	}
 }
 
+func TestUploadInitiatePreservesSpaceOnlyPath(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	body := make([]byte, 1<<20)
+	tests := []struct {
+		name     string
+		endpoint string
+		payload  map[string]any
+	}{
+		{
+			name:     "v1",
+			endpoint: "/v1/uploads/initiate",
+			payload: map[string]any{
+				"path":           "  ",
+				"total_size":     len(body),
+				"part_checksums": strings.Split(partChecksumHeader(body), ","),
+			},
+		},
+		{
+			name:     "v2",
+			endpoint: "/v2/uploads/initiate",
+			payload: map[string]any{
+				"path":       "  ",
+				"total_size": len(body),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded, err := json.Marshal(tt.payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := mustNewRequest(t, http.MethodPost, ts.URL+tt.endpoint, bytes.NewReader(encoded))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusAccepted {
+				respBody, _ := io.ReadAll(resp.Body)
+				t.Errorf("status = %d, want %d: %s", resp.StatusCode, http.StatusAccepted, respBody)
+			}
+		})
+	}
+}
+
 func TestUploadInitiateSanitizesCreateMultipartProviderError(t *testing.T) {
 	leakedErr := errors.New("operation error S3: CreateMultipartUpload, https response error StatusCode: 403, RequestID: QCRQPQAG0J880ZFK, HostID: KAjMF1T1LtFzMU/V7Tzp0rt14AqR7irO2HJtlHdXBCQioAv14tJsNkbUWvBZbSGYcFxqroX6fdo=, api error AccessDenied: User: arn:aws:sts::401696231252:assumed-role/prod-dat9-server-irsa/1777968029598718639 is not authorized to perform: kms:GenerateDataKey on resource: arn:aws:kms:ap-southeast-1:401696231252:key/fca526d7-bbff-44d4-9eee-7dd44053e85b")
 	s := newTestServerWithCreateMultipartError(t, leakedErr)

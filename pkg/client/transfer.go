@@ -11,6 +11,7 @@ import (
 	"hash/crc32"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -1713,8 +1714,11 @@ func (c *Client) ResumeUploadWithSummaryAndTags(ctx context.Context, path string
 
 // queryUpload finds an active upload for the given path.
 func (c *Client) queryUpload(ctx context.Context, path string) (*UploadMeta, error) {
+	query := url.Values{}
+	query.Set("path", path)
+	query.Set("status", "UPLOADING")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		c.baseURL+"/v1/uploads?path="+path+"&status=UPLOADING", nil)
+		c.baseURL+"/v1/uploads?"+query.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}

@@ -1,11 +1,38 @@
 package fuse
 
 import (
+	"io"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = original }()
+
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
+}
 
 func TestSSEWatcherResetPreservesInodes(t *testing.T) {
 	// Set up a Dat9FS with some cached inodes (no real server needed).
@@ -131,6 +158,28 @@ func TestSSEWatcherHandleChangeInvalidatesCache(t *testing.T) {
 	// Inode should still be there.
 	if _, ok := fs.inodes.GetInode("/docs/readme.md"); !ok {
 		t.Error("inode should survive a change event")
+	}
+}
+
+func TestSSEWatcherHandleChangeEscapesPathInStderr(t *testing.T) {
+	const path = "/docs/line\nbreak\tname\r.txt"
+	opts := &MountOptions{CacheSize: 1 << 20, DirTTL: 5 * time.Second}
+	opts.setDefaults()
+	fs := &Dat9FS{
+		inodes:    NewInodeToPath(),
+		readCache: NewReadCache(opts.CacheSize, 0),
+		dirCache:  NewDirCache(opts.DirTTL),
+	}
+	w := &SSEWatcher{fs: fs, actor: "my-actor"}
+
+	output := captureStderr(t, func() {
+		w.handleChange(&client.ChangeEvent{Path: path, Op: "write", Actor: "other-actor"})
+	})
+	if strings.Contains(output, path) {
+		t.Errorf("stderr contains raw path: %q", output)
+	}
+	if !strings.Contains(output, `/docs/line\nbreak\tname\r.txt`) {
+		t.Errorf("stderr = %q, want escaped path", output)
 	}
 }
 

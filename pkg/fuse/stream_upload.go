@@ -2,7 +2,6 @@ package fuse
 
 import (
 	"context"
-	"log"
 	"sync"
 	"time"
 
@@ -297,7 +296,7 @@ func (su *StreamUploader) Abort() {
 
 	if sw != nil {
 		if err := sw.Abort(context.Background()); err != nil {
-			log.Printf("stream upload abort failed for %s: %v", path, err)
+			safeLogPrintf("stream upload abort failed for %s: %v", path, err)
 		}
 	}
 }

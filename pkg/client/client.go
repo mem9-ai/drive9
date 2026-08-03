@@ -5,6 +5,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -321,7 +322,25 @@ func (c *Client) url(path string) string {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	return c.baseURL + "/v1/fs" + path
+	return c.baseURL + "/v1/fs" + escapeFSPath(path)
+}
+
+func escapeFSPath(path string) string {
+	// Escape each path byte that is unsafe in an HTTP request target while
+	// retaining separators so the server receives the original path shape.
+	escaped := url.PathEscape(path)
+	return strings.ReplaceAll(escaped, "%2F", "/")
+}
+
+const pathHeaderEncodingBase64URL = "base64url"
+
+func setSourcePathHeader(req *http.Request, header, path string) {
+	if !strings.ContainsAny(path, "\r\n\t\x7f") && !strings.HasPrefix(path, " ") && !strings.HasSuffix(path, " ") {
+		req.Header.Set(header, path)
+		return
+	}
+	req.Header.Set(header, base64.RawURLEncoding.EncodeToString([]byte(path)))
+	req.Header.Set("X-Dat9-Path-Encoding", pathHeaderEncodingBase64URL)
 }
 
 func (c *Client) RawGet(endpoint string) (*http.Response, error) {
@@ -616,7 +635,7 @@ func (c *Client) HardlinkCtx(ctx context.Context, srcPath, dstPath string) error
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Dat9-Hardlink-Source", srcPath)
+	setSourcePathHeader(req, "X-Dat9-Hardlink-Source", srcPath)
 	resp, err := c.do(req)
 	if err != nil {
 		return err
@@ -1092,7 +1111,7 @@ func (c *Client) CopyCtx(ctx context.Context, srcPath, dstPath string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Dat9-Copy-Source", srcPath)
+	setSourcePathHeader(req, "X-Dat9-Copy-Source", srcPath)
 	resp, err := c.do(req)
 	if err != nil {
 		return err
@@ -1115,7 +1134,7 @@ func (c *Client) RenameCtx(ctx context.Context, oldPath, newPath string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Dat9-Rename-Source", oldPath)
+	setSourcePathHeader(req, "X-Dat9-Rename-Source", oldPath)
 	resp, err := c.do(req)
 	if err != nil {
 		return err

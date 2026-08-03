@@ -3558,6 +3558,21 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+func sourcePathFromHeader(r *http.Request, header string) (string, error) {
+	raw := r.Header.Get(header)
+	if r.Header.Get("X-Dat9-Path-Encoding") == "" {
+		return raw, nil
+	}
+	if r.Header.Get("X-Dat9-Path-Encoding") != "base64url" {
+		return "", fmt.Errorf("unsupported X-Dat9-Path-Encoding")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid encoded %s: %w", header, err)
+	}
+	return string(decoded), nil
+}
+
 func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath string) {
 	// Copy semantics: src needs read, dst needs write. The source path is
 	// in the X-Dat9-Copy-Source HEADER (not the URL) — banked invariant
@@ -3565,7 +3580,11 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 	// could authorize ONLY the dst from the URL and let a scoped token
 	// exfiltrate from any zone it doesn't have read on, as long as its dst
 	// zone is writable. Both ends MUST authorize.
-	srcPath := r.Header.Get("X-Dat9-Copy-Source")
+	srcPath, decodeErr := sourcePathFromHeader(r, "X-Dat9-Copy-Source")
+	if decodeErr != nil {
+		errJSON(w, http.StatusBadRequest, decodeErr.Error())
+		return
+	}
 	if srcPath == "" {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_missing_source_header", "dst_path", dstPath)...)
 		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Copy-Source header")
@@ -3599,7 +3618,11 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 }
 
 func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath string) {
-	srcPath := r.Header.Get("X-Dat9-Hardlink-Source")
+	srcPath, decodeErr := sourcePathFromHeader(r, "X-Dat9-Hardlink-Source")
+	if decodeErr != nil {
+		errJSON(w, http.StatusBadRequest, decodeErr.Error())
+		return
+	}
 	if srcPath == "" {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "hardlink_missing_source_header", "dst_path", dstPath)...)
 		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Hardlink-Source header")
@@ -3648,7 +3671,11 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 	// (= write). Subtle but important — a scoped token with read+write on
 	// the source zone but no delete CAN read & copy the file but must NOT
 	// rename it away. See banked invariant.
-	oldPath := r.Header.Get("X-Dat9-Rename-Source")
+	oldPath, decodeErr := sourcePathFromHeader(r, "X-Dat9-Rename-Source")
+	if decodeErr != nil {
+		errJSON(w, http.StatusBadRequest, decodeErr.Error())
+		return
+	}
 	if oldPath == "" {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "rename_missing_source_header", "new_path", newPath)...)
 		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Rename-Source header")
@@ -3944,7 +3971,7 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.Path) == "" {
+	if req.Path == "" {
 		errJSON(w, http.StatusBadRequest, "missing path")
 		return
 	}
@@ -4431,7 +4458,7 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.Path) == "" {
+	if req.Path == "" {
 		errJSON(w, http.StatusBadRequest, "missing path")
 		return
 	}
