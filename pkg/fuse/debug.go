@@ -2,8 +2,10 @@ package fuse
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -52,13 +54,38 @@ func safeStderrPrintf(format string, args ...any) {
 
 func escapeLogArgs(args []any) {
 	for i, arg := range args {
-		switch value := arg.(type) {
+		switch arg.(type) {
 		case string:
-			args[i] = escapeLogControlWhitespace(value)
+			args[i] = safeLogValue{value: arg}
 		case error:
-			args[i] = escapeLogControlWhitespace(value.Error())
+			args[i] = safeLogValue{value: arg}
 		case fmt.Stringer:
-			args[i] = escapeLogControlWhitespace(value.String())
+			args[i] = safeLogValue{value: arg}
 		}
 	}
+}
+
+type safeLogValue struct {
+	value any
+}
+
+func (v safeLogValue) Format(state fmt.State, verb rune) {
+	var directive strings.Builder
+	directive.WriteByte('%')
+	for _, flag := range "#0+- " {
+		if state.Flag(int(flag)) {
+			directive.WriteRune(flag)
+		}
+	}
+	if width, ok := state.Width(); ok {
+		directive.WriteString(strconv.Itoa(width))
+	}
+	if precision, ok := state.Precision(); ok {
+		directive.WriteByte('.')
+		directive.WriteString(strconv.Itoa(precision))
+	}
+	directive.WriteRune(verb)
+
+	rendered := fmt.Sprintf(directive.String(), v.value)
+	_, _ = io.WriteString(state, escapeLogControlWhitespace(rendered))
 }
