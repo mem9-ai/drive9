@@ -611,6 +611,46 @@ func TestCopyCtxEncodesControlWhitespaceSourceHeader(t *testing.T) {
 	}
 }
 
+func TestCopyCtxPreservesEdgeSpacesInSourceHeader(t *testing.T) {
+	tests := []string{
+		" /leading.txt",
+		"/trailing.txt ",
+		" /both.txt ",
+		"/interior space.txt",
+	}
+	for _, source := range tests {
+		t.Run(source, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got, err := sourcePathFromRequestHeader(r, "X-Dat9-Copy-Source")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != source {
+					t.Fatalf("source path = %q, want %q", got, source)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer ts.Close()
+
+			if err := New(ts.URL, "").CopyCtx(context.Background(), source, "/destination.txt"); err != nil {
+				t.Fatalf("CopyCtx error = %v", err)
+			}
+		})
+	}
+}
+
+func sourcePathFromRequestHeader(r *http.Request, header string) (string, error) {
+	raw := r.Header.Get(header)
+	if r.Header.Get("X-Dat9-Path-Encoding") == "" {
+		return raw, nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return "", err
+	}
+	return string(decoded), nil
+}
+
 func TestCreateFileCtxPostsCreateActionAndReturnsRevision(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

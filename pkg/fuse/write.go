@@ -2,7 +2,6 @@ package fuse
 
 import (
 	"fmt"
-	"log"
 	"syscall"
 )
 
@@ -431,7 +430,7 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 	// Recreate as zero-filled — the original data is gone (already on S3).
 	// Only the newly written bytes will be meaningful; other bytes are zeros.
 	if wb.uploadedParts != nil && wb.uploadedParts[partIdx] {
-		log.Printf("WARNING: back-write to evicted part %d of %s — "+
+		safeLogPrintf("WARNING: back-write to evicted part %d of %s — "+
 			"non-written bytes will be zero (original data already uploaded to S3)", partIdx, wb.path)
 		data := make([]byte, wb.partSize)
 		wb.parts[partIdx] = data

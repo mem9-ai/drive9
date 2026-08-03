@@ -24,8 +24,24 @@ func TestFSLayerPathQueryPreservesControlWhitespace(t *testing.T) {
 	}
 }
 
+func TestFSLayerPathQueryPreservesEdgeSpaces(t *testing.T) {
+	for _, path := range []string{"/repo/ leading", "/repo/trailing ", "/repo/ both "} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/layers/layer/entries?path="+url.QueryEscape(path), nil)
+		if got := fsLayerPathQuery(req); got != path {
+			t.Fatalf("path query = %q, want %q", got, path)
+		}
+	}
+}
+
 func TestFSLayerRenameTargetPreservesControlWhitespace(t *testing.T) {
 	entry := &datastore.FSLayerEntry{ContentText: "/repo/target\t\r\n"}
+	if got := fsLayerRenameTarget(entry); got != entry.ContentText {
+		t.Fatalf("rename target = %q, want %q", got, entry.ContentText)
+	}
+}
+
+func TestFSLayerRenameTargetPreservesSpaces(t *testing.T) {
+	entry := &datastore.FSLayerEntry{ContentText: "  "}
 	if got := fsLayerRenameTarget(entry); got != entry.ContentText {
 		t.Fatalf("rename target = %q, want %q", got, entry.ContentText)
 	}

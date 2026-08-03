@@ -1912,6 +1912,16 @@ func TestSourcePathHeaderDecodesBase64URL(t *testing.T) {
 	}
 }
 
+func TestSourcePathHeaderRejectsUnsupportedEncoding(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/fs/destination?copy", nil)
+	req.Header.Set("X-Dat9-Copy-Source", "/source.txt")
+	req.Header.Set("X-Dat9-Path-Encoding", "hex")
+
+	if _, err := sourcePathFromHeader(req, "X-Dat9-Copy-Source"); err == nil {
+		t.Fatal("sourcePathFromHeader error = nil, want unsupported encoding error")
+	}
+}
+
 func TestHardlinkRoundTrip(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
