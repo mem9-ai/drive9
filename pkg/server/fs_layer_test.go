@@ -24,6 +24,13 @@ func TestFSLayerPathQueryPreservesControlWhitespace(t *testing.T) {
 	}
 }
 
+func TestFSLayerRenameTargetPreservesControlWhitespace(t *testing.T) {
+	entry := &datastore.FSLayerEntry{ContentText: "/repo/target\t\r\n"}
+	if got := fsLayerRenameTarget(entry); got != entry.ContentText {
+		t.Fatalf("rename target = %q, want %q", got, entry.ContentText)
+	}
+}
+
 func TestFSLayerObjectPathPreservesTrailingControlWhitespace(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
