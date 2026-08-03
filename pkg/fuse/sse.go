@@ -101,7 +101,7 @@ func (w *SSEWatcher) handleChange(ce *client.ChangeEvent) {
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "drive9: SSE event op=%s path=%s local=%s actor=%s\n", ce.Op, remotePath, p, ce.Actor)
+	safeStderrPrintf("drive9: SSE event op=%s path=%s local=%s actor=%s\n", ce.Op, remotePath, p, ce.Actor)
 
 	// Invalidate read cache and resolved read targets for the changed file.
 	w.fs.invalidateReadCacheAndTargets(p)

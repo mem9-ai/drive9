@@ -3,6 +3,7 @@ package fuse
 import (
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 )
@@ -40,6 +41,16 @@ func escapeLogControlWhitespace(value string) string {
 }
 
 func safeLogPrintf(format string, args ...any) {
+	escapeLogArgs(args)
+	log.Printf(format, args...)
+}
+
+func safeStderrPrintf(format string, args ...any) {
+	escapeLogArgs(args)
+	_, _ = fmt.Fprintf(os.Stderr, format, args...)
+}
+
+func escapeLogArgs(args []any) {
 	for i, arg := range args {
 		switch value := arg.(type) {
 		case string:
@@ -50,5 +61,4 @@ func safeLogPrintf(format string, args ...any) {
 			args[i] = escapeLogControlWhitespace(value.String())
 		}
 	}
-	log.Printf(format, args...)
 }

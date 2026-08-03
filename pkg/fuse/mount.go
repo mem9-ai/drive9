@@ -421,7 +421,7 @@ func Mount(opts *MountOptions) error {
 				for _, pe := range wbCache.ListPending() {
 					if !shadowStore.Has(pe.Meta.Path) {
 						if err := shadowStore.WriteFull(pe.Meta.Path, pe.Data, pe.Meta.BaseRev); err != nil {
-							fmt.Fprintf(os.Stderr, "drive9: migrate legacy entry %s to shadow: %v\n", pe.Meta.Path, err)
+							safeStderrPrintf("drive9: migrate legacy entry %s to shadow: %v\n", pe.Meta.Path, err)
 						}
 					}
 				}
