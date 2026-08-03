@@ -25,10 +25,16 @@ const (
 	// stream without an interleaved heartbeat; LB and client idle timeouts
 	// would otherwise kill multi-minute replays.
 	sseReplayHeartbeatInterval = 5 * time.Second
-	// sseCatchupPollDelay is the re-arm delay of the Phase-2 catch-up timer:
-	// when one wake hits the full-page cap, the stream flushes and polls again
-	// after this delay instead of waiting for the next notify signal.
+	// sseCatchupPollDelay is the base re-arm delay of the Phase-2 catch-up
+	// timer: when one wake hits the full-page cap, the stream flushes and
+	// polls again after this delay instead of waiting for the next notify
+	// signal. Consecutive query errors back off exponentially (doubling per
+	// error) up to sseCatchupMaxPollDelay — see sseCatchupBackoff.
 	sseCatchupPollDelay = 10 * time.Millisecond
+	// sseCatchupMaxPollDelay caps the catch-up re-arm backoff so a stream
+	// stuck on a persistent query error polls at most ~1/sec instead of
+	// hammering an already-suffering tenant DB at 100/sec.
+	sseCatchupMaxPollDelay = 1 * time.Second
 
 	// fsEventsSweepInterval throttles the lazy fs_events retention sweep on
 	// the write path to at most once per hour per tenant.
@@ -42,6 +48,20 @@ const (
 	// tenant DB cannot leak the goroutine.
 	fsEventsLazySweepTimeout = 5 * time.Minute
 
+	// sharedFSEventsSweepInterval throttles the shared-pool fs_events sweep
+	// (one physical table for all tenants in shared-schema deployments).
+	// Applied twice: as a cheap per-pod pre-filter (Server.lastSharedSweepUnix)
+	// and as the authoritative cluster-wide meta-DB claim interval, so N pods
+	// do not sweep the same table on N independent clocks.
+	sharedFSEventsSweepInterval = 30 * time.Minute
+	// sharedFSEventsSweepClaimName is the shared_maintenance_state row key
+	// for the pool sweep's cluster-wide claim.
+	sharedFSEventsSweepClaimName = "fs_events_sweep"
+	// sharedPoolMetricTenantID is the fixed tenant_id label for pool-wide
+	// sweep metrics: the operation cleans every tenant's rows, so attributing
+	// it to the triggering tenant would be misleading.
+	sharedPoolMetricTenantID = "shared_pool"
+
 	// sseEventsRoute is the SSE change-notification stream endpoint. It is the
 	// only SSE route today; observe uses this constant (plus the
 	// sseStreamEstablished context flag) to distinguish real SSE connection
@@ -54,13 +74,32 @@ var (
 	// single Phase-2 wake drains before flushing and re-arming the catch-up
 	// timer, so heartbeats and disconnects are serviced between bursts. A var
 	// (not a const) so tests can exercise the cap with a small page size.
+	// Tests that mutate it must restore it via t.Cleanup and must NOT use
+	// t.Parallel() — the mutation is process-global.
 	sseMaxFullPagesPerWake = 10
 
-	// eventsSinceE is the Phase-1 drain's event source. A package var so
-	// tests can inject a mid-drain query error deterministically (mirrors the
-	// tenantWorkerUsesTiDBAutoEmbedding seam).
+	// eventsSinceE is the event source for the Phase-1 mid-drain loop and
+	// Phase-2 pollAndSend. A package var so tests can inject query errors
+	// deterministically (mirrors the tenantWorkerUsesTiDBAutoEmbedding seam).
+	// Tests that swap it must restore it via t.Cleanup and must NOT use
+	// t.Parallel() — the swap is process-global.
 	eventsSinceE = (*EventBus).EventsSinceE
 )
+
+// sseCatchupBackoff returns the catch-up re-arm delay after consecutiveErrs
+// consecutive query errors: sseCatchupPollDelay doubled per error, capped at
+// sseCatchupMaxPollDelay. Pure function so tests can assert the backoff curve
+// without sleeping.
+func sseCatchupBackoff(consecutiveErrs int) time.Duration {
+	if consecutiveErrs < 1 {
+		consecutiveErrs = 1
+	}
+	d := sseCatchupPollDelay << min(consecutiveErrs-1, 10)
+	if d > sseCatchupMaxPollDelay {
+		d = sseCatchupMaxPollDelay
+	}
+	return d
+}
 
 // stopTimer drains a timer's channel after stopping it to prevent spurious
 // ticks. Returns true if the timer was stopped before it fired.
@@ -299,7 +338,15 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 // consumer whose cursor is older than the retention simply gets a longer
 // replay), so leftover rows and failures are fine: failures are metrics + warn
 // logs only, and rows beyond the batch cap drain on the next sweep.
+//
+// In shared-schema deployments the fs_id-scoped sweep is skipped entirely: one
+// physical table holds every tenant's rows, so per-tenant sweeps would miss
+// dead tenants and duplicate each other — the pool-wide sweep runs instead.
 func (s *Server) maybeSweepFSEvents(ctx context.Context, bus *EventBus, store *datastore.Store) {
+	if store.Scope().Shared() {
+		s.maybeSweepSharedFSEvents(store, bus.TiDBCloudOrgID())
+		return
+	}
 	now := time.Now().Unix()
 	last := bus.lastSweepUnix.Load()
 	if now-last < int64(fsEventsSweepInterval/time.Second) {
@@ -333,6 +380,65 @@ func (s *Server) maybeSweepFSEvents(ctx context.Context, bus *EventBus, store *d
 			// write-path sweep or tenant-worker maintenance cycle.
 			logger.Info(ctx, "fs_events_lazy_sweep_has_more",
 				zap.String("tenant_id", bus.tenantID),
+				zap.Int64("deleted", deleted))
+		}
+	}()
+}
+
+// maybeSweepSharedFSEvents runs the shared-pool fs_events retention sweep:
+// one batched DELETE across ALL tenants' expired rows in the shared physical
+// table (no fs_id predicate), because dead/idle tenants' rows are unreachable
+// by any per-tenant sweep. It is the single entry point shared by the write
+// path (maybeSweepFSEvents) and the tenant worker's piggyback maintenance
+// (via TenantWorkerOptions.SweepSharedFSEvents), so both ride ONE throttle:
+// a cheap per-pod pre-filter atomic, then the authoritative cluster-wide
+// meta-DB claim (ClaimSharedMaintenanceRun). The sweep itself runs on a
+// detached background goroutine so it never occupies the caller (mutation
+// path or tenant worker goroutine). Metrics use the fixed
+// sharedPoolMetricTenantID label — the operation cleans every tenant's rows.
+func (s *Server) maybeSweepSharedFSEvents(store *datastore.Store, tidbCloudOrgID string) {
+	now := time.Now().Unix()
+	last := s.lastSharedSweepUnix.Load()
+	if now-last < int64(sharedFSEventsSweepInterval/time.Second) {
+		return
+	}
+	if !s.lastSharedSweepUnix.CompareAndSwap(last, now) {
+		return
+	}
+	retention := s.fsEventsRetention
+	if retention <= 0 {
+		// Hand-constructed servers (tests) may skip NewWithConfig defaults.
+		retention = defaultFSEventsRetention
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(backgroundWithTrace(context.Background()), fsEventsLazySweepTimeout)
+		defer cancel()
+		// Cluster-wide claim: exactly one pod sweeps the pool per interval.
+		// Without a meta store there is no shared pool to protect (single-
+		// tenant mode never has shared-shape stores), so skip the claim.
+		if s.meta != nil {
+			claimed, err := s.meta.ClaimSharedMaintenanceRun(ctx, sharedFSEventsSweepClaimName, sharedFSEventsSweepInterval)
+			if err != nil {
+				logger.Warn(ctx, "shared_fs_events_sweep_claim_failed", zap.Error(err))
+				metrics.RecordTenantOperationWithOrg(sharedPoolMetricTenantID, tidbCloudOrgID, "event_bus", "retention_sweep_shared", metrics.ResultForError(err), 0)
+				return
+			}
+			if !claimed {
+				return
+			}
+		}
+		deleted, hasMore, err := store.DeleteSharedFSEventsBefore(ctx, time.Now().Add(-retention), fsEventsSweepBatchSize, fsEventsSweepMaxBatches)
+		if err != nil {
+			logger.Warn(ctx, "shared_fs_events_sweep_failed", zap.Error(err))
+			metrics.RecordTenantOperationWithOrg(sharedPoolMetricTenantID, tidbCloudOrgID, "event_bus", "retention_sweep_shared", metrics.ResultForError(err), 0)
+			return
+		}
+		metrics.RecordTenantOperationWithOrg(sharedPoolMetricTenantID, tidbCloudOrgID, "event_bus", "retention_sweep_shared", "ok", 0)
+		metrics.RecordFSEventsPruned(deleted)
+		if hasMore {
+			// Batch cap hit with leftover rows: they drain on the next
+			// throttled pass.
+			logger.Info(ctx, "shared_fs_events_sweep_has_more",
 				zap.Int64("deleted", deleted))
 		}
 	}()
@@ -529,20 +635,24 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// of waiting for the next notify signal (the outbox coalescer emits only
 	// one signal per tenant per 200ms window, so a >cap burst would otherwise
 	// stall its tail until the next write). Only a short page disarms it.
+	// Consecutive query errors re-arm with bounded exponential backoff
+	// (catchupErrs → sseCatchupBackoff), so a stream stuck on a failing
+	// tenant DB cannot hammer it at a fixed 10ms cadence.
 	var catchupTimer *time.Timer
 	var catchupC <-chan time.Time
+	catchupErrs := 0
 	defer func() {
 		if catchupTimer != nil {
 			stopTimer(catchupTimer)
 			catchupC = nil
 		}
 	}()
-	armCatchup := func() {
+	armCatchup := func(delay time.Duration) {
 		if catchupTimer == nil {
-			catchupTimer = time.NewTimer(sseCatchupPollDelay)
+			catchupTimer = time.NewTimer(delay)
 		} else {
 			stopTimer(catchupTimer)
-			catchupTimer.Reset(sseCatchupPollDelay)
+			catchupTimer.Reset(delay)
 		}
 		catchupC = catchupTimer.C
 	}
@@ -557,11 +667,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// A full page (eventPageSize events) means the backlog likely continues, so
 	// it polls again immediately — up to sseMaxFullPagesPerWake consecutive full
 	// pages per wake, then flushes and re-arms the catch-up timer; a short page
-	// disarms. Returns false if the stream should terminate (write error).
-	pollAndSend := func() bool {
+	// disarms. Query errors keep the connection and re-arm with bounded
+	// exponential backoff (sseCatchupBackoff) instead of a fixed cadence.
+	// fromCatchup marks a wake from the catch-up timer itself (a drain
+	// in progress). Returns false if the stream should terminate (write error).
+	pollAndSend := func(fromCatchup bool) bool {
 		capped := false
 		for fullPages := 0; ; {
-			liveEvents, liveHead, liveOK := bus.EventsSince(ctx, lastSeen)
+			liveEvents, liveHead, liveOK, qErr := eventsSinceE(bus, ctx, lastSeen)
 			if !liveOK {
 				sendSSEReset(bw, liveHead, "seq_too_old")
 				metrics.RecordSSEResetSentWithOrg(tenantID, tidbCloudOrgID, "seq_too_old")
@@ -577,6 +690,27 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				disarmCatchup()
 				return true
 			}
+			if qErr != nil {
+				// Tolerated query error (EventsSinceE already logged/metriced
+				// it): deliver nothing and keep the connection — that part is
+				// deliberate. Do NOT disarm the catch-up timer: if this wake
+				// came from the timer itself, it is already spent, so re-arm
+				// it (with bounded exponential backoff on consecutive errors)
+				// or the in-progress burst drain dies here; a notify- or
+				// liveness-driven wake leaves any armed timer untouched and
+				// does not create a new one (no fresh polling against a quiet
+				// stream's failing DB). Also do NOT stamp lastSuccessfulPoll
+				// (a FAILED poll is not a success; the liveness poll must
+				// still detect the signal loss).
+				if fromCatchup {
+					catchupErrs++
+					armCatchup(sseCatchupBackoff(catchupErrs))
+				}
+				return true
+			}
+			// Successful poll: a recovered DB resumes the full-speed drain
+			// immediately, and the liveness clock is fresh.
+			catchupErrs = 0
 			lastSuccessfulPoll = time.Now()
 			for _, ev := range liveEvents {
 				sendSSEEvent(bw, ev)
@@ -629,7 +763,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if capped {
-			armCatchup()
+			armCatchup(sseCatchupPollDelay)
 		} else {
 			disarmCatchup()
 		}
@@ -652,7 +786,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		case <-livenessC:
 			if time.Since(lastSuccessfulPoll) >= s.sseLivenessPollInterval {
-				if !pollAndSend() {
+				if !pollAndSend(false) {
 					return
 				}
 			}
@@ -660,7 +794,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			// A previous wake hit the full-page cap: resume the drain. The
 			// select loop serviced heartbeats and disconnects in between.
 			catchupC = nil
-			if !pollAndSend() {
+			if !pollAndSend(true) {
 				return
 			}
 		case <-flushC:
@@ -674,7 +808,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if !open {
 				return
 			}
-			if !pollAndSend() {
+			if !pollAndSend(false) {
 				return
 			}
 		}

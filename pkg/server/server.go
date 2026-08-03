@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -315,6 +316,11 @@ type Server struct {
 	// (not leader-gated); stopped during Close before the coalescer's final
 	// flush so its last notify signals still land in the outbox.
 	eventRetry *eventRetryBuffer
+	// lastSharedSweepUnix is the per-pod pre-filter throttle for the
+	// shared-pool fs_events sweep (see maybeSweepSharedFSEvents in sse.go).
+	// The authoritative cluster-wide throttle is the meta-DB claim; this
+	// atomic only keeps the common case off the meta DB.
+	lastSharedSweepUnix atomic.Int64
 	// sseNotifyRetention is how long outbox rows are kept before leader pruning.
 	sseNotifyRetention time.Duration
 	// fsEventsRetention is how long fs_events rows are kept before the lazy
@@ -710,7 +716,20 @@ func NewWithConfig(cfg Config) *Server {
 	}
 
 	s.mux = mux
-	s.tenantWorker = newTenantWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.TenantWorkers, cfg.TenantMaintenanceInterval)
+	// Finalize the tenant worker options against the server's effective
+	// config: fall back to the server's fs_events retention when the caller
+	// only set Config.FSEventsRetention (belt-and-braces for programmatic
+	// use; main.go sets both), and wire the shared-pool sweep entry point so
+	// the worker's piggyback maintenance and the write path share ONE
+	// throttle (per-pod pre-filter + cluster claim) instead of two clocks.
+	workerOpts := cfg.TenantWorkers
+	if workerOpts.FSEventsRetention <= 0 {
+		workerOpts.FSEventsRetention = s.fsEventsRetention
+	}
+	if workerOpts.SweepSharedFSEvents == nil {
+		workerOpts.SweepSharedFSEvents = s.maybeSweepSharedFSEvents
+	}
+	s.tenantWorker = newTenantWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, workerOpts, cfg.TenantMaintenanceInterval)
 	if s.tenantWorker != nil {
 		// Wire the write-path notifier so freshly enqueued semantic/file_gc/
 		// quota work triggers an immediate in-process kick (~0ms latency for

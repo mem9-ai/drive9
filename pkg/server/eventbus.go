@@ -30,7 +30,9 @@ var (
 	// Callers (SSE Phase-1 replay and Phase-2 poll) must loop on a full page:
 	// a short page signals the backlog is drained. A var (not a const) so
 	// tests can shrink the page instead of inserting tens of thousands of
-	// rows to exercise multi-page drains.
+	// rows to exercise multi-page drains. Tests that mutate it must restore
+	// it via t.Cleanup and must NOT use t.Parallel() — the mutation is
+	// process-global.
 	eventPageSize = 1000
 )
 

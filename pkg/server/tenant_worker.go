@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/failpoint"
@@ -49,11 +48,6 @@ const (
 	// defaultTenantMaintenanceInterval is the throttle interval for piggybacked
 	// maintenance (fs_events cleanup + observation metrics) per tenant.
 	defaultTenantMaintenanceInterval = 5 * time.Minute
-	// sharedFSEventsSweepInterval throttles the shared-pool fs_events sweep
-	// GLOBALLY (across all tenants this manager serves): one call sweeps the
-	// whole pool's physical table, so the per-tenant maintenance throttle
-	// would sweep the same table over and over.
-	sharedFSEventsSweepInterval = 30 * time.Minute
 )
 
 var tenantWorkerUsesTiDBAutoEmbedding = tenant.UsesTiDBAutoEmbedding
@@ -87,6 +81,12 @@ type TenantWorkerOptions struct {
 	// piggybacked maintenance sweep prunes them (backstop for the lazy
 	// write-path sweep). Defaults to defaultFSEventsRetention.
 	FSEventsRetention time.Duration
+	// SweepSharedFSEvents runs the shared-pool fs_events retention sweep for
+	// the pool the given store belongs to. Wired from NewWithConfig to the
+	// server-level helper (detached; throttled cluster-wide), so the
+	// piggyback path and the write path share one throttle. Nil disables the
+	// pool sweep (the piggyback branch skips shared stores).
+	SweepSharedFSEvents func(store *datastore.Store, tidbCloudOrgID string)
 }
 
 func (o *TenantWorkerOptions) normalize() {
@@ -179,9 +179,6 @@ type tenantWorkerManager struct {
 
 	lastMaintenance   map[string]time.Time
 	semanticMetricOrg map[string]string // tenantID -> org used by the last semantic gauge observation
-	// lastSharedSweepUnix throttles the shared-pool fs_events sweep globally;
-	// see maybeSweepSharedFSEvents.
-	lastSharedSweepUnix atomic.Int64
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -618,11 +615,14 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 	if target.store.Scope().Shared() {
 		// Shared schema: every tenant lives in one physical fs_events table,
 		// so dead/idle tenants' rows are unreachable by any fs_id-scoped
-		// sweep. Sweep the whole pool instead, throttled globally. Running
-		// here (piggybackMaintenance only fires for already-warm tenants) is
-		// the design's "no cold wakeup" gate: maintenance of an active shared
+		// sweep. Run the pool-wide sweep via the server-level helper instead
+		// (detached, cluster-throttled; wired in NewWithConfig). Running here
+		// (piggybackMaintenance only fires for already-warm tenants) is the
+		// design's "no cold wakeup" gate: maintenance of an active shared
 		// resource, not a cron over cold DBs.
-		m.maybeSweepSharedFSEvents(ctx, target, now)
+		if m.opts.SweepSharedFSEvents != nil {
+			m.opts.SweepSharedFSEvents(target.store, target.metricOrgID())
+		}
 	} else if n, hasMore, err := target.store.DeleteFSEventsBefore(ctx, now.Add(-m.opts.FSEventsRetention), fsEventsSweepBatchSize, fsEventsSweepMaxBatches); err != nil {
 		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "event_bus", "retention_sweep", metrics.ResultForError(err), 0)
 		if ctx.Err() == nil {
@@ -641,36 +641,6 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 
 	// Observation metrics: sample queue depth + dead-letter count.
 	m.observeTenant(ctx, target, now)
-}
-
-// maybeSweepSharedFSEvents runs the shared-pool fs_events sweep at most once
-// per sharedFSEventsSweepInterval across the whole manager. The sweep carries
-// no fs_id predicate (one call cleans every tenant's expired rows in the
-// shared physical table); failures are metrics + warn logs only, and leftover
-// rows drain on the next throttled pass.
-func (m *tenantWorkerManager) maybeSweepSharedFSEvents(ctx context.Context, target *tenantTarget, now time.Time) {
-	last := m.lastSharedSweepUnix.Load()
-	if now.Unix()-last < int64(sharedFSEventsSweepInterval/time.Second) {
-		return
-	}
-	if !m.lastSharedSweepUnix.CompareAndSwap(last, now.Unix()) {
-		return
-	}
-	if n, hasMore, err := target.store.DeleteSharedFSEventsBefore(ctx, now.Add(-m.opts.FSEventsRetention), fsEventsSweepBatchSize, fsEventsSweepMaxBatches); err != nil {
-		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "event_bus", "retention_sweep_shared", metrics.ResultForError(err), 0)
-		if ctx.Err() == nil {
-			logger.Warn(ctx, "tenant_worker_shared_fs_events_cleanup_failed",
-				zap.String("tenant_id", target.tenantID), zap.Error(err))
-		}
-	} else {
-		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "event_bus", "retention_sweep_shared", "ok", 0)
-		metrics.RecordFSEventsPruned(n)
-		if hasMore {
-			logger.Info(ctx, "tenant_worker_shared_fs_events_cleanup_has_more",
-				zap.String("tenant_id", target.tenantID),
-				zap.Int64("deleted", n))
-		}
-	}
 }
 
 func (m *tenantWorkerManager) observeTenant(ctx context.Context, target *tenantTarget, now time.Time) {

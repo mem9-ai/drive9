@@ -1095,6 +1095,15 @@ func metaInitSchemaStatements() []string {
 			updated_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			PRIMARY KEY (pod_id)
 		)`,
+		// shared_maintenance_state holds one row per cluster-wide maintenance
+		// task (e.g. the shared-pool fs_events sweep) so all pods can throttle
+		// against each other via an atomic claim instead of each running the
+		// task on its own interval.
+		`CREATE TABLE IF NOT EXISTS shared_maintenance_state (
+			name        VARCHAR(64) NOT NULL,
+			last_run_at DATETIME(3) NOT NULL,
+			PRIMARY KEY (name)
+		)`,
 	}
 }
 
@@ -5105,6 +5114,42 @@ func (s *Store) DeleteTenantOutboxCursor(ctx context.Context, podID string) (err
 		 AND EXISTS (SELECT 1 FROM pod_registry WHERE pod_id = ? AND status = 'stale')`,
 		podID, podID)
 	return err
+}
+
+// ---------------------------------------------------------------------------
+// Shared maintenance state
+// ---------------------------------------------------------------------------
+
+// ClaimSharedMaintenanceRun atomically claims the right to run the named
+// cluster-wide maintenance task (e.g. the shared-pool fs_events sweep).
+// Exactly one caller across all pods wins per minInterval window: the UPDATE
+// only succeeds when the stored last_run_at is older than the interval, and
+// the winner stamps its own run in the same statement. The row is created
+// lazily via INSERT IGNORE (seeded at the epoch so the first claim always
+// wins). Callers should keep a cheap local pre-filter so the common case
+// never reaches the meta DB.
+func (s *Store) ClaimSharedMaintenanceRun(ctx context.Context, name string, minInterval time.Duration) (claimed bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "claim_shared_maintenance_run", start, &err)
+	if _, err = s.db.ExecContext(ctx,
+		`INSERT IGNORE INTO shared_maintenance_state (name, last_run_at) VALUES (?, ?)`,
+		name, time.Unix(0, 0).UTC()); err != nil {
+		return false, err
+	}
+	res, execErr := s.db.ExecContext(ctx,
+		`UPDATE shared_maintenance_state SET last_run_at = NOW(3)
+		 WHERE name = ? AND last_run_at < DATE_SUB(NOW(3), INTERVAL ? SECOND)`,
+		name, int64(minInterval/time.Second))
+	if execErr != nil {
+		err = execErr
+		return false, err
+	}
+	n, rowsErr := res.RowsAffected()
+	if rowsErr != nil {
+		err = rowsErr
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // ListAllActivePodIDs returns the pod_id of every active pod in pod_registry,

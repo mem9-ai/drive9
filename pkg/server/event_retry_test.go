@@ -274,31 +274,36 @@ func TestEventRetryExpiredEntryDropped(t *testing.T) {
 // TestEventRetryEnqueueAfterStopDropped verifies the stopped gate: an event
 // enqueued after stop must NOT be buffered (the flush goroutine is gone, so
 // it would never be retried) — it is counted as dropped with reason stopped.
+// Entries still buffered when stop's flush budget runs out are discarded and
+// counted with reason shutdown.
 func TestEventRetryEnqueueAfterStopDropped(t *testing.T) {
 	buf, _ := newTestEventRetryBuffer()
 	bus := NewEventBus("stopped-tenant", nil)
 
 	// Buffer one entry, then stop (never started: wg.Wait returns immediately;
-	// the final flush requeues the entry against the nil store).
+	// the final flush fails against the nil store and the leftover is
+	// discarded as shutdown loss).
 	buf.enqueue(bus, "/kept.txt", "write", "", 100)
 	buf.stop()
 
+	if got := bufferDepth(buf); got != 0 {
+		t.Fatalf("depth after stop = %d, want 0 (leftover discarded as shutdown loss)", got)
+	}
+
 	buf.enqueue(bus, "/dropped.txt", "write", "", 200)
 
-	if got := bufferDepth(buf); got != 1 {
-		t.Fatalf("depth = %d, want 1 (post-stop enqueue must not buffer)", got)
-	}
-	buf.mu.Lock()
-	keptPath := buf.entries[0].path
-	buf.mu.Unlock()
-	if keptPath != "/kept.txt" {
-		t.Fatalf("remaining entry = %q, want /kept.txt", keptPath)
+	if got := bufferDepth(buf); got != 0 {
+		t.Fatalf("depth = %d, want 0 (post-stop enqueue must not buffer)", got)
 	}
 
 	rec := httptest.NewRecorder()
 	metrics.WritePrometheus(rec)
-	if !strings.Contains(rec.Body.String(), `drive9_sse_event_retry_dropped_total{reason="stopped",tenant_id="stopped-tenant",tidbcloud_org_id="guest"} 1`) {
-		t.Fatalf("expected stopped drop counter series:\n%s", rec.Body.String())
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_sse_event_retry_dropped_total{reason="stopped",tenant_id="stopped-tenant",tidbcloud_org_id="guest"} 1`) {
+		t.Fatalf("expected stopped drop counter series:\n%s", text)
+	}
+	if !strings.Contains(text, `drive9_sse_event_retry_dropped_total{reason="shutdown",tenant_id="stopped-tenant",tidbcloud_org_id="guest"} 1`) {
+		t.Fatalf("expected shutdown drop counter series:\n%s", text)
 	}
 }
 

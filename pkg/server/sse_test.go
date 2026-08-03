@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -988,5 +989,184 @@ func TestSSEEndpointPhase1MidDrainErrorTerminates(t *testing.T) {
 	}
 	if calls < 1 {
 		t.Fatalf("eventsSinceE calls = %d, want >= 1 (mid-drain call)", calls)
+	}
+}
+
+// TestSSEEndpointPhase2QueryErrorKeepsCatchupArmed verifies that a DB query
+// error mid-burst does NOT kill the event-driven drain: the catch-up timer
+// must stay armed so the tail is delivered once the error clears, with no
+// further notify signal. (The companion guarantee — the failed poll not
+// stamping lastSuccessfulPoll — is enforced in pollAndSend by the early
+// qErr return before the stamp; a timing-based assertion of that internal
+// clock would be flaky by construction, so it is covered by review of that
+// branch plus the liveness-poll path in handleEvents.)
+func TestSSEEndpointPhase2QueryErrorKeepsCatchupArmed(t *testing.T) {
+	oldPage, oldCap := eventPageSize, sseMaxFullPagesPerWake
+	eventPageSize, sseMaxFullPagesPerWake = 50, 3
+	t.Cleanup(func() { eventPageSize, sseMaxFullPagesPerWake = oldPage, oldCap })
+
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
+
+	// One existing event so the client can connect at head with no replay.
+	publishTestEvent(t, store, bus, "/existing.txt", "write", "")
+
+	// Inject exactly ONE query error: the 4th poll (the first catch-up fire
+	// after the initial 3-page wake) fails; every other call goes through.
+	realEventsSinceE := eventsSinceE
+	var pollCalls atomic.Int32
+	eventsSinceE = func(eb *EventBus, ctx context.Context, since uint64) ([]ChangeEvent, uint64, bool, error) {
+		if pollCalls.Add(1) == 4 {
+			return nil, since, true, fmt.Errorf("injected mid-burst db error")
+		}
+		return realEventsSinceE(eb, ctx, since)
+	}
+	t.Cleanup(func() { eventsSinceE = realEventsSinceE })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+
+	// First event must be the end-of-Phase-1 heartbeat (caught up at head).
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial heartbeat")
+	}
+	if ev.Event != "heartbeat" {
+		t.Fatalf("first event = %q, want heartbeat", ev.Event)
+	}
+
+	// Commit a 5-page burst (page=50, cap=3) and send ONE notify signal.
+	// Wake 1 drains 3 pages and arms the catch-up timer. The first catch-up
+	// fire hits the injected error: with the bug it would disarm and the tail
+	// would stall until the next write (test would time out); post-fix the
+	// timer stays armed and the remaining 2 pages arrive on later fires.
+	const backlog = 250
+	bulkInsertFSEvents(t, store, backlog)
+	bus.Publish()
+
+	for i := 0; i < backlog; i++ {
+		ev, ok := readSSEEvent(scanner)
+		if !ok {
+			t.Fatalf("stream ended after %d/%d events (query error killed the catch-up drain)", i, backlog)
+		}
+		if ev.Event != "file_changed" {
+			t.Fatalf("event %d = %q, want file_changed", i, ev.Event)
+		}
+	}
+	if got := pollCalls.Load(); got < 7 {
+		t.Fatalf("poll calls = %d, want >= 7 (3 initial + 1 error + 3 drain)", got)
+	}
+}
+
+// TestSSECatchupBackoff asserts the catch-up re-arm backoff curve as pure
+// state (no sleeping): 10ms doubling per consecutive error, capped at 1s.
+func TestSSECatchupBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		errs int
+		want time.Duration
+	}{
+		{0, 10 * time.Millisecond}, // defensive floor
+		{1, 10 * time.Millisecond},
+		{2, 20 * time.Millisecond},
+		{3, 40 * time.Millisecond},
+		{6, 320 * time.Millisecond},
+		{7, 640 * time.Millisecond},
+		{8, sseCatchupMaxPollDelay}, // 10ms << 7 = 1.28s → capped
+		{100, sseCatchupMaxPollDelay},
+	} {
+		if got := sseCatchupBackoff(tc.errs); got != tc.want {
+			t.Fatalf("sseCatchupBackoff(%d) = %v, want %v", tc.errs, got, tc.want)
+		}
+	}
+}
+
+// TestSSEEndpointPhase2QueryErrorBackoffResumesDrain verifies that a burst
+// drain survives MULTIPLE consecutive query errors on the catch-up timer: the
+// re-arm backs off (10ms → 20ms → 40ms) instead of giving up, and once the
+// error clears the tail is delivered with no further notify signal.
+func TestSSEEndpointPhase2QueryErrorBackoffResumesDrain(t *testing.T) {
+	oldPage, oldCap := eventPageSize, sseMaxFullPagesPerWake
+	eventPageSize, sseMaxFullPagesPerWake = 50, 3
+	t.Cleanup(func() { eventPageSize, sseMaxFullPagesPerWake = oldPage, oldCap })
+
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
+
+	// One existing event so the client can connect at head with no replay.
+	publishTestEvent(t, store, bus, "/existing.txt", "write", "")
+
+	// Inject THREE consecutive query errors: catch-up fires 1-3 (poll calls
+	// 4-6) fail; every other call goes through.
+	realEventsSinceE := eventsSinceE
+	var pollCalls atomic.Int32
+	eventsSinceE = func(eb *EventBus, ctx context.Context, since uint64) ([]ChangeEvent, uint64, bool, error) {
+		if n := pollCalls.Add(1); n >= 4 && n <= 6 {
+			return nil, since, true, fmt.Errorf("injected persistent db error")
+		}
+		return realEventsSinceE(eb, ctx, since)
+	}
+	t.Cleanup(func() { eventsSinceE = realEventsSinceE })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+
+	// First event must be the end-of-Phase-1 heartbeat (caught up at head).
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial heartbeat")
+	}
+	if ev.Event != "heartbeat" {
+		t.Fatalf("first event = %q, want heartbeat", ev.Event)
+	}
+
+	// Commit a 5-page burst (page=50, cap=3) and send ONE notify signal.
+	// Wake 1 drains 3 pages and arms the catch-up timer; fires 1-3 hit the
+	// injected errors (backoff 10ms → 20ms → 40ms); fire 4 succeeds and
+	// drains the remaining 2 pages at full speed.
+	const backlog = 250
+	bulkInsertFSEvents(t, store, backlog)
+	bus.Publish()
+
+	for i := 0; i < backlog; i++ {
+		ev, ok := readSSEEvent(scanner)
+		if !ok {
+			t.Fatalf("stream ended after %d/%d events (backoff did not resume the drain)", i, backlog)
+		}
+		if ev.Event != "file_changed" {
+			t.Fatalf("event %d = %q, want file_changed", i, ev.Event)
+		}
+	}
+	if got := pollCalls.Load(); got < 9 {
+		t.Fatalf("poll calls = %d, want >= 9 (3 initial + 3 errors + 3 drain)", got)
 	}
 }

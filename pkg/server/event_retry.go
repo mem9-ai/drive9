@@ -146,7 +146,9 @@ func (b *eventRetryBuffer) start(ctx context.Context) {
 // after it), cancels the flush goroutine, waits for it to exit, then attempts
 // one final best-effort flush with a bounded timeout so buffered entries get
 // a last chance to land before the process exits. All entries are made due
-// for this flush regardless of their backoff slot.
+// for this flush regardless of their backoff slot. Entries still buffered
+// after the flush budget runs out are hard loss: each is counted as dropped
+// (reason "shutdown") and the remaining depth is warn-logged.
 func (b *eventRetryBuffer) stop() {
 	b.mu.Lock()
 	b.stopped = true
@@ -163,6 +165,19 @@ func (b *eventRetryBuffer) stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), eventRetryShutdownFlushTimeout)
 	defer cancel()
 	b.flushDue(ctx)
+	b.mu.Lock()
+	leftover := len(b.entries)
+	for _, e := range b.entries {
+		metrics.RecordSSEEventRetryDropped(e.tenantID, e.orgID, "shutdown")
+	}
+	b.entries = nil
+	b.tenantCounts = make(map[string]int)
+	b.mu.Unlock()
+	if leftover > 0 {
+		logger.Warn(context.Background(), "sse_event_retry_shutdown_leftover",
+			zap.Int("dropped", leftover))
+	}
+	metrics.RecordSSEEventRetryBufferDepth(0)
 }
 
 // run scans for due entries every eventRetryScanInterval until ctx is done.
