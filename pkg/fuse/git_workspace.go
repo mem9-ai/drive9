@@ -3576,7 +3576,10 @@ func (fs *Dat9FS) applyGitOverlayMirrorEntryUnlessWhiteout(fh *FileHandle, size 
 		fh.Unlinked = true
 		return
 	}
-	fs.rememberPendingGitOverlayEntry(fh.GitWorkspaceID, entry)
+	// Capture the pending seq so registration-time whiteout adoption can drop
+	// only THIS handle's stale pending entry — a legitimate same-path
+	// recreate re-remembers the path with a newer seq and must survive.
+	fh.GitPendingMirrorSeq = fs.rememberPendingGitOverlayEntry(fh.GitWorkspaceID, entry)
 }
 
 func (fs *Dat9FS) rememberPendingGitOverlayEntry(workspaceID string, entry client.GitOverlayEntry) uint64 {
@@ -4109,9 +4112,15 @@ func (fs *Dat9FS) gitCreateHandle(ctx context.Context, localPath string, flags u
 	if hasMode {
 		fs.setPendingModeLocked(fh, mode, 0)
 	}
+	// Apply the create's mirror entry BEFORE creating the dirty mirror file:
+	// a straddled open adopting the unlinked state removes the stale mirror
+	// pathname while the whiteout is still authoritative
+	// (removeGitDirtyMirrorIfWhiteout, under rt.mu). Applying first orders
+	// this create against that cleanup — the cleanup either sees this upsert
+	// (and skips the removal) or runs before this mirror exists.
+	fs.applyGitOverlayMirrorEntry(fh, 0)
 	if file, ok := fs.openGitDirtyMirrorFile(rt, rel, flags|uint32(syscall.O_TRUNC), nil); ok {
 		fh.LocalFile = file
-		fs.applyGitOverlayMirrorEntry(fh, 0)
 	}
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
 	return fh, entry, gofuse.OK
@@ -4150,11 +4159,29 @@ func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flag
 	}
 	accMode := flags & syscall.O_ACCMODE
 	if accMode != syscall.O_WRONLY && accMode != syscall.O_RDWR {
-		// Read-only opens do not preload. Stash the observed overlay content
-		// so a whiteout racing the rest of this open can still give the
-		// registered handle an anonymous-fd read backing instead of EOF.
-		if overlaySeen && overlayObserved.Op != "whiteout" && len(overlayObserved.Content) > 0 {
+		// Read-only opens stay preload-free for clean-tree files, but an
+		// overlay-backed fd must never be stranded without a read backing: if
+		// a whiteout races the rest of this open, registration adopts the
+		// unlinked state and Read must still serve the pre-unlink bytes — or
+		// the open must fail rather than succeed and read EOF.
+		switch {
+		case overlaySeen && overlayObserved.Op == "whiteout":
+			// The name is already gone; a stale kernel dentry can still
+			// reach here. Fail fast instead of registering an fd with no
+			// backing.
+			return gofuse.ENOENT
+		case overlaySeen && len(overlayObserved.Content) > 0:
 			fh.GitOpenSnapshot = overlayObserved.Content
+		case overlaySeen && overlayObserved.SizeBytes > 0:
+			// Metadata-only entry (list responses may omit content). Fetch
+			// the bytes now: read-through never caches the response back
+			// over a whiteout, and if the whiteout won first the read fails
+			// and the open fails fast instead of succeeding with no backing.
+			data, err := fs.readGitOverlayFile(ctx, rt, fh.Path, rel, overlayObserved, 0, -1)
+			if err != nil {
+				return gitReadErrToFuseStatus(err)
+			}
+			fh.GitOpenSnapshot = data
 		}
 		return gofuse.OK
 	}
@@ -4220,43 +4247,78 @@ func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flag
 // or the re-check runs after the whiteout was applied and marks it here. The
 // handle keeps POSIX anonymous-fd semantics: reads/writes stay local, and the
 // fh.Unlinked guards suppress any mirror/flush that would upsert over the
-// whiteout.
-//
-// Adopting the unlinked state also requires three cleanups, which run right
-// after the critical section (the whiteout is already authoritative, so they
-// cannot be raced into validity):
-//
-//  1. Any pending overlay upsert this open's dirty mirror registered is
-//     dropped: a whiteout landing between the mirror's whiteout-checked
-//     apply and its rememberPendingGitOverlayEntry would otherwise leave a
-//     stale pending upsert that mergePendingGitOverlayEntries replays over
-//     the server whiteout on the next refresh. A pending upsert coexisting
-//     with an authoritative whiteout for the same path is stale by
-//     definition — a legitimate recreate applies its own overlay entry,
-//     which would have made the re-check above see an upsert instead.
-//  2. The dirty-mirror pathname is removed (mirroring putGitWhiteout):
-//     otherwise a later same-path recreate/refresh would prefer the stale
-//     anonymous mirror bytes over the replacement content. The open fd keeps
-//     working as the handle's anonymous backing.
-//  3. A read-only handle gets an anonymous-fd read backing
-//     (preserveGitUnlinkedReadBacking) so Read keeps serving pre-unlink
-//     contents instead of EOF.
+// whiteout. cleanupGitWhiteoutAdoption then finishes the adoption (see its
+// contract).
 func (fs *Dat9FS) allocateGitWorkspaceFileHandle(ctx context.Context, fh *FileHandle, rt *gitWorkspaceRuntime, rel string) uint64 {
 	fhID := fs.fileHandles.Allocate(fh)
+	if fs.registerGitWorkspaceHandle(fh, rt, rel) {
+		fs.cleanupGitWhiteoutAdoption(ctx, fh, rt, rel)
+	}
+	return fhID
+}
+
+// registerGitWorkspaceHandle adds fh to openHandles, atomically adopting the
+// unlinked state when a whiteout raced the open. Reports whether the unlinked
+// state was adopted and cleanupGitWhiteoutAdoption must run.
+func (fs *Dat9FS) registerGitWorkspaceHandle(fh *FileHandle, rt *gitWorkspaceRuntime, rel string) bool {
 	fs.openHandles.mu.Lock()
+	defer fs.openHandles.mu.Unlock()
 	marked := false
 	if e, ok := rt.overlayEntry(rel); ok && e.Op == "whiteout" {
 		fh.Unlinked = true
 		marked = true
 	}
 	fs.openHandles.addLocked(fh)
-	fs.openHandles.mu.Unlock()
-	if marked {
-		fs.forgetPendingGitOverlayEntry(fh.GitWorkspaceID, rel, 0)
-		fs.removeGitDirtyMirror(rt, rel)
-		fs.preserveGitUnlinkedReadBacking(ctx, fh, rt, rel)
+	return marked
+}
+
+// cleanupGitWhiteoutAdoption finishes adopting the unlinked state for a
+// handle registered after a whiteout. Every step is ownership-scoped so a
+// legitimate same-path recreate that landed after the registration re-check
+// cannot lose its own state to the straddled handle's cleanup:
+//
+//  1. Only THIS handle's pending mirror upsert is dropped (seq-scoped): a
+//     whiteout landing between the mirror's whiteout-checked apply and its
+//     rememberPendingGitOverlayEntry leaves a stale pending upsert that
+//     mergePendingGitOverlayEntries would replay over the server whiteout on
+//     the next refresh. A recreate re-remembers the path with a newer seq,
+//     so its entry survives.
+//  2. The dirty-mirror pathname is removed only while the whiteout is still
+//     authoritative (atomically under rt.mu): a recreate applies its overlay
+//     entry before creating its mirror, so it either flips the check to its
+//     upsert (removal skipped) or creates its mirror after the removal.
+//     Without this a later same-path recreate/refresh would prefer the stale
+//     anonymous mirror bytes over the replacement content. The open fd keeps
+//     working as the handle's anonymous backing.
+//  3. A read-only handle gets an anonymous-fd read backing
+//     (preserveGitUnlinkedReadBacking) so Read keeps serving pre-unlink
+//     contents instead of EOF.
+func (fs *Dat9FS) cleanupGitWhiteoutAdoption(ctx context.Context, fh *FileHandle, rt *gitWorkspaceRuntime, rel string) {
+	if fh.GitPendingMirrorSeq != 0 {
+		fs.forgetPendingGitOverlayEntry(fh.GitWorkspaceID, rel, fh.GitPendingMirrorSeq)
 	}
-	return fhID
+	fs.removeGitDirtyMirrorIfWhiteout(rt, rel)
+	fs.preserveGitUnlinkedReadBacking(ctx, fh, rt, rel)
+}
+
+// removeGitDirtyMirrorIfWhiteout unlinks the dirty-mirror pathname for rel
+// only while the overlay whiteout is still authoritative, holding rt.mu
+// across the check and the unlink. A legitimate same-path recreate applies
+// its overlay entry (under rt.mu via applyGitOverlayEntry/its callers) before
+// creating its mirror, so it either flips the check to its upsert — and the
+// mirror is left alone — or creates its mirror after this removal.
+func (fs *Dat9FS) removeGitDirtyMirrorIfWhiteout(rt *gitWorkspaceRuntime, rel string) {
+	if rt == nil || rel == "" {
+		return
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if e, ok := rt.overlay[rel]; !ok || e.Op != "whiteout" {
+		return
+	}
+	if mirrorPath, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel); ok {
+		_ = os.Remove(mirrorPath)
+	}
 }
 
 // preserveGitUnlinkedReadBacking gives a read-only handle that adopted the
