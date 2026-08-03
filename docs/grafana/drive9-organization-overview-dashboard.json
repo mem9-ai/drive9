@@ -380,7 +380,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Organization-attributed tenant request rate.",
+      "description": "Organization request rate. Successful control-plane requests are organization-only aggregates; data-plane requests and control-plane errors also retain tenant attribution.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -425,7 +425,7 @@
           "refId": "A"
         }
       ],
-      "title": "Tenant Request Rate",
+      "title": "Organization Request Rate",
       "type": "stat"
     },
     {
@@ -433,7 +433,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Organization-attributed tenant server-error ratio.",
+      "description": "Organization 5xx ratio across all organization-attributed request series.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -478,7 +478,7 @@
           "refId": "A"
         }
       ],
-      "title": "Tenant 5xx Ratio",
+      "title": "Organization 5xx Ratio",
       "type": "stat"
     },
     {
@@ -539,7 +539,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Organization request rate grouped by HTTP status class.",
+      "description": "Organization request rate grouped by HTTP status class, including organization-only successful control-plane aggregates.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1649,7 +1649,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "",
+      "description": "Top tenant-attributed request rates. Organization-only successful control-plane aggregates are excluded.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1688,7 +1688,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "topk(20, sum by (tenant_id, surface) (rate(drive9_tenant_requests_total{tidbcloud_org_id=\"$org\"}[$__rate_interval])))",
+          "expr": "topk(20, sum by (tenant_id, surface) (rate(drive9_tenant_requests_total{tidbcloud_org_id=\"$org\",tenant_id!=\"\"}[$__rate_interval])))",
           "legendFormat": "{{tenant_id}} / {{surface}}",
           "range": true,
           "refId": "A"

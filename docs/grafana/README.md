@@ -40,7 +40,7 @@ dashboard is organized as:
   reserve slots, reserve depletion, total storage usage, storage usage ratio,
   request rate, 5xx ratio, and compact organization-wide trends.
 - **Pool Capacity and Supply**: free tenant bindings, configured reserve target,
-  metadata resume waits, and the active shared DB-pool count.
+  metadata resume waits, and shared physical pool counts by lifecycle status.
 - **Organization Database Resources**: organization-scoped dedicated
   `role="user"` handles and shared `role="shared"` / `role="shared_schema"`
   handles. Tenant DB operation latency is not shown because its histogram does
@@ -145,8 +145,11 @@ shows no data when no positive reserve target exists.
 
 - `drive9_tenant_request_duration_seconds` intentionally has no organization or
   tenant labels, so Organization and Tenant Overview do not pretend to provide
-  scoped request latency. Scoped request rate and 5xx ratio use
-  `drive9_tenant_requests_total`.
+  scoped request latency. `drive9_tenant_requests_total` always carries
+  `tidbcloud_org_id`; data-plane requests and control-plane 4xx/5xx responses
+  additionally carry `tenant_id`. Organization request panels therefore cover
+  all organization-attributed requests, while Tenant Overview intentionally
+  excludes successful control-plane requests that have no tenant label.
 - `drive9_db_operations_total` and
   `drive9_db_operation_duration_seconds` have role/operation/result labels but
   no organization or tenant identity. Exact tenant DB connection statistics

@@ -79,7 +79,7 @@ var fuseRemoteOperationsTotal = fuseMeter.Int64Counter("drive9_fuse_remote_opera
 var fuseRemoteOperationDuration = fuseMeter.Float64Histogram("drive9_fuse_remote_operation_duration_seconds", "Remote FUSE operation duration histogram", operationDurationBounds)
 var fuseRemoteOperationBytes = fuseMeter.Int64Counter("drive9_fuse_remote_operation_bytes_total", "Bytes processed by remote FUSE operation/result")
 
-var tenantRequestsTotal = tenantMeter.Int64Counter("drive9_tenant_requests_total", "Tenant-scoped requests by tenant/tidbcloud_org/surface/action/status_class")
+var tenantRequestsTotal = tenantMeter.Int64Counter("drive9_tenant_requests_total", "Organization-scoped requests by tidbcloud_org/surface/action/status_class, with tenant attribution on data-plane requests and errors")
 var tenantRequestDuration = tenantMeter.Float64Histogram("drive9_tenant_request_duration_seconds", "Tenant request duration histogram by surface/status_class", httpDurationBounds)
 var tenantInflight = tenantMeter.Float64Gauge("drive9_tenant_inflight_requests", "Current in-flight tenant-scoped requests by tenant/tidbcloud_org/surface")
 var tenantFileBytes = tenantMeter.Int64Counter("drive9_tenant_file_bytes_total", "Tenant-scoped logical file bytes by tenant/tidbcloud_org/direction")
@@ -500,9 +500,10 @@ func RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, surface, action s
 		Attr("surface", surface),
 		Attr("action", action),
 		Attr("status_class", statusClass),
+		Attr("tidbcloud_org_id", tidbCloudOrgID),
 	}
 	if tenantAttributedSurface(surface, statusClass) {
-		attrs = append(attrs, Attr("tenant_id", tenantID), Attr("tidbcloud_org_id", tidbCloudOrgID))
+		attrs = append(attrs, Attr("tenant_id", tenantID))
 	}
 	tenantRequestsTotal.Add(1, attrs...)
 }
@@ -578,9 +579,10 @@ func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action string
 		Attr("surface", surface),
 		Attr("action", action),
 		Attr("status_class", statusClass),
+		Attr("tidbcloud_org_id", tidbCloudOrgID),
 	}
 	if tenantAttributedSurface(surface, statusClass) {
-		attrs = append(attrs, Attr("tenant_id", tenantID), Attr("tidbcloud_org_id", tidbCloudOrgID))
+		attrs = append(attrs, Attr("tenant_id", tenantID))
 	}
 	tenantRequestsTotal.Add(1, attrs...)
 	if d <= 0 {
