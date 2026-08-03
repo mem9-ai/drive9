@@ -20,6 +20,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 	"go.uber.org/zap"
@@ -846,6 +847,11 @@ func TestBackendErrorStatus(t *testing.T) {
 			want: http.StatusGatewayTimeout,
 		},
 		{
+			name: "cam metadata unavailable",
+			err:  fmt.Errorf("%w: metadata timeout", s3client.ErrCAMMetadataUnavailable),
+			want: http.StatusServiceUnavailable,
+		},
+		{
 			name: "tidb quota error 1105",
 			err:  fmt.Errorf("open db: Error 1105 (HY000): Due to the usage quota being exhausted"),
 			want: http.StatusPaymentRequired,
@@ -903,6 +909,22 @@ func TestBackendErrorStatus(t *testing.T) {
 				t.Errorf("backendErrorStatus() = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestWriteBackendErrorCAMMetadataUnavailableIsRetryable(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/v1/fs/file", nil)
+	writeBackendError(recorder, request, fmt.Errorf("%w: metadata timeout", s3client.ErrCAMMetadataUnavailable))
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if retryAfter := recorder.Header().Get("Retry-After"); retryAfter == "" {
+		t.Fatal("Retry-After header is missing")
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, `"error":"backend unavailable"`) {
+		t.Fatalf("body = %q, want sanitized backend error", body)
 	}
 }
 

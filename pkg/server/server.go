@@ -6295,7 +6295,12 @@ func errJSONInvalidRootDentry(w http.ResponseWriter, err error) bool {
 const internalStorageErrorMessage = "storage backend unavailable; contact support"
 
 func errJSONInternalStorage(w http.ResponseWriter, r *http.Request, err error) {
-	errJSON(w, backendErrorStatus(r.Context(), err), internalStorageErrorMessage)
+	status := backendErrorStatus(r.Context(), err)
+	if status == http.StatusServiceUnavailable {
+		errJSONRetryable(w, internalStorageErrorMessage)
+		return
+	}
+	errJSON(w, status, internalStorageErrorMessage)
 }
 
 func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request) {
