@@ -2512,22 +2512,19 @@
         "type": "query"
       },
       {
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${datasource}"
+        "current": {
+          "selected": false,
+          "text": "",
+          "value": ""
         },
-        "definition": "label_values({__name__=~\"drive9_tenant_requests_total|drive9_tenant_storage_bytes|drive9_tenant_inflight_requests|drive9_db_pool_registered|drive9_tenant_operation_failures_total|drive9_sse_inflight_connections|drive9_fs_events_rows\",tidbcloud_org_id=\"$org\",tenant_id!~\"^(|unknown)$\"}, tenant_id)",
+        "description": "Enter one exact tenant ID. This variable does not run a Prometheus tenant-inventory query.",
         "hide": 0,
-        "includeAll": false,
         "label": "Tenant ID",
-        "multi": false,
         "name": "tenant",
         "options": [],
-        "query": "label_values({__name__=~\"drive9_tenant_requests_total|drive9_tenant_storage_bytes|drive9_tenant_inflight_requests|drive9_db_pool_registered|drive9_tenant_operation_failures_total|drive9_sse_inflight_connections|drive9_fs_events_rows\",tidbcloud_org_id=\"$org\",tenant_id!~\"^(|unknown)$\"}, tenant_id)",
-        "refresh": 2,
-        "regex": "",
-        "sort": 1,
-        "type": "query"
+        "query": "",
+        "skipUrlSync": false,
+        "type": "textbox"
       }
     ]
   },

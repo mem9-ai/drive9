@@ -55,7 +55,7 @@ dashboard is organized as:
   organization-attributed lifecycle outcomes.
 
 The tenant dashboard link carries the selected organization into Tenant
-Overview, where the tenant dropdown is refreshed for that organization.
+Overview. Enter the exact tenant ID after opening the tenant dashboard.
 
 Organization Overview does not return unbounded series grouped by
 `tenant_id`. Tenant-ranked panels use `topk(20)`; all other panels aggregate by
@@ -65,8 +65,10 @@ or `operation`. Exact tenant detail belongs in Tenant Overview.
 ## Drive9 Tenant Overview
 
 Import `drive9-tenant-overview-dashboard.json` for one exact tenant. Select the
-organization first, then select a tenant from the query-backed **Tenant ID**
-dropdown. It is a single-select variable, not a regex textbox.
+organization first, then enter the exact value in the **Tenant ID** textbox.
+The textbox does not run a tenant-inventory query, so it remains usable when a
+large tenant series set makes a query-backed dropdown slow or incomplete. It is
+an exact ID input, not a regular-expression filter.
 
 Every tenant-scoped PromQL expression uses both
 `tidbcloud_org_id="$org"` and `tenant_id="$tenant"`. Its rows cover:
