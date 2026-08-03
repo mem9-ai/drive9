@@ -761,7 +761,7 @@ func bulkInsertFSEvents(t *testing.T, store *datastore.Store, n int) {
 func TestSSEEndpointPhase1DrainsMultiPageBacklog(t *testing.T) {
 	srv, store := newSSETestServer(t)
 
-	const total = eventPageSize + 50
+	total := eventPageSize + 50
 	bulkInsertFSEvents(t, store, total)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -799,7 +799,7 @@ func TestSSEEndpointPhase1DrainsMultiPageBacklog(t *testing.T) {
 			if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
 				t.Fatalf("unmarshal heartbeat: %v", err)
 			}
-			if data["seq"] != total {
+			if data["seq"] != uint64(total) {
 				t.Fatalf("heartbeat seq = %d, want %d", data["seq"], total)
 			}
 			return
@@ -846,7 +846,7 @@ func TestSSEEndpointPhase2EventDrivenDrain(t *testing.T) {
 
 	// Commit a > 1 page backlog directly, then send ONE notify signal. The
 	// event-driven drain must deliver all of them on that single wake.
-	const backlog = eventPageSize + 10
+	backlog := eventPageSize + 10
 	bulkInsertFSEvents(t, store, backlog)
 	bus.Publish()
 
@@ -858,5 +858,135 @@ func TestSSEEndpointPhase2EventDrivenDrain(t *testing.T) {
 		if ev.Event != "file_changed" {
 			t.Fatalf("event %d = %q, want file_changed", i, ev.Event)
 		}
+	}
+}
+
+// TestSSEEndpointPhase2CatchupTimerDrainsBurst verifies that a burst larger
+// than sseMaxFullPagesPerWake pages does NOT stall after the per-wake cap:
+// the catch-up timer re-arms and the tail is delivered with no further
+// notify signal (the outbox coalescer emits only one signal per tenant per
+// 200ms window, so without the timer the tail would wait for the next write).
+func TestSSEEndpointPhase2CatchupTimerDrainsBurst(t *testing.T) {
+	oldPage, oldCap := eventPageSize, sseMaxFullPagesPerWake
+	eventPageSize, sseMaxFullPagesPerWake = 50, 3
+	t.Cleanup(func() { eventPageSize, sseMaxFullPagesPerWake = oldPage, oldCap })
+
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
+
+	// One existing event so the client can connect at head with no replay.
+	publishTestEvent(t, store, bus, "/existing.txt", "write", "")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+
+	// First event must be the end-of-Phase-1 heartbeat (caught up at head).
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial heartbeat")
+	}
+	if ev.Event != "heartbeat" {
+		t.Fatalf("first event = %q, want heartbeat", ev.Event)
+	}
+
+	// Commit a 5-page burst (page=50, cap=3): the first wake drains 3 pages
+	// and re-arms the catch-up timer; the remaining 2 pages must arrive on
+	// timer fires with NO further Publish.
+	const backlog = 250
+	bulkInsertFSEvents(t, store, backlog)
+	bus.Publish()
+
+	for i := 0; i < backlog; i++ {
+		ev, ok := readSSEEvent(scanner)
+		if !ok {
+			t.Fatalf("stream ended after %d/%d events (catch-up timer failed to resume the drain)", i, backlog)
+		}
+		if ev.Event != "file_changed" {
+			t.Fatalf("event %d = %q, want file_changed", i, ev.Event)
+		}
+	}
+}
+
+// TestSSEEndpointPhase1MidDrainErrorTerminates verifies that a DB query error
+// in the middle of the Phase-1 backlog drain TERMINATES the stream instead of
+// sending a false caught-up heartbeat: the client must reconnect and resume
+// from its durable cursor rather than believe it is current.
+func TestSSEEndpointPhase1MidDrainErrorTerminates(t *testing.T) {
+	oldPage := eventPageSize
+	eventPageSize = 3
+	t.Cleanup(func() { eventPageSize = oldPage })
+
+	srv, store := newSSETestServer(t)
+
+	// 4 real events; with page size 3 and since=1 the first (real, tolerated)
+	// Phase-1 call returns a full page (seqs 2,3,4).
+	bulkInsertFSEvents(t, store, 4)
+
+	// Stub the mid-drain event source to report a DB error deterministically.
+	realEventsSinceE := eventsSinceE
+	calls := 0
+	eventsSinceE = func(eb *EventBus, _ context.Context, since uint64) ([]ChangeEvent, uint64, bool, error) {
+		calls++
+		return nil, since, true, fmt.Errorf("injected mid-drain db error")
+	}
+	t.Cleanup(func() { eventsSinceE = realEventsSinceE })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+
+	// The client receives the first page (3 events) and then the stream must
+	// END: no heartbeat, no reset — EOF. Without termination the next read
+	// would block until the 5s ctx timeout and fail this test.
+	for i, wantSeq := range []uint64{2, 3, 4} {
+		ev, ok := readSSEEvent(scanner)
+		if !ok {
+			t.Fatalf("stream ended before page-1 event %d", i)
+		}
+		if ev.Event != "file_changed" {
+			t.Fatalf("event %d = %q, want file_changed", i, ev.Event)
+		}
+		var data ChangeEvent
+		if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
+			t.Fatalf("unmarshal event %d: %v", i, err)
+		}
+		if data.Seq != wantSeq {
+			t.Fatalf("event %d seq = %d, want %d", i, data.Seq, wantSeq)
+		}
+	}
+	if ev, ok := readSSEEvent(scanner); ok {
+		t.Fatalf("expected stream termination after mid-drain error, got extra event %q (false caught-up marker?)", ev.Event)
+	}
+	if calls < 1 {
+		t.Fatalf("eventsSinceE calls = %d, want >= 1 (mid-drain call)", calls)
 	}
 }

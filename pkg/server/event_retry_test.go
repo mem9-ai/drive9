@@ -42,7 +42,7 @@ func newTestEventRetryBuffer() (*eventRetryBuffer, *[]notifyCall) {
 	calls := &[]notifyCall{}
 	buf := newEventRetryBuffer(func(tenantID string, workMask int) {
 		*calls = append(*calls, notifyCall{tenantID: tenantID, workMask: workMask})
-	})
+	}, time.Hour)
 	return buf, calls
 }
 
@@ -237,8 +237,8 @@ func TestEventRetryFlushSuccessSecondWake(t *testing.T) {
 	}
 }
 
-// TestEventRetryExpiredEntryDropped verifies that entries older than
-// eventRetryMaxAge are dropped (counted as hard loss) without an insert
+// TestEventRetryExpiredEntryDropped verifies that entries older than the
+// buffer's maxAge are dropped (counted as hard loss) without an insert
 // attempt.
 func TestEventRetryExpiredEntryDropped(t *testing.T) {
 	buf, calls := newTestEventRetryBuffer()
@@ -248,7 +248,7 @@ func TestEventRetryExpiredEntryDropped(t *testing.T) {
 
 	buf.enqueue(bus, "/a.txt", "write", "", 100)
 	buf.mu.Lock()
-	buf.entries[0].enqueuedAt = time.Now().Add(-2 * eventRetryMaxAge)
+	buf.entries[0].enqueuedAt = time.Now().Add(-2 * buf.maxAge)
 	buf.entries[0].nextRetry = time.Time{}
 	buf.mu.Unlock()
 
@@ -268,5 +268,52 @@ func TestEventRetryExpiredEntryDropped(t *testing.T) {
 	metrics.WritePrometheus(rec)
 	if !strings.Contains(rec.Body.String(), `drive9_sse_event_retry_dropped_total{reason="expired",tenant_id="expired-tenant",tidbcloud_org_id="guest"} 1`) {
 		t.Fatalf("expected expired drop counter series:\n%s", rec.Body.String())
+	}
+}
+
+// TestEventRetryEnqueueAfterStopDropped verifies the stopped gate: an event
+// enqueued after stop must NOT be buffered (the flush goroutine is gone, so
+// it would never be retried) — it is counted as dropped with reason stopped.
+func TestEventRetryEnqueueAfterStopDropped(t *testing.T) {
+	buf, _ := newTestEventRetryBuffer()
+	bus := NewEventBus("stopped-tenant", nil)
+
+	// Buffer one entry, then stop (never started: wg.Wait returns immediately;
+	// the final flush requeues the entry against the nil store).
+	buf.enqueue(bus, "/kept.txt", "write", "", 100)
+	buf.stop()
+
+	buf.enqueue(bus, "/dropped.txt", "write", "", 200)
+
+	if got := bufferDepth(buf); got != 1 {
+		t.Fatalf("depth = %d, want 1 (post-stop enqueue must not buffer)", got)
+	}
+	buf.mu.Lock()
+	keptPath := buf.entries[0].path
+	buf.mu.Unlock()
+	if keptPath != "/kept.txt" {
+		t.Fatalf("remaining entry = %q, want /kept.txt", keptPath)
+	}
+
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	if !strings.Contains(rec.Body.String(), `drive9_sse_event_retry_dropped_total{reason="stopped",tenant_id="stopped-tenant",tidbcloud_org_id="guest"} 1`) {
+		t.Fatalf("expected stopped drop counter series:\n%s", rec.Body.String())
+	}
+}
+
+// TestEventRetryMaxAgeClamped verifies the constructor clamps the per-entry
+// drop age into [eventRetryMinMaxAge, eventRetryMaxMaxAge] so the server's
+// fs_events retention maps to min(retention, 24h) floored at 1h.
+func TestEventRetryMaxAgeClamped(t *testing.T) {
+	noop := func(string, int) {}
+	if got := newEventRetryBuffer(noop, time.Minute).maxAge; got != eventRetryMinMaxAge {
+		t.Fatalf("maxAge for 1m retention = %v, want floor %v", got, eventRetryMinMaxAge)
+	}
+	if got := newEventRetryBuffer(noop, 168*time.Hour).maxAge; got != eventRetryMaxMaxAge {
+		t.Fatalf("maxAge for 168h retention = %v, want cap %v", got, eventRetryMaxMaxAge)
+	}
+	if got := newEventRetryBuffer(noop, 6*time.Hour).maxAge; got != 6*time.Hour {
+		t.Fatalf("maxAge for 6h retention = %v, want 6h", got)
 	}
 }

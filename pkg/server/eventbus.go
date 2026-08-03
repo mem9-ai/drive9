@@ -23,9 +23,14 @@ type ChangeEvent struct {
 
 const (
 	eventBusListenerChanSize = 1 // signal-only channel
+)
+
+var (
 	// eventPageSize is the max number of events one EventsSince call returns.
 	// Callers (SSE Phase-1 replay and Phase-2 poll) must loop on a full page:
-	// a short page signals the backlog is drained.
+	// a short page signals the backlog is drained. A var (not a const) so
+	// tests can shrink the page instead of inserting tens of thousands of
+	// rows to exercise multi-page drains.
 	eventPageSize = 1000
 )
 
@@ -178,35 +183,51 @@ func (eb *EventBus) Seq(ctx context.Context) uint64 {
 // Interior seq holes (other tenants interleaved on a shared-schema table, or
 // AUTO_INCREMENT ids burned by rolled-back inserts) are NOT a reset
 // condition: no events of this tenant were lost, so delivery continues.
+//
+// DB query errors are masked (ok=true, empty events, headSeq=since): see
+// EventsSinceE for the rationale and for the error-distinguishing variant.
 func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []ChangeEvent, headSeq uint64, ok bool) {
+	events, headSeq, ok, _ = eb.EventsSinceE(ctx, since)
+	return events, headSeq, ok
+}
+
+// EventsSinceE is EventsSince but distinguishes DB query errors: when the
+// ListFSEventsSince query fails it returns the same tolerated fallback
+// (ok=true, empty events, headSeq=since — the FUSE TTL/HEAD revalidation
+// provides correctness without SSE, and sending a reset on every failed poll
+// would cause continuous full-cache invalidation) PLUS the error itself.
+// Callers that cannot tolerate a false "caught up" marker (the SSE Phase-1
+// backlog drain) use this variant to stop instead of continuing blind.
+func (eb *EventBus) EventsSinceE(ctx context.Context, since uint64) (events []ChangeEvent, headSeq uint64, ok bool, err error) {
 	store := eb.store.Load()
 	if store == nil {
-		return nil, 0, false
+		return nil, 0, false, nil
 	}
 	if since == 0 {
 		// Initial sync: send reset so client starts fresh.
 		headSeq = uint64(clampNonNegative(latestSeqSafeWithMetric(ctx, store, eb.tenantID)))
-		return nil, headSeq, false
+		return nil, headSeq, false, nil
 	}
 	queryStart := time.Now()
-	rows, err := store.ListFSEventsSince(ctx, int64(since), eventPageSize)
-	metrics.RecordEventBusQuery(eb.tenantID, "events_since", queryResult(err), time.Since(queryStart))
-	if err != nil {
+	rows, qErr := store.ListFSEventsSince(ctx, int64(since), eventPageSize)
+	metrics.RecordEventBusQuery(eb.tenantID, "events_since", queryResult(qErr), time.Since(queryStart))
+	if qErr != nil {
 		// Table missing or query failed: don't send reset on every poll —
 		// that would cause continuous full-cache invalidation. Instead, return
 		// ok=true with empty events (caught up). The FUSE client's TTL/HEAD
 		// revalidation provides correctness without SSE. Only since=0 (initial
 		// connection) sends a reset. Log the error and emit a metric counter so
 		// operators can detect and alert on persistent table-missing or DB
-		// connectivity issues.
+		// connectivity issues. The error is returned so callers that must not
+		// claim "caught up" (Phase-1 drain) can distinguish this branch.
 		logger.Warn(ctx, "event_bus_query_failed",
 			zap.String("tenant_id", eb.tenantID),
 			zap.Uint64("since", since),
 			zap.Float64("query_ms", float64(time.Since(queryStart).Microseconds())/1000),
-			zap.Error(err))
-		metrics.RecordTenantOperationWithOrg(eb.tenantID, eb.TiDBCloudOrgID(), "event_bus", "query", metrics.ResultForError(err), 0)
+			zap.Error(qErr))
+		metrics.RecordTenantOperationWithOrg(eb.tenantID, eb.TiDBCloudOrgID(), "event_bus", "query", metrics.ResultForError(qErr), 0)
 		headSeq = since // keep the client's cursor unchanged
-		return nil, headSeq, true
+		return nil, headSeq, true, qErr
 	}
 	events = make([]ChangeEvent, 0, len(rows))
 	for _, r := range rows {
@@ -232,11 +253,11 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 			oldest := oldestSeqSafeWithMetric(ctx, store, eb.tenantID)
 			if int64(since)+1 < oldest {
 				headSeq = events[len(events)-1].Seq
-				return nil, headSeq, false // pruned gap → reset
+				return nil, headSeq, false, nil // pruned gap → reset
 			}
 		}
 		headSeq = events[len(events)-1].Seq
-		return events, headSeq, true
+		return events, headSeq, true, nil
 	}
 	// No rows after since. Check the actual table state to determine whether
 	// the client's cursor is stale (events pruned) or simply caught up.
@@ -248,12 +269,12 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 	oldestQueryMs := float64(time.Since(oldestStart).Microseconds()) / 1000
 	if latest == 0 {
 		// Table is empty (all events pruned): cursor is stale → reset.
-		return nil, 0, false
+		return nil, 0, false, nil
 	}
 	headSeq = uint64(latest)
 	if int64(since) > latest {
 		// Client cursor is ahead of head (server_restart): reset.
-		return nil, headSeq, false
+		return nil, headSeq, false, nil
 	}
 	if int64(since)+1 < oldest {
 		// Client cursor is behind the oldest retained event: events between
@@ -269,10 +290,10 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 			zap.Int64("latest", latest),
 			zap.Float64("latest_query_ms", latestQueryMs),
 			zap.Float64("oldest_query_ms", oldestQueryMs))
-		return nil, headSeq, false
+		return nil, headSeq, false, nil
 	}
 	// Client is caught up: no new events after since, cursor within range.
-	return nil, headSeq, true
+	return nil, headSeq, true, nil
 }
 
 // latestSeqSafeWithMetric is latestSeqSafe plus a per-query duration metric.

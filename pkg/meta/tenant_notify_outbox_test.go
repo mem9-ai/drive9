@@ -152,21 +152,28 @@ func TestDeleteTenantNotifyBeforeFreshFloor(t *testing.T) {
 }
 
 // TestUpsertTenantOutboxCursorRefreshesUpdatedAt verifies the cursor's
-// updated_at is refreshed on every upsert — the freshness bound in
-// DeleteTenantNotifyBefore depends on it.
+// updated_at advances only when last_id advances — the freshness bound in
+// DeleteTenantNotifyBefore depends on it: a pod whose poll is stuck (frozen
+// last_id) must go stale even while its cursor flushes keep succeeding.
 func TestUpsertTenantOutboxCursorRefreshesUpdatedAt(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 	resetTenantOutboxTables(t, s)
+	stale := func() time.Time { return time.Now().Add(-2 * tenantOutboxCursorFreshnessBound) }
+	age := func(podID string) {
+		t.Helper()
+		if _, err := s.DB().ExecContext(ctx,
+			`UPDATE tenant_outbox_cursor SET updated_at = ? WHERE pod_id = ?`, stale(), podID); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	if err := s.UpsertTenantOutboxCursor(ctx, "pod-a", 10); err != nil {
 		t.Fatal(err)
 	}
-	stale := time.Now().Add(-2 * tenantOutboxCursorFreshnessBound)
-	if _, err := s.DB().ExecContext(ctx,
-		`UPDATE tenant_outbox_cursor SET updated_at = ? WHERE pod_id = ?`, stale, "pod-a"); err != nil {
-		t.Fatal(err)
-	}
+	age("pod-a")
+
+	// Advancing last_id refreshes updated_at.
 	if err := s.UpsertTenantOutboxCursor(ctx, "pod-a", 20); err != nil {
 		t.Fatal(err)
 	}
@@ -178,6 +185,37 @@ func TestUpsertTenantOutboxCursorRefreshesUpdatedAt(t *testing.T) {
 		t.Fatalf("last_id = %d, want 20", cursor.LastID)
 	}
 	if time.Since(cursor.UpdatedAt) > tenantOutboxCursorFreshnessBound {
-		t.Fatalf("updated_at = %v not refreshed by upsert", cursor.UpdatedAt)
+		t.Fatalf("updated_at = %v not refreshed by an advancing upsert", cursor.UpdatedAt)
+	}
+
+	// Re-flushing the SAME last_id (poller caught up, zero traffic — or poll
+	// failing) must NOT refresh updated_at: the cursor goes stale.
+	age("pod-a")
+	if err := s.UpsertTenantOutboxCursor(ctx, "pod-a", 20); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = s.GetTenantOutboxCursor(ctx, "pod-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(cursor.UpdatedAt) <= tenantOutboxCursorFreshnessBound {
+		t.Fatalf("updated_at = %v refreshed by an unchanged last_id; cursor would never go stale", cursor.UpdatedAt)
+	}
+
+	// A regressing last_id must NOT refresh updated_at either (but last_id
+	// itself follows the upsert, preserving prior upsert semantics).
+	age("pod-a")
+	if err := s.UpsertTenantOutboxCursor(ctx, "pod-a", 5); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = s.GetTenantOutboxCursor(ctx, "pod-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.LastID != 5 {
+		t.Fatalf("last_id = %d, want 5", cursor.LastID)
+	}
+	if time.Since(cursor.UpdatedAt) <= tenantOutboxCursorFreshnessBound {
+		t.Fatalf("updated_at = %v refreshed by a regressing last_id", cursor.UpdatedAt)
 	}
 }

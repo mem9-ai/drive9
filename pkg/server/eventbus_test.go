@@ -366,3 +366,34 @@ func TestEventBusUnsubscribeOneOfManyReturnsImmediately(t *testing.T) {
 		t.Fatal("Unsubscribe blocked while another subscriber remained connected")
 	}
 }
+
+// TestEventsSinceEDistinguishesQueryError verifies that EventsSinceE surfaces
+// DB query errors while the EventsSince wrapper keeps the tolerated
+// caught-up fallback (ok=true, empty events, headSeq=since).
+func TestEventsSinceEDistinguishesQueryError(t *testing.T) {
+	store := newTestStoreForEventBus(t)
+	bus := NewEventBus("test-tenant", store)
+
+	// Insert one event so since=1 is a valid cursor (not initial sync).
+	if _, err := store.InsertFSEvent(context.Background(), "/a.txt", "write", "", time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close the store's DB to simulate query failure.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	events, headSeq, ok, err := bus.EventsSinceE(context.Background(), 1)
+	if err == nil {
+		t.Fatal("EventsSinceE should return the query error")
+	}
+	if !ok || len(events) != 0 || headSeq != 1 {
+		t.Fatalf("EventsSinceE fallback = (%v, %d, %v), want ([], 1, true) alongside the error", events, headSeq, ok)
+	}
+
+	events, headSeq, ok = bus.EventsSince(context.Background(), 1)
+	if !ok || len(events) != 0 || headSeq != 1 {
+		t.Fatalf("EventsSince tolerated fallback = (%v, %d, %v), want ([], 1, true)", events, headSeq, ok)
+	}
+}

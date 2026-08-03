@@ -5011,9 +5011,11 @@ const tenantOutboxCursorFreshnessBound = 10 * time.Minute
 // that has not yet processed a row does not lose its work signal. Cursors
 // whose updated_at is older than tenantOutboxCursorFreshnessBound are ignored
 // when computing that floor: SSE notify rows are lossy hints, and pruning past
-// a stalled pod's cursor is safe because its connected clients recover via
-// reconnect replay. When no fresh cursors remain (e.g. before any pod has
-// registered), pruning falls back to age alone.
+// a stalled pod's cursor is safe — its online clients simply STALL (no new
+// wake-ups) until they reconnect and recover via replay (or, if enabled, the
+// per-connection liveness poll detects the signal loss). When no fresh
+// cursors remain (e.g. before any pod has registered), pruning falls back to
+// age alone.
 func (s *Store) DeleteTenantNotifyBefore(ctx context.Context, before time.Time) (n int64, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "delete_tenant_notify_before", start, &err)
@@ -5065,14 +5067,26 @@ func (s *Store) GetTenantOutboxCursor(ctx context.Context, podID string) (out *T
 
 // UpsertTenantOutboxCursor persists (or refreshes) the cursor for podID. The
 // poller flushes its in-memory last_id every few seconds so a restart resumes
-// from the last processed row.
+// from the last processed row. updated_at advances only when last_id advances:
+// the DeleteTenantNotifyBefore freshness bound uses updated_at to detect
+// stalled pods, and a pod whose poll query keeps failing (while its cursor
+// flush still succeeds) must be allowed to go stale. A healthy caught-up pod
+// also goes stale during zero-traffic periods and falls out of the prune
+// floor — safe, because age-only pruning then applies and the 1-hour age gate
+// leaves it an hour of rows to resume from.
 func (s *Store) UpsertTenantOutboxCursor(ctx context.Context, podID string, lastID uint64) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "upsert_tenant_outbox_cursor", start, &err)
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO tenant_outbox_cursor (pod_id, last_id) VALUES (?, ?)
-		 ON DUPLICATE KEY UPDATE last_id = VALUES(last_id), updated_at = CURRENT_TIMESTAMP(3)`,
+		 ON DUPLICATE KEY UPDATE updated_at = IF(VALUES(last_id) > last_id, CURRENT_TIMESTAMP(3), updated_at),
+		                         last_id = VALUES(last_id)`,
 		podID, lastID)
+	// NOTE: assignment order is load-bearing. MySQL/TiDB evaluate ON
+	// DUPLICATE KEY UPDATE assignments left to right, so the updated_at
+	// comparison must run BEFORE last_id is overwritten — otherwise
+	// VALUES(last_id) > last_id compares the new value against itself and
+	// updated_at never refreshes.
 	return err
 }
 

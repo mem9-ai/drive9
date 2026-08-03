@@ -435,7 +435,8 @@ func main() {
 		logger.Info(context.Background(), "tenant_outbox_config",
 			zap.String("pod_id", podID),
 			zap.String("pod_addr", podAddr),
-			zap.Duration("retention", sseNotifyRetention))
+			zap.Duration("retention", sseNotifyRetention),
+			zap.Duration("fs_events_retention", fsEventsRetention))
 	}
 
 	srv := server.NewWithConfig(server.Config{

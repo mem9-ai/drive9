@@ -25,10 +25,10 @@ const (
 	// stream without an interleaved heartbeat; LB and client idle timeouts
 	// would otherwise kill multi-minute replays.
 	sseReplayHeartbeatInterval = 5 * time.Second
-	// sseMaxFullPagesPerWake caps how many consecutive full event pages a
-	// single Phase-2 wake drains before yielding back to the select loop, so
-	// a large backlog cannot starve heartbeats and disconnect handling.
-	sseMaxFullPagesPerWake = 10
+	// sseCatchupPollDelay is the re-arm delay of the Phase-2 catch-up timer:
+	// when one wake hits the full-page cap, the stream flushes and polls again
+	// after this delay instead of waiting for the next notify signal.
+	sseCatchupPollDelay = 10 * time.Millisecond
 
 	// fsEventsSweepInterval throttles the lazy fs_events retention sweep on
 	// the write path to at most once per hour per tenant.
@@ -47,6 +47,19 @@ const (
 	// sseStreamEstablished context flag) to distinguish real SSE connection
 	// lifetimes from bounded error responses on the same route.
 	sseEventsRoute = "/v1/events"
+)
+
+var (
+	// sseMaxFullPagesPerWake caps how many consecutive full event pages a
+	// single Phase-2 wake drains before flushing and re-arming the catch-up
+	// timer, so heartbeats and disconnects are serviced between bursts. A var
+	// (not a const) so tests can exercise the cap with a small page size.
+	sseMaxFullPagesPerWake = 10
+
+	// eventsSinceE is the Phase-1 drain's event source. A package var so
+	// tests can inject a mid-drain query error deterministically (mirrors the
+	// tenantWorkerUsesTiDBAutoEmbedding seam).
+	eventsSinceE = (*EventBus).EventsSinceE
 )
 
 // stopTimer drains a timer's channel after stopping it to prevent spurious
@@ -231,10 +244,11 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 	// enclosing mutation — the event is enqueued into the per-pod retry buffer
 	// (event_retry.go) and flushed with backoff; the buffer's second wake then
 	// delivers it to SSE clients. Buffer overflow is counted per tenant as hard
-	// loss. Local SSE clients still get instant delivery via the notify channel
-	// below regardless (their EventsSince will find no new rows but the notify
-	// signal wakes them to re-check, returning empty = caught up). FUSE
-	// correctness is maintained by HEAD revalidation regardless.
+	// loss. Local SSE clients are NOT durably served on this path: the notify
+	// channel below wakes them once, their poll finds no new row (caught up),
+	// and actual delivery waits for the retry buffer's second wake
+	// (bus.Publish after a successful flush). FUSE correctness is maintained
+	// by HEAD revalidation regardless.
 	// For existing tenants without the fs_events table (pre-migration), the
 	// INSERT will fail until EnsureTiDBSchemaForAutoEmbeddingProfile creates the
 	// table (triggered automatically by the CRC32 schema version bump).
@@ -380,6 +394,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// Phase 1: Replay or Reset.
 	// EventsSince reads from the durable fs_events table, so events written
 	// by other pods are visible here (cross-pod propagation).
+	// The FIRST call uses the tolerated wrapper (query error → caught-up
+	// fallback): pre-migration tenants without the fs_events table must not
+	// reconnect-loop, and FUSE HEAD revalidation provides correctness without
+	// SSE. Mid-drain calls below use eventsSinceE instead, because a masked
+	// error there would falsely mark a still-behind client as caught up.
 	phase1Start := time.Now()
 	events, headSeq, ok := bus.EventsSince(ctx, since)
 	lastSeen := since
@@ -432,7 +451,21 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
-			events, headSeq, ok = bus.EventsSince(ctx, lastSeen)
+			var qErr error
+			events, headSeq, ok, qErr = eventsSinceE(bus, ctx, lastSeen)
+			if qErr != nil {
+				// Mid-drain query error: the tolerated "caught up" fallback
+				// would be a LIE here — the client already consumed earlier
+				// pages and is still behind. Terminate the stream WITHOUT the
+				// end-of-replay heartbeat; the client reconnects and resumes
+				// from its durable cursor (the last seq it already saw).
+				logger.Warn(ctx, "sse_phase1_drain_query_failed",
+					zap.String("tenant_id", tenantID),
+					zap.Uint64("last_seen", lastSeen),
+					zap.Error(qErr))
+				metrics.RecordTenantOperationWithOrg(tenantID, tidbCloudOrgID, "event_bus", "phase1_drain", metrics.ResultForError(qErr), 0)
+				return
+			}
 			if !ok {
 				// The cursor went stale mid-drain (a retention sweep raced the
 				// replay): same reset contract as the initial ok=false path.
@@ -491,12 +524,42 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Catch-up timer for the event-driven drain: when one wake hits the
+	// full-page cap, pollAndSend flushes and re-arms this short timer instead
+	// of waiting for the next notify signal (the outbox coalescer emits only
+	// one signal per tenant per 200ms window, so a >cap burst would otherwise
+	// stall its tail until the next write). Only a short page disarms it.
+	var catchupTimer *time.Timer
+	var catchupC <-chan time.Time
+	defer func() {
+		if catchupTimer != nil {
+			stopTimer(catchupTimer)
+			catchupC = nil
+		}
+	}()
+	armCatchup := func() {
+		if catchupTimer == nil {
+			catchupTimer = time.NewTimer(sseCatchupPollDelay)
+		} else {
+			stopTimer(catchupTimer)
+			catchupTimer.Reset(sseCatchupPollDelay)
+		}
+		catchupC = catchupTimer.C
+	}
+	disarmCatchup := func() {
+		if catchupTimer != nil {
+			stopTimer(catchupTimer)
+		}
+		catchupC = nil
+	}
+
 	// pollAndSend queries fs_events for new rows since lastSeen and streams them.
 	// A full page (eventPageSize events) means the backlog likely continues, so
 	// it polls again immediately — up to sseMaxFullPagesPerWake consecutive full
-	// pages per wake, then flushes and yields to the select loop; a short page
+	// pages per wake, then flushes and re-arms the catch-up timer; a short page
 	// disarms. Returns false if the stream should terminate (write error).
 	pollAndSend := func() bool {
+		capped := false
 		for fullPages := 0; ; {
 			liveEvents, liveHead, liveOK := bus.EventsSince(ctx, lastSeen)
 			if !liveOK {
@@ -510,6 +573,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 					stopTimer(flushTimer)
 					flushC = nil
 				}
+				// A reset jumps the cursor to head: no backlog left to chase.
+				disarmCatchup()
 				return true
 			}
 			lastSuccessfulPoll = time.Now()
@@ -538,8 +603,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 					}
 					continue
 				}
-				// Per-wake cap reached: fall through to the normal flush path.
-				// The next notify (or liveness tick) resumes the drain.
+				// Per-wake cap reached: fall through to the normal flush path,
+				// then re-arm the catch-up timer to resume the drain.
+				capped = true
 			}
 			break
 		}
@@ -561,6 +627,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				}
 				flushC = flushTimer.C
 			}
+		}
+		if capped {
+			armCatchup()
+		} else {
+			disarmCatchup()
 		}
 		return true
 	}
@@ -584,6 +655,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				if !pollAndSend() {
 					return
 				}
+			}
+		case <-catchupC:
+			// A previous wake hit the full-page cap: resume the drain. The
+			// select loop serviced heartbeats and disconnects in between.
+			catchupC = nil
+			if !pollAndSend() {
+				return
 			}
 		case <-flushC:
 			if bw.count > 0 {

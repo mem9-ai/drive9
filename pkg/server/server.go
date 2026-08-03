@@ -600,9 +600,12 @@ func NewWithConfig(cfg Config) *Server {
 	// so a zero Config keeps the scan off.
 	// Start the fs_events insert retry buffer on every pod (not leader-gated,
 	// and also in single-tenant mode): publishEvent enqueues on insert failure
-	// in both modes. Stopped in stopNotifyInfrastructure, which Close always
-	// calls, with a final best-effort flush before the coalescer drains.
-	s.eventRetry = newEventRetryBuffer(s.insertTenantNotify)
+	// in both modes. The per-entry drop age tracks the fs_events retention
+	// (clamped to [1h, 24h] by the constructor) so a longer replay window is
+	// actually reachable by retried events. Stopped in
+	// stopNotifyInfrastructure, which Close always calls, with a final
+	// best-effort flush before the coalescer drains.
+	s.eventRetry = newEventRetryBuffer(s.insertTenantNotify, s.fsEventsRetention)
 	s.eventRetry.start(backgroundWithTrace(context.Background()))
 	mux := http.NewServeMux()
 
