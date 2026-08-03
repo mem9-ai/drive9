@@ -25,6 +25,7 @@ func TestCanonicalize(t *testing.T) {
 		{"/data/trailing.txt ", "/data/trailing.txt ", false},
 		{"  ", "/  ", false},
 		{"/data/file\x02name.txt", "", true},
+		{"/data/file\x1fname.txt", "", true},
 		{"/data/file\x7fname.txt", "", true},
 		{"/data\\file.txt", "", true},
 		{"/data/file.txt/", "/data/file.txt", false},
