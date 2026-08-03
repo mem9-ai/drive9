@@ -3,7 +3,6 @@ package fuse
 import (
 	"context"
 	"io"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -138,7 +137,7 @@ func (p *Prefetcher) debugf(format string, args ...any) {
 	if p == nil || !p.debug {
 		return
 	}
-	log.Printf("dat9 debug: prefetch "+format, args...)
+	safeLogPrintf("dat9 debug: prefetch "+format, args...)
 }
 
 // Get checks the prefetch cache for data at [offset, offset+size).

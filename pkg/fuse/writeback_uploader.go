@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -216,7 +215,7 @@ func (u *WriteBackUploader) Submit(localPath string) {
 		u.perf.uploaderSubmit.add(1)
 	}
 	if u.stopped.Load() {
-		log.Printf("writeback uploader: already stopped, uploading synchronously for %s", localPath)
+		safeLogPrintf("writeback uploader: already stopped, uploading synchronously for %s", localPath)
 		if u.perf != nil {
 			u.perf.uploaderSyncFallback.add(1)
 		}
@@ -232,7 +231,7 @@ func (u *WriteBackUploader) Submit(localPath string) {
 		select {
 		case u.uploadCh <- localPath:
 		case <-timer.C:
-			log.Printf("writeback uploader: channel full after %v, uploading synchronously for %s", submitTimeout, localPath)
+			safeLogPrintf("writeback uploader: channel full after %v, uploading synchronously for %s", submitTimeout, localPath)
 			if u.perf != nil {
 				u.perf.uploaderSyncFallback.add(1)
 			}
@@ -286,14 +285,14 @@ func (u *WriteBackUploader) RecoverPending() {
 	for _, e := range entries {
 		if e.Meta.Kind == PendingOverwrite && e.Meta.BaseRev <= 0 {
 			skippedLegacyOverwrites++
-			log.Printf("writeback: skipping legacy overwrite without base revision for %s", e.Meta.Path)
+			safeLogPrintf("writeback: skipping legacy overwrite without base revision for %s", e.Meta.Path)
 			continue
 		}
-		log.Printf("writeback: recovering pending upload for %s (%d bytes)", e.Meta.Path, e.Meta.Size)
+		safeLogPrintf("writeback: recovering pending upload for %s (%d bytes)", e.Meta.Path, e.Meta.Size)
 		u.Submit(e.Meta.Path)
 	}
 	if skippedLegacyOverwrites > 0 {
-		log.Printf("writeback: skipped %d legacy overwrite entries without base revision during recovery", skippedLegacyOverwrites)
+		safeLogPrintf("writeback: skipped %d legacy overwrite entries without base revision during recovery", skippedLegacyOverwrites)
 	}
 }
 
@@ -397,7 +396,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		// TODO: add a migration or cleanup path for legacy overwrite entries
 		// without base revisions so they do not remain pending forever when
 		// they only flow through Flush -> Release -> background uploadOne.
-		log.Printf("writeback upload skipped for %s: %v", localPath, err)
+		safeLogPrintf("writeback upload skipped for %s: %v", localPath, err)
 		return
 	}
 
@@ -429,7 +428,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		if errors.Is(lastErr, client.ErrConflict) {
 			break
 		}
-		log.Printf("writeback upload attempt %d/%d failed for %s: %v", attempt+1, uploadMaxRetries+1, localPath, lastErr)
+		safeLogPrintf("writeback upload attempt %d/%d failed for %s: %v", attempt+1, uploadMaxRetries+1, localPath, lastErr)
 	}
 
 	if lastErr != nil {
@@ -439,10 +438,10 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		if errors.Is(lastErr, client.ErrConflict) {
 			// TODO: persist a conflict marker or resolution flow so these
 			// entries do not remain pending forever across mounts.
-			log.Printf("writeback upload conflict for %s at base revision %d (will keep local pending data)", localPath, meta.BaseRev)
+			safeLogPrintf("writeback upload conflict for %s at base revision %d (will keep local pending data)", localPath, meta.BaseRev)
 			return
 		}
-		log.Printf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", localPath, uploadMaxRetries+1, lastErr)
+		safeLogPrintf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", localPath, uploadMaxRetries+1, lastErr)
 		return
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
@@ -454,11 +453,11 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 			u.perf.uploaderFailure.add(1)
 		}
 		if updated, err := u.cache.MarkChmodPending(localPath, gen); err != nil {
-			log.Printf("writeback upload chmod-pending meta update failed for %s: %v", localPath, err)
+			safeLogPrintf("writeback upload chmod-pending meta update failed for %s: %v", localPath, err)
 		} else if updated {
-			log.Printf("writeback upload data committed for %s; chmod remains pending", localPath)
+			safeLogPrintf("writeback upload data committed for %s; chmod remains pending", localPath)
 		}
-		log.Printf("%v (will retry on next mount)", modeErr)
+		safeLogPrintf("%v (will retry on next mount)", modeErr)
 		return
 	}
 
@@ -513,7 +512,7 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 			// Backward compatibility for pre-CAS writeback entries: preserve
 			// the historical UploadSync behaviour so fsync/rename do not fail
 			// with EIO on mounts that still have legacy pending overwrites.
-			log.Printf("writeback uploadsync: legacy overwrite without base revision for %s, falling back to unconditional write", localPath)
+			safeLogPrintf("writeback uploadsync: legacy overwrite without base revision for %s, falling back to unconditional write", localPath)
 			expectedRevision = -1
 		} else {
 			return 0, fmt.Errorf("resolve expected revision for %s: %w", localPath, err)
@@ -572,7 +571,7 @@ func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath str
 		if sync {
 			return err
 		}
-		log.Printf("%v (chmod remains pending)", err)
+		safeLogPrintf("%v (chmod remains pending)", err)
 		return nil
 	}
 

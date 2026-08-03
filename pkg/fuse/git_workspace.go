@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log"
 	"os"
 	"os/exec"
 	"path"
@@ -205,7 +204,7 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 	}
 	if len(loadErrs) > 0 {
 		err := errors.Join(loadErrs...)
-		log.Printf("git workspace refresh incomplete: %v", err)
+		safeLogPrintf("git workspace refresh incomplete: %v", err)
 		return err
 	}
 	sort.Slice(loaded, func(i, j int) bool {
@@ -238,13 +237,13 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 	baseCtx := ctx
 	ensureCtx, cancel := context.WithTimeout(baseCtx, fuseTimeout)
 	if err := fs.ensureGitWorkspaces(ensureCtx); err != nil {
-		log.Printf("git workspace refresh failed for %s: %v", localPath, err)
+		safeLogPrintf("git workspace refresh failed for %s: %v", localPath, err)
 	}
 	cancel()
 	if fs.gitWorkspaceCacheInvalidatedLocally(baseCtx) {
 		refreshCtx, refreshCancel := context.WithTimeout(baseCtx, fuseTimeout)
 		if err := fs.forceRefreshGitWorkspaces(refreshCtx); err != nil {
-			log.Printf("git workspace forced refresh failed for invalidated cache %s: %v", localPath, err)
+			safeLogPrintf("git workspace forced refresh failed for invalidated cache %s: %v", localPath, err)
 		}
 		refreshCancel()
 	}
@@ -255,7 +254,7 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 	if fs.shouldForceRefreshGitWorkspacesForGitStatePath(localPath) {
 		refreshCtx, refreshCancel := context.WithTimeout(baseCtx, fuseTimeout)
 		if err := fs.forceRefreshGitWorkspaces(refreshCtx); err != nil {
-			log.Printf("git workspace forced refresh failed for git state path %s: %v", localPath, err)
+			safeLogPrintf("git workspace forced refresh failed for git state path %s: %v", localPath, err)
 		}
 		refreshCancel()
 		if rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath); ok {
@@ -811,7 +810,7 @@ func (fs *Dat9FS) ensureGitLocalHeadTree(ctx context.Context, rt *gitWorkspaceRu
 	}
 	nodes, children := parseLocalGitTree(rt.workspace.WorkspaceID, head, treeOut)
 	if err := fs.fillLocalGitTreeSizes(ctx, rt, gitDir, nodes, children); err != nil {
-		log.Printf("git workspace local HEAD size fill failed workspace=%s head=%s: %v", rt.workspace.WorkspaceID, head, err)
+		safeLogPrintf("git workspace local HEAD size fill failed workspace=%s head=%s: %v", rt.workspace.WorkspaceID, head, err)
 	}
 	rt.mu.Lock()
 	rt.localTreeCommit = head
@@ -916,7 +915,7 @@ func (fs *Dat9FS) fillLocalGitTreeSizes(ctx context.Context, rt *gitWorkspaceRun
 		}
 		if localRoot != "" && workspaceID != "" && baseCommit != "" {
 			if size, hit, err := gitcache.StatBlob(ctx, localRoot, workspaceID, baseCommit, oid); err != nil {
-				log.Printf("git workspace base blob cache stat failed workspace=%s commit=%s oid=%s: %v", workspaceID, baseCommit, oid, err)
+				safeLogPrintf("git workspace base blob cache stat failed workspace=%s commit=%s oid=%s: %v", workspaceID, baseCommit, oid, err)
 			} else if hit {
 				sizeByObject[oid] = size
 				setGitTreeNodeSize(nodes, children, rel, size)
@@ -2306,7 +2305,7 @@ func (fs *Dat9FS) ensureGitStateForLocalPath(ctx context.Context, localPath stri
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, fuseTimeout)
 	if err := fs.ensureGitWorkspaces(refreshCtx); err != nil {
-		log.Printf("git workspace refresh failed for %s: %v", localPath, err)
+		safeLogPrintf("git workspace refresh failed for %s: %v", localPath, err)
 	}
 	cancel()
 	rt, rel, ok := fs.loadedGitWorkspaceForGitStatePath(localPath)
@@ -2359,7 +2358,7 @@ func (fs *Dat9FS) runGitWorkspaceHydrate(rt *gitWorkspaceRuntime) {
 		if fs.perfEnabled() {
 			fs.perf.gitHydrateFailure.add(1)
 		}
-		log.Printf("git workspace hydrate restore failed for %s: %v", rt.workspace.RootPath, err)
+		safeLogPrintf("git workspace hydrate restore failed for %s: %v", rt.workspace.RootPath, err)
 		return
 	}
 	gitDir := ""
@@ -2390,7 +2389,7 @@ func (fs *Dat9FS) runGitWorkspaceHydrate(rt *gitWorkspaceRuntime) {
 		}
 	}
 	if err != nil {
-		log.Printf("git workspace hydrate failed for %s: %v", rt.workspace.RootPath, err)
+		safeLogPrintf("git workspace hydrate failed for %s: %v", rt.workspace.RootPath, err)
 	}
 }
 
@@ -2563,7 +2562,7 @@ func (fs *Dat9FS) scheduleGitStateCheckpoint(localPath string) {
 		ctx, cancel := context.WithTimeout(context.Background(), gitCheckpointTimeout)
 		defer cancel()
 		if err := fs.checkpointGitStateForRuntime(ctx, rt); err != nil {
-			log.Printf("git state checkpoint failed for workspace %s root %s: %v", rt.workspace.WorkspaceID, rt.workspace.RootPath, err)
+			safeLogPrintf("git state checkpoint failed for workspace %s root %s: %v", rt.workspace.WorkspaceID, rt.workspace.RootPath, err)
 		}
 	})
 }
@@ -2613,7 +2612,7 @@ func (fs *Dat9FS) checkpointAllGitWorkspaces() {
 	defer cancel()
 	for _, rt := range workspaces {
 		if err := fs.checkpointGitStateForRuntime(ctx, rt); err != nil {
-			log.Printf("git state final checkpoint failed for workspace %s root %s: %v", rt.workspace.WorkspaceID, rt.workspace.RootPath, err)
+			safeLogPrintf("git state final checkpoint failed for workspace %s root %s: %v", rt.workspace.WorkspaceID, rt.workspace.RootPath, err)
 		}
 	}
 }
@@ -3628,7 +3627,7 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 			commitCtx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 			if _, err := fs.putGitOverlayRemote(commitCtx, workspaceID, req); err != nil {
-				log.Printf("git workspace overlay async commit failed workspace=%s path=%s op=%s: %v", workspaceID, req.Path, req.Op, err)
+				safeLogPrintf("git workspace overlay async commit failed workspace=%s path=%s op=%s: %v", workspaceID, req.Path, req.Op, err)
 			} else {
 				fs.forgetPendingGitOverlayEntry(workspaceID, req.Path, pendingSeq)
 			}
@@ -3760,7 +3759,7 @@ func (fs *Dat9FS) syncGitDirtyMirrorRoot(workspaceID string, rt *gitWorkspaceRun
 		}, WritePolicyWriteSync, true)
 		cancel()
 		if err != nil {
-			log.Printf("git workspace dirty mirror sync failed workspace=%s root=%s path=%s: %v", workspaceID, dirtyRoot, rel, err)
+			safeLogPrintf("git workspace dirty mirror sync failed workspace=%s root=%s path=%s: %v", workspaceID, dirtyRoot, rel, err)
 		}
 		return nil
 	})
@@ -4403,7 +4402,7 @@ func (fs *Dat9FS) validateGitRenameTarget(ctx context.Context, oldRel, newRel st
 }
 
 func (fs *Dat9FS) renameGitDir(ctx context.Context, rt *gitWorkspaceRuntime, oldRel, newRel string) gofuse.Status {
-	log.Printf("git workspace directory rename requires cross-device fallback workspace=%s old=%s new=%s",
+	safeLogPrintf("git workspace directory rename requires cross-device fallback workspace=%s old=%s new=%s",
 		rt.workspace.WorkspaceID, oldRel, newRel)
 	return gofuse.Status(syscall.EXDEV)
 }

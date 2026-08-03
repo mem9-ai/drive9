@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -231,7 +230,7 @@ func (s *ShadowStore) checkByteQuota(requiredBytes int64) error {
 	if s.writeCacheMaxBytes > 0 {
 		currentPending := s.pendingBytes.Load()
 		if currentPending+requiredBytes > s.writeCacheMaxBytes {
-			log.Printf("write-back quota rejected: cache_dir=%s pending_bytes=%d required_bytes=%d quota_bytes=%d reason=byte_quota_exceeded",
+			safeLogPrintf("write-back quota rejected: cache_dir=%s pending_bytes=%d required_bytes=%d quota_bytes=%d reason=byte_quota_exceeded",
 				s.dir, currentPending, requiredBytes, s.writeCacheMaxBytes)
 			return syscall.ENOSPC
 		}
@@ -262,7 +261,7 @@ func (s *ShadowStore) evalFreeRatio(freeBytes, totalBytes, requiredBytes int64) 
 	if totalBytes > 0 {
 		ratioAfterWrite := float64(freeAfterWrite) / float64(totalBytes)
 		if ratioAfterWrite < s.writeCacheFreeRatio {
-			log.Printf("write-back quota rejected: cache_dir=%s free_bytes=%d required_bytes=%d free_ratio=%.4f threshold=%.4f reason=free_ratio_exceeded",
+			safeLogPrintf("write-back quota rejected: cache_dir=%s free_bytes=%d required_bytes=%d free_ratio=%.4f threshold=%.4f reason=free_ratio_exceeded",
 				s.dir, freeBytes, requiredBytes, ratioAfterWrite, s.writeCacheFreeRatio)
 			return syscall.ENOSPC
 		}
