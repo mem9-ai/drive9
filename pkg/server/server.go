@@ -3971,7 +3971,7 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.Path) == "" {
+	if req.Path == "" {
 		errJSON(w, http.StatusBadRequest, "missing path")
 		return
 	}
@@ -4458,7 +4458,7 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.Path) == "" {
+	if req.Path == "" {
 		errJSON(w, http.StatusBadRequest, "missing path")
 		return
 	}

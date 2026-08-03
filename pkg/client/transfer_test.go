@@ -1999,6 +1999,39 @@ func TestResumeUpload(t *testing.T) {
 	}
 }
 
+func TestQueryUploadEscapesPathQuery(t *testing.T) {
+	tests := []string{
+		"/line\nbreak.txt",
+		"/carriage\rreturn.txt",
+		"/tab\tname.txt",
+		" /leading.txt",
+		"/trailing.txt ",
+		"/plus+amp&hash#.txt",
+	}
+	for _, path := range tests {
+		t.Run(path, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.URL.Query().Get("path"); got != path {
+					t.Errorf("query path = %q, want %q", got, path)
+				}
+				if got := r.URL.Query().Get("status"); got != "UPLOADING" {
+					t.Errorf("status = %q, want UPLOADING", got)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"uploads": []map[string]any{{"upload_id": "u1", "parts_total": 1, "status": "UPLOADING"}}})
+			}))
+			defer ts.Close()
+
+			meta, err := New(ts.URL, "").queryUpload(context.Background(), path)
+			if err != nil {
+				t.Fatalf("queryUpload: %v", err)
+			}
+			if meta.UploadID != "u1" {
+				t.Errorf("upload ID = %q, want u1", meta.UploadID)
+			}
+		})
+	}
+}
+
 func TestResumeUploadWithSummaryAndTagsSendsTagsOnComplete(t *testing.T) {
 	var completeReq struct {
 		Tags map[string]string `json:"tags"`

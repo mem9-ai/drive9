@@ -289,7 +289,7 @@ func (c *Client) UploadFSLayerFile(ctx context.Context, layerID, path string, bo
 	if strings.TrimSpace(layerID) == "" {
 		return nil, fmt.Errorf("layerID must not be empty")
 	}
-	if strings.TrimSpace(path) == "" {
+	if path == "" {
 		return nil, fmt.Errorf("path must not be empty")
 	}
 	q := url.Values{}
@@ -336,7 +336,7 @@ func (c *Client) ReadFSLayerFileStream(ctx context.Context, layerID, path string
 	if strings.TrimSpace(layerID) == "" {
 		return nil, fmt.Errorf("layerID must not be empty")
 	}
-	if strings.TrimSpace(path) == "" {
+	if path == "" {
 		return nil, fmt.Errorf("path must not be empty")
 	}
 	q := url.Values{}
@@ -375,7 +375,7 @@ func (c *Client) getFSLayerEntry(ctx context.Context, layerID, path string, maxS
 	if strings.TrimSpace(layerID) == "" {
 		return nil, fmt.Errorf("layerID must not be empty")
 	}
-	if strings.TrimSpace(path) == "" {
+	if path == "" {
 		return nil, fmt.Errorf("path must not be empty")
 	}
 	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID) + "/entries?path=" + url.QueryEscape(path)
