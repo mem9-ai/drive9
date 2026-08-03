@@ -65,16 +65,16 @@ func tencentSecretKey() string {
 }
 
 type camProvider struct {
-	mu           sync.Mutex
-	cached       aws.Credentials
-	expiresAt    time.Time
-	client       *http.Client
-	metadataURL  string
-	maxAttempts  int
-	retryBackoff time.Duration
-	refreshAhead time.Duration
-	fallbackMin  time.Duration
-	keepExpiry   bool
+	mu             sync.Mutex
+	cached         aws.Credentials
+	expiresAt      time.Time
+	client         *http.Client
+	metadataURL    string
+	maxAttempts    int
+	retryBackoff   time.Duration
+	refreshAhead   time.Duration
+	fallbackMin    time.Duration
+	fallbackResult bool
 }
 
 func newCAMProvider() *camProvider {
@@ -99,7 +99,7 @@ func (p *camProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 	defer p.mu.Unlock()
 	now := time.Now()
 	if now.Before(p.expiresAt.Add(-p.refreshAhead)) {
-		p.keepExpiry = false
+		p.fallbackResult = false
 		return p.cached, nil
 	}
 
@@ -108,24 +108,28 @@ func (p *camProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 		if errors.Is(err, ErrCAMMetadataUnavailable) &&
 			p.cached.AccessKeyID != "" &&
 			time.Now().Before(p.expiresAt.Add(-p.fallbackMin)) {
-			p.keepExpiry = true
+			p.fallbackResult = true
 			return p.cached, nil
 		}
-		p.keepExpiry = false
+		p.fallbackResult = false
 		return aws.Credentials{}, err
 	}
 	p.cached = creds
 	p.expiresAt = expiry
-	p.keepExpiry = false
+	p.fallbackResult = false
 	return p.cached, nil
 }
 
 func (p *camProvider) AdjustExpiresBy(creds aws.Credentials, duration time.Duration) (aws.Credentials, error) {
 	p.mu.Lock()
-	keepExpiry := p.keepExpiry
-	p.keepExpiry = false
+	fallbackResult := p.fallbackResult
+	p.fallbackResult = false
 	p.mu.Unlock()
-	if keepExpiry || !creds.CanExpire {
+	if !creds.CanExpire {
+		return creds, nil
+	}
+	if fallbackResult {
+		creds.Expires = creds.Expires.Add(-p.fallbackMin)
 		return creds, nil
 	}
 	creds.Expires = creds.Expires.Add(duration)

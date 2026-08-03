@@ -110,7 +110,7 @@ func TestCAMProviderFallsBackToSafelyUnexpiredCredentials(t *testing.T) {
 	}
 }
 
-func TestCAMCredentialsCacheFallbackPreservesActualExpiry(t *testing.T) {
+func TestCAMCredentialsCacheFallbackStopsBeforeSafetyMargin(t *testing.T) {
 	expiry := time.Now().Add(10 * time.Minute)
 	var metadataCalls atomic.Int32
 	var metadataUnavailable atomic.Bool
@@ -149,8 +149,8 @@ func TestCAMCredentialsCacheFallbackPreservesActualExpiry(t *testing.T) {
 	if creds.AccessKeyID != "tmp-id" {
 		t.Fatalf("fallback AccessKeyID = %q, want tmp-id", creds.AccessKeyID)
 	}
-	if !creds.Expires.Equal(expiry) {
-		t.Fatalf("fallback expiry = %v, want actual expiry %v", creds.Expires, expiry)
+	if want := expiry.Add(-provider.fallbackMin); !creds.Expires.Equal(want) {
+		t.Fatalf("fallback expiry = %v, want safety cutoff %v", creds.Expires, want)
 	}
 	callsAfterFallback := metadataCalls.Load()
 	if _, err := credentials.Retrieve(context.Background()); err != nil {
