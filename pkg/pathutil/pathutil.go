@@ -36,7 +36,7 @@ func canonicalize(raw string, isDir bool) (string, error) {
 		if b == '\n' || b == '\t' || b == '\r' {
 			continue
 		}
-		if b >= 0x01 && b <= 0x1f {
+		if (b >= 0x01 && b <= 0x1f) || b == 0x7f {
 			return "", fmt.Errorf("path contains control character 0x%02x", b)
 		}
 	}
