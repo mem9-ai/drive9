@@ -4770,6 +4770,61 @@ func TestInitTenantSchemaAsyncPersistsTargetSchemaVersion(t *testing.T) {
 	}
 }
 
+func TestInitTenantSchemaAsyncRecordsOrgScopedEvent(t *testing.T) {
+	db := newTenantDeleteDBInfo(t)
+	metaStore := db.Meta
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	const (
+		tenantID = "tenant-schema-init-event"
+		orgID    = "org-schema-init-event"
+	)
+	now := time.Now().UTC()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantProvisioning,
+		DBHost:           db.DBHost,
+		DBPort:           db.DBPort,
+		DBUser:           db.DBUser,
+		DBPasswordCipher: []byte{},
+		DBName:           db.DBName,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		ClusterID:        "cluster-schema-init-event",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.UpsertTenantTiDBCloudOrgBinding(context.Background(), &meta.TenantTiDBCloudOrgBinding{
+		TenantID:       tenantID,
+		OrganizationID: orgID,
+		ClusterID:      "cluster-schema-init-event",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := NewWithConfig(Config{
+		Meta:        metaStore,
+		Pool:        db.Pool,
+		Provisioner: &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
+	})
+	defer srv.Close()
+	dsn := tenantDSN(db.DBUser, db.DBPass, db.DBHost, db.DBPort, db.DBName, false, tenant.ProviderTiDBCloudNative)
+	srv.initTenantSchemaAsync(context.Background(), tenantID, dsn, tenant.ProviderTiDBCloudNative, func(context.Context, string) error {
+		return nil
+	})
+
+	recorder := httptest.NewRecorder()
+	srv.metrics.writePrometheus(recorder)
+	want := `drive9_business_events_total{event="tenant_schema_init",provider="tidb_cloud_native",result="ok",tenant_id="tenant-schema-init-event",tidbcloud_org_id="org-schema-init-event"} 1`
+	if !strings.Contains(recorder.Body.String(), want) {
+		t.Errorf("missing organization-scoped schema-init event %q:\n%s", want, recorder.Body.String())
+	}
+}
+
 func TestAutoEmbeddingProfileForTenantEnsuresDefaultProfile(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
