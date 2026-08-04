@@ -76,8 +76,9 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out *De
 
 const (
 	// deleteDirEstimateMaxDirs bounds the counting walk used to derive the
-	// transaction budget.
-	deleteDirEstimateMaxDirs = 100_000
+	// transaction budget. Deliberately small: the budget only needs to be
+	// sufficient, not exact — maxDuration is the hard backstop.
+	deleteDirEstimateMaxDirs = 10_000
 )
 
 // Tunables are package-level variables so tests can shrink them.
@@ -150,7 +151,10 @@ func (q *dirDeleteQueue) empty() bool { return len(q.stack) == 0 }
 // AbortUploadsByTargetPrefix best-effort aborts active uploads whose target
 // path lies under dirPath, so their finalize cannot materialize nodes inside
 // a tree being deleted. uploads has no target_path prefix index, so this is a
-// bounded scan of the tenant's active uploads.
+// bounded scan of the tenant's active uploads. Note this only marks the
+// metadata rows ABORTED (which blocks finalize); the S3 multipart sessions
+// themselves are left to the usual lifecycle/abort sweeper, as the store
+// layer has no S3 client.
 func (s *Store) AbortUploadsByTargetPrefix(ctx context.Context, dirPath string) (n int64, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "abort_uploads_by_target_prefix", start, &err)
@@ -260,9 +264,13 @@ func (s *Store) lookupDirNodeID(ctx context.Context, dirPath string) (string, er
 }
 
 // estimateSubtreeSize counts files and directories under dirPath with an
-// indexed per-directory COUNT walk. The walk is bounded by
-// deleteDirEstimateMaxDirs; a partial estimate still yields a safe budget.
+// indexed per-directory COUNT walk, bounding the walk at
+// deleteDirEstimateMaxDirs directories. The estimate only feeds the
+// transaction budget, so it errs on the generous side: any query failure
+// returns the walk cap (budget then saturates at deleteDirMaxBatchesCap and
+// maxDuration remains the real backstop).
 func (s *Store) estimateSubtreeSize(ctx context.Context, dirPath string) (files, dirs int64) {
+	generous := func() (int64, int64) { return files, deleteDirEstimateMaxDirs }
 	queue := []string{dirPath}
 	for len(queue) > 0 && dirs < deleteDirEstimateMaxDirs {
 		parent := queue[len(queue)-1]
@@ -272,7 +280,7 @@ func (s *Store) estimateSubtreeSize(ctx context.Context, dirPath string) (files,
 			WHERE `+s.scope.And(`parent_path_hash = ? AND parent_path = ?`),
 			s.scope.Args(fileNodePathHash(parent), parent)...).Scan(&total, &dirCount)
 		if err != nil {
-			return files, dirs
+			return generous()
 		}
 		files += total - dirCount
 		dirs += dirCount
@@ -284,14 +292,14 @@ func (s *Store) estimateSubtreeSize(ctx context.Context, dirPath string) (files,
 				ORDER BY name LIMIT 1000`,
 				s.scope.Args(fileNodePathHash(parent), parent, offset)...)
 			if err != nil {
-				return files, dirs
+				return generous()
 			}
 			n := 0
 			for rows.Next() {
 				var p string
 				if err := rows.Scan(&p); err != nil {
 					_ = rows.Close()
-					return files, dirs
+					return generous()
 				}
 				queue = append(queue, p)
 				offset = baseName(p)

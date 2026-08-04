@@ -1080,7 +1080,10 @@ func (c *Client) RemoveAllCtx(ctx context.Context, path string) error {
 // removeAllMaxRetries bounds the 503 retry loop for recursive deletes. The
 // server answers 503 (ErrDeleteIncomplete) when a batched recursive delete
 // exhausts its transaction/time budget; the sweep is resumable and idempotent,
-// so re-issuing the same DELETE continues where it left off.
+// so re-issuing the same DELETE continues where it left off. Note this only
+// helps when the server's budget trips before the gateway/client deadline —
+// a huge tree can still be cut off by an upstream timeout first (the async
+// delete follow-up covers that case).
 const removeAllMaxRetries = 4
 
 func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kind string) error {

@@ -330,3 +330,77 @@ func TestDeleteReconcileRepairEnabled(t *testing.T) {
 		t.Fatal("repair mode disabled with DRIVE9_DELETE_RECONCILE_REPAIR=1")
 	}
 }
+
+// TestReconcileStrandedInodeSharedScopeIsolation is the regression test for
+// the ungrouped-OR bug in the repair re-checks: under shared schema,
+// `fs_id = ? AND file_id = ? OR inode_id = ?` lets the inode_id branch escape
+// the fs_id conjunct, so a *different tenant's* file_nodes/file_gc_tasks row
+// with the same ID would make the repair wrongly conclude "still referenced"
+// and skip the stranded inode forever. Both re-checks must group the OR.
+func TestReconcileStrandedInodeSharedScopeIsolation(t *testing.T) {
+	installSharedCoreFSNoLegacy(t)
+	ctx := context.Background()
+	const fsA, fsB int64 = 4600001, 4600002
+	storeA := newSharedStore(t, fsA)
+	storeB := newSharedStore(t, fsB)
+	now := time.Now()
+
+	// Two stranded CONFIRMED file inodes for tenant A: no file_nodes row, no
+	// GC task.
+	for _, id := range []string{"shared-stray-1", "shared-stray-2"} {
+		if err := storeA.InsertFile(ctx, &File{
+			FileID: id, StorageType: StorageDB9, StorageRef: "inline:" + id,
+			SizeBytes: 1, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now,
+		}); err != nil {
+			t.Fatalf("InsertFile %s: %v", id, err)
+		}
+	}
+
+	// Tenant B references the same IDs — a file_nodes row for one, a GC task
+	// for the other. Neither must affect A's reconciliation.
+	if _, err := storeB.DB().Exec(`INSERT INTO file_nodes
+		(fs_id, node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, created_at)
+		VALUES (?, ?, ?, ?, '/', ?, 'b.txt', 0, 'shared-stray-1', ?)`,
+		fsB, "shared-b-node-1", "/b.txt", fileNodePathHash("/b.txt"), fileNodePathHash("/"), now); err != nil {
+		t.Fatalf("insert B file_nodes row: %v", err)
+	}
+	if _, err := storeB.EnqueueFileGCTaskTx(storeB.DB(), &FileGCTask{
+		FileID: "shared-stray-2", StorageType: StorageDB9, StorageRef: "inline:b",
+	}); err != nil {
+		t.Fatalf("insert B gc task: %v", err)
+	}
+
+	report, err := storeA.ReconcileDeleteOrphans(ctx, false, 0)
+	if err != nil {
+		t.Fatalf("ReconcileDeleteOrphans: %v", err)
+	}
+	if report.StrandedInodes != 2 || report.Repaired != 2 {
+		t.Fatalf("report = %+v, want 2 stranded inodes and 2 repairs", report)
+	}
+	for _, id := range []string{"shared-stray-1", "shared-stray-2"} {
+		var status string
+		if err := storeA.DB().QueryRow(`SELECT status FROM inodes WHERE fs_id = ? AND inode_id = ?`,
+			fsA, id).Scan(&status); err != nil {
+			t.Fatalf("read inode %s: %v", id, err)
+		}
+		if status != string(StatusDeleted) {
+			t.Fatalf("inode %s status = %s, want DELETED", id, status)
+		}
+		if _, err := storeA.GetFileGCTaskByFileID(ctx, id); err != nil {
+			t.Fatalf("gc task for %s: %v", id, err)
+		}
+	}
+
+	// Tenant B's rows are untouched.
+	var bNodes int
+	if err := storeB.DB().QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE fs_id = ? AND file_id = ?`,
+		fsB, "shared-stray-1").Scan(&bNodes); err != nil {
+		t.Fatal(err)
+	}
+	if bNodes != 1 {
+		t.Fatalf("tenant B file_nodes row count = %d, want 1", bNodes)
+	}
+	if _, err := storeB.GetFileGCTaskByFileID(ctx, "shared-stray-2"); err != nil {
+		t.Fatalf("tenant B gc task should survive: %v", err)
+	}
+}

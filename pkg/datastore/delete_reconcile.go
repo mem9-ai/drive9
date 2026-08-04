@@ -38,6 +38,12 @@ import (
 // caller does not specify a batch size.
 const DefaultDeleteReconcileBatchSize = 500
 
+// deleteReconcileMaxScanRows bounds the rows one reconciliation round scans
+// per table, so a hot tenant cannot turn a 10-minute piggyback round into an
+// hours-long scan. Repair progress persists across rounds (repaired rows
+// disappear), so capping a round is safe; dry-run simply re-audits.
+const deleteReconcileMaxScanRows = 200_000
+
 // DeleteReconcileReport summarizes one reconciliation round.
 type DeleteReconcileReport struct {
 	// BrokenDentries counts scan-time broken-chain dentry candidates.
@@ -102,6 +108,7 @@ type reconcileDentryCandidate struct {
 
 func (s *Store) reconcileBrokenDentries(ctx context.Context, dryRun bool, batchSize int, report *DeleteReconcileReport) error {
 	cursor := ""
+	scannedTotal := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -138,16 +145,22 @@ func (s *Store) reconcileBrokenDentries(ctx context.Context, dryRun bool, batchS
 		if err := rows.Close(); err != nil {
 			return err
 		}
+		scannedTotal += scanned
 
-		// Classify the whole page (snapshot point-checks) before repairing,
-		// so a repair cannot reclassify an unscanned sibling in this round.
+		// Classify the whole page (one batched snapshot check) before
+		// repairing, so a repair cannot reclassify an unscanned sibling in
+		// this round.
+		parentPaths := make([]string, 0, len(page))
+		for _, c := range page {
+			parentPaths = append(parentPaths, c.parentPath)
+		}
+		existing, err := s.reconcileExistingParentDirs(ctx, parentPaths)
+		if err != nil {
+			return err
+		}
 		var broken []reconcileDentryCandidate
 		for _, c := range page {
-			ok, err := s.reconcileParentDirExists(ctx, c.parentPath)
-			if err != nil {
-				return err
-			}
-			if !ok {
+			if !existing[c.parentPath] {
 				broken = append(broken, c)
 			}
 		}
@@ -166,23 +179,62 @@ func (s *Store) reconcileBrokenDentries(ctx context.Context, dryRun bool, batchS
 		if scanned < batchSize {
 			return nil
 		}
+		if scannedTotal >= deleteReconcileMaxScanRows {
+			logger.Info(ctx, "delete_reconcile_scan_capped",
+				zap.Int("scanned_rows", scannedTotal))
+			return nil
+		}
 	}
 }
 
-// reconcileParentDirExists is the snapshot parent check: the parent must
-// exist and be a directory.
-func (s *Store) reconcileParentDirExists(ctx context.Context, parentPath string) (bool, error) {
-	var one int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE `+
-		s.scope.And(`path_hash = ? AND path = ? AND is_directory = 1`),
-		s.scope.Args(fileNodePathHash(parentPath), parentPath)...).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+// reconcileExistingParentDirs returns the set of parent paths that exist as
+// directory dentries, using one (path_hash, path) row-constructor IN query
+// per chunk instead of a point check per candidate row.
+func (s *Store) reconcileExistingParentDirs(ctx context.Context, parentPaths []string) (map[string]bool, error) {
+	existing := make(map[string]bool, len(parentPaths))
+	seen := make(map[string]bool, len(parentPaths))
+	uniq := make([]string, 0, len(parentPaths))
+	for _, p := range parentPaths {
+		if !seen[p] {
+			seen[p] = true
+			uniq = append(uniq, p)
+		}
 	}
-	if err != nil {
-		return false, err
+	for start := 0; start < len(uniq); start += DefaultDeleteReconcileBatchSize {
+		end := start + DefaultDeleteReconcileBatchSize
+		if end > len(uniq) {
+			end = len(uniq)
+		}
+		chunk := uniq[start:end]
+		tuples := make([]string, 0, len(chunk))
+		args := make([]any, 0, len(chunk)*2)
+		for _, p := range chunk {
+			tuples = append(tuples, "(?, ?)")
+			args = append(args, fileNodePathHash(p), p)
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT path FROM file_nodes WHERE `+
+			s.scope.And(`(path_hash, path) IN (`+strings.Join(tuples, ",")+`) AND is_directory = 1`),
+			s.scope.Args(args...)...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			existing[p] = true
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
 	}
-	return true, nil
+	return existing, nil
 }
 
 // reconcileParentDirExistsTx is the same check as a current read inside a
@@ -254,6 +306,7 @@ func (s *Store) repairBrokenDentry(ctx context.Context, c reconcileDentryCandida
 
 func (s *Store) reconcileStrandedInodes(ctx context.Context, dryRun bool, batchSize int, report *DeleteReconcileReport) error {
 	cursor := ""
+	scannedTotal := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -312,6 +365,12 @@ func (s *Store) reconcileStrandedInodes(ctx context.Context, dryRun bool, batchS
 		if len(page) < batchSize {
 			return nil
 		}
+		scannedTotal += len(page)
+		if scannedTotal >= deleteReconcileMaxScanRows {
+			logger.Info(ctx, "delete_reconcile_scan_capped",
+				zap.Int("scanned_rows", scannedTotal))
+			return nil
+		}
 		cursor = page[len(page)-1]
 	}
 }
@@ -342,7 +401,7 @@ func (s *Store) repairStrandedInode(ctx context.Context, inodeID string) (repair
 		err = tx.QueryRowContext(ctx, `SELECT i.size_bytes, c.storage_type, c.storage_ref, c.content_type
 			FROM inodes i JOIN contents c ON c.inode_id = i.inode_id
 			WHERE `+s.scope.AndAs("i", s.scope.AndAs("c", `i.inode_id = ?`)),
-			scopeWhereArgs(s.scope, 2, s.scope.Args(inodeID)...)...).Scan(
+			scopeWhereArgs(s.scope, 2, inodeID)...).Scan(
 			&sizeBytes, &storageType, &storageRef, &contentType)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil // no contents row: directory inode — Non-goal, leave it
@@ -399,7 +458,7 @@ func (s *Store) repairStrandedInode(ctx context.Context, inodeID string) (repair
 func (s *Store) reconcileInodeReferencedTx(ctx context.Context, tx *sql.Tx, inodeID string) (bool, error) {
 	var one int
 	err := tx.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE `+
-		s.scope.And(`file_id = ? OR inode_id = ?`)+` LIMIT 1`,
+		s.scope.And(`(file_id = ? OR inode_id = ?)`)+` LIMIT 1`,
 		s.scope.Args(inodeID, inodeID)...).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -415,7 +474,7 @@ func (s *Store) reconcileInodeReferencedTx(ctx context.Context, tx *sql.Tx, inod
 func (s *Store) reconcileInodeHasGCTaskTx(ctx context.Context, tx *sql.Tx, inodeID string) (bool, error) {
 	var one int
 	err := tx.QueryRowContext(ctx, `SELECT 1 FROM file_gc_tasks WHERE `+
-		s.scope.And(`file_id = ? OR inode_id = ?`)+` LIMIT 1`,
+		s.scope.And(`(file_id = ? OR inode_id = ?)`)+` LIMIT 1`,
 		s.scope.Args(inodeID, inodeID)...).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil

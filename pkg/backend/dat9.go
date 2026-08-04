@@ -567,8 +567,11 @@ func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error)
 		}
 		return err
 	}
-	_, err = b.store.DeleteDirRecursive(ctx, path)
-	if err == nil {
+	summary, err := b.store.DeleteDirRecursive(ctx, path)
+	// Kick the GC worker even when the sweep ended in a retryable error
+	// (ErrDeleteIncomplete / ErrDirectoryNotEmpty): batches committed before
+	// the error may already have enqueued GC tasks.
+	if summary != nil && summary.OrphansEnqueued > 0 {
 		b.notifyWorkEnqueued(BackendWorkFileGC)
 	}
 	return err

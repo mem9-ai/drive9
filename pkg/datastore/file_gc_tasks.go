@@ -420,9 +420,12 @@ func normalizeFileGCTask(task *FileGCTask, now time.Time) {
 }
 
 // enqueueFileGCTasksTx inserts many queued tasks in chunked multi-row
-// INSERT IGNORE statements, giving the same duplicate-is-no-op semantics as
+// statements, giving the same duplicate-is-no-op semantics as
 // enqueueFileGCTask (file IDs are never reused; hardlink batches may repeat a
-// file_id). It returns the number of tasks actually inserted.
+// file_id). ON DUPLICATE KEY UPDATE (not INSERT IGNORE) is deliberate: only
+// unique-key conflicts are swallowed, while real errors (bad types, length,
+// constraints) still fail the batch instead of silently dropping GC tasks.
+// It returns the number of tasks actually inserted.
 func (s *Store) enqueueFileGCTasksTx(db execer, tasks []*FileGCTask) (int64, error) {
 	var inserted int64
 	now := time.Now().UTC()
@@ -452,16 +455,19 @@ func (s *Store) enqueueFileGCTasksTx(db execer, tasks []*FileGCTask) (int64, err
 				task.AvailableAt.UTC(), nullStr(task.LastError), task.CreatedAt.UTC(),
 				task.UpdatedAt.UTC(), nilTime(task.CompletedAt))...)
 		}
-		res, err := db.Exec(`INSERT IGNORE INTO file_gc_tasks
+		res, err := db.Exec(`INSERT INTO file_gc_tasks
 			(`+s.scope.InsCols(`task_id, file_id, storage_type, storage_ref, size_bytes, content_type,
 			 status, attempt_count, max_attempts, receipt, leased_at, lease_until,
 			 available_at, last_error, created_at, updated_at, completed_at`)+`)
-			VALUES `+strings.Join(values, `,`), args...)
+			VALUES `+strings.Join(values, `,`)+`
+			ON DUPLICATE KEY UPDATE task_id = task_id`, args...)
 		if err != nil {
 			return inserted, err
 		}
 		n, _ := res.RowsAffected()
-		inserted += n
+		// MySQL counts a duplicate-key no-op update as 2 affected rows; only
+		// count real inserts.
+		inserted += min(n, int64(len(batch)))
 	}
 	return inserted, nil
 }
