@@ -331,6 +331,104 @@ func TestSharedDBCapacityConfigFromEnv(t *testing.T) {
 	}
 }
 
+func TestTiDBCloudNonFreePlanCacheTTLFromEnv(t *testing.T) {
+	const key = "DRIVE9_TIDBCLOUD_NON_FREE_PLAN_CACHE_TTL"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	unsetEnv(t, []string{key})
+	got, err := tiDBCloudNonFreePlanCacheTTLFromEnv()
+	if err != nil || got != 30*time.Minute {
+		t.Fatalf("default cache TTL = %v/%v, want 30m/nil", got, err)
+	}
+	setEnv(t, key, "45m")
+	got, err = tiDBCloudNonFreePlanCacheTTLFromEnv()
+	if err != nil || got != 45*time.Minute {
+		t.Fatalf("configured cache TTL = %v/%v, want 45m/nil", got, err)
+	}
+	for _, raw := range []string{"0", "-1s", "bad"} {
+		setEnv(t, key, raw)
+		if _, err := tiDBCloudNonFreePlanCacheTTLFromEnv(); err == nil {
+			t.Fatalf("cache TTL %q error = nil, want error", raw)
+		}
+	}
+}
+
+func TestTiDBCloudFreePlanLimitsFromEnv(t *testing.T) {
+	keys := []string{
+		"DRIVE9_TIDBCLOUD_FREE_TENANT_COUNT",
+		"DRIVE9_TIDBCLOUD_FREE_MAX_STORAGE_BYTES",
+		"DRIVE9_TIDBCLOUD_FREE_MAX_FILE_SIZE_BYTES",
+		"DRIVE9_TIDBCLOUD_FREE_MAX_FILE_COUNT",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	unsetEnv(t, keys)
+	got, err := tiDBCloudFreePlanLimitsFromEnv(server.DefaultMaxUploadBytes)
+	if err != nil {
+		t.Fatalf("default free limits: %v", err)
+	}
+	want := server.TiDBCloudFreePlanLimits{
+		TenantCount: 5, MaxStorageBytes: 5368709120,
+		MaxFileSizeBytes: 524288000, MaxFileCount: 500,
+	}
+	if got != want {
+		t.Fatalf("default free limits = %+v, want %+v", got, want)
+	}
+
+	got, err = tiDBCloudFreePlanLimitsFromEnv(1 << 20)
+	if err != nil {
+		t.Fatalf("default free max file size with smaller upload cap: %v", err)
+	}
+	if got.MaxFileSizeBytes != 1<<20 {
+		t.Fatalf("default free max file size = %d, want upload cap %d", got.MaxFileSizeBytes, 1<<20)
+	}
+
+	setEnv(t, keys[0], "5")
+	setEnv(t, keys[1], "4096")
+	setEnv(t, keys[2], "1024")
+	setEnv(t, keys[3], "2000")
+	got, err = tiDBCloudFreePlanLimitsFromEnv(server.DefaultMaxUploadBytes)
+	if err != nil || got.TenantCount != 5 || got.MaxStorageBytes != 4096 || got.MaxFileSizeBytes != 1024 || got.MaxFileCount != 2000 {
+		t.Fatalf("configured free limits = %+v/%v", got, err)
+	}
+
+	for i, key := range keys {
+		unsetEnv(t, keys)
+		setEnv(t, key, "0")
+		if _, err := tiDBCloudFreePlanLimitsFromEnv(server.DefaultMaxUploadBytes); err == nil {
+			t.Fatalf("zero %s (index %d) error = nil", key, i)
+		}
+	}
+	unsetEnv(t, keys)
+	setEnv(t, keys[2], "1048577")
+	if _, err := tiDBCloudFreePlanLimitsFromEnv(1048576); err == nil {
+		t.Fatal("free max file size above upload limit error = nil")
+	}
+}
+
+func TestGlobalMaxTenantFileCountFromEnv(t *testing.T) {
+	const key = "DRIVE9_MAX_TENANT_FILE_COUNT"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	unsetEnv(t, []string{key})
+	if got, err := maxTenantFileCountFromEnv(); err != nil || got != 0 {
+		t.Fatalf("default max file count = %d/%v, want 0/nil", got, err)
+	}
+	setEnv(t, key, "2500")
+	if got, err := maxTenantFileCountFromEnv(); err != nil || got != 2500 {
+		t.Fatalf("configured max file count = %d/%v, want 2500/nil", got, err)
+	}
+	for _, raw := range []string{"-1", "bad"} {
+		setEnv(t, key, raw)
+		if _, err := maxTenantFileCountFromEnv(); err == nil {
+			t.Fatalf("max file count %q error = nil", raw)
+		}
+	}
+}
+
 func TestDBHealthProbeOptionsFromEnvDefaults(t *testing.T) {
 	keys := []string{
 		"DRIVE9_DB_HEALTH_PROBE_META_ENABLED",

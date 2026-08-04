@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 )
 
@@ -54,6 +55,37 @@ type TiDBCloudAPIKeyIdentity struct {
 	Role           string
 }
 
+const (
+	TiDBCloudAPIServiceIAM     = "iam"
+	TiDBCloudAPIServiceBilling = "billing"
+	TiDBCloudAPIServiceCluster = "cluster"
+)
+
+type TiDBCloudAPIError struct {
+	Service      string
+	Operation    string
+	StatusCode   int
+	UpstreamBody string
+}
+
+func (e *TiDBCloudAPIError) Error() string {
+	if e == nil {
+		return ""
+	}
+	msg := fmt.Sprintf("tidbcloud native %s status %d", e.Operation, e.StatusCode)
+	if e.UpstreamBody != "" {
+		return msg + ": " + e.UpstreamBody
+	}
+	switch e.StatusCode {
+	case http.StatusUnauthorized:
+		return msg + ": invalid TiDB Cloud API key"
+	case http.StatusForbidden:
+		return msg + ": access denied"
+	default:
+		return msg + ": upstream error"
+	}
+}
+
 type TiDBCloudAPIKeyIdentityResolver interface {
 	ResolveAPIKeyIdentity(ctx context.Context, req CredentialProvisionRequest) (*TiDBCloudAPIKeyIdentity, error)
 }
@@ -74,14 +106,10 @@ type CloudClusterInfo struct {
 	TiDBCloudSpendingLimitMonthly *int64
 }
 
-type CredentialProvisioner interface {
+type CredentialEarlyBindingProvisioner interface {
 	Provisioner
-	ProvisionWithCredentials(ctx context.Context, tenantID string, req CredentialProvisionRequest) (*ClusterInfo, error)
-}
-
-type CredentialQuotaProvisioner interface {
-	Provisioner
-	ProvisionWithCredentialsAndQuota(ctx context.Context, tenantID string, req CredentialProvisionRequest, opts QuotaUpdateOptions) (*ClusterInfo, *QuotaCloudConfig, error)
+	CreateClusterWithCredentialsAndQuota(ctx context.Context, tenantID string, req CredentialProvisionRequest, opts QuotaUpdateOptions) (*ClusterInfo, *QuotaCloudConfig, error)
+	WaitForClusterMetadataWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) (*ClusterInfo, error)
 }
 
 type TenantPoolClusterManager interface {

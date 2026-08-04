@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -29,6 +30,292 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+type readErrorBody struct {
+	err error
+}
+
+func (b readErrorBody) Read([]byte) (int, error) {
+	return 0, b.err
+}
+
+func (readErrorBody) Close() error {
+	return nil
+}
+
+func TestProvisionerDoesNotExposeLegacyCredentialProvisionMethods(t *testing.T) {
+	typ := reflect.TypeOf((*Provisioner)(nil))
+	for _, name := range []string{"ProvisionWithCredentials", "ProvisionWithCredentialsAndQuota"} {
+		if _, ok := typ.MethodByName(name); ok {
+			t.Fatalf("legacy compatibility method %s is still exported", name)
+		}
+	}
+}
+
+func setRequiredNativeProvisionerEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
+	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "https://billing.tidbapi.com")
+	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
+	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
+}
+
+func TestNewProvisionerFromEnvRequiresBillingURLForNative(t *testing.T) {
+	setRequiredNativeProvisionerEnv(t)
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "")
+
+	_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
+	if err == nil || !strings.Contains(err.Error(), EnvTiDBCloudBillingAPIURL) {
+		t.Fatalf("error = %v, want missing Billing URL", err)
+	}
+}
+
+func TestNewProvisionerFromEnvRejectsNonHTTPSBillingURL(t *testing.T) {
+	setRequiredNativeProvisionerEnv(t)
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "http://billing.tidbapi.com")
+
+	_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
+	if err == nil || !strings.Contains(err.Error(), EnvTiDBCloudBillingAPIURL) {
+		t.Fatalf("error = %v, want invalid Billing URL", err)
+	}
+}
+
+func TestNewProvisionerFromEnvRejectsBaseURLComponents(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		value string
+	}{
+		{name: "native API query", env: EnvTiDBCloudNativeAPIURL, value: "https://serverless.tidbapi.com?region=us-east-1"},
+		{name: "IAM fragment", env: EnvTiDBCloudIAMAPIURL, value: "https://iam.tidbapi.com#lookup"},
+		{name: "Billing query", env: EnvTiDBCloudBillingAPIURL, value: "https://billing.tidbapi.com?plan=free"},
+		{name: "Billing empty query", env: EnvTiDBCloudBillingAPIURL, value: "https://billing.tidbapi.com?"},
+		{name: "Billing fragment", env: EnvTiDBCloudBillingAPIURL, value: "https://billing.tidbapi.com#plans"},
+		{name: "Billing empty fragment", env: EnvTiDBCloudBillingAPIURL, value: "https://billing.tidbapi.com#"},
+		{name: "Billing userinfo", env: EnvTiDBCloudBillingAPIURL, value: "https://user:password@billing.tidbapi.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequiredNativeProvisionerEnv(t)
+			t.Setenv(tt.env, tt.value)
+
+			_, err := NewProvisionerFromEnv(tenant.ProviderTiDBCloudNative)
+			if err == nil || !strings.Contains(err.Error(), tt.env) {
+				t.Fatalf("error = %v, want invalid %s", err, tt.env)
+			}
+		})
+	}
+}
+
+func TestResolveOrganizationPlanClassification(t *testing.T) {
+	const organizationID = "1372813089209302377"
+	tests := []struct {
+		name      string
+		body      string
+		wantFree  bool
+		wantErrIs error
+	}{
+		{
+			name: "on demand",
+			body: `{"tenant_id_str":"1372813089209302377","effective_plan":"on_demand"}`,
+		},
+		{
+			name: "positive POC exact decimal",
+			body: `{"tenant_id":1372813089209302377,"tenant_id_str":"1372813089209302377","effective_plan":"poc","poc_credits":"185610.84"}`,
+		},
+		{
+			name: "positive POC leading decimal point",
+			body: `{"tenant_id_str":"1372813089209302377","effective_plan":"poc","poc_credits":"+.0001"}`,
+		},
+		{
+			name:     "zero POC",
+			body:     `{"tenant_id_str":"1372813089209302377","effective_plan":"poc","poc_credits":"0.00"}`,
+			wantFree: true,
+		},
+		{
+			name:     "negative POC",
+			body:     `{"tenant_id_str":"1372813089209302377","effective_plan":"poc","poc_credits":"-1"}`,
+			wantFree: true,
+		},
+		{
+			name:     "unknown plan",
+			body:     `{"tenant_id_str":"1372813089209302377","effective_plan":"free_trial"}`,
+			wantFree: true,
+		},
+		{
+			name:     "empty plan",
+			body:     `{"tenant_id_str":"1372813089209302377","effective_plan":""}`,
+			wantFree: true,
+		},
+		{
+			name:      "invalid POC exponent",
+			body:      `{"tenant_id_str":"1372813089209302377","effective_plan":"poc","poc_credits":"1e3"}`,
+			wantErrIs: tenant.ErrTiDBCloudBillingResponseInvalid,
+		},
+		{
+			name:      "missing POC credits",
+			body:      `{"tenant_id_str":"1372813089209302377","effective_plan":"poc"}`,
+			wantErrIs: tenant.ErrTiDBCloudBillingResponseInvalid,
+		},
+		{
+			name:      "missing identity",
+			body:      `{"effective_plan":"on_demand"}`,
+			wantErrIs: tenant.ErrTiDBCloudBillingResponseInvalid,
+		},
+		{
+			name:      "string identity mismatch",
+			body:      `{"tenant_id_str":"1440002","effective_plan":"on_demand"}`,
+			wantErrIs: tenant.ErrTiDBCloudBillingResponseInvalid,
+		},
+		{
+			name:      "numeric identity mismatch",
+			body:      `{"tenant_id":1440002,"tenant_id_str":"1372813089209302377","effective_plan":"on_demand"}`,
+			wantErrIs: tenant.ErrTiDBCloudBillingResponseInvalid,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var authenticatedCalls atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") == "" {
+					w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-billing", qop="auth"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				authenticatedCalls.Add(1)
+				if r.Method != http.MethodGet || r.URL.EscapedPath() != "/v1beta1/tenants/1372813089209302377/plans" {
+					t.Errorf("request = %s %s", r.Method, r.URL.EscapedPath())
+				}
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer ts.Close()
+
+			p := &Provisioner{billingURL: ts.URL, client: ts.Client()}
+			plan, err := p.ResolveOrganizationPlan(context.Background(), organizationID, tenant.CredentialProvisionRequest{
+				PublicKey: "BILLINGKEY1", PrivateKey: "billing-private",
+			})
+			if tt.wantErrIs != nil {
+				if !errors.Is(err, tt.wantErrIs) {
+					t.Fatalf("error = %v, want %v", err, tt.wantErrIs)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveOrganizationPlan: %v", err)
+			}
+			if plan.OrganizationID != organizationID || plan.IsFree != tt.wantFree {
+				t.Fatalf("plan = %+v, want org=%s free=%t", plan, organizationID, tt.wantFree)
+			}
+			if authenticatedCalls.Load() != 1 {
+				t.Fatalf("authenticated calls = %d, want 1", authenticatedCalls.Load())
+			}
+		})
+	}
+}
+
+func TestResolveOrganizationPlanRecordsBillingMetricOnce(t *testing.T) {
+	before := tiDBCloudOpenAPIMetricValue(t, "billing", "get_organization_plan", "ok")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-billing-metric", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, `{"tenant_id_str":"1440002","effective_plan":"on_demand"}`)
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{billingURL: ts.URL, client: ts.Client()}
+	if _, err := p.ResolveOrganizationPlan(context.Background(), "1440002", tenant.CredentialProvisionRequest{
+		PublicKey: "BILLINGKEY2", PrivateKey: "billing-private",
+	}); err != nil {
+		t.Fatalf("ResolveOrganizationPlan: %v", err)
+	}
+	after := tiDBCloudOpenAPIMetricValue(t, "billing", "get_organization_plan", "ok")
+	if after != before+1 {
+		t.Fatalf("billing metric delta = %v, want 1 (before=%v after=%v)", after-before, before, after)
+	}
+}
+
+func TestResolveOrganizationPlanReturnsSanitizedTypedStatusErrors(t *testing.T) {
+	for _, statusCode := range []int{
+		http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+	} {
+		t.Run(strconv.Itoa(statusCode), func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") == "" {
+					w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-billing-status", qop="auth"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				w.WriteHeader(statusCode)
+				_, _ = io.WriteString(w, `{"private_key":"SENSITIVE_BILLING_BODY"}`)
+			}))
+			defer ts.Close()
+
+			p := &Provisioner{billingURL: ts.URL, client: ts.Client()}
+			_, err := p.ResolveOrganizationPlan(context.Background(), "1440002", tenant.CredentialProvisionRequest{
+				PublicKey: "SENSITIVE_BILLING_PUBLIC", PrivateKey: "SENSITIVE_BILLING_PRIVATE",
+			})
+			var apiErr *tenant.TiDBCloudAPIError
+			if !errors.As(err, &apiErr) || apiErr.Service != tenant.TiDBCloudAPIServiceBilling ||
+				apiErr.StatusCode != statusCode || apiErr.UpstreamBody != "" {
+				t.Fatalf("error = %#v, want sanitized typed status %d", err, statusCode)
+			}
+			for _, secret := range []string{"SENSITIVE_BILLING_BODY", "SENSITIVE_BILLING_PUBLIC", "SENSITIVE_BILLING_PRIVATE"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("error leaked %q: %v", secret, err)
+				}
+			}
+		})
+	}
+}
+
+func TestResolveOrganizationPlanRejectsMalformedAndOversizedResponses(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "malformed JSON", body: `{"tenant_id_str":`},
+		{name: "trailing JSON", body: `{"tenant_id_str":"1440002"}{}`},
+		{name: "oversized", body: strings.Repeat("x", upstreamClusterBodyLimit+1)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") == "" {
+					w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-billing-invalid", qop="auth"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer ts.Close()
+
+			p := &Provisioner{billingURL: ts.URL, client: ts.Client()}
+			_, err := p.ResolveOrganizationPlan(context.Background(), "1440002", tenant.CredentialProvisionRequest{
+				PublicKey: "BILLINGKEY3", PrivateKey: "billing-private",
+			})
+			if !errors.Is(err, tenant.ErrTiDBCloudBillingResponseInvalid) {
+				t.Fatalf("error = %v, want invalid Billing response", err)
+			}
+		})
+	}
+}
+
+func TestRequestPathRedactsBillingOrganization(t *testing.T) {
+	got := requestPath("https://billing.tidbapi.com/v1beta1/tenants/1372813089209302377/plans")
+	if got != "/v1beta1/tenants/***/plans" {
+		t.Fatalf("request path = %q, want redacted Billing organization", got)
+	}
 }
 
 func tiDBCloudOpenAPIMetricValue(t *testing.T, api, operation, result string) float64 {
@@ -55,36 +342,59 @@ func TestTiDBCloudOpenAPIRequestErrorsAreClassified(t *testing.T) {
 		transport  http.RoundTripper
 		wantResult string
 	}{
-		{name: "digest challenge", transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: http.StatusUnauthorized, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
-		}), wantResult: tidbCloudResultDigestError},
-		{name: "canceled", transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
-			return nil, context.Canceled
-		}), wantResult: tidbCloudResultCanceled},
-		{name: "timeout", transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
-			return nil, context.DeadlineExceeded
-		}), wantResult: tidbCloudResultTimeout},
-		{name: "transport", transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
-			return nil, errors.New("network unavailable")
-		}), wantResult: tidbCloudResultTransportError},
+		{
+			name: "digest challenge",
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusUnauthorized,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			}),
+			wantResult: "digest_error",
+		},
+		{
+			name: "canceled",
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return nil, context.Canceled
+			}),
+			wantResult: "canceled",
+		},
+		{
+			name: "timeout",
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return nil, context.DeadlineExceeded
+			}),
+			wantResult: "timeout",
+		},
+		{
+			name: "transport",
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("network unavailable")
+			}),
+			wantResult: "transport_error",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			before := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tt.wantResult)
-			api := NewHTTPClustersAPI("", "https://iam.tidbapi.com", &http.Client{Transport: tt.transport})
-			if _, err := api.ResolveAPIKey(context.Background(), "METRICKEY1", "metric-private"); err == nil {
+			p := &Provisioner{
+				iamURL: "https://iam.tidbapi.com",
+				client: &http.Client{Transport: tt.transport},
+			}
+			_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+				PublicKey: "METRICKEY1", PrivateKey: "metric-private",
+			})
+			if err == nil {
 				t.Fatal("expected request error")
 			}
-			after := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tt.wantResult)
-			if after != before+1 {
-				t.Fatalf("metric delta = %v, want 1", after-before)
-			}
+
+			assertTiDBCloudOpenAPIMetric(t, "iam", "resolve_api_key_identity", tt.wantResult, 1)
 		})
 	}
 }
 
-func TestTiDBCloudOpenAPIDigestRetryRecordsOneLogicalRequest(t *testing.T) {
+func TestTiDBCloudOpenAPIDigestChallengeRecordsOneLogicalRequest(t *testing.T) {
 	var calls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -94,102 +404,102 @@ func TestTiDBCloudOpenAPIDigestRetryRecordsOneLogicalRequest(t *testing.T) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"name": "orgs/123/projects/456/apiKeys/789", "accessKey": "METRICKEY2", "role": tenant.TiDBCloudRoleOrgOwner,
+			"name":      "orgs/123/projects/456/apiKeys/789",
+			"accessKey": "METRICKEY2",
+			"role":      tenant.TiDBCloudRoleOrgOwner,
 		})
 	}))
 	defer ts.Close()
 
-	before := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultOK)
-	api := NewHTTPClustersAPI("", ts.URL, ts.Client())
-	if _, err := api.ResolveAPIKey(context.Background(), "METRICKEY2", "metric-private"); err != nil {
-		t.Fatal(err)
+	p := &Provisioner{iamURL: ts.URL, client: ts.Client()}
+	_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "METRICKEY2", PrivateKey: "metric-private",
+	})
+	if err != nil {
+		t.Fatalf("ResolveAPIKeyIdentity: %v", err)
 	}
-	after := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultOK)
-	if calls.Load() != 2 || after != before+1 {
-		t.Fatalf("HTTP calls=%d metric delta=%v, want 2 calls and one logical request", calls.Load(), after-before)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("HTTP calls = %d, want challenge plus authenticated retry", got)
 	}
+	assertTiDBCloudOpenAPIMetric(t, "iam", "resolve_api_key_identity", "ok", 1)
 }
 
-func TestTiDBCloudOpenAPIProtocolFailureReplacesHTTPSuccess(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{not-json`)
-	}))
-	defer ts.Close()
-
-	beforeOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultOK)
-	beforeProtocol := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultProtocolError)
-	api := NewHTTPClustersAPI("", ts.URL, ts.Client())
-	if _, err := api.ResolveAPIKey(context.Background(), "METRICKEY3", "metric-private"); err == nil {
-		t.Fatal("ResolveAPIKey unexpectedly accepted a malformed response")
-	}
-	afterOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultOK)
-	afterProtocol := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, tidbCloudResultProtocolError)
-	if afterOK != beforeOK || afterProtocol != beforeProtocol+1 {
-		t.Fatalf("ok delta=%v protocol_error delta=%v, want 0 and 1", afterOK-beforeOK, afterProtocol-beforeProtocol)
-	}
-}
-
-func TestTiDBCloudOpenAPIDeleteUnexpectedSuccessIsProtocolError(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		call func(*HTTPClustersAPI) error
-		op   string
+func TestTiDBCloudOpenAPIHTTPResponsesAreClassified(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		wantResult string
+		wantCount  int
 	}{
-		{name: "cluster", call: func(api *HTTPClustersAPI) error {
-			return api.DeleteCluster(context.Background(), "public", "private", "cluster-202")
-		}, op: tidbCloudOperationDeleteCluster},
-		{name: "branch", call: func(api *HTTPClustersAPI) error {
-			return api.DeleteBranch(context.Background(), "public", "private", "cluster-202", "branch-202")
-		}, op: tidbCloudOperationDeleteBranch},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
-				return &http.Response{
-					StatusCode: http.StatusAccepted,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(strings.NewReader("accepted")),
-				}, nil
-			})}
-			beforeOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tc.op, tidbCloudResultOK)
-			beforeProtocol := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tc.op, tidbCloudResultProtocolError)
-			api := NewHTTPClustersAPI("https://cluster.tidbapi.com", "", client)
-			if err := tc.call(api); err == nil {
-				t.Fatal("unexpected 2xx delete response was accepted")
+		{name: "client error", statusCode: http.StatusForbidden, wantResult: "client_error", wantCount: 1},
+		{name: "rate limited", statusCode: http.StatusTooManyRequests, wantResult: "rate_limited", wantCount: 1},
+		{name: "upstream error", statusCode: http.StatusBadGateway, wantResult: "upstream_error", wantCount: 1},
+		{name: "redirect", statusCode: http.StatusTemporaryRedirect, wantResult: "protocol_error", wantCount: 1},
+		{name: "malformed success", statusCode: http.StatusOK, body: `{`, wantResult: "protocol_error", wantCount: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &Provisioner{
+				iamURL: "https://iam.tidbapi.com",
+				client: &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: tt.statusCode,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(tt.body)),
+					}, nil
+				})},
 			}
-			afterOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tc.op, tidbCloudResultOK)
-			afterProtocol := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tc.op, tidbCloudResultProtocolError)
-			if afterOK != beforeOK || afterProtocol != beforeProtocol+1 {
-				t.Fatalf("ok delta=%v protocol_error delta=%v, want 0 and 1", afterOK-beforeOK, afterProtocol-beforeProtocol)
+			_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+				PublicKey: "METRICKEY3", PrivateKey: "metric-private",
+			})
+			if err == nil {
+				t.Fatal("expected IAM response error")
 			}
+			assertTiDBCloudOpenAPIMetric(t, "iam", "resolve_api_key_identity", tt.wantResult, tt.wantCount)
 		})
 	}
 }
 
-func TestTiDBCloudOpenAPIClusterListWithoutQueryUsesListOperation(t *testing.T) {
+func TestTiDBCloudOpenAPIClusterListUsesBoundedLabels(t *testing.T) {
+	var calls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="cluster-metric-nonce", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		_, _ = io.WriteString(w, `{"clusters":[]}`)
 	}))
 	defer ts.Close()
-	before := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tidbCloudOperationListClusters, tidbCloudResultOK)
-	api := NewHTTPClustersAPI(ts.URL, "", ts.Client())
-	if _, _, err := api.ListClusters(context.Background(), "public", "private", nil); err != nil {
-		t.Fatal(err)
+
+	p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+	_, err := p.ListManagedClusters(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "METRICKEY4", PrivateKey: "metric-private",
+	}, tenant.ManagedClusterListOptions{})
+	if err != nil {
+		t.Fatalf("ListManagedClusters: %v", err)
 	}
-	after := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tidbCloudOperationListClusters, tidbCloudResultOK)
-	if after != before+1 {
-		t.Fatalf("list_clusters metric delta = %v, want 1", after-before)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("HTTP calls = %d, want challenge plus authenticated retry", got)
 	}
+	assertTiDBCloudOpenAPIMetric(t, "cluster", "list_clusters", "ok", 1)
 }
 
-func setRequiredNativeProvisionerEnv(t *testing.T) {
+func assertTiDBCloudOpenAPIMetric(t *testing.T, api, operation, result string, count int) {
 	t.Helper()
-	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
-	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
-	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
-	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	want := fmt.Sprintf(`drive9_tidbcloud_openapi_requests_total{api=%q,operation=%q,result=%q} %d`, api, operation, result, count)
+	if !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("missing metric %q:\n%s", want, rec.Body.String())
+	}
 }
 
 func TestNewProvisionerFromEnvRequiresIAMURLForNative(t *testing.T) {
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "https://billing.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
 	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
@@ -309,47 +619,109 @@ func TestResolveAPIKeyIdentityUsesIAMAPI(t *testing.T) {
 	}
 }
 
-func TestValidateSharedCredentialsUsesConfiguredKeyAtStartup(t *testing.T) {
+func TestValidateSharedAccessUsesConfiguredKeyAtStartup(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		role    string
-		wantErr bool
+		name            string
+		role            string
+		iamOrganization string
+		billingBody     string
+		billingStatus   int
+		wantErrIs       error
+		wantErrContains string
 	}{
-		{name: "organization owner", role: tenant.TiDBCloudRoleOrgOwner},
-		{name: "project owner", role: tenant.TiDBCloudRoleProjectOwner},
-		{name: "viewer rejected", role: "org:viewer", wantErr: true},
+		{
+			name: "organization owner on demand", role: tenant.TiDBCloudRoleOrgOwner,
+			iamOrganization: "1234567890123456789",
+			billingBody:     `{"tenant_id_str":"1234567890123456789","effective_plan":"on_demand"}`,
+		},
+		{
+			name: "project owner positive POC", role: tenant.TiDBCloudRoleProjectOwner,
+			iamOrganization: "1234567890123456789",
+			billingBody:     `{"tenant_id_str":"1234567890123456789","effective_plan":"poc","poc_credits":"1.25"}`,
+		},
+		{
+			name: "viewer rejected", role: "org:viewer",
+			iamOrganization: "1234567890123456789",
+			billingBody:     `{"tenant_id_str":"1234567890123456789","effective_plan":"on_demand"}`,
+			wantErrIs:       tenant.ErrTiDBCloudRoleInsufficient,
+		},
+		{
+			name: "free organization rejected", role: tenant.TiDBCloudRoleOrgOwner,
+			iamOrganization: "1234567890123456789",
+			billingBody:     `{"tenant_id_str":"1234567890123456789","effective_plan":"poc","poc_credits":"0"}`,
+			wantErrContains: "must be non-free",
+		},
+		{
+			name: "billing organization mismatch", role: tenant.TiDBCloudRoleOrgOwner,
+			iamOrganization: "1234567890123456789",
+			billingBody:     `{"tenant_id_str":"999","effective_plan":"on_demand"}`,
+			wantErrIs:       tenant.ErrTiDBCloudBillingResponseInvalid,
+		},
+		{
+			name: "billing response invalid", role: tenant.TiDBCloudRoleOrgOwner,
+			iamOrganization: "1234567890123456789",
+			billingBody:     `{"tenant_id_str":"1234567890123456789","effective_plan":"poc","poc_credits":"NaN"}`,
+			wantErrIs:       tenant.ErrTiDBCloudBillingResponseInvalid,
+		},
+		{
+			name: "billing unavailable", role: tenant.TiDBCloudRoleOrgOwner,
+			iamOrganization: "1234567890123456789",
+			billingStatus:   http.StatusBadGateway,
+			billingBody:     `{"message":"unavailable"}`,
+			wantErrContains: "Billing plan lookup",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var gotPath string
+			var gotIAMPath, gotBillingPath string
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Header.Get("Authorization") == "" {
 					w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-shared-startup", qop="auth"`)
 					w.WriteHeader(http.StatusUnauthorized)
 					return
 				}
-				gotPath = r.URL.Path
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"name": "orgs/1234567890123456789/apiKeys/111111", "accessKey": "SHAREDOWNER1", "role": tc.role,
-				})
+				switch {
+				case strings.HasPrefix(r.URL.Path, "/v1beta1/apikeys/"):
+					gotIAMPath = r.URL.Path
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"name": "orgs/" + tc.iamOrganization + "/apiKeys/111111", "accessKey": "SHAREDOWNER1", "role": tc.role,
+					})
+				case strings.HasSuffix(r.URL.Path, "/plans"):
+					gotBillingPath = r.URL.Path
+					if tc.billingStatus != 0 {
+						w.WriteHeader(tc.billingStatus)
+					}
+					_, _ = io.WriteString(w, tc.billingBody)
+				default:
+					http.NotFound(w, r)
+				}
 			}))
 			defer ts.Close()
 
 			p := &Provisioner{
-				iamURL:                 ts.URL,
+				iamURL: ts.URL, billingURL: ts.URL, client: ts.Client(),
 				defaultSharedPublicKey: "SHAREDOWNER1", defaultSharedPrivateKey: "test-shared-private",
 			}
-			err := p.ValidateSharedCredentials(context.Background())
-			if tc.wantErr {
-				if !errors.Is(err, tenant.ErrTiDBCloudRoleInsufficient) {
-					t.Errorf("ValidateSharedCredentials error = %v, want insufficient role", err)
+			err := p.ValidateSharedAccess(context.Background())
+			if tc.wantErrIs != nil {
+				if !errors.Is(err, tc.wantErrIs) {
+					t.Errorf("ValidateSharedAccess error = %v, want %v", err, tc.wantErrIs)
+				}
+				return
+			}
+			if tc.wantErrContains != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrContains) {
+					t.Errorf("ValidateSharedAccess error = %v, want %q", err, tc.wantErrContains)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("ValidateSharedCredentials: %v", err)
+				t.Fatalf("ValidateSharedAccess: %v", err)
 			}
-			if gotPath != "/v1beta1/apikeys/SHAREDOWNER1" {
-				t.Errorf("IAM path = %q, want configured shared key", gotPath)
+			if gotIAMPath != "/v1beta1/apikeys/SHAREDOWNER1" {
+				t.Errorf("IAM path = %q, want configured shared key", gotIAMPath)
+			}
+			if gotBillingPath != "/v1beta1/tenants/1234567890123456789/plans" {
+				t.Errorf("Billing path = %q, want IAM organization", gotBillingPath)
 			}
 		})
 	}
@@ -463,10 +835,110 @@ func TestResolveAPIKeyIdentityDoesNotExposeIAMErrorBody(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected IAM status error")
 	}
+	var apiErr *tenant.TiDBCloudAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *tenant.TiDBCloudAPIError", err)
+	}
+	if apiErr.Service != tenant.TiDBCloudAPIServiceIAM || apiErr.Operation != "IAM API key lookup" ||
+		apiErr.StatusCode != http.StatusForbidden || apiErr.UpstreamBody != "" {
+		t.Fatalf("IAM error = %#v", apiErr)
+	}
 	for _, sensitive := range []string{"RESPONSEKEY1", "SENSITIVE_SECRET", "SENSITIVE_DISPLAY", "REQUESTKEY1", "request-private"} {
 		if strings.Contains(err.Error(), sensitive) {
 			t.Fatalf("error leaked IAM response material %q: %v", sensitive, err)
 		}
+	}
+}
+
+func TestResolveAPIKeyIdentityPreservesTypedStatusWhenErrorBodyDrainFails(t *testing.T) {
+	drainErr := errors.New("drain IAM error body")
+	p := &Provisioner{
+		iamURL: "https://iam.tidbapi.com",
+		client: &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     make(http.Header),
+				Body:       readErrorBody{err: drainErr},
+			}, nil
+		})},
+	}
+
+	_, err := p.ResolveAPIKeyIdentity(context.Background(), tenant.CredentialProvisionRequest{
+		PublicKey: "IAMKEY-DRAIN", PrivateKey: "iam-private",
+	})
+	var apiErr *tenant.TiDBCloudAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want typed TiDB Cloud API error", err)
+	}
+	if apiErr.Service != tenant.TiDBCloudAPIServiceIAM || apiErr.StatusCode != http.StatusForbidden {
+		t.Fatalf("typed error = %+v, want IAM status 403", apiErr)
+	}
+}
+
+func TestStatusErrorReturnsTypedError(t *testing.T) {
+	err := statusError(tenant.TiDBCloudAPIServiceCluster, "cluster list", http.StatusTooManyRequests, `{"message":"slow down"}`)
+	var apiErr *tenant.TiDBCloudAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *tenant.TiDBCloudAPIError", err)
+	}
+	if apiErr.Service != tenant.TiDBCloudAPIServiceCluster || apiErr.Operation != "cluster list" ||
+		apiErr.StatusCode != http.StatusTooManyRequests || apiErr.UpstreamBody != `{"message":"slow down"}` {
+		t.Fatalf("status error = %#v", apiErr)
+	}
+}
+
+func TestIdempotentDeleteNotFoundRecordsOK(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation string
+		path      string
+		delete    func(*Provisioner, tenant.CredentialProvisionRequest) error
+	}{
+		{
+			name: "branch", operation: tidbCloudOperationDeleteBranch,
+			path: "/v1beta1/clusters/cluster-1/branches/branch-1",
+			delete: func(p *Provisioner, req tenant.CredentialProvisionRequest) error {
+				return p.DeleteBranchWithCredentials(context.Background(), "cluster-1", "branch-1", req)
+			},
+		},
+		{
+			name: "cluster", operation: tidbCloudOperationDeleteCluster,
+			path: "/v1beta1/clusters/cluster-1",
+			delete: func(p *Provisioner, req tenant.CredentialProvisionRequest) error {
+				return p.DeprovisionWithCredentials(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, req)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") == "" {
+					w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="delete-404", qop="auth"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if r.Method != http.MethodDelete || r.URL.Path != tt.path {
+					t.Fatalf("request = %s %s, want DELETE %s", r.Method, r.URL.Path, tt.path)
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			defer ts.Close()
+			p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+			req := tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}
+			beforeOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tt.operation, tidbCloudResultOK)
+			beforeClientError := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tt.operation, tidbCloudResultClientError)
+			if err := tt.delete(p, req); err != nil {
+				t.Fatal(err)
+			}
+			afterOK := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tt.operation, tidbCloudResultOK)
+			afterClientError := tiDBCloudOpenAPIMetricValue(t, tidbCloudAPICluster, tt.operation, tidbCloudResultClientError)
+			if afterOK != beforeOK+1 {
+				t.Fatalf("ok metric delta = %v, want 1", afterOK-beforeOK)
+			}
+			if afterClientError != beforeClientError {
+				t.Fatalf("client_error metric delta = %v, want 0", afterClientError-beforeClientError)
+			}
+		})
 	}
 }
 
@@ -541,6 +1013,7 @@ func TestResolveAPIKeyIdentityRedactsAccessKeyFromTransportErrorsAndLogs(t *test
 }
 
 func TestNewProvisionerFromEnvReadsServerSideConfigOnly(t *testing.T) {
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "https://billing.tidbapi.com")
 	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
@@ -569,6 +1042,7 @@ func TestNewProvisionerFromEnvReadsServerSideConfigOnly(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvUsesBuiltinDefaultSpendingLimit(t *testing.T) {
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "https://billing.tidbapi.com")
 	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
@@ -585,6 +1059,7 @@ func TestNewProvisionerFromEnvUsesBuiltinDefaultSpendingLimit(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvRejectsTooSmallDefaultSpendingLimit(t *testing.T) {
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "https://billing.tidbapi.com")
 	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
@@ -604,6 +1079,7 @@ func TestNewProvisionerFromEnvRejectsTooSmallDefaultSpendingLimit(t *testing.T) 
 }
 
 func TestNewProvisionerFromEnvRequiresCloudProviderAndRegion(t *testing.T) {
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "https://billing.tidbapi.com")
 	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "")
@@ -619,6 +1095,7 @@ func TestNewProvisionerFromEnvRequiresCloudProviderAndRegion(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvRejectsNonHTTPSAPIURL(t *testing.T) {
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "https://billing.tidbapi.com")
 	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "http://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
@@ -634,6 +1111,7 @@ func TestNewProvisionerFromEnvRejectsNonHTTPSAPIURL(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvRejectsInvalidDefaultDatabaseName(t *testing.T) {
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "https://billing.tidbapi.com")
 	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
@@ -650,6 +1128,7 @@ func TestNewProvisionerFromEnvRejectsInvalidDefaultDatabaseName(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvRejectsInvalidDefaultSpendingLimit(t *testing.T) {
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "https://billing.tidbapi.com")
 	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
@@ -665,7 +1144,7 @@ func TestNewProvisionerFromEnvRejectsInvalidDefaultSpendingLimit(t *testing.T) {
 	}
 }
 
-func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testing.T) {
+func TestCreateAndWaitForClusterMetadataUseRequestCredentialsAndServerConfig(t *testing.T) {
 	var pollCount int
 	origEnsureDatabase := ensureDatabaseFunc
 	ensureDatabaseFunc = func(context.Context, string, string, string, int, string) error {
@@ -736,12 +1215,17 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 		defaultDatabaseName: DefaultDatabaseName,
 		defaultSpendLimit:   int32Ptr(5000),
 	}
-	out, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	req := tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
-	})
+	}
+	created, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", req, tenant.QuotaUpdateOptions{})
 	if err != nil {
-		t.Fatalf("ProvisionWithCredentials: %v", err)
+		t.Fatalf("CreateClusterWithCredentialsAndQuota: %v", err)
+	}
+	out, err := p.WaitForClusterMetadataWithCredentials(context.Background(), created, req)
+	if err != nil {
+		t.Fatalf("WaitForClusterMetadataWithCredentials: %v", err)
 	}
 	if !strings.Contains(gotAuth, `username="public-1"`) {
 		t.Fatalf("Authorization header did not use request public key: %q", gotAuth)
@@ -775,7 +1259,7 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	}
 }
 
-func TestProvisionWithCredentialsAndQuotaSendsCreateTimeSpendingLimit(t *testing.T) {
+func TestCreateClusterWithCredentialsAndQuotaSendsCreateTimeSpendingLimit(t *testing.T) {
 	var gotBody struct {
 		Labels        map[string]string `json:"labels"`
 		SpendingLimit struct {
@@ -812,12 +1296,12 @@ func TestProvisionWithCredentialsAndQuotaSendsCreateTimeSpendingLimit(t *testing
 		defaultSpendLimit:   int32Ptr(5000),
 	}
 	monthly := int64(10000)
-	_, cloudCfg, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	_, cloudCfg, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	}, tenant.QuotaUpdateOptions{TiDBCloudSpendingLimitMonthly: &monthly})
 	if err != nil {
-		t.Fatalf("ProvisionWithCredentialsAndQuota: %v", err)
+		t.Fatalf("CreateClusterWithCredentialsAndQuota: %v", err)
 	}
 	if gotBody.SpendingLimit.Monthly != int32(monthly) {
 		t.Fatalf("spendingLimit.monthly = %d, want %d", gotBody.SpendingLimit.Monthly, monthly)
@@ -830,6 +1314,72 @@ func TestProvisionWithCredentialsAndQuotaSendsCreateTimeSpendingLimit(t *testing
 	}
 	if cloudCfg == nil || cloudCfg.TiDBCloudSpendingLimitMonthly == nil || *cloudCfg.TiDBCloudSpendingLimitMonthly != monthly {
 		t.Fatalf("cloud config = %#v, want spending limit %d", cloudCfg, monthly)
+	}
+}
+
+func TestCreateClusterWithCredentialsReturnsBeforeMetadataAndWaitPreservesCreateState(t *testing.T) {
+	var authorizedPosts atomic.Int32
+	var authorizedGets atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1beta1/clusters":
+			authorizedPosts.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId": "cluster-early-1",
+				"state":     "CREATING",
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters/cluster-early-1":
+			authorizedGets.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId":  "cluster-early-1",
+				"state":      "CREATING",
+				"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-early-1"},
+				"userPrefix": "u1",
+				"endpoints":  map[string]any{"public": map[string]any{"host": "db.example", "port": 4000}},
+			})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		cloudProvider:       "aws",
+		region:              "us-east-1",
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	created, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-early-1", tenant.CredentialProvisionRequest{
+		PublicKey: "public-1", PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{})
+	if err != nil {
+		t.Fatalf("CreateClusterWithCredentialsAndQuota: %v", err)
+	}
+	if created.ClusterID != "cluster-early-1" || created.Password == "" || created.DBName != DefaultDatabaseName {
+		t.Fatalf("created cluster = %+v", created)
+	}
+	if authorizedPosts.Load() != 1 || authorizedGets.Load() != 0 {
+		t.Fatalf("create calls post/get = %d/%d, want 1/0", authorizedPosts.Load(), authorizedGets.Load())
+	}
+
+	ready, err := p.WaitForClusterMetadataWithCredentials(context.Background(), created, tenant.CredentialProvisionRequest{
+		PublicKey: "public-1", PrivateKey: "private-1",
+	})
+	if err != nil {
+		t.Fatalf("WaitForClusterMetadataWithCredentials: %v", err)
+	}
+	if authorizedGets.Load() != 1 {
+		t.Fatalf("metadata GET calls = %d, want 1", authorizedGets.Load())
+	}
+	if ready.ClusterID != created.ClusterID || ready.Password != created.Password || ready.DBName != created.DBName ||
+		ready.OrganizationID != "org-early-1" || ready.Host != "db.example" || ready.Port != 4000 || ready.Username != "u1.root" {
+		t.Fatalf("ready cluster = %+v, created = %+v", ready, created)
 	}
 }
 
@@ -1017,6 +1567,38 @@ func TestBatchProvisionSharedDBPoolsUsesPhysicalPoolIdentity(t *testing.T) {
 	if len(got) != 2 || got[0].DBPoolID != 41 || got[0].DBPoolUUID != poolUUIDs[0] || got[0].ClusterID != "cluster-pool-41" ||
 		got[1].DBPoolID != 42 || got[1].DBPoolUUID != poolUUIDs[1] || got[1].ClusterID != "cluster-pool-42" {
 		t.Fatalf("shared pool results = %#v", got)
+	}
+}
+
+func TestBatchProvisionSharedDBPoolsPreservesValidResultsWhenResponseHasMalformedCluster(t *testing.T) {
+	const validUUID = "11111111-1111-4111-8111-111111111111"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-partial", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"clusters": []map[string]any{
+			{"clusterId": "cluster-valid", "state": "CREATING", "labels": map[string]string{
+				TiDBCloudOrganizationLabel: "org-1", Drive9DBPoolUUIDLabel: validUUID,
+			}},
+			{"clusterId": "cluster-malformed", "state": "CREATING", "labels": map[string]string{
+				TiDBCloudOrganizationLabel: "org-1", Drive9DBPoolUUIDLabel: "not-a-uuid",
+			}},
+		}})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{apiURL: ts.URL, cloudProvider: "aws", region: "us-east-1", defaultDatabaseName: DefaultDatabaseName}
+	got, err := p.BatchProvisionSharedDBPoolsWithCredentials(context.Background(), []tenant.SharedDBPoolCreateRequest{
+		{DBPoolID: 41, DBPoolUUID: validUUID, CustomerOrganizationID: "customer-org", RootPassword: "password", SpendingLimitMonthly: 1_000_000},
+		{DBPoolID: 42, DBPoolUUID: "22222222-2222-4222-8222-222222222222", CustomerOrganizationID: "customer-org", RootPassword: "password", SpendingLimitMonthly: 1_000_000},
+	}, tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"})
+	if err == nil || !strings.Contains(err.Error(), Drive9DBPoolUUIDLabel) {
+		t.Fatalf("error = %v, want malformed cluster validation error", err)
+	}
+	if len(got) != 1 || got[0].DBPoolID != 41 || got[0].ClusterID != "cluster-valid" {
+		t.Fatalf("valid results = %#v, want the valid cluster preserved", got)
 	}
 }
 
@@ -1747,7 +2329,7 @@ func int32Ptr(v int32) *int32 {
 	return &v
 }
 
-func TestProvisionWithCredentialsDefaultsDatabaseName(t *testing.T) {
+func TestCreateClusterWithCredentialsAndQuotaDefaultsDatabaseName(t *testing.T) {
 	origEnsureDatabase := ensureDatabaseFunc
 	ensureDatabaseFunc = func(context.Context, string, string, string, int, string) error {
 		t.Fatal("ensure database should not run during provision")
@@ -1777,12 +2359,12 @@ func TestProvisionWithCredentialsDefaultsDatabaseName(t *testing.T) {
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
 	}
-	out, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	out, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
-	})
+	}, tenant.QuotaUpdateOptions{})
 	if err != nil {
-		t.Fatalf("ProvisionWithCredentials: %v", err)
+		t.Fatalf("CreateClusterWithCredentialsAndQuota: %v", err)
 	}
 	if out.DBName != DefaultDatabaseName {
 		t.Fatalf("database name = %q, want %q", out.DBName, DefaultDatabaseName)
@@ -1855,7 +2437,7 @@ func TestEnsureDatabaseFromDSNRejectsNonPositivePort(t *testing.T) {
 	}
 }
 
-func TestProvisionWithCredentialsIncludesUpstreamBodyOnError(t *testing.T) {
+func TestCreateClusterWithCredentialsAndQuotaIncludesUpstreamBodyOnError(t *testing.T) {
 	longBody := strings.Repeat("x", upstreamErrorBodyLimit+100)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
@@ -1873,10 +2455,10 @@ func TestProvisionWithCredentialsIncludesUpstreamBodyOnError(t *testing.T) {
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
 	}
-	_, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	_, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
-	})
+	}, tenant.QuotaUpdateOptions{})
 	if err == nil {
 		t.Fatal("expected upstream error")
 	}
@@ -2684,6 +3266,7 @@ func TestWaitForBranchUserWithCredentialsUsesUserPrefix(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvReadsPrivateEndpointFlag(t *testing.T) {
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "https://billing.tidbapi.com")
 	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
@@ -2727,6 +3310,7 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointFlag(t *testing.T) {
 }
 
 func TestNewProvisionerFromEnvRejectsMalformedPrivateEndpointFlag(t *testing.T) {
+	t.Setenv(EnvTiDBCloudBillingAPIURL, "https://billing.tidbapi.com")
 	t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
@@ -2744,6 +3328,7 @@ func TestNewProvisionerFromEnvRejectsMalformedPrivateEndpointFlag(t *testing.T) 
 func TestNewProvisionerFromEnvReadsPrivateEndpointHostMap(t *testing.T) {
 	setPrivateEnv := func(t *testing.T, provider string) {
 		t.Helper()
+		t.Setenv(EnvTiDBCloudBillingAPIURL, "https://billing.tidbapi.com")
 		t.Setenv(EnvTiDBCloudIAMAPIURL, "https://iam.tidbapi.com")
 		t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 		t.Setenv(EnvTiDBCloudNativeCloudProvider, provider)
@@ -2851,7 +3436,7 @@ func TestClusterConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	}
 }
 
-func TestProvisionWithCredentialsUsesPrivateEndpoint(t *testing.T) {
+func TestCreateClusterWithCredentialsAndQuotaUsesPrivateEndpoint(t *testing.T) {
 	var pollCount int
 	origEnsureDatabase := ensureDatabaseFunc
 	ensureDatabaseFunc = func(context.Context, string, string, string, int, string) error {
@@ -2891,11 +3476,11 @@ func TestProvisionWithCredentialsUsesPrivateEndpoint(t *testing.T) {
 		defaultDatabaseName: DefaultDatabaseName,
 		usePrivateEndpoint:  true,
 	}
-	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	res, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey: "public-1", PrivateKey: "private-1",
 	}, tenant.QuotaUpdateOptions{})
 	if err != nil {
-		t.Fatalf("ProvisionWithCredentialsAndQuota: %v", err)
+		t.Fatalf("CreateClusterWithCredentialsAndQuota: %v", err)
 	}
 	if res.Host != "private.internal" {
 		t.Fatalf("Host = %q, want private.internal", res.Host)
@@ -2905,7 +3490,7 @@ func TestProvisionWithCredentialsUsesPrivateEndpoint(t *testing.T) {
 	}
 }
 
-func TestProvisionWithCredentialsMapsPublicHostToPrivateEndpoint(t *testing.T) {
+func TestCreateClusterWithCredentialsAndQuotaMapsPublicHostToPrivateEndpoint(t *testing.T) {
 	origEnsureDatabase := ensureDatabaseFunc
 	ensureDatabaseFunc = func(context.Context, string, string, string, int, string) error {
 		return nil
@@ -2939,11 +3524,11 @@ func TestProvisionWithCredentialsMapsPublicHostToPrivateEndpoint(t *testing.T) {
 		alicloudPrivateEndpointHost: "legacy-alicloud.internal",
 		privateEndpointHostMap:      map[string]string{"public-a.example": "private-a.internal"},
 	}
-	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	res, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey: "public-1", PrivateKey: "private-1",
 	}, tenant.QuotaUpdateOptions{})
 	if err != nil {
-		t.Fatalf("ProvisionWithCredentialsAndQuota: %v", err)
+		t.Fatalf("CreateClusterWithCredentialsAndQuota: %v", err)
 	}
 	if res.Host != "private-a.internal" {
 		t.Fatalf("Host = %q, want private-a.internal", res.Host)
@@ -2953,7 +3538,7 @@ func TestProvisionWithCredentialsMapsPublicHostToPrivateEndpoint(t *testing.T) {
 	}
 }
 
-func TestProvisionWithCredentialsErrorsWhenPrivateHostMappingMissing(t *testing.T) {
+func TestCreateClusterWithCredentialsAndQuotaErrorsWhenPrivateHostMappingMissing(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
 			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
@@ -2981,11 +3566,11 @@ func TestProvisionWithCredentialsErrorsWhenPrivateHostMappingMissing(t *testing.
 		alicloudPrivateEndpointHost: "legacy-alicloud.internal",
 		privateEndpointHostMap:      map[string]string{"public-a.example": "private-a.internal"},
 	}
-	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	res, _, err := p.CreateClusterWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey: "public-1", PrivateKey: "private-1",
 	}, tenant.QuotaUpdateOptions{})
 	if err == nil {
-		t.Fatalf("ProvisionWithCredentialsAndQuota error = nil, want missing mapping error")
+		t.Fatalf("CreateClusterWithCredentialsAndQuota error = nil, want missing mapping error")
 	}
 	if !strings.Contains(err.Error(), EnvTiDBCloudPrivateEndpointHostMap) || !strings.Contains(err.Error(), "unmapped.example") {
 		t.Fatalf("error = %v, want mapping miss with public host", err)

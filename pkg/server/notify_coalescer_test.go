@@ -203,7 +203,6 @@ func TestTenantNotifyCoalescerFlushFailureFallsBackToPerRow(t *testing.T) {
 		`drive9_notify_coalescer_flush_total{result="fallback"}`,
 		`drive9_notify_coalescer_per_row_fallback_total{result="ok"}`,
 		`drive9_notify_coalescer_per_row_fallback_total{result="error"}`,
-		`drive9_notify_coalescer_pending 1.000000`,
 	} {
 		if !strings.Contains(metricText, want) {
 			t.Fatalf("missing notify coalescer metric %q: %s", want, metricText)
@@ -217,10 +216,11 @@ func TestTenantNotifyCoalescerFlushFailureFallsBackToPerRow(t *testing.T) {
 	if len(calls) != 3 || len(calls[2]) != 1 || calls[2][0].TenantID != "tenant-b" || calls[2][0].WorkMask != 2 {
 		t.Fatalf("retried batch calls = %+v, want third batch with tenant-b mask 2", calls)
 	}
-	metricRec = httptest.NewRecorder()
-	metrics.WritePrometheus(metricRec)
-	if !strings.Contains(metricRec.Body.String(), `drive9_notify_coalescer_pending 0.000000`) {
-		t.Fatalf("pending gauge did not clear after retry success: %s", metricRec.Body.String())
+	c.mu.Lock()
+	pending, inFlight := len(c.pending), len(c.inFlight)
+	c.mu.Unlock()
+	if pending != 0 || inFlight != 0 {
+		t.Fatalf("coalescer state after retry success = pending:%d in_flight:%d, want both zero", pending, inFlight)
 	}
 }
 

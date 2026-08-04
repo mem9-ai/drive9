@@ -322,11 +322,8 @@ func (a *HTTPClustersAPI) ResolveAPIKey(ctx context.Context, publicKey, privateK
 	defer func() { _ = resp.Body.Close() }()
 	if !httpStatusOK(resp.StatusCode) {
 		recordTiDBCloudHTTPResponse(tidbCloudAPIIAM, tidbCloudOperationResolveAPIKeyIdentity, resp.StatusCode, true)
-		_, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
-		if readErr != nil {
-			return nil, readErr
-		}
-		return nil, fmt.Errorf("%s", statusError("IAM API key lookup", resp.StatusCode, ""))
+		_, _ = readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		return nil, statusError(tenant.TiDBCloudAPIServiceIAM, "IAM API key lookup", resp.StatusCode, "")
 	}
 	var info struct {
 		Name      string `json:"name"`

@@ -48,6 +48,9 @@ func TestListFailedNativeTenantCleanupCandidatesUsesOrganizationEligibility(t *t
 
 func TestListFailedSharedTenantCleanupCandidatesUsesMembershipOrPlacementOrganization(t *testing.T) {
 	s := newControlStore(t)
+	t.Cleanup(func() {
+		_, _ = s.DB().ExecContext(context.Background(), `DELETE FROM tenant_pool_memberships WHERE tenant_id = ?`, "shared-wrong-membership-org")
+	})
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	cutoff := now.Add(-30 * time.Minute)

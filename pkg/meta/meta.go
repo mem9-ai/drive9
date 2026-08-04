@@ -21,14 +21,16 @@ import (
 )
 
 var (
-	ErrNotFound                     = errors.New("not found")
-	ErrDuplicate                    = errors.New("duplicate entry")
-	ErrStorageQuotaExceeded         = errors.New("tenant storage quota exceeded")
-	ErrFileCountQuotaExceeded       = errors.New("tenant file count quota exceeded")
-	ErrReservationAlreadyExists     = errors.New("upload reservation already exists")
-	ErrQuotaReservationBusy         = errors.New("quota reservation busy")
-	ErrSharedDBPoolIdentityConflict = errors.New("shared db pool physical identity changed after provisioning started")
-	ErrSharedDBPoolNotProvisioning  = errors.New("shared db pool is not provisioning")
+	ErrNotFound                        = errors.New("not found")
+	ErrDuplicate                       = errors.New("duplicate entry")
+	ErrStorageQuotaExceeded            = errors.New("tenant storage quota exceeded")
+	ErrFileCountQuotaExceeded          = errors.New("tenant file count quota exceeded")
+	ErrReservationAlreadyExists        = errors.New("upload reservation already exists")
+	ErrQuotaReservationBusy            = errors.New("quota reservation busy")
+	ErrTiDBCloudFreeQuotaBusy          = errors.New("free tenant quota check is busy; retry later")
+	ErrTiDBCloudFreeTenantLimitReached = errors.New("free TiDB Cloud tenant limit reached")
+	ErrSharedDBPoolIdentityConflict    = errors.New("shared db pool physical identity changed after provisioning started")
+	ErrSharedDBPoolNotProvisioning     = errors.New("shared db pool is not provisioning")
 )
 
 type TenantStatus string
@@ -377,6 +379,10 @@ const tidbCloudOrgBindingLockTimeoutSeconds = 90
 const tidbCloudOrgBindingReleaseLockTimeout = 5 * time.Second
 const tenantPoolLockTimeoutSeconds = 300
 const tenantPoolReleaseLockTimeout = 5 * time.Second
+
+var tidbCloudFreeQuotaLockTimeoutSeconds = 5
+
+const tidbCloudFreeQuotaReleaseLockTimeout = 5 * time.Second
 
 func (s *Store) migrate() (err error) {
 	ctx := context.Background()
@@ -1757,29 +1763,33 @@ func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
 	// fs_registry.tenant_id. The deadlock victim retries cleanly.
 	return withMetaLockConflictRetry(ctx, "insert_tenant", func() error {
 		return s.InTx(ctx, func(tx *sql.Tx) error {
-			_, err := tx.ExecContext(ctx, `INSERT INTO tenants
-			(id, status, kind, parent_tenant_id, storage_namespace_id, db_host, db_port, db_user, db_password, db_name, db_tls,
-			 provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
-			 s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				t.ID, t.Status, tenantKindForInsert(t), t.ParentTenantID, t.StorageNamespaceID,
-				t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
-				t.Provider, nullStr(t.ClusterID), t.BranchID, nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
-				tenantS3EncryptionModeForInsert(t), t.S3KMSKeyID, boolToInt(tenantS3BucketKeyEnabledForInsert(t)),
-				t.CreatedAt.UTC(), t.UpdatedAt.UTC())
-			if isDuplicateEntry(err) {
-				return ErrDuplicate
-			}
-			if err != nil {
-				return err
-			}
-			// Every tenant gets a stable internal fs_id at creation time (see
-			// fs_registry). INSERT IGNORE keeps this idempotent for tenants that
-			// were pre-registered by BackfillFsRegistry.
-			_, err = tx.ExecContext(ctx, `INSERT IGNORE INTO fs_registry (tenant_id) VALUES (?)`, t.ID)
-			return err
+			return insertTenantTx(ctx, tx, t)
 		})
 	})
+}
+
+func insertTenantTx(ctx context.Context, tx *sql.Tx, t *Tenant) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO tenants
+		(id, status, kind, parent_tenant_id, storage_namespace_id, db_host, db_port, db_user, db_password, db_name, db_tls,
+		 provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
+		 s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Status, tenantKindForInsert(t), t.ParentTenantID, t.StorageNamespaceID,
+		t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
+		t.Provider, nullStr(t.ClusterID), t.BranchID, nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
+		tenantS3EncryptionModeForInsert(t), t.S3KMSKeyID, boolToInt(tenantS3BucketKeyEnabledForInsert(t)),
+		t.CreatedAt.UTC(), t.UpdatedAt.UTC())
+	if isDuplicateEntry(err) {
+		return ErrDuplicate
+	}
+	if err != nil {
+		return err
+	}
+	// Every tenant gets a stable internal fs_id at creation time (see
+	// fs_registry). INSERT IGNORE keeps this idempotent for tenants that were
+	// pre-registered by BackfillFsRegistry.
+	_, err = tx.ExecContext(ctx, `INSERT IGNORE INTO fs_registry (tenant_id) VALUES (?)`, t.ID)
+	return err
 }
 
 func (s *Store) UpsertTenantAutoEmbeddingProfile(ctx context.Context, p *TenantAutoEmbeddingProfile) (err error) {
@@ -2305,7 +2315,7 @@ func (s *Store) countFreeTenantPoolBindingsByStatus(ctx context.Context, organiz
 	}
 	row := s.db.QueryRowContext(ctx, fmt.Sprintf(countFreeTenantPoolBindingsSQL, placeholders, placeholders), args...)
 	if err = row.Scan(&out); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("count free tidbcloud pool bindings for organization %s: %w", organizationID, err)
 	}
 	return out, nil
 }
@@ -2450,6 +2460,18 @@ func (s *Store) listFreeTenantPoolBindings(ctx context.Context, organizationID s
 }
 
 func (s *Store) ClaimOldestFreeTenantPoolBinding(ctx context.Context, organizationID string) (out *TenantWithTiDBCloudOrgBinding, err error) {
+	return s.claimFreeTenantPoolBinding(ctx, organizationID, "", QuotaConfigPatch{})
+}
+
+func (s *Store) ClaimFreeTenantPoolBinding(ctx context.Context, organizationID, tenantID string, quota QuotaConfigPatch) (out *TenantWithTiDBCloudOrgBinding, err error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant_id is required")
+	}
+	return s.claimFreeTenantPoolBinding(ctx, organizationID, tenantID, quota)
+}
+
+func (s *Store) claimFreeTenantPoolBinding(ctx context.Context, organizationID, tenantID string, quota QuotaConfigPatch) (out *TenantWithTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "claim_free_tidbcloud_pool_binding", start, &err)
 	organizationID = strings.TrimSpace(organizationID)
@@ -2466,13 +2488,24 @@ func (s *Store) ClaimOldestFreeTenantPoolBinding(ctx context.Context, organizati
 			FROM tenant_tidbcloud_org_bindings b
 			JOIN tenants t ON t.id = b.tenant_id
 				WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
-					AND t.status = ?
+					AND t.status = ?`
+		args := []any{organizationID, TenantPoolBindingFree, tidbCloudNativeProvider, TenantActive}
+		if tenantID != "" {
+			query += ` AND t.id = ?`
+			args = append(args, tenantID)
+		}
+		query += `
 				ORDER BY b.created_at ASC, b.tenant_id ASC
 				LIMIT 1 FOR UPDATE`
-		row := tx.QueryRowContext(ctx, query, organizationID, TenantPoolBindingFree, tidbCloudNativeProvider, TenantActive)
+		row := tx.QueryRowContext(ctx, query, args...)
 		rec, scanErr := scanTenantBindingRow(row)
 		if scanErr != nil {
 			return scanErr
+		}
+		if quota.AnySet() {
+			if err := upsertTenantQuotaPatchTx(ctx, tx, rec.Tenant.ID, quota); err != nil {
+				return err
+			}
 		}
 		now := time.Now().UTC()
 		res, execErr := tx.ExecContext(ctx, `UPDATE tenant_tidbcloud_org_bindings
@@ -2641,6 +2674,31 @@ func (s *Store) UpdateTenantPoolBindingStatus(ctx context.Context, tenantID stri
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (s *Store) ReleaseTenantPoolClaim(ctx context.Context, tenantID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "release_tidbcloud_pool_claim", start, &err)
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return fmt.Errorf("tenant_id is required")
+	}
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE tenant_tidbcloud_org_bindings
+			SET pool_status = ?, used_at = NULL, updated_at = ?
+			WHERE tenant_id = ? AND pool_status = ?`,
+			TenantPoolBindingFree, time.Now().UTC(), tenantID, TenantPoolBindingUsed)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(res); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_quota_config WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (s *Store) MarkFreeTenantPoolTenantDeleting(ctx context.Context, tenantID string, from TenantStatus) (updated bool, err error) {
@@ -3722,6 +3780,29 @@ func (s *Store) UpdateTenantStatusIf(ctx context.Context, id string, from, to Te
 	return updated, nil
 }
 
+func (s *Store) FinalizeTenantConnection(ctx context.Context, id string, from, to TenantStatus, cluster *Tenant) (updated bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "finalize_tenant_connection", start, &err)
+	if cluster == nil {
+		return false, fmt.Errorf("tenant connection is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants
+		SET status = ?, db_host = ?, db_port = ?, db_user = ?, db_password = ?, db_name = ?, db_tls = ?,
+			provider = ?, cluster_id = ?, branch_id = ?, claim_url = ?, claim_expires_at = ?, updated_at = ?
+		WHERE id = ? AND status = ?`,
+		to, cluster.DBHost, cluster.DBPort, cluster.DBUser, cluster.DBPasswordCipher, cluster.DBName, boolToInt(cluster.DBTLS),
+		cluster.Provider, nullStr(cluster.ClusterID), cluster.BranchID, nullStr(cluster.ClaimURL), cluster.ClaimExpiresAt,
+		time.Now().UTC(), id, from)
+	if err != nil {
+		return false, fmt.Errorf("finalize tenant connection: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read finalized tenant rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
 func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *Tenant) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_connection", start, &err)
@@ -3744,6 +3825,60 @@ func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *
 	}
 	s.apiKeys.evictTenant(id)
 	return nil
+}
+
+func (s *Store) PersistTiDBCloudTenantClusterReference(ctx context.Context, id, organizationID string, cluster *Tenant) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "persist_tidbcloud_tenant_cluster_reference", start, &err)
+	id = strings.TrimSpace(id)
+	organizationID = strings.TrimSpace(organizationID)
+	if id == "" || organizationID == "" {
+		return fmt.Errorf("tenant id and tidbcloud organization id are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return fmt.Errorf("tenant cluster reference is required")
+	}
+	clusterID := strings.TrimSpace(cluster.ClusterID)
+	branchID := strings.TrimSpace(cluster.BranchID)
+	return s.withTiDBCloudOrgBindingLock(ctx, organizationID, clusterID, branchID, func(ctx context.Context, q metaQueryExecer) error {
+		conn, ok := q.(*sql.Conn)
+		if !ok {
+			return fmt.Errorf("tidbcloud org binding lock connection is unavailable")
+		}
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := deleteStaleTiDBCloudOrgBindingConflicts(ctx, tx, id, organizationID, clusterID, branchID); err != nil {
+			return err
+		}
+		if err := ensureTiDBCloudOrgBindingAvailable(ctx, tx, id, organizationID, clusterID, branchID); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		res, err := tx.ExecContext(ctx, `UPDATE tenants
+			SET provider = ?, cluster_id = ?, branch_id = ?, claim_url = ?, claim_expires_at = ?, updated_at = ?
+			WHERE id = ? AND status = ?`,
+			cluster.Provider, clusterID, branchID, nullStr(cluster.ClaimURL), cluster.ClaimExpiresAt, now, id, TenantPending)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(res); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO tenant_tidbcloud_org_bindings
+			(tenant_id, organization_id, cluster_id, branch_id, pool_id, pool_status, used_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, '', ?, NULL, ?, ?)
+			ON DUPLICATE KEY UPDATE
+				organization_id = VALUES(organization_id), cluster_id = VALUES(cluster_id), branch_id = VALUES(branch_id),
+				pool_id = '', pool_status = VALUES(pool_status), used_at = NULL, updated_at = VALUES(updated_at)`,
+			id, organizationID, clusterID, branchID, TenantPoolBindingUsed, now, now)
+		if err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 }
 
 func (s *Store) UpdateTenantClusterReference(ctx context.Context, id string, cluster *Tenant) (err error) {

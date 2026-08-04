@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	neturl "net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/mem9-ai/drive9/internal/testmysql"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
@@ -40,6 +42,7 @@ type quotaTestProvisioner struct {
 	getCalls                    atomic.Int32
 	listCalls                   atomic.Int32
 	iamCalls                    atomic.Int32
+	billingCalls                atomic.Int32
 	deprovisionCalls            atomic.Int32
 	batchPoolCalls              atomic.Int32
 	markPoolUsedCalls           atomic.Int32
@@ -56,7 +59,10 @@ type quotaTestProvisioner struct {
 	listPages                   []*tenant.ManagedClusterListResult
 	iamIdentities               []*tenant.TiDBCloudAPIKeyIdentity
 	iamErr                      error
+	billingErr                  error
+	billingFree                 bool
 	batchPoolErr                error
+	markPoolUsedErr             error
 	batchPoolOmitConnectionInfo bool
 	batchPoolEmptyPassword      bool
 	batchPoolMissingOrg         map[int]bool
@@ -193,6 +199,17 @@ func (p *quotaTestProvisioner) ResolveAPIKeyIdentity(_ context.Context, req tena
 		return &out, nil
 	}
 	return &tenant.TiDBCloudAPIKeyIdentity{OrganizationID: "org-1", Role: tenant.TiDBCloudRoleOrgOwner}, nil
+}
+
+func (p *quotaTestProvisioner) ResolveOrganizationPlan(_ context.Context, organizationID string, _ tenant.CredentialProvisionRequest) (*tenant.TiDBCloudOrganizationPlan, error) {
+	p.billingCalls.Add(1)
+	if p.billingErr != nil {
+		return nil, p.billingErr
+	}
+	return &tenant.TiDBCloudOrganizationPlan{
+		OrganizationID: organizationID,
+		IsFree:         p.billingFree,
+	}, nil
 }
 
 func (p *quotaTestProvisioner) DefaultSharedCredentials() (tenant.CredentialProvisionRequest, bool) {
@@ -354,6 +371,9 @@ func (p *quotaTestProvisioner) WaitForPoolClustersMetadata(_ context.Context, cl
 func (p *quotaTestProvisioner) MarkClusterPoolUsed(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, _ time.Time, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
 	p.markPoolUsedCalls.Add(1)
 	p.recordCall("mark_pool_used", req, cluster, &opts)
+	if p.markPoolUsedErr != nil {
+		return nil, p.markPoolUsedErr
+	}
 	if p.cloudCfg != nil {
 		return p.cloudCfg, nil
 	}
@@ -495,6 +515,102 @@ func newQuotaRuntimeWithOptions(t *testing.T, provider string, opts quotaRuntime
 		DefaultTenantProvider: opts.defaultTenantProvider, TokenSecret: tokenSecret})
 	t.Cleanup(server.Close)
 	return &quotaRuntime{meta: db.Meta, tenantID: tenantID, apiKey: apiKey, prov: prov, server: server}
+}
+
+func tiDBCloudRBACRoleRequestsForPath(t *testing.T, path string) int64 {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	var total int64
+	for _, line := range strings.Split(recorder.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "drive9_tidbcloud_rbac_cache_requests_total{") ||
+			!strings.Contains(line, `path="`+path+`"`) ||
+			!strings.Contains(line, `scope="role"`) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			t.Fatalf("unexpected RBAC metric line %q", line)
+		}
+		value, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			t.Fatalf("parse RBAC metric line %q: %v", line, err)
+		}
+		total += value
+	}
+	return total
+}
+
+func TestAdminTenantGetResolvesTiDBCloudAccessOncePerRequest(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	before := tiDBCloudRBACRoleRequestsForPath(t, "admin_tenant_get")
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/admin/tenants/"+rt.tenantID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(quotaPublicKeyHeader, "public-1")
+	req.Header.Set(quotaPrivateKeyHeader, "private-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	after := tiDBCloudRBACRoleRequestsForPath(t, "admin_tenant_get")
+	if got := after - before; got != 1 {
+		t.Fatalf("RBAC role resolutions = %d, want 1", got)
+	}
+}
+
+func TestQuotaSetResolvesTiDBCloudAccessOncePerRequest(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	before := tiDBCloudRBACRoleRequestsForPath(t, "quota_set")
+	body := fmt.Sprintf(`{"tenant_id":%q,"public_key":"public-1","private_key":"private-1","max_file_count":10}`, rt.tenantID)
+	resp, err := http.Post(ts.URL+"/v1/quota", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
+	}
+	after := tiDBCloudRBACRoleRequestsForPath(t, "quota_set")
+	if got := after - before; got != 1 {
+		t.Fatalf("RBAC role resolutions = %d, want 1", got)
+	}
+}
+
+func TestApplyQuotaSetDoesNotRecordHandlerLevelTiDBCloudOpenAPIMetrics(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	tenantRow, err := rt.meta.GetTenant(context.Background(), rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendingLimit := int64(0)
+	err = rt.server.applyQuotaSet(context.Background(), "metric_duplicate_test", tenantRow, tenant.CredentialProvisionRequest{
+		PublicKey: "public-1", PrivateKey: "private-1",
+	}, quotaRequest{quotaFields: quotaFields{TiDBCloudSpendingLimit: &spendingLimit}})
+	if err != nil {
+		t.Fatalf("applyQuotaSet: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	for _, operation := range []string{"mark_quota_update_started", "update_quota"} {
+		if strings.Contains(rec.Body.String(), `api="metric_duplicate_test",operation="`+operation+`"`) {
+			t.Fatalf("quota handler double-counted TiDB Cloud OpenAPI operation %q:\n%s", operation, rec.Body.String())
+		}
+	}
 }
 
 func TestQuotaGetRejectsDrive9Key(t *testing.T) {
@@ -1451,6 +1567,78 @@ func TestAdminTenantListReturnsEmptyForIAMOrganizationWithoutTenants(t *testing.
 	}
 	if got := rt.prov.listCalls.Load(); got != 0 {
 		t.Fatalf("cluster list calls = %d, want 0", got)
+	}
+}
+
+func TestFreeTiDBCloudOrganizationRejectsEveryAdminAndQuotaMutation(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.billingFree = true
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	tests := []struct {
+		name        string
+		method      string
+		path        string
+		body        string
+		headers     bool
+		wantMessage string
+	}{
+		{name: "admin create", method: http.MethodPost, path: "/v1/admin/tenants", body: `{"public_key":"public-1","private_key":"private-1"}`, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "admin list", method: http.MethodGet, path: "/v1/admin/tenants", headers: true, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "admin get", method: http.MethodGet, path: "/v1/admin/tenants/" + rt.tenantID, headers: true, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "admin delete", method: http.MethodDelete, path: "/v1/admin/tenants/" + rt.tenantID, body: `{"public_key":"public-1","private_key":"private-1"}`, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "admin quota", method: http.MethodPost, path: "/v1/admin/tenants/" + rt.tenantID + "/quota", body: `{"public_key":"public-1","private_key":"private-1","max_file_count":10}`, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "pool create", method: http.MethodPost, path: "/v1/admin/tenant-pool", body: `{"public_key":"public-1","private_key":"private-1","pool_size":1}`, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "pool get", method: http.MethodGet, path: "/v1/admin/tenant-pool", headers: true, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "pool update", method: http.MethodPatch, path: "/v1/admin/tenant-pool", body: `{"public_key":"public-1","private_key":"private-1","pool_size":1}`, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "pool delete", method: http.MethodDelete, path: "/v1/admin/tenant-pool", body: `{"public_key":"public-1","private_key":"private-1"}`, wantMessage: tenant.ErrTiDBCloudFreeAdminForbidden.Error()},
+		{name: "quota mutation", method: http.MethodPost, path: "/v1/quota", body: fmt.Sprintf(`{"tenant_id":%q,"public_key":"public-1","private_key":"private-1","max_file_count":10}`, rt.tenantID), wantMessage: tenant.ErrTiDBCloudFreeQuotaMutationForbidden.Error()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(tt.method, ts.URL+tt.path, strings.NewReader(tt.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.headers {
+				req.Header.Set(quotaPublicKeyHeader, "public-1")
+				req.Header.Set(quotaPrivateKeyHeader, "private-1")
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusForbidden || strings.TrimSpace(string(body)) != fmt.Sprintf(`{"error":%q}`, tt.wantMessage) {
+				t.Fatalf("response = %d %s, want 403 %q", resp.StatusCode, body, tt.wantMessage)
+			}
+		})
+	}
+	if got := rt.prov.billingCalls.Load(); got != int32(len(tests)) {
+		t.Fatalf("Billing calls = %d, want one uncached free lookup per request (%d)", got, len(tests))
+	}
+	if got := rt.prov.updateCalls.Load() + rt.prov.markCalls.Load() + rt.prov.batchPoolCalls.Load(); got != 0 {
+		t.Fatalf("cloud mutation calls after free rejection = %d, want 0", got)
+	}
+}
+
+func TestFreeTiDBCloudOrganizationCanReadQuota(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.billingFree = true
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := getQuota(t, ts.URL, rt.tenantID, "", "", rt.apiKey)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("quota read status = %d, want 200: %s", resp.StatusCode, body)
 	}
 }
 

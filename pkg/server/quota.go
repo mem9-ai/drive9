@@ -239,6 +239,11 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	access, err := s.authorizeTiDBCloudQuotaMutation(r.Context(), cred, "quota_set")
+	if err != nil {
+		writeQuotaSetError(w, r.Context(), err, "authorize")
+		return
+	}
 	if err := s.validateQuotaSetRequest(req); err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
@@ -257,7 +262,7 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 	}
 	var sharedPhysical *meta.SharedDB
 	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
-		physical, err := s.authorizeSharedQuotaCredentials(r.Context(), t, cred, "quota_set")
+		physical, err := s.authorizeSharedQuotaOrganization(r.Context(), t, access.OrganizationID)
 		if err != nil {
 			writeQuotaSetError(w, r.Context(), err, "authorize")
 			return
@@ -268,7 +273,7 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		}
 		sharedPhysical = physical
 	} else {
-		if _, err := s.authorizeNativeTenantCredentials(r.Context(), t, cred, "quota_set"); err != nil {
+		if _, err := s.authorizeNativeTenantOrganization(r.Context(), t, access.OrganizationID); err != nil {
 			writeQuotaSetError(w, r.Context(), err, "authorize")
 			return
 		}
@@ -297,8 +302,26 @@ func (s *Server) authorizeSharedQuotaCredentials(ctx context.Context, t *meta.Te
 		}
 		return nil, fmt.Errorf("get shared DB for tenant: %w", err)
 	}
-	if _, err := s.authorizeTiDBCloudOrganization(ctx, cred, physical.TiDBCloudOrganizationID, metricPath); err != nil {
+	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, metricPath)
+	if err != nil {
 		return nil, err
+	}
+	if !tiDBCloudOrganizationMatches(identity.OrganizationID, physical.TiDBCloudOrganizationID) {
+		return nil, tenant.ErrQuotaPermissionDenied
+	}
+	return physical, nil
+}
+
+func (s *Server) authorizeSharedQuotaOrganization(ctx context.Context, t *meta.Tenant, organizationID string) (*meta.SharedDB, error) {
+	physical, err := s.meta.GetSharedDBForTenant(ctx, t.ID)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			return nil, tenant.ErrQuotaBackendNotFound
+		}
+		return nil, fmt.Errorf("get shared DB for tenant: %w", err)
+	}
+	if !tiDBCloudOrganizationMatches(organizationID, physical.TiDBCloudOrganizationID) {
+		return nil, tenant.ErrQuotaPermissionDenied
 	}
 	return physical, nil
 }
@@ -610,6 +633,11 @@ func writeQuotaCredentialError(w http.ResponseWriter, ctx context.Context, err e
 }
 
 func writeQuotaSetError(w http.ResponseWriter, ctx context.Context, err error, action string) {
+	if isTiDBCloudBillingLookupError(err) {
+		status, msg := tiDBCloudBillingErrorResponse(err)
+		errJSON(w, status, msg)
+		return
+	}
 	if status, msg, ok := quotaSetErrorStatusMessage(err, action); ok {
 		if errors.Is(err, errQuotaLocalUpdateFailed) {
 			logger.Warn(ctx, "drive9_quota_update_failed", zap.String("action", action), zap.Error(err))
@@ -622,6 +650,8 @@ func writeQuotaSetError(w http.ResponseWriter, ctx context.Context, err error, a
 
 func quotaSetErrorStatusMessage(err error, action string) (int, string, bool) {
 	switch {
+	case errors.Is(err, tenant.ErrTiDBCloudFreeQuotaMutationForbidden):
+		return http.StatusForbidden, tenant.ErrTiDBCloudFreeQuotaMutationForbidden.Error(), true
 	case errors.Is(err, errQuotaSettingNotEnabled):
 		return http.StatusNotFound, "quota setting not enabled", true
 	case errors.Is(err, errQuotaLocalUpdateFailed):

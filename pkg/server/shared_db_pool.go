@@ -239,7 +239,7 @@ func (s *Server) sharedTenantQuotaConfig(tenantID string, opts provisionTenantOp
 		TenantID:               tenantID,
 		MaxStorageBytes:        meta.DefaultMaxStorageBytes(),
 		MaxFileSizeBytes:       meta.DefaultMaxFileSizeBytes(),
-		MaxFileCount:           0,
+		MaxFileCount:           meta.DefaultMaxFileCount(),
 		MaxMediaLLMFiles:       meta.DefaultMaxMediaLLMFiles(),
 		MaxVideoLLMFiles:       meta.DefaultMaxVideoLLMFiles(),
 		TiDBCloudSpendingLimit: &virtualLimit,

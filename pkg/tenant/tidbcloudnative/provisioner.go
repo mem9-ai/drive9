@@ -3,6 +3,7 @@
 package tidbcloudnative
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/rand"
@@ -36,6 +37,7 @@ import (
 const (
 	EnvTiDBCloudNativeAPIURL                  = "DRIVE9_TIDBCLOUD_NATIVE_API_URL"
 	EnvTiDBCloudIAMAPIURL                     = "DRIVE9_TIDBCLOUD_IAM_API_URL"
+	EnvTiDBCloudBillingAPIURL                 = "DRIVE9_TIDBCLOUD_BILLING_API_URL"
 	EnvTiDBCloudNativeCloudProvider           = "DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER"
 	EnvTiDBCloudNativeRegion                  = "DRIVE9_TIDBCLOUD_NATIVE_REGION"
 	EnvTiDBCloudNativeDefaultDatabaseName     = "DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME"
@@ -75,6 +77,9 @@ const (
 
 	upstreamErrorBodyLimit   = 2048
 	upstreamClusterBodyLimit = 1 << 20
+
+	tidbCloudAPIBilling                   = "billing"
+	tidbCloudOperationGetOrganizationPlan = "get_organization_plan"
 )
 
 var (
@@ -86,6 +91,7 @@ var (
 
 var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 var displayNameCharPattern = regexp.MustCompile(`[^A-Za-z0-9-]`)
+var decimalPattern = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$`)
 
 var (
 	ensureDatabaseFunc                        = ensureDatabase
@@ -98,6 +104,7 @@ var (
 type Provisioner struct {
 	apiURL                      string
 	iamURL                      string
+	billingURL                  string
 	cloudProvider               string
 	region                      string
 	defaultDatabaseName         string
@@ -110,6 +117,7 @@ type Provisioner struct {
 	privateEndpointHostMap      map[string]string
 	tencentPrivateEndpointHost  string
 	alicloudPrivateEndpointHost string
+	client                      *http.Client
 	// clusters is the TiDB Cloud control-plane backend (HTTP OpenAPI or Local Docker).
 	// When nil, api() builds an HTTPClustersAPI from apiURL/iamURL (tests).
 	clusters ClustersAPI
@@ -179,6 +187,7 @@ func NewProvisionerFromEnv(providerType string) (*Provisioner, error) {
 
 	switch backend {
 	case "local":
+		p.client = httpClient
 		if p.cloudProvider == "" {
 			p.cloudProvider = cloudProviderAWS
 		}
@@ -196,24 +205,34 @@ func NewProvisionerFromEnv(providerType string) (*Provisioner, error) {
 	case "http":
 		apiURL := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeAPIURL))
 		iamURL := strings.TrimSpace(os.Getenv(EnvTiDBCloudIAMAPIURL))
-		if apiURL == "" || iamURL == "" || cloudProvider == "" || region == "" {
-			return nil, fmt.Errorf("%s, %s, %s and %s are required", EnvTiDBCloudNativeAPIURL, EnvTiDBCloudIAMAPIURL, EnvTiDBCloudNativeCloudProvider, EnvTiDBCloudNativeRegion)
+		billingURL := strings.TrimSpace(os.Getenv(EnvTiDBCloudBillingAPIURL))
+		if apiURL == "" || iamURL == "" || billingURL == "" || cloudProvider == "" || region == "" {
+			return nil, fmt.Errorf("%s, %s, %s, %s and %s are required", EnvTiDBCloudNativeAPIURL, EnvTiDBCloudIAMAPIURL, EnvTiDBCloudBillingAPIURL, EnvTiDBCloudNativeCloudProvider, EnvTiDBCloudNativeRegion)
 		}
-		parsedAPIURL, err := url.Parse(apiURL)
-		if err != nil || parsedAPIURL.Scheme != "https" || parsedAPIURL.Host == "" {
+		if !validTiDBCloudBaseURL(apiURL) {
 			return nil, fmt.Errorf("%s must be a valid https URL", EnvTiDBCloudNativeAPIURL)
 		}
-		parsedIAMURL, err := url.Parse(iamURL)
-		if err != nil || parsedIAMURL.Scheme != "https" || parsedIAMURL.Host == "" {
+		if !validTiDBCloudBaseURL(iamURL) {
 			return nil, fmt.Errorf("%s must be a valid https URL", EnvTiDBCloudIAMAPIURL)
+		}
+		if !validTiDBCloudBaseURL(billingURL) {
+			return nil, fmt.Errorf("%s must be a valid https URL", EnvTiDBCloudBillingAPIURL)
 		}
 		p.apiURL = strings.TrimRight(apiURL, "/")
 		p.iamURL = strings.TrimRight(iamURL, "/")
+		p.billingURL = strings.TrimRight(billingURL, "/")
+		p.client = httpClient
 		p.clusters = NewHTTPClustersAPI(p.apiURL, p.iamURL, httpClient)
 		return p, nil
 	default:
 		return nil, unexpectedBackend(backend)
 	}
+}
+
+func validTiDBCloudBaseURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	return err == nil && !strings.ContainsAny(rawURL, "?#") && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil &&
+		parsed.RawQuery == "" && parsed.Fragment == "" && parsed.Opaque == ""
 }
 
 // api returns the control-plane backend. Tests may set apiURL/iamURL without
@@ -225,7 +244,11 @@ func (p *Provisioner) api() ClustersAPI {
 	if p.clusters != nil {
 		return p.clusters
 	}
-	return NewHTTPClustersAPI(p.apiURL, p.iamURL, &http.Client{Timeout: 60 * time.Second})
+	client := p.client
+	if client == nil {
+		client = &http.Client{Timeout: 60 * time.Second}
+	}
+	return NewHTTPClustersAPI(p.apiURL, p.iamURL, client)
 }
 
 func (p *Provisioner) ProviderType() string { return tenant.ProviderTiDBCloudNative }
@@ -251,22 +274,183 @@ func (p *Provisioner) DefaultSharedCredentials() (tenant.CredentialProvisionRequ
 	}, true
 }
 
-// ValidateSharedCredentials verifies the server-owned shared credential once
-// during startup. Shared credentials are independent from customer IAM
-// authorization and are never placed in the server's customer RBAC cache.
-func (p *Provisioner) ValidateSharedCredentials(ctx context.Context) error {
+// ValidateSharedAccess verifies the server-owned shared credential and its
+// non-free Billing plan once during startup. This direct validation is
+// independent from customer request caches, which do not exist yet.
+func (p *Provisioner) ValidateSharedAccess(ctx context.Context) error {
 	cred, ok := p.DefaultSharedCredentials()
 	if !ok {
 		return fmt.Errorf("shared TiDB Cloud credentials are not configured")
 	}
-	if _, err := p.ResolveAPIKeyIdentity(ctx, cred); err != nil {
+	identity, err := p.ResolveAPIKeyIdentity(ctx, cred)
+	if err != nil {
 		return fmt.Errorf("validate shared TiDB Cloud credentials: %w", err)
+	}
+	plan, err := p.ResolveOrganizationPlan(ctx, identity.OrganizationID, cred)
+	if err != nil {
+		return fmt.Errorf("validate shared TiDB Cloud Billing access: %w", err)
+	}
+	if plan.OrganizationID != identity.OrganizationID {
+		return fmt.Errorf("validate shared TiDB Cloud Billing access: %w", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+	if plan.IsFree {
+		return fmt.Errorf("shared TiDB Cloud organization must be non-free")
 	}
 	return nil
 }
 
 func (p *Provisioner) ResolveAPIKeyIdentity(ctx context.Context, req tenant.CredentialProvisionRequest) (*tenant.TiDBCloudAPIKeyIdentity, error) {
 	return p.api().ResolveAPIKey(ctx, strings.TrimSpace(req.PublicKey), strings.TrimSpace(req.PrivateKey))
+}
+
+func (p *Provisioner) doObservedDigestAuthRequest(ctx context.Context, api, operation, publicKey, privateKey, method, uri string, body []byte) (*http.Response, error) {
+	client := p.client
+	if client == nil {
+		client = &http.Client{Timeout: 60 * time.Second}
+	}
+	req, err := http.NewRequestWithContext(ctx, method, uri, bytes.NewReader(body))
+	if err != nil {
+		recordTiDBCloudOpenAPIRequest(api, operation, tidbCloudResultProtocolError)
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		err = redactRequestError(err, uri)
+		recordTiDBCloudOpenAPIRequest(api, operation, tiDBCloudRequestErrorResult(err))
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		return resp, nil
+	}
+	_ = resp.Body.Close()
+	nonce, realm, qop := parseDigestChallenge(resp.Header.Get("WWW-Authenticate"))
+	if nonce == "" {
+		recordTiDBCloudOpenAPIRequest(api, operation, tidbCloudResultDigestError)
+		return nil, fmt.Errorf("invalid digest challenge")
+	}
+	auth, err := buildDigestAuth(publicKey, privateKey, method, uri, nonce, realm, qop)
+	if err != nil {
+		recordTiDBCloudOpenAPIRequest(api, operation, tidbCloudResultDigestError)
+		return nil, err
+	}
+	req, err = http.NewRequestWithContext(ctx, method, uri, bytes.NewReader(body))
+	if err != nil {
+		recordTiDBCloudOpenAPIRequest(api, operation, tidbCloudResultProtocolError)
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", auth)
+	resp, err = client.Do(req)
+	if err != nil {
+		err = redactRequestError(err, uri)
+		recordTiDBCloudOpenAPIRequest(api, operation, tiDBCloudRequestErrorResult(err))
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (p *Provisioner) ResolveOrganizationPlan(ctx context.Context, organizationID string, req tenant.CredentialProvisionRequest) (*tenant.TiDBCloudOrganizationPlan, error) {
+	organizationID = strings.TrimSpace(organizationID)
+	if _, ok := p.clusters.(*LocalClustersAPI); ok {
+		if organizationID != localOrgID {
+			return nil, fmt.Errorf("%w: organization mismatch", tenant.ErrTiDBCloudBillingResponseInvalid)
+		}
+		return &tenant.TiDBCloudOrganizationPlan{OrganizationID: organizationID, IsFree: false}, nil
+	}
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	if organizationID == "" {
+		return nil, fmt.Errorf("%w: organization is required", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+	endpoint := fmt.Sprintf("%s/v1beta1/tenants/%s/plans", p.billingURL, url.PathEscape(organizationID))
+	resp, err := p.doObservedDigestAuthRequest(ctx, tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, publicKey, privateKey, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", tenant.ErrTiDBCloudBillingUnavailable, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		recordTiDBCloudHTTPResponse(tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, resp.StatusCode, true)
+		_, _ = readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		return nil, statusError(tenant.TiDBCloudAPIServiceBilling, "Billing plan lookup", resp.StatusCode, "")
+	}
+	raw, err := readUpstreamBody(resp.Body, upstreamClusterBodyLimit+1)
+	if err != nil {
+		recordTiDBCloudHTTPResponse(tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, resp.StatusCode, false)
+		return nil, fmt.Errorf("%w: read response", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+	if len(raw) > upstreamClusterBodyLimit {
+		recordTiDBCloudHTTPResponse(tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, resp.StatusCode, false)
+		return nil, fmt.Errorf("%w: response too large", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+	plan, err := parseOrganizationPlanResponse(raw, organizationID)
+	if err != nil {
+		recordTiDBCloudHTTPResponse(tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, resp.StatusCode, false)
+		return nil, err
+	}
+	recordTiDBCloudHTTPResponse(tidbCloudAPIBilling, tidbCloudOperationGetOrganizationPlan, resp.StatusCode, true)
+	return plan, nil
+}
+
+func parseOrganizationPlanResponse(raw []byte, organizationID string) (*tenant.TiDBCloudOrganizationPlan, error) {
+	var response struct {
+		TenantID      json.RawMessage `json:"tenant_id"`
+		TenantIDStr   string          `json:"tenant_id_str"`
+		EffectivePlan string          `json:"effective_plan"`
+		POCCredits    string          `json:"poc_credits"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&response); err != nil {
+		return nil, fmt.Errorf("%w: malformed JSON", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return nil, fmt.Errorf("%w: trailing JSON", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+
+	identities := make([]string, 0, 2)
+	if value := strings.TrimSpace(response.TenantIDStr); value != "" {
+		identities = append(identities, value)
+	}
+	if len(response.TenantID) > 0 && string(response.TenantID) != "null" {
+		var number json.Number
+		if err := json.Unmarshal(response.TenantID, &number); err != nil || strings.TrimSpace(number.String()) == "" {
+			return nil, fmt.Errorf("%w: invalid numeric organization", tenant.ErrTiDBCloudBillingResponseInvalid)
+		}
+		identities = append(identities, number.String())
+	}
+	if len(identities) == 0 {
+		return nil, fmt.Errorf("%w: organization is missing", tenant.ErrTiDBCloudBillingResponseInvalid)
+	}
+	for _, identity := range identities {
+		if identity != organizationID {
+			return nil, fmt.Errorf("%w: organization mismatch", tenant.ErrTiDBCloudBillingResponseInvalid)
+		}
+	}
+
+	effectivePlan := strings.TrimSpace(response.EffectivePlan)
+	isFree := true
+	switch effectivePlan {
+	case "on_demand":
+		isFree = false
+	case "poc":
+		credits := strings.TrimSpace(response.POCCredits)
+		if !decimalPattern.MatchString(credits) {
+			return nil, fmt.Errorf("%w: invalid POC credits", tenant.ErrTiDBCloudBillingResponseInvalid)
+		}
+		value, ok := new(big.Rat).SetString(credits)
+		if !ok {
+			return nil, fmt.Errorf("%w: invalid POC credits", tenant.ErrTiDBCloudBillingResponseInvalid)
+		}
+		isFree = value.Sign() <= 0
+	}
+	return &tenant.TiDBCloudOrganizationPlan{
+		OrganizationID: organizationID,
+		IsFree:         isFree,
+	}, nil
 }
 
 func (p *Provisioner) ProvisioningRegion() string { return p.region }
@@ -347,12 +531,7 @@ func (p *Provisioner) ValidateCredentialProvisionRequest(req tenant.CredentialPr
 	return err
 }
 
-func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID string, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
-	out, _, err := p.ProvisionWithCredentialsAndQuota(ctx, tenantID, req, tenant.QuotaUpdateOptions{})
-	return out, err
-}
-
-func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
+func (p *Provisioner) CreateClusterWithCredentialsAndQuota(ctx context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
 	publicKey := strings.TrimSpace(req.PublicKey)
 	privateKey := strings.TrimSpace(req.PrivateKey)
 	if publicKey == "" || privateKey == "" {
@@ -402,29 +581,20 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 	if info.ClusterID == "" {
 		return nil, nil, fmt.Errorf("tidbcloud native response missing cluster id")
 	}
-	if p.clusterProvisionMetadataIncomplete(info) {
-		clusterID := info.ClusterID
-		info, err = p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, clusterID)
-		if err != nil {
-			return &tenant.ClusterInfo{
-				TenantID:  tenantID,
-				ClusterID: clusterID,
-				Password:  password,
-				DBName:    dbName,
-				Provider:  tenant.ProviderTiDBCloudNative,
-			}, nil, err
-		}
+	out := &tenant.ClusterInfo{
+		TenantID:       tenantID,
+		ClusterID:      strings.TrimSpace(info.ClusterID),
+		OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
+		Password:       password,
+		DBName:         dbName,
+		Provider:       tenant.ProviderTiDBCloudNative,
 	}
-	out, err := p.clusterInfoFromResponse(tenantID, dbName, password, info)
-	if err != nil {
-		return &tenant.ClusterInfo{
-			TenantID:       tenantID,
-			ClusterID:      info.ClusterID,
-			OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
-			Password:       password,
-			DBName:         dbName,
-			Provider:       tenant.ProviderTiDBCloudNative,
-		}, nil, err
+	if !p.clusterProvisionMetadataIncomplete(info) {
+		ready, convertErr := p.clusterInfoFromResponse(tenantID, dbName, password, info)
+		if convertErr != nil {
+			return out, nil, convertErr
+		}
+		out = ready
 	}
 	cloudCfg := &tenant.QuotaCloudConfig{
 		Labels: map[string]string{
@@ -436,6 +606,30 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(*spendingLimit)
 	}
 	return out, cloudCfg, nil
+}
+
+func (p *Provisioner) WaitForClusterMetadataWithCredentials(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return cluster, fmt.Errorf("public_key and private_key are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return cluster, fmt.Errorf("tidbcloud native cluster id is required")
+	}
+	if strings.TrimSpace(cluster.Host) != "" && cluster.Port > 0 && strings.TrimSpace(cluster.Username) != "" && strings.TrimSpace(cluster.OrganizationID) != "" {
+		out := *cluster
+		return &out, nil
+	}
+	info, err := p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, strings.TrimSpace(cluster.ClusterID))
+	if err != nil {
+		return cluster, err
+	}
+	out, err := p.clusterInfoFromResponse(cluster.TenantID, cluster.DBName, cluster.Password, info)
+	if err != nil {
+		return cluster, err
+	}
+	return out, nil
 }
 
 func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx context.Context, tenantIDs []string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) ([]*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
@@ -637,12 +831,14 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 		info := &createdClusters[i]
 		parsedUUID, err := uuid.Parse(strings.TrimSpace(info.Labels[Drive9DBPoolUUIDLabel]))
 		if err != nil {
-			return nil, fmt.Errorf("tidbcloud native shared batch response has invalid %s label for cluster %q", Drive9DBPoolUUIDLabel, info.ClusterID)
+			partialErr = errors.Join(partialErr, fmt.Errorf("tidbcloud native shared batch response has invalid %s label for cluster %q", Drive9DBPoolUUIDLabel, info.ClusterID))
+			continue
 		}
 		poolUUID := parsedUUID.String()
 		input, ok := inputsByUUID[poolUUID]
 		if !ok {
-			return nil, fmt.Errorf("tidbcloud native shared batch response returned unknown db pool uuid %s", poolUUID)
+			partialErr = errors.Join(partialErr, fmt.Errorf("tidbcloud native shared batch response returned unknown db pool uuid %s", poolUUID))
+			continue
 		}
 		result := &tenant.SharedDBPoolInfo{
 			DBPoolID: input.DBPoolID, DBPoolUUID: poolUUID, ClusterID: strings.TrimSpace(info.ClusterID),
@@ -650,12 +846,14 @@ func (p *Provisioner) BatchProvisionSharedDBPoolsWithCredentials(ctx context.Con
 			Password:       input.RootPassword, DBName: databaseNames[poolUUID],
 		}
 		if result.ClusterID == "" {
-			return nil, fmt.Errorf("tidbcloud native shared batch response missing cluster id for db pool %s", poolUUID)
+			partialErr = errors.Join(partialErr, fmt.Errorf("tidbcloud native shared batch response missing cluster id for db pool %s", poolUUID))
+			continue
 		}
 		if !p.clusterProvisionMetadataIncomplete(info) {
 			result.Host, result.Port, err = p.resolveClusterEndpoint(info)
 			if err != nil {
-				return nil, err
+				partialErr = errors.Join(partialErr, err)
+				continue
 			}
 			result.Username = strings.TrimSpace(info.UserPrefix) + ".root"
 		}
@@ -1548,10 +1746,6 @@ func (p *Provisioner) listClusterInfosPageWithCredentials(ctx context.Context, p
 	values.Set("filter", filter)
 	clusters, next, err := p.api().ListClusters(ctx, publicKey, privateKey, values)
 	if err != nil {
-		var se *apiStatusError
-		if asAPIStatus(err, &se) {
-			return nil, "", &tidbCloudStatusError{operation: se.op, code: se.code, upstreamBody: se.body}
-		}
 		return nil, "", err
 	}
 	return clusters, strings.TrimSpace(next), nil
@@ -1975,52 +2169,46 @@ func readUpstreamBody(r io.Reader, limit int64) ([]byte, error) {
 	return raw, nil
 }
 
-type tidbCloudStatusError struct {
-	operation    string
-	code         int
-	upstreamBody string
-}
-
-func (e *tidbCloudStatusError) Error() string {
-	if e == nil {
-		return ""
-	}
-	return statusError(e.operation, e.code, e.upstreamBody)
-}
-
 func isTiDBCloudStatus(err error, code int) bool {
-	var statusErr *tidbCloudStatusError
-	return errors.As(err, &statusErr) && statusErr.code == code
+	var statusErr *tenant.TiDBCloudAPIError
+	return errors.As(err, &statusErr) && statusErr != nil && statusErr.StatusCode == code
 }
 
-func statusError(operation string, code int, upstreamBody string) string {
+func statusErrorMessage(operation string, code int, upstreamBody string) string {
 	msg := fmt.Sprintf("tidbcloud native %s status %d", operation, code)
 	if upstreamBody != "" {
-		msg += ": " + upstreamBody
-	} else {
-		switch code {
-		case http.StatusUnauthorized:
-			msg += ": invalid TiDB Cloud API key"
-		case http.StatusForbidden:
-			msg += ": access denied"
-		default:
-			msg += ": upstream error"
-		}
+		return msg + ": " + upstreamBody
 	}
-	return msg
+	switch code {
+	case http.StatusUnauthorized:
+		return msg + ": invalid TiDB Cloud API key"
+	case http.StatusForbidden:
+		return msg + ": access denied"
+	default:
+		return msg + ": upstream error"
+	}
+}
+
+func statusError(service, operation string, code int, upstreamBody string) error {
+	return &tenant.TiDBCloudAPIError{
+		Service:      strings.TrimSpace(service),
+		Operation:    strings.TrimSpace(operation),
+		StatusCode:   code,
+		UpstreamBody: strings.TrimSpace(upstreamBody),
+	}
 }
 
 func quotaStatusError(operation string, code int, upstreamBody string) error {
-	msg := statusError(operation, code, upstreamBody)
+	apiErr := statusError(tenant.TiDBCloudAPIServiceCluster, operation, code, upstreamBody)
 	switch code {
 	case http.StatusUnauthorized:
-		return fmt.Errorf("%w: %s", tenant.ErrQuotaPermissionDenied, msg)
+		return fmt.Errorf("%w: %w", tenant.ErrQuotaPermissionDenied, apiErr)
 	case http.StatusForbidden:
-		return fmt.Errorf("%w: %s", tenant.ErrQuotaPermissionDenied, msg)
+		return fmt.Errorf("%w: %w", tenant.ErrQuotaPermissionDenied, apiErr)
 	case http.StatusNotFound:
-		return fmt.Errorf("%w: %s", tenant.ErrQuotaBackendNotFound, msg)
+		return fmt.Errorf("%w: %w", tenant.ErrQuotaBackendNotFound, apiErr)
 	default:
-		return fmt.Errorf("%s", msg)
+		return apiErr
 	}
 }
 
@@ -2392,6 +2580,10 @@ func requestPath(uri string) string {
 	const iamAPIKeyPath = "/v1beta1/apikeys/"
 	if strings.HasPrefix(u.Path, iamAPIKeyPath) {
 		return iamAPIKeyPath + "***"
+	}
+	const billingTenantPath = "/v1beta1/tenants/"
+	if strings.HasPrefix(u.Path, billingTenantPath) && strings.HasSuffix(u.Path, "/plans") {
+		return billingTenantPath + "***/plans"
 	}
 	return u.Path
 }

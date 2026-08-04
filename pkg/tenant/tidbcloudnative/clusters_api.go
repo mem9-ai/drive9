@@ -75,7 +75,11 @@ type apiStatusError struct {
 }
 
 func (e *apiStatusError) Error() string {
-	return statusError(e.op, e.code, e.body)
+	return statusErrorMessage(e.op, e.code, e.body)
+}
+
+func (e *apiStatusError) Unwrap() error {
+	return statusError(tenant.TiDBCloudAPIServiceCluster, e.op, e.code, e.body)
 }
 
 func newAPIStatusError(op string, code int, body string) error {

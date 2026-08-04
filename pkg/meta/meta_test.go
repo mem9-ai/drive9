@@ -2154,6 +2154,131 @@ func TestClaimOldestFreeTenantPoolBindingRequiresActiveTenant(t *testing.T) {
 	}
 }
 
+func TestClaimFreeTenantPoolBindingDoesNotFallThroughToNextCandidate(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := s.CreateTenantPool(ctx, &TenantPool{
+		PoolID: "pool-exact-claim", OrganizationID: "org-exact-claim", Size: 2,
+		Status: TenantPoolActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i, tenantID := range []string{"exact-claim-a", "exact-claim-b"} {
+		createdAt := now.Add(time.Duration(i) * time.Second)
+		clusterID := "cluster-" + tenantID
+		insertTiDBCloudBindingTenant(t, s, tenantID, TenantKindLive, TenantActive, clusterID, "", createdAt)
+		if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+			TenantID: tenantID, OrganizationID: "org-exact-claim", ClusterID: clusterID,
+			PoolID: "pool-exact-claim", PoolStatus: TenantPoolBindingFree,
+			CreatedAt: createdAt, UpdatedAt: createdAt,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed, err := s.ClaimOldestFreeTenantPoolBinding(ctx, "org-exact-claim")
+	if err != nil || claimed.Tenant.ID != "exact-claim-a" {
+		t.Fatalf("claim candidate A = %+v, err=%v", claimed, err)
+	}
+	zero := int64(0)
+	_, err = s.ClaimFreeTenantPoolBinding(ctx, "org-exact-claim", "exact-claim-a", QuotaConfigPatch{
+		TiDBCloudSpendingLimit: &zero,
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("exact claim error = %v, want ErrNotFound", err)
+	}
+	binding, err := s.GetTenantTiDBCloudOrgBinding(ctx, "exact-claim-b")
+	if err != nil || binding.PoolStatus != TenantPoolBindingFree {
+		t.Fatalf("candidate B binding = %+v, err=%v, want free", binding, err)
+	}
+}
+
+func TestPersistTiDBCloudTenantClusterReferenceCommitsReferenceAndBindingAtomically(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	insertTiDBCloudBindingTenant(t, s, "early-bind-owner", TenantKindLive, TenantActive, "cluster-conflict", "", now)
+	if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+		TenantID: "early-bind-owner", OrganizationID: "org-early-bind", ClusterID: "cluster-conflict",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tenantID := range []string{"early-bind-success", "early-bind-rollback"} {
+		if err := s.InsertTenant(ctx, &Tenant{
+			ID: tenantID, Status: TenantPending, Kind: TenantKindLive,
+			DBPasswordCipher: []byte{}, Provider: tidbCloudNativeProvider,
+			SchemaVersion: 1, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.PersistTiDBCloudTenantClusterReference(ctx, "early-bind-success", "org-early-bind", &Tenant{
+		Provider: tidbCloudNativeProvider, ClusterID: "cluster-success",
+	}); err != nil {
+		t.Fatalf("PersistTiDBCloudTenantClusterReference success: %v", err)
+	}
+	tenantRow, err := s.GetTenant(ctx, "early-bind-success")
+	if err != nil || tenantRow.ClusterID != "cluster-success" || tenantRow.Status != TenantPending {
+		t.Fatalf("early-bound tenant = %+v, err=%v", tenantRow, err)
+	}
+	binding, err := s.GetTenantTiDBCloudOrgBinding(ctx, "early-bind-success")
+	if err != nil || binding.OrganizationID != "org-early-bind" || binding.ClusterID != "cluster-success" {
+		t.Fatalf("early binding = %+v, err=%v", binding, err)
+	}
+
+	err = s.PersistTiDBCloudTenantClusterReference(ctx, "early-bind-rollback", "org-early-bind", &Tenant{
+		Provider: tidbCloudNativeProvider, ClusterID: "cluster-conflict",
+	})
+	if err == nil {
+		t.Fatal("conflicting early binding succeeded")
+	}
+	tenantRow, err = s.GetTenant(ctx, "early-bind-rollback")
+	if err != nil || tenantRow.ClusterID != "" {
+		t.Fatalf("rolled-back tenant = %+v, err=%v", tenantRow, err)
+	}
+	if _, err := s.GetTenantTiDBCloudOrgBinding(ctx, "early-bind-rollback"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rolled-back binding error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestFinalizeTenantConnectionAndStatusCASIsAtomic(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := s.InsertTenant(ctx, &Tenant{
+		ID: "finalize-native", Status: TenantPending, Kind: TenantKindLive,
+		DBPasswordCipher: []byte{}, Provider: tidbCloudNativeProvider, ClusterID: "cluster-finalize",
+		SchemaVersion: 1, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.FinalizeTenantConnection(ctx, "finalize-native", TenantPending, TenantProvisioning, &Tenant{
+		DBHost: "db.example", DBPort: 4000, DBUser: "u1.root", DBPasswordCipher: []byte("cipher"),
+		DBName: "tidbcloud_fs", DBTLS: true, Provider: tidbCloudNativeProvider, ClusterID: "cluster-finalize",
+	})
+	if err != nil || !updated {
+		t.Fatalf("FinalizeTenantConnection updated=%v err=%v", updated, err)
+	}
+	row, err := s.GetTenant(ctx, "finalize-native")
+	if err != nil || row.Status != TenantProvisioning || row.DBHost != "db.example" || row.DBUser != "u1.root" || string(row.DBPasswordCipher) != "cipher" {
+		t.Fatalf("finalized tenant = %+v, err=%v", row, err)
+	}
+
+	updated, err = s.FinalizeTenantConnection(ctx, "finalize-native", TenantPending, TenantProvisioning, &Tenant{
+		DBHost: "wrong.example", DBPort: 4000, DBUser: "wrong.root", DBPasswordCipher: []byte("wrong"),
+		DBName: "tidbcloud_fs", DBTLS: true, Provider: tidbCloudNativeProvider, ClusterID: "cluster-finalize",
+	})
+	if err != nil || updated {
+		t.Fatalf("second FinalizeTenantConnection updated=%v err=%v, want false/nil", updated, err)
+	}
+	row, err = s.GetTenant(ctx, "finalize-native")
+	if err != nil || row.DBHost != "db.example" || row.DBUser != "u1.root" || string(row.DBPasswordCipher) != "cipher" {
+		t.Fatalf("tenant changed after lost CAS = %+v, err=%v", row, err)
+	}
+}
+
 func TestCountTenantPoolBindingsByStatusGroupsByPoolOrganizationAndStatus(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()

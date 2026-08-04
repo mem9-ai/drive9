@@ -152,7 +152,7 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 	if err == sql.ErrNoRows {
 		cfg.MaxStorageBytes = DefaultMaxStorageBytes()
 		cfg.MaxFileSizeBytes = DefaultMaxFileSizeBytes()
-		cfg.MaxFileCount = 0
+		cfg.MaxFileCount = DefaultMaxFileCount()
 		cfg.MaxMediaLLMFiles = DefaultMaxMediaLLMFiles()
 		cfg.MaxVideoLLMFiles = DefaultMaxVideoLLMFiles()
 		cfg.MaxMonthlyCostMC = 0
@@ -232,7 +232,7 @@ func (s *Store) SetQuotaConfigPatch(ctx context.Context, tenantID string, patch 
 	if patch.MaxFileSizeBytes != nil {
 		insertFileSize = *patch.MaxFileSizeBytes
 	}
-	insertFileCount := int64(0)
+	insertFileCount := DefaultMaxFileCount()
 	if patch.MaxFileCount != nil {
 		insertFileCount = *patch.MaxFileCount
 	}
@@ -377,7 +377,7 @@ func (s *Store) SetTiDBCloudSpendingLimitIfNotUpdatedAfter(ctx context.Context, 
 		 ON DUPLICATE KEY UPDATE
 		   tidbcloud_spending_limit = IF(updated_at < ?, VALUES(tidbcloud_spending_limit), tidbcloud_spending_limit),
 		   tidbcloud_spending_limit_checked_at = IF(updated_at < ?, VALUES(tidbcloud_spending_limit_checked_at), tidbcloud_spending_limit_checked_at)`,
-		tenantID, DefaultMaxStorageBytes(), DefaultMaxFileSizeBytes(), int64(0), sql.NullInt64{Int64: limit, Valid: true}, sql.NullTime{Time: checkedAt, Valid: true},
+		tenantID, DefaultMaxStorageBytes(), DefaultMaxFileSizeBytes(), DefaultMaxFileCount(), sql.NullInt64{Int64: limit, Valid: true}, sql.NullTime{Time: checkedAt, Valid: true},
 		DefaultMaxMediaLLMFiles(), DefaultMaxVideoLLMFiles(),
 		observedCutoff, observedCutoff)
 	if err != nil {
@@ -666,12 +666,14 @@ func (s *Store) IncrQuotaUsageCountersTx(tx *sql.Tx, tenantID string, storageDel
 // defaultMaxStorageBytes is the fallback limit when no per-tenant config row exists.
 var defaultMaxStorageBytes atomic.Int64
 var defaultMaxFileSizeBytes atomic.Int64
+var defaultMaxFileCount atomic.Int64
 var defaultMaxMediaLLMFiles atomic.Int64
 var defaultMaxVideoLLMFiles atomic.Int64
 
 func init() {
 	defaultMaxStorageBytes.Store(int64(50 * (1 << 30)))  // 50 GiB
 	defaultMaxFileSizeBytes.Store(int64(10 * (1 << 30))) // 10 GiB
+	defaultMaxFileCount.Store(0)                         // unlimited
 	defaultMaxMediaLLMFiles.Store(int64(500))
 	defaultMaxVideoLLMFiles.Store(int64(50))
 }
@@ -695,6 +697,18 @@ func SetDefaultMaxFileSizeBytes(bytes int64) {
 
 // DefaultMaxFileSizeBytes returns the configured per-tenant fallback file size quota.
 func DefaultMaxFileSizeBytes() int64 { return defaultMaxFileSizeBytes.Load() }
+
+// SetDefaultMaxFileCount overrides the per-tenant fallback file count quota.
+// Zero means unlimited. Negative values are rejected by leaving the current
+// value unchanged.
+func SetDefaultMaxFileCount(count int64) {
+	if count >= 0 {
+		defaultMaxFileCount.Store(count)
+	}
+}
+
+// DefaultMaxFileCount returns the configured per-tenant fallback file count.
+func DefaultMaxFileCount() int64 { return defaultMaxFileCount.Load() }
 
 // SetDefaultMaxMediaLLMFiles overrides the per-tenant fallback media LLM file limit.
 func SetDefaultMaxMediaLLMFiles(n int64) {
