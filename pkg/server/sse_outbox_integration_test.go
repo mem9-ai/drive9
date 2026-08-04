@@ -44,10 +44,10 @@ func newSSEOutboxTestCluster(t *testing.T) *sseOutboxTestCluster {
 	}
 	t.Cleanup(func() { _ = metaStore.Close() })
 	testmysql.ResetMetaDB(t, metaStore.DB())
-	// Clean up SSE notify tables (ResetMetaDB may not know about new tables).
-	// Fail on error so stale rows don't leak between tests.
+	// Clean up pod tables ResetMetaDB does not cover. Fail on error so stale
+	// rows don't leak between tests.
 	ctx := context.Background()
-	for _, table := range []string{"tenant_notify_outbox", "tenant_outbox_cursor", "pod_subscriptions", "pod_registry", "tenant_api_keys", "tenants"} {
+	for _, table := range []string{"pod_subscriptions", "pod_registry"} {
 		if _, err := metaStore.DB().ExecContext(ctx, "DELETE FROM "+table); err != nil {
 			t.Fatalf("clean up %s: %v", table, err)
 		}
@@ -434,5 +434,57 @@ func TestSSEOutboxOutboxCleanup(t *testing.T) {
 	}
 	if tenantRow.WorkMask != WorkSSE {
 		t.Fatalf("expected remaining row work_mask=%d, got %d", WorkSSE, tenantRow.WorkMask)
+	}
+}
+
+// TestResolveRetryStoreRefreshesBus verifies the production store resolver:
+// for an active tenant it re-acquires the backend through the pool and
+// refreshes the bus's cached store pointer; for a tenant that no longer
+// exists it reports errTenantGone so buffered events drop instead of spinning.
+func TestResolveRetryStoreRefreshesBus(t *testing.T) {
+	tc := newSSEOutboxTestCluster(t)
+
+	// A bus with no cached store (no traffic yet): the resolver must acquire
+	// one through the pool and refresh the pointer as a side effect.
+	bus := tc.podA.events.get(tc.tenantID, nil)
+	if bus.store.Load() != nil {
+		t.Fatal("precondition: bus store should be nil before resolve")
+	}
+	inserter, err := tc.podA.resolveRetryStore(context.Background(), tc.tenantID, bus)
+	if err != nil {
+		t.Fatalf("resolveRetryStore: %v", err)
+	}
+	if inserter == nil {
+		t.Fatal("resolver returned nil inserter for an active tenant")
+	}
+	if bus.store.Load() == nil {
+		t.Fatal("bus store pointer not refreshed by the resolver")
+	}
+
+	// The resolved store actually inserts (create the standalone fs_events
+	// table first — the cluster provisions the tenant row, not the schema).
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS fs_events (
+			seq        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+			path       TEXT NOT NULL,
+			op         VARCHAR(64) NOT NULL,
+			actor      VARCHAR(255),
+			ts         BIGINT NOT NULL,
+			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+		)`,
+		`CREATE INDEX idx_fs_events_created ON fs_events(created_at)`,
+	} {
+		if _, err := tc.metaStore.DB().ExecContext(context.Background(), ddl); err != nil && !strings.Contains(err.Error(), "Duplicate key") {
+			t.Fatalf("apply fs_events DDL: %v", err)
+		}
+	}
+	if _, err := inserter.InsertFSEvent(context.Background(), "/resolved.txt", "write", "tester", time.Now().UnixMilli()); err != nil {
+		t.Fatalf("insert via resolved store: %v", err)
+	}
+
+	// A tenant that does not exist yields errTenantGone (entries drop with
+	// reason tenant_gone instead of spinning).
+	if _, err := tc.podA.resolveRetryStore(context.Background(), "no-such-tenant", nil); !errors.Is(err, errTenantGone) {
+		t.Fatalf("err = %v, want errTenantGone", err)
 	}
 }

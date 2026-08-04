@@ -64,7 +64,12 @@ func installSharedFSEventsTable(t *testing.T) {
 
 func newSharedSweepStore(t *testing.T, fsID int64) *datastore.Store {
 	t.Helper()
-	store, err := datastore.OpenForTenantScoped(context.Background(), testDSN, "", "", datastore.SharedScope(fsID))
+	return newSharedSweepStoreDB(t, fsID, 0)
+}
+
+func newSharedSweepStoreDB(t *testing.T, fsID, dbID int64) *datastore.Store {
+	t.Helper()
+	store, err := datastore.OpenForTenantScoped(context.Background(), testDSN, "", "", datastore.SharedScopeWithDB(fsID, dbID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,4 +203,59 @@ func TestMaybeSweepSharedFSEventsOrchestration(t *testing.T) {
 	}
 	s3.maybeSweepSharedFSEvents(storeA, "")
 	waitForSharedFSEventCount(t, storeA, 0, 3*time.Second)
+}
+
+// TestMaybeSweepSharedFSEventsPerPoolClaims verifies that shared pools sweep
+// INDEPENDENTLY: two physical pools (distinct dbIDs) can both win their claim
+// inside the same interval window, so a hot pool cannot starve a cold one.
+func TestMaybeSweepSharedFSEventsPerPoolClaims(t *testing.T) {
+	ctx := context.Background()
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	cleanMaintenanceState := func() {
+		t.Helper()
+		if _, err := metaStore.DB().ExecContext(ctx, `DELETE FROM shared_maintenance_state`); err != nil {
+			t.Fatalf("clean shared_maintenance_state: %v", err)
+		}
+	}
+	cleanMaintenanceState()
+	t.Cleanup(cleanMaintenanceState)
+
+	installSharedFSEventsTable(t)
+	storeA := newSharedSweepStoreDB(t, 7700011, 101)
+	storeB := newSharedSweepStoreDB(t, 7700012, 102)
+
+	insertAgedSharedEvent(t, storeA, "/pool101/a")
+	s := &Server{meta: metaStore}
+
+	// Pool 101's sweep claims fs_events_sweep:101 and deletes.
+	s.maybeSweepSharedFSEvents(storeA, "")
+	waitForSharedFSEventCount(t, storeA, 0, 3*time.Second)
+
+	// Pool 102's sweep, triggered immediately after (same pod, same window),
+	// must ALSO win: the claim names are per pool.
+	insertAgedSharedEvent(t, storeB, "/pool102/b")
+	s.maybeSweepSharedFSEvents(storeB, "")
+	waitForSharedFSEventCount(t, storeA, 0, 3*time.Second)
+
+	// Both per-pool claim rows exist.
+	rows, err := metaStore.DB().QueryContext(ctx, `SELECT name FROM shared_maintenance_state ORDER BY name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	if len(names) != 2 || names[0] != "fs_events_sweep:101" || names[1] != "fs_events_sweep:102" {
+		t.Fatalf("claim names = %v, want [fs_events_sweep:101 fs_events_sweep:102]", names)
+	}
 }

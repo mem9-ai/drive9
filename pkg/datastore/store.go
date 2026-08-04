@@ -1733,6 +1733,14 @@ func isMissingTableError(err error) bool {
 		strings.Contains(msg, "table") && strings.Contains(msg, "doesn't exist")
 }
 
+// IsMissingTableError reports whether err is a MySQL 1146 ("table doesn't
+// exist") failure. Callers use it to distinguish pre-migration tenants (the
+// table was never created — a benign, expected state) from real connectivity
+// or syntax failures.
+func IsMissingTableError(err error) bool {
+	return isMissingTableError(err)
+}
+
 // --- composite operations ---
 
 func (s *Store) Stat(ctx context.Context, path string) (out *NodeWithFile, err error) {

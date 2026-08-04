@@ -78,7 +78,7 @@ var (
 	// t.Parallel() — the mutation is process-global.
 	sseMaxFullPagesPerWake = 10
 
-	// eventsSinceE is the event source for the Phase-1 mid-drain loop and
+	// eventsSinceE is the event source for the Phase-1 drain loop and
 	// Phase-2 pollAndSend. A package var so tests can inject query errors
 	// deterministically (mirrors the tenantWorkerUsesTiDBAutoEmbedding seam).
 	// Tests that swap it must restore it via t.Cleanup and must NOT use
@@ -86,15 +86,34 @@ var (
 	eventsSinceE = (*EventBus).EventsSinceE
 )
 
+// sseWakeSource identifies what woke a Phase-2 pollAndSend. The query-error
+// re-arm decision depends on it: notify and catch-up wakes indicate real
+// pending work, a liveness wake is only a safety net.
+type sseWakeSource int
+
+const (
+	// sseWakeNotify is a wake from the bus notify channel: a real signal that
+	// a durable fs_events row was (probably) just written.
+	sseWakeNotify sseWakeSource = iota
+	// sseWakeLiveness is a wake from the optional liveness-poll ticker: a
+	// safety net only — nothing indicates new rows exist.
+	sseWakeLiveness
+	// sseWakeCatchup is a wake from the catch-up timer: a burst drain is in
+	// progress by definition.
+	sseWakeCatchup
+)
+
 // sseCatchupBackoff returns the catch-up re-arm delay after consecutiveErrs
 // consecutive query errors: sseCatchupPollDelay doubled per error, capped at
-// sseCatchupMaxPollDelay. Pure function so tests can assert the backoff curve
-// without sleeping.
+// sseCatchupMaxPollDelay. The shift is clamped at 7 — 10ms<<7 (1.28s) already
+// exceeds the 1s cap, so larger shifts change nothing (and stay far from any
+// overflow). Pure function so tests can assert the backoff curve without
+// sleeping.
 func sseCatchupBackoff(consecutiveErrs int) time.Duration {
 	if consecutiveErrs < 1 {
 		consecutiveErrs = 1
 	}
-	d := sseCatchupPollDelay << min(consecutiveErrs-1, 10)
+	d := sseCatchupPollDelay << min(consecutiveErrs-1, 7)
 	if d > sseCatchupMaxPollDelay {
 		d = sseCatchupMaxPollDelay
 	}
@@ -312,7 +331,7 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 			// tenant. Writes are the only operation that both creates rows and
 			// guarantees the tenant DB is already awake, so the sweep rides the
 			// write path instead of a periodic task.
-			s.maybeSweepFSEvents(ctx, bus, store)
+			s.maybeSweepFSEvents(bus, store)
 		}
 	}
 
@@ -332,6 +351,27 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 	bus.Publish()
 }
 
+// sweepGoroutine runs fn on a detached goroutine tied to the server
+// lifecycle: the context is canceled promptly by stopNotifyInfrastructure
+// (the batched DELETE loops check ctx between batches) and the goroutine is
+// tracked by notifyWG so Close waits for in-flight sweeps. The
+// fsEventsLazySweepTimeout only bounds a fully stuck driver; it never delays
+// shutdown. Hand-constructed servers (tests) without a sweepCtx fall back to
+// a plain background context.
+func (s *Server) sweepGoroutine(fn func(ctx context.Context)) {
+	base := s.sweepCtx
+	if base == nil {
+		base = backgroundWithTrace(context.Background())
+	}
+	ctx, cancel := context.WithTimeout(base, fsEventsLazySweepTimeout)
+	s.notifyWG.Add(1)
+	go func() {
+		defer s.notifyWG.Done()
+		defer cancel()
+		fn(ctx)
+	}()
+}
+
 // maybeSweepFSEvents runs the fs_events retention sweep for the tenant at most
 // once per fsEventsSweepInterval, on a detached background goroutine so it
 // never adds mutation latency. Over-retention has no correctness cost (a
@@ -342,7 +382,7 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 // In shared-schema deployments the fs_id-scoped sweep is skipped entirely: one
 // physical table holds every tenant's rows, so per-tenant sweeps would miss
 // dead tenants and duplicate each other — the pool-wide sweep runs instead.
-func (s *Server) maybeSweepFSEvents(ctx context.Context, bus *EventBus, store *datastore.Store) {
+func (s *Server) maybeSweepFSEvents(bus *EventBus, store *datastore.Store) {
 	if store.Scope().Shared() {
 		s.maybeSweepSharedFSEvents(store, bus.TiDBCloudOrgID())
 		return
@@ -360,16 +400,14 @@ func (s *Server) maybeSweepFSEvents(ctx context.Context, bus *EventBus, store *d
 		// Hand-constructed servers (tests) may skip NewWithConfig defaults.
 		retention = defaultFSEventsRetention
 	}
-	go func() {
-		// Detach from the request context: a client disconnect must not abort
-		// the sweep, but the sweep must not outlive a slow tenant DB either.
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), fsEventsLazySweepTimeout)
-		defer cancel()
-		deleted, hasMore, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-retention), fsEventsSweepBatchSize, fsEventsSweepMaxBatches)
+	s.sweepGoroutine(func(sweepCtx context.Context) {
+		deleted, hasMore, err := store.DeleteFSEventsBefore(sweepCtx, time.Now().Add(-retention), fsEventsSweepBatchSize, fsEventsSweepMaxBatches)
 		if err != nil {
-			logger.Warn(ctx, "fs_events_lazy_sweep_failed",
-				zap.String("tenant_id", bus.tenantID),
-				zap.Error(err))
+			if sweepCtx.Err() == nil {
+				logger.Warn(sweepCtx, "fs_events_lazy_sweep_failed",
+					zap.String("tenant_id", bus.tenantID),
+					zap.Error(err))
+			}
 			metrics.RecordTenantOperationWithOrg(bus.tenantID, bus.TiDBCloudOrgID(), "event_bus", "retention_sweep", metrics.ResultForError(err), 0)
 			return
 		}
@@ -378,11 +416,11 @@ func (s *Server) maybeSweepFSEvents(ctx context.Context, bus *EventBus, store *d
 		if hasMore {
 			// Batch cap hit with leftover rows: they drain on the next
 			// write-path sweep or tenant-worker maintenance cycle.
-			logger.Info(ctx, "fs_events_lazy_sweep_has_more",
+			logger.Info(sweepCtx, "fs_events_lazy_sweep_has_more",
 				zap.String("tenant_id", bus.tenantID),
 				zap.Int64("deleted", deleted))
 		}
-	}()
+	})
 }
 
 // maybeSweepSharedFSEvents runs the shared-pool fs_events retention sweep:
@@ -390,43 +428,63 @@ func (s *Server) maybeSweepFSEvents(ctx context.Context, bus *EventBus, store *d
 // table (no fs_id predicate), because dead/idle tenants' rows are unreachable
 // by any per-tenant sweep. It is the single entry point shared by the write
 // path (maybeSweepFSEvents) and the tenant worker's piggyback maintenance
-// (via TenantWorkerOptions.SweepSharedFSEvents), so both ride ONE throttle:
-// a cheap per-pod pre-filter atomic, then the authoritative cluster-wide
-// meta-DB claim (ClaimSharedMaintenanceRun). The sweep itself runs on a
-// detached background goroutine so it never occupies the caller (mutation
-// path or tenant worker goroutine). Metrics use the fixed
-// sharedPoolMetricTenantID label — the operation cleans every tenant's rows.
+// (via TenantWorkerOptions.SweepSharedFSEvents), so both ride ONE throttle
+// PER PHYSICAL POOL (db_pool.db_id from the store's scope; multiple shared
+// pools sweep independently so a hot pool cannot starve a cold one): a cheap
+// per-pod pre-filter (sharedSweepLast), then the authoritative cluster-wide
+// meta-DB claim (ClaimSharedMaintenanceRun with a per-pool claim name; a
+// zero/unknown dbID falls back to the plain name, preserving single-pool
+// behavior). The sweep itself runs on a detached goroutine tied to the
+// server lifecycle (sweepGoroutine), so it never occupies the caller.
+// Metrics use the fixed "shared_pool[:<dbID>]" tenant label — the operation
+// cleans every tenant's rows.
 func (s *Server) maybeSweepSharedFSEvents(store *datastore.Store, tidbCloudOrgID string) {
-	now := time.Now().Unix()
-	last := s.lastSharedSweepUnix.Load()
-	if now-last < int64(sharedFSEventsSweepInterval/time.Second) {
-		return
+	dbID := store.Scope().DBID()
+	claimName := sharedFSEventsSweepClaimName
+	metricTenant := sharedPoolMetricTenantID
+	if dbID > 0 {
+		claimName = fmt.Sprintf("%s:%d", sharedFSEventsSweepClaimName, dbID)
+		metricTenant = fmt.Sprintf("%s:%d", sharedPoolMetricTenantID, dbID)
 	}
-	if !s.lastSharedSweepUnix.CompareAndSwap(last, now) {
-		return
+	now := time.Now().Unix()
+	var prev int64 // this pool's previous trigger time; restored on claim error
+	for {
+		// LoadOrStore because sync.Map.CompareAndSwap fails on a missing key:
+		// the first trigger for a pool stores `now` atomically and proceeds.
+		lastRaw, loaded := s.sharedSweepLast.LoadOrStore(dbID, now)
+		if !loaded {
+			break
+		}
+		prev, _ = lastRaw.(int64)
+		if now-prev < int64(sharedFSEventsSweepInterval/time.Second) {
+			return
+		}
+		if s.sharedSweepLast.CompareAndSwap(dbID, prev, now) {
+			break
+		}
+		// Raced another trigger: re-read and retry.
 	}
 	retention := s.fsEventsRetention
 	if retention <= 0 {
 		// Hand-constructed servers (tests) may skip NewWithConfig defaults.
 		retention = defaultFSEventsRetention
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(backgroundWithTrace(context.Background()), fsEventsLazySweepTimeout)
-		defer cancel()
+	s.sweepGoroutine(func(ctx context.Context) {
 		// Cluster-wide claim: exactly one pod sweeps the pool per interval.
 		// Without a meta store there is no shared pool to protect (single-
 		// tenant mode never has shared-shape stores), so skip the claim.
 		if s.meta != nil {
-			claimed, err := s.meta.ClaimSharedMaintenanceRun(ctx, sharedFSEventsSweepClaimName, sharedFSEventsSweepInterval)
+			claimed, err := s.meta.ClaimSharedMaintenanceRun(ctx, claimName, sharedFSEventsSweepInterval)
 			if err != nil {
-				// Meta-DB blip: restore the per-pod pre-filter so the NEXT
-				// trigger retries instead of waiting out the full interval.
-				// (A lost claim keeps the pre-filter set — another pod
-				// sweeping is the intended backoff; a lost race on this
+				// Meta-DB blip: restore this pool's per-pod pre-filter so
+				// the NEXT trigger retries instead of waiting out the full
+				// interval. (A lost claim keeps the pre-filter set — another
+				// pod sweeping is the intended backoff; a lost race on this
 				// restore is harmless.)
-				s.lastSharedSweepUnix.CompareAndSwap(now, last)
-				logger.Warn(ctx, "shared_fs_events_sweep_claim_failed", zap.Error(err))
-				metrics.RecordTenantOperationWithOrg(sharedPoolMetricTenantID, tidbCloudOrgID, "event_bus", "retention_sweep_shared", metrics.ResultForError(err), 0)
+				s.sharedSweepLast.CompareAndSwap(dbID, now, prev)
+				logger.Warn(ctx, "shared_fs_events_sweep_claim_failed",
+					zap.Int64("db_id", dbID), zap.Error(err))
+				metrics.RecordTenantOperationWithOrg(metricTenant, tidbCloudOrgID, "event_bus", "retention_sweep_shared", metrics.ResultForError(err), 0)
 				return
 			}
 			if !claimed {
@@ -435,19 +493,23 @@ func (s *Server) maybeSweepSharedFSEvents(store *datastore.Store, tidbCloudOrgID
 		}
 		deleted, hasMore, err := store.DeleteSharedFSEventsBefore(ctx, time.Now().Add(-retention), fsEventsSweepBatchSize, fsEventsSweepMaxBatches)
 		if err != nil {
-			logger.Warn(ctx, "shared_fs_events_sweep_failed", zap.Error(err))
-			metrics.RecordTenantOperationWithOrg(sharedPoolMetricTenantID, tidbCloudOrgID, "event_bus", "retention_sweep_shared", metrics.ResultForError(err), 0)
+			if ctx.Err() == nil {
+				logger.Warn(ctx, "shared_fs_events_sweep_failed",
+					zap.Int64("db_id", dbID), zap.Error(err))
+			}
+			metrics.RecordTenantOperationWithOrg(metricTenant, tidbCloudOrgID, "event_bus", "retention_sweep_shared", metrics.ResultForError(err), 0)
 			return
 		}
-		metrics.RecordTenantOperationWithOrg(sharedPoolMetricTenantID, tidbCloudOrgID, "event_bus", "retention_sweep_shared", "ok", 0)
+		metrics.RecordTenantOperationWithOrg(metricTenant, tidbCloudOrgID, "event_bus", "retention_sweep_shared", "ok", 0)
 		metrics.RecordFSEventsPruned(deleted)
 		if hasMore {
 			// Batch cap hit with leftover rows: they drain on the next
 			// throttled pass.
 			logger.Info(ctx, "shared_fs_events_sweep_has_more",
+				zap.Int64("db_id", dbID),
 				zap.Int64("deleted", deleted))
 		}
-	}()
+	})
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -506,13 +568,24 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// Phase 1: Replay or Reset.
 	// EventsSince reads from the durable fs_events table, so events written
 	// by other pods are visible here (cross-pod propagation).
-	// The FIRST call uses the tolerated wrapper (query error → caught-up
-	// fallback): pre-migration tenants without the fs_events table must not
-	// reconnect-loop, and FUSE HEAD revalidation provides correctness without
-	// SSE. Mid-drain calls below use eventsSinceE instead, because a masked
-	// error there would falsely mark a still-behind client as caught up.
+	// The FIRST call distinguishes query errors via eventsSinceE: a MISSING
+	// TABLE means a pre-migration tenant (the fs_events table is created
+	// lazily) and keeps the tolerated caught-up fallback that EventsSinceE
+	// returns in that branch — otherwise those tenants' clients would
+	// reconnect-loop until migration. Any OTHER error is transient and must
+	// not mark a potentially-behind client as caught up: the stream
+	// terminates WITHOUT the heartbeat, exactly like the mid-drain path, and
+	// the client resumes from its durable cursor on reconnect.
 	phase1Start := time.Now()
-	events, headSeq, ok := bus.EventsSince(ctx, since)
+	events, headSeq, ok, firstErr := eventsSinceE(bus, ctx, since)
+	if firstErr != nil && !datastore.IsMissingTableError(firstErr) {
+		logger.Warn(ctx, "sse_phase1_initial_query_failed",
+			zap.String("tenant_id", tenantID),
+			zap.Uint64("since", since),
+			zap.Error(firstErr))
+		metrics.RecordTenantOperationWithOrg(tenantID, tidbCloudOrgID, "event_bus", "phase1_drain", metrics.ResultForError(firstErr), 0)
+		return
+	}
 	lastSeen := since
 	// lastSuccessfulPoll tracks the last EventsSince that returned ok=true;
 	// the optional Phase-2 liveness poll uses it to detect signal loss.
@@ -524,8 +597,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		reason := "initial_sync"
 		if since > 0 {
+			// A fully-pruned table reports headSeq == 0: the client's cursor
+			// is behind the retained window (seq_too_old), NOT ahead of it.
+			// server_restart is reserved for a cursor ahead of a non-empty
+			// head.
 			reason = "seq_too_old"
-			if since > headSeq {
+			if headSeq > 0 && since > headSeq {
 				reason = "server_restart"
 			}
 		}
@@ -679,9 +756,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// pages per wake, then flushes and re-arms the catch-up timer; a short page
 	// disarms. Query errors keep the connection and re-arm with bounded
 	// exponential backoff (sseCatchupBackoff) instead of a fixed cadence.
-	// fromCatchup marks a wake from the catch-up timer itself (a drain
-	// in progress). Returns false if the stream should terminate (write error).
-	pollAndSend := func(fromCatchup bool) bool {
+	// wake identifies the wake source (notify / liveness / catchup).
+	// Returns false if the stream should terminate (write error).
+	pollAndSend := func(wake sseWakeSource) bool {
 		capped := false
 		for fullPages := 0; ; {
 			liveEvents, liveHead, liveOK, qErr := eventsSinceE(bus, ctx, lastSeen)
@@ -705,16 +782,16 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				// it): deliver nothing and keep the connection — that part is
 				// deliberate. Do NOT abandon the drain: re-arm the timer
 				// (with bounded exponential backoff on consecutive errors)
-				// whenever this wake came from the timer itself OR this wake
-				// already delivered full pages — full pages mean a backlog
-				// definitively exists, and the timer is the only thing that
-				// resumes the drain without another write. Only a quiet
-				// stream's first-poll failure (fullPages==0, not fromCatchup)
-				// starts no timer: no fresh polling against a quiet stream's
-				// failing DB. Also do NOT stamp lastSuccessfulPoll (a FAILED
-				// poll is not a success; the liveness poll must still detect
-				// the signal loss).
-				if fromCatchup || fullPages > 0 {
+				// whenever the wake indicates real pending work — a catch-up
+				// fire (drain in progress), full pages already delivered
+				// (backlog definitively exists), or a notify (a real signal:
+				// a durable row was just written). Only a LIVENESS-driven
+				// first-poll failure (fullPages==0) starts no timer: the
+				// liveness poll is just a safety net and must not poll a
+				// quiet stream's failing DB. Also do NOT stamp
+				// lastSuccessfulPoll (a FAILED poll is not a success; the
+				// liveness poll must still detect the signal loss).
+				if wake == sseWakeCatchup || fullPages > 0 || wake == sseWakeNotify {
 					catchupErrs++
 					armCatchup(sseCatchupBackoff(catchupErrs))
 				}
@@ -798,7 +875,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		case <-livenessC:
 			if time.Since(lastSuccessfulPoll) >= s.sseLivenessPollInterval {
-				if !pollAndSend(false) {
+				if !pollAndSend(sseWakeLiveness) {
 					return
 				}
 			}
@@ -806,7 +883,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			// A previous wake hit the full-page cap: resume the drain. The
 			// select loop serviced heartbeats and disconnects in between.
 			catchupC = nil
-			if !pollAndSend(true) {
+			if !pollAndSend(sseWakeCatchup) {
 				return
 			}
 		case <-flushC:
@@ -820,7 +897,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if !open {
 				return
 			}
-			if !pollAndSend(false) {
+			if !pollAndSend(sseWakeNotify) {
 				return
 			}
 		}

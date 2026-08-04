@@ -19,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -151,10 +150,14 @@ type Config struct {
 	TenantMaintenanceInterval       time.Duration
 	SafetyNetScanInterval           time.Duration
 	SSENotifyRetention              time.Duration
-	FSEventsRetention               time.Duration
-	SSELivenessPollInterval         time.Duration
-	PodID                           string
-	PodAddr                         string
+	// FSEventsRetention is how long fs_events rows are kept before pruning
+	// (default 1h; production sets 168h via DRIVE9_FS_EVENTS_RETENTION).
+	FSEventsRetention time.Duration
+	// SSELivenessPollInterval enables an optional per-connection liveness
+	// poll for connected SSE clients (default 0 = off).
+	SSELivenessPollInterval time.Duration
+	PodID                   string
+	PodAddr                 string
 }
 
 type SlockOAuthClient interface {
@@ -316,11 +319,22 @@ type Server struct {
 	// (not leader-gated); stopped during Close before the coalescer's final
 	// flush so its last notify signals still land in the outbox.
 	eventRetry *eventRetryBuffer
-	// lastSharedSweepUnix is the per-pod pre-filter throttle for the
-	// shared-pool fs_events sweep (see maybeSweepSharedFSEvents in sse.go).
-	// The authoritative cluster-wide throttle is the meta-DB claim; this
-	// atomic only keeps the common case off the meta DB.
-	lastSharedSweepUnix atomic.Int64
+	// sweepCtx/sweepCancel tie the detached fs_events sweep goroutines
+	// (maybeSweepFSEvents / maybeSweepSharedFSEvents) to the server
+	// lifecycle: stopNotifyInfrastructure cancels them promptly (the batched
+	// DELETE loop checks ctx between batches) and notifyWG.Wait covers them,
+	// so they cannot outlive Close and hit a closed meta store.
+	// Hand-constructed servers (tests) leave both nil and use a background
+	// context instead. Mirrors the forkWorkerCtx precedent.
+	sweepCtx    context.Context
+	sweepCancel context.CancelFunc
+	// sharedSweepLast is the per-pod pre-filter throttle for the shared-pool
+	// fs_events sweep (see maybeSweepSharedFSEvents in sse.go), keyed by
+	// physical pool id (db_pool.db_id; 0 = unknown/single pool): each shared
+	// pool is throttled and claimed independently so a hot pool cannot
+	// starve a cold one. The authoritative cluster-wide throttle is the
+	// meta-DB claim; this map only keeps the common case off the meta DB.
+	sharedSweepLast sync.Map // dbID int64 -> unix seconds int64
 	// sseNotifyRetention is how long outbox rows are kept before leader pruning.
 	sseNotifyRetention time.Duration
 	// fsEventsRetention is how long fs_events rows are kept before the lazy
@@ -437,9 +451,9 @@ func NewWithConfig(cfg Config) *Server {
 	if maxUpload <= 0 {
 		maxUpload = DefaultMaxUploadBytes
 	}
-	logger := cfg.Logger
-	if logger == nil {
-		logger, _ = zap.NewProduction()
+	srvLog := cfg.Logger
+	if srvLog == nil {
+		srvLog, _ = zap.NewProduction()
 	}
 	metrics.SetFeatureEnabled("vault", len(cfg.VaultMasterKey) > 0)
 	metrics.SetModuleAvailability("vault", false)
@@ -448,7 +462,7 @@ func NewWithConfig(cfg Config) *Server {
 		var err error
 		vaultMK, err = vault.NewMasterKey(cfg.VaultMasterKey)
 		if err != nil {
-			logger.Warn("vault master key invalid, vault disabled", zap.Error(err))
+			srvLog.Warn("vault master key invalid, vault disabled", zap.Error(err))
 		} else {
 			metrics.SetModuleAvailability("vault", true)
 		}
@@ -529,6 +543,7 @@ func NewWithConfig(cfg Config) *Server {
 		defaultTenantProvider = cfg.Provisioner.ProviderType()
 	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
+	sweepCtx, sweepCancel := context.WithCancel(backgroundWithTrace(context.Background()))
 	s := &Server{
 		fallback:              cfg.Backend,
 		meta:                  cfg.Meta,
@@ -567,7 +582,7 @@ func NewWithConfig(cfg Config) *Server {
 		tenantPoolRefillFreeRatio: tenantPoolRefillFreeRatio,
 		inlineThreshold:           inlineThreshold,
 		metrics:                   newServerMetrics(),
-		logger:                    logger,
+		logger:                    srvLog,
 		events:                    newEventBuses(),
 		slockOAuth:                cfg.SlockOAuth,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
@@ -579,6 +594,8 @@ func NewWithConfig(cfg Config) *Server {
 		journalCursorSecret:     newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:           forkWorkerCtx,
 		forkWorkerCancel:        forkWorkerCancel,
+		sweepCtx:                sweepCtx,
+		sweepCancel:             sweepCancel,
 		tidbCloudRBACCache:      newTiDBCloudRBACCache(tidbCloudRBACCacheTTL),
 		leader:                  cfg.Leader,
 		sseNotifyRetention:      cfg.SSENotifyRetention,
@@ -598,7 +615,7 @@ func NewWithConfig(cfg Config) *Server {
 	// Log the effective retention at startup so a missing
 	// DRIVE9_FS_EVENTS_RETENTION env var is visible instead of silently
 	// reverting to the default.
-	logger.Info("fs_events_retention_configured",
+	logger.Info(context.Background(), "fs_events_retention_configured",
 		zap.Duration("retention", s.fsEventsRetention))
 	// safetyNetScanInterval is taken as configured: a non-positive value
 	// disables the safety-net scan entirely (see startNotifyInfrastructure).
@@ -611,7 +628,7 @@ func NewWithConfig(cfg Config) *Server {
 	// actually reachable by retried events. Stopped in
 	// stopNotifyInfrastructure, which Close always calls, with a final
 	// best-effort flush before the coalescer drains.
-	s.eventRetry = newEventRetryBuffer(s.insertTenantNotify, s.fsEventsRetention)
+	s.eventRetry = newEventRetryBuffer(s.insertTenantNotify, s.fsEventsRetention, s.resolveRetryStore)
 	s.eventRetry.start(backgroundWithTrace(context.Background()))
 	mux := http.NewServeMux()
 
@@ -778,7 +795,7 @@ func NewWithConfig(cfg Config) *Server {
 		// heartbeat goroutine. If not yet leader, workers stay stopped until
 		// leadership is gained.
 		if !s.leader.IsLeader() {
-			logger.Info("server_leader_standby",
+			srvLog.Info("server_leader_standby",
 				zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
 				zap.Strings("app_managed_task_types", appManagedTaskTypes),
 				zap.Strings("fallback_task_types", fallbackTaskTypes),
@@ -957,6 +974,15 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 func (s *Server) stopNotifyInfrastructure() {
 	if s.notifyCancel != nil {
 		s.notifyCancel()
+	}
+	// Cancel detached fs_events sweep goroutines BEFORE waiting: the batched
+	// DELETE loop checks ctx between batches, so in-flight sweeps exit
+	// promptly and notifyWG.Wait below cannot block on the 5min sweep
+	// timeout. The meta store is still open (it is closed later by the
+	// server binary), so a sweep that lands before cancellation completes
+	// normally.
+	if s.sweepCancel != nil {
+		s.sweepCancel()
 	}
 	// Stop the event retry buffer BEFORE the coalescer: its stop performs a
 	// final best-effort flush whose second-wake signals go through

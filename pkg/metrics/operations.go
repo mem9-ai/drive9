@@ -963,9 +963,9 @@ func RecordFSEventsPruned(count int64) {
 
 // RecordSSEEventRetryDropped records one retry-buffer entry dropped before its
 // durable insert (hard event loss). reason is one of tenant_cap, global_cap,
-// expired, stopped (enqueued after shutdown began), or shutdown (still
-// buffered when the shutdown flush budget ran out). Alert on any non-zero
-// rate.
+// expired, stopped (enqueued after shutdown began), shutdown (still buffered
+// when the shutdown flush budget ran out), or tenant_gone (tenant deleted
+// before the flush landed). Alert on any non-zero rate.
 func RecordSSEEventRetryDropped(tenantID, tidbCloudOrgID, reason string) {
 	RegisterModule("sse")
 	sseEventRetryDroppedTotal.Add(1,

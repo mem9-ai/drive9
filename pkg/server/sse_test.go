@@ -646,6 +646,15 @@ func TestSSEResetFlushWhenSeqTooOld(t *testing.T) {
 	if ev.Event != "reset" {
 		t.Fatalf("expected reset, got %q", ev.Event)
 	}
+	// A fully-pruned table (headSeq == 0) must be labeled seq_too_old — the
+	// cursor is behind the retained window, not ahead of a non-empty head.
+	var data sseResetPayload
+	if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
+		t.Fatalf("unmarshal reset: %v", err)
+	}
+	if data.Reason != "seq_too_old" {
+		t.Fatalf("reset reason = %q, want seq_too_old (fully-pruned table)", data.Reason)
+	}
 }
 
 // TestSSEResetWhenPartialPruning verifies that a client whose cursor falls
@@ -939,10 +948,14 @@ func TestSSEEndpointPhase1MidDrainErrorTerminates(t *testing.T) {
 	bulkInsertFSEvents(t, store, 4)
 
 	// Stub the mid-drain event source to report a DB error deterministically.
+	// The FIRST Phase-1 call delegates to the real implementation (it must
+	// return the full page from the real rows); later calls fail.
 	realEventsSinceE := eventsSinceE
-	calls := 0
-	eventsSinceE = func(eb *EventBus, _ context.Context, since uint64) ([]ChangeEvent, uint64, bool, error) {
-		calls++
+	var calls atomic.Int32
+	eventsSinceE = func(eb *EventBus, ctx context.Context, since uint64) ([]ChangeEvent, uint64, bool, error) {
+		if calls.Add(1) == 1 {
+			return realEventsSinceE(eb, ctx, since)
+		}
 		return nil, since, true, fmt.Errorf("injected mid-drain db error")
 	}
 	t.Cleanup(func() { eventsSinceE = realEventsSinceE })
@@ -987,8 +1000,8 @@ func TestSSEEndpointPhase1MidDrainErrorTerminates(t *testing.T) {
 	if ev, ok := readSSEEvent(scanner); ok {
 		t.Fatalf("expected stream termination after mid-drain error, got extra event %q (false caught-up marker?)", ev.Event)
 	}
-	if calls < 1 {
-		t.Fatalf("eventsSinceE calls = %d, want >= 1 (mid-drain call)", calls)
+	if calls.Load() < 1 {
+		t.Fatalf("eventsSinceE calls = %d, want >= 1 (mid-drain call)", calls.Load())
 	}
 }
 
@@ -1246,5 +1259,162 @@ func TestSSEEndpointPhase2NotifyWakeQueryErrorStartsCatchup(t *testing.T) {
 	}
 	if got := pollCalls.Load(); got < 7 {
 		t.Fatalf("poll calls = %d, want >= 7 (1 page + 1 error + 5 drain)", got)
+	}
+}
+
+// TestSSEEndpointPhase2NotifyFirstPollErrorStartsCatchup verifies the Q4
+// path: a NOTIFY wake whose FIRST poll fails (no full page delivered) still
+// arms the catch-up timer, because a notify is a real signal that a durable
+// row exists — unlike a liveness tick. With no further notify, the tail must
+// drain via the timer once the error clears.
+func TestSSEEndpointPhase2NotifyFirstPollErrorStartsCatchup(t *testing.T) {
+	oldPage, oldCap := eventPageSize, sseMaxFullPagesPerWake
+	eventPageSize, sseMaxFullPagesPerWake = 50, 3
+	t.Cleanup(func() { eventPageSize, sseMaxFullPagesPerWake = oldPage, oldCap })
+
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
+
+	// One existing event so the client can connect at head with no replay.
+	publishTestEvent(t, store, bus, "/existing.txt", "write", "")
+
+	// Inject exactly ONE query error on the FIRST Phase-2 poll after the
+	// notify (call 1 is Phase 1, which must succeed so the connection
+	// reaches the live phase).
+	realEventsSinceE := eventsSinceE
+	var pollCalls atomic.Int32
+	eventsSinceE = func(eb *EventBus, ctx context.Context, since uint64) ([]ChangeEvent, uint64, bool, error) {
+		if pollCalls.Add(1) == 2 {
+			return nil, since, true, fmt.Errorf("injected first-poll db error")
+		}
+		return realEventsSinceE(eb, ctx, since)
+	}
+	t.Cleanup(func() { eventsSinceE = realEventsSinceE })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+
+	// First event must be the end-of-Phase-1 heartbeat (caught up at head).
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial heartbeat")
+	}
+	if ev.Event != "heartbeat" {
+		t.Fatalf("first event = %q, want heartbeat", ev.Event)
+	}
+
+	// Commit a 5-page burst and send ONE notify signal. The wake's first poll
+	// fails; the catch-up timer must arm and drain all 5 pages with NO
+	// further Publish.
+	const backlog = 250
+	bulkInsertFSEvents(t, store, backlog)
+	bus.Publish()
+
+	for i := 0; i < backlog; i++ {
+		ev, ok := readSSEEvent(scanner)
+		if !ok {
+			t.Fatalf("stream ended after %d/%d events (notify first-poll error did not arm the catch-up timer)", i, backlog)
+		}
+		if ev.Event != "file_changed" {
+			t.Fatalf("event %d = %q, want file_changed", i, ev.Event)
+		}
+	}
+	if got := pollCalls.Load(); got < 7 {
+		t.Fatalf("poll calls = %d, want >= 7 (phase1 + 1 error + 5 pages + 1 short)", got)
+	}
+}
+
+// TestSSEEndpointPhase1InitialQueryErrorTerminates verifies that a transient
+// (non-missing-table) query error on the FIRST Phase-1 call terminates the
+// stream WITHOUT a caught-up heartbeat: the client must reconnect and resume
+// from its durable cursor rather than believe it is current.
+func TestSSEEndpointPhase1InitialQueryErrorTerminates(t *testing.T) {
+	realEventsSinceE := eventsSinceE
+	var calls atomic.Int32
+	eventsSinceE = func(eb *EventBus, _ context.Context, since uint64) ([]ChangeEvent, uint64, bool, error) {
+		calls.Add(1)
+		return nil, since, true, fmt.Errorf("injected initial transient db error")
+	}
+	t.Cleanup(func() { eventsSinceE = realEventsSinceE })
+
+	srv, store := newSSETestServer(t)
+	bulkInsertFSEvents(t, store, 3) // a backlog exists; the error must not mask it
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// The stream must END immediately: no replay events, no reset, and above
+	// all no caught-up heartbeat. Without termination the read would block
+	// until the 5s ctx timeout.
+	scanner := bufio.NewScanner(resp.Body)
+	if ev, ok := readSSEEvent(scanner); ok {
+		t.Fatalf("expected immediate termination after initial query error, got event %q (false caught-up marker?)", ev.Event)
+	}
+	if calls.Load() < 1 {
+		t.Fatalf("eventsSinceE calls = %d, want >= 1", calls.Load())
+	}
+}
+
+// TestSSEEndpointPhase1MissingTableTolerated verifies the asymmetry: a
+// MISSING fs_events table (pre-migration tenant) keeps the tolerated
+// caught-up fallback — the client gets its heartbeat instead of a
+// reconnect-loop.
+func TestSSEEndpointPhase1MissingTableTolerated(t *testing.T) {
+	srv, store := newSSETestServer(t)
+	if _, err := store.DB().ExecContext(context.Background(), `DROP TABLE fs_events`); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected heartbeat for the missing-table (pre-migration) case")
+	}
+	if ev.Event != "heartbeat" {
+		t.Fatalf("event = %q, want heartbeat (missing table must be tolerated)", ev.Event)
 	}
 }

@@ -157,6 +157,11 @@ func (s *Store) DeleteFSEventsBefore(ctx context.Context, before time.Time, batc
 	}
 	stmt := `DELETE FROM fs_events WHERE ` + s.scope.And(`created_at < ?`) + ` LIMIT ?`
 	for batch := 0; batch < maxBatches; batch++ {
+		// Check ctx between batches so a canceled sweep (server shutdown)
+		// exits promptly instead of running the full batch cap.
+		if err := ctx.Err(); err != nil {
+			return deleted, false, fmt.Errorf("delete fs_events before %s (batch %d): %w", before, batch, err)
+		}
 		res, execErr := s.db.ExecContext(ctx, stmt, s.scope.Args(before, batchSize)...)
 		if execErr != nil {
 			return deleted, false, fmt.Errorf("delete fs_events before %s (batch %d): %w", before, batch, execErr)
@@ -198,6 +203,11 @@ func (s *Store) DeleteSharedFSEventsBefore(ctx context.Context, before time.Time
 	}
 	const stmt = `DELETE FROM fs_events WHERE created_at < ? LIMIT ?`
 	for batch := 0; batch < maxBatches; batch++ {
+		// Check ctx between batches so a canceled sweep (server shutdown)
+		// exits promptly instead of running the full batch cap.
+		if err := ctx.Err(); err != nil {
+			return deleted, false, fmt.Errorf("delete shared fs_events before %s (batch %d): %w", before, batch, err)
+		}
 		res, execErr := s.db.ExecContext(ctx, stmt, before, batchSize)
 		if execErr != nil {
 			return deleted, false, fmt.Errorf("delete shared fs_events before %s (batch %d): %w", before, batch, execErr)

@@ -5134,19 +5134,19 @@ func (s *Store) ClaimSharedMaintenanceRun(ctx context.Context, name string, minI
 	if _, err = s.db.ExecContext(ctx,
 		`INSERT IGNORE INTO shared_maintenance_state (name, last_run_at) VALUES (?, ?)`,
 		name, time.Unix(0, 0).UTC()); err != nil {
-		return false, err
+		return false, fmt.Errorf("seed shared maintenance state %q: %w", name, err)
 	}
 	res, execErr := s.db.ExecContext(ctx,
 		`UPDATE shared_maintenance_state SET last_run_at = NOW(3)
 		 WHERE name = ? AND last_run_at < DATE_SUB(NOW(3), INTERVAL ? SECOND)`,
 		name, int64(minInterval/time.Second))
 	if execErr != nil {
-		err = execErr
+		err = fmt.Errorf("claim shared maintenance %q: %w", name, execErr)
 		return false, err
 	}
 	n, rowsErr := res.RowsAffected()
 	if rowsErr != nil {
-		err = rowsErr
+		err = fmt.Errorf("claim shared maintenance %q rows affected: %w", name, rowsErr)
 		return false, err
 	}
 	return n == 1, nil
