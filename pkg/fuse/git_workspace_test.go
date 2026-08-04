@@ -37,22 +37,32 @@ type gitWorkspaceFixture struct {
 	// overlayPostWait, so tests can open files while a whiteout is in flight.
 	overlayPostEntered     chan struct{}
 	overlayPostEnteredOnce sync.Once
-	objectPacks            map[string]client.GitObjectPack
-	state                  []byte
-	stateStorage           string
-	gitStatePuts           int
-	mode                   string
-	headCommit             string
-	deleted                bool
-	listRequests           int
-	server                 *httptest.Server
-	repoURL                string
-	treeNodes              []client.GitTreeNode
-	readmeObjectSHA        string
-	readmeSize             int64
-	failTree               bool
-	failOverlay            bool
-	failOverlayPut         bool
+	// overlayGetWait/overlayGetEntered park single-entry overlay GETs the same
+	// way, so tests can race an open's read-through against a whiteout.
+	overlayGetWait        chan struct{}
+	overlayGetEntered     chan struct{}
+	overlayGetEnteredOnce sync.Once
+	// overlayGetFillContent makes single-entry GETs synthesize deterministic
+	// content for entries seeded with a size but no inline content (modelling
+	// metadata-only list responses). Off by default so the missing-content
+	// error path stays testable.
+	overlayGetFillContent bool
+	objectPacks           map[string]client.GitObjectPack
+	state                 []byte
+	stateStorage          string
+	gitStatePuts          int
+	mode                  string
+	headCommit            string
+	deleted               bool
+	listRequests          int
+	server                *httptest.Server
+	repoURL               string
+	treeNodes             []client.GitTreeNode
+	readmeObjectSHA       string
+	readmeSize            int64
+	failTree              bool
+	failOverlay           bool
+	failOverlayPut        bool
 }
 
 type gitStateOnlyFixture struct {
@@ -357,18 +367,37 @@ func (f *gitWorkspaceFixture) handleOverlay(w http.ResponseWriter, r *http.Reque
 	switch r.Method {
 	case http.MethodGet:
 		f.mu.Lock()
-		defer f.mu.Unlock()
 		if f.failOverlay {
+			f.mu.Unlock()
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "overlay unavailable"})
 			return
 		}
 		if p := r.URL.Query().Get("path"); p != "" {
+			// Snapshot the entry and the gate channels BEFORE parking: a test
+			// that parks the GET models a response read before a concurrent
+			// whiteout committed and delayed on the wire.
 			entry, ok := f.overlay[p]
+			wait := f.overlayGetWait
+			entered := f.overlayGetEntered
+			fill := f.overlayGetFillContent
+			f.mu.Unlock()
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
 				return
+			}
+			// Single-entry GETs carry the content even when list responses
+			// were metadata-only; entries seeded without content get
+			// deterministic bytes of their declared size.
+			if fill && len(entry.Content) == 0 && entry.SizeBytes > 0 {
+				entry.Content = bytes.Repeat([]byte{0x5a}, int(entry.SizeBytes))
+			}
+			if wait != nil {
+				if entered != nil {
+					f.overlayGetEnteredOnce.Do(func() { close(entered) })
+				}
+				<-wait
 			}
 			_ = json.NewEncoder(w).Encode(entry)
 			return
@@ -377,6 +406,7 @@ func (f *gitWorkspaceFixture) handleOverlay(w http.ResponseWriter, r *http.Reque
 		for _, entry := range f.overlay {
 			entries = append(entries, entry)
 		}
+		f.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries})
 	case http.MethodPost, http.MethodPut:
 		var req client.GitOverlayEntryRequest
@@ -4331,5 +4361,842 @@ func TestGitWorkspaceUnlinkMarksHandlesOpenedDuringWhiteout(t *testing.T) {
 	}
 	if !ok || entry.Op != "whiteout" {
 		t.Fatalf("overlay entry = %+v, %v — want whiteout preserved", entry, ok)
+	}
+}
+
+// TestGitWorkspaceOpenStraddlingWhiteoutMarkedUnlinked: an Open whose overlay
+// read snapshots the pre-whiteout state, but whose handle registers only after
+// the unlink's whiteout and post-commit pass have both completed, must still
+// adopt the unlinked state at registration. Otherwise the handle escapes every
+// marking pass and a later write/flush upserts over the whiteout,
+// resurrecting the deleted name. Here the fixture parks the open's
+// single-entry overlay GET with a pre-whiteout snapshot already taken, the
+// unlink then commits the whiteout and finishes, and the open resumes after.
+func TestGitWorkspaceOpenStraddlingWhiteoutMarkedUnlinked(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	staleContent := bytes.Repeat([]byte{0x5a}, 8)
+	fixture.mu.Lock()
+	fixture.overlay["straddle.txt"] = client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "straddle.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   int64(len(staleContent)),
+		// No inline content: the open's read-through does a single-entry GET,
+		// which is the park point below.
+	}
+	fixture.mu.Unlock()
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "straddle.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+
+	getWait := make(chan struct{})
+	getEntered := make(chan struct{})
+	fixture.mu.Lock()
+	fixture.overlayGetWait = getWait
+	fixture.overlayGetEntered = getEntered
+	fixture.overlayGetFillContent = true
+	fixture.mu.Unlock()
+
+	openDone := make(chan gofuse.Status, 1)
+	var openOut gofuse.OpenOut
+	go func() {
+		openDone <- fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+			Flags:    uint32(syscall.O_RDWR),
+		}, &openOut)
+	}()
+	select {
+	case <-getEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("overlay GET never parked")
+	}
+
+	// Commit the whiteout while the open's read is still parked on its
+	// pre-whiteout snapshot. Both marking passes find no handle for the path.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "straddle.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	close(getWait)
+	if st := <-openDone; st != gofuse.OK {
+		t.Fatalf("Open straddling whiteout status = %v, want OK (anonymous fd)", st)
+	}
+
+	// The straddling open adopted the unlinked state at registration.
+	fh, ok := fs.fileHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("handle missing")
+	}
+	fh.Lock()
+	unlinked := fh.Unlinked
+	fh.Unlock()
+	if !unlinked {
+		t.Fatal("straddling open handle not marked unlinked at registration")
+	}
+
+	// The stale GET snapshot must not have resurrected the name in the local
+	// overlay either.
+	rt, rel, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/straddle.txt")
+	if !ok {
+		t.Fatal("workspace missing after unlink")
+	}
+	if entry, found := rt.overlayEntry(rel); !found || entry.Op != "whiteout" {
+		t.Fatalf("local overlay entry = %+v, %v — want whiteout preserved", entry, found)
+	}
+
+	// Anonymous-fd reads still serve the pre-unlink content.
+	buf := make([]byte, len(staleContent))
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read on unlinked straddled handle = %v, want OK", st)
+	}
+	data, code := result.Bytes(buf)
+	if code != gofuse.OK {
+		t.Fatalf("Read result bytes = %v, want OK", code)
+	}
+	if !bytes.Equal(data, staleContent) {
+		t.Fatalf("Read content = %q, want pre-unlink %q", data, staleContent)
+	}
+
+	// Nothing the handle does may republish the name.
+	v2 := []byte("git-v2-must-stay-local")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write after unlink on straddled handle = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: openOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush after unlink on straddled handle = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["straddle.txt"]
+	puts := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if puts != 1 {
+		t.Fatalf("overlay puts = %d, want 1 (whiteout only) — straddled handle resurrected the entry", puts)
+	}
+	if !ok || entry.Op != "whiteout" {
+		t.Fatalf("remote overlay entry = %+v, %v — want whiteout preserved", entry, ok)
+	}
+	if entry, found := rt.overlayEntry(rel); !found || entry.Op != "whiteout" {
+		t.Fatalf("local overlay entry after writes = %+v, %v — want whiteout preserved", entry, found)
+	}
+}
+
+// TestApplyGitOverlayMirrorEntryUnlessWhiteout covers the open-time mirror
+// primitive directly: prepareGitOpenHandle applies the O_TRUNC dirty-mirror
+// upsert before the handle is registered, so it must lose atomically against
+// an authoritative whiteout (and adopt the unlinked state) instead of
+// upserting over it.
+func TestApplyGitOverlayMirrorEntryUnlessWhiteout(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+
+	// Force the workspace runtime to load before applying overlay entries.
+	if _, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/seed"); !ok {
+		t.Fatal("workspace ws1 not loaded")
+	}
+
+	newGitHandle := func(rel string) *FileHandle {
+		return &FileHandle{
+			Path:           "/repo/" + rel,
+			Layer:          PathLayerGitWorkspace,
+			GitWorkspaceID: "ws1",
+			GitRelPath:     rel,
+			GitKind:        "file",
+		}
+	}
+	pendingHas := func(rel string) bool {
+		fs.gitOverlayMu.Lock()
+		defer fs.gitOverlayMu.Unlock()
+		_, ok := fs.gitOverlayPending["ws1"][rel]
+		return ok
+	}
+	overlayOp := func(rel string) (string, bool) {
+		rt, relPath, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/"+rel)
+		if !ok {
+			return "", false
+		}
+		entry, found := rt.overlayEntry(relPath)
+		return entry.Op, found
+	}
+
+	// A whiteout already authoritative for the path: the mirror upsert is
+	// dropped, nothing is remembered as pending, and the handle adopts the
+	// unlinked state.
+	fs.applyGitOverlayEntry("ws1", client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "gone.txt",
+		Op:          "whiteout",
+		Kind:        "file",
+	})
+	blocked := newGitHandle("gone.txt")
+	fs.applyGitOverlayMirrorEntryUnlessWhiteout(blocked, 0)
+	if !blocked.Unlinked {
+		t.Fatal("handle mirroring over a whiteout not marked unlinked")
+	}
+	if op, found := overlayOp("gone.txt"); !found || op != "whiteout" {
+		t.Fatalf("overlay after blocked mirror = %q, %v — want whiteout preserved", op, found)
+	}
+	if pendingHas("gone.txt") {
+		t.Fatal("blocked mirror left a pending overlay entry")
+	}
+
+	// A live upsert: the mirror entry applies and is remembered as pending,
+	// with the seq captured for ownership-scoped cleanup.
+	live := newGitHandle("live.txt")
+	fs.applyGitOverlayMirrorEntryUnlessWhiteout(live, 5)
+	if live.Unlinked {
+		t.Fatal("handle on a live path wrongly marked unlinked")
+	}
+	if op, found := overlayOp("live.txt"); !found || op != "upsert" {
+		t.Fatalf("overlay after mirror = %q, %v — want upsert", op, found)
+	}
+	if !pendingHas("live.txt") {
+		t.Fatal("mirror entry not remembered as pending")
+	}
+	if live.GitPendingMirrorSeq == 0 {
+		t.Fatal("mirror pending seq not captured on the handle")
+	}
+}
+
+// TestGitWorkspaceOpenSpanningWhiteoutCommitMarkedUnlinked replays the exact
+// straddling schedule reproduced on the PR #804 base in
+// https://github.com/mem9-ai/drive9/issues/817#issuecomment-5138095001:
+// the whiteout POST is parked FIRST, then the open's overlay GET snapshots
+// the old upsert and parks, then the whiteout commits and Unlink returns,
+// and only then does the open resume and register. On the base this produced
+// a registered handle with Unlinked == false whose write/flush flipped the
+// fixture overlay from whiteout back to upsert; here the handle must adopt
+// the unlinked state and the whiteout must survive.
+func TestGitWorkspaceOpenSpanningWhiteoutCommitMarkedUnlinked(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.mu.Lock()
+	fixture.overlay["sync.txt"] = client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "sync.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   8,
+		// No inline content: the open's read-through does a single-entry GET,
+		// which is the park point below.
+	}
+	fixture.mu.Unlock()
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+
+	postWait := make(chan struct{})
+	postEntered := make(chan struct{})
+	getWait := make(chan struct{})
+	getEntered := make(chan struct{})
+	fixture.mu.Lock()
+	fixture.overlayPostWait = postWait
+	fixture.overlayPostEntered = postEntered
+	fixture.overlayGetWait = getWait
+	fixture.overlayGetEntered = getEntered
+	fixture.overlayGetFillContent = true
+	fixture.mu.Unlock()
+
+	// Step 1: start the whiteout unlink and park its overlay POST.
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt")
+	}()
+	select {
+	case <-postEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("whiteout POST never parked")
+	}
+
+	// Step 2: start the open; its overlay GET snapshots the old upsert (the
+	// whiteout has not committed yet) and parks before handle registration.
+	openDone := make(chan gofuse.Status, 1)
+	var openOut gofuse.OpenOut
+	go func() {
+		openDone <- fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+			Flags:    uint32(syscall.O_RDWR),
+		}, &openOut)
+	}()
+	select {
+	case <-getEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("overlay GET never parked")
+	}
+
+	// Step 3: release the whiteout and let the unlink finish — pass 1 already
+	// ran before the POST, and the post-commit pass still finds no handle.
+	close(postWait)
+	if st := <-unlinkDone; st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+
+	// Step 4: release the stale snapshot; the open resumes and registers.
+	close(getWait)
+	if st := <-openDone; st != gofuse.OK {
+		t.Fatalf("Open spanning whiteout status = %v, want OK (anonymous fd)", st)
+	}
+
+	// The straddling open adopted the unlinked state at registration.
+	fh, ok := fs.fileHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("handle missing")
+	}
+	fh.Lock()
+	unlinked := fh.Unlinked
+	fh.Unlock()
+	if !unlinked {
+		t.Fatal("handle registered after spanning the whiteout has Unlinked == false")
+	}
+
+	// Write/flush through the handle must not flip the committed whiteout
+	// back to an upsert.
+	v2 := []byte("git-v2-must-stay-local")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write after unlink on straddled handle = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: openOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush after unlink on straddled handle = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	puts := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if puts != 1 {
+		t.Fatalf("overlay puts = %d, want 1 (whiteout only) — straddled handle resurrected the entry", puts)
+	}
+	if !ok || entry.Op != "whiteout" {
+		t.Fatalf("remote overlay entry = %+v, %v — want whiteout preserved", entry, ok)
+	}
+}
+
+// TestPrepareGitOpenHandleTruncOnWhiteoutAdoptsUnlinked: an O_TRUNC open whose
+// dirty-mirror upsert races a committed whiteout must lose against the
+// whiteout (adopting the unlinked state) instead of upserting the name back
+// into the live overlay. prepareGitOpenHandle runs before handle
+// registration, so neither the unlink's marking passes nor the fh.Unlinked
+// guard in applyGitOverlayMirrorEntry can cover it.
+func TestPrepareGitOpenHandleTruncOnWhiteoutAdoptsUnlinked(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.mu.Lock()
+	fixture.overlay["trunc.txt"] = client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "trunc.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   4,
+		Content:     []byte("data"),
+	}
+	fixture.mu.Unlock()
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "trunc.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "trunc.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+
+	// Model the straddle at the prepare level: the whiteout is committed
+	// before the O_TRUNC dirty-mirror upsert runs.
+	fh := &FileHandle{
+		Ino:         lookupOut.NodeId,
+		Path:        "/repo/trunc.txt",
+		Flags:       uint32(syscall.O_TRUNC | syscall.O_RDWR),
+		WritePolicy: WritePolicyWriteSync,
+	}
+	if st := fs.prepareGitOpenHandle(context.Background(), fh, fh.Flags); st != gofuse.OK {
+		t.Fatalf("prepareGitOpenHandle status = %v, want OK (anonymous fd)", st)
+	}
+	if !fh.Unlinked {
+		t.Fatal("O_TRUNC open over a whiteout not marked unlinked")
+	}
+	rt, rel, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/trunc.txt")
+	if !ok {
+		t.Fatal("workspace missing after unlink")
+	}
+	if entry, found := rt.overlayEntry(rel); !found || entry.Op != "whiteout" {
+		t.Fatalf("local overlay entry = %+v, %v — want whiteout preserved (mirror resurrected it)", entry, found)
+	}
+	fs.gitOverlayMu.Lock()
+	_, pending := fs.gitOverlayPending["ws1"]["trunc.txt"]
+	fs.gitOverlayMu.Unlock()
+	if pending {
+		t.Fatal("blocked mirror left a pending overlay entry")
+	}
+}
+
+// TestGitWorkspaceRegistrationDropsStalePendingMirrorEntry replays the
+// pending-map gap from the adversarial review: the open-time mirror applies
+// its upsert, the whiteout's sync commit (forget pending, then apply) lands
+// before the mirror's pending registration runs, and the stale pending upsert
+// would be replayed by mergePendingGitOverlayEntries over the server whiteout
+// on the next refresh. Registration-time adoption of the unlinked state must
+// drop it.
+func TestGitWorkspaceRegistrationDropsStalePendingMirrorEntry(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+
+	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/race.txt")
+	if !ok {
+		t.Fatal("workspace ws1 not loaded")
+	}
+
+	// The open-time mirror applies its upsert while no whiteout exists yet.
+	upsert := client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "race.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+	}
+	applied, blocked := fs.applyGitOverlayEntryUnlessWhiteout("ws1", upsert)
+	if !applied || blocked {
+		t.Fatalf("mirror apply = %v, blocked %v — want applied", applied, blocked)
+	}
+	// The parked gap: the whiteout's sync commit (forget pending, then apply)
+	// lands between the mirror's whiteout-checked apply and its pending
+	// registration...
+	fs.forgetPendingGitOverlayEntry("ws1", "race.txt", 0)
+	fs.applyGitOverlayEntry("ws1", client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "race.txt",
+		Op:          "whiteout",
+		Kind:        "file",
+	})
+	// ...and only then does the mirror's pending registration run — stale.
+	staleSeq := fs.rememberPendingGitOverlayEntry("ws1", upsert)
+
+	// Registration marks the straddled handle and must drop the stale pending
+	// (seq-scoped to this handle's own mirror entry).
+	fh := &FileHandle{
+		Path:                "/repo/race.txt",
+		Layer:               PathLayerGitWorkspace,
+		GitWorkspaceID:      "ws1",
+		GitRelPath:          "race.txt",
+		GitKind:             "file",
+		GitPendingMirrorSeq: staleSeq,
+	}
+	fs.allocateGitWorkspaceFileHandle(context.Background(), fh, rt, "race.txt")
+	if !fh.Unlinked {
+		t.Fatal("handle not marked unlinked at registration")
+	}
+	fs.gitOverlayMu.Lock()
+	_, pending := fs.gitOverlayPending["ws1"]["race.txt"]
+	fs.gitOverlayMu.Unlock()
+	if pending {
+		t.Fatal("stale pending mirror upsert survived registration")
+	}
+
+	// A workspace refresh merging pending entries over the server state must
+	// keep the authoritative whiteout.
+	serverOverlay := map[string]client.GitOverlayEntry{
+		"race.txt": {WorkspaceID: "ws1", Path: "race.txt", Op: "whiteout", Kind: "file"},
+	}
+	fs.mergePendingGitOverlayEntries("ws1", serverOverlay)
+	if got := serverOverlay["race.txt"].Op; got != "whiteout" {
+		t.Fatalf("merged overlay op = %q, want whiteout; stale mirror pending resurrected path", got)
+	}
+}
+
+// TestGitWorkspaceReadonlyOpenStraddlingWhiteoutReadsPreUnlinkContent: a
+// read-only open whose registration adopts the unlinked state must keep
+// serving the pre-unlink contents (POSIX anonymous-fd reads), not EOF.
+// Read-only opens do not preload, so the registration-time backing comes from
+// the overlay content the open observed in prepareGitOpenHandle.
+func TestGitWorkspaceReadonlyOpenStraddlingWhiteoutReadsPreUnlinkContent(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	content := []byte("read-only-before-unlink")
+	fixture.mu.Lock()
+	fixture.overlay["ro.txt"] = client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "ro.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   int64(len(content)),
+		Content:     content,
+	}
+	fixture.mu.Unlock()
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "ro.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+
+	// Model the straddle deterministically at the prepare/register boundary:
+	// prepare (read-only — stashes the observed overlay content), the
+	// whiteout commits, then registration adopts the unlinked state.
+	fh := &FileHandle{
+		Ino:         lookupOut.NodeId,
+		Path:        "/repo/ro.txt",
+		Flags:       uint32(syscall.O_RDONLY),
+		WritePolicy: WritePolicyWriteSync,
+	}
+	if st := fs.prepareGitOpenHandle(context.Background(), fh, fh.Flags); st != gofuse.OK {
+		t.Fatalf("prepareGitOpenHandle status = %v, want OK", st)
+	}
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "ro.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	rt, rel, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/ro.txt")
+	if !ok {
+		t.Fatal("workspace missing after unlink")
+	}
+	fhID := fs.allocateGitWorkspaceFileHandle(context.Background(), fh, rt, rel)
+	if !fh.Unlinked {
+		t.Fatal("read-only straddled handle not marked unlinked")
+	}
+
+	// The anonymous fd keeps serving the pre-unlink contents.
+	buf := make([]byte, len(content))
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       fhID,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read on unlinked read-only handle = %v, want OK", st)
+	}
+	data, code := result.Bytes(buf)
+	if code != gofuse.OK {
+		t.Fatalf("Read result bytes = %v, want OK", code)
+	}
+	if !bytes.Equal(data, content) {
+		t.Fatalf("read content = %q, want %q", data, content)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: fhID})
+}
+
+// TestGitWorkspaceStraddledOpenRemovesStaleDirtyMirror: when the whiteout
+// wins against an open-time dirty mirror, the mirror pathname must be removed
+// (the open fd stays as the anonymous backing). Otherwise a later same-path
+// replacement is shadowed by the stale mirror — readGitDirtyMirror is
+// consulted before the overlay entry.
+func TestGitWorkspaceStraddledOpenRemovesStaleDirtyMirror(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.mu.Lock()
+	fixture.overlay["trunc.txt"] = client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "trunc.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   4,
+		Content:     []byte("data"),
+	}
+	fixture.mu.Unlock()
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "trunc.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "trunc.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+
+	// O_TRUNC prepare after the whiteout: the mirror file is created, the
+	// mirror upsert loses against the whiteout, the handle adopts unlinked.
+	fh := &FileHandle{
+		Ino:         lookupOut.NodeId,
+		Path:        "/repo/trunc.txt",
+		Flags:       uint32(syscall.O_TRUNC | syscall.O_RDWR),
+		WritePolicy: WritePolicyWriteSync,
+	}
+	if st := fs.prepareGitOpenHandle(context.Background(), fh, fh.Flags); st != gofuse.OK {
+		t.Fatalf("prepareGitOpenHandle status = %v, want OK", st)
+	}
+	if !fh.Unlinked {
+		t.Fatal("O_TRUNC open over a whiteout not marked unlinked")
+	}
+	rt, rel, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/trunc.txt")
+	if !ok {
+		t.Fatal("workspace missing after unlink")
+	}
+	mirrorPath, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel)
+	if !ok {
+		t.Fatal("dirty mirror path unavailable")
+	}
+	if _, err := os.Stat(mirrorPath); err != nil {
+		t.Fatalf("dirty mirror missing before registration: %v", err)
+	}
+
+	// Registration removes the mirror pathname; the open fd remains the
+	// handle's anonymous backing.
+	fhID := fs.allocateGitWorkspaceFileHandle(context.Background(), fh, rt, rel)
+	if _, err := os.Stat(mirrorPath); !os.IsNotExist(err) {
+		t.Fatalf("dirty mirror pathname survived registration: err=%v", err)
+	}
+
+	// A legitimate same-path replacement must serve its own bytes, not the
+	// stale anonymous mirror's.
+	replacement := []byte("replacement")
+	fs.applyGitOverlayEntry("ws1", client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "trunc.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   int64(len(replacement)),
+		Content:     replacement,
+	})
+	got, err := fs.readGitFile(context.Background(), "/repo/trunc.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("readGitFile replacement: %v", err)
+	}
+	if !bytes.Equal(got, replacement) {
+		t.Fatalf("read replacement = %q, want %q; stale trunc mirror shadowed recreated path", got, replacement)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: fhID})
+}
+
+// TestGitWorkspaceReadonlyOpenStraddlingWhiteoutReadsMetadataOnlyContent: a
+// read-only open of a metadata-only overlay entry (list responses may omit
+// content) whose read-through GET snapshots the pre-whiteout state must still
+// serve the pre-unlink bytes after registration adopts the unlinked state —
+// not EOF. prepareGitOpenHandle fetches the bytes up front for exactly this
+// case; the fixture parks the GET so the whiteout commits mid-open.
+func TestGitWorkspaceReadonlyOpenStraddlingWhiteoutReadsMetadataOnlyContent(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	want := bytes.Repeat([]byte{0x5a}, 7)
+	fixture.mu.Lock()
+	fixture.overlay["meta.txt"] = client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "meta.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   int64(len(want)),
+		// No inline content: metadata-only — the open's read-through does a
+		// single-entry GET, which is the park point below.
+	}
+	fixture.mu.Unlock()
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "meta.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+
+	getWait := make(chan struct{})
+	getEntered := make(chan struct{})
+	fixture.mu.Lock()
+	fixture.overlayGetWait = getWait
+	fixture.overlayGetEntered = getEntered
+	fixture.overlayGetFillContent = true
+	fixture.mu.Unlock()
+
+	openDone := make(chan gofuse.Status, 1)
+	var openOut gofuse.OpenOut
+	go func() {
+		openDone <- fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+			Flags:    uint32(syscall.O_RDONLY),
+		}, &openOut)
+	}()
+	select {
+	case <-getEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("overlay GET never parked")
+	}
+
+	// Commit the whiteout while the open's read-through is parked on its
+	// pre-whiteout snapshot, then let the open resume and register.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "meta.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	close(getWait)
+	if st := <-openDone; st != gofuse.OK {
+		t.Fatalf("Open straddling whiteout status = %v, want OK (anonymous fd)", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("handle missing")
+	}
+	fh.Lock()
+	unlinked := fh.Unlinked
+	fh.Unlock()
+	if !unlinked {
+		t.Fatal("read-only straddled handle not marked unlinked")
+	}
+
+	// The anonymous fd serves the pre-unlink bytes, not EOF.
+	buf := make([]byte, len(want))
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read on unlinked read-only handle = %v, want OK", st)
+	}
+	data, code := result.Bytes(buf)
+	if code != gofuse.OK {
+		t.Fatalf("Read result bytes = %v, want OK", code)
+	}
+	if !bytes.Equal(data, want) {
+		t.Fatalf("read content = %q, want %q", data, want)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+}
+
+// TestGitWorkspaceStraddleAdoptionPreservesSamePathRecreate: the adoption
+// cleanup that runs after the registration re-check must be ownership-scoped.
+// A legitimate same-path recreate that lands between the re-check and the
+// cleanup applies its own overlay upsert (with a newer pending seq) and then
+// creates its dirty mirror; the straddled handle's cleanup must drop only its
+// own stale pending entry and must not remove the recreate's mirror.
+func TestGitWorkspaceStraddleAdoptionPreservesSamePathRecreate(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+
+	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/recreate.txt")
+	if !ok {
+		t.Fatal("workspace ws1 not loaded")
+	}
+
+	// The straddler's open-time mirror applied and remembered its upsert while
+	// no whiteout existed yet.
+	straddler := &FileHandle{
+		Path:           "/repo/recreate.txt",
+		Layer:          PathLayerGitWorkspace,
+		GitWorkspaceID: "ws1",
+		GitRelPath:     "recreate.txt",
+		GitKind:        "file",
+	}
+	fs.applyGitOverlayMirrorEntryUnlessWhiteout(straddler, 0)
+	if straddler.GitPendingMirrorSeq == 0 {
+		t.Fatal("mirror pending seq not captured on the straddler")
+	}
+
+	// The whiteout's sync commit lands (forget pending, then apply).
+	fs.forgetPendingGitOverlayEntry("ws1", "recreate.txt", 0)
+	fs.applyGitOverlayEntry("ws1", client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "recreate.txt",
+		Op:          "whiteout",
+		Kind:        "file",
+	})
+	// The straggling pending registration runs after it — stale.
+	fs.rememberPendingGitOverlayEntry("ws1", client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "recreate.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+	})
+
+	// The registration re-check sees the whiteout and marks the straddler.
+	if !fs.registerGitWorkspaceHandle(straddler, rt, "recreate.txt") {
+		t.Fatal("straddler not marked unlinked at registration")
+	}
+
+	// A legitimate recreate lands BEFORE the adoption cleanup: its overlay
+	// upsert first (newer pending seq), then its dirty mirror.
+	replacement := []byte("replacement")
+	recreate := &FileHandle{
+		Path:           "/repo/recreate.txt",
+		Layer:          PathLayerGitWorkspace,
+		GitWorkspaceID: "ws1",
+		GitRelPath:     "recreate.txt",
+		GitKind:        "file",
+	}
+	fs.applyGitOverlayMirrorEntry(recreate, int64(len(replacement)))
+	mirrorFile, ok := fs.openGitDirtyMirrorFile(rt, "recreate.txt", uint32(syscall.O_RDWR), replacement)
+	if !ok {
+		t.Fatal("recreate dirty mirror not created")
+	}
+	defer func() { _ = mirrorFile.Close() }()
+	mirrorPath, ok := fs.gitWorkspaceDirtyMirrorPath(rt, "recreate.txt")
+	if !ok {
+		t.Fatal("dirty mirror path unavailable")
+	}
+
+	// The straddler's late cleanup must not delete the recreate's state.
+	fs.cleanupGitWhiteoutAdoption(context.Background(), straddler, rt, "recreate.txt")
+
+	// The pending entry that owns the path must be the recreate's upsert (the
+	// straddler's stale size-0 entry is dropped seq-scoped; the recreate's
+	// newer-seq entry survives).
+	fs.gitOverlayMu.Lock()
+	pending, hasPending := fs.gitOverlayPending["ws1"]["recreate.txt"]
+	fs.gitOverlayMu.Unlock()
+	if !hasPending {
+		t.Fatal("adoption cleanup deleted the recreate's pending entry")
+	}
+	if pending.entry.Op != "upsert" || pending.entry.SizeBytes != int64(len(replacement)) {
+		t.Fatalf("pending entry after cleanup = %+v — want recreate upsert (size %d)", pending.entry, len(replacement))
+	}
+	entry, found := rt.overlayEntry("recreate.txt")
+	if !found || entry.Op != "upsert" || entry.SizeBytes != int64(len(replacement)) {
+		t.Fatalf("overlay after cleanup = %+v, %v — want recreate upsert preserved", entry, found)
+	}
+	mirrorData, err := os.ReadFile(mirrorPath)
+	if err != nil {
+		t.Fatalf("recreate dirty mirror removed by adoption cleanup: %v", err)
+	}
+	if !bytes.Equal(mirrorData, replacement) {
+		t.Fatalf("recreate dirty mirror content = %q, want %q", mirrorData, replacement)
 	}
 }

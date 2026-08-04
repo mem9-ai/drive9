@@ -45,17 +45,31 @@ type FileHandle struct {
 	GitKind           string
 	GitMode           string
 	GitBaseObjectSHA  string
-	PendingMode       uint32 // mode change deferred because a dirty handle was open
-	HasPendingMode    bool   // true when PendingMode should be applied on Release
-	PendingModeGen    uint64 // generation for PendingMode, used to avoid clearing newer chmods
-	PreviousMode      uint32 // mode before PendingMode was set (for rollback on flush failure)
-	HasPreviousMode   bool   // true when previous mode state was snapshotted
-	PreviousModeKnown bool   // true when PreviousMode was authoritative
-	Unlinked          bool   // true after the directory entry was removed while this handle stayed open
-	UnlinkedSnapshot  bool   // true when UnlinkedData is an authoritative read snapshot
-	UnlinkedData      []byte // read-only snapshot for open-but-unlinked remote files
-	UnlinkedShadowGen uint64 // generation pin for large open-unlink snapshots stored in ShadowStore
-	UnlinkedSize      int64
+	// GitOpenSnapshot is the overlay entry content observed (or fetched, for
+	// metadata-only entries) by a read-only prepareGitOpenHandle. It exists
+	// so a whiteout racing the rest of the open can still give the registered
+	// handle an anonymous-fd read backing (see
+	// preserveGitUnlinkedReadBacking); nil for writable opens (they preload
+	// into Dirty / the dirty mirror) and for clean-tree files (their
+	// content-addressed backing is whiteout-immune).
+	GitOpenSnapshot []byte
+	// GitPendingMirrorSeq is the pending-map sequence of this handle's
+	// open-time dirty-mirror upsert (0 = none). Registration-time whiteout
+	// adoption uses it to drop only THIS handle's stale pending entry — a
+	// legitimate same-path recreate re-remembers the path with a newer seq
+	// and must survive the cleanup.
+	GitPendingMirrorSeq uint64
+	PendingMode         uint32 // mode change deferred because a dirty handle was open
+	HasPendingMode      bool   // true when PendingMode should be applied on Release
+	PendingModeGen      uint64 // generation for PendingMode, used to avoid clearing newer chmods
+	PreviousMode        uint32 // mode before PendingMode was set (for rollback on flush failure)
+	HasPreviousMode     bool   // true when previous mode state was snapshotted
+	PreviousModeKnown   bool   // true when PreviousMode was authoritative
+	Unlinked            bool   // true after the directory entry was removed while this handle stayed open
+	UnlinkedSnapshot    bool   // true when UnlinkedData is an authoritative read snapshot
+	UnlinkedData        []byte // read-only snapshot for open-but-unlinked remote files
+	UnlinkedShadowGen   uint64 // generation pin for large open-unlink snapshots stored in ShadowStore
+	UnlinkedSize        int64
 	// Staging generations recorded when this handle staged path-keyed state.
 	// discardUnlinkedHandleStateLocked uses them for ownership-scoped cleanup:
 	// after a pathname is unlinked and recreated, path-global removes would

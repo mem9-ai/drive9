@@ -29,6 +29,13 @@ func (idx *OpenHandleIndex) Add(fh *FileHandle) {
 	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	idx.addLocked(fh)
+}
+
+// addLocked inserts fh into the indexes; the caller must hold idx.mu. It
+// exists so a registration can be made atomic with another check (see
+// allocateGitWorkspaceFileHandle).
+func (idx *OpenHandleIndex) addLocked(fh *FileHandle) {
 	addHandleToSet(idx.byInode, fh.Ino, fh)
 	addHandleToSet(idx.byPath, fh.Path, fh)
 	idx.pathByHandle[fh] = fh.Path
