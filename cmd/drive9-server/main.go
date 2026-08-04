@@ -413,6 +413,12 @@ func main() {
 	// the central tenant_notify_outbox (always-provisioned meta DB) at 200ms and
 	// dispatches by work_mask. See pkg/server/tenant_outbox_poller.go.
 	sseNotifyRetention := envDuration("DRIVE9_SSE_NOTIFY_RETENTION", time.Hour)
+	// fs_events is the durable SSE replay log. Its retention is deliberately
+	// independent of the outbox retention above: production sets 168h so
+	// consumer outages within a week remain replayable. The same value feeds
+	// both sweep paths (lazy write-path sweep + tenant worker backstop).
+	fsEventsRetention := envDuration("DRIVE9_FS_EVENTS_RETENTION", time.Hour)
+	tenantWorkerOpts.FSEventsRetention = fsEventsRetention
 	podID := strings.TrimSpace(os.Getenv("DRIVE9_POD_ID"))
 	podAddr := strings.TrimSpace(os.Getenv("DRIVE9_POD_ADDR"))
 	// Default podAddr to the listen addr only if it's a real, non-wildcard
@@ -425,16 +431,12 @@ func main() {
 			podAddr = "http://" + net.JoinHostPort(host, port)
 		}
 	}
-	var podNotifySecret []byte
-	if raw := strings.TrimSpace(os.Getenv("DRIVE9_POD_NOTIFY_SECRET")); raw != "" {
-		podNotifySecret = []byte(raw)
-	}
 	if podID != "" {
 		logger.Info(context.Background(), "tenant_outbox_config",
 			zap.String("pod_id", podID),
 			zap.String("pod_addr", podAddr),
 			zap.Duration("retention", sseNotifyRetention),
-			zap.Bool("push_enabled", podNotifySecret != nil))
+			zap.Duration("fs_events_retention", fsEventsRetention))
 	}
 
 	srv := server.NewWithConfig(server.Config{
@@ -493,9 +495,10 @@ func main() {
 		TenantMaintenanceInterval:       envDurationCompat("DRIVE9_TENANT_MAINTENANCE_INTERVAL", "DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS", 5*time.Minute),
 		SafetyNetScanInterval:           envDurationCompat("DRIVE9_SAFETY_NET_SCAN_INTERVAL", "DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS", 5*time.Minute),
 		SSENotifyRetention:              sseNotifyRetention,
+		FSEventsRetention:               fsEventsRetention,
+		SSELivenessPollInterval:         envDuration("DRIVE9_SSE_LIVENESS_POLL_INTERVAL", 0),
 		PodID:                           podID,
 		PodAddr:                         podAddr,
-		PodNotifySecret:                 podNotifySecret,
 	})
 
 	// Graceful shutdown: on SIGINT/SIGTERM drain in-flight requests so
@@ -715,18 +718,21 @@ environment:
 
   SSE cross-pod notification (set DRIVE9_POD_ID to enable; required for large multi-tenant deployments):
   DRIVE9_POD_ID     unique pod identifier; when set, this pod registers in the central
-                    pod_registry and reports its SSE subscriber tenant set so peers can
-                    route push notifications. The outbox poller runs on all multi-tenant
-                    pods regardless; cross-pod HTTP push requires DRIVE9_POD_NOTIFY_SECRET.
-  DRIVE9_POD_ADDR   full base URL (e.g. http://10.0.0.5:9009) reachable by other pods for
-                    peer push notifications. Defaults to http://<listen-addr> when the
-                    listen address is a non-wildcard host; must be set explicitly in
-                    multi-host deployments.
-  DRIVE9_POD_NOTIFY_SECRET  shared bearer token for the legacy /v1/internal/sse-notify
-                    pod-to-pod endpoint (retained for backward compat; the unified
-                    outbox poller is the primary cross-pod path).
+                    pod_registry and reports its SSE subscriber tenant set. The outbox
+                    poller runs on all multi-tenant pods regardless.
+  DRIVE9_POD_ADDR   full base URL (e.g. http://10.0.0.5:9009) advertised in the pod
+                    registry. Defaults to http://<listen-addr> when the listen address
+                    is a non-wildcard host; must be set explicitly in multi-host
+                    deployments.
   DRIVE9_SSE_NOTIFY_RETENTION      how long tenant_notify_outbox rows are kept before
                     leader pruning (default: 1h)
+  DRIVE9_FS_EVENTS_RETENTION       how long fs_events rows are kept before lazy
+                    write-path and piggyback-maintenance pruning (default: 1h;
+                    production: 168h). Independent of DRIVE9_SSE_NOTIFY_RETENTION:
+                    fs_events is the durable replay log, the outbox is a lossy hint.
+  DRIVE9_SSE_LIVENESS_POLL_INTERVAL
+                    optional per-connection SSE liveness poll interval covering
+                    signal loss for connected clients (default: 0 = off)
   DRIVE9_TENANT_OUTBOX_POLL_INTERVAL     unified outbox poll interval (default: 200ms)
   DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_INTERVAL
                     how often the poller persists its cursor (default: 5s)

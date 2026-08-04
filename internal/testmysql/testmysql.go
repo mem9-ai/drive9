@@ -135,6 +135,9 @@ func ResetMetaDB(t *testing.T, db *sql.DB) {
 		"DELETE FROM db_pool",
 		"DELETE FROM fs_registry",
 		"DELETE FROM tenants",
+		"DELETE FROM tenant_notify_outbox",
+		"DELETE FROM tenant_outbox_cursor",
+		"DELETE FROM shared_maintenance_state",
 	}
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {

@@ -1095,6 +1095,15 @@ func metaInitSchemaStatements() []string {
 			updated_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			PRIMARY KEY (pod_id)
 		)`,
+		// shared_maintenance_state holds one row per cluster-wide maintenance
+		// task (e.g. the shared-pool fs_events sweep) so all pods can throttle
+		// against each other via an atomic claim instead of each running the
+		// task on its own interval.
+		`CREATE TABLE IF NOT EXISTS shared_maintenance_state (
+			name        VARCHAR(64) NOT NULL,
+			last_run_at DATETIME(3) NOT NULL,
+			PRIMARY KEY (name)
+		)`,
 	}
 }
 
@@ -4647,8 +4656,8 @@ func (s *Store) UpsertPod(ctx context.Context, podID, addr string) (err error) {
 	return err
 }
 
-// ListActivePods returns all active pods excluding selfID. Used by the pod
-// notifier to build its peer list for cross-pod HTTP push.
+// ListActivePods returns all active pods excluding selfID. Used by the shard
+// resolver to build the active pod ring and by tests to verify registration.
 func (s *Store) ListActivePods(ctx context.Context, selfID string) (out []PodRow, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_active_pods", start, &err)
@@ -4998,21 +5007,34 @@ func (s *Store) MaxTenantNotifyID(ctx context.Context) (out uint64, err error) {
 	return out, nil
 }
 
+// tenantOutboxCursorFreshnessBound is the maximum age of a cursor's
+// updated_at for that cursor to hold back outbox pruning. A pod whose
+// heartbeat is healthy but whose outbox poller is stuck stops refreshing its
+// cursor; ignoring cursors older than this bound prevents such a stalled pod
+// from pinning MIN(last_id) forever and growing the 1-hour outbox unboundedly.
+const tenantOutboxCursorFreshnessBound = 10 * time.Minute
+
 // DeleteTenantNotifyBefore prunes outbox rows older than the given threshold.
 // Leader-gated; retention is relative to DB insert time (created_at). Rows are
-// only pruned up to the minimum last_id across all pods' cursors so a lagging
-// pod that has not yet processed a row does not lose its work signal. When no
-// cursors exist (e.g. before any pod has registered), falls back to age-only
-// pruning.
+// only pruned up to the minimum last_id across pods' cursors so a lagging pod
+// that has not yet processed a row does not lose its work signal. Cursors
+// whose updated_at is older than tenantOutboxCursorFreshnessBound are ignored
+// when computing that floor: SSE notify rows are lossy hints, and pruning past
+// a stalled pod's cursor is safe — its online clients simply STALL (no new
+// wake-ups) until they reconnect and recover via replay (or, if enabled, the
+// per-connection liveness poll detects the signal loss). When no fresh
+// cursors remain (e.g. before any pod has registered), pruning falls back to
+// age alone.
 func (s *Store) DeleteTenantNotifyBefore(ctx context.Context, before time.Time) (n int64, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "delete_tenant_notify_before", start, &err)
+	freshSince := start.Add(-tenantOutboxCursorFreshnessBound)
 	res, err := s.db.ExecContext(ctx, `DELETE FROM tenant_notify_outbox
 WHERE created_at < ?
 AND (
-  NOT EXISTS (SELECT 1 FROM tenant_outbox_cursor)
-  OR id <= (SELECT MIN(last_id) FROM tenant_outbox_cursor)
-)`, before)
+  NOT EXISTS (SELECT 1 FROM tenant_outbox_cursor WHERE updated_at >= ?)
+  OR id <= (SELECT MIN(last_id) FROM tenant_outbox_cursor WHERE updated_at >= ?)
+)`, before, freshSince, freshSince)
 	if err != nil {
 		return 0, err
 	}
@@ -5054,14 +5076,26 @@ func (s *Store) GetTenantOutboxCursor(ctx context.Context, podID string) (out *T
 
 // UpsertTenantOutboxCursor persists (or refreshes) the cursor for podID. The
 // poller flushes its in-memory last_id every few seconds so a restart resumes
-// from the last processed row.
+// from the last processed row. updated_at advances only when last_id advances:
+// the DeleteTenantNotifyBefore freshness bound uses updated_at to detect
+// stalled pods, and a pod whose poll query keeps failing (while its cursor
+// flush still succeeds) must be allowed to go stale. A healthy caught-up pod
+// also goes stale during zero-traffic periods and falls out of the prune
+// floor — safe, because age-only pruning then applies and the 1-hour age gate
+// leaves it an hour of rows to resume from.
 func (s *Store) UpsertTenantOutboxCursor(ctx context.Context, podID string, lastID uint64) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "upsert_tenant_outbox_cursor", start, &err)
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO tenant_outbox_cursor (pod_id, last_id) VALUES (?, ?)
-		 ON DUPLICATE KEY UPDATE last_id = VALUES(last_id), updated_at = CURRENT_TIMESTAMP(3)`,
+		 ON DUPLICATE KEY UPDATE updated_at = IF(VALUES(last_id) > last_id, CURRENT_TIMESTAMP(3), updated_at),
+		                         last_id = VALUES(last_id)`,
 		podID, lastID)
+	// NOTE: assignment order is load-bearing. MySQL/TiDB evaluate ON
+	// DUPLICATE KEY UPDATE assignments left to right, so the updated_at
+	// comparison must run BEFORE last_id is overwritten — otherwise
+	// VALUES(last_id) > last_id compares the new value against itself and
+	// updated_at never refreshes.
 	return err
 }
 
@@ -5080,6 +5114,42 @@ func (s *Store) DeleteTenantOutboxCursor(ctx context.Context, podID string) (err
 		 AND EXISTS (SELECT 1 FROM pod_registry WHERE pod_id = ? AND status = 'stale')`,
 		podID, podID)
 	return err
+}
+
+// ---------------------------------------------------------------------------
+// Shared maintenance state
+// ---------------------------------------------------------------------------
+
+// ClaimSharedMaintenanceRun atomically claims the right to run the named
+// cluster-wide maintenance task (e.g. the shared-pool fs_events sweep).
+// Exactly one caller across all pods wins per minInterval window: the UPDATE
+// only succeeds when the stored last_run_at is older than the interval, and
+// the winner stamps its own run in the same statement. The row is created
+// lazily via INSERT IGNORE (seeded at the epoch so the first claim always
+// wins). Callers should keep a cheap local pre-filter so the common case
+// never reaches the meta DB.
+func (s *Store) ClaimSharedMaintenanceRun(ctx context.Context, name string, minInterval time.Duration) (claimed bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "claim_shared_maintenance_run", start, &err)
+	if _, err = s.db.ExecContext(ctx,
+		`INSERT IGNORE INTO shared_maintenance_state (name, last_run_at) VALUES (?, ?)`,
+		name, time.Unix(0, 0).UTC()); err != nil {
+		return false, fmt.Errorf("seed shared maintenance state %q: %w", name, err)
+	}
+	res, execErr := s.db.ExecContext(ctx,
+		`UPDATE shared_maintenance_state SET last_run_at = NOW(3)
+		 WHERE name = ? AND last_run_at < DATE_SUB(NOW(3), INTERVAL ? SECOND)`,
+		name, int64(minInterval/time.Second))
+	if execErr != nil {
+		err = fmt.Errorf("claim shared maintenance %q: %w", name, execErr)
+		return false, err
+	}
+	n, rowsErr := res.RowsAffected()
+	if rowsErr != nil {
+		err = fmt.Errorf("claim shared maintenance %q rows affected: %w", name, rowsErr)
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // ListAllActivePodIDs returns the pod_id of every active pod in pod_registry,

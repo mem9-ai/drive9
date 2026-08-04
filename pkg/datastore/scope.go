@@ -17,6 +17,12 @@ package datastore
 type Scope struct {
 	fsID   int64
 	shared bool
+	// dbID is the physical shared-DB pool id (db_pool.db_id) backing this
+	// scope; 0 for standalone stores and for shared scopes whose pool is
+	// unknown (tests, legacy construction). Cluster-wide maintenance (the
+	// shared fs_events sweep) keys its throttle on it so multiple shared
+	// pools sweep independently.
+	dbID int64
 }
 
 // StandaloneScope returns the Scope for a per-tenant database with the
@@ -29,8 +35,16 @@ func StandaloneScope(fsID int64) Scope {
 
 // SharedScope returns the Scope for a shared database whose tables carry an
 // fs_id column. fsID must be the tenant's registered id from fs_registry.
+// The physical pool id is unknown (0); prefer SharedScopeWithDB when it is
+// available.
 func SharedScope(fsID int64) Scope {
 	return Scope{fsID: fsID, shared: true}
+}
+
+// SharedScopeWithDB is SharedScope plus the physical shared-DB pool id
+// (db_pool.db_id) backing the connection.
+func SharedScopeWithDB(fsID, dbID int64) Scope {
+	return Scope{fsID: fsID, shared: true, dbID: dbID}
 }
 
 // Shared reports whether the Store addresses a shared-schema database.
@@ -38,6 +52,10 @@ func (s Scope) Shared() bool { return s.shared }
 
 // FsID returns the tenant's internal numeric id (0 when unknown).
 func (s Scope) FsID() int64 { return s.fsID }
+
+// DBID returns the physical shared-DB pool id backing this scope, or 0 when
+// standalone or unknown.
+func (s Scope) DBID() int64 { return s.dbID }
 
 // TenantCol returns the tenant-discriminator column name used by journal and
 // vault tables: "tenant_id" in standalone shape, "fs_id" in shared shape.

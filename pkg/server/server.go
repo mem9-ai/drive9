@@ -134,23 +134,30 @@ type Config struct {
 	// over its shard's warm tenants. A non-positive value disables the scan.
 	// SSENotifyRetention is how long outbox rows are kept before leader-gated
 	// pruning (default 1h).
+	// FSEventsRetention is how long fs_events rows are kept before pruning
+	// (default 1h; production sets 168h via DRIVE9_FS_EVENTS_RETENTION). It is
+	// deliberately independent of SSENotifyRetention: fs_events is the durable
+	// replay log, the outbox is a lossy wake-up hint.
+	// SSELivenessPollInterval enables an optional per-connection liveness poll
+	// for connected SSE clients (default 0 = off). See handleEvents.
 	//
 	// PodID uniquely identifies this pod in the central pod_registry. PodAddr
 	// is the internally reachable address (host:port). When both are set, this
 	// pod registers itself and reports its SSE subscriber set.
-	//
-	// PodNotifySecret is retained for backward compatibility (the internal
-	// /v1/internal/sse-notify endpoint). Cross-pod push is superseded by the
-	// unified outbox poller; the secret still gates the legacy endpoint.
 	TenantOutboxPollInterval        time.Duration
 	TenantOutboxCursorFlushInterval time.Duration
 	TenantShardRefreshInterval      time.Duration
 	TenantMaintenanceInterval       time.Duration
 	SafetyNetScanInterval           time.Duration
 	SSENotifyRetention              time.Duration
-	PodID                           string
-	PodAddr                         string
-	PodNotifySecret                 []byte
+	// FSEventsRetention is how long fs_events rows are kept before pruning
+	// (default 1h; production sets 168h via DRIVE9_FS_EVENTS_RETENTION).
+	FSEventsRetention time.Duration
+	// SSELivenessPollInterval enables an optional per-connection liveness
+	// poll for connected SSE clients (default 0 = off).
+	SSELivenessPollInterval time.Duration
+	PodID                   string
+	PodAddr                 string
 }
 
 type SlockOAuthClient interface {
@@ -298,18 +305,45 @@ type Server struct {
 	// and subscriber set in the central DB. All run on every pod (not
 	// leader-gated); the leader additionally sweeps stale pods and prunes the
 	// outbox.
-	podRegistry     *podRegistry
-	podNotifySecret []byte
-	notifyCancel    context.CancelFunc
-	notifyWG        sync.WaitGroup
+	podRegistry  *podRegistry
+	notifyCancel context.CancelFunc
+	notifyWG     sync.WaitGroup
 	// notifyCoalescer OR-merges per-tenant outbox signals and flushes them
 	// in one multi-row INSERT per 200ms window (see notify_coalescer.go).
 	// Created in startNotifyInfrastructure (multi-tenant mode only); nil in
 	// single-tenant mode, where insertTenantNotify falls back to direct
 	// single-row inserts.
 	notifyCoalescer *tenantNotifyCoalescer
+	// eventRetry buffers fs_events rows whose durable insert failed and
+	// flushes them with backoff (see event_retry.go). Runs on every pod
+	// (not leader-gated); stopped during Close before the coalescer's final
+	// flush so its last notify signals still land in the outbox.
+	eventRetry *eventRetryBuffer
+	// sweepCtx/sweepCancel tie the detached fs_events sweep goroutines
+	// (maybeSweepFSEvents / maybeSweepSharedFSEvents) to the server
+	// lifecycle: stopNotifyInfrastructure cancels them promptly (the batched
+	// DELETE loop checks ctx between batches) and notifyWG.Wait covers them,
+	// so they cannot outlive Close and hit a closed meta store.
+	// Hand-constructed servers (tests) leave both nil and use a background
+	// context instead. Mirrors the forkWorkerCtx precedent.
+	sweepCtx    context.Context
+	sweepCancel context.CancelFunc
+	// sharedSweepLast is the per-pod pre-filter throttle for the shared-pool
+	// fs_events sweep (see maybeSweepSharedFSEvents in sse.go), keyed by
+	// physical pool id (db_pool.db_id; 0 = unknown/single pool): each shared
+	// pool is throttled and claimed independently so a hot pool cannot
+	// starve a cold one. The authoritative cluster-wide throttle is the
+	// meta-DB claim; this map only keeps the common case off the meta DB.
+	sharedSweepLast sync.Map // dbID int64 -> unix seconds int64
 	// sseNotifyRetention is how long outbox rows are kept before leader pruning.
 	sseNotifyRetention time.Duration
+	// fsEventsRetention is how long fs_events rows are kept before the lazy
+	// write-path sweep and the tenant-worker's piggyback maintenance prune
+	// them. Independent of sseNotifyRetention by design.
+	fsEventsRetention time.Duration
+	// sseLivenessPollInterval enables the optional Phase-2 liveness poll for
+	// connected SSE clients (default 0 = off).
+	sseLivenessPollInterval time.Duration
 	// safetyNetScanInterval is how often each pod runs the safety-net scan.
 	// Non-positive disables it.
 	safetyNetScanInterval time.Duration
@@ -417,9 +451,9 @@ func NewWithConfig(cfg Config) *Server {
 	if maxUpload <= 0 {
 		maxUpload = DefaultMaxUploadBytes
 	}
-	logger := cfg.Logger
-	if logger == nil {
-		logger, _ = zap.NewProduction()
+	srvLog := cfg.Logger
+	if srvLog == nil {
+		srvLog, _ = zap.NewProduction()
 	}
 	metrics.SetFeatureEnabled("vault", len(cfg.VaultMasterKey) > 0)
 	metrics.SetModuleAvailability("vault", false)
@@ -428,7 +462,7 @@ func NewWithConfig(cfg Config) *Server {
 		var err error
 		vaultMK, err = vault.NewMasterKey(cfg.VaultMasterKey)
 		if err != nil {
-			logger.Warn("vault master key invalid, vault disabled", zap.Error(err))
+			srvLog.Warn("vault master key invalid, vault disabled", zap.Error(err))
 		} else {
 			metrics.SetModuleAvailability("vault", true)
 		}
@@ -509,6 +543,7 @@ func NewWithConfig(cfg Config) *Server {
 		defaultTenantProvider = cfg.Provisioner.ProviderType()
 	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
+	sweepCtx, sweepCancel := context.WithCancel(backgroundWithTrace(context.Background()))
 	s := &Server{
 		fallback:              cfg.Backend,
 		meta:                  cfg.Meta,
@@ -547,7 +582,7 @@ func NewWithConfig(cfg Config) *Server {
 		tenantPoolRefillFreeRatio: tenantPoolRefillFreeRatio,
 		inlineThreshold:           inlineThreshold,
 		metrics:                   newServerMetrics(),
-		logger:                    logger,
+		logger:                    srvLog,
 		events:                    newEventBuses(),
 		slockOAuth:                cfg.SlockOAuth,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
@@ -555,24 +590,46 @@ func NewWithConfig(cfg Config) *Server {
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
 			apiBase: strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIBase),
 		},
-		disableDBAutoEmbed:    cfg.DisableDatabaseAutoEmbedding,
-		journalCursorSecret:   newJournalCursorSecret(cfg.TokenSecret),
-		forkWorkerCtx:         forkWorkerCtx,
-		forkWorkerCancel:      forkWorkerCancel,
-		tidbCloudRBACCache:    newTiDBCloudRBACCache(tidbCloudRBACCacheTTL),
-		leader:                cfg.Leader,
-		podNotifySecret:       cfg.PodNotifySecret,
-		sseNotifyRetention:    cfg.SSENotifyRetention,
-		safetyNetScanInterval: cfg.SafetyNetScanInterval,
+		disableDBAutoEmbed:      cfg.DisableDatabaseAutoEmbedding,
+		journalCursorSecret:     newJournalCursorSecret(cfg.TokenSecret),
+		forkWorkerCtx:           forkWorkerCtx,
+		forkWorkerCancel:        forkWorkerCancel,
+		sweepCtx:                sweepCtx,
+		sweepCancel:             sweepCancel,
+		tidbCloudRBACCache:      newTiDBCloudRBACCache(tidbCloudRBACCacheTTL),
+		leader:                  cfg.Leader,
+		sseNotifyRetention:      cfg.SSENotifyRetention,
+		fsEventsRetention:       cfg.FSEventsRetention,
+		sseLivenessPollInterval: cfg.SSELivenessPollInterval,
+		safetyNetScanInterval:   cfg.SafetyNetScanInterval,
 	}
 	// Default SSE notify retention.
 	if s.sseNotifyRetention <= 0 {
 		s.sseNotifyRetention = defaultSSENotifyRetention
 	}
+	// Default fs_events retention. This is the durable replay log's retention;
+	// it is deliberately independent of the outbox retention above.
+	if s.fsEventsRetention <= 0 {
+		s.fsEventsRetention = defaultFSEventsRetention
+	}
+	// Log the effective retention at startup so a missing
+	// DRIVE9_FS_EVENTS_RETENTION env var is visible instead of silently
+	// reverting to the default.
+	logger.Info(context.Background(), "fs_events_retention_configured",
+		zap.Duration("retention", s.fsEventsRetention))
 	// safetyNetScanInterval is taken as configured: a non-positive value
 	// disables the safety-net scan entirely (see startNotifyInfrastructure).
 	// The 5min default lives in the server binaries' env fallback, not here,
 	// so a zero Config keeps the scan off.
+	// Start the fs_events insert retry buffer on every pod (not leader-gated,
+	// and also in single-tenant mode): publishEvent enqueues on insert failure
+	// in both modes. The per-entry drop age tracks the fs_events retention
+	// (clamped to [1h, 24h] by the constructor) so a longer replay window is
+	// actually reachable by retried events. Stopped in
+	// stopNotifyInfrastructure, which Close always calls, with a final
+	// best-effort flush before the coalescer drains.
+	s.eventRetry = newEventRetryBuffer(s.insertTenantNotify, s.fsEventsRetention, s.resolveRetryStore)
+	s.eventRetry.start(backgroundWithTrace(context.Background()))
 	mux := http.NewServeMux()
 
 	var business http.Handler = http.HandlerFunc(s.handleBusiness)
@@ -633,12 +690,6 @@ func NewWithConfig(cfg Config) *Server {
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
-	// Internal pod-to-pod SSE push endpoint. Authenticated via a shared
-	// internal bearer secret (not tenant auth). Only registered when a secret
-	// is configured; the handler rejects all requests if no secret is set.
-	if len(cfg.PodNotifySecret) > 0 {
-		mux.HandleFunc(sseNotifyInternalRoute, s.handleInternalSSENotify)
-	}
 
 	local := cfg.LocalS3
 	if local == nil && cfg.Backend != nil {
@@ -682,7 +733,20 @@ func NewWithConfig(cfg Config) *Server {
 	}
 
 	s.mux = mux
-	s.tenantWorker = newTenantWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.TenantWorkers, cfg.TenantMaintenanceInterval)
+	// Finalize the tenant worker options against the server's effective
+	// config: fall back to the server's fs_events retention when the caller
+	// only set Config.FSEventsRetention (belt-and-braces for programmatic
+	// use; main.go sets both), and wire the shared-pool sweep entry point so
+	// the worker's piggyback maintenance and the write path share ONE
+	// throttle (per-pod pre-filter + cluster claim) instead of two clocks.
+	workerOpts := cfg.TenantWorkers
+	if workerOpts.FSEventsRetention <= 0 {
+		workerOpts.FSEventsRetention = s.fsEventsRetention
+	}
+	if workerOpts.SweepSharedFSEvents == nil {
+		workerOpts.SweepSharedFSEvents = s.maybeSweepSharedFSEvents
+	}
+	s.tenantWorker = newTenantWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, workerOpts, cfg.TenantMaintenanceInterval)
 	if s.tenantWorker != nil {
 		// Wire the write-path notifier so freshly enqueued semantic/file_gc/
 		// quota work triggers an immediate in-process kick (~0ms latency for
@@ -731,7 +795,7 @@ func NewWithConfig(cfg Config) *Server {
 		// heartbeat goroutine. If not yet leader, workers stay stopped until
 		// leadership is gained.
 		if !s.leader.IsLeader() {
-			logger.Info("server_leader_standby",
+			srvLog.Info("server_leader_standby",
 				zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
 				zap.Strings("app_managed_task_types", appManagedTaskTypes),
 				zap.Strings("fallback_task_types", fallbackTaskTypes),
@@ -910,6 +974,22 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 func (s *Server) stopNotifyInfrastructure() {
 	if s.notifyCancel != nil {
 		s.notifyCancel()
+	}
+	// Cancel detached fs_events sweep goroutines BEFORE waiting: the batched
+	// DELETE loop checks ctx between batches, so in-flight sweeps exit
+	// promptly and notifyWG.Wait below cannot block on the 5min sweep
+	// timeout. The meta store is still open (it is closed later by the
+	// server binary), so a sweep that lands before cancellation completes
+	// normally.
+	if s.sweepCancel != nil {
+		s.sweepCancel()
+	}
+	// Stop the event retry buffer BEFORE the coalescer: its stop performs a
+	// final best-effort flush whose second-wake signals go through
+	// insertTenantNotify, and those must land in the coalescer before its own
+	// final flush below drains pending signals to the meta DB.
+	if s.eventRetry != nil {
+		s.eventRetry.stop()
 	}
 	// Stop the coalescer right after cancel: its flush loop exits on the
 	// cancelled context, then stop() performs a final flush of pending
@@ -1173,13 +1253,20 @@ func (s *Server) startLeaderWorkers() {
 	}
 }
 
-// fsEventsRetention is how long event rows are kept before pruning. Used by
-// the piggybacked maintenance in the tenant worker.
-const fsEventsRetention = 1 * time.Hour
+// defaultFSEventsRetention is how long fs_events rows are kept before pruning
+// when DRIVE9_FS_EVENTS_RETENTION is unset. fs_events is the durable replay
+// log: production deployments set 168h (7 days) so consumer outages within a
+// week remain replayable. Both sweep paths (the lazy write-path sweep in
+// publishEvent and the tenant worker's piggyback maintenance) read the same
+// configured value.
+const defaultFSEventsRetention = 1 * time.Hour
 
 // defaultSSENotifyRetention is how long tenant_notify_outbox rows are kept
-// before the leader prunes them. Matches fs_events retention so the outbox
-// doesn't outlive the work it points to.
+// before the leader prunes them. The outbox is a lossy wake-up hint consumed
+// within ~200ms by the outbox poller, so 1h is ample. Its retention is
+// deliberately independent of fs_events retention (defaultFSEventsRetention):
+// fs_events is the durable log (1h default, 168h in production), the outbox is
+// only a signal. Do NOT keep the two in sync.
 const defaultSSENotifyRetention = 1 * time.Hour
 
 // tenantNotifyCleanupInterval is how often the leader prunes old outbox rows.
