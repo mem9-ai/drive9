@@ -87,6 +87,9 @@ func sanitizeClientError(err error) string {
 	if errors.Is(err, datastore.ErrDirectoryNotEmpty) {
 		return err.Error()
 	}
+	if errors.Is(err, datastore.ErrDeleteIncomplete) {
+		return "recursive delete in progress, retry to resume"
+	}
 	if isQuotaError(err) {
 		return "tenant usage quota exceeded"
 	}
@@ -103,6 +106,9 @@ func backendErrorStatus(ctx context.Context, err error) int {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return http.StatusGatewayTimeout
 	}
+	if errors.Is(err, datastore.ErrDeleteIncomplete) {
+		return http.StatusServiceUnavailable
+	}
 	if errors.Is(err, datastore.ErrDirectoryNotEmpty) {
 		return http.StatusConflict
 	}
@@ -116,6 +122,11 @@ func backendErrorStatus(ctx context.Context, err error) int {
 }
 
 func writeBackendError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, datastore.ErrDeleteIncomplete) {
+		// A bounded recursive delete ran out of budget; it is resumable, so tell
+		// the client when to re-issue the same request to continue the sweep.
+		w.Header().Set("Retry-After", "2")
+	}
 	errJSON(w, backendErrorStatus(r.Context(), err), sanitizeClientError(err))
 }
 

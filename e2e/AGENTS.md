@@ -70,6 +70,10 @@ bash e2e/fuse-correctness-workload.sh
 # Bounded FUSE concurrency stress workload
 bash e2e/fuse-concurrency-stress.sh
 
+# Batched recursive-delete stress workload (requires a server with
+# DRIVE9_RECURSIVE_DELETE_BATCHED=1 to exercise the batched sweep)
+bash e2e/fuse-recursive-delete-stress.sh
+
 # Opt-in FUSE performance baseline metrics workload
 bash e2e/fuse-performance-baseline.sh
 
@@ -408,6 +412,38 @@ deterministic writable concurrency coverage, not a Git or cross-mount workload.
 8. Preserve run root, mount log, expected/actual manifests, and reader error log
    on failure
 
+### `fuse-recursive-delete-stress.sh`
+
+Host support: Linux and macOS only. This script needs real FUSE support and is
+stress coverage for the batched recursive directory delete redesign
+(`docs/design/recursive-delete-batched-design.md`, server flag
+`DRIVE9_RECURSIVE_DELETE_BATCHED`). The server must run with the flag enabled
+to exercise the batched sweep; against a legacy-flag server this suite is the
+regression detector for the single-transaction failure modes. Trees are built
+through the FUSE mount; deletes go through `drive9 fs rm -r`
+(`DELETE /v1/fs/{path}?recursive`, the batched-sweep entry point). Manual-only
+in CI (see `e2e/README.md` "CI automation tiers") until the flag flips on.
+
+1. Provision tenant unless `DRIVE9_API_KEY` is already set
+2. Prepare `drive9` CLI binary (build local or download official release)
+3. Mount a fresh writable namespace through real FUSE
+4. Scenario A: build a large tree (default 2000 files / 50 subdirs) through the
+   mount, run `rm -r` on it while a background writer keeps writing a sibling
+   tree; assert `rm -r` succeeds, reports no lock-wait/deadlock errors, the
+   tree is absent remotely, and the sibling tree matches an exact sha256
+   manifest (mount + remote snapshot)
+5. Scenario B: start `rm -r` on a large tree, SIGKILL the CLI mid-sweep, then
+   retry `rm -r`; assert the retry succeeds (or the first pass already
+   finished) and the tree converges to fully removed remotely with no residue
+6. Scenario C: `mkdir` at the same path racing an in-flight `rm -r`, then
+   write a new file set at the recreated path; assert the raced `rm -r`
+   succeeds and the new tree is intact (exact manifest via mount + remote
+   snapshot, so no old content survives and no new content is swept)
+7. Unmount, copy sibling and recreated trees back through the CLI, and verify
+   the remote snapshots match the expected manifests
+8. Preserve run root, mount log, manifests, and rm/sibling-writer logs on
+   failure
+
 ### `fuse-performance-baseline.sh`
 
 Host support: Linux and macOS only. This script needs real FUSE support and is
@@ -616,8 +652,8 @@ See `e2e/shared-smoke-test/README.md`.
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
 | `LARGE_FILE_MB` | `100` | `api-smoke-test.sh` |
 | `BATCH_SMALL_FILE_COUNT` | `10` | `api-smoke-test.sh` |
-| `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
+| `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-recursive-delete-stress.sh` |
+| `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-recursive-delete-stress.sh` |
 | `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` (defaults to `0` when `DRIVE9_API_KEY` is set) | `api-smoke-test.sh` |
 | `UPLOAD_LIMIT_BYTES` | `10737418240` | `api-smoke-test.sh` |
 | `RUN_SEMANTIC_CHECKS` | `1` | `api-smoke-test.sh` |
@@ -634,16 +670,16 @@ See `e2e/shared-smoke-test/README.md`.
 | `RUN_CLI_FORK_CHECKS` | `1` (auto-skip when `/v1/fork` is unavailable) | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_TIMEOUT_S` | `90` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_INTERVAL_S` | `3` | `cli-smoke-test.sh` |
-| `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `CLI_RELEASE_BASE_URL` | `https://drive9.ai/releases` | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
+| `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-recursive-delete-stress.sh` |
+| `CLI_RELEASE_BASE_URL` | `https://drive9.ai/releases` | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-recursive-delete-stress.sh` |
+| `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-recursive-delete-stress.sh` |
+| `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-recursive-delete-stress.sh` |
+| `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-recursive-delete-stress.sh` |
+| `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-recursive-delete-stress.sh` |
 | `CLI_MAX_RETRIES` | `8` | `fuse-smoke-test.sh` |
 | `CLI_RETRY_SLEEP_S` | `2` | `fuse-smoke-test.sh` |
-| `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
+| `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-recursive-delete-stress.sh` |
+| `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-recursive-delete-stress.sh` |
 | `FUSE_CORRECTNESS_LARGE_MB` | `9` | `fuse-correctness-workload.sh` |
 | `FUSE_CORRECTNESS_KEEP_ARTIFACTS` | `0` | `fuse-correctness-workload.sh` |
 | `RUN_FUSE_ALL_WORKLOADS` | `0` | `fuse-release-gate.sh` |
@@ -663,6 +699,17 @@ See `e2e/shared-smoke-test/README.md`.
 | `FUSE_CONCURRENCY_PAYLOAD_KB` | `32` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_TIMEOUT_S` | `120` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_KEEP_ARTIFACTS` | `0` | `fuse-concurrency-stress.sh` |
+| `FUSE_RDEL_FILES` | `2000` | `fuse-recursive-delete-stress.sh` |
+| `FUSE_RDEL_SUBDIRS` | `50` | `fuse-recursive-delete-stress.sh` |
+| `FUSE_RDEL_PAYLOAD_KB` | `4` | `fuse-recursive-delete-stress.sh` |
+| `FUSE_RDEL_RACE_FILES` | `64` | `fuse-recursive-delete-stress.sh` |
+| `FUSE_RDEL_SIBLING_BASE_FILES` | `16` | `fuse-recursive-delete-stress.sh` |
+| `FUSE_RDEL_SIBLING_MAX_WRITES` | `4000` | `fuse-recursive-delete-stress.sh` |
+| `FUSE_RDEL_KILL_AFTER_S` | `2` | `fuse-recursive-delete-stress.sh` |
+| `FUSE_RDEL_BUILD_TIMEOUT_S` | `600` | `fuse-recursive-delete-stress.sh` |
+| `FUSE_RDEL_SWEEP_TIMEOUT_S` | `180` | `fuse-recursive-delete-stress.sh` |
+| `FUSE_RDEL_KEEP_ARTIFACTS` | `0` | `fuse-recursive-delete-stress.sh` |
+| `FUSE_RDEL_ARTIFACT_DIR` | - | `fuse-recursive-delete-stress.sh` |
 | `RUN_FUSE_CONCURRENCY_STRESS` | `0` | `fuse-release-gate.sh` |
 | `RUN_FUSE_POSIX_FSX` | `0` | `fuse-release-gate.sh` |
 | `RUN_FUSE_PERFORMANCE_BASELINE` | `0` | `fuse-release-gate.sh` |

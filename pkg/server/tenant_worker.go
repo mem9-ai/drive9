@@ -50,6 +50,12 @@ const (
 	defaultTenantMaintenanceInterval = 5 * time.Minute
 )
 
+// tenantDeleteReconcileInterval is the throttle interval for the per-tenant
+// delete-orphan reconciliation round (design doc
+// recursive-delete-batched-design.md §4.2.1). A package-level variable so
+// tests can shrink it.
+var tenantDeleteReconcileInterval = 10 * time.Minute
+
 var tenantWorkerUsesTiDBAutoEmbedding = tenant.UsesTiDBAutoEmbedding
 
 var tenantWorkerAllowedEmbedTaskTypes = []semantic.TaskType{semantic.TaskTypeEmbed}
@@ -178,7 +184,8 @@ type tenantWorkerManager struct {
 	kicks chan kickMsg
 
 	lastMaintenance   map[string]time.Time
-	semanticMetricOrg map[string]string // tenantID -> org used by the last semantic gauge observation
+	lastReconcile     map[string]time.Time // tenantID -> last delete-orphan reconciliation round
+	semanticMetricOrg map[string]string    // tenantID -> org used by the last semantic gauge observation
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -228,6 +235,7 @@ func newTenantWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store
 	m.inflight = make(map[string]int)
 	m.kickPending = make(map[string]pendingKick)
 	m.lastMaintenance = make(map[string]time.Time)
+	m.lastReconcile = make(map[string]time.Time)
 	m.semanticMetricOrg = make(map[string]string)
 	m.kicks = make(chan kickMsg, tenantKickQueueCapacity)
 	return m
@@ -284,6 +292,7 @@ func (m *tenantWorkerManager) ForgetTenant(tenantID string) {
 	m.mu.Lock()
 	delete(m.kickPending, tenantID)
 	delete(m.lastMaintenance, tenantID)
+	delete(m.lastReconcile, tenantID)
 	delete(m.semanticMetricOrg, tenantID)
 	m.mu.Unlock()
 }
@@ -639,8 +648,54 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 		}
 	}
 
+	// Delete-orphan reconciliation (§4.2.1): one throttled round per tenant,
+	// dry-run unless DRIVE9_DELETE_RECONCILE_REPAIR is set.
+	m.reconcileDeleteOrphans(ctx, target)
+
 	// Observation metrics: sample queue depth + dead-letter count.
 	m.observeTenant(ctx, target, now)
+}
+
+// reconcileDeleteOrphans runs one delete-orphan reconciliation round for the
+// tenant, throttled to once per tenantDeleteReconcileInterval. Like the rest
+// of piggyback maintenance it only fires for already-warm (kick-driven)
+// tenants — it never wakes a cold tenant.
+func (m *tenantWorkerManager) reconcileDeleteOrphans(ctx context.Context, target *tenantTarget) {
+	if ctx.Err() != nil {
+		return
+	}
+	now := time.Now()
+	m.mu.Lock()
+	if m.lastReconcile == nil {
+		m.lastReconcile = make(map[string]time.Time)
+	}
+	last := m.lastReconcile[target.tenantID]
+	if now.Sub(last) < tenantDeleteReconcileInterval {
+		m.mu.Unlock()
+		return
+	}
+	m.lastReconcile[target.tenantID] = now
+	m.mu.Unlock()
+
+	dryRun := !datastore.DeleteReconcileRepairEnabled()
+	report, err := target.store.ReconcileDeleteOrphans(ctx, dryRun, 0)
+	if err != nil {
+		if !isContextDoneErr(err) {
+			logger.Warn(ctx, "tenant_worker_delete_reconcile_failed",
+				zap.String("tenant_id", target.tenantID),
+				zap.Bool("dry_run", dryRun),
+				zap.Error(err))
+		}
+		return
+	}
+	if report.BrokenDentries > 0 || report.StrandedInodes > 0 {
+		logger.Info(ctx, "tenant_worker_delete_reconcile_candidates",
+			zap.String("tenant_id", target.tenantID),
+			zap.Bool("dry_run", dryRun),
+			zap.Int64("broken_dentries", report.BrokenDentries),
+			zap.Int64("stranded_inodes", report.StrandedInodes),
+			zap.Int64("repaired", report.Repaired))
+	}
 }
 
 func (m *tenantWorkerManager) observeTenant(ctx context.Context, target *tenantTarget, now time.Time) {

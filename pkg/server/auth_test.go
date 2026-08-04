@@ -833,6 +833,30 @@ func TestSanitizeClientError_DirectoryNotEmpty(t *testing.T) {
 	}
 }
 
+func TestSanitizeClientError_DeleteIncomplete(t *testing.T) {
+	err := fmt.Errorf("%w: /projects/a/ (tx=12)", datastore.ErrDeleteIncomplete)
+	got := sanitizeClientError(err)
+	if got != "recursive delete in progress, retry to resume" {
+		t.Fatalf("got %q, want %q", got, "recursive delete in progress, retry to resume")
+	}
+}
+
+func TestWriteBackendError_DeleteIncomplete(t *testing.T) {
+	err := fmt.Errorf("%w: /projects/a/ (tx=12)", datastore.ErrDeleteIncomplete)
+	req := httptest.NewRequest(http.MethodDelete, "/v1/fs/projects/a/?recursive=1", nil)
+	rr := httptest.NewRecorder()
+	writeBackendError(rr, req, err)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want %d", rr.Code, http.StatusServiceUnavailable)
+	}
+	if got := rr.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want %q", got, "2")
+	}
+	if body := rr.Body.String(); !strings.Contains(body, "recursive delete in progress, retry to resume") {
+		t.Fatalf("body = %q, want sanitized retry message", body)
+	}
+}
+
 func TestBackendErrorStatus(t *testing.T) {
 	tests := []struct {
 		name string
@@ -878,6 +902,16 @@ func TestBackendErrorStatus(t *testing.T) {
 			name: "directory not empty wrapped",
 			err:  fmt.Errorf("%w: /projects/a/b/", datastore.ErrDirectoryNotEmpty),
 			want: http.StatusConflict,
+		},
+		{
+			name: "delete incomplete",
+			err:  datastore.ErrDeleteIncomplete,
+			want: http.StatusServiceUnavailable,
+		},
+		{
+			name: "delete incomplete wrapped",
+			err:  fmt.Errorf("%w: /projects/a/ (tx=12)", datastore.ErrDeleteIncomplete),
+			want: http.StatusServiceUnavailable,
 		},
 		{
 			name: "unknown error",

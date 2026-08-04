@@ -374,44 +374,20 @@ func (s *Store) enqueueFileGCTask(db execer, task *FileGCTask) (bool, error) {
 	if task == nil {
 		return false, fmt.Errorf("file gc task is required")
 	}
-	if strings.TrimSpace(task.TaskID) == "" {
-		task.TaskID = task.FileID
-	}
 	if strings.TrimSpace(task.FileID) == "" {
 		return false, fmt.Errorf("file_id is required")
 	}
-	now := time.Now().UTC()
-	status := task.Status
-	if status == "" {
-		status = FileGCTaskQueued
-	}
-	maxAttempts := task.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = defaultFileGCMaxAttempts
-	}
-	availableAt := task.AvailableAt
-	if availableAt.IsZero() {
-		availableAt = now
-	}
-	createdAt := task.CreatedAt
-	if createdAt.IsZero() {
-		createdAt = now
-	}
-	updatedAt := task.UpdatedAt
-	if updatedAt.IsZero() {
-		updatedAt = createdAt
-	}
-
+	normalizeFileGCTask(task, time.Now().UTC())
 	_, err := db.Exec(`INSERT INTO file_gc_tasks
 		(`+s.scope.InsCols(`task_id, file_id, storage_type, storage_ref, size_bytes, content_type,
 		 status, attempt_count, max_attempts, receipt, leased_at, lease_until,
 		 available_at, last_error, created_at, updated_at, completed_at`)+`)
 		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
 		s.scope.Args(task.TaskID, task.FileID, task.StorageType, task.StorageRef, task.SizeBytes,
-			nullStr(task.ContentType), status, task.AttemptCount, maxAttempts,
+			nullStr(task.ContentType), task.Status, task.AttemptCount, task.MaxAttempts,
 			nullStr(task.Receipt), nilTime(task.LeasedAt), nilTime(task.LeaseUntil),
-			availableAt.UTC(), nullStr(task.LastError), createdAt.UTC(),
-			updatedAt.UTC(), nilTime(task.CompletedAt))...)
+			task.AvailableAt.UTC(), nullStr(task.LastError), task.CreatedAt.UTC(),
+			task.UpdatedAt.UTC(), nilTime(task.CompletedAt))...)
 	if err == nil {
 		return true, nil
 	}
@@ -419,6 +395,75 @@ func (s *Store) enqueueFileGCTask(db execer, task *FileGCTask) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+// normalizeFileGCTask applies the defaulting rules of enqueueFileGCTask.
+func normalizeFileGCTask(task *FileGCTask, now time.Time) {
+	if strings.TrimSpace(task.TaskID) == "" {
+		task.TaskID = task.FileID
+	}
+	if task.Status == "" {
+		task.Status = FileGCTaskQueued
+	}
+	if task.MaxAttempts <= 0 {
+		task.MaxAttempts = defaultFileGCMaxAttempts
+	}
+	if task.AvailableAt.IsZero() {
+		task.AvailableAt = now
+	}
+	if task.CreatedAt.IsZero() {
+		task.CreatedAt = now
+	}
+	if task.UpdatedAt.IsZero() {
+		task.UpdatedAt = task.CreatedAt
+	}
+}
+
+// enqueueFileGCTasksTx inserts many queued tasks in chunked multi-row
+// INSERT IGNORE statements, giving the same duplicate-is-no-op semantics as
+// enqueueFileGCTask (file IDs are never reused; hardlink batches may repeat a
+// file_id). It returns the number of tasks actually inserted.
+func (s *Store) enqueueFileGCTasksTx(db execer, tasks []*FileGCTask) (int64, error) {
+	var inserted int64
+	now := time.Now().UTC()
+	for start := 0; start < len(tasks); start += deleteFileIDBatchSize {
+		end := start + deleteFileIDBatchSize
+		if end > len(tasks) {
+			end = len(tasks)
+		}
+		batch := tasks[start:end]
+		if len(batch) == 0 {
+			continue
+		}
+		values := make([]string, 0, len(batch))
+		args := make([]any, 0, len(batch)*18)
+		for _, task := range batch {
+			if task == nil {
+				return inserted, fmt.Errorf("file gc task is required")
+			}
+			if strings.TrimSpace(task.FileID) == "" {
+				return inserted, fmt.Errorf("file_id is required")
+			}
+			normalizeFileGCTask(task, now)
+			values = append(values, `(`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`)
+			args = append(args, s.scope.Args(task.TaskID, task.FileID, task.StorageType, task.StorageRef, task.SizeBytes,
+				nullStr(task.ContentType), task.Status, task.AttemptCount, task.MaxAttempts,
+				nullStr(task.Receipt), nilTime(task.LeasedAt), nilTime(task.LeaseUntil),
+				task.AvailableAt.UTC(), nullStr(task.LastError), task.CreatedAt.UTC(),
+				task.UpdatedAt.UTC(), nilTime(task.CompletedAt))...)
+		}
+		res, err := db.Exec(`INSERT IGNORE INTO file_gc_tasks
+			(`+s.scope.InsCols(`task_id, file_id, storage_type, storage_ref, size_bytes, content_type,
+			 status, attempt_count, max_attempts, receipt, leased_at, lease_until,
+			 available_at, last_error, created_at, updated_at, completed_at`)+`)
+			VALUES `+strings.Join(values, `,`), args...)
+		if err != nil {
+			return inserted, err
+		}
+		n, _ := res.RowsAffected()
+		inserted += n
+	}
+	return inserted, nil
 }
 
 func (s *Store) fileGCTaskLeaseError(ctx context.Context, taskID string) error {

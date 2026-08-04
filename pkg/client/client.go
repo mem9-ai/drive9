@@ -1069,9 +1069,19 @@ func (c *Client) RemoveAll(path string) error {
 // RemoveAllCtx removes a file or directory tree recursively with context support.
 // It forwards to deleteCtx with recursive=true, so regular files use Delete
 // semantics and missing paths return the same 404 *StatusError as RemoveAll.
+// A large tree delete may exceed the server's per-request budget; the server
+// then answers 503 and RemoveAllCtx retries with backoff (honoring Retry-After,
+// at most removeAllMaxRetries times). Retrying is safe: the server-side sweep
+// is resumable and idempotent, so a repeated DELETE continues it.
 func (c *Client) RemoveAllCtx(ctx context.Context, path string) error {
 	return c.deleteCtx(ctx, path, true, "")
 }
+
+// removeAllMaxRetries bounds the 503 retry loop for recursive deletes. The
+// server answers 503 (ErrDeleteIncomplete) when a batched recursive delete
+// exhausts its transaction/time budget; the sweep is resumable and idempotent,
+// so re-issuing the same DELETE continues where it left off.
+const removeAllMaxRetries = 4
 
 func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kind string) error {
 	requestURL := c.url(path)
@@ -1082,19 +1092,40 @@ func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kin
 		requestURL += "?kind=" + url.QueryEscape(kind)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)
-	if err != nil {
-		return err
+	backoff := time.Second
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := c.do(req)
+		if err != nil {
+			return err
+		}
+		if recursive && resp.StatusCode == http.StatusServiceUnavailable && attempt < removeAllMaxRetries {
+			retryAfter := resp.Header.Get("Retry-After")
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			delay := backoff
+			if secs, perr := strconv.Atoi(strings.TrimSpace(retryAfter)); perr == nil && secs >= 0 {
+				delay = time.Duration(secs) * time.Second
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			backoff *= 2
+			continue
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode >= 300 {
+			return readError(resp)
+		}
+		return nil
 	}
-	resp, err := c.do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode >= 300 {
-		return readError(resp)
-	}
-	return nil
 }
 
 // Copy performs a server-side zero-copy (same file_id, new path).

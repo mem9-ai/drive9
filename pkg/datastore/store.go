@@ -37,6 +37,10 @@ var (
 	ErrJournalPayloadTooLarge  = errors.New("journal payload too large")
 	ErrRevisionConflict        = errors.New("revision conflict")
 	ErrFileGCTaskLeaseMismatch = errors.New("file gc task lease mismatch")
+	// ErrDeleteIncomplete marks a bounded recursive delete that exhausted its
+	// transaction/time budget before finishing. The operation is resumable:
+	// callers may retry the same request to continue.
+	ErrDeleteIncomplete = errors.New("recursive delete incomplete, retry to resume")
 )
 
 type StorageType string
@@ -367,7 +371,9 @@ func (s *Store) DeleteNode(ctx context.Context, path string) (err error) {
 	return nil
 }
 
-// DeleteEmptyDir atomically checks a directory is empty and deletes it.
+// DeleteEmptyDir atomically checks a directory is empty and deletes it. The
+// post-DELETE re-check closes the TiDB no-gap-lock window where a concurrent
+// create commits a child between the emptiness check and the delete.
 func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_empty_dir", start, &err)
@@ -393,6 +399,13 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return ErrNotFound
+	}
+	stillHasChildren, err := s.dirHasChildrenTx(ctx, tx, path)
+	if err != nil {
+		return err
+	}
+	if stillHasChildren {
+		return fmt.Errorf("%w: %s", ErrDirectoryNotEmpty, path)
 	}
 	err = tx.Commit()
 	return err
@@ -2014,10 +2027,11 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	return out, nil
 }
 
-func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*File, err error) {
-	start := time.Now()
-	defer observeStoreOp(ctx, "delete_dir_recursive", start, &err)
-
+// deleteDirRecursiveLegacy is the pre-flag implementation: the whole subtree
+// in one unbounded transaction. Kept as the default while
+// DRIVE9_RECURSIVE_DELETE_BATCHED soaks; see
+// docs/design/recursive-delete-batched-design.md.
+func (s *Store) deleteDirRecursiveLegacy(ctx context.Context, dirPath string) (out *DeleteDirRecursiveSummary, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -2044,10 +2058,12 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		return nil, err
 	}
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.andAsGrouped("", `path = ? OR path LIKE ?`),
-		s.scope.Args(dirPath, dirPath+"%")...); err != nil {
+	delRes, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.andAsGrouped("", `path = ? OR path LIKE ?`),
+		s.scope.Args(dirPath, dirPath+"%")...)
+	if err != nil {
 		return nil, err
 	}
+	nodesDeleted, _ := delRes.RowsAffected()
 
 	orphaned, err := s.scanOrphanedFilesByIDTx(ctx, tx, fileIDs)
 	if err != nil {
@@ -2064,21 +2080,27 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		return nil, err
 	}
 
+	tasks := make([]*FileGCTask, 0, len(orphaned))
 	for _, f := range orphaned {
 		task, err := NewFileGCTaskFromFile(f, time.Now().UTC())
 		if err != nil {
 			return nil, err
 		}
-		if _, err := s.EnqueueFileGCTaskTx(tx, task); err != nil {
-			return nil, err
-		}
+		tasks = append(tasks, task)
+	}
+	enqueued, err := s.enqueueFileGCTasksTx(tx, tasks)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	out = orphaned
-	return out, nil
+	return &DeleteDirRecursiveSummary{
+		NodesDeleted:    nodesDeleted,
+		OrphansEnqueued: enqueued,
+		TxCount:         1,
+	}, nil
 }
 
 type deleteCandidate struct {

@@ -96,6 +96,19 @@ embedding. Override any var before running.
 
 ---
 
+## Feature flags
+
+- `DRIVE9_RECURSIVE_DELETE_BATCHED=1` — batched post-order recursive directory delete
+  (fast path single transaction for small trees, bounded per-batch sweep otherwise).
+  Unset/empty keeps the legacy single-transaction delete. See
+  `docs/design/recursive-delete-batched-design.md`.
+- `DRIVE9_DELETE_RECONCILE_REPAIR=1` — lets the periodic per-tenant orphan
+  reconciliation (`Store.ReconcileDeleteOrphans`, piggybacked on tenant maintenance)
+  repair broken-chain dentries / stranded inodes. Default is dry-run (audit only).
+
+
+---
+
 ## Project layout
 
 ```

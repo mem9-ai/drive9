@@ -21,6 +21,7 @@ including local single-tenant validation via `drive9-server-local`.
 | `fuse-correctness-workload.sh` | Real read-only FUSE workload over a manifest fixture: `find`, `grep`, `stat`, `cat`, `sha256`, symlink, hardlink, unicode/space paths, empty files, binary files, and 8MiB+ files |
 | `fuse-sqlite-correctness.sh` | Real writable FUSE SQLite correctness workload with rollback-journal mode, `PRAGMA integrity_check`, unmount/remount parity, and remote snapshot verification; set `RUN_FUSE_SQLITE_WAL=1` for WAL, `RUN_FUSE_SQLITE_CHURN=1` for repeated large-DB rewrite churn, and `RUN_FUSE_SQLITE_CONCURRENCY=1` for the bounded readers/writer detector |
 | `fuse-concurrency-stress.sh` | Real writable FUSE concurrency workload with parallel writers/readers, atomic rename, unlink churn, open-handle rename reads, and deterministic final manifest checks |
+| `fuse-recursive-delete-stress.sh` | Batched recursive-delete stress (`DRIVE9_RECURSIVE_DELETE_BATCHED`): large-tree `rm -r` under concurrent sibling writes with exact sha256 sibling manifest and no lock-wait errors, `rm -r` killed mid-sweep then retried to full removal, and same-path `mkdir`/rewrite racing the sweep with the new tree verified intact (mount + remote snapshot) |
 | `fuse-posix-fsx-gate.sh` | Opt-in JuiceFS-style POSIX/fsx subset over real writable FUSE: deterministic random write/read/truncate, atomic rename replacement, unlink-open reads, directory fsync, final model hash, unmount, and remote snapshot parity |
 | `fuse-performance-baseline.sh` | Opt-in real writable FUSE baseline that records small-file, large-file, repeated large-read, and SQLite transaction/read metrics as JSON artifacts without hardcoded throughput thresholds; SQLite reads verify stored row payload bytes against row checksums |
 | `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, mount-log audit, manifest-based FUSE correctness workload, and SQLite rollback-journal correctness; set `RUN_FUSE_ALL_WORKLOADS=1` to add all optional release-gate workloads, `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip SQLite temporarily, `RUN_FUSE_CONCURRENCY_STRESS=1` to add bounded concurrency stress, `RUN_FUSE_POSIX_FSX=1` to add the POSIX/fsx subset, and `RUN_FUSE_PERFORMANCE_BASELINE=1` to add performance metrics |
@@ -47,7 +48,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, full `smoke-all.sh` (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | `e2e-all` workflow (`Run workflow` button) | Everything above via `run_all_e2e=1` |
-| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `local-smoke.sh` (`make e2e-local` wrapper) |
+| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `local-smoke.sh` (`make e2e-local` wrapper), `fuse-recursive-delete-stress.sh` (requires a server started with `DRIVE9_RECURSIVE_DELETE_BATCHED=1`; the flag is off by default during soak, so no CI deployment exercises it — wire into `local-e2e.yml` when the flag flips on) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
@@ -136,6 +137,11 @@ bash e2e/fuse-sqlite-correctness.sh
 
 # Bounded concurrency stress on a real writable FUSE mount.
 bash e2e/fuse-concurrency-stress.sh
+
+# Batched recursive-delete stress on a real writable FUSE mount. Requires the
+# server to run with DRIVE9_RECURSIVE_DELETE_BATCHED=1 to exercise the batched
+# sweep; see the manual-only note under "CI automation tiers".
+bash e2e/fuse-recursive-delete-stress.sh
 
 # JuiceFS-style POSIX/fsx subset on a real writable FUSE mount.
 bash e2e/fuse-posix-fsx-gate.sh

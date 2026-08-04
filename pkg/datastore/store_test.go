@@ -998,14 +998,13 @@ func TestDeleteDirRecursive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	orphaned, err := s.DeleteDirRecursive(context.Background(), "/data/")
+	summary, err := s.DeleteDirRecursive(context.Background(), "/data/")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(orphaned) != 1 || orphaned[0].FileID != "f2" {
-		t.Fatalf("expected 1 orphaned (f2), got %d", len(orphaned))
+	if summary.NodesDeleted != 3 || summary.OrphansEnqueued != 1 {
+		t.Fatalf("summary = %+v, want 3 nodes deleted and 1 orphan (f2)", summary)
 	}
-	requireEmbeddingRevision(t, orphaned[0].EmbeddingRevision, 23)
 	if _, err := s.GetFileGCTaskByFileID(context.Background(), "f1"); err != ErrNotFound {
 		t.Fatalf("expected no gc task for shared f1, got %v", err)
 	}
@@ -1051,12 +1050,12 @@ func TestDeleteDirRecursiveDoesNotDeleteSiblingPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	orphaned, err := s.DeleteDirRecursive(context.Background(), "/data/")
+	summary, err := s.DeleteDirRecursive(context.Background(), "/data/")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(orphaned) != 1 || orphaned[0].FileID != "f1" {
-		t.Fatalf("orphaned = %+v, want only f1", orphaned)
+	if summary.OrphansEnqueued != 1 {
+		t.Fatalf("summary = %+v, want 1 orphan (f1)", summary)
 	}
 	if _, err := s.GetNode(context.Background(), "/data-other/"); err != nil {
 		t.Fatalf("sibling directory should survive: %v", err)
