@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -138,7 +139,7 @@ func TestReconcileDeleteOrphansRepairsOnlyBrokenDentry(t *testing.T) {
 	reconcilePlantFile(t, s, "f-orphan")
 	reconcilePlantFileNode(t, s, "n-orphan", "/ghost/a.txt", "/ghost/", "f-orphan")
 
-	report, err := s.ReconcileDeleteOrphans(ctx, false, 100)
+	report, err := s.ReconcileDeleteOrphans(ctx, false, 100, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +189,7 @@ func TestReconcileDeleteOrphansBrokenDirMultiRound(t *testing.T) {
 
 	// Round 1: only the top broken dentry is repaired; the children's chains
 	// were intact at scan time.
-	report, err := s.ReconcileDeleteOrphans(ctx, false, 100)
+	report, err := s.ReconcileDeleteOrphans(ctx, false, 100, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +206,7 @@ func TestReconcileDeleteOrphansBrokenDirMultiRound(t *testing.T) {
 	// Later rounds converge: every descendant is repaired, files get GC tasks.
 	converged := false
 	for round := 2; round <= 6; round++ {
-		report, err := s.ReconcileDeleteOrphans(ctx, false, 100)
+		report, err := s.ReconcileDeleteOrphans(ctx, false, 100, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -239,7 +240,7 @@ func TestReconcileDeleteOrphansStrandedInode(t *testing.T) {
 	// CONFIRMED inode + contents, no file_nodes reference.
 	reconcilePlantFile(t, s, "f-stray")
 
-	report, err := s.ReconcileDeleteOrphans(ctx, false, 100)
+	report, err := s.ReconcileDeleteOrphans(ctx, false, 100, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +273,7 @@ func TestReconcileDeleteOrphansIgnoresDirectoryInode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	report, err := s.ReconcileDeleteOrphans(ctx, false, 100)
+	report, err := s.ReconcileDeleteOrphans(ctx, false, 100, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +296,7 @@ func TestReconcileDeleteOrphansDryRun(t *testing.T) {
 	reconcilePlantFileNode(t, s, "n-orphan", "/ghost/a.txt", "/ghost/", "f-orphan")
 	reconcilePlantFile(t, s, "f-stray")
 
-	report, err := s.ReconcileDeleteOrphans(ctx, true, 100)
+	report, err := s.ReconcileDeleteOrphans(ctx, true, 100, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +371,7 @@ func TestReconcileStrandedInodeSharedScopeIsolation(t *testing.T) {
 		t.Fatalf("insert B gc task: %v", err)
 	}
 
-	report, err := storeA.ReconcileDeleteOrphans(ctx, false, 0)
+	report, err := storeA.ReconcileDeleteOrphans(ctx, false, 0, nil)
 	if err != nil {
 		t.Fatalf("ReconcileDeleteOrphans: %v", err)
 	}
@@ -402,5 +403,79 @@ func TestReconcileStrandedInodeSharedScopeIsolation(t *testing.T) {
 	}
 	if _, err := storeB.GetFileGCTaskByFileID(ctx, "shared-stray-2"); err != nil {
 		t.Fatalf("tenant B gc task should survive: %v", err)
+	}
+}
+
+// TestReconcileCappedRoundResumesFromCursor pins the checkpoint behavior:
+// when a round hits deleteReconcileMaxScanRows, the next round must resume
+// from the stored cursor instead of re-auditing the same prefix — otherwise
+// tenants larger than the cap would never have their tail rows audited
+// (dry-run would report a false "no orphans" signal forever).
+func TestReconcileCappedRoundResumesFromCursor(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	oldMax := deleteReconcileMaxScanRows
+	deleteReconcileMaxScanRows = 10
+	t.Cleanup(func() { deleteReconcileMaxScanRows = oldMax })
+
+	// A real directory with 25 files: 26 scanned rows, none top-level except
+	// the directory itself (parent_path "/"), so the cap trips on page 1.
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "cap-d", Path: "/cap/", ParentPath: "/", Name: "cap", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 25; i++ {
+		name := fmt.Sprintf("f%02d.txt", i)
+		if err := s.InsertNode(ctx, &FileNode{
+			NodeID: fmt.Sprintf("cap-n%02d", i), Path: "/cap/" + name, ParentPath: "/cap/", Name: name, CreatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A broken-chain dentry whose node_id sorts AFTER all the rows above:
+	// the first capped round must not see it, a later round must.
+	if _, err := s.DB().Exec(`INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, created_at)
+		VALUES ('zzz-broken', '/gone/x.txt', ?, '/gone/', ?, 'x.txt', 0, '', ?)`,
+		fileNodePathHash("/gone/x.txt"), fileNodePathHash("/gone/"), now); err != nil {
+		t.Fatalf("insert broken dentry: %v", err)
+	}
+
+	state := &DeleteReconcileState{}
+	report1, err := s.ReconcileDeleteOrphans(ctx, true, 10, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report1.BrokenDentries != 0 {
+		t.Fatalf("round 1 should not reach the tail row, got %d broken", report1.BrokenDentries)
+	}
+	if state.DentryCursor == "" {
+		t.Fatal("capped round must keep the cursor for the next round")
+	}
+	firstCursor := state.DentryCursor
+
+	report2, err := s.ReconcileDeleteOrphans(ctx, true, 10, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.DentryCursor == firstCursor {
+		t.Fatal("round 2 must advance the cursor, not restart from the prefix")
+	}
+
+	// Keep rounding until the full pass completes: the tail broken dentry is
+	// found and the cursor resets for the next full pass.
+	found := report2.BrokenDentries
+	for i := 0; i < 10 && state.DentryCursor != ""; i++ {
+		r, err := s.ReconcileDeleteOrphans(ctx, true, 10, state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found += r.BrokenDentries
+	}
+	if state.DentryCursor != "" {
+		t.Fatal("cursor must reset after a full pass completes")
+	}
+	if found != 1 {
+		t.Fatalf("broken dentry across rounds = %d, want 1", found)
 	}
 }

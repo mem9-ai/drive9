@@ -310,7 +310,7 @@ func TestDeleteDirBatchedEmptyDirDeleteRace(t *testing.T) {
 
 	// The reconciliation sweep (repair mode) must remove the broken-chain
 	// dentry and run the orphan pipeline for its file.
-	report, err := s.ReconcileDeleteOrphans(context.Background(), false, 100)
+	report, err := s.ReconcileDeleteOrphans(context.Background(), false, 100, nil)
 	if err != nil {
 		t.Fatalf("ReconcileDeleteOrphans: %v", err)
 	}

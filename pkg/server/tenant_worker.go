@@ -185,7 +185,8 @@ type tenantWorkerManager struct {
 
 	lastMaintenance   map[string]time.Time
 	lastReconcile     map[string]time.Time // tenantID -> last delete-orphan reconciliation round
-	semanticMetricOrg map[string]string    // tenantID -> org used by the last semantic gauge observation
+	reconcileState    map[string]*datastore.DeleteReconcileState
+	semanticMetricOrg map[string]string // tenantID -> org used by the last semantic gauge observation
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -236,6 +237,7 @@ func newTenantWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store
 	m.kickPending = make(map[string]pendingKick)
 	m.lastMaintenance = make(map[string]time.Time)
 	m.lastReconcile = make(map[string]time.Time)
+	m.reconcileState = make(map[string]*datastore.DeleteReconcileState)
 	m.semanticMetricOrg = make(map[string]string)
 	m.kicks = make(chan kickMsg, tenantKickQueueCapacity)
 	return m
@@ -293,6 +295,7 @@ func (m *tenantWorkerManager) ForgetTenant(tenantID string) {
 	delete(m.kickPending, tenantID)
 	delete(m.lastMaintenance, tenantID)
 	delete(m.lastReconcile, tenantID)
+	delete(m.reconcileState, tenantID)
 	delete(m.semanticMetricOrg, tenantID)
 	m.mu.Unlock()
 }
@@ -650,9 +653,7 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 
 	// Delete-orphan reconciliation (§4.2.1): one throttled round per tenant,
 	// dry-run unless DRIVE9_DELETE_RECONCILE_REPAIR is set.
-	m.reconcileDeleteOrphans(ctx, target)
-
-	// Observation metrics: sample queue depth + dead-letter count.
+	m.reconcileDeleteOrphans(ctx, target)	// Observation metrics: sample queue depth + dead-letter count.
 	m.observeTenant(ctx, target, now)
 }
 
@@ -669,16 +670,24 @@ func (m *tenantWorkerManager) reconcileDeleteOrphans(ctx context.Context, target
 	if m.lastReconcile == nil {
 		m.lastReconcile = make(map[string]time.Time)
 	}
+	if m.reconcileState == nil {
+		m.reconcileState = make(map[string]*datastore.DeleteReconcileState)
+	}
 	last := m.lastReconcile[target.tenantID]
 	if now.Sub(last) < tenantDeleteReconcileInterval {
 		m.mu.Unlock()
 		return
 	}
 	m.lastReconcile[target.tenantID] = now
+	state := m.reconcileState[target.tenantID]
+	if state == nil {
+		state = &datastore.DeleteReconcileState{}
+		m.reconcileState[target.tenantID] = state
+	}
 	m.mu.Unlock()
 
 	dryRun := !datastore.DeleteReconcileRepairEnabled()
-	report, err := target.store.ReconcileDeleteOrphans(ctx, dryRun, 0)
+	report, err := target.store.ReconcileDeleteOrphans(ctx, dryRun, 0, state)
 	if err != nil {
 		if !isContextDoneErr(err) {
 			logger.Warn(ctx, "tenant_worker_delete_reconcile_failed",

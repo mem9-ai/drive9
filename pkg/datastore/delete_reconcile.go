@@ -41,8 +41,21 @@ const DefaultDeleteReconcileBatchSize = 500
 // deleteReconcileMaxScanRows bounds the rows one reconciliation round scans
 // per table, so a hot tenant cannot turn a 10-minute piggyback round into an
 // hours-long scan. Repair progress persists across rounds (repaired rows
-// disappear), so capping a round is safe; dry-run simply re-audits.
-const deleteReconcileMaxScanRows = 200_000
+// disappear), so capping a round is safe; dry-run simply re-audits. A
+// package-level variable so tests can shrink it.
+var deleteReconcileMaxScanRows = 200_000
+
+// DeleteReconcileState carries the scan cursors between reconciliation
+// rounds. The per-tenant worker holds one instance per tenant (alongside its
+// other throttle state), so a round that hits deleteReconcileMaxScanRows
+// resumes where it stopped instead of re-auditing the same prefix forever.
+// It is in-worker state, not durable: a pod restart re-covers earlier rows,
+// which is acceptable for an audit/repair backstop whose repairs themselves
+// persist. A nil state is equivalent to a fresh one (tests, one-shot runs).
+type DeleteReconcileState struct {
+	DentryCursor string
+	InodeCursor  string
+}
 
 // DeleteReconcileReport summarizes one reconciliation round.
 type DeleteReconcileReport struct {
@@ -69,20 +82,25 @@ func DeleteReconcileRepairEnabled() bool {
 // ReconcileDeleteOrphans runs one reconciliation round over this tenant's
 // store: a schema-agnostic broken-chain dentry scan, plus a stranded file
 // inode scan on split-schema stores (skipped when HasLegacyFiles is true).
-// In dry-run mode candidates are only counted and logged.
-func (s *Store) ReconcileDeleteOrphans(ctx context.Context, dryRun bool, batchSize int) (report *DeleteReconcileReport, err error) {
+// In dry-run mode candidates are only counted and logged. state carries the
+// scan cursors between rounds (nil = fresh); a round that completes a full
+// pass resets its cursor so the next round starts over.
+func (s *Store) ReconcileDeleteOrphans(ctx context.Context, dryRun bool, batchSize int, state *DeleteReconcileState) (report *DeleteReconcileReport, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_reconcile", start, &err)
 
 	if batchSize <= 0 {
 		batchSize = DefaultDeleteReconcileBatchSize
 	}
+	if state == nil {
+		state = &DeleteReconcileState{}
+	}
 	report = &DeleteReconcileReport{}
-	if err := s.reconcileBrokenDentries(ctx, dryRun, batchSize, report); err != nil {
+	if err := s.reconcileBrokenDentries(ctx, dryRun, batchSize, state, report); err != nil {
 		return report, err
 	}
 	if !s.useLegacyFiles {
-		if err := s.reconcileStrandedInodes(ctx, dryRun, batchSize, report); err != nil {
+		if err := s.reconcileStrandedInodes(ctx, dryRun, batchSize, state, report); err != nil {
 			return report, err
 		}
 	}
@@ -106,8 +124,7 @@ type reconcileDentryCandidate struct {
 	isDir      bool
 }
 
-func (s *Store) reconcileBrokenDentries(ctx context.Context, dryRun bool, batchSize int, report *DeleteReconcileReport) error {
-	cursor := ""
+func (s *Store) reconcileBrokenDentries(ctx context.Context, dryRun bool, batchSize int, state *DeleteReconcileState, report *DeleteReconcileReport) error {
 	scannedTotal := 0
 	for {
 		if err := ctx.Err(); err != nil {
@@ -115,7 +132,7 @@ func (s *Store) reconcileBrokenDentries(ctx context.Context, dryRun bool, batchS
 		}
 		rows, err := s.db.QueryContext(ctx, `SELECT node_id, path, parent_path, COALESCE(file_id, ''), is_directory
 			FROM file_nodes WHERE `+s.scope.And(`node_id > ?`)+` ORDER BY node_id LIMIT ?`,
-			s.scope.Args(cursor, batchSize)...)
+			s.scope.Args(state.DentryCursor, batchSize)...)
 		if err != nil {
 			return err
 		}
@@ -130,7 +147,7 @@ func (s *Store) reconcileBrokenDentries(ctx context.Context, dryRun bool, batchS
 			}
 			c.isDir = isDir != 0
 			scanned++
-			cursor = c.nodeID
+			state.DentryCursor = c.nodeID
 			// Top-level rows are always valid: the root is implicit and has
 			// no file_nodes row, so a parent lookup would always miss.
 			if c.parentPath == "/" {
@@ -177,9 +194,13 @@ func (s *Store) reconcileBrokenDentries(ctx context.Context, dryRun bool, batchS
 			}
 		}
 		if scanned < batchSize {
+			// Full pass completed: restart from the beginning next round.
+			state.DentryCursor = ""
 			return nil
 		}
 		if scannedTotal >= deleteReconcileMaxScanRows {
+			// Capped round: keep the cursor in state so the next round
+			// resumes here instead of re-auditing the same prefix.
 			logger.Info(ctx, "delete_reconcile_scan_capped",
 				zap.Int("scanned_rows", scannedTotal))
 			return nil
@@ -188,43 +209,56 @@ func (s *Store) reconcileBrokenDentries(ctx context.Context, dryRun bool, batchS
 }
 
 // reconcileExistingParentDirs returns the set of parent paths that exist as
-// directory dentries, using one (path_hash, path) row-constructor IN query
-// per chunk instead of a point check per candidate row.
+// directory dentries. It queries path_hash IN (...) (an index-friendly form
+// on both MySQL and TiDB) and filters the exact path match in memory, instead
+// of a point check per candidate row.
 func (s *Store) reconcileExistingParentDirs(ctx context.Context, parentPaths []string) (map[string]bool, error) {
 	existing := make(map[string]bool, len(parentPaths))
-	seen := make(map[string]bool, len(parentPaths))
-	uniq := make([]string, 0, len(parentPaths))
+	hashToPaths := make(map[string][]string, len(parentPaths))
 	for _, p := range parentPaths {
-		if !seen[p] {
-			seen[p] = true
-			uniq = append(uniq, p)
+		h := fileNodePathHash(p)
+		if len(hashToPaths[h]) == 0 {
+			hashToPaths[h] = []string{p}
+			continue
+		}
+		dup := false
+		for _, q := range hashToPaths[h] {
+			if q == p {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			hashToPaths[h] = append(hashToPaths[h], p)
 		}
 	}
-	for start := 0; start < len(uniq); start += DefaultDeleteReconcileBatchSize {
+	hashes := make([]string, 0, len(hashToPaths))
+	for h := range hashToPaths {
+		hashes = append(hashes, h)
+	}
+	for start := 0; start < len(hashes); start += DefaultDeleteReconcileBatchSize {
 		end := start + DefaultDeleteReconcileBatchSize
-		if end > len(uniq) {
-			end = len(uniq)
+		if end > len(hashes) {
+			end = len(hashes)
 		}
-		chunk := uniq[start:end]
-		tuples := make([]string, 0, len(chunk))
-		args := make([]any, 0, len(chunk)*2)
-		for _, p := range chunk {
-			tuples = append(tuples, "(?, ?)")
-			args = append(args, fileNodePathHash(p), p)
-		}
-		rows, err := s.db.QueryContext(ctx, `SELECT path FROM file_nodes WHERE `+
-			s.scope.And(`(path_hash, path) IN (`+strings.Join(tuples, ",")+`) AND is_directory = 1`),
-			s.scope.Args(args...)...)
+		chunk := hashes[start:end]
+		rows, err := s.db.QueryContext(ctx, `SELECT path_hash, path FROM file_nodes WHERE `+
+			s.scope.And(`path_hash IN (`+questionPlaceholders(len(chunk))+`) AND is_directory = 1`),
+			s.scope.Args(stringsToAny(chunk)...)...)
 		if err != nil {
 			return nil, err
 		}
 		for rows.Next() {
-			var p string
-			if err := rows.Scan(&p); err != nil {
+			var h, p string
+			if err := rows.Scan(&h, &p); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
-			existing[p] = true
+			for _, q := range hashToPaths[h] {
+				if q == p {
+					existing[p] = true
+				}
+			}
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
@@ -304,8 +338,7 @@ func (s *Store) repairBrokenDentry(ctx context.Context, c reconcileDentryCandida
 
 // --- stranded file inodes (split schema only) ---
 
-func (s *Store) reconcileStrandedInodes(ctx context.Context, dryRun bool, batchSize int, report *DeleteReconcileReport) error {
-	cursor := ""
+func (s *Store) reconcileStrandedInodes(ctx context.Context, dryRun bool, batchSize int, state *DeleteReconcileState, report *DeleteReconcileReport) error {
 	scannedTotal := 0
 	for {
 		if err := ctx.Err(); err != nil {
@@ -318,7 +351,7 @@ func (s *Store) reconcileStrandedInodes(ctx context.Context, dryRun bool, batchS
 		// file_gc_tasks row.
 		args := s.scope.Args()                 // i
 		args = append(args, s.scope.Args()...) // c
-		args = append(args, cursor)            // i.inode_id > ?
+		args = append(args, state.InodeCursor) // i.inode_id > ?
 		args = append(args, s.scope.Args()...) // fn
 		args = append(args, s.scope.Args()...) // g
 		args = append(args, batchSize)         // LIMIT
@@ -363,15 +396,19 @@ func (s *Store) reconcileStrandedInodes(ctx context.Context, dryRun bool, batchS
 			}
 		}
 		if len(page) < batchSize {
+			// Full pass completed: restart from the beginning next round.
+			state.InodeCursor = ""
 			return nil
 		}
 		scannedTotal += len(page)
+		state.InodeCursor = page[len(page)-1]
 		if scannedTotal >= deleteReconcileMaxScanRows {
+			// Capped round: keep the cursor in state so the next round
+			// resumes here instead of re-auditing the same prefix.
 			logger.Info(ctx, "delete_reconcile_scan_capped",
 				zap.Int("scanned_rows", scannedTotal))
 			return nil
 		}
-		cursor = page[len(page)-1]
 	}
 }
 
