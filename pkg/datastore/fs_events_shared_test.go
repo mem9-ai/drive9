@@ -71,12 +71,15 @@ func TestFSEventsSharedShapeParity(t *testing.T) {
 	if _, err := store.DB().Exec(`UPDATE fs_events SET created_at = ? WHERE seq = ?`, old, seq1); err != nil {
 		t.Fatalf("age row: %v", err)
 	}
-	deleted, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-time.Hour))
+	deleted, hasMore, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-time.Hour), 1000, 10)
 	if err != nil {
 		t.Fatalf("DeleteFSEventsBefore: %v", err)
 	}
 	if deleted != 1 {
 		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+	if hasMore {
+		t.Fatal("hasMore = true, want false after short final batch")
 	}
 	events, err = store.ListFSEventsSince(ctx, 0, 10)
 	if err != nil {
@@ -145,12 +148,15 @@ func TestFSEventsSharedShapeInterleaving(t *testing.T) {
 	}
 
 	// A's retention sweep must delete only A's rows.
-	deleted, err := storeA.DeleteFSEventsBefore(ctx, time.Now().Add(time.Hour))
+	deleted, hasMore, err := storeA.DeleteFSEventsBefore(ctx, time.Now().Add(time.Hour), 1000, 10)
 	if err != nil {
 		t.Fatalf("DeleteFSEventsBefore A: %v", err)
 	}
 	if deleted != 3 {
 		t.Fatalf("A deleted = %d, want 3", deleted)
+	}
+	if hasMore {
+		t.Fatal("A hasMore = true, want false")
 	}
 	eventsB, err := storeB.ListFSEventsSince(ctx, 0, 10)
 	if err != nil {
@@ -165,5 +171,82 @@ func TestFSEventsSharedShapeInterleaving(t *testing.T) {
 	}
 	if total != 2 {
 		t.Fatalf("total fs_events rows = %d, want 2 (only B's rows survive)", total)
+	}
+}
+
+// TestDeleteSharedFSEventsBefore exercises the shared-pool sweep: one call
+// deletes expired rows across ALL tenants (no fs_id predicate), batched with
+// hasMore semantics like the per-tenant variant.
+func TestDeleteSharedFSEventsBefore(t *testing.T) {
+	installSharedCoreFSSchema(t)
+	const fsA, fsB int64 = 4400020, 4400021
+	storeA := newSharedStore(t, fsA)
+	storeB := newSharedStore(t, fsB)
+	ctx := context.Background()
+
+	// 3 old rows for A, 2 old rows for B, 1 fresh row for B.
+	old := time.Now().Add(-2 * time.Hour)
+	for i, tc := range []struct {
+		store *Store
+		path  string
+		age   bool
+	}{
+		{storeA, "/a/1", true}, {storeA, "/a/2", true}, {storeA, "/a/3", true},
+		{storeB, "/b/1", true}, {storeB, "/b/2", true},
+		{storeB, "/b/fresh", false},
+	} {
+		seq, err := tc.store.InsertFSEvent(ctx, tc.path, "write", "tester", int64(300+i))
+		if err != nil {
+			t.Fatalf("InsertFSEvent %s: %v", tc.path, err)
+		}
+		if tc.age {
+			if _, err := tc.store.DB().ExecContext(ctx, `UPDATE fs_events SET created_at = ? WHERE seq = ?`, old, seq); err != nil {
+				t.Fatalf("age row %s: %v", tc.path, err)
+			}
+		}
+	}
+
+	cutoff := time.Now().Add(-time.Hour)
+
+	// First sweep from A's store: batchSize 2, maxBatches 2 → 4 of the 5 old
+	// rows (across BOTH tenants) deleted, hasMore=true.
+	deleted, hasMore, err := storeA.DeleteSharedFSEventsBefore(ctx, cutoff, 2, 2)
+	if err != nil {
+		t.Fatalf("DeleteSharedFSEventsBefore sweep 1: %v", err)
+	}
+	if deleted != 4 {
+		t.Fatalf("sweep 1 deleted = %d, want 4 (cross-tenant, batched)", deleted)
+	}
+	if !hasMore {
+		t.Fatal("sweep 1 hasMore = false, want true (batch cap hit with leftover)")
+	}
+
+	// Second sweep drains the remaining old row regardless of which tenant's
+	// store issues it.
+	deleted, hasMore, err = storeB.DeleteSharedFSEventsBefore(ctx, cutoff, 100, 10)
+	if err != nil {
+		t.Fatalf("DeleteSharedFSEventsBefore sweep 2: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("sweep 2 deleted = %d, want 1", deleted)
+	}
+	if hasMore {
+		t.Fatal("sweep 2 hasMore = true, want false after short final batch")
+	}
+
+	// Only B's fresh row survives.
+	var total int64
+	if err := storeA.DB().QueryRow(`SELECT COUNT(*) FROM fs_events`).Scan(&total); err != nil {
+		t.Fatalf("count all fs_events: %v", err)
+	}
+	if total != 1 {
+		t.Fatalf("total fs_events rows = %d, want 1 (only the fresh row)", total)
+	}
+	eventsB, err := storeB.ListFSEventsSince(ctx, 0, 10)
+	if err != nil {
+		t.Fatalf("ListFSEventsSince B: %v", err)
+	}
+	if len(eventsB) != 1 || eventsB[0].Path != "/b/fresh" {
+		t.Fatalf("B events after shared sweep = %#v, want only /b/fresh", eventsB)
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,6 +90,76 @@ type ShadowStore struct {
 	cachedFreeBytes  atomic.Int64 // cached Statfs free bytes (Bavail*Bsize)
 	cachedTotalBytes atomic.Int64 // cached Statfs total bytes (Blocks*Bsize)
 
+	// pathLocks serializes all disk+memory mutations per remote path, so a
+	// generation-checked removal (RemoveIfGeneration) cannot delete or retire
+	// the on-disk shadow of a fresher same-path write that already passed the
+	// in-memory generation check. Lock order: path lock (outer) → s.mu (inner).
+	pathLocks map[string]*shadowPathLock
+}
+
+// shadowPathLock is a refcounted per-path mutex, mirroring WriteBackCache's
+// pathLockEntry.
+type shadowPathLock struct {
+	mu      sync.Mutex
+	waiters int
+}
+
+func (s *ShadowStore) acquirePathLock(remotePath string) *shadowPathLock {
+	s.mu.Lock()
+	pl, ok := s.pathLocks[remotePath]
+	if !ok {
+		pl = &shadowPathLock{}
+		s.pathLocks[remotePath] = pl
+	}
+	pl.waiters++
+	s.mu.Unlock()
+
+	pl.mu.Lock()
+	return pl
+}
+
+func (s *ShadowStore) releasePathLock(remotePath string, pl *shadowPathLock) {
+	s.mu.Lock()
+	pl.waiters--
+	if pl.waiters == 0 {
+		delete(s.pathLocks, remotePath)
+	}
+	s.mu.Unlock()
+	pl.mu.Unlock()
+}
+
+// acquireTwoPathLocks locks both paths in a stable (lexicographic) order so
+// Rename cannot deadlock against a concurrent opposite-direction Rename.
+// The returned locks correspond to the SORTED names: pla protects first,
+// plb protects second.
+func (s *ShadowStore) acquireTwoPathLocks(a, b string) (pla, plb *shadowPathLock) {
+	if a == b {
+		pla = s.acquirePathLock(a)
+		return pla, nil
+	}
+	first, second := a, b
+	if second < first {
+		first, second = second, first
+	}
+	pla = s.acquirePathLock(first)
+	plb = s.acquirePathLock(second)
+	return pla, plb
+}
+
+func (s *ShadowStore) releaseTwoPathLocks(a, b string, pla, plb *shadowPathLock) {
+	// Release against the same SORTED names used by acquireTwoPathLocks:
+	// pla protects the lexicographically smaller path, plb the larger one.
+	// Releasing against the original unsorted names crosses the lock/path
+	// pairing for reverse-ordered renames and can delete a live lock's map
+	// entry, splitting one path into two mutexes.
+	first, second := a, b
+	if second < first {
+		first, second = second, first
+	}
+	if plb != nil {
+		s.releasePathLock(second, plb)
+	}
+	s.releasePathLock(first, pla)
 }
 
 // NewShadowStore creates a ShadowStore rooted at dir.
@@ -126,6 +195,7 @@ func NewShadowStoreWithQuota(dir string, freeRatio float64, maxBytes int64) (*Sh
 		writeGen:            make(map[string]uint64),
 		writeCacheFreeRatio: freeRatio,
 		writeCacheMaxBytes:  maxBytes,
+		pathLocks:           make(map[string]*shadowPathLock),
 	}
 	return ss, nil
 }
@@ -160,7 +230,7 @@ func (s *ShadowStore) checkByteQuota(requiredBytes int64) error {
 	if s.writeCacheMaxBytes > 0 {
 		currentPending := s.pendingBytes.Load()
 		if currentPending+requiredBytes > s.writeCacheMaxBytes {
-			log.Printf("write-back quota rejected: cache_dir=%s pending_bytes=%d required_bytes=%d quota_bytes=%d reason=byte_quota_exceeded",
+			safeLogPrintf("write-back quota rejected: cache_dir=%s pending_bytes=%d required_bytes=%d quota_bytes=%d reason=byte_quota_exceeded",
 				s.dir, currentPending, requiredBytes, s.writeCacheMaxBytes)
 			return syscall.ENOSPC
 		}
@@ -191,7 +261,7 @@ func (s *ShadowStore) evalFreeRatio(freeBytes, totalBytes, requiredBytes int64) 
 	if totalBytes > 0 {
 		ratioAfterWrite := float64(freeAfterWrite) / float64(totalBytes)
 		if ratioAfterWrite < s.writeCacheFreeRatio {
-			log.Printf("write-back quota rejected: cache_dir=%s free_bytes=%d required_bytes=%d free_ratio=%.4f threshold=%.4f reason=free_ratio_exceeded",
+			safeLogPrintf("write-back quota rejected: cache_dir=%s free_bytes=%d required_bytes=%d free_ratio=%.4f threshold=%.4f reason=free_ratio_exceeded",
 				s.dir, freeBytes, requiredBytes, ratioAfterWrite, s.writeCacheFreeRatio)
 			return syscall.ENOSPC
 		}
@@ -310,6 +380,9 @@ func (s *ShadowStore) ensureShadowFile(remotePath string, baseRev int64) (*Shado
 // This is used to establish a local writable source of truth for new or
 // truncating handles before any user writes arrive.
 func (s *ShadowStore) Ensure(remotePath string, size int64, baseRev int64) error {
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
 		return err
@@ -341,6 +414,9 @@ func (s *ShadowStore) Ensure(remotePath string, size int64, baseRev int64) error
 // WriteAt writes user data directly into the shadow file without syncing.
 // The caller decides when the shadow needs durable persistence.
 func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, baseRev int64) (int, error) {
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
 		return 0, err
@@ -398,6 +474,9 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 // WriteFull replaces the shadow contents with a full snapshot.
 // Returns ENOSPC if the write would breach disk protection limits.
 func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) error {
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
 		return err
@@ -527,6 +606,9 @@ func (s *ShadowStore) checkFreeRatioThrottled(requiredBytes int64) error {
 // perform the actual fd.ReadAt call under RLock, so no concurrent reader
 // can be using the old fd when WriteStream releases Lock.
 func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64) (int64, error) {
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
 		return 0, err
@@ -594,6 +676,9 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 // Truncate updates the shadow file length without syncing it.
 // Returns ENOSPC if the growth would breach disk protection limits.
 func (s *ShadowStore) Truncate(remotePath string, size int64, baseRev int64) error {
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
 		return err
@@ -638,6 +723,9 @@ func (s *ShadowStore) Sync(remotePath string) error {
 // Each dirty part is written at its correct offset via pwrite.
 // This avoids full-file materialization — cost is O(dirty_parts) syscalls.
 func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev int64) error {
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
 		return err
@@ -1057,14 +1145,21 @@ func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 // pins, the shadow is "retired" — removed from the active files map so new
 // writers get a fresh shadow, but kept alive for existing readers until the
 // last Unpin.
+//
+// The per-path lock is held across map removal AND disk cleanup so a
+// concurrent same-path write cannot open/reuse the shared disk path in
+// between.
 func (s *ShadowStore) Remove(remotePath string) {
+	pl := s.acquirePathLock(remotePath)
 	s.mu.Lock()
 	cleanup, ok := s.removeCoreLocked(remotePath, 0)
 	s.mu.Unlock()
 	if !ok {
+		s.releasePathLock(remotePath, pl)
 		return
 	}
 	s.runRemoveCleanup(cleanup)
+	s.releasePathLock(remotePath, pl)
 }
 
 // RemoveIfGeneration removes the shadow file for remotePath only if its current
@@ -1074,14 +1169,22 @@ func (s *ShadowStore) Remove(remotePath string) {
 // between the check and the actual removal. Returns true only if the entry was
 // removed. This prevents a stale upload from removing a fresher shadow that
 // was written while the old upload was in flight.
+//
+// The per-path lock is additionally held across the disk cleanup (retire
+// rename or immediate remove), closing the window where a replacement write
+// could create its new shadow at the shared disk path after the in-memory
+// check but before the stale cleanup removed/renamed it.
 func (s *ShadowStore) RemoveIfGeneration(remotePath string, expectedGen uint64) bool {
+	pl := s.acquirePathLock(remotePath)
 	s.mu.Lock()
 	cleanup, ok := s.removeCoreLocked(remotePath, expectedGen)
 	s.mu.Unlock()
 	if !ok {
+		s.releasePathLock(remotePath, pl)
 		return false
 	}
 	s.runRemoveCleanup(cleanup)
+	s.releasePathLock(remotePath, pl)
 	return true
 }
 
@@ -1109,6 +1212,9 @@ func (s *ShadowStore) bumpWriteGenLocked(remotePath string) uint64 {
 // pendingBytes (the replacement shadow's disk file is overwritten by the
 // os.Rename).
 func (s *ShadowStore) Rename(oldPath, newPath string) bool {
+	pla, plb := s.acquireTwoPathLocks(oldPath, newPath)
+	defer s.releaseTwoPathLocks(oldPath, newPath, pla, plb)
+
 	s.mu.Lock()
 
 	sf, ok := s.files[oldPath]

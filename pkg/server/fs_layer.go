@@ -272,14 +272,21 @@ func authorizeFSLayerEntryMutation(w http.ResponseWriter, r *http.Request, entry
 	case datastore.FSLayerEntryOpWhiteout:
 		return authorizeFS(w, r, FSOpDelete, entry.Path)
 	case datastore.FSLayerEntryOpRename:
-		target := strings.TrimSpace(entry.ContentText)
-		if target == "" && len(entry.ContentBlob) > 0 {
-			target = strings.TrimSpace(string(entry.ContentBlob))
-		}
+		target := fsLayerRenameTarget(entry)
 		return authorizeFSPair(w, r, FSOpDelete, entry.Path, FSOpWrite, target)
 	default:
 		return authorizeFS(w, r, FSOpWrite, entry.Path)
 	}
+}
+
+func fsLayerRenameTarget(entry *datastore.FSLayerEntry) string {
+	if entry == nil {
+		return ""
+	}
+	if entry.ContentText != "" {
+		return entry.ContentText
+	}
+	return string(entry.ContentBlob)
 }
 
 func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *backendpkg.Dat9Backend, store *datastore.Store) {
@@ -416,8 +423,12 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 	}
 }
 
+func fsLayerPathQuery(r *http.Request) string {
+	return r.URL.Query().Get("path")
+}
+
 func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request, b *backendpkg.Dat9Backend, store *datastore.Store, layer *datastore.FSLayer) {
-	rawPath := strings.TrimSpace(r.URL.Query().Get("path"))
+	rawPath := fsLayerPathQuery(r)
 	if rawPath == "" {
 		errJSON(w, http.StatusBadRequest, "path is required")
 		return
@@ -473,7 +484,7 @@ func (s *Server) handleFSLayerObjectUpload(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	rawPath := strings.TrimSpace(r.URL.Query().Get("path"))
+	rawPath := fsLayerPathQuery(r)
 	if rawPath == "" {
 		errJSON(w, http.StatusBadRequest, "path is required")
 		return
@@ -645,7 +656,7 @@ func parseFSLayerModeQuery(r *http.Request, key string) (uint32, bool) {
 }
 
 func (s *Server) handleFSLayerEntryGet(w http.ResponseWriter, r *http.Request, store *datastore.Store, layer *datastore.FSLayer) {
-	path := strings.TrimSpace(r.URL.Query().Get("path"))
+	path := fsLayerPathQuery(r)
 	if path == "" {
 		errJSON(w, http.StatusBadRequest, "path is required")
 		return
@@ -836,10 +847,7 @@ func normalizeAndValidateFSLayerServerEntry(layer *datastore.FSLayer, entry *dat
 	}
 	entry.Path = path
 	if entry.Op == datastore.FSLayerEntryOpRename {
-		target := strings.TrimSpace(entry.ContentText)
-		if target == "" && len(entry.ContentBlob) > 0 {
-			target = strings.TrimSpace(string(entry.ContentBlob))
-		}
+		target := fsLayerRenameTarget(entry)
 		targetPath, err := canonicalFSLayerServerPath(target, "", string(entry.Kind))
 		if err != nil {
 			return fmt.Errorf("invalid fs layer rename target: %w", err)
@@ -853,7 +861,6 @@ func normalizeAndValidateFSLayerServerEntry(layer *datastore.FSLayer, entry *dat
 }
 
 func canonicalFSLayerServerPath(rawPath, op, kind string) (string, error) {
-	rawPath = strings.TrimSpace(rawPath)
 	if rawPath == "" {
 		return "", fmt.Errorf("path is required")
 	}
@@ -881,10 +888,7 @@ func validateFSLayerCommitScope(layer *datastore.FSLayer, entries []datastore.FS
 			conflicts = append(conflicts, fsLayerCommitConflict{Path: entries[i].Path, Reason: "entry outside base root"})
 		}
 		if entries[i].Op == datastore.FSLayerEntryOpRename {
-			target := strings.TrimSpace(entries[i].ContentText)
-			if target == "" && len(entries[i].ContentBlob) > 0 {
-				target = strings.TrimSpace(string(entries[i].ContentBlob))
-			}
+			target := fsLayerRenameTarget(&entries[i])
 			targetPath, err := canonicalFSLayerServerPath(target, "", string(entries[i].Kind))
 			if err != nil {
 				conflicts = append(conflicts, fsLayerCommitConflict{Path: entries[i].Path, Reason: "invalid rename target"})
@@ -963,10 +967,7 @@ func snapshotFSLayerCommit(ctx context.Context, b *backendpkg.Dat9Backend, entri
 			if entries[i].Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entries[i].Path, "/") {
 				addDirTreePaths(entries[i].Path)
 			}
-			target := strings.TrimSpace(entries[i].ContentText)
-			if target == "" && len(entries[i].ContentBlob) > 0 {
-				target = strings.TrimSpace(string(entries[i].ContentBlob))
-			}
+			target := fsLayerRenameTarget(&entries[i])
 			if targetPath, err := canonicalFSLayerServerPath(target, "", string(entries[i].Kind)); err == nil {
 				addParentCleanupPaths(targetPath)
 				addTrackedPath(targetPath, false)
@@ -1017,10 +1018,7 @@ func filterFSLayerSnapshotsForEntries(snapshots []fsLayerBaseSnapshot, entries [
 		if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entry.Path, "/") {
 			addDirTreePaths(entry.Path)
 		}
-		target := strings.TrimSpace(entry.ContentText)
-		if target == "" && len(entry.ContentBlob) > 0 {
-			target = strings.TrimSpace(string(entry.ContentBlob))
-		}
+		target := fsLayerRenameTarget(entry)
 		if targetPath, err := canonicalFSLayerServerPath(target, "", string(entry.Kind)); err == nil {
 			addParentCleanupPaths(targetPath)
 			addPath(targetPath)
@@ -1365,10 +1363,7 @@ func fsLayerEntryAlreadyApplied(ctx context.Context, b *backendpkg.Dat9Backend, 
 		}
 		return string(data) == target, nil
 	case datastore.FSLayerEntryOpRename:
-		target := strings.TrimSpace(entry.ContentText)
-		if target == "" && len(entry.ContentBlob) > 0 {
-			target = strings.TrimSpace(string(entry.ContentBlob))
-		}
+		target := fsLayerRenameTarget(entry)
 		if target == "" {
 			return false, nil
 		}
@@ -1402,10 +1397,7 @@ func preflightFSLayerRename(ctx context.Context, b *backendpkg.Dat9Backend, entr
 	if err != nil {
 		return append(conflicts, fsLayerCommitConflict{Path: entry.Path, Reason: err.Error()})
 	}
-	target := strings.TrimSpace(entry.ContentText)
-	if target == "" && len(entry.ContentBlob) > 0 {
-		target = strings.TrimSpace(string(entry.ContentBlob))
-	}
+	target := fsLayerRenameTarget(entry)
 	if target == "" {
 		return append(conflicts, fsLayerCommitConflict{Path: entry.Path, Reason: "rename target is required"})
 	}
@@ -1475,10 +1467,7 @@ func markFSLayerEntryTouched(touched map[string]struct{}, entry *datastore.FSLay
 	if entry.Op != datastore.FSLayerEntryOpRename {
 		return
 	}
-	target := strings.TrimSpace(entry.ContentText)
-	if target == "" && len(entry.ContentBlob) > 0 {
-		target = strings.TrimSpace(string(entry.ContentBlob))
-	}
+	target := fsLayerRenameTarget(entry)
 	if target != "" {
 		touched[target] = struct{}{}
 	}
@@ -1630,10 +1619,7 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		}
 		return b.CreateSymlinkCtx(ctx, entry.Path, target)
 	case datastore.FSLayerEntryOpRename:
-		target := strings.TrimSpace(entry.ContentText)
-		if target == "" && len(entry.ContentBlob) > 0 {
-			target = strings.TrimSpace(string(entry.ContentBlob))
-		}
+		target := fsLayerRenameTarget(entry)
 		if target == "" {
 			return fmt.Errorf("rename target is required")
 		}
@@ -1672,6 +1658,10 @@ func applyFSLayerEntryMode(ctx context.Context, b *backendpkg.Dat9Backend, path 
 func writeFSLayerStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, datastore.ErrNotFound) {
 		errJSON(w, http.StatusNotFound, "not found")
+		return
+	}
+	if errors.Is(err, datastore.ErrRevisionConflict) {
+		errJSON(w, http.StatusConflict, err.Error())
 		return
 	}
 	if errors.Is(err, datastore.ErrFSLayerRefAmbiguous) {

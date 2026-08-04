@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1417,5 +1418,127 @@ func TestShadowStoreRemoveIfGenerationRaceStaleVsNewerWrite(t *testing.T) {
 	}
 	if !bytes.Equal(got, newest) {
 		t.Fatalf("content = %q, want %q (newer content must survive)", got, newest)
+	}
+}
+
+// TestShadowStoreRemoveIfGenerationWriteFullRaceConsistency races replacement
+// WriteFulls against a stale-generation removal and asserts that whenever an
+// active shadow generation exists, its disk file is present and readable.
+// Without per-path serialization, the stale remove can delete/rename the
+// replacement's fresh shadow after the in-memory generation check passed.
+func TestShadowStoreRemoveIfGenerationWriteFullRaceConsistency(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	const p = "/race/file.txt"
+
+	if err := ss.WriteFull(p, []byte("stale"), 0); err != nil {
+		t.Fatal(err)
+	}
+	staleGen := ss.ActiveGeneration(p)
+	if staleGen == 0 {
+		t.Fatal("no active generation after WriteFull")
+	}
+
+	const racers = 8
+	const rounds = 100
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			ss.RemoveIfGeneration(p, staleGen)
+		}
+	}()
+	for r := 0; r < racers; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			for i := 0; i < rounds; i++ {
+				if err := ss.WriteFull(p, []byte("gen"), 0); err != nil {
+					t.Errorf("WriteFull: %v", err)
+					return
+				}
+			}
+		}(r)
+	}
+	wg.Wait()
+
+	if gen := ss.ActiveGeneration(p); gen != 0 {
+		if _, err := ss.ReadAll(p); err != nil {
+			t.Fatalf("active generation %d present but shadow unreadable: %v", gen, err)
+		}
+		if _, err := os.Stat(ss.shadowPath(p)); err != nil {
+			t.Fatalf("active generation %d present but disk file missing: %v", gen, err)
+		}
+	}
+}
+
+// TestShadowStoreTwoPathLocksReverseOrder is the ShadowStore counterpart of
+// TestPendingIndexTwoPathLocksReverseOrder: a reverse-lexicographic
+// acquire/release pair must not split one path into two live mutexes.
+func TestShadowStoreTwoPathLocksReverseOrder(t *testing.T) {
+	ss, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	pla, plb := ss.acquireTwoPathLocks("/z", "/a")
+
+	waiterHeld := make(chan *shadowPathLock, 1)
+	waiterDone := make(chan struct{})
+	go func() {
+		defer close(waiterDone)
+		pl := ss.acquirePathLock("/a")
+		waiterHeld <- pl
+		time.Sleep(150 * time.Millisecond)
+		ss.releasePathLock("/a", pl)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ss.mu.Lock()
+		pl, ok := ss.pathLocks["/a"]
+		waiters := 0
+		if ok {
+			waiters = pl.waiters
+		}
+		ss.mu.Unlock()
+		if ok && waiters >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("waiter never queued on /a path lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	ss.releaseTwoPathLocks("/z", "/a", pla, plb)
+
+	select {
+	case <-waiterHeld:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not acquire /a lock after pair release")
+	}
+
+	secondAcquired := make(chan struct{})
+	go func() {
+		pl := ss.acquirePathLock("/a")
+		close(secondAcquired)
+		ss.releasePathLock("/a", pl)
+	}()
+	select {
+	case <-secondAcquired:
+		t.Fatal("second acquirer entered /a while the waiter still held it — path split into two locks")
+	case <-time.After(50 * time.Millisecond):
+	}
+	<-waiterDone
+	select {
+	case <-secondAcquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second acquirer never entered /a after waiter released")
 	}
 }

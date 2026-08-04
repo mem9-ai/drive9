@@ -18,8 +18,8 @@ import (
 //
 //  2. subscriptionLoop: periodically reports the set of tenant IDs for which
 //     this pod has active SSE subscribers, and prunes tenants that are no
-//     longer active. Writers consult this table (via the podNotifier's route
-//     cache) to push notifications only to pods that care about each tenant.
+//     longer active. The set is observability data for cross-pod routing;
+//     cross-pod delivery itself goes through the unified outbox poller.
 //
 // The leader additionally runs stalePodSweepLoop to mark pods with expired
 // heartbeats as stale and clean up their subscription rows.
@@ -140,8 +140,7 @@ func (pr *podRegistry) heartbeatLoop(ctx context.Context) {
 
 // subscriptionLoop periodically reports this pod's active SSE subscriber
 // tenant set to pod_subscriptions and prunes tenants that no longer have
-// subscribers. This lets the podNotifier build an accurate tenant→peer route
-// table for push targeting.
+// subscribers. The set is observability data for cross-pod routing.
 func (pr *podRegistry) subscriptionLoop(ctx context.Context) {
 	ticker := time.NewTicker(podSubscriptionRefreshInterval)
 	defer ticker.Stop()

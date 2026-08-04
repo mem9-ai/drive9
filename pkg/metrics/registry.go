@@ -342,6 +342,21 @@ func (r *Registry) DeleteCountersByLabel(labelKey, labelValue string) {
 	}
 }
 
+func (r *Registry) DeleteCounterByLabel(name, labelKey, labelValue string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	inst := r.counters[name]
+	if inst == nil {
+		return
+	}
+	match := labelKey + `="` + EscapePromLabel(labelValue) + `"`
+	for labels := range inst.values {
+		if labelHasKeyValue(labels, match) {
+			delete(inst.values, labels)
+		}
+	}
+}
+
 func (r *Registry) DeleteHistogramsByLabel(labelKey, labelValue string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

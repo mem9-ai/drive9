@@ -4,14 +4,81 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 )
+
+func TestFSLayerPathQueryPreservesControlWhitespace(t *testing.T) {
+	const path = "/repo/line\nbreak\tname\r"
+	req := httptest.NewRequest(http.MethodGet, "/v1/layers/layer/entries?path="+url.QueryEscape(path), nil)
+	if got := fsLayerPathQuery(req); got != path {
+		t.Fatalf("path query = %q, want %q", got, path)
+	}
+}
+
+func TestFSLayerPathQueryPreservesEdgeSpaces(t *testing.T) {
+	for _, path := range []string{"/repo/ leading", "/repo/trailing ", "/repo/ both "} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/layers/layer/entries?path="+url.QueryEscape(path), nil)
+		if got := fsLayerPathQuery(req); got != path {
+			t.Fatalf("path query = %q, want %q", got, path)
+		}
+	}
+}
+
+func TestFSLayerRenameTargetPreservesControlWhitespace(t *testing.T) {
+	entry := &datastore.FSLayerEntry{ContentText: "/repo/target\t\r\n"}
+	if got := fsLayerRenameTarget(entry); got != entry.ContentText {
+		t.Fatalf("rename target = %q, want %q", got, entry.ContentText)
+	}
+}
+
+func TestFSLayerRenameTargetPreservesSpaces(t *testing.T) {
+	entry := &datastore.FSLayerEntry{ContentText: "  "}
+	if got := fsLayerRenameTarget(entry); got != entry.ContentText {
+		t.Fatalf("rename target = %q, want %q", got, entry.ContentText)
+	}
+}
+
+func TestFSLayerObjectPathPreservesTrailingControlWhitespace(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-control-whitespace",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	const path = "/repo/name\t"
+	if _, err := c.UploadFSLayerFile(ctx, "layer-control-whitespace", path, strings.NewReader("payload"), 7, 0, 0o644, true); err != nil {
+		t.Fatalf("UploadFSLayerFile: %v", err)
+	}
+	entry, err := c.GetFSLayerEntry(ctx, "layer-control-whitespace", path)
+	if err != nil {
+		t.Fatalf("GetFSLayerEntry: %v", err)
+	}
+	if entry.Path != path {
+		t.Fatalf("entry path = %q, want %q", entry.Path, path)
+	}
+	data, err := c.ReadFSLayerFile(ctx, "layer-control-whitespace", path, nil)
+	if err != nil {
+		t.Fatalf("ReadFSLayerFile: %v", err)
+	}
+	if string(data) != "payload" {
+		t.Fatalf("payload = %q, want payload", data)
+	}
+}
 
 func TestFSLayerAPIFlow(t *testing.T) {
 	s := newTestServer(t)
@@ -901,5 +968,61 @@ func TestValidateFSLayerCommitSnapshotsRejectsIncomplete(t *testing.T) {
 	}})
 	if err == nil {
 		t.Fatal("validateFSLayerCommitSnapshots succeeded, want error")
+	}
+}
+
+func TestFSLayerEntryUpsertBaseRevisionCAS(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	putBase := func(body string) {
+		req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/base.txt", strings.NewReader(body))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("write base: %d", resp.StatusCode)
+		}
+	}
+	upsertEntry := func(baseRevision int64) int {
+		payload := fmt.Sprintf(`{"path":"/base.txt","op":"upsert","kind":"file","base_revision":%d,"content":"bGF5ZXIgZGF0YQ=="}`, baseRevision)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/layers/layer-cas/entries", strings.NewReader(payload))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	putBase("v1")
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/layers", strings.NewReader(`{"layer_id":"layer-cas","base_root_path":"/"}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("layer create: %d", resp.StatusCode)
+	}
+
+	// Upsert against the current base revision is accepted.
+	if code := upsertEntry(1); code != http.StatusOK {
+		t.Fatalf("upsert with current base revision: %d, want 200", code)
+	}
+
+	// Base moves to revision 2; the stale base_revision=1 upsert must be
+	// rejected synchronously (no silent splice into the layer).
+	putBase("v2")
+	if code := upsertEntry(1); code != http.StatusConflict {
+		t.Fatalf("upsert with stale base revision: %d, want 409", code)
+	}
+
+	// The fresh base revision is accepted again.
+	if code := upsertEntry(2); code != http.StatusOK {
+		t.Fatalf("upsert with fresh base revision: %d, want 200", code)
 	}
 }

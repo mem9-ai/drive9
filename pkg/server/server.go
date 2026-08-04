@@ -137,23 +137,30 @@ type Config struct {
 	// over its shard's warm tenants. A non-positive value disables the scan.
 	// SSENotifyRetention is how long outbox rows are kept before leader-gated
 	// pruning (default 1h).
+	// FSEventsRetention is how long fs_events rows are kept before pruning
+	// (default 1h; production sets 168h via DRIVE9_FS_EVENTS_RETENTION). It is
+	// deliberately independent of SSENotifyRetention: fs_events is the durable
+	// replay log, the outbox is a lossy wake-up hint.
+	// SSELivenessPollInterval enables an optional per-connection liveness poll
+	// for connected SSE clients (default 0 = off). See handleEvents.
 	//
 	// PodID uniquely identifies this pod in the central pod_registry. PodAddr
 	// is the internally reachable address (host:port). When both are set, this
 	// pod registers itself and reports its SSE subscriber set.
-	//
-	// PodNotifySecret is retained for backward compatibility (the internal
-	// /v1/internal/sse-notify endpoint). Cross-pod push is superseded by the
-	// unified outbox poller; the secret still gates the legacy endpoint.
 	TenantOutboxPollInterval        time.Duration
 	TenantOutboxCursorFlushInterval time.Duration
 	TenantShardRefreshInterval      time.Duration
 	TenantMaintenanceInterval       time.Duration
 	SafetyNetScanInterval           time.Duration
 	SSENotifyRetention              time.Duration
-	PodID                           string
-	PodAddr                         string
-	PodNotifySecret                 []byte
+	// FSEventsRetention is how long fs_events rows are kept before pruning
+	// (default 1h; production sets 168h via DRIVE9_FS_EVENTS_RETENTION).
+	FSEventsRetention time.Duration
+	// SSELivenessPollInterval enables an optional per-connection liveness
+	// poll for connected SSE clients (default 0 = off).
+	SSELivenessPollInterval time.Duration
+	PodID                   string
+	PodAddr                 string
 }
 
 type SlockOAuthClient interface {
@@ -303,18 +310,45 @@ type Server struct {
 	// and subscriber set in the central DB. All run on every pod (not
 	// leader-gated); the leader additionally sweeps stale pods and prunes the
 	// outbox.
-	podRegistry     *podRegistry
-	podNotifySecret []byte
-	notifyCancel    context.CancelFunc
-	notifyWG        sync.WaitGroup
+	podRegistry  *podRegistry
+	notifyCancel context.CancelFunc
+	notifyWG     sync.WaitGroup
 	// notifyCoalescer OR-merges per-tenant outbox signals and flushes them
 	// in one multi-row INSERT per 200ms window (see notify_coalescer.go).
 	// Created in startNotifyInfrastructure (multi-tenant mode only); nil in
 	// single-tenant mode, where insertTenantNotify falls back to direct
 	// single-row inserts.
 	notifyCoalescer *tenantNotifyCoalescer
+	// eventRetry buffers fs_events rows whose durable insert failed and
+	// flushes them with backoff (see event_retry.go). Runs on every pod
+	// (not leader-gated); stopped during Close before the coalescer's final
+	// flush so its last notify signals still land in the outbox.
+	eventRetry *eventRetryBuffer
+	// sweepCtx/sweepCancel tie the detached fs_events sweep goroutines
+	// (maybeSweepFSEvents / maybeSweepSharedFSEvents) to the server
+	// lifecycle: stopNotifyInfrastructure cancels them promptly (the batched
+	// DELETE loop checks ctx between batches) and notifyWG.Wait covers them,
+	// so they cannot outlive Close and hit a closed meta store.
+	// Hand-constructed servers (tests) leave both nil and use a background
+	// context instead. Mirrors the forkWorkerCtx precedent.
+	sweepCtx    context.Context
+	sweepCancel context.CancelFunc
+	// sharedSweepLast is the per-pod pre-filter throttle for the shared-pool
+	// fs_events sweep (see maybeSweepSharedFSEvents in sse.go), keyed by
+	// physical pool id (db_pool.db_id; 0 = unknown/single pool): each shared
+	// pool is throttled and claimed independently so a hot pool cannot
+	// starve a cold one. The authoritative cluster-wide throttle is the
+	// meta-DB claim; this map only keeps the common case off the meta DB.
+	sharedSweepLast sync.Map // dbID int64 -> unix seconds int64
 	// sseNotifyRetention is how long outbox rows are kept before leader pruning.
 	sseNotifyRetention time.Duration
+	// fsEventsRetention is how long fs_events rows are kept before the lazy
+	// write-path sweep and the tenant-worker's piggyback maintenance prune
+	// them. Independent of sseNotifyRetention by design.
+	fsEventsRetention time.Duration
+	// sseLivenessPollInterval enables the optional Phase-2 liveness poll for
+	// connected SSE clients (default 0 = off).
+	sseLivenessPollInterval time.Duration
 	// safetyNetScanInterval is how often each pod runs the safety-net scan.
 	// Non-positive disables it.
 	safetyNetScanInterval time.Duration
@@ -422,9 +456,9 @@ func NewWithConfig(cfg Config) *Server {
 	if maxUpload <= 0 {
 		maxUpload = DefaultMaxUploadBytes
 	}
-	logger := cfg.Logger
-	if logger == nil {
-		logger, _ = zap.NewProduction()
+	srvLog := cfg.Logger
+	if srvLog == nil {
+		srvLog, _ = zap.NewProduction()
 	}
 	metrics.SetFeatureEnabled("vault", len(cfg.VaultMasterKey) > 0)
 	metrics.SetModuleAvailability("vault", false)
@@ -433,7 +467,7 @@ func NewWithConfig(cfg Config) *Server {
 		var err error
 		vaultMK, err = vault.NewMasterKey(cfg.VaultMasterKey)
 		if err != nil {
-			logger.Warn("vault master key invalid, vault disabled", zap.Error(err))
+			srvLog.Warn("vault master key invalid, vault disabled", zap.Error(err))
 		} else {
 			metrics.SetModuleAvailability("vault", true)
 		}
@@ -514,6 +548,7 @@ func NewWithConfig(cfg Config) *Server {
 		defaultTenantProvider = cfg.Provisioner.ProviderType()
 	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
+	sweepCtx, sweepCancel := context.WithCancel(backgroundWithTrace(context.Background()))
 	s := &Server{
 		fallback:              cfg.Backend,
 		meta:                  cfg.Meta,
@@ -552,7 +587,7 @@ func NewWithConfig(cfg Config) *Server {
 		tenantPoolRefillFreeRatio: tenantPoolRefillFreeRatio,
 		inlineThreshold:           inlineThreshold,
 		metrics:                   newServerMetrics(),
-		logger:                    logger,
+		logger:                    srvLog,
 		events:                    newEventBuses(),
 		slockOAuth:                cfg.SlockOAuth,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
@@ -564,22 +599,44 @@ func NewWithConfig(cfg Config) *Server {
 		journalCursorSecret:     newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:           forkWorkerCtx,
 		forkWorkerCancel:        forkWorkerCancel,
+		sweepCtx:                sweepCtx,
+		sweepCancel:             sweepCancel,
 		tidbCloudRBACCache:      newTiDBCloudRBACCache(tidbCloudRBACCacheTTL),
 		tidbCloudPlanCache:      newTiDBCloudNonFreePlanCache(cfg.TiDBCloudNonFreePlanCacheTTL),
 		tidbCloudFreePlanLimits: normalizeTiDBCloudFreePlanLimits(cfg.TiDBCloudFreePlanLimits),
 		leader:                  cfg.Leader,
-		podNotifySecret:         cfg.PodNotifySecret,
 		sseNotifyRetention:      cfg.SSENotifyRetention,
+		fsEventsRetention:       cfg.FSEventsRetention,
+		sseLivenessPollInterval: cfg.SSELivenessPollInterval,
 		safetyNetScanInterval:   cfg.SafetyNetScanInterval,
 	}
 	// Default SSE notify retention.
 	if s.sseNotifyRetention <= 0 {
 		s.sseNotifyRetention = defaultSSENotifyRetention
 	}
+	// Default fs_events retention. This is the durable replay log's retention;
+	// it is deliberately independent of the outbox retention above.
+	if s.fsEventsRetention <= 0 {
+		s.fsEventsRetention = defaultFSEventsRetention
+	}
+	// Log the effective retention at startup so a missing
+	// DRIVE9_FS_EVENTS_RETENTION env var is visible instead of silently
+	// reverting to the default.
+	logger.Info(context.Background(), "fs_events_retention_configured",
+		zap.Duration("retention", s.fsEventsRetention))
 	// safetyNetScanInterval is taken as configured: a non-positive value
 	// disables the safety-net scan entirely (see startNotifyInfrastructure).
 	// The 5min default lives in the server binaries' env fallback, not here,
 	// so a zero Config keeps the scan off.
+	// Start the fs_events insert retry buffer on every pod (not leader-gated,
+	// and also in single-tenant mode): publishEvent enqueues on insert failure
+	// in both modes. The per-entry drop age tracks the fs_events retention
+	// (clamped to [1h, 24h] by the constructor) so a longer replay window is
+	// actually reachable by retried events. Stopped in
+	// stopNotifyInfrastructure, which Close always calls, with a final
+	// best-effort flush before the coalescer drains.
+	s.eventRetry = newEventRetryBuffer(s.insertTenantNotify, s.fsEventsRetention, s.resolveRetryStore)
+	s.eventRetry.start(backgroundWithTrace(context.Background()))
 	mux := http.NewServeMux()
 
 	var business http.Handler = http.HandlerFunc(s.handleBusiness)
@@ -640,12 +697,6 @@ func NewWithConfig(cfg Config) *Server {
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
-	// Internal pod-to-pod SSE push endpoint. Authenticated via a shared
-	// internal bearer secret (not tenant auth). Only registered when a secret
-	// is configured; the handler rejects all requests if no secret is set.
-	if len(cfg.PodNotifySecret) > 0 {
-		mux.HandleFunc(sseNotifyInternalRoute, s.handleInternalSSENotify)
-	}
 
 	local := cfg.LocalS3
 	if local == nil && cfg.Backend != nil {
@@ -689,7 +740,20 @@ func NewWithConfig(cfg Config) *Server {
 	}
 
 	s.mux = mux
-	s.tenantWorker = newTenantWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.TenantWorkers, cfg.TenantMaintenanceInterval)
+	// Finalize the tenant worker options against the server's effective
+	// config: fall back to the server's fs_events retention when the caller
+	// only set Config.FSEventsRetention (belt-and-braces for programmatic
+	// use; main.go sets both), and wire the shared-pool sweep entry point so
+	// the worker's piggyback maintenance and the write path share ONE
+	// throttle (per-pod pre-filter + cluster claim) instead of two clocks.
+	workerOpts := cfg.TenantWorkers
+	if workerOpts.FSEventsRetention <= 0 {
+		workerOpts.FSEventsRetention = s.fsEventsRetention
+	}
+	if workerOpts.SweepSharedFSEvents == nil {
+		workerOpts.SweepSharedFSEvents = s.maybeSweepSharedFSEvents
+	}
+	s.tenantWorker = newTenantWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, workerOpts, cfg.TenantMaintenanceInterval)
 	if s.tenantWorker != nil {
 		// Wire the write-path notifier so freshly enqueued semantic/file_gc/
 		// quota work triggers an immediate in-process kick (~0ms latency for
@@ -738,7 +802,7 @@ func NewWithConfig(cfg Config) *Server {
 		// heartbeat goroutine. If not yet leader, workers stay stopped until
 		// leadership is gained.
 		if !s.leader.IsLeader() {
-			logger.Info("server_leader_standby",
+			srvLog.Info("server_leader_standby",
 				zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
 				zap.Strings("app_managed_task_types", appManagedTaskTypes),
 				zap.Strings("fallback_task_types", fallbackTaskTypes),
@@ -917,6 +981,22 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 func (s *Server) stopNotifyInfrastructure() {
 	if s.notifyCancel != nil {
 		s.notifyCancel()
+	}
+	// Cancel detached fs_events sweep goroutines BEFORE waiting: the batched
+	// DELETE loop checks ctx between batches, so in-flight sweeps exit
+	// promptly and notifyWG.Wait below cannot block on the 5min sweep
+	// timeout. The meta store is still open (it is closed later by the
+	// server binary), so a sweep that lands before cancellation completes
+	// normally.
+	if s.sweepCancel != nil {
+		s.sweepCancel()
+	}
+	// Stop the event retry buffer BEFORE the coalescer: its stop performs a
+	// final best-effort flush whose second-wake signals go through
+	// insertTenantNotify, and those must land in the coalescer before its own
+	// final flush below drains pending signals to the meta DB.
+	if s.eventRetry != nil {
+		s.eventRetry.stop()
 	}
 	// Stop the coalescer right after cancel: its flush loop exits on the
 	// cancelled context, then stop() performs a final flush of pending
@@ -1180,13 +1260,20 @@ func (s *Server) startLeaderWorkers() {
 	}
 }
 
-// fsEventsRetention is how long event rows are kept before pruning. Used by
-// the piggybacked maintenance in the tenant worker.
-const fsEventsRetention = 1 * time.Hour
+// defaultFSEventsRetention is how long fs_events rows are kept before pruning
+// when DRIVE9_FS_EVENTS_RETENTION is unset. fs_events is the durable replay
+// log: production deployments set 168h (7 days) so consumer outages within a
+// week remain replayable. Both sweep paths (the lazy write-path sweep in
+// publishEvent and the tenant worker's piggyback maintenance) read the same
+// configured value.
+const defaultFSEventsRetention = 1 * time.Hour
 
 // defaultSSENotifyRetention is how long tenant_notify_outbox rows are kept
-// before the leader prunes them. Matches fs_events retention so the outbox
-// doesn't outlive the work it points to.
+// before the leader prunes them. The outbox is a lossy wake-up hint consumed
+// within ~200ms by the outbox poller, so 1h is ample. Its retention is
+// deliberately independent of fs_events retention (defaultFSEventsRetention):
+// fs_events is the durable log (1h default, 168h in production), the outbox is
+// only a signal. Do NOT keep the two in sync.
 const defaultSSENotifyRetention = 1 * time.Hour
 
 // tenantNotifyCleanupInterval is how often the leader prunes old outbox rows.
@@ -1344,7 +1431,7 @@ func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 				zap.String("cluster_id", t.ClusterID),
 				zap.String("reason", "tidbcloud_credentials_unavailable"))
 			if s.metrics != nil {
-				s.metrics.recordEvent(t.ID, "tenant_pool_pending_resume",
+				s.metrics.recordEvent(t.ID, s.tenantMetricTiDBCloudOrgID(ctx, &t), "tenant_pool_pending_resume",
 					"provider", t.Provider,
 					"result", "skipped",
 					"reason", "tidbcloud_credentials_unavailable")
@@ -1504,7 +1591,7 @@ func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
 				zap.String("cluster_id", t.ClusterID),
 				zap.String("reason", "explicit_pool_ownership"))
 			if s.metrics != nil {
-				s.metrics.recordEvent(t.ID, "tenant_pool_pending_resume",
+				s.metrics.recordEvent(t.ID, s.tenantMetricTiDBCloudOrgID(ctx, &t), "tenant_pool_pending_resume",
 					"provider", t.Provider,
 					"result", "skipped",
 					"reason", "explicit_pool_ownership")
@@ -3533,6 +3620,12 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	}
 	if nf.File != nil {
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(nf.File.Revision, 10))
+		// Advertise the authoritative storage class so clients (notably FUSE
+		// write-sync) can route PATCH vs full-upload on fact instead of a
+		// size-based heuristic. Older clients simply ignore the header.
+		if nf.File.StorageType != "" {
+			w.Header().Set("X-Dat9-Storage-Type", string(nf.File.StorageType))
+		}
 		if nf.File.ConfirmedAt != nil {
 			w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.File.ConfirmedAt.Unix(), 10))
 		} else {
@@ -3601,6 +3694,21 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+func sourcePathFromHeader(r *http.Request, header string) (string, error) {
+	raw := r.Header.Get(header)
+	if r.Header.Get("X-Dat9-Path-Encoding") == "" {
+		return raw, nil
+	}
+	if r.Header.Get("X-Dat9-Path-Encoding") != "base64url" {
+		return "", fmt.Errorf("unsupported X-Dat9-Path-Encoding")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid encoded %s: %w", header, err)
+	}
+	return string(decoded), nil
+}
+
 func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath string) {
 	// Copy semantics: src needs read, dst needs write. The source path is
 	// in the X-Dat9-Copy-Source HEADER (not the URL) — banked invariant
@@ -3608,7 +3716,11 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 	// could authorize ONLY the dst from the URL and let a scoped token
 	// exfiltrate from any zone it doesn't have read on, as long as its dst
 	// zone is writable. Both ends MUST authorize.
-	srcPath := r.Header.Get("X-Dat9-Copy-Source")
+	srcPath, decodeErr := sourcePathFromHeader(r, "X-Dat9-Copy-Source")
+	if decodeErr != nil {
+		errJSON(w, http.StatusBadRequest, decodeErr.Error())
+		return
+	}
 	if srcPath == "" {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_missing_source_header", "dst_path", dstPath)...)
 		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Copy-Source header")
@@ -3642,7 +3754,11 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 }
 
 func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath string) {
-	srcPath := r.Header.Get("X-Dat9-Hardlink-Source")
+	srcPath, decodeErr := sourcePathFromHeader(r, "X-Dat9-Hardlink-Source")
+	if decodeErr != nil {
+		errJSON(w, http.StatusBadRequest, decodeErr.Error())
+		return
+	}
 	if srcPath == "" {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "hardlink_missing_source_header", "dst_path", dstPath)...)
 		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Hardlink-Source header")
@@ -3691,7 +3807,11 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 	// (= write). Subtle but important — a scoped token with read+write on
 	// the source zone but no delete CAN read & copy the file but must NOT
 	// rename it away. See banked invariant.
-	oldPath := r.Header.Get("X-Dat9-Rename-Source")
+	oldPath, decodeErr := sourcePathFromHeader(r, "X-Dat9-Rename-Source")
+	if decodeErr != nil {
+		errJSON(w, http.StatusBadRequest, decodeErr.Error())
+		return
+	}
 	if oldPath == "" {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "rename_missing_source_header", "new_path", newPath)...)
 		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Rename-Source header")
@@ -3987,7 +4107,7 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.Path) == "" {
+	if req.Path == "" {
 		errJSON(w, http.StatusBadRequest, "missing path")
 		return
 	}
@@ -4474,7 +4594,7 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.Path) == "" {
+	if req.Path == "" {
 		errJSON(w, http.StatusBadRequest, "missing path")
 		return
 	}
@@ -6233,6 +6353,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		zap.String("tenant_id", tenantID),
 		zap.String("provider", provider),
 	))
+	tidbCloudOrgID := s.tenantMetricTiDBCloudOrgID(ctx, &meta.Tenant{ID: tenantID, Provider: provider})
 	logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_started", "tenant_id", tenantID, "provider", provider)...)
 	deadline := time.Now().Add(schemaInitRetryWindow)
 	backoff := schemaInitInitialBackoff
@@ -6260,7 +6381,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 				if versionErr := s.updateTenantSchemaVersionForProfile(ctx, tenantID, provider); versionErr != nil {
 					logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_version_persist_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", versionErr)...)
 					if s.metrics != nil {
-						s.metrics.recordEvent(tenantID, "tenant_schema_init", "provider", provider, "result", "error", "stage", "schema_version_persist")
+						s.metrics.recordEvent(tenantID, tidbCloudOrgID, "tenant_schema_init", "provider", provider, "result", "error", "stage", "schema_version_persist")
 					}
 					err = versionErr
 				}
@@ -6270,7 +6391,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			s.schemaInitErrors.Delete(tenantID)
 			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_ok", "tenant_id", tenantID, "provider", provider, "attempt", attempt)...)
 			if s.metrics != nil {
-				s.metrics.recordEvent(tenantID, "tenant_schema_init", "provider", provider, "result", "ok")
+				s.metrics.recordEvent(tenantID, tidbCloudOrgID, "tenant_schema_init", "provider", provider, "result", "ok")
 			}
 			updated, err := s.meta.UpdateTenantStatusIf(ctx, tenantID, meta.TenantProvisioning, meta.TenantActive)
 			if err != nil {
@@ -6292,7 +6413,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 				logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", err)...)
 			}
 			if s.metrics != nil && !expectedRetryErr {
-				s.metrics.recordEvent(tenantID, "tenant_schema_init", "provider", provider, "result", "error")
+				s.metrics.recordEvent(tenantID, tidbCloudOrgID, "tenant_schema_init", "provider", provider, "result", "error")
 			}
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
@@ -6433,6 +6554,11 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func errJSONRetryable(w http.ResponseWriter, msg string) {
+	w.Header().Set("Retry-After", "1")
+	errJSON(w, http.StatusServiceUnavailable, msg)
 }
 
 func errJSONInvalidRootDentry(w http.ResponseWriter, err error) bool {

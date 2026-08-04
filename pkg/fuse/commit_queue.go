@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"math"
 	"net/http"
 	"sort"
@@ -94,7 +93,7 @@ type CommitQueue struct {
 	// back. When true, Enqueue returns errLayerRolledBack and commitOne
 	// skips tryAutoResolveConflict, going straight to terminal failure so
 	// pending writes are preserved as PendingConflict.
-	abandoned    bool
+	abandoned bool
 
 	// OnSuccess is called after successful upload with the committed
 	// revision. Used by dat9fs to seed readCache and update inode revision.
@@ -576,16 +575,16 @@ func (cq *CommitQueue) RecoverPending() {
 		if cq.shadows != nil && !cq.shadows.Has(path) {
 			// Shadow file missing — prune orphaned pending index entry so
 			// Lookup/GetAttr don't serve stale metadata.
-			log.Printf("commit queue: pruning orphaned pending entry for %s (shadow missing)", path)
+			safeLogPrintf("commit queue: pruning orphaned pending entry for %s (shadow missing)", path)
 			cq.index.Remove(path)
 			continue
 		}
 		if meta.Kind == PendingConflict {
-			log.Printf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
+			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
 			continue
 		}
 		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
-			log.Printf("commit queue: skip legacy pending overwrite without base revision for %s", path)
+			safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
 			continue
 		}
 		// The shadow file is the data actually uploaded; its size is
@@ -608,7 +607,7 @@ func (cq *CommitQueue) RecoverPending() {
 			HasMode:     meta.HasMode,
 		}
 		if err := cq.Enqueue(entry); err != nil {
-			log.Printf("commit queue: recover enqueue failed for %s: %v", path, err)
+			safeLogPrintf("commit queue: recover enqueue failed for %s: %v", path, err)
 		}
 	}
 }
@@ -739,6 +738,79 @@ func (cq *CommitQueue) CancelPathPreserveLocal(path string) {
 	cq.cancelPath(path, true)
 }
 
+// CancelPathIfInode cancels queued or in-flight uploads for path whose entries
+// were staged by the given inode, leaving entries owned by other inodes (e.g.
+// a replacement file that reused the pathname after an unlink) untouched.
+// Local shadow/index state is always preserved — the caller performs its own
+// generation-scoped cleanup.
+func (cq *CommitQueue) CancelPathIfInode(path string, ino uint64) {
+	if cq == nil || path == "" {
+		return
+	}
+	var cancels []context.CancelFunc
+	seen := make(map[*CommitEntry]struct{})
+	markCanceled := func(e *CommitEntry) {
+		if e == nil || e.Inode != ino {
+			return
+		}
+		e.canceled = true
+		cq.stopDelayedLocked(e)
+		if _, ok := seen[e]; ok {
+			return
+		}
+		seen[e] = struct{}{}
+		if e.cancelCommit != nil {
+			cancels = append(cancels, e.cancelCommit)
+		}
+		if e.cancelUpload != nil {
+			cancels = append(cancels, e.cancelUpload)
+		}
+	}
+
+	cq.mu.Lock()
+	if e, ok := cq.inFlight[path]; ok {
+		markCanceled(e)
+	}
+	if cq.queuedByPath != nil {
+		for e := range cq.queuedByPath[path] {
+			markCanceled(e)
+		}
+		if len(seen) > 0 {
+			remaining := cq.queue[:0]
+			for _, e := range cq.queue {
+				if _, drop := seen[e]; drop {
+					continue
+				}
+				remaining = append(remaining, e)
+			}
+			cq.queue = remaining
+			for e := range seen {
+				if set, ok := cq.queuedByPath[path]; ok {
+					delete(set, e)
+					if len(set) == 0 {
+						delete(cq.queuedByPath, path)
+					}
+				}
+			}
+		}
+	} else {
+		remaining := cq.queue[:0]
+		for _, e := range cq.queue {
+			if e.Path == path && e.Inode == ino {
+				markCanceled(e)
+				continue
+			}
+			remaining = append(remaining, e)
+		}
+		cq.queue = remaining
+	}
+	cq.mu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
 // CancelQueuedZeroTruncatePreserveLocal cancels queued, not in-flight,
 // zero-byte overwrite entries for path without removing shadow/pending state.
 // It returns true only when no in-flight or other queued same-path entry remains.
@@ -851,7 +923,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 			Op:   JournalCommit,
 			Path: path,
 		}); err != nil {
-			log.Printf("commit queue: journal cancel marker failed for %s: %v", path, err)
+			safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, err)
 		}
 	}
 }
@@ -917,7 +989,7 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 				Op:   JournalCommit,
 				Path: p,
 			}); err != nil {
-				log.Printf("commit queue: journal cancel marker failed for %s: %v", p, err)
+				safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", p, err)
 			}
 		}
 	}
@@ -945,12 +1017,12 @@ func (cq *CommitQueue) worker() {
 func (cq *CommitQueue) processEntry(entry *CommitEntry) {
 	if cq.isEntryCanceled(entry) {
 		cq.removeFromQueue(entry)
-		log.Printf("commit queue: skipping canceled entry for %s", entry.Path)
+		safeLogPrintf("commit queue: skipping canceled entry for %s", entry.Path)
 		return
 	}
 	if !cq.beginInFlight(entry) {
 		cq.removeFromQueue(entry)
-		log.Printf("commit queue: entry for %s was canceled before in-flight", entry.Path)
+		safeLogPrintf("commit queue: entry for %s was canceled before in-flight", entry.Path)
 		return
 	}
 	handled, deferred := cq.tryCommitBatch(entry)
@@ -1047,7 +1119,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cq.mu.Unlock()
 		entryCancel()
 		cq.removeFromQueue(entry)
-		log.Printf("commit queue: entry for %s was canceled before retry loop", entry.Path)
+		safeLogPrintf("commit queue: entry for %s was canceled before retry loop", entry.Path)
 		return
 	}
 	entry.cancelCommit = entryCancel
@@ -1065,7 +1137,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		// Re-check cancelation between retries.
 		if cq.isEntryCanceled(entry) {
 			cq.removeFromQueue(entry)
-			log.Printf("commit queue: entry for %s was canceled during retry", entry.Path)
+			safeLogPrintf("commit queue: entry for %s was canceled during retry", entry.Path)
 			return
 		}
 
@@ -1079,7 +1151,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			}
 			if !sleepWithCancel(entryCtx, delay) {
 				cq.removeFromQueue(entry)
-				log.Printf("commit queue: entry for %s was canceled during retry backoff", entry.Path)
+				safeLogPrintf("commit queue: entry for %s was canceled during retry backoff", entry.Path)
 				return
 			}
 		}
@@ -1094,7 +1166,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			cq.mu.Unlock()
 			cancel()
 			cq.removeFromQueue(entry)
-			log.Printf("commit queue: entry for %s was canceled before upload", entry.Path)
+			safeLogPrintf("commit queue: entry for %s was canceled before upload", entry.Path)
 			return
 		}
 		entry.cancelUpload = cancel
@@ -1117,7 +1189,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			if cq.isEntryCanceled(entry) {
 				unlockPath()
 				cq.removeFromQueue(entry)
-				log.Printf("commit queue: entry for %s was canceled after upload succeeded, skipping cleanup to preserve newer staged data", entry.Path)
+				safeLogPrintf("commit queue: entry for %s was canceled after upload succeeded, skipping cleanup to preserve newer staged data", entry.Path)
 				return
 			}
 			if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err == nil {
@@ -1125,7 +1197,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 				return
 			} else {
 				unlockPath()
-				log.Printf("commit queue: post-upload attempt %d/%d failed for %s: %v", attempt+1, maxRetries, entry.Path, err)
+				safeLogPrintf("commit queue: post-upload attempt %d/%d failed for %s: %v", attempt+1, maxRetries, entry.Path, err)
 				cq.onCommitPostUploadFailure(entry, err)
 				return
 			}
@@ -1133,7 +1205,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		if cq.isEntryCanceled(entry) {
 			unlockPath()
 			cq.removeFromQueue(entry)
-			log.Printf("commit queue: entry for %s was canceled during upload", entry.Path)
+			safeLogPrintf("commit queue: entry for %s was canceled during upload", entry.Path)
 			return
 		}
 		if errors.Is(err, client.ErrConflict) {
@@ -1145,22 +1217,22 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			abandoned := cq.abandoned
 			cq.mu.Unlock()
 			if abandoned {
-				log.Printf("commit queue: layer abandoned, terminal failure for %s", entry.Path)
+				safeLogPrintf("commit queue: layer abandoned, terminal failure for %s", entry.Path)
 				cq.onCommitTerminalFailure(entry)
 				unlockPath()
 				return
 			}
-			log.Printf("commit queue: conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
+			safeLogPrintf("commit queue: conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
 			cq.tryAutoResolveConflict(entryCtx, entry)
 			unlockPath()
 			return
 		}
 		unlockPath()
 		lastErr = err
-		log.Printf("commit queue: upload attempt %d/%d failed for %s: %v", attempt+1, maxRetries, entry.Path, err)
+		safeLogPrintf("commit queue: upload attempt %d/%d failed for %s: %v", attempt+1, maxRetries, entry.Path, err)
 	}
 
-	log.Printf("commit queue: giving up on %s after %d retries: %v", entry.Path, maxRetries, lastErr)
+	safeLogPrintf("commit queue: giving up on %s after %d retries: %v", entry.Path, maxRetries, lastErr)
 	if errors.Is(lastErr, errCommitPostUpload) {
 		cq.onCommitPostUploadFailure(entry, lastErr)
 		return
@@ -1217,7 +1289,7 @@ func (cq *CommitQueue) collectBatchEntries(first *CommitEntry, cfg commitBatchCo
 			}
 			if cq.isEntryCanceled(candidate) {
 				cq.removeFromQueue(candidate)
-				log.Printf("commit queue: skipping canceled entry for %s", candidate.Path)
+				safeLogPrintf("commit queue: skipping canceled entry for %s", candidate.Path)
 				continue
 			}
 			if !cq.canAddToBatch(candidate, seenPaths, totalBytes, cfg) {
@@ -1325,12 +1397,12 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 		if isBatchWriteUnsupported(err) {
 			cq.ConfigureBatchWrite(0, 0, 0)
 		}
-		log.Printf("commit queue: batch write failed for %d entries, falling back to single commits: %v", len(entries), err)
+		safeLogPrintf("commit queue: batch write failed for %d entries, falling back to single commits: %v", len(entries), err)
 		cq.fallbackBatchEntries(entries)
 		return
 	}
 	if len(results) != len(entries) {
-		log.Printf("commit queue: batch write returned %d results for %d entries, falling back to single commits", len(results), len(entries))
+		safeLogPrintf("commit queue: batch write returned %d results for %d entries, falling back to single commits", len(results), len(entries))
 		cq.fallbackBatchEntries(entries)
 		return
 	}
@@ -1339,12 +1411,12 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 		if cq.isEntryCanceled(entry) {
 			cq.removeFromQueue(entry)
 			cq.endInFlight(entry)
-			log.Printf("commit queue: entry for %s was canceled after batch upload, skipping cleanup to preserve newer staged data", entry.Path)
+			safeLogPrintf("commit queue: entry for %s was canceled after batch upload, skipping cleanup to preserve newer staged data", entry.Path)
 			continue
 		}
 		if result.OK() {
 			if err := cq.onCommitSuccessWithOptions(entry, entry.BaseRev, result.Revision, remoteItems[i].HasMode); err != nil {
-				log.Printf("commit queue: batch post-upload failed for %s: %v", entry.Path, err)
+				safeLogPrintf("commit queue: batch post-upload failed for %s: %v", entry.Path, err)
 				cq.onCommitPostUploadFailure(entry, err)
 			}
 			cq.endInFlight(entry)
@@ -1352,12 +1424,12 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 		}
 		resultErr := batchWriteResultError(result)
 		if errors.Is(resultErr, client.ErrConflict) {
-			log.Printf("commit queue: batch conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
+			safeLogPrintf("commit queue: batch conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
 			cq.tryAutoResolveConflict(entryCtx, entry)
 			cq.endInFlight(entry)
 			continue
 		}
-		log.Printf("commit queue: batch write result failed for %s, falling back to single commit: %v", entry.Path, resultErr)
+		safeLogPrintf("commit queue: batch write result failed for %s, falling back to single commit: %v", entry.Path, resultErr)
 		cq.commitOne(entry)
 		cq.endInFlight(entry)
 	}
@@ -1712,7 +1784,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			// and proceed — the mode will be applied by the next successful
 			// commit for this path.
 			if client.IsNotFound(err) {
-				log.Printf("commit queue: post-upload chmod not found for %s (concurrent write likely replaced it); proceeding without mode update", entry.Path)
+				safeLogPrintf("commit queue: post-upload chmod not found for %s (concurrent write likely replaced it); proceeding without mode update", entry.Path)
 			} else {
 				return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
 			}
@@ -1726,7 +1798,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			Op:   JournalCommit,
 			Path: entry.Path,
 		}); err != nil {
-			log.Printf("commit queue: journal commit marker failed for %s: %v (keeping local state)", entry.Path, err)
+			safeLogPrintf("commit queue: journal commit marker failed for %s: %v (keeping local state)", entry.Path, err)
 			cq.removeFromQueue(entry)
 			return nil
 		}
@@ -1764,7 +1836,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	if cq.perf != nil {
 		cq.perf.commitSuccess.add(1)
 	}
-	log.Printf("commit queue: successfully uploaded %s (%d bytes, rev=%d)", entry.Path, entry.Size, committedRev)
+	safeLogPrintf("commit queue: successfully uploaded %s (%d bytes, rev=%d)", entry.Path, entry.Size, committedRev)
 	return nil
 }
 
@@ -1780,7 +1852,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	// Bail early if the file was deleted locally while queued.
 	if cq.isEntryCanceled(entry) {
 		cq.removeFromQueue(entry)
-		log.Printf("commit queue: auto-resolve skipped for %s (canceled)", entry.Path)
+		safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled)", entry.Path)
 		return
 	}
 
@@ -1788,7 +1860,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	// compare against the base FS namespace, so neither the idempotent
 	// check nor LWW can be trusted. Keep layer conflicts terminal.
 	if cq.layerRefSnapshot() != "" {
-		log.Printf("commit queue: auto-resolve unsupported for layer mount, terminal failure for %s", entry.Path)
+		safeLogPrintf("commit queue: auto-resolve unsupported for layer mount, terminal failure for %s", entry.Path)
 		cq.onCommitTerminalFailure(entry)
 		return
 	}
@@ -1814,10 +1886,10 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 		// (Unlink/Rmdir). Treat as canceled rather than a true conflict.
 		if cq.isEntryCanceled(entry) {
 			cq.removeFromQueue(entry)
-			log.Printf("commit queue: auto-resolve skipped for %s (canceled mid-read)", entry.Path)
+			safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled mid-read)", entry.Path)
 			return
 		}
-		log.Printf("commit queue: auto-resolve failed for %s: read shadow: %v", entry.Path, err)
+		safeLogPrintf("commit queue: auto-resolve failed for %s: read shadow: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
 		return
 	}
@@ -1841,14 +1913,14 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 			// as a create; terminal only if the retry also fails.
 			if cq.isEntryCanceled(entry) {
 				cq.removeFromQueue(entry)
-				log.Printf("commit queue: auto-resolve skipped for %s (canceled before create retry)", entry.Path)
+				safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled before create retry)", entry.Path)
 				return
 			}
-			log.Printf("commit queue: conflict for %s but remote file not found, retrying upload as create", entry.Path)
+			safeLogPrintf("commit queue: conflict for %s but remote file not found, retrying upload as create", entry.Path)
 			uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(int64(len(localData))))
 			if !ok {
 				cq.removeFromQueue(entry)
-				log.Printf("commit queue: auto-resolve skipped for %s (canceled before create retry upload)", entry.Path)
+				safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled before create retry upload)", entry.Path)
 				return
 			}
 			uploadStart := time.Now()
@@ -1865,21 +1937,21 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 			}
 			if cq.isEntryCanceled(entry) {
 				cq.removeFromQueue(entry)
-				log.Printf("commit queue: auto-resolve skipped for %s (canceled during create retry upload)", entry.Path)
+				safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled during create retry upload)", entry.Path)
 				return
 			}
 			if uploadErr != nil {
-				log.Printf("commit queue: create retry failed for %s: %v", entry.Path, uploadErr)
+				safeLogPrintf("commit queue: create retry failed for %s: %v", entry.Path, uploadErr)
 				cq.onCommitTerminalFailure(entry)
 				return
 			}
-			log.Printf("commit queue: auto-resolved conflict for %s via create retry (no remote file)", entry.Path)
+			safeLogPrintf("commit queue: auto-resolved conflict for %s via create retry (no remote file)", entry.Path)
 			if err := cq.onCommitSuccess(entry, 0, committedRev); err != nil {
 				cq.onCommitPostUploadFailure(entry, err)
 			}
 			return
 		}
-		log.Printf("commit queue: auto-resolve failed for %s: stat: %v", entry.Path, err)
+		safeLogPrintf("commit queue: auto-resolve failed for %s: stat: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
 		return
 	}
@@ -1893,14 +1965,14 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 		cq.perf.recordRemoteOp(perfRemoteRead, err, time.Since(readStart), uint64(len(serverData)))
 	}
 	if err != nil {
-		log.Printf("commit queue: auto-resolve failed for %s: read server: %v", entry.Path, err)
+		safeLogPrintf("commit queue: auto-resolve failed for %s: read server: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
 		return
 	}
 
 	// Branch 1: idempotent — content already matches server.
 	if bytes.Equal(localData, serverData) {
-		log.Printf("commit queue: auto-resolved conflict for %s (idempotent, content matches server rev %d)", entry.Path, serverRev)
+		safeLogPrintf("commit queue: auto-resolved conflict for %s (idempotent, content matches server rev %d)", entry.Path, serverRev)
 		if err := cq.onCommitSuccess(entry, serverRev, serverRev); err != nil {
 			cq.onCommitPostUploadFailure(entry, err)
 		}
@@ -1911,14 +1983,14 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	// Re-check cancelation before the potentially expensive upload.
 	if cq.isEntryCanceled(entry) {
 		cq.removeFromQueue(entry)
-		log.Printf("commit queue: auto-resolve aborted for %s before LWW upload (canceled)", entry.Path)
+		safeLogPrintf("commit queue: auto-resolve aborted for %s before LWW upload (canceled)", entry.Path)
 		return
 	}
-	log.Printf("commit queue: auto-resolving conflict for %s via LWW (base rev %d → server rev %d)", entry.Path, entry.BaseRev, serverRev)
+	safeLogPrintf("commit queue: auto-resolving conflict for %s via LWW (base rev %d → server rev %d)", entry.Path, entry.BaseRev, serverRev)
 	uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(int64(len(localData))))
 	if !ok {
 		cq.removeFromQueue(entry)
-		log.Printf("commit queue: auto-resolve aborted for %s before LWW upload (canceled)", entry.Path)
+		safeLogPrintf("commit queue: auto-resolve aborted for %s before LWW upload (canceled)", entry.Path)
 		return
 	}
 	uploadStart := time.Now()
@@ -1928,17 +2000,17 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(uploadStart), uint64(len(localData)))
 	}
 	if err != nil {
-		log.Printf("commit queue: auto-resolve LWW re-upload failed for %s: %v", entry.Path, err)
+		safeLogPrintf("commit queue: auto-resolve LWW re-upload failed for %s: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
 		return
 	}
 	if cq.isEntryCanceled(entry) {
 		cq.removeFromQueue(entry)
-		log.Printf("commit queue: auto-resolve skipped for %s (canceled during LWW upload)", entry.Path)
+		safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled during LWW upload)", entry.Path)
 		return
 	}
 
-	log.Printf("commit queue: auto-resolved conflict for %s via LWW (overwrote rev %d → new upload based on rev %d)", entry.Path, entry.BaseRev, serverRev)
+	safeLogPrintf("commit queue: auto-resolved conflict for %s via LWW (overwrote rev %d → new upload based on rev %d)", entry.Path, entry.BaseRev, serverRev)
 	if err := cq.onCommitSuccess(entry, serverRev, 0); err != nil {
 		cq.onCommitPostUploadFailure(entry, err)
 	}
@@ -1976,14 +2048,14 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 			// retry also fails.
 			if cq.isEntryCanceled(entry) {
 				cq.removeFromQueue(entry)
-				log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled before create retry)", entry.Path)
+				safeLogPrintf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled before create retry)", entry.Path)
 				return
 			}
-			log.Printf("commit queue: ShadowSpill conflict for %s but remote file not found, retrying upload as create", entry.Path)
+			safeLogPrintf("commit queue: ShadowSpill conflict for %s but remote file not found, retrying upload as create", entry.Path)
 			uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(entry.Size))
 			if !ok {
 				cq.removeFromQueue(entry)
-				log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled before create retry upload)", entry.Path)
+				safeLogPrintf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled before create retry upload)", entry.Path)
 				return
 			}
 			uploadStart := time.Now()
@@ -1998,21 +2070,21 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 			}
 			if cq.isEntryCanceled(entry) {
 				cq.removeFromQueue(entry)
-				log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled during create retry upload)", entry.Path)
+				safeLogPrintf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled during create retry upload)", entry.Path)
 				return
 			}
 			if uploadErr != nil {
-				log.Printf("commit queue: ShadowSpill create retry failed for %s: %v", entry.Path, uploadErr)
+				safeLogPrintf("commit queue: ShadowSpill create retry failed for %s: %v", entry.Path, uploadErr)
 				cq.onCommitTerminalFailure(entry)
 				return
 			}
-			log.Printf("commit queue: auto-resolved ShadowSpill conflict for %s via create retry (no remote file)", entry.Path)
+			safeLogPrintf("commit queue: auto-resolved ShadowSpill conflict for %s via create retry (no remote file)", entry.Path)
 			if err := cq.onCommitSuccess(entry, 0, committedRev); err != nil {
 				cq.onCommitPostUploadFailure(entry, err)
 			}
 			return
 		}
-		log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: stat: %v", entry.Path, err)
+		safeLogPrintf("commit queue: ShadowSpill auto-resolve failed for %s: stat: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
 		return
 	}
@@ -2022,15 +2094,15 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		// Shadow gone — likely canceled by a concurrent Unlink/Rmdir.
 		if cq.isEntryCanceled(entry) {
 			cq.removeFromQueue(entry)
-			log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled)", entry.Path)
+			safeLogPrintf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled)", entry.Path)
 			return
 		}
-		log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: shadow missing", entry.Path)
+		safeLogPrintf("commit queue: ShadowSpill auto-resolve failed for %s: shadow missing", entry.Path)
 		cq.onCommitTerminalFailure(entry)
 		return
 	}
 	if stat.Size != localSize {
-		log.Printf("commit queue: ShadowSpill conflict for %s is genuine (local %d bytes vs server %d bytes), terminal failure", entry.Path, localSize, stat.Size)
+		safeLogPrintf("commit queue: ShadowSpill conflict for %s is genuine (local %d bytes vs server %d bytes), terminal failure", entry.Path, localSize, stat.Size)
 		cq.onCommitTerminalFailure(entry)
 		return
 	}
@@ -2041,7 +2113,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		// compares when the file is unlinked mid-resolve.
 		if cq.isEntryCanceled(entry) {
 			cq.removeFromQueue(entry)
-			log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled mid-compare)", entry.Path)
+			safeLogPrintf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled mid-compare)", entry.Path)
 			return
 		}
 		n := int64(shadowSpillCompareChunk)
@@ -2056,7 +2128,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 			cq.perf.recordRemoteOp(perfRemoteRead, err, time.Since(readStart), uint64(len(serverChunk)))
 		}
 		if err != nil {
-			log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: read server @%d: %v", entry.Path, off, err)
+			safeLogPrintf("commit queue: ShadowSpill auto-resolve failed for %s: read server @%d: %v", entry.Path, off, err)
 			cq.onCommitTerminalFailure(entry)
 			return
 		}
@@ -2064,21 +2136,21 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		if err != nil || int64(ln) != n {
 			if cq.isEntryCanceled(entry) {
 				cq.removeFromQueue(entry)
-				log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled mid-read)", entry.Path)
+				safeLogPrintf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled mid-read)", entry.Path)
 				return
 			}
-			log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: read shadow @%d: n=%d err=%v", entry.Path, off, ln, err)
+			safeLogPrintf("commit queue: ShadowSpill auto-resolve failed for %s: read shadow @%d: n=%d err=%v", entry.Path, off, ln, err)
 			cq.onCommitTerminalFailure(entry)
 			return
 		}
 		if int64(len(serverChunk)) != n || !bytes.Equal(serverChunk, buf[:n]) {
-			log.Printf("commit queue: ShadowSpill conflict for %s is genuine (content differs @%d), terminal failure", entry.Path, off)
+			safeLogPrintf("commit queue: ShadowSpill conflict for %s is genuine (content differs @%d), terminal failure", entry.Path, off)
 			cq.onCommitTerminalFailure(entry)
 			return
 		}
 	}
 
-	log.Printf("commit queue: auto-resolved ShadowSpill conflict for %s (idempotent, %d bytes match server rev %d)", entry.Path, localSize, stat.Revision)
+	safeLogPrintf("commit queue: auto-resolved ShadowSpill conflict for %s (idempotent, %d bytes match server rev %d)", entry.Path, localSize, stat.Revision)
 	if err := cq.onCommitSuccess(entry, stat.Revision, stat.Revision); err != nil {
 		cq.onCommitPostUploadFailure(entry, err)
 	}
@@ -2089,7 +2161,7 @@ func (cq *CommitQueue) onCommitPostUploadFailure(entry *CommitEntry, err error) 
 		cq.perf.commitFailure.add(1)
 	}
 	cq.removeFromQueue(entry)
-	log.Printf("commit queue: post-upload failure for %s; local pending state preserved for retry: %v", entry.Path, err)
+	safeLogPrintf("commit queue: post-upload failure for %s; local pending state preserved for retry: %v", entry.Path, err)
 }
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
@@ -2109,7 +2181,7 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
 			// Conflict marker not durable — leave the entry queued so
 			// RecoverPending can retry on next startup rather than
 			// silently dropping it.
-			log.Printf("commit queue: failed to mark conflict for %s: %v (entry remains queued)", entry.Path, err)
+			safeLogPrintf("commit queue: failed to mark conflict for %s: %v (entry remains queued)", entry.Path, err)
 			cq.removeFromQueue(entry)
 			return
 		}
@@ -2119,7 +2191,7 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
 			Op:   JournalCommit, // treated as "done" so recovery won't re-enqueue
 			Path: entry.Path,
 		}); err != nil {
-			log.Printf("commit queue: journal done marker failed for %s: %v", entry.Path, err)
+			safeLogPrintf("commit queue: journal done marker failed for %s: %v", entry.Path, err)
 		}
 	}
 
@@ -2127,5 +2199,5 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
 	// until bookkeeping is complete.
 	cq.removeFromQueue(entry)
 
-	log.Printf("commit queue: terminal failure for %s — local data preserved for manual recovery", entry.Path)
+	safeLogPrintf("commit queue: terminal failure for %s — local data preserved for manual recovery", entry.Path)
 }

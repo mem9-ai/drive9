@@ -618,12 +618,16 @@ func TestSharedTenantStatusLogsAndMetricsUseDBOrganization(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	metrics.WritePrometheus(recorder)
 	metricsText := recorder.Body.String()
-	wantMetric := `drive9_tenant_requests_total{action="get",status_class="2xx",surface="status"}`
+	wantMetric := `drive9_tenant_requests_total{action="get",status_class="2xx",surface="status",tidbcloud_org_id="org-shared-status-output"}`
 	if !strings.Contains(metricsText, wantMetric) {
-		t.Fatalf("missing aggregated status request metric %q", wantMetric)
+		t.Errorf("missing organization-scoped status request metric %q", wantMetric)
 	}
-	if strings.Contains(metricsText, `drive9_tenant_requests_total{action="get",status_class="2xx",surface="status",tenant_id=`) {
-		t.Fatalf("successful status request metric unexpectedly carried tenant labels")
+	for _, line := range strings.Split(metricsText, "\n") {
+		if strings.HasPrefix(line, `drive9_tenant_requests_total{`) &&
+			strings.Contains(line, `action="get"`) && strings.Contains(line, `status_class="2xx"`) &&
+			strings.Contains(line, `surface="status"`) && strings.Contains(line, `tenant_id=`) {
+			t.Errorf("successful status request metric unexpectedly carried tenant labels: %s", line)
+		}
 	}
 }
 
@@ -933,5 +937,56 @@ func TestAuthForkDeleteSkipsPoolAcquire(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status=%d", resp.StatusCode)
+	}
+}
+
+func TestAuthTenantStatusResponses(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+
+	setStatus := func(status meta.TenantStatus) {
+		t.Helper()
+		if err := rt.meta.UpdateTenantStatus(context.Background(), rt.tenantID, status); err != nil {
+			t.Fatalf("set tenant status %s: %v", status, err)
+		}
+	}
+
+	h := tenantAuthMiddleware(rt.meta, rt.pool, rt.tokenSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	cases := []struct {
+		name           string
+		method         string
+		path           string
+		status         meta.TenantStatus
+		wantCode       int
+		wantRetryAfter bool
+	}{
+		{"get pending is retryable", http.MethodGet, "/v1/fs/", meta.TenantPending, http.StatusServiceUnavailable, true},
+		{"get provisioning is retryable", http.MethodGet, "/v1/fs/", meta.TenantProvisioning, http.StatusServiceUnavailable, true},
+		{"get failed is forbidden", http.MethodGet, "/v1/fs/", meta.TenantFailed, http.StatusForbidden, false},
+		{"tenant delete pending is retryable", http.MethodDelete, "/v1/tenant", meta.TenantPending, http.StatusServiceUnavailable, true},
+		{"tenant delete provisioning is retryable", http.MethodDelete, "/v1/tenant", meta.TenantProvisioning, http.StatusServiceUnavailable, true},
+		{"tenant delete failed reaches handler", http.MethodDelete, "/v1/tenant", meta.TenantFailed, http.StatusNoContent, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setStatus(tc.status)
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+rt.token)
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			if rr.Code != tc.wantCode {
+				t.Fatalf("status=%d want=%d body=%s", rr.Code, tc.wantCode, rr.Body.String())
+			}
+			retryAfter := rr.Header().Get("Retry-After")
+			if tc.wantRetryAfter && retryAfter == "" {
+				t.Fatal("missing Retry-After header")
+			}
+			if !tc.wantRetryAfter && retryAfter != "" {
+				t.Fatalf("unexpected Retry-After header: %q", retryAfter)
+			}
+		})
 	}
 }

@@ -70,6 +70,32 @@ func (idx *OpenHandleIndex) UnlinkPath(p string) {
 	delete(idx.byPath, p)
 }
 
+// RelinkPath re-attaches handles to the path index, reversing UnlinkPath.
+// Used to roll back a failed Unlink. Handles that are no longer open (absent
+// from the inode index, e.g. released in between) are skipped.
+func (idx *OpenHandleIndex) RelinkPath(p string, handles []*FileHandle) {
+	if idx == nil || p == "" {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	for _, fh := range handles {
+		if fh == nil {
+			continue
+		}
+		set, ok := idx.byInode[fh.Ino]
+		if !ok {
+			continue
+		}
+		if _, ok := set[fh]; !ok {
+			continue
+		}
+		addHandleToSet(idx.byPath, p, fh)
+		idx.pathByHandle[fh] = p
+	}
+}
+
 // Has reports whether any open handle matches ino or p.
 // When both are supplied this intentionally uses OR semantics to preserve the
 // old conservative inode/path checks from the pre-index table scan.

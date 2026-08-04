@@ -173,9 +173,28 @@ class Drive9FuseTargetProvider:
         display = cmd if isinstance(cmd, str) else " ".join(cmd)
         start = time.monotonic()
         progress(f"command start: {safe_name} (timeout={timeout}s, logs={log_dir})")
+        # Append across invocations. Modules that parse their own logs (e.g.
+        # community.pjdfstest) locate the latest run via the per-invocation
+        # header line below; truncating here would overwrite earlier same-name
+        # logs (e.g. ltp_syscalls shard loops) that failure messages reference.
         with stdout.open("ab") as out, stderr.open("ab") as err:
-            out.write(f"\n# {utc_ts()} $ {display}\n".encode())
-            out.flush()
+            # Each per-invocation header must begin on its own line (the
+            # pjdfstest parser matches headers at line starts in BOTH
+            # streams); a previous command's output may not have ended
+            # with "\n". Fail closed if the boundary check itself cannot
+            # be verified, rather than appending an unanchored header.
+            header = f"# {utc_ts()} $ {display}\n".encode()
+            for stream, log_path in ((out, stdout), (err, stderr)):
+                try:
+                    if log_path.stat().st_size > 0:
+                        with log_path.open("rb") as prev:
+                            prev.seek(-1, os.SEEK_END)
+                            if prev.read(1) != b"\n":
+                                stream.write(b"\n")
+                except OSError as exc:
+                    raise BlackboxError(f"cannot verify log header boundary in {log_path}: {exc}") from exc
+                stream.write(header)
+                stream.flush()
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(cwd or REPO_ROOT),

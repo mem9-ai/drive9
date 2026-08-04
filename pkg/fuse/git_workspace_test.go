@@ -33,21 +33,26 @@ type gitWorkspaceFixture struct {
 	overlay         map[string]client.GitOverlayEntry
 	overlayPuts     int
 	overlayPostWait chan struct{}
-	objectPacks     map[string]client.GitObjectPack
-	state           []byte
-	stateStorage    string
-	gitStatePuts    int
-	mode            string
-	headCommit      string
-	deleted         bool
-	listRequests    int
-	server          *httptest.Server
-	repoURL         string
-	treeNodes       []client.GitTreeNode
-	readmeObjectSHA string
-	readmeSize      int64
-	failTree        bool
-	failOverlay     bool
+	// overlayPostEntered is closed when a POST first parks on
+	// overlayPostWait, so tests can open files while a whiteout is in flight.
+	overlayPostEntered     chan struct{}
+	overlayPostEnteredOnce sync.Once
+	objectPacks            map[string]client.GitObjectPack
+	state                  []byte
+	stateStorage           string
+	gitStatePuts           int
+	mode                   string
+	headCommit             string
+	deleted                bool
+	listRequests           int
+	server                 *httptest.Server
+	repoURL                string
+	treeNodes              []client.GitTreeNode
+	readmeObjectSHA        string
+	readmeSize             int64
+	failTree               bool
+	failOverlay            bool
+	failOverlayPut         bool
 }
 
 type gitStateOnlyFixture struct {
@@ -380,9 +385,19 @@ func (f *gitWorkspaceFixture) handleOverlay(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		f.mu.Lock()
+		if f.failOverlayPut {
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "overlay put unavailable"})
+			return
+		}
 		wait := f.overlayPostWait
+		entered := f.overlayPostEntered
 		f.mu.Unlock()
 		if wait != nil {
+			if entered != nil {
+				f.overlayPostEnteredOnce.Do(func() { close(entered) })
+			}
 			<-wait
 		}
 		entry := client.GitOverlayEntry{
@@ -3978,5 +3993,343 @@ func TestEnsureGitWorkspacesRecordsRefreshPerfCounters(t *testing.T) {
 	}
 	if got := snap.Counters["git_workspace_forced_refresh"]; got != 1 {
 		t.Fatalf("git_workspace_forced_refresh after force = %d, want 1", got)
+	}
+}
+
+// TestGitWorkspaceWriteSyncWriteAfterUnlinkDoesNotResurrectOverlay covers the
+// git quadrant of the open-unlink invariant: a write-sync git handle unlinked
+// while open must accept further writes on the anonymous fd, but neither the
+// write nor Flush/Release may upsert the overlay entry back over the whiteout.
+func TestGitWorkspaceWriteSyncWriteAfterUnlinkDoesNotResurrectOverlay(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	v1 := []byte("git-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1 status = %v, want OK", st)
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	fixture.mu.Unlock()
+	if !ok || entry.Op != "upsert" {
+		t.Fatalf("overlay entry after v1 write = %+v, %v — want upsert", entry, ok)
+	}
+
+	// Unlink while the write-sync git fd stays open: overlay becomes a
+	// whiteout, and the handle must be marked unlinked.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	fixture.mu.Lock()
+	entry, ok = fixture.overlay["sync.txt"]
+	putsAfterWhiteout := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if !ok || entry.Op != "whiteout" {
+		t.Fatalf("overlay entry after unlink = %+v, %v — want whiteout", entry, ok)
+	}
+	if fh, ok := fs.fileHandles.Get(createOut.Fh); !ok {
+		t.Fatal("handle missing")
+	} else {
+		fh.Lock()
+		unlinked := fh.Unlinked
+		fh.Unlock()
+		if !unlinked {
+			t.Fatal("git handle not marked unlinked by gitEntry unlink path")
+		}
+	}
+
+	// Write-after-unlink must succeed (anonymous fd) but NOT upsert.
+	v2 := []byte("git-v2-must-stay-local")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write after unlink status = %v, want OK", st)
+	}
+	// Anonymous-fd semantics: the post-unlink write stays readable from the
+	// fd's own backing (LocalFile for checked-out git handles, otherwise the
+	// Dirty buffer).
+	if fh, ok := fs.fileHandles.Get(createOut.Fh); ok {
+		fh.Lock()
+		localName := ""
+		if fh.LocalFile != nil {
+			localName = fh.LocalFile.Name()
+		}
+		dirty := fh.Dirty
+		fh.Unlock()
+		if localName != "" {
+			// The whiteout removed the dirty-mirror NAME, but the open
+			// *os.File keeps the inode alive — read via the fd itself.
+			fh.Lock()
+			buf := make([]byte, len(v2))
+			n, err := fh.LocalFile.ReadAt(buf, 0)
+			fh.Unlock()
+			if err != nil && n == 0 {
+				t.Fatalf("read unlinked git LocalFile fd: %v", err)
+			}
+			if string(buf[:n]) != string(v2) {
+				t.Fatalf("LocalFile fd content = %q, want %q", buf[:n], v2)
+			}
+		} else {
+			if dirty == nil {
+				t.Fatal("no readable backing on unlinked git handle")
+			}
+			buf := make([]byte, len(v2))
+			n := dirty.ReadAt(0, buf)
+			if n != len(v2) || string(buf) != string(v2) {
+				t.Fatalf("Dirty buffer content = %q (n=%d), want %q", buf[:n], n, v2)
+			}
+		}
+	} else {
+		t.Fatal("handle missing before close")
+	}
+
+	// Flush and Release must not upsert either.
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush after unlink status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	fixture.mu.Lock()
+	entry, ok = fixture.overlay["sync.txt"]
+	putsFinal := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if putsFinal != putsAfterWhiteout {
+		t.Fatalf("overlay puts after whiteout = %d, after write/flush/release = %d — unlinked git handle resurrected the entry", putsAfterWhiteout, putsFinal)
+	}
+	if !ok || entry.Op != "whiteout" {
+		t.Fatalf("overlay entry after write-after-unlink = %+v, %v — want whiteout preserved", entry, ok)
+	}
+
+	// Live mount state: the whiteout must stay authoritative — lookups and
+	// gitEntry report the name absent, and no pending upsert mirrors it back.
+	if ge, handled := fs.gitEntry(context.Background(), "/repo/sync.txt", false); !handled || ge != nil {
+		t.Fatalf("gitEntry after write-after-unlink = %+v, handled=%v — want whiteout (nil entry)", ge, handled)
+	}
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt", &lookupOut); st != gofuse.ENOENT {
+		t.Fatalf("Lookup after write-after-unlink = %v, want ENOENT", st)
+	}
+	fs.gitOverlayMu.Lock()
+	var pendingUpsert any
+	if byPath := fs.gitOverlayPending["ws1"]; byPath != nil {
+		if pe, ok := byPath["sync.txt"]; ok {
+			pendingUpsert = pe.entry
+		}
+	}
+	fs.gitOverlayMu.Unlock()
+	if pendingUpsert != nil {
+		t.Fatalf("pending overlay upsert for unlinked path = %+v", pendingUpsert)
+	}
+}
+
+// TestGitWorkspaceUnlinkWhiteoutFailureRollsBackHandleMarks: when the git
+// whiteout write fails, Unlink must roll the open-handle marking back — the
+// entry still exists authoritatively, so handles must not stay unlinked and
+// their later writes must publish normally.
+func TestGitWorkspaceUnlinkWhiteoutFailureRollsBackHandleMarks(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	v1 := []byte("git-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1 status = %v, want OK", st)
+	}
+
+	// Whiteout write fails → Unlink must error AND roll the marking back.
+	fixture.mu.Lock()
+	fixture.failOverlayPut = true
+	fixture.mu.Unlock()
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt"); st == gofuse.OK {
+		t.Fatal("Unlink unexpectedly succeeded despite failing whiteout")
+	}
+	fixture.mu.Lock()
+	fixture.failOverlayPut = false
+	fixture.mu.Unlock()
+
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("handle missing")
+	}
+	fh.Lock()
+	unlinked := fh.Unlinked
+	fh.Unlock()
+	if unlinked {
+		t.Fatal("handle left marked unlinked after failed whiteout")
+	}
+	if got := len(fs.openHandles.SnapshotPath("/repo/sync.txt")); got != 1 {
+		t.Fatalf("openHandles path index after rollback = %d handles, want 1 relinked", got)
+	}
+
+	// The handle publishes normally again.
+	v2 := []byte("git-v2-published")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write after failed whiteout status = %v, want OK", st)
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	fixture.mu.Unlock()
+	if !ok || entry.Op != "upsert" || string(entry.Content) != string(v2) {
+		t.Fatalf("overlay after failed whiteout + rewrite = %+v, %v — want upsert with v2 content", entry, ok)
+	}
+
+	// Path remains linked.
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup after failed whiteout = %v, want OK", st)
+	}
+}
+
+// TestGitWorkspaceUnlinkMarksHandlesOpenedDuringWhiteout: a handle opened
+// while the git whiteout request is in flight must be marked by the
+// post-commit pass — otherwise its later write/flush would upsert the overlay
+// entry back over the whiteout (the remote-DELETE path has the same second
+// mark pass).
+func TestGitWorkspaceUnlinkMarksHandlesOpenedDuringWhiteout(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	v1 := []byte("git-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1 status = %v, want OK", st)
+	}
+
+	// Park the whiteout POST; open a SECOND writable handle while it is in
+	// flight (after the unlink's first mark pass, before the whiteout lands).
+	postWait := make(chan struct{})
+	postEntered := make(chan struct{})
+	fixture.mu.Lock()
+	fixture.overlayPostWait = postWait
+	fixture.overlayPostEntered = postEntered
+	fixture.mu.Unlock()
+
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt")
+	}()
+	select {
+	case <-postEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("whiteout POST never parked")
+	}
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup during in-flight whiteout = %v, want OK (name still present)", st)
+	}
+	var open2 gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &open2); st != gofuse.OK {
+		t.Fatalf("Open second handle during in-flight whiteout = %v, want OK", st)
+	}
+
+	close(postWait)
+	if st := <-unlinkDone; st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+
+	// Both handles must be marked unlinked now — the first by pass 1, the
+	// second by the post-commit pass.
+	for _, fhID := range []uint64{createOut.Fh, open2.Fh} {
+		fh, ok := fs.fileHandles.Get(fhID)
+		if !ok {
+			t.Fatalf("handle %d missing", fhID)
+		}
+		fh.Lock()
+		unlinked := fh.Unlinked
+		fh.Unlock()
+		if !unlinked {
+			t.Fatalf("handle %d not marked unlinked after whiteout (pass-2 gap)", fhID)
+		}
+	}
+
+	// Neither handle may upsert on write/flush/release.
+	fixture.mu.Lock()
+	putsAfterWhiteout := fixture.overlayPuts
+	fixture.mu.Unlock()
+	v2 := []byte("git-v2-must-stay-local")
+	for _, fhID := range []uint64{createOut.Fh, open2.Fh} {
+		if _, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+			Fh:       fhID,
+			Size:     uint32(len(v2)),
+		}, v2); st != gofuse.OK {
+			t.Fatalf("Write after unlink on handle %d = %v, want OK", fhID, st)
+		}
+		if st := fs.Flush(nil, &gofuse.FlushIn{Fh: fhID}); st != gofuse.OK {
+			t.Fatalf("Flush after unlink on handle %d = %v, want OK", fhID, st)
+		}
+		fs.Release(nil, &gofuse.ReleaseIn{Fh: fhID})
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	putsFinal := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if putsFinal != putsAfterWhiteout {
+		t.Fatalf("overlay puts after whiteout = %d, after writes = %d — handle opened during whiteout resurrected the entry", putsAfterWhiteout, putsFinal)
+	}
+	if !ok || entry.Op != "whiteout" {
+		t.Fatalf("overlay entry = %+v, %v — want whiteout preserved", entry, ok)
 	}
 }

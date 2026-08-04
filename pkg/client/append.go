@@ -181,7 +181,12 @@ func isClientNotFound(err error) bool {
 	return strings.HasPrefix(err.Error(), "not found: ")
 }
 
-func shouldRewriteAppend(err error) bool {
+// IsUnsupportedStorageTargetErr reports whether err is the server's 400
+// rejection of a partial-update operation (PATCH or append) because the
+// target file is not S3-stored (or S3 is not configured at all). Callers
+// should fall back to a full-content rewrite, which is valid for any storage
+// class.
+func IsUnsupportedStorageTargetErr(err error) bool {
 	var statusErr *StatusError
 	if !errors.As(err, &statusErr) {
 		return false
@@ -190,6 +195,19 @@ func shouldRewriteAppend(err error) bool {
 		return false
 	}
 	return strings.HasPrefix(statusErr.Message, "file is not S3-stored:") ||
-		strings.Contains(statusErr.Message, "S3 not configured") ||
-		strings.Contains(statusErr.Message, "unknown POST action")
+		strings.Contains(statusErr.Message, "S3 not configured")
+}
+
+func shouldRewriteAppend(err error) bool {
+	if IsUnsupportedStorageTargetErr(err) {
+		return true
+	}
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	if statusErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	return strings.Contains(statusErr.Message, "unknown POST action")
 }

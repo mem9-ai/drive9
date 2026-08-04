@@ -30,6 +30,7 @@ type flushDebouncer struct {
 type pendingFlush struct {
 	timer    *time.Timer
 	uploadFn func()
+	owner    any // scheduling owner (e.g. *FileHandle); used by CancelNoWaitIfOwner
 	done     chan struct{}
 	once     sync.Once
 }
@@ -60,6 +61,14 @@ func newFlushDebouncer(delay time.Duration) *flushDebouncer {
 // the timer callback will not run a second concurrent callback for the same
 // path — it waits for the existing inflight to drain first.
 func (d *flushDebouncer) Schedule(path string, uploadFn func()) {
+	d.ScheduleWithOwner(path, nil, uploadFn)
+}
+
+// ScheduleWithOwner is Schedule with an explicit owner token (typically a
+// *FileHandle) so that CancelNoWaitIfOwner can cancel only entries owned by a
+// specific handle — path-global cancels would otherwise kill a replacement
+// file's pending debounce after unlink + pathname reuse.
+func (d *flushDebouncer) ScheduleWithOwner(path string, owner any, uploadFn func()) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -69,7 +78,7 @@ func (d *flushDebouncer) Schedule(path string, uploadFn func()) {
 		delete(d.pending, path)
 	}
 
-	pf := &pendingFlush{uploadFn: uploadFn, done: make(chan struct{})}
+	pf := &pendingFlush{uploadFn: uploadFn, owner: owner, done: make(chan struct{})}
 	pf.timer = time.AfterFunc(d.delay, func() {
 		d.runCallback(path, pf)
 	})
@@ -150,6 +159,21 @@ func (d *flushDebouncer) CancelNoWait(path string) {
 	d.mu.Lock()
 	pf, ok := d.pending[path]
 	if ok {
+		pf.timer.Stop()
+		pf.finish()
+		delete(d.pending, path)
+	}
+	d.mu.Unlock()
+}
+
+// CancelNoWaitIfOwner is like CancelNoWait but only cancels when the pending
+// entry was scheduled by owner. Used by unlink-while-open discard so an old
+// unlinked handle cannot cancel a debounce scheduled by a replacement file
+// that reused the pathname.
+func (d *flushDebouncer) CancelNoWaitIfOwner(path string, owner any) {
+	d.mu.Lock()
+	pf, ok := d.pending[path]
+	if ok && pf.owner == owner {
 		pf.timer.Stop()
 		pf.finish()
 		delete(d.pending, path)

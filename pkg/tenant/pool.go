@@ -1307,7 +1307,7 @@ func (p *Pool) PurgeSharedTenant(ctx context.Context, fsID, dbID int64) error {
 		return err
 	}
 	defer lease.Release()
-	return datastore.NewStoreWithDB(lease.DB(), datastore.SharedScope(fsID)).PurgeTenantData(ctx)
+	return datastore.NewStoreWithDB(lease.DB(), datastore.SharedScopeWithDB(fsID, lease.DBID())).PurgeTenantData(ctx)
 }
 
 func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9Backend, *datastore.Store, string, *sharedDBHandleLease, error) {
@@ -1359,7 +1359,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		if err != nil {
 			return nil, nil, tidbCloudOrgID, nil, err
 		}
-		store = datastore.NewStoreWithDB(sharedLease.DB(), datastore.SharedScope(fsID))
+		store = datastore.NewStoreWithDB(sharedLease.DB(), datastore.SharedScopeWithDB(fsID, sharedLease.DBID()))
 	} else {
 		decryptStart := time.Now()
 		pass, err := p.enc.Decrypt(ctx, t.DBPasswordCipher)
@@ -1781,6 +1781,7 @@ func (p *Pool) closeEntry(e *entry) {
 		_ = e.store.Close()
 	}
 	e.sharedDBLease.Release()
+	metrics.DeleteTenantRequestCounters(e.tenantID)
 }
 
 type tenantPoolResult string

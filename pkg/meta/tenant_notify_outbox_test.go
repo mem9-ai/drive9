@@ -1,0 +1,260 @@
+package meta
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/mem9-ai/drive9/internal/testmysql"
+)
+
+// insertOldTenantNotify inserts one outbox row with an old created_at and
+// returns its id.
+func insertOldTenantNotify(t *testing.T, s *Store, tenantID string, age time.Duration) uint64 {
+	t.Helper()
+	res, err := s.DB().ExecContext(context.Background(),
+		`INSERT INTO tenant_notify_outbox (tenant_id, work_mask, created_at) VALUES (?, ?, ?)`,
+		tenantID, 1, time.Now().Add(-age))
+	if err != nil {
+		t.Fatalf("insert old outbox row: %v", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("last insert id: %v", err)
+	}
+	return uint64(id)
+}
+
+func listTenantNotifyIDs(t *testing.T, s *Store) map[uint64]bool {
+	t.Helper()
+	rows, err := s.ListTenantNotifySince(context.Background(), 0, 100)
+	if err != nil {
+		t.Fatalf("ListTenantNotifySince: %v", err)
+	}
+	ids := make(map[uint64]bool, len(rows))
+	for _, r := range rows {
+		ids[r.ID] = true
+	}
+	return ids
+}
+
+// TestDeleteTenantNotifyBeforeFreshFloor verifies the pruning floor: rows are
+// pruned up to MIN(last_id) across fresh cursors, stale cursors are ignored,
+// and age-only pruning applies when no fresh cursors remain.
+func TestDeleteTenantNotifyBeforeFreshFloor(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	cutoff := func() time.Time { return time.Now().Add(-time.Hour) }
+
+	// Case A: a fresh cursor holds the floor — rows above its last_id survive
+	// even when older than the retention.
+	testmysql.ResetMetaDB(t, s.DB())
+	id1 := insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
+	id2 := insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
+	id3 := insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
+	if err := s.UpsertTenantOutboxCursor(ctx, "pod-fresh", id2); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.DeleteTenantNotifyBefore(ctx, cutoff())
+	if err != nil {
+		t.Fatalf("DeleteTenantNotifyBefore case A: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("case A deleted = %d, want 2 (floor at cursor last_id)", n)
+	}
+	ids := listTenantNotifyIDs(t, s)
+	if ids[id1] || ids[id2] {
+		t.Fatalf("case A: rows <= floor should be pruned: %v", ids)
+	}
+	if !ids[id3] {
+		t.Fatalf("case A: row above fresh cursor floor must survive: %v", ids)
+	}
+
+	// Case B: the only cursor is stale (updated_at older than the freshness
+	// bound) — it is ignored, so pruning falls back to age alone.
+	testmysql.ResetMetaDB(t, s.DB())
+	id1 = insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
+	id2 = insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
+	id3 = insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
+	if err := s.UpsertTenantOutboxCursor(ctx, "pod-stalled", id1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx,
+		`UPDATE tenant_outbox_cursor SET updated_at = ? WHERE pod_id = ?`,
+		time.Now().Add(-2*tenantOutboxCursorFreshnessBound), "pod-stalled"); err != nil {
+		t.Fatal(err)
+	}
+	n, err = s.DeleteTenantNotifyBefore(ctx, cutoff())
+	if err != nil {
+		t.Fatalf("DeleteTenantNotifyBefore case B: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("case B deleted = %d, want 3 (stale cursor ignored, age-only prune)", n)
+	}
+	if ids = listTenantNotifyIDs(t, s); ids[id1] || ids[id2] || ids[id3] {
+		t.Fatalf("case B: all old rows should be pruned: %v", ids)
+	}
+
+	// Case C: a stale cursor with a low last_id alongside a fresh cursor with
+	// a high last_id — the floor comes from the fresh cursor only.
+	testmysql.ResetMetaDB(t, s.DB())
+	id1 = insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
+	id2 = insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
+	id3 = insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
+	if err := s.UpsertTenantOutboxCursor(ctx, "pod-stalled", id1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx,
+		`UPDATE tenant_outbox_cursor SET updated_at = ? WHERE pod_id = ?`,
+		time.Now().Add(-2*tenantOutboxCursorFreshnessBound), "pod-stalled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertTenantOutboxCursor(ctx, "pod-fresh", id2); err != nil {
+		t.Fatal(err)
+	}
+	n, err = s.DeleteTenantNotifyBefore(ctx, cutoff())
+	if err != nil {
+		t.Fatalf("DeleteTenantNotifyBefore case C: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("case C deleted = %d, want 2 (floor from fresh cursor)", n)
+	}
+	if ids = listTenantNotifyIDs(t, s); ids[id1] || ids[id2] || !ids[id3] {
+		t.Fatalf("case C: want id1,id2 pruned and id3 retained: %v", ids)
+	}
+
+	// Case D: no cursors at all — plain age-only pruning, fresh rows survive.
+	testmysql.ResetMetaDB(t, s.DB())
+	insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
+	if err := s.InsertTenantNotify(ctx, "tenant-a", 1); err != nil {
+		t.Fatal(err)
+	}
+	n, err = s.DeleteTenantNotifyBefore(ctx, cutoff())
+	if err != nil {
+		t.Fatalf("DeleteTenantNotifyBefore case D: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("case D deleted = %d, want 1", n)
+	}
+	if got := len(listTenantNotifyIDs(t, s)); got != 1 {
+		t.Fatalf("case D: fresh row must survive, remaining = %d", got)
+	}
+}
+
+// TestUpsertTenantOutboxCursorRefreshesUpdatedAt verifies the cursor's
+// updated_at advances only when last_id advances — the freshness bound in
+// DeleteTenantNotifyBefore depends on it: a pod whose poll is stuck (frozen
+// last_id) must go stale even while its cursor flushes keep succeeding.
+func TestUpsertTenantOutboxCursorRefreshesUpdatedAt(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	testmysql.ResetMetaDB(t, s.DB())
+	stale := func() time.Time { return time.Now().Add(-2 * tenantOutboxCursorFreshnessBound) }
+	age := func(podID string) {
+		t.Helper()
+		if _, err := s.DB().ExecContext(ctx,
+			`UPDATE tenant_outbox_cursor SET updated_at = ? WHERE pod_id = ?`, stale(), podID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.UpsertTenantOutboxCursor(ctx, "pod-a", 10); err != nil {
+		t.Fatal(err)
+	}
+	age("pod-a")
+
+	// Advancing last_id refreshes updated_at.
+	if err := s.UpsertTenantOutboxCursor(ctx, "pod-a", 20); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := s.GetTenantOutboxCursor(ctx, "pod-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.LastID != 20 {
+		t.Fatalf("last_id = %d, want 20", cursor.LastID)
+	}
+	if time.Since(cursor.UpdatedAt) > tenantOutboxCursorFreshnessBound {
+		t.Fatalf("updated_at = %v not refreshed by an advancing upsert", cursor.UpdatedAt)
+	}
+
+	// Re-flushing the SAME last_id (poller caught up, zero traffic — or poll
+	// failing) must NOT refresh updated_at: the cursor goes stale.
+	age("pod-a")
+	if err := s.UpsertTenantOutboxCursor(ctx, "pod-a", 20); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = s.GetTenantOutboxCursor(ctx, "pod-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(cursor.UpdatedAt) <= tenantOutboxCursorFreshnessBound {
+		t.Fatalf("updated_at = %v refreshed by an unchanged last_id; cursor would never go stale", cursor.UpdatedAt)
+	}
+
+	// A regressing last_id must NOT refresh updated_at either (but last_id
+	// itself follows the upsert, preserving prior upsert semantics).
+	age("pod-a")
+	if err := s.UpsertTenantOutboxCursor(ctx, "pod-a", 5); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = s.GetTenantOutboxCursor(ctx, "pod-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.LastID != 5 {
+		t.Fatalf("last_id = %d, want 5", cursor.LastID)
+	}
+	if time.Since(cursor.UpdatedAt) <= tenantOutboxCursorFreshnessBound {
+		t.Fatalf("updated_at = %v refreshed by a regressing last_id", cursor.UpdatedAt)
+	}
+}
+
+// TestClaimSharedMaintenanceRun verifies the cluster-wide maintenance claim:
+// one winner per interval across all "pods", re-claimable after the interval,
+// independent per task name.
+func TestClaimSharedMaintenanceRun(t *testing.T) {
+	s := newControlStore(t) // ResetMetaDB covers shared_maintenance_state
+	ctx := context.Background()
+
+	// First claim wins (row created lazily at the epoch).
+	claimed, err := s.ClaimSharedMaintenanceRun(ctx, "fs_events_sweep", 30*time.Minute)
+	if err != nil {
+		t.Fatalf("claim 1: %v", err)
+	}
+	if !claimed {
+		t.Fatal("first claim should win")
+	}
+
+	// An immediate second claim (another pod) loses.
+	claimed, err = s.ClaimSharedMaintenanceRun(ctx, "fs_events_sweep", 30*time.Minute)
+	if err != nil {
+		t.Fatalf("claim 2: %v", err)
+	}
+	if claimed {
+		t.Fatal("second claim inside the interval should lose")
+	}
+
+	// A different task name claims independently.
+	claimed, err = s.ClaimSharedMaintenanceRun(ctx, "other_task", 30*time.Minute)
+	if err != nil {
+		t.Fatalf("claim other task: %v", err)
+	}
+	if !claimed {
+		t.Fatal("first claim of a different task should win")
+	}
+
+	// After last_run_at ages past the interval, the claim succeeds again.
+	if _, err := s.DB().ExecContext(ctx,
+		`UPDATE shared_maintenance_state SET last_run_at = DATE_SUB(NOW(3), INTERVAL 1 HOUR) WHERE name = ?`,
+		"fs_events_sweep"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = s.ClaimSharedMaintenanceRun(ctx, "fs_events_sweep", 30*time.Minute)
+	if err != nil {
+		t.Fatalf("claim after aging: %v", err)
+	}
+	if !claimed {
+		t.Fatal("claim after the interval should win again")
+	}
+}

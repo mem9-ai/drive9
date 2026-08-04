@@ -1,7 +1,7 @@
 package fuse
 
 import (
-	"log"
+	"fmt"
 	"syscall"
 )
 
@@ -430,7 +430,7 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 	// Recreate as zero-filled — the original data is gone (already on S3).
 	// Only the newly written bytes will be meaningful; other bytes are zeros.
 	if wb.uploadedParts != nil && wb.uploadedParts[partIdx] {
-		log.Printf("WARNING: back-write to evicted part %d of %s — "+
+		safeLogPrintf("WARNING: back-write to evicted part %d of %s — "+
 			"non-written bytes will be zero (original data already uploaded to S3)", partIdx, wb.path)
 		data := make([]byte, wb.partSize)
 		wb.parts[partIdx] = data
@@ -844,6 +844,46 @@ func (wb *WriteBuffer) CanMaterializeFull() bool {
 		}
 	}
 	return true
+}
+
+// LoadMissingParts force-loads every unloaded part of the retained remote
+// prefix via the configured LoadPart loader, so Bytes()/bytesView can
+// reconstruct the complete current contents. It is a no-op when the buffer
+// has no remote-backed ranges and never marks parts dirty. Returns an error
+// when a required part cannot be loaded — no loader configured, load
+// failure, or a part evicted after streaming upload (its original bytes are
+// no longer available) — leaving previously loaded parts untouched.
+func (wb *WriteBuffer) LoadMissingParts() error {
+	if wb.smallFileData != nil {
+		return nil
+	}
+	covered := wb.remoteSize
+	if wb.totalSize < covered {
+		covered = wb.totalSize
+	}
+	if covered <= 0 {
+		return nil
+	}
+
+	numParts := int((covered + wb.partSize - 1) / wb.partSize)
+	for idx := 0; idx < numParts; idx++ {
+		if wb.IsPartLoaded(idx) {
+			continue
+		}
+		if wb.uploadedParts != nil && wb.uploadedParts[idx] {
+			return fmt.Errorf("part %d was evicted after streaming upload and cannot be refetched", idx+1)
+		}
+		if wb.LoadPart == nil {
+			return fmt.Errorf("part %d is not loaded and no lazy part loader is configured", idx+1)
+		}
+		data, err := wb.LoadPart(idx + 1) // 1-based
+		if err != nil {
+			return fmt.Errorf("load part %d: %w", idx+1, err)
+		}
+		wb.parts[idx] = data
+		wb.curMemory += int64(len(data))
+	}
+	return nil
 }
 
 // Reset clears the buffer, releasing the underlying memory.

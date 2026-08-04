@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -492,6 +493,39 @@ func TestStat(t *testing.T) {
 	}
 	if resp.Header.Get("X-Dat9-IsDir") != "false" {
 		t.Errorf("expected X-Dat9-IsDir false, got %s", resp.Header.Get("X-Dat9-IsDir"))
+	}
+	if got := resp.Header.Get("X-Dat9-Storage-Type"); got != "db9" {
+		t.Errorf("expected X-Dat9-Storage-Type db9 for small inline file, got %q", got)
+	}
+}
+
+func TestStatStorageTypeHeader(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Directory stat must not carry a storage type.
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/dir?mkdir", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir: %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/dir", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stat dir: %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Dat9-Storage-Type"); got != "" {
+		t.Errorf("expected no X-Dat9-Storage-Type for directory, got %q", got)
 	}
 }
 
@@ -1863,6 +1897,31 @@ func TestCopy(t *testing.T) {
 	}
 }
 
+func TestSourcePathHeaderDecodesBase64URL(t *testing.T) {
+	const path = "/source\nname\twith\rwhitespace.txt"
+	req := httptest.NewRequest(http.MethodPost, "/v1/fs/destination?copy", nil)
+	req.Header.Set("X-Dat9-Copy-Source", base64.RawURLEncoding.EncodeToString([]byte(path)))
+	req.Header.Set("X-Dat9-Path-Encoding", "base64url")
+
+	got, err := sourcePathFromHeader(req, "X-Dat9-Copy-Source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != path {
+		t.Fatalf("source path = %q, want %q", got, path)
+	}
+}
+
+func TestSourcePathHeaderRejectsUnsupportedEncoding(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/fs/destination?copy", nil)
+	req.Header.Set("X-Dat9-Copy-Source", "/source.txt")
+	req.Header.Set("X-Dat9-Path-Encoding", "hex")
+
+	if _, err := sourcePathFromHeader(req, "X-Dat9-Copy-Source"); err == nil {
+		t.Fatal("sourcePathFromHeader error = nil, want unsupported encoding error")
+	}
+}
+
 func TestHardlinkRoundTrip(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
@@ -2456,5 +2515,64 @@ func TestUploadActionMetrics(t *testing.T) {
 	}
 	if !strings.Contains(text, `drive9_business_events_total{event="upload_abort",result="error"}`) {
 		t.Fatalf("expected upload_abort metric, got: %s", text)
+	}
+}
+
+// TestNewWithConfigFallsBackWorkerFSEventsRetention verifies the belt-and-braces
+// wiring for programmatic callers: when Config.TenantWorkers leaves
+// FSEventsRetention unset, the worker inherits the server's effective
+// fs_events retention instead of falling back to the 1h default — and the
+// shared-pool sweep entry point is wired.
+func TestNewWithConfigFallsBackWorkerFSEventsRetention(t *testing.T) {
+	s3Dir, err := os.MkdirTemp("", "dat9-srv-s3-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
+
+	initServerTenantSchema(t, testDSN)
+	store, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testmysql.ResetDB(t, store.DB())
+	t.Cleanup(func() { _ = store.Close() })
+
+	s3c, err := s3client.NewLocal(s3Dir, "/s3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := backend.NewWithS3(store, s3c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewWithConfig(Config{
+		Backend:           b,
+		Logger:            zap.NewNop(),
+		FSEventsRetention: 2 * time.Hour,
+	})
+	t.Cleanup(func() { s.Close() })
+
+	if s.tenantWorker == nil {
+		t.Fatal("expected a tenant worker in fallback mode")
+	}
+	if got := s.tenantWorker.opts.FSEventsRetention; got != 2*time.Hour {
+		t.Fatalf("worker FSEventsRetention = %v, want 2h (server effective retention fallback)", got)
+	}
+	if s.tenantWorker.opts.SweepSharedFSEvents == nil {
+		t.Fatal("worker SweepSharedFSEvents not wired to the server helper")
+	}
+
+	// An explicit worker-level value wins over the server fallback.
+	s2 := NewWithConfig(Config{
+		Backend:           b,
+		Logger:            zap.NewNop(),
+		FSEventsRetention: 2 * time.Hour,
+		TenantWorkers:     TenantWorkerOptions{FSEventsRetention: 3 * time.Hour},
+	})
+	t.Cleanup(func() { s2.Close() })
+	if got := s2.tenantWorker.opts.FSEventsRetention; got != 3*time.Hour {
+		t.Fatalf("worker FSEventsRetention = %v, want 3h (explicit worker option wins)", got)
 	}
 }

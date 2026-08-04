@@ -5,6 +5,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -575,6 +576,101 @@ func TestStatCtxPreservesStatusErrorOnNotFound(t *testing.T) {
 	if statusErr.StatusCode != http.StatusNotFound {
 		t.Fatalf("status code = %d, want %d", statusErr.StatusCode, http.StatusNotFound)
 	}
+}
+
+func TestStatCtxEscapesControlWhitespaceInPath(t *testing.T) {
+	const pathWithWhitespace = "/line\nbreak\tname\r.txt"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs"+pathWithWhitespace {
+			t.Fatalf("path = %q, want %q", r.URL.Path, "/v1/fs"+pathWithWhitespace)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	if _, err := New(ts.URL, "").StatCtx(context.Background(), pathWithWhitespace); err != nil {
+		t.Fatalf("StatCtx error = %v", err)
+	}
+}
+
+func TestCopyCtxEncodesControlWhitespaceSourceHeader(t *testing.T) {
+	const source = "/source\nname\twith\rwhitespace.txt"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Dat9-Copy-Source"); got != base64.RawURLEncoding.EncodeToString([]byte(source)) {
+			t.Fatalf("source header = %q, want base64url encoding", got)
+		}
+		if got := r.Header.Get("X-Dat9-Path-Encoding"); got != "base64url" {
+			t.Fatalf("path encoding = %q, want base64url", got)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	if err := New(ts.URL, "").CopyCtx(context.Background(), source, "/destination.txt"); err != nil {
+		t.Fatalf("CopyCtx error = %v", err)
+	}
+}
+
+func TestCopyCtxEncodesDELSourceHeader(t *testing.T) {
+	const source = "/source/del\x7fname.txt"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, err := sourcePathFromRequestHeader(r, "X-Dat9-Copy-Source")
+		if err != nil {
+			t.Fatalf("decode source header: %v", err)
+		}
+		if got != source {
+			t.Fatalf("source path = %q, want %q", got, source)
+		}
+		if got := r.Header.Get("X-Dat9-Path-Encoding"); got != pathHeaderEncodingBase64URL {
+			t.Fatalf("path encoding = %q, want %q", got, pathHeaderEncodingBase64URL)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	if err := New(ts.URL, "").CopyCtx(context.Background(), source, "/destination.txt"); err != nil {
+		t.Fatalf("CopyCtx error = %v", err)
+	}
+}
+
+func TestCopyCtxPreservesEdgeSpacesInSourceHeader(t *testing.T) {
+	tests := []string{
+		" /leading.txt",
+		"/trailing.txt ",
+		" /both.txt ",
+		"/interior space.txt",
+	}
+	for _, source := range tests {
+		t.Run(source, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got, err := sourcePathFromRequestHeader(r, "X-Dat9-Copy-Source")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != source {
+					t.Fatalf("source path = %q, want %q", got, source)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer ts.Close()
+
+			if err := New(ts.URL, "").CopyCtx(context.Background(), source, "/destination.txt"); err != nil {
+				t.Fatalf("CopyCtx error = %v", err)
+			}
+		})
+	}
+}
+
+func sourcePathFromRequestHeader(r *http.Request, header string) (string, error) {
+	raw := r.Header.Get(header)
+	if r.Header.Get("X-Dat9-Path-Encoding") == "" {
+		return raw, nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return "", err
+	}
+	return string(decoded), nil
 }
 
 func TestCreateFileCtxPostsCreateActionAndReturnsRevision(t *testing.T) {
