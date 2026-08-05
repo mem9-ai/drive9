@@ -1242,6 +1242,7 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 	}
 	if opts.ReadOnly {
 		fuseOpts.Options = append(fuseOpts.Options, "ro")
+		fuseOpts.DirectMountFlags = readOnlyDirectMountFlags()
 	}
 	return fuseOpts
 }
