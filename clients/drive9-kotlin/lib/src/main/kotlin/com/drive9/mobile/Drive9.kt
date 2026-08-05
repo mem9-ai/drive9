@@ -1,6 +1,7 @@
 package com.drive9.mobile
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
@@ -40,6 +41,11 @@ import javax.net.ssl.SSLSocketFactory
 
 private const val DEFAULT_SMALL_FILE_THRESHOLD = 50_000L
 private const val DEFAULT_PART_SIZE = 8L * 1024L * 1024L
+
+// Bounds the 503 retry loop for recursive deletes. The server answers 503
+// when a batched recursive delete exhausts its per-request budget; the sweep
+// is resumable and idempotent, so re-issuing the same DELETE continues it.
+private const val REMOVE_ALL_MAX_RETRIES = 4
 
 /** Idiomatic Kotlin Drive9 client implemented with platform-native HTTP. */
 public class Drive9Client(
@@ -135,6 +141,40 @@ public class Drive9Client(
 
     public suspend fun delete(path: String): Unit = withContext(Dispatchers.IO) {
         request("DELETE", fsUrl(path)).close()
+    }
+
+    /**
+     * Removes a file or directory tree recursively.
+     *
+     * A large tree delete may exceed the server's per-request budget; the
+     * server then answers 503 and this method retries with backoff (honoring
+     * Retry-After, at most [REMOVE_ALL_MAX_RETRIES] times). Retrying is safe:
+     * the server-side sweep is resumable and idempotent, so a repeated DELETE
+     * continues where it left off.
+     */
+    public suspend fun removeAll(path: String): Unit = withContext(Dispatchers.IO) {
+        val url = "${fsUrl(path)}?recursive=1"
+        var backoffMs = 1_000L
+        var attempt = 0
+        while (true) {
+            val conn = open("DELETE", url)
+            try {
+                val status = conn.responseCode
+                if (status == HttpURLConnection.HTTP_UNAVAILABLE && attempt < REMOVE_ALL_MAX_RETRIES) {
+                    val retryAfterSecs = conn.getHeaderField("Retry-After")?.trim()?.toLongOrNull()
+                    val delayMs = if (retryAfterSecs != null && retryAfterSecs >= 0) retryAfterSecs * 1_000 else backoffMs
+                    backoffMs *= 2
+                    attempt++
+                    conn.disconnect()
+                    delay(delayMs)
+                    continue
+                }
+                if (status !in 200..299) throw errorFrom(conn, status)
+                return@withContext
+            } finally {
+                conn.disconnect()
+            }
+        }
     }
 
     public suspend fun copy(srcPath: String, dstPath: String): Unit = withContext(Dispatchers.IO) {

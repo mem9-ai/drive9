@@ -17,7 +17,9 @@ bindings, C interop, shared libraries, linker flags, or a regeneration step.
 - `Drive9Client(baseUrl, apiKey)`
 - `Drive9Client.defaultClient()`, `withSmallFileThreshold`, `baseUrl`, `apiKey`
 - `write`, `writeWithRevision`, `read`, `uploadFile`, `downloadFile`
-- `list`, `stat`, `delete`, `copy`, `rename`, `mkdir`
+- `list`, `stat`, `delete`, `removeAll`, `copy`, `rename`, `mkdir`
+  (`removeAll` issues `DELETE ?recursive=1` and automatically retries
+  resumable 503 responses, honoring `Retry-After`, up to 4 times)
 - `grep`, `find`, `sql`
 - `downloadStream`, `downloadRangeStream`, `uploadStream`
 - `newStreamUpload` / `Drive9StreamUpload` for v2 multipart stream upload

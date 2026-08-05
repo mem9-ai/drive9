@@ -124,6 +124,16 @@ const DEFAULT_SMALL_FILE_THRESHOLD = 50_000;
 const DEFAULT_SERVER = "https://api.drive9.ai";
 const DOWNLOAD_DIR_CONCURRENCY = 16;
 
+// REMOVE_ALL_MAX_RETRIES bounds the 503 retry loop for recursive deletes. The
+// server answers 503 when a batched recursive delete exhausts its per-request
+// budget; the sweep is resumable and idempotent, so re-issuing the same DELETE
+// continues where it left off.
+const REMOVE_ALL_MAX_RETRIES = 4;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 interface Drive9Config {
   server?: string;
   current_context?: string;
@@ -515,8 +525,25 @@ export class Client {
   }
 
   async removeAll(path: string): Promise<void> {
-    const resp = await fetch(`${this.fsUrl(path)}?recursive=1`, { method: "DELETE", headers: this.authHeaders() });
-    await checkError(resp);
+    const url = `${this.fsUrl(path)}?recursive=1`;
+    let backoff = 1000;
+    for (let attempt = 0; ; attempt++) {
+      const resp = await fetch(url, { method: "DELETE", headers: this.authHeaders() });
+      if (resp.status === 503 && attempt < REMOVE_ALL_MAX_RETRIES) {
+        const retryAfter = (resp.headers.get("retry-after") || "").trim();
+        // Consume and discard the body before retrying.
+        await resp.text().catch(() => "");
+        let delay = backoff;
+        if (/^\d+$/.test(retryAfter)) {
+          delay = Number(retryAfter) * 1000;
+        }
+        await sleep(delay);
+        backoff *= 2;
+        continue;
+      }
+      await checkError(resp);
+      return;
+    }
   }
 
   async copy(srcPath: string, dstPath: string): Promise<void> {

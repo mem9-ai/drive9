@@ -97,6 +97,69 @@ def test_delete(client):
 
 
 @responses.activate
+def test_remove_all(client):
+    responses.add(
+        responses.DELETE,
+        f"{BASE_URL}/v1/fs/dir?recursive=1",
+        status=200,
+    )
+    client.remove_all("/dir")
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_remove_all_retries_on_503_then_succeeds(client):
+    url = f"{BASE_URL}/v1/fs/dir?recursive=1"
+    for _ in range(2):
+        responses.add(
+            responses.DELETE,
+            url,
+            json={"error": "recursive delete in progress, retry to resume"},
+            status=503,
+            headers={"Retry-After": "0"},
+        )
+    responses.add(responses.DELETE, url, status=200)
+
+    client.remove_all("/dir")
+
+    assert len(responses.calls) == 3
+    for call in responses.calls:
+        assert call.request.url == url
+
+
+@responses.activate
+def test_remove_all_gives_up_after_max_retries(client):
+    url = f"{BASE_URL}/v1/fs/dir?recursive=1"
+    responses.add(
+        responses.DELETE,
+        url,
+        json={"error": "recursive delete in progress, retry to resume"},
+        status=503,
+        headers={"Retry-After": "0"},
+    )
+
+    with pytest.raises(Drive9Error) as exc_info:
+        client.remove_all("/dir")
+
+    assert exc_info.value.status_code == 503
+    # 1 initial attempt + _REMOVE_ALL_MAX_RETRIES retries.
+    assert len(responses.calls) == 5
+
+
+@responses.activate
+def test_remove_all_missing_retry_after_uses_backoff(client):
+    url = f"{BASE_URL}/v1/fs/dir?recursive=1"
+    responses.add(responses.DELETE, url, status=503)  # no Retry-After header
+    responses.add(responses.DELETE, url, status=200)
+
+    with mock.patch("drive9.client.time.sleep") as sleep:
+        client.remove_all("/dir")
+
+    sleep.assert_called_once_with(1.0)
+    assert len(responses.calls) == 2
+
+
+@responses.activate
 def test_copy(client):
     responses.add(
         responses.POST,

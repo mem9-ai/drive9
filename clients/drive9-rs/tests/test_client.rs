@@ -2,6 +2,9 @@ use base64::Engine;
 use drive9::{Client, Drive9Error};
 use mockito::Matcher;
 use sha2::{Digest, Sha256};
+use std::io::{Read as _, Write as _};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 #[tokio::test]
 async fn test_write_and_read() {
@@ -213,4 +216,75 @@ async fn test_patch_file_respects_presigned_checksum_header() {
         )
         .await
         .unwrap();
+}
+
+/// Spin up a tiny one-request-per-connection HTTP server that answers DELETE
+/// with the given status sequence (the last status repeats once the sequence
+/// is exhausted). 503 responses carry `Retry-After: 0` to keep tests fast.
+/// Returns the base URL and a shared counter of requests received.
+fn spawn_status_sequence_server(statuses: Vec<u16>) -> (String, Arc<AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_bg = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let idx = hits_bg.fetch_add(1, Ordering::SeqCst);
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let status = statuses
+                .get(idx)
+                .copied()
+                .unwrap_or_else(|| *statuses.last().unwrap());
+            let (status_line, body, extra) = if status == 503 {
+                (
+                    "503 Service Unavailable",
+                    r#"{"error":"recursive delete in progress, retry to resume"}"#,
+                    "Retry-After: 0\r\n",
+                )
+            } else {
+                ("200 OK", "", "")
+            };
+            let resp = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_line,
+                extra,
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    (format!("http://127.0.0.1:{}", port), hits)
+}
+
+#[tokio::test]
+async fn test_remove_all_retries_503_then_succeeds() {
+    let (url, hits) = spawn_status_sequence_server(vec![503, 503, 200]);
+    let client = Client::new(url, "test-key");
+    client.remove_all("/big-tree/").await.unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn test_remove_all_gives_up_after_max_retries() {
+    let (url, hits) = spawn_status_sequence_server(vec![503]);
+    let client = Client::new(url, "test-key");
+    let err = client.remove_all("/big-tree/").await.unwrap_err();
+    match err {
+        Drive9Error::Status { status_code, .. } => assert_eq!(status_code, 503),
+        _ => panic!("expected Status error, got {:?}", err),
+    }
+    // 1 initial attempt + REMOVE_ALL_MAX_RETRIES (4) retries.
+    assert_eq!(hits.load(Ordering::SeqCst), 5);
 }

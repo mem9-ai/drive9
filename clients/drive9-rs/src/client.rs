@@ -8,6 +8,12 @@ use std::collections::HashMap;
 
 const DEFAULT_SMALL_FILE_THRESHOLD: i64 = 50_000;
 
+/// Bounds the 503 retry loop for recursive deletes. The server answers 503
+/// with a Retry-After header when a batched recursive delete exhausts its
+/// transaction/time budget; the sweep is resumable and idempotent, so
+/// re-issuing the same DELETE continues where it left off.
+const REMOVE_ALL_MAX_RETRIES: u32 = 4;
+
 fn load_config_file() -> Option<(String, Option<String>)> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -237,6 +243,45 @@ impl Client {
             .await?;
         check_error(resp).await?;
         Ok(())
+    }
+
+    /// Remove a file or directory tree recursively via `DELETE ?recursive=1`.
+    ///
+    /// A large tree delete may exceed the server's per-request budget; the
+    /// server then answers 503 and this method retries with backoff (honoring
+    /// Retry-After, at most REMOVE_ALL_MAX_RETRIES times). Retrying is safe:
+    /// the server-side sweep is resumable and idempotent, so a repeated DELETE
+    /// continues it.
+    pub async fn remove_all(&self, path: &str) -> Result<(), Drive9Error> {
+        // Use an explicit value to avoid intermediaries dropping bare "?recursive".
+        let url = format!("{}?recursive=1", self.fs_url(path));
+        let mut backoff = std::time::Duration::from_secs(1);
+        let mut attempt: u32 = 0;
+        loop {
+            let resp = self
+                .http
+                .delete(&url)
+                .headers(self.auth_headers())
+                .send()
+                .await?;
+            if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                && attempt < REMOVE_ALL_MAX_RETRIES
+            {
+                let delay = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(backoff);
+                tokio::time::sleep(delay).await;
+                backoff *= 2;
+                attempt += 1;
+                continue;
+            }
+            check_error(resp).await?;
+            return Ok(());
+        }
     }
 
     pub async fn copy(&self, src_path: &str, dst_path: &str) -> Result<(), Drive9Error> {

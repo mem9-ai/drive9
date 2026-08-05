@@ -12,6 +12,7 @@ final class HitCounter: @unchecked Sendable {
     private var count = 0
     private let lock = NSLock()
     func bump() { lock.lock(); count += 1; lock.unlock() }
+    func bumpAndGet() -> Int { lock.lock(); defer { lock.unlock() }; count += 1; return count }
     func get() -> Int { lock.lock(); defer { lock.unlock() }; return count }
 }
 
@@ -105,6 +106,57 @@ final class Drive9Tests: XCTestCase {
         try await client.copy(srcPath: "src.txt", dstPath: "/dst.txt")
         try await client.rename(oldPath: "/old.txt", newPath: "/new.txt")
         try await client.mkdir(path: "/dir/")
+    }
+
+    func testRemoveAllRetries503ThenSucceeds() async throws {
+        let hits = HitCounter()
+        server.routeAnyQuery("DELETE", "/v1/fs/dir/") { req in
+            XCTAssertEqual(req.query, "recursive=1")
+            let n = hits.bumpAndGet()
+            if n < 3 {
+                let body = #"{"error":"recursive delete in progress, retry to resume"}"#
+                return MockResponse(
+                    status: 503,
+                    body: Data(body.utf8),
+                    contentType: "application/json",
+                    extraHeaders: ["Retry-After": "0"]
+                )
+            }
+            return MockResponse(status: 200, body: Data())
+        }
+
+        let client = Drive9Client(baseUrl: server.baseURL, apiKey: "k")
+        try await client.removeAll(path: "/dir/")
+        XCTAssertEqual(hits.get(), 3)
+    }
+
+    func testRemoveAllGivesUpAfterMaxRetries() async throws {
+        let hits = HitCounter()
+        server.routeAnyQuery("DELETE", "/v1/fs/dir/") { req in
+            XCTAssertEqual(req.query, "recursive=1")
+            _ = hits.bumpAndGet()
+            let body = #"{"error":"recursive delete in progress, retry to resume"}"#
+            return MockResponse(
+                status: 503,
+                body: Data(body.utf8),
+                contentType: "application/json",
+                extraHeaders: ["Retry-After": "0"]
+            )
+        }
+
+        let client = Drive9Client(baseUrl: server.baseURL, apiKey: "k")
+        do {
+            try await client.removeAll(path: "/dir/")
+            XCTFail("expected removeAll to throw after retries exhausted")
+        } catch let error as Drive9Exception {
+            guard case let .Drive9(code, statusCode, _, _) = error else {
+                XCTFail("unexpected variant: \(error)")
+                return
+            }
+            XCTAssertEqual(code, "http_status")
+            XCTAssertEqual(statusCode, 503)
+        }
+        XCTAssertEqual(hits.get(), 5)
     }
 
     func testGrepReturnsSearchResultsWithEncodedQuery() async throws {

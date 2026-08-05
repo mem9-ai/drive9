@@ -150,6 +150,53 @@ class Drive9Test {
     }
 
     @Test
+    fun removeAllRetries503ThenSucceeds() = runBlocking {
+        var hits = 0
+        route("DELETE", "/v1/fs/tree/?recursive=1") { ex ->
+            hits++
+            if (hits < 3) {
+                val body = """{"error":"recursive delete in progress, retry to resume"}"""
+                    .toByteArray(StandardCharsets.UTF_8)
+                ex.responseHeaders.add("Content-Type", "application/json")
+                ex.responseHeaders.add("Retry-After", "0")
+                ex.sendResponseHeaders(503, body.size.toLong())
+                ex.responseBody.write(body)
+                ex.close()
+            } else {
+                ex.sendResponseHeaders(200, -1)
+                ex.close()
+            }
+        }
+
+        val client = Drive9Client(baseUrl, "k")
+        client.removeAll("/tree/")
+        assertEquals(3, hits)
+    }
+
+    @Test
+    fun removeAllGivesUpAfterBoundedRetries() = runBlocking {
+        var hits = 0
+        route("DELETE", "/v1/fs/tree/?recursive=1") { ex ->
+            hits++
+            val body = """{"error":"recursive delete in progress, retry to resume"}"""
+                .toByteArray(StandardCharsets.UTF_8)
+            ex.responseHeaders.add("Content-Type", "application/json")
+            ex.responseHeaders.add("Retry-After", "0")
+            ex.sendResponseHeaders(503, body.size.toLong())
+            ex.responseBody.write(body)
+            ex.close()
+        }
+
+        val client = Drive9Client(baseUrl, "k")
+        val err = assertFailsWith<Drive9Exception.Drive9> {
+            client.removeAll("/tree/")
+        }
+        assertEquals(503, err.statusCode)
+        // 1 initial request + REMOVE_ALL_MAX_RETRIES (4) retries.
+        assertEquals(5, hits)
+    }
+
+    @Test
     fun conflictPreservesServerRevision() = runBlocking {
         route("PUT", "/v1/fs/r.txt") { ex ->
             ex.requestBody.readBytes()

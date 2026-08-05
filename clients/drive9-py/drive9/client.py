@@ -1,5 +1,6 @@
 """Drive9 HTTP client."""
 
+import time
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urlencode, quote
@@ -16,6 +17,13 @@ from .stream import StreamWriter
 def _parse_iso_datetime(s: str) -> datetime:
     """Parse ISO8601 datetime, handling Z suffix for Python < 3.11."""
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+# _REMOVE_ALL_MAX_RETRIES bounds the 503 retry loop for recursive deletes. The
+# server answers 503 when a batched recursive delete exhausts its per-request
+# budget; the sweep is resumable and idempotent, so re-issuing the same DELETE
+# continues where it left off.
+_REMOVE_ALL_MAX_RETRIES = 4
 
 
 class Client(TransferMixin, PatchMixin):
@@ -199,6 +207,37 @@ class Client(TransferMixin, PatchMixin):
         """Remove a file or directory."""
         resp = self._request("DELETE", self._url(path))
         self._check_error(resp)
+
+    def remove_all(self, path: str) -> None:
+        """Remove a file or directory tree recursively.
+
+        A large tree delete may exceed the server's per-request budget; the
+        server then answers 503 (with an optional Retry-After header) and this
+        method retries with backoff, at most _REMOVE_ALL_MAX_RETRIES times.
+        Retrying is safe: the server-side sweep is resumable and idempotent,
+        so a repeated DELETE continues where it left off.
+        """
+        url = self._url(path) + "?recursive=1"
+        backoff = 1.0
+        attempt = 0
+        while True:
+            resp = self._request("DELETE", url)
+            if resp.status_code == 503 and attempt < _REMOVE_ALL_MAX_RETRIES:
+                delay = backoff
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after is not None:
+                    try:
+                        secs = int(retry_after.strip())
+                        if secs >= 0:
+                            delay = secs
+                    except ValueError:
+                        pass
+                time.sleep(delay)
+                backoff *= 2
+                attempt += 1
+                continue
+            self._check_error(resp)
+            return
 
     def copy(self, src_path: str, dst_path: str) -> None:
         """Perform a server-side zero-copy."""

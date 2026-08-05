@@ -47,7 +47,7 @@ def prefix(client):
     yield p
     # best-effort cleanup
     try:
-        client.delete(p.rstrip("/") + "?recursive")
+        client.remove_all(p.rstrip("/"))
     except Exception:
         pass
 

@@ -19,6 +19,8 @@ require Rust, generated bindings, shared libraries, or a regeneration step.
 - `Drive9Client.defaultClient()`, `withSmallFileThreshold`, `baseUrl`, `apiKey`
 - `write`, `writeWithRevision`, `read`, `uploadFile`, `downloadFile`
 - `list`, `stat`, `delete`, `copy`, `rename`, `mkdir`
+- `removeAll` — recursive delete; automatically retries server 503 responses
+  (honoring `Retry-After`, bounded) while a large tree sweep is in progress
 - `grep`, `find`, `sql`
 - `downloadFlow`, `downloadRangeFlow`, `uploadFlow`
 - `newStreamUpload` / `Drive9StreamUpload` for v2 multipart stream upload
