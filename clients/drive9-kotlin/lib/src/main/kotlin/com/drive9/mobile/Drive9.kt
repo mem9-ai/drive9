@@ -165,7 +165,9 @@ public class Drive9Client(
                     val delayMs = if (retryAfterSecs != null && retryAfterSecs >= 0) retryAfterSecs * 1_000 else backoffMs
                     backoffMs *= 2
                     attempt++
-                    conn.disconnect()
+                    // Drain the 503 body so the underlying connection can be
+                    // reused for the retry instead of being discarded.
+                    conn.errorStream?.use { it.readBytes() }
                     delay(delayMs)
                     continue
                 }

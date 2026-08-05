@@ -221,14 +221,19 @@ async fn test_patch_file_respects_presigned_checksum_header() {
 /// Spin up a tiny one-request-per-connection HTTP server that answers DELETE
 /// with the given status sequence (the last status repeats once the sequence
 /// is exhausted). 503 responses carry `Retry-After: 0` to keep tests fast.
-/// Returns the base URL and a shared counter of requests received.
-fn spawn_status_sequence_server(statuses: Vec<u16>) -> (String, Arc<AtomicUsize>) {
+/// The listener thread exits after `max_requests` connections so tests do not
+/// leak a blocked thread. Returns the base URL and a shared counter of
+/// requests received.
+fn spawn_status_sequence_server(
+    statuses: Vec<u16>,
+    max_requests: usize,
+) -> (String, Arc<AtomicUsize>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let hits = Arc::new(AtomicUsize::new(0));
     let hits_bg = hits.clone();
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
+        for stream in listener.incoming().take(max_requests) {
             let Ok(mut stream) = stream else { break };
             let idx = hits_bg.fetch_add(1, Ordering::SeqCst);
             let mut buf = Vec::new();
@@ -270,7 +275,7 @@ fn spawn_status_sequence_server(statuses: Vec<u16>) -> (String, Arc<AtomicUsize>
 
 #[tokio::test]
 async fn test_remove_all_retries_503_then_succeeds() {
-    let (url, hits) = spawn_status_sequence_server(vec![503, 503, 200]);
+    let (url, hits) = spawn_status_sequence_server(vec![503, 503, 200], 3);
     let client = Client::new(url, "test-key");
     client.remove_all("/big-tree/").await.unwrap();
     assert_eq!(hits.load(Ordering::SeqCst), 3);
@@ -278,7 +283,7 @@ async fn test_remove_all_retries_503_then_succeeds() {
 
 #[tokio::test]
 async fn test_remove_all_gives_up_after_max_retries() {
-    let (url, hits) = spawn_status_sequence_server(vec![503]);
+    let (url, hits) = spawn_status_sequence_server(vec![503], 5);
     let client = Client::new(url, "test-key");
     let err = client.remove_all("/big-tree/").await.unwrap_err();
     match err {
