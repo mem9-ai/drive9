@@ -652,8 +652,13 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 	}
 
 	// Delete-orphan reconciliation (§4.2.1): one throttled round per tenant,
-	// dry-run unless DRIVE9_DELETE_RECONCILE_REPAIR is set.
-	m.reconcileDeleteOrphans(ctx, target)	// Observation metrics: sample queue depth + dead-letter count.
+	// dry-run unless DRIVE9_DELETE_RECONCILE_REPAIR is set. The scan cursor is
+	// held per tenant in this manager (in-memory): a pod restart or shard
+	// owner change re-covers earlier rows — repairs persist, so this only
+	// delays tail coverage for very large tenants, it never loses repairs.
+	m.reconcileDeleteOrphans(ctx, target)
+
+	// Observation metrics: sample queue depth + dead-letter count.
 	m.observeTenant(ctx, target, now)
 }
 

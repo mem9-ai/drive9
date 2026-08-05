@@ -479,3 +479,75 @@ func TestReconcileCappedRoundResumesFromCursor(t *testing.T) {
 		t.Fatalf("broken dentry across rounds = %d, want 1", found)
 	}
 }
+
+// TestReconcileCappedRoundRepairResumes is the repair-mode counterpart of
+// TestReconcileCappedRoundResumesFromCursor: repairs made by earlier rounds
+// persist, later rounds resume from the cursor, and no row is repaired twice.
+func TestReconcileCappedRoundRepairResumes(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	oldMax := deleteReconcileMaxScanRows
+	deleteReconcileMaxScanRows = 10
+	t.Cleanup(func() { deleteReconcileMaxScanRows = oldMax })
+
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "rcap-d", Path: "/rcap/", ParentPath: "/", Name: "rcap", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 25; i++ {
+		name := fmt.Sprintf("f%02d.txt", i)
+		if err := s.InsertNode(ctx, &FileNode{
+			NodeID: fmt.Sprintf("rcap-n%02d", i), Path: "/rcap/" + name, ParentPath: "/rcap/", Name: name, CreatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two broken-chain dentries, sorting before and after the /rcap/ rows.
+	insertBroken := func(nodeID, path string) {
+		t.Helper()
+		if _, err := s.DB().Exec(`INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, created_at)
+			VALUES (?, ?, ?, '/gone/', ?, ?, 0, '', ?)`,
+			nodeID, path, fileNodePathHash(path), fileNodePathHash("/gone/"), baseName(path), now); err != nil {
+			t.Fatalf("insert broken dentry %s: %v", nodeID, err)
+		}
+	}
+	insertBroken("aaa-broken", "/gone/aaa.txt")
+	insertBroken("zzz-broken", "/gone/zzz.txt")
+
+	state := &DeleteReconcileState{}
+	var totalRepaired int64
+	for i := 0; i < 12; i++ {
+		r, err := s.ReconcileDeleteOrphans(ctx, false, 10, state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		totalRepaired += r.Repaired
+		if state.DentryCursor == "" {
+			break
+		}
+	}
+	if state.DentryCursor != "" {
+		t.Fatal("expected a full pass to complete within the round budget")
+	}
+	if totalRepaired != 2 {
+		t.Fatalf("repaired = %d, want 2 (no double-repair, no skipped page)", totalRepaired)
+	}
+	for _, nodeID := range []string{"aaa-broken", "zzz-broken"} {
+		var n int
+		if err := s.DB().QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE node_id = ?`, nodeID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("broken dentry %s still present", nodeID)
+		}
+	}
+	// The healthy tree was not touched.
+	var healthy int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE parent_path = '/rcap/'`).Scan(&healthy); err != nil {
+		t.Fatal(err)
+	}
+	if healthy != 25 {
+		t.Fatalf("healthy rows = %d, want 25", healthy)
+	}
+}

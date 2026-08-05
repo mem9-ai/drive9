@@ -52,6 +52,12 @@ var deleteReconcileMaxScanRows = 200_000
 // It is in-worker state, not durable: a pod restart re-covers earlier rows,
 // which is acceptable for an audit/repair backstop whose repairs themselves
 // persist. A nil state is equivalent to a fresh one (tests, one-shot runs).
+//
+// Cursors advance in node_id / inode_id sort order: rows created behind the
+// cursor are seen by the current pass, rows created ahead of it wait for the
+// next full pass. This is eventual coverage, not real-time auditing. If a
+// repair fails mid-page, the cursor rolls back to the page start so the next
+// round retries that page.
 type DeleteReconcileState struct {
 	DentryCursor string
 	InodeCursor  string
@@ -130,6 +136,7 @@ func (s *Store) reconcileBrokenDentries(ctx context.Context, dryRun bool, batchS
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		pageStart := state.DentryCursor
 		rows, err := s.db.QueryContext(ctx, `SELECT node_id, path, parent_path, COALESCE(file_id, ''), is_directory
 			FROM file_nodes WHERE `+s.scope.And(`node_id > ?`)+` ORDER BY node_id LIMIT ?`,
 			s.scope.Args(state.DentryCursor, batchSize)...)
@@ -186,6 +193,10 @@ func (s *Store) reconcileBrokenDentries(ctx context.Context, dryRun bool, batchS
 			for _, c := range broken {
 				repaired, err := s.repairBrokenDentry(ctx, c)
 				if err != nil {
+					// Roll the cursor back to the page start so the next
+					// round retries this page's remaining repairs instead
+					// of skipping them until the next full pass.
+					state.DentryCursor = pageStart
 					return err
 				}
 				if repaired {
@@ -344,6 +355,7 @@ func (s *Store) reconcileStrandedInodes(ctx context.Context, dryRun bool, batchS
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		pageStart := state.InodeCursor
 		// Candidate set: CONFIRMED inodes joined to contents (a directory
 		// inode has no contents row, so the join excludes them), with no
 		// file_nodes reference via either column (file dentries reference
@@ -388,6 +400,10 @@ func (s *Store) reconcileStrandedInodes(ctx context.Context, dryRun bool, batchS
 			for _, id := range page {
 				repaired, err := s.repairStrandedInode(ctx, id)
 				if err != nil {
+					// Roll the cursor back to the page start so the next
+					// round retries this page's remaining repairs instead
+					// of skipping them until the next full pass.
+					state.InodeCursor = pageStart
 					return err
 				}
 				if repaired {
