@@ -80,21 +80,7 @@ fn rand_suffix() -> u64 {
 
 async fn cleanup_prefix(p: &str) {
     let c = make_client();
-    let key = match c.api_key() {
-        Some(k) => k.to_string(),
-        None => return,
-    };
-    let url = format!(
-        "{}/v1/fs{}?recursive=1",
-        base(),
-        p.trim_end_matches('/')
-    );
-    // The Rust SDK does not expose RemoveAll, so issue a raw recursive DELETE.
-    let _ = reqwest::Client::new()
-        .delete(&url)
-        .header("Authorization", format!("Bearer {}", key))
-        .send()
-        .await;
+    let _ = c.remove_all(p).await;
 }
 
 // Helpers to build a Box<dyn SeekableReader> from a Vec<u8>.

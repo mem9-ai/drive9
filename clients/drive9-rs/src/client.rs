@@ -274,6 +274,9 @@ impl Client {
                     .and_then(|v| v.trim().parse::<u64>().ok())
                     .map(std::time::Duration::from_secs)
                     .unwrap_or(backoff);
+                // Release the connection before sleeping so it is returned to
+                // the pool instead of being held for the whole backoff.
+                drop(resp);
                 tokio::time::sleep(delay).await;
                 backoff *= 2;
                 attempt += 1;

@@ -3,6 +3,7 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestRemoveAllRetriesOn503 verifies the bounded retry loop around recursive
@@ -68,5 +70,68 @@ func TestRemoveAllRetryLimitExceeded(t *testing.T) {
 	}
 	if got, want := calls.Load(), int32(1+removeAllMaxRetries); got != want {
 		t.Fatalf("requests = %d, want %d", got, want)
+	}
+}
+
+// TestDeleteDoesNotRetryOn503 verifies the 503 retry loop only applies to
+// recursive deletes: a plain (non-recursive) delete must surface the first
+// 503 immediately, without re-issuing the request.
+func TestDeleteDoesNotRetryOn503(t *testing.T) {
+	var calls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if strings.Contains(r.URL.RawQuery, "recursive=1") {
+			t.Errorf("unexpected recursive query: %s", r.URL)
+		}
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	err := c.Delete("/data/file.txt")
+	var se *StatusError
+	if !errors.As(err, &se) || se.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("error = %v, want 503 *StatusError", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("requests = %d, want 1 (no retry for non-recursive delete)", got)
+	}
+}
+
+// TestRemoveAllCtxCancelDuringBackoff verifies that cancelling the context
+// while the retry loop is waiting out a Retry-After delay aborts the wait
+// immediately instead of sleeping through it.
+func TestRemoveAllCtxCancelDuringBackoff(t *testing.T) {
+	var calls atomic.Int32
+	responded := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		close(responded)
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c := New(ts.URL, "")
+	done := make(chan error, 1)
+	go func() { done <- c.RemoveAllCtx(ctx, "/data/") }()
+
+	// Wait until the first 503 response is sent (the retry loop is now in its
+	// backoff wait), then cancel.
+	<-responded
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RemoveAllCtx did not return promptly after cancel")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
 	}
 }

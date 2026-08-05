@@ -232,6 +232,9 @@ class Client(TransferMixin, PatchMixin):
                             delay = secs
                     except ValueError:
                         pass
+                # Release the connection back to the pool before sleeping;
+                # requests only returns it once the body is consumed/closed.
+                resp.close()
                 time.sleep(delay)
                 backoff *= 2
                 attempt += 1
