@@ -47,6 +47,11 @@ private const val DEFAULT_PART_SIZE = 8L * 1024L * 1024L
 // is resumable and idempotent, so re-issuing the same DELETE continues it.
 private const val REMOVE_ALL_MAX_RETRIES = 4
 
+// REMOVE_ALL_MAX_RETRY_DELAY_SECS caps the delay honored from a Retry-After
+// header so a pathological value (e.g. Retry-After: 999999) cannot block the
+// caller for days.
+private const val REMOVE_ALL_MAX_RETRY_DELAY_SECS = 60L
+
 /** Idiomatic Kotlin Drive9 client implemented with platform-native HTTP. */
 public class Drive9Client(
     baseUrl: String,
@@ -158,24 +163,25 @@ public class Drive9Client(
         var attempt = 0
         while (true) {
             val conn = open("DELETE", url)
+            var retryDelayMs: Long? = null
             try {
                 val status = conn.responseCode
                 if (status == HttpURLConnection.HTTP_UNAVAILABLE && attempt < REMOVE_ALL_MAX_RETRIES) {
                     val retryAfterSecs = conn.getHeaderField("Retry-After")?.trim()?.toLongOrNull()
-                    val delayMs = if (retryAfterSecs != null && retryAfterSecs >= 0) retryAfterSecs * 1_000 else backoffMs
+                    retryDelayMs = removeAllRetryDelayMs(retryAfterSecs, backoffMs)
                     backoffMs *= 2
                     attempt++
                     // Drain the 503 body so the underlying connection can be
                     // reused for the retry instead of being discarded.
                     conn.errorStream?.use { it.readBytes() }
-                    delay(delayMs)
-                    continue
+                } else {
+                    if (status !in 200..299) throw errorFrom(conn, status)
+                    return@withContext
                 }
-                if (status !in 200..299) throw errorFrom(conn, status)
-                return@withContext
             } finally {
                 conn.disconnect()
             }
+            retryDelayMs?.let { delay(it) }
         }
     }
 
@@ -1289,6 +1295,20 @@ private fun urlEncode(value: String): String =
 
 private fun pathEncode(value: String): String =
     value.split('/').joinToString("/") { urlEncode(it) }
+
+/**
+ * Decides the sleep before the next recursive-delete retry. A valid
+ * non-negative Retry-After value (integer delta-seconds) is honored and
+ * clamped to REMOVE_ALL_MAX_RETRY_DELAY_SECS; honoring 0 as an immediate
+ * retry is intentional (the retry loop is bounded). A missing or unparseable
+ * header falls back to the passed exponential backoff.
+ */
+internal fun removeAllRetryDelayMs(retryAfterSecs: Long?, backoffMs: Long): Long {
+    if (retryAfterSecs != null && retryAfterSecs >= 0) {
+        return minOf(retryAfterSecs, REMOVE_ALL_MAX_RETRY_DELAY_SECS) * 1_000L
+    }
+    return backoffMs
+}
 
 private fun checkCancel(token: Drive9CancelToken?) {
     if (token?.isCancelled() == true) {

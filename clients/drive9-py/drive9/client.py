@@ -25,6 +25,37 @@ def _parse_iso_datetime(s: str) -> datetime:
 # continues where it left off.
 _REMOVE_ALL_MAX_RETRIES = 4
 
+# _REMOVE_ALL_MAX_RETRY_DELAY caps the delay honored from a Retry-After header
+# so a pathological value (e.g. Retry-After: 999999) cannot block the caller
+# for days.
+_REMOVE_ALL_MAX_RETRY_DELAY = 60.0
+
+
+def _remove_all_retry_delay(retry_after: Optional[str], backoff: float) -> float:
+    """Decide the sleep before the next recursive-delete retry.
+
+    A valid Retry-After header (integer delta-seconds) is honored, clamped to
+    _REMOVE_ALL_MAX_RETRY_DELAY; honoring 0 as an immediate retry is
+    intentional — the server dictates the delay and the retry loop is bounded
+    to _REMOVE_ALL_MAX_RETRIES + 1 requests. A missing, unparseable, or
+    negative header falls back to the passed exponential backoff.
+    """
+    if retry_after is not None:
+        try:
+            secs = int(retry_after.strip())
+            if secs >= 0:
+                return min(float(secs), _REMOVE_ALL_MAX_RETRY_DELAY)
+        except ValueError:
+            pass
+    return backoff
+
+
+def _encode_fs_path(path: str) -> str:
+    """Percent-encode each segment of a drive9 path, preserving slashes."""
+    if not path.startswith("/"):
+        path = "/" + path
+    return "/".join(quote(segment, safe="") for segment in path.split("/"))
+
 
 class Client(TransferMixin, PatchMixin):
     """The Drive9 HTTP client."""
@@ -78,9 +109,7 @@ class Client(TransferMixin, PatchMixin):
             self.session.mount("https://", adapter)
 
     def _url(self, path: str) -> str:
-        if not path.startswith("/"):
-            path = "/" + path
-        return f"{self.base_url}/v1/fs{path}"
+        return f"{self.base_url}/v1/fs{_encode_fs_path(path)}"
 
     def _vault_url(self, path: str) -> str:
         if not path.startswith("/"):
@@ -223,17 +252,9 @@ class Client(TransferMixin, PatchMixin):
         while True:
             resp = self._request("DELETE", url)
             if resp.status_code == 503 and attempt < _REMOVE_ALL_MAX_RETRIES:
-                delay = backoff
-                retry_after = resp.headers.get("Retry-After")
-                if retry_after is not None:
-                    try:
-                        secs = int(retry_after.strip())
-                        if secs >= 0:
-                            delay = secs
-                    except ValueError:
-                        pass
-                # Release the connection back to the pool before sleeping;
-                # requests only returns it once the body is consumed/closed.
+                delay = _remove_all_retry_delay(resp.headers.get("Retry-After"), backoff)
+                # Close the response before sleeping so the connection is not
+                # held open for the whole backoff.
                 resp.close()
                 time.sleep(delay)
                 backoff *= 2

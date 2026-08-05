@@ -14,6 +14,40 @@ const DEFAULT_SMALL_FILE_THRESHOLD: i64 = 50_000;
 /// re-issuing the same DELETE continues where it left off.
 const REMOVE_ALL_MAX_RETRIES: u32 = 4;
 
+/// Caps the delay honored from a Retry-After header so a pathological value
+/// (e.g. Retry-After: 999999) cannot block the caller for days.
+const REMOVE_ALL_MAX_RETRY_DELAY_SECS: u64 = 60;
+
+/// Percent-encode each segment of a drive9 path, preserving separators, so
+/// characters such as `?` and `#` cannot be reinterpreted as URL delimiters.
+fn encoded_fs_path(path: &str) -> String {
+    let normalized = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    normalized
+        .split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Decide the sleep before the next recursive-delete retry. A valid
+/// non-negative Retry-After value (integer delta-seconds) is honored and
+/// clamped to REMOVE_ALL_MAX_RETRY_DELAY_SECS; honoring 0 as an immediate
+/// retry is intentional (the retry loop is bounded). A missing or unparseable
+/// header falls back to the passed exponential backoff.
+fn remove_all_retry_delay(
+    retry_after: Option<&str>,
+    backoff: std::time::Duration,
+) -> std::time::Duration {
+    match retry_after.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(secs) => std::time::Duration::from_secs(secs.min(REMOVE_ALL_MAX_RETRY_DELAY_SECS)),
+        None => backoff,
+    }
+}
+
 fn load_config_file() -> Option<(String, Option<String>)> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -40,14 +74,15 @@ fn load_config_file() -> Option<(String, Option<String>)> {
 }
 
 fn load_config() -> (String, Option<String>) {
-    let env_server = std::env::var("DRIVE9_SERVER").ok().filter(|s| !s.is_empty());
-    let env_key = std::env::var("DRIVE9_API_KEY").ok().filter(|s| !s.is_empty());
-    let (file_server, file_key) = load_config_file()
-        .unwrap_or_else(|| ("https://api.drive9.ai".to_string(), None));
-    (
-        env_server.unwrap_or(file_server),
-        env_key.or(file_key),
-    )
+    let env_server = std::env::var("DRIVE9_SERVER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let env_key = std::env::var("DRIVE9_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let (file_server, file_key) =
+        load_config_file().unwrap_or_else(|| ("https://api.drive9.ai".to_string(), None));
+    (env_server.unwrap_or(file_server), env_key.or(file_key))
 }
 
 #[derive(Clone, Debug)]
@@ -106,12 +141,7 @@ impl Client {
     }
 
     pub(crate) fn fs_url(&self, path: &str) -> String {
-        let p = if path.starts_with('/') {
-            path
-        } else {
-            &format!("/{}", path)
-        };
-        format!("{}/v1/fs{}", self.base_url, p)
+        format!("{}/v1/fs{}", self.base_url, encoded_fs_path(path))
     }
 
     pub(crate) fn vault_url(&self, path: &str) -> String {
@@ -267,15 +297,14 @@ impl Client {
             if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
                 && attempt < REMOVE_ALL_MAX_RETRIES
             {
-                let delay = resp
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or(backoff);
-                // Release the connection before sleeping so it is returned to
-                // the pool instead of being held for the whole backoff.
+                let delay = remove_all_retry_delay(
+                    resp.headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok()),
+                    backoff,
+                );
+                // Release the response before sleeping so the connection is
+                // not held open for the whole backoff.
                 drop(resp);
                 tokio::time::sleep(delay).await;
                 backoff *= 2;
@@ -404,5 +433,38 @@ impl Client {
             total_size,
             expected_revision,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_fs_path_escapes_query_and_fragment_delimiters() {
+        assert_eq!(encoded_fs_path("/dir?name"), "/dir%3Fname");
+        assert_eq!(encoded_fs_path("/dir#name"), "/dir%23name");
+        assert_eq!(encoded_fs_path("dir?name"), "/dir%3Fname");
+        assert_eq!(encoded_fs_path("/a b/c"), "/a%20b/c");
+    }
+
+    #[test]
+    fn remove_all_retry_delay_clamps_huge_retry_after() {
+        assert_eq!(
+            remove_all_retry_delay(Some("999999"), std::time::Duration::from_secs(1)),
+            std::time::Duration::from_secs(REMOVE_ALL_MAX_RETRY_DELAY_SECS)
+        );
+        assert_eq!(
+            remove_all_retry_delay(Some("0"), std::time::Duration::from_secs(1)),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            remove_all_retry_delay(Some("2"), std::time::Duration::from_secs(1)),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            remove_all_retry_delay(None, std::time::Duration::from_secs(4)),
+            std::time::Duration::from_secs(4)
+        );
     }
 }

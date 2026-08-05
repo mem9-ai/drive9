@@ -160,6 +160,55 @@ def test_remove_all_missing_retry_after_uses_backoff(client):
 
 
 @responses.activate
+def test_remove_all_large_retry_after_is_clamped(client):
+    url = f"{BASE_URL}/v1/fs/dir?recursive=1"
+    responses.add(
+        responses.DELETE,
+        url,
+        json={"error": "recursive delete in progress, retry to resume"},
+        status=503,
+        headers={"Retry-After": "999999"},
+    )
+    responses.add(responses.DELETE, url, status=200)
+
+    with mock.patch("drive9.client.time.sleep") as sleep:
+        client.remove_all("/dir")
+
+    sleep.assert_called_once_with(60.0)
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_remove_all_encodes_query_and_fragment_in_path(client):
+    urls = [
+        f"{BASE_URL}/v1/fs/dir%3Fname?recursive=1",
+        f"{BASE_URL}/v1/fs/dir%23name?recursive=1",
+    ]
+    for url in urls:
+        responses.add(responses.DELETE, url, status=200)
+
+    client.remove_all("/dir?name")
+    client.remove_all("/dir#name")
+
+    assert [call.request.url for call in responses.calls] == urls
+
+
+@responses.activate
+def test_delete_encodes_query_and_fragment_in_path(client):
+    urls = [
+        f"{BASE_URL}/v1/fs/dir%3Fname",
+        f"{BASE_URL}/v1/fs/dir%23name",
+    ]
+    for url in urls:
+        responses.add(responses.DELETE, url, status=200)
+
+    client.delete("/dir?name")
+    client.delete("/dir#name")
+
+    assert [call.request.url for call in responses.calls] == urls
+
+
+@responses.activate
 def test_copy(client):
     responses.add(
         responses.POST,

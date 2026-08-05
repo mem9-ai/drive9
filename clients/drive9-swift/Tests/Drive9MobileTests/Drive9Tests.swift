@@ -159,6 +159,37 @@ final class Drive9Tests: XCTestCase {
         XCTAssertEqual(hits.get(), 5)
     }
 
+    func testRemoveAllRetryDelayClampsHugeRetryAfter() {
+        let client = Drive9Client(baseUrl: "http://127.0.0.1:1", apiKey: "k")
+        XCTAssertEqual(
+            client.removeAllRetryDelayNs(retryAfter: "999999", backoffNs: 1_000_000_000),
+            60_000_000_000
+        )
+        XCTAssertEqual(client.removeAllRetryDelayNs(retryAfter: "0", backoffNs: 1_000_000_000), 0)
+        XCTAssertEqual(client.removeAllRetryDelayNs(retryAfter: "2", backoffNs: 1_000_000_000), 2_000_000_000)
+        XCTAssertEqual(client.removeAllRetryDelayNs(retryAfter: nil, backoffNs: 2_000_000_000), 2_000_000_000)
+    }
+
+    func testBearerTokenOnlySentToHTTPSOrLoopbackHTTP() {
+        let client = Drive9Client(baseUrl: "http://example.com", apiKey: "k")
+        XCTAssertFalse(client.canSendCredentials(to: URL(string: "http://example.com/v1/fs/x")!))
+        XCTAssertTrue(client.canSendCredentials(to: URL(string: "https://api.drive9.ai/v1/fs/x")!))
+        XCTAssertTrue(client.canSendCredentials(to: URL(string: "http://127.0.0.1:9009/v1/fs/x")!))
+        XCTAssertTrue(client.canSendCredentials(to: URL(string: "http://localhost:9009/v1/fs/x")!))
+    }
+
+    func testInsecureHTTPWithBearerThrows() throws {
+        let client = Drive9Client(baseUrl: "http://example.com", apiKey: "k")
+
+        var request = URLRequest(url: URL(string: "http://example.com/v1/fs/x")!)
+        request.setValue("Bearer k", forHTTPHeaderField: "Authorization")
+        XCTAssertThrowsError(try client.ensureRequestCredentialsAllowed(request))
+
+        request = URLRequest(url: URL(string: "http://127.0.0.1:9009/v1/fs/x")!)
+        request.setValue("Bearer k", forHTTPHeaderField: "Authorization")
+        XCTAssertNoThrow(try client.ensureRequestCredentialsAllowed(request))
+    }
+
     func testGrepReturnsSearchResultsWithEncodedQuery() async throws {
         server.route("GET", "/v1/fs/?grep=hello%20world&limit=3") { _ in
             let body = #"[{"path":"/a.txt","name":"a.txt","size_bytes":7,"score":0.5}]"#

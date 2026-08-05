@@ -226,7 +226,12 @@ async fn integration_streaming() {
 
     // write_stream_conditional
     let _ = c
-        .write_stream_conditional(&format!("{}cond.bin", p), seekable(sdata.clone()), sdata.len() as i64, -1)
+        .write_stream_conditional(
+            &format!("{}cond.bin", p),
+            seekable(sdata.clone()),
+            sdata.len() as i64,
+            -1,
+        )
         .await
         .unwrap();
 
@@ -244,9 +249,7 @@ async fn integration_streaming() {
     assert_eq!(head.len(), 10);
 
     // resume_upload (best-effort)
-    let _ = c
-        .resume_upload(&large, seekable(ldata.clone()), size)
-        .await;
+    let _ = c.resume_upload(&large, seekable(ldata.clone()), size).await;
 
     cleanup_prefix(&p).await;
 }
@@ -327,7 +330,10 @@ async fn integration_vault() {
     let sec = match c.create_vault_secret(&sec_name, &fields).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("create_vault_secret (best-effort, local server may not enable vault): {:?}", e);
+            eprintln!(
+                "create_vault_secret (best-effort, local server may not enable vault): {:?}",
+                e
+            );
             return;
         }
     };
@@ -345,7 +351,10 @@ async fn integration_vault() {
 
     // issue / revoke vault token (best-effort)
     let scope = vec![format!("secret:{}", sec_name)];
-    if let Ok(vt) = c.issue_vault_token("it-rs-agent", "it-rs-task", &scope, 60).await {
+    if let Ok(vt) = c
+        .issue_vault_token("it-rs-agent", "it-rs-task", &scope, 60)
+        .await
+    {
         assert!(!vt.token.is_empty());
         let _ = c.revoke_vault_token(&vt.token_id).await;
     }

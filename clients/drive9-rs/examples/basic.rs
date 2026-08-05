@@ -18,7 +18,10 @@ async fn main() -> Result<(), drive9::Drive9Error> {
 
     // Stat the file
     let info = client.stat(path).await?;
-    println!("Stat: size={} revision={} is_dir={}", info.size, info.revision, info.is_dir);
+    println!(
+        "Stat: size={} revision={} is_dir={}",
+        info.size, info.revision, info.is_dir
+    );
 
     // List directory
     let entries = client.list("/examples/").await?;
@@ -28,12 +31,16 @@ async fn main() -> Result<(), drive9::Drive9Error> {
     }
 
     // Conditional write
-    client.write_with_revision(path, b"updated content", info.revision).await?;
+    client
+        .write_with_revision(path, b"updated content", info.revision)
+        .await?;
     println!("Conditional write succeeded");
 
     // Copy and rename
     client.copy(path, "/examples/hello-copy.txt").await?;
-    client.rename("/examples/hello-copy.txt", "/examples/hello-moved.txt").await?;
+    client
+        .rename("/examples/hello-copy.txt", "/examples/hello-moved.txt")
+        .await?;
 
     // Clean up
     client.delete(path).await?;

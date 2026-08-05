@@ -130,8 +130,22 @@ const DOWNLOAD_DIR_CONCURRENCY = 16;
 // continues where it left off.
 const REMOVE_ALL_MAX_RETRIES = 4;
 
+// REMOVE_ALL_MAX_RETRY_DELAY_MS caps the delay honored from a Retry-After
+// header so a pathological value (e.g. Retry-After: 999999) cannot block the
+// caller for days.
+const REMOVE_ALL_MAX_RETRY_DELAY_MS = 60_000;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function removeAllRetryDelay(retryAfter: string, backoff: number): number {
+  if (/^\d+$/.test(retryAfter)) {
+    // Honoring 0 as an immediate retry is intentional: the server explicitly
+    // dictates the delay, and the loop is bounded to REMOVE_ALL_MAX_RETRIES + 1 requests.
+    return Math.min(Number(retryAfter) * 1000, REMOVE_ALL_MAX_RETRY_DELAY_MS);
+  }
+  return backoff;
 }
 
 interface Drive9Config {
@@ -257,7 +271,8 @@ export class Client {
 
   fsUrl(path: string): string {
     const p = path.startsWith("/") ? path : `/${path}`;
-    return `${this.baseUrl}/v1/fs${p}`;
+    const encodedPath = p.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+    return `${this.baseUrl}/v1/fs${encodedPath}`;
   }
 
   vaultUrl(path: string): string {
@@ -533,11 +548,7 @@ export class Client {
         const retryAfter = (resp.headers.get("retry-after") || "").trim();
         // Consume and discard the body before retrying.
         await resp.text().catch(() => "");
-        let delay = backoff;
-        if (/^\d+$/.test(retryAfter)) {
-          delay = Number(retryAfter) * 1000;
-        }
-        await sleep(delay);
+        await sleep(removeAllRetryDelay(retryAfter, backoff));
         backoff *= 2;
         continue;
       }

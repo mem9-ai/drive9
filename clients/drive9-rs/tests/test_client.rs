@@ -293,3 +293,28 @@ async fn test_remove_all_gives_up_after_max_retries() {
     // 1 initial attempt + REMOVE_ALL_MAX_RETRIES (4) retries.
     assert_eq!(hits.load(Ordering::SeqCst), 5);
 }
+
+#[tokio::test]
+async fn test_remove_all_encodes_query_and_fragment_in_path() {
+    let mut server = mockito::Server::new_async().await;
+    let _m1 = server
+        .mock("DELETE", "/v1/fs/dir%3Fname?recursive=1")
+        .with_status(200)
+        .create_async()
+        .await;
+    let _m2 = server
+        .mock("DELETE", "/v1/fs/dir%23name?recursive=1")
+        .with_status(200)
+        .create_async()
+        .await;
+    let _m3 = server
+        .mock("DELETE", "/v1/fs/dir%3Fname")
+        .with_status(200)
+        .create_async()
+        .await;
+
+    let client = Client::new(server.url(), "test-key");
+    client.remove_all("/dir?name").await.unwrap();
+    client.remove_all("/dir#name").await.unwrap();
+    client.delete("/dir?name").await.unwrap();
+}

@@ -21,7 +21,10 @@ async fn main() -> Result<(), drive9::Drive9Error> {
     println!("Read secret: {:?}", secret);
 
     // Read a single field
-    if let Ok(field) = client.read_vault_secret_field(secret_name, "password").await {
+    if let Ok(field) = client
+        .read_vault_secret_field(secret_name, "password")
+        .await
+    {
         println!("Password field: {}", field);
     }
 

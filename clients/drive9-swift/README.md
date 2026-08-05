@@ -28,6 +28,9 @@ bindings, C interop, shared libraries, linker flags, or a regeneration step.
 
 `baseUrl` may include a trailing slash. If `apiKey` is non-empty, requests send
 `Authorization: Bearer <apiKey>`; an empty key sends no authorization header.
+The client refuses to send that token over non-loopback plain HTTP. Use
+`https://` for production endpoints; plain HTTP is accepted only for loopback
+endpoints such as `http://127.0.0.1:9009` used in local tests.
 
 ## Parity notes
 

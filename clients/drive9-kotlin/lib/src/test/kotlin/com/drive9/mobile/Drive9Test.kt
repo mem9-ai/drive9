@@ -197,6 +197,14 @@ class Drive9Test {
     }
 
     @Test
+    fun removeAllRetryDelayClampsHugeRetryAfter() {
+        assertEquals(60_000L, removeAllRetryDelayMs(999_999L, 1_000L))
+        assertEquals(0L, removeAllRetryDelayMs(0L, 1_000L))
+        assertEquals(2_000L, removeAllRetryDelayMs(2L, 1_000L))
+        assertEquals(1_000L, removeAllRetryDelayMs(null, 1_000L))
+    }
+
+    @Test
     fun conflictPreservesServerRevision() = runBlocking {
         route("PUT", "/v1/fs/r.txt") { ex ->
             ex.requestBody.readBytes()

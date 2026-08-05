@@ -99,6 +99,32 @@ func TestDeleteDoesNotRetryOn503(t *testing.T) {
 	}
 }
 
+// TestRemoveAllRetryDelayClampsRetryAfter verifies that a huge Retry-After
+// value is clamped to removeAllMaxRetryDelay instead of parking the client
+// for days, while normal and missing values keep their existing behavior.
+func TestRemoveAllRetryDelayClampsRetryAfter(t *testing.T) {
+	tests := []struct {
+		name       string
+		retryAfter string
+		backoff    time.Duration
+		want       time.Duration
+	}{
+		{name: "huge value is clamped", retryAfter: "999999", backoff: time.Second, want: removeAllMaxRetryDelay},
+		{name: "overflow-scale value is clamped before conversion", retryAfter: "10000000000", backoff: time.Second, want: removeAllMaxRetryDelay},
+		{name: "zero means immediate retry", retryAfter: "0", backoff: time.Second, want: 0},
+		{name: "small value is honored", retryAfter: "2", backoff: time.Second, want: 2 * time.Second},
+		{name: "missing header uses backoff", retryAfter: "", backoff: 2 * time.Second, want: 2 * time.Second},
+		{name: "invalid header uses backoff", retryAfter: "soon", backoff: 4 * time.Second, want: 4 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := removeAllRetryDelay(tt.retryAfter, tt.backoff); got != tt.want {
+				t.Fatalf("removeAllRetryDelay(%q, %v) = %v, want %v", tt.retryAfter, tt.backoff, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestRemoveAllCtxCancelDuringBackoff verifies that cancelling the context
 // while the retry loop is waiting out a Retry-After delay aborts the wait
 // immediately instead of sleeping through it.

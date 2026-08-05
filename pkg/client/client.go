@@ -1088,6 +1088,31 @@ func (c *Client) RemoveAllCtx(ctx context.Context, path string) error {
 // delete follow-up covers that case).
 const removeAllMaxRetries = 4
 
+// removeAllMaxRetryDelay caps the Retry-After value honored by the recursive
+// delete retry loop, so a bogus header (e.g. "999999") cannot park the client
+// for days. The exponential backoff fallback is already bounded by
+// removeAllMaxRetries and needs no cap.
+const removeAllMaxRetryDelay = 60 * time.Second
+
+// removeAllRetryDelay computes how long to wait before retrying a recursive
+// delete after a 503. A valid, non-negative Retry-After value (integer
+// delta-seconds) is honored, clamped to removeAllMaxRetryDelay; a missing or
+// invalid header falls back to the passed backoff.
+func removeAllRetryDelay(retryAfter string, backoff time.Duration) time.Duration {
+	if secs, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && secs >= 0 {
+		// Honoring 0 as an immediate retry is intentional: the server
+		// explicitly dictates the delay, and the loop is bounded to
+		// 1 + removeAllMaxRetries requests.
+		// Clamp in seconds before converting so an absurd header cannot
+		// overflow the Duration multiplication and bypass the cap.
+		if secs > int(removeAllMaxRetryDelay/time.Second) {
+			secs = int(removeAllMaxRetryDelay / time.Second)
+		}
+		return time.Duration(secs) * time.Second
+	}
+	return backoff
+}
+
 func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kind string) error {
 	requestURL := c.url(path)
 	if recursive {
@@ -1108,13 +1133,9 @@ func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kin
 			return err
 		}
 		if recursive && resp.StatusCode == http.StatusServiceUnavailable && attempt < removeAllMaxRetries {
-			retryAfter := resp.Header.Get("Retry-After")
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-			delay := backoff
-			if secs, perr := strconv.Atoi(strings.TrimSpace(retryAfter)); perr == nil && secs >= 0 {
-				delay = time.Duration(secs) * time.Second
-			}
+			delay := removeAllRetryDelay(resp.Header.Get("Retry-After"), backoff)
 			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
@@ -1125,6 +1146,8 @@ func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kin
 			backoff *= 2
 			continue
 		}
+		// Retry branches close the body explicitly before continuing; this
+		// defer only covers the terminal iteration that returns from the loop.
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 300 {
 			return readError(resp)
