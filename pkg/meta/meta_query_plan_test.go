@@ -26,7 +26,6 @@ func TestObservePendingMutationsSQLAggregatesBeforeOrganizationLookups(t *testin
 		"FROM quota_mutation_log FORCE INDEX (idx_pending_tenant_age)",
 		"WHERE status = 'pending'\n\t\tGROUP BY tenant_id",
 		"pending.pending_count, pending.oldest_created_at",
-		"FROM pending_mutations pending\n\tLEFT JOIN tenants t ON t.id = pending.tenant_id",
 	} {
 		if !strings.Contains(observePendingMutationsSQL, fragment) {
 			t.Fatalf("optimized pending mutation query missing %q:\n%s", fragment, observePendingMutationsSQL)

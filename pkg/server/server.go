@@ -4760,7 +4760,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	if tenant.UsesTiDBCloudNativeCredentials(provider) && credentialReq != nil {
 		poolClaimStarted := time.Now()
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_started", "provider", provider, "quota_requested", quotaReq != nil)...)
-		if res, pool, claimed, _, err := s.claimAdminTenantFromPoolWithAccess(r.Context(), *credentialReq, quotaReq, tiDBCloudAccess); err != nil {
+		if res, pool, claimed, err := s.claimAdminTenantFromPoolWithAccess(r.Context(), *credentialReq, quotaReq, tiDBCloudAccess); err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_failed", "provider", provider, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", provisionTenantPoolClaimMetricResult(err))
 			status, msg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", err)

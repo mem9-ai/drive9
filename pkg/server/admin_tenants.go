@@ -175,7 +175,7 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 	}
 	poolClaimStarted := time.Now()
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_started", "provider", tenant.ProviderTiDBCloudNative, "quota_requested", quotaOpt != nil)...)
-	res, pool, claimed, _, err := s.claimAdminTenantFromPoolWithAccess(r.Context(), cred, quotaOpt, access)
+	res, pool, claimed, err := s.claimAdminTenantFromPoolWithAccess(r.Context(), cred, quotaOpt, access)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_failed", "provider", tenant.ProviderTiDBCloudNative, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
 		status, msg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", err)

@@ -9,7 +9,7 @@ drive9 delivers filesystem change notifications over SSE (`GET /v1/events`). Eac
 Today `fs_events` rows are retained for **1 hour** (hard-coded `fsEventsRetention` at `pkg/server/server.go:1178`). Two new requirements motivate a redesign of the retention and durability behavior:
 
 1. **Events are pushed to external customers.** The stream is becoming a customer-facing integration channel, so the replay window must cover realistic consumer outages: **7 days** instead of 1 hour.
-2. **Tenant databases are serverless.** Periodically waking cold tenant DBs (or the shared multi-tenant DB) for polling or retention sweeps creates a per-request billing storm across thousands of mostly-idle tenants. The design must touch a tenant DB **only** when that tenant is already active.
+2. **Tenant databases are serverless.** Periodically waking cold tenant DBs for polling or retention sweeps creates a per-request billing storm across thousands of mostly-idle tenants. The design must touch a tenant DB **only** when that tenant is already active.
 
 Durability requirement: **99.99% event availability**, defined below as SLIs plus an explicit loss-budget formula — not as a bare percentage. A failed event insert must **not** fail the enclosing filesystem mutation — mutations are primary, events are derived. If a customer contract genuinely requires every single event, this design does not satisfy it; that requirement leads back to co-transactional writes or per-consumer acks, both rejected here (see "Rejected alternatives"). Align on 99.99% before implementation.
 

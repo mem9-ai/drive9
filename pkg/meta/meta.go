@@ -3210,22 +3210,6 @@ func tenantStatusNeedsMetricsCleanup(status TenantStatus) bool {
 	return status == TenantDeleting || status == TenantDeleted
 }
 
-// UpdateTenantProvider rewrites a tenant's persisted provider.
-func (s *Store) UpdateTenantProvider(ctx context.Context, id, provider string) (err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "update_tenant_provider", start, &err)
-	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET provider = ?, updated_at = ? WHERE id = ?`, provider, time.Now().UTC(), id)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	s.apiKeys.evictTenant(id)
-	return nil
-}
-
 // UpdateTenantStatusIf has the same per-tenant transaction boundary as
 // UpdateTenantStatus when moving to deleting/deleted, while preserving the
 // conditional update and per-tenant failure isolation expected by cleanup

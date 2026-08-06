@@ -152,9 +152,6 @@ type Store struct {
 	db             *sql.DB
 	useLegacyFiles bool // true when the legacy `files` table exists and needs dual-write
 	scope          Scope
-	// externalDB marks a Store wrapping a handle owned by someone else;
-	// Close must not close it.
-	externalDB bool
 }
 
 func Open(dsn string) (*Store, error) {
@@ -191,19 +188,9 @@ func OpenForTenantScoped(ctx context.Context, dsn, tenantID, tidbCloudOrgID stri
 }
 
 func (s *Store) Close() error {
-	if s.externalDB {
-		return nil
-	}
 	return mysqlutil.CloseInstrumented(s.db)
 }
 func (s *Store) DB() *sql.DB { return s.db }
-
-// NewStoreWithDB wraps an externally owned *sql.DB with the given scope.
-// Close is a no-op — the owner controls the handle's lifetime. No
-// legacy-files detection runs.
-func NewStoreWithDB(db *sql.DB, scope Scope) *Store {
-	return &Store{db: db, scope: scope, externalDB: true}
-}
 
 // Scope returns the schema-shape scope fixed at construction.
 func (s *Store) Scope() Scope { return s.scope }

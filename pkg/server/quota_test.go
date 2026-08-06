@@ -2384,7 +2384,7 @@ func TestTenantPoolClaimMissTriggersPendingMetadataResume(t *testing.T) {
 		t.Fatalf("upsert binding: %v", err)
 	}
 
-	res, pool, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
+	res, pool, claimed, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	}, nil)
@@ -2429,7 +2429,7 @@ func TestTenantPoolClaimMissReplenishesZeroInventory(t *testing.T) {
 		t.Fatalf("create pool: %v", err)
 	}
 
-	res, gotPool, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
+	res, gotPool, claimed, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
 		PublicKey: "public-1", PrivateKey: "private-1",
 	}, nil)
 	if err != nil {
@@ -2510,7 +2510,7 @@ func TestTenantPoolClaimSeedsQuotaConfigWithoutExplicitQuota(t *testing.T) {
 		t.Fatalf("upsert binding: %v", err)
 	}
 
-	res, _, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
+	res, _, claimed, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	}, nil)

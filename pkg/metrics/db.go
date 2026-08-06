@@ -22,14 +22,12 @@ type dbProbeState struct {
 type registeredDB struct {
 	role           string
 	tenantID       string
-	dbPoolUUID     string
 	tidbCloudOrgID string
 }
 
 type dbMetricKey struct {
 	role           string
 	tenantID       string
-	dbPoolUUID     string
 	tidbCloudOrgID string
 }
 
@@ -101,17 +99,17 @@ func RegisterTenantDB(role, tenantID string, db *sql.DB) {
 }
 
 func RegisterTenantDBWithOrg(role, tenantID, tidbCloudOrgID string, db *sql.DB) {
-	registerDB(role, tenantID, "", tidbCloudOrgID, db)
+	registerDB(role, tenantID, tidbCloudOrgID, db)
 }
 
-func registerDB(role, tenantID, dbPoolUUID, tidbCloudOrgID string, db *sql.DB) {
+func registerDB(role, tenantID, tidbCloudOrgID string, db *sql.DB) {
 	if db == nil {
 		return
 	}
 	RegisterModule("db")
 	globalDB.mu.Lock()
 	globalDB.dbs[db] = registeredDB{
-		role: role, tenantID: tenantID, dbPoolUUID: dbPoolUUID, tidbCloudOrgID: tidbCloudOrgID,
+		role: role, tenantID: tenantID, tidbCloudOrgID: tidbCloudOrgID,
 	}
 	globalDB.mu.Unlock()
 }
@@ -486,7 +484,6 @@ func (p registeredDB) metricKey() dbMetricKey {
 	return dbMetricKey{
 		role:           cleanMetricValue(p.role, "unknown"),
 		tenantID:       cleanMetricValue(p.tenantID, "unknown"),
-		dbPoolUUID:     cleanMetricValue(p.dbPoolUUID, "unknown"),
 		tidbCloudOrgID: cleanTiDBCloudOrgID(p.tidbCloudOrgID),
 	}
 }
@@ -539,9 +536,6 @@ func dbLabels(key dbMetricKey) string {
 	if key.hasTenantID() {
 		labels += fmt.Sprintf(",tenant_id=\"%s\"", EscapePromLabel(key.tenantID))
 	}
-	if key.hasDBPoolUUID() {
-		labels += fmt.Sprintf(",db_pool_uuid=\"%s\"", EscapePromLabel(key.dbPoolUUID))
-	}
 	if key.hasScopedIdentity() {
 		labels += fmt.Sprintf(",tidbcloud_org_id=\"%s\"", EscapePromLabel(key.tidbCloudOrgID))
 	}
@@ -552,12 +546,8 @@ func (key dbMetricKey) hasTenantID() bool {
 	return key.tenantID != "" && key.tenantID != "unknown"
 }
 
-func (key dbMetricKey) hasDBPoolUUID() bool {
-	return key.dbPoolUUID != "" && key.dbPoolUUID != "unknown"
-}
-
 func (key dbMetricKey) hasScopedIdentity() bool {
-	return key.hasTenantID() || key.hasDBPoolUUID()
+	return key.hasTenantID()
 }
 
 func sortedDBMetricKeys(totals map[dbMetricKey]dbPoolTotals) []dbMetricKey {
@@ -571,9 +561,6 @@ func sortedDBMetricKeys(totals map[dbMetricKey]dbPoolTotals) []dbMetricKey {
 		}
 		if keys[i].tenantID != keys[j].tenantID {
 			return keys[i].tenantID < keys[j].tenantID
-		}
-		if keys[i].dbPoolUUID != keys[j].dbPoolUUID {
-			return keys[i].dbPoolUUID < keys[j].dbPoolUUID
 		}
 		return keys[i].tidbCloudOrgID < keys[j].tidbCloudOrgID
 	})

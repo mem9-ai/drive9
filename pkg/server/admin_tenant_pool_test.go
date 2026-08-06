@@ -107,7 +107,7 @@ func TestFreeTenantPoolClaimRejectsUncountedCandidateAtLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, _, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx,
+	res, _, claimed, err := rt.server.claimAdminTenantFromPool(ctx,
 		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}, nil)
 	if !errors.Is(err, tenant.ErrTiDBCloudFreeTenantLimitReached) {
 		t.Fatalf("claim error = %v, want tenant limit", err)
@@ -124,7 +124,7 @@ func TestFreeTenantPoolClaimRejectsUncountedCandidateAtLimit(t *testing.T) {
 func TestFreeTenantPoolClaimWithHeadroomBecomesCounted(t *testing.T) {
 	rt, candidateID := newFreeNativePoolClaimRuntime(t, "org-free-claim-headroom")
 	ctx := context.Background()
-	res, _, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx,
+	res, _, claimed, err := rt.server.claimAdminTenantFromPool(ctx,
 		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}, nil)
 	if err != nil || !claimed || res == nil || res.TenantID != candidateID {
 		t.Fatalf("claim result = %+v claimed=%v err=%v", res, claimed, err)
@@ -141,7 +141,7 @@ func TestFreeTenantPoolClaimFailureRollsBackQuotaAndPoolStatus(t *testing.T) {
 	wantErr := errors.New("mark pool used failed")
 	rt.prov.markPoolUsedErr = wantErr
 
-	res, _, claimed, _, err := rt.server.claimAdminTenantFromPool(ctx,
+	res, _, claimed, err := rt.server.claimAdminTenantFromPool(ctx,
 		tenant.CredentialProvisionRequest{PublicKey: "public", PrivateKey: "private"}, nil)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("claim error = %v, want %v", err, wantErr)

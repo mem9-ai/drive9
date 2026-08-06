@@ -1517,7 +1517,6 @@ func (s *Store) ListPendingMutations(ctx context.Context, minAge time.Duration, 
 		        COALESCE(b.organization_id, ''),
 		        q.mutation_type, q.mutation_data, q.status, q.retry_count, q.created_at, q.applied_at
 		 FROM quota_mutation_log q
-		 LEFT JOIN tenants t ON t.id = q.tenant_id
 		 LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = q.tenant_id
 		 WHERE q.status = 'pending' AND q.created_at < ?
 		 ORDER BY q.tenant_id, q.id ASC
@@ -1550,7 +1549,6 @@ SELECT pending.tenant_id,
 	COALESCE(b.organization_id, ''),
 	pending.pending_count, pending.oldest_created_at
 	FROM pending_mutations pending
-	LEFT JOIN tenants t ON t.id = pending.tenant_id
 	LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = pending.tenant_id
 	ORDER BY pending.tenant_id`
 
