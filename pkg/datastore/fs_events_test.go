@@ -108,18 +108,3 @@ func TestCountFSEvents(t *testing.T) {
 		t.Fatalf("count = %d, want 3", count)
 	}
 }
-
-// TestDeleteSharedFSEventsBeforeRefusesStandalone verifies the shared-pool
-// sweep refuses to run on a non-shared (dedicated tenant) store: an unscoped
-// DELETE there would be a catastrophic bug.
-func TestDeleteSharedFSEventsBeforeRefusesStandalone(t *testing.T) {
-	store := newTestStore(t)
-	if _, _, err := store.DeleteSharedFSEventsBefore(context.Background(), time.Now(), 100, 10); err == nil {
-		t.Fatal("DeleteSharedFSEventsBefore on a standalone store should return an error")
-	}
-	// Invalid parameters are rejected (on a shared store these would be;
-	// here the shape check fires first, which is also fine).
-	if _, _, err := store.DeleteSharedFSEventsBefore(context.Background(), time.Now(), 0, 10); err == nil {
-		t.Fatal("batchSize 0 should return an error")
-	}
-}

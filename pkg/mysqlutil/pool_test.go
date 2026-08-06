@@ -1,7 +1,6 @@
 package mysqlutil
 
 import (
-	"database/sql"
 	"testing"
 	"time"
 )
@@ -64,13 +63,6 @@ func TestDefaultPoolLifetime(t *testing.T) {
 		t.Fatalf("user schema idle time = %s, want %s", idleTime, defaultUserSchemaConnMaxIdleTime)
 	}
 
-	lifetime, idleTime = defaultPoolLifetime(RoleShared)
-	if lifetime != 30*time.Minute {
-		t.Fatalf("shared lifetime = %s, want 30m", lifetime)
-	}
-	if idleTime != 5*time.Minute {
-		t.Fatalf("shared idle time = %s, want 5m", idleTime)
-	}
 }
 
 func TestDefaultPoolLimits(t *testing.T) {
@@ -98,79 +90,6 @@ func TestDefaultPoolLimits(t *testing.T) {
 		t.Fatalf("user schema max idle = %d, want %d", maxIdle, defaultUserSchemaMaxIdleConns)
 	}
 
-	maxOpen, maxIdle = defaultPoolLimits(RoleShared)
-	if maxOpen != 300 || maxIdle != 50 {
-		t.Fatalf("shared limits = %d/%d, want 300/50", maxOpen, maxIdle)
-	}
-
-	// The schema handle only serves one ensure at a time, so it must not claim a
-	// data-plane sized budget against the same physical DB.
-	maxOpen, maxIdle = defaultPoolLimits(RoleSharedSchema)
-	if maxOpen != defaultSharedSchemaMaxOpenConns {
-		t.Fatalf("shared schema max open = %d, want %d", maxOpen, defaultSharedSchemaMaxOpenConns)
-	}
-	if maxIdle != defaultSharedSchemaMaxIdleConns {
-		t.Fatalf("shared schema max idle = %d, want %d", maxIdle, defaultSharedSchemaMaxIdleConns)
-	}
-	if maxOpen >= defaultSharedMaxOpenConns {
-		t.Fatalf("shared schema max open = %d, want well under the shared budget %d", maxOpen, defaultSharedMaxOpenConns)
-	}
-}
-
-func TestSharedSchemaPoolEnvOverridesLimits(t *testing.T) {
-	t.Setenv("DRIVE9_SHARED_SCHEMA_DB_MAX_OPEN_CONNS", "3")
-
-	if got := poolEnvInt(RoleSharedSchema, "MAX_OPEN_CONNS", defaultSharedSchemaMaxOpenConns); got != 3 {
-		t.Fatalf("shared schema max open = %d, want 3", got)
-	}
-	// The shared data-plane knob must not bleed into the schema handle.
-	t.Setenv("DRIVE9_SHARED_DB_MAX_OPEN_CONNS", "77")
-	if got := poolEnvInt(RoleSharedSchema, "MAX_OPEN_CONNS", defaultSharedSchemaMaxOpenConns); got != 3 {
-		t.Fatalf("shared schema max open after shared override = %d, want 3", got)
-	}
-}
-
-func TestSharedSchemaPoolRequiresTwoConnections(t *testing.T) {
-	t.Setenv("DRIVE9_SHARED_SCHEMA_DB_MAX_OPEN_CONNS", "1")
-	db, err := sql.Open("mysql", "")
-	if err != nil {
-		t.Fatalf("open sql db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-
-	ApplyPoolDefaults(db, RoleSharedSchema)
-	if got := db.Stats().MaxOpenConnections; got != 2 {
-		t.Fatalf("shared schema max open = %d, want 2 to reserve one connection for the advisory lock", got)
-	}
-}
-
-func TestDefaultPoolLifetimeSharedSchemaIsShortLived(t *testing.T) {
-	lifetime, idleTime := defaultPoolLifetime(RoleSharedSchema)
-	if lifetime != defaultSharedSchemaConnMaxLifetime || idleTime != defaultSharedSchemaConnMaxIdleTime {
-		t.Fatalf("shared schema lifetimes = %v/%v, want %v/%v",
-			lifetime, idleTime, defaultSharedSchemaConnMaxLifetime, defaultSharedSchemaConnMaxIdleTime)
-	}
-	if lifetime >= defaultSharedConnMaxLifetime {
-		t.Fatalf("shared schema lifetime = %v, want shorter than the shared handle %v", lifetime, defaultSharedConnMaxLifetime)
-	}
-}
-
-func TestSharedPoolDurationEnv(t *testing.T) {
-	t.Setenv("DRIVE9_SHARED_DB_CONN_MAX_LIFETIME", "45m")
-	t.Setenv("DRIVE9_SHARED_DB_CONN_MAX_IDLE_TIME", "12m")
-	lifetime, idleTime := poolLifetime(RoleShared)
-	if lifetime != 45*time.Minute || idleTime != 12*time.Minute {
-		t.Fatalf("shared env durations = %s/%s, want 45m/12m", lifetime, idleTime)
-	}
-}
-
-func TestSharedPoolDurationEnvRejectsZeroIdleTime(t *testing.T) {
-	t.Setenv("DRIVE9_SHARED_DB_CONN_MAX_IDLE_TIME", "0s")
-
-	_, idleTime := poolLifetime(RoleShared)
-	if idleTime != defaultSharedConnMaxIdleTime {
-		t.Fatalf("shared idle time = %s, want default %s", idleTime, defaultSharedConnMaxIdleTime)
-	}
 }
 
 func TestMetaPoolDurationEnvAllowsZeroIdleTime(t *testing.T) {

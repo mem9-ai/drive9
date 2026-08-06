@@ -81,12 +81,6 @@ type TenantWorkerOptions struct {
 	// piggybacked maintenance sweep prunes them (backstop for the lazy
 	// write-path sweep). Defaults to defaultFSEventsRetention.
 	FSEventsRetention time.Duration
-	// SweepSharedFSEvents runs the shared-pool fs_events retention sweep for
-	// the pool the given store belongs to. Wired from NewWithConfig to the
-	// server-level helper (detached; throttled cluster-wide), so the
-	// piggyback path and the write path share one throttle. Nil disables the
-	// pool sweep (the piggyback branch skips shared stores).
-	SweepSharedFSEvents func(store *datastore.Store, tidbCloudOrgID string)
 }
 
 func (o *TenantWorkerOptions) normalize() {
@@ -612,18 +606,7 @@ func (m *tenantWorkerManager) piggybackMaintenance(ctx context.Context, target *
 	} else {
 		metrics.DeleteFSEventsRowsWithOrg(target.tenantID, target.metricOrgID())
 	}
-	if target.store.Scope().Shared() {
-		// Shared schema: every tenant lives in one physical fs_events table,
-		// so dead/idle tenants' rows are unreachable by any fs_id-scoped
-		// sweep. Run the pool-wide sweep via the server-level helper instead
-		// (detached, cluster-throttled; wired in NewWithConfig). Running here
-		// (piggybackMaintenance only fires for already-warm tenants) is the
-		// design's "no cold wakeup" gate: maintenance of an active shared
-		// resource, not a cron over cold DBs.
-		if m.opts.SweepSharedFSEvents != nil {
-			m.opts.SweepSharedFSEvents(target.store, target.metricOrgID())
-		}
-	} else if n, hasMore, err := target.store.DeleteFSEventsBefore(ctx, now.Add(-m.opts.FSEventsRetention), fsEventsSweepBatchSize, fsEventsSweepMaxBatches); err != nil {
+	if n, hasMore, err := target.store.DeleteFSEventsBefore(ctx, now.Add(-m.opts.FSEventsRetention), fsEventsSweepBatchSize, fsEventsSweepMaxBatches); err != nil {
 		metrics.RecordTenantOperationWithOrg(target.tenantID, target.metricOrgID(), "event_bus", "retention_sweep", metrics.ResultForError(err), 0)
 		if ctx.Err() == nil {
 			logger.Warn(ctx, "tenant_worker_fs_events_cleanup_failed",

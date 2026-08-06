@@ -25,7 +25,7 @@ Use a hosted deployment by default. For local development on this machine, use
 
 #### Deployment endpoints
 
-Current shared dev deployment:
+Current dev deployments:
 
 ```bash
 # Dev
@@ -136,9 +136,8 @@ bash e2e/cli-smoke-test.sh
 
 Useful knobs for existing-tenant runs:
 
-- `RUN_CLI_FORK_CHECKS=0` — skip the fork flow. Recommended for shared-schema
-  tenants (which reject `/v1/fork` with 409) or very large tenants where
-  forking is undesirable.
+- `RUN_CLI_FORK_CHECKS=0` — skip the fork flow. Recommended for very large
+  tenants where forking is undesirable.
 - `RUN_LARGE_FILE=0` — skip the 100MB API large-file upload.
 - `RUN_SEMANTIC_CHECKS=0` / `RUN_CLI_SEMANTIC_CHECKS=0` — skip semantic recall
   checks when no embedding endpoint is available.
@@ -582,25 +581,6 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 17. Delete main tenant via `drive9 delete` and verify removal (401/403/404 on `GET /v1/status`)
 18. Trap-based cleanup: attempts to delete both admin and main tenants on script failure unless `SKIP_CLEANUP=1`
 
-### `shared-smoke-test.sh` (multi-tenant / shared-schema)
-
-**Canonical** smoke for everything multi-tenant / shared-schema:
-
-- control: placement, soft-cap, delete/count, fork/sql gates, metrics  
-- multi-tenant data plane: cross-tenant isolation (same path, list/grep/find, mutations)
-
-Default **self-contained** via `scripts/run-drive9-server-local-shared.sh`.  
-Does **not** replace single-tenant `api-smoke` / `cli-smoke` / `fuse-*`.  
-Cases under `e2e/shared-smoke-test/cases/` are independent (no cross-case order).
-
-```bash
-bash e2e/shared-smoke-test.sh                      # all cases, clean env
-bash e2e/shared-smoke-test.sh multi-tenant-isolation
-bash e2e/shared-smoke-test.sh attach               # reuse existing stack
-```
-
-See `e2e/shared-smoke-test/README.md`.
-
 ## Environment variables
 
 | Variable | Default | Used by |
@@ -621,7 +601,7 @@ See `e2e/shared-smoke-test/README.md`.
 | `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` (defaults to `0` when `DRIVE9_API_KEY` is set) | `api-smoke-test.sh` |
 | `UPLOAD_LIMIT_BYTES` | `10737418240` | `api-smoke-test.sh` |
 | `RUN_SEMANTIC_CHECKS` | `1` | `api-smoke-test.sh` |
-| `RUN_SQL_CHECKS` | `1` | `api-smoke-test.sh` (set `0` for shared-schema; `POST /v1/sql` is unsupported there) |
+| `RUN_SQL_CHECKS` | `1` | `api-smoke-test.sh` |
 | `SEMANTIC_TIMEOUT_S` | `90` | `api-smoke-test.sh` |
 | `SEMANTIC_INTERVAL_S` | `3` | `api-smoke-test.sh` |
 | `CLI_LARGE_FILE_MB` | `100` | `cli-smoke-test.sh` |

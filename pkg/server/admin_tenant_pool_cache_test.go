@@ -63,13 +63,6 @@ func TestResolveTiDBCloudIdentityRejectsInsufficientRole(t *testing.T) {
 	}
 }
 
-func TestAdminTenantAPIEnabledForSharedProvider(t *testing.T) {
-	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNativeShared)
-	if !rt.server.adminTenantAPIEnabled() {
-		t.Fatal("admin tenant API must be enabled for tidb_cloud_native_shared")
-	}
-}
-
 func TestAdminTenantHTTPRejectsInsufficientIAMRoleWithoutLeakingDetails(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.prov.iamErr = fmt.Errorf("%w: org:viewer SENSITIVE_IAM_DETAIL", tenant.ErrTiDBCloudRoleInsufficient)

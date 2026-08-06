@@ -21,21 +21,6 @@ const (
 	defaultUserSchemaConnMaxIdleTime = 20 * time.Second
 	defaultUserSchemaMaxOpenConns    = 8
 	defaultUserSchemaMaxIdleConns    = 2
-	// Shared data-plane handles serve many tenants through one *sql.DB, so they
-	// get meta-like lifetimes and a much larger connection budget than
-	// per-tenant user pools.
-	defaultSharedConnMaxLifetime = 30 * time.Minute
-	defaultSharedConnMaxIdleTime = 5 * time.Minute
-	defaultSharedMaxOpenConns    = 300
-	defaultSharedMaxIdleConns    = 50
-	// Shared-schema handles live only for one schema ensure, so they get short
-	// lifetimes. The open budget covers the DDL fan-out (table groups) and the
-	// contract diff workers plus the connection that holds the advisory lock.
-	defaultSharedSchemaConnMaxLifetime = 3 * time.Minute
-	defaultSharedSchemaConnMaxIdleTime = 20 * time.Second
-	defaultSharedSchemaMaxOpenConns    = 12
-	defaultSharedSchemaMaxIdleConns    = 4
-	sharedSchemaMinOpenConns           = 2 // one pinned advisory-lock connection plus schema work
 )
 
 // ApplyPoolDefaults rotates and prunes idle connections before common LB/NAT
@@ -47,21 +32,14 @@ const (
 //   - DRIVE9_META_DB_CONN_MAX_LIFETIME / DRIVE9_META_DB_CONN_MAX_IDLE_TIME
 //   - DRIVE9_USER_DB_MAX_OPEN_CONNS / DRIVE9_USER_DB_MAX_IDLE_CONNS
 //   - DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS / DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS
-//   - DRIVE9_SHARED_DB_MAX_OPEN_CONNS / DRIVE9_SHARED_DB_MAX_IDLE_CONNS
-//   - DRIVE9_SHARED_DB_CONN_MAX_LIFETIME / DRIVE9_SHARED_DB_CONN_MAX_IDLE_TIME
-//   - DRIVE9_SHARED_SCHEMA_DB_MAX_OPEN_CONNS / DRIVE9_SHARED_SCHEMA_DB_MAX_IDLE_CONNS
 //
-// The limits apply to each *sql.DB pool. In a multi-pod deployment, size them
-// against TiDB max_connections and the expected number of active shared pools.
+// The limits apply to each *sql.DB pool.
 func ApplyPoolDefaults(db *sql.DB, role string) {
 	lifetime, idleTime := poolLifetime(role)
 	db.SetConnMaxLifetime(lifetime)
 	db.SetConnMaxIdleTime(idleTime)
 	maxOpen, maxIdle := defaultPoolLimits(role)
 	if v := poolEnvInt(role, "MAX_OPEN_CONNS", maxOpen); v > 0 {
-		if role == RoleSharedSchema && v < sharedSchemaMinOpenConns {
-			v = sharedSchemaMinOpenConns
-		}
 		db.SetMaxOpenConns(v)
 	}
 	if v := poolEnvInt(role, "MAX_IDLE_CONNS", maxIdle); v >= 0 {
@@ -71,7 +49,7 @@ func ApplyPoolDefaults(db *sql.DB, role string) {
 
 func poolLifetime(role string) (time.Duration, time.Duration) {
 	lifetime, idleTime := defaultPoolLifetime(role)
-	if role != RoleMeta && role != RoleShared {
+	if role != RoleMeta {
 		return lifetime, idleTime
 	}
 	return poolEnvDuration(role, "CONN_MAX_LIFETIME", lifetime, false),
@@ -84,10 +62,6 @@ func defaultPoolLifetime(role string) (time.Duration, time.Duration) {
 		return defaultUserConnMaxLifetime, defaultUserConnMaxIdleTime
 	case RoleUserSchema:
 		return defaultUserSchemaConnMaxLifetime, defaultUserSchemaConnMaxIdleTime
-	case RoleShared:
-		return defaultSharedConnMaxLifetime, defaultSharedConnMaxIdleTime
-	case RoleSharedSchema:
-		return defaultSharedSchemaConnMaxLifetime, defaultSharedSchemaConnMaxIdleTime
 	default:
 		return defaultMetaConnMaxLifetime, defaultMetaConnMaxIdleTime
 	}
@@ -101,10 +75,6 @@ func defaultPoolLimits(role string) (int, int) {
 		return defaultUserMaxOpenConns, defaultUserMaxIdleConns
 	case RoleUserSchema:
 		return defaultUserSchemaMaxOpenConns, defaultUserSchemaMaxIdleConns
-	case RoleShared:
-		return defaultSharedMaxOpenConns, defaultSharedMaxIdleConns
-	case RoleSharedSchema:
-		return defaultSharedSchemaMaxOpenConns, defaultSharedSchemaMaxIdleConns
 	default:
 		return 0, 0
 	}
@@ -143,10 +113,6 @@ func rolePoolEnvKey(role, suffix string) string {
 		return "DRIVE9_USER_DB_" + suffix
 	case RoleUserSchema:
 		return "DRIVE9_USER_SCHEMA_DB_" + suffix
-	case RoleShared:
-		return "DRIVE9_SHARED_DB_" + suffix
-	case RoleSharedSchema:
-		return "DRIVE9_SHARED_SCHEMA_DB_" + suffix
 	default:
 		return ""
 	}

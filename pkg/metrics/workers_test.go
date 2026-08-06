@@ -19,10 +19,6 @@ func TestCriticalWorkerMetricsUseBoundedLabels(t *testing.T) {
 	RecordNotifyCoalescerPerRowFallback("error")
 	RecordTenantOutboxPoll("ok", 50*time.Millisecond, 1000, 12*time.Second, true)
 	RecordTenantOutboxCursorFlush("error")
-	RecordSharedDBPoolStatusAge("org-workers", "pool-workers", "pending", 15*time.Minute)
-	RecordSharedDBPoolStuckMarkedFailed("pending")
-	RecordSharedDBPoolWave("ok", 2, 40)
-	RecordSharedDBPoolCleanup("deprovision", "error")
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
@@ -44,12 +40,6 @@ func TestCriticalWorkerMetricsUseBoundedLabels(t *testing.T) {
 		`drive9_tenant_outbox_backlog_oldest_age_seconds 12.000000`,
 		`drive9_tenant_outbox_full_batches_total 1`,
 		`drive9_tenant_outbox_cursor_flush_total{result="error"} 1`,
-		`drive9_shared_db_pool_status_age_seconds{db_pool_uuid="pool-workers",status="pending",tidbcloud_org_id="org-workers"} 900.000000`,
-		`drive9_shared_db_pool_stuck_marked_failed_total{previous_status="pending"} 1`,
-		`drive9_shared_db_pool_wave_total{result="ok"} 1`,
-		`drive9_shared_db_pool_wave_physical_pools_count 1`,
-		`drive9_shared_db_pool_wave_tenants_count 1`,
-		`drive9_shared_db_pool_cleanup_total{result="error",stage="deprovision"} 1`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("missing worker metric %q:\n%s", want, text)
@@ -60,11 +50,7 @@ func TestCriticalWorkerMetricsUseBoundedLabels(t *testing.T) {
 			if !strings.HasPrefix(line, "drive9_mutation_dispatcher_") &&
 				!strings.HasPrefix(line, "drive9_api_key_resolve_cache_") &&
 				!strings.HasPrefix(line, "drive9_notify_coalescer_") &&
-				!strings.HasPrefix(line, "drive9_tenant_outbox_") &&
-				!strings.HasPrefix(line, "drive9_shared_db_pool_status_age_seconds") &&
-				!strings.HasPrefix(line, "drive9_shared_db_pool_stuck_marked_failed_total") &&
-				!strings.HasPrefix(line, "drive9_shared_db_pool_wave_") &&
-				!strings.HasPrefix(line, "drive9_shared_db_pool_cleanup_total") {
+				!strings.HasPrefix(line, "drive9_tenant_outbox_") {
 				continue
 			}
 			if strings.Contains(line, forbidden) {

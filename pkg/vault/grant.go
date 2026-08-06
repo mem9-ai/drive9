@@ -111,7 +111,7 @@ func (s *Store) IssueGrant(
 //  6. DB revocation (scoped to tenant for isolation)
 //
 // Per pr-a-jwt-implementation.md §4 step 6: the DB query MUST filter on the
-// tenant discriminator (tenant_id in standalone shape, fs_id in shared shape)
+// tenant discriminator
 // to prevent cross-tenant token reuse.
 //
 // The iss claim is additionally checked against expectedIssuer; a mismatch

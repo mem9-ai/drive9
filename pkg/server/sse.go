@@ -48,20 +48,6 @@ const (
 	// tenant DB cannot leak the goroutine.
 	fsEventsLazySweepTimeout = 5 * time.Minute
 
-	// sharedFSEventsSweepInterval throttles the shared-pool fs_events sweep
-	// (one physical table for all tenants in shared-schema deployments).
-	// Applied twice: as a cheap per-pod pre-filter (Server.lastSharedSweepUnix)
-	// and as the authoritative cluster-wide meta-DB claim interval, so N pods
-	// do not sweep the same table on N independent clocks.
-	sharedFSEventsSweepInterval = 30 * time.Minute
-	// sharedFSEventsSweepClaimName is the shared_maintenance_state row key
-	// for the pool sweep's cluster-wide claim.
-	sharedFSEventsSweepClaimName = "fs_events_sweep"
-	// sharedPoolMetricTenantID is the fixed tenant_id label for pool-wide
-	// sweep metrics: the operation cleans every tenant's rows, so attributing
-	// it to the triggering tenant would be misleading.
-	sharedPoolMetricTenantID = "shared_pool"
-
 	// sseEventsRoute is the SSE change-notification stream endpoint. It is the
 	// only SSE route today; observe uses this constant (plus the
 	// sseStreamEstablished context flag) to distinguish real SSE connection
@@ -378,15 +364,7 @@ func (s *Server) sweepGoroutine(fn func(ctx context.Context)) {
 // consumer whose cursor is older than the retention simply gets a longer
 // replay), so leftover rows and failures are fine: failures are metrics + warn
 // logs only, and rows beyond the batch cap drain on the next sweep.
-//
-// In shared-schema deployments the fs_id-scoped sweep is skipped entirely: one
-// physical table holds every tenant's rows, so per-tenant sweeps would miss
-// dead tenants and duplicate each other — the pool-wide sweep runs instead.
 func (s *Server) maybeSweepFSEvents(bus *EventBus, store *datastore.Store) {
-	if store.Scope().Shared() {
-		s.maybeSweepSharedFSEvents(store, bus.TiDBCloudOrgID())
-		return
-	}
 	now := time.Now().Unix()
 	last := bus.lastSweepUnix.Load()
 	if now-last < int64(fsEventsSweepInterval/time.Second) {
@@ -418,95 +396,6 @@ func (s *Server) maybeSweepFSEvents(bus *EventBus, store *datastore.Store) {
 			// write-path sweep or tenant-worker maintenance cycle.
 			logger.Info(sweepCtx, "fs_events_lazy_sweep_has_more",
 				zap.String("tenant_id", bus.tenantID),
-				zap.Int64("deleted", deleted))
-		}
-	})
-}
-
-// maybeSweepSharedFSEvents runs the shared-pool fs_events retention sweep:
-// one batched DELETE across ALL tenants' expired rows in the shared physical
-// table (no fs_id predicate), because dead/idle tenants' rows are unreachable
-// by any per-tenant sweep. It is the single entry point shared by the write
-// path (maybeSweepFSEvents) and the tenant worker's piggyback maintenance
-// (via TenantWorkerOptions.SweepSharedFSEvents), so both ride ONE throttle
-// PER PHYSICAL POOL (db_pool.db_id from the store's scope; multiple shared
-// pools sweep independently so a hot pool cannot starve a cold one): a cheap
-// per-pod pre-filter (sharedSweepLast), then the authoritative cluster-wide
-// meta-DB claim (ClaimSharedMaintenanceRun with a per-pool claim name; a
-// zero/unknown dbID falls back to the plain name, preserving single-pool
-// behavior). The sweep itself runs on a detached goroutine tied to the
-// server lifecycle (sweepGoroutine), so it never occupies the caller.
-// Metrics use the fixed "shared_pool[:<dbID>]" tenant label — the operation
-// cleans every tenant's rows.
-func (s *Server) maybeSweepSharedFSEvents(store *datastore.Store, tidbCloudOrgID string) {
-	dbID := store.Scope().DBID()
-	claimName := sharedFSEventsSweepClaimName
-	metricTenant := sharedPoolMetricTenantID
-	if dbID > 0 {
-		claimName = fmt.Sprintf("%s:%d", sharedFSEventsSweepClaimName, dbID)
-		metricTenant = fmt.Sprintf("%s:%d", sharedPoolMetricTenantID, dbID)
-	}
-	now := time.Now().Unix()
-	var prev int64 // this pool's previous trigger time; restored on claim error
-	for {
-		// LoadOrStore because sync.Map.CompareAndSwap fails on a missing key:
-		// the first trigger for a pool stores `now` atomically and proceeds.
-		lastRaw, loaded := s.sharedSweepLast.LoadOrStore(dbID, now)
-		if !loaded {
-			break
-		}
-		prev, _ = lastRaw.(int64)
-		if now-prev < int64(sharedFSEventsSweepInterval/time.Second) {
-			return
-		}
-		if s.sharedSweepLast.CompareAndSwap(dbID, prev, now) {
-			break
-		}
-		// Raced another trigger: re-read and retry.
-	}
-	retention := s.fsEventsRetention
-	if retention <= 0 {
-		// Hand-constructed servers (tests) may skip NewWithConfig defaults.
-		retention = defaultFSEventsRetention
-	}
-	s.sweepGoroutine(func(ctx context.Context) {
-		// Cluster-wide claim: exactly one pod sweeps the pool per interval.
-		// Without a meta store there is no shared pool to protect (single-
-		// tenant mode never has shared-shape stores), so skip the claim.
-		if s.meta != nil {
-			claimed, err := s.meta.ClaimSharedMaintenanceRun(ctx, claimName, sharedFSEventsSweepInterval)
-			if err != nil {
-				// Meta-DB blip: restore this pool's per-pod pre-filter so
-				// the NEXT trigger retries instead of waiting out the full
-				// interval. (A lost claim keeps the pre-filter set — another
-				// pod sweeping is the intended backoff; a lost race on this
-				// restore is harmless.)
-				s.sharedSweepLast.CompareAndSwap(dbID, now, prev)
-				logger.Warn(ctx, "shared_fs_events_sweep_claim_failed",
-					zap.Int64("db_id", dbID), zap.Error(err))
-				metrics.RecordTenantOperationWithOrg(metricTenant, tidbCloudOrgID, "event_bus", "retention_sweep_shared", metrics.ResultForError(err), 0)
-				return
-			}
-			if !claimed {
-				return
-			}
-		}
-		deleted, hasMore, err := store.DeleteSharedFSEventsBefore(ctx, time.Now().Add(-retention), fsEventsSweepBatchSize, fsEventsSweepMaxBatches)
-		if err != nil {
-			if ctx.Err() == nil {
-				logger.Warn(ctx, "shared_fs_events_sweep_failed",
-					zap.Int64("db_id", dbID), zap.Error(err))
-			}
-			metrics.RecordTenantOperationWithOrg(metricTenant, tidbCloudOrgID, "event_bus", "retention_sweep_shared", metrics.ResultForError(err), 0)
-			return
-		}
-		metrics.RecordTenantOperationWithOrg(metricTenant, tidbCloudOrgID, "event_bus", "retention_sweep_shared", "ok", 0)
-		metrics.RecordFSEventsPruned(deleted)
-		if hasMore {
-			// Batch cap hit with leftover rows: they drain on the next
-			// throttled pass.
-			logger.Info(ctx, "shared_fs_events_sweep_has_more",
-				zap.Int64("db_id", dbID),
 				zap.Int64("deleted", deleted))
 		}
 	})

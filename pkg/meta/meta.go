@@ -29,8 +29,6 @@ var (
 	ErrQuotaReservationBusy            = errors.New("quota reservation busy")
 	ErrTiDBCloudFreeQuotaBusy          = errors.New("free tenant quota check is busy; retry later")
 	ErrTiDBCloudFreeTenantLimitReached = errors.New("free TiDB Cloud tenant limit reached")
-	ErrSharedDBPoolIdentityConflict    = errors.New("shared db pool physical identity changed after provisioning started")
-	ErrSharedDBPoolNotProvisioning     = errors.New("shared db pool is not provisioning")
 )
 
 type TenantStatus string
@@ -67,7 +65,6 @@ var allTenantStatuses = []TenantStatus{
 }
 
 const tidbCloudNativeProvider = "tidb_cloud_native"
-const tidbCloudNativeSharedProvider = "tidb_cloud_native_shared"
 const maxTiDBCloudOrgBindingDuplicateTuples = 20
 
 type TenantKind string
@@ -401,13 +398,7 @@ func (s *Store) migrate() (err error) {
 	if err != nil {
 		return fmt.Errorf("parse meta schema statements: %w", err)
 	}
-	if err := migrateLegacyDBPoolClusterIDIndex(ctx, s.db); err != nil {
-		return err
-	}
 	if err := dropObsoleteMetaIndexes(ctx, s.db); err != nil {
-		return err
-	}
-	if err := ensureDBPoolUUID(ctx, s.db); err != nil {
 		return err
 	}
 	diffs, err := diffMetaSchema(ctx, s.db, spec)
@@ -415,9 +406,6 @@ func (s *Store) migrate() (err error) {
 		return fmt.Errorf("diff meta schema: %w", err)
 	}
 	if err := applyMetaSchemaRepairs(ctx, s.db, plannedMetaSchemaRepairs(diffs)); err != nil {
-		return err
-	}
-	if err := expandManagedDBPoolSchema(ctx, s.db); err != nil {
 		return err
 	}
 	if err := backfillTiDBCloudOrgBindingBranchIDs(ctx, s.db); err != nil {
@@ -435,207 +423,6 @@ func (s *Store) migrate() (err error) {
 	}
 	if len(diffs) > 0 {
 		return &metaSchemaDiffError{diffs: diffs}
-	}
-	return nil
-}
-
-func expandManagedDBPoolSchema(ctx context.Context, db *sql.DB) error {
-	nullableColumns := []struct {
-		name       string
-		definition string
-	}{
-		{name: "org_id", definition: "VARCHAR(64) NULL"},
-		{name: "db_host", definition: "VARCHAR(255) NULL"},
-		{name: "db_port", definition: "INT NULL"},
-		{name: "db_user", definition: "VARCHAR(255) NULL"},
-		{name: "db_password", definition: "VARBINARY(2048) NULL"},
-		{name: "db_name", definition: "VARCHAR(255) NULL"},
-	}
-	for _, column := range nullableColumns {
-		var nullable string
-		if err := db.QueryRowContext(ctx, `SELECT is_nullable
-			FROM information_schema.columns
-			WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = ?`, column.name).Scan(&nullable); err != nil {
-			return fmt.Errorf("inspect db_pool.%s nullability: %w", column.name, err)
-		}
-		if nullable == "YES" {
-			continue
-		}
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE db_pool MODIFY COLUMN %s %s", column.name, column.definition)); err != nil {
-			return fmt.Errorf("make db_pool.%s nullable: %w", column.name, err)
-		}
-	}
-
-	var softCapColumnExists int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
-		FROM information_schema.columns
-		WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = 'soft_cap_reached'`).Scan(&softCapColumnExists); err != nil {
-		return fmt.Errorf("inspect db_pool.soft_cap_reached: %w", err)
-	}
-	if softCapColumnExists == 0 {
-		if _, err := db.ExecContext(ctx, `ALTER TABLE db_pool ADD COLUMN soft_cap_reached TINYINT(1) NOT NULL DEFAULT 0 AFTER tenant_count`); err != nil {
-			return fmt.Errorf("add db_pool.soft_cap_reached: %w", err)
-		}
-	}
-	var statusUpdatedAtColumnExists int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
-		FROM information_schema.columns
-		WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = 'status_updated_at'`).Scan(&statusUpdatedAtColumnExists); err != nil {
-		return fmt.Errorf("inspect db_pool.status_updated_at: %w", err)
-	}
-	if statusUpdatedAtColumnExists == 0 {
-		if _, err := db.ExecContext(ctx, `ALTER TABLE db_pool ADD COLUMN status_updated_at DATETIME(3) NULL AFTER status`); err != nil {
-			return fmt.Errorf("add db_pool.status_updated_at: %w", err)
-		}
-		if _, err := db.ExecContext(ctx, `UPDATE db_pool SET status_updated_at = updated_at WHERE status_updated_at IS NULL`); err != nil {
-			return fmt.Errorf("backfill db_pool.status_updated_at: %w", err)
-		}
-		if _, err := db.ExecContext(ctx, `ALTER TABLE db_pool MODIFY COLUMN status_updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)`); err != nil {
-			return fmt.Errorf("make db_pool.status_updated_at non-null: %w", err)
-		}
-	}
-	// Only ever open the latch during migration. Do not clear a latched pool
-	// below the soft cap here; deletion owns the hysteresis transition.
-	if _, err := db.ExecContext(ctx, `UPDATE db_pool
-		SET soft_cap_reached = 1
-		WHERE max_tenants > 0 AND tenant_count >= max_tenants AND soft_cap_reached = 0`); err != nil {
-		return fmt.Errorf("backfill db_pool.soft_cap_reached: %w", err)
-	}
-	return ensureDBPoolClusterIDUniqueIndex(ctx, db)
-}
-
-func ensureDBPoolClusterIDUniqueIndex(ctx context.Context, db *sql.DB) error {
-	exists, err := metaIndexExists(ctx, db, "db_pool", "uk_db_pool_cluster_id")
-	if err != nil {
-		return fmt.Errorf("check db_pool cluster id unique index: %w", err)
-	}
-	if !exists {
-		var duplicateCount int
-		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM (
-			SELECT cluster_id
-			FROM db_pool
-			WHERE cluster_id IS NOT NULL
-			GROUP BY cluster_id
-			HAVING COUNT(*) > 1
-		) duplicates`).Scan(&duplicateCount); err != nil {
-			return fmt.Errorf("preflight db_pool cluster id unique index: %w", err)
-		}
-		if duplicateCount > 0 {
-			return fmt.Errorf("preflight db_pool cluster id unique index: found %d duplicate cluster ids", duplicateCount)
-		}
-		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX uk_db_pool_cluster_id ON db_pool(cluster_id)`); err != nil && !isIgnorableMetaSchemaError(err) {
-			return fmt.Errorf("create db_pool cluster id unique index: %w", err)
-		}
-	}
-	return nil
-}
-
-func migrateLegacyDBPoolClusterIDIndex(ctx context.Context, db *sql.DB) error {
-	exists, err := metaIndexExists(ctx, db, "db_pool", "uk_db_pool_cloud_resource")
-	if err != nil {
-		return fmt.Errorf("check legacy db_pool cluster id unique index: %w", err)
-	}
-	if !exists {
-		return nil
-	}
-	if err := ensureDBPoolClusterIDUniqueIndex(ctx, db); err != nil {
-		return err
-	}
-	if err := dropMetaIndexIfExists(ctx, db, "db_pool", "uk_db_pool_cloud_resource"); err != nil {
-		return fmt.Errorf("drop legacy db_pool cluster id unique index: %w", err)
-	}
-	return nil
-}
-
-func ensureDBPoolUUID(ctx context.Context, db *sql.DB) error {
-	var tableExists int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
-		FROM information_schema.tables
-		WHERE table_schema = DATABASE() AND table_name = 'db_pool'`).Scan(&tableExists); err != nil {
-		return fmt.Errorf("inspect db_pool table for uuid migration: %w", err)
-	}
-	if tableExists == 0 {
-		return nil
-	}
-
-	var columnExists int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
-		FROM information_schema.columns
-		WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = 'uuid'`).Scan(&columnExists); err != nil {
-		return fmt.Errorf("inspect db_pool.uuid: %w", err)
-	}
-	if columnExists == 0 {
-		if _, err := db.ExecContext(ctx, `ALTER TABLE db_pool ADD COLUMN uuid CHAR(36) NULL AFTER db_id`); err != nil {
-			return fmt.Errorf("add db_pool.uuid: %w", err)
-		}
-	}
-
-	type dbPoolUUIDRow struct {
-		id   int64
-		uuid sql.NullString
-	}
-	rows, err := db.QueryContext(ctx, `SELECT db_id, uuid FROM db_pool ORDER BY db_id`)
-	if err != nil {
-		return fmt.Errorf("list db_pool rows for uuid migration: %w", err)
-	}
-	var existing []dbPoolUUIDRow
-	for rows.Next() {
-		var row dbPoolUUIDRow
-		if err := rows.Scan(&row.id, &row.uuid); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("scan db_pool uuid migration row: %w", err)
-		}
-		existing = append(existing, row)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return fmt.Errorf("iterate db_pool uuid migration rows: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close db_pool uuid migration rows: %w", err)
-	}
-	for _, row := range existing {
-		raw := strings.TrimSpace(row.uuid.String)
-		if raw != "" {
-			value, valueErr := sharedDBUUID(raw)
-			if valueErr != nil {
-				return fmt.Errorf("db_pool %d uuid migration: %w", row.id, valueErr)
-			}
-			if value != raw {
-				if _, err := db.ExecContext(ctx, `UPDATE db_pool SET uuid = ? WHERE db_id = ?`, value, row.id); err != nil {
-					return fmt.Errorf("canonicalize db_pool %d uuid: %w", row.id, err)
-				}
-			}
-			continue
-		}
-		value, valueErr := sharedDBUUID("")
-		if valueErr != nil {
-			return fmt.Errorf("db_pool %d uuid migration: %w", row.id, valueErr)
-		}
-		if _, err := db.ExecContext(ctx, `UPDATE db_pool SET uuid = ?
-			WHERE db_id = ? AND (uuid IS NULL OR uuid = '')`, value, row.id); err != nil {
-			return fmt.Errorf("backfill db_pool %d uuid: %w", row.id, err)
-		}
-	}
-	var isNullable string
-	if err := db.QueryRowContext(ctx, `SELECT is_nullable
-		FROM information_schema.columns
-		WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = 'uuid'`).Scan(&isNullable); err != nil {
-		return fmt.Errorf("inspect db_pool.uuid nullability: %w", err)
-	}
-	if isNullable != "NO" {
-		if _, err := db.ExecContext(ctx, `ALTER TABLE db_pool MODIFY COLUMN uuid CHAR(36) NOT NULL`); err != nil {
-			return fmt.Errorf("make db_pool.uuid non-null: %w", err)
-		}
-	}
-	exists, err := metaIndexExists(ctx, db, "db_pool", "uk_db_pool_uuid")
-	if err != nil {
-		return fmt.Errorf("check db_pool uuid unique index: %w", err)
-	}
-	if !exists {
-		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX uk_db_pool_uuid ON db_pool(uuid)`); err != nil && !isIgnorableMetaSchemaError(err) {
-			return fmt.Errorf("create db_pool uuid unique index: %w", err)
-		}
 	}
 	return nil
 }
@@ -780,66 +567,6 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_tenant_namespace (storage_namespace_id, kind, status),
 			INDEX idx_tenant_parent (parent_tenant_id)
 		)`,
-		`CREATE TABLE IF NOT EXISTS fs_registry (
-			fs_id      BIGINT AUTO_INCREMENT PRIMARY KEY,
-			tenant_id  VARCHAR(64) NOT NULL UNIQUE,
-			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
-		)`,
-		// db_pool is the fleet-wide registry of physical databases available
-		// for tenant placement under the shared-schema layout. org_id scopes a
-		// database to one exact TiDB Cloud organization. db_password holds the same
-		// encrypted envelope as tenants.db_password. tenant_count is maintained
-		// atomically with placement writes via CompleteSharedTenantProvision and
-		// DeleteTenantPlacementAndDecrCount.
-		// The `role` column name is backtick-quoted because ROLE is a reserved
-		// word in MySQL 8.0.
-		`CREATE TABLE IF NOT EXISTS db_pool (
-			db_id        BIGINT AUTO_INCREMENT PRIMARY KEY,
-			uuid         CHAR(36) NOT NULL,
-			org_id       VARCHAR(64) NULL,
-			cluster_id   VARCHAR(255) NULL,
-			provisioning_key VARBINARY(32) NULL,
-			cloud_provider VARCHAR(32) NULL,
-			region       VARCHAR(64) NULL,
-			` + "`role`" + `       VARCHAR(20) NOT NULL,
-			db_host      VARCHAR(255) NULL,
-			db_port      INT NULL,
-			db_user      VARCHAR(255) NULL,
-			db_password  VARBINARY(2048) NULL,
-			db_name      VARCHAR(255) NULL,
-			db_tls       VARCHAR(32) NOT NULL DEFAULT '',
-			max_tenants  INT NOT NULL DEFAULT 0,
-			tenant_count INT NOT NULL DEFAULT 0,
-			soft_cap_reached TINYINT(1) NOT NULL DEFAULT 0,
-			spending_limit BIGINT NULL,
-			schema_version INT UNSIGNED NOT NULL DEFAULT 0,
-			status       VARCHAR(20) NOT NULL DEFAULT 'active',
-			status_updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-			UNIQUE INDEX uk_db_pool_uuid (uuid),
-			UNIQUE INDEX uk_db_pool_cluster_id (cluster_id),
-			INDEX idx_db_pool_allocate (org_id, status, db_id),
-			INDEX idx_db_pool_provisioning_key (provisioning_key, status, db_id),
-			INDEX idx_db_pool_role_status_id (` + "`role`" + `, status, db_id)
-		)`,
-		// tenant_placements records which physical database (db_pool row) hosts
-		// each filesystem (fs_registry row). A missing row means the tenant
-		// still lives on its legacy standalone database. epoch is reserved for
-		// optimistic concurrency during future migrations; it stays 1 unless a
-		// migration explicitly bumps it.
-		`CREATE TABLE IF NOT EXISTS tenant_placements (
-			fs_id        BIGINT PRIMARY KEY,
-			db_id        BIGINT NOT NULL,
-			placement    VARCHAR(20) NOT NULL,
-			schema_shape VARCHAR(20) NOT NULL,
-			status       VARCHAR(20) NOT NULL DEFAULT 'active',
-			target_db_id BIGINT NULL,
-			epoch        BIGINT NOT NULL DEFAULT 1,
-			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-			INDEX idx_placement_db (db_id, status)
-		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_auto_embedding_profiles (
 			tenant_id      VARCHAR(64) PRIMARY KEY,
 			embedding_mode VARCHAR(32) NULL,
@@ -954,17 +681,6 @@ func metaInitSchemaStatements() []string {
 			UNIQUE INDEX uk_tidbcloud_pool_org (organization_id),
 			INDEX idx_tidbcloud_pool_status (status, created_at),
 			INDEX idx_tidbcloud_pool_status_id (status, pool_id)
-		)`,
-		`CREATE TABLE IF NOT EXISTS tenant_pool_memberships (
-			tenant_id                    VARCHAR(64) PRIMARY KEY,
-			tidbcloud_organization_id    VARCHAR(64) NULL,
-			pool_id                      VARCHAR(64) NOT NULL,
-			pool_status                  VARCHAR(20) NOT NULL DEFAULT 'free',
-			used_at                      DATETIME(3) NULL,
-			created_at                   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			updated_at                   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-			INDEX idx_tenant_pool_claim (pool_id, pool_status, created_at, tenant_id),
-			INDEX idx_tenant_pool_org_status (tidbcloud_organization_id, pool_status, pool_id, created_at, tenant_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_api_key_fs_scopes (
 			tenant_id   VARCHAR(64) NOT NULL,
@@ -1101,15 +817,6 @@ func metaInitSchemaStatements() []string {
 			updated_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			PRIMARY KEY (pod_id)
 		)`,
-		// shared_maintenance_state holds one row per cluster-wide maintenance
-		// task (e.g. the shared-pool fs_events sweep) so all pods can throttle
-		// against each other via an atomic claim instead of each running the
-		// task on its own interval.
-		`CREATE TABLE IF NOT EXISTS shared_maintenance_state (
-			name        VARCHAR(64) NOT NULL,
-			last_run_at DATETIME(3) NOT NULL,
-			PRIMARY KEY (name)
-		)`,
 	}
 }
 
@@ -1120,9 +827,6 @@ func dropObsoleteMetaIndexes(ctx context.Context, db *sql.DB) error {
 	if err := dropMetaIndexIfColumns(ctx, db, "tenant_tidbcloud_org_bindings", "idx_tidbcloud_org_cluster",
 		[]string{"organization_id", "cluster_id", "created_at", "tenant_id"}); err != nil {
 		return fmt.Errorf("drop obsolete meta index idx_tidbcloud_org_cluster: %w", err)
-	}
-	if err := dropMetaIndexIfExists(ctx, db, "db_pool", "uk_db_pool_endpoint"); err != nil {
-		return fmt.Errorf("drop obsolete meta index uk_db_pool_endpoint: %w", err)
 	}
 	return nil
 }
@@ -1754,13 +1458,37 @@ func schemaSnippet(stmt string) string {
 	return schemaspec.SQLSnippet(stmt)
 }
 
+// withMetaLockConflictRetry runs fn with a few bounded retries on InnoDB
+// lock-conflict errors (1213/1205/40001), which are expected when concurrent
+// provision/Acquire paths write different tenant rows at the same time.
+// Mirrors the quota path's retryMetaLockConflict: context cancellation aborts
+// the backoff and each retry is logged so deadlock storms stay visible.
+func withMetaLockConflictRetry(ctx context.Context, operation string, fn func() error) error {
+	const maxAttempts = 4
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if !isMetaLockConflictError(err) {
+			return err
+		}
+		logger.Warn(ctx, "meta_lock_conflict_retry",
+			zap.String("operation", operation),
+			zap.Int("attempt", attempt+1),
+			zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(20*(1<<attempt)) * time.Millisecond):
+		}
+	}
+	return err
+}
+
 func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "insert_tenant", start, &err)
-	// Retry the whole tx on lock conflicts: concurrent cold Acquires allocate
-	// fs_ids through EnsureFsID, and the two-table write below (tenants +
-	// fs_registry) can deadlock with them on the unique index of
-	// fs_registry.tenant_id. The deadlock victim retries cleanly.
 	return withMetaLockConflictRetry(ctx, "insert_tenant", func() error {
 		return s.InTx(ctx, func(tx *sql.Tx) error {
 			return insertTenantTx(ctx, tx, t)
@@ -1785,11 +1513,7 @@ func insertTenantTx(ctx context.Context, tx *sql.Tx, t *Tenant) error {
 	if err != nil {
 		return err
 	}
-	// Every tenant gets a stable internal fs_id at creation time (see
-	// fs_registry). INSERT IGNORE keeps this idempotent for tenants that were
-	// pre-registered by BackfillFsRegistry.
-	_, err = tx.ExecContext(ctx, `INSERT IGNORE INTO fs_registry (tenant_id) VALUES (?)`, t.ID)
-	return err
+	return nil
 }
 
 func (s *Store) UpsertTenantAutoEmbeddingProfile(ctx context.Context, p *TenantAutoEmbeddingProfile) (err error) {
@@ -1966,12 +1690,9 @@ func (s *Store) UpsertTenantTiDBCloudOrgBinding(ctx context.Context, b *TenantTi
 	branchID := strings.TrimSpace(b.BranchID)
 	// tenants.branch_id is the source of truth; callers cannot override the
 	// branch dimension used for duplicate-ownership checks.
-	if tenantBranchID, tenantProvider, ok, lookupErr := s.lookupTenantBindingIdentity(ctx, tenantID); lookupErr != nil {
+	if tenantBranchID, _, ok, lookupErr := s.lookupTenantBindingIdentity(ctx, tenantID); lookupErr != nil {
 		return lookupErr
 	} else if ok {
-		if tenantProvider == tidbCloudNativeSharedProvider {
-			return fmt.Errorf("shared tenant %q cannot own a dedicated tidbcloud org binding", tenantID)
-		}
 		branchID = tenantBranchID
 	}
 	now := time.Now().UTC()
@@ -2242,54 +1963,11 @@ func (s *Store) CountTenantPoolFreeSlots(ctx context.Context, organizationID str
 	return s.countFreeTenantPoolBindingsByStatus(ctx, organizationID, []TenantStatus{TenantPending, TenantProvisioning, TenantActive})
 }
 
-// CountTenantPoolPlannedSlots counts shared free pending/provisioning inventory
-// whose durable physical attempt remains non-terminal. The stuck-pool watchdog
-// is the sole authority that expires a pending/provisioning physical attempt;
-// active physical pools are finalized by the activation reconciler. Native
-// pending tenants are intentionally excluded because leader refill has no
-// request-scoped customer credential with which to advance them.
-func (s *Store) CountTenantPoolPlannedSlots(ctx context.Context, organizationID string) (out int, err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "count_tidbcloud_pool_planned_slots", start, &err)
-	organizationID = strings.TrimSpace(organizationID)
-	if organizationID == "" {
-		return 0, fmt.Errorf("organization_id is required")
-	}
-	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(slot_count), 0) FROM (
-		SELECT COUNT(*) AS slot_count
-			FROM tenant_pool_memberships m
-			STRAIGHT_JOIN tenants t ON t.id = m.tenant_id
-			STRAIGHT_JOIN fs_registry f ON f.tenant_id = t.id
-			STRAIGHT_JOIN tenant_placements p ON p.fs_id = f.fs_id
-			STRAIGHT_JOIN db_pool d ON d.db_id = p.db_id
-			WHERE m.tidbcloud_organization_id = ? AND m.pool_status = ? AND t.provider = ?
-				AND t.status IN (?, ?) AND d.status IN (?, ?, ?)
-		UNION ALL
-		SELECT COALESCE(SUM(GREATEST(d.max_tenants - d.tenant_count, 0)), 0) AS slot_count
-			FROM db_pool d
-			WHERE d.org_id = ? AND d.`+"`role`"+` = ? AND d.provisioning_key IS NOT NULL
-				AND d.status IN (?, ?) AND d.tenant_count = 0 AND d.max_tenants > 0
-	) inventory`,
-		organizationID, TenantPoolBindingFree, tidbCloudNativeSharedProvider,
-		TenantPending, TenantProvisioning, SharedDBStatusPending, SharedDBStatusProvisioning, SharedDBStatusActive,
-		organizationID, SharedDBRoleShared, SharedDBStatusPending, SharedDBStatusProvisioning)
-	if err = row.Scan(&out); err != nil {
-		return 0, err
-	}
-	return out, nil
-}
-
 const countFreeTenantPoolBindingsSQL = `SELECT COALESCE(SUM(slot_count), 0) FROM (
 	SELECT COUNT(*) AS slot_count
 		FROM tenant_tidbcloud_org_bindings b
 		STRAIGHT_JOIN tenants t ON t.id = b.tenant_id
 		WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
-			AND t.status IN (%s)
-	UNION ALL
-	SELECT COUNT(*) AS slot_count
-		FROM tenant_pool_memberships m
-		STRAIGHT_JOIN tenants t ON t.id = m.tenant_id
-		WHERE m.tidbcloud_organization_id = ? AND m.pool_status = ? AND t.provider = ?
 			AND t.status IN (%s)
 ) inventory`
 
@@ -2304,16 +1982,12 @@ func (s *Store) countFreeTenantPoolBindingsByStatus(ctx context.Context, organiz
 		return 0, fmt.Errorf("tenant statuses are required")
 	}
 	placeholders := strings.TrimRight(strings.Repeat("?,", len(statuses)), ",")
-	args := make([]any, 0, 6+2*len(statuses))
+	args := make([]any, 0, 3+len(statuses))
 	args = append(args, organizationID, TenantPoolBindingFree, tidbCloudNativeProvider)
 	for _, status := range statuses {
 		args = append(args, status)
 	}
-	args = append(args, organizationID, TenantPoolBindingFree, tidbCloudNativeSharedProvider)
-	for _, status := range statuses {
-		args = append(args, status)
-	}
-	row := s.db.QueryRowContext(ctx, fmt.Sprintf(countFreeTenantPoolBindingsSQL, placeholders, placeholders), args...)
+	row := s.db.QueryRowContext(ctx, fmt.Sprintf(countFreeTenantPoolBindingsSQL, placeholders), args...)
 	if err = row.Scan(&out); err != nil {
 		return 0, fmt.Errorf("count free tidbcloud pool bindings for organization %s: %w", organizationID, err)
 	}
@@ -2330,22 +2004,11 @@ const countTenantPoolBindingsByStatusSQL = `WITH binding_deltas AS (
 		WHERE pool_id <> ''
 		GROUP BY organization_id, pool_id, pool_status
 	UNION ALL
-	SELECT tidbcloud_organization_id AS organization_id, pool_id, pool_status, COUNT(*) AS delta
-		FROM tenant_pool_memberships
-		WHERE pool_id <> ''
-		GROUP BY tidbcloud_organization_id, pool_id, pool_status
-	UNION ALL
 	SELECT b.organization_id, b.pool_id, b.pool_status, -COUNT(*) AS delta
 		FROM tenants t
 		STRAIGHT_JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = t.id
 		WHERE t.status = ? AND b.pool_id <> ''
 		GROUP BY b.organization_id, b.pool_id, b.pool_status
-	UNION ALL
-	SELECT m.tidbcloud_organization_id AS organization_id, m.pool_id, m.pool_status, -COUNT(*) AS delta
-		FROM tenants t
-		STRAIGHT_JOIN tenant_pool_memberships m ON m.tenant_id = t.id
-		WHERE t.status = ? AND m.pool_id <> ''
-		GROUP BY m.tidbcloud_organization_id, m.pool_id, m.pool_status
 ), binding_counts AS (
 	SELECT organization_id, pool_id, pool_status, SUM(delta) AS binding_count
 		FROM binding_deltas
@@ -2375,7 +2038,7 @@ func (s *Store) CountTenantPoolBindingsByStatus(ctx context.Context) (out []Tena
 	start := time.Now()
 	defer observeMeta(ctx, "count_tidbcloud_pool_bindings_by_status", start, &err)
 	rows, err := s.db.QueryContext(ctx, countTenantPoolBindingsByStatusSQL,
-		TenantDeleted, TenantDeleted, TenantPoolBindingFree, TenantPoolBindingUsed)
+		TenantDeleted, TenantPoolBindingFree, TenantPoolBindingUsed)
 	if err != nil {
 		return nil, fmt.Errorf("count tenant pool bindings by status query: %w", err)
 	}
@@ -2600,7 +2263,7 @@ func (s *Store) DetachUsedTenantPoolBindings(ctx context.Context, poolID string)
 }
 
 // DeleteTenantPoolAndDetachUsedMembers atomically removes logical-pool
-// ownership from used native/shared members and deletes the logical pool row.
+// ownership from used members and deletes the logical pool row.
 func (s *Store) DeleteTenantPoolAndDetachUsedMembers(ctx context.Context, poolID string) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "delete_tenant_pool_and_detach_used_members", start, &err)
@@ -2624,21 +2287,10 @@ func (s *Store) DeleteTenantPoolAndDetachUsedMembers(ctx context.Context, poolID
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM tenant_pool_memberships
-			WHERE pool_id = ? AND pool_status = ? LIMIT 1 FOR UPDATE`,
-			poolID, TenantPoolBindingFree).Scan(&freeTenantID); err == nil {
-			return fmt.Errorf("tenant pool %q still has free shared member %q", poolID, freeTenantID)
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
 		now := time.Now().UTC()
 		if _, err := tx.ExecContext(ctx, `UPDATE tenant_tidbcloud_org_bindings
 			SET pool_id = '', updated_at = ? WHERE pool_id = ? AND pool_status = ?`,
 			now, poolID, TenantPoolBindingUsed); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_pool_memberships
-			WHERE pool_id = ? AND pool_status = ?`, poolID, TenantPoolBindingUsed); err != nil {
 			return err
 		}
 		res, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_pools WHERE pool_id = ?`, poolID)
@@ -2826,9 +2478,8 @@ func (s *Store) ListTenantsByTiDBCloudOrgClusterBindings(ctx context.Context, bi
 	return scanTenantBindingRows(rows)
 }
 
-// ListTenantsByTiDBCloudOrganization lists dedicated and shared tenants owned
-// by one IAM-authenticated TiDB Cloud organization. Pagination is applied
-// after both provider sources are combined.
+// ListTenantsByTiDBCloudOrganization lists dedicated tenants owned by one
+// IAM-authenticated TiDB Cloud organization.
 func (s *Store) ListTenantsByTiDBCloudOrganization(ctx context.Context, organizationID string, offset, limit int) (out []Tenant, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_tenants_by_tidbcloud_organization", start, &err)
@@ -2842,32 +2493,18 @@ func (s *Store) ListTenantsByTiDBCloudOrganization(ctx context.Context, organiza
 	if limit <= 0 {
 		limit = 10
 	}
-	args := []any{TenantDeleted, tidbCloudNativeProvider, organizationID, TenantPoolBindingFree,
-		tidbCloudNativeSharedProvider, organizationID, TenantPoolBindingFree, limit, offset}
+	args := []any{TenantDeleted, tidbCloudNativeProvider, organizationID, TenantPoolBindingFree, limit, offset}
 	query := `SELECT
 			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
 			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at
 		FROM tenants t
-		WHERE t.status <> ? AND (
-			(t.provider = ? AND EXISTS (
-				SELECT 1 FROM tenant_tidbcloud_org_bindings b
-				WHERE b.tenant_id = t.id
-					AND b.organization_id = ?
-					AND b.pool_status <> ?
-			)) OR
-			(t.provider = ? AND EXISTS (
-				SELECT 1 FROM fs_registry f
-				JOIN tenant_placements p ON p.fs_id = f.fs_id
-				JOIN db_pool d ON d.db_id = p.db_id
-				WHERE f.tenant_id = t.id
-					AND d.org_id = ?
-					AND NOT EXISTS (
-						SELECT 1 FROM tenant_pool_memberships m
-						WHERE m.tenant_id = t.id AND m.pool_status = ?
-					)
-			))
+		WHERE t.status <> ? AND t.provider = ? AND EXISTS (
+			SELECT 1 FROM tenant_tidbcloud_org_bindings b
+			WHERE b.tenant_id = t.id
+				AND b.organization_id = ?
+				AND b.pool_status <> ?
 		)
 		ORDER BY t.created_at DESC, t.id DESC
 		LIMIT ? OFFSET ?`
@@ -3016,148 +2653,6 @@ func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(c
 	return fn(ctx)
 }
 
-// WithSharedDBAllocationLock serializes compact DB-pool selection and durable
-// pool planning for one TiDB Cloud organization or unresolved credential
-// fingerprint. Physical Cloud work uses the per-db_pool work locks below so
-// already-planned pools in one organization do not serialize each other.
-func (s *Store) WithSharedDBAllocationLock(ctx context.Context, identity string, fn func(context.Context) error) (err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "shared_db_allocation_lock", start, &err)
-	if strings.TrimSpace(identity) == "" {
-		return fmt.Errorf("shared db allocation identity is required")
-	}
-	if fn == nil {
-		return fmt.Errorf("shared db allocation lock callback is required")
-	}
-	sum := sha256.Sum256([]byte(identity))
-	lockName := "d9_dbpool:" + hex.EncodeToString(sum[:20])
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close() }()
-	var databaseName sql.NullString
-	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
-		return err
-	}
-	lockName = tenantPoolDatabaseLockName(lockName, databaseName.String)
-	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, tenantPoolLockTimeoutSeconds).Scan(&got); err != nil {
-		return err
-	}
-	if !got.Valid {
-		return fmt.Errorf("shared db allocation named lock returned NULL")
-	}
-	if got.Int64 != 1 {
-		return fmt.Errorf("timed out waiting for shared db allocation named lock")
-	}
-	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), tenantPoolReleaseLockTimeout)
-		defer cancel()
-		var released sql.NullInt64
-		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
-		if releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-			return
-		}
-		if !released.Valid || released.Int64 != 1 {
-			err = errors.Join(err, fmt.Errorf("shared db allocation named lock was not held by current connection"))
-		}
-	}()
-	return fn(ctx)
-}
-
-// WithSharedDBPoolWorkLock serializes one lifecycle attempt for a durable
-// db_pool row. Unlike WithSharedDBAllocationLock, this lock is scoped to one
-// physical pool, so unrelated pools in the same organization can enter Cloud
-// create and continuation concurrently. The session-owned advisory lock is
-// released automatically if its process or database connection disappears.
-func (s *Store) WithSharedDBPoolWorkLock(ctx context.Context, dbID int64, fn func(context.Context) error) error {
-	if fn == nil {
-		return fmt.Errorf("shared db pool work lock callback is required")
-	}
-	return s.withSharedDBPoolWorkLocks(ctx, []int64{dbID}, tenantPoolLockTimeoutSeconds, true,
-		func(lockCtx context.Context, _ []int64) error { return fn(lockCtx) })
-}
-
-// WithSharedDBPoolWorkClaims tries to own each supplied physical pool
-// without waiting. The callback receives the subset this connection owns, so
-// one busy pool never delays unrelated members of a Cloud batch. All claims
-// remain held through the callback and are released together afterward.
-func (s *Store) WithSharedDBPoolWorkClaims(ctx context.Context, dbIDs []int64, fn func(context.Context, []int64) error) error {
-	if fn == nil {
-		return fmt.Errorf("shared db pool work claims callback is required")
-	}
-	return s.withSharedDBPoolWorkLocks(ctx, dbIDs, 0, false, fn)
-}
-
-func (s *Store) withSharedDBPoolWorkLocks(ctx context.Context, dbIDs []int64, waitSeconds int, requireAll bool, fn func(context.Context, []int64) error) (err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "shared_db_pool_work_lock", start, &err)
-	if len(dbIDs) == 0 {
-		return nil
-	}
-	ids := append([]int64(nil), dbIDs...)
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	unique := ids[:0]
-	for _, dbID := range ids {
-		if dbID <= 0 {
-			return fmt.Errorf("db_id must be positive")
-		}
-		if len(unique) == 0 || unique[len(unique)-1] != dbID {
-			unique = append(unique, dbID)
-		}
-	}
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close() }()
-	var databaseName sql.NullString
-	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
-		return err
-	}
-	lockNames := make([]string, 0, len(unique))
-	ownedIDs := make([]int64, 0, len(unique))
-	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), tenantPoolReleaseLockTimeout)
-		defer cancel()
-		for i := len(lockNames) - 1; i >= 0; i-- {
-			var released sql.NullInt64
-			releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockNames[i]).Scan(&released)
-			if releaseErr != nil {
-				err = errors.Join(err, releaseErr)
-				continue
-			}
-			if !released.Valid || released.Int64 != 1 {
-				err = errors.Join(err, fmt.Errorf("shared db pool work named lock was not held by current connection"))
-			}
-		}
-	}()
-	for _, dbID := range unique {
-		lockName := tenantPoolDatabaseLockName(fmt.Sprintf("d9_dbwork:%d", dbID), databaseName.String)
-		var got sql.NullInt64
-		if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, waitSeconds).Scan(&got); err != nil {
-			return err
-		}
-		if !got.Valid {
-			return fmt.Errorf("shared db pool work named lock returned NULL")
-		}
-		if got.Int64 != 1 {
-			if requireAll {
-				return fmt.Errorf("timed out waiting for shared db pool work named lock")
-			}
-			continue
-		}
-		lockNames = append(lockNames, lockName)
-		ownedIDs = append(ownedIDs, dbID)
-	}
-	if len(ownedIDs) == 0 {
-		return nil
-	}
-	return fn(ctx, ownedIDs)
-}
-
 func externalBindingLockName(provider, subjectKey string) string {
 	sum := sha256.Sum256([]byte(provider + "\x00" + subjectKey))
 	return "d9_extbind:" + hex.EncodeToString(sum[:20])
@@ -3182,9 +2677,9 @@ func tenantPoolDatabaseLockName(baseLockName, databaseName string) string {
 	return baseLockName + ":" + hex.EncodeToString(sum[:4])
 }
 
-// apiKeyResolveDBTimeout bounds the detached context used for the shared DB
-// query inside the resolve singleflight (see ResolveByAPIKeyHash), so a slow
-// metadb cannot park flight waiters forever.
+// apiKeyResolveDBTimeout bounds the detached context used for the resolve
+// singleflight query (see ResolveByAPIKeyHash), so a slow metadb cannot park
+// flight waiters forever.
 const apiKeyResolveDBTimeout = 10 * time.Second
 
 // ResolveByAPIKeyHash resolves a tenant and its API key by jwt_hash. Results
@@ -3242,14 +2737,11 @@ func (s *Store) resolveByAPIKeyHashDB(ctx context.Context, hash string) (out *Te
 			k.id, k.tenant_id, k.key_name, k.jwt_ciphertext, k.jwt_hash, k.token_version, k.status, k.scope_kind,
 			k.issued_by_provider, k.issued_by_subject_key, k.issued_by_metadata_json, k.issued_at,
 			k.revoked_at, k.created_at, k.updated_at,
-			COALESCE(CASE WHEN t.provider = ? THEN d.org_id ELSE b.organization_id END, '')
+			COALESCE(b.organization_id, '')
 		FROM tenant_api_keys k
 		JOIN tenants t ON t.id = k.tenant_id
 		LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = t.id
-		LEFT JOIN fs_registry f ON f.tenant_id = t.id
-		LEFT JOIN tenant_placements p ON p.fs_id = f.fs_id
-		LEFT JOIN db_pool d ON d.db_id = p.db_id
-		WHERE k.jwt_hash = ?`, tidbCloudNativeSharedProvider, hash)
+		WHERE k.jwt_hash = ?`, hash)
 
 	var rec TenantWithAPIKey
 	var dbTLS int
@@ -3718,11 +3210,7 @@ func tenantStatusNeedsMetricsCleanup(status TenantStatus) bool {
 	return status == TenantDeleting || status == TenantDeleted
 }
 
-// UpdateTenantProvider rewrites a tenant's persisted provider. It exists for
-// the shared-pool placement path, where the tenant row is inserted with the
-// request provider (e.g. tidb_cloud_native) and must be re-labeled as
-// tidb_cloud_native_shared once placement on a shared-schema DB is decided,
-// so provider-driven capability checks classify the tenant correctly.
+// UpdateTenantProvider rewrites a tenant's persisted provider.
 func (s *Store) UpdateTenantProvider(ctx context.Context, id, provider string) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_provider", start, &err)
@@ -4431,11 +3919,6 @@ func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID 
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE p FROM tenant_placements p
-			JOIN fs_registry f ON f.fs_id = p.fs_id
-			WHERE f.tenant_id = ? AND p.status = ?`, tenantID, PlacementStatusDeleting); err != nil {
-			return err
-		}
 		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)
 	})
 	if err != nil {
@@ -4645,10 +4128,6 @@ func observeMeta(ctx context.Context, op string, start time.Time, errp *error) {
 			result = "not_found"
 		case errors.Is(*errp, ErrDuplicate):
 			result = "duplicate"
-		case errors.Is(*errp, ErrSharedDBCapacityExhausted):
-			// Capacity races are an expected allocator miss. The caller either
-			// selects another pool or reports the unrecovered wave failure.
-			result = "capacity_exhausted"
 		case errors.Is(*errp, sql.ErrConnDone):
 			// Connection closed during shutdown — not an unexpected failure.
 			result = "conn_closed"
@@ -4663,9 +4142,6 @@ func observeMeta(ctx context.Context, op string, start time.Time, errp *error) {
 		case "conn_closed":
 			// Connection closed during shutdown — suppress the noisy log and
 			// only record the metric below.
-		case "capacity_exhausted":
-			// Expected allocator outcome; the caller retries another candidate
-			// or reports an unrecovered wave failure.
 		case "not_found", "duplicate":
 			logger.Warn(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.String("detail", (*errp).Error()))
 		case "error":
@@ -5103,18 +4579,15 @@ func (s *Store) ListTenantNotifySince(ctx context.Context, afterID uint64, limit
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT o.id, o.tenant_id,
-		        COALESCE(CASE WHEN t.provider = ? THEN d.org_id ELSE b.organization_id END, ''),
+		        COALESCE(b.organization_id, ''),
 		        o.work_mask, o.created_at
 		 FROM tenant_notify_outbox o
 		 LEFT JOIN tenants t ON t.id = o.tenant_id
 		 LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = o.tenant_id
-		 LEFT JOIN fs_registry f ON f.tenant_id = o.tenant_id
-		 LEFT JOIN tenant_placements p ON p.fs_id = f.fs_id
-		 LEFT JOIN db_pool d ON d.db_id = p.db_id
 		 WHERE o.id > ?
 		 ORDER BY o.id
 		 LIMIT ?`,
-		tidbCloudNativeSharedProvider, afterID, limit)
+		afterID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -5249,42 +4722,6 @@ func (s *Store) DeleteTenantOutboxCursor(ctx context.Context, podID string) (err
 		 AND EXISTS (SELECT 1 FROM pod_registry WHERE pod_id = ? AND status = 'stale')`,
 		podID, podID)
 	return err
-}
-
-// ---------------------------------------------------------------------------
-// Shared maintenance state
-// ---------------------------------------------------------------------------
-
-// ClaimSharedMaintenanceRun atomically claims the right to run the named
-// cluster-wide maintenance task (e.g. the shared-pool fs_events sweep).
-// Exactly one caller across all pods wins per minInterval window: the UPDATE
-// only succeeds when the stored last_run_at is older than the interval, and
-// the winner stamps its own run in the same statement. The row is created
-// lazily via INSERT IGNORE (seeded at the epoch so the first claim always
-// wins). Callers should keep a cheap local pre-filter so the common case
-// never reaches the meta DB.
-func (s *Store) ClaimSharedMaintenanceRun(ctx context.Context, name string, minInterval time.Duration) (claimed bool, err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "claim_shared_maintenance_run", start, &err)
-	if _, err = s.db.ExecContext(ctx,
-		`INSERT IGNORE INTO shared_maintenance_state (name, last_run_at) VALUES (?, ?)`,
-		name, time.Unix(0, 0).UTC()); err != nil {
-		return false, fmt.Errorf("seed shared maintenance state %q: %w", name, err)
-	}
-	res, execErr := s.db.ExecContext(ctx,
-		`UPDATE shared_maintenance_state SET last_run_at = NOW(3)
-		 WHERE name = ? AND last_run_at < DATE_SUB(NOW(3), INTERVAL ? SECOND)`,
-		name, int64(minInterval/time.Second))
-	if execErr != nil {
-		err = fmt.Errorf("claim shared maintenance %q: %w", name, execErr)
-		return false, err
-	}
-	n, rowsErr := res.RowsAffected()
-	if rowsErr != nil {
-		err = fmt.Errorf("claim shared maintenance %q rows affected: %w", name, rowsErr)
-		return false, err
-	}
-	return n == 1, nil
 }
 
 // ListAllActivePodIDs returns the pod_id of every active pod in pod_registry,

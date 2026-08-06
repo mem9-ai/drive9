@@ -2521,8 +2521,7 @@ func TestUploadActionMetrics(t *testing.T) {
 // TestNewWithConfigFallsBackWorkerFSEventsRetention verifies the belt-and-braces
 // wiring for programmatic callers: when Config.TenantWorkers leaves
 // FSEventsRetention unset, the worker inherits the server's effective
-// fs_events retention instead of falling back to the 1h default — and the
-// shared-pool sweep entry point is wired.
+// fs_events retention instead of falling back to the 1h default.
 func TestNewWithConfigFallsBackWorkerFSEventsRetention(t *testing.T) {
 	s3Dir, err := os.MkdirTemp("", "dat9-srv-s3-*")
 	if err != nil {
@@ -2560,10 +2559,6 @@ func TestNewWithConfigFallsBackWorkerFSEventsRetention(t *testing.T) {
 	if got := s.tenantWorker.opts.FSEventsRetention; got != 2*time.Hour {
 		t.Fatalf("worker FSEventsRetention = %v, want 2h (server effective retention fallback)", got)
 	}
-	if s.tenantWorker.opts.SweepSharedFSEvents == nil {
-		t.Fatal("worker SweepSharedFSEvents not wired to the server helper")
-	}
-
 	// An explicit worker-level value wins over the server fallback.
 	s2 := NewWithConfig(Config{
 		Backend:           b,

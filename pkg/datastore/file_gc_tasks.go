@@ -144,9 +144,6 @@ func (s *Store) ClaimFileGCTask(ctx context.Context, now time.Time, leaseDuratio
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// SelCols adds the fs_id projection in shared shape to work around the
-	// TiDB FOR UPDATE SKIP LOCKED planner bug that rejects WHERE predicates
-	// over unprojected columns (see Scope.SelCols).
 	row := tx.QueryRowContext(ctx, `SELECT `+s.scope.SelCols(`task_id, file_id, storage_type, storage_ref,
 		size_bytes, content_type, status, attempt_count, max_attempts, receipt,
 		leased_at, lease_until, available_at, last_error, created_at, updated_at, completed_at`)+`
@@ -155,9 +152,7 @@ func (s *Store) ClaimFileGCTask(ctx context.Context, now time.Time, leaseDuratio
 		ORDER BY available_at, created_at, task_id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED`, s.scope.Args(FileGCTaskQueued, now)...)
-	// The claim query projects fs_id first in shared shape (workaround for
-	// the TiDB SKIP LOCKED planner bug; see Scope.SelCols); withFsID skips it.
-	task, err := scanFileGCTask(row, s.scope.Shared())
+	task, err := scanFileGCTask(row)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil, false, nil
@@ -304,15 +299,8 @@ func (s *Store) RecoverExpiredFileGCTasks(ctx context.Context, now time.Time, li
 
 	var taskIDs []string
 	for rows.Next() {
-		// Shared shape projects fs_id first (workaround for the TiDB SKIP
-		// LOCKED planner bug; see Scope.SelCols); scan and discard it.
-		var fsID int64
 		var taskID string
-		if s.scope.Shared() {
-			if err := rows.Scan(&fsID, &taskID); err != nil {
-				return 0, err
-			}
-		} else if err := rows.Scan(&taskID); err != nil {
+		if err := rows.Scan(&taskID); err != nil {
 			return 0, err
 		}
 		taskIDs = append(taskIDs, taskID)
@@ -433,18 +421,11 @@ func (s *Store) fileGCTaskLeaseError(ctx context.Context, taskID string) error {
 	return ErrFileGCTaskLeaseMismatch
 }
 
-func scanFileGCTask(s scanner, withFsID ...bool) (*FileGCTask, error) {
+func scanFileGCTask(s scanner) (*FileGCTask, error) {
 	var task FileGCTask
 	var contentType, receipt, lastError sql.NullString
 	var leasedAt, leaseUntil, completedAt sql.NullTime
-	// withFsID[0] is set by the SKIP LOCKED claim paths: in shared shape those
-	// queries project fs_id first (workaround for the TiDB SKIP LOCKED
-	// planner bug; see Scope.SelCols), so scan and discard the leading column.
 	dest := make([]any, 0, 18)
-	if len(withFsID) > 0 && withFsID[0] {
-		var fsID int64
-		dest = append(dest, &fsID)
-	}
 	dest = append(dest, &task.TaskID, &task.FileID, &task.StorageType, &task.StorageRef,
 		&task.SizeBytes, &contentType, &task.Status, &task.AttemptCount,
 		&task.MaxAttempts, &receipt, &leasedAt, &leaseUntil, &task.AvailableAt,

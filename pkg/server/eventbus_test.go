@@ -136,9 +136,9 @@ func TestEventBusEventsSinceReplays(t *testing.T) {
 	}
 }
 
-// Interior seq holes (e.g. AUTO_INCREMENT ids burned by rolled-back inserts,
-// or other tenants interleaved on a shared-schema table) must NOT trigger a
-// reset: no events of this tenant were lost, so delivery continues normally.
+// Interior seq holes (e.g. AUTO_INCREMENT ids burned by rolled-back inserts)
+// must NOT trigger a reset: no events of this tenant were lost, so delivery
+// continues normally.
 func TestEventBusEventsSinceInteriorGapDelivers(t *testing.T) {
 	store := newTestStoreForEventBus(t)
 	bus := NewEventBus("test-tenant", store)
