@@ -179,6 +179,25 @@ def test_remove_all_large_retry_after_is_clamped(client):
 
 
 @responses.activate
+def test_remove_all_overflow_retry_after_is_clamped(client):
+    url = f"{BASE_URL}/v1/fs/dir?recursive=1"
+    responses.add(
+        responses.DELETE,
+        url,
+        json={"error": "recursive delete in progress, retry to resume"},
+        status=503,
+        headers={"Retry-After": "9" * 400},
+    )
+    responses.add(responses.DELETE, url, status=200)
+
+    with mock.patch("drive9.client.time.sleep") as sleep:
+        client.remove_all("/dir")
+
+    sleep.assert_called_once_with(60.0)
+    assert len(responses.calls) == 2
+
+
+@responses.activate
 def test_remove_all_encodes_query_and_fragment_in_path(client):
     urls = [
         f"{BASE_URL}/v1/fs/dir%3Fname?recursive=1",

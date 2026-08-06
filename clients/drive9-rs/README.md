@@ -86,6 +86,10 @@ Environment variables `DRIVE9_SERVER` and `DRIVE9_API_KEY` override values from 
 | Grep | `client.grep(query, prefix, limit).await` |
 | Find | `client.find(prefix, params).await` |
 
+The client attaches `Authorization` only when the base URL is HTTPS or an
+HTTP loopback address (`127.0.0.1`, `localhost`, `::1`); credentials are
+omitted for other plain-HTTP origins.
+
 ### Streaming & multipart
 
 | Operation | Method |

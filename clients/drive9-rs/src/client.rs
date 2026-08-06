@@ -48,6 +48,24 @@ fn remove_all_retry_delay(
     }
 }
 
+/// Returns true when a bearer token may be attached to a request targeting
+/// `base_url`: HTTPS is always allowed, plain HTTP only for loopback hosts.
+fn can_send_credentials(base_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(base_url) else {
+        return false;
+    };
+    if url.scheme() == "https" {
+        return true;
+    }
+    if url.scheme() != "http" {
+        return false;
+    }
+    matches!(
+        url.host_str(),
+        Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+    )
+}
+
 fn load_config_file() -> Option<(String, Option<String>)> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -155,9 +173,11 @@ impl Client {
 
     pub(crate) fn auth_headers(&self) -> HeaderMap {
         let mut h = HeaderMap::new();
-        if let Some(ref key) = self.api_key {
-            if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", key)) {
-                h.insert("Authorization", v);
+        if can_send_credentials(&self.base_url) {
+            if let Some(ref key) = self.api_key {
+                if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", key)) {
+                    h.insert("Authorization", v);
+                }
             }
         }
         h
@@ -466,5 +486,26 @@ mod tests {
             remove_all_retry_delay(None, std::time::Duration::from_secs(4)),
             std::time::Duration::from_secs(4)
         );
+    }
+
+    #[test]
+    fn can_send_credentials_allows_https_and_loopback_http() {
+        assert!(can_send_credentials("https://api.drive9.ai"));
+        assert!(can_send_credentials("http://127.0.0.1:9009"));
+        assert!(can_send_credentials("http://localhost:9009"));
+        assert!(!can_send_credentials("http://example.com"));
+        assert!(!can_send_credentials(""));
+    }
+
+    #[test]
+    fn auth_headers_omit_bearer_on_non_loopback_http() {
+        let https = Client::new("https://api.drive9.ai", "k");
+        assert!(https.auth_headers().contains_key("Authorization"));
+
+        let loopback = Client::new("http://127.0.0.1:9009", "k");
+        assert!(loopback.auth_headers().contains_key("Authorization"));
+
+        let insecure = Client::new("http://example.com", "k");
+        assert!(!insecure.auth_headers().contains_key("Authorization"));
     }
 }

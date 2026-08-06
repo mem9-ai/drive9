@@ -44,7 +44,9 @@ def _remove_all_retry_delay(retry_after: Optional[str], backoff: float) -> float
         try:
             secs = int(retry_after.strip())
             if secs >= 0:
-                return min(float(secs), _REMOVE_ALL_MAX_RETRY_DELAY)
+                # Clamp in the integer domain first: float() can raise
+                # OverflowError for valid ints with hundreds of digits.
+                return float(min(secs, int(_REMOVE_ALL_MAX_RETRY_DELAY)))
         except ValueError:
             pass
     return backoff
