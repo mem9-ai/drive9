@@ -9,7 +9,7 @@ drive9 delivers filesystem change notifications over SSE (`GET /v1/events`). Eac
 Today `fs_events` rows are retained for **1 hour** (hard-coded `fsEventsRetention` at `pkg/server/server.go:1178`). Two new requirements motivate a redesign of the retention and durability behavior:
 
 1. **Events are pushed to external customers.** The stream is becoming a customer-facing integration channel, so the replay window must cover realistic consumer outages: **7 days** instead of 1 hour.
-2. **Tenant databases are serverless.** Periodically waking cold tenant DBs (or the shared multi-tenant DB) for polling or retention sweeps creates a per-request billing storm across thousands of mostly-idle tenants. The design must touch a tenant DB **only** when that tenant is already active.
+2. **Tenant databases are serverless.** Periodically waking cold tenant DBs for polling or retention sweeps creates a per-request billing storm across thousands of mostly-idle tenants. The design must touch a tenant DB **only** when that tenant is already active.
 
 Durability requirement: **99.99% event availability**, defined below as SLIs plus an explicit loss-budget formula — not as a bare percentage. A failed event insert must **not** fail the enclosing filesystem mutation — mutations are primary, events are derived. If a customer contract genuinely requires every single event, this design does not satisfy it; that requirement leads back to co-transactional writes or per-consumer acks, both rejected here (see "Rejected alternatives"). Align on 99.99% before implementation.
 
@@ -97,7 +97,7 @@ Who touches a tenant DB, and when:
 - In `publishEvent` (`pkg/server/sse.go:212`), after a successful insert, run the sweep throttled to at most once per hour per tenant, on a detached background context so it never adds mutation latency. Failures are metrics + warn logs only.
 - `DeleteFSEventsBefore` (`pkg/datastore/fs_events.go:134`) is currently a single unbounded `DELETE`. Change it to **batched deletes** (`DELETE ... LIMIT n` loop, e.g. 5k rows per batch) with a per-sweep batch cap; leftover rows are deleted next hour. The cost of one unbounded statement is driven by table size, not rows matched — a 7-day hot tenant can hold millions of rows, and the first sweep after a long idle over-retention period (or after a retention decrease) would otherwise hit TiDB transaction size limits on the write path's own DB.
 - **Rollback note:** raising retention (1h → 7d) needs no catch-up delete. Lowering it (7d → 1h) triggers a one-time large purge; the rollback runbook must say so and let the batched sweeper drain it over several cycles (or run the operator sweep manually).
-- Active tenants: zero extra wakeups. Tenants that go cold stop sweeping and simply over-retain their last ≤ 7 days of rows (storage ∝ past activity; correctness unaffected). See "Shared-table storage policy" for the shared-schema case.
+- Active tenants: zero extra wakeups. Tenants that go cold stop sweeping and simply over-retain their last ≤ 7 days of rows (storage ∝ past activity; correctness unaffected).
 - No TiDB `TTL`, no per-tenant partitioned tables, no cluster-level periodic sweeper over dedicated tenant DBs — all three are periodic per-tenant-DB access by another name.
 
 ### 3. Event insert retry buffer (P0)
@@ -134,13 +134,6 @@ Rename/delete/mkdir/copy currently surface only as `reset(structural_change)` (`
 
 `/v1/internal/sse-notify` was superseded by the outbox poller and retained only for sub-10 ms cross-pod latency. **Resolved (implemented): removed entirely** — handler, request type, route registration, `PodNotifySecret` config, and `DRIVE9_POD_NOTIFY_SECRET` env — after a repo-wide search confirmed no active sender ever existed.
 
-## Shared-table storage policy (adjudicating `docs/TENANT_DB_REDESIGN.md` §13.16)
-
-§13.16 plans a cluster-level batched retention sweep because idle tenants' rows grow forever. The ruling depends on deployment shape:
-
-- **Dedicated tenant DBs:** lazy write-path sweep only. Over-retention is intended behavior; cold DBs are never woken. Remedy for visible storage from abandoned tenants is a documented runbook with a manual sweep command.
-- **Shared multi-tenant DB:** all tenants share one physical `fs_events` table, so dead/idle tenants' rows are never reached by any tenant's write path — over-retention here is unbounded growth of a shared resource (exactly the §13.16 issue), and a sweep of the shared DB wakes only that one DB, not thousands of cold tenants. Therefore the shared pool gets an **automated, off-peak, rate-limited, batched sweep** (`DELETE ... WHERE created_at < cutoff LIMIT n`, not per-`fs_id`), gated to run only when the shared DB is already serving traffic — maintenance of an active shared resource, not a cold-DB wakeup. If the entire shared pool goes cold, rows rest until it warms. **Implemented:** `DeleteSharedFSEventsBefore` (pkg/datastore, refuses non-shared stores) runs from ONE server-level entry point (`Server.maybeSweepSharedFSEvents`) reached by both the write path (`publishEvent`'s lazy sweep, which skips the fs_id-scoped variant on shared stores) and the tenant worker's `piggybackMaintenance` via `TenantWorkerOptions.SweepSharedFSEvents` — both only ever fire for already-active tenants/DBs, providing the no-cold-wakeup gate. Throttling is **per physical pool** (`db_pool.db_id`, threaded into the store's scope at construction): a per-pod pre-filter map keyed by dbID plus an authoritative cluster-wide claim per pool in the meta DB (`shared_maintenance_state` name `fs_events_sweep:<dbID>`, plain `fs_events_sweep` for unknown dbID; 30 min interval), so multiple `role='shared'` pools sweep independently and a hot pool cannot starve a cold one. The sweep runs on a server-lifecycle goroutine (canceled promptly at Close, tracked by the notify WaitGroup) and is labeled `tenant_id="shared_pool[:<dbID>]"` in metrics.
-
 ## Durability SLIs (what "99.99%" means operationally)
 
 | SLI | Meaning | Target / alert |
@@ -159,7 +152,7 @@ The target is "drops ≈ 0, transient insert failures recovered by the buffer, c
 - **Central partitioned log in the meta DB.** One append-only table with daily `DROP PARTITION` retention is simpler in the abstract, but it puts the meta DB on the write path of every mutation (availability coupling: meta-DB outage kills the event stream fleet-wide), violates tenant-DB residency, and forfeits the property that event durability rides the same DB that just committed the mutation.
 - **TiDB table `TTL`.** TTL scans are server-side periodic jobs that wake every tenant DB on schedule — exactly the billing pattern we must avoid.
 - **Per-tenant partitioned tables.** `DROP PARTITION` still requires a per-tenant DDL alarm clock, plus per-tenant-day schema churn.
-- **Cluster-level periodic sweeper over dedicated tenant DBs.** Wakes cold tenants by design; superseded by lazy sweeping. (The shared-DB shape is exempt — see the storage policy section.)
+- **Cluster-level periodic sweeper over dedicated tenant DBs.** Wakes cold tenants by design; superseded by lazy sweeping.
 - **Co-transactional event insert, or fail-the-mutation on insert error.** Buys the last fraction of a percent of durability at the cost of coupling mutation availability to the event path. The retry buffer reaches the SLI targets without either.
 - **Head-of-line-ordered flush.** Pausing a tenant's event writes until a failed insert flushes restores global order but couples mutation-path latency to event-DB health. Bounded reorder plus idempotent consumers is the chosen trade.
 - **Kafka / external log infra.** Massive operational step-up for one event stream; the relational log is sufficient at filesystem event rates.
@@ -167,7 +160,7 @@ The target is "drops ≈ 0, transient insert failures recovered by the buffer, c
 ## Deployment and observability
 
 - Config: set `DRIVE9_FS_EVENTS_RETENTION=168h`. Leave `DRIVE9_SSE_NOTIFY_RETENTION` at its 1h default. Startup logs the effective retention; production checklist verifies it.
-- Pre-production checklist: run the cursor-upsert freshness test (`TestUpsertTenantOutboxCursorRefreshesUpdatedAt`, pkg/meta) and the maintenance-claim test (`TestClaimSharedMaintenanceRun`, pkg/meta) against real TiDB before enabling the freshness-bound prune floor and the cluster-wide sweep claim — the `ON DUPLICATE KEY UPDATE` assignment-order semantics and the `INTERVAL ?` placeholder they depend on are covered on MySQL 8.0 only.
+- Pre-production checklist: run the cursor-upsert freshness test (`TestUpsertTenantOutboxCursorRefreshesUpdatedAt`, pkg/meta) against real TiDB before enabling the freshness-bound prune floor — the `ON DUPLICATE KEY UPDATE` assignment-order semantics it depends on are covered on MySQL 8.0 only.
 - Rollback: 1h → 7d needs no catch-up delete; 7d → 1h triggers a one-time large purge drained by the batched sweeper over multiple cycles (or run the manual operator sweep).
 - Alerts: the SLIs above, plus per-tenant `drive9_fs_events_rows` for capacity tracking.
 - Capacity: size tenant DB storage at peak write rate × 168 h per tenant.
@@ -175,7 +168,7 @@ The target is "drops ≈ 0, transient insert failures recovered by the buffer, c
 ## Consumer contract
 
 - Persist the `seq` cursor durably; reconnect with `?since=<seq>`.
-- `seq` is a **persistence order**, not a causal or wall-clock order: retried inserts are sequenced at flush time, so consumers can observe bounded reorder around insert failures. Treat events as **idempotent hints** and re-fetch state on ambiguity; use `ts` only for loose ordering. `seq` also contains holes (table-global `AUTO_INCREMENT` under the shared schema); cursors compare only against the oldest retained seq.
+- `seq` is a **persistence order**, not a causal or wall-clock order: retried inserts are sequenced at flush time, so consumers can observe bounded reorder around insert failures. Treat events as **idempotent hints** and re-fetch state on ambiguity; use `ts` only for loose ordering. `seq` also contains holes (AUTO_INCREMENT ids burned by rolled-back inserts); cursors compare only against the oldest retained seq.
 - There are **no per-consumer acks**. Offline beyond the retention window produces `reset(seq_too_old)`; the official recovery path is a full listing followed by a fresh stream. `reset` reasons `server_restart` / `initial_sync` carry the same fallback.
 - Structural events will gain an additive `payload` field (separate design); ignore unknown fields. During its dual-emit window, structural ops appear both as detailed `file_changed` events and as `reset(structural_change)`.
 - This design does not provide a webhook/MQ push channel; customers that cannot hold a reconnecting SSE client need a separate mechanism.

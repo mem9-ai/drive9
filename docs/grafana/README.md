@@ -40,19 +40,18 @@ dashboard is organized as:
   reserve slots, reserve depletion, total storage usage, storage usage ratio,
   request rate, 5xx ratio, and compact organization-wide trends.
 - **Pool Capacity and Supply**: free tenant bindings, configured reserve target,
-  metadata resume waits, and shared physical pool counts by lifecycle status.
+  and metadata resume waits.
 - **Organization Database Resources**: organization-scoped dedicated
-  `role="user"` handles and shared `role="shared"` / `role="shared_schema"`
-  handles. Tenant DB operation latency is not shown because its histogram does
-  not carry organization labels.
+  `role="user"` handles. Tenant DB operation latency is not shown because its
+  histogram does not carry organization labels.
 - **Organization Usage and Request Experience**: organization aggregates for
   in-flight work, logical file I/O, SSE, and `fs_events` rows, plus a bounded
   top-20 tenant request view.
 - **Quota, Storage and Content**: organization totals plus bounded top-20 tenant
   comparisons for storage, media files, video files, and published limits.
 - **Failures and Recovery**: aggregate tenant-attributed failures and SSE reset
-  reasons, bounded top-20 failure/backlog views, shared-pool cache state, and
-  organization-attributed lifecycle outcomes.
+  reasons, bounded top-20 failure/backlog views, and organization-attributed
+  lifecycle outcomes.
 
 The tenant dashboard link carries the selected organization into Tenant
 Overview. Enter the exact tenant ID after opening the tenant dashboard.
@@ -87,11 +86,6 @@ Every tenant-scoped PromQL expression uses both
   connections, waits, and closes.
 - **Failures and Recovery**: tenant-attributed operation failures, quota-related
   failures, mutation replay state, and attributable lifecycle outcomes.
-
-`native_shared` tenants use an organization-scoped physical database pool and
-do not emit an exact tenant-specific DB pool. Their **Dedicated Tenant
-Database** row therefore shows no data; the physical shared-pool state remains
-in Organization Overview.
 
 ## Metric semantics used by the dashboards
 

@@ -198,20 +198,12 @@ SELECT layer_id, base_root_path, name, state, durability_mode, actor_id, durable
 }
 
 func (s *Store) ListFSLayers(ctx context.Context) ([]FSLayer, error) {
-	// A full layer list has no natural WHERE clause; in shared shape still
-	// restrict the scan to this tenant's fs_id.
 	query := `
 SELECT layer_id, base_root_path, name, state, durability_mode, actor_id, durable_seq, created_at, updated_at, sealed_at
 FROM fs_layers`
-	var args []any
-	if s.scope.Shared() {
-		query += `
-WHERE fs_id = ?`
-		args = append(args, s.scope.FsID())
-	}
 	query += `
 ORDER BY updated_at DESC, layer_id`
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("list fs layers: %w", err)
 	}
@@ -720,10 +712,6 @@ func (s *Store) listFSLayerEntriesLatest(ctx context.Context, layerID string, ma
 		where += " AND entry_seq <= ?"
 		args = append(args, *maxSeq)
 	}
-	// Both the derived latest table and the outer fs_layer_entries alias get
-	// an fs_id predicate in shared shape: the same (layer_id, path) pair can
-	// exist under another fs_id, and an unfiltered MAX(entry_seq) could then
-	// hide this tenant's newest entry.
 	query := `
 SELECT e.layer_id, e.path, e.path_hash, e.parent_path, e.parent_path_hash, e.name, e.op, e.kind, e.base_inode_id, e.base_revision,
 	e.storage_type, e.storage_ref, e.storage_ref_hash, e.storage_encryption_mode, e.storage_encryption_key_id,
@@ -894,20 +882,12 @@ ORDER BY updated_at DESC, layer_id`, s.scope.Args(name)...)
 	return s.scanFSLayersWithTags(ctx, rows, "list fs layers by name")
 }
 
-// fsLayerJoinArgs prepends the two fs_id bind arguments used when a query
-// filters both fs_layer join aliases in shared shape; standalone shape
-// leaves args unchanged.
+// fsLayerJoinArgs returns the bind arguments unchanged.
 func (s *Store) fsLayerJoinArgs(args ...any) []any {
-	if s.scope.Shared() {
-		return append([]any{s.scope.FsID(), s.scope.FsID()}, args...)
-	}
 	return args
 }
 
 func (s *Store) listFSLayersByTag(ctx context.Context, key, value string, hasValue bool) ([]FSLayer, error) {
-	// The same layer_id can exist under two fs_ids in shared shape, so both
-	// join aliases get an fs_id predicate: one-sided filtering could join a
-	// tag row to another tenant's layer row (or duplicate the result rows).
 	query := `
 SELECT l.layer_id, l.base_root_path, l.name, l.state, l.durability_mode, l.actor_id, l.durable_seq, l.created_at, l.updated_at, l.sealed_at
 FROM fs_layers l

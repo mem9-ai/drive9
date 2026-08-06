@@ -31,9 +31,7 @@ type quotaFields struct {
 	MaxStorageSize *int64 `json:"max_storage_size,omitempty"`
 	MaxFileSize    *int64 `json:"max_file_size,omitempty"`
 	MaxFileCount   *int64 `json:"max_file_count,omitempty"`
-	// TiDBCloudSpendingLimit is physical for native tenants. For shared tenants,
-	// it is virtual compatibility metadata and does not affect allocation,
-	// capacity, or the shared cluster's physical TiDB Cloud spending limit.
+	// TiDBCloudSpendingLimit is the physical TiDB Cloud spending limit.
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
 }
 
@@ -57,8 +55,7 @@ type quotaConfigResponse struct {
 	MaxStorageSize int64 `json:"max_storage_size"`
 	MaxFileSize    int64 `json:"max_file_size"`
 	MaxFileCount   int64 `json:"max_file_count"`
-	// TiDBCloudSpendingLimit is returned for API compatibility. For shared
-	// tenants, it is a virtual value and is not physically enforced.
+	// TiDBCloudSpendingLimit is the physical TiDB Cloud spending limit.
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
 }
 
@@ -98,7 +95,7 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !tenant.IsSharedSchemaProvider(t.Provider) && strings.TrimSpace(t.ClusterID) == "" {
+	if strings.TrimSpace(t.ClusterID) == "" {
 		errJSON(w, http.StatusNotFound, quotaBackendNotFoundMessage)
 		return
 	}
@@ -114,21 +111,6 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		errJSON(w, http.StatusForbidden, "API key tenant does not match requested tenant")
-		return
-	}
-	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
-		cred, err := quotaCredentials(req)
-		if err != nil {
-			errJSON(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		physical, err := s.authorizeSharedQuotaCredentials(r.Context(), t, cred, "quota_get")
-		if err != nil {
-			writeQuotaCredentialError(w, r.Context(), err, "query")
-			return
-		}
-		setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, physical.TiDBCloudOrganizationID, classifyTenantRequest(r))
-		s.writeQuotaResponse(w, r, t)
 		return
 	}
 	if t.Provider != tenant.ProviderTiDBCloudNative {
@@ -252,7 +234,7 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if t.Provider != tenant.ProviderTiDBCloudNative && t.Provider != tenant.ProviderTiDBCloudNativeShared {
+	if t.Provider != tenant.ProviderTiDBCloudNative {
 		errJSON(w, http.StatusConflict, "quota setting is only supported for tidb_cloud_native tenants")
 		return
 	}
@@ -260,84 +242,17 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusConflict, err.Error())
 		return
 	}
-	var sharedPhysical *meta.SharedDB
-	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
-		physical, err := s.authorizeSharedQuotaOrganization(r.Context(), t, access.OrganizationID)
-		if err != nil {
-			writeQuotaSetError(w, r.Context(), err, "authorize")
-			return
-		}
-		if err := s.applySharedQuotaSet(r.Context(), t, req); err != nil {
-			writeQuotaSetError(w, r.Context(), err, "update")
-			return
-		}
-		sharedPhysical = physical
-	} else {
-		if _, err := s.authorizeNativeTenantOrganization(r.Context(), t, access.OrganizationID); err != nil {
-			writeQuotaSetError(w, r.Context(), err, "authorize")
-			return
-		}
-		if err := s.applyQuotaSet(r.Context(), "quota_set", t, cred, req); err != nil {
-			writeQuotaSetError(w, r.Context(), err, "update")
-			return
-		}
+	if _, err := s.authorizeNativeTenantOrganization(r.Context(), t, access.OrganizationID); err != nil {
+		writeQuotaSetError(w, r.Context(), err, "authorize")
+		return
 	}
-	metricOrgID := ""
-	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
-		// The shared authorization path already resolved the physical pool;
-		// reuse its organization label instead of issuing another meta query.
-		metricOrgID = sharedPhysical.TiDBCloudOrganizationID
-	} else {
-		metricOrgID = s.tenantMetricTiDBCloudOrgID(r.Context(), t)
+	if err := s.applyQuotaSet(r.Context(), "quota_set", t, cred, req); err != nil {
+		writeQuotaSetError(w, r.Context(), err, "update")
+		return
 	}
+	metricOrgID := s.tenantMetricTiDBCloudOrgID(r.Context(), t)
 	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, metricOrgID, classifyTenantRequest(r))
 	s.writeQuotaResponse(w, r, t)
-}
-
-func (s *Server) authorizeSharedQuotaCredentials(ctx context.Context, t *meta.Tenant, cred tenant.CredentialProvisionRequest, metricPath string) (*meta.SharedDB, error) {
-	physical, err := s.meta.GetSharedDBForTenant(ctx, t.ID)
-	if err != nil {
-		if errors.Is(err, meta.ErrNotFound) {
-			return nil, tenant.ErrQuotaBackendNotFound
-		}
-		return nil, fmt.Errorf("get shared DB for tenant: %w", err)
-	}
-	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, metricPath)
-	if err != nil {
-		return nil, err
-	}
-	if !tiDBCloudOrganizationMatches(identity.OrganizationID, physical.TiDBCloudOrganizationID) {
-		return nil, tenant.ErrQuotaPermissionDenied
-	}
-	return physical, nil
-}
-
-func (s *Server) authorizeSharedQuotaOrganization(ctx context.Context, t *meta.Tenant, organizationID string) (*meta.SharedDB, error) {
-	physical, err := s.meta.GetSharedDBForTenant(ctx, t.ID)
-	if err != nil {
-		if errors.Is(err, meta.ErrNotFound) {
-			return nil, tenant.ErrQuotaBackendNotFound
-		}
-		return nil, fmt.Errorf("get shared DB for tenant: %w", err)
-	}
-	if !tiDBCloudOrganizationMatches(organizationID, physical.TiDBCloudOrganizationID) {
-		return nil, tenant.ErrQuotaPermissionDenied
-	}
-	return physical, nil
-}
-
-func (s *Server) applySharedQuotaSet(ctx context.Context, t *meta.Tenant, req quotaRequest) error {
-	patch, err := quotaConfigPatchFromRequest(req)
-	if err != nil {
-		return err
-	}
-	if err := s.meta.UpdateSharedTenantQuotaConfig(ctx, t.ID, patch); err != nil {
-		return err
-	}
-	if err := s.meta.EnsureQuotaUsageRow(ctx, t.ID); err != nil {
-		return fmt.Errorf("%w: quota usage initialization failed: %w", errQuotaLocalUpdateFailed, err)
-	}
-	return nil
 }
 
 func decodeQuotaRequest(w http.ResponseWriter, r *http.Request) (quotaRequest, error) {

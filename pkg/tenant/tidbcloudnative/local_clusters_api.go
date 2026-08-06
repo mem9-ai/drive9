@@ -34,7 +34,7 @@ const (
 	localUserPrefix       = "local"
 	localSessionLabelKey  = "drive9.local.session"
 
-	// Concurrent warm-pool grow + real-time shared create can race on host
+	// Concurrent warm-pool grow + real-time create can race on host
 	// ports. Serialize allocate+run and retry on bind conflicts.
 	localCreatePortAttempts = 8
 	localPickPortAttempts   = 32
@@ -43,7 +43,7 @@ const (
 
 // LocalClustersAPI simulates TiDB Cloud OpenAPI with one Docker/Podman TiDB
 // instance per cluster identity. Labels, spending limits, and org binding are
-// tracked in-process so drive9 shared-pool / warm-pool control paths run
+// tracked in-process so drive9 warm-pool control paths run
 // unchanged. Each Cloud cluster is one container (multi-pool => multi-TiDB).
 type LocalClustersAPI struct {
 	runtime   string

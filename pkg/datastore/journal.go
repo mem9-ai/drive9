@@ -561,10 +561,8 @@ func (s *Store) journalExists(ctx context.Context, tenantID, journalID string) (
 }
 
 // scanJournal scans one journals row. The leading column is the tenant
-// discriminator (tenant_id in standalone shape, fs_id in shared shape); it is
-// discarded and tenantID — the authoritative identity the caller resolved —
-// is stamped onto the result instead, so a shared-shape numeric fs_id can
-// never leak into Journal.TenantID.
+// discriminator; it is discarded and tenantID — the authoritative identity
+// the caller resolved — is stamped onto the result instead.
 func scanJournal(row interface{ Scan(dest ...any) error }, tenantID string) (*journal.Journal, string, error) {
 	var j journal.Journal
 	var title, actorType, actorID, source sql.NullString
@@ -673,8 +671,7 @@ func (s *Store) selectEntryColumnsAlias(alias string) string {
 }
 
 // scanEntryRows scans journal entry rows and stamps each entry's TenantID
-// with tenantID: in shared shape the leading column is fs_id (numeric), and
-// the app-layer tenant UUID comes from the request scope, not the row.
+// with tenantID.
 func scanEntryRows(rows *sql.Rows, tenantID string) ([]journal.Entry, error) {
 	var out []journal.Entry
 	for rows.Next() {

@@ -20,7 +20,6 @@ import (
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/migrate"
-	"github.com/mem9-ai/drive9/pkg/mysqlutil"
 	"github.com/mem9-ai/drive9/pkg/s3client"
 	"github.com/mem9-ai/drive9/pkg/semantic"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
@@ -66,12 +65,9 @@ type PoolConfig struct {
 	// IsLeader() snapshot.
 	LeaderChecker LeaderChecker
 
-	// IdleTimeout controls how long a standalone cached backend can stay in the
-	// warm cache without activity before the idle reaper evicts it. Shared
-	// tenant entries intentionally bypass this per-tenant TTL; they are reclaimed
-	// by capacity pressure or together when their physical shared DB has had no
-	// real activity for defaultSharedDBHandleIdleTTL. 0 disables standalone
-	// idle eviction; shared physical-DB group reaping remains active.
+	// IdleTimeout controls how long a cached backend can stay in the warm
+	// cache without activity before the idle reaper evicts it. 0 disables
+	// idle eviction.
 	//
 	// For standalone tenants, "activity" includes foreground requests and
 	// tenant-specific durable work. Background work refreshes this idle TTL but
@@ -84,17 +80,9 @@ type PoolConfig struct {
 	// per due attempt.
 	IdleTimeout time.Duration
 
-	// IdleReapInterval is how often the reaper scans standalone entries and
-	// activity-idle shared physical-DB groups. It defaults to
-	// defaultTenantPoolIdleReapInterval when not set.
+	// IdleReapInterval is how often the reaper scans entries for idle
+	// eviction. It defaults to defaultTenantPoolIdleReapInterval when not set.
 	IdleReapInterval time.Duration
-
-	// SharedDBForcePlaintext, when true, opens shared-schema DB handles without
-	// TLS regardless of the meta-persisted SharedDB.TLSMode. Set once at Pool
-	// construction for LocalClustersAPI (Docker/Podman TiDB has no TLS). Do not
-	// re-read process env on each open — a leaked DRIVE9_TIDBCLOUD_CLUSTERS_BACKEND
-	// must not silently strip TLS from production connections.
-	SharedDBForcePlaintext bool
 }
 
 // LeaderChecker reports whether the current process is the leader. Used by
@@ -157,24 +145,6 @@ type Pool struct {
 	reapInterval  time.Duration
 	reapStop      context.CancelFunc
 	reapWG        sync.WaitGroup
-	// sharedDBs caches one *sql.DB handle per shared-schema database (keyed by
-	// db_pool.id). All tenants placed on the same shared DB share its
-	// handle; each Acquire still gets its own Store (carrying that tenant's
-	// fs_id scope) over the shared handle.
-	sharedMu         sync.Mutex
-	sharedDBs        map[int64]*sql.DB
-	sharedDBRefs     map[int64]int
-	sharedDBLastUsed map[int64]time.Time
-	sharedDBLabels   map[int64]sharedDBMetricLabels
-	sharedDBOpenMu   map[int64]*sync.Mutex
-	sharedDBClosed   bool
-}
-
-// sharedDBMetricLabels remembers the metric identity of a cached shared DB
-// handle so ref-count gauges and series cleanup do not need a meta lookup.
-type sharedDBMetricLabels struct {
-	orgID string
-	uuid  string
 }
 
 type tenantAutoEmbeddingProfile struct {
@@ -188,17 +158,9 @@ var (
 	applyTiDBAutoEmbeddingProviderConfig    = schema.ApplyTiDBAutoEmbeddingProviderConfig
 	ensureTiDBSchemaForAutoEmbeddingProfile = schema.EnsureTiDBSchemaForAutoEmbeddingProfile
 	ensureTiDBSchemaForFTSOnlyProfile       = schema.EnsureTiDBSchemaForFTSOnlyProfile
-	ensureSharedDBSchema                    = schema.EnsureSharedSchema
-	ErrSharedDBSchemaEnsureBusy             = errors.New("shared schema ensure already running")
 	defaultTenantPoolDrainTimeout           = 30 * time.Second
 	defaultTenantPoolMaxTenants             = 1024
 	defaultTenantPoolIdleReapInterval       = 2 * time.Minute
-	defaultSharedDBHandleIdleTTL            = 10 * time.Minute
-)
-
-const (
-	sharedDBSchemaLockReleaseTimeout        = 5 * time.Second
-	sharedDBSchemaForegroundLockWaitSeconds = 1
 )
 
 func ensureTiDBSchemaForEmbeddingMode(ctx context.Context, db *sql.DB, mode string, profile schema.TiDBAutoEmbeddingProfile) error {
@@ -214,65 +176,6 @@ func ensureTiDBSchemaForEmbeddingMode(ctx context.Context, db *sql.DB, mode stri
 	default:
 		return schema.EnsureTiDBSchemaForEmbeddingModeProfile(ctx, db, tidbMode, profile)
 	}
-}
-
-// withSharedDBSchemaAdvisoryLock serializes schema ensure on the target
-// physical DB itself. It does not retain a MetaDB connection, and distinct
-// db_pool rows use distinct lock names so their DDL remains concurrent. The
-// lock is session-owned; if that target connection is lost mid-DDL, TiDB
-// releases it and a later attempt can overlap the still-finishing statement.
-func withSharedDBSchemaAdvisoryLock(
-	ctx context.Context,
-	db *sql.DB,
-	dbID int64,
-	waitForLock bool,
-	fn func(context.Context) error,
-) (err error) {
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close() }()
-	lockName := fmt.Sprintf("drive9:shared-schema:%d", dbID)
-	// MySQL honors a zero GET_LOCK timeout as non-blocking. TiDB clamps its
-	// minimum timeout to one second, so the provisioning path is fail-fast but
-	// can wait for approximately one second when the same physical DB is busy.
-	waitSeconds := 0
-	if waitForLock {
-		waitSeconds = sharedDBSchemaForegroundLockWaitSeconds
-	}
-	for {
-		var acquired sql.NullInt64
-		if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, waitSeconds).Scan(&acquired); err != nil {
-			return fmt.Errorf("acquire shared schema advisory lock for db pool %d: %w", dbID, err)
-		}
-		if !acquired.Valid {
-			return fmt.Errorf("acquire shared schema advisory lock for db pool %d returned NULL", dbID)
-		}
-		if acquired.Int64 == 1 {
-			break
-		}
-		if !waitForLock {
-			return fmt.Errorf("%w for db pool %d", ErrSharedDBSchemaEnsureBusy, dbID)
-		}
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("wait for shared schema advisory lock for db pool %d: %w", dbID, err)
-		}
-	}
-	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), sharedDBSchemaLockReleaseTimeout)
-		defer cancel()
-		var released sql.NullInt64
-		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
-		if releaseErr != nil {
-			err = errors.Join(err, fmt.Errorf("release shared schema advisory lock for db pool %d: %w", dbID, releaseErr))
-			return
-		}
-		if !released.Valid || released.Int64 != 1 {
-			err = errors.Join(err, fmt.Errorf("shared schema advisory lock for db pool %d was not held by current connection", dbID))
-		}
-	}()
-	return fn(ctx)
 }
 
 func durationMs(d time.Duration) float64 {
@@ -301,56 +204,10 @@ type entry struct {
 	s3EncryptionPolicy meta.S3EncryptionPolicy
 	backend            *backend.Dat9Backend
 	store              *datastore.Store
-	sharedDBLease      *sharedDBHandleLease
 	elem               *list.Element
 	refs               int
 	retired            bool
 	lastUsed           time.Time // refreshed by real activity through Acquire; never by AcquireCached
-	sharedDBID         int64     // db_pool.id for shared-schema tenants; zero for standalone tenants
-}
-
-// sharedDBHandleLease pins one physical shared-DB handle generation while a
-// caller constructs or uses a tenant-scoped Store. Release is generation-safe:
-// a delayed release from an invalidated handle cannot decrement refs belonging
-// to a newly opened handle with the same db_pool.id.
-type sharedDBHandleLease struct {
-	pool *Pool
-	dbID int64
-	db   *sql.DB
-	once sync.Once
-}
-
-func (l *sharedDBHandleLease) DB() *sql.DB {
-	if l == nil {
-		return nil
-	}
-	return l.db
-}
-
-func (l *sharedDBHandleLease) DBID() int64 {
-	if l == nil {
-		return 0
-	}
-	return l.dbID
-}
-
-func (l *sharedDBHandleLease) Release() {
-	if l == nil || l.pool == nil || l.dbID <= 0 || l.db == nil {
-		return
-	}
-	l.once.Do(func() {
-		l.pool.sharedMu.Lock()
-		defer l.pool.sharedMu.Unlock()
-		if current, ok := l.pool.sharedDBs[l.dbID]; !ok || current != l.db {
-			return
-		}
-		if refs := l.pool.sharedDBRefs[l.dbID]; refs > 1 {
-			l.pool.sharedDBRefs[l.dbID] = refs - 1
-		} else {
-			delete(l.pool.sharedDBRefs, l.dbID)
-		}
-		l.pool.recordSharedDBCacheTenantsLocked(l.dbID)
-	})
 }
 
 func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
@@ -366,16 +223,11 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 	metrics.RecordGauge("tenant_pool", "cached_backends", 0)
 	metrics.RecordGauge("tenant_pool", "max_backends", float64(max))
 	return &Pool{
-		cfg:              cfg,
-		enc:              enc,
-		items:            map[string]*entry{},
-		order:            list.New(),
-		maxSize:          max,
-		sharedDBs:        map[int64]*sql.DB{},
-		sharedDBRefs:     map[int64]int{},
-		sharedDBLastUsed: map[int64]time.Time{},
-		sharedDBLabels:   map[int64]sharedDBMetricLabels{},
-		sharedDBOpenMu:   map[int64]*sync.Mutex{},
+		cfg:     cfg,
+		enc:     enc,
+		items:   map[string]*entry{},
+		order:   list.New(),
+		maxSize: max,
 		// No LeaderChecker means single-pod mode: FileGC runs unconditionally.
 		fileGCEnabled: cfg.LeaderChecker == nil,
 		idleTimeout:   idleTimeout,
@@ -415,8 +267,8 @@ func (p *Pool) wireTenantWorkNotifier(b *backend.Dat9Backend, tenantID string) {
 }
 
 // Acquire returns a backend pinned for real tenant activity, including request
-// traffic and durable background work. It may cold-open the tenant, promotes
-// cache hits in the capacity LRU, and refreshes shared physical-DB activity.
+// traffic and durable background work. It may cold-open the tenant and promotes
+// cache hits in the capacity LRU.
 // The returned release callback must be called when the caller is done.
 func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backend, release func(), err error) {
 	start := time.Now()
@@ -438,7 +290,6 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		if e.s3EncryptionPolicy == s3EncryptionPolicy && (storageNamespaceID == "" || e.storageNamespaceID == storageNamespaceID) {
 			e.refs++
 			p.order.MoveToFront(e.elem)
-			p.touchSharedDBActivityLocked(e.sharedDBID, time.Now())
 			e.lastUsed = time.Now()
 			p.mu.Unlock()
 			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
@@ -460,14 +311,13 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	}
 
 	createBackendStart := time.Now()
-	b, st, tidbCloudOrgID, sharedLease, err := p.createBackend(ctx, t)
+	b, st, tidbCloudOrgID, err := p.createBackend(ctx, t)
 	if err != nil {
 		// Cold-open failure: a tenant TiDB open was attempted but failed.
 		// Record so alerts can detect a scan path that is churning cold opens.
 		metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "error", time.Since(createBackendStart))
 		return nil, nil, err
 	}
-	sharedDBID := sharedLease.DBID()
 	createBackendDurationMs := float64(time.Since(createBackendStart).Microseconds()) / 1000.0
 	// Cold-open success: a tenant TiDB was opened from scratch (cache miss).
 	// This is the canonical "a serverless TiDB was woken up" signal — the
@@ -480,12 +330,10 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		if e.s3EncryptionPolicy == s3EncryptionPolicy && (t.StorageNamespaceID == "" || e.storageNamespaceID == t.StorageNamespaceID) {
 			e.refs++
 			p.order.MoveToFront(e.elem)
-			p.touchSharedDBActivityLocked(e.sharedDBID, time.Now())
 			e.lastUsed = time.Now()
 			p.mu.Unlock()
 			b.Close()
 			_ = st.Close()
-			sharedLease.Release()
 			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
 			totalDuration := time.Since(start)
 			logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
@@ -496,10 +344,9 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			toClose = append(toClose, removed)
 		}
 	}
-	e := &entry{tenantID: t.ID, storageNamespaceID: t.StorageNamespaceID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st, sharedDBLease: sharedLease, refs: 1, lastUsed: time.Now(), sharedDBID: sharedDBID}
+	e := &entry{tenantID: t.ID, storageNamespaceID: t.StorageNamespaceID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st, refs: 1, lastUsed: time.Now()}
 	e.elem = p.order.PushFront(e)
 	p.items[t.ID] = e
-	p.touchSharedDBActivityLocked(sharedDBID, time.Now())
 	for p.order.Len() > p.maxSize {
 		oldest := p.order.Back()
 		if oldest != nil {
@@ -582,8 +429,8 @@ func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release fu
 }
 
 // acquireCached pins an existing tenant backend without cold-opening it. When
-// refreshActivity is true, the warm hit is real tenant activity: it promotes
-// the capacity LRU and refreshes tenant and physical shared-DB idle state.
+// refreshActivity is true, the warm hit is real tenant activity and promotes
+// the capacity LRU.
 // AcquireCached passes false for safety-net observation; the local S3 gateway
 // passes true after resolving the tenant from a presigned URL.
 func (p *Pool) acquireCached(t *meta.Tenant, refreshActivity bool) (b *backend.Dat9Backend, release func(), ok bool) {
@@ -622,7 +469,6 @@ func (p *Pool) acquireCached(t *meta.Tenant, refreshActivity bool) (b *backend.D
 	if refreshActivity {
 		now := time.Now()
 		p.order.MoveToFront(e.elem)
-		p.touchSharedDBActivityLocked(e.sharedDBID, now)
 		e.lastUsed = now
 	}
 	p.mu.Unlock()
@@ -751,9 +597,8 @@ func withTenantPoolDrainTimeout(ctx context.Context) (context.Context, context.C
 	return context.WithTimeout(ctx, defaultTenantPoolDrainTimeout)
 }
 
-// Start launches the reaper goroutine. IdleTimeout=0 disables standalone
-// tenant eviction, but shared physical-DB handles still need this reaper.
-// The reaper is stopped by Close.
+// Start launches the reaper goroutine. IdleTimeout=0 disables tenant
+// eviction. The reaper is stopped by Close.
 func (p *Pool) Start(ctx context.Context) {
 	if p == nil || p.reapInterval <= 0 {
 		return
@@ -792,13 +637,6 @@ func (p *Pool) reapOnce(ctx context.Context) {
 			if e.retired || e.refs > 0 {
 				continue
 			}
-			// Shared tenant backends are lightweight fs_id-scoped views over a
-			// separately managed physical DB handle. Keep them warm until the
-			// capacity LRU evicts them; applying the standalone idle TTL here turns
-			// stable high-cardinality shared traffic into continuous cold opens.
-			if e.sharedDBID > 0 {
-				continue
-			}
 			if now.Sub(e.lastUsed) > p.idleTimeout {
 				if removed := p.removeLocked(e.elem, "idle"); removed != nil {
 					toClose = append(toClose, removed)
@@ -811,8 +649,6 @@ func (p *Pool) reapOnce(ctx context.Context) {
 	for _, retired := range toClose {
 		p.closeEntry(retired)
 	}
-	p.reapExpiredSharedDBTenantEntries(now)
-	p.reapIdleSharedDBs(now)
 }
 
 func (p *Pool) Close() {
@@ -832,26 +668,6 @@ func (p *Pool) Close() {
 	p.mu.Unlock()
 	for _, retired := range toClose {
 		p.closeEntry(retired)
-	}
-	type sharedDBToClose struct {
-		id int64
-		db *sql.DB
-	}
-	p.sharedMu.Lock()
-	p.sharedDBClosed = true
-	sharedToClose := make([]sharedDBToClose, 0, len(p.sharedDBs))
-	for dbID, db := range p.sharedDBs {
-		sharedToClose = append(sharedToClose, sharedDBToClose{id: dbID, db: db})
-		delete(p.sharedDBs, dbID)
-		delete(p.sharedDBRefs, dbID)
-		delete(p.sharedDBLastUsed, dbID)
-		p.deleteSharedDBCacheMetricsLocked(dbID)
-	}
-	p.sharedMu.Unlock()
-	for _, item := range sharedToClose {
-		if err := mysqlutil.CloseInstrumented(item.db); err != nil {
-			logger.Warn(context.Background(), "shared_db_close_failed", zap.Int64("db_id", item.id), zap.Error(err))
-		}
 	}
 }
 
@@ -920,21 +736,6 @@ func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantI
 	return b, release
 }
 
-// fsIDForTenant resolves the tenant's internal fs_id from the meta DB,
-// allocating one on first use. Returns (0, nil) when the pool has no meta
-// store (tests, non-multi-tenant mode); the standalone SQL shape never emits
-// fs_id, so 0 is inert there.
-func (p *Pool) fsIDForTenant(ctx context.Context, t *meta.Tenant) (int64, error) {
-	if p.metaStore == nil || t == nil || t.ID == "" {
-		return 0, nil
-	}
-	fsID, err := p.metaStore.EnsureFsID(ctx, t.ID)
-	if err != nil {
-		return 0, fmt.Errorf("ensure fs_id for tenant %s: %w", t.ID, err)
-	}
-	return fsID, nil
-}
-
 func (p *Pool) tenantMetricTiDBCloudOrgID(ctx context.Context, t *meta.Tenant) string {
 	if t == nil || strings.TrimSpace(t.ID) == "" || !UsesTiDBCloudNativeCredentials(t.Provider) {
 		return defaultTenantMetricTiDBCloudOrgID
@@ -944,22 +745,6 @@ func (p *Pool) tenantMetricTiDBCloudOrgID(ctx context.Context, t *meta.Tenant) s
 	}
 	if p == nil || p.metaStore == nil {
 		return defaultTenantMetricTiDBCloudOrgID
-	}
-	if IsSharedSchemaProvider(t.Provider) {
-		sharedDB, err := p.metaStore.GetSharedDBForTenant(ctx, t.ID)
-		if err != nil {
-			if !errors.Is(err, meta.ErrNotFound) {
-				logger.Warn(ctx, "tenant_pool_metric_shared_org_lookup_failed",
-					zap.String("tenant_id", t.ID),
-					zap.Error(err))
-			}
-			return defaultTenantMetricTiDBCloudOrgID
-		}
-		orgID := strings.TrimSpace(sharedDB.TiDBCloudOrganizationID)
-		if orgID == "" {
-			return defaultTenantMetricTiDBCloudOrgID
-		}
-		return orgID
 	}
 	binding, err := p.metaStore.GetTenantTiDBCloudOrgBinding(ctx, t.ID)
 	if err != nil {
@@ -977,430 +762,51 @@ func (p *Pool) tenantMetricTiDBCloudOrgID(ctx context.Context, t *meta.Tenant) s
 	return orgID
 }
 
-// placementForTenant returns the tenant's placement row, or (nil, nil) when
-// the tenant has none — which is the normal case for every standalone tenant
-// today. Placement lookup errors are fatal to the cold open: silently falling
-// back to standalone could route a shared tenant with the wrong schema shape.
-func (p *Pool) placementForTenant(ctx context.Context, fsID int64) (*meta.TenantPlacement, error) {
-	if p.metaStore == nil || fsID <= 0 {
-		return nil, nil
-	}
-	placement, err := p.metaStore.GetTenantPlacement(ctx, fsID)
-	if errors.Is(err, meta.ErrNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("resolve tenant placement for fs_id %d: %w", fsID, err)
-	}
-	return placement, nil
-}
-
-// leaseSharedDBLocked acquires one reference to the current physical handle.
-// Caller must hold p.sharedMu.
-func (p *Pool) leaseSharedDBLocked(dbID int64, db *sql.DB) *sharedDBHandleLease {
-	p.sharedDBRefs[dbID]++
-	p.sharedDBLastUsed[dbID] = time.Now()
-	p.recordSharedDBCacheTenantsLocked(dbID)
-	return &sharedDBHandleLease{pool: p, dbID: dbID, db: db}
-}
-
-// touchSharedDBActivityLocked refreshes physical shared-DB activity for real
-// tenant use. Caller must hold p.mu; taking p.sharedMu here preserves the
-// pool-wide lock order p.mu -> p.sharedMu.
-func (p *Pool) touchSharedDBActivityLocked(dbID int64, now time.Time) {
-	if dbID <= 0 {
-		return
-	}
-	p.sharedMu.Lock()
-	if _, ok := p.sharedDBs[dbID]; ok {
-		p.sharedDBLastUsed[dbID] = now
-	}
-	p.sharedMu.Unlock()
-}
-
-// recordSharedDBCacheTenantsLocked emits the per-handle reference gauge. The
-// count includes cached tenant ownership and short-lived handle reservations
-// used while opening or maintaining a tenant view.
-// Caller must hold p.sharedMu.
-func (p *Pool) recordSharedDBCacheTenantsLocked(dbID int64) {
-	labels, ok := p.sharedDBLabels[dbID]
-	if !ok {
-		return
-	}
-	metrics.RecordSharedDBPoolCacheTenants(labels.orgID, dbID, labels.uuid, int64(p.sharedDBRefs[dbID]))
-}
-
-// deleteSharedDBCacheMetricsLocked removes both cache series for a handle that
-// is leaving the cache. Caller must hold p.sharedMu.
-func (p *Pool) deleteSharedDBCacheMetricsLocked(dbID int64) {
-	labels, ok := p.sharedDBLabels[dbID]
-	if !ok {
-		return
-	}
-	metrics.DeleteSharedDBPoolCacheHandles(labels.orgID, dbID, labels.uuid)
-	metrics.DeleteSharedDBPoolCacheTenants(labels.orgID, dbID, labels.uuid)
-	delete(p.sharedDBLabels, dbID)
-}
-
-// reapExpiredSharedDBTenantEntries retires every cached tenant view belonging
-// to a physical shared DB whose activity TTL expired. Active entries leave
-// the capacity LRU immediately but remain usable until their references drain.
-//
-// Expiration is revalidated while holding p.mu -> p.sharedMu. sharedMu is then
-// released before walking the capacity LRU so opening or leasing unrelated
-// physical handles is not blocked by a large tenant cache scan. Stores and
-// per-entry metrics are handled outside both locks.
-func (p *Pool) reapExpiredSharedDBTenantEntries(now time.Time) {
-	p.sharedMu.Lock()
-	candidates := make([]int64, 0)
-	for dbID := range p.sharedDBs {
-		lastUsed := p.sharedDBLastUsed[dbID]
-		if !lastUsed.IsZero() && now.Sub(lastUsed) > defaultSharedDBHandleIdleTTL {
-			candidates = append(candidates, dbID)
-		}
-	}
-	p.sharedMu.Unlock()
-	if len(candidates) == 0 {
-		return
-	}
-
-	var toClose []*entry
-	p.mu.Lock()
-	p.sharedMu.Lock()
-	expired := make(map[int64]struct{}, len(candidates))
-	for _, dbID := range candidates {
-		lastUsed := p.sharedDBLastUsed[dbID]
-		_, exists := p.sharedDBs[dbID]
-		if exists && !lastUsed.IsZero() && now.Sub(lastUsed) > defaultSharedDBHandleIdleTTL {
-			expired[dbID] = struct{}{}
-		}
-	}
-	p.sharedMu.Unlock()
-	removedCount := 0
-	for elem := p.order.Front(); elem != nil; {
-		next := elem.Next()
-		e := elem.Value.(*entry)
-		if _, ok := expired[e.sharedDBID]; ok {
-			removedCount++
-			if removed := p.removeLockedWithoutMetrics(elem); removed != nil {
-				toClose = append(toClose, removed)
-			}
-		}
-		elem = next
-	}
-	cachedCount := len(p.items)
-	p.mu.Unlock()
-	if removedCount > 0 {
-		metrics.RecordGauge("tenant_pool", "cached_backends", float64(cachedCount))
-		for range removedCount {
-			metrics.RecordOperation("tenant_pool", "remove", "shared_idle", 0)
-		}
-	}
-	for _, retired := range toClose {
-		p.closeEntry(retired)
-	}
-}
-
-// reapIdleSharedDBs closes physical shared-DB handles only after the activity
-// TTL has expired and all cached, active, or in-flight handle references have
-// drained. The existing tenant-pool reaper invokes this; no separate worker is
-// needed.
-func (p *Pool) reapIdleSharedDBs(now time.Time) {
-	type sharedDBToClose struct {
-		id int64
-		db *sql.DB
-	}
-	var toClose []sharedDBToClose
-	p.sharedMu.Lock()
-	for dbID, db := range p.sharedDBs {
-		if p.sharedDBRefs[dbID] > 0 {
-			continue
-		}
-		lastUsed := p.sharedDBLastUsed[dbID]
-		if lastUsed.IsZero() || now.Sub(lastUsed) <= defaultSharedDBHandleIdleTTL {
-			continue
-		}
-		toClose = append(toClose, sharedDBToClose{id: dbID, db: db})
-		delete(p.sharedDBs, dbID)
-		delete(p.sharedDBRefs, dbID)
-		delete(p.sharedDBLastUsed, dbID)
-		p.deleteSharedDBCacheMetricsLocked(dbID)
-	}
-	p.sharedMu.Unlock()
-	for _, item := range toClose {
-		if err := mysqlutil.CloseInstrumented(item.db); err != nil {
-			logger.Warn(context.Background(), "shared_db_idle_close_failed", zap.Int64("db_id", item.id), zap.Error(err))
-		}
-	}
-}
-
-// sharedDBHandle returns the cached *sql.DB for a shared-schema database
-// (db_pool.id), opening it on first use. A new handle gets one activity-idle
-// grace window; real tenant or maintenance use extends it. Once expired, the
-// reaper retires the handle's tenant entries and closes the handle after their
-// active references drain.
-func (p *Pool) sharedDBHandle(ctx context.Context, dbID int64) (*sharedDBHandleLease, error) {
-	return p.sharedDBHandleWithSchemaLockWait(ctx, dbID, true)
-}
-
-func (p *Pool) sharedDBHandleWithSchemaLockWait(ctx context.Context, dbID int64, waitForSchemaLock bool) (*sharedDBHandleLease, error) {
-	p.sharedMu.Lock()
-	if db, ok := p.sharedDBs[dbID]; ok {
-		lease := p.leaseSharedDBLocked(dbID, db)
-		p.sharedMu.Unlock()
-		return lease, nil
-	}
-	if p.sharedDBClosed {
-		p.sharedMu.Unlock()
-		return nil, fmt.Errorf("shared db pool is closed")
-	}
-	openMu := p.sharedDBOpenMu[dbID]
-	if openMu == nil {
-		openMu = &sync.Mutex{}
-		p.sharedDBOpenMu[dbID] = openMu
-	}
-	p.sharedMu.Unlock()
-
-	openMu.Lock()
-	defer openMu.Unlock()
-	p.sharedMu.Lock()
-	if db, ok := p.sharedDBs[dbID]; ok {
-		lease := p.leaseSharedDBLocked(dbID, db)
-		p.sharedMu.Unlock()
-		return lease, nil
-	}
-	if p.sharedDBClosed {
-		p.sharedMu.Unlock()
-		return nil, fmt.Errorf("shared db pool is closed")
-	}
-	p.sharedMu.Unlock()
-	if p.metaStore == nil {
-		return nil, fmt.Errorf("shared db %d: no meta store", dbID)
-	}
-	info, err := p.metaStore.GetSharedDB(ctx, dbID)
-	if err != nil {
-		return nil, fmt.Errorf("shared db %d: %w", dbID, err)
-	}
-	ctx = logger.WithContext(ctx, logger.FromContext(ctx).With(
-		zap.Int64("db_pool_id", info.ID),
-		zap.String("db_pool_uuid", info.UUID),
-		zap.String("tidbcloud_org_id", info.TiDBCloudOrganizationID),
-	))
-	pass, err := p.enc.Decrypt(ctx, info.PasswordCipher)
-	if err != nil {
-		return nil, fmt.Errorf("shared db %d: decrypt password: %w", dbID, err)
-	}
-	query := "parseTime=true"
-	// LocalClustersAPI TiDB has no TLS. Warm-pool batch once persisted tls=true and
-	// blocked schema ensure / free-tenant activation; force plaintext when the
-	// pool was constructed for the local backend (not via a live env re-read).
-	tlsMode := info.TLSMode
-	if p.cfg.SharedDBForcePlaintext {
-		tlsMode = ""
-	}
-	if tlsMode != "" {
-		query += "&tls=" + tlsMode
-	}
-	// An empty TLSMode means a plain connection (local/self-hosted databases);
-	// shared DBs on TiDB Cloud are registered with tls=skip-verify or tls=true.
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", info.User, string(pass), info.Host, info.Port, info.Name, query)
-	// Bootstrap the schema before the data-plane handle exists, on a handle of
-	// its own, so multi-second DDL and lock waits never land in the
-	// role="shared" series that data-plane latency alerts read.
-	if info.SchemaVersion != schema.CurrentSharedTiDBSchemaVersion {
-		if err := p.ensureSharedDBSchemaOnce(ctx, dsn, info, dbID, waitForSchemaLock); err != nil {
-			return nil, fmt.Errorf("shared db %d: %w", dbID, err)
-		}
-	}
-	db, err := mysqlutil.OpenInstrumentedForSharedDB(ctx, dsn, info.UUID, info.TiDBCloudOrganizationID)
-	if err != nil {
-		return nil, fmt.Errorf("shared db %d: open: %w", dbID, err)
-	}
-	p.sharedMu.Lock()
-	if p.sharedDBClosed {
-		p.sharedMu.Unlock()
-		_ = mysqlutil.CloseInstrumented(db)
-		return nil, fmt.Errorf("shared db pool is closed")
-	}
-	p.sharedDBs[dbID] = db
-	// A newly opened physical handle gets one activity-idle grace window.
-	p.sharedDBLastUsed[dbID] = time.Now()
-	p.sharedDBLabels[dbID] = sharedDBMetricLabels{orgID: info.TiDBCloudOrganizationID, uuid: info.UUID}
-	metrics.RecordSharedDBPoolCacheHandles(info.TiDBCloudOrganizationID, dbID, info.UUID, 1)
-	lease := p.leaseSharedDBLocked(dbID, db)
-	p.sharedMu.Unlock()
-	return lease, nil
-}
-
-// ensureSharedDBSchemaOnce applies the checked-in shared schema through a
-// dedicated handle opened with mysqlutil.RoleSharedSchema and closes it before
-// the data-plane handle is opened. The advisory lock runs on the same handle, so
-// both the lock wait and the DDL are attributed to schema work.
-func (p *Pool) ensureSharedDBSchemaOnce(ctx context.Context, dsn string, info *meta.SharedDB, dbID int64, waitForSchemaLock bool) error {
-	schemaDB, err := schema.OpenSharedSchemaDB(ctx, dsn, info.UUID, info.TiDBCloudOrganizationID)
-	if err != nil {
-		return fmt.Errorf("open schema handle: %w", err)
-	}
-	defer func() { _ = mysqlutil.CloseInstrumented(schemaDB) }()
-	return withSharedDBSchemaAdvisoryLock(ctx, schemaDB, dbID, waitForSchemaLock, func(lockCtx context.Context) error {
-		// Another pod may have completed the migration between the initial
-		// metadata read and this lock acquisition.
-		current, err := p.metaStore.GetSharedDB(lockCtx, dbID)
-		if err != nil {
-			return err
-		}
-		if current.SchemaVersion == schema.CurrentSharedTiDBSchemaVersion {
-			return nil
-		}
-		if err := ensureSharedDBSchema(lockCtx, schemaDB); err != nil {
-			return fmt.Errorf("ensure schema: %w", err)
-		}
-		return p.metaStore.UpdateSharedDBSchemaVersion(lockCtx, dbID, schema.CurrentSharedTiDBSchemaVersion)
-	})
-}
-
-// EnsureSharedDBReady opens the shared physical DB through the normal cache
-// path, which also compares and applies the checked-in shared schema version.
-func (p *Pool) EnsureSharedDBReady(ctx context.Context, dbID int64) error {
-	lease, err := p.sharedDBHandleWithSchemaLockWait(ctx, dbID, false)
-	if err != nil {
-		return err
-	}
-	lease.Release()
-	return nil
-}
-
-// InvalidateSharedDB removes and closes one cached physical shared-DB handle.
-// A later access reopens it from the current db_pool connection metadata.
-func (p *Pool) InvalidateSharedDB(dbID int64) error {
-	if dbID <= 0 {
-		return fmt.Errorf("shared db id must be positive")
-	}
-	p.sharedMu.Lock()
-	openMu := p.sharedDBOpenMu[dbID]
-	if openMu == nil {
-		openMu = &sync.Mutex{}
-		p.sharedDBOpenMu[dbID] = openMu
-	}
-	p.sharedMu.Unlock()
-	openMu.Lock()
-	defer openMu.Unlock()
-	p.sharedMu.Lock()
-	db := p.sharedDBs[dbID]
-	delete(p.sharedDBs, dbID)
-	delete(p.sharedDBRefs, dbID)
-	delete(p.sharedDBLastUsed, dbID)
-	p.deleteSharedDBCacheMetricsLocked(dbID)
-	p.sharedMu.Unlock()
-	if db == nil {
-		return nil
-	}
-	return mysqlutil.CloseInstrumented(db)
-}
-
-// PurgeSharedTenant deletes all rows belonging to fsID from the shared DB it
-// is placed on, in bounded batches. It runs after the tenant's pool entry has
-// been drained, so no backend is concurrently writing through the same scope.
-func (p *Pool) PurgeSharedTenant(ctx context.Context, fsID, dbID int64) error {
-	lease, err := p.sharedDBHandle(ctx, dbID)
-	if err != nil {
-		return err
-	}
-	defer lease.Release()
-	return datastore.NewStoreWithDB(lease.DB(), datastore.SharedScopeWithDB(fsID, lease.DBID())).PurgeTenantData(ctx)
-}
-
-func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9Backend, *datastore.Store, string, *sharedDBHandleLease, error) {
+func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9Backend, *datastore.Store, string, error) {
 	start := time.Now()
 	tidbCloudOrgID := p.tenantMetricTiDBCloudOrgID(ctx, t)
-	var sharedLease *sharedDBHandleLease
-	leaseTransferred := false
-	defer func() {
-		if sharedLease != nil && !leaseTransferred {
-			sharedLease.Release()
-		}
-	}()
 	opts := p.cfg.BackendOptions
 	resolvedEncryptionPolicy, err := meta.ResolveS3EncryptionPolicy(p.cfg.S3EncryptionPolicy, t.S3EncryptionPolicy())
 	if err != nil {
-		return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("resolve s3 encryption policy: %w", err)
+		return nil, nil, tidbCloudOrgID, fmt.Errorf("resolve s3 encryption policy: %w", err)
 	}
 	opts.TenantID = t.ID
 	opts.TiDBCloudOrgID = tidbCloudOrgID
 	opts.S3EncryptionPolicy = resolvedEncryptionPolicy
 
-	fsID, err := p.fsIDForTenant(ctx, t)
-	if err != nil {
-		return nil, nil, tidbCloudOrgID, nil, err
-	}
-	placement, err := p.placementForTenant(ctx, fsID)
-	if err != nil {
-		return nil, nil, tidbCloudOrgID, nil, err
-	}
-	sharedTenant := placement != nil && placement.SchemaShape == meta.SchemaShapeShared
-	if IsSharedSchemaProvider(t.Provider) && !sharedTenant {
-		// The persisted provider says shared but the placement row is gone.
-		// Opening a standalone store against the (connectionless) tenant row
-		// would fail with a confusing empty-host DSN error — and if the row
-		// still had coordinates it could even serve the wrong schema shape.
-		// This happens only mid-delete (placement is removed before final
-		// cleanup), so fail fast with a clear message instead.
-		return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("tenant %s is shared-schema but has no placement row", t.ID)
-	}
-
 	decryptDurationMs := 0.0
 	openStoreStart := time.Now()
-	var store *datastore.Store
-	if sharedTenant {
-		// Shared-schema tenant: connect through the shared DB handle and skip
-		// the per-tenant DSN/decrypt entirely — the tenant row carries no
-		// connection coordinates for shared placements.
-		sharedLease, err = p.sharedDBHandle(ctx, placement.DbID)
-		if err != nil {
-			return nil, nil, tidbCloudOrgID, nil, err
-		}
-		store = datastore.NewStoreWithDB(sharedLease.DB(), datastore.SharedScopeWithDB(fsID, sharedLease.DBID()))
-	} else {
-		decryptStart := time.Now()
-		pass, err := p.enc.Decrypt(ctx, t.DBPasswordCipher)
-		if err != nil {
-			return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("decrypt db password: %w", err)
-		}
-		decryptDurationMs = float64(time.Since(decryptStart).Microseconds()) / 1000.0
-		query := "parseTime=true"
-		if t.DBTLS {
-			query += "&tls=true"
-		} else if t.Provider == ProviderTiDBCloudNative {
-			query += "&tls=skip-verify"
-		}
-		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
-		store, err = datastore.OpenForTenantScoped(ctx, dsn, t.ID, tidbCloudOrgID, datastore.StandaloneScope(fsID))
-		if err != nil {
-			return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("open datastore: %w", err)
-		}
+	decryptStart := time.Now()
+	pass, err := p.enc.Decrypt(ctx, t.DBPasswordCipher)
+	if err != nil {
+		return nil, nil, tidbCloudOrgID, fmt.Errorf("decrypt db password: %w", err)
+	}
+	decryptDurationMs = float64(time.Since(decryptStart).Microseconds()) / 1000.0
+	query := "parseTime=true"
+	if t.DBTLS {
+		query += "&tls=true"
+	} else if t.Provider == ProviderTiDBCloudNative {
+		query += "&tls=skip-verify"
+	}
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
+	store, err := datastore.OpenForTenantScoped(ctx, dsn, t.ID, tidbCloudOrgID, datastore.StandaloneScope())
+	if err != nil {
+		return nil, nil, tidbCloudOrgID, fmt.Errorf("open datastore: %w", err)
 	}
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
 	ensureSchemaDurationMs := 0.0
 	migrateDurationMs := 0.0
-	if sharedTenant {
-		// Shared schema has no generated columns, so database auto-embedding
-		// is unavailable; schema is managed per physical DB, not per tenant,
-		// so the Acquire-time ensure below is skipped entirely.
-		opts.DatabaseAutoEmbedding = false
-		opts.AppSemanticTasksEnabled = false
-		opts.AsyncImageExtract = backend.AsyncImageExtractOptions{}
-		opts.AsyncAudioExtract = backend.AsyncAudioExtractOptions{}
-	} else if UsesTiDBAutoEmbedding(t.Provider) {
+	if UsesTiDBAutoEmbedding(t.Provider) {
 		autoEmbeddingProfile, err := p.autoEmbeddingProfileForTenant(ctx, t)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
 		}
 		if autoEmbeddingProfile.mode == meta.TenantEmbeddingModeAuto {
 			opts.DatabaseAutoEmbedding = true
 			if err := applyTiDBAutoEmbeddingProviderConfig(ctx, store.DB(), autoEmbeddingProfile.provider); err != nil {
 				_ = store.Close()
-				return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
+				return nil, nil, tidbCloudOrgID, fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
 			}
 		} else {
 			opts.DatabaseAutoEmbedding = false
@@ -1412,25 +818,17 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			targetSchemaVersion, err := TiDBTenantSchemaVersionForEmbeddingMode(autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile)
 			if err != nil {
 				_ = store.Close()
-				return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("resolve tenant embedding schema version: %w", err)
+				return nil, nil, tidbCloudOrgID, fmt.Errorf("resolve tenant embedding schema version: %w", err)
 			}
 			if t.SchemaVersion != targetSchemaVersion {
 				ensureSchemaStart := time.Now()
 				schemaCtx := schema.WithTenantID(ctx, t.ID)
 				if err := ensureTiDBSchemaForEmbeddingMode(schemaCtx, store.DB(), autoEmbeddingProfile.mode, autoEmbeddingProfile.schemaProfile); err != nil {
 					_ = store.Close()
-					return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("ensure tidb embedding schema: %w", err)
+					return nil, nil, tidbCloudOrgID, fmt.Errorf("ensure tidb embedding schema: %w", err)
 				}
 				ensureSchemaDurationMs += float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
 				if p.metaStore != nil {
-					// Record the tenant-profile-specific version only after the
-					// schema has been confirmed to match that tenant's profile.
-					// Version-matched opens trust this durable value and skip the
-					// physical diff by default; out-of-band schema drift is detected
-					// only when the target schema version changes, or through an
-					// explicit validation/repair path. SkipTiDBSchemaCheck disables
-					// the Acquire-time TiDB schema ensure/check entirely, mainly for
-					// tests that use a TiDB-class provider against plain MySQL.
 					updateSchemaVersionStart := time.Now()
 					if verErr := p.metaStore.UpdateTenantSchemaVersion(ctx, t.ID, targetSchemaVersion); verErr != nil {
 						recordTenantSchemaVersionUpdateFailure(ctx, t.ID, targetSchemaVersion, time.Since(updateSchemaVersionStart), verErr)
@@ -1440,7 +838,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			if autoEmbeddingProfile.modeWasNull && p.metaStore != nil {
 				if _, modeErr := p.metaStore.SetTenantAutoEmbeddingProfileModeIfNull(ctx, t.ID, autoEmbeddingProfile.mode); modeErr != nil {
 					_ = store.Close()
-					return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("persist tenant embedding mode: %w", modeErr)
+					return nil, nil, tidbCloudOrgID, fmt.Errorf("persist tenant embedding mode: %w", modeErr)
 				}
 			}
 		}
@@ -1451,7 +849,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	if store.HasLegacyFiles() {
 		if err := p.migrateSplitTables(ctx, store.DB(), t.Provider); err != nil {
 			_ = store.Close()
-			return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("migrate split tables: %w", err)
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("migrate split tables: %w", err)
 		}
 	}
 	migrateDurationMs = float64(time.Since(migrateStart).Microseconds()) / 1000.0
@@ -1459,7 +857,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		ns, err := p.resolveStorageNamespace(ctx, t, "s3", p.cfg.S3Bucket)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, tidbCloudOrgID, nil, err
+			return nil, nil, tidbCloudOrgID, err
 		}
 		opts.StorageNamespaceID = ns.ID
 		prefix := ns.Prefix
@@ -1477,7 +875,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		})
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("create aws s3 client: %w", err)
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("create aws s3 client: %w", err)
 		}
 		s3ClientDurationMs := float64(time.Since(s3ClientStart).Microseconds()) / 1000.0
 		smallInDB := SmallInDB(t.Provider)
@@ -1485,7 +883,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, opts)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("create backend with s3 mode: %w", err)
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("create backend with s3 mode: %w", err)
 		}
 		backendCreateDurationMs := float64(time.Since(backendCreateStart).Microseconds()) / 1000.0
 		totalDuration := time.Since(start)
@@ -1502,14 +900,13 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("total_ms", durationMs(totalDuration)))
 		p.wireQuotaStore(ctx, b, t.ID)
 		p.wireTenantWorkNotifier(b, t.ID)
-		leaseTransferred = true
-		return b, store, tidbCloudOrgID, sharedLease, nil
+		return b, store, tidbCloudOrgID, nil
 	}
 	if p.cfg.S3Dir != "" {
 		ns, err := p.resolveStorageNamespace(ctx, t, "local", "")
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, tidbCloudOrgID, nil, err
+			return nil, nil, tidbCloudOrgID, err
 		}
 		opts.StorageNamespaceID = ns.ID
 		localPrefix := strings.Trim(ns.Prefix, "/")
@@ -1519,7 +916,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		s3c, err := s3client.NewLocal(s3Dir, s3BaseURL)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("create local s3 client: %w", err)
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("create local s3 client: %w", err)
 		}
 		s3ClientDurationMs := float64(time.Since(s3ClientStart).Microseconds()) / 1000.0
 		smallInDB := SmallInDB(t.Provider)
@@ -1527,7 +924,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, opts)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("create backend with local s3 mode: %w", err)
+			return nil, nil, tidbCloudOrgID, fmt.Errorf("create backend with local s3 mode: %w", err)
 		}
 		backendCreateDurationMs := float64(time.Since(backendCreateStart).Microseconds()) / 1000.0
 		totalDuration := time.Since(start)
@@ -1544,14 +941,13 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("total_ms", durationMs(totalDuration)))
 		p.wireQuotaStore(ctx, b, t.ID)
 		p.wireTenantWorkNotifier(b, t.ID)
-		leaseTransferred = true
-		return b, store, tidbCloudOrgID, sharedLease, nil
+		return b, store, tidbCloudOrgID, nil
 	}
 	backendCreateStart := time.Now()
 	b, err := backend.NewWithOptions(store, opts)
 	if err != nil {
 		_ = store.Close()
-		return nil, nil, tidbCloudOrgID, nil, fmt.Errorf("create backend: %w", err)
+		return nil, nil, tidbCloudOrgID, fmt.Errorf("create backend: %w", err)
 	}
 	backendCreateDurationMs := float64(time.Since(backendCreateStart).Microseconds()) / 1000.0
 	totalDuration := time.Since(start)
@@ -1568,8 +964,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("total_ms", durationMs(totalDuration)))
 	p.wireQuotaStore(ctx, b, t.ID)
 	p.wireTenantWorkNotifier(b, t.ID)
-	leaseTransferred = true
-	return b, store, tidbCloudOrgID, sharedLease, nil
+	return b, store, tidbCloudOrgID, nil
 }
 
 func (p *Pool) migrateSplitTables(ctx context.Context, db *sql.DB, provider string) error {
@@ -1729,7 +1124,7 @@ func (p *Pool) makeRelease(e *entry) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			p.releaseEntry(e, true, true)
+			p.releaseEntry(e, true)
 		})
 	}
 }
@@ -1741,12 +1136,12 @@ func (p *Pool) makeReleaseNoRefresh(e *entry) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			p.releaseEntry(e, false, false)
+			p.releaseEntry(e, false)
 		})
 	}
 }
 
-func (p *Pool) releaseEntry(e *entry, refreshLastUsed, refreshSharedActivity bool) {
+func (p *Pool) releaseEntry(e *entry, refreshLastUsed bool) {
 	if e == nil {
 		return
 	}
@@ -1757,9 +1152,6 @@ func (p *Pool) releaseEntry(e *entry, refreshLastUsed, refreshSharedActivity boo
 	}
 	if e.refs == 0 && !e.retired && refreshLastUsed {
 		e.lastUsed = time.Now()
-	}
-	if !e.retired && refreshSharedActivity {
-		p.touchSharedDBActivityLocked(e.sharedDBID, time.Now())
 	}
 	if e.refs == 0 && e.retired {
 		toClose = e
@@ -1780,7 +1172,6 @@ func (p *Pool) closeEntry(e *entry) {
 	if e.store != nil {
 		_ = e.store.Close()
 	}
-	e.sharedDBLease.Release()
 	metrics.DeleteTenantRequestCounters(e.tenantID)
 }
 

@@ -231,8 +231,8 @@ bash e2e/cli-smoke-test.sh
 
 Useful knobs for existing-tenant runs:
 
-- `RUN_CLI_FORK_CHECKS=0` — skip the fork flow (shared-schema tenants reject
-  `/v1/fork` with 409; very large tenants should not be forked).
+- `RUN_CLI_FORK_CHECKS=0` — skip the fork flow (very large tenants should not
+  be forked).
 - `RUN_LARGE_FILE=0` — skip the 100MB API large-file upload.
 - `RUN_SEMANTIC_CHECKS=0` / `RUN_CLI_SEMANTIC_CHECKS=0` — skip semantic recall
   checks when no embedding endpoint is available.

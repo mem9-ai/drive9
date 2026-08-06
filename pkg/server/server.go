@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -47,34 +46,10 @@ type Config struct {
 	Pool                  *tenant.Pool
 	Provisioner           tenant.Provisioner
 	DefaultTenantProvider string
-	// SharedDBMaxTenants and SharedDBSpendingLimit apply only to new
-	// managed tidb_cloud_native_shared pools. Zero values use their defaults.
-	SharedDBMaxTenants    int
-	SharedDBHardCapRatio  float64
-	SharedDBReopenRatio   float64
-	SharedDBSpendingLimit int64
 	// TiDBCloudNonFreePlanCacheTTL controls the positive-only Billing plan
 	// cache. A non-positive value uses the 30-minute default.
 	TiDBCloudNonFreePlanCacheTTL time.Duration
 	TiDBCloudFreePlanLimits      TiDBCloudFreePlanLimits
-	// Managed shared-pool concurrency and polling controls. Zero values use
-	// the exported defaults below. MetadataWorkers and MetadataBatchSize are
-	// safety-capped at their defaults; CloudBatchSize and ProvisioningWorkers
-	// accept larger configured values.
-	ManagedSharedDBCloudBatchSize       int
-	ManagedSharedDBMetadataWorkers      int
-	ManagedSharedDBMetadataBatchSize    int
-	ManagedSharedDBMetadataPollInterval time.Duration
-	ManagedSharedDBProvisioningWorkers  int
-	// TenantPoolReconcileInterval drives the leader-only durable logical-pool
-	// scan. ManagedSharedDBStuckTimeout measures no-progress time in one physical
-	// pending/provisioning status. Failed cleanup has its own low-rate worker.
-	TenantPoolReconcileInterval           time.Duration
-	TenantPoolReconcileWorkers            int
-	TenantPoolReconcileWorkerRest         time.Duration
-	ManagedSharedDBStuckTimeout           time.Duration
-	ManagedSharedDBFailedCleanupInterval  time.Duration
-	ManagedSharedDBFailedCleanupBatchSize int
 	// LegacyStarterProvisioner is only used for delete/fork compatibility on
 	// persisted tidb_cloud_starter tenants. New starter provisioning remains
 	// disabled and NormalizeProvider does not accept tidb_cloud_starter.
@@ -201,7 +176,7 @@ func (s *Server) provisionerForTenantProvider(provider string) tenant.Provisione
 	switch provider {
 	case tenant.ProviderTiDBCloudStarterLegacy:
 		return s.legacyStarterProvisioner
-	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBZero, tenant.ProviderDB9, tenant.ProviderTiDBCloudNativeShared:
+	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBZero, tenant.ProviderDB9:
 		return s.provisioner
 	default:
 		return nil
@@ -214,35 +189,6 @@ type Server struct {
 	pool                  *tenant.Pool
 	provisioner           tenant.Provisioner
 	defaultTenantProvider string
-	sharedDBMaxTenants    int
-	sharedDBHardCapRatio  float64
-	sharedDBReopenRatio   float64
-	sharedDBSpendingLimit int64
-
-	managedSharedDBCloudBatchSize           int
-	managedSharedDBCloudBatchSlots          chan struct{}
-	managedSharedDBCloudBatchSlotsOnce      sync.Once
-	managedSharedDBMetadataWorkers          int
-	managedSharedDBMetadataBatchSize        int
-	managedSharedDBMetadataPollInterval     time.Duration
-	managedSharedDBProvisioningWorkers      int
-	managedSharedDBProvisioningConcurrency  int
-	tenantPoolReconcileInterval             time.Duration
-	tenantPoolReconcileWorkers              int
-	tenantPoolReconcileQueue                chan tenantPoolReconcileJob
-	tenantPoolReconcileWorkerRest           time.Duration
-	tenantPoolLeaderReconcileJobs           sync.Map
-	managedSharedDBStuckTimeout             time.Duration
-	managedSharedDBMetadataSlots            chan struct{}
-	managedSharedDBProvisioningSlots        chan struct{}
-	managedSharedDBMetadataJobs             sync.Map
-	managedSharedDBProvisioningJobs         sync.Map
-	managedSharedDBFailedCleanupBatchSize   int
-	managedSharedDBFailedCleanupInterval    time.Duration
-	managedSharedDBFailedCleanupCursor      int64
-	managedSharedDBPendingResumeCursor      int64
-	managedSharedDBProvisioningResumeCursor int64
-	managedSharedDBActivationResumeCursor   int64
 
 	legacyStarterProvisioner  tenant.Provisioner
 	tokenSecret               []byte
@@ -273,8 +219,6 @@ type Server struct {
 	tenantPoolLocks           sync.Map
 	tenantPoolReplenishJobs   sync.Map
 	tenantPoolCreateLocks     sync.Map
-	sharedDBAllocationLocks   sync.Map
-	sharedDBReservationLocks  sync.Map
 	tenantPoolResumeJobs      sync.Map
 	tenantPoolResumeScans     sync.Map
 	tenantFailedCleanupJobs   sync.Map
@@ -324,22 +268,15 @@ type Server struct {
 	// (not leader-gated); stopped during Close before the coalescer's final
 	// flush so its last notify signals still land in the outbox.
 	eventRetry *eventRetryBuffer
-	// sweepCtx/sweepCancel tie the detached fs_events sweep goroutines
-	// (maybeSweepFSEvents / maybeSweepSharedFSEvents) to the server
-	// lifecycle: stopNotifyInfrastructure cancels them promptly (the batched
-	// DELETE loop checks ctx between batches) and notifyWG.Wait covers them,
-	// so they cannot outlive Close and hit a closed meta store.
+	// sweepCtx/sweepCancel tie the detached fs_events sweep goroutine
+	// (maybeSweepFSEvents) to the server lifecycle: stopNotifyInfrastructure
+	// cancels it promptly (the batched DELETE loop checks ctx between batches)
+	// and notifyWG.Wait covers it, so it cannot outlive Close and hit a closed
+	// meta store.
 	// Hand-constructed servers (tests) leave both nil and use a background
 	// context instead. Mirrors the forkWorkerCtx precedent.
 	sweepCtx    context.Context
 	sweepCancel context.CancelFunc
-	// sharedSweepLast is the per-pod pre-filter throttle for the shared-pool
-	// fs_events sweep (see maybeSweepSharedFSEvents in sse.go), keyed by
-	// physical pool id (db_pool.db_id; 0 = unknown/single pool): each shared
-	// pool is throttled and claimed independently so a hot pool cannot
-	// starve a cold one. The authoritative cluster-wide throttle is the
-	// meta-DB claim; this map only keeps the common case off the meta DB.
-	sharedSweepLast sync.Map // dbID int64 -> unix seconds int64
 	// sseNotifyRetention is how long outbox rows are kept before leader pruning.
 	sseNotifyRetention time.Duration
 	// fsEventsRetention is how long fs_events rows are kept before the lazy
@@ -389,33 +326,6 @@ const DefaultTenantPoolMaxSize = 200
 // DefaultTenantPoolRefillFreeRatio delays claim-triggered pool refill until the
 // active free tenant count falls below 80% of the configured pool size.
 const DefaultTenantPoolRefillFreeRatio = 0.8
-
-// DefaultSharedDBHardCapRatio lets direct shared provisioning temporarily use
-// 20% emergency headroom after physical DB creation fails.
-const DefaultSharedDBHardCapRatio = 1.2
-
-// DefaultSharedDBReopenRatio reopens a latched shared pool once usage falls
-// to 80% of its persisted soft capacity.
-const DefaultSharedDBReopenRatio = 0.8
-
-// DefaultManagedSharedDBSpendingLimit is the physical spending-limit target
-// persisted for a new managed shared DB pool when no override is configured.
-const DefaultManagedSharedDBSpendingLimit = int64(1_000_000)
-
-const (
-	DefaultManagedSharedDBCloudBatchSize         = 50
-	defaultManagedSharedDBCloudBatchConcurrency  = 5
-	DefaultManagedSharedDBMetadataWorkers        = 15
-	DefaultManagedSharedDBMetadataBatchSize      = 30
-	DefaultManagedSharedDBMetadataPollInterval   = 15 * time.Second
-	DefaultManagedSharedDBProvisioningWorkers    = 100
-	DefaultTenantPoolReconcileInterval           = 5 * time.Second
-	DefaultTenantPoolReconcileWorkers            = 15
-	DefaultTenantPoolReconcileWorkerRest         = 5 * time.Second
-	DefaultManagedSharedDBStuckTimeout           = 30 * time.Minute
-	DefaultManagedSharedDBFailedCleanupInterval  = time.Minute
-	DefaultManagedSharedDBFailedCleanupBatchSize = 5
-)
 
 // TenantStatusResponse is the JSON body of GET /v1/status. Fields are filled
 // per authenticated tenant so callers can discover their effective limits
@@ -484,65 +394,6 @@ func NewWithConfig(cfg Config) *Server {
 		tenantPoolMaxSize = DefaultTenantPoolMaxSize
 	}
 	tenantPoolRefillFreeRatio := normalizeTenantPoolRefillFreeRatio(cfg.TenantPoolRefillFreeRatio)
-	sharedDBHardCapRatio := cfg.SharedDBHardCapRatio
-	if sharedDBHardCapRatio < 1 || sharedDBHardCapRatio != sharedDBHardCapRatio || math.IsInf(sharedDBHardCapRatio, 0) {
-		sharedDBHardCapRatio = DefaultSharedDBHardCapRatio
-	}
-	sharedDBReopenRatio := cfg.SharedDBReopenRatio
-	if sharedDBReopenRatio <= 0 || sharedDBReopenRatio >= 1 || sharedDBReopenRatio != sharedDBReopenRatio || math.IsInf(sharedDBReopenRatio, 0) {
-		sharedDBReopenRatio = DefaultSharedDBReopenRatio
-	}
-	sharedDBSpendingLimit := cfg.SharedDBSpendingLimit
-	if sharedDBSpendingLimit <= 0 {
-		sharedDBSpendingLimit = DefaultManagedSharedDBSpendingLimit
-	}
-	managedSharedDBCloudBatchSize := cfg.ManagedSharedDBCloudBatchSize
-	if managedSharedDBCloudBatchSize <= 0 {
-		managedSharedDBCloudBatchSize = DefaultManagedSharedDBCloudBatchSize
-	}
-	managedSharedDBMetadataWorkers := cfg.ManagedSharedDBMetadataWorkers
-	if managedSharedDBMetadataWorkers <= 0 {
-		managedSharedDBMetadataWorkers = DefaultManagedSharedDBMetadataWorkers
-	}
-	managedSharedDBMetadataWorkers = min(managedSharedDBMetadataWorkers, DefaultManagedSharedDBMetadataWorkers)
-	managedSharedDBMetadataBatchSize := cfg.ManagedSharedDBMetadataBatchSize
-	if managedSharedDBMetadataBatchSize <= 0 {
-		managedSharedDBMetadataBatchSize = DefaultManagedSharedDBMetadataBatchSize
-	}
-	managedSharedDBMetadataBatchSize = min(managedSharedDBMetadataBatchSize, DefaultManagedSharedDBMetadataBatchSize)
-	managedSharedDBMetadataPollInterval := cfg.ManagedSharedDBMetadataPollInterval
-	if managedSharedDBMetadataPollInterval <= 0 {
-		managedSharedDBMetadataPollInterval = DefaultManagedSharedDBMetadataPollInterval
-	}
-	managedSharedDBProvisioningWorkers := cfg.ManagedSharedDBProvisioningWorkers
-	if managedSharedDBProvisioningWorkers <= 0 {
-		managedSharedDBProvisioningWorkers = DefaultManagedSharedDBProvisioningWorkers
-	}
-	managedSharedDBProvisioningConcurrency := managedSharedDBProvisioningWorkers
-	tenantPoolReconcileInterval := cfg.TenantPoolReconcileInterval
-	if tenantPoolReconcileInterval <= 0 {
-		tenantPoolReconcileInterval = DefaultTenantPoolReconcileInterval
-	}
-	tenantPoolReconcileWorkers := cfg.TenantPoolReconcileWorkers
-	if tenantPoolReconcileWorkers <= 0 {
-		tenantPoolReconcileWorkers = DefaultTenantPoolReconcileWorkers
-	}
-	tenantPoolReconcileWorkerRest := cfg.TenantPoolReconcileWorkerRest
-	if tenantPoolReconcileWorkerRest <= 0 {
-		tenantPoolReconcileWorkerRest = DefaultTenantPoolReconcileWorkerRest
-	}
-	managedSharedDBStuckTimeout := cfg.ManagedSharedDBStuckTimeout
-	if managedSharedDBStuckTimeout <= 0 {
-		managedSharedDBStuckTimeout = DefaultManagedSharedDBStuckTimeout
-	}
-	managedSharedDBFailedCleanupInterval := cfg.ManagedSharedDBFailedCleanupInterval
-	if managedSharedDBFailedCleanupInterval <= 0 {
-		managedSharedDBFailedCleanupInterval = DefaultManagedSharedDBFailedCleanupInterval
-	}
-	managedSharedDBFailedCleanupBatchSize := cfg.ManagedSharedDBFailedCleanupBatchSize
-	if managedSharedDBFailedCleanupBatchSize <= 0 {
-		managedSharedDBFailedCleanupBatchSize = DefaultManagedSharedDBFailedCleanupBatchSize
-	}
 	defaultTenantProvider := strings.TrimSpace(cfg.DefaultTenantProvider)
 	if defaultTenantProvider == "" && cfg.Provisioner != nil {
 		defaultTenantProvider = cfg.Provisioner.ProviderType()
@@ -560,26 +411,6 @@ func NewWithConfig(cfg Config) *Server {
 		publicURL:             strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
 		provisioner:           cfg.Provisioner,
 		defaultTenantProvider: defaultTenantProvider,
-		sharedDBMaxTenants:    cfg.SharedDBMaxTenants,
-		sharedDBHardCapRatio:  sharedDBHardCapRatio,
-		sharedDBReopenRatio:   sharedDBReopenRatio,
-		sharedDBSpendingLimit: sharedDBSpendingLimit,
-
-		managedSharedDBCloudBatchSize:          managedSharedDBCloudBatchSize,
-		managedSharedDBMetadataWorkers:         managedSharedDBMetadataWorkers,
-		managedSharedDBMetadataBatchSize:       managedSharedDBMetadataBatchSize,
-		managedSharedDBMetadataPollInterval:    managedSharedDBMetadataPollInterval,
-		managedSharedDBProvisioningWorkers:     managedSharedDBProvisioningWorkers,
-		managedSharedDBProvisioningConcurrency: managedSharedDBProvisioningConcurrency,
-		tenantPoolReconcileInterval:            tenantPoolReconcileInterval,
-		tenantPoolReconcileWorkers:             tenantPoolReconcileWorkers,
-		tenantPoolReconcileQueue:               make(chan tenantPoolReconcileJob),
-		tenantPoolReconcileWorkerRest:          tenantPoolReconcileWorkerRest,
-		managedSharedDBStuckTimeout:            managedSharedDBStuckTimeout,
-		managedSharedDBFailedCleanupInterval:   managedSharedDBFailedCleanupInterval,
-		managedSharedDBFailedCleanupBatchSize:  managedSharedDBFailedCleanupBatchSize,
-		managedSharedDBMetadataSlots:           make(chan struct{}, managedSharedDBMetadataWorkers),
-		managedSharedDBProvisioningSlots:       make(chan struct{}, managedSharedDBProvisioningConcurrency),
 
 		legacyStarterProvisioner:  cfg.LegacyStarterProvisioner,
 		maxUploadBytes:            maxUpload,
@@ -743,15 +574,10 @@ func NewWithConfig(cfg Config) *Server {
 	// Finalize the tenant worker options against the server's effective
 	// config: fall back to the server's fs_events retention when the caller
 	// only set Config.FSEventsRetention (belt-and-braces for programmatic
-	// use; main.go sets both), and wire the shared-pool sweep entry point so
-	// the worker's piggyback maintenance and the write path share ONE
-	// throttle (per-pod pre-filter + cluster claim) instead of two clocks.
+	// use; main.go sets both).
 	workerOpts := cfg.TenantWorkers
 	if workerOpts.FSEventsRetention <= 0 {
 		workerOpts.FSEventsRetention = s.fsEventsRetention
-	}
-	if workerOpts.SweepSharedFSEvents == nil {
-		workerOpts.SweepSharedFSEvents = s.maybeSweepSharedFSEvents
 	}
 	s.tenantWorker = newTenantWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, workerOpts, cfg.TenantMaintenanceInterval)
 	if s.tenantWorker != nil {
@@ -1063,20 +889,6 @@ func (s *Server) Close() {
 	s.stopNotifyInfrastructure()
 }
 
-func runManagedSharedDBResumeLoop(ctx context.Context, interval time.Duration, resume func(context.Context)) {
-	for {
-		resume(ctx)
-		timer := time.NewTimer(interval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-		timer.Stop()
-	}
-}
-
 // startLeaderWorkers launches the background schedulers that should run only
 // on the leader pod: the fork-worker group (pending tenant reconciler, tenant
 // delete cleanup, one-time resume tasks), the semantic and object GC workers,
@@ -1116,30 +928,6 @@ func (s *Server) startLeaderWorkers() {
 		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			s.resumeProvisioningTenantsWithCtx(workerCtx)
-		})
-		sharedPollInterval := s.managedSharedDBMetadataPollInterval
-		if sharedPollInterval <= 0 {
-			sharedPollInterval = DefaultManagedSharedDBMetadataPollInterval
-		}
-		startManagedSharedDBResumeLoop := func(resume func(context.Context)) {
-			s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-				runManagedSharedDBResumeLoop(workerCtx, sharedPollInterval, resume)
-			})
-		}
-		startManagedSharedDBResumeLoop(s.resumePendingManagedSharedDBPoolsWithCtx)
-		startManagedSharedDBResumeLoop(s.resumeProvisioningManagedSharedDBPoolsWithCtx)
-		startManagedSharedDBResumeLoop(s.resumeActiveManagedSharedDBTenantsWithCtx)
-		for range s.tenantPoolReconcileWorkers {
-			s.startLeaderGoroutine(leaderCtx, s.runTenantPoolReconcileWorker)
-		}
-		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			runManagedSharedDBResumeLoop(workerCtx, s.tenantPoolReconcileInterval, s.reconcileStuckManagedSharedDBPoolsWithCtx)
-		})
-		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			runManagedSharedDBResumeLoop(workerCtx, s.tenantPoolReconcileInterval, s.reconcileSharedTenantPoolsWithCtx)
-		})
-		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			runManagedSharedDBResumeLoop(workerCtx, s.managedSharedDBFailedCleanupInterval, s.cleanupFailedManagedSharedDBPoolsWithCtx)
 		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			s.resumeDeletingForkTenantsWithCtx(workerCtx)
@@ -1181,22 +969,11 @@ func (s *Server) startLeaderWorkers() {
 	if s.meta != nil {
 		s.replayWorker = backend.StartMutationReplayWorker(tenant.NewMetaQuotaAdapter(s.meta))
 		s.expirySweepWorker = backend.StartExpirySweepWorker(s.meta)
-		// One-time fs_registry backfill so pre-existing tenants hold a stable
-		// internal fs_id before the routing layer needs it. Idempotent.
-		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			inserted, err := s.meta.BackfillFsRegistry(workerCtx)
-			if err != nil {
-				logger.Error(workerCtx, "server_event", eventFields(workerCtx, "fs_registry_backfill_failed", "error", err)...)
-				return
-			}
-			logger.Info(workerCtx, "server_event", eventFields(workerCtx, "fs_registry_backfill_done", "inserted", inserted)...)
-		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			ticker := time.NewTicker(tenantCountMetricsInterval)
 			defer ticker.Stop()
 			s.observeTenantCounts(workerCtx)
 			s.observeTenantPoolBindingCounts(workerCtx)
-			s.observeSharedDBPoolMetrics(workerCtx)
 			for {
 				select {
 				case <-workerCtx.Done():
@@ -1204,7 +981,6 @@ func (s *Server) startLeaderWorkers() {
 				case <-ticker.C:
 					s.observeTenantCounts(workerCtx)
 					s.observeTenantPoolBindingCounts(workerCtx)
-					s.observeSharedDBPoolMetrics(workerCtx)
 				}
 			}
 		})
@@ -1349,7 +1125,6 @@ func (s *Server) stopLeaderWorkers() {
 	}
 	if s.metrics != nil {
 		s.metrics.clearTenantPoolBindingSnapshot()
-		s.metrics.clearSharedDBPoolSnapshot()
 	}
 	// In multi-tenant mode the tenant worker is started/stopped in
 	// startNotifyInfrastructure. In single-tenant mode (s.meta == nil) it is
@@ -1401,12 +1176,6 @@ func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 	}
 	for i := range tenants {
 		t := tenants[i]
-		if t.Provider == tenant.ProviderTiDBCloudNativeShared {
-			// Shared tenants never run per-tenant schema initialization. Their
-			// physical DB-pool continuation owns schema readiness and activates
-			// every placed provisioning tenant after the pool becomes active.
-			continue
-		}
 		if t.Kind == meta.TenantKindFork {
 			logger.Info(ctx, "resume_provisioning_fork",
 				zap.String("tenant_id", t.ID),
@@ -1557,22 +1326,6 @@ func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
 	t = *current
 	if t.Status != meta.TenantPending || !isStalePendingTenant(now, t) {
 		return
-	}
-	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
-		_, err := s.meta.GetSharedDBForTenant(ctx, t.ID)
-		if err == nil {
-			logger.Info(ctx, "resume_pending_shared_pool_tenant_skipped",
-				zap.String("tenant_id", t.ID),
-				zap.String("provider", t.Provider),
-				zap.String("reason", "managed_by_shared_pool"))
-			return
-		}
-		if !errors.Is(err, meta.ErrNotFound) {
-			logger.Error(ctx, "resume_pending_shared_pool_tenant_lookup_error",
-				zap.String("tenant_id", t.ID),
-				zap.Error(err))
-			return
-		}
 	}
 	if t.Provider == tenant.ProviderTiDBCloudNative && strings.TrimSpace(t.ClusterID) != "" && strings.TrimSpace(t.DBUser) == "" {
 		poolOwned, ownershipErr := s.meta.HasTenantPoolOwnership(ctx, t.ID)
@@ -5007,7 +4760,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	if tenant.UsesTiDBCloudNativeCredentials(provider) && credentialReq != nil {
 		poolClaimStarted := time.Now()
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_started", "provider", provider, "quota_requested", quotaReq != nil)...)
-		if res, pool, claimed, _, err := s.claimAdminTenantFromPoolWithAccess(r.Context(), *credentialReq, quotaReq, tiDBCloudAccess); err != nil {
+		if res, pool, claimed, err := s.claimAdminTenantFromPoolWithAccess(r.Context(), *credentialReq, quotaReq, tiDBCloudAccess); err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_failed", "provider", provider, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", provisionTenantPoolClaimMetricResult(err))
 			status, msg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", err)
@@ -5178,21 +4931,9 @@ func resolveDefaultCredentials(p tenant.Provisioner, provider string) *tenant.Cr
 	type defaultCredentialProvider interface {
 		DefaultCredentials() (tenant.CredentialProvisionRequest, bool)
 	}
-	type defaultSharedCredentialProvider interface {
-		DefaultSharedCredentials() (tenant.CredentialProvisionRequest, bool)
-	}
 	if dp, ok := p.(defaultCredentialProvider); ok {
 		if req, ok := dp.DefaultCredentials(); ok {
 			return &req
-		}
-	}
-	// Shared deployments commonly only set server-owned shared keys. Empty-body
-	// /v1/provision (api-smoke, local shared) falls back to those.
-	if tenant.IsSharedSchemaProvider(provider) {
-		if sp, ok := p.(defaultSharedCredentialProvider); ok {
-			if req, ok := sp.DefaultSharedCredentials(); ok {
-				return &req
-			}
 		}
 	}
 	return nil
@@ -5575,166 +5316,6 @@ func (s *Server) updateTenantSchemaVersionForProfile(ctx context.Context, tenant
 	return nil
 }
 
-// findSharedDBForProvision resolves whether the tenant being provisioned
-// should be placed on a shared-schema database registered for the request's
-// exact TiDB Cloud organization. It returns (nil, nil) when the
-// tenant should follow the normal per-tenant provisioning path. Lookup
-// failures are returned as errors — never silently treated as "no pool",
-// which would provision the wrong tenant shape on a transient meta outage.
-//
-// Only TiDB Cloud providers carry an IAM-resolved organization and may route
-// to an organization-bound shared pool.
-func (s *Server) findSharedDBForProvision(ctx context.Context, provider string, opts provisionTenantOptions) (*meta.SharedDB, error) {
-	if s.meta == nil {
-		return nil, nil
-	}
-	switch provider {
-	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBCloudNativeShared:
-	default:
-		return nil, nil
-	}
-	orgID := ""
-	if opts.TiDBCloudAccess != nil {
-		orgID = strings.TrimSpace(opts.TiDBCloudAccess.OrganizationID)
-	} else if opts.CredentialProvisioner != nil {
-		if id, err := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner); err == nil {
-			orgID = id
-		} else {
-			logger.Warn(ctx, "server_event", eventFields(ctx, "provision_org_resolve_failed", "error", err)...)
-		}
-	}
-	if orgID == "" {
-		if provider == tenant.ProviderTiDBCloudNativeShared {
-			return nil, fmt.Errorf("cannot resolve tidbcloud organization for shared-pool placement")
-		}
-		return nil, nil
-	}
-	sharedDB, err := s.meta.FindSharedDBForOrg(ctx, orgID)
-	if err != nil {
-		if errors.Is(err, meta.ErrNotFound) {
-			if provider == tenant.ProviderTiDBCloudNativeShared {
-				return nil, fmt.Errorf("no shared-schema pool registered for org %q", orgID)
-			}
-			return nil, nil
-		}
-		return nil, fmt.Errorf("resolve shared-schema pool for org %q: %w", orgID, err)
-	}
-	return sharedDB, nil
-}
-
-// provisionTenantOnSharedDB completes provisioning for a tenant placed on a
-// shared-schema database: no cluster is created and the schema already exists
-// there. After the idempotent identity/profile steps, every state-changing
-// meta write — the capacity reservation and placement, the provider re-label
-// (tidb_cloud_native_shared, so provider-driven capability checks classify
-// the tenant correctly), the active-status transition, and the owner key —
-// commits in ONE meta transaction (CompleteSharedTenantProvision). A failed
-// provision therefore leaves no partial state: no active shared tenant
-// without a placement row, no capacity leak, no orphaned key.
-func (s *Server) provisionTenantOnSharedDB(ctx context.Context, tenantID string, sharedDB *meta.SharedDB, provider, keyName string, opts provisionTenantOptions, now time.Time) (*provisionTenantResult, error) {
-	return s.provisionTenantOnSharedDBMode(ctx, tenantID, sharedDB, provider, keyName, opts, now, meta.SharedDBCapacityNormal, 0)
-}
-
-func (s *Server) provisionTenantOnSharedDBEmergency(ctx context.Context, tenantID string, sharedDB *meta.SharedDB, provider, keyName string, opts provisionTenantOptions, now time.Time, hardCap int) (*provisionTenantResult, error) {
-	return s.provisionTenantOnSharedDBMode(ctx, tenantID, sharedDB, provider, keyName, opts, now, meta.SharedDBCapacityEmergency, hardCap)
-}
-
-func (s *Server) provisionTenantOnManagedSharedDB(ctx context.Context, tenantID string, sharedDB *meta.SharedDB, provider, keyName string, opts provisionTenantOptions, now time.Time) (*provisionTenantResult, error) {
-	current, err := s.meta.GetSharedDB(ctx, sharedDB.ID)
-	if err != nil {
-		return nil, err
-	}
-	identity := sharedDBAllocationIdentity(current.TiDBCloudOrganizationID, current.ProvisioningKey)
-	var result *provisionTenantResult
-	err = s.withSharedDBAllocationLock(ctx, identity, func(lockCtx context.Context) error {
-		locked, loadErr := s.meta.GetSharedDB(lockCtx, current.ID)
-		if loadErr != nil {
-			return loadErr
-		}
-		var provisionErr error
-		result, provisionErr = s.provisionTenantOnSharedDB(lockCtx, tenantID, locked, provider, keyName, opts, now)
-		return provisionErr
-	})
-	return result, err
-}
-
-func isSharedDBReservationConflict(err error) bool {
-	return errors.Is(err, meta.ErrSharedDBCapacityExhausted)
-}
-
-func (s *Server) provisionTenantOnSharedDBMode(ctx context.Context, tenantID string, sharedDB *meta.SharedDB, provider, keyName string, opts provisionTenantOptions, now time.Time, capacityMode meta.SharedDBCapacityMode, hardCap int) (*provisionTenantResult, error) {
-	fail := func(err error) (*provisionTenantResult, error) {
-		s.failTenantProvision(ctx, tenantID, provider)
-		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to place tenant on shared pool", err)
-	}
-	// Only the managed shared provider materializes a per-tenant virtual
-	// spending limit. Legacy native/zero routing to a manually registered shared
-	// DB pool must keep failing closed instead of silently dropping the request.
-	if provider != tenant.ProviderTiDBCloudNativeShared && opts.Quota != nil &&
-		opts.Quota.TiDBCloudSpendingLimit != nil && *opts.Quota.TiDBCloudSpendingLimit != 0 {
-		s.failTenantProvision(ctx, tenantID, provider)
-		return nil, newProvisionTenantError(http.StatusBadRequest,
-			"tidbcloud spending limit is not supported for shared-pool tenants",
-			fmt.Errorf("spending limit requested for shared-pool tenant"))
-	}
-	fsID, err := s.meta.EnsureFsID(ctx, tenantID)
-	if err != nil {
-		return fail(err)
-	}
-	// Forces the fts_only embedding profile (shared tables carry plain VECTOR
-	// columns — per-tenant EMBED_TEXT generated columns are impossible).
-	if err := s.meta.UpsertTenantAutoEmbeddingProfile(ctx, &meta.TenantAutoEmbeddingProfile{
-		TenantID:      tenantID,
-		EmbeddingMode: meta.TenantEmbeddingModeFTSOnly,
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	}); err != nil {
-		return fail(err)
-	}
-	// Token generation and encryption are pure computation — build the key
-	// material first so its insert can join the atomic transition.
-	apiToken, apiKeyID, keyRec, err := s.buildOwnerAPIKey(ctx, tenantID, keyName, opts.TokenVersion, opts.APIKeySource)
-	if err != nil {
-		return fail(err)
-	}
-	placement := &meta.TenantPlacement{
-		FsID:        fsID,
-		DbID:        sharedDB.ID,
-		Placement:   meta.PlacementShared,
-		SchemaShape: meta.SchemaShapeShared,
-	}
-	var provisionErr error
-	if capacityMode == meta.SharedDBCapacityEmergency {
-		provisionErr = s.meta.CompleteSharedTenantProvisionEmergency(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared, placement, keyRec, hardCap)
-	} else {
-		provisionErr = s.meta.CompleteSharedTenantProvision(ctx, tenantID, tenant.ProviderTiDBCloudNativeShared, placement, keyRec)
-	}
-	if provisionErr != nil {
-		if errors.Is(provisionErr, meta.ErrSharedDBCapacityExhausted) {
-			return nil, newProvisionTenantError(http.StatusConflict, "shared pool is at capacity", provisionErr)
-		}
-		return fail(provisionErr)
-	}
-	metricEvent(ctx, "metadb_query", "api", "insert_api_key", "result", "ok")
-	logger.Info(ctx, "server_event", eventFields(ctx, "provision_shared_pool_placed", "tenant_id", tenantID, "provider", tenant.ProviderTiDBCloudNativeShared, "db_pool_id", sharedDB.ID, "db_pool_uuid", sharedDB.UUID, "tidbcloud_org_id", sharedDB.TiDBCloudOrganizationID)...)
-	metricEvent(ctx, "tenant_provision", "provider", tenant.ProviderTiDBCloudNativeShared, "result", "shared_pool")
-	status := meta.TenantActive
-	switch sharedDB.Status {
-	case meta.SharedDBStatusPending:
-		status = meta.TenantPending
-	case meta.SharedDBStatusProvisioning:
-		status = meta.TenantProvisioning
-	}
-	return &provisionTenantResult{
-		TenantID:       tenantID,
-		APIKey:         apiToken,
-		APIKeyID:       apiKeyID,
-		Status:         status,
-		Provider:       tenant.ProviderTiDBCloudNativeShared,
-		OrganizationID: strings.TrimSpace(sharedDB.TiDBCloudOrganizationID),
-	}, nil
-}
-
 func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOptions) (*provisionTenantResult, error) {
 	rawProvider := s.defaultTenantProvider
 	if opts.Provider != "" {
@@ -5831,8 +5412,8 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			if err != nil {
 				return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to build free tenant quota", err)
 			}
-			// A reservation becomes countable only after its native org binding or shared
-			// placement is durable, so this lock must remain held through that persist.
+			// A reservation becomes countable only after its native org binding is
+			// durable, so this lock must remain held through that persist.
 			freeQuotaRelease, reservationErr = s.meta.AcquireTiDBCloudFreeQuotaLock(ctx, organizationID)
 			if reservationErr == nil {
 				var count int
@@ -5865,97 +5446,6 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "ok")
 	logProvisionStage(ctx, "provision_tenant_inserted", tenantID, provider, stageStarted, "status", meta.TenantPending)
-	if provider == tenant.ProviderTiDBCloudNativeShared {
-		if opts.CredentialProvisioner == nil {
-			s.failTenantProvision(ctx, tenantID, provider)
-			return nil, newProvisionTenantError(http.StatusBadRequest, tenant.ErrCredentialsRequired.Error(), tenant.ErrCredentialsRequired)
-		}
-		if err := s.materializeSharedTenantQuota(ctx, tenantID, opts); err != nil {
-			s.failTenantProvision(ctx, tenantID, provider)
-			return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
-		}
-		var lastConflict error
-		for attempt := 0; attempt < 2; attempt++ {
-			sharedDB, created, allocateErr := s.allocateManagedSharedDB(ctx, *opts.CredentialProvisioner, nil)
-			if allocateErr != nil {
-				s.failTenantProvision(ctx, tenantID, provider)
-				return nil, newProvisionTenantError(http.StatusBadGateway, "failed to allocate shared database", allocateErr)
-			}
-			if sharedDB.SpendingLimit != nil && (created || sharedDB.ClusterID == "" || sharedDB.Host == "" || sharedDB.Port <= 0 || sharedDB.User == "") {
-				plannedDB := sharedDB
-				sharedDB, err = s.ensureManagedSharedDBPhysical(ctx, plannedDB.ID)
-				if err != nil {
-					orgID, orgErr := s.firstManagedOrganization(ctx, *opts.CredentialProvisioner)
-					if orgErr == nil {
-						fallback, findErr := s.meta.FindSharedDBForEmergency(ctx, orgID, s.sharedDBHardCapRatio)
-						if findErr == nil {
-							hardCap, hardErr := s.managedSharedDBHardCap(fallback.MaxTenants)
-							if hardErr == nil {
-								res, reserveErr := s.provisionTenantOnSharedDBEmergency(ctx, tenantID, fallback, provider, keyName, opts, now, hardCap)
-								if reserveErr == nil {
-									if releaseErr := releaseFreeQuotaLock(); releaseErr != nil {
-										s.failTenantProvision(ctx, tenantID, provider)
-										return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to release free tenant quota lock", releaseErr)
-									}
-									s.scheduleManagedSharedDBContinuation(ctx, plannedDB.ID)
-									return res, nil
-								}
-								if isSharedDBReservationConflict(reserveErr) {
-									lastConflict = reserveErr
-									continue
-								}
-							}
-						}
-					}
-					s.failTenantProvision(ctx, tenantID, provider)
-					return nil, newProvisionTenantError(http.StatusBadGateway, "failed to create shared database", err)
-				}
-			}
-			res, reserveErr := s.provisionTenantOnManagedSharedDB(ctx, tenantID, sharedDB, provider, keyName, opts, now)
-			if reserveErr != nil {
-				if isSharedDBReservationConflict(reserveErr) {
-					lastConflict = reserveErr
-					continue
-				}
-				s.failTenantProvision(ctx, tenantID, provider)
-				return nil, reserveErr
-			}
-			if releaseErr := releaseFreeQuotaLock(); releaseErr != nil {
-				s.failTenantProvision(ctx, tenantID, provider)
-				return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to release free tenant quota lock", releaseErr)
-			}
-			if created || sharedDB.Status == meta.SharedDBStatusPending || sharedDB.Status == meta.SharedDBStatusProvisioning {
-				s.scheduleManagedSharedDBContinuation(ctx, sharedDB.ID)
-			}
-			return res, nil
-		}
-		s.failTenantProvision(ctx, tenantID, provider)
-		return nil, lastConflict
-	}
-
-	// Shared-pool placement: when a shared-schema database is registered for
-	// this tenant's exact TiDB Cloud organization, the tenant is placed on
-	// it directly — no cluster is created and the schema already exists there.
-	sharedDB, err := s.findSharedDBForProvision(ctx, provider, opts)
-	if err != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "provision_shared_pool_resolve_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		s.failTenantProvision(ctx, tenantID, provider)
-		return nil, newProvisionTenantError(http.StatusBadGateway, "failed to resolve shared-schema pool", err)
-	}
-	if sharedDB != nil {
-		res, provisionErr := s.provisionTenantOnSharedDB(ctx, tenantID, sharedDB, provider, keyName, opts, now)
-		if provisionErr != nil {
-			s.failTenantProvision(ctx, tenantID, provider)
-			return res, provisionErr
-		}
-		if releaseErr := releaseFreeQuotaLock(); releaseErr != nil {
-			s.failTenantProvision(ctx, tenantID, provider)
-			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to release free tenant quota lock", releaseErr)
-		}
-		return res, nil
-	}
-
 	if autoProfile != nil {
 		stageStarted = time.Now()
 		if err := s.meta.UpsertTenantAutoEmbeddingProfile(ctx, autoProfile); err != nil {

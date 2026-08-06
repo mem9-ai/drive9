@@ -152,9 +152,6 @@ type Store struct {
 	db             *sql.DB
 	useLegacyFiles bool // true when the legacy `files` table exists and needs dual-write
 	scope          Scope
-	// externalDB marks a Store wrapping a handle owned by someone else (a
-	// shared-pool *sql.DB serving many tenants); Close must not close it.
-	externalDB bool
 }
 
 func Open(dsn string) (*Store, error) {
@@ -166,12 +163,11 @@ func OpenForTenant(ctx context.Context, dsn, tenantID string) (*Store, error) {
 }
 
 func OpenForTenantWithOrg(ctx context.Context, dsn, tenantID, tidbCloudOrgID string) (*Store, error) {
-	return OpenForTenantScoped(ctx, dsn, tenantID, tidbCloudOrgID, StandaloneScope(0))
+	return OpenForTenantScoped(ctx, dsn, tenantID, tidbCloudOrgID, StandaloneScope())
 }
 
-// OpenForTenantScoped opens a Store whose SQL is shaped by scope: standalone
-// (per-tenant DB, no fs_id columns) or shared (multi-tenant DB with fs_id
-// row keys). The scope is fixed for the lifetime of the Store.
+// OpenForTenantScoped opens a Store whose SQL is shaped by scope. The scope
+// is fixed for the lifetime of the Store.
 func OpenForTenantScoped(ctx context.Context, dsn, tenantID, tidbCloudOrgID string, scope Scope) (*Store, error) {
 	lower := strings.ToLower(dsn)
 	if strings.Contains(lower, "multistatements=true") || strings.Contains(lower, "multistatements=1") {
@@ -192,20 +188,9 @@ func OpenForTenantScoped(ctx context.Context, dsn, tenantID, tidbCloudOrgID stri
 }
 
 func (s *Store) Close() error {
-	if s.externalDB {
-		return nil
-	}
 	return mysqlutil.CloseInstrumented(s.db)
 }
-func (s *Store) DB() *sql.DB  { return s.db }
-
-// NewStoreWithDB wraps an externally owned *sql.DB (e.g. a shared-pool handle
-// serving many tenants) with the given scope. Close is a no-op — the owner
-// controls the handle's lifetime. No legacy-files detection runs: shared
-// schema databases never carry the legacy files table.
-func NewStoreWithDB(db *sql.DB, scope Scope) *Store {
-	return &Store{db: db, scope: scope, externalDB: true}
-}
+func (s *Store) DB() *sql.DB { return s.db }
 
 // Scope returns the schema-shape scope fixed at construction.
 func (s *Store) Scope() Scope { return s.scope }
@@ -1511,13 +1496,6 @@ func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {
 	// check. If upload concurrency grows, re-evaluate the access path and add a
 	// more targeted uploads status/index strategy or a pre-aggregated quota state.
 	//
-	// In shared shape the fs_id predicate on the uploads driving alias is not
-	// enough: target paths are not globally unique, so the file_nodes join must
-	// also carry fs_id in its ON clause or one tenant's upload could join
-	// another tenant's dentry at the same path and misread its size. The
-	// inodes join needs the same guard: inode ids are unique only within a
-	// tenant in shared shape, so an unscoped join could read another tenant's
-	// confirmed size and understate this tenant's reservation.
 	err := db.QueryRow(`SELECT COALESCE(SUM(
 		CASE
 			WHEN u.total_size > COALESCE(i.size_bytes, 0) THEN u.total_size - COALESCE(i.size_bytes, 0)
@@ -1687,33 +1665,16 @@ func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
 				return err
 			}
 		}
-		// Whole-table wipes. In shared shape every one of these tables carries
-		// an fs_id column (vault tables included), so the DELETE must be
-		// restricted to this tenant's rows — unscoped it would destroy other
-		// tenants' runtime state. llm_usage is standalone-only (the central
-		// meta DB ledger is authoritative in shared deployments) and is wiped
-		// only there; a leftover standalone llm_usage table on a shared DB has
-		// no fs_id column to restrict by, so it must not be touched.
-		wipeTables := []string{"uploads", "file_gc_tasks", "semantic_tasks"}
-		if !s.scope.Shared() {
-			wipeTables = append(wipeTables, "llm_usage")
-		}
-		wipeTables = append(wipeTables,
+		wipeTables := []string{"uploads", "file_gc_tasks", "semantic_tasks", "llm_usage",
 			"vault_audit_log",
 			"vault_grants",
 			"vault_tokens",
 			"vault_secret_fields",
 			"vault_secrets",
 			"vault_deks",
-		)
+		}
 		for _, tbl := range wipeTables {
-			stmt := `DELETE FROM ` + tbl
-			args := []any(nil)
-			if s.scope.Shared() {
-				stmt += ` WHERE fs_id = ?`
-				args = s.scope.Args()
-			}
-			if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM `+tbl); err != nil {
 				if isMissingTableError(err) {
 					continue
 				}
@@ -1880,8 +1841,8 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at,
 		s.embedding_revision
 		FROM file_nodes fn
-		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
-		LEFT JOIN semantic s ON `+s.scope.AndOn(`i.inode_id = s.inode_id`, "s")+`
+		LEFT JOIN inodes i ON ` + s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i") + `
+		LEFT JOIN semantic s ON ` + s.scope.AndOn(`i.inode_id = s.inode_id`, "s") + `
 		WHERE ` + s.scope.AndAs("fn", `fn.parent_path_hash = ? AND fn.parent_path = ?`) + `
 		ORDER BY fn.name`
 	rows, err := s.db.QueryContext(ctx, q, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(parentPath), parentPath)...)...)
@@ -2402,19 +2363,9 @@ func pathPrefixPredicate(column, prefix string) (string, []any) {
 	return "BINARY " + column + " LIKE BINARY ? ESCAPE '\\\\'", []any{likeLiteralPrefixPattern(prefix)}
 }
 
-// andAsGrouped prefixes pred with the scope's fs_id predicate for WHERE
-// clauses whose top-level OR would otherwise escape the fs_id conjunct:
-// shared shape wraps pred in parentheses before applying And/AndAs. alias may
-// be empty for unqualified predicates. Standalone shape returns pred
-// byte-identical.
+// andAsGrouped returns pred unchanged.
 func (s *Store) andAsGrouped(alias, pred string) string {
-	if !s.scope.Shared() {
-		return pred
-	}
-	if alias == "" {
-		return s.scope.And("(" + pred + ")")
-	}
-	return s.scope.AndAs(alias, "("+pred+")")
+	return pred
 }
 
 // --- uploads operations ---

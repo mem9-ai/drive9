@@ -56,7 +56,7 @@ func TestSupportsClusterDelete(t *testing.T) {
 }
 
 func TestUsesTiDBCloudNativeCredentials(t *testing.T) {
-	for _, provider := range []string{ProviderTiDBCloudNative, ProviderTiDBCloudNativeShared} {
+	for _, provider := range []string{ProviderTiDBCloudNative} {
 		if !UsesTiDBCloudNativeCredentials(provider) {
 			t.Fatalf("%s should use the TiDB Cloud native credential family", provider)
 		}

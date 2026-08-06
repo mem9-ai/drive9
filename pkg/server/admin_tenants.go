@@ -138,7 +138,7 @@ func (s *Server) adminTenantAPIEnabled() bool {
 		return false
 	}
 	provider, err := tenant.NormalizeProvider(s.provisioner.ProviderType())
-	if err != nil || (provider != tenant.ProviderTiDBCloudNative && provider != tenant.ProviderTiDBCloudNativeShared) {
+	if err != nil || provider != tenant.ProviderTiDBCloudNative {
 		return false
 	}
 	_, ok := s.provisioner.(tenant.TiDBCloudAPIKeyIdentityResolver)
@@ -175,7 +175,7 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 	}
 	poolClaimStarted := time.Now()
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_started", "provider", tenant.ProviderTiDBCloudNative, "quota_requested", quotaOpt != nil)...)
-	res, pool, claimed, sharedPoolMatched, err := s.claimAdminTenantFromPoolWithAccess(r.Context(), cred, quotaOpt, access)
+	res, pool, claimed, err := s.claimAdminTenantFromPoolWithAccess(r.Context(), cred, quotaOpt, access)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_failed", "provider", tenant.ProviderTiDBCloudNative, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
 		status, msg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", err)
@@ -199,22 +199,13 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_create_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted))...)
 		return
 	}
-	provider := ""
-	if sharedPoolMatched {
-		provider = tenant.ProviderTiDBCloudNativeShared
-	}
-	logProvider := tenant.ProviderTiDBCloudNative
-	if provider != "" {
-		logProvider = provider
-	}
-	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_missed", "provider", logProvider, "duration_ms", durationMillis(poolClaimStarted))...)
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_missed", "provider", tenant.ProviderTiDBCloudNative, "duration_ms", durationMillis(poolClaimStarted))...)
 	res, err = s.provisionTenant(r.Context(), provisionTenantOptions{
 		KeyName:               "default",
 		TokenVersion:          1,
 		CredentialProvisioner: &cred,
 		TiDBCloudAccess:       access,
 		Quota:                 quotaOpt,
-		Provider:              provider,
 	})
 	if err != nil {
 		var pe *provisionTenantError
@@ -333,12 +324,7 @@ func (s *Server) handleAdminTenantQuotaSet(w http.ResponseWriter, r *http.Reques
 		errJSON(w, http.StatusConflict, err.Error())
 		return
 	}
-	var applyErr error
-	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
-		applyErr = s.applySharedQuotaSet(r.Context(), t, quotaReq)
-	} else {
-		applyErr = s.applyQuotaSet(r.Context(), "admin_tenant_quota_set", t, cred, quotaReq)
-	}
+	applyErr := s.applyQuotaSet(r.Context(), "admin_tenant_quota_set", t, cred, quotaReq)
 	if applyErr != nil {
 		writeQuotaSetError(w, r.Context(), applyErr, "update")
 		return
@@ -375,12 +361,6 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 	}
 	if t.Status == meta.TenantDeleted {
 		errJSON(w, http.StatusNotFound, "tenant not found")
-		return
-	}
-	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
-		s.handleSharedTenantDeleteWithStatusWriter(w, r, t, func(w http.ResponseWriter, status meta.TenantStatus) {
-			writeJSON(w, http.StatusAccepted, adminTenantDeleteResponse{TenantID: t.ID, Status: string(status)})
-		})
 		return
 	}
 	if t.StorageNamespaceID != "" {
@@ -467,38 +447,8 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 		errJSON(w, http.StatusNotFound, "tenant not found")
 		return nil, nil, false
 	}
-	if t.Provider == tenant.ProviderTiDBCloudNativeShared {
-		membership, membershipErr := s.meta.GetTenantPoolMembership(r.Context(), tenantID)
-		if membershipErr == nil && membership.PoolStatus == meta.TenantPoolBindingFree {
-			errJSON(w, http.StatusNotFound, "tenant not found")
-			return nil, nil, false
-		}
-		if membershipErr != nil && !errors.Is(membershipErr, meta.ErrNotFound) {
-			errJSON(w, http.StatusInternalServerError, "tenant pool membership lookup failed")
-			return nil, nil, false
-		}
-		physical, physicalErr := s.meta.GetSharedDBForTenant(r.Context(), t.ID)
-		if errors.Is(physicalErr, meta.ErrNotFound) {
-			errJSON(w, http.StatusNotFound, "tenant shared DB pool not found")
-			return nil, nil, false
-		}
-		if physicalErr != nil {
-			errJSON(w, backendErrorStatus(r.Context(), physicalErr), "tenant shared DB pool lookup failed")
-			return nil, nil, false
-		}
-		if physical == nil {
-			errJSON(w, http.StatusNotFound, "tenant shared DB pool not found")
-			return nil, nil, false
-		}
-		if !tiDBCloudOrganizationMatches(organizationID, physical.TiDBCloudOrganizationID) {
-			errJSON(w, http.StatusForbidden, "TiDB Cloud API key organization does not match tenant")
-			return nil, nil, false
-		}
-		setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, physical.TiDBCloudOrganizationID, classifyTenantRequest(r))
-		return t, nil, true
-	}
 	if t.Provider != tenant.ProviderTiDBCloudNative {
-		errJSON(w, http.StatusConflict, "admin tenant API is only supported for tidb_cloud_native or tidb_cloud_native_shared tenants")
+		errJSON(w, http.StatusConflict, "admin tenant API is only supported for tidb_cloud_native tenants")
 		return nil, nil, false
 	}
 	binding, err := s.meta.GetTenantTiDBCloudOrgBinding(r.Context(), tenantID)

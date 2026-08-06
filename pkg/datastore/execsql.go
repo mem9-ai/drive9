@@ -2,7 +2,6 @@ package datastore
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -13,12 +12,6 @@ import (
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 )
-
-// ErrExecSQLNotSupportedShared is returned by ExecSQL when the Store
-// addresses a shared-schema (fs_id) database. Raw agent SQL carries no fs_id
-// predicates and cannot be rewritten to be tenant-safe, so it is rejected
-// outright in shared shape.
-var ErrExecSQLNotSupportedShared = errors.New("exec SQL is not supported on shared-schema stores")
 
 var wsNorm = regexp.MustCompile(`\s+`)
 
@@ -35,13 +28,6 @@ func (s *Store) ExecSQL(ctx context.Context, query string) (out []map[string]int
 		}
 		metrics.RecordOperation("datastore", "exec_sql", result, time.Since(start))
 	}()
-
-	// Shared shape: raw agent SQL cannot be made tenant-safe, so reject it
-	// before anything executes.
-	if s != nil && s.scope.Shared() {
-		err = ErrExecSQLNotSupportedShared
-		return nil, err
-	}
 
 	q := strings.TrimSpace(query)
 	norm := strings.ToUpper(normalizeSQL(q))

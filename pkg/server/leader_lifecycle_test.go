@@ -325,7 +325,7 @@ func TestStopLeaderWorkersDoesNotHoldLifecycleLockWhileWaiting(t *testing.T) {
 		defer srv.leaderWorkerWG.Done()
 		<-ctx.Done()
 		close(workerExiting)
-		_ = srv.startManagedSharedDBWorker(ctx, func(context.Context) {})
+		srv.startLeaderGoroutine(ctx, func(context.Context) {})
 	}()
 
 	stopped := make(chan struct{})

@@ -19,7 +19,7 @@ const EnvTiDBCloudClustersBackend = "DRIVE9_TIDBCLOUD_CLUSTERS_BACKEND"
 
 // ClustersAPI is the TiDB Cloud control-plane surface used by Provisioner.
 // HTTPClustersAPI talks to the real OpenAPI; LocalClustersAPI simulates it with
-// one local TiDB instance per Cloud cluster so drive9 shared/warm-pool logic
+// one local TiDB instance per Cloud cluster so drive9 warm-pool logic
 // can run unchanged.
 type ClustersAPI interface {
 	CreateCluster(ctx context.Context, publicKey, privateKey string, body []byte) (*clusterInfo, error)
@@ -55,7 +55,7 @@ func IsLocalClustersBackend() bool {
 	return ClustersBackendFromEnv() == "local"
 }
 
-// DBTLSModeForBackend returns the mysql driver TLS mode for tenant/shared DB
+// DBTLSModeForBackend returns the mysql driver TLS mode for tenant DB
 // connections. Local Docker TiDB has no TLS.
 func DBTLSModeForBackend() string {
 	if IsLocalClustersBackend() {

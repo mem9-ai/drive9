@@ -14,51 +14,32 @@ func TestCountTiDBCloudFreeTenantsUsesExplicitZeroAndNonDeletedStatus(t *testing
 	zero, positive := int64(0), int64(100)
 	tests := []struct {
 		id         string
-		provider   string
 		status     TenantStatus
 		org        string
 		spending   *int64
 		poolStatus TenantPoolBindingStatus
 		want       bool
 	}{
-		{id: "native-pending-zero", provider: tidbCloudNativeProvider, status: TenantPending, org: "org-a", spending: &zero, want: true},
-		{id: "native-active-zero", provider: tidbCloudNativeProvider, status: TenantActive, org: "org-a", spending: &zero, want: true},
-		{id: "shared-failed-zero", provider: tidbCloudNativeSharedProvider, status: TenantFailed, org: "org-a", spending: &zero, want: true},
-		{id: "shared-deleting-zero", provider: tidbCloudNativeSharedProvider, status: TenantDeleting, org: "org-a", spending: &zero, want: true},
-		{id: "native-deleted-zero", provider: tidbCloudNativeProvider, status: TenantDeleted, org: "org-a", spending: &zero},
-		{id: "shared-active-positive", provider: tidbCloudNativeSharedProvider, status: TenantActive, org: "org-a", spending: &positive},
-		{id: "native-active-null", provider: tidbCloudNativeProvider, status: TenantActive, org: "org-a"},
-		{id: "shared-other-org-zero", provider: tidbCloudNativeSharedProvider, status: TenantActive, org: "org-b", spending: &zero},
-		{id: "native-free-pool-inventory", provider: tidbCloudNativeProvider, status: TenantActive, org: "org-a", spending: &zero, poolStatus: TenantPoolBindingFree},
-		{id: "shared-free-pool-inventory", provider: tidbCloudNativeSharedProvider, status: TenantActive, org: "org-a", spending: &zero, poolStatus: TenantPoolBindingFree},
+		{id: "native-pending-zero", status: TenantPending, org: "org-a", spending: &zero, want: true},
+		{id: "native-active-zero", status: TenantActive, org: "org-a", spending: &zero, want: true},
+		{id: "native-deleted-zero", status: TenantDeleted, org: "org-a", spending: &zero},
+		{id: "native-active-positive", status: TenantActive, org: "org-a", spending: &positive},
+		{id: "native-active-null", status: TenantActive, org: "org-a"},
+		{id: "native-other-org-zero", status: TenantActive, org: "org-b", spending: &zero},
+		{id: "native-free-pool-inventory", status: TenantActive, org: "org-a", spending: &zero, poolStatus: TenantPoolBindingFree},
 	}
 	want := 0
 	for _, tt := range tests {
-		insertFreeQuotaTestTenant(t, s, tt.id, tt.status, tt.provider)
-		switch tt.provider {
-		case tidbCloudNativeProvider:
-			binding := &TenantTiDBCloudOrgBinding{
-				TenantID: tt.id, OrganizationID: tt.org, ClusterID: "cluster-" + tt.id,
-			}
-			if tt.poolStatus != "" {
-				binding.PoolID = "pool-" + tt.id
-				binding.PoolStatus = tt.poolStatus
-			}
-			if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, binding); err != nil {
-				t.Fatal(err)
-			}
-		case tidbCloudNativeSharedProvider:
-			insertSharedTenantPlacementForExistingTenantTest(t, s, tt.id, tt.org)
-			if tt.poolStatus != "" {
-				if err := s.UpsertTenantPoolMembership(ctx, &TenantPoolMembership{
-					TenantID: tt.id, PoolID: "pool-" + tt.id,
-					TiDBCloudOrganizationID: tt.org, PoolStatus: tt.poolStatus,
-				}); err != nil {
-					t.Fatal(err)
-				}
-			}
-		default:
-			t.Fatalf("unsupported provider %q", tt.provider)
+		insertFreeQuotaTestTenant(t, s, tt.id, tt.status, tidbCloudNativeProvider)
+		binding := &TenantTiDBCloudOrgBinding{
+			TenantID: tt.id, OrganizationID: tt.org, ClusterID: "cluster-" + tt.id,
+		}
+		if tt.poolStatus != "" {
+			binding.PoolID = "pool-" + tt.id
+			binding.PoolStatus = tt.poolStatus
+		}
+		if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, binding); err != nil {
+			t.Fatal(err)
 		}
 		if tt.spending != nil {
 			if err := s.SetQuotaConfigPatch(ctx, tt.id, QuotaConfigPatch{TiDBCloudSpendingLimit: tt.spending}); err != nil {
@@ -77,31 +58,6 @@ func TestCountTiDBCloudFreeTenantsUsesExplicitZeroAndNonDeletedStatus(t *testing
 	}
 	if got != want {
 		t.Fatalf("free tenant count = %d, want %d", got, want)
-	}
-}
-
-func insertSharedTenantPlacementForExistingTenantTest(t *testing.T, s *Store, tenantID, organizationID string) {
-	t.Helper()
-	ctx := context.Background()
-	fsID, err := s.EnsureFsID(ctx, tenantID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
-		TiDBCloudOrganizationID: organizationID,
-		Host:                    tenantID + ".shared.example.com",
-		Port:                    4000,
-		User:                    "root",
-		PasswordCipher:          []byte("cipher"),
-		Name:                    "shared_" + tenantID,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.UpsertTenantPlacement(ctx, &TenantPlacement{
-		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
-	}); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -198,9 +154,9 @@ func TestDeleteStaleTiDBCloudFreeReservationRequiresReservationOnlyShape(t *test
 	ctx := context.Background()
 	cutoff := time.Now().UTC().Add(-time.Minute)
 
-	insertReservation := func(tenantID, provider string) {
+	insertReservation := func(tenantID string) {
 		t.Helper()
-		insertFreeQuotaTestTenant(t, s, tenantID, TenantPending, provider)
+		insertFreeQuotaTestTenant(t, s, tenantID, TenantPending, tidbCloudNativeProvider)
 		zero := int64(0)
 		if err := s.SetQuotaConfigPatch(ctx, tenantID, QuotaConfigPatch{TiDBCloudSpendingLimit: &zero}); err != nil {
 			t.Fatal(err)
@@ -227,7 +183,7 @@ func TestDeleteStaleTiDBCloudFreeReservationRequiresReservationOnlyShape(t *test
 		}
 	}
 
-	insertReservation("reservation-only", tidbCloudNativeProvider)
+	insertReservation("reservation-only")
 	deleted, err := s.DeleteStaleTiDBCloudFreeReservation(ctx, "reservation-only", cutoff)
 	if err != nil {
 		t.Fatal(err)
@@ -243,14 +199,14 @@ func TestDeleteStaleTiDBCloudFreeReservationRequiresReservationOnlyShape(t *test
 		t.Fatalf("reservation-only status = %s, want %s", reservation.Status, TenantDeleted)
 	}
 
-	insertReservation("reservation-namespace", tidbCloudNativeProvider)
+	insertReservation("reservation-namespace")
 	if _, err := s.DB().ExecContext(ctx, `UPDATE tenants SET storage_namespace_id = 'namespace-1', updated_at = ?
 		WHERE id = 'reservation-namespace'`, cutoff.Add(-time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	assertNotDeleted("reservation-namespace", TenantPending)
 
-	insertReservation("reservation-api-key", tidbCloudNativeProvider)
+	insertReservation("reservation-api-key")
 	if _, err := s.DB().ExecContext(ctx, `INSERT INTO tenant_api_keys
 		(id, tenant_id, key_name, jwt_ciphertext, jwt_hash, status)
 		VALUES ('key-reservation', 'reservation-api-key', 'default', X'01', 'hash-reservation', 'revoked')`); err != nil {
@@ -258,14 +214,14 @@ func TestDeleteStaleTiDBCloudFreeReservationRequiresReservationOnlyShape(t *test
 	}
 	assertNotDeleted("reservation-api-key", TenantPending)
 
-	insertReservation("reservation-cluster", tidbCloudNativeProvider)
+	insertReservation("reservation-cluster")
 	if _, err := s.DB().ExecContext(ctx, `UPDATE tenants SET cluster_id = 'cluster-reservation', updated_at = ?
 		WHERE id = 'reservation-cluster'`, cutoff.Add(-time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	assertNotDeleted("reservation-cluster", TenantPending)
 
-	insertReservation("reservation-native-binding", tidbCloudNativeProvider)
+	insertReservation("reservation-native-binding")
 	if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
 		TenantID: "reservation-native-binding", OrganizationID: "org-reservation-cleanup", ClusterID: "cluster-native-binding",
 	}); err != nil {
@@ -273,39 +229,13 @@ func TestDeleteStaleTiDBCloudFreeReservationRequiresReservationOnlyShape(t *test
 	}
 	assertNotDeleted("reservation-native-binding", TenantPending)
 
-	insertReservation("reservation-placement", tidbCloudNativeProvider)
-	fsID, err := s.EnsureFsID(ctx, "reservation-placement")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
-		TiDBCloudOrganizationID: "org-reservation-cleanup", Host: "reservation-placement.example", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "reservation_placement",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.UpsertTenantPlacement(ctx, &TenantPlacement{
-		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	assertNotDeleted("reservation-placement", TenantPending)
-
-	insertReservation("reservation-membership", tidbCloudNativeSharedProvider)
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO tenant_pool_memberships
-		(tenant_id, pool_id, pool_status) VALUES ('reservation-membership', 'pool-reservation', 'free')`); err != nil {
-		t.Fatal(err)
-	}
-	assertNotDeleted("reservation-membership", TenantPending)
-
-	insertReservation("reservation-fresh", tidbCloudNativeProvider)
+	insertReservation("reservation-fresh")
 	if _, err := s.DB().ExecContext(ctx, `UPDATE tenants SET updated_at = ? WHERE id = 'reservation-fresh'`, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	assertNotDeleted("reservation-fresh", TenantPending)
 
-	insertReservation("reservation-status-changed", tidbCloudNativeProvider)
+	insertReservation("reservation-status-changed")
 	if _, err := s.DB().ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = 'reservation-status-changed'`, TenantProvisioning, cutoff.Add(-time.Minute)); err != nil {
 		t.Fatal(err)
 	}
@@ -342,38 +272,6 @@ func TestHasTenantPoolOwnershipUsesExplicitOwnershipMetadata(t *testing.T) {
 	owned, err = s.HasTenantPoolOwnership(ctx, "ownership-native-pool")
 	if err != nil || !owned {
 		t.Fatalf("native pool ownership = %v, err=%v, want true", owned, err)
-	}
-
-	insertFreeQuotaTestTenant(t, s, "ownership-membership", TenantPending, tidbCloudNativeSharedProvider)
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO tenant_pool_memberships
-		(tenant_id, pool_id, pool_status) VALUES ('ownership-membership', 'pool-membership', 'free')`); err != nil {
-		t.Fatal(err)
-	}
-	owned, err = s.HasTenantPoolOwnership(ctx, "ownership-membership")
-	if err != nil || !owned {
-		t.Fatalf("membership ownership = %v, err=%v, want true", owned, err)
-	}
-
-	insertFreeQuotaTestTenant(t, s, "ownership-placement", TenantPending, tidbCloudNativeSharedProvider)
-	fsID, err := s.EnsureFsID(ctx, "ownership-placement")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
-		TiDBCloudOrganizationID: "org-ownership-placement", Host: "ownership-placement.example", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "ownership_placement",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.UpsertTenantPlacement(ctx, &TenantPlacement{
-		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	owned, err = s.HasTenantPoolOwnership(ctx, "ownership-placement")
-	if err != nil || !owned {
-		t.Fatalf("placement ownership = %v, err=%v, want true", owned, err)
 	}
 }
 

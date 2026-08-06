@@ -186,16 +186,15 @@ func TestTenantPoolClaimReturnsWithoutWaitingForFailedCleanupAndPassesCredential
 	})
 	wantCred := tenant.CredentialProvisionRequest{PublicKey: "request-public", PrivateKey: "request-private"}
 	type claimResult struct {
-		result            *provisionTenantResult
-		pool              *meta.TenantPool
-		claimed           bool
-		sharedPoolMatched bool
-		err               error
+		result  *provisionTenantResult
+		pool    *meta.TenantPool
+		claimed bool
+		err     error
 	}
 	claimDone := make(chan claimResult, 1)
 	go func() {
-		result, pool, claimed, sharedPoolMatched, err := rt.server.claimAdminTenantFromPool(ctx, wantCred, nil)
-		claimDone <- claimResult{result, pool, claimed, sharedPoolMatched, err}
+		result, pool, claimed, err := rt.server.claimAdminTenantFromPool(ctx, wantCred, nil)
+		claimDone <- claimResult{result, pool, claimed, err}
 	}()
 
 	var gotCred tenant.CredentialProvisionRequest
@@ -206,7 +205,7 @@ func TestTenantPoolClaimReturnsWithoutWaitingForFailedCleanupAndPassesCredential
 	}
 	select {
 	case got := <-claimDone:
-		if got.err != nil || got.result != nil || got.pool != nil || got.claimed || got.sharedPoolMatched {
+		if got.err != nil || got.result != nil || got.pool != nil || got.claimed {
 			t.Fatalf("claim result = %+v, want non-pool miss", got)
 		}
 	case <-time.After(time.Second):
@@ -233,10 +232,10 @@ func TestTenantPoolClaimTriggersDirectFailedCleanupWithoutLogicalPool(t *testing
 	upsertFailedCleanupNativeBinding(t, rt, claimedTenantID, "cluster-claimed", "pool-claimed", meta.TenantPoolBindingUsed)
 	wantCred := tenant.CredentialProvisionRequest{PublicKey: "public-direct", PrivateKey: "private-direct"}
 
-	result, pool, claimed, sharedPoolMatched, err := rt.server.claimAdminTenantFromPool(ctx, wantCred, nil)
-	if err != nil || result != nil || pool != nil || claimed || sharedPoolMatched {
-		t.Fatalf("claim result = result=%+v pool=%+v claimed=%v shared=%v err=%v, want non-pool miss",
-			result, pool, claimed, sharedPoolMatched, err)
+	result, pool, claimed, err := rt.server.claimAdminTenantFromPool(ctx, wantCred, nil)
+	if err != nil || result != nil || pool != nil || claimed {
+		t.Fatalf("claim result = result=%+v pool=%+v claimed=%v err=%v, want non-pool miss",
+			result, pool, claimed, err)
 	}
 	rt.server.forkWorkerWG.Wait()
 
@@ -262,11 +261,11 @@ func TestTenantPoolClaimResultUnaffectedByFailedCleanupError(t *testing.T) {
 	cleanupErr := errors.New("cloud cleanup failed")
 	rt.prov.deprovisionErr = cleanupErr
 
-	result, pool, claimed, sharedPoolMatched, err := rt.server.claimAdminTenantFromPool(ctx,
+	result, pool, claimed, err := rt.server.claimAdminTenantFromPool(ctx,
 		tenant.CredentialProvisionRequest{PublicKey: "public-failure", PrivateKey: "private-failure"}, nil)
-	if err != nil || result != nil || pool != nil || claimed || sharedPoolMatched {
-		t.Fatalf("claim result = result=%+v pool=%+v claimed=%v shared=%v err=%v, want unaffected non-pool miss",
-			result, pool, claimed, sharedPoolMatched, err)
+	if err != nil || result != nil || pool != nil || claimed {
+		t.Fatalf("claim result = result=%+v pool=%+v claimed=%v err=%v, want unaffected non-pool miss",
+			result, pool, claimed, err)
 	}
 	rt.server.forkWorkerWG.Wait()
 

@@ -90,10 +90,6 @@ type TiDBCloudAPIKeyIdentityResolver interface {
 	ResolveAPIKeyIdentity(ctx context.Context, req CredentialProvisionRequest) (*TiDBCloudAPIKeyIdentity, error)
 }
 
-type SharedCredentialProvider interface {
-	DefaultSharedCredentials() (CredentialProvisionRequest, bool)
-}
-
 type QuotaCloudConfig struct {
 	TiDBCloudSpendingLimitMonthly *int64
 	Labels                        map[string]string
@@ -118,61 +114,6 @@ type TenantPoolClusterManager interface {
 	MarkClusterPoolUsed(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest, usedAt time.Time, opts QuotaUpdateOptions) (*QuotaCloudConfig, error)
 	MarkClusterPoolFree(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
 }
-
-type SharedDBPoolCreateRequest struct {
-	DBPoolID               int64
-	DBPoolUUID             string
-	CustomerOrganizationID string
-	DatabaseName           string
-	RootPassword           string
-	SpendingLimitMonthly   int64
-}
-
-type SharedDBPoolInfo struct {
-	DBPoolID       int64
-	DBPoolUUID     string
-	ClusterID      string
-	OrganizationID string
-	Host           string
-	Port           int
-	Username       string
-	Password       string
-	DBName         string
-}
-
-type SharedDBPoolLoadRequest struct {
-	DBPoolID   int64
-	DBPoolUUID string
-	ClusterID  string
-}
-
-type SharedDBPoolBatchLoader interface {
-	// BatchLoadSharedDBPoolsWithCredentials refreshes known cluster IDs and
-	// discovers requests without a cluster ID by their durable DB-pool UUID.
-	BatchLoadSharedDBPoolsWithCredentials(ctx context.Context, requests []SharedDBPoolLoadRequest, req CredentialProvisionRequest) ([]*SharedDBPoolInfo, error)
-}
-
-type SharedDBPoolLister interface {
-	// ListSharedDBPoolsWithCredentials returns every exact managed cluster
-	// carrying one durable DB-pool UUID. Cleanup uses it to converge duplicate
-	// Cloud resources instead of failing forever on ambiguity.
-	ListSharedDBPoolsWithCredentials(ctx context.Context, dbPoolID int64, dbPoolUUID string, req CredentialProvisionRequest) ([]*SharedDBPoolInfo, error)
-}
-
-type SharedDBPoolProvisioner interface {
-	Provisioner
-	// BatchProvisionSharedDBPoolsWithCredentials may return the successfully
-	// decoded subset together with a non-nil error. Callers must persist/process
-	// every returned result before handling the error.
-	BatchProvisionSharedDBPoolsWithCredentials(ctx context.Context, requests []SharedDBPoolCreateRequest, req CredentialProvisionRequest) ([]*SharedDBPoolInfo, error)
-	LoadSharedDBPoolWithCredentials(ctx context.Context, dbPoolID int64, dbPoolUUID, clusterID string, req CredentialProvisionRequest) (*SharedDBPoolInfo, error)
-}
-
-type SharedDBPoolMetadataWaiter interface {
-	WaitForSharedDBPoolMetadataWithCredentials(ctx context.Context, dbPoolID int64, dbPoolUUID, clusterID string, req CredentialProvisionRequest) (*SharedDBPoolInfo, error)
-}
-
-var ErrSharedDBPoolAmbiguous = errors.New("multiple shared db pool cloud resources found")
 
 type TenantPoolClusterMetadataWaiter interface {
 	Provisioner

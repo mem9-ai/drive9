@@ -433,7 +433,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Dedicated role=user DB connections. No data is expected for native_shared tenants.",
+      "description": "Dedicated role=user DB connections.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1704,7 +1704,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Dedicated role=user pools for this tenant. Native_shared tenants do not emit a tenant-specific DB pool.",
+      "description": "Dedicated role=user pools for this tenant.",
       "fieldConfig": {
         "defaults": {
           "color": {

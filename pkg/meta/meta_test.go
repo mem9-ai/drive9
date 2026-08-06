@@ -10,8 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/mem9-ai/drive9/internal/testmysql"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 )
@@ -25,38 +23,6 @@ func newControlStore(t *testing.T) *Store {
 	t.Cleanup(func() { _ = s.Close() })
 	testmysql.ResetMetaDB(t, s.DB())
 	return s
-}
-
-func insertSharedTenantPlacementForOrgTest(t *testing.T, s *Store, tenantID, organizationID string) {
-	t.Helper()
-	t.Cleanup(func() {
-		testmysql.ResetMetaDB(t, s.DB())
-	})
-	ctx := context.Background()
-	now := time.Now().UTC()
-	if err := s.InsertTenant(ctx, &Tenant{
-		ID: tenantID, Status: TenantActive, Kind: TenantKindLive,
-		Provider: tidbCloudNativeSharedProvider, DBPasswordCipher: []byte{}, DBTLS: true,
-		SchemaVersion: 1, CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	fsID, err := s.EnsureFsID(ctx, tenantID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
-		TiDBCloudOrganizationID: organizationID, Host: "shared.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_db",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.UpsertTenantPlacement(ctx, &TenantPlacement{
-		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
-	}); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestMetaDBMetrics(t *testing.T) {
@@ -285,33 +251,6 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 	}
 	if issuerKept.APIKey.Status != APIKeyActive {
 		t.Fatalf("issuer kept key status = %s, want %s", issuerKept.APIKey.Status, APIKeyActive)
-	}
-}
-
-func TestResolveByAPIKeyHashUsesSharedDBOrganization(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	now := time.Now().UTC()
-	tenantID := "shared-api-key-org"
-	insertSharedTenantPlacementForOrgTest(t, s, tenantID, "org-shared-api-key")
-	if err := s.InsertAPIKey(ctx, &APIKey{
-		ID: "shared-api-key", TenantID: tenantID, KeyName: "default",
-		JWTCiphertext: []byte("jwt-cipher"), JWTHash: "shared-api-key-hash", TokenVersion: 1,
-		Status: APIKeyActive, ScopeKind: APIKeyScopeKindOwner,
-		IssuedAt: now, CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := s.ResolveByAPIKeyHash(ctx, "shared-api-key-hash")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.TiDBCloudOrgID != "org-shared-api-key" {
-		t.Fatalf("resolved org = %q, want org-shared-api-key", got.TiDBCloudOrgID)
-	}
-	if got.Tenant.TiDBCloudOrgID != "org-shared-api-key" {
-		t.Fatalf("tenant org = %q, want org-shared-api-key", got.Tenant.TiDBCloudOrgID)
 	}
 }
 
@@ -883,25 +822,6 @@ func TestFinalizeTenantDeleteUpdatesJobNamespaceAndTenant(t *testing.T) {
 	if !updated {
 		t.Fatal("MarkTenantDeleteJobRunning updated = false, want true")
 	}
-	dbID, err := s.RegisterSharedDB(ctx, &SharedDB{
-		TiDBCloudOrganizationID: "org-delete-finalize", Host: "shared.example.com", Port: 4000,
-		User: "root", PasswordCipher: []byte("cipher"), Name: "shared_delete_finalize",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	fsID, err := s.EnsureFsID(ctx, "delete-finalize-tenant")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.UpsertTenantPlacement(ctx, &TenantPlacement{
-		FsID: fsID, DbID: dbID, Placement: PlacementShared, SchemaShape: SchemaShapeShared,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.DB().ExecContext(ctx, "UPDATE tenant_placements SET status = ? WHERE fs_id = ?", PlacementStatusDeleting, fsID); err != nil {
-		t.Fatal(err)
-	}
 	if err := s.FinalizeTenantDelete(ctx, "delete-finalize-tenant", "delete-finalize-ns", 11, 2); err != nil {
 		t.Fatal(err)
 	}
@@ -928,9 +848,6 @@ func TestFinalizeTenantDeleteUpdatesJobNamespaceAndTenant(t *testing.T) {
 	}
 	if _, err := s.GetTenantTiDBCloudOrgBinding(ctx, "delete-finalize-tenant"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("org binding err = %v, want %v", err, ErrNotFound)
-	}
-	if _, err := s.GetTenantPlacement(ctx, fsID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("deleting placement after finalization = %v, want %v", err, ErrNotFound)
 	}
 }
 
@@ -983,105 +900,6 @@ func TestListTenantNotifySinceIncludesTiDBCloudOrgBinding(t *testing.T) {
 		return
 	}
 	t.Fatalf("missing notify row for tenant %s: %+v", tenantID, rows)
-}
-
-func TestListTenantNotifySinceUsesSharedDBOrganization(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	if _, err := s.DB().ExecContext(ctx, `DELETE FROM tenant_notify_outbox`); err != nil {
-		t.Fatal(err)
-	}
-	tenantID := "notify-shared-tenant"
-	insertSharedTenantPlacementForOrgTest(t, s, tenantID, "org-notify-shared")
-	if err := s.InsertTenantNotify(ctx, tenantID, 3); err != nil {
-		t.Fatal(err)
-	}
-
-	rows, err := s.ListTenantNotifySince(ctx, 0, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rows) != 1 {
-		t.Fatalf("notify row count = %d, want 1", len(rows))
-	}
-	if rows[0].TiDBCloudOrgID != "org-notify-shared" {
-		t.Fatalf("notify row org = %q, want org-notify-shared", rows[0].TiDBCloudOrgID)
-	}
-}
-
-func TestListPendingMutationsUsesSharedDBOrganization(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	if _, err := s.DB().ExecContext(ctx, `DELETE FROM quota_mutation_log`); err != nil {
-		t.Fatal(err)
-	}
-	tenantID := "mutation-shared-tenant"
-	insertSharedTenantPlacementForOrgTest(t, s, tenantID, "org-mutation-shared")
-	id, err := s.InsertMutationLog(ctx, &MutationLogEntry{
-		TenantID: tenantID, MutationType: "file_create", MutationData: []byte(`{"file_id":"f1"}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.DB().ExecContext(ctx, `UPDATE quota_mutation_log SET created_at = ? WHERE id = ?`, time.Now().UTC().Add(-time.Minute), id); err != nil {
-		t.Fatal(err)
-	}
-
-	rows, err := s.ListPendingMutations(ctx, 0, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rows) != 1 {
-		t.Fatalf("mutation row count = %d, want 1", len(rows))
-	}
-	if rows[0].TiDBCloudOrgID != "org-mutation-shared" {
-		t.Fatalf("mutation row org = %q, want org-mutation-shared", rows[0].TiDBCloudOrgID)
-	}
-}
-
-func TestObservePendingMutationsUsesSharedDBOrganization(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	if _, err := s.DB().ExecContext(ctx, `DELETE FROM quota_mutation_log`); err != nil {
-		t.Fatal(err)
-	}
-	tenantID := "mutation-observe-shared-tenant"
-	insertSharedTenantPlacementForOrgTest(t, s, tenantID, "org-mutation-observe-shared")
-	oldest := time.Now().UTC().Add(-5 * time.Minute)
-	firstID, err := s.InsertMutationLog(ctx, &MutationLogEntry{
-		TenantID: tenantID, MutationType: "file_delete", MutationData: []byte(`{"file_id":"f1"}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.InsertMutationLog(ctx, &MutationLogEntry{
-		TenantID: tenantID, MutationType: "file_delete", MutationData: []byte(`{"file_id":"f2"}`),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.DB().ExecContext(ctx, `UPDATE quota_mutation_log SET created_at = ? WHERE id = ?`, oldest, firstID); err != nil {
-		t.Fatal(err)
-	}
-
-	rows, err := s.ObservePendingMutations(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, row := range rows {
-		if row.TenantID == tenantID {
-			if row.TiDBCloudOrgID != "org-mutation-observe-shared" {
-				t.Fatalf("mutation observation org = %q, want org-mutation-observe-shared", row.TiDBCloudOrgID)
-			}
-			if row.PendingCount != 2 {
-				t.Fatalf("mutation observation pending count = %d, want 2", row.PendingCount)
-			}
-			if row.OldestPendingAgeSeconds < 4*60 || row.OldestPendingAgeSeconds > 6*60 {
-				t.Fatalf("mutation observation oldest age = %.3fs, want about 5m", row.OldestPendingAgeSeconds)
-			}
-			return
-		}
-	}
-	t.Fatalf("missing mutation observation for tenant %q", tenantID)
 }
 
 func TestListTenantsByStatus(t *testing.T) {
@@ -1580,368 +1398,6 @@ func TestMetaSchemaSpecIncludesTiDBCloudOrgBindings(t *testing.T) {
 	}
 }
 
-func TestMetaSchemaSpecIncludesManagedSharedDBControlPlane(t *testing.T) {
-	dbPool := mustMetaTableSpec(t, mustMetaSpec(t), "db_pool")
-	for _, column := range []string{
-		"db_id", "uuid", "org_id", "cluster_id", "provisioning_key", "cloud_provider", "region",
-		"role", "db_host", "db_port", "db_user", "db_password", "db_name", "db_tls",
-		"max_tenants", "tenant_count", "soft_cap_reached", "spending_limit", "schema_version", "status", "status_updated_at",
-		"created_at", "updated_at",
-	} {
-		if _, ok := dbPool.columns[column]; !ok {
-			t.Fatalf("db_pool schema missing %s", column)
-		}
-	}
-	for _, index := range []string{
-		"primary", "uk_db_pool_uuid", "uk_db_pool_cluster_id",
-		"idx_db_pool_allocate", "idx_db_pool_provisioning_key", "idx_db_pool_role_status_id",
-	} {
-		if _, ok := dbPool.indexes[index]; !ok {
-			t.Fatalf("db_pool schema missing index %s", index)
-		}
-	}
-	pools := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_tidbcloud_pools")
-	if _, ok := pools.indexes["idx_tidbcloud_pool_status_id"]; !ok {
-		t.Fatal("tenant_tidbcloud_pools schema missing idx_tidbcloud_pool_status_id")
-	}
-	if _, ok := dbPool.indexes["uk_db_pool_endpoint"]; ok {
-		t.Fatal("db_pool schema must not define endpoint uniqueness")
-	}
-
-	memberships := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_pool_memberships")
-	for _, column := range []string{
-		"tenant_id", "tidbcloud_organization_id", "pool_id", "pool_status", "used_at", "created_at", "updated_at",
-	} {
-		if _, ok := memberships.columns[column]; !ok {
-			t.Fatalf("tenant_pool_memberships schema missing %s", column)
-		}
-	}
-	if _, ok := memberships.columns["organization_id"]; ok {
-		t.Fatal("tenant_pool_memberships must not use ambiguous organization_id column")
-	}
-	for _, index := range []string{"primary", "idx_tenant_pool_claim", "idx_tenant_pool_org_status"} {
-		if _, ok := memberships.indexes[index]; !ok {
-			t.Fatalf("tenant_pool_memberships schema missing index %s", index)
-		}
-	}
-}
-
-func TestDBPoolClusterIDIndexIsGloballyUnique(t *testing.T) {
-	s := newControlStore(t)
-	columns, err := loadMetaIndexColumns(context.Background(), s.DB(), "db_pool", "uk_db_pool_cluster_id")
-	if err != nil {
-		t.Fatalf("load uk_db_pool_cluster_id columns: %v", err)
-	}
-	if want := []string{"cluster_id"}; !sameStringSlice(columns, want) {
-		t.Fatalf("uk_db_pool_cluster_id columns = %v, want %v", columns, want)
-	}
-}
-
-func TestManagedSharedDBPeriodicScanIndexesMatchKeysetQueries(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	for _, tc := range []struct {
-		table string
-		index string
-		want  []string
-	}{
-		{table: "db_pool", index: "idx_db_pool_role_status_id", want: []string{"role", "status", "db_id"}},
-		{table: "tenant_tidbcloud_pools", index: "idx_tidbcloud_pool_status_id", want: []string{"status", "pool_id"}},
-	} {
-		columns, err := loadMetaIndexColumns(ctx, s.DB(), tc.table, tc.index)
-		if err != nil {
-			t.Fatalf("load %s columns: %v", tc.index, err)
-		}
-		if !sameStringSlice(columns, tc.want) {
-			t.Fatalf("%s columns = %v, want %v", tc.index, columns, tc.want)
-		}
-	}
-}
-
-func TestMigrateKeepsLegacyClusterIDIndexWhenReplacementCannotBeCreated(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	if _, err := s.DB().ExecContext(ctx, `DROP TABLE db_pool`); err != nil {
-		t.Fatalf("drop current db_pool: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = s.DB().ExecContext(context.Background(), `DROP TABLE IF EXISTS db_pool`)
-		if err := s.migrate(); err != nil {
-			t.Errorf("restore current db_pool schema: %v", err)
-		}
-	})
-	if _, err := s.DB().ExecContext(ctx, `CREATE TABLE db_pool (
-		db_id BIGINT AUTO_INCREMENT PRIMARY KEY,
-		org_id VARCHAR(64) NOT NULL DEFAULT '',
-		cluster_id VARCHAR(255) NULL,
-		`+"`role`"+` VARCHAR(20) NOT NULL,
-		db_host VARCHAR(255) NOT NULL,
-		db_port INT NOT NULL,
-		db_user VARCHAR(255) NOT NULL,
-		db_password VARBINARY(2048) NOT NULL,
-		db_name VARCHAR(255) NOT NULL,
-		db_tls VARCHAR(32) NOT NULL DEFAULT '',
-		max_tenants INT NOT NULL DEFAULT 0,
-		tenant_count INT NOT NULL DEFAULT 0,
-		status VARCHAR(20) NOT NULL DEFAULT 'active',
-		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-		updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-		UNIQUE INDEX uk_db_pool_cloud_resource (org_id, cluster_id)
-	)`); err != nil {
-		t.Fatalf("create legacy db_pool: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO db_pool
-		(org_id, cluster_id, `+"`role`"+`, db_host, db_port, db_user, db_password, db_name)
-		VALUES
-		('org-a', 'duplicate-cluster', 'shared', 'shared.example.com', 4000, 'user-a', X'01', 'shared_db'),
-		('org-b', 'duplicate-cluster', 'shared', 'shared.example.com', 4000, 'user-b', X'02', 'shared_db')`); err != nil {
-		t.Fatalf("insert duplicate legacy cluster ids: %v", err)
-	}
-
-	if err := s.migrate(); err == nil {
-		t.Fatal("migrate duplicate legacy cluster ids error = nil, want error")
-	}
-	legacyIndexExists, err := metaIndexExists(ctx, s.DB(), "db_pool", "uk_db_pool_cloud_resource")
-	if err != nil {
-		t.Fatalf("check uk_db_pool_cloud_resource: %v", err)
-	}
-	if !legacyIndexExists {
-		t.Fatal("legacy uk_db_pool_cloud_resource was dropped before its replacement was created")
-	}
-}
-
-func TestMigrateExpandsLegacyDBPoolForManagedProvisioning(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	if _, err := s.DB().ExecContext(ctx, `DROP TABLE db_pool`); err != nil {
-		t.Fatalf("drop current db_pool: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = s.DB().ExecContext(context.Background(), `DROP TABLE IF EXISTS db_pool`)
-		if err := s.migrate(); err != nil {
-			t.Errorf("restore current db_pool schema: %v", err)
-		}
-	})
-	if _, err := s.DB().ExecContext(ctx, `CREATE TABLE db_pool (
-		db_id BIGINT AUTO_INCREMENT PRIMARY KEY,
-		org_id VARCHAR(64) NOT NULL DEFAULT '',
-		cluster_id VARCHAR(255) NULL,
-		`+"`role`"+` VARCHAR(20) NOT NULL,
-		db_host VARCHAR(255) NOT NULL,
-		db_port INT NOT NULL,
-		db_user VARCHAR(255) NOT NULL,
-		db_password VARBINARY(2048) NOT NULL,
-		db_name VARCHAR(255) NOT NULL,
-		db_tls VARCHAR(32) NOT NULL DEFAULT '',
-		max_tenants INT NOT NULL DEFAULT 0,
-		tenant_count INT NOT NULL DEFAULT 0,
-		status VARCHAR(20) NOT NULL DEFAULT 'active',
-		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-		updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-		UNIQUE INDEX uk_db_pool_endpoint (org_id, db_host, db_name),
-		UNIQUE INDEX uk_db_pool_cloud_resource (org_id, cluster_id),
-		INDEX idx_db_pool_org (org_id, status)
-	)`); err != nil {
-		t.Fatalf("create legacy db_pool: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO db_pool
-		(org_id, `+"`role`"+`, db_host, db_port, db_user, db_password, db_name, max_tenants)
-		VALUES ('org-legacy', 'shared', 'legacy.example.com', 4000, 'root', X'01', 'legacy_db', 2)`); err != nil {
-		t.Fatalf("insert legacy db_pool row: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET tenant_count = 2 WHERE org_id = 'org-legacy'`); err != nil {
-		t.Fatalf("fill legacy db_pool row: %v", err)
-	}
-
-	if err := s.migrate(); err != nil {
-		t.Fatalf("migrate legacy db_pool: %v", err)
-	}
-
-	for _, column := range []string{"org_id", "db_host", "db_port", "db_user", "db_password", "db_name"} {
-		var nullable string
-		if err := s.DB().QueryRowContext(ctx, `SELECT is_nullable
-			FROM information_schema.columns
-			WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = ?`, column).Scan(&nullable); err != nil {
-			t.Fatalf("load db_pool.%s nullability: %v", column, err)
-		}
-		if nullable != "YES" {
-			t.Fatalf("db_pool.%s is_nullable = %q, want YES", column, nullable)
-		}
-	}
-	for _, index := range []string{"uk_db_pool_uuid", "uk_db_pool_cluster_id", "idx_db_pool_allocate", "idx_db_pool_provisioning_key"} {
-		exists, err := metaIndexExists(ctx, s.DB(), "db_pool", index)
-		if err != nil {
-			t.Fatalf("check %s: %v", index, err)
-		}
-		if !exists {
-			t.Fatalf("db_pool index %s was not created", index)
-		}
-	}
-	endpointIndexExists, err := metaIndexExists(ctx, s.DB(), "db_pool", "uk_db_pool_endpoint")
-	if err != nil {
-		t.Fatalf("check uk_db_pool_endpoint: %v", err)
-	}
-	if endpointIndexExists {
-		t.Fatal("legacy uk_db_pool_endpoint was not dropped")
-	}
-	legacyCloudIndexExists, err := metaIndexExists(ctx, s.DB(), "db_pool", "uk_db_pool_cloud_resource")
-	if err != nil {
-		t.Fatalf("check uk_db_pool_cloud_resource: %v", err)
-	}
-	if legacyCloudIndexExists {
-		t.Fatal("legacy uk_db_pool_cloud_resource was not dropped")
-	}
-	var dbPoolUUID, status string
-	var softCapReached bool
-	var spendingLimit *int64
-	if err := s.DB().QueryRowContext(ctx, `SELECT uuid, status, spending_limit, soft_cap_reached FROM db_pool WHERE org_id = 'org-legacy'`).Scan(&dbPoolUUID, &status, &spendingLimit, &softCapReached); err != nil {
-		t.Fatalf("load migrated legacy row: %v", err)
-	}
-	if _, err := uuid.Parse(dbPoolUUID); err != nil {
-		t.Fatalf("migrated db_pool uuid = %q: %v", dbPoolUUID, err)
-	}
-	var uuidNullable string
-	if err := s.DB().QueryRowContext(ctx, `SELECT is_nullable
-		FROM information_schema.columns
-		WHERE table_schema = DATABASE() AND table_name = 'db_pool' AND column_name = 'uuid'`).Scan(&uuidNullable); err != nil {
-		t.Fatalf("load db_pool.uuid nullability: %v", err)
-	}
-	if uuidNullable != "NO" {
-		t.Fatalf("db_pool.uuid is_nullable = %q, want NO", uuidNullable)
-	}
-	if status != "active" || spendingLimit != nil {
-		t.Fatalf("legacy row status/spending_limit = %q/%v, want active/NULL", status, spendingLimit)
-	}
-	if !softCapReached {
-		t.Fatal("legacy row at max_tenants must be backfilled with soft_cap_reached=true")
-	}
-
-	if _, err := s.DB().ExecContext(ctx, `DROP INDEX uk_db_pool_uuid ON db_pool`); err != nil {
-		t.Fatalf("drop db_pool uuid index to simulate partial migration: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET uuid = UPPER(uuid) WHERE org_id = 'org-legacy'`); err != nil {
-		t.Fatalf("uppercase db_pool uuid to simulate partial migration: %v", err)
-	}
-	if err := s.migrate(); err != nil {
-		t.Fatalf("resume partial db_pool uuid migration: %v", err)
-	}
-	if err := s.migrate(); err != nil {
-		t.Fatalf("repeat completed db_pool uuid migration: %v", err)
-	}
-	var uuidAfterRetries string
-	if err := s.DB().QueryRowContext(ctx, `SELECT uuid FROM db_pool WHERE org_id = 'org-legacy'`).Scan(&uuidAfterRetries); err != nil {
-		t.Fatalf("load db_pool uuid after repeated migration: %v", err)
-	}
-	if uuidAfterRetries != dbPoolUUID {
-		t.Fatalf("db_pool uuid after repeated migration = %q, want stable %q", uuidAfterRetries, dbPoolUUID)
-	}
-	if exists, err := metaIndexExists(ctx, s.DB(), "db_pool", "uk_db_pool_uuid"); err != nil || !exists {
-		t.Fatalf("db_pool uuid index after repeated migration = %t/%v, want true/nil", exists, err)
-	}
-}
-
-func TestMigratePreservesManagedSharedDBSpendingLimit(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	limit := MaxTiDBCloudSpendingLimit
-	id, err := s.CreateManagedSharedDBPool(ctx, &SharedDB{
-		TiDBCloudOrganizationID: "org-spending-migration", ProvisioningKey: make([]byte, 32),
-		CloudProvider: "aws", Region: "us-east-1", MaxTenants: 100, SpendingLimit: &limit,
-	})
-	if err != nil {
-		t.Fatalf("CreateManagedSharedDBPool: %v", err)
-	}
-	const configuredLimit = int64(2_000_000)
-	if _, err := s.DB().ExecContext(ctx, `UPDATE db_pool SET spending_limit = ? WHERE db_id = ?`, configuredLimit, id); err != nil {
-		t.Fatalf("seed configured spending limit: %v", err)
-	}
-
-	if err := s.migrate(); err != nil {
-		t.Fatalf("migrate configured spending limit: %v", err)
-	}
-	got, err := s.GetSharedDB(ctx, id)
-	if err != nil {
-		t.Fatalf("GetSharedDB: %v", err)
-	}
-	if got.SpendingLimit == nil || *got.SpendingLimit != configuredLimit {
-		t.Fatalf("spending limit = %v, want %d", got.SpendingLimit, configuredLimit)
-	}
-
-	if err := s.migrate(); err != nil {
-		t.Fatalf("repeat spending-limit migration: %v", err)
-	}
-}
-
-func TestUpsertTenantTiDBCloudOrgBindingRejectsDuplicateLiveClusterBranch(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	now := time.Now().UTC()
-	insertTiDBCloudBindingTenant(t, s, "binding-live-tenant", TenantKindLive, TenantActive, "cluster-shared", "", now)
-	insertTiDBCloudBindingTenant(t, s, "binding-other-tenant", TenantKindLive, TenantActive, "cluster-shared", "", now)
-	if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
-		TenantID:       "binding-live-tenant",
-		OrganizationID: "org-1",
-		ClusterID:      "cluster-shared",
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	}); err != nil {
-		t.Fatalf("upsert first binding: %v", err)
-	}
-	err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
-		TenantID:       "binding-other-tenant",
-		OrganizationID: "org-1",
-		ClusterID:      "cluster-shared",
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	})
-	if !errors.Is(err, ErrDuplicate) {
-		t.Fatalf("duplicate cluster branch upsert err = %v, want ErrDuplicate", err)
-	}
-}
-
-func TestUpsertTenantTiDBCloudOrgBindingRejectsSharedTenant(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	now := time.Now().UTC()
-	insertTiDBCloudBindingTenant(t, s, "binding-shared-tenant", TenantKindLive, TenantActive, "", "", now)
-	if err := s.UpdateTenantProvider(ctx, "binding-shared-tenant", "tidb_cloud_native_shared"); err != nil {
-		t.Fatalf("mark tenant shared: %v", err)
-	}
-	err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
-		TenantID: "binding-shared-tenant", OrganizationID: "org-shared",
-		ClusterID: "cluster-shared", CreatedAt: now, UpdatedAt: now,
-	})
-	if err == nil || !strings.Contains(err.Error(), "shared tenant") {
-		t.Fatalf("shared binding error = %v, want shared tenant rejection", err)
-	}
-}
-
-func TestUpsertTenantTiDBCloudOrgBindingAllowsSharedClusterAcrossBranches(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	now := time.Now().UTC()
-	insertTiDBCloudBindingTenant(t, s, "binding-live-tenant", TenantKindLive, TenantActive, "cluster-shared", "", now)
-	insertTiDBCloudBindingTenant(t, s, "binding-fork-tenant", TenantKindFork, TenantActive, "cluster-shared", "branch-1", now)
-	for _, tenantID := range []string{"binding-live-tenant", "binding-fork-tenant"} {
-		if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
-			TenantID:       tenantID,
-			OrganizationID: "org-1",
-			ClusterID:      "cluster-shared",
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		}); err != nil {
-			t.Fatalf("upsert binding for %s: %v", tenantID, err)
-		}
-	}
-	forkBinding, err := s.GetTenantTiDBCloudOrgBinding(ctx, "binding-fork-tenant")
-	if err != nil {
-		t.Fatalf("get fork binding: %v", err)
-	}
-	if forkBinding.BranchID != "branch-1" {
-		t.Fatalf("fork binding branch id = %q, want branch-1", forkBinding.BranchID)
-	}
-}
-
 func TestUpsertTenantTiDBCloudOrgBindingIgnoresDeletedClusterBranch(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
@@ -2329,27 +1785,6 @@ func TestCountTenantPoolBindingsByStatusGroupsByPoolOrganizationAndStatus(t *tes
 			t.Fatalf("upsert binding %s: %v", tc.tenantID, err)
 		}
 	}
-	for _, tc := range []struct {
-		tenantID string
-		status   TenantStatus
-		pool     TenantPoolBindingStatus
-	}{
-		{tenantID: "binding-counts-shared-free", status: TenantActive, pool: TenantPoolBindingFree},
-		{tenantID: "binding-counts-shared-deleted", status: TenantDeleted, pool: TenantPoolBindingUsed},
-	} {
-		insertTenantForPoolMembershipTest(t, s, tc.tenantID, tc.status, now)
-		if err := s.UpsertTenantPoolMembership(ctx, &TenantPoolMembership{
-			TenantID:                tc.tenantID,
-			TiDBCloudOrganizationID: "org-binding-counts-a",
-			PoolID:                  "pool-binding-counts-a",
-			PoolStatus:              tc.pool,
-			CreatedAt:               now,
-			UpdatedAt:               now,
-		}); err != nil {
-			t.Fatalf("upsert shared membership %s: %v", tc.tenantID, err)
-		}
-	}
-
 	counts, err := s.CountTenantPoolBindingsByStatus(ctx)
 	if err != nil {
 		t.Fatalf("count tenant pool bindings by status: %v", err)
@@ -2359,7 +1794,7 @@ func TestCountTenantPoolBindingsByStatusGroupsByPoolOrganizationAndStatus(t *tes
 		got[count.PoolID+"|"+count.OrganizationID+"|"+string(count.Status)] = count.Count
 	}
 	want := map[string]int64{
-		"pool-binding-counts-a|org-binding-counts-a|free":         3,
+		"pool-binding-counts-a|org-binding-counts-a|free":         2,
 		"pool-binding-counts-a|org-binding-counts-a|used":         1,
 		"pool-binding-counts-empty|org-binding-counts-empty|free": 0,
 		"pool-binding-counts-empty|org-binding-counts-empty|used": 0,

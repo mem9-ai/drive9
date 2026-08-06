@@ -22,12 +22,11 @@ type Store struct {
 // NewStore creates a new vault store for the standalone (per-tenant DB)
 // schema shape.
 func NewStore(db *sql.DB, mk *MasterKey) *Store {
-	return NewStoreScoped(db, mk, datastore.StandaloneScope(0))
+	return NewStoreScoped(db, mk, datastore.StandaloneScope())
 }
 
 // NewStoreScoped creates a new vault store whose SQL is shaped by scope:
-// standalone tables key tenant rows by tenant_id, the shared (multi-tenant)
-// schema keys them by fs_id (see pkg/datastore.Scope).
+// tables key tenant rows by tenant_id (see pkg/datastore.Scope).
 func NewStoreScoped(db *sql.DB, mk *MasterKey, scope datastore.Scope) *Store {
 	return &Store{db: db, mk: mk, scope: scope}
 }
@@ -40,7 +39,7 @@ func (s *Store) DB() *sql.DB { return s.db }
 func (s *Store) tenantCol() string { return s.scope.TenantCol() }
 
 // tenantArg returns the bind value for the tenant discriminator of vault
-// tables: tenantID in standalone shape, the scope's fs_id in shared shape.
+// tables.
 func (s *Store) tenantArg(tenantID string) any { return s.scope.TenantArg(tenantID) }
 
 // ---- DEK Management ----
@@ -168,8 +167,7 @@ func (s *Store) GetSecret(ctx context.Context, tenantID, name string) (*Secret, 
 	if err != nil {
 		return nil, err
 	}
-	// In shared shape the row stores fs_id, not the tenant UUID; the
-	// app-layer tenant id comes from the request scope.
+	// The app-layer tenant id comes from the request scope.
 	sec.TenantID = tenantID
 	return &sec, nil
 }
@@ -193,7 +191,7 @@ func (s *Store) ListSecrets(ctx context.Context, tenantID string) ([]*Secret, er
 			&sec.Revision, &sec.CreatedBy, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
 			return nil, err
 		}
-		// In shared shape the row stores fs_id; stamp the app-layer tenant id.
+		// Stamp the app-layer tenant id.
 		sec.TenantID = tenantID
 		secrets = append(secrets, &sec)
 	}
@@ -537,7 +535,7 @@ func (s *Store) QueryAuditLog(ctx context.Context, tenantID string, secretName s
 			&ev.TaskID, &ev.SecretName, &ev.FieldName, &ev.Adapter, &detailJSON, &ev.Timestamp); err != nil {
 			return nil, err
 		}
-		// In shared shape the row stores fs_id; stamp the app-layer tenant id.
+		// Stamp the app-layer tenant id.
 		ev.TenantID = tenantID
 		if detailJSON != nil {
 			_ = json.Unmarshal(detailJSON, &ev.Detail)

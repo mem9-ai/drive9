@@ -1542,7 +1542,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Wait metrics may carry tenant or db_pool_uuid identity; this server panel aggregates the whole role.",
+      "description": "Wait metrics may carry tenant identity; this server panel aggregates the whole role.",
       "fieldConfig": {
         "defaults": {
           "color": {

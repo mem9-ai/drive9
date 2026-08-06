@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -46,7 +45,6 @@ const (
 	defaultListenAddr                   = ":9009"
 	defaultS3Dir                        = "s3"
 	defaultTenantBackendCacheMaxTenants = 1024
-	defaultSharedBackendCacheMaxTenants = 20480
 )
 
 type s3Config struct {
@@ -191,22 +189,6 @@ func main() {
 	if err != nil {
 		die(err)
 	}
-	sharedDBHardCapRatio, err := sharedDBHardCapRatioFromEnv()
-	if err != nil {
-		die(err)
-	}
-	sharedDBReopenRatio, err := sharedDBReopenRatioFromEnv()
-	if err != nil {
-		die(err)
-	}
-	sharedDBMaxTenants, err := sharedDBMaxTenantsFromEnv()
-	if err != nil {
-		die(err)
-	}
-	sharedDBDefaultSpendingLimit, err := sharedDBDefaultSpendingLimitFromEnv()
-	if err != nil {
-		die(err)
-	}
 	tidbCloudNonFreePlanCacheTTL, err := tiDBCloudNonFreePlanCacheTTLFromEnv()
 	if err != nil {
 		die(err)
@@ -251,18 +233,10 @@ func main() {
 	switch providerType {
 	case tenant.ProviderTiDBZero:
 		provisioner, provisionerErr = tidbzero.NewProvisionerFromEnv()
-	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBCloudNativeShared:
+	case tenant.ProviderTiDBCloudNative:
 		provisioner, provisionerErr = tidbcloudnative.NewProvisionerFromEnv(providerType)
 	case tenant.ProviderDB9:
 		provisioner, provisionerErr = db9.NewProvisionerFromEnv()
-	}
-	if provisionerErr == nil && providerType == tenant.ProviderTiDBCloudNativeShared {
-		validator, ok := provisioner.(interface{ ValidateSharedAccess(context.Context) error })
-		if !ok {
-			provisionerErr = fmt.Errorf("shared TiDB Cloud access validation is not supported")
-		} else if err := validator.ValidateSharedAccess(context.Background()); err != nil {
-			provisionerErr = err
-		}
 	}
 	if provisionerErr != nil {
 		if tenant.UsesTiDBCloudNativeCredentials(providerType) {
@@ -361,9 +335,6 @@ func main() {
 			IdleReapInterval:             envDuration("DRIVE9_POOL_IDLE_REAP_INTERVAL", 2*time.Minute),
 			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 			LeaderChecker:                leaderManager,
-			// Capture once at startup: LocalClustersAPI TiDB is plaintext.
-			// Do not re-read DRIVE9_TIDBCLOUD_CLUSTERS_BACKEND on each open.
-			SharedDBForcePlaintext: tidbcloudnative.IsLocalClustersBackend(),
 		}, enc)
 		// The cross-tenant quota mutation dispatcher (started in
 		// server.startNotifyInfrastructure) must outlive every backend:
@@ -453,38 +424,12 @@ func main() {
 	}
 
 	srv := server.NewWithConfig(server.Config{
-		Meta:                         store,
-		Pool:                         pool,
-		Provisioner:                  provisioner,
-		DefaultTenantProvider:        providerType,
-		SharedDBMaxTenants:           sharedDBMaxTenants,
-		SharedDBHardCapRatio:         sharedDBHardCapRatio,
-		SharedDBReopenRatio:          sharedDBReopenRatio,
-		SharedDBSpendingLimit:        sharedDBDefaultSpendingLimit,
-		TiDBCloudNonFreePlanCacheTTL: tidbCloudNonFreePlanCacheTTL,
-		TiDBCloudFreePlanLimits:      tidbCloudFreePlanLimits,
-		ManagedSharedDBCloudBatchSize: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_CLOUD_BATCH_SIZE",
-			server.DefaultManagedSharedDBCloudBatchSize),
-		ManagedSharedDBMetadataWorkers: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_WORKERS",
-			server.DefaultManagedSharedDBMetadataWorkers),
-		ManagedSharedDBMetadataBatchSize: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_BATCH_SIZE",
-			server.DefaultManagedSharedDBMetadataBatchSize),
-		ManagedSharedDBMetadataPollInterval: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_POLL_INTERVAL",
-			server.DefaultManagedSharedDBMetadataPollInterval),
-		ManagedSharedDBProvisioningWorkers: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_PROVISIONING_WORKERS",
-			server.DefaultManagedSharedDBProvisioningWorkers),
-		TenantPoolReconcileInterval: envDuration("DRIVE9_TENANT_POOL_RECONCILE_INTERVAL",
-			server.DefaultTenantPoolReconcileInterval),
-		TenantPoolReconcileWorkers: envInt("DRIVE9_TENANT_POOL_RECONCILE_WORKERS",
-			server.DefaultTenantPoolReconcileWorkers),
-		TenantPoolReconcileWorkerRest: envDuration("DRIVE9_TENANT_POOL_RECONCILE_WORKER_REST",
-			server.DefaultTenantPoolReconcileWorkerRest),
-		ManagedSharedDBStuckTimeout: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_STUCK_TIMEOUT",
-			server.DefaultManagedSharedDBStuckTimeout),
-		ManagedSharedDBFailedCleanupInterval: envDuration("DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_INTERVAL",
-			server.DefaultManagedSharedDBFailedCleanupInterval),
-		ManagedSharedDBFailedCleanupBatchSize: envInt("DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_BATCH_SIZE",
-			server.DefaultManagedSharedDBFailedCleanupBatchSize),
+		Meta:                            store,
+		Pool:                            pool,
+		Provisioner:                     provisioner,
+		DefaultTenantProvider:           providerType,
+		TiDBCloudNonFreePlanCacheTTL:    tidbCloudNonFreePlanCacheTTL,
+		TiDBCloudFreePlanLimits:         tidbCloudFreePlanLimits,
 		LegacyStarterProvisioner:        legacyStarterProvisioner,
 		TokenSecret:                     tokenSecret,
 		VaultMasterKey:                  vaultMasterKey,
@@ -635,14 +580,14 @@ func usage(out io.Writer, exitCode int) {
 	_, _ = fmt.Fprintf(out, `usage:
   drive9-server [listen-addr]
   drive9-server version
-  drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_native|tidb_cloud_native_shared>
+  drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_native>
 
 environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
   DRIVE9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
   DRIVE9_META_DSN    control-plane MySQL DSN (required)
-  DRIVE9_POOL_MAX_TENANTS max cached tenant backends per pod (default: 20480 for tidb_cloud_native_shared, 1024 otherwise)
-  DRIVE9_POOL_IDLE_TTL  idle duration before a standalone tenant backend is evicted (default: 5m, 0=disabled; shared tenants use capacity LRU only)
+  DRIVE9_POOL_MAX_TENANTS max cached tenant backends per pod (default: 1024)
+  DRIVE9_POOL_IDLE_TTL  idle duration before a tenant backend is evicted (default: 5m, 0=disabled)
   DRIVE9_POOL_IDLE_REAP_INTERVAL  how often the idle reaper scans (default: 2m)
   DRIVE9_META_DB_MAX_OPEN_CONNS max open connections for the per-pod meta DB pool (default: 100)
   DRIVE9_META_DB_MAX_IDLE_CONNS max idle connections for the per-pod meta DB pool (default: 20)
@@ -653,10 +598,6 @@ environment:
   DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS max open connections for tenant schema-init DB pools (default: 8)
   DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS max idle connections for tenant schema-init DB pools (default: 2)
   DRIVE9_TIDBCLOUD_CLUSTERS_BACKEND http|local TiDB Cloud control-plane backend (default: http; local = Docker TiDB per cluster)
-  DRIVE9_SHARED_DB_MAX_OPEN_CONNS max open connections for each shared-schema DB handle (default: 300)
-  DRIVE9_SHARED_DB_MAX_IDLE_CONNS max idle connections for each shared-schema DB handle (default: 50)
-  DRIVE9_SHARED_DB_CONN_MAX_LIFETIME maximum shared connection lifetime (default: 30m)
-  DRIVE9_SHARED_DB_CONN_MAX_IDLE_TIME maximum shared connection idle time (default: 5m)
   DRIVE9_DB_HEALTH_PROBE_INTERVAL_SECONDS DB health probe interval seconds (default: 15)
   DRIVE9_DB_HEALTH_PROBE_TIMEOUT_SECONDS DB health probe timeout seconds (default: 3)
   DRIVE9_DB_HEALTH_PROBE_META_ENABLED true|false to probe the control-plane DB (default: true)
@@ -693,33 +634,16 @@ environment:
                                     required by openai, cohere, jina_ai, gemini, huggingface, nvidia_nim, nvidia
   DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE provider base endpoint for models that require it
                                      optional for openai models; set it for Azure OpenAI endpoints
-  DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_native|tidb_cloud_native_shared (default for provisioning)
+  DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_native (default for provisioning)
   DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default TiDB Cloud Cluster spendingLimit.monthly; native defaults to 1000 when unset
   DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Cluster API base URL for tidb_cloud_native
-  DRIVE9_TIDBCLOUD_IAM_API_URL TiDB Cloud IAM API base URL; required for tidb_cloud_native and tidb_cloud_native_shared
+  DRIVE9_TIDBCLOUD_IAM_API_URL TiDB Cloud IAM API base URL; required for tidb_cloud_native
   DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER cloud provider for tidb_cloud_native cluster creation, e.g. aws
   DRIVE9_TIDBCLOUD_NATIVE_REGION region for tidb_cloud_native cluster creation, e.g. us-east-1
   DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidb_cloud_native database name (default: tidbcloud_fs)
   DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY optional default TiDB Cloud API public key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY optional default TiDB Cloud API private key for tidb_cloud_native create/delete when caller omits it
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_PUBLIC_KEY server-managed TiDB Cloud API public key for shared DB pool operations; required for tidb_cloud_native_shared
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_PRIVATE_KEY server-managed TiDB Cloud API private key for shared DB pool operations; required for tidb_cloud_native_shared
   DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT true|false to use TiDB Cloud private endpoint hosts for tidb_cloud_native
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_MAX_TENANTS soft capacity for new managed shared DB pools (default: 100)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO emergency hard-cap ratio > 1 after physical create failure (default: 1.2)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_REOPEN_RATIO reopen ratio for a latched shared pool (default: 0.8)
-  DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT physical spending-limit target for new managed shared DB pools (default: 1000000)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_CLOUD_BATCH_SIZE maximum physical pools in one refill Cloud request (default: 50)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_WORKERS concurrent pending metadata workers (default and maximum: 15)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_BATCH_SIZE physical pools per metadata list request (default and maximum: 30)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_METADATA_POLL_INTERVAL delay between metadata list rounds (default: 15s)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_PROVISIONING_WORKERS concurrent shared schema-init workers (default: 100)
-  DRIVE9_TENANT_POOL_RECONCILE_INTERVAL leader logical-pool refill scan interval (default: 5s)
-  DRIVE9_TENANT_POOL_RECONCILE_WORKERS concurrent queued leader logical-pool refill workers (default: 15)
-  DRIVE9_TENANT_POOL_RECONCILE_WORKER_REST delay before a completed refill worker takes another task (default: 5s)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_STUCK_TIMEOUT pending/provisioning no-progress timeout (default: 30m)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_INTERVAL failed physical-pool cleanup interval (default: 1m)
-  DRIVE9_TIDBCLOUD_NATIVE_SHARED_FAILED_CLEANUP_BATCH_SIZE failed physical pools processed per cleanup pass (default: 5)
   DRIVE9_TIDBCLOUD_PRIVATE_ENDPOINT_HOST_MAP comma-separated public_host=private_host mappings (also accepts public_host:private_host);
                                              when set, disables legacy single-host private endpoint overrides
   DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST legacy tencentcloud private endpoint fallback host, used only when host map is unset
@@ -1181,9 +1105,6 @@ func dbHealthProbeOptionsFromEnv() metrics.DBHealthProbeOptions {
 
 func tenantBackendCacheMaxTenants(provider string) int {
 	fallback := defaultTenantBackendCacheMaxTenants
-	if provider == tenant.ProviderTiDBCloudNativeShared {
-		fallback = defaultSharedBackendCacheMaxTenants
-	}
 	maxTenants := envInt("DRIVE9_POOL_MAX_TENANTS", fallback)
 	if maxTenants <= 0 {
 		return fallback
@@ -1235,54 +1156,6 @@ func tenantPoolRefillFreeRatioFromEnv() (float64, error) {
 	v, err := strconv.ParseFloat(raw, 64)
 	if err != nil || v <= 0 || v > 1 || v != v {
 		return 0, fmt.Errorf("invalid DRIVE9_TENANT_POOL_REFILL_FREE_RATIO=%q: must be a number in (0,1]", raw)
-	}
-	return v, nil
-}
-
-func sharedDBHardCapRatioFromEnv() (float64, error) {
-	raw := strings.TrimSpace(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO"))
-	if raw == "" {
-		return server.DefaultSharedDBHardCapRatio, nil
-	}
-	v, err := strconv.ParseFloat(raw, 64)
-	if err != nil || v <= 1 || math.IsNaN(v) || math.IsInf(v, 0) {
-		return 0, fmt.Errorf("invalid DRIVE9_TIDBCLOUD_NATIVE_SHARED_HARD_CAP_RATIO=%q: must be a finite number > 1", raw)
-	}
-	return v, nil
-}
-
-func sharedDBReopenRatioFromEnv() (float64, error) {
-	raw := strings.TrimSpace(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_SHARED_REOPEN_RATIO"))
-	if raw == "" {
-		return server.DefaultSharedDBReopenRatio, nil
-	}
-	v, err := strconv.ParseFloat(raw, 64)
-	if err != nil || v <= 0 || v >= 1 || math.IsNaN(v) || math.IsInf(v, 0) {
-		return 0, fmt.Errorf("invalid DRIVE9_TIDBCLOUD_NATIVE_SHARED_REOPEN_RATIO=%q: must be a finite number in (0,1)", raw)
-	}
-	return v, nil
-}
-
-func sharedDBMaxTenantsFromEnv() (int, error) {
-	raw := strings.TrimSpace(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_SHARED_MAX_TENANTS"))
-	if raw == "" {
-		return 100, nil
-	}
-	v, err := strconv.Atoi(raw)
-	if err != nil || v <= 0 {
-		return 0, fmt.Errorf("invalid DRIVE9_TIDBCLOUD_NATIVE_SHARED_MAX_TENANTS=%q: must be a positive integer", raw)
-	}
-	return v, nil
-}
-
-func sharedDBDefaultSpendingLimitFromEnv() (int64, error) {
-	raw := strings.TrimSpace(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT"))
-	if raw == "" {
-		return server.DefaultManagedSharedDBSpendingLimit, nil
-	}
-	v, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || v <= 0 || v > int64(math.MaxInt32) {
-		return 0, fmt.Errorf("invalid DRIVE9_TIDBCLOUD_NATIVE_DB_POOL_DEFAULT_SPENDING_LIMIT=%q: must be in (0,%d]", raw, int64(math.MaxInt32))
 	}
 	return v, nil
 }

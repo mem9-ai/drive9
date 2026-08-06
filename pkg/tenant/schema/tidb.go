@@ -10,7 +10,7 @@ type InitTiDBTenantSchemaOptions struct {
 }
 
 // InitTiDBTenantSchema initializes the TiDB launch schema baseline with the
-// shared database-managed auto-embedding contract used by TiDB tenants.
+// database-managed auto-embedding contract used by TiDB tenants.
 func InitTiDBTenantSchema(dsn string) error {
 	return InitTiDBTenantSchemaForMode(dsn, TiDBEmbeddingModeAuto)
 }

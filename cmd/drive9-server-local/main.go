@@ -599,7 +599,7 @@ func initLocalTenantSchema(ctx context.Context, dsn string, mode schema.TiDBEmbe
 	initOpts := schema.InitTiDBTenantSchemaOptions{}
 	if mode == schema.TiDBEmbeddingModeApp {
 		// drive9-server-local can bootstrap app-managed schema on TiDB builds
-		// that lack optional FTS/vector index features; shared schema init paths
+		// that lack optional FTS/vector index features; schema init paths
 		// remain strict.
 		initOpts.AllowUnsupportedOptionalIndexes = true
 	}

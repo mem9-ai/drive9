@@ -74,11 +74,7 @@ func subtreeCond(prefix string) (string, []any) {
 	return "(fn.path = ? OR fn.path LIKE ?)", []any{prefix, prefix + "/%"}
 }
 
-// scopeWhereAnd prefixes a WHERE predicate with one fs_id predicate per JOIN
-// alias in shared shape and returns it unchanged in standalone shape. Every
-// joined alias is filtered, not just the driving table: in shared shape
-// entity ids are unique only within a tenant, so an id-only join condition
-// would fan out across tenants and leak rows sideways on collision.
+// scopeWhereAnd prefixes a WHERE predicate with one predicate per JOIN alias.
 func scopeWhereAnd(scope Scope, pred string, aliases ...string) string {
 	for i := len(aliases) - 1; i >= 0; i-- {
 		pred = scope.AndAs(aliases[i], pred)
@@ -86,17 +82,9 @@ func scopeWhereAnd(scope Scope, pred string, aliases ...string) string {
 	return pred
 }
 
-// scopeWhereArgs prepends one fs_id bind argument per alias, matching the
-// predicate order produced by scopeWhereAnd.
+// scopeWhereArgs returns the bind arguments unchanged.
 func scopeWhereArgs(scope Scope, aliases int, args ...any) []any {
-	if !scope.Shared() {
-		return args
-	}
-	out := make([]any, 0, aliases+len(args))
-	for i := 0; i < aliases; i++ {
-		out = append(out, scope.FsID())
-	}
-	return append(out, args...)
+	return args
 }
 
 // VectorSearch runs a vector similarity search for the supplied embedding.
@@ -145,12 +133,11 @@ func (s *Store) runVectorSearch(ctx context.Context, q string, args []any) ([]Se
 }
 
 func buildVectorSearchQuery(queryEmbedding []float32, pathPrefix string, limit int) (string, []any, bool) {
-	return buildVectorSearchQueryScoped(StandaloneScope(0), queryEmbedding, pathPrefix, limit)
+	return buildVectorSearchQueryScoped(StandaloneScope(), queryEmbedding, pathPrefix, limit)
 }
 
 // buildVectorSearchQueryScoped builds the vector search query for the given
-// schema-shape scope. In shared shape every joined alias carries an fs_id
-// predicate (see scopeWhereAnd).
+// scope.
 func buildVectorSearchQueryScoped(scope Scope, queryEmbedding []float32, pathPrefix string, limit int) (string, []any, bool) {
 	if len(queryEmbedding) == 0 {
 		return "", nil, false
@@ -165,8 +152,6 @@ func buildVectorSearchQueryScoped(scope Scope, queryEmbedding []float32, pathPre
 		conds = append(conds, cond)
 		condArgs = append(condArgs, pargs...)
 	}
-	// The fs_id predicates lead the WHERE clause in shared shape, so their
-	// bind arguments go right after the SELECT-list distance placeholder.
 	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, vecParam, limit)
 
@@ -180,7 +165,7 @@ func buildVectorSearchQueryScoped(scope Scope, queryEmbedding []float32, pathPre
 }
 
 func buildVectorSearchByTextQuery(queryText, pathPrefix string, limit int) (string, []any, bool) {
-	return buildVectorSearchByTextQueryScoped(StandaloneScope(0), queryText, pathPrefix, limit)
+	return buildVectorSearchByTextQueryScoped(StandaloneScope(), queryText, pathPrefix, limit)
 }
 
 func buildVectorSearchByTextQueryScoped(scope Scope, queryText, pathPrefix string, limit int) (string, []any, bool) {
@@ -322,9 +307,6 @@ func buildFTSSearchQuery(scope Scope, safeQuery, pathPrefix string, limit int) (
 	contentExpr := "fts_match_word('" + safeQuery + "', content_text)"
 	descExpr := "fts_match_word('" + safeQuery + "', description)"
 
-	// In shared shape the fs_id predicate must live inside each UNION branch
-	// (before the GROUP BY/LIMIT aggregation), otherwise other tenants' rows
-	// compete for the shared LIMIT and dilute per-tenant recall.
 	innerQ := `SELECT inode_id, MAX(score) AS score FROM (
 		SELECT inode_id, ` + contentExpr + ` AS score
 		FROM semantic WHERE ` + scope.And(contentExpr) + `

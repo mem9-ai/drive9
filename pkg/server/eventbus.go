@@ -37,8 +37,8 @@ var (
 )
 
 // EventBus is a per-tenant event hub backed by the durable fs_events table.
-// Events are stored in the shared tenant database so that they propagate across
-// all pods. The local notify channel provides instant push to same-pod SSE
+// Events are stored in the tenant database so that they propagate across all
+// pods. The local notify channel provides instant push to same-pod SSE
 // clients; cross-pod events are discovered via the central tenant_notify_outbox
 // table in the meta DB (polled by a single global notifyPoller per pod, not a
 // per-bus goroutine).
@@ -182,9 +182,9 @@ func (eb *EventBus) Seq(ctx context.Context) uint64 {
 //   - since < oldestSeq: events pruned between client cursor and retained window
 //   - since > headSeq: server_restart (client cursor ahead of head)
 //
-// Interior seq holes (other tenants interleaved on a shared-schema table, or
-// AUTO_INCREMENT ids burned by rolled-back inserts) are NOT a reset
-// condition: no events of this tenant were lost, so delivery continues.
+// Interior seq holes (AUTO_INCREMENT ids burned by rolled-back inserts) are
+// NOT a reset condition: no events of this tenant were lost, so delivery
+// continues.
 //
 // DB query errors are masked (ok=true, empty events, headSeq=since): see
 // EventsSinceE for the rationale and for the error-distinguishing variant.
@@ -245,11 +245,10 @@ func (eb *EventBus) EventsSinceE(ctx context.Context, since uint64) (events []Ch
 		// Got rows: a gap between the client's cursor and the first returned
 		// event means one of two things. Either events were pruned at the left
 		// edge of the retained window (the client missed real events → reset),
-		// or the hole is interior: other tenants' interleaved seqs on a
-		// shared-schema fs_events table, or AUTO_INCREMENT ids burned by
-		// rolled-back inserts (no events lost → deliver normally). Pruning
-		// only happens at the left edge, so compare against the oldest
-		// retained seq to tell them apart.
+		// or the hole is interior: AUTO_INCREMENT ids burned by rolled-back
+		// inserts (no events lost → deliver normally). Pruning only happens at
+		// the left edge, so compare against the oldest retained seq to tell
+		// them apart.
 		firstSeq := events[0].Seq
 		if since+1 < firstSeq {
 			oldest := oldestSeqSafeWithMetric(ctx, store, eb.tenantID)
