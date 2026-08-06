@@ -1,10 +1,6 @@
 name: Release CLI binaries
 
 on:
-  workflow_run:
-    workflows: ["Deploy server to prod"]
-    types:
-      - completed
   workflow_dispatch:
 
 concurrency:
@@ -14,7 +10,7 @@ concurrency:
 jobs:
   release:
     name: Build and publish CLI
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -22,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
 
       - name: Checkout agfs dependency
         run: |
@@ -36,7 +32,7 @@ jobs:
 
       - name: Determine version
         run: |
-          SOURCE_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          SOURCE_SHA="${{ github.sha }}"
           VERSION="${SOURCE_SHA::7}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
