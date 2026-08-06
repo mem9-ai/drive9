@@ -1376,7 +1376,7 @@ func TestUploadThresholdHonoursLoweredServerThreshold(t *testing.T) {
 	// need to observe routing. The call is therefore expected to fail
 	// past initiate; what matters is which endpoint the client hit
 	// before failing. The unused-error discard is deliberate.
-	_, _ = c.writeStreamConditionalWithSummary(context.Background(), "/test.bin", body, fileSize, nil, -1, nil, "")
+	_, _ = c.writeStreamConditionalWithSummary(context.Background(), "/test.bin", body, fileSize, nil, -1, nil, "", "")
 	if directPUTs > 0 {
 		t.Fatalf("client issued %d direct PUTs for %dB above %dB threshold; multipart was required", directPUTs, fileSize, serverThreshold)
 	}
