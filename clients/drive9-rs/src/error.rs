@@ -42,7 +42,11 @@ pub(crate) async fn check_error(resp: reqwest::Response) -> Result<reqwest::Resp
         })
         .or_else(|| {
             let text = String::from_utf8_lossy(&bytes).trim().to_string();
-            if text.is_empty() { None } else { Some(text) }
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
         })
         .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
     if status == StatusCode::CONFLICT {

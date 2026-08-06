@@ -8,6 +8,64 @@ use std::collections::HashMap;
 
 const DEFAULT_SMALL_FILE_THRESHOLD: i64 = 50_000;
 
+/// Bounds the 503 retry loop for recursive deletes. The server answers 503
+/// with a Retry-After header when a batched recursive delete exhausts its
+/// transaction/time budget; the sweep is resumable and idempotent, so
+/// re-issuing the same DELETE continues where it left off.
+const REMOVE_ALL_MAX_RETRIES: u32 = 4;
+
+/// Caps the delay honored from a Retry-After header so a pathological value
+/// (e.g. Retry-After: 999999) cannot block the caller for days.
+const REMOVE_ALL_MAX_RETRY_DELAY_SECS: u64 = 60;
+
+/// Percent-encode each segment of a drive9 path, preserving separators, so
+/// characters such as `?` and `#` cannot be reinterpreted as URL delimiters.
+fn encoded_fs_path(path: &str) -> String {
+    let normalized = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    normalized
+        .split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Decide the sleep before the next recursive-delete retry. A valid
+/// non-negative Retry-After value (integer delta-seconds) is honored and
+/// clamped to REMOVE_ALL_MAX_RETRY_DELAY_SECS; honoring 0 as an immediate
+/// retry is intentional (the retry loop is bounded). A missing or unparseable
+/// header falls back to the passed exponential backoff.
+fn remove_all_retry_delay(
+    retry_after: Option<&str>,
+    backoff: std::time::Duration,
+) -> std::time::Duration {
+    match retry_after.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(secs) => std::time::Duration::from_secs(secs.min(REMOVE_ALL_MAX_RETRY_DELAY_SECS)),
+        None => backoff,
+    }
+}
+
+/// Returns true when a bearer token may be attached to a request targeting
+/// `base_url`: HTTPS is always allowed, plain HTTP only for loopback hosts.
+fn can_send_credentials(base_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(base_url) else {
+        return false;
+    };
+    if url.scheme() == "https" {
+        return true;
+    }
+    if url.scheme() != "http" {
+        return false;
+    }
+    matches!(
+        url.host_str(),
+        Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+    )
+}
+
 fn load_config_file() -> Option<(String, Option<String>)> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -34,14 +92,15 @@ fn load_config_file() -> Option<(String, Option<String>)> {
 }
 
 fn load_config() -> (String, Option<String>) {
-    let env_server = std::env::var("DRIVE9_SERVER").ok().filter(|s| !s.is_empty());
-    let env_key = std::env::var("DRIVE9_API_KEY").ok().filter(|s| !s.is_empty());
-    let (file_server, file_key) = load_config_file()
-        .unwrap_or_else(|| ("https://api.drive9.ai".to_string(), None));
-    (
-        env_server.unwrap_or(file_server),
-        env_key.or(file_key),
-    )
+    let env_server = std::env::var("DRIVE9_SERVER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let env_key = std::env::var("DRIVE9_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let (file_server, file_key) =
+        load_config_file().unwrap_or_else(|| ("https://api.drive9.ai".to_string(), None));
+    (env_server.unwrap_or(file_server), env_key.or(file_key))
 }
 
 #[derive(Clone, Debug)]
@@ -100,12 +159,7 @@ impl Client {
     }
 
     pub(crate) fn fs_url(&self, path: &str) -> String {
-        let p = if path.starts_with('/') {
-            path
-        } else {
-            &format!("/{}", path)
-        };
-        format!("{}/v1/fs{}", self.base_url, p)
+        format!("{}/v1/fs{}", self.base_url, encoded_fs_path(path))
     }
 
     pub(crate) fn vault_url(&self, path: &str) -> String {
@@ -119,9 +173,11 @@ impl Client {
 
     pub(crate) fn auth_headers(&self) -> HeaderMap {
         let mut h = HeaderMap::new();
-        if let Some(ref key) = self.api_key {
-            if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", key)) {
-                h.insert("Authorization", v);
+        if can_send_credentials(&self.base_url) {
+            if let Some(ref key) = self.api_key {
+                if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", key)) {
+                    h.insert("Authorization", v);
+                }
             }
         }
         h
@@ -237,6 +293,47 @@ impl Client {
             .await?;
         check_error(resp).await?;
         Ok(())
+    }
+
+    /// Remove a file or directory tree recursively via `DELETE ?recursive=1`.
+    ///
+    /// A large tree delete may exceed the server's per-request budget; the
+    /// server then answers 503 and this method retries with backoff (honoring
+    /// Retry-After, at most REMOVE_ALL_MAX_RETRIES times). Retrying is safe:
+    /// the server-side sweep is resumable and idempotent, so a repeated DELETE
+    /// continues it.
+    pub async fn remove_all(&self, path: &str) -> Result<(), Drive9Error> {
+        // Use an explicit value to avoid intermediaries dropping bare "?recursive".
+        let url = format!("{}?recursive=1", self.fs_url(path));
+        let mut backoff = std::time::Duration::from_secs(1);
+        let mut attempt: u32 = 0;
+        loop {
+            let resp = self
+                .http
+                .delete(&url)
+                .headers(self.auth_headers())
+                .send()
+                .await?;
+            if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                && attempt < REMOVE_ALL_MAX_RETRIES
+            {
+                let delay = remove_all_retry_delay(
+                    resp.headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok()),
+                    backoff,
+                );
+                // Release the response before sleeping so the connection is
+                // not held open for the whole backoff.
+                drop(resp);
+                tokio::time::sleep(delay).await;
+                backoff *= 2;
+                attempt += 1;
+                continue;
+            }
+            check_error(resp).await?;
+            return Ok(());
+        }
     }
 
     pub async fn copy(&self, src_path: &str, dst_path: &str) -> Result<(), Drive9Error> {
@@ -356,5 +453,59 @@ impl Client {
             total_size,
             expected_revision,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_fs_path_escapes_query_and_fragment_delimiters() {
+        assert_eq!(encoded_fs_path("/dir?name"), "/dir%3Fname");
+        assert_eq!(encoded_fs_path("/dir#name"), "/dir%23name");
+        assert_eq!(encoded_fs_path("dir?name"), "/dir%3Fname");
+        assert_eq!(encoded_fs_path("/a b/c"), "/a%20b/c");
+    }
+
+    #[test]
+    fn remove_all_retry_delay_clamps_huge_retry_after() {
+        assert_eq!(
+            remove_all_retry_delay(Some("999999"), std::time::Duration::from_secs(1)),
+            std::time::Duration::from_secs(REMOVE_ALL_MAX_RETRY_DELAY_SECS)
+        );
+        assert_eq!(
+            remove_all_retry_delay(Some("0"), std::time::Duration::from_secs(1)),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            remove_all_retry_delay(Some("2"), std::time::Duration::from_secs(1)),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            remove_all_retry_delay(None, std::time::Duration::from_secs(4)),
+            std::time::Duration::from_secs(4)
+        );
+    }
+
+    #[test]
+    fn can_send_credentials_allows_https_and_loopback_http() {
+        assert!(can_send_credentials("https://api.drive9.ai"));
+        assert!(can_send_credentials("http://127.0.0.1:9009"));
+        assert!(can_send_credentials("http://localhost:9009"));
+        assert!(!can_send_credentials("http://example.com"));
+        assert!(!can_send_credentials(""));
+    }
+
+    #[test]
+    fn auth_headers_omit_bearer_on_non_loopback_http() {
+        let https = Client::new("https://api.drive9.ai", "k");
+        assert!(https.auth_headers().contains_key("Authorization"));
+
+        let loopback = Client::new("http://127.0.0.1:9009", "k");
+        assert!(loopback.auth_headers().contains_key("Authorization"));
+
+        let insecure = Client::new("http://example.com", "k");
+        assert!(!insecure.auth_headers().contains_key("Authorization"));
     }
 }

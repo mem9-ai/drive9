@@ -94,7 +94,7 @@ Environment variables `DRIVE9_SERVER` or `DRIVE9_BASE` and `DRIVE9_API_KEY` take
 | Delete | `await client.delete(path)` |
 | Delete file (kind hint) | `await client.deleteFile(path)` |
 | Delete dir (kind hint) | `await client.deleteDir(path)` |
-| Recursive delete | `await client.removeAll(path)` |
+| Recursive delete | `await client.removeAll(path)` — automatically retries with backoff (honoring `Retry-After`, max 4 retries) when the server answers 503 for a large tree sweep still in progress |
 | Copy | `await client.copy(src, dst)` |
 | Rename | `await client.rename(old, new)` |
 | Mkdir | `await client.mkdir(path, mode?)` |

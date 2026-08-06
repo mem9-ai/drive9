@@ -58,7 +58,7 @@ def prefix(client):
     client.mkdir(p.rstrip("/"))
     yield p
     try:
-        client.delete(p.rstrip("/") + "?recursive")
+        client.remove_all(p.rstrip("/"))
     except Exception:
         pass
 

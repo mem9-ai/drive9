@@ -206,9 +206,10 @@ impl Client {
         let status = resp.status();
         if status.as_u16() == 206 {
             let stream = resp.bytes_stream();
-            let reader = StreamReader::new(stream.map(|item| {
-                item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-            }));
+            let reader =
+                StreamReader::new(stream.map(|item| {
+                    item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                }));
             return Ok(Box::new(reader));
         }
         if status.as_u16() == 416 {

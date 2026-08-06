@@ -1,3 +1,7 @@
+import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import XCTest
 @testable import Drive9Mobile
 
@@ -12,6 +16,7 @@ final class HitCounter: @unchecked Sendable {
     private var count = 0
     private let lock = NSLock()
     func bump() { lock.lock(); count += 1; lock.unlock() }
+    func bumpAndGet() -> Int { lock.lock(); defer { lock.unlock() }; count += 1; return count }
     func get() -> Int { lock.lock(); defer { lock.unlock() }; return count }
 }
 
@@ -105,6 +110,88 @@ final class Drive9Tests: XCTestCase {
         try await client.copy(srcPath: "src.txt", dstPath: "/dst.txt")
         try await client.rename(oldPath: "/old.txt", newPath: "/new.txt")
         try await client.mkdir(path: "/dir/")
+    }
+
+    func testRemoveAllRetries503ThenSucceeds() async throws {
+        let hits = HitCounter()
+        server.routeAnyQuery("DELETE", "/v1/fs/dir/") { req in
+            XCTAssertEqual(req.query, "recursive=1")
+            let n = hits.bumpAndGet()
+            if n < 3 {
+                let body = #"{"error":"recursive delete in progress, retry to resume"}"#
+                return MockResponse(
+                    status: 503,
+                    body: Data(body.utf8),
+                    contentType: "application/json",
+                    extraHeaders: ["Retry-After": "0"]
+                )
+            }
+            return MockResponse(status: 200, body: Data())
+        }
+
+        let client = Drive9Client(baseUrl: server.baseURL, apiKey: "k")
+        try await client.removeAll(path: "/dir/")
+        XCTAssertEqual(hits.get(), 3)
+    }
+
+    func testRemoveAllGivesUpAfterMaxRetries() async throws {
+        let hits = HitCounter()
+        server.routeAnyQuery("DELETE", "/v1/fs/dir/") { req in
+            XCTAssertEqual(req.query, "recursive=1")
+            _ = hits.bumpAndGet()
+            let body = #"{"error":"recursive delete in progress, retry to resume"}"#
+            return MockResponse(
+                status: 503,
+                body: Data(body.utf8),
+                contentType: "application/json",
+                extraHeaders: ["Retry-After": "0"]
+            )
+        }
+
+        let client = Drive9Client(baseUrl: server.baseURL, apiKey: "k")
+        do {
+            try await client.removeAll(path: "/dir/")
+            XCTFail("expected removeAll to throw after retries exhausted")
+        } catch let error as Drive9Exception {
+            guard case let .Drive9(code, statusCode, _, _) = error else {
+                XCTFail("unexpected variant: \(error)")
+                return
+            }
+            XCTAssertEqual(code, "http_status")
+            XCTAssertEqual(statusCode, 503)
+        }
+        XCTAssertEqual(hits.get(), 5)
+    }
+
+    func testRemoveAllRetryDelayClampsHugeRetryAfter() {
+        let client = Drive9Client(baseUrl: "http://127.0.0.1:1", apiKey: "k")
+        XCTAssertEqual(
+            client.removeAllRetryDelayNs(retryAfter: "999999", backoffNs: 1_000_000_000),
+            60_000_000_000
+        )
+        XCTAssertEqual(client.removeAllRetryDelayNs(retryAfter: "0", backoffNs: 1_000_000_000), 0)
+        XCTAssertEqual(client.removeAllRetryDelayNs(retryAfter: "2", backoffNs: 1_000_000_000), 2_000_000_000)
+        XCTAssertEqual(client.removeAllRetryDelayNs(retryAfter: nil, backoffNs: 2_000_000_000), 2_000_000_000)
+    }
+
+    func testBearerTokenOnlySentToHTTPSOrLoopbackHTTP() {
+        let client = Drive9Client(baseUrl: "http://example.com", apiKey: "k")
+        XCTAssertFalse(client.canSendCredentials(to: URL(string: "http://example.com/v1/fs/x")!))
+        XCTAssertTrue(client.canSendCredentials(to: URL(string: "https://api.drive9.ai/v1/fs/x")!))
+        XCTAssertTrue(client.canSendCredentials(to: URL(string: "http://127.0.0.1:9009/v1/fs/x")!))
+        XCTAssertTrue(client.canSendCredentials(to: URL(string: "http://localhost:9009/v1/fs/x")!))
+    }
+
+    func testInsecureHTTPWithBearerThrows() throws {
+        let client = Drive9Client(baseUrl: "http://example.com", apiKey: "k")
+
+        var request = URLRequest(url: URL(string: "http://example.com/v1/fs/x")!)
+        request.setValue("Bearer k", forHTTPHeaderField: "Authorization")
+        XCTAssertThrowsError(try client.ensureRequestCredentialsAllowed(request))
+
+        request = URLRequest(url: URL(string: "http://127.0.0.1:9009/v1/fs/x")!)
+        request.setValue("Bearer k", forHTTPHeaderField: "Authorization")
+        XCTAssertNoThrow(try client.ensureRequestCredentialsAllowed(request))
     }
 
     func testGrepReturnsSearchResultsWithEncodedQuery() async throws {

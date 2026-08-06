@@ -17,7 +17,9 @@ bindings, C interop, shared libraries, linker flags, or a regeneration step.
 - `Drive9Client(baseUrl, apiKey)`
 - `Drive9Client.defaultClient()`, `withSmallFileThreshold`, `baseUrl`, `apiKey`
 - `write`, `writeWithRevision`, `read`, `uploadFile`, `downloadFile`
-- `list`, `stat`, `delete`, `copy`, `rename`, `mkdir`
+- `list`, `stat`, `delete`, `removeAll`, `copy`, `rename`, `mkdir`
+  (`removeAll` issues `DELETE ?recursive=1` and automatically retries
+  resumable 503 responses, honoring `Retry-After`, up to 4 times)
 - `grep`, `find`, `sql`
 - `downloadStream`, `downloadRangeStream`, `uploadStream`
 - `newStreamUpload` / `Drive9StreamUpload` for v2 multipart stream upload
@@ -26,6 +28,9 @@ bindings, C interop, shared libraries, linker flags, or a regeneration step.
 
 `baseUrl` may include a trailing slash. If `apiKey` is non-empty, requests send
 `Authorization: Bearer <apiKey>`; an empty key sends no authorization header.
+The client refuses to send that token over non-loopback plain HTTP. Use
+`https://` for production endpoints; plain HTTP is accepted only for loopback
+endpoints such as `http://127.0.0.1:9009` used in local tests.
 
 ## Parity notes
 

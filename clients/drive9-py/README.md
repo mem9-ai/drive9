@@ -35,6 +35,10 @@ client.copy("/src.txt", "/dst.txt")
 client.rename("/old.txt", "/new.txt")
 client.delete("/tmp.txt")
 
+# Recursive delete (retries automatically with backoff if the server
+# answers 503 while sweeping a large tree)
+client.remove_all("/mydir")
+
 # SQL query
 rows = client.sql('SELECT * FROM files WHERE path = "/hello.txt"')
 

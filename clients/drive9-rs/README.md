@@ -78,12 +78,17 @@ Environment variables `DRIVE9_SERVER` and `DRIVE9_API_KEY` override values from 
 | List directory | `client.list(path).await` |
 | Stat | `client.stat(path).await` |
 | Delete | `client.delete(path).await` |
+| Recursive delete | `client.remove_all(path).await` (retries automatically on 503 while the server sweeps a large tree) |
 | Copy | `client.copy(src, dst).await` |
 | Rename | `client.rename(old, new).await` |
 | Mkdir | `client.mkdir(path).await` |
 | SQL query | `client.sql(query).await` |
 | Grep | `client.grep(query, prefix, limit).await` |
 | Find | `client.find(prefix, params).await` |
+
+The client attaches `Authorization` only when the base URL is HTTPS or an
+HTTP loopback address (`127.0.0.1`, `localhost`, `::1`); credentials are
+omitted for other plain-HTTP origins.
 
 ### Streaming & multipart
 

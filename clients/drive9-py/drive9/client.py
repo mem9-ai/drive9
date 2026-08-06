@@ -1,5 +1,6 @@
 """Drive9 HTTP client."""
 
+import time
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urlencode, quote
@@ -16,6 +17,46 @@ from .stream import StreamWriter
 def _parse_iso_datetime(s: str) -> datetime:
     """Parse ISO8601 datetime, handling Z suffix for Python < 3.11."""
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+# _REMOVE_ALL_MAX_RETRIES bounds the 503 retry loop for recursive deletes. The
+# server answers 503 when a batched recursive delete exhausts its per-request
+# budget; the sweep is resumable and idempotent, so re-issuing the same DELETE
+# continues where it left off.
+_REMOVE_ALL_MAX_RETRIES = 4
+
+# _REMOVE_ALL_MAX_RETRY_DELAY caps the delay honored from a Retry-After header
+# so a pathological value (e.g. Retry-After: 999999) cannot block the caller
+# for days.
+_REMOVE_ALL_MAX_RETRY_DELAY = 60.0
+
+
+def _remove_all_retry_delay(retry_after: Optional[str], backoff: float) -> float:
+    """Decide the sleep before the next recursive-delete retry.
+
+    A valid Retry-After header (integer delta-seconds) is honored, clamped to
+    _REMOVE_ALL_MAX_RETRY_DELAY; honoring 0 as an immediate retry is
+    intentional — the server dictates the delay and the retry loop is bounded
+    to _REMOVE_ALL_MAX_RETRIES + 1 requests. A missing, unparseable, or
+    negative header falls back to the passed exponential backoff.
+    """
+    if retry_after is not None:
+        try:
+            secs = int(retry_after.strip())
+            if secs >= 0:
+                # Clamp in the integer domain first: float() can raise
+                # OverflowError for valid ints with hundreds of digits.
+                return float(min(secs, int(_REMOVE_ALL_MAX_RETRY_DELAY)))
+        except ValueError:
+            pass
+    return backoff
+
+
+def _encode_fs_path(path: str) -> str:
+    """Percent-encode each segment of a drive9 path, preserving slashes."""
+    if not path.startswith("/"):
+        path = "/" + path
+    return "/".join(quote(segment, safe="") for segment in path.split("/"))
 
 
 class Client(TransferMixin, PatchMixin):
@@ -70,9 +111,7 @@ class Client(TransferMixin, PatchMixin):
             self.session.mount("https://", adapter)
 
     def _url(self, path: str) -> str:
-        if not path.startswith("/"):
-            path = "/" + path
-        return f"{self.base_url}/v1/fs{path}"
+        return f"{self.base_url}/v1/fs{_encode_fs_path(path)}"
 
     def _vault_url(self, path: str) -> str:
         if not path.startswith("/"):
@@ -199,6 +238,32 @@ class Client(TransferMixin, PatchMixin):
         """Remove a file or directory."""
         resp = self._request("DELETE", self._url(path))
         self._check_error(resp)
+
+    def remove_all(self, path: str) -> None:
+        """Remove a file or directory tree recursively.
+
+        A large tree delete may exceed the server's per-request budget; the
+        server then answers 503 (with an optional Retry-After header) and this
+        method retries with backoff, at most _REMOVE_ALL_MAX_RETRIES times.
+        Retrying is safe: the server-side sweep is resumable and idempotent,
+        so a repeated DELETE continues where it left off.
+        """
+        url = self._url(path) + "?recursive=1"
+        backoff = 1.0
+        attempt = 0
+        while True:
+            resp = self._request("DELETE", url)
+            if resp.status_code == 503 and attempt < _REMOVE_ALL_MAX_RETRIES:
+                delay = _remove_all_retry_delay(resp.headers.get("Retry-After"), backoff)
+                # Close the response before sleeping so the connection is not
+                # held open for the whole backoff.
+                resp.close()
+                time.sleep(delay)
+                backoff *= 2
+                attempt += 1
+                continue
+            self._check_error(resp)
+            return
 
     def copy(self, src_path: str, dst_path: str) -> None:
         """Perform a server-side zero-copy."""

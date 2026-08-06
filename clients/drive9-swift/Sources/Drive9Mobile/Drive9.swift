@@ -6,6 +6,17 @@ import FoundationNetworking
 private let defaultSmallFileThreshold: Int64 = 50_000
 private let defaultPartSize: Int64 = 8 * 1024 * 1024
 
+// removeAllMaxRetries bounds the 503 retry loop for recursive deletes. The
+// server answers 503 when a batched recursive delete exhausts its per-request
+// budget; the sweep is resumable and idempotent, so re-issuing the same
+// DELETE continues where it left off.
+private let removeAllMaxRetries = 4
+
+// removeAllMaxRetryDelaySeconds caps the delay honored from a Retry-After
+// header so a pathological value (e.g. Retry-After: 999999) cannot block the
+// caller for days.
+private let removeAllMaxRetryDelaySeconds: UInt64 = 60
+
 public final class Drive9Client: @unchecked Sendable {
     private let baseUrlValue: String
     private let apiKeyValue: String?
@@ -96,6 +107,45 @@ public final class Drive9Client: @unchecked Sendable {
 
     public func delete(path: String) async throws {
         _ = try await send(makeRequest(method: "DELETE", url: fsUrl(path)))
+    }
+
+    /// Removes a file or directory tree recursively. A large tree delete may
+    /// exceed the server's per-request budget; the server then answers 503
+    /// (with an optional Retry-After header) and removeAll retries with
+    /// backoff, at most removeAllMaxRetries times. Retrying is safe: the
+    /// server-side sweep is resumable and idempotent, so a repeated DELETE
+    /// continues where it left off.
+    public func removeAll(path: String) async throws {
+        var components = URLComponents(url: fsUrl(path), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "recursive", value: "1")]
+        let request = makeRequest(method: "DELETE", url: components.url!)
+
+        var backoffNs: UInt64 = 1_000_000_000 // 1s
+        for attempt in 0...removeAllMaxRetries {
+            try ensureRequestCredentialsAllowed(request)
+            let result: (Data, URLResponse)
+            do {
+                result = try await session.data(for: request)
+            } catch {
+                throw Drive9Exception.Drive9(code: "request", statusCode: nil, detail: error.localizedDescription, serverRevision: nil)
+            }
+            guard let http = result.1 as? HTTPURLResponse else {
+                throw Drive9Exception.Drive9(code: "request", statusCode: nil, detail: "non-HTTP response", serverRevision: nil)
+            }
+            if http.statusCode == 503 && attempt < removeAllMaxRetries {
+                let delayNs = removeAllRetryDelayNs(
+                    retryAfter: http.value(forHTTPHeaderField: "Retry-After"),
+                    backoffNs: backoffNs
+                )
+                try await Task.sleep(nanoseconds: delayNs)
+                backoffNs *= 2
+                continue
+            }
+            guard (200...299).contains(http.statusCode) else {
+                throw errorFrom(data: result.0, status: http.statusCode)
+            }
+            return
+        }
     }
 
     public func copy(srcPath: String, dstPath: String) async throws {
@@ -663,7 +713,29 @@ public final class Drive9Client: @unchecked Sendable {
         return request
     }
 
+    func canSendCredentials(to url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return false }
+        if scheme == "https" { return true }
+        guard scheme == "http", let host = url.host?.lowercased() else { return false }
+        return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
+    }
+
+    func ensureRequestCredentialsAllowed(_ request: URLRequest) throws {
+        guard request.value(forHTTPHeaderField: "Authorization") != nil,
+              let url = request.url,
+              !canSendCredentials(to: url) else {
+            return
+        }
+        throw Drive9Exception.Drive9(
+            code: "insecure_base_url",
+            statusCode: nil,
+            detail: "refusing to send bearer token to a non-HTTPS, non-loopback origin",
+            serverRevision: nil
+        )
+    }
+
     private func send(_ request: URLRequest, body: Data? = nil, accepted: ClosedRange<Int> = 200...299) async throws -> (data: Data, http: HTTPURLResponse) {
+        try ensureRequestCredentialsAllowed(request)
         do {
             let result: (Data, URLResponse)
             if let body {
@@ -811,6 +883,20 @@ public final class Drive9Client: @unchecked Sendable {
         normalizedPath(path).split(separator: "/", omittingEmptySubsequences: false)
             .map { String($0).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
             .joined(separator: "/")
+    }
+
+    /// Decides the sleep before the next recursive-delete retry. A valid
+    /// non-negative Retry-After value (integer delta-seconds) is honored and
+    /// clamped to removeAllMaxRetryDelaySeconds; honoring 0 as an immediate
+    /// retry is intentional (the retry loop is bounded). A missing or
+    /// unparseable header falls back to the passed exponential backoff.
+    func removeAllRetryDelayNs(retryAfter: String?, backoffNs: UInt64) -> UInt64 {
+        if let raw = retryAfter,
+           let secs = Int(raw.trimmingCharacters(in: .whitespaces)),
+           secs >= 0 {
+            return min(UInt64(secs), removeAllMaxRetryDelaySeconds) * 1_000_000_000
+        }
+        return backoffNs
     }
 }
 

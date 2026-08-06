@@ -1069,8 +1069,48 @@ func (c *Client) RemoveAll(path string) error {
 // RemoveAllCtx removes a file or directory tree recursively with context support.
 // It forwards to deleteCtx with recursive=true, so regular files use Delete
 // semantics and missing paths return the same 404 *StatusError as RemoveAll.
+// A large tree delete may exceed the server's per-request budget; the server
+// then answers 503 and RemoveAllCtx retries with backoff (honoring Retry-After,
+// at most removeAllMaxRetries times). Retrying is safe: the server-side sweep
+// is resumable and idempotent, so a repeated DELETE continues it.
 func (c *Client) RemoveAllCtx(ctx context.Context, path string) error {
 	return c.deleteCtx(ctx, path, true, "")
+}
+
+// removeAllMaxRetries bounds the 503 retry loop for recursive deletes. The
+// server answers 503 (ErrDeleteIncomplete) when a batched recursive delete
+// exhausts its transaction/time budget; the sweep is resumable and idempotent,
+// so re-issuing the same DELETE continues where it left off. The server-side
+// contract lives in tidbcloud/fs (https://github.com/tidbcloud/fs/pull/39);
+// ErrDeleteIncomplete is defined there, not in this repo. Note this only
+// helps when the server's budget trips before the gateway/client deadline —
+// a huge tree can still be cut off by an upstream timeout first (the async
+// delete follow-up covers that case).
+const removeAllMaxRetries = 4
+
+// removeAllMaxRetryDelay caps the Retry-After value honored by the recursive
+// delete retry loop, so a bogus header (e.g. "999999") cannot park the client
+// for days. The exponential backoff fallback is already bounded by
+// removeAllMaxRetries and needs no cap.
+const removeAllMaxRetryDelay = 60 * time.Second
+
+// removeAllRetryDelay computes how long to wait before retrying a recursive
+// delete after a 503. A valid, non-negative Retry-After value (integer
+// delta-seconds) is honored, clamped to removeAllMaxRetryDelay; a missing or
+// invalid header falls back to the passed backoff.
+func removeAllRetryDelay(retryAfter string, backoff time.Duration) time.Duration {
+	if secs, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && secs >= 0 {
+		// Honoring 0 as an immediate retry is intentional: the server
+		// explicitly dictates the delay, and the loop is bounded to
+		// 1 + removeAllMaxRetries requests.
+		// Clamp in seconds before converting so an absurd header cannot
+		// overflow the Duration multiplication and bypass the cap.
+		if secs > int(removeAllMaxRetryDelay/time.Second) {
+			secs = int(removeAllMaxRetryDelay / time.Second)
+		}
+		return time.Duration(secs) * time.Second
+	}
+	return backoff
 }
 
 func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kind string) error {
@@ -1082,19 +1122,38 @@ func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kin
 		requestURL += "?kind=" + url.QueryEscape(kind)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)
-	if err != nil {
-		return err
+	backoff := time.Second
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := c.do(req)
+		if err != nil {
+			return err
+		}
+		if recursive && resp.StatusCode == http.StatusServiceUnavailable && attempt < removeAllMaxRetries {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			delay := removeAllRetryDelay(resp.Header.Get("Retry-After"), backoff)
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			backoff *= 2
+			continue
+		}
+		// Retry branches close the body explicitly before continuing; this
+		// defer only covers the terminal iteration that returns from the loop.
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode >= 300 {
+			return readError(resp)
+		}
+		return nil
 	}
-	resp, err := c.do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode >= 300 {
-		return readError(resp)
-	}
-	return nil
 }
 
 // Copy performs a server-side zero-copy (same file_id, new path).
