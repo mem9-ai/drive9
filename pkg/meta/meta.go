@@ -4566,7 +4566,6 @@ func (s *Store) ListTenantNotifySince(ctx context.Context, afterID uint64, limit
 		        COALESCE(b.organization_id, ''),
 		        o.work_mask, o.created_at
 		 FROM tenant_notify_outbox o
-		 LEFT JOIN tenants t ON t.id = o.tenant_id
 		 LEFT JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = o.tenant_id
 		 WHERE o.id > ?
 		 ORDER BY o.id
