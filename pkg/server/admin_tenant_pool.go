@@ -1504,71 +1504,64 @@ func (s *Server) replenishTenantPool(ctx context.Context, pool *meta.TenantPool,
 	defer func() {
 		metrics.RecordOperation(adminTenantPoolMetricsComponent, "replenish", metricResult, time.Since(replenishStarted))
 	}()
-	createdAny := false
-	for {
-		if err := ctx.Err(); err != nil {
-			metricResult = adminTenantPoolMetricResult(err)
-			return
-		}
-		current, err := s.meta.GetTenantPoolByID(ctx, pool.PoolID)
-		if err != nil {
-			if !errors.Is(err, meta.ErrNotFound) {
-				logger.Warn(ctx, "admin_tenant_pool_replenish_get_pool_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
-				metricResult = "error"
-			} else {
-				metricResult = "not_found"
-			}
-			return
-		}
-		if current.Status != meta.TenantPoolActive || current.OrganizationID == "" || current.Size <= 0 {
-			metricResult = "skipped"
-			return
-		}
-		freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
-		if err != nil {
-			logger.Warn(ctx, "admin_tenant_pool_replenish_free_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+	if err := ctx.Err(); err != nil {
+		metricResult = adminTenantPoolMetricResult(err)
+		return
+	}
+	current, err := s.meta.GetTenantPoolByID(ctx, pool.PoolID)
+	if err != nil {
+		if !errors.Is(err, meta.ErrNotFound) {
+			logger.Warn(ctx, "admin_tenant_pool_replenish_get_pool_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
 			metricResult = "error"
-			return
-		}
-		s.recordTenantPoolCapacity(current.PoolID, current.OrganizationID, current.Size, freeSize)
-		if !createdAny && !s.tenantPoolBelowRefillWatermark(freeSize, current.Size) {
-			logger.Info(ctx, "admin_tenant_pool_replenish_skipped",
-				zap.String("pool_id", current.PoolID),
-				zap.String("organization_id", current.OrganizationID),
-				zap.Int("pool_size", current.Size),
-				zap.Int("free_size", freeSize),
-				zap.Float64("refill_free_ratio", s.effectiveTenantPoolRefillFreeRatio()))
-			metricResult = "noop"
-			return
-		}
-
-		slotSize, countErr := s.meta.CountTenantPoolFreeSlots(ctx, current.OrganizationID)
-		if countErr != nil {
-			logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(countErr))
-			metricResult = "error"
-			return
-		}
-		missing := current.Size - slotSize
-		if missing <= 0 {
-			if !createdAny {
-				metricResult = "noop"
-			}
-			return
-		}
-		results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
-		if err != nil {
-			logger.Warn(ctx, "admin_tenant_pool_replenish_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
-			metricResult = "cluster_error"
-			return
-		}
-		for _, res := range results {
-			s.startProvisionedTenantSchemaInit(ctx, res)
-		}
-		if len(results) > 0 {
-			createdAny = true
-			metricResult = "ok"
+		} else {
+			metricResult = "not_found"
 		}
 		return
+	}
+	if current.Status != meta.TenantPoolActive || current.OrganizationID == "" || current.Size <= 0 {
+		metricResult = "skipped"
+		return
+	}
+	freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
+	if err != nil {
+		logger.Warn(ctx, "admin_tenant_pool_replenish_free_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+		metricResult = "error"
+		return
+	}
+	s.recordTenantPoolCapacity(current.PoolID, current.OrganizationID, current.Size, freeSize)
+	if !s.tenantPoolBelowRefillWatermark(freeSize, current.Size) {
+		logger.Info(ctx, "admin_tenant_pool_replenish_skipped",
+			zap.String("pool_id", current.PoolID),
+			zap.String("organization_id", current.OrganizationID),
+			zap.Int("pool_size", current.Size),
+			zap.Int("free_size", freeSize),
+			zap.Float64("refill_free_ratio", s.effectiveTenantPoolRefillFreeRatio()))
+		metricResult = "noop"
+		return
+	}
+
+	slotSize, countErr := s.meta.CountTenantPoolFreeSlots(ctx, current.OrganizationID)
+	if countErr != nil {
+		logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(countErr))
+		metricResult = "error"
+		return
+	}
+	missing := current.Size - slotSize
+	if missing <= 0 {
+		metricResult = "noop"
+		return
+	}
+	results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
+	if err != nil {
+		logger.Warn(ctx, "admin_tenant_pool_replenish_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+		metricResult = "cluster_error"
+		return
+	}
+	for _, res := range results {
+		s.startProvisionedTenantSchemaInit(ctx, res)
+	}
+	if len(results) > 0 {
+		metricResult = "ok"
 	}
 }
 

@@ -244,15 +244,6 @@ func (s *Server) cleanupFailedNativeTenantWithDependencies(
 	return true, nil
 }
 
-func (s *Server) restoreFailedTenantAfterCleanup(
-	ctx context.Context,
-	tenantID, provider, organizationID string,
-	cleanupErr error,
-) {
-	s.restoreFailedTenantAfterCleanupWithUpdater(
-		ctx, tenantID, provider, organizationID, cleanupErr, s.meta.UpdateTenantStatusIf)
-}
-
 func (s *Server) restoreFailedTenantAfterCleanupWithUpdater(
 	ctx context.Context,
 	tenantID, provider, organizationID string,

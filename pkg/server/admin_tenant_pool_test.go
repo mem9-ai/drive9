@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -15,35 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/pkg/leader"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
-
-func newFollowerLeaderManager(t *testing.T, metaStore *meta.Store) *leader.Manager {
-	t.Helper()
-	ctx := context.Background()
-	conn, err := metaStore.DB().Conn(ctx)
-	if err != nil {
-		t.Fatalf("open leader lock connection: %v", err)
-	}
-	lockName := fmt.Sprintf("d9:test-follower:%d", time.Now().UnixNano())
-	var acquired sql.NullInt64
-	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?, 0)`, lockName).Scan(&acquired); err != nil {
-		_ = conn.Close()
-		t.Fatalf("hold leader lock: %v", err)
-	}
-	if !acquired.Valid || acquired.Int64 != 1 {
-		_ = conn.Close()
-		t.Fatalf("hold leader lock result = %+v, want 1", acquired)
-	}
-	t.Cleanup(func() {
-		var released sql.NullInt64
-		_ = conn.QueryRowContext(context.Background(), `SELECT RELEASE_LOCK(?)`, lockName).Scan(&released)
-		_ = conn.Close()
-	})
-	return leader.NewManager(metaStore.DB(), leader.WithLockName(lockName))
-}
 
 func TestRetryTenantPoolClaimCASSucceedsOnEighthAttempt(t *testing.T) {
 	attempts := 0

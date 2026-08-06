@@ -142,16 +142,6 @@ func TestBlockingDatabaseEnsurerSignalsStartedOnceAcrossRetries(t *testing.T) {
 	}
 }
 
-type countingEncryptor struct {
-	encrypt.Encryptor
-	decryptCalls atomic.Int32
-}
-
-func (e *countingEncryptor) Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error) {
-	e.decryptCalls.Add(1)
-	return e.Encryptor.Decrypt(ctx, ciphertext)
-}
-
 type failingEncryptor struct {
 	err error
 }
@@ -211,12 +201,6 @@ func (f *fakeProvisioner) ResolveOrganizationPlan(_ context.Context, organizatio
 		OrganizationID: organizationID,
 		IsFree:         f.billingFree,
 	}, nil
-}
-
-func (f *fakeProvisioner) iamCredentialsSnapshot() []tenant.CredentialProvisionRequest {
-	f.iamMu.Lock()
-	defer f.iamMu.Unlock()
-	return append([]tenant.CredentialProvisionRequest(nil), f.iamCredentials...)
 }
 
 func (f *fakeProvisioner) ProviderType() string { return f.provider }

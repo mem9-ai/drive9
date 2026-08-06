@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
@@ -286,22 +285,6 @@ func upsertFailedCleanupNativeBinding(t *testing.T, rt *quotaRuntime, tenantID, 
 	}); err != nil {
 		t.Fatalf("upsert native cleanup binding: %v", err)
 	}
-}
-
-func newFailedCleanupRuntimeWithoutWorkers(t *testing.T) (*quotaRuntime, *testDBInfo) {
-	t.Helper()
-	db := newTenantDeleteDBInfo(t)
-	testmysql.ResetMetaDB(t, db.Meta.DB())
-	testmysql.ResetDB(t, db.Meta.DB())
-	t.Cleanup(func() {
-		testmysql.ResetMetaDB(t, db.Meta.DB())
-		testmysql.ResetDB(t, db.Meta.DB())
-	})
-	prov := &quotaTestProvisioner{provider: tenant.ProviderTiDBCloudNative}
-	server := &Server{
-		meta: db.Meta, pool: db.Pool, provisioner: prov,
-	}
-	return &quotaRuntime{meta: db.Meta, prov: prov, server: server}, db
 }
 
 func assertFailedCleanupTenantStatus(t *testing.T, rt *quotaRuntime, tenantID string, want meta.TenantStatus) *meta.Tenant {
