@@ -1,0 +1,387 @@
+package migration
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/mem9-ai/drive9/pkg/client"
+)
+
+const (
+	roundInterval  = time.Second
+	retryBase      = 100 * time.Millisecond
+	maxRetryDelay  = 30 * time.Second
+	attentionAfter = 5 * time.Minute
+)
+
+// Worker owns the process-local execution state for one Job.
+type Worker struct {
+	startup       *Startup
+	api           *client.Client
+	scanner       *Scanner
+	inventory     *TargetScanner
+	apply         *ApplyEngine
+	checkpoint    *CheckpointStore
+	recovery      *Recovery
+	state         *State
+	roundID       atomic.Uint64
+	eventID       atomic.Int64
+	gracePeriod   time.Duration
+	now           func() time.Time
+	reporter      *eventReporter
+	eventIngest   bool
+	controlMu     sync.Mutex
+	writesFenced  atomic.Bool
+	fenceIntent   atomic.Bool
+	fenceComplete atomic.Bool
+}
+
+func NewWorker(ctx context.Context, startup *Startup) (*Worker, error) {
+	if startup == nil || startup.Config == nil {
+		return nil, errors.New("Worker requires startup configuration")
+	}
+	scanner, err := NewScanner(startup.Job.Source.Root)
+	if err != nil {
+		return nil, err
+	}
+	w := &Worker{startup: startup, scanner: scanner, gracePeriod: time.Duration(startup.Config.JobDefaults.Sync.GracePeriod)}
+	if err := w.refreshClient(ctx); err != nil {
+		return nil, err
+	}
+	w.recovery, err = w.checkpoint.Recover(ctx, startup)
+	if err != nil {
+		return nil, err
+	}
+	w.state = w.recovery.State
+	w.writesFenced.Store(!w.recovery.WritesAllowed)
+	w.fenceIntent.Store(w.recovery.Record.Checkpoint.FenceIntent)
+	w.fenceComplete.Store(w.recovery.Record.Checkpoint.FenceComplete)
+	if w.recovery.WritesAllowed {
+		if err := w.rebuildApply(); err != nil {
+			return nil, err
+		}
+		if w.eventIngest {
+			w.reporter = newEventReporter(w.api, 128)
+			w.apply.onCAS = w.reportCAS
+		}
+	}
+	return w, nil
+}
+
+func RunWorker(ctx context.Context, startup *Startup) error {
+	return RunWorkerAt(ctx, startup, DefaultControlSocket)
+}
+
+func RunWorkerAt(ctx context.Context, startup *Startup, socket string) error {
+	worker, err := NewWorker(ctx, startup)
+	if err != nil {
+		return err
+	}
+	control, err := startControl(ctx, socket, worker)
+	if err != nil {
+		return err
+	}
+	defer control.close()
+	return worker.Run(ctx)
+}
+
+func (w *Worker) refreshClient(ctx context.Context) error {
+	key, err := w.startup.Credential.Read()
+	if err != nil {
+		return err
+	}
+	w.api = client.New(w.startup.Config.Drive9.Endpoint, key)
+	caps, err := w.api.GetMigrationCapabilities(ctx)
+	if err != nil {
+		return err
+	}
+	if missing := missingCapabilities(caps); missing != "" {
+		return fmt.Errorf("required capability %s is unavailable", missing)
+	}
+	w.eventIngest = caps.EventIngest
+	if w.reporter != nil {
+		w.reporter.api.Store(w.api)
+	}
+	w.inventory, err = NewTargetScanner(w.api, w.startup.Job.Target.Prefix)
+	if err != nil {
+		return err
+	}
+	w.checkpoint = NewCheckpointStore(w.api)
+	if w.state != nil {
+		return w.rebuildApply()
+	}
+	return nil
+}
+
+func (w *Worker) rebuildApply() error {
+	performance := w.startup.Config.JobDefaults.Performance
+	var err error
+	w.apply, err = NewApplyEngine(w.api, w.scanner, ApplyConfig{
+		Prefix: w.startup.Job.Target.Prefix, Phase: w.state.Snapshot().Phase,
+		SmallFileThreshold: w.api.CachedSmallFileThreshold(), SmallWorkers: performance.SmallFileWorkers,
+		LargeWorkers: performance.LargeFileWorkers, MaxBytesPerSecond: performance.MaxBytesPerSecond,
+	})
+	if err == nil && w.reporter != nil {
+		w.apply.onCAS = w.reportCAS
+	}
+	return err
+}
+
+func (w *Worker) State() StateSnapshot { return w.state.Snapshot() }
+
+func (w *Worker) DeepRecovery(ctx context.Context) error {
+	if err := w.Round(ctx, RoundModeDeep); err != nil {
+		return err
+	}
+	if !w.state.Snapshot().Current.ScanComplete {
+		return ErrIncompleteRound
+	}
+	w.state.SetRecoveryComplete(true)
+	if w.state.Snapshot().Phase == PhaseDualWriteRepairing {
+		w.state.setRepairMtimeFloor(w.state.Snapshot().Current.StartedAt.Add(-w.gracePeriod))
+	}
+	return nil
+}
+
+func (w *Worker) Round(ctx context.Context, mode RoundMode) error {
+	if w.writesFenced.Load() {
+		return ErrIllegalAction
+	}
+	if w.state.Snapshot().Phase == PhaseDualWriteRepairing {
+		return w.dualRound(ctx, mode)
+	}
+	id := fmt.Sprintf("round-%d", w.roundID.Add(1))
+	started := w.clock()
+	w.state.BeginRound(id, mode, started)
+	source, target, err := w.scanPair(ctx)
+	if err != nil {
+		w.state.FailRound(id, "scan")
+		return err
+	}
+	round, err := BuildRound(id, mode, started, source, target)
+	if err != nil {
+		w.state.FailRound(id, "inventory")
+		return err
+	}
+	if unsafeRound(round) {
+		w.state.SetAttention(true)
+		return w.state.PublishRound(round)
+	}
+	if !round.Converged {
+		if w.apply == nil {
+			w.state.FailRound(id, "fenced")
+			return ErrIllegalAction
+		}
+		if err := w.apply.Apply(ctx, source.Entries, target.Entries); err != nil {
+			if errors.Is(err, ErrUnsafeApply) {
+				w.state.SetAttention(true)
+				return w.state.PublishRound(round)
+			}
+			w.state.FailRound(id, "apply")
+			return err
+		}
+		source, target, err = w.scanPair(ctx)
+		if err != nil {
+			w.state.FailRound(id, "reread")
+			return err
+		}
+		round, err = BuildRound(id, mode, started, source, target)
+		if err != nil {
+			w.state.FailRound(id, "reread")
+			return err
+		}
+	}
+	if round.Converged {
+		for path, entry := range round.Source {
+			w.state.MarkReconciled(path, entry.Version)
+		}
+	}
+	if err := w.state.PublishRound(round); err != nil {
+		return err
+	}
+	if round.Converged && w.state.Snapshot().Phase == PhaseSyncing {
+		w.state.SetInitialCopyComplete(true)
+	}
+	w.state.SetAttention(false)
+	return nil
+}
+
+func (w *Worker) scanPair(ctx context.Context) (ScanResult, TargetScan, error) {
+	source, err := w.scanner.Scan(ctx)
+	if err != nil {
+		return source, TargetScan{}, err
+	}
+	deepPaths := make(map[string]struct{})
+	for path, entry := range source.Entries {
+		if entry.Kind == EntryRegular {
+			deep, readErr := w.scanner.ReadStable(ctx, path, entry.Version)
+			if readErr != nil {
+				source.Complete = false
+				return source, TargetScan{}, readErr
+			}
+			entry.ChecksumSHA256 = deep.ChecksumSHA256
+			source.Entries[path] = entry
+		}
+		if entry.Kind != EntryDirectory {
+			deepPaths[path] = struct{}{}
+		}
+	}
+	target, err := w.inventory.Scan(ctx, deepPaths)
+	return source, target, err
+}
+
+func unsafeRound(round Round) bool {
+	for _, finding := range round.Findings {
+		switch finding.Kind {
+		case FindingSourceOnly, FindingTargetOnly, FindingContent, FindingMetadata,
+			FindingSparseFile, FindingSymlinkTarget, FindingModeBits:
+		default:
+			if finding.Severity == SeverityBlocker {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (w *Worker) Run(ctx context.Context) error {
+	if w.recovery != nil && !w.recovery.WritesAllowed {
+		if w.recovery.FenceRecoveryOnly {
+			if _, err := w.completeFence(ctx); err != nil {
+				return err
+			}
+		}
+		<-ctx.Done()
+		return nil
+	}
+	if w.reporter != nil {
+		reporterCtx, cancel := context.WithCancel(ctx)
+		w.reporter.start(reporterCtx)
+		defer func() { cancel(); w.reporter.wait() }()
+	}
+	recovered := w.state.Snapshot().RecoveryComplete
+	attempt := 0
+	var blockedAt time.Time
+	for {
+		if w.writesFenced.Load() {
+			<-ctx.Done()
+			return nil
+		}
+		var err error
+		w.controlMu.Lock()
+		if recovered {
+			mode := RoundModeFull
+			if w.state.Snapshot().Phase == PhaseDualWriteRepairing {
+				mode = RoundModeFast
+			}
+			err = w.Round(ctx, mode)
+		} else {
+			err = w.DeepRecovery(ctx)
+			recovered = err == nil
+		}
+		w.controlMu.Unlock()
+		if ctx.Err() != nil {
+			return nil
+		}
+		delay := roundInterval
+		if err != nil {
+			authRetry := isAuthError(err) && w.startup != nil
+			if authRetry {
+				if refreshErr := w.refreshClient(ctx); refreshErr != nil {
+					w.state.SetAttention(true)
+				}
+			} else if !retryableWorkerError(err) {
+				w.state.SetAttention(true)
+				return err
+			}
+			if blockedAt.IsZero() {
+				blockedAt = w.clock()
+			} else if w.clock().Sub(blockedAt) >= attentionAfter {
+				w.state.SetAttention(true)
+			}
+			delay = retryDelay(attempt, maxRetryDelay)
+			attempt++
+		} else {
+			attempt, blockedAt = 0, time.Time{}
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
+}
+
+func (w *Worker) reportCAS(source SourceEntry, target *client.StatResult, expected int64, started time.Time, err error) {
+	if w.reporter == nil || w.startup == nil {
+		return
+	}
+	now, snapshot := time.Now(), w.state.Snapshot()
+	firstSeen := started
+	for _, candidate := range snapshot.Grace {
+		if candidate.Path == source.Path && candidate.Token == sourceVersionToken(source.Version) {
+			firstSeen = candidate.FirstSeen
+		}
+	}
+	result, class := "success", ""
+	if errors.Is(err, client.ErrConflict) {
+		result, class = "conflict", "cas_conflict"
+	} else if err != nil {
+		result, class = "failure", classifyRetry(err)
+	}
+	attempt := w.eventID.Add(1)
+	event := client.MigrationEvent{
+		EventID: fmt.Sprintf("%s-%d-%d", snapshot.Current.ID, attempt, now.UnixNano()), EmittedAt: now.UTC().Format(time.RFC3339Nano),
+		Phase: string(snapshot.Phase), RoundID: snapshot.Current.ID, CASAttempt: attempt, FirstSeenAt: firstSeen.UTC().Format(time.RFC3339Nano), GraceSeconds: int64(w.graceWindow().Seconds()),
+		JobID: w.startup.Job.VolumeID, VolumeID: w.startup.Job.VolumeID, NodeName: w.startup.Job.NodeName, SpaceID: w.startup.Job.Target.SpaceRef,
+		SourcePath: source.Path, TargetPath: targetRemotePath(w.startup.Job.Target.Prefix, source.Path, false), SourceVersionToken: sourceVersionToken(source.Version),
+		Size: source.Version.Size, Mtime: source.Version.MtimeNS, SourceChecksumSHA256: source.ChecksumSHA256, ExpectedRevision: expected,
+		Operation: "update", Result: result, ErrorClass: class, LatencyMS: time.Since(started).Milliseconds(),
+	}
+	if expected == 0 {
+		event.Operation = "create"
+	}
+	event.PodName, _ = os.Hostname()
+	if target != nil {
+		event.ResourceID, event.Revision, event.Drive9ChecksumSHA256 = target.ResourceID, target.Revision, target.ChecksumSHA256
+	}
+	w.reporter.enqueue(event)
+}
+
+func (w *Worker) clock() time.Time {
+	if w.now != nil {
+		return w.now()
+	}
+	return time.Now()
+}
+
+func retryDelay(attempt int, maximum time.Duration) time.Duration {
+	delay := retryBase << min(attempt, 20)
+	return min(delay, maximum)
+}
+
+func isAuthError(err error) bool {
+	var status *client.StatusError
+	return errors.As(err, &status) && (status.StatusCode == http.StatusUnauthorized || status.StatusCode == http.StatusForbidden)
+}
+
+func retryableWorkerError(err error) bool {
+	if errors.Is(err, ErrSourceChanged) || errors.Is(err, ErrApplyRescan) || errors.Is(err, ErrCheckpointConflict) {
+		return true
+	}
+	var status *client.StatusError
+	if errors.As(err, &status) {
+		return status.StatusCode == http.StatusTooManyRequests || status.StatusCode >= 500
+	}
+	var network net.Error
+	return errors.As(err, &network)
+}

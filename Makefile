@@ -12,6 +12,7 @@ GOARCH ?= $(HOST_GOARCH)
 
 APP_NAME ?= drive9-server
 CLI_NAME ?= drive9
+MIGRATION_NAME ?= drive9-migration
 LOCAL_SERVER_NAME ?= drive9-server-local
 
 BIN_DIR ?= bin
@@ -21,6 +22,7 @@ BIN_DIR_ABS := $(abspath $(BIN_DIR))
 DIST_DIR ?= dist
 SERVER_BIN ?= $(BIN_DIR)/$(APP_NAME)
 CLI_BIN ?= $(BIN_DIR)/$(CLI_NAME)
+MIGRATION_BIN ?= $(BIN_DIR)/$(MIGRATION_NAME)
 LOCAL_SERVER_BIN ?= $(BIN_DIR)/$(LOCAL_SERVER_NAME)
 
 VERSION ?=
@@ -29,6 +31,7 @@ GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknow
 BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
+MIGRATION_TARGETS ?= linux/amd64 linux/arm64
 
 GOLANGCI_LINT_VERSION ?= v2.5.0
 GOLANGCI_LINT_BIN ?= $(BIN_DIR)/golangci-lint
@@ -47,7 +50,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local e2e-local sdk-integration-tests docker-build
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release build-migration build-migration-release run-server-local e2e-local sdk-integration-tests docker-build
 
 mod:
 	$(GO) mod tidy
@@ -136,6 +139,22 @@ sdk-integration-tests:
 build-cli:
 	mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(CLI_BIN) ./cmd/drive9
+
+build-migration:
+	mkdir -p $(dir $(MIGRATION_BIN))
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(MIGRATION_BIN) ./cmd/drive9-migration
+
+build-migration-release:
+	@set -euo pipefail; \
+	mkdir -p $(DIST_DIR); \
+	for target in $(MIGRATION_TARGETS); do \
+		os="$${target%/*}"; \
+		arch="$${target#*/}"; \
+		out="$(DIST_DIR)/$(MIGRATION_NAME)-$${os}-$${arch}"; \
+		echo "Building $$(basename "$$out")..."; \
+		$(MAKE) --no-print-directory build-migration GOOS="$$os" GOARCH="$$arch" MIGRATION_BIN="$$out" VERSION="$(VERSION)"; \
+	done; \
+	cd $(DIST_DIR) && sha256sum $(MIGRATION_NAME)-* > migration-checksums.txt
 
 build-cli-release:
 	@set -euo pipefail; \
