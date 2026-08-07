@@ -711,6 +711,9 @@ func TestMigrationPreCompleteCheckPreventsDirectV1AndV2Commit(t *testing.T) {
 			if !errors.Is(err, checkErr) {
 				t.Fatalf("error=%v, want pre-Complete check error", err)
 			}
+			if IsCommitAttempted(err) {
+				t.Fatalf("pre-Complete error was marked as a commit attempt: %v", err)
+			}
 			if checkHits != 1 || commitHits.Load() != 0 {
 				t.Fatalf("checks=%d commits=%d", checkHits, commitHits.Load())
 			}
@@ -795,6 +798,9 @@ func TestMigrationV2HungAbortIsBoundedAndPreservesCompleteError(t *testing.T) {
 		var statusErr *StatusError
 		if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable || !strings.Contains(err.Error(), "original complete failure") {
 			t.Fatalf("error=%T %v, want original 503", err, err)
+		}
+		if !IsCommitAttempted(err) {
+			t.Fatalf("Complete error was not marked as a commit attempt: %v", err)
 		}
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("bounded abort did not return")

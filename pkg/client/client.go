@@ -778,11 +778,18 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 	}
 	resp, err := c.do(req)
 	if err != nil {
+		if expectedRevision >= 0 {
+			err = markCommitAttempt(err)
+		}
 		return 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
-		return 0, readError(resp)
+		err := readError(resp)
+		if expectedRevision >= 0 {
+			err = markCommitAttempt(err)
+		}
+		return 0, err
 	}
 	// Parse committed revision from response body.
 	var result struct {

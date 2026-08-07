@@ -261,7 +261,7 @@ func (m *memoryTarget) handler(w http.ResponseWriter, r *http.Request) {
 			Mode uint32 `json:"mode"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		node.mode = body.Mode
+		node.mode = node.mode&0o170000 | body.Mode&0o777
 		m.nodes[name] = node
 	case http.MethodDelete:
 		if !exists {
@@ -405,6 +405,37 @@ func TestWorkerSyncingInitialIncrementalRenameAndRestart(t *testing.T) {
 	}
 	if err := restarted.DeepRecovery(context.Background()); err != nil || !restarted.State().Conditions.ReadyForRollout {
 		t.Fatalf("restart recovery error=%v state=%+v", err, restarted.State())
+	}
+}
+
+func TestWorkerSyncingRepairsSymlinkMode(t *testing.T) {
+	root := t.TempDir()
+	name := filepath.Join(root, "link")
+	if err := os.Symlink("target", name); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMode := uint32(info.Mode().Perm())
+	target := &memoryTarget{nodes: map[string]memoryTargetNode{
+		"link": {data: []byte("target"), revision: 1, mode: 0o120000 | (wantMode ^ 0o100), resourceID: "link-id"},
+	}}
+	worker, server := newRoundWorker(t, root, target)
+	defer server.Close()
+
+	if err := worker.DeepRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	got := target.nodes["link"].mode
+	target.mu.Unlock()
+	if got&0o170000 != 0o120000 || got&0o777 != wantMode {
+		t.Fatalf("symlink mode=%#o, want type symlink and permissions %#o", got, wantMode)
+	}
+	if !worker.State().Conditions.ReadyForRollout {
+		t.Fatalf("symlink mode repair did not converge: %+v", worker.State())
 	}
 }
 

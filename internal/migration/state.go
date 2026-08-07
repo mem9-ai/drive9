@@ -258,6 +258,19 @@ func sourceVersionToken(version SourceVersion) string {
 	return fmt.Sprintf("%d:%d:%s:%d:%d:%d:%d", version.Device, version.Inode, version.Kind, version.Size, version.MtimeNS, version.CtimeNS, version.Mode)
 }
 
+type casEventContext struct {
+	Phase     Phase
+	RoundID   string
+	Candidate GraceCandidate
+}
+
+func (s *State) eventContextForCAS(path, token string) (casEventContext, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	candidate, ok := s.grace[path+"\x00"+token]
+	return casEventContext{Phase: s.phase, RoundID: s.current.ID, Candidate: candidate}, ok
+}
+
 func (s *State) trackGrace(path string, version SourceVersion, now time.Time) GraceCandidate {
 	s.mu.Lock()
 	defer s.mu.Unlock()
