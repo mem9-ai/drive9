@@ -67,7 +67,7 @@ func (e *ApplyEngine) ApplyWithManifest(ctx context.Context, source, manifest ma
 	if target == nil {
 		target = make(map[string]TargetEntry)
 	}
-	directories, files, links := make([]SourceEntry, 0), make([]SourceEntry, 0), make([]SourceEntry, 0)
+	directories, files, links, symlinks := make([]SourceEntry, 0), make([]SourceEntry, 0), make([]SourceEntry, 0), make([]SourceEntry, 0)
 	primaries := matchingHardlinkPrimaries(manifest, target)
 	uploadPrimaries := make(map[string]struct{})
 	paths := sortedSourcePaths(source)
@@ -96,6 +96,7 @@ func (e *ApplyEngine) ApplyWithManifest(ctx context.Context, source, manifest ma
 			}
 		case EntrySymlink:
 			links = append(links, entry)
+			symlinks = append(symlinks, entry)
 		default:
 			return fmt.Errorf("%w: unsupported source type at %s", ErrUnsafeApply, entry.Path)
 		}
@@ -145,7 +146,11 @@ func (e *ApplyEngine) ApplyWithManifest(ctx context.Context, source, manifest ma
 			return err
 		}
 	}
-	if err := e.applyModes(ctx, append(files, directories...), target); err != nil {
+	modeEntries := make([]SourceEntry, 0, len(files)+len(symlinks)+len(directories))
+	modeEntries = append(modeEntries, files...)
+	modeEntries = append(modeEntries, symlinks...)
+	modeEntries = append(modeEntries, directories...)
+	if err := e.applyModes(ctx, modeEntries, target); err != nil {
 		return err
 	}
 	return e.applyDeletes(ctx, manifest, target)
@@ -264,7 +269,7 @@ func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, obse
 		func() error { return e.validateOpenSource(file, source) },
 	)
 	operationDone()
-	if e.onCAS != nil {
+	if e.onCAS != nil && (uploadErr == nil || client.IsCommitAttempted(uploadErr)) {
 		e.onCAS(source, current, expected, started, uploadErr)
 	}
 	closeErr := file.Close()

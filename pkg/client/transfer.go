@@ -374,6 +374,27 @@ func (c *Client) WriteStreamConditionalWithChecksumAndPreCompleteCheck(ctx conte
 	return c.writeStreamConditionalWithChecksumAndPreCompleteCheck(ctx, path, r, size, progress, expectedRevision, checksumSHA256, preCompleteCheck)
 }
 
+type commitAttemptError struct {
+	err error
+}
+
+func (e *commitAttemptError) Error() string { return e.err.Error() }
+func (e *commitAttemptError) Unwrap() error { return e.err }
+
+func markCommitAttempt(err error) error {
+	if err == nil || IsCommitAttempted(err) {
+		return err
+	}
+	return &commitAttemptError{err: err}
+}
+
+// IsCommitAttempted reports whether err occurred after the Client dispatched a
+// direct conditional write or multipart Complete request.
+func IsCommitAttempted(err error) bool {
+	var attempted *commitAttemptError
+	return errors.As(err, &attempted)
+}
+
 func (c *Client) writeStreamConditionalWithChecksumAndPreCompleteCheck(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, checksumSHA256 string, preCompleteCheck func() error) (*StatResult, error) {
 	if expectedRevision < 0 {
 		return nil, fmt.Errorf("expected revision must be zero for create or positive for update")
@@ -383,7 +404,7 @@ func (c *Client) writeStreamConditionalWithChecksumAndPreCompleteCheck(ctx conte
 	}
 	stat, err := c.StatCtx(ctx, path)
 	if err != nil {
-		return nil, fmt.Errorf("stat completed upload: %w", err)
+		return nil, markCommitAttempt(fmt.Errorf("stat completed upload: %w", err))
 	}
 	return stat, nil
 }
@@ -920,12 +941,12 @@ func (c *Client) completeUploadWithOptions(ctx context.Context, uploadID string,
 
 	resp, err := c.do(req)
 	if err != nil {
-		return err
+		return markCommitAttempt(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
-		return readError(resp)
+		return markCommitAttempt(readError(resp))
 	}
 	return nil
 }
@@ -1265,12 +1286,12 @@ func (c *Client) completeUploadV2WithOptions(ctx context.Context, uploadID strin
 
 	resp, err := c.do(req)
 	if err != nil {
-		return err
+		return markCommitAttempt(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
-		return readError(resp)
+		return markCommitAttempt(readError(resp))
 	}
 	return nil
 }

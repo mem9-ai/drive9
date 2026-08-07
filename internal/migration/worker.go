@@ -508,17 +508,12 @@ func (w *Worker) reportCAS(source SourceEntry, target *client.StatResult, expect
 	if w.reporter == nil || w.startup == nil {
 		return
 	}
-	snapshot := w.state.Snapshot()
-	if snapshot.Phase != PhaseDualWriteRepairing {
+	token := sourceVersionToken(source.Version)
+	eventContext, ok := w.state.eventContextForCAS(source.Path, token)
+	if !ok || eventContext.Phase != PhaseDualWriteRepairing {
 		return
 	}
-	var firstSeen time.Time
-	for _, candidate := range snapshot.Grace {
-		if candidate.Path == source.Path && candidate.Token == sourceVersionToken(source.Version) {
-			firstSeen = candidate.FirstSeen
-			break
-		}
-	}
+	firstSeen := eventContext.Candidate.FirstSeen
 	if firstSeen.IsZero() || w.clock().Before(firstSeen.Add(w.graceWindow())) {
 		return
 	}
@@ -531,10 +526,10 @@ func (w *Worker) reportCAS(source SourceEntry, target *client.StatResult, expect
 	}
 	attempt := w.eventID.Add(1)
 	event := client.MigrationEvent{
-		EventID: fmt.Sprintf("%s-%d-%d", snapshot.Current.ID, attempt, now.UnixNano()), EmittedAt: now.UTC().Format(time.RFC3339Nano),
-		Phase: string(snapshot.Phase), RoundID: snapshot.Current.ID, CASAttempt: attempt, FirstSeenAt: firstSeen.UTC().Format(time.RFC3339Nano), GraceSeconds: int64(w.graceWindow().Seconds()),
+		EventID: fmt.Sprintf("%s-%d-%d", eventContext.RoundID, attempt, now.UnixNano()), EmittedAt: now.UTC().Format(time.RFC3339Nano),
+		Phase: string(eventContext.Phase), RoundID: eventContext.RoundID, CASAttempt: attempt, FirstSeenAt: firstSeen.UTC().Format(time.RFC3339Nano), GraceSeconds: int64(w.graceWindow().Seconds()),
 		JobID: w.startup.Job.VolumeID, VolumeID: w.startup.Job.VolumeID, NodeName: w.startup.Job.NodeName, SpaceID: w.startup.Job.Target.SpaceRef,
-		SourcePath: source.Path, TargetPath: targetRemotePath(w.startup.Job.Target.Prefix, source.Path, false), SourceVersionToken: sourceVersionToken(source.Version),
+		SourcePath: source.Path, TargetPath: targetRemotePath(w.startup.Job.Target.Prefix, source.Path, false), SourceVersionToken: token,
 		Size: source.Version.Size, Mtime: source.Version.MtimeNS, SourceChecksumSHA256: source.ChecksumSHA256, ExpectedRevision: expected,
 		Operation: "update", Result: result, ErrorClass: class, LatencyMS: time.Since(started).Milliseconds(),
 	}

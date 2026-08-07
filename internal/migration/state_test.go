@@ -168,6 +168,37 @@ func TestStateConcurrentSnapshotsAreRaceFree(t *testing.T) {
 	wg.Wait()
 }
 
+func TestCASEventContextDoesNotCloneCompleteRound(t *testing.T) {
+	state := NewState(PhaseDualWriteRepairing)
+	state.BeginRound("round", RoundModeFast, time.Now())
+	version := SourceVersion{Device: 1, Inode: 2, Kind: EntryRegular, Size: 3, MtimeNS: 4, CtimeNS: 5, Mode: 0o644}
+	candidate := state.trackGrace("/file", version, time.Now().Add(-time.Minute))
+
+	largeRound := &Round{Source: make(map[string]SourceEntry, 10_000), Target: make(map[string]TargetEntry, 10_000)}
+	for i := range 10_000 {
+		path := fmt.Sprintf("/entry/%d", i)
+		largeRound.Source[path] = SourceEntry{Path: path}
+		largeRound.Target[path] = TargetEntry{Path: path}
+	}
+	state.mu.Lock()
+	state.lastComplete = largeRound
+	state.mu.Unlock()
+
+	token := sourceVersionToken(version)
+	context, ok := state.eventContextForCAS("/file", token)
+	if !ok || context.Phase != PhaseDualWriteRepairing || context.RoundID != "round" || context.Candidate != candidate {
+		t.Fatalf("event context=%+v found=%v", context, ok)
+	}
+	if _, ok := state.eventContextForCAS("/missing", token); ok {
+		t.Fatal("missing Grace candidate returned an event context")
+	}
+	if allocs := testing.AllocsPerRun(20, func() {
+		_, _ = state.eventContextForCAS("/file", token)
+	}); allocs > 2 {
+		t.Fatalf("event context allocated %.1f objects; likely cloned process state", allocs)
+	}
+}
+
 func TestStateSnapshotHasNoSecretOrFileContentField(t *testing.T) {
 	state := NewState(PhaseSyncing)
 	state.BeginRound("one", RoundModeDeep, time.Now())

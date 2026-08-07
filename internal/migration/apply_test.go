@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -168,6 +169,67 @@ func TestApplyRegularUsesConditionalCreateAndUpdate(t *testing.T) {
 			defer remote.mu.Unlock()
 			if len(remote.expected) != 1 || remote.expected[0] != tc.wantExpect || string(remote.body) != "new-content" {
 				t.Fatalf("expected=%v body=%q", remote.expected, remote.body)
+			}
+		})
+	}
+}
+
+func TestApplyReportsOnlyActualConditionalCommitAttempts(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		threshold      int64
+		directStatus   int
+		partStatus     int
+		completeStatus int
+		wantCAS        int32
+	}{
+		{name: "direct PUT failure", threshold: 1024, directStatus: http.StatusServiceUnavailable, wantCAS: 1},
+		{name: "part upload failure", threshold: 1, partStatus: http.StatusServiceUnavailable, completeStatus: http.StatusOK, wantCAS: 0},
+		{name: "Complete failure", threshold: 1, partStatus: http.StatusOK, completeStatus: http.StatusServiceUnavailable, wantCAS: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var casCalls, completeCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				switch {
+				case request.Method == http.MethodHead && request.URL.Path == "/v1/fs/data/file":
+					http.NotFound(w, request)
+				case request.Method == http.MethodPut && request.URL.Path == "/v1/fs/data/file":
+					http.Error(w, "injected direct PUT failure", tc.directStatus)
+				case request.Method == http.MethodPost && request.URL.Path == "/v2/uploads/initiate":
+					w.WriteHeader(http.StatusAccepted)
+					_ = json.NewEncoder(w).Encode(map[string]any{"upload_id": "upload", "part_size": 8, "total_parts": 1})
+				case request.Method == http.MethodPost && request.URL.Path == "/v2/uploads/upload/presign-batch":
+					_ = json.NewEncoder(w).Encode(map[string]any{"parts": []map[string]any{{
+						"number": 1, "url": "http://" + request.Host + "/part", "size": 8, "expires_at": time.Now().Add(time.Minute),
+					}}})
+				case request.Method == http.MethodPut && request.URL.Path == "/part":
+					if tc.partStatus >= http.StatusMultipleChoices {
+						http.Error(w, "injected part failure", tc.partStatus)
+						return
+					}
+					w.Header().Set("ETag", `"etag"`)
+					w.WriteHeader(tc.partStatus)
+				case request.Method == http.MethodPost && request.URL.Path == "/v2/uploads/upload/complete":
+					completeCalls.Add(1)
+					http.Error(w, "injected Complete failure", tc.completeStatus)
+				case request.Method == http.MethodPost && request.URL.Path == "/v2/uploads/upload/abort":
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					http.NotFound(w, request)
+				}
+			}))
+			defer server.Close()
+
+			scanner, source := newApplyFixture(t, "12345678")
+			engine := newTestApplyEngine(t, server, scanner, tc.threshold)
+			engine.onCAS = func(SourceEntry, *client.StatResult, int64, time.Time, error) {
+				casCalls.Add(1)
+			}
+			if err := engine.Apply(context.Background(), map[string]SourceEntry{source.Path: source}, nil); err == nil {
+				t.Fatal("Apply unexpectedly succeeded")
+			}
+			if got := casCalls.Load(); got != tc.wantCAS {
+				t.Fatalf("CAS reports=%d, want %d; Complete calls=%d", got, tc.wantCAS, completeCalls.Load())
 			}
 		})
 	}
@@ -612,7 +674,12 @@ func TestApplyMultipartSourceMutationCannotCommitOrFalseConverge(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := newTestApplyEngine(t, srv, scanner, 1).Apply(context.Background(), map[string]SourceEntry{"/file": source}, nil)
+	engine := newTestApplyEngine(t, srv, scanner, 1)
+	var casCalls atomic.Int32
+	engine.onCAS = func(SourceEntry, *client.StatResult, int64, time.Time, error) {
+		casCalls.Add(1)
+	}
+	err := engine.Apply(context.Background(), map[string]SourceEntry{"/file": source}, nil)
 	if !errors.Is(err, ErrSourceChanged) {
 		t.Fatalf("error=%v, want ErrSourceChanged", err)
 	}
@@ -636,8 +703,8 @@ func TestApplyMultipartSourceMutationCannotCommitOrFalseConverge(t *testing.T) {
 	if uploadedParts != partCount || len(uploaded) != len(original) || bytes.Equal(uploaded, original) {
 		t.Fatalf("fixture parts=%d bytes=%d mutated=%v", uploadedParts, len(uploaded), !bytes.Equal(uploaded, original))
 	}
-	if wasCommitted || gotCompleteHits != 0 || gotAbortHits != 1 {
-		t.Fatalf("committed=%v complete=%d abort=%d", wasCommitted, gotCompleteHits, gotAbortHits)
+	if wasCommitted || gotCompleteHits != 0 || gotAbortHits != 1 || casCalls.Load() != 0 {
+		t.Fatalf("committed=%v complete=%d abort=%d CAS reports=%d", wasCommitted, gotCompleteHits, gotAbortHits, casCalls.Load())
 	}
 
 	restored, err := scanner.Scan(context.Background())
