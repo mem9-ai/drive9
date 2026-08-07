@@ -67,6 +67,53 @@ func TestControlStatusDiffPermissionsAndUnavailable(t *testing.T) {
 	}
 }
 
+func TestStartControlReclaimsStaleSocket(t *testing.T) {
+	socket := testControlSocket(t)
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unixListener, ok := listener.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("listener type=%T", listener)
+	}
+	unixListener.SetUnlinkOnClose(false)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("stale socket mode=%v", info.Mode())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	server, err := startControl(ctx, socket, &Worker{})
+	if err != nil {
+		cancel()
+		t.Fatalf("reclaim stale socket: %v", err)
+	}
+	cancel()
+	server.close()
+}
+
+func TestStartControlDoesNotRemoveNonSocketPath(t *testing.T) {
+	socket := testControlSocket(t)
+	const contents = "not-a-socket"
+	if err := os.WriteFile(socket, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := startControl(context.Background(), socket, &Worker{}); err == nil {
+		t.Fatal("non-socket path was replaced")
+	}
+	got, err := os.ReadFile(socket)
+	if err != nil || string(got) != contents {
+		t.Fatalf("non-socket contents=%q err=%v", got, err)
+	}
+}
+
 func TestStatusReportsPendingAndBlockedUploadInFlight(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "file"), []byte("content"), 0o644); err != nil {

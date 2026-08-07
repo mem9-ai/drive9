@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -108,7 +109,7 @@ func startControl(ctx context.Context, path string, worker *Worker) (*controlSer
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	listener, err := net.Listen("unix", path)
+	listener, err := listenControlSocket(path)
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +122,34 @@ func startControl(ctx context.Context, path string, worker *Worker) (*controlSer
 	go server.serve()
 	go func() { <-ctx.Done(); server.close() }()
 	return server, nil
+}
+
+func listenControlSocket(path string) (net.Listener, error) {
+	listener, listenErr := net.Listen("unix", path)
+	if listenErr == nil || !errors.Is(listenErr, syscall.EADDRINUSE) {
+		return listener, listenErr
+	}
+
+	staleInfo, err := os.Lstat(path)
+	if err != nil || staleInfo.Mode()&os.ModeSocket == 0 {
+		return nil, listenErr
+	}
+	conn, dialErr := net.DialTimeout("unix", path, 250*time.Millisecond)
+	if dialErr == nil {
+		_ = conn.Close()
+		return nil, listenErr
+	}
+	if !errors.Is(dialErr, syscall.ECONNREFUSED) {
+		return nil, listenErr
+	}
+	currentInfo, err := os.Lstat(path)
+	if err != nil || !os.SameFile(staleInfo, currentInfo) || currentInfo.Mode()&os.ModeSocket == 0 {
+		return nil, listenErr
+	}
+	if err := os.Remove(path); err != nil {
+		return nil, fmt.Errorf("remove stale control socket %q: %w", path, err)
+	}
+	return net.Listen("unix", path)
 }
 
 func (s *controlServer) serve() {
