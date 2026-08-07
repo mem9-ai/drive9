@@ -361,10 +361,24 @@ func (c *Client) WriteStreamConditional(ctx context.Context, path string, r io.R
 // the committed Stat. Direct PUT ignores the supplied checksum because the
 // Server computes it from the received bytes.
 func (c *Client) WriteStreamConditionalWithChecksum(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, checksumSHA256 string) (*StatResult, error) {
+	return c.writeStreamConditionalWithChecksumAndPreCompleteCheck(ctx, path, r, size, progress, expectedRevision, checksumSHA256, nil)
+}
+
+// WriteStreamConditionalWithChecksumAndPreCompleteCheck performs a Migration
+// upload whose check runs after every source read and before direct PUT or
+// Multipart Complete. A check failure prevents the attempt from committing.
+func (c *Client) WriteStreamConditionalWithChecksumAndPreCompleteCheck(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, checksumSHA256 string, preCompleteCheck func() error) (*StatResult, error) {
+	if preCompleteCheck == nil {
+		return nil, errors.New("pre-Complete check is required")
+	}
+	return c.writeStreamConditionalWithChecksumAndPreCompleteCheck(ctx, path, r, size, progress, expectedRevision, checksumSHA256, preCompleteCheck)
+}
+
+func (c *Client) writeStreamConditionalWithChecksumAndPreCompleteCheck(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, checksumSHA256 string, preCompleteCheck func() error) (*StatResult, error) {
 	if expectedRevision < 0 {
 		return nil, fmt.Errorf("expected revision must be zero for create or positive for update")
 	}
-	if _, err := c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, expectedRevision, nil, "", checksumSHA256); err != nil {
+	if _, err := c.writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx, path, r, size, progress, expectedRevision, nil, "", checksumSHA256, preCompleteCheck); err != nil {
 		return nil, err
 	}
 	stat, err := c.StatCtx(ctx, path)
@@ -397,6 +411,10 @@ func (c *Client) WriteMultipartStreamConditional(ctx context.Context, path strin
 }
 
 func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, tags map[string]string, description, checksumSHA256 string) (*UploadSummary, error) {
+	return c.writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx, path, r, size, progress, expectedRevision, tags, description, checksumSHA256, nil)
+}
+
+func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, tags map[string]string, description, checksumSHA256 string, preCompleteCheck func() error) (*UploadSummary, error) {
 	if err := validateWholeChecksumSHA256(checksumSHA256); err != nil {
 		return nil, err
 	}
@@ -432,6 +450,9 @@ func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path str
 		if err != nil {
 			return nil, fmt.Errorf("read data: %w", err)
 		}
+		if err := runPreCompleteCheck(ctx, preCompleteCheck); err != nil {
+			return nil, err
+		}
 		if err := c.writeCtxConditionalWithTagsAndDescription(ctx, path, data, expectedRevision, tags, description); err != nil {
 			return nil, err
 		}
@@ -445,10 +466,10 @@ func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path str
 
 	// Every attempt is fresh. Prefer V2 and use V1 only when the endpoint is
 	// explicitly unavailable on an older Server.
-	err := c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256)
+	err := c.writeStreamV2WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, preCompleteCheck)
 	if err == errV2NotAvailable {
 		// Server doesn't support v2 — fall back to v1.
-		if err := c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256); err != nil {
+		if err := c.writeStreamV1WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, preCompleteCheck); err != nil {
 			return nil, err
 		}
 		return finishUploadSummary(summary), nil
@@ -489,6 +510,10 @@ func finishUploadSummary(summary *UploadSummary) *UploadSummary {
 }
 
 func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string, description, checksumSHA256 string) error {
+	return c.writeStreamV1WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, nil)
+}
+
+func (c *Client) writeStreamV1WithSummaryAndPreCompleteCheck(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string, description, checksumSHA256 string, preCompleteCheck func() error) error {
 	if err := validateTags(tags); err != nil {
 		return err
 	}
@@ -532,6 +557,9 @@ func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra i
 	if summary != nil {
 		summary.UploadSeconds = time.Since(uploadStart).Seconds()
 	}
+	if err := runPreCompleteCheck(ctx, preCompleteCheck); err != nil {
+		return err
+	}
 
 	completeStart := time.Now()
 	if err := c.completeUploadWithOptions(ctx, plan.UploadID, tags, checksumSHA256); err != nil {
@@ -544,6 +572,10 @@ func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra i
 }
 
 func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string, description, checksumSHA256 string) error {
+	return c.writeStreamV2WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, nil)
+}
+
+func (c *Client) writeStreamV2WithSummaryAndPreCompleteCheck(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string, description, checksumSHA256 string, preCompleteCheck func() error) error {
 	if err := validateTags(tags); err != nil {
 		return err
 	}
@@ -578,25 +610,42 @@ func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra i
 	uploadStart := time.Now()
 	parts, err := c.uploadPartsV2(ctx, plan, ra, presignCh, presignErrCh, presignRecorder, progress)
 	if err != nil {
-		_ = c.abortUploadV2(context.Background(), plan.UploadID)
+		c.abortUploadV2BestEffort(ctx, plan.UploadID)
 		return err
 	}
 	if summary != nil {
 		summary.UploadSeconds = time.Since(uploadStart).Seconds()
 		summary.PresignSeconds = presignRecorder.Seconds()
 	}
+	if err := runPreCompleteCheck(ctx, preCompleteCheck); err != nil {
+		c.abortUploadV2BestEffort(ctx, plan.UploadID)
+		return err
+	}
 
 	completeStart := time.Now()
 	if err := c.completeUploadV2WithOptions(ctx, plan.UploadID, parts, tags, checksumSHA256); err != nil {
 		// Complete failed (network error, 5xx, 409, 410) — best-effort abort
 		// to avoid leaving orphaned multipart uploads / upload rows.
-		_ = c.abortUploadV2(context.Background(), plan.UploadID)
+		c.abortUploadV2BestEffort(ctx, plan.UploadID)
 		return err
 	}
 	if summary != nil {
 		summary.CompleteSeconds = time.Since(completeStart).Seconds()
 	}
 	return nil
+}
+
+func runPreCompleteCheck(ctx context.Context, check func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if check == nil {
+		return nil
+	}
+	if err := check(); err != nil {
+		return fmt.Errorf("pre-Complete check: %w", err)
+	}
+	return ctx.Err()
 }
 
 type uploadInitiateRequest struct {
@@ -1242,6 +1291,22 @@ func (c *Client) abortUploadV2(ctx context.Context, uploadID string) error {
 		return readError(resp)
 	}
 	return nil
+}
+
+const defaultMultipartAbortTimeout = 5 * time.Second
+
+func (c *Client) abortUploadV2BestEffort(parent context.Context, uploadID string) {
+	timeout := c.multipartAbortTimeout
+	if timeout <= 0 {
+		timeout = defaultMultipartAbortTimeout
+	}
+	ctx, cancel := newMultipartAbortContext(parent, timeout)
+	defer cancel()
+	_ = c.abortUploadV2(ctx, uploadID)
+}
+
+func newMultipartAbortContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), timeout)
 }
 
 // ReadStream reads a file, following 302 redirects for large files.

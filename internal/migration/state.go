@@ -32,6 +32,7 @@ type SourceVersion struct {
 
 type SourceEntry struct {
 	Path            string
+	LocalPath       string
 	Kind            EntryKind
 	Version         SourceVersion
 	Mode            uint32
@@ -138,6 +139,13 @@ type VerificationState struct {
 	MismatchCount int64     `json:"mismatch_count"`
 }
 
+type CandidateCounts struct {
+	Mtime              int `json:"mtime"`
+	SourceTokenChanged int `json:"source_token_changed"`
+	NewPath            int `json:"new_path"`
+	Filtered           int `json:"filtered"`
+}
+
 type StateSnapshot struct {
 	Phase               Phase
 	RecoveryComplete    bool
@@ -149,6 +157,8 @@ type StateSnapshot struct {
 	Retry               map[string]RetryItem
 	Observed            map[string]SourceVersion
 	Reconciled          map[string]SourceVersion
+	CandidateCounts     CandidateCounts
+	PendingRepairs      int
 	ActiveOperations    int
 	RepairMtimeFloor    *time.Time
 	Verification        VerificationState
@@ -168,6 +178,8 @@ type State struct {
 	retry               map[string]RetryItem
 	observed            map[string]SourceVersion
 	reconciled          map[string]SourceVersion
+	candidateCounts     CandidateCounts
+	pendingRepairs      int
 	activeOperations    int
 	repairMtimeFloor    *time.Time
 	verification        VerificationState
@@ -187,6 +199,8 @@ func (s *State) BeginRound(id string, mode RoundMode, startedAt time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.current = RoundStatus{ID: id, Mode: mode, StartedAt: startedAt}
+	s.candidateCounts = CandidateCounts{}
+	s.pendingRepairs = 0
 	s.recomputeLocked()
 }
 
@@ -342,10 +356,39 @@ func (s *State) SetAttention(attention bool) {
 	s.recomputeLocked()
 }
 
+func (s *State) setCandidateCounts(counts CandidateCounts) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.candidateCounts = counts
+}
+
+func (s *State) setPendingRepairs(pending int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingRepairs = max(0, pending)
+	s.recomputeLocked()
+}
+
+func (s *State) beginOperation() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activeOperations++
+	s.recomputeLocked()
+}
+
+func (s *State) endOperation() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeOperations > 0 {
+		s.activeOperations--
+	}
+	s.recomputeLocked()
+}
+
 func (s *State) recomputeLocked() {
 	latestConverged := s.lastComplete != nil && s.current.ID == s.lastComplete.ID && s.current.ScanComplete && s.current.Converged
 	syncReady := s.phase == PhaseSyncing && s.recoveryComplete && s.initialCopyComplete && latestConverged && !s.attention
-	dualReady := s.phase == PhaseDualWriteRepairing && s.recoveryComplete && latestConverged && len(s.grace) == 0 && len(s.retry) == 0 && s.activeOperations == 0 && !s.attention
+	dualReady := s.phase == PhaseDualWriteRepairing && s.recoveryComplete && latestConverged && len(s.grace) == 0 && len(s.retry) == 0 && s.pendingRepairs == 0 && s.activeOperations == 0 && !s.attention
 	// Conditions are derived rather than independently mutable.
 	s.conditions = Conditions{ReadyForRollout: syncReady, CurrentConverged: dualReady, Attention: s.attention}
 }
@@ -362,7 +405,8 @@ func (s *State) Snapshot() StateSnapshot {
 		Phase: s.phase, RecoveryComplete: s.recoveryComplete, InitialCopyComplete: s.initialCopyComplete,
 		Current: s.current, LastComplete: last, Conditions: s.conditions,
 		Grace: cloneMap(s.grace), Retry: cloneMap(s.retry), Observed: cloneMap(s.observed), Reconciled: cloneMap(s.reconciled),
-		ActiveOperations: s.activeOperations, RepairMtimeFloor: cloneTime(s.repairMtimeFloor), Verification: s.verification,
+		CandidateCounts: s.candidateCounts, PendingRepairs: s.pendingRepairs, ActiveOperations: s.activeOperations,
+		RepairMtimeFloor: cloneTime(s.repairMtimeFloor), Verification: s.verification,
 	}
 }
 

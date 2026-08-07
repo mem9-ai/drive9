@@ -4,13 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path"
+	"os"
 	"strings"
-	"unicode/utf8"
-
-	"golang.org/x/text/unicode/norm"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 const ControlPrefix = "/.drive9-migration"
@@ -18,24 +16,31 @@ const ControlPrefix = "/.drive9-migration"
 var ErrPreflight = errors.New("migration preflight failed")
 
 type PreflightResult struct {
-	VolumeID                string `json:"volume_id"`
-	NodeName                string `json:"node_name"`
-	SourceRoot              string `json:"source_root"`
-	SpaceRef                string `json:"space_ref"`
-	Prefix                  string `json:"prefix"`
-	CredentialRef           string `json:"credential_ref"`
-	ConfigHash              string `json:"config_hash"`
-	ControlPrefix           string `json:"control_prefix"`
-	EntryCount              int    `json:"entry_count"`
-	DirectoryCount          int    `json:"directory_count"`
-	LogicalBytes            int64  `json:"logical_bytes"`
-	VolumeIdentityVerified  bool   `json:"volume_identity_verified"`
-	RequiredCapabilities    bool   `json:"required_capabilities"`
-	EventReportingAvailable bool   `json:"event_reporting_available"`
-	MaxUploadBytes          int64  `json:"max_upload_bytes"`
-	InlineThreshold         int64  `json:"inline_threshold"`
-	TargetEmpty             bool   `json:"target_empty"`
-	RecoveryControlPresent  bool   `json:"recovery_control_present"`
+	VolumeID                string  `json:"volume_id"`
+	NodeName                string  `json:"node_name"`
+	SourceRoot              string  `json:"source_root"`
+	SpaceRef                string  `json:"space_ref"`
+	Prefix                  string  `json:"prefix"`
+	CredentialRef           string  `json:"credential_ref"`
+	ConfigHash              string  `json:"config_hash"`
+	ControlPrefix           string  `json:"control_prefix"`
+	EntryCount              int     `json:"entry_count"`
+	DirectoryCount          int     `json:"directory_count"`
+	LogicalBytes            int64   `json:"logical_bytes"`
+	RegularFileCount        int     `json:"regular_file_count"`
+	LargestFileBytes        int64   `json:"largest_file_bytes"`
+	InlineFileCount         int     `json:"inline_file_count"`
+	InlineLogicalBytes      int64   `json:"inline_logical_bytes"`
+	MultipartFileCount      int     `json:"multipart_file_count"`
+	MultipartLogicalBytes   int64   `json:"multipart_logical_bytes"`
+	SmallFileRatio          float64 `json:"small_file_ratio"`
+	VolumeIdentityVerified  bool    `json:"volume_identity_verified"`
+	RequiredCapabilities    bool    `json:"required_capabilities"`
+	EventReportingAvailable bool    `json:"event_reporting_available"`
+	MaxUploadBytes          int64   `json:"max_upload_bytes"`
+	InlineThreshold         int64   `json:"inline_threshold"`
+	TargetEmpty             bool    `json:"target_empty"`
+	RecoveryControlPresent  bool    `json:"recovery_control_present"`
 }
 
 // ValidateMappings checks the complete batch before any selected-Job probe.
@@ -48,16 +53,11 @@ func ValidateMappings(cfg *Config) error {
 	}
 	bySpace := make(map[string][]string)
 	nodes := make(map[string]struct{})
-	roots := make(map[string]struct{})
 	for _, job := range cfg.Jobs {
 		if _, exists := nodes[job.NodeName]; exists {
 			return fmt.Errorf("duplicate node_name %q", job.NodeName)
 		}
 		nodes[job.NodeName] = struct{}{}
-		if _, exists := roots[job.Source.Root]; exists {
-			return fmt.Errorf("duplicate Source Root %q", job.Source.Root)
-		}
-		roots[job.Source.Root] = struct{}{}
 		prefix, err := validateTargetPrefix(job.Target.Prefix)
 		if err != nil {
 			return fmt.Errorf("job %q: %w", job.VolumeID, err)
@@ -80,7 +80,8 @@ func ValidateMappings(cfg *Config) error {
 }
 
 func validateTargetPrefix(prefix string) (string, error) {
-	if !utf8.ValidString(prefix) || norm.NFC.String(prefix) != prefix || !strings.HasPrefix(prefix, "/") || path.Clean(prefix) != prefix {
+	canonical, err := pathutil.Canonicalize(prefix)
+	if err != nil || canonical != prefix {
 		return "", fmt.Errorf("target prefix must be absolute, clean UTF-8 NFC")
 	}
 	if prefix == ControlPrefix || strings.HasPrefix(prefix, ControlPrefix+"/") {
@@ -95,15 +96,35 @@ func prefixesOverlap(left, right string) bool {
 
 // Preflight performs the shared read-only plan/run gate for one local Job.
 func Preflight(ctx context.Context, startup *Startup) (PreflightResult, error) {
-	return preflightWithVerifier(ctx, startup, verifyMountedVolume)
+	return preflightWithProbe(ctx, startup, observeMountedSource, os.Open)
 }
 
 func preflightWithVerifier(ctx context.Context, startup *Startup, verifyVolume func(string, string) (bool, error)) (PreflightResult, error) {
+	return preflightWithChecks(ctx, startup, verifyVolume, os.Open)
+}
+
+func preflightWithChecks(ctx context.Context, startup *Startup, verifyVolume func(string, string) (bool, error), openFile func(string) (*os.File, error)) (PreflightResult, error) {
+	probe := func(root, volumeID string) (sourceMountIdentity, error) {
+		identity, err := observeSourceRoot(root)
+		if err != nil {
+			return sourceMountIdentity{}, err
+		}
+		identity.VolumeIdentityVerified, err = verifyVolume(root, volumeID)
+		return identity, err
+	}
+	return preflightWithProbe(ctx, startup, probe, openFile)
+}
+
+func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string, string) (sourceMountIdentity, error), openFile func(string) (*os.File, error)) (PreflightResult, error) {
 	if startup == nil || startup.Config == nil {
 		return PreflightResult{}, fmt.Errorf("%w: missing startup snapshot", ErrPreflight)
 	}
 	if err := ValidateMappings(startup.Config); err != nil {
 		return PreflightResult{}, fmt.Errorf("%w: static mapping: %v", ErrPreflight, err)
+	}
+	initialMountIdentity, err := probe(startup.Job.Source.Root, startup.Job.VolumeID)
+	if err != nil {
+		return PreflightResult{}, fmt.Errorf("%w: initial volume identity: %w", ErrPreflight, err)
 	}
 	scanner, err := NewScanner(startup.Job.Source.Root)
 	if err != nil {
@@ -118,6 +139,9 @@ func preflightWithVerifier(ctx context.Context, startup *Startup, verifyVolume f
 			return PreflightResult{}, fmt.Errorf("%w: source blocker %s", ErrPreflight, finding.Kind)
 		}
 	}
+	if err := verifySourceReadAccess(ctx, scanner, scan, openFile); err != nil {
+		return PreflightResult{}, fmt.Errorf("%w: source read access: %w", ErrPreflight, err)
+	}
 	if startup.Job.Target.Prefix == "/" {
 		for sourcePath := range scan.Entries {
 			if sourcePath == ControlPrefix || strings.HasPrefix(sourcePath, ControlPrefix+"/") {
@@ -125,9 +149,12 @@ func preflightWithVerifier(ctx context.Context, startup *Startup, verifyVolume f
 			}
 		}
 	}
-	verified, err := verifyVolume(startup.Job.Source.Root, startup.Job.VolumeID)
+	mountIdentity, err := probe(startup.Job.Source.Root, startup.Job.VolumeID)
 	if err != nil {
-		return PreflightResult{}, fmt.Errorf("%w: volume identity: %w", ErrPreflight, err)
+		return PreflightResult{}, fmt.Errorf("%w: final volume identity: %w", ErrPreflight, err)
+	}
+	if mountIdentity != initialMountIdentity {
+		return PreflightResult{}, fmt.Errorf("%w: volume identity changed during source validation: %w", ErrPreflight, ErrSourceMountChanged)
 	}
 	key, err := startup.Credential.Read()
 	if err != nil {
@@ -142,29 +169,118 @@ func preflightWithVerifier(ctx context.Context, startup *Startup, verifyVolume f
 	if missing != "" {
 		return PreflightResult{}, fmt.Errorf("%w: required capability %s is unavailable", ErrPreflight, missing)
 	}
+	maxUploadBytes, inlineThreshold := api.MaxUploadBytes(ctx), api.CachedSmallFileThreshold()
+	distribution, err := fileDistribution(scan, maxUploadBytes, inlineThreshold)
+	if err != nil {
+		return PreflightResult{}, fmt.Errorf("%w: %w", ErrPreflight, err)
+	}
+	checkpoint, err := NewCheckpointStore(api).Load(ctx, startup.Job.VolumeID)
+	if err != nil {
+		return PreflightResult{}, fmt.Errorf("%w: checkpoint: %w", ErrPreflight, err)
+	}
+	recoveryControlPresent := checkpoint.Revision > 0
+	if recoveryControlPresent {
+		desired := checkpointFromStartup(startup)
+		if !sameCheckpointIdentity(checkpoint.Checkpoint, desired) {
+			return PreflightResult{}, fmt.Errorf("%w: checkpoint: %w: immutable job identity", ErrPreflight, ErrCheckpointMismatch)
+		}
+		if !checkpoint.Checkpoint.FenceIntent && phaseRank(startup.Phase) < phaseRank(checkpoint.Checkpoint.HighestPhase) {
+			return PreflightResult{}, fmt.Errorf("%w: checkpoint: %w: requested phase rollback", ErrPreflight, ErrCheckpointMismatch)
+		}
+	}
 	entries, err := api.ListCtx(ctx, listPath(startup.Job.Target.Prefix))
 	if err != nil && !client.IsNotFound(err) {
 		return PreflightResult{}, fmt.Errorf("%w: target listing: %w", ErrPreflight, err)
 	}
-	targetEmpty := len(entries) == 0
-	controlPresent := false
+	targetEmpty := true
 	for _, entry := range entries {
 		if startup.Job.Target.Prefix == "/" && strings.TrimSuffix(entry.Name, "/") == strings.TrimPrefix(ControlPrefix, "/") && entry.IsDir {
-			controlPresent = true
 			continue
 		}
-		return PreflightResult{}, fmt.Errorf("%w: target prefix is not empty", ErrPreflight)
+		targetEmpty = false
 	}
+	if !targetEmpty && !recoveryControlPresent {
+		return PreflightResult{}, fmt.Errorf("%w: target prefix is not empty and no matching checkpoint exists", ErrPreflight)
+	}
+	startup.acceptedSource = initialMountIdentity
 	return PreflightResult{
 		VolumeID: startup.Job.VolumeID, NodeName: startup.Job.NodeName,
 		SourceRoot: startup.Job.Source.Root, SpaceRef: startup.Job.Target.SpaceRef,
 		Prefix: startup.Job.Target.Prefix, CredentialRef: startup.Space.CredentialRef,
 		ConfigHash: startup.ConfigHash, ControlPrefix: ControlPrefix,
 		EntryCount: scan.EntryCount, DirectoryCount: scan.DirectoryCount, LogicalBytes: scan.LogicalBytes,
-		VolumeIdentityVerified: verified, RequiredCapabilities: true, EventReportingAvailable: caps.EventIngest,
-		MaxUploadBytes: api.MaxUploadBytes(ctx), InlineThreshold: api.CachedSmallFileThreshold(),
-		TargetEmpty: targetEmpty, RecoveryControlPresent: controlPresent,
+		RegularFileCount: distribution.regularFiles, LargestFileBytes: distribution.largestFileBytes,
+		InlineFileCount: distribution.inlineFiles, InlineLogicalBytes: distribution.inlineBytes,
+		MultipartFileCount: distribution.multipartFiles, MultipartLogicalBytes: distribution.multipartBytes,
+		SmallFileRatio:         distribution.smallFileRatio,
+		VolumeIdentityVerified: mountIdentity.VolumeIdentityVerified, RequiredCapabilities: true, EventReportingAvailable: caps.EventIngest,
+		MaxUploadBytes: maxUploadBytes, InlineThreshold: inlineThreshold,
+		TargetEmpty: targetEmpty, RecoveryControlPresent: recoveryControlPresent,
 	}, nil
+}
+
+func verifySourceReadAccess(ctx context.Context, scanner *Scanner, scan ScanResult, openFile func(string) (*os.File, error)) error {
+	for _, sourcePath := range sortedSourcePaths(scan.Entries) {
+		entry := scan.Entries[sourcePath]
+		if entry.Kind != EntryRegular {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		name, err := scanner.resolvePath(sourceLocalPath(entry))
+		if err != nil {
+			return err
+		}
+		file, err := openFile(name)
+		if err != nil {
+			return err
+		}
+		info, statErr := file.Stat()
+		closeErr := file.Close()
+		if statErr != nil {
+			return statErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		identity, identityErr := scanner.identity(name, info)
+		if identityErr != nil || identity.version != entry.Version {
+			return ErrSourceChanged
+		}
+	}
+	return nil
+}
+
+type observedFileDistribution struct {
+	regularFiles, inlineFiles, multipartFiles     int
+	largestFileBytes, inlineBytes, multipartBytes int64
+	smallFileRatio                                float64
+}
+
+func fileDistribution(scan ScanResult, maxUploadBytes, inlineThreshold int64) (observedFileDistribution, error) {
+	var result observedFileDistribution
+	for _, entry := range scan.Entries {
+		if entry.Kind != EntryRegular {
+			continue
+		}
+		result.regularFiles++
+		result.largestFileBytes = max(result.largestFileBytes, entry.Version.Size)
+		if entry.Version.Size > maxUploadBytes {
+			return observedFileDistribution{}, fmt.Errorf("regular file exceeds max_upload_bytes")
+		}
+		if entry.Version.Size == 0 || entry.Version.Size < inlineThreshold {
+			result.inlineFiles++
+			result.inlineBytes += entry.Version.Size
+		} else {
+			result.multipartFiles++
+			result.multipartBytes += entry.Version.Size
+		}
+	}
+	if result.regularFiles > 0 {
+		result.smallFileRatio = float64(result.inlineFiles) / float64(result.regularFiles)
+	}
+	return result, nil
 }
 
 func missingCapabilities(caps client.MigrationCapabilities) string {
@@ -187,18 +303,4 @@ func listPath(prefix string) string {
 		return prefix
 	}
 	return prefix + "/"
-}
-
-func verifyMountedVolume(root, volumeID string) (bool, error) {
-	serial, available, err := platformVolumeSerial(root)
-	if err != nil || !available {
-		return false, err
-	}
-	normalize := func(value string) string {
-		return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(value), "-", ""))
-	}
-	if !strings.Contains(normalize(serial), normalize(volumeID)) {
-		return false, fmt.Errorf("mounted volume serial does not match volume_id")
-	}
-	return true, nil
 }

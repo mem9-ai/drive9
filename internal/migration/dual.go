@@ -3,15 +3,12 @@ package migration
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
-func (w *Worker) dualRound(ctx context.Context, mode RoundMode) error {
-	id, started := fmt.Sprintf("round-%d", w.roundID.Add(1)), w.clock()
-	w.state.BeginRound(id, mode, started)
+func (w *Worker) dualRound(ctx context.Context, mode RoundMode, id string, started time.Time) error {
 	source, target, candidates, err := w.dualObservation(ctx, mode)
 	if err != nil {
 		w.state.FailRound(id, "scan")
@@ -24,6 +21,8 @@ func (w *Worker) dualRound(ctx context.Context, mode RoundMode) error {
 		return err
 	}
 	normalizeDualFindings(&round)
+	w.state.setPendingRepairs(repairFindingCount(round))
+	observedAt := w.clock()
 	expired, unsafe := make(map[string]SourceEntry), false
 	for path := range candidates {
 		entry, exists := source.Entries[path]
@@ -39,18 +38,22 @@ func (w *Worker) dualRound(ctx context.Context, mode RoundMode) error {
 			unsafe = true
 			continue
 		}
-		candidate := w.state.trackGrace(path, entry.Version, started)
-		if !started.Before(candidate.FirstSeen.Add(w.graceWindow())) {
+		candidate := w.state.trackGrace(path, entry.Version, observedAt)
+		if !observedAt.Before(candidate.FirstSeen.Add(w.graceWindow())) {
 			expired[path] = entry
 		}
 	}
 	if len(expired) > 0 {
-		if err := w.apply.Apply(ctx, expired, target.Entries); err != nil {
+		if err := w.validateRoundBoundary(ctx); err != nil {
+			w.state.FailRound(id, "identity")
+			return err
+		}
+		if err := w.apply.ApplyWithManifest(ctx, expired, source.Entries, target.Entries); err != nil {
 			if errors.Is(err, ErrUnsafeApply) || (!retryableWorkerError(err) && !isAuthError(err)) {
 				unsafe = true
 			} else {
 				for path, entry := range expired {
-					w.state.queueRetry(path, entry.Version, classifyRetry(err), started)
+					w.state.queueRetry(path, entry.Version, classifyRetry(err), w.clock())
 				}
 				_ = w.state.PublishRound(round)
 				return err
@@ -58,7 +61,7 @@ func (w *Worker) dualRound(ctx context.Context, mode RoundMode) error {
 		} else {
 			for path, entry := range expired {
 				if err := w.refreshDualTarget(ctx, path, entry, target.Entries); err != nil {
-					w.state.queueRetry(path, entry.Version, "target_reread", started)
+					w.state.queueRetry(path, entry.Version, "target_reread", w.clock())
 					_ = w.state.PublishRound(round)
 					return err
 				}
@@ -69,6 +72,7 @@ func (w *Worker) dualRound(ctx context.Context, mode RoundMode) error {
 				return err
 			}
 			normalizeDualFindings(&round)
+			w.state.setPendingRepairs(repairFindingCount(round))
 		}
 	}
 	for _, finding := range round.Findings {
@@ -92,10 +96,20 @@ func (w *Worker) dualObservation(ctx context.Context, mode RoundMode) (ScanResul
 		return source, TargetScan{}, nil, err
 	}
 	snapshot := w.state.Snapshot()
-	candidates := dualCandidates(source, snapshot)
+	if snapshot.LastComplete != nil {
+		for path, entry := range source.Entries {
+			prior, exists := snapshot.LastComplete.Source[path]
+			if exists && prior.Version == entry.Version {
+				entry.ChecksumSHA256 = prior.ChecksumSHA256
+				source.Entries[path] = entry
+			}
+		}
+	}
+	candidates, counts := dualCandidates(source, snapshot)
+	w.state.setCandidateCounts(counts)
 	for path, entry := range source.Entries {
 		if _, selected := candidates[path]; selected && entry.Kind == EntryRegular {
-			deep, readErr := w.scanner.ReadStable(ctx, path, entry.Version)
+			deep, readErr := w.scanner.ReadStableEntry(ctx, entry)
 			if readErr != nil {
 				return source, TargetScan{}, nil, readErr
 			}
@@ -119,11 +133,24 @@ func (w *Worker) dualObservation(ctx context.Context, mode RoundMode) (ScanResul
 	return source, target, candidates, nil
 }
 
-func dualCandidates(source ScanResult, snapshot StateSnapshot) map[string]struct{} {
+func dualCandidates(source ScanResult, snapshot StateSnapshot) (map[string]struct{}, CandidateCounts) {
 	result := make(map[string]struct{})
+	var counts CandidateCounts
 	for path, entry := range source.Entries {
-		_, reconciled := snapshot.Reconciled[path]
-		if snapshot.RepairMtimeFloor == nil || entry.Version.MtimeNS >= snapshot.RepairMtimeFloor.UnixNano() || !reconciled || snapshot.Reconciled[path] != entry.Version {
+		selected := false
+		if snapshot.RepairMtimeFloor == nil || entry.Version.MtimeNS >= snapshot.RepairMtimeFloor.UnixNano() {
+			counts.Mtime++
+			selected = true
+		}
+		prior, reconciled := snapshot.Reconciled[path]
+		if !reconciled {
+			counts.NewPath++
+			selected = true
+		} else if prior != entry.Version {
+			counts.SourceTokenChanged++
+			selected = true
+		}
+		if selected {
 			result[path] = struct{}{}
 		}
 	}
@@ -133,7 +160,12 @@ func dualCandidates(source ScanResult, snapshot StateSnapshot) map[string]struct
 	for _, retry := range snapshot.Retry {
 		result[retry.Path] = struct{}{}
 	}
-	return result
+	for path := range source.Entries {
+		if _, selected := result[path]; !selected {
+			counts.Filtered++
+		}
+	}
+	return result, counts
 }
 
 func allSourcePaths(source ScanResult) map[string]struct{} {

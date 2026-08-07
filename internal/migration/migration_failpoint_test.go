@@ -273,7 +273,7 @@ func TestMigrationCheckpointCASFailpointFailsClosed(t *testing.T) {
 	}
 }
 
-func TestMigrationFullVerificationFailpointRecordsFailure(t *testing.T) {
+func TestMigrationFullVerificationFailpointResetsOperationalAttempt(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a"), []byte("same"), 0o644); err != nil {
 		t.Fatal(err)
@@ -292,10 +292,15 @@ func TestMigrationFullVerificationFailpointRecordsFailure(t *testing.T) {
 		}
 		return original(name, info)
 	}
-	enableMigrationTestFault(t, "full_verification")
+	disable := enableMigrationTestFault(t, "full_verification")
 	result, err := worker.VerifyFull(context.Background())
-	if err == nil || result.Status != "failed" || worker.State().Verification.Status != "failed" || worker.State().Phase != PhaseDualWriteRepairing {
+	if err == nil || result.Status != "" || worker.State().Verification.Status != "" || worker.State().Phase != PhaseDualWriteRepairing {
 		t.Fatalf("verification=%+v state=%+v err=%v", result, worker.State().Verification, err)
+	}
+	disable()
+	result, err = worker.VerifyFull(context.Background())
+	if err != nil || result.Status != "passed" || worker.State().Verification.Status != "passed" {
+		t.Fatalf("verification retry=%+v state=%+v err=%v", result, worker.State().Verification, err)
 	}
 }
 

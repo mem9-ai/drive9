@@ -71,6 +71,114 @@ func TestScannerPreservesSupportedFilesystemFactsWithoutFollowingLinks(t *testin
 	}
 }
 
+func TestScannerWarnsForNormalizedExternalAndDanglingSymlinkTargets(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "target"), []byte("target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, target := range map[string]string{
+		"nested-external": "child/../../outside",
+		"dangling":        "missing",
+		"external-hop":    "hop-outside",
+		"hop-outside":     outside,
+		"cycle-a":         "cycle-b",
+		"cycle-b":         "cycle-a",
+		"non-directory":   "target/child",
+		"internal":        "target",
+		"internal-hop":    "internal",
+	} {
+		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("../target", filepath.Join(root, "child", "parent-internal")); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner, err := NewScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := scanner.Scan(context.Background())
+	if err != nil || !result.Complete {
+		t.Fatalf("scan complete=%v err=%v", result.Complete, err)
+	}
+	for _, path := range []string{
+		"/nested-external", "/dangling", "/external-hop", "/hop-outside",
+		"/cycle-a", "/cycle-b", "/non-directory",
+	} {
+		if !hasFindingAt(result.Findings, path, FindingSymlinkTarget) {
+			t.Fatalf("symlink warning missing at %s: %+v", path, result.Findings)
+		}
+	}
+	for _, path := range []string{"/internal", "/internal-hop", "/child/parent-internal"} {
+		if hasFindingAt(result.Findings, path, FindingSymlinkTarget) {
+			t.Fatalf("valid internal target warned at %s: %+v", path, result.Findings)
+		}
+	}
+}
+
+func TestScannerResolvesSymlinkTargetComponentsBeforeDotDot(t *testing.T) {
+	root := t.TempDir()
+	outsideParent := t.TempDir()
+	outsideHop := filepath.Join(outsideParent, "hop")
+	outsideSafe := filepath.Join(outsideParent, "safe")
+	if err := os.Mkdir(outsideHop, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(outsideSafe, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "safe"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideHop, filepath.Join(root, "hop")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("hop/../safe", filepath.Join(root, "external-after-hop")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "regular"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "valid"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("regular/../valid", filepath.Join(root, "dangling-after-file")); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved, err := filepath.EvalSymlinks(filepath.Join(root, "external-after-hop"))
+	if err != nil {
+		t.Fatalf("external symlink resolved=%q err=%v", resolved, err)
+	}
+	expected, err := filepath.EvalSymlinks(outsideSafe)
+	if err != nil || resolved != expected {
+		t.Fatalf("external symlink resolved=%q expected=%q err=%v", resolved, expected, err)
+	}
+	if _, err := filepath.EvalSymlinks(filepath.Join(root, "dangling-after-file")); err == nil {
+		t.Fatal("regular-file/../valid unexpectedly resolved")
+	}
+
+	scanner, err := NewScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := scanner.Scan(context.Background())
+	if err != nil || !result.Complete {
+		t.Fatalf("scan complete=%v err=%v", result.Complete, err)
+	}
+	for _, path := range []string{"/external-after-hop", "/dangling-after-file"} {
+		if !hasFindingAt(result.Findings, path, FindingSymlinkTarget) {
+			t.Errorf("symlink warning missing at %s: %+v", path, result.Findings)
+		}
+	}
+}
+
 func TestScannerStableReadHashesWithBoundedBuffer(t *testing.T) {
 	root := t.TempDir()
 	data := strings.Repeat("abcdef", 1000)
@@ -165,6 +273,45 @@ func TestScannerStableReadFailureClasses(t *testing.T) {
 	scanner.afterRead = func(string) { _ = os.Remove(filePath) }
 	if _, err := scanner.ReadStable(context.Background(), "/file", version); !errors.Is(err, ErrSourceChanged) {
 		t.Fatalf("removed-after-read error=%v", err)
+	}
+}
+
+func TestScannerNormalizesScanAndReadDisappearance(t *testing.T) {
+	root := t.TempDir()
+	filePath := filepath.Join(root, "file")
+	if err := os.WriteFile(filePath, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := NewScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed := false
+	scanner.beforeEntry = func(name string) {
+		if !removed && name == filePath {
+			removed = true
+			_ = os.Remove(name)
+		}
+	}
+	result, err := scanner.Scan(context.Background())
+	if !errors.Is(err, ErrSourceChanged) || result.Complete {
+		t.Fatalf("scan disappearance result=%+v err=%v", result, err)
+	}
+
+	scanner.beforeEntry = nil
+	if err := os.WriteFile(filePath, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err = scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := result.Entries["/file"].Version
+	if err := os.Remove(filePath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scanner.ReadStable(context.Background(), "/file", version); !errors.Is(err, ErrSourceChanged) {
+		t.Fatalf("read disappearance error=%v", err)
 	}
 }
 
@@ -270,6 +417,44 @@ func TestScannerDetectsNFCCollisionNestedMountAndIdentityFailure(t *testing.T) {
 	}
 }
 
+func TestScannerRetainsRawLocalSpellingForNormalizedLogicalPath(t *testing.T) {
+	root := t.TempDir()
+	rawName := "e\u0301"
+	canonical := norm.NFC.String("/" + rawName)
+	if err := os.WriteFile(filepath.Join(root, rawName), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := NewScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, exists := result.Entries[canonical]
+	if !exists || entry.Path != canonical || entry.LocalPath == canonical {
+		t.Fatalf("normalized entry=%+v entries=%+v", entry, result.Entries)
+	}
+	var readName string
+	identity := scanner.identity
+	scanner.identity = func(name string, info os.FileInfo) (fileIdentity, error) {
+		readName = name
+		return identity(name, info)
+	}
+	if _, err := scanner.ReadStableEntry(context.Background(), entry); err != nil {
+		t.Fatal(err)
+	}
+	if readName != filepath.Join(root, rawName) {
+		t.Fatalf("read used %q, want raw local spelling %q", readName, filepath.Join(root, rawName))
+	}
+	for _, invalid := range []string{"bad\\name", "bad\x01name"} {
+		if _, ok := canonicalSourcePath(invalid); ok {
+			t.Fatalf("invalid Drive9 path %q was accepted", invalid)
+		}
+	}
+}
+
 func TestScannerFailureIsIncompleteAndPathsCannotEscape(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "file"), []byte("x"), 0o600); err != nil {
@@ -334,6 +519,15 @@ func TestScannerManifestCapacityExpectation(t *testing.T) {
 func hasFinding(findings []Finding, kind FindingKind) bool {
 	for _, finding := range findings {
 		if finding.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFindingAt(findings []Finding, path string, kind FindingKind) bool {
+	for _, finding := range findings {
+		if finding.Path == path && finding.Kind == kind {
 			return true
 		}
 	}

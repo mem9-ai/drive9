@@ -31,11 +31,13 @@ type ApplyConfig struct {
 
 // ApplyEngine applies one complete in-memory diff through pkg/client.
 type ApplyEngine struct {
-	api     *client.Client
-	scanner *Scanner
-	config  ApplyConfig
-	limiter *byteTokenBucket
-	onCAS   func(SourceEntry, *client.StatResult, int64, time.Time, error)
+	api              *client.Client
+	scanner          *Scanner
+	config           ApplyConfig
+	limiter          *byteTokenBucket
+	onCAS            func(SourceEntry, *client.StatResult, int64, time.Time, error)
+	onOperationStart func()
+	onOperationDone  func()
 }
 
 func NewApplyEngine(api *client.Client, scanner *Scanner, config ApplyConfig) (*ApplyEngine, error) {
@@ -57,8 +59,17 @@ func NewApplyEngine(api *client.Client, scanner *Scanner, config ApplyConfig) (*
 }
 
 func (e *ApplyEngine) Apply(ctx context.Context, source map[string]SourceEntry, target map[string]TargetEntry) error {
+	return e.ApplyWithManifest(ctx, source, source, target)
+}
+
+// ApplyWithManifest limits mutations to source while using manifest to resolve namespace dependencies.
+func (e *ApplyEngine) ApplyWithManifest(ctx context.Context, source, manifest map[string]SourceEntry, target map[string]TargetEntry) error {
+	if target == nil {
+		target = make(map[string]TargetEntry)
+	}
 	directories, files, links := make([]SourceEntry, 0), make([]SourceEntry, 0), make([]SourceEntry, 0)
-	primaries := make(map[string]string)
+	primaries := matchingHardlinkPrimaries(manifest, target)
+	uploadPrimaries := make(map[string]struct{})
 	paths := sortedSourcePaths(source)
 	for _, sourcePath := range paths {
 		entry := source[sourcePath]
@@ -70,13 +81,18 @@ func (e *ApplyEngine) Apply(ctx context.Context, source map[string]SourceEntry, 
 		case EntryDirectory:
 			directories = append(directories, entry)
 		case EntryRegular:
-			if entry.HardlinkKey != "" && !entry.HardlinkPrimary {
-				links = append(links, entry)
-			} else {
+			if entry.HardlinkKey == "" {
 				files = append(files, entry)
-				if entry.HardlinkKey != "" {
-					primaries[entry.HardlinkKey] = entry.Path
-				}
+				break
+			}
+			if _, anchored := primaries[entry.HardlinkKey]; anchored {
+				links = append(links, entry)
+			} else if _, selected := uploadPrimaries[entry.HardlinkKey]; !selected {
+				files = append(files, entry)
+				primaries[entry.HardlinkKey] = entry.Path
+				uploadPrimaries[entry.HardlinkKey] = struct{}{}
+			} else {
+				links = append(links, entry)
 			}
 		case EntrySymlink:
 			links = append(links, entry)
@@ -87,20 +103,23 @@ func (e *ApplyEngine) Apply(ctx context.Context, source map[string]SourceEntry, 
 	sort.SliceStable(directories, func(i, j int) bool { return pathDepth(directories[i].Path) < pathDepth(directories[j].Path) })
 	for _, entry := range directories {
 		if _, exists := target[entry.Path]; !exists {
-			if err := e.validateSource(entry.Path, entry.Version); err != nil {
+			if err := e.validateSourceEntry(entry); err != nil {
 				return err
 			}
 			mode := entry.Mode
 			if e.config.Phase == PhaseSyncing {
 				mode = 0o755
 			}
-			if err := e.api.MkdirCtx(ctx, targetRemotePath(e.config.Prefix, entry.Path, true), mode); err != nil {
+			operationDone := e.beginOperation()
+			err := e.api.MkdirCtx(ctx, targetRemotePath(e.config.Prefix, entry.Path, true), mode)
+			operationDone()
+			if err != nil {
 				if errors.Is(err, client.ErrConflict) {
 					return fmt.Errorf("%w: mkdir target %s: %w", ErrApplyRescan, entry.Path, err)
 				}
 				return fmt.Errorf("mkdir target %s: %w", entry.Path, err)
 			}
-			if err := e.validateSource(entry.Path, entry.Version); err != nil {
+			if err := e.validateSourceEntry(entry); err != nil {
 				return err
 			}
 		}
@@ -108,15 +127,46 @@ func (e *ApplyEngine) Apply(ctx context.Context, source map[string]SourceEntry, 
 	if err := e.applyFilePools(ctx, files, target); err != nil {
 		return err
 	}
+	for _, entry := range files {
+		if entry.HardlinkKey == "" {
+			continue
+		}
+		stat, err := e.api.StatCtx(ctx, targetRemotePath(e.config.Prefix, entry.Path, false))
+		if err != nil {
+			return fmt.Errorf("reread hardlink upload primary %s: %w", entry.Path, err)
+		}
+		if stat.IsDir || stat.Revision <= 0 || stat.ResourceID == "" || !stat.HasMode || stat.ChecksumSHA256 == "" {
+			return fmt.Errorf("%w: hardlink upload primary %s", ErrApplyVerification, entry.Path)
+		}
+		target[entry.Path] = TargetEntry{Path: entry.Path, Kind: EntryRegular, Size: stat.Size, Mode: stat.Mode & 0o777, HasMode: true, Revision: stat.Revision, ResourceID: stat.ResourceID, Nlink: stat.Nlink, ChecksumSHA256: stat.ChecksumSHA256}
+	}
 	for _, entry := range links {
-		if err := e.applyLink(ctx, entry, source, target, primaries); err != nil {
+		if err := e.applyLink(ctx, entry, manifest, target, primaries); err != nil {
 			return err
 		}
 	}
 	if err := e.applyModes(ctx, append(files, directories...), target); err != nil {
 		return err
 	}
-	return e.applyDeletes(ctx, source, target)
+	return e.applyDeletes(ctx, manifest, target)
+}
+
+func matchingHardlinkPrimaries(source map[string]SourceEntry, target map[string]TargetEntry) map[string]string {
+	primaries := make(map[string]string)
+	for _, sourcePath := range sortedSourcePaths(source) {
+		entry := source[sourcePath]
+		if entry.HardlinkKey == "" {
+			continue
+		}
+		observed, exists := target[sourcePath]
+		if !exists || observed.Kind != EntryRegular || observed.ResourceID == "" || observed.Revision <= 0 || !observed.HasMode || observed.Mode&0o777 != entry.Mode&0o777 || observed.Size != entry.Version.Size || entry.ChecksumSHA256 == "" || observed.ChecksumSHA256 != entry.ChecksumSHA256 {
+			continue
+		}
+		if _, exists := primaries[entry.HardlinkKey]; !exists {
+			primaries[entry.HardlinkKey] = entry.Path
+		}
+	}
+	return primaries
 }
 
 func validateApplyEntry(phase Phase, source SourceEntry, target TargetEntry, exists bool) error {
@@ -190,7 +240,7 @@ func (e *ApplyEngine) runFileWorkers(ctx context.Context, cancel context.CancelF
 }
 
 func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, observed TargetEntry, exists bool) error {
-	deep, err := e.scanner.ReadStable(ctx, source.Path, source.Version)
+	deep, err := e.scanner.ReadStableEntry(ctx, source)
 	if err != nil {
 		return fmt.Errorf("hash source %s: %w", source.Path, err)
 	}
@@ -200,15 +250,20 @@ func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, obse
 		return err
 	}
 	if current != nil && current.Size == deep.Size && current.ChecksumSHA256 == deep.ChecksumSHA256 {
-		return e.validateSource(source.Path, source.Version)
+		return e.validateSourceEntry(source)
 	}
-	file, err := e.openSource(source.Path, source.Version)
+	file, err := e.openSource(source)
 	if err != nil {
 		return err
 	}
 	limited := &limitedSource{File: file, limiter: e.limiterForSize(source.Version.Size), ctx: ctx}
 	started := time.Now()
-	committed, uploadErr := e.api.WriteStreamConditionalWithChecksum(ctx, remote, limited, deep.Size, nil, expected, deep.ChecksumSHA256)
+	operationDone := e.beginOperation()
+	committed, uploadErr := e.api.WriteStreamConditionalWithChecksumAndPreCompleteCheck(
+		ctx, remote, limited, deep.Size, nil, expected, deep.ChecksumSHA256,
+		func() error { return e.validateOpenSource(file, source) },
+	)
+	operationDone()
 	if e.onCAS != nil {
 		e.onCAS(source, current, expected, started, uploadErr)
 	}
@@ -230,7 +285,7 @@ func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, obse
 	if e.config.Phase == PhaseDualWriteRepairing && committed.Mode&0o777 != source.Mode&0o777 {
 		return fmt.Errorf("%w: post-T0 mode mismatch at %s", ErrUnsafeApply, source.Path)
 	}
-	return e.validateSource(source.Path, source.Version)
+	return e.validateSourceEntry(source)
 }
 
 func (e *ApplyEngine) currentTarget(ctx context.Context, remote string, observed TargetEntry, exists bool) (int64, *client.StatResult, error) {
@@ -258,14 +313,14 @@ func (e *ApplyEngine) currentTarget(ctx context.Context, remote string, observed
 	return observed.Revision, stat, nil
 }
 
-func (e *ApplyEngine) openSource(sourcePath string, expected SourceVersion) (*os.File, error) {
-	name, err := e.scanner.resolvePath(sourcePath)
+func (e *ApplyEngine) openSource(source SourceEntry) (*os.File, error) {
+	name, err := e.scanner.resolvePath(sourceLocalPath(source))
 	if err != nil {
 		return nil, err
 	}
 	file, err := os.Open(name)
 	if err != nil {
-		return nil, err
+		return nil, sourceChangeError(err)
 	}
 	info, statErr := file.Stat()
 	if statErr != nil {
@@ -273,11 +328,40 @@ func (e *ApplyEngine) openSource(sourcePath string, expected SourceVersion) (*os
 		return nil, ErrSourceChanged
 	}
 	identity, identityErr := e.scanner.identity(name, info)
-	if identityErr != nil || identity.version != expected {
+	if identityErr != nil || identity.version != source.Version {
 		_ = file.Close()
 		return nil, ErrSourceChanged
 	}
 	return file, nil
+}
+
+func sourceLocalPath(source SourceEntry) string {
+	if source.LocalPath != "" {
+		return source.LocalPath
+	}
+	return source.Path
+}
+
+func (e *ApplyEngine) validateSourceEntry(source SourceEntry) error {
+	return e.validateSource(sourceLocalPath(source), source.Version)
+}
+
+func (e *ApplyEngine) validateOpenSource(file *os.File, source SourceEntry) error {
+	name, err := e.scanner.resolvePath(sourceLocalPath(source))
+	if err != nil {
+		return err
+	}
+	opened, openErr := file.Stat()
+	current, pathErr := os.Lstat(name)
+	if openErr != nil || pathErr != nil {
+		return ErrSourceChanged
+	}
+	openedIdentity, openIdentityErr := e.scanner.identity(name, opened)
+	pathIdentity, pathIdentityErr := e.scanner.identity(name, current)
+	if openIdentityErr != nil || pathIdentityErr != nil || openedIdentity.version != source.Version || pathIdentity.version != source.Version {
+		return ErrSourceChanged
+	}
+	return nil
 }
 
 func (e *ApplyEngine) validateSource(sourcePath string, expected SourceVersion) error {
@@ -297,7 +381,7 @@ func (e *ApplyEngine) validateSource(sourcePath string, expected SourceVersion) 
 }
 
 func (e *ApplyEngine) applyLink(ctx context.Context, entry SourceEntry, source map[string]SourceEntry, target map[string]TargetEntry, primaries map[string]string) error {
-	if err := e.validateSource(entry.Path, entry.Version); err != nil {
+	if err := e.validateSourceEntry(entry); err != nil {
 		return err
 	}
 	observed, exists := target[entry.Path]
@@ -311,33 +395,44 @@ func (e *ApplyEngine) applyLink(ctx context.Context, entry SourceEntry, source m
 		if !ok {
 			return fmt.Errorf("%w: missing hardlink primary for %s", ErrUnsafeApply, entry.Path)
 		}
-		if err := e.validateSource(primary.Path, primary.Version); err != nil {
+		deep, err := e.scanner.ReadStableEntry(ctx, primary)
+		if err != nil {
 			return err
 		}
-		primaryStat, err := e.api.StatCtx(ctx, targetRemotePath(e.config.Prefix, primary.Path, false))
+		primaryObserved, primaryExists := target[primary.Path]
+		if !primaryExists {
+			return fmt.Errorf("%w: hardlink primary disappeared at %s", ErrApplyRescan, primary.Path)
+		}
+		_, primaryStat, err := e.currentTarget(ctx, targetRemotePath(e.config.Prefix, primary.Path, false), primaryObserved, true)
 		if err != nil {
 			return fmt.Errorf("hardlink primary %s: %w", primary.Path, err)
 		}
-		if primaryStat.ResourceID == "" {
+		if primaryStat == nil || primaryStat.ResourceID == "" || primaryStat.Size != deep.Size || primaryStat.ChecksumSHA256 != deep.ChecksumSHA256 {
 			return fmt.Errorf("%w: hardlink primary identity at %s", ErrApplyVerification, primary.Path)
 		}
 		matched = exists && observed.ResourceID == primaryStat.ResourceID
 		if !matched && (!exists || e.config.Phase == PhaseSyncing) {
 			if exists {
-				if err := e.api.DeleteFileCtx(ctx, remote); err != nil {
+				operationDone := e.beginOperation()
+				err := e.api.DeleteFileCtx(ctx, remote)
+				operationDone()
+				if err != nil {
 					return err
 				}
 			}
-			if err := e.validateSource(entry.Path, entry.Version); err != nil {
+			if err := e.validateSourceEntry(entry); err != nil {
 				return err
 			}
-			if err := e.api.HardlinkCtx(ctx, targetRemotePath(e.config.Prefix, primary.Path, false), remote); err != nil {
+			operationDone := e.beginOperation()
+			err = e.api.HardlinkCtx(ctx, targetRemotePath(e.config.Prefix, primary.Path, false), remote)
+			operationDone()
+			if err != nil {
 				if errors.Is(err, client.ErrConflict) {
 					return fmt.Errorf("%w: hardlink target %s: %w", ErrApplyRescan, entry.Path, err)
 				}
 				return err
 			}
-			return e.validateSource(entry.Path, entry.Version)
+			return e.validateSourceEntry(entry)
 		}
 	}
 	if matched {
@@ -347,20 +442,26 @@ func (e *ApplyEngine) applyLink(ctx context.Context, entry SourceEntry, source m
 		if e.config.Phase != PhaseSyncing {
 			return fmt.Errorf("%w: post-T0 link replacement at %s", ErrUnsafeApply, entry.Path)
 		}
-		if err := e.api.DeleteFileCtx(ctx, remote); err != nil {
+		operationDone := e.beginOperation()
+		err := e.api.DeleteFileCtx(ctx, remote)
+		operationDone()
+		if err != nil {
 			return err
 		}
 	}
-	if err := e.validateSource(entry.Path, entry.Version); err != nil {
+	if err := e.validateSourceEntry(entry); err != nil {
 		return err
 	}
-	if err := e.api.SymlinkCtx(ctx, entry.LinkTarget, remote); err != nil {
+	operationDone := e.beginOperation()
+	err := e.api.SymlinkCtx(ctx, entry.LinkTarget, remote)
+	operationDone()
+	if err != nil {
 		if errors.Is(err, client.ErrConflict) {
 			return fmt.Errorf("%w: symlink target %s: %w", ErrApplyRescan, entry.Path, err)
 		}
 		return err
 	}
-	return e.validateSource(entry.Path, entry.Version)
+	return e.validateSourceEntry(entry)
 }
 
 func (e *ApplyEngine) applyModes(ctx context.Context, entries []SourceEntry, target map[string]TargetEntry) error {
@@ -378,13 +479,16 @@ func (e *ApplyEngine) applyModes(ctx context.Context, entries []SourceEntry, tar
 		if exists && observed.Mode&0o777 == entry.Mode&0o777 {
 			continue
 		}
-		if err := e.validateSource(entry.Path, entry.Version); err != nil {
+		if err := e.validateSourceEntry(entry); err != nil {
 			return err
 		}
-		if err := e.api.ChmodCtx(ctx, targetRemotePath(e.config.Prefix, entry.Path, entry.Kind == EntryDirectory), entry.Mode&0o777); err != nil {
+		operationDone := e.beginOperation()
+		err := e.api.ChmodCtx(ctx, targetRemotePath(e.config.Prefix, entry.Path, entry.Kind == EntryDirectory), entry.Mode&0o777)
+		operationDone()
+		if err != nil {
 			return fmt.Errorf("chmod target %s: %w", entry.Path, err)
 		}
-		if err := e.validateSource(entry.Path, entry.Version); err != nil {
+		if err := e.validateSourceEntry(entry); err != nil {
 			return err
 		}
 	}
@@ -410,11 +514,13 @@ func (e *ApplyEngine) applyDeletes(ctx context.Context, source map[string]Source
 		}
 		remote := targetRemotePath(e.config.Prefix, path, entry.Kind == EntryDirectory)
 		var err error
+		operationDone := e.beginOperation()
 		if entry.Kind == EntryDirectory {
 			err = e.api.DeleteDirCtx(ctx, remote)
 		} else {
 			err = e.api.DeleteFileCtx(ctx, remote)
 		}
+		operationDone()
 		if err != nil {
 			return fmt.Errorf("delete target %s: %w", path, err)
 		}
@@ -432,6 +538,17 @@ func sortedSourcePaths(source map[string]SourceEntry) []string {
 }
 
 func pathDepth(value string) int { return strings.Count(strings.Trim(value, "/"), "/") }
+
+func (e *ApplyEngine) beginOperation() func() {
+	if e.onOperationStart != nil {
+		e.onOperationStart()
+	}
+	return func() {
+		if e.onOperationDone != nil {
+			e.onOperationDone()
+		}
+	}
+}
 
 func (e *ApplyEngine) limiterForSize(int64) *byteTokenBucket { return e.limiter }
 

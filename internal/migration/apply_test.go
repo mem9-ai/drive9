@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -271,10 +272,10 @@ func TestApplySourceStabilityHelpersFailClosed(t *testing.T) {
 	defer server.Close()
 	scanner, source := newApplyFixture(t, "content")
 	engine := newTestApplyEngine(t, server, scanner, 1<<20)
-	if _, err := engine.openSource("/missing", source.Version); err == nil {
+	if _, err := engine.openSource(SourceEntry{Path: "/missing", Version: source.Version}); err == nil {
 		t.Fatal("missing source opened")
 	}
-	if _, err := engine.openSource("../escape", source.Version); !errors.Is(err, ErrUnsafeSourcePath) {
+	if _, err := engine.openSource(SourceEntry{Path: "../escape", Version: source.Version}); !errors.Is(err, ErrUnsafeSourcePath) {
 		t.Fatalf("unsafe open error=%v", err)
 	}
 	if err := engine.validateSource("/missing", source.Version); !errors.Is(err, ErrSourceChanged) {
@@ -487,6 +488,161 @@ func TestApplyMultipartFailureStartsFreshAttempt(t *testing.T) {
 	}
 }
 
+func TestApplyMultipartSourceMutationCannotCommitOrFalseConverge(t *testing.T) {
+	const (
+		partSize  = 4
+		partCount = 17
+	)
+	original := []byte(strings.Repeat("A", partSize*partCount))
+	changed := []byte(strings.Repeat("B", partSize*partCount))
+	scanner, source := newApplyFixture(t, string(original))
+	filePath := filepath.Join(scanner.root, "file")
+	originalSum := sha256.Sum256(original)
+
+	var mu sync.Mutex
+	parts := make(map[int][]byte)
+	started := 0
+	committed := false
+	completeHits := 0
+	abortHits := 0
+	targetChecksum := ""
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		segments := strings.Split(strings.Trim(request.URL.Path, "/"), "/")
+		switch {
+		case request.Method == http.MethodHead && request.URL.Path == "/v1/fs/data/file":
+			mu.Lock()
+			exists := committed
+			checksum := targetChecksum
+			mu.Unlock()
+			if !exists {
+				http.NotFound(w, request)
+				return
+			}
+			w.Header().Set("Content-Length", fmt.Sprint(len(original)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.Header().Set("X-Dat9-Resource-ID", "unstable-file")
+			w.Header().Set("X-Dat9-Mode", fmt.Sprint(uint32(0o100644)))
+			w.Header().Set("X-Dat9-Checksum-SHA256", checksum)
+			w.WriteHeader(http.StatusOK)
+		case request.Method == http.MethodPost && request.URL.Path == "/v2/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"upload_id": "unstable", "part_size": partSize, "total_parts": partCount})
+		case request.Method == http.MethodPost && request.URL.Path == "/v2/uploads/unstable/presign-batch":
+			var requested struct {
+				Parts []struct {
+					PartNumber int `json:"part_number"`
+				} `json:"parts"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&requested); err != nil {
+				http.Error(w, "bad presign request", http.StatusBadRequest)
+				return
+			}
+			presigned := make([]map[string]any, 0, len(requested.Parts))
+			for _, requestedPart := range requested.Parts {
+				part := requestedPart.PartNumber
+				presigned = append(presigned, map[string]any{
+					"number": part, "url": fmt.Sprintf("http://%s/parts/%d", request.Host, part),
+					"size": partSize, "expires_at": time.Now().Add(time.Minute),
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"parts": presigned})
+		case request.Method == http.MethodPut && len(segments) == 2 && segments[0] == "parts":
+			var part int
+			_, _ = fmt.Sscanf(segments[1], "%d", &part)
+			body, _ := io.ReadAll(request.Body)
+			mu.Lock()
+			parts[part] = append([]byte(nil), body...)
+			started++
+			shouldMutate := started == 16
+			mu.Unlock()
+			if shouldMutate {
+				if err := os.WriteFile(filePath, changed, 0o644); err != nil {
+					t.Error(err)
+				}
+				if err := os.Chmod(filePath, 0o600); err != nil {
+					t.Error(err)
+				}
+				releaseOnce.Do(func() { close(release) })
+			}
+			<-release
+			w.Header().Set("ETag", fmt.Sprintf(`"etag-%d"`, part))
+			w.WriteHeader(http.StatusOK)
+		case request.Method == http.MethodPost && request.URL.Path == "/v2/uploads/unstable/complete":
+			var body struct {
+				Checksum string `json:"checksum_sha256"`
+			}
+			_ = json.NewDecoder(request.Body).Decode(&body)
+			mu.Lock()
+			completeHits++
+			committed = true
+			targetChecksum = body.Checksum
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case request.Method == http.MethodPost && request.URL.Path == "/v2/uploads/unstable/abort":
+			mu.Lock()
+			abortHits++
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer srv.Close()
+
+	err := newTestApplyEngine(t, srv, scanner, 1).Apply(context.Background(), map[string]SourceEntry{"/file": source}, nil)
+	if !errors.Is(err, ErrSourceChanged) {
+		t.Fatalf("error=%v, want ErrSourceChanged", err)
+	}
+	if err := os.WriteFile(filePath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filePath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	wasCommitted := committed
+	gotCompleteHits := completeHits
+	gotAbortHits := abortHits
+	uploadedParts := len(parts)
+	uploaded := make([]byte, 0, len(original))
+	for part := 1; part <= partCount; part++ {
+		uploaded = append(uploaded, parts[part]...)
+	}
+	mu.Unlock()
+	if uploadedParts != partCount || len(uploaded) != len(original) || bytes.Equal(uploaded, original) {
+		t.Fatalf("fixture parts=%d bytes=%d mutated=%v", uploadedParts, len(uploaded), !bytes.Equal(uploaded, original))
+	}
+	if wasCommitted || gotCompleteHits != 0 || gotAbortHits != 1 {
+		t.Fatalf("committed=%v complete=%d abort=%d", wasCommitted, gotCompleteHits, gotAbortHits)
+	}
+
+	restored, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredEntry := restored.Entries["/file"]
+	deep, err := scanner.ReadStableEntry(context.Background(), restoredEntry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deep.ChecksumSHA256 != hex.EncodeToString(originalSum[:]) {
+		t.Fatalf("restored checksum=%s", deep.ChecksumSHA256)
+	}
+	restoredEntry.ChecksumSHA256 = deep.ChecksumSHA256
+	restored.Entries["/file"] = restoredEntry
+	round, err := BuildRound("verification", RoundModeVerification, time.Now(), restored, TargetScan{Complete: true, Entries: map[string]TargetEntry{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if round.Converged || !hasFindingAt(round.Findings, "/file", FindingSourceOnly) {
+		t.Fatalf("unstable attempt falsely converged: %+v", round)
+	}
+}
+
 func TestApplyOrdersNamespaceAndUsesOneLimiter(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, "d"), 0o750); err != nil {
@@ -584,6 +740,73 @@ func TestApplyDualWriteSkipsDeleteAndBlocksUnsafeLinkReplacement(t *testing.T) {
 	if err := engine.Apply(context.Background(), map[string]SourceEntry{}, map[string]TargetEntry{"/extra": target["/extra"]}); err != nil || hits != 0 {
 		t.Fatalf("target-only residue error=%v hits=%d", err, hits)
 	}
+}
+
+func TestApplyDualHardlinkAliasUsesPrimaryOutsideMutationSet(t *testing.T) {
+	root := t.TempDir()
+	primaryPath := filepath.Join(root, "a-primary")
+	if err := os.WriteFile(primaryPath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(primaryPath, filepath.Join(root, "z-alias")); err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := NewScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary, alias := manifest.Entries["/a-primary"], manifest.Entries["/z-alias"]
+	deep, err := scanner.ReadStableEntry(context.Background(), primary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary.ChecksumSHA256 = deep.ChecksumSHA256
+	manifest.Entries[primary.Path] = primary
+	remote := &applyRemote{exists: true, revision: 4, resourceID: "hardlink-resource", mode: 0o644, body: []byte("content")}
+	server := httptest.NewServer(http.HandlerFunc(remote.handler))
+	defer server.Close()
+	api := client.New(server.URL, "key")
+	api.SetSmallFileThresholdForTests(1 << 20)
+	engine, err := NewApplyEngine(api, scanner, ApplyConfig{
+		Prefix: "/data", Phase: PhaseDualWriteRepairing, SmallFileThreshold: 1 << 20,
+		SmallWorkers: 1, LargeWorkers: 1, MaxBytesPerSecond: 1 << 30,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := map[string]TargetEntry{
+		primary.Path: {Path: primary.Path, Kind: EntryRegular, Size: deep.Size, Mode: 0o644, HasMode: true, Revision: 4, ResourceID: "hardlink-resource", ChecksumSHA256: deep.ChecksumSHA256},
+	}
+	if err := engine.ApplyWithManifest(context.Background(), map[string]SourceEntry{alias.Path: alias}, manifest.Entries, target); err != nil {
+		t.Fatal(err)
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if !containsOperation(remote.operations, "hardlink /z-alias") || containsOperationPrefix(remote.operations, "write ") {
+		t.Fatalf("operations=%v", remote.operations)
+	}
+}
+
+func containsOperation(operations []string, want string) bool {
+	for _, operation := range operations {
+		if operation == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsOperationPrefix(operations []string, prefix string) bool {
+	for _, operation := range operations {
+		if strings.HasPrefix(operation, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestByteTokenBucketAggregatesReservations(t *testing.T) {

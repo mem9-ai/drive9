@@ -7,13 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
-	pathpkg "path"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
 
-	"golang.org/x/text/unicode/norm"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 const MaxSourceReadBufferBytes = 256 << 10
@@ -47,10 +47,11 @@ type ScanResult struct {
 
 // Scanner reads one mounted EBS Source Root without mutating it.
 type Scanner struct {
-	root       string
-	bufferSize int
-	identity   func(string, os.FileInfo) (fileIdentity, error)
-	afterRead  func(string)
+	root        string
+	bufferSize  int
+	identity    func(string, os.FileInfo) (fileIdentity, error)
+	beforeEntry func(string)
+	afterRead   func(string)
 }
 
 func NewScanner(root string) (*Scanner, error) {
@@ -106,13 +107,16 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 	hardlinks := make(map[string]struct{})
 	err = filepath.WalkDir(s.root, func(name string, directory os.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return walkErr
+			return sourceChangeError(walkErr)
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if name == s.root {
 			return nil
+		}
+		if s.beforeEntry != nil {
+			s.beforeEntry(name)
 		}
 		relative, err := filepath.Rel(s.root, name)
 		if err != nil {
@@ -128,7 +132,7 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 		}
 		info, err := os.Lstat(name)
 		if err != nil {
-			return err
+			return sourceChangeError(err)
 		}
 		identity, err := s.identity(name, info)
 		if err != nil {
@@ -145,7 +149,8 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 			}
 			return nil
 		}
-		entry := SourceEntry{Path: canonical, Kind: identity.version.Kind, Version: identity.version, Mode: uint32(info.Mode().Perm())}
+		localPath := "/" + filepath.ToSlash(relative)
+		entry := SourceEntry{Path: canonical, LocalPath: localPath, Kind: identity.version.Kind, Version: identity.version, Mode: uint32(info.Mode().Perm())}
 		switch entry.Kind {
 		case EntryRegular:
 			if identity.nlink > 1 {
@@ -162,14 +167,14 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 		case EntrySymlink:
 			target, err := os.Readlink(name)
 			if err != nil {
-				return err
+				return sourceChangeError(err)
 			}
 			entry.LinkTarget = target
 			sum := sha256.Sum256([]byte(target))
 			entry.ChecksumSHA256 = hex.EncodeToString(sum[:])
 			if !utf8.ValidString(target) {
 				accumulator.findings = append(accumulator.findings, Finding{Path: canonical, Kind: FindingInvalidUTF8, Severity: SeverityBlocker})
-			} else if filepath.IsAbs(target) || strings.HasPrefix(filepath.ToSlash(target), "../") {
+			} else if s.symlinkTargetNeedsWarning(name, target) {
 				accumulator.findings = append(accumulator.findings, Finding{Path: canonical, Kind: FindingSymlinkTarget, Severity: SeverityWarning})
 			}
 		case EntrySpecial:
@@ -178,12 +183,20 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 		if info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
 			accumulator.findings = append(accumulator.findings, Finding{Path: canonical, Kind: FindingModeBits, Severity: SeverityWarning})
 		}
-		accumulator.add(canonical, "/"+filepath.ToSlash(relative), entry)
+		accumulator.add(canonical, localPath, entry)
 		return nil
 	})
 	if err != nil {
 		result.Findings = accumulator.findings
 		return result, fmt.Errorf("scan source namespace: %w", err)
+	}
+	rootAfter, err := os.Lstat(s.root)
+	if err != nil {
+		return result, fmt.Errorf("restat source root: %w", sourceChangeError(err))
+	}
+	rootIdentityAfter, err := s.identity(s.root, rootAfter)
+	if err != nil || rootIdentityAfter.version.Device != rootIdentity.version.Device || rootIdentityAfter.version.Inode != rootIdentity.version.Inode {
+		return result, ErrSourceChanged
 	}
 	result.Entries = accumulator.entries
 	result.Findings = accumulator.findings
@@ -198,6 +211,82 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 	}
 	result.Complete = true
 	return result, nil
+}
+
+const maxSymlinkTargetHops = 255
+
+// symlinkTargetNeedsWarning resolves only path and link metadata under the
+// Source Root. It never opens target content or walks a target directory.
+func (s *Scanner) symlinkTargetNeedsWarning(linkName, target string) bool {
+	if target == "" || filepath.IsAbs(target) {
+		return true
+	}
+	relativeParent, inside := relativeWithinRoot(s.root, filepath.Dir(linkName))
+	if !inside {
+		return true
+	}
+	resolved := make([]string, 0)
+	if relativeParent != "." {
+		resolved = append(resolved, strings.Split(relativeParent, string(filepath.Separator))...)
+	}
+	pending := strings.Split(target, string(filepath.Separator))
+	hops := 0
+	for len(pending) > 0 {
+		part := pending[0]
+		pending = pending[1:]
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if len(resolved) == 0 {
+				return true
+			}
+			resolved = resolved[:len(resolved)-1]
+			continue
+		}
+
+		components := make([]string, 0, len(resolved)+2)
+		components = append(components, s.root)
+		components = append(components, resolved...)
+		components = append(components, part)
+		current := filepath.Join(components...)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return true
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			hops++
+			if hops > maxSymlinkTargetHops {
+				return true
+			}
+			next, err := os.Readlink(current)
+			if err != nil || next == "" || filepath.IsAbs(next) {
+				return true
+			}
+			pending = append(strings.Split(next, string(filepath.Separator)), pending...)
+			continue
+		}
+		if len(pending) > 0 && !info.IsDir() {
+			return true
+		}
+		resolved = append(resolved, part)
+	}
+	return false
+}
+
+func relativeWithinRoot(root, candidate string) (string, bool) {
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return relative, true
+}
+
+func sourceChangeError(err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return ErrSourceChanged
+	}
+	return err
 }
 
 type scanAccumulator struct {
@@ -223,15 +312,15 @@ func canonicalSourcePath(relative string) (string, bool) {
 	if !utf8.ValidString(relative) {
 		return "", false
 	}
-	canonical := norm.NFC.String("/" + filepath.ToSlash(relative))
-	if pathpkg.Clean(canonical) != canonical {
+	canonical, err := pathutil.Canonicalize("/" + filepath.ToSlash(relative))
+	if err != nil {
 		return "", false
 	}
 	return canonical, true
 }
 
 func (s *Scanner) resolvePath(sourcePath string) (string, error) {
-	if !strings.HasPrefix(sourcePath, "/") || sourcePath == "/" || pathpkg.Clean(sourcePath) != sourcePath {
+	if !strings.HasPrefix(sourcePath, "/") || sourcePath == "/" || filepath.ToSlash(filepath.Clean(filepath.FromSlash(sourcePath))) != sourcePath {
 		return "", ErrUnsafeSourcePath
 	}
 	resolved := filepath.Join(s.root, filepath.FromSlash(strings.TrimPrefix(sourcePath, "/")))
@@ -240,6 +329,15 @@ func (s *Scanner) resolvePath(sourcePath string) (string, error) {
 		return "", ErrUnsafeSourcePath
 	}
 	return resolved, nil
+}
+
+// ReadStableEntry reads an entry through its original local spelling while preserving its normalized logical path.
+func (s *Scanner) ReadStableEntry(ctx context.Context, entry SourceEntry) (DeepRead, error) {
+	localPath := entry.LocalPath
+	if localPath == "" {
+		localPath = entry.Path
+	}
+	return s.ReadStable(ctx, localPath, entry.Version)
 }
 
 // ReadStable hashes a regular file through lstat/open/read/lstat token checks.
@@ -253,7 +351,7 @@ func (s *Scanner) ReadStable(ctx context.Context, sourcePath string, expected So
 	}
 	before, err := os.Lstat(name)
 	if err != nil {
-		return DeepRead{}, err
+		return DeepRead{}, sourceChangeError(err)
 	}
 	beforeIdentity, err := s.identity(name, before)
 	if err != nil {
@@ -264,7 +362,7 @@ func (s *Scanner) ReadStable(ctx context.Context, sourcePath string, expected So
 	}
 	file, err := os.Open(name)
 	if err != nil {
-		return DeepRead{}, err
+		return DeepRead{}, sourceChangeError(err)
 	}
 	defer func() { _ = file.Close() }()
 	opened, err := file.Stat()
