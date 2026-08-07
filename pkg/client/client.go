@@ -25,11 +25,12 @@ import (
 
 // Client is the drive9 HTTP client.
 type Client struct {
-	baseURL            string
-	apiKey             string
-	actor              string // X-Dat9-Actor header value (per-mount ID)
-	httpClient         *http.Client
-	smallFileThreshold int64 // 0 means use DefaultSmallFileThreshold
+	baseURL               string
+	apiKey                string
+	actor                 string // X-Dat9-Actor header value (per-mount ID)
+	httpClient            *http.Client
+	smallFileThreshold    int64 // 0 means use DefaultSmallFileThreshold
+	multipartAbortTimeout time.Duration
 
 	// statusFetchMu serializes /v1/status fetches across concurrent callers
 	// so a transient warm failure can be retried but two callers never
@@ -213,8 +214,9 @@ func newClient(baseURL, credential string) *Client {
 		return baseDialer.DialContext(ctx, network, net.JoinHostPort(ips[0], port))
 	}
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		apiKey:  credential,
+		baseURL:               strings.TrimRight(baseURL, "/"),
+		apiKey:                credential,
+		multipartAbortTimeout: defaultMultipartAbortTimeout,
 		httpClient: &http.Client{
 			Transport: transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {

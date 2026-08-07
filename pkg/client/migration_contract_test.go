@@ -650,6 +650,171 @@ func TestMigrationChecksumUploadRetryStartsFreshAtPartOne(t *testing.T) {
 	}
 }
 
+func TestMigrationPreCompleteCheckPreventsDirectV1AndV2Commit(t *testing.T) {
+	checkErr := errors.New("source changed before commit")
+	for _, mode := range []string{"direct", "v1", "v2"} {
+		t.Run(mode, func(t *testing.T) {
+			var partHits, commitHits, abortHits atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/file":
+					commitHits.Add(1)
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+					if mode == "v1" {
+						http.NotFound(w, r)
+						return
+					}
+					w.WriteHeader(http.StatusAccepted)
+					_ = json.NewEncoder(w).Encode(uploadPlanV2{UploadID: "v2", PartSize: 8, TotalParts: 1})
+				case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2/presign-batch":
+					_ = json.NewEncoder(w).Encode(struct {
+						Parts []presignedPart `json:"parts"`
+					}{Parts: []presignedPart{{Number: 1, URL: fmt.Sprintf("http://%s/part", r.Host), Size: 8, ExpiresAt: time.Now().Add(time.Minute)}}})
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+					w.WriteHeader(http.StatusAccepted)
+					_ = json.NewEncoder(w).Encode(UploadPlan{UploadID: "v1", PartSize: 8, Parts: []PartURL{{Number: 1, URL: fmt.Sprintf("http://%s/part", r.Host), Size: 8}}})
+				case r.Method == http.MethodPut && r.URL.Path == "/part":
+					_, _ = io.Copy(io.Discard, r.Body)
+					partHits.Add(1)
+					w.Header().Set("ETag", `"etag"`)
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/complete"):
+					commitHits.Add(1)
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/abort"):
+					abortHits.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			api := New(srv.URL, "")
+			if mode == "direct" {
+				api.SetSmallFileThresholdForTests(1024)
+			} else {
+				api.SetSmallFileThresholdForTests(1)
+			}
+			checkHits := 0
+			_, err := api.WriteStreamConditionalWithChecksumAndPreCompleteCheck(
+				context.Background(), "/file", bytes.NewReader([]byte("12345678")), 8, nil, 0, strings.Repeat("a", 64),
+				func() error {
+					checkHits++
+					if mode != "direct" && partHits.Load() != 1 {
+						t.Errorf("pre-Complete check ran before part upload: parts=%d", partHits.Load())
+					}
+					return checkErr
+				},
+			)
+			if !errors.Is(err, checkErr) {
+				t.Fatalf("error=%v, want pre-Complete check error", err)
+			}
+			if checkHits != 1 || commitHits.Load() != 0 {
+				t.Fatalf("checks=%d commits=%d", checkHits, commitHits.Load())
+			}
+			wantAbort := int32(0)
+			if mode == "v2" {
+				wantAbort = 1
+			}
+			if abortHits.Load() != wantAbort {
+				t.Fatalf("abort hits=%d, want %d", abortHits.Load(), wantAbort)
+			}
+		})
+	}
+}
+
+func TestMigrationPreCompleteCheckIsRequiredBeforeRequests(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	api := New(srv.URL, "")
+	api.SetSmallFileThresholdForTests(1)
+	_, err := api.WriteStreamConditionalWithChecksumAndPreCompleteCheck(
+		context.Background(), "/file", bytes.NewReader([]byte("12345678")), 8, nil, 0, strings.Repeat("a", 64), nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "pre-Complete check is required") || requests.Load() != 0 {
+		t.Fatalf("error=%v requests=%d", err, requests.Load())
+	}
+}
+
+func TestMigrationV2HungAbortIsBoundedAndPreservesCompleteError(t *testing.T) {
+	abortStarted := make(chan struct{})
+	var abortOnce sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(uploadPlanV2{UploadID: "hung", PartSize: 8, TotalParts: 1})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/hung/presign-batch":
+			_ = json.NewEncoder(w).Encode(struct {
+				Parts []presignedPart `json:"parts"`
+			}{Parts: []presignedPart{{Number: 1, URL: fmt.Sprintf("http://%s/part", r.Host), Size: 8, ExpiresAt: time.Now().Add(time.Minute)}}})
+		case r.Method == http.MethodPut && r.URL.Path == "/part":
+			w.Header().Set("ETag", `"etag"`)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/hung/complete":
+			http.Error(w, "original complete failure", http.StatusServiceUnavailable)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/hung/abort":
+			abortOnce.Do(func() { close(abortStarted) })
+			select {
+			case <-r.Context().Done():
+			case <-time.After(300 * time.Millisecond):
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	api := New(srv.URL, "")
+	api.SetSmallFileThresholdForTests(1)
+	api.multipartAbortTimeout = 80 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := api.WriteStreamConditionalWithChecksum(
+			ctx, "/file", bytes.NewReader([]byte("12345678")), 8, nil, 0, strings.Repeat("b", 64),
+		)
+		result <- err
+	}()
+
+	select {
+	case <-abortStarted:
+	case <-time.After(time.Second):
+		t.Fatal("abort did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		var statusErr *StatusError
+		if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable || !strings.Contains(err.Error(), "original complete failure") {
+			t.Fatalf("error=%T %v, want original 503", err, err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("bounded abort did not return")
+	}
+}
+
+func TestMultipartAbortContextIsIndependentAndBounded(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	cleanup, cancelCleanup := newMultipartAbortContext(parent, time.Second)
+	defer cancelCleanup()
+	deadline, bounded := cleanup.Deadline()
+	if !bounded || time.Until(deadline) <= 0 || time.Until(deadline) > time.Second {
+		t.Fatalf("cleanup deadline=%v bounded=%v", deadline, bounded)
+	}
+	cancelParent()
+	if !errors.Is(parent.Err(), context.Canceled) || cleanup.Err() != nil {
+		t.Fatalf("parent error=%v cleanup error=%v", parent.Err(), cleanup.Err())
+	}
+}
+
 func TestMigrationChecksumUploadV1RetryStartsFreshAtPartOne(t *testing.T) {
 	checksum := strings.Repeat("e", 64)
 	var initiateHits atomic.Int32

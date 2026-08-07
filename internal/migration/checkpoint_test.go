@@ -19,13 +19,14 @@ import (
 )
 
 type checkpointFake struct {
-	mu          sync.Mutex
-	revision    int64
-	body        []byte
-	failCAS     bool
-	writes      int
-	dirConflict bool
-	dirIsDir    bool
+	mu             sync.Mutex
+	revision       int64
+	body           []byte
+	failCAS        bool
+	writes         int
+	dirConflict    bool
+	dirIsDir       bool
+	failGetAtWrite int
 }
 
 func (f *checkpointFake) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -61,6 +62,11 @@ func (f *checkpointFake) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		if f.revision == 0 {
 			http.NotFound(w, r)
+			return
+		}
+		if f.failGetAtWrite > 0 && f.writes == f.failGetAtWrite {
+			f.failGetAtWrite = 0
+			http.Error(w, "injected checkpoint read failure", http.StatusInternalServerError)
 			return
 		}
 		_, _ = w.Write(f.body)

@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -23,24 +23,35 @@ const (
 
 // Worker owns the process-local execution state for one Job.
 type Worker struct {
-	startup       *Startup
-	api           *client.Client
-	scanner       *Scanner
-	inventory     *TargetScanner
-	apply         *ApplyEngine
-	checkpoint    *CheckpointStore
-	recovery      *Recovery
-	state         *State
-	roundID       atomic.Uint64
-	eventID       atomic.Int64
-	gracePeriod   time.Duration
-	now           func() time.Time
-	reporter      *eventReporter
-	eventIngest   bool
-	controlMu     sync.Mutex
-	writesFenced  atomic.Bool
-	fenceIntent   atomic.Bool
-	fenceComplete atomic.Bool
+	startup        *Startup
+	api            *client.Client
+	scanner        *Scanner
+	inventory      *TargetScanner
+	apply          *ApplyEngine
+	checkpoint     *CheckpointStore
+	recovery       *Recovery
+	state          *State
+	roundID        atomic.Uint64
+	eventID        atomic.Int64
+	gracePeriod    time.Duration
+	now            func() time.Time
+	retryWait      func(context.Context, time.Duration) error
+	reporter       *eventReporter
+	eventIngest    bool
+	controlGate    serialGate
+	sourceIdentity sourceMountIdentity
+	credentialID   credentialFingerprint
+	writesFenced   atomic.Bool
+	fenceIntent    atomic.Bool
+	fenceComplete  atomic.Bool
+}
+
+type workerClientRuntime struct {
+	api         *client.Client
+	inventory   *TargetScanner
+	apply       *ApplyEngine
+	checkpoint  *CheckpointStore
+	eventIngest bool
 }
 
 func NewWorker(ctx context.Context, startup *Startup) (*Worker, error) {
@@ -51,7 +62,19 @@ func NewWorker(ctx context.Context, startup *Startup) (*Worker, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := &Worker{startup: startup, scanner: scanner, gracePeriod: time.Duration(startup.Config.JobDefaults.Sync.GracePeriod)}
+	observedSource, err := observeMountedSource(startup.Job.Source.Root, startup.Job.VolumeID)
+	if err != nil {
+		return nil, fmt.Errorf("observe mounted source: %w", err)
+	}
+	if !startup.acceptedSource.present() {
+		startup.acceptedSource = observedSource
+	} else if !startup.acceptedSource.matches(observedSource) {
+		return nil, ErrSourceMountChanged
+	}
+	w := &Worker{
+		startup: startup, scanner: scanner, sourceIdentity: startup.acceptedSource,
+		gracePeriod: time.Duration(startup.Config.JobDefaults.Sync.GracePeriod),
+	}
 	if err := w.refreshClient(ctx); err != nil {
 		return nil, err
 	}
@@ -67,7 +90,7 @@ func NewWorker(ctx context.Context, startup *Startup) (*Worker, error) {
 		if err := w.rebuildApply(); err != nil {
 			return nil, err
 		}
-		if w.eventIngest {
+		if w.eventIngest && w.state.Snapshot().Phase == PhaseDualWriteRepairing {
 			w.reporter = newEventReporter(w.api, 128)
 			w.apply.onCAS = w.reportCAS
 		}
@@ -93,45 +116,174 @@ func RunWorkerAt(ctx context.Context, startup *Startup, socket string) error {
 }
 
 func (w *Worker) refreshClient(ctx context.Context) error {
-	key, err := w.startup.Credential.Read()
+	if err := w.controlGate.Acquire(ctx); err != nil {
+		return err
+	}
+	defer w.controlGate.Release()
+	return w.refreshClientLocked(ctx)
+}
+
+func (w *Worker) refreshClientLocked(ctx context.Context) error {
+	key, credentialID, err := w.startup.Credential.readStable()
 	if err != nil {
 		return err
 	}
-	w.api = client.New(w.startup.Config.Drive9.Endpoint, key)
-	caps, err := w.api.GetMigrationCapabilities(ctx)
+	api := client.New(w.startup.Config.Drive9.Endpoint, key)
+	caps, err := api.GetMigrationCapabilities(ctx)
 	if err != nil {
 		return err
 	}
 	if missing := missingCapabilities(caps); missing != "" {
 		return fmt.Errorf("required capability %s is unavailable", missing)
 	}
-	w.eventIngest = caps.EventIngest
-	if w.reporter != nil {
-		w.reporter.api.Store(w.api)
-	}
-	w.inventory, err = NewTargetScanner(w.api, w.startup.Job.Target.Prefix)
+	inventory, err := NewTargetScanner(api, w.startup.Job.Target.Prefix)
 	if err != nil {
 		return err
 	}
-	w.checkpoint = NewCheckpointStore(w.api)
+	candidate := workerClientRuntime{
+		api: api, inventory: inventory, checkpoint: NewCheckpointStore(api), eventIngest: caps.EventIngest,
+	}
+	if w.recovery != nil {
+		observed, loadErr := candidate.checkpoint.Load(ctx, w.startup.Job.VolumeID)
+		if loadErr != nil {
+			return fmt.Errorf("validate refreshed credential checkpoint: %w", loadErr)
+		}
+		active := w.recovery.Record
+		if observed.Revision == 0 || observed.Revision != active.Revision || !sameCheckpointIdentity(observed.Checkpoint, active.Checkpoint) || observed.Checkpoint.HighestPhase != active.Checkpoint.HighestPhase || observed.Checkpoint.FenceIntent != active.Checkpoint.FenceIntent || observed.Checkpoint.FenceComplete != active.Checkpoint.FenceComplete {
+			return fmt.Errorf("%w: refreshed credential checkpoint identity or control state", ErrCheckpointMismatch)
+		}
+		if w.state != nil && w.recovery.WritesAllowed {
+			candidate.apply, err = w.newApplyEngine(api)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	w.api, w.inventory, w.checkpoint = candidate.api, candidate.inventory, candidate.checkpoint
+	w.apply, w.eventIngest = candidate.apply, candidate.eventIngest
+	w.credentialID = credentialID
+	if w.reporter != nil {
+		w.reporter.api.Store(candidate.api)
+		if w.apply != nil {
+			w.apply.onCAS = nil
+			if candidate.eventIngest && w.state.Snapshot().Phase == PhaseDualWriteRepairing {
+				w.apply.onCAS = w.reportCAS
+			}
+		}
+	}
 	if w.state != nil {
-		return w.rebuildApply()
+		if w.recovery == nil || w.recovery.WritesAllowed {
+			if w.apply == nil {
+				return w.rebuildApply()
+			}
+		}
 	}
 	return nil
 }
 
 func (w *Worker) rebuildApply() error {
-	performance := w.startup.Config.JobDefaults.Performance
-	var err error
-	w.apply, err = NewApplyEngine(w.api, w.scanner, ApplyConfig{
-		Prefix: w.startup.Job.Target.Prefix, Phase: w.state.Snapshot().Phase,
-		SmallFileThreshold: w.api.CachedSmallFileThreshold(), SmallWorkers: performance.SmallFileWorkers,
-		LargeWorkers: performance.LargeFileWorkers, MaxBytesPerSecond: performance.MaxBytesPerSecond,
-	})
-	if err == nil && w.reporter != nil {
+	apply, err := w.newApplyEngine(w.api)
+	if err != nil {
+		return err
+	}
+	w.apply = apply
+	if w.reporter != nil && w.eventIngest && w.state.Snapshot().Phase == PhaseDualWriteRepairing {
 		w.apply.onCAS = w.reportCAS
 	}
-	return err
+	return nil
+}
+
+func (w *Worker) newApplyEngine(api *client.Client) (*ApplyEngine, error) {
+	performance := w.startup.Config.JobDefaults.Performance
+	apply, err := NewApplyEngine(api, w.scanner, ApplyConfig{
+		Prefix: w.startup.Job.Target.Prefix, Phase: w.state.Snapshot().Phase,
+		SmallFileThreshold: api.CachedSmallFileThreshold(), SmallWorkers: performance.SmallFileWorkers,
+		LargeWorkers: performance.LargeFileWorkers, MaxBytesPerSecond: performance.MaxBytesPerSecond,
+	})
+	if err != nil {
+		return nil, err
+	}
+	apply.onOperationStart = w.state.beginOperation
+	apply.onOperationDone = w.state.endOperation
+	return apply, nil
+}
+
+func (w *Worker) validateSourceMount() error {
+	var (
+		observed sourceMountIdentity
+		err      error
+	)
+	if w.startup != nil && w.startup.Job.Source.Root != "" {
+		observed, err = observeMountedSource(w.startup.Job.Source.Root, w.startup.Job.VolumeID)
+	} else if w.scanner != nil {
+		observed, err = observeSourceRoot(w.scanner.root)
+	} else {
+		err = errors.New("missing source scanner")
+	}
+	if err == nil && !w.sourceIdentity.present() {
+		w.sourceIdentity = observed
+		return nil
+	}
+	if err != nil || !w.sourceIdentity.matches(observed) {
+		if w.state != nil {
+			w.state.SetAttention(true)
+		}
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrSourceMountChanged, err)
+		}
+		return ErrSourceMountChanged
+	}
+	return nil
+}
+
+func (w *Worker) refreshChangedCredentialLocked(ctx context.Context) (bool, error) {
+	if w.startup == nil || w.startup.Credential.path == "" {
+		return false, nil
+	}
+	observed, err := w.startup.Credential.fingerprint()
+	if err != nil {
+		w.state.SetAttention(true)
+		return false, err
+	}
+	if observed == w.credentialID {
+		return false, nil
+	}
+	if err := w.refreshClientLocked(ctx); err != nil {
+		w.state.SetAttention(true)
+		return false, err
+	}
+	return true, nil
+}
+
+func (w *Worker) validateRemoteCheckpoint(ctx context.Context) error {
+	if w.startup == nil || w.recovery == nil || w.checkpoint == nil {
+		return nil
+	}
+	observed, err := w.checkpoint.Load(ctx, w.startup.Job.VolumeID)
+	if err != nil {
+		return err
+	}
+	active := w.recovery.Record
+	if observed.Revision == 0 || observed.Revision != active.Revision || observed.Checkpoint != active.Checkpoint {
+		w.state.SetAttention(true)
+		w.writesFenced.Store(true)
+		return fmt.Errorf("%w: remote control state changed", ErrCheckpointMismatch)
+	}
+	return nil
+}
+
+func (w *Worker) validateRoundBoundary(ctx context.Context) error {
+	if err := w.validateSourceMount(); err != nil {
+		return err
+	}
+	refreshed, err := w.refreshChangedCredentialLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if refreshed {
+		return nil
+	}
+	return w.validateRemoteCheckpoint(ctx)
 }
 
 func (w *Worker) State() StateSnapshot { return w.state.Snapshot() }
@@ -154,12 +306,20 @@ func (w *Worker) Round(ctx context.Context, mode RoundMode) error {
 	if w.writesFenced.Load() {
 		return ErrIllegalAction
 	}
-	if w.state.Snapshot().Phase == PhaseDualWriteRepairing {
-		return w.dualRound(ctx, mode)
-	}
 	id := fmt.Sprintf("round-%d", w.roundID.Add(1))
 	started := w.clock()
 	w.state.BeginRound(id, mode, started)
+	if err := w.validateRoundBoundary(ctx); err != nil {
+		failureClass := "identity"
+		if errors.Is(err, ErrSourceMountChanged) {
+			failureClass = "scan"
+		}
+		w.state.FailRound(id, failureClass)
+		return err
+	}
+	if w.state.Snapshot().Phase == PhaseDualWriteRepairing {
+		return w.dualRound(ctx, mode, id, started)
+	}
 	source, target, err := w.scanPair(ctx)
 	if err != nil {
 		w.state.FailRound(id, "scan")
@@ -170,6 +330,7 @@ func (w *Worker) Round(ctx context.Context, mode RoundMode) error {
 		w.state.FailRound(id, "inventory")
 		return err
 	}
+	w.state.setPendingRepairs(repairFindingCount(round))
 	if unsafeRound(round) {
 		w.state.SetAttention(true)
 		return w.state.PublishRound(round)
@@ -178,6 +339,10 @@ func (w *Worker) Round(ctx context.Context, mode RoundMode) error {
 		if w.apply == nil {
 			w.state.FailRound(id, "fenced")
 			return ErrIllegalAction
+		}
+		if err := w.validateRoundBoundary(ctx); err != nil {
+			w.state.FailRound(id, "identity")
+			return err
 		}
 		if err := w.apply.Apply(ctx, source.Entries, target.Entries); err != nil {
 			if errors.Is(err, ErrUnsafeApply) {
@@ -197,6 +362,7 @@ func (w *Worker) Round(ctx context.Context, mode RoundMode) error {
 			w.state.FailRound(id, "reread")
 			return err
 		}
+		w.state.setPendingRepairs(repairFindingCount(round))
 	}
 	if round.Converged {
 		for path, entry := range round.Source {
@@ -221,7 +387,7 @@ func (w *Worker) scanPair(ctx context.Context) (ScanResult, TargetScan, error) {
 	deepPaths := make(map[string]struct{})
 	for path, entry := range source.Entries {
 		if entry.Kind == EntryRegular {
-			deep, readErr := w.scanner.ReadStable(ctx, path, entry.Version)
+			deep, readErr := w.scanner.ReadStableEntry(ctx, entry)
 			if readErr != nil {
 				source.Complete = false
 				return source, TargetScan{}, readErr
@@ -251,10 +417,25 @@ func unsafeRound(round Round) bool {
 	return false
 }
 
+func repairFindingCount(round Round) int {
+	paths := make(map[string]struct{})
+	for _, finding := range round.Findings {
+		if finding.Severity == SeverityBlocker {
+			paths[finding.Path] = struct{}{}
+		}
+	}
+	return len(paths)
+}
+
 func (w *Worker) Run(ctx context.Context) error {
 	if w.recovery != nil && !w.recovery.WritesAllowed {
 		if w.recovery.FenceRecoveryOnly {
-			if _, err := w.completeFence(ctx); err != nil {
+			if err := w.controlGate.Acquire(ctx); err != nil {
+				return err
+			}
+			_, err := w.completeFenceLocked(ctx)
+			w.controlGate.Release()
+			if err != nil {
 				return err
 			}
 		}
@@ -275,7 +456,9 @@ func (w *Worker) Run(ctx context.Context) error {
 			return nil
 		}
 		var err error
-		w.controlMu.Lock()
+		if acquireErr := w.controlGate.Acquire(ctx); acquireErr != nil {
+			return nil
+		}
 		if recovered {
 			mode := RoundModeFull
 			if w.state.Snapshot().Phase == PhaseDualWriteRepairing {
@@ -286,7 +469,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			err = w.DeepRecovery(ctx)
 			recovered = err == nil
 		}
-		w.controlMu.Unlock()
+		w.controlGate.Release()
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -325,14 +508,22 @@ func (w *Worker) reportCAS(source SourceEntry, target *client.StatResult, expect
 	if w.reporter == nil || w.startup == nil {
 		return
 	}
-	now, snapshot := time.Now(), w.state.Snapshot()
-	firstSeen := started
+	snapshot := w.state.Snapshot()
+	if snapshot.Phase != PhaseDualWriteRepairing {
+		return
+	}
+	var firstSeen time.Time
 	for _, candidate := range snapshot.Grace {
 		if candidate.Path == source.Path && candidate.Token == sourceVersionToken(source.Version) {
 			firstSeen = candidate.FirstSeen
+			break
 		}
 	}
-	result, class := "success", ""
+	if firstSeen.IsZero() || w.clock().Before(firstSeen.Add(w.graceWindow())) {
+		return
+	}
+	now := time.Now()
+	result, class := "success", "none"
 	if errors.Is(err, client.ErrConflict) {
 		result, class = "conflict", "cas_conflict"
 	} else if err != nil {
@@ -364,6 +555,20 @@ func (w *Worker) clock() time.Time {
 	return time.Now()
 }
 
+func (w *Worker) waitForRetry(ctx context.Context, delay time.Duration) error {
+	if w.retryWait != nil {
+		return w.retryWait(ctx, delay)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func retryDelay(attempt int, maximum time.Duration) time.Duration {
 	delay := retryBase << min(attempt, 20)
 	return min(delay, maximum)
@@ -375,7 +580,7 @@ func isAuthError(err error) bool {
 }
 
 func retryableWorkerError(err error) bool {
-	if errors.Is(err, ErrSourceChanged) || errors.Is(err, ErrApplyRescan) || errors.Is(err, ErrCheckpointConflict) {
+	if errors.Is(err, ErrSourceChanged) || errors.Is(err, ErrTargetChanged) || errors.Is(err, ErrApplyRescan) || errors.Is(err, ErrCheckpointConflict) || errors.Is(err, ErrCredentialChanged) || errors.Is(err, fs.ErrNotExist) {
 		return true
 	}
 	var status *client.StatusError

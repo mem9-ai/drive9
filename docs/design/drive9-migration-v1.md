@@ -494,6 +494,12 @@ The scanner uses `lstat` and never follows symlinks. A deep regular-file read
 uses stat/open/read/stat and revalidates the token after hashing/upload. Any
 change invalidates the result and retries from the new token.
 
+For a conditional upload, the Worker also validates both the opened file and
+its current Source path against that same token after every byte used by the
+attempt has been read and immediately before a direct write or Multipart
+Complete. A failed check prevents Complete; V2 cleanup uses an independent,
+bounded context, while V1 is abandoned without adopting or resuming the upload.
+
 Two token fields are distinct:
 
 1. `last_observed_source_token` records the latest namespace observation.
@@ -520,6 +526,14 @@ new complete deep recovery round.
 | Sparse file | Copy logical bytes; sparse layout is not preserved |
 | Invalid UTF-8 path or symlink target | Block |
 | NFC collision | Block; never auto-rename |
+
+Symlink target classification is metadata-only. Relative targets are resolved
+lexically from the link's parent, and each in-root link hop is inspected with
+`lstat`/`readlink`; no target directory is enumerated and no target file content
+is opened. An absolute target or any hop outside the Source Root is external. A
+missing component, non-directory intermediate component, or link cycle is
+dangling. Each condition emits the existing symlink-target warning while the
+original link text remains unchanged.
 
 Directory creation precedes children. Regular files and hardlink primaries
 precede link aliases. Directory permissions are applied last. In `SYNCING`,
@@ -707,6 +721,10 @@ No Drive9 Server or Client conditional Delete/Rename API is added in V1.
 13. A first large-file attempt may read EBS twice: once to compute whole
     SHA-256 and Part checksums, then to upload. V1 accepts the extra I/O and
     possible orphaned incomplete uploads rather than adding local persistence.
+14. The Migration Client adapter invokes a Worker-supplied Source-stability
+    check after all direct or Multipart reads and before the operation that can
+    commit the supplied whole checksum. The check is required for Migration but
+    does not change generic upload or Resume behavior.
 
 ## 11. Full verification and cutover
 
@@ -860,7 +878,7 @@ Migration adapter before any Worker task consumes Drive9 APIs.
 | Conditional upload | Preserve Revision 0 create and exact positive-Revision update; no unconditional fallback |
 | Fresh upload | Carry the whole checksum through a new V1/V2 conditional Multipart completion; Migration does not call Resume |
 | Capabilities | Expose bounded Migration-required checksum read/complete capabilities |
-| Event endpoint | Owner-authenticated `POST /v1/migration/events` with bounded JSON |
+| Event endpoint | Owner-authenticated `POST /v1/migration/events` with bounded JSON; Server derives Tenant identity from the authenticated Owner API key |
 | Event storage | One structured log and low-cardinality metrics only; no database table |
 
 Required data capabilities are fail-fast preflight gates. Event availability is
@@ -876,7 +894,9 @@ The event endpoint rejects scoped tokens in production deployments. Production
 requests use tenant authentication, and caller-supplied checksums and Migration
 events require an Owner API key. Local/fallback Server mode is test-only, is not
 enabled in production, and is excluded from this V1 production acceptance
-surface. No new token type or Prefix scope is added.
+surface. The request MUST NOT accept or require a caller-supplied Tenant ID;
+the Server resolves Tenant identity from the authenticated Owner API key. No
+new token type or Prefix scope is added.
 
 ## 14. Observability and local control
 
@@ -915,12 +935,12 @@ Required diagnostic fields:
 | Category | Fields |
 | --- | --- |
 | Event | `event_id`, `emitted_at`, `phase`, `round_id`, `cas_attempt`, `first_seen_at`, `grace_seconds` |
-| Job/runtime | `job_id`, `volume_id`, `node_name`, `pod_name`, `tenant_id`, `space_id` |
+| Job/runtime | `job_id`, `volume_id`, `node_name`, `pod_name`, `space_id` |
 | Source | `source_path`, `target_path`, `source_version_token`, `size`, `mtime`, `source_checksum_sha256` |
 | Target | diagnostic `resource_id`, `revision`, `drive9_checksum_sha256`, `expected_revision` |
 | Result | `operation`, `result`, `error_class`, `latency_ms` |
 
-The V1 wire schema is closed: all 27 fields above are required and unknown
+The V1 wire schema is closed: all 26 fields above are required and unknown
 fields are rejected. `mtime` is signed Unix nanoseconds and may be negative;
 all other numeric fields are non-negative, with `cas_attempt >= 1`.
 `operation` is `create` or `update`; `result` is `success`, `conflict`, or

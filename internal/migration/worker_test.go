@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -29,31 +30,59 @@ type memoryTargetNode struct {
 }
 
 type memoryTarget struct {
-	mu          sync.Mutex
-	nodes       map[string]memoryTargetNode
-	writes      int
-	listCalls   int
-	failList    bool
-	failListAt  int
-	failPut     bool
-	conflictPut bool
-	listHit     chan struct{}
-	eventStatus int
-	events      []client.MigrationEvent
+	mu              sync.Mutex
+	nodes           map[string]memoryTargetNode
+	writes          int
+	listCalls       int
+	failList        bool
+	failListAt      int
+	failListCount   int
+	failListStatus  int
+	failPut         bool
+	conflictPut     bool
+	changeAfterList bool
+	afterList       func()
+	listHit         chan struct{}
+	putStarted      chan struct{}
+	putRelease      chan struct{}
+	eventStatus     int
+	events          []client.MigrationEvent
 }
 
 type workerServer struct {
-	target     *memoryTarget
-	checkpoint *checkpointFake
-	mu         sync.Mutex
-	auth       []string
-	caps       client.MigrationCapabilities
+	target           *memoryTarget
+	checkpoint       *checkpointFake
+	checkpointByAuth map[string]*checkpointFake
+	rejectAuth       map[string]bool
+	rejectStatus     int
+	onReject         func()
+	mu               sync.Mutex
+	auth             []string
+	caps             client.MigrationCapabilities
 }
 
 func (s *workerServer) handler(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	s.auth = append(s.auth, r.Header.Get("Authorization"))
+	authorization := r.Header.Get("Authorization")
+	s.auth = append(s.auth, authorization)
+	checkpoint := s.checkpoint
+	if candidate, exists := s.checkpointByAuth[authorization]; exists {
+		checkpoint = candidate
+	}
+	rejected := s.rejectAuth[authorization]
+	rejectStatus := s.rejectStatus
+	onReject := s.onReject
 	s.mu.Unlock()
+	if rejected {
+		if onReject != nil {
+			onReject()
+		}
+		if rejectStatus == 0 {
+			rejectStatus = http.StatusUnauthorized
+		}
+		http.Error(w, "unauthorized", rejectStatus)
+		return
+	}
 	switch {
 	case r.URL.Path == "/v1/status":
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -61,7 +90,11 @@ func (s *workerServer) handler(w http.ResponseWriter, r *http.Request) {
 			"migration_capabilities": s.caps,
 		})
 	case strings.HasPrefix(r.URL.Path, "/v1/fs/.drive9-migration"):
-		s.checkpoint.serveHTTP(w, r)
+		if checkpoint == nil {
+			http.NotFound(w, r)
+			return
+		}
+		checkpoint.serveHTTP(w, r)
 	default:
 		s.target.handler(w, r)
 	}
@@ -89,8 +122,15 @@ func (m *memoryTarget) handler(w http.ResponseWriter, r *http.Request) {
 			default:
 			}
 		}
-		if m.failList || m.failListAt == m.listCalls {
-			http.Error(w, "injected list failure", http.StatusServiceUnavailable)
+		if m.failList || m.failListAt == m.listCalls || m.failListCount > 0 {
+			if m.failListCount > 0 {
+				m.failListCount--
+			}
+			status := m.failListStatus
+			if status == 0 {
+				status = http.StatusServiceUnavailable
+			}
+			http.Error(w, "injected list failure", status)
 			return
 		}
 		names := make([]string, 0, len(m.nodes))
@@ -104,6 +144,17 @@ func (m *memoryTarget) handler(w http.ResponseWriter, r *http.Request) {
 			entries = append(entries, client.FileInfo{Name: name, Size: int64(len(node.data)), Revision: node.revision, Mode: node.mode, HasMode: true, ResourceID: node.resourceID, Nlink: 1})
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries})
+		if m.afterList != nil {
+			afterList := m.afterList
+			m.afterList = nil
+			afterList()
+		}
+		if m.changeAfterList && len(names) > 0 {
+			node := m.nodes[names[0]]
+			node.revision++
+			m.nodes[names[0]] = node
+			m.changeAfterList = false
+		}
 		return
 	}
 	if r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat" {
@@ -147,6 +198,15 @@ func (m *memoryTarget) handler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Dat9-Checksum-SHA256", hex.EncodeToString(sum[:]))
 		w.WriteHeader(http.StatusOK)
 	case http.MethodPut:
+		if m.putStarted != nil {
+			select {
+			case m.putStarted <- struct{}{}:
+			default:
+			}
+		}
+		if m.putRelease != nil {
+			<-m.putRelease
+		}
 		if m.failPut {
 			http.Error(w, "injected write failure", http.StatusServiceUnavailable)
 			return
@@ -170,6 +230,18 @@ func (m *memoryTarget) handler(w http.ResponseWriter, r *http.Request) {
 		m.writes++
 		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": node.revision})
 	case http.MethodPost:
+		if r.URL.Query().Has("hardlink") {
+			sourceName := strings.TrimPrefix(r.Header.Get("X-Dat9-Hardlink-Source"), "/data/")
+			source, sourceExists := m.nodes[sourceName]
+			if exists || !sourceExists {
+				http.Error(w, "hardlink conflict", http.StatusConflict)
+				return
+			}
+			m.nodes[name] = source
+			m.writes++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if !r.URL.Query().Has("chmod") || !exists {
 			http.NotFound(w, r)
 			return
@@ -242,6 +314,17 @@ func newWorkerStartup(t *testing.T, root string, server *httptest.Server) *Start
 		t.Fatal(err)
 	}
 	return &Startup{Config: config, Job: job, Space: config.Spaces["space"], Phase: PhaseSyncing, ConfigHash: hash, Credential: credential}
+}
+
+func replaceSourceRootWithEmptyDirectory(t *testing.T, root string) {
+	t.Helper()
+	mounted := root + "-detached"
+	if err := os.Rename(root, mounted); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func allWorkerCapabilities() client.MigrationCapabilities {
@@ -414,6 +497,274 @@ func TestNewWorkerBuildsRuntimeAndReloadsCredential(t *testing.T) {
 	}
 }
 
+func TestRoundProactivelyReloadsChangedCredential(t *testing.T) {
+	for _, revokedOldKey := range []bool{false, true} {
+		t.Run(fmt.Sprintf("revoked=%v", revokedOldKey), func(t *testing.T) {
+			root := t.TempDir()
+			backend := &workerServer{
+				target: &memoryTarget{nodes: make(map[string]memoryTargetNode)}, checkpoint: &checkpointFake{},
+				caps: allWorkerCapabilities(), rejectAuth: make(map[string]bool),
+			}
+			server := httptest.NewServer(http.HandlerFunc(backend.handler))
+			defer server.Close()
+			startup := newWorkerStartup(t, root, server)
+			worker, err := NewWorker(context.Background(), startup)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := worker.DeepRecovery(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(startup.Credential.path, []byte("rotated-key\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			backend.mu.Lock()
+			backend.rejectAuth["Bearer first-key"] = revokedOldKey
+			backend.mu.Unlock()
+
+			if err := worker.Round(context.Background(), RoundModeFull); err != nil {
+				t.Fatalf("round after credential rotation: %v", err)
+			}
+			backend.mu.Lock()
+			lastAuth := backend.auth[len(backend.auth)-1]
+			backend.mu.Unlock()
+			if lastAuth != "Bearer rotated-key" {
+				t.Fatalf("round retained old credential: %q", lastAuth)
+			}
+		})
+	}
+}
+
+func TestSourceRootReplacementFailsClosedInEveryWritableMode(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		phase Phase
+		mode  RoundMode
+	}{
+		{name: "syncing", phase: PhaseSyncing, mode: RoundModeFull},
+		{name: "dual-write", phase: PhaseDualWriteRepairing, mode: RoundModeFast},
+		{name: "verification", phase: PhaseDualWriteRepairing, mode: RoundModeVerification},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			root := filepath.Join(parent, "source")
+			if err := os.Mkdir(root, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "file"), []byte("content"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			target := &memoryTarget{nodes: map[string]memoryTargetNode{
+				"file": {data: []byte("content"), revision: 1, mode: 0o100644, resourceID: "file"},
+			}}
+			worker, server := newRoundWorker(t, root, target)
+			defer server.Close()
+			worker.state = NewState(tc.phase)
+			worker.apply.config.Phase = tc.phase
+			if err := worker.DeepRecovery(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			replaceSourceRootWithEmptyDirectory(t, root)
+
+			var err error
+			if tc.mode == RoundModeVerification {
+				_, err = worker.VerifyFull(context.Background())
+			} else {
+				err = worker.Round(context.Background(), tc.mode)
+			}
+			if err == nil {
+				t.Fatal("replacement source root was accepted")
+			}
+			target.mu.Lock()
+			_, retained := target.nodes["file"]
+			target.mu.Unlock()
+			if !retained {
+				t.Fatal("source replacement deleted the Drive9 copy")
+			}
+			if !worker.State().Conditions.Attention {
+				t.Fatal("source identity failure did not raise Attention")
+			}
+		})
+	}
+}
+
+func TestRoundRejectsAdvancedOrRevisedRemoteCheckpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Checkpoint)
+	}{
+		{name: "higher phase", mutate: func(checkpoint *Checkpoint) { checkpoint.HighestPhase = PhaseDualWriteRepairing }},
+		{name: "fence intent", mutate: func(checkpoint *Checkpoint) {
+			checkpoint.HighestPhase = PhaseDualWriteRepairing
+			checkpoint.FenceIntent = true
+		}},
+		{name: "stale revision", mutate: func(*Checkpoint) {}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "file"), []byte("content"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			target := &memoryTarget{nodes: map[string]memoryTargetNode{
+				"file":  {data: []byte("content"), revision: 1, mode: 0o100644, resourceID: "file"},
+				"extra": {data: []byte("keep"), revision: 1, mode: 0o100644, resourceID: "extra"},
+			}}
+			checkpoint := &checkpointFake{}
+			backend := &workerServer{target: target, checkpoint: checkpoint, caps: allWorkerCapabilities()}
+			server := httptest.NewServer(http.HandlerFunc(backend.handler))
+			defer server.Close()
+			worker, err := NewWorker(context.Background(), newWorkerStartup(t, root, server))
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpoint.mu.Lock()
+			var remote Checkpoint
+			if err := json.Unmarshal(checkpoint.body, &remote); err != nil {
+				checkpoint.mu.Unlock()
+				t.Fatal(err)
+			}
+			tc.mutate(&remote)
+			checkpoint.body, err = json.Marshal(remote)
+			checkpoint.revision++
+			checkpoint.mu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := worker.Round(context.Background(), RoundModeFull); err == nil {
+				t.Fatal("stale Worker accepted changed Checkpoint")
+			}
+			target.mu.Lock()
+			_, retained := target.nodes["extra"]
+			target.mu.Unlock()
+			if !retained {
+				t.Fatal("stale Worker deleted target data")
+			}
+			if !worker.State().Conditions.Attention {
+				t.Fatal("Checkpoint conflict did not raise Attention")
+			}
+		})
+	}
+}
+
+func TestRoundRevalidatesSourceAndCheckpointImmediatelyBeforeApply(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*testing.T, string, *checkpointFake)
+		want   error
+	}{
+		{
+			name: "source mount",
+			change: func(t *testing.T, root string, _ *checkpointFake) {
+				replaceSourceRootWithEmptyDirectory(t, root)
+			},
+			want: ErrSourceMountChanged,
+		},
+		{
+			name: "remote checkpoint",
+			change: func(t *testing.T, _ string, checkpoint *checkpointFake) {
+				checkpoint.mu.Lock()
+				defer checkpoint.mu.Unlock()
+				var remote Checkpoint
+				if err := json.Unmarshal(checkpoint.body, &remote); err != nil {
+					t.Fatal(err)
+				}
+				remote.HighestPhase = PhaseDualWriteRepairing
+				body, err := json.Marshal(remote)
+				if err != nil {
+					t.Fatal(err)
+				}
+				checkpoint.body = body
+				checkpoint.revision++
+			},
+			want: ErrCheckpointMismatch,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "file"), []byte("content"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			target := &memoryTarget{nodes: map[string]memoryTargetNode{
+				"file":  {data: []byte("content"), revision: 1, mode: 0o100644, resourceID: "file"},
+				"extra": {data: []byte("keep"), revision: 1, mode: 0o100644, resourceID: "extra"},
+			}}
+			checkpoint := &checkpointFake{}
+			backend := &workerServer{target: target, checkpoint: checkpoint, caps: allWorkerCapabilities()}
+			server := httptest.NewServer(http.HandlerFunc(backend.handler))
+			defer server.Close()
+			worker, err := NewWorker(context.Background(), newWorkerStartup(t, root, server))
+			if err != nil {
+				t.Fatal(err)
+			}
+			target.afterList = func() { tc.change(t, root, checkpoint) }
+
+			err = worker.Round(context.Background(), RoundModeFull)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("Round error=%v, want %v", err, tc.want)
+			}
+			target.mu.Lock()
+			_, retained := target.nodes["extra"]
+			writes := target.writes
+			target.mu.Unlock()
+			if !retained || writes != 0 {
+				t.Fatalf("pre-Apply identity change retained=%v writes=%d", retained, writes)
+			}
+			if !worker.State().Conditions.Attention {
+				t.Fatal("pre-Apply identity change did not raise Attention")
+			}
+		})
+	}
+}
+
+func TestCredentialRefreshValidatesCheckpointBeforeAtomicSwap(t *testing.T) {
+	root := t.TempDir()
+	activeCheckpoint := &checkpointFake{}
+	backend := &workerServer{
+		target: &memoryTarget{nodes: make(map[string]memoryTargetNode)}, checkpoint: activeCheckpoint,
+		checkpointByAuth: map[string]*checkpointFake{"Bearer wrong-tenant-key": nil}, caps: allWorkerCapabilities(),
+	}
+	server := httptest.NewServer(http.HandlerFunc(backend.handler))
+	defer server.Close()
+	startup := newWorkerStartup(t, root, server)
+	worker, err := NewWorker(context.Background(), startup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAPI, oldInventory, oldCheckpoint, oldApply := worker.api, worker.inventory, worker.checkpoint, worker.apply
+	if err := os.WriteFile(startup.Credential.path, []byte("wrong-tenant-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.refreshClient(context.Background()); !errors.Is(err, ErrCheckpointMismatch) {
+		t.Fatalf("wrong-tenant refresh error=%v", err)
+	}
+	if worker.api != oldAPI || worker.inventory != oldInventory || worker.checkpoint != oldCheckpoint || worker.apply != oldApply {
+		t.Fatal("failed credential refresh partially replaced the active runtime")
+	}
+
+	activeCheckpoint.mu.Lock()
+	other := checkpointFromStartup(startup)
+	other.SpaceRef = "other-space"
+	body, marshalErr := json.Marshal(other)
+	activeCheckpoint.mu.Unlock()
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	wrongSpace := &checkpointFake{revision: 1, body: body}
+	backend.mu.Lock()
+	backend.checkpointByAuth["Bearer wrong-space-key"] = wrongSpace
+	backend.mu.Unlock()
+	if err := os.WriteFile(startup.Credential.path, []byte("wrong-space-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.refreshClient(context.Background()); !errors.Is(err, ErrCheckpointMismatch) {
+		t.Fatalf("wrong-space refresh error=%v", err)
+	}
+	if worker.api != oldAPI || worker.inventory != oldInventory || worker.checkpoint != oldCheckpoint || worker.apply != oldApply {
+		t.Fatal("identity mismatch partially replaced the active runtime")
+	}
+}
+
 func TestRunWorkerCancelsCleanly(t *testing.T) {
 	root := t.TempDir()
 	target := &memoryTarget{nodes: make(map[string]memoryTargetNode), listHit: make(chan struct{}, 1)}
@@ -556,8 +907,10 @@ func TestWorkerErrorClassification(t *testing.T) {
 	}
 	for _, err := range []error{
 		ErrSourceChanged,
+		ErrTargetChanged,
 		ErrApplyRescan,
 		ErrCheckpointConflict,
+		os.ErrNotExist,
 		&client.StatusError{StatusCode: http.StatusTooManyRequests},
 		&client.StatusError{StatusCode: http.StatusServiceUnavailable},
 	} {
@@ -567,6 +920,34 @@ func TestWorkerErrorClassification(t *testing.T) {
 	}
 	if retryableWorkerError(&client.StatusError{StatusCode: http.StatusBadRequest}) || retryableWorkerError(errors.New("permanent")) {
 		t.Fatal("permanent error classified as retryable")
+	}
+}
+
+func TestWorkerRunRetriesTargetChangeInsteadOfExiting(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("same"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := &memoryTarget{nodes: map[string]memoryTargetNode{"a": {data: []byte("same"), revision: 1, mode: 0o100644, resourceID: "id"}}}
+	worker, server := newRoundWorker(t, root, target)
+	defer server.Close()
+	if err := worker.DeepRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	previousRound := worker.State().Current.ID
+	target.mu.Lock()
+	target.changeAfterList = true
+	target.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	waitFor(t, func() bool {
+		current := worker.State().Current
+		return current.ID != previousRound && current.ScanComplete
+	})
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Worker exited on target churn: %v", err)
 	}
 }
 
@@ -698,6 +1079,116 @@ func TestDualTokenChangeRestartsGraceAndCASConflictRetries(t *testing.T) {
 	}
 	if !worker.State().Conditions.CurrentConverged {
 		t.Fatalf("CAS retry did not converge: %+v", worker.State())
+	}
+}
+
+func TestDualGraceStartsWhenStableMismatchIsObserved(t *testing.T) {
+	root := t.TempDir()
+	filePath := filepath.Join(root, "a")
+	if err := os.WriteFile(filePath, []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := &memoryTarget{nodes: map[string]memoryTargetNode{"a": {data: []byte("one"), revision: 1, mode: 0o100644, resourceID: "id"}}}
+	now := time.Now()
+	worker, server := newDualWorker(t, root, target, time.Minute, &now)
+	defer server.Close()
+	if err := worker.DeepRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filePath, []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	roundStarted := now
+	advanced := false
+	worker.scanner.beforeEntry = func(string) {
+		if !advanced {
+			advanced = true
+			now = now.Add(2 * time.Minute)
+		}
+	}
+	if err := worker.Round(context.Background(), RoundModeFast); err != nil {
+		t.Fatal(err)
+	}
+	candidate := onlyGrace(t, worker.State())
+	if !candidate.FirstSeen.Equal(now) || candidate.FirstSeen.Equal(roundStarted) {
+		t.Fatalf("first_seen=%s round_started=%s observation=%s", candidate.FirstSeen, roundStarted, now)
+	}
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	if target.writes != 0 {
+		t.Fatalf("long scan consumed grace and repaired immediately: writes=%d", target.writes)
+	}
+}
+
+func TestDualCandidateCountsDescribeSelectionReasons(t *testing.T) {
+	floor := time.Unix(0, 100)
+	stable := SourceVersion{Device: 1, Inode: 1, Kind: EntryRegular, Size: 1, MtimeNS: 1, CtimeNS: 1, Mode: 0o644}
+	changed := stable
+	changed.CtimeNS++
+	source := ScanResult{Entries: map[string]SourceEntry{
+		"/mtime":    {Path: "/mtime", Version: SourceVersion{Device: 1, Inode: 2, Kind: EntryRegular, Size: 1, MtimeNS: floor.UnixNano(), CtimeNS: 1, Mode: 0o644}},
+		"/token":    {Path: "/token", Version: changed},
+		"/new":      {Path: "/new", Version: stable},
+		"/grace":    {Path: "/grace", Version: stable},
+		"/retry":    {Path: "/retry", Version: stable},
+		"/filtered": {Path: "/filtered", Version: stable},
+	}}
+	snapshot := StateSnapshot{
+		RepairMtimeFloor: &floor,
+		Reconciled: map[string]SourceVersion{
+			"/mtime": source.Entries["/mtime"].Version,
+			"/token": stable, "/grace": stable, "/retry": stable, "/filtered": stable,
+		},
+		Grace: map[string]GraceCandidate{"grace": {Path: "/grace"}},
+		Retry: map[string]RetryItem{"retry": {Path: "/retry"}},
+	}
+	candidates, counts := dualCandidates(source, snapshot)
+	if counts.Mtime != 1 || counts.SourceTokenChanged != 1 || counts.NewPath != 1 || counts.Filtered != 1 {
+		t.Fatalf("candidate counts=%+v", counts)
+	}
+	for _, path := range []string{"/mtime", "/token", "/new", "/grace", "/retry"} {
+		if _, exists := candidates[path]; !exists {
+			t.Fatalf("candidate %s missing: %v", path, candidates)
+		}
+	}
+	if _, exists := candidates["/filtered"]; exists {
+		t.Fatalf("filtered path selected: %v", candidates)
+	}
+}
+
+func TestDualRepairMissingHardlinkAliasUsesMatchingPrimary(t *testing.T) {
+	root := t.TempDir()
+	primaryPath := filepath.Join(root, "a")
+	if err := os.WriteFile(primaryPath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(primaryPath, filepath.Join(root, "b")); err != nil {
+		t.Fatal(err)
+	}
+	target := &memoryTarget{nodes: map[string]memoryTargetNode{
+		"a": {data: []byte("content"), revision: 1, mode: 0o100644, resourceID: "hardlink-resource"},
+	}}
+	now := time.Now()
+	worker, server := newDualWorker(t, root, target, time.Minute, &now)
+	defer server.Close()
+	if err := worker.DeepRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if candidate := onlyGrace(t, worker.State()); candidate.Path != "/b" {
+		t.Fatalf("grace candidate=%+v", candidate)
+	}
+	now = now.Add(time.Minute)
+	if err := worker.Round(context.Background(), RoundModeFast); err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	alias, exists := target.nodes["b"]
+	target.mu.Unlock()
+	if !exists || alias.resourceID != "hardlink-resource" {
+		t.Fatalf("hardlink alias=%+v exists=%v", alias, exists)
+	}
+	if !worker.State().Conditions.CurrentConverged {
+		t.Fatalf("hardlink repair did not converge: %+v", worker.State())
 	}
 }
 

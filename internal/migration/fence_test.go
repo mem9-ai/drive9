@@ -3,9 +3,11 @@ package migration
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func newFenceWorker(t *testing.T) (*Worker, *Startup, *checkpointFake, *httptest.Server) {
@@ -28,6 +30,29 @@ func newFenceWorker(t *testing.T) (*Worker, *Startup, *checkpointFake, *httptest
 		t.Fatal(err)
 	}
 	return worker, startup, backend.checkpoint, server
+}
+
+func TestPrepareCutoverCancellationWhileWaitingForGateDoesNotFence(t *testing.T) {
+	worker, _, fake, server := newFenceWorker(t)
+	defer server.Close()
+	if err := worker.controlGate.Acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer worker.controlGate.Release()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := worker.PrepareCutover(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled cutover error=%v", err)
+	}
+	if worker.fenceIntent.Load() || worker.writesFenced.Load() {
+		t.Fatalf("canceled cutover changed fence state: %+v", worker.statusOutput())
+	}
+	fake.mu.Lock()
+	writes := fake.writes
+	fake.mu.Unlock()
+	if writes != 1 {
+		t.Fatalf("canceled cutover checkpoint writes=%d, want startup write only", writes)
+	}
 }
 
 func TestCutoverFenceSuccessDuplicateAndRestart(t *testing.T) {
@@ -114,9 +139,106 @@ func TestCutoverFenceFailureSplitAndRecovery(t *testing.T) {
 			t.Fatalf("complete retry err=%v", err)
 		}
 	})
+	t.Run("complete response loss is adopted", func(t *testing.T) {
+		worker, _, _, server := newFenceWorker(t)
+		defer server.Close()
+		worker.checkpoint.afterWrite = func(checkpoint Checkpoint) error {
+			if checkpoint.FenceComplete {
+				return errors.New("lost complete response")
+			}
+			return nil
+		}
+		checkpoint, err := worker.PrepareCutover(context.Background())
+		if err != nil || !checkpoint.FenceComplete || !worker.fenceComplete.Load() || worker.State().Phase != PhaseCutoverReady {
+			t.Fatalf("adopted checkpoint=%+v status=%+v err=%v", checkpoint, worker.statusOutput(), err)
+		}
+	})
+	t.Run("complete post-write read loss is reconciled", func(t *testing.T) {
+		worker, _, fake, server := newFenceWorker(t)
+		defer server.Close()
+		fake.mu.Lock()
+		fake.failGetAtWrite = 3
+		fake.mu.Unlock()
+		checkpoint, err := worker.PrepareCutover(context.Background())
+		if err != nil || !checkpoint.FenceComplete || !worker.fenceComplete.Load() {
+			t.Fatalf("reconciled checkpoint=%+v status=%+v err=%v", checkpoint, worker.statusOutput(), err)
+		}
+	})
 }
 
-func TestCutoverRejectsEarlyAttentionAndStaleVerification(t *testing.T) {
+func TestFenceRecoverySerializesWithControlCutover(t *testing.T) {
+	worker, startup, _, targetServer := newFenceWorker(t)
+	defer targetServer.Close()
+	worker.checkpoint.afterWrite = func(checkpoint Checkpoint) error {
+		if checkpoint.FenceIntent && !checkpoint.FenceComplete {
+			return errors.New("lost fence intent response")
+		}
+		return nil
+	}
+	if _, err := worker.PrepareCutover(context.Background()); err == nil {
+		t.Fatal("fence intent response-loss injection did not fail")
+	}
+	restarted, err := NewWorker(context.Background(), startup)
+	if err != nil || !restarted.recovery.FenceRecoveryOnly {
+		t.Fatalf("restart recovery=%+v err=%v", restarted.recovery, err)
+	}
+
+	writeStarted := make(chan struct{}, 2)
+	releaseWrite := make(chan struct{})
+	restarted.checkpoint.beforeWrite = func(checkpoint Checkpoint) error {
+		if checkpoint.FenceComplete {
+			writeStarted <- struct{}{}
+			<-releaseWrite
+		}
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	socket := testControlSocket(t)
+	controlServer, err := startControl(ctx, socket, restarted)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- restarted.Run(ctx) }()
+	select {
+	case <-writeStarted:
+	case <-time.After(time.Second):
+		cancel()
+		controlServer.close()
+		t.Fatal("startup fence recovery did not reach Checkpoint completion")
+	}
+	restarted.controlGate.initialize()
+	gateHeldByRecovery := true
+	select {
+	case <-restarted.controlGate.token:
+		gateHeldByRecovery = false
+		restarted.controlGate.token <- struct{}{}
+	default:
+	}
+	controlDone := make(chan error, 1)
+	go func() {
+		controlDone <- Control(context.Background(), socket, ControlRequest{Command: "prepare-drive9-cutover"}, io.Discard)
+	}()
+	close(releaseWrite)
+	if err := <-controlDone; err != nil {
+		cancel()
+		controlServer.close()
+		t.Fatal(err)
+	}
+	waitFor(t, restarted.fenceComplete.Load)
+	cancel()
+	if err := <-runDone; err != nil {
+		controlServer.close()
+		t.Fatal(err)
+	}
+	controlServer.close()
+	if !gateHeldByRecovery {
+		t.Fatal("startup fence recovery entered Checkpoint completion without the control Gate")
+	}
+}
+
+func TestCutoverRejectsAttentionButAcceptsPassedVerificationAfterFastRound(t *testing.T) {
 	worker, _, _, server := newFenceWorker(t)
 	defer server.Close()
 	worker.state.SetAttention(true)
@@ -127,7 +249,7 @@ func TestCutoverRejectsEarlyAttentionAndStaleVerification(t *testing.T) {
 	if err := worker.Round(context.Background(), RoundModeFast); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := worker.PrepareCutover(context.Background()); !errors.Is(err, ErrIllegalAction) {
-		t.Fatalf("stale verification error=%v", err)
+	if checkpoint, err := worker.PrepareCutover(context.Background()); err != nil || !checkpoint.FenceComplete {
+		t.Fatalf("cutover after converged fast Round checkpoint=%+v err=%v", checkpoint, err)
 	}
 }

@@ -171,7 +171,7 @@ func TestTargetScannerFailureAndConcurrentChangeRemainIncomplete(t *testing.T) {
 			stats:       map[string]client.BatchStatResult{"/data/file": targetStat("/data/file", EntryRegular, 2, "")},
 		}
 		result, err := newTargetScannerFixture(t, fixture, "/data").Scan(context.Background(), nil)
-		if err == nil || !strings.Contains(err.Error(), "changed") || result.Complete {
+		if !errors.Is(err, ErrTargetChanged) || result.Complete {
 			t.Fatalf("result=%+v error=%v", result, err)
 		}
 	})

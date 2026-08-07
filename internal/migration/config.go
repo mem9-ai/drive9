@@ -39,6 +39,8 @@ var (
 	ErrIllegalAction = errors.New("illegal migration action")
 	// ErrControlUnavailable classifies an unavailable local Worker socket.
 	ErrControlUnavailable = errors.New("migration control unavailable")
+	// ErrControlOutcomeUnknown means a mutation was accepted but its terminal response was lost.
+	ErrControlOutcomeUnknown = errors.New("migration control outcome is unknown")
 )
 
 // Duration is a strict YAML duration.
@@ -304,12 +306,13 @@ func (s CredentialSource) Read() (string, error) {
 
 // Startup is a secret-free immutable startup snapshot plus a reloadable source.
 type Startup struct {
-	Config     *Config          `json:"config"`
-	Job        Job              `json:"job"`
-	Space      SpaceConfig      `json:"space"`
-	Phase      Phase            `json:"phase"`
-	ConfigHash string           `json:"config_hash"`
-	Credential CredentialSource `json:"-"`
+	Config         *Config          `json:"config"`
+	Job            Job              `json:"job"`
+	Space          SpaceConfig      `json:"space"`
+	Phase          Phase            `json:"phase"`
+	ConfigHash     string           `json:"config_hash"`
+	Credential     CredentialSource `json:"-"`
+	acceptedSource sourceMountIdentity
 }
 
 // ConfigHash hashes only one Job's normalized immutable configuration.

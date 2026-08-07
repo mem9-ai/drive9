@@ -8,10 +8,10 @@ source_revision: 1517
 design_document: docs/design/drive9-migration-v1.md
 scope_class: large
 production_net_loc: 2480-3820
-actual_production_net_loc: 3853
-scope_audit: non_expanding_overage_33
+actual_production_net_loc: 4968
+scope_audit: non_expanding_fifth_review_remediation_overage_1148
 repository_amendment: memory-only-worker-state-no-multipart-resume
-external_server_contract: available
+external_server_contract: data_available_event_tenant_derivation_blocked_fs_45
 ---
 
 ## 1. Objective
@@ -35,8 +35,12 @@ and Migration never resumes a prior Multipart upload.
 
 ### 2.1 Start gate
 
-The external Server Wire Contract is available. This statement does not assert
-or modify `SG99` in the Server plan.
+The external data-path Server Wire Contract is available. Event ingestion has
+one external Server blocker: Tenant identity must be derived from the
+authenticated Owner API key instead of required from the request body. This is
+tracked by [tidbcloud/fs#45](https://github.com/tidbcloud/fs/issues/45), does not
+change Worker data correctness, and does not assert or modify `SG99` in the
+Server plan.
 
 1. `C01` implements only the matching Go Client Migration Contract.
 2. `A01` accepts that Client Contract before any Worker task that consumes a
@@ -303,17 +307,15 @@ EXT00 -> D04 -> A04 --+--> D05 -> A05 --+--> D08 -> A08 ---------+
                                                                                                  |
                        A01 + A07 ---------------------------------------------------------------+
                                                                                                  v
-                                                                                           D17 -> A17
-                                                                                                 |
-                                                                                                 v
-                                                                                                CG99
+                                                                                           D17 -> A17 -> RV01 -> RV02 -> RV03 -> RV04 -> RV05 -> CG99
 ```
 
 | ID | Type | Component | Depends on | Current state | Completion signal |
 | --- | --- | --- | --- | --- | --- |
-| `EXT00` | Gate | External Server Wire Contract | User-supplied repository split | `PASSED` | Contract is available; no Server-plan `SG99` assertion. |
+| `EXT00` | Gate | External data-path Server Wire Contract | User-supplied repository split | `PASSED` | Required data contract is available; no Server-plan `SG99` assertion. |
+| `EXT01` | Gate | Event Tenant derivation | User-confirmed Server ownership | `SERVER_BLOCKER` | [tidbcloud/fs#45](https://github.com/tidbcloud/fs/issues/45); Worker must not invent Tenant identity. |
 | `C01` | Dev | Go Client Migration Contract | `EXT00` | `COMPLETED` | Code and tests handed to `A01`. |
-| `A01` | Accept | Go Client Contract | `C01` | `PASSED` | Client checks pass without production edits. |
+| `A01` | Accept | Go Client Contract | `C01` | `PASSED_LOCAL` | Data contract checks pass; Event Tenant sub-check is deferred under `EXT01`. |
 | `D04` | Dev | Binary and config | `EXT00` | `COMPLETED` | Code and tests handed to `A04`. |
 | `A04` | Accept | CLI/config/secret | `D04` | `PASSED` | Required checks pass. |
 | `D05` | Dev | In-memory working state | `A04` | `COMPLETED` | Code and tests handed to `A05`. |
@@ -342,7 +344,12 @@ EXT00 -> D04 -> A04 --+--> D05 -> A05 --+--> D08 -> A08 ---------+
 | `A16` | Accept | Irreversible fence | `D16` | `PASSED` | Required checks pass. |
 | `D17` | Dev | Build/handoff | `A01`, `A07`, `A14`, `A16` | `COMPLETED` | Code and tests handed to `A17`. |
 | `A17` | Accept | Packaging/scope | `D17` | `PASSED` | Required checks pass. |
-| `CG99` | Gate | Local Client/Worker acceptance | `A01`, `A04`-`A17` | `PASSED` | Reached `READY_FOR_DEV_REGRESSION`; deferred Dev checks are recorded, not passed. |
+| `RV01` | Review | First Worker review remediation | `A17` | `PASSED` | First-review findings fixed and locally accepted. |
+| `RV02` | Review | Second Worker re-review remediation | `RV01` | `PASSED` | Four High and two Medium findings fixed and locally accepted. |
+| `RV03` | Review | Third Worker re-review remediation | `RV02` | `PASSED` | Two High and one Medium findings fixed and locally accepted. |
+| `RV04` | Review | Fourth Worker re-review remediation | `RV03` | `PASSED` | Multipart stability, bounded abort, and Symlink warning fixes passed local acceptance. |
+| `RV05` | Review | Fifth Worker re-review remediation | `RV04` | `PASSED` | Ordered Symlink resolution and current Plan metadata passed local acceptance. |
+| `CG99` | Gate | Local Client/Worker acceptance | `A01`, `A04`-`A17`, `RV05` | `PASSED` | Reached `READY_FOR_DEV_REGRESSION`; deferred Dev checks are recorded, not passed. |
 
 ## 8. Work packages
 
@@ -1105,7 +1112,7 @@ Execution record:
    `internal/migration/worker.go`; tests are in
    `internal/migration/reporter_test.go` and `worker_test.go`.
 3. Production Net LoC: approximately 151, above the 50-80 estimate. Scope
-   audit: the delta is the closed 27-field diagnostic construction plus
+   audit: the delta is the bounded diagnostic construction plus
    explicit lifecycle, timeout/retry, atomic counters, credential-rotation
    Client swap, and the actual-conditional-write hook required by D13. No new
    Wire Contract, persistence, generic framework, or data-path dependency was
@@ -1418,7 +1425,7 @@ Acceptance record:
 ### CG99 validation
 
 Status: `PASSED`
-Dependencies: `A01` and every `A04` through `A17` are `PASSED`
+Dependencies: `A01` is `PASSED_LOCAL`; every `A04` through `A17` and `RV05` are `PASSED`
 
 Run failpoint instrumentation serially after ordinary tests and lint are idle:
 
@@ -1457,8 +1464,10 @@ Run failpoint instrumentation serially after ordinary tests and lint are idle:
 2. Coverage, race, failpoint, regression, integration, and build checks pass.
 3. Production Net LoC remains 2480-3820 or has a recorded non-expanding
    explanation.
-4. The Client adapter matches and the Worker consumes the external Server
-   Wire Contract without changing it.
+4. The Client adapter matches and the Worker consumes the external data-path
+   Server Wire Contract without changing it. An optional Event-only mismatch
+   may be deferred only when it is a user-confirmed `SERVER_BLOCKER`, has an
+   external issue, and is not recorded as passed.
 5. T0, T1, T2, observation duration, and batch progression remain customer
    decisions.
 6. The deviation register is empty or every entry has a user-confirmed
@@ -1468,14 +1477,15 @@ Run failpoint instrumentation serially after ordinary tests and lint are idle:
 
 Acceptance record:
 
-1. Owner: primary acceptance agent; CG99 made no production edit after A17.
+1. Owner: primary implementation and acceptance agent. `RV01` through `RV05` made
+   the bounded production corrections listed below, then reran the full local
+   acceptance.
 2. Modified-Go gofmt, changed-package Vet, `git diff --check`, and full
    `make lint`: exit 0; lint reported zero issues. Migration and command unit
-   suites: exit 0 at 87.3% and 87.2% statement coverage. Client Migration plus
-   non-DB generic Resume targets: exit 0 at 18.3% whole-package targeted
-   coverage. All three targeted Race suites: exit 0.
-3. Coverage floors pass: State 94.9%; Reconciliation aggregate 86.0%;
-   Grace/CAS 87.7%; Verification 100%; Fence 97.2%. The eight serial Migration
+   suites: exit 0 at 86.5% and 87.2% statement coverage. The database-free
+   Client Migration Contract suite and all three targeted Race suites pass.
+3. Coverage floors pass: State 95.6%; Reconciliation aggregate 85.9%;
+   Grace/CAS 89.9%; Verification 92.2%; Fence 91.4%. The eight serial Migration
    failpoint cases all pass in the final tree, and instrumentation disable
    succeeds. The repository runner also passed all Migration cases before the
    pre-existing backend suite stopped because no Podman/Docker socket or MySQL
@@ -1484,8 +1494,10 @@ Acceptance record:
 4. Client fake-Server integration passes checksum Stat/BatchStat compatibility,
    capability/limit preflight, typed errors and cache recovery, V2 preference,
    explicit-only V1 fallback, Revision 0/positive CAS, fresh V1/V2 retries,
-   closed event DTO/redaction, and the assertion that Migration never invokes
-   Resume. Existing non-DB generic Resume targets remain passing.
+   pre-Complete Source stability, bounded independent V2 Abort, event
+   DTO/redaction, and the assertion that Migration never invokes Resume.
+   Event Tenant derivation remains an unpassed external Server sub-check under
+   `EXT01`; it is not recorded as Worker acceptance.
 5. Local Worker scenarios pass initial copy, repeatable and incremental
    `SYNCING` Create/Update/Delete/Rename, incomplete-round safety, restart deep
    recovery, T0 grace/CAS repair, post-T0 residue, T1 full verification, T2
@@ -1495,32 +1507,243 @@ Acceptance record:
    ARM64 static `CGO_ENABLED=0` release builds: exit 0. Binary help, strict
    sample config, stable output schema, UDS bounds/mode, Prefix/control escape,
    secret/content redaction, and Runbook consistency checks pass.
-7. `make test TEST_TIMEOUT=30s` is not passed: it exits 2 because Podman and
-   Docker are unavailable and the host has only about 0.8% free disk, below
-   existing FUSE write-back tests' 10% safety threshold. No user data was
-   deleted and no unrelated threshold was changed. Live external Server/MySQL,
-   deployment, CSI, and whole Dev-environment scenarios remain unexecuted.
-8. Production Go LoC is 212 Client plus 3,641 Worker, total 3,853. This is 33
-   above the advisory reference ceiling. Scope audit finds no new state,
+7. Full `pkg/client` and repository tests are not passed because Podman and
+   Docker are unavailable for the existing MySQL Testcontainers `TestMain`;
+   unrelated FUSE tests also reject the host's approximately 0.6% free-space
+   ratio. Live external Server/MySQL, deployment, CSI, and whole Dev-environment
+   scenarios remain unexecuted.
+8. Production Go LoC is 288 Client plus 4,680 Worker, total 4,968. This is 1,148
+   above the advisory reference ceiling. Scope audit finds no new phase,
    Source, persistence, protocol, control plane, watcher, framework,
    deployment, or deferred feature; the user explicitly directed that a
    non-expanding LoC overage must not interrupt development. The 20-line
    Makefile build target is outside the production-Go count.
 9. Final boundary audit passes: no Server, datastore/backend, CSI, deployment,
    CRD, controller, or external repository file changed; `pkg/client`
-   production changes are limited to C01. Open deviations: zero; `DEV-001` is
-   resolved by the user-specified Design-over-Plan authority rule.
-10. Final state: `READY_FOR_DEV_REGRESSION`. This is not whole-system Migration
-    V1 acceptance. No commit, push, PR, deployment, or external-document update
-    was performed.
+   production changes are limited to C01. Open Worker deviations: zero;
+   `DEV-001` is resolved by the user-specified Design-over-Plan authority rule,
+   and `EXT-001` is the user-confirmed external Server blocker. `RV05` adds no
+   Design deviation.
+10. Final state: `READY_FOR_DEV_REGRESSION` for the Client/Worker tree, with the
+    event-specific Dev check explicitly blocked by `EXT01`. This is not
+    whole-system Migration V1 acceptance.
 
-## 10. Deviation register
+## 10. Worker review remediation
+
+The review remediation is complete as one bounded `RV01` work package owned by
+the primary implementation agent. Production changes are 438 net Go LoC
+(589 additions and 151 removals/replacements); total feature production Go LoC
+is 4,291. The overage is advisory and the scope audit found no new phase,
+Source type, persistence schema, control plane, watcher, deployment surface, or
+general reconciliation framework.
+
+| ID | Result | Production files | Test files and evidence |
+| --- | --- | --- | --- |
+| `R01` restart preflight | `PASSED` | `preflight.go` | `preflight_test.go`: ordinary and T0 rollout restart accept only an exact same-Job Checkpoint |
+| `R02` UDS lifetime | `REOPENED_AND_PASSED_RV02` | `control.go`, `config.go` | `control_test.go`: cancellable waiting Gate plus accepted/terminal protocol removes Busy races and ambiguous zero-response success |
+| `R03` verification/cutover | `PASSED` | `fence.go` | `fence_test.go`: a later converged fast Round does not invalidate passed verification |
+| `R04` expected churn | `REOPENED_AND_PASSED_RV02` | `scanner.go`, `verification.go`, `worker.go` | `verification_test.go`, `worker_test.go`, `migration_failpoint_test.go`: operational attempts reset or safely retry beyond four Rounds; only complete data results are sticky |
+| `R05` node-local roots | `PASSED` | `preflight.go` | `preflight_test.go`: identical mount strings on distinct nodes/volumes are accepted |
+| `R06` ambiguous fence commit | `PASSED` | `fence.go` | `fence_test.go`, `checkpoint_test.go`: response-loss and post-write-read-loss recovery adopt or safely retry both fence stages |
+| `R07` credential rotation | `REOPENED_AND_PASSED_RV02` | `runtime_identity.go`, `worker.go` | `worker_test.go`: non-sensitive Secret fingerprint proactively triggers candidate validation and atomic swap for valid and revoked old keys |
+| `R08` events | `WORKER_PASSED`, `SERVER_BLOCKER` | `worker.go` | `reporter_test.go`: only actual post-Grace dual CAS emits; success uses `error_class=none`; SYNCING emits none; Tenant derivation is #45 |
+| `R09` path semantics | `PASSED` | `scanner.go`, `preflight.go`, `apply.go` | `scanner_test.go`, `preflight_test.go`, `apply_test.go`: exact Drive9 rules plus raw NFD/local and normalized logical paths |
+| `R10` Grace timing | `PASSED` | `dual.go` | `worker_test.go`: `first_seen_at` begins after complete stable dual observation |
+| `R11` hardlink partial repair | `PASSED` | `apply.go`, `dual.go` | `apply_test.go`, `worker_test.go`: alias-only repair revalidates and links to a matching external Primary |
+| `R12` status contract | `PASSED` | `state.go`, `control.go`, `apply.go`, `dual.go`, `worker.go` | `control_test.go`, `worker_test.go`: candidate reasons, backlog/pending, and blocked-upload in-flight facts |
+| `R13` plan inputs | `PASSED` | `preflight.go` | `preflight_test.go`: open/identity probe, largest file, size distribution, and upload-cap rejection |
+| `R14` scale | `DEV_REGRESSION` | none | no local code; retain full-namespace memory/latency measurement as a Dev performance watch item |
+
+Validation record:
+
+1. `gofmt`, `git diff --check`, changed-package `go vet`, and `make lint`:
+   exit 0; lint reports zero issues.
+2. `go test ./internal/migration ./cmd/drive9-migration -count=1`: exit 0.
+   Coverage is 86.8% and 87.2%; State 95.6%, Reconciliation 85.9%,
+   Grace/CAS 85.9%, Verification 100%, and Fence 90.7%.
+3. Worker/CLI Race and the database-free Client Migration Contract Race: exit
+   0.
+4. All eight Migration failpoint cases pass. The repository-wide runner then
+   exits nonzero in the unrelated Backend package because no Podman/Docker
+   socket is available; that remainder is not recorded as passed.
+5. `make build`, `make build-migration`, and Linux AMD64/ARM64
+   `CGO_ENABLED=0` migration builds: exit 0.
+6. Full `pkg/client`/repository tests requiring MySQL Testcontainers remain
+   unexecuted successfully because Docker/Podman is unavailable. The isolated
+   Client Migration Contract suite passes.
+
+## 11. Second Worker re-review remediation
+
+`RV02` resolves all four High and two Medium findings in the second re-review.
+It changes no phase, Source type, Checkpoint schema, persistence model, Server
+Wire Contract, deployment surface, or correctness boundary. Production changes
+are 501 net Go LoC (580 additions and 79 removals/replacements); total feature
+production Go LoC is 4,792.
+
+| ID | Result | Production files | Test files and evidence |
+| --- | --- | --- | --- |
+| `RR2-01` Source mount loss | `PASSED` | `runtime_identity.go`, `preflight.go`, `scanner.go`, `worker.go` | `preflight_test.go`, `scanner_test.go`, `worker_test.go`: accepted serial/device/inode is revalidated at Round and pre-Apply boundaries; empty host-directory replacement never deletes or verifies as empty |
+| `RR2-02` verification retry lifecycle | `PASSED` | `verification.go`, `worker.go` | `verification_test.go`, `migration_failpoint_test.go`: 401/403 rotation, 429, 503, network failure, more than four churn rounds, Grace repair, cancellation, reset, retry, and completed-result idempotence |
+| `RR2-03` UDS terminal protocol | `PASSED` | `config.go`, `control.go` | `control_test.go`: typed accepted/terminal frames, strict payload/command/order validation, zero-response failure, empty successful diff, response-loss unknown outcome, and accepted cutover continuation |
+| `RR2-04` remote Checkpoint freshness | `PASSED` | `worker.go`, `dual.go` | `worker_test.go`: exact Revision/body revalidation at every Round and immediately before Apply blocks stale higher-phase, fence, and revised Checkpoints with zero mutation |
+| `RR2-05` one-shot serialization | `PASSED` | `control.go`, `fence.go`, `worker.go` | `control_test.go`, `fence_test.go`: a cancellable Gate waits for the active Round, prevents the next Round, honors pre-acceptance cancellation, drains before cutover, and never consumes a token from an already-canceled Context |
+| `RR2-06` proactive Secret rotation | `PASSED` | `runtime_identity.go`, `worker.go` | `worker_test.go`: stable stat/read/stat fingerprint reloads before Round work, validates capabilities and the exact Checkpoint, and atomically swaps the runtime without retaining the key |
+
+Validation record:
+
+1. `gofmt -l internal/migration cmd/drive9-migration`, `git diff --check`,
+   `go vet ./internal/migration ./cmd/drive9-migration`, `go vet ./pkg/client`,
+   and `make lint`: exit 0; lint reports zero issues.
+2. `go test ./internal/migration ./cmd/drive9-migration -count=1`: exit 0.
+   Statement coverage is 86.2% and 87.2%; State 95.6%, Reconciliation 85.8%,
+   Grace/CAS 85.5%, Verification 91.9%, and Fence 91.4%.
+3. `go test -race ./internal/migration ./cmd/drive9-migration -count=1` and
+   the database-free Client Migration Contract Race suite: exit 0.
+4. All eight Migration failpoint cases pass serially. The repository runner
+   then exits 1 in the unrelated Backend TestMain because Podman/Docker/MySQL is
+   unavailable; instrumentation disable succeeds.
+5. `make build`, `make build-migration`, the CGO-disabled `drive9` build, and
+   Linux AMD64/ARM64 `drive9-migration` builds: exit 0.
+6. `make test TEST_TIMEOUT=30s`: exit 2 after dependency-free packages pass;
+   MySQL Testcontainer packages cannot start because Podman/Docker is
+   unavailable. This command is not recorded as passed.
+7. Correctness, code quality, Design alignment, scope, and PR boundary: passed.
+   Deviation: none. Live Dev-environment regression remains unexecuted.
+
+## 12. Third Worker re-review remediation
+
+`RV03` resolves both High and the Medium finding in the third re-review and
+removes the dead local Busy error branch. It changes no phase, Source type,
+Checkpoint schema, persistence model, Server Wire Contract, deployment surface,
+or correctness boundary. Production changes are 11 net Go LoC; total feature
+production Go LoC is 4,803.
+
+| ID | Result | Production files | Test files and evidence |
+| --- | --- | --- | --- |
+| `RR3-01` startup Source identity | `PASSED` | `preflight.go` | `preflight_test.go`: deterministic Source replacement between read validation and the final probe fails closed and never stores the replacement identity |
+| `RR3-02` fence recovery serialization | `PASSED` | `worker.go`, `fence.go` | `fence_test.go`: startup completion holds the shared control Gate while a UDS cutover waits and then returns idempotently |
+| `RR3-03` long Grace Attention | `PASSED` | `verification.go` | `verification_test.go`: a valid ten-minute Grace wait never raises Attention and later converges |
+| `RR3-04` dead Busy contract | `PASSED` | `config.go`, `control.go` | package tests, Vet, and Lint pass with no `ErrControlBusy` producer or mapping |
+
+Validation record:
+
+1. `gofmt -l internal/migration cmd/drive9-migration`, `git diff --check`,
+   changed-package Vet, and `make lint`: exit 0; lint reports zero issues.
+2. Worker and CLI unit suites: exit 0 at 86.4% and 87.2% statement coverage.
+   State is 95.6%, Reconciliation 85.2%, Grace/CAS 89.9%, Verification 92.2%,
+   and Fence 91.4%.
+3. Full Worker/CLI Race and the database-free Client Migration Contract unit
+   and Race suites: exit 0. The three new regression tests also pass 25 repeated
+   runs.
+4. All eight Migration failpoint cases pass serially. The repository failpoint
+   runner then exits 1 in the unrelated Backend TestMain because
+   Podman/Docker/MySQL is unavailable; instrumentation disable succeeds.
+5. `make build`, `make build-migration`, the CGO-disabled `drive9` build, and
+   Linux AMD64/ARM64 `drive9-migration` builds: exit 0.
+6. `make test TEST_TIMEOUT=30s` exits 2. Migration and other dependency-free
+   packages pass; MySQL Testcontainer packages cannot start, and unrelated FUSE
+   write-back tests reject the host's approximately 0.7% free-space ratio. The
+   full repository command is not recorded as passed.
+7. Correctness, code quality, Design alignment, scope, and PR boundary: passed.
+   Deviation: none. Live Dev-environment regression remains unexecuted.
+
+## 13. Fourth Worker re-review remediation
+
+Status: `PASSED`
+
+`RV04` repairs the three findings in the fourth re-review without changing a
+phase, Source type, Checkpoint schema, persistence model, Server Wire Contract,
+deployment surface, or correctness boundary.
+
+Production changes are 159 Go LoC under the established accounting: 76 Client
+additions/modifications and 83 Worker additions/modifications. Total feature
+production Go LoC is 4,962. The advisory overage remains non-expanding: every
+line maps to the three accepted review findings, with no added phase, Source,
+persistence, Wire Contract, control plane, framework, or deployment surface.
+
+| ID | Result | Production files | Test files and evidence |
+| --- | --- | --- | --- |
+| `RR4-01` Multipart Source stability | `PASSED` | `pkg/client/transfer.go`, `internal/migration/apply.go` | `pkg/client/migration_contract_test.go`, `internal/migration/apply_test.go`: direct/V1/V2 checks run after reads and before commit; a deterministic 17-Part same-size mutation cannot Complete, then restored Source cannot falsely converge in a verification Round |
+| `RR4-02` bounded V2 Abort | `PASSED` | `pkg/client/client.go`, `pkg/client/transfer.go` | `pkg/client/migration_contract_test.go`: hung Abort has an independent deadline, ignores parent cancellation, and preserves the original typed Complete error |
+| `RR4-03` Symlink warnings | `REOPENED_AND_PASSED_RV05` | `internal/migration/scanner.go` | `internal/migration/scanner_test.go`: normalized escape, direct dangling, ordered external hop/`..`, cycle, non-directory/`..`, valid internal hop, and parent-relative internal target |
+
+Validation record:
+
+1. TDD red commands exited 1 because the Client hook/timeout did not exist,
+   unstable Multipart committed, and normalized escape was not warned. All
+   corresponding targeted tests then exited 0 and passed 25 repeated runs;
+   the Source-mutation and Symlink tests also passed ten Race repetitions.
+2. `go test ./internal/migration ./cmd/drive9-migration -count=1` and the
+   database-free Client Migration/Transfer contract suites: exit 0. One broad
+   experimental Client regex exited 1 because it selected a MySQL-backed test
+   while using a deliberately non-connectable placeholder DSN; the corrected
+   database-free suite exited 0 and is the recorded Client result.
+3. Full Worker/CLI Race and database-free Client Migration Contract Race:
+   exit 0. Statement coverage is Migration 86.5%, command 87.2%, and targeted
+   Client 15.4%; State 95.6%, Apply plus Inventory 85.9%, Verification 92.2%,
+   and Fence 91.4%. Existing Grace/CAS coverage remains 89.9%.
+4. `gofmt`, `git diff --check`, changed-package Vet, and `make lint`: exit 0;
+   lint reports zero issues.
+5. All eight Migration failpoint cases pass serially. The repository runner
+   exits 1 only after those passes because the unrelated Backend TestMain cannot
+   reach Podman/Docker/MySQL; instrumentation cleanup succeeds.
+6. `make build`, `make build-migration`, the CGO-disabled `drive9` host build,
+   and Linux AMD64/ARM64 `drive9-migration` builds: exit 0.
+7. `make test TEST_TIMEOUT=30s` exits 2. Migration and other dependency-free
+   packages pass; MySQL Testcontainer packages cannot start, and unrelated FUSE
+   tests reject the host's approximately 0.6% free-space ratio. The repository
+   command is not recorded as passed.
+8. Local code/spec/security review recommendation: `APPROVE`; architecture
+   status: `CLEAR`. Correctness, code quality, Design alignment, scope, and PR
+   boundary pass. Deviation: none. Live Dev regression remains unexecuted.
+
+## 14. Fifth Worker re-review remediation
+
+Status: `PASSED`
+
+`RV05` repairs both findings in the fifth re-review without changing a phase,
+Source type, Checkpoint schema, persistence model, Server Wire Contract,
+deployment surface, or correctness boundary. The ordered resolver replacement
+adds 6 net Worker production Go LoC under the established feature accounting.
+Total production Go LoC is 4,968. The 1,148-LoC advisory overage remains
+non-expanding and maps only to accepted Client/Worker requirements and review
+remediation.
+
+| ID | Result | Production or Plan files | Test files and evidence |
+| --- | --- | --- | --- |
+| `RR5-01` ordered Symlink target resolution | `PASSED` | `internal/migration/scanner.go` | `internal/migration/scanner_test.go`: the red test missed both external `symlink/..` and dangling `regular-file/..`; the component-queue resolver now inspects each hop before `..`, and both regressions pass |
+| `RR5-02` current LoC metadata | `PASSED` | `.sisyphus/plans/drive9-migration-cli-v1.md` | frontmatter, scope audit, acceptance record, RV05, and final handoff all record 288 Client plus 4,680 Worker = 4,968 production Go LoC |
+| `RR5-03` task dependency traceability | `PASSED` | `.sisyphus/plans/drive9-migration-cli-v1.md` | dependency graph and tracker record `RV04 -> RV05`; `CG99` depends on the passed `RV05` gate |
+
+Validation record:
+
+1. The deterministic TDD red command exited 1 with both required Warning
+   findings missing. The corrected Scanner tests exit 0; the new test also
+   passes 25 Race repetitions.
+2. Worker and CLI unit suites exit 0 at 86.5% and 87.2% statement coverage. The
+   database-free Client Migration Contract suite exits 0 at 15.4% targeted
+   coverage.
+3. Full Worker/CLI Race and database-free Client Migration Contract Race:
+   exit 0.
+4. Modified-Go gofmt, `git diff --check`, changed-package Vet, and `make lint`:
+   exit 0; lint reports zero issues.
+5. All eight Migration failpoint cases pass serially. The repository runner
+   then exits 1 in the unrelated Backend TestMain because Podman/Docker/MySQL
+   remains unavailable; instrumentation disable succeeds.
+6. `make build`, `make build-migration`, and Linux AMD64/ARM64
+   `CGO_ENABLED=0` Migration builds: exit 0.
+7. Local code/spec/security review recommendation: `APPROVE`; architecture
+   status: `CLEAR`. Correctness, code quality, Design alignment, scope, and PR
+   boundary pass. Deviation: none. Live Dev regression remains unexecuted.
+
+## 15. Deviation register
 
 Append one row before making any behavior choice not fixed by revision 1517.
 
 | ID | Task | Observed mismatch or ambiguity | Classification | Decision | Status |
 | --- | --- | --- | --- | --- | --- |
 | `DEV-001` | `D04` | D04 prose assigns generic config failure to exit 2, while Design 5.2 assigns configuration failure to exit 1. | `BLOCKER` | Follow the user-defined authority order: Design wins; configuration/argument/internal errors use 1, illegal phase/action uses 2. | `RESOLVED_BY_USER_AUTHORITY_RULE` |
+| `EXT-001` | `D13/A13` | The external Event endpoint requires caller-supplied `tenant_id`, contrary to authenticated Tenant ownership. | `SERVER_BLOCKER` | Server derives Tenant from the Owner API key; tracked in [tidbcloud/fs#45](https://github.com/tidbcloud/fs/issues/45). Worker does not invent a Tenant ID. | `USER_CONFIRMED_TRACKED_EXTERNALLY` |
 
 Classifications:
 
@@ -1531,18 +1754,18 @@ Classifications:
 3. `FOLLOW_UP`: real but independently fixable; keep it out of V1.
 4. `LATER_PHASE`: belongs to an explicitly deferred option.
 
-## 11. Final handoff record
+## 16. Final handoff record
 
 | Field | Result |
 | --- | --- |
 | Final state | `READY_FOR_DEV_REGRESSION` |
-| Server contract base | External Wire Contract declared available; no local `SG99` assertion |
-| Passed acceptance tasks | 15/15 (`A01`, `A04`-`A17`) plus local `CG99` |
-| Production Net LoC | 212 Client + 3,641 Worker = 3,853 production Go LoC; non-expanding overage audit recorded |
-| Coverage | Client targeted 18.3%; Migration 87.3%; command 87.2%; State 94.9%; Reconciliation 86.0%; Grace/CAS 87.7%; Verification 100%; Fence 97.2% |
+| Server contract base | Data contract available; Event Tenant derivation blocked by tidbcloud/fs#45; no local `SG99` assertion |
+| Passed acceptance tasks | Worker-local `A01`, `A04`-`A17`, `RV01`-`RV05`, and `CG99`; external Event Tenant sub-check deferred under #45 |
+| Production Net LoC | 288 Client + 4,680 Worker = 4,968 production Go LoC; non-expanding fifth-review remediation audit recorded |
+| Coverage | Targeted Client 15.4%; Migration 86.5%; command 87.2%; State 95.6%; Reconciliation 85.9%; Grace/CAS 89.9%; Verification 92.2%; Fence 91.4% |
 | Race/failpoint result | Client, Worker, and command targeted Race passed; all eight Migration failpoints passed; dependency-backed repository remainder not passed |
-| Integration result | Client fake-Server Contract and all local Worker scenarios passed; live external Server/MySQL not run |
+| Integration result | Client fake-Server data Contract and all local Worker scenarios passed; Event Tenant sub-check is blocked by #45; live external Server/MySQL not run |
 | PR-boundary audit | Passed; only allowed Client/Worker/build/test/local-document surfaces changed |
 | Dev environment regression | Not run and not passed: live Server/MySQL, Podman/Docker, deployment/CSI, and whole-environment scenarios remain |
-| Open deviations | 0 |
-| Commit/push/PR | Not part of this plan |
+| Open deviations | 0 Worker deviations; 1 user-confirmed external Server blocker (#45) |
+| Commit/push/PR | Git history and the remote branch are authoritative for commit/push state; no PR or deployment is part of this handoff |

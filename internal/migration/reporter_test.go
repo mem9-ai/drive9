@@ -134,7 +134,7 @@ func TestDualCASReportsExactlyOneLogicalEventAndNeverBlocksRepair(t *testing.T) 
 			target.mu.Lock()
 			events := append([]client.MigrationEvent(nil), target.events...)
 			target.mu.Unlock()
-			if len(events) == 0 || events[0].CASAttempt != 1 || events[0].SourceVersionToken == "" || events[0].Operation != "create" || events[0].SourceChecksumSHA256 == "" {
+			if len(events) == 0 || events[0].CASAttempt != 1 || events[0].Phase != string(PhaseDualWriteRepairing) || events[0].SourceVersionToken == "" || events[0].Operation != "create" || events[0].SourceChecksumSHA256 == "" || events[0].ErrorClass != "none" {
 				t.Fatalf("events=%+v", events)
 			}
 			for _, event := range events[1:] {
@@ -143,6 +143,25 @@ func TestDualCASReportsExactlyOneLogicalEventAndNeverBlocksRepair(t *testing.T) 
 				}
 			}
 		})
+	}
+}
+
+func TestSyncingCASNeverReportsMigrationEvent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := &memoryTarget{nodes: make(map[string]memoryTargetNode)}
+	worker, server := newRoundWorker(t, root, target)
+	defer server.Close()
+	worker.startup = &Startup{Job: Job{VolumeID: "vol-001", Target: TargetConfig{Prefix: "/data"}}}
+	worker.reporter = newEventReporter(worker.api, 1)
+	worker.apply.onCAS = worker.reportCAS
+	if err := worker.DeepRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := worker.reporter.snapshot(); snapshot != (ReporterSnapshot{}) {
+		t.Fatalf("SYNCING emitted event: %+v", snapshot)
 	}
 }
 
