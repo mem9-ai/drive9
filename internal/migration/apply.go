@@ -486,6 +486,9 @@ func (e *ApplyEngine) applyModes(ctx context.Context, entries []SourceEntry, tar
 		err := e.api.ChmodCtx(ctx, targetRemotePath(e.config.Prefix, entry.Path, entry.Kind == EntryDirectory), entry.Mode&0o777)
 		operationDone()
 		if err != nil {
+			if client.IsNotFound(err) {
+				return fmt.Errorf("%w: chmod target %s: %w", ErrApplyRescan, entry.Path, err)
+			}
 			return fmt.Errorf("chmod target %s: %w", entry.Path, err)
 		}
 		if err := e.validateSourceEntry(entry); err != nil {

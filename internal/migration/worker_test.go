@@ -40,6 +40,8 @@ type memoryTarget struct {
 	failListStatus  int
 	failPut         bool
 	conflictPut     bool
+	failChmodCount  int
+	failChmodStatus int
 	changeAfterList bool
 	afterList       func()
 	listHit         chan struct{}
@@ -244,6 +246,15 @@ func (m *memoryTarget) handler(w http.ResponseWriter, r *http.Request) {
 		}
 		if !r.URL.Query().Has("chmod") || !exists {
 			http.NotFound(w, r)
+			return
+		}
+		if m.failChmodCount > 0 {
+			m.failChmodCount--
+			status := m.failChmodStatus
+			if status == 0 {
+				status = http.StatusNotFound
+			}
+			http.Error(w, "injected chmod failure", status)
 			return
 		}
 		var body struct {
@@ -948,6 +959,42 @@ func TestWorkerRunRetriesTargetChangeInsteadOfExiting(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Worker exited on target churn: %v", err)
+	}
+}
+
+func TestWorkerRunRetriesChmodNotFoundInsteadOfExiting(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := &memoryTarget{
+		nodes:           make(map[string]memoryTargetNode),
+		failChmodCount:  1,
+		failChmodStatus: http.StatusNotFound,
+	}
+	worker, server := newRoundWorker(t, root, target)
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+
+	waitFor(t, func() bool {
+		select {
+		case err := <-done:
+			t.Fatalf("Worker exited on chmod 404: %v", err)
+		default:
+		}
+		snapshot := worker.State()
+		return snapshot.RecoveryComplete && snapshot.Conditions.ReadyForRollout
+	})
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("canceled Worker error=%v", err)
+	}
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	if target.writes != 1 {
+		t.Fatalf("committed file was uploaded %d times, want once", target.writes)
 	}
 }
 

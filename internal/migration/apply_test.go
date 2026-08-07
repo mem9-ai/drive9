@@ -32,6 +32,7 @@ type applyRemote struct {
 	operations  []string
 	putStatus   int
 	postHeadErr int
+	chmodStatus int
 	afterPut    func()
 	checksum    string
 }
@@ -97,6 +98,12 @@ func (r *applyRemote) handler(w http.ResponseWriter, request *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	case request.Method == http.MethodPost && request.URL.Query().Has("chmod"):
 		r.operations = append(r.operations, "chmod "+remote)
+		if r.chmodStatus != 0 {
+			status := r.chmodStatus
+			r.chmodStatus = 0
+			http.Error(w, "injected chmod failure", status)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	case request.Method == http.MethodDelete:
 		r.operations = append(r.operations, "delete "+remote)
@@ -222,6 +229,19 @@ func TestApplyConflictAndSourceMutationRequestRescan(t *testing.T) {
 			t.Fatalf("error=%v", err)
 		}
 	})
+}
+
+func TestApplyChmodNotFoundRequestsRescan(t *testing.T) {
+	remote := &applyRemote{chmodStatus: http.StatusNotFound}
+	server := httptest.NewServer(http.HandlerFunc(remote.handler))
+	defer server.Close()
+	scanner, source := newApplyFixture(t, "content")
+
+	err := newTestApplyEngine(t, server, scanner, 1<<20).Apply(context.Background(), map[string]SourceEntry{"/file": source}, nil)
+	var statusErr *client.StatusError
+	if !errors.Is(err, ErrApplyRescan) || !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusNotFound {
+		t.Fatalf("error=%T %v", err, err)
+	}
 }
 
 func TestApplyCurrentTargetChangeMatrix(t *testing.T) {
