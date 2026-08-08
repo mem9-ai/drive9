@@ -315,6 +315,66 @@ func TestScannerNormalizesScanAndReadDisappearance(t *testing.T) {
 	}
 }
 
+func TestScannerRejectsDirectoryMutationAfterEnumeration(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "directory")
+	if err := os.Mkdir(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(directory, "marker")
+	if err := os.WriteFile(marker, []byte("marker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := NewScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := false
+	scanner.beforeEntry = func(name string) {
+		if name == marker && !created {
+			created = true
+			if err := os.WriteFile(filepath.Join(directory, "late"), []byte("late"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	result, err := scanner.Scan(context.Background())
+	if !errors.Is(err, ErrSourceChanged) || result.Complete {
+		t.Fatalf("directory mutation result=%+v err=%v", result, err)
+	}
+}
+
+func TestScannerReadStableRejectsAncestorSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "directory")
+	if err := os.Mkdir(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "file"), []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := NewScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := filepath.Join(t.TempDir(), "moved")
+	if err := os.Rename(directory, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(moved, directory); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := scanner.ReadStableEntry(context.Background(), manifest.Entries["/directory/file"]); err == nil {
+		t.Fatal("stable read followed an ancestor symlink outside the source root")
+	}
+}
+
 func TestScannerReportsUnsupportedAndUnsafeEntries(t *testing.T) {
 	root := t.TempDir()
 	if err := unix.Mkfifo(filepath.Join(root, "fifo"), 0o600); err != nil {

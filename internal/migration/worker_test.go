@@ -39,6 +39,7 @@ type memoryTarget struct {
 	failListCount   int
 	failListStatus  int
 	failPut         bool
+	failPutStatus   int
 	conflictPut     bool
 	failChmodCount  int
 	failChmodStatus int
@@ -210,7 +211,11 @@ func (m *memoryTarget) handler(w http.ResponseWriter, r *http.Request) {
 			<-m.putRelease
 		}
 		if m.failPut {
-			http.Error(w, "injected write failure", http.StatusServiceUnavailable)
+			status := m.failPutStatus
+			if status == 0 {
+				status = http.StatusServiceUnavailable
+			}
+			http.Error(w, "injected write failure", status)
 			return
 		}
 		if m.conflictPut {
@@ -298,6 +303,70 @@ func newDualWorker(t *testing.T, root string, target *memoryTarget, grace time.D
 	worker.now = func() time.Time { return *now }
 	worker.apply.config.Phase = PhaseDualWriteRepairing
 	return worker, server
+}
+
+func TestWorkerCarvesOutReservedControlPrefixEveryRound(t *testing.T) {
+	root := t.TempDir()
+	control := filepath.Join(root, strings.TrimPrefix(ControlPrefix, "/"))
+	if err := os.Mkdir(control, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(control, "payload"), []byte("must-not-upload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := &memoryTarget{nodes: make(map[string]memoryTargetNode)}
+	worker, server := newRoundWorker(t, root, target)
+	defer server.Close()
+	inventory, err := NewTargetScanner(worker.api, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.inventory = inventory
+	worker.apply.config.Prefix = "/"
+
+	if err := worker.Round(context.Background(), RoundModeFull); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := worker.State()
+	if snapshot.LastComplete == nil || !hasFindingAt(snapshot.LastComplete.Findings, ControlPrefix, FindingControlPrefix) {
+		t.Fatalf("round=%+v", snapshot.LastComplete)
+	}
+	if !snapshot.Conditions.Attention {
+		t.Fatalf("reserved control collision did not set Attention: %+v", snapshot.Conditions)
+	}
+	if _, exists := snapshot.LastComplete.Source[ControlPrefix]; exists {
+		t.Fatalf("reserved source leaked into business manifest: %+v", snapshot.LastComplete.Source)
+	}
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	if target.writes != 0 {
+		t.Fatalf("reserved control collision caused %d target writes", target.writes)
+	}
+}
+
+func TestWorkerRunRedactsSourcePathFromTerminalError(t *testing.T) {
+	root := t.TempDir()
+	const sensitivePath = "customer-secret-name"
+	if err := os.WriteFile(filepath.Join(root, sensitivePath), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := &memoryTarget{nodes: make(map[string]memoryTargetNode), failPut: true, failPutStatus: http.StatusBadRequest}
+	worker, server := newRoundWorker(t, root, target)
+	defer server.Close()
+
+	err := worker.Run(context.Background())
+	if err == nil {
+		t.Fatal("worker returned nil for permanent upload failure")
+	}
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		if strings.Contains(current.Error(), sensitivePath) {
+			t.Fatalf("terminal error chain leaked source path: %v", current)
+		}
+	}
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("terminal error lost typed cause: %T %v", err, err)
+	}
 }
 
 func newWorkerStartup(t *testing.T, root string, server *httptest.Server) *Startup {

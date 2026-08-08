@@ -75,6 +75,11 @@ func (g *serialGate) Release() {
 }
 
 type StatusOutput struct {
+	VolumeID         string              `json:"volume_id,omitempty"`
+	NodeName         string              `json:"node_name,omitempty"`
+	SpaceRef         string              `json:"space_ref,omitempty"`
+	Prefix           string              `json:"prefix,omitempty"`
+	CredentialRef    string              `json:"credential_ref,omitempty"`
 	Phase            Phase               `json:"phase"`
 	StartupPhase     Phase               `json:"startup_phase"`
 	RecoveryComplete bool                `json:"recovery_complete"`
@@ -281,6 +286,11 @@ func (w *Worker) statusOutput() StatusOutput {
 	status := StatusOutput{Phase: snapshot.Phase, StartupPhase: snapshot.Phase, RecoveryComplete: snapshot.RecoveryComplete, Current: snapshot.Current, Conditions: snapshot.Conditions, RepairMtimeFloor: snapshot.RepairMtimeFloor, CandidateCounts: snapshot.CandidateCounts, GraceCandidates: len(snapshot.Grace), CASRetry: len(snapshot.Retry), Backlog: len(snapshot.Retry), PendingRepairs: snapshot.PendingRepairs, InFlight: snapshot.ActiveOperations, Verification: snapshot.Verification, Findings: make(map[FindingKind]int)}
 	if w.startup != nil {
 		status.StartupPhase = w.startup.Phase
+		status.VolumeID = w.startup.Job.VolumeID
+		status.NodeName = w.startup.Job.NodeName
+		status.SpaceRef = w.startup.Job.Target.SpaceRef
+		status.Prefix = w.startup.Job.Target.Prefix
+		status.CredentialRef = w.startup.Space.CredentialRef
 	}
 	if snapshot.LastComplete != nil {
 		status.SourceCount = len(snapshot.LastComplete.Source)

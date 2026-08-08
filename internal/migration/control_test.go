@@ -484,6 +484,24 @@ func TestControlRejectsInvalidProtocolAndCoversStatusBranches(t *testing.T) {
 	}
 }
 
+func TestStatusIncludesSecretFreeJobMapping(t *testing.T) {
+	worker := &Worker{
+		state: NewState(PhaseSyncing),
+		startup: &Startup{
+			Job: Job{
+				VolumeID: "vol-001", NodeName: "node-a",
+				Target: TargetConfig{SpaceRef: "space-a", Prefix: "/tenant-a"},
+			},
+			Space: SpaceConfig{CredentialRef: "owner-key"},
+		},
+	}
+
+	status := worker.statusOutput()
+	if status.VolumeID != "vol-001" || status.NodeName != "node-a" || status.SpaceRef != "space-a" || status.Prefix != "/tenant-a" || status.CredentialRef != "owner-key" {
+		t.Fatalf("status mapping=%+v", status)
+	}
+}
+
 func TestAttentionThresholdAndSuccessfulRecheck(t *testing.T) {
 	target := &memoryTarget{nodes: make(map[string]memoryTargetNode)}
 	worker, targetServer := newRoundWorker(t, t.TempDir(), target)
