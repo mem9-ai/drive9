@@ -18,6 +18,27 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
+func runSourceOperationWithoutFIFOBlock(t *testing.T, fifoPath string, operation func() error) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- operation() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(time.Second):
+		fd, openErr := unix.Open(fifoPath, unix.O_WRONLY|unix.O_NONBLOCK, 0)
+		if openErr == nil {
+			_ = unix.Close(fd)
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("source operation blocked opening a FIFO")
+		return nil
+	}
+}
+
 func TestScannerPreservesSupportedFilesystemFactsWithoutFollowingLinks(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
@@ -375,6 +396,46 @@ func TestScannerReadStableRejectsAncestorSymlinkEscape(t *testing.T) {
 	}
 }
 
+func TestScannerReadStableRegularToFIFORaceDoesNotBlock(t *testing.T) {
+	root := t.TempDir()
+	name := filepath.Join(root, "file")
+	if err := os.WriteFile(name, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := NewScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	swapped := false
+	scanner.openFile = func(sourceRoot *os.Root, relative string) (*os.File, error) {
+		if !swapped {
+			swapped = true
+			if removeErr := os.Remove(name); removeErr != nil {
+				return nil, removeErr
+			}
+			if fifoErr := unix.Mkfifo(name, 0o600); fifoErr != nil {
+				return nil, fifoErr
+			}
+		}
+		return openRootSourceFile(sourceRoot, relative)
+	}
+
+	err = runSourceOperationWithoutFIFOBlock(t, name, func() error {
+		_, readErr := scanner.ReadStableEntry(context.Background(), manifest.Entries["/file"])
+		return readErr
+	})
+	if !errors.Is(err, ErrSourceChanged) {
+		t.Fatalf("FIFO race error=%v", err)
+	}
+	if !swapped {
+		t.Fatal("FIFO race hook was not reached")
+	}
+}
+
 func TestScannerReportsUnsupportedAndUnsafeEntries(t *testing.T) {
 	root := t.TempDir()
 	if err := unix.Mkfifo(filepath.Join(root, "fifo"), 0o600); err != nil {
@@ -391,19 +452,6 @@ func TestScannerReportsUnsupportedAndUnsafeEntries(t *testing.T) {
 	if os.Symlink(string([]byte{'x', 0xff}), filepath.Join(root, "bad-link")) == nil {
 		wantInvalidFinding = true
 	}
-	sparsePath := filepath.Join(root, "sparse")
-	file, err := os.Create(sparsePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.Seek(1<<20, 0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.Write([]byte{1}); err != nil {
-		t.Fatal(err)
-	}
-	_ = file.Close()
-
 	scanner, err := NewScanner(root)
 	if err != nil {
 		t.Fatal(err)
@@ -412,7 +460,7 @@ func TestScannerReportsUnsupportedAndUnsafeEntries(t *testing.T) {
 	if err != nil || !result.Complete {
 		t.Fatalf("scan complete=%v err=%v", result.Complete, err)
 	}
-	wanted := []FindingKind{FindingSpecialFile, FindingSparseFile}
+	wanted := []FindingKind{FindingSpecialFile}
 	if wantInvalidFinding {
 		wanted = append(wanted, FindingInvalidUTF8)
 	}
@@ -420,6 +468,33 @@ func TestScannerReportsUnsupportedAndUnsafeEntries(t *testing.T) {
 		if !hasFinding(result.Findings, want) {
 			t.Fatalf("findings=%+v, missing %s", result.Findings, want)
 		}
+	}
+}
+
+func TestScannerReportsSparseFileFromBlockAccounting(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "sparse"), []byte("logical bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := NewScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultIdentity := scanner.identity
+	scanner.identity = func(name string, info os.FileInfo) (fileIdentity, error) {
+		identity, identityErr := defaultIdentity(name, info)
+		if filepath.Base(name) == "sparse" {
+			identity.blocks = 0
+		}
+		return identity, identityErr
+	}
+
+	result, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(result.Findings, FindingSparseFile) {
+		t.Fatalf("sparse findings=%+v", result.Findings)
 	}
 }
 

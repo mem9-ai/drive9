@@ -896,7 +896,7 @@ func TestMigrationEventUsesClosedSourceVersionTokenDTO(t *testing.T) {
 	event := MigrationEvent{
 		EventID: "evt-1", EmittedAt: "2026-08-04T12:00:00Z", Phase: "DUAL_WRITE_REPAIRING", RoundID: "round-1", CASAttempt: 1,
 		FirstSeenAt: "2026-08-04T11:59:00Z", GraceSeconds: 60, JobID: "job-1", VolumeID: "vol-1", NodeName: "node-1", PodName: "pod-1",
-		TenantID: "tenant-1", SpaceID: "space-1", SourcePath: "/ebs/file", TargetPath: "/drive9/file", SourceVersionToken: "inode:1:2",
+		SpaceID: "space-1", SourcePath: "/ebs/file", TargetPath: "/drive9/file", SourceVersionToken: "inode:1:2",
 		Size: 7, Mtime: 123, SourceChecksumSHA256: strings.Repeat("a", 64), ResourceID: "resource-1", Revision: 2,
 		Drive9ChecksumSHA256: strings.Repeat("b", 64), ExpectedRevision: 1, Operation: "update", Result: "success", ErrorClass: "none", LatencyMS: 12,
 	}
@@ -925,8 +925,11 @@ func TestMigrationEventUsesClosedSourceVersionTokenDTO(t *testing.T) {
 	if _, exists := got["source_version"]; exists {
 		t.Fatal("legacy source_version was sent")
 	}
-	if len(got) != 27 {
-		t.Fatalf("event field count = %d, want closed 27-field DTO", len(got))
+	if _, exists := got["tenant_id"]; exists {
+		t.Fatal("tenant_id was sent instead of being derived from Owner authentication")
+	}
+	if len(got) != 26 {
+		t.Fatalf("event field count = %d, want closed 26-field DTO", len(got))
 	}
 	encoded, err := json.Marshal(got)
 	if err != nil {

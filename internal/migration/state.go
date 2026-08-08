@@ -370,6 +370,14 @@ func (s *State) SetAttention(attention bool) {
 	s.recomputeLocked()
 }
 
+func (s *State) setAttentionReason(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attention = true
+	s.current.FailureClass = reason
+	s.recomputeLocked()
+}
+
 func (s *State) setCandidateCounts(counts CandidateCounts) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

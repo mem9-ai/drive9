@@ -254,6 +254,9 @@ func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, obse
 	if err != nil {
 		return err
 	}
+	if current != nil && current.Nlink != observed.Nlink {
+		return fmt.Errorf("%w: target link count changed at %s", ErrApplyRescan, source.Path)
+	}
 	if current != nil && current.Size == deep.Size && current.ChecksumSHA256 == deep.ChecksumSHA256 {
 		return e.validateSourceEntry(source)
 	}

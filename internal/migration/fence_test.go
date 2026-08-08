@@ -166,6 +166,37 @@ func TestCutoverFenceFailureSplitAndRecovery(t *testing.T) {
 	})
 }
 
+func TestCutoverFenceIntentOutcomeUnknownStaysFencedAndRaisesAttention(t *testing.T) {
+	worker, startup, fake, server := newFenceWorker(t)
+	defer server.Close()
+	worker.checkpoint.afterWrite = func(checkpoint Checkpoint) error {
+		if checkpoint.FenceIntent && !checkpoint.FenceComplete {
+			return errors.New("lost intent response")
+		}
+		return nil
+	}
+	fake.mu.Lock()
+	fake.failGetAtWrite = 2
+	fake.mu.Unlock()
+
+	if _, err := worker.PrepareCutover(context.Background()); err == nil {
+		t.Fatal("ambiguous fence intent unexpectedly succeeded")
+	}
+	status := worker.statusOutput()
+	if !worker.writesFenced.Load() || status.FenceIntent || status.FenceComplete || !status.Conditions.Attention || status.AttentionReason != "fence_intent_outcome_unknown" {
+		t.Fatalf("ambiguous intent status=%+v writes_fenced=%v", status, worker.writesFenced.Load())
+	}
+	if err := worker.Round(context.Background(), RoundModeFast); !errors.Is(err, ErrIllegalAction) {
+		t.Fatalf("ambiguous intent allowed a write Round: %v", err)
+	}
+
+	worker.checkpoint.afterWrite = nil
+	restarted, err := NewWorker(context.Background(), startup)
+	if err != nil || !restarted.recovery.FenceRecoveryOnly {
+		t.Fatalf("restart did not recover durable intent: recovery=%+v err=%v", restarted.recovery, err)
+	}
+}
+
 func TestFenceRecoverySerializesWithControlCutover(t *testing.T) {
 	worker, startup, _, targetServer := newFenceWorker(t)
 	defer targetServer.Close()

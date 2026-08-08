@@ -36,6 +36,7 @@ type applyRemote struct {
 	chmodStatus int
 	afterPut    func()
 	checksum    string
+	nlink       uint32
 }
 
 func (r *applyRemote) handler(w http.ResponseWriter, request *http.Request) {
@@ -61,6 +62,9 @@ func (r *applyRemote) handler(w http.ResponseWriter, request *http.Request) {
 		w.Header().Set("X-Dat9-Revision", fmt.Sprint(r.revision))
 		w.Header().Set("X-Dat9-Resource-ID", r.resourceID)
 		w.Header().Set("X-Dat9-Mode", fmt.Sprint(r.mode))
+		if r.nlink != 0 {
+			w.Header().Set("X-Dat9-Nlink", fmt.Sprint(r.nlink))
+		}
 		checksum := r.checksum
 		if checksum == "" {
 			checksum = hex.EncodeToString(sum[:])
@@ -171,6 +175,26 @@ func TestApplyRegularUsesConditionalCreateAndUpdate(t *testing.T) {
 				t.Fatalf("expected=%v body=%q", remote.expected, remote.body)
 			}
 		})
+	}
+}
+
+func TestApplyRegularRejectsTargetNlinkChangeBeforeWrite(t *testing.T) {
+	remote := &applyRemote{exists: true, revision: 7, resourceID: "resource-file", mode: 0o644, body: []byte("old"), nlink: 2}
+	server := httptest.NewServer(http.HandlerFunc(remote.handler))
+	defer server.Close()
+	scanner, source := newApplyFixture(t, "new-content")
+	target := map[string]TargetEntry{
+		"/file": {Path: "/file", Kind: EntryRegular, Size: 3, Mode: 0o644, HasMode: true, Revision: 7, ResourceID: "resource-file", Nlink: 1},
+	}
+
+	err := newTestApplyEngine(t, server, scanner, 1<<20).Apply(context.Background(), map[string]SourceEntry{"/file": source}, target)
+	if !errors.Is(err, ErrApplyRescan) {
+		t.Fatalf("Nlink drift error=%v", err)
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if containsOperationPrefix(remote.operations, "write ") {
+		t.Fatalf("Nlink drift reached write: %v", remote.operations)
 	}
 }
 

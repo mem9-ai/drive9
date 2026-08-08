@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
 var (
 	ErrCredentialChanged  = errors.New("credential file changed during read")
 	ErrSourceMountChanged = errors.New("mounted source identity changed")
+	ebsVolumeIDPattern    = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])vol-?([0-9a-f]+)(?:$|[^a-z0-9])`)
 )
 
 type sourceMountIdentity struct {
@@ -47,16 +49,28 @@ func observeMountedSource(root, volumeID string) (sourceMountIdentity, error) {
 	if !available {
 		return identity, nil
 	}
-	identity.VolumeSerial = normalizeVolumeIdentity(serial)
-	if !strings.Contains(identity.VolumeSerial, normalizeVolumeIdentity(volumeID)) {
+	identity.VolumeSerial = extractEBSVolumeID(serial)
+	if identity.VolumeSerial == "" || identity.VolumeSerial != canonicalVolumeID(volumeID) {
 		return sourceMountIdentity{}, errors.New("mounted volume serial does not match volume_id")
 	}
 	identity.VolumeIdentityVerified = true
 	return identity, nil
 }
 
-func normalizeVolumeIdentity(value string) string {
-	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(value), "-", ""))
+func extractEBSVolumeID(value string) string {
+	match := ebsVolumeIDPattern.FindStringSubmatch(strings.TrimSpace(value))
+	if len(match) != 2 {
+		return ""
+	}
+	return "vol-" + strings.ToLower(match[1])
+}
+
+func canonicalVolumeID(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if !volumeIDPattern.MatchString(value) {
+		return ""
+	}
+	return value
 }
 
 func (accepted sourceMountIdentity) matches(observed sourceMountIdentity) bool {

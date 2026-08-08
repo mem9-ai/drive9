@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mem9-ai/drive9/pkg/pathutil"
+	"golang.org/x/sys/unix"
 )
 
 const MaxSourceReadBufferBytes = 256 << 10
@@ -64,6 +65,7 @@ type Scanner struct {
 	root        string
 	bufferSize  int
 	identity    func(string, os.FileInfo) (fileIdentity, error)
+	openFile    func(*os.Root, string) (*os.File, error)
 	beforeEntry func(string)
 	afterRead   func(string)
 }
@@ -72,7 +74,11 @@ func NewScanner(root string) (*Scanner, error) {
 	if !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		return nil, fmt.Errorf("%w: source root must be clean and absolute", ErrUnsafeSourcePath)
 	}
-	return &Scanner{root: root, bufferSize: MaxSourceReadBufferBytes, identity: defaultFileIdentity}, nil
+	return &Scanner{root: root, bufferSize: MaxSourceReadBufferBytes, identity: defaultFileIdentity, openFile: openRootSourceFile}, nil
+}
+
+func openRootSourceFile(root *os.Root, relative string) (*os.File, error) {
+	return root.OpenFile(relative, os.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW, 0)
 }
 
 func defaultFileIdentity(_ string, info os.FileInfo) (fileIdentity, error) {
@@ -410,7 +416,7 @@ func (s *Scanner) openStableSource(sourcePath string, expected SourceVersion) (*
 	if err != nil || beforeIdentity.version != expected {
 		return nil, ErrSourceChanged
 	}
-	file, err := root.Open(relative)
+	file, err := s.openFile(root, relative)
 	if err != nil {
 		return nil, rootedSourceChangeError(err)
 	}
