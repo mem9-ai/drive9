@@ -82,6 +82,12 @@ bash e2e/git-workspace-smoke-test.sh
 # Lightweight Git operations smoke for PR local e2e
 bash e2e/git-ops-smoke-test.sh
 
+# On-demand git-workspace discovery (DORMANT refresh=0, live --fast arm, index remount, AC5 cleanup)
+# Knobs: GIT_ONDEMAND_ARMED_IDLE_S, GIT_ONDEMAND_REFRESH_MAX_SINGLE/DUAL,
+#        GIT_ONDEMAND_DORMANT_ACTIVITY_LOOPS, GIT_ONDEMAND_KEEP_ARTIFACTS
+DRIVE9_BASE=http://127.0.0.1:9009 DRIVE9_API_KEY=local-dev-key \
+  bash e2e/git-workspace-ondemand-smoke-test.sh
+
 # POSIX permission smoke (API/CLI/FUSE chmod and mkdir mode)
 bash e2e/posix-permission-smoke-test.sh
 
@@ -89,8 +95,8 @@ bash e2e/posix-permission-smoke-test.sh
 bash e2e/smoke-all.sh
 
 # Or enable optional Git coverage in that same single smoke-all run.
-# Set either variable to 1 as needed; setting both includes both Git suites.
-RUN_GIT_OPS_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
+# Set any of these to 1 as needed; setting all includes all Git suites.
+RUN_GIT_OPS_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 RUN_GIT_ONDEMAND_SMOKE=1 bash e2e/smoke-all.sh
 
 # Include portable profile pack/unpack coverage in smoke-all when desired.
 RUN_PACK_SMOKE=1 bash e2e/smoke-all.sh
