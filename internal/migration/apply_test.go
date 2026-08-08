@@ -878,6 +878,49 @@ func TestApplyDualHardlinkAliasUsesPrimaryOutsideMutationSet(t *testing.T) {
 	}
 }
 
+func TestApplyDoesNotReopenSourceThroughEscapedAncestor(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "directory")
+	if err := os.Mkdir(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "file"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := NewScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := filepath.Join(t.TempDir(), "moved")
+	scanner.afterRead = func(string) {
+		if err := os.Rename(directory, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(moved, directory); err != nil {
+			t.Fatal(err)
+		}
+		scanner.afterRead = nil
+	}
+	remote := &applyRemote{}
+	server := httptest.NewServer(http.HandlerFunc(remote.handler))
+	defer server.Close()
+	engine := newTestApplyEngine(t, server, scanner, 1<<20)
+
+	err = engine.Apply(context.Background(), manifest.Entries, nil)
+	if err == nil {
+		t.Fatal("apply uploaded a source reopened through an escaped ancestor")
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if containsOperationPrefix(remote.operations, "write ") {
+		t.Fatalf("operations=%v", remote.operations)
+	}
+}
+
 func containsOperation(operations []string, want string) bool {
 	for _, operation := range operations {
 		if operation == want {

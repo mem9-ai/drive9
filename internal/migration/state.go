@@ -73,6 +73,7 @@ const (
 	FindingSparseFile     FindingKind = "sparse_file"
 	FindingSymlinkTarget  FindingKind = "symlink_target"
 	FindingModeBits       FindingKind = "unsupported_mode_bits"
+	FindingControlPrefix  FindingKind = "reserved_control_prefix"
 
 	SeverityWarning Severity = "warning"
 	SeverityBlocker Severity = "blocker"

@@ -261,7 +261,7 @@ func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, obse
 	if err != nil {
 		return err
 	}
-	limited := &limitedSource{File: file, limiter: e.limiterForSize(source.Version.Size), ctx: ctx}
+	limited := &limitedSource{File: file.file, limiter: e.limiterForSize(source.Version.Size), ctx: ctx}
 	started := time.Now()
 	operationDone := e.beginOperation()
 	committed, uploadErr := e.api.WriteStreamConditionalWithChecksumAndPreCompleteCheck(
@@ -272,7 +272,7 @@ func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, obse
 	if e.onCAS != nil && (uploadErr == nil || client.IsCommitAttempted(uploadErr)) {
 		e.onCAS(source, current, expected, started, uploadErr)
 	}
-	closeErr := file.Close()
+	closeErr := file.close()
 	if uploadErr != nil {
 		if errors.Is(uploadErr, client.ErrConflict) {
 			return fmt.Errorf("%w: conditional upload %s: %w", ErrApplyRescan, source.Path, uploadErr)
@@ -318,26 +318,8 @@ func (e *ApplyEngine) currentTarget(ctx context.Context, remote string, observed
 	return observed.Revision, stat, nil
 }
 
-func (e *ApplyEngine) openSource(source SourceEntry) (*os.File, error) {
-	name, err := e.scanner.resolvePath(sourceLocalPath(source))
-	if err != nil {
-		return nil, err
-	}
-	file, err := os.Open(name)
-	if err != nil {
-		return nil, sourceChangeError(err)
-	}
-	info, statErr := file.Stat()
-	if statErr != nil {
-		_ = file.Close()
-		return nil, ErrSourceChanged
-	}
-	identity, identityErr := e.scanner.identity(name, info)
-	if identityErr != nil || identity.version != source.Version {
-		_ = file.Close()
-		return nil, ErrSourceChanged
-	}
-	return file, nil
+func (e *ApplyEngine) openSource(source SourceEntry) (*rootedSourceFile, error) {
+	return e.scanner.openStableSource(sourceLocalPath(source), source.Version)
 }
 
 func sourceLocalPath(source SourceEntry) string {
@@ -351,38 +333,12 @@ func (e *ApplyEngine) validateSourceEntry(source SourceEntry) error {
 	return e.validateSource(sourceLocalPath(source), source.Version)
 }
 
-func (e *ApplyEngine) validateOpenSource(file *os.File, source SourceEntry) error {
-	name, err := e.scanner.resolvePath(sourceLocalPath(source))
-	if err != nil {
-		return err
-	}
-	opened, openErr := file.Stat()
-	current, pathErr := os.Lstat(name)
-	if openErr != nil || pathErr != nil {
-		return ErrSourceChanged
-	}
-	openedIdentity, openIdentityErr := e.scanner.identity(name, opened)
-	pathIdentity, pathIdentityErr := e.scanner.identity(name, current)
-	if openIdentityErr != nil || pathIdentityErr != nil || openedIdentity.version != source.Version || pathIdentity.version != source.Version {
-		return ErrSourceChanged
-	}
-	return nil
+func (e *ApplyEngine) validateOpenSource(file *rootedSourceFile, _ SourceEntry) error {
+	return file.validate()
 }
 
 func (e *ApplyEngine) validateSource(sourcePath string, expected SourceVersion) error {
-	name, err := e.scanner.resolvePath(sourcePath)
-	if err != nil {
-		return err
-	}
-	info, err := os.Lstat(name)
-	if err != nil {
-		return ErrSourceChanged
-	}
-	identity, err := e.scanner.identity(name, info)
-	if err != nil || identity.version != expected {
-		return ErrSourceChanged
-	}
-	return nil
+	return e.scanner.validateSourcePath(sourcePath, expected)
 }
 
 func (e *ApplyEngine) applyLink(ctx context.Context, entry SourceEntry, source map[string]SourceEntry, target map[string]TargetEntry, primaries map[string]string) error {

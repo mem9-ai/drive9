@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -380,7 +381,7 @@ func (w *Worker) Round(ctx context.Context, mode RoundMode) error {
 }
 
 func (w *Worker) scanPair(ctx context.Context) (ScanResult, TargetScan, error) {
-	source, err := w.scanner.Scan(ctx)
+	source, err := w.scanSource(ctx)
 	if err != nil {
 		return source, TargetScan{}, err
 	}
@@ -401,6 +402,42 @@ func (w *Worker) scanPair(ctx context.Context) (ScanResult, TargetScan, error) {
 	}
 	target, err := w.inventory.Scan(ctx, deepPaths)
 	return source, target, err
+}
+
+func (w *Worker) scanSource(ctx context.Context) (ScanResult, error) {
+	source, err := w.scanner.Scan(ctx)
+	if err != nil {
+		return source, err
+	}
+	prefix := ""
+	if w.inventory != nil {
+		prefix = w.inventory.prefix
+	} else if w.startup != nil {
+		prefix = w.startup.Job.Target.Prefix
+	}
+	carveOutReservedControlPrefix(&source, prefix)
+	return source, nil
+}
+
+func carveOutReservedControlPrefix(source *ScanResult, targetPrefix string) {
+	if source == nil || targetPrefix != "/" {
+		return
+	}
+	for _, path := range sortedSourcePaths(source.Entries) {
+		if path != ControlPrefix && !strings.HasPrefix(path, ControlPrefix+"/") {
+			continue
+		}
+		entry := source.Entries[path]
+		delete(source.Entries, path)
+		source.EntryCount--
+		if entry.Kind == EntryDirectory {
+			source.DirectoryCount--
+		}
+		if entry.Kind == EntryRegular {
+			source.LogicalBytes -= entry.Version.Size
+		}
+		source.Findings = append(source.Findings, Finding{Path: path, Kind: FindingControlPrefix, Severity: SeverityBlocker})
+	}
 }
 
 func unsafeRound(round Round) bool {
@@ -482,7 +519,7 @@ func (w *Worker) Run(ctx context.Context) error {
 				}
 			} else if !retryableWorkerError(err) {
 				w.state.SetAttention(true)
-				return err
+				return newWorkerRunError(err)
 			}
 			if blockedAt.IsZero() {
 				blockedAt = w.clock()
@@ -502,6 +539,31 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
+}
+
+type workerRunError struct {
+	class string
+	cause error
+}
+
+func (e *workerRunError) Error() string { return "migration worker stopped: " + e.class }
+func (e *workerRunError) Unwrap() error { return e.cause }
+
+func newWorkerRunError(err error) error {
+	result := &workerRunError{class: "non_retryable_operation"}
+	var status *client.StatusError
+	switch {
+	case errors.As(err, &status):
+		result.class = fmt.Sprintf("drive9_http_%d", status.StatusCode)
+		result.cause = &client.StatusError{StatusCode: status.StatusCode}
+	case errors.Is(err, ErrUnsafeApply):
+		result.class, result.cause = "unsafe_apply", ErrUnsafeApply
+	case errors.Is(err, ErrUnsafeSourcePath):
+		result.class, result.cause = "unsafe_source", ErrUnsafeSourcePath
+	case errors.Is(err, ErrCheckpointMismatch):
+		result.class, result.cause = "checkpoint_mismatch", ErrCheckpointMismatch
+	}
+	return result
 }
 
 func (w *Worker) reportCAS(source SourceEntry, target *client.StatResult, expected int64, started time.Time, err error) {

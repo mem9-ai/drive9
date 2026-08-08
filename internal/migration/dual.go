@@ -91,7 +91,7 @@ func (w *Worker) dualObservation(ctx context.Context, mode RoundMode) (ScanResul
 		source, target, err := w.scanPair(ctx)
 		return source, target, allSourcePaths(source), err
 	}
-	source, err := w.scanner.Scan(ctx)
+	source, err := w.scanSource(ctx)
 	if err != nil {
 		return source, TargetScan{}, nil, err
 	}
