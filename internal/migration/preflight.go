@@ -51,7 +51,7 @@ func ValidateMappings(cfg *Config) error {
 	if err := cfg.validate(); err != nil {
 		return err
 	}
-	bySpace := make(map[string][]string)
+	byCredential := make(map[string][]string)
 	nodes := make(map[string]struct{})
 	for _, job := range cfg.Jobs {
 		if _, exists := nodes[job.NodeName]; exists {
@@ -62,16 +62,17 @@ func ValidateMappings(cfg *Config) error {
 		if err != nil {
 			return fmt.Errorf("job %q: %w", job.VolumeID, err)
 		}
-		bySpace[job.Target.SpaceRef] = append(bySpace[job.Target.SpaceRef], prefix)
+		credentialRef := cfg.Spaces[job.Target.SpaceRef].CredentialRef
+		byCredential[credentialRef] = append(byCredential[credentialRef], prefix)
 	}
-	for space, prefixes := range bySpace {
+	for credentialRef, prefixes := range byCredential {
 		for i, left := range prefixes {
 			if left == "/" && len(prefixes) > 1 {
-				return fmt.Errorf("space %q root prefix cannot be shared", space)
+				return fmt.Errorf("credential_ref %q root prefix cannot be shared", credentialRef)
 			}
 			for _, right := range prefixes[i+1:] {
 				if prefixesOverlap(left, right) {
-					return fmt.Errorf("space %q has overlapping prefixes %q and %q", space, left, right)
+					return fmt.Errorf("credential_ref %q has overlapping prefixes %q and %q", credentialRef, left, right)
 				}
 			}
 		}

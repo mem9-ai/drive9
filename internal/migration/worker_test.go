@@ -45,6 +45,7 @@ type memoryTarget struct {
 	failChmodStatus int
 	changeAfterList bool
 	afterList       func()
+	afterHead       func()
 	listHit         chan struct{}
 	putStarted      chan struct{}
 	putRelease      chan struct{}
@@ -210,6 +211,11 @@ func (m *memoryTarget) handler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Dat9-Nlink", strconv.FormatUint(uint64(m.resourceNlink(node.resourceID)), 10))
 		w.Header().Set("X-Dat9-Checksum-SHA256", hex.EncodeToString(sum[:]))
 		w.WriteHeader(http.StatusOK)
+		if m.afterHead != nil {
+			afterHead := m.afterHead
+			m.afterHead = nil
+			afterHead()
+		}
 	case http.MethodPut:
 		if m.putStarted != nil {
 			select {
@@ -883,6 +889,60 @@ func TestRoundRejectsSourceMutationDuringTargetInventory(t *testing.T) {
 			}
 			if current := worker.State().Current; current.ScanComplete || current.Converged {
 				t.Fatalf("source mutation published round: %+v", current)
+			}
+		})
+	}
+}
+
+func TestDualFastRoundRejectsSourceMutationDuringTargetReads(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*testing.T, string)
+	}{
+		{
+			name: "existing file changes",
+			change: func(t *testing.T, root string) {
+				if err := os.WriteFile(filepath.Join(root, "a"), []byte("changed-content"), 0o644); err != nil {
+					t.Error(err)
+				}
+			},
+		},
+		{
+			name: "new path appears",
+			change: func(t *testing.T, root string) {
+				if err := os.WriteFile(filepath.Join(root, "new"), []byte("new-content"), 0o644); err != nil {
+					t.Error(err)
+					return
+				}
+				future := time.Now().Add(2 * time.Second)
+				if err := os.Chtimes(root, future, future); err != nil {
+					t.Error(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "a"), []byte("same"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			target := &memoryTarget{nodes: map[string]memoryTargetNode{
+				"a": {data: []byte("same"), revision: 1, mode: 0o100644, resourceID: "a"},
+			}}
+			now := time.Now()
+			worker, server := newDualWorker(t, root, target, time.Minute, &now)
+			defer server.Close()
+			if err := worker.DeepRecovery(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			target.afterHead = func() { tc.change(t, root) }
+
+			err := worker.Round(context.Background(), RoundModeFast)
+			if !errors.Is(err, ErrSourceChanged) {
+				t.Fatalf("Fast Round error=%v, want ErrSourceChanged", err)
+			}
+			if current := worker.State().Current; current.ScanComplete || current.Converged {
+				t.Fatalf("source mutation published Fast Round: %+v", current)
 			}
 		})
 	}

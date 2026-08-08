@@ -14,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 const (
@@ -330,9 +332,31 @@ func writeControlFrame(output io.Writer, frame controlFrame) error {
 func writeControlTerminal(output io.Writer, command string, err error) error {
 	frame := controlFrame{Type: controlFrameTerminal, Command: command, OK: err == nil}
 	if err != nil {
-		frame.Error, frame.Code = err.Error(), controlErrorCode(err)
+		frame.Error, frame.Code = controlErrorMessage(err), controlErrorCode(err)
 	}
 	return writeControlFrame(output, frame)
+}
+
+func controlErrorMessage(err error) string {
+	switch {
+	case errors.Is(err, ErrIllegalAction):
+		return ErrIllegalAction.Error()
+	case errors.Is(err, ErrInvalidPhase):
+		return ErrInvalidPhase.Error()
+	case errors.Is(err, context.Canceled):
+		return context.Canceled.Error()
+	case errors.Is(err, context.DeadlineExceeded):
+		return context.DeadlineExceeded.Error()
+	case errors.Is(err, ErrVerificationFailed):
+		return ErrVerificationFailed.Error()
+	case errors.Is(err, ErrControlOutcomeUnknown):
+		return ErrControlOutcomeUnknown.Error()
+	}
+	var status *client.StatusError
+	if errors.As(err, &status) {
+		return fmt.Sprintf("drive9 request failed: HTTP %d", status.StatusCode)
+	}
+	return "migration control operation failed"
 }
 
 func Control(ctx context.Context, socket string, request ControlRequest, output io.Writer) error {

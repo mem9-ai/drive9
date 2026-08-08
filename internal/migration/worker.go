@@ -404,15 +404,22 @@ func (w *Worker) scanPair(ctx context.Context) (ScanResult, TargetScan, error) {
 	if err != nil {
 		return source, target, err
 	}
-	if err := w.validateSourceMount(); err != nil {
-		source.Complete = false
-		return source, target, err
-	}
-	if err := w.scanner.validateSnapshot(ctx, source); err != nil {
-		source.Complete = false
+	if err := w.validateScannedSource(ctx, &source); err != nil {
 		return source, target, err
 	}
 	return source, target, nil
+}
+
+func (w *Worker) validateScannedSource(ctx context.Context, source *ScanResult) error {
+	if err := w.validateSourceMount(); err != nil {
+		source.Complete = false
+		return err
+	}
+	if err := w.scanner.validateSnapshot(ctx, *source); err != nil {
+		source.Complete = false
+		return err
+	}
+	return nil
 }
 
 func (w *Worker) scanSource(ctx context.Context) (ScanResult, error) {

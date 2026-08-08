@@ -125,6 +125,35 @@ func TestValidateMappingsRejectsOverlapRootSharingAndControlPrefix(t *testing.T)
 	}
 }
 
+func TestValidateMappingsUsesCredentialMappingForSpaceAliases(t *testing.T) {
+	newConfig := func(t *testing.T, aliasCredential, aliasPrefix string) *Config {
+		t.Helper()
+		cfg := mappingConfig(t, `  - volume_id: vol-001
+    node_name: node-a
+    source: {type: ebs, root: /ebs/001}
+    target: {space_ref: space-001, prefix: /team}
+  - volume_id: vol-002
+    node_name: node-b
+    source: {type: ebs, root: /ebs/002}
+    target: {space_ref: space-001, prefix: /other}
+`)
+		cfg.Spaces["alias"] = SpaceConfig{CredentialRef: aliasCredential}
+		cfg.Jobs[1].Target = TargetConfig{SpaceRef: "alias", Prefix: aliasPrefix}
+		return cfg
+	}
+
+	sameCredential := "space-001-key"
+	if err := ValidateMappings(newConfig(t, sameCredential, "/team/sub")); err == nil {
+		t.Fatal("overlapping Space aliases using one credential_ref were accepted")
+	}
+	if err := ValidateMappings(newConfig(t, sameCredential, "/other")); err != nil {
+		t.Fatalf("non-overlapping Space aliases using one credential_ref: %v", err)
+	}
+	if err := ValidateMappings(newConfig(t, "other-space-key", "/team/sub")); err != nil {
+		t.Fatalf("independent credentials were treated as one Space: %v", err)
+	}
+}
+
 func TestValidateTargetPrefixUsesDrive9PathRules(t *testing.T) {
 	for _, prefix := range []string{"/bad\\path", "/bad\x01path", "/dot/../path"} {
 		if _, err := validateTargetPrefix(prefix); err == nil {
