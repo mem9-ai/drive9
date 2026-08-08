@@ -29,6 +29,9 @@ func mappingConfig(t *testing.T, jobs string) *Config {
       space_ref: space-001
       prefix: /
 `, "jobs:\n"+jobs, 1)
+	if body == validConfigYAML {
+		t.Fatal("jobs block was not replaced; validConfigYAML drifted")
+	}
 	cfg, err := LoadConfig(writeConfig(t, body))
 	if err != nil {
 		t.Fatal(err)
@@ -180,7 +183,14 @@ func TestValidateMappingsAllowsSameNodeLocalMountPathOnDifferentNodes(t *testing
 func preflightStartup(t *testing.T, endpoint, root string) *Startup {
 	t.Helper()
 	body := strings.Replace(validConfigYAML, "https://drive9.example.com", endpoint, 1)
-	body = strings.Replace(body, "/ebs/001", root, 1)
+	if body == validConfigYAML {
+		t.Fatal("preflight endpoint substitution did not apply")
+	}
+	withRoot := strings.Replace(body, "/ebs/001", root, 1)
+	if withRoot == body {
+		t.Fatal("preflight Source Root substitution did not apply")
+	}
+	body = withRoot
 	configPath := writeConfig(t, body)
 	secretRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(secretRoot, "space-001-key"), []byte("owner-key\n"), 0o600); err != nil {

@@ -555,10 +555,18 @@ func TestScannerDetectsNFCCollisionNestedMountAndIdentityFailure(t *testing.T) {
 func TestScannerRetainsRawLocalSpellingForNormalizedLogicalPath(t *testing.T) {
 	root := t.TempDir()
 	rawName := "e\u0301"
-	canonical := norm.NFC.String("/" + rawName)
 	if err := os.WriteFile(filepath.Join(root, rawName), []byte("content"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	directoryEntries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(directoryEntries) != 1 {
+		t.Fatalf("Source Root entries=%v", directoryEntries)
+	}
+	storedName := directoryEntries[0].Name()
+	canonical := norm.NFC.String("/" + storedName)
 	scanner, err := NewScanner(root)
 	if err != nil {
 		t.Fatal(err)
@@ -568,7 +576,7 @@ func TestScannerRetainsRawLocalSpellingForNormalizedLogicalPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry, exists := result.Entries[canonical]
-	if !exists || entry.Path != canonical || entry.LocalPath == canonical {
+	if !exists || entry.Path != canonical || entry.LocalPath != "/"+filepath.ToSlash(storedName) {
 		t.Fatalf("normalized entry=%+v entries=%+v", entry, result.Entries)
 	}
 	var readName string
@@ -580,8 +588,8 @@ func TestScannerRetainsRawLocalSpellingForNormalizedLogicalPath(t *testing.T) {
 	if _, err := scanner.ReadStableEntry(context.Background(), entry); err != nil {
 		t.Fatal(err)
 	}
-	if readName != filepath.Join(root, rawName) {
-		t.Fatalf("read used %q, want raw local spelling %q", readName, filepath.Join(root, rawName))
+	if readName != filepath.Join(root, storedName) {
+		t.Fatalf("read used %q, want stored local spelling %q", readName, filepath.Join(root, storedName))
 	}
 	for _, invalid := range []string{"bad\\name", "bad\x01name"} {
 		if _, ok := canonicalSourcePath(invalid); ok {
