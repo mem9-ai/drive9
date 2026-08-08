@@ -828,17 +828,6 @@ func markLocalGitWorkspaceDeleted(ctx context.Context, resolved mountedGitTarget
 	return gitcache.MarkWorkspaceDeleted(ctx, localRoot, workspaceID)
 }
 
-func clearLocalGitWorkspaceDeleted(ctx context.Context, resolved mountedGitTarget, workspaceID string) error {
-	localRoot := strings.TrimSpace(resolved.LocalRoot)
-	if localRoot == "" || strings.TrimSpace(workspaceID) == "" {
-		return nil
-	}
-	if !filepath.IsAbs(localRoot) {
-		return fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
-	}
-	return gitcache.ClearWorkspaceDeleted(ctx, localRoot, workspaceID)
-}
-
 func markLocalGitWorkspaceRegistered(ctx context.Context, resolved mountedGitTarget, workspaceID string) error {
 	localRoot := strings.TrimSpace(resolved.LocalRoot)
 	if localRoot == "" || strings.TrimSpace(workspaceID) == "" {

@@ -20,12 +20,9 @@ func TestUpsertAndRemoveGitWorkspaceIndex(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Client paths are under /v1/fs/...
 		path := r.URL.Path
-		if path != "/v1/fs"+GitWorkspaceIndexPath && path != GitWorkspaceIndexPath {
-			// also accept url-encoded or cleaned forms
-			if !(len(path) > 0 && (path == "/v1/fs/.drive9/git-workspaces/index.json")) {
-				http.NotFound(w, r)
-				return
-			}
+		if path != "/v1/fs"+GitWorkspaceIndexPath && path != GitWorkspaceIndexPath && path != "/v1/fs/.drive9/git-workspaces/index.json" {
+			http.NotFound(w, r)
+			return
 		}
 		mu.Lock()
 		defer mu.Unlock()
