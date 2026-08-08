@@ -42,8 +42,11 @@ func TestControlStatusDiffPermissionsAndUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(socket)
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("socket mode=%v err=%v", info.Mode().Perm(), err)
+	if err != nil {
+		t.Fatalf("stat control socket: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("socket mode=%v", info.Mode().Perm())
 	}
 	var status bytes.Buffer
 	if err := Control(context.Background(), socket, ControlRequest{Command: "status", Output: "json"}, &status); err != nil {

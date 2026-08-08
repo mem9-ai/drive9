@@ -1,6 +1,9 @@
 package migration
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestExtractEBSVolumeIDRequiresExactToken(t *testing.T) {
 	for _, tc := range []struct {
@@ -18,7 +21,15 @@ func TestExtractEBSVolumeIDRequiresExactToken(t *testing.T) {
 			t.Fatalf("extractEBSVolumeID(%q)=%q, want %q", tc.serial, got, tc.want)
 		}
 	}
-	if serial := extractEBSVolumeID("nvme-Amazon_Elastic_Block_Store_vol0123abcd"); serial == canonicalVolumeID("vol-0123") {
-		t.Fatal("short configured volume ID matched a longer serial")
+}
+
+func TestVerifyMountedVolumeSerialReturnsTypedMismatch(t *testing.T) {
+	identity := sourceMountIdentity{Device: 1, Inode: 2}
+	verified, err := verifyMountedVolumeSerial(identity, "vol-0123abcd", "nvme-Amazon_Elastic_Block_Store_vol0123abcd")
+	if err != nil || !verified.VolumeIdentityVerified || verified.Device != identity.Device || verified.Inode != identity.Inode {
+		t.Fatalf("verified identity=%+v err=%v", verified, err)
+	}
+	if _, err := verifyMountedVolumeSerial(identity, "vol-0123", "nvme-Amazon_Elastic_Block_Store_vol0123abcd"); !errors.Is(err, ErrSourceMountChanged) {
+		t.Fatalf("volume mismatch error=%v", err)
 	}
 }

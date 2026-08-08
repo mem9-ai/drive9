@@ -75,10 +75,11 @@ func TestCutoverFenceSuccessDuplicateAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake.mu.Lock()
-	if fake.writes != writes {
-		t.Fatalf("duplicate fence wrote %d -> %d", writes, fake.writes)
-	}
+	duplicateWrites := fake.writes
 	fake.mu.Unlock()
+	if duplicateWrites != writes {
+		t.Fatalf("duplicate fence wrote %d -> %d", writes, duplicateWrites)
+	}
 	restarted, err := NewWorker(context.Background(), startup)
 	if err != nil || restarted.recovery.WritesAllowed || restarted.State().Phase != PhaseCutoverReady || !restarted.fenceComplete.Load() {
 		t.Fatalf("restart=%+v err=%v", restarted, err)

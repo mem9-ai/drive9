@@ -65,6 +65,64 @@ type workerServer struct {
 	caps             client.MigrationCapabilities
 }
 
+func TestMemoryTargetPausedPutAllowsConcurrentHead(t *testing.T) {
+	target := &memoryTarget{
+		nodes:      map[string]memoryTargetNode{"file": {data: []byte("old"), revision: 1, mode: 0o100644, resourceID: "id-file"}},
+		putStarted: make(chan struct{}, 1),
+		putRelease: make(chan struct{}),
+	}
+	server := httptest.NewServer(http.HandlerFunc(target.handler))
+	defer server.Close()
+	var release sync.Once
+	releasePut := func() { release.Do(func() { close(target.putRelease) }) }
+	t.Cleanup(releasePut)
+
+	putDone := make(chan error, 1)
+	go func() {
+		request, err := http.NewRequest(http.MethodPut, server.URL+"/v1/fs/data/file", strings.NewReader("new"))
+		if err == nil {
+			request.Header.Set("X-Dat9-Expected-Revision", "1")
+			response, doErr := http.DefaultClient.Do(request)
+			if doErr != nil {
+				err = doErr
+			} else {
+				_ = response.Body.Close()
+				if response.StatusCode != http.StatusOK {
+					err = fmt.Errorf("PUT status=%d", response.StatusCode)
+				}
+			}
+		}
+		putDone <- err
+	}()
+	select {
+	case <-target.putStarted:
+	case <-time.After(time.Second):
+		t.Fatal("PUT did not reach the pause gate")
+	}
+
+	headCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	headRequest, err := http.NewRequestWithContext(headCtx, http.MethodHead, server.URL+"/v1/fs/data/file", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headResponse, err := http.DefaultClient.Do(headRequest)
+	if err != nil {
+		releasePut()
+		<-putDone
+		t.Fatalf("HEAD was blocked by paused PUT: %v", err)
+	}
+	_ = headResponse.Body.Close()
+	if headResponse.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD status=%d", headResponse.StatusCode)
+	}
+
+	releasePut()
+	if err := <-putDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (m *memoryTarget) resourceNlink(resourceID string) uint32 {
 	var count uint32
 	for _, node := range m.nodes {
@@ -224,7 +282,11 @@ func (m *memoryTarget) handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if m.putRelease != nil {
-			<-m.putRelease
+			putRelease := m.putRelease
+			m.mu.Unlock()
+			<-putRelease
+			m.mu.Lock()
+			node, exists = m.nodes[name]
 		}
 		if m.failPut {
 			status := m.failPutStatus

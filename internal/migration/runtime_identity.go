@@ -49,9 +49,13 @@ func observeMountedSource(root, volumeID string) (sourceMountIdentity, error) {
 	if !available {
 		return identity, nil
 	}
+	return verifyMountedVolumeSerial(identity, volumeID, serial)
+}
+
+func verifyMountedVolumeSerial(identity sourceMountIdentity, volumeID, serial string) (sourceMountIdentity, error) {
 	identity.VolumeSerial = extractEBSVolumeID(serial)
 	if identity.VolumeSerial == "" || identity.VolumeSerial != canonicalVolumeID(volumeID) {
-		return sourceMountIdentity{}, errors.New("mounted volume serial does not match volume_id")
+		return sourceMountIdentity{}, fmt.Errorf("%w: mounted volume serial does not match volume_id", ErrSourceMountChanged)
 	}
 	identity.VolumeIdentityVerified = true
 	return identity, nil
