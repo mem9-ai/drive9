@@ -33,6 +33,28 @@ func processAliveImpl(pid int) bool {
 	return false
 }
 
+// processMatchesIdentity reports whether pid is still the process that was
+// recorded with creation.
+//
+// creation==0 is fail-closed (return false): without ownership metadata we
+// refuse to signal, which avoids PID-reuse kills from stale/old-format state
+// and keeps unit tests with fake PIDs from sending real SIGTERM/SIGKILL.
+//
+// IMPORTANT: use mountstate.ProcessCreationTime (same implementation that
+// writers use when recording SupervisorCreationTime / CreationTime). CLI
+// processCreationTimeByPID historically differed on Darwin (kinfo ns vs ps
+// lstart hash), which made supervised umount skip SIGTERM entirely.
+func processMatchesIdentity(pid int, creation uint64) bool {
+	if pid <= 0 || creation == 0 || !processAliveImpl(pid) {
+		return false
+	}
+	got, err := mountstate.ProcessCreationTime(pid)
+	if err != nil || got == 0 {
+		return false
+	}
+	return got == creation
+}
+
 func waitForProcessExitByPID(pid int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {

@@ -12,8 +12,10 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -90,6 +92,11 @@ type MountOptions struct {
 	// the FUSE daemon from hanging indefinitely when a backend upload is slow.
 	// Default 5s; 0 uses default; negative disables the timeout (legacy behavior).
 	RemoteCommitWaitTimeout time.Duration
+	// SkipProcessState skips writing the mount pid/process state file. Used when
+	// a supervisor owns the authoritative process state.
+	SkipProcessState bool
+	// Supervised marks this worker as managed by an external supervisor (logging only).
+	Supervised bool
 }
 
 const defaultUploadConcurrency = 16
@@ -205,22 +212,51 @@ func (o *MountOptions) setDefaults() {
 
 // Mount creates and serves a FUSE mount. It blocks until the filesystem
 // is unmounted or a signal (SIGINT, SIGTERM) is received.
-func Mount(opts *MountOptions) error {
+func Mount(opts *MountOptions) (err error) {
 	if opts == nil {
 		return fmt.Errorf("mount: options are required")
 	}
 	opts.setDefaults()
 	if err := validateMountOptionsProfile(opts); err != nil {
-		return err
+		return ExitStartupPermanentErr("invalid mount profile", err)
 	}
+	var (
+		mountBecameActive bool
+		mountPointCopy    string
+	)
+	defer func() {
+		if r := recover(); r != nil {
+			stack := string(debug.Stack())
+			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=panic mountpoint=%s detail=%v\n%s\n", mountPointCopy, r, stack)
+			// Prefer live mount check over flag: panic may occur after NewServer
+			// before mountBecameActive is set, or the flag may lag.
+			if mountPointCopy != "" {
+				if mountBecameActive {
+					forceUnmountLazy(mountPointCopy)
+				} else if active, _ := activeMountPoint(mountPointCopy); active {
+					forceUnmountLazy(mountPointCopy)
+				}
+			}
+			detail := fmt.Sprintf("%v", r)
+			err = ExitPanicErr(detail, fmt.Errorf("panic: %v", r))
+			_ = mountstate.WriteExitReason(mountPointCopy, mountstate.ExitReason{
+				Reason: string(ExitReasonPanic),
+				Detail: detail,
+				Code:   ExitUnhealthy,
+				PID:    os.Getpid(),
+				At:     time.Now().UTC(),
+			})
+		}
+	}()
 	if localOverlay := NewLocalOverlay(opts.LocalRoot); localOverlay != nil {
 		if err := localOverlay.EnsureRoot(); err != nil {
-			return fmt.Errorf("mount: prepare LocalRoot: %w", err)
+			return ExitStartupPermanentErr("prepare LocalRoot", err)
 		}
 	}
 
+	mountPointCopy = opts.MountPoint
 	if err := os.MkdirAll(opts.MountPoint, 0o755); err != nil {
-		return fmt.Errorf("create mount point: %w", err)
+		return ExitStartupTransientErr("create mount point", err)
 	}
 
 	// Validate credential inputs. MountOptions.APIKey and MountOptions.Token
@@ -228,15 +264,15 @@ func Mount(opts *MountOptions) error {
 	// Both empty is caller error; both non-empty would let a silent
 	// priority rule override what the caller wrote, which we refuse.
 	if opts.APIKey != "" && opts.Token != "" {
-		return fmt.Errorf("mount: APIKey and Token are mutually exclusive (choose one principal kind at mount time)")
+		return ExitStartupPermanentErr("APIKey and Token are mutually exclusive", nil)
 	}
 	if opts.APIKey == "" && opts.Token == "" {
-		return fmt.Errorf("mount: either APIKey (owner) or Token (delegated) is required")
+		return ExitStartupPermanentErr("either APIKey (owner) or Token (delegated) is required", nil)
 	}
 	opts.LayerRef = strings.TrimSpace(opts.LayerRef)
 	opts.CheckpointRef = strings.TrimSpace(opts.CheckpointRef)
 	if opts.CheckpointRef != "" && opts.LayerRef == "" {
-		return fmt.Errorf("mount: CheckpointRef requires LayerRef")
+		return ExitStartupPermanentErr("CheckpointRef requires LayerRef", nil)
 	}
 
 	// Generate per-mount actor ID for SSE self-filtering.
@@ -257,12 +293,12 @@ func Mount(opts *MountOptions) error {
 	// Validate remote root (or server connectivity for root mounts).
 	remoteRoot, err := mountpath.NormalizeRoot(opts.RemoteRoot)
 	if err != nil {
-		return fmt.Errorf("mount: %w", err)
+		return ExitStartupPermanentErr("normalize remote root", err)
 	}
 	opts.RemoteRoot = remoteRoot
 	if remoteRoot == "/" {
 		if _, err := c.List("/"); err != nil {
-			return fmt.Errorf("cannot reach drive9 server: %w", err)
+			return ExitStartupTransientErr("cannot reach drive9 server", err)
 		}
 	} else {
 		stat, err := c.Stat(remoteRoot)
@@ -270,27 +306,27 @@ func Mount(opts *MountOptions) error {
 			// If Stat explicitly says "not found", trust it — don't fall back
 			// to List which may return empty success for non-existent paths.
 			if client.IsNotFound(err) {
-				return fmt.Errorf("drive9 mount: remote source %q does not exist\n\n  To create it first:\n    drive9 fs mkdir :%s\n  Then retry:\n    drive9 mount :%s <mountpoint>", remoteRoot, remoteRoot, remoteRoot)
+				return ExitStartupPermanentErr(fmt.Sprintf("remote source %q does not exist", remoteRoot), err)
 			}
 			// Stat may fail on backends where directory stat is unsupported
 			// (non-404 error). Fall back to List to verify existence.
 			if _, listErr := c.List(remoteRoot); listErr != nil {
 				if client.IsNotFound(listErr) {
-					return fmt.Errorf("drive9 mount: remote source %q does not exist\n\n  To create it first:\n    drive9 fs mkdir :%s\n  Then retry:\n    drive9 mount :%s <mountpoint>", remoteRoot, remoteRoot, remoteRoot)
+					return ExitStartupPermanentErr(fmt.Sprintf("remote source %q does not exist", remoteRoot), listErr)
 				}
-				return fmt.Errorf("remote root %q: %w", remoteRoot, listErr)
+				return ExitStartupTransientErr(fmt.Sprintf("remote root %q", remoteRoot), listErr)
 			}
 		} else if !stat.IsDir {
-			return fmt.Errorf("remote root %q is not a directory", remoteRoot)
+			return ExitStartupPermanentErr(fmt.Sprintf("remote root %q is not a directory", remoteRoot), nil)
 		}
 	}
 	if opts.LayerRef != "" {
 		layer, err := c.GetFSLayer(context.Background(), opts.LayerRef)
 		if err != nil {
-			return fmt.Errorf("mount: resolve fs layer %q: %w", opts.LayerRef, err)
+			return ExitStartupPermanentErr(fmt.Sprintf("resolve fs layer %q", opts.LayerRef), err)
 		}
 		if layer.State != "active" {
-			return fmt.Errorf("mount: fs layer %q is %s, want active", opts.LayerRef, layer.State)
+			return ExitStartupPermanentErr(fmt.Sprintf("fs layer %q is %s, want active", opts.LayerRef, layer.State), nil)
 		}
 		opts.LayerRef = layer.LayerID
 		fmt.Fprintf(os.Stderr, "drive9: fs layer: %s\n", layer.LayerID)
@@ -302,7 +338,7 @@ func Mount(opts *MountOptions) error {
 
 	profiler, err := StartProfiler(opts.Profiling)
 	if err != nil {
-		return fmt.Errorf("start profiler: %w", err)
+		return ExitStartupTransientErr("start profiler", err)
 	}
 	opts.Profiling.PprofAddr = profiler.PprofAddr()
 	defer profiler.Stop()
@@ -313,7 +349,7 @@ func Mount(opts *MountOptions) error {
 	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", resolved)
 	perfRecorder, err := StartContinuousPerf(opts.Profiling, dat9fs)
 	if err != nil {
-		return fmt.Errorf("start continuous perf: %w", err)
+		return ExitStartupTransientErr("start continuous perf", err)
 	}
 	defer perfRecorder.Stop()
 
@@ -475,8 +511,10 @@ func Mount(opts *MountOptions) error {
 	server, err := gofuse.NewServer(dat9fs, opts.MountPoint, fuseOpts)
 	if err != nil {
 		cleanupNewServerFailure(opts.MountPoint, err, layerEventWatcherStop, dat9fs.FlushAll, forceUnmount, nil)
-		return fmt.Errorf("fuse mount: %w", err)
+		return ExitStartupTransientErr("fuse mount", err)
 	}
+	// Kernel mount may already be live after NewServer; track for panic cleanup.
+	mountBecameActive = true
 
 	// Start SSE watcher after WaitMount. The initial stream reset invalidates
 	// kernel/user-space caches; if it races go-fuse's WaitMount pollHack open
@@ -516,7 +554,7 @@ func Mount(opts *MountOptions) error {
 			unmount:      server.Unmount,
 			forceUnmount: forceUnmount,
 		})
-		return fmt.Errorf("fuse wait mount: %w", err)
+		return ExitStartupTransientErr("fuse wait mount", err)
 	})
 	if err != nil {
 		return err
@@ -532,7 +570,7 @@ func Mount(opts *MountOptions) error {
 			unmount:      server.Unmount,
 			forceUnmount: forceUnmount,
 		})
-		return fmt.Errorf("start mount control socket: %w", err)
+		return ExitStartupTransientErr("start mount control socket", err)
 	}
 	if controlServer != nil {
 		defer controlServer.Close()
@@ -548,52 +586,68 @@ func Mount(opts *MountOptions) error {
 	if opts.Token != "" {
 		credentialKind = mountstate.CredentialKindToken
 	}
-	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
-		PID:                 os.Getpid(),
-		Component:           "drive9-fuse",
-		MountKind:           mountstate.MountKindFUSE,
-		MountPoint:          stateMountPoint,
-		RemoteRoot:          opts.RemoteRoot,
-		Profile:             opts.Profile,
-		LocalRoot:           opts.LocalRoot,
-		Server:              opts.Server,
-		PackPaths:           append([]string(nil), opts.PackPaths...),
-		CredentialKind:      credentialKind,
-		APIKey:              opts.APIKey,
-		Token:               opts.Token,
-		ProfileDir:          opts.Profiling.ProfileDir,
-		PerfSamplesPath:     opts.Profiling.PerfSamplesPath,
-		PerfInterval:        opts.Profiling.PerfSampleInterval.String(),
-		PerfMaxSamples:      opts.Profiling.PerfMaxSamples,
-		PerfMaxSampleFiles:  opts.Profiling.PerfMaxSampleFiles,
-		PerfMaxProfileFiles: opts.Profiling.PerfMaxProfileFiles,
-		PprofAddr:           opts.Profiling.PprofAddr,
-		StartedAt:           time.Now().UTC().Format(time.RFC3339Nano),
-		HeapProfilePath:     opts.Profiling.HeapProfilePath,
-		ControlSocket:       controlServer.SocketPath(),
-	})
-	if err != nil {
+	var pidFile string
+	if !opts.SkipProcessState {
+		creationTime, _ := mountstate.ProcessCreationTime(os.Getpid())
+		controlSock := ""
 		if controlServer != nil {
-			controlServer.Close()
+			controlSock = controlServer.SocketPath()
 		}
-		cleanupMountStartFailure(mountStartCleanup{
-			reason:       "mount process state failure",
-			mountPoint:   opts.MountPoint,
-			cause:        err,
-			stopWatchers: stopWatchers,
-			flushAll:     dat9fs.FlushAll,
-			unmount:      server.Unmount,
-			forceUnmount: forceUnmount,
+		pidFile, err = mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
+			PID:                 os.Getpid(),
+			CreationTime:        creationTime,
+			Component:           "drive9-fuse",
+			MountKind:           mountstate.MountKindFUSE,
+			MountPoint:          stateMountPoint,
+			RemoteRoot:          opts.RemoteRoot,
+			Profile:             opts.Profile,
+			LocalRoot:           opts.LocalRoot,
+			Server:              opts.Server,
+			PackPaths:           append([]string(nil), opts.PackPaths...),
+			CredentialKind:      credentialKind,
+			APIKey:              opts.APIKey,
+			Token:               opts.Token,
+			ProfileDir:          opts.Profiling.ProfileDir,
+			PerfSamplesPath:     opts.Profiling.PerfSamplesPath,
+			PerfInterval:        opts.Profiling.PerfSampleInterval.String(),
+			PerfMaxSamples:      opts.Profiling.PerfMaxSamples,
+			PerfMaxSampleFiles:  opts.Profiling.PerfMaxSampleFiles,
+			PerfMaxProfileFiles: opts.Profiling.PerfMaxProfileFiles,
+			PprofAddr:           opts.Profiling.PprofAddr,
+			StartedAt:           time.Now().UTC().Format(time.RFC3339Nano),
+			HeapProfilePath:     opts.Profiling.HeapProfilePath,
+			ControlSocket:       controlSock,
+			Role:                mountstate.RoleWorker,
+			Supervise:           opts.Supervised,
 		})
-		return fmt.Errorf("write mount pid file: %w", err)
-	}
-	defer func() {
-		if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, err)
+		if err != nil {
+			if controlServer != nil {
+				controlServer.Close()
+			}
+			cleanupMountStartFailure(mountStartCleanup{
+				reason:       "mount process state failure",
+				mountPoint:   opts.MountPoint,
+				cause:        err,
+				stopWatchers: stopWatchers,
+				flushAll:     dat9fs.FlushAll,
+				unmount:      server.Unmount,
+				forceUnmount: forceUnmount,
+			})
+			return ExitStartupTransientErr("write mount pid file", err)
 		}
-	}()
+		defer func() {
+			if pidFile == "" {
+				return
+			}
+			if removeErr := os.Remove(pidFile); removeErr != nil && !os.IsNotExist(removeErr) {
+				fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, removeErr)
+			}
+		}()
+	}
 
 	shutdown := newMountShutdown(stopWatchers, dat9fs.FlushAll)
+	var unmountRequested atomic.Bool
+	mountStartedAt := time.Now()
 
 	// Signal handling for graceful shutdown.
 	//
@@ -629,6 +683,7 @@ func Mount(opts *MountOptions) error {
 
 	go func() {
 		<-sigCh
+		unmountRequested.Store(true)
 		fmt.Fprintf(os.Stderr, "\ndrive9: unmounting %s...\n", opts.MountPoint)
 
 		// Periodic progress reporter — stops when progressDone is closed.
@@ -680,14 +735,22 @@ func Mount(opts *MountOptions) error {
 			} else {
 				fmt.Fprintf(os.Stderr, "drive9: force-quit\n")
 			}
-			forceUnmount(opts.MountPoint)
+			forceUnmountLazy(opts.MountPoint)
 			if controlServer != nil {
 				controlServer.Close()
 			}
 			if pidFile != "" {
 				_ = os.Remove(pidFile)
 			}
-			os.Exit(1)
+			_ = mountstate.WriteExitReason(opts.MountPoint, mountstate.ExitReason{
+				Reason: string(ExitReasonSignal),
+				Detail: "force quit after second signal",
+				Code:   ExitForceQuit,
+				PID:    os.Getpid(),
+				At:     time.Now().UTC(),
+			})
+			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=%d reason=force_quit mountpoint=%s\n", ExitForceQuit, opts.MountPoint)
+			os.Exit(ExitForceQuit)
 		}()
 
 		shutdown()
@@ -708,14 +771,95 @@ func Mount(opts *MountOptions) error {
 
 		// All retries exhausted — force unmount via OS tool.
 		fmt.Fprintf(os.Stderr, "drive9: retries exhausted, force-unmounting %s\n", opts.MountPoint)
-		forceUnmount(opts.MountPoint)
+		forceUnmountLazy(opts.MountPoint)
 	}()
 
 	fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
 		opts.MountPoint, opts.Server, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
 	server.Wait()
 	shutdown()
-	return nil
+
+	uptime := time.Since(mountStartedAt).Round(time.Second)
+	reason, detail := classifyServeEnd(unmountRequested.Load(), opts.MountPoint)
+	pendingFiles, pendingBytes := 0, int64(0)
+	if dat9fs.commitQueue != nil {
+		pendingFiles, pendingBytes = dat9fs.commitQueue.PendingStats()
+	}
+
+	exitRec := mountstate.ExitReason{
+		Reason:       string(reason),
+		Detail:       detail,
+		PID:          os.Getpid(),
+		PendingFiles: pendingFiles,
+		PendingBytes: pendingBytes,
+		At:           time.Now().UTC(),
+	}
+
+	switch reason {
+	case ExitReasonSignal, ExitReasonExternalUnmount:
+		exitRec.Code = ExitOK
+		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
+		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=serve_end reason=%s mountpoint=%s pid=%d uptime=%s\n",
+			reason, opts.MountPoint, os.Getpid(), uptime)
+		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=0 reason=%s mountpoint=%s\n", reason, opts.MountPoint)
+		return nil
+	default:
+		// Serve ended without intentional stop — clean stale mount and fail non-zero.
+		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=serve_end reason=%s detail=%s mountpoint=%s pid=%d uptime=%s\n",
+			reason, detail, opts.MountPoint, os.Getpid(), uptime)
+		if stillActive, _ := activeMountPoint(opts.MountPoint); stillActive {
+			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=force_unmount mountpoint=%s reason=serve_abnormal\n", opts.MountPoint)
+			if unmountErr := server.Unmount(); unmountErr != nil {
+				forceUnmountLazy(opts.MountPoint)
+			}
+		}
+		exitRec.Code = ExitServeAbnormal
+		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
+		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=%d reason=%s mountpoint=%s\n",
+			ExitServeAbnormal, reason, opts.MountPoint)
+		return ExitServeAbnormalErr(detail)
+	}
+}
+
+// classifyServeEnd decides why the FUSE serve loop ended.
+func classifyServeEnd(unmountRequested bool, mountPoint string) (MountExitReason, string) {
+	if unmountRequested {
+		return ExitReasonSignal, "stop requested by signal"
+	}
+	// Re-probe to avoid racing external umount teardown.
+	active, err := activeMountPoint(mountPoint)
+	if err != nil {
+		if isTransportBroken(err) {
+			return ExitReasonServeAbnormal, "mountpoint unreadable after serve end: " + err.Error()
+		}
+		// Path gone after external umount is a clean end.
+		if os.IsNotExist(err) {
+			return ExitReasonExternalUnmount, "mountpoint gone after serve end"
+		}
+		return ExitReasonServeAbnormal, "active mount check failed: " + err.Error()
+	}
+	if !active {
+		return ExitReasonExternalUnmount, "kernel unmounted mountpoint"
+	}
+	// Brief settle, then re-check (external umount race).
+	time.Sleep(250 * time.Millisecond)
+	active, err = activeMountPoint(mountPoint)
+	if err != nil {
+		if isTransportBroken(err) {
+			return ExitReasonServeAbnormal, "mount still broken after serve end: " + err.Error()
+		}
+		if os.IsNotExist(err) {
+			return ExitReasonExternalUnmount, "mountpoint gone after serve end"
+		}
+	}
+	if err == nil && !active {
+		return ExitReasonExternalUnmount, "kernel unmounted mountpoint"
+	}
+	probeDetail := "serve loop ended while mount still active"
+	if probeErr := probeMountPointReady(mountPoint); probeErr != nil {
+		probeDetail = probeErr.Error()
+	}
+	return ExitReasonServeAbnormal, probeDetail
 }
 
 type mountStartCleanup struct {

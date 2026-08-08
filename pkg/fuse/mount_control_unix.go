@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,6 +94,17 @@ func (s *mountControlServer) handleConn(conn net.Conn) {
 		resp.Fail("bad_request", "", err)
 		resp.Finish(time.Now().UTC())
 		_ = json.NewEncoder(conn).Encode(resp)
+		return
+	}
+	op := strings.ToLower(strings.TrimSpace(req.Op))
+	if op == "status" || op == "ping" {
+		_ = json.NewEncoder(conn).Encode(mountcontrol.StatusResponse{
+			OK:         true,
+			MountPoint: s.mountPoint(),
+			Op:         op,
+			PID:        os.Getpid(),
+			StartedAt:  time.Now().UTC(),
+		})
 		return
 	}
 	timeout := req.Timeout()

@@ -14,7 +14,19 @@ import (
 const DefaultDrainTimeout = 30 * time.Second
 
 type DrainRequest struct {
-	TimeoutMS int64 `json:"timeout_ms,omitempty"`
+	// Op is "" or "drain" (default) or "status"/"ping".
+	Op        string `json:"op,omitempty"`
+	TimeoutMS int64  `json:"timeout_ms,omitempty"`
+}
+
+// StatusResponse is a cheap liveness reply from the mount control socket.
+type StatusResponse struct {
+	OK         bool      `json:"ok"`
+	MountPoint string    `json:"mount_point,omitempty"`
+	Op         string    `json:"op,omitempty"`
+	PID        int       `json:"pid,omitempty"`
+	StartedAt  time.Time `json:"started_at,omitempty"`
+	Error      string    `json:"error,omitempty"`
 }
 
 func (r DrainRequest) Timeout() time.Duration {

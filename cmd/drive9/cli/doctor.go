@@ -15,6 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/mountsupervisor"
 )
 
 type doctorStatus string
@@ -175,6 +178,7 @@ func runDoctorFuse(args []string, deps doctorDeps) error {
 		doctorUnmountHelperCheck(deps, *mountpoint),
 		doctorFuseConfCheck(deps),
 		doctorMountpointCheck(deps, *mountpoint),
+		doctorMountSupervisionCheck(*mountpoint),
 		doctorCacheDirCheck(deps, *cacheDir),
 		doctorCredentialsCheck(creds),
 		doctorServerCheck(context.Background(), deps, creds, *timeout),
@@ -354,6 +358,50 @@ func doctorMountpointCheck(deps doctorDeps, mountpoint string) doctorCheck {
 		}
 	}
 	return doctorCheck{name: "mountpoint", status: doctorPass, detail: mountpoint + " is an available directory"}
+}
+
+func doctorMountSupervisionCheck(mountpoint string) doctorCheck {
+	mountpoint = strings.TrimSpace(mountpoint)
+	if mountpoint == "" {
+		return doctorCheck{name: "mount supervision", status: doctorPass, detail: "no mountpoint provided"}
+	}
+	snap := mountsupervisor.CollectStatus(mountpoint)
+	if _, _, err := mountstate.ReadProcessState(mountpoint); err != nil && !snap.Supervised {
+		// Not mounted / no state — not a failure for doctor prerequisites.
+		return doctorCheck{name: "mount supervision", status: doctorPass, detail: "no active mount state"}
+	}
+	if snap.State == mountstate.SupervisorStateCircuitOpen {
+		return doctorCheck{
+			name:   "mount supervision",
+			status: doctorFail,
+			detail: "supervisor circuit open after restart budget exhausted",
+			fix:    "run `drive9 mount ensure --reset " + mountpoint + "` after fixing the underlying fault",
+		}
+	}
+	if snap.Healthy {
+		detail := fmt.Sprintf("healthy supervised=%v state=%s", snap.Supervised, snap.State)
+		if snap.WorkerPID > 0 {
+			detail += fmt.Sprintf(" worker_pid=%d", snap.WorkerPID)
+		}
+		if snap.SupervisorPID > 0 {
+			detail += fmt.Sprintf(" supervisor_pid=%d", snap.SupervisorPID)
+		}
+		return doctorCheck{name: "mount supervision", status: doctorPass, detail: detail}
+	}
+	if snap.ProbeError != "" || strings.Contains(strings.ToLower(snap.ProbeError+snap.LastHealthErr), "transport endpoint") {
+		return doctorCheck{
+			name:   "mount supervision",
+			status: doctorFail,
+			detail: "stale or unhealthy mount: " + firstNonEmpty(snap.ProbeError, snap.LastHealthErr, snap.State),
+			fix:    "run `drive9 mount ensure " + mountpoint + "` or `drive9 umount " + mountpoint + "` then remount",
+		}
+	}
+	return doctorCheck{
+		name:   "mount supervision",
+		status: doctorFail,
+		detail: firstNonEmpty(snap.State, "unhealthy"),
+		fix:    "inspect `drive9 mount status " + mountpoint + "` and remount if needed",
+	}
 }
 
 func doctorCacheDirCheck(deps doctorDeps, dir string) doctorCheck {
