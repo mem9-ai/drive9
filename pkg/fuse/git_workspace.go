@@ -31,7 +31,11 @@ const gitCheckpointTimeout = 2 * time.Minute
 const gitCheckpointDebounce = 2 * time.Second
 const gitWorkspaceHydrateTimeout = 30 * time.Minute
 const gitCheckIgnoreTimeout = 2 * time.Second
-const gitWorkspaceRefreshInterval = time.Second
+const gitWorkspaceRefreshInterval = time.Second // armed list coalescing only (not empty poll)
+const gitWorkspaceIndexRescanInterval = 60 * time.Second
+const gitWorkspaceLocalArmScanInterval = 250 * time.Millisecond
+const gitWorkspaceListBackoffMin = time.Second
+const gitWorkspaceListBackoffMax = 30 * time.Second
 const gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
 const gitWorkspaceModeFastBlobless = "fast-blobless"
 const gitLocalObjectMaxBlobBytes int64 = 5 << 20
@@ -45,6 +49,23 @@ type gitWorkspaceLayer struct {
 	loaded     bool
 	loadedAt   time.Time
 	workspaces []*gitWorkspaceRuntime
+
+	// On-demand discovery (design: dormant → armed).
+	armed            bool
+	dormantConfirmed bool // index 404/empty confirmed; skip remote index until local arm
+	localArmMtime    time.Time
+	localArmScanAt   time.Time
+	indexRevision    int64
+	indexMtime       time.Time
+	indexScanAt      time.Time
+	indexProbeDone   bool
+	listBackoffUntil time.Time
+	listBackoff      time.Duration
+	listFailures     int
+	pendingForce     bool // force requested while in backoff/in-flight; sticky until consumed
+	pendingForceGen  uint64
+	ensureInflight   bool
+	ensureWait       chan struct{}
 
 	materialize     map[string]*gitMaterializeCall
 	hydrateStarted  map[string]struct{}
@@ -118,23 +139,362 @@ func newGitWorkspaceLayer() *gitWorkspaceLayer {
 }
 
 func (fs *Dat9FS) ensureGitWorkspaces(ctx context.Context) error {
+	// Explicit ensure arms and lists subject to the short freshness window.
+	// Hot-path FUSE ops must not use this for empty polling — they use
+	// gitWorkspaceForPath's event-driven arming + force flags instead.
+	fs.markGitWorkspacesArmed()
 	return fs.ensureGitWorkspacesWithRefresh(ctx, false)
 }
 
 func (fs *Dat9FS) forceRefreshGitWorkspaces(ctx context.Context) error {
+	fs.markGitWorkspacesArmed()
 	return fs.ensureGitWorkspacesWithRefresh(ctx, true)
+}
+
+func (fs *Dat9FS) markGitWorkspacesArmed() {
+	if fs == nil || fs.git == nil {
+		return
+	}
+	fs.git.mu.Lock()
+	fs.git.armed = true
+	fs.git.dormantConfirmed = false
+	fs.git.mu.Unlock()
+}
+
+func (fs *Dat9FS) gitWorkspacesArmed() bool {
+	if fs == nil || fs.git == nil {
+		return false
+	}
+	fs.git.mu.Lock()
+	defer fs.git.mu.Unlock()
+	return fs.git.armed
+}
+
+func (fs *Dat9FS) disarmGitWorkspacesLocked() {
+	fs.git.armed = false
+	fs.git.loaded = false // allow needInitialLoad if re-armed on this mount
+	fs.git.loadedAt = time.Time{}
+	fs.git.workspaces = nil
+	fs.git.dormantConfirmed = true
+	fs.git.pendingForce = false
+}
+
+// probeGitWorkspaceIndexAsync starts a background probe with retries on network
+// errors (exponential backoff capped at gitWorkspaceListBackoffMax).
+func (fs *Dat9FS) probeGitWorkspaceIndexAsync() {
+	if fs == nil || fs.git == nil || fs.client == nil || fs.opts == nil || !fs.opts.EnableGitWorkspaces {
+		return
+	}
+	fs.git.mu.Lock()
+	if fs.git.indexProbeDone || fs.git.armed {
+		fs.git.mu.Unlock()
+		return
+	}
+	fs.git.indexProbeDone = true // in-flight; cleared only on hard success/404 confirm
+	fs.git.mu.Unlock()
+
+	go fs.runGitWorkspaceIndexProbeLoop()
+}
+
+func (fs *Dat9FS) runGitWorkspaceIndexProbeLoop() {
+	backoff := gitWorkspaceListBackoffMin
+	for {
+		if fs == nil || fs.git == nil {
+			return
+		}
+		fs.git.mu.Lock()
+		if fs.git.armed || fs.git.dormantConfirmed {
+			fs.git.mu.Unlock()
+			return
+		}
+		fs.git.mu.Unlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), fuseTimeout)
+		err := fs.probeGitWorkspaceIndex(ctx)
+		cancel()
+		if err == nil {
+			return
+		}
+		// Permanent auth/permission failures: stop probing (e.g. fs_scoped cannot
+		// read tenant-root /.drive9/). Do not spin forever; stay dormant.
+		if client.IsForbidden(err) || client.IsUnauthorized(err) {
+			fs.git.mu.Lock()
+			if !fs.git.armed {
+				fs.git.dormantConfirmed = true
+			}
+			fs.git.indexProbeDone = true
+			fs.git.mu.Unlock()
+			safeLogPrintf("git workspace index probe permanent error, staying dormant: %v", err)
+			return
+		}
+		safeLogPrintf("git workspace index probe: %v (retry in %s)", err, backoff)
+		time.Sleep(backoff)
+		if backoff < gitWorkspaceListBackoffMax {
+			backoff *= 2
+			if backoff > gitWorkspaceListBackoffMax {
+				backoff = gitWorkspaceListBackoffMax
+			}
+		}
+	}
+}
+
+func (fs *Dat9FS) probeGitWorkspaceIndex(ctx context.Context) error {
+	if fs == nil || fs.git == nil || fs.client == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	exists, rev, mtime, err := fs.client.StatGitWorkspaceIndex(ctx)
+	if err != nil {
+		// Network error: do not dormant-confirm; caller retries.
+		return err
+	}
+	if !exists {
+		fs.git.mu.Lock()
+		if !fs.git.armed {
+			fs.git.dormantConfirmed = true
+		}
+		fs.git.indexRevision = 0
+		fs.git.indexMtime = time.Time{}
+		fs.git.indexScanAt = time.Now()
+		fs.git.indexProbeDone = true
+		fs.git.mu.Unlock()
+		return nil
+	}
+	// Index exists: read and arm only if entries remain after RemoteRoot filter.
+	idx, gotRev, readErr := fs.client.ReadGitWorkspaceIndex(ctx)
+	if readErr != nil {
+		return readErr
+	}
+	if gotRev != 0 {
+		rev = gotRev
+	}
+	if !client.GitWorkspaceIndexHasEntries(idx) {
+		fs.git.mu.Lock()
+		if !fs.git.armed {
+			fs.git.dormantConfirmed = true
+		}
+		fs.git.indexRevision = rev
+		fs.git.indexMtime = mtime
+		fs.git.indexScanAt = time.Now()
+		fs.git.indexProbeDone = true
+		fs.git.mu.Unlock()
+		return nil
+	}
+	if !fs.gitWorkspaceIndexRelevant(idx) {
+		// Tenant has workspaces elsewhere; this mount stays dormant.
+		fs.git.mu.Lock()
+		if !fs.git.armed {
+			fs.git.dormantConfirmed = true
+		}
+		fs.git.indexRevision = rev
+		fs.git.indexMtime = mtime
+		fs.git.indexScanAt = time.Now()
+		fs.git.indexProbeDone = true
+		fs.git.mu.Unlock()
+		return nil
+	}
+	fs.git.mu.Lock()
+	fs.git.armed = true
+	fs.git.dormantConfirmed = false
+	fs.git.indexRevision = rev
+	fs.git.indexMtime = mtime
+	fs.git.indexScanAt = time.Now()
+	fs.git.indexProbeDone = true
+	fs.git.mu.Unlock()
+	return fs.ensureGitWorkspacesWithRefresh(ctx, true)
+}
+
+func (fs *Dat9FS) gitWorkspaceIndexRelevant(idx *client.GitWorkspaceIndex) bool {
+	if idx == nil || fs == nil {
+		return false
+	}
+	for _, e := range idx.Workspaces {
+		if _, ok := fs.localPath(strings.TrimSuffix(e.RootPath, "/")); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// tryArmFromLocalSignals returns (isArmed, forceReload).
+// forceReload is true when local markers advanced after we were already armed
+// (e.g. same-mount second --fast registering a new workspace id).
+func (fs *Dat9FS) tryArmFromLocalSignals() (armed bool, forceReload bool) {
+	if fs == nil || fs.git == nil || fs.opts == nil {
+		return false, false
+	}
+	localRoot := strings.TrimSpace(fs.opts.LocalRoot)
+	if localRoot == "" {
+		return false, false
+	}
+	now := time.Now()
+	fs.git.mu.Lock()
+	// When already armed, throttle directory stats on the hot path.
+	// When dormant, always re-scan so a just-written marker is not missed
+	// inside the throttle window.
+	if fs.git.armed && !fs.git.localArmScanAt.IsZero() && now.Sub(fs.git.localArmScanAt) < gitWorkspaceLocalArmScanInterval {
+		fs.git.mu.Unlock()
+		return true, false
+	}
+	last := fs.git.localArmMtime
+	wasArmed := fs.git.armed
+	fs.git.localArmScanAt = now
+	fs.git.mu.Unlock()
+
+	signal, newMT := gitcache.LocalArmSignal(context.Background(), localRoot, last)
+	fs.git.mu.Lock()
+	defer fs.git.mu.Unlock()
+	mtimeAdvanced := !newMT.IsZero() && (last.IsZero() || newMT.After(last))
+	if !newMT.IsZero() {
+		fs.git.localArmMtime = newMT
+	}
+	if signal {
+		fs.git.armed = true
+		fs.git.dormantConfirmed = false
+		// New/updated local marker while already armed → must re-list (new workspace id).
+		if wasArmed && mtimeAdvanced {
+			return true, true
+		}
+		return true, false
+	}
+	return fs.git.armed, false
+}
+
+func (fs *Dat9FS) maybeRescanRemoteIndex(ctx context.Context) bool {
+	if fs == nil || fs.git == nil || fs.client == nil {
+		return false
+	}
+	fs.git.mu.Lock()
+	armed := fs.git.armed
+	lastScan := fs.git.indexScanAt
+	prevRev := fs.git.indexRevision
+	prevMT := fs.git.indexMtime
+	fs.git.mu.Unlock()
+	if !armed {
+		return false
+	}
+	if !lastScan.IsZero() && time.Since(lastScan) < gitWorkspaceIndexRescanInterval {
+		return false
+	}
+	exists, rev, mtime, err := fs.client.StatGitWorkspaceIndex(ctx)
+	fs.git.mu.Lock()
+	fs.git.indexScanAt = time.Now()
+	fs.git.mu.Unlock()
+	if err != nil {
+		return false
+	}
+	if !exists {
+		// Only force a list when we previously observed an index that disappeared.
+		if prevRev == 0 && prevMT.IsZero() {
+			return false
+		}
+		return true
+	}
+	if rev != prevRev || (!mtime.IsZero() && mtime.After(prevMT)) {
+		fs.git.mu.Lock()
+		fs.git.indexRevision = rev
+		fs.git.indexMtime = mtime
+		fs.git.mu.Unlock()
+		return true
+	}
+	return false
+}
+
+// notifyGitWorkspaceIndexChanged is called from SSE when the remote index path changes.
+func (fs *Dat9FS) notifyGitWorkspaceIndexChanged() {
+	if fs == nil || fs.git == nil {
+		return
+	}
+	fs.git.mu.Lock()
+	fs.git.dormantConfirmed = false
+	fs.git.indexScanAt = time.Time{} // force rescan
+	// If we were dormant-confirmed empty, re-probe and arm if needed.
+	wasArmed := fs.git.armed
+	fs.git.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), fuseTimeout)
+		defer cancel()
+		if !wasArmed {
+			_ = fs.probeGitWorkspaceIndex(ctx)
+			return
+		}
+		_ = fs.forceRefreshGitWorkspaces(ctx)
+	}()
 }
 
 func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool) error {
 	if fs == nil || fs.git == nil || fs.client == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Singleflight: only one list in flight.
 	fs.git.mu.Lock()
-	if !force && fs.git.loaded && time.Since(fs.git.loadedAt) < gitWorkspaceRefreshInterval {
+	if !fs.git.armed {
 		fs.git.mu.Unlock()
 		return nil
 	}
+	if force {
+		// Sticky + generation so mid-flight force is not cleared by soft success.
+		fs.git.pendingForce = true
+		fs.git.pendingForceGen++
+	}
+	// Backoff applies to soft and forced lists (G4: no op-level storm).
+	if !fs.git.listBackoffUntil.IsZero() && time.Now().Before(fs.git.listBackoffUntil) {
+		fs.git.mu.Unlock()
+		return nil
+	}
+	if fs.git.pendingForce {
+		force = true
+	}
+	// Soft freshness window (skip only when we already have a successful snapshot).
+	if !force && fs.git.loaded && len(fs.git.workspaces) > 0 && time.Since(fs.git.loadedAt) < gitWorkspaceRefreshInterval {
+		fs.git.mu.Unlock()
+		return nil
+	}
+	// After failed load (loaded but empty + failures), allow retry once backoff elapsed.
+	if !force && fs.git.loaded && len(fs.git.workspaces) == 0 && fs.git.listFailures == 0 && time.Since(fs.git.loadedAt) < gitWorkspaceRefreshInterval {
+		fs.git.mu.Unlock()
+		return nil
+	}
+	if fs.git.ensureInflight {
+		wait := fs.git.ensureWait
+		fs.git.mu.Unlock()
+		if wait != nil {
+			select {
+			case <-wait:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		// After waiting: if force arrived mid-flight (pendingForce still set) or
+		// we still lack a snapshot, re-enter as leader.
+		fs.git.mu.Lock()
+		need := fs.git.pendingForce || !fs.git.loaded || len(fs.git.workspaces) == 0
+		fs.git.mu.Unlock()
+		if need {
+			return fs.ensureGitWorkspacesWithRefresh(ctx, true)
+		}
+		return nil
+	}
+	// Capture gen at leader start: only clear pendingForce on success if no
+	// newer force arrived while we were listing.
+	startForceGen := fs.git.pendingForceGen
+	fs.git.ensureInflight = true
+	fs.git.ensureWait = make(chan struct{})
+	waitCh := fs.git.ensureWait
 	fs.git.mu.Unlock()
+	defer func() {
+		fs.git.mu.Lock()
+		fs.git.ensureInflight = false
+		close(waitCh)
+		fs.git.ensureWait = nil
+		fs.git.mu.Unlock()
+	}()
 
 	if fs.perfEnabled() {
 		fs.perf.gitWorkspaceRefresh.add(1)
@@ -145,14 +505,34 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 	listStart := fs.perfStart()
 	workspaces, err := fs.client.ListGitWorkspaces(ctx)
 	if client.IsNotFound(err) {
-		// Expected on servers without git workspaces — not a remote error.
+		// Servers without git workspaces — same as empty list.
 		fs.perfRecordRemote(perfRemoteList, listStart, nil, 0)
-		return nil
+		err = nil
+		workspaces = nil
+	} else {
+		fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	}
-	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
+		fs.git.mu.Lock()
+		fs.git.listFailures++
+		if fs.git.listBackoff == 0 {
+			fs.git.listBackoff = gitWorkspaceListBackoffMin
+		} else {
+			fs.git.listBackoff *= 2
+			if fs.git.listBackoff > gitWorkspaceListBackoffMax {
+				fs.git.listBackoff = gitWorkspaceListBackoffMax
+			}
+		}
+		fs.git.listBackoffUntil = time.Now().Add(fs.git.listBackoff)
+		// Keep previous non-empty snapshot. If we never loaded successfully,
+		// leave loaded=false so needInitialLoad retries after backoff (G1/G2).
+		if len(fs.git.workspaces) == 0 {
+			fs.git.loaded = false
+		}
+		fs.git.mu.Unlock()
 		return err
 	}
+
 	loaded := make([]*gitWorkspaceRuntime, 0, len(workspaces))
 	var loadErrs []error
 	for i := range workspaces {
@@ -177,7 +557,6 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 		overlayStart := fs.perfStart()
 		overlays, err := fs.client.ListGitOverlayEntries(ctx, ws.WorkspaceID)
 		if client.IsNotFound(err) {
-			// Expected when a workspace has no overlay entries yet.
 			err = nil
 		}
 		fs.perfRecordRemote(perfRemoteList, overlayStart, err, 0)
@@ -202,29 +581,75 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 		fs.mergePendingGitOverlayEntries(ws.WorkspaceID, rt.overlay)
 		loaded = append(loaded, rt)
 	}
+	var incomplete error
 	if len(loadErrs) > 0 {
-		err := errors.Join(loadErrs...)
-		safeLogPrintf("git workspace refresh incomplete: %v", err)
-		return err
+		incomplete = errors.Join(loadErrs...)
+		safeLogPrintf("git workspace refresh incomplete: %v", incomplete)
+		// On total failure this round: keep previous non-empty snapshot if any;
+		// otherwise leave loaded=false so post-backoff needInitialLoad retries.
+		if len(loaded) == 0 {
+			fs.git.mu.Lock()
+			fs.git.listFailures++
+			if fs.git.listBackoff == 0 {
+				fs.git.listBackoff = gitWorkspaceListBackoffMin
+			} else {
+				fs.git.listBackoff *= 2
+				if fs.git.listBackoff > gitWorkspaceListBackoffMax {
+					fs.git.listBackoff = gitWorkspaceListBackoffMax
+				}
+			}
+			fs.git.listBackoffUntil = time.Now().Add(fs.git.listBackoff)
+			if len(fs.git.workspaces) == 0 {
+				fs.git.loaded = false
+			} else {
+				fs.git.loaded = true
+				fs.git.loadedAt = time.Now()
+			}
+			fs.git.mu.Unlock()
+			return incomplete
+		}
+		// Partial success: install what we have, still report error.
 	}
 	sort.Slice(loaded, func(i, j int) bool {
 		return len(loaded[i].localRoot) > len(loaded[j].localRoot)
 	})
 	loadedAt := time.Now()
 	for _, rt := range loaded {
-		rt.loadedAt = loadedAt
+		if rt.loadedAt.IsZero() {
+			rt.loadedAt = loadedAt
+		}
 	}
 
 	fs.git.mu.Lock()
 	fs.git.workspaces = loaded
 	fs.git.loaded = true
 	fs.git.loadedAt = loadedAt
+	fs.git.listFailures = 0
+	fs.git.listBackoff = 0
+	fs.git.listBackoffUntil = time.Time{}
+	// Consume sticky force only if no newer force arrived mid-flight.
+	if fs.git.pendingForceGen == startForceGen {
+		fs.git.pendingForce = false
+	}
+	if len(loaded) == 0 {
+		// Empty list: disarm if no local arm signal remains.
+		localRoot := ""
+		if fs.opts != nil {
+			localRoot = strings.TrimSpace(fs.opts.LocalRoot)
+		}
+		fs.git.mu.Unlock()
+		signal, _ := gitcache.LocalArmSignal(ctx, localRoot, time.Time{})
+		fs.git.mu.Lock()
+		if !signal {
+			fs.disarmGitWorkspacesLocked()
+		}
+	}
 	fs.git.mu.Unlock()
 
 	for _, rt := range loaded {
 		fs.maybeStartGitWorkspaceHydrate(rt)
 	}
-	return nil
+	return incomplete
 }
 
 func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*gitWorkspaceRuntime, string, bool) {
@@ -235,15 +660,31 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 		ctx = context.TODO()
 	}
 	baseCtx := ctx
-	ensureCtx, cancel := context.WithTimeout(baseCtx, fuseTimeout)
-	if err := fs.ensureGitWorkspaces(ensureCtx); err != nil {
-		safeLogPrintf("git workspace refresh failed for %s: %v", localPath, err)
+
+	// DORMANT: only arm from local signals (remote index is mount-time / SSE).
+	armed, localForce := fs.tryArmFromLocalSignals()
+	if !armed {
+		return nil, "", false
 	}
-	cancel()
+
+	// Armed: event-driven refresh only (no empty poll).
+	force := localForce
 	if fs.gitWorkspaceCacheInvalidatedLocally(baseCtx) {
+		force = true
+	}
+	if fs.maybeRescanRemoteIndex(baseCtx) {
+		force = true
+	}
+	fs.git.mu.Lock()
+	needInitialLoad := fs.git.armed && !fs.git.loaded
+	if fs.git.pendingForce {
+		force = true
+	}
+	fs.git.mu.Unlock()
+	if force || needInitialLoad {
 		refreshCtx, refreshCancel := context.WithTimeout(baseCtx, fuseTimeout)
-		if err := fs.forceRefreshGitWorkspaces(refreshCtx); err != nil {
-			safeLogPrintf("git workspace forced refresh failed for invalidated cache %s: %v", localPath, err)
+		if err := fs.ensureGitWorkspacesWithRefresh(refreshCtx, true); err != nil {
+			safeLogPrintf("git workspace refresh failed for %s: %v", localPath, err)
 		}
 		refreshCancel()
 	}
@@ -251,7 +692,11 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 	if rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath); ok {
 		return rt, rel, true
 	}
-	if fs.shouldForceRefreshGitWorkspacesForGitStatePath(localPath) {
+	// .git force only when we already have loaded workspaces (not empty dormant arm).
+	fs.git.mu.Lock()
+	hasWS := len(fs.git.workspaces) > 0
+	fs.git.mu.Unlock()
+	if hasWS && fs.shouldForceRefreshGitWorkspacesForGitStatePath(localPath) {
 		refreshCtx, refreshCancel := context.WithTimeout(baseCtx, fuseTimeout)
 		if err := fs.forceRefreshGitWorkspaces(refreshCtx); err != nil {
 			safeLogPrintf("git workspace forced refresh failed for git state path %s: %v", localPath, err)
@@ -2309,14 +2754,14 @@ func (fs *Dat9FS) ensureGitStateForLocalPath(ctx context.Context, localPath stri
 	if ctx == nil {
 		ctx = context.TODO()
 	}
-	refreshCtx, cancel := context.WithTimeout(ctx, fuseTimeout)
-	if err := fs.ensureGitWorkspaces(refreshCtx); err != nil {
-		safeLogPrintf("git workspace refresh failed for %s: %v", localPath, err)
-	}
-	cancel()
-	rt, rel, ok := fs.loadedGitWorkspaceForGitStatePath(localPath)
-	if !ok {
+	// Reuse on-demand arm path; do not list while dormant.
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
+	if !ok || rt == nil {
 		return nil
+	}
+	// Prefer linked-aware git state path resolution when available.
+	if linked, linkedRel, linkedOK := fs.loadedGitWorkspaceForGitStatePath(localPath); linkedOK {
+		rt, rel = linked, linkedRel
 	}
 	if rel == ".git" || strings.HasPrefix(rel, ".git/") {
 		return fs.ensureGitStateRestored(ctx, rt)
@@ -4015,17 +4460,31 @@ func (fs *Dat9FS) removeGitWorkspaceRoot(ctx context.Context, rt *gitWorkspaceRu
 	if rt == nil || fs == nil || fs.client == nil {
 		return gofuse.EIO
 	}
-	if err := fs.client.DeleteGitWorkspace(ctx, rt.workspace.WorkspaceID); err != nil {
+	wsID := rt.workspace.WorkspaceID
+	if err := fs.client.DeleteGitWorkspace(ctx, wsID); err != nil {
 		return httpToFuseStatus(err)
+	}
+	// Keep remote index in sync so remounts stay dormant when the last workspace is gone.
+	if err := fs.client.RemoveGitWorkspaceIndexEntry(ctx, wsID); err != nil {
+		safeLogPrintf("git workspace index remove after delete workspace=%s: %v", wsID, err)
+	}
+	if fs.opts != nil && strings.TrimSpace(fs.opts.LocalRoot) != "" {
+		if err := gitcache.MarkWorkspaceDeleted(ctx, fs.opts.LocalRoot, wsID); err != nil {
+			safeLogPrintf("git workspace local deleted marker workspace=%s: %v", wsID, err)
+		}
 	}
 	fs.git.mu.Lock()
 	for i, candidate := range fs.git.workspaces {
-		if candidate == rt || candidate.workspace.WorkspaceID == rt.workspace.WorkspaceID {
+		if candidate == rt || candidate.workspace.WorkspaceID == wsID {
 			fs.git.workspaces = append(fs.git.workspaces[:i], fs.git.workspaces[i+1:]...)
 			break
 		}
 	}
-	fs.git.loadedAt = time.Now()
+	if len(fs.git.workspaces) == 0 {
+		fs.disarmGitWorkspacesLocked()
+	} else {
+		fs.git.loadedAt = time.Now()
+	}
 	fs.git.mu.Unlock()
 	fs.inodes.Remove(localPath)
 	fs.invalidateReadCacheAndTargets(localPath)

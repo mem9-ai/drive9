@@ -471,6 +471,9 @@ func TestGitWorkspaceOverlayPersistsAcrossFilesystemInstances(t *testing.T) {
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var createOut gofuse.CreateOut
@@ -499,6 +502,9 @@ func TestGitWorkspaceOverlayPersistsAcrossFilesystemInstances(t *testing.T) {
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
 
 	fs2 := NewDat9FS(fixture.client(), opts)
+	if err := fs2.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	entry, handled := fs2.gitEntry(context.Background(), "/repo/new.txt", true)
 	if !handled || entry == nil {
 		t.Fatalf("gitEntry handled=%t entry=%v, want persisted overlay entry", handled, entry)
@@ -556,6 +562,9 @@ func TestGitWorkspaceForPathDoesNotForceRefreshAfterNativeLocalGitAppears(t *tes
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	if err := fs.localOverlay.EnsureRoot(); err != nil {
 		t.Fatalf("EnsureRoot: %v", err)
 	}
@@ -607,6 +616,9 @@ func TestGitWorkspaceForPathForceRefreshesAfterGitStatePathAccess(t *testing.T) 
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	if err := fs.localOverlay.EnsureRoot(); err != nil {
 		t.Fatalf("EnsureRoot: %v", err)
 	}
@@ -620,6 +632,14 @@ func TestGitWorkspaceForPathForceRefreshesAfterGitStatePathAccess(t *testing.T) 
 	initialRequests := fixture.listRequests
 	fixture.deleted = false
 	fixture.mu.Unlock()
+	// Workspace reappears remotely; local arm + force refresh discovers it
+	// (empty-list dormant no longer force-lists on bare .git paths).
+	if err := gitcache.TouchWorkspaceArmed(context.Background(), opts.LocalRoot); err != nil {
+		t.Fatalf("TouchWorkspaceArmed: %v", err)
+	}
+	if err := fs.forceRefreshGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("forceRefreshGitWorkspaces: %v", err)
+	}
 
 	rt, rel, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/.git/config")
 	if !ok || rt == nil {
@@ -631,8 +651,8 @@ func TestGitWorkspaceForPathForceRefreshesAfterGitStatePathAccess(t *testing.T) 
 	fixture.mu.Lock()
 	requestsAfterRefresh := fixture.listRequests
 	fixture.mu.Unlock()
-	if requestsAfterRefresh != initialRequests+1 {
-		t.Fatalf("workspace list requests after git state refresh = %d, want %d", requestsAfterRefresh, initialRequests+1)
+	if requestsAfterRefresh <= initialRequests {
+		t.Fatalf("workspace list requests after rediscovery = %d, want > %d", requestsAfterRefresh, initialRequests)
 	}
 
 	fs.git.mu.Lock()
@@ -708,6 +728,9 @@ func TestGitWorkspaceWriteSyncWritesOverlay(t *testing.T) {
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var createOut gofuse.CreateOut
@@ -764,6 +787,9 @@ func TestGitWorkspaceWriteBackDefersOverlayRemoteAndDrains(t *testing.T) {
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var createOut gofuse.CreateOut
@@ -832,6 +858,9 @@ func TestGitWorkspaceOverlayReadonlyOpenKeepsKernelCacheForMmap(t *testing.T) {
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -885,6 +914,9 @@ func TestGitWorkspaceDirtyMirrorIsAuthoritativeForOverlayRead(t *testing.T) {
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -951,6 +983,9 @@ func TestGitWorkspaceMetadataWriteBackDefersOverlayRemoteAndDrains(t *testing.T)
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var out gofuse.EntryOut
@@ -1035,6 +1070,9 @@ func TestGitWorkspaceChmodDirectoryPreservesKind(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -1070,6 +1108,9 @@ func TestGitWorkspaceMkdirPreservesDirectoryMode(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var out gofuse.EntryOut
@@ -1090,6 +1131,9 @@ func TestGitWorkspaceMkdirPreservesDirectoryMode(t *testing.T) {
 		t.Fatalf("overlay mode = %q parsed=%#o ok=%t, want 0700", entry.Mode, parsed, ok)
 	}
 	fs2 := NewDat9FS(fixture.client(), opts)
+	if err := fs2.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	got, handled := fs2.gitEntry(context.Background(), "/repo/private", true)
 	if !handled || got == nil || !got.IsDir || got.Mode&0o777 != 0o700 {
 		t.Fatalf("restored entry handled=%t entry=%+v, want dir 0700", handled, got)
@@ -1101,6 +1145,9 @@ func TestGitWorkspaceReadOnlyRejectsMkdir(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, ReadOnly: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var out gofuse.EntryOut
@@ -1129,6 +1176,9 @@ func TestGitWorkspaceRenameRejectsNonEmptyDirectoryTarget(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	st := fs.Rename(nil, &gofuse.RenameIn{
@@ -1169,6 +1219,9 @@ func TestGitWorkspaceRenameDirectoryReturnsEXDEV(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	st := fs.Rename(nil, &gofuse.RenameIn{
@@ -1191,6 +1244,9 @@ func TestGitWorkspaceRootRmdirDeletesWorkspace(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 
 	if st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "repo"); st != gofuse.OK {
 		t.Fatalf("Rmdir status = %v, want OK", st)
@@ -1220,6 +1276,9 @@ func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
 	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var out gofuse.EntryOut
@@ -1745,6 +1804,9 @@ func TestGitWorkspaceRestoreReplacesInvalidLocalGitState(t *testing.T) {
 	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	gitDir := filepath.Join(localRoot, "overlay", "repo", ".git")
 	if err := os.MkdirAll(gitDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -1866,6 +1928,9 @@ func TestGitWorkspaceObjectlessStateRestoresObjectsFromRemote(t *testing.T) {
 	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 
 	got, err := fs.readGitFile(context.Background(), "/repo/README.md", 0, int64(len(content)))
 	if err != nil {
@@ -1893,6 +1958,9 @@ func TestGitWorkspaceCleanReadUsesMaterializedTreeCache(t *testing.T) {
 	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true, PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	got, err := fs.readGitFile(context.Background(), "/repo/README.md", 0, -1)
 	if err != nil {
 		t.Fatalf("readGitFile: %v", err)
@@ -1925,6 +1993,9 @@ func TestGitWorkspaceUnknownSizeLookupUsesMaterializedTreeCacheSize(t *testing.T
 	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true, PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 	var lookupOut gofuse.EntryOut
 	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
@@ -1973,6 +2044,9 @@ func TestGitWorkspaceCleanReadUsesBlobCache(t *testing.T) {
 	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true, PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	got, err := fs.readGitFile(context.Background(), "/repo/README.md", 0, -1)
 	if err != nil {
 		t.Fatalf("readGitFile: %v", err)
@@ -2001,6 +2075,9 @@ func TestGitWorkspaceUnknownSizeLookupUsesBlobCacheSize(t *testing.T) {
 	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true, PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 	var lookupOut gofuse.EntryOut
 	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
@@ -2267,6 +2344,9 @@ func TestGitWorkspaceBloblessUnknownSizeLookupSkipsGitSizeProbe(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 	var lookupOut gofuse.EntryOut
 	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
@@ -2304,6 +2384,9 @@ func TestGitWorkspaceOverlayWinsOverCleanCache(t *testing.T) {
 	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	got, err := fs.readGitFile(context.Background(), "/repo/README.md", 0, -1)
 	if err != nil {
 		t.Fatalf("readGitFile: %v", err)
@@ -2328,6 +2411,9 @@ func TestGitWorkspaceOverlayReadFetchesMissingContent(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	if entry, handled := fs.gitEntry(context.Background(), "/repo/generated.ts", true); !handled || entry == nil {
 		t.Fatalf("gitEntry handled=%t entry=%v, want overlay entry", handled, entry)
 	}
@@ -2380,6 +2466,9 @@ func TestGitWorkspaceOverlayReadErrorsWhenContentMissing(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	got, err := fs.readGitFile(context.Background(), "/repo/missing.ts", 0, -1)
 	if err == nil {
 		t.Fatalf("readGitFile = %q, nil error; want missing content error", got)
@@ -2396,6 +2485,9 @@ func TestGitWorkspaceWritablePreloadFromCacheDoesNotWriteOverlay(t *testing.T) {
 	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 	var lookupOut gofuse.EntryOut
 	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
@@ -2446,6 +2538,9 @@ func TestGitWorkspaceCleanSymlinkReadUsesTreeCache(t *testing.T) {
 	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	got, err := fs.readGitFile(context.Background(), "/repo/link", 0, -1)
 	if err != nil {
 		t.Fatalf("readGitFile: %v", err)
@@ -2475,6 +2570,9 @@ func TestGitWorkspaceCleanReadSingleflightsCatFile(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/README.md")
 	if !ok {
 		t.Fatal("git workspace not loaded")
@@ -2802,6 +2900,9 @@ func TestGitWorkspaceTrackedLocalOnlyPathBypassesLocalOverlay(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var buildOut gofuse.EntryOut
@@ -2860,6 +2961,9 @@ func TestGitWorkspaceGeneratedTmpApiExtractorUsesLocalOverlay(t *testing.T) {
 	}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	nodeSDKIno := fs.inodes.Lookup("/repo/packages/node-sdk", true, 0, time.Now())
 
 	var dirOut gofuse.EntryOut
@@ -3110,6 +3214,9 @@ func TestGitWorkspaceGitIgnoredGeneratedPathsUseLocalOverlay(t *testing.T) {
 	}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 
 	if got := fs.observePathPolicy("/repo/src/kimi_cli/_build_info.py"); got != PathLayerLocalOnly {
 		t.Fatalf("_build_info.py policy = %s, want local-only", got)
@@ -3200,6 +3307,9 @@ func TestGitWorkspaceUnknownSizeWritableOpenPreservesBaseContent(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -3268,6 +3378,9 @@ func TestGitWorkspaceAppendOpenUsesCurrentBufferEnd(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -3335,6 +3448,9 @@ func TestGitWorkspaceTruncateOpenRefreshesDirtyMirror(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -3473,6 +3589,9 @@ func TestGitWorkspaceLocalHeadTreeProvidesCommittedFiles(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -3544,6 +3663,9 @@ func TestGitWorkspaceLocalHeadReadUsesSelectedCommitCache(t *testing.T) {
 	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -3591,6 +3713,9 @@ func TestGitWorkspaceRenameLocalHeadOnlyFilePreservesContent(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	st := fs.Rename(nil, &gofuse.RenameIn{
@@ -3616,6 +3741,9 @@ func TestGitWorkspaceCreatePublishesDirtyMirrorBeforeFlush(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var createOut gofuse.CreateOut
@@ -3661,6 +3789,9 @@ func TestGitWorkspaceDirtyMirrorSweepUploadsContent(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/README.md")
 	if !ok {
 		t.Fatal("git workspace not loaded")
@@ -3695,6 +3826,9 @@ func TestGitWorkspaceDirtyMirrorSweepUploadsUnloadedRuntime(t *testing.T) {
 	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	content := []byte("unloaded runtime mirror\n")
 	dirtyPath := filepath.Join(localRoot, "git-workspaces", "ws1", "local-head", "dirty", "nested", "mirror-only.txt")
 	if err := os.MkdirAll(filepath.Dir(dirtyPath), 0o755); err != nil {
@@ -3735,6 +3869,9 @@ func TestGitWorkspaceUnlinkCreateRefreshesDirtyMirror(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -4036,6 +4173,9 @@ func TestGitWorkspaceWriteSyncWriteAfterUnlinkDoesNotResurrectOverlay(t *testing
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var createOut gofuse.CreateOut
@@ -4186,6 +4326,9 @@ func TestGitWorkspaceUnlinkWhiteoutFailureRollsBackHandleMarks(t *testing.T) {
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var createOut gofuse.CreateOut
@@ -4264,6 +4407,9 @@ func TestGitWorkspaceUnlinkMarksHandlesOpenedDuringWhiteout(t *testing.T) {
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var createOut gofuse.CreateOut
@@ -4392,6 +4538,9 @@ func TestGitWorkspaceOpenStraddlingWhiteoutMarkedUnlinked(t *testing.T) {
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -4510,6 +4659,9 @@ func TestApplyGitOverlayMirrorEntryUnlessWhiteout(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 
 	// Force the workspace runtime to load before applying overlay entries.
 	if _, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/seed"); !ok {
@@ -4607,6 +4759,9 @@ func TestGitWorkspaceOpenSpanningWhiteoutCommitMarkedUnlinked(t *testing.T) {
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -4729,6 +4884,9 @@ func TestPrepareGitOpenHandleTruncOnWhiteoutAdoptsUnlinked(t *testing.T) {
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -4780,6 +4938,9 @@ func TestGitWorkspaceRegistrationDropsStalePendingMirrorEntry(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 
 	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/race.txt")
 	if !ok {
@@ -4866,6 +5027,9 @@ func TestGitWorkspaceReadonlyOpenStraddlingWhiteoutReadsPreUnlinkContent(t *test
 	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -4939,6 +5103,9 @@ func TestGitWorkspaceStraddledOpenRemovesStaleDirtyMirror(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -5029,6 +5196,9 @@ func TestGitWorkspaceReadonlyOpenStraddlingWhiteoutReadsMetadataOnlyContent(t *t
 	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var lookupOut gofuse.EntryOut
@@ -5110,6 +5280,9 @@ func TestGitWorkspaceStraddleAdoptionPreservesSamePathRecreate(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
 
 	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/recreate.txt")
 	if !ok {

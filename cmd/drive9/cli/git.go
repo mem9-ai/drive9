@@ -181,6 +181,13 @@ func gitClone(args []string) error {
 	if err := uploadGitStateCheckpoint(cmdCtx, c, ws.WorkspaceID, head, gitDir); err != nil {
 		return err
 	}
+	// Index + local arm before success/hydrate so live mounts and remounts discover us.
+	if err := publishGitWorkspaceIndexEntry(cmdCtx, c, ws); err != nil {
+		return fmt.Errorf("publish git workspace index: %w", err)
+	}
+	if err := markLocalGitWorkspaceRegistered(cmdCtx, resolved, ws.WorkspaceID); err != nil {
+		return fmt.Errorf("mark local git workspace registered: %w", err)
+	}
 
 	fmt.Fprintf(os.Stderr, "drive9: registered git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, resolved.RemotePath, len(nodes))
 	if *blobless {
@@ -199,9 +206,6 @@ func gitClone(args []string) error {
 				fmt.Fprintf(os.Stderr, "drive9: warning: could not start background hydrate: %v\n", err)
 			}
 		}
-	}
-	if err := clearLocalGitWorkspaceDeleted(cmdCtx, resolved, ws.WorkspaceID); err != nil {
-		return fmt.Errorf("clear stale local git workspace deletion marker: %w", err)
 	}
 	return nil
 }
@@ -387,6 +391,12 @@ func gitWorktreeAdd(args []string) error {
 	if err := uploadGitStateCheckpoint(cmdCtx, c, baseWS.WorkspaceID, baseWS.HeadCommit, baseGitDir); err != nil {
 		return fmt.Errorf("checkpoint base .git after worktree add: %w", err)
 	}
+	if err := publishGitWorkspaceIndexEntry(cmdCtx, c, ws); err != nil {
+		return fmt.Errorf("publish linked git workspace index: %w", err)
+	}
+	if err := markLocalGitWorkspaceRegistered(cmdCtx, worktreeResolved, ws.WorkspaceID); err != nil {
+		return fmt.Errorf("mark local linked git workspace registered: %w", err)
+	}
 
 	fmt.Fprintf(os.Stderr, "drive9: registered linked git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, worktreeResolved.RemotePath, len(nodes))
 	if linkedBlobless {
@@ -405,9 +415,6 @@ func gitWorktreeAdd(args []string) error {
 				fmt.Fprintf(os.Stderr, "drive9: warning: could not start background hydrate: %v\n", err)
 			}
 		}
-	}
-	if err := clearLocalGitWorkspaceDeleted(cmdCtx, worktreeResolved, ws.WorkspaceID); err != nil {
-		return fmt.Errorf("clear stale linked git workspace deletion marker: %w", err)
 	}
 	return nil
 }
@@ -509,6 +516,12 @@ func gitWorktreeRemove(args []string) error {
 	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
 		cancel()
 		return fmt.Errorf("delete linked git workspace: %w", err)
+	}
+	cancel()
+	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
+	if err := c.RemoveGitWorkspaceIndexEntry(ctx, ws.WorkspaceID); err != nil {
+		cancel()
+		return fmt.Errorf("remove linked git workspace from index: %w", err)
 	}
 	cancel()
 	var cleanupErrs []error
@@ -824,6 +837,35 @@ func clearLocalGitWorkspaceDeleted(ctx context.Context, resolved mountedGitTarge
 		return fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
 	}
 	return gitcache.ClearWorkspaceDeleted(ctx, localRoot, workspaceID)
+}
+
+func markLocalGitWorkspaceRegistered(ctx context.Context, resolved mountedGitTarget, workspaceID string) error {
+	localRoot := strings.TrimSpace(resolved.LocalRoot)
+	if localRoot == "" || strings.TrimSpace(workspaceID) == "" {
+		return nil
+	}
+	if !filepath.IsAbs(localRoot) {
+		return fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
+	}
+	return gitcache.MarkWorkspaceRegistered(ctx, localRoot, workspaceID)
+}
+
+func publishGitWorkspaceIndexEntry(ctx context.Context, c *client.Client, ws *client.GitWorkspace) error {
+	if c == nil || ws == nil {
+		return fmt.Errorf("publish git workspace index: nil client or workspace")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	kind := strings.TrimSpace(ws.WorkspaceKind)
+	if kind == "" {
+		kind = "main"
+	}
+	return c.UpsertGitWorkspaceIndexEntry(ctx, client.GitWorkspaceIndexEntry{
+		WorkspaceID:   ws.WorkspaceID,
+		RootPath:      ws.RootPath,
+		WorkspaceKind: kind,
+	})
 }
 
 func sameDrive9Mount(a, b mountedGitTarget) bool {
