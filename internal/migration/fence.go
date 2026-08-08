@@ -28,13 +28,17 @@ func (w *Worker) prepareCutoverLocked(ctx context.Context) (Checkpoint, error) {
 	record, err := w.checkpoint.Update(ctx, w.recovery.Record, next)
 	if err != nil {
 		observed, loadErr := w.checkpoint.Load(ctx, next.JobID)
-		if loadErr == nil && sameCheckpointIdentity(observed.Checkpoint, next) && observed.Checkpoint.FenceComplete {
+		if loadErr != nil {
+			w.state.setAttentionReason("fence_intent_outcome_unknown")
+			return Checkpoint{}, fmt.Errorf("%w: fence intent update: %w; reconcile: %w", ErrControlOutcomeUnknown, err, loadErr)
+		}
+		if sameCheckpointIdentity(observed.Checkpoint, next) && observed.Checkpoint.FenceComplete {
 			return w.adoptCompletedFence(observed)
 		}
-		if loadErr == nil && sameCheckpointIdentity(observed.Checkpoint, next) && observed.Checkpoint.FenceIntent {
+		if sameCheckpointIdentity(observed.Checkpoint, next) && observed.Checkpoint.FenceIntent {
 			w.recovery.Record, w.recovery.WritesAllowed = observed, false
 			w.fenceIntent.Store(true)
-		} else if loadErr == nil {
+		} else {
 			w.writesFenced.Store(false)
 		}
 		return Checkpoint{}, err

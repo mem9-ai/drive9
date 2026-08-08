@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"golang.org/x/sys/unix"
 )
 
 func mappingConfig(t *testing.T, jobs string) *Config {
@@ -270,8 +271,8 @@ func TestPreflightRejectsSourceIdentityChangeDuringValidation(t *testing.T) {
 		context.Background(),
 		startup,
 		func(root, _ string) (sourceMountIdentity, error) { return observeSourceRoot(root) },
-		func(name string) (*os.File, error) {
-			file, openErr := os.Open(name)
+		func(sourceRoot *os.Root, relative string) (*os.File, error) {
+			file, openErr := openRootSourceFile(sourceRoot, relative)
 			if openErr == nil && !changed {
 				changed = true
 				replaceSourceRootWithEmptyDirectory(t, root)
@@ -306,7 +307,7 @@ func TestPreflightRejectsUnreadableAndOversizedRegularFiles(t *testing.T) {
 
 	_, err := preflightWithChecks(context.Background(), startup,
 		func(string, string) (bool, error) { return true, nil },
-		func(string) (*os.File, error) { return nil, os.ErrPermission })
+		func(*os.Root, string) (*os.File, error) { return nil, os.ErrPermission })
 	if !errors.Is(err, ErrPreflight) || !strings.Contains(err.Error(), "read access") || remoteHits.Load() != 0 {
 		t.Fatalf("unreadable error=%v remote_hits=%d", err, remoteHits.Load())
 	}
@@ -314,6 +315,45 @@ func TestPreflightRejectsUnreadableAndOversizedRegularFiles(t *testing.T) {
 	_, err = preflightWithVerifier(context.Background(), startup, func(string, string) (bool, error) { return true, nil })
 	if !errors.Is(err, ErrPreflight) || !strings.Contains(err.Error(), "max_upload_bytes") || remoteHits.Load() != 1 {
 		t.Fatalf("oversized error=%v remote_hits=%d", err, remoteHits.Load())
+	}
+}
+
+func TestPreflightRegularToFIFORaceDoesNotBlock(t *testing.T) {
+	root := t.TempDir()
+	name := filepath.Join(root, "file")
+	if err := os.WriteFile(name, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var remoteHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		remoteHits.Add(1)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	startup := preflightStartup(t, server.URL, root)
+	swapped := false
+	err := runSourceOperationWithoutFIFOBlock(t, name, func() error {
+		_, preflightErr := preflightWithChecks(
+			context.Background(),
+			startup,
+			func(string, string) (bool, error) { return true, nil },
+			func(sourceRoot *os.Root, relative string) (*os.File, error) {
+				if !swapped {
+					swapped = true
+					if removeErr := os.Remove(name); removeErr != nil {
+						return nil, removeErr
+					}
+					if fifoErr := unix.Mkfifo(name, 0o600); fifoErr != nil {
+						return nil, fifoErr
+					}
+				}
+				return openRootSourceFile(sourceRoot, relative)
+			},
+		)
+		return preflightErr
+	})
+	if !swapped || !errors.Is(err, ErrPreflight) || !errors.Is(err, ErrSourceChanged) || remoteHits.Load() != 0 {
+		t.Fatalf("FIFO race swapped=%v error=%v remote_hits=%d", swapped, err, remoteHits.Load())
 	}
 }
 

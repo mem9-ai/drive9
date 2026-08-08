@@ -290,16 +290,17 @@ func TestCheckpointLoadRejectsUnstableAndOversizedReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name     string
-		body     []byte
-		unstable bool
-		want     error
+		name      string
+		body      []byte
+		unstable  bool
+		want      error
+		wantReads int32
 	}{
-		{name: "unstable", body: body, unstable: true, want: ErrCheckpointConflict},
+		{name: "unstable", body: body, unstable: true, want: ErrCheckpointConflict, wantReads: 1},
 		{name: "oversized", body: bytes.Repeat([]byte{'x'}, maxCheckpointBytes+1), want: ErrCheckpointMismatch},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var heads atomic.Int32
+			var heads, reads atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.Method {
 				case http.MethodHead:
@@ -309,7 +310,9 @@ func TestCheckpointLoadRejectsUnstableAndOversizedReads(t *testing.T) {
 					}
 					w.Header().Set("X-Dat9-IsDir", "false")
 					w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+					w.Header().Set("Content-Length", strconv.Itoa(len(tc.body)))
 				case http.MethodGet:
+					reads.Add(1)
 					_, _ = w.Write(tc.body)
 				}
 			}))
@@ -317,6 +320,9 @@ func TestCheckpointLoadRejectsUnstableAndOversizedReads(t *testing.T) {
 			store := NewCheckpointStore(driveclient.New(server.URL, ""))
 			if _, err := store.Load(context.Background(), "vol-001"); !errors.Is(err, tc.want) {
 				t.Fatalf("load error=%v, want %v", err, tc.want)
+			}
+			if got := reads.Load(); got != tc.wantReads {
+				t.Fatalf("checkpoint GETs=%d, want %d", got, tc.wantReads)
 			}
 		})
 	}

@@ -93,9 +93,20 @@ func (s *CheckpointStore) Load(ctx context.Context, jobID string) (CheckpointRec
 	if before.IsDir || before.Revision <= 0 {
 		return CheckpointRecord{}, fmt.Errorf("%w: checkpoint type or revision", ErrCheckpointMismatch)
 	}
-	body, err := s.client.ReadCtx(ctx, checkpointPath)
+	if before.Size > maxCheckpointBytes {
+		return CheckpointRecord{}, fmt.Errorf("%w: checkpoint exceeds size limit", ErrCheckpointMismatch)
+	}
+	stream, err := s.client.ReadStreamRange(ctx, checkpointPath, 0, maxCheckpointBytes+1)
 	if err != nil {
 		return CheckpointRecord{}, fmt.Errorf("read checkpoint: %w", err)
+	}
+	body, readErr := io.ReadAll(stream)
+	closeErr := stream.Close()
+	if readErr != nil {
+		return CheckpointRecord{}, fmt.Errorf("read checkpoint: %w", readErr)
+	}
+	if closeErr != nil {
+		return CheckpointRecord{}, fmt.Errorf("close checkpoint: %w", closeErr)
 	}
 	if len(body) > maxCheckpointBytes {
 		return CheckpointRecord{}, fmt.Errorf("%w: checkpoint exceeds size limit", ErrCheckpointMismatch)

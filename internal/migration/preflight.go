@@ -96,14 +96,14 @@ func prefixesOverlap(left, right string) bool {
 
 // Preflight performs the shared read-only plan/run gate for one local Job.
 func Preflight(ctx context.Context, startup *Startup) (PreflightResult, error) {
-	return preflightWithProbe(ctx, startup, observeMountedSource, os.Open)
+	return preflightWithProbe(ctx, startup, observeMountedSource, nil)
 }
 
 func preflightWithVerifier(ctx context.Context, startup *Startup, verifyVolume func(string, string) (bool, error)) (PreflightResult, error) {
-	return preflightWithChecks(ctx, startup, verifyVolume, os.Open)
+	return preflightWithChecks(ctx, startup, verifyVolume, nil)
 }
 
-func preflightWithChecks(ctx context.Context, startup *Startup, verifyVolume func(string, string) (bool, error), openFile func(string) (*os.File, error)) (PreflightResult, error) {
+func preflightWithChecks(ctx context.Context, startup *Startup, verifyVolume func(string, string) (bool, error), openFile func(*os.Root, string) (*os.File, error)) (PreflightResult, error) {
 	probe := func(root, volumeID string) (sourceMountIdentity, error) {
 		identity, err := observeSourceRoot(root)
 		if err != nil {
@@ -115,7 +115,7 @@ func preflightWithChecks(ctx context.Context, startup *Startup, verifyVolume fun
 	return preflightWithProbe(ctx, startup, probe, openFile)
 }
 
-func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string, string) (sourceMountIdentity, error), openFile func(string) (*os.File, error)) (PreflightResult, error) {
+func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string, string) (sourceMountIdentity, error), openFile func(*os.Root, string) (*os.File, error)) (PreflightResult, error) {
 	if startup == nil || startup.Config == nil {
 		return PreflightResult{}, fmt.Errorf("%w: missing startup snapshot", ErrPreflight)
 	}
@@ -130,6 +130,9 @@ func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string
 	if err != nil {
 		return PreflightResult{}, fmt.Errorf("%w: source: %v", ErrPreflight, err)
 	}
+	if openFile != nil {
+		scanner.openFile = openFile
+	}
 	scan, err := scanner.Scan(ctx)
 	if err != nil {
 		return PreflightResult{}, fmt.Errorf("%w: source scan: %w", ErrPreflight, err)
@@ -139,7 +142,7 @@ func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string
 			return PreflightResult{}, fmt.Errorf("%w: source blocker %s", ErrPreflight, finding.Kind)
 		}
 	}
-	if err := verifySourceReadAccess(ctx, scanner, scan, openFile); err != nil {
+	if err := verifySourceReadAccess(ctx, scanner, scan); err != nil {
 		return PreflightResult{}, fmt.Errorf("%w: source read access: %w", ErrPreflight, err)
 	}
 	if startup.Job.Target.Prefix == "/" {
@@ -219,7 +222,7 @@ func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string
 	}, nil
 }
 
-func verifySourceReadAccess(ctx context.Context, scanner *Scanner, scan ScanResult, openFile func(string) (*os.File, error)) error {
+func verifySourceReadAccess(ctx context.Context, scanner *Scanner, scan ScanResult) error {
 	for _, sourcePath := range sortedSourcePaths(scan.Entries) {
 		entry := scan.Entries[sourcePath]
 		if entry.Kind != EntryRegular {
@@ -228,25 +231,12 @@ func verifySourceReadAccess(ctx context.Context, scanner *Scanner, scan ScanResu
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		name, err := scanner.resolvePath(sourceLocalPath(entry))
+		file, err := scanner.openStableSource(sourceLocalPath(entry), entry.Version)
 		if err != nil {
 			return err
 		}
-		file, err := openFile(name)
-		if err != nil {
+		if err := file.close(); err != nil {
 			return err
-		}
-		info, statErr := file.Stat()
-		closeErr := file.Close()
-		if statErr != nil {
-			return statErr
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		identity, identityErr := scanner.identity(name, info)
-		if identityErr != nil || identity.version != entry.Version {
-			return ErrSourceChanged
 		}
 	}
 	return nil

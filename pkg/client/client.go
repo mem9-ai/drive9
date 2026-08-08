@@ -80,7 +80,6 @@ type MigrationEvent struct {
 	VolumeID             string `json:"volume_id"`
 	NodeName             string `json:"node_name"`
 	PodName              string `json:"pod_name"`
-	TenantID             string `json:"tenant_id"`
 	SpaceID              string `json:"space_id"`
 	SourcePath           string `json:"source_path"`
 	TargetPath           string `json:"target_path"`

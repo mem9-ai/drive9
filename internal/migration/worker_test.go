@@ -1406,6 +1406,35 @@ func TestDualUnsafeRevisionBlocksWithoutWrite(t *testing.T) {
 	}
 }
 
+func TestDualPermanentApplyFailureStopsRound(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := &memoryTarget{
+		nodes:         map[string]memoryTargetNode{"a": {data: []byte("old"), revision: 1, mode: 0o100644, resourceID: "target-a"}},
+		failPut:       true,
+		failPutStatus: http.StatusBadRequest,
+	}
+	now := time.Now()
+	worker, server := newDualWorker(t, root, target, time.Minute, &now)
+	defer server.Close()
+	if err := worker.DeepRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := worker.Run(ctx)
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("permanent Apply error=%T %v", err, err)
+	}
+	if !worker.State().Conditions.Attention {
+		t.Fatal("permanent Apply failure did not set Attention")
+	}
+}
+
 func TestDualChangedTokenRemainsPendingAfterUnstableRead(t *testing.T) {
 	root := t.TempDir()
 	name := filepath.Join(root, "a")

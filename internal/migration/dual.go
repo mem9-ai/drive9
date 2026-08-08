@@ -50,7 +50,9 @@ func (w *Worker) dualRound(ctx context.Context, mode RoundMode, id string, start
 		}
 		if err := w.apply.ApplyWithManifest(ctx, expired, source.Entries, target.Entries); err != nil {
 			if errors.Is(err, ErrUnsafeApply) || (!retryableWorkerError(err) && !isAuthError(err)) {
-				unsafe = true
+				w.state.SetAttention(true)
+				w.state.FailRound(id, "apply")
+				return err
 			} else {
 				for path, entry := range expired {
 					w.state.queueRetry(path, entry.Version, classifyRetry(err), w.clock())
