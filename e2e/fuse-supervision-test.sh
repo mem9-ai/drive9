@@ -556,7 +556,7 @@ if [ "$RUN_ENSURE_SMOKE" = "1" ]; then
   kill_supervisor_tree
   sleep 1
 
-  # Product contract under test: ensure (not the harness) must clean a dead
+  # Product contract under test: ensure (not the test script) must clean a dead
   # FUSE superblock / restart from stored Args. Do NOT force_unmount first.
   # Prefer "still mounted but unhealthy"; if the kernel already dropped the
   # mount, ensure still has to rebuild from stored state — that is also valid.
@@ -601,7 +601,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# C. --supervise-foreground smoke (AGS-style blocking supervisor)
+# C. --supervise-foreground smoke (blocking supervisor (sandbox entrypoint))
 # ---------------------------------------------------------------------------
 if [ "$RUN_FOREGROUND_SMOKE" = "1" ]; then
   echo "[10] --supervise-foreground smoke"

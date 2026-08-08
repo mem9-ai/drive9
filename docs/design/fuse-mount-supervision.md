@@ -9,7 +9,7 @@
 
 ## 1. Problem summary
 
-In long-lived agent sandboxes (for example Kimi project sessions on Tencent AGS), the drive9 FUSE daemon is a critical process that currently has **orphan semantics and a success-biased exit path**. When it dies, customers see a dead mountpoint (`ENOTCONN` / "Transport endpoint is not connected") with no clear reason, no automatic recovery, and no platform-agnostic supervisor.
+In long-lived agent sandboxes, the drive9 FUSE daemon is a critical process that currently has **orphan semantics and a success-biased exit path**. When it dies, customers see a dead mountpoint (`ENOTCONN` / "Transport endpoint is not connected") with no clear reason, no automatic recovery, and no platform-agnostic supervisor.
 
 ### 1.1 What fails today (mapped to code)
 
@@ -39,8 +39,8 @@ This is not primarily a FUSE durability bug. It is a **process lifecycle / super
 - Long-lived sandbox (~17h) with FUSE mount at `/mnt/agents`.
 - Daemon dies mid-session; no auto-reconnect.
 - Fingerprints: `Transport endpoint is not connected` (ENOTCONN after daemon death), `Software caused connection abort` (ECONNABORTED, often daemon↔server path).
-- Mount flags example: `drive9 mount --mode=fuse -allow-other -readdir-prefetch --parallel-read-concurrency 8 --read-concurrency 48 --profile kimi-project :/projects/<id> /mnt/agents`
-- Temporary mitigation: customer-pasted systemd units with healthcheck + `Restart=always` (side effect: `drive9 umount` exit 0 causes restart unless `systemctl stop`). AGS sandboxes often have **no systemd**.
+- Mount flags example: `drive9 mount --mode=fuse -allow-other -readdir-prefetch --parallel-read-concurrency 8 --read-concurrency 48 --profile coding-agent :/path /mnt/drive9`
+- Temporary mitigation: pasted systemd units with healthcheck + `Restart=always` (side effect: `drive9 umount` exit 0 causes restart unless `systemctl stop`). Many sandboxes have **no systemd**.
 
 ---
 
@@ -51,7 +51,7 @@ This is not primarily a FUSE durability bug. It is a **process lifecycle / super
 1. **Distinguish clean stop vs abnormal death** via exit codes + structured logs.
 2. **Never leave a silent success exit** when the serve loop ended unexpectedly.
 3. **Best-effort stale mount cleanup** whenever a process that owns the mount dies with a chance to run (signals, Wait return, panic recovery, supervisor reaping).
-4. **Built-in supervisor** that works with **no systemd** (containers, AGS sandboxes, macOS user sessions).
+4. **Built-in supervisor** that works with **no systemd** (containers, sandboxes, macOS user sessions).
 5. **Intentional stop does not restart** (`drive9 umount` stays correct).
 6. **Bounded auto-restart** with backoff and permanent-failure classification.
 7. **Healthcheck** that detects dead mounts and wedged daemons, not just process liveness.
@@ -82,13 +82,13 @@ drive9 mount …                      # CLI parent: wait ready, exit 0 (UX uncha
 | Mode | Flag | Behavior | Primary use |
 | --- | --- | --- | --- |
 | Supervised detach | **default** for background | CLI spawns supervisor, returns after ready | desktop / VM / containers without orphan reapers |
-| Supervised foreground | `--supervise-foreground` | CLI process **is** supervisor, blocks | **AGS / Kimi sandboxes**, systemd `ExecStart` |
+| Supervised foreground | `--supervise-foreground` | CLI process **is** supervisor, blocks | long-lived sandboxes that keep a main process; systemd `ExecStart` |
 | Legacy | `--no-supervise` | today's single orphan daemon | escape hatch |
 
 **Hard constraints:**
 
 - **Worker is never `Setsid`.** It must remain a child of the supervisor so the supervisor can `waitpid`, signal, and probe it.
-- Supervisor may detach for background mode only. For AGS, prefer `--supervise-foreground` so the mount tree is not an orphan session leader that platform orphan-process cleaners target.
+- Supervisor may detach for background mode only. Prefer `--supervise-foreground` when the environment may reap orphan session leaders, so the mount tree stays a first-class process.
 - systemd is a **P2 supplement**, not the product primary path.
 
 **Why supervisor-outside-worker (not self-restart inside Mount):**
@@ -97,7 +97,7 @@ drive9 mount …                      # CLI parent: wait ready, exit 0 (UX uncha
 | --- | --- | --- | --- | --- |
 | In-daemon restart only | No | Only if something external cleans | Hard | Low but incomplete |
 | Parent supervisor (**chosen**) | Yes | Yes | Easy | Medium |
-| systemd only | Yes on systemd hosts | Via units | Easy | Low, **fails AGS** |
+| systemd only | Yes on systemd hosts | Via units | Easy | Low, **fails without systemd** |
 
 **Who watches the supervisor?** In-binary, nobody. If the whole process tree is killed, platforms use `drive9 mount ensure` as the reconcile primitive (entrypoint loop, cron, container `HEALTHCHECK`).
 
@@ -324,7 +324,7 @@ No dependency on drive9-server for mount-local reliability alerts.
 | --- | --- | --- |
 | *(default background)* | supervise on | background supervisor + worker |
 | `--foreground` | off | worker only, blocking (tests / external supervisors) |
-| `--supervise-foreground` | off | this process is supervisor, blocks (AGS-friendly) |
+| `--supervise-foreground` | off | this process is supervisor, blocks (sandbox-friendly) |
 | `--no-supervise` | off | legacy single background worker |
 | `--max-restarts N` | 5 | circuit window budget |
 | `--restart-window dur` | 10m | circuit window |
@@ -464,7 +464,7 @@ Live open file descriptors held by workloads at crash time get EIO/ENOTCONN — 
 | `mount status`, `mount ensure` | new CLI files; `MountCmd` dispatch |
 | Readiness handshake for supervisor child | `waitForBackgroundMountReady*` |
 | Tests: kill -9 restart, umount no restart, max restarts, stop races | unit + e2e |
-| Docs: AGS / openclaw recipe → `--supervise-foreground` / `ensure` | docs |
+| Docs: sandbox recipe → `--supervise-foreground` / `ensure` | docs |
 
 **Acceptance:**
 
@@ -504,7 +504,7 @@ drive9 umount /mnt/agents
 | `drive9 umount` races restart | Stop token **before** signal; STOPPING checked before every restart |
 | PID reuse kills wrong process | Always store/check `CreationTime` |
 | Double mounts | Pre-start stale detect + refuse healthy live mount owned by other PID; flock |
-| Setsid/orphan GC still kills supervisor | Document `--supervise-foreground` / `mount ensure` as AGS entrypoint |
+| Setsid/orphan GC still kills supervisor | Document `--supervise-foreground` / `mount ensure` as sandbox entrypoint |
 | Lazy unmount leaves busy mounts weird | Lazy only on death path; graceful umount tries normal first |
 | Credential snapshot sensitive | Keep 0600; status file must **not** include secrets |
 | Supervisor dies, worker lives | Worker remains usable; umount can still signal worker; `ensure` adopts |
@@ -520,10 +520,10 @@ drive9 umount /mnt/agents
 ## 7. Recommended customer recipes
 
 ```bash
-# Preferred in sandboxes that keep a main process / have orphan reapers (AGS):
+# Preferred in sandboxes that keep a main process / have orphan reapers:
 drive9 mount --supervise-foreground --mode=fuse -allow-other \
   -readdir-prefetch --parallel-read-concurrency 8 --read-concurrency 48 \
-  --profile kimi-project :/projects/<id> /mnt/agents
+  --profile coding-agent :/path /mnt/drive9
 
 # Or platform-side periodic reconcile:
 drive9 mount ensure /mnt/agents
@@ -553,7 +553,7 @@ drive9 doctor fuse --mountpoint /mnt/agents
 | Intentional stop | **Stop token + umount → supervisor exit 0, no restart** |
 | Health | Supervisor-side local FUSE probe + consecutive failure threshold |
 | Storm control | Exit taxonomy + circuit breaker (5 / 10m) |
-| AGS integration | `--supervise-foreground` and/or `mount ensure` |
+| Sandbox integration | `--supervise-foreground` and/or `mount ensure` |
 | Ship order | **P0 → P1 → P2** |
 | Product answer | Not "paste a systemd unit" |
 
@@ -561,7 +561,7 @@ drive9 doctor fuse --mountpoint /mnt/agents
 
 ## 9. Consensus record
 
-This design was produced by synthesizing three independent design proposals (Grok, Kimi, Deepseek) and an approval round. All three reviewers **APPROVED** the consensus plan, including:
+This design captures the agreed implementation plan for in-binary mount supervision:
 
 - Supervisor + worker process model without requiring systemd
 - P0 honest exit classification via `unmountRequested` + `activeMountPoint`
@@ -569,9 +569,9 @@ This design was produced by synthesizing three independent design proposals (Gro
 - Stop token + SIGTERM supervisor for intentional stop
 - Circuit breaker stay-alive semantics with `circuit_open`
 - `mount ensure` as the no-systemd platform reconcile primitive
-- `--supervise-foreground` as the AGS/orphan-reaper recipe
+- `--supervise-foreground` as the sandbox/orphan-reaper recipe
 
-Non-blocking preferences from the approval round are incorporated above as implementation constraints (intent-first restart, circuit open force-unmount, persist sanitized Args, readiness handshake change, RUNNING-only health counting, adopt-by-monitor caveats).
+Implementation constraints include intent-first restart, circuit open force-unmount, persist sanitized Args, readiness handshake change, RUNNING-only health counting, and adopt-by-monitor caveats.
 
 ---
 
