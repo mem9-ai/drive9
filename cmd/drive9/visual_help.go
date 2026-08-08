@@ -717,7 +717,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 		{
 			Name:    "mount",
 			Args:    "[flags] [:/remote] <mountpoint>",
-			Summary: "mount drive9 as a local filesystem",
+			Summary: "mount drive9 as a local filesystem (supervised by default)",
 			Sections: []visualHelpSection{
 				{Title: "Connection", Flags: []visualHelpFlag{
 					{Name: "--server URL", Desc: "drive9 server URL; overrides DRIVE9_SERVER and config"},
@@ -725,6 +725,19 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "--mode auto|fuse|webdav", Desc: "mount mode; auto selects the best supported mode"},
 					{Name: "--foreground", Desc: "run in foreground and block until unmounted"},
 					{Name: "--direct-mount-strict", Desc: "Linux only; use mount(2) without fallback to fusermount"},
+				}},
+				{Title: "Supervision", Flags: []visualHelpFlag{
+					{Name: "--supervise-foreground", Desc: "run this process as the supervisor and block until stop"},
+					{Name: "--no-supervise", Desc: "legacy fire-and-forget background mount without supervisor"},
+					{Name: "--max-restarts N", Desc: "supervisor max restarts within the restart window; default 5"},
+					{Name: "--restart-window DURATION", Desc: "sliding window for restart budget; default 10m"},
+					{Name: "--health-interval DURATION", Desc: "supervisor FUSE health probe interval; default 10s"},
+					{Name: "--health-timeout DURATION", Desc: "supervisor health probe timeout; default 5s"},
+					{Name: "--health-failures N", Desc: "consecutive health failures before worker restart; default 3"},
+					{Name: "--stop-timeout DURATION", Desc: "SIGTERM to SIGKILL grace for worker stop; default 60s"},
+					{Name: "--restart-backoff-max DURATION", Desc: "maximum restart backoff; default 30s"},
+					{Name: "--alert-webhook URL", Desc: "optional webhook for restart / give-up / healthkill events"},
+					{Name: "--alert-file PATH", Desc: "optional append-only file for mount alert events"},
 				}},
 				{Title: "Read cache", Flags: []visualHelpFlag{
 					{Name: "--cache-dir DIR", Desc: "write-back cache directory; default ~/.cache/drive9"},
@@ -787,10 +800,44 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				}},
 			},
 			Examples: []visualHelpExample{
-				{Command: "drive9 mount :/ ./mnt", Desc: "mount root"},
+				{Command: "drive9 mount :/ ./mnt", Desc: "supervised background mount (default)"},
+				{Command: "drive9 mount --supervise-foreground :/ ./mnt", Desc: "block as supervisor (sandbox entrypoint)"},
 				{Command: "drive9 mount --profile coding-agent :/workspace ./mnt", Desc: "profile mount"},
 				{Command: "drive9 mount --layer layer_123 --checkpoint cp_456 :/team ./mnt", Desc: "restore a layer checkpoint before mounting"},
-				{Command: "drive9 mount --perf-dir ./perf --foreground :/ ./mnt", Desc: "foreground mount with profiling outputs"},
+				{Command: "drive9 mount --perf-dir ./perf --foreground :/ ./mnt", Desc: "foreground worker only with profiling outputs"},
+			},
+		},
+		{
+			Name:    "mount status",
+			Args:    "[--json] <mountpoint>",
+			Summary: "show supervised mount health and process state",
+			Flags: []visualHelpFlag{
+				{Name: "--json", Desc: "emit machine-readable status JSON"},
+			},
+			Examples: []visualHelpExample{
+				{Command: "drive9 mount status ./mnt", Desc: "human status: healthy, pids, restarts"},
+				{Command: "drive9 mount status --json ./mnt", Desc: "JSON for scripts and platforms"},
+			},
+		},
+		{
+			Name:    "mount health",
+			Args:    "<mountpoint>",
+			Summary: "exit 0 if the mount is healthy, else 1",
+			Examples: []visualHelpExample{
+				{Command: "drive9 mount health ./mnt", Desc: "probe process + FUSE path readiness"},
+			},
+		},
+		{
+			Name:    "mount ensure",
+			Args:    "[--reset] [--restart] <mountpoint>",
+			Summary: "idempotently repair or start a supervised mount",
+			Flags: []visualHelpFlag{
+				{Name: "--reset", Desc: "clear circuit-breaker state before ensure"},
+				{Name: "--restart", Desc: "force restart even if currently healthy"},
+			},
+			Examples: []visualHelpExample{
+				{Command: "drive9 mount ensure ./mnt", Desc: "heal stale/dead mounts from stored args"},
+				{Command: "drive9 mount ensure --reset ./mnt", Desc: "reset restart budget then ensure"},
 			},
 		},
 		{
@@ -804,6 +851,19 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			Examples: []visualHelpExample{
 				{Command: "drive9 mount drain ./mnt --timeout=30s", Desc: "wait until a mounted filesystem is pause-ready"},
 				{Command: "drive9 mount drain ./mnt --json", Desc: "inspect queue depth, failed path, and phase timings"},
+			},
+		},
+		{
+			Name:    "mount systemd-unit",
+			Args:    "[--install] [--name name] [mount flags] <mountpoint>",
+			Summary: "print or install a systemd unit for a supervised mount",
+			Flags: []visualHelpFlag{
+				{Name: "--install", Desc: "write unit to ~/.config/systemd/user/"},
+				{Name: "--name NAME", Desc: "unit name without .service suffix; default drive9-mount"},
+			},
+			Examples: []visualHelpExample{
+				{Command: "drive9 mount systemd-unit --mode=fuse :/ ./mnt", Desc: "print unit with ExecStart/ExecStop"},
+				{Command: "drive9 mount systemd-unit --install --name work :/work ./mnt", Desc: "install a user unit"},
 			},
 		},
 		{
@@ -827,6 +887,9 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			Name:    "umount",
 			Args:    "[flags] <mountpoint>",
 			Summary: "unmount a drive9 mount and optionally pack overlay state",
+			Details: []string{
+				"for supervised mounts, writes a stop token and SIGTERM the supervisor so the mount does not restart",
+			},
 			Flags: []visualHelpFlag{
 				{Name: "--timeout DURATION", Desc: "wait for flush/unmount"},
 				{Name: "--pack :/archive.tar.gz", Desc: "write pack archive before unmount"},
@@ -834,7 +897,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Name: "--no-auto-pack", Desc: "skip configured auto-pack"},
 			},
 			Examples: []visualHelpExample{
-				{Command: "drive9 umount ./mnt", Desc: "clean unmount"},
+				{Command: "drive9 umount ./mnt", Desc: "clean unmount (no supervisor restart)"},
 				{Command: "drive9 umount --pack :/packs/work.tar.gz ./mnt", Desc: "pack on unmount"},
 			},
 		},
@@ -843,7 +906,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			Args:    "fuse",
 			Summary: "diagnose local runtime prerequisites",
 			Flags: []visualHelpFlag{
-				{Name: "--mountpoint PATH", Desc: "mountpoint path to inspect"},
+				{Name: "--mountpoint PATH", Desc: "mountpoint path to inspect (includes supervision/stale checks)"},
 				{Name: "--cache-dir DIR", Desc: "cache directory to inspect"},
 				{Name: "--server URL", Desc: "drive9 server URL to check"},
 				{Name: "--timeout DURATION", Desc: "server connectivity timeout"},

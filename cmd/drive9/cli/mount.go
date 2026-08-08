@@ -130,7 +130,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
 	mode := fs.String("mode", "auto", "mount mode: auto, fuse, or webdav")
 	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
-	superviseForeground := fs.Bool("supervise-foreground", false, "run as in-process supervisor (blocks; AGS/systemd friendly)")
+	superviseForeground := fs.Bool("supervise-foreground", false, "run as in-process supervisor and block until stop (sandbox/systemd friendly)")
 	noSupervise := fs.Bool("no-supervise", false, "legacy fire-and-forget background mount without supervisor")
 	supervised := fs.Bool("supervised", false, "internal: worker managed by supervisor")
 	maxRestarts := fs.Int("max-restarts", 5, "supervisor max restarts within restart window")
