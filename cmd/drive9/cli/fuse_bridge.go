@@ -87,6 +87,7 @@ type mountFuseOptions struct {
 	PerfMaxSamples          int
 	PerfMaxSampleFiles      int
 	PerfMaxProfileFiles     int
+	Supervised              bool
 }
 
 type vaultMountOptions struct {
