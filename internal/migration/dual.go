@@ -192,7 +192,14 @@ func (w *Worker) refreshDualTarget(ctx context.Context, path string, source Sour
 		return err
 	}
 	kind := targetKind(client.BatchStatResult{IsDir: stat.IsDir, Mode: stat.Mode, HasMode: stat.HasMode})
-	entries[path] = TargetEntry{Path: path, Kind: kind, Size: stat.Size, Mode: stat.Mode & 0o777, HasMode: stat.HasMode, Revision: stat.Revision, ResourceID: stat.ResourceID, Nlink: stat.Nlink, ChecksumSHA256: stat.ChecksumSHA256}
+	entry := TargetEntry{Path: path, Kind: kind, Size: stat.Size, Mode: stat.Mode & 0o777, HasMode: stat.HasMode, Revision: stat.Revision, ResourceID: stat.ResourceID, Nlink: stat.Nlink, ChecksumSHA256: stat.ChecksumSHA256}
+	for existingPath, existing := range entries {
+		if existingPath != path && existing.Kind == EntryRegular && existing.ResourceID == entry.ResourceID {
+			existing.Nlink = entry.Nlink
+			entries[existingPath] = existing
+		}
+	}
+	entries[path] = entry
 	return nil
 }
 

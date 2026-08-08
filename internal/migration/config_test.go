@@ -251,6 +251,29 @@ func TestConfigHashCoversOnlySelectedEffectiveJob(t *testing.T) {
 	}
 }
 
+func TestConfigHashExcludesNodeAssignment(t *testing.T) {
+	cfg, err := LoadConfig(writeConfig(t, validConfigYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := cfg.SelectJob("node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := ConfigHash(cfg, job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job.NodeName = "replacement-node"
+	after, err := ConfigHash(cfg, job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("node assignment changed config_hash: %s != %s", before, after)
+	}
+}
+
 func TestLoadStartupRejectsMissingCredential(t *testing.T) {
 	_, err := LoadStartup(writeConfig(t, validConfigYAML), "node-a", string(PhaseSyncing), t.TempDir(), "")
 	if err == nil || strings.Contains(err.Error(), "Bearer") {

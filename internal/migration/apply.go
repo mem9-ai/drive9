@@ -125,7 +125,8 @@ func (e *ApplyEngine) ApplyWithManifest(ctx context.Context, source, manifest ma
 			}
 		}
 	}
-	if err := e.applyFilePools(ctx, files, target); err != nil {
+	ownedLinks := targetOwnedLinkCounts(manifest, target)
+	if err := e.applyFilePools(ctx, files, target, ownedLinks); err != nil {
 		return err
 	}
 	for _, entry := range files {
@@ -141,8 +142,9 @@ func (e *ApplyEngine) ApplyWithManifest(ctx context.Context, source, manifest ma
 		}
 		target[entry.Path] = TargetEntry{Path: entry.Path, Kind: EntryRegular, Size: stat.Size, Mode: stat.Mode & 0o777, HasMode: true, Revision: stat.Revision, ResourceID: stat.ResourceID, Nlink: stat.Nlink, ChecksumSHA256: stat.ChecksumSHA256}
 	}
+	ownedLinks = targetOwnedLinkCounts(manifest, target)
 	for _, entry := range links {
-		if err := e.applyLink(ctx, entry, manifest, target, primaries); err != nil {
+		if err := e.applyLink(ctx, entry, manifest, target, primaries, ownedLinks); err != nil {
 			return err
 		}
 	}
@@ -191,7 +193,7 @@ func validateApplyEntry(phase Phase, source SourceEntry, target TargetEntry, exi
 	return nil
 }
 
-func (e *ApplyEngine) applyFilePools(ctx context.Context, files []SourceEntry, target map[string]TargetEntry) error {
+func (e *ApplyEngine) applyFilePools(ctx context.Context, files []SourceEntry, target map[string]TargetEntry, ownedLinks map[targetLinkOwner]uint32) error {
 	small, large := make([]SourceEntry, 0), make([]SourceEntry, 0)
 	for _, entry := range files {
 		if entry.Version.Size < e.config.SmallFileThreshold {
@@ -203,8 +205,12 @@ func (e *ApplyEngine) applyFilePools(ctx context.Context, files []SourceEntry, t
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errorsByPool := make(chan error, 2)
-	go func() { errorsByPool <- e.runFileWorkers(ctx, cancel, small, target, e.config.SmallWorkers) }()
-	go func() { errorsByPool <- e.runFileWorkers(ctx, cancel, large, target, e.config.LargeWorkers) }()
+	go func() {
+		errorsByPool <- e.runFileWorkers(ctx, cancel, small, target, ownedLinks, e.config.SmallWorkers)
+	}()
+	go func() {
+		errorsByPool <- e.runFileWorkers(ctx, cancel, large, target, ownedLinks, e.config.LargeWorkers)
+	}()
 	var first error
 	for range 2 {
 		if err := <-errorsByPool; err != nil && first == nil {
@@ -215,7 +221,7 @@ func (e *ApplyEngine) applyFilePools(ctx context.Context, files []SourceEntry, t
 	return first
 }
 
-func (e *ApplyEngine) runFileWorkers(ctx context.Context, cancel context.CancelFunc, files []SourceEntry, target map[string]TargetEntry, workers int) error {
+func (e *ApplyEngine) runFileWorkers(ctx context.Context, cancel context.CancelFunc, files []SourceEntry, target map[string]TargetEntry, ownedLinks map[targetLinkOwner]uint32, workers int) error {
 	tasks := make(chan SourceEntry, len(files))
 	for _, entry := range files {
 		tasks <- entry
@@ -233,7 +239,7 @@ func (e *ApplyEngine) runFileWorkers(ctx context.Context, cancel context.CancelF
 					return
 				}
 				observed, exists := target[entry.Path]
-				if err := e.applyRegular(ctx, entry, observed, exists); err != nil {
+				if err := e.applyRegular(ctx, entry, observed, exists, ownedLinks); err != nil {
 					once.Do(func() { first = err; cancel() })
 					return
 				}
@@ -244,7 +250,7 @@ func (e *ApplyEngine) runFileWorkers(ctx context.Context, cancel context.CancelF
 	return first
 }
 
-func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, observed TargetEntry, exists bool) error {
+func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, observed TargetEntry, exists bool, ownedLinks map[targetLinkOwner]uint32) error {
 	deep, err := e.scanner.ReadStableEntry(ctx, source)
 	if err != nil {
 		return fmt.Errorf("hash source %s: %w", source.Path, err)
@@ -254,8 +260,10 @@ func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, obse
 	if err != nil {
 		return err
 	}
-	if current != nil && current.Nlink != observed.Nlink {
-		return fmt.Errorf("%w: target link count changed at %s", ErrApplyRescan, source.Path)
+	if current != nil {
+		if err := validateTargetLinkOwnership(source, observed, current, ownedLinks); err != nil {
+			return err
+		}
 	}
 	if current != nil && current.Size == deep.Size && current.ChecksumSHA256 == deep.ChecksumSHA256 {
 		return e.validateSourceEntry(source)
@@ -294,6 +302,20 @@ func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, obse
 		return fmt.Errorf("%w: post-T0 mode mismatch at %s", ErrUnsafeApply, source.Path)
 	}
 	return e.validateSourceEntry(source)
+}
+
+func validateTargetLinkOwnership(source SourceEntry, observed TargetEntry, current *client.StatResult, ownedLinks map[targetLinkOwner]uint32) error {
+	if current == nil {
+		return fmt.Errorf("%w: missing target link identity at %s", ErrApplyVerification, source.Path)
+	}
+	if current.Nlink != observed.Nlink {
+		return fmt.Errorf("%w: target link count changed at %s", ErrApplyRescan, source.Path)
+	}
+	owner := targetLinkOwner{source: targetLinkSourceOwner(source), resource: current.ResourceID}
+	if current.Nlink == 0 || current.Nlink != ownedLinks[owner] {
+		return fmt.Errorf("%w: target has unowned hardlinks at %s", ErrUnsafeApply, source.Path)
+	}
+	return nil
 }
 
 func (e *ApplyEngine) currentTarget(ctx context.Context, remote string, observed TargetEntry, exists bool) (int64, *client.StatResult, error) {
@@ -344,7 +366,7 @@ func (e *ApplyEngine) validateSource(sourcePath string, expected SourceVersion) 
 	return e.scanner.validateSourcePath(sourcePath, expected)
 }
 
-func (e *ApplyEngine) applyLink(ctx context.Context, entry SourceEntry, source map[string]SourceEntry, target map[string]TargetEntry, primaries map[string]string) error {
+func (e *ApplyEngine) applyLink(ctx context.Context, entry SourceEntry, source map[string]SourceEntry, target map[string]TargetEntry, primaries map[string]string, ownedLinks map[targetLinkOwner]uint32) error {
 	if err := e.validateSourceEntry(entry); err != nil {
 		return err
 	}
@@ -370,6 +392,9 @@ func (e *ApplyEngine) applyLink(ctx context.Context, entry SourceEntry, source m
 		_, primaryStat, err := e.currentTarget(ctx, targetRemotePath(e.config.Prefix, primary.Path, false), primaryObserved, true)
 		if err != nil {
 			return fmt.Errorf("hardlink primary %s: %w", primary.Path, err)
+		}
+		if err := validateTargetLinkOwnership(primary, primaryObserved, primaryStat, ownedLinks); err != nil {
+			return err
 		}
 		if primaryStat == nil || primaryStat.ResourceID == "" || primaryStat.Size != deep.Size || primaryStat.ChecksumSHA256 != deep.ChecksumSHA256 {
 			return fmt.Errorf("%w: hardlink primary identity at %s", ErrApplyVerification, primary.Path)

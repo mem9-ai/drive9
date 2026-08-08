@@ -100,6 +100,32 @@ func TestVerifyFullInterruptedAttemptCanBeRetried(t *testing.T) {
 	}
 }
 
+func TestVerifyFullDoesNotPassSourceChangeDuringTargetInventory(t *testing.T) {
+	root := t.TempDir()
+	filePath := filepath.Join(root, "a")
+	if err := os.WriteFile(filePath, []byte("same"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := &memoryTarget{nodes: map[string]memoryTargetNode{"a": {data: []byte("same"), revision: 1, mode: 0o100644, resourceID: "id"}}}
+	now := time.Now()
+	worker, server := newDualWorker(t, root, target, time.Minute, &now)
+	defer server.Close()
+	if err := worker.DeepRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	target.afterList = func() {
+		if err := os.WriteFile(filePath, []byte("changed-content"), 0o644); err != nil {
+			t.Error(err)
+		}
+	}
+	worker.retryWait = func(context.Context, time.Duration) error { return context.Canceled }
+
+	result, err := worker.VerifyFull(context.Background())
+	if !errors.Is(err, context.Canceled) || result.Status == "passed" {
+		t.Fatalf("verification=%+v err=%v", result, err)
+	}
+}
+
 func TestVerifyFullRetriesMoreThanFourSourceChanges(t *testing.T) {
 	root := t.TempDir()
 	filePath := filepath.Join(root, "a")

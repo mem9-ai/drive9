@@ -204,11 +204,11 @@ func TestBuildRoundClassifiesDiffsAndMissingChecksum(t *testing.T) {
 	}}
 	target := TargetScan{Complete: true, Entries: map[string]TargetEntry{
 		"/target-only": {Path: "/target-only", Kind: EntryRegular, Revision: 1, ResourceID: "extra", HasMode: true, Mode: 0o644},
-		"/content":     {Path: "/content", Kind: EntryRegular, Size: 4, Revision: 1, ResourceID: "content", HasMode: true, Mode: 0o644, ChecksumSHA256: checksumB},
-		"/metadata":    {Path: "/metadata", Kind: EntryRegular, Size: 4, Revision: 1, ResourceID: "metadata", HasMode: true, Mode: 0o644, ChecksumSHA256: checksumA},
+		"/content":     {Path: "/content", Kind: EntryRegular, Size: 4, Revision: 1, ResourceID: "content", Nlink: 1, HasMode: true, Mode: 0o644, ChecksumSHA256: checksumB},
+		"/metadata":    {Path: "/metadata", Kind: EntryRegular, Size: 4, Revision: 1, ResourceID: "metadata", Nlink: 1, HasMode: true, Mode: 0o644, ChecksumSHA256: checksumA},
 		"/type":        {Path: "/type", Kind: EntryRegular, Revision: 1, ResourceID: "type", HasMode: true, Mode: 0o644},
 		"/identity":    {Path: "/identity", Kind: EntryRegular, Size: 4, Revision: 1, HasMode: true, Mode: 0o644},
-		"/revision":    {Path: "/revision", Kind: EntryRegular, Size: 4, ResourceID: "revision", HasMode: true, Mode: 0o644},
+		"/revision":    {Path: "/revision", Kind: EntryRegular, Size: 4, ResourceID: "revision", Nlink: 1, HasMode: true, Mode: 0o644},
 	}}
 	round, err := BuildRound("round", RoundModeFull, time.Now(), source, target)
 	if err != nil {
@@ -240,7 +240,7 @@ func TestIncompleteScanNeverBuildsDeleteAndObservedDoesNotReconcile(t *testing.T
 	state.SetRecoveryComplete(true)
 	state.MarkReconciled("/file", SourceVersion{Device: 1, Inode: 1, Kind: EntryRegular, Size: 4})
 	goodTarget := TargetScan{Complete: true, Entries: map[string]TargetEntry{
-		"/file": {Path: "/file", Kind: EntryRegular, Size: 4, Mode: 0o644, HasMode: true, Revision: 1, ResourceID: "file"},
+		"/file": {Path: "/file", Kind: EntryRegular, Size: 4, Mode: 0o644, HasMode: true, Revision: 1, ResourceID: "file", Nlink: 1},
 	}}
 	round, err = BuildRound("one", RoundModeFull, time.Now(), ScanResult{Complete: true, Entries: map[string]SourceEntry{"/file": sourceEntry}}, goodTarget)
 	if err != nil {
@@ -272,8 +272,8 @@ func TestDiffHardlinkIdentityIsDeterministic(t *testing.T) {
 		"/b": {Path: "/b", Kind: EntryRegular, Version: SourceVersion{Kind: EntryRegular, Size: 1}, Mode: 0o644, HardlinkKey: "1:2"},
 	}
 	target := map[string]TargetEntry{
-		"/a": {Path: "/a", Kind: EntryRegular, Size: 1, Mode: 0o644, HasMode: true, Revision: 1, ResourceID: "one"},
-		"/b": {Path: "/b", Kind: EntryRegular, Size: 1, Mode: 0o644, HasMode: true, Revision: 1, ResourceID: "two"},
+		"/a": {Path: "/a", Kind: EntryRegular, Size: 1, Mode: 0o644, HasMode: true, Revision: 1, ResourceID: "one", Nlink: 1},
+		"/b": {Path: "/b", Kind: EntryRegular, Size: 1, Mode: 0o644, HasMode: true, Revision: 1, ResourceID: "two", Nlink: 1},
 	}
 	for range 20 {
 		findings := diffSnapshots(source, target)
