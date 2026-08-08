@@ -820,19 +820,36 @@ func runSuperviseForeground(req mountSuperviseStartRequest) error {
 	if len(supArgs) < 2 || supArgs[0] != "mount" || supArgs[1] != "supervise" {
 		return fmt.Errorf("drive9 mount: internal supervise args invalid")
 	}
-	// Ensure credentials are in env for worker children.
-	env := mountBackgroundEnv(os.Environ(), mountBackgroundRequest{
+	// Match background path: scrub credential envs that were intentionally
+	// omitted (e.g. DRIVE9_PUBLIC_KEY), then apply the resolved snapshot.
+	// Setenv alone leaves stripped vars inherited by the in-process supervisor.
+	scrubbed := mountBackgroundEnv(os.Environ(), mountBackgroundRequest{
 		Server: req.Server,
 		APIKey: req.APIKey,
 		Token:  req.Token,
 	})
-	for _, kv := range env {
+	applyScrubbedMountEnv(scrubbed)
+	_ = exe
+	return runMountSupervise(supArgs[2:])
+}
+
+// applyScrubbedMountEnv unsets mount credential env vars then applies scrubbed.
+// Needed for in-process --supervise-foreground (unlike cmd.Env on a child).
+func applyScrubbedMountEnv(scrubbed []string) {
+	for _, key := range []string{
+		EnvServer,
+		EnvAPIKey,
+		EnvVaultToken,
+		EnvTiDBCloudPublicKey,
+		EnvTiDBCloudPrivateKey,
+	} {
+		_ = os.Unsetenv(key)
+	}
+	for _, kv := range scrubbed {
 		if i := strings.IndexByte(kv, '='); i > 0 {
 			_ = os.Setenv(kv[:i], kv[i+1:])
 		}
 	}
-	_ = exe
-	return runMountSupervise(supArgs[2:])
 }
 
 func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-chan error, logPath string, timeout time.Duration) error {
@@ -847,7 +864,42 @@ func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-
 		default:
 		}
 		if time.Now().After(deadline) {
-			_ = terminateProcess(supervisorPID, 5*time.Second)
+			// Stop the whole supervised mount: stop token + graceful supervisor
+			// stop (so it can clean the worker), then kill leftover worker and
+			// force-unmount if the FUSE endpoint is still present/broken.
+			_ = mountstate.WriteStopToken(mountPoint, "ready-timeout")
+			_ = terminateProcessGraceful(supervisorPID, 10*time.Second)
+			var workerCreation uint64
+			if sst, _, rerr := mountstate.ReadSupervisorState(mountPoint); rerr == nil {
+				workerCreation = sst.WorkerCreation
+			}
+			if st, _, rerr := mountstate.ReadProcessState(mountPoint); rerr == nil {
+				if st.WorkerPID > 0 {
+					// Identity-gated when creation is known; ready-timeout is
+					// our own child tree so fall back to liveness if metadata
+					// was never published yet (first-boot race).
+					if processMatchesIdentity(st.WorkerPID, workerCreation) ||
+						(workerCreation == 0 && processAliveImpl(st.WorkerPID)) {
+						_ = terminateProcess(st.WorkerPID, 5*time.Second)
+					}
+				}
+				// Supervisor may still be stuck; hard-kill if identity matches.
+				// supervisorPID is this process's own child, so identity-or-alive
+				// is safe within the ready window.
+				if st.SupervisorPID > 0 && processMatchesIdentity(st.SupervisorPID, st.SupervisorCreationTime) {
+					_ = terminateProcess(st.SupervisorPID, 3*time.Second)
+				} else if processAliveImpl(supervisorPID) {
+					_ = terminateProcess(supervisorPID, 3*time.Second)
+				}
+			} else if processAliveImpl(supervisorPID) {
+				_ = terminateProcess(supervisorPID, 3*time.Second)
+			}
+			_, _ = ensureCleanMountPointCLI(mountPoint)
+			_ = mountstate.ClearStopToken(mountPoint)
+			// Supervisor may have been SIGKILL'd before shutdownClean; drop
+			// stale state so status/umount do not see a dead "starting" mount.
+			_ = mountstate.ClearSupervisorState(mountPoint)
+			_ = os.Remove(mountstate.PIDFilePath(mountPoint))
 			return fmt.Errorf("drive9 mount: timed out waiting for supervised mount to become ready after %s (log: %s)", timeout, logPath)
 		}
 		// Ready when process state exists and probe succeeds (supervisor owns pidfile).
@@ -1325,29 +1377,6 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-func isAlreadyUnmountedError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	for _, sub := range []string{
-		"not mounted",
-		"not currently mounted",
-		"no such file or directory",
-		"invalid argument",
-		"einval",
-		// fusermount3 after supervisor already unmounted:
-		// "entry for <path> not found in /etc/mtab"
-		"not found in /etc/mtab",
-		"not found in /proc/mounts",
-	} {
-		if strings.Contains(msg, sub) {
-			return true
-		}
-	}
-	return false
-}
-
 // mountPointStillActive is a best-effort check used after supervised stop.
 // Prefer fuse.ActiveMountPoint when available (non-windows).
 func mountPointStillActive(mountPoint string) bool {
@@ -1523,26 +1552,62 @@ func runUmount(args []string, deps umountDeps) error {
 	// (graceful), then fall through to fusermount. Always clear the stop token
 	// after the stop attempt so the next remount is not stuck.
 	// If the supervisor already unmounted, fusermount "not mounted" is success.
+	// Verify process identity (PID + creation time) before signaling so a reused
+	// PID from stale state cannot kill an unrelated process.
 	stoppedSupervisor := false
 	if deps.goos != "windows" {
 		_ = mountstate.WriteStopToken(stateMountPoint, "umount")
 		stopPID := 0
+		var stopCreation uint64
+		workerPID := 0
+		var workerCreation uint64
 		if deps.readProcessState != nil {
 			if st, _, rerr := deps.readProcessState(stateMountPoint); rerr == nil {
 				if st.SupervisorPID > 0 {
 					stopPID = st.SupervisorPID
+					stopCreation = st.SupervisorCreationTime
+					if stopCreation == 0 {
+						stopCreation = st.CreationTime
+					}
 				} else if st.Role == mountstate.RoleSupervisor {
 					stopPID = st.PID
+					stopCreation = st.CreationTime
+				}
+				if st.WorkerPID > 0 {
+					workerPID = st.WorkerPID
+				} else if st.Role != mountstate.RoleSupervisor && st.PID > 0 {
+					// Unsupervised / orphan worker recorded as main PID.
+					workerPID = st.PID
+					workerCreation = st.CreationTime
 				}
 			}
 		}
-		if sst, _, rerr := mountstate.ReadSupervisorState(stateMountPoint); rerr == nil && sst.PID > 0 {
-			stopPID = sst.PID
+		if sst, _, rerr := mountstate.ReadSupervisorState(stateMountPoint); rerr == nil {
+			if sst.PID > 0 {
+				stopPID = sst.PID
+				stopCreation = sst.CreationTime
+			}
+			if sst.WorkerPID > 0 {
+				workerPID = sst.WorkerPID
+				workerCreation = sst.WorkerCreation
+			}
 		}
 		if stopPID > 0 {
-			stoppedSupervisor = true
-			if terr := terminateProcessGraceful(stopPID, *waitTimeout); terr != nil && deps.printErrf != nil {
-				deps.printErrf("drive9 umount: stop supervisor pid %d: %v\n", stopPID, terr)
+			if processMatchesIdentity(stopPID, stopCreation) {
+				stoppedSupervisor = true
+				if terr := terminateProcessGraceful(stopPID, *waitTimeout); terr != nil && deps.printErrf != nil {
+					deps.printErrf("drive9 umount: stop supervisor pid %d: %v\n", stopPID, terr)
+				}
+			} else if deps.printErrf != nil {
+				deps.printErrf("drive9 umount: skip stop for stale supervisor pid %d (identity mismatch)\n", stopPID)
+			}
+		}
+		// Dead supervisor + live orphan worker: stop worker by identity so a
+		// stuck FUSE endpoint can be force-unmounted below.
+		if workerPID > 0 && processMatchesIdentity(workerPID, workerCreation) {
+			stoppedSupervisor = true // enable force-clean forgiveness path
+			if terr := terminateProcessGraceful(workerPID, *waitTimeout); terr != nil && deps.printErrf != nil {
+				deps.printErrf("drive9 umount: stop worker pid %d: %v\n", workerPID, terr)
 			}
 		}
 		defer func() {
@@ -1582,8 +1647,17 @@ func runUmount(args []string, deps umountDeps) error {
 	// fails with "not found in /etc/mtab" (stderr only; ExitError is just
 	// "exit status 1"). Treat as success when we stopped a supervisor and the
 	// mountpoint is no longer active so umount exits 0 and --pack still runs.
+	// Do NOT treat broken-but-still-mounted endpoints (ENOTCONN) as gone:
+	// mountPointStillActive returns true for transport-broken mounts, and we
+	// force-unmount so the stale FUSE node is cleaned up.
 	if runErr != nil && stoppedSupervisor {
-		if isAlreadyUnmountedError(runErr) || !mountPointStillActive(mountPoint) {
+		// Prefer mount-table reality over fusermount error strings: messages
+		// like "invalid argument" can mean a still-mounted broken FUSE node.
+		// Force-clean while active/broken; only forgive when truly gone.
+		if mountPointStillActive(mountPoint) {
+			forceUnmountMountPointCLI(mountPoint)
+		}
+		if !mountPointStillActive(mountPoint) {
 			runErr = nil
 		}
 	}

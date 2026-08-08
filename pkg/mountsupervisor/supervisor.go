@@ -510,7 +510,11 @@ func (s *supervisor) writeAuthoritativeProcessState() error {
 	s.mu.Lock()
 	st := s.state
 	s.mu.Unlock()
-	// Prefer reading worker-written state for secrets/control socket.
+	// Prefer reading worker-written state for control socket / secrets when the
+	// worker wrote them. On remount after a killed supervisor the pidfile can
+	// still hold STALE tenant metadata — always overwrite identity fields from
+	// the current supervisor config so status/pack/repair never republish the
+	// previous mount's server/remote-root/credentials.
 	base, _, err := mountstate.ReadProcessState(s.cfg.MountPoint)
 	if err != nil {
 		base = mountstate.ProcessState{}
@@ -528,46 +532,40 @@ func (s *supervisor) writeAuthoritativeProcessState() error {
 	base.StatusPath = mountstate.SupervisorStatePath(s.cfg.MountPoint)
 	base.StopTokenPath = mountstate.StopTokenPath(s.cfg.MountPoint)
 	base.Args = append([]string(nil), s.cfg.SanitizedArgs...)
-	if base.Server == "" {
-		base.Server = s.cfg.Server
-	}
-	if base.RemoteRoot == "" {
-		base.RemoteRoot = s.cfg.RemoteRoot
-	}
-	if base.Profile == "" {
-		base.Profile = s.cfg.Profile
-	}
-	if base.LocalRoot == "" {
-		base.LocalRoot = s.cfg.LocalRoot
-	}
-	if len(base.PackPaths) == 0 && len(s.cfg.PackPaths) > 0 {
-		base.PackPaths = append([]string(nil), s.cfg.PackPaths...)
-	}
-	// When the supervised worker skips the pidfile, recover credentials from env
-	// so umount --pack and status tooling still work.
-	if base.APIKey == "" && base.Token == "" {
-		for _, kv := range s.cfg.Env {
-			if after, ok := strings.CutPrefix(kv, "DRIVE9_API_KEY="); ok && after != "" {
-				base.APIKey = after
-				base.CredentialKind = mountstate.CredentialKindAPIKey
-			}
-			if after, ok := strings.CutPrefix(kv, "DRIVE9_VAULT_TOKEN="); ok && after != "" {
-				base.Token = after
-				base.CredentialKind = mountstate.CredentialKindToken
-			}
-			// Also accept token env used by the CLI vault path if present.
-			if after, ok := strings.CutPrefix(kv, "DRIVE9_TOKEN="); ok && after != "" && base.Token == "" {
-				base.Token = after
-				base.CredentialKind = mountstate.CredentialKindToken
-			}
+	// Current config wins for mount identity (remount-safe). Always assign so
+	// empty current values clear stale pidfile metadata from a prior mount.
+	base.Server = s.cfg.Server
+	base.RemoteRoot = s.cfg.RemoteRoot
+	base.Profile = s.cfg.Profile
+	base.LocalRoot = s.cfg.LocalRoot
+	base.PackPaths = append([]string(nil), s.cfg.PackPaths...)
+	// Credentials: always derive from the current env snapshot; never keep
+	// stale secrets from a previous mount's pidfile.
+	envAPIKey, envToken := "", ""
+	for _, kv := range s.cfg.Env {
+		if after, ok := strings.CutPrefix(kv, "DRIVE9_API_KEY="); ok && after != "" {
+			envAPIKey = after
+		}
+		if after, ok := strings.CutPrefix(kv, "DRIVE9_VAULT_TOKEN="); ok && after != "" {
+			envToken = after
+		}
+		if after, ok := strings.CutPrefix(kv, "DRIVE9_TOKEN="); ok && after != "" && envToken == "" {
+			envToken = after
 		}
 	}
-	if base.Component == "" {
-		base.Component = "drive9-fuse-supervisor"
+	base.APIKey = ""
+	base.Token = ""
+	base.CredentialKind = ""
+	if envToken != "" {
+		base.Token = envToken
+		base.CredentialKind = mountstate.CredentialKindToken
+	} else if envAPIKey != "" {
+		base.APIKey = envAPIKey
+		base.CredentialKind = mountstate.CredentialKindAPIKey
 	}
-	if base.MountKind == "" {
-		base.MountKind = mountstate.MountKindFUSE
-	}
+	// Component / kind always reflect this supervisor (never keep stale vault/webdav).
+	base.Component = "drive9-fuse-supervisor"
+	base.MountKind = mountstate.MountKindFUSE
 	if base.StartedAt == "" {
 		base.StartedAt = s.cfg.Now().UTC().Format(time.RFC3339Nano)
 	}
@@ -645,9 +643,15 @@ func (s *supervisor) shutdownClean() error {
 	s.setState(mountstate.SupervisorStateStopping)
 	// stopWorker is idempotent: takes ownership of waitCh and reaps once.
 	s.stopWorker()
-	// Force clean mount on stop.
-	if active, _ := drive9fuse.ActiveMountPoint(s.cfg.MountPoint); active {
-		drive9fuse.ForceUnmount(s.cfg.MountPoint)
+	// Force clean mount on stop, including transport-broken (ENOTCONN) endpoints
+	// that ActiveMountPoint reports as (false, err).
+	if _, err := drive9fuse.EnsureCleanMountpoint(s.cfg.MountPoint); err != nil {
+		// Best-effort fallback if ensure-clean itself fails.
+		if active, aerr := drive9fuse.ActiveMountPoint(s.cfg.MountPoint); aerr == nil && active {
+			drive9fuse.ForceUnmountLazy(s.cfg.MountPoint)
+		} else if drive9fuse.IsTransportBroken(aerr) {
+			drive9fuse.ForceUnmountLazy(s.cfg.MountPoint)
+		}
 	}
 	_ = mountstate.ClearStopToken(s.cfg.MountPoint)
 	s.setState(mountstate.SupervisorStateStopped)

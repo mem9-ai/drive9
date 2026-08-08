@@ -9,3 +9,9 @@ func probeMountPointReadyCLI(mountPoint string) bool {
 func mountPointStillActiveImpl(mountPoint string) bool {
 	return false
 }
+
+func forceUnmountMountPointCLI(mountPoint string) {}
+
+func ensureCleanMountPointCLI(mountPoint string) (bool, error) {
+	return false, nil
+}

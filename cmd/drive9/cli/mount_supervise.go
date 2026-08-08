@@ -248,12 +248,24 @@ func runMountEnsure(args []string) error {
 		}
 	}
 
-	// Reconstruct mount from stored args.
+	// Capture stored args + credentials BEFORE stop clears process state.
 	var sanitized []string
+	var storedServer, storedAPIKey, storedToken string
 	if st, _, err := mountstate.ReadSupervisorState(mp); err == nil && len(st.Args) > 0 {
 		sanitized = st.Args
-	} else if ps, _, err := mountstate.ReadProcessState(mp); err == nil && len(ps.Args) > 0 {
-		sanitized = ps.Args
+		if st.Server != "" {
+			storedServer = st.Server
+		}
+	}
+	if ps, _, err := mountstate.ReadProcessState(mp); err == nil {
+		if len(sanitized) == 0 && len(ps.Args) > 0 {
+			sanitized = ps.Args
+		}
+		if storedServer == "" {
+			storedServer = ps.Server
+		}
+		storedAPIKey = ps.APIKey
+		storedToken = ps.Token
 	}
 	if len(sanitized) == 0 {
 		return fmt.Errorf("drive9 mount ensure: no stored mount args for %s; run drive9 mount explicitly", mp)
@@ -261,19 +273,127 @@ func runMountEnsure(args []string) error {
 	// Ensure must not re-enter a blocking --supervise-foreground process.
 	sanitized = stripEnsureBlockingFlags(sanitized)
 
-	// Stop any existing supervisor/worker first (graceful).
+	// Stop any existing supervisor/worker first (graceful), verifying identity.
 	_ = mountstate.WriteStopToken(mp, "ensure")
-	if snap.SupervisorPID > 0 && processAliveImpl(snap.SupervisorPID) {
-		_ = terminateProcessGraceful(snap.SupervisorPID, 30*time.Second)
-	} else if snap.WorkerPID > 0 && processAliveImpl(snap.WorkerPID) {
-		_ = terminateProcessGraceful(snap.WorkerPID, 30*time.Second)
+	var workerCreation uint64
+	var workerPID int
+	if sst, _, err := mountstate.ReadSupervisorState(mp); err == nil {
+		workerCreation = sst.WorkerCreation
+		if sst.WorkerPID > 0 {
+			workerPID = sst.WorkerPID
+		}
+	}
+	if ps, _, err := mountstate.ReadProcessState(mp); err == nil {
+		if workerPID == 0 && ps.WorkerPID > 0 {
+			workerPID = ps.WorkerPID
+		}
+		// Unsupervised / dead-supervisor leftover: worker may be recorded as PID.
+		if workerPID == 0 && ps.PID > 0 && ps.Role != mountstate.RoleSupervisor {
+			workerPID = ps.PID
+			workerCreation = ps.CreationTime
+		}
+	}
+	if snap.SupervisorPID > 0 {
+		var creation uint64
+		if ps, _, err := mountstate.ReadProcessState(mp); err == nil {
+			if ps.SupervisorPID == snap.SupervisorPID {
+				creation = ps.SupervisorCreationTime
+				if creation == 0 {
+					creation = ps.CreationTime
+				}
+			}
+		}
+		if sst, _, err := mountstate.ReadSupervisorState(mp); err == nil && sst.PID == snap.SupervisorPID {
+			creation = sst.CreationTime
+		}
+		if processMatchesIdentity(snap.SupervisorPID, creation) {
+			_ = terminateProcessGraceful(snap.SupervisorPID, 30*time.Second)
+		}
+	}
+	// Always attempt worker stop when identity matches (covers dead supervisor +
+	// orphan worker, and avoids PID-reuse kill without creation check).
+	if workerPID == 0 {
+		workerPID = snap.WorkerPID
+	}
+	if workerPID > 0 && processMatchesIdentity(workerPID, workerCreation) {
+		_ = terminateProcessGraceful(workerPID, 30*time.Second)
 	}
 	_ = mountstate.ClearStopToken(mp)
 	_ = mountstate.ClearSupervisorState(mp)
+	_ = os.Remove(mountstate.PIDFilePath(mp))
 	_, _ = mountsupervisor.EnsureClean(mp)
 
-	// Start supervised mount using stored sanitized args (no secrets — rely on env/config).
-	return fsMountCmdWithBackground(sanitized, true)
+	// Replay original mount principal: inject stored server/API key as flags,
+	// and vault token via env (no --token flag on mount).
+	sanitized = injectEnsureCredentials(sanitized, storedServer, storedAPIKey)
+	return withEnsureCredentialEnv(storedServer, storedAPIKey, storedToken, func() error {
+		return fsMountCmdWithBackground(sanitized, true)
+	})
+}
+
+// injectEnsureCredentials prepends --server/--api-key from stored process state
+// so ensure remounts the same principal even if the caller's env/config changed.
+func injectEnsureCredentials(args []string, server, apiKey string) []string {
+	out := append([]string(nil), args...)
+	if server != "" && !argsHasFlag(out, "--server") {
+		out = append([]string{"--server", server}, out...)
+	}
+	if apiKey != "" && !argsHasFlag(out, "--api-key") {
+		out = append([]string{"--api-key", apiKey}, out...)
+	}
+	return out
+}
+
+func argsHasFlag(args []string, name string) bool {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == name {
+			return true
+		}
+		if strings.HasPrefix(a, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// withEnsureCredentialEnv temporarily installs stored mount credentials into
+// the process environment for remount (needed for vault tokens which have no flag).
+func withEnsureCredentialEnv(server, apiKey, token string, fn func() error) error {
+	if server == "" && apiKey == "" && token == "" {
+		return fn()
+	}
+	type snap struct {
+		key string
+		val string
+		ok  bool
+	}
+	keys := []string{EnvServer, EnvAPIKey, EnvVaultToken}
+	prev := make([]snap, 0, len(keys))
+	for _, k := range keys {
+		v, ok := os.LookupEnv(k)
+		prev = append(prev, snap{key: k, val: v, ok: ok})
+	}
+	defer func() {
+		for _, s := range prev {
+			if s.ok {
+				_ = os.Setenv(s.key, s.val)
+			} else {
+				_ = os.Unsetenv(s.key)
+			}
+		}
+	}()
+	if server != "" {
+		_ = os.Setenv(EnvServer, server)
+	}
+	if token != "" {
+		_ = os.Setenv(EnvVaultToken, token)
+		_ = os.Unsetenv(EnvAPIKey)
+	} else if apiKey != "" {
+		_ = os.Setenv(EnvAPIKey, apiKey)
+		_ = os.Unsetenv(EnvVaultToken)
+	}
+	return fn()
 }
 
 func stripEnsureBlockingFlags(args []string) []string {
@@ -294,15 +414,13 @@ func stripEnsureBlockingFlags(args []string) []string {
 }
 
 func runMountSystemdUnit(args []string) error {
-	fs := flag.NewFlagSet("mount systemd-unit", flag.ContinueOnError)
-	install := fs.Bool("install", false, "write to ~/.config/systemd/user/")
-	unitName := fs.String("name", "drive9-mount", "unit name without .service")
-	fs.SetOutput(os.Stderr)
-	if err := fs.Parse(args); err != nil {
+	// Peel only systemd-unit-specific flags; pass the rest through as mount args
+	// so `drive9 mount systemd-unit --mode=fuse :/repo /mnt/d9` works without
+	// requiring an undocumented `--` separator.
+	install, unitName, rest, err := peelSystemdUnitFlags(args)
+	if err != nil {
 		return err
 	}
-	// Remaining: mount flags and mountpoint as would be passed to mount.
-	rest := fs.Args()
 	if len(rest) == 0 {
 		return fmt.Errorf("usage: drive9 mount systemd-unit [--install] [--name name] [mount flags] <mountpoint>")
 	}
@@ -335,7 +453,7 @@ TimeoutStopSec=70
 WantedBy=default.target
 `, mountPoint, execStart, execStop)
 
-	if !*install {
+	if !install {
 		fmt.Print(unit)
 		return nil
 	}
@@ -347,12 +465,51 @@ WantedBy=default.target
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	path := filepath.Join(dir, *unitName+".service")
-	if err := os.WriteFile(path, []byte(unit), 0o644); err != nil {
+	path := filepath.Join(dir, unitName+".service")
+	// 0600: unit may embed --api-key or other secrets in ExecStart.
+	if err := os.WriteFile(path, []byte(unit), 0o600); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "wrote %s\n", path)
 	return nil
+}
+
+// peelSystemdUnitFlags extracts --install/--name and leaves mount flags intact.
+func peelSystemdUnitFlags(args []string) (install bool, name string, rest []string, err error) {
+	name = "drive9-mount"
+	rest = make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			rest = append(rest, args[i+1:]...)
+			return install, name, rest, nil
+		case a == "--install":
+			install = true
+		case a == "--install=true" || a == "--install=1":
+			install = true
+		case a == "--install=false" || a == "--install=0":
+			install = false
+		case strings.HasPrefix(a, "--install="):
+			return false, "", nil, fmt.Errorf("drive9 mount systemd-unit: invalid --install value")
+		case a == "--name":
+			if i+1 >= len(args) {
+				return false, "", nil, fmt.Errorf("drive9 mount systemd-unit: --name requires a value")
+			}
+			i++
+			name = args[i]
+		case strings.HasPrefix(a, "--name="):
+			name = strings.TrimPrefix(a, "--name=")
+			if name == "" {
+				return false, "", nil, fmt.Errorf("drive9 mount systemd-unit: --name requires a value")
+			}
+		case a == "-h" || a == "--help":
+			return false, "", nil, fmt.Errorf("usage: drive9 mount systemd-unit [--install] [--name name] [mount flags] <mountpoint>")
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return install, name, rest, nil
 }
 
 func shellJoin(parts []string) string {

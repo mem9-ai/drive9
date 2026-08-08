@@ -90,6 +90,13 @@ func EnsureCleanMountpoint(mountPoint string) (cleaned bool, err error) {
 	return false, nil
 }
 
+// IsTransportBroken reports whether err indicates a still-mounted but unusable
+// FUSE endpoint (ENOTCONN / EIO / etc.). Callers should treat these as active
+// for cleanup purposes rather than "already unmounted".
+func IsTransportBroken(err error) bool {
+	return isTransportBroken(err)
+}
+
 func isTransportBroken(err error) bool {
 	if err == nil {
 		return false
@@ -97,6 +104,7 @@ func isTransportBroken(err error) bool {
 	msg := strings.ToLower(err.Error())
 	for _, sub := range []string{
 		"transport endpoint is not connected",
+		"socket is not connected", // Darwin ENOTCONN wording
 		"connection aborted",
 		"software caused connection abort",
 		"input/output error",
