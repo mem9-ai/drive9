@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 func TestControlStatusDiffPermissionsAndUnavailable(t *testing.T) {
@@ -344,6 +347,30 @@ func TestControlRequiresTypedTerminalResponse(t *testing.T) {
 			t.Fatal("mismatched terminal command succeeded")
 		}
 	})
+}
+
+func TestControlTerminalRedactsOperationalDetails(t *testing.T) {
+	const sourcePath = "/customers/acme/private.txt"
+	operationErr := fmt.Errorf("upload source %s: %w", sourcePath, &client.StatusError{
+		StatusCode: http.StatusBadRequest,
+		Message:    "backend rejected owner-key-secret",
+	})
+	var output bytes.Buffer
+	if err := writeControlTerminal(&output, "verify-full", operationErr); err != nil {
+		t.Fatal(err)
+	}
+	var frame controlFrame
+	if err := decodeControlJSON(output.Bytes(), &frame); err != nil {
+		t.Fatal(err)
+	}
+	if frame.OK || frame.Code != 1 || frame.Error != "drive9 request failed: HTTP 400" {
+		t.Fatalf("terminal frame=%+v", frame)
+	}
+	for _, forbidden := range []string{sourcePath, "owner-key-secret", "backend rejected"} {
+		if strings.Contains(output.String(), forbidden) {
+			t.Fatalf("control terminal leaked %q: %s", forbidden, output.String())
+		}
+	}
 }
 
 func TestAcceptedCutoverContinuesAfterCallerLosesResponse(t *testing.T) {

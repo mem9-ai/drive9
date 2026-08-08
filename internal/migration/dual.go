@@ -84,6 +84,12 @@ func (w *Worker) dualRound(ctx context.Context, mode RoundMode, id string, start
 			}
 		}
 	}
+	if mode == RoundModeFast {
+		if err := w.validateScannedSource(ctx, &source); err != nil {
+			w.state.FailRound(id, "scan")
+			return err
+		}
+	}
 	w.state.SetAttention(unsafe)
 	return w.state.PublishRound(round)
 }
