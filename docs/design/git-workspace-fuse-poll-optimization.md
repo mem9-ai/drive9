@@ -5,7 +5,6 @@
 **Scope:** FUSE-side git-workspace discovery and refresh; eliminate idle `/v1/git-workspaces*` traffic when the user never ran `drive9 git --fast`  
 **Non-goals:** Overlay write path, checkpoint, and hydrate protocol semantics  
 **Related:** [git-fast-clone-workspace.md](./git-fast-clone-workspace.md), [pack-unpack-profile-spec.md](./pack-unpack-profile-spec.md)  
-**Chinese version:** [git-workspace-fuse-poll-optimization.zh.md](./git-workspace-fuse-poll-optimization.zh.md)
 
 ---
 
