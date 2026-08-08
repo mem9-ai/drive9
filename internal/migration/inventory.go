@@ -239,6 +239,7 @@ func BuildRound(id string, mode RoundMode, started time.Time, source ScanResult,
 func diffSnapshots(source map[string]SourceEntry, target map[string]TargetEntry) []Finding {
 	findings := make([]Finding, 0)
 	seen := make(map[string]struct{})
+	ownedLinks := targetOwnedLinkCounts(source, target)
 	add := func(path string, kind FindingKind) {
 		key := path + "\x00" + string(kind)
 		if _, exists := seen[key]; exists {
@@ -279,9 +280,8 @@ func diffSnapshots(source map[string]SourceEntry, target map[string]TargetEntry)
 			add(sourcePath, FindingContent)
 		}
 		if sourceEntry.Kind == EntryRegular && targetEntry.ResourceID != "" {
-			owner := "path:" + sourcePath
+			owner := targetLinkSourceOwner(sourceEntry)
 			if sourceEntry.HardlinkKey != "" {
-				owner = "hardlink:" + sourceEntry.HardlinkKey
 				if prior := groupResources[owner]; prior != "" && prior != targetEntry.ResourceID {
 					add(sourcePath, FindingIdentity)
 				} else {
@@ -292,6 +292,9 @@ func diffSnapshots(source map[string]SourceEntry, target map[string]TargetEntry)
 				add(sourcePath, FindingIdentity)
 			} else {
 				resourceOwners[targetEntry.ResourceID] = owner
+			}
+			if targetEntry.Nlink == 0 || targetEntry.Nlink != ownedLinks[targetLinkOwner{source: owner, resource: targetEntry.ResourceID}] {
+				add(sourcePath, FindingIdentity)
 			}
 		}
 	}
@@ -306,4 +309,29 @@ func diffSnapshots(source map[string]SourceEntry, target map[string]TargetEntry)
 		}
 	}
 	return findings
+}
+
+type targetLinkOwner struct {
+	source   string
+	resource string
+}
+
+func targetLinkSourceOwner(entry SourceEntry) string {
+	if entry.HardlinkKey != "" {
+		return "hardlink:" + entry.HardlinkKey
+	}
+	return "path:" + entry.Path
+}
+
+func targetOwnedLinkCounts(source map[string]SourceEntry, target map[string]TargetEntry) map[targetLinkOwner]uint32 {
+	counts := make(map[targetLinkOwner]uint32)
+	for path, targetEntry := range target {
+		sourceEntry, exists := source[path]
+		if !exists || sourceEntry.Kind != EntryRegular || targetEntry.Kind != EntryRegular || targetEntry.ResourceID == "" {
+			continue
+		}
+		key := targetLinkOwner{source: targetLinkSourceOwner(sourceEntry), resource: targetEntry.ResourceID}
+		counts[key]++
+	}
+	return counts
 }

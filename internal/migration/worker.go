@@ -401,7 +401,18 @@ func (w *Worker) scanPair(ctx context.Context) (ScanResult, TargetScan, error) {
 		}
 	}
 	target, err := w.inventory.Scan(ctx, deepPaths)
-	return source, target, err
+	if err != nil {
+		return source, target, err
+	}
+	if err := w.validateSourceMount(); err != nil {
+		source.Complete = false
+		return source, target, err
+	}
+	if err := w.scanner.validateSnapshot(ctx, source); err != nil {
+		source.Complete = false
+		return source, target, err
+	}
+	return source, target, nil
 }
 
 func (w *Worker) scanSource(ctx context.Context) (ScanResult, error) {

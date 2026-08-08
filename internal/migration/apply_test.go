@@ -62,9 +62,11 @@ func (r *applyRemote) handler(w http.ResponseWriter, request *http.Request) {
 		w.Header().Set("X-Dat9-Revision", fmt.Sprint(r.revision))
 		w.Header().Set("X-Dat9-Resource-ID", r.resourceID)
 		w.Header().Set("X-Dat9-Mode", fmt.Sprint(r.mode))
-		if r.nlink != 0 {
-			w.Header().Set("X-Dat9-Nlink", fmt.Sprint(r.nlink))
+		nlink := r.nlink
+		if nlink == 0 {
+			nlink = 1
 		}
+		w.Header().Set("X-Dat9-Nlink", fmt.Sprint(nlink))
 		checksum := r.checksum
 		if checksum == "" {
 			checksum = hex.EncodeToString(sum[:])
@@ -158,7 +160,7 @@ func TestApplyRegularUsesConditionalCreateAndUpdate(t *testing.T) {
 	}{
 		{name: "create", remote: &applyRemote{}, target: map[string]TargetEntry{}, wantExpect: "0"},
 		{name: "update", remote: &applyRemote{exists: true, revision: 7, resourceID: "resource-file", mode: 0o644, body: []byte("old")}, target: map[string]TargetEntry{
-			"/file": {Path: "/file", Kind: EntryRegular, Size: 3, Mode: 0o644, HasMode: true, Revision: 7, ResourceID: "resource-file"},
+			"/file": {Path: "/file", Kind: EntryRegular, Size: 3, Mode: 0o644, HasMode: true, Revision: 7, ResourceID: "resource-file", Nlink: 1},
 		}, wantExpect: "7"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -195,6 +197,60 @@ func TestApplyRegularRejectsTargetNlinkChangeBeforeWrite(t *testing.T) {
 	defer remote.mu.Unlock()
 	if containsOperationPrefix(remote.operations, "write ") {
 		t.Fatalf("Nlink drift reached write: %v", remote.operations)
+	}
+}
+
+func TestApplyRegularRejectsUnaccountedStableTargetNlinkBeforeWrite(t *testing.T) {
+	remote := &applyRemote{exists: true, revision: 7, resourceID: "resource-file", mode: 0o644, body: []byte("old"), nlink: 2}
+	server := httptest.NewServer(http.HandlerFunc(remote.handler))
+	defer server.Close()
+	scanner, source := newApplyFixture(t, "new-content")
+	target := map[string]TargetEntry{
+		"/file": {Path: "/file", Kind: EntryRegular, Size: 3, Mode: 0o644, HasMode: true, Revision: 7, ResourceID: "resource-file", Nlink: 2},
+	}
+
+	err := newTestApplyEngine(t, server, scanner, 1<<20).Apply(context.Background(), map[string]SourceEntry{"/file": source}, target)
+	if !errors.Is(err, ErrUnsafeApply) {
+		t.Fatalf("unaccounted Nlink error=%v", err)
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if containsOperationPrefix(remote.operations, "write ") {
+		t.Fatalf("unaccounted Nlink reached write: %v", remote.operations)
+	}
+}
+
+func TestApplyHardlinkPrimaryRejectsUnaccountedStableTargetNlink(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("new-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(root, "a"), filepath.Join(root, "b")); err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := NewScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &applyRemote{exists: true, revision: 7, resourceID: "resource-hardlink", mode: 0o644, body: []byte("old"), nlink: 2}
+	server := httptest.NewServer(http.HandlerFunc(remote.handler))
+	defer server.Close()
+	target := map[string]TargetEntry{
+		"/a": {Path: "/a", Kind: EntryRegular, Size: 3, Mode: 0o644, HasMode: true, Revision: 7, ResourceID: "resource-hardlink", Nlink: 2},
+	}
+
+	err = newTestApplyEngine(t, server, scanner, 1<<20).Apply(context.Background(), source.Entries, target)
+	if !errors.Is(err, ErrUnsafeApply) {
+		t.Fatalf("partial hardlink ownership error=%v", err)
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if containsOperationPrefix(remote.operations, "write ") {
+		t.Fatalf("partial hardlink ownership reached write: %v", remote.operations)
 	}
 }
 
@@ -890,7 +946,7 @@ func TestApplyDualHardlinkAliasUsesPrimaryOutsideMutationSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	target := map[string]TargetEntry{
-		primary.Path: {Path: primary.Path, Kind: EntryRegular, Size: deep.Size, Mode: 0o644, HasMode: true, Revision: 4, ResourceID: "hardlink-resource", ChecksumSHA256: deep.ChecksumSHA256},
+		primary.Path: {Path: primary.Path, Kind: EntryRegular, Size: deep.Size, Mode: 0o644, HasMode: true, Revision: 4, ResourceID: "hardlink-resource", Nlink: 1, ChecksumSHA256: deep.ChecksumSHA256},
 	}
 	if err := engine.ApplyWithManifest(context.Background(), map[string]SourceEntry{alias.Path: alias}, manifest.Entries, target); err != nil {
 		t.Fatal(err)
@@ -899,6 +955,57 @@ func TestApplyDualHardlinkAliasUsesPrimaryOutsideMutationSet(t *testing.T) {
 	defer remote.mu.Unlock()
 	if !containsOperation(remote.operations, "hardlink /z-alias") || containsOperationPrefix(remote.operations, "write ") {
 		t.Fatalf("operations=%v", remote.operations)
+	}
+}
+
+func TestApplyDualHardlinkAliasRejectsUnownedPrimary(t *testing.T) {
+	root := t.TempDir()
+	primaryPath := filepath.Join(root, "a-primary")
+	if err := os.WriteFile(primaryPath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(primaryPath, filepath.Join(root, "z-alias")); err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := NewScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary, alias := manifest.Entries["/a-primary"], manifest.Entries["/z-alias"]
+	deep, err := scanner.ReadStableEntry(context.Background(), primary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary.ChecksumSHA256 = deep.ChecksumSHA256
+	manifest.Entries[primary.Path] = primary
+	remote := &applyRemote{exists: true, revision: 4, resourceID: "hardlink-resource", mode: 0o644, body: []byte("content"), nlink: 2}
+	server := httptest.NewServer(http.HandlerFunc(remote.handler))
+	defer server.Close()
+	api := client.New(server.URL, "key")
+	api.SetSmallFileThresholdForTests(1 << 20)
+	engine, err := NewApplyEngine(api, scanner, ApplyConfig{
+		Prefix: "/data", Phase: PhaseDualWriteRepairing, SmallFileThreshold: 1 << 20,
+		SmallWorkers: 1, LargeWorkers: 1, MaxBytesPerSecond: 1 << 30,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := map[string]TargetEntry{
+		primary.Path: {Path: primary.Path, Kind: EntryRegular, Size: deep.Size, Mode: 0o644, HasMode: true, Revision: 4, ResourceID: "hardlink-resource", Nlink: 2, ChecksumSHA256: deep.ChecksumSHA256},
+	}
+
+	err = engine.ApplyWithManifest(context.Background(), map[string]SourceEntry{alias.Path: alias}, manifest.Entries, target)
+	if !errors.Is(err, ErrUnsafeApply) {
+		t.Fatalf("unowned hardlink primary error=%v", err)
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if containsOperationPrefix(remote.operations, "hardlink ") {
+		t.Fatalf("unowned hardlink primary reached link creation: %v", remote.operations)
 	}
 }
 

@@ -58,6 +58,7 @@ type ScanResult struct {
 	EntryCount     int
 	DirectoryCount int
 	LogicalBytes   int64
+	rootVersion    SourceVersion
 }
 
 // Scanner reads one mounted EBS Source Root without mutating it.
@@ -121,6 +122,7 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 	if err != nil {
 		return result, fmt.Errorf("source root identity: %w", err)
 	}
+	result.rootVersion = rootIdentity.version
 	accumulator := newScanAccumulator()
 	hardlinks := make(map[string]struct{})
 	directories := []scannedDirectory{{name: ".", version: rootIdentity.version}}
@@ -241,6 +243,72 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 	}
 	result.Complete = true
 	return result, nil
+}
+
+func (s *Scanner) validateSnapshot(ctx context.Context, snapshot ScanResult) error {
+	if !snapshot.Complete || snapshot.rootVersion.Kind != EntryDirectory {
+		return ErrSourceChanged
+	}
+	root, rootInfo, err := s.openRoot()
+	if err != nil {
+		return ErrSourceChanged
+	}
+	defer func() { _ = root.Close() }()
+	rootIdentity, err := s.identity(s.root, rootInfo)
+	if err != nil || rootIdentity.version != snapshot.rootVersion {
+		return ErrSourceChanged
+	}
+	directories := []scannedDirectory{{name: ".", version: snapshot.rootVersion}}
+	for _, entry := range snapshot.Entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		localPath := entry.LocalPath
+		if localPath == "" {
+			localPath = entry.Path
+		}
+		name, err := s.resolvePath(localPath)
+		if err != nil {
+			return err
+		}
+		relative := filepath.FromSlash(strings.TrimPrefix(localPath, "/"))
+		if err := s.validateAncestors(root, relative); err != nil {
+			return err
+		}
+		info, err := root.Lstat(relative)
+		if err != nil {
+			return ErrSourceChanged
+		}
+		identity, err := s.identity(name, info)
+		if err != nil || identity.version != entry.Version {
+			return ErrSourceChanged
+		}
+		if entry.Kind == EntryDirectory {
+			directories = append(directories, scannedDirectory{name: relative, version: entry.Version})
+		}
+	}
+	for _, directory := range directories {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		info, err := root.Lstat(directory.name)
+		if err != nil {
+			return ErrSourceChanged
+		}
+		name := s.root
+		if directory.name != "." {
+			name = filepath.Join(s.root, directory.name)
+		}
+		identity, err := s.identity(name, info)
+		if err != nil || identity.version != directory.version {
+			return ErrSourceChanged
+		}
+	}
+	rootAfter, err := os.Lstat(s.root)
+	if err != nil || !rootAfter.IsDir() || !os.SameFile(rootInfo, rootAfter) {
+		return ErrSourceChanged
+	}
+	return nil
 }
 
 const maxSymlinkTargetHops = 255

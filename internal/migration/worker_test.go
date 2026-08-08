@@ -64,6 +64,16 @@ type workerServer struct {
 	caps             client.MigrationCapabilities
 }
 
+func (m *memoryTarget) resourceNlink(resourceID string) uint32 {
+	var count uint32
+	for _, node := range m.nodes {
+		if node.resourceID == resourceID {
+			count++
+		}
+	}
+	return count
+}
+
 func (s *workerServer) handler(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	authorization := r.Header.Get("Authorization")
@@ -144,7 +154,7 @@ func (m *memoryTarget) handler(w http.ResponseWriter, r *http.Request) {
 		entries := make([]client.FileInfo, 0, len(names))
 		for _, name := range names {
 			node := m.nodes[name]
-			entries = append(entries, client.FileInfo{Name: name, Size: int64(len(node.data)), Revision: node.revision, Mode: node.mode, HasMode: true, ResourceID: node.resourceID, Nlink: 1})
+			entries = append(entries, client.FileInfo{Name: name, Size: int64(len(node.data)), Revision: node.revision, Mode: node.mode, HasMode: true, ResourceID: node.resourceID, Nlink: m.resourceNlink(node.resourceID)})
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries})
 		if m.afterList != nil {
@@ -174,7 +184,7 @@ func (m *memoryTarget) handler(w http.ResponseWriter, r *http.Request) {
 				results[i] = client.BatchStatResult{Path: remote, Status: http.StatusNotFound, Error: "missing"}
 				continue
 			}
-			results[i] = client.BatchStatResult{Path: remote, Status: http.StatusOK, Size: int64(len(node.data)), Revision: node.revision, Mode: node.mode, HasMode: true, ResourceID: node.resourceID, Nlink: 1}
+			results[i] = client.BatchStatResult{Path: remote, Status: http.StatusOK, Size: int64(len(node.data)), Revision: node.revision, Mode: node.mode, HasMode: true, ResourceID: node.resourceID, Nlink: m.resourceNlink(node.resourceID)}
 			if request.IncludeChecksum {
 				sum := sha256.Sum256(node.data)
 				results[i].ChecksumSHA256 = hex.EncodeToString(sum[:])
@@ -197,7 +207,7 @@ func (m *memoryTarget) handler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(node.revision, 10))
 		w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(node.mode), 10))
 		w.Header().Set("X-Dat9-Resource-ID", node.resourceID)
-		w.Header().Set("X-Dat9-Nlink", "1")
+		w.Header().Set("X-Dat9-Nlink", strconv.FormatUint(uint64(m.resourceNlink(node.resourceID)), 10))
 		w.Header().Set("X-Dat9-Checksum-SHA256", hex.EncodeToString(sum[:]))
 		w.WriteHeader(http.StatusOK)
 	case http.MethodPut:
@@ -823,6 +833,56 @@ func TestRoundRevalidatesSourceAndCheckpointImmediatelyBeforeApply(t *testing.T)
 			}
 			if !worker.State().Conditions.Attention {
 				t.Fatal("pre-Apply identity change did not raise Attention")
+			}
+		})
+	}
+}
+
+func TestRoundRejectsSourceMutationDuringTargetInventory(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*testing.T, string)
+	}{
+		{
+			name: "existing file changes",
+			change: func(t *testing.T, root string) {
+				if err := os.WriteFile(filepath.Join(root, "a"), []byte("changed-content"), 0o644); err != nil {
+					t.Error(err)
+				}
+			},
+		},
+		{
+			name: "new path appears",
+			change: func(t *testing.T, root string) {
+				if err := os.WriteFile(filepath.Join(root, "new"), []byte("new-content"), 0o644); err != nil {
+					t.Error(err)
+					return
+				}
+				future := time.Now().Add(2 * time.Second)
+				if err := os.Chtimes(root, future, future); err != nil {
+					t.Error(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "a"), []byte("same"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			target := &memoryTarget{nodes: map[string]memoryTargetNode{
+				"a": {data: []byte("same"), revision: 1, mode: 0o100644, resourceID: "a"},
+			}}
+			worker, server := newRoundWorker(t, root, target)
+			defer server.Close()
+			target.afterList = func() { tc.change(t, root) }
+
+			err := worker.Round(context.Background(), RoundModeFull)
+			if !errors.Is(err, ErrSourceChanged) {
+				t.Fatalf("Round error=%v, want ErrSourceChanged", err)
+			}
+			if current := worker.State().Current; current.ScanComplete || current.Converged {
+				t.Fatalf("source mutation published round: %+v", current)
 			}
 		})
 	}

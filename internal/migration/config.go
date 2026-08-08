@@ -321,13 +321,22 @@ func ConfigHash(cfg *Config, job Job) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("config hash references unknown Space %q", job.Target.SpaceRef)
 	}
+	type stableJob struct {
+		VolumeID string       `json:"volume_id"`
+		Source   SourceConfig `json:"source"`
+		Target   TargetConfig `json:"target"`
+	}
 	body, err := json.Marshal(struct {
 		Version     string       `json:"version"`
 		Drive9      Drive9Config `json:"drive9"`
 		JobDefaults JobDefaults  `json:"job_defaults"`
-		Job         Job          `json:"job"`
+		Job         stableJob    `json:"job"`
 		Space       SpaceConfig  `json:"space"`
-	}{cfg.Version, cfg.Drive9, cfg.JobDefaults, job, space})
+	}{
+		Version: cfg.Version, Drive9: cfg.Drive9, JobDefaults: cfg.JobDefaults,
+		Job:   stableJob{VolumeID: job.VolumeID, Source: job.Source, Target: job.Target},
+		Space: space,
+	})
 	if err != nil {
 		return "", fmt.Errorf("marshal config hash input: %w", err)
 	}
