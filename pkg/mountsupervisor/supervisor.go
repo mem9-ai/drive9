@@ -807,7 +807,7 @@ func (s *supervisor) persist() error {
 
 func (s *supervisor) logf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(s.cfg.Stderr, "drive9: supervisor: %s\n", msg)
+	_, _ = fmt.Fprintf(s.cfg.Stderr, "drive9: supervisor: %s\n", msg)
 }
 
 func (s *supervisor) alert(event, detail string) {
@@ -870,13 +870,6 @@ func processAlive(pid int, creation uint64) bool {
 		return false
 	}
 	return got == creation
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // ResetCircuit clears restart budget for ensure --reset style recovery.
