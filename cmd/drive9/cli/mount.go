@@ -1638,27 +1638,27 @@ func runUmount(args []string, deps umountDeps) error {
 		return fmt.Errorf("drive9 umount: --pack-path requires an auto-pack mount or --pack")
 	}
 
-	argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
-	if err != nil {
-		return err
-	}
-	runErr := deps.run(argv)
-	// Supervisor stop already unmounts the FUSE mount. fusermount then often
-	// fails with "not found in /etc/mtab" (stderr only; ExitError is just
-	// "exit status 1"). Treat as success when we stopped a supervisor and the
-	// mountpoint is no longer active so umount exits 0 and --pack still runs.
-	// Do NOT treat broken-but-still-mounted endpoints (ENOTCONN) as gone:
-	// mountPointStillActive returns true for transport-broken mounts, and we
-	// force-unmount so the stale FUSE node is cleaned up.
-	if runErr != nil && stoppedSupervisor {
-		// Prefer mount-table reality over fusermount error strings: messages
-		// like "invalid argument" can mean a still-mounted broken FUSE node.
-		// Force-clean while active/broken; only forgive when truly gone.
-		if mountPointStillActive(mountPoint) {
-			forceUnmountMountPointCLI(mountPoint)
+	var runErr error
+	// Supervised stop already asked the supervisor to unmount. If the endpoint
+	// is gone, skip fusermount entirely — otherwise fusermount3 prints a noisy
+	// "not found in /etc/mtab" line even when umount succeeds (exit 0).
+	// If still active/broken (ENOTCONN counts as active), force-clean instead
+	// of relying on a second fusermount that may also fail.
+	if stoppedSupervisor && !mountPointStillActive(mountPoint) {
+		runErr = nil
+	} else {
+		argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
+		if err != nil {
+			return err
 		}
-		if !mountPointStillActive(mountPoint) {
-			runErr = nil
+		runErr = deps.run(argv)
+		if runErr != nil && stoppedSupervisor {
+			if mountPointStillActive(mountPoint) {
+				forceUnmountMountPointCLI(mountPoint)
+			}
+			if !mountPointStillActive(mountPoint) {
+				runErr = nil
+			}
 		}
 	}
 	if deps.goos == "windows" {
