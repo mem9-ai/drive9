@@ -1,46 +1,45 @@
 # Drive9 FUSE Mount Daemon Reliability & Supervision
 
-**Status:** design consensus (approved for implementation)
-**Date:** 2026-08-08
-**Scope:** mount daemon liveness, exit contracts, stale-mount cleanup, built-in supervision without systemd
-**Non-scope:** CSI, live reexec / fd handoff (`fuse-clean-state-reexec-audit.md`), Windows/WebDAV first-class supervision in P0/P1
+**Status:** design  
+**Date:** 2026-08-08  
+**Scope:** mount daemon liveness, exit contracts, stale-mount cleanup, built-in supervision without systemd  
+**Non-scope:** CSI, live reexec / fd handoff (`fuse-clean-state-reexec-audit.md`), Windows/WebDAV first-class supervision in P0/P1  
 
 ---
 
 ## 1. Problem summary
 
-In long-lived agent sandboxes, the drive9 FUSE daemon is a critical process that currently has **orphan semantics and a success-biased exit path**. When it dies, customers see a dead mountpoint (`ENOTCONN` / "Transport endpoint is not connected") with no clear reason, no automatic recovery, and no platform-agnostic supervisor.
+In long-lived agent sandboxes and containers, the drive9 FUSE daemon is a critical process that currently has **orphan semantics and a success-biased exit path**. When it dies, operators see a dead mountpoint (`ENOTCONN` / "Transport endpoint is not connected") with no clear reason, no automatic recovery, and no platform-agnostic supervisor.
 
 ### 1.1 What fails today (mapped to code)
 
 | Failure mode | Current behavior | Code anchor |
 | --- | --- | --- |
-| Serve loop ends (kernel connection drop, unexpected unmount) | `server.Wait()` returns → `shutdown(); return nil` → **exit 0**, often **no reason log** | `pkg/fuse/mount.go` (~716–718) |
+| Serve loop ends (kernel connection drop, unexpected unmount) | `server.Wait()` returns → `shutdown(); return nil` → **exit 0**, often **no reason log** | `pkg/fuse/mount.go` |
 | Background mount | Parent starts `--foreground` child with **`Setsid: true`**, waits for pidfile readiness, **exits 0** and never supervises | `cmd/drive9/cli/mount_background_unix.go`, `mount.go` `startMountBackgroundImpl` |
-| SIGKILL / OOM kill | No atexit; kernel FUSE mount remains; pidfile may linger | e2e crash-recovery paths force-unmount after `kill -9` |
+| SIGKILL / OOM kill | No atexit; kernel FUSE mount remains; pidfile may linger | e2e crash-recovery force-unmount after `kill -9` |
 | Intentional umount vs crash | Both look like "process gone"; no stop token; systemd `Restart=always` fights `drive9 umount` | `UmountCmd` |
 | Health / hang | No continuous probe after mount; freeze leaves session "up" while IO wedges | `probeMountPointReady` is startup-only |
 | Alerts | Logs under cache/tmp; no status surface | `mountBackgroundLogPath` |
 
-### 1.2 Customer-visible symptom chain
+### 1.2 Operator-visible symptom chain
 
 1. Daemon dies silently (or exits 0 after Wait).
-2. Kernel keeps a dead FUSE superblock (for example at `/mnt/agents`).
-3. All agent IO returns `ENOTCONN` / `ECONNABORTED`.
+2. Kernel keeps a dead FUSE superblock at the mountpoint.
+3. All IO through the mount returns `ENOTCONN` / `ECONNABORTED`.
 4. Without systemd, nothing restarts the daemon; even with systemd, clean umount restarts unless carefully gated.
-5. Recovery requires force-unmount + remount, or sandbox recreate.
+5. Recovery requires force-unmount + remount, or environment recreate.
 
 ### 1.3 Root-cause framing
 
 This is not primarily a FUSE durability bug. It is a **process lifecycle / supervision** gap. Data recovery after crash is already partly covered (journal / shadow / pending + e2e crash recovery). **Mount availability** is not.
 
-### 1.4 Customer incident context (illustrative)
+Common fingerprints:
 
-- Long-lived sandbox (~17h) with FUSE mount at `/mnt/agents`.
-- Daemon dies mid-session; no auto-reconnect.
-- Fingerprints: `Transport endpoint is not connected` (ENOTCONN after daemon death), `Software caused connection abort` (ECONNABORTED, often daemon↔server path).
-- Mount flags example: `drive9 mount --mode=fuse -allow-other -readdir-prefetch --parallel-read-concurrency 8 --read-concurrency 48 --profile coding-agent :/path /mnt/drive9`
-- Temporary mitigation: pasted systemd units with healthcheck + `Restart=always` (side effect: `drive9 umount` exit 0 causes restart unless `systemctl stop`). Many sandboxes have **no systemd**.
+- `Transport endpoint is not connected` (ENOTCONN after daemon death / stale mount)
+- `Software caused connection abort` (ECONNABORTED; may appear on daemon↔server or broken local paths)
+
+Operators sometimes mitigate with pasted systemd units (`Restart=always` + external healthcheck). That does not work where systemd is unavailable, and `Restart=always` restarts clean `drive9 umount` unless stop is carefully gated.
 
 ---
 
@@ -119,12 +118,12 @@ drive9 mount …                      # CLI parent: wait ready, exit 0 (UX uncha
 
 ### 3.3 Exit code contract (worker)
 
-Implemented as a typed error with `ExitCode() int` (already honored by `cmd/drive9/main.go` `fatal()`).
+Implemented as a typed error with `ExitCode() int` (honored by `cmd/drive9/main.go` `fatal()`).
 
 | Code | Meaning | Supervisor restarts? |
 | --- | --- | --- |
 | **0** | Intentional / clean stop | **No** |
-| **1** | Force-quit after second signal (intentional stop semantics) | **No** |
+| **1** | Force-quit after second signal, or unclassified failure | **Yes** without stop token (intent-first; see below) |
 | **2** | Usage / flag errors | **No** |
 | **3** | Serve loop ended abnormally | **Yes** |
 | **4** | Unhealthy / panic | **Yes** |
@@ -140,13 +139,14 @@ Supervisor final exit codes:
 | 1 | Internal supervisor error |
 | 3 | Gave up (circuit open / permanent start budget exhausted) |
 
-#### Implementation constraint: intent-first restart decisions
+#### Intent-first restart decisions
 
 Restart decisions are **supervisor-intent-first**, not "exit code alone":
 
-- Health kills must restart even if the worker exits 0 after SIGTERM (clean unmount path) — gate "no restart" on **stop token / STOPPING**, not only codes 0/1.
+- Stop token / STOPPING always suppresses restart.
+- Health kills must restart even if the worker exits 0 after SIGTERM (clean unmount path).
 - On worker exit 0 while supervisor is still RUNNING, re-check that the mountpoint is inactive; if still active, treat as serve-loop-abnormal.
-- During P0, classify startup failures into 5/6 aggressively so a generic exit 1 cannot silently suppress a deserved restart.
+- Startup failures should be classified as 5/6 aggressively so a generic exit 1 cannot silently suppress a deserved restart. Bare exit 1 without a stop token is treated as restartable.
 
 ---
 
@@ -181,8 +181,8 @@ Top-level `recover` in `pkg/fuse.Mount`: log stack, force-unmount if mount still
 On every terminal transition, emit one structured line (human + key=value / JSON line for scrapers):
 
 ```
-drive9: mount lifecycle event=serve_end reason=unexpected_wait mountpoint=/mnt/agents pid=123 uptime=4h12m
-drive9: mount lifecycle event=force_unmount mountpoint=/mnt/agents result=ok|err
+drive9: mount lifecycle event=serve_end reason=unexpected_wait mountpoint=/mnt/drive9 pid=123 uptime=4h12m
+drive9: mount lifecycle event=force_unmount mountpoint=/mnt/drive9 result=ok|err
 drive9: mount lifecycle event=exit code=3 reason=fuse_serve_ended_unexpectedly
 ```
 
@@ -202,7 +202,7 @@ Three layers (defense in depth):
 | --- | --- | --- |
 | **L1 In-worker** | Abnormal Wait, panic recover, second signal | existing `forceUnmount` + stronger Linux death-path flags |
 | **L2 Supervisor** | Worker `Wait` for any reason; health fail; pre-start | Always ensure mountpoint is not a dead FUSE mount before restart |
-| **L3 External** | Supervisor itself SIGKILLed | `drive9 mount ensure` / agent preflight |
+| **L3 External** | Supervisor itself SIGKILLed | `drive9 mount ensure` / platform preflight |
 
 #### Death-path force-unmount
 
@@ -267,7 +267,7 @@ Optional secondary signal (P1 if cheap): control-socket `status` ping (read-only
 
 Marker-file fallback when supervisor socket is unreachable (dead/racing supervisor): a supervisor that later sees its worker exit checks the marker first — present → no restart, exit 0.
 
-This also fixes temporary systemd pastes: unit `ExecStop` must call `drive9 umount` (writes stop token), not merely kill the process.
+This also makes systemd units correct: unit `ExecStop` should call `drive9 umount` (writes stop token), not merely kill the process. Prefer `Restart=on-failure`, not `Restart=always`.
 
 #### Restart rules
 
@@ -302,7 +302,7 @@ Supervisor restarts worker with the **same argv/env snapshot** captured at first
 
 ### 4.5 Alerts / observability
 
-P0/P1 local-first (sandbox constraint):
+P0/P1 local-first (sandbox / offline constraint):
 
 1. **Background log** (existing path) — lifecycle events always.
 2. **Status JSON** — supervisor sidecar for platform probes (no secrets).
@@ -340,7 +340,7 @@ No dependency on drive9-server for mount-local reliability alerts.
 | --- | --- |
 | `drive9 mount status [--json] <mountpoint>` | merge supervisor + worker + probe into machine-readable status |
 | `drive9 mount ensure <mountpoint>` | idempotent reconcile: healthy→0; stale/dead→clean+start; supervisor dead but worker alive→adopt-by-monitor (poll + CreationTime, not waitpid) |
-| `drive9 mount health <mountpoint>` | P2 / scripts: exit 0 healthy, 1 unhealthy |
+| `drive9 mount health <mountpoint>` | scripts / units: exit 0 healthy, 1 unhealthy |
 | `drive9 umount` | supervisor-aware: stop token → SIGTERM supervisor → existing fusermount path; wait for supervisor exit |
 | `drive9 doctor fuse` | live supervised checks, stale ENOTCONN detection |
 
@@ -378,7 +378,7 @@ Supervisor status sidecar (example fields):
 ```json
 {
   "role": "supervisor",
-  "mount_point": "/mnt/agents",
+  "mount_point": "/mnt/drive9",
   "worker_pid": 1234,
   "supervisor_pid": 1200,
   "state": "running|restarting|stopping|circuit_open|failed",
@@ -392,7 +392,7 @@ Supervisor status sidecar (example fields):
 }
 ```
 
-**Recommendation for pidfile ownership in supervised mode:** supervisor owns the authoritative `WriteProcessState` after ready (so umount finds the right process); worker may skip the global pidfile when launched with an internal `--supervised` flag, or supervisor overwrites after ready — pick one and test umount thoroughly. Control socket remains on the worker.
+**Pidfile ownership in supervised mode:** supervisor owns the authoritative `WriteProcessState` after ready (so umount finds the right process). Worker may skip the global pidfile when launched with an internal `--supervised` flag. Control socket remains on the worker; supervisor records the deterministic control-socket path in process state.
 
 Stop token / status / supervisor state files use the same hash scheme as pidfiles under temp/runtime dirs — **never under the FUSE mountpoint** (mount may be wedged).
 
@@ -400,7 +400,7 @@ Supervisor exclusivity: flock on `drive9-mount-<hash>.supervise.lock` so two `dr
 
 ### 4.8 Interaction with systemd (supplement only)
 
-Generate optional unit (P2), for example `drive9 mount --print-systemd-unit …`:
+Generate optional unit (P2), for example `drive9 mount systemd-unit …` or `--print-systemd-unit`:
 
 ```ini
 [Service]
@@ -411,17 +411,16 @@ Restart=on-failure
 RestartSec=2
 KillMode=mixed
 TimeoutStopSec=70
-# Do NOT use Restart=always without stop-token semantics —
-# that was the temporary paste footgun.
+# Do NOT use Restart=always without stop-token semantics.
 ```
 
 Because intentional stop exits 0, `Restart=on-failure` is correct. Document: never `Restart=always` without stop-token semantics; pair `TimeoutStopSec` with the worker's second-SIGTERM force-quit path.
 
-Existing pasted units keep working better after P0 alone: exit 3/4/6 become restartable under `on-failure`, exit 0 no longer lies about clean death.
+After P0 alone, existing units using `on-failure` also improve: exit 3/4/6 become restartable; exit 0 no longer lies about clean death.
 
 ### 4.9 Data safety
 
-Restart is a **cold remount**. Existing journal WAL replay, shadow store, pending index, and commit-queue recovery (keyed by stable mount-hash cache dirs) make crash remount data-safe enough for the customer path. Prefer SIGTERM before SIGKILL on health kills so the drain path can run. `close-sync`-class durability profiles further bound in-flight loss.
+Restart is a **cold remount**. Existing journal WAL replay, shadow store, pending index, and commit-queue recovery (keyed by stable mount-hash cache dirs) make crash remount data-safe enough for the reliability path. Prefer SIGTERM before SIGKILL on health kills so the drain path can run. `close-sync`-class durability profiles further bound in-flight loss.
 
 Live open file descriptors held by workloads at crash time get EIO/ENOTCONN — inherent to FUSE remount, acceptable for this reliability scope (not live reexec).
 
@@ -431,7 +430,7 @@ Live open file descriptors held by workloads at crash time get EIO/ENOTCONN — 
 
 ### P0 — Honest death + local cleanup
 
-**Customer impact:** logs show why mount died; abnormal death exits non-zero; best-effort unmount on death; less ENOTCONN after "polite" exits. **Does not alone survive SIGKILL.**
+**Impact:** logs show why mount died; abnormal death exits non-zero; best-effort unmount on death; less ENOTCONN after "polite" exits. **Does not alone survive SIGKILL.**
 
 | Task | Files (indicative) |
 | --- | --- |
@@ -447,9 +446,9 @@ Live open file descriptors held by workloads at crash time get EIO/ENOTCONN — 
 
 **Acceptance:** non-SIGKILL deaths never leave silent exit 0 with ENOTCONN.
 
-**Foreground SIGTERM semantics (clarify):** unsupervised / foreground worker SIGTERM remains intentional stop (exit 0) for operator expectation. Supervised worker SIGTERM **from supervisor during STOPPING** is intentional. Serve ended without signal/stop → exit 3. SIGKILL has no worker code path; supervisor handles in P1.
+**Foreground SIGTERM semantics:** unsupervised / foreground worker SIGTERM remains intentional stop (exit 0) for operator expectation. Supervised worker SIGTERM **from supervisor during STOPPING** is intentional. Serve ended without signal/stop → exit 3. SIGKILL has no worker code path; supervisor handles in P1.
 
-### P1 — Built-in supervisor (customer fix)
+### P1 — Built-in supervisor
 
 | Task | Files (indicative) |
 | --- | --- |
@@ -469,14 +468,14 @@ Live open file descriptors held by workloads at crash time get EIO/ENOTCONN — 
 **Acceptance:**
 
 ```bash
-drive9 mount --mode=fuse ... :/projects/<id> /mnt/agents
+drive9 mount --mode=fuse ... :/remote/path /mnt/drive9
 # or:
 drive9 mount --supervise-foreground ... &
 
 kill -9 <worker_pid>
 # within seconds: mount usable again OR clean remount; no permanent ENOTCONN
 
-drive9 umount /mnt/agents
+drive9 umount /mnt/drive9
 # process tree gone; no restart
 ```
 
@@ -485,11 +484,11 @@ drive9 umount /mnt/agents
 | Task | Notes |
 | --- | --- |
 | `drive9 mount health` | exit 0/1 for scripts / systemd |
-| `--print-systemd-unit` | `on-failure` + `ExecStop=umount` |
+| `drive9 mount systemd-unit` / print unit | `on-failure` + `ExecStop=umount` |
 | Optional webhook / alert file | fire-and-forget |
 | `doctor fuse` live supervised checks | stale + status |
 | Log rotation for mount-logs | pre-existing unbounded growth |
-| Optional sd_notify | only if customers use WatchdogSec |
+| Optional sd_notify | for WatchdogSec units |
 | Control-socket status op polish | if not done in P1 |
 | Vault / WebDAV parity if needed | later |
 
@@ -517,26 +516,26 @@ drive9 umount /mnt/agents
 
 ---
 
-## 7. Recommended customer recipes
+## 7. Recommended recipes
 
 ```bash
-# Preferred in sandboxes that keep a main process / have orphan reapers:
+# Sandboxes that keep a main process / may reap orphans:
 drive9 mount --supervise-foreground --mode=fuse -allow-other \
   -readdir-prefetch --parallel-read-concurrency 8 --read-concurrency 48 \
   --profile coding-agent :/path /mnt/drive9
 
-# Or platform-side periodic reconcile:
-drive9 mount ensure /mnt/agents
+# Platform-side periodic reconcile:
+drive9 mount ensure /mnt/drive9
 
 # Default supervised background when orphan GC is not hostile:
-drive9 mount --mode=fuse ... :/projects/<id> /mnt/agents
+drive9 mount --mode=fuse ... :/path /mnt/drive9
 
 # Clean stop (never restarts):
-drive9 umount /mnt/agents
+drive9 umount /mnt/drive9
 
 # Inspect:
-drive9 mount status /mnt/agents
-drive9 doctor fuse --mountpoint /mnt/agents
+drive9 mount status /mnt/drive9
+drive9 doctor fuse --mountpoint /mnt/drive9
 ```
 
 ---
@@ -559,24 +558,8 @@ drive9 doctor fuse --mountpoint /mnt/agents
 
 ---
 
-## 9. Consensus record
-
-This design captures the agreed implementation plan for in-binary mount supervision:
-
-- Supervisor + worker process model without requiring systemd
-- P0 honest exit classification via `unmountRequested` + `activeMountPoint`
-- Supervisor-side FUSE probe as primary hang detector (worker self-probe rejected as primary)
-- Stop token + SIGTERM supervisor for intentional stop
-- Circuit breaker stay-alive semantics with `circuit_open`
-- `mount ensure` as the no-systemd platform reconcile primitive
-- `--supervise-foreground` as the sandbox/orphan-reaper recipe
-
-Implementation constraints include intent-first restart, circuit open force-unmount, persist sanitized Args, readiness handshake change, RUNNING-only health counting, and adopt-by-monitor caveats.
-
----
-
-## 10. Related documents
+## 9. Related documents
 
 - `docs/design/fuse-clean-state-reexec-audit.md` — live reexec / fd handoff (orthogonal; not this work)
 - `docs/design/fuse-durability-policy.md` — write/fsync durability profiles (orthogonal; restarts are cold remount + existing recovery)
-- `docs/openclaw-drive9-fuse.md` — operational FUSE guidance (update after P1 for supervised recipes)
+- `docs/openclaw-drive9-fuse.md` — operational FUSE guidance (update for supervised recipes)
