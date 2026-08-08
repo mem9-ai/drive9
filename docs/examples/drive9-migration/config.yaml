@@ -1,0 +1,40 @@
+version: v3
+drive9:
+  endpoint: https://drive9.example.com
+job_defaults:
+  sync:
+    grace_period: 60s
+  performance:
+    max_bytes_per_second: 104857600
+    small_file_workers: 8
+    large_file_workers: 2
+spaces:
+  volume-a:
+    credential_ref: volume-a-owner-key
+  shared:
+    credential_ref: shared-owner-key
+jobs:
+  - volume_id: vol-0a
+    node_name: migration-node-a
+    source:
+      type: ebs
+      root: /mnt/ebs/vol-0a
+    target:
+      space_ref: volume-a
+      prefix: /
+  - volume_id: vol-0b
+    node_name: migration-node-b
+    source:
+      type: ebs
+      root: /mnt/ebs/vol-0b
+    target:
+      space_ref: shared
+      prefix: /vol-0b
+  - volume_id: vol-0c
+    node_name: migration-node-c
+    source:
+      type: ebs
+      root: /mnt/ebs/vol-0c
+    target:
+      space_ref: shared
+      prefix: /vol-0c
