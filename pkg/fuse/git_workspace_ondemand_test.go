@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -224,8 +225,22 @@ func TestArmedLocalMarkerForcesReloadForNewWorkspace(t *testing.T) {
 	}
 
 	// Advance local arm signal with a new workspace id (same mount, second --fast).
-	time.Sleep(5 * time.Millisecond)
+	// Force a strictly later mtime so coarse CI filesystems (1s granularity)
+	// still observe mtimeAdvanced; a fixed 5ms sleep is not enough on HFS+/NFS.
 	if err := gitcache.MarkWorkspaceRegistered(context.Background(), localRoot, "ws-b"); err != nil {
+		t.Fatal(err)
+	}
+	armedPath := gitcache.WorkspaceArmedPath(localRoot)
+	info, err := os.Stat(armedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	later := info.ModTime().Add(2 * time.Second)
+	if err := os.Chtimes(armedPath, later, later); err != nil {
+		t.Fatal(err)
+	}
+	refreshPath := gitcache.WorkspaceRefreshMarkerPath(localRoot, "ws-b")
+	if err := os.Chtimes(refreshPath, later, later); err != nil {
 		t.Fatal(err)
 	}
 	// Clear throttle so scan sees new mtime.
@@ -253,7 +268,6 @@ func TestEnsureGitWorkspacesStillWorksForTests(t *testing.T) {
 	if !ok || rt == nil || rel != "README.md" {
 		t.Fatalf("loaded path ok=%v rel=%q", ok, rel)
 	}
-	_ = time.Second
 }
 
 func TestCarryGitKnownSizesIntoRuntime(t *testing.T) {

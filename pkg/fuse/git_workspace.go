@@ -67,6 +67,10 @@ type gitWorkspaceLayer struct {
 	ensureInflight   bool
 	ensureWait       chan struct{}
 
+	// stopCtx cancels background probe/hydrate loops on mount teardown.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
+
 	materialize     map[string]*gitMaterializeCall
 	hydrateStarted  map[string]struct{}
 	ignoreCache     map[string]bool
@@ -130,12 +134,24 @@ type pendingGitOverlayEntry struct {
 }
 
 func newGitWorkspaceLayer() *gitWorkspaceLayer {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &gitWorkspaceLayer{
+		stopCtx:         ctx,
+		stopCancel:      cancel,
 		materialize:     make(map[string]*gitMaterializeCall),
 		hydrateStarted:  make(map[string]struct{}),
 		ignoreCache:     make(map[string]bool),
 		gitStateRefresh: make(map[string]time.Time),
 	}
+}
+
+// stopGitWorkspaceBackground cancels long-lived git-workspace goroutines
+// (index probe loop, SSE probe helpers). Safe to call multiple times.
+func (fs *Dat9FS) stopGitWorkspaceBackground() {
+	if fs == nil || fs.git == nil || fs.git.stopCancel == nil {
+		return
+	}
+	fs.git.stopCancel()
 }
 
 func (fs *Dat9FS) ensureGitWorkspaces(ctx context.Context) error {
@@ -177,6 +193,8 @@ func (fs *Dat9FS) disarmGitWorkspacesLocked() {
 	fs.git.workspaces = nil
 	fs.git.dormantConfirmed = true
 	fs.git.pendingForce = false
+	fs.git.localArmMtime = time.Time{}
+	fs.git.localArmScanAt = time.Time{}
 }
 
 // probeGitWorkspaceIndexAsync starts a background probe with retries on network
@@ -202,17 +220,32 @@ func (fs *Dat9FS) runGitWorkspaceIndexProbeLoop() {
 		if fs == nil || fs.git == nil {
 			return
 		}
+		stopCtx := fs.git.stopCtx
 		fs.git.mu.Lock()
 		if fs.git.armed || fs.git.dormantConfirmed {
 			fs.git.mu.Unlock()
 			return
 		}
 		fs.git.mu.Unlock()
+		if stopCtx != nil {
+			select {
+			case <-stopCtx.Done():
+				return
+			default:
+			}
+		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), fuseTimeout)
+		base := context.Background()
+		if stopCtx != nil {
+			base = stopCtx
+		}
+		ctx, cancel := context.WithTimeout(base, fuseTimeout)
 		err := fs.probeGitWorkspaceIndex(ctx)
 		cancel()
 		if err == nil {
+			return
+		}
+		if stopCtx != nil && stopCtx.Err() != nil {
 			return
 		}
 		// Permanent auth/permission failures: stop probing (e.g. fs_scoped cannot
@@ -228,7 +261,17 @@ func (fs *Dat9FS) runGitWorkspaceIndexProbeLoop() {
 			return
 		}
 		safeLogPrintf("git workspace index probe: %v (retry in %s)", err, backoff)
-		time.Sleep(backoff)
+		timer := time.NewTimer(backoff)
+		if stopCtx != nil {
+			select {
+			case <-stopCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		} else {
+			<-timer.C
+		}
 		if backoff < gitWorkspaceListBackoffMax {
 			backoff *= 2
 			if backoff > gitWorkspaceListBackoffMax {
@@ -393,6 +436,12 @@ func (fs *Dat9FS) maybeRescanRemoteIndex(ctx context.Context) bool {
 		if prevRev == 0 && prevMT.IsZero() {
 			return false
 		}
+		// Clear observed index state so subsequent rescans do not re-force list
+		// every gitWorkspaceIndexRescanInterval (would reintroduce idle polling).
+		fs.git.mu.Lock()
+		fs.git.indexRevision = 0
+		fs.git.indexMtime = time.Time{}
+		fs.git.mu.Unlock()
 		return true
 	}
 	if rev != prevRev || (!mtime.IsZero() && mtime.After(prevMT)) {
@@ -415,14 +464,20 @@ func (fs *Dat9FS) notifyGitWorkspaceIndexChanged() {
 	fs.git.indexScanAt = time.Time{} // force rescan
 	// If we were dormant-confirmed empty, re-probe and arm if needed.
 	wasArmed := fs.git.armed
+	if !wasArmed {
+		// Allow the async probe loop to run again (including retries on
+		// transient network errors). A single-shot probe can drop a cross-host
+		// --fast after a timeout/5xx.
+		fs.git.indexProbeDone = false
+	}
 	fs.git.mu.Unlock()
+	if !wasArmed {
+		fs.probeGitWorkspaceIndexAsync()
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), fuseTimeout)
 		defer cancel()
-		if !wasArmed {
-			_ = fs.probeGitWorkspaceIndex(ctx)
-			return
-		}
 		_ = fs.forceRefreshGitWorkspaces(ctx)
 	}()
 }
@@ -475,9 +530,11 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 			}
 		}
 		// After waiting: if force arrived mid-flight (pendingForce still set) or
-		// we still lack a snapshot, re-enter as leader.
+		// we still lack a successful snapshot, re-enter as leader.
+		// Empty workspaces with loaded=true is a valid snapshot (no workspaces
+		// under this mount) — do not re-list per waiter.
 		fs.git.mu.Lock()
-		need := fs.git.pendingForce || !fs.git.loaded || len(fs.git.workspaces) == 0
+		need := fs.git.pendingForce || !fs.git.loaded
 		fs.git.mu.Unlock()
 		if need {
 			return fs.ensureGitWorkspacesWithRefresh(ctx, true)
@@ -627,15 +684,58 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 	}
 
 	fs.git.mu.Lock()
+	// On partial load failure, keep previous runtimes for workspaces that failed
+	// this round so they are not dropped until a successful reload.
+	if incomplete != nil && len(fs.git.workspaces) > 0 {
+		have := make(map[string]struct{}, len(loaded))
+		for _, rt := range loaded {
+			have[rt.workspace.WorkspaceID] = struct{}{}
+		}
+		for _, prev := range fs.git.workspaces {
+			if prev == nil {
+				continue
+			}
+			id := strings.TrimSpace(prev.workspace.WorkspaceID)
+			if id == "" {
+				continue
+			}
+			if _, ok := have[id]; ok {
+				continue
+			}
+			if fs.gitWorkspaceDeletedLocally(ctx, id) {
+				continue
+			}
+			loaded = append(loaded, prev)
+			have[id] = struct{}{}
+		}
+		sort.Slice(loaded, func(i, j int) bool {
+			return len(loaded[i].localRoot) > len(loaded[j].localRoot)
+		})
+	}
 	fs.git.workspaces = loaded
 	fs.git.loaded = true
 	fs.git.loadedAt = loadedAt
-	fs.git.listFailures = 0
-	fs.git.listBackoff = 0
-	fs.git.listBackoffUntil = time.Time{}
-	// Consume sticky force only if no newer force arrived mid-flight.
-	if fs.git.pendingForceGen == startForceGen {
-		fs.git.pendingForce = false
+	if incomplete != nil {
+		// Keep backoff so event-driven path still retries failed workspaces.
+		fs.git.listFailures++
+		if fs.git.listBackoff == 0 {
+			fs.git.listBackoff = gitWorkspaceListBackoffMin
+		} else {
+			fs.git.listBackoff *= 2
+			if fs.git.listBackoff > gitWorkspaceListBackoffMax {
+				fs.git.listBackoff = gitWorkspaceListBackoffMax
+			}
+		}
+		fs.git.listBackoffUntil = time.Now().Add(fs.git.listBackoff)
+		// Leave pendingForce sticky so a later lookup after backoff re-lists.
+	} else {
+		fs.git.listFailures = 0
+		fs.git.listBackoff = 0
+		fs.git.listBackoffUntil = time.Time{}
+		// Consume sticky force only if no newer force arrived mid-flight.
+		if fs.git.pendingForceGen == startForceGen {
+			fs.git.pendingForce = false
+		}
 	}
 	if len(loaded) == 0 {
 		// Empty list: disarm if no local arm signal remains.
@@ -646,7 +746,8 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 		fs.git.mu.Unlock()
 		signal, _ := gitcache.LocalArmSignal(ctx, localRoot, time.Time{})
 		fs.git.mu.Lock()
-		if !signal {
+		// Re-check emptiness under lock so we do not wipe a concurrent install.
+		if !signal && len(fs.git.workspaces) == 0 {
 			fs.disarmGitWorkspacesLocked()
 		}
 	}
@@ -4528,12 +4629,27 @@ func (fs *Dat9FS) removeGitWorkspaceRoot(ctx context.Context, rt *gitWorkspaceRu
 			break
 		}
 	}
-	if len(fs.git.workspaces) == 0 {
-		fs.disarmGitWorkspacesLocked()
-	} else {
+	last := len(fs.git.workspaces) == 0
+	if !last {
 		fs.git.loadedAt = time.Now()
 	}
+	localRoot := ""
+	if fs.opts != nil {
+		localRoot = strings.TrimSpace(fs.opts.LocalRoot)
+	}
 	fs.git.mu.Unlock()
+	// Clear armed/refresh markers first, then re-disarm under lock so a concurrent
+	// path op cannot re-arm from stale markers between unlock and clear.
+	if last && localRoot != "" {
+		if err := gitcache.ClearLocalArmSignals(ctx, localRoot); err != nil {
+			safeLogPrintf("git workspace clear local arm signals after last delete: %v", err)
+		}
+		fs.git.mu.Lock()
+		if len(fs.git.workspaces) == 0 {
+			fs.disarmGitWorkspacesLocked()
+		}
+		fs.git.mu.Unlock()
+	}
 	fs.inodes.Remove(localPath)
 	fs.invalidateReadCacheAndTargets(localPath)
 	fs.dirCache.Invalidate(parentDir(localPath))

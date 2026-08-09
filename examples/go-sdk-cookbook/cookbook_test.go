@@ -435,8 +435,11 @@ func ExampleClient_eventsLayersGitAndJournal() {
 		})
 		_, _ = c.GetGitOverlayEntry(ctx, ws.WorkspaceID, "README.md")
 		_, _ = c.ListGitOverlayEntries(ctx, ws.WorkspaceID)
-		_ = c.RemoveGitWorkspaceIndexEntry(ctx, ws.WorkspaceID)
-		_ = c.DeleteGitWorkspace(ctx, ws.WorkspaceID)
+		// Prefer index removal before workspace delete so FUSE does not arm on a
+		// stale existence signal. Examples intentionally ignore network errors.
+		if err := c.RemoveGitWorkspaceIndexEntry(ctx, ws.WorkspaceID); err == nil {
+			_ = c.DeleteGitWorkspace(ctx, ws.WorkspaceID)
+		}
 	}
 
 	j, err := c.CreateJournal(ctx, journal.CreateRequest{

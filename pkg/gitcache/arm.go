@@ -2,6 +2,7 @@ package gitcache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -85,14 +86,16 @@ func LocalArmSignal(ctx context.Context, localRoot string, lastScanMtime time.Ti
 	// armed file
 	consider(WorkspaceArmedPath(localRoot))
 
-	// any refresh/<id> marker or the refresh directory itself
+	// Any refresh/<id> file marker. An empty refresh/ directory alone is not a
+	// signal (avoids re-arming after ClearLocalArmSignals left a bare dir).
 	refreshDir := WorkspaceRefreshDir(localRoot)
-	consider(refreshDir)
 	if entries, err := os.ReadDir(refreshDir); err == nil {
+		fileCount := 0
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
 			}
+			fileCount++
 			info, err := e.Info()
 			if err != nil {
 				continue
@@ -102,7 +105,7 @@ func LocalArmSignal(ctx context.Context, localRoot string, lastScanMtime time.Ti
 				maxMtime = mt
 			}
 		}
-		if len(entries) > 0 && maxMtime.IsZero() {
+		if fileCount > 0 && maxMtime.IsZero() {
 			// Directory exists with entries but mtimes unreadable — still a signal.
 			maxMtime = time.Now()
 		}
@@ -135,4 +138,46 @@ func MarkWorkspaceRegistered(ctx context.Context, localRoot, workspaceID string)
 		return err
 	}
 	return TouchWorkspaceArmed(ctx, localRoot)
+}
+
+// ClearLocalArmSignals removes the LocalRoot armed file and refresh markers so a
+// mount can stay dormant after the last workspace is deleted. Deleted markers
+// under git-workspaces/deleted/ are left intact.
+func ClearLocalArmSignals(ctx context.Context, localRoot string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	localRoot = strings.TrimSpace(localRoot)
+	if localRoot == "" {
+		return nil
+	}
+	var errs []error
+	armed := WorkspaceArmedPath(localRoot)
+	if err := os.Remove(armed); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("remove git workspace armed marker %q: %w", armed, err))
+	}
+	refreshDir := WorkspaceRefreshDir(localRoot)
+	entries, err := os.ReadDir(refreshDir)
+	if err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("read git workspace refresh dir %q: %w", refreshDir, err))
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		p := filepath.Join(refreshDir, e.Name())
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove git workspace refresh marker %q: %w", p, err))
+		}
+	}
+	// Drop the refresh directory itself so LocalArmSignal does not treat an empty
+	// dir mtime as an arm signal.
+	_ = os.Remove(refreshDir)
+	if len(errs) == 0 {
+		return nil
+	}
+	return errors.Join(errs...)
 }

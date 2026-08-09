@@ -61,3 +61,34 @@ func TestMarkWorkspaceRegistered(t *testing.T) {
 	}
 	_ = filepath.Join(root, "x")
 }
+
+func TestClearLocalArmSignals(t *testing.T) {
+	root := t.TempDir()
+	if err := MarkWorkspaceRegistered(context.Background(), root, "ws1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearLocalArmSignals(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(WorkspaceArmedPath(root)); !os.IsNotExist(err) {
+		t.Fatalf("armed marker still present after clear, err=%v", err)
+	}
+	if _, err := os.Stat(WorkspaceRefreshMarkerPath(root, "ws1")); !os.IsNotExist(err) {
+		t.Fatalf("refresh marker still present after clear, err=%v", err)
+	}
+	ok, _ := LocalArmSignal(context.Background(), root, time.Time{})
+	if ok {
+		t.Fatal("LocalArmSignal after ClearLocalArmSignals = true, want false")
+	}
+}
+
+func TestLocalArmSignalEmptyRefreshDir(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(WorkspaceRefreshDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ok, _ := LocalArmSignal(context.Background(), root, time.Time{})
+	if ok {
+		t.Fatal("LocalArmSignal with empty refresh/ only = true, want false")
+	}
+}

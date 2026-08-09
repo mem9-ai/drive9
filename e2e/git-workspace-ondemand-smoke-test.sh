@@ -826,6 +826,14 @@ precheck_fuse() {
 cleanup() {
   local rc=$?
   stop_mount >/dev/null 2>&1 || true
+  # Existing-tenant CI (local-dev-key) accumulates timestamped remote trees; always
+  # best-effort delete the suite RemoteRoot when API credentials are known.
+  if [ -n "${API_KEY:-}" ] && [ -n "${REMOTE_ROOT:-}" ] && [ -n "${CLI_BIN:-}" ] && [ -x "${CLI_BIN:-}" ]; then
+    drive9 fs rm -r --force ":$REMOTE_ROOT" >/dev/null 2>&1 || \
+      curl -sS --max-time 60 -o /dev/null -X DELETE \
+        -H "Authorization: Bearer $API_KEY" \
+        "$BASE/v1/fs${REMOTE_ROOT}?recursive=true" >/dev/null 2>&1 || true
+  fi
   if [ "$rc" -ne 0 ] || [ "$FAIL" -ne 0 ]; then
     if [ -n "$RUN_ROOT" ] && [ -d "$RUN_ROOT" ]; then
       find "$RUN_ROOT" -type f -name 'mount-*.log' -print | while read -r log_file; do
@@ -983,7 +991,13 @@ check_cmd "D first repo ready" wait_repo_git_ready "$repo_d1"
 ls -la "$repo_d1" >/dev/null
 sleep 0.5
 # Baseline after first --fast: at least one workspace under this root.
-ws_after_first=$(list_count_for_root "$REMOTE_ROOT") || ws_after_first="0"
+# Do not default a transport failure to "0" — that softens the growth check.
+ws_after_first=""
+if ws_after_first=$(list_count_for_root "$REMOTE_ROOT"); then
+  :
+else
+  ws_after_first="err"
+fi
 check_ge "D ListGitWorkspaces >=1 after first --fast" "$ws_after_first" "1"
 check_cmd "D second clone --fast (new root)" \
   drive9_with_timeout "$GIT_ONDEMAND_CLONE_TIMEOUT_S" git clone --fast --hydrate=off "$FIXTURE_URL" "$repo_d2"
@@ -1002,7 +1016,11 @@ check_forced_ge "D G3 forced_refresh >= 2 (arm + second --fast force)" "$log_d" 
 ws_count=$(list_count_for_root "$REMOTE_ROOT") || ws_count="err"
 check_ge "D ListGitWorkspaces returns >=2 under suite RemoteRoot" "$ws_count" "2"
 # Growth after second clone proves the second registration landed (complements force counter).
-check_ge "D ListGitWorkspaces grew after second --fast" "$ws_count" "$((ws_after_first + 1))"
+if [ "$ws_after_first" != "err" ] && [ -n "$ws_after_first" ]; then
+  check_ge "D ListGitWorkspaces grew after second --fast" "$ws_count" "$((ws_after_first + 1))"
+else
+  check_cmd "D ListGitWorkspaces grew after second --fast (baseline unreadable)" false
+fi
 idx_n=$(index_count_for_root "$REMOTE_ROOT") || idx_n="err"
 check_ge "D remote index has >=2 workspace entries under suite RemoteRoot" "$idx_n" "2"
 fetch_remote_index_body >"$RUN_ROOT/index-d.json"

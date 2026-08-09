@@ -518,13 +518,15 @@ func gitWorktreeRemove(args []string) error {
 		return fmt.Errorf("delete linked git workspace: %w", err)
 	}
 	cancel()
+	// Index cleanup can fail after the irreversible workspace delete. Always
+	// finish local marker/overlay/worktree cleanup so a partial failure does not
+	// leave a broken local worktree that cannot be looked up for retry.
+	var cleanupErrs []error
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	if err := c.RemoveGitWorkspaceIndexEntry(ctx, ws.WorkspaceID); err != nil {
-		cancel()
-		return fmt.Errorf("remove linked git workspace from index: %w", err)
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("remove linked git workspace from index: %w", err))
 	}
 	cancel()
-	var cleanupErrs []error
 	if err := markLocalGitWorkspaceDeleted(cmdCtx, resolved, ws.WorkspaceID); err != nil {
 		cleanupErrs = append(cleanupErrs, fmt.Errorf("mark linked git workspace deleted locally: %w", err))
 	}

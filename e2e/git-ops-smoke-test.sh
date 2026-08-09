@@ -640,18 +640,33 @@ wait_repo_ops_ready() {
   start=$(date +%s)
   deadline=$(( start + timeout_s ))
   while :; do
-    if configure_git_identity "$repo" \
-      && assert_repo_ready "$repo" \
-      && assert_fixture_reads "$repo" \
-      && assert_clean_status "$repo"; then
+    # Bound each readiness attempt so a hung FUSE read cannot exceed the settle
+    # window indefinitely (git_cmd is already timeout-wrapped; wrap FS greps too).
+    if run_with_timeout 15 bash -c "
+      configure_git_identity() { git -C \"\$1\" config user.email drive9-e2e@example.test && git -C \"\$1\" config user.name 'Drive9 E2E'; }
+      # Inline light probes; full helpers may not be exported to this subshell.
+      git -C \"$repo\" config user.email drive9-e2e@example.test >/dev/null 2>&1 || exit 1
+      git -C \"$repo\" config user.name 'Drive9 E2E' >/dev/null 2>&1 || exit 1
+      test -e \"$repo/.git\" || exit 1
+      git -C \"$repo\" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 1
+      git -C \"$repo\" log --oneline -1 >/dev/null 2>&1 || exit 1
+      git -C \"$repo\" status --porcelain=v1 --untracked-files=all >/dev/null 2>&1 || exit 1
+      grep -q 'Drive9 fixture' \"$repo/README.md\" || exit 1
+      grep -q 'Fixture guide' \"$repo/docs/guide.md\" || exit 1
+      git -C \"$repo\" ls-files --error-unmatch README.md docs/guide.md src/app.py script.sh >/dev/null 2>&1 || exit 1
+      git -C \"$repo\" ls-files --stage script.sh | grep -q '^100755 ' || exit 1
+      test \"\$(readlink '$repo/link-to-readme')\" = 'README.md' || exit 1
+      out=\$(git -C \"$repo\" status --porcelain=v1 --untracked-files=all) || exit 1
+      test -z \"\$out\"
+    "; then
       return 0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
       echo "wait_repo_ops_ready: timeout after ${timeout_s}s repo=$repo" >&2
-      # Last-ditch diagnostics for CI logs.
+      # Last-ditch diagnostics for CI logs (stdout preserved; git stderr silenced).
       git_cmd -C "$repo" status --porcelain=v1 --untracked-files=all 2>/dev/null | head -n 40 >&2 || true
-      git_cmd -C "$repo" rev-parse HEAD 2>/dev/null >&2 || true
-      ls -la "$repo" 2>/dev/null | head -n 20 >&2 || true
+      git_cmd -C "$repo" rev-parse HEAD >&2 2>/dev/null || true
+      run_with_timeout 10 ls -la "$repo" 2>/dev/null | head -n 20 >&2 || true
       return 1
     fi
     sleep 0.5
