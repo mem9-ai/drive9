@@ -63,7 +63,7 @@ func NewWorker(ctx context.Context, startup *Startup) (*Worker, error) {
 	if err != nil {
 		return nil, err
 	}
-	observedSource, err := observeMountedSource(startup.Job.Source.Root, startup.Job.VolumeID)
+	observedSource, err := sourceMountProbeFor(startup)(startup.Job.Source.Root, startup.Job.VolumeID)
 	if err != nil {
 		return nil, fmt.Errorf("observe mounted source: %w", err)
 	}
@@ -215,7 +215,7 @@ func (w *Worker) validateSourceMount() error {
 		err      error
 	)
 	if w.startup != nil && w.startup.Job.Source.Root != "" {
-		observed, err = observeMountedSource(w.startup.Job.Source.Root, w.startup.Job.VolumeID)
+		observed, err = sourceMountProbeFor(w.startup)(w.startup.Job.Source.Root, w.startup.Job.VolumeID)
 	} else if w.scanner != nil {
 		observed, err = observeSourceRoot(w.scanner.root)
 	} else {

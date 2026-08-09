@@ -471,7 +471,10 @@ func newWorkerStartup(t *testing.T, root string, server *httptest.Server) *Start
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Startup{Config: config, Job: job, Space: config.Spaces["space"], Phase: PhaseSyncing, ConfigHash: hash, Credential: credential}
+	return &Startup{
+		Config: config, Job: job, Space: config.Spaces["space"], Phase: PhaseSyncing,
+		ConfigHash: hash, Credential: credential, mountProbe: testMountedSourceProbe,
+	}
 }
 
 func replaceSourceRootWithEmptyDirectory(t *testing.T, root string) {

@@ -97,7 +97,7 @@ func prefixesOverlap(left, right string) bool {
 
 // Preflight performs the shared read-only plan/run gate for one local Job.
 func Preflight(ctx context.Context, startup *Startup) (PreflightResult, error) {
-	return preflightWithProbe(ctx, startup, observeMountedSource, nil)
+	return preflightWithProbe(ctx, startup, sourceMountProbeFor(startup), nil)
 }
 
 func preflightWithVerifier(ctx context.Context, startup *Startup, verifyVolume func(string, string) (bool, error)) (PreflightResult, error) {

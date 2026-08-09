@@ -5,6 +5,33 @@ import (
 	"testing"
 )
 
+func testMountedSourceProbe(root, volumeID string) (sourceMountIdentity, error) {
+	identity, err := observeSourceRoot(root)
+	if err != nil {
+		return sourceMountIdentity{}, err
+	}
+	identity.VolumeSerial = canonicalVolumeID(volumeID)
+	if identity.VolumeSerial == "" {
+		return sourceMountIdentity{}, errors.New("test mount probe received invalid volume_id")
+	}
+	identity.VolumeIdentityVerified = true
+	return identity, nil
+}
+
+func TestSourceMountProbeForUsesStartupScopedOverride(t *testing.T) {
+	want := sourceMountIdentity{Device: 1, Inode: 2, VolumeSerial: "vol-001", VolumeIdentityVerified: true}
+	startup := &Startup{mountProbe: func(root, volumeID string) (sourceMountIdentity, error) {
+		if root != "/source" || volumeID != "vol-001" {
+			t.Fatalf("probe arguments = %q, %q", root, volumeID)
+		}
+		return want, nil
+	}}
+	got, err := sourceMountProbeFor(startup)("/source", "vol-001")
+	if err != nil || got != want {
+		t.Fatalf("probe identity = %+v, err = %v", got, err)
+	}
+}
+
 func TestExtractEBSVolumeIDRequiresExactToken(t *testing.T) {
 	for _, tc := range []struct {
 		serial string

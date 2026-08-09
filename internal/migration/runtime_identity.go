@@ -22,6 +22,15 @@ type sourceMountIdentity struct {
 	VolumeIdentityVerified bool
 }
 
+type sourceMountProbe func(root, volumeID string) (sourceMountIdentity, error)
+
+func sourceMountProbeFor(startup *Startup) sourceMountProbe {
+	if startup != nil && startup.mountProbe != nil {
+		return startup.mountProbe
+	}
+	return observeMountedSource
+}
+
 func observeSourceRoot(root string) (sourceMountIdentity, error) {
 	info, err := os.Lstat(root)
 	if err != nil {

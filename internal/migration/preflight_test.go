@@ -200,6 +200,7 @@ func preflightStartup(t *testing.T, endpoint, root string) *Startup {
 	if err != nil {
 		t.Fatal(err)
 	}
+	startup.mountProbe = testMountedSourceProbe
 	return startup
 }
 
