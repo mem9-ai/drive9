@@ -47,6 +47,10 @@ type Config struct {
 	Profile       string
 	LocalRoot     string
 	PackPaths     []string
+	// Adopt-by-monitor: poll an existing worker without waitpid (orphan recovery).
+	Adopt               bool
+	AdoptWorkerPID      int
+	AdoptWorkerCreation uint64
 	// ReadyNotify is closed once the first worker is ready (optional).
 	ReadyNotify chan<- struct{}
 	// Now/Sleep allow tests to inject clocks.
@@ -67,18 +71,20 @@ func Run(cfg Config) error {
 type supervisor struct {
 	cfg Config
 
-	mu             sync.Mutex
-	state          mountstate.SupervisorState
-	stopRequested  bool
-	workerCmd      *exec.Cmd
-	workerWait     chan exitResult
-	restarts       []time.Time
+	mu            sync.Mutex
+	state         mountstate.SupervisorState
+	stopRequested bool
+	workerCmd     *exec.Cmd
+	workerWait    chan exitResult
+	restarts      []time.Time
 	permanentFails int
-	backoff        time.Duration
-	lockFile       *os.File
+	backoff       time.Duration
+	lockFile      *os.File
+	adopted       bool
+	startedAt     time.Time
 
-	healthFails int
-	lastHealth  string
+	healthFails   int
+	lastHealth    string
 	lastHealthErr string
 }
 
@@ -102,16 +108,30 @@ func newSupervisor(cfg Config) (*supervisor, error) {
 	if len(cfg.WorkerArgs) == 0 {
 		return nil, fmt.Errorf("mountsupervisor: worker args required")
 	}
+	startedAt := cfg.Now()
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
 	lock, err := acquireLock(cfg.MountPoint)
 	if err != nil {
 		return nil, err
 	}
+	// Only after exclusive lock: clear stop tokens that predate this process
+	// (sticky tokens from SIGKILL-path umount). A token newer than startedAt
+	// is a concurrent intentional stop — honor it, do not clear.
+	if ts, ok := mountstate.ReadStopTokenTime(cfg.MountPoint); ok {
+		if ts.IsZero() || ts.Before(startedAt) {
+			_ = mountstate.ClearStopToken(cfg.MountPoint)
+		}
+	}
 	creation, _ := mountstate.ProcessCreationTime(os.Getpid())
 	now := cfg.Now()
 	s := &supervisor{
-		cfg:      cfg,
-		lockFile: lock,
-		backoff:  time.Second,
+		cfg:       cfg,
+		lockFile:  lock,
+		backoff:   time.Second,
+		startedAt: startedAt,
+		adopted:   cfg.Adopt && cfg.AdoptWorkerPID > 0,
 		state: mountstate.SupervisorState{
 			PID:          os.Getpid(),
 			CreationTime: creation,
@@ -124,6 +144,10 @@ func newSupervisor(cfg Config) (*supervisor, error) {
 			RemoteRoot:   cfg.RemoteRoot,
 			Profile:      cfg.Profile,
 		},
+	}
+	if s.adopted {
+		s.state.WorkerPID = cfg.AdoptWorkerPID
+		s.state.WorkerCreation = cfg.AdoptWorkerCreation
 	}
 	_ = s.persist()
 	return s, nil
@@ -184,9 +208,12 @@ func (s *supervisor) loop() error {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	// Best-effort clean before first spawn.
-	if _, err := drive9fuse.EnsureCleanMountpoint(s.cfg.MountPoint); err != nil {
-		s.logf("pre-start clean: %v", err)
+	// Fresh stop token written after we acquired the lock (concurrent umount).
+	if mountstate.StopTokenPresent(s.cfg.MountPoint) {
+		if ts, ok := mountstate.ReadStopTokenTime(s.cfg.MountPoint); ok && !ts.IsZero() && !ts.Before(s.startedAt) {
+			s.requestStop("stop token present at start")
+			return s.shutdownClean()
+		}
 	}
 
 	readyOnce := sync.Once{}
@@ -195,6 +222,37 @@ func (s *supervisor) loop() error {
 			return
 		}
 		readyOnce.Do(func() { close(s.cfg.ReadyNotify) })
+	}
+
+	// Adopt-by-monitor: do not force-clean a live healthy orphan worker.
+	if s.adopted {
+		if !processAlive(s.state.WorkerPID, s.state.WorkerCreation) {
+			s.logf("adopt: worker pid %d not alive; falling back to spawn", s.state.WorkerPID)
+			s.adopted = false
+		} else {
+			s.setState(mountstate.SupervisorStateRunning)
+			_ = s.writeAuthoritativeProcessState()
+			s.logf("adopt: monitoring existing worker pid=%d", s.state.WorkerPID)
+			notifyReady()
+			// Poll-based supervise (no waitpid on non-child).
+			res, stop := s.superviseAdopted(sigCh)
+			if stop {
+				return s.shutdownClean()
+			}
+			s.adopted = false
+			s.clearWorker()
+			code, reason := s.classifyExit(res.err)
+			s.recordExit(code, reason)
+			if s.isStopRequested() || mountstate.StopTokenPresent(s.cfg.MountPoint) {
+				return s.shutdownClean()
+			}
+			// Fall through into normal restart/spawn path below.
+		}
+	}
+
+	// Best-effort clean before first spawn (not when adopting a live worker).
+	if _, err := drive9fuse.EnsureCleanMountpoint(s.cfg.MountPoint); err != nil {
+		s.logf("pre-start clean: %v", err)
 	}
 
 	for {
@@ -401,6 +459,77 @@ func (s *supervisor) superviseRunning(sigCh <-chan os.Signal) (error, bool) {
 	}
 }
 
+// superviseAdopted polls an existing worker (not our child) until death or stop.
+func (s *supervisor) superviseAdopted(sigCh <-chan os.Signal) (exitResult, bool) {
+	healthTicker := time.NewTicker(s.cfg.HealthInterval)
+	defer healthTicker.Stop()
+	poll := time.NewTicker(time.Second)
+	defer poll.Stop()
+	s.workerWait = make(chan exitResult, 1)
+	for {
+		select {
+		case sig := <-sigCh:
+			s.requestStop(fmt.Sprintf("signal %v", sig))
+			s.stopAdoptedWorker()
+			return exitResult{}, true
+		case <-poll.C:
+			if s.isStopRequested() || mountstate.StopTokenPresent(s.cfg.MountPoint) {
+				s.requestStop("stop during adopt")
+				s.stopAdoptedWorker()
+				return exitResult{}, true
+			}
+			s.mu.Lock()
+			pid, creation := s.state.WorkerPID, s.state.WorkerCreation
+			s.mu.Unlock()
+			if !processAlive(pid, creation) {
+				s.logf("adopt: worker pid %d died", pid)
+				return exitResult{err: drive9fuse.ExitUnhealthyErr("adopted worker died")}, false
+			}
+		case <-healthTicker.C:
+			if s.isStopRequested() || mountstate.StopTokenPresent(s.cfg.MountPoint) {
+				s.requestStop("stop during adopt health")
+				s.stopAdoptedWorker()
+				return exitResult{}, true
+			}
+			if !s.healthOK() {
+				s.healthFails++
+				s.setHealth("fail", s.lastHealthErr)
+				if s.healthFails >= s.cfg.HealthFailures {
+					s.logf("adopt: health failed %d times; stopping worker: %s", s.healthFails, s.lastHealthErr)
+					s.alert("mount_unhealthy", s.lastHealthErr)
+					s.stopAdoptedWorker()
+					return exitResult{err: drive9fuse.ExitUnhealthyErr(s.lastHealthErr)}, false
+				}
+			} else {
+				s.healthFails = 0
+				s.setHealth("ok", "")
+			}
+		}
+	}
+}
+
+func (s *supervisor) stopAdoptedWorker() {
+	s.mu.Lock()
+	pid, creation := s.state.WorkerPID, s.state.WorkerCreation
+	s.mu.Unlock()
+	if pid <= 0 || !processAlive(pid, creation) {
+		return
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	_ = proc.Signal(syscall.SIGTERM)
+	deadline := time.Now().Add(s.cfg.StopTimeout)
+	for time.Now().Before(deadline) {
+		if !processAlive(pid, creation) {
+			return
+		}
+		s.cfg.Sleep(100 * time.Millisecond)
+	}
+	_ = proc.Kill()
+}
+
 func (s *supervisor) healthOK() bool {
 	s.mu.Lock()
 	pid := s.state.WorkerPID
@@ -410,10 +539,11 @@ func (s *supervisor) healthOK() bool {
 		s.lastHealthErr = "worker process not alive"
 		return false
 	}
-	// Bound probe with timeout via channel.
+	// Local-only health for kill decisions: never readdir/remote List.
+	// Backend outage while mounted is degraded status, not FUSE death.
 	done := make(chan error, 1)
 	go func() {
-		done <- drive9fuse.ProbeMountPointReady(s.cfg.MountPoint)
+		done <- drive9fuse.ProbeMountLocalHealth(s.cfg.MountPoint)
 	}()
 	select {
 	case err := <-done:
@@ -593,6 +723,8 @@ func (s *supervisor) stopWorker() {
 	s.mu.Lock()
 	cmd := s.workerCmd
 	waitCh := s.workerWait
+	adopted := s.adopted
+	pid, creation := s.state.WorkerPID, s.state.WorkerCreation
 	// Take ownership of wait channel so a second stopWorker/shutdownClean
 	// cannot re-drain the same channel for StopTimeout.
 	s.workerWait = nil
@@ -601,6 +733,16 @@ func (s *supervisor) stopWorker() {
 	s.state.WorkerCreation = 0
 	s.mu.Unlock()
 	if cmd == nil || cmd.Process == nil {
+		if adopted && pid > 0 {
+			// Restore identity temporarily for stopAdoptedWorker.
+			s.mu.Lock()
+			s.state.WorkerPID, s.state.WorkerCreation = pid, creation
+			s.mu.Unlock()
+			s.stopAdoptedWorker()
+			s.mu.Lock()
+			s.state.WorkerPID, s.state.WorkerCreation = 0, 0
+			s.mu.Unlock()
+		}
 		return
 	}
 	_ = cmd.Process.Signal(syscall.SIGTERM)
@@ -967,9 +1109,12 @@ func CollectStatus(mountPoint string) StatusSnapshot {
 			}
 		}
 	}
-	if err := drive9fuse.ProbeMountPointReady(mountPoint); err != nil {
-		snap.ProbeError = err.Error()
+	// Local health for ensure/status exit: never treat backend readdir failure
+	// as unhealthy FUSE. Optional IO probe is reported in ProbeError only.
+	localErr := drive9fuse.ProbeMountLocalHealth(mountPoint)
+	if localErr != nil {
 		snap.Healthy = false
+		snap.ProbeError = localErr.Error()
 		if snap.State == "" {
 			snap.State = "unhealthy"
 		}
@@ -977,6 +1122,17 @@ func CollectStatus(mountPoint string) StatusSnapshot {
 		snap.Healthy = true
 		if snap.State == "" {
 			snap.State = "running"
+		}
+		if ioErr := drive9fuse.ProbeMountPointReady(mountPoint); ioErr != nil {
+			// Degraded: local endpoint OK but full IO probe failed (often remote).
+			snap.ProbeError = ioErr.Error()
+		}
+	}
+	// Dead supervisor with healthy local endpoint is not fully supervised.
+	if snap.SupervisorPID > 0 && !processAlive(snap.SupervisorPID, 0) {
+		// Soft signal for ensure: keep Healthy for IO but mark state.
+		if snap.State == "running" {
+			snap.State = "orphan_worker"
 		}
 	}
 	return snap

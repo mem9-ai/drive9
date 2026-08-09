@@ -739,11 +739,6 @@ func TestHandleForkDeleteNativeFailedCleansBranchBeforeDeletingStatus(t *testing
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("status code = %d, body = %s", rr.Code, rr.Body.String())
 	}
-	// Concurrent resumeDeletingForkTenants may race; wait until terminal.
-	waitForCondition(t, func() bool {
-		got, err := rt.meta.GetTenant(context.Background(), "fork-failed")
-		return err == nil && got.Status == meta.TenantDeleted
-	})
 	got, err := rt.meta.GetTenant(context.Background(), "fork-failed")
 	if err != nil {
 		t.Fatal(err)
@@ -751,21 +746,16 @@ func TestHandleForkDeleteNativeFailedCleansBranchBeforeDeletingStatus(t *testing
 	if got.Status != meta.TenantDeleted {
 		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantDeleted)
 	}
-	deleted := rt.prov.deletedBranches()
-	if len(deleted) == 0 {
-		t.Fatal("branch was not deleted")
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-a" {
+		t.Fatalf("deleted branches = %#v", deleted)
 	}
-	for _, d := range deleted {
-		if d != "cluster-a/branch-a" {
-			t.Fatalf("deleted branches = %#v, want only cluster-a/branch-a", deleted)
-		}
-	}
-	// Prefer the request-provided credentials when the API path claimed cleanup.
-	// If the resume worker claimed first (no request creds), default credentials
-	// may have been used instead — both are valid cleanup outcomes.
 	credentialReqs := rt.prov.credentialRequests()
 	if len(credentialReqs) == 0 {
 		t.Fatal("DeleteBranchWithCredentials was not called")
+	}
+	last := credentialReqs[len(credentialReqs)-1]
+	if last.PublicKey != "public-1" || last.PrivateKey != "private-1" {
+		t.Fatalf("last credential request = %+v", last)
 	}
 }
 

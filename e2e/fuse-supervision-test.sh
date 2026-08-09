@@ -26,7 +26,7 @@ DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 # Leave headroom over CLI defaultMountBackgroundReadyTimeout (30s).
-MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-45}"
+MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-60}"
 MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
 HEAL_TIMEOUT_S="${HEAL_TIMEOUT_S:-60}"
 HEAL_INTERVAL_S="${HEAL_INTERVAL_S:-2}"
@@ -34,6 +34,8 @@ NO_RESTART_OBSERVE_S="${NO_RESTART_OBSERVE_S:-12}"
 # Bound individual FUSE I/O / health / mountpoint probes so a wedged FUSE
 # endpoint cannot hang the PR gate until the global job timeout.
 FUSE_PROBE_TIMEOUT_S="${FUSE_PROBE_TIMEOUT_S:-10}"
+# close-sync write+read can exceed 10s under CI load; keep mountpoint/health shorter.
+FUSE_IO_PROBE_TIMEOUT_S="${FUSE_IO_PROBE_TIMEOUT_S:-30}"
 FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
 FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-45s}"
@@ -147,7 +149,8 @@ probe_mount_io() {
   local marker="$1"
   local f="$MOUNT_POINT/supervise-probe.txt"
   # Shell write/read can block forever on a wedged FUSE endpoint; bound them.
-  with_timeout "$FUSE_PROBE_TIMEOUT_S" bash -c '
+  # Use IO-specific budget: close-sync durability may need longer than health probes.
+  with_timeout "$FUSE_IO_PROBE_TIMEOUT_S" bash -c '
     marker="$1"; f="$2"
     printf "%s\n" "$marker" >"$f" || exit 1
     got="$(tr -d "\n" <"$f" 2>/dev/null || true)"
@@ -202,13 +205,20 @@ pid_alive() {
 wait_healthy_io() {
   local label="$1"
   local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  local last_fail="unknown"
   while :; do
-    if is_mounted "$MOUNT_POINT" \
-      && with_timeout "$FUSE_PROBE_TIMEOUT_S" drive9 mount health "$MOUNT_POINT" >/dev/null 2>&1 \
-      && probe_mount_io "$label-$(date +%s)"; then
+    if ! is_mounted "$MOUNT_POINT"; then
+      last_fail="is_mounted"
+    elif ! with_timeout "$FUSE_PROBE_TIMEOUT_S" drive9 mount health "$MOUNT_POINT" >/dev/null 2>&1; then
+      last_fail="mount_health"
+    elif ! probe_mount_io "$label-$(date +%s)"; then
+      last_fail="probe_mount_io"
+    else
       return 0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "wait_healthy_io timed out after ${MOUNT_READY_TIMEOUT_S}s (last_fail=$last_fail)" >&2
+      drive9 mount status --json "$MOUNT_POINT" >&2 || true
       return 1
     fi
     sleep "$MOUNT_READY_INTERVAL_S"

@@ -57,9 +57,9 @@ const (
 )
 
 func PIDFilePath(mountPoint string) string {
-	canonical := canonicalMountPoint(mountPoint)
-	sum := sha256.Sum256([]byte(canonical))
-	return filepath.Join(os.TempDir(), "drive9-mount-"+hex.EncodeToString(sum[:8])+".pid")
+	// Legacy location kept for cross-version umount of mounts started before
+	// UID-scoped state dirs. New writes still use this path.
+	return filepath.Join(os.TempDir(), "drive9-mount-"+hash8(canonicalMountPoint(mountPoint))+".pid")
 }
 
 func ControlSocketPath(mountPoint string) string {
@@ -84,15 +84,35 @@ func controlSocketDir(uid string) string {
 	return filepath.Join(os.TempDir(), "drive9-"+uid)
 }
 
+// stateDir is a UID-scoped 0700 directory for supervisor state/lock/stop/exit
+// files so other users cannot pre-create predictable paths in a sticky /tmp.
+func stateDir() string {
+	return controlSocketDir(currentUID())
+}
+
+func ensureStateDir() error {
+	dir := stateDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	_ = os.Chmod(dir, 0o700)
+	return nil
+}
+
+// canonicalMountPoint normalizes mountpoint for hashing without EvalSymlinks.
+// Symlink resolution can hang forever on a wedged FUSE endpoint; control-plane
+// path lookup must not perform mountpoint I/O.
 func canonicalMountPoint(mountPoint string) string {
 	canonical := filepath.Clean(mountPoint)
 	if abs, err := filepath.Abs(canonical); err == nil {
 		canonical = abs
 	}
-	if resolved, err := filepath.EvalSymlinks(canonical); err == nil {
-		canonical = resolved
-	}
 	return canonical
+}
+
+func hash8(canonical string) string {
+	sum := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(sum[:8])
 }
 
 func WritePID(mountPoint string, pid int) (string, error) {

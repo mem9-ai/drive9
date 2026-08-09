@@ -20,8 +20,7 @@ type ExitReason struct {
 }
 
 func ExitReasonPath(mountPoint string) string {
-	canonical := canonicalMountPoint(mountPoint)
-	return filepath.Join(os.TempDir(), "drive9-mount-"+hash8(canonical)+".exit.json")
+	return filepath.Join(stateDir(), "drive9-mount-"+hash8(canonicalMountPoint(mountPoint))+".exit.json")
 }
 
 func WriteExitReason(mountPoint string, rec ExitReason) error {
@@ -29,6 +28,9 @@ func WriteExitReason(mountPoint string, rec ExitReason) error {
 		rec.At = time.Now().UTC()
 	} else {
 		rec.At = rec.At.UTC()
+	}
+	if err := ensureStateDir(); err != nil {
+		return err
 	}
 	path := ExitReasonPath(mountPoint)
 	data, err := json.Marshal(rec)
@@ -41,6 +43,12 @@ func WriteExitReason(mountPoint string, rec ExitReason) error {
 func ReadExitReason(mountPoint string) (ExitReason, string, error) {
 	path := ExitReasonPath(mountPoint)
 	data, err := os.ReadFile(path)
+	if err != nil && os.IsNotExist(err) {
+		legacy := legacyTempStatePath(".exit.json", mountPoint)
+		if b, lerr := os.ReadFile(legacy); lerr == nil {
+			data, path, err = b, legacy, nil
+		}
+	}
 	if err != nil {
 		return ExitReason{}, path, err
 	}
@@ -52,9 +60,11 @@ func ReadExitReason(mountPoint string) (ExitReason, string, error) {
 }
 
 func ClearExitReason(mountPoint string) error {
-	path := ExitReasonPath(mountPoint)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
+	var first error
+	for _, path := range []string{ExitReasonPath(mountPoint), legacyTempStatePath(".exit.json", mountPoint)} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && first == nil {
+			first = err
+		}
 	}
-	return nil
+	return first
 }

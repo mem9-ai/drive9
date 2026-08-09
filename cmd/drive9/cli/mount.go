@@ -976,13 +976,14 @@ func stripBackgroundOnlyCredentialArgs(args []string) []string {
 	out := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		if arg == "--api-key" {
+		// Go's flag package accepts both -api-key and --api-key forms.
+		if arg == "--api-key" || arg == "-api-key" {
 			if i+1 < len(args) {
 				i++
 			}
 			continue
 		}
-		if strings.HasPrefix(arg, "--api-key=") {
+		if strings.HasPrefix(arg, "--api-key=") || strings.HasPrefix(arg, "-api-key=") {
 			continue
 		}
 		out = append(out, arg)
@@ -1039,9 +1040,7 @@ func mountBackgroundLogPath(mountPoint string) (string, error) {
 	if abs, err := filepath.Abs(canonical); err == nil {
 		canonical = abs
 	}
-	if resolved, err := filepath.EvalSymlinks(canonical); err == nil {
-		canonical = resolved
-	}
+	// Do not EvalSymlinks: that can hang on a wedged FUSE mountpoint.
 	sum := sha256.Sum256([]byte(canonical))
 	return filepath.Join(dir, "mount-"+hex.EncodeToString(sum[:8])+".log"), nil
 }

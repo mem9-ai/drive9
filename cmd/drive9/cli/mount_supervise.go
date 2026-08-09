@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -37,6 +38,9 @@ func runMountSupervise(args []string) error {
 	localRootMeta := fs.String("local-root-meta", "", "local root for pack metadata")
 	packPathsJSON := fs.String("pack-paths-json", "", "JSON array of pack paths")
 	sanitizedJSON := fs.String("sanitized-args-json", "", "JSON array of sanitized args")
+	adopt := fs.Bool("adopt", false, "adopt an existing worker by PID (poll-based; no waitpid)")
+	adoptWorkerPID := fs.Int("adopt-worker-pid", 0, "worker PID to adopt")
+	adoptWorkerCreation := fs.Uint64("adopt-worker-creation", 0, "worker process creation identity")
 	fs.SetOutput(os.Stderr)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -45,12 +49,24 @@ func runMountSupervise(args []string) error {
 	if strings.TrimSpace(*mountPoint) == "" {
 		return fmt.Errorf("drive9 mount supervise: --mountpoint is required")
 	}
-	if len(workerArgs) == 0 {
+	if !*adopt && len(workerArgs) == 0 {
 		return fmt.Errorf("drive9 mount supervise: worker args required after flags")
 	}
 	// Normalize: worker args should start with "mount".
-	if workerArgs[0] != "mount" {
+	if len(workerArgs) > 0 && workerArgs[0] != "mount" {
 		workerArgs = append([]string{"mount"}, workerArgs...)
+	}
+	if *adopt && len(workerArgs) == 0 {
+		// Reconstruct from sanitized args for post-adopt restarts.
+		if s := strings.TrimSpace(*sanitizedJSON); s != "" {
+			var sanitized []string
+			if err := json.Unmarshal([]byte(s), &sanitized); err == nil {
+				workerArgs = mountsupervisor.WorkerArgsFromSanitized(sanitized)
+			}
+		}
+		if len(workerArgs) == 0 {
+			return fmt.Errorf("drive9 mount supervise: --adopt requires worker args or sanitized-args-json")
+		}
 	}
 
 	var sanitized []string
@@ -105,9 +121,8 @@ func runMountSupervise(args []string) error {
 		}
 	}
 
-	// Stale stop tokens from a prior SIGKILL-path umount must not block remount.
-	_ = mountstate.ClearStopToken(*mountPoint)
-
+	// Stop-token clearing is done inside mountsupervisor after exclusive lock
+	// so a concurrent umount intent cannot be erased by a non-owner process.
 	return mountsupervisor.Run(mountsupervisor.Config{
 		MountPoint:     *mountPoint,
 		Executable:     exe,
@@ -131,6 +146,9 @@ func runMountSupervise(args []string) error {
 		Profile:        *profile,
 		LocalRoot:      *localRootMeta,
 		PackPaths:      packPaths,
+		Adopt:               *adopt,
+		AdoptWorkerPID:      *adoptWorkerPID,
+		AdoptWorkerCreation: *adoptWorkerCreation,
 	})
 }
 
@@ -223,9 +241,15 @@ func runMountEnsure(args []string) error {
 		_ = mountsupervisor.ResetCircuit(mp)
 	}
 	snap := mountsupervisor.CollectStatus(mp)
-	if snap.Healthy && !*restart {
+	supAlive := snap.SupervisorPID > 0 && processAliveImpl(snap.SupervisorPID)
+	workerAlive := snap.WorkerPID > 0 && processAliveImpl(snap.WorkerPID)
+	if snap.Healthy && !*restart && supAlive {
 		fmt.Fprintf(os.Stderr, "drive9: mount ensure: already healthy at %s\n", mp)
 		return nil
+	}
+	// Dead supervisor + live worker + healthy mount: adopt-by-monitor (design).
+	if snap.Healthy && !*restart && !supAlive && workerAlive {
+		return ensureAdoptSupervisor(mp, snap)
 	}
 	// Clean stale mount if needed.
 	if cleaned, err := mountsupervisor.EnsureClean(mp); err != nil {
@@ -329,6 +353,91 @@ func runMountEnsure(args []string) error {
 	sanitized = injectEnsureServerFlag(sanitized, storedServer)
 	return withEnsureCredentialEnv(storedServer, storedAPIKey, storedToken, func() error {
 		return fsMountCmdWithBackground(sanitized, true)
+	})
+}
+
+// ensureAdoptSupervisor starts a poll-based supervisor over a live orphan worker.
+func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error {
+	var workerCreation uint64
+	var sanitized []string
+	var storedServer, storedAPIKey, storedToken string
+	if st, _, err := mountstate.ReadSupervisorState(mp); err == nil {
+		workerCreation = st.WorkerCreation
+		sanitized = append([]string(nil), st.Args...)
+		storedServer = st.Server
+	}
+	if ps, _, err := mountstate.ReadProcessState(mp); err == nil {
+		if len(sanitized) == 0 {
+			sanitized = append([]string(nil), ps.Args...)
+		}
+		if storedServer == "" {
+			storedServer = ps.Server
+		}
+		storedAPIKey, storedToken = ps.APIKey, ps.Token
+	}
+	if snap.WorkerPID <= 0 {
+		return fmt.Errorf("drive9 mount ensure: adopt requires worker pid")
+	}
+	if len(sanitized) == 0 {
+		return fmt.Errorf("drive9 mount ensure: no stored mount args for adopt; remount explicitly")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	logPath, _ := mountBackgroundLogPath(mp)
+	sanitizedJSON, err := json.Marshal(sanitized)
+	if err != nil {
+		return err
+	}
+	args := []string{
+		"mount", "supervise",
+		"--mountpoint", mp,
+		"--log", logPath,
+		"--adopt",
+		"--adopt-worker-pid", fmt.Sprintf("%d", snap.WorkerPID),
+		"--adopt-worker-creation", fmt.Sprintf("%d", workerCreation),
+		"--sanitized-args-json", string(sanitizedJSON),
+		"--server", storedServer,
+	}
+	return withEnsureCredentialEnv(storedServer, storedAPIKey, storedToken, func() error {
+		cmd := exec.Command(exe, args...)
+		cmd.Env = mountBackgroundEnv(os.Environ(), mountBackgroundRequest{
+			Server: storedServer,
+			APIKey: storedAPIKey,
+			Token:  storedToken,
+		})
+		configureMountBackgroundCommand(cmd)
+		var logFile *os.File
+		if logPath != "" {
+			if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+				logFile = f
+				cmd.Stdout = f
+				cmd.Stderr = f
+			}
+		}
+		if err := cmd.Start(); err != nil {
+			if logFile != nil {
+				_ = logFile.Close()
+			}
+			return fmt.Errorf("drive9 mount ensure: start adopt supervisor: %w", err)
+		}
+		if logFile != nil {
+			// Child has inherited the fd; parent may close.
+			_ = logFile.Close()
+		}
+		// Detach: do not wait. Poll until status shows a live supervisor.
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			s2 := mountsupervisor.CollectStatus(mp)
+			if s2.SupervisorPID > 0 && processAliveImpl(s2.SupervisorPID) && s2.Healthy {
+				fmt.Fprintf(os.Stderr, "drive9: mount ensure: adopted orphan worker pid=%d under supervisor pid=%d\n",
+					snap.WorkerPID, s2.SupervisorPID)
+				return nil
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		return fmt.Errorf("drive9 mount ensure: adopt supervisor did not become ready")
 	})
 }
 

@@ -1,8 +1,6 @@
 package mountstate
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -54,21 +52,29 @@ type SupervisorState struct {
 }
 
 func SupervisorStatePath(mountPoint string) string {
-	return filepath.Join(os.TempDir(), "drive9-mount-"+hash8(canonicalMountPoint(mountPoint))+".supervise.json")
+	return filepath.Join(stateDir(), "drive9-mount-"+hash8(canonicalMountPoint(mountPoint))+".supervise.json")
 }
 
 func StopTokenPath(mountPoint string) string {
-	return filepath.Join(os.TempDir(), "drive9-mount-"+hash8(canonicalMountPoint(mountPoint))+".stop")
+	return filepath.Join(stateDir(), "drive9-mount-"+hash8(canonicalMountPoint(mountPoint))+".stop")
 }
 
 func SupervisorLockPath(mountPoint string) string {
-	return filepath.Join(os.TempDir(), "drive9-mount-"+hash8(canonicalMountPoint(mountPoint))+".supervise.lock")
+	return filepath.Join(stateDir(), "drive9-mount-"+hash8(canonicalMountPoint(mountPoint))+".supervise.lock")
+}
+
+// legacyTempStatePath is the pre-UID-scoped location under bare os.TempDir().
+func legacyTempStatePath(suffix, mountPoint string) string {
+	return filepath.Join(os.TempDir(), "drive9-mount-"+hash8(canonicalMountPoint(mountPoint))+suffix)
 }
 
 func WriteSupervisorState(mountPoint string, state SupervisorState) error {
 	state.Role = RoleSupervisor
 	if state.MountPoint == "" {
 		state.MountPoint = canonicalMountPoint(mountPoint)
+	}
+	if err := ensureStateDir(); err != nil {
+		return err
 	}
 	path := SupervisorStatePath(mountPoint)
 	data, err := json.Marshal(state)
@@ -81,6 +87,13 @@ func WriteSupervisorState(mountPoint string, state SupervisorState) error {
 func ReadSupervisorState(mountPoint string) (SupervisorState, string, error) {
 	path := SupervisorStatePath(mountPoint)
 	data, err := os.ReadFile(path)
+	if err != nil && os.IsNotExist(err) {
+		// Upgrade-compat: mounts started before UID-scoped state dirs.
+		legacy := legacyTempStatePath(".supervise.json", mountPoint)
+		if b, lerr := os.ReadFile(legacy); lerr == nil {
+			data, path, err = b, legacy, nil
+		}
+	}
 	if err != nil {
 		return SupervisorState{}, path, err
 	}
@@ -89,14 +102,6 @@ func ReadSupervisorState(mountPoint string) (SupervisorState, string, error) {
 		return SupervisorState{}, path, fmt.Errorf("read supervisor state %s: %w", path, err)
 	}
 	return state, path, nil
-}
-
-func ClearSupervisorState(mountPoint string) error {
-	path := SupervisorStatePath(mountPoint)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
 }
 
 // WriteStopToken marks intentional stop for a supervised mount.
@@ -112,23 +117,61 @@ func WriteStopToken(mountPoint string, reason string) error {
 	if err != nil {
 		return err
 	}
+	if err := ensureStateDir(); err != nil {
+		return err
+	}
 	return writeFileAtomic(StopTokenPath(mountPoint), append(data, '\n'), 0o600)
 }
 
+// ReadStopTokenTime returns the token timestamp when present.
+func ReadStopTokenTime(mountPoint string) (time.Time, bool) {
+	for _, path := range []string{StopTokenPath(mountPoint), legacyTempStatePath(".stop", mountPoint)} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var payload struct {
+			TS string `json:"ts"`
+		}
+		if json.Unmarshal(data, &payload) != nil || payload.TS == "" {
+			return time.Time{}, true
+		}
+		ts, err := time.Parse(time.RFC3339Nano, payload.TS)
+		if err != nil {
+			ts, err = time.Parse(time.RFC3339, payload.TS)
+		}
+		if err != nil {
+			return time.Time{}, true
+		}
+		return ts, true
+	}
+	return time.Time{}, false
+}
+
 func StopTokenPresent(mountPoint string) bool {
-	_, err := os.Stat(StopTokenPath(mountPoint))
+	if _, err := os.Stat(StopTokenPath(mountPoint)); err == nil {
+		return true
+	}
+	_, err := os.Stat(legacyTempStatePath(".stop", mountPoint))
 	return err == nil
 }
 
 func ClearStopToken(mountPoint string) error {
-	path := StopTokenPath(mountPoint)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
+	var first error
+	for _, path := range []string{StopTokenPath(mountPoint), legacyTempStatePath(".stop", mountPoint)} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && first == nil {
+			first = err
+		}
 	}
-	return nil
+	return first
 }
 
-func hash8(canonical string) string {
-	sum := sha256.Sum256([]byte(canonical))
-	return hex.EncodeToString(sum[:8])
+func ClearSupervisorState(mountPoint string) error {
+	var first error
+	for _, path := range []string{SupervisorStatePath(mountPoint), legacyTempStatePath(".supervise.json", mountPoint)} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && first == nil {
+			first = err
+		}
+	}
+	return first
 }

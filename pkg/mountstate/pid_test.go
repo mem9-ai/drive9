@@ -29,13 +29,17 @@ func TestPIDFilePathCanonicalizesMountPoint(t *testing.T) {
 		t.Fatalf("mkdir mountpoint: %v", err)
 	}
 
-	relPath := PIDFilePath("mnt/../mnt")
-	absPath := PIDFilePath(filepath.Join(dir, "mnt"))
-	if relPath != absPath {
-		t.Fatalf("PIDFilePath relative = %q, absolute = %q", relPath, absPath)
+	// Clean collapses mnt/../mnt; both relative forms must hash the same after Abs.
+	// Do not require equality with an absolute path that may differ by platform
+	// symlink prefixes (/var vs /private/var on macOS) because we deliberately
+	// skip EvalSymlinks to avoid hanging on wedged FUSE mounts.
+	relPath := PIDFilePath("mnt")
+	relCollapsed := PIDFilePath("mnt/../mnt")
+	if relPath != relCollapsed {
+		t.Fatalf("PIDFilePath mnt = %q, mnt/../mnt = %q", relPath, relCollapsed)
 	}
-	if !strings.HasPrefix(relPath, os.TempDir()) {
-		t.Fatalf("PIDFilePath = %q, want temp-dir path", relPath)
+	if !strings.Contains(relPath, "drive9-mount-") {
+		t.Fatalf("PIDFilePath = %q, want drive9-mount- prefix", relPath)
 	}
 }
 

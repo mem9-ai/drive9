@@ -1005,11 +1005,6 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 	if t.Kind != meta.TenantKindFork {
 		return nil
 	}
-	// Already finished (or concurrent cleanup won the race). Resume workers and
-	// API delete can both target the same failed fork; do not re-delete.
-	if t.Status == meta.TenantDeleted {
-		return nil
-	}
 	if err := s.pool.InvalidateAndWait(ctx, tenantID); err != nil {
 		return fmt.Errorf("drain fork backend: %w", err)
 	}

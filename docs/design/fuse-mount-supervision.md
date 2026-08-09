@@ -1,9 +1,9 @@
 # Drive9 FUSE Mount Daemon Reliability & Supervision
 
-**Status:** design  
-**Date:** 2026-08-08  
-**Scope:** mount daemon liveness, exit contracts, stale-mount cleanup, built-in supervision without systemd  
-**Non-scope:** CSI, live reexec / fd handoff (`fuse-clean-state-reexec-audit.md`), Windows/WebDAV first-class supervision in P0/P1  
+**Status:** design
+**Date:** 2026-08-08
+**Scope:** mount daemon liveness, exit contracts, stale-mount cleanup, built-in supervision without systemd
+**Non-scope:** CSI, live reexec / fd handoff (`fuse-clean-state-reexec-audit.md`), Windows/WebDAV first-class supervision in P0/P1
 
 ---
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 
 	"github.com/mem9-ai/drive9/pkg/mountstate"
@@ -13,6 +14,10 @@ import (
 
 func acquireLock(mountPoint string) (*os.File, error) {
 	path := mountstate.SupervisorLockPath(mountPoint)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("mountsupervisor: create lock dir: %w", err)
+	}
+	_ = os.Chmod(filepath.Dir(path), 0o700)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("mountsupervisor: open lock: %w", err)
