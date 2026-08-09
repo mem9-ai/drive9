@@ -313,6 +313,7 @@ type Startup struct {
 	ConfigHash     string           `json:"config_hash"`
 	Credential     CredentialSource `json:"-"`
 	acceptedSource sourceMountIdentity
+	mountProbe     sourceMountProbe
 }
 
 // ConfigHash hashes only one Job's normalized immutable configuration.
