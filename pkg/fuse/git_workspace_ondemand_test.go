@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -264,6 +265,213 @@ func TestEnsureGitWorkspacesStillWorksForTests(t *testing.T) {
 	rt, rel, ok := fs.loadedGitWorkspaceForPath("/repo/README.md")
 	if !ok || rt == nil || rel != "README.md" {
 		t.Fatalf("loaded path ok=%v rel=%q", ok, rel)
+	}
+}
+
+func TestProbeIndex401DoesNotLatchDormantAndRetries(t *testing.T) {
+	// First Stat returns 401 (transient); later retries must still arm when the
+	// index becomes readable. Only 403 permanently latches dormantConfirmed.
+	var headCalls atomic.Int64
+	idx := client.GitWorkspaceIndex{
+		Version: 1,
+		Workspaces: []client.GitWorkspaceIndexEntry{{
+			WorkspaceID: "ws1",
+			RootPath:    "/repo/",
+		}},
+	}
+	idxBody, _ := json.Marshal(idx)
+	indexFSPath := "/v1/fs" + client.GitWorkspaceIndexPath
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == indexFSPath && r.Method == http.MethodHead:
+			n := headCalls.Add(1)
+			if n == 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.Header().Set("Content-Length", "10")
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == indexFSPath && r.Method == http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Dat9-Revision", "1")
+			_, _ = w.Write(idxBody)
+		case r.URL.Path == "/v1/git-workspaces" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"workspaces": []map[string]any{{
+					"workspace_id": "ws1",
+					"root_path":    "/repo/",
+					"head_commit":  fixtureHeadCommit,
+					"mode":         "fast",
+					"status":       "live",
+				}},
+			})
+		case r.URL.Path == "/v1/git-workspaces/ws1/tree":
+			_ = json.NewEncoder(w).Encode(map[string]any{"nodes": []any{}})
+		case r.URL.Path == "/v1/git-workspaces/ws1/overlay":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, RemoteRoot: "/"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(srv.URL), opts)
+
+	// Single probe: 401 must surface as error and must not latch dormant.
+	err := fs.probeGitWorkspaceIndex(context.Background())
+	if err == nil {
+		t.Fatal("probeGitWorkspaceIndex: want 401 error, got nil")
+	}
+	if !client.IsUnauthorized(err) {
+		t.Fatalf("probe err = %v, want unauthorized", err)
+	}
+	fs.git.mu.Lock()
+	confirmed := fs.git.dormantConfirmed
+	armed := fs.git.armed
+	fs.git.mu.Unlock()
+	if confirmed {
+		t.Fatal("dormantConfirmed latched on 401; want retryable")
+	}
+	if armed {
+		t.Fatal("armed on 401; want unarmed until readable index")
+	}
+
+	// Async probe loop retries after backoff and arms when Stat succeeds.
+	done := make(chan struct{})
+	go func() {
+		fs.runGitWorkspaceIndexProbeLoop()
+		close(done)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if fs.gitWorkspacesArmed() {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !fs.gitWorkspacesArmed() {
+		t.Fatal("expected armed after 401 then successful index Stat retry")
+	}
+	fs.git.mu.Lock()
+	confirmed = fs.git.dormantConfirmed
+	fs.git.mu.Unlock()
+	if confirmed {
+		t.Fatal("dormantConfirmed true after successful retry arm")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		// Loop exits on arm; allow a short grace period.
+	}
+	if got := headCalls.Load(); got < 2 {
+		t.Fatalf("index HEAD calls = %d, want >= 2 (401 then success)", got)
+	}
+}
+
+func TestProbeIndex403LatchesDormant(t *testing.T) {
+	indexFSPath := "/v1/fs" + client.GitWorkspaceIndexPath
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == indexFSPath {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, RemoteRoot: "/"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(srv.URL), opts)
+
+	done := make(chan struct{})
+	go func() {
+		fs.runGitWorkspaceIndexProbeLoop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe loop did not stop on 403")
+	}
+	fs.git.mu.Lock()
+	confirmed := fs.git.dormantConfirmed
+	armed := fs.git.armed
+	fs.git.mu.Unlock()
+	if !confirmed {
+		t.Fatal("dormantConfirmed = false after 403; want permanent latch")
+	}
+	if armed {
+		t.Fatal("armed after 403; want unarmed dormant")
+	}
+}
+
+func TestPendingForceOrdinaryLookupsSingleList(t *testing.T) {
+	// 1 external force + 2 ordinary concurrent lookups must produce exactly one
+	// ListGitWorkspaces. Ordinary joins must not bump pendingForceGen (storm).
+	var listCalls atomic.Int64
+	listEntered := make(chan struct{}, 1)
+	releaseList := make(chan struct{})
+	var enteredOnce sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/git-workspaces" && r.Method == http.MethodGet {
+			n := listCalls.Add(1)
+			if n == 1 {
+				enteredOnce.Do(func() { listEntered <- struct{}{} })
+				select {
+				case <-releaseList:
+				case <-time.After(5 * time.Second):
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"workspaces": []any{}})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, RemoteRoot: "/"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(srv.URL), opts)
+	fs.markGitWorkspacesArmed()
+
+	forceErr := make(chan error, 1)
+	go func() {
+		forceErr <- fs.forceRefreshGitWorkspaces(context.Background())
+	}()
+	select {
+	case <-listEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("forced list never entered")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _ = fs.gitWorkspaceForPath(context.Background(), "/x")
+		}()
+	}
+	// Let waiters join the in-flight force before the leader finishes.
+	time.Sleep(50 * time.Millisecond)
+	close(releaseList)
+	wg.Wait()
+	if err := <-forceErr; err != nil {
+		t.Fatalf("forceRefreshGitWorkspaces: %v", err)
+	}
+	// Brief settle window for any mistaken re-enter leader.
+	time.Sleep(100 * time.Millisecond)
+	if got := listCalls.Load(); got != 1 {
+		t.Fatalf("ListGitWorkspaces calls = %d, want 1 (1 external force + 2 ordinary joins)", got)
+	}
+	fs.git.mu.Lock()
+	pending := fs.git.pendingForce
+	fs.git.mu.Unlock()
+	if pending {
+		t.Fatal("pendingForce still set after successful list with no mid-flight external force")
 	}
 }
 

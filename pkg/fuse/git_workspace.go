@@ -248,9 +248,12 @@ func (fs *Dat9FS) runGitWorkspaceIndexProbeLoop() {
 		if stopCtx != nil && stopCtx.Err() != nil {
 			return
 		}
-		// Permanent auth/permission failures: stop probing (e.g. fs_scoped cannot
+		// Permanent permission failures: stop probing (e.g. fs_scoped cannot
 		// read tenant-root /.drive9/). Do not spin forever; stay dormant.
-		if client.IsForbidden(err) || client.IsUnauthorized(err) {
+		// 401 is commonly transient (expired/refreshing token) and the client
+		// does not refresh before surfacing it — treat like network/5xx retry.
+		// Only 403 permanently latches dormantConfirmed.
+		if client.IsForbidden(err) {
 			fs.git.mu.Lock()
 			if !fs.git.armed {
 				fs.git.dormantConfirmed = true
@@ -498,16 +501,25 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 		fs.git.mu.Unlock()
 		return nil
 	}
+	// force=true means an *external* force request (local arm gen, index change,
+	// forceRefreshGitWorkspaces). Ordinary lookups must call force=false so they
+	// join an existing pending force without bumping pendingForceGen (otherwise
+	// concurrent lookups self-amplify into a list storm).
 	if force {
-		// Sticky + generation so mid-flight force is not cleared by soft success.
-		fs.git.pendingForce = true
-		fs.git.pendingForceGen++
+		if !fs.git.pendingForce {
+			fs.git.pendingForce = true
+			fs.git.pendingForceGen++
+		} else if fs.git.ensureInflight {
+			// Mid-flight external force: bump gen so the leader cannot clear sticky force.
+			fs.git.pendingForceGen++
+		}
 	}
 	// Backoff applies to soft and forced lists (G4: no op-level storm).
 	if !fs.git.listBackoffUntil.IsZero() && time.Now().Before(fs.git.listBackoffUntil) {
 		fs.git.mu.Unlock()
 		return nil
 	}
+	// Promote soft joins when a pending force already exists (no gen bump).
 	if fs.git.pendingForce {
 		force = true
 	}
@@ -535,11 +547,12 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 		// we still lack a successful snapshot, re-enter as leader.
 		// Empty workspaces with loaded=true is a valid snapshot (no workspaces
 		// under this mount) — do not re-list per waiter.
+		// Re-enter with force=false so we join/consume pending without a gen bump.
 		fs.git.mu.Lock()
 		need := fs.git.pendingForce || !fs.git.loaded
 		fs.git.mu.Unlock()
 		if need {
-			return fs.ensureGitWorkspacesWithRefresh(ctx, true)
+			return fs.ensureGitWorkspacesWithRefresh(ctx, false)
 		}
 		return nil
 	}
@@ -777,6 +790,8 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 	}
 
 	// Armed: event-driven refresh only (no empty poll).
+	// force=true only for real external events (local gen / cache invalid / index).
+	// Observing pendingForce must NOT pass force=true (would self-amplify gen).
 	force := localForce
 	if fs.gitWorkspaceCacheInvalidatedLocally(baseCtx) {
 		force = true
@@ -786,13 +801,12 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 	}
 	fs.git.mu.Lock()
 	needInitialLoad := fs.git.armed && !fs.git.loaded
-	if fs.git.pendingForce {
-		force = true
-	}
+	joinPending := fs.git.pendingForce
 	fs.git.mu.Unlock()
-	if force || needInitialLoad {
+	if force || needInitialLoad || joinPending {
 		refreshCtx, refreshCancel := context.WithTimeout(baseCtx, fuseTimeout)
-		if err := fs.ensureGitWorkspacesWithRefresh(refreshCtx, true); err != nil {
+		// External force bumps gen; soft join/needInitialLoad does not.
+		if err := fs.ensureGitWorkspacesWithRefresh(refreshCtx, force); err != nil {
 			safeLogPrintf("git workspace refresh failed for %s: %v", localPath, err)
 		}
 		refreshCancel()

@@ -1,10 +1,10 @@
 # FUSE mount: on-demand Git Workspace discovery
 
-**Status:** Final design  
-**Date:** 2026-08-09  
-**Scope:** FUSE-side git-workspace discovery and refresh; eliminate idle `/v1/git-workspaces*` traffic when the user never ran `drive9 git --fast`  
-**Non-goals:** Overlay write path, checkpoint, and hydrate protocol semantics  
-**Related:** [git-fast-clone-workspace.md](./git-fast-clone-workspace.md), [pack-unpack-profile-spec.md](./pack-unpack-profile-spec.md)  
+**Status:** Final design
+**Date:** 2026-08-09
+**Scope:** FUSE-side git-workspace discovery and refresh; eliminate idle `/v1/git-workspaces*` traffic when the user never ran `drive9 git --fast`
+**Non-goals:** Overlay write path, checkpoint, and hydrate protocol semantics
+**Related:** [git-fast-clone-workspace.md](./git-fast-clone-workspace.md), [pack-unpack-profile-spec.md](./pack-unpack-profile-spec.md)
 
 ---
 
@@ -30,10 +30,10 @@ User expectation: **if the user never registered a workspace with `drive9 git --
 
 ### 2.2 Non-goals
 
-- Do not disable future `--fast` capability by default (default is DORMANT, armable).  
-- Do not promise: after mount-time index 404 confirmation, a first `--fast` from another machine becomes visible **without remount** (see §6 product boundaries).  
-- Do not treat the remote index as the runtime source of truth (no index-only tree/overlay load).  
-- Do not add forced hiding for `/.drive9/` (same class as packs: dotdir convention).  
+- Do not disable future `--fast` capability by default (default is DORMANT, armable).
+- Do not promise: after mount-time index 404 confirmation, a first `--fast` from another machine becomes visible **without remount** (see §6 product boundaries).
+- Do not treat the remote index as the runtime source of truth (no index-only tree/overlay load).
+- Do not add forced hiding for `/.drive9/` (same class as packs: dotdir convention).
 - Do not ship a `drive9 git reindex` user command.
 
 ---
@@ -88,8 +88,8 @@ DORMANT
 /.drive9/git-workspaces/index.json
 ```
 
-- Read/write with client absolute remote paths (`StatCtx` / `ReadStream` / `WriteCtxConditionalWithRevision`). **Do not** re-join through FUSE `remotePath`.  
-- Entry `root_path` values are tenant-absolute; the mount filters by its own `RemoteRoot`.  
+- Read/write with client absolute remote paths (`StatCtx` / `ReadStream` / `WriteCtxConditionalWithRevision`). **Do not** re-join through FUSE `remotePath`.
+- Entry `root_path` values are tenant-absolute; the mount filters by its own `RemoteRoot`.
 - **fs_scoped** credentials that cannot read tenant-root `/.drive9/`: cannot arm via index; use `--git-workspaces=on` or widen scope.
 
 **Schema (existence only; keep fields small):**
@@ -110,10 +110,10 @@ DORMANT
 
 Rules:
 
-- Do not put `repo_url` or other full restore fields in the index.  
-- **After arming, always build runtime via `ListGitWorkspaces` (or Get by id)**; the index only answers “should we arm?”.  
-- Missing file or empty `workspaces` → may set `dormantConfirmed`.  
-- Writes: single whole-document replace + revision CAS; when empty, CAS-write an empty document (avoid unconditional delete racing concurrent upserts).  
+- Do not put `repo_url` or other full restore fields in the index.
+- **After arming, always build runtime via `ListGitWorkspaces` (or Get by id)**; the index only answers “should we arm?”.
+- Missing file or empty `workspaces` → may set `dormantConfirmed`.
+- Writes: single whole-document replace + revision CAS; when empty, CAS-write an empty document (avoid unconditional delete racing concurrent upserts).
 - No separate `epoch` file; use revision / mtime / `updated_at`.
 
 ### 5.2 Local LocalRoot (same-machine live)
@@ -133,8 +133,8 @@ gen    = fingerprint(armed body + refresh/<id> names/bodies)
 force  = !wasArmed OR (armed AND gen != lastGen)
 ```
 
-- `deleted/` is for post-list hiding and invalidation, not a standalone arm condition and not part of `gen`.  
-- Only mounts sharing the **same LocalRoot** share local signals; different `--local-root` / credentials → remote index path.  
+- `deleted/` is for post-list hiding and invalidation, not a standalone arm condition and not part of `gen`.
+- Only mounts sharing the **same LocalRoot** share local signals; different `--local-root` / credentials → remote index path.
 - When already ARMED, further local marker generation advances (e.g. second `--fast` on the same mount registering a new id) → **force list**.
 
 ### 5.3 Writers
@@ -202,11 +202,12 @@ While unarmed, forbid: `ListGitWorkspaces`, tree, overlay, git-state APIs; forbi
 
 ### 6.2 Mount-time remote index
 
-1. After mount completes and the SSE watcher starts, **async** probe the index (must not block mount success).  
-2. **404 / empty / no entries for this mount after filter** → `dormantConfirmed`; zero git-workspace APIs until local arm.  
-3. **Relevant entries** → `armed`, then `ListGitWorkspaces` to build runtime.  
-4. **Network / 5xx / parse errors** → do not confirm dormant; exponential backoff Stat retries (cap ~30s).  
-5. **401 / 403** → treat as permanently unreadable; confirm dormant and stop the probe loop (avoid fs_scoped spin).
+1. After mount completes and the SSE watcher starts, **async** probe the index (must not block mount success).
+2. **404 / empty / no entries for this mount after filter** → `dormantConfirmed`; zero git-workspace APIs until local arm.
+3. **Relevant entries** → `armed`, then `ListGitWorkspaces` to build runtime.
+4. **Network / 5xx / parse errors** → do not confirm dormant; exponential backoff Stat retries (cap ~30s).
+5. **403** → permanently unreadable (e.g. fs_scoped cannot read `/.drive9/`); confirm dormant and stop the probe loop.
+6. **401** → treat as transient (expired/refreshing auth); exponential backoff retry like network/5xx — do **not** permanently latch dormant on a single 401.
 
 ### 6.3 Refresh while ARMED
 
@@ -220,8 +221,8 @@ While unarmed, forbid: `ListGitWorkspaces`, tree, overlay, git-state APIs; forbi
 
 On list / tree / overlay failure:
 
-- Keep a previous non-empty snapshot if any.  
-- If never successfully loaded → `loaded=false`; retry after backoff.  
+- Keep a previous non-empty snapshot if any.
+- If never successfully loaded → `loaded=false`; retry after backoff.
 - Force requests during backoff are sticky (`pendingForce` + generation); a successful in-flight list must not swallow a mid-flight force.
 
 Concurrent lists: singleflight; waiters re-enter when still needed.
@@ -240,8 +241,8 @@ Concurrent lists: singleflight; waiters re-enter when still needed.
 
 No `reindex` user command. If the DB already has workspaces but no index yet:
 
-1. Run any path that writes the index (`--fast`, worktree ops, FUSE delete, …); or  
-2. Mount with `--git-workspaces=on` to list directly (debug/emergency); or  
+1. Run any path that writes the index (`--fast`, worktree ops, FUSE delete, …); or
+2. Mount with `--git-workspaces=on` to list directly (debug/emergency); or
 3. Server auto-maintains index on Upsert/Delete, with optional deploy-time backfill.
 
 ---
@@ -257,7 +258,7 @@ No `reindex` user command. If the DB already has workspaces but no index yet:
 | 5 | Same-machine arm | Directory-level signals; not loaded-id-only scans |
 | 6 | CLI index/local write failure | Fail the whole command |
 | 7 | CLI write order | Index + local before success/hydrate |
-| 8 | Stat failure | 404→dormant; network→backoff; 401/403→dormant, stop probe |
+| 8 | Stat failure | 404→dormant; network/5xx/401→backoff retry; 403→dormant, stop probe |
 | 9 | ARMED cross-host freshness | 60s throttled Stat and/or SSE on index |
 | 10 | After dormantConfirmed, remote first register | Requires remount (or same-LocalRoot local signal) |
 | 11 | Default-path delivery | Ship discovery, index, CLI order, and SSE wiring together so “dormant without index writes” cannot break remount |
@@ -268,14 +269,14 @@ No `reindex` user command. If the DB already has workspaces but no index yet:
 
 ## 8. Correctness constraints
 
-1. `dormantConfirmed && !localArmSignal` ⇒ 0× git-workspace HTTP.  
-2. `localArmSignal` must be directory-level.  
-3. Index is existence-only; runtime is List/Get only.  
-4. Index path is tenant-absolute; filter by RemoteRoot.  
-5. CLI: index + local armed before success/hydrate; failure fails the whole command.  
-6. FUSE workspace delete must update the index.  
-7. List/arm singleflight + failure backoff; force does not bypass the backoff gate—use sticky re-issue.  
-8. While DORMANT, `.git` paths must not force-list.  
+1. `dormantConfirmed && !localArmSignal` ⇒ 0× git-workspace HTTP.
+2. `localArmSignal` must be directory-level.
+3. Index is existence-only; runtime is List/Get only.
+4. Index path is tenant-absolute; filter by RemoteRoot.
+5. CLI: index + local armed before success/hydrate; failure fails the whole command.
+6. FUSE workspace delete must update the index.
+7. List/arm singleflight + failure backoff; force does not bypass the backoff gate—use sticky re-issue.
+8. While DORMANT, `.git` paths must not force-list.
 9. No forced hiding of `/.drive9/`.
 
 ---
@@ -298,12 +299,12 @@ No `reindex` user command. If the DB already has workspaces but no index yet:
 
 ## 10. Acceptance criteria
 
-1. No index, no local markers: mount + active FS for 120s → `ListGitWorkspaces` = **0**, index Stat **≤1** (404 expected).  
-2. Same LocalRoot: after `--fast`, next `ls`/stat enters the git layer.  
-3. Already armed, then a new workspace id (local marker generation advances) → another list.  
-4. `sandbox_restore` (fresh LocalRoot remount) passes on the default path.  
-5. After all workspaces removed and index empty, a new mount → 0 lists.  
-6. Under network faults, list count is backoff-bounded, not per-op.  
+1. No index, no local markers: mount + active FS for 120s → `ListGitWorkspaces` = **0**, index Stat **≤1** (404 expected).
+2. Same LocalRoot: after `--fast`, next `ls`/stat enters the git layer.
+3. Already armed, then a new workspace id (local marker generation advances) → another list.
+4. `sandbox_restore` (fresh LocalRoot remount) passes on the default path.
+5. After all workspaces removed and index empty, a new mount → 0 lists.
+6. Under network faults, list count is backoff-bounded, not per-op.
 7. Existing git-ops / git-workspace e2e pass.
 
 ---
@@ -334,9 +335,9 @@ No `reindex` user command. If the DB already has workspaces but no index yet:
 
 ## 13. Optional follow-ups
 
-- Skip `ListGitTree` when `HeadCommit` is unchanged (cost reduction).  
-- Server auto-maintains index on Upsert/Delete (bare API consistency; CLI CAS can simplify).  
-- CLI flag matrix: `--git-workspaces=auto|on|off|poll` and perf counters (`arm_local` / `arm_index` / `list` / `index_stat`).  
+- Skip `ListGitTree` when `HeadCommit` is unchanged (cost reduction).
+- Server auto-maintains index on Upsert/Delete (bare API consistency; CLI CAS can simplify).
+- CLI flag matrix: `--git-workspaces=auto|on|off|poll` and perf counters (`arm_local` / `arm_index` / `list` / `index_stat`).
 - Whether fs_scoped needs a RemoteRoot-mirrored index path (if product requires it).
 
 These do not block the default path described above.
@@ -345,6 +346,6 @@ These do not block the default path described above.
 
 ## 14. Open items (non-blocking)
 
-1. Long-term: whether fs_scoped must include `/.drive9/` in scope, or get a RemoteRoot-mirrored index path.  
-2. Schedule for server-side index maintenance.  
+1. Long-term: whether fs_scoped must include `/.drive9/` in scope, or get a RemoteRoot-mirrored index path.
+2. Schedule for server-side index maintenance.
 3. Whether to keep a debug `poll` mode (default remains auto/on-demand).
