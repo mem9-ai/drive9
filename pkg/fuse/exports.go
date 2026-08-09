@@ -92,7 +92,7 @@ func ForceUnmountLazy(mountPoint string) {
 // endpoint; always fall through to umount -l so remount can succeed.
 func forceUnmountLazy(mountpoint string) {
 	if runtime.GOOS == "darwin" {
-		runUnmountCmd(5*time.Second, "diskutil", "unmount", "force", mountpoint)
+		_ = runUnmountCmd(5*time.Second, "diskutil", "unmount", "force", mountpoint)
 		return
 	}
 	// Linux: try fusermount lazy first (updates mtab), then kernel lazy.
