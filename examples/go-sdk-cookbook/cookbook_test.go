@@ -395,6 +395,14 @@ func ExampleClient_eventsLayersGitAndJournal() {
 		_, _ = c.GetGitWorkspaceByRoot(ctx, "/repo/")
 		_, _ = c.GetGitWorkspace(ctx, ws.WorkspaceID)
 		_, _ = c.ListGitWorkspaces(ctx)
+		// Existence-only index used by FUSE on-demand arming (not runtime content).
+		_ = c.UpsertGitWorkspaceIndexEntry(ctx, drive9.GitWorkspaceIndexEntry{
+			WorkspaceID:   ws.WorkspaceID,
+			RootPath:      "/repo/",
+			WorkspaceKind: "main",
+		})
+		_, _, _, _ = c.StatGitWorkspaceIndex(ctx)
+		_, _, _ = c.ReadGitWorkspaceIndex(ctx)
 		_ = c.ReplaceGitTree(ctx, ws.WorkspaceID, drive9.GitTreeReplaceRequest{
 			CommitSHA: "abc123",
 			Nodes: []drive9.GitTreeNode{{
@@ -427,6 +435,7 @@ func ExampleClient_eventsLayersGitAndJournal() {
 		})
 		_, _ = c.GetGitOverlayEntry(ctx, ws.WorkspaceID, "README.md")
 		_, _ = c.ListGitOverlayEntries(ctx, ws.WorkspaceID)
+		_ = c.RemoveGitWorkspaceIndexEntry(ctx, ws.WorkspaceID)
 		_ = c.DeleteGitWorkspace(ctx, ws.WorkspaceID)
 	}
 
@@ -571,6 +580,7 @@ var coveredClientMethods = map[string]bool{
 	"RawDelete":                            true,
 	"RawGet":                               true,
 	"RawPost":                              true,
+	"ReadGitWorkspaceIndex":                true,
 	"Read":                                 true,
 	"ReadAt":                               true,
 	"ReadAtCtx":                            true,
@@ -588,6 +598,7 @@ var coveredClientMethods = map[string]bool{
 	"ReplaceGitTree":                       true,
 	"RemoveAll":                            true,
 	"RemoveAllCtx":                         true,
+	"RemoveGitWorkspaceIndexEntry":         true,
 	"Rename":                               true,
 	"RenameCtx":                            true,
 	"ReplayFSLayer":                        true,
@@ -610,6 +621,7 @@ var coveredClientMethods = map[string]bool{
 	"SmallFileThreshold":                   true,
 	"Stat":                                 true,
 	"StatCtx":                              true,
+	"StatGitWorkspaceIndex":                true,
 	"StatMetadata":                         true,
 	"StatMetadataCompat":                   true,
 	"StatMetadataCompatCtx":                true,
@@ -621,6 +633,7 @@ var coveredClientMethods = map[string]bool{
 	"UpsertFSLayerEntry":                   true,
 	"UpsertGitState":                       true,
 	"UpsertGitWorkspace":                   true,
+	"UpsertGitWorkspaceIndexEntry":         true,
 	"VerifyJournal":                        true,
 	"Warm":                                 true,
 	"WatchEvents":                          true,

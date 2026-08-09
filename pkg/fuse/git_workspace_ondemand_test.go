@@ -255,3 +255,79 @@ func TestEnsureGitWorkspacesStillWorksForTests(t *testing.T) {
 	}
 	_ = time.Second
 }
+
+func TestCarryGitKnownSizesIntoRuntime(t *testing.T) {
+	t.Helper()
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:0"), opts)
+
+	const (
+		wsID = "ws-carry"
+		oid  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		oid2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	prev := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{WorkspaceID: wsID, HeadCommit: "deadbeef"},
+		localRoot: "/repo",
+		nodes: map[string]client.GitTreeNode{
+			"README.md": {
+				Path: "README.md", Name: "README.md", Kind: "file", Mode: "100644",
+				ObjectSHA: oid, SizeBytes: 42, CommitSHA: "deadbeef",
+			},
+			"other.txt": {
+				Path: "other.txt", Name: "other.txt", Kind: "file", Mode: "100644",
+				ObjectSHA: oid2, SizeBytes: 7, CommitSHA: "deadbeef",
+			},
+		},
+		children: map[string][]client.GitTreeNode{},
+	}
+	fs.git.mu.Lock()
+	fs.git.workspaces = []*gitWorkspaceRuntime{prev}
+	fs.git.mu.Unlock()
+
+	// Fresh list snapshot reintroduces SizeBytes=-1 (blobless ListGitTree shape).
+	next := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{WorkspaceID: wsID, HeadCommit: "deadbeef"},
+		localRoot: "/repo",
+		nodes: map[string]client.GitTreeNode{
+			"README.md": {
+				Path: "README.md", Name: "README.md", Kind: "file", Mode: "100644",
+				ObjectSHA: oid, SizeBytes: -1, CommitSHA: "deadbeef",
+			},
+			"other.txt": {
+				Path: "other.txt", Name: "other.txt", Kind: "file", Mode: "100644",
+				// SHA changed → must NOT carry old size.
+				ObjectSHA: "cccccccccccccccccccccccccccccccccccccccc", SizeBytes: -1, CommitSHA: "deadbeef",
+			},
+			"new.txt": {
+				Path: "new.txt", Name: "new.txt", Kind: "file", Mode: "100644",
+				ObjectSHA: "dddddddddddddddddddddddddddddddddddddddd", SizeBytes: -1, CommitSHA: "deadbeef",
+			},
+		},
+		children: map[string][]client.GitTreeNode{},
+	}
+	fs.carryGitKnownSizesIntoRuntime(next)
+
+	if got := next.nodes["README.md"].SizeBytes; got != 42 {
+		t.Fatalf("README.md size after carry = %d, want 42", got)
+	}
+	if got := next.nodes["other.txt"].SizeBytes; got != -1 {
+		t.Fatalf("other.txt size after SHA mismatch carry = %d, want -1", got)
+	}
+	if got := next.nodes["new.txt"].SizeBytes; got != -1 {
+		t.Fatalf("new.txt size with no prev = %d, want -1", got)
+	}
+
+	// No prev snapshot: no-op.
+	lonely := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{WorkspaceID: "ws-missing"},
+		nodes: map[string]client.GitTreeNode{
+			"a": {Path: "a", Name: "a", Kind: "file", ObjectSHA: oid, SizeBytes: -1},
+		},
+	}
+	fs.carryGitKnownSizesIntoRuntime(lonely)
+	if got := lonely.nodes["a"].SizeBytes; got != -1 {
+		t.Fatalf("lonely size = %d, want -1", got)
+	}
+}

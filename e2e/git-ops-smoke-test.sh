@@ -630,16 +630,41 @@ verify_restored_git_state() {
   check_file_eq "restored untracked content matches" "$actual_dir/untracked-content.txt" "$state_dir/untracked-content.txt"
 }
 
+# After --fast (esp. blobless), on-demand arm + git-state restore + size fill
+# can lag a beat. Poll until the repo is usable instead of failing the first
+# status/read race (CI is more sensitive than local Orb).
+wait_repo_ops_ready() {
+  local repo="$1"
+  local timeout_s="${2:-$GIT_OPS_STATUS_SETTLE_TIMEOUT_S}"
+  local start deadline
+  start=$(date +%s)
+  deadline=$(( start + timeout_s ))
+  while :; do
+    if configure_git_identity "$repo" \
+      && assert_repo_ready "$repo" \
+      && assert_fixture_reads "$repo" \
+      && assert_clean_status "$repo"; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "wait_repo_ops_ready: timeout after ${timeout_s}s repo=$repo" >&2
+      # Last-ditch diagnostics for CI logs.
+      git_cmd -C "$repo" status --porcelain=v1 --untracked-files=all 2>/dev/null | head -n 40 >&2 || true
+      git_cmd -C "$repo" rev-parse HEAD 2>/dev/null >&2 || true
+      ls -la "$repo" 2>/dev/null | head -n 20 >&2 || true
+      return 1
+    fi
+    sleep 0.5
+  done
+}
+
 exercise_git_operations() {
   local repo="$1"
   local marker="$2"
   local state_dir="$3"
   local branch="drive9-e2e-${marker//[^A-Za-z0-9._-]/-}"
 
-  configure_git_identity "$repo" || return
-  assert_repo_ready "$repo" || return
-  assert_fixture_reads "$repo" || return
-  assert_clean_status "$repo" || return
+  wait_repo_ops_ready "$repo" || return
 
   git_cmd -C "$repo" switch -c "$branch" || return
   printf '\ncommitted change %s\n' "$marker" >> "$repo/docs/guide.md"

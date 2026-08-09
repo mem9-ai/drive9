@@ -353,8 +353,11 @@ func (fs *Dat9FS) tryArmFromLocalSignals() (armed bool, forceReload bool) {
 	if signal {
 		fs.git.armed = true
 		fs.git.dormantConfirmed = false
-		// New/updated local marker while already armed → must re-list (new workspace id).
-		if wasArmed && mtimeAdvanced {
+		// First arm after dormant must force-list: needInitialLoad alone is not
+		// enough if a prior empty list left loaded=true with zero workspaces
+		// (e.g. index SSE raced registration). Same-LocalRoot second --fast
+		// advances mtime while already armed and also needs a force re-list.
+		if !wasArmed || mtimeAdvanced {
 			return true, true
 		}
 		return true, false
@@ -578,6 +581,9 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 		for _, e := range overlays {
 			rt.overlay[e.Path] = e
 		}
+		// Preserve in-memory size fills across force-refresh (blobless trees often
+		// arrive with SizeBytes=-1; losing fills causes phantom git status dirty).
+		fs.carryGitKnownSizesIntoRuntime(rt)
 		fs.mergePendingGitOverlayEntries(ws.WorkspaceID, rt.overlay)
 		loaded = append(loaded, rt)
 	}
@@ -1976,6 +1982,48 @@ func (fs *Dat9FS) updateGitKnownSize(rt *gitWorkspaceRuntime, localPath, rel str
 		fs.inodes.UpdateSize(ino, size)
 	}
 	rt.updateCleanNodeSize(rel, gitNodeCommit(rt, n), size)
+}
+
+// carryGitKnownSizesIntoRuntime copies SizeBytes fills from the previous runtime
+// snapshot for the same workspace id (matched by path + object SHA). Force
+// refresh rebuilds runtimes from ListGitTree which re-introduces SizeBytes=-1
+// for blobless trees; without this, getattr oscillates and git status reports
+// phantom modifications.
+func (fs *Dat9FS) carryGitKnownSizesIntoRuntime(rt *gitWorkspaceRuntime) {
+	if fs == nil || fs.git == nil || rt == nil {
+		return
+	}
+	wsID := strings.TrimSpace(rt.workspace.WorkspaceID)
+	if wsID == "" {
+		return
+	}
+	fs.git.mu.Lock()
+	var prev *gitWorkspaceRuntime
+	for _, candidate := range fs.git.workspaces {
+		if candidate != nil && strings.TrimSpace(candidate.workspace.WorkspaceID) == wsID {
+			prev = candidate
+			break
+		}
+	}
+	fs.git.mu.Unlock()
+	if prev == nil {
+		return
+	}
+	prev.mu.RLock()
+	defer prev.mu.RUnlock()
+	for rel, n := range rt.nodes {
+		if n.SizeBytes >= 0 || !gitNodeHasBlobSize(n) {
+			continue
+		}
+		old, ok := prev.nodes[rel]
+		if !ok || old.SizeBytes < 0 {
+			continue
+		}
+		if gitObjectCacheKey(old.ObjectSHA) != gitObjectCacheKey(n.ObjectSHA) {
+			continue
+		}
+		rt.updateCleanNodeSize(rel, gitNodeCommit(rt, n), old.SizeBytes)
+	}
 }
 
 func (fs *Dat9FS) resolveGitCleanNodeSize(ctx context.Context, rt *gitWorkspaceRuntime, rel string, n client.GitTreeNode) int64 {
