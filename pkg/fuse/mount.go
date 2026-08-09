@@ -1420,32 +1420,30 @@ func newMountShutdown(stopWatcher func(), flushAll func()) func() {
 // Uses a 5-second timeout so that the forced-exit path can't itself hang
 // on a wedged FUSE endpoint.
 func forceUnmount(mountpoint string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var cmd *exec.Cmd
 	if runtime.GOOS == "darwin" {
-		cmd = exec.CommandContext(ctx, "diskutil", "unmount", "force", mountpoint)
-	} else {
-		// Linux: prefer fusermount3 (fuse3, default on Ubuntu 22.04+ /
-		// Debian 12+), then fusermount, then umount -l.
-		if _, err := exec.LookPath("fusermount3"); err == nil {
-			cmd = exec.CommandContext(ctx, "fusermount3", "-u", mountpoint)
-		} else if _, err := exec.LookPath("fusermount"); err == nil {
-			cmd = exec.CommandContext(ctx, "fusermount", "-u", mountpoint)
-		} else {
-			cmd = exec.CommandContext(ctx, "umount", "-l", mountpoint)
-		}
-	}
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			fmt.Fprintf(os.Stderr, "drive9: force unmount timed out after 5s\n")
-		} else {
+		if err := runUnmountCmd(5*time.Second, "diskutil", "unmount", "force", mountpoint); err != nil {
 			fmt.Fprintf(os.Stderr, "drive9: force unmount failed: %v\n", err)
 		}
+		return
 	}
+	// Linux: prefer fusermount, always fall through to umount -l when the
+	// endpoint remains (fusermount often fails with EACCES after daemon death).
+	if _, err := exec.LookPath("fusermount3"); err == nil {
+		if runUnmountCmd(5*time.Second, "fusermount3", "-u", mountpoint) == nil && !mountStillNeedsClean(mountpoint) {
+			return
+		}
+	} else if _, err := exec.LookPath("fusermount"); err == nil {
+		if runUnmountCmd(5*time.Second, "fusermount", "-u", mountpoint) == nil && !mountStillNeedsClean(mountpoint) {
+			return
+		}
+	}
+	if _, err := exec.LookPath("umount"); err == nil {
+		if err := runUnmountCmd(5*time.Second, "umount", "-l", mountpoint); err != nil {
+			fmt.Fprintf(os.Stderr, "drive9: force unmount (umount -l) failed: %v\n", err)
+		}
+		return
+	}
+	fmt.Fprintf(os.Stderr, "drive9: force unmount: no fusermount/umount available\n")
 }
 
 // humanizeBytes formats a byte count as a human-readable string (e.g. "1.5 MB").

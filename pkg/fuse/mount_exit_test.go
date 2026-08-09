@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
 func TestMountExitErrorExitCode(t *testing.T) {
@@ -67,5 +69,46 @@ func TestEnsureCleanMountpointPlainDir(t *testing.T) {
 	// Ensure dir still exists.
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestIsTransportBrokenPermissionDenied(t *testing.T) {
+	// After FUSE daemon SIGKILL some kernels surface EACCES instead of ENOTCONN.
+	cases := []string{
+		"permission denied",
+		"Permission denied",
+		"operation not permitted",
+		"transport endpoint is not connected",
+		"input/output error",
+	}
+	for _, msg := range cases {
+		if !IsTransportBroken(errors.New(msg)) {
+			t.Fatalf("IsTransportBroken(%q) = false, want true", msg)
+		}
+	}
+	if IsTransportBroken(nil) {
+		t.Fatal("IsTransportBroken(nil) = true, want false")
+	}
+	if IsTransportBroken(errors.New("file not found")) {
+		t.Fatal("IsTransportBroken(ordinary error) = true, want false")
+	}
+}
+
+func TestOwnerAliveSupervisorWithoutWorker(t *testing.T) {
+	// Supervised mount with WorkerPID cleared must not report owner alive
+	// just because the supervisor process is still running.
+	mp := t.TempDir()
+	st := mountstate.SupervisorState{
+		PID:        os.Getpid(),
+		WorkerPID:  0,
+		MountPoint: mp,
+		State:      mountstate.SupervisorStateRestarting,
+	}
+	if err := mountstate.WriteSupervisorState(mp, st); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+	if ownerAlive(mp) {
+		t.Fatal("ownerAlive with supervisor-only state should be false")
 	}
 }

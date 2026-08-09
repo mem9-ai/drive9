@@ -331,7 +331,7 @@ func (s *supervisor) loop() error {
 			// Transient / abnormal / unknown (including bare exit 1) → restart.
 			s.noteRestart(reason)
 			s.alert("mount_restart", reason)
-			_, _ = drive9fuse.EnsureCleanMountpoint(s.cfg.MountPoint)
+			s.cleanMountBeforeRestart(reason)
 			s.cfg.Sleep(s.nextBackoff())
 			continue
 		}
@@ -392,9 +392,39 @@ func (s *supervisor) loop() error {
 		}
 
 		s.noteRestart(reason)
-		_, _ = drive9fuse.EnsureCleanMountpoint(s.cfg.MountPoint)
+		// Always lazy-detach before respawn: after SIGKILL the kernel keeps a
+		// dead FUSE superblock; fusermount remount then fails with EACCES
+		// ("Permission denied") if we only conditional-clean.
+		s.cleanMountBeforeRestart(reason)
 		s.alert("mount_restart", reason)
 		s.cfg.Sleep(s.nextBackoff())
+	}
+}
+
+// cleanMountBeforeRestart force-clears a stale FUSE endpoint after worker death.
+// Always lazy-detach first: after SIGKILL the kernel keeps a dead FUSE
+// superblock and fusermount remount fails with EACCES ("Permission denied")
+// unless the endpoint is detached before the next spawn.
+func (s *supervisor) cleanMountBeforeRestart(reason string) {
+	// Drop recorded worker identity so EnsureClean does not treat a dead PID
+	// (or a recycled one) as a live owner via stale supervise.json / pidfile.
+	s.mu.Lock()
+	s.state.WorkerPID = 0
+	s.state.WorkerCreation = 0
+	s.mu.Unlock()
+	_ = s.persist()
+	// Also clear worker identity in the pidfile used by ownerAlive fallback.
+	if base, _, err := mountstate.ReadProcessState(s.cfg.MountPoint); err == nil {
+		base.WorkerPID = 0
+		_, _ = mountstate.WriteProcessState(s.cfg.MountPoint, base)
+	}
+	drive9fuse.ForceUnmountLazy(s.cfg.MountPoint)
+	if cleaned, err := drive9fuse.EnsureCleanMountpoint(s.cfg.MountPoint); err != nil {
+		s.logf("restart clean after %s: %v", reason, err)
+		// Second pass — some kernels need two lazy detaches for ENOTCONN/EACCES.
+		drive9fuse.ForceUnmountLazy(s.cfg.MountPoint)
+	} else if cleaned {
+		s.logf("restart clean after %s: force-unmounted stale mount", reason)
 	}
 }
 

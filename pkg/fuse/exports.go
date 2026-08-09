@@ -88,32 +88,53 @@ func ForceUnmountLazy(mountPoint string) {
 }
 
 // forceUnmountLazy prefers lazy/force detach variants for death cleanup.
+// After FUSE daemon SIGKILL, fusermount can fail with EACCES on the dead
+// endpoint; always fall through to umount -l so remount can succeed.
 func forceUnmountLazy(mountpoint string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var cmd *exec.Cmd
 	if runtime.GOOS == "darwin" {
-		cmd = exec.CommandContext(ctx, "diskutil", "unmount", "force", mountpoint)
-	} else {
-		if _, err := exec.LookPath("fusermount3"); err == nil {
-			cmd = exec.CommandContext(ctx, "fusermount3", "-uz", mountpoint)
-		} else if _, err := exec.LookPath("fusermount"); err == nil {
-			cmd = exec.CommandContext(ctx, "fusermount", "-uz", mountpoint)
-		} else {
-			cmd = exec.CommandContext(ctx, "umount", "-l", mountpoint)
+		runUnmountCmd(5*time.Second, "diskutil", "unmount", "force", mountpoint)
+		return
+	}
+	// Linux: try fusermount lazy first (updates mtab), then kernel lazy.
+	tried := false
+	if _, err := exec.LookPath("fusermount3"); err == nil {
+		tried = true
+		if runUnmountCmd(5*time.Second, "fusermount3", "-uz", mountpoint) == nil && !mountStillNeedsClean(mountpoint) {
+			return
 		}
 	}
+	if _, err := exec.LookPath("fusermount"); err == nil {
+		tried = true
+		if runUnmountCmd(5*time.Second, "fusermount", "-uz", mountpoint) == nil && !mountStillNeedsClean(mountpoint) {
+			return
+		}
+	}
+	// umount -l is the reliable last resort for orphan FUSE superblocks.
+	if _, err := exec.LookPath("umount"); err == nil {
+		if err := runUnmountCmd(5*time.Second, "umount", "-l", mountpoint); err != nil && tried {
+			fmt.Fprintf(os.Stderr, "drive9: force unmount (lazy) exhausted fusermount+umount -l: %v\n", err)
+		}
+		return
+	}
+	if tried {
+		// No umount binary — fall back to non-lazy fusermount.
+		forceUnmount(mountpoint)
+	}
+}
+
+// runUnmountCmd runs an unmount helper with a deadline. Stderr is inherited so
+// fusermount diagnostics remain visible in supervisor logs.
+func runUnmountCmd(timeout time.Duration, name string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			fmt.Fprintf(os.Stderr, "drive9: force unmount (lazy) timed out after 5s\n")
-		} else {
-			fmt.Fprintf(os.Stderr, "drive9: force unmount (lazy) failed: %v; retrying standard force\n", err)
-			forceUnmount(mountpoint)
-		}
+	err := cmd.Run()
+	if err != nil && ctx.Err() == context.DeadlineExceeded {
+		fmt.Fprintf(os.Stderr, "drive9: %s %v timed out after %s\n", name, args, timeout)
 	}
+	return err
 }
 
 // EnsureCleanMountpoint force-unmounts a stale (broken) mount if present.
@@ -132,14 +153,13 @@ func EnsureCleanMountpoint(mountPoint string) (cleaned bool, err error) {
 		if os.IsNotExist(activeErr) {
 			return false, nil
 		}
-		if isTransportBroken(activeErr) {
-			forceUnmountLazy(mountPoint)
-			if stillBroken := mountStillNeedsClean(mountPoint); stillBroken {
-				return true, fmt.Errorf("force unmount did not clear broken mountpoint %s", mountPoint)
-			}
-			return true, nil
+		// Any non-NotExist stat failure on a (possibly dead) FUSE endpoint —
+		// ENOTCONN, EACCES after daemon SIGKILL, EIO, etc. — needs lazy detach.
+		forceUnmountLazy(mountPoint)
+		if stillBroken := mountStillNeedsClean(mountPoint); stillBroken {
+			return true, fmt.Errorf("force unmount did not clear broken mountpoint %s: %v", mountPoint, activeErr)
 		}
-		return false, activeErr
+		return true, nil
 	}
 	if !active {
 		return false, nil
@@ -161,10 +181,14 @@ func ownerAlive(mountPoint string) bool {
 	pid := 0
 	var creation uint64
 	if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+		// FUSE endpoint is owned by the worker, never the supervisor process.
+		// WorkerPID==0 means the worker is gone (or not yet recorded); do not
+		// treat the live supervisor as owner or EnsureClean will refuse to
+		// detach orphans after kill -9.
 		if st.WorkerPID > 0 {
 			pid, creation = st.WorkerPID, st.WorkerCreation
-		} else if st.PID > 0 {
-			pid, creation = st.PID, st.CreationTime
+		} else {
+			return false
 		}
 	}
 	if pid == 0 {
@@ -174,7 +198,11 @@ func ownerAlive(mountPoint string) bool {
 		}
 		if ps.WorkerPID > 0 {
 			pid = ps.WorkerPID
+		} else if ps.Role == mountstate.RoleSupervisor || ps.Supervise {
+			// Supervised mount with no worker identity → orphan.
+			return false
 		} else {
+			// Unsupervised single-process mount: PID is the FUSE daemon.
 			pid = ps.PID
 			creation = ps.CreationTime
 		}
@@ -221,6 +249,12 @@ func isTransportBroken(err error) bool {
 		"input/output error",
 		"enotconn",
 		"econnaborted",
+		// After FUSE daemon SIGKILL some kernels surface EACCES/EPERM on the
+		// mountpoint instead of ENOTCONN; still needs force/lazy unmount.
+		"permission denied",
+		"operation not permitted",
+		"eacces",
+		"eperm",
 	} {
 		if strings.Contains(msg, sub) {
 			return true
