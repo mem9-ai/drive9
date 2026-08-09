@@ -209,8 +209,8 @@ wait_healthy_io() {
   while :; do
     if ! is_mounted "$MOUNT_POINT"; then
       last_fail="is_mounted"
-    elif ! with_timeout "$FUSE_PROBE_TIMEOUT_S" drive9 mount health "$MOUNT_POINT" >/dev/null 2>&1; then
-      last_fail="mount_health"
+    elif ! status_reports_healthy; then
+      last_fail="mount_status_healthy"
     elif ! probe_mount_io "$label-$(date +%s)"; then
       last_fail="probe_mount_io"
     else
@@ -219,10 +219,19 @@ wait_healthy_io() {
     if [ "$(date +%s)" -ge "$deadline" ]; then
       echo "wait_healthy_io timed out after ${MOUNT_READY_TIMEOUT_S}s (last_fail=$last_fail)" >&2
       drive9 mount status --json "$MOUNT_POINT" >&2 || true
+      with_timeout "$FUSE_PROBE_TIMEOUT_S" drive9 mount health "$MOUNT_POINT" >&2 || true
       return 1
     fi
     sleep "$MOUNT_READY_INTERVAL_S"
   done
+}
+
+# status_reports_healthy uses mount status --json (local health only; no readdir).
+# Avoid wrapping the whole CLI in a tight timeout that races process start + probe.
+status_reports_healthy() {
+  local json
+  json="$(with_timeout 20 drive9 mount status --json "$MOUNT_POINT" 2>/dev/null || true)"
+  printf '%s' "$json" | jq -e '.healthy == true' >/dev/null 2>&1
 }
 
 # start_supervised_mount uses the default supervised background path.

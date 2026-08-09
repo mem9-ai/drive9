@@ -1109,8 +1109,10 @@ func CollectStatus(mountPoint string) StatusSnapshot {
 			}
 		}
 	}
-	// Local health for ensure/status exit: never treat backend readdir failure
-	// as unhealthy FUSE. Optional IO probe is reported in ProbeError only.
+	// Local health only — never readdir/List here. A full IO probe can block
+	// for seconds on a slow backend and made `drive9 mount health` exceed the
+	// e2e with_timeout budget even when the mount was fine (last_fail=mount_health
+	// while status.healthy was true under a longer wait).
 	localErr := drive9fuse.ProbeMountLocalHealth(mountPoint)
 	if localErr != nil {
 		snap.Healthy = false
@@ -1122,10 +1124,6 @@ func CollectStatus(mountPoint string) StatusSnapshot {
 		snap.Healthy = true
 		if snap.State == "" {
 			snap.State = "running"
-		}
-		if ioErr := drive9fuse.ProbeMountPointReady(mountPoint); ioErr != nil {
-			// Degraded: local endpoint OK but full IO probe failed (often remote).
-			snap.ProbeError = ioErr.Error()
 		}
 	}
 	// Dead supervisor with healthy local endpoint is not fully supervised.

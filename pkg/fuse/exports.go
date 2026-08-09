@@ -58,11 +58,13 @@ func probeMountLocalHealthOnce(mountPoint string) error {
 		return fmt.Errorf("mountpoint is not an active mount")
 	}
 	// Control socket ping is backend-independent (separate goroutine in worker).
+	// Use a short dial budget so a stuck socket cannot dominate health latency.
 	sock := mountstate.ControlSocketPath(mountPoint)
 	if _, statErr := os.Stat(sock); statErr == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), probeMountPointReadyTimeout)
+		const pingTimeout = 2 * time.Second
+		ctx, cancel := context.WithTimeout(context.Background(), pingTimeout)
 		defer cancel()
-		if _, pingErr := mountcontrol.RequestStatus(ctx, sock, probeMountPointReadyTimeout); pingErr != nil {
+		if _, pingErr := mountcontrol.RequestStatus(ctx, sock, pingTimeout); pingErr != nil {
 			return fmt.Errorf("control socket ping: %w", pingErr)
 		}
 	}
