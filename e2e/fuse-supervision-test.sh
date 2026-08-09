@@ -104,6 +104,8 @@ skip_or_fail() {
 }
 
 # with_timeout runs a command under coreutils timeout when available.
+# NOTE: `timeout` cannot see shell functions (e.g. drive9()). Pass absolute
+# binaries (CLI_BIN, mountpoint, bash) — never a bare "drive9" name.
 with_timeout() {
   local secs="$1"
   shift
@@ -112,6 +114,13 @@ with_timeout() {
   else
     "$@"
   fi
+}
+
+# drive9 under timeout: absolute CLI_BIN + the same env as the drive9() wrapper.
+with_timeout_drive9() {
+  local secs="$1"
+  shift
+  with_timeout "$secs" env HOME="$CTX_HOME" DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
 }
 
 is_mounted() {
@@ -219,7 +228,7 @@ wait_healthy_io() {
     if [ "$(date +%s)" -ge "$deadline" ]; then
       echo "wait_healthy_io timed out after ${MOUNT_READY_TIMEOUT_S}s (last_fail=$last_fail)" >&2
       drive9 mount status --json "$MOUNT_POINT" >&2 || true
-      with_timeout "$FUSE_PROBE_TIMEOUT_S" drive9 mount health "$MOUNT_POINT" >&2 || true
+      with_timeout_drive9 "$FUSE_PROBE_TIMEOUT_S" mount health "$MOUNT_POINT" >&2 || true
       return 1
     fi
     sleep "$MOUNT_READY_INTERVAL_S"
@@ -227,10 +236,9 @@ wait_healthy_io() {
 }
 
 # status_reports_healthy uses mount status --json (local health only; no readdir).
-# Avoid wrapping the whole CLI in a tight timeout that races process start + probe.
 status_reports_healthy() {
   local json
-  json="$(with_timeout 20 drive9 mount status --json "$MOUNT_POINT" 2>/dev/null || true)"
+  json="$(with_timeout_drive9 20 mount status --json "$MOUNT_POINT" 2>/dev/null || true)"
   printf '%s' "$json" | jq -e '.healthy == true' >/dev/null 2>&1
 }
 
