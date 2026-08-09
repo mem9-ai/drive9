@@ -23,20 +23,22 @@ import (
 )
 
 type applyRemote struct {
-	mu          sync.Mutex
-	exists      bool
-	revision    int64
-	resourceID  string
-	mode        uint32
-	body        []byte
-	expected    []string
-	operations  []string
-	putStatus   int
-	postHeadErr int
-	chmodStatus int
-	afterPut    func()
-	checksum    string
-	nlink       uint32
+	mu             sync.Mutex
+	exists         bool
+	revision       int64
+	resourceID     string
+	mode           uint32
+	body           []byte
+	expected       []string
+	operations     []string
+	putStatus      int
+	postHeadErr    int
+	chmodStatus    int
+	afterPut       func()
+	checksum       string
+	nlink          uint32
+	nlinkAfterHead uint32
+	nlinkOnPut     uint32
 }
 
 func (r *applyRemote) handler(w http.ResponseWriter, request *http.Request) {
@@ -67,6 +69,10 @@ func (r *applyRemote) handler(w http.ResponseWriter, request *http.Request) {
 			nlink = 1
 		}
 		w.Header().Set("X-Dat9-Nlink", fmt.Sprint(nlink))
+		if r.nlinkAfterHead != 0 {
+			r.nlink = r.nlinkAfterHead
+			r.nlinkAfterHead = 0
+		}
 		checksum := r.checksum
 		if checksum == "" {
 			checksum = hex.EncodeToString(sum[:])
@@ -79,6 +85,10 @@ func (r *applyRemote) handler(w http.ResponseWriter, request *http.Request) {
 		if r.putStatus != 0 {
 			http.Error(w, "injected write failure", r.putStatus)
 			return
+		}
+		if r.nlinkOnPut != 0 {
+			r.nlink = r.nlinkOnPut
+			r.nlinkOnPut = 0
 		}
 		body, _ := io.ReadAll(request.Body)
 		r.body = body
@@ -217,6 +227,52 @@ func TestApplyRegularRejectsUnaccountedStableTargetNlinkBeforeWrite(t *testing.T
 	defer remote.mu.Unlock()
 	if containsOperationPrefix(remote.operations, "write ") {
 		t.Fatalf("unaccounted Nlink reached write: %v", remote.operations)
+	}
+}
+
+func TestApplyRegularRevalidatesTargetLinksImmediatelyBeforeWrite(t *testing.T) {
+	remote := &applyRemote{
+		exists: true, revision: 7, resourceID: "resource-file", mode: 0o644,
+		body: []byte("old"), nlink: 1, nlinkAfterHead: 2,
+	}
+	server := httptest.NewServer(http.HandlerFunc(remote.handler))
+	defer server.Close()
+	scanner, source := newApplyFixture(t, "new-content")
+	target := map[string]TargetEntry{
+		"/file": {Path: "/file", Kind: EntryRegular, Size: 3, Mode: 0o644, HasMode: true, Revision: 7, ResourceID: "resource-file", Nlink: 1},
+	}
+
+	err := newTestApplyEngine(t, server, scanner, 1<<20).Apply(context.Background(), map[string]SourceEntry{"/file": source}, target)
+	if !errors.Is(err, ErrApplyRescan) {
+		t.Fatalf("pre-write target link race error=%v", err)
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if containsOperationPrefix(remote.operations, "write ") {
+		t.Fatalf("pre-write target link race reached write: %v", remote.operations)
+	}
+}
+
+func TestApplyRegularRejectsTargetLinkRaceDuringCommit(t *testing.T) {
+	remote := &applyRemote{
+		exists: true, revision: 7, resourceID: "resource-file", mode: 0o644,
+		body: []byte("old"), nlink: 1, nlinkOnPut: 2,
+	}
+	server := httptest.NewServer(http.HandlerFunc(remote.handler))
+	defer server.Close()
+	scanner, source := newApplyFixture(t, "new-content")
+	target := map[string]TargetEntry{
+		"/file": {Path: "/file", Kind: EntryRegular, Size: 3, Mode: 0o644, HasMode: true, Revision: 7, ResourceID: "resource-file", Nlink: 1},
+	}
+
+	err := newTestApplyEngine(t, server, scanner, 1<<20).Apply(context.Background(), map[string]SourceEntry{"/file": source}, target)
+	if !errors.Is(err, ErrApplyRescan) {
+		t.Fatalf("in-commit target link race error=%v", err)
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if !containsOperationPrefix(remote.operations, "write ") {
+		t.Fatalf("in-commit target link race did not reach write: %v", remote.operations)
 	}
 }
 
@@ -527,15 +583,18 @@ func TestApplyPostUploadRereadFailsClosed(t *testing.T) {
 }
 
 type multipartApplyRemote struct {
-	t          *testing.T
-	mu         sync.Mutex
-	fail       string
-	initiates  int
-	committed  bool
-	expected   []int64
-	parts      map[string]map[int]int
-	checksum   string
-	resumeHits int
+	t              *testing.T
+	mu             sync.Mutex
+	fail           string
+	initiates      int
+	committed      bool
+	expected       []int64
+	parts          map[string]map[int]int
+	checksum       string
+	resumeHits     int
+	nlink          uint32
+	linkOnComplete bool
+	completeHits   int
 }
 
 func (r *multipartApplyRemote) handler(w http.ResponseWriter, request *http.Request) {
@@ -544,16 +603,21 @@ func (r *multipartApplyRemote) handler(w http.ResponseWriter, request *http.Requ
 	case request.Method == http.MethodHead && request.URL.Path == "/v1/fs/data/file":
 		r.mu.Lock()
 		committed := r.committed
+		nlink := r.nlink
 		r.mu.Unlock()
 		if !committed {
 			http.NotFound(w, request)
 			return
+		}
+		if nlink == 0 {
+			nlink = 1
 		}
 		w.Header().Set("Content-Length", "8")
 		w.Header().Set("X-Dat9-IsDir", "false")
 		w.Header().Set("X-Dat9-Revision", "1")
 		w.Header().Set("X-Dat9-Resource-ID", "big-file")
 		w.Header().Set("X-Dat9-Mode", fmt.Sprint(uint32(0o100644)))
+		w.Header().Set("X-Dat9-Nlink", fmt.Sprint(nlink))
 		w.Header().Set("X-Dat9-Checksum-SHA256", r.checksum)
 		w.WriteHeader(http.StatusOK)
 	case request.Method == http.MethodPost && request.URL.Path == "/v2/uploads/initiate":
@@ -604,6 +668,10 @@ func (r *multipartApplyRemote) handler(w http.ResponseWriter, request *http.Requ
 		}
 		r.mu.Lock()
 		r.committed = true
+		r.completeHits++
+		if r.linkOnComplete {
+			r.nlink = 2
+		}
 		r.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	case request.Method == http.MethodPost && len(pathParts) == 4 && pathParts[0] == "v2" && pathParts[3] == "abort":
@@ -647,6 +715,26 @@ func TestApplyMultipartFailureStartsFreshAttempt(t *testing.T) {
 				t.Fatalf("fresh upload parts=%v", remote.parts)
 			}
 		})
+	}
+}
+
+func TestApplyMultipartRejectsTargetLinkRaceDuringCommit(t *testing.T) {
+	scanner, source := newApplyFixture(t, "12345678")
+	checksum := sha256.Sum256([]byte("12345678"))
+	remote := &multipartApplyRemote{
+		t: t, parts: make(map[string]map[int]int), checksum: hex.EncodeToString(checksum[:]), linkOnComplete: true,
+	}
+	server := httptest.NewServer(http.HandlerFunc(remote.handler))
+	defer server.Close()
+
+	err := newTestApplyEngine(t, server, scanner, 1).Apply(context.Background(), map[string]SourceEntry{"/file": source}, nil)
+	if !errors.Is(err, ErrApplyRescan) {
+		t.Fatalf("multipart in-commit target link race error=%v", err)
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if remote.completeHits != 1 || !remote.committed {
+		t.Fatalf("multipart commit hits=%d committed=%v", remote.completeHits, remote.committed)
 	}
 }
 
