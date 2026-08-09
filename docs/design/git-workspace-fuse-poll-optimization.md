@@ -127,15 +127,15 @@ Rules:
 **Directory-level arm signal (must not rely only on per-id scans of already-loaded runtimes):**
 
 ```text
-localArmSignal =
-    exists(armed)
-    OR any file under refresh/
-    OR armed/refresh mtime advanced since last scan
+armed  = exists(armed) OR any file under refresh/
+gen    = fingerprint(armed body + refresh/<id> names/bodies)
+         (not max FS mtime alone)
+force  = !wasArmed OR (armed AND gen != lastGen)
 ```
 
-- `deleted/` is for post-list hiding and invalidation, not a standalone arm condition.  
+- `deleted/` is for post-list hiding and invalidation, not a standalone arm condition and not part of `gen`.  
 - Only mounts sharing the **same LocalRoot** share local signals; different `--local-root` / credentials → remote index path.  
-- When already ARMED, further local mtime advances (e.g. second `--fast` on the same mount registering a new id) → **force list**.
+- When already ARMED, further local marker generation advances (e.g. second `--fast` on the same mount registering a new id) → **force list**.
 
 ### 5.3 Writers
 
@@ -156,6 +156,34 @@ localArmSignal =
 4. Print success to the user
 5. hydrate (optional, may be long; unrelated to discovery)
 ```
+
+**Atomicity and partial-failure recovery:**
+
+Steps 1–3 are **not** one distributed transaction across the metadata API, the
+remote index document, and the local FS. Each step is independently durable and
+idempotent (upserts/replaces keyed by workspace id / commit / root_path). The
+command prints success only after steps 1–3 complete; hydrate never gates
+registration. Recovery for steps 1–3 is **re-run the command** (or remount when
+only local markers are missing). Prefer “registered but not yet discoverable”
+over “discoverable but incomplete”.
+
+| After | Failure | Observable state | Recovery |
+| --- | --- | --- | --- |
+| **1** Upsert + ReplaceTree + git-state | Any sub-write fails | May leave a partial workspace row/tree/state; **no** index entry; **no** local markers; mounts stay dormant | Fail the command. Re-run `--fast` / worktree op (sub-writes are upserts/replaces), or delete the orphan workspace and retry. |
+| **2** Remote index CAS | Conflict exhausted / network | Workspace exists in DB; index missing or stale for this id; no local markers; same-LocalRoot live mount not armed; cross-sandbox remount not discovered via index | Fail the command. Client CAS already retries (~4×). Re-run the command so index is rewritten. Index is only an arming *hint*; `ListGitWorkspaces` remains runtime authority once armed. |
+| **3** Local armed / refresh markers | Local FS error | Remote registration + index OK (remount discovery works); **this** LocalRoot may stay dormant until remount / another arm event | Fail the command. Re-run (marker writes are rewrites) or remount / use another LocalRoot that reads the index. |
+| **4** Print success | — | Discovery contract met for this host | Users may use the FS immediately. |
+| **5** hydrate | Timeout / network (sync may exit non-zero *after* success line; background start may warn) | Registration and discovery intact; objects may be incomplete | Re-run `drive9 git hydrate` or open paths that trigger on-demand hydrate. Never rolls back steps 1–3. |
+
+Crash between steps 1–3 is recovered by re-running the command. Step 1 is **not**
+rolled back when step 2 fails (deleting the registration would orphan tree/state
+and is worse than a missing index hint). Delete-path asymmetry: after an
+irreversible `DeleteGitWorkspace`, index/local cleanup failures are collected
+but local cleanup still proceeds so the target stays retryable (`worktree remove --fast`).
+
+Local arm markers are a **generation** over the marker set (armed body + each
+`refresh/<id>` name and body), not max FS mtime alone — so same-second
+registrations of a new id still force a live mount to re-list.
 
 ---
 
@@ -184,7 +212,7 @@ While unarmed, forbid: `ListGitWorkspaces`, tree, overlay, git-state APIs; forbi
 
 | Event | Action |
 | --- | --- |
-| Local armed / refresh / deleted signal change | force list (subject to backoff/throttle) |
+| Local armed / refresh marker generation change | force list (subject to backoff/throttle) |
 | Path hits a loaded workspace | in-memory runtime |
 | Remote index revision/mtime change (throttled Stat, default 60s while FS is active) | force list |
 | SSE: index path change (when `EnableGitWorkspaces`) | force list / re-arm |
@@ -272,7 +300,7 @@ No `reindex` user command. If the DB already has workspaces but no index yet:
 
 1. No index, no local markers: mount + active FS for 120s → `ListGitWorkspaces` = **0**, index Stat **≤1** (404 expected).  
 2. Same LocalRoot: after `--fast`, next `ls`/stat enters the git layer.  
-3. Already armed, then a new workspace id (local marker mtime advances) → another list.  
+3. Already armed, then a new workspace id (local marker generation advances) → another list.  
 4. `sandbox_restore` (fresh LocalRoot remount) passes on the default path.  
 5. After all workspaces removed and index empty, a new mount → 0 lists.  
 6. Under network faults, list count is backoff-bounded, not per-op.  

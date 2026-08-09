@@ -225,25 +225,22 @@ func TestArmedLocalMarkerForcesReloadForNewWorkspace(t *testing.T) {
 	}
 
 	// Advance local arm signal with a new workspace id (same mount, second --fast).
-	// Force a strictly later mtime so coarse CI filesystems (1s granularity)
-	// still observe mtimeAdvanced; a fixed 5ms sleep is not enough on HFS+/NFS.
+	// Generation fingerprints marker names+bodies, so equal FS mtimes still force-list.
 	if err := gitcache.MarkWorkspaceRegistered(context.Background(), localRoot, "ws-b"); err != nil {
 		t.Fatal(err)
 	}
-	armedPath := gitcache.WorkspaceArmedPath(localRoot)
-	info, err := os.Stat(armedPath)
-	if err != nil {
-		t.Fatal(err)
+	// Pin all marker mtimes to the same second to prove we do not rely on mtime alone.
+	fixed := time.Unix(1_700_000_000, 0)
+	for _, p := range []string{
+		gitcache.WorkspaceArmedPath(localRoot),
+		gitcache.WorkspaceRefreshMarkerPath(localRoot, "ws-a"),
+		gitcache.WorkspaceRefreshMarkerPath(localRoot, "ws-b"),
+	} {
+		if err := os.Chtimes(p, fixed, fixed); err != nil {
+			t.Fatal(err)
+		}
 	}
-	later := info.ModTime().Add(2 * time.Second)
-	if err := os.Chtimes(armedPath, later, later); err != nil {
-		t.Fatal(err)
-	}
-	refreshPath := gitcache.WorkspaceRefreshMarkerPath(localRoot, "ws-b")
-	if err := os.Chtimes(refreshPath, later, later); err != nil {
-		t.Fatal(err)
-	}
-	// Clear throttle so scan sees new mtime.
+	// Clear throttle so scan re-reads markers.
 	fs.git.mu.Lock()
 	fs.git.localArmScanAt = time.Time{}
 	fs.git.mu.Unlock()

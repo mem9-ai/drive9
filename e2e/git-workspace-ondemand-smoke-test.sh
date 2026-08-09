@@ -589,30 +589,59 @@ list_count_for_root() {
   '
 }
 
+# Stat index revision via ?stat=1 (prefer over HEAD; some .drive9 paths hang).
+# Prints "code revision" (revision empty when missing/404).
+fetch_remote_index_stat_rev() {
+  local url="$BASE/v1/fs/.drive9/git-workspaces/index.json?stat=1"
+  local body_file code rev
+  body_file="$(mktemp)"
+  code=$(curl -sS --max-time 15 -o "$body_file" -w "%{http_code}" \
+    -H "Authorization: Bearer $API_KEY" "$url" || printf '000')
+  rev=""
+  if [ "$code" = "200" ]; then
+    # Distinguish null (missing) from revision 0; never use // empty on numbers.
+    rev=$(jq -r 'if .revision == null then empty else (.revision|tostring) end' <"$body_file" 2>/dev/null || true)
+  fi
+  rm -f "$body_file"
+  printf '%s %s' "$code" "$rev"
+}
+
 # Rewrite remote index removing entries under remote_root.
 # API DELETE alone does not maintain the index; empty/filtered index is required
-# for AC5 remount → DORMANT (refresh=0). Retries read-modify-write; fails hard if
-# entries for this root remain after the last attempt.
+# for AC5 remount → DORMANT (refresh=0). Uses X-Dat9-Expected-Revision CAS
+# (same contract as client.WriteCtxConditionalWithRevision); 409 → retry.
+# Fails hard if entries for this root remain after the last attempt.
 rewrite_index_without_root() {
   local remote_root="$1"
-  local attempt code body new_body url put_code remaining
+  local attempt code body new_body url put_code remaining rev stat_out
   url="$BASE/v1/fs/.drive9/git-workspaces/index.json"
-  for attempt in 1 2 3 4; do
-    code=$(stat_remote_index)
+  for attempt in 1 2 3 4 5 6; do
+    stat_out=$(fetch_remote_index_stat_rev)
+    code=$(printf '%s' "$stat_out" | awk '{print $1}')
+    rev=$(printf '%s' "$stat_out" | awk '{print $2}')
     if [ "$code" = "404" ]; then
       return 0
     fi
     if [ "$code" = "000" ]; then
-      echo "rewrite_index: index GET transport failure (attempt $attempt)" >&2
+      echo "rewrite_index: index stat transport failure (attempt $attempt)" >&2
       sleep 0.5
       continue
     fi
     if [ "$code" != "200" ]; then
-      echo "rewrite_index: unexpected index status $code (attempt $attempt)" >&2
+      echo "rewrite_index: unexpected index stat status $code (attempt $attempt)" >&2
       sleep 0.5
       continue
     fi
+    if [ -z "$rev" ]; then
+      # Legacy servers may omit revision; fall back to unconditioned PUT with a warning.
+      echo "rewrite_index: warning: missing revision from ?stat=1; PUT without CAS (attempt $attempt)" >&2
+    fi
     body=$(fetch_remote_index_body)
+    if [ -z "$body" ] || ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+      echo "rewrite_index: index body unreadable/invalid (attempt $attempt)" >&2
+      sleep 0.5
+      continue
+    fi
     new_body=$(printf '%s' "$body" | jq -c --arg root "$remote_root" '
       .workspaces = ([.workspaces // []
         | .[]
@@ -622,12 +651,32 @@ rewrite_index_without_root() {
           )])
       | .updated_at = (now | todateiso8601)
       | .version = (.version // 1)
-    ')
-    put_code=$(curl -sS --max-time 30 -o /dev/null -w "%{http_code}" -X PUT \
-      -H "Authorization: Bearer $API_KEY" \
-      -H "Content-Type: application/json" \
-      -d "$new_body" \
-      "$url" || printf '000')
+    ') || true
+    if [ -z "$new_body" ]; then
+      echo "rewrite_index: filtered body empty (attempt $attempt)" >&2
+      sleep 0.5
+      continue
+    fi
+    # Existing objects start at revision >= 1; rev "0" is create-only — do not CAS with 0.
+    if [ -n "$rev" ] && [ "$rev" != "0" ]; then
+      put_code=$(curl -sS --max-time 30 -o /dev/null -w "%{http_code}" -X PUT \
+        -H "Authorization: Bearer $API_KEY" \
+        -H "Content-Type: application/json" \
+        -H "X-Dat9-Expected-Revision: $rev" \
+        -d "$new_body" \
+        "$url" || printf '000')
+    else
+      put_code=$(curl -sS --max-time 30 -o /dev/null -w "%{http_code}" -X PUT \
+        -H "Authorization: Bearer $API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "$new_body" \
+        "$url" || printf '000')
+    fi
+    if [ "$put_code" = "409" ]; then
+      echo "rewrite_index: index CAS conflict (attempt $attempt)" >&2
+      sleep 0.5
+      continue
+    fi
     if [ "$put_code" != "200" ] && [ "$put_code" != "201" ] && [ "$put_code" != "204" ]; then
       echo "rewrite_index: PUT status $put_code (attempt $attempt)" >&2
       sleep 0.5

@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -54,81 +56,69 @@ func TouchWorkspaceArmed(ctx context.Context, localRoot string) error {
 }
 
 // LocalArmSignal reports whether local markers indicate git workspaces should
-// be armed. This is directory-level and works with an empty loaded workspace
-// list (unlike per-ID refresh marker scans).
+// be armed, and an opaque generation token for the marker *set*.
 //
-// lastScanMtime is the previously observed max mtime of armed/refresh signals
-// (zero if never scanned). Returns (armed, newMaxMtime).
-func LocalArmSignal(ctx context.Context, localRoot string, lastScanMtime time.Time) (bool, time.Time) {
+// Generation changes when the armed marker body or the set of refresh/<id>
+// marker names/bodies changes — not only when FS max mtime advances. That way
+// a second MarkWorkspaceRegistered for a new workspace id still forces a FUSE
+// re-list on coarse-mtime filesystems (same-second mtimes).
+//
+// gen is empty when !armed. Compare gen with == only; do not parse it.
+func LocalArmSignal(ctx context.Context, localRoot string) (armed bool, gen string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if ctx.Err() != nil {
-		return false, lastScanMtime
+		return false, ""
 	}
 	localRoot = strings.TrimSpace(localRoot)
 	if localRoot == "" {
-		return false, lastScanMtime
+		return false, ""
 	}
 
-	var maxMtime time.Time
-	consider := func(p string) {
-		info, err := os.Stat(p)
-		if err != nil {
-			return
-		}
-		mt := info.ModTime()
-		if mt.After(maxMtime) {
-			maxMtime = mt
-		}
+	type markerPart struct {
+		name string
+		body string
 	}
+	var parts []markerPart
 
-	// armed file
-	consider(WorkspaceArmedPath(localRoot))
+	armedPath := WorkspaceArmedPath(localRoot)
+	if data, err := os.ReadFile(armedPath); err == nil {
+		parts = append(parts, markerPart{name: "armed", body: string(data)})
+	}
 
 	// Any refresh/<id> file marker. An empty refresh/ directory alone is not a
 	// signal (avoids re-arming after ClearLocalArmSignals left a bare dir).
 	refreshDir := WorkspaceRefreshDir(localRoot)
 	if entries, err := os.ReadDir(refreshDir); err == nil {
-		fileCount := 0
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
 			}
-			fileCount++
-			info, err := e.Info()
+			name := e.Name()
+			data, err := os.ReadFile(filepath.Join(refreshDir, name))
 			if err != nil {
+				// Unreadable entry still contributes identity so a new name is seen.
+				parts = append(parts, markerPart{name: "refresh/" + name, body: "?"})
 				continue
 			}
-			mt := info.ModTime()
-			if mt.After(maxMtime) {
-				maxMtime = mt
-			}
-		}
-		if fileCount > 0 && maxMtime.IsZero() {
-			// Directory exists with entries but mtimes unreadable — still a signal.
-			maxMtime = time.Now()
+			parts = append(parts, markerPart{name: "refresh/" + name, body: string(data)})
 		}
 	}
 
-	if maxMtime.IsZero() {
-		return false, lastScanMtime
+	if len(parts) == 0 {
+		return false, ""
 	}
-	if lastScanMtime.IsZero() {
-		// First observation of any marker is an arm signal.
-		return true, maxMtime
+
+	sort.Slice(parts, func(i, j int) bool { return parts[i].name < parts[j].name })
+	h := fnv.New64a()
+	for _, p := range parts {
+		_, _ = h.Write([]byte(p.name))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(p.body))
+		_, _ = h.Write([]byte{0})
 	}
-	if maxMtime.After(lastScanMtime) {
-		return true, maxMtime
-	}
-	// Marker still present (armed file or non-empty refresh/) → stay armed-capable.
-	if _, err := os.Stat(WorkspaceArmedPath(localRoot)); err == nil {
-		return true, maxMtime
-	}
-	if entries, err := os.ReadDir(refreshDir); err == nil && len(entries) > 0 {
-		return true, maxMtime
-	}
-	return false, maxMtime
+	return true, fmt.Sprintf("%016x", h.Sum64())
 }
 
 // MarkWorkspaceRegistered updates local signals after a successful remote

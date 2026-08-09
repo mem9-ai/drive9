@@ -53,7 +53,7 @@ type gitWorkspaceLayer struct {
 	// On-demand discovery (design: dormant → armed).
 	armed            bool
 	dormantConfirmed bool // index 404/empty confirmed; skip remote index until local arm
-	localArmMtime    time.Time
+	localArmGen      string // last LocalArmSignal generation token (marker set fingerprint)
 	localArmScanAt   time.Time
 	indexRevision    int64
 	indexMtime       time.Time
@@ -193,7 +193,7 @@ func (fs *Dat9FS) disarmGitWorkspacesLocked() {
 	fs.git.workspaces = nil
 	fs.git.dormantConfirmed = true
 	fs.git.pendingForce = false
-	fs.git.localArmMtime = time.Time{}
+	fs.git.localArmGen = ""
 	fs.git.localArmScanAt = time.Time{}
 }
 
@@ -381,17 +381,19 @@ func (fs *Dat9FS) tryArmFromLocalSignals() (armed bool, forceReload bool) {
 		fs.git.mu.Unlock()
 		return true, false
 	}
-	last := fs.git.localArmMtime
+	lastGen := fs.git.localArmGen
 	wasArmed := fs.git.armed
 	fs.git.localArmScanAt = now
 	fs.git.mu.Unlock()
 
-	signal, newMT := gitcache.LocalArmSignal(context.Background(), localRoot, last)
+	// Generation fingerprints marker names+bodies, not only FS mtime, so a
+	// second --fast in the same coarse-mtime second still force-lists.
+	signal, gen := gitcache.LocalArmSignal(context.Background(), localRoot)
 	fs.git.mu.Lock()
 	defer fs.git.mu.Unlock()
-	mtimeAdvanced := !newMT.IsZero() && (last.IsZero() || newMT.After(last))
-	if !newMT.IsZero() {
-		fs.git.localArmMtime = newMT
+	genAdvanced := gen != "" && gen != lastGen
+	if gen != "" {
+		fs.git.localArmGen = gen
 	}
 	if signal {
 		fs.git.armed = true
@@ -399,8 +401,8 @@ func (fs *Dat9FS) tryArmFromLocalSignals() (armed bool, forceReload bool) {
 		// First arm after dormant must force-list: needInitialLoad alone is not
 		// enough if a prior empty list left loaded=true with zero workspaces
 		// (e.g. index SSE raced registration). Same-LocalRoot second --fast
-		// advances mtime while already armed and also needs a force re-list.
-		if !wasArmed || mtimeAdvanced {
+		// changes the marker generation and also needs a force re-list.
+		if !wasArmed || genAdvanced {
 			return true, true
 		}
 		return true, false
@@ -744,7 +746,7 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 			localRoot = strings.TrimSpace(fs.opts.LocalRoot)
 		}
 		fs.git.mu.Unlock()
-		signal, _ := gitcache.LocalArmSignal(ctx, localRoot, time.Time{})
+		signal, _ := gitcache.LocalArmSignal(ctx, localRoot)
 		fs.git.mu.Lock()
 		// Re-check emptiness under lock so we do not wipe a concurrent install.
 		if !signal && len(fs.git.workspaces) == 0 {
