@@ -275,9 +275,25 @@ func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, obse
 	limited := &limitedSource{File: file.file, limiter: e.limiterForSize(source.Version.Size), ctx: ctx}
 	started := time.Now()
 	operationDone := e.beginOperation()
+	preCommitTarget := current
 	committed, uploadErr := e.api.WriteStreamConditionalWithChecksumAndPreCompleteCheck(
 		ctx, remote, limited, deep.Size, nil, expected, deep.ChecksumSHA256,
-		func() error { return e.validateOpenSource(file, source) },
+		func() error {
+			if err := e.validateOpenSource(file, source); err != nil {
+				return err
+			}
+			_, latest, err := e.currentTarget(ctx, remote, observed, exists)
+			if err != nil {
+				return err
+			}
+			if latest != nil {
+				if err := validateTargetLinkOwnership(source, observed, latest, ownedLinks); err != nil {
+					return err
+				}
+			}
+			preCommitTarget = latest
+			return nil
+		},
 	)
 	operationDone()
 	if e.onCAS != nil && (uploadErr == nil || client.IsCommitAttempted(uploadErr)) {
@@ -298,6 +314,9 @@ func (e *ApplyEngine) applyRegular(ctx context.Context, source SourceEntry, obse
 		(modeType != 0 && modeType != 0o100000) || committed.Size != deep.Size || committed.ChecksumSHA256 != deep.ChecksumSHA256 {
 		return fmt.Errorf("%w: post-upload target %s", ErrApplyVerification, source.Path)
 	}
+	if err := validateCommittedTargetLinkOwnership(source, preCommitTarget, committed, ownedLinks); err != nil {
+		return err
+	}
 	if e.config.Phase == PhaseDualWriteRepairing && committed.Mode&0o777 != source.Mode&0o777 {
 		return fmt.Errorf("%w: post-T0 mode mismatch at %s", ErrUnsafeApply, source.Path)
 	}
@@ -314,6 +333,23 @@ func validateTargetLinkOwnership(source SourceEntry, observed TargetEntry, curre
 	owner := targetLinkOwner{source: targetLinkSourceOwner(source), resource: current.ResourceID}
 	if current.Nlink == 0 || current.Nlink != ownedLinks[owner] {
 		return fmt.Errorf("%w: target has unowned hardlinks at %s", ErrUnsafeApply, source.Path)
+	}
+	return nil
+}
+
+func validateCommittedTargetLinkOwnership(source SourceEntry, before, committed *client.StatResult, ownedLinks map[targetLinkOwner]uint32) error {
+	if before == nil {
+		if committed.Nlink != 1 {
+			return fmt.Errorf("%w: target link count changed during create at %s", ErrApplyRescan, source.Path)
+		}
+		return nil
+	}
+	if committed.ResourceID != before.ResourceID || committed.Nlink != before.Nlink {
+		return fmt.Errorf("%w: target link identity changed during upload at %s", ErrApplyRescan, source.Path)
+	}
+	owner := targetLinkOwner{source: targetLinkSourceOwner(source), resource: committed.ResourceID}
+	if committed.Nlink == 0 || committed.Nlink != ownedLinks[owner] {
+		return fmt.Errorf("%w: post-upload target has unowned hardlinks at %s", ErrUnsafeApply, source.Path)
 	}
 	return nil
 }
