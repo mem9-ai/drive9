@@ -10,12 +10,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
-func TestGitWorkspaceUpsertRejectsSelfLinkedWorkspace(t *testing.T) {
-	s := newTestServer(t)
+func ensureGitWorkspaceSchema(t *testing.T, s *Server) {
+	t.Helper()
 	for _, stmt := range schema.GitWorkspaceTiDBSchemaStatements() {
 		if _, err := s.fallback.Store().DB().Exec(stmt); err != nil {
 			msg := strings.ToLower(err.Error())
@@ -25,6 +27,133 @@ func TestGitWorkspaceUpsertRejectsSelfLinkedWorkspace(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func writeGitWorkspaceIndexForTest(t *testing.T, s *Server, body []byte) {
+	t.Helper()
+	ctx := context.Background()
+	// Ensure parent dirs exist via unconditional writes of empty placeholders is
+	// not needed: WriteCtxIfRevision creates intermediate path nodes.
+	if _, _, err := s.fallback.WriteCtxIfRevisionWithTagsResult(
+		ctx,
+		gitWorkspaceIndexPath,
+		body,
+		0,
+		filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate,
+		-1,
+		nil,
+		"",
+	); err != nil {
+		t.Fatalf("seed git workspace index: %v", err)
+	}
+}
+
+func TestGitWorkspaceDeleteRemovesIndexEntry(t *testing.T) {
+	s := newTestServer(t)
+	ensureGitWorkspaceSchema(t, s)
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+
+	c := client.New(ts.URL, "")
+	ctx := context.Background()
+	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo/",
+		RepoURL:    "https://example.test/repo.git",
+		RemoteName: "origin",
+		HeadCommit: "1111111111111111111111111111111111111111",
+	})
+	if err != nil {
+		t.Fatalf("UpsertGitWorkspace: %v", err)
+	}
+
+	idxBody, err := json.MarshalIndent(gitWorkspaceIndexDoc{
+		Version: 1,
+		Workspaces: []gitWorkspaceIndexDocEntry{
+			{WorkspaceID: ws.WorkspaceID, RootPath: "/repo/"},
+			{WorkspaceID: "ws-other", RootPath: "/other/"},
+		},
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeGitWorkspaceIndexForTest(t, s, idxBody)
+
+	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
+		t.Fatalf("DeleteGitWorkspace: %v", err)
+	}
+
+	data, err := s.fallback.ReadCtx(ctx, gitWorkspaceIndexPath, 0, -1)
+	if err != nil {
+		t.Fatalf("read index after delete: %v", err)
+	}
+	var idx gitWorkspaceIndexDoc
+	if err := json.Unmarshal(data, &idx); err != nil {
+		t.Fatalf("parse index: %v", err)
+	}
+	if len(idx.Workspaces) != 1 || idx.Workspaces[0].WorkspaceID != "ws-other" {
+		t.Fatalf("index after delete = %+v, want only ws-other", idx.Workspaces)
+	}
+}
+
+func TestGitWorkspaceDeleteIdempotentCleansStaleIndex(t *testing.T) {
+	// Convergent repair: workspace row already non-live, index still lists it.
+	// A second DELETE must succeed and remove the stale index entry.
+	s := newTestServer(t)
+	ensureGitWorkspaceSchema(t, s)
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+
+	c := client.New(ts.URL, "")
+	ctx := context.Background()
+	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo2/",
+		RepoURL:    "https://example.test/repo2.git",
+		RemoteName: "origin",
+		HeadCommit: "2222222222222222222222222222222222222222",
+	})
+	if err != nil {
+		t.Fatalf("UpsertGitWorkspace: %v", err)
+	}
+	// Soft-delete row only (bypass handler) to simulate partial prior failure.
+	if err := s.fallback.Store().DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
+		t.Fatalf("store.DeleteGitWorkspace: %v", err)
+	}
+	idxBody, err := json.MarshalIndent(gitWorkspaceIndexDoc{
+		Version: 1,
+		Workspaces: []gitWorkspaceIndexDocEntry{
+			{WorkspaceID: ws.WorkspaceID, RootPath: "/repo2/"},
+		},
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeGitWorkspaceIndexForTest(t, s, idxBody)
+
+	// API DELETE must be idempotent and finish index cleanup.
+	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
+		t.Fatalf("DeleteGitWorkspace repair: %v", err)
+	}
+	data, err := s.fallback.ReadCtx(ctx, gitWorkspaceIndexPath, 0, -1)
+	if err != nil {
+		t.Fatalf("read index after repair delete: %v", err)
+	}
+	var idx gitWorkspaceIndexDoc
+	if err := json.Unmarshal(data, &idx); err != nil {
+		t.Fatalf("parse index: %v", err)
+	}
+	if len(idx.Workspaces) != 0 {
+		t.Fatalf("index after repair = %+v, want empty workspaces", idx.Workspaces)
+	}
+
+	// Third call still OK (fully clean).
+	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
+		t.Fatalf("DeleteGitWorkspace already clean: %v", err)
+	}
+}
+
+func TestGitWorkspaceUpsertRejectsSelfLinkedWorkspace(t *testing.T) {
+	s := newTestServer(t)
+	ensureGitWorkspaceSchema(t, s)
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 

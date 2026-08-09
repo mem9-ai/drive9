@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+
+	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/gitcache"
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -24,7 +28,24 @@ const (
 	maxGitBlobBodyBytes       = 512 << 20
 	maxGitObjectPackBytes     = 256 << 20
 	maxGitObjectPackBodyBytes = maxGitObjectPackBytes + maxGitObjectPackBytes/3 + 1<<20
+
+	// Tenant-absolute remote existence index (mirrors client.GitWorkspaceIndexPath).
+	gitWorkspaceIndexPath = "/.drive9/git-workspaces/index.json"
 )
+
+// gitWorkspaceIndexDoc is the remote FS document used only as an existence
+// signal for FUSE on-demand arming (same shape as the client index type).
+type gitWorkspaceIndexDoc struct {
+	Version    int                         `json:"version"`
+	UpdatedAt  string                      `json:"updated_at"`
+	Workspaces []gitWorkspaceIndexDocEntry `json:"workspaces"`
+}
+
+type gitWorkspaceIndexDocEntry struct {
+	WorkspaceID   string `json:"workspace_id"`
+	RootPath      string `json:"root_path"`
+	WorkspaceKind string `json:"workspace_kind,omitempty"`
+}
 
 type gitWorkspaceRequest struct {
 	RootPath          string `json:"root_path"`
@@ -335,12 +356,117 @@ func (s *Server) handleGitWorkspaceList(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) handleGitWorkspaceDelete(w http.ResponseWriter, r *http.Request, store *datastore.Store, workspaceID string) {
-	if err := store.DeleteGitWorkspace(r.Context(), workspaceID); err != nil {
+	b := backendFromRequest(r)
+	if b == nil {
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	// Soft-delete is idempotent for convergent repair: NotFound means the row
+	// is already non-live, but a prior attempt may have left index cleanup pending.
+	if err := store.DeleteGitWorkspace(r.Context(), workspaceID); err != nil && !errors.Is(err, datastore.ErrNotFound) {
 		writeGitWorkspaceStoreError(w, r, err)
+		return
+	}
+	// Durable index maintenance is server-owned so CLI/FUSE cannot leave other
+	// armed mounts serving a stale index after workspace delete succeeds.
+	if err := removeGitWorkspaceIndexEntry(r.Context(), b, workspaceID); err != nil {
+		logger.Error(r.Context(), "git_workspace_index_cleanup_failed",
+			eventFields(r.Context(), "git_workspace_index_cleanup_failed",
+				"workspace_id", workspaceID, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, "failed to update git workspace index after delete")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+}
+
+// removeGitWorkspaceIndexEntry removes workspaceID from the remote existence
+// index with revision CAS retries. Missing index or already-absent entry is OK
+// (idempotent). Emits a normal FS write so SSE subscribers observe the change.
+func removeGitWorkspaceIndexEntry(ctx context.Context, b *backend.Dat9Backend, workspaceID string) error {
+	if b == nil {
+		return fmt.Errorf("backend is nil")
+	}
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		nf, err := b.StatNodeCtx(ctx, gitWorkspaceIndexPath)
+		if errors.Is(err, datastore.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("stat git workspace index: %w", err)
+		}
+		rev := int64(0)
+		if nf != nil && nf.File != nil {
+			rev = nf.File.Revision
+		}
+		data, err := b.ReadCtx(ctx, gitWorkspaceIndexPath, 0, -1)
+		if errors.Is(err, datastore.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read git workspace index: %w", err)
+		}
+		var idx gitWorkspaceIndexDoc
+		if len(strings.TrimSpace(string(data))) > 0 {
+			if err := json.Unmarshal(data, &idx); err != nil {
+				return fmt.Errorf("parse git workspace index: %w", err)
+			}
+		}
+		if idx.Version == 0 {
+			idx.Version = 1
+		}
+		out := make([]gitWorkspaceIndexDocEntry, 0, len(idx.Workspaces))
+		found := false
+		for _, e := range idx.Workspaces {
+			if e.WorkspaceID == workspaceID {
+				found = true
+				continue
+			}
+			out = append(out, e)
+		}
+		if !found {
+			return nil
+		}
+		idx.Workspaces = out
+		idx.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		body, err := json.MarshalIndent(idx, "", "  ")
+		if err != nil {
+			return fmt.Errorf("encode git workspace index: %w", err)
+		}
+		// Empty document is kept via CAS write (same as client) so concurrent
+		// upserts are not lost to an unconditional delete race.
+		_, _, err = b.WriteCtxIfRevisionWithTagsResult(
+			ctx,
+			gitWorkspaceIndexPath,
+			body,
+			0,
+			filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate,
+			rev,
+			nil,
+			"",
+		)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if errors.Is(err, datastore.ErrRevisionConflict) && attempt+1 < maxAttempts {
+			continue
+		}
+		return fmt.Errorf("write git workspace index: %w", err)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("write git workspace index: %w", lastErr)
+	}
+	return fmt.Errorf("write git workspace index: exhausted retries")
 }
 
 func (s *Server) handleGitWorkspaceObject(w http.ResponseWriter, r *http.Request, store *datastore.Store) {

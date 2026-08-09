@@ -268,143 +268,53 @@ func TestEnsureGitWorkspacesStillWorksForTests(t *testing.T) {
 	}
 }
 
-func TestProbeIndex401DoesNotLatchDormantAndRetries(t *testing.T) {
-	// First Stat returns 401 (transient); later retries must still arm when the
-	// index becomes readable. Only 403 permanently latches dormantConfirmed.
-	var headCalls atomic.Int64
-	idx := client.GitWorkspaceIndex{
-		Version: 1,
-		Workspaces: []client.GitWorkspaceIndexEntry{{
-			WorkspaceID: "ws1",
-			RootPath:    "/repo/",
-		}},
-	}
-	idxBody, _ := json.Marshal(idx)
-	indexFSPath := "/v1/fs" + client.GitWorkspaceIndexPath
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == indexFSPath && r.Method == http.MethodHead:
-			n := headCalls.Add(1)
-			if n == 1 {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
+func TestProbeIndex401And403LatchDormant(t *testing.T) {
+	// Mount client holds a static credential with no refresh path. Server 401 is
+	// a persistent credential failure; 403 is permanent scope denial. Both must
+	// stop the probe loop and latch dormantConfirmed (not backoff forever).
+	for _, tc := range []struct {
+		name   string
+		status int
+	}{
+		{name: "401", status: http.StatusUnauthorized},
+		{name: "403", status: http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			indexFSPath := "/v1/fs" + client.GitWorkspaceIndexPath
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == indexFSPath {
+					http.Error(w, "denied", tc.status)
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			t.Cleanup(srv.Close)
+
+			opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, RemoteRoot: "/"}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(srv.URL), opts)
+
+			done := make(chan struct{})
+			go func() {
+				fs.runGitWorkspaceIndexProbeLoop()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("probe loop did not stop on %d", tc.status)
 			}
-			w.Header().Set("X-Dat9-Revision", "1")
-			w.Header().Set("Content-Length", "10")
-			w.WriteHeader(http.StatusOK)
-		case r.URL.Path == indexFSPath && r.Method == http.MethodGet:
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("X-Dat9-Revision", "1")
-			_, _ = w.Write(idxBody)
-		case r.URL.Path == "/v1/git-workspaces" && r.Method == http.MethodGet:
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"workspaces": []map[string]any{{
-					"workspace_id": "ws1",
-					"root_path":    "/repo/",
-					"head_commit":  fixtureHeadCommit,
-					"mode":         "fast",
-					"status":       "live",
-				}},
-			})
-		case r.URL.Path == "/v1/git-workspaces/ws1/tree":
-			_ = json.NewEncoder(w).Encode(map[string]any{"nodes": []any{}})
-		case r.URL.Path == "/v1/git-workspaces/ws1/overlay":
-			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(srv.Close)
-
-	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, RemoteRoot: "/"}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(srv.URL), opts)
-
-	// Single probe: 401 must surface as error and must not latch dormant.
-	err := fs.probeGitWorkspaceIndex(context.Background())
-	if err == nil {
-		t.Fatal("probeGitWorkspaceIndex: want 401 error, got nil")
-	}
-	if !client.IsUnauthorized(err) {
-		t.Fatalf("probe err = %v, want unauthorized", err)
-	}
-	fs.git.mu.Lock()
-	confirmed := fs.git.dormantConfirmed
-	armed := fs.git.armed
-	fs.git.mu.Unlock()
-	if confirmed {
-		t.Fatal("dormantConfirmed latched on 401; want retryable")
-	}
-	if armed {
-		t.Fatal("armed on 401; want unarmed until readable index")
-	}
-
-	// Async probe loop retries after backoff and arms when Stat succeeds.
-	done := make(chan struct{})
-	go func() {
-		fs.runGitWorkspaceIndexProbeLoop()
-		close(done)
-	}()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if fs.gitWorkspacesArmed() {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if !fs.gitWorkspacesArmed() {
-		t.Fatal("expected armed after 401 then successful index Stat retry")
-	}
-	fs.git.mu.Lock()
-	confirmed = fs.git.dormantConfirmed
-	fs.git.mu.Unlock()
-	if confirmed {
-		t.Fatal("dormantConfirmed true after successful retry arm")
-	}
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		// Loop exits on arm; allow a short grace period.
-	}
-	if got := headCalls.Load(); got < 2 {
-		t.Fatalf("index HEAD calls = %d, want >= 2 (401 then success)", got)
-	}
-}
-
-func TestProbeIndex403LatchesDormant(t *testing.T) {
-	indexFSPath := "/v1/fs" + client.GitWorkspaceIndexPath
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == indexFSPath {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	t.Cleanup(srv.Close)
-
-	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, RemoteRoot: "/"}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(srv.URL), opts)
-
-	done := make(chan struct{})
-	go func() {
-		fs.runGitWorkspaceIndexProbeLoop()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("probe loop did not stop on 403")
-	}
-	fs.git.mu.Lock()
-	confirmed := fs.git.dormantConfirmed
-	armed := fs.git.armed
-	fs.git.mu.Unlock()
-	if !confirmed {
-		t.Fatal("dormantConfirmed = false after 403; want permanent latch")
-	}
-	if armed {
-		t.Fatal("armed after 403; want unarmed dormant")
+			fs.git.mu.Lock()
+			confirmed := fs.git.dormantConfirmed
+			armed := fs.git.armed
+			fs.git.mu.Unlock()
+			if !confirmed {
+				t.Fatalf("dormantConfirmed = false after %d; want permanent latch", tc.status)
+			}
+			if armed {
+				t.Fatalf("armed after %d; want unarmed dormant", tc.status)
+			}
+		})
 	}
 }
 

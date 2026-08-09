@@ -512,16 +512,19 @@ func gitWorktreeRemove(args []string) error {
 			return fmt.Errorf("checkpoint common .git after worktree remove: %w", err)
 		}
 	}
+	// Server DELETE soft-deletes the workspace and durably maintains the remote
+	// index (CAS). Failure is retryable/convergent: a second DELETE with the same
+	// id treats an already-deleted row as OK and finishes index cleanup.
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
 		cancel()
 		return fmt.Errorf("delete linked git workspace: %w", err)
 	}
 	cancel()
-	// Index cleanup can fail after the irreversible workspace delete. Always
-	// finish local marker/overlay/worktree cleanup so a partial failure does not
-	// leave a broken local worktree that cannot be looked up for retry.
+	// Local cleanup is independent of remote index (server already cleaned it).
+	// Keep collecting local errors so partial local failure is visible.
 	var cleanupErrs []error
+	// Defense in depth for older servers without server-side index maintenance.
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	if err := c.RemoveGitWorkspaceIndexEntry(ctx, ws.WorkspaceID); err != nil {
 		cleanupErrs = append(cleanupErrs, fmt.Errorf("remove linked git workspace from index: %w", err))

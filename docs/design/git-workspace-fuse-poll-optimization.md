@@ -177,9 +177,12 @@ over “discoverable but incomplete”.
 
 Crash between steps 1–3 is recovered by re-running the command. Step 1 is **not**
 rolled back when step 2 fails (deleting the registration would orphan tree/state
-and is worse than a missing index hint). Delete-path asymmetry: after an
-irreversible `DeleteGitWorkspace`, index/local cleanup failures are collected
-but local cleanup still proceeds so the target stays retryable (`worktree remove --fast`).
+and is worse than a missing index hint). **Delete path:** server `DELETE
+/v1/git-workspaces/{id}` soft-deletes the row and CAS-updates the remote index
+in the same request; index failure returns 5xx so the client can retry.
+DELETE is idempotent (already-deleted row still runs index cleanup) so repair is
+convergent. CLI/FUSE may best-effort double-remove the index entry after a
+successful DELETE and still finish local cleanup independently.
 
 Local arm markers are a **generation** over the marker set (armed body + each
 `refresh/<id>` name and body), not max FS mtime alone — so same-second
@@ -206,8 +209,7 @@ While unarmed, forbid: `ListGitWorkspaces`, tree, overlay, git-state APIs; forbi
 2. **404 / empty / no entries for this mount after filter** → `dormantConfirmed`; zero git-workspace APIs until local arm.
 3. **Relevant entries** → `armed`, then `ListGitWorkspaces` to build runtime.
 4. **Network / 5xx / parse errors** → do not confirm dormant; exponential backoff Stat retries (cap ~30s).
-5. **403** → permanently unreadable (e.g. fs_scoped cannot read `/.drive9/`); confirm dormant and stop the probe loop.
-6. **401** → treat as transient (expired/refreshing auth); exponential backoff retry like network/5xx — do **not** permanently latch dormant on a single 401.
+5. **401 / 403** → treat as permanently unreadable; confirm dormant and stop the probe loop (401: static credential invalid for this mount client; 403: fs_scoped cannot read `/.drive9/`).
 
 ### 6.3 Refresh while ARMED
 
@@ -258,7 +260,7 @@ No `reindex` user command. If the DB already has workspaces but no index yet:
 | 5 | Same-machine arm | Directory-level signals; not loaded-id-only scans |
 | 6 | CLI index/local write failure | Fail the whole command |
 | 7 | CLI write order | Index + local before success/hydrate |
-| 8 | Stat failure | 404→dormant; network/5xx/401→backoff retry; 403→dormant, stop probe |
+| 8 | Stat failure | 404→dormant; network/5xx→backoff; 401/403→dormant, stop probe |
 | 9 | ARMED cross-host freshness | 60s throttled Stat and/or SSE on index |
 | 10 | After dormantConfirmed, remote first register | Requires remount (or same-LocalRoot local signal) |
 | 11 | Default-path delivery | Ship discovery, index, CLI order, and SSE wiring together so “dormant without index writes” cannot break remount |
@@ -274,7 +276,7 @@ No `reindex` user command. If the DB already has workspaces but no index yet:
 3. Index is existence-only; runtime is List/Get only.
 4. Index path is tenant-absolute; filter by RemoteRoot.
 5. CLI: index + local armed before success/hydrate; failure fails the whole command.
-6. FUSE workspace delete must update the index.
+6. Workspace delete must update the remote index durably on the server (CAS); clients may best-effort double-remove. Partial delete+index failure is retryable/convergent (DELETE is idempotent).
 7. List/arm singleflight + failure backoff; force does not bypass the backoff gate—use sticky re-issue.
 8. While DORMANT, `.git` paths must not force-list.
 9. No forced hiding of `/.drive9/`.
