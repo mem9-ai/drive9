@@ -31,6 +31,9 @@ MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
 HEAL_TIMEOUT_S="${HEAL_TIMEOUT_S:-60}"
 HEAL_INTERVAL_S="${HEAL_INTERVAL_S:-2}"
 NO_RESTART_OBSERVE_S="${NO_RESTART_OBSERVE_S:-12}"
+# Bound individual FUSE I/O / health / mountpoint probes so a wedged FUSE
+# endpoint cannot hang the PR gate until the global job timeout.
+FUSE_PROBE_TIMEOUT_S="${FUSE_PROBE_TIMEOUT_S:-10}"
 FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
 FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-45s}"
@@ -98,15 +101,26 @@ skip_or_fail() {
   skip "$@"
 }
 
+# with_timeout runs a command under coreutils timeout when available.
+with_timeout() {
+  local secs="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${secs}s" "$@"
+  else
+    "$@"
+  fi
+}
+
 is_mounted() {
   local mount_point="$1"
   local physical_mount_point
   physical_mount_point="$(cd "$(dirname "$mount_point")" 2>/dev/null && pwd -P)/$(basename "$mount_point")"
   if command -v mountpoint >/dev/null 2>&1; then
-    mountpoint -q "$mount_point"
+    with_timeout "$FUSE_PROBE_TIMEOUT_S" mountpoint -q "$mount_point"
     return
   fi
-  mount | awk -v mp="$mount_point" -v pmp="$physical_mount_point" \
+  with_timeout "$FUSE_PROBE_TIMEOUT_S" mount | awk -v mp="$mount_point" -v pmp="$physical_mount_point" \
     '{for(i=1;i<=NF;i++) if($i=="on" && ($(i+1)==mp || $(i+1)==pmp)) found=1} END{exit !found}'
 }
 
@@ -132,10 +146,13 @@ wait_mount_state() {
 probe_mount_io() {
   local marker="$1"
   local f="$MOUNT_POINT/supervise-probe.txt"
-  printf '%s\n' "$marker" >"$f" || return 1
-  local got
-  got="$(tr -d '\n' <"$f" 2>/dev/null || true)"
-  [ "$got" = "$marker" ]
+  # Shell write/read can block forever on a wedged FUSE endpoint; bound them.
+  with_timeout "$FUSE_PROBE_TIMEOUT_S" bash -c '
+    marker="$1"; f="$2"
+    printf "%s\n" "$marker" >"$f" || exit 1
+    got="$(tr -d "\n" <"$f" 2>/dev/null || true)"
+    [ "$got" = "$marker" ]
+  ' _ "$marker" "$f"
 }
 
 mount_status_json() {
@@ -187,7 +204,7 @@ wait_healthy_io() {
   local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
   while :; do
     if is_mounted "$MOUNT_POINT" \
-      && drive9 mount health "$MOUNT_POINT" >/dev/null 2>&1 \
+      && with_timeout "$FUSE_PROBE_TIMEOUT_S" drive9 mount health "$MOUNT_POINT" >/dev/null 2>&1 \
       && probe_mount_io "$label-$(date +%s)"; then
       return 0
     fi
@@ -480,6 +497,10 @@ check_cmd "mount status reports healthy" \
 check_cmd "initial IO through supervised mount" probe_mount_io "before-crash"
 check_cmd "resolved worker pid before kill" test -n "${WORKER_PID:-}"
 check_cmd "resolved supervisor pid before kill" test -n "${SUPERVISOR_PID:-}"
+if [ -z "${WORKER_PID:-}" ] || [ -z "${SUPERVISOR_PID:-}" ]; then
+  echo "FAIL cannot continue without supervisor/worker pids" >&2
+  exit 1
+fi
 
 echo "[6] kill -9 worker only (supervisor should heal)"
 check_cmd "worker killed with SIGKILL" kill -9 "$WORKER_PID"

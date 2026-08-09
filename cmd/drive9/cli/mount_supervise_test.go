@@ -46,17 +46,35 @@ func TestPeelSystemdUnitFlagsDoubleDash(t *testing.T) {
 	}
 }
 
-func TestInjectEnsureCredentials(t *testing.T) {
-	got := injectEnsureCredentials([]string{"--mode=fuse", ":/r", "/m"}, "https://s", "sk-1")
-	want := []string{"--api-key", "sk-1", "--server", "https://s", "--mode=fuse", ":/r", "/m"}
+func TestInjectEnsureServerFlag(t *testing.T) {
+	got := injectEnsureServerFlag([]string{"--mode=fuse", ":/r", "/m"}, "https://s")
+	want := []string{"--server", "https://s", "--mode=fuse", ":/r", "/m"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
-	// Do not duplicate existing flags.
-	got2 := injectEnsureCredentials([]string{"--server", "https://keep", ":/r", "/m"}, "https://s", "sk-1")
-	want2 := []string{"--api-key", "sk-1", "--server", "https://keep", ":/r", "/m"}
+	// Do not duplicate existing flags; never inject --api-key onto argv.
+	got2 := injectEnsureServerFlag([]string{"--server", "https://keep", ":/r", "/m"}, "https://s")
+	want2 := []string{"--server", "https://keep", ":/r", "/m"}
 	if !reflect.DeepEqual(got2, want2) {
 		t.Fatalf("got2 %v, want %v", got2, want2)
+	}
+}
+
+func TestValidateSystemdUnitName(t *testing.T) {
+	if err := validateSystemdUnitName("drive9-mount"); err != nil {
+		t.Fatalf("valid name: %v", err)
+	}
+	if err := validateSystemdUnitName("../../evil"); err == nil {
+		t.Fatal("expected path traversal reject")
+	}
+	if err := validateSystemdUnitName("a/b"); err == nil {
+		t.Fatal("expected slash reject")
+	}
+}
+
+func TestSystemdEscapePercents(t *testing.T) {
+	if got, want := systemdEscapePercents("a%b%%c"), "a%%b%%%%c"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 

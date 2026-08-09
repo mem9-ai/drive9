@@ -450,7 +450,7 @@ func usage(code int) {
 			"  profile show [profile]\n"+
 			"                         print mount profile configuration\n"+
 			"  mount [flags] [:/remote] <mountpoint>\n"+
-			"                         mount drive9 filesystem (supervised by default)\n"+
+			"                         mount drive9 filesystem (background FUSE supervised by default on Linux/macOS)\n"+
 			"  mount drain [--timeout duration] [--json] <mountpoint>\n"+
 			"                         drain pending writes for a live FUSE mount\n"+
 			"  mount status [--json] <mountpoint>\n"+

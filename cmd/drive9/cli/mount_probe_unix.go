@@ -15,15 +15,13 @@ func probeMountPointReadyCLI(mountPoint string) bool {
 func mountPointStillActiveImpl(mountPoint string) bool {
 	active, err := drive9fuse.ActiveMountPoint(mountPoint)
 	if err != nil {
-		// Missing path → not mounted. Broken FUSE (ENOTCONN etc.) is still
-		// present and needs force-unmount cleanup, so treat as active.
+		// Missing path → not mounted.
 		if os.IsNotExist(err) {
 			return false
 		}
-		if drive9fuse.IsTransportBroken(err) {
-			return true
-		}
-		return false
+		// Broken FUSE (ENOTCONN) and other unknown stat failures: treat as
+		// active so umount does not forgive a failed fusermount as success.
+		return true
 	}
 	return active
 }

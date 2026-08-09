@@ -171,8 +171,10 @@ func applyDefaults(cfg Config) Config {
 
 func (s *supervisor) unlock() {
 	if s.lockFile != nil {
+		// Only close the fd to release the flock. Do not unlink the lock path:
+		// removing it lets a new process create a different inode and take a
+		// "lock" while this process still held the old one (or races shutdown).
 		_ = s.lockFile.Close()
-		_ = os.Remove(mountstate.SupervisorLockPath(s.cfg.MountPoint))
 		s.lockFile = nil
 	}
 }
@@ -295,12 +297,17 @@ func (s *supervisor) loop() error {
 			return s.shutdownClean()
 		}
 
-		// Exit 0 while still RUNNING: verify mount inactive; if still active, treat as abnormal.
+		// Exit 0 while still RUNNING: verify mount inactive; if still active
+		// or transport-broken (ENOTCONN), treat as abnormal so we restart/clean.
 		if code == 0 {
-			if active, _ := drive9fuse.ActiveMountPoint(s.cfg.MountPoint); active {
+			active, activeErr := drive9fuse.ActiveMountPoint(s.cfg.MountPoint)
+			if active || drive9fuse.IsTransportBroken(activeErr) {
 				if probeErr := drive9fuse.ProbeMountPointReady(s.cfg.MountPoint); probeErr != nil {
 					code = drive9fuse.ExitServeAbnormal
 					reason = "worker exit 0 but mount broken: " + probeErr.Error()
+				} else if drive9fuse.IsTransportBroken(activeErr) {
+					code = drive9fuse.ExitServeAbnormal
+					reason = "worker exit 0 but mount transport broken: " + activeErr.Error()
 				} else {
 					// Live healthy mount with dead worker is unexpected — restart.
 					code = drive9fuse.ExitServeAbnormal
@@ -615,17 +622,24 @@ func (s *supervisor) stopWorker() {
 func (s *supervisor) killWorkerForHealth() {
 	s.mu.Lock()
 	cmd := s.workerCmd
+	waitCh := s.workerWait
 	s.mu.Unlock()
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
 	_ = cmd.Process.Signal(syscall.SIGTERM)
-	// Grace uses full --stop-timeout, then SIGKILL.
-	s.cfg.Sleep(s.cfg.StopTimeout)
-	s.mu.Lock()
-	cmd = s.workerCmd
-	s.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
+	if waitCh == nil {
+		return
+	}
+	// Same pattern as stopWorker: wait for exit, only escalate after grace.
+	// Re-queue the result so the caller can still read workerWait to classify.
+	select {
+	case res := <-waitCh:
+		select {
+		case waitCh <- res:
+		default:
+		}
+	case <-time.After(s.cfg.StopTimeout):
 		_ = cmd.Process.Kill()
 	}
 }

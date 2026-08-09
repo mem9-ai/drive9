@@ -222,7 +222,9 @@ func Mount(opts *MountOptions) (err error) {
 	}
 	var (
 		mountBecameActive bool
-		mountPointCopy    string
+		// Assign before deferred recover so panics in overlay setup still
+		// write exit reason under the real mountpoint hash (not empty string).
+		mountPointCopy = opts.MountPoint
 	)
 	defer func() {
 		if r := recover(); r != nil {
@@ -239,13 +241,15 @@ func Mount(opts *MountOptions) (err error) {
 			}
 			detail := fmt.Sprintf("%v", r)
 			err = ExitPanicErr(detail, fmt.Errorf("panic: %v", r))
-			_ = mountstate.WriteExitReason(mountPointCopy, mountstate.ExitReason{
-				Reason: string(ExitReasonPanic),
-				Detail: detail,
-				Code:   ExitUnhealthy,
-				PID:    os.Getpid(),
-				At:     time.Now().UTC(),
-			})
+			if mountPointCopy != "" {
+				_ = mountstate.WriteExitReason(mountPointCopy, mountstate.ExitReason{
+					Reason: string(ExitReasonPanic),
+					Detail: detail,
+					Code:   ExitUnhealthy,
+					PID:    os.Getpid(),
+					At:     time.Now().UTC(),
+				})
+			}
 		}
 	}()
 	if localOverlay := NewLocalOverlay(opts.LocalRoot); localOverlay != nil {
@@ -254,7 +258,6 @@ func Mount(opts *MountOptions) (err error) {
 		}
 	}
 
-	mountPointCopy = opts.MountPoint
 	if err := os.MkdirAll(opts.MountPoint, 0o755); err != nil {
 		return ExitStartupTransientErr("create mount point", err)
 	}
@@ -323,7 +326,12 @@ func Mount(opts *MountOptions) (err error) {
 	if opts.LayerRef != "" {
 		layer, err := c.GetFSLayer(context.Background(), opts.LayerRef)
 		if err != nil {
-			return ExitStartupPermanentErr(fmt.Sprintf("resolve fs layer %q", opts.LayerRef), err)
+			// Not-found / invalid ref is permanent; network/5xx is transient so
+			// the supervisor can retry instead of circuit-opening immediately.
+			if client.IsNotFound(err) {
+				return ExitStartupPermanentErr(fmt.Sprintf("resolve fs layer %q", opts.LayerRef), err)
+			}
+			return ExitStartupTransientErr(fmt.Sprintf("resolve fs layer %q", opts.LayerRef), err)
 		}
 		if layer.State != "active" {
 			return ExitStartupPermanentErr(fmt.Sprintf("fs layer %q is %s, want active", opts.LayerRef, layer.State), nil)
@@ -777,10 +785,14 @@ func Mount(opts *MountOptions) (err error) {
 	fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
 		opts.MountPoint, opts.Server, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
 	server.Wait()
+	// Classify serve-end *before* shutdown drains. Drain can take a long time
+	// for a large commit queue; an external umount completing mid-drain would
+	// make an abnormal exit look like ExitReasonExternalUnmount.
+	unmountWasRequested := unmountRequested.Load()
+	reason, detail := classifyServeEnd(unmountWasRequested, opts.MountPoint)
 	shutdown()
 
 	uptime := time.Since(mountStartedAt).Round(time.Second)
-	reason, detail := classifyServeEnd(unmountRequested.Load(), opts.MountPoint)
 	pendingFiles, pendingBytes := 0, int64(0)
 	if dat9fs.commitQueue != nil {
 		pendingFiles, pendingBytes = dat9fs.commitQueue.PendingStats()
@@ -807,9 +819,13 @@ func Mount(opts *MountOptions) (err error) {
 		// Serve ended without intentional stop — clean stale mount and fail non-zero.
 		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=serve_end reason=%s detail=%s mountpoint=%s pid=%d uptime=%s\n",
 			reason, detail, opts.MountPoint, os.Getpid(), uptime)
-		if stillActive, _ := activeMountPoint(opts.MountPoint); stillActive {
+		stillActive, stillErr := activeMountPoint(opts.MountPoint)
+		if stillActive || isTransportBroken(stillErr) {
 			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=force_unmount mountpoint=%s reason=serve_abnormal\n", opts.MountPoint)
 			if unmountErr := server.Unmount(); unmountErr != nil {
+				forceUnmountLazy(opts.MountPoint)
+			} else if isTransportBroken(stillErr) {
+				// Unmount may report success while the endpoint is still broken.
 				forceUnmountLazy(opts.MountPoint)
 			}
 		}

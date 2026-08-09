@@ -323,23 +323,20 @@ func runMountEnsure(args []string) error {
 	_ = os.Remove(mountstate.PIDFilePath(mp))
 	_, _ = mountsupervisor.EnsureClean(mp)
 
-	// Replay original mount principal: inject stored server/API key as flags,
-	// and vault token via env (no --token flag on mount).
-	sanitized = injectEnsureCredentials(sanitized, storedServer, storedAPIKey)
+	// Replay original mount principal via env only — never put --api-key on
+	// argv (would land in process listings / sanitized args / systemd units).
+	// --server is non-secret and may be injected as a flag for clarity.
+	sanitized = injectEnsureServerFlag(sanitized, storedServer)
 	return withEnsureCredentialEnv(storedServer, storedAPIKey, storedToken, func() error {
 		return fsMountCmdWithBackground(sanitized, true)
 	})
 }
 
-// injectEnsureCredentials prepends --server/--api-key from stored process state
-// so ensure remounts the same principal even if the caller's env/config changed.
-func injectEnsureCredentials(args []string, server, apiKey string) []string {
+// injectEnsureServerFlag prepends --server from stored process state when missing.
+func injectEnsureServerFlag(args []string, server string) []string {
 	out := append([]string(nil), args...)
 	if server != "" && !argsHasFlag(out, "--server") {
 		out = append([]string{"--server", server}, out...)
-	}
-	if apiKey != "" && !argsHasFlag(out, "--api-key") {
-		out = append([]string{"--api-key", apiKey}, out...)
 	}
 	return out
 }
@@ -432,11 +429,12 @@ func runMountSystemdUnit(args []string) error {
 	// Build ExecStart with --supervise-foreground.
 	startArgs := []string{exe, "mount", "--supervise-foreground"}
 	startArgs = append(startArgs, rest...)
-	// Quote simply.
-	execStart := shellJoin(startArgs)
-	execStop := shellJoin([]string{exe, "umount", "--timeout", "60s", mountPoint})
+	// Quote simply; escape % for systemd (%% is a literal percent).
+	execStart := systemdEscapePercents(shellJoin(startArgs))
+	execStop := systemdEscapePercents(shellJoin([]string{exe, "umount", "--timeout", "60s", mountPoint}))
+	desc := systemdEscapePercents(fmt.Sprintf("drive9 FUSE mount for %s", mountPoint))
 	unit := fmt.Sprintf(`[Unit]
-Description=drive9 FUSE mount for %s
+Description=%s
 After=network-online.target
 Wants=network-online.target
 
@@ -451,7 +449,7 @@ TimeoutStopSec=70
 
 [Install]
 WantedBy=default.target
-`, mountPoint, execStart, execStop)
+`, desc, execStart, execStop)
 
 	if !install {
 		fmt.Print(unit)
@@ -463,6 +461,9 @@ WantedBy=default.target
 	}
 	dir := filepath.Join(home, ".config", "systemd", "user")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := validateSystemdUnitName(unitName); err != nil {
 		return err
 	}
 	path := filepath.Join(dir, unitName+".service")
@@ -509,7 +510,28 @@ func peelSystemdUnitFlags(args []string) (install bool, name string, rest []stri
 			rest = append(rest, a)
 		}
 	}
+	if err := validateSystemdUnitName(name); err != nil {
+		return false, "", nil, err
+	}
 	return install, name, rest, nil
+}
+
+func validateSystemdUnitName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("drive9 mount systemd-unit: --name requires a value")
+	}
+	if strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") || filepath.IsAbs(name) {
+		return fmt.Errorf("drive9 mount systemd-unit: --name must be a simple unit basename, got %q", name)
+	}
+	if name != filepath.Base(name) {
+		return fmt.Errorf("drive9 mount systemd-unit: --name must be a simple unit basename, got %q", name)
+	}
+	return nil
+}
+
+func systemdEscapePercents(s string) string {
+	return strings.ReplaceAll(s, "%", "%%")
 }
 
 func shellJoin(parts []string) string {

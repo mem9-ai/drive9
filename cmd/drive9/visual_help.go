@@ -717,7 +717,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 		{
 			Name:    "mount",
 			Args:    "[flags] [:/remote] <mountpoint>",
-			Summary: "mount drive9 as a local filesystem (supervised by default)",
+			Summary: "mount drive9 as a local filesystem (background FUSE supervised by default on Linux/macOS)",
 			Sections: []visualHelpSection{
 				{Title: "Connection", Flags: []visualHelpFlag{
 					{Name: "--server URL", Desc: "drive9 server URL; overrides DRIVE9_SERVER and config"},

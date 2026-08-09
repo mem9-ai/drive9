@@ -63,7 +63,9 @@ func forceUnmountLazy(mountpoint string) {
 }
 
 // EnsureCleanMountpoint force-unmounts a stale (broken) mount if present.
-// Returns true if a cleanup action was taken.
+// Returns true if a cleanup action was taken. When a force-unmount is attempted
+// but the endpoint remains active/broken, returns a non-nil error so callers
+// can fall back (e.g. ForceUnmountLazy again).
 func EnsureCleanMountpoint(mountPoint string) (cleaned bool, err error) {
 	mountPoint = strings.TrimSpace(mountPoint)
 	if mountPoint == "" {
@@ -76,6 +78,9 @@ func EnsureCleanMountpoint(mountPoint string) (cleaned bool, err error) {
 		}
 		if isTransportBroken(activeErr) {
 			forceUnmountLazy(mountPoint)
+			if stillBroken := mountStillNeedsClean(mountPoint); stillBroken {
+				return true, fmt.Errorf("force unmount did not clear broken mountpoint %s", mountPoint)
+			}
 			return true, nil
 		}
 		return false, activeErr
@@ -85,9 +90,24 @@ func EnsureCleanMountpoint(mountPoint string) (cleaned bool, err error) {
 	}
 	if probeErr := probeMountPointReady(mountPoint); probeErr != nil {
 		forceUnmountLazy(mountPoint)
+		if still, _ := activeMountPoint(mountPoint); still {
+			return true, fmt.Errorf("force unmount did not clear mountpoint %s", mountPoint)
+		}
+		if activeErr := mountStillNeedsClean(mountPoint); activeErr {
+			return true, fmt.Errorf("force unmount did not clear mountpoint %s", mountPoint)
+		}
 		return true, nil
 	}
 	return false, nil
+}
+
+func mountStillNeedsClean(mountPoint string) bool {
+	active, err := activeMountPoint(mountPoint)
+	if err != nil {
+		// NotExist → clean. Any other error (including ENOTCONN) → still needs work.
+		return !os.IsNotExist(err)
+	}
+	return active
 }
 
 // IsTransportBroken reports whether err indicates a still-mounted but unusable
