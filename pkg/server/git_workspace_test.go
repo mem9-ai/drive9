@@ -151,6 +151,30 @@ func TestGitWorkspaceDeleteIdempotentCleansStaleIndex(t *testing.T) {
 	}
 }
 
+
+func TestGitWorkspaceDeleteWithoutIndexIsOK(t *testing.T) {
+	// Old deployments / never --fast: no index file. DELETE must still succeed.
+	s := newTestServer(t)
+	ensureGitWorkspaceSchema(t, s)
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+
+	c := client.New(ts.URL, "")
+	ctx := context.Background()
+	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo3/",
+		RepoURL:    "https://example.test/repo3.git",
+		RemoteName: "origin",
+		HeadCommit: "3333333333333333333333333333333333333333",
+	})
+	if err != nil {
+		t.Fatalf("UpsertGitWorkspace: %v", err)
+	}
+	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
+		t.Fatalf("DeleteGitWorkspace without index: %v", err)
+	}
+}
+
 func TestGitWorkspaceUpsertRejectsSelfLinkedWorkspace(t *testing.T) {
 	s := newTestServer(t)
 	ensureGitWorkspaceSchema(t, s)

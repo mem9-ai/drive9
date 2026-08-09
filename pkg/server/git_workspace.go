@@ -363,6 +363,11 @@ func (s *Server) handleGitWorkspaceDelete(w http.ResponseWriter, r *http.Request
 	}
 	// Soft-delete is idempotent for convergent repair: NotFound means the row
 	// is already non-live, but a prior attempt may have left index cleanup pending.
+	// Mixed-version notes:
+	// - New server + old client: server owns durable index cleanup; client may
+	//   still best-effort Remove on the FS path (idempotent if already cleaned).
+	// - New server + missing index file: Stat NotFound → no-op (safe).
+	// - Second DELETE after success: row NotFound still runs index cleanup → 200.
 	if err := store.DeleteGitWorkspace(r.Context(), workspaceID); err != nil && !errors.Is(err, datastore.ErrNotFound) {
 		writeGitWorkspaceStoreError(w, r, err)
 		return

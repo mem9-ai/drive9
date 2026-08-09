@@ -4626,14 +4626,16 @@ func (fs *Dat9FS) removeGitWorkspaceRoot(ctx context.Context, rt *gitWorkspaceRu
 		return gofuse.EIO
 	}
 	wsID := rt.workspace.WorkspaceID
-	// Server DELETE maintains the remote index durably (CAS + idempotent retry).
-	// If index maintenance fails, Delete returns an error so we do not report OK
-	// while other armed mounts keep a stale index/runtime.
+	// Version skew:
+	// - New server: DELETE soft-deletes + CAS-updates the remote index; failure
+	//   returns 5xx so we do not report OK while other mounts keep a stale index.
+	// - Old server: DELETE only soft-deletes the row; client must still try
+	//   RemoveGitWorkspaceIndexEntry below (best-effort).
 	if err := fs.client.DeleteGitWorkspace(ctx, wsID); err != nil {
 		return httpToFuseStatus(err)
 	}
-	// Defense in depth for older servers: best-effort client index remove is
-	// idempotent when the server already cleaned the entry.
+	// Always attempt client-side index remove for old servers / dual-write period.
+	// On new servers the entry is already gone → idempotent no-op / CAS no-op.
 	if err := fs.client.RemoveGitWorkspaceIndexEntry(ctx, wsID); err != nil {
 		safeLogPrintf("git workspace index remove after delete workspace=%s: %v", wsID, err)
 	}
