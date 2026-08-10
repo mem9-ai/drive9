@@ -193,7 +193,7 @@ func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string
 		}
 	}
 	if startup.Phase == PhaseCutoverReady && (!recoveryControlPresent || phaseRank(checkpoint.Checkpoint.HighestPhase) < phaseRank(PhaseDualWriteRepairing)) {
-		return PreflightResult{}, fmt.Errorf("%w: checkpoint: %w: CUTOVER_READY requires an existing DUAL_WRITE_REPAIRING checkpoint", ErrPreflight, ErrCheckpointMismatch)
+		return PreflightResult{}, fmt.Errorf("%w: %w: checkpoint: %w: CUTOVER_READY requires an existing DUAL_WRITE_REPAIRING checkpoint", ErrPreflight, ErrInvalidPhase, ErrCheckpointMismatch)
 	}
 	entries, err := api.ListCtx(ctx, listPath(startup.Job.Target.Prefix))
 	if err != nil && !client.IsNotFound(err) {

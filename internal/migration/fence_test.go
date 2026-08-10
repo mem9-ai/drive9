@@ -13,8 +13,14 @@ import (
 )
 
 func newFenceWorker(t *testing.T) (*Worker, *Startup, *checkpointFake, *httptest.Server) {
+	worker, startup, checkpoint, _, server := newFenceWorkerWithTarget(t)
+	return worker, startup, checkpoint, server
+}
+
+func newFenceWorkerWithTarget(t *testing.T) (*Worker, *Startup, *checkpointFake, *memoryTarget, *httptest.Server) {
 	t.Helper()
-	backend := &workerServer{target: &memoryTarget{nodes: make(map[string]memoryTargetNode)}, checkpoint: &checkpointFake{}, caps: allWorkerCapabilities()}
+	target := &memoryTarget{nodes: make(map[string]memoryTargetNode)}
+	backend := &workerServer{target: target, checkpoint: &checkpointFake{}, caps: allWorkerCapabilities()}
 	server := httptest.NewServer(http.HandlerFunc(backend.handler))
 	startup := newWorkerStartup(t, t.TempDir(), server)
 	startup.Phase = PhaseDualWriteRepairing
@@ -31,7 +37,7 @@ func newFenceWorker(t *testing.T) (*Worker, *Startup, *checkpointFake, *httptest
 		server.Close()
 		t.Fatal(err)
 	}
-	return worker, startup, backend.checkpoint, server
+	return worker, startup, backend.checkpoint, target, server
 }
 
 func TestPrepareCutoverCancellationWhileWaitingForGateDoesNotFence(t *testing.T) {
@@ -120,6 +126,33 @@ func TestConfigMapCutoverRequestRunsFreshVerificationAndFence(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("automatic cutover Worker error=%v", err)
+	}
+}
+
+func TestConfigMapCutoverRequestRetriesTransientRecoveryFailure(t *testing.T) {
+	_, startup, _, target, server := newFenceWorkerWithTarget(t)
+	defer server.Close()
+	startup.Phase = PhaseCutoverReady
+
+	worker, err := NewWorker(context.Background(), startup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	target.failListCount = 1
+	target.failListStatus = http.StatusServiceUnavailable
+	target.mu.Unlock()
+	retries := 0
+	worker.retryWait = func(context.Context, time.Duration) error {
+		retries++
+		return nil
+	}
+
+	if err := worker.runRequestedCutover(context.Background()); err != nil {
+		t.Fatalf("automatic cutover did not retry transient recovery failure: %v", err)
+	}
+	if retries != 1 || !worker.fenceComplete.Load() {
+		t.Fatalf("automatic cutover retries=%d status=%+v", retries, worker.statusOutput())
 	}
 }
 

@@ -143,6 +143,12 @@ func TestExecuteHelpAndPreflightFailure(t *testing.T) {
 	if code := execute([]string{"plan", "-f", "/config.yaml"}, io.Discard, io.Discard, deps); code != exitFailure {
 		t.Fatalf("preflight failure exit=%d", code)
 	}
+	deps.preflight = func(context.Context, *migration.Startup) (migration.PreflightResult, error) {
+		return migration.PreflightResult{}, errors.Join(migration.ErrPreflight, migration.ErrInvalidPhase)
+	}
+	if code := execute([]string{"run", "-f", "/config.yaml"}, io.Discard, io.Discard, deps); code != exitIllegalOperation {
+		t.Fatalf("illegal preflight phase exit=%d", code)
+	}
 }
 
 func TestExecuteUsesProvidedContextAndHelpDocumentsEveryCommand(t *testing.T) {

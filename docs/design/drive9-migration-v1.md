@@ -874,7 +874,9 @@ Worker from regressing phase or fence state.
    any convergence claim.
    Recovery completion requires a complete source/target observation, not
    convergence; blockers or grace candidates remain visible and keep the
-   applicable condition false.
+   applicable condition false. Retryable source changes, network failures,
+   HTTP 429 responses, and HTTP 5xx responses use the normal bounded backoff;
+   they do not terminate a configured cutover request before verification.
 5. A remote business write committed before process failure is rediscovered by
    the full target reread; a matching object is treated as converged and a
    mismatch follows the current phase's normal CAS rules.

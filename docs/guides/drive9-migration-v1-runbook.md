@@ -29,6 +29,12 @@ ghcr.io/drive9-ai/drive9-migration:<source-sha7>
 
 The workflow does not publish `latest`. Use the published commit tag directly.
 
+The Kubernetes example remains pinned to `3a6d226` for its tested T0/T1 trial.
+That image predates ConfigMap-driven `CUTOVER_READY`. Before T2, replace both
+image fields with a published source tag that contains ConfigMap-driven cutover;
+otherwise the init container and Worker reject the requested phase. A failed
+rollout is never evidence that T2 completed.
+
 The `mem9-ai/drive9` repository must provide the Actions secrets
 `DRIVE9_AI_GHCR_USERNAME` and `DRIVE9_AI_GHCR_TOKEN`. The token must belong to an
 account authorized to publish packages in `drive9-ai` and needs only the GitHub
@@ -99,6 +105,22 @@ for one existing EBS PVC on one Node. Before applying it:
 5. Keep both PVC declarations read-only. The initContainer runs `plan`; the
    Worker starts only when that preflight succeeds.
 
+The example intentionally uses UID/GID 0 for both containers. This is a
+restricted migration exception: the projected credential is mode `0600`, and
+the existing Source may expose only customer-approved root-readable paths. The
+profile was exercised by the dev single-PVC trial with a read-only PVC,
+read-only root filesystem, no privilege escalation, all Linux capabilities
+dropped, and the runtime-default seccomp profile. It does not prove that every
+customer permission layout is readable.
+
+The example deliberately omits `fsGroup` because kubelet ownership adjustment
+could mutate an existing Source PVC. Before deployment, verify that UID 0 with
+no added capabilities can read every supported file and traverse every Source
+directory. If `plan` reports a Source read-access failure, stop and have the
+customer grant narrowly scoped read/traverse mode or ACL access. Do not
+recursively change Source ownership and do not add broad capabilities merely to
+make preflight pass.
+
 Apply and inspect the trial with:
 
 ```bash
@@ -108,7 +130,7 @@ kubectl -n "$migration_namespace" apply \
 kubectl -n "$migration_namespace" logs daemonset/drive9-migration -c plan
 kubectl -n "$migration_namespace" rollout status daemonset/drive9-migration
 kubectl -n "$migration_namespace" exec daemonset/drive9-migration \
-  -c worker -- \
+  -c drive9-migration -- \
   /drive9-migration status --output json
 ```
 
@@ -147,7 +169,7 @@ kubectl -n "$migration_namespace" rollout restart \
 kubectl -n "$migration_namespace" rollout status \
   daemonset/drive9-migration
 kubectl -n "$migration_namespace" exec daemonset/drive9-migration \
-  -c worker -- \
+  -c drive9-migration -- \
   /drive9-migration status --output json
 ```
 
@@ -175,10 +197,10 @@ From the Kubernetes Worker, run:
 
 ```bash
 kubectl -n "$migration_namespace" exec daemonset/drive9-migration \
-  -c worker -- \
+  -c drive9-migration -- \
   /drive9-migration verify-full
 kubectl -n "$migration_namespace" exec daemonset/drive9-migration \
-  -c worker -- \
+  -c drive9-migration -- \
   /drive9-migration status --output json
 ```
 
@@ -207,16 +229,49 @@ kubectl -n "$migration_namespace" rollout status \
 Each restarted Worker requires an existing `DUAL_WRITE_REPAIRING` Checkpoint,
 runs a new deep recovery and full verification, then executes the irreversible
 fence protocol. `kubectl rollout status` confirms only that the replacement
-Pods started; it is not the T2 completion gate. Use the kube plugin to require
-every declared Job to report both:
+Pods started; it is not the T2 completion gate.
 
-```text
-phase=CUTOVER_READY
-fence_complete=true
+The aggregate gate requires the released `kubectl-drive9-migration` client-side
+plugin, `jq` 1.6 or later, and `yq` v4. Install the platform plugin artifact as
+`kubectl-drive9-migration` on `PATH`, then confirm that
+`kubectl drive9 migration --help` succeeds. The manifest labels every Worker
+with batch `single-pvc-trial` and names its Worker container
+`drive9-migration`, which are required for plugin discovery.
+
+Run this exact gate. `yq` reads the complete declared Job ID set from the
+ConfigMap, the plugin queries every labeled observed Worker, and `jq` requires
+an exact unique ID-set match plus completed fencing:
+
+```bash
+(
+  set -euo pipefail
+  migration_batch=single-pvc-trial
+  expected_job_ids_json="$(
+    kubectl -n "$migration_namespace" get configmap drive9-migration \
+      -o jsonpath='{.data.config\.yaml}' | \
+      yq -o=json '.jobs | map(.volume_id)'
+  )"
+  kubectl drive9 migration status \
+    -n "$migration_namespace" \
+    --batch "$migration_batch" \
+    -o json | \
+    jq -e --argjson expected "$expected_job_ids_json" '
+      ([.jobs[].job_id] | sort) as $observed
+      | ($expected | sort) as $declared
+      | ($observed == $declared)
+        and (($observed | length) == ($observed | unique | length))
+        and all(.jobs[];
+          .status == "CUTOVER_READY"
+          and .worker_status.phase == "CUTOVER_READY"
+          and .worker_status.fence_complete == true)
+    '
+)
 ```
 
-Only after the aggregate check succeeds may the business switch to Drive9-only.
-Missing, duplicate, or unreachable Jobs fail that check closed.
+The subshell exits nonzero for a missing ConfigMap, missing or duplicate Job,
+unreachable Worker, plugin collection failure, ID-set mismatch, incomplete
+phase, or incomplete fence. If the plugin is not installed, T2 is blocked. Only
+after this command exits zero may the business switch to Drive9-only.
 
 The existing explicit per-Job path remains available and idempotent. It requires
 a current passed full verification, a converged latest round, no Attention, and

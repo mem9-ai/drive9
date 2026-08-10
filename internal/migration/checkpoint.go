@@ -242,13 +242,13 @@ func (s *CheckpointStore) Recover(ctx context.Context, startup *Startup) (*Recov
 	cutoverRequested := startup.Phase == PhaseCutoverReady
 	if cutoverRequested {
 		if record.Revision == 0 {
-			return nil, fmt.Errorf("%w: CUTOVER_READY requires an existing DUAL_WRITE_REPAIRING checkpoint", ErrCheckpointMismatch)
+			return nil, fmt.Errorf("%w: %w: CUTOVER_READY requires an existing DUAL_WRITE_REPAIRING checkpoint", ErrInvalidPhase, ErrCheckpointMismatch)
 		}
 		if !sameCheckpointIdentity(record.Checkpoint, desired) {
 			return nil, fmt.Errorf("%w: immutable job identity", ErrCheckpointMismatch)
 		}
 		if phaseRank(record.Checkpoint.HighestPhase) < phaseRank(PhaseDualWriteRepairing) {
-			return nil, fmt.Errorf("%w: CUTOVER_READY requires an existing DUAL_WRITE_REPAIRING checkpoint", ErrCheckpointMismatch)
+			return nil, fmt.Errorf("%w: %w: CUTOVER_READY requires an existing DUAL_WRITE_REPAIRING checkpoint", ErrInvalidPhase, ErrCheckpointMismatch)
 		}
 	} else if record.Revision == 0 {
 		record, err = s.Update(ctx, CheckpointRecord{}, desired)

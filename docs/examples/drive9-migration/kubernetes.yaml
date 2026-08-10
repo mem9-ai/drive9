@@ -1,6 +1,9 @@
 # Single-PVC trial manifest. Apply it to the namespace that contains the PVC.
 # Replace the endpoint, volume ID, Node name, PVC name, and Owner API key.
 # Do not commit a real API key.
+# The pinned 3a6d226 image supports the tested T0/T1 trial but predates
+# ConfigMap-driven CUTOVER_READY. Replace both image fields with a published
+# cutover-capable source tag before T2.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -45,10 +48,16 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: drive9-migration
+  labels:
+    app.kubernetes.io/name: drive9-migration
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/instance: single-pvc-trial
 spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: drive9-migration
+      app.kubernetes.io/component: worker
+      app.kubernetes.io/instance: single-pvc-trial
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
@@ -57,12 +66,16 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: drive9-migration
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/instance: single-pvc-trial
     spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       nodeSelector:
         kubernetes.io/hostname: REPLACE_WITH_KUBERNETES_NODE_NAME
       securityContext:
+        # Deliberately omit fsGroup: changing ownership on an existing Source
+        # PVC is outside the migration contract. See the Runbook root exception.
         seccompProfile:
           type: RuntimeDefault
       initContainers:
@@ -84,6 +97,8 @@ spec:
               drop:
                 - ALL
             readOnlyRootFilesystem: true
+            # Restricted-root exception: required by the 0600 Secret and the
+            # customer-approved Source permissions; both mounts remain read-only.
             runAsGroup: 0
             runAsUser: 0
           volumeMounts:
@@ -97,7 +112,7 @@ spec:
               mountPath: /mnt/ebs/source
               readOnly: true
       containers:
-        - name: worker
+        - name: drive9-migration
           image: ghcr.io/drive9-ai/drive9-migration:3a6d226
           imagePullPolicy: IfNotPresent
           args:
@@ -119,6 +134,8 @@ spec:
               drop:
                 - ALL
             readOnlyRootFilesystem: true
+            # Restricted-root exception: required by the 0600 Secret and the
+            # customer-approved Source permissions; both mounts remain read-only.
             runAsGroup: 0
             runAsUser: 0
           volumeMounts:

@@ -164,7 +164,7 @@ func TestCheckpointPhaseAdvanceRejectsRollbackAndIdentityMismatch(t *testing.T) 
 func TestCheckpointCutoverRequestRequiresDualWriteAndDoesNotAdvanceActualPhase(t *testing.T) {
 	store, fake, startup := newCheckpointFixture(t)
 	startup.Phase = PhaseCutoverReady
-	if _, err := store.Recover(context.Background(), startup); !errors.Is(err, ErrCheckpointMismatch) {
+	if _, err := store.Recover(context.Background(), startup); !errors.Is(err, ErrCheckpointMismatch) || !errors.Is(err, ErrInvalidPhase) {
 		t.Fatalf("fresh cutover request error=%v", err)
 	}
 	fake.mu.Lock()
@@ -178,7 +178,7 @@ func TestCheckpointCutoverRequestRequiresDualWriteAndDoesNotAdvanceActualPhase(t
 		t.Fatal(err)
 	}
 	startup.Phase = PhaseCutoverReady
-	if _, err := store.Recover(context.Background(), startup); !errors.Is(err, ErrCheckpointMismatch) {
+	if _, err := store.Recover(context.Background(), startup); !errors.Is(err, ErrCheckpointMismatch) || !errors.Is(err, ErrInvalidPhase) {
 		t.Fatalf("SYNCING cutover request error=%v", err)
 	}
 

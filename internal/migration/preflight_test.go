@@ -440,7 +440,7 @@ func TestPreflightAllowsNonEmptyTargetOnlyForMatchingCheckpoint(t *testing.T) {
 		t.Fatalf("T0 rollout restart preflight=%+v err=%v", result, err)
 	}
 	startup.Phase = PhaseCutoverReady
-	if _, err := preflightWithVerifier(context.Background(), startup, func(string, string) (bool, error) { return true, nil }); !errors.Is(err, ErrPreflight) || !strings.Contains(err.Error(), "DUAL_WRITE_REPAIRING") {
+	if _, err := preflightWithVerifier(context.Background(), startup, func(string, string) (bool, error) { return true, nil }); !errors.Is(err, ErrPreflight) || !errors.Is(err, ErrInvalidPhase) || !strings.Contains(err.Error(), "DUAL_WRITE_REPAIRING") {
 		t.Fatalf("cutover request from SYNCING error=%v", err)
 	}
 	checkpoint.HighestPhase = PhaseDualWriteRepairing
