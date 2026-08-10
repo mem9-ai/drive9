@@ -83,7 +83,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 			PerfMaxSampleFiles:  opts.PerfMaxSampleFiles,
 			PerfMaxProfileFiles: opts.PerfMaxProfileFiles,
 		},
-		Supervised:       opts.Supervised,
+		Supervised: opts.Supervised,
 		// Supervised workers do not own the global pidfile; the supervisor does.
 		SkipProcessState: opts.Supervised,
 	})

@@ -95,7 +95,44 @@ func ensureStateDir() error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	_ = os.Chmod(dir, 0o700)
+	return validateStateDir(dir)
+}
+
+// validateStateDir fails closed on symlink / wrong-owner / unrepairable mode
+// state directories so a pre-created predictable path in sticky /tmp cannot
+// intercept supervisor state, stop tokens, locks, or exit files.
+func validateStateDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("state dir %s: %w", dir, err)
+	}
+	if err := checkStateDirInfo(dir, info); err != nil {
+		return err
+	}
+	if info.Mode().Perm() != 0o700 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("chmod state dir %s: %w", dir, err)
+		}
+		info, err = os.Lstat(dir)
+		if err != nil {
+			return fmt.Errorf("state dir %s: %w", dir, err)
+		}
+		if info.Mode().Perm() != 0o700 {
+			return fmt.Errorf("state dir %s: mode %o after chmod, want 700", dir, info.Mode().Perm())
+		}
+	}
+	return nil
+}
+
+// checkStateDirInfo validates directory-ness and ownership for a state dir.
+// Owner check is skipped when the platform does not expose POSIX UIDs.
+func checkStateDirInfo(dir string, info os.FileInfo) error {
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("state dir %s: not a directory (mode %s)", dir, info.Mode())
+	}
+	if uid, ok := stateDirOwnerUID(info); ok && uid != os.Getuid() {
+		return fmt.Errorf("state dir %s: owned by uid %d, want %d", dir, uid, os.Getuid())
+	}
 	return nil
 }
 

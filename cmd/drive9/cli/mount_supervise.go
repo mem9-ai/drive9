@@ -49,6 +49,11 @@ func runMountSupervise(args []string) error {
 	if strings.TrimSpace(*mountPoint) == "" {
 		return fmt.Errorf("drive9 mount supervise: --mountpoint is required")
 	}
+	// Adopt without creation identity is fail-closed: PID-only would monitor a
+	// reused PID as if it were the drive9 worker.
+	if *adopt && (*adoptWorkerPID <= 0 || *adoptWorkerCreation == 0) {
+		return fmt.Errorf("drive9 mount supervise: --adopt requires --adopt-worker-pid > 0 and --adopt-worker-creation > 0")
+	}
 	if !*adopt && len(workerArgs) == 0 {
 		return fmt.Errorf("drive9 mount supervise: worker args required after flags")
 	}

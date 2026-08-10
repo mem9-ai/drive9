@@ -4,8 +4,11 @@ package cli
 
 import (
 	"os"
+	"os/exec"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
@@ -148,5 +151,121 @@ func TestProcessMatchesIdentitySelf(t *testing.T) {
 	}
 	if processMatchesIdentity(0, 0) {
 		t.Fatal("pid 0 should not match")
+	}
+}
+
+func TestRunMountSuperviseAdoptRequiresCreation(t *testing.T) {
+	mp := t.TempDir()
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"no creation", []string{"--mountpoint", mp, "--adopt", "--adopt-worker-pid", "12345"}},
+		{"zero creation", []string{"--mountpoint", mp, "--adopt", "--adopt-worker-pid", "12345", "--adopt-worker-creation", "0"}},
+		{"no pid", []string{"--mountpoint", mp, "--adopt", "--adopt-worker-creation", "1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := runMountSupervise(tc.args)
+			if err == nil {
+				t.Fatal("expected adopt identity error")
+			}
+			if !strings.Contains(err.Error(), "adopt") {
+				t.Fatalf("error = %v, want adopt mention", err)
+			}
+		})
+	}
+}
+
+func TestSupervisedReadyStateMatches(t *testing.T) {
+	self := os.Getpid()
+	ct, err := mountstate.ProcessCreationTime(self)
+	if err != nil || ct == 0 {
+		t.Skip("platform has no process creation metadata")
+	}
+	match := mountstate.SupervisorState{
+		PID:            self,
+		CreationTime:   ct,
+		WorkerPID:      self,
+		WorkerCreation: ct,
+	}
+	cases := []struct {
+		name        string
+		st          mountstate.SupervisorState
+		supPID      int
+		supCreation uint64
+		want        bool
+	}{
+		{"match", match, self, ct, true},
+		{"wrong-gen supervisor", func() mountstate.SupervisorState {
+			s := match
+			s.CreationTime = ct + 1
+			return s
+		}(), self, ct, false},
+		{"missing supervisor creation", func() mountstate.SupervisorState {
+			s := match
+			s.CreationTime = 0
+			return s
+		}(), self, ct, false},
+		{"stale supervisor pid", match, self + 1, ct, false},
+		{"missing worker creation", func() mountstate.SupervisorState {
+			s := match
+			s.WorkerCreation = 0
+			return s
+		}(), self, ct, false},
+		{"no worker", func() mountstate.SupervisorState {
+			s := match
+			s.WorkerPID = 0
+			return s
+		}(), self, ct, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := supervisedReadyStateMatches(tc.st, tc.supPID, tc.supCreation); got != tc.want {
+				t.Fatalf("got %v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWaitForSupervisedMountReadyIgnoresStaleState(t *testing.T) {
+	mp := t.TempDir()
+	self := os.Getpid()
+	ct, err := mountstate.ProcessCreationTime(self)
+	if err != nil || ct == 0 {
+		t.Skip("platform has no process creation metadata")
+	}
+	// Stale state looks fully healthy for *this* process, but parent spawned a
+	// different supervisor PID (foreign generation).
+	st := mountstate.SupervisorState{
+		PID:            self,
+		CreationTime:   ct,
+		WorkerPID:      self,
+		WorkerCreation: ct,
+		MountPoint:     mp,
+		State:          mountstate.SupervisorStateRunning,
+	}
+	if err := mountstate.WriteSupervisorState(mp, st); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+
+	// Finished child → non-live supervisorPID that will not match stale state.
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	foreignPID := cmd.ProcessState.Pid()
+	if foreignPID == self || processAliveImpl(foreignPID) {
+		t.Skip("could not obtain a dead foreign pid")
+	}
+
+	waitCh := make(chan error) // never closes
+	err = waitForSupervisedMountReady(mp, foreignPID, waitCh, "/dev/null", 300*time.Millisecond)
+	if err == nil {
+		t.Fatal("stale healthy state must not satisfy ready for a different supervisor PID")
+	}
+	if !strings.Contains(err.Error(), "timed out waiting") {
+		t.Fatalf("error = %v, want ready timeout", err)
 	}
 }

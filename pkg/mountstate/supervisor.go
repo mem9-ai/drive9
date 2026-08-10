@@ -24,31 +24,31 @@ const (
 
 // SupervisorState is the supervisor sidecar status JSON.
 type SupervisorState struct {
-	Role             string    `json:"role,omitempty"`
-	PID              int       `json:"pid"`
-	CreationTime     uint64    `json:"creation_time,omitempty"`
-	MountPoint       string    `json:"mount_point"`
-	State            string    `json:"state"`
-	WorkerPID        int       `json:"worker_pid,omitempty"`
-	WorkerCreation   uint64    `json:"worker_creation_time,omitempty"`
-	RestartCount     int       `json:"restart_count"`
-	WindowStart      time.Time `json:"window_start,omitempty"`
-	LastExitCode     int       `json:"last_exit_code,omitempty"`
-	LastExitReason   string    `json:"last_exit_reason,omitempty"`
-	LastHealth       string    `json:"last_health,omitempty"`
-	LastHealthAt     time.Time `json:"last_health_at,omitempty"`
-	LastHealthError  string    `json:"last_health_error,omitempty"`
-	LastRestartAt    time.Time `json:"last_restart_at,omitempty"`
-	StartedAt        time.Time `json:"started_at,omitempty"`
-	StopRequested    bool      `json:"stop_requested,omitempty"`
-	LogPath          string    `json:"log_path,omitempty"`
-	ControlSocket    string    `json:"control_socket,omitempty"`
-	Args             []string  `json:"args,omitempty"`
-	Server           string    `json:"server,omitempty"`
-	RemoteRoot       string    `json:"remote_root,omitempty"`
-	Profile          string    `json:"profile,omitempty"`
-	LocalRoot        string    `json:"local_root,omitempty"`
-	PackPaths        []string  `json:"pack_paths,omitempty"`
+	Role            string    `json:"role,omitempty"`
+	PID             int       `json:"pid"`
+	CreationTime    uint64    `json:"creation_time,omitempty"`
+	MountPoint      string    `json:"mount_point"`
+	State           string    `json:"state"`
+	WorkerPID       int       `json:"worker_pid,omitempty"`
+	WorkerCreation  uint64    `json:"worker_creation_time,omitempty"`
+	RestartCount    int       `json:"restart_count"`
+	WindowStart     time.Time `json:"window_start,omitempty"`
+	LastExitCode    int       `json:"last_exit_code,omitempty"`
+	LastExitReason  string    `json:"last_exit_reason,omitempty"`
+	LastHealth      string    `json:"last_health,omitempty"`
+	LastHealthAt    time.Time `json:"last_health_at,omitempty"`
+	LastHealthError string    `json:"last_health_error,omitempty"`
+	LastRestartAt   time.Time `json:"last_restart_at,omitempty"`
+	StartedAt       time.Time `json:"started_at,omitempty"`
+	StopRequested   bool      `json:"stop_requested,omitempty"`
+	LogPath         string    `json:"log_path,omitempty"`
+	ControlSocket   string    `json:"control_socket,omitempty"`
+	Args            []string  `json:"args,omitempty"`
+	Server          string    `json:"server,omitempty"`
+	RemoteRoot      string    `json:"remote_root,omitempty"`
+	Profile         string    `json:"profile,omitempty"`
+	LocalRoot       string    `json:"local_root,omitempty"`
+	PackPaths       []string  `json:"pack_paths,omitempty"`
 }
 
 func SupervisorStatePath(mountPoint string) string {

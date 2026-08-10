@@ -29,5 +29,5 @@ type cliExitError struct {
 	msg  string
 }
 
-func (e cliExitError) Error() string  { return e.msg }
+func (e cliExitError) Error() string { return e.msg }
 func (e cliExitError) ExitCode() int { return e.code }

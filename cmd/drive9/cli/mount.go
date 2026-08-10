@@ -854,6 +854,8 @@ func applyScrubbedMountEnv(scrubbed []string) {
 
 func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-chan error, logPath string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	// Capture child identity once (Darwin ProcessCreationTime shells out to ps).
+	supCreation, _ := mountstate.ProcessCreationTime(supervisorPID)
 	for {
 		select {
 		case err := <-waitCh:
@@ -902,17 +904,38 @@ func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-
 			_ = os.Remove(mountstate.PIDFilePath(mountPoint))
 			return fmt.Errorf("drive9 mount: timed out waiting for supervised mount to become ready after %s (log: %s)", timeout, logPath)
 		}
-		// Ready when process state exists and probe succeeds (supervisor owns pidfile).
-		if state, _, err := mountstate.ReadProcessState(mountPoint); err == nil {
-			alive := processAliveImpl(state.PID) || (state.WorkerPID > 0 && processAliveImpl(state.WorkerPID))
-			if alive {
-				if probeOK := probeMountReadyForCLI(mountPoint); probeOK {
-					return nil
-				}
+		// Ready only when SupervisorState matches the child we just spawned
+		// (PID+creation) and its worker is identity-alive — never accept a
+		// stale pidfile from a previous generation.
+		if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+			if supervisedReadyStateMatches(st, supervisorPID, supCreation) && probeMountReadyForCLI(mountPoint) {
+				return nil
 			}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// supervisedReadyStateMatches reports whether recorded supervisor state belongs
+// to the supervisor child this parent just spawned (wrong-generation guard) and
+// whether its worker is identity-alive. Creation mismatches are fail-closed when
+// the platform supplies creation metadata (supCreation != 0).
+func supervisedReadyStateMatches(st mountstate.SupervisorState, supervisorPID int, supCreation uint64) bool {
+	if supervisorPID <= 0 || st.PID != supervisorPID {
+		return false
+	}
+	if supCreation != 0 && st.CreationTime != supCreation {
+		return false
+	}
+	if st.WorkerPID <= 0 {
+		return false
+	}
+	if st.WorkerCreation > 0 {
+		return processMatchesIdentity(st.WorkerPID, st.WorkerCreation)
+	}
+	// No recorded worker creation: only acceptable where the platform cannot
+	// supply creation metadata at all; otherwise fail closed.
+	return supCreation == 0 && processAliveImpl(st.WorkerPID)
 }
 
 func probeMountReadyForCLI(mountPoint string) bool {

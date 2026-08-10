@@ -235,7 +235,7 @@ func Mount(opts *MountOptions) (err error) {
 			if mountPointCopy != "" {
 				if mountBecameActive {
 					forceUnmountLazy(mountPointCopy)
-				} else if active, _ := activeMountPoint(mountPointCopy); active {
+				} else if active, _ := activeMountPointBounded(mountPointCopy); active {
 					forceUnmountLazy(mountPointCopy)
 				}
 			}
@@ -819,8 +819,8 @@ func Mount(opts *MountOptions) (err error) {
 		// Serve ended without intentional stop — clean stale mount and fail non-zero.
 		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=serve_end reason=%s detail=%s mountpoint=%s pid=%d uptime=%s\n",
 			reason, detail, opts.MountPoint, os.Getpid(), uptime)
-		stillActive, stillErr := activeMountPoint(opts.MountPoint)
-		if stillActive || isTransportBroken(stillErr) {
+		stillActive, stillErr := activeMountPointBounded(opts.MountPoint)
+		if shouldForceUnmountAfterAbnormalServe(stillActive, stillErr) {
 			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=force_unmount mountpoint=%s reason=serve_abnormal\n", opts.MountPoint)
 			if unmountErr := server.Unmount(); unmountErr != nil {
 				forceUnmountLazy(opts.MountPoint)
@@ -828,6 +828,10 @@ func Mount(opts *MountOptions) (err error) {
 				// Unmount may report success while the endpoint is still broken.
 				forceUnmountLazy(opts.MountPoint)
 			}
+		} else if stillErr != nil && !os.IsNotExist(stillErr) {
+			// Indeterminate (bounded-probe timeout / unknown): never blind-detach;
+			// supervisor restart cleanup owns destructive recovery.
+			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=cleanup_skip mountpoint=%s reason=probe_indeterminate err=%v\n", opts.MountPoint, stillErr)
 		}
 		exitRec.Code = ExitServeAbnormal
 		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
@@ -842,8 +846,9 @@ func classifyServeEnd(unmountRequested bool, mountPoint string) (MountExitReason
 	if unmountRequested {
 		return ExitReasonSignal, "stop requested by signal"
 	}
-	// Re-probe to avoid racing external umount teardown.
-	active, err := activeMountPoint(mountPoint)
+	// Re-probe to avoid racing external umount teardown. Bounded: wedged FUSE
+	// must not hang worker exit / supervisor recovery forever.
+	active, err := activeMountPointBounded(mountPoint)
 	if err != nil {
 		if isTransportBroken(err) {
 			return ExitReasonServeAbnormal, "mountpoint unreadable after serve end: " + err.Error()
@@ -852,6 +857,7 @@ func classifyServeEnd(unmountRequested bool, mountPoint string) (MountExitReason
 		if os.IsNotExist(err) {
 			return ExitReasonExternalUnmount, "mountpoint gone after serve end"
 		}
+		// Timeout / unknown: conservative — never misreport as external_unmount.
 		return ExitReasonServeAbnormal, "active mount check failed: " + err.Error()
 	}
 	if !active {
@@ -859,7 +865,7 @@ func classifyServeEnd(unmountRequested bool, mountPoint string) (MountExitReason
 	}
 	// Brief settle, then re-check (external umount race).
 	time.Sleep(250 * time.Millisecond)
-	active, err = activeMountPoint(mountPoint)
+	active, err = activeMountPointBounded(mountPoint)
 	if err != nil {
 		if isTransportBroken(err) {
 			return ExitReasonServeAbnormal, "mount still broken after serve end: " + err.Error()
@@ -876,6 +882,14 @@ func classifyServeEnd(unmountRequested bool, mountPoint string) (MountExitReason
 		probeDetail = probeErr.Error()
 	}
 	return ExitReasonServeAbnormal, probeDetail
+}
+
+// shouldForceUnmountAfterAbnormalServe reports whether to attempt unmount after
+// an abnormal serve end. Indeterminate probe results (bounded-probe timeout /
+// unknown errors) are conservative: never detach on uncertainty — the
+// supervisor's bounded restart cleanup owns destructive recovery.
+func shouldForceUnmountAfterAbnormalServe(active bool, err error) bool {
+	return active || isTransportBroken(err)
 }
 
 type mountStartCleanup struct {

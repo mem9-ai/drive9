@@ -144,8 +144,54 @@ func TestOwnerAliveWorkerIdentity(t *testing.T) {
 	}
 }
 
-func TestEnsureCleanMountpointBoundedWhenProbeHangs(t *testing.T) {
-	// Inject a hanging active-mount probe: cleanup must time out, not block forever.
+func TestEnsureCleanMountpointTimeoutWithLiveOwner(t *testing.T) {
+	// Slow-but-live owned mount must not be force-unmounted on probe timeout.
+	oldProbe := activeMountProbe
+	oldTimeout := cleanupActiveMountTimeout
+	activeMountProbe = func(string) (bool, error) {
+		time.Sleep(30 * time.Second)
+		return true, nil
+	}
+	cleanupActiveMountTimeout = 50 * time.Millisecond
+	t.Cleanup(func() {
+		activeMountProbe = oldProbe
+		cleanupActiveMountTimeout = oldTimeout
+	})
+
+	mp := t.TempDir()
+	self := os.Getpid()
+	ct, err := mountstate.ProcessCreationTime(self)
+	if err != nil || ct == 0 {
+		t.Skip("platform has no process creation metadata")
+	}
+	st := mountstate.SupervisorState{
+		PID:            self + 1,
+		WorkerPID:      self,
+		WorkerCreation: ct,
+		MountPoint:     mp,
+		State:          mountstate.SupervisorStateRunning,
+	}
+	if err := mountstate.WriteSupervisorState(mp, st); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+
+	start := time.Now()
+	cleaned, err := EnsureCleanMountpoint(mp)
+	elapsed := time.Since(start)
+	if elapsed > 2*time.Second {
+		t.Fatalf("EnsureClean blocked for %s", elapsed)
+	}
+	if cleaned {
+		t.Fatalf("cleaned=true with live owner on timeout (would detach live mount), err=%v", err)
+	}
+	if err != nil {
+		t.Fatalf("err=%v, want nil for live-owner timeout", err)
+	}
+}
+
+func TestEnsureCleanMountpointTimeoutWithDeadOwner(t *testing.T) {
+	// Orphan (no owner identity): timeout still forces detach path.
 	oldProbe := activeMountProbe
 	oldTimeout := cleanupActiveMountTimeout
 	activeMountProbe = func(string) (bool, error) {
@@ -163,15 +209,44 @@ func TestEnsureCleanMountpointBoundedWhenProbeHangs(t *testing.T) {
 	cleaned, err := EnsureCleanMountpoint(dir)
 	elapsed := time.Since(start)
 	if elapsed > 2*time.Second {
-		t.Fatalf("EnsureClean blocked for %s (want bounded ~timeout)", elapsed)
+		t.Fatalf("EnsureClean blocked for %s", elapsed)
 	}
-	// Hanging probe → timeout error path → force unmount attempted.
 	if !cleaned {
-		t.Fatalf("expected cleaned=true on hang path, err=%v", err)
+		t.Fatalf("expected cleaned=true for dead/missing owner on hang path, err=%v", err)
 	}
-	// force-unmount of a plain dir is best-effort; err may be non-nil if still "needs clean"
-	// because the probe still hangs on the verification pass.
-	_ = err
+	_ = err // verification re-probe may also time out
+}
+
+func TestEnsureCleanMountpointTransportBrokenWithLiveOwner(t *testing.T) {
+	// Transport-broken endpoints detach even if owner identity is live.
+	oldProbe := activeMountProbe
+	activeMountProbe = func(string) (bool, error) {
+		return false, errors.New("transport endpoint is not connected")
+	}
+	t.Cleanup(func() { activeMountProbe = oldProbe })
+
+	mp := t.TempDir()
+	self := os.Getpid()
+	ct, err := mountstate.ProcessCreationTime(self)
+	if err != nil || ct == 0 {
+		t.Skip("platform has no process creation metadata")
+	}
+	st := mountstate.SupervisorState{
+		PID:            self + 1,
+		WorkerPID:      self,
+		WorkerCreation: ct,
+		MountPoint:     mp,
+		State:          mountstate.SupervisorStateRunning,
+	}
+	if err := mountstate.WriteSupervisorState(mp, st); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+
+	cleaned, err := EnsureCleanMountpoint(mp)
+	if !cleaned {
+		t.Fatalf("transport-broken must force detach even with live owner, cleaned=%v err=%v", cleaned, err)
+	}
 }
 
 func TestActiveMountPointBoundedTimesOut(t *testing.T) {
@@ -193,5 +268,47 @@ func TestActiveMountPointBoundedTimesOut(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("bounded probe took %s", elapsed)
+	}
+}
+
+func TestShouldForceUnmountAfterAbnormalServe(t *testing.T) {
+	cases := []struct {
+		active bool
+		err    error
+		want   bool
+	}{
+		{true, nil, true},
+		{false, errors.New("transport endpoint is not connected"), true},
+		{false, errors.New("active mount check timed out after 2s"), false},
+		{false, os.ErrNotExist, false},
+		{false, nil, false},
+	}
+	for _, tc := range cases {
+		if got := shouldForceUnmountAfterAbnormalServe(tc.active, tc.err); got != tc.want {
+			t.Fatalf("active=%v err=%v: got %v want %v", tc.active, tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestClassifyServeEndBoundedWhenProbeHangs(t *testing.T) {
+	oldProbe := activeMountProbe
+	oldTimeout := cleanupActiveMountTimeout
+	activeMountProbe = func(string) (bool, error) {
+		time.Sleep(30 * time.Second)
+		return true, nil
+	}
+	cleanupActiveMountTimeout = 50 * time.Millisecond
+	t.Cleanup(func() {
+		activeMountProbe = oldProbe
+		cleanupActiveMountTimeout = oldTimeout
+	})
+
+	start := time.Now()
+	reason, _ := classifyServeEnd(false, t.TempDir())
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("classifyServeEnd blocked for %s", elapsed)
+	}
+	if reason != ExitReasonServeAbnormal {
+		t.Fatalf("reason=%s want serve_abnormal (not external_unmount on indeterminate)", reason)
 	}
 }

@@ -71,6 +71,57 @@ func TestControlSocketPathFallbackIsUIDScoped(t *testing.T) {
 	}
 }
 
+func TestEnsureStateDirCreatesPrivateDir(t *testing.T) {
+	xdg := filepath.Join(t.TempDir(), "xdg")
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	if err := ensureStateDir(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(xdg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatal("not a directory")
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("mode=%o want 700", info.Mode().Perm())
+	}
+}
+
+func TestEnsureStateDirRepairsTooWideMode(t *testing.T) {
+	xdg := filepath.Join(t.TempDir(), "xdg")
+	if err := os.MkdirAll(xdg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Force wide mode in case umask narrowed MkdirAll.
+	if err := os.Chmod(xdg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	if err := ensureStateDir(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(xdg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("mode=%o want 700 after repair", info.Mode().Perm())
+	}
+}
+
+func TestEnsureStateDirRejectsNonDirectory(t *testing.T) {
+	xdg := filepath.Join(t.TempDir(), "xdg-file")
+	if err := os.WriteFile(xdg, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	if err := ensureStateDir(); err == nil {
+		t.Fatal("expected non-directory reject")
+	}
+}
+
 func TestWriteReadPID(t *testing.T) {
 	mountPoint := filepath.Join(t.TempDir(), "mnt")
 	pid := 12345

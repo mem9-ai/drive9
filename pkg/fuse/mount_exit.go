@@ -7,24 +7,24 @@ import (
 
 // Mount exit codes (worker process). See docs/design/fuse-mount-supervision.md.
 const (
-	ExitOK                = 0
-	ExitForceQuit         = 1
-	ExitUsage             = 2
-	ExitServeAbnormal     = 3
-	ExitUnhealthy         = 4
-	ExitStartupPermanent  = 5
-	ExitStartupTransient  = 6
+	ExitOK               = 0
+	ExitForceQuit        = 1
+	ExitUsage            = 2
+	ExitServeAbnormal    = 3
+	ExitUnhealthy        = 4
+	ExitStartupPermanent = 5
+	ExitStartupTransient = 6
 )
 
 // MountExitReason classifies why a mount process ended.
 type MountExitReason string
 
 const (
-	ExitReasonSignal          MountExitReason = "signal"
-	ExitReasonExternalUnmount MountExitReason = "external_unmount"
-	ExitReasonServeAbnormal   MountExitReason = "serve_abnormal"
-	ExitReasonPanic           MountExitReason = "panic"
-	ExitReasonUnhealthy       MountExitReason = "unhealthy"
+	ExitReasonSignal           MountExitReason = "signal"
+	ExitReasonExternalUnmount  MountExitReason = "external_unmount"
+	ExitReasonServeAbnormal    MountExitReason = "serve_abnormal"
+	ExitReasonPanic            MountExitReason = "panic"
+	ExitReasonUnhealthy        MountExitReason = "unhealthy"
 	ExitReasonStartupPermanent MountExitReason = "startup_permanent"
 	ExitReasonStartupTransient MountExitReason = "startup_transient"
 )

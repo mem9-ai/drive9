@@ -108,6 +108,9 @@ func newSupervisor(cfg Config) (*supervisor, error) {
 	if len(cfg.WorkerArgs) == 0 {
 		return nil, fmt.Errorf("mountsupervisor: worker args required")
 	}
+	if cfg.Adopt && (cfg.AdoptWorkerPID <= 0 || cfg.AdoptWorkerCreation == 0) {
+		return nil, fmt.Errorf("mountsupervisor: adopt requires worker pid and creation identity")
+	}
 	startedAt := cfg.Now()
 	if startedAt.IsZero() {
 		startedAt = time.Now()
@@ -546,8 +549,8 @@ func (s *supervisor) stopAdoptedWorker() {
 		return
 	}
 	_ = proc.Signal(syscall.SIGTERM)
-	deadline := time.Now().Add(s.cfg.StopTimeout)
-	for time.Now().Before(deadline) {
+	deadline := s.cfg.Now().Add(s.cfg.StopTimeout)
+	for s.cfg.Now().Before(deadline) {
 		if !processAlive(pid, creation) {
 			return
 		}

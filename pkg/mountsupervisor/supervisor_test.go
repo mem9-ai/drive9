@@ -143,6 +143,42 @@ func TestClassifyExitExecError(t *testing.T) {
 	_ = syscall.SIGTERM
 }
 
+func TestNewSupervisorAdoptRequiresCreationIdentity(t *testing.T) {
+	mp := t.TempDir()
+	_, err := newSupervisor(Config{
+		MountPoint:          mp,
+		WorkerArgs:          []string{"mount", "--foreground", mp},
+		Adopt:               true,
+		AdoptWorkerPID:      os.Getpid(),
+		AdoptWorkerCreation: 0,
+	})
+	if err == nil {
+		t.Fatal("adopt without creation must fail closed")
+	}
+
+	ct, cerr := mountstate.ProcessCreationTime(os.Getpid())
+	if cerr != nil || ct == 0 {
+		t.Skip("platform has no process creation metadata")
+	}
+	s, err := newSupervisor(Config{
+		MountPoint:          mp,
+		WorkerArgs:          []string{"mount", "--foreground", mp},
+		Adopt:               true,
+		AdoptWorkerPID:      os.Getpid(),
+		AdoptWorkerCreation: ct,
+	})
+	if err != nil {
+		t.Fatalf("adopt with full identity: %v", err)
+	}
+	t.Cleanup(func() { s.unlock() })
+	if !s.adopted {
+		t.Fatal("expected adopted=true")
+	}
+	if s.state.WorkerPID != os.Getpid() {
+		t.Fatalf("WorkerPID=%d", s.state.WorkerPID)
+	}
+}
+
 func TestProcessIdentityAliveFailClosed(t *testing.T) {
 	self := os.Getpid()
 	if processIdentityAlive(self, 0, true) {

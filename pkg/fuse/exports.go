@@ -177,11 +177,15 @@ func runUnmountCmd(timeout time.Duration, name string, args ...string) error {
 }
 
 // EnsureCleanMountpoint force-unmounts a stale (broken) mount if present.
-// Destructive cleanup is local-only: transport-broken endpoints, or active
-// mounts whose recorded owner process is dead. Backend readdir failures on a
-// live owned mount must NOT trigger force-unmount (design: backend outage ≠
-// FUSE death). When force-unmount is attempted but the endpoint remains,
-// returns a non-nil error.
+// Destructive cleanup is local-only:
+//   - transport-broken endpoints (ENOTCONN/EIO/EACCES-after-daemon-death), or
+//   - active mounts whose recorded owner process is dead.
+//
+// Timeout / unknown probe errors first pass the ownerAlive identity gate: a
+// slow-but-live owned mount is degraded, not stale, and must not be detached
+// (design: backend outage / slow getattr ≠ FUSE death). Backend readdir
+// failures on a live owned mount must NOT trigger force-unmount. When
+// force-unmount is attempted but the endpoint remains, returns a non-nil error.
 func EnsureCleanMountpoint(mountPoint string) (cleaned bool, err error) {
 	mountPoint = strings.TrimSpace(mountPoint)
 	if mountPoint == "" {
@@ -194,7 +198,12 @@ func EnsureCleanMountpoint(mountPoint string) (cleaned bool, err error) {
 		if os.IsNotExist(activeErr) {
 			return false, nil
 		}
-		// Timeout, ENOTCONN, EACCES after daemon SIGKILL, EIO, etc. — detach.
+		// Transport-broken: kernel-mounted dead endpoint — detach immediately.
+		// Timeout/unknown: may be a slow-but-live FUSE daemon; only detach when
+		// the recorded owner (worker PID+creation) is dead/missing.
+		if !isTransportBroken(activeErr) && ownerAlive(mountPoint) {
+			return false, nil
+		}
 		forceUnmountLazy(mountPoint)
 		if stillBroken := mountStillNeedsClean(mountPoint); stillBroken {
 			return true, fmt.Errorf("force unmount did not clear broken mountpoint %s: %v", mountPoint, activeErr)
