@@ -218,6 +218,10 @@ func buildSyncRound(id string, mode RoundMode, started time.Time, source ScanRes
 	return buildRound(id, mode, started, source, target, true)
 }
 
+func buildDualRound(id string, mode RoundMode, started time.Time, source ScanResult, target TargetScan) (Round, error) {
+	return buildRound(id, mode, started, source, target, true)
+}
+
 func buildRound(id string, mode RoundMode, started time.Time, source ScanResult, target TargetScan, includeTargetOnlyLinks bool) (Round, error) {
 	round := Round{ID: id, Mode: mode, StartedAt: started}
 	if !source.Complete || !target.Complete {

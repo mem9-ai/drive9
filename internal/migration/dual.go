@@ -15,7 +15,7 @@ func (w *Worker) dualRound(ctx context.Context, mode RoundMode, id string, start
 		return err
 	}
 	w.state.clearAbsentWork(source.Entries)
-	round, err := BuildRound(id, mode, started, source, target)
+	round, err := buildDualRound(id, mode, started, source, target)
 	if err != nil {
 		w.state.FailRound(id, "inventory")
 		return err
@@ -69,7 +69,7 @@ func (w *Worker) dualRound(ctx context.Context, mode RoundMode, id string, start
 				}
 				w.state.MarkReconciled(path, entry.Version)
 			}
-			round, err = BuildRound(id, mode, started, source, target)
+			round, err = buildDualRound(id, mode, started, source, target)
 			if err != nil {
 				return err
 			}
