@@ -39,6 +39,9 @@ GOLANGCI_LINT_BIN ?= $(BIN_DIR)/golangci-lint
 IMAGE_REPO ?= drive9-server
 IMAGE_TAG ?= latest
 IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
+MIGRATION_IMAGE ?= ghcr.io/drive9-ai/drive9-migration:local
+MIGRATION_PLATFORM ?= linux/$(HOST_GOARCH)
+MIGRATION_PLATFORMS ?= linux/amd64,linux/arm64
 LINT_TIMEOUT ?= 10m
 TEST_TIMEOUT ?= 10m
 TEST_P ?=
@@ -50,7 +53,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release build-migration build-migration-release run-server-local e2e-local sdk-integration-tests docker-build
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release build-migration build-migration-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
@@ -173,6 +176,36 @@ build-cli-release:
 	cd $(DIST_DIR) && sha256sum $(CLI_NAME)-* > checksums.txt && printf '%s\n' "$(VERSION)" > version
 
 DOCKER_BUILD_ARGS ?=
+MIGRATION_DOCKER_BUILD_ARGS ?=
 
 docker-build: build-server
 	$(DOCKER) build $(DOCKER_BUILD_ARGS) -t $(IMAGE) .
+
+docker-build-migration:
+	$(DOCKER) build $(MIGRATION_DOCKER_BUILD_ARGS) \
+		--platform $(MIGRATION_PLATFORM) \
+		--build-arg VERSION="$(if $(VERSION),$(VERSION),dev)" \
+		--build-arg GIT_HASH="$(GIT_HASH)" \
+		--build-arg GIT_BRANCH="$(GIT_BRANCH)" \
+		--build-arg BUILD_TIME="$(BUILD_TIME)" \
+		-f Dockerfile.migration \
+		-t $(MIGRATION_IMAGE) .
+
+docker-push-migration-multi:
+	@image="$(MIGRATION_IMAGE)"; \
+	if [[ ! "$$image" =~ :[^/:]+$$ ]] || \
+		[[ "$$image" == *:local ]] || \
+		[[ "$$image" == *:latest ]] || \
+		[[ "$$image" == *@* ]]; then \
+		echo "MIGRATION_IMAGE must use an explicit non-local, non-latest tag" >&2; \
+		exit 1; \
+	fi
+	$(DOCKER) buildx build $(MIGRATION_DOCKER_BUILD_ARGS) \
+		--platform $(MIGRATION_PLATFORMS) \
+		--build-arg VERSION="$(if $(VERSION),$(VERSION),dev)" \
+		--build-arg GIT_HASH="$(GIT_HASH)" \
+		--build-arg GIT_BRANCH="$(GIT_BRANCH)" \
+		--build-arg BUILD_TIME="$(BUILD_TIME)" \
+		-f Dockerfile.migration \
+		-t $(MIGRATION_IMAGE) \
+		--push .

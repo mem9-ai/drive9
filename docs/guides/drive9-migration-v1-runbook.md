@@ -17,6 +17,44 @@ timestamps, xattrs, ACLs, special bits, or sparse layout. Revision reuse after
 delete/recreate retains a residual ABA overwrite risk. Throttling is per Job,
 not batch-wide, and Jobs have no cross-Job transaction.
 
+## Public container image
+
+The manually triggered `publish-migration-image.yml` workflow builds Linux
+AMD64 and ARM64 images from `main` and publishes one multi-architecture manifest
+to:
+
+```text
+ghcr.io/drive9-ai/drive9-migration:<source-sha7>
+```
+
+The workflow does not publish `latest`. Operators must use the immutable digest
+reported in the workflow summary:
+
+```text
+ghcr.io/drive9-ai/drive9-migration@sha256:<manifest-digest>
+```
+
+The `mem9-ai/drive9` repository must provide the Actions secrets
+`DRIVE9_AI_GHCR_USERNAME` and `DRIVE9_AI_GHCR_TOKEN`. The token must belong to an
+account authorized to publish packages in `drive9-ai` and needs only the GitHub
+Packages `write:packages` scope. Never put this token in configuration, source,
+workflow output, or the container image.
+
+GitHub creates the package as private on its first publication. A `drive9-ai`
+owner must then open the `drive9-migration` package settings and change its
+visibility to Public. This is a one-time and irreversible visibility change.
+Afterward, verify from an environment that is not logged in to GHCR:
+
+```bash
+docker pull ghcr.io/drive9-ai/drive9-migration@sha256:<manifest-digest>
+docker run --rm \
+  ghcr.io/drive9-ai/drive9-migration@sha256:<manifest-digest> --help
+```
+
+The image entrypoint is `drive9-migration`. A Worker container therefore uses
+arguments `run -f /etc/drive9-migration/config.yaml`; the mounts and environment
+described below remain required.
+
 ## Inputs and handoff mapping
 
 Use [the sample configuration](../examples/drive9-migration/config.yaml) as the
