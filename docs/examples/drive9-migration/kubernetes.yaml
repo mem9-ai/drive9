@@ -1,0 +1,150 @@
+# Single-PVC trial manifest. Apply it to the namespace that contains the PVC.
+# Replace the endpoint, volume ID, Node name, PVC name, and Owner API key.
+# Do not commit a real API key.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: drive9-migration
+data:
+  # Allowed startup requests: SYNCING, DUAL_WRITE_REPAIRING, CUTOVER_READY.
+  # Patch this value and rollout-restart the DaemonSet for each transition.
+  phase: SYNCING
+  config.yaml: |
+    version: v3
+    drive9:
+      endpoint: https://drive9.example.com
+    job_defaults:
+      sync:
+        grace_period: 60s
+      performance:
+        max_bytes_per_second: 104857600
+        small_file_workers: 8
+        large_file_workers: 2
+    spaces:
+      migration-target:
+        credential_ref: owner-api-key
+    jobs:
+      - volume_id: vol-00000000000000000
+        node_name: REPLACE_WITH_KUBERNETES_NODE_NAME
+        source:
+          type: ebs
+          root: /mnt/ebs/source
+        target:
+          space_ref: migration-target
+          prefix: /
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: drive9-migration-credentials
+type: Opaque
+stringData:
+  owner-api-key: REPLACE_WITH_DRIVE9_OWNER_API_KEY
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: drive9-migration
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: drive9-migration
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: drive9-migration
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/hostname: REPLACE_WITH_KUBERNETES_NODE_NAME
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: plan
+          image: ghcr.io/drive9-ai/drive9-migration:3a6d226
+          imagePullPolicy: IfNotPresent
+          args:
+            - plan
+            - -f
+            - /etc/drive9-migration/config.yaml
+          env:
+            - name: DRIVE9_MIGRATION_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 0
+            runAsUser: 0
+          volumeMounts:
+            - name: config
+              mountPath: /etc/drive9-migration
+              readOnly: true
+            - name: credentials
+              mountPath: /var/run/secrets/drive9-migration
+              readOnly: true
+            - name: source
+              mountPath: /mnt/ebs/source
+              readOnly: true
+      containers:
+        - name: worker
+          image: ghcr.io/drive9-ai/drive9-migration:3a6d226
+          imagePullPolicy: IfNotPresent
+          args:
+            - run
+            - -f
+            - /etc/drive9-migration/config.yaml
+          env:
+            - name: DRIVE9_MIGRATION_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 0
+            runAsUser: 0
+          volumeMounts:
+            - name: config
+              mountPath: /etc/drive9-migration
+              readOnly: true
+            - name: credentials
+              mountPath: /var/run/secrets/drive9-migration
+              readOnly: true
+            - name: source
+              mountPath: /mnt/ebs/source
+              readOnly: true
+            - name: runtime
+              mountPath: /run/drive9-migration
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: drive9-migration
+        - name: credentials
+          secret:
+            secretName: drive9-migration-credentials
+            defaultMode: 0600
+        - name: source
+          persistentVolumeClaim:
+            claimName: replace-with-existing-ebs-pvc
+            readOnly: true
+        - name: runtime
+          emptyDir: {}

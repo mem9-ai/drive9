@@ -145,6 +145,12 @@ func TestReadStartupPhaseSourcesAndRollback(t *testing.T) {
 	if phase, err := ReadStartupPhase(configPath, string(PhaseDualWriteRepairing), PhaseDualWriteRepairing); err != nil || phase != PhaseDualWriteRepairing {
 		t.Fatalf("idempotent phase=%q err=%v", phase, err)
 	}
+	if phase, err := ReadStartupPhase(configPath, string(PhaseCutoverReady), PhaseDualWriteRepairing); err != nil || phase != PhaseCutoverReady {
+		t.Fatalf("cutover request phase=%q err=%v", phase, err)
+	}
+	if phase, err := ReadStartupPhase(configPath, string(PhaseCutoverReady), PhaseCutoverReady); err != nil || phase != PhaseCutoverReady {
+		t.Fatalf("idempotent cutover request phase=%q err=%v", phase, err)
+	}
 }
 
 func TestCredentialSourceReloadsRotationAndDoesNotLeak(t *testing.T) {
