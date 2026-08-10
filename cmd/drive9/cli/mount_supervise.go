@@ -124,28 +124,28 @@ func runMountSupervise(args []string) error {
 	// Stop-token clearing is done inside mountsupervisor after exclusive lock
 	// so a concurrent umount intent cannot be erased by a non-owner process.
 	return mountsupervisor.Run(mountsupervisor.Config{
-		MountPoint:     *mountPoint,
-		Executable:     exe,
-		WorkerArgs:     workerArgs,
-		Env:            os.Environ(),
-		LogPath:        *logPath,
-		Stdout:         stdout,
-		Stderr:         stderr,
-		MaxRestarts:    *maxRestarts,
-		RestartWindow:  *restartWindow,
-		HealthInterval: *healthInterval,
-		HealthTimeout:  *healthTimeout,
-		HealthFailures: *healthFailures,
-		StopTimeout:    *stopTimeout,
-		BackoffMax:     *backoffMax,
-		AlertWebhook:   firstNonEmpty(*alertWebhook, os.Getenv("DRIVE9_MOUNT_ALERT_WEBHOOK")),
-		AlertFile:      *alertFile,
-		SanitizedArgs:  sanitized,
-		Server:         *server,
-		RemoteRoot:     *remoteRoot,
-		Profile:        *profile,
-		LocalRoot:      *localRootMeta,
-		PackPaths:      packPaths,
+		MountPoint:          *mountPoint,
+		Executable:          exe,
+		WorkerArgs:          workerArgs,
+		Env:                 os.Environ(),
+		LogPath:             *logPath,
+		Stdout:              stdout,
+		Stderr:              stderr,
+		MaxRestarts:         *maxRestarts,
+		RestartWindow:       *restartWindow,
+		HealthInterval:      *healthInterval,
+		HealthTimeout:       *healthTimeout,
+		HealthFailures:      *healthFailures,
+		StopTimeout:         *stopTimeout,
+		BackoffMax:          *backoffMax,
+		AlertWebhook:        firstNonEmpty(*alertWebhook, os.Getenv("DRIVE9_MOUNT_ALERT_WEBHOOK")),
+		AlertFile:           *alertFile,
+		SanitizedArgs:       sanitized,
+		Server:              *server,
+		RemoteRoot:          *remoteRoot,
+		Profile:             *profile,
+		LocalRoot:           *localRootMeta,
+		PackPaths:           packPaths,
 		Adopt:               *adopt,
 		AdoptWorkerPID:      *adoptWorkerPID,
 		AdoptWorkerCreation: *adoptWorkerCreation,
@@ -241,14 +241,15 @@ func runMountEnsure(args []string) error {
 		_ = mountsupervisor.ResetCircuit(mp)
 	}
 	snap := mountsupervisor.CollectStatus(mp)
-	supAlive := snap.SupervisorPID > 0 && processAliveImpl(snap.SupervisorPID)
-	workerAlive := snap.WorkerPID > 0 && processAliveImpl(snap.WorkerPID)
-	if snap.Healthy && !*restart && supAlive {
+	// Ownership is always PID+creation (fail closed when creation missing).
+	// PID-only checks would skip adopt after supervisor death if the old PID
+	// was reused by an unrelated process.
+	switch mountsupervisor.DecideEnsureAction(snap, *restart) {
+	case mountsupervisor.EnsureAlreadyHealthy:
 		fmt.Fprintf(os.Stderr, "drive9: mount ensure: already healthy at %s\n", mp)
 		return nil
-	}
-	// Dead supervisor + live worker + healthy mount: adopt-by-monitor (design).
-	if snap.Healthy && !*restart && !supAlive && workerAlive {
+	case mountsupervisor.EnsureAdopt:
+		// Dead/stale supervisor + live worker + healthy mount: adopt-by-monitor.
 		return ensureAdoptSupervisor(mp, snap)
 	}
 	// Clean stale mount if needed.
@@ -258,8 +259,8 @@ func runMountEnsure(args []string) error {
 		fmt.Fprintf(os.Stderr, "drive9: mount ensure: cleaned stale mount at %s\n", mp)
 	}
 
-	// If supervisor still alive and not restart, nothing more.
-	if !*restart && snap.SupervisorPID > 0 && processAliveImpl(snap.SupervisorPID) {
+	// If supervisor identity still matches and not restart, wait for self-heal.
+	if !*restart && mountsupervisor.SupervisorIdentityAlive(snap) {
 		// Wait briefly for self-heal.
 		deadline := time.Now().Add(45 * time.Second)
 		for time.Now().Before(deadline) {
@@ -298,47 +299,37 @@ func runMountEnsure(args []string) error {
 	sanitized = stripEnsureBlockingFlags(sanitized)
 
 	// Stop any existing supervisor/worker first (graceful), verifying identity.
+	// Prefer creation times already resolved by CollectStatus (PID+creation).
 	_ = mountstate.WriteStopToken(mp, "ensure")
-	var workerCreation uint64
-	var workerPID int
-	if sst, _, err := mountstate.ReadSupervisorState(mp); err == nil {
-		workerCreation = sst.WorkerCreation
-		if sst.WorkerPID > 0 {
-			workerPID = sst.WorkerPID
+	workerPID := snap.WorkerPID
+	workerCreation := snap.WorkerCreation
+	if workerPID == 0 || workerCreation == 0 {
+		if sst, _, err := mountstate.ReadSupervisorState(mp); err == nil {
+			if workerCreation == 0 {
+				workerCreation = sst.WorkerCreation
+			}
+			if workerPID == 0 && sst.WorkerPID > 0 {
+				workerPID = sst.WorkerPID
+			}
 		}
-	}
-	if ps, _, err := mountstate.ReadProcessState(mp); err == nil {
-		if workerPID == 0 && ps.WorkerPID > 0 {
-			workerPID = ps.WorkerPID
-		}
-		// Unsupervised / dead-supervisor leftover: worker may be recorded as PID.
-		if workerPID == 0 && ps.PID > 0 && ps.Role != mountstate.RoleSupervisor {
-			workerPID = ps.PID
-			workerCreation = ps.CreationTime
-		}
-	}
-	if snap.SupervisorPID > 0 {
-		var creation uint64
 		if ps, _, err := mountstate.ReadProcessState(mp); err == nil {
-			if ps.SupervisorPID == snap.SupervisorPID {
-				creation = ps.SupervisorCreationTime
-				if creation == 0 {
-					creation = ps.CreationTime
+			if workerPID == 0 && ps.WorkerPID > 0 {
+				workerPID = ps.WorkerPID
+			}
+			// Unsupervised leftover: worker may be recorded as PID.
+			if workerPID == 0 && ps.PID > 0 && ps.Role != mountstate.RoleSupervisor {
+				workerPID = ps.PID
+				if workerCreation == 0 {
+					workerCreation = ps.CreationTime
 				}
 			}
 		}
-		if sst, _, err := mountstate.ReadSupervisorState(mp); err == nil && sst.PID == snap.SupervisorPID {
-			creation = sst.CreationTime
-		}
-		if processMatchesIdentity(snap.SupervisorPID, creation) {
-			_ = terminateProcessGraceful(snap.SupervisorPID, 30*time.Second)
-		}
+	}
+	if processMatchesIdentity(snap.SupervisorPID, snap.SupervisorCreation) {
+		_ = terminateProcessGraceful(snap.SupervisorPID, 30*time.Second)
 	}
 	// Always attempt worker stop when identity matches (covers dead supervisor +
 	// orphan worker, and avoids PID-reuse kill without creation check).
-	if workerPID == 0 {
-		workerPID = snap.WorkerPID
-	}
 	if workerPID > 0 && processMatchesIdentity(workerPID, workerCreation) {
 		_ = terminateProcessGraceful(workerPID, 30*time.Second)
 	}
@@ -358,11 +349,13 @@ func runMountEnsure(args []string) error {
 
 // ensureAdoptSupervisor starts a poll-based supervisor over a live orphan worker.
 func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error {
-	var workerCreation uint64
+	workerCreation := snap.WorkerCreation
 	var sanitized []string
 	var storedServer, storedAPIKey, storedToken string
 	if st, _, err := mountstate.ReadSupervisorState(mp); err == nil {
-		workerCreation = st.WorkerCreation
+		if workerCreation == 0 {
+			workerCreation = st.WorkerCreation
+		}
 		sanitized = append([]string(nil), st.Args...)
 		storedServer = st.Server
 	}
@@ -374,9 +367,17 @@ func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error
 			storedServer = ps.Server
 		}
 		storedAPIKey, storedToken = ps.APIKey, ps.Token
+		// Worker creation may only exist on process state for older formats.
+		if workerCreation == 0 && ps.WorkerPID == snap.WorkerPID && ps.CreationTime > 0 && ps.Role != mountstate.RoleSupervisor {
+			workerCreation = ps.CreationTime
+		}
 	}
 	if snap.WorkerPID <= 0 {
 		return fmt.Errorf("drive9 mount ensure: adopt requires worker pid")
+	}
+	// Fail closed: adopt without creation identity risks monitoring the wrong process.
+	if workerCreation == 0 {
+		return fmt.Errorf("drive9 mount ensure: adopt requires worker creation identity; remount with --restart")
 	}
 	if len(sanitized) == 0 {
 		return fmt.Errorf("drive9 mount ensure: no stored mount args for adopt; remount explicitly")
@@ -426,11 +427,12 @@ func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error
 			// Child has inherited the fd; parent may close.
 			_ = logFile.Close()
 		}
-		// Detach: do not wait. Poll until status shows a live supervisor.
+		// Detach: do not wait. Poll until status shows a live supervisor
+		// by PID+creation identity (same contract as ensure decision).
 		deadline := time.Now().Add(30 * time.Second)
 		for time.Now().Before(deadline) {
 			s2 := mountsupervisor.CollectStatus(mp)
-			if s2.SupervisorPID > 0 && processAliveImpl(s2.SupervisorPID) && s2.Healthy {
+			if mountsupervisor.SupervisorIdentityAlive(s2) && s2.Healthy {
 				fmt.Fprintf(os.Stderr, "drive9: mount ensure: adopted orphan worker pid=%d under supervisor pid=%d\n",
 					snap.WorkerPID, s2.SupervisorPID)
 				return nil
@@ -660,7 +662,7 @@ type cliExitError struct {
 	msg  string
 }
 
-func (e cliExitError) Error() string  { return e.msg }
+func (e cliExitError) Error() string { return e.msg }
 func (e cliExitError) ExitCode() int { return e.code }
 
 func fileIsTerminal(f *os.File) bool {

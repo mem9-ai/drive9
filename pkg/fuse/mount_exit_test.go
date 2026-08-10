@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
@@ -110,5 +111,87 @@ func TestOwnerAliveSupervisorWithoutWorker(t *testing.T) {
 	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
 	if ownerAlive(mp) {
 		t.Fatal("ownerAlive with supervisor-only state should be false")
+	}
+}
+
+func TestOwnerAliveWorkerIdentity(t *testing.T) {
+	mp := t.TempDir()
+	self := os.Getpid()
+	ct, err := mountstate.ProcessCreationTime(self)
+	if err != nil || ct == 0 {
+		t.Skip("platform has no process creation metadata")
+	}
+	st := mountstate.SupervisorState{
+		PID:            self + 1, // not used as FUSE owner
+		WorkerPID:      self,
+		WorkerCreation: ct,
+		MountPoint:     mp,
+		State:          mountstate.SupervisorStateRunning,
+	}
+	if err := mountstate.WriteSupervisorState(mp, st); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+	if !ownerAlive(mp) {
+		t.Fatal("ownerAlive with matching worker identity should be true")
+	}
+	st.WorkerCreation = ct + 1
+	if err := mountstate.WriteSupervisorState(mp, st); err != nil {
+		t.Fatal(err)
+	}
+	if ownerAlive(mp) {
+		t.Fatal("ownerAlive with mismatched worker creation should be false")
+	}
+}
+
+func TestEnsureCleanMountpointBoundedWhenProbeHangs(t *testing.T) {
+	// Inject a hanging active-mount probe: cleanup must time out, not block forever.
+	oldProbe := activeMountProbe
+	oldTimeout := cleanupActiveMountTimeout
+	activeMountProbe = func(string) (bool, error) {
+		time.Sleep(30 * time.Second)
+		return true, nil
+	}
+	cleanupActiveMountTimeout = 50 * time.Millisecond
+	t.Cleanup(func() {
+		activeMountProbe = oldProbe
+		cleanupActiveMountTimeout = oldTimeout
+	})
+
+	dir := t.TempDir()
+	start := time.Now()
+	cleaned, err := EnsureCleanMountpoint(dir)
+	elapsed := time.Since(start)
+	if elapsed > 2*time.Second {
+		t.Fatalf("EnsureClean blocked for %s (want bounded ~timeout)", elapsed)
+	}
+	// Hanging probe → timeout error path → force unmount attempted.
+	if !cleaned {
+		t.Fatalf("expected cleaned=true on hang path, err=%v", err)
+	}
+	// force-unmount of a plain dir is best-effort; err may be non-nil if still "needs clean"
+	// because the probe still hangs on the verification pass.
+	_ = err
+}
+
+func TestActiveMountPointBoundedTimesOut(t *testing.T) {
+	oldProbe := activeMountProbe
+	oldTimeout := cleanupActiveMountTimeout
+	activeMountProbe = func(string) (bool, error) {
+		time.Sleep(5 * time.Second)
+		return true, nil
+	}
+	cleanupActiveMountTimeout = 30 * time.Millisecond
+	t.Cleanup(func() {
+		activeMountProbe = oldProbe
+		cleanupActiveMountTimeout = oldTimeout
+	})
+	start := time.Now()
+	_, err := ActiveMountPointBounded(t.TempDir())
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("bounded probe took %s", elapsed)
 	}
 }

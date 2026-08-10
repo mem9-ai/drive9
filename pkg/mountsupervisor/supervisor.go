@@ -71,17 +71,17 @@ func Run(cfg Config) error {
 type supervisor struct {
 	cfg Config
 
-	mu            sync.Mutex
-	state         mountstate.SupervisorState
-	stopRequested bool
-	workerCmd     *exec.Cmd
-	workerWait    chan exitResult
-	restarts      []time.Time
+	mu             sync.Mutex
+	state          mountstate.SupervisorState
+	stopRequested  bool
+	workerCmd      *exec.Cmd
+	workerWait     chan exitResult
+	restarts       []time.Time
 	permanentFails int
-	backoff       time.Duration
-	lockFile      *os.File
-	adopted       bool
-	startedAt     time.Time
+	backoff        time.Duration
+	lockFile       *os.File
+	adopted        bool
+	startedAt      time.Time
 
 	healthFails   int
 	lastHealth    string
@@ -119,11 +119,7 @@ func newSupervisor(cfg Config) (*supervisor, error) {
 	// Only after exclusive lock: clear stop tokens that predate this process
 	// (sticky tokens from SIGKILL-path umount). A token newer than startedAt
 	// is a concurrent intentional stop — honor it, do not clear.
-	if ts, ok := mountstate.ReadStopTokenTime(cfg.MountPoint); ok {
-		if ts.IsZero() || ts.Before(startedAt) {
-			_ = mountstate.ClearStopToken(cfg.MountPoint)
-		}
-	}
+	clearStaleStopToken(cfg.MountPoint, startedAt)
 	creation, _ := mountstate.ProcessCreationTime(os.Getpid())
 	now := cfg.Now()
 	s := &supervisor{
@@ -358,7 +354,7 @@ func (s *supervisor) loop() error {
 		// Exit 0 while still RUNNING: verify mount inactive; if still active
 		// or transport-broken (ENOTCONN), treat as abnormal so we restart/clean.
 		if code == 0 {
-			active, activeErr := drive9fuse.ActiveMountPoint(s.cfg.MountPoint)
+			active, activeErr := drive9fuse.ActiveMountPointBounded(s.cfg.MountPoint)
 			if active || drive9fuse.IsTransportBroken(activeErr) {
 				if probeErr := drive9fuse.ProbeMountPointReady(s.cfg.MountPoint); probeErr != nil {
 					code = drive9fuse.ExitServeAbnormal
@@ -832,10 +828,12 @@ func (s *supervisor) shutdownClean() error {
 	// Force clean mount on stop, including transport-broken (ENOTCONN) endpoints
 	// that ActiveMountPoint reports as (false, err).
 	if _, err := drive9fuse.EnsureCleanMountpoint(s.cfg.MountPoint); err != nil {
-		// Best-effort fallback if ensure-clean itself fails.
-		if active, aerr := drive9fuse.ActiveMountPoint(s.cfg.MountPoint); aerr == nil && active {
+		// Best-effort fallback if ensure-clean itself fails. Use bounded probe
+		// so shutdown cannot hang on a wedged endpoint.
+		if active, aerr := drive9fuse.ActiveMountPointBounded(s.cfg.MountPoint); aerr == nil && active {
 			drive9fuse.ForceUnmountLazy(s.cfg.MountPoint)
-		} else if drive9fuse.IsTransportBroken(aerr) {
+		} else if aerr != nil {
+			// Timeout / transport-broken / other: always try lazy detach.
 			drive9fuse.ForceUnmountLazy(s.cfg.MountPoint)
 		}
 	}
@@ -1062,6 +1060,32 @@ func processAlive(pid int, creation uint64) bool {
 	return got == creation
 }
 
+// processIdentityAlive is the ownership check for supervised mounts.
+// When requireCreation is true (ensure/status ownership decisions), missing
+// creation metadata is fail-closed (not alive) so PID reuse cannot skip adopt.
+func processIdentityAlive(pid int, creation uint64, requireCreation bool) bool {
+	if pid <= 0 {
+		return false
+	}
+	if requireCreation && creation == 0 {
+		return false
+	}
+	return processAlive(pid, creation)
+}
+
+// clearStaleStopToken removes a stop token only after exclusive flock ownership
+// and only when the token predates this supervisor start (or has no timestamp).
+// Concurrent umount tokens written after startedAt are preserved.
+func clearStaleStopToken(mountPoint string, startedAt time.Time) {
+	ts, ok := mountstate.ReadStopTokenTime(mountPoint)
+	if !ok {
+		return
+	}
+	if ts.IsZero() || ts.Before(startedAt) {
+		_ = mountstate.ClearStopToken(mountPoint)
+	}
+}
+
 // ResetCircuit clears restart budget for ensure --reset style recovery.
 func ResetCircuit(mountPoint string) error {
 	st, _, err := mountstate.ReadSupervisorState(mountPoint)
@@ -1076,20 +1100,60 @@ func ResetCircuit(mountPoint string) error {
 
 // StatusSnapshot merges supervisor + process + probe for mount status.
 type StatusSnapshot struct {
-	MountPoint     string `json:"mount_point"`
-	State          string `json:"state"`
-	Healthy        bool   `json:"healthy"`
-	SupervisorPID  int    `json:"supervisor_pid,omitempty"`
-	WorkerPID      int    `json:"worker_pid,omitempty"`
-	Restarts       int    `json:"restarts"`
-	LastExitCode   int    `json:"last_exit_code,omitempty"`
-	LastExitReason string `json:"last_exit_reason,omitempty"`
-	LastHealth     string `json:"last_health,omitempty"`
-	LastHealthErr  string `json:"last_health_error,omitempty"`
-	LogPath        string `json:"log_path,omitempty"`
-	ProbeError     string `json:"probe_error,omitempty"`
-	StopRequested  bool   `json:"stop_requested,omitempty"`
-	Supervised     bool   `json:"supervised"`
+	MountPoint         string `json:"mount_point"`
+	State              string `json:"state"`
+	Healthy            bool   `json:"healthy"`
+	SupervisorPID      int    `json:"supervisor_pid,omitempty"`
+	SupervisorCreation uint64 `json:"supervisor_creation_time,omitempty"`
+	WorkerPID          int    `json:"worker_pid,omitempty"`
+	WorkerCreation     uint64 `json:"worker_creation_time,omitempty"`
+	Restarts           int    `json:"restarts"`
+	LastExitCode       int    `json:"last_exit_code,omitempty"`
+	LastExitReason     string `json:"last_exit_reason,omitempty"`
+	LastHealth         string `json:"last_health,omitempty"`
+	LastHealthErr      string `json:"last_health_error,omitempty"`
+	LogPath            string `json:"log_path,omitempty"`
+	ProbeError         string `json:"probe_error,omitempty"`
+	StopRequested      bool   `json:"stop_requested,omitempty"`
+	Supervised         bool   `json:"supervised"`
+}
+
+// SupervisorIdentityAlive reports whether the recorded supervisor process is
+// still the same process (PID+creation). Missing creation on supervised mounts
+// is fail-closed.
+func SupervisorIdentityAlive(snap StatusSnapshot) bool {
+	return processIdentityAlive(snap.SupervisorPID, snap.SupervisorCreation, true)
+}
+
+// WorkerIdentityAlive reports whether the recorded worker process is still the
+// same process (PID+creation). Missing creation is fail-closed.
+func WorkerIdentityAlive(snap StatusSnapshot) bool {
+	return processIdentityAlive(snap.WorkerPID, snap.WorkerCreation, true)
+}
+
+// EnsureAction is the pure decision for `drive9 mount ensure` (testable).
+type EnsureAction string
+
+const (
+	EnsureAlreadyHealthy EnsureAction = "already_healthy"
+	EnsureAdopt          EnsureAction = "adopt"
+	EnsureRemount        EnsureAction = "remount"
+)
+
+// DecideEnsureAction chooses adopt / remount / no-op from status + flags.
+// Identity is always PID+creation; missing creation fails closed so a reused
+// PID cannot skip adopt after supervisor death.
+func DecideEnsureAction(snap StatusSnapshot, restart bool) EnsureAction {
+	if restart || !snap.Healthy {
+		return EnsureRemount
+	}
+	if SupervisorIdentityAlive(snap) {
+		return EnsureAlreadyHealthy
+	}
+	if WorkerIdentityAlive(snap) {
+		return EnsureAdopt
+	}
+	return EnsureRemount
 }
 
 func CollectStatus(mountPoint string) StatusSnapshot {
@@ -1098,7 +1162,9 @@ func CollectStatus(mountPoint string) StatusSnapshot {
 		snap.Supervised = true
 		snap.State = st.State
 		snap.SupervisorPID = st.PID
+		snap.SupervisorCreation = st.CreationTime
 		snap.WorkerPID = st.WorkerPID
+		snap.WorkerCreation = st.WorkerCreation
 		snap.Restarts = st.RestartCount
 		snap.LastExitCode = st.LastExitCode
 		snap.LastExitReason = st.LastExitReason
@@ -1110,12 +1176,22 @@ func CollectStatus(mountPoint string) StatusSnapshot {
 	if ps, _, err := mountstate.ReadProcessState(mountPoint); err == nil {
 		if snap.SupervisorPID == 0 && ps.SupervisorPID > 0 {
 			snap.SupervisorPID = ps.SupervisorPID
+			snap.SupervisorCreation = ps.SupervisorCreationTime
+		} else if snap.SupervisorPID > 0 && snap.SupervisorCreation == 0 {
+			if ps.SupervisorPID == snap.SupervisorPID && ps.SupervisorCreationTime > 0 {
+				snap.SupervisorCreation = ps.SupervisorCreationTime
+			} else if ps.Role == mountstate.RoleSupervisor && ps.PID == snap.SupervisorPID {
+				snap.SupervisorCreation = ps.CreationTime
+			}
 		}
 		if snap.WorkerPID == 0 {
 			if ps.WorkerPID > 0 {
 				snap.WorkerPID = ps.WorkerPID
 			} else if ps.Role != mountstate.RoleSupervisor {
 				snap.WorkerPID = ps.PID
+				if snap.WorkerCreation == 0 {
+					snap.WorkerCreation = ps.CreationTime
+				}
 			}
 		}
 		if snap.LogPath == "" {
@@ -1156,10 +1232,10 @@ func CollectStatus(mountPoint string) StatusSnapshot {
 			snap.State = "running"
 		}
 	}
-	// Dead supervisor with healthy local endpoint is not fully supervised.
-	if snap.SupervisorPID > 0 && !processAlive(snap.SupervisorPID, 0) {
-		// Soft signal for ensure: keep Healthy for IO but mark state.
-		if snap.State == "running" {
+	// Dead/reused supervisor with healthy local endpoint is not fully supervised.
+	// Use PID+creation (fail closed when creation missing).
+	if snap.SupervisorPID > 0 && !processIdentityAlive(snap.SupervisorPID, snap.SupervisorCreation, true) {
+		if snap.State == "running" || snap.State == mountstate.SupervisorStateRunning {
 			snap.State = "orphan_worker"
 		}
 	}
@@ -1192,5 +1268,3 @@ func WorkerArgsFromSanitized(sanitized []string) []string {
 	}
 	return out
 }
-
-

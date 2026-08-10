@@ -72,8 +72,47 @@ func probeMountLocalHealthOnce(mountPoint string) error {
 }
 
 // ActiveMountPoint reports whether path is currently an active mount.
+// Unbounded: may hang on a wedged FUSE endpoint. Prefer
+// ActiveMountPointBounded for supervisor cleanup / ensure paths.
 func ActiveMountPoint(path string) (bool, error) {
 	return activeMountPoint(path)
+}
+
+// cleanupActiveMountTimeout bounds Stat used by destructive cleanup.
+// Wedged FUSE daemons can block os.Stat indefinitely; cleanup must not.
+var cleanupActiveMountTimeout = 2 * time.Second
+
+// activeMountProbe is the underlying active-mount check. Tests inject hangs.
+var activeMountProbe = activeMountPoint
+
+// ActiveMountPointBounded is ActiveMountPoint with a hard timeout for cleanup
+// and recovery paths that must not stall on a wedged FUSE endpoint.
+func ActiveMountPointBounded(path string) (bool, error) {
+	return activeMountPointBounded(path)
+}
+
+func activeMountPointBounded(path string) (bool, error) {
+	type result struct {
+		active bool
+		err    error
+	}
+	// Capture probe in the caller goroutine so test cleanups that restore
+	// activeMountProbe cannot race a still-running timed-out probe goroutine.
+	probe := activeMountProbe
+	timeout := cleanupActiveMountTimeout
+	ch := make(chan result, 1)
+	go func() {
+		// A timeout abandons this goroutine; if the underlying Stat is wedged
+		// it may leak until the endpoint recovers (same tradeoff as health probes).
+		a, e := probe(path)
+		ch <- result{a, e}
+	}()
+	select {
+	case r := <-ch:
+		return r.active, r.err
+	case <-time.After(timeout):
+		return false, fmt.Errorf("active mount check timed out after %s", timeout)
+	}
 }
 
 // ForceUnmount force-unmounts a FUSE mountpoint (graceful-death path).
@@ -148,13 +187,14 @@ func EnsureCleanMountpoint(mountPoint string) (cleaned bool, err error) {
 	if mountPoint == "" {
 		return false, fmt.Errorf("empty mountpoint")
 	}
-	active, activeErr := activeMountPoint(mountPoint)
+	// Always use the bounded probe: cleanup is on the supervisor critical path
+	// and must not hang forever on a wedged FUSE stat(2).
+	active, activeErr := activeMountPointBounded(mountPoint)
 	if activeErr != nil {
 		if os.IsNotExist(activeErr) {
 			return false, nil
 		}
-		// Any non-NotExist stat failure on a (possibly dead) FUSE endpoint —
-		// ENOTCONN, EACCES after daemon SIGKILL, EIO, etc. — needs lazy detach.
+		// Timeout, ENOTCONN, EACCES after daemon SIGKILL, EIO, etc. — detach.
 		forceUnmountLazy(mountPoint)
 		if stillBroken := mountStillNeedsClean(mountPoint); stillBroken {
 			return true, fmt.Errorf("force unmount did not clear broken mountpoint %s: %v", mountPoint, activeErr)
@@ -221,9 +261,9 @@ func ownerAlive(mountPoint string) bool {
 }
 
 func mountStillNeedsClean(mountPoint string) bool {
-	active, err := activeMountPoint(mountPoint)
+	active, err := activeMountPointBounded(mountPoint)
 	if err != nil {
-		// NotExist → clean. Any other error (including ENOTCONN) → still needs work.
+		// NotExist → clean. Timeout / ENOTCONN / other → still needs work.
 		return !os.IsNotExist(err)
 	}
 	return active
