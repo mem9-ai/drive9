@@ -1,0 +1,206 @@
+name: Publish migration image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-migration-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/drive9-ai/drive9-migration
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      build_time: ${{ steps.metadata.outputs.build_time }}
+      trace_tag: ${{ steps.metadata.outputs.trace_tag }}
+    steps:
+      - name: Require the main branch
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Migration images may only be published from main" >&2
+            exit 1
+          fi
+
+      - name: Resolve image metadata
+        id: metadata
+        shell: bash
+        run: |
+          trace_tag="${GITHUB_SHA:0:7}"
+          build_time="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          printf 'trace_tag=%s\n' "$trace_tag" >> "$GITHUB_OUTPUT"
+          printf 'build_time=%s\n' "$build_time" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs:
+      - metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            artifact: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            artifact: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.DRIVE9_AI_GHCR_USERNAME }}
+          password: ${{ secrets.DRIVE9_AI_GHCR_TOKEN }}
+
+      - name: Build and push platform digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.migration
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ needs.metadata.outputs.trace_tag }}
+            GIT_HASH=${{ github.sha }}
+            GIT_BRANCH=${{ github.ref_name }}
+            BUILD_TIME=${{ needs.metadata.outputs.build_time }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=drive9-migration
+            org.opencontainers.image.description=Drive9 EBS migration worker
+            org.opencontainers.image.source=https://github.com/mem9-ai/drive9
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.metadata.outputs.trace_tag }}
+            org.opencontainers.image.created=${{ needs.metadata.outputs.build_time }}
+
+      - name: Smoke test published platform image
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Build did not produce a valid image digest" >&2
+            exit 1
+          fi
+          docker run --rm --platform "$PLATFORM" "$IMAGE@$DIGEST" --help
+
+      - name: Export digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          digest="${DIGEST#sha256:}"
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${digest}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-digest-${{ matrix.artifact }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs:
+      - metadata
+      - build
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+      reference: ${{ steps.manifest.outputs.reference }}
+      tag: ${{ needs.metadata.outputs.trace_tag }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.DRIVE9_AI_GHCR_USERNAME }}
+          password: ${{ secrets.DRIVE9_AI_GHCR_TOKEN }}
+
+      - name: Download platform digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: migration-digest-*
+          merge-multiple: true
+
+      - name: Create and verify manifest list
+        id: manifest
+        shell: bash
+        env:
+          TRACE_TAG: ${{ needs.metadata.outputs.trace_tag }}
+        run: |
+          shopt -s nullglob
+          digest_files=(/tmp/digests/*)
+          if ((${#digest_files[@]} != 2)); then
+            echo "Expected two platform digests, found ${#digest_files[@]}" >&2
+            exit 1
+          fi
+
+          sources=()
+          for digest_file in "${digest_files[@]}"; do
+            digest="${digest_file##*/}"
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Invalid platform digest: $digest" >&2
+              exit 1
+            fi
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+
+          image_ref="${IMAGE}:${TRACE_TAG}"
+          docker buildx imagetools create -t "$image_ref" "${sources[@]}"
+
+          raw_manifest="${RUNNER_TEMP}/drive9-migration-manifest-raw.json"
+          image_metadata="${RUNNER_TEMP}/drive9-migration-manifest.json"
+          docker buildx imagetools inspect "$image_ref" --raw > "$raw_manifest"
+          docker buildx imagetools inspect "$image_ref" \
+            --format '{{json .}}' > "$image_metadata"
+
+          jq -e '
+            [.manifests[]
+              | select(.platform.os == "linux")
+              | .platform.architecture]
+            | unique
+            | sort == ["amd64", "arm64"]
+          ' "$raw_manifest" >/dev/null
+
+          image_digest="$(jq -er '
+            .manifest.digest | select(test("^sha256:[0-9a-f]{64}$"))
+          ' "$image_metadata")"
+          printf 'digest=%s\n' "$image_digest" >> "$GITHUB_OUTPUT"
+          printf 'reference=%s@%s\n' "$IMAGE" "$image_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Report published image
+        shell: bash
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+          REFERENCE: ${{ steps.manifest.outputs.reference }}
+          TRACE_TAG: ${{ needs.metadata.outputs.trace_tag }}
+        run: |
+          {
+            printf '### Published Drive9 Migration image\n\n'
+            printf -- "- Source commit: \`%s\`\n" "$GITHUB_SHA"
+            printf -- "- Tag: \`%s:%s\`\n" "$IMAGE" "$TRACE_TAG"
+            printf -- "- Digest: \`%s\`\n" "$DIGEST"
+            printf -- "- Immutable reference: \`%s\`\n\n" "$REFERENCE"
+            printf '> First publication creates a private GHCR package. '
+            printf 'A drive9-ai owner must change its visibility to Public once.\n'
+          } >> "$GITHUB_STEP_SUMMARY"

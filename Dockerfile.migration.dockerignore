@@ -1,0 +1,11 @@
+**
+!Makefile
+!go.mod
+!go.sum
+!cmd/
+!cmd/drive9-migration/
+!cmd/drive9-migration/**
+!internal/
+!internal/**
+!pkg/
+!pkg/**
