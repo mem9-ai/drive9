@@ -161,6 +161,41 @@ func TestCheckpointPhaseAdvanceRejectsRollbackAndIdentityMismatch(t *testing.T) 
 	}
 }
 
+func TestCheckpointCutoverRequestRequiresDualWriteAndDoesNotAdvanceActualPhase(t *testing.T) {
+	store, fake, startup := newCheckpointFixture(t)
+	startup.Phase = PhaseCutoverReady
+	if _, err := store.Recover(context.Background(), startup); !errors.Is(err, ErrCheckpointMismatch) || !errors.Is(err, ErrInvalidPhase) {
+		t.Fatalf("fresh cutover request error=%v", err)
+	}
+	fake.mu.Lock()
+	if fake.writes != 0 {
+		t.Fatalf("fresh cutover request wrote %d checkpoints", fake.writes)
+	}
+	fake.mu.Unlock()
+
+	startup.Phase = PhaseSyncing
+	if _, err := store.Recover(context.Background(), startup); err != nil {
+		t.Fatal(err)
+	}
+	startup.Phase = PhaseCutoverReady
+	if _, err := store.Recover(context.Background(), startup); !errors.Is(err, ErrCheckpointMismatch) || !errors.Is(err, ErrInvalidPhase) {
+		t.Fatalf("SYNCING cutover request error=%v", err)
+	}
+
+	startup.Phase = PhaseDualWriteRepairing
+	if _, err := store.Recover(context.Background(), startup); err != nil {
+		t.Fatal(err)
+	}
+	startup.Phase = PhaseCutoverReady
+	recovery, err := store.Recover(context.Background(), startup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery.Record.Checkpoint.HighestPhase != PhaseDualWriteRepairing || recovery.State.Snapshot().Phase != PhaseDualWriteRepairing || !recovery.WritesAllowed || !recovery.DeepRecoveryRequired {
+		t.Fatalf("cutover request recovery=%+v", recovery)
+	}
+}
+
 func TestCheckpointStaleCASFailsClosed(t *testing.T) {
 	store, fake, startup := newCheckpointFixture(t)
 	recovery, err := store.Recover(context.Background(), startup)

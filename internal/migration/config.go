@@ -259,7 +259,7 @@ func ReadStartupPhase(configPath, environmentValue string, highestApplied Phase)
 		value = strings.TrimSpace(string(body))
 	}
 	desired := Phase(value)
-	if desired != PhaseSyncing && desired != PhaseDualWriteRepairing {
+	if desired != PhaseSyncing && desired != PhaseDualWriteRepairing && desired != PhaseCutoverReady {
 		return "", fmt.Errorf("%w: unsupported startup value %q", ErrInvalidPhase, value)
 	}
 	if highestApplied != "" && phaseRank(highestApplied) == 0 {

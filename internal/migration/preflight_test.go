@@ -421,7 +421,8 @@ func TestPreflightAllowsNonEmptyTargetOnlyForMatchingCheckpoint(t *testing.T) {
 	defer server.Close()
 
 	startup := preflightStartup(t, server.URL, root)
-	body, err := json.Marshal(checkpointFromStartup(startup))
+	checkpoint := checkpointFromStartup(startup)
+	body, err := json.Marshal(checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,9 +439,21 @@ func TestPreflightAllowsNonEmptyTargetOnlyForMatchingCheckpoint(t *testing.T) {
 	if err != nil || result.TargetEmpty || !result.RecoveryControlPresent {
 		t.Fatalf("T0 rollout restart preflight=%+v err=%v", result, err)
 	}
+	startup.Phase = PhaseCutoverReady
+	if _, err := preflightWithVerifier(context.Background(), startup, func(string, string) (bool, error) { return true, nil }); !errors.Is(err, ErrPreflight) || !errors.Is(err, ErrInvalidPhase) || !strings.Contains(err.Error(), "DUAL_WRITE_REPAIRING") {
+		t.Fatalf("cutover request from SYNCING error=%v", err)
+	}
+	checkpoint.HighestPhase = PhaseDualWriteRepairing
+	checkpointBody, err = json.Marshal(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err = preflightWithVerifier(context.Background(), startup, func(string, string) (bool, error) { return true, nil })
+	if err != nil || result.TargetEmpty || !result.RecoveryControlPresent {
+		t.Fatalf("cutover rollout restart preflight=%+v err=%v", result, err)
+	}
 	startup.Phase = PhaseSyncing
 
-	checkpoint := checkpointFromStartup(startup)
 	checkpoint.ConfigHash = "other-config"
 	checkpointBody, err = json.Marshal(checkpoint)
 	if err != nil {

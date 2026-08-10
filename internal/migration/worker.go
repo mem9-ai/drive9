@@ -502,6 +502,16 @@ func (w *Worker) Run(ctx context.Context) error {
 		w.reporter.start(reporterCtx)
 		defer func() { cancel(); w.reporter.wait() }()
 	}
+	if w.startup != nil && w.startup.Phase == PhaseCutoverReady {
+		if err := w.runRequestedCutover(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return newWorkerRunError(err)
+		}
+		<-ctx.Done()
+		return nil
+	}
 	recovered := w.state.Snapshot().RecoveryComplete
 	attempt := 0
 	var blockedAt time.Time
@@ -557,6 +567,53 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
+}
+
+func (w *Worker) runRequestedCutover(ctx context.Context) error {
+	if err := w.controlGate.Acquire(ctx); err != nil {
+		return err
+	}
+	defer w.controlGate.Release()
+	if err := w.recoverRequestedCutoverLocked(ctx); err != nil {
+		return err
+	}
+	if _, err := w.verifyFullLocked(ctx); err != nil {
+		return err
+	}
+	_, err := w.prepareCutoverLocked(ctx)
+	return err
+}
+
+func (w *Worker) recoverRequestedCutoverLocked(ctx context.Context) error {
+	attempt := 0
+	var blockedAt time.Time
+	for !w.state.Snapshot().RecoveryComplete {
+		err := w.DeepRecovery(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if isAuthError(err) {
+			if refreshErr := w.refreshClientLocked(ctx); refreshErr != nil {
+				w.state.SetAttention(true)
+			}
+		} else if !retryableWorkerError(err) {
+			w.state.SetAttention(true)
+			return err
+		}
+		if blockedAt.IsZero() {
+			blockedAt = w.clock()
+		} else if w.clock().Sub(blockedAt) >= attentionAfter {
+			w.state.SetAttention(true)
+		}
+		if err := w.waitForRetry(ctx, retryDelay(attempt, maxRetryDelay)); err != nil {
+			return err
+		}
+		attempt++
+	}
+	return nil
 }
 
 type workerRunError struct {

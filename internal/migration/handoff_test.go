@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	sampleConfigPath = "../../docs/examples/drive9-migration/config.yaml"
-	runbookPath      = "../../docs/guides/drive9-migration-v1-runbook.md"
+	sampleConfigPath     = "../../docs/examples/drive9-migration/config.yaml"
+	kubernetesSamplePath = "../../docs/examples/drive9-migration/kubernetes.yaml"
+	runbookPath          = "../../docs/guides/drive9-migration-v1-runbook.md"
 )
 
 func TestOperatorSampleSupportsBothLayoutsAndContainsNoCredential(t *testing.T) {
@@ -53,9 +54,32 @@ func TestPlanHandoffSchemaIsNonSensitiveAndRunbookCoversAcceptedWorkflow(t *test
 		t.Fatal(err)
 	}
 	text := string(runbook)
-	for _, required := range []string{"T0", "T1", "T2", "ConfigMap", "rollout-restart", "verify-full", "prepare-drive9-cutover", "post-T0", "residue", "metadata", "per Job", "residual ABA", "one mounted, read-only EBS Source per Job", "no rollback", "exact per-Job control directory"} {
+	for _, required := range []string{"T0", "T1", "T2", "ConfigMap", "rollout-restart", "verify-full", "prepare-drive9-cutover", "post-T0", "residue", "metadata", "per Job", "residual ABA", "one mounted, read-only EBS Source per Job", "no rollback", "exact per-Job control directory", "kubectl-drive9-migration", "expected_job_ids_json", ".worker_status.fence_complete == true", "fsGroup", "recursively change Source ownership"} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("runbook omitted %q", required)
 		}
+	}
+}
+
+func TestKubernetesSampleMatchesPluginAndRestrictedRootContract(t *testing.T) {
+	body, err := os.ReadFile(kubernetesSamplePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, required := range []string{
+		"app.kubernetes.io/component: worker",
+		"app.kubernetes.io/instance: single-pvc-trial",
+		"- name: drive9-migration",
+		"allowPrivilegeEscalation: false",
+		"readOnlyRootFilesystem: true",
+		"capabilities:\n              drop:\n                - ALL",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("Kubernetes sample omitted %q", required)
+		}
+	}
+	if strings.Count(text, "runAsUser: 0") != 2 || strings.Count(text, "runAsGroup: 0") != 2 {
+		t.Fatalf("Kubernetes sample must apply the documented root exception to plan and Worker")
 	}
 }

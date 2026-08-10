@@ -192,6 +192,9 @@ func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string
 			return PreflightResult{}, fmt.Errorf("%w: checkpoint: %w: requested phase rollback", ErrPreflight, ErrCheckpointMismatch)
 		}
 	}
+	if startup.Phase == PhaseCutoverReady && (!recoveryControlPresent || phaseRank(checkpoint.Checkpoint.HighestPhase) < phaseRank(PhaseDualWriteRepairing)) {
+		return PreflightResult{}, fmt.Errorf("%w: %w: checkpoint: %w: CUTOVER_READY requires an existing DUAL_WRITE_REPAIRING checkpoint", ErrPreflight, ErrInvalidPhase, ErrCheckpointMismatch)
+	}
 	entries, err := api.ListCtx(ctx, listPath(startup.Job.Target.Prefix))
 	if err != nil && !client.IsNotFound(err) {
 		return PreflightResult{}, fmt.Errorf("%w: target listing: %w", ErrPreflight, err)
