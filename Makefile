@@ -13,6 +13,7 @@ GOARCH ?= $(HOST_GOARCH)
 APP_NAME ?= drive9-server
 CLI_NAME ?= drive9
 MIGRATION_NAME ?= drive9-migration
+KUBE_PLUGIN_NAME ?= kubectl-drive9-migration
 LOCAL_SERVER_NAME ?= drive9-server-local
 
 BIN_DIR ?= bin
@@ -23,6 +24,7 @@ DIST_DIR ?= dist
 SERVER_BIN ?= $(BIN_DIR)/$(APP_NAME)
 CLI_BIN ?= $(BIN_DIR)/$(CLI_NAME)
 MIGRATION_BIN ?= $(BIN_DIR)/$(MIGRATION_NAME)
+KUBE_PLUGIN_BIN ?= $(BIN_DIR)/$(KUBE_PLUGIN_NAME)
 LOCAL_SERVER_BIN ?= $(BIN_DIR)/$(LOCAL_SERVER_NAME)
 
 VERSION ?=
@@ -32,6 +34,7 @@ BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 MIGRATION_TARGETS ?= linux/amd64 linux/arm64
+KUBE_PLUGIN_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 
 GOLANGCI_LINT_VERSION ?= v2.5.0
 GOLANGCI_LINT_BIN ?= $(BIN_DIR)/golangci-lint
@@ -53,7 +56,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release build-migration build-migration-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
@@ -147,6 +150,10 @@ build-migration:
 	mkdir -p $(dir $(MIGRATION_BIN))
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(MIGRATION_BIN) ./cmd/drive9-migration
 
+build-migration-kube-plugin:
+	mkdir -p $(dir $(KUBE_PLUGIN_BIN))
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(KUBE_PLUGIN_BIN) ./cmd/kubectl-drive9-migration
+
 build-migration-release:
 	@set -euo pipefail; \
 	mkdir -p $(DIST_DIR); \
@@ -158,6 +165,22 @@ build-migration-release:
 		$(MAKE) --no-print-directory build-migration GOOS="$$os" GOARCH="$$arch" MIGRATION_BIN="$$out" VERSION="$(VERSION)"; \
 	done; \
 	cd $(DIST_DIR) && sha256sum $(MIGRATION_NAME)-* > migration-checksums.txt
+
+build-migration-kube-plugin-release:
+	@set -euo pipefail; \
+	mkdir -p $(DIST_DIR); \
+	for target in $(KUBE_PLUGIN_TARGETS); do \
+		os="$${target%/*}"; \
+		arch="$${target#*/}"; \
+		ext=""; \
+		if [ "$$os" = "windows" ]; then \
+			ext=".exe"; \
+		fi; \
+		out="$(DIST_DIR)/$(KUBE_PLUGIN_NAME)-$${os}-$${arch}$$ext"; \
+		echo "Building $$(basename "$$out")..."; \
+		$(MAKE) --no-print-directory build-migration-kube-plugin GOOS="$$os" GOARCH="$$arch" KUBE_PLUGIN_BIN="$$out" VERSION="$(VERSION)"; \
+	done; \
+	cd $(DIST_DIR) && sha256sum $(KUBE_PLUGIN_NAME)-* > migration-kube-plugin-checksums.txt
 
 build-cli-release:
 	@set -euo pipefail; \
