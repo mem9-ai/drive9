@@ -283,6 +283,46 @@ func TestDiffHardlinkIdentityIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestDiffTreatsFullyObservedTargetOnlyHardlinkAsDeleteWork(t *testing.T) {
+	checksum := strings.Repeat("a", 64)
+	source := map[string]SourceEntry{
+		"/a": {Path: "/a", Kind: EntryRegular, Version: SourceVersion{Kind: EntryRegular, Size: 1}, Mode: 0o644, ChecksumSHA256: checksum},
+	}
+	target := map[string]TargetEntry{
+		"/a":     {Path: "/a", Kind: EntryRegular, Size: 1, Mode: 0o644, HasMode: true, Revision: 1, ResourceID: "shared", Nlink: 2, ChecksumSHA256: checksum},
+		"/stale": {Path: "/stale", Kind: EntryRegular, Size: 1, Mode: 0o644, HasMode: true, Revision: 1, ResourceID: "shared", Nlink: 2, ChecksumSHA256: checksum},
+	}
+
+	if findings := diffSnapshots(source, target); !hasFindingAt(findings, "/a", FindingIdentity) {
+		t.Fatalf("strict target-only alias findings=%+v", findings)
+	}
+	findings := diffSnapshotsWithTargetOnlyLinks(source, target, true)
+	if len(findings) != 1 || !hasFindingAt(findings, "/stale", FindingTargetOnly) || hasFindingAt(findings, "/a", FindingIdentity) {
+		t.Fatalf("fully observed stale alias findings=%+v", findings)
+	}
+
+	for path, entry := range target {
+		entry.Nlink = 3
+		target[path] = entry
+	}
+	findings = diffSnapshotsWithTargetOnlyLinks(source, target, true)
+	if !hasFindingAt(findings, "/a", FindingIdentity) || !hasFindingAt(findings, "/stale", FindingTargetOnly) {
+		t.Fatalf("unobserved external alias findings=%+v", findings)
+	}
+
+	for path, entry := range target {
+		entry.Nlink = 2
+		if path == "/stale" {
+			entry.Revision = 0
+		}
+		target[path] = entry
+	}
+	findings = diffSnapshotsWithTargetOnlyLinks(source, target, true)
+	if !hasFindingAt(findings, "/a", FindingIdentity) {
+		t.Fatalf("unsafe stale alias delete findings=%+v", findings)
+	}
+}
+
 func TestTargetScannerRejectsEscapingServerName(t *testing.T) {
 	fixture := &inventoryFixture{directories: map[string][]client.FileInfo{"/data": {{Name: "../escape"}}}, stats: map[string]client.BatchStatResult{}}
 	result, err := newTargetScannerFixture(t, fixture, "/data").Scan(context.Background(), nil)

@@ -383,6 +383,35 @@ func newDualWorker(t *testing.T, root string, target *memoryTarget, grace time.D
 	return worker, server
 }
 
+func TestSyncingDeletesStaleHardlinkAliasAndConverges(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := &memoryTarget{nodes: map[string]memoryTargetNode{
+		"a": {data: []byte("content"), revision: 1, mode: 0o100644, resourceID: "shared"},
+		"b": {data: []byte("content"), revision: 1, mode: 0o100644, resourceID: "shared"},
+	}}
+	worker, server := newRoundWorker(t, root, target)
+	defer server.Close()
+
+	if err := worker.DeepRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	_, primaryExists := target.nodes["a"]
+	_, staleExists := target.nodes["b"]
+	writes := target.writes
+	target.mu.Unlock()
+	if !primaryExists || staleExists || writes != 1 {
+		t.Fatalf("target primary=%v stale=%v writes=%d", primaryExists, staleExists, writes)
+	}
+	snapshot := worker.State()
+	if !snapshot.RecoveryComplete || !snapshot.Current.Converged || !snapshot.Conditions.ReadyForRollout || snapshot.Conditions.Attention {
+		t.Fatalf("stale hardlink alias recovery=%+v", snapshot)
+	}
+}
+
 func TestWorkerCarvesOutReservedControlPrefixEveryRound(t *testing.T) {
 	root := t.TempDir()
 	control := filepath.Join(root, strings.TrimPrefix(ControlPrefix, "/"))

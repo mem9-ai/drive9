@@ -125,7 +125,7 @@ func (e *ApplyEngine) ApplyWithManifest(ctx context.Context, source, manifest ma
 			}
 		}
 	}
-	ownedLinks := targetOwnedLinkCounts(manifest, target)
+	ownedLinks := targetAccountedLinkCounts(manifest, target, e.config.Phase == PhaseSyncing)
 	if err := e.applyFilePools(ctx, files, target, ownedLinks); err != nil {
 		return err
 	}
@@ -142,7 +142,7 @@ func (e *ApplyEngine) ApplyWithManifest(ctx context.Context, source, manifest ma
 		}
 		target[entry.Path] = TargetEntry{Path: entry.Path, Kind: EntryRegular, Size: stat.Size, Mode: stat.Mode & 0o777, HasMode: true, Revision: stat.Revision, ResourceID: stat.ResourceID, Nlink: stat.Nlink, ChecksumSHA256: stat.ChecksumSHA256}
 	}
-	ownedLinks = targetOwnedLinkCounts(manifest, target)
+	ownedLinks = targetAccountedLinkCounts(manifest, target, e.config.Phase == PhaseSyncing)
 	for _, entry := range links {
 		if err := e.applyLink(ctx, entry, manifest, target, primaries, ownedLinks); err != nil {
 			return err
