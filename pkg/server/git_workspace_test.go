@@ -13,6 +13,7 @@ import (
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
@@ -172,6 +173,43 @@ func TestGitWorkspaceDeleteWithoutIndexIsOK(t *testing.T) {
 	}
 	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
 		t.Fatalf("DeleteGitWorkspace without index: %v", err)
+	}
+}
+
+func TestGitWorkspaceDeleteIndexFailureStillReturns200(t *testing.T) {
+	// Soft-delete is the durable state; index is an arming hint. A permanent
+	// index parse failure must not turn DELETE into 500/EIO for the caller.
+	s := newTestServer(t)
+	ensureGitWorkspaceSchema(t, s)
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+
+	c := client.New(ts.URL, "")
+	ctx := context.Background()
+	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo-bad-idx/",
+		RepoURL:    "https://example.test/repo-bad-idx.git",
+		RemoteName: "origin",
+		HeadCommit: "4444444444444444444444444444444444444444",
+	})
+	if err != nil {
+		t.Fatalf("UpsertGitWorkspace: %v", err)
+	}
+	writeGitWorkspaceIndexForTest(t, s, []byte("{"))
+
+	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
+		t.Fatalf("DeleteGitWorkspace with bad index: %v (want 200)", err)
+	}
+	got, err := s.fallback.Store().GetGitWorkspace(ctx, ws.WorkspaceID)
+	if err != nil {
+		t.Fatalf("GetGitWorkspace after DELETE: %v", err)
+	}
+	if got.Status != datastore.GitWorkspaceStatusDeleted {
+		t.Fatalf("workspace status = %q, want %q", got.Status, datastore.GitWorkspaceStatusDeleted)
+	}
+	// Idempotent retry still 200 (cleanup re-attempted, still fails parse, still 200).
+	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
+		t.Fatalf("DeleteGitWorkspace retry: %v", err)
 	}
 }
 

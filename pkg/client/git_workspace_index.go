@@ -188,12 +188,9 @@ func (c *Client) mutateGitWorkspaceIndex(ctx context.Context, mut func(*GitWorks
 		}
 		// expectedRevision: 0 = must not exist (create); positive = exact CAS.
 		// ReadGitWorkspaceIndex returns (nil, 0) on 404 → create with expected 0.
+		// rev == 0 is create-only; if a concurrent create won, the write conflicts → retry.
 		// Do not re-Stat here: that opens a lost-update window after concurrent create.
 		expected := rev
-		if expected == 0 {
-			// create-only; if concurrent create won, write fails with conflict → retry.
-			expected = 0
-		}
 		_, err = c.WriteCtxConditionalWithRevision(ctx, GitWorkspaceIndexPath, body, expected)
 		if err == nil {
 			return nil

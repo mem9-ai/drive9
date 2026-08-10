@@ -77,6 +77,10 @@ func TestLocalArmSignalTriggersList(t *testing.T) {
 	if err := gitcache.MarkWorkspaceRegistered(context.Background(), localRoot, "ws-new"); err != nil {
 		t.Fatal(err)
 	}
+	// Clear dormant throttle so the post-marker op re-scans (window is 250ms).
+	fs.git.mu.Lock()
+	fs.git.localArmScanAt = time.Time{}
+	fs.git.mu.Unlock()
 	// Next path op should arm + list once.
 	_, _, _ = fs.gitWorkspaceForPath(context.Background(), "/x")
 	if got := listCalls.Load(); got != 1 {
@@ -86,6 +90,94 @@ func TestLocalArmSignalTriggersList(t *testing.T) {
 	_, _, _ = fs.gitWorkspaceForPath(context.Background(), "/y")
 	if got := listCalls.Load(); got != 1 {
 		t.Fatalf("list calls after second op = %d, want 1 (no empty poll)", got)
+	}
+}
+
+func TestDormantLocalArmScanThrottled(t *testing.T) {
+	// Busy dormant mounts must not re-scan arm markers on every FS op.
+	var listCalls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/git-workspaces" {
+			listCalls.Add(1)
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(srv.URL), opts)
+
+	// Prime one scan while dormant.
+	_, _, _ = fs.gitWorkspaceForPath(context.Background(), "/a")
+	fs.git.mu.Lock()
+	firstScan := fs.git.localArmScanAt
+	fs.git.mu.Unlock()
+	if firstScan.IsZero() {
+		t.Fatal("localArmScanAt not set after first dormant lookup")
+	}
+	for i := 0; i < 50; i++ {
+		_, _, _ = fs.gitWorkspaceForPath(context.Background(), "/a")
+	}
+	fs.git.mu.Lock()
+	secondScan := fs.git.localArmScanAt
+	armed := fs.git.armed
+	fs.git.mu.Unlock()
+	if !secondScan.Equal(firstScan) {
+		t.Fatalf("localArmScanAt advanced under throttle: first=%v second=%v", firstScan, secondScan)
+	}
+	if armed {
+		t.Fatal("armed while dormant under throttle")
+	}
+	if got := listCalls.Load(); got != 0 {
+		t.Fatalf("list calls = %d, want 0", got)
+	}
+}
+
+func TestDormantArmMissesMarkerInsideThrottleWindow(t *testing.T) {
+	// Accepted trade-off: same-LocalRoot --fast may miss until the throttle window
+	// elapses; after that the next op arms. Deterministic via timestamp rewind.
+	var listCalls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/git-workspaces" && r.Method == http.MethodGet {
+			listCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"workspaces": []any{}})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	localRoot := t.TempDir()
+	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(srv.URL), opts)
+
+	// Prime dormant scan.
+	_, _, _ = fs.gitWorkspaceForPath(context.Background(), "/x")
+	if err := gitcache.MarkWorkspaceRegistered(context.Background(), localRoot, "ws-new"); err != nil {
+		t.Fatal(err)
+	}
+	// Immediate op stays inside the throttle window → still dormant.
+	if _, _, ok := fs.gitWorkspaceForPath(context.Background(), "/x"); ok {
+		t.Fatal("expected miss inside dormant throttle window after marker write")
+	}
+	if fs.gitWorkspacesArmed() {
+		t.Fatal("armed inside throttle window; want delayed arm")
+	}
+	if got := listCalls.Load(); got != 0 {
+		t.Fatalf("list calls inside window = %d, want 0", got)
+	}
+	// Simulate window elapsed without sleeping.
+	fs.git.mu.Lock()
+	fs.git.localArmScanAt = time.Now().Add(-2 * gitWorkspaceLocalArmScanInterval)
+	fs.git.mu.Unlock()
+	_, _, _ = fs.gitWorkspaceForPath(context.Background(), "/x")
+	if !fs.gitWorkspacesArmed() {
+		t.Fatal("expected armed after throttle window elapsed")
+	}
+	if got := listCalls.Load(); got != 1 {
+		t.Fatalf("list calls after window = %d, want 1", got)
 	}
 }
 

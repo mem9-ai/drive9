@@ -179,7 +179,7 @@ Crash between steps 1–3 is recovered by re-running the command. Step 1 is **no
 rolled back when step 2 fails (deleting the registration would orphan tree/state
 and is worse than a missing index hint). **Delete path:** server `DELETE
 /v1/git-workspaces/{id}` soft-deletes the row and CAS-updates the remote index
-in the same request; index failure returns 5xx so the client can retry.
+in the same request; index cleanup is best-effort in the same request (failure logged, DELETE still returns 200); convergence via client best-effort Remove and idempotent DELETE retries.
 DELETE is idempotent (already-deleted row still runs index cleanup) so repair is
 convergent. CLI/FUSE may best-effort double-remove the index entry after a
 successful DELETE and still finish local cleanup independently.
@@ -202,6 +202,8 @@ else → miss (no list)
 ```
 
 While unarmed, forbid: `ListGitWorkspaces`, tree, overlay, git-state APIs; forbid force-list solely because the path contains `.git`.
+
+Local arm marker scans are throttled (250ms) in both dormant and armed states so busy never-`--fast` mounts do not pay per-op `ReadFile`/`ReadDir` of arm markers. Same-LocalRoot live `--fast` arms on the first FS op after that window; cross-host discovery uses the remote index + SSE, not unthrottled local rescans. Next-op local arm after the throttle window is a product requirement (not optional latency).
 
 ### 6.2 Mount-time remote index
 
@@ -276,7 +278,7 @@ No `reindex` user command. If the DB already has workspaces but no index yet:
 3. Index is existence-only; runtime is List/Get only.
 4. Index path is tenant-absolute; filter by RemoteRoot.
 5. CLI: index + local armed before success/hydrate; failure fails the whole command.
-6. Workspace delete must update the remote index durably on the server (CAS); clients may best-effort double-remove. Partial delete+index failure is retryable/convergent (DELETE is idempotent).
+6. Workspace delete soft-deletes the row and best-effort CAS-updates the remote index on the server (index failure logged, DELETE still 200); clients dual-write Remove. DELETE is idempotent so index cleanup can converge on retry.
 7. List/arm singleflight + failure backoff; force does not bypass the backoff gate—use sticky re-issue.
 8. While DORMANT, `.git` paths must not force-list.
 9. No forced hiding of `/.drive9/`.

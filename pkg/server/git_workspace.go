@@ -364,22 +364,23 @@ func (s *Server) handleGitWorkspaceDelete(w http.ResponseWriter, r *http.Request
 	// Soft-delete is idempotent for convergent repair: NotFound means the row
 	// is already non-live, but a prior attempt may have left index cleanup pending.
 	// Mixed-version notes:
-	// - New server + old client: server owns durable index cleanup; client may
-	//   still best-effort Remove on the FS path (idempotent if already cleaned).
+	// - New server + old client: server attempts index cleanup; client may still
+	//   best-effort Remove on the FS path (idempotent if already cleaned).
 	// - New server + missing index file: Stat NotFound → no-op (safe).
 	// - Second DELETE after success: row NotFound still runs index cleanup → 200.
+	// Index cleanup failure is logged, not surfaced: the soft-deleted row is the
+	// durable state; the index is only an arming hint.
 	if err := store.DeleteGitWorkspace(r.Context(), workspaceID); err != nil && !errors.Is(err, datastore.ErrNotFound) {
 		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
-	// Durable index maintenance is server-owned so CLI/FUSE cannot leave other
-	// armed mounts serving a stale index after workspace delete succeeds.
+	// Best-effort index maintenance: do not turn a successful soft-delete into
+	// 500/EIO (user-facing rmdir will not retry). Convergence via client
+	// dual-write Remove and idempotent DELETE retries that re-run cleanup.
 	if err := removeGitWorkspaceIndexEntry(r.Context(), b, workspaceID); err != nil {
 		logger.Error(r.Context(), "git_workspace_index_cleanup_failed",
 			eventFields(r.Context(), "git_workspace_index_cleanup_failed",
 				"workspace_id", workspaceID, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, "failed to update git workspace index after delete")
-		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})

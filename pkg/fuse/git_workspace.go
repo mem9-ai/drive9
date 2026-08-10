@@ -377,12 +377,16 @@ func (fs *Dat9FS) tryArmFromLocalSignals() (armed bool, forceReload bool) {
 	}
 	now := time.Now()
 	fs.git.mu.Lock()
-	// When already armed, throttle directory stats on the hot path.
-	// When dormant, always re-scan so a just-written marker is not missed
-	// inside the throttle window.
-	if fs.git.armed && !fs.git.localArmScanAt.IsZero() && now.Sub(fs.git.localArmScanAt) < gitWorkspaceLocalArmScanInterval {
+	// Throttle local marker scans on the hot path in BOTH dormant and armed
+	// states. Unthrottled dormant rescans turn every lookup/getattr/readdir into
+	// ReadFile+ReadDir of arm markers — a busy never-`--fast` mount would pay
+	// thousands of local syscalls/sec. Cost: same-LocalRoot live `--fast` arms
+	// on the first op after the window (≤gitWorkspaceLocalArmScanInterval);
+	// cross-host discovery relies on SSE + the remote index, not per-op rescans.
+	if !fs.git.localArmScanAt.IsZero() && now.Sub(fs.git.localArmScanAt) < gitWorkspaceLocalArmScanInterval {
+		armed := fs.git.armed
 		fs.git.mu.Unlock()
-		return true, false
+		return armed, false
 	}
 	lastGen := fs.git.localArmGen
 	wasArmed := fs.git.armed
@@ -4627,15 +4631,15 @@ func (fs *Dat9FS) removeGitWorkspaceRoot(ctx context.Context, rt *gitWorkspaceRu
 	}
 	wsID := rt.workspace.WorkspaceID
 	// Version skew:
-	// - New server: DELETE soft-deletes + CAS-updates the remote index; failure
-	//   returns 5xx so we do not report OK while other mounts keep a stale index.
-	// - Old server: DELETE only soft-deletes the row; client must still try
-	//   RemoveGitWorkspaceIndexEntry below (best-effort).
+	// - New server: DELETE soft-deletes + best-effort index cleanup (failure
+	//   logged, still 200). Client Remove below is the immediate dual-write
+	//   convergence path and covers old servers that never touch the index.
+	// - Old server: DELETE only soft-deletes the row; client Remove required.
 	if err := fs.client.DeleteGitWorkspace(ctx, wsID); err != nil {
 		return httpToFuseStatus(err)
 	}
-	// Always attempt client-side index remove for old servers / dual-write period.
-	// On new servers the entry is already gone → idempotent no-op / CAS no-op.
+	// Always attempt client-side index remove: required on old servers; covers
+	// new-server cleanup failure; idempotent when the entry is already gone.
 	if err := fs.client.RemoveGitWorkspaceIndexEntry(ctx, wsID); err != nil {
 		safeLogPrintf("git workspace index remove after delete workspace=%s: %v", wsID, err)
 	}

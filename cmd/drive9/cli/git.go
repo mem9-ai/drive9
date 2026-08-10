@@ -513,8 +513,8 @@ func gitWorktreeRemove(args []string) error {
 		}
 	}
 	// Version skew:
-	// - New server: DELETE soft-deletes + CAS-updates index; failure is retryable
-	//   (DELETE is idempotent and finishes index cleanup on retry).
+	// - New server: DELETE soft-deletes + best-effort index cleanup (still 200 on
+	//   index failure); client Remove below is dual-write / immediate convergence.
 	// - Old server: DELETE only soft-deletes; client Remove below still required.
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
