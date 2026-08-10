@@ -1383,6 +1383,65 @@ func TestDualTargetOnlyResidueWarnsWithoutDelete(t *testing.T) {
 	}
 }
 
+func TestDualTargetOnlyHardlinkResidueWarnsWithoutDelete(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := &memoryTarget{nodes: map[string]memoryTargetNode{
+		"a": {data: []byte("content"), revision: 1, mode: 0o100644, resourceID: "shared"},
+		"b": {data: []byte("content"), revision: 1, mode: 0o100644, resourceID: "shared"},
+	}}
+	now := time.Now()
+	worker, server := newDualWorker(t, root, target, time.Minute, &now)
+	defer server.Close()
+
+	if err := worker.DeepRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := worker.State()
+	if !snapshot.Conditions.CurrentConverged || snapshot.Conditions.Attention || snapshot.LastComplete == nil ||
+		len(snapshot.LastComplete.Findings) != 1 || snapshot.LastComplete.Findings[0].Path != "/b" ||
+		snapshot.LastComplete.Findings[0].Kind != FindingTargetOnly || snapshot.LastComplete.Findings[0].Severity != SeverityWarning {
+		t.Fatalf("target-only hardlink recovery=%+v", snapshot)
+	}
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	if _, exists := target.nodes["b"]; !exists || target.writes != 0 {
+		t.Fatalf("target-only hardlink residue was mutated: %+v", target.nodes)
+	}
+}
+
+func TestDualTargetOnlyHardlinkResidueBlocksSharedContentRepair(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := &memoryTarget{nodes: map[string]memoryTargetNode{
+		"a": {data: []byte("old"), revision: 1, mode: 0o100644, resourceID: "shared"},
+		"b": {data: []byte("old"), revision: 1, mode: 0o100644, resourceID: "shared"},
+	}}
+	now := time.Now()
+	worker, server := newDualWorker(t, root, target, time.Minute, &now)
+	defer server.Close()
+
+	if err := worker.DeepRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	if err := worker.Round(context.Background(), RoundModeFast); !errors.Is(err, ErrUnsafeApply) {
+		t.Fatalf("shared-content repair error=%v", err)
+	}
+	if !worker.State().Conditions.Attention {
+		t.Fatal("unsafe shared-content repair did not raise attention")
+	}
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	if target.writes != 0 || string(target.nodes["a"].data) != "old" || string(target.nodes["b"].data) != "old" {
+		t.Fatalf("unsafe shared-content repair mutated target: writes=%d nodes=%+v", target.writes, target.nodes)
+	}
+}
+
 func TestDualTokenChangeRestartsGraceAndCASConflictRetries(t *testing.T) {
 	root := t.TempDir()
 	name := filepath.Join(root, "a")
