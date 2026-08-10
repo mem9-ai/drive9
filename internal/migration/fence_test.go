@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -83,6 +85,63 @@ func TestCutoverFenceSuccessDuplicateAndRestart(t *testing.T) {
 	restarted, err := NewWorker(context.Background(), startup)
 	if err != nil || restarted.recovery.WritesAllowed || restarted.State().Phase != PhaseCutoverReady || !restarted.fenceComplete.Load() {
 		t.Fatalf("restart=%+v err=%v", restarted, err)
+	}
+}
+
+func TestConfigMapCutoverRequestRunsFreshVerificationAndFence(t *testing.T) {
+	_, startup, _, server := newFenceWorker(t)
+	defer server.Close()
+	startup.Phase = PhaseCutoverReady
+
+	worker, err := NewWorker(context.Background(), startup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := worker.statusOutput()
+	if before.StartupPhase != PhaseCutoverReady || before.Phase != PhaseDualWriteRepairing || before.RecoveryComplete || before.Verification.Status != "" || before.FenceIntent || before.FenceComplete {
+		t.Fatalf("pre-cutover status=%+v", before)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	waitFor(t, worker.fenceComplete.Load)
+	after := worker.statusOutput()
+	if after.Phase != PhaseCutoverReady || after.StartupPhase != PhaseCutoverReady || after.Verification.Status != "passed" || !after.FenceIntent || !after.FenceComplete {
+		cancel()
+		<-done
+		t.Fatalf("automatic cutover status=%+v", after)
+	}
+	if _, err := worker.PrepareCutover(context.Background()); err != nil {
+		cancel()
+		<-done
+		t.Fatalf("manual cutover after automatic completion: %v", err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("automatic cutover Worker error=%v", err)
+	}
+}
+
+func TestConfigMapCutoverRequestFailsClosedWhenFreshVerificationFails(t *testing.T) {
+	_, startup, _, server := newFenceWorker(t)
+	defer server.Close()
+	if err := os.WriteFile(filepath.Join(startup.Job.Source.Root, "unsafe-mode"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	startup.Phase = PhaseCutoverReady
+
+	worker, err := NewWorker(context.Background(), startup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = worker.Run(context.Background())
+	if err == nil {
+		t.Fatal("automatic cutover succeeded after failed verification")
+	}
+	status := worker.statusOutput()
+	if status.Phase != PhaseDualWriteRepairing || status.Verification.Status != "failed" || status.FenceIntent || status.FenceComplete || !status.Conditions.Attention {
+		t.Fatalf("failed automatic cutover status=%+v error=%v", status, err)
 	}
 }
 

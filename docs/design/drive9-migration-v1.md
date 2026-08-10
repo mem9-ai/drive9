@@ -120,7 +120,7 @@ Delete/Rename primitive is scope expansion.
 | `INV-03` | A Job never reads, verifies, mutates, or deletes business data outside its Target Prefix. |
 | `INV-04` | EBS remains Migration's authority through T2. The business remains EBS-primary for reads until the cutover fence is complete for every Job. |
 | `INV-05` | The only V1 phases are `SYNCING`, `DUAL_WRITE_REPAIRING`, and `CUTOVER_READY`. T1 is not a phase. |
-| `INV-06` | Phase changes are explicit. Conditions never advance a phase automatically. |
+| `INV-06` | Phase requests are explicit. A startup `CUTOVER_READY` request runs verification and the fence protocol; conditions never advance a phase by themselves. |
 | `INV-07` | From T0 onward, Migration never calls Drive9 Delete or Rename. |
 | `INV-08` | Create uses Must-Not-Exist/expected Revision 0. Update uses the exact observed positive Revision. A conflict never falls back to an unconditional write. |
 | `INV-09` | An incomplete source scan never implies deletion and never produces Delete work. |
@@ -200,7 +200,7 @@ entire Tenant/Space.
 
 ~~~text
 Operator-managed Kubernetes
-  ConfigMap snapshot + Secret Volume + DaemonSet rollout + kubectl exec
+  ConfigMap snapshot + Secret Volume + DaemonSet rollout + optional kubectl exec
                                    |
                                    v
                          drive9-migration
@@ -315,8 +315,11 @@ Configuration rules:
 
 1. ConfigMap changes are not hot-loaded. Every change requires a DaemonSet
    rollout restart.
-2. `phase` accepts only `SYNCING` or `DUAL_WRITE_REPAIRING`.
-   `CUTOVER_READY` is reachable only through the local fence command.
+2. `phase` accepts `SYNCING`, `DUAL_WRITE_REPAIRING`, or `CUTOVER_READY`.
+   `CUTOVER_READY` is a startup request, not proof that the actual phase has
+   changed. It requires an existing `DUAL_WRITE_REPAIRING` Checkpoint and runs a
+   new deep recovery, full verification, and the same fence protocol used by
+   `prepare-drive9-cutover`.
 3. By default, phase is read from the file named `phase` beside the `-f`
    configuration file. `DRIVE9_MIGRATION_PHASE` MAY replace that file at
    startup. Supplying both sources, or neither source, is an error. API keys
@@ -331,10 +334,14 @@ Configuration rules:
    and API-key values.
 8. A recovered Job whose static configuration or Source/Target identity differs
    from its Checkpoint fails closed.
-9. Repeating the current phase is idempotent. Requesting a phase lower than the
-   highest applied phase is rejected.
+9. Repeating the current phase is idempotent. Before fence intent, requesting a
+   phase lower than the highest applied phase is rejected. Fence state never
+   regresses, regardless of a later ConfigMap rollback.
 10. The shared ConfigMap phase is a batch-wide desired startup phase, but each
     Worker applies it independently during rollout.
+11. A configured `CUTOVER_READY` request does not directly update
+    `highest_phase`. Actual phase remains `DUAL_WRITE_REPAIRING` until durable
+    Fence Intent and Fence Complete succeed.
 
 ### 5.4 Credentials
 
@@ -403,17 +410,22 @@ startup
   |
   +-- configured DUAL_WRITE_REPAIRING --------> DUAL_WRITE_REPAIRING
                                                    |
-                                                   | prepare-drive9-cutover
+  +-- configured CUTOVER_READY --------------------+ startup recovery +
+                                                   | verify-full + fence
+                                                   |
+                                                   | or prepare-drive9-cutover
                                                    v
                                              CUTOVER_READY
 ~~~
 
 At startup, the Worker loads the minimal Checkpoint, validates monotonicity,
-then conditionally applies the configured non-regressing phase. It may report
-that actual phase while the mandatory deep recovery round is still running,
-but every convergence condition remains false until recovery succeeds.
+then conditionally applies the configured non-regressing phase. A configured
+`CUTOVER_READY` value is handled specially: the Checkpoint must already be at
+least `DUAL_WRITE_REPAIRING`; the Worker keeps that actual phase, completes deep
+recovery and a fresh full verification, and only then executes the fence
+protocol. Every convergence condition remains false until recovery succeeds.
 `ReadyForRollout` and `Attention` are not startup gates. There is no phase
-watcher and no automatic phase transition.
+watcher; ConfigMap changes require a rollout restart.
 
 If a durable fence intent exists, recovery may only finish fencing. It may not
 resume a writable phase.
@@ -460,7 +472,7 @@ Condition rules:
 | T0-T1 | Old Pods write EBS; new Pods write EBS and Drive9; EBS remains read authority | Complete the rolling business deployment | Fast rounds, grace, stable-source checks, conditional Create/Update; no Delete/Rename |
 | T1 | Every business Pod is externally confirmed dual-write | Record T1 outside Migration; invoke `verify-full` once per Job | Phase remains `DUAL_WRITE_REPAIRING`; serialize a full verification after the current fast Round |
 | T1-T2 | Business remains EBS-primary and dual-writes Drive9 | Observe per-Job status and diff; the external operator chooses duration and T2 | Continue fast repair after full verification |
-| T2 | Prepare Drive9-only writes | Invoke `prepare-drive9-cutover` per Job; wait until all Jobs are `CUTOVER_READY`; then switch the business | Permanently fence Migration writes |
+| T2 | Prepare Drive9-only writes | Set ConfigMap phase to `CUTOVER_READY` and rollout restart the Migration DaemonSet, or invoke `prepare-drive9-cutover` per Job; use the external kube plugin to wait until all Jobs are actually `CUTOVER_READY` with `fence_complete=true`; then switch the business | Run fresh startup recovery and verification for the ConfigMap path, then permanently fence Migration writes |
 
 Migration cannot detect whether all business Pods are dual-write, cannot select
 T1 or T2, and cannot aggregate a batch decision. DaemonSet rollout and per-Job
@@ -754,13 +766,23 @@ Execution:
 `full_verification.status` is one of `pending`, `running`, `passed`, or
 `failed` for the current process. An overlapping request is rejected and a
 duplicate call after completion returns the current result. Restart discards
-the request and result; after the mandatory startup recovery round, the
-operator must invoke `verify-full` again before cutover.
+the request and result. A normal `DUAL_WRITE_REPAIRING` restart requires the
+operator to invoke `verify-full` again; a configured `CUTOVER_READY` startup
+request runs a fresh verification automatically after deep recovery.
 
 A passed result covers data only through its completion time. It does not prove
 T1, encode an observation interval, or choose T2.
 
 ### 11.2 `prepare-drive9-cutover`
+
+The fence protocol has two triggers:
+
+1. `prepare-drive9-cutover` explicitly invokes it against the running Worker.
+2. A rollout with startup phase `CUTOVER_READY` first completes deep recovery
+   and a fresh full verification, then invokes the same protocol internally.
+
+The explicit command remains supported and idempotent after automatic
+completion.
 
 Per-Job preconditions:
 
@@ -770,7 +792,7 @@ Per-Job preconditions:
 4. Latest in-memory `full_verification.status=passed`.
 5. No newer full-verification request is pending, running, or failed.
 
-The command does not verify external T1, business Pod state, or any other Job.
+Neither trigger verifies external T1, business Pod state, or any other Job.
 Those are external batch-level gates.
 
 Protocol:
@@ -840,12 +862,16 @@ Worker from regressing phase or fence state.
 ### 12.3 Recovery rules
 
 1. Load and validate the minimal Checkpoint before any business-data mutation.
-2. Reject immutable identity/config mismatch and requested phase rollback.
+2. Reject immutable identity/config mismatch, requested phase rollback, and a
+   `CUTOVER_READY` request without an existing `DUAL_WRITE_REPAIRING`
+   Checkpoint.
 3. If fence intent exists, keep writes disabled and only finish persisting the
    complete fence.
-4. Otherwise enter the configured non-regressing phase with every condition
-   false and complete one deep full recovery round before normal or fast
-   rounds and before any convergence claim.
+4. Otherwise enter configured `SYNCING` or `DUAL_WRITE_REPAIRING` with every
+   condition false. For a configured `CUTOVER_READY` request, restore actual
+   `DUAL_WRITE_REPAIRING` without advancing the Checkpoint. Complete one deep
+   full recovery round before normal or fast rounds, automatic verification, or
+   any convergence claim.
    Recovery completion requires a complete source/target observation, not
    convergence; blockers or grace candidates remain visible and keep the
    applicable condition false.
@@ -854,9 +880,11 @@ Worker from regressing phase or fence state.
    mismatch follows the current phase's normal CAS rules.
 6. In `DUAL_WRITE_REPAIRING`, derive a new in-memory
    `repair_mtime_floor` from the recovery Round. Restart every grace interval.
-7. Discard an interrupted `verify-full`; the operator invokes it again after
-   recovery. Before fence intent, an interrupted cutover command is retried by
-   the operator. After fence intent, recovery may only complete fencing.
+7. Discard an interrupted `verify-full`. A normal dual-write restart requires
+   another operator request; a configured `CUTOVER_READY` startup reruns it
+   automatically. Before fence intent, an interrupted explicit cutover command
+   is retried by the operator. After fence intent, recovery may only complete
+   fencing.
 8. A Checkpoint or target ownership conflict indicates a duplicate/stale
    Worker and fails closed with `Attention=true`.
 
@@ -1091,11 +1119,15 @@ acceptance must prove the following behavior.
 16. UDS permissions, bounds, deadlines, streaming, serialization, schema, and
     exit codes are tested.
 17. `verify-full` is serialized, unfiltered by mtime, in-memory only, and does
-    not change phase; restart requires the operator to invoke it again.
-18. Fence failures before and after intent prove the irreversible recovery
+    not change phase; a configured `CUTOVER_READY` startup runs a fresh
+    verification after restart.
+18. ConfigMap cutover cannot create a fresh Job, skip `SYNCING`, or directly
+    persist actual `CUTOVER_READY`. Automatic and explicit triggers produce the
+    same fence.
+19. Fence failures before and after intent prove the irreversible recovery
     split; no post-intent write is possible.
-19. Keys and file contents are absent from every forbidden sink.
-20. Existing binaries build unchanged; `drive9-migration` builds with
+20. Keys and file contents are absent from every forbidden sink.
+21. Existing binaries build unchanged; `drive9-migration` builds with
     `CGO_ENABLED=0` for Linux AMD64 and ARM64.
 
 No acceptance test may claim strict consistency, No Extras, maximum RPO,
@@ -1147,9 +1179,9 @@ the V1 implementation contract:
 4. Actual file count, logical bytes, change rate, largest file, and small-file
    distribution for each EBS.
 5. Whether EBS serial/by-id is readable in the Worker environment.
-6. Operator Runbook integration for ConfigMap update, DaemonSet restart,
-   per-Job status, external T1 recording, `verify-full`, and
-   `prepare-drive9-cutover`.
+6. Operator Runbook integration for ConfigMap updates at T0 and T2, DaemonSet
+   restart, per-Job status, external T1 recording, `verify-full`, optional
+   `prepare-drive9-cutover`, and the kube plugin's all-Job T2 gate.
 7. Validation that the business writer normally changes at least one mtime or
    Source Version Token field for Create, Update, metadata change, atomic
    replace, and Rename.
