@@ -25,19 +25,20 @@ import (
 
 // Client is the drive9 HTTP client.
 type Client struct {
-	baseURL            string
-	apiKey             string
-	actor              string // X-Dat9-Actor header value (per-mount ID)
-	httpClient         *http.Client
-	smallFileThreshold int64 // 0 means use DefaultSmallFileThreshold
+	baseURL               string
+	apiKey                string
+	actor                 string // X-Dat9-Actor header value (per-mount ID)
+	httpClient            *http.Client
+	smallFileThreshold    int64 // 0 means use DefaultSmallFileThreshold
+	multipartAbortTimeout time.Duration
 
 	// statusFetchMu serializes /v1/status fetches across concurrent callers
 	// so a transient warm failure can be retried but two callers never
-	// double-fetch. Set statusFetched only on a successful HTTP 200, so a
+	// double-fetch. Set statusBody only on a successful HTTP 200, so a
 	// timeout/5xx during warm never permanently caches "unknown" — the
 	// next caller will retry.
 	statusFetchMu sync.Mutex
-	statusFetched atomic.Bool
+	statusBody    atomic.Pointer[tenantStatusResponse]
 	// statusMax / statusInline are atomic so warmup goroutines and hot-path
 	// readers (commit queue, FUSE write decisions) coordinate without a
 	// mutex. Race detector previously caught this when FUSE's async warm
@@ -49,13 +50,59 @@ type Client struct {
 // tenantStatusResponse mirrors the server's TenantStatusResponse JSON shape.
 // Forward-compatible: unknown fields decode-and-ignore cleanly.
 type tenantStatusResponse struct {
-	Status          string `json:"status"`
-	MaxUploadBytes  int64  `json:"max_upload_bytes"`
-	InlineThreshold int64  `json:"inline_threshold,omitempty"`
+	Status                string                 `json:"status"`
+	MaxUploadBytes        int64                  `json:"max_upload_bytes"`
+	InlineThreshold       int64                  `json:"inline_threshold,omitempty"`
+	MigrationCapabilities *MigrationCapabilities `json:"migration_capabilities,omitempty"`
+}
+
+// MigrationCapabilities is the bounded Server contract. A missing object
+// means the Server predates Migration V1; individual false fields mean that
+// capability is unavailable on a Server that understands the contract.
+type MigrationCapabilities struct {
+	ChecksumRead      bool `json:"checksum_read"`
+	ChecksumComplete  bool `json:"checksum_complete"`
+	ConditionalCreate bool `json:"conditional_create"`
+	ConditionalUpdate bool `json:"conditional_update"`
+	EventIngest       bool `json:"event_ingest"`
+}
+
+// MigrationEvent is one post-grace conditional-write diagnostic event.
+type MigrationEvent struct {
+	EventID              string `json:"event_id"`
+	EmittedAt            string `json:"emitted_at"`
+	Phase                string `json:"phase"`
+	RoundID              string `json:"round_id"`
+	CASAttempt           int64  `json:"cas_attempt"`
+	FirstSeenAt          string `json:"first_seen_at"`
+	GraceSeconds         int64  `json:"grace_seconds"`
+	JobID                string `json:"job_id"`
+	VolumeID             string `json:"volume_id"`
+	NodeName             string `json:"node_name"`
+	PodName              string `json:"pod_name"`
+	SpaceID              string `json:"space_id"`
+	SourcePath           string `json:"source_path"`
+	TargetPath           string `json:"target_path"`
+	SourceVersionToken   string `json:"source_version_token"`
+	Size                 int64  `json:"size"`
+	Mtime                int64  `json:"mtime"`
+	SourceChecksumSHA256 string `json:"source_checksum_sha256"`
+	ResourceID           string `json:"resource_id"`
+	Revision             int64  `json:"revision"`
+	Drive9ChecksumSHA256 string `json:"drive9_checksum_sha256"`
+	ExpectedRevision     int64  `json:"expected_revision"`
+	Operation            string `json:"operation"`
+	Result               string `json:"result"`
+	ErrorClass           string `json:"error_class"`
+	LatencyMS            int64  `json:"latency_ms"`
 }
 
 // ErrConflict reports an HTTP 409 write conflict from the server.
 var ErrConflict = errors.New("conflict")
+
+// ErrMigrationUnsupported reports a successful status response from a Server
+// that does not expose the Migration V1 capability object.
+var ErrMigrationUnsupported = errors.New("migration unsupported")
 
 // StatusError preserves the HTTP status code for API errors.
 type StatusError struct {
@@ -166,8 +213,9 @@ func newClient(baseURL, credential string) *Client {
 		return baseDialer.DialContext(ctx, network, net.JoinHostPort(ips[0], port))
 	}
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		apiKey:  credential,
+		baseURL:               strings.TrimRight(baseURL, "/"),
+		apiKey:                credential,
+		multipartAbortTimeout: defaultMultipartAbortTimeout,
 		httpClient: &http.Client{
 			Transport: transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -219,6 +267,9 @@ type StatResult struct {
 	HasMode    bool // true when the server returned a mode header (including 0)
 	ResourceID string
 	Nlink      uint32
+	// ChecksumSHA256 is empty when the Server omitted the whole-file checksum.
+	// A valid checksum, including that of an empty file, is always non-empty.
+	ChecksumSHA256 string
 	// StorageType is the server-authoritative storage class (StorageTypeDB9
 	// or StorageTypeS3) from the X-Dat9-Storage-Type header. Empty when the
 	// server predates the header; callers must treat empty as "unknown" and
@@ -228,6 +279,12 @@ type StatResult struct {
 
 // MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
 const MaxBatchStatPaths = 256
+
+// BatchStatOptions controls optional BatchStat response fields.
+type BatchStatOptions struct {
+	// IncludeChecksum requests each file's persisted whole-file SHA-256.
+	IncludeChecksum bool
+}
 
 // MaxBatchReadSmallPaths is the maximum number of paths accepted by BatchReadSmallCtx.
 const MaxBatchReadSmallPaths = 128
@@ -254,6 +311,8 @@ type BatchStatResult struct {
 	HasMode    bool   `json:"hasMode"`
 	ResourceID string `json:"resource_id,omitempty"`
 	Nlink      uint32 `json:"nlink,omitempty"`
+	// ChecksumSHA256 is empty when checksum was not requested or unavailable.
+	ChecksumSHA256 string `json:"checksum_sha256,omitempty"`
 }
 
 // OK reports whether the per-path batch stat result is successful.
@@ -449,25 +508,34 @@ func (c *Client) CachedSmallFileThreshold() int64 {
 	return c.statusInline.Load()
 }
 
-// ensureTenantStatus fetches and caches /v1/status fields once per Client.
-// Failures cache as zero so callers fall back to local defaults instead of
-// retrying every request.
+// ensureTenantStatus is the compatibility warm path. Legacy getters
+// intentionally ignore the concrete error and keep their zero-value fallback;
+// Migration preflight uses tenantStatus directly and never ignores failures.
 func (c *Client) ensureTenantStatus(ctx context.Context) {
-	if c.statusFetched.Load() {
-		return
+	_, _ = c.tenantStatus(ctx)
+}
+
+// tenantStatus fetches and applies all status-backed Client settings as one
+// successful cache entry. Failed requests leave the cache empty and retryable.
+func (c *Client) tenantStatus(ctx context.Context) (tenantStatusResponse, error) {
+	if body := c.statusBody.Load(); body != nil {
+		return *body, nil
 	}
 	c.statusFetchMu.Lock()
 	defer c.statusFetchMu.Unlock()
-	if c.statusFetched.Load() {
-		return
+	if body := c.statusBody.Load(); body != nil {
+		return *body, nil
 	}
-	body, ok := c.fetchTenantStatus(ctx)
-	if !ok {
+	body, err := c.fetchTenantStatus(ctx)
+	if err != nil {
 		// Transient failure (timeout, 5xx, network). Don't mark fetched —
 		// a future Warm/MaxUploadBytes/SmallFileThreshold call will retry.
 		// Hot-path reads continue to fall back to compiled defaults until
 		// then.
-		return
+		return tenantStatusResponse{}, err
+	}
+	if body.MigrationCapabilities != nil && (body.MaxUploadBytes <= 0 || body.InlineThreshold <= 0) {
+		return tenantStatusResponse{}, fmt.Errorf("invalid tenant status: migration capabilities require positive max_upload_bytes and inline_threshold")
 	}
 	if body.MaxUploadBytes > 0 {
 		c.statusMax.Store(body.MaxUploadBytes)
@@ -478,27 +546,72 @@ func (c *Client) ensureTenantStatus(ctx context.Context) {
 	// Mark fetched even when the server omits inline_threshold (older
 	// build): that's an authoritative "no value", retrying won't help and
 	// hot paths should stop attempting status fetches every call.
-	c.statusFetched.Store(true)
+	c.statusBody.Store(&body)
+	return body, nil
 }
 
-func (c *Client) fetchTenantStatus(ctx context.Context) (tenantStatusResponse, bool) {
+func (c *Client) fetchTenantStatus(ctx context.Context) (tenantStatusResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/status", nil)
 	if err != nil {
-		return tenantStatusResponse{}, false
+		return tenantStatusResponse{}, fmt.Errorf("create tenant status request: %w", err)
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return tenantStatusResponse{}, false
+		return tenantStatusResponse{}, fmt.Errorf("fetch tenant status: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return tenantStatusResponse{}, false
+		return tenantStatusResponse{}, readError(resp)
 	}
 	var body tenantStatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return tenantStatusResponse{}, false
+	decoder := json.NewDecoder(resp.Body)
+	if err := decoder.Decode(&body); err != nil {
+		return tenantStatusResponse{}, fmt.Errorf("decode tenant status: %w", err)
 	}
-	return body, true
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return tenantStatusResponse{}, fmt.Errorf("decode tenant status trailing data: %w", err)
+	}
+	return body, nil
+}
+
+// GetMigrationCapabilities returns the exact Server Migration contract while
+// preserving concrete transport, status, context, and decode errors.
+func (c *Client) GetMigrationCapabilities(ctx context.Context) (MigrationCapabilities, error) {
+	body, err := c.tenantStatus(ctx)
+	if err != nil {
+		return MigrationCapabilities{}, fmt.Errorf("fetch migration capabilities: %w", err)
+	}
+	if body.MigrationCapabilities == nil {
+		return MigrationCapabilities{}, fmt.Errorf("%w: status omitted migration_capabilities", ErrMigrationUnsupported)
+	}
+	return *body.MigrationCapabilities, nil
+}
+
+// PostMigrationEvent sends one diagnostic event to the optional Server
+// endpoint. Reporting policy and non-blocking behavior belong to the Worker.
+func (c *Client) PostMigrationEvent(ctx context.Context, event MigrationEvent) error {
+	body, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("marshal migration event: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/migration/events", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create migration event request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return fmt.Errorf("post migration event: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("post migration event: %w", readError(resp))
+	}
+	return nil
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
@@ -664,11 +777,18 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 	}
 	resp, err := c.do(req)
 	if err != nil {
+		if expectedRevision >= 0 {
+			err = markCommitAttempt(err)
+		}
 		return 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
-		return 0, readError(resp)
+		err := readError(resp)
+		if expectedRevision >= 0 {
+			err = markCommitAttempt(err)
+		}
+		return 0, err
 	}
 	// Parse committed revision from response body.
 	var result struct {
@@ -753,6 +873,11 @@ func (c *Client) ListCtx(ctx context.Context, path string) ([]FileInfo, error) {
 // inside the corresponding BatchStatResult so one missing path does not fail
 // the whole batch.
 func (c *Client) BatchStatCtx(ctx context.Context, paths []string) ([]BatchStatResult, error) {
+	return c.BatchStatWithOptionsCtx(ctx, paths, BatchStatOptions{})
+}
+
+// BatchStatWithOptionsCtx returns lightweight metadata with optional fields.
+func (c *Client) BatchStatWithOptionsCtx(ctx context.Context, paths []string, opts BatchStatOptions) ([]BatchStatResult, error) {
 	if len(paths) == 0 {
 		return []BatchStatResult{}, nil
 	}
@@ -760,8 +885,9 @@ func (c *Client) BatchStatCtx(ctx context.Context, paths []string) ([]BatchStatR
 		return nil, fmt.Errorf("batch stat: %d paths exceeds limit of %d", len(paths), MaxBatchStatPaths)
 	}
 	body, err := json.Marshal(struct {
-		Paths []string `json:"paths"`
-	}{Paths: paths})
+		Paths           []string `json:"paths"`
+		IncludeChecksum bool     `json:"include_checksum,omitempty"`
+	}{Paths: paths, IncludeChecksum: opts.IncludeChecksum})
 	if err != nil {
 		return nil, err
 	}
@@ -942,6 +1068,7 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 	}
 	s.ResourceID = resp.Header.Get("X-Dat9-Resource-ID")
 	s.StorageType = StorageType(resp.Header.Get("X-Dat9-Storage-Type"))
+	s.ChecksumSHA256 = resp.Header.Get("X-Dat9-Checksum-SHA256")
 	if nlink := resp.Header.Get("X-Dat9-Nlink"); nlink != "" {
 		if n, err := strconv.ParseUint(nlink, 10, 32); err == nil {
 			s.Nlink = uint32(n)
