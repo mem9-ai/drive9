@@ -1656,6 +1656,10 @@ func applyFSLayerEntryMode(ctx context.Context, b *backendpkg.Dat9Backend, path 
 }
 
 func writeFSLayerStoreError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, datastore.ErrFSLayerInvalidArgument) {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if errors.Is(err, datastore.ErrNotFound) {
 		errJSON(w, http.StatusNotFound, "not found")
 		return

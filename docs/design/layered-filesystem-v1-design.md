@@ -236,6 +236,10 @@ fs_layer_checkpoints
 fs_layer_tags
 ```
 
+`layer_id` and `checkpoint_id` are UTF-8 strings limited to 64 bytes. A
+`layer_id` must not contain `:` because event IDs use `:` as their structural
+separator. Invalid identifiers are client errors and return HTTP 400.
+
 ### fs_layers
 
 `fs_layers` represents one agent session:
@@ -343,6 +347,9 @@ after_json
 idempotency_key
 created_at
 ```
+
+`event_id` is `VARCHAR(128)` so the longest valid 64-byte `layer_id` plus the
+rollback marker and sequence suffix always fits.
 
 ### fs_layer_checkpoints
 

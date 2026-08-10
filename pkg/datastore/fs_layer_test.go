@@ -4,8 +4,67 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 )
+
+func TestFSLayerIdentifierBoundaries(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for i, size := range []int{49, 50, 51, FSLayerIDMaxBytes} {
+		layerID := strings.Repeat(string(rune('a'+i)), size)
+		if err := s.CreateFSLayer(ctx, &FSLayer{LayerID: layerID, BaseRootPath: "/repo"}); err != nil {
+			t.Fatalf("CreateFSLayer %d bytes: %v", size, err)
+		}
+		if err := s.RollbackFSLayer(ctx, layerID); err != nil {
+			t.Fatalf("RollbackFSLayer %d bytes: %v", size, err)
+		}
+		events, err := s.ListFSLayerEvents(ctx, layerID, 0, 10)
+		if err != nil {
+			t.Fatalf("ListFSLayerEvents %d bytes: %v", size, err)
+		}
+		if len(events) != 1 || events[0].EventID != fmt.Sprintf("%s:rollback:1", layerID) {
+			t.Fatalf("events for %d-byte layer = %+v", size, events)
+		}
+	}
+
+	for _, layerID := range []string{
+		strings.Repeat("z", FSLayerIDMaxBytes+1),
+		strings.Repeat("界", 22),
+		"layer:invalid",
+	} {
+		err := s.CreateFSLayer(ctx, &FSLayer{LayerID: layerID, BaseRootPath: "/repo"})
+		if !errors.Is(err, ErrFSLayerInvalidArgument) {
+			t.Fatalf("CreateFSLayer %q err=%v, want ErrFSLayerInvalidArgument", layerID, err)
+		}
+	}
+}
+
+func TestFSLayerCheckpointIdentifierBoundaries(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateFSLayer(ctx, &FSLayer{LayerID: "layer-checkpoint-boundary", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+
+	checkpointID := strings.Repeat("c", FSLayerCheckpointIDMaxBytes)
+	if err := s.CreateFSLayerCheckpoint(ctx, &FSLayerCheckpoint{
+		CheckpointID: checkpointID,
+		LayerID:      "layer-checkpoint-boundary",
+	}); err != nil {
+		t.Fatalf("CreateFSLayerCheckpoint %d bytes: %v", FSLayerCheckpointIDMaxBytes, err)
+	}
+
+	err := s.CreateFSLayerCheckpoint(ctx, &FSLayerCheckpoint{
+		CheckpointID: strings.Repeat("c", FSLayerCheckpointIDMaxBytes+1),
+		LayerID:      "layer-checkpoint-boundary",
+	})
+	if !errors.Is(err, ErrFSLayerInvalidArgument) {
+		t.Fatalf("CreateFSLayerCheckpoint oversized err=%v, want ErrFSLayerInvalidArgument", err)
+	}
+}
 
 func TestFSLayerRoundTripAndState(t *testing.T) {
 	s := newTestStore(t)
