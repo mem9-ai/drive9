@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1
+
+FROM --platform=$BUILDPLATFORM golang:1.25.1-bookworm AS builder
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ARG VERSION=dev
+ARG GIT_HASH=unknown
+ARG GIT_BRANCH=unknown
+ARG BUILD_TIME=unknown
+
+WORKDIR /src
+
+COPY go.mod go.sum Makefile ./
+RUN go mod download
+
+COPY cmd/drive9-migration ./cmd/drive9-migration
+COPY internal ./internal
+COPY pkg ./pkg
+
+RUN make build-migration \
+    GOOS="${TARGETOS}" \
+    GOARCH="${TARGETARCH}" \
+    MIGRATION_BIN=/out/drive9-migration \
+    VERSION="${VERSION}" \
+    GIT_HASH="${GIT_HASH}" \
+    GIT_BRANCH="${GIT_BRANCH}" \
+    BUILD_TIME="${BUILD_TIME}" \
+ && go version -m /out/drive9-migration
+
+FROM scratch AS runtime
+
+ARG VERSION=dev
+ARG GIT_HASH=unknown
+ARG BUILD_TIME=unknown
+
+LABEL org.opencontainers.image.title="drive9-migration" \
+      org.opencontainers.image.description="Drive9 EBS migration worker" \
+      org.opencontainers.image.source="https://github.com/mem9-ai/drive9" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_HASH}" \
+      org.opencontainers.image.created="${BUILD_TIME}"
+
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/drive9-migration /drive9-migration
+
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/drive9-migration"]
