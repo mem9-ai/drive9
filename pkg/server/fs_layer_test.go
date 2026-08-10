@@ -47,6 +47,77 @@ func TestFSLayerRenameTargetPreservesSpaces(t *testing.T) {
 	}
 }
 
+func TestFSLayerAPIIdentifierBoundaries(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	for i, size := range []int{49, 50, 51, datastore.FSLayerIDMaxBytes} {
+		layerID := strings.Repeat(string(rune('a'+i)), size)
+		layer, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+			LayerID:      layerID,
+			BaseRootPath: "/repo",
+		})
+		if err != nil {
+			t.Fatalf("CreateFSLayer %d bytes: %v", size, err)
+		}
+		if layer.LayerID != layerID {
+			t.Fatalf("CreateFSLayer %d bytes returned id=%q", size, layer.LayerID)
+		}
+	}
+
+	auto, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{BaseRootPath: "/repo"})
+	if err != nil {
+		t.Fatalf("CreateFSLayer generated id: %v", err)
+	}
+	if auto.LayerID == "" || len(auto.LayerID) > datastore.FSLayerIDMaxBytes {
+		t.Fatalf("generated layer id = %q", auto.LayerID)
+	}
+
+	for _, tt := range []struct {
+		name    string
+		layerID string
+		message string
+	}{
+		{name: "oversized", layerID: strings.Repeat("z", datastore.FSLayerIDMaxBytes+1), message: "layer_id exceeds 64 bytes"},
+		{name: "colon", layerID: "layer:invalid", message: `layer_id must not contain ":"`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{LayerID: tt.layerID, BaseRootPath: "/repo"})
+			var statusErr *client.StatusError
+			if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+				t.Fatalf("CreateFSLayer err=%v, want HTTP 400", err)
+			}
+			if !strings.Contains(statusErr.Message, tt.message) {
+				t.Fatalf("CreateFSLayer message=%q, want %q", statusErr.Message, tt.message)
+			}
+		})
+	}
+
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-checkpoint-boundary",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer checkpoint boundary: %v", err)
+	}
+	checkpointID := strings.Repeat("c", datastore.FSLayerCheckpointIDMaxBytes)
+	if _, err := c.CheckpointFSLayer(ctx, "layer-checkpoint-boundary", client.FSLayerCheckpointRequest{CheckpointID: checkpointID}); err != nil {
+		t.Fatalf("CheckpointFSLayer %d bytes: %v", datastore.FSLayerCheckpointIDMaxBytes, err)
+	}
+	_, err = c.CheckpointFSLayer(ctx, "layer-checkpoint-boundary", client.FSLayerCheckpointRequest{
+		CheckpointID: strings.Repeat("c", datastore.FSLayerCheckpointIDMaxBytes+1),
+	})
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("CheckpointFSLayer oversized err=%v, want HTTP 400", err)
+	}
+	if !strings.Contains(statusErr.Message, "checkpoint_id exceeds 64 bytes") {
+		t.Fatalf("CheckpointFSLayer message=%q", statusErr.Message)
+	}
+}
+
 func TestFSLayerObjectPathPreservesTrailingControlWhitespace(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

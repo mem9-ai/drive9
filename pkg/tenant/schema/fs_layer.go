@@ -63,7 +63,7 @@ func FSLayerTiDBSchemaStatements() []string {
 		`CREATE INDEX idx_fs_layer_entries_op ON fs_layer_entries(layer_id, op)`,
 
 		`CREATE TABLE IF NOT EXISTS fs_layer_events (
-			event_id        VARCHAR(64) PRIMARY KEY,
+			event_id        VARCHAR(128) NOT NULL,
 			layer_id        VARCHAR(64) NOT NULL,
 			seq             BIGINT NOT NULL,
 			actor_id        VARCHAR(255) NOT NULL DEFAULT '',
@@ -72,7 +72,8 @@ func FSLayerTiDBSchemaStatements() []string {
 			before_json     JSON,
 			after_json      JSON,
 			idempotency_key VARCHAR(255) NOT NULL DEFAULT '',
-			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (event_id)
 		)`,
 		`CREATE UNIQUE INDEX uk_fs_layer_events_seq ON fs_layer_events(layer_id, seq)`,
 		`CREATE INDEX idx_fs_layer_events_created ON fs_layer_events(layer_id, created_at)`,
@@ -150,7 +151,7 @@ func FSLayerDB9SchemaStatements() []string {
 		`CREATE INDEX IF NOT EXISTS idx_fs_layer_entries_op ON fs_layer_entries(layer_id, op)`,
 
 		`CREATE TABLE IF NOT EXISTS fs_layer_events (
-			event_id        VARCHAR(64) PRIMARY KEY,
+			event_id        VARCHAR(128) NOT NULL,
 			layer_id        VARCHAR(64) NOT NULL,
 			seq             BIGINT NOT NULL,
 			actor_id        VARCHAR(255) NOT NULL DEFAULT '',
@@ -159,8 +160,10 @@ func FSLayerDB9SchemaStatements() []string {
 			before_json     JSONB,
 			after_json      JSONB,
 			idempotency_key VARCHAR(255) NOT NULL DEFAULT '',
-			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (event_id)
 		)`,
+		`ALTER TABLE IF EXISTS fs_layer_events ALTER COLUMN event_id TYPE VARCHAR(128)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uk_fs_layer_events_seq ON fs_layer_events(layer_id, seq)`,
 		`CREATE INDEX IF NOT EXISTS idx_fs_layer_events_created ON fs_layer_events(layer_id, created_at)`,
 

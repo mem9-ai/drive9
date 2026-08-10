@@ -18,6 +18,7 @@ type FSLayerEntryKind string
 
 var ErrFSLayerRefAmbiguous = errors.New("fs layer ref is ambiguous")
 var ErrFSLayerStateConflict = errors.New("fs layer state conflict")
+var ErrFSLayerInvalidArgument = errors.New("invalid fs layer argument")
 
 const (
 	FSLayerStateActive     FSLayerState = "active"
@@ -41,6 +42,9 @@ const (
 	FSLayerEntryKindFile    FSLayerEntryKind = "file"
 	FSLayerEntryKindDir     FSLayerEntryKind = "dir"
 	FSLayerEntryKindSymlink FSLayerEntryKind = "symlink"
+
+	FSLayerIDMaxBytes           = 64
+	FSLayerCheckpointIDMaxBytes = 64
 
 	// fsLayerEventOpRollback is the synthetic event op emitted into
 	// fs_layer_events when a layer is rolled back. It lets mounted FUSE
@@ -117,19 +121,13 @@ func (s *Store) CreateFSLayer(ctx context.Context, layer *FSLayer) error {
 	}
 	layer.LayerID = strings.TrimSpace(layer.LayerID)
 	if layer.LayerID == "" {
-		return fmt.Errorf("fs layer id is required")
+		return fmt.Errorf("%w: layer_id is required", ErrFSLayerInvalidArgument)
 	}
-	// fs_layer_events.event_id is VARCHAR(64) PRIMARY KEY. Normal upsert
-	// event_ids use "<layerID>:<seq>"; rollback event_ids use
-	// "<layerID>:rollback:<seq>" (9 chars longer). A layer_id near 64
-	// chars would overflow the PK on rollback, and a layer_id containing
-	// ":" could collide with another layer's rollback event_id. Reject
-	// both here so all event_id formats always fit the schema.
-	if len(layer.LayerID) > 50 {
-		return fmt.Errorf("fs layer id too long (%d chars, max 50)", len(layer.LayerID))
+	if len(layer.LayerID) > FSLayerIDMaxBytes {
+		return fmt.Errorf("%w: layer_id exceeds %d bytes", ErrFSLayerInvalidArgument, FSLayerIDMaxBytes)
 	}
 	if strings.Contains(layer.LayerID, ":") {
-		return fmt.Errorf("fs layer id must not contain \":\"")
+		return fmt.Errorf("%w: layer_id must not contain \":\"", ErrFSLayerInvalidArgument)
 	}
 	root, err := pathutil.CanonicalizeDir(layer.BaseRootPath)
 	if err != nil {
@@ -752,10 +750,13 @@ func (s *Store) CreateFSLayerCheckpoint(ctx context.Context, checkpoint *FSLayer
 	checkpoint.CheckpointID = strings.TrimSpace(checkpoint.CheckpointID)
 	checkpoint.LayerID = strings.TrimSpace(checkpoint.LayerID)
 	if checkpoint.CheckpointID == "" {
-		return fmt.Errorf("fs layer checkpoint id is required")
+		return fmt.Errorf("%w: checkpoint_id is required", ErrFSLayerInvalidArgument)
+	}
+	if len(checkpoint.CheckpointID) > FSLayerCheckpointIDMaxBytes {
+		return fmt.Errorf("%w: checkpoint_id exceeds %d bytes", ErrFSLayerInvalidArgument, FSLayerCheckpointIDMaxBytes)
 	}
 	if checkpoint.LayerID == "" {
-		return fmt.Errorf("fs layer id is required")
+		return fmt.Errorf("%w: layer_id is required", ErrFSLayerInvalidArgument)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
