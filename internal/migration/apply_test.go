@@ -230,6 +230,28 @@ func TestApplyRegularRejectsUnaccountedStableTargetNlinkBeforeWrite(t *testing.T
 	}
 }
 
+func TestApplySyncingDeletesFullyObservedTargetOnlyHardlinkAlias(t *testing.T) {
+	remote := &applyRemote{exists: true, revision: 7, resourceID: "resource-file", mode: 0o644, body: []byte("content"), nlink: 2}
+	server := httptest.NewServer(http.HandlerFunc(remote.handler))
+	defer server.Close()
+	scanner, source := newApplyFixture(t, "content")
+	checksum := sha256.Sum256([]byte("content"))
+	targetChecksum := hex.EncodeToString(checksum[:])
+	target := map[string]TargetEntry{
+		"/file":  {Path: "/file", Kind: EntryRegular, Size: 7, Mode: 0o644, HasMode: true, Revision: 7, ResourceID: "resource-file", Nlink: 2, ChecksumSHA256: targetChecksum},
+		"/stale": {Path: "/stale", Kind: EntryRegular, Size: 7, Mode: 0o644, HasMode: true, Revision: 7, ResourceID: "resource-file", Nlink: 2, ChecksumSHA256: targetChecksum},
+	}
+
+	if err := newTestApplyEngine(t, server, scanner, 1<<20).Apply(context.Background(), map[string]SourceEntry{"/file": source}, target); err != nil {
+		t.Fatal(err)
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if !containsOperation(remote.operations, "delete /stale") || containsOperationPrefix(remote.operations, "write ") {
+		t.Fatalf("stale hardlink alias operations=%v", remote.operations)
+	}
+}
+
 func TestApplyRegularRevalidatesTargetLinksImmediatelyBeforeWrite(t *testing.T) {
 	remote := &applyRemote{
 		exists: true, revision: 7, resourceID: "resource-file", mode: 0o644,

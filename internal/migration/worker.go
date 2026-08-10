@@ -326,7 +326,7 @@ func (w *Worker) Round(ctx context.Context, mode RoundMode) error {
 		w.state.FailRound(id, "scan")
 		return err
 	}
-	round, err := BuildRound(id, mode, started, source, target)
+	round, err := buildSyncRound(id, mode, started, source, target)
 	if err != nil {
 		w.state.FailRound(id, "inventory")
 		return err
@@ -358,7 +358,7 @@ func (w *Worker) Round(ctx context.Context, mode RoundMode) error {
 			w.state.FailRound(id, "reread")
 			return err
 		}
-		round, err = BuildRound(id, mode, started, source, target)
+		round, err = buildSyncRound(id, mode, started, source, target)
 		if err != nil {
 			w.state.FailRound(id, "reread")
 			return err

@@ -211,6 +211,14 @@ func targetRemotePath(prefix, logical string, directory bool) string {
 
 // BuildRound creates diff work only from two complete namespace observations.
 func BuildRound(id string, mode RoundMode, started time.Time, source ScanResult, target TargetScan) (Round, error) {
+	return buildRound(id, mode, started, source, target, false)
+}
+
+func buildSyncRound(id string, mode RoundMode, started time.Time, source ScanResult, target TargetScan) (Round, error) {
+	return buildRound(id, mode, started, source, target, true)
+}
+
+func buildRound(id string, mode RoundMode, started time.Time, source ScanResult, target TargetScan, includeTargetOnlyLinks bool) (Round, error) {
 	round := Round{ID: id, Mode: mode, StartedAt: started}
 	if !source.Complete || !target.Complete {
 		return round, ErrIncompleteInventory
@@ -219,7 +227,7 @@ func BuildRound(id string, mode RoundMode, started time.Time, source ScanResult,
 	round.CompletedAt = time.Now()
 	round.Source = source.Entries
 	round.Target = target.Entries
-	round.Findings = append(append([]Finding(nil), source.Findings...), diffSnapshots(source.Entries, target.Entries)...)
+	round.Findings = append(append([]Finding(nil), source.Findings...), diffSnapshotsWithTargetOnlyLinks(source.Entries, target.Entries, includeTargetOnlyLinks)...)
 	sort.Slice(round.Findings, func(i, j int) bool {
 		if round.Findings[i].Path == round.Findings[j].Path {
 			return round.Findings[i].Kind < round.Findings[j].Kind
@@ -237,9 +245,13 @@ func BuildRound(id string, mode RoundMode, started time.Time, source ScanResult,
 }
 
 func diffSnapshots(source map[string]SourceEntry, target map[string]TargetEntry) []Finding {
+	return diffSnapshotsWithTargetOnlyLinks(source, target, false)
+}
+
+func diffSnapshotsWithTargetOnlyLinks(source map[string]SourceEntry, target map[string]TargetEntry, includeTargetOnlyLinks bool) []Finding {
 	findings := make([]Finding, 0)
 	seen := make(map[string]struct{})
-	ownedLinks := targetOwnedLinkCounts(source, target)
+	ownedLinks := targetAccountedLinkCounts(source, target, includeTargetOnlyLinks)
 	add := func(path string, kind FindingKind) {
 		key := path + "\x00" + string(kind)
 		if _, exists := seen[key]; exists {
@@ -323,15 +335,51 @@ func targetLinkSourceOwner(entry SourceEntry) string {
 	return "path:" + entry.Path
 }
 
-func targetOwnedLinkCounts(source map[string]SourceEntry, target map[string]TargetEntry) map[targetLinkOwner]uint32 {
+type targetResourceLinks struct {
+	owner string
+	paths uint32
+	nlink uint32
+	safe  bool
+}
+
+func targetAccountedLinkCounts(source map[string]SourceEntry, target map[string]TargetEntry, includeTargetOnly bool) map[targetLinkOwner]uint32 {
 	counts := make(map[targetLinkOwner]uint32)
+	resources := make(map[string]targetResourceLinks)
 	for path, targetEntry := range target {
-		sourceEntry, exists := source[path]
-		if !exists || sourceEntry.Kind != EntryRegular || targetEntry.Kind != EntryRegular || targetEntry.ResourceID == "" {
+		if targetEntry.ResourceID == "" {
 			continue
 		}
-		key := targetLinkOwner{source: targetLinkSourceOwner(sourceEntry), resource: targetEntry.ResourceID}
+		resource, exists := resources[targetEntry.ResourceID]
+		if !exists {
+			resource.safe = true
+		}
+		resource.paths++
+		if targetEntry.Kind != EntryRegular || targetEntry.Revision <= 0 || targetEntry.Nlink == 0 || resource.nlink != 0 && resource.nlink != targetEntry.Nlink {
+			resource.safe = false
+		} else {
+			resource.nlink = targetEntry.Nlink
+		}
+		sourceEntry, exists := source[path]
+		if !exists || sourceEntry.Kind != EntryRegular || targetEntry.Kind != EntryRegular {
+			resources[targetEntry.ResourceID] = resource
+			continue
+		}
+		owner := targetLinkSourceOwner(sourceEntry)
+		if resource.owner == "" {
+			resource.owner = owner
+		} else if resource.owner != owner {
+			resource.safe = false
+		}
+		key := targetLinkOwner{source: owner, resource: targetEntry.ResourceID}
 		counts[key]++
+		resources[targetEntry.ResourceID] = resource
+	}
+	if includeTargetOnly {
+		for resourceID, resource := range resources {
+			if resource.safe && resource.owner != "" && resource.paths == resource.nlink {
+				counts[targetLinkOwner{source: resource.owner, resource: resourceID}] = resource.paths
+			}
+		}
 	}
 	return counts
 }
