@@ -228,6 +228,58 @@ func TestSupervisedReadyStateMatches(t *testing.T) {
 	}
 }
 
+func TestCleanupSupervisedReadyTimeoutIgnoresStaleWorker(t *testing.T) {
+	// Stale SupervisorState for a different generation must not authorize worker kill.
+	// We assert the pure generation gate + that cleanup does not panic / does not
+	// require matching worker identity when generation mismatches.
+	self := os.Getpid()
+	ct, err := mountstate.ProcessCreationTime(self)
+	if err != nil || ct == 0 {
+		t.Skip("platform has no process creation metadata")
+	}
+	stale := mountstate.SupervisorState{
+		PID:            self,
+		CreationTime:   ct,
+		WorkerPID:      self,
+		WorkerCreation: ct,
+	}
+	// Foreign supervisor PID (not self) → generation mismatch.
+	if supervisorStateMatchesGeneration(stale, self+1, ct) {
+		t.Fatal("stale state must not match foreign supervisor generation")
+	}
+	// Matching generation but missing worker creation → ready false (fail closed).
+	noWorkerCT := stale
+	noWorkerCT.WorkerCreation = 0
+	if supervisedReadyStateMatches(noWorkerCT, self, ct) {
+		t.Fatal("missing worker creation must fail closed for ready")
+	}
+	// cleanupSupervisedReadyTimeout with foreign pid must not treat stale as ours.
+	mp := t.TempDir()
+	if err := mountstate.WriteSupervisorState(mp, stale); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+	// Use a dead foreign PID so we never signal ourselves as the "supervisor".
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	foreign := cmd.ProcessState.Pid()
+	if foreign == self || processAliveImpl(foreign) {
+		t.Skip("need a dead foreign pid")
+	}
+	// Should not kill self (stale worker identity) because generation does not match foreign.
+	cleanupSupervisedReadyTimeout(mp, foreign, ct+999)
+	// Stale state should remain (generation mismatch → not cleared as our generation).
+	if _, _, err := mountstate.ReadSupervisorState(mp); err != nil {
+		t.Fatalf("stale foreign-generation state should not be cleared: %v", err)
+	}
+	// Self still alive.
+	if !processAliveImpl(self) {
+		t.Fatal("cleanup must not have killed the test process")
+	}
+}
+
 func TestWaitForSupervisedMountReadyIgnoresStaleState(t *testing.T) {
 	mp := t.TempDir()
 	self := os.Getpid()

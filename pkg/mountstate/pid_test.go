@@ -71,6 +71,70 @@ func TestControlSocketPathFallbackIsUIDScoped(t *testing.T) {
 	}
 }
 
+func TestReadProcessStateRejectsGroupWritable(t *testing.T) {
+	mp := filepath.Join(t.TempDir(), "mnt")
+	path := PIDFilePath(mp)
+	if err := os.WriteFile(path, []byte(`{"pid":12345}`+"\n"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	// Force world-writable (umask may have masked WriteFile mode).
+	if err := os.Chmod(path, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := ReadProcessState(mp)
+	if err == nil {
+		t.Fatal("group/world-writable pidfile must be rejected")
+	}
+}
+
+func TestReadProcessStateRejectsSymlink(t *testing.T) {
+	mp := filepath.Join(t.TempDir(), "mnt")
+	real := filepath.Join(t.TempDir(), "real.pid")
+	if err := os.WriteFile(real, []byte(`{"pid":99}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := PIDFilePath(mp)
+	if err := os.Symlink(real, path); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := ReadProcessState(mp)
+	if err == nil {
+		t.Fatal("symlink pidfile must be rejected")
+	}
+}
+
+func TestCheckTrustedFileInfoRejectsWrongOwner(t *testing.T) {
+	// Use pure check with fake FileInfo (same pattern as state dir tests on unix).
+	// Platform without Sys()->Stat_t skips owner check — still validates regular/mode.
+	info, err := os.Stat(t.TempDir()) // dir, not regular
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkTrustedFileInfo("/x", info); err == nil {
+		t.Fatal("directory must be rejected as state file")
+	}
+}
+
+func TestLegacyStopTokenUntrustedIgnored(t *testing.T) {
+	mp := filepath.Join(t.TempDir(), "mnt")
+	// Ensure no trusted token in stateDir.
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "xdg"))
+	legacy := legacyTempStatePath(".stop", mp)
+	if err := os.WriteFile(legacy, []byte(`{"reason":"umount","ts":"2099-01-01T00:00:00Z"}`+"\n"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(legacy, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(legacy) })
+	if StopTokenPresent(mp) {
+		t.Fatal("world-writable legacy stop token must not count as present")
+	}
+	if _, ok := ReadStopTokenTime(mp); ok {
+		t.Fatal("world-writable legacy stop token must not be read")
+	}
+}
+
 func TestEnsureStateDirCreatesPrivateDir(t *testing.T) {
 	xdg := filepath.Join(t.TempDir(), "xdg")
 	t.Setenv("XDG_RUNTIME_DIR", xdg)

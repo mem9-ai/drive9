@@ -42,10 +42,10 @@ func WriteExitReason(mountPoint string, rec ExitReason) error {
 
 func ReadExitReason(mountPoint string) (ExitReason, string, error) {
 	path := ExitReasonPath(mountPoint)
-	data, err := os.ReadFile(path)
+	data, err := readTrustedFile(path)
 	if err != nil && os.IsNotExist(err) {
 		legacy := legacyTempStatePath(".exit.json", mountPoint)
-		if b, lerr := os.ReadFile(legacy); lerr == nil {
+		if b, lerr := readTrustedFile(legacy); lerr == nil {
 			data, path, err = b, legacy, nil
 		}
 	}

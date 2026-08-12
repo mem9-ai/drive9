@@ -90,6 +90,13 @@ func stateDir() string {
 	return controlSocketDir(currentUID())
 }
 
+// EnsureStateDir creates and validates the UID-scoped state directory used for
+// supervisor lock/state/stop/exit files. Callers that open lock files must use
+// this instead of raw MkdirAll so squatted/wrong-owner dirs fail closed.
+func EnsureStateDir() error {
+	return ensureStateDir()
+}
+
 func ensureStateDir() error {
 	dir := stateDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -108,6 +115,11 @@ func validateStateDir(dir string) error {
 	}
 	if err := checkStateDirInfo(dir, info); err != nil {
 		return err
+	}
+	// POSIX mode bits are not meaningful on Windows (dirs report 0777);
+	// only enforce 0700 repair when the platform exposes POSIX UIDs.
+	if _, ok := stateDirOwnerUID(info); !ok {
+		return nil
 	}
 	if info.Mode().Perm() != 0o700 {
 		if err := os.Chmod(dir, 0o700); err != nil {
@@ -136,6 +148,51 @@ func checkStateDirInfo(dir string, info os.FileInfo) error {
 	return nil
 }
 
+// readTrustedFile reads a regular file only when it is owned by the current
+// user (when the platform exposes UIDs) and is not group/world-writable.
+// Symlinks and non-regular files are rejected so bare /tmp or legacy paths
+// cannot be used as a forged trust root for identity / stop intent.
+func readTrustedFile(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTrustedFileInfo(path, info); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
+}
+
+// checkTrustedFileInfo is the pure ownership/mode gate for identity state files.
+func checkTrustedFileInfo(path string, info os.FileInfo) error {
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("state file %s: symlink not allowed", path)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("state file %s: not a regular file (mode %s)", path, info.Mode())
+	}
+	uid, hasUID := stateDirOwnerUID(info)
+	if hasUID && uid != os.Getuid() {
+		return fmt.Errorf("state file %s: owned by uid %d, want %d", path, uid, os.Getuid())
+	}
+	// Reject group/world-writable files on POSIX (sticky /tmp squat). On
+	// Windows, writable files report mode 0666 and owner UIDs are unavailable;
+	// skip the mode gate there (mirrors stateDirOwnerUID opt-out).
+	if hasUID && info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("state file %s: mode %o is group/world-writable", path, info.Mode().Perm())
+	}
+	return nil
+}
+
+// trustedFilePresent reports whether path exists as a trusted regular state file.
+func trustedFilePresent(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	return checkTrustedFileInfo(path, info) == nil
+}
+
 // canonicalMountPoint normalizes mountpoint for hashing without EvalSymlinks.
 // Symlink resolution can hang forever on a wedged FUSE endpoint; control-plane
 // path lookup must not perform mountpoint I/O.
@@ -157,7 +214,8 @@ func WritePID(mountPoint string, pid int) (string, error) {
 		return "", fmt.Errorf("invalid pid %d", pid)
 	}
 	path := PIDFilePath(mountPoint)
-	if err := writeFileAtomic(path, []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
+	// 0600: identity files must not be group/world-writable (trust root).
+	if err := writeFileAtomic(path, []byte(strconv.Itoa(pid)+"\n"), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -237,7 +295,7 @@ func ReadPID(mountPoint string) (int, string, error) {
 
 func ReadProcessState(mountPoint string) (ProcessState, string, error) {
 	path := PIDFilePath(mountPoint)
-	data, err := os.ReadFile(path)
+	data, err := readTrustedFile(path)
 	if err != nil {
 		return ProcessState{}, path, err
 	}

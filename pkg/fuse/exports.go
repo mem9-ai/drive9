@@ -178,14 +178,15 @@ func runUnmountCmd(timeout time.Duration, name string, args ...string) error {
 
 // EnsureCleanMountpoint force-unmounts a stale (broken) mount if present.
 // Destructive cleanup is local-only:
-//   - transport-broken endpoints (ENOTCONN/EIO/EACCES-after-daemon-death), or
+//   - definitive transport-broken endpoints (ENOTCONN/EIO/conn-abort), or
 //   - active mounts whose recorded owner process is dead.
 //
-// Timeout / unknown probe errors first pass the ownerAlive identity gate: a
-// slow-but-live owned mount is degraded, not stale, and must not be detached
-// (design: backend outage / slow getattr ≠ FUSE death). Backend readdir
-// failures on a live owned mount must NOT trigger force-unmount. When
-// force-unmount is attempted but the endpoint remains, returns a non-nil error.
+// Timeout / permission (EACCES/EPERM) / unknown probe errors first pass the
+// ownerAlive identity gate: a slow-or-restricted but live owned mount is
+// degraded, not stale, and must not be detached (design: backend outage /
+// permission noise ≠ FUSE death). Backend readdir failures on a live owned
+// mount must NOT trigger force-unmount. When force-unmount is attempted but
+// the endpoint remains, returns a non-nil error.
 func EnsureCleanMountpoint(mountPoint string) (cleaned bool, err error) {
 	mountPoint = strings.TrimSpace(mountPoint)
 	if mountPoint == "" {
@@ -198,9 +199,9 @@ func EnsureCleanMountpoint(mountPoint string) (cleaned bool, err error) {
 		if os.IsNotExist(activeErr) {
 			return false, nil
 		}
-		// Transport-broken: kernel-mounted dead endpoint — detach immediately.
-		// Timeout/unknown: may be a slow-but-live FUSE daemon; only detach when
-		// the recorded owner (worker PID+creation) is dead/missing.
+		// Only definitive disconnects (ENOTCONN/EIO/...) bypass the owner gate.
+		// Timeout, EACCES/EPERM, and unknown errors may be a slow-or-restricted
+		// but still-live mount — detach only when the owner is dead/missing.
 		if !isTransportBroken(activeErr) && ownerAlive(mountPoint) {
 			return false, nil
 		}
@@ -289,6 +290,11 @@ func isTransportBroken(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Definitive disconnects only. EACCES/EPERM are NOT transport-broken:
+	// they can come from restricted parents / tightened mode bits on a live
+	// mount and must go through the ownerAlive gate before any force-unmount.
+	// After daemon death some kernels report EACCES; EnsureClean still detaches
+	// those when ownerAlive is false (orphan path).
 	msg := strings.ToLower(err.Error())
 	for _, sub := range []string{
 		"transport endpoint is not connected",
@@ -298,12 +304,6 @@ func isTransportBroken(err error) bool {
 		"input/output error",
 		"enotconn",
 		"econnaborted",
-		// After FUSE daemon SIGKILL some kernels surface EACCES/EPERM on the
-		// mountpoint instead of ENOTCONN; still needs force/lazy unmount.
-		"permission denied",
-		"operation not permitted",
-		"eacces",
-		"eperm",
 	} {
 		if strings.Contains(msg, sub) {
 			return true

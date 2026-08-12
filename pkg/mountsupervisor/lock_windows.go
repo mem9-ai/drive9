@@ -11,6 +11,9 @@ import (
 
 func acquireLock(mountPoint string) (*os.File, error) {
 	path := mountstate.SupervisorLockPath(mountPoint)
+	if err := mountstate.EnsureStateDir(); err != nil {
+		return nil, fmt.Errorf("mountsupervisor: state dir: %w", err)
+	}
 	// Exclusive create-ish lock: open with exclusive share mode is not portable
 	// here; best-effort open is enough for Windows non-FUSE builds.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)

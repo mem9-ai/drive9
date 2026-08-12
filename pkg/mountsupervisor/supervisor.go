@@ -148,7 +148,12 @@ func newSupervisor(cfg Config) (*supervisor, error) {
 		s.state.WorkerPID = cfg.AdoptWorkerPID
 		s.state.WorkerCreation = cfg.AdoptWorkerCreation
 	}
-	_ = s.persist()
+	// Initial persist is the trust root for ready/ensure identity; fail closed
+	// so a squatted state dir cannot leave a locked supervisor with no state.
+	if err := s.persist(); err != nil {
+		s.unlock()
+		return nil, fmt.Errorf("mountsupervisor: persist initial state: %w", err)
+	}
 	return s, nil
 }
 

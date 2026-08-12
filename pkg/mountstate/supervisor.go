@@ -86,11 +86,13 @@ func WriteSupervisorState(mountPoint string, state SupervisorState) error {
 
 func ReadSupervisorState(mountPoint string) (SupervisorState, string, error) {
 	path := SupervisorStatePath(mountPoint)
-	data, err := os.ReadFile(path)
+	data, err := readTrustedFile(path)
 	if err != nil && os.IsNotExist(err) {
 		// Upgrade-compat: mounts started before UID-scoped state dirs.
+		// Legacy bare /tmp paths are only trusted when owner/mode pass the
+		// same gate as UID-scoped state (reject forged sticky-/tmp files).
 		legacy := legacyTempStatePath(".supervise.json", mountPoint)
-		if b, lerr := os.ReadFile(legacy); lerr == nil {
+		if b, lerr := readTrustedFile(legacy); lerr == nil {
 			data, path, err = b, legacy, nil
 		}
 	}
@@ -123,10 +125,11 @@ func WriteStopToken(mountPoint string, reason string) error {
 	return writeFileAtomic(StopTokenPath(mountPoint), append(data, '\n'), 0o600)
 }
 
-// ReadStopTokenTime returns the token timestamp when present.
+// ReadStopTokenTime returns the token timestamp when a trusted token is present.
+// Untrusted legacy/bare /tmp tokens (wrong owner, world-writable) are ignored.
 func ReadStopTokenTime(mountPoint string) (time.Time, bool) {
 	for _, path := range []string{StopTokenPath(mountPoint), legacyTempStatePath(".stop", mountPoint)} {
-		data, err := os.ReadFile(path)
+		data, err := readTrustedFile(path)
 		if err != nil {
 			continue
 		}
@@ -149,16 +152,28 @@ func ReadStopTokenTime(mountPoint string) (time.Time, bool) {
 }
 
 func StopTokenPresent(mountPoint string) bool {
-	if _, err := os.Stat(StopTokenPath(mountPoint)); err == nil {
+	if trustedFilePresent(StopTokenPath(mountPoint)) {
 		return true
 	}
-	_, err := os.Stat(legacyTempStatePath(".stop", mountPoint))
-	return err == nil
+	return trustedFilePresent(legacyTempStatePath(".stop", mountPoint))
 }
 
 func ClearStopToken(mountPoint string) error {
 	var first error
 	for _, path := range []string{StopTokenPath(mountPoint), legacyTempStatePath(".stop", mountPoint)} {
+		// Only remove files we would also trust as stop intent.
+		if !trustedFilePresent(path) {
+			// Still try remove if we own a non-writable-but-readable leftover;
+			// ignore errors on untrusted paths.
+			if info, err := os.Lstat(path); err == nil {
+				if uid, ok := stateDirOwnerUID(info); ok && uid == os.Getuid() {
+					if err := os.Remove(path); err != nil && !os.IsNotExist(err) && first == nil {
+						first = err
+					}
+				}
+			}
+			continue
+		}
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && first == nil {
 			first = err
 		}

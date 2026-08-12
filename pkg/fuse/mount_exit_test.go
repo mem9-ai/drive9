@@ -73,25 +73,67 @@ func TestEnsureCleanMountpointPlainDir(t *testing.T) {
 	}
 }
 
-func TestIsTransportBrokenPermissionDenied(t *testing.T) {
-	// After FUSE daemon SIGKILL some kernels surface EACCES instead of ENOTCONN.
-	cases := []string{
+func TestIsTransportBrokenDefinitiveOnly(t *testing.T) {
+	// Definitive disconnects only — not permission errors.
+	for _, msg := range []string{
+		"transport endpoint is not connected",
+		"socket is not connected",
+		"input/output error",
+		"enotconn",
+	} {
+		if !IsTransportBroken(errors.New(msg)) {
+			t.Fatalf("IsTransportBroken(%q) = false, want true", msg)
+		}
+	}
+	for _, msg := range []string{
 		"permission denied",
 		"Permission denied",
 		"operation not permitted",
-		"transport endpoint is not connected",
-		"input/output error",
-	}
-	for _, msg := range cases {
-		if !IsTransportBroken(errors.New(msg)) {
-			t.Fatalf("IsTransportBroken(%q) = false, want true", msg)
+		"eacces",
+		"eperm",
+		"file not found",
+	} {
+		if IsTransportBroken(errors.New(msg)) {
+			t.Fatalf("IsTransportBroken(%q) = true, want false (must use owner gate)", msg)
 		}
 	}
 	if IsTransportBroken(nil) {
 		t.Fatal("IsTransportBroken(nil) = true, want false")
 	}
-	if IsTransportBroken(errors.New("file not found")) {
-		t.Fatal("IsTransportBroken(ordinary error) = true, want false")
+}
+
+func TestEnsureCleanMountpointPermissionDeniedWithLiveOwner(t *testing.T) {
+	// EACCES/EPERM must not bypass ownerAlive (restricted but live mount).
+	oldProbe := activeMountProbe
+	activeMountProbe = func(string) (bool, error) {
+		return false, errors.New("permission denied")
+	}
+	t.Cleanup(func() { activeMountProbe = oldProbe })
+
+	mp := t.TempDir()
+	self := os.Getpid()
+	ct, err := mountstate.ProcessCreationTime(self)
+	if err != nil || ct == 0 {
+		t.Skip("platform has no process creation metadata")
+	}
+	st := mountstate.SupervisorState{
+		PID:            self + 1,
+		WorkerPID:      self,
+		WorkerCreation: ct,
+		MountPoint:     mp,
+		State:          mountstate.SupervisorStateRunning,
+	}
+	if err := mountstate.WriteSupervisorState(mp, st); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+
+	cleaned, err := EnsureCleanMountpoint(mp)
+	if cleaned {
+		t.Fatalf("EACCES with live owner must not force-unmount, cleaned=%v err=%v", cleaned, err)
+	}
+	if err != nil {
+		t.Fatalf("err=%v, want nil", err)
 	}
 }
 

@@ -866,42 +866,10 @@ func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-
 		default:
 		}
 		if time.Now().After(deadline) {
-			// Stop the whole supervised mount: stop token + graceful supervisor
-			// stop (so it can clean the worker), then kill leftover worker and
-			// force-unmount if the FUSE endpoint is still present/broken.
-			_ = mountstate.WriteStopToken(mountPoint, "ready-timeout")
-			_ = terminateProcessGraceful(supervisorPID, 10*time.Second)
-			var workerCreation uint64
-			if sst, _, rerr := mountstate.ReadSupervisorState(mountPoint); rerr == nil {
-				workerCreation = sst.WorkerCreation
-			}
-			if st, _, rerr := mountstate.ReadProcessState(mountPoint); rerr == nil {
-				if st.WorkerPID > 0 {
-					// Identity-gated when creation is known; ready-timeout is
-					// our own child tree so fall back to liveness if metadata
-					// was never published yet (first-boot race).
-					if processMatchesIdentity(st.WorkerPID, workerCreation) ||
-						(workerCreation == 0 && processAliveImpl(st.WorkerPID)) {
-						_ = terminateProcess(st.WorkerPID, 5*time.Second)
-					}
-				}
-				// Supervisor may still be stuck; hard-kill if identity matches.
-				// supervisorPID is this process's own child, so identity-or-alive
-				// is safe within the ready window.
-				if st.SupervisorPID > 0 && processMatchesIdentity(st.SupervisorPID, st.SupervisorCreationTime) {
-					_ = terminateProcess(st.SupervisorPID, 3*time.Second)
-				} else if processAliveImpl(supervisorPID) {
-					_ = terminateProcess(supervisorPID, 3*time.Second)
-				}
-			} else if processAliveImpl(supervisorPID) {
-				_ = terminateProcess(supervisorPID, 3*time.Second)
-			}
-			_, _ = ensureCleanMountPointCLI(mountPoint)
-			_ = mountstate.ClearStopToken(mountPoint)
-			// Supervisor may have been SIGKILL'd before shutdownClean; drop
-			// stale state so status/umount do not see a dead "starting" mount.
-			_ = mountstate.ClearSupervisorState(mountPoint)
-			_ = os.Remove(mountstate.PIDFilePath(mountPoint))
+			// Stop only the supervisor we just spawned. Worker kill is gated on
+			// SupervisorState matching this generation (PID+creation); never
+			// act on stale state or PID-only liveness (fail closed).
+			cleanupSupervisedReadyTimeout(mountPoint, supervisorPID, supCreation)
 			return fmt.Errorf("drive9 mount: timed out waiting for supervised mount to become ready after %s (log: %s)", timeout, logPath)
 		}
 		// Ready only when SupervisorState matches the child we just spawned
@@ -921,10 +889,7 @@ func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-
 // whether its worker is identity-alive. Creation mismatches are fail-closed when
 // the platform supplies creation metadata (supCreation != 0).
 func supervisedReadyStateMatches(st mountstate.SupervisorState, supervisorPID int, supCreation uint64) bool {
-	if supervisorPID <= 0 || st.PID != supervisorPID {
-		return false
-	}
-	if supCreation != 0 && st.CreationTime != supCreation {
+	if !supervisorStateMatchesGeneration(st, supervisorPID, supCreation) {
 		return false
 	}
 	if st.WorkerPID <= 0 {
@@ -936,6 +901,70 @@ func supervisedReadyStateMatches(st mountstate.SupervisorState, supervisorPID in
 	// No recorded worker creation: only acceptable where the platform cannot
 	// supply creation metadata at all; otherwise fail closed.
 	return supCreation == 0 && processAliveImpl(st.WorkerPID)
+}
+
+// supervisorStateMatchesGeneration reports whether st is the supervisor this
+// parent just spawned (PID + creation when the platform supplies metadata).
+func supervisorStateMatchesGeneration(st mountstate.SupervisorState, supervisorPID int, supCreation uint64) bool {
+	if supervisorPID <= 0 || st.PID != supervisorPID {
+		return false
+	}
+	if supCreation != 0 && st.CreationTime != supCreation {
+		return false
+	}
+	return true
+}
+
+// cleanupSupervisedReadyTimeout stops the spawned supervisor and only signals a
+// worker when SupervisorState matches this generation with full creation identity.
+func cleanupSupervisedReadyTimeout(mountPoint string, supervisorPID int, supCreation uint64) {
+	_ = mountstate.WriteStopToken(mountPoint, "ready-timeout")
+	// Stop only our child supervisor (PID we spawned + creation when available).
+	if isOurSupervisorProcess(supervisorPID, supCreation) {
+		_ = terminateProcessGraceful(supervisorPID, 10*time.Second)
+	}
+	// Worker kill only from matching-generation SupervisorState with creation
+	// (fail closed: missing WorkerCreation → do not signal).
+	if sst, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+		if supervisorStateMatchesGeneration(sst, supervisorPID, supCreation) &&
+			sst.WorkerPID > 0 && sst.WorkerCreation > 0 &&
+			processMatchesIdentity(sst.WorkerPID, sst.WorkerCreation) {
+			_ = terminateProcess(sst.WorkerPID, 5*time.Second)
+		}
+	}
+	// Final hard-kill of our child if it ignored SIGTERM.
+	if isOurSupervisorProcess(supervisorPID, supCreation) {
+		_ = terminateProcess(supervisorPID, 3*time.Second)
+	}
+	_, _ = ensureCleanMountPointCLI(mountPoint)
+	_ = mountstate.ClearStopToken(mountPoint)
+	// Only clear state / pidfile that belong to this generation (or are absent).
+	if sst, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+		if supervisorStateMatchesGeneration(sst, supervisorPID, supCreation) {
+			_ = mountstate.ClearSupervisorState(mountPoint)
+			_ = os.Remove(mountstate.PIDFilePath(mountPoint))
+		}
+	} else {
+		// No trusted supervisor state: safe to clear leftovers for this mountpoint
+		// after we stopped our own child (if any).
+		_ = mountstate.ClearSupervisorState(mountPoint)
+		if isOurSupervisorProcess(supervisorPID, supCreation) || !processAliveImpl(supervisorPID) {
+			_ = os.Remove(mountstate.PIDFilePath(mountPoint))
+		}
+	}
+}
+
+// isOurSupervisorProcess is true when pid is still the process we spawned.
+// When creation metadata is available it is fail-closed on mismatch; when the
+// platform cannot supply creation, PID liveness of our spawn is accepted.
+func isOurSupervisorProcess(supervisorPID int, supCreation uint64) bool {
+	if supervisorPID <= 0 {
+		return false
+	}
+	if supCreation > 0 {
+		return processMatchesIdentity(supervisorPID, supCreation)
+	}
+	return processAliveImpl(supervisorPID)
 }
 
 func probeMountReadyForCLI(mountPoint string) bool {
