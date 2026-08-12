@@ -33,15 +33,17 @@ func renderTable(output io.Writer, wide bool, jobs []jobResult, batches []batchS
 	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
 	showBatch := shouldShowBatch(jobs)
 	if wide {
-		if _, err := fmt.Fprintln(table, "NAMESPACE\tBATCH\tJOB\tPHASE\tSTATUS\tROUND\tFILES\tDIFF\tRETRY\tVERIFY\tNODE\tPOD\tSPACE\tPREFIX\tPENDING\tIN_FLIGHT\tERROR"); err != nil {
+		if _, err := fmt.Fprintln(table, "NAMESPACE\tBATCH\tJOB\tPHASE\tSTATUS\tROUND\tFILES\tDIFF\tRETRY\tVERIFY\tNODE\tPOD\tSPACE\tPREFIX\tCAND_MTIME\tCAND_SOURCE_TOKEN_CHANGED\tCAND_NEW_PATH\tCAND_FILTERED\tPENDING\tIN_FLIGHT\tERROR"); err != nil {
 			return err
 		}
 		for _, job := range jobs {
 			status := job.parsed
-			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			candidateMtime, candidateSourceToken, candidateNewPath, candidateFiltered := candidateCounts(status)
+			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				valueOrDash(job.Namespace), valueOrDash(job.Batch), valueOrDash(job.JobID), valueOrDash(job.Phase),
 				job.DisplayStatus, roundDisplay(status), sourceCount(status), findingCount(status), retryCount(status),
 				verificationDisplay(status), valueOrDash(job.Node), valueOrDash(job.Pod), spaceRef(status), prefix(status),
+				candidateMtime, candidateSourceToken, candidateNewPath, candidateFiltered,
 				pendingRepairs(status), inFlight(status), valueOrDash(job.Error)); err != nil {
 				return err
 			}
@@ -165,6 +167,16 @@ func prefix(status *workerStatus) string {
 		return "-"
 	}
 	return valueOrDash(status.Prefix)
+}
+
+func candidateCounts(status *workerStatus) (string, string, string, string) {
+	if status == nil {
+		return "-", "-", "-", "-"
+	}
+	return strconv.Itoa(status.CandidateCounts.Mtime),
+		strconv.Itoa(status.CandidateCounts.SourceTokenChanged),
+		strconv.Itoa(status.CandidateCounts.NewPath),
+		strconv.Itoa(status.CandidateCounts.Filtered)
 }
 
 func pendingRepairs(status *workerStatus) string {

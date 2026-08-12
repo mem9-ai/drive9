@@ -150,12 +150,50 @@ metadata:
     app.kubernetes.io/name: drive9-migration
     app.kubernetes.io/component: worker
     app.kubernetes.io/instance: customer-a-20260810
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: drive9-migration
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/instance: customer-a-20260810
 ```
 
 The Worker container name must be `drive9-migration`. Download the plugin
-artifact for the operator's platform, rename it to
-`kubectl-drive9-migration` (`kubectl-drive9-migration.exe` on Windows), make it
-executable where applicable, and place it on `PATH`. Confirm discovery with:
+artifact for the operator's platform together with
+`migration-kube-plugin-checksums.txt`. Verify the downloaded artifact before
+installing it. For Linux:
+
+```bash
+plugin_artifact=kubectl-drive9-migration-linux-amd64
+grep " $plugin_artifact$" migration-kube-plugin-checksums.txt |
+  sha256sum --check
+```
+
+For macOS:
+
+```bash
+plugin_artifact=kubectl-drive9-migration-darwin-arm64
+grep " $plugin_artifact$" migration-kube-plugin-checksums.txt |
+  shasum --algorithm 256 --check
+```
+
+For Windows PowerShell:
+
+```powershell
+$artifact = "kubectl-drive9-migration-windows-amd64.exe"
+$line = Get-Content migration-kube-plugin-checksums.txt |
+  Where-Object { $_ -match "  $([regex]::Escape($artifact))$" }
+if (-not $line) { throw "checksum entry not found" }
+$expected = ($line -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 $artifact).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "checksum mismatch" }
+```
+
+Choose the artifact name matching the operator's architecture. After successful
+verification, rename it to `kubectl-drive9-migration`
+(`kubectl-drive9-migration.exe` on Windows), make it executable where
+applicable, and place it on `PATH`. Confirm discovery with:
 
 ```bash
 kubectl plugin list

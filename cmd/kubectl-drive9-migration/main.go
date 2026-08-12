@@ -1,3 +1,5 @@
+// Command kubectl-drive9-migration implements the read-only kubectl plugin for
+// aggregating Drive9 Migration Worker status.
 package main
 
 import (

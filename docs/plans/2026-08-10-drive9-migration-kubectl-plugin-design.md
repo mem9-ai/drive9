@@ -137,10 +137,11 @@ ambiguous.
 
 | Display status | Derivation |
 | --- | --- |
-| `POD_PENDING`, `POD_FAILED`, `TERMINATING` | Kubernetes Pod cannot provide a current Worker result |
+| `POD_<PHASE>` | Any non-`Running` Kubernetes Pod, including `POD_PENDING`, `POD_FAILED`, and `POD_SUCCEEDED` |
+| `TERMINATING` | Kubernetes Pod has a deletion timestamp |
 | `UNAVAILABLE` | Exec failed, timed out, or returned invalid JSON |
 | `DUPLICATE` | More than one observed Pod reports the same Job identity in one batch |
-| `ATTENTION` | `conditions.attention=true` |
+| `ATTENTION` | `conditions.attention=true`, or actual phase is `CUTOVER_READY` while the fence is incomplete |
 | `CUTOVER_READY` | Actual phase is `CUTOVER_READY` and the fence is complete |
 | `READY_FOR_ROLLOUT` | `conditions.ready_for_rollout=true` |
 | `CONVERGED` | `conditions.current_converged=true` |

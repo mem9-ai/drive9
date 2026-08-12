@@ -13,6 +13,9 @@ func renderedJob(namespace, batch, pod, volumeID string) jobResult {
 		VolumeID: volumeID, NodeName: "node-a", SpaceRef: "space-a", Prefix: "/data",
 		Phase: "SYNCING", StartupPhase: "SYNCING", SourceCount: 42,
 		Conditions: workerConditions{ReadyForRollout: true},
+		CandidateCounts: workerCandidates{
+			Mtime: 3, SourceTokenChanged: 5, NewPath: 7, Filtered: 11,
+		},
 		Round: workerRound{
 			ID: "round-1", Mode: "full", CompletedAt: time.Date(2026, 8, 10, 2, 0, 0, 0, time.UTC),
 			ScanComplete: true, Converged: true,
@@ -69,7 +72,11 @@ func TestRenderWideIncludesOperationalDetails(t *testing.T) {
 	if err := renderStatus(&output, options{output: "wide"}, time.Now(), []jobResult{job}, summarizeBatches([]jobResult{job})); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"NAMESPACE", "NODE", "SPACE", "PREFIX", "IN_FLIGHT", "migration", "node-a", "space-a", "/data", "bounded detail"} {
+	for _, want := range []string{
+		"NAMESPACE", "NODE", "SPACE", "PREFIX", "CAND_MTIME", "CAND_SOURCE_TOKEN_CHANGED",
+		"CAND_NEW_PATH", "CAND_FILTERED", "IN_FLIGHT", "migration", "node-a",
+		"space-a", "/data", "3", "5", "7", "11", "bounded detail",
+	} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("wide output omitted %q:\n%s", want, output.String())
 		}
