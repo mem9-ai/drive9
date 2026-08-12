@@ -288,7 +288,7 @@ func summarizeBatches(jobs []jobResult) []batchSummary {
 			Status:       deriveBatchStatus(group),
 		}
 		for _, job := range group {
-			if job.parsed != nil {
+			if !job.collectionFailed {
 				summary.Available++
 			} else {
 				summary.Unavailable++

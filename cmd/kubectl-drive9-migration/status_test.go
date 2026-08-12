@@ -173,6 +173,22 @@ func TestDeriveBatchStatus(t *testing.T) {
 	}
 }
 
+func TestSummarizeBatchesCountsCollectionFailuresAsUnavailable(t *testing.T) {
+	available := batchJob("available", "SYNCING", "SYNCING")
+	attention := batchJob("attention", "SYNCING", "ATTENTION")
+	unavailable := batchJob("duplicate", "SYNCING", "DUPLICATE")
+	unavailable.collectionFailed = true
+
+	summaries := summarizeBatches([]jobResult{available, attention, unavailable})
+	if len(summaries) != 1 {
+		t.Fatalf("summaries=%+v", summaries)
+	}
+	summary := summaries[0]
+	if summary.Available != 2 || summary.Attention != 1 || summary.Unavailable != 1 {
+		t.Fatalf("summary=%+v", summary)
+	}
+}
+
 func TestCollectStatusPreservesFailuresAndDetectsDuplicates(t *testing.T) {
 	fake := &fakeKubectl{
 		podList: podListJSON(t,
@@ -200,6 +216,16 @@ func TestCollectStatusPreservesFailuresAndDetectsDuplicates(t *testing.T) {
 	}
 	if !partial || len(jobs) != 4 || len(batches) != 2 {
 		t.Fatalf("partial=%v jobs=%d batches=%+v", partial, len(jobs), batches)
+	}
+	byBatch := make(map[string]batchSummary)
+	for _, batch := range batches {
+		byBatch[batch.Batch] = batch
+	}
+	if batch := byBatch["batch-a"]; batch.Available != 0 || batch.Unavailable != 3 {
+		t.Fatalf("duplicate batch summary=%+v", batch)
+	}
+	if batch := byBatch[missingBatch]; batch.Available != 0 || batch.Unavailable != 1 {
+		t.Fatalf("missing-label batch summary=%+v", batch)
 	}
 	byPod := make(map[string]jobResult)
 	for _, job := range jobs {
