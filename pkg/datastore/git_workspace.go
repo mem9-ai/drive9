@@ -177,6 +177,62 @@ ON DUPLICATE KEY UPDATE
 	return nil
 }
 
+// ReplaceDeletedGitWorkspace revives a deleted root under a new workspace_id
+// so stale runtimes that still hold the old id cannot write into the new
+// generation. The old id disappears (GET/subresource → NotFound).
+func (s *Store) ReplaceDeletedGitWorkspace(ctx context.Context, oldID string, ws GitWorkspace) error {
+	oldID = strings.TrimSpace(oldID)
+	if oldID == "" {
+		return fmt.Errorf("git workspace id is required")
+	}
+	if strings.TrimSpace(ws.WorkspaceID) == "" || ws.WorkspaceID == oldID {
+		return fmt.Errorf("replacement git workspace id must be a new identity")
+	}
+	if strings.TrimSpace(ws.RootPath) == "" {
+		return fmt.Errorf("git workspace root path is required")
+	}
+	root, err := pathutil.CanonicalizeDir(ws.RootPath)
+	if err != nil {
+		return fmt.Errorf("invalid git workspace root path: %w", err)
+	}
+	ws.RootPath = root
+	if strings.TrimSpace(ws.RepoURL) == "" {
+		return fmt.Errorf("git workspace repo url is required")
+	}
+	if ws.RemoteName == "" {
+		ws.RemoteName = "origin"
+	}
+	if ws.Mode == "" {
+		ws.Mode = GitWorkspaceModeFast
+	}
+	if ws.Kind == "" {
+		ws.Kind = GitWorkspaceKindMain
+	}
+	ws.Status = GitWorkspaceStatusLive
+	res, err := s.db.ExecContext(ctx, `
+UPDATE git_workspaces
+SET workspace_id = ?, root_path = ?, repo_url = ?, remote_name = ?, branch_name = ?,
+	base_commit = ?, head_commit = ?, mode = ?, workspace_kind = ?, common_workspace_id = ?,
+	worktree_name = ?, gitdir_rel = ?, status = ?, updated_at = UTC_TIMESTAMP(3)
+WHERE `+s.scope.And(`workspace_id = ? AND status = ?`),
+		append([]any{
+			ws.WorkspaceID, ws.RootPath, ws.RepoURL, ws.RemoteName, ws.BranchName,
+			ws.BaseCommit, ws.HeadCommit, string(ws.Mode), string(ws.Kind), ws.CommonID,
+			ws.WorktreeName, ws.GitDirRel, string(ws.Status),
+		}, s.scope.Args(oldID, string(GitWorkspaceStatusDeleted))...)...)
+	if err != nil {
+		return fmt.Errorf("replace deleted git workspace %s: %w", oldID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("replace deleted git workspace %s: %w", oldID, err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) GetGitWorkspace(ctx context.Context, workspaceID string) (*GitWorkspace, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT workspace_id, root_path, repo_url, remote_name, branch_name,
@@ -265,19 +321,31 @@ WHERE `+s.scope.And(`workspace_id = ?`), s.scope.Args(workspaceID)...).Scan(&sta
 	})
 }
 
+const gitWorkspaceSubresourceDeleteBatch = 5000
+
 func (s *Store) deleteGitWorkspaceSubresourcesTx(ctx context.Context, tx *sql.Tx, workspaceID string) error {
 	stmts := []struct {
 		name string
 		q    string
 	}{
-		{"tree", `DELETE FROM git_workspace_tree_nodes WHERE ` + s.scope.And(`workspace_id = ?`)},
-		{"state", `DELETE FROM git_workspace_git_state WHERE ` + s.scope.And(`workspace_id = ?`)},
-		{"packs", `DELETE FROM git_workspace_object_packs WHERE ` + s.scope.And(`workspace_id = ?`)},
-		{"overlay", `DELETE FROM git_workspace_overlay WHERE ` + s.scope.And(`workspace_id = ?`)},
+		{"tree", `DELETE FROM git_workspace_tree_nodes WHERE ` + s.scope.And(`workspace_id = ?`) + ` LIMIT ?`},
+		{"state", `DELETE FROM git_workspace_git_state WHERE ` + s.scope.And(`workspace_id = ?`) + ` LIMIT ?`},
+		{"packs", `DELETE FROM git_workspace_object_packs WHERE ` + s.scope.And(`workspace_id = ?`) + ` LIMIT ?`},
+		{"overlay", `DELETE FROM git_workspace_overlay WHERE ` + s.scope.And(`workspace_id = ?`) + ` LIMIT ?`},
 	}
 	for _, st := range stmts {
-		if _, err := tx.ExecContext(ctx, st.q, s.scope.Args(workspaceID)...); err != nil {
-			return fmt.Errorf("delete git workspace %s %s: %w", workspaceID, st.name, err)
+		for {
+			res, err := tx.ExecContext(ctx, st.q, append(s.scope.Args(workspaceID), gitWorkspaceSubresourceDeleteBatch)...)
+			if err != nil {
+				return fmt.Errorf("delete git workspace %s %s: %w", workspaceID, st.name, err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("delete git workspace %s %s: %w", workspaceID, st.name, err)
+			}
+			if n < int64(gitWorkspaceSubresourceDeleteBatch) {
+				break
+			}
 		}
 	}
 	return nil

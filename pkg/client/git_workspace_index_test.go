@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -139,5 +140,85 @@ func TestParseGitWorkspaceIndexRejectsTooManyEntries(t *testing.T) {
 	_, err = parseGitWorkspaceIndex(body)
 	if !errors.Is(err, ErrGitWorkspaceIndexTooLarge) {
 		t.Fatalf("parse many entries = %v, want ErrGitWorkspaceIndexTooLarge", err)
+	}
+}
+
+func TestUpsertPreservesUnknownIndexFields(t *testing.T) {
+	var mu sync.Mutex
+	var body []byte
+	var rev int64
+	exists := false
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			if !exists {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if !exists {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			_, _ = w.Write(body)
+		case http.MethodPut:
+			data, _ := io.ReadAll(r.Body)
+			body = data
+			exists = true
+			rev++
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": rev})
+		default:
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	seed := []byte(`{
+  "version": 1,
+  "schema_note": "keep-top",
+  "workspaces": [
+    {"workspace_id": "ws-old", "root_path": "/old/", "alias": "keep-entry"}
+  ]
+}`)
+	mu.Lock()
+	body = seed
+	exists = true
+	rev = 1
+	mu.Unlock()
+
+	c := New(srv.URL, "test-key")
+	if err := c.UpsertGitWorkspaceIndexEntry(context.Background(), GitWorkspaceIndexEntry{
+		WorkspaceID: "ws-new",
+		RootPath:    "/new/",
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if err := c.RemoveGitWorkspaceIndexEntry(context.Background(), "ws-new"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	idx, _, err := c.ReadGitWorkspaceIndex(context.Background())
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	mu.Lock()
+	got := string(body)
+	mu.Unlock()
+	if !strings.Contains(got, `"schema_note"`) || !strings.Contains(got, `keep-top`) {
+		t.Fatalf("top-level extra stripped: %s", got)
+	}
+	if !strings.Contains(got, `"alias"`) || !strings.Contains(got, `keep-entry`) {
+		t.Fatalf("per-entry extra stripped: %s", got)
+	}
+	if idx == nil || len(idx.Workspaces) != 1 || idx.Workspaces[0].WorkspaceID != "ws-old" {
+		t.Fatalf("index after upsert/remove = %+v", idx)
 	}
 }

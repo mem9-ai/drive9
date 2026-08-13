@@ -164,11 +164,13 @@ remote index document, and the local FS. Each step is independently durable and
 idempotent (upserts/replaces keyed by workspace id / commit / root_path). The
 command prints success only after steps 1–3 complete; hydrate never gates
 registration. Recovery for steps 1–3 is **re-run the command** (or remount when
-only local markers are missing). A re-run is executable even when the
-checkout/worktree already exists: `clone --fast` and `worktree add --fast`
-skip `git clone` / `git worktree add` when the target is already a git work
-tree and resume from upsert + index + local markers. Prefer “registered but
-not yet discoverable” over “discoverable but incomplete”.
+only local markers are missing). A re-run is executable when the
+checkout/worktree already exists **and matches this command's identity**:
+`clone --fast` resumes only if `origin` is the requested repo; `worktree add
+--fast` resumes only if the destination shares the base checkout's git
+common dir. Any other existing destination is rejected (git's non-empty
+safety), not silently registered. Prefer “registered but not yet
+discoverable” over “discoverable but incomplete”.
 
 | After | Failure | Observable state | Recovery |
 | --- | --- | --- | --- |
@@ -196,6 +198,9 @@ The remote index document is capped (1 MiB / 4096 entries) on automatic read
 paths. Empty-list disarm is fenced to the force generation and local-arm
 generation captured before the local-marker scan, and that scan uses an
 independent context so a canceled refresh cannot hide existing markers.
+Same-root recreate of a deleted workspace mints a **new workspace id** so a
+stale armed runtime still holding the old id cannot write into the new
+generation (GET/subresource on the old id is NotFound).
 
 Local arm markers are a **generation** over the marker set (armed body + each
 `refresh/<id>` name and body), not max FS mtime alone — so same-second

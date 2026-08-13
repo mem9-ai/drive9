@@ -157,19 +157,33 @@ func TestDeleteGitWorkspaceWipesSubresourcesAndFencesWrites(t *testing.T) {
 		t.Fatalf("overlay write after delete: %v, want NotFound", err)
 	}
 
-	// Same-root recreate reuses the row id; wiped children must stay gone.
-	if err := s.UpsertGitWorkspace(ctx, GitWorkspace{
-		WorkspaceID: wsID,
+	const newID = "ws-del-new"
+	if err := s.ReplaceDeletedGitWorkspace(ctx, wsID, GitWorkspace{
+		WorkspaceID: newID,
 		RootPath:    "/repo-del/",
 		RepoURL:     "https://example.test/repo-del.git",
 		RemoteName:  "origin",
 		HeadCommit:  strings.Repeat("d", 40),
-		Status:      GitWorkspaceStatusLive,
 	}); err != nil {
-		t.Fatalf("recreate UpsertGitWorkspace: %v", err)
+		t.Fatalf("ReplaceDeletedGitWorkspace: %v", err)
 	}
-	if _, err := s.GetGitOverlayEntry(ctx, wsID, "dirty.txt"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetGitWorkspace(ctx, wsID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old id after replace: %v, want NotFound", err)
+	}
+	got, err := s.GetGitWorkspaceByRoot(ctx, "/repo-del/")
+	if err != nil {
+		t.Fatalf("GetGitWorkspaceByRoot after replace: %v", err)
+	}
+	if got.WorkspaceID != newID || got.Status != GitWorkspaceStatusLive {
+		t.Fatalf("revived workspace = %+v, want id=%s live", got, newID)
+	}
+	if _, err := s.GetGitOverlayEntry(ctx, newID, "dirty.txt"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("recreate inherited overlay: %v, want NotFound", err)
+	}
+	if err := s.UpsertGitOverlayEntry(ctx, GitOverlayEntry{
+		WorkspaceID: wsID, Path: "stale-runtime.txt", Op: GitOverlayOpUpsert, Kind: GitOverlayKindFile,
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old-generation overlay write: %v, want NotFound", err)
 	}
 }
 

@@ -163,6 +163,55 @@ func TestExistingFastGitCheckout(t *testing.T) {
 	}
 }
 
+func TestFastCloneResumeRejectsDifferentOrigin(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	ctx := context.Background()
+	repo := filepath.Join(t.TempDir(), "repo")
+	runTestGit(t, "", "init", "-b", "main", repo)
+	runTestGit(t, repo, "remote", "add", "origin", "https://example.test/actual.git")
+	if err := checkFastCloneResumeIdentity(ctx, repo, "https://example.test/actual.git"); err != nil {
+		t.Fatalf("same origin resume: %v", err)
+	}
+	if err := checkFastCloneResumeIdentity(ctx, repo, "https://example.test/other.git"); err == nil {
+		t.Fatal("different origin resume succeeded, want error")
+	}
+	if !sameGitRemoteIdentity("https://github.com/org/repo.git", "git@github.com:org/repo.git") {
+		t.Fatal("same host/path over https and ssh should match")
+	}
+	if sameGitRemoteIdentity("https://example.test/actual.git", "https://example.test/other.git") {
+		t.Fatal("different repos compared equal")
+	}
+}
+
+func TestFastWorktreeResumeRejectsUnrelatedCheckout(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	base := filepath.Join(root, "base")
+	wt := filepath.Join(root, "wt")
+	other := filepath.Join(root, "other")
+	runTestGit(t, "", "init", "-b", "main", base)
+	runTestGit(t, base, "config", "user.email", "drive9-test@example.invalid")
+	runTestGit(t, base, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(base, "README.md"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runTestGit(t, base, "add", ".")
+	runTestGit(t, base, "commit", "-m", "init")
+	runTestGit(t, base, "worktree", "add", "--detach", wt, "HEAD")
+	if err := checkFastWorktreeResumeIdentity(ctx, wt, base); err != nil {
+		t.Fatalf("same-base worktree resume: %v", err)
+	}
+	runTestGit(t, "", "init", "-b", "main", other)
+	if err := checkFastWorktreeResumeIdentity(ctx, other, base); err == nil {
+		t.Fatal("unrelated checkout resume succeeded, want error")
+	}
+}
+
 func TestPublishGitWorkspaceIndexRetryable(t *testing.T) {
 	var attempts atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +260,72 @@ func TestMarkLocalGitWorkspaceRegisteredRetryable(t *testing.T) {
 	}
 	if err := markLocalGitWorkspaceRegistered(ctx, good, wsID); err != nil {
 		t.Fatalf("idempotent remake: %v", err)
+	}
+}
+
+func TestLinkedWorktreeGitDirMetadataRejectsForeignGitDir(t *testing.T) {
+	root := t.TempDir()
+	baseGit := filepath.Join(root, "base", ".git")
+	foreign := filepath.Join(root, "other", ".git", "worktrees", "wt")
+	if err := os.MkdirAll(baseGit, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(foreign, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitFile := filepath.Join(root, "wt", ".git")
+	if err := os.MkdirAll(filepath.Dir(gitFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gitFile, []byte("gitdir: "+foreign+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := linkedWorktreeGitDirMetadata(gitFile, baseGit); err == nil {
+		t.Fatal("foreign gitdir accepted, want error")
+	}
+}
+
+func TestLinkedWorktreeGitDirMetadataAcceptsAbsoluteGitDirSameBase(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	base := filepath.Join(root, "base")
+	wt := filepath.Join(root, "wt")
+	runTestGit(t, "", "init", "-b", "main", base)
+	runTestGit(t, base, "config", "user.email", "drive9-test@example.invalid")
+	runTestGit(t, base, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(base, "README.md"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runTestGit(t, base, "add", ".")
+	runTestGit(t, base, "commit", "-m", "init")
+	runTestGit(t, base, "worktree", "add", "--detach", wt, "HEAD")
+
+	common, err := gitCommonDir(ctx, wt)
+	if err != nil {
+		t.Fatalf("gitCommonDir: %v", err)
+	}
+	absGitDir, err := gitOutput(ctx, wt, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		t.Fatalf("absolute-git-dir: %v", err)
+	}
+	gitFile := filepath.Join(wt, ".git")
+	if err := os.WriteFile(gitFile, []byte("gitdir: "+absGitDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Overlay-style common path that does not string-prefix the FUSE/abs gitdir.
+	overlayCommon := filepath.Join(t.TempDir(), "overlay", "base", ".git")
+	if err := os.MkdirAll(overlayCommon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gotDir, _, rel, err := linkedWorktreeGitDirMetadata(gitFile, overlayCommon)
+	if err != nil {
+		t.Fatalf("same-base absolute gitdir: %v", err)
+	}
+	if gotDir == "" || rel == "" || strings.Contains(rel, "..") {
+		t.Fatalf("gitDir=%q rel=%q common=%q", gotDir, rel, common)
 	}
 }
 

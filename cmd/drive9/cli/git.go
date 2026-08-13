@@ -111,6 +111,9 @@ func gitClone(args []string) error {
 	}
 
 	if existingFastGitCheckout(cmdCtx, target) {
+		if err := checkFastCloneResumeIdentity(cmdCtx, target, repoURL); err != nil {
+			return err
+		}
 		fmt.Fprintf(os.Stderr, "drive9: resuming --fast registration for existing checkout %s\n", target)
 	} else {
 		cloneArgs := gitFastCloneArgs(repoURL, target, *blobless)
@@ -187,10 +190,10 @@ func gitClone(args []string) error {
 	}
 	// Index + local arm before success/hydrate so live mounts and remounts discover us.
 	if err := publishGitWorkspaceIndexEntry(cmdCtx, c, ws); err != nil {
-		return fmt.Errorf("publish git workspace index: %w", err)
+		return fmt.Errorf("registered git workspace %s, but publishing discovery index failed: %w", ws.WorkspaceID, err)
 	}
 	if err := markLocalGitWorkspaceRegistered(cmdCtx, resolved, ws.WorkspaceID); err != nil {
-		return fmt.Errorf("mark local git workspace registered: %w", err)
+		return fmt.Errorf("registered git workspace %s, but writing local discovery marker failed: %w", ws.WorkspaceID, err)
 	}
 
 	fmt.Fprintf(os.Stderr, "drive9: registered git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, resolved.RemotePath, len(nodes))
@@ -313,6 +316,9 @@ func gitWorktreeAdd(args []string) error {
 	}
 
 	if existingFastGitCheckout(cmdCtx, worktreePath) {
+		if err := checkFastWorktreeResumeIdentity(cmdCtx, worktreePath, basePath); err != nil {
+			return err
+		}
 		fmt.Fprintf(os.Stderr, "drive9: resuming --fast registration for existing worktree %s\n", worktreePath)
 	} else {
 		worktreeCommit := gitFastWorktreeAddCommit(*branch, *detach, commitish, resolvedCommit)
@@ -400,10 +406,10 @@ func gitWorktreeAdd(args []string) error {
 		return fmt.Errorf("checkpoint base .git after worktree add: %w", err)
 	}
 	if err := publishGitWorkspaceIndexEntry(cmdCtx, c, ws); err != nil {
-		return fmt.Errorf("publish linked git workspace index: %w", err)
+		return fmt.Errorf("registered linked git workspace %s, but publishing discovery index failed: %w", ws.WorkspaceID, err)
 	}
 	if err := markLocalGitWorkspaceRegistered(cmdCtx, worktreeResolved, ws.WorkspaceID); err != nil {
-		return fmt.Errorf("mark local linked git workspace registered: %w", err)
+		return fmt.Errorf("registered linked git workspace %s, but writing local discovery marker failed: %w", ws.WorkspaceID, err)
 	}
 
 	fmt.Fprintf(os.Stderr, "drive9: registered linked git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, worktreeResolved.RemotePath, len(nodes))
@@ -966,13 +972,28 @@ func linkedWorktreeGitDirMetadata(gitFile, commonGitDir string) (gitDir string, 
 	if worktreeName == "." || worktreeName == string(filepath.Separator) || worktreeName == "" {
 		return "", "", "", fmt.Errorf("could not derive linked worktree name from gitdir %s", gitDir)
 	}
-	gitDirRel = filepath.ToSlash(filepath.Join("worktrees", worktreeName))
-	if commonGitDir != "" {
-		if rel, relErr := filepath.Rel(commonGitDir, gitDir); relErr == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." {
-			gitDirRel = filepath.ToSlash(rel)
+	// gitdir: in the .git file is often a FUSE-absolute path, while
+	// commonGitDir is the overlay LocalGitDir. Rel across those namespaces
+	// looks like "outside" even for a same-base worktree. Prefer the
+	// worktree's own --git-common-dir (same namespace as gitdir:), then
+	// fall back to the overlay path.
+	var candidates []string
+	if wtRoot := filepath.Dir(gitFile); wtRoot != "" {
+		if common, err := gitCommonDir(context.Background(), wtRoot); err == nil && common != "" {
+			candidates = append(candidates, common)
 		}
 	}
-	return gitDir, worktreeName, gitDirRel, nil
+	if strings.TrimSpace(commonGitDir) != "" {
+		candidates = append(candidates, commonGitDir)
+	}
+	for _, common := range candidates {
+		rel, relErr := filepath.Rel(common, gitDir)
+		if relErr != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		return gitDir, worktreeName, filepath.ToSlash(rel), nil
+	}
+	return "", "", "", fmt.Errorf("linked worktree gitdir %s is not inside the base git dir", gitDir)
 }
 
 func gitDirFromMountedGitPath(gitPath string) (string, error) {
@@ -1063,6 +1084,85 @@ func existingFastGitCheckout(ctx context.Context, target string) bool {
 	}
 	out, err := gitOutput(ctx, target, "rev-parse", "--is-inside-work-tree")
 	return err == nil && strings.EqualFold(strings.TrimSpace(out), "true")
+}
+
+// checkFastCloneResumeIdentity allows skipping git clone only when target is
+// already a checkout of the requested repo. A stale/wrong destination keeps
+// normal git "destination exists" safety instead of being registered as the
+// caller-supplied repoURL.
+func checkFastCloneResumeIdentity(ctx context.Context, target, repoURL string) error {
+	origin, err := gitOutput(ctx, target, "remote", "get-url", "origin")
+	if err != nil {
+		return fmt.Errorf("destination %s is already a git checkout without a usable origin remote (not a resumable drive9 --fast clone of %s): %w", target, repoURL, err)
+	}
+	if !sameGitRemoteIdentity(origin, repoURL) {
+		return fmt.Errorf("destination %s is already a git checkout of %q, not %q", target, origin, repoURL)
+	}
+	return nil
+}
+
+// checkFastWorktreeResumeIdentity allows skipping git worktree add only when
+// target is already a worktree of the supplied base checkout.
+func checkFastWorktreeResumeIdentity(ctx context.Context, worktreePath, basePath string) error {
+	wtCommon, err := gitCommonDir(ctx, worktreePath)
+	if err != nil {
+		return fmt.Errorf("destination %s is already a git checkout that is not a linked worktree of %s: %w", worktreePath, basePath, err)
+	}
+	baseCommon, err := gitCommonDir(ctx, basePath)
+	if err != nil {
+		return fmt.Errorf("lookup base git dir %s: %w", basePath, err)
+	}
+	if filepath.Clean(wtCommon) != filepath.Clean(baseCommon) {
+		return fmt.Errorf("destination %s is already a git checkout that is not a linked worktree of %s", worktreePath, basePath)
+	}
+	return nil
+}
+
+func gitCommonDir(ctx context.Context, repoDir string) (string, error) {
+	out, err := gitOutput(ctx, repoDir, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(out) {
+		out = filepath.Join(repoDir, out)
+	}
+	abs, err := filepath.Abs(out)
+	if err != nil {
+		return filepath.Clean(out), nil
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved, nil
+	}
+	return filepath.Clean(abs), nil
+}
+
+func sameGitRemoteIdentity(a, b string) bool {
+	ia := gitRemoteIdentity(a)
+	ib := gitRemoteIdentity(b)
+	return ia != "" && ia == ib
+}
+
+func gitRemoteIdentity(raw string) string {
+	raw = gitcache.SanitizeRepoURL(strings.TrimSpace(raw))
+	if raw == "" {
+		return ""
+	}
+	// scp-like: git@host:path
+	if !strings.Contains(raw, "://") && strings.Contains(raw, "@") {
+		parts := strings.SplitN(raw, "@", 2)
+		if len(parts) == 2 {
+			hostPath := strings.Replace(parts[1], ":", "/", 1)
+			hostPath = strings.TrimSuffix(hostPath, ".git")
+			hostPath = strings.Trim(hostPath, "/")
+			return strings.ToLower(hostPath)
+		}
+	}
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		path := strings.TrimSuffix(u.Path, ".git")
+		path = strings.Trim(path, "/")
+		return strings.ToLower(u.Host + "/" + path)
+	}
+	return strings.ToLower(strings.TrimSuffix(raw, ".git"))
 }
 
 func gitOutput(ctx context.Context, repoDir string, args ...string) (string, error) {

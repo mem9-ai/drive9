@@ -17,6 +17,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/gitcache"
+	"github.com/mem9-ai/drive9/pkg/gitwsindex"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
@@ -29,27 +30,12 @@ const (
 	maxGitObjectPackBytes     = 256 << 20
 	maxGitObjectPackBodyBytes = maxGitObjectPackBytes + maxGitObjectPackBytes/3 + 1<<20
 
-	// Tenant-absolute remote existence index (mirrors client.GitWorkspaceIndexPath).
-	gitWorkspaceIndexPath = "/.drive9/git-workspaces/index.json"
+	// Tenant-absolute remote existence index (shared wire type).
+	gitWorkspaceIndexPath = gitwsindex.Path
 
-	// Keep in sync with client.MaxGitWorkspaceIndexBytes / Entries.
-	maxGitWorkspaceIndexBytes   = 1 << 20
-	maxGitWorkspaceIndexEntries = 4096
+	maxGitWorkspaceIndexBytes   = gitwsindex.MaxBytes
+	maxGitWorkspaceIndexEntries = gitwsindex.MaxEntries
 )
-
-// gitWorkspaceIndexDoc is the remote FS document used only as an existence
-// signal for FUSE on-demand arming (same shape as the client index type).
-type gitWorkspaceIndexDoc struct {
-	Version    int                         `json:"version"`
-	UpdatedAt  string                      `json:"updated_at"`
-	Workspaces []gitWorkspaceIndexDocEntry `json:"workspaces"`
-}
-
-type gitWorkspaceIndexDocEntry struct {
-	WorkspaceID   string `json:"workspace_id"`
-	RootPath      string `json:"root_path"`
-	WorkspaceKind string `json:"workspace_kind,omitempty"`
-}
 
 type gitWorkspaceRequest struct {
 	RootPath          string `json:"root_path"`
@@ -281,12 +267,20 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 
 	workspaceID := token.NewID()
 	existing, err := store.GetGitWorkspaceByRoot(r.Context(), root)
+	replaceDeletedID := ""
 	if err == nil {
 		if workspaceKind == datastore.GitWorkspaceKindLinked && commonWorkspaceID == existing.WorkspaceID {
 			errJSON(w, http.StatusBadRequest, "linked git workspace cannot reference itself as common_workspace_id")
 			return
 		}
-		workspaceID = existing.WorkspaceID
+		if existing.Status == datastore.GitWorkspaceStatusLive {
+			// In-place update of a live workspace keeps the id.
+			workspaceID = existing.WorkspaceID
+		} else {
+			// Deleted root: mint a new id so stale runtimes holding the old
+			// id cannot write into the recreated generation.
+			replaceDeletedID = existing.WorkspaceID
+		}
 	} else if !errors.Is(err, datastore.ErrNotFound) {
 		writeGitWorkspaceStoreError(w, r, err)
 		return
@@ -312,7 +306,12 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 	if ws.Mode == "" {
 		ws.Mode = datastore.GitWorkspaceModeFast
 	}
-	if err := store.UpsertGitWorkspace(r.Context(), ws); err != nil {
+	if replaceDeletedID != "" {
+		if err := store.ReplaceDeletedGitWorkspace(r.Context(), replaceDeletedID, ws); err != nil {
+			writeGitWorkspaceStoreError(w, r, err)
+			return
+		}
+	} else if err := store.UpsertGitWorkspace(r.Context(), ws); err != nil {
 		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
@@ -431,19 +430,14 @@ func removeGitWorkspaceIndexEntry(ctx context.Context, b *backend.Dat9Backend, w
 		if int64(len(data)) > maxGitWorkspaceIndexBytes {
 			return fmt.Errorf("git workspace index exceeds maximum size (%d bytes)", maxGitWorkspaceIndexBytes)
 		}
-		var idx gitWorkspaceIndexDoc
-		if len(strings.TrimSpace(string(data))) > 0 {
-			if err := json.Unmarshal(data, &idx); err != nil {
-				return fmt.Errorf("parse git workspace index: %w", err)
-			}
-		}
-		if len(idx.Workspaces) > maxGitWorkspaceIndexEntries {
-			return fmt.Errorf("git workspace index exceeds maximum entry count (%d)", maxGitWorkspaceIndexEntries)
+		idx, err := gitwsindex.Parse(data)
+		if err != nil {
+			return err
 		}
 		if idx.Version == 0 {
 			idx.Version = 1
 		}
-		out := make([]gitWorkspaceIndexDocEntry, 0, len(idx.Workspaces))
+		out := make([]gitwsindex.Entry, 0, len(idx.Workspaces))
 		found := false
 		for _, e := range idx.Workspaces {
 			if e.WorkspaceID == workspaceID {
@@ -478,6 +472,11 @@ func removeGitWorkspaceIndexEntry(ctx context.Context, b *backend.Dat9Backend, w
 		}
 		lastErr = err
 		if errors.Is(err, datastore.ErrRevisionConflict) && attempt+1 < maxAttempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(50*(attempt+1)) * time.Millisecond):
+			}
 			continue
 		}
 		return fmt.Errorf("write git workspace index: %w", err)

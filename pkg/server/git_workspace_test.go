@@ -14,6 +14,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/gitwsindex"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
@@ -67,9 +68,9 @@ func TestGitWorkspaceDeleteRemovesIndexEntry(t *testing.T) {
 		t.Fatalf("UpsertGitWorkspace: %v", err)
 	}
 
-	idxBody, err := json.MarshalIndent(gitWorkspaceIndexDoc{
+	idxBody, err := json.MarshalIndent(gitwsindex.Index{
 		Version: 1,
-		Workspaces: []gitWorkspaceIndexDocEntry{
+		Workspaces: []gitwsindex.Entry{
 			{WorkspaceID: ws.WorkspaceID, RootPath: "/repo/"},
 			{WorkspaceID: "ws-other", RootPath: "/other/"},
 		},
@@ -87,7 +88,7 @@ func TestGitWorkspaceDeleteRemovesIndexEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read index after delete: %v", err)
 	}
-	var idx gitWorkspaceIndexDoc
+	var idx gitwsindex.Index
 	if err := json.Unmarshal(data, &idx); err != nil {
 		t.Fatalf("parse index: %v", err)
 	}
@@ -119,9 +120,9 @@ func TestGitWorkspaceDeleteIdempotentCleansStaleIndex(t *testing.T) {
 	if err := s.fallback.Store().DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
 		t.Fatalf("store.DeleteGitWorkspace: %v", err)
 	}
-	idxBody, err := json.MarshalIndent(gitWorkspaceIndexDoc{
+	idxBody, err := json.MarshalIndent(gitwsindex.Index{
 		Version: 1,
-		Workspaces: []gitWorkspaceIndexDocEntry{
+		Workspaces: []gitwsindex.Entry{
 			{WorkspaceID: ws.WorkspaceID, RootPath: "/repo2/"},
 		},
 	}, "", "  ")
@@ -138,7 +139,7 @@ func TestGitWorkspaceDeleteIdempotentCleansStaleIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read index after repair delete: %v", err)
 	}
-	var idx gitWorkspaceIndexDoc
+	var idx gitwsindex.Index
 	if err := json.Unmarshal(data, &idx); err != nil {
 		t.Fatalf("parse index: %v", err)
 	}
@@ -351,8 +352,16 @@ func TestGitWorkspaceSubresourcesRejectedAfterDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recreate UpsertGitWorkspace: %v", err)
 	}
-	if recreated.WorkspaceID != ws.WorkspaceID {
-		t.Fatalf("recreate id = %s, want reused %s", recreated.WorkspaceID, ws.WorkspaceID)
+	if recreated.WorkspaceID == ws.WorkspaceID {
+		t.Fatalf("recreate reused deleted workspace id %s", ws.WorkspaceID)
+	}
+	if _, err := c.GetGitWorkspace(ctx, ws.WorkspaceID); !client.IsNotFound(err) {
+		t.Fatalf("GET old workspace id after recreate: %v, want NotFound", err)
+	}
+	if _, err := c.PutGitOverlayEntry(ctx, ws.WorkspaceID, client.GitOverlayEntryRequest{
+		Path: "stale-runtime.txt", Op: "upsert", Kind: "file", Content: []byte("from-old-mount"),
+	}); !client.IsNotFound(err) {
+		t.Fatalf("old-generation overlay write after recreate: %v, want NotFound", err)
 	}
 	entries, err := c.ListGitOverlayEntries(ctx, recreated.WorkspaceID)
 	if err != nil {
@@ -360,6 +369,42 @@ func TestGitWorkspaceSubresourcesRejectedAfterDelete(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("recreate inherited overlay = %+v", entries)
+	}
+	if _, err := c.PutGitOverlayEntry(ctx, recreated.WorkspaceID, client.GitOverlayEntryRequest{
+		Path: "fresh.txt", Op: "upsert", Kind: "file", Content: []byte("new-gen"),
+	}); err != nil {
+		t.Fatalf("new-generation overlay write: %v", err)
+	}
+}
+
+func TestGitWorkspaceLiveUpsertKeepsID(t *testing.T) {
+	s := newTestServer(t)
+	ensureGitWorkspaceSchema(t, s)
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+
+	c := client.New(ts.URL, "")
+	ctx := context.Background()
+	first, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo-live/",
+		RepoURL:    "https://example.test/repo-live.git",
+		RemoteName: "origin",
+		HeadCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
+	if err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	second, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo-live/",
+		RepoURL:    "https://example.test/repo-live.git",
+		RemoteName: "origin",
+		HeadCommit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	})
+	if err != nil {
+		t.Fatalf("live upsert: %v", err)
+	}
+	if second.WorkspaceID != first.WorkspaceID {
+		t.Fatalf("live upsert id = %s, want %s", second.WorkspaceID, first.WorkspaceID)
 	}
 }
 
