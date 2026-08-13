@@ -636,6 +636,31 @@ put_layer_entry_expect_code() {
   check_eq "$desc" "$(http_code "$resp")" "$want_code"
 }
 
+get_layer_entry_field() {
+  local layer_ref="$1"
+  local path="$2"
+  local field="$3"
+  local resp
+  resp=$(curl_body_code GET "$BASE/v1/layers/$(url_escape "$layer_ref")/entries?path=$(url_escape "$path")" "$API_KEY")
+  if [ "$(http_code "$resp")" != "200" ]; then
+    printf 'HTTP_%s' "$(http_code "$resp")"
+    return
+  fi
+  json_body "$resp" | jq -r --arg f "$field" '.[$f] // empty'
+}
+
+get_layer_object_text() {
+  local layer_ref="$1"
+  local path="$2"
+  local resp
+  resp=$(curl_body_code GET "$BASE/v1/layers/$(url_escape "$layer_ref")/objects?path=$(url_escape "$path")" "$API_KEY")
+  if [ "$(http_code "$resp")" != "200" ]; then
+    printf 'HTTP_%s' "$(http_code "$resp")"
+    return
+  fi
+  json_body "$resp"
+}
+
 require_layer_fuse_prereqs() {
   if [ "$RUN_LAYER_FUSE_SMOKE" != "1" ]; then
     skip_layer_fuse "set RUN_LAYER_FUSE_SMOKE=1 to run real FUSE layer restore coverage"
@@ -886,6 +911,163 @@ check_eq "commit CLI --layer writes succeeds" "$cli_commit_status" "ok"
 check_eq "CLI --layer small file visible after commit" "$(drive9_retry fs cat "$cli_small_remote")" "$(cat "$cli_small_local")"
 drive9_retry fs cp ":$cli_large_remote" "$cli_large_download" >/dev/null
 check_eq "CLI --layer large file hash after commit" "$(sha256_file "$cli_large_download")" "$(sha256_file "$cli_large_local")"
+
+echo "[fork] CoW fork chain coverage"
+fork_root="/layer-fork-${ts}"
+fork_parent_name="layer-fork-parent-${ts}"
+fork_child_name="layer-fork-child-${ts}"
+fork_a="${fork_root}/parent-a.txt"
+fork_b="${fork_root}/parent-b.txt"
+fork_c="${fork_root}/child-c.txt"
+fork_mode="${fork_root}/mode.txt"
+drive9_retry fs mkdir "$fork_root" >/dev/null
+
+fork_parent_json=$(drive9_retry fs layer create \
+  --name "$fork_parent_name" \
+  --tag "fork_parent_run=$ts" \
+  --json \
+  ":$fork_root")
+fork_parent_id=$(printf '%s' "$fork_parent_json" | jq -r '.layer_id // empty')
+check_cmd "fork parent create returns id" test -n "$fork_parent_id"
+
+put_layer_entry "$fork_parent_name" "$fork_a" "upsert" "file" "parent tip before fork ${ts}"
+put_layer_entry "$fork_parent_name" "$fork_mode" "upsert" "file" "mode body ${ts}"
+put_layer_entry "$fork_parent_name" "$fork_mode" "chmod" "file" "" 384
+
+fork_child_json=$(drive9_retry fs layer fork --name "$fork_child_name" --json "$fork_parent_name")
+fork_child_id=$(printf '%s' "$fork_child_json" | jq -r '.layer_id // empty')
+check_cmd "fork child create returns id" test -n "$fork_child_id"
+check_eq "fork child parent_layer_id" "$(printf '%s' "$fork_child_json" | jq -r '.parent_layer_id')" "$fork_parent_id"
+check_eq "fork child origin is fork" "$(printf '%s' "$fork_child_json" | jq -r '.origin')" "fork"
+check_eq "fork child origin_seq > 0" "$(printf '%s' "$fork_child_json" | jq -r 'if (.origin_seq // 0) > 0 then "yes" else "no" end')" "yes"
+
+check_eq "child GET sees uncheckpointed parent tip" "$(get_layer_entry_field "$fork_child_name" "$fork_a" "content_text")" "parent tip before fork ${ts}"
+check_eq "child GET folded upsert+chmod keeps body" "$(get_layer_entry_field "$fork_child_name" "$fork_mode" "content_text")" "mode body ${ts}"
+check_eq "child GET folded upsert+chmod keeps mode" "$(get_layer_entry_field "$fork_child_name" "$fork_mode" "mode")" "384"
+check_eq "child object GET returns folded body" "$(get_layer_object_text "$fork_child_name" "$fork_mode")" "mode body ${ts}"
+
+chain_json=$(drive9_retry fs layer chain --json "$fork_child_name")
+check_eq "child chain has two frames" "$(printf '%s' "$chain_json" | jq '.chain | length')" "2"
+check_eq "child chain root is parent" "$(printf '%s' "$chain_json" | jq -r '.chain[0].layer_id')" "$fork_parent_id"
+check_eq "child chain tip is child" "$(printf '%s' "$chain_json" | jq -r '.chain[1].layer_id')" "$fork_child_id"
+
+put_layer_entry "$fork_parent_name" "$fork_b" "upsert" "file" "parent after fork ${ts}"
+check_eq "child does not see post-fork parent write" "$(get_layer_entry_field "$fork_child_name" "$fork_b" "content_text")" "HTTP_404"
+check_eq "parent still sees post-fork write" "$(get_layer_entry_field "$fork_parent_name" "$fork_b" "content_text")" "parent after fork ${ts}"
+
+find_child_out=$(drive9_retry fs find --layer "$fork_child_name" "$fork_root")
+check_eq "find --layer child sees pinned parent file" "$(printf '%s\n' "$find_child_out" | grep -F "$fork_a" | wc -l | tr -d ' ')" "1"
+check_eq "find --layer child hides post-fork parent file" "$(printf '%s\n' "$find_child_out" | grep -F "$fork_b" | wc -l | tr -d ' ')" "0"
+
+put_layer_entry "$fork_child_name" "$fork_c" "upsert" "file" "child only ${ts}"
+child_commit_out=$(drive9_retry fs layer commit "$fork_child_name")
+case "$child_commit_out" in
+  committed\ layer="$fork_child_id"\ applied=*) child_commit_status="ok" ;;
+  *) child_commit_status="$child_commit_out" ;;
+esac
+check_eq "child commit to main succeeds" "$child_commit_status" "ok"
+check_eq "child file visible on main after child commit" "$(drive9_retry fs cat "$fork_c")" "child only ${ts}"
+check_eq "parent tip file visible on main after child flatten commit" "$(drive9_retry fs cat "$fork_a")" "parent tip before fork ${ts}"
+check_eq "mode file body landed on main" "$(drive9_retry fs cat "$fork_mode")" "mode body ${ts}"
+check_cmd_fail "post-fork parent file not on main before parent commit" drive9 fs cat "$fork_b"
+
+parent_commit_out=$(drive9_retry fs layer commit "$fork_parent_name")
+case "$parent_commit_out" in
+  committed\ layer="$fork_parent_id"\ applied=*) parent_commit_status="ok" ;;
+  *) parent_commit_status="$parent_commit_out" ;;
+esac
+check_eq "parent commit succeeds while child existed" "$parent_commit_status" "ok"
+check_eq "post-fork parent file visible after parent commit" "$(drive9_retry fs cat "$fork_b")" "parent after fork ${ts}"
+
+# Parent is committed, so further forks from it must fail (D13).
+check_cmd_fail "CLI fork from committed parent fails" drive9 fs layer fork --name "from-committed-${ts}" "$fork_parent_name"
+check_cmd_fail "CLI fork from earlier committed smoke layer fails" drive9 fs layer fork --name "from-smoke-committed-${ts}" "$layer_id"
+
+# Fresh active parent+child for delete / rollback / depth / checkpoint pin.
+pin_root="/layer-fork-pin-${ts}"
+pin_parent_name="layer-fork-pin-parent-${ts}"
+pin_child_name="layer-fork-pin-child-${ts}"
+pin_file="${pin_root}/pinned.txt"
+drive9_retry fs mkdir "$pin_root" >/dev/null
+pin_parent_json=$(drive9_retry fs layer create --name "$pin_parent_name" --json ":$pin_root")
+pin_parent_id=$(printf '%s' "$pin_parent_json" | jq -r '.layer_id // empty')
+check_cmd "pin parent create returns id" test -n "$pin_parent_id"
+put_layer_entry "$pin_parent_name" "$pin_file" "upsert" "file" "pinned before rollback ${ts}"
+pin_ckpt_json=$(drive9_retry fs layer checkpoint --label pin-cp --json "$pin_parent_name")
+pin_ckpt_id=$(printf '%s' "$pin_ckpt_json" | jq -r '.checkpoint_id // empty')
+check_cmd "pin parent checkpoint id" test -n "$pin_ckpt_id"
+put_layer_entry "$pin_parent_name" "${pin_root}/after-cp.txt" "upsert" "file" "after checkpoint ${ts}"
+
+pin_cp_child_json=$(drive9_retry fs layer fork --name "layer-fork-at-cp-${ts}" --checkpoint "$pin_ckpt_id" --json "$pin_parent_name")
+pin_cp_child_id=$(printf '%s' "$pin_cp_child_json" | jq -r '.layer_id // empty')
+check_cmd "checkpoint-pin child create returns id" test -n "$pin_cp_child_id"
+check_eq "checkpoint-pin child sees pinned file" "$(get_layer_entry_field "$pin_cp_child_id" "$pin_file" "content_text")" "pinned before rollback ${ts}"
+check_eq "checkpoint-pin child hides post-checkpoint parent write" "$(get_layer_entry_field "$pin_cp_child_id" "${pin_root}/after-cp.txt" "content_text")" "HTTP_404"
+
+pin_child_json=$(drive9_retry fs layer fork --name "$pin_child_name" --json "$pin_parent_name")
+pin_child_id=$(printf '%s' "$pin_child_json" | jq -r '.layer_id // empty')
+check_cmd "tip-pin child create returns id" test -n "$pin_child_id"
+
+delete_parent_resp=$(curl_body_code DELETE "$BASE/v1/layers/$(url_escape "$pin_parent_id")" "$API_KEY")
+check_eq "DELETE parent with active child is 409" "$(http_code "$delete_parent_resp")" "409"
+
+check_eq "rollback parent with child returns ok" "$(drive9_retry fs layer rollback "$pin_parent_name")" "ok"
+check_eq "child still reads pin after parent rollback" "$(get_layer_entry_field "$pin_child_id" "$pin_file" "content_text")" "pinned before rollback ${ts}"
+
+delete_abandoned_resp=$(curl_body_code DELETE "$BASE/v1/layers/$(url_escape "$pin_parent_id")" "$API_KEY")
+check_eq "DELETE abandoned parent with active child is 409" "$(http_code "$delete_abandoned_resp")" "409"
+check_eq "cascade delete abandoned parent returns ok" "$(drive9_retry fs layer delete --cascade "$pin_parent_name")" "ok"
+check_eq "cascaded child is abandoned" "$(drive9_retry fs layer status --json "$pin_child_id" | jq -r '.state')" "abandoned"
+
+# Transitive pin: root → mid → leaf; abandon mid; DELETE root 409.
+trans_root_name="layer-fork-trans-root-${ts}"
+trans_mid_name="layer-fork-trans-mid-${ts}"
+trans_leaf_name="layer-fork-trans-leaf-${ts}"
+trans_root_json=$(drive9_retry fs layer create --name "$trans_root_name" --json ":$pin_root")
+trans_root_id=$(printf '%s' "$trans_root_json" | jq -r '.layer_id // empty')
+trans_mid_json=$(drive9_retry fs layer fork --name "$trans_mid_name" --json "$trans_root_name")
+trans_mid_id=$(printf '%s' "$trans_mid_json" | jq -r '.layer_id // empty')
+trans_leaf_json=$(drive9_retry fs layer fork --name "$trans_leaf_name" --json "$trans_mid_name")
+trans_leaf_id=$(printf '%s' "$trans_leaf_json" | jq -r '.layer_id // empty')
+check_cmd "transitive root/mid/leaf created" test -n "$trans_root_id" -a -n "$trans_mid_id" -a -n "$trans_leaf_id"
+check_eq "rollback mid with leaf returns ok" "$(drive9_retry fs layer rollback "$trans_mid_name")" "ok"
+trans_del=$(curl_body_code DELETE "$BASE/v1/layers/$(url_escape "$trans_root_id")" "$API_KEY")
+check_eq "DELETE root with active grandchild is 409" "$(http_code "$trans_del")" "409"
+check_eq "cascade delete transitive root returns ok" "$(drive9_retry fs layer delete --cascade "$trans_root_name")" "ok"
+
+depth_cur="$trans_leaf_name"
+# trans leaf was abandoned by cascade; start a new depth chain.
+depth_root_json=$(drive9_retry fs layer create --name "layer-fork-depth-0-${ts}" --json ":$pin_root")
+depth_cur=$(printf '%s' "$depth_root_json" | jq -r '.layer_id // empty')
+check_cmd "depth-0 root id" test -n "$depth_cur"
+depth_i=1
+while [ "$depth_i" -le 8 ]; do
+  depth_next_json=$(drive9_retry fs layer fork --name "layer-fork-depth-${depth_i}-${ts}" --json "$depth_cur")
+  depth_next=$(printf '%s' "$depth_next_json" | jq -r '.layer_id // empty')
+  check_cmd "fork depth ${depth_i} succeeds" test -n "$depth_next"
+  depth_cur="$depth_next"
+  depth_i=$((depth_i + 1))
+done
+check_cmd_fail "fork depth 9 is rejected" drive9 fs layer fork --name "layer-fork-depth-9-${ts}" "$depth_cur"
+
+tenant_fork_resp=$(curl_body_code POST "$BASE/v1/fork" "$API_KEY" "{\"name\":\"layer-e2e-tenant-fork-${ts}\"}")
+tenant_fork_code=$(http_code "$tenant_fork_resp")
+tenant_fork_body=$(json_body "$tenant_fork_resp")
+case "$tenant_fork_code" in
+  409)
+    if printf '%s' "$tenant_fork_body" | grep -F "/v1/layers/" >/dev/null; then
+      check_eq "share/non-branch tenant fork 409 points at layer fork" "yes" "yes"
+    else
+      check_eq "share/non-branch tenant fork 409 points at layer fork" "$tenant_fork_body" "contains /v1/layers/"
+    fi
+    ;;
+  404)
+    echo "SKIP tenant /v1/fork not enabled on this server (HTTP 404)"
+    ;;
+  *)
+    echo "SKIP tenant /v1/fork returned HTTP ${tenant_fork_code} (branch-capable or unrelated)"
+    ;;
+esac
 
 if require_layer_fuse_prereqs; then
   echo "[fuse] layer mount restore coverage"

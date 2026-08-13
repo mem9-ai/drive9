@@ -240,12 +240,10 @@ func (s *Store) listFSLayerChainEffectiveLog(ctx context.Context, layerID string
 	if err != nil {
 		return nil, err
 	}
-	if tipMaxSeq != nil && len(chain) > 0 {
-		if *tipMaxSeq < 0 {
-			return nil, fmt.Errorf("fs layer max seq must be non-negative")
-		}
-		chain[len(chain)-1].LimitSeq = *tipMaxSeq
+	if tipMaxSeq != nil && *tipMaxSeq < 0 {
+		return nil, fmt.Errorf("fs layer max seq must be non-negative")
 	}
+	chain = applyTipLimit(chain, tipMaxSeq)
 	var out []FSLayerEntry
 	for _, frame := range chain {
 		var log []FSLayerEntry
