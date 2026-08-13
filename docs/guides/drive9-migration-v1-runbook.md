@@ -139,6 +139,88 @@ production use, remove that Secret document and create the same
 `drive9-migration-credentials` Secret from a protected local file or secret
 manager. Never commit the populated manifest.
 
+## Aggregate status with the kubectl plugin
+
+Label the Migration DaemonSet and its Pod template so the client-side plugin can
+discover Workers. Use one instance value for one customer migration batch:
+
+```yaml
+metadata:
+  labels:
+    app.kubernetes.io/name: drive9-migration
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/instance: customer-a-20260810
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: drive9-migration
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/instance: customer-a-20260810
+```
+
+The Worker container name must be `drive9-migration`. Download the plugin
+artifact for the operator's platform together with
+`migration-kube-plugin-checksums.txt`. Verify the downloaded artifact before
+installing it. For Linux:
+
+```bash
+plugin_artifact=kubectl-drive9-migration-linux-amd64
+grep " $plugin_artifact$" migration-kube-plugin-checksums.txt |
+  sha256sum --check
+```
+
+For macOS:
+
+```bash
+plugin_artifact=kubectl-drive9-migration-darwin-arm64
+grep " $plugin_artifact$" migration-kube-plugin-checksums.txt |
+  shasum --algorithm 256 --check
+```
+
+For Windows PowerShell:
+
+```powershell
+$artifact = "kubectl-drive9-migration-windows-amd64.exe"
+$line = Get-Content migration-kube-plugin-checksums.txt |
+  Where-Object { $_ -match "  $([regex]::Escape($artifact))$" }
+if (-not $line) { throw "checksum entry not found" }
+$expected = ($line -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 $artifact).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "checksum mismatch" }
+```
+
+Choose the artifact name matching the operator's architecture. After successful
+verification, rename it to `kubectl-drive9-migration`
+(`kubectl-drive9-migration.exe` on Windows), make it executable where
+applicable, and place it on `PATH`. Confirm discovery with:
+
+```bash
+kubectl plugin list
+```
+
+The zero-argument command queries all labeled Workers in the current namespace:
+
+```bash
+kubectl drive9 migration status
+kubectl drive9 migration status --batch customer-a-20260810
+kubectl drive9 migration status -n migration-system
+kubectl drive9 migration status -A
+kubectl drive9 migration status -o wide
+kubectl drive9 migration status -o json
+```
+
+The plugin uses the operator's existing kubectl context and Pod list/exec
+permissions. It does not read the Migration ConfigMap or Secret and does not add
+RBAC. Each summary deliberately says `observed N jobs`: a Job with no Pod is not
+discoverable. Pending, Failed, Terminating, unreachable, and duplicate observed
+Pods remain visible and make the command exit nonzero. Attention and incomplete
+migration remain status facts and do not make an otherwise complete query fail.
+
+An observed `CUTOVER_READY` summary does not prove that every configured Job was
+discovered, does not prove external T1, and does not authorize the business
+switch. The T1 and T2 gates below remain authoritative.
+
 ## SYNCING and rollout readiness
 
 Inspect each Job independently:
