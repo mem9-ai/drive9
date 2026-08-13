@@ -239,7 +239,7 @@ func TestReplayFSLayerOverlayRecreateSourceAfterRenameIntoNewDir(t *testing.T) {
 	if len(idx) != 3 {
 		t.Fatalf("drafts=%+v, missing mkdir/rename/recreate", drafts)
 	}
-	if !(idx["mkdir"] < idx["rename"] && idx["rename"] < idx["recreate"]) {
+	if idx["mkdir"] >= idx["rename"] || idx["rename"] >= idx["recreate"] {
 		t.Fatalf("order mkdir=%d rename=%d recreate=%d, want mkdir < rename < recreate; drafts=%+v", idx["mkdir"], idx["rename"], idx["recreate"], drafts)
 	}
 }
