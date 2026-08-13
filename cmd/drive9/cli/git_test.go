@@ -166,10 +166,10 @@ func TestExistingFastGitCheckout(t *testing.T) {
 func TestPublishGitWorkspaceIndexRetryable(t *testing.T) {
 	var attempts atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodHead || r.Method == http.MethodGet:
+		switch r.Method {
+		case http.MethodHead, http.MethodGet:
 			http.NotFound(w, r)
-		case r.Method == http.MethodPut:
+		case http.MethodPut:
 			n := attempts.Add(1)
 			if n == 1 {
 				http.Error(w, "conflict", http.StatusConflict)
