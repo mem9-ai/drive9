@@ -67,23 +67,23 @@ const (
 )
 
 type FSLayer struct {
-	LayerID             string
-	BaseRootPath        string
-	Name                string
-	Tags                map[string]string
-	State               FSLayerState
-	DurabilityMode      FSLayerDurabilityMode
-	ActorID             string
-	DurableSeq          int64
-	ParentLayerID       string
-	OriginSeq           int64
-	OriginCheckpointID  string
-	RootLayerID         string
-	Depth               int
-	Origin              string
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
-	SealedAt            *time.Time
+	LayerID            string
+	BaseRootPath       string
+	Name               string
+	Tags               map[string]string
+	State              FSLayerState
+	DurabilityMode     FSLayerDurabilityMode
+	ActorID            string
+	DurableSeq         int64
+	ParentLayerID      string
+	OriginSeq          int64
+	OriginCheckpointID string
+	RootLayerID        string
+	Depth              int
+	Origin             string
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+	SealedAt           *time.Time
 }
 
 type FSLayerEntry struct {
@@ -1106,9 +1106,9 @@ func validateFSLayerEntryWithinBaseRoot(entry *FSLayerEntry, baseRoot string) er
 	if entry.Op != FSLayerEntryOpRename {
 		return nil
 	}
-	target := strings.TrimSpace(entry.ContentText)
+	target := entry.ContentText
 	if target == "" && len(entry.ContentBlob) > 0 {
-		target = strings.TrimSpace(string(entry.ContentBlob))
+		target = string(entry.ContentBlob)
 	}
 	if target == "" {
 		return nil

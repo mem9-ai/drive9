@@ -293,7 +293,10 @@ func Mount(opts *MountOptions) error {
 		if err != nil {
 			return fmt.Errorf("mount: resolve fs layer %q: %w", opts.LayerRef, err)
 		}
-		if layer.State != "active" {
+		if !fsLayerMountStateAllowed(layer.State, opts.CheckpointRef != "") {
+			if opts.CheckpointRef != "" {
+				return fmt.Errorf("mount: fs layer %q is %s, checkpoint mount requires active, sealed, or committed", opts.LayerRef, layer.State)
+			}
 			return fmt.Errorf("mount: fs layer %q is %s, want active", opts.LayerRef, layer.State)
 		}
 		opts.LayerRef = layer.LayerID
@@ -1148,15 +1151,30 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 }
 
 func layerEntryFetchMaxSeq(entry *client.FSLayerEntry, hasCheckpoint bool, checkpointMaxSeq int64) *int64 {
-	if entry != nil && entry.EntrySeq > 0 {
-		seq := entry.EntrySeq
-		return &seq
-	}
+	// Checkpoint restores must stay pinned to the checkpoint tip. Ancestor
+	// rows can carry a larger entry_seq than the child tip; using that seq
+	// against the child layer would leak later child writes into the view.
 	if hasCheckpoint {
 		seq := checkpointMaxSeq
 		return &seq
 	}
+	if entry != nil && entry.EntrySeq > 0 {
+		seq := entry.EntrySeq
+		return &seq
+	}
 	return nil
+}
+
+func fsLayerMountStateAllowed(state string, checkpoint bool) bool {
+	if checkpoint {
+		switch state {
+		case "active", "sealed", "committed":
+			return true
+		default:
+			return false
+		}
+	}
+	return state == "active"
 }
 
 func getLayerEntryForRestore(ctx context.Context, c *client.Client, layerID, path string, maxSeq *int64) (*client.FSLayerEntry, error) {
@@ -1178,9 +1196,9 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 		}
 		fullEntry = fetched
 	}
-	targetRemote := strings.TrimSpace(fullEntry.ContentText)
+	targetRemote := fullEntry.ContentText
 	if targetRemote == "" && len(fullEntry.Content) > 0 {
-		targetRemote = strings.TrimSpace(string(fullEntry.Content))
+		targetRemote = string(fullEntry.Content)
 	}
 	if targetRemote == "" {
 		return fmt.Errorf("restore fs layer rename entry %s: missing target", entry.Path)

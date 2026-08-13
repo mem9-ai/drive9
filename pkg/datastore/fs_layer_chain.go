@@ -27,7 +27,7 @@ type FSLayerForkOptions struct {
 
 // FSLayerChainFrame is one hop on the parent chain from root toward tip.
 type FSLayerChainFrame struct {
-	Layer     FSLayer
+	Layer FSLayer
 	// LimitSeq is the max entry_seq visible on this layer for the requesting child.
 	// For the tip layer itself, LimitSeq is -1 meaning tip (no max).
 	LimitSeq int64
@@ -111,7 +111,7 @@ WHERE `+s.scope.And(`checkpoint_id = ?`), s.scope.Args(checkpointID)...).Scan(&c
 			return nil, fmt.Errorf("read checkpoint %s: %w", checkpointID, err)
 		}
 		if cpLayer != parentID {
-			return nil, fmt.Errorf("checkpoint %s does not belong to parent layer %s", checkpointID, parentID)
+			return nil, fmt.Errorf("%w: checkpoint %s does not belong to parent layer %s", ErrFSLayerStateConflict, checkpointID, parentID)
 		}
 		originSeq = cpSeq
 		originCheckpointID = checkpointID
@@ -382,6 +382,9 @@ func (s *Store) DeleteFSLayer(ctx context.Context, layerID string, opts DeleteFS
 	if err != nil {
 		return err
 	}
+	if layer.State == FSLayerStateCommitting {
+		return fmt.Errorf("%w: layer %s is committing", ErrFSLayerStateConflict, layerID)
+	}
 	pins, err := s.FSLayerStillPins(ctx, layerID)
 	if err != nil {
 		return err
@@ -406,7 +409,7 @@ func (s *Store) DeleteFSLayer(ctx context.Context, layerID string, opts DeleteFS
 	}
 	// Logical abandon; preserve entries for any residual pin safety.
 	if err := s.SetFSLayerStateIf(ctx, layerID,
-		[]FSLayerState{FSLayerStateActive, FSLayerStateSealed, FSLayerStateConflicted, FSLayerStateCommitted, FSLayerStateCommitting},
+		[]FSLayerState{FSLayerStateActive, FSLayerStateSealed, FSLayerStateConflicted, FSLayerStateCommitted},
 		FSLayerStateAbandoned); err != nil {
 		// Already abandoned or wrong state — re-check.
 		cur, gerr := s.GetFSLayer(ctx, layerID)

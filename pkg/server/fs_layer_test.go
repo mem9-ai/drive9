@@ -544,6 +544,377 @@ func TestFSLayerCommitRejectsCommittingWithoutFence(t *testing.T) {
 	}
 }
 
+func TestFSLayerChildObjectReadHonorsExplicitZeroMaxSeq(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-obj-parent",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-obj-parent", client.FSLayerEntryRequest{
+		Path:    "/repo/a.txt",
+		Op:      "upsert",
+		Kind:    "file",
+		Content: []byte("v1"),
+		Mode:    0o644,
+	}); err != nil {
+		t.Fatalf("parent upsert: %v", err)
+	}
+	if _, err := c.ForkFSLayer(ctx, "layer-obj-parent", client.FSLayerForkRequest{
+		LayerID: "layer-obj-child",
+	}); err != nil {
+		t.Fatalf("fork: %v", err)
+	}
+	if _, err := c.CheckpointFSLayer(ctx, "layer-obj-child", client.FSLayerCheckpointRequest{
+		CheckpointID: "cp-child-zero",
+	}); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-obj-child", client.FSLayerEntryRequest{
+		Path:    "/repo/a.txt",
+		Op:      "upsert",
+		Kind:    "file",
+		Content: []byte("v2"),
+		Mode:    0o644,
+	}); err != nil {
+		t.Fatalf("child upsert: %v", err)
+	}
+	zero := int64(0)
+	got, err := c.ReadFSLayerFile(ctx, "layer-obj-child", "/repo/a.txt", &zero)
+	if err != nil {
+		t.Fatalf("ReadFSLayerFile max_seq=0: %v", err)
+	}
+	if !bytes.Equal(got, []byte("v1")) {
+		t.Fatalf("max_seq=0 content=%q, want v1 (checkpoint tip, not later child write)", got)
+	}
+	tip, err := c.ReadFSLayerFile(ctx, "layer-obj-child", "/repo/a.txt", nil)
+	if err != nil {
+		t.Fatalf("ReadFSLayerFile tip: %v", err)
+	}
+	if !bytes.Equal(tip, []byte("v2")) {
+		t.Fatalf("tip content=%q, want v2", tip)
+	}
+}
+
+func TestFSLayerOverlayMatchesMainRejectsSizeOnlyEquality(t *testing.T) {
+	e := &datastore.FSLayerEntry{
+		Op:          datastore.FSLayerEntryOpUpsert,
+		Kind:        datastore.FSLayerEntryKindFile,
+		ContentBlob: []byte("aaaa"),
+		SizeBytes:   4,
+		Mode:        0o644,
+	}
+	nf := &datastore.NodeWithFile{
+		File: &datastore.File{SizeBytes: 4, Mode: 0o644},
+	}
+	if fsLayerOverlayMatchesMain(e, nf) {
+		t.Fatal("size-only inline blob must not match main")
+	}
+}
+
+func TestPlanFSLayerCommitVsMainKeepsFileRecreateAfterRenameVacates(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if _, _, err := s.fallback.WriteCtxIfRevisionWithTagsResult(ctx, "/repo/a.txt", []byte("hello"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, -1, nil, ""); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	overlay := map[string]datastore.FSLayerOverlayNode{
+		"/repo/b.txt": {
+			Path:       "/repo/b.txt",
+			RenameFrom: "/repo/a.txt",
+			Kind:       datastore.FSLayerEntryKindFile,
+			Entry: datastore.FSLayerEntry{
+				Path:        "/repo/a.txt",
+				Op:          datastore.FSLayerEntryOpRename,
+				Kind:        datastore.FSLayerEntryKindFile,
+				ContentText: "/repo/b.txt",
+			},
+		},
+		"/repo/a.txt": {
+			Path:    "/repo/a.txt",
+			HasBody: true,
+			Kind:    datastore.FSLayerEntryKindFile,
+			Mode:    0o644,
+			Entry: datastore.FSLayerEntry{
+				Path:           "/repo/a.txt",
+				Op:             datastore.FSLayerEntryOpUpsert,
+				Kind:           datastore.FSLayerEntryKindFile,
+				ContentBlob:    []byte("hello"),
+				ChecksumSHA256: "unused-equal-size-must-not-matter",
+				SizeBytes:      5,
+				Mode:           0o644,
+			},
+		},
+	}
+	// Give the overlay entry the live checksum so a naive match would skip.
+	nf, err := s.fallback.StatNodeCtx(ctx, "/repo/a.txt")
+	if err != nil {
+		t.Fatalf("stat a.txt: %v", err)
+	}
+	if nf.File != nil {
+		n := overlay["/repo/a.txt"]
+		n.Entry.ChecksumSHA256 = nf.File.ChecksumSHA256
+		overlay["/repo/a.txt"] = n
+	}
+	entries, err := planFSLayerCommitVsMain(ctx, s.fallback, overlay)
+	if err != nil {
+		t.Fatalf("planFSLayerCommitVsMain: %v", err)
+	}
+	var sawRename, sawUpsert bool
+	for _, e := range entries {
+		if e.Op == datastore.FSLayerEntryOpRename && e.Path == "/repo/a.txt" {
+			sawRename = true
+		}
+		if e.Op == datastore.FSLayerEntryOpUpsert && e.Path == "/repo/a.txt" {
+			sawUpsert = true
+		}
+	}
+	if !sawRename || !sawUpsert {
+		t.Fatalf("entries=%+v, want rename plus identical-body recreate", entries)
+	}
+}
+
+func TestPlanFSLayerCommitVsMainKeepsSymlinkRecreateAfterRenameVacates(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if err := s.fallback.CreateSymlinkCtx(ctx, "/repo/link", "target.txt"); err != nil {
+		t.Fatalf("CreateSymlinkCtx: %v", err)
+	}
+	overlay := map[string]datastore.FSLayerOverlayNode{
+		"/repo/link2": {
+			Path:       "/repo/link2",
+			RenameFrom: "/repo/link",
+			Kind:       datastore.FSLayerEntryKindSymlink,
+			Entry: datastore.FSLayerEntry{
+				Path:        "/repo/link",
+				Op:          datastore.FSLayerEntryOpRename,
+				Kind:        datastore.FSLayerEntryKindSymlink,
+				ContentText: "/repo/link2",
+			},
+		},
+		"/repo/link": {
+			Path:    "/repo/link",
+			HasBody: true,
+			Kind:    datastore.FSLayerEntryKindSymlink,
+			Entry: datastore.FSLayerEntry{
+				Path:        "/repo/link",
+				Op:          datastore.FSLayerEntryOpSymlink,
+				Kind:        datastore.FSLayerEntryKindSymlink,
+				ContentText: "target.txt",
+			},
+		},
+	}
+	entries, err := planFSLayerCommitVsMain(ctx, s.fallback, overlay)
+	if err != nil {
+		t.Fatalf("planFSLayerCommitVsMain: %v", err)
+	}
+	var sawRename, sawSymlink bool
+	for _, e := range entries {
+		if e.Op == datastore.FSLayerEntryOpRename && e.Path == "/repo/link" {
+			sawRename = true
+		}
+		if e.Op == datastore.FSLayerEntryOpSymlink && e.Path == "/repo/link" {
+			sawSymlink = true
+		}
+	}
+	if !sawRename || !sawSymlink {
+		t.Fatalf("entries=%+v, want rename plus identical symlink recreate", entries)
+	}
+}
+
+func TestPlanFSLayerCommitVsMainKeepsMkdirAfterRenameVacatesDir(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if err := s.fallback.MkdirCtx(ctx, "/repo/", 0o755); err != nil {
+		t.Fatalf("mkdir /repo/: %v", err)
+	}
+	if err := s.fallback.MkdirCtx(ctx, "/repo/old/", 0o755); err != nil {
+		t.Fatalf("mkdir /repo/old/: %v", err)
+	}
+	overlay := map[string]datastore.FSLayerOverlayNode{
+		"/repo/new/": {
+			Path:       "/repo/new/",
+			RenameFrom: "/repo/old/",
+			Kind:       datastore.FSLayerEntryKindDir,
+			Entry: datastore.FSLayerEntry{
+				Path:        "/repo/old/",
+				Op:          datastore.FSLayerEntryOpRename,
+				Kind:        datastore.FSLayerEntryKindDir,
+				ContentText: "/repo/new/",
+			},
+		},
+		"/repo/old/": {
+			Path:    "/repo/old/",
+			HasBody: true,
+			Kind:    datastore.FSLayerEntryKindDir,
+			Mode:    0o755,
+			Entry:   datastore.FSLayerEntry{Path: "/repo/old/", Op: datastore.FSLayerEntryOpMkdir, Kind: datastore.FSLayerEntryKindDir, Mode: 0o755},
+		},
+	}
+	entries, err := planFSLayerCommitVsMain(ctx, s.fallback, overlay)
+	if err != nil {
+		t.Fatalf("planFSLayerCommitVsMain: %v", err)
+	}
+	var sawRename, sawMkdir bool
+	for _, e := range entries {
+		if e.Op == datastore.FSLayerEntryOpRename && e.Path == "/repo/old/" {
+			sawRename = true
+		}
+		if e.Op == datastore.FSLayerEntryOpMkdir && e.Path == "/repo/old/" {
+			sawMkdir = true
+		}
+	}
+	if !sawRename || !sawMkdir {
+		t.Fatalf("entries=%+v, want rename vacate plus mkdir recreate", entries)
+	}
+}
+
+func TestPlanFSLayerCommitVsMainKeepsChmodAfterMissingRenameDest(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	overlay := map[string]datastore.FSLayerOverlayNode{
+		"/repo/b.txt": {
+			Path:       "/repo/b.txt",
+			RenameFrom: "/repo/a.txt",
+			Kind:       datastore.FSLayerEntryKindFile,
+			Mode:       0o600,
+			ModeSet:    true,
+			Entry: datastore.FSLayerEntry{
+				Path:        "/repo/a.txt",
+				Op:          datastore.FSLayerEntryOpRename,
+				Kind:        datastore.FSLayerEntryKindFile,
+				ContentText: "/repo/b.txt",
+				Mode:        0o600,
+			},
+		},
+		"/repo/a.txt": {
+			Path:             "/repo/a.txt",
+			Whiteout:         true,
+			ConsumedByRename: true,
+			Kind:             datastore.FSLayerEntryKindFile,
+			Entry:            datastore.FSLayerEntry{Path: "/repo/a.txt", Op: datastore.FSLayerEntryOpWhiteout},
+		},
+	}
+	entries, err := planFSLayerCommitVsMain(ctx, s.fallback, overlay)
+	if err != nil {
+		t.Fatalf("planFSLayerCommitVsMain: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries=%+v, want rename then dest chmod", entries)
+	}
+	if entries[0].Op != datastore.FSLayerEntryOpRename || entries[0].Path != "/repo/a.txt" {
+		t.Fatalf("first=%+v, want rename", entries[0])
+	}
+	if entries[1].Op != datastore.FSLayerEntryOpChmod || entries[1].Path != "/repo/b.txt" || entries[1].Mode&0o777 != 0o600 {
+		t.Fatalf("second=%+v, want chmod dest 0600", entries[1])
+	}
+}
+
+func TestPlanFSLayerCommitVsMainKeepsMissingSourceRename(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	overlay := map[string]datastore.FSLayerOverlayNode{
+		"/repo/b.txt": {
+			Path:       "/repo/b.txt",
+			RenameFrom: "/repo/a.txt",
+			Kind:       datastore.FSLayerEntryKindFile,
+			Entry: datastore.FSLayerEntry{
+				Path:        "/repo/a.txt",
+				Op:          datastore.FSLayerEntryOpRename,
+				Kind:        datastore.FSLayerEntryKindFile,
+				ContentText: "/repo/b.txt",
+			},
+		},
+		"/repo/a.txt": {
+			Path:             "/repo/a.txt",
+			Whiteout:         true,
+			ConsumedByRename: true,
+			Kind:             datastore.FSLayerEntryKindFile,
+			Entry:            datastore.FSLayerEntry{Path: "/repo/a.txt", Op: datastore.FSLayerEntryOpWhiteout},
+		},
+	}
+	entries, err := planFSLayerCommitVsMain(ctx, s.fallback, overlay)
+	if err != nil {
+		t.Fatalf("planFSLayerCommitVsMain: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Op != datastore.FSLayerEntryOpRename || entries[0].Path != "/repo/a.txt" {
+		t.Fatalf("entries=%+v, want kept missing-source rename", entries)
+	}
+}
+
+func TestFSLayerChildCommitDirectoryRenameMovesDescendants(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	if err := s.fallback.MkdirCtx(ctx, "/repo/", 0o755); err != nil {
+		t.Fatalf("MkdirCtx /repo/: %v", err)
+	}
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-parent-dir",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-parent-dir", client.FSLayerEntryRequest{
+		Path: "/repo/old/",
+		Op:   "mkdir",
+		Kind: "dir",
+		Mode: 0o755,
+	}); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-parent-dir", client.FSLayerEntryRequest{
+		Path:      "/repo/old/child.txt",
+		Op:        "upsert",
+		Kind:      "file",
+		Content:   []byte("child"),
+		SizeBytes: 5,
+		Mode:      0o644,
+	}); err != nil {
+		t.Fatalf("upsert child: %v", err)
+	}
+	if _, err := c.ForkFSLayer(ctx, "layer-parent-dir", client.FSLayerForkRequest{
+		LayerID: "layer-child-dir",
+		Name:    "child",
+	}); err != nil {
+		t.Fatalf("ForkFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-child-dir", client.FSLayerEntryRequest{
+		Path:        "/repo/old/",
+		Op:          "rename",
+		Kind:        "dir",
+		ContentText: "/repo/new/",
+	}); err != nil {
+		t.Fatalf("rename dir: %v", err)
+	}
+	commit, err := c.CommitFSLayer(ctx, "layer-child-dir")
+	if err != nil {
+		t.Fatalf("CommitFSLayer: %v commit=%+v", err, commit)
+	}
+	if commit.Status != "committed" {
+		t.Fatalf("commit = %+v, want committed", commit)
+	}
+	if _, err := s.fallback.StatNodeCtx(ctx, "/repo/old/child.txt"); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("old child stat err=%v, want ErrNotFound", err)
+	}
+	got, err := s.fallback.ReadCtx(ctx, "/repo/new/child.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("ReadCtx new child: %v", err)
+	}
+	if !bytes.Equal(got, []byte("child")) {
+		t.Fatalf("new child content = %q, want child", got)
+	}
+}
+
 func TestFSLayerCommitDirectoryRename(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

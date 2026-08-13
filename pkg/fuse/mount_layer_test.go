@@ -419,6 +419,97 @@ func TestRestoreLayerEntriesStreamsObjectBackedFile(t *testing.T) {
 	}
 }
 
+func TestRestoreLayerEntriesHonorsChildCheckpointTipNotAncestorSeq(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layer-checkpoints/cp-child":
+			_ = json.NewEncoder(w).Encode(client.FSLayerCheckpoint{
+				CheckpointID: "cp-child",
+				LayerID:      "child-1",
+				DurableSeq:   0,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/child-1/diff":
+			if r.URL.Query().Get("max_seq") != "0" {
+				t.Errorf("diff max_seq = %q, want 0", r.URL.Query().Get("max_seq"))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []client.FSLayerEntry{
+					{LayerID: "parent-1", Path: "/repo/a.txt", Op: "upsert", Kind: "file", SizeBytes: 2, EntrySeq: 10},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/child-1/entries":
+			if r.URL.Query().Get("path") != "/repo/a.txt" {
+				t.Errorf("unexpected entry path: %q", r.URL.Query().Get("path"))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if r.URL.Query().Get("max_seq") != "0" {
+				t.Errorf("entry max_seq = %q, want checkpoint tip 0 not ancestor seq 10", r.URL.Query().Get("max_seq"))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+				LayerID:   "parent-1",
+				Path:      "/repo/a.txt",
+				Op:        "upsert",
+				Kind:      "file",
+				Content:   []byte("v1"),
+				SizeBytes: 2,
+				EntrySeq:  10,
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreLayerEntries(context.Background(), client.New(ts.URL, ""), &MountOptions{
+		LayerRef:      "child-1",
+		CheckpointRef: "cp-child",
+		RemoteRoot:    "/repo",
+	}, shadow, pending, nil); err != nil {
+		t.Fatalf("restoreLayerEntries: %v", err)
+	}
+	got, err := shadow.ReadAll("/a.txt")
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, []byte("v1")) {
+		t.Fatalf("restored = %q, want v1", got)
+	}
+}
+
+func TestFSLayerMountStateAllowed(t *testing.T) {
+	if !fsLayerMountStateAllowed("active", false) {
+		t.Fatal("writable mount should allow active")
+	}
+	if fsLayerMountStateAllowed("sealed", false) {
+		t.Fatal("writable mount should reject sealed")
+	}
+	if fsLayerMountStateAllowed("committed", false) {
+		t.Fatal("writable mount should reject committed")
+	}
+	if !fsLayerMountStateAllowed("sealed", true) || !fsLayerMountStateAllowed("committed", true) {
+		t.Fatal("checkpoint mount should allow sealed and committed")
+	}
+	if fsLayerMountStateAllowed("abandoned", true) || fsLayerMountStateAllowed("committing", true) {
+		t.Fatal("checkpoint mount should reject abandoned and committing")
+	}
+}
+
 func TestRestoreLayerChmodOnlyFileRecordsModeOverlay(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

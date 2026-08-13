@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -500,13 +501,17 @@ func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request,
 	if !authorizeFS(w, r, FSOpRead, path) {
 		return
 	}
-	maxSeq := parseFSLayerInt64Query(r, "max_seq")
+	maxSeq, hasMaxSeq, err := fsLayerMaxSeqFromRequest(r)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	var (
 		entry *datastore.FSLayerEntry
 	)
 	if layer.HasParent() {
 		var tipMax *int64
-		if maxSeq > 0 {
+		if hasMaxSeq {
 			tipMax = &maxSeq
 		}
 		var hit bool
@@ -519,7 +524,7 @@ func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request,
 			errJSON(w, http.StatusNotFound, "not found")
 			return
 		}
-	} else if maxSeq > 0 {
+	} else if hasMaxSeq {
 		entry, err = store.GetFSLayerEntryAtSeq(r.Context(), layer.LayerID, path, maxSeq)
 		if err != nil {
 			writeFSLayerStoreError(w, r, err)
@@ -1352,14 +1357,19 @@ func planFSLayerCommitVsMain(ctx context.Context, b *backendpkg.Dat9Backend, ove
 		}
 		missing := errors.Is(err, datastore.ErrNotFound)
 		if e.Op == datastore.FSLayerEntryOpRename {
-			srcNF, srcErr := b.StatNodeCtx(ctx, e.Path)
-			if srcErr != nil && !errors.Is(srcErr, datastore.ErrNotFound) {
-				return nil, srcErr
+			if missing {
+				dest := fsLayerRenameTarget(&e)
+				if dest != "" {
+					_, destErr := b.StatNodeCtx(ctx, dest)
+					if destErr != nil && !errors.Is(destErr, datastore.ErrNotFound) {
+						return nil, destErr
+					}
+					if destErr == nil {
+						// Source gone and dest present: rename already applied.
+						continue
+					}
+				}
 			}
-			if errors.Is(srcErr, datastore.ErrNotFound) {
-				continue
-			}
-			_ = srcNF
 			fillFSLayerBaseSnapshot(ctx, b, &e)
 			out = append(out, e)
 			continue
@@ -1374,7 +1384,12 @@ func planFSLayerCommitVsMain(ctx context.Context, b *backendpkg.Dat9Backend, ove
 		}
 		if e.Op == datastore.FSLayerEntryOpChmod {
 			if missing {
-				// chmod-only with no main path: nothing to apply
+				// Dest does not exist on live main yet, but a kept rename in
+				// this apply set will create it (chmod after main-backed rename).
+				if fsLayerDraftRenameCreates(drafts, e.Path) {
+					fillFSLayerBaseSnapshot(ctx, b, &e)
+					out = append(out, e)
+				}
 				continue
 			}
 			if overlayNodeModeMatches(nf, e.Mode) {
@@ -1385,6 +1400,12 @@ func planFSLayerCommitVsMain(ctx context.Context, b *backendpkg.Dat9Backend, ove
 			continue
 		}
 		if e.Kind == datastore.FSLayerEntryKindDir || e.Op == datastore.FSLayerEntryOpMkdir {
+			if fsLayerDraftRenameVacates(drafts, e.Path) {
+				// mv dir new; mkdir dir — live main still has the old dir.
+				fillFSLayerBaseSnapshot(ctx, b, &e)
+				out = append(out, e)
+				continue
+			}
 			if !missing && nf.Node.IsDirectory {
 				if overlayNodeModeMatches(nf, e.Mode) {
 					continue
@@ -1399,7 +1420,7 @@ func planFSLayerCommitVsMain(ctx context.Context, b *backendpkg.Dat9Backend, ove
 			continue
 		}
 		if e.Op == datastore.FSLayerEntryOpSymlink || e.Kind == datastore.FSLayerEntryKindSymlink {
-			if !missing {
+			if !missing && !fsLayerDraftRenameVacates(drafts, e.Path) {
 				same, serr := fsLayerSymlinkMatchesMain(ctx, b, &e)
 				if serr != nil {
 					return nil, serr
@@ -1412,13 +1433,54 @@ func planFSLayerCommitVsMain(ctx context.Context, b *backendpkg.Dat9Backend, ove
 			out = append(out, e)
 			continue
 		}
-		if !missing && nf.File != nil && fsLayerOverlayMatchesMain(&e, nf) {
-			continue
+		if !missing && nf.File != nil && !fsLayerDraftRenameVacates(drafts, e.Path) {
+			if fsLayerOverlayMatchesMain(&e, nf) {
+				continue
+			}
+			same, cmpErr := fsLayerInlineBlobMatchesMain(ctx, b, &e, nf)
+			if cmpErr != nil {
+				return nil, cmpErr
+			}
+			if same {
+				continue
+			}
 		}
 		fillFSLayerBaseSnapshot(ctx, b, &e)
 		out = append(out, e)
 	}
 	return out, nil
+}
+
+func fsLayerDraftRenameVacates(drafts []datastore.FSLayerEntry, path string) bool {
+	if path == "" {
+		return false
+	}
+	for i := range drafts {
+		if drafts[i].Op == datastore.FSLayerEntryOpRename && drafts[i].Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+func fsLayerDraftRenameCreates(drafts []datastore.FSLayerEntry, path string) bool {
+	if path == "" {
+		return false
+	}
+	for i := range drafts {
+		if drafts[i].Op != datastore.FSLayerEntryOpRename {
+			continue
+		}
+		dest := fsLayerRenameTarget(&drafts[i])
+		if dest == path {
+			return true
+		}
+		destPath, err := canonicalFSLayerServerPath(dest, "", string(drafts[i].Kind))
+		if err == nil && destPath == path {
+			return true
+		}
+	}
+	return false
 }
 
 func overlayNodeModeMatches(nf *datastore.NodeWithFile, mode uint32) bool {
@@ -1470,19 +1532,46 @@ func fsLayerOverlayMatchesMain(e *datastore.FSLayerEntry, nf *datastore.NodeWith
 	if e.StorageRef != "" && nf.File.StorageRef == e.StorageRef && e.SizeBytes == nf.File.SizeBytes {
 		return true
 	}
-	if len(e.ContentBlob) > 0 && int64(len(e.ContentBlob)) == nf.File.SizeBytes && overlayNodeModeMatches(nf, e.Mode) {
-		return true
-	}
 	return false
+}
+
+func fsLayerInlineBlobMatchesMain(ctx context.Context, b *backendpkg.Dat9Backend, e *datastore.FSLayerEntry, nf *datastore.NodeWithFile) (bool, error) {
+	if b == nil || e == nil || nf == nil || nf.File == nil || len(e.ContentBlob) == 0 {
+		return false, nil
+	}
+	if e.ChecksumSHA256 != "" || e.StorageRef != "" {
+		return false, nil
+	}
+	if !overlayNodeModeMatches(nf, e.Mode) {
+		return false, nil
+	}
+	data, err := b.ReadCtx(ctx, e.Path, 0, -1)
+	if errors.Is(err, datastore.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(data, e.ContentBlob), nil
 }
 
 func fsLayerSymlinkMatchesMain(ctx context.Context, b *backendpkg.Dat9Backend, e *datastore.FSLayerEntry) (bool, error) {
 	if b == nil || e == nil {
 		return false, nil
 	}
-	want := strings.TrimSpace(e.ContentText)
+	nf, err := b.StatNodeCtx(ctx, e.Path)
+	if errors.Is(err, datastore.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if nf.File == nil || !isFSLayerSymlinkMode(nf.File.Mode) {
+		return false, nil
+	}
+	want := e.ContentText
 	if want == "" && len(e.ContentBlob) > 0 {
-		want = strings.TrimSpace(string(e.ContentBlob))
+		want = string(e.ContentBlob)
 	}
 	if want == "" {
 		return false, nil

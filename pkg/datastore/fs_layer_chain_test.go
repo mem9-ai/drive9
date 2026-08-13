@@ -13,10 +13,10 @@ func TestForkFSLayerTipPinSeesUncheckpointedEntries(t *testing.T) {
 		t.Fatalf("CreateFSLayer: %v", err)
 	}
 	if err := s.UpsertFSLayerEntry(ctx, &FSLayerEntry{
-		LayerID: "parent-tip",
-		Path:    "/repo/a.txt",
-		Op:      FSLayerEntryOpUpsert,
-		Kind:    FSLayerEntryKindFile,
+		LayerID:     "parent-tip",
+		Path:        "/repo/a.txt",
+		Op:          FSLayerEntryOpUpsert,
+		Kind:        FSLayerEntryKindFile,
 		ContentBlob: []byte("hello"),
 	}); err != nil {
 		t.Fatalf("UpsertFSLayerEntry: %v", err)
@@ -214,6 +214,72 @@ func TestListFSLayerChainAndMerged(t *testing.T) {
 	}
 	if len(merged) != 2 {
 		t.Fatalf("merged len=%d, want 2", len(merged))
+	}
+}
+
+func TestForkRejectsCheckpointFromOtherLayer(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateFSLayer(ctx, &FSLayer{LayerID: "p-cp-a", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	if err := s.CreateFSLayer(ctx, &FSLayer{LayerID: "p-cp-b", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("create b: %v", err)
+	}
+	if err := s.CreateFSLayerCheckpoint(ctx, &FSLayerCheckpoint{CheckpointID: "cp-b", LayerID: "p-cp-b"}); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	_, err := s.ForkFSLayer(ctx, FSLayerForkOptions{
+		ChildLayerID:  "c-cp-mismatch",
+		ParentLayerID: "p-cp-a",
+		CheckpointID:  "cp-b",
+	})
+	if !errors.Is(err, ErrFSLayerStateConflict) {
+		t.Fatalf("err=%v, want ErrFSLayerStateConflict", err)
+	}
+}
+
+func TestDeleteFSLayerRejectsCommitting(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateFSLayer(ctx, &FSLayer{LayerID: "p-commit-del", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := s.BeginFSLayerCommit(ctx, "p-commit-del"); err != nil {
+		t.Fatalf("begin commit: %v", err)
+	}
+	err := s.DeleteFSLayer(ctx, "p-commit-del", DeleteFSLayerOptions{})
+	if !errors.Is(err, ErrFSLayerStateConflict) {
+		t.Fatalf("delete err=%v, want ErrFSLayerStateConflict", err)
+	}
+}
+
+func TestDeleteFSLayerCascadeThroughAbandonedMiddle(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateFSLayer(ctx, &FSLayer{LayerID: "root-cas", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	if _, err := s.ForkFSLayer(ctx, FSLayerForkOptions{ChildLayerID: "mid-cas", ParentLayerID: "root-cas"}); err != nil {
+		t.Fatalf("fork mid: %v", err)
+	}
+	if _, err := s.ForkFSLayer(ctx, FSLayerForkOptions{ChildLayerID: "leaf-cas", ParentLayerID: "mid-cas"}); err != nil {
+		t.Fatalf("fork leaf: %v", err)
+	}
+	if err := s.RollbackFSLayer(ctx, "mid-cas"); err != nil {
+		t.Fatalf("abandon mid: %v", err)
+	}
+	if err := s.DeleteFSLayer(ctx, "root-cas", DeleteFSLayerOptions{Cascade: true}); err != nil {
+		t.Fatalf("cascade delete: %v", err)
+	}
+	for _, id := range []string{"root-cas", "mid-cas", "leaf-cas"} {
+		got, err := s.GetFSLayer(ctx, id)
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		if got.State != FSLayerStateAbandoned {
+			t.Fatalf("%s state=%s, want abandoned", id, got.State)
+		}
 	}
 }
 
