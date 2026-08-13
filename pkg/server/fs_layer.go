@@ -866,8 +866,8 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		writeFSLayerStoreError(w, r, err)
 		return
 	}
-	// D19/D18: root keeps V1 ordered log. Child materializes overlay tree
-	// then diffs vs live main (skip equal paths; live claims).
+	// Child: flatten overlay then diff vs live main (D18/D19).
+	// Root: keep V1 ordered log replay.
 	var (
 		entries []datastore.FSLayerEntry
 		err     error

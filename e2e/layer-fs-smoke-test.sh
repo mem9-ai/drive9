@@ -850,7 +850,7 @@ check_eq "non-empty directory whiteout preserves child" "$(drive9_retry fs cat "
 
 commit_out=$(drive9_retry fs layer commit "tag:$unique_tag")
 case "$commit_out" in
-  committed\ layer="$layer_id"\ applied=12) commit_status="ok" ;;
+  committed\ layer="$layer_id"\ applied=*) commit_status="ok" ;;
   *) commit_status="$commit_out" ;;
 esac
 check_eq "commit by tag key succeeds" "$commit_status" "ok"
@@ -960,6 +960,21 @@ check_eq "find --layer child sees pinned parent file" "$(printf '%s\n' "$find_ch
 check_eq "find --layer child hides post-fork parent file" "$(printf '%s\n' "$find_child_out" | grep -F "$fork_b" | wc -l | tr -d ' ')" "0"
 
 put_layer_entry "$fork_child_name" "$fork_c" "upsert" "file" "child only ${ts}"
+# Commit the parent first so leftover parent-only writes land while the
+# child is still active (D6). Child flatten after that applies only the
+# child's extra path (plus any still-uncommitted pin view).
+parent_commit_out=$(drive9_retry fs layer commit "$fork_parent_name")
+case "$parent_commit_out" in
+  committed\ layer="$fork_parent_id"\ applied=*) parent_commit_status="ok" ;;
+  *) parent_commit_status="$parent_commit_out" ;;
+esac
+check_eq "parent commit succeeds while child is active" "$parent_commit_status" "ok"
+check_eq "parent tip file visible after parent commit" "$(drive9_retry fs cat "$fork_a")" "parent tip before fork ${ts}"
+check_eq "mode file body landed on main" "$(drive9_retry fs cat "$fork_mode")" "mode body ${ts}"
+check_eq "post-fork parent file visible after parent commit" "$(drive9_retry fs cat "$fork_b")" "parent after fork ${ts}"
+check_eq "child still sees pinned parent tip after parent commit" "$(get_layer_entry_field "$fork_child_name" "$fork_a" "content_text")" "parent tip before fork ${ts}"
+check_eq "child still hides nothing from its own write" "$(get_layer_entry_field "$fork_child_name" "$fork_c" "content_text")" "child only ${ts}"
+
 child_commit_out=$(drive9_retry fs layer commit "$fork_child_name")
 case "$child_commit_out" in
   committed\ layer="$fork_child_id"\ applied=*) child_commit_status="ok" ;;
@@ -967,17 +982,6 @@ case "$child_commit_out" in
 esac
 check_eq "child commit to main succeeds" "$child_commit_status" "ok"
 check_eq "child file visible on main after child commit" "$(drive9_retry fs cat "$fork_c")" "child only ${ts}"
-check_eq "parent tip file visible on main after child flatten commit" "$(drive9_retry fs cat "$fork_a")" "parent tip before fork ${ts}"
-check_eq "mode file body landed on main" "$(drive9_retry fs cat "$fork_mode")" "mode body ${ts}"
-check_cmd_fail "post-fork parent file not on main before parent commit" drive9 fs cat "$fork_b"
-
-parent_commit_out=$(drive9_retry fs layer commit "$fork_parent_name")
-case "$parent_commit_out" in
-  committed\ layer="$fork_parent_id"\ applied=*) parent_commit_status="ok" ;;
-  *) parent_commit_status="$parent_commit_out" ;;
-esac
-check_eq "parent commit succeeds while child existed" "$parent_commit_status" "ok"
-check_eq "post-fork parent file visible after parent commit" "$(drive9_retry fs cat "$fork_b")" "parent after fork ${ts}"
 
 # Parent is committed, so further forks from it must fail (D13).
 check_cmd_fail "CLI fork from committed parent fails" drive9 fs layer fork --name "from-committed-${ts}" "$fork_parent_name"

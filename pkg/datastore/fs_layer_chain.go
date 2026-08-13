@@ -382,9 +382,6 @@ func (s *Store) DeleteFSLayer(ctx context.Context, layerID string, opts DeleteFS
 	if err != nil {
 		return err
 	}
-	if layer.State == FSLayerStateAbandoned {
-		return nil
-	}
 	pins, err := s.FSLayerStillPins(ctx, layerID)
 	if err != nil {
 		return err
@@ -403,6 +400,9 @@ func (s *Store) DeleteFSLayer(ctx context.Context, layerID string, opts DeleteFS
 				return err
 			}
 		}
+	}
+	if layer.State == FSLayerStateAbandoned {
+		return nil
 	}
 	// Logical abandon; preserve entries for any residual pin safety.
 	if err := s.SetFSLayerStateIf(ctx, layerID,
