@@ -31,6 +31,10 @@ const (
 
 	// Tenant-absolute remote existence index (mirrors client.GitWorkspaceIndexPath).
 	gitWorkspaceIndexPath = "/.drive9/git-workspaces/index.json"
+
+	// Keep in sync with client.MaxGitWorkspaceIndexBytes / Entries.
+	maxGitWorkspaceIndexBytes   = 1 << 20
+	maxGitWorkspaceIndexEntries = 4096
 )
 
 // gitWorkspaceIndexDoc is the remote FS document used only as an existence
@@ -413,19 +417,28 @@ func removeGitWorkspaceIndexEntry(ctx context.Context, b *backend.Dat9Backend, w
 		rev := int64(0)
 		if nf != nil && nf.File != nil {
 			rev = nf.File.Revision
+			if nf.File.SizeBytes > maxGitWorkspaceIndexBytes {
+				return fmt.Errorf("git workspace index exceeds maximum size (%d bytes)", maxGitWorkspaceIndexBytes)
+			}
 		}
-		data, err := b.ReadCtx(ctx, gitWorkspaceIndexPath, 0, -1)
+		data, err := b.ReadCtx(ctx, gitWorkspaceIndexPath, 0, maxGitWorkspaceIndexBytes+1)
 		if errors.Is(err, datastore.ErrNotFound) {
 			return nil
 		}
 		if err != nil {
 			return fmt.Errorf("read git workspace index: %w", err)
 		}
+		if int64(len(data)) > maxGitWorkspaceIndexBytes {
+			return fmt.Errorf("git workspace index exceeds maximum size (%d bytes)", maxGitWorkspaceIndexBytes)
+		}
 		var idx gitWorkspaceIndexDoc
 		if len(strings.TrimSpace(string(data))) > 0 {
 			if err := json.Unmarshal(data, &idx); err != nil {
 				return fmt.Errorf("parse git workspace index: %w", err)
 			}
+		}
+		if len(idx.Workspaces) > maxGitWorkspaceIndexEntries {
+			return fmt.Errorf("git workspace index exceeds maximum entry count (%d)", maxGitWorkspaceIndexEntries)
 		}
 		if idx.Version == 0 {
 			idx.Version = 1

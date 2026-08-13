@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -132,6 +133,84 @@ func TestGitListTreeLeavesBlobSizesUnknown(t *testing.T) {
 	}
 	if nodes[0].SizeBytes != 6 {
 		t.Fatalf("SizeBytes with sizes = %d, want 6", nodes[0].SizeBytes)
+	}
+}
+
+func TestExistingFastGitCheckout(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	ctx := context.Background()
+	missing := filepath.Join(t.TempDir(), "nope")
+	if existingFastGitCheckout(ctx, missing) {
+		t.Fatal("missing path reported as checkout")
+	}
+	empty := t.TempDir()
+	if existingFastGitCheckout(ctx, empty) {
+		t.Fatal("empty dir reported as checkout")
+	}
+	repo := filepath.Join(t.TempDir(), "repo")
+	runTestGit(t, "", "init", "-b", "main", repo)
+	if !existingFastGitCheckout(ctx, repo) {
+		t.Fatal("git repo not detected as checkout")
+	}
+	nested := filepath.Join(repo, "subdir")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if existingFastGitCheckout(ctx, nested) {
+		t.Fatal("nested dir inside a work tree must not count as a checkout root")
+	}
+}
+
+func TestPublishGitWorkspaceIndexRetryable(t *testing.T) {
+	var attempts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead || r.Method == http.MethodGet:
+			http.NotFound(w, r)
+		case r.Method == http.MethodPut:
+			n := attempts.Add(1)
+			if n == 1 {
+				http.Error(w, "conflict", http.StatusConflict)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Dat9-Revision", "1")
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 1})
+		default:
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c := client.New(srv.URL, "test-key")
+	ws := &client.GitWorkspace{WorkspaceID: "ws-retry", RootPath: "/repo/", WorkspaceKind: "main"}
+	if err := publishGitWorkspaceIndexEntry(context.Background(), c, ws); err != nil {
+		t.Fatalf("first publish (conflict then retry): %v", err)
+	}
+	if err := publishGitWorkspaceIndexEntry(context.Background(), c, ws); err != nil {
+		t.Fatalf("second publish: %v", err)
+	}
+}
+
+func TestMarkLocalGitWorkspaceRegisteredRetryable(t *testing.T) {
+	ctx := context.Background()
+	wsID := "ws-mark"
+	notDir := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(notDir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bad := mountedGitTarget{LocalRoot: notDir}
+	if err := markLocalGitWorkspaceRegistered(ctx, bad, wsID); err == nil {
+		t.Fatal("mark with file LocalRoot succeeded, want error")
+	}
+	good := mountedGitTarget{LocalRoot: t.TempDir()}
+	if err := markLocalGitWorkspaceRegistered(ctx, good, wsID); err != nil {
+		t.Fatalf("mark after previous failure: %v", err)
+	}
+	if err := markLocalGitWorkspaceRegistered(ctx, good, wsID); err != nil {
+		t.Fatalf("idempotent remake: %v", err)
 	}
 }
 

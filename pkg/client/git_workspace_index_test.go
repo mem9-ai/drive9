@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -98,5 +99,45 @@ func TestUpsertAndRemoveGitWorkspaceIndex(t *testing.T) {
 	}
 	if GitWorkspaceIndexHasEntries(idx) {
 		t.Fatalf("want empty index after remove, got %+v", idx)
+	}
+}
+
+func TestReadGitWorkspaceIndexRejectsOversizedDocument(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(MaxGitWorkspaceIndexBytes+1))
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "test-key")
+	_, _, err := c.ReadGitWorkspaceIndex(context.Background())
+	if !errors.Is(err, ErrGitWorkspaceIndexTooLarge) {
+		t.Fatalf("Read oversized = %v, want ErrGitWorkspaceIndexTooLarge", err)
+	}
+}
+
+func TestParseGitWorkspaceIndexRejectsTooManyEntries(t *testing.T) {
+	entries := make([]GitWorkspaceIndexEntry, MaxGitWorkspaceIndexEntries+1)
+	for i := range entries {
+		entries[i] = GitWorkspaceIndexEntry{
+			WorkspaceID: "ws" + strconv.Itoa(i),
+			RootPath:    "/r" + strconv.Itoa(i) + "/",
+		}
+	}
+	body, err := json.Marshal(GitWorkspaceIndex{Version: 1, Workspaces: entries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(body)) > MaxGitWorkspaceIndexBytes {
+		t.Skip("entry-count fixture exceeded byte cap")
+	}
+	_, err = parseGitWorkspaceIndex(body)
+	if !errors.Is(err, ErrGitWorkspaceIndexTooLarge) {
+		t.Fatalf("parse many entries = %v, want ErrGitWorkspaceIndexTooLarge", err)
 	}
 }

@@ -242,6 +242,27 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:   time.Now(),
 			UpdatedAt:   time.Now(),
 		}}})
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/git-workspaces/ws1":
+		f.mu.Lock()
+		deleted := f.deleted
+		f.mu.Unlock()
+		status := "active"
+		if deleted {
+			status = "deleted"
+		}
+		_ = json.NewEncoder(w).Encode(client.GitWorkspace{
+			WorkspaceID: "ws1",
+			RootPath:    "/repo/",
+			RepoURL:     f.repoURL,
+			RemoteName:  "origin",
+			BranchName:  "main",
+			BaseCommit:  f.headCommit,
+			HeadCommit:  f.headCommit,
+			Mode:        f.mode,
+			Status:      status,
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+		})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/git-workspaces/ws1/tree":
 		f.mu.Lock()
 		failTree := f.failTree

@@ -3,11 +3,23 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"time"
 )
+
+// Bounds for the user-writable remote existence index. Automatic mount/DELETE
+// paths must not io.ReadAll an unbounded document (default file cap is 10 GiB).
+const (
+	MaxGitWorkspaceIndexBytes   = 1 << 20
+	MaxGitWorkspaceIndexEntries = 4096
+)
+
+// ErrGitWorkspaceIndexTooLarge is returned when the remote index document
+// exceeds MaxGitWorkspaceIndexBytes or MaxGitWorkspaceIndexEntries.
+var ErrGitWorkspaceIndexTooLarge = errors.New("git workspace index exceeds size or entry limit")
 
 // Tenant-absolute path for the cross-sandbox git workspace existence index.
 // Aligns with pack metadata under /.drive9/packs.
@@ -17,9 +29,9 @@ const GitWorkspaceIndexPath = "/.drive9/git-workspaces/index.json"
 // drive9 git --fast workspaces exist. FUSE uses it only as an arming signal;
 // runtime content always comes from ListGitWorkspaces.
 type GitWorkspaceIndex struct {
-	Version     int                       `json:"version"`
-	UpdatedAt   string                    `json:"updated_at"`
-	Workspaces  []GitWorkspaceIndexEntry  `json:"workspaces"`
+	Version    int                      `json:"version"`
+	UpdatedAt  string                   `json:"updated_at"`
+	Workspaces []GitWorkspaceIndexEntry `json:"workspaces"`
 }
 
 // GitWorkspaceIndexEntry is a minimal existence record (tenant-absolute root_path).
@@ -53,6 +65,9 @@ func (c *Client) ReadGitWorkspaceIndex(ctx context.Context) (*GitWorkspaceIndex,
 	rev := int64(0)
 	if stat != nil {
 		rev = stat.Revision
+		if stat.Size > MaxGitWorkspaceIndexBytes {
+			return nil, rev, fmt.Errorf("%w: stat size %d", ErrGitWorkspaceIndexTooLarge, stat.Size)
+		}
 	}
 	rc, err := c.ReadStream(ctx, GitWorkspaceIndexPath)
 	if IsNotFound(err) {
@@ -62,18 +77,32 @@ func (c *Client) ReadGitWorkspaceIndex(ctx context.Context) (*GitWorkspaceIndex,
 		return nil, rev, err
 	}
 	defer func() { _ = rc.Close() }()
-	data, err := io.ReadAll(rc)
+	data, err := io.ReadAll(io.LimitReader(rc, MaxGitWorkspaceIndexBytes+1))
 	if err != nil {
 		return nil, rev, fmt.Errorf("read git workspace index: %w", err)
 	}
+	idx, err := parseGitWorkspaceIndex(data)
+	if err != nil {
+		return nil, rev, err
+	}
+	return idx, rev, nil
+}
+
+func parseGitWorkspaceIndex(data []byte) (*GitWorkspaceIndex, error) {
+	if int64(len(data)) > MaxGitWorkspaceIndexBytes {
+		return nil, fmt.Errorf("%w: %d bytes", ErrGitWorkspaceIndexTooLarge, len(data))
+	}
 	if len(strings.TrimSpace(string(data))) == 0 {
-		return &GitWorkspaceIndex{Version: 1}, rev, nil
+		return &GitWorkspaceIndex{Version: 1}, nil
 	}
 	var idx GitWorkspaceIndex
 	if err := json.Unmarshal(data, &idx); err != nil {
-		return nil, rev, fmt.Errorf("parse git workspace index: %w", err)
+		return nil, fmt.Errorf("parse git workspace index: %w", err)
 	}
-	return &idx, rev, nil
+	if len(idx.Workspaces) > MaxGitWorkspaceIndexEntries {
+		return nil, fmt.Errorf("%w: %d entries", ErrGitWorkspaceIndexTooLarge, len(idx.Workspaces))
+	}
+	return &idx, nil
 }
 
 // StatGitWorkspaceIndex reports whether the index exists and its revision/mtime.

@@ -152,7 +152,6 @@ func TestGitWorkspaceDeleteIdempotentCleansStaleIndex(t *testing.T) {
 	}
 }
 
-
 func TestGitWorkspaceDeleteWithoutIndexIsOK(t *testing.T) {
 	// Old deployments / never --fast: no index file. DELETE must still succeed.
 	s := newTestServer(t)
@@ -257,5 +256,141 @@ func TestGitWorkspaceUpsertRejectsSelfLinkedWorkspace(t *testing.T) {
 	}
 	if !strings.Contains(string(gotBody), "cannot reference itself") {
 		t.Fatalf("body = %s, want self-link error", gotBody)
+	}
+}
+
+func TestGitWorkspaceSubresourcesRejectedAfterDelete(t *testing.T) {
+	s := newTestServer(t)
+	ensureGitWorkspaceSchema(t, s)
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+
+	c := client.New(ts.URL, "")
+	ctx := context.Background()
+	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo-sub/",
+		RepoURL:    "https://example.test/repo-sub.git",
+		RemoteName: "origin",
+		HeadCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
+	if err != nil {
+		t.Fatalf("UpsertGitWorkspace: %v", err)
+	}
+	if _, err := c.PutGitOverlayEntry(ctx, ws.WorkspaceID, client.GitOverlayEntryRequest{
+		Path: "dirty.txt", Op: "upsert", Kind: "file", Content: []byte("old"),
+	}); err != nil {
+		t.Fatalf("PutGitOverlayEntry: %v", err)
+	}
+	if err := c.ReplaceGitTree(ctx, ws.WorkspaceID, client.GitTreeReplaceRequest{
+		CommitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Nodes: []client.GitTreeNode{{
+			Path: "README.md", Name: "README.md", Kind: "file", Mode: "100644",
+			ObjectSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		}},
+	}); err != nil {
+		t.Fatalf("ReplaceGitTree: %v", err)
+	}
+	if _, err := c.UpsertGitState(ctx, ws.WorkspaceID, client.GitStateRequest{
+		CheckpointCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}); err != nil {
+		t.Fatalf("UpsertGitState: %v", err)
+	}
+	if _, err := c.PutGitObjectPack(ctx, ws.WorkspaceID, client.GitObjectPackRequest{
+		Content: []byte("PACK-stale"),
+	}); err != nil {
+		t.Fatalf("PutGitObjectPack: %v", err)
+	}
+
+	// Corrupt index so DELETE still 200 but emits no usable invalidation.
+	writeGitWorkspaceIndexForTest(t, s, []byte("{"))
+	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
+		t.Fatalf("DeleteGitWorkspace: %v", err)
+	}
+
+	if _, err := c.PutGitOverlayEntry(ctx, ws.WorkspaceID, client.GitOverlayEntryRequest{
+		Path: "after.txt", Op: "upsert", Kind: "file", Content: []byte("new"),
+	}); !client.IsNotFound(err) {
+		t.Fatalf("overlay write after delete: %v, want NotFound", err)
+	}
+	if _, err := c.GetGitOverlayEntry(ctx, ws.WorkspaceID, "dirty.txt"); !client.IsNotFound(err) {
+		t.Fatalf("overlay read after delete: %v, want NotFound", err)
+	}
+	if _, err := c.ListGitOverlayEntries(ctx, ws.WorkspaceID); !client.IsNotFound(err) {
+		t.Fatalf("overlay list after delete: %v, want NotFound", err)
+	}
+	if err := c.ReplaceGitTree(ctx, ws.WorkspaceID, client.GitTreeReplaceRequest{
+		CommitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Nodes: []client.GitTreeNode{{
+			Path: "README.md", Name: "README.md", Kind: "file", Mode: "100644",
+			ObjectSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		}},
+	}); !client.IsNotFound(err) {
+		t.Fatalf("tree write after delete: %v, want NotFound", err)
+	}
+	if _, err := c.ListGitTree(ctx, ws.WorkspaceID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); !client.IsNotFound(err) {
+		t.Fatalf("tree list after delete: %v, want NotFound", err)
+	}
+	if _, err := c.UpsertGitState(ctx, ws.WorkspaceID, client.GitStateRequest{
+		CheckpointCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}); !client.IsNotFound(err) {
+		t.Fatalf("git-state write after delete: %v, want NotFound", err)
+	}
+	if _, err := c.GetGitState(ctx, ws.WorkspaceID); !client.IsNotFound(err) {
+		t.Fatalf("git-state read after delete: %v, want NotFound", err)
+	}
+	if _, err := c.PutGitObjectPack(ctx, ws.WorkspaceID, client.GitObjectPackRequest{Content: []byte("PACK-new")}); !client.IsNotFound(err) {
+		t.Fatalf("object-pack write after delete: %v, want NotFound", err)
+	}
+
+	recreated, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo-sub/",
+		RepoURL:    "https://example.test/repo-sub.git",
+		RemoteName: "origin",
+		HeadCommit: "cccccccccccccccccccccccccccccccccccccccc",
+	})
+	if err != nil {
+		t.Fatalf("recreate UpsertGitWorkspace: %v", err)
+	}
+	if recreated.WorkspaceID != ws.WorkspaceID {
+		t.Fatalf("recreate id = %s, want reused %s", recreated.WorkspaceID, ws.WorkspaceID)
+	}
+	entries, err := c.ListGitOverlayEntries(ctx, recreated.WorkspaceID)
+	if err != nil {
+		t.Fatalf("list overlay after recreate: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("recreate inherited overlay = %+v", entries)
+	}
+}
+
+func TestGitWorkspaceDeleteRejectsOversizedIndex(t *testing.T) {
+	s := newTestServer(t)
+	ensureGitWorkspaceSchema(t, s)
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+
+	c := client.New(ts.URL, "")
+	ctx := context.Background()
+	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo-huge-idx/",
+		RepoURL:    "https://example.test/repo-huge-idx.git",
+		RemoteName: "origin",
+		HeadCommit: "dddddddddddddddddddddddddddddddddddddddd",
+	})
+	if err != nil {
+		t.Fatalf("UpsertGitWorkspace: %v", err)
+	}
+	huge := bytes.Repeat([]byte("x"), maxGitWorkspaceIndexBytes+1)
+	writeGitWorkspaceIndexForTest(t, s, huge)
+	// Soft-delete still succeeds; oversized index is logged, not a 500.
+	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
+		t.Fatalf("DeleteGitWorkspace oversized index: %v", err)
+	}
+	got, err := s.fallback.Store().GetGitWorkspace(ctx, ws.WorkspaceID)
+	if err != nil {
+		t.Fatalf("GetGitWorkspace: %v", err)
+	}
+	if got.Status != datastore.GitWorkspaceStatusDeleted {
+		t.Fatalf("status = %q, want deleted", got.Status)
 	}
 }

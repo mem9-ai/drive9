@@ -477,6 +477,117 @@ func TestPendingForceOrdinaryLookupsSingleList(t *testing.T) {
 	}
 }
 
+func TestEmptyRefreshDoesNotClobberNewerForce(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/git-workspaces" && r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]any{"workspaces": []any{}})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, RemoteRoot: "/"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(srv.URL), opts)
+	fs.markGitWorkspacesArmed()
+
+	t.Cleanup(func() { testHookAfterEmptyLocalScan = nil })
+	testHookAfterEmptyLocalScan = func() {
+		fs.git.mu.Lock()
+		fs.git.pendingForce = true
+		fs.git.pendingForceGen++
+		fs.git.localArmGen = "newer-arm"
+		fs.git.mu.Unlock()
+	}
+
+	if err := fs.forceRefreshGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("forceRefreshGitWorkspaces: %v", err)
+	}
+	fs.git.mu.Lock()
+	armed := fs.git.armed
+	pending := fs.git.pendingForce
+	gen := fs.git.localArmGen
+	fs.git.mu.Unlock()
+	if !armed {
+		t.Fatal("empty refresh disarmed after a newer force arrived")
+	}
+	if !pending {
+		t.Fatal("empty refresh cleared pendingForce from a newer force")
+	}
+	if gen != "newer-arm" {
+		t.Fatalf("localArmGen = %q, want newer-arm", gen)
+	}
+}
+
+func TestEmptyRefreshCanceledContextStillSeesLocalMarkers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/git-workspaces" && r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]any{"workspaces": []any{}})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	localRoot := t.TempDir()
+	if err := gitcache.MarkWorkspaceRegistered(context.Background(), localRoot, "ws-keep"); err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if armed, _ := gitcache.LocalArmSignal(canceled, localRoot); armed {
+		t.Fatal("precondition: LocalArmSignal with canceled ctx should be false")
+	}
+
+	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true, RemoteRoot: "/"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(srv.URL), opts)
+	fs.markGitWorkspacesArmed()
+	if err := fs.forceRefreshGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("forceRefreshGitWorkspaces: %v", err)
+	}
+	if !fs.gitWorkspacesArmed() {
+		t.Fatal("empty refresh disarmed even though local markers exist")
+	}
+}
+
+func TestArmedMountDropsDeletedWorkspaceWithoutIndexEvent(t *testing.T) {
+	// Two mounts share a workspace. DELETE succeeds; index is left stale
+	// (no SSE). The remote mount must stop serving after liveness revalidation.
+	fixture := newGitWorkspaceFixture(t)
+	optsA := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, RemoteRoot: "/"}
+	optsA.setDefaults()
+	optsB := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, RemoteRoot: "/"}
+	optsB.setDefaults()
+	fsA := NewDat9FS(fixture.client(), optsA)
+	fsB := NewDat9FS(fixture.client(), optsB)
+	if err := fsA.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensure A: %v", err)
+	}
+	if err := fsB.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensure B: %v", err)
+	}
+	if _, _, ok := fsB.loadedGitWorkspaceForPath("/repo/README.md"); !ok {
+		t.Fatal("mount B missing workspace before delete")
+	}
+
+	if err := fixture.client().DeleteGitWorkspace(context.Background(), "ws1"); err != nil {
+		t.Fatalf("DeleteGitWorkspace: %v", err)
+	}
+	// No index/SSE change. Advance liveness window without sleeping.
+	fsB.git.mu.Lock()
+	fsB.git.loadedAt = time.Now().Add(-2 * gitWorkspaceRefreshInterval)
+	fsB.git.mu.Unlock()
+	if _, _, ok := fsB.gitWorkspaceForPath(context.Background(), "/repo/README.md"); ok {
+		t.Fatal("mount B still serving deleted workspace after liveness revalidation")
+	}
+	if fsB.gitWorkspacesArmed() {
+		t.Fatal("mount B stayed armed after last workspace was deleted")
+	}
+	_ = fsA
+}
+
 func TestCarryGitKnownSizesIntoRuntime(t *testing.T) {
 	t.Helper()
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}

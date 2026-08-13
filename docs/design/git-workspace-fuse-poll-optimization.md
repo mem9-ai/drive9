@@ -164,8 +164,11 @@ remote index document, and the local FS. Each step is independently durable and
 idempotent (upserts/replaces keyed by workspace id / commit / root_path). The
 command prints success only after steps 1–3 complete; hydrate never gates
 registration. Recovery for steps 1–3 is **re-run the command** (or remount when
-only local markers are missing). Prefer “registered but not yet discoverable”
-over “discoverable but incomplete”.
+only local markers are missing). A re-run is executable even when the
+checkout/worktree already exists: `clone --fast` and `worktree add --fast`
+skip `git clone` / `git worktree add` when the target is already a git work
+tree and resume from upsert + index + local markers. Prefer “registered but
+not yet discoverable” over “discoverable but incomplete”.
 
 | After | Failure | Observable state | Recovery |
 | --- | --- | --- | --- |
@@ -175,14 +178,24 @@ over “discoverable but incomplete”.
 | **4** Print success | — | Discovery contract met for this host | Users may use the FS immediately. |
 | **5** hydrate | Timeout / network (sync may exit non-zero *after* success line; background start may warn) | Registration and discovery intact; objects may be incomplete | Re-run `drive9 git hydrate` or open paths that trigger on-demand hydrate. Never rolls back steps 1–3. |
 
-Crash between steps 1–3 is recovered by re-running the command. Step 1 is **not**
+Crash between steps 1–3 is recovered by re-running the command (existing
+checkout is reused). Step 1 is **not**
 rolled back when step 2 fails (deleting the registration would orphan tree/state
 and is worse than a missing index hint). **Delete path:** server `DELETE
-/v1/git-workspaces/{id}` soft-deletes the row and CAS-updates the remote index
-in the same request; index cleanup is best-effort in the same request (failure logged, DELETE still returns 200); convergence via client best-effort Remove and idempotent DELETE retries.
-DELETE is idempotent (already-deleted row still runs index cleanup) so repair is
-convergent. CLI/FUSE may best-effort double-remove the index entry after a
-successful DELETE and still finish local cleanup independently.
+/v1/git-workspaces/{id}` soft-deletes the row, **wipes tree/git-state/object-pack/overlay
+rows in the same transaction**, and CAS-updates the remote index
+in the same request. Index cleanup is best-effort (failure logged, DELETE still
+returns 200). Subresource APIs require `status=active` and take the live row
+`FOR UPDATE` on writes so they cannot race DELETE. Armed mounts revalidate
+cached workspace IDs with GET-by-id (1s coalesce) so a missed index/SSE still
+drops the runtime. DELETE is idempotent (already-deleted row still wipes
+children and runs index cleanup). CLI/FUSE may best-effort double-remove the
+index entry after a successful DELETE and still finish local cleanup independently.
+
+The remote index document is capped (1 MiB / 4096 entries) on automatic read
+paths. Empty-list disarm is fenced to the force generation and local-arm
+generation captured before the local-marker scan, and that scan uses an
+independent context so a canceled refresh cannot hide existing markers.
 
 Local arm markers are a **generation** over the marker set (armed body + each
 `refresh/<id>` name and body), not max FS mtime alone — so same-second
@@ -218,7 +231,7 @@ Local arm marker scans are throttled (250ms) in both dormant and armed states so
 | Event | Action |
 | --- | --- |
 | Local armed / refresh marker generation change | force list (subject to backoff/throttle) |
-| Path hits a loaded workspace | in-memory runtime |
+| Path hits a loaded workspace | in-memory runtime; GET-by-id liveness drop if the row is deleted (1s coalesce; not a list) |
 | Remote index revision/mtime change (throttled Stat, default 60s while FS is active) | force list |
 | SSE: index path change (when `EnableGitWorkspaces`) | force list / re-arm |
 | No event | **zero** lists |
@@ -278,7 +291,7 @@ No `reindex` user command. If the DB already has workspaces but no index yet:
 3. Index is existence-only; runtime is List/Get only.
 4. Index path is tenant-absolute; filter by RemoteRoot.
 5. CLI: index + local armed before success/hydrate; failure fails the whole command.
-6. Workspace delete soft-deletes the row and best-effort CAS-updates the remote index on the server (index failure logged, DELETE still 200); clients dual-write Remove. DELETE is idempotent so index cleanup can converge on retry.
+6. Workspace delete soft-deletes the row, wipes subresources in the same TX, and best-effort CAS-updates the remote index (index failure logged, DELETE still 200). Subresource APIs require a live row (writes `FOR UPDATE`). Armed mounts GET-by-id to drop stale runtimes. Clients dual-write Remove. DELETE is idempotent so index cleanup can converge on retry.
 7. List/arm singleflight + failure backoff; force does not bypass the backoff gate—use sticky re-issue.
 8. While DORMANT, `.git` paths must not force-list.
 9. No forced hiding of `/.drive9/`.

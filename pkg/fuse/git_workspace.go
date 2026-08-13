@@ -31,7 +31,8 @@ const gitCheckpointTimeout = 2 * time.Minute
 const gitCheckpointDebounce = 2 * time.Second
 const gitWorkspaceHydrateTimeout = 30 * time.Minute
 const gitCheckIgnoreTimeout = 2 * time.Second
-const gitWorkspaceRefreshInterval = time.Second // armed list coalescing only (not empty poll)
+const gitWorkspaceRefreshInterval = time.Second // armed list coalescing / liveness revalidation
+const gitWorkspaceStatusDeleted = "deleted"
 const gitWorkspaceIndexRescanInterval = 60 * time.Second
 const gitWorkspaceLocalArmScanInterval = 250 * time.Millisecond
 const gitWorkspaceListBackoffMin = time.Second
@@ -43,6 +44,10 @@ const gitLocalObjectMaxPackBytes int64 = 256 << 20
 
 var gitCleanTreeDefaultMtime = time.Unix(1, 0).UTC()
 
+// testHookAfterEmptyLocalScan runs after an empty-list leader scans local
+// markers and before it relocks to decide whether to disarm. Tests only.
+var testHookAfterEmptyLocalScan func()
+
 type gitWorkspaceLayer struct {
 	mu         sync.Mutex
 	checkpoint sync.Mutex
@@ -52,7 +57,7 @@ type gitWorkspaceLayer struct {
 
 	// On-demand discovery (design: dormant → armed).
 	armed            bool
-	dormantConfirmed bool // index 404/empty confirmed; skip remote index until local arm
+	dormantConfirmed bool   // index 404/empty confirmed; skip remote index until local arm
 	localArmGen      string // last LocalArmSignal generation token (marker set fingerprint)
 	localArmScanAt   time.Time
 	indexRevision    int64
@@ -757,16 +762,27 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 		}
 	}
 	if len(loaded) == 0 {
-		// Empty list: disarm if no local arm signal remains.
+		// Empty list: disarm only if this snapshot is still current. A
+		// registration/force that arrives after the local scan must not be
+		// wiped (that would make the waiting FS op miss G1).
 		localRoot := ""
 		if fs.opts != nil {
 			localRoot = strings.TrimSpace(fs.opts.LocalRoot)
 		}
+		emptyForceGen := fs.git.pendingForceGen
+		emptyLocalGen := fs.git.localArmGen
 		fs.git.mu.Unlock()
-		signal, _ := gitcache.LocalArmSignal(ctx, localRoot)
+		// Independent of the caller's ctx: a canceled refresh must not hide
+		// existing markers and accidentally disarm.
+		signal, _ := gitcache.LocalArmSignal(context.Background(), localRoot)
+		if testHookAfterEmptyLocalScan != nil {
+			testHookAfterEmptyLocalScan()
+		}
 		fs.git.mu.Lock()
-		// Re-check emptiness under lock so we do not wipe a concurrent install.
-		if !signal && len(fs.git.workspaces) == 0 {
+		if !signal &&
+			len(fs.git.workspaces) == 0 &&
+			fs.git.pendingForceGen == emptyForceGen &&
+			fs.git.localArmGen == emptyLocalGen {
 			fs.disarmGitWorkspacesLocked()
 		}
 	}
@@ -816,6 +832,11 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 		refreshCancel()
 	}
 
+	// Authoritative liveness: drop cached runtimes whose workspace row is
+	// no longer live, even when index/SSE cleanup was missed. GET-by-id
+	// only (does not list, so it cannot discover new cross-host workspaces).
+	fs.revalidateArmedWorkspaceLiveness(baseCtx)
+
 	if rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath); ok {
 		return rt, rel, true
 	}
@@ -834,6 +855,98 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 		}
 	}
 	return nil, "", false
+}
+
+// revalidateArmedWorkspaceLiveness drops cached runtimes whose authoritative
+// workspace row is gone or deleted. It is a GET-by-id check coalesced to
+// gitWorkspaceRefreshInterval so a missed index/SSE delete still converges
+// without turning into a ListGitWorkspaces poll.
+func (fs *Dat9FS) revalidateArmedWorkspaceLiveness(ctx context.Context) {
+	if fs == nil || fs.git == nil || fs.client == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	fs.git.mu.Lock()
+	if !fs.git.armed || len(fs.git.workspaces) == 0 {
+		fs.git.mu.Unlock()
+		return
+	}
+	if !fs.git.loadedAt.IsZero() && time.Since(fs.git.loadedAt) < gitWorkspaceRefreshInterval {
+		fs.git.mu.Unlock()
+		return
+	}
+	ids := make([]string, 0, len(fs.git.workspaces))
+	for _, rt := range fs.git.workspaces {
+		if rt == nil {
+			continue
+		}
+		id := strings.TrimSpace(rt.workspace.WorkspaceID)
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	fs.git.mu.Unlock()
+	if len(ids) == 0 {
+		return
+	}
+
+	dead := make(map[string]struct{})
+	for _, id := range ids {
+		ws, err := fs.client.GetGitWorkspace(ctx, id)
+		if client.IsNotFound(err) {
+			dead[id] = struct{}{}
+			continue
+		}
+		if err != nil {
+			// Transient: keep the cached runtime.
+			continue
+		}
+		if ws != nil && ws.Status == gitWorkspaceStatusDeleted {
+			dead[id] = struct{}{}
+		}
+	}
+	if len(dead) == 0 {
+		fs.git.mu.Lock()
+		fs.git.loadedAt = time.Now()
+		fs.git.mu.Unlock()
+		return
+	}
+
+	localRoot := ""
+	if fs.opts != nil {
+		localRoot = strings.TrimSpace(fs.opts.LocalRoot)
+	}
+	fs.git.mu.Lock()
+	kept := fs.git.workspaces[:0]
+	for _, rt := range fs.git.workspaces {
+		if rt == nil {
+			continue
+		}
+		if _, gone := dead[rt.workspace.WorkspaceID]; gone {
+			continue
+		}
+		kept = append(kept, rt)
+	}
+	fs.git.workspaces = kept
+	fs.git.loadedAt = time.Now()
+	allGone := len(kept) == 0
+	forceGen := fs.git.pendingForceGen
+	localGen := fs.git.localArmGen
+	fs.git.mu.Unlock()
+	if !allGone {
+		return
+	}
+	signal, _ := gitcache.LocalArmSignal(context.Background(), localRoot)
+	fs.git.mu.Lock()
+	if !signal &&
+		len(fs.git.workspaces) == 0 &&
+		fs.git.pendingForceGen == forceGen &&
+		fs.git.localArmGen == localGen {
+		fs.disarmGitWorkspacesLocked()
+	}
+	fs.git.mu.Unlock()
 }
 
 func (fs *Dat9FS) shouldForceRefreshGitWorkspacesForGitStatePath(localPath string) bool {

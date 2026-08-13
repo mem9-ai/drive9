@@ -110,9 +110,13 @@ func gitClone(args []string) error {
 		return err
 	}
 
-	cloneArgs := gitFastCloneArgs(repoURL, target, *blobless)
-	if err := runGitStreaming(cmdCtx, cloneArgs...); err != nil {
-		return fmt.Errorf("git clone failed: %w", err)
+	if existingFastGitCheckout(cmdCtx, target) {
+		fmt.Fprintf(os.Stderr, "drive9: resuming --fast registration for existing checkout %s\n", target)
+	} else {
+		cloneArgs := gitFastCloneArgs(repoURL, target, *blobless)
+		if err := runGitStreaming(cmdCtx, cloneArgs...); err != nil {
+			return fmt.Errorf("git clone failed: %w", err)
+		}
 	}
 	head, err := gitOutput(cmdCtx, target, "rev-parse", "HEAD")
 	if err != nil {
@@ -308,10 +312,14 @@ func gitWorktreeAdd(args []string) error {
 		}
 	}
 
-	worktreeCommit := gitFastWorktreeAddCommit(*branch, *detach, commitish, resolvedCommit)
-	worktreeArgs := gitFastWorktreeAddArgs(basePath, worktreePath, *branch, *detach, worktreeCommit)
-	if err := runGitStreaming(cmdCtx, worktreeArgs...); err != nil {
-		return fmt.Errorf("git worktree add failed: %w", err)
+	if existingFastGitCheckout(cmdCtx, worktreePath) {
+		fmt.Fprintf(os.Stderr, "drive9: resuming --fast registration for existing worktree %s\n", worktreePath)
+	} else {
+		worktreeCommit := gitFastWorktreeAddCommit(*branch, *detach, commitish, resolvedCommit)
+		worktreeArgs := gitFastWorktreeAddArgs(basePath, worktreePath, *branch, *detach, worktreeCommit)
+		if err := runGitStreaming(cmdCtx, worktreeArgs...); err != nil {
+			return fmt.Errorf("git worktree add failed: %w", err)
+		}
 	}
 	head, err := gitOutput(cmdCtx, worktreePath, "rev-parse", "HEAD")
 	if err != nil {
@@ -1032,6 +1040,29 @@ func runGitStreaming(ctx context.Context, args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// existingFastGitCheckout reports whether target is already a git work tree so
+// `clone --fast` / `worktree add --fast` can resume after a partial
+// registration (index or local-marker failure) without re-running git clone /
+// worktree add against a non-empty destination.
+func existingFastGitCheckout(ctx context.Context, target string) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	st, err := os.Stat(target)
+	if err != nil || !st.IsDir() {
+		return false
+	}
+	// Require a work-tree *root* (`.git` file or directory).
+	// `rev-parse --is-inside-work-tree` is also true for nested dirs
+	// inside another checkout, which would skip clone/worktree add and
+	// register the parent HEAD as the new workspace.
+	if _, err := os.Stat(filepath.Join(target, ".git")); err != nil {
+		return false
+	}
+	out, err := gitOutput(ctx, target, "rev-parse", "--is-inside-work-tree")
+	return err == nil && strings.EqualFold(strings.TrimSpace(out), "true")
 }
 
 func gitOutput(ctx context.Context, repoDir string, args ...string) (string, error) {
