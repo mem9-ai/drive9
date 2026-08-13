@@ -238,6 +238,10 @@ func Mount(opts *MountOptions) error {
 	if opts.CheckpointRef != "" && opts.LayerRef == "" {
 		return fmt.Errorf("mount: CheckpointRef requires LayerRef")
 	}
+	// D10: checkpoint mount is read-only; writable restore is fork --checkpoint.
+	if opts.CheckpointRef != "" {
+		opts.ReadOnly = true
+	}
 
 	// Generate per-mount actor ID for SSE self-filtering.
 	actorID := generateMountID()
@@ -465,6 +469,29 @@ func Mount(opts *MountOptions) error {
 					uploader.RecoverPending()
 				}
 			}
+		}
+	}
+
+	// D10: checkpoint / explicit RO still needs overlay restore (read-only view),
+	// but must not start a commit queue. Membership check lives in restoreLayerEntries.
+	if opts.ReadOnly && opts.LayerRef != "" && cacheBase != "" && mountHash != "" {
+		pendingDir := filepath.Join(cacheBase, mountHash, "pending-ro")
+		shadowDir = filepath.Join(cacheBase, mountHash, "shadow-ro")
+		pendingIdx, pErr := NewPendingIndex(pendingDir)
+		if pErr != nil {
+			return fmt.Errorf("mount: read-only pending index: %w", pErr)
+		}
+		if err := pendingIdx.RecoverFromDisk(); err != nil {
+			fmt.Fprintf(os.Stderr, "drive9: read-only pending recovery: %v\n", err)
+		}
+		shadowStore, sErr := NewShadowStoreWithQuota(shadowDir, opts.WriteCacheFreeRatio, 0)
+		if sErr != nil {
+			return fmt.Errorf("mount: read-only shadow store: %w", sErr)
+		}
+		dat9fs.pendingIndex = pendingIdx
+		dat9fs.shadowStore = shadowStore
+		if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
+			return fmt.Errorf("mount: restore fs layer entries: %w", err)
 		}
 	}
 

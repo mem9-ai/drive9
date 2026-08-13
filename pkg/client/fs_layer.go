@@ -22,17 +22,44 @@ type FSLayerCreateRequest struct {
 }
 
 type FSLayer struct {
-	LayerID        string            `json:"layer_id"`
-	BaseRootPath   string            `json:"base_root_path"`
-	Name           string            `json:"name"`
-	Tags           map[string]string `json:"tags,omitempty"`
-	State          string            `json:"state"`
-	DurabilityMode string            `json:"durability_mode"`
-	ActorID        string            `json:"actor_id"`
-	DurableSeq     int64             `json:"durable_seq"`
-	CreatedAt      time.Time         `json:"created_at"`
-	UpdatedAt      time.Time         `json:"updated_at"`
-	SealedAt       *time.Time        `json:"sealed_at,omitempty"`
+	LayerID            string            `json:"layer_id"`
+	BaseRootPath       string            `json:"base_root_path"`
+	Name               string            `json:"name"`
+	Tags               map[string]string `json:"tags,omitempty"`
+	State              string            `json:"state"`
+	DurabilityMode     string            `json:"durability_mode"`
+	ActorID            string            `json:"actor_id"`
+	DurableSeq         int64             `json:"durable_seq"`
+	ParentLayerID      string            `json:"parent_layer_id,omitempty"`
+	OriginSeq          int64             `json:"origin_seq,omitempty"`
+	OriginCheckpointID string            `json:"origin_checkpoint_id,omitempty"`
+	RootLayerID        string            `json:"root_layer_id,omitempty"`
+	Depth              int               `json:"depth,omitempty"`
+	Origin             string            `json:"origin,omitempty"`
+	CreatedAt          time.Time         `json:"created_at"`
+	UpdatedAt          time.Time         `json:"updated_at"`
+	SealedAt           *time.Time        `json:"sealed_at,omitempty"`
+}
+
+type FSLayerForkRequest struct {
+	LayerID      string `json:"layer_id,omitempty"`
+	Name         string `json:"name,omitempty"`
+	ActorID      string `json:"actor_id,omitempty"`
+	CheckpointID string `json:"checkpoint_id,omitempty"`
+}
+
+type FSLayerChainFrame struct {
+	LayerID            string    `json:"layer_id"`
+	Name               string    `json:"name"`
+	State              string    `json:"state"`
+	ParentLayerID      string    `json:"parent_layer_id,omitempty"`
+	OriginSeq          int64     `json:"origin_seq,omitempty"`
+	OriginCheckpointID string    `json:"origin_checkpoint_id,omitempty"`
+	Depth              int       `json:"depth,omitempty"`
+	RootLayerID        string    `json:"root_layer_id,omitempty"`
+	BaseRootPath       string    `json:"base_root_path,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+	LimitSeq           int64     `json:"limit_seq"`
 }
 
 type FSLayerEntry struct {
@@ -489,6 +516,84 @@ func (c *Client) ListFSLayerEvents(ctx context.Context, layerID string, since in
 
 func (c *Client) RollbackFSLayer(ctx context.Context, layerID string) error {
 	return c.postFSLayerAction(ctx, layerID, "rollback")
+}
+
+func (c *Client) ForkFSLayer(ctx context.Context, parentRef string, req FSLayerForkRequest) (*FSLayer, error) {
+	if strings.TrimSpace(parentRef) == "" {
+		return nil, fmt.Errorf("parent layer ref must not be empty")
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	u := c.baseURL + "/v1/layers/" + url.PathEscape(parentRef) + "/fork"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out FSLayer
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode forked fs layer: %w", err)
+	}
+	return &out, nil
+}
+
+func (c *Client) ListFSLayerChain(ctx context.Context, layerID string) ([]FSLayerChainFrame, error) {
+	if strings.TrimSpace(layerID) == "" {
+		return nil, fmt.Errorf("layerID must not be empty")
+	}
+	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID) + "/chain"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out struct {
+		Chain []FSLayerChainFrame `json:"chain"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode fs layer chain: %w", err)
+	}
+	return out.Chain, nil
+}
+
+func (c *Client) DeleteFSLayer(ctx context.Context, layerID string, cascade bool) error {
+	if strings.TrimSpace(layerID) == "" {
+		return fmt.Errorf("layerID must not be empty")
+	}
+	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID)
+	if cascade {
+		u += "?cascade=true"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return readError(resp)
+	}
+	return nil
 }
 
 func (c *Client) CommitFSLayer(ctx context.Context, layerID string) (*FSLayerCommit, error) {

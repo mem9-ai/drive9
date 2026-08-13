@@ -315,7 +315,8 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, forkErr(http.StatusConflict, "source tenant is not active")
 	}
 	if !s.forkProviderSupported(source.Provider) {
-		return nil, forkErr(http.StatusConflict, "fork is not supported in this TiDBCloud mode")
+		return nil, forkErr(http.StatusConflict,
+			"tenant fork is not supported in this mode; use POST /v1/layers/{ref}/fork (or drive9 fs layer fork) for CoW filesystem branches")
 	}
 	credentialReq, err = s.resolveForkCredentialRequest(source.Provider, credentialReq)
 	if err != nil {
@@ -325,7 +326,9 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, forkErr(http.StatusConflict, "source tenant storage namespace is not initialized")
 	}
 	if !s.forkBranchCreateSupported(source.Provider, credentialReq) {
-		return nil, forkErr(http.StatusConflict, "fork requires branch-capable provisioner")
+		// Share / non-branch tenants: FS layer fork is the supported path (D9).
+		return nil, forkErr(http.StatusConflict,
+			"tenant fork requires a branch-capable provisioner; use POST /v1/layers/{ref}/fork (or drive9 fs layer fork) for CoW filesystem branches")
 	}
 	if hasReservations, err := s.sourceHasActiveUploadReservations(ctx, source.ID); err != nil {
 		logger.Error(ctx, "fork_check_upload_reservations_failed",

@@ -18,6 +18,8 @@ type FSLayerEntryKind string
 
 var ErrFSLayerRefAmbiguous = errors.New("fs layer ref is ambiguous")
 var ErrFSLayerStateConflict = errors.New("fs layer state conflict")
+var ErrFSLayerDepthExceeded = errors.New("fs layer depth exceeded")
+var ErrFSLayerHasChildren = errors.New("fs layer has pinned descendants")
 
 const (
 	FSLayerStateActive     FSLayerState = "active"
@@ -42,6 +44,18 @@ const (
 	FSLayerEntryKindDir     FSLayerEntryKind = "dir"
 	FSLayerEntryKindSymlink FSLayerEntryKind = "symlink"
 
+	FSLayerOriginCreate = "create"
+	FSLayerOriginFork   = "fork"
+
+	// FSLayerDefaultMaxDepth is the default soft cap (D15). Hard top is FSLayerHardMaxDepth.
+	FSLayerDefaultMaxDepth = 8
+	FSLayerHardMaxDepth    = 16
+
+	// fsLayerSelectCols is the column list for scanning fs_layers rows.
+	fsLayerSelectCols = `layer_id, base_root_path, name, state, durability_mode, actor_id, durable_seq,
+	parent_layer_id, origin_seq, origin_checkpoint_id, root_layer_id, depth, origin,
+	created_at, updated_at, sealed_at`
+
 	// fsLayerEventOpRollback is the synthetic event op emitted into
 	// fs_layer_events when a layer is rolled back. It lets mounted FUSE
 	// clients detect the rollback via the layer-event watcher and refresh
@@ -53,17 +67,23 @@ const (
 )
 
 type FSLayer struct {
-	LayerID        string
-	BaseRootPath   string
-	Name           string
-	Tags           map[string]string
-	State          FSLayerState
-	DurabilityMode FSLayerDurabilityMode
-	ActorID        string
-	DurableSeq     int64
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	SealedAt       *time.Time
+	LayerID             string
+	BaseRootPath        string
+	Name                string
+	Tags                map[string]string
+	State               FSLayerState
+	DurabilityMode      FSLayerDurabilityMode
+	ActorID             string
+	DurableSeq          int64
+	ParentLayerID       string
+	OriginSeq           int64
+	OriginCheckpointID  string
+	RootLayerID         string
+	Depth               int
+	Origin              string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+	SealedAt            *time.Time
 }
 
 type FSLayerEntry struct {
@@ -150,6 +170,19 @@ func (s *Store) CreateFSLayer(ctx context.Context, layer *FSLayer) error {
 	if err := validateFSLayerDurability(layer.DurabilityMode); err != nil {
 		return err
 	}
+	// Root layers (create): parent empty, self root, depth 0.
+	if strings.TrimSpace(layer.ParentLayerID) == "" {
+		layer.ParentLayerID = ""
+		layer.OriginSeq = 0
+		layer.OriginCheckpointID = ""
+		if layer.RootLayerID == "" {
+			layer.RootLayerID = layer.LayerID
+		}
+		layer.Depth = 0
+		if layer.Origin == "" {
+			layer.Origin = FSLayerOriginCreate
+		}
+	}
 	tags, err := normalizeFSLayerTags(layer.Tags)
 	if err != nil {
 		return err
@@ -161,10 +194,13 @@ func (s *Store) CreateFSLayer(ctx context.Context, layer *FSLayer) error {
 	defer func() { _ = tx.Rollback() }()
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO fs_layers (
-	`+s.scope.InsCols(`layer_id, base_root_path, name, state, durability_mode, actor_id, durable_seq, created_at, updated_at, sealed_at`)+`
-) VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), ?`)+`)`,
+	`+s.scope.InsCols(`layer_id, base_root_path, name, state, durability_mode, actor_id, durable_seq,
+	parent_layer_id, origin_seq, origin_checkpoint_id, root_layer_id, depth, origin,
+	created_at, updated_at, sealed_at`)+`
+) VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), ?`)+`)`,
 		s.scope.Args(layer.LayerID, layer.BaseRootPath, layer.Name, string(layer.State), string(layer.DurabilityMode), layer.ActorID,
-			layer.DurableSeq, nilTime(layer.SealedAt))...)
+			layer.DurableSeq, layer.ParentLayerID, layer.OriginSeq, layer.OriginCheckpointID, layer.RootLayerID, layer.Depth, layer.Origin,
+			nilTime(layer.SealedAt))...)
 	if err != nil {
 		return fmt.Errorf("create fs layer %s: %w", layer.LayerID, err)
 	}
@@ -184,7 +220,7 @@ func (s *Store) GetFSLayer(ctx context.Context, layerID string) (*FSLayer, error
 		return nil, fmt.Errorf("fs layer id is required")
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT layer_id, base_root_path, name, state, durability_mode, actor_id, durable_seq, created_at, updated_at, sealed_at
+SELECT `+fsLayerSelectCols+`
 	FROM fs_layers
 	WHERE `+s.scope.And(`layer_id = ?`), s.scope.Args(layerID)...)
 	layer, err := scanFSLayer(row)
@@ -199,7 +235,7 @@ SELECT layer_id, base_root_path, name, state, durability_mode, actor_id, durable
 
 func (s *Store) ListFSLayers(ctx context.Context) ([]FSLayer, error) {
 	query := `
-SELECT layer_id, base_root_path, name, state, durability_mode, actor_id, durable_seq, created_at, updated_at, sealed_at
+SELECT ` + fsLayerSelectCols + `
 FROM fs_layers`
 	query += `
 ORDER BY updated_at DESC, layer_id`
@@ -851,6 +887,7 @@ func scanFSLayer(row interface{ Scan(dest ...any) error }) (*FSLayer, error) {
 	var sealedAt sql.NullTime
 	if err := row.Scan(
 		&layer.LayerID, &layer.BaseRootPath, &layer.Name, &state, &durability, &layer.ActorID, &layer.DurableSeq,
+		&layer.ParentLayerID, &layer.OriginSeq, &layer.OriginCheckpointID, &layer.RootLayerID, &layer.Depth, &layer.Origin,
 		&layer.CreatedAt, &layer.UpdatedAt, &sealedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -860,6 +897,12 @@ func scanFSLayer(row interface{ Scan(dest ...any) error }) (*FSLayer, error) {
 	}
 	layer.State = FSLayerState(state)
 	layer.DurabilityMode = FSLayerDurabilityMode(durability)
+	if layer.RootLayerID == "" {
+		layer.RootLayerID = layer.LayerID
+	}
+	if layer.Origin == "" {
+		layer.Origin = FSLayerOriginCreate
+	}
 	layer.CreatedAt = layer.CreatedAt.UTC()
 	layer.UpdatedAt = layer.UpdatedAt.UTC()
 	if sealedAt.Valid {
@@ -871,7 +914,7 @@ func scanFSLayer(row interface{ Scan(dest ...any) error }) (*FSLayer, error) {
 
 func (s *Store) listFSLayersByName(ctx context.Context, name string) ([]FSLayer, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT layer_id, base_root_path, name, state, durability_mode, actor_id, durable_seq, created_at, updated_at, sealed_at
+SELECT `+fsLayerSelectCols+`
 FROM fs_layers
 WHERE `+s.scope.And(`name = ?`)+`
 ORDER BY updated_at DESC, layer_id`, s.scope.Args(name)...)
@@ -889,7 +932,9 @@ func (s *Store) fsLayerJoinArgs(args ...any) []any {
 
 func (s *Store) listFSLayersByTag(ctx context.Context, key, value string, hasValue bool) ([]FSLayer, error) {
 	query := `
-SELECT l.layer_id, l.base_root_path, l.name, l.state, l.durability_mode, l.actor_id, l.durable_seq, l.created_at, l.updated_at, l.sealed_at
+SELECT l.layer_id, l.base_root_path, l.name, l.state, l.durability_mode, l.actor_id, l.durable_seq,
+	l.parent_layer_id, l.origin_seq, l.origin_checkpoint_id, l.root_layer_id, l.depth, l.origin,
+	l.created_at, l.updated_at, l.sealed_at
 FROM fs_layers l
 JOIN fs_layer_tags t ON t.layer_id = l.layer_id
 WHERE ` + s.scope.AndAs("l", s.scope.AndAs("t", "t.tag_key = ?"))

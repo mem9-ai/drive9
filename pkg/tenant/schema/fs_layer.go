@@ -3,6 +3,10 @@ package schema
 // FSLayerTiDBSchemaStatements returns tenant-local tables for generic Drive9
 // filesystem layers. These tables sit beside file_nodes/inodes/contents: base
 // data remains unchanged until an explicit layer commit applies overlay entries.
+//
+// CoW fork chain columns (parent_layer_id, origin_seq, …) are additive; ALTER
+// statements repair existing tables. ExecSchemaStatementsContext tolerates
+// duplicate column errors for fresh schemas.
 func FSLayerTiDBSchemaStatements() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS fs_layers (
@@ -13,13 +17,30 @@ func FSLayerTiDBSchemaStatements() []string {
 			durability_mode VARCHAR(32) NOT NULL DEFAULT 'restore-safe',
 			actor_id        VARCHAR(255) NOT NULL DEFAULT '',
 			durable_seq     BIGINT NOT NULL DEFAULT 0,
+			parent_layer_id VARCHAR(64) NOT NULL DEFAULT '',
+			origin_seq      BIGINT NOT NULL DEFAULT 0,
+			origin_checkpoint_id VARCHAR(64) NOT NULL DEFAULT '',
+			root_layer_id   VARCHAR(64) NOT NULL DEFAULT '',
+			depth           INT NOT NULL DEFAULT 0,
+			origin          VARCHAR(32) NOT NULL DEFAULT 'create',
 			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			sealed_at       DATETIME(3)
 		)`,
+		// Repair existing fs_layers tables created before CoW fork chain.
+		`ALTER TABLE fs_layers ADD COLUMN parent_layer_id VARCHAR(64) NOT NULL DEFAULT ''`,
+		`ALTER TABLE fs_layers ADD COLUMN origin_seq BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE fs_layers ADD COLUMN origin_checkpoint_id VARCHAR(64) NOT NULL DEFAULT ''`,
+		`ALTER TABLE fs_layers ADD COLUMN root_layer_id VARCHAR(64) NOT NULL DEFAULT ''`,
+		`ALTER TABLE fs_layers ADD COLUMN depth INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE fs_layers ADD COLUMN origin VARCHAR(32) NOT NULL DEFAULT 'create'`,
+		// Backfill chain root for pre-fork rows (root_layer_id empty → self).
+		`UPDATE fs_layers SET root_layer_id = layer_id WHERE root_layer_id = '' OR root_layer_id IS NULL`,
 		`CREATE INDEX idx_fs_layers_state ON fs_layers(state, updated_at)`,
 		`CREATE INDEX idx_fs_layers_base_root ON fs_layers(base_root_path)`,
 		`CREATE INDEX idx_fs_layers_name ON fs_layers(name, updated_at)`,
+		`CREATE INDEX idx_fs_layers_parent ON fs_layers(parent_layer_id, state)`,
+		`CREATE INDEX idx_fs_layers_root ON fs_layers(root_layer_id)`,
 
 		`CREATE TABLE IF NOT EXISTS fs_layer_tags (
 			layer_id   VARCHAR(64) NOT NULL,
@@ -100,13 +121,28 @@ func FSLayerDB9SchemaStatements() []string {
 			durability_mode VARCHAR(32) NOT NULL DEFAULT 'restore-safe',
 			actor_id        VARCHAR(255) NOT NULL DEFAULT '',
 			durable_seq     BIGINT NOT NULL DEFAULT 0,
+			parent_layer_id VARCHAR(64) NOT NULL DEFAULT '',
+			origin_seq      BIGINT NOT NULL DEFAULT 0,
+			origin_checkpoint_id VARCHAR(64) NOT NULL DEFAULT '',
+			root_layer_id   VARCHAR(64) NOT NULL DEFAULT '',
+			depth           INT NOT NULL DEFAULT 0,
+			origin          VARCHAR(32) NOT NULL DEFAULT 'create',
 			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			sealed_at       TIMESTAMPTZ
 		)`,
+		`ALTER TABLE fs_layers ADD COLUMN IF NOT EXISTS parent_layer_id VARCHAR(64) NOT NULL DEFAULT ''`,
+		`ALTER TABLE fs_layers ADD COLUMN IF NOT EXISTS origin_seq BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE fs_layers ADD COLUMN IF NOT EXISTS origin_checkpoint_id VARCHAR(64) NOT NULL DEFAULT ''`,
+		`ALTER TABLE fs_layers ADD COLUMN IF NOT EXISTS root_layer_id VARCHAR(64) NOT NULL DEFAULT ''`,
+		`ALTER TABLE fs_layers ADD COLUMN IF NOT EXISTS depth INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE fs_layers ADD COLUMN IF NOT EXISTS origin VARCHAR(32) NOT NULL DEFAULT 'create'`,
+		`UPDATE fs_layers SET root_layer_id = layer_id WHERE root_layer_id = '' OR root_layer_id IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_fs_layers_state ON fs_layers(state, updated_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_fs_layers_base_root ON fs_layers(base_root_path)`,
 		`CREATE INDEX IF NOT EXISTS idx_fs_layers_name ON fs_layers(name, updated_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_fs_layers_parent ON fs_layers(parent_layer_id, state)`,
+		`CREATE INDEX IF NOT EXISTS idx_fs_layers_root ON fs_layers(root_layer_id)`,
 
 		`CREATE TABLE IF NOT EXISTS fs_layer_tags (
 			layer_id   VARCHAR(64) NOT NULL,
