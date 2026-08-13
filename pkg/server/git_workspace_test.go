@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 
@@ -405,6 +407,78 @@ func TestGitWorkspaceLiveUpsertKeepsID(t *testing.T) {
 	}
 	if second.WorkspaceID != first.WorkspaceID {
 		t.Fatalf("live upsert id = %s, want %s", second.WorkspaceID, first.WorkspaceID)
+	}
+}
+
+func TestGitWorkspaceUpsertMintsNewIDWhenDeleteInterleavesAfterLiveRead(t *testing.T) {
+	s := newTestServer(t)
+	ensureGitWorkspaceSchema(t, s)
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+
+	c := client.New(ts.URL, "")
+	ctx := context.Background()
+	old, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo-race/",
+		RepoURL:    "https://example.test/repo-race.git",
+		RemoteName: "origin",
+		HeadCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
+	if err != nil {
+		t.Fatalf("seed upsert: %v", err)
+	}
+	if _, err := c.PutGitOverlayEntry(ctx, old.WorkspaceID, client.GitOverlayEntryRequest{
+		Path: "stale.txt", Op: "upsert", Kind: "file", Content: []byte("old"),
+	}); err != nil {
+		t.Fatalf("seed overlay: %v", err)
+	}
+
+	lookupSeen := make(chan struct{})
+	resume := make(chan struct{})
+	var once sync.Once
+	testHookAfterGitWorkspaceLookup = func() {
+		once.Do(func() { close(lookupSeen) })
+		<-resume
+	}
+	t.Cleanup(func() { testHookAfterGitWorkspaceLookup = nil })
+
+	type upsertResult struct {
+		ws  *client.GitWorkspace
+		err error
+	}
+	ch := make(chan upsertResult, 1)
+	go func() {
+		ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+			RootPath:   "/repo-race/",
+			RepoURL:    "https://example.test/repo-race.git",
+			RemoteName: "origin",
+			HeadCommit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		})
+		ch <- upsertResult{ws: ws, err: err}
+	}()
+	select {
+	case <-lookupSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upsert never reached lookup hook")
+	}
+	if err := c.DeleteGitWorkspace(ctx, old.WorkspaceID); err != nil {
+		t.Fatalf("interleaved DELETE: %v", err)
+	}
+	close(resume)
+	got := <-ch
+	if got.err != nil {
+		t.Fatalf("upsert after interleaved DELETE: %v", got.err)
+	}
+	if got.ws == nil || got.ws.WorkspaceID == old.WorkspaceID {
+		t.Fatalf("upsert reused old id %s after DELETE", old.WorkspaceID)
+	}
+	if _, err := c.GetGitWorkspace(ctx, old.WorkspaceID); !client.IsNotFound(err) {
+		t.Fatalf("GET old id after interleaved recreate: %v, want NotFound", err)
+	}
+	if _, err := c.PutGitOverlayEntry(ctx, old.WorkspaceID, client.GitOverlayEntryRequest{
+		Path: "from-stale-runtime.txt", Op: "upsert", Kind: "file", Content: []byte("nope"),
+	}); !client.IsNotFound(err) {
+		t.Fatalf("old-id overlay write after interleaved recreate: %v, want NotFound", err)
 	}
 }
 

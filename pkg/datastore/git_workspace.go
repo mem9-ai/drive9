@@ -122,20 +122,20 @@ type GitOverlayEntry struct {
 	UpdatedAt      time.Time
 }
 
-func (s *Store) UpsertGitWorkspace(ctx context.Context, ws GitWorkspace) error {
+func normalizeGitWorkspace(ws GitWorkspace) (GitWorkspace, error) {
 	if strings.TrimSpace(ws.WorkspaceID) == "" {
-		return fmt.Errorf("git workspace id is required")
+		return ws, fmt.Errorf("git workspace id is required")
 	}
 	if strings.TrimSpace(ws.RootPath) == "" {
-		return fmt.Errorf("git workspace root path is required")
+		return ws, fmt.Errorf("git workspace root path is required")
 	}
 	root, err := pathutil.CanonicalizeDir(ws.RootPath)
 	if err != nil {
-		return fmt.Errorf("invalid git workspace root path: %w", err)
+		return ws, fmt.Errorf("invalid git workspace root path: %w", err)
 	}
 	ws.RootPath = root
 	if strings.TrimSpace(ws.RepoURL) == "" {
-		return fmt.Errorf("git workspace repo url is required")
+		return ws, fmt.Errorf("git workspace repo url is required")
 	}
 	if ws.RemoteName == "" {
 		ws.RemoteName = "origin"
@@ -148,6 +148,14 @@ func (s *Store) UpsertGitWorkspace(ctx context.Context, ws GitWorkspace) error {
 	}
 	if ws.Status == "" {
 		ws.Status = GitWorkspaceStatusLive
+	}
+	return ws, nil
+}
+
+func (s *Store) UpsertGitWorkspace(ctx context.Context, ws GitWorkspace) error {
+	ws, err := normalizeGitWorkspace(ws)
+	if err != nil {
+		return err
 	}
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO git_workspaces (
@@ -177,39 +185,112 @@ ON DUPLICATE KEY UPDATE
 	return nil
 }
 
+// CommitGitWorkspace inserts or updates a workspace while deciding live-keep
+// vs deleted-root replacement against the locked current row. ws.WorkspaceID
+// is the candidate id for insert or revive; a live row keeps its existing id.
+func (s *Store) CommitGitWorkspace(ctx context.Context, ws GitWorkspace) (*GitWorkspace, error) {
+	ws, err := normalizeGitWorkspace(ws)
+	if err != nil {
+		return nil, err
+	}
+	ws.Status = GitWorkspaceStatusLive
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		existing, err := s.getGitWorkspaceByRootTx(ctx, tx, ws.RootPath)
+		if errors.Is(err, ErrNotFound) {
+			return s.insertGitWorkspaceTx(ctx, tx, ws)
+		}
+		if err != nil {
+			return err
+		}
+		if existing.Status == GitWorkspaceStatusLive {
+			ws.WorkspaceID = existing.WorkspaceID
+			return s.updateLiveGitWorkspaceTx(ctx, tx, ws)
+		}
+		return s.replaceDeletedGitWorkspaceTx(ctx, tx, existing.WorkspaceID, ws)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.GetGitWorkspaceByRoot(ctx, ws.RootPath)
+}
+
+func (s *Store) getGitWorkspaceByRootTx(ctx context.Context, tx *sql.Tx, root string) (*GitWorkspace, error) {
+	row := tx.QueryRowContext(ctx, `
+SELECT workspace_id, root_path, repo_url, remote_name, branch_name,
+	base_commit, head_commit, mode, workspace_kind, common_workspace_id,
+	worktree_name, gitdir_rel, status, created_at, updated_at
+FROM git_workspaces
+WHERE `+s.scope.And(`root_path = ?`)+`
+FOR UPDATE`, s.scope.Args(root)...)
+	return scanGitWorkspace(row)
+}
+
+func (s *Store) insertGitWorkspaceTx(ctx context.Context, tx *sql.Tx, ws GitWorkspace) error {
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO git_workspaces (
+	`+s.scope.InsCols(`workspace_id, root_path, repo_url, remote_name, branch_name,
+	base_commit, head_commit, mode, workspace_kind, common_workspace_id,
+	worktree_name, gitdir_rel, status, created_at, updated_at`)+`
+) VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)`)+`)`,
+		s.scope.Args(ws.WorkspaceID, ws.RootPath, ws.RepoURL, ws.RemoteName, ws.BranchName,
+			ws.BaseCommit, ws.HeadCommit, string(ws.Mode), string(ws.Kind), ws.CommonID,
+			ws.WorktreeName, ws.GitDirRel, string(ws.Status))...)
+	if err != nil {
+		return fmt.Errorf("insert git workspace %s: %w", ws.WorkspaceID, err)
+	}
+	return nil
+}
+
+func (s *Store) updateLiveGitWorkspaceTx(ctx context.Context, tx *sql.Tx, ws GitWorkspace) error {
+	res, err := tx.ExecContext(ctx, `
+UPDATE git_workspaces
+SET repo_url = ?, remote_name = ?, branch_name = ?,
+	base_commit = ?, head_commit = ?, mode = ?, workspace_kind = ?, common_workspace_id = ?,
+	worktree_name = ?, gitdir_rel = ?, status = ?, updated_at = UTC_TIMESTAMP(3)
+WHERE `+s.scope.And(`workspace_id = ? AND status = ?`),
+		append([]any{
+			ws.RepoURL, ws.RemoteName, ws.BranchName,
+			ws.BaseCommit, ws.HeadCommit, string(ws.Mode), string(ws.Kind), ws.CommonID,
+			ws.WorktreeName, ws.GitDirRel, string(GitWorkspaceStatusLive),
+		}, s.scope.Args(ws.WorkspaceID, string(GitWorkspaceStatusLive))...)...)
+	if err != nil {
+		return fmt.Errorf("update live git workspace %s: %w", ws.WorkspaceID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update live git workspace %s: %w", ws.WorkspaceID, err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ReplaceDeletedGitWorkspace revives a deleted root under a new workspace_id
 // so stale runtimes that still hold the old id cannot write into the new
 // generation. The old id disappears (GET/subresource → NotFound).
 func (s *Store) ReplaceDeletedGitWorkspace(ctx context.Context, oldID string, ws GitWorkspace) error {
+	ws, err := normalizeGitWorkspace(ws)
+	if err != nil {
+		return err
+	}
+	ws.Status = GitWorkspaceStatusLive
+	return s.replaceDeletedGitWorkspaceTx(ctx, s.db, oldID, ws)
+}
+
+type gitWorkspaceExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func (s *Store) replaceDeletedGitWorkspaceTx(ctx context.Context, exec gitWorkspaceExecer, oldID string, ws GitWorkspace) error {
 	oldID = strings.TrimSpace(oldID)
 	if oldID == "" {
 		return fmt.Errorf("git workspace id is required")
 	}
-	if strings.TrimSpace(ws.WorkspaceID) == "" || ws.WorkspaceID == oldID {
+	if ws.WorkspaceID == "" || ws.WorkspaceID == oldID {
 		return fmt.Errorf("replacement git workspace id must be a new identity")
 	}
-	if strings.TrimSpace(ws.RootPath) == "" {
-		return fmt.Errorf("git workspace root path is required")
-	}
-	root, err := pathutil.CanonicalizeDir(ws.RootPath)
-	if err != nil {
-		return fmt.Errorf("invalid git workspace root path: %w", err)
-	}
-	ws.RootPath = root
-	if strings.TrimSpace(ws.RepoURL) == "" {
-		return fmt.Errorf("git workspace repo url is required")
-	}
-	if ws.RemoteName == "" {
-		ws.RemoteName = "origin"
-	}
-	if ws.Mode == "" {
-		ws.Mode = GitWorkspaceModeFast
-	}
-	if ws.Kind == "" {
-		ws.Kind = GitWorkspaceKindMain
-	}
-	ws.Status = GitWorkspaceStatusLive
-	res, err := s.db.ExecContext(ctx, `
+	res, err := exec.ExecContext(ctx, `
 UPDATE git_workspaces
 SET workspace_id = ?, root_path = ?, repo_url = ?, remote_name = ?, branch_name = ?,
 	base_commit = ?, head_commit = ?, mode = ?, workspace_kind = ?, common_workspace_id = ?,
@@ -218,7 +299,7 @@ WHERE `+s.scope.And(`workspace_id = ? AND status = ?`),
 		append([]any{
 			ws.WorkspaceID, ws.RootPath, ws.RepoURL, ws.RemoteName, ws.BranchName,
 			ws.BaseCommit, ws.HeadCommit, string(ws.Mode), string(ws.Kind), ws.CommonID,
-			ws.WorktreeName, ws.GitDirRel, string(ws.Status),
+			ws.WorktreeName, ws.GitDirRel, string(GitWorkspaceStatusLive),
 		}, s.scope.Args(oldID, string(GitWorkspaceStatusDeleted))...)...)
 	if err != nil {
 		return fmt.Errorf("replace deleted git workspace %s: %w", oldID, err)
@@ -321,6 +402,11 @@ WHERE `+s.scope.And(`workspace_id = ?`), s.scope.Args(workspaceID)...).Scan(&sta
 	})
 }
 
+// Batches bound per-statement size. All batches stay in DeleteGitWorkspace's
+// single transaction: splitting them would let a same-root upsert interleave
+// and inherit leftover child rows. Tree-node count is expected to stay well
+// below hundreds of thousands per workspace; if that changes, raise the batch
+// size or move to a background drain with the live-row fence still in place.
 const gitWorkspaceSubresourceDeleteBatch = 5000
 
 func (s *Store) deleteGitWorkspaceSubresourcesTx(ctx context.Context, tx *sql.Tx, workspaceID string) error {

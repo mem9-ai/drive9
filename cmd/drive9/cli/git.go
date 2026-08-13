@@ -1137,32 +1137,70 @@ func gitCommonDir(ctx context.Context, repoDir string) (string, error) {
 }
 
 func sameGitRemoteIdentity(a, b string) bool {
-	ia := gitRemoteIdentity(a)
-	ib := gitRemoteIdentity(b)
-	return ia != "" && ia == ib
+	pa, oka := parseGitRemote(a)
+	pb, okb := parseGitRemote(b)
+	if !oka || !okb {
+		return false
+	}
+	if !strings.EqualFold(pa.host, pb.host) {
+		return false
+	}
+	if isGitHubHost(pa.host) && isGitHubHost(pb.host) {
+		// GitHub HTTPS <-> git@github.com: is the one explicit equivalence.
+		// Paths are case-insensitive; account is not part of the repo namespace.
+		return strings.EqualFold(stripGitSuffix(pa.path), stripGitSuffix(pb.path))
+	}
+	// Generic git: host is DNS-case-insensitive; path and SSH account are not.
+	return pa.user == pb.user && stripGitSuffix(pa.path) == stripGitSuffix(pb.path)
 }
 
-func gitRemoteIdentity(raw string) string {
+type gitRemoteParts struct {
+	host string
+	user string
+	path string
+}
+
+func parseGitRemote(raw string) (gitRemoteParts, bool) {
 	raw = gitcache.SanitizeRepoURL(strings.TrimSpace(raw))
 	if raw == "" {
-		return ""
+		return gitRemoteParts{}, false
 	}
-	// scp-like: git@host:path
-	if !strings.Contains(raw, "://") && strings.Contains(raw, "@") {
-		parts := strings.SplitN(raw, "@", 2)
-		if len(parts) == 2 {
-			hostPath := strings.Replace(parts[1], ":", "/", 1)
-			hostPath = strings.TrimSuffix(hostPath, ".git")
-			hostPath = strings.Trim(hostPath, "/")
-			return strings.ToLower(hostPath)
+	if !strings.Contains(raw, "://") && strings.Contains(raw, ":") {
+		rest := raw
+		user := ""
+		if at := strings.LastIndex(rest, "@"); at >= 0 && !strings.Contains(rest[:at], ":") {
+			user = rest[:at]
+			rest = rest[at+1:]
 		}
+		host, path, ok := strings.Cut(rest, ":")
+		if !ok || host == "" || path == "" {
+			return gitRemoteParts{}, false
+		}
+		return gitRemoteParts{host: host, user: user, path: strings.TrimPrefix(path, "/")}, true
 	}
-	if u, err := url.Parse(raw); err == nil && u.Host != "" {
-		path := strings.TrimSuffix(u.Path, ".git")
-		path = strings.Trim(path, "/")
-		return strings.ToLower(u.Host + "/" + path)
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return gitRemoteParts{}, false
 	}
-	return strings.ToLower(strings.TrimSuffix(raw, ".git"))
+	user := ""
+	if u.User != nil {
+		user = u.User.Username()
+	}
+	return gitRemoteParts{host: u.Hostname(), user: user, path: strings.TrimPrefix(u.Path, "/")}, true
+}
+
+func isGitHubHost(host string) bool {
+	switch strings.ToLower(host) {
+	case "github.com", "www.github.com":
+		return true
+	default:
+		return false
+	}
+}
+
+func stripGitSuffix(path string) string {
+	path = strings.TrimSuffix(path, ".git")
+	return strings.Trim(path, "/")
 }
 
 func gitOutput(ctx context.Context, repoDir string, args ...string) (string, error) {

@@ -23,6 +23,10 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
 
+// testHookAfterGitWorkspaceLookup runs after the unlocked root lookup and
+// before CommitGitWorkspace. Tests only.
+var testHookAfterGitWorkspaceLookup func()
+
 const (
 	maxGitWorkspaceBodyBytes  = 4 << 20
 	maxGitTreeBodyBytes       = 128 << 20
@@ -265,28 +269,23 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 		gitDirRel = ""
 	}
 
-	workspaceID := token.NewID()
 	existing, err := store.GetGitWorkspaceByRoot(r.Context(), root)
-	replaceDeletedID := ""
 	if err == nil {
 		if workspaceKind == datastore.GitWorkspaceKindLinked && commonWorkspaceID == existing.WorkspaceID {
 			errJSON(w, http.StatusBadRequest, "linked git workspace cannot reference itself as common_workspace_id")
 			return
 		}
-		if existing.Status == datastore.GitWorkspaceStatusLive {
-			// In-place update of a live workspace keeps the id.
-			workspaceID = existing.WorkspaceID
-		} else {
-			// Deleted root: mint a new id so stale runtimes holding the old
-			// id cannot write into the recreated generation.
-			replaceDeletedID = existing.WorkspaceID
-		}
 	} else if !errors.Is(err, datastore.ErrNotFound) {
 		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
+	// Unlocked lookup is only for the self-link check. Live-vs-deleted
+	// identity is decided again under row lock in CommitGitWorkspace.
+	if testHookAfterGitWorkspaceLookup != nil {
+		testHookAfterGitWorkspaceLookup()
+	}
 	ws := datastore.GitWorkspace{
-		WorkspaceID:  workspaceID,
+		WorkspaceID:  token.NewID(),
 		RootPath:     root,
 		RepoURL:      repoURL,
 		RemoteName:   strings.TrimSpace(req.RemoteName),
@@ -306,18 +305,13 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 	if ws.Mode == "" {
 		ws.Mode = datastore.GitWorkspaceModeFast
 	}
-	if replaceDeletedID != "" {
-		if err := store.ReplaceDeletedGitWorkspace(r.Context(), replaceDeletedID, ws); err != nil {
-			writeGitWorkspaceStoreError(w, r, err)
-			return
-		}
-	} else if err := store.UpsertGitWorkspace(r.Context(), ws); err != nil {
+	out, err := store.CommitGitWorkspace(r.Context(), ws)
+	if err != nil {
 		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
-	out, err := store.GetGitWorkspaceByRoot(r.Context(), root)
-	if err != nil {
-		writeGitWorkspaceStoreError(w, r, err)
+	if out == nil {
+		writeGitWorkspaceStoreError(w, r, datastore.ErrNotFound)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

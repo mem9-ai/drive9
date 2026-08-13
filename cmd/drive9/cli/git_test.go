@@ -178,10 +178,19 @@ func TestFastCloneResumeRejectsDifferentOrigin(t *testing.T) {
 		t.Fatal("different origin resume succeeded, want error")
 	}
 	if !sameGitRemoteIdentity("https://github.com/org/repo.git", "git@github.com:org/repo.git") {
-		t.Fatal("same host/path over https and ssh should match")
+		t.Fatal("GitHub HTTPS vs git@github.com: should match")
 	}
 	if sameGitRemoteIdentity("https://example.test/actual.git", "https://example.test/other.git") {
 		t.Fatal("different repos compared equal")
+	}
+	if sameGitRemoteIdentity("ssh://alice@example.test/Repo.git", "ssh://bob@example.test/repo.git") {
+		t.Fatal("generic remotes with different SSH users / path case compared equal")
+	}
+	if sameGitRemoteIdentity("https://example.test/Repo.git", "https://example.test/repo.git") {
+		t.Fatal("generic remotes with case-distinct paths compared equal")
+	}
+	if err := checkFastCloneResumeIdentity(ctx, repo, "https://example.test/Actual.git"); err == nil {
+		t.Fatal("generic origin path case mismatch resume succeeded, want error")
 	}
 }
 
