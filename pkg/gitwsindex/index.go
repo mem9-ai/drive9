@@ -4,9 +4,14 @@ package gitwsindex
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
+
+// ErrUnreadable is returned when the index document is malformed or exceeds
+// the size/entry limits. Mounts treat this as a permanent dormant signal.
+var ErrUnreadable = errors.New("git workspace index is unreadable")
 
 const (
 	Path       = "/.drive9/git-workspaces/index.json"
@@ -132,17 +137,17 @@ func (e Entry) MarshalJSON() ([]byte, error) {
 // Parse decodes an index document. Empty input is a valid empty index.
 func Parse(data []byte) (*Index, error) {
 	if int64(len(data)) > MaxBytes {
-		return nil, fmt.Errorf("git workspace index exceeds maximum size (%d bytes)", MaxBytes)
+		return nil, fmt.Errorf("%w: exceeds maximum size (%d bytes)", ErrUnreadable, MaxBytes)
 	}
 	if len(strings.TrimSpace(string(data))) == 0 {
 		return &Index{Version: 1}, nil
 	}
 	var idx Index
 	if err := json.Unmarshal(data, &idx); err != nil {
-		return nil, fmt.Errorf("parse git workspace index: %w", err)
+		return nil, fmt.Errorf("%w: %v", ErrUnreadable, err)
 	}
 	if len(idx.Workspaces) > MaxEntries {
-		return nil, fmt.Errorf("git workspace index exceeds maximum entry count (%d)", MaxEntries)
+		return nil, fmt.Errorf("%w: exceeds maximum entry count (%d)", ErrUnreadable, MaxEntries)
 	}
 	return &idx, nil
 }

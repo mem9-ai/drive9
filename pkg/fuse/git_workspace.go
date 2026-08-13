@@ -258,7 +258,7 @@ func (fs *Dat9FS) runGitWorkspaceIndexProbeLoop() {
 		// The client holds a static bearer with no refresh path; server 401 is a
 		// persistent credential failure (not retryable without remount). 403 is
 		// permanent scope denial. Transient backend failures are 5xx, not 401.
-		if client.IsForbidden(err) || client.IsUnauthorized(err) {
+		if client.IsForbidden(err) || client.IsUnauthorized(err) || client.IsUnreadableGitWorkspaceIndex(err) {
 			fs.git.mu.Lock()
 			if !fs.git.armed {
 				fs.git.dormantConfirmed = true

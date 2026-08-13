@@ -1142,22 +1142,24 @@ func sameGitRemoteIdentity(a, b string) bool {
 	if !oka || !okb {
 		return false
 	}
-	if !strings.EqualFold(pa.host, pb.host) {
-		return false
-	}
-	if isGitHubHost(pa.host) && isGitHubHost(pb.host) {
-		// GitHub HTTPS <-> git@github.com: is the one explicit equivalence.
-		// Paths are case-insensitive; account is not part of the repo namespace.
+	if githubDefaultEndpoint(pa) && githubDefaultEndpoint(pb) {
 		return strings.EqualFold(stripGitSuffix(pa.path), stripGitSuffix(pb.path))
 	}
-	// Generic git: host is DNS-case-insensitive; path and SSH account are not.
-	return pa.user == pb.user && stripGitSuffix(pa.path) == stripGitSuffix(pb.path)
+	return strings.EqualFold(pa.scheme, pb.scheme) &&
+		strings.EqualFold(pa.host, pb.host) &&
+		pa.port == pb.port &&
+		pa.user == pb.user &&
+		pa.absPath == pb.absPath &&
+		stripGitSuffix(pa.path) == stripGitSuffix(pb.path)
 }
 
 type gitRemoteParts struct {
-	host string
-	user string
-	path string
+	scheme  string
+	host    string
+	port    string
+	user    string
+	path    string
+	absPath bool
 }
 
 func parseGitRemote(raw string) (gitRemoteParts, bool) {
@@ -1176,7 +1178,8 @@ func parseGitRemote(raw string) (gitRemoteParts, bool) {
 		if !ok || host == "" || path == "" {
 			return gitRemoteParts{}, false
 		}
-		return gitRemoteParts{host: host, user: user, path: strings.TrimPrefix(path, "/")}, true
+		abs := strings.HasPrefix(path, "/")
+		return gitRemoteParts{scheme: "scp", host: host, user: user, path: strings.TrimPrefix(path, "/"), absPath: abs}, true
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
@@ -1186,7 +1189,14 @@ func parseGitRemote(raw string) (gitRemoteParts, bool) {
 	if u.User != nil {
 		user = u.User.Username()
 	}
-	return gitRemoteParts{host: u.Hostname(), user: user, path: strings.TrimPrefix(u.Path, "/")}, true
+	return gitRemoteParts{
+		scheme:  strings.ToLower(u.Scheme),
+		host:    u.Hostname(),
+		port:    u.Port(),
+		user:    user,
+		path:    strings.TrimPrefix(u.Path, "/"),
+		absPath: strings.HasPrefix(u.Path, "/"),
+	}, true
 }
 
 func isGitHubHost(host string) bool {
@@ -1198,9 +1208,22 @@ func isGitHubHost(host string) bool {
 	}
 }
 
+func githubDefaultEndpoint(p gitRemoteParts) bool {
+	if !isGitHubHost(p.host) {
+		return false
+	}
+	switch p.scheme {
+	case "https":
+		return p.port == "" || p.port == "443"
+	case "ssh", "scp":
+		return p.port == "" || p.port == "22"
+	default:
+		return false
+	}
+}
+
 func stripGitSuffix(path string) string {
-	path = strings.TrimSuffix(path, ".git")
-	return strings.Trim(path, "/")
+	return strings.TrimSuffix(path, ".git")
 }
 
 func gitOutput(ctx context.Context, repoDir string, args ...string) (string, error) {

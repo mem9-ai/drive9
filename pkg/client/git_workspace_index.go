@@ -85,12 +85,17 @@ func (c *Client) ReadGitWorkspaceIndex(ctx context.Context) (*GitWorkspaceIndex,
 func parseGitWorkspaceIndex(data []byte) (*GitWorkspaceIndex, error) {
 	idx, err := gitwsindex.Parse(data)
 	if err != nil {
-		if strings.Contains(err.Error(), "exceeds maximum") {
+		if errors.Is(err, gitwsindex.ErrUnreadable) {
 			return nil, fmt.Errorf("%w: %v", ErrGitWorkspaceIndexTooLarge, err)
 		}
 		return nil, err
 	}
 	return idx, nil
+}
+
+// IsUnreadableGitWorkspaceIndex reports a malformed or oversized index document.
+func IsUnreadableGitWorkspaceIndex(err error) bool {
+	return errors.Is(err, ErrGitWorkspaceIndexTooLarge) || errors.Is(err, gitwsindex.ErrUnreadable)
 }
 
 // StatGitWorkspaceIndex reports whether the index exists and its revision/mtime.

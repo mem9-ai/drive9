@@ -411,7 +411,7 @@ func removeGitWorkspaceIndexEntry(ctx context.Context, b *backend.Dat9Backend, w
 		if nf != nil && nf.File != nil {
 			rev = nf.File.Revision
 			if nf.File.SizeBytes > maxGitWorkspaceIndexBytes {
-				return fmt.Errorf("git workspace index exceeds maximum size (%d bytes)", maxGitWorkspaceIndexBytes)
+				return rewriteGitWorkspaceIndexFromStore(ctx, b, workspaceID, rev)
 			}
 		}
 		data, err := b.ReadCtx(ctx, gitWorkspaceIndexPath, 0, maxGitWorkspaceIndexBytes+1)
@@ -422,10 +422,13 @@ func removeGitWorkspaceIndexEntry(ctx context.Context, b *backend.Dat9Backend, w
 			return fmt.Errorf("read git workspace index: %w", err)
 		}
 		if int64(len(data)) > maxGitWorkspaceIndexBytes {
-			return fmt.Errorf("git workspace index exceeds maximum size (%d bytes)", maxGitWorkspaceIndexBytes)
+			return rewriteGitWorkspaceIndexFromStore(ctx, b, workspaceID, rev)
 		}
 		idx, err := gitwsindex.Parse(data)
 		if err != nil {
+			if errors.Is(err, gitwsindex.ErrUnreadable) {
+				return rewriteGitWorkspaceIndexFromStore(ctx, b, workspaceID, rev)
+			}
 			return err
 		}
 		if idx.Version == 0 {
@@ -479,6 +482,51 @@ func removeGitWorkspaceIndexEntry(ctx context.Context, b *backend.Dat9Backend, w
 		return fmt.Errorf("write git workspace index: %w", lastErr)
 	}
 	return fmt.Errorf("write git workspace index: exhausted retries")
+}
+
+// rewriteGitWorkspaceIndexFromStore replaces a corrupt/oversized index with a
+// fresh document built from live git_workspaces rows (excluding excludeID).
+func rewriteGitWorkspaceIndexFromStore(ctx context.Context, b *backend.Dat9Backend, excludeID string, rev int64) error {
+	if b == nil || b.Store() == nil {
+		return fmt.Errorf("backend store is nil")
+	}
+	live, err := b.Store().ListGitWorkspaces(ctx)
+	if err != nil {
+		return fmt.Errorf("list git workspaces for index rebuild: %w", err)
+	}
+	idx := gitwsindex.Index{
+		Version:   1,
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	for i := range live {
+		ws := live[i]
+		if ws.WorkspaceID == excludeID {
+			continue
+		}
+		idx.Workspaces = append(idx.Workspaces, gitwsindex.Entry{
+			WorkspaceID:   ws.WorkspaceID,
+			RootPath:      ws.RootPath,
+			WorkspaceKind: string(ws.Kind),
+		})
+	}
+	body, err := json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode rebuilt git workspace index: %w", err)
+	}
+	_, _, err = b.WriteCtxIfRevisionWithTagsResult(
+		ctx,
+		gitWorkspaceIndexPath,
+		body,
+		0,
+		filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate,
+		rev,
+		nil,
+		"",
+	)
+	if err != nil {
+		return fmt.Errorf("write rebuilt git workspace index: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) handleGitWorkspaceObject(w http.ResponseWriter, r *http.Request, store *datastore.Store) {

@@ -192,6 +192,18 @@ func TestFastCloneResumeRejectsDifferentOrigin(t *testing.T) {
 	if err := checkFastCloneResumeIdentity(ctx, repo, "https://example.test/Actual.git"); err == nil {
 		t.Fatal("generic origin path case mismatch resume succeeded, want error")
 	}
+	if sameGitRemoteIdentity("ssh://git@example.test:2222/repo.git", "ssh://git@example.test:22/repo.git") {
+		t.Fatal("explicit ports 2222 and 22 compared equal")
+	}
+	if sameGitRemoteIdentity("http://example.test/repo.git", "https://example.test/repo.git") {
+		t.Fatal("http and https compared equal")
+	}
+	if sameGitRemoteIdentity("https://github.com:4443/org/repo.git", "https://github.com/org/repo.git") {
+		t.Fatal("non-default GitHub port compared equal to default")
+	}
+	if sameGitRemoteIdentity("git@example.test:repo.git", "ssh://git@example.test/repo.git") {
+		t.Fatal("scp-relative and URL-absolute paths compared equal")
+	}
 }
 
 func TestFastWorktreeResumeRejectsUnrelatedCheckout(t *testing.T) {

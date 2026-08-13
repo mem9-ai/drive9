@@ -410,6 +410,61 @@ func TestProbeIndex401And403LatchDormant(t *testing.T) {
 	}
 }
 
+func TestProbeIndexCorruptLatchesDormant(t *testing.T) {
+	indexFSPath := "/v1/fs" + client.GitWorkspaceIndexPath
+	var listCalls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/git-workspaces" {
+			listCalls.Add(1)
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path == indexFSPath {
+			switch r.Method {
+			case http.MethodHead:
+				w.Header().Set("Content-Length", "1")
+				w.Header().Set("X-Dat9-Revision", "1")
+				w.WriteHeader(http.StatusOK)
+			case http.MethodGet:
+				_, _ = w.Write([]byte("{"))
+			default:
+				http.Error(w, "method", http.StatusMethodNotAllowed)
+			}
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, RemoteRoot: "/"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(srv.URL), opts)
+
+	done := make(chan struct{})
+	go func() {
+		fs.runGitWorkspaceIndexProbeLoop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe loop did not stop on corrupt index")
+	}
+	fs.git.mu.Lock()
+	confirmed := fs.git.dormantConfirmed
+	armed := fs.git.armed
+	fs.git.mu.Unlock()
+	if !confirmed {
+		t.Fatal("dormantConfirmed = false after corrupt index; want permanent latch")
+	}
+	if armed {
+		t.Fatal("armed after corrupt index; want unarmed dormant")
+	}
+	if got := listCalls.Load(); got != 0 {
+		t.Fatalf("ListGitWorkspaces calls = %d, want 0", got)
+	}
+}
+
 func TestPendingForceOrdinaryLookupsSingleList(t *testing.T) {
 	// 1 external force + 2 ordinary concurrent lookups must produce exactly one
 	// ListGitWorkspaces. Ordinary joins must not bump pendingForceGen (storm).

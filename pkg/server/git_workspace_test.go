@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -201,6 +202,19 @@ func TestGitWorkspaceDeleteIndexFailureStillReturns200(t *testing.T) {
 
 	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
 		t.Fatalf("DeleteGitWorkspace with bad index: %v (want 200)", err)
+	}
+	rebuilt, err := s.fallback.ReadCtx(ctx, gitWorkspaceIndexPath, 0, maxGitWorkspaceIndexBytes+1)
+	if err != nil {
+		t.Fatalf("read rebuilt index: %v", err)
+	}
+	idx, err := gitwsindex.Parse(rebuilt)
+	if err != nil {
+		t.Fatalf("parse rebuilt index: %v", err)
+	}
+	for _, e := range idx.Workspaces {
+		if e.WorkspaceID == ws.WorkspaceID {
+			t.Fatalf("rebuilt index still lists deleted %s", ws.WorkspaceID)
+		}
 	}
 	got, err := s.fallback.Store().GetGitWorkspace(ctx, ws.WorkspaceID)
 	if err != nil {
@@ -479,6 +493,86 @@ func TestGitWorkspaceUpsertMintsNewIDWhenDeleteInterleavesAfterLiveRead(t *testi
 		Path: "from-stale-runtime.txt", Op: "upsert", Kind: "file", Content: []byte("nope"),
 	}); !client.IsNotFound(err) {
 		t.Fatalf("old-id overlay write after interleaved recreate: %v, want NotFound", err)
+	}
+}
+
+func TestCommitGitWorkspaceDoesNotReturnSuccessorGeneration(t *testing.T) {
+	s := newTestServer(t)
+	ensureGitWorkspaceSchema(t, s)
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+
+	c := client.New(ts.URL, "")
+	ctx := context.Background()
+	old, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo-gen/",
+		RepoURL:    "https://example.test/repo-gen.git",
+		RemoteName: "origin",
+		HeadCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
+	if err != nil {
+		t.Fatalf("seed upsert: %v", err)
+	}
+
+	committed := make(chan struct{})
+	resume := make(chan struct{})
+	var parkFirst atomic.Bool
+	parkFirst.Store(true)
+	datastore.TestHookAfterCommitGitWorkspaceTx = func() {
+		if !parkFirst.CompareAndSwap(true, false) {
+			return
+		}
+		close(committed)
+		<-resume
+	}
+	t.Cleanup(func() { datastore.TestHookAfterCommitGitWorkspaceTx = nil })
+
+	type upsertResult struct {
+		ws  *client.GitWorkspace
+		err error
+	}
+	ch := make(chan upsertResult, 1)
+	go func() {
+		ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+			RootPath:   "/repo-gen/",
+			RepoURL:    "https://example.test/repo-gen.git",
+			RemoteName: "origin",
+			HeadCommit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		})
+		ch <- upsertResult{ws: ws, err: err}
+	}()
+	select {
+	case <-committed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("commit hook never ran")
+	}
+	if err := c.DeleteGitWorkspace(ctx, old.WorkspaceID); err != nil {
+		t.Fatalf("delete after commit: %v", err)
+	}
+	newer, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo-gen/",
+		RepoURL:    "https://example.test/repo-gen.git",
+		RemoteName: "origin",
+		HeadCommit: "cccccccccccccccccccccccccccccccccccccccc",
+	})
+	if err != nil {
+		t.Fatalf("recreate after commit: %v", err)
+	}
+	close(resume)
+	got := <-ch
+	if got.err != nil {
+		t.Fatalf("older upsert: %v", got.err)
+	}
+	if got.ws == nil || got.ws.WorkspaceID != old.WorkspaceID {
+		t.Fatalf("older upsert id = %v, want original %s", got.ws, old.WorkspaceID)
+	}
+	if newer.WorkspaceID == old.WorkspaceID {
+		t.Fatal("recreate reused old id")
+	}
+	if _, err := c.PutGitOverlayEntry(ctx, got.ws.WorkspaceID, client.GitOverlayEntryRequest{
+		Path: "from-older-request.txt", Op: "upsert", Kind: "file", Content: []byte("nope"),
+	}); !client.IsNotFound(err) {
+		t.Fatalf("older request wrote into successor generation: %v", err)
 	}
 }
 

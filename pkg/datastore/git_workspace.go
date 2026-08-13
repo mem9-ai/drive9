@@ -194,24 +194,51 @@ func (s *Store) CommitGitWorkspace(ctx context.Context, ws GitWorkspace) (*GitWo
 		return nil, err
 	}
 	ws.Status = GitWorkspaceStatusLive
+	var committed *GitWorkspace
 	err = s.InTx(ctx, func(tx *sql.Tx) error {
 		existing, err := s.getGitWorkspaceByRootTx(ctx, tx, ws.RootPath)
 		if errors.Is(err, ErrNotFound) {
-			return s.insertGitWorkspaceTx(ctx, tx, ws)
+			if err := s.insertGitWorkspaceTx(ctx, tx, ws); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		} else if existing.Status == GitWorkspaceStatusLive {
+			ws.WorkspaceID = existing.WorkspaceID
+			if err := s.updateLiveGitWorkspaceTx(ctx, tx, ws); err != nil {
+				return err
+			}
+		} else if err := s.replaceDeletedGitWorkspaceTx(ctx, tx, existing.WorkspaceID, ws); err != nil {
+			return err
 		}
+		row, err := s.getGitWorkspaceTx(ctx, tx, ws.WorkspaceID)
 		if err != nil {
 			return err
 		}
-		if existing.Status == GitWorkspaceStatusLive {
-			ws.WorkspaceID = existing.WorkspaceID
-			return s.updateLiveGitWorkspaceTx(ctx, tx, ws)
-		}
-		return s.replaceDeletedGitWorkspaceTx(ctx, tx, existing.WorkspaceID, ws)
+		committed = row
+		return nil
 	})
+	if TestHookAfterCommitGitWorkspaceTx != nil {
+		TestHookAfterCommitGitWorkspaceTx()
+	}
 	if err != nil {
 		return nil, err
 	}
-	return s.GetGitWorkspaceByRoot(ctx, ws.RootPath)
+	return committed, nil
+}
+
+// TestHookAfterCommitGitWorkspaceTx runs after the commit transaction returns
+// and before CommitGitWorkspace returns the in-transaction row. Tests only.
+var TestHookAfterCommitGitWorkspaceTx func()
+
+func (s *Store) getGitWorkspaceTx(ctx context.Context, tx *sql.Tx, workspaceID string) (*GitWorkspace, error) {
+	row := tx.QueryRowContext(ctx, `
+SELECT workspace_id, root_path, repo_url, remote_name, branch_name,
+	base_commit, head_commit, mode, workspace_kind, common_workspace_id,
+	worktree_name, gitdir_rel, status, created_at, updated_at
+FROM git_workspaces
+WHERE `+s.scope.And(`workspace_id = ?`), s.scope.Args(workspaceID)...)
+	return scanGitWorkspace(row)
 }
 
 func (s *Store) getGitWorkspaceByRootTx(ctx context.Context, tx *sql.Tx, root string) (*GitWorkspace, error) {
