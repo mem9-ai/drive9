@@ -544,6 +544,71 @@ func TestFSLayerCommitRejectsCommittingWithoutFence(t *testing.T) {
 	}
 }
 
+func TestFSLayerChildObjectReadFallsBackToMain(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	if _, _, err := s.fallback.WriteCtxIfRevisionWithTagsResult(ctx, "/repo/base.txt", []byte("from-main"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, -1, nil, ""); err != nil {
+		t.Fatalf("write main: %v", err)
+	}
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-obj-main-parent",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.ForkFSLayer(ctx, "layer-obj-main-parent", client.FSLayerForkRequest{
+		LayerID: "layer-obj-main-child",
+	}); err != nil {
+		t.Fatalf("ForkFSLayer: %v", err)
+	}
+	got, err := c.ReadFSLayerFile(ctx, "layer-obj-main-child", "/repo/base.txt", nil)
+	if err != nil {
+		t.Fatalf("ReadFSLayerFile child main fallback: %v", err)
+	}
+	if !bytes.Equal(got, []byte("from-main")) {
+		t.Fatalf("child read = %q, want from-main", got)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-obj-main-child", client.FSLayerEntryRequest{
+		Path: "/repo/base.txt",
+		Op:   "whiteout",
+		Kind: "file",
+	}); err != nil {
+		t.Fatalf("whiteout: %v", err)
+	}
+	if _, err := c.ReadFSLayerFile(ctx, "layer-obj-main-child", "/repo/base.txt", nil); err == nil {
+		t.Fatal("whiteout read err=nil, want not found")
+	}
+}
+
+func TestFSLayerRootObjectReadFallsBackToMain(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	if _, _, err := s.fallback.WriteCtxIfRevisionWithTagsResult(ctx, "/repo/only-main.txt", []byte("root-main"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, -1, nil, ""); err != nil {
+		t.Fatalf("write main: %v", err)
+	}
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-obj-root-fallback",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	got, err := c.ReadFSLayerFile(ctx, "layer-obj-root-fallback", "/repo/only-main.txt", nil)
+	if err != nil {
+		t.Fatalf("ReadFSLayerFile root main fallback: %v", err)
+	}
+	if !bytes.Equal(got, []byte("root-main")) {
+		t.Fatalf("root read = %q, want root-main", got)
+	}
+}
+
 func TestFSLayerChildObjectReadHonorsExplicitZeroMaxSeq(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

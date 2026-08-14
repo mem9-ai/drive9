@@ -1,6 +1,6 @@
 # LayerFS CoW Fork
 
-Date: 2026-08-13  
+Date: 2026-08-13
 Status: Canonical
 
 This specification adds **zero-copy layer fork** and **server-side chain reads** to Drive9 LayerFS. Product surface stays **layer** (`fs layer`, `/v1/layers`, `mount --layer`). Checkpoint, commit, and rollback keep their V1 names and meanings.
@@ -156,7 +156,7 @@ Creation is not a full-tree copy. It is lazy per-path CoW plus a chain pin.
 - Do not change main-table current-state semantics or UNIQUE(path).
 - CoW state stays in **`fs_layer_*`**; chain support is **additive**.
 - Shared and dedicated schemas stay in lockstep. TiDB and DB9 variants stay in lockstep. `dump-init-sql` (tidb_zero / tidb_cloud_native / db9) is the export source.
-- Existing tenants: online `ALTER` plus backfill  
+- Existing tenants: online `ALTER` plus backfill
   `parent_layer_id=''`, `origin_seq=0`, `depth=0`, `root_layer_id=layer_id`, `origin_checkpoint_id=''`.
 
 ### 5.2 `fs_layers` additive columns
@@ -191,8 +191,8 @@ In one transaction:
 1. `SELECT … FROM fs_layers WHERE layer_id=? FOR UPDATE` (parent).
 2. State ∈ {`active`,`sealed`} or **409**.
 3. Same tenant; `depth+1` ≤ 8 (hard 16) or **409**.
-4. **Tip pin:**  
-   `origin_seq = COALESCE((SELECT MAX(entry_seq) FROM fs_layer_entries WHERE layer_id=parent), 0)`  
+4. **Tip pin:**
+   `origin_seq = COALESCE((SELECT MAX(entry_seq) FROM fs_layer_entries WHERE layer_id=parent), 0)`
    — **not** `fs_layers.durable_seq`.
 5. **Checkpoint pin:** checkpoint belongs to parent; `origin_seq = checkpoint.durable_seq`; set `origin_checkpoint_id`.
 6. Child inherits `base_root_path` and `durability_mode`; `depth` / `root_layer_id` per D14; `state=active`.

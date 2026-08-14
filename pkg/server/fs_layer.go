@@ -506,59 +506,75 @@ func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request,
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	var (
-		entry *datastore.FSLayerEntry
-	)
+	entry, hit, err := resolveFSLayerObjectEntry(r.Context(), store, layer, path, maxSeq, hasMaxSeq)
+	if err != nil {
+		writeFSLayerStoreError(w, r, err)
+		return
+	}
+	if hit {
+		if entry.Op == datastore.FSLayerEntryOpWhiteout {
+			errJSON(w, http.StatusNotFound, "not found")
+			return
+		}
+		if entry.Op != datastore.FSLayerEntryOpUpsert || entry.Kind != datastore.FSLayerEntryKindFile {
+			errJSON(w, http.StatusBadRequest, "fs layer object path is not a file upsert")
+			return
+		}
+		rc, err := b.OpenFSLayerEntryData(r.Context(), entry)
+		if err != nil {
+			logger.Error(r.Context(), "fs_layer_object_read_failed", eventFields(r.Context(), "fs_layer_object_read_failed", "path", entry.Path, "error", err)...)
+			writeBackendError(w, r, err)
+			return
+		}
+		defer func() { _ = rc.Close() }()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if entry.SizeBytes > 0 || (entry.SizeBytes == 0 && len(entry.ContentBlob) == 0) {
+			w.Header().Set("Content-Length", strconv.FormatInt(entry.SizeBytes, 10))
+		}
+		if _, err := io.Copy(w, rc); err != nil {
+			return
+		}
+		return
+	}
+	// MISS → live main (D7 / §5.6.2). Whiteout already returned 404 above.
+	data, err := b.ReadCtx(r.Context(), path, 0, -1)
+	if errors.Is(err, datastore.ErrNotFound) {
+		errJSON(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err != nil {
+		writeBackendError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(int64(len(data)), 10))
+	_, _ = w.Write(data)
+}
+
+func resolveFSLayerObjectEntry(ctx context.Context, store *datastore.Store, layer *datastore.FSLayer, path string, maxSeq int64, hasMaxSeq bool) (*datastore.FSLayerEntry, bool, error) {
 	if layer.HasParent() {
 		var tipMax *int64
 		if hasMaxSeq {
 			tipMax = &maxSeq
 		}
-		var hit bool
-		entry, hit, err = store.ResolveFSLayerPathAtSeq(r.Context(), layer.LayerID, path, tipMax)
-		if err != nil {
-			writeFSLayerStoreError(w, r, err)
-			return
-		}
-		if !hit {
-			errJSON(w, http.StatusNotFound, "not found")
-			return
-		}
-	} else if hasMaxSeq {
-		entry, err = store.GetFSLayerEntryAtSeq(r.Context(), layer.LayerID, path, maxSeq)
-		if err != nil {
-			writeFSLayerStoreError(w, r, err)
-			return
-		}
+		return store.ResolveFSLayerPathAtSeq(ctx, layer.LayerID, path, tipMax)
+	}
+	var (
+		entry *datastore.FSLayerEntry
+		err   error
+	)
+	if hasMaxSeq {
+		entry, err = store.GetFSLayerEntryAtSeq(ctx, layer.LayerID, path, maxSeq)
 	} else {
-		entry, err = store.GetFSLayerEntry(r.Context(), layer.LayerID, path)
-		if err != nil {
-			writeFSLayerStoreError(w, r, err)
-			return
-		}
+		entry, err = store.GetFSLayerEntry(ctx, layer.LayerID, path)
 	}
-	if entry.Op == datastore.FSLayerEntryOpWhiteout {
-		errJSON(w, http.StatusNotFound, "not found")
-		return
+	if errors.Is(err, datastore.ErrNotFound) {
+		return nil, false, nil
 	}
-	if entry.Op != datastore.FSLayerEntryOpUpsert || entry.Kind != datastore.FSLayerEntryKindFile {
-		errJSON(w, http.StatusBadRequest, "fs layer object path is not a file upsert")
-		return
-	}
-	rc, err := b.OpenFSLayerEntryData(r.Context(), entry)
 	if err != nil {
-		logger.Error(r.Context(), "fs_layer_object_read_failed", eventFields(r.Context(), "fs_layer_object_read_failed", "path", entry.Path, "error", err)...)
-		writeBackendError(w, r, err)
-		return
+		return nil, false, err
 	}
-	defer func() { _ = rc.Close() }()
-	w.Header().Set("Content-Type", "application/octet-stream")
-	if entry.SizeBytes > 0 || (entry.SizeBytes == 0 && len(entry.ContentBlob) == 0) {
-		w.Header().Set("Content-Length", strconv.FormatInt(entry.SizeBytes, 10))
-	}
-	if _, err := io.Copy(w, rc); err != nil {
-		return
-	}
+	return entry, true, nil
 }
 
 func (s *Server) handleFSLayerObjectUpload(w http.ResponseWriter, r *http.Request, b *backendpkg.Dat9Backend, store *datastore.Store, layer *datastore.FSLayer) {

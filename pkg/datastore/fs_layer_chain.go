@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/pingcap/failpoint"
 )
 
 // FSLayerForkOptions controls ForkFSLayer.
@@ -304,21 +306,24 @@ func (s *Store) FSLayerStillPins(ctx context.Context, layerID string) (bool, err
 	if layerID == "" {
 		return false, fmt.Errorf("fs layer id is required")
 	}
-	return s.fsLayerStillPinsRec(ctx, layerID, map[string]struct{}{})
+	return s.fsLayerStillPinsRec(ctx, s.db, layerID, map[string]struct{}{})
 }
 
-func (s *Store) fsLayerStillPinsRec(ctx context.Context, layerID string, seen map[string]struct{}) (bool, error) {
+type fsLayerQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func (s *Store) fsLayerStillPinsRec(ctx context.Context, q fsLayerQueryer, layerID string, seen map[string]struct{}) (bool, error) {
 	if _, ok := seen[layerID]; ok {
 		return false, nil
 	}
 	seen[layerID] = struct{}{}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := q.QueryContext(ctx, `
 SELECT layer_id, state FROM fs_layers WHERE `+s.scope.And(`parent_layer_id = ?`),
 		s.scope.Args(layerID)...)
 	if err != nil {
 		return false, fmt.Errorf("list child layers of %s: %w", layerID, err)
 	}
-	defer func() { _ = rows.Close() }()
 	type child struct {
 		id    string
 		state FSLayerState
@@ -327,11 +332,14 @@ SELECT layer_id, state FROM fs_layers WHERE `+s.scope.And(`parent_layer_id = ?`)
 	for rows.Next() {
 		var id, state string
 		if err := rows.Scan(&id, &state); err != nil {
+			_ = rows.Close()
 			return false, err
 		}
 		children = append(children, child{id: id, state: FSLayerState(state)})
 	}
-	if err := rows.Err(); err != nil {
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
 		return false, err
 	}
 	for _, c := range children {
@@ -340,7 +348,7 @@ SELECT layer_id, state FROM fs_layers WHERE `+s.scope.And(`parent_layer_id = ?`)
 			return true, nil
 		}
 		// abandoned/committed: pin if their subtree still needs them
-		sub, err := s.fsLayerStillPinsRec(ctx, c.id, seen)
+		sub, err := s.fsLayerStillPinsRec(ctx, q, c.id, seen)
 		if err != nil {
 			return false, err
 		}
@@ -349,6 +357,28 @@ SELECT layer_id, state FROM fs_layers WHERE `+s.scope.And(`parent_layer_id = ?`)
 		}
 	}
 	return false, nil
+}
+
+func (s *Store) listFSLayerDirectChildIDs(ctx context.Context, q fsLayerQueryer, layerID string) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT layer_id FROM fs_layers WHERE `+s.scope.And(`parent_layer_id = ?`)+`
+ORDER BY layer_id`, s.scope.Args(layerID)...)
+	if err != nil {
+		return nil, fmt.Errorf("list child layer ids of %s: %w", layerID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // ListFSLayerDirectChildren returns layers whose parent_layer_id = layerID.
@@ -373,55 +403,103 @@ type DeleteFSLayerOptions struct {
 
 // DeleteFSLayer logically abandons a layer (D17). Physical row/entry delete is
 // not performed while still_pins. Without cascade, still_pins → ErrFSLayerHasChildren.
+//
+// Each abandon is a short transaction that locks the target row with the same
+// SELECT … FOR UPDATE fork uses, so a concurrent fork cannot insert a child
+// after the pins check and before the state flip. Cascade is still one short
+// transaction per layer, not a single tree-wide transaction.
 func (s *Store) DeleteFSLayer(ctx context.Context, layerID string, opts DeleteFSLayerOptions) error {
 	layerID = strings.TrimSpace(layerID)
 	if layerID == "" {
 		return fmt.Errorf("fs layer id is required")
 	}
-	layer, err := s.GetFSLayer(ctx, layerID)
-	if err != nil {
-		return err
-	}
-	if layer.State == FSLayerStateCommitting {
-		return fmt.Errorf("%w: layer %s is committing", ErrFSLayerStateConflict, layerID)
-	}
-	pins, err := s.FSLayerStillPins(ctx, layerID)
-	if err != nil {
-		return err
-	}
-	if pins {
-		if !opts.Cascade {
-			return fmt.Errorf("%w: layer %s has descendants; use cascade", ErrFSLayerHasChildren, layerID)
-		}
-		children, err := s.ListFSLayerDirectChildren(ctx, layerID)
+	for {
+		children, err := s.abandonFSLayerLocked(ctx, layerID, opts.Cascade)
 		if err != nil {
 			return err
 		}
-		// Depth-first: delete children first.
+		if len(children) == 0 {
+			return nil
+		}
 		for i := range children {
-			if err := s.DeleteFSLayer(ctx, children[i].LayerID, DeleteFSLayerOptions{Cascade: true}); err != nil {
+			if err := s.DeleteFSLayer(ctx, children[i], DeleteFSLayerOptions{Cascade: true}); err != nil {
 				return err
 			}
 		}
 	}
-	if layer.State == FSLayerStateAbandoned {
-		return nil
+}
+
+func (s *Store) abandonFSLayerLocked(ctx context.Context, layerID string, cascade bool) ([]string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin delete fs layer %s: %w", layerID, err)
 	}
-	// Logical abandon; preserve entries for any residual pin safety.
-	if err := s.SetFSLayerStateIf(ctx, layerID,
-		[]FSLayerState{FSLayerStateActive, FSLayerStateSealed, FSLayerStateConflicted, FSLayerStateCommitted},
-		FSLayerStateAbandoned); err != nil {
-		// Already abandoned or wrong state — re-check.
-		cur, gerr := s.GetFSLayer(ctx, layerID)
-		if gerr != nil {
-			return gerr
+	defer func() { _ = tx.Rollback() }()
+
+	var state string
+	err = tx.QueryRowContext(ctx, `
+SELECT state FROM fs_layers WHERE `+s.scope.And(`layer_id = ?`)+` FOR UPDATE`,
+		s.scope.Args(layerID)...).Scan(&state)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
 		}
-		if cur.State == FSLayerStateAbandoned {
-			return nil
-		}
-		return err
+		return nil, fmt.Errorf("lock fs layer %s: %w", layerID, err)
 	}
-	return nil
+	st := FSLayerState(state)
+	if st == FSLayerStateCommitting {
+		return nil, fmt.Errorf("%w: layer %s is committing", ErrFSLayerStateConflict, layerID)
+	}
+
+	pins, err := s.fsLayerStillPinsRec(ctx, tx, layerID, map[string]struct{}{})
+	if err != nil {
+		return nil, err
+	}
+	if pins {
+		if !cascade {
+			return nil, fmt.Errorf("%w: layer %s has descendants; use cascade", ErrFSLayerHasChildren, layerID)
+		}
+		ids, err := s.listFSLayerDirectChildIDs(ctx, tx, layerID)
+		if err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit delete fs layer %s: %w", layerID, err)
+		}
+		return ids, nil
+	}
+	if st == FSLayerStateAbandoned {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit delete fs layer %s: %w", layerID, err)
+		}
+		return nil, nil
+	}
+
+	// Pins are false while this row is locked, so fork cannot insert a child.
+	failpoint.InjectCall("fsLayerDeleteAfterPinsCheck", layerID)
+
+	res, err := tx.ExecContext(ctx, `
+UPDATE fs_layers
+SET state = ?, updated_at = UTC_TIMESTAMP(3), sealed_at = COALESCE(sealed_at, UTC_TIMESTAMP(3))
+WHERE `+s.scope.And(`layer_id = ? AND state IN (?, ?, ?, ?)`),
+		append([]any{string(FSLayerStateAbandoned)},
+			s.scope.Args(layerID,
+				string(FSLayerStateActive), string(FSLayerStateSealed),
+				string(FSLayerStateConflicted), string(FSLayerStateCommitted))...)...)
+	if err != nil {
+		return nil, fmt.Errorf("abandon fs layer %s: %w", layerID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("%w: layer %s", ErrFSLayerStateConflict, layerID)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit delete fs layer %s: %w", layerID, err)
+	}
+	return nil, nil
 }
 
 // HasFSLayerParent returns true if the layer is a non-root (forked) layer.
