@@ -542,6 +542,10 @@ func Mount(opts *MountOptions) (err error) {
 
 	err = serveWaitMountThenStartWatchers(server.Serve, server.WaitMount, func() {
 		sseWatcher = StartSSEWatcher(dat9fs, c, actorID)
+		// After SSE is up, asynchronously probe the remote git-workspace index
+		// (one FS Stat — not ListGitWorkspaces) so sandbox remounts arm when
+		// prior --fast registrations exist.
+		dat9fs.probeGitWorkspaceIndexAsync()
 	}, func(err error) error {
 		ok, probeErr := shouldContinueAfterWaitMountPermissionError(err, opts.MountPoint, probeMountPointReady)
 		if ok {

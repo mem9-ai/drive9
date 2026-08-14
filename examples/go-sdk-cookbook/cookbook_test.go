@@ -3,6 +3,8 @@ package go_sdk_cookbook_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -189,6 +191,73 @@ func ExampleClient_transfersAppendPatchAndStreaming() {
 	_ = conditional.Abort(ctx)
 	described := c.NewStreamWriterWithDescription(ctx, "/streams/desc.bin", int64(len(body)), "stream upload")
 	_ = described.Abort(ctx)
+}
+
+func ExampleClient_migrationContract() {
+	ctx := context.Background()
+	c := drive9.New("https://drive9.example.com", "owner-api-key")
+
+	capabilities, err := c.GetMigrationCapabilities(ctx)
+	if err != nil ||
+		!capabilities.ChecksumRead ||
+		!capabilities.ChecksumComplete ||
+		!capabilities.ConditionalCreate ||
+		!capabilities.ConditionalUpdate {
+		return
+	}
+
+	stats, err := c.BatchStatWithOptionsCtx(ctx, []string{"/migration/existing.bin"}, drive9.BatchStatOptions{
+		IncludeChecksum: true,
+	})
+	if err != nil {
+		return
+	}
+	_ = stats
+
+	body := []byte("payload")
+	checksum := sha256.Sum256(body)
+	checksumSHA256 := hex.EncodeToString(checksum[:])
+	_, _ = c.WriteStreamConditionalWithChecksum(
+		ctx, "/migration/new.bin", bytes.NewReader(body), int64(len(body)), nil, 0, checksumSHA256,
+	)
+
+	readSourceVersionToken := func() (string, error) {
+		// Build this token from a fresh lstat of the source entry.
+		return "device:inode:type:size:mtime:ctime:mode", nil
+	}
+	sourceVersionToken, err := readSourceVersionToken()
+	if err != nil {
+		return
+	}
+	verifySourceUnchanged := func() error {
+		currentToken, err := readSourceVersionToken()
+		if err != nil {
+			return err
+		}
+		if currentToken != sourceVersionToken {
+			return errors.New("source changed during upload")
+		}
+		return nil
+	}
+	_, _ = c.WriteStreamConditionalWithChecksumAndPreCompleteCheck(
+		ctx, "/migration/existing.bin", bytes.NewReader(body), int64(len(body)), nil, 12, checksumSHA256, verifySourceUnchanged,
+	)
+
+	if !capabilities.EventIngest {
+		return
+	}
+	_ = c.PostMigrationEvent(ctx, drive9.MigrationEvent{
+		EventID:            "repair-01",
+		EmittedAt:          time.Now().UTC().Format(time.RFC3339Nano),
+		Phase:              "DUAL_WRITE_REPAIRING",
+		JobID:              "volume-01",
+		SourcePath:         "/mnt/ebs/existing.bin",
+		TargetPath:         "/migration/existing.bin",
+		SourceVersionToken: sourceVersionToken,
+		ExpectedRevision:   12,
+		Operation:          "update",
+		Result:             "repaired",
+	})
 }
 
 // ExampleClient_archive demonstrates downloading a remote directory tree as a
@@ -395,6 +464,14 @@ func ExampleClient_eventsLayersGitAndJournal() {
 		_, _ = c.GetGitWorkspaceByRoot(ctx, "/repo/")
 		_, _ = c.GetGitWorkspace(ctx, ws.WorkspaceID)
 		_, _ = c.ListGitWorkspaces(ctx)
+		// Existence-only index used by FUSE on-demand arming (not runtime content).
+		_ = c.UpsertGitWorkspaceIndexEntry(ctx, drive9.GitWorkspaceIndexEntry{
+			WorkspaceID:   ws.WorkspaceID,
+			RootPath:      "/repo/",
+			WorkspaceKind: "main",
+		})
+		_, _, _, _ = c.StatGitWorkspaceIndex(ctx)
+		_, _, _ = c.ReadGitWorkspaceIndex(ctx)
 		_ = c.ReplaceGitTree(ctx, ws.WorkspaceID, drive9.GitTreeReplaceRequest{
 			CommitSHA: "abc123",
 			Nodes: []drive9.GitTreeNode{{
@@ -427,7 +504,11 @@ func ExampleClient_eventsLayersGitAndJournal() {
 		})
 		_, _ = c.GetGitOverlayEntry(ctx, ws.WorkspaceID, "README.md")
 		_, _ = c.ListGitOverlayEntries(ctx, ws.WorkspaceID)
-		_ = c.DeleteGitWorkspace(ctx, ws.WorkspaceID)
+		// Prefer index removal before workspace delete so FUSE does not arm on a
+		// stale existence signal. Examples intentionally ignore network errors.
+		if err := c.RemoveGitWorkspaceIndexEntry(ctx, ws.WorkspaceID); err == nil {
+			_ = c.DeleteGitWorkspace(ctx, ws.WorkspaceID)
+		}
 	}
 
 	j, err := c.CreateJournal(ctx, journal.CreateRequest{
@@ -571,6 +652,7 @@ var coveredClientMethods = map[string]bool{
 	"RawDelete":                            true,
 	"RawGet":                               true,
 	"RawPost":                              true,
+	"ReadGitWorkspaceIndex":                true,
 	"Read":                                 true,
 	"ReadAt":                               true,
 	"ReadAtCtx":                            true,
@@ -588,6 +670,7 @@ var coveredClientMethods = map[string]bool{
 	"ReplaceGitTree":                       true,
 	"RemoveAll":                            true,
 	"RemoveAllCtx":                         true,
+	"RemoveGitWorkspaceIndexEntry":         true,
 	"Rename":                               true,
 	"RenameCtx":                            true,
 	"ReplayFSLayer":                        true,
@@ -610,6 +693,7 @@ var coveredClientMethods = map[string]bool{
 	"SmallFileThreshold":                   true,
 	"Stat":                                 true,
 	"StatCtx":                              true,
+	"StatGitWorkspaceIndex":                true,
 	"StatMetadata":                         true,
 	"StatMetadataCompat":                   true,
 	"StatMetadataCompatCtx":                true,
@@ -621,6 +705,7 @@ var coveredClientMethods = map[string]bool{
 	"UpsertFSLayerEntry":                   true,
 	"UpsertGitState":                       true,
 	"UpsertGitWorkspace":                   true,
+	"UpsertGitWorkspaceIndexEntry":         true,
 	"VerifyJournal":                        true,
 	"Warm":                                 true,
 	"WatchEvents":                          true,
@@ -638,6 +723,13 @@ var coveredClientMethods = map[string]bool{
 	"WriteStreamWithSummaryAndDescription": true,
 	"WriteStreamWithSummaryAndTags":        true,
 	"WriteStreamWithTags":                  true,
+
+	// Migration V1 client contract.
+	"BatchStatWithOptionsCtx":                               true,
+	"GetMigrationCapabilities":                              true,
+	"PostMigrationEvent":                                    true,
+	"WriteStreamConditionalWithChecksum":                    true,
+	"WriteStreamConditionalWithChecksumAndPreCompleteCheck": true,
 }
 
 func TestClientMethodExampleCoverage(t *testing.T) {

@@ -14,8 +14,8 @@
 #    existing-tenant regression without pulling in journal/layer-fs/fuse.
 #  - RUN_FUSE_SMOKE=0 skips the FUSE suite (and derives RUN_LAYER_FUSE_SMOKE
 #    from it). macOS WebDAV fallback cannot satisfy symlink/hardlink asserts.
-#  - RUN_GIT_OPS_SMOKE=1 / RUN_GIT_WORKSPACE_SMOKE=1 / RUN_PACK_SMOKE=1
-#    opt into the heavier optional suites.
+#  - RUN_GIT_OPS_SMOKE=1 / RUN_GIT_WORKSPACE_SMOKE=1 / RUN_GIT_ONDEMAND_SMOKE=1
+#    / RUN_PACK_SMOKE=1 opt into the heavier optional suites.
 
 set -euo pipefail
 
@@ -28,6 +28,7 @@ fi
 RUN_API_ONLY="${RUN_API_ONLY:-0}"
 RUN_GIT_OPS_SMOKE="${RUN_GIT_OPS_SMOKE:-0}"
 RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
+RUN_GIT_ONDEMAND_SMOKE="${RUN_GIT_ONDEMAND_SMOKE:-0}"
 RUN_FUSE_SMOKE="${RUN_FUSE_SMOKE:-1}"
 RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-$RUN_FUSE_SMOKE}"
 export RUN_LAYER_FUSE_SMOKE
@@ -87,6 +88,7 @@ if [ "$RUN_API_ONLY" = "1" ]; then
   skip_case "fuse" "e2e/fuse-smoke-test.sh" "set RUN_API_ONLY=0 to run FUSE coverage"
   skip_case "posix-permission" "e2e/posix-permission-smoke-test.sh" "set RUN_API_ONLY=0 to run posix-permission coverage"
   skip_case "git-ops" "e2e/git-ops-smoke-test.sh" "set RUN_API_ONLY=0 to run Git ops coverage"
+  skip_case "git-workspace-ondemand" "e2e/git-workspace-ondemand-smoke-test.sh" "set RUN_API_ONLY=0 to run on-demand discovery coverage"
   skip_case "git-workspace" "e2e/git-workspace-smoke-test.sh" "set RUN_API_ONLY=0 to run Git workspace coverage"
   skip_case "pack" "e2e/pack-smoke-test.sh" "set RUN_API_ONLY=0 to run pack coverage"
 else
@@ -102,6 +104,11 @@ else
     run_case "git-ops" "e2e/git-ops-smoke-test.sh"
   else
     skip_case "git-ops" "e2e/git-ops-smoke-test.sh" "set RUN_GIT_OPS_SMOKE=1 to run lightweight Git clone/status/restore coverage"
+  fi
+  if [ "$RUN_GIT_ONDEMAND_SMOKE" = "1" ]; then
+    run_case "git-workspace-ondemand" "e2e/git-workspace-ondemand-smoke-test.sh"
+  else
+    skip_case "git-workspace-ondemand" "e2e/git-workspace-ondemand-smoke-test.sh" "set RUN_GIT_ONDEMAND_SMOKE=1 to run on-demand discovery coverage"
   fi
   if [ "$RUN_GIT_WORKSPACE_SMOKE" = "1" ]; then
     run_case "git-workspace" "e2e/git-workspace-smoke-test.sh"

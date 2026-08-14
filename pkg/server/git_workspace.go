@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,12 +12,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+
+	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/gitcache"
+	"github.com/mem9-ai/drive9/pkg/gitwsindex"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
+
+// testHookAfterGitWorkspaceLookup runs after the unlocked root lookup and
+// before CommitGitWorkspace. Tests only.
+var testHookAfterGitWorkspaceLookup func()
 
 const (
 	maxGitWorkspaceBodyBytes  = 4 << 20
@@ -24,6 +33,12 @@ const (
 	maxGitBlobBodyBytes       = 512 << 20
 	maxGitObjectPackBytes     = 256 << 20
 	maxGitObjectPackBodyBytes = maxGitObjectPackBytes + maxGitObjectPackBytes/3 + 1<<20
+
+	// Tenant-absolute remote existence index (shared wire type).
+	gitWorkspaceIndexPath = gitwsindex.Path
+
+	maxGitWorkspaceIndexBytes   = gitwsindex.MaxBytes
+	maxGitWorkspaceIndexEntries = gitwsindex.MaxEntries
 )
 
 type gitWorkspaceRequest struct {
@@ -254,20 +269,23 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 		gitDirRel = ""
 	}
 
-	workspaceID := token.NewID()
 	existing, err := store.GetGitWorkspaceByRoot(r.Context(), root)
 	if err == nil {
 		if workspaceKind == datastore.GitWorkspaceKindLinked && commonWorkspaceID == existing.WorkspaceID {
 			errJSON(w, http.StatusBadRequest, "linked git workspace cannot reference itself as common_workspace_id")
 			return
 		}
-		workspaceID = existing.WorkspaceID
 	} else if !errors.Is(err, datastore.ErrNotFound) {
 		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
+	// Unlocked lookup is only for the self-link check. Live-vs-deleted
+	// identity is decided again under row lock in CommitGitWorkspace.
+	if testHookAfterGitWorkspaceLookup != nil {
+		testHookAfterGitWorkspaceLookup()
+	}
 	ws := datastore.GitWorkspace{
-		WorkspaceID:  workspaceID,
+		WorkspaceID:  token.NewID(),
 		RootPath:     root,
 		RepoURL:      repoURL,
 		RemoteName:   strings.TrimSpace(req.RemoteName),
@@ -287,13 +305,13 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 	if ws.Mode == "" {
 		ws.Mode = datastore.GitWorkspaceModeFast
 	}
-	if err := store.UpsertGitWorkspace(r.Context(), ws); err != nil {
+	out, err := store.CommitGitWorkspace(r.Context(), ws)
+	if err != nil {
 		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
-	out, err := store.GetGitWorkspaceByRoot(r.Context(), root)
-	if err != nil {
-		writeGitWorkspaceStoreError(w, r, err)
+	if out == nil {
+		writeGitWorkspaceStoreError(w, r, datastore.ErrNotFound)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -335,12 +353,180 @@ func (s *Server) handleGitWorkspaceList(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) handleGitWorkspaceDelete(w http.ResponseWriter, r *http.Request, store *datastore.Store, workspaceID string) {
-	if err := store.DeleteGitWorkspace(r.Context(), workspaceID); err != nil {
+	b := backendFromRequest(r)
+	if b == nil {
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	// Soft-delete is idempotent for convergent repair: NotFound means the row
+	// is already non-live, but a prior attempt may have left index cleanup pending.
+	// Mixed-version notes:
+	// - New server + old client: server attempts index cleanup; client may still
+	//   best-effort Remove on the FS path (idempotent if already cleaned).
+	// - New server + missing index file: Stat NotFound → no-op (safe).
+	// - Second DELETE after success: row NotFound still runs index cleanup → 200.
+	// Index cleanup failure is logged, not surfaced: the soft-deleted row is the
+	// durable state; the index is only an arming hint.
+	if err := store.DeleteGitWorkspace(r.Context(), workspaceID); err != nil && !errors.Is(err, datastore.ErrNotFound) {
 		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
+	// Best-effort index maintenance: do not turn a successful soft-delete into
+	// 500/EIO (user-facing rmdir will not retry). Convergence via client
+	// dual-write Remove and idempotent DELETE retries that re-run cleanup.
+	if err := removeGitWorkspaceIndexEntry(r.Context(), b, workspaceID); err != nil {
+		logger.Error(r.Context(), "git_workspace_index_cleanup_failed",
+			eventFields(r.Context(), "git_workspace_index_cleanup_failed",
+				"workspace_id", workspaceID, "error", err)...)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+}
+
+// removeGitWorkspaceIndexEntry removes workspaceID from the remote existence
+// index with revision CAS retries. Missing index or already-absent entry is OK
+// (idempotent). Emits a normal FS write so SSE subscribers observe the change.
+func removeGitWorkspaceIndexEntry(ctx context.Context, b *backend.Dat9Backend, workspaceID string) error {
+	if b == nil {
+		return fmt.Errorf("backend is nil")
+	}
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		nf, err := b.StatNodeCtx(ctx, gitWorkspaceIndexPath)
+		if errors.Is(err, datastore.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("stat git workspace index: %w", err)
+		}
+		rev := int64(0)
+		if nf != nil && nf.File != nil {
+			rev = nf.File.Revision
+			if nf.File.SizeBytes > maxGitWorkspaceIndexBytes {
+				return rewriteGitWorkspaceIndexFromStore(ctx, b, workspaceID, rev)
+			}
+		}
+		data, err := b.ReadCtx(ctx, gitWorkspaceIndexPath, 0, maxGitWorkspaceIndexBytes+1)
+		if errors.Is(err, datastore.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read git workspace index: %w", err)
+		}
+		if int64(len(data)) > maxGitWorkspaceIndexBytes {
+			return rewriteGitWorkspaceIndexFromStore(ctx, b, workspaceID, rev)
+		}
+		idx, err := gitwsindex.Parse(data)
+		if err != nil {
+			if errors.Is(err, gitwsindex.ErrUnreadable) {
+				return rewriteGitWorkspaceIndexFromStore(ctx, b, workspaceID, rev)
+			}
+			return err
+		}
+		if idx.Version == 0 {
+			idx.Version = 1
+		}
+		out := make([]gitwsindex.Entry, 0, len(idx.Workspaces))
+		found := false
+		for _, e := range idx.Workspaces {
+			if e.WorkspaceID == workspaceID {
+				found = true
+				continue
+			}
+			out = append(out, e)
+		}
+		if !found {
+			return nil
+		}
+		idx.Workspaces = out
+		idx.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		body, err := json.MarshalIndent(idx, "", "  ")
+		if err != nil {
+			return fmt.Errorf("encode git workspace index: %w", err)
+		}
+		// Empty document is kept via CAS write (same as client) so concurrent
+		// upserts are not lost to an unconditional delete race.
+		_, _, err = b.WriteCtxIfRevisionWithTagsResult(
+			ctx,
+			gitWorkspaceIndexPath,
+			body,
+			0,
+			filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate,
+			rev,
+			nil,
+			"",
+		)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if errors.Is(err, datastore.ErrRevisionConflict) && attempt+1 < maxAttempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(50*(attempt+1)) * time.Millisecond):
+			}
+			continue
+		}
+		return fmt.Errorf("write git workspace index: %w", err)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("write git workspace index: %w", lastErr)
+	}
+	return fmt.Errorf("write git workspace index: exhausted retries")
+}
+
+// rewriteGitWorkspaceIndexFromStore replaces a corrupt/oversized index with a
+// fresh document built from live git_workspaces rows (excluding excludeID).
+func rewriteGitWorkspaceIndexFromStore(ctx context.Context, b *backend.Dat9Backend, excludeID string, rev int64) error {
+	if b == nil || b.Store() == nil {
+		return fmt.Errorf("backend store is nil")
+	}
+	live, err := b.Store().ListGitWorkspaces(ctx)
+	if err != nil {
+		return fmt.Errorf("list git workspaces for index rebuild: %w", err)
+	}
+	idx := gitwsindex.Index{
+		Version:   1,
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	for i := range live {
+		ws := live[i]
+		if ws.WorkspaceID == excludeID {
+			continue
+		}
+		idx.Workspaces = append(idx.Workspaces, gitwsindex.Entry{
+			WorkspaceID:   ws.WorkspaceID,
+			RootPath:      ws.RootPath,
+			WorkspaceKind: string(ws.Kind),
+		})
+	}
+	body, err := json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode rebuilt git workspace index: %w", err)
+	}
+	_, _, err = b.WriteCtxIfRevisionWithTagsResult(
+		ctx,
+		gitWorkspaceIndexPath,
+		body,
+		0,
+		filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate,
+		rev,
+		nil,
+		"",
+	)
+	if err != nil {
+		return fmt.Errorf("write rebuilt git workspace index: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) handleGitWorkspaceObject(w http.ResponseWriter, r *http.Request, store *datastore.Store) {

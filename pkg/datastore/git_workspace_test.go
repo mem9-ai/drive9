@@ -3,7 +3,9 @@ package datastore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
@@ -55,8 +57,18 @@ func TestGitWorkspaceLinkedMetadataRoundTrip(t *testing.T) {
 
 func TestGitObjectPackRoundTrip(t *testing.T) {
 	s := newTestStore(t)
-	initGitObjectPackTestSchema(t, s)
+	initGitWorkspaceTestSchema(t, s)
 	ctx := context.Background()
+	if err := s.UpsertGitWorkspace(ctx, GitWorkspace{
+		WorkspaceID: "ws1",
+		RootPath:    "/repo-pack/",
+		RepoURL:     "https://example.test/repo.git",
+		RemoteName:  "origin",
+		HeadCommit:  strings.Repeat("1", 40),
+		Status:      GitWorkspaceStatusLive,
+	}); err != nil {
+		t.Fatalf("UpsertGitWorkspace: %v", err)
+	}
 	content := []byte("PACK test")
 	pack := GitObjectPack{
 		WorkspaceID:    "ws1",
@@ -87,36 +99,164 @@ func TestGitObjectPackRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDeleteGitWorkspaceWipesSubresourcesAndFencesWrites(t *testing.T) {
+	s := newTestStore(t)
+	initGitWorkspaceTestSchema(t, s)
+	ctx := context.Background()
+	const wsID = "ws-del"
+	if err := s.UpsertGitWorkspace(ctx, GitWorkspace{
+		WorkspaceID: wsID,
+		RootPath:    "/repo-del/",
+		RepoURL:     "https://example.test/repo-del.git",
+		RemoteName:  "origin",
+		HeadCommit:  strings.Repeat("a", 40),
+	}); err != nil {
+		t.Fatalf("UpsertGitWorkspace: %v", err)
+	}
+	if err := s.UpsertGitOverlayEntry(ctx, GitOverlayEntry{
+		WorkspaceID: wsID,
+		Path:        "dirty.txt",
+		Op:          GitOverlayOpUpsert,
+		Kind:        GitOverlayKindFile,
+		ContentBlob: []byte("stale"),
+	}); err != nil {
+		t.Fatalf("UpsertGitOverlayEntry: %v", err)
+	}
+	if err := s.UpsertGitState(ctx, GitState{WorkspaceID: wsID, CheckpointCommit: strings.Repeat("a", 40)}); err != nil {
+		t.Fatalf("UpsertGitState: %v", err)
+	}
+	if err := s.ReplaceGitTreeNodes(ctx, wsID, strings.Repeat("a", 40), []GitTreeNode{{
+		Path: "README.md", Kind: GitTreeNodeKindFile, Mode: "100644", ObjectSHA: strings.Repeat("b", 40),
+	}}); err != nil {
+		t.Fatalf("ReplaceGitTreeNodes: %v", err)
+	}
+	if err := s.UpsertGitObjectPack(ctx, GitObjectPack{
+		WorkspaceID: wsID, PackID: strings.Repeat("c", 64), ChecksumSHA256: strings.Repeat("c", 64), ContentBlob: []byte("P"),
+	}); err != nil {
+		t.Fatalf("UpsertGitObjectPack: %v", err)
+	}
+
+	if err := s.DeleteGitWorkspace(ctx, wsID); err != nil {
+		t.Fatalf("DeleteGitWorkspace: %v", err)
+	}
+	if _, err := s.GetGitOverlayEntry(ctx, wsID, "dirty.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("overlay after delete: %v, want NotFound", err)
+	}
+	if _, err := s.GetGitState(ctx, wsID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("git-state after delete: %v, want NotFound", err)
+	}
+	if _, err := s.ListGitTreeNodes(ctx, wsID, strings.Repeat("a", 40)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("tree after delete: %v, want NotFound", err)
+	}
+	if _, err := s.GetGitObjectPack(ctx, wsID, strings.Repeat("c", 64)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("pack after delete: %v, want NotFound", err)
+	}
+	if err := s.UpsertGitOverlayEntry(ctx, GitOverlayEntry{
+		WorkspaceID: wsID, Path: "after-delete.txt", Op: GitOverlayOpUpsert, Kind: GitOverlayKindFile,
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("overlay write after delete: %v, want NotFound", err)
+	}
+
+	const newID = "ws-del-new"
+	if err := s.ReplaceDeletedGitWorkspace(ctx, wsID, GitWorkspace{
+		WorkspaceID: newID,
+		RootPath:    "/repo-del/",
+		RepoURL:     "https://example.test/repo-del.git",
+		RemoteName:  "origin",
+		HeadCommit:  strings.Repeat("d", 40),
+	}); err != nil {
+		t.Fatalf("ReplaceDeletedGitWorkspace: %v", err)
+	}
+	if _, err := s.GetGitWorkspace(ctx, wsID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old id after replace: %v, want NotFound", err)
+	}
+	got, err := s.GetGitWorkspaceByRoot(ctx, "/repo-del/")
+	if err != nil {
+		t.Fatalf("GetGitWorkspaceByRoot after replace: %v", err)
+	}
+	if got.WorkspaceID != newID || got.Status != GitWorkspaceStatusLive {
+		t.Fatalf("revived workspace = %+v, want id=%s live", got, newID)
+	}
+	if _, err := s.GetGitOverlayEntry(ctx, newID, "dirty.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("recreate inherited overlay: %v, want NotFound", err)
+	}
+	if err := s.UpsertGitOverlayEntry(ctx, GitOverlayEntry{
+		WorkspaceID: wsID, Path: "stale-runtime.txt", Op: GitOverlayOpUpsert, Kind: GitOverlayKindFile,
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old-generation overlay write: %v, want NotFound", err)
+	}
+}
+
+func TestDeleteGitWorkspaceConcurrentWithOverlayWrite(t *testing.T) {
+	s := newTestStore(t)
+	initGitWorkspaceTestSchema(t, s)
+	ctx := context.Background()
+	const wsID = "ws-race"
+	if err := s.UpsertGitWorkspace(ctx, GitWorkspace{
+		WorkspaceID: wsID,
+		RootPath:    "/repo-race/",
+		RepoURL:     "https://example.test/repo-race.git",
+		RemoteName:  "origin",
+		HeadCommit:  strings.Repeat("e", 40),
+	}); err != nil {
+		t.Fatalf("UpsertGitWorkspace: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_ = s.UpsertGitOverlayEntry(ctx, GitOverlayEntry{
+				WorkspaceID: wsID,
+				Path:        "race.txt",
+				Op:          GitOverlayOpUpsert,
+				Kind:        GitOverlayKindFile,
+				ContentBlob: []byte{byte(i)},
+			})
+		}(i)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := s.DeleteGitWorkspace(ctx, wsID); err != nil {
+			t.Errorf("DeleteGitWorkspace: %v", err)
+		}
+	}()
+	wg.Wait()
+
+	got, err := s.GetGitWorkspace(ctx, wsID)
+	if err != nil {
+		t.Fatalf("GetGitWorkspace: %v", err)
+	}
+	if got.Status != GitWorkspaceStatusDeleted {
+		t.Fatalf("status = %q, want deleted", got.Status)
+	}
+	if _, err := s.GetGitOverlayEntry(ctx, wsID, "race.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("overlay after concurrent delete: %v, want NotFound", err)
+	}
+
+	if err := s.UpsertGitWorkspace(ctx, GitWorkspace{
+		WorkspaceID: wsID,
+		RootPath:    "/repo-race/",
+		RepoURL:     "https://example.test/repo-race.git",
+		RemoteName:  "origin",
+		HeadCommit:  strings.Repeat("f", 40),
+		Status:      GitWorkspaceStatusLive,
+	}); err != nil {
+		t.Fatalf("recreate: %v", err)
+	}
+	if _, err := s.GetGitOverlayEntry(ctx, wsID, "race.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("recreate inherited concurrent overlay: %v, want NotFound", err)
+	}
+}
+
 func initGitWorkspaceTestSchema(t *testing.T, s *Store) {
 	t.Helper()
 	for _, stmt := range schema.GitWorkspaceTiDBSchemaStatements() {
 		if _, err := s.DB().Exec(stmt); err != nil {
 			msg := strings.ToLower(err.Error())
 			if strings.Contains(msg, "duplicate key name") || strings.Contains(msg, "duplicate column") || strings.Contains(msg, "already exist") {
-				continue
-			}
-			t.Fatal(err)
-		}
-	}
-}
-
-func initGitObjectPackTestSchema(t *testing.T, s *Store) {
-	t.Helper()
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS git_workspace_object_packs (
-			workspace_id    VARCHAR(64) NOT NULL,
-			pack_id         VARCHAR(64) NOT NULL,
-			checksum_sha256 VARCHAR(128) NOT NULL DEFAULT '',
-			size_bytes      BIGINT NOT NULL DEFAULT 0,
-			content_blob    LONGBLOB,
-			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			PRIMARY KEY (workspace_id, pack_id)
-		)`,
-		`CREATE INDEX idx_git_object_packs_created ON git_workspace_object_packs(workspace_id, created_at)`,
-	}
-	for _, stmt := range stmts {
-		if _, err := s.DB().Exec(stmt); err != nil {
-			if strings.Contains(err.Error(), "Duplicate key name") {
 				continue
 			}
 			t.Fatal(err)
