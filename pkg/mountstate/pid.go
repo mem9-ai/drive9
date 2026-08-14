@@ -265,15 +265,6 @@ func resolvedCanonicalIfMissing(mountPoint string) []string {
 	return []string{cached}
 }
 
-// canonicalMountPointCandidates is the write-form hash plus, when the caller
-// already knows the primary is missing, the pre-upgrade EvalSymlinks form.
-func canonicalMountPointCandidates(mountPoint string) []string {
-	primary := canonicalMountPoint(mountPoint)
-	out := []string{primary}
-	out = append(out, resolvedCanonicalIfMissing(mountPoint)...)
-	return out
-}
-
 func resolveMountPointSymlinksBounded(absCanonical string) string {
 	type result struct {
 		s   string
