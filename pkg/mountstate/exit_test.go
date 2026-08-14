@@ -40,6 +40,44 @@ func TestWriteReadClearExitReason(t *testing.T) {
 	}
 }
 
+func TestClearStopTokenIfLeavesSuccessor(t *testing.T) {
+	mp := t.TempDir()
+	oldTS, err := WriteStopTokenReceipt(mp, "ready-timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Successor overwrites with a newer token.
+	time.Sleep(2 * time.Millisecond)
+	newTS, err := WriteStopTokenReceipt(mp, "umount")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearStopTokenIf(mp, oldTS); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := ReadStopTokenTime(mp)
+	if !ok {
+		t.Fatal("successor stop token was cleared")
+	}
+	if !got.Equal(newTS) {
+		t.Fatalf("token ts=%v want successor %v", got, newTS)
+	}
+}
+
+func TestClearStopTokenIfRemovesMatching(t *testing.T) {
+	mp := t.TempDir()
+	ts, err := WriteStopTokenReceipt(mp, "ready-timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearStopTokenIf(mp, ts); err != nil {
+		t.Fatal(err)
+	}
+	if StopTokenPresent(mp) {
+		t.Fatal("matching token should be cleared")
+	}
+}
+
 func TestStopTokenRoundTrip(t *testing.T) {
 	mp := filepath.Join(t.TempDir(), "mnt")
 	if err := WriteStopToken(mp, "umount"); err != nil {

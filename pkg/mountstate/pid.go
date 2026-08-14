@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 type ProcessState struct {
@@ -58,15 +60,39 @@ const (
 
 func PIDFilePath(mountPoint string) string {
 	// Legacy location kept for cross-version umount of mounts started before
-	// UID-scoped state dirs. New writes still use this path.
-	return filepath.Join(os.TempDir(), "drive9-mount-"+hash8(canonicalMountPoint(mountPoint))+".pid")
+	// UID-scoped state dirs. New writes still use this path (unresolved hash).
+	return pidFilePathForCanonical(canonicalMountPoint(mountPoint))
+}
+
+func pidFilePathForCanonical(canonical string) string {
+	return filepath.Join(os.TempDir(), "drive9-mount-"+hash8(canonical)+".pid")
 }
 
 func ControlSocketPath(mountPoint string) string {
-	canonical := canonicalMountPoint(mountPoint)
+	return controlSocketPathForCanonical(canonicalMountPoint(mountPoint))
+}
+
+func controlSocketPathForCanonical(canonical string) string {
 	uid := currentUID()
 	sum := sha256.Sum256([]byte(uid + "\x00" + canonical))
 	return filepath.Join(controlSocketDir(uid), "drive9-mount-"+hex.EncodeToString(sum[:8])+".sock")
+}
+
+// ControlSocketPathCandidates is the write path plus, only if that socket is
+// missing, a bounded EvalSymlinks fallback for pre-upgrade binaries.
+func ControlSocketPathCandidates(mountPoint string) []string {
+	primary := ControlSocketPath(mountPoint)
+	out := []string{primary}
+	if _, err := os.Lstat(primary); err == nil {
+		return out
+	}
+	for _, canon := range resolvedCanonicalIfMissing(mountPoint) {
+		p := controlSocketPathForCanonical(canon)
+		if p != primary {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func currentUID() string {
@@ -194,14 +220,127 @@ func trustedFilePresent(path string) bool {
 }
 
 // canonicalMountPoint normalizes mountpoint for hashing without EvalSymlinks.
-// Symlink resolution can hang forever on a wedged FUSE endpoint; control-plane
-// path lookup must not perform mountpoint I/O.
+// Symlink resolution can hang forever on a wedged FUSE endpoint; writes and
+// lock paths must not perform mountpoint I/O.
 func canonicalMountPoint(mountPoint string) string {
 	canonical := filepath.Clean(mountPoint)
 	if abs, err := filepath.Abs(canonical); err == nil {
 		canonical = abs
 	}
 	return canonical
+}
+
+// evalSymlinksTimeout bounds upgrade-compat symlink resolution. A wedged FUSE
+// endpoint can block EvalSymlinks; reads fall back to the unresolved hash.
+var evalSymlinksTimeout = 200 * time.Millisecond
+
+var (
+	resolvedCanonMu    sync.Mutex
+	resolvedCanonCache = map[string]string{} // primary canonical → resolved or ""
+)
+
+// resolvedCanonicalIfMissing runs bounded EvalSymlinks once per canonical path.
+// Callers should invoke this only after the unresolved write-path file is
+// absent. A cached empty string means resolve failed or timed out — do not
+// re-walk a wedged FUSE root on every StopTokenPresent poll.
+func resolvedCanonicalIfMissing(mountPoint string) []string {
+	primary := canonicalMountPoint(mountPoint)
+	resolvedCanonMu.Lock()
+	cached, ok := resolvedCanonCache[primary]
+	resolvedCanonMu.Unlock()
+	if !ok {
+		cached = resolveMountPointSymlinksBounded(primary)
+		resolvedCanonMu.Lock()
+		// Do not let a timed-out racer overwrite a successful resolve.
+		if prev, exists := resolvedCanonCache[primary]; exists && prev != "" {
+			cached = prev
+		} else {
+			resolvedCanonCache[primary] = cached
+		}
+		resolvedCanonMu.Unlock()
+	}
+	if cached == "" || cached == primary {
+		return nil
+	}
+	return []string{cached}
+}
+
+// canonicalMountPointCandidates is the write-form hash plus, when the caller
+// already knows the primary is missing, the pre-upgrade EvalSymlinks form.
+func canonicalMountPointCandidates(mountPoint string) []string {
+	primary := canonicalMountPoint(mountPoint)
+	out := []string{primary}
+	out = append(out, resolvedCanonicalIfMissing(mountPoint)...)
+	return out
+}
+
+func resolveMountPointSymlinksBounded(absCanonical string) string {
+	type result struct {
+		s   string
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		resolved, err := filepath.EvalSymlinks(absCanonical)
+		if err != nil {
+			ch <- result{"", err}
+			return
+		}
+		ch <- result{resolved, nil}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil || r.s == "" {
+			return ""
+		}
+		return r.s
+	case <-time.After(evalSymlinksTimeout):
+		return ""
+	}
+}
+
+// readTrustedFileCandidates tries primary then symlink-resolved hashes.
+// If the primary is missing and an alternate is found, best-effort migrate
+// the bytes to the primary write path so later lookups stay off EvalSymlinks.
+func readTrustedFileCandidates(primary string, alts []string) (data []byte, path string, err error) {
+	data, err = readTrustedFile(primary)
+	if err == nil {
+		return data, primary, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, primary, err
+	}
+	for _, alt := range alts {
+		if alt == "" || alt == primary {
+			continue
+		}
+		b, aerr := readTrustedFile(alt)
+		if aerr != nil {
+			continue
+		}
+		migrateTrustedFile(alt, primary)
+		return b, alt, nil
+	}
+	return nil, primary, err
+}
+
+func migrateTrustedFile(from, to string) {
+	if from == to || to == "" {
+		return
+	}
+	if _, err := os.Lstat(to); err == nil {
+		return
+	}
+	data, err := readTrustedFile(from)
+	if err != nil {
+		return
+	}
+	if err := writeFileAtomic(to, data, 0o600); err != nil {
+		return
+	}
+	// Keep the eval-hash source: on macOS /tmp vs /private/tmp the resolved
+	// path is a different write-path primary. Clearing both hashes is the
+	// job of Clear* helpers, not migrate.
 }
 
 func hash8(canonical string) string {
@@ -294,11 +433,26 @@ func ReadPID(mountPoint string) (int, string, error) {
 }
 
 func ReadProcessState(mountPoint string) (ProcessState, string, error) {
-	path := PIDFilePath(mountPoint)
-	data, err := readTrustedFile(path)
+	primary := PIDFilePath(mountPoint)
+	data, err := readTrustedFile(primary)
+	if err == nil {
+		return parseProcessState(data, primary)
+	}
+	if !os.IsNotExist(err) {
+		return ProcessState{}, primary, err
+	}
+	var alts []string
+	for _, canon := range resolvedCanonicalIfMissing(mountPoint) {
+		alts = append(alts, pidFilePathForCanonical(canon))
+	}
+	data, path, err := readTrustedFileCandidates(primary, alts)
 	if err != nil {
 		return ProcessState{}, path, err
 	}
+	return parseProcessState(data, path)
+}
+
+func parseProcessState(data []byte, path string) (ProcessState, string, error) {
 	trimmed := strings.TrimSpace(string(data))
 	if trimmed == "" {
 		return ProcessState{}, path, fmt.Errorf("read pid file %s: empty file", path)

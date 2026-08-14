@@ -228,6 +228,100 @@ func TestSupervisedReadyStateMatches(t *testing.T) {
 	}
 }
 
+func TestCleanupSupervisedReadyTimeoutDoesNotDetachSuccessor(t *testing.T) {
+	mp := t.TempDir()
+	self := os.Getpid()
+	ct, err := mountstate.ProcessCreationTime(self)
+	if err != nil || ct == 0 {
+		t.Skip("platform has no process creation metadata")
+	}
+
+	// Successor supervisor state (different generation).
+	succ := mountstate.SupervisorState{
+		PID:            self,
+		CreationTime:   ct,
+		WorkerPID:      self,
+		WorkerCreation: ct,
+		MountPoint:     mp,
+		State:          mountstate.SupervisorStateRunning,
+	}
+	if err := mountstate.WriteSupervisorState(mp, succ); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+
+	// Timed-out generation A wrote a receipt, then successor B overwrote it
+	// (or wrote a newer umount token) after taking the lock.
+	oldReceipt := time.Now().UTC().Add(-time.Second)
+	succTS, err := mountstate.WriteStopTokenReceipt(mp, "umount")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if succTS.Equal(oldReceipt) {
+		t.Fatal("need distinct receipts")
+	}
+
+	cleaned := false
+	oldClean := ensureCleanAfterReadyTimeout
+	oldLock := tryExclusiveReadyTimeout
+	ensureCleanAfterReadyTimeout = func(string) (bool, error) {
+		cleaned = true
+		return true, nil
+	}
+	// Successor holds the flock.
+	tryExclusiveReadyTimeout = func(string, func() error) (bool, error) {
+		return false, nil
+	}
+	t.Cleanup(func() {
+		ensureCleanAfterReadyTimeout = oldClean
+		tryExclusiveReadyTimeout = oldLock
+	})
+
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	foreign := cmd.ProcessState.Pid()
+	if foreign == self || processAliveImpl(foreign) {
+		t.Skip("need a dead foreign pid")
+	}
+
+	// Post-kill tail only: A already wrote its token before B started.
+	finishReadyTimeoutCleanup(mp, foreign, ct+999, oldReceipt)
+	if cleaned {
+		t.Fatal("ready-timeout cleanup must not detach successor mount")
+	}
+	got, ok := mountstate.ReadStopTokenTime(mp)
+	if !ok || !got.Equal(succTS) {
+		t.Fatalf("successor stop token cleared: ok=%v ts=%v want %v", ok, got, succTS)
+	}
+	if _, _, err := mountstate.ReadSupervisorState(mp); err != nil {
+		t.Fatalf("successor supervisor state cleared: %v", err)
+	}
+
+	// Same assertions when TryExclusive succeeds but recorded state is B's
+	// generation (lock-path mismatch / upgrade): still must not detach.
+	cleaned = false
+	tryExclusiveReadyTimeout = func(_ string, fn func() error) (bool, error) {
+		return true, fn()
+	}
+	if err := mountstate.WriteSupervisorState(mp, succ); err != nil {
+		t.Fatal(err)
+	}
+	succTS2, err := mountstate.WriteStopTokenReceipt(mp, "umount")
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishReadyTimeoutCleanup(mp, foreign, ct+999, oldReceipt)
+	if cleaned {
+		t.Fatal("must not detach when lock is free but state is successor generation")
+	}
+	got, ok = mountstate.ReadStopTokenTime(mp)
+	if !ok || !got.Equal(succTS2) {
+		t.Fatalf("successor token cleared under acquired lock: ok=%v ts=%v", ok, got)
+	}
+}
+
 func TestCleanupSupervisedReadyTimeoutIgnoresStaleWorker(t *testing.T) {
 	// Stale SupervisorState for a different generation must not authorize worker kill.
 	// We assert the pure generation gate + that cleanup does not panic / does not

@@ -20,7 +20,11 @@ type ExitReason struct {
 }
 
 func ExitReasonPath(mountPoint string) string {
-	return filepath.Join(stateDir(), "drive9-mount-"+hash8(canonicalMountPoint(mountPoint))+".exit.json")
+	return exitReasonPathForCanonical(canonicalMountPoint(mountPoint))
+}
+
+func exitReasonPathForCanonical(canonical string) string {
+	return filepath.Join(stateDir(), "drive9-mount-"+hash8(canonical)+".exit.json")
 }
 
 func WriteExitReason(mountPoint string, rec ExitReason) error {
@@ -41,17 +45,30 @@ func WriteExitReason(mountPoint string, rec ExitReason) error {
 }
 
 func ReadExitReason(mountPoint string) (ExitReason, string, error) {
-	path := ExitReasonPath(mountPoint)
-	data, err := readTrustedFile(path)
-	if err != nil && os.IsNotExist(err) {
-		legacy := legacyTempStatePath(".exit.json", mountPoint)
-		if b, lerr := readTrustedFile(legacy); lerr == nil {
-			data, path, err = b, legacy, nil
-		}
+	primary := ExitReasonPath(mountPoint)
+	data, err := readTrustedFile(primary)
+	if err == nil {
+		return parseExitReason(data, primary)
 	}
+	if !os.IsNotExist(err) {
+		return ExitReason{}, primary, err
+	}
+	var alts []string
+	alts = append(alts, legacyTempStatePath(".exit.json", mountPoint))
+	for _, canon := range resolvedCanonicalIfMissing(mountPoint) {
+		alts = append(alts,
+			exitReasonPathForCanonical(canon),
+			legacyTempStatePathForCanonical(".exit.json", canon),
+		)
+	}
+	data, path, err := readTrustedFileCandidates(primary, alts)
 	if err != nil {
 		return ExitReason{}, path, err
 	}
+	return parseExitReason(data, path)
+}
+
+func parseExitReason(data []byte, path string) (ExitReason, string, error) {
 	var rec ExitReason
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return ExitReason{}, path, fmt.Errorf("read exit reason %s: %w", path, err)
@@ -61,7 +78,14 @@ func ReadExitReason(mountPoint string) (ExitReason, string, error) {
 
 func ClearExitReason(mountPoint string) error {
 	var first error
-	for _, path := range []string{ExitReasonPath(mountPoint), legacyTempStatePath(".exit.json", mountPoint)} {
+	paths := []string{ExitReasonPath(mountPoint), legacyTempStatePath(".exit.json", mountPoint)}
+	for _, canon := range resolvedCanonicalIfMissing(mountPoint) {
+		paths = append(paths,
+			exitReasonPathForCanonical(canon),
+			legacyTempStatePathForCanonical(".exit.json", canon),
+		)
+	}
+	for _, path := range paths {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && first == nil {
 			first = err
 		}

@@ -22,3 +22,17 @@ func acquireLock(mountPoint string) (*os.File, error) {
 	}
 	return f, nil
 }
+
+// TryExclusive acquires the lock file and runs fn. Windows has no flock;
+// exclusive create-ish open is best-effort.
+func TryExclusive(mountPoint string, fn func() error) (acquired bool, err error) {
+	f, err := acquireLock(mountPoint)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	if fn != nil {
+		return true, fn()
+	}
+	return true, nil
+}

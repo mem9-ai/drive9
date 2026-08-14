@@ -11,6 +11,86 @@ import (
 	"testing"
 )
 
+func TestReadProcessStateFindsEvalSymlinkHash(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate pre-upgrade write: pidfile hashed with Clean+Abs+EvalSymlinks.
+	resolved := real
+	if abs, err := filepath.Abs(real); err == nil {
+		if ev, err := filepath.EvalSymlinks(abs); err == nil {
+			resolved = ev
+		}
+	}
+	legacyPath := pidFilePathForCanonical(resolved)
+	want := ProcessState{PID: 4242, MountPoint: link}
+	data, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(legacyPath)
+		_ = os.Remove(PIDFilePath(link))
+	})
+
+	// Write path for the symlink form must differ from the resolved hash
+	// (this is the upgrade-compat gap). Abs must not hide a reintroduced
+	// EvalSymlinks in canonicalMountPoint.
+	if PIDFilePath(link) == legacyPath {
+		t.Fatal("write-path hash equals EvalSymlinks hash; upgrade lookup would be untestable")
+	}
+	if SupervisorStatePath(link) == supervisorStatePathForCanonical(resolved) {
+		t.Fatal("supervisor write path unexpectedly equals resolved hash")
+	}
+
+	got, _, err := ReadProcessState(link)
+	if err != nil {
+		t.Fatalf("ReadProcessState via symlink: %v", err)
+	}
+	if got.PID != want.PID {
+		t.Fatalf("PID=%d want %d", got.PID, want.PID)
+	}
+	// Adopt/migrate: next lookup should hit the unresolved write path.
+	if _, err := os.Lstat(PIDFilePath(link)); err != nil {
+		t.Fatalf("expected migration to write-path pidfile: %v", err)
+	}
+
+	// Supervisor state on the resolved hash must also be found via the link.
+	st := SupervisorState{PID: 7, MountPoint: link, State: SupervisorStateRunning}
+	data, err = json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySup := supervisorStatePathForCanonical(resolved)
+	if err := os.MkdirAll(filepath.Dir(legacySup), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacySup, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(legacySup) })
+	gotSt, _, err := ReadSupervisorState(link)
+	if err != nil {
+		t.Fatalf("ReadSupervisorState via symlink: %v", err)
+	}
+	if gotSt.PID != 7 {
+		t.Fatalf("supervisor PID=%d want 7", gotSt.PID)
+	}
+	socks := ControlSocketPathCandidates(link)
+	if len(socks) < 1 {
+		t.Fatal("expected at least write-path socket candidate")
+	}
+}
+
 func TestPIDFilePathCanonicalizesMountPoint(t *testing.T) {
 	dir := t.TempDir()
 	oldwd, err := os.Getwd()

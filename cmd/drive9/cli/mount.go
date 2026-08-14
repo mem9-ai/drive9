@@ -21,6 +21,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/mountsupervisor"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 	drive9webdav "github.com/mem9-ai/drive9/pkg/webdav"
 )
@@ -915,10 +916,19 @@ func supervisorStateMatchesGeneration(st mountstate.SupervisorState, supervisorP
 	return true
 }
 
+// Injected for tests: successor-lock / detach hooks.
+var (
+	tryExclusiveReadyTimeout     = mountsupervisor.TryExclusive
+	ensureCleanAfterReadyTimeout = ensureCleanMountPointCLI
+)
+
 // cleanupSupervisedReadyTimeout stops the spawned supervisor and only signals a
 // worker when SupervisorState matches this generation with full creation identity.
+// Mount detach and stop-token clear are generation+lock gated so a successor
+// supervisor that started after we timed out cannot be torn down or have its
+// token erased.
 func cleanupSupervisedReadyTimeout(mountPoint string, supervisorPID int, supCreation uint64) {
-	_ = mountstate.WriteStopToken(mountPoint, "ready-timeout")
+	receipt, _ := mountstate.WriteStopTokenReceipt(mountPoint, "ready-timeout")
 	// Stop only our child supervisor (PID we spawned + creation when available).
 	if isOurSupervisorProcess(supervisorPID, supCreation) {
 		_ = terminateProcessGraceful(supervisorPID, 10*time.Second)
@@ -936,22 +946,40 @@ func cleanupSupervisedReadyTimeout(mountPoint string, supervisorPID int, supCrea
 	if isOurSupervisorProcess(supervisorPID, supCreation) {
 		_ = terminateProcess(supervisorPID, 3*time.Second)
 	}
-	_, _ = ensureCleanMountPointCLI(mountPoint)
-	_ = mountstate.ClearStopToken(mountPoint)
-	// Only clear state / pidfile that belong to this generation (or are absent).
-	if sst, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
-		if supervisorStateMatchesGeneration(sst, supervisorPID, supCreation) {
+	finishReadyTimeoutCleanup(mountPoint, supervisorPID, supCreation, receipt)
+}
+
+// finishReadyTimeoutCleanup is the mountpoint-global tail: detach and token
+// clear happen only while holding the supervisor lock and only if recorded
+// state still belongs to this generation. Token clear is receipt-CAS.
+func finishReadyTimeoutCleanup(mountPoint string, supervisorPID int, supCreation uint64, receipt time.Time) {
+	detachAndClear := func() error {
+		if sst, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+			if !supervisorStateMatchesGeneration(sst, supervisorPID, supCreation) {
+				_ = mountstate.ClearStopTokenIf(mountPoint, receipt)
+				return nil
+			}
+		}
+		_, _ = ensureCleanAfterReadyTimeout(mountPoint)
+		_ = mountstate.ClearStopTokenIf(mountPoint, receipt)
+		if sst, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+			if supervisorStateMatchesGeneration(sst, supervisorPID, supCreation) {
+				_ = mountstate.ClearSupervisorState(mountPoint)
+				_ = os.Remove(mountstate.PIDFilePath(mountPoint))
+			}
+		} else {
 			_ = mountstate.ClearSupervisorState(mountPoint)
-			_ = os.Remove(mountstate.PIDFilePath(mountPoint))
+			if isOurSupervisorProcess(supervisorPID, supCreation) || !processAliveImpl(supervisorPID) {
+				_ = os.Remove(mountstate.PIDFilePath(mountPoint))
+			}
 		}
-	} else {
-		// No trusted supervisor state: safe to clear leftovers for this mountpoint
-		// after we stopped our own child (if any).
-		_ = mountstate.ClearSupervisorState(mountPoint)
-		if isOurSupervisorProcess(supervisorPID, supCreation) || !processAliveImpl(supervisorPID) {
-			_ = os.Remove(mountstate.PIDFilePath(mountPoint))
-		}
+		return nil
 	}
+
+	// Detach and token clear run only while we hold the flock. If a successor
+	// holds it, they already ran clearStaleStopToken; touching the token here
+	// is a check-then-remove race that can delete B's newer receipt.
+	_, _ = tryExclusiveReadyTimeout(mountPoint, detachAndClear)
 }
 
 // isOurSupervisorProcess is true when pid is still the process we spawned.

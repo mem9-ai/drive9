@@ -1090,7 +1090,12 @@ func clearStaleStopToken(mountPoint string, startedAt time.Time) {
 		return
 	}
 	if ts.IsZero() || ts.Before(startedAt) {
-		_ = mountstate.ClearStopToken(mountPoint)
+		// CAS: only remove the token we just observed (not a successor token).
+		if ts.IsZero() {
+			_ = mountstate.ClearStopToken(mountPoint)
+			return
+		}
+		_ = mountstate.ClearStopTokenIf(mountPoint, ts)
 	}
 }
 
