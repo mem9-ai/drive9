@@ -322,13 +322,22 @@ func TestReadInlineNoRedirect(t *testing.T) {
 
 func TestGitObjectPackAPIRoundTrip(t *testing.T) {
 	s := newTestServer(t)
-	initServerGitObjectPackTestSchema(t, s)
+	ensureGitWorkspaceSchema(t, s)
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 
 	c := client.New(ts.URL, "")
 	ctx := context.Background()
-	workspaceID := "ws1"
+	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo-pack/",
+		RepoURL:    "https://example.test/repo-pack.git",
+		RemoteName: "origin",
+		HeadCommit: "1111111111111111111111111111111111111111",
+	})
+	if err != nil {
+		t.Fatalf("UpsertGitWorkspace: %v", err)
+	}
+	workspaceID := ws.WorkspaceID
 
 	content := []byte("small inline pack")
 	sum := sha256.Sum256(content)
@@ -364,31 +373,6 @@ func TestGitObjectPackAPIRoundTrip(t *testing.T) {
 	}
 	if string(downloaded.Content) != string(content) {
 		t.Fatalf("downloaded content = %q, want %q", downloaded.Content, content)
-	}
-}
-
-func initServerGitObjectPackTestSchema(t *testing.T, s *Server) {
-	t.Helper()
-	db := s.fallback.Store().DB()
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS git_workspace_object_packs (
-			workspace_id    VARCHAR(64) NOT NULL,
-			pack_id         VARCHAR(64) NOT NULL,
-			checksum_sha256 VARCHAR(128) NOT NULL DEFAULT '',
-			size_bytes      BIGINT NOT NULL DEFAULT 0,
-			content_blob    LONGBLOB,
-			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			PRIMARY KEY (workspace_id, pack_id)
-		)`,
-		`CREATE INDEX idx_git_object_packs_created ON git_workspace_object_packs(workspace_id, created_at)`,
-	}
-	for _, stmt := range stmts {
-		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
-			if strings.Contains(err.Error(), "Duplicate key name") {
-				continue
-			}
-			t.Fatal(err)
-		}
 	}
 }
 

@@ -302,6 +302,14 @@ jobs:
           FUSE_STRICT_PREREQS: "1"
         run: bash e2e/git-ops-smoke-test.sh
 
+      - name: Run Git workspace on-demand discovery smoke
+        id: git-workspace-ondemand-smoke
+        continue-on-error: true
+        env:
+          DRIVE9_API_KEY: local-dev-key
+          FUSE_STRICT_PREREQS: "1"
+        run: bash e2e/git-workspace-ondemand-smoke-test.sh
+
       - name: Run pack smoke
         id: pack-smoke
         continue-on-error: true
@@ -408,6 +416,7 @@ jobs:
         env:
           FUSE_STRICT_PREREQS: "1"
           RUN_GIT_WORKSPACE_SMOKE: "1"
+          RUN_GIT_ONDEMAND_SMOKE: "1"
           GIT_WORKSPACE_CLONE_TIMEOUT_S: "1800"
         run: bash e2e/smoke-all.sh
 
@@ -433,6 +442,7 @@ jobs:
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
             echo "| FUSE patch storage-class e2e | ${{ steps.fuse-patch-storage-class.outcome || 'skipped' }} |"
             echo "| Git operations smoke | ${{ steps.git-ops-smoke.outcome || 'skipped' }} |"
+            echo "| Git workspace on-demand discovery smoke | ${{ steps.git-workspace-ondemand-smoke.outcome || 'skipped' }} |"
             echo "| Pack smoke | ${{ steps.pack-smoke.outcome || 'skipped' }} |"
             echo "| FUSE crash recovery e2e | ${{ steps.fuse-crash-recovery.outcome || 'skipped' }} |"
             echo "| FUSE write perf budget e2e | ${{ steps.fuse-write-perf-budget.outcome || 'skipped' }} |"
@@ -476,6 +486,7 @@ jobs:
             "fuse-smoke": "${{ steps.fuse-smoke.outcome }}",
             "fuse-patch-storage-class": "${{ steps.fuse-patch-storage-class.outcome }}",
             "git-ops-smoke": "${{ steps.git-ops-smoke.outcome }}",
+            "git-workspace-ondemand-smoke": "${{ steps.git-workspace-ondemand-smoke.outcome }}",
             "pack-smoke": "${{ steps.pack-smoke.outcome }}",
             "fuse-crash-recovery": "${{ steps.fuse-crash-recovery.outcome }}",
             "fuse-write-perf-budget": "${{ steps.fuse-write-perf-budget.outcome }}",
@@ -573,6 +584,7 @@ jobs:
           check_required "Layer FS smoke" "${{ steps.layer-fs-smoke.outcome }}"
           check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
           check_required "Git operations smoke" "${{ steps.git-ops-smoke.outcome }}"
+          check_required "Git workspace on-demand discovery smoke" "${{ steps.git-workspace-ondemand-smoke.outcome }}"
           check_required "Pack smoke" "${{ steps.pack-smoke.outcome }}"
           check_required "FUSE crash recovery e2e" "${{ steps.fuse-crash-recovery.outcome }}"
           check_required "FUSE write perf budget e2e" "${{ steps.fuse-write-perf-budget.outcome }}"

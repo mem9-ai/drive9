@@ -13642,6 +13642,9 @@ func (fs *Dat9FS) FlushAll() {
 	// Wait for any inflight async kernel notifications to complete.
 	fs.notifyWg.Wait()
 
+	// Stop git-workspace background probe/retry loops before exit.
+	fs.stopGitWorkspaceBackground()
+
 	if fs.perf != nil {
 		fs.perf.printSummary(os.Stderr)
 	}

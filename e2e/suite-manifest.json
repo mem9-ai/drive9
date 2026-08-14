@@ -43,6 +43,13 @@
       "owner_hint": "git",
       "failure_class": "correctness"
     },
+    "git-workspace-ondemand-smoke": {
+      "title": "Git workspace on-demand discovery smoke",
+      "product_area": "git",
+      "product_promise": "git workspace discovery is on-demand (zero idle ListGitWorkspaces when unused)",
+      "owner_hint": "git",
+      "failure_class": "correctness"
+    },
     "pack-smoke": {
       "title": "Pack smoke",
       "product_area": "portability",
