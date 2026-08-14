@@ -228,6 +228,89 @@ func TestSupervisedReadyStateMatches(t *testing.T) {
 	}
 }
 
+func TestFinishOwnedGenerationCleanupSkipsSuccessorEnsureUmount(t *testing.T) {
+	mp := t.TempDir()
+	self := os.Getpid()
+	ct, err := mountstate.ProcessCreationTime(self)
+	if err != nil || ct == 0 {
+		t.Skip("platform has no process creation metadata")
+	}
+	succ := mountstate.SupervisorState{
+		PID:            self,
+		CreationTime:   ct,
+		WorkerPID:      self,
+		WorkerCreation: ct,
+		MountPoint:     mp,
+		State:          mountstate.SupervisorStateRunning,
+	}
+	if err := mountstate.WriteSupervisorState(mp, succ); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+	succTS, err := mountstate.WriteStopTokenReceipt(mp, "umount")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldReceipt := succTS.Add(-time.Second)
+
+	cleaned := false
+	oldClean := ensureCleanAfterReadyTimeout
+	oldLock := tryExclusiveReadyTimeout
+	ensureCleanAfterReadyTimeout = func(string) (bool, error) {
+		cleaned = true
+		return true, nil
+	}
+	tryExclusiveReadyTimeout = func(_ string, fn func() error) (bool, error) {
+		return false, nil
+	}
+	t.Cleanup(func() {
+		ensureCleanAfterReadyTimeout = oldClean
+		tryExclusiveReadyTimeout = oldLock
+	})
+
+	owned := finishOwnedGenerationCleanup(mp, self+1, ct+1, oldReceipt, func() {
+		_, _ = ensureCleanAfterReadyTimeout(mp)
+	})
+	if owned {
+		t.Fatal("successor-held lock must report not owned")
+	}
+	if cleaned {
+		t.Fatal("ensure/umount tail must not detach successor mount")
+	}
+	got, ok := mountstate.ReadStopTokenTime(mp)
+	if !ok || !got.Equal(succTS) {
+		t.Fatalf("successor token cleared: ok=%v ts=%v", ok, got)
+	}
+
+	cleaned = false
+	tryExclusiveReadyTimeout = func(_ string, fn func() error) (bool, error) {
+		return true, fn()
+	}
+	if err := mountstate.WriteSupervisorState(mp, succ); err != nil {
+		t.Fatal(err)
+	}
+	succTS2, err := mountstate.WriteStopTokenReceipt(mp, "ensure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned = finishOwnedGenerationCleanup(mp, self+1, ct+1, oldReceipt, func() {
+		_, _ = ensureCleanAfterReadyTimeout(mp)
+	})
+	if owned {
+		t.Fatal("successor generation under lock must report not owned")
+	}
+	if cleaned {
+		t.Fatal("must not detach successor when lock is free but state is B")
+	}
+	got, ok = mountstate.ReadStopTokenTime(mp)
+	if !ok || !got.Equal(succTS2) {
+		t.Fatalf("successor token cleared under lock: ok=%v ts=%v", ok, got)
+	}
+	if _, _, err := mountstate.ReadSupervisorState(mp); err != nil {
+		t.Fatalf("successor state cleared: %v", err)
+	}
+}
+
 func TestCleanupSupervisedReadyTimeoutDoesNotDetachSuccessor(t *testing.T) {
 	mp := t.TempDir()
 	self := os.Getpid()

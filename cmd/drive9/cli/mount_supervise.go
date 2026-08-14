@@ -305,7 +305,7 @@ func runMountEnsure(args []string) error {
 
 	// Stop any existing supervisor/worker first (graceful), verifying identity.
 	// Prefer creation times already resolved by CollectStatus (PID+creation).
-	_ = mountstate.WriteStopToken(mp, "ensure")
+	receipt, _ := mountstate.WriteStopTokenReceipt(mp, "ensure")
 	workerPID := snap.WorkerPID
 	workerCreation := snap.WorkerCreation
 	if workerPID == 0 || workerCreation == 0 {
@@ -338,10 +338,15 @@ func runMountEnsure(args []string) error {
 	if workerPID > 0 && processMatchesIdentity(workerPID, workerCreation) {
 		_ = terminateProcessGraceful(workerPID, 30*time.Second)
 	}
-	_ = mountstate.ClearStopToken(mp)
-	_ = mountstate.ClearSupervisorState(mp)
-	_ = os.Remove(mountstate.PIDFilePath(mp))
-	_, _ = mountsupervisor.EnsureClean(mp)
+	// Generation+lock fence: do not EnsureClean / wipe state if a successor
+	// already took the mountpoint after we stopped generation A.
+	owned := finishOwnedGenerationCleanup(mp, snap.SupervisorPID, snap.SupervisorCreation, receipt, func() {
+		_, _ = mountsupervisor.EnsureClean(mp)
+	})
+	if !owned {
+		fmt.Fprintf(os.Stderr, "drive9: mount ensure: successor supervisor owns %s; skipping remount\n", mp)
+		return nil
+	}
 
 	// Replay original mount principal via env only — never put --api-key on
 	// argv (would land in process listings / sanitized args / systemd units).

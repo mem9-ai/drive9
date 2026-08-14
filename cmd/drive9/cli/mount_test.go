@@ -219,6 +219,61 @@ func TestRunUmountDoesNotBlockOnStalePID(t *testing.T) {
 	}
 }
 
+func TestRunUmountSuccessorDoesNotWaitOrFusermount(t *testing.T) {
+	mp := t.TempDir()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	foreign := cmd.ProcessState.Pid()
+	if processAliveImpl(foreign) {
+		t.Skip("need a dead foreign pid")
+	}
+	if err := mountstate.WriteSupervisorState(mp, mountstate.SupervisorState{
+		PID: foreign, CreationTime: 99, WorkerPID: foreign, WorkerCreation: 99,
+		MountPoint: mp, State: mountstate.SupervisorStateRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+
+	oldLock := tryExclusiveReadyTimeout
+	tryExclusiveReadyTimeout = func(string, func() error) (bool, error) {
+		return false, nil // successor holds flock
+	}
+	t.Cleanup(func() { tryExclusiveReadyTimeout = oldLock })
+
+	runCalls := 0
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run: func([]string) error {
+			runCalls++
+			return nil
+		},
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{PID: foreign, WorkerPID: foreign, Supervise: true}, "/tmp/fake.pid", nil
+		},
+		terminate: func(int, time.Duration) error {
+			t.Fatal("must not terminate successor")
+			return nil
+		},
+		pidAlive: func(int) bool {
+			t.Fatal("must not poll successor pid")
+			return true
+		},
+		now:       time.Now,
+		sleep:     func(time.Duration) { t.Fatal("must not wait on successor") },
+		printErrf: func(string, ...any) {},
+	}
+	if err := runUmount([]string{mp}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+	if runCalls != 0 {
+		t.Fatalf("fusermount called %d times, want 0", runCalls)
+	}
+}
+
 func TestRunUmountNoPIDFileReturnsSuccess(t *testing.T) {
 	deps := umountDeps{
 		goos:     "linux",

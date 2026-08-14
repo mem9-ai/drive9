@@ -920,6 +920,8 @@ func supervisorStateMatchesGeneration(st mountstate.SupervisorState, supervisorP
 var (
 	tryExclusiveReadyTimeout     = mountsupervisor.TryExclusive
 	ensureCleanAfterReadyTimeout = ensureCleanMountPointCLI
+	forceUnmountAfterUmount      = forceUnmountMountPointCLI
+	mountStillActiveAfterUmount  = mountPointStillActive
 )
 
 // cleanupSupervisedReadyTimeout stops the spawned supervisor and only signals a
@@ -953,33 +955,43 @@ func cleanupSupervisedReadyTimeout(mountPoint string, supervisorPID int, supCrea
 // clear happen only while holding the supervisor lock and only if recorded
 // state still belongs to this generation. Token clear is receipt-CAS.
 func finishReadyTimeoutCleanup(mountPoint string, supervisorPID int, supCreation uint64, receipt time.Time) {
-	detachAndClear := func() error {
+	_ = finishOwnedGenerationCleanup(mountPoint, supervisorPID, supCreation, receipt, func() {
+		_, _ = ensureCleanAfterReadyTimeout(mountPoint)
+	})
+}
+
+// finishOwnedGenerationCleanup runs fn (detach / fusermount) and then clears
+// this generation's token/state only while holding the supervisor flock and
+// only if recorded state still belongs to gen. Returns true iff this
+// generation still owns the mountpoint (safe to remount).
+func finishOwnedGenerationCleanup(mountPoint string, genPID int, genCreation uint64, receipt time.Time, underLock func()) bool {
+	owned := false
+	_, _ = tryExclusiveReadyTimeout(mountPoint, func() error {
 		if sst, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
-			if !supervisorStateMatchesGeneration(sst, supervisorPID, supCreation) {
-				_ = mountstate.ClearStopTokenIf(mountPoint, receipt)
+			if !supervisorStateMatchesGeneration(sst, genPID, genCreation) {
+				// Successor (or other generation) owns this mountpoint.
 				return nil
 			}
 		}
-		_, _ = ensureCleanAfterReadyTimeout(mountPoint)
+		if underLock != nil {
+			underLock()
+		}
 		_ = mountstate.ClearStopTokenIf(mountPoint, receipt)
 		if sst, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
-			if supervisorStateMatchesGeneration(sst, supervisorPID, supCreation) {
+			if supervisorStateMatchesGeneration(sst, genPID, genCreation) {
 				_ = mountstate.ClearSupervisorState(mountPoint)
 				_ = os.Remove(mountstate.PIDFilePath(mountPoint))
 			}
 		} else {
 			_ = mountstate.ClearSupervisorState(mountPoint)
-			if isOurSupervisorProcess(supervisorPID, supCreation) || !processAliveImpl(supervisorPID) {
+			if genPID <= 0 || isOurSupervisorProcess(genPID, genCreation) || !processAliveImpl(genPID) {
 				_ = os.Remove(mountstate.PIDFilePath(mountPoint))
 			}
 		}
+		owned = true
 		return nil
-	}
-
-	// Detach and token clear run only while we hold the flock. If a successor
-	// holds it, they already ran clearStaleStopToken; touching the token here
-	// is a check-then-remove race that can delete B's newer receipt.
-	_, _ = tryExclusiveReadyTimeout(mountPoint, detachAndClear)
+	})
+	return owned
 }
 
 // isOurSupervisorProcess is true when pid is still the process we spawned.
@@ -1628,14 +1640,15 @@ func runUmount(args []string, deps umountDeps) error {
 	}
 
 	// Intentional stop for supervised mounts: write stop token, SIGTERM supervisor
-	// (graceful), then fall through to fusermount. Always clear the stop token
-	// after the stop attempt so the next remount is not stuck.
-	// If the supervisor already unmounted, fusermount "not mounted" is success.
+	// (graceful), then fusermount only while we still own this generation.
 	// Verify process identity (PID + creation time) before signaling so a reused
 	// PID from stale state cannot kill an unrelated process.
 	stoppedSupervisor := false
+	var umountReceipt time.Time
+	umountGenPID := 0
+	var umountGenCreation uint64
 	if deps.goos != "windows" {
-		_ = mountstate.WriteStopToken(stateMountPoint, "umount")
+		umountReceipt, _ = mountstate.WriteStopTokenReceipt(stateMountPoint, "umount")
 		stopPID := 0
 		var stopCreation uint64
 		workerPID := 0
@@ -1671,6 +1684,7 @@ func runUmount(args []string, deps umountDeps) error {
 				workerCreation = sst.WorkerCreation
 			}
 		}
+		umountGenPID, umountGenCreation = stopPID, stopCreation
 		if stopPID > 0 {
 			if processMatchesIdentity(stopPID, stopCreation) {
 				stoppedSupervisor = true
@@ -1689,10 +1703,6 @@ func runUmount(args []string, deps umountDeps) error {
 				deps.printErrf("drive9 umount: stop worker pid %d: %v\n", workerPID, terr)
 			}
 		}
-		defer func() {
-			_ = mountstate.ClearStopToken(stateMountPoint)
-			_ = mountstate.ClearSupervisorState(stateMountPoint)
-		}()
 	}
 
 	packArchiveArgs := append([]string(nil), packArchives...)
@@ -1718,12 +1728,35 @@ func runUmount(args []string, deps umountDeps) error {
 	}
 
 	var runErr error
-	// Supervised stop already asked the supervisor to unmount. If the endpoint
-	// is gone, skip fusermount entirely — otherwise fusermount3 prints a noisy
-	// "not found in /etc/mtab" line even when umount succeeds (exit 0).
-	// If still active/broken (ENOTCONN counts as active), force-clean instead
-	// of relying on a second fusermount that may also fail.
-	if stoppedSupervisor && !mountPointStillActive(mountPoint) {
+	// Supervised stop already asked the supervisor to unmount. Fusermount /
+	// force-unmount and token/state clear are generation+lock gated so a
+	// successor that started after we stopped generation A is not torn down.
+	if deps.goos != "windows" {
+		owned := finishOwnedGenerationCleanup(stateMountPoint, umountGenPID, umountGenCreation, umountReceipt, func() {
+			if stoppedSupervisor && !mountStillActiveAfterUmount(mountPoint) {
+				return
+			}
+			argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
+			if err != nil {
+				runErr = err
+				return
+			}
+			runErr = deps.run(argv)
+			if runErr != nil && stoppedSupervisor {
+				if mountStillActiveAfterUmount(mountPoint) {
+					forceUnmountAfterUmount(mountPoint)
+				}
+				if !mountStillActiveAfterUmount(mountPoint) {
+					runErr = nil
+				}
+			}
+		})
+		if !owned {
+			// Successor already owns the mountpoint. Do not re-read pidfile,
+			// wait on B, pack B's overlay, or fusermount B.
+			return nil
+		}
+	} else if stoppedSupervisor && !mountPointStillActive(mountPoint) {
 		runErr = nil
 	} else {
 		argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
