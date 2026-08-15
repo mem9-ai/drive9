@@ -22,8 +22,8 @@ func TestShouldRestartMatrix(t *testing.T) {
 		want bool
 	}{
 		{0, false},
-		{1, true}, // bare exit 1 is restartable without stop token
-		{2, false},
+		{1, true},  // bare exit 1 is restartable without stop token
+		{2, false}, // usage before ready is not restartable
 		{3, true},
 		{4, true},
 		{5, false},
@@ -38,6 +38,17 @@ func TestShouldRestartMatrix(t *testing.T) {
 	s.requestStop("test")
 	if s.shouldRestart(3) {
 		t.Fatal("should not restart when stop requested")
+	}
+}
+
+func TestShouldRestartExit2AfterReady(t *testing.T) {
+	s := &supervisor{cfg: applyDefaults(Config{MountPoint: t.TempDir()})}
+	if s.shouldRestart(2) {
+		t.Fatal("exit 2 before ready must not restart (usage)")
+	}
+	s.workerReady = true
+	if !s.shouldRestart(2) {
+		t.Fatal("exit 2 after ready must restart (panic/runtime)")
 	}
 }
 

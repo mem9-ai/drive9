@@ -930,7 +930,16 @@ var (
 // supervisor that started after we timed out cannot be torn down or have its
 // token erased.
 func cleanupSupervisedReadyTimeout(mountPoint string, supervisorPID int, supCreation uint64) {
-	receipt, _ := mountstate.WriteStopTokenReceipt(mountPoint, "ready-timeout")
+	receipt, tokErr := mountstate.WriteStopTokenReceipt(mountPoint, "ready-timeout")
+	if tokErr != nil {
+		// Still stop the child we spawned; skip mountpoint-global detach
+		// without a receipt (would be an unconditional token clear).
+		if isOurSupervisorProcess(supervisorPID, supCreation) {
+			_ = terminateProcessGraceful(supervisorPID, 10*time.Second)
+			_ = terminateProcess(supervisorPID, 3*time.Second)
+		}
+		return
+	}
 	// Stop only our child supervisor (PID we spawned + creation when available).
 	if isOurSupervisorProcess(supervisorPID, supCreation) {
 		_ = terminateProcessGraceful(supervisorPID, 10*time.Second)
@@ -1648,7 +1657,11 @@ func runUmount(args []string, deps umountDeps) error {
 	umountGenPID := 0
 	var umountGenCreation uint64
 	if deps.goos != "windows" {
-		umountReceipt, _ = mountstate.WriteStopTokenReceipt(stateMountPoint, "umount")
+		var tokErr error
+		umountReceipt, tokErr = mountstate.WriteStopTokenReceipt(stateMountPoint, "umount")
+		if tokErr != nil {
+			return fmt.Errorf("drive9 umount: write stop token for %s: %w", stateMountPoint, tokErr)
+		}
 		stopPID := 0
 		var stopCreation uint64
 		workerPID := 0

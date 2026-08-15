@@ -220,6 +220,9 @@ func TestRunUmountDoesNotBlockOnStalePID(t *testing.T) {
 }
 
 func TestRunUmountSuccessorDoesNotWaitOrFusermount(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("supervised umount fencing is not used on Windows")
+	}
 	mp := t.TempDir()
 	cmd := exec.Command("true")
 	if err := cmd.Run(); err != nil {

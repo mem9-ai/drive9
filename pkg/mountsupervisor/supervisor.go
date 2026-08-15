@@ -1,3 +1,5 @@
+//go:build !windows
+
 // Package mountsupervisor provides in-binary supervision for drive9 FUSE mounts.
 package mountsupervisor
 
@@ -86,6 +88,7 @@ type supervisor struct {
 	healthFails   int
 	lastHealth    string
 	lastHealthErr string
+	workerReady   bool // true after the first successful ready transition
 }
 
 type exitResult struct {
@@ -342,6 +345,8 @@ func (s *supervisor) loop() error {
 
 		s.permanentFails = 0
 		s.backoff = time.Second
+		s.healthFails = 0
+		s.workerReady = true
 		s.setState(mountstate.SupervisorStateRunning)
 		notifyReady()
 		s.logf("worker ready pid=%d", s.state.WorkerPID)
@@ -879,8 +884,12 @@ func (s *supervisor) shouldRestart(code int) bool {
 	// is restartable when no stop token is present so transient startup
 	// failures cannot silently kill supervision.
 	switch code {
-	case drive9fuse.ExitOK, drive9fuse.ExitUsage, drive9fuse.ExitStartupPermanent:
+	case drive9fuse.ExitOK, drive9fuse.ExitStartupPermanent:
 		return false
+	case drive9fuse.ExitUsage:
+		// Exit 2 is usage only during startup. After ready it is Go's panic
+		// runtime exit (recover only covers the Mount() goroutine).
+		return s.workerReady
 	default:
 		return true
 	}

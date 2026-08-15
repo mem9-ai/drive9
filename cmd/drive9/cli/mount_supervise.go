@@ -305,7 +305,10 @@ func runMountEnsure(args []string) error {
 
 	// Stop any existing supervisor/worker first (graceful), verifying identity.
 	// Prefer creation times already resolved by CollectStatus (PID+creation).
-	receipt, _ := mountstate.WriteStopTokenReceipt(mp, "ensure")
+	receipt, err := mountstate.WriteStopTokenReceipt(mp, "ensure")
+	if err != nil {
+		return fmt.Errorf("drive9 mount ensure: write stop token for %s: %w", mp, err)
+	}
 	workerPID := snap.WorkerPID
 	workerCreation := snap.WorkerCreation
 	if workerPID == 0 || workerCreation == 0 {
