@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +25,7 @@ type mountControlServer struct {
 	fs         *Dat9FS
 	listener   net.Listener
 	socketPath string
+	startedAt  time.Time
 	done       chan struct{}
 	drainMu    sync.Mutex
 }
@@ -45,6 +47,7 @@ func startMountControlServer(mountPoint string, fs *Dat9FS) (*mountControlServer
 		fs:         fs,
 		listener:   ln,
 		socketPath: socketPath,
+		startedAt:  time.Now().UTC(),
 		done:       make(chan struct{}),
 	}
 	go s.serve()
@@ -93,6 +96,21 @@ func (s *mountControlServer) handleConn(conn net.Conn) {
 		resp.Fail("bad_request", "", err)
 		resp.Finish(time.Now().UTC())
 		_ = json.NewEncoder(conn).Encode(resp)
+		return
+	}
+	op := strings.ToLower(strings.TrimSpace(req.Op))
+	if op == "status" || op == "ping" {
+		started := s.startedAt
+		if started.IsZero() {
+			started = time.Now().UTC()
+		}
+		_ = json.NewEncoder(conn).Encode(mountcontrol.StatusResponse{
+			OK:         true,
+			MountPoint: s.mountPoint(),
+			Op:         op,
+			PID:        os.Getpid(),
+			StartedAt:  started,
+		})
 		return
 	}
 	timeout := req.Timeout()

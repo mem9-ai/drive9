@@ -11,6 +11,86 @@ import (
 	"testing"
 )
 
+func TestReadProcessStateFindsEvalSymlinkHash(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate pre-upgrade write: pidfile hashed with Clean+Abs+EvalSymlinks.
+	resolved := real
+	if abs, err := filepath.Abs(real); err == nil {
+		if ev, err := filepath.EvalSymlinks(abs); err == nil {
+			resolved = ev
+		}
+	}
+	legacyPath := pidFilePathForCanonical(resolved)
+	want := ProcessState{PID: 4242, MountPoint: link}
+	data, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(legacyPath)
+		_ = os.Remove(PIDFilePath(link))
+	})
+
+	// Write path for the symlink form must differ from the resolved hash
+	// (this is the upgrade-compat gap). Abs must not hide a reintroduced
+	// EvalSymlinks in canonicalMountPoint.
+	if PIDFilePath(link) == legacyPath {
+		t.Fatal("write-path hash equals EvalSymlinks hash; upgrade lookup would be untestable")
+	}
+	if SupervisorStatePath(link) == supervisorStatePathForCanonical(resolved) {
+		t.Fatal("supervisor write path unexpectedly equals resolved hash")
+	}
+
+	got, _, err := ReadProcessState(link)
+	if err != nil {
+		t.Fatalf("ReadProcessState via symlink: %v", err)
+	}
+	if got.PID != want.PID {
+		t.Fatalf("PID=%d want %d", got.PID, want.PID)
+	}
+	// Adopt/migrate: next lookup should hit the unresolved write path.
+	if _, err := os.Lstat(PIDFilePath(link)); err != nil {
+		t.Fatalf("expected migration to write-path pidfile: %v", err)
+	}
+
+	// Supervisor state on the resolved hash must also be found via the link.
+	st := SupervisorState{PID: 7, MountPoint: link, State: SupervisorStateRunning}
+	data, err = json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySup := supervisorStatePathForCanonical(resolved)
+	if err := os.MkdirAll(filepath.Dir(legacySup), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacySup, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(legacySup) })
+	gotSt, _, err := ReadSupervisorState(link)
+	if err != nil {
+		t.Fatalf("ReadSupervisorState via symlink: %v", err)
+	}
+	if gotSt.PID != 7 {
+		t.Fatalf("supervisor PID=%d want 7", gotSt.PID)
+	}
+	socks := ControlSocketPathCandidates(link)
+	if len(socks) < 1 {
+		t.Fatal("expected at least write-path socket candidate")
+	}
+}
+
 func TestPIDFilePathCanonicalizesMountPoint(t *testing.T) {
 	dir := t.TempDir()
 	oldwd, err := os.Getwd()
@@ -29,13 +109,17 @@ func TestPIDFilePathCanonicalizesMountPoint(t *testing.T) {
 		t.Fatalf("mkdir mountpoint: %v", err)
 	}
 
-	relPath := PIDFilePath("mnt/../mnt")
-	absPath := PIDFilePath(filepath.Join(dir, "mnt"))
-	if relPath != absPath {
-		t.Fatalf("PIDFilePath relative = %q, absolute = %q", relPath, absPath)
+	// Clean collapses mnt/../mnt; both relative forms must hash the same after Abs.
+	// Do not require equality with an absolute path that may differ by platform
+	// symlink prefixes (/var vs /private/var on macOS) because we deliberately
+	// skip EvalSymlinks to avoid hanging on wedged FUSE mounts.
+	relPath := PIDFilePath("mnt")
+	relCollapsed := PIDFilePath("mnt/../mnt")
+	if relPath != relCollapsed {
+		t.Fatalf("PIDFilePath mnt = %q, mnt/../mnt = %q", relPath, relCollapsed)
 	}
-	if !strings.HasPrefix(relPath, os.TempDir()) {
-		t.Fatalf("PIDFilePath = %q, want temp-dir path", relPath)
+	if !strings.Contains(relPath, "drive9-mount-") {
+		t.Fatalf("PIDFilePath = %q, want drive9-mount- prefix", relPath)
 	}
 }
 
@@ -64,6 +148,121 @@ func TestControlSocketPathFallbackIsUIDScoped(t *testing.T) {
 	wantDir := filepath.Join(os.TempDir(), "drive9-"+currentUID())
 	if filepath.Dir(path) != wantDir {
 		t.Fatalf("ControlSocketPath dir = %q, want %q", filepath.Dir(path), wantDir)
+	}
+}
+
+func TestReadProcessStateRejectsGroupWritable(t *testing.T) {
+	mp := filepath.Join(t.TempDir(), "mnt")
+	path := PIDFilePath(mp)
+	if err := os.WriteFile(path, []byte(`{"pid":12345}`+"\n"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	// Force world-writable (umask may have masked WriteFile mode).
+	if err := os.Chmod(path, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := ReadProcessState(mp)
+	if err == nil {
+		t.Fatal("group/world-writable pidfile must be rejected")
+	}
+}
+
+func TestReadProcessStateRejectsSymlink(t *testing.T) {
+	mp := filepath.Join(t.TempDir(), "mnt")
+	real := filepath.Join(t.TempDir(), "real.pid")
+	if err := os.WriteFile(real, []byte(`{"pid":99}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := PIDFilePath(mp)
+	if err := os.Symlink(real, path); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := ReadProcessState(mp)
+	if err == nil {
+		t.Fatal("symlink pidfile must be rejected")
+	}
+}
+
+func TestCheckTrustedFileInfoRejectsWrongOwner(t *testing.T) {
+	// Use pure check with fake FileInfo (same pattern as state dir tests on unix).
+	// Platform without Sys()->Stat_t skips owner check — still validates regular/mode.
+	info, err := os.Stat(t.TempDir()) // dir, not regular
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkTrustedFileInfo("/x", info); err == nil {
+		t.Fatal("directory must be rejected as state file")
+	}
+}
+
+func TestLegacyStopTokenUntrustedIgnored(t *testing.T) {
+	mp := filepath.Join(t.TempDir(), "mnt")
+	// Ensure no trusted token in stateDir.
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "xdg"))
+	legacy := legacyTempStatePath(".stop", mp)
+	if err := os.WriteFile(legacy, []byte(`{"reason":"umount","ts":"2099-01-01T00:00:00Z"}`+"\n"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(legacy, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(legacy) })
+	if StopTokenPresent(mp) {
+		t.Fatal("world-writable legacy stop token must not count as present")
+	}
+	if _, ok := ReadStopTokenTime(mp); ok {
+		t.Fatal("world-writable legacy stop token must not be read")
+	}
+}
+
+func TestEnsureStateDirCreatesPrivateDir(t *testing.T) {
+	xdg := filepath.Join(t.TempDir(), "xdg")
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	if err := ensureStateDir(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(xdg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatal("not a directory")
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("mode=%o want 700", info.Mode().Perm())
+	}
+}
+
+func TestEnsureStateDirRepairsTooWideMode(t *testing.T) {
+	xdg := filepath.Join(t.TempDir(), "xdg")
+	if err := os.MkdirAll(xdg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Force wide mode in case umask narrowed MkdirAll.
+	if err := os.Chmod(xdg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	if err := ensureStateDir(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(xdg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("mode=%o want 700 after repair", info.Mode().Perm())
+	}
+}
+
+func TestEnsureStateDirRejectsNonDirectory(t *testing.T) {
+	xdg := filepath.Join(t.TempDir(), "xdg-file")
+	if err := os.WriteFile(xdg, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	if err := ensureStateDir(); err == nil {
+		t.Fatal("expected non-directory reject")
 	}
 }
 

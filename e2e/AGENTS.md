@@ -64,6 +64,10 @@ bash e2e/layer-fs-smoke-test.sh
 # FUSE smoke (mount + bidirectional filesystem checks)
 bash e2e/fuse-smoke-test.sh
 
+# FUSE supervision PR gate (worker kill-9 heal, umount no-restart, ensure, foreground)
+bash e2e/fuse-supervision-test.sh
+# Optional toggles: RUN_ENSURE_SMOKE=0 RUN_FOREGROUND_SMOKE=0
+
 # Manifest-based FUSE read correctness workload
 bash e2e/fuse-correctness-workload.sh
 

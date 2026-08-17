@@ -64,6 +64,13 @@
       "owner_hint": "fs",
       "failure_class": "correctness"
     },
+    "fuse-supervision": {
+      "title": "FUSE supervision e2e",
+      "product_area": "fuse",
+      "product_promise": "FUSE mount supervisor auto-heals worker death, honors intentional umount, ensure recovers after tree death, and --supervise-foreground works",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
+    },
     "fuse-write-perf-budget": {
       "title": "FUSE write perf budget e2e",
       "product_area": "fuse",

@@ -29,6 +29,20 @@ func processAliveImpl(pid int) bool {
 	return status == uint32(windows.WAIT_TIMEOUT)
 }
 
+// processMatchesIdentity reports whether pid is still the process that was
+// recorded with creation. creation==0 is fail-closed (see unix twin).
+// Uses mountstate.ProcessCreationTime so verify matches writers.
+func processMatchesIdentity(pid int, creation uint64) bool {
+	if pid <= 0 || creation == 0 || !processAliveImpl(pid) {
+		return false
+	}
+	got, err := mountstate.ProcessCreationTime(pid)
+	if err != nil || got == 0 {
+		return false
+	}
+	return got == creation
+}
+
 func waitForProcessExitByPID(pid int, timeout time.Duration) error {
 	if pid <= 0 {
 		return fmt.Errorf("invalid mount process pid %d", pid)

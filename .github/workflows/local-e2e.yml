@@ -328,6 +328,24 @@ jobs:
           path: /tmp/drive9-fuse-crash-*/mount.log
           if-no-files-found: warn
 
+      - name: Run FUSE supervision e2e
+        id: fuse-supervision
+        continue-on-error: true
+        env:
+          FUSE_STRICT_PREREQS: "1"
+        run: bash e2e/fuse-supervision-test.sh
+
+      - name: Upload FUSE supervision artifacts
+        if: always() && steps.fuse-supervision.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuse-supervision
+          path: |
+            /tmp/drive9-fuse-supervise-*/mount.log
+            /tmp/drive9-fuse-supervise-*/supervisor-worker.log
+            /tmp/drive9-fuse-supervise-*/*.log
+          if-no-files-found: warn
+
       - name: Run FUSE write perf budget e2e
         id: fuse-write-perf-budget
         continue-on-error: true
@@ -445,6 +463,7 @@ jobs:
             echo "| Git workspace on-demand discovery smoke | ${{ steps.git-workspace-ondemand-smoke.outcome || 'skipped' }} |"
             echo "| Pack smoke | ${{ steps.pack-smoke.outcome || 'skipped' }} |"
             echo "| FUSE crash recovery e2e | ${{ steps.fuse-crash-recovery.outcome || 'skipped' }} |"
+            echo "| FUSE supervision e2e | ${{ steps.fuse-supervision.outcome || 'skipped' }} |"
             echo "| FUSE write perf budget e2e | ${{ steps.fuse-write-perf-budget.outcome || 'skipped' }} |"
             echo "| FUSE performance compare | ${{ steps.fuse_performance_compare.outcome || 'skipped' }} |"
             echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.outcome || 'skipped' }} |"
@@ -489,6 +508,7 @@ jobs:
             "git-workspace-ondemand-smoke": "${{ steps.git-workspace-ondemand-smoke.outcome }}",
             "pack-smoke": "${{ steps.pack-smoke.outcome }}",
             "fuse-crash-recovery": "${{ steps.fuse-crash-recovery.outcome }}",
+            "fuse-supervision": "${{ steps.fuse-supervision.outcome }}",
             "fuse-write-perf-budget": "${{ steps.fuse-write-perf-budget.outcome }}",
             "fuse_performance_compare": "${{ steps.fuse_performance_compare.outcome }}",
             "fuse-concurrency-stress": "${{ steps.fuse-concurrency-stress.outcome }}",
@@ -587,6 +607,7 @@ jobs:
           check_required "Git workspace on-demand discovery smoke" "${{ steps.git-workspace-ondemand-smoke.outcome }}"
           check_required "Pack smoke" "${{ steps.pack-smoke.outcome }}"
           check_required "FUSE crash recovery e2e" "${{ steps.fuse-crash-recovery.outcome }}"
+          check_required "FUSE supervision e2e" "${{ steps.fuse-supervision.outcome }}"
           check_required "FUSE write perf budget e2e" "${{ steps.fuse-write-perf-budget.outcome }}"
           if [ "${COMPARE_FUSE_PERFORMANCE_METRICS}" = "1" ]; then
             check_required "FUSE performance compare" "${{ steps.fuse_performance_compare.outcome }}"
