@@ -450,9 +450,17 @@ func usage(code int) {
 			"  profile show [profile]\n"+
 			"                         print mount profile configuration\n"+
 			"  mount [flags] [:/remote] <mountpoint>\n"+
-			"                         mount drive9 filesystem\n"+
+			"                         mount drive9 filesystem (background FUSE supervised by default on Linux/macOS)\n"+
 			"  mount drain [--timeout duration] [--json] <mountpoint>\n"+
 			"                         drain pending writes for a live FUSE mount\n"+
+			"  mount status [--json] <mountpoint>\n"+
+			"                         show supervised mount health/status\n"+
+			"  mount health <mountpoint>\n"+
+			"                         exit 0 if mount healthy, else 1\n"+
+			"  mount ensure [--reset] [--restart] <mountpoint>\n"+
+			"                         idempotently repair/start a supervised mount\n"+
+			"  mount systemd-unit [flags] <mount args...>\n"+
+			"                         print (or --install) a systemd unit for the mount\n"+
 			"  mount vault [flags] <mountpoint>\n"+
 			"                         mount vault secrets read-only\n"+
 			"  umount <mountpoint>    unmount a drive9 mount\n"+

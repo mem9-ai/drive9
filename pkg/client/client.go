@@ -127,6 +127,18 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &se) && se.StatusCode == http.StatusNotFound
 }
 
+// IsForbidden reports whether err is an HTTP 403 StatusError.
+func IsForbidden(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.StatusCode == http.StatusForbidden
+}
+
+// IsUnauthorized reports whether err is an HTTP 401 StatusError.
+func IsUnauthorized(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.StatusCode == http.StatusUnauthorized
+}
+
 // New creates a new drive9 client authenticated with an owner API key.
 //
 // Owner credentials reach the tenant management plane (CreateVaultSecret,

@@ -43,6 +43,13 @@
       "owner_hint": "git",
       "failure_class": "correctness"
     },
+    "git-workspace-ondemand-smoke": {
+      "title": "Git workspace on-demand discovery smoke",
+      "product_area": "git",
+      "product_promise": "git workspace discovery is on-demand (zero idle ListGitWorkspaces when unused)",
+      "owner_hint": "git",
+      "failure_class": "correctness"
+    },
     "pack-smoke": {
       "title": "Pack smoke",
       "product_area": "portability",
@@ -54,6 +61,13 @@
       "title": "FUSE crash recovery e2e",
       "product_area": "fuse",
       "product_promise": "FUSE recovers cleanly after a crash",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
+    },
+    "fuse-supervision": {
+      "title": "FUSE supervision e2e",
+      "product_area": "fuse",
+      "product_promise": "FUSE mount supervisor auto-heals worker death, honors intentional umount, ensure recovers after tree death, and --supervise-foreground works",
       "owner_hint": "fs",
       "failure_class": "correctness"
     },

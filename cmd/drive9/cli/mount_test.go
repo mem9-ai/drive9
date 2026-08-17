@@ -219,6 +219,64 @@ func TestRunUmountDoesNotBlockOnStalePID(t *testing.T) {
 	}
 }
 
+func TestRunUmountSuccessorDoesNotWaitOrFusermount(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("supervised umount fencing is not used on Windows")
+	}
+	mp := t.TempDir()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	foreign := cmd.ProcessState.Pid()
+	if processAliveImpl(foreign) {
+		t.Skip("need a dead foreign pid")
+	}
+	if err := mountstate.WriteSupervisorState(mp, mountstate.SupervisorState{
+		PID: foreign, CreationTime: 99, WorkerPID: foreign, WorkerCreation: 99,
+		MountPoint: mp, State: mountstate.SupervisorStateRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+
+	oldLock := tryExclusiveReadyTimeout
+	tryExclusiveReadyTimeout = func(string, func() error) (bool, error) {
+		return false, nil // successor holds flock
+	}
+	t.Cleanup(func() { tryExclusiveReadyTimeout = oldLock })
+
+	runCalls := 0
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run: func([]string) error {
+			runCalls++
+			return nil
+		},
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{PID: foreign, WorkerPID: foreign, Supervise: true}, "/tmp/fake.pid", nil
+		},
+		terminate: func(int, time.Duration) error {
+			t.Fatal("must not terminate successor")
+			return nil
+		},
+		pidAlive: func(int) bool {
+			t.Fatal("must not poll successor pid")
+			return true
+		},
+		now:       time.Now,
+		sleep:     func(time.Duration) { t.Fatal("must not wait on successor") },
+		printErrf: func(string, ...any) {},
+	}
+	if err := runUmount([]string{mp}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+	if runCalls != 0 {
+		t.Fatalf("fusermount called %d times, want 0", runCalls)
+	}
+}
+
 func TestRunUmountNoPIDFileReturnsSuccess(t *testing.T) {
 	deps := umountDeps{
 		goos:     "linux",
@@ -834,15 +892,22 @@ func TestResolveMountCredentials_MissingServer(t *testing.T) {
 
 func TestMountCmdStartsBackgroundByDefault(t *testing.T) {
 	oldStartMountBackground := startMountBackground
+	oldStartSupervised := startMountSupervisedBackground
 	oldMountFuse := mountFuse
 	t.Cleanup(func() {
 		startMountBackground = oldStartMountBackground
+		startMountSupervisedBackground = oldStartSupervised
 		mountFuse = oldMountFuse
 	})
 
-	var got mountBackgroundRequest
+	var gotSupervised mountSuperviseStartRequest
+	var gotLegacy mountBackgroundRequest
+	startMountSupervisedBackground = func(req mountSuperviseStartRequest) error {
+		gotSupervised = req
+		return nil
+	}
 	startMountBackground = func(req mountBackgroundRequest) error {
-		got = req
+		gotLegacy = req
 		return nil
 	}
 	mountFuse = func(*mountFuseOptions) error {
@@ -861,14 +926,63 @@ func TestMountCmdStartsBackgroundByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MountCmd: %v", err)
 	}
+	// Default FUSE background path is supervised.
+	if runtime.GOOS != "windows" {
+		if gotSupervised.MountPoint != mountPoint {
+			t.Fatalf("MountPoint = %q, want %q", gotSupervised.MountPoint, mountPoint)
+		}
+		if gotSupervised.Server != "https://drive9.example" || gotSupervised.APIKey != "sk-test" || gotSupervised.Token != "" {
+			t.Fatalf("supervised credentials = server %q api %q token %q", gotSupervised.Server, gotSupervised.APIKey, gotSupervised.Token)
+		}
+		if containsString(gotSupervised.OriginalArgs, "--foreground") {
+			t.Fatalf("supervised request args = %v, should preserve original user args", gotSupervised.OriginalArgs)
+		}
+		if gotLegacy.MountPoint != "" {
+			t.Fatal("legacy startMountBackground should not run for default supervised path")
+		}
+	} else if gotLegacy.MountPoint != mountPoint {
+		t.Fatalf("legacy MountPoint = %q, want %q", gotLegacy.MountPoint, mountPoint)
+	}
+}
+
+func TestMountCmdNoSuperviseUsesLegacyBackground(t *testing.T) {
+	oldStartMountBackground := startMountBackground
+	oldStartSupervised := startMountSupervisedBackground
+	oldMountFuse := mountFuse
+	t.Cleanup(func() {
+		startMountBackground = oldStartMountBackground
+		startMountSupervisedBackground = oldStartSupervised
+		mountFuse = oldMountFuse
+	})
+
+	var got mountBackgroundRequest
+	startMountBackground = func(req mountBackgroundRequest) error {
+		got = req
+		return nil
+	}
+	startMountSupervisedBackground = func(req mountSuperviseStartRequest) error {
+		t.Fatal("supervised path should not run with --no-supervise")
+		return nil
+	}
+	mountFuse = func(*mountFuseOptions) error {
+		t.Fatal("mountFuse should not run in-process")
+		return nil
+	}
+
+	mountPoint := t.TempDir()
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--no-supervise",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "interactive",
+		mountPoint,
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
 	if got.MountPoint != mountPoint {
 		t.Fatalf("MountPoint = %q, want %q", got.MountPoint, mountPoint)
-	}
-	if got.Server != "https://drive9.example" || got.APIKey != "sk-test" || got.Token != "" {
-		t.Fatalf("background credentials = server %q api %q token %q", got.Server, got.APIKey, got.Token)
-	}
-	if containsString(got.Args, "--foreground") {
-		t.Fatalf("background request args = %v, should preserve original user args", got.Args)
 	}
 }
 

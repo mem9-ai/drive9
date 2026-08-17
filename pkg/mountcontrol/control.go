@@ -14,7 +14,19 @@ import (
 const DefaultDrainTimeout = 30 * time.Second
 
 type DrainRequest struct {
-	TimeoutMS int64 `json:"timeout_ms,omitempty"`
+	// Op is "" or "drain" (default) or "status"/"ping".
+	Op        string `json:"op,omitempty"`
+	TimeoutMS int64  `json:"timeout_ms,omitempty"`
+}
+
+// StatusResponse is a cheap liveness reply from the mount control socket.
+type StatusResponse struct {
+	OK         bool      `json:"ok"`
+	MountPoint string    `json:"mount_point,omitempty"`
+	Op         string    `json:"op,omitempty"`
+	PID        int       `json:"pid,omitempty"`
+	StartedAt  time.Time `json:"started_at,omitempty"`
+	Error      string    `json:"error,omitempty"`
 }
 
 func (r DrainRequest) Timeout() time.Duration {
@@ -106,6 +118,46 @@ func RequestDrain(ctx context.Context, socketPath string, timeout time.Duration)
 	var resp DrainResponse
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
 		return nil, fmt.Errorf("read drain response: %w", err)
+	}
+	return &resp, nil
+}
+
+// RequestStatus pings the mount control socket with Op=status/ping.
+// This does not touch FUSE readdir and never reaches the remote backend.
+func RequestStatus(ctx context.Context, socketPath string, timeout time.Duration) (*StatusResponse, error) {
+	if socketPath == "" {
+		return nil, fmt.Errorf("missing mount control socket")
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("dial mount control socket %s: %w", socketPath, err)
+	}
+	defer func() { _ = conn.Close() }()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	req := DrainRequest{Op: "ping", TimeoutMS: timeout.Milliseconds()}
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return nil, fmt.Errorf("write status request: %w", err)
+	}
+	var resp StatusResponse
+	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
+		return nil, fmt.Errorf("read status response: %w", err)
+	}
+	if !resp.OK {
+		if resp.Error != "" {
+			return &resp, fmt.Errorf("mount control status: %s", resp.Error)
+		}
+		return &resp, fmt.Errorf("mount control status: not ok")
 	}
 	return &resp, nil
 }

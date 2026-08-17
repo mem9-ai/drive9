@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/mountsupervisor"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 	drive9webdav "github.com/mem9-ai/drive9/pkg/webdav"
 )
@@ -51,6 +53,7 @@ type mountBackgroundRequest struct {
 }
 
 var startMountBackground = startMountBackgroundImpl
+var startMountSupervisedBackground = startMountSupervisedBackgroundImpl
 
 // MountCmd handles the "drive9 mount" command.
 //
@@ -75,11 +78,22 @@ var startMountBackground = startMountBackgroundImpl
 func MountCmd(args []string) error {
 	fmt.Fprint(os.Stderr, buildinfo.String("drive9 mount"))
 	if len(args) > 0 {
-		if args[0] == "vault" {
+		switch args[0] {
+		case "vault":
 			return vaultMountCmd(args[1:], true)
-		}
-		if args[0] == "drain" {
+		case "drain":
 			return MountDrainCmd(args[1:])
+		case "status":
+			return runMountStatus(args[1:])
+		case "health":
+			return runMountHealth(args[1:])
+		case "ensure":
+			return runMountEnsure(args[1:])
+		case "supervise":
+			// Hidden supervisor entrypoint — do not print build banner twice.
+			return runMountSupervise(args[1:])
+		case "systemd-unit":
+			return runMountSystemdUnit(args[1:])
 		}
 	}
 	return fsMountCmdWithBackground(args, true)
@@ -117,6 +131,18 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
 	mode := fs.String("mode", "auto", "mount mode: auto, fuse, or webdav")
 	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
+	superviseForeground := fs.Bool("supervise-foreground", false, "run as in-process supervisor and block until stop (sandbox/systemd friendly)")
+	noSupervise := fs.Bool("no-supervise", false, "legacy fire-and-forget background mount without supervisor")
+	supervised := fs.Bool("supervised", false, "internal: worker managed by supervisor")
+	maxRestarts := fs.Int("max-restarts", 5, "supervisor max restarts within restart window")
+	restartWindow := fs.Duration("restart-window", 10*time.Minute, "supervisor restart budget window")
+	healthInterval := fs.Duration("health-interval", 10*time.Second, "supervisor health probe interval")
+	healthTimeout := fs.Duration("health-timeout", 5*time.Second, "supervisor health probe timeout")
+	healthFailures := fs.Int("health-failures", 3, "consecutive health failures before worker restart")
+	stopTimeout := fs.Duration("stop-timeout", 60*time.Second, "supervisor SIGTERM to SIGKILL grace")
+	restartBackoffMax := fs.Duration("restart-backoff-max", 30*time.Second, "supervisor max restart backoff")
+	alertWebhook := fs.String("alert-webhook", "", "optional webhook for mount restart/give-up alerts")
+	alertFile := fs.String("alert-file", "", "optional file for mount alert events")
 	cacheDir := fs.String("cache-dir", "", "write-back cache directory (default ~/.cache/drive9)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
 	readCacheMaxFile := fs.Int64("read-cache-max-file-mb", 4, "maximum single file size admitted to read cache in MB; files at or below this size are fetched with a single whole-file request")
@@ -452,7 +478,56 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		})
 	}
 
+	// Resolve supervision mode from flags + env.
+	// DRIVE9_MOUNT_SUPERVISE=off forces legacy behavior.
+	envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
+	wantSupervise := !*noSupervise && !envSuperviseOff
+	if *superviseForeground {
+		// This process becomes the supervisor (blocks).
+		return runSuperviseForeground(mountSuperviseStartRequest{
+			OriginalArgs:      append([]string(nil), args...),
+			MountPoint:        mountPoint,
+			Server:            serverVal,
+			APIKey:            apiKeyVal,
+			Token:             tokenVal,
+			RemoteRoot:        remoteRoot,
+			Profile:           profileCfg.Name,
+			LocalRoot:         normalizedLocalRoot,
+			PackPaths:         append([]string(nil), effectivePackPaths...),
+			MaxRestarts:       *maxRestarts,
+			RestartWindow:     *restartWindow,
+			HealthInterval:    *healthInterval,
+			HealthTimeout:     *healthTimeout,
+			HealthFailures:    *healthFailures,
+			StopTimeout:       *stopTimeout,
+			RestartBackoffMax: *restartBackoffMax,
+			AlertWebhook:      firstNonEmpty(*alertWebhook, os.Getenv("DRIVE9_MOUNT_ALERT_WEBHOOK")),
+			AlertFile:         *alertFile,
+		})
+	}
 	if background && !*foreground {
+		if wantSupervise && resolved == MountModeFUSE && runtime.GOOS != "windows" {
+			return startMountSupervisedBackground(mountSuperviseStartRequest{
+				OriginalArgs:      append([]string(nil), args...),
+				MountPoint:        mountPoint,
+				Server:            serverVal,
+				APIKey:            apiKeyVal,
+				Token:             tokenVal,
+				RemoteRoot:        remoteRoot,
+				Profile:           profileCfg.Name,
+				LocalRoot:         normalizedLocalRoot,
+				PackPaths:         append([]string(nil), effectivePackPaths...),
+				MaxRestarts:       *maxRestarts,
+				RestartWindow:     *restartWindow,
+				HealthInterval:    *healthInterval,
+				HealthTimeout:     *healthTimeout,
+				HealthFailures:    *healthFailures,
+				StopTimeout:       *stopTimeout,
+				RestartBackoffMax: *restartBackoffMax,
+				AlertWebhook:      firstNonEmpty(*alertWebhook, os.Getenv("DRIVE9_MOUNT_ALERT_WEBHOOK")),
+				AlertFile:         *alertFile,
+			})
+		}
 		return startMountBackground(mountBackgroundRequest{
 			Args:       append([]string(nil), args...),
 			MountPoint: mountPoint,
@@ -461,6 +536,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			Token:      tokenVal,
 		})
 	}
+	_ = supervised // used via flag for worker process; passed through argv by supervisor
 
 	// WebDAV path: create client, start local WebDAV server, invoke mount_webdav.
 	if resolved == MountModeWebDAV {
@@ -593,9 +669,360 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		PerfMaxSamples:          *perfMaxSamples,
 		PerfMaxSampleFiles:      *perfMaxSampleFiles,
 		PerfMaxProfileFiles:     *perfMaxProfileFiles,
+		Supervised:              *supervised,
 	}
 
 	return mountFuse(opts)
+}
+
+type mountSuperviseStartRequest struct {
+	OriginalArgs      []string
+	MountPoint        string
+	Server            string
+	APIKey            string
+	Token             string
+	RemoteRoot        string
+	Profile           string
+	LocalRoot         string
+	PackPaths         []string
+	MaxRestarts       int
+	RestartWindow     time.Duration
+	HealthInterval    time.Duration
+	HealthTimeout     time.Duration
+	HealthFailures    int
+	StopTimeout       time.Duration
+	RestartBackoffMax time.Duration
+	AlertWebhook      string
+	AlertFile         string
+}
+
+func sanitizedMountArgs(args []string) []string {
+	return stripBackgroundOnlyCredentialArgs(args)
+}
+
+func workerArgsForSupervise(args []string) []string {
+	// Build: mount --foreground --supervised <sanitized original args without duplicate flags>
+	out := []string{"mount", "--foreground", "--supervised"}
+	cleaned := stripBackgroundOnlyCredentialArgs(args)
+	// Drop --foreground / --supervise-foreground / --no-supervise if present in cleaned.
+	for i := 0; i < len(cleaned); i++ {
+		a := cleaned[i]
+		switch {
+		case a == "--foreground" || a == "--supervise-foreground" || a == "--no-supervise" || a == "--supervised":
+			continue
+		case strings.HasPrefix(a, "--foreground=") || strings.HasPrefix(a, "--supervise-foreground=") ||
+			strings.HasPrefix(a, "--no-supervise=") || strings.HasPrefix(a, "--supervised="):
+			continue
+		default:
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func superviseCommandArgs(req mountSuperviseStartRequest, logPath string) ([]string, error) {
+	sanitized, err := json.Marshal(sanitizedMountArgs(req.OriginalArgs))
+	if err != nil {
+		return nil, err
+	}
+	out := []string{
+		"mount", "supervise",
+		"--mountpoint", req.MountPoint,
+		"--log", logPath,
+		"--max-restarts", fmt.Sprintf("%d", req.MaxRestarts),
+		"--restart-window", req.RestartWindow.String(),
+		"--health-interval", req.HealthInterval.String(),
+		"--health-timeout", req.HealthTimeout.String(),
+		"--health-failures", fmt.Sprintf("%d", req.HealthFailures),
+		"--stop-timeout", req.StopTimeout.String(),
+		"--restart-backoff-max", req.RestartBackoffMax.String(),
+		"--server", req.Server,
+		"--remote-root", req.RemoteRoot,
+		"--profile", req.Profile,
+		"--local-root-meta", req.LocalRoot,
+		"--sanitized-args-json", string(sanitized),
+	}
+	if len(req.PackPaths) > 0 {
+		packJSON, err := json.Marshal(req.PackPaths)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, "--pack-paths-json", string(packJSON))
+	}
+	if req.AlertWebhook != "" {
+		out = append(out, "--alert-webhook", req.AlertWebhook)
+	}
+	if req.AlertFile != "" {
+		out = append(out, "--alert-file", req.AlertFile)
+	}
+	out = append(out, workerArgsForSupervise(req.OriginalArgs)...)
+	return out, nil
+}
+
+func startMountSupervisedBackgroundImpl(req mountSuperviseStartRequest) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("drive9 mount: locate executable: %w", err)
+	}
+	logPath, logFile, err := openMountBackgroundLog(req.MountPoint)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = logFile.Close() }()
+
+	supArgs, err := superviseCommandArgs(req, logPath)
+	if err != nil {
+		return err
+	}
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		return fmt.Errorf("drive9 mount: open %s: %w", os.DevNull, err)
+	}
+	defer func() { _ = devNull.Close() }()
+
+	cmd := exec.Command(exe, supArgs...)
+	cmd.Env = mountBackgroundEnv(os.Environ(), mountBackgroundRequest{
+		Server: req.Server,
+		APIKey: req.APIKey,
+		Token:  req.Token,
+	})
+	cmd.Stdin = devNull
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	// Detach supervisor session for background mode only.
+	configureMountBackgroundCommand(cmd)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("drive9 mount: start supervised mount: %w", err)
+	}
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+
+	if err := waitForSupervisedMountReady(req.MountPoint, cmd.Process.Pid, waitCh, logPath, defaultMountBackgroundReadyTimeout); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "drive9: mount supervised in background (supervisor pid: %d, log: %s)\n", cmd.Process.Pid, logPath)
+	fmt.Fprintf(os.Stderr, "drive9: unmount with `drive9 umount %s`\n", req.MountPoint)
+	return nil
+}
+
+func runSuperviseForeground(req mountSuperviseStartRequest) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	logPath, err := mountBackgroundLogPath(req.MountPoint)
+	if err != nil {
+		// Non-fatal: supervise without dedicated log file.
+		logPath = ""
+	}
+	supArgs, err := superviseCommandArgs(req, logPath)
+	if err != nil {
+		return err
+	}
+	// Run supervise in-process by re-entering the same binary path would
+	// double-fork; call the supervise runner directly instead.
+	// Rebuild argv for runMountSupervise: drop leading "mount" "supervise".
+	if len(supArgs) < 2 || supArgs[0] != "mount" || supArgs[1] != "supervise" {
+		return fmt.Errorf("drive9 mount: internal supervise args invalid")
+	}
+	// Match background path: scrub credential envs that were intentionally
+	// omitted (e.g. DRIVE9_PUBLIC_KEY), then apply the resolved snapshot.
+	// Setenv alone leaves stripped vars inherited by the in-process supervisor.
+	scrubbed := mountBackgroundEnv(os.Environ(), mountBackgroundRequest{
+		Server: req.Server,
+		APIKey: req.APIKey,
+		Token:  req.Token,
+	})
+	applyScrubbedMountEnv(scrubbed)
+	_ = exe
+	return runMountSupervise(supArgs[2:])
+}
+
+// applyScrubbedMountEnv unsets mount credential env vars then applies scrubbed.
+// Needed for in-process --supervise-foreground (unlike cmd.Env on a child).
+func applyScrubbedMountEnv(scrubbed []string) {
+	for _, key := range []string{
+		EnvServer,
+		EnvAPIKey,
+		EnvVaultToken,
+		EnvTiDBCloudPublicKey,
+		EnvTiDBCloudPrivateKey,
+	} {
+		_ = os.Unsetenv(key)
+	}
+	for _, kv := range scrubbed {
+		if i := strings.IndexByte(kv, '='); i > 0 {
+			_ = os.Setenv(kv[:i], kv[i+1:])
+		}
+	}
+}
+
+func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-chan error, logPath string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	// Capture child identity once (Darwin ProcessCreationTime shells out to ps).
+	supCreation, _ := mountstate.ProcessCreationTime(supervisorPID)
+	for {
+		select {
+		case err := <-waitCh:
+			if err != nil {
+				return fmt.Errorf("drive9 mount: supervised mount exited before becoming ready: %w (log: %s)", err, logPath)
+			}
+			return fmt.Errorf("drive9 mount: supervised mount exited before becoming ready (log: %s)", logPath)
+		default:
+		}
+		if time.Now().After(deadline) {
+			// Stop only the supervisor we just spawned. Worker kill is gated on
+			// SupervisorState matching this generation (PID+creation); never
+			// act on stale state or PID-only liveness (fail closed).
+			cleanupSupervisedReadyTimeout(mountPoint, supervisorPID, supCreation)
+			return fmt.Errorf("drive9 mount: timed out waiting for supervised mount to become ready after %s (log: %s)", timeout, logPath)
+		}
+		// Ready only when SupervisorState matches the child we just spawned
+		// (PID+creation) and its worker is identity-alive — never accept a
+		// stale pidfile from a previous generation.
+		if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+			if supervisedReadyStateMatches(st, supervisorPID, supCreation) && probeMountReadyForCLI(mountPoint) {
+				return nil
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// supervisedReadyStateMatches reports whether recorded supervisor state belongs
+// to the supervisor child this parent just spawned (wrong-generation guard) and
+// whether its worker is identity-alive. Creation mismatches are fail-closed when
+// the platform supplies creation metadata (supCreation != 0).
+func supervisedReadyStateMatches(st mountstate.SupervisorState, supervisorPID int, supCreation uint64) bool {
+	if !supervisorStateMatchesGeneration(st, supervisorPID, supCreation) {
+		return false
+	}
+	if st.WorkerPID <= 0 {
+		return false
+	}
+	if st.WorkerCreation > 0 {
+		return processMatchesIdentity(st.WorkerPID, st.WorkerCreation)
+	}
+	// No recorded worker creation: only acceptable where the platform cannot
+	// supply creation metadata at all; otherwise fail closed.
+	return supCreation == 0 && processAliveImpl(st.WorkerPID)
+}
+
+// supervisorStateMatchesGeneration reports whether st is the supervisor this
+// parent just spawned (PID + creation when the platform supplies metadata).
+func supervisorStateMatchesGeneration(st mountstate.SupervisorState, supervisorPID int, supCreation uint64) bool {
+	if supervisorPID <= 0 || st.PID != supervisorPID {
+		return false
+	}
+	if supCreation != 0 && st.CreationTime != supCreation {
+		return false
+	}
+	return true
+}
+
+// Injected for tests: successor-lock / detach hooks.
+var (
+	tryExclusiveReadyTimeout     = mountsupervisor.TryExclusive
+	ensureCleanAfterReadyTimeout = ensureCleanMountPointCLI
+	forceUnmountAfterUmount      = forceUnmountMountPointCLI
+	mountStillActiveAfterUmount  = mountPointStillActive
+)
+
+// cleanupSupervisedReadyTimeout stops the spawned supervisor and only signals a
+// worker when SupervisorState matches this generation with full creation identity.
+// Mount detach and stop-token clear are generation+lock gated so a successor
+// supervisor that started after we timed out cannot be torn down or have its
+// token erased.
+func cleanupSupervisedReadyTimeout(mountPoint string, supervisorPID int, supCreation uint64) {
+	receipt, tokErr := mountstate.WriteStopTokenReceipt(mountPoint, "ready-timeout")
+	if tokErr != nil {
+		// Still stop the child we spawned; skip mountpoint-global detach
+		// without a receipt (would be an unconditional token clear).
+		if isOurSupervisorProcess(supervisorPID, supCreation) {
+			_ = terminateProcessGraceful(supervisorPID, 10*time.Second)
+			_ = terminateProcess(supervisorPID, 3*time.Second)
+		}
+		return
+	}
+	// Stop only our child supervisor (PID we spawned + creation when available).
+	if isOurSupervisorProcess(supervisorPID, supCreation) {
+		_ = terminateProcessGraceful(supervisorPID, 10*time.Second)
+	}
+	// Worker kill only from matching-generation SupervisorState with creation
+	// (fail closed: missing WorkerCreation → do not signal).
+	if sst, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+		if supervisorStateMatchesGeneration(sst, supervisorPID, supCreation) &&
+			sst.WorkerPID > 0 && sst.WorkerCreation > 0 &&
+			processMatchesIdentity(sst.WorkerPID, sst.WorkerCreation) {
+			_ = terminateProcess(sst.WorkerPID, 5*time.Second)
+		}
+	}
+	// Final hard-kill of our child if it ignored SIGTERM.
+	if isOurSupervisorProcess(supervisorPID, supCreation) {
+		_ = terminateProcess(supervisorPID, 3*time.Second)
+	}
+	finishReadyTimeoutCleanup(mountPoint, supervisorPID, supCreation, receipt)
+}
+
+// finishReadyTimeoutCleanup is the mountpoint-global tail: detach and token
+// clear happen only while holding the supervisor lock and only if recorded
+// state still belongs to this generation. Token clear is receipt-CAS.
+func finishReadyTimeoutCleanup(mountPoint string, supervisorPID int, supCreation uint64, receipt time.Time) {
+	_ = finishOwnedGenerationCleanup(mountPoint, supervisorPID, supCreation, receipt, func() {
+		_, _ = ensureCleanAfterReadyTimeout(mountPoint)
+	})
+}
+
+// finishOwnedGenerationCleanup runs fn (detach / fusermount) and then clears
+// this generation's token/state only while holding the supervisor flock and
+// only if recorded state still belongs to gen. Returns true iff this
+// generation still owns the mountpoint (safe to remount).
+func finishOwnedGenerationCleanup(mountPoint string, genPID int, genCreation uint64, receipt time.Time, underLock func()) bool {
+	owned := false
+	_, _ = tryExclusiveReadyTimeout(mountPoint, func() error {
+		if sst, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+			if !supervisorStateMatchesGeneration(sst, genPID, genCreation) {
+				// Successor (or other generation) owns this mountpoint.
+				return nil
+			}
+		}
+		if underLock != nil {
+			underLock()
+		}
+		_ = mountstate.ClearStopTokenIf(mountPoint, receipt)
+		if sst, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+			if supervisorStateMatchesGeneration(sst, genPID, genCreation) {
+				_ = mountstate.ClearSupervisorState(mountPoint)
+				_ = os.Remove(mountstate.PIDFilePath(mountPoint))
+			}
+		} else {
+			_ = mountstate.ClearSupervisorState(mountPoint)
+			if genPID <= 0 || isOurSupervisorProcess(genPID, genCreation) || !processAliveImpl(genPID) {
+				_ = os.Remove(mountstate.PIDFilePath(mountPoint))
+			}
+		}
+		owned = true
+		return nil
+	})
+	return owned
+}
+
+// isOurSupervisorProcess is true when pid is still the process we spawned.
+// When creation metadata is available it is fail-closed on mismatch; when the
+// platform cannot supply creation, PID liveness of our spawn is accepted.
+func isOurSupervisorProcess(supervisorPID int, supCreation uint64) bool {
+	if supervisorPID <= 0 {
+		return false
+	}
+	if supCreation > 0 {
+		return processMatchesIdentity(supervisorPID, supCreation)
+	}
+	return processAliveImpl(supervisorPID)
+}
+
+func probeMountReadyForCLI(mountPoint string) bool {
+	// Avoid importing fuse on windows build of this file path — use build-tagged helper.
+	return probeMountPointReadyCLI(mountPoint)
 }
 
 func startMountBackgroundImpl(req mountBackgroundRequest) error {
@@ -654,13 +1081,14 @@ func stripBackgroundOnlyCredentialArgs(args []string) []string {
 	out := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		if arg == "--api-key" {
+		// Go's flag package accepts both -api-key and --api-key forms.
+		if arg == "--api-key" || arg == "-api-key" {
 			if i+1 < len(args) {
 				i++
 			}
 			continue
 		}
-		if strings.HasPrefix(arg, "--api-key=") {
+		if strings.HasPrefix(arg, "--api-key=") || strings.HasPrefix(arg, "-api-key=") {
 			continue
 		}
 		out = append(out, arg)
@@ -717,9 +1145,7 @@ func mountBackgroundLogPath(mountPoint string) (string, error) {
 	if abs, err := filepath.Abs(canonical); err == nil {
 		canonical = abs
 	}
-	if resolved, err := filepath.EvalSymlinks(canonical); err == nil {
-		canonical = resolved
-	}
+	// Do not EvalSymlinks: that can hang on a wedged FUSE mountpoint.
 	sum := sha256.Sum256([]byte(canonical))
 	return filepath.Join(dir, "mount-"+hex.EncodeToString(sum[:8])+".log"), nil
 }
@@ -1046,6 +1472,21 @@ func pathBase(value string) string {
 	return value
 }
 
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// mountPointStillActive is a best-effort check used after supervised stop.
+// Prefer fuse.ActiveMountPoint when available (non-windows).
+func mountPointStillActive(mountPoint string) bool {
+	return mountPointStillActiveImpl(mountPoint)
+}
+
 func validateMountPolicyPatterns(patternGroups ...[]string) error {
 	for _, patterns := range patternGroups {
 		for _, pattern := range patterns {
@@ -1188,6 +1629,8 @@ func runUmount(args []string, deps umountDeps) error {
 		}
 	}
 
+	// Read pack metadata BEFORE stopping the supervisor — shutdownClean removes
+	// the pidfile, so a post-stop read would fail for supervised mounts.
 	var packState mountstate.ProcessState
 	packStateOK := false
 	needPackState := len(packArchives) > 0 || len(packPaths) > 0 || !*noAutoPack
@@ -1205,6 +1648,76 @@ func runUmount(args []string, deps umountDeps) error {
 				}
 			} else {
 				packStateOK = true
+			}
+		}
+	}
+
+	// Intentional stop for supervised mounts: write stop token, SIGTERM supervisor
+	// (graceful), then fusermount only while we still own this generation.
+	// Verify process identity (PID + creation time) before signaling so a reused
+	// PID from stale state cannot kill an unrelated process.
+	stoppedSupervisor := false
+	var umountReceipt time.Time
+	umountGenPID := 0
+	var umountGenCreation uint64
+	if deps.goos != "windows" {
+		var tokErr error
+		umountReceipt, tokErr = mountstate.WriteStopTokenReceipt(stateMountPoint, "umount")
+		if tokErr != nil {
+			return fmt.Errorf("drive9 umount: write stop token for %s: %w", stateMountPoint, tokErr)
+		}
+		stopPID := 0
+		var stopCreation uint64
+		workerPID := 0
+		var workerCreation uint64
+		if deps.readProcessState != nil {
+			if st, _, rerr := deps.readProcessState(stateMountPoint); rerr == nil {
+				if st.SupervisorPID > 0 {
+					stopPID = st.SupervisorPID
+					stopCreation = st.SupervisorCreationTime
+					if stopCreation == 0 {
+						stopCreation = st.CreationTime
+					}
+				} else if st.Role == mountstate.RoleSupervisor {
+					stopPID = st.PID
+					stopCreation = st.CreationTime
+				}
+				if st.WorkerPID > 0 {
+					workerPID = st.WorkerPID
+				} else if st.Role != mountstate.RoleSupervisor && st.PID > 0 {
+					// Unsupervised / orphan worker recorded as main PID.
+					workerPID = st.PID
+					workerCreation = st.CreationTime
+				}
+			}
+		}
+		if sst, _, rerr := mountstate.ReadSupervisorState(stateMountPoint); rerr == nil {
+			if sst.PID > 0 {
+				stopPID = sst.PID
+				stopCreation = sst.CreationTime
+			}
+			if sst.WorkerPID > 0 {
+				workerPID = sst.WorkerPID
+				workerCreation = sst.WorkerCreation
+			}
+		}
+		umountGenPID, umountGenCreation = stopPID, stopCreation
+		if stopPID > 0 {
+			if processMatchesIdentity(stopPID, stopCreation) {
+				stoppedSupervisor = true
+				if terr := terminateProcessGraceful(stopPID, *waitTimeout); terr != nil && deps.printErrf != nil {
+					deps.printErrf("drive9 umount: stop supervisor pid %d: %v\n", stopPID, terr)
+				}
+			} else if deps.printErrf != nil {
+				deps.printErrf("drive9 umount: skip stop for stale supervisor pid %d (identity mismatch)\n", stopPID)
+			}
+		}
+		// Dead supervisor + live orphan worker: stop worker by identity so a
+		// stuck FUSE endpoint can be force-unmounted below.
+		if workerPID > 0 && processMatchesIdentity(workerPID, workerCreation) {
+			stoppedSupervisor = true // enable force-clean forgiveness path
+			if terr := terminateProcessGraceful(workerPID, *waitTimeout); terr != nil && deps.printErrf != nil {
+				deps.printErrf("drive9 umount: stop worker pid %d: %v\n", workerPID, terr)
 			}
 		}
 	}
@@ -1231,11 +1744,52 @@ func runUmount(args []string, deps umountDeps) error {
 		return fmt.Errorf("drive9 umount: --pack-path requires an auto-pack mount or --pack")
 	}
 
-	argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
-	if err != nil {
-		return err
+	var runErr error
+	// Supervised stop already asked the supervisor to unmount. Fusermount /
+	// force-unmount and token/state clear are generation+lock gated so a
+	// successor that started after we stopped generation A is not torn down.
+	if deps.goos != "windows" {
+		owned := finishOwnedGenerationCleanup(stateMountPoint, umountGenPID, umountGenCreation, umountReceipt, func() {
+			if stoppedSupervisor && !mountStillActiveAfterUmount(mountPoint) {
+				return
+			}
+			argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
+			if err != nil {
+				runErr = err
+				return
+			}
+			runErr = deps.run(argv)
+			if runErr != nil && stoppedSupervisor {
+				if mountStillActiveAfterUmount(mountPoint) {
+					forceUnmountAfterUmount(mountPoint)
+				}
+				if !mountStillActiveAfterUmount(mountPoint) {
+					runErr = nil
+				}
+			}
+		})
+		if !owned {
+			// Successor already owns the mountpoint. Do not re-read pidfile,
+			// wait on B, pack B's overlay, or fusermount B.
+			return nil
+		}
+	} else if stoppedSupervisor && !mountPointStillActive(mountPoint) {
+		runErr = nil
+	} else {
+		argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
+		if err != nil {
+			return err
+		}
+		runErr = deps.run(argv)
+		if runErr != nil && stoppedSupervisor {
+			if mountPointStillActive(mountPoint) {
+				forceUnmountMountPointCLI(mountPoint)
+			}
+			if !mountPointStillActive(mountPoint) {
+				runErr = nil
+			}
+		}
 	}
-	runErr := deps.run(argv)
 	if deps.goos == "windows" {
 		var (
 			state mountstate.ProcessState
@@ -1545,6 +2099,16 @@ func processAlive(pid int) bool {
 var waitForProcessExit = waitForProcessExitByPID
 
 func terminateProcess(pid int, waitTimeout time.Duration) error {
+	// Legacy hard kill used by paths that must not wait on graceful drain.
+	return terminateProcessWithSignal(pid, waitTimeout, true)
+}
+
+// terminateProcessGraceful sends SIGTERM first, then SIGKILL after waitTimeout.
+func terminateProcessGraceful(pid int, waitTimeout time.Duration) error {
+	return terminateProcessWithSignal(pid, waitTimeout, false)
+}
+
+func terminateProcessWithSignal(pid int, waitTimeout time.Duration, killOnly bool) error {
 	if pid <= 0 {
 		return fmt.Errorf("invalid mount process pid %d", pid)
 	}
@@ -1552,7 +2116,18 @@ func terminateProcess(pid int, waitTimeout time.Duration) error {
 	if err != nil {
 		return err
 	}
-	err = process.Kill()
+	if killOnly {
+		err = process.Kill()
+	} else {
+		err = process.Signal(syscall.SIGTERM)
+		if err != nil {
+			if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+				return nil
+			}
+			// Fall back to kill if SIGTERM fails.
+			err = process.Kill()
+		}
+	}
 	if err != nil {
 		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
 			err = nil
@@ -1561,12 +2136,14 @@ func terminateProcess(pid int, waitTimeout time.Duration) error {
 		}
 	}
 	if waitTimeout > 0 {
-		return waitForProcessExit(pid, waitTimeout)
+		if waitErr := waitForProcessExit(pid, waitTimeout); waitErr != nil {
+			// Escalate to SIGKILL after grace.
+			_ = process.Kill()
+			return waitForProcessExit(pid, 5*time.Second)
+		}
+		return nil
 	}
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 // resolveMountCredentials selects the (server, apiKey, token) triple that a

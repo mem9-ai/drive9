@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -94,6 +95,16 @@ func (w *SSEWatcher) handleEvent(change *client.ChangeEvent, reset *client.Reset
 func (w *SSEWatcher) handleChange(ce *client.ChangeEvent) {
 	remotePath := ce.Path
 	if remotePath == "" {
+		return
+	}
+	// Tenant-absolute git workspace index lives outside some RemoteRoot mounts;
+	// still arm/refresh the git layer when it changes.
+	if remotePath == client.GitWorkspaceIndexPath || strings.HasPrefix(remotePath, "/.drive9/git-workspaces/") {
+		if w.fs == nil || w.fs.opts == nil || !w.fs.opts.EnableGitWorkspaces {
+			return
+		}
+		safeStderrPrintf("drive9: SSE git-workspace index event op=%s path=%s actor=%s\n", ce.Op, remotePath, ce.Actor)
+		w.fs.notifyGitWorkspaceIndexChanged()
 		return
 	}
 	p, ok := w.fs.localPath(remotePath)
