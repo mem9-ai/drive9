@@ -277,6 +277,10 @@ func Mount(opts *MountOptions) (err error) {
 	if opts.CheckpointRef != "" && opts.LayerRef == "" {
 		return ExitStartupPermanentErr("CheckpointRef requires LayerRef", nil)
 	}
+	// D10: checkpoint mount is read-only; writable restore is fork --checkpoint.
+	if opts.CheckpointRef != "" {
+		opts.ReadOnly = true
+	}
 
 	// Generate per-mount actor ID for SSE self-filtering.
 	actorID := generateMountID()
@@ -333,7 +337,10 @@ func Mount(opts *MountOptions) (err error) {
 			}
 			return ExitStartupTransientErr(fmt.Sprintf("resolve fs layer %q", opts.LayerRef), err)
 		}
-		if layer.State != "active" {
+		if !fsLayerMountStateAllowed(layer.State, opts.CheckpointRef != "") {
+			if opts.CheckpointRef != "" {
+				return ExitStartupPermanentErr(fmt.Sprintf("fs layer %q is %s, checkpoint mount requires active, sealed, or committed", opts.LayerRef, layer.State), nil)
+			}
 			return ExitStartupPermanentErr(fmt.Sprintf("fs layer %q is %s, want active", opts.LayerRef, layer.State), nil)
 		}
 		opts.LayerRef = layer.LayerID
@@ -509,6 +516,29 @@ func Mount(opts *MountOptions) (err error) {
 					uploader.RecoverPending()
 				}
 			}
+		}
+	}
+
+	// D10: checkpoint / explicit RO still needs overlay restore (read-only view),
+	// but must not start a commit queue. Membership check lives in restoreLayerEntries.
+	if opts.ReadOnly && opts.LayerRef != "" && cacheBase != "" && mountHash != "" {
+		pendingDir := filepath.Join(cacheBase, mountHash, "pending-ro")
+		shadowDir = filepath.Join(cacheBase, mountHash, "shadow-ro")
+		pendingIdx, pErr := NewPendingIndex(pendingDir)
+		if pErr != nil {
+			return fmt.Errorf("mount: read-only pending index: %w", pErr)
+		}
+		if err := pendingIdx.RecoverFromDisk(); err != nil {
+			fmt.Fprintf(os.Stderr, "drive9: read-only pending recovery: %v\n", err)
+		}
+		shadowStore, sErr := NewShadowStoreWithQuota(shadowDir, opts.WriteCacheFreeRatio, 0)
+		if sErr != nil {
+			return fmt.Errorf("mount: read-only shadow store: %w", sErr)
+		}
+		dat9fs.pendingIndex = pendingIdx
+		dat9fs.shadowStore = shadowStore
+		if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
+			return fmt.Errorf("mount: restore fs layer entries: %w", err)
 		}
 	}
 
@@ -1299,15 +1329,30 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 }
 
 func layerEntryFetchMaxSeq(entry *client.FSLayerEntry, hasCheckpoint bool, checkpointMaxSeq int64) *int64 {
-	if entry != nil && entry.EntrySeq > 0 {
-		seq := entry.EntrySeq
-		return &seq
-	}
+	// Checkpoint restores must stay pinned to the checkpoint tip. Ancestor
+	// rows can carry a larger entry_seq than the child tip; using that seq
+	// against the child layer would leak later child writes into the view.
 	if hasCheckpoint {
 		seq := checkpointMaxSeq
 		return &seq
 	}
+	if entry != nil && entry.EntrySeq > 0 {
+		seq := entry.EntrySeq
+		return &seq
+	}
 	return nil
+}
+
+func fsLayerMountStateAllowed(state string, checkpoint bool) bool {
+	if checkpoint {
+		switch state {
+		case "active", "sealed", "committed":
+			return true
+		default:
+			return false
+		}
+	}
+	return state == "active"
 }
 
 func getLayerEntryForRestore(ctx context.Context, c *client.Client, layerID, path string, maxSeq *int64) (*client.FSLayerEntry, error) {
@@ -1329,9 +1374,9 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 		}
 		fullEntry = fetched
 	}
-	targetRemote := strings.TrimSpace(fullEntry.ContentText)
+	targetRemote := fullEntry.ContentText
 	if targetRemote == "" && len(fullEntry.Content) > 0 {
-		targetRemote = strings.TrimSpace(string(fullEntry.Content))
+		targetRemote = string(fullEntry.Content)
 	}
 	if targetRemote == "" {
 		return fmt.Errorf("restore fs layer rename entry %s: missing target", entry.Path)

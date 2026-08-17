@@ -38,13 +38,19 @@ func Layer(c *client.Client, args []string) error {
 		return LayerRollback(c, args[1:])
 	case "commit":
 		return LayerCommit(c, args[1:])
+	case "fork":
+		return LayerFork(c, args[1:])
+	case "chain":
+		return LayerChain(c, args[1:])
+	case "delete", "rm":
+		return LayerDelete(c, args[1:])
 	default:
 		return fmt.Errorf("unknown fs layer command %q", args[0])
 	}
 }
 
 func layerUsage() string {
-	return "usage: drive9 fs layer <create|list|status|diff|checkpoint|rollback|commit>"
+	return "usage: drive9 fs layer <create|list|status|diff|checkpoint|rollback|commit|fork|chain|delete>"
 }
 
 func LayerCreate(c *client.Client, args []string) error {
@@ -153,6 +159,12 @@ func LayerStatus(c *client.Client, args []string) error {
 	_, _ = fmt.Fprintf(tw, "base_root\t%s\n", layer.BaseRootPath)
 	_, _ = fmt.Fprintf(tw, "name\t%s\n", layer.Name)
 	_, _ = fmt.Fprintf(tw, "durable_seq\t%d\n", layer.DurableSeq)
+	if layer.ParentLayerID != "" {
+		_, _ = fmt.Fprintf(tw, "parent_layer_id\t%s\n", layer.ParentLayerID)
+		_, _ = fmt.Fprintf(tw, "origin_seq\t%d\n", layer.OriginSeq)
+		_, _ = fmt.Fprintf(tw, "depth\t%d\n", layer.Depth)
+		_, _ = fmt.Fprintf(tw, "root_layer_id\t%s\n", layer.RootLayerID)
+	}
 	if layer.ActorID != "" {
 		_, _ = fmt.Fprintf(tw, "actor\t%s\n", layer.ActorID)
 	}
@@ -257,6 +269,89 @@ func LayerCommit(c *client.Client, args []string) error {
 		return err
 	}
 	_, _ = fmt.Fprintf(os.Stdout, "%s layer=%s applied=%d\n", result.Status, result.LayerID, result.Applied)
+	return nil
+}
+
+func LayerFork(c *client.Client, args []string) error {
+	fs := flag.NewFlagSet("fs layer fork", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	layerID := fs.String("id", "", "child layer id")
+	name := fs.String("name", "", "child layer name")
+	checkpoint := fs.String("checkpoint", "", "pin to parent checkpoint id")
+	actor := fs.String("actor", "", "actor id")
+	asJSON := fs.Bool("json", false, "print JSON")
+	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return printLayerHelp(fs, "usage: drive9 fs layer fork [flags] <parent-layer>")
+		}
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: drive9 fs layer fork [flags] <parent-layer>")
+	}
+	child, err := c.ForkFSLayer(context.Background(), fs.Arg(0), client.FSLayerForkRequest{
+		LayerID:      *layerID,
+		Name:         *name,
+		ActorID:      *actor,
+		CheckpointID: *checkpoint,
+	})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		return enc.Encode(child)
+	}
+	_, _ = fmt.Fprintln(os.Stdout, child.LayerID)
+	return nil
+}
+
+func LayerChain(c *client.Client, args []string) error {
+	fs := flag.NewFlagSet("fs layer chain", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	asJSON := fs.Bool("json", false, "print JSON")
+	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return printLayerHelp(fs, "usage: drive9 fs layer chain [flags] <layer>")
+		}
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: drive9 fs layer chain [flags] <layer>")
+	}
+	chain, err := c.ListFSLayerChain(context.Background(), fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		return enc.Encode(map[string]any{"chain": chain})
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	for _, frame := range chain {
+		_, _ = fmt.Fprintf(tw, "%s\tdepth=%d\torigin_seq=%d\tlimit=%d\t%s\t%s\n",
+			frame.LayerID, frame.Depth, frame.OriginSeq, frame.LimitSeq, frame.State, frame.Name)
+	}
+	return tw.Flush()
+}
+
+func LayerDelete(c *client.Client, args []string) error {
+	fs := flag.NewFlagSet("fs layer delete", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cascade := fs.Bool("cascade", false, "abandon descendant layers first")
+	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return printLayerHelp(fs, "usage: drive9 fs layer delete [flags] <layer>")
+		}
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: drive9 fs layer delete [flags] <layer>")
+	}
+	if err := c.DeleteFSLayer(context.Background(), fs.Arg(0), *cascade); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintln(os.Stdout, "ok")
 	return nil
 }
 

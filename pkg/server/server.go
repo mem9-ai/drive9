@@ -1675,12 +1675,21 @@ func isScopedFSLayerRouteAllowed(method, path string, query url.Values) bool {
 	parts := strings.Split(rest, "/")
 	switch len(parts) {
 	case 1:
-		return method == http.MethodGet && len(query) == 0
+		// GET status or DELETE (logical abandon; cascade query optional)
+		if method == http.MethodGet {
+			return len(query) == 0
+		}
+		if method == http.MethodDelete {
+			return queryKeysSubsetOf(query, []string{"cascade"})
+		}
+		return false
 	case 2:
 		switch parts[1] {
 		case "diff":
 			return method == http.MethodGet && queryKeysSubsetOf(query, []string{"max_seq", "replay", "mode"})
-		case "checkpoints", "rollback", "commit":
+		case "chain":
+			return method == http.MethodGet && len(query) == 0
+		case "fork", "checkpoints", "rollback", "commit":
 			return method == http.MethodPost && len(query) == 0
 		case "entries":
 			if method == http.MethodGet {
@@ -6382,7 +6391,12 @@ func resolveSearchLayerEntries(ctx context.Context, b *backend.Dat9Backend, laye
 	default:
 		return nil, nil, fmt.Errorf("fs layer %s is %s", layer.LayerID, layer.State)
 	}
-	entries, err := b.Store().ListFSLayerEntries(ctx, layer.LayerID)
+	var entries []datastore.FSLayerEntry
+	if layer.HasParent() {
+		entries, err = b.Store().ListFSLayerChainMergedEntries(ctx, layer.LayerID)
+	} else {
+		entries, err = b.Store().ListFSLayerEntries(ctx, layer.LayerID)
+	}
 	if err != nil {
 		return nil, nil, err
 	}

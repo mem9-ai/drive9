@@ -448,6 +448,14 @@ func ExampleClient_eventsLayersGitAndJournal() {
 		checkpoint, err := c.CheckpointFSLayer(ctx, layer.LayerID, drive9.FSLayerCheckpointRequest{Label: "before-commit"})
 		if err == nil {
 			_, _ = c.GetFSLayerCheckpoint(ctx, checkpoint.CheckpointID)
+			child, err := c.ForkFSLayer(ctx, layer.LayerID, drive9.FSLayerForkRequest{
+				Name:         "agent-a-child",
+				CheckpointID: checkpoint.CheckpointID,
+			})
+			if err == nil {
+				_, _ = c.ListFSLayerChain(ctx, child.LayerID)
+				_ = c.DeleteFSLayer(ctx, child.LayerID, true)
+			}
 		}
 		_, _ = c.ListFSLayerEvents(ctx, layer.LayerID, 0)
 		_ = c.RollbackFSLayer(ctx, layer.LayerID)
@@ -597,6 +605,7 @@ var coveredClientMethods = map[string]bool{
 	"CreateFile":                           true,
 	"CreateFileCtx":                        true,
 	"CreateFSLayer":                        true,
+	"DeleteFSLayer":                        true,
 	"CreateJournal":                        true,
 	"CreateVaultSecret":                    true,
 	"Delete":                               true,
@@ -606,6 +615,7 @@ var coveredClientMethods = map[string]bool{
 	"DeleteGitWorkspace":                   true,
 	"DeleteVaultSecret":                    true,
 	"DiffFSLayer":                          true,
+	"ForkFSLayer":                          true,
 	"DiffFSLayerAtSeq":                     true,
 	"DownloadDir":                          true,
 	"DownloadDirCtx":                       true,
@@ -631,6 +641,7 @@ var coveredClientMethods = map[string]bool{
 	"IssueVaultToken":                      true,
 	"List":                                 true,
 	"ListCtx":                              true,
+	"ListFSLayerChain":                     true,
 	"ListFSLayerEvents":                    true,
 	"ListFSLayers":                         true,
 	"ListGitObjectPacks":                   true,

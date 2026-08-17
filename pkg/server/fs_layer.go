@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -36,17 +37,30 @@ type fsLayerCreateRequest struct {
 }
 
 type fsLayerResponse struct {
-	LayerID        string            `json:"layer_id"`
-	BaseRootPath   string            `json:"base_root_path"`
-	Name           string            `json:"name"`
-	Tags           map[string]string `json:"tags,omitempty"`
-	State          string            `json:"state"`
-	DurabilityMode string            `json:"durability_mode"`
-	ActorID        string            `json:"actor_id"`
-	DurableSeq     int64             `json:"durable_seq"`
-	CreatedAt      time.Time         `json:"created_at"`
-	UpdatedAt      time.Time         `json:"updated_at"`
-	SealedAt       *time.Time        `json:"sealed_at,omitempty"`
+	LayerID            string            `json:"layer_id"`
+	BaseRootPath       string            `json:"base_root_path"`
+	Name               string            `json:"name"`
+	Tags               map[string]string `json:"tags,omitempty"`
+	State              string            `json:"state"`
+	DurabilityMode     string            `json:"durability_mode"`
+	ActorID            string            `json:"actor_id"`
+	DurableSeq         int64             `json:"durable_seq"`
+	ParentLayerID      string            `json:"parent_layer_id,omitempty"`
+	OriginSeq          int64             `json:"origin_seq,omitempty"`
+	OriginCheckpointID string            `json:"origin_checkpoint_id,omitempty"`
+	RootLayerID        string            `json:"root_layer_id,omitempty"`
+	Depth              int               `json:"depth,omitempty"`
+	Origin             string            `json:"origin,omitempty"`
+	CreatedAt          time.Time         `json:"created_at"`
+	UpdatedAt          time.Time         `json:"updated_at"`
+	SealedAt           *time.Time        `json:"sealed_at,omitempty"`
+}
+
+type fsLayerForkRequest struct {
+	LayerID      string `json:"layer_id,omitempty"`
+	Name         string `json:"name,omitempty"`
+	ActorID      string `json:"actor_id,omitempty"`
+	CheckpointID string `json:"checkpoint_id,omitempty"`
 }
 
 type fsLayerEntryResponse struct {
@@ -309,6 +323,37 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 	layerID := layer.LayerID
 	switch {
 	case !hasSub:
+		switch r.Method {
+		case http.MethodGet:
+			if !authorizeFS(w, r, FSOpRead, layer.BaseRootPath) {
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(toFSLayerResponse(layer))
+		case http.MethodDelete:
+			if !authorizeFS(w, r, FSOpWrite, layer.BaseRootPath) {
+				return
+			}
+			cascade := strings.EqualFold(r.URL.Query().Get("cascade"), "true") || r.URL.Query().Get("cascade") == "1"
+			if err := store.DeleteFSLayer(r.Context(), layerID, datastore.DeleteFSLayerOptions{Cascade: cascade}); err != nil {
+				writeFSLayerStoreError(w, r, err)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "abandoned", "layer_id": layerID})
+		default:
+			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+	case sub == "fork":
+		if r.Method != http.MethodPost {
+			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if !authorizeFS(w, r, FSOpWrite, layer.BaseRootPath) {
+			return
+		}
+		s.handleFSLayerFork(w, r, store, layer)
+	case sub == "chain":
 		if r.Method != http.MethodGet {
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -316,8 +361,7 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 		if !authorizeFS(w, r, FSOpRead, layer.BaseRootPath) {
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(toFSLayerResponse(layer))
+		s.handleFSLayerChain(w, r, store, layer)
 	case sub == "diff":
 		if r.Method != http.MethodGet {
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -333,7 +377,19 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 		}
 		var entries []datastore.FSLayerEntry
 		replayLog := fsLayerReplayLogFromRequest(r)
-		if replayLog && hasMaxSeq {
+		// Chain-aware: child layers merge parent@origin_seq (D8). max_seq
+		// only caps the tip layer; ancestors stay pin-limited.
+		if layer.HasParent() {
+			if replayLog && hasMaxSeq {
+				entries, err = store.ListFSLayerChainEffectiveLogAtSeq(r.Context(), layerID, maxSeq)
+			} else if replayLog {
+				entries, err = store.ListFSLayerChainEffectiveLog(r.Context(), layerID)
+			} else if hasMaxSeq {
+				entries, err = store.ListFSLayerChainMergedEntriesAtSeq(r.Context(), layerID, maxSeq)
+			} else {
+				entries, err = store.ListFSLayerChainMergedEntries(r.Context(), layerID)
+			}
+		} else if replayLog && hasMaxSeq {
 			entries, err = store.ListFSLayerEntryLogAtSeq(r.Context(), layerID, maxSeq)
 		} else if replayLog {
 			entries, err = store.ListFSLayerEntryLog(r.Context(), layerID)
@@ -445,37 +501,80 @@ func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request,
 	if !authorizeFS(w, r, FSOpRead, path) {
 		return
 	}
-	maxSeq := parseFSLayerInt64Query(r, "max_seq")
-	var (
-		entry *datastore.FSLayerEntry
-	)
-	if maxSeq > 0 {
-		entry, err = store.GetFSLayerEntryAtSeq(r.Context(), layer.LayerID, path, maxSeq)
-	} else {
-		entry, err = store.GetFSLayerEntry(r.Context(), layer.LayerID, path)
+	maxSeq, hasMaxSeq, err := fsLayerMaxSeqFromRequest(r)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
 	}
+	entry, hit, err := resolveFSLayerObjectEntry(r.Context(), store, layer, path, maxSeq, hasMaxSeq)
 	if err != nil {
 		writeFSLayerStoreError(w, r, err)
 		return
 	}
-	if entry.Op != datastore.FSLayerEntryOpUpsert || entry.Kind != datastore.FSLayerEntryKindFile {
-		errJSON(w, http.StatusBadRequest, "fs layer object path is not a file upsert")
+	if hit {
+		if entry.Op == datastore.FSLayerEntryOpWhiteout {
+			errJSON(w, http.StatusNotFound, "not found")
+			return
+		}
+		if entry.Op != datastore.FSLayerEntryOpUpsert || entry.Kind != datastore.FSLayerEntryKindFile {
+			errJSON(w, http.StatusBadRequest, "fs layer object path is not a file upsert")
+			return
+		}
+		rc, err := b.OpenFSLayerEntryData(r.Context(), entry)
+		if err != nil {
+			logger.Error(r.Context(), "fs_layer_object_read_failed", eventFields(r.Context(), "fs_layer_object_read_failed", "path", entry.Path, "error", err)...)
+			writeBackendError(w, r, err)
+			return
+		}
+		defer func() { _ = rc.Close() }()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if entry.SizeBytes > 0 || (entry.SizeBytes == 0 && len(entry.ContentBlob) == 0) {
+			w.Header().Set("Content-Length", strconv.FormatInt(entry.SizeBytes, 10))
+		}
+		if _, err := io.Copy(w, rc); err != nil {
+			return
+		}
 		return
 	}
-	rc, err := b.OpenFSLayerEntryData(r.Context(), entry)
+	// MISS → live main (D7 / §5.6.2). Whiteout already returned 404 above.
+	data, err := b.ReadCtx(r.Context(), path, 0, -1)
+	if errors.Is(err, datastore.ErrNotFound) {
+		errJSON(w, http.StatusNotFound, "not found")
+		return
+	}
 	if err != nil {
-		logger.Error(r.Context(), "fs_layer_object_read_failed", eventFields(r.Context(), "fs_layer_object_read_failed", "path", entry.Path, "error", err)...)
 		writeBackendError(w, r, err)
 		return
 	}
-	defer func() { _ = rc.Close() }()
 	w.Header().Set("Content-Type", "application/octet-stream")
-	if entry.SizeBytes > 0 || (entry.SizeBytes == 0 && len(entry.ContentBlob) == 0) {
-		w.Header().Set("Content-Length", strconv.FormatInt(entry.SizeBytes, 10))
+	w.Header().Set("Content-Length", strconv.FormatInt(int64(len(data)), 10))
+	_, _ = w.Write(data)
+}
+
+func resolveFSLayerObjectEntry(ctx context.Context, store *datastore.Store, layer *datastore.FSLayer, path string, maxSeq int64, hasMaxSeq bool) (*datastore.FSLayerEntry, bool, error) {
+	if layer.HasParent() {
+		var tipMax *int64
+		if hasMaxSeq {
+			tipMax = &maxSeq
+		}
+		return store.ResolveFSLayerPathAtSeq(ctx, layer.LayerID, path, tipMax)
 	}
-	if _, err := io.Copy(w, rc); err != nil {
-		return
+	var (
+		entry *datastore.FSLayerEntry
+		err   error
+	)
+	if hasMaxSeq {
+		entry, err = store.GetFSLayerEntryAtSeq(ctx, layer.LayerID, path, maxSeq)
+	} else {
+		entry, err = store.GetFSLayerEntry(ctx, layer.LayerID, path)
 	}
+	if errors.Is(err, datastore.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return entry, true, nil
 }
 
 func (s *Server) handleFSLayerObjectUpload(w http.ResponseWriter, r *http.Request, b *backendpkg.Dat9Backend, store *datastore.Store, layer *datastore.FSLayer) {
@@ -679,17 +778,96 @@ func (s *Server) handleFSLayerEntryGet(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 	var entry *datastore.FSLayerEntry
-	if hasMaxSeq {
+	if layer.HasParent() {
+		var tipMax *int64
+		if hasMaxSeq {
+			tipMax = &maxSeq
+		}
+		var hit bool
+		entry, hit, err = store.ResolveFSLayerPathAtSeq(r.Context(), layer.LayerID, path, tipMax)
+		if err != nil {
+			writeFSLayerStoreError(w, r, err)
+			return
+		}
+		if !hit {
+			errJSON(w, http.StatusNotFound, "not found")
+			return
+		}
+	} else if hasMaxSeq {
 		entry, err = store.GetFSLayerEntryAtSeq(r.Context(), layer.LayerID, path, maxSeq)
+		if err != nil {
+			writeFSLayerStoreError(w, r, err)
+			return
+		}
 	} else {
 		entry, err = store.GetFSLayerEntry(r.Context(), layer.LayerID, path)
+		if err != nil {
+			writeFSLayerStoreError(w, r, err)
+			return
+		}
 	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(toFSLayerEntryResponse(entry, true))
+}
+
+func (s *Server) handleFSLayerFork(w http.ResponseWriter, r *http.Request, store *datastore.Store, parent *datastore.FSLayer) {
+	defer func() { _ = r.Body.Close() }()
+	var req fsLayerForkRequest
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxFSLayerBodyBytes)).Decode(&req); err != nil {
+			errJSON(w, http.StatusBadRequest, "malformed JSON")
+			return
+		}
+	}
+	childID := strings.TrimSpace(req.LayerID)
+	if childID == "" {
+		childID = journal.NewID("layer")
+	}
+	actorID := strings.TrimSpace(req.ActorID)
+	if actorID == "" {
+		actorID = strings.TrimSpace(r.Header.Get("X-Dat9-Actor"))
+	}
+	child, err := store.ForkFSLayer(r.Context(), datastore.FSLayerForkOptions{
+		ChildLayerID:  childID,
+		ParentLayerID: parent.LayerID,
+		Name:          req.Name,
+		ActorID:       actorID,
+		CheckpointID:  req.CheckpointID,
+	})
 	if err != nil {
 		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(toFSLayerEntryResponse(entry, true))
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(toFSLayerResponse(child))
+}
+
+func (s *Server) handleFSLayerChain(w http.ResponseWriter, r *http.Request, store *datastore.Store, layer *datastore.FSLayer) {
+	frames, err := store.ListFSLayerChain(r.Context(), layer.LayerID)
+	if err != nil {
+		writeFSLayerStoreError(w, r, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(frames))
+	for _, f := range frames {
+		item := map[string]any{
+			"layer_id":             f.Layer.LayerID,
+			"name":                 f.Layer.Name,
+			"state":                string(f.Layer.State),
+			"parent_layer_id":      f.Layer.ParentLayerID,
+			"origin_seq":           f.Layer.OriginSeq,
+			"origin_checkpoint_id": f.Layer.OriginCheckpointID,
+			"depth":                f.Layer.Depth,
+			"root_layer_id":        f.Layer.RootLayerID,
+			"base_root_path":       f.Layer.BaseRootPath,
+			"created_at":           f.Layer.CreatedAt,
+			"limit_seq":            f.LimitSeq,
+		}
+		out = append(out, item)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"chain": out})
 }
 
 func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *backendpkg.Dat9Backend, store *datastore.Store, layer *datastore.FSLayer) {
@@ -709,7 +887,21 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		writeFSLayerStoreError(w, r, err)
 		return
 	}
-	entries, err := store.ListFSLayerEntryLog(r.Context(), layer.LayerID)
+	// Child: flatten overlay then diff vs live main (D18/D19).
+	// Root: keep V1 ordered log replay.
+	var (
+		entries []datastore.FSLayerEntry
+		err     error
+	)
+	if layer.HasParent() {
+		var overlay map[string]datastore.FSLayerOverlayNode
+		overlay, err = store.MaterializeFSLayerOverlay(r.Context(), layer.LayerID, nil)
+		if err == nil {
+			entries, err = planFSLayerCommitVsMain(r.Context(), b, overlay)
+		}
+	} else {
+		entries, err = store.ListFSLayerEntryLog(r.Context(), layer.LayerID)
+	}
 	if err != nil {
 		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		writeFSLayerStoreError(w, r, err)
@@ -1167,6 +1359,247 @@ func removeFSLayerBasePathIfExists(ctx context.Context, b *backendpkg.Dat9Backen
 
 func isFSLayerSymlinkMode(mode uint32) bool {
 	return mode&0o170000 == 0o120000
+}
+
+// planFSLayerCommitVsMain implements D18: apply set ≡ overlay − live main.
+func planFSLayerCommitVsMain(ctx context.Context, b *backendpkg.Dat9Backend, overlay map[string]datastore.FSLayerOverlayNode) ([]datastore.FSLayerEntry, error) {
+	drafts := datastore.OverlayCommitDrafts(overlay)
+	out := make([]datastore.FSLayerEntry, 0, len(drafts))
+	for i := range drafts {
+		e := drafts[i]
+		nf, err := b.StatNodeCtx(ctx, e.Path)
+		if err != nil && !errors.Is(err, datastore.ErrNotFound) {
+			return nil, err
+		}
+		missing := errors.Is(err, datastore.ErrNotFound)
+		if e.Op == datastore.FSLayerEntryOpRename {
+			if missing {
+				dest := fsLayerRenameTarget(&e)
+				if dest != "" {
+					_, destErr := b.StatNodeCtx(ctx, dest)
+					if destErr != nil && !errors.Is(destErr, datastore.ErrNotFound) {
+						return nil, destErr
+					}
+					if destErr == nil {
+						// Source gone and dest present: rename already applied.
+						continue
+					}
+				}
+			}
+			fillFSLayerBaseSnapshot(ctx, b, &e)
+			out = append(out, e)
+			continue
+		}
+		if e.Op == datastore.FSLayerEntryOpWhiteout {
+			if missing {
+				continue
+			}
+			fillFSLayerBaseSnapshot(ctx, b, &e)
+			out = append(out, e)
+			continue
+		}
+		if e.Op == datastore.FSLayerEntryOpChmod {
+			if missing {
+				// Dest does not exist on live main yet, but a kept rename in
+				// this apply set will create it (chmod after main-backed rename).
+				if fsLayerDraftRenameCreates(drafts, e.Path) {
+					fillFSLayerBaseSnapshot(ctx, b, &e)
+					out = append(out, e)
+				}
+				continue
+			}
+			if overlayNodeModeMatches(nf, e.Mode) {
+				continue
+			}
+			fillFSLayerBaseSnapshot(ctx, b, &e)
+			out = append(out, e)
+			continue
+		}
+		if e.Kind == datastore.FSLayerEntryKindDir || e.Op == datastore.FSLayerEntryOpMkdir {
+			if fsLayerDraftRenameVacates(drafts, e.Path) {
+				// mv dir new; mkdir dir — live main still has the old dir.
+				fillFSLayerBaseSnapshot(ctx, b, &e)
+				out = append(out, e)
+				continue
+			}
+			if !missing && nf.Node.IsDirectory {
+				if overlayNodeModeMatches(nf, e.Mode) {
+					continue
+				}
+				e.Op = datastore.FSLayerEntryOpChmod
+				fillFSLayerBaseSnapshot(ctx, b, &e)
+				out = append(out, e)
+				continue
+			}
+			fillFSLayerBaseSnapshot(ctx, b, &e)
+			out = append(out, e)
+			continue
+		}
+		if e.Op == datastore.FSLayerEntryOpSymlink || e.Kind == datastore.FSLayerEntryKindSymlink {
+			if !missing && !fsLayerDraftRenameVacates(drafts, e.Path) {
+				same, serr := fsLayerSymlinkMatchesMain(ctx, b, &e)
+				if serr != nil {
+					return nil, serr
+				}
+				if same {
+					continue
+				}
+			}
+			fillFSLayerBaseSnapshot(ctx, b, &e)
+			out = append(out, e)
+			continue
+		}
+		if !missing && nf.File != nil && !fsLayerDraftRenameVacates(drafts, e.Path) {
+			if fsLayerOverlayMatchesMain(&e, nf) {
+				continue
+			}
+			same, cmpErr := fsLayerInlineBlobMatchesMain(ctx, b, &e, nf)
+			if cmpErr != nil {
+				return nil, cmpErr
+			}
+			if same {
+				continue
+			}
+		}
+		fillFSLayerBaseSnapshot(ctx, b, &e)
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+func fsLayerDraftRenameVacates(drafts []datastore.FSLayerEntry, path string) bool {
+	if path == "" {
+		return false
+	}
+	for i := range drafts {
+		if drafts[i].Op == datastore.FSLayerEntryOpRename && drafts[i].Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+func fsLayerDraftRenameCreates(drafts []datastore.FSLayerEntry, path string) bool {
+	if path == "" {
+		return false
+	}
+	for i := range drafts {
+		if drafts[i].Op != datastore.FSLayerEntryOpRename {
+			continue
+		}
+		dest := fsLayerRenameTarget(&drafts[i])
+		if dest == path {
+			return true
+		}
+		destPath, err := canonicalFSLayerServerPath(dest, "", string(drafts[i].Kind))
+		if err == nil && destPath == path {
+			return true
+		}
+	}
+	return false
+}
+
+func overlayNodeModeMatches(nf *datastore.NodeWithFile, mode uint32) bool {
+	if nf == nil || mode == 0 {
+		return true
+	}
+	cur := nf.Mode
+	if nf.File != nil && nf.File.Mode != 0 {
+		cur = nf.File.Mode
+	}
+	return cur&0o777 == mode&0o777
+}
+
+func fsLayerOverlayMatchesMain(e *datastore.FSLayerEntry, nf *datastore.NodeWithFile) bool {
+	if e == nil || nf == nil || nf.File == nil {
+		return false
+	}
+	if e.Kind == datastore.FSLayerEntryKindDir || nf.Node.IsDirectory {
+		return false
+	}
+	if e.Op == datastore.FSLayerEntryOpSymlink || e.Kind == datastore.FSLayerEntryKindSymlink {
+		return false // compared via already-applied / ReadCtx in caller if needed
+	}
+	if e.ChecksumSHA256 != "" && nf.File.ChecksumSHA256 != "" && e.ChecksumSHA256 != nf.File.ChecksumSHA256 {
+		return false
+	}
+	if e.SizeBytes > 0 && nf.File.SizeBytes != e.SizeBytes {
+		return false
+	}
+	if e.StorageRef != "" && nf.File.StorageRef != "" && e.StorageRef != nf.File.StorageRef {
+		return false
+	}
+	if e.ChecksumSHA256 == "" && e.StorageRef == "" && len(e.ContentBlob) > 0 {
+		if int64(len(e.ContentBlob)) != nf.File.SizeBytes {
+			return false
+		}
+	}
+	if e.Mode != 0 && !overlayNodeModeMatches(nf, e.Mode) {
+		return false
+	}
+	// Require at least one positive identity signal so empty overlay
+	// entries are not treated as equal to an existing main file.
+	if e.ChecksumSHA256 == "" && e.StorageRef == "" && len(e.ContentBlob) == 0 {
+		return false
+	}
+	if e.ChecksumSHA256 != "" && nf.File.ChecksumSHA256 == e.ChecksumSHA256 {
+		return true
+	}
+	if e.StorageRef != "" && nf.File.StorageRef == e.StorageRef && e.SizeBytes == nf.File.SizeBytes {
+		return true
+	}
+	return false
+}
+
+func fsLayerInlineBlobMatchesMain(ctx context.Context, b *backendpkg.Dat9Backend, e *datastore.FSLayerEntry, nf *datastore.NodeWithFile) (bool, error) {
+	if b == nil || e == nil || nf == nil || nf.File == nil || len(e.ContentBlob) == 0 {
+		return false, nil
+	}
+	if e.ChecksumSHA256 != "" || e.StorageRef != "" {
+		return false, nil
+	}
+	if !overlayNodeModeMatches(nf, e.Mode) {
+		return false, nil
+	}
+	data, err := b.ReadCtx(ctx, e.Path, 0, -1)
+	if errors.Is(err, datastore.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(data, e.ContentBlob), nil
+}
+
+func fsLayerSymlinkMatchesMain(ctx context.Context, b *backendpkg.Dat9Backend, e *datastore.FSLayerEntry) (bool, error) {
+	if b == nil || e == nil {
+		return false, nil
+	}
+	nf, err := b.StatNodeCtx(ctx, e.Path)
+	if errors.Is(err, datastore.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if nf.File == nil || !isFSLayerSymlinkMode(nf.File.Mode) {
+		return false, nil
+	}
+	want := e.ContentText
+	if want == "" && len(e.ContentBlob) > 0 {
+		want = string(e.ContentBlob)
+	}
+	if want == "" {
+		return false, nil
+	}
+	data, err := b.ReadCtx(ctx, e.Path, 0, -1)
+	if errors.Is(err, datastore.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return string(data) == want, nil
 }
 
 func fillFSLayerBaseSnapshot(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) {
@@ -1672,23 +2105,37 @@ func writeFSLayerStoreError(w http.ResponseWriter, r *http.Request, err error) {
 		errJSON(w, http.StatusConflict, err.Error())
 		return
 	}
+	if errors.Is(err, datastore.ErrFSLayerDepthExceeded) {
+		errJSON(w, http.StatusConflict, err.Error())
+		return
+	}
+	if errors.Is(err, datastore.ErrFSLayerHasChildren) {
+		errJSON(w, http.StatusConflict, err.Error())
+		return
+	}
 	logger.Error(r.Context(), "fs_layer_store_error", eventFields(r.Context(), "fs_layer_store_error", "error", err)...)
 	writeBackendError(w, r, err)
 }
 
 func toFSLayerResponse(layer *datastore.FSLayer) fsLayerResponse {
 	return fsLayerResponse{
-		LayerID:        layer.LayerID,
-		BaseRootPath:   layer.BaseRootPath,
-		Name:           layer.Name,
-		Tags:           layer.Tags,
-		State:          string(layer.State),
-		DurabilityMode: string(layer.DurabilityMode),
-		ActorID:        layer.ActorID,
-		DurableSeq:     layer.DurableSeq,
-		CreatedAt:      layer.CreatedAt,
-		UpdatedAt:      layer.UpdatedAt,
-		SealedAt:       layer.SealedAt,
+		LayerID:            layer.LayerID,
+		BaseRootPath:       layer.BaseRootPath,
+		Name:               layer.Name,
+		Tags:               layer.Tags,
+		State:              string(layer.State),
+		DurabilityMode:     string(layer.DurabilityMode),
+		ActorID:            layer.ActorID,
+		DurableSeq:         layer.DurableSeq,
+		ParentLayerID:      layer.ParentLayerID,
+		OriginSeq:          layer.OriginSeq,
+		OriginCheckpointID: layer.OriginCheckpointID,
+		RootLayerID:        layer.RootLayerID,
+		Depth:              layer.Depth,
+		Origin:             layer.Origin,
+		CreatedAt:          layer.CreatedAt,
+		UpdatedAt:          layer.UpdatedAt,
+		SealedAt:           layer.SealedAt,
 	}
 }
 

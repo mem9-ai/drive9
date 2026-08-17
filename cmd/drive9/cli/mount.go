@@ -431,6 +431,10 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if strings.TrimSpace(*checkpointRef) != "" && strings.TrimSpace(*layerRef) == "" {
 		return fmt.Errorf("drive9 mount: --checkpoint requires --layer")
 	}
+	// D10: --checkpoint is a read-only restore view.
+	if strings.TrimSpace(*checkpointRef) != "" {
+		*readOnly = true
+	}
 
 	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
 	if err != nil {
