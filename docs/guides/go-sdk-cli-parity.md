@@ -65,6 +65,7 @@ exported `*client.Client` method and every exported `StreamWriter` method.
 | `journal new/append/cat/find/verify` | flag parsing, JSONL/stdin parsing, idempotency-key defaults, human/JSON output | SDK has journal API methods | No SDK helper for CLI input/output formats. |
 | `git clone --fast` | local `git` orchestration, worktree setup, GitHub tree-size enrichment, local `.git` archiving, hydration | SDK has server-side git workspace/tree/state/object/overlay APIs | No SDK one-shot fast-clone workflow. |
 | remote context syntax | `ctxname:/path` arguments in fs commands | CLI-only | SDK methods accept already-resolved server/client and drive9 path. |
+| multi-backend URIs | `:/` ≡ `drive9://`; `s3://` / `cos://` / `tos://` / `oss://` / `gs://` / `az://` on `fs cp/ls/stat/cat/rm/mkdir` and `drive9 mount`. Credentials come from each cloud's own chain (AWS profile/env/role, 腾讯/火山/阿里 env, GCP ADC, Azure env/CLI/MSI). | CLI-only (`pkg/objectfs` for object I/O and mount) | SDK remains HTTP `/v1/fs` only. Object-store traffic does not go through drive9-server. |
 
 ## SDK ergonomics gaps not strictly tied to CLI
 

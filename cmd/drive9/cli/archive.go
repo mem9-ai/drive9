@@ -95,7 +95,14 @@ func Archive(c *client.Client, args []string) error {
 
 	// Resolve source remote dir.
 	srcArg := positionals[0]
-	srcRP, isRemote := ParseRemote(srcArg)
+	srcLoc, err := Parse(srcArg)
+	if err != nil {
+		return err
+	}
+	if srcLoc.Kind == KindObject {
+		return fmt.Errorf("archive: object-store URIs are not supported")
+	}
+	srcRP, isRemote := locationAsRemotePath(srcLoc)
 	if !isRemote {
 		return fmt.Errorf("archive source must be a remote path (got %q); use drive9 pack for local→remote archiving", srcArg)
 	}

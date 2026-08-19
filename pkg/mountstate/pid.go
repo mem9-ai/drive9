@@ -56,6 +56,7 @@ const (
 	MountKindFUSE   = "fuse"
 	MountKindVault  = "vault"
 	MountKindWebDAV = "webdav"
+	MountKindObject = "object"
 )
 
 func PIDFilePath(mountPoint string) string {

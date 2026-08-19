@@ -50,8 +50,7 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 		return fmt.Errorf("--length must be >= 0")
 	}
 	path := fs.Arg(0)
-	var err error
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
 	}
@@ -59,9 +58,9 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 		rc io.ReadCloser
 	)
 	if offsetSet {
-		rc, err = c.ReadStreamRange(context.Background(), path, *offset, *length)
+		rc, err = h.Backend.OpenReadRange(context.Background(), h.Loc, *offset, *length)
 	} else {
-		rc, err = c.ReadStream(context.Background(), path)
+		rc, err = h.Backend.OpenRead(context.Background(), h.Loc)
 	}
 	if err != nil {
 		return err

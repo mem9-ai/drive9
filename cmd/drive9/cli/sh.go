@@ -48,6 +48,10 @@ func Sh(c *client.Client, _ []string) error {
 		case "cd":
 			dir := "/"
 			if len(args) > 0 {
+				if loc, err := Parse(args[0]); err == nil && loc.Kind == KindObject {
+					fmt.Fprintln(os.Stderr, "cd: object-store URIs are not supported in fs sh")
+					continue
+				}
 				dir = resolve(cwd, args[0])
 			}
 			// Verify the path exists and is a directory
@@ -94,8 +98,7 @@ func Sh(c *client.Client, _ []string) error {
 				fmt.Fprintln(os.Stderr, "usage: cp <src> <dst>")
 				continue
 			}
-			// In shell mode, all paths are remote — add ":" prefix for Cp
-			if err := Cp(c, []string{":" + resolve(cwd, args[0]), ":" + resolve(cwd, args[1])}); err != nil {
+			if err := Cp(c, []string{shCPArg(cwd, args[0]), shCPArg(cwd, args[1])}); err != nil {
 				fmt.Fprintf(os.Stderr, "cp: %v\n", err)
 			}
 
@@ -143,10 +146,22 @@ func Sh(c *client.Client, _ []string) error {
 
 // resolve resolves a path relative to the current working directory.
 // Handles ":" prefixed remote paths like cp command (fixes issue #19).
+func shCPArg(cwd, path string) string {
+	if loc, err := Parse(path); err == nil && loc.Kind == KindObject {
+		return path
+	}
+	return ":" + resolve(cwd, path)
+}
+
 func resolve(cwd, path string) string {
 	// Handle ":" prefixed remote paths
-	if rp, isRemote := ParseRemote(path); isRemote {
-		return rp.Path
+	if loc, err := Parse(path); err == nil {
+		if loc.Kind == KindObject {
+			return path
+		}
+		if loc.Kind == KindDrive9 {
+			return loc.Path
+		}
 	}
 	if strings.HasPrefix(path, "/") {
 		return path

@@ -143,7 +143,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	restartBackoffMax := fs.Duration("restart-backoff-max", 30*time.Second, "supervisor max restart backoff")
 	alertWebhook := fs.String("alert-webhook", "", "optional webhook for mount restart/give-up alerts")
 	alertFile := fs.String("alert-file", "", "optional file for mount alert events")
-	cacheDir := fs.String("cache-dir", "", "write-back cache directory (default ~/.cache/drive9)")
+	cacheDir := fs.String("cache-dir", "", "write-back cache directory for drive9 and object mounts (default ~/.cache/drive9)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
 	readCacheMaxFile := fs.Int64("read-cache-max-file-mb", 4, "maximum single file size admitted to read cache in MB; files at or below this size are fetched with a single whole-file request")
 	readCacheTTL := fs.Duration("read-cache-ttl", 30*time.Second, "read cache TTL; 0 disables time-based expiry")
@@ -201,7 +201,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	perfAddr := fs.String("perf-addr", "", "serve live pprof on this address, e.g. 127.0.0.1:6060")
 
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: drive9 mount [flags] [:/remote] <mountpoint>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: drive9 mount [flags] [:/remote|s3://bucket/prefix/|gs://bucket/prefix/|az://container/prefix/] <mountpoint>\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 
@@ -209,25 +209,72 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		return err
 	}
 
-	// Parse positional args: 1-arg = mountpoint; 2-arg = :/remote mountpoint.
+	// Parse positional args: 1-arg = mountpoint; 2-arg = remote mountpoint.
 	var remoteRoot, mountPoint string
+	var objectLoc *Location
 	switch fs.NArg() {
 	case 1:
 		remoteRoot = "/"
 		mountPoint = fs.Arg(0)
 	case 2:
-		rp, ok := ParseRemote(fs.Arg(0))
-		if !ok {
-			return fmt.Errorf("drive9 mount: first positional argument must be a remote source (e.g. :/path), got %q", fs.Arg(0))
+		src := fs.Arg(0)
+		loc, err := Parse(src)
+		if err != nil {
+			return fmt.Errorf("drive9 mount: %w", err)
 		}
-		if rp.Context != "" {
-			return fmt.Errorf("drive9 mount: context-scoped remote sources (e.g. %s:/path) are not yet supported", rp.Context)
+		switch loc.Kind {
+		case KindObject:
+			objectLoc = &loc
+			mountPoint = fs.Arg(1)
+		case KindDrive9:
+			if loc.Context != "" {
+				return fmt.Errorf("drive9 mount: context-scoped remote sources (e.g. %s:/path) are not yet supported", loc.Context)
+			}
+			remoteRoot = loc.Path
+			mountPoint = fs.Arg(1)
+		default:
+			return fmt.Errorf("drive9 mount: first positional argument must be a remote source (e.g. :/path, s3://bucket/prefix/, gs://bucket/prefix/, or az://container/prefix/), got %q", src)
 		}
-		remoteRoot = rp.Path
-		mountPoint = fs.Arg(1)
 	default:
 		fs.Usage()
 		os.Exit(2)
+	}
+
+	if objectLoc != nil {
+		if err := validateObjectMount(runtime.GOOS, *mode, *layerRef, *checkpointRef, *profile); err != nil {
+			return err
+		}
+		envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
+		wantSupervise := !*noSupervise && !envSuperviseOff
+		supReq := mountSuperviseStartRequest{
+			OriginalArgs:      append([]string(nil), args...),
+			MountPoint:        mountPoint,
+			RemoteRoot:        objectLoc.Raw,
+			Profile:           "none",
+			MountKind:         mountstate.MountKindObject,
+			MaxRestarts:       *maxRestarts,
+			RestartWindow:     *restartWindow,
+			HealthInterval:    *healthInterval,
+			HealthTimeout:     *healthTimeout,
+			HealthFailures:    *healthFailures,
+			StopTimeout:       *stopTimeout,
+			RestartBackoffMax: *restartBackoffMax,
+			AlertWebhook:      firstNonEmpty(*alertWebhook, os.Getenv("DRIVE9_MOUNT_ALERT_WEBHOOK")),
+			AlertFile:         *alertFile,
+		}
+		if *superviseForeground {
+			return runSuperviseForeground(supReq)
+		}
+		if background && !*foreground {
+			if wantSupervise && runtime.GOOS != "windows" {
+				return startMountSupervisedBackground(supReq)
+			}
+			return startMountBackground(mountBackgroundRequest{
+				Args:       append([]string(nil), args...),
+				MountPoint: mountPoint,
+			})
+		}
+		return mountObjectStore(objectLoc, mountPoint, *cacheDir, *readOnly, *debug, *supervised, *allowOther)
 	}
 
 	var err error
@@ -683,6 +730,7 @@ type mountSuperviseStartRequest struct {
 	Token             string
 	RemoteRoot        string
 	Profile           string
+	MountKind         string
 	LocalRoot         string
 	PackPaths         []string
 	MaxRestarts       int
@@ -741,6 +789,9 @@ func superviseCommandArgs(req mountSuperviseStartRequest, logPath string) ([]str
 		"--profile", req.Profile,
 		"--local-root-meta", req.LocalRoot,
 		"--sanitized-args-json", string(sanitized),
+	}
+	if req.MountKind != "" {
+		out = append(out, "--mount-kind", req.MountKind)
 	}
 	if len(req.PackPaths) > 0 {
 		packJSON, err := json.Marshal(req.PackPaths)

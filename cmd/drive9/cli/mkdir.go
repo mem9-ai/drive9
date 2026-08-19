@@ -21,10 +21,21 @@ func Mkdir(c *client.Client, args []string) error {
 		return fmt.Errorf("usage: drive9 fs mkdir [--layer <ref>] <path>")
 	}
 	path := args[0]
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
 	}
+	if h.Loc.Kind == KindObject {
+		if layerRef != "" {
+			return fmt.Errorf("--layer is drive9-only")
+		}
+		if err := h.Backend.Mkdir(context.Background(), h.Loc); err != nil {
+			return err
+		}
+		fmt.Printf("created %s\n", path)
+		return nil
+	}
+	c, path = h.Client, h.Path
 	if layerRef != "" {
 		if err := mkdirLayerPath(context.Background(), c, layerRef, path, 0o755); err != nil {
 			return err

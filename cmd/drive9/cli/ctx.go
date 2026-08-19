@@ -432,6 +432,9 @@ func ctxAdd(cfg *Config, name string, ctx *Context) (*Context, error) {
 	if name == "" {
 		return nil, fmt.Errorf("context name is required")
 	}
+	if IsReservedContextName(name) {
+		return nil, fmt.Errorf("context name %q is reserved for URI schemes; use %s-ctx or another name (existing %s:/path still works)", name, name, name)
+	}
 	if cfg.Contexts == nil {
 		cfg.Contexts = map[string]*Context{}
 	}
@@ -834,6 +837,9 @@ func defaultImportName(cfg *Config, claims *jwtClaims) string {
 		} else {
 			base = randomName()
 		}
+	}
+	if IsReservedContextName(base) {
+		base = base + "-ctx"
 	}
 	if _, exists := cfg.Contexts[base]; !exists {
 		return base

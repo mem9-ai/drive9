@@ -448,6 +448,8 @@ printf "cli-smoke-%s" "$TS" > "$SMALL_LOCAL"
 drive9_retry fs cp "$SMALL_LOCAL" ":$SMALL_REMOTE" >/dev/null
 
 ls_out="$(drive9_retry fs ls /)"
+ls_drive9="$(drive9_retry fs ls drive9:///)"
+check_eq "drive9:/// lists the same as /" "$ls_drive9" "$ls_out"
 small_present=$(python3 - "$ls_out" "$(basename "$SMALL_REMOTE")" <<'PY'
 import sys
 out=sys.argv[1].splitlines()
@@ -1055,6 +1057,26 @@ PY
   over_err=$(jq -r '.error // empty' "$over_file")
   check_cmd "cli-boundary over-limit has error message" test -n "$over_err"
   rm -f "$boundary_over_payload" "$over_file"
+fi
+
+if [ -n "${DRIVE9_E2E_S3_URI:-}" ]; then
+  echo "[object] optional s3-compatible copy (DRIVE9_E2E_S3_URI)"
+  obj_base="${DRIVE9_E2E_S3_URI%%\?*}"
+  obj_base="${obj_base%/}"
+  obj_q=""
+  if [ "$DRIVE9_E2E_S3_URI" != "${DRIVE9_E2E_S3_URI%%\?*}" ]; then
+    obj_q="?${DRIVE9_E2E_S3_URI#*\?}"
+  fi
+  obj_dst="${obj_base}/cli-smoke-${TS}.txt${obj_q}"
+  if drive9 fs cp ":$SMALL_REMOTE" "$obj_dst"; then
+    check_eq "fs cp drive9 → object URI" "ok" "ok"
+    check_cmd "fs cat object URI" drive9 fs cat "$obj_dst"
+    check_cmd "fs rm object URI" drive9 fs rm "$obj_dst"
+  else
+    check_eq "fs cp drive9 → object URI" "fail" "ok"
+  fi
+else
+  skip_check "object-store e2e (set DRIVE9_E2E_S3_URI to enable)"
 fi
 
 rm -f "${pfile:-}" "$CLI_BIN" "$SMALL_LOCAL" "$HARDLINK_LOCAL" "$IMAGE_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"

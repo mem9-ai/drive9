@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"text/tabwriter"
@@ -27,20 +28,27 @@ func Ls(c *client.Client, args []string) error {
 		}
 	}
 
-	var err error
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
 	}
 
-	entries, err := c.List(path)
+	page, err := h.Backend.List(context.Background(), h.Loc, ListOpts{})
 	if err != nil {
 		return err
+	}
+	for page.NextCursor != "" {
+		more, err := h.Backend.List(context.Background(), h.Loc, ListOpts{Cursor: page.NextCursor})
+		if err != nil {
+			return err
+		}
+		page.Entries = append(page.Entries, more.Entries...)
+		page.NextCursor = more.NextCursor
 	}
 
 	if long {
 		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		for _, e := range entries {
+		for _, e := range page.Entries {
 			kind := "-"
 			if e.IsDir {
 				kind = "d"
@@ -50,7 +58,7 @@ func Ls(c *client.Client, args []string) error {
 		return w.Flush()
 	}
 
-	for _, e := range entries {
+	for _, e := range page.Entries {
 		name := e.Name
 		if e.IsDir {
 			name += "/"

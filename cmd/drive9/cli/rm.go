@@ -47,10 +47,20 @@ func Rm(c *client.Client, args []string) error {
 		return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] <path>")
 	}
 
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
-	if err != nil {
-		return err
+	h, herr := fsHandleForArg(c, path)
+	if herr != nil {
+		return herr
 	}
+	if h.Loc.Kind == KindObject {
+		if layerRef != "" {
+			return fmt.Errorf("--layer is drive9-only")
+		}
+		if err := h.Backend.Remove(context.Background(), h.Loc, recursive); err != nil {
+			return err
+		}
+		return nil
+	}
+	c, path = h.Client, h.Path
 	if layerRef != "" {
 		return whiteoutLayerPath(context.Background(), c, layerRef, path, recursive)
 	}

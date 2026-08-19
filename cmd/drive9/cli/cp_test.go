@@ -59,6 +59,23 @@ func TestParseRemote(t *testing.T) {
 	}
 }
 
+func TestJoinDestLocalDir(t *testing.T) {
+	dst := Location{Kind: KindLocal, Local: "/tmp/dl"}
+	got := joinDest(dst, "k")
+	if got.Local != filepath.Join("/tmp/dl", "k") || got.Path != "" {
+		t.Fatalf("local join = %+v", got)
+	}
+	got = joinDest(dst, "sub/a.txt")
+	if got.Local != filepath.Join("/tmp/dl", "sub", "a.txt") {
+		t.Fatalf("local nested = %+v", got)
+	}
+	obj := Location{Kind: KindObject, Path: "prefix"}
+	got = joinDest(obj, "k")
+	if got.Path != "prefix/k" {
+		t.Fatalf("object join = %+v", got)
+	}
+}
+
 func TestDownloadFileEmitsDownloadSummaryToCLILogForLargeFile(t *testing.T) {
 	data := bytes.Repeat([]byte("ab"), (8<<20)/2)
 	data = append(data, []byte("tail")...)
