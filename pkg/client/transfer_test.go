@@ -934,6 +934,76 @@ func TestWriteStreamV2MultiPartUsesPlanPartSize(t *testing.T) {
 	}
 }
 
+func TestPresignedUploadsStripDrive9Credentials(t *testing.T) {
+	var requests int
+	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Header.Get("Authorization") != "" || r.Header.Get("X-Dat9-Actor") != "" {
+			t.Errorf("S3 received Drive9 credentials: Authorization=%q Actor=%q", r.Header.Get("Authorization"), r.Header.Get("X-Dat9-Actor"))
+		}
+		if r.Header.Get("X-Amz-Meta-Test") != "allowed" {
+			t.Errorf("S3 allowed presigned header = %q, want allowed", r.Header.Get("X-Amz-Meta-Test"))
+		}
+		w.Header().Set("ETag", `"etag-1"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s3.Close()
+
+	headers := map[string]string{
+		"authorization":   "Bearer leaked",
+		"x-dAt9-aCtOr":    "actor-leaked",
+		"X-Amz-Meta-Test": "allowed",
+	}
+	c := New("http://drive9.test", "")
+	if _, err := c.uploadOnePart(context.Background(), PartURL{URL: s3.URL, Headers: headers}, []byte("v1")); err != nil {
+		t.Fatalf("uploadOnePart: %v", err)
+	}
+	if _, err := c.uploadOnePartV2(context.Background(), presignedPart{URL: s3.URL, Headers: headers}, []byte("v2")); err != nil {
+		t.Fatalf("uploadOnePartV2: %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("S3 requests = %d, want 2", requests)
+	}
+}
+
+func TestPresignedPartErrorsLimitBody(t *testing.T) {
+	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, strings.Repeat("x", 65<<10))
+	}))
+	defer s3.Close()
+
+	for _, tc := range []struct {
+		name   string
+		upload func() error
+	}{
+		{
+			name: "v1",
+			upload: func() error {
+				_, err := (&Client{httpClient: http.DefaultClient}).uploadOnePart(context.Background(), PartURL{URL: s3.URL}, []byte("payload"))
+				return err
+			},
+		},
+		{
+			name: "v2",
+			upload: func() error {
+				_, err := (&Client{httpClient: http.DefaultClient}).uploadOnePartV2(context.Background(), presignedPart{URL: s3.URL}, []byte("payload"))
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.upload()
+			if err == nil {
+				t.Fatal("upload error = nil, want S3 error")
+			}
+			if len(err.Error()) > (64<<10)+32 {
+				t.Fatalf("upload error length = %d, want bounded S3 response", len(err.Error()))
+			}
+		})
+	}
+}
+
 func TestWriteStreamV2RePresignsExpiredPart(t *testing.T) {
 	var expiredUploads atomic.Int32
 	var freshUploads atomic.Int32

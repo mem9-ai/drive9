@@ -709,6 +709,10 @@ func TestCommitQueueLayerUploadAcceptsShadowSpillWithoutBaseWrite(t *testing.T) 
 	var gotBody []byte
 	var putCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/uploads/initiate" {
+			http.NotFound(w, r)
+			return
+		}
 		if r.Method == http.MethodPut {
 			putCalls.Add(1)
 			w.WriteHeader(http.StatusInternalServerError)
