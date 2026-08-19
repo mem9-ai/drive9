@@ -12,8 +12,7 @@ import (
 )
 
 const (
-	fsLayerPresignBatchSize  = 16
-	fsLayerMaxErrorBodyBytes = 64 << 10
+	fsLayerPresignBatchSize = 16
 )
 
 type fsLayerUploadInitiateRequest struct {
@@ -207,7 +206,7 @@ func (c *Client) uploadFSLayerPart(ctx context.Context, part presignedPart, body
 		return "", errPresignExpired
 	}
 	if resp.StatusCode >= 300 {
-		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, fsLayerMaxErrorBodyBytes))
+		responseBody := readPresignedErrorBody(resp)
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(responseBody))
 	}
 	etag := resp.Header.Get("ETag")

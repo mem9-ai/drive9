@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+// DefaultFSLayerInlineEntryBytes is the largest raw content payload that can
+// be sent in an inline LayerFS entry without exceeding the server's JSON body
+// limit after base64 encoding and envelope overhead.
+const DefaultFSLayerInlineEntryBytes int64 = 95 << 20
+
 type FSLayerCreateRequest struct {
 	LayerID        string            `json:"layer_id,omitempty"`
 	BaseRootPath   string            `json:"base_root_path"`

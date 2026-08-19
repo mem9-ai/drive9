@@ -966,6 +966,44 @@ func TestPresignedUploadsStripDrive9Credentials(t *testing.T) {
 	}
 }
 
+func TestPresignedPartErrorsLimitBody(t *testing.T) {
+	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, strings.Repeat("x", 65<<10))
+	}))
+	defer s3.Close()
+
+	for _, tc := range []struct {
+		name   string
+		upload func() error
+	}{
+		{
+			name: "v1",
+			upload: func() error {
+				_, err := (&Client{httpClient: http.DefaultClient}).uploadOnePart(context.Background(), PartURL{URL: s3.URL}, []byte("payload"))
+				return err
+			},
+		},
+		{
+			name: "v2",
+			upload: func() error {
+				_, err := (&Client{httpClient: http.DefaultClient}).uploadOnePartV2(context.Background(), presignedPart{URL: s3.URL}, []byte("payload"))
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.upload()
+			if err == nil {
+				t.Fatal("upload error = nil, want S3 error")
+			}
+			if len(err.Error()) > (64<<10)+32 {
+				t.Fatalf("upload error length = %d, want bounded S3 response", len(err.Error()))
+			}
+		})
+	}
+}
+
 func TestWriteStreamV2RePresignsExpiredPart(t *testing.T) {
 	var expiredUploads atomic.Int32
 	var freshUploads atomic.Int32

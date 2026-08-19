@@ -405,3 +405,22 @@ func TestPatchUploadRespectsPresignedChecksumHeader(t *testing.T) {
 		})
 	}
 }
+
+func TestPatchUploadPartLimitsErrorBody(t *testing.T) {
+	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, strings.Repeat("x", 65<<10))
+	}))
+	defer s3.Close()
+
+	c := New("http://drive9.test", "")
+	err := c.uploadPatchPart(context.Background(), &PatchPartURL{Number: 1, URL: s3.URL, Size: 7}, func(int, int64, []byte) ([]byte, error) {
+		return []byte("payload"), nil
+	})
+	if err == nil {
+		t.Fatal("uploadPatchPart error = nil, want S3 error")
+	}
+	if len(err.Error()) > (64<<10)+64 {
+		t.Fatalf("uploadPatchPart error length = %d, want bounded S3 response", len(err.Error()))
+	}
+}

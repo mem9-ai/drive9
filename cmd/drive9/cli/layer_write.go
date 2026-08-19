@@ -14,7 +14,7 @@ import (
 // Inline layer entries are JSON/base64 encoded and the server caps that
 // request body at 128 MiB. Leave room for the JSON envelope below the 96 MiB
 // raw-content boundary implied by base64 expansion.
-const cliLayerInlineLimit = 95 << 20
+const cliLayerInlineLimit = client.DefaultFSLayerInlineEntryBytes
 
 func layerBaseRevision(ctx context.Context, c *client.Client, remotePath string) (int64, error) {
 	stat, err := c.StatCtx(ctx, remotePath)

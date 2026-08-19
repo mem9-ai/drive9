@@ -12,6 +12,12 @@ import (
 	"testing"
 )
 
+func TestDefaultFSLayerInlineEntryBytes(t *testing.T) {
+	if got, want := DefaultFSLayerInlineEntryBytes, int64(95<<20); got != want {
+		t.Fatalf("DefaultFSLayerInlineEntryBytes = %d, want %d", got, want)
+	}
+}
+
 func TestUploadFSLayerFileDirectMultipart(t *testing.T) {
 	const payload = "layer payload"
 	var uploaded strings.Builder
