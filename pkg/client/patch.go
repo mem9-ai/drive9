@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 )
 
@@ -171,7 +170,7 @@ func (c *Client) uploadPatchPart(ctx context.Context, part *PatchPartURL, readPa
 		}
 		// AWS presigned URLs with Range require the matching Range header.
 		for k, v := range part.ReadHeaders {
-			if !strings.EqualFold(k, "host") {
+			if !isForbiddenPresignedHeader(k) {
 				req.Header.Set(k, v)
 			}
 		}
@@ -203,7 +202,7 @@ func (c *Client) uploadPatchPart(ctx context.Context, part *PatchPartURL, readPa
 		return err
 	}
 	for k, v := range part.Headers {
-		if strings.EqualFold(k, "host") {
+		if isForbiddenPresignedHeader(k) {
 			continue
 		}
 		req.Header.Set(k, v)

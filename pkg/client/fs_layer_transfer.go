@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 )
 
-const fsLayerPresignBatchSize = 16
+const (
+	fsLayerPresignBatchSize  = 16
+	fsLayerMaxErrorBodyBytes = 64 << 10
+)
 
 type fsLayerUploadInitiateRequest struct {
 	Path         string `json:"path"`
@@ -83,6 +86,7 @@ func validateFSLayerUploadPlan(plan *uploadPlanV2, size int64) error {
 func (c *Client) uploadFSLayerFileDirect(ctx context.Context, layerID string, body io.Reader, size int64, plan *uploadPlanV2) (*FSLayerEntry, error) {
 	parts := make([]completePart, 0, plan.TotalParts)
 	remaining := size
+	seeker, seekable := body.(io.Seeker)
 	for start := 1; start <= plan.TotalParts; start += fsLayerPresignBatchSize {
 		end := min(start+fsLayerPresignBatchSize-1, plan.TotalParts)
 		expectedSizes := make([]int64, 0, end-start+1)
@@ -100,7 +104,24 @@ func (c *Client) uploadFSLayerFileDirect(ctx context.Context, layerID string, bo
 		for i, part := range presigned {
 			partNumber := start + i
 			partSize := expectedSizes[i]
+			partOffset, canRetry := int64(0), false
+			if seekable {
+				partOffset, err = seeker.Seek(0, io.SeekCurrent)
+				canRetry = err == nil
+			}
 			etag, err := c.uploadFSLayerPart(ctx, part, body, partSize)
+			if errors.Is(err, errPresignExpired) && canRetry {
+				if _, seekErr := seeker.Seek(partOffset, io.SeekStart); seekErr != nil {
+					err = fmt.Errorf("rewind fs layer part %d: %w", partNumber, seekErr)
+				} else {
+					fresh, presignErr := c.presignFSLayerUploadParts(ctx, layerID, plan.UploadID, partNumber, partNumber, []int64{partSize})
+					if presignErr != nil {
+						err = fmt.Errorf("re-presign fs layer part %d: %w", partNumber, presignErr)
+					} else {
+						etag, err = c.uploadFSLayerPart(ctx, fresh[0], body, partSize)
+					}
+				}
+			}
 			if err != nil {
 				c.abortFSLayerUploadBestEffort(ctx, layerID, plan.UploadID)
 				return nil, fmt.Errorf("upload fs layer part %d: %w", partNumber, err)
@@ -152,13 +173,17 @@ func (c *Client) presignFSLayerUploadParts(ctx context.Context, layerID, uploadI
 	if len(out.Parts) != len(entries) {
 		return nil, fmt.Errorf("invalid fs layer presign response: got %d parts, want %d", len(out.Parts), len(entries))
 	}
-	for i, part := range out.Parts {
-		partNumber := start + i
-		if part.Number != partNumber || part.URL == "" || part.Size != expectedSizes[i] {
-			return nil, fmt.Errorf("invalid fs layer presign response for part %d", partNumber)
+	ordered := make([]presignedPart, len(out.Parts))
+	seen := make([]bool, len(out.Parts))
+	for _, part := range out.Parts {
+		index := part.Number - start
+		if index < 0 || index >= len(ordered) || seen[index] || part.URL == "" || part.Size != expectedSizes[index] {
+			return nil, fmt.Errorf("invalid fs layer presign response for part %d", part.Number)
 		}
+		ordered[index] = part
+		seen[index] = true
 	}
-	return out.Parts, nil
+	return ordered, nil
 }
 
 func (c *Client) uploadFSLayerPart(ctx context.Context, part presignedPart, body io.Reader, size int64) (string, error) {
@@ -167,7 +192,7 @@ func (c *Client) uploadFSLayerPart(ctx context.Context, part presignedPart, body
 		return "", err
 	}
 	for key, value := range part.Headers {
-		if strings.EqualFold(key, "host") {
+		if isForbiddenPresignedHeader(key) {
 			continue
 		}
 		req.Header.Set(key, value)
@@ -182,7 +207,7 @@ func (c *Client) uploadFSLayerPart(ctx context.Context, part presignedPart, body
 		return "", errPresignExpired
 	}
 	if resp.StatusCode >= 300 {
-		responseBody, _ := io.ReadAll(resp.Body)
+		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, fsLayerMaxErrorBodyBytes))
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(responseBody))
 	}
 	etag := resp.Header.Get("ETag")

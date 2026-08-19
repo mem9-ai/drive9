@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +22,9 @@ func TestUploadFSLayerFileDirectMultipart(t *testing.T) {
 		}
 		if r.Header.Get("Authorization") != "" || r.Header.Get("X-Dat9-Actor") != "" {
 			t.Errorf("S3 received Drive9 credentials: Authorization=%q Actor=%q", r.Header.Get("Authorization"), r.Header.Get("X-Dat9-Actor"))
+		}
+		if r.Header.Get("X-Amz-Meta-Test") != "allowed" {
+			t.Errorf("S3 allowed presigned header = %q, want allowed", r.Header.Get("X-Amz-Meta-Test"))
 		}
 		data, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -83,6 +87,11 @@ func TestUploadFSLayerFileDirectMultipart(t *testing.T) {
 					Number: requestedPart.PartNumber,
 					URL:    s3.URL + "/part/" + string(rune('0'+requestedPart.PartNumber)),
 					Size:   partSize,
+					Headers: map[string]string{
+						"authorization":   "Bearer leaked",
+						"x-dAt9-aCtOr":    "actor-leaked",
+						"X-Amz-Meta-Test": "allowed",
+					},
 				})
 			}
 			presigned = true
@@ -124,6 +133,120 @@ func TestUploadFSLayerFileDirectMultipart(t *testing.T) {
 	}
 	if entry.Path != "/repo/blob.bin" || entry.StorageType != "s3" {
 		t.Fatalf("entry = %+v", entry)
+	}
+}
+
+func TestPresignFSLayerUploadPartsAcceptsOutOfOrderResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/layers/layer-1/uploads/upload-1/presign-batch" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"parts": []presignedPart{
+			{Number: 3, URL: "https://s3.example/3", Size: 3},
+			{Number: 1, URL: "https://s3.example/1", Size: 5},
+			{Number: 2, URL: "https://s3.example/2", Size: 5},
+		}})
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	parts, err := c.presignFSLayerUploadParts(context.Background(), "layer-1", "upload-1", 1, 3, []int64{5, 5, 3})
+	if err != nil {
+		t.Fatalf("presignFSLayerUploadParts: %v", err)
+	}
+	if len(parts) != 3 || parts[0].Number != 1 || parts[1].Number != 2 || parts[2].Number != 3 {
+		t.Fatalf("parts = %+v, want part numbers [1 2 3]", parts)
+	}
+}
+
+func TestUploadFSLayerPartLimitsErrorBody(t *testing.T) {
+	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, strings.Repeat("x", 65<<10))
+	}))
+	defer s3.Close()
+
+	c := New("http://drive9.test", "")
+	_, err := c.uploadFSLayerPart(context.Background(), presignedPart{URL: s3.URL}, strings.NewReader("payload"), 7)
+	if err == nil {
+		t.Fatal("uploadFSLayerPart error = nil, want S3 error")
+	}
+	if len(err.Error()) > (64<<10)+32 {
+		t.Fatalf("uploadFSLayerPart error length = %d, want bounded S3 response", len(err.Error()))
+	}
+}
+
+func TestUploadFSLayerFileRePresignsExpiredPart(t *testing.T) {
+	const payload = "abcdefghij"
+	var part1Calls, part2Calls, presignCalls, abortCalls int
+	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read S3 body: %v", err)
+		}
+		switch r.URL.Path {
+		case "/part/1":
+			part1Calls++
+			if string(data) != "abcde" {
+				t.Errorf("S3 part 1 body = %q, want abcde", data)
+			}
+			w.Header().Set("ETag", `"etag-1"`)
+		case "/part/2":
+			part2Calls++
+			if string(data) != "fghij" {
+				t.Errorf("S3 part 2 body = %q, want fghij", data)
+			}
+			if part2Calls == 1 {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			w.Header().Set("ETag", `"etag-2"`)
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s3.Close()
+
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/layers/layer-1/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(uploadPlanV2{UploadID: "upload-1", PartSize: 5, TotalParts: 2})
+		case "/v1/layers/layer-1/uploads/upload-1/presign-batch":
+			presignCalls++
+			var req struct {
+				Parts []struct {
+					PartNumber int `json:"part_number"`
+				} `json:"parts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode presign request: %v", err)
+			}
+			presigned := make([]presignedPart, 0, len(req.Parts))
+			for _, requested := range req.Parts {
+				presigned = append(presigned, presignedPart{Number: requested.PartNumber, URL: fmt.Sprintf("%s/part/%d", s3.URL, requested.PartNumber), Size: 5})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"parts": presigned})
+		case "/v1/layers/layer-1/uploads/upload-1/complete":
+			_ = json.NewEncoder(w).Encode(FSLayerEntry{Path: "/repo/a.bin", StorageType: "s3"})
+		case "/v1/layers/layer-1/uploads/upload-1/abort":
+			abortCalls++
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+
+	c := New(api.URL, "")
+	entry, err := c.UploadFSLayerFile(context.Background(), "layer-1", "/repo/a.bin", strings.NewReader(payload), int64(len(payload)), 0, 0, false)
+	if err != nil {
+		t.Fatalf("UploadFSLayerFile: %v", err)
+	}
+	if entry.StorageType != "s3" || part1Calls != 1 || part2Calls != 2 || presignCalls != 2 || abortCalls != 0 {
+		t.Fatalf("entry=%+v part1Calls=%d part2Calls=%d presignCalls=%d abortCalls=%d, want s3, 1, 2, 2, 0", entry, part1Calls, part2Calls, presignCalls, abortCalls)
 	}
 }
 

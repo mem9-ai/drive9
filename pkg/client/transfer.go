@@ -229,6 +229,12 @@ func uploadParallelism(partSize int64) int {
 	return min(byMemory, uploadMaxConcurrency)
 }
 
+func isForbiddenPresignedHeader(key string) bool {
+	return strings.EqualFold(key, "host") ||
+		strings.EqualFold(key, "authorization") ||
+		strings.EqualFold(key, "x-dat9-actor")
+}
+
 func boundedUploadParallelism(partSize int64, partCount int) int {
 	parallelism := uploadParallelism(partSize)
 	if partCount > 0 && parallelism > partCount {
@@ -879,7 +885,7 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 		return "", err
 	}
 	for k, v := range part.Headers {
-		if strings.EqualFold(k, "host") {
+		if isForbiddenPresignedHeader(k) {
 			continue
 		}
 		req.Header.Set(k, v)
@@ -1203,7 +1209,7 @@ func (c *Client) uploadOnePartV2(ctx context.Context, part presignedPart, data [
 		return "", err
 	}
 	for k, v := range part.Headers {
-		if strings.EqualFold(k, "host") {
+		if isForbiddenPresignedHeader(k) {
 			continue
 		}
 		req.Header.Set(k, v)
