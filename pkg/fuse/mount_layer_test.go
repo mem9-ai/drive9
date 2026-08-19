@@ -1183,6 +1183,8 @@ func TestLayerSetAttrLargeTruncateUploadsLayerObjectFromShadow(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/uploads/initiate":
+			http.NotFound(w, r)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/objects":
 			uploadCalls++
 			if got := r.URL.Query().Get("path"); got != remotePath {

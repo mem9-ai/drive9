@@ -319,6 +319,19 @@ func (c *Client) UploadFSLayerFile(ctx context.Context, layerID, path string, bo
 	if path == "" {
 		return nil, fmt.Errorf("path must not be empty")
 	}
+	if size > 0 {
+		plan, unavailable, err := c.initiateFSLayerUpload(ctx, layerID, path, size, baseRevision, mode, hasMode)
+		if err != nil {
+			return nil, err
+		}
+		if !unavailable {
+			return c.uploadFSLayerFileDirect(ctx, layerID, body, size, plan)
+		}
+	}
+	return c.uploadFSLayerFileLegacy(ctx, layerID, path, body, size, baseRevision, mode, hasMode)
+}
+
+func (c *Client) uploadFSLayerFileLegacy(ctx context.Context, layerID, path string, body io.Reader, size int64, baseRevision int64, mode uint32, hasMode bool) (*FSLayerEntry, error) {
 	q := url.Values{}
 	q.Set("path", path)
 	q.Set("size", fmt.Sprintf("%d", size))

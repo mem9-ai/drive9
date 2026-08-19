@@ -11,8 +11,6 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
-const cliLayerInlineLimit = 96 << 20
-
 func layerBaseRevision(ctx context.Context, c *client.Client, remotePath string) (int64, error) {
 	stat, err := c.StatCtx(ctx, remotePath)
 	if client.IsNotFound(err) {
@@ -49,7 +47,11 @@ func uploadReaderToLayer(ctx context.Context, c *client.Client, layerRef, remote
 	if err != nil {
 		return err
 	}
-	if size <= cliLayerInlineLimit {
+	inlineLimit := c.SmallFileThreshold(ctx)
+	if inlineLimit <= 0 {
+		inlineLimit = client.DefaultSmallFileThreshold
+	}
+	if size <= inlineLimit {
 		data, err := io.ReadAll(r)
 		if err != nil {
 			return fmt.Errorf("read layer upload: %w", err)
