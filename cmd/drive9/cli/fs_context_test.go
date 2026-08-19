@@ -227,12 +227,12 @@ func TestCpStreamsMixedExplicitAndCurrentRemoteContexts(t *testing.T) {
 	withIsolatedHome(t)
 
 	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodHead:
+		switch r.Method {
+		case http.MethodHead:
 			w.Header().Set("Content-Length", "5")
 			w.Header().Set("X-Dat9-IsDir", "false")
 			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodGet:
+		case http.MethodGet:
 			_, _ = w.Write([]byte("hello"))
 		default:
 			w.WriteHeader(http.StatusOK)

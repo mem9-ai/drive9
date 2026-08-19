@@ -45,8 +45,8 @@ func TestRcloneFUSELookupRead(t *testing.T) {
 	if st := ofs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "hello.txt", &ent); st != gofuse.OK {
 		t.Fatalf("Lookup hello.txt: %v", st)
 	}
-	if ent.Attr.Size != 5 {
-		t.Fatalf("size=%d", ent.Attr.Size)
+	if ent.Size != 5 {
+		t.Fatalf("size=%d", ent.Size)
 	}
 
 	var attr gofuse.AttrOut

@@ -678,7 +678,7 @@ func cpTreeViaBackend(ctx context.Context, srcH, dstH fsHandle) error {
 	root := strings.TrimSuffix(walkRoot(srcH), string(filepath.Separator))
 	root = strings.TrimSuffix(root, "/")
 	return Walk(ctx, srcH.Backend, srcH.Loc, func(info FileInfo) error {
-		rel := info.Path
+		var rel string
 		if srcH.Loc.Kind == KindLocal {
 			rel, err = filepath.Rel(root, info.Path)
 			if err != nil {
