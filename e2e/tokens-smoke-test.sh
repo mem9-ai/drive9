@@ -27,6 +27,8 @@ CP_PUBLIC="${DRIVE9_TOKENS_CP_PUBLIC_KEY:-local-public}"
 CP_PRIVATE="${DRIVE9_TOKENS_CP_PRIVATE_KEY:-local-private}"
 REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-6}"
 REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-1}"
+POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
+POLL_INTERVAL_S="${POLL_INTERVAL_S:-2}"
 # Local bootstrap uses tenant_id "local" and org "local-org".
 LOCAL_TENANT_ID="${DRIVE9_TOKENS_LOCAL_TENANT_ID:-local}"
 
@@ -150,6 +152,24 @@ else
   skip_check "provision (DRIVE9_API_KEY set; tenant_id default=$TENANT_ID)"
   ok "using existing DRIVE9_API_KEY"
 fi
+
+# Fresh provision returns 202 while the tenant is still provisioning. Token
+# routes 503 until /v1/status is active (same wait as journal / sse-retention).
+deadline=$(($(date +%s) + POLL_TIMEOUT_S))
+status=""
+while :; do
+  sresp=$(bearer GET "/v1/status")
+  scode=$(http_code "$sresp")
+  status=$(json_body "$sresp" | jq -r '.status // empty')
+  if [ "$scode" = "200" ] && [ "$status" = "active" ]; then
+    break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    break
+  fi
+  sleep "$POLL_INTERVAL_S"
+done
+check_eq "tenant eventually becomes active" "$status" "active"
 
 # Discover tenant_id from status/list if possible.
 list_probe=$(bearer GET "/v1/tokens")
