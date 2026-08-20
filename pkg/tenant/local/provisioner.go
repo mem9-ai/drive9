@@ -220,7 +220,7 @@ func validTenantDatabaseName(name string) bool {
 		return false
 	}
 	for _, r := range name[len(dbNamePrefix):] {
-		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_') {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
 			return false
 		}
 	}

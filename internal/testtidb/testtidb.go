@@ -57,7 +57,7 @@ func Start(ctx context.Context) (*Instance, error) {
 				WaitingFor: wait.ForAll(
 					wait.ForLog("server is running MySQL protocol"),
 					wait.ForListeningPort(tidbPort),
-				).WithStartupTimeout(2 * time.Minute),
+				).WithDeadline(2 * time.Minute),
 			},
 			Started: true,
 		})
