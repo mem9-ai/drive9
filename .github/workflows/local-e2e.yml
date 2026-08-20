@@ -1,4 +1,4 @@
-name: local-e2e
+name: Local E2E
 
 on:
   pull_request:

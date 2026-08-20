@@ -1,4 +1,4 @@
-name: blackbox
+name: Blackbox
 
 # Manual trigger only — no push, no schedule, no PR.
 on:
@@ -34,7 +34,7 @@ env:
 
 jobs:
   blackbox:
-    name: blackbox (${{ inputs.group || 'all' }})
+    name: Blackbox (${{ inputs.group || 'all' }})
     runs-on: ubuntu-latest
     timeout-minutes: 240
 

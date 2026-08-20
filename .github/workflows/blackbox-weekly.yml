@@ -1,4 +1,4 @@
-name: blackbox-weekly
+name: Blackbox Weekly
 
 on:
   schedule:
@@ -23,7 +23,7 @@ env:
 
 jobs:
   blackbox-weekly:
-    name: blackbox-weekly (community)
+    name: Blackbox Weekly (community)
     runs-on: ubuntu-latest
     timeout-minutes: 240
 

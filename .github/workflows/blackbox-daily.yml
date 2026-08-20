@@ -1,4 +1,4 @@
-name: blackbox-daily
+name: Blackbox Daily
 
 on:
   schedule:
@@ -23,7 +23,7 @@ env:
 
 jobs:
   blackbox-daily:
-    name: blackbox-daily (community)
+    name: Blackbox Daily (community)
     runs-on: ubuntu-latest
     timeout-minutes: 120
 

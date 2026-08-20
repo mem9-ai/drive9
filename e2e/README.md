@@ -47,7 +47,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | PR gate | `pull_request` to `main` (local-e2e) | api, cli, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback), fuse-patch-storage-class, git-ops, git-workspace-ondemand, portable pack/unpack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget |
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
-| Manual all | `e2e-all` workflow (`Run workflow` button) | Everything above via `run_all_e2e=1` |
+| Manual all | Local E2E `workflow_dispatch` with `run_all_e2e=1` | Everything above |
 | Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`

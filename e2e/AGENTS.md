@@ -13,8 +13,8 @@ Every new e2e script MUST be wired into `.github/workflows/local-e2e.yml` in the
 same PR that adds it (PR gate for fast suites, push-to-main/schedule toggles for
 heavy ones), or be documented as manual-only with a reason in `e2e/README.md`
 ("CI automation tiers" section). An e2e script that no automation runs is dead
-code. The `e2e-all` workflow (manual dispatch) must keep covering every wired
-suite via `run_all_e2e=1`.
+code. Manual "run everything" is Local E2E `workflow_dispatch` with
+`run_all_e2e=1`.
 
 ## Run
 
