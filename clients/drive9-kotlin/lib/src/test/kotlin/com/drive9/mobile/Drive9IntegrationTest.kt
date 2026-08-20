@@ -32,7 +32,7 @@ class Drive9IntegrationTest {
     private val base: String =
         System.getenv("DRIVE9_SERVER")?.takeIf { it.isNotEmpty() } ?: "http://127.0.0.1:9009"
     private val apiKey: String =
-        System.getenv("DRIVE9_API_KEY")?.takeIf { it.isNotEmpty() } ?: "local-dev-key"
+        System.getenv("DRIVE9_API_KEY")?.takeIf { it.isNotEmpty() } ?: ""
 
     private fun client(): Drive9Client = Drive9Client(base, apiKey)
 

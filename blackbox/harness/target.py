@@ -123,7 +123,7 @@ class Drive9FuseTargetProvider:
         self.server_bin = Path(args.local_server).expanduser().resolve() if args.local_server else None
         self.server_url = ""
         self.api_key = ""
-        self.local_api_key = os.environ.get("DRIVE9_LOCAL_API_KEY", "local-dev-key")
+        self.local_api_key = os.environ.get("DRIVE9_LOCAL_API_KEY", "")
         self.server_proc: subprocess.Popen[bytes] | None = None
         self.db_container = ""
         self.db_runtime = ""
@@ -287,14 +287,19 @@ class Drive9FuseTargetProvider:
     def ensure_database(self, dsn: str) -> None:
         host, port, db_name = self.parse_tcp_dsn(dsn)
         mysql = shutil.which("mysql")
-        if mysql is None or not db_name:
+        if not db_name:
             return
-        subprocess.run(
+        if mysql is None:
+            raise BlackboxError("mysql client is required to CREATE DATABASE " + db_name)
+        result = subprocess.run(
             [mysql, "--protocol=tcp", "-h", host, "-P", str(port), "-u", "root", "-e", f"CREATE DATABASE IF NOT EXISTS `{db_name}`;"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
             check=False,
         )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            raise BlackboxError(f"CREATE DATABASE `{db_name}` failed: {err or result.returncode}")
 
     def start_tidb_if_needed(self) -> str:
         dsn = os.environ.get("DRIVE9_LOCAL_DSN", "").strip()
@@ -311,7 +316,7 @@ class Drive9FuseTargetProvider:
             return default
         runtime = self.detect_runtime()
         self.db_runtime = runtime
-        image = os.environ.get("DRIVE9_LOCAL_E2E_DB_IMAGE", "pingcap/tidb:v8.5.5")
+        image = os.environ.get("DRIVE9_LOCAL_E2E_DB_IMAGE", "pingcap/tidb:v8.5.6")
         db_name = os.environ.get("DRIVE9_LOCAL_E2E_DB_NAME", "drive9_local")
         self.db_container = f"drive9-blackbox-{int(time.time())}-{os.getpid()}"
         progress(f"setup: starting TiDB container {self.db_container} with {runtime} image={image}")
@@ -323,11 +328,11 @@ class Drive9FuseTargetProvider:
                 "-d",
                 "--name",
                 self.db_container,
-                "--platform",
-                "linux/amd64",
                 "-p",
                 "127.0.0.1::4000",
                 image,
+                "--store=unistore",
+                "--path=/tmp/tidb",
             ],
             timeout=180,
         )

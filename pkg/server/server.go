@@ -1460,13 +1460,7 @@ func contextWithTrace(parent, traceSource context.Context) context.Context {
 }
 
 func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled bool, provider string) string {
-	query := "parseTime=true"
-	if tlsEnabled {
-		query += "&tls=true"
-	} else if tenant.UsesTiDBCloudNativeCredentials(provider) {
-		query += "&tls=skip-verify"
-	}
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", user, password, host, port, dbName, query)
+	return tenant.FormatTenantMySQLDSN(user, password, host, port, dbName, tlsEnabled, provider)
 }
 
 func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handler {

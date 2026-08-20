@@ -32,7 +32,10 @@ fn base() -> String {
 }
 
 fn api_key() -> String {
-    env_or("DRIVE9_API_KEY", "local-dev-key")
+    std::env::var("DRIVE9_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
 }
 
 fn make_client() -> Client {

@@ -20,7 +20,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-TIDB_IMAGE="${DESCRIPTION_TIDB_IMAGE:-pingcap/tidb:v8.5.0}"
+TIDB_IMAGE="${DESCRIPTION_TIDB_IMAGE:-pingcap/tidb:v8.5.6}"
 OLLAMA_IMAGE="${DESCRIPTION_OLLAMA_IMAGE:-ollama/ollama:latest}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-mxbai-embed-large}"
 EMBED_DIMS="${EMBED_DIMS:-1024}"
@@ -126,10 +126,9 @@ make build-cli build-server
 info "starting TiDB container..."
 docker run -d \
   --name "${COMPOSE_PROJECT}-tidb" \
-  --platform linux/amd64 \
   -p "${TIDB_PORT}:4000" \
   -e TZ=UTC \
-  "${TIDB_IMAGE}" >/dev/null
+  "${TIDB_IMAGE}" --store=unistore --path=/tmp/tidb >/dev/null
 
 wait_for_tcp 127.0.0.1 "$TIDB_PORT" "TiDB" 60
 sleep 2
@@ -285,8 +284,8 @@ wait_for_task() {
 echo ""
 echo "[0] cleanup previous artifacts"
 $MYSQL_CLIENT -e "DELETE FROM semantic_tasks WHERE task_type = 'embed';" 2>/dev/null || true
+$MYSQL_CLIENT -e "DELETE FROM semantic WHERE inode_id IN (SELECT inode_id FROM file_nodes WHERE path LIKE '/smoke-%');" 2>/dev/null || true
 $MYSQL_CLIENT -e "DELETE FROM file_nodes WHERE path LIKE '/smoke-%';" 2>/dev/null || true
-$MYSQL_CLIENT -e "DELETE f FROM files f LEFT JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.file_id IS NULL;" 2>/dev/null || true
 $MYSQL_CLIENT -e "DELETE FROM uploads WHERE target_path LIKE '/smoke-%';" 2>/dev/null || true
 
 echo "[1] small file upload with description"
@@ -294,14 +293,14 @@ $CLI ctx add e2e "$BASE" "$API_KEY" 2>/dev/null || true
 $CLI ctx e2e 2>/dev/null || true
 $CLI fs cp --description "quarterly financial report Q1 2026" /etc/hosts :/smoke-small.txt
 
-DESC=$(sql_scalar "SELECT description FROM files f JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.path = '/smoke-small.txt';")
+DESC=$(sql_scalar "SELECT s.description FROM semantic s JOIN file_nodes fn ON fn.inode_id = s.inode_id WHERE fn.path = '/smoke-small.txt';")
 check_eq "description stored" "$DESC" "quarterly financial report Q1 2026"
 
-FILE_ID=$(sql_scalar "SELECT f.file_id FROM files f JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.path = '/smoke-small.txt';")
+FILE_ID=$(sql_scalar "SELECT fn.file_id FROM file_nodes fn WHERE fn.path = '/smoke-small.txt';")
 if wait_for_task "$FILE_ID" 60; then
-  HAS_DESC_EMB=$(sql_scalar "SELECT description_embedding IS NOT NULL FROM files f JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.path = '/smoke-small.txt';")
+  HAS_DESC_EMB=$(sql_scalar "SELECT s.description_embedding IS NOT NULL FROM semantic s JOIN file_nodes fn ON fn.inode_id = s.inode_id WHERE fn.path = '/smoke-small.txt';")
   check_eq "description_embedding generated" "$HAS_DESC_EMB" "1"
-  REV_MATCH=$(sql_scalar "SELECT description_embedding_revision = revision FROM files f JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.path = '/smoke-small.txt';")
+  REV_MATCH=$(sql_scalar "SELECT s.description_embedding_revision = i.revision FROM semantic s JOIN file_nodes fn ON fn.inode_id = s.inode_id JOIN inodes i ON i.inode_id = fn.inode_id WHERE fn.path = '/smoke-small.txt';")
   check_eq "description_embedding_revision matches revision" "$REV_MATCH" "1"
 else
   check_eq "description_embedding generated" "failed" "1"
@@ -311,21 +310,21 @@ echo "[2] large file multipart upload with description"
 dd if=/dev/urandom of=/tmp/smoke-large.bin bs=1M count=5 2>/dev/null
 $CLI fs cp --description "5MB random blob for backup" /tmp/smoke-large.bin :/smoke-large.bin
 
-DESC2=$(sql_scalar "SELECT description FROM files f JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.path = '/smoke-large.bin';")
+DESC2=$(sql_scalar "SELECT s.description FROM semantic s JOIN file_nodes fn ON fn.inode_id = s.inode_id WHERE fn.path = '/smoke-large.bin';")
 check_eq "large file description stored" "$DESC2" "5MB random blob for backup"
 
 echo "[3] overwrite without description preserves old value"
 cat /etc/hosts | $CLI fs cp - :/smoke-small.txt
-FILE_ID=$(sql_scalar "SELECT f.file_id FROM files f JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.path = '/smoke-small.txt';")
+FILE_ID=$(sql_scalar "SELECT fn.file_id FROM file_nodes fn WHERE fn.path = '/smoke-small.txt';")
 wait_for_task "$FILE_ID" 60 || true
-DESC3=$(sql_scalar "SELECT description FROM files f JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.path = '/smoke-small.txt';")
+DESC3=$(sql_scalar "SELECT s.description FROM semantic s JOIN file_nodes fn ON fn.inode_id = s.inode_id WHERE fn.path = '/smoke-small.txt';")
 check_eq "description preserved after overwrite without desc" "$DESC3" "quarterly financial report Q1 2026"
 
 echo "[4] overwrite with new description replaces old value"
 $CLI fs cp --description "updated description after review" /etc/hosts :/smoke-small.txt
-FILE_ID=$(sql_scalar "SELECT f.file_id FROM files f JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.path = '/smoke-small.txt';")
+FILE_ID=$(sql_scalar "SELECT fn.file_id FROM file_nodes fn WHERE fn.path = '/smoke-small.txt';")
 wait_for_task "$FILE_ID" 60 || true
-DESC4=$(sql_scalar "SELECT description FROM files f JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.path = '/smoke-small.txt';")
+DESC4=$(sql_scalar "SELECT s.description FROM semantic s JOIN file_nodes fn ON fn.inode_id = s.inode_id WHERE fn.path = '/smoke-small.txt';")
 check_eq "description updated after overwrite with new desc" "$DESC4" "updated description after review"
 
 echo "[5] grep API on local TiDB (known platform limit)"

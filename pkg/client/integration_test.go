@@ -52,9 +52,11 @@ func TestMain(m *testing.M) {
 	if integBaseURL == "" {
 		integBaseURL = "http://127.0.0.1:9009"
 	}
-	integAPIKey = os.Getenv("DRIVE9_API_KEY")
+	integAPIKey = strings.TrimSpace(os.Getenv("DRIVE9_API_KEY"))
 	if integAPIKey == "" {
-		integAPIKey = "local-dev-key"
+		integSkip = true
+		fmt.Fprintf(os.Stderr, "integration: DRIVE9_API_KEY is required — skipping package\n")
+		os.Exit(m.Run())
 	}
 
 	// Probe the server; skip the whole package if it is not reachable so

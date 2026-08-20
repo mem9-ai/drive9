@@ -291,6 +291,7 @@ Obtain a logger from `pkg/logger` or accept `*zap.Logger` via `Config`.
 drive9-server schema dump-init-sql --provider tidb_zero
 drive9-server schema dump-init-sql --provider tidb_cloud_native
 drive9-server schema dump-init-sql --provider db9
+drive9-server schema dump-init-sql --provider local
 ```
 
 - Do not maintain a second handwritten copy of those init SQL statements when a command can

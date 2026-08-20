@@ -98,7 +98,8 @@ cleanup() {
   fi
   rm -rf "$WORK_DIR" || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -243,9 +244,11 @@ bootstrap_db() {
   host="$(python3 -c 'import re,sys; m=re.search(r"@tcp\(([^:]+):(\d+)\)/([^?]*)", sys.argv[1]); print(m.group(1) if m else "")' "$DRIVE9_LOCAL_DSN")"
   port="$(python3 -c 'import re,sys; m=re.search(r"@tcp\(([^:]+):(\d+)\)/([^?]*)", sys.argv[1]); print(m.group(2) if m else "")' "$DRIVE9_LOCAL_DSN")"
   db="$(python3 -c 'import re,sys; m=re.search(r"@tcp\(([^:]+):(\d+)\)/([^?]*)", sys.argv[1]); print(m.group(3) if m else "drive9_local")' "$DRIVE9_LOCAL_DSN")"
-  if have mysql; then
-    mysql --protocol=tcp -h "$host" -P "$port" -u root -e "CREATE DATABASE IF NOT EXISTS \`$db\`;" >/dev/null
+  if ! have mysql; then
+    echo "mysql client is required to CREATE DATABASE \`$db\` (install mysql or start TiDB with drive9_local already created)" >&2
+    exit 1
   fi
+  mysql --protocol=tcp -h "$host" -P "$port" -u root -e "CREATE DATABASE IF NOT EXISTS \`$db\`;" >/dev/null
   echo "TiDB is ready"
 }
 

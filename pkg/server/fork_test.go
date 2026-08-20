@@ -1098,7 +1098,18 @@ func TestCreateForkTenantPersistsPrivateEndpointDBTLS(t *testing.T) {
 				t.Fatalf("decrypt fork password: %v", err)
 			}
 			dsn := tenantDSN(forkTenant.DBUser, string(plain), forkTenant.DBHost, forkTenant.DBPort, forkTenant.DBName, forkTenant.DBTLS, forkTenant.Provider)
-			if !strings.Contains(dsn, tc.wantDSNTLS) {
+			switch {
+			case tc.wantDBTLS:
+				if !strings.Contains(dsn, "tls=true") {
+					t.Fatalf("fork DSN = %q, want tls=true", dsn)
+				}
+			case strings.Contains(dsn, "tls=true"):
+				t.Fatalf("fork DSN = %q, private endpoint should not use tls=true", dsn)
+			case tenant.IsLoopbackDBHost(forkTenant.DBHost):
+				if strings.Contains(dsn, "tls=") {
+					t.Fatalf("fork DSN = %q, loopback TiDB should not request TLS", dsn)
+				}
+			case !strings.Contains(dsn, tc.wantDSNTLS):
 				t.Fatalf("fork DSN = %q, want it to contain %q", dsn, tc.wantDSNTLS)
 			}
 		})

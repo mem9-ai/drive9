@@ -505,7 +505,8 @@ Host support: Linux and macOS only. This script needs real FUSE support and is
 targeted regression coverage for PATCH-vs-storage-class mismatches
 (`patch_unsupported_target`), not a general filesystem workload.
 
-1. Starts its own MySQL container and `drive9-server` with a high
+1. Requires a reachable TiDB (`DRIVE9_LOCAL_DSN`, default 127.0.0.1:4000);
+   starts `drive9-server` (provider=local) with a high
    `DRIVE9_INLINE_THRESHOLD`, seeds a file that lands inline (db9), then
    restarts the server with a low threshold so the mount's cached threshold is
    below the file size while the object stays db9-stored

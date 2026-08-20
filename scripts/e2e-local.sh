@@ -32,7 +32,7 @@ cd "$ROOT"
 
 LISTEN_ADDR="${DRIVE9_LISTEN_ADDR:-127.0.0.1:9009}"
 DEFAULT_DSN="root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true"
-DB_IMAGE="${DRIVE9_LOCAL_E2E_DB_IMAGE:-pingcap/tidb:v8.5.7}"
+DB_IMAGE="${DRIVE9_LOCAL_E2E_DB_IMAGE:-pingcap/tidb:v8.5.6}"
 DB_CONTAINER_NAME="${DRIVE9_LOCAL_E2E_DB_CONTAINER:-drive9-e2e-tidb}"
 DB_NAME="${DRIVE9_LOCAL_E2E_DB_NAME:-drive9_local}"
 SERVER_BIN="${DRIVE9_SERVER_BIN:-$ROOT/bin/drive9-server}"
@@ -45,6 +45,7 @@ SERVER_PID=""
 S3_DIR=""
 WORK_DIR="$(mktemp -d -t drive9-e2e-local-XXXXXX)"
 cleanup_done=0
+KEEP_WORK_DIR=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -74,13 +75,14 @@ cleanup() {
     echo "removing $DB_CONTAINER_NAME"
     "$DB_RUNTIME" rm -f "$DB_CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
-  if [ "$KEEP_SERVER" = 1 ]; then
-    echo "server log: $WORK_DIR/server.log"
+  if [ "$KEEP_SERVER" = 1 ] || [ "$KEEP_WORK_DIR" = 1 ]; then
+    echo "preserving $WORK_DIR (server.log)"
     return
   fi
   rm -rf "$WORK_DIR" || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 log() { printf '\n>>> %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -298,4 +300,10 @@ start_server
 apply_smoke_defaults
 
 log "running $SMOKE_SCRIPT (DRIVE9_BASE=$DRIVE9_BASE RUN_API_ONLY=$RUN_API_ONLY RUN_FUSE_SMOKE=$RUN_FUSE_SMOKE)"
-bash "$SMOKE_SCRIPT"
+SMOKE_RC=0
+bash "$SMOKE_SCRIPT" || SMOKE_RC=$?
+if [ "$SMOKE_RC" -ne 0 ]; then
+  KEEP_WORK_DIR=1
+  echo "smoke failed; preserving $WORK_DIR (server.log)" >&2
+fi
+exit "$SMOKE_RC"

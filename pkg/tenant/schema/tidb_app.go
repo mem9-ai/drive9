@@ -14,8 +14,9 @@ import (
 // generated expressions, or constraints here, update that external workflow at
 // the same time.
 //
-// There is intentionally no drive9-server dump-init-sql --provider export path
-// for this app-managed statement list.
+// Export path: `drive9-server schema dump-init-sql --provider local`.
+// The dump includes optional FTS/VECTOR ALTER statements unconditionally;
+// runtime local init applies those best-effort (AllowUnsupportedOptionalIndexes).
 func tidbAppEmbeddingSchemaStatements() []string {
 	stmts := tidbAppEmbeddingBaseSchemaStatements()
 	stmts = append(stmts, tidbAppEmbeddingOptionalSchemaStatements()...)

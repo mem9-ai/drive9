@@ -554,7 +554,7 @@ For automated CI, point `e2e/description-smoke-test.sh` at a TiDB Cloud test ins
 ```bash
 export DRIVE9_BASE="https://drive9-e2e.example.com/v1"
 export DRIVE9_LOCAL_DSN="<tidb-cloud-dsn>"
-export DRIVE9_LOCAL_INIT_SCHEMA=true
+export DRIVE9_TENANT_PROVIDER=local
 export DRIVE9_EMBED_API_BASE="https://api.openai.com/v1"
 export DRIVE9_EMBED_API_KEY="<openai-key>"
 export DRIVE9_EMBED_MODEL="text-embedding-3-small"

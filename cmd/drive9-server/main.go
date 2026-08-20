@@ -87,13 +87,15 @@ func main() {
 	die(err)
 	die(schema.ConfigureTiDBAutoEmbedding(autoEmbeddingConfig))
 
-	if strings.TrimSpace(os.Getenv("DRIVE9_TENANT_PROVIDER")) == tenant.ProviderLocal {
-		applyLocalProviderEnvDefaults()
-	}
-
-	addr := envOr("DRIVE9_LISTEN_ADDR", defaultListenAddr)
+	cliAddr := ""
 	if len(os.Args) == 2 {
-		addr = os.Args[1]
+		cliAddr = os.Args[1]
+	}
+	localProvider := strings.TrimSpace(os.Getenv("DRIVE9_TENANT_PROVIDER")) == tenant.ProviderLocal
+	addr := resolveServerListenAddr(cliAddr, os.Getenv("DRIVE9_LISTEN_ADDR"), localProvider)
+	if localProvider {
+		applyLocalProviderEnvDefaults(addr)
+		die(rejectLocalProviderNonLoopbackDefaults(addr))
 	}
 
 	srvLogger, err := logger.NewServerLogger()
@@ -341,7 +343,6 @@ func main() {
 			IdleTimeout:                  envDuration("DRIVE9_POOL_IDLE_TTL", 5*time.Minute),
 			IdleReapInterval:             envDuration("DRIVE9_POOL_IDLE_REAP_INTERVAL", 2*time.Minute),
 			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
-			SkipTiDBSchemaCheck:          providerType == tenant.ProviderLocal,
 			LeaderChecker:                leaderManager,
 		}, enc)
 		// The cross-tenant quota mutation dispatcher (started in
@@ -644,7 +645,7 @@ environment:
                                      optional for openai models; set it for Azure OpenAI endpoints
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_native|local (default tidb_zero; local = TiDB CREATE DATABASE provisioner)
   DRIVE9_LOCAL_MYSQL_DSN admin DSN for provider=local (falls back to DRIVE9_LOCAL_DSN or DRIVE9_META_DSN)
-  DRIVE9_LOCAL_EMBEDDING_MODE app|auto for provider=local tenant schema (default app)
+  DRIVE9_LOCAL_EMBEDDING_MODE app for provider=local tenant schema (default app)
   DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default TiDB Cloud Cluster spendingLimit.monthly; native defaults to 1000 when unset
   DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Cluster API base URL for tidb_cloud_native
   DRIVE9_TIDBCLOUD_IAM_API_URL TiDB Cloud IAM API base URL; required for tidb_cloud_native

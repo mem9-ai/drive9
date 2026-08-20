@@ -25,7 +25,7 @@ final class Drive9IntegrationTests: XCTestCase {
     }
 
     private var apiKey: String {
-        ProcessInfo.processInfo.environment["DRIVE9_API_KEY"] ?? "local-dev-key"
+        ProcessInfo.processInfo.environment["DRIVE9_API_KEY"] ?? ""
     }
 
     private func makeClient() -> Drive9Client {

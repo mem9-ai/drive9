@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -36,10 +37,9 @@ const (
 	DefaultTokenSigningKeyHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	DefaultMasterKeyHex       = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-	dbNamePrefix  = "drive9_"
-	maxDBNameLen  = 64
-	embeddingApp  = "app"
-	embeddingAuto = "auto"
+	dbNamePrefix = "drive9_"
+	maxDBNameLen = 64
+	embeddingApp = "app"
 )
 
 // Provisioner implements tenant.Provisioner for a single existing TiDB
@@ -79,7 +79,7 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 
 func (p *Provisioner) ProviderType() string { return tenant.ProviderLocal }
 
-func (p *Provisioner) Provision(_ context.Context, tenantID string) (*tenant.ClusterInfo, error) {
+func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
 	if p == nil || p.admin == nil {
 		return nil, fmt.Errorf("local provisioner is not configured")
 	}
@@ -92,7 +92,7 @@ func (p *Provisioner) Provision(_ context.Context, tenantID string) (*tenant.Clu
 		return nil, err
 	}
 	defer func() { _ = admin.Close() }()
-	if _, err := admin.Exec("CREATE DATABASE IF NOT EXISTS " + quoteIdent(dbName)); err != nil {
+	if _, err := admin.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteIdent(dbName)); err != nil {
 		return nil, fmt.Errorf("create local tenant database %s: %w", dbName, err)
 	}
 	host, port := splitAddr(p.admin.Addr)
@@ -114,21 +114,15 @@ func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
 	if p == nil {
 		return fmt.Errorf("local provisioner is not configured")
 	}
-	switch p.mode {
-	case embeddingApp, "":
-		return schema.InitTiDBTenantSchemaForModeWithOptionsContext(ctx, dsn, schema.TiDBEmbeddingModeApp, schema.InitTiDBTenantSchemaOptions{
-			AllowUnsupportedOptionalIndexes: true,
-		})
-	case embeddingAuto:
-		return schema.InitTiDBTenantSchemaForModeWithOptionsContext(ctx, dsn, schema.TiDBEmbeddingModeAuto, schema.InitTiDBTenantSchemaOptions{
-			AllowUnsupportedOptionalIndexes: true,
-		})
-	default:
-		return fmt.Errorf("unsupported local embedding mode %q", p.mode)
+	if p.mode != "" && p.mode != embeddingApp {
+		return fmt.Errorf("unsupported local embedding mode %q (want app)", p.mode)
 	}
+	return schema.InitTiDBTenantSchemaForModeWithOptionsContext(ctx, dsn, schema.TiDBEmbeddingModeApp, schema.InitTiDBTenantSchemaOptions{
+		AllowUnsupportedOptionalIndexes: true,
+	})
 }
 
-func (p *Provisioner) Deprovision(_ context.Context, cluster *tenant.ClusterInfo) error {
+func (p *Provisioner) Deprovision(ctx context.Context, cluster *tenant.ClusterInfo) error {
 	if p == nil || p.admin == nil {
 		return fmt.Errorf("local provisioner is not configured")
 	}
@@ -147,7 +141,7 @@ func (p *Provisioner) Deprovision(_ context.Context, cluster *tenant.ClusterInfo
 		return err
 	}
 	defer func() { _ = admin.Close() }()
-	if _, err := admin.Exec("DROP DATABASE IF EXISTS " + quoteIdent(dbName)); err != nil {
+	if _, err := admin.ExecContext(ctx, "DROP DATABASE IF EXISTS "+quoteIdent(dbName)); err != nil {
 		return fmt.Errorf("drop local tenant database %s: %w", dbName, err)
 	}
 	return nil
@@ -184,10 +178,8 @@ func embeddingModeFromEnv() (string, error) {
 	switch raw {
 	case "", "app":
 		return embeddingApp, nil
-	case "auto":
-		return embeddingAuto, nil
 	default:
-		return "", fmt.Errorf("invalid %s %q (want app|auto)", EnvEmbeddingMode, raw)
+		return "", fmt.Errorf("invalid %s %q (want app)", EnvEmbeddingMode, raw)
 	}
 }
 
@@ -237,14 +229,21 @@ func splitAddr(addr string) (string, int) {
 	if addr == "" {
 		return host, port
 	}
-	h, p, ok := strings.Cut(addr, ":")
+	h, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		if strings.Contains(addr, "/") {
+			return host, port
+		}
+		if !strings.Contains(addr, ":") {
+			return addr, port
+		}
+		return host, port
+	}
 	if h != "" {
 		host = h
 	}
-	if ok && p != "" {
-		if n, err := strconv.Atoi(p); err == nil && n > 0 {
-			port = n
-		}
+	if n, convErr := strconv.Atoi(p); convErr == nil && n > 0 {
+		port = n
 	}
 	return host, port
 }

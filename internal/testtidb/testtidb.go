@@ -144,33 +144,10 @@ func OpenDB(t *testing.T, dsn string) *sql.DB {
 
 func ResetDB(t *testing.T, db *sql.DB) {
 	t.Helper()
-	queries := []string{
-		"DELETE FROM fs_layer_checkpoints",
-		"DELETE FROM fs_layer_events",
-		"DELETE FROM fs_layer_tags",
-		"DELETE FROM fs_layer_entries",
-		"DELETE FROM fs_layers",
-		"DELETE FROM quota_outbox",
-		"DELETE FROM quota_admission_locks",
-		"DELETE FROM file_gc_tasks",
-		"DELETE FROM fs_events",
-		"DELETE FROM semantic_tasks",
-		"DELETE FROM file_nodes",
-		"DELETE FROM file_tags",
-		"DELETE FROM uploads",
-		"DELETE FROM files",
-		"DELETE FROM inodes",
-		"DELETE FROM contents",
-		"DELETE FROM semantic",
-	}
-	for _, q := range queries {
-		if _, err := db.Exec(q); err != nil {
-			if isMissingTableError(err) {
-				continue
-			}
-			t.Fatalf("reset test db: %v", err)
-		}
-	}
+	execResetQueries(t, db, append(resetDeleteQueries, "DELETE FROM files"))
+	// DELETE does not rewind TiDB AUTO_INCREMENT (unlike MySQL). Tests that
+	// assert seq=1 / SSE since=1 need a real reset.
+	truncateAutoIncrementTable(t, db, "fs_events")
 }
 
 // ResetMetaDB clears control-plane tenant metadata tables for meta store tests.
@@ -196,28 +173,34 @@ func ResetMetaDB(t *testing.T, db *sql.DB) {
 	}
 }
 
+var resetDeleteQueries = []string{
+	"DELETE FROM fs_layer_checkpoints",
+	"DELETE FROM fs_layer_events",
+	"DELETE FROM fs_layer_tags",
+	"DELETE FROM fs_layer_entries",
+	"DELETE FROM fs_layers",
+	"DELETE FROM quota_outbox",
+	"DELETE FROM quota_admission_locks",
+	"DELETE FROM file_gc_tasks",
+	"DELETE FROM semantic_tasks",
+	"DELETE FROM file_nodes",
+	"DELETE FROM file_tags",
+	"DELETE FROM uploads",
+	"DELETE FROM inodes",
+	"DELETE FROM contents",
+	"DELETE FROM semantic",
+}
+
 // ResetDBWithoutFiles is like ResetDB but for tests that intentionally drop
 // the legacy files table to exercise the no-legacy-table code path.
 func ResetDBWithoutFiles(t *testing.T, db *sql.DB) {
 	t.Helper()
-	queries := []string{
-		"DELETE FROM fs_layer_checkpoints",
-		"DELETE FROM fs_layer_events",
-		"DELETE FROM fs_layer_tags",
-		"DELETE FROM fs_layer_entries",
-		"DELETE FROM fs_layers",
-		"DELETE FROM quota_outbox",
-		"DELETE FROM quota_admission_locks",
-		"DELETE FROM file_gc_tasks",
-		"DELETE FROM fs_events",
-		"DELETE FROM semantic_tasks",
-		"DELETE FROM file_nodes",
-		"DELETE FROM file_tags",
-		"DELETE FROM uploads",
-		"DELETE FROM inodes",
-		"DELETE FROM contents",
-		"DELETE FROM semantic",
-	}
+	execResetQueries(t, db, resetDeleteQueries)
+	truncateAutoIncrementTable(t, db, "fs_events")
+}
+
+func execResetQueries(t *testing.T, db *sql.DB, queries []string) {
+	t.Helper()
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {
 			if isMissingTableError(err) {
@@ -225,6 +208,16 @@ func ResetDBWithoutFiles(t *testing.T, db *sql.DB) {
 			}
 			t.Fatalf("reset test db: %v", err)
 		}
+	}
+}
+
+func truncateAutoIncrementTable(t *testing.T, db *sql.DB, table string) {
+	t.Helper()
+	if _, err := db.Exec("TRUNCATE TABLE `" + table + "`"); err != nil {
+		if isMissingTableError(err) {
+			return
+		}
+		t.Fatalf("truncate %s: %v", table, err)
 	}
 }
 

@@ -40,6 +40,10 @@ func TestSplitAddr(t *testing.T) {
 	if host != "127.0.0.1" || port != 3306 {
 		t.Fatalf("splitAddr empty = %s:%d", host, port)
 	}
+	host, port = splitAddr("[::1]:4000")
+	if host != "::1" || port != 4000 {
+		t.Fatalf("splitAddr ipv6 = %s:%d, want [::1]:4000", host, port)
+	}
 }
 
 func TestDeprovisionRefusesNonPrefixedName(t *testing.T) {
@@ -94,6 +98,10 @@ func TestEmbeddingModeFromEnv(t *testing.T) {
 	t.Setenv(EnvEmbeddingMode, "none")
 	if _, err := embeddingModeFromEnv(); err == nil {
 		t.Fatal("expected none embedding mode to be rejected")
+	}
+	t.Setenv(EnvEmbeddingMode, "auto")
+	if _, err := embeddingModeFromEnv(); err == nil {
+		t.Fatal("expected auto embedding mode to be rejected")
 	}
 }
 

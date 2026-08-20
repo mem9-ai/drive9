@@ -183,7 +183,7 @@ env:
 
 jobs:
   local-e2e:
-    name: drive9-server local e2e smoke
+    name: Local E2E
     runs-on: ubuntu-latest
     timeout-minutes: 120
 

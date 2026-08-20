@@ -39,7 +39,7 @@ WRITE_OFFSET="${WRITE_OFFSET:-65536}"
 WRITE_BYTES="${WRITE_BYTES:-4096}"
 
 DEFAULT_LOCAL_DSN="root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true"
-LOCAL_API_KEY="${DRIVE9_LOCAL_API_KEY:-local-dev-key}"
+LOCAL_API_KEY="${DRIVE9_LOCAL_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-90}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-1}"
 MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
@@ -130,6 +130,9 @@ PY
     mysql --protocol=tcp -h "$host" -P "$port" -u root -e "CREATE DATABASE IF NOT EXISTS \`$db\`;" >/dev/null
   elif command -v mycli >/dev/null 2>&1; then
     mycli --host "$host" --port "$port" -u root -e "CREATE DATABASE IF NOT EXISTS \`$db\`;" >/dev/null
+  else
+    echo "mysql or mycli is required to CREATE DATABASE \`$db\`" >&2
+    exit 1
   fi
 }
 

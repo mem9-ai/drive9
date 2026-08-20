@@ -22,7 +22,7 @@ import { Client, StreamWriter, ConflictError } from "../src/index.js";
 
 const ENABLED = !!process.env.DRIVE9_INTEGRATION;
 const BASE = (process.env.DRIVE9_SERVER ?? "http://127.0.0.1:9009").replace(/\/$/, "");
-const API_KEY = process.env.DRIVE9_API_KEY ?? "local-dev-key";
+const API_KEY = process.env.DRIVE9_API_KEY ?? "";
 
 // Minimal ustar reader: returns entry names (dirs get trailing slash).
 function listTarGzNames(buf: Buffer): string[] {
@@ -104,7 +104,7 @@ async function serverReachable(): Promise<boolean> {
   }
 }
 
-const describeIntegration = ENABLED ? describe : describe.skip;
+const describeIntegration = ENABLED && API_KEY ? describe : describe.skip;
 
 describeIntegration("TypeScript SDK integration", () => {
   beforeEach(async () => {

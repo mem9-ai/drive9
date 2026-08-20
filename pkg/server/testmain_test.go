@@ -21,7 +21,7 @@ func TestMain(m *testing.M) {
 
 	inst, err := testtidb.Start(context.Background())
 	if err != nil {
-		log.Fatalf("setup mysql test instance: %v", err)
+		log.Fatalf("setup tidb test instance: %v", err)
 	}
 	testDSN = inst.DSN
 

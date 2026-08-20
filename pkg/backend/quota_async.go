@@ -8,9 +8,9 @@ import (
 // apply. Enqueued mutations are handed to the process-global mutation
 // dispatcher (mutation_dispatcher.go), which batches applies cross-tenant
 // into single metadb transactions while preserving per-tenant FIFO (one
-// shard per tenant). When the dispatcher is not running (unit tests,
-// provider=local) or the backend is closing, items apply inline,
-// exactly like the pre-dispatcher per-backend queue fallback did.
+// shard per tenant). When the dispatcher is not running (unit tests)
+// or the backend is closing, items apply inline, exactly like the
+// pre-dispatcher per-backend queue fallback did.
 //
 // Cross-instance ordering is not guaranteed; see logAndEnqueueMutation.
 // The durable quota_mutation_log plus MutationReplayWorker provides the
