@@ -22,7 +22,7 @@ func TestMain(m *testing.M) {
 
 	code := m.Run()
 	if err := inst.Close(context.Background()); err != nil {
-		log.Printf("teardown mysql test instance: %v", err)
+		log.Printf("teardown tidb test instance: %v", err)
 	}
 	os.Exit(code)
 }
