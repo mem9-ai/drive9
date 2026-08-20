@@ -216,6 +216,11 @@ type Server struct {
 	forkWorkerWG              sync.WaitGroup
 	forkWorkerMu              sync.Mutex
 	forkWorkerClosed          bool
+	// forkStartupResumeDone is closed after the one-shot deleting/failed fork
+	// resume launched from startLeaderWorkers returns (or immediately when
+	// that resume is not scheduled). Tests wait on it so later inserts cannot
+	// race the startup list.
+	forkStartupResumeDone     chan struct{}
 	tenantPoolLocks           sync.Map
 	tenantPoolReplenishJobs   sync.Map
 	tenantPoolCreateLocks     sync.Map
@@ -430,6 +435,7 @@ func NewWithConfig(cfg Config) *Server {
 		journalCursorSecret:     newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:           forkWorkerCtx,
 		forkWorkerCancel:        forkWorkerCancel,
+		forkStartupResumeDone:   make(chan struct{}),
 		sweepCtx:                sweepCtx,
 		sweepCancel:             sweepCancel,
 		tidbCloudRBACCache:      newTiDBCloudRBACCache(tidbCloudRBACCacheTTL),
@@ -930,6 +936,7 @@ func (s *Server) startLeaderWorkers() {
 			s.resumeProvisioningTenantsWithCtx(workerCtx)
 		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			defer close(s.forkStartupResumeDone)
 			s.resumeDeletingForkTenantsWithCtx(workerCtx)
 		})
 		// Periodic tenant delete cleanup.
@@ -984,6 +991,8 @@ func (s *Server) startLeaderWorkers() {
 				}
 			}
 		})
+	} else {
+		close(s.forkStartupResumeDone)
 	}
 	// Per-tenant FileGC and quota outbox workers are no longer per-backend
 	// goroutines — they are driven by kicks through the unified tenant worker.

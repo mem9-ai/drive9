@@ -240,6 +240,11 @@ func newForkCleanupTestRuntimeWithProvisioner(t *testing.T, override tenant.Prov
 	}
 	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: configuredProvisioner,
 		TokenSecret: []byte("ctx-fork-test-secret")})
+	select {
+	case <-server.forkStartupResumeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for startup fork cleanup resume")
+	}
 	t.Cleanup(server.Close)
 	return &forkCleanupTestRuntime{server: server, meta: db.Meta, pool: db.Pool, prov: prov, dbHost: db.DBHost, dbPort: db.DBPort, dbUser: db.DBUser, dbPass: db.DBPass, dbName: db.DBName}
 }
