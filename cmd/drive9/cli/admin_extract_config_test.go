@@ -47,10 +47,10 @@ func TestAdminTenantExtractConfigGetPrintsTableAndHeaders(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v1/admin/tenants/tenant-1/extract-config/audio" {
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 		if r.Header.Get("X-TiDBCloud-Public-Key") != "public-1" || r.Header.Get("X-TiDBCloud-Private-Key") != "private-1" {
-			t.Fatalf("missing TiDB Cloud headers")
+			t.Errorf("missing TiDB Cloud headers")
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"enabled":    true,
@@ -94,13 +94,13 @@ func TestAdminTenantExtractConfigSetPreservesExplicitFields(t *testing.T) {
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut || r.URL.Path != "/v1/admin/tenants/tenant-1/extract-config/image" {
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 		if r.Header.Get("X-TiDBCloud-Public-Key") != "public-1" || r.Header.Get("X-TiDBCloud-Private-Key") != "private-1" {
-			t.Fatalf("missing TiDB Cloud headers")
+			t.Errorf("missing TiDB Cloud headers")
 		}
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-			t.Fatalf("decode body: %v", err)
+			t.Errorf("decode body: %v", err)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"enabled": false,
@@ -147,7 +147,7 @@ func TestAdminTenantExtractConfigSetFullProviderBody(t *testing.T) {
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-			t.Fatalf("decode body: %v", err)
+			t.Errorf("decode body: %v", err)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"enabled":  true,

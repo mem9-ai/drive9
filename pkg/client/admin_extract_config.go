@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // ExtractMediaType identifies the media-specific extraction configuration.
@@ -23,13 +24,13 @@ const (
 // AdminTenantExtractConfig is the effective extraction configuration returned
 // by the admin API. APIKey is masked by the server.
 type AdminTenantExtractConfig struct {
-	Enabled   bool   `json:"enabled"`
-	APIBase   string `json:"api_base,omitempty"`
-	APIKey    string `json:"api_key,omitempty"`
-	Model     string `json:"model,omitempty"`
-	Prompt    string `json:"prompt,omitempty"`
-	Source    string `json:"source"`
-	UpdatedAt string `json:"updated_at,omitempty"`
+	Enabled   bool       `json:"enabled"`
+	APIBase   *string    `json:"api_base,omitempty"`
+	APIKey    *string    `json:"api_key,omitempty"`
+	Model     *string    `json:"model,omitempty"`
+	Prompt    *string    `json:"prompt,omitempty"`
+	Source    string     `json:"source"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
 
 // AdminTenantExtractConfigGetRequest identifies a tenant and media type for
@@ -91,13 +92,15 @@ func (c *Client) AdminSetTenantExtractConfig(ctx context.Context, update AdminTe
 }
 
 func adminTenantExtractConfigPath(tenantID string, mediaType ExtractMediaType) (string, error) {
-	if strings.TrimSpace(tenantID) == "" {
+	tenantID = strings.TrimSpace(tenantID)
+	mediaTypeValue := strings.TrimSpace(string(mediaType))
+	if tenantID == "" {
 		return "", fmt.Errorf("tenant ID is required")
 	}
-	if strings.TrimSpace(string(mediaType)) == "" {
+	if mediaTypeValue == "" {
 		return "", fmt.Errorf("media type is required")
 	}
-	return "/v1/admin/tenants/" + url.PathEscape(tenantID) + "/extract-config/" + url.PathEscape(string(mediaType)), nil
+	return "/v1/admin/tenants/" + url.PathEscape(tenantID) + "/extract-config/" + url.PathEscape(mediaTypeValue), nil
 }
 
 func (c *Client) doAdminTenantExtractConfig(req *http.Request, operation string) (*AdminTenantExtractConfig, error) {

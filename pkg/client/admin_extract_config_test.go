@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestAdminGetTenantExtractConfigSendsHeadersAndDecodesResponse(t *testing.T) {
@@ -17,7 +18,7 @@ func TestAdminGetTenantExtractConfigSendsHeadersAndDecodesResponse(t *testing.T)
 	var gotPrivateKey string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			t.Fatalf("method = %s, want GET", r.Method)
+			t.Errorf("method = %s, want GET", r.Method)
 		}
 		gotEscapedPath = r.URL.EscapedPath()
 		gotPublicKey = r.Header.Get("X-TiDBCloud-Public-Key")
@@ -35,8 +36,8 @@ func TestAdminGetTenantExtractConfigSendsHeadersAndDecodesResponse(t *testing.T)
 	defer srv.Close()
 
 	out, err := New(srv.URL, "").AdminGetTenantExtractConfig(context.Background(), AdminTenantExtractConfigGetRequest{
-		TenantID:   "tenant/1",
-		MediaType:  ExtractMediaType("future/type"),
+		TenantID:   " tenant/1 ",
+		MediaType:  ExtractMediaType(" future/type "),
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	})
@@ -49,7 +50,11 @@ func TestAdminGetTenantExtractConfigSendsHeadersAndDecodesResponse(t *testing.T)
 	if gotPublicKey != "public-1" || gotPrivateKey != "private-1" {
 		t.Fatalf("credentials public=%q private=%q", gotPublicKey, gotPrivateKey)
 	}
-	if !out.Enabled || out.Source != "custom" || out.APIBase != "https://provider.example.com" || out.APIKey != "sk-a********" || out.Model != "vision-model" || out.Prompt != "custom prompt" || out.UpdatedAt != "2026-08-21T01:02:03Z" {
+	updatedAt, err := time.Parse(time.RFC3339, "2026-08-21T01:02:03Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.APIBase == nil || *out.APIBase != "https://provider.example.com" || out.APIKey == nil || *out.APIKey != "sk-a********" || out.Model == nil || *out.Model != "vision-model" || out.Prompt == nil || *out.Prompt != "custom prompt" || out.UpdatedAt == nil || !out.UpdatedAt.Equal(updatedAt) || !out.Enabled || out.Source != "custom" {
 		t.Fatalf("response = %#v", out)
 	}
 }
@@ -62,16 +67,16 @@ func TestAdminSetTenantExtractConfigPreservesPartialFieldPresence(t *testing.T) 
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
-			t.Fatalf("method = %s, want PUT", r.Method)
+			t.Errorf("method = %s, want PUT", r.Method)
 		}
 		if r.URL.Path != "/v1/admin/tenants/tenant-1/extract-config/audio" {
-			t.Fatalf("path = %q", r.URL.Path)
+			t.Errorf("path = %q", r.URL.Path)
 		}
 		if r.Header.Get("X-TiDBCloud-Public-Key") != "public-1" || r.Header.Get("X-TiDBCloud-Private-Key") != "private-1" {
-			t.Fatalf("missing TiDB Cloud credential headers")
+			t.Errorf("missing TiDB Cloud credential headers")
 		}
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-			t.Fatalf("decode request body: %v", err)
+			t.Errorf("decode request body: %v", err)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"enabled": false,
@@ -113,6 +118,28 @@ func TestAdminTenantExtractConfigRejectsEmptyIdentity(t *testing.T) {
 	}
 	if _, err := c.AdminGetTenantExtractConfig(context.Background(), AdminTenantExtractConfigGetRequest{TenantID: "tenant-1"}); err == nil {
 		t.Fatal("empty media type error = nil")
+	}
+}
+
+func TestAdminTenantExtractConfigPreservesOptionalResponsePresence(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"enabled":false,"api_base":"","prompt":"","source":"none"}`))
+	}))
+	defer srv.Close()
+
+	out, err := New(srv.URL, "").AdminGetTenantExtractConfig(context.Background(), AdminTenantExtractConfigGetRequest{
+		TenantID: "tenant-1", MediaType: ExtractMediaTypeImage,
+	})
+	if err != nil {
+		t.Fatalf("AdminGetTenantExtractConfig: %v", err)
+	}
+	if out.APIBase == nil || *out.APIBase != "" || out.Prompt == nil || *out.Prompt != "" {
+		t.Fatalf("explicit empty values lost: %#v", out)
+	}
+	if out.APIKey != nil || out.Model != nil || out.UpdatedAt != nil {
+		t.Fatalf("absent values decoded as present: %#v", out)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
@@ -284,8 +285,22 @@ func printAdminTenantExtractConfigResponse(out *client.AdminTenantExtractConfig,
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	_, _ = fmt.Fprintln(w, "MEDIA_TYPE\tENABLED\tSOURCE\tAPI_BASE\tAPI_KEY\tMODEL\tPROMPT\tUPDATED_AT")
-	_, _ = fmt.Fprintf(w, "%s\t%t\t%s\t%s\t%s\t%s\t%s\t%s\n", mediaType, out.Enabled, emptyAsDash(out.Source), emptyAsDash(out.APIBase), emptyAsDash(out.APIKey), emptyAsDash(out.Model), emptyAsDash(out.Prompt), emptyAsDash(out.UpdatedAt))
+	_, _ = fmt.Fprintf(w, "%s\t%t\t%s\t%s\t%s\t%s\t%s\t%s\n", mediaType, out.Enabled, emptyAsDash(out.Source), optionalExtractString(out.APIBase), optionalExtractString(out.APIKey), optionalExtractString(out.Model), optionalExtractString(out.Prompt), optionalExtractTime(out.UpdatedAt))
 	return w.Flush()
+}
+
+func optionalExtractString(value *string) string {
+	if value == nil {
+		return "-"
+	}
+	return emptyAsDash(*value)
+}
+
+func optionalExtractTime(value *time.Time) string {
+	if value == nil || value.IsZero() {
+		return "-"
+	}
+	return value.Format(time.RFC3339)
 }
 
 func adminTenantExtractConfigUsage() string {
