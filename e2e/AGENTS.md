@@ -105,6 +105,10 @@ RUN_FUSE_SMOKE=0 bash e2e/smoke-all.sh
 # Post-merge extras on top of the PR set
 RUN_JOURNAL_SMOKE=1 RUN_POSIX_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
 
+# Opt-in HTTP extras (off by default, including post-merge)
+RUN_TOKENS_SMOKE=1 bash e2e/tokens-smoke-test.sh
+RUN_SSE_SMOKE=1 bash e2e/sse-retention-smoke-test.sh
+
 # TiDB Cloud Native (tidbcloud-native) tenant lifecycle smoke
 # Requires credentials, not wired into CI. Set DRIVE9_BASE from Deployment
 # endpoints above, or export manually. Credentials are stored in repo secrets
@@ -485,6 +489,21 @@ developer machines or EC2-style validation rather than the default smoke path.
 7. Platform-aware `stat` for macOS (`stat -f %Lp`) and Linux (`stat -c %a`)
 8. Cleanup of remote permission test trees
 
+### `tokens-smoke-test.sh`
+
+Opt-in (`RUN_TOKENS_SMOKE=1`). HTTP `/v1/tokens` management: credential
+dispatcher, scoped issue/list/activate/deactivate/delete/revoke/refresh,
+scoped gate, and control-plane generate/list when `provider=local` mock IAM
+is enabled. Not part of the PR or post-merge default.
+
+### `sse-retention-smoke-test.sh`
+
+Opt-in (`RUN_SSE_SMOKE=1`). `GET /v1/events` initial sync, live
+`file_changed` delivery, cursor replay, and a >1000-event backlog drain.
+Optional `SSE_SWEEP_TEST=1` (needs a short `DRIVE9_FS_EVENTS_RETENTION`)
+checks retention pruning via dedicated-shape `POST /v1/sql`. Not part of
+the PR or post-merge default.
+
 ### `git-feature-smoke-test.sh`
 
 Broader Git feature smoke on a coding-agent FUSE mount (clone modes, readiness,
@@ -570,6 +589,8 @@ existing-tenant mode in one shot. Set `RUN_API_ONLY=1` for api + cli only.
 Set `RUN_FUSE_SMOKE=0` to skip FUSE-related suites (and layer-fs FUSE restore);
 macOS WebDAV fallback cannot satisfy those asserts. Post-merge extras:
 `RUN_JOURNAL_SMOKE=1`, `RUN_POSIX_SMOKE=1`, `RUN_GIT_WORKSPACE_SMOKE=1`.
+Opt-in HTTP extras (off even on post-merge): `RUN_TOKENS_SMOKE=1`,
+`RUN_SSE_SMOKE=1`.
 
 ### `native-smoke-test.sh`
 
@@ -681,6 +702,8 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `RUN_GIT_WORKSPACE_SMOKE` | `0` | `smoke-all.sh` post-merge extra |
 | `RUN_JOURNAL_SMOKE` | `0` | `smoke-all.sh` post-merge extra |
 | `RUN_POSIX_SMOKE` | `0` | `smoke-all.sh` post-merge extra |
+| `RUN_TOKENS_SMOKE` | `0` | `smoke-all.sh` opt-in extra (`e2e/tokens-smoke-test.sh`) |
+| `RUN_SSE_SMOKE` | `0` | `smoke-all.sh` opt-in extra (`e2e/sse-retention-smoke-test.sh`) |
 | `RUN_FUSE_SMOKE` | `1` | `smoke-all.sh` |
 | `RUN_API_ONLY` | `0` | `smoke-all.sh` (run only api + cli, skip the rest) |
 | `GIT_WORKSPACE_REPOS` | `drive9=...,kimi-cli=...,kimi-code=...` | `git-workspace-smoke-test.sh` |

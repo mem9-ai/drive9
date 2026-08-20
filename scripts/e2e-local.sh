@@ -22,6 +22,8 @@
 #   RUN_CLI_SEMANTIC_CHECKS=0   cli embedding/recall (set 1 to enable)
 #   RUN_SQL_CHECKS=0            api POST /v1/sql (set 1 to enable)
 #   RUN_CLI_FORK_CHECKS=0       cli tenant fork (set 1 to enable)
+#   RUN_TOKENS_SMOKE=0          /v1/tokens management smoke (set 1 to enable)
+#   RUN_SSE_SMOKE=0             /v1/events retention smoke (set 1 to enable)
 #
 # Compatible with macOS bash 3.2.
 

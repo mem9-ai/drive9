@@ -18,6 +18,9 @@
 #    layer-fs FUSE restore. macOS WebDAV cannot satisfy those asserts.
 #  - RUN_JOURNAL_SMOKE=1 / RUN_POSIX_SMOKE=1 / RUN_GIT_WORKSPACE_SMOKE=1 —
 #    extras used by post-merge local-e2e, not part of the PR default.
+#  - RUN_TOKENS_SMOKE=1 / RUN_SSE_SMOKE=1 — HTTP tokens + SSE retention
+#    extras; off by default (not even post-merge). Enable from an integrator
+#    that points DRIVE9_SERVER_BIN at a server with those surfaces.
 
 set -euo pipefail
 
@@ -32,6 +35,8 @@ export RUN_LAYER_FUSE_SMOKE
 RUN_JOURNAL_SMOKE="${RUN_JOURNAL_SMOKE:-0}"
 RUN_POSIX_SMOKE="${RUN_POSIX_SMOKE:-0}"
 RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
+RUN_TOKENS_SMOKE="${RUN_TOKENS_SMOKE:-0}"
+RUN_SSE_SMOKE="${RUN_SSE_SMOKE:-0}"
 
 if [ "$RUN_FUSE_SMOKE" = "1" ]; then
   export FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-1}"
@@ -126,6 +131,12 @@ if [ "$RUN_POSIX_SMOKE" = "1" ]; then
 fi
 if [ "$RUN_GIT_WORKSPACE_SMOKE" = "1" ]; then
   run_fuse_case "git-workspace" "e2e/git-workspace-smoke-test.sh"
+fi
+if [ "$RUN_TOKENS_SMOKE" = "1" ]; then
+  run_case "tokens" "e2e/tokens-smoke-test.sh"
+fi
+if [ "$RUN_SSE_SMOKE" = "1" ]; then
+  run_case "sse-retention" "e2e/sse-retention-smoke-test.sh"
 fi
 
 echo
