@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/mem9-ai/drive9/pkg/embedding"
 	"github.com/mem9-ai/drive9/pkg/s3client"
 	"github.com/mem9-ai/drive9/pkg/semantic"
+	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
 type backendSemanticTaskRow struct {
@@ -45,10 +47,11 @@ func loadSemanticTasksForFile(t *testing.T, b *Dat9Backend, fileID string) []bac
 
 func setStoredEmbeddingState(t *testing.T, b *Dat9Backend, fileID string, revision int64) {
 	t.Helper()
-	if _, err := b.Store().DB().Exec(`UPDATE files SET embedding = ?, embedding_revision = ? WHERE file_id = ?`, "old-vector", revision, fileID); err != nil {
+	vector := embedding.FormatVector(make([]float32, schema.TiDBAutoEmbeddingDimensions))
+	if _, err := b.Store().DB().Exec(`UPDATE files SET embedding = ?, embedding_revision = ? WHERE file_id = ?`, vector, revision, fileID); err != nil {
 		t.Fatalf("set embedding state for %s: %v", fileID, err)
 	}
-	if _, err := b.Store().DB().Exec(`UPDATE semantic SET embedding = ?, embedding_revision = ? WHERE inode_id = ?`, "old-vector", revision, fileID); err != nil {
+	if _, err := b.Store().DB().Exec(`UPDATE semantic SET embedding = ?, embedding_revision = ? WHERE inode_id = ?`, vector, revision, fileID); err != nil {
 		t.Fatalf("set semantic embedding state for %s: %v", fileID, err)
 	}
 }

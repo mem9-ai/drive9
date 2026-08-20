@@ -1,7 +1,7 @@
 // Integration tests for the Drive9 Rust SDK.
 //
 // Exercises every exported Client / StreamWriter method against a live
-// drive9-server-local. Marked `#[ignore]` so the default `cargo test` (which
+// local drive9-server (provider=local). Marked `#[ignore]` so the default `cargo test` (which
 // runs the mockito-backed unit tests) does not require a server. The
 // cross-SDK runner (scripts/sdk-integration-tests.sh) invokes:
 //
@@ -322,7 +322,7 @@ async fn integration_vault() {
     let sec_name = format!("it-rs-secret-{}", ts());
 
     // The vault backend requires a master-key configuration that
-    // drive9-server-local does not enable by default. Treat the suite as
+    // local drive9-server does not enable by default. Treat the suite as
     // best-effort: exercise the call path but return early when the server
     // reports the vault backend is unavailable.
     let mut fields = serde_json::Map::new();

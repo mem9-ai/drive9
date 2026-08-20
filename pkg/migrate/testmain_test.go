@@ -9,13 +9,13 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 )
 
 var testDSN string
 
 func TestMain(m *testing.M) {
-	inst, err := testmysql.Start(context.Background())
+	inst, err := testtidb.Start(context.Background())
 	if err != nil {
 		log.Fatalf("setup mysql test instance: %v", err)
 	}

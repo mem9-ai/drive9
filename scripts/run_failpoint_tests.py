@@ -37,7 +37,7 @@ def main() -> int:
 
     exit_code = 0
     try:
-        if not env.get("DRIVE9_TEST_MYSQL_DSN") and command_exists("podman"):
+        if not env.get("DRIVE9_TEST_TIDB_DSN") and command_exists("podman"):
             env = load_podman_test_env(repo_root, env)
         run([str(failpoint_ctl), "enable", "."], cwd=repo_root, env=env)
         for pkg, tests in sorted(tests_by_pkg.items()):

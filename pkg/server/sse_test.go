@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 )
 
@@ -49,7 +49,7 @@ func newTestStoreForSSE(t *testing.T) *datastore.Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	testmysql.ResetDB(t, store.DB())
+	testtidb.ResetDB(t, store.DB())
 	if _, err := store.DB().Exec(`CREATE TABLE IF NOT EXISTS fs_events (
 		seq        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
 		path       TEXT NOT NULL,

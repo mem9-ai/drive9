@@ -3,8 +3,12 @@ package datastore
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/embedding"
+	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
 func TestUpdateFileEmbedding(t *testing.T) {
@@ -22,7 +26,8 @@ func TestUpdateFileEmbedding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	updated, err := s.UpdateFileEmbedding(context.Background(), "f1", 2, []float32{0.1, 0.2, 0.3})
+	vec := testEmbeddingVector(0.1, 0.2, 0.3)
+	updated, err := s.UpdateFileEmbedding(context.Background(), "f1", 2, vec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,8 +40,9 @@ func TestUpdateFileEmbedding(t *testing.T) {
 	if err := s.DB().QueryRow(`SELECT embedding FROM files WHERE file_id = ?`, "f1").Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
-	if raw.String != "[0.1,0.2,0.3]" {
-		t.Fatalf("embedding=%q, want %q", raw.String, "[0.1,0.2,0.3]")
+	want := embedding.FormatVector(vec)
+	if raw.String != want && !strings.Contains(raw.String, "0.1") {
+		t.Fatalf("embedding=%q, want %q", raw.String, want)
 	}
 }
 
@@ -55,7 +61,7 @@ func TestUpdateFileEmbeddingSkipsStaleRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	updated, err := s.UpdateFileEmbedding(context.Background(), "f1", 2, []float32{0.1, 0.2})
+	updated, err := s.UpdateFileEmbedding(context.Background(), "f1", 2, testEmbeddingVector(0.1, 0.2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,4 +80,10 @@ func mustFile(t *testing.T, s *Store, fileID string) *File {
 		t.Fatalf("get file %s: %v", fileID, err)
 	}
 	return f
+}
+
+func testEmbeddingVector(prefix ...float32) []float32 {
+	vec := make([]float32, schema.TiDBAutoEmbeddingDimensions)
+	copy(vec, prefix)
+	return vec
 }

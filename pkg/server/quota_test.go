@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
@@ -415,9 +415,9 @@ func quotaConfigRowExists(t *testing.T, rt *quotaRuntime) bool {
 func newQuotaRuntimeWithOptions(t *testing.T, provider string, opts quotaRuntimeOptions) *quotaRuntime {
 	t.Helper()
 	db := newTenantDeleteDBInfo(t)
-	testmysql.ResetMetaDB(t, db.Meta.DB())
+	testtidb.ResetMetaDB(t, db.Meta.DB())
 	t.Cleanup(func() {
-		testmysql.ResetMetaDB(t, db.Meta.DB())
+		testtidb.ResetMetaDB(t, db.Meta.DB())
 	})
 
 	tenantID := token.NewID()

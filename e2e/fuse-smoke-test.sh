@@ -703,9 +703,9 @@ start_mount() {
     echo "=== drive9 mount start mode=$mode time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
   } >>"$MOUNT_LOG"
   if [ "$mode" = "ro" ]; then
-    drive9 mount --read-only "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+    drive9 mount --mode=fuse --read-only "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
   else
-    drive9 mount "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+    drive9 mount --mode=fuse "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
   fi
   MOUNT_PID="$!"
 

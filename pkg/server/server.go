@@ -176,7 +176,7 @@ func (s *Server) provisionerForTenantProvider(provider string) tenant.Provisione
 	switch provider {
 	case tenant.ProviderTiDBCloudStarterLegacy:
 		return s.legacyStarterProvisioner
-	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBZero, tenant.ProviderDB9:
+	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBZero, tenant.ProviderDB9, tenant.ProviderLocal:
 		return s.provisioner
 	default:
 		return nil
@@ -2032,8 +2032,8 @@ func (s *Server) localTenantShimEnabled() bool {
 	return s.fallback != nil && s.meta == nil && s.pool == nil && len(s.tokenSecret) == 0 && s.localTenantAPIKey != ""
 }
 
-// handleLocalTenantStatus serves drive9-server-local's single-tenant compatibility
-// path so e2e scripts can probe tenant status without enabling the multi-tenant
+// handleLocalTenantStatus serves the legacy single-tenant compatibility
+// path so unit tests can probe tenant status without enabling the multi-tenant
 // control plane.
 func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request) {
 	tok := bearerToken(r)
@@ -5751,6 +5751,9 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 }
 
 func dbTLSForProvisionedTenant(provider string) bool {
+	if provider == tenant.ProviderLocal {
+		return false
+	}
 	if !tenant.UsesTiDBCloudNativeCredentials(provider) {
 		return true
 	}
@@ -5829,8 +5832,8 @@ func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string,
 	return rawToken, apiKeyID, nil
 }
 
-// handleLocalTenantProvision serves drive9-server-local's single-tenant
-// compatibility path so e2e scripts can obtain one stable API key without
+// handleLocalTenantProvision serves the legacy single-tenant
+// compatibility path so unit tests can obtain one stable API key without
 // enabling the multi-tenant provision flow.
 func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Request) {
 	setRequestMetricTenant(r.Context(), "local", "local", "local", "", classifyTenantRequest(r))

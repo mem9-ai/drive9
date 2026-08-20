@@ -5,6 +5,7 @@ import "fmt"
 const (
 	ProviderDB9             = "db9"
 	ProviderTiDBZero        = "tidb_zero"
+	ProviderLocal           = "local"
 	ProviderTiDBCloudNative = "tidb_cloud_native"
 
 	// ProviderTiDBCloudStarterLegacy is kept only for tenant rows persisted
@@ -15,7 +16,7 @@ const (
 
 func NormalizeProvider(provider string) (string, error) {
 	switch provider {
-	case ProviderDB9, ProviderTiDBZero, ProviderTiDBCloudNative:
+	case ProviderDB9, ProviderTiDBZero, ProviderLocal, ProviderTiDBCloudNative:
 		return provider, nil
 	default:
 		return "", fmt.Errorf("unsupported provider: %s", provider)
@@ -30,7 +31,7 @@ func UsesTiDBCloudNativeCredentials(provider string) bool {
 
 func SmallInDB(provider string) bool {
 	switch provider {
-	case ProviderTiDBZero, ProviderTiDBCloudNative, ProviderTiDBCloudStarterLegacy:
+	case ProviderTiDBZero, ProviderLocal, ProviderTiDBCloudNative, ProviderTiDBCloudStarterLegacy:
 		return true
 	default:
 		return false
@@ -52,5 +53,5 @@ func UsesTiDBAutoEmbedding(provider string) bool {
 // its backing TiDB Cloud cluster. The legacy starter value is kept only so rows
 // persisted before starter provisioning was removed keep their cleanup path.
 func SupportsClusterDelete(provider string) bool {
-	return provider == ProviderTiDBCloudNative || provider == ProviderTiDBCloudStarterLegacy
+	return provider == ProviderTiDBCloudNative || provider == ProviderTiDBCloudStarterLegacy || provider == ProviderLocal
 }

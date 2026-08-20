@@ -266,80 +266,93 @@ class Drive9FuseTargetProvider:
             return "docker"
         if shutil.which("podman"):
             return "podman"
-        raise BlackboxError("docker or podman is required when DRIVE9_LOCAL_DSN is not set")
+        raise BlackboxError("docker or podman is required when TiDB is not already reachable")
 
-    def start_mysql_if_needed(self) -> str:
-        dsn = os.environ.get("DRIVE9_LOCAL_DSN", "")
+    def parse_tcp_dsn(self, dsn: str) -> tuple[str, int, str]:
+        import re
+
+        match = re.search(r"@tcp\(([^:]+):(\d+)\)/([^?]*)", dsn)
+        if not match:
+            raise BlackboxError(f"cannot parse host/port from DSN: {dsn}")
+        return match.group(1), int(match.group(2)), match.group(3) or "drive9_local"
+
+    def wait_for_tidb(self, host: str, port: int, timeout: float = 90) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if mysql_tcp_handshake_ready(host, port):
+                return
+            time.sleep(0.5)
+        raise BlackboxError(f"timed out waiting for TiDB at {host}:{port}")
+
+    def ensure_database(self, dsn: str) -> None:
+        host, port, db_name = self.parse_tcp_dsn(dsn)
+        mysql = shutil.which("mysql")
+        if mysql is None or not db_name:
+            return
+        subprocess.run(
+            [mysql, "--protocol=tcp", "-h", host, "-P", str(port), "-u", "root", "-e", f"CREATE DATABASE IF NOT EXISTS `{db_name}`;"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+    def start_tidb_if_needed(self) -> str:
+        dsn = os.environ.get("DRIVE9_LOCAL_DSN", "").strip()
         if dsn:
             progress("setup: using DRIVE9_LOCAL_DSN for local datastore")
+            host, port, _ = self.parse_tcp_dsn(dsn)
+            self.wait_for_tidb(host, port)
+            self.ensure_database(dsn)
             return dsn
+        default = "root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true"
+        if mysql_tcp_handshake_ready("127.0.0.1", 4000):
+            progress("setup: using local TiDB at 127.0.0.1:4000")
+            self.ensure_database(default)
+            return default
         runtime = self.detect_runtime()
         self.db_runtime = runtime
-        image = os.environ.get("DRIVE9_LOCAL_E2E_DB_IMAGE", "mysql:8.4")
-        password = os.environ.get("DRIVE9_LOCAL_E2E_DB_PASSWORD", "drive9pass")
+        image = os.environ.get("DRIVE9_LOCAL_E2E_DB_IMAGE", "pingcap/tidb:v8.5.5")
         db_name = os.environ.get("DRIVE9_LOCAL_E2E_DB_NAME", "drive9_local")
         self.db_container = f"drive9-blackbox-{int(time.time())}-{os.getpid()}"
-        progress(f"setup: starting MySQL container {self.db_container} with {runtime} image={image}")
+        progress(f"setup: starting TiDB container {self.db_container} with {runtime} image={image}")
         result = self.run_cmd(
-            "mysql-container-run",
+            "tidb-container-run",
             [
                 runtime,
                 "run",
                 "-d",
                 "--name",
                 self.db_container,
-                "-e",
-                f"MYSQL_ROOT_PASSWORD={password}",
-                "-e",
-                f"MYSQL_DATABASE={db_name}",
+                "--platform",
+                "linux/amd64",
                 "-p",
-                "127.0.0.1::3306",
+                "127.0.0.1::4000",
                 image,
             ],
             timeout=180,
         )
         if not result.ok:
-            raise BlackboxError(f"start MySQL container failed; see {result.stderr}")
+            raise BlackboxError(f"start TiDB container failed; see {result.stderr}")
         deadline = time.monotonic() + 120
-        progress(f"setup: waiting for MySQL container {self.db_container} readiness")
+        progress(f"setup: waiting for TiDB container {self.db_container} readiness")
         next_wait_log = time.monotonic() + 10
         while time.monotonic() < deadline:
             port = ""
             try:
-                out = self.capture([runtime, "port", self.db_container, "3306/tcp"], timeout=20)
+                out = self.capture([runtime, "port", self.db_container, "4000/tcp"], timeout=20)
                 port = out.strip().rsplit(":", 1)[-1]
             except Exception:
                 port = ""
-            if port:
-                ping = subprocess.run(
-                    [runtime, "exec", self.db_container, "mysqladmin", "ping", "-uroot", f"-p{password}", "--silent"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-                if ping.returncode == 0:
-                    progress(f"setup: MySQL container ping ok on host port {port}; waiting for host TCP handshake")
-                    host_ready_deadline = time.monotonic() + int(os.environ.get("DRIVE9_LOCAL_E2E_DB_HOST_READY_TIMEOUT_S", "60"))
-                    stable = 0
-                    next_host_wait_log = time.monotonic() + 10
-                    while time.monotonic() < host_ready_deadline:
-                        if mysql_tcp_handshake_ready("127.0.0.1", int(port)):
-                            stable += 1
-                            if stable >= 2:
-                                time.sleep(float(os.environ.get("DRIVE9_LOCAL_E2E_DB_READY_GRACE_S", "1")))
-                                progress(f"setup: MySQL ready at 127.0.0.1:{port}")
-                                return f"root:{password}@tcp(127.0.0.1:{port})/{db_name}?parseTime=true"
-                        else:
-                            stable = 0
-                        if time.monotonic() >= next_host_wait_log:
-                            progress(f"setup: still waiting for MySQL host TCP handshake on 127.0.0.1:{port}")
-                            next_host_wait_log = time.monotonic() + 10
-                        time.sleep(0.5)
+            if port and mysql_tcp_handshake_ready("127.0.0.1", int(port)):
+                dsn = f"root@tcp(127.0.0.1:{port})/{db_name}?parseTime=true"
+                self.ensure_database(dsn)
+                progress(f"setup: TiDB ready at 127.0.0.1:{port}")
+                return dsn
             if time.monotonic() >= next_wait_log:
-                progress(f"setup: still waiting for MySQL container {self.db_container}")
+                progress(f"setup: still waiting for TiDB container {self.db_container}")
                 next_wait_log = time.monotonic() + 10
             time.sleep(1)
-        raise BlackboxError("timed out waiting for MySQL container readiness")
+        raise BlackboxError("timed out waiting for TiDB container readiness")
 
     def start_server(self) -> None:
         mode = self.args.server_mode
@@ -350,56 +363,86 @@ class Drive9FuseTargetProvider:
             raise BlackboxError(f"unknown server mode: {mode}")
         if self.server_bin is None or not self.server_bin.exists():
             raise BlackboxError("--local-server <path> is required for --server-mode local")
-        progress(f"setup: using drive9-server-local {self.server_bin}")
-        dsn = self.start_mysql_if_needed()
+        progress(f"setup: using drive9-server {self.server_bin}")
+        dsn = self.start_tidb_if_needed()
         listen_addr = f"127.0.0.1:{pick_port()}"
         self.server_url = f"http://{listen_addr}"
         self.api_key = self.local_api_key
-        log = self.logs_dir / "drive9-server-local.log"
-        progress(f"setup: starting drive9-server-local at {self.server_url}")
+        log = self.logs_dir / "drive9-server.log"
+        progress(f"setup: starting drive9-server at {self.server_url}")
         env = dict(os.environ)
         env.update(
             {
                 "DRIVE9_LISTEN_ADDR": listen_addr,
                 "DRIVE9_PUBLIC_URL": self.server_url,
+                "DRIVE9_TENANT_PROVIDER": os.environ.get("DRIVE9_TENANT_PROVIDER", "local"),
                 "DRIVE9_LOCAL_DSN": dsn,
-                "DRIVE9_LOCAL_INIT_SCHEMA": os.environ.get("DRIVE9_LOCAL_INIT_SCHEMA", "true"),
-                "DRIVE9_LOCAL_EMBEDDING_MODE": os.environ.get("DRIVE9_LOCAL_EMBEDDING_MODE", "none"),
-                "DRIVE9_LOCAL_API_KEY": self.api_key,
+                "DRIVE9_META_DSN": os.environ.get("DRIVE9_META_DSN", dsn),
+                "DRIVE9_LOCAL_MYSQL_DSN": os.environ.get("DRIVE9_LOCAL_MYSQL_DSN", dsn),
+                "DRIVE9_LOCAL_EMBEDDING_MODE": os.environ.get("DRIVE9_LOCAL_EMBEDDING_MODE", "app"),
                 "DRIVE9_S3_DIR": os.environ.get("DRIVE9_S3_DIR", str(self.tmp_dir / "s3")),
                 "DRIVE9_LOG_LEVEL": os.environ.get("DRIVE9_LOG_LEVEL", "warn"),
             }
         )
         with log.open("ab") as handle:
-            handle.write(f"# {utc_ts()} starting drive9-server-local at {self.server_url}\n".encode())
+            handle.write(f"# {utc_ts()} starting drive9-server at {self.server_url}\n".encode())
             self.server_proc = subprocess.Popen([str(self.server_bin)], cwd=str(REPO_ROOT), env=env, stdout=handle, stderr=handle, start_new_session=True)
         deadline = time.monotonic() + 120
-        progress(f"setup: waiting for drive9-server-local healthz at {self.server_url}/healthz")
+        progress(f"setup: waiting for drive9-server healthz at {self.server_url}/healthz")
         next_wait_log = time.monotonic() + 10
         while time.monotonic() < deadline:
             if self.server_proc.poll() is not None:
                 tail = log_tail(log)
-                detail = f"drive9-server-local exited early; see {log}"
+                detail = f"drive9-server exited early; see {log}"
                 if tail:
                     detail += f"\nlast log lines:\n{tail}"
                 raise BlackboxError(detail)
             try:
                 code, parsed, _ = http_json("GET", f"{self.server_url}/healthz", timeout=5)
-                if code == 200:
-                    self.recorder.event({"type": "server", "mode": "local", "url": self.server_url, "health": parsed})
-                    progress(f"setup: drive9-server-local healthy at {self.server_url}")
-                    return
             except Exception:
-                pass
+                code, parsed = 0, None
+            if code == 200:
+                self.recorder.event({"type": "server", "mode": "local", "url": self.server_url, "health": parsed})
+                progress(f"setup: drive9-server healthy at {self.server_url}")
+                self.provision_owner_key()
+                return
             if time.monotonic() >= next_wait_log:
-                progress(f"setup: still waiting for drive9-server-local healthz at {self.server_url}")
+                progress(f"setup: still waiting for drive9-server healthz at {self.server_url}")
                 next_wait_log = time.monotonic() + 10
             time.sleep(1)
         tail = log_tail(log)
-        detail = f"timed out waiting for drive9-server-local; see {log}"
+        detail = f"timed out waiting for drive9-server; see {log}"
         if tail:
             detail += f"\nlast log lines:\n{tail}"
         raise BlackboxError(detail)
+
+    def provision_owner_key(self) -> None:
+        progress(f"setup: provisioning owner API key at {self.server_url}/v1/provision")
+        code, parsed, text = http_json("POST", f"{self.server_url}/v1/provision", timeout=30)
+        api_key = ""
+        if isinstance(parsed, dict):
+            api_key = str(parsed.get("api_key") or "").strip()
+        if code not in (200, 202) or not api_key:
+            detail = f"POST /v1/provision failed: HTTP {code}"
+            if text:
+                detail += f"\n{text[-2000:]}"
+            raise BlackboxError(detail)
+        self.api_key = api_key
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            try:
+                status_code, status_body, _ = http_json("GET", f"{self.server_url}/v1/status", token=api_key, timeout=5)
+            except Exception:
+                status_code, status_body = 0, None
+            status = ""
+            if isinstance(status_body, dict):
+                status = str(status_body.get("status") or "").strip()
+            if status_code == 200 and status == "active":
+                self.recorder.event({"type": "provision", "mode": "local", "url": self.server_url, "http": code})
+                progress("setup: owner API key provisioned")
+                return
+            time.sleep(1)
+        raise BlackboxError(f"tenant not active after provision; last status HTTP {status_code} body={status_body!r}")
 
     def drive9(self, name: str, args: list[str], *, timeout: int = 120, ok_codes: tuple[int, ...] = (0,)) -> CommandResult:
         return self.run_cmd(name, [str(self.cli), *args], timeout=timeout, env=self.base_env(), ok_codes=ok_codes)
@@ -571,10 +614,10 @@ class Drive9FuseTargetProvider:
                 pass
         self.mounts.clear()
         if self.server_proc is not None:
-            progress("cleanup: stopping drive9-server-local")
+            progress("cleanup: stopping drive9-server")
             self.kill_process_group(self.server_proc)
         if self.db_container and self.db_runtime and os.environ.get("DRIVE9_LOCAL_E2E_KEEP_DB", "0") != "1":
-            progress(f"cleanup: removing MySQL container {self.db_container}")
+            progress(f"cleanup: removing TiDB container {self.db_container}")
             subprocess.run([self.db_runtime, "rm", "-f", self.db_container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         keep_all = getattr(self.args, "keep_all_artifacts", False)
         if not keep_all and not self.args.keep_artifacts and not self.recorder.has_failures():

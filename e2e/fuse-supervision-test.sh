@@ -12,7 +12,7 @@
 #   6) --supervise-foreground smoke (ready, IO, umount, process exits)
 #
 # Local:
-#   source ./scripts/drive9-server-local-env.sh   # if using local server
+#   make run-server-local
 #   make build-cli
 #   DRIVE9_BASE=http://127.0.0.1:9009 bash e2e/fuse-supervision-test.sh
 #

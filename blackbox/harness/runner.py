@@ -540,7 +540,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=0, help="Performance run count. Defaults to BLACKBOX_RUNS or 1.")
     parser.add_argument("--server-mode", choices=["config", "local"], default=env_value("SERVER_MODE", "config", ""))
     parser.add_argument("--bin", default="", help="Path to the drive9 CLI binary. Defaults to 'drive9' on PATH.")
-    parser.add_argument("--local-server", default="", help="Path to drive9-server-local binary (required for --server-mode local).")
+    parser.add_argument(
+        "--local-server",
+        default=os.environ.get("DRIVE9_SERVER_BIN", ""),
+        help="Path to drive9-server binary (required for --server-mode local). Defaults to DRIVE9_SERVER_BIN.",
+    )
     parser.add_argument("--work-dir", default=env_value("WORK_DIR", "", ""), help="Isolated working directory for cache/tmp/results. Defaults to BLACKBOX_WORK_DIR.")
     parser.add_argument("--out-dir", default=env_value("OUT_DIR", "", ""))
     parser.add_argument("--session", default=env_value("SESSION", "", ""))

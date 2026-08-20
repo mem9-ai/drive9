@@ -1,7 +1,7 @@
 // Integration tests for the Drive9 TypeScript SDK.
 //
 // Exercises every exported Client / StreamWriter method against a live
-// drive9-server-local. Gated by the DRIVE9_INTEGRATION env var so the default
+// local drive9-server (provider=local). Gated by the DRIVE9_INTEGRATION env var so the default
 // `npm test` (which runs the MSW-mocked suites) is unaffected. The cross-SDK
 // runner (scripts/sdk-integration-tests.sh) exports DRIVE9_INTEGRATION=1 plus
 // DRIVE9_SERVER / DRIVE9_API_KEY before invoking:
@@ -513,7 +513,7 @@ describeIntegration("TypeScript SDK integration", () => {
         scopes: [{ prefix: "/", ops: ["read"] }],
       });
     } catch (e) {
-      // token management may be disabled on drive9-server-local
+      // token management may be disabled on local drive9-server
       return;
     }
     expect(resp.token).toBeTruthy();
@@ -547,7 +547,7 @@ describeIntegration("TypeScript SDK integration", () => {
     try {
       sec = await c.createVaultSecret(secName, { token: "hunter2" });
     } catch {
-      // vault backend not configured on drive9-server-local
+      // vault backend not configured on local drive9-server
       return;
     }
     expect(sec.name).toBe(secName);

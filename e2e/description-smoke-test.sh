@@ -2,14 +2,14 @@
 # description-smoke-test: file description feature smoke (self-contained stack).
 #
 # Starts TiDB + stub embedder (default) or Ollama, builds binaries, runs
-# drive9-server-local, then checks description storage/embed/overwrite behavior.
+# drive9-server (provider=local), then checks description storage/embed/overwrite behavior.
 # Everything is cleaned up on exit.
 #
 # Prerequisites: Docker, Go, jq, mycli or mysql client.
 #
 # Env:
 #   USE_STUB_EMBEDDER=1 (default) | USE_LOCAL_OLLAMA=1 | neither → Docker Ollama
-#   OLLAMA_MODEL, EMBED_DIMS, DRIVE9_API_KEY (default local-dev-key)
+#   OLLAMA_MODEL, EMBED_DIMS (API key is provisioned after healthz)
 #   POLL_TIMEOUT_S, POLL_INTERVAL_S
 #
 # Usage:
@@ -81,7 +81,7 @@ cleanup() {
     docker rm -f "${COMPOSE_PROJECT}-ollama" 2>/dev/null || true
   fi
   if [ "$exit_code" -ne 0 ]; then
-    echo "failed (rc=$exit_code); server log: /tmp/drive9-server-local-desc-smoke.log" >&2
+    echo "failed (rc=$exit_code); server log: /tmp/drive9-server-desc-smoke.log" >&2
   fi
 }
 trap cleanup EXIT
@@ -121,7 +121,7 @@ echo "USE_STUB_EMBEDDER=$USE_STUB_EMBEDDER USE_LOCAL_OLLAMA=$USE_LOCAL_OLLAMA"
 
 info "building drive9 binaries..."
 cd "$PROJECT_ROOT"
-make build-cli build-server-local
+make build-cli build-server
 
 info "starting TiDB container..."
 docker run -d \
@@ -173,11 +173,12 @@ else
   wait_for_http "http://127.0.0.1:${OLLAMA_PORT}" "Ollama API" 30
 fi
 
-info "starting drive9-server-local..."
+info "starting drive9-server (provider=local)..."
+export DRIVE9_TENANT_PROVIDER="${DRIVE9_TENANT_PROVIDER:-local}"
 export DRIVE9_LOCAL_DSN="${DRIVE9_LOCAL_DSN:-root@tcp(127.0.0.1:${TIDB_PORT})/drive9_local?parseTime=true}"
-export DRIVE9_LOCAL_INIT_SCHEMA="${DRIVE9_LOCAL_INIT_SCHEMA:-true}"
+export DRIVE9_META_DSN="${DRIVE9_META_DSN:-$DRIVE9_LOCAL_DSN}"
+export DRIVE9_LOCAL_MYSQL_DSN="${DRIVE9_LOCAL_MYSQL_DSN:-$DRIVE9_LOCAL_DSN}"
 export DRIVE9_LOCAL_EMBEDDING_MODE=app
-export DRIVE9_LOCAL_API_KEY="${DRIVE9_API_KEY:-local-dev-key}"
 
 if [ "$USE_STUB_EMBEDDER" = "1" ]; then
   export DRIVE9_EMBED_API_BASE="${STUB_API_BASE}/v1"
@@ -202,29 +203,50 @@ fi
 export DRIVE9_SEMANTIC_WORKERS=1
 export DRIVE9_SEMANTIC_POLL_INTERVAL_MS=200
 
-"${PROJECT_ROOT}/bin/drive9-server-local" >/tmp/drive9-server-local-desc-smoke.log 2>&1 &
+"${PROJECT_ROOT}/bin/drive9-server" >/tmp/drive9-server-desc-smoke.log 2>&1 &
 SERVER_PID=$!
 
-API_KEY="${DRIVE9_API_KEY:-local-dev-key}"
 waited=0
-while ! curl -sf "http://127.0.0.1:${SERVER_PORT}/v1/status" -H "Authorization: Bearer ${API_KEY}" >/dev/null 2>&1; do
+while ! curl -sf "http://127.0.0.1:${SERVER_PORT}/healthz" >/dev/null 2>&1; do
   if [ "$waited" -ge "$POLL_TIMEOUT_S" ]; then
-    echo "timeout: drive9-server-local not ready within ${POLL_TIMEOUT_S}s" >&2
+    echo "timeout: drive9-server not ready within ${POLL_TIMEOUT_S}s" >&2
     exit 1
   fi
   sleep "$POLL_INTERVAL_S"
   waited=$((waited + POLL_INTERVAL_S))
 done
-info "drive9-server-local ready (waited ${waited}s)"
+info "drive9-server ready (waited ${waited}s)"
+
+BASE="${DRIVE9_BASE:-http://127.0.0.1:${SERVER_PORT}}"
+PROVISION_JSON="$(curl -sS -X POST "${BASE}/v1/provision")"
+API_KEY="$(printf '%s' "$PROVISION_JSON" | jq -r '.api_key // empty')"
+TENANT_ID="$(printf '%s' "$PROVISION_JSON" | jq -r '.tenant_id // empty')"
+if [ -z "$API_KEY" ] || [ -z "$TENANT_ID" ]; then
+  echo "provision failed: $PROVISION_JSON" >&2
+  exit 1
+fi
+TENANT_DB="drive9_$(printf '%s' "$TENANT_ID" | tr -d '-' | tr '[:upper:]' '[:lower:]')"
+waited=0
+while :; do
+  state="$(curl -sS -H "Authorization: Bearer ${API_KEY}" "${BASE}/v1/status" | jq -r '.status // empty')"
+  if [ "$state" = "active" ]; then
+    break
+  fi
+  if [ "$waited" -ge "$POLL_TIMEOUT_S" ]; then
+    echo "timeout: tenant not active (status=$state)" >&2
+    exit 1
+  fi
+  sleep "$POLL_INTERVAL_S"
+  waited=$((waited + POLL_INTERVAL_S))
+done
 
 CLI="${PROJECT_ROOT}/bin/drive9"
-BASE="${DRIVE9_BASE:-http://127.0.0.1:${SERVER_PORT}}"
-DB_DSN="root@tcp(127.0.0.1:${TIDB_PORT})/drive9_local"
+DB_DSN="root@tcp(127.0.0.1:${TIDB_PORT})/${TENANT_DB}"
 
 if command -v mycli >/dev/null 2>&1; then
   MYSQL_CLIENT="mycli --dsn ${DB_DSN}"
 else
-  MYSQL_CLIENT="mysql -h 127.0.0.1 -P ${TIDB_PORT} -u root -D drive9_local"
+  MYSQL_CLIENT="mysql -h 127.0.0.1 -P ${TIDB_PORT} -u root -D ${TENANT_DB}"
 fi
 
 sql_scalar() {

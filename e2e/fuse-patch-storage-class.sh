@@ -20,7 +20,7 @@
 #   fixed    — fixed client + fixed server: the stat header seeds the storage
 #              class, so PATCH is never attempted and the write succeeds.
 #
-# Binaries default to the repo builds (bin/drive9-server-local, bin/drive9);
+# Binaries default to the repo builds (bin/drive9-server, bin/drive9);
 # override with DRIVE9_SERVER_BIN / DRIVE9_CLI_BIN for cross-version runs.
 
 set -euo pipefail
@@ -29,7 +29,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 SCENARIO="${SCENARIO:-fixed}"
-SERVER_BIN="${DRIVE9_SERVER_BIN:-$ROOT_DIR/bin/drive9-server-local}"
+SERVER_BIN="${DRIVE9_SERVER_BIN:-$ROOT_DIR/bin/drive9-server}"
 CLI_BIN="${DRIVE9_CLI_BIN:-$ROOT_DIR/bin/drive9}"
 
 SEED_THRESHOLD="${SEED_THRESHOLD:-262144}"   # 256 KiB: seed file lands inline
@@ -38,10 +38,7 @@ SEED_SIZE="${SEED_SIZE:-204800}"             # 200 KiB
 WRITE_OFFSET="${WRITE_OFFSET:-65536}"
 WRITE_BYTES="${WRITE_BYTES:-4096}"
 
-DB_RUNTIME="${DRIVE9_LOCAL_E2E_DB_RUNTIME:-}"
-DB_IMAGE="${DRIVE9_LOCAL_E2E_DB_IMAGE:-mysql:8.4}"
-DB_NAME="${DRIVE9_LOCAL_E2E_DB_NAME:-drive9_local}"
-DB_PASSWORD="${DRIVE9_LOCAL_E2E_DB_PASSWORD:-drive9pass}"
+DEFAULT_LOCAL_DSN="root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true"
 LOCAL_API_KEY="${DRIVE9_LOCAL_API_KEY:-local-dev-key}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-90}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-1}"
@@ -49,7 +46,6 @@ MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
 
 PASS=0
 FAIL=0
-DB_CONTAINER=""
 SERVER_PID=""
 MOUNT_POINT=""
 TMP_DIR="$(mktemp -d)"
@@ -75,9 +71,6 @@ cleanup() {
     kill "$SERVER_PID" >/dev/null 2>&1 || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
-  if [ -n "$DB_CONTAINER" ]; then
-    "$DB_RUNTIME" rm -f "$DB_CONTAINER" >/dev/null 2>&1 || true
-  fi
   if [ "$rc" -eq 0 ] && [ "$FAIL" -eq 0 ]; then
     rm -rf "$TMP_DIR"
   else
@@ -102,46 +95,23 @@ s.close()
 PY
 }
 
-detect_runtime() {
-  if [ -n "$DB_RUNTIME" ]; then
-    need_cmd "$DB_RUNTIME"
-    return
+ensure_tidb() {
+  : "${DRIVE9_LOCAL_DSN:=$DEFAULT_LOCAL_DSN}"
+  export DRIVE9_LOCAL_DSN
+  local host port db deadline
+  host="$(python3 -c 'import re,sys; m=re.search(r"@tcp\(([^:]+):(\d+)\)/([^?]*)", sys.argv[1]); print(m.group(1) if m else "")' "$DRIVE9_LOCAL_DSN")"
+  port="$(python3 -c 'import re,sys; m=re.search(r"@tcp\(([^:]+):(\d+)\)/([^?]*)", sys.argv[1]); print(m.group(2) if m else "")' "$DRIVE9_LOCAL_DSN")"
+  db="$(python3 -c 'import re,sys; m=re.search(r"@tcp\(([^:]+):(\d+)\)/([^?]*)", sys.argv[1]); print(m.group(3) if m else "drive9_local")' "$DRIVE9_LOCAL_DSN")"
+  if [ -z "$host" ] || [ -z "$port" ]; then
+    echo "cannot parse host/port from DRIVE9_LOCAL_DSN=$DRIVE9_LOCAL_DSN" >&2
+    exit 1
   fi
-  if command -v docker >/dev/null 2>&1; then DB_RUNTIME="docker"; return; fi
-  if command -v podman >/dev/null 2>&1; then DB_RUNTIME="podman"; return; fi
-  echo "docker or podman is required" >&2
-  exit 1
-}
-
-start_mysql() {
-  detect_runtime
-  DB_CONTAINER="drive9-patch-e2e-$(date +%s)-$$"
-  echo "Starting $DB_RUNTIME container $DB_CONTAINER"
-  "$DB_RUNTIME" run -d --name "$DB_CONTAINER" \
-    -e MYSQL_ROOT_PASSWORD="$DB_PASSWORD" \
-    -e MYSQL_DATABASE="$DB_NAME" \
-    -p 127.0.0.1::3306 "$DB_IMAGE" >/dev/null
-  local deadline port
+  echo "Using TiDB at $host:$port (database $db)"
   deadline=$(($(date +%s) + POLL_TIMEOUT_S))
   while :; do
-    port=$("$DB_RUNTIME" port "$DB_CONTAINER" 3306/tcp 2>/dev/null | awk -F: 'END{print $NF}')
-    [ -n "$port" ] && break
-    [ "$(date +%s)" -ge "$deadline" ] && { echo "timed out waiting for container port" >&2; exit 1; }
-    sleep "$POLL_INTERVAL_S"
-  done
-  while :; do
-    "$DB_RUNTIME" exec "$DB_CONTAINER" mysqladmin ping -uroot -p"$DB_PASSWORD" --silent >/dev/null 2>&1 && break
-    [ "$(date +%s)" -ge "$deadline" ] && { echo "timed out waiting for MySQL" >&2; exit 1; }
-    sleep "$POLL_INTERVAL_S"
-  done
-  # mysqladmin ping succeeds inside the container before the host-side port
-  # mapping serves real connections; wait until the mapped port completes a
-  # genuine MySQL handshake (server sends a greeting packet), not just a TCP
-  # accept that gets dropped during init.
-  while :; do
-    if python3 - "$port" <<'PY' >/dev/null 2>&1
+    if python3 - "$host" "$port" <<'PY' >/dev/null 2>&1
 import socket, sys
-s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2)
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
 s.settimeout(3)
 data = s.recv(64)
 s.close()
@@ -150,11 +120,17 @@ PY
     then
       break
     fi
-    [ "$(date +%s)" -ge "$deadline" ] && { echo "timed out waiting for MySQL handshake on port $port" >&2; exit 1; }
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "timed out waiting for TiDB at $host:$port (start playground or set DRIVE9_LOCAL_DSN)" >&2
+      exit 1
+    fi
     sleep "$POLL_INTERVAL_S"
   done
-  DRIVE9_LOCAL_DSN="root:${DB_PASSWORD}@tcp(127.0.0.1:${port})/${DB_NAME}?parseTime=true"
-  export DRIVE9_LOCAL_DSN
+  if command -v mysql >/dev/null 2>&1; then
+    mysql --protocol=tcp -h "$host" -P "$port" -u root -e "CREATE DATABASE IF NOT EXISTS \`$db\`;" >/dev/null
+  elif command -v mycli >/dev/null 2>&1; then
+    mycli --host "$host" --port "$port" -u root -e "CREATE DATABASE IF NOT EXISTS \`$db\`;" >/dev/null
+  fi
 }
 
 wait_server() {
@@ -165,7 +141,7 @@ wait_server() {
       return
     fi
     if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
-      echo "drive9-server-local exited early; log tail:" >&2
+      echo "drive9-server exited early; log tail:" >&2
       tail -50 "$SERVER_LOG" >&2 || true
       exit 1
     fi
@@ -174,7 +150,35 @@ wait_server() {
   done
 }
 
-start_server() { # start_server <threshold> <init_schema>
+provision_owner_key() {
+  local base="$1" body code key status deadline
+  body="$(mktemp)"
+  code="$(curl -sS -o "$body" -w "%{http_code}" -X POST "$base/v1/provision" || true)"
+  if [ "$code" != "202" ] && [ "$code" != "200" ]; then
+    echo "POST $base/v1/provision failed: HTTP ${code:-000}" >&2
+    cat "$body" >&2 || true
+    rm -f "$body"
+    exit 1
+  fi
+  key="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("api_key") or "")' "$body")"
+  rm -f "$body"
+  if [ -z "$key" ]; then
+    echo "provision response missing api_key" >&2
+    exit 1
+  fi
+  deadline=$(($(date +%s) + POLL_TIMEOUT_S))
+  while :; do
+    status="$(curl -sS -H "Authorization: Bearer ${key}" "$base/v1/status" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status") or "")' 2>/dev/null || true)"
+    if [ "$status" = "active" ]; then
+      printf '%s\n' "$key"
+      return
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && { echo "tenant not active (status=${status:-unknown})" >&2; exit 1; }
+    sleep "$POLL_INTERVAL_S"
+  done
+}
+
+start_server() { # start_server <threshold>
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
     wait "$SERVER_PID" 2>/dev/null || true
@@ -182,10 +186,11 @@ start_server() { # start_server <threshold> <init_schema>
   env \
     DRIVE9_LISTEN_ADDR="$LISTEN_ADDR" \
     DRIVE9_PUBLIC_URL="$PUBLIC_URL" \
+    DRIVE9_TENANT_PROVIDER="${DRIVE9_TENANT_PROVIDER:-local}" \
     DRIVE9_LOCAL_DSN="$DRIVE9_LOCAL_DSN" \
-    DRIVE9_LOCAL_INIT_SCHEMA="$2" \
-    DRIVE9_LOCAL_EMBEDDING_MODE=none \
-    DRIVE9_LOCAL_API_KEY="$LOCAL_API_KEY" \
+    DRIVE9_META_DSN="${DRIVE9_META_DSN:-$DRIVE9_LOCAL_DSN}" \
+    DRIVE9_LOCAL_MYSQL_DSN="${DRIVE9_LOCAL_MYSQL_DSN:-$DRIVE9_LOCAL_DSN}" \
+    DRIVE9_LOCAL_EMBEDDING_MODE="${DRIVE9_LOCAL_EMBEDDING_MODE:-app}" \
     DRIVE9_S3_DIR="$TMP_DIR/s3" \
     DRIVE9_INLINE_THRESHOLD="$1" \
     DRIVE9_LOG_LEVEL=warn \
@@ -224,8 +229,8 @@ need_cmd shasum
 # CI convenience: build the default binaries when absent. Explicitly overridden
 # binary paths must already exist.
 if [ -z "${DRIVE9_SERVER_BIN:-}" ] && [ ! -x "$SERVER_BIN" ]; then
-  echo "Building drive9-server-local"
-  make build-server-local
+  echo "Building drive9-server"
+  make build-server
 fi
 if [ -z "${DRIVE9_CLI_BIN:-}" ] && [ ! -x "$CLI_BIN" ]; then
   echo "Building drive9 CLI"
@@ -237,7 +242,7 @@ need_cmd "$CLI_BIN"
 E2E_HOME="$TMP_DIR/home"
 mkdir -p "$E2E_HOME"
 
-start_mysql
+ensure_tidb
 
 LISTEN_ADDR="127.0.0.1:$(pick_port)"
 PUBLIC_URL="http://${LISTEN_ADDR}"
@@ -262,7 +267,12 @@ with open(path, "wb") as f:
 PY
 
 echo "=== phase 1: seed 200KB file with inline threshold $SEED_THRESHOLD (db9-stored)"
-start_server "$SEED_THRESHOLD" true
+start_server "$SEED_THRESHOLD"
+if [ -z "${DRIVE9_API_KEY:-}" ]; then
+  LOCAL_API_KEY="$(provision_owner_key "$PUBLIC_URL")"
+else
+  LOCAL_API_KEY="$DRIVE9_API_KEY"
+fi
 code=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT \
   -H "Authorization: Bearer $LOCAL_API_KEY" \
   --data-binary "@$SEED_FILE" \
@@ -278,7 +288,7 @@ else
 fi
 
 echo "=== phase 2: restart server with inline threshold $PATCH_THRESHOLD"
-start_server "$PATCH_THRESHOLD" false
+start_server "$PATCH_THRESHOLD"
 PATCH_LOG_MARK=$(wc -l <"$SERVER_LOG" | tr -d ' ')
 
 echo "=== phase 3: mount with $(basename "$CLI_BIN") (durability=write-sync)"

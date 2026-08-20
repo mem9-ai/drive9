@@ -1,4 +1,5 @@
-package testmysql
+// Package testtidb starts a shared TiDB instance for tests.
+package testtidb
 
 import (
 	"context"
@@ -11,10 +12,17 @@ import (
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
-	tcmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-const envDSN = "DRIVE9_TEST_MYSQL_DSN"
+const (
+	envDSN       = "DRIVE9_TEST_TIDB_DSN"
+	tidbImage    = "pingcap/tidb:v8.5.6"
+	tidbPort     = "4000/tcp"
+	testDatabase = "drive9_test"
+	startTimeout = 4 * time.Minute
+)
 
 type Instance struct {
 	DSN       string
@@ -29,62 +37,106 @@ func (i *Instance) Close(ctx context.Context) error {
 }
 
 func Start(ctx context.Context) (*Instance, error) {
-	if dsn := os.Getenv(envDSN); dsn != "" {
+	if dsn := strings.TrimSpace(os.Getenv(envDSN)); dsn != "" {
 		return &Instance{DSN: dsn}, nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, startTimeout)
 	defer cancel()
 
-	// The MySQL container asks Docker for an ephemeral host port, but Docker's
-	// port allocator can lose a race on busy CI runners and fail container
-	// start with "failed to bind host port ...: address already in use".
-	// Retrying picks a fresh port and is far cheaper than re-running the job.
-	var c *tcmysql.MySQLContainer
+	var c testcontainers.Container
 	var err error
 	for attempt := 1; ; attempt++ {
-		c, err = tcmysql.Run(ctx,
-			"mysql:8.0.36",
-			tcmysql.WithDatabase("dat9_test"),
-			tcmysql.WithUsername("dat9"),
-			tcmysql.WithPassword("dat9pass"),
-		)
+		c, err = testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: testcontainers.ContainerRequest{
+				Image:        tidbImage,
+				ExposedPorts: []string{tidbPort},
+				// pingcap/tidb is tidb-server. Without unistore it expects an
+				// external PD and never becomes a usable MySQL endpoint.
+				Cmd: []string{"--store=unistore", "--path=/tmp/tidb"},
+				WaitingFor: wait.ForAll(
+					wait.ForLog("server is running MySQL protocol"),
+					wait.ForListeningPort(tidbPort),
+				).WithStartupTimeout(2 * time.Minute),
+			},
+			Started: true,
+		})
 		if err == nil || attempt >= 3 || !isPortBindConflict(err) {
 			break
 		}
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("start mysql container: %w", ctx.Err())
+			return nil, fmt.Errorf("start tidb container: %w", ctx.Err())
 		case <-time.After(time.Duration(attempt) * 2 * time.Second):
 		}
 	}
 	if err != nil {
-		return nil, fmt.Errorf("start mysql container: %w", err)
+		return nil, fmt.Errorf("start tidb container: %w", err)
 	}
 
-	// parseTime=true lets DATETIME scan directly into time.Time.
-	dsn, err := c.ConnectionString(ctx, "parseTime=true")
+	host, err := c.Host(ctx)
 	if err != nil {
 		_ = c.Terminate(context.Background())
-		return nil, fmt.Errorf("build mysql dsn: %w", err)
+		return nil, fmt.Errorf("tidb container host: %w", err)
+	}
+	mapped, err := c.MappedPort(ctx, tidbPort)
+	if err != nil {
+		_ = c.Terminate(context.Background())
+		return nil, fmt.Errorf("tidb container port: %w", err)
+	}
+	adminDSN := fmt.Sprintf("root@tcp(%s:%s)/?parseTime=true", host, mapped.Port())
+	if err := waitAndCreateTestDatabase(ctx, adminDSN); err != nil {
+		_ = c.Terminate(context.Background())
+		return nil, err
 	}
 
 	return &Instance{
-		DSN: dsn,
+		DSN: fmt.Sprintf("root@tcp(%s:%s)/%s?parseTime=true", host, mapped.Port(), testDatabase),
 		terminate: func(ctx context.Context) error {
 			return c.Terminate(ctx)
 		},
 	}, nil
 }
 
+func waitAndCreateTestDatabase(ctx context.Context, adminDSN string) error {
+	db, err := sql.Open("mysql", adminDSN)
+	if err != nil {
+		return fmt.Errorf("open tidb admin: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(2 * time.Minute)
+	}
+	var pingErr error
+	for {
+		pingErr = db.PingContext(ctx)
+		if pingErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("ping tidb: %w", pingErr)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("ping tidb: %w", ctx.Err())
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	if _, err := db.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+testDatabase+"`"); err != nil {
+		return fmt.Errorf("create test database: %w", err)
+	}
+	return nil
+}
+
 func OpenDB(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
 	if dsn == "" {
-		t.Fatal("mysql test DSN is empty")
+		t.Fatal("tidb test DSN is empty")
 	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		t.Fatalf("open mysql test db: %v", err)
+		t.Fatalf("open tidb test db: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
@@ -176,8 +228,6 @@ func ResetDBWithoutFiles(t *testing.T, db *sql.DB) {
 	}
 }
 
-// isPortBindConflict reports whether a container-start failure is Docker's
-// ephemeral host-port allocation race, which a retry can recover from.
 func isPortBindConflict(err error) bool {
 	if err == nil {
 		return false

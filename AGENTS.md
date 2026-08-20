@@ -43,21 +43,21 @@ make test TEST_PKGS='./pkg/datastore/...'
 make test TEST_RUN='TestInsertAndGetNode' TEST_PKGS='./pkg/datastore/...'
 ```
 
-MySQL-backed tests require a container runtime or an explicit DSN:
+TiDB-backed tests require a container runtime or an explicit DSN:
 
 ```bash
-# Use an existing MySQL/TiDB instance
-DRIVE9_TEST_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/drive9_test?parseTime=true' make test
+# Use an existing TiDB instance
+DRIVE9_TEST_TIDB_DSN='root@tcp(127.0.0.1:4000)/drive9_test?parseTime=true' make test
 ```
 
-If `DRIVE9_TEST_MYSQL_DSN` is unset and `podman` is available, `make test` auto-configures
+If `DRIVE9_TEST_TIDB_DSN` is unset and `podman` is available, `make test` auto-configures
 testcontainers via `scripts/test-podman.sh`. Otherwise a Docker-compatible runtime is used.
 
 If a direct `go test` run fails with `rootless Docker not found`, retry with `make test`
 so the project can use `scripts/test-podman.sh` to route testcontainers through Podman.
 
 **E2E smoke tests** (not `go test`) live in `e2e/` and target live deployments.
-Read `e2e/AGENTS.md` first for endpoint selection, `drive9-server-local` workflow,
+Read `e2e/AGENTS.md` first for endpoint selection, local `drive9-server` (provider=local) workflow,
 environment variables, script coverage, and known expectations.
 
 Common entry points:
@@ -67,6 +67,19 @@ DRIVE9_BASE=https://... bash e2e/api-smoke-test.sh
 DRIVE9_BASE=https://... bash e2e/cli-smoke-test.sh
 DRIVE9_BASE=https://... bash e2e/smoke-all.sh
 ```
+
+Local e2e is `.github/workflows/local-e2e.yml` (TiDB playground +
+`DRIVE9_TENANT_PROVIDER=local`). On a machine:
+
+```bash
+make e2e-local
+```
+
+That runs `scripts/e2e-local.sh`: starts TiDB if `127.0.0.1:4000` is down,
+starts `drive9-server` with `provider=local`, then `e2e/smoke-all.sh` (the
+`local-e2e.yml` PR set, including FUSE). macOS needs macFUSE; suites pass
+`--mode=fuse`. Pass a pre-built server with `DRIVE9_SERVER_BIN`. For a
+long-running local server only, use `make run-server-local`.
 
 ---
 
@@ -86,13 +99,14 @@ tests on every PR to `main`.
 ## Local dev server
 
 ```bash
-source ./scripts/drive9-server-local-env.sh
-export DRIVE9_LOCAL_INIT_SCHEMA=true   # only for a fresh/disposable database
 make run-server-local
 ```
 
-The env script sets defaults for `DRIVE9_LOCAL_DSN`, local mock S3, and Ollama-compatible
-embedding. Override any var before running.
+`make run-server-local` sets `DRIVE9_TENANT_PROVIDER=local`. Control-plane tables
+are migrated on startup, and each `POST /v1/provision` creates `drive9_<tenantid>`
+and inits tenant schema. Defaults assume TiDB at `127.0.0.1:4000` and local mock
+S3. Override any `DRIVE9_*` var before running. E2E scripts provision their own
+tenant when `DRIVE9_API_KEY` is unset.
 
 ---
 
@@ -119,7 +133,7 @@ pkg/
   semantic/             Durable background task types
   traceid/              Trace ID helpers
 internal/
-  testmysql/            MySQL test helpers (shared across packages)
+  testtidb/             TiDB test helpers (shared across packages)
 e2e/                    Live bash smoke tests; read e2e/AGENTS.md first
 scripts/                Shell helpers for local dev and test
 docs/                   Design documents
@@ -215,7 +229,8 @@ Obtain a logger from `pkg/logger` or accept `*zap.Logger` via `Config`.
 ### Testing
 
 - Test files use `package foo` (same package, not `foo_test`) for white-box access.
-- Shared MySQL setup via `internal/testmysql`; call `testmysql.ResetDB(t, db)` to clean state.
+- Shared TiDB setup via `internal/testtidb`; call `testtidb.ResetDB(t, db)` to clean state.
+  Override with `DRIVE9_TEST_TIDB_DSN`.
 - Test helper constructors (`newTestStore`, `newTestServer`) accept `*testing.T`, call
   `t.Helper()`, register cleanup with `t.Cleanup(func() { ... })`.
 - Use `t.Fatal` / `t.Fatalf` for setup failures; use `t.Errorf` for assertion failures.

@@ -51,15 +51,15 @@ func TestFieldsIncludeAllValues(t *testing.T) {
 	setBuildInfoForTest(t, "v9.9.9", "deadbeef", "main", "2026-04-16T09:00:00Z")
 
 	core, recorded := observer.New(zap.InfoLevel)
-	zap.New(core).Info("build_info", Fields("drive9-server-local")...)
+	zap.New(core).Info("build_info", Fields("drive9-server")...)
 
 	entries := recorded.All()
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
 	ctx := entries[0].ContextMap()
-	if ctx["component"] != "drive9-server-local" {
-		t.Fatalf("component = %v, want drive9-server-local", ctx["component"])
+	if ctx["component"] != "drive9-server" {
+		t.Fatalf("component = %v, want drive9-server", ctx["component"])
 	}
 	if ctx["version"] != "v9.9.9" {
 		t.Fatalf("version = %v, want v9.9.9", ctx["version"])

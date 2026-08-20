@@ -17,7 +17,7 @@ import kotlin.test.assertTrue
  * Live-server integration tests for the Drive9 Kotlin SDK.
  *
  * Exercises every public [Drive9Client] / [Drive9StreamUpload] method against a
- * real drive9-server-local. The client is built via [Drive9Client.defaultClient],
+ * real local drive9-server. The client is built via [Drive9Client.defaultClient],
  * which reads DRIVE9_SERVER / DRIVE9_API_KEY env vars first and ~/.drive9/config
  * second, so the real config-resolution path is exercised.
  *
@@ -320,7 +320,7 @@ class Drive9IntegrationTest {
         val secName = "it-kt-secret-${ts()}-${randSuffix()}"
         val fields = mapOf("token" to kotlinx.serialization.json.JsonPrimitive("hunter2"))
 
-        // The vault backend may not be enabled on drive9-server-local; treat
+        // The vault backend may not be enabled on local drive9-server; treat
         // the suite as best-effort and return early when create fails.
         val sec = runCatching { c.createVaultSecret(secName, fields) }.getOrElse {
             println("createVaultSecret best-effort: ${it.message}")
@@ -347,7 +347,7 @@ class Drive9IntegrationTest {
     fun `vault read best-effort`() = runBlocking {
         val c = client()
         val secName = "it-kt-read-${ts()}-${randSuffix()}"
-        // Vault backend may not be enabled on drive9-server-local; skip the
+        // Vault backend may not be enabled on local drive9-server; skip the
         // whole test when create fails.
         runCatching { c.createVaultSecret(secName, mapOf("token" to kotlinx.serialization.json.JsonPrimitive("read-me"))) }
             .getOrElse {

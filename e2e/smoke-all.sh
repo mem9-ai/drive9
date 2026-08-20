@@ -1,38 +1,44 @@
 #!/usr/bin/env bash
-# Run all drive9 smoke tests (API + CLI + journal + layer FS + FUSE).
+# Run the local-e2e.yml PR-gate suites against a live drive9-server.
 #
 # Tenant mode:
 #  - Fresh (default): each suite provisions its own tenant.
-#  - Existing (DRIVE9_API_KEY set in the environment): every suite that honors
-#    DRIVE9_API_KEY (api, cli, journal, layer-fs, fuse, posix-permission, git
-#    suites, pack) skips provision and reuses the tenant the key belongs to.
-#    The key is explicitly re-exported below so a future `env -u` in run_case
-#    cannot silently drop it.
+#  - Existing (DRIVE9_API_KEY set): suites that honor the key skip provision
+#    and reuse that tenant. The key is re-exported so run_case cannot drop it.
+#
+# Default set matches `.github/workflows/local-e2e.yml` PR steps:
+#  api, cli, layer-fs, fuse-release-gate, fuse-patch-storage-class, git-ops,
+#  git-workspace-ondemand, pack, fuse-crash-recovery, fuse-supervision,
+#  fuse-write-perf-budget.
 #
 # Subset knobs:
-#  - RUN_API_ONLY=1 runs only api + cli (the core two). Useful for a quick
-#    existing-tenant regression without pulling in journal/layer-fs/fuse.
-#  - RUN_FUSE_SMOKE=0 skips the FUSE suite (and derives RUN_LAYER_FUSE_SMOKE
-#    from it). macOS WebDAV fallback cannot satisfy symlink/hardlink asserts.
-#  - RUN_GIT_OPS_SMOKE=1 / RUN_GIT_WORKSPACE_SMOKE=1 / RUN_GIT_ONDEMAND_SMOKE=1
-#    / RUN_PACK_SMOKE=1 opt into the heavier optional suites.
+#  - RUN_API_ONLY=1 — api + cli only.
+#  - RUN_FUSE_SMOKE=0 — skip FUSE-related suites (release-gate, patch,
+#    crash-recovery, supervision, write-perf, git-ops, git-ondemand) and
+#    layer-fs FUSE restore. macOS WebDAV cannot satisfy those asserts.
+#  - RUN_JOURNAL_SMOKE=1 / RUN_POSIX_SMOKE=1 / RUN_GIT_WORKSPACE_SMOKE=1 —
+#    extras used by post-merge local-e2e, not part of the PR default.
 
 set -euo pipefail
 
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
-# Re-export explicitly so the existing-tenant intent is durable across run_case
-# subprocesses; do not rely on implicit inheritance.
 if [ -n "${DRIVE9_API_KEY:-}" ]; then
   export DRIVE9_API_KEY
 fi
 RUN_API_ONLY="${RUN_API_ONLY:-0}"
-RUN_GIT_OPS_SMOKE="${RUN_GIT_OPS_SMOKE:-0}"
-RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
-RUN_GIT_ONDEMAND_SMOKE="${RUN_GIT_ONDEMAND_SMOKE:-0}"
 RUN_FUSE_SMOKE="${RUN_FUSE_SMOKE:-1}"
 RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-$RUN_FUSE_SMOKE}"
 export RUN_LAYER_FUSE_SMOKE
-RUN_PACK_SMOKE="${RUN_PACK_SMOKE:-0}"
+RUN_JOURNAL_SMOKE="${RUN_JOURNAL_SMOKE:-0}"
+RUN_POSIX_SMOKE="${RUN_POSIX_SMOKE:-0}"
+RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
+
+if [ "$RUN_FUSE_SMOKE" = "1" ]; then
+  export FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-1}"
+  export LAYER_FUSE_STRICT_PREREQS="${LAYER_FUSE_STRICT_PREREQS:-1}"
+  export RUN_FUSE_CONCURRENCY_STRESS="${RUN_FUSE_CONCURRENCY_STRESS:-0}"
+  export RUN_FUSE_POSIX_FSX="${RUN_FUSE_POSIX_FSX:-0}"
+fi
 
 PASS=0
 FAIL=0
@@ -66,6 +72,16 @@ skip_case() {
   echo "SKIP [$name] $reason"
 }
 
+run_fuse_case() {
+  local name="$1"
+  local script="$2"
+  if [ "$RUN_FUSE_SMOKE" = "1" ]; then
+    run_case "$name" "$script"
+  else
+    skip_case "$name" "$script" "set RUN_FUSE_SMOKE=1 to run FUSE coverage"
+  fi
+}
+
 if [ -n "${DRIVE9_API_KEY:-}" ]; then
   TENANT_MODE="existing (DRIVE9_API_KEY)"
 else
@@ -75,51 +91,41 @@ fi
 echo "=== drive9 smoke-all ==="
 echo "BASE=$BASE"
 echo "Tenant=$TENANT_MODE"
-if [ "$RUN_API_ONLY" = "1" ]; then
-  echo "RUN_API_ONLY=1 (core two suites only)"
-fi
+echo "RUN_API_ONLY=$RUN_API_ONLY RUN_FUSE_SMOKE=$RUN_FUSE_SMOKE"
 
 run_case "api" "e2e/api-smoke-test.sh"
 run_case "cli" "e2e/cli-smoke-test.sh"
 
 if [ "$RUN_API_ONLY" = "1" ]; then
-  skip_case "journal" "e2e/journal-smoke-test.sh" "set RUN_API_ONLY=0 to run journal coverage"
-  skip_case "layer-fs" "e2e/layer-fs-smoke-test.sh" "set RUN_API_ONLY=0 to run layer-fs coverage"
-  skip_case "fuse" "e2e/fuse-smoke-test.sh" "set RUN_API_ONLY=0 to run FUSE coverage"
-  skip_case "posix-permission" "e2e/posix-permission-smoke-test.sh" "set RUN_API_ONLY=0 to run posix-permission coverage"
-  skip_case "git-ops" "e2e/git-ops-smoke-test.sh" "set RUN_API_ONLY=0 to run Git ops coverage"
-  skip_case "git-workspace-ondemand" "e2e/git-workspace-ondemand-smoke-test.sh" "set RUN_API_ONLY=0 to run on-demand discovery coverage"
-  skip_case "git-workspace" "e2e/git-workspace-smoke-test.sh" "set RUN_API_ONLY=0 to run Git workspace coverage"
-  skip_case "pack" "e2e/pack-smoke-test.sh" "set RUN_API_ONLY=0 to run pack coverage"
+  skip_case "layer-fs" "e2e/layer-fs-smoke-test.sh" "set RUN_API_ONLY=0"
+  skip_case "fuse-release-gate" "e2e/fuse-release-gate.sh" "set RUN_API_ONLY=0"
+  skip_case "fuse-patch-storage-class" "e2e/fuse-patch-storage-class.sh" "set RUN_API_ONLY=0"
+  skip_case "git-ops" "e2e/git-ops-smoke-test.sh" "set RUN_API_ONLY=0"
+  skip_case "git-workspace-ondemand" "e2e/git-workspace-ondemand-smoke-test.sh" "set RUN_API_ONLY=0"
+  skip_case "pack" "e2e/pack-smoke-test.sh" "set RUN_API_ONLY=0"
+  skip_case "fuse-crash-recovery" "e2e/fuse-crash-recovery-test.sh" "set RUN_API_ONLY=0"
+  skip_case "fuse-supervision" "e2e/fuse-supervision-test.sh" "set RUN_API_ONLY=0"
+  skip_case "fuse-write-perf-budget" "e2e/fuse-write-perf-budget-test.sh" "set RUN_API_ONLY=0"
 else
-  run_case "journal" "e2e/journal-smoke-test.sh"
   run_case "layer-fs" "e2e/layer-fs-smoke-test.sh"
-  if [ "$RUN_FUSE_SMOKE" = "1" ]; then
-    run_case "fuse" "e2e/fuse-smoke-test.sh"
-  else
-    skip_case "fuse" "e2e/fuse-smoke-test.sh" "set RUN_FUSE_SMOKE=1 to run FUSE symlink/hardlink coverage"
-  fi
+  run_fuse_case "fuse-release-gate" "e2e/fuse-release-gate.sh"
+  run_fuse_case "fuse-patch-storage-class" "e2e/fuse-patch-storage-class.sh"
+  run_fuse_case "git-ops" "e2e/git-ops-smoke-test.sh"
+  run_fuse_case "git-workspace-ondemand" "e2e/git-workspace-ondemand-smoke-test.sh"
+  run_case "pack" "e2e/pack-smoke-test.sh"
+  run_fuse_case "fuse-crash-recovery" "e2e/fuse-crash-recovery-test.sh"
+  run_fuse_case "fuse-supervision" "e2e/fuse-supervision-test.sh"
+  run_fuse_case "fuse-write-perf-budget" "e2e/fuse-write-perf-budget-test.sh"
+fi
+
+if [ "$RUN_JOURNAL_SMOKE" = "1" ]; then
+  run_case "journal" "e2e/journal-smoke-test.sh"
+fi
+if [ "$RUN_POSIX_SMOKE" = "1" ]; then
   run_case "posix-permission" "e2e/posix-permission-smoke-test.sh"
-  if [ "$RUN_GIT_OPS_SMOKE" = "1" ]; then
-    run_case "git-ops" "e2e/git-ops-smoke-test.sh"
-  else
-    skip_case "git-ops" "e2e/git-ops-smoke-test.sh" "set RUN_GIT_OPS_SMOKE=1 to run lightweight Git clone/status/restore coverage"
-  fi
-  if [ "$RUN_GIT_ONDEMAND_SMOKE" = "1" ]; then
-    run_case "git-workspace-ondemand" "e2e/git-workspace-ondemand-smoke-test.sh"
-  else
-    skip_case "git-workspace-ondemand" "e2e/git-workspace-ondemand-smoke-test.sh" "set RUN_GIT_ONDEMAND_SMOKE=1 to run on-demand discovery coverage"
-  fi
-  if [ "$RUN_GIT_WORKSPACE_SMOKE" = "1" ]; then
-    run_case "git-workspace" "e2e/git-workspace-smoke-test.sh"
-  else
-    skip_case "git-workspace" "e2e/git-workspace-smoke-test.sh" "set RUN_GIT_WORKSPACE_SMOKE=1 to run fast-clone Git workspace coverage"
-  fi
-  if [ "$RUN_PACK_SMOKE" = "1" ]; then
-    run_case "pack" "e2e/pack-smoke-test.sh"
-  else
-    skip_case "pack" "e2e/pack-smoke-test.sh" "set RUN_PACK_SMOKE=1 to run portable profile pack/unpack coverage"
-  fi
+fi
+if [ "$RUN_GIT_WORKSPACE_SMOKE" = "1" ]; then
+  run_fuse_case "git-workspace" "e2e/git-workspace-smoke-test.sh"
 fi
 
 echo

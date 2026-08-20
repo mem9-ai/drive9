@@ -11,7 +11,7 @@ import (
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/s3client"
 )
@@ -313,7 +313,7 @@ func TestPatchUploadUsesChecksumAlgoNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open datastore: %v", err)
 	}
-	testmysql.ResetDB(t, store.DB())
+	testtidb.ResetDB(t, store.DB())
 	t.Cleanup(func() { _ = store.Close() })
 
 	localS3, err := s3client.NewLocal(s3Dir, "http://localhost:9091/s3")

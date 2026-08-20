@@ -1,4 +1,4 @@
-package testmysql
+package testtidb
 
 import (
 	"errors"

@@ -155,8 +155,10 @@ concurrency:
 env:
   TIDB_VERSION: v8.5.5
   DRIVE9_BASE: http://127.0.0.1:9009
+  DRIVE9_TENANT_PROVIDER: local
   DRIVE9_LOCAL_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
-  DRIVE9_LOCAL_INIT_SCHEMA: "true"
+  DRIVE9_META_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
+  DRIVE9_LOCAL_MYSQL_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
   DRIVE9_LOCAL_EMBEDDING_MODE: app
   RUN_SEMANTIC_CHECKS: "0"
   RUN_CLI_SEMANTIC_CHECKS: "0"
@@ -181,7 +183,7 @@ env:
 
 jobs:
   local-e2e:
-    name: drive9-server-local e2e smoke
+    name: drive9-server local e2e smoke
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -248,12 +250,22 @@ jobs:
           cat /tmp/tidb-sql-ready.log >&2 || true
           exit 1
 
-      - name: Start drive9-server-local
+      - name: Start drive9-server
         run: |
-          nohup make run-server-local > /tmp/drive9-server-local.log 2>&1 &
-          echo $! > /tmp/drive9-server-local.pid
+          set -euo pipefail
+          if [ -n "${DRIVE9_SERVER_BIN:-}" ]; then
+            if [ ! -x "$DRIVE9_SERVER_BIN" ]; then
+              echo "DRIVE9_SERVER_BIN is not executable: $DRIVE9_SERVER_BIN" >&2
+              exit 1
+            fi
+            echo "starting pre-built server $DRIVE9_SERVER_BIN"
+            nohup "$DRIVE9_SERVER_BIN" > /tmp/drive9-server.log 2>&1 &
+          else
+            nohup make run-server-local > /tmp/drive9-server.log 2>&1 &
+          fi
+          echo $! > /tmp/drive9-server.pid
 
-      - name: Wait for drive9-server-local readiness
+      - name: Wait for drive9-server readiness
         run: |
           for _ in {1..60}; do
             if curl -sf "$DRIVE9_BASE/healthz" > /tmp/drive9-healthz.json; then
@@ -262,7 +274,7 @@ jobs:
             fi
             sleep 2
           done
-          echo "drive9-server-local did not become ready in time" >&2
+          echo "drive9-server did not become ready in time" >&2
           exit 1
 
       - name: Run API smoke
@@ -298,7 +310,6 @@ jobs:
         id: git-ops-smoke
         continue-on-error: true
         env:
-          DRIVE9_API_KEY: local-dev-key
           FUSE_STRICT_PREREQS: "1"
         run: bash e2e/git-ops-smoke-test.sh
 
@@ -306,7 +317,6 @@ jobs:
         id: git-workspace-ondemand-smoke
         continue-on-error: true
         env:
-          DRIVE9_API_KEY: local-dev-key
           FUSE_STRICT_PREREQS: "1"
         run: bash e2e/git-workspace-ondemand-smoke-test.sh
 
@@ -433,8 +443,9 @@ jobs:
         continue-on-error: true
         env:
           FUSE_STRICT_PREREQS: "1"
+          RUN_JOURNAL_SMOKE: "1"
+          RUN_POSIX_SMOKE: "1"
           RUN_GIT_WORKSPACE_SMOKE: "1"
-          RUN_GIT_ONDEMAND_SMOKE: "1"
           GIT_WORKSPACE_CLONE_TIMEOUT_S: "1800"
         run: bash e2e/smoke-all.sh
 
@@ -450,7 +461,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "## drive9-server-local e2e"
+            echo "## drive9-server local e2e"
             echo
             echo "| Check | Outcome |"
             echo "| --- | --- |"
@@ -563,19 +574,19 @@ jobs:
             cat /tmp/tiup-playground.log
           fi
 
-      - name: Dump drive9-server-local logs
+      - name: Dump drive9-server logs
         if: always()
         run: |
-          if [ -f /tmp/drive9-server-local.log ]; then
-            echo "=== drive9-server-local log ==="
-            cat /tmp/drive9-server-local.log
+          if [ -f /tmp/drive9-server.log ]; then
+            echo "=== drive9-server log ==="
+            cat /tmp/drive9-server.log
           fi
 
-      - name: Stop drive9-server-local
+      - name: Stop drive9-server
         if: always()
         run: |
-          if [ -f /tmp/drive9-server-local.pid ]; then
-            kill "$(cat /tmp/drive9-server-local.pid)" || true
+          if [ -f /tmp/drive9-server.pid ]; then
+            kill "$(cat /tmp/drive9-server.pid)" || true
           fi
 
       - name: Stop TiDB playground

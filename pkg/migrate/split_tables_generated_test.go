@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"testing"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 )
 
 // TestSplitTablesMigratorSkipGeneratedColumns verifies that when the semantic
@@ -18,7 +18,7 @@ func TestSplitTablesMigratorSkipGeneratedColumns(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	ctx := t.Context()
-	testmysql.ResetDB(t, db)
+	testtidb.ResetDB(t, db)
 
 	// Insert a file with content_text.
 	if _, err := db.Exec(`
@@ -91,7 +91,7 @@ func TestSemanticHasGeneratedColumns(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	ctx := t.Context()
-	testmysql.ResetDB(t, db)
+	testtidb.ResetDB(t, db)
 
 	// Ensure plain semantic table (previous tests may have left a generated-column version).
 	if _, err := db.Exec(`DROP TABLE IF EXISTS semantic`); err != nil {

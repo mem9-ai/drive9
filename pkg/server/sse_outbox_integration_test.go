@@ -9,7 +9,7 @@ import (
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/encrypt"
 	"github.com/mem9-ai/drive9/pkg/leader"
 	"github.com/mem9-ai/drive9/pkg/meta"
@@ -43,7 +43,7 @@ func newSSEOutboxTestCluster(t *testing.T) *sseOutboxTestCluster {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = metaStore.Close() })
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 	// Clean up pod tables ResetMetaDB does not cover. Fail on error so stale
 	// rows don't leak between tests.
 	ctx := context.Background()

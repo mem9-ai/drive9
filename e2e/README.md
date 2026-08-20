@@ -1,7 +1,7 @@
 # drive9 E2E tests
 
 Live end-to-end scripts for validating deployed `drive9-server` behavior,
-including local single-tenant validation via `drive9-server-local`.
+including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=local`.
 
 ## Prerequisites
 
@@ -34,8 +34,7 @@ including local single-tenant validation via `drive9-server-local`.
 | `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
 | `native-smoke-test.sh` | TiDB Cloud Native tenant lifecycle: CLI provision with credentials, status poll, basic fs ops (mkdir/cp/cat/ls/rm), delete + verification, trap cleanup on failure |
-| `smoke-all.sh` | Runs API + CLI + journal + layer FS + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; re-exports `DRIVE9_API_KEY` so every sub-suite runs in existing-tenant mode when set; set `RUN_FUSE_SMOKE=0` to skip FUSE symlink/hardlink coverage, `RUN_API_ONLY=1` to run only the core api + cli pair, `RUN_GIT_OPS_SMOKE=1` to include lightweight Git coverage, `RUN_GIT_WORKSPACE_SMOKE=1` to include heavier Git workspace coverage, `RUN_GIT_ONDEMAND_SMOKE=1` to include on-demand discovery coverage, and `RUN_PACK_SMOKE=1` to include portable pack/unpack coverage |
-| `local-smoke.sh` | Starts `drive9-server-local` with a disposable local DB by default, then runs `smoke-all.sh` with semantic checks disabled and FUSE smoke skipped unless `RUN_FUSE_SMOKE=1` |
+| `smoke-all.sh` | PR-gate aggregator aligned with `local-e2e.yml`: api, cli, layer-fs, fuse-release-gate, fuse-patch-storage-class, git-ops, git-workspace-ondemand, pack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget. Re-exports `DRIVE9_API_KEY` for existing-tenant mode. `RUN_FUSE_SMOKE=0` skips FUSE-related suites; `RUN_API_ONLY=1` keeps only api + cli; `RUN_JOURNAL_SMOKE=1` / `RUN_POSIX_SMOKE=1` / `RUN_GIT_WORKSPACE_SMOKE=1` add post-merge extras |
 
 ## CI automation tiers
 
@@ -46,10 +45,10 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Tier | Trigger | What runs |
 |------|---------|-----------|
 | PR gate | `pull_request` to `main` (local-e2e) | api, cli, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback), fuse-patch-storage-class, git-ops, git-workspace-ondemand, portable pack/unpack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget |
-| Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, full `smoke-all.sh` (journal, posix-permission, git-workspace), git feature smoke |
+| Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | `e2e-all` workflow (`Run workflow` button) | Everything above via `run_all_e2e=1` |
-| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `local-smoke.sh` (`make e2e-local` wrapper) |
+| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
@@ -85,7 +84,7 @@ in place of the synthesized-from-outcome summary. When adding a suite to
 ## Run
 
 Use a hosted deployment by default. For local development on this machine, use
-`drive9-server-local` instead.
+`drive9-server` with `DRIVE9_TENANT_PROVIDER=local` instead.
 
 ### Hosted endpoints
 
@@ -197,8 +196,8 @@ DRIVE9_TIDBCLOUD_PUBLIC_KEY=xxx DRIVE9_TIDBCLOUD_PRIVATE_KEY=xxx bash e2e/native
 
 bash e2e/smoke-all.sh
 
-# Include portable profile pack/unpack coverage in smoke-all.
-RUN_PACK_SMOKE=1 bash e2e/smoke-all.sh
+# Skip FUSE-related suites.
+RUN_FUSE_SMOKE=0 bash e2e/smoke-all.sh
 ```
 
 #### Existing-tenant regression
@@ -233,26 +232,33 @@ bash e2e/cli-smoke-test.sh
 
 Useful knobs for existing-tenant runs:
 
-- `RUN_CLI_FORK_CHECKS=0` — skip the fork flow (very large tenants should not
-  be forked).
+- `RUN_CLI_FORK_CHECKS=1` — enable the tenant fork flow (off by default).
 - `RUN_LARGE_FILE=0` — skip the 100MB API large-file upload.
-- `RUN_SEMANTIC_CHECKS=0` / `RUN_CLI_SEMANTIC_CHECKS=0` — skip semantic recall
-  checks when no embedding endpoint is available.
+- `RUN_SEMANTIC_CHECKS=1` / `RUN_CLI_SEMANTIC_CHECKS=1` — enable semantic recall
+  checks (off by default; needs an embedding endpoint).
+- `RUN_SQL_CHECKS=1` — enable API `POST /v1/sql` checks (off by default).
 - `RUN_UPLOAD_LIMIT_BOUNDARY=1` / `RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1` — force the
   upload-limit boundary checks back on in existing-tenant mode.
 
-#### `drive9-server-local` notes
+#### Local `drive9-server` (`DRIVE9_TENANT_PROVIDER=local`) notes
 
-- `drive9-server-local` serves a single local tenant with API key
-  `${DRIVE9_LOCAL_API_KEY:-local-dev-key}` by default.
-- `api-smoke-test.sh`, `cli-smoke-test.sh`, and `fuse-smoke-test.sh` still
-  provision fresh timestamped test paths as part of the smoke flow by default.
-  Point them at the built-in local tenant with
-  `DRIVE9_API_KEY=${DRIVE9_LOCAL_API_KEY:-local-dev-key}`.
+- Prefer `POST /v1/provision` and the returned `api_key` (a JWT). Do not
+  assume `local-dev-key` authenticates.
+- `api-smoke-test.sh`, `cli-smoke-test.sh`, and `fuse-smoke-test.sh` provision
+  unless `DRIVE9_API_KEY` is already set, then poll `/v1/status` until `active`.
 - If the final upload-limit boundary check unexpectedly returns `507` instead of
   `202`, inspect tenant `uploads` records before blaming the test itself.
   Stale `INITIATED` / `UPLOADING` multipart rows can consume reserved quota even
   when the file tree looks empty.
+
+#### Local server binary
+
+`make e2e-local` (`scripts/e2e-local.sh`) starts TiDB if needed, then in-tree
+`drive9-server` with `DRIVE9_TENANT_PROVIDER=local`, then `e2e/smoke-all.sh`.
+`local-e2e.yml` and `make run-server-local` also use `provider=local` unless
+`DRIVE9_SERVER_BIN` points at a pre-built executable. Blackbox
+`--server-mode local` uses `--local-server`, which defaults to
+`DRIVE9_SERVER_BIN`.
 
 ## Notes
 
@@ -261,9 +267,11 @@ Useful knobs for existing-tenant runs:
 - `api-smoke-test.sh` defaults `POLL_TIMEOUT_S` to 300s because schema initialization can exceed 120s in some regions.
 - File operations use `/v1/fs/*` and include nested directory coverage.
 - Semantic recall polling knobs for API smoke are `SEMANTIC_TIMEOUT_S` and `SEMANTIC_INTERVAL_S`.
-- Set `RUN_SEMANTIC_CHECKS=0` to skip semantic text recall and image-associated recall in `api-smoke-test.sh`.
+- Semantic text recall and image-associated recall in `api-smoke-test.sh` are off by default; set `RUN_SEMANTIC_CHECKS=1` to enable them.
 - Semantic recall polling knobs for CLI smoke are `CLI_SEMANTIC_TIMEOUT_S` and `CLI_SEMANTIC_INTERVAL_S`.
-- Set `RUN_CLI_SEMANTIC_CHECKS=0` to skip semantic text recall and image-associated recall in `cli-smoke-test.sh`.
+- Semantic text recall and image-associated recall in `cli-smoke-test.sh` are off by default; set `RUN_CLI_SEMANTIC_CHECKS=1` to enable them.
+- API `POST /v1/sql` checks are off by default; set `RUN_SQL_CHECKS=1` to enable them.
+- CLI tenant fork checks are off by default; set `RUN_CLI_FORK_CHECKS=1` to enable them.
 - Image fixture path is `DRIVE9_IMAGE_FIXTURE_PATH` (default `e2e/fixtures/cat03.jpg`) and uses the repo-local fixture.
 - Large-file scenario is enabled by default (`RUN_LARGE_FILE=1`) and runs a multipart upload using checksum-bound presigned parts.
 - You can tune size with `LARGE_FILE_MB` (default `100`).
@@ -278,9 +286,9 @@ Useful knobs for existing-tenant runs:
 - FUSE concurrency workload knobs are `FUSE_CONCURRENCY_WORKERS`, `FUSE_CONCURRENCY_FILES_PER_WORKER`, `FUSE_CONCURRENCY_READER_WORKERS`, `FUSE_CONCURRENCY_PAYLOAD_KB`, `FUSE_CONCURRENCY_TIMEOUT_S`, and `FUSE_CONCURRENCY_KEEP_ARTIFACTS`.
 - FUSE POSIX/fsx workload knobs are `FUSE_POSIX_FSX_OPS`, `FUSE_POSIX_FSX_MAX_BYTES`, `FUSE_POSIX_FSX_SEED`, `FUSE_POSIX_FSX_TIMEOUT_S`, and `FUSE_POSIX_FSX_KEEP_ARTIFACTS`. When enabled in CI, failures are hard failures.
 - FUSE performance baseline knobs are `FUSE_PERF_SMALL_FILES`, `FUSE_PERF_SMALL_BYTES`, `FUSE_PERF_LARGE_MB`, `FUSE_PERF_READ_PASSES`, `FUSE_PERF_SQLITE_ROWS`, `FUSE_PERF_KEEP_ARTIFACTS`, `FUSE_PERF_ARTIFACT_DIR`, `FUSE_PERF_COMPARE_WARN_RATIO`, and `FUSE_PERF_COMPARE_FAIL_ON_REGRESSION`. The baseline records small-file, large-file, rollback-journal SQLite, WAL SQLite, and WAL checkpoint metrics; SQLite rows are read back as payload bytes and SHA-256 verified before metrics are accepted.
-- Layer filesystem knobs are `RUN_LAYER_FUSE_SMOKE`, `LAYER_FUSE_STRICT_PREREQS`, `LAYER_DIFF_TIMEOUT_S`, and `LAYER_DIFF_INTERVAL_S`. Ordinary PR `local-e2e.yml` runs `layer-fs-smoke-test.sh` with `RUN_LAYER_FUSE_SMOKE=1` against `drive9-server-local`, so layer schema/API/FUSE restore coverage does not depend on a dedicated dev backend. Point at any deployment with `DRIVE9_BASE`. `smoke-all.sh` defaults `RUN_LAYER_FUSE_SMOKE` from `RUN_FUSE_SMOKE`.
+- Layer filesystem knobs are `RUN_LAYER_FUSE_SMOKE`, `LAYER_FUSE_STRICT_PREREQS`, `LAYER_DIFF_TIMEOUT_S`, and `LAYER_DIFF_INTERVAL_S`. Ordinary PR `local-e2e.yml` runs `layer-fs-smoke-test.sh` with `RUN_LAYER_FUSE_SMOKE=1` against local `drive9-server`, so layer schema/API/FUSE restore coverage does not depend on a dedicated dev backend. Point at any deployment with `DRIVE9_BASE`. `smoke-all.sh` defaults `RUN_LAYER_FUSE_SMOKE` from `RUN_FUSE_SMOKE`. FUSE mounts in these suites pass `--mode=fuse` (required on macOS, where `auto` is WebDAV).
 - Full daily local-e2e knobs are `RUN_E2E_SMOKE_ALL` and `RUN_GIT_FEATURE_SMOKE`; the scheduled run sets both to `1`, and manual `workflow_dispatch` runs can enable them with `run_e2e_smoke_all=1` and `run_git_feature_smoke=1`.
-- `local-e2e.yml` runs the lightweight pack smoke on ordinary PR triggers. It does not run the performance baseline or heavy FUSE/Git detectors on ordinary PR triggers. Use manual `workflow_dispatch` inputs `run_fuse_concurrency_stress=1`, `run_fuse_posix_fsx=1`, `run_fuse_sqlite_wal=1`, `run_fuse_sqlite_churn=1`, `run_fuse_sqlite_concurrency=1`, `run_fuse_performance_baseline=1`, `compare_fuse_performance_metrics=1`, `run_e2e_smoke_all=1`, and `run_git_feature_smoke=1` to enable them on demand. The scheduled daily run enables all of these flags; concurrency stress, POSIX/fsx, full smoke-all, and Git feature smoke run as separate hard-fail steps after the release gate and metrics archive, and all are attempted so one failure does not hide another workload's result. `run_e2e_smoke_all=1` also enables Git workspace smoke coverage.
+- `local-e2e.yml` runs the lightweight pack smoke on ordinary PR triggers. It does not run the performance baseline or heavy FUSE/Git detectors on ordinary PR triggers. Use manual `workflow_dispatch` inputs `run_fuse_concurrency_stress=1`, `run_fuse_posix_fsx=1`, `run_fuse_sqlite_wal=1`, `run_fuse_sqlite_churn=1`, `run_fuse_sqlite_concurrency=1`, `run_fuse_performance_baseline=1`, `compare_fuse_performance_metrics=1`, `run_e2e_smoke_all=1`, and `run_git_feature_smoke=1` to enable them on demand. The scheduled daily run enables all of these flags; concurrency stress, POSIX/fsx, full smoke-all, and Git feature smoke run as separate hard-fail steps after the release gate and metrics archive, and all are attempted so one failure does not hide another workload's result. `run_e2e_smoke_all=1` also enables journal, posix-permission, and Git workspace smoke coverage.
 - Set `archive_fuse_performance_metrics=1` on manual `local-e2e` runs, or use the daily scheduled run, to copy `performance-metrics-*.json`, `performance-compare-*.json`, `performance-compare-*.md`, mount logs, and an archive manifest to the Drive9 CI workspace under `/benchmarks/fuse-performance/<YYYY>/<MM>/<DD>/<branch>/<sha>/<run_id>-<attempt>/`. The same files are still uploaded as the GitHub artifact `fuse-performance-baseline`.
 - Set `compare_fuse_performance_metrics=1` on manual `local-e2e` runs, or use the daily scheduled run, to compare current metrics against the latest Drive9 archive before archiving the current run. By default, `FUSE_PERF_COMPARE_FAIL_ON_REGRESSION=1` makes any metric below `1 - FUSE_PERF_COMPARE_WARN_RATIO` fail the compare step after writing JSON/Markdown reports. Missing historical baselines, parameter mismatches, and legacy baselines missing newly added workloads still produce non-failing warnings; invalid current metrics, broken Drive9 compare configuration, malformed archived manifests, and structurally invalid baseline metrics fail closed.
 - The daily local-e2e gate intentionally covers the local CI-safe SQLite/Git/FUSE scripts. `description-smoke-test.sh` remains a manual environment-specific run (Docker + Ollama or stub embedder). Full pjdfstest lives under `blackbox` (`community.pjdfstest`).
@@ -291,7 +299,7 @@ Useful knobs for existing-tenant runs:
 - Git workspace timeout knobs are `GIT_WORKSPACE_CLONE_TIMEOUT_S` and `GIT_WORKSPACE_GIT_TIMEOUT_S`.
 - Git workspace clone uses `drive9 git clone --fast --blobless --hydrate=${GIT_WORKSPACE_HYDRATE:-sync}` inside a `--profile=coding-agent` FUSE mount.
 - Git ops smoke uses `tools/git_fixture.py` to create a local bare remote, so it
-  is suitable for `drive9-server-local` and does not depend on dev/prod tenant
+  is suitable for local `drive9-server` and does not depend on dev/prod tenant
   schema rollout. It runs the matrix from `GIT_OPS_PROFILES`
   (`coding-agent,portable`) and `GIT_OPS_CLONE_MODES`
   (`native,fast,blobless`).

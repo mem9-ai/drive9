@@ -6,9 +6,9 @@ import (
 
 func TestInitSchemaRequiredColumns(t *testing.T) {
 	// TODO(async-embedding): This test only validates schema shape through the
-	// MySQL fixture used by the current store/runtime path. It does not execute
-	// initDB9Schema on a real Postgres-backed store or validate Postgres-specific
-	// SQL/runtime behavior end-to-end.
+	// TiDB app-embedding fixture used by the current store/runtime path. It does
+	// not execute initDB9Schema on a real Postgres-backed store or validate
+	// Postgres-specific SQL/runtime behavior end-to-end.
 	s1, err := Open(testDSN)
 	if err != nil {
 		t.Fatal(err)

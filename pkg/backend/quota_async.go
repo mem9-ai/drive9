@@ -9,7 +9,7 @@ import (
 // dispatcher (mutation_dispatcher.go), which batches applies cross-tenant
 // into single metadb transactions while preserving per-tenant FIFO (one
 // shard per tenant). When the dispatcher is not running (unit tests,
-// drive9-server-local) or the backend is closing, items apply inline,
+// provider=local) or the backend is closing, items apply inline,
 // exactly like the pre-dispatcher per-backend queue fallback did.
 //
 // Cross-instance ordering is not guaranteed; see logAndEnqueueMutation.
