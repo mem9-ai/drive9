@@ -15,6 +15,7 @@
 set -euo pipefail
 
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
+API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
@@ -283,16 +284,20 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# [1] Provision tenant
+# [1] Provision tenant (or reuse DRIVE9_API_KEY)
 # ---------------------------------------------------------------------------
 echo "[1] provision tenant"
-resp=$(curl_body_code POST "$BASE/v1/provision")
-code=$(http_code "$resp")
-body=$(json_body "$resp")
-check_eq "POST /v1/provision returns 202" "$code" "202"
+if [ -z "$API_KEY" ]; then
+  resp=$(curl_body_code POST "$BASE/v1/provision")
+  code=$(http_code "$resp")
+  body=$(json_body "$resp")
+  check_eq "POST /v1/provision returns 202" "$code" "202"
 
-API_KEY=$(printf '%s' "$body" | jq -r '.api_key // empty')
-check_cmd "provision returns api_key" test -n "$API_KEY"
+  API_KEY=$(printf '%s' "$body" | jq -r '.api_key // empty')
+  check_cmd "provision returns api_key" test -n "$API_KEY"
+else
+  echo "SKIP provision (DRIVE9_API_KEY set)"
+fi
 
 # ---------------------------------------------------------------------------
 # [2] Poll tenant active
