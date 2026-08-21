@@ -116,6 +116,13 @@ RUN_SSE_SMOKE=1 bash e2e/sse-retention-smoke-test.sh
 DRIVE9_TIDBCLOUD_PUBLIC_KEY="$DRIVE9_TIDBCLOUD_PUBLIC_KEY" \
 DRIVE9_TIDBCLOUD_PRIVATE_KEY="$DRIVE9_TIDBCLOUD_PRIVATE_KEY" \
 bash e2e/native-smoke-test.sh
+
+# Tenant image-extract config smoke. Manual-only: hosted control-plane plus a
+# billable OpenAI-compatible vision provider. Skips if any required env is unset.
+export DRIVE9_E2E_IMAGE_EXTRACT_API_BASE="https://..."
+export DRIVE9_E2E_IMAGE_EXTRACT_API_KEY="..."
+export DRIVE9_E2E_IMAGE_EXTRACT_MODEL="..."
+bash e2e/image-extract-config-smoke-test.sh
 ```
 
 #### Existing-tenant regression
@@ -592,6 +599,22 @@ macOS WebDAV fallback cannot satisfy those asserts. Post-merge extras:
 Opt-in HTTP extras (off even on post-merge): `RUN_TOKENS_SMOKE=1`,
 `RUN_SSE_SMOKE=1`.
 
+### `image-extract-config-smoke-test.sh`
+
+Manual-only: hosted control-plane credentials plus a billable OpenAI-compatible
+vision provider. Not wired into CI. Skips before any HTTP request when a
+required variable is missing. `DRIVE9_TENANT_PROVIDER=local` cannot run this
+suite: local image extract is env-only and does not validate tenant config.
+
+1. `POST /v1/provision` with control-plane keys; capture `tenant_id` / `api_key`
+2. Poll `GET /v1/status` until `active`
+3. `GET /v1/admin/tenants/{id}/extract-config/image` — new tenant source is `none` or `default`
+4. Invalid provider API key → 400, config unchanged; unreachable API base → 502/504, config unchanged
+5. Valid custom config PUT — provider validated, response/GET mask the API key
+6. Upload `e2e/fixtures/cat03.jpg`; poll `?stat` until `tags.e2e_marker` appears; `find` by that tag
+7. Disable config (`enabled:false` clears provider fields); upload a second image and require empty semantic text/tags for `DISABLED_EXTRACT_WAIT_S`
+8. Exit trap disables config, deletes the test tree, then `DELETE /v1/admin/tenants/{id}`
+
 ### `native-smoke-test.sh`
 
 Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
@@ -620,12 +643,12 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | Variable | Default | Used by |
 |----------|---------|---------|
 | `DRIVE9_BASE` | `http://127.0.0.1:9009` | all scripts |
-| `DRIVE9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh` |
+| `DRIVE9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh`, `image-extract-config-smoke-test.sh` |
 | `DRIVE9_API_KEY` | - | `api-smoke-test.sh` (optional; when set, skip provision and reuse the tenant; cleanup test tree at end) |
 | `DRIVE9_API_KEY` | - | `cli-smoke-test.sh` (optional; when set, skip provision and reuse the tenant) |
 | `DRIVE9_API_KEY` | - | `fuse-smoke-test.sh` (optional; skip provision when set) |
 | `DRIVE9_API_KEY` | - | `posix-permission-smoke-test.sh` (optional; skip provision when set) |
-| `POLL_TIMEOUT_S` | `300` (api smoke), `120` (other smoke) | polling scripts |
+| `POLL_TIMEOUT_S` | `300` (api smoke), `600` (image-extract), `120` (other smoke) | polling scripts |
 | `POLL_INTERVAL_S` | `5` | polling scripts |
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
 | `LARGE_FILE_MB` | `100` | `api-smoke-test.sh` |
@@ -716,8 +739,15 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `GIT_FEATURE_TIMEOUT_S` | `240` | `git-feature-smoke-test.sh` |
 | `GIT_FEATURE_RUN_OVERSIZED` | `1` | `git-feature-smoke-test.sh` |
 | `GIT_WORKSPACE_HYDRATE` | `sync` | `git-workspace-smoke-test.sh` |
-| `DRIVE9_TIDBCLOUD_PUBLIC_KEY` | *(required)* | `native-smoke-test.sh` |
-| `DRIVE9_TIDBCLOUD_PRIVATE_KEY` | *(required)* | `native-smoke-test.sh` |
+| `DRIVE9_TIDBCLOUD_PUBLIC_KEY` | *(required)* | `native-smoke-test.sh`, `image-extract-config-smoke-test.sh` |
+| `DRIVE9_TIDBCLOUD_PRIVATE_KEY` | *(required)* | `native-smoke-test.sh`, `image-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_IMAGE_EXTRACT_API_BASE` | *(required)* | `image-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_IMAGE_EXTRACT_API_KEY` | *(required)* | `image-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_IMAGE_EXTRACT_MODEL` | *(required)* | `image-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_UNREACHABLE_API_BASE` | `https://example.com:81/v1` | `image-extract-config-smoke-test.sh` |
+| `IMAGE_EXTRACT_TIMEOUT_S` | `180` | `image-extract-config-smoke-test.sh` |
+| `IMAGE_EXTRACT_INTERVAL_S` | `3` | `image-extract-config-smoke-test.sh` |
+| `DISABLED_EXTRACT_WAIT_S` | `30` | `image-extract-config-smoke-test.sh` |
 | `SKIP_CLEANUP` | `0` | `native-smoke-test.sh` |
 
 ## Conventions

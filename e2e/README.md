@@ -35,6 +35,7 @@ including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=loca
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
 | `tokens-smoke-test.sh` | `/v1/tokens` management: dispatcher, scoped issue/list/activate/deactivate/delete/revoke/refresh, scoped gate, control-plane generate/list/status (needs `provider=local` mock IAM). Off in default `smoke-all.sh`; set `RUN_TOKENS_SMOKE=1` |
 | `sse-retention-smoke-test.sh` | SSE `/v1/events` initial sync, live `file_changed` delivery + cursor replay, >1000-event backlog drain; optional long-window replay and short-retention sweep (`SSE_SWEEP_TEST=1`). Off in default `smoke-all.sh`; set `RUN_SSE_SMOKE=1` |
+| `image-extract-config-smoke-test.sh` | Opt-in hosted HTTP test: provision a disposable tenant, validate tenant image-extract config (reject invalid key / unreachable base, persist a masked custom config), upload an image, assert a generated attribute tag via stat/find, disable the config, and delete the tenant. Manual-only: needs control-plane keys and a billable vision provider |
 | `native-smoke-test.sh` | TiDB Cloud Native tenant lifecycle: CLI provision with credentials, status poll, basic fs ops (mkdir/cp/cat/ls/rm), delete + verification, trap cleanup on failure |
 | `smoke-all.sh` | PR-gate aggregator aligned with `local-e2e.yml`: api, cli, layer-fs, fuse-release-gate, fuse-patch-storage-class, git-ops, git-workspace-ondemand, pack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget. Re-exports `DRIVE9_API_KEY` for existing-tenant mode. `RUN_FUSE_SMOKE=0` skips FUSE-related suites; `RUN_API_ONLY=1` keeps only api + cli; `RUN_JOURNAL_SMOKE=1` / `RUN_POSIX_SMOKE=1` / `RUN_GIT_WORKSPACE_SMOKE=1` add post-merge extras; `RUN_TOKENS_SMOKE=1` / `RUN_SSE_SMOKE=1` add HTTP tokens and SSE retention (off even on post-merge) |
 
@@ -50,7 +51,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | Local E2E `workflow_dispatch` with `run_all_e2e=1` | Everything above |
-| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials) |
+| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `image-extract-config-smoke-test.sh` (hosted control-plane + billable vision provider) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
@@ -196,6 +197,18 @@ bash e2e/posix-permission-smoke-test.sh
 # TiDB Cloud Native tenant lifecycle smoke (requires credentials, manual-only).
 DRIVE9_TIDBCLOUD_PUBLIC_KEY=xxx DRIVE9_TIDBCLOUD_PRIVATE_KEY=xxx bash e2e/native-smoke-test.sh
 
+# Tenant image-extract config smoke (hosted control-plane + billable vision
+# provider). Skips before any HTTP call when a required variable is missing.
+# Must target a multi-tenant drive9-server; DRIVE9_TENANT_PROVIDER=local uses
+# env-only image extract and cannot validate tenant config resolution.
+export DRIVE9_BASE="https://..."
+export DRIVE9_TIDBCLOUD_PUBLIC_KEY="..."
+export DRIVE9_TIDBCLOUD_PRIVATE_KEY="..."
+export DRIVE9_E2E_IMAGE_EXTRACT_API_BASE="https://..."
+export DRIVE9_E2E_IMAGE_EXTRACT_API_KEY="..."
+export DRIVE9_E2E_IMAGE_EXTRACT_MODEL="..."
+bash e2e/image-extract-config-smoke-test.sh
+
 bash e2e/smoke-all.sh
 
 # Skip FUSE-related suites.
@@ -265,6 +278,26 @@ Useful knobs for existing-tenant runs:
 ## Notes
 
 - `api-smoke-test.sh` expects `POST /v1/provision` to return `tenant_id`, `api_key`, and `status`.
+- `image-extract-config-smoke-test.sh` always provisions a disposable tenant
+  with `DRIVE9_TIDBCLOUD_PUBLIC_KEY` / `DRIVE9_TIDBCLOUD_PRIVATE_KEY`. Provider
+  configuration requires `DRIVE9_E2E_IMAGE_EXTRACT_API_BASE`,
+  `DRIVE9_E2E_IMAGE_EXTRACT_API_KEY`, and `DRIVE9_E2E_IMAGE_EXTRACT_MODEL`.
+  The config PUT performs a real validation request before storing the config,
+  and the uploaded fixture causes a second provider request in the image
+  worker. The custom prompt fixes the attribute key `e2e_marker`; its value is
+  a short lowercase English noun chosen by the model from the image. The test
+  never prints either private key. Exit trap disables the custom config first,
+  then removes the test file tree and deletes the tenant. `POLL_TIMEOUT_S`
+  controls tenant readiness (default `600`); `IMAGE_EXTRACT_TIMEOUT_S` and
+  `IMAGE_EXTRACT_INTERVAL_S` control tag polling (defaults `180` and `3`).
+  After the positive path, the test disables the custom config, uploads a new
+  image, and requires its semantic text and tags to stay empty for
+  `DISABLED_EXTRACT_WAIT_S` (default `30`). Individual HTTP calls use
+  `CURL_CONNECT_TIMEOUT_S=10` and `CURL_MAX_TIME_S=120` by default. Before
+  storing a valid provider config, the test verifies that an invalid API key
+  and an unreachable API base are rejected without changing the tenant's
+  config. Override `DRIVE9_E2E_UNREACHABLE_API_BASE` only when the default
+  public, closed-port endpoint is unsuitable.
 - Tenant readiness is checked through `GET /v1/status`.
 - `api-smoke-test.sh` defaults `POLL_TIMEOUT_S` to 300s because schema initialization can exceed 120s in some regions.
 - File operations use `/v1/fs/*` and include nested directory coverage.
