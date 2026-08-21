@@ -350,21 +350,9 @@ func printAdminTenantList(out *client.AdminTenantListResponse, includeQuota bool
 func printAdminTenantTable(tenants []client.AdminTenant, includeQuota bool) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	if includeQuota {
-		_, _ = fmt.Fprintln(w, "TENANT_ID\tSTATUS\tKIND\tMAX_STORAGE\tMAX_FILE_SIZE\tMAX_FILE_COUNT\tSPENDING_LIMIT\tSTORAGE_USED\tRESERVED\tFILE_COUNT")
+		_, _ = fmt.Fprintln(w, quotaTableHeader(true))
 		for _, t := range tenants {
-			quota := t.Quota
-			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				t.TenantID,
-				t.Status,
-				t.Kind,
-				adminQuotaMaxStorage(quota),
-				adminQuotaMaxFileSize(quota),
-				adminQuotaMaxFileCount(quota),
-				adminQuotaSpendingLimit(quota),
-				adminQuotaStorageUsed(quota),
-				adminQuotaReserved(quota),
-				adminQuotaFileCount(quota),
-			)
+			_, _ = fmt.Fprintln(w, quotaTableRow(t.TenantID, t.Status, t.Kind, t.Quota, true))
 		}
 	} else {
 		_, _ = fmt.Fprintln(w, "TENANT_ID\tSTATUS\tKIND")
@@ -373,6 +361,48 @@ func printAdminTenantTable(tenants []client.AdminTenant, includeQuota bool) erro
 		}
 	}
 	return w.Flush()
+}
+
+func quotaTableHeader(includeKind bool) string {
+	columns := []string{"TENANT_ID", "STATUS"}
+	if includeKind {
+		columns = append(columns, "KIND")
+	}
+	columns = append(columns,
+		"MAX_STORAGE",
+		"MAX_FILE_SIZE",
+		"MAX_FILE_COUNT",
+		"MAX_MEDIA_LLM_FILES",
+		"MAX_VIDEO_LLM_FILES",
+		"SPENDING_LIMIT",
+		"STORAGE_USED",
+		"RESERVED",
+		"FILE_COUNT",
+		"MEDIA_FILE_COUNT",
+		"VIDEO_FILE_COUNT",
+	)
+	return strings.Join(columns, "\t")
+}
+
+func quotaTableRow(tenantID, status, kind string, quota *client.AdminTenantQuota, includeKind bool) string {
+	values := []string{tenantID, status}
+	if includeKind {
+		values = append(values, kind)
+	}
+	values = append(values,
+		adminQuotaMaxStorage(quota),
+		adminQuotaMaxFileSize(quota),
+		adminQuotaMaxFileCount(quota),
+		adminQuotaMaxMediaLLMFiles(quota),
+		adminQuotaMaxVideoLLMFiles(quota),
+		adminQuotaSpendingLimit(quota),
+		adminQuotaStorageUsed(quota),
+		adminQuotaReserved(quota),
+		adminQuotaFileCount(quota),
+		adminQuotaMediaFileCount(quota),
+		adminQuotaVideoFileCount(quota),
+	)
+	return strings.Join(values, "\t")
 }
 
 func adminQuotaMaxStorage(quota *client.AdminTenantQuota) string {
@@ -397,6 +427,20 @@ func adminQuotaMaxFileCount(quota *client.AdminTenantQuota) string {
 		return "unlimited"
 	}
 	return fmt.Sprintf("%d", quota.Config.MaxFileCount)
+}
+
+func adminQuotaMaxMediaLLMFiles(quota *client.AdminTenantQuota) string {
+	if quota == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%d", quota.Config.MaxMediaLLMFiles)
+}
+
+func adminQuotaMaxVideoLLMFiles(quota *client.AdminTenantQuota) string {
+	if quota == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%d", quota.Config.MaxVideoLLMFiles)
 }
 
 func adminQuotaSpendingLimit(quota *client.AdminTenantQuota) string {
@@ -425,6 +469,20 @@ func adminQuotaFileCount(quota *client.AdminTenantQuota) string {
 		return "-"
 	}
 	return fmt.Sprintf("%d", quota.Usage.FileCount)
+}
+
+func adminQuotaMediaFileCount(quota *client.AdminTenantQuota) string {
+	if quota == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%d", quota.Usage.MediaFileCount)
+}
+
+func adminQuotaVideoFileCount(quota *client.AdminTenantQuota) string {
+	if quota == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%d", quota.Usage.VideoFileCount)
 }
 
 func adminTenantDelete(args []string) error {
@@ -829,6 +887,8 @@ flags:
   --max-storage-size Mi            max confirmed+reserved storage size in Mi
   --max-file-size Mi               max single file size in Mi; must not exceed server DRIVE9_MAX_UPLOAD_BYTES
   --max-file-count N               max confirmed file count; 0 means unlimited
+  --max-media-llm-files N          max media LLM extract files; non-negative; requires media extract config
+  --max-video-llm-files N          max video LLM extract files; non-negative; requires video extract config
   --tidbcloud-spending-limit N     TiDB Cloud Cluster Spending Limit; must be non-negative
   --json                           output result as JSON
 
