@@ -4260,6 +4260,13 @@ func (fs *Dat9FS) resetMountViewOnAuthorizationError(err error) error {
 	return err
 }
 
+func (fs *Dat9FS) resetMountViewOnUnauthorizedError(err error) error {
+	if client.IsUnauthorized(err) {
+		fs.resetMountView()
+	}
+	return err
+}
+
 func isTransientLookupErr(err error) bool {
 	if err == nil {
 		return false
@@ -5105,7 +5112,7 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 		return stat, generation, err
 	}
 	if !isTransientLookupErr(err) {
-		return stat, 0, fs.resetMountViewOnAuthorizationError(err)
+		return stat, 0, err
 	}
 
 	// Mapping interruption to a retryable errno alone is insufficient for callers
@@ -5152,7 +5159,7 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 			return nil, generation, err
 		}
 		if !isTransientLookupErr(err) {
-			return nil, 0, fs.resetMountViewOnAuthorizationError(err)
+			return nil, 0, err
 		}
 		lastErr = err
 	}
@@ -5174,7 +5181,8 @@ func (fs *Dat9FS) lookupStatWithRetry(cancel <-chan struct{}, childP string) (*c
 func (fs *Dat9FS) getAttrStatWithRetry(cancel <-chan struct{}, remotePath string) (*client.StatResult, uint64, error) {
 	// Keep GetAttr retries out of lookupStatRetry* so that those counters retain
 	// a single meaning: Lookup path retry behavior.
-	return fs.statWithTransientRetry(cancel, remotePath, false)
+	stat, generation, err := fs.statWithTransientRetry(cancel, remotePath, false)
+	return stat, generation, fs.resetMountViewOnAuthorizationError(err)
 }
 
 func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
@@ -6303,7 +6311,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 			return gofuse.OK
 		}
 		if !statNotFound {
-			return listDirErrToFuseStatus(err)
+			return listDirErrToFuseStatus(fs.resetMountViewOnAuthorizationError(err))
 		}
 		// Cache negative lookup: tell kernel this entry doesn't exist
 		// for NegativeEntryTTL so it doesn't re-ask immediately.
@@ -11040,7 +11048,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			if errors.Is(err, errReadRetriesExhausted) {
 				return nil, gofuse.EIO
 			}
-			return nil, httpToFuseStatus(err)
+			return nil, httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
 		}
 		offset := int64(input.Offset)
 		if offset >= int64(len(data)) {
@@ -11122,7 +11130,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			if errors.Is(err, errReadRetriesExhausted) {
 				return nil, gofuse.EIO
 			}
-			return nil, listDirErrToFuseStatus(err)
+			return nil, listDirErrToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
 		}
 		if fs.debugEnabled() && time.Since(rangeStart) >= fuseDebugSlowReadThreshold {
 			fs.debugf("read disk-cache range done path=%s off=%d req=%d got=%d source=%s dur=%s", p, input.Offset, input.Size, n, source, time.Since(rangeStart))
@@ -11154,7 +11162,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		if errors.Is(err, errReadRetriesExhausted) {
 			return nil, gofuse.EIO
 		}
-		return nil, httpToFuseStatus(err)
+		return nil, httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
 	}
 	if fs.debugEnabled() && time.Since(rangeStart) >= fuseDebugSlowReadThreshold {
 		fs.debugf("read range done path=%s off=%d req=%d got=%d source=%s dur=%s", p, input.Offset, input.Size, n, source, time.Since(rangeStart))
