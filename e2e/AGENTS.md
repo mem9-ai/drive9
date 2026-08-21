@@ -500,8 +500,9 @@ developer machines or EC2-style validation rather than the default smoke path.
 
 Opt-in (`RUN_TOKENS_SMOKE=1`). HTTP `/v1/tokens` management: credential
 dispatcher, scoped issue/list/activate/deactivate/delete/revoke/refresh,
-scoped gate, and control-plane generate/list when `provider=local` mock IAM
-is enabled. Not part of the PR or post-merge default.
+pseudoroot projected listing and hidden siblings, scoped gate, and
+control-plane generate/list when `provider=local` mock IAM is enabled.
+Not part of the PR or post-merge default.
 
 ### `sse-retention-smoke-test.sh`
 

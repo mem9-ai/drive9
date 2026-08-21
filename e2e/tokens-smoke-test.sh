@@ -5,6 +5,7 @@
 #   - Credential dispatcher (Bearer vs control-plane; ambiguous → 400; neither → 401)
 #   - Data-plane: issue scoped, list, activate/deactivate, delete, revoke-by-key, refresh
 #   - Scoped gate: only POST /v1/tokens/refresh allowed for scoped tokens
+#   - Pseudoroot projected listing and hidden siblings
 #   - Control-plane (local mock IAM on provider=local): generate, list, activate,
 #     deactivate, delete, revoke-by-key, org-wide list
 #   - Legacy zero-change: owner delete/revoke body {"status":"ok"}
@@ -430,9 +431,90 @@ resp=$(bearer DELETE "/v1/tokens/$DD_ID")
 check_eq "delete disabled key → 200" "$(http_code "$resp")" "200"
 
 # ---------------------------------------------------------------------------
-# [9] Control-plane generate / list / status / delete / revoke
+# [9] Pseudoroot projected namespace
 # ---------------------------------------------------------------------------
-step 9 "control-plane management"
+step 9 "pseudoroot projected namespace"
+
+pseudo_suffix="$(date +%s)-$$"
+pseudo_p1="e2e-pseudoroot-p1-$pseudo_suffix"
+pseudo_p2="e2e-pseudoroot-p2-$pseudo_suffix"
+pseudo_secret="e2e-pseudoroot-secret-$pseudo_suffix"
+
+for pseudo_dir in "$pseudo_p1" "$pseudo_p2" "$pseudo_secret"; do
+	resp=$(bearer POST "/v1/fs/$pseudo_dir?mkdir")
+	check_eq "create $pseudo_dir" "$(http_code "$resp")" "200"
+done
+resp=$(bearer PUT "/v1/fs/$pseudo_p1/a.txt" "a")
+check_eq "write projected p1 file" "$(http_code "$resp")" "200"
+resp=$(bearer PUT "/v1/fs/$pseudo_secret/hidden.txt" "hidden")
+check_eq "write hidden sibling file" "$(http_code "$resp")" "200"
+
+pseudo_issue_body=$(jq -nc \
+	--arg p1 "/$pseudo_p1" \
+	--arg p2 "/$pseudo_p2" \
+	'{subject:"e2e-pseudoroot",ttl_seconds:600,scopes:[
+		{prefix:"/",ops:["pseudoroot"]},
+		{prefix:$p1,ops:["read","list"]},
+		{prefix:$p2,ops:["read","list"]}
+	]}')
+resp=$(bearer POST "/v1/tokens" "$pseudo_issue_body")
+body=$(json_body "$resp")
+check_eq "issue pseudoroot token" "$(http_code "$resp")" "201"
+pseudo_token=$(printf '%s' "$body" | jq -r '.token // empty')
+pseudo_token_id=$(printf '%s' "$body" | jq -r '.token_id // empty')
+check_eq "pseudoroot canonical directive" \
+	"$(printf '%s' "$body" | jq -r '.scopes[] | select(.prefix=="/") | .ops | join(",")')" \
+	"pseudoroot"
+
+resp=$(bearer GET "/v1/fs/?list" "" "$pseudo_token")
+check_eq "pseudoroot root list" "$(http_code "$resp")" "200"
+projected_names=$(json_body "$resp" | jq -r '[.entries[].name] | sort | join(",")')
+expected_names=$(printf '%s\n%s\n' "$pseudo_p1" "$pseudo_p2" | sort | paste -sd, -)
+check_eq "pseudoroot root names" "$projected_names" "$expected_names"
+
+resp=$(bearer GET "/v1/fs/$pseudo_p1?list" "" "$pseudo_token")
+check_eq "pseudoroot target list" "$(http_code "$resp")" "200"
+check_eq "pseudoroot target file" \
+	"$(json_body "$resp" | jq -r '[.entries[].name] | join(",")')" \
+	"a.txt"
+
+resp=$(bearer GET "/v1/fs/$pseudo_secret?list" "" "$pseudo_token")
+check_eq "pseudoroot hidden sibling list" "$(http_code "$resp")" "404"
+resp=$(bearer GET "/v1/fs/$pseudo_secret/hidden.txt" "" "$pseudo_token")
+check_eq "pseudoroot hidden sibling read" "$(http_code "$resp")" "403"
+
+resp=$(bearer POST "/v1/tokens" \
+	'{"subject":"e2e-pseudoroot-empty","ttl_seconds":600,"scopes":[{"prefix":"/","ops":["pseudoroot"]}]}')
+body=$(json_body "$resp")
+check_eq "issue empty pseudoroot token" "$(http_code "$resp")" "201"
+empty_pseudo_token=$(printf '%s' "$body" | jq -r '.token // empty')
+empty_pseudo_token_id=$(printf '%s' "$body" | jq -r '.token_id // empty')
+resp=$(bearer GET "/v1/fs/?list" "" "$empty_pseudo_token")
+check_eq "empty pseudoroot root list" "$(http_code "$resp")" "200"
+check_eq "empty pseudoroot has no entries" \
+	"$(json_body "$resp" | jq -r '.entries | length')" \
+	"0"
+
+resp=$(bearer POST "/v1/tokens" \
+	'{"subject":"e2e-pseudoroot-conflict","ttl_seconds":600,"scopes":[{"prefix":"/","ops":["pseudoroot","list"]}]}')
+check_eq "reject covering pseudoroot list" "$(http_code "$resp")" "400"
+
+for pseudo_token_cleanup_id in "$pseudo_token_id" "$empty_pseudo_token_id"; do
+	if [[ -n "$pseudo_token_cleanup_id" ]]; then
+		resp=$(bearer DELETE "/v1/tokens/$pseudo_token_cleanup_id")
+		check_eq "delete pseudoroot token $pseudo_token_cleanup_id" \
+			"$(http_code "$resp")" "200"
+	fi
+done
+for pseudo_dir in "$pseudo_p1" "$pseudo_p2" "$pseudo_secret"; do
+	resp=$(bearer DELETE "/v1/fs/$pseudo_dir?recursive=1")
+	check_eq "cleanup $pseudo_dir" "$(http_code "$resp")" "200"
+done
+
+# ---------------------------------------------------------------------------
+# [10] Control-plane generate / list / status / delete / revoke
+# ---------------------------------------------------------------------------
+step 10 "control-plane management"
 # Probe generate with headers (empty body) — works when local mock IAM is enabled.
 resp=$(cp_hdr POST "/v1/tokens/generate?tenant_id=$TENANT_ID")
 code=$(http_code "$resp")
