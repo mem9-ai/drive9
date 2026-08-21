@@ -21,7 +21,7 @@ type readDirPrefetchCandidate struct {
 	revision   int64
 }
 
-func (fs *Dat9FS) prefetchReadCacheForDir(ctx context.Context, dirPath string, items []CachedFileInfo) {
+func (fs *Dat9FS) prefetchReadCacheForDir(ctx context.Context, dirPath string, items []CachedFileInfo, generation uint64) {
 	if fs == nil || fs.opts == nil || !fs.opts.ReadDirPrefetch || len(items) == 0 {
 		return
 	}
@@ -52,6 +52,9 @@ func (fs *Dat9FS) prefetchReadCacheForDir(ctx context.Context, dirPath string, i
 				zap.Error(err))
 			return
 		}
+		if !fs.lockMountViewRead(generation) {
+			return
+		}
 		for i, result := range results {
 			if !result.OK() {
 				continue
@@ -74,6 +77,7 @@ func (fs *Dat9FS) prefetchReadCacheForDir(ctx context.Context, dirPath string, i
 				}
 			}
 		}
+		fs.mountViewMu.RUnlock()
 	}
 }
 

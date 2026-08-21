@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -196,6 +197,50 @@ func TestDirectoryListDiscardedWhenMountViewResetsInFlight(t *testing.T) {
 	defer dh.mu.Unlock()
 	if dh.Entries != nil {
 		t.Fatalf("directory handle retained in-flight entries: %#v", dh.Entries)
+	}
+	if cached, ok := fs.dirCache.Get("/"); ok {
+		t.Fatalf("directory cache retained in-flight entries after reset: %#v", cached)
+	}
+}
+
+func TestDirectoryPrefetchDiscardedWhenMountViewResetsInFlight(t *testing.T) {
+	prefetchStarted := make(chan struct{})
+	releasePrefetch := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"entries":[{"name":"prefetch.txt","isdir":false,"size":5,"revision":7}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-read-small":
+			close(prefetchStarted)
+			<-releasePrefetch
+			_, _ = w.Write([]byte(`{"results":[{"path":"/prefetch.txt","status":200,"data":"aGVsbG8=","size":5,"revision":7}]}`))
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+	opts := &MountOptions{ReadDirPrefetch: true, PrefetchTimeout: time.Second}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := fs.listDir(context.Background(), "/")
+		done <- err
+	}()
+	<-prefetchStarted
+	fs.resetMountView()
+	close(releasePrefetch)
+
+	if err := <-done; err != nil {
+		t.Fatalf("listDir error = %v, want nil", err)
+	}
+	if _, ok := fs.dirCache.Get("/"); ok {
+		t.Fatal("directory cache was repopulated after reset")
+	}
+	if _, ok := fs.readCache.Get("/prefetch.txt", 7); ok {
+		t.Fatal("read cache was repopulated after reset")
 	}
 }
 

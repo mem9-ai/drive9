@@ -9440,6 +9440,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 		fs.perf.dirCacheMiss.add(1)
 	}
 
+	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
@@ -9452,8 +9453,12 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	if err := fs.applyBatchStats(ctx, dirPath, cached); err != nil {
 		return nil, err
 	}
+	if !fs.lockMountViewRead(generation) {
+		return nil, syscall.EAGAIN
+	}
 	fs.dirCache.Put(dirPath, cached)
-	fs.prefetchReadCacheForDir(ctx, dirPath, cached)
+	fs.mountViewMu.RUnlock()
+	fs.prefetchReadCacheForDir(ctx, dirPath, cached, generation)
 
 	entries := fs.cachedToDirEntries(dirPath, cached)
 	return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
