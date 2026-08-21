@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -19,7 +20,7 @@ func TestValidateRemoteRootAuthorizationErrorsArePermanent(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			err := validateRemoteRoot(client.NewWithToken(ts.URL, "scoped"), "/")
+			err := validateRemoteRoot(context.Background(), client.NewWithToken(ts.URL, "scoped"), "/")
 			assertMountExit(t, err, ExitStartupPermanent, ExitReasonStartupPermanent)
 			if !strings.Contains(err.Error(), "authorization denied") {
 				t.Fatalf("error = %q, want authorization detail", err)
@@ -40,7 +41,7 @@ func TestValidateRemoteRootNonRootForbiddenFallsBackToList(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	err := validateRemoteRoot(client.NewWithToken(ts.URL, "scoped"), "/team")
+	err := validateRemoteRoot(context.Background(), client.NewWithToken(ts.URL, "scoped"), "/team")
 	if err != nil {
 		t.Fatalf("validateRemoteRoot: %v, want list-only mount accepted", err)
 	}
@@ -57,7 +58,7 @@ func TestValidateRemoteRootNonRootForbiddenListDeniedIsPermanent(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	err := validateRemoteRoot(client.NewWithToken(ts.URL, "scoped"), "/team")
+	err := validateRemoteRoot(context.Background(), client.NewWithToken(ts.URL, "scoped"), "/team")
 	assertMountExit(t, err, ExitStartupPermanent, ExitReasonStartupPermanent)
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("remote validation calls = %d, want HEAD plus denied List", got)
@@ -68,7 +69,7 @@ func TestValidateRemoteRootNotFoundRemainsPermanent(t *testing.T) {
 	ts := httptest.NewServer(http.NotFoundHandler())
 	defer ts.Close()
 
-	err := validateRemoteRoot(client.New(ts.URL, "owner"), "/missing")
+	err := validateRemoteRoot(context.Background(), client.New(ts.URL, "owner"), "/missing")
 	assertMountExit(t, err, ExitStartupPermanent, ExitReasonStartupPermanent)
 	if !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("error = %q, want missing-root detail", err)
@@ -81,8 +82,23 @@ func TestValidateRemoteRootServiceUnavailableRemainsTransient(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	err := validateRemoteRoot(client.New(ts.URL, "owner"), "/")
+	err := validateRemoteRoot(context.Background(), client.New(ts.URL, "owner"), "/")
 	assertMountExit(t, err, ExitStartupTransient, ExitReasonStartupTransient)
+}
+
+func TestValidateRemoteRootHonorsCanceledContext(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"entries":[]}`))
+	}))
+	defer ts.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := validateRemoteRoot(ctx, client.New(ts.URL, "owner"), "/")
+	assertMountExit(t, err, ExitStartupTransient, ExitReasonStartupTransient)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
+	}
 }
 
 func assertMountExit(t *testing.T, err error, code int, reason MountExitReason) {

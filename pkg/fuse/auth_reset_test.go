@@ -2,9 +2,11 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
+	"syscall"
 	"testing"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
@@ -121,6 +123,7 @@ func TestBatchStatPerPathForbiddenKeepsListOnlyEntry(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+	seedMountViewCaches(fs)
 
 	entries, err := fs.listDir(context.Background(), "/project")
 	if err != nil {
@@ -128,6 +131,71 @@ func TestBatchStatPerPathForbiddenKeepsListOnlyEntry(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name != "visible.txt" {
 		t.Fatalf("entries = %#v, want list-only visible.txt", entries)
+	}
+	if _, ok := fs.dirCache.Get("/stale"); !ok {
+		t.Fatal("directory cache was cleared by a per-path 403")
+	}
+	if _, ok := fs.readCache.Get("/stale.txt", 1); !ok {
+		t.Fatal("read cache was cleared by a per-path 403")
+	}
+}
+
+func TestResetMountViewInvalidatesOpenDirectoryHandleEntries(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken("http://localhost", "scoped"), opts)
+	dh := &DirHandle{
+		Ino:               1,
+		Path:              "/",
+		Entries:           []DirEntry{{Name: "stale"}},
+		entriesGeneration: fs.mountViewGeneration.Load(),
+	}
+	fs.dirHandles.Allocate(dh)
+
+	fs.resetMountView()
+
+	dh.mu.Lock()
+	defer dh.mu.Unlock()
+	if dh.Entries != nil {
+		t.Fatalf("directory handle entries = %#v, want invalidated", dh.Entries)
+	}
+	if dh.entriesGeneration != fs.mountViewGeneration.Load() {
+		t.Fatalf("handle generation = %d, mount generation = %d", dh.entriesGeneration, fs.mountViewGeneration.Load())
+	}
+}
+
+func TestDirectoryListDiscardedWhenMountViewResetsInFlight(t *testing.T) {
+	listStarted := make(chan struct{})
+	releaseList := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(listStarted)
+		<-releaseList
+		_, _ = w.Write([]byte(`{"entries":[{"name":"stale","isdir":true}]}`))
+	}))
+	defer ts.Close()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+	dh := &DirHandle{Ino: 1, Path: "/", entriesGeneration: fs.mountViewGeneration.Load()}
+	fs.dirHandles.Allocate(dh)
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := fs.loadDirHandleEntries(context.Background(), dh)
+		done <- err
+	}()
+	<-listStarted
+	fs.resetMountView()
+	close(releaseList)
+
+	err := <-done
+	if !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("loadDirHandleEntries error = %v, want EAGAIN after reset", err)
+	}
+	dh.mu.Lock()
+	defer dh.mu.Unlock()
+	if dh.Entries != nil {
+		t.Fatalf("directory handle retained in-flight entries: %#v", dh.Entries)
 	}
 }
 

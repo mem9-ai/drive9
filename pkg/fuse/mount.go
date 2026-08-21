@@ -210,15 +210,15 @@ func (o *MountOptions) setDefaults() {
 	}
 }
 
-func validateRemoteRoot(c *client.Client, remoteRoot string) error {
+func validateRemoteRoot(ctx context.Context, c *client.Client, remoteRoot string) error {
 	if remoteRoot == "/" {
-		if _, err := c.List(remoteRoot); err != nil {
+		if _, err := c.ListCtx(ctx, remoteRoot); err != nil {
 			return remoteRootValidationError(remoteRoot, err)
 		}
 		return nil
 	}
 
-	stat, err := c.Stat(remoteRoot)
+	stat, err := c.StatCtx(ctx, remoteRoot)
 	if err == nil {
 		if !stat.IsDir {
 			return ExitStartupPermanentErr(fmt.Sprintf("remote root %q is not a directory", remoteRoot), nil)
@@ -231,7 +231,7 @@ func validateRemoteRoot(c *client.Client, remoteRoot string) error {
 	// Stat may fail when directory stat is unsupported or when a scoped token
 	// grants list without read. Fall back to List and classify its result as the
 	// authoritative non-root mount validation.
-	if _, listErr := c.List(remoteRoot); listErr != nil {
+	if _, listErr := c.ListCtx(ctx, remoteRoot); listErr != nil {
 		if client.IsNotFound(listErr) {
 			return ExitStartupPermanentErr(fmt.Sprintf("remote source %q does not exist", remoteRoot), listErr)
 		}
@@ -343,7 +343,7 @@ func Mount(opts *MountOptions) (err error) {
 		return ExitStartupPermanentErr("normalize remote root", err)
 	}
 	opts.RemoteRoot = remoteRoot
-	if err := validateRemoteRoot(c, remoteRoot); err != nil {
+	if err := validateRemoteRoot(context.Background(), c, remoteRoot); err != nil {
 		return err
 	}
 	if opts.LayerRef != "" {

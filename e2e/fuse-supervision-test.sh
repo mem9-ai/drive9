@@ -478,9 +478,24 @@ start_scoped_mount() {
 	local context_name="$1"
 	local remote_root="$2"
 	select_scoped_context "$context_name" || return 1
-	scoped_drive9 mount --mode=fuse --durability=close-sync \
-		":$remote_root" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 || return 1
-	wait_mount_state mounted
+	if ! scoped_drive9 mount --mode=fuse --durability=close-sync \
+		":$remote_root" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1; then
+		cat "$MOUNT_LOG" >&2 || true
+		return 1
+	fi
+	if ! wait_mount_state mounted; then
+		cat "$MOUNT_LOG" >&2 || true
+		return 1
+	fi
+}
+
+token_management_status() {
+	local resp
+	if ! resp="$(curl_body_code GET "$BASE/v1/tokens" "$API_KEY")"; then
+		printf '000'
+		return
+	fi
+	http_code "$resp"
 }
 
 list_mount_names() {
@@ -525,10 +540,10 @@ capture_supervisor_log() {
 cleanup() {
   local rc=$?
   stop_mount
-	for context_name in "${pseudoroot_contexts[@]}"; do
+	for context_name in ${pseudoroot_contexts[@]+"${pseudoroot_contexts[@]}"}; do
 		drive9 token revoke "$context_name" >/dev/null 2>&1 || true
 	done
-	for remote_root in "${pseudoroot_remote_roots[@]}"; do
+	for remote_root in ${pseudoroot_remote_roots[@]+"${pseudoroot_remote_roots[@]}"}; do
 		drive9 fs rm -r "$remote_root" >/dev/null 2>&1 || true
 	done
   if [ "$rc" -ne 0 ] || [ "$FAIL" -ne 0 ]; then
@@ -761,6 +776,11 @@ else
   echo "[10] SKIP foreground smoke (RUN_FOREGROUND_SMOKE=0)"
 fi
 
+# The CLI repo's local fallback server intentionally has no token-management
+# backend. Run this cross-repo contract only against an fs#83-compatible server;
+# keep unexpected probe failures fatal instead of silently skipping them.
+token_management_code="$(token_management_status)"
+if [[ "$token_management_code" == "200" ]]; then
 echo "[11] pseudoroot-scoped supervised mounts"
 pseudo_base="/${RUN_ID}-pseudoroot"
 pseudo_other="/${RUN_ID}-pseudoroot-other"
@@ -826,7 +846,9 @@ denied_output="$(with_timeout "$FUSE_PROBE_TIMEOUT_S" cat \
 	"$MOUNT_POINT/$pseudo_base_name/no-read/denied.txt" 2>&1)"
 denied_rc=$?
 set -e
-if ((denied_rc != 0)); then
+if ((denied_rc == 124)); then
+	check_eq "projected list-only content read denied" "timeout" "denied"
+elif ((denied_rc != 0)); then
 	check_eq "projected list-only content read denied" "denied" "denied"
 else
 	check_eq "projected list-only content read denied" "allowed" "denied"
@@ -925,14 +947,20 @@ check_cmd "legacy root list remains broad" \
 check_cmd "umount legacy root list" drive9 umount \
 	--timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT"
 check_cmd "legacy root list unmounted" wait_mount_state unmounted
+elif [[ "$token_management_code" == "404" ]]; then
+	echo "[11] SKIP pseudoroot mounts (token management unavailable; use compatible fs#83 server)"
+else
+	check_eq "token management probe" "$token_management_code" "200 or 404"
+	exit 1
+fi
 
 echo "[12] cleanup remote fixture"
 drive9 fs rm -r "$ROOT_REMOTE" >/dev/null 2>&1 || true
-for context_name in "${pseudoroot_contexts[@]}"; do
+for context_name in ${pseudoroot_contexts[@]+"${pseudoroot_contexts[@]}"}; do
 	drive9 token revoke "$context_name" >/dev/null 2>&1 || true
 done
 pseudoroot_contexts=()
-for remote_root in "${pseudoroot_remote_roots[@]}"; do
+for remote_root in ${pseudoroot_remote_roots[@]+"${pseudoroot_remote_roots[@]}"}; do
 	drive9 fs rm -r "$remote_root" >/dev/null 2>&1 || true
 done
 pseudoroot_remote_roots=()
