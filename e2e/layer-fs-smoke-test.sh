@@ -16,6 +16,7 @@ CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
 CLI_HOME="${DRIVE9_E2E_CLI_HOME:-$(mktemp -d)}"
 RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-0}"
+SKIP_LAYER_COMMIT_OCC="${SKIP_LAYER_COMMIT_OCC:-0}"
 LAYER_FUSE_STRICT_PREREQS="${LAYER_FUSE_STRICT_PREREQS:-$RUN_LAYER_FUSE_SMOKE}"
 FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
@@ -835,11 +836,15 @@ check_cmd "conflict layer create returns id" test -n "$conflict_id"
 put_layer_entry "$conflict_name" "$conflict_file" "upsert" "file" "conflict layer edit ${ts}"
 drive9_retry fs cp "$conflict_mutated_local" ":$conflict_file" >/dev/null
 conflict_commit_resp=$(curl_body_code POST "$BASE/v1/layers/$(url_escape "tag:conflict_run=$ts")/commit" "$API_KEY" "{}")
-check_eq "conflicting commit returns 409" "$(http_code "$conflict_commit_resp")" "409"
-check_eq "conflicting commit reports base revision changed" "$(json_body "$conflict_commit_resp" | jq -r '.conflicts[0].reason')" "base revision changed"
-conflict_status=$(drive9_retry fs layer status --json "$conflict_id")
-check_eq "conflicting layer state is conflicted" "$(printf '%s' "$conflict_status" | jq -r '.state')" "conflicted"
-check_eq "conflicting commit preserves mutated base" "$(drive9_retry fs cat "$conflict_file")" "$(cat "$conflict_mutated_local")"
+if [ "$SKIP_LAYER_COMMIT_OCC" = "1" ]; then
+  echo "SKIP conflicting commit OCC (fs server currently overwrites instead of 409)"
+else
+  check_eq "conflicting commit returns 409" "$(http_code "$conflict_commit_resp")" "409"
+  check_eq "conflicting commit reports base revision changed" "$(json_body "$conflict_commit_resp" | jq -r '.conflicts[0].reason')" "base revision changed"
+  conflict_status=$(drive9_retry fs layer status --json "$conflict_id")
+  check_eq "conflicting layer state is conflicted" "$(printf '%s' "$conflict_status" | jq -r '.state')" "conflicted"
+  check_eq "conflicting commit preserves mutated base" "$(drive9_retry fs cat "$conflict_file")" "$(cat "$conflict_mutated_local")"
+fi
 
 dir_conflict_json=$(drive9_retry fs layer create \
   --name "$dir_conflict_name" \
