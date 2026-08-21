@@ -36,6 +36,7 @@ type Dat9FS struct {
 	openHandles         *OpenHandleIndex
 	locks               *fuseLockTable
 	dirHandles          *HandleTable[*DirHandle]
+	mountViewMu         sync.RWMutex
 	mountViewGeneration atomic.Uint64
 	committedMu         sync.Mutex
 	committedRev        map[string]int64
@@ -987,6 +988,7 @@ func (fs *Dat9FS) resetMountView() {
 	if fs == nil {
 		return
 	}
+	fs.mountViewMu.Lock()
 	generation := fs.mountViewGeneration.Add(1)
 	if fs.dirHandles != nil {
 		for _, dh := range fs.dirHandles.Snapshot() {
@@ -1007,6 +1009,7 @@ func (fs *Dat9FS) resetMountView() {
 	if fs.dirCache != nil {
 		fs.dirCache.InvalidateAll()
 	}
+	fs.mountViewMu.Unlock()
 
 	// Best-effort kernel cache invalidation for all known inodes.
 	// Snapshot entries first so we don't hold the inode map lock during
@@ -1025,6 +1028,15 @@ func (fs *Dat9FS) resetMountView() {
 			}
 		}
 	}
+}
+
+func (fs *Dat9FS) lockMountViewRead(generation uint64) bool {
+	fs.mountViewMu.RLock()
+	if fs.mountViewGeneration.Load() != generation {
+		fs.mountViewMu.RUnlock()
+		return false
+	}
+	return true
 }
 
 // applyLayerRollback reacts to a rollback event observed by the layer-event
@@ -9134,11 +9146,15 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
 
-	entries, _, err := fs.loadDirHandleEntries(ctx, dh)
+	entries, generation, err := fs.loadDirHandleEntries(ctx, dh)
 	if err != nil {
 		safeLogPrintf("list dir failed for %s: %v", dh.Path, err)
 		return listDirErrToFuseStatus(err)
 	}
+	if !fs.lockMountViewRead(generation) {
+		return gofuse.Status(syscall.EAGAIN)
+	}
+	defer fs.mountViewMu.RUnlock()
 
 	// POSIX readdir yields "." and ".." before the real entries. go-fuse's raw
 	// layer does not synthesize them (only nodefs does), so emit them here.
@@ -9189,6 +9205,10 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 		safeLogPrintf("list dir plus failed for %s: %v", dh.Path, err)
 		return listDirErrToFuseStatus(err)
 	}
+	if !fs.lockMountViewRead(generation) {
+		return gofuse.Status(syscall.EAGAIN)
+	}
+	defer fs.mountViewMu.RUnlock()
 
 	// POSIX "." / ".." entries before real children (see ReadDir). For
 	// READDIRPLUS the kernel treats a successful entry with a known inode as

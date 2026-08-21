@@ -199,6 +199,39 @@ func TestDirectoryListDiscardedWhenMountViewResetsInFlight(t *testing.T) {
 	}
 }
 
+func TestMountViewReadGuardRejectsStaleGeneration(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken("http://localhost", "scoped"), opts)
+	staleGeneration := fs.mountViewGeneration.Load()
+	fs.resetMountView()
+
+	if fs.lockMountViewRead(staleGeneration) {
+		fs.mountViewMu.RUnlock()
+		t.Fatal("stale generation acquired mount-view read guard")
+	}
+}
+
+func TestMountViewReadGuardExcludesResetWriter(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken("http://localhost", "scoped"), opts)
+	generation := fs.mountViewGeneration.Load()
+	if !fs.lockMountViewRead(generation) {
+		t.Fatal("current generation failed to acquire mount-view read guard")
+	}
+	if fs.mountViewMu.TryLock() {
+		fs.mountViewMu.Unlock()
+		fs.mountViewMu.RUnlock()
+		t.Fatal("reset writer acquired mount-view lock during response guard")
+	}
+	fs.mountViewMu.RUnlock()
+	if !fs.mountViewMu.TryLock() {
+		t.Fatal("reset writer could not acquire mount-view lock after response guard")
+	}
+	fs.mountViewMu.Unlock()
+}
+
 func newNamespaceAuthorizationTestFS(t *testing.T, status int) (*Dat9FS, *atomic.Int32, func()) {
 	t.Helper()
 	var calls atomic.Int32
