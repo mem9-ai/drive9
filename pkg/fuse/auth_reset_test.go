@@ -1,10 +1,12 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -22,7 +24,7 @@ func TestNamespaceAuthorizationErrorsResetMountView(t *testing.T) {
 		{
 			name: "stat",
 			call: func(fs *Dat9FS) error {
-				_, err := fs.statWithTransientRetry(nil, "/denied", true)
+				_, _, err := fs.statWithTransientRetry(nil, "/denied", true)
 				return err
 			},
 		},
@@ -385,6 +387,161 @@ func TestRmdirRejectsDirectoryListWhenMountViewResetsInFlight(t *testing.T) {
 
 	if got := <-done; got != gofuse.Status(syscall.EAGAIN) {
 		t.Fatalf("Rmdir status = %v, want EAGAIN after reset", got)
+	}
+}
+
+func TestResetMountViewPublishesGenerationAfterInvalidation(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken("http://localhost", "scoped"), opts)
+	dh := &DirHandle{Ino: 1, Path: "/"}
+	fs.dirHandles.Allocate(dh)
+	dh.mu.Lock()
+	oldGeneration := fs.mountViewGeneration.Load()
+	done := make(chan struct{})
+	go func() {
+		fs.resetMountView()
+		close(done)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	writerLocked := false
+	for time.Now().Before(deadline) {
+		if fs.mountViewMu.TryRLock() {
+			fs.mountViewMu.RUnlock()
+			runtime.Gosched()
+			continue
+		}
+		writerLocked = true
+		break
+	}
+	observedGeneration := fs.mountViewGeneration.Load()
+	dh.mu.Unlock()
+	<-done
+
+	if !writerLocked {
+		t.Fatal("resetMountView did not acquire the mount-view write lock")
+	}
+	if observedGeneration != oldGeneration {
+		t.Fatalf("generation became visible during invalidation: got %d, want %d", observedGeneration, oldGeneration)
+	}
+	if got := fs.mountViewGeneration.Load(); got != oldGeneration+1 {
+		t.Fatalf("generation after reset = %d, want %d", got, oldGeneration+1)
+	}
+}
+
+func TestStatDiscardedWhenMountViewResetsInFlight(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			statStarted := make(chan struct{})
+			releaseStat := make(chan struct{})
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodHead {
+					_, _ = w.Write([]byte(`{"entries":[]}`))
+					return
+				}
+				close(statStarted)
+				<-releaseStat
+				if status == http.StatusOK {
+					w.Header().Set("Content-Length", "5")
+					w.Header().Set("X-Dat9-IsDir", "false")
+					w.Header().Set("X-Dat9-Revision", "7")
+				}
+				w.WriteHeader(status)
+			}))
+			defer ts.Close()
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+
+			done := make(chan gofuse.Status, 1)
+			go func() {
+				done <- fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "file.txt", &gofuse.EntryOut{})
+			}()
+			<-statStarted
+			fs.resetMountView()
+			close(releaseStat)
+
+			if got := <-done; got != gofuse.Status(syscall.EAGAIN) {
+				t.Fatalf("Lookup status = %v, want EAGAIN after reset", got)
+			}
+		})
+	}
+}
+
+func TestSmallReadDiscardedWhenMountViewResetsInFlight(t *testing.T) {
+	data := []byte("fresh")
+	readStarted := make(chan struct{})
+	releaseRead := make(chan struct{})
+	fs, ino, cleanup := newTestDat9FS(t, int64(len(data)), func(w http.ResponseWriter, _ *http.Request) {
+		close(readStarted)
+		<-releaseRead
+		_, _ = w.Write(data)
+	})
+	defer cleanup()
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fh := openDat9FSTestHandle(t, fs, ino, "/file.bin")
+	defer fs.fileHandles.Delete(fh)
+	diskKey, ok := fs.diskReadCacheKey("/file.bin", mustGetInodeEntry(t, fs, ino), 0, int64(len(data)))
+	if !ok {
+		t.Fatal("disk cache key unavailable")
+	}
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		_, status, _ := readDat9FSTestRange(fs, ino, fh, 0, len(data))
+		done <- status
+	}()
+	<-readStarted
+	fs.resetMountView()
+	close(releaseRead)
+
+	if got := <-done; got != gofuse.Status(syscall.EAGAIN) {
+		t.Fatalf("Read status = %v, want EAGAIN after reset", got)
+	}
+	if cached, ok := fs.readCache.Get("/file.bin", 1); ok {
+		t.Fatalf("read cache retained in-flight data after reset: %q", cached)
+	}
+	if cached, ok := fs.diskReadCache.Get(diskKey); ok {
+		t.Fatalf("disk read cache retained in-flight data after reset: %q", cached)
+	}
+}
+
+func TestRangeReadDiscardedWhenMountViewResetsInFlight(t *testing.T) {
+	data := bytes.Repeat([]byte("r"), defaultReadCacheMaxFileSize+1024)
+	readStarted := make(chan struct{})
+	releaseRead := make(chan struct{})
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, _ *http.Request) {
+		close(readStarted)
+		<-releaseRead
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[128:192])
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.inodes.UpdateRevision(ino, 1)
+	fh := openDat9FSTestHandle(t, fs, ino, "/file.bin")
+	defer fs.fileHandles.Delete(fh)
+	diskKey, ok := fs.diskReadCacheKey("/file.bin", mustGetInodeEntry(t, fs, ino), 128, 64)
+	if !ok {
+		t.Fatal("disk cache key unavailable")
+	}
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		_, status, _ := readDat9FSTestRange(fs, ino, fh, 128, 64)
+		done <- status
+	}()
+	<-readStarted
+	fs.resetMountView()
+	close(releaseRead)
+
+	if got := <-done; got != gofuse.Status(syscall.EAGAIN) {
+		t.Fatalf("Read status = %v, want EAGAIN after reset", got)
+	}
+	if cached, ok := fs.diskReadCache.Get(diskKey); ok {
+		t.Fatalf("disk read cache retained in-flight range after reset: %q", cached)
 	}
 }
 
