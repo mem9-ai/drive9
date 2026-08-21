@@ -9,16 +9,16 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
 var testDB *sql.DB
 
 func TestMain(m *testing.M) {
-	inst, err := testmysql.Start(context.Background())
+	inst, err := testtidb.Start(context.Background())
 	if err != nil {
-		log.Fatalf("setup mysql test instance: %v", err)
+		log.Fatalf("setup tidb test instance: %v", err)
 	}
 
 	db, err := sql.Open("mysql", inst.DSN)
@@ -34,7 +34,7 @@ func TestMain(m *testing.M) {
 
 	_ = db.Close()
 	if err := inst.Close(context.Background()); err != nil {
-		log.Printf("teardown mysql test instance: %v", err)
+		log.Printf("teardown tidb test instance: %v", err)
 	}
 	os.Exit(code)
 }

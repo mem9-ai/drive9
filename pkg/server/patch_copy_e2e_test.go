@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/s3client"
@@ -117,7 +117,7 @@ func newPatchCopyE2EServer(
 	if err != nil {
 		t.Fatal(err)
 	}
-	testmysql.ResetDB(t, store.DB())
+	testtidb.ResetDB(t, store.DB())
 	t.Cleanup(func() { _ = store.Close() })
 
 	localS3, err := s3client.NewLocal(s3Dir, "/s3")

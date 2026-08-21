@@ -1,4 +1,4 @@
-name: sdk-ci
+name: SDK CI
 
 on:
   pull_request:

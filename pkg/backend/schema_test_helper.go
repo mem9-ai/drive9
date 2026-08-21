@@ -2,7 +2,6 @@ package backend
 
 import (
 	"database/sql"
-	"strings"
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -16,15 +15,9 @@ func initBackendSchema(t *testing.T, dsn string) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	stmts := schema.MySQLNoEmbeddingTenantSchemaStatements()
-	stmts = append(stmts, schema.MySQLNoEmbeddingLegacyFilesStatements()...)
-	for _, stmt := range stmts {
-		if _, err := db.Exec(stmt); err != nil {
-			msg := err.Error()
-			if strings.Contains(msg, "Duplicate key name") || strings.Contains(msg, "already exists") || strings.Contains(msg, "Duplicate column") {
-				continue
-			}
-			t.Fatal(err)
-		}
+	stmts := schema.TiDBAppEmbeddingTenantSchemaStatements()
+	stmts = append(stmts, schema.TiDBAppEmbeddingLegacyFilesStatements()...)
+	if err := schema.ExecSchemaStatements(db, stmts); err != nil {
+		t.Fatal(err)
 	}
 }

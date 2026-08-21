@@ -194,6 +194,12 @@ func (s *Server) deprovisionTenantCluster(ctx context.Context, t *meta.Tenant, r
 			return fmt.Errorf("provisioner does not support credential deprovision")
 		}
 		return deprovisioner.DeprovisionWithCredentials(ctx, cluster, req)
+	case tenant.ProviderLocal:
+		deprovisioner, ok := s.provisioner.(tenant.Deprovisioner)
+		if !ok {
+			return fmt.Errorf("local provisioner does not support deprovision")
+		}
+		return deprovisioner.Deprovision(ctx, cluster)
 	case tenant.ProviderTiDBCloudStarterLegacy:
 		deprovisioner, ok := s.legacyStarterProvisioner.(tenant.Deprovisioner)
 		if !ok {

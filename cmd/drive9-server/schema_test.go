@@ -10,6 +10,23 @@ import (
 	tenantschema "github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
+func TestSchemaDumpInitSQLByProviderLocal(t *testing.T) {
+	out := captureSchemaStdout(t, func() {
+		if err := runSchemaCommand([]string{"dump-init-sql", "--provider", "local"}); err != nil {
+			t.Fatalf("dump local schema: %v", err)
+		}
+	})
+	if !strings.Contains(out, "CREATE TABLE IF NOT EXISTS inodes") {
+		t.Fatalf("dump missing inodes table: %q", out)
+	}
+	if !strings.Contains(out, "VECTOR(") {
+		t.Fatalf("local dump missing VECTOR columns: %q", out)
+	}
+	if strings.Contains(out, "GENERATED ALWAYS AS (EMBED_TEXT") {
+		t.Fatalf("local dump should not include auto-embedding expressions: %q", out)
+	}
+}
+
 func TestSchemaDumpInitSQLByProvider(t *testing.T) {
 	for _, provider := range []string{"tidb_zero", "tidb_cloud_native"} {
 		t.Run(provider, func(t *testing.T) {

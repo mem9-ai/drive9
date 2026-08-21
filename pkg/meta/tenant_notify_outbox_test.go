@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 )
 
 // insertOldTenantNotify inserts one outbox row with an old created_at and
@@ -48,7 +48,7 @@ func TestDeleteTenantNotifyBeforeFreshFloor(t *testing.T) {
 
 	// Case A: a fresh cursor holds the floor — rows above its last_id survive
 	// even when older than the retention.
-	testmysql.ResetMetaDB(t, s.DB())
+	testtidb.ResetMetaDB(t, s.DB())
 	id1 := insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
 	id2 := insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
 	id3 := insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
@@ -72,7 +72,7 @@ func TestDeleteTenantNotifyBeforeFreshFloor(t *testing.T) {
 
 	// Case B: the only cursor is stale (updated_at older than the freshness
 	// bound) — it is ignored, so pruning falls back to age alone.
-	testmysql.ResetMetaDB(t, s.DB())
+	testtidb.ResetMetaDB(t, s.DB())
 	id1 = insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
 	id2 = insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
 	id3 = insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
@@ -97,7 +97,7 @@ func TestDeleteTenantNotifyBeforeFreshFloor(t *testing.T) {
 
 	// Case C: a stale cursor with a low last_id alongside a fresh cursor with
 	// a high last_id — the floor comes from the fresh cursor only.
-	testmysql.ResetMetaDB(t, s.DB())
+	testtidb.ResetMetaDB(t, s.DB())
 	id1 = insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
 	id2 = insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
 	id3 = insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
@@ -124,7 +124,7 @@ func TestDeleteTenantNotifyBeforeFreshFloor(t *testing.T) {
 	}
 
 	// Case D: no cursors at all — plain age-only pruning, fresh rows survive.
-	testmysql.ResetMetaDB(t, s.DB())
+	testtidb.ResetMetaDB(t, s.DB())
 	insertOldTenantNotify(t, s, "tenant-a", 2*time.Hour)
 	if err := s.InsertTenantNotify(ctx, "tenant-a", 1); err != nil {
 		t.Fatal(err)
@@ -148,7 +148,7 @@ func TestDeleteTenantNotifyBeforeFreshFloor(t *testing.T) {
 func TestUpsertTenantOutboxCursorRefreshesUpdatedAt(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	testmysql.ResetMetaDB(t, s.DB())
+	testtidb.ResetMetaDB(t, s.DB())
 	stale := func() time.Time { return time.Now().Add(-2 * tenantOutboxCursorFreshnessBound) }
 	age := func(podID string) {
 		t.Helper()

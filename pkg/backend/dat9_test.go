@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/s3client"
 	"github.com/mem9-ai/drive9/pkg/semantic"
@@ -35,7 +35,7 @@ func newTestBackendWithOptions(t *testing.T, opts Options) *Dat9Backend {
 	if err != nil {
 		t.Fatal(err)
 	}
-	testmysql.ResetDB(t, store.DB())
+	testtidb.ResetDB(t, store.DB())
 	t.Cleanup(func() { _ = store.Close() })
 
 	s3c, err := s3client.NewLocal(s3Dir, "/s3")
@@ -106,7 +106,7 @@ func TestCreateDuplicateDoesNotLeaveOrphanFileOrObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	testmysql.ResetDB(t, store.DB())
+	testtidb.ResetDB(t, store.DB())
 	t.Cleanup(func() { _ = store.Close() })
 
 	s3c, err := s3client.NewLocal(s3Dir, "/s3")

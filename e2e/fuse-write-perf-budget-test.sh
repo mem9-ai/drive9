@@ -149,7 +149,7 @@ start_mount() {
   # --foreground keeps the daemon as our child so its stderr (the perf
   # summary) lands in MOUNT_LOG; plain `drive9 mount` daemonizes.
   local perf_dir="$RUN_ROOT/perf"
-  drive9 mount --foreground --cache-dir "$CACHE_DIR" --durability interactive \
+  drive9 mount --mode=fuse --foreground --cache-dir "$CACHE_DIR" --durability interactive \
     --perf-dir "$perf_dir" \
     --perf-interval 1h \
     --perf-cpu-duration 1ms \

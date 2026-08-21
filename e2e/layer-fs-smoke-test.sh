@@ -134,6 +134,9 @@ curl_body_code() {
   local url="$2"
   local auth="${3:-}"
   local data="${4:-}"
+  # Unset 5th arg keeps the historical JSON default; pass "" to omit Content-Type
+  # (raw PUT /v1/fs bodies are not JSON).
+  local content_type="${5-application/json}"
   local body_file
   local code
   local curl_rc
@@ -149,7 +152,10 @@ curl_body_code() {
       args+=(-H "Authorization: Bearer $auth")
     fi
     if [ -n "$data" ]; then
-      args+=(-H "Content-Type: application/json" --data-binary "$data")
+      if [ -n "$content_type" ]; then
+        args+=(-H "Content-Type: $content_type")
+      fi
+      args+=(--data-binary "$data")
     fi
     if code=$(curl "${args[@]}" "$url"); then
       curl_rc=0
@@ -1072,6 +1078,99 @@ case "$tenant_fork_code" in
     echo "SKIP tenant /v1/fork returned HTTP ${tenant_fork_code} (branch-capable or unrelated)"
     ;;
 esac
+
+echo "[http-fork] HTTP CoW: main-tree object fallback, HTTP commit, HTTP cascade"
+http_rel="layer-http-fork-${ts}"
+http_root="/${http_rel}"
+http_main="${http_root}/main.txt"
+http_parent="layer-http-parent-${ts}"
+http_child="layer-http-child-${ts}"
+http_child2="layer-http-child2-${ts}"
+http_ckpt="ckpt-http-${ts}"
+http_child_path="${http_root}/child.txt"
+http_after_path="${http_root}/after-ckpt.txt"
+
+resp=$(curl_body_code POST "$BASE/v1/fs/${http_rel}?mkdir" "$API_KEY")
+check_eq "HTTP fork POST mkdir returns 200" "$(http_code "$resp")" "200"
+resp=$(curl_body_code PUT "$BASE/v1/fs/${http_rel}/main.txt" "$API_KEY" "from-main-${ts}" "")
+check_eq "HTTP fork PUT main-tree file returns 200" "$(http_code "$resp")" "200"
+
+create_body=$(printf '{"layer_id":"%s","base_root_path":"%s","name":"http parent %s"}' "$http_parent" "$http_root" "$ts")
+resp=$(curl_body_code POST "$BASE/v1/layers" "$API_KEY" "$create_body")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "POST /v1/layers returns 200" "$code" "200"
+check_eq "HTTP root layer origin is create" "$(printf '%s' "$body" | jq -r '.origin // empty')" "create"
+check_eq "HTTP root layer has empty parent" "$(printf '%s' "$body" | jq -r '.parent_layer_id // empty')" ""
+check_eq "HTTP root layer root_layer_id is self" "$(printf '%s' "$body" | jq -r '.root_layer_id // empty')" "$http_parent"
+
+fork_body=$(printf '{"layer_id":"%s","name":"http child %s"}' "$http_child" "$ts")
+resp=$(curl_body_code POST "$BASE/v1/layers/$(url_escape "$http_parent")/fork" "$API_KEY" "$fork_body")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "POST /v1/layers/{id}/fork returns 201" "$code" "201"
+check_eq "HTTP child origin is fork" "$(printf '%s' "$body" | jq -r '.origin // empty')" "fork"
+check_eq "HTTP child parent_layer_id" "$(printf '%s' "$body" | jq -r '.parent_layer_id // empty')" "$http_parent"
+check_eq "HTTP child depth is 1" "$(printf '%s' "$body" | jq -r '.depth // empty')" "1"
+
+resp=$(curl_body_code GET "$BASE/v1/layers/$(url_escape "$http_child")/chain" "$API_KEY")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "GET /v1/layers/{id}/chain returns 200" "$code" "200"
+check_eq "HTTP chain length is 2" "$(printf '%s' "$body" | jq -r '.chain | length')" "2"
+check_eq "HTTP chain[0] is parent" "$(printf '%s' "$body" | jq -r '.chain[0].layer_id')" "$http_parent"
+check_eq "HTTP chain[1] is child" "$(printf '%s' "$body" | jq -r '.chain[1].layer_id')" "$http_child"
+
+check_eq "HTTP child object GET falls back to main" "$(get_layer_object_text "$http_child" "$http_main")" "from-main-${ts}"
+
+put_layer_entry "$http_child" "$http_child_path" "upsert" "file" "child-overlay"
+check_eq "HTTP child overlay object GET" "$(get_layer_object_text "$http_child" "$http_child_path")" "child-overlay"
+
+resp=$(curl_body_code GET "$BASE/v1/layers/$(url_escape "$http_child")/diff" "$API_KEY")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "GET HTTP child diff returns 200" "$code" "200"
+check_eq "HTTP child diff includes overlay path" "$(printf '%s' "$body" | jq -r --arg p "$http_child_path" '[.entries[] | select(.path==$p)] | length')" "1"
+
+resp=$(curl_body_code POST "$BASE/v1/layers/$(url_escape "$http_parent")/checkpoints" "$API_KEY" "$(printf '{"checkpoint_id":"%s","label":"e2e-http"}' "$http_ckpt")")
+check_eq "POST HTTP parent checkpoint returns 200" "$(http_code "$resp")" "200"
+put_layer_entry "$http_parent" "$http_after_path" "upsert" "file" "after"
+fork2_body=$(printf '{"layer_id":"%s","checkpoint_id":"%s"}' "$http_child2" "$http_ckpt")
+resp=$(curl_body_code POST "$BASE/v1/layers/$(url_escape "$http_parent")/fork" "$API_KEY" "$fork2_body")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "POST HTTP checkpoint fork returns 201" "$code" "201"
+check_eq "HTTP checkpoint child origin_seq is 0" "$(printf '%s' "$body" | jq -r '.origin_seq // 0')" "0"
+check_eq "HTTP checkpoint child origin_checkpoint_id" "$(printf '%s' "$body" | jq -r '.origin_checkpoint_id // empty')" "$http_ckpt"
+check_eq "HTTP checkpoint child misses post-pin parent write" "$(get_layer_object_text "$http_child2" "$http_after_path")" "HTTP_404"
+
+resp=$(curl_body_code POST "$BASE/v1/layers/$(url_escape "$http_child")/commit" "$API_KEY" "{}")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "POST HTTP child commit returns 200" "$code" "200"
+check_eq "HTTP child commit status" "$(printf '%s' "$body" | jq -r '.status // empty')" "committed"
+resp=$(curl_body_code GET "$BASE/v1/fs/${http_rel}/child.txt" "$API_KEY")
+check_eq "GET main after HTTP child commit returns 200" "$(http_code "$resp")" "200"
+check_eq "main has HTTP committed overlay body" "$(json_body "$resp")" "child-overlay"
+
+resp=$(curl_body_code DELETE "$BASE/v1/layers/$(url_escape "$http_parent")" "$API_KEY")
+check_eq "DELETE HTTP parent without cascade returns 409" "$(http_code "$resp")" "409"
+resp=$(curl_body_code DELETE "$BASE/v1/layers/$(url_escape "$http_parent")?cascade=1" "$API_KEY")
+check_eq "DELETE HTTP parent?cascade=1 returns 200" "$(http_code "$resp")" "200"
+resp=$(curl_body_code GET "$BASE/v1/layers/$(url_escape "$http_child2")" "$API_KEY")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "GET HTTP checkpoint child after cascade returns 200" "$code" "200"
+check_eq "HTTP checkpoint child is abandoned" "$(printf '%s' "$body" | jq -r '.state // empty')" "abandoned"
+
+if [ -n "${DRIVE9_API_KEY:-}" ]; then
+  resp=$(curl_body_code DELETE "$BASE/v1/fs/${http_rel}?recursive=1" "$API_KEY")
+  code=$(http_code "$resp")
+  case "$code" in
+    200|204|404) check_eq "HTTP fork cleanup DELETE test tree accepted" "ok" "ok" ;;
+    *) check_eq "HTTP fork cleanup DELETE /v1/fs/${http_rel}?recursive=1" "$code" "200" ;;
+  esac
+fi
 
 if require_layer_fuse_prereqs; then
   echo "[fuse] layer mount restore coverage"

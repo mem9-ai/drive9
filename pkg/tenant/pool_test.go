@@ -13,7 +13,7 @@ import (
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/go-sql-driver/mysql"
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/encrypt"
@@ -98,7 +98,7 @@ func TestLoadS3BackendPinsUseUntilRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = metaStore.Close() })
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 	tenant.S3EncryptionMode = meta.S3EncryptionModeInherit
 	if err := metaStore.InsertTenant(context.Background(), tenant); err != nil {
 		t.Fatal(err)
@@ -356,7 +356,7 @@ func newTestPoolAndTenantWithConfig(t *testing.T, cfg PoolConfig, tenantID strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	testmysql.ResetDB(t, resetStore.DB())
+	testtidb.ResetDB(t, resetStore.DB())
 	if err := resetStore.Close(); err != nil {
 		t.Fatal(err)
 	}

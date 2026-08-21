@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/s3client"
@@ -37,7 +37,7 @@ func newTestClient(t *testing.T) (*Client, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	testmysql.ResetDB(t, store.DB())
+	testtidb.ResetDB(t, store.DB())
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

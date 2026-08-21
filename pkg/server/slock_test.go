@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/slockoauth"
 	"github.com/mem9-ai/drive9/pkg/tenant"
@@ -36,7 +36,7 @@ func (f *fakeSlockOAuth) Userinfo(_ context.Context, _ string) (slockoauth.UserI
 func newSlockTestServer(t *testing.T, info slockoauth.UserInfo) (*Server, *meta.Store, []byte) {
 	t.Helper()
 	dbi := newTestDBInfo(t)
-	testmysql.ResetMetaDB(t, dbi.Meta.DB())
+	testtidb.ResetMetaDB(t, dbi.Meta.DB())
 	tokenSecret := make([]byte, 32)
 	if _, err := rand.Read(tokenSecret); err != nil {
 		t.Fatal(err)
@@ -273,7 +273,7 @@ func TestWantsJSONAcceptHeaderCaseInsensitive(t *testing.T) {
 
 func TestSlockCallbackRejectsOversizedSubjectBeforeProvision(t *testing.T) {
 	dbi := newTestDBInfo(t)
-	testmysql.ResetMetaDB(t, dbi.Meta.DB())
+	testtidb.ResetMetaDB(t, dbi.Meta.DB())
 	tokenSecret := make([]byte, 32)
 	if _, err := rand.Read(tokenSecret); err != nil {
 		t.Fatal(err)
@@ -318,7 +318,7 @@ func TestSlockCallbackRejectsOversizedSubjectBeforeProvision(t *testing.T) {
 
 func TestSlockCallbackRejectsOversizedMetadataBeforeProvision(t *testing.T) {
 	dbi := newTestDBInfo(t)
-	testmysql.ResetMetaDB(t, dbi.Meta.DB())
+	testtidb.ResetMetaDB(t, dbi.Meta.DB())
 	tokenSecret := make([]byte, 32)
 	if _, err := rand.Read(tokenSecret); err != nil {
 		t.Fatal(err)

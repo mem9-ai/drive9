@@ -1008,6 +1008,9 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 	if t.Kind != meta.TenantKindFork {
 		return nil
 	}
+	if t.Status == meta.TenantDeleted {
+		return nil
+	}
 	if err := s.pool.InvalidateAndWait(ctx, tenantID); err != nil {
 		return fmt.Errorf("drain fork backend: %w", err)
 	}
@@ -1059,7 +1062,17 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 }
 
 func (s *Server) cleanupFailedForkBranch(ctx context.Context, t *meta.Tenant, credentialReq *tenant.CredentialProvisionRequest) error {
+	claimed, err := s.meta.UpdateTenantStatusIf(ctx, t.ID, meta.TenantFailed, meta.TenantDeleting)
+	if err != nil {
+		return fmt.Errorf("claim failed fork cleanup: %w", err)
+	}
+	if !claimed {
+		return nil
+	}
 	if err := s.deleteForkBranch(ctx, t.Provider, t.ClusterID, t.BranchID, credentialReq); err != nil {
+		if _, revertErr := s.meta.UpdateTenantStatusIf(ctx, t.ID, meta.TenantDeleting, meta.TenantFailed); revertErr != nil {
+			logger.Error(ctx, "fork_failed_cleanup_revert_failed", zap.String("tenant_id", t.ID), zap.Error(revertErr))
+		}
 		return fmt.Errorf("delete failed fork branch: %w", err)
 	}
 	if err := s.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted); err != nil {

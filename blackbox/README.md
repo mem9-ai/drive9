@@ -74,7 +74,7 @@ python3 blackbox/run.py --all --bin ./bin/drive9
 
 # Local server mode (user-built server binary, no auto-build)
 python3 blackbox/run.py --module community.pjdfstest \
-  --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local
+  --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server
 
 # Bootstrap: prepare dependencies, then exit
 python3 blackbox/run.py --all --bootstrap --work-dir /tmp/bb
@@ -106,10 +106,13 @@ python3 blackbox/run.py --all --offline
   and lets the CLI resolve server URL and API key from `~/.drive9/config`. No
   CLI build, no server provisioning, no local server. This is the normal mode
   for running against an existing drive9 deployment.
-- **`local`**: Starts a `drive9-server-local` process with a MySQL container
-  (or `DRIVE9_LOCAL_DSN`). Requires `--local-server <path>` pointing to a
-  pre-built server binary and `--bin <path>` for the CLI. Neither binary is
-  built automatically.
+- **`local`**: Starts `drive9-server` (`DRIVE9_TENANT_PROVIDER=local`) against
+  TiDB (`DRIVE9_LOCAL_DSN`, default `127.0.0.1:4000`, or a `pingcap/tidb`
+  container). Requires `--local-server <path>`
+  pointing to a pre-built server binary and `--bin <path>` for the CLI. Neither
+  binary is built automatically. `--local-server` defaults to `DRIVE9_SERVER_BIN`
+  when that env var is set. After healthz the harness `POST /v1/provision`,
+  waits until `/v1/status` is `active`, and uses the returned JWT.
 
 ## Module Structure
 
@@ -207,5 +210,5 @@ Three GitHub Actions workflows are provided:
 - **`blackbox-daily.yml`** — runs at 06:00 UTC daily, community group only.
 - **`blackbox-weekly.yml`** — runs at 06:00 UTC every Monday, community group only.
 
-All three use `--server-mode local` to start an isolated MySQL container and
-`drive9-server-local`, then run `python3 blackbox/run.py` directly.
+All three use `--server-mode local` against TiDB playground and
+`drive9-server` (`provider=local`), then run `python3 blackbox/run.py` directly.

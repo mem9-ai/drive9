@@ -6,9 +6,9 @@
 //
 //	go test -tags integration ./pkg/client/...
 //
-// The suite is hermetic: it expects a drive9-server-local reachable at
-// DRIVE9_SERVER (default http://127.0.0.1:9009) with DRIVE9_API_KEY (default
-// local-dev-key). When the server is unreachable the whole package is skipped
+// The suite is hermetic: it expects a local drive9-server reachable at
+// DRIVE9_SERVER (default http://127.0.0.1:9009) with DRIVE9_API_KEY (from
+// POST /v1/provision). When the server is unreachable the whole package is skipped
 // so the file is safe to run in any CI environment. The cross-SDK runner
 // (scripts/sdk-integration-tests.sh) guarantees the server is up.
 //
@@ -52,9 +52,11 @@ func TestMain(m *testing.M) {
 	if integBaseURL == "" {
 		integBaseURL = "http://127.0.0.1:9009"
 	}
-	integAPIKey = os.Getenv("DRIVE9_API_KEY")
+	integAPIKey = strings.TrimSpace(os.Getenv("DRIVE9_API_KEY"))
 	if integAPIKey == "" {
-		integAPIKey = "local-dev-key"
+		integSkip = true
+		fmt.Fprintf(os.Stderr, "integration: DRIVE9_API_KEY is required — skipping package\n")
+		os.Exit(m.Run())
 	}
 
 	// Probe the server; skip the whole package if it is not reachable so
@@ -1000,8 +1002,8 @@ func TestIntegrationTokens(t *testing.T) {
 	c := newIntegClient(t)
 	ctx := context.Background()
 
-	// Token management may be disabled on drive9-server-local (single-tenant
-	// fallback mode). Treat the whole suite as best-effort: exercise the call
+	// Token management may be disabled on local drive9-server. Treat the
+	// whole suite as best-effort: exercise the call
 	// path but only hard-fail if the server is reachable and reports an
 	// unexpected non-"not enabled" error.
 	resp, err := c.IssueScopedToken(ctx, IssueScopedTokenRequest{

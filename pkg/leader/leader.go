@@ -101,7 +101,7 @@ func WithHeartbeatInterval(d time.Duration) Option {
 }
 
 // WithDisabled makes the manager always report IsLeader=true without acquiring
-// any lock. Use for single-pod deployments (e.g. drive9-server-local).
+// any lock. Use for single-pod deployments (e.g. provider=local).
 func WithDisabled() Option {
 	return func(m *Manager) {
 		m.disabled = true

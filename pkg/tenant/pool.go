@@ -782,13 +782,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		return nil, nil, tidbCloudOrgID, fmt.Errorf("decrypt db password: %w", err)
 	}
 	decryptDurationMs = float64(time.Since(decryptStart).Microseconds()) / 1000.0
-	query := "parseTime=true"
-	if t.DBTLS {
-		query += "&tls=true"
-	} else if t.Provider == ProviderTiDBCloudNative {
-		query += "&tls=skip-verify"
-	}
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
+	dsn := FormatTenantMySQLDSN(t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, t.DBTLS, t.Provider)
 	store, err := datastore.OpenForTenantScoped(ctx, dsn, t.ID, tidbCloudOrgID, datastore.StandaloneScope())
 	if err != nil {
 		return nil, nil, tidbCloudOrgID, fmt.Errorf("open datastore: %w", err)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Verify local durable img_extract_text flows against drive9-server-local.
+"""Verify local durable img_extract_text flows against drive9-server (provider=local).
 
 This script exercises two end-to-end paths:
 
@@ -302,7 +302,7 @@ def print_result(result: VerificationResult) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--base-url", default=DEFAULT_BASE_URL, help="drive9-server-local base URL"
+        "--base-url", default=DEFAULT_BASE_URL, help="drive9-server base URL"
     )
     parser.add_argument(
         "--timeout-seconds",

@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/s3client"
@@ -2385,7 +2385,7 @@ func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	testmysql.ResetDB(t, store.DB())
+	testtidb.ResetDB(t, store.DB())
 	defer func() { _ = store.Close() }()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

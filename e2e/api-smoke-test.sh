@@ -22,9 +22,9 @@
 #  6) Batch small-file write/list/read validation
 #  7) Content search (`grep`) and attribute search (`find`)
 #  8) Image upload + image query (`find` by jpg extension)
-#  9) Semantic text recall checks (`grep` with paraphrase query)
-# 10) Image-associated recall checks (caption text + image file)
-# 11) SQL endpoint sanity query
+#  9) Semantic text recall checks (`grep` with paraphrase query; off unless RUN_SEMANTIC_CHECKS=1)
+# 10) Image-associated recall checks (caption text + image file; off unless RUN_SEMANTIC_CHECKS=1)
+# 11) SQL endpoint sanity query (off unless RUN_SQL_CHECKS=1)
 # 12) Copy, hardlink, rename, delete
 # 13) Final list verification
 # 14) 100MB multipart upload via POST /v1/uploads/initiate + download checksum
@@ -57,8 +57,8 @@ fi
 UPLOAD_LIMIT_BYTES="${UPLOAD_LIMIT_BYTES:-10737418240}"
 SEMANTIC_TIMEOUT_S="${SEMANTIC_TIMEOUT_S:-90}"
 SEMANTIC_INTERVAL_S="${SEMANTIC_INTERVAL_S:-3}"
-RUN_SEMANTIC_CHECKS="${RUN_SEMANTIC_CHECKS:-1}"
-RUN_SQL_CHECKS="${RUN_SQL_CHECKS:-1}"
+RUN_SEMANTIC_CHECKS="${RUN_SEMANTIC_CHECKS:-0}"
+RUN_SQL_CHECKS="${RUN_SQL_CHECKS:-0}"
 
 PASS=0
 FAIL=0

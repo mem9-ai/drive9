@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/journal"
 )
 
@@ -19,7 +19,7 @@ func newJournalStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	testmysql.ResetDB(t, store.DB())
+	testtidb.ResetDB(t, store.DB())
 	t.Cleanup(func() { _ = store.Close() })
 	return store
 }

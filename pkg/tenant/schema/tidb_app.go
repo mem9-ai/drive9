@@ -14,12 +14,55 @@ import (
 // generated expressions, or constraints here, update that external workflow at
 // the same time.
 //
-// There is intentionally no drive9-server dump-init-sql --provider export path
-// for this app-managed statement list.
+// Export path: `drive9-server schema dump-init-sql --provider local`.
+// The dump includes optional FTS/VECTOR ALTER statements unconditionally;
+// runtime local init applies those best-effort (AllowUnsupportedOptionalIndexes).
 func tidbAppEmbeddingSchemaStatements() []string {
 	stmts := tidbAppEmbeddingBaseSchemaStatements()
 	stmts = append(stmts, tidbAppEmbeddingOptionalSchemaStatements()...)
 	return stmts
+}
+
+// TiDBAppEmbeddingTenantSchemaStatements returns the required app-managed
+// tenant DDL. Optional FTS/VECTOR indexes are omitted so tests and local
+// bootstrap can run on TiDB builds that do not support those features.
+func TiDBAppEmbeddingTenantSchemaStatements() []string {
+	return CloneStatements(tidbAppEmbeddingBaseSchemaStatements())
+}
+
+// TiDBAppEmbeddingLegacyFilesStatements returns the legacy `files` table for
+// the app-managed schema. Fresh tenant init does not create this table; tests
+// that exercise the dual-write path can opt in.
+func TiDBAppEmbeddingLegacyFilesStatements() []string {
+	dim := strconv.Itoa(TiDBAutoEmbeddingDimensions)
+	return []string{
+		`CREATE TABLE IF NOT EXISTS files (
+			file_id                    VARCHAR(64) PRIMARY KEY,
+			storage_type               VARCHAR(32) NOT NULL,
+			storage_ref                TEXT NOT NULL,
+			storage_ref_hash           VARCHAR(64) NOT NULL DEFAULT '',
+			storage_encryption_mode    VARCHAR(16) NOT NULL DEFAULT 'legacy',
+			storage_encryption_key_id  VARCHAR(256) NOT NULL DEFAULT '',
+			content_blob               LONGBLOB,
+			content_type               VARCHAR(255),
+			size_bytes                 BIGINT NOT NULL DEFAULT 0,
+			checksum_sha256            VARCHAR(128),
+			revision                   BIGINT NOT NULL DEFAULT 1,
+			status                     VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+			source_id                  VARCHAR(255),
+			content_text               LONGTEXT,
+			description                LONGTEXT,
+			embedding                  VECTOR(` + dim + `),
+			embedding_revision         BIGINT,
+			description_embedding      VECTOR(` + dim + `),
+			description_embedding_revision BIGINT,
+			created_at                 DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			confirmed_at               DATETIME(3),
+			expires_at                 DATETIME(3)
+		)`,
+		`CREATE INDEX idx_status ON files(status, created_at)`,
+		`CREATE INDEX idx_files_storage_ref_hash ON files(storage_ref_hash)`,
+	}
 }
 
 func tidbAppEmbeddingBaseSchemaStatements() []string {

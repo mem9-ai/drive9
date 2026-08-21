@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/traceid"
 	"go.uber.org/zap"
@@ -24,7 +24,7 @@ func newTestStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	testmysql.ResetDB(t, s.DB())
+	testtidb.ResetDB(t, s.DB())
 	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
@@ -1894,7 +1894,7 @@ func TestInsertFileWithoutLegacyTable(t *testing.T) {
 	if _, err := db.Exec(`DROP TABLE IF EXISTS files`); err != nil {
 		t.Fatalf("drop files: %v", err)
 	}
-	testmysql.ResetDBWithoutFiles(t, db)
+	testtidb.ResetDBWithoutFiles(t, db)
 	_ = db.Close()
 
 	s, err := Open(testDSN)

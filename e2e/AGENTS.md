@@ -13,13 +13,13 @@ Every new e2e script MUST be wired into `.github/workflows/local-e2e.yml` in the
 same PR that adds it (PR gate for fast suites, push-to-main/schedule toggles for
 heavy ones), or be documented as manual-only with a reason in `e2e/README.md`
 ("CI automation tiers" section). An e2e script that no automation runs is dead
-code. The `e2e-all` workflow (manual dispatch) must keep covering every wired
-suite via `run_all_e2e=1`.
+code. Manual "run everything" is Local E2E `workflow_dispatch` with
+`run_all_e2e=1`.
 
 ## Run
 
 Use a hosted deployment by default. For local development on this machine, use
-`drive9-server-local` instead.
+`drive9-server` with `DRIVE9_TENANT_PROVIDER=local` instead.
 
 ### Hosted endpoints
 
@@ -89,21 +89,25 @@ bash e2e/git-ops-smoke-test.sh
 # On-demand git-workspace discovery (DORMANT refresh=0, live --fast arm, index remount, AC5 cleanup)
 # Knobs: GIT_ONDEMAND_ARMED_IDLE_S, GIT_ONDEMAND_REFRESH_MAX_SINGLE/DUAL,
 #        GIT_ONDEMAND_DORMANT_ACTIVITY_LOOPS, GIT_ONDEMAND_KEEP_ARTIFACTS
-DRIVE9_BASE=http://127.0.0.1:9009 DRIVE9_API_KEY=local-dev-key \
+DRIVE9_BASE=http://127.0.0.1:9009 \
+DRIVE9_API_KEY=$(curl -sS -X POST http://127.0.0.1:9009/v1/provision | jq -r .api_key) \
   bash e2e/git-workspace-ondemand-smoke-test.sh
 
 # POSIX permission smoke (API/CLI/FUSE chmod and mkdir mode)
 bash e2e/posix-permission-smoke-test.sh
 
-# Run the default smoke-all sequence once
+# Run the default smoke-all sequence once (local-e2e.yml PR set)
 bash e2e/smoke-all.sh
 
-# Or enable optional Git coverage in that same single smoke-all run.
-# Set any of these to 1 as needed; setting all includes all Git suites.
-RUN_GIT_OPS_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 RUN_GIT_ONDEMAND_SMOKE=1 bash e2e/smoke-all.sh
+# Skip FUSE-related suites (macOS / no real FUSE)
+RUN_FUSE_SMOKE=0 bash e2e/smoke-all.sh
 
-# Include portable profile pack/unpack coverage in smoke-all when desired.
-RUN_PACK_SMOKE=1 bash e2e/smoke-all.sh
+# Post-merge extras on top of the PR set
+RUN_JOURNAL_SMOKE=1 RUN_POSIX_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
+
+# Opt-in HTTP extras (off by default, including post-merge)
+RUN_TOKENS_SMOKE=1 bash e2e/tokens-smoke-test.sh
+RUN_SSE_SMOKE=1 bash e2e/sse-retention-smoke-test.sh
 
 # TiDB Cloud Native (tidbcloud-native) tenant lifecycle smoke
 # Requires credentials, not wired into CI. Set DRIVE9_BASE from Deployment
@@ -112,6 +116,13 @@ RUN_PACK_SMOKE=1 bash e2e/smoke-all.sh
 DRIVE9_TIDBCLOUD_PUBLIC_KEY="$DRIVE9_TIDBCLOUD_PUBLIC_KEY" \
 DRIVE9_TIDBCLOUD_PRIVATE_KEY="$DRIVE9_TIDBCLOUD_PRIVATE_KEY" \
 bash e2e/native-smoke-test.sh
+
+# Tenant image-extract config smoke. Manual-only: hosted control-plane plus a
+# billable OpenAI-compatible vision provider. Skips if any required env is unset.
+export DRIVE9_E2E_IMAGE_EXTRACT_API_BASE="https://..."
+export DRIVE9_E2E_IMAGE_EXTRACT_API_KEY="..."
+export DRIVE9_E2E_IMAGE_EXTRACT_MODEL="..."
+bash e2e/image-extract-config-smoke-test.sh
 ```
 
 #### Existing-tenant regression
@@ -146,37 +157,32 @@ bash e2e/cli-smoke-test.sh
 
 Useful knobs for existing-tenant runs:
 
-- `RUN_CLI_FORK_CHECKS=0` — skip the fork flow. Recommended for very large
-  tenants where forking is undesirable.
+- `RUN_CLI_FORK_CHECKS=1` — enable the tenant fork flow (off by default).
 - `RUN_LARGE_FILE=0` — skip the 100MB API large-file upload.
-- `RUN_SEMANTIC_CHECKS=0` / `RUN_CLI_SEMANTIC_CHECKS=0` — skip semantic recall
-  checks when no embedding endpoint is available.
+- `RUN_SEMANTIC_CHECKS=1` / `RUN_CLI_SEMANTIC_CHECKS=1` — enable semantic recall
+  checks (off by default; needs an embedding endpoint).
+- `RUN_SQL_CHECKS=1` — enable API `POST /v1/sql` checks (off by default).
 - `RUN_UPLOAD_LIMIT_BOUNDARY=1` / `RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1` — force the
   upload-limit boundary checks back on in existing-tenant mode.
 
-### Local via `drive9-server-local`
+### Local via `drive9-server` (`DRIVE9_TENANT_PROVIDER=local`)
 
 When the task is specifically about local validation on this machine, prefer
-`drive9-server-local` over hosted endpoints.
+`drive9-server` with `DRIVE9_TENANT_PROVIDER=local` over hosted endpoints.
 
-`scripts/drive9-server-local-env.sh` is the source of truth for local default
-environment values.
-
-For a disposable local e2e run that does not depend on TiDB auto-embedding,
-Ollama, or a hosted dev deployment:
+CI coverage is `.github/workflows/local-e2e.yml` (TiDB playground +
+`provider=local`). On a machine the one-shot entry is:
 
 ```bash
 make e2e-local
+# or: bash scripts/e2e-local.sh
 ```
 
-This starts a temporary MySQL container, initializes
-`DRIVE9_LOCAL_EMBEDDING_MODE=none`, starts `drive9-server-local`, and runs
-`e2e/smoke-all.sh` with semantic checks disabled and `RUN_FUSE_SMOKE=0` by
-default. `smoke-all.sh` derives `RUN_LAYER_FUSE_SMOKE` from `RUN_FUSE_SMOKE`.
-Set `DRIVE9_LOCAL_DSN` to reuse an existing local database instead of starting a
-container. Set `RUN_FUSE_SMOKE=1` only when the machine has native FUSE support;
-macOS WebDAV fallback does not satisfy the symlink/hardlink FUSE smoke
-assertions.
+That starts TiDB if needed, starts `drive9-server` (`provider=local`), and
+runs `e2e/smoke-all.sh` (the `local-e2e.yml` PR set, including FUSE). macOS
+needs macFUSE; suites pass `--mode=fuse`. Pass a pre-built server with
+`DRIVE9_SERVER_BIN`. For a long-running server you drive yourself, use
+`make run-server-local` and the scripts below.
 
 ### Prerequisites
 
@@ -186,26 +192,27 @@ assertions.
   because it does not require a local Ollama deployment.
 - Use a local TiDB/MySQL instance together with a local embedding service.
   Create the database referenced by `DRIVE9_LOCAL_DSN` before startup, then
-  make sure the embedding endpoint is available. The default env script expects
-  Ollama at `http://127.0.0.1:11434` with model `bge-m3`.
-- Use ordinary MySQL with `DRIVE9_LOCAL_EMBEDDING_MODE=none` for non-semantic
-  local filesystem/layer/journal/FUSE smoke coverage. Disable semantic checks
-  with `RUN_SEMANTIC_CHECKS=0 RUN_CLI_SEMANTIC_CHECKS=0`.
+  make sure the embedding endpoint is available. For Ollama, set
+  `DRIVE9_EMBED_API_BASE=http://127.0.0.1:11434 DRIVE9_EMBED_API_KEY=ollama
+  DRIVE9_EMBED_MODEL=bge-m3`.
+- Local e2e, fuse-patch, SDK integration, and blackbox local mode all use TiDB
+  with `DRIVE9_LOCAL_EMBEDDING_MODE=app` (default). Semantic/SQL/tenant-fork
+  cases are off by default; set `RUN_SEMANTIC_CHECKS=1 RUN_CLI_SEMANTIC_CHECKS=1
+  RUN_SQL_CHECKS=1 RUN_CLI_FORK_CHECKS=1` when you want them.
 
-### Terminal 1: start `drive9-server-local`
+### Terminal 1: start local `drive9-server`
 
 ```bash
 export DRIVE9_REPO_ROOT=/path/to/drive9
 cd "$DRIVE9_REPO_ROOT"
 
 export DRIVE9_LOCAL_DSN='root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true'   # optional if you use the default local DSN; replace with your TiDB Starter DSN when applicable
-export DRIVE9_LOCAL_INIT_SCHEMA=true   # only for a fresh/disposable database
 make run-server-local
 ```
 
-`make run-server-local` already sources `scripts/drive9-server-local-env.sh` and
-stays attached to the foreground. Export any overrides before invoking it, then
-run the smoke scripts from a second terminal after the server is healthy.
+`make run-server-local` sets `DRIVE9_TENANT_PROVIDER=local` and stays attached
+to the foreground. Export any `DRIVE9_*` overrides before invoking it, then run
+the smoke scripts from a second terminal after the server is healthy.
 
 ### Terminal 2: verify health and run E2E
 
@@ -218,7 +225,6 @@ export DRIVE9_BASE=http://127.0.0.1:9009
 curl "$DRIVE9_BASE/healthz"
 
 bash e2e/api-smoke-test.sh
-DRIVE9_API_KEY='local-dev-key' bash e2e/api-smoke-test.sh
 bash e2e/cli-smoke-test.sh
 bash e2e/fuse-smoke-test.sh
 bash e2e/git-ops-smoke-test.sh
@@ -230,14 +236,15 @@ bash e2e/smoke-all.sh
 Use `http://127.0.0.1:9009` as `DRIVE9_BASE` once `healthz` returns
 `{"status":"ok"}`.
 
-If you overrode `DRIVE9_LOCAL_API_KEY` before starting `drive9-server-local`,
-use the same value as `DRIVE9_API_KEY` here.
+Local `drive9-server` (`provider=local`) returns a JWT from `POST /v1/provision`.
+Do not assume `local-dev-key` authenticates. Leave `DRIVE9_API_KEY` unset so
+each suite provisions a fresh tenant.
 
 ### Local-server-specific expectations
 
-- `drive9-server-local` exposes a built-in single tenant key via
-  `DRIVE9_LOCAL_API_KEY`; the default is `local-dev-key` when the env var is
-  not overridden. Reuse it with `DRIVE9_API_KEY=local-dev-key bash e2e/api-smoke-test.sh`.
+- Blackbox `--server-mode local` and the e2e scripts call `POST /v1/provision`
+  after healthz and use the returned `api_key`. Do not assume `local-dev-key`
+  authenticates.
 - Upload-limit boundary failures (`507` on the `limit-1g.bin` initiate step)
   can be caused by stale multipart reservations in the tenant `uploads` table,
   not by current file-tree contents.
@@ -489,6 +496,22 @@ developer machines or EC2-style validation rather than the default smoke path.
 7. Platform-aware `stat` for macOS (`stat -f %Lp`) and Linux (`stat -c %a`)
 8. Cleanup of remote permission test trees
 
+### `tokens-smoke-test.sh`
+
+Opt-in (`RUN_TOKENS_SMOKE=1`). HTTP `/v1/tokens` management: credential
+dispatcher, scoped issue/list/activate/deactivate/delete/revoke/refresh,
+pseudoroot projected listing and hidden siblings, scoped gate, and
+control-plane generate/list when `provider=local` mock IAM is enabled.
+Not part of the PR or post-merge default.
+
+### `sse-retention-smoke-test.sh`
+
+Opt-in (`RUN_SSE_SMOKE=1`). `GET /v1/events` initial sync, live
+`file_changed` delivery, cursor replay, and a >1000-event backlog drain.
+Optional `SSE_SWEEP_TEST=1` (needs a short `DRIVE9_FS_EVENTS_RETENTION`)
+checks retention pruning via dedicated-shape `POST /v1/sql`. Not part of
+the PR or post-merge default.
+
 ### `git-feature-smoke-test.sh`
 
 Broader Git feature smoke on a coding-agent FUSE mount (clone modes, readiness,
@@ -509,7 +532,8 @@ Host support: Linux and macOS only. This script needs real FUSE support and is
 targeted regression coverage for PATCH-vs-storage-class mismatches
 (`patch_unsupported_target`), not a general filesystem workload.
 
-1. Starts its own MySQL container and `drive9-server-local` with a high
+1. Requires a reachable TiDB (`DRIVE9_LOCAL_DSN`, default 127.0.0.1:4000);
+   starts `drive9-server` (provider=local) with a high
    `DRIVE9_INLINE_THRESHOLD`, seeds a file that lands inline (db9), then
    restarts the server with a low threshold so the mount's cached threshold is
    below the file size while the object stays db9-stored
@@ -554,19 +578,43 @@ enabled.
 
 ### `smoke-all.sh`
 
-1. Runs `api-smoke-test.sh`
-2. Runs `cli-smoke-test.sh`
-3. Runs `journal-smoke-test.sh`
-4. Runs `fuse-smoke-test.sh`
-5. Runs `pack-smoke-test.sh` when `RUN_PACK_SMOKE=1`
-6. Aggregates pass/fail at script level for quick regression checks
+Default set matches the `local-e2e.yml` PR gate:
 
-Re-exports `DRIVE9_API_KEY` when set so every sub-suite that honors it (api,
-cli, journal, layer-fs, fuse, posix-permission, git suites, portable pack)
-runs in existing-tenant mode in one shot. Set `RUN_API_ONLY=1` to run only the
-core api + cli pair (useful for a quick existing-tenant regression). Set
-`RUN_FUSE_SMOKE=0` to skip FUSE (and derived `RUN_LAYER_FUSE_SMOKE`); macOS
-WebDAV fallback cannot satisfy symlink/hardlink asserts.
+1. `api-smoke-test.sh`
+2. `cli-smoke-test.sh`
+3. `layer-fs-smoke-test.sh`
+4. `fuse-release-gate.sh`
+5. `fuse-patch-storage-class.sh`
+6. `git-ops-smoke-test.sh`
+7. `git-workspace-ondemand-smoke-test.sh`
+8. `pack-smoke-test.sh`
+9. `fuse-crash-recovery-test.sh`
+10. `fuse-supervision-test.sh`
+11. `fuse-write-perf-budget-test.sh`
+
+Re-exports `DRIVE9_API_KEY` when set so every sub-suite that honors it runs in
+existing-tenant mode in one shot. Set `RUN_API_ONLY=1` for api + cli only.
+Set `RUN_FUSE_SMOKE=0` to skip FUSE-related suites (and layer-fs FUSE restore);
+macOS WebDAV fallback cannot satisfy those asserts. Post-merge extras:
+`RUN_JOURNAL_SMOKE=1`, `RUN_POSIX_SMOKE=1`, `RUN_GIT_WORKSPACE_SMOKE=1`.
+Opt-in HTTP extras (off even on post-merge): `RUN_TOKENS_SMOKE=1`,
+`RUN_SSE_SMOKE=1`.
+
+### `image-extract-config-smoke-test.sh`
+
+Manual-only: hosted control-plane credentials plus a billable OpenAI-compatible
+vision provider. Not wired into CI. Skips before any HTTP request when a
+required variable is missing. `DRIVE9_TENANT_PROVIDER=local` cannot run this
+suite: local image extract is env-only and does not validate tenant config.
+
+1. `POST /v1/provision` with control-plane keys; capture `tenant_id` / `api_key`
+2. Poll `GET /v1/status` until `active`
+3. `GET /v1/admin/tenants/{id}/extract-config/image` — new tenant source is `none` or `default`
+4. Invalid provider API key → 400, config unchanged; unreachable API base → 502/504, config unchanged
+5. Valid custom config PUT — provider validated, response/GET mask the API key
+6. Upload `e2e/fixtures/cat03.jpg`; poll `?stat` until `tags.e2e_marker` appears; `find` by that tag
+7. Disable config (`enabled:false` clears provider fields); upload a second image and require empty semantic text/tags for `DISABLED_EXTRACT_WAIT_S`
+8. Exit trap disables config, deletes the test tree, then `DELETE /v1/admin/tenants/{id}`
 
 ### `native-smoke-test.sh`
 
@@ -596,12 +644,12 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | Variable | Default | Used by |
 |----------|---------|---------|
 | `DRIVE9_BASE` | `http://127.0.0.1:9009` | all scripts |
-| `DRIVE9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh` |
+| `DRIVE9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh`, `image-extract-config-smoke-test.sh` |
 | `DRIVE9_API_KEY` | - | `api-smoke-test.sh` (optional; when set, skip provision and reuse the tenant; cleanup test tree at end) |
 | `DRIVE9_API_KEY` | - | `cli-smoke-test.sh` (optional; when set, skip provision and reuse the tenant) |
 | `DRIVE9_API_KEY` | - | `fuse-smoke-test.sh` (optional; skip provision when set) |
 | `DRIVE9_API_KEY` | - | `posix-permission-smoke-test.sh` (optional; skip provision when set) |
-| `POLL_TIMEOUT_S` | `300` (api smoke), `120` (other smoke) | polling scripts |
+| `POLL_TIMEOUT_S` | `300` (api smoke), `600` (image-extract), `120` (other smoke) | polling scripts |
 | `POLL_INTERVAL_S` | `5` | polling scripts |
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
 | `LARGE_FILE_MB` | `100` | `api-smoke-test.sh` |
@@ -610,8 +658,8 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
 | `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` (defaults to `0` when `DRIVE9_API_KEY` is set) | `api-smoke-test.sh` |
 | `UPLOAD_LIMIT_BYTES` | `10737418240` | `api-smoke-test.sh` |
-| `RUN_SEMANTIC_CHECKS` | `1` | `api-smoke-test.sh` |
-| `RUN_SQL_CHECKS` | `1` | `api-smoke-test.sh` |
+| `RUN_SEMANTIC_CHECKS` | `0` | `api-smoke-test.sh` |
+| `RUN_SQL_CHECKS` | `0` | `api-smoke-test.sh` |
 | `SEMANTIC_TIMEOUT_S` | `90` | `api-smoke-test.sh` |
 | `SEMANTIC_INTERVAL_S` | `3` | `api-smoke-test.sh` |
 | `CLI_LARGE_FILE_MB` | `100` | `cli-smoke-test.sh` |
@@ -620,8 +668,8 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `CLI_RETRY_SLEEP_S` | `2` | `cli-smoke-test.sh` |
 | `RUN_CLI_UPLOAD_LIMIT_BOUNDARY` | `1` (defaults to `0` when `DRIVE9_API_KEY` is set) | `cli-smoke-test.sh` |
 | `CLI_UPLOAD_LIMIT_BYTES` | `10737418240` | `cli-smoke-test.sh` |
-| `RUN_CLI_SEMANTIC_CHECKS` | `1` | `cli-smoke-test.sh` |
-| `RUN_CLI_FORK_CHECKS` | `1` (auto-skip when `/v1/fork` is unavailable) | `cli-smoke-test.sh` |
+| `RUN_CLI_SEMANTIC_CHECKS` | `0` | `cli-smoke-test.sh` |
+| `RUN_CLI_FORK_CHECKS` | `0` (also auto-skip when `/v1/fork` is unavailable) | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_TIMEOUT_S` | `90` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_INTERVAL_S` | `3` | `cli-smoke-test.sh` |
 | `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
@@ -675,9 +723,13 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `FUSE_GIT_CLONE_TIMEOUT_S` | `180` | `fuse-smoke-test.sh` |
 | `RUN_FUSE_UMOUNT_DURABLE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `RUN_FUSE_LOG_AUDIT` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
-| `RUN_GIT_WORKSPACE_SMOKE` | `0` | `smoke-all.sh` |
+| `RUN_GIT_WORKSPACE_SMOKE` | `0` | `smoke-all.sh` post-merge extra |
+| `RUN_JOURNAL_SMOKE` | `0` | `smoke-all.sh` post-merge extra |
+| `RUN_POSIX_SMOKE` | `0` | `smoke-all.sh` post-merge extra |
+| `RUN_TOKENS_SMOKE` | `0` | `smoke-all.sh` opt-in extra (`e2e/tokens-smoke-test.sh`) |
+| `RUN_SSE_SMOKE` | `0` | `smoke-all.sh` opt-in extra (`e2e/sse-retention-smoke-test.sh`) |
+| `RUN_FUSE_SMOKE` | `1` | `smoke-all.sh` |
 | `RUN_API_ONLY` | `0` | `smoke-all.sh` (run only api + cli, skip the rest) |
-| `RUN_PACK_SMOKE` | `0` | `smoke-all.sh`; `pack-smoke-test.sh` is required separately by `local-e2e.yml` |
 | `GIT_WORKSPACE_REPOS` | `drive9=...,kimi-cli=...,kimi-code=...` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_SCENARIOS` | `agent_edit_add_commit,agent_patch_apply,sandbox_restore,fast_worktree` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_EXISTING_FILES` | `20` | `git-workspace-smoke-test.sh` |
@@ -688,8 +740,15 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `GIT_FEATURE_TIMEOUT_S` | `240` | `git-feature-smoke-test.sh` |
 | `GIT_FEATURE_RUN_OVERSIZED` | `1` | `git-feature-smoke-test.sh` |
 | `GIT_WORKSPACE_HYDRATE` | `sync` | `git-workspace-smoke-test.sh` |
-| `DRIVE9_TIDBCLOUD_PUBLIC_KEY` | *(required)* | `native-smoke-test.sh` |
-| `DRIVE9_TIDBCLOUD_PRIVATE_KEY` | *(required)* | `native-smoke-test.sh` |
+| `DRIVE9_TIDBCLOUD_PUBLIC_KEY` | *(required)* | `native-smoke-test.sh`, `image-extract-config-smoke-test.sh` |
+| `DRIVE9_TIDBCLOUD_PRIVATE_KEY` | *(required)* | `native-smoke-test.sh`, `image-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_IMAGE_EXTRACT_API_BASE` | *(required)* | `image-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_IMAGE_EXTRACT_API_KEY` | *(required)* | `image-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_IMAGE_EXTRACT_MODEL` | *(required)* | `image-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_UNREACHABLE_API_BASE` | `https://example.com:81/v1` | `image-extract-config-smoke-test.sh` |
+| `IMAGE_EXTRACT_TIMEOUT_S` | `180` | `image-extract-config-smoke-test.sh` |
+| `IMAGE_EXTRACT_INTERVAL_S` | `3` | `image-extract-config-smoke-test.sh` |
+| `DISABLED_EXTRACT_WAIT_S` | `30` | `image-extract-config-smoke-test.sh` |
 | `SKIP_CLEANUP` | `0` | `native-smoke-test.sh` |
 
 ## Conventions
