@@ -28,7 +28,28 @@ func TestValidateRemoteRootAuthorizationErrorsArePermanent(t *testing.T) {
 	}
 }
 
-func TestValidateRemoteRootNonRootForbiddenSkipsListFallback(t *testing.T) {
+func TestValidateRemoteRootNonRootForbiddenFallsBackToList(t *testing.T) {
+	var calls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Method == http.MethodHead {
+			http.Error(w, "read forbidden", http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write([]byte(`{"entries":[]}`))
+	}))
+	defer ts.Close()
+
+	err := validateRemoteRoot(client.NewWithToken(ts.URL, "scoped"), "/team")
+	if err != nil {
+		t.Fatalf("validateRemoteRoot: %v, want list-only mount accepted", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("remote validation calls = %d, want HEAD plus List", got)
+	}
+}
+
+func TestValidateRemoteRootNonRootForbiddenListDeniedIsPermanent(t *testing.T) {
 	var calls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
@@ -38,8 +59,8 @@ func TestValidateRemoteRootNonRootForbiddenSkipsListFallback(t *testing.T) {
 
 	err := validateRemoteRoot(client.NewWithToken(ts.URL, "scoped"), "/team")
 	assertMountExit(t, err, ExitStartupPermanent, ExitReasonStartupPermanent)
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("remote validation calls = %d, want 1 without list fallback", got)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("remote validation calls = %d, want HEAD plus denied List", got)
 	}
 }
 
