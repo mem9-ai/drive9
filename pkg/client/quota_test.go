@@ -51,7 +51,10 @@ func TestGetQuotaSendsHeadersAndDecodesResponse(t *testing.T) {
 	if resp.Config.MaxStorageSize != 1000 || resp.Config.MaxFileSize != 64 || resp.Config.MaxFileCount != 42 {
 		t.Fatalf("config = %#v", resp.Config)
 	}
-	if resp.Usage.StorageBytes != 1 || resp.Usage.ReservedBytes != 2 || resp.Usage.FileCount != 3 {
+	if resp.Config.MaxMediaLLMFiles != 400 || resp.Config.MaxVideoLLMFiles != 50 {
+		t.Fatalf("llm config = %#v", resp.Config)
+	}
+	if resp.Usage.StorageBytes != 1 || resp.Usage.ReservedBytes != 2 || resp.Usage.FileCount != 3 || resp.Usage.MediaFileCount != 4 || resp.Usage.VideoFileCount != 5 {
 		t.Fatalf("usage = %#v", resp.Usage)
 	}
 }
@@ -60,6 +63,8 @@ func TestAdminSetTenantQuotaPostsPartialFieldsAndDecodesResponse(t *testing.T) {
 	t.Parallel()
 
 	storageSize := int64(1000)
+	mediaLLMFiles := int64(400)
+	videoLLMFiles := int64(0)
 	var gotAuth string
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -78,10 +83,12 @@ func TestAdminSetTenantQuotaPostsPartialFieldsAndDecodesResponse(t *testing.T) {
 	defer srv.Close()
 
 	resp, err := New(srv.URL, "").AdminSetTenantQuota(context.Background(), QuotaSetRequest{
-		TenantID:       "tenant-1",
-		PublicKey:      "public-1",
-		PrivateKey:     "private-1",
-		MaxStorageSize: &storageSize,
+		TenantID:         "tenant-1",
+		PublicKey:        "public-1",
+		PrivateKey:       "private-1",
+		MaxStorageSize:   &storageSize,
+		MaxMediaLLMFiles: &mediaLLMFiles,
+		MaxVideoLLMFiles: &videoLLMFiles,
 	})
 	if err != nil {
 		t.Fatalf("AdminSetTenantQuota: %v", err)
@@ -92,8 +99,11 @@ func TestAdminSetTenantQuotaPostsPartialFieldsAndDecodesResponse(t *testing.T) {
 	if gotBody["max_storage_size"] != float64(1000) {
 		t.Fatalf("request body = %#v", gotBody)
 	}
-	if len(gotBody) != 3 {
-		t.Fatalf("request body = %#v, want only public_key, private_key, and max_storage_size", gotBody)
+	if gotBody["max_media_llm_files"] != float64(400) || gotBody["max_video_llm_files"] != float64(0) {
+		t.Fatalf("request llm fields = %#v", gotBody)
+	}
+	if len(gotBody) != 5 {
+		t.Fatalf("request body = %#v, want credentials, max_storage_size, and both llm limits", gotBody)
 	}
 	if resp.Config.MaxStorageSize != 1000 {
 		t.Fatalf("max storage size = %d, want 1000", resp.Config.MaxStorageSize)
@@ -107,6 +117,8 @@ func TestSetQuotaPostsDeprecatedCompatibilityEndpoint(t *testing.T) {
 	t.Parallel()
 
 	storageSize := int64(1000)
+	mediaLLMFiles := int64(400)
+	videoLLMFiles := int64(0)
 	var gotAuth string
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -125,10 +137,12 @@ func TestSetQuotaPostsDeprecatedCompatibilityEndpoint(t *testing.T) {
 	defer srv.Close()
 
 	resp, err := New(srv.URL, "").SetQuota(context.Background(), QuotaSetRequest{
-		TenantID:       "tenant-1",
-		PublicKey:      "public-1",
-		PrivateKey:     "private-1",
-		MaxStorageSize: &storageSize,
+		TenantID:         "tenant-1",
+		PublicKey:        "public-1",
+		PrivateKey:       "private-1",
+		MaxStorageSize:   &storageSize,
+		MaxMediaLLMFiles: &mediaLLMFiles,
+		MaxVideoLLMFiles: &videoLLMFiles,
 	})
 	if err != nil {
 		t.Fatalf("SetQuota: %v", err)
@@ -141,6 +155,9 @@ func TestSetQuotaPostsDeprecatedCompatibilityEndpoint(t *testing.T) {
 	}
 	if gotBody["max_storage_size"] != float64(1000) {
 		t.Fatalf("request body = %#v", gotBody)
+	}
+	if gotBody["max_media_llm_files"] != float64(400) || gotBody["max_video_llm_files"] != float64(0) {
+		t.Fatalf("request llm fields = %#v", gotBody)
 	}
 	if resp.Config.MaxStorageSize != 1000 {
 		t.Fatalf("max storage size = %d, want 1000", resp.Config.MaxStorageSize)
@@ -220,6 +237,34 @@ func TestAdminSetTenantQuotaPostsSpendingLimit(t *testing.T) {
 	}
 }
 
+func TestAdminSetTenantQuotaOmitsUnsetLLMFields(t *testing.T) {
+	t.Parallel()
+
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(quotaClientTestResponse("tenant-1"))
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL, "").AdminSetTenantQuota(context.Background(), QuotaSetRequest{
+		TenantID:   "tenant-1",
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err != nil {
+		t.Fatalf("AdminSetTenantQuota: %v", err)
+	}
+	if _, ok := gotBody["max_media_llm_files"]; ok {
+		t.Fatalf("request body should omit unset max_media_llm_files: %#v", gotBody)
+	}
+	if _, ok := gotBody["max_video_llm_files"]; ok {
+		t.Fatalf("request body should omit unset max_video_llm_files: %#v", gotBody)
+	}
+}
+
 func TestGetQuotaReturnsStatusError(t *testing.T) {
 	t.Parallel()
 
@@ -254,12 +299,16 @@ func quotaClientTestResponse(tenantID string) map[string]any {
 			"max_storage_size":         1000,
 			"max_file_size":            64,
 			"max_file_count":           42,
+			"max_media_llm_files":      400,
+			"max_video_llm_files":      50,
 			"tidbcloud_spending_limit": 10000,
 		},
 		"usage": map[string]any{
-			"storage_bytes":  1,
-			"reserved_bytes": 2,
-			"file_count":     3,
+			"storage_bytes":    1,
+			"reserved_bytes":   2,
+			"file_count":       3,
+			"media_file_count": 4,
+			"video_file_count": 5,
 		},
 	}
 }
