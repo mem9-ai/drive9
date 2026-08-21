@@ -447,6 +447,49 @@ drive9() {
   HOME="$CTX_HOME" DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
 }
 
+scoped_drive9() {
+	env -u DRIVE9_API_KEY HOME="$CTX_HOME" DRIVE9_SERVER="$BASE" \
+		"$CLI_BIN" "$@"
+}
+
+with_timeout_scoped_drive9() {
+	local secs="$1"
+	shift
+	with_timeout "$secs" env -u DRIVE9_API_KEY HOME="$CTX_HOME" \
+		DRIVE9_SERVER="$BASE" "$CLI_BIN" "$@"
+}
+
+issue_scoped_context() {
+	local name="$1"
+	shift
+	if drive9 token issue "$name" --ttl 10m "$@" >/dev/null; then
+		pseudoroot_contexts+=("$name")
+		return 0
+	fi
+	return 1
+}
+
+select_scoped_context() {
+	local name="$1"
+	drive9 ctx use "$name" >/dev/null
+}
+
+start_scoped_mount() {
+	local context_name="$1"
+	local remote_root="$2"
+	select_scoped_context "$context_name" || return 1
+	scoped_drive9 mount --mode=fuse --durability=close-sync \
+		":$remote_root" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 || return 1
+	wait_mount_state mounted
+}
+
+list_mount_names() {
+	local dir="$1"
+	with_timeout "$FUSE_PROBE_TIMEOUT_S" ls -1A "$dir" \
+		| LC_ALL=C sort \
+		| paste -sd, -
+}
+
 TS="$(date +%s)"
 RUN_ROOT="$(mktemp -d "$FUSE_MOUNT_ROOT/drive9-fuse-supervise-${TS}.XXXXXX")"
 RUN_ID="$(basename "$RUN_ROOT")"
@@ -455,6 +498,8 @@ MOUNT_LOG="$RUN_ROOT/mount.log"
 CTX_HOME="$RUN_ROOT/ctx-home"
 ROOT_REL="$RUN_ID"
 ROOT_REMOTE="/$ROOT_REL"
+pseudoroot_contexts=()
+pseudoroot_remote_roots=()
 
 mkdir -p "$MOUNT_POINT" "$CTX_HOME"
 : >"$MOUNT_LOG"
@@ -480,6 +525,12 @@ capture_supervisor_log() {
 cleanup() {
   local rc=$?
   stop_mount
+	for context_name in "${pseudoroot_contexts[@]}"; do
+		drive9 token revoke "$context_name" >/dev/null 2>&1 || true
+	done
+	for remote_root in "${pseudoroot_remote_roots[@]}"; do
+		drive9 fs rm -r "$remote_root" >/dev/null 2>&1 || true
+	done
   if [ "$rc" -ne 0 ] || [ "$FAIL" -ne 0 ]; then
     capture_supervisor_log
   fi
@@ -710,8 +761,181 @@ else
   echo "[10] SKIP foreground smoke (RUN_FOREGROUND_SMOKE=0)"
 fi
 
-echo "[11] cleanup remote fixture"
+echo "[11] pseudoroot-scoped supervised mounts"
+pseudo_base="/${RUN_ID}-pseudoroot"
+pseudo_other="/${RUN_ID}-pseudoroot-other"
+pseudo_base_name="${pseudo_base#/}"
+pseudo_other_name="${pseudo_other#/}"
+pseudoroot_remote_roots+=("$pseudo_base" "$pseudo_other")
+
+fixture_file="$RUN_ROOT/pseudoroot-fixture.txt"
+printf 'projected content\n' >"$fixture_file"
+for remote_dir in \
+	"$pseudo_base" \
+	"$pseudo_base/project-a" \
+	"$pseudo_base/team" \
+	"$pseudo_base/team/project-b" \
+	"$pseudo_base/no-read" \
+	"$pseudo_base/secret" \
+	"$pseudo_other"; do
+	check_cmd "create pseudoroot fixture $remote_dir" \
+		drive9 fs mkdir "$remote_dir"
+done
+for remote_file in \
+	"$pseudo_base/project-a/a.txt" \
+	"$pseudo_base/team/project-b/b.txt" \
+	"$pseudo_base/no-read/denied.txt" \
+	"$pseudo_base/secret/hidden.txt" \
+	"$pseudo_other/other.txt"; do
+	check_cmd "write pseudoroot fixture $remote_file" \
+		drive9 fs cp "$fixture_file" ":$remote_file"
+done
+
+root_context="${RUN_ID}-pseudoroot-root"
+if issue_scoped_context "$root_context" \
+	--allow "/:pseudoroot" \
+	--allow "$pseudo_base/project-a:read,list" \
+	--allow "$pseudo_base/team/project-b:read,list" \
+	--allow "$pseudo_base/no-read:list" \
+	--allow "$pseudo_other:read,list"; then
+	check_eq "issue root pseudoroot context" "issued" "issued"
+else
+	check_eq "issue root pseudoroot context" "failed" "issued"
+	exit 1
+fi
+if start_scoped_mount "$root_context" "/"; then
+	check_eq "projected root is mounted" "mounted" "mounted"
+else
+	check_eq "projected root is mounted" "failed" "mounted"
+	exit 1
+fi
+root_names="$(list_mount_names "$MOUNT_POINT")"
+check_eq "projected root names" "$root_names" \
+	"$pseudo_base_name,$pseudo_other_name"
+base_names="$(list_mount_names "$MOUNT_POINT/$pseudo_base_name")"
+check_eq "projected nested names" "$base_names" \
+	"no-read,project-a,team"
+check_cmd "projected authorized read" with_timeout \
+	"$FUSE_PROBE_TIMEOUT_S" cmp "$fixture_file" \
+	"$MOUNT_POINT/$pseudo_base_name/project-a/a.txt"
+check_cmd "projected hidden sibling absent" \
+	bash -c '[[ ! -e "$1" ]]' _ \
+	"$MOUNT_POINT/$pseudo_base_name/secret"
+set +e
+denied_output="$(with_timeout "$FUSE_PROBE_TIMEOUT_S" cat \
+	"$MOUNT_POINT/$pseudo_base_name/no-read/denied.txt" 2>&1)"
+denied_rc=$?
+set -e
+if ((denied_rc != 0)); then
+	check_eq "projected list-only content read denied" "denied" "denied"
+else
+	check_eq "projected list-only content read denied" "allowed" "denied"
+fi
+check_cmd "projected denial reports permission" \
+	bash -c 'grep -qi "permission denied" <<<"$1"' _ "$denied_output"
+check_cmd "umount projected root" drive9 umount \
+	--timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT"
+check_cmd "projected root unmounted" wait_mount_state unmounted
+
+team_context="${RUN_ID}-pseudoroot-team"
+if issue_scoped_context "$team_context" \
+	--allow "$pseudo_base/team:pseudoroot" \
+	--allow "$pseudo_base/team/project-b:read,list"; then
+	check_eq "issue non-root pseudoroot context" "issued" "issued"
+else
+	check_eq "issue non-root pseudoroot context" "failed" "issued"
+	exit 1
+fi
+if start_scoped_mount "$team_context" "$pseudo_base/team"; then
+	check_eq "projected non-root is mounted" "mounted" "mounted"
+else
+	check_eq "projected non-root is mounted" "failed" "mounted"
+	exit 1
+fi
+check_eq "projected non-root names" \
+	"$(list_mount_names "$MOUNT_POINT")" "project-b"
+if with_timeout_scoped_drive9 "$FUSE_PROBE_TIMEOUT_S" fs ls :/ \
+	>/dev/null 2>&1; then
+	check_eq "non-root pseudoroot does not authorize root" \
+		"authorized" "denied"
+else
+	check_eq "non-root pseudoroot does not authorize root" \
+		"denied" "denied"
+fi
+check_cmd "umount projected non-root" drive9 umount \
+	--timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT"
+check_cmd "projected non-root unmounted" wait_mount_state unmounted
+
+denied_context="${RUN_ID}-pseudoroot-denied"
+if issue_scoped_context "$denied_context" \
+	--allow "$pseudo_base/project-a:read,list"; then
+	check_eq "issue root-denied context" "issued" "issued"
+else
+	check_eq "issue root-denied context" "failed" "issued"
+	exit 1
+fi
+if ! select_scoped_context "$denied_context"; then
+	check_eq "select root-denied context" "failed" "selected"
+	exit 1
+fi
+failure_start="$(date +%s)"
+set +e
+with_timeout_scoped_drive9 10 mount --mode=fuse --durability=close-sync \
+	":/" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1
+denied_mount_rc=$?
+set -e
+failure_elapsed=$(( $(date +%s) - failure_start ))
+if ((denied_mount_rc != 0 && denied_mount_rc != 124)); then
+	check_eq "root authorization failure exits nonzero" "nonzero" "nonzero"
+else
+	check_eq "root authorization failure exits nonzero" \
+		"$denied_mount_rc" "nonzero"
+fi
+if ((failure_elapsed < 10)); then
+	check_eq "root authorization failure is fast" "fast" "fast"
+else
+	check_eq "root authorization failure is fast" \
+		"${failure_elapsed}s" "under 10s"
+fi
+if is_mounted "$MOUNT_POINT"; then
+	check_eq "permanent auth failure stays unmounted" "mounted" "unmounted"
+	stop_mount
+else
+	check_eq "permanent auth failure stays unmounted" \
+		"unmounted" "unmounted"
+fi
+
+legacy_context="${RUN_ID}-legacy-list"
+if issue_scoped_context "$legacy_context" --allow "/:list"; then
+	check_eq "issue legacy root-list context" "issued" "issued"
+else
+	check_eq "issue legacy root-list context" "failed" "issued"
+	exit 1
+fi
+if start_scoped_mount "$legacy_context" "/"; then
+	check_eq "legacy root list is mounted" "mounted" "mounted"
+else
+	check_eq "legacy root list is mounted" "failed" "mounted"
+	exit 1
+fi
+legacy_names="$(list_mount_names "$MOUNT_POINT")"
+check_cmd "legacy root list remains broad" \
+	bash -c '[[ ",$1," == *",$2,"* && ",$1," == *",$3,"* ]]' _ \
+	"$legacy_names" "$pseudo_base_name" "$ROOT_REL"
+check_cmd "umount legacy root list" drive9 umount \
+	--timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT"
+check_cmd "legacy root list unmounted" wait_mount_state unmounted
+
+echo "[12] cleanup remote fixture"
 drive9 fs rm -r "$ROOT_REMOTE" >/dev/null 2>&1 || true
+for context_name in "${pseudoroot_contexts[@]}"; do
+	drive9 token revoke "$context_name" >/dev/null 2>&1 || true
+done
+pseudoroot_contexts=()
+for remote_root in "${pseudoroot_remote_roots[@]}"; do
+	drive9 fs rm -r "$remote_root" >/dev/null 2>&1 || true
+done
+pseudoroot_remote_roots=()
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"
 exit "$FAIL"

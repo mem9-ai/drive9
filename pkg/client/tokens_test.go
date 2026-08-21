@@ -30,14 +30,17 @@ func TestIssueScopedTokenSendsRequest(t *testing.T) {
 		gotScopes, _ = body["scopes"].([]any)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"token":"dat9_scoped","token_id":"key_123","subject":"vm0","scope_kind":"fs_scoped","expires_at":"2026-05-21T00:00:00Z","scopes":[{"prefix":"/scratch","ops":["read","write"]}]}`))
+		_, _ = w.Write([]byte(`{"token":"dat9_scoped","token_id":"key_123","subject":"vm0","scope_kind":"fs_scoped","expires_at":"2026-05-21T00:00:00Z","scopes":[{"prefix":"/","ops":["pseudoroot"]},{"prefix":"/scratch","ops":["read","write"]}]}`))
 	}))
 	defer ts.Close()
 
 	c := New(ts.URL, "owner-key")
 	resp, err := c.IssueScopedToken(context.Background(), IssueScopedTokenRequest{
 		TTLSeconds: 3600,
-		Scopes:     []FSScopeGrant{{Prefix: ":/scratch", Ops: []string{"read", "write"}}},
+		Scopes: []FSScopeGrant{
+			{Prefix: "/", Ops: []string{"pseudoroot"}},
+			{Prefix: ":/scratch", Ops: []string{"read", "write"}},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +48,7 @@ func TestIssueScopedTokenSendsRequest(t *testing.T) {
 	if gotAuth != "Bearer owner-key" {
 		t.Fatalf("Authorization = %q, want owner bearer", gotAuth)
 	}
-	if gotSubject != nil || gotTTL != 3600 || len(gotScopes) != 1 {
+	if gotSubject != nil || gotTTL != 3600 || len(gotScopes) != 2 {
 		t.Fatalf("request body subject=%q ttl=%v scopes=%v", gotSubject, gotTTL, gotScopes)
 	}
 	if resp.Token != "dat9_scoped" || resp.TokenID != "key_123" || resp.ScopeKind != "fs_scoped" {
@@ -53,6 +56,9 @@ func TestIssueScopedTokenSendsRequest(t *testing.T) {
 	}
 	if resp.ExpiresAt == nil {
 		t.Fatal("ExpiresAt = nil, want timestamp")
+	}
+	if len(resp.Scopes) != 2 || resp.Scopes[0].Prefix != "/" || len(resp.Scopes[0].Ops) != 1 || resp.Scopes[0].Ops[0] != "pseudoroot" {
+		t.Fatalf("response scopes = %#v, want opaque pseudoroot directive", resp.Scopes)
 	}
 }
 
