@@ -24,7 +24,7 @@ func TestNamespaceAuthorizationErrorsResetMountView(t *testing.T) {
 		{
 			name: "stat",
 			call: func(fs *Dat9FS) error {
-				_, _, err := fs.statWithTransientRetry(nil, "/denied", true)
+				_, _, err := fs.getAttrStatWithRetry(nil, "/denied")
 				return err
 			},
 		},
@@ -87,6 +87,80 @@ func TestNamespaceNotFoundDoesNotResetMountView(t *testing.T) {
 	}
 	if _, ok := fs.dirCache.Get("/stale"); !ok {
 		t.Fatal("directory cache was cleared by 404")
+	}
+}
+
+func TestContentReadUnauthorizedResetsMountView(t *testing.T) {
+	tests := []struct {
+		name      string
+		size      int64
+		diskCache bool
+	}{
+		{name: "small file", size: 5},
+		{name: "range", size: defaultReadCacheMaxFileSize + 1024},
+		{name: "disk-cached range", size: defaultReadCacheMaxFileSize + 1024, diskCache: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs, ino, cleanup := newTestDat9FS(t, tt.size, func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+			})
+			defer cleanup()
+			fs.inodes.UpdateRevision(ino, 1)
+			if tt.diskCache {
+				fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+			}
+			fh := openDat9FSTestHandle(t, fs, ino, "/file.bin")
+			defer fs.fileHandles.Delete(fh)
+			seedMountViewCaches(fs)
+			generation := fs.mountViewGeneration.Load()
+
+			readSize := 64
+			if tt.size < int64(readSize) {
+				readSize = int(tt.size)
+			}
+			_, status, err := readDat9FSTestRange(fs, ino, fh, 0, readSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status != gofuse.EACCES {
+				t.Fatalf("Read status = %v, want EACCES", status)
+			}
+			if got := fs.mountViewGeneration.Load(); got == generation {
+				t.Fatalf("mount-view generation = %d, want reset after 401", got)
+			}
+			assertMountViewCachesCleared(t, fs)
+		})
+	}
+}
+
+func TestContentReadForbiddenDoesNotResetMountView(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 5, func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	defer cleanup()
+	fs.inodes.UpdateRevision(ino, 1)
+	fh := openDat9FSTestHandle(t, fs, ino, "/file.bin")
+	defer fs.fileHandles.Delete(fh)
+	seedMountViewCaches(fs)
+	generation := fs.mountViewGeneration.Load()
+
+	_, status, err := readDat9FSTestRange(fs, ino, fh, 0, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != gofuse.EACCES {
+		t.Fatalf("Read status = %v, want EACCES", status)
+	}
+	if got := fs.mountViewGeneration.Load(); got != generation {
+		t.Fatalf("mount-view generation = %d, want unchanged %d after scoped 403", got, generation)
+	}
+	if _, ok := fs.readCache.Get("/stale.txt", 1); !ok {
+		t.Fatal("read cache was cleared by content-read 403")
+	}
+	if _, ok := fs.dirCache.Get("/stale"); !ok {
+		t.Fatal("directory cache was cleared by content-read 403")
 	}
 }
 
@@ -564,6 +638,8 @@ func TestLookupForbiddenStatFallsBackToAuthorizedList(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+	seedMountViewCaches(fs)
+	generation := fs.mountViewGeneration.Load()
 
 	var out gofuse.EntryOut
 	if got := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "visible.txt", &out); got != gofuse.OK {
@@ -578,6 +654,42 @@ func TestLookupForbiddenStatFallsBackToAuthorizedList(t *testing.T) {
 	if got := listCalls.Load(); got != 1 {
 		t.Fatalf("List calls = %d, want 1", got)
 	}
+	if got := fs.mountViewGeneration.Load(); got != generation {
+		t.Fatalf("mount-view generation = %d, want unchanged %d after authorized List fallback", got, generation)
+	}
+	if _, ok := fs.readCache.Get("/stale.txt", 1); !ok {
+		t.Fatal("read cache was cleared before authorized List fallback")
+	}
+	if _, ok := fs.dirCache.Get("/stale"); !ok {
+		t.Fatal("directory cache was cleared before authorized List fallback")
+	}
+}
+
+func TestLookupUnauthorizedStatResetsMountView(t *testing.T) {
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			listCalls.Add(1)
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+	seedMountViewCaches(fs)
+	generation := fs.mountViewGeneration.Load()
+
+	if got := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "denied.txt", &gofuse.EntryOut{}); got != gofuse.EACCES {
+		t.Fatalf("Lookup status = %v, want EACCES", got)
+	}
+	if got := listCalls.Load(); got != 0 {
+		t.Fatalf("List calls = %d, want 0 after unauthorized Stat", got)
+	}
+	if got := fs.mountViewGeneration.Load(); got == generation {
+		t.Fatalf("mount-view generation = %d, want reset after unauthorized Stat", got)
+	}
+	assertMountViewCachesCleared(t, fs)
 }
 
 func TestRmdirRejectsRemoteChildCheckWhenMountViewResetsInFlight(t *testing.T) {
