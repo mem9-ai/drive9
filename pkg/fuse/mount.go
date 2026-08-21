@@ -228,12 +228,9 @@ func validateRemoteRoot(c *client.Client, remoteRoot string) error {
 	if client.IsNotFound(err) {
 		return ExitStartupPermanentErr(fmt.Sprintf("remote source %q does not exist", remoteRoot), err)
 	}
-	if client.IsUnauthorized(err) || client.IsForbidden(err) {
-		return remoteRootValidationError(remoteRoot, err)
-	}
-
-	// Stat may fail on backends where directory stat is unsupported. Fall back
-	// to List to verify existence, but keep authorization failures terminal.
+	// Stat may fail when directory stat is unsupported or when a scoped token
+	// grants list without read. Fall back to List and classify its result as the
+	// authoritative non-root mount validation.
 	if _, listErr := c.List(remoteRoot); listErr != nil {
 		if client.IsNotFound(listErr) {
 			return ExitStartupPermanentErr(fmt.Sprintf("remote source %q does not exist", remoteRoot), listErr)
