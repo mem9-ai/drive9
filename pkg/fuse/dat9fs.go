@@ -30,19 +30,20 @@ import (
 type Dat9FS struct {
 	gofuse.RawFileSystem
 
-	client            *client.Client
-	inodes            *InodeToPath
-	fileHandles       *HandleTable[*FileHandle]
-	openHandles       *OpenHandleIndex
-	locks             *fuseLockTable
-	dirHandles        *HandleTable[*DirHandle]
-	committedMu       sync.Mutex
-	committedRev      map[string]int64
-	remoteCommitMu    sync.Mutex
-	remoteCommitLocks map[string]*sync.Mutex
-	readCache         *ReadCache
-	diskReadCache     *DiskReadCache
-	dirCache          *DirCache
+	client              *client.Client
+	inodes              *InodeToPath
+	fileHandles         *HandleTable[*FileHandle]
+	openHandles         *OpenHandleIndex
+	locks               *fuseLockTable
+	dirHandles          *HandleTable[*DirHandle]
+	mountViewGeneration atomic.Uint64
+	committedMu         sync.Mutex
+	committedRev        map[string]int64
+	remoteCommitMu      sync.Mutex
+	remoteCommitLocks   map[string]*sync.Mutex
+	readCache           *ReadCache
+	diskReadCache       *DiskReadCache
+	dirCache            *DirCache
 	// statCacheUnverified is true while the SSE stream is not known-current.
 	// In that state, file stat cache hits embedded in DirCache must fall back
 	// to HEAD revalidation instead of serving TTL-only attrs. Even when the
@@ -985,6 +986,15 @@ func (fs *Dat9FS) clearLayerOverlay() {
 func (fs *Dat9FS) resetMountView() {
 	if fs == nil {
 		return
+	}
+	generation := fs.mountViewGeneration.Add(1)
+	if fs.dirHandles != nil {
+		for _, dh := range fs.dirHandles.Snapshot() {
+			dh.mu.Lock()
+			dh.Entries = nil
+			dh.entriesGeneration = generation
+			dh.mu.Unlock()
+		}
 	}
 	// Clear all user-space caches.
 	if fs.readCache != nil {
@@ -9070,12 +9080,47 @@ func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gof
 	fs.observePathPolicyWithContext(ctx, p)
 
 	dh := &DirHandle{
-		Ino:  input.NodeId,
-		Path: p,
+		Ino:               input.NodeId,
+		Path:              p,
+		entriesGeneration: fs.mountViewGeneration.Load(),
 	}
 	out.Fh = fs.dirHandles.Allocate(dh)
 	out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	return gofuse.OK
+}
+
+func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle) ([]DirEntry, uint64, error) {
+	dh.mu.Lock()
+	generation := fs.mountViewGeneration.Load()
+	if dh.entriesGeneration == generation && dh.Entries != nil {
+		entries := append([]DirEntry(nil), dh.Entries...)
+		dh.mu.Unlock()
+		return entries, generation, nil
+	}
+	dh.mu.Unlock()
+
+	entries, err := fs.listDir(ctx, dh.Path)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	dh.mu.Lock()
+	defer dh.mu.Unlock()
+	if fs.mountViewGeneration.Load() != generation {
+		return nil, 0, syscall.EAGAIN
+	}
+	dh.Entries = append([]DirEntry(nil), entries...)
+	dh.entriesGeneration = generation
+	return append([]DirEntry(nil), entries...), generation, nil
+}
+
+func (dh *DirHandle) updateEntryIno(generation uint64, index int, ino uint64) {
+	dh.mu.Lock()
+	defer dh.mu.Unlock()
+	if dh.entriesGeneration != generation || index < 0 || index >= len(dh.Entries) {
+		return
+	}
+	dh.Entries[index].Ino = ino
 }
 
 func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) (status gofuse.Status) {
@@ -9089,14 +9134,10 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
 
-	// Populate entries if not already done
-	if dh.Entries == nil {
-		entries, err := fs.listDir(ctx, dh.Path)
-		if err != nil {
-			safeLogPrintf("list dir failed for %s: %v", dh.Path, err)
-			return listDirErrToFuseStatus(err)
-		}
-		dh.Entries = entries
+	entries, _, err := fs.loadDirHandleEntries(ctx, dh)
+	if err != nil {
+		safeLogPrintf("list dir failed for %s: %v", dh.Path, err)
+		return listDirErrToFuseStatus(err)
 	}
 
 	// POSIX readdir yields "." and ".." before the real entries. go-fuse's raw
@@ -9115,8 +9156,8 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	if realStart < 0 {
 		realStart = 0
 	}
-	for i := realStart; i < len(dh.Entries); i++ {
-		e := dh.Entries[i]
+	for i := realStart; i < len(entries); i++ {
+		e := entries[i]
 		if !validDirEntryName(e.Name) {
 			continue
 		}
@@ -9143,13 +9184,10 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
 
-	if dh.Entries == nil {
-		entries, err := fs.listDir(ctx, dh.Path)
-		if err != nil {
-			safeLogPrintf("list dir plus failed for %s: %v", dh.Path, err)
-			return listDirErrToFuseStatus(err)
-		}
-		dh.Entries = entries
+	entries, generation, err := fs.loadDirHandleEntries(ctx, dh)
+	if err != nil {
+		safeLogPrintf("list dir plus failed for %s: %v", dh.Path, err)
+		return listDirErrToFuseStatus(err)
 	}
 
 	// POSIX "." / ".." entries before real children (see ReadDir). For
@@ -9178,14 +9216,14 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	if realStart < 0 {
 		realStart = 0
 	}
-	for i := realStart; i < len(dh.Entries); i++ {
-		e := dh.Entries[i]
+	for i := realStart; i < len(entries); i++ {
+		e := entries[i]
 		if !validDirEntryName(e.Name) {
 			continue
 		}
 		if _, ok := fs.inodes.GetEntry(e.Ino); !ok {
 			e.Ino = fs.recreateDirEntryInode(dh.Path, e)
-			dh.Entries[i].Ino = e.Ino
+			dh.updateEntryIno(generation, i, e.Ino)
 		}
 		entryOut := out.AddDirLookupEntry(gofuse.DirEntry{
 			Name: e.Name,

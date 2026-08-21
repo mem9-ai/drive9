@@ -126,9 +126,11 @@ func (fh *FileHandle) LockWithTimeout(timeout time.Duration) bool {
 
 // DirHandle represents an open directory in the FUSE filesystem.
 type DirHandle struct {
-	Ino     uint64
-	Path    string
-	Entries []DirEntry // cached directory entries for ReadDir
+	mu                sync.Mutex
+	Ino               uint64
+	Path              string
+	Entries           []DirEntry // guarded by mu; cached directory entries for ReadDir
+	entriesGeneration uint64
 }
 
 // DirEntry is a simplified directory entry for FUSE readdir.
