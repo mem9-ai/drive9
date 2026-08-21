@@ -87,7 +87,7 @@ capability token, such as a vault JWT. Filesystem commands normally use
 The SDK exposes typed admin tenant and quota helpers in `pkg/client`. See
 [`docs/guides/quota.md`](quota.md) for the full CLI and HTTP reference.
 
-Get a `tidb_cloud_native` tenant with quota:
+Get a `tidb_cloud_native` or `tidb_cloud_native_shared` tenant with quota:
 
 ```go
 tenant, err := drive9.New(serverURL, "").AdminGetTenant(ctx, drive9.QuotaRequest{
@@ -102,15 +102,21 @@ quota := tenant.Quota
 _ = quota.Config.MaxStorageSize
 _ = quota.Config.MaxFileSize
 _ = quota.Config.MaxFileCount
+_ = quota.Config.MaxMediaLLMFiles
+_ = quota.Config.MaxVideoLLMFiles
 _ = quota.Config.TiDBCloudSpendingLimit
 _ = quota.Usage.FileCount
+_ = quota.Usage.MediaFileCount
+_ = quota.Usage.VideoFileCount
 ```
 
-Set quota for a `tidb_cloud_native` tenant with TiDB Cloud credentials.
-`MaxStorageSize` and `MaxFileSize` are in Mi. `MaxFileSize` must be no larger
-than the server `DRIVE9_MAX_UPLOAD_BYTES` limit. `MaxFileCount` uses `0` for
-unlimited. `TiDBCloudSpendingLimit` updates the TiDB Cloud Cluster Spending
-Limit.
+Set quota for a `tidb_cloud_native` or `tidb_cloud_native_shared` tenant with
+TiDB Cloud credentials. `MaxStorageSize` and `MaxFileSize` are in Mi.
+`MaxFileSize` must be no larger than the server `DRIVE9_MAX_UPLOAD_BYTES` limit.
+`MaxFileCount` uses `0` for unlimited. `MaxMediaLLMFiles` and
+`MaxVideoLLMFiles` require the corresponding tenant-specific extract config to
+be enabled before they can be changed. Shared tenants accept and ignore
+`TiDBCloudSpendingLimit`; dedicated tenants retain the TiDB Cloud behavior.
 
 ```go
 storageSize := int64(102400)
