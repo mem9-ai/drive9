@@ -5668,12 +5668,13 @@ func (fs *Dat9FS) snapshotDeletedPaths() map[string]struct{} {
 	return out
 }
 
-func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string) (bool, error) {
+func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string) (bool, uint64, error) {
+	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	// Filter out entries that have active delete tombstones. This handles
 	// eventual-consistency lag where a just-deleted file still appears in
@@ -5700,10 +5701,14 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 		}
 		liveItems = append(liveItems, item)
 	}
+	if !fs.lockMountViewRead(generation) {
+		return false, 0, syscall.EAGAIN
+	}
 	if fs.dirCache != nil {
 		fs.dirCache.Put(dirPath, cachedFileInfos(liveItems))
 	}
-	return len(liveItems) > 0, nil
+	fs.mountViewMu.RUnlock()
+	return len(liveItems) > 0, generation, nil
 }
 
 func (fs *Dat9FS) remoteHardlinkCommittedDetached(srcP, dstP string) bool {
@@ -6235,19 +6240,23 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if !ok {
 		return gofuse.ENOENT
 	}
-	if handled, cacheStatus := fs.lookupFromDirCache(parentPath, childP, name, out); handled {
+	cacheGeneration := fs.mountViewGeneration.Load()
+	if !fs.lockMountViewRead(cacheGeneration) {
+		return gofuse.Status(syscall.EAGAIN)
+	}
+	handled, cacheStatus := fs.lookupFromDirCache(parentPath, childP, name, out)
+	fs.mountViewMu.RUnlock()
+	if handled {
 		return cacheStatus
 	}
 
 	stat, statGeneration, err := fs.lookupStatWithRetry(cancel, childP)
 	if err != nil {
-		if !isNotFoundErr(err) {
-			return listDirErrToFuseStatus(err)
-		}
-
-		if fs.opts.LegacyDirStatFallback {
-			// Compatibility path for private legacy servers that do not support
-			// stat/HEAD on directories: list the parent and match by name.
+		statNotFound := isNotFoundErr(err)
+		if isForbiddenErr(err) || (statNotFound && fs.opts.LegacyDirStatFallback) {
+			// Compatibility path for list-only scopes and private legacy servers
+			// that do not support stat/HEAD on directories: list the parent and
+			// match by name.
 			items, listGeneration, listErr := fs.lookupListWithRetry(cancel, parentPath)
 			if listErr != nil {
 				return listDirErrToFuseStatus(listErr)
@@ -6292,6 +6301,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 			fs.fillEntryOut(entry, out)
 			fs.mountViewMu.RUnlock()
 			return gofuse.OK
+		}
+		if !statNotFound {
+			return listDirErrToFuseStatus(err)
 		}
 		// Cache negative lookup: tell kernel this entry doesn't exist
 		// for NegativeEntryTTL so it doesn't re-ask immediately.
@@ -8578,7 +8590,18 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 						status = gofuse.Status(syscall.EINTR)
 						return status
 					}
-					hasChildren, listErr := fs.remoteDirectoryHasChildren(ctx, childP)
+					hasChildren, listGeneration, listErr := fs.remoteDirectoryHasChildren(ctx, childP)
+					if errors.Is(listErr, syscall.EAGAIN) {
+						status = gofuse.Status(syscall.EAGAIN)
+						return status
+					}
+					if listErr == nil && !fs.lockMountViewRead(listGeneration) {
+						status = gofuse.Status(syscall.EAGAIN)
+						return status
+					}
+					if listErr == nil {
+						fs.mountViewMu.RUnlock()
+					}
 					if listErr != nil || !hasChildren {
 						entries = nil
 						break
@@ -8614,7 +8637,18 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		// tombstones + the cancel-aware polling loop below to handle any
 		// remaining eventual consistency.
 		// giving the backend time to propagate recent deletes.
-		hasChildren, err := fs.remoteDirectoryHasChildren(ctx, childP)
+		hasChildren, listGeneration, err := fs.remoteDirectoryHasChildren(ctx, childP)
+		if errors.Is(err, syscall.EAGAIN) {
+			status = gofuse.Status(syscall.EAGAIN)
+			return status
+		}
+		if err == nil && !fs.lockMountViewRead(listGeneration) {
+			status = gofuse.Status(syscall.EAGAIN)
+			return status
+		}
+		if err == nil {
+			fs.mountViewMu.RUnlock()
+		}
 		if err == nil && hasChildren {
 			// Invalidate the dirCache entry that was just written from the
 			// potentially-stale remote listing, so hasKnownLocalDirectoryChildren
@@ -8633,7 +8667,18 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 						status = gofuse.Status(syscall.EINTR)
 						return status
 					}
-					hasChildren, err = fs.remoteDirectoryHasChildren(ctx, childP)
+					hasChildren, listGeneration, err = fs.remoteDirectoryHasChildren(ctx, childP)
+					if errors.Is(err, syscall.EAGAIN) {
+						status = gofuse.Status(syscall.EAGAIN)
+						return status
+					}
+					if err == nil && !fs.lockMountViewRead(listGeneration) {
+						status = gofuse.Status(syscall.EAGAIN)
+						return status
+					}
+					if err == nil {
+						fs.mountViewMu.RUnlock()
+					}
 					if err != nil || !hasChildren {
 						break
 					}
