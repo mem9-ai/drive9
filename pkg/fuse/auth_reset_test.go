@@ -545,6 +545,108 @@ func TestRangeReadDiscardedWhenMountViewResetsInFlight(t *testing.T) {
 	}
 }
 
+func TestLookupForbiddenStatFallsBackToAuthorizedList(t *testing.T) {
+	var statCalls atomic.Int32
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			statCalls.Add(1)
+			http.Error(w, "read forbidden", http.StatusForbidden)
+		case http.MethodGet:
+			listCalls.Add(1)
+			_, _ = w.Write([]byte(`{"entries":[{"name":"visible.txt","isdir":false,"size":5,"revision":7}]}`))
+		default:
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+
+	var out gofuse.EntryOut
+	if got := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "visible.txt", &out); got != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK for list-only entry", got)
+	}
+	if out.NodeId == 0 || out.Size != 5 {
+		t.Fatalf("Lookup output = node:%d size:%d, want visible file", out.NodeId, out.Size)
+	}
+	if got := statCalls.Load(); got != 1 {
+		t.Fatalf("Stat calls = %d, want 1", got)
+	}
+	if got := listCalls.Load(); got != 1 {
+		t.Fatalf("List calls = %d, want 1", got)
+	}
+}
+
+func TestRmdirRejectsRemoteChildCheckWhenMountViewResetsInFlight(t *testing.T) {
+	listStarted := make(chan struct{})
+	releaseList := make(chan struct{})
+	var deleteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			close(listStarted)
+			<-releaseList
+			_, _ = w.Write([]byte(`{"entries":[]}`))
+		case http.MethodDelete:
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	}()
+	<-listStarted
+	fs.resetMountView()
+	close(releaseList)
+
+	if got := <-done; got != gofuse.Status(syscall.EAGAIN) {
+		t.Fatalf("Rmdir status = %v, want EAGAIN after reset", got)
+	}
+	if got := deleteCalls.Load(); got != 0 {
+		t.Fatalf("remote delete calls = %d, want 0", got)
+	}
+}
+
+func TestLookupCacheHitWaitsForMountViewReset(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken("http://localhost", "scoped"), opts)
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "cached.txt", Size: 5, Revision: 7}})
+	oldGeneration := fs.mountViewGeneration.Load()
+	fs.mountViewMu.Lock()
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "cached.txt", &gofuse.EntryOut{})
+	}()
+	returnedEarly := false
+	select {
+	case <-done:
+		returnedEarly = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	fs.dirCache.InvalidateAll()
+	fs.mountViewGeneration.Store(oldGeneration + 1)
+	fs.mountViewMu.Unlock()
+	if returnedEarly {
+		t.Fatal("Lookup cache hit bypassed the mount-view write lock")
+	}
+	if got := <-done; got != gofuse.Status(syscall.EAGAIN) {
+		t.Fatalf("Lookup status = %v, want EAGAIN after reset", got)
+	}
+}
+
 func TestMountViewReadGuardRejectsStaleGeneration(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
