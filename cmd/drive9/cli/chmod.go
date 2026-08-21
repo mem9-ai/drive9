@@ -22,10 +22,14 @@ func Chmod(c *client.Client, args []string) error {
 	if err != nil {
 		return fmt.Errorf("invalid mode %q: %w", modeStr, err)
 	}
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
 	}
+	if err := requireCapOnHandle(h, CapChmod, "chmod"); err != nil {
+		return err
+	}
+	c, path = h.Client, h.Path
 	if layerRef != "" {
 		return chmodLayerPath(context.Background(), c, layerRef, path, uint32(mode64))
 	}

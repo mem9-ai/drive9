@@ -92,6 +92,22 @@ func TestRunMountDrainJSONReturnsErrorForNonOKResponse(t *testing.T) {
 	}
 }
 
+func TestRunMountDrainRejectsObjectMount(t *testing.T) {
+	deps := mountDrainDeps{
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{
+				PID:       123,
+				MountKind: mountstate.MountKindObject,
+			}, "", nil
+		},
+	}
+
+	err := runMountDrain([]string{"/mnt/obj"}, deps)
+	if err == nil || !strings.Contains(err.Error(), "only supported for FUSE mounts") {
+		t.Fatalf("runMountDrain error = %v", err)
+	}
+}
+
 func TestRunMountDrainRejectsNonFuseMount(t *testing.T) {
 	deps := mountDrainDeps{
 		readProcessState: func(string) (mountstate.ProcessState, string, error) {

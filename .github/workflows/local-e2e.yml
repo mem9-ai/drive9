@@ -275,6 +275,13 @@ jobs:
         continue-on-error: true
         run: bash e2e/cli-smoke-test.sh
 
+      - name: Run object-store smoke
+        id: object-store-smoke
+        continue-on-error: true
+        env:
+          OBJECT_STRICT_MOUNT: "1"
+        run: bash e2e/object-store-smoke-test.sh
+
       - name: Run layer FS smoke
         id: layer-fs-smoke
         continue-on-error: true
@@ -456,6 +463,7 @@ jobs:
             echo "| --- | --- |"
             echo "| API smoke | ${{ steps.api-smoke.outcome || 'skipped' }} |"
             echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
+            echo "| Object-store smoke | ${{ steps.object-store-smoke.outcome || 'skipped' }} |"
             echo "| Layer FS smoke | ${{ steps.layer-fs-smoke.outcome || 'skipped' }} |"
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
             echo "| FUSE patch storage-class e2e | ${{ steps.fuse-patch-storage-class.outcome || 'skipped' }} |"
@@ -501,6 +509,7 @@ jobs:
           {
             "api-smoke": "${{ steps.api-smoke.outcome }}",
             "cli-smoke": "${{ steps.cli-smoke.outcome }}",
+            "object-store-smoke": "${{ steps.object-store-smoke.outcome }}",
             "layer-fs-smoke": "${{ steps.layer-fs-smoke.outcome }}",
             "fuse-smoke": "${{ steps.fuse-smoke.outcome }}",
             "fuse-patch-storage-class": "${{ steps.fuse-patch-storage-class.outcome }}",
@@ -601,6 +610,7 @@ jobs:
 
           check_required "API smoke" "${{ steps.api-smoke.outcome }}"
           check_required "CLI smoke" "${{ steps.cli-smoke.outcome }}"
+          check_required "Object-store smoke" "${{ steps.object-store-smoke.outcome }}"
           check_required "Layer FS smoke" "${{ steps.layer-fs-smoke.outcome }}"
           check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
           check_required "Git operations smoke" "${{ steps.git-ops-smoke.outcome }}"

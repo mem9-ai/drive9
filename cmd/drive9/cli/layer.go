@@ -77,11 +77,15 @@ func LayerCreate(c *client.Client, args []string) error {
 		return err
 	}
 	baseRoot := fs.Arg(0)
-	if rp, ok := ParseRemote(baseRoot); ok {
-		if rp.Context != "" {
-			return fmt.Errorf("fs layer create: context-scoped remote sources (e.g. %s:/path) are not yet supported", rp.Context)
+	if loc, err := Parse(baseRoot); err != nil {
+		return err
+	} else if loc.Kind == KindObject {
+		return fmt.Errorf("fs layer create: object-store URIs are not supported")
+	} else if loc.Kind == KindDrive9 {
+		if loc.Context != "" {
+			return fmt.Errorf("fs layer create: context-scoped remote sources (e.g. %s:/path) are not yet supported", loc.Context)
 		}
-		baseRoot = rp.Path
+		baseRoot = loc.Path
 	}
 	req := client.FSLayerCreateRequest{
 		LayerID:        *layerID,

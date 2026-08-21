@@ -35,6 +35,7 @@ func runMountSupervise(args []string) error {
 	server := fs.String("server", "", "server for status metadata")
 	remoteRoot := fs.String("remote-root", "", "remote root for status metadata")
 	profile := fs.String("profile", "", "profile for status metadata")
+	mountKind := fs.String("mount-kind", "", "mount kind recorded in process state (fuse or object)")
 	localRootMeta := fs.String("local-root-meta", "", "local root for pack metadata")
 	packPathsJSON := fs.String("pack-paths-json", "", "JSON array of pack paths")
 	sanitizedJSON := fs.String("sanitized-args-json", "", "JSON array of sanitized args")
@@ -149,6 +150,7 @@ func runMountSupervise(args []string) error {
 		Server:              *server,
 		RemoteRoot:          *remoteRoot,
 		Profile:             *profile,
+		MountKind:           *mountKind,
 		LocalRoot:           *localRootMeta,
 		PackPaths:           packPaths,
 		Adopt:               *adopt,
@@ -360,11 +362,28 @@ func runMountEnsure(args []string) error {
 	})
 }
 
+func adoptSupervisorCommandArgs(mp, logPath, storedServer, sanitizedJSON string, workerPID int, workerCreation uint64, mountKind string) []string {
+	args := []string{
+		"mount", "supervise",
+		"--mountpoint", mp,
+		"--log", logPath,
+		"--adopt",
+		"--adopt-worker-pid", fmt.Sprintf("%d", workerPID),
+		"--adopt-worker-creation", fmt.Sprintf("%d", workerCreation),
+		"--sanitized-args-json", sanitizedJSON,
+		"--server", storedServer,
+	}
+	if mountKind != "" {
+		args = append(args, "--mount-kind", mountKind)
+	}
+	return args
+}
+
 // ensureAdoptSupervisor starts a poll-based supervisor over a live orphan worker.
 func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error {
 	workerCreation := snap.WorkerCreation
 	var sanitized []string
-	var storedServer, storedAPIKey, storedToken string
+	var storedServer, storedAPIKey, storedToken, storedKind string
 	if st, _, err := mountstate.ReadSupervisorState(mp); err == nil {
 		if workerCreation == 0 {
 			workerCreation = st.WorkerCreation
@@ -379,6 +398,7 @@ func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error
 		if storedServer == "" {
 			storedServer = ps.Server
 		}
+		storedKind = ps.MountKind
 		storedAPIKey, storedToken = ps.APIKey, ps.Token
 		// Worker creation may only exist on process state for older formats.
 		if workerCreation == 0 && ps.WorkerPID == snap.WorkerPID && ps.CreationTime > 0 && ps.Role != mountstate.RoleSupervisor {
@@ -404,16 +424,7 @@ func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error
 	if err != nil {
 		return err
 	}
-	args := []string{
-		"mount", "supervise",
-		"--mountpoint", mp,
-		"--log", logPath,
-		"--adopt",
-		"--adopt-worker-pid", fmt.Sprintf("%d", snap.WorkerPID),
-		"--adopt-worker-creation", fmt.Sprintf("%d", workerCreation),
-		"--sanitized-args-json", string(sanitizedJSON),
-		"--server", storedServer,
-	}
+	args := adoptSupervisorCommandArgs(mp, logPath, storedServer, string(sanitizedJSON), snap.WorkerPID, workerCreation, storedKind)
 	return withEnsureCredentialEnv(storedServer, storedAPIKey, storedToken, func() error {
 		cmd := exec.Command(exe, args...)
 		cmd.Env = mountBackgroundEnv(os.Environ(), mountBackgroundRequest{

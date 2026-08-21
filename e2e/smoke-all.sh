@@ -33,6 +33,7 @@ RUN_FUSE_SMOKE="${RUN_FUSE_SMOKE:-1}"
 RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-$RUN_FUSE_SMOKE}"
 export RUN_LAYER_FUSE_SMOKE
 RUN_PACK_SMOKE="${RUN_PACK_SMOKE:-0}"
+RUN_OBJECT_STORE_SMOKE="${RUN_OBJECT_STORE_SMOKE:-1}"
 
 PASS=0
 FAIL=0
@@ -81,6 +82,11 @@ fi
 
 run_case "api" "e2e/api-smoke-test.sh"
 run_case "cli" "e2e/cli-smoke-test.sh"
+if [ "$RUN_OBJECT_STORE_SMOKE" = "1" ]; then
+  run_case "object-store" "e2e/object-store-smoke-test.sh"
+else
+  skip_case "object-store" "e2e/object-store-smoke-test.sh" "set RUN_OBJECT_STORE_SMOKE=1 to run MinIO fs/mount coverage"
+fi
 
 if [ "$RUN_API_ONLY" = "1" ]; then
   skip_case "journal" "e2e/journal-smoke-test.sh" "set RUN_API_ONLY=0 to run journal coverage"

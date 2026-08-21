@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -44,11 +45,37 @@ func Stat(c *client.Client, args []string) error {
 	if path == "" {
 		return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
 	}
-	var err error
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
 	}
+	if h.Loc.Kind == KindObject {
+		info, err := h.Backend.Stat(context.Background(), h.Loc)
+		if err != nil {
+			return err
+		}
+		if outputFormat == "json" {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(info)
+		}
+		kind := "file"
+		if info.IsDir {
+			kind = "dir"
+		}
+		fmt.Printf("path:\t%s\nkind:\t%s\nsize:\t%d\n", h.Loc.Raw, kind, info.Size)
+		if !info.Mtime.IsZero() {
+			fmt.Printf("mtime:\t%s\n", info.Mtime.Format(time.RFC3339))
+		}
+		if info.ETag != "" {
+			fmt.Printf("etag:\t%s\n", info.ETag)
+		}
+		if info.ContentType != "" {
+			fmt.Printf("content-type:\t%s\n", info.ContentType)
+		}
+		return nil
+	}
+	c, path = h.Client, h.Path
 	m, err := c.StatMetadataCompat(path)
 	if err != nil {
 		return err

@@ -23,10 +23,14 @@ func Grep(c *client.Client, args []string) error {
 		path = args[1]
 	}
 
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
 	}
+	if err := requireCapOnHandle(h, CapSearch, "grep"); err != nil {
+		return err
+	}
+	c, path = h.Client, h.Path
 
 	results, err := c.GrepWithLayer(query, path, 20, layerRef)
 	if err != nil {

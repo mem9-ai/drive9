@@ -154,6 +154,19 @@ func TestProcessMatchesIdentitySelf(t *testing.T) {
 	}
 }
 
+func TestAdoptSupervisorCommandArgsIncludesMountKind(t *testing.T) {
+	args := adoptSupervisorCommandArgs("/mnt/obj", "/tmp/obj.log", "https://s", `["s3://b/","/mnt/obj"]`, 42, 7, mountstate.MountKindObject)
+	kind := ""
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--mount-kind" {
+			kind = args[i+1]
+		}
+	}
+	if kind != mountstate.MountKindObject {
+		t.Fatalf("args %v: --mount-kind=%q", args, kind)
+	}
+}
+
 func TestRunMountSuperviseAdoptRequiresCreation(t *testing.T) {
 	mp := t.TempDir()
 	cases := []struct {

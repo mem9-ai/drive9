@@ -105,6 +105,14 @@ RUN_GIT_OPS_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 RUN_GIT_ONDEMAND_SMOKE=1 bash e2e/
 # Include portable profile pack/unpack coverage in smoke-all when desired.
 RUN_PACK_SMOKE=1 bash e2e/smoke-all.sh
 
+# Object-store CLI + mount against a local MinIO (docker/podman).
+# Does not need drive9-server. OBJECT_STRICT_MOUNT=1 fails if FUSE is missing.
+bash e2e/object-store-smoke-test.sh
+OBJECT_STRICT_MOUNT=1 bash e2e/object-store-smoke-test.sh
+
+# Optional extra object step inside cli-smoke-test.sh against a real bucket.
+DRIVE9_E2E_S3_URI='s3://bucket/prefix/?region=us-east-1' bash e2e/cli-smoke-test.sh
+
 # TiDB Cloud Native (tidbcloud-native) tenant lifecycle smoke
 # Requires credentials, not wired into CI. Set DRIVE9_BASE from Deployment
 # endpoints above, or export manually. Credentials are stored in repo secrets

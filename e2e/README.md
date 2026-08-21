@@ -15,6 +15,7 @@ including local single-tenant validation via `drive9-server-local`.
 |--------|--------------------|
 | `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download; set `DRIVE9_API_KEY` to skip provision and reuse an existing tenant (cleans up its test tree in that mode) |
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, default-slot `pack`/`unpack`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download; honors `DRIVE9_API_KEY` to skip provision and reuse an existing tenant |
+| `object-store-smoke-test.sh` | Local MinIO (docker/podman) or `OBJECT_S3_URI`: `fs mkdir/cp/ls/stat/cat/mv/rm`, stdin/stdout, rejected object ops, object FUSE mount writeback + remount, `mount status/health`, drain rejected. Does not need drive9-server. Set `OBJECT_STRICT_MOUNT=1` to fail if FUSE is missing |
 | `layer-fs-smoke-test.sh` | Layer filesystem API+CLI+FUSE workflow: create by name/tag, diff/checkpoint lookup, rollback, commit, scope rejection, conflict detection, mkdir/upsert/whiteout/rename/symlink/chmod entries, CoW fork (tip/checkpoint pin, chain read, child/parent commit, delete/cascade, depth cap), and checkpoint/full restore into fresh local roots. Point at any backend with `DRIVE9_BASE`; set `RUN_LAYER_FUSE_SMOKE=1` (and optionally `LAYER_FUSE_STRICT_PREREQS=1`) for FUSE restore coverage |
 | `pack-smoke-test.sh` | Portable profile pack/unpack over a deterministic local repo: offline npm `file:` install creates `node_modules`, Git staged/unstaged/untracked status changes are captured, pack writes the default hidden archive, fresh local-root unpack restores overlay files, symlinks, `.git`, `node_modules`, branch, HEAD, and `git status` |
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/hardlink/rename/stat semantics, cross-channel consistency, `mount drain`/native `sync -f` drain checks, mounted 10KiB→8MiB→10KiB tier-transition parity, read-only and error-path checks |
@@ -45,7 +46,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 
 | Tier | Trigger | What runs |
 |------|---------|-----------|
-| PR gate | `pull_request` to `main` (local-e2e) | api, cli, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback), fuse-patch-storage-class, git-ops, git-workspace-ondemand, portable pack/unpack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget |
+| PR gate | `pull_request` to `main` (local-e2e) | api, cli, object-store, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback), fuse-patch-storage-class, git-ops, git-workspace-ondemand, portable pack/unpack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget |
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, full `smoke-all.sh` (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | `e2e-all` workflow (`Run workflow` button) | Everything above via `run_all_e2e=1` |

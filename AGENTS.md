@@ -109,6 +109,7 @@ pkg/
   embedding/            Embedding provider integration
   encrypt/              Encryption helpers
   fuse/                 FUSE mount (go-fuse/v2)
+  objectfs/             Object-store (s3/cos/tos/oss/gs/az) I/O and FUSE via rclone VFS
   logger/               Structured logging (zap)
   meta/                 Metadata/search models
   metrics/              Metrics recording

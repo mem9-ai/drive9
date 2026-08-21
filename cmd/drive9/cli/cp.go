@@ -135,8 +135,58 @@ func Cp(c *client.Client, args []string) error {
 	}
 	src, dst := args[0], args[1]
 
-	srcRP, srcIsRemote := ParseRemote(src)
-	dstRP, dstIsRemote := ParseRemote(dst)
+	srcLoc, err := Parse(src)
+	if err != nil {
+		return err
+	}
+	dstLoc, err := Parse(dst)
+	if err != nil {
+		return err
+	}
+	if srcLoc.Kind == KindObject || dstLoc.Kind == KindObject {
+		if layerRef != "" {
+			return fmt.Errorf("--layer is drive9-only")
+		}
+		if appendMode {
+			return fmt.Errorf("--append is only supported for uploads to drive9")
+		}
+		if resume {
+			return fmt.Errorf("--resume is not supported for object-store URIs")
+		}
+		if dstLoc.Kind != KindDrive9 && (len(tags) > 0 || description != "") {
+			return fmt.Errorf("--tag/--description are only supported for uploads to drive9")
+		}
+		return cpViaBackend(context.Background(), c, srcLoc, dstLoc, recursive, tags, description)
+	}
+	// D14: cross-context drive9 copy streams through the laptop.
+	if srcLoc.Kind == KindDrive9 && dstLoc.Kind == KindDrive9 &&
+		srcLoc.Context != dstLoc.Context {
+		if layerRef != "" {
+			return fmt.Errorf("--layer is not supported for cross-context copy")
+		}
+		if appendMode {
+			return fmt.Errorf("--append is not supported for cross-context copy")
+		}
+		if resume {
+			return fmt.Errorf("--resume is not supported for cross-context copy")
+		}
+		return cpViaBackend(context.Background(), c, srcLoc, dstLoc, recursive, tags, description)
+	}
+
+	if srcLoc.Scheme == SchemeFile && srcLoc.Local != "" {
+		src = srcLoc.Local
+	}
+	if dstLoc.Scheme == SchemeFile && dstLoc.Local != "" {
+		dst = dstLoc.Local
+	}
+	srcRP, srcIsRemote := locationAsRemotePath(srcLoc)
+	dstRP, dstIsRemote := locationAsRemotePath(dstLoc)
+	if srcLoc.Kind == KindStdin {
+		srcIsRemote = false
+	}
+	if dstLoc.Kind == KindStdin {
+		dstIsRemote = false
+	}
 	if description != "" {
 		descriptionSupported := dstIsRemote && !appendMode && !resume && (src == "-" || !srcIsRemote)
 		if !descriptionSupported {
@@ -488,6 +538,170 @@ func streamToStdout(ctx context.Context, c *client.Client, remotePath string) er
 
 	_, err = io.Copy(os.Stdout, rc)
 	return err
+}
+
+func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Location, recursive bool, tags map[string]string, description string) error {
+	if src.Kind == KindStdin && dst.Kind == KindStdin {
+		return fmt.Errorf("cannot copy stdin to stdout via stream copy")
+	}
+	if dst.Kind != KindStdin && dst.Query[QueryVersionID] != "" {
+		return fmt.Errorf("versionId is only valid on a copy source")
+	}
+	if recursive && (src.Kind == KindStdin || dst.Kind == KindStdin) {
+		return fmt.Errorf("-r/--recursive does not support stdin/stdout endpoints")
+	}
+
+	srcH, err := fsHandleForArgOpts(defaultClient, src.Raw, true)
+	if err != nil {
+		return err
+	}
+	if src.Kind == KindStdin {
+		srcH.Loc = src
+	}
+
+	if dst.Kind == KindStdin {
+		rc, err := srcH.Backend.OpenRead(ctx, srcH.Loc)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rc.Close() }()
+		_, err = io.Copy(os.Stdout, rc)
+		return err
+	}
+
+	dstH, err := fsHandleForArgOpts(defaultClient, dst.Raw, true)
+	if err != nil {
+		return err
+	}
+
+	if recursive {
+		return cpTreeViaBackend(ctx, srcH, dstH)
+	}
+
+	if src.Kind == KindStdin {
+		if dstH.Loc.DirHint || strings.HasSuffix(dstH.Loc.Path, "/") || strings.HasSuffix(dstH.Loc.Local, string(filepath.Separator)) {
+			return fmt.Errorf("destination %q is a directory; supply a file name", dst.Raw)
+		}
+		wh, err := dstH.Backend.OpenWrite(ctx, dstH.Loc, WriteOpts{
+			Size:        -1,
+			Overwrite:   true,
+			Tags:        tags,
+			Description: description,
+		})
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(wh, os.Stdin); err != nil {
+			_ = wh.Abort(ctx)
+			return err
+		}
+		return wh.Close()
+	}
+
+	info, err := srcH.Backend.Stat(ctx, srcH.Loc)
+	if err != nil {
+		return err
+	}
+	if info.IsDir {
+		return fmt.Errorf("source %q is a directory (use -r)", src.Raw)
+	}
+	finalDst := dstH.Loc
+	if dstH.Loc.DirHint || strings.HasSuffix(dstH.Loc.Path, "/") || strings.HasSuffix(dstH.Loc.Local, "/") {
+		finalDst = joinDest(dstH.Loc, copyLeafName(srcH.Loc))
+	} else {
+		st, err := dstH.Backend.Stat(ctx, dstH.Loc)
+		if err == nil && st.IsDir {
+			finalDst = joinDest(dstH.Loc, copyLeafName(srcH.Loc))
+		}
+	}
+	return Copy(ctx, srcH.Backend, dstH.Backend, srcH.Loc, finalDst, info, CopyOpts{
+		Overwrite:   true,
+		Tags:        tags,
+		Description: description,
+	})
+}
+
+func copyLeafName(src Location) string {
+	if src.Kind == KindLocal && src.Local != "" {
+		return filepath.Base(src.Local)
+	}
+	p := src.Path
+	if p == "" {
+		p = src.Local
+	}
+	return pathpkg.Base(strings.TrimSuffix(p, "/"))
+}
+
+// joinDest appends rel under dst. KindLocal uses Local/filepath; other
+// kinds use Path with slash separators.
+func joinDest(dst Location, rel string) Location {
+	out := dst
+	out.DirHint = false
+	if dst.Kind == KindLocal {
+		base := dst.Local
+		if base == "" {
+			base = dst.Path
+		}
+		out.Local = filepath.Join(base, filepath.FromSlash(rel))
+		out.Path = ""
+		return out
+	}
+	if dst.Path == "" {
+		out.Path = rel
+	} else {
+		out.Path = strings.TrimSuffix(dst.Path, "/") + "/" + rel
+	}
+	return out
+}
+
+func walkRoot(h fsHandle) string {
+	if h.Path != "" {
+		return h.Path
+	}
+	if h.Loc.Local != "" {
+		return h.Loc.Local
+	}
+	return h.Loc.Path
+}
+
+func cpTreeViaBackend(ctx context.Context, srcH, dstH fsHandle) error {
+	st, err := srcH.Backend.Stat(ctx, srcH.Loc)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir {
+		return fmt.Errorf("source %q is not a directory", srcH.Loc.Raw)
+	}
+	if dstSt, err := dstH.Backend.Stat(ctx, dstH.Loc); err == nil && !dstSt.IsDir {
+		return fmt.Errorf("destination %q is not a directory", dstH.Loc.Raw)
+	}
+	root := strings.TrimSuffix(walkRoot(srcH), string(filepath.Separator))
+	root = strings.TrimSuffix(root, "/")
+	return Walk(ctx, srcH.Backend, srcH.Loc, func(info FileInfo) error {
+		var rel string
+		if srcH.Loc.Kind == KindLocal {
+			rel, err = filepath.Rel(root, info.Path)
+			if err != nil {
+				return err
+			}
+			rel = filepath.ToSlash(rel)
+		} else {
+			rel = strings.TrimPrefix(info.Path, root)
+			rel = strings.TrimPrefix(rel, "/")
+		}
+		if rel == "" || rel == "." {
+			return nil
+		}
+		child := joinDest(dstH.Loc, rel)
+		child.DirHint = info.IsDir
+		if info.IsDir {
+			return dstH.Backend.Mkdir(ctx, child)
+		}
+		srcChild := srcH.Loc
+		srcChild.Path = info.Path
+		srcChild.DirHint = false
+		return Copy(ctx, srcH.Backend, dstH.Backend, srcChild, child, &info, CopyOpts{Overwrite: true})
+	})
 }
 
 func printProgress(partNumber, totalParts int, bytesUploaded int64) {

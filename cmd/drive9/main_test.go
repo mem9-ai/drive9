@@ -90,7 +90,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"journal <new|append|cat|find|verify>",
 		"region list [--json] [--manifest-url URL]",
 		"profile show [profile]",
-		"mount [flags] [:/remote] <mountpoint>",
+		"mount [flags] [:/remote|s3://bucket/prefix/|gs://bucket/prefix/|az://container/prefix/] <mountpoint>",
 		"mount drain [--timeout duration] [--json] <mountpoint>",
 		"mount status [--json] <mountpoint>",
 		"mount health <mountpoint>",
