@@ -1,6 +1,6 @@
 # drive9 quota guide
 
-Last verified: 2026-07-10.
+Last verified: 2026-08-22.
 
 This guide shows how to read and update Drive9 tenant quota from the CLI and
 HTTP API in TiDBCloud Mode.
@@ -14,7 +14,9 @@ Drive9 exposes these user-settable quota settings:
 | `max_storage_size` | Maximum confirmed plus reserved file storage size, in Mi. Stored in Drive9. |
 | `max_file_size` | Maximum single file size, in Mi. Stored in Drive9. Must not exceed the server `DRIVE9_MAX_UPLOAD_BYTES` limit. |
 | `max_file_count` | Maximum file count. Stored in Drive9. `0` means unlimited. |
-| `tidbcloud_spending_limit` | TiDB Cloud Cluster Spending Limit. Drive9 stores the latest known value locally after create/update or a TiDB Cloud authorization refresh. `0` is a valid explicit value; missing local data is treated as unknown until it is backfilled from TiDB Cloud. See the [TiDB Cloud Spending Limit guide](https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit). |
+| `max_media_llm_files` | Maximum number of media (image/audio) LLM extraction files admitted for the tenant. Stored in Drive9. Updating it requires the tenant-specific media extract config to be enabled. |
+| `max_video_llm_files` | Maximum number of video LLM extraction tasks admitted for the tenant. Stored in Drive9. Updating it requires the tenant-specific video extract config to be enabled. |
+| `tidbcloud_spending_limit` | TiDB Cloud Cluster Spending Limit for dedicated native tenants. Shared tenants omit this response field and ignore it when supplied. `0` remains a valid explicit input for dedicated compatibility. See the [TiDB Cloud Spending Limit guide](https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit). |
 
 Quota responses include these storage usage counters:
 
@@ -23,6 +25,8 @@ Quota responses include these storage usage counters:
 | `storage_bytes` | Confirmed file storage bytes. |
 | `reserved_bytes` | Bytes reserved by active uploads. |
 | `file_count` | Current file count used by quota admission. Active upload reservations for new files may be included until they complete or abort. |
+| `media_file_count` | Current media files counted by LLM extraction admission. |
+| `video_file_count` | Current video extraction tasks counted by LLM extraction admission. |
 
 ## Permissions and supported modes
 
@@ -33,8 +37,8 @@ deprovision are not used as a fallback by quota read or update. Callers must
 supply TiDB Cloud credentials on each quota request; those credentials may be
 the same keys as the server defaults when passed explicitly.
 
-Only `tidb_cloud_native` tenants support quota update through this API. Other
-tenant providers use their configured defaults.
+`tidb_cloud_native` and `tidb_cloud_native_shared` tenants support quota update
+through this API. Other tenant providers use their configured defaults.
 
 Tenant list/get validates that the supplied TiDB Cloud API key can access the
 tenant's cluster. Drive9 caches successful API-key-to-cluster authorization in
@@ -44,12 +48,15 @@ create/delete paths invalidate the full-list cache for the submitted
 credentials. The quota response itself is assembled from Drive9's local tenant,
 quota config, and usage tables after authorization succeeds.
 
-Quota update first reads the TiDB Cloud cluster labels, then patches the Drive9
-quota update labels to confirm the API key has cluster write permission. If that
-label patch succeeds, Drive9 patches `tidbcloud_spending_limit` when present and
-then writes any Drive9-stored quota fields. If a TiDB Cloud read returns a
-spending limit that is missing or different locally, Drive9 updates the local
-copy before returning the quota response.
+For a dedicated `tidb_cloud_native` tenant, quota update validates TiDB Cloud
+cluster write permission, patches `tidbcloud_spending_limit` when present, and
+then writes the Drive9-stored quota fields. The effective dedicated spending
+limit is returned by the provisioner and persisted locally. For a
+`tidb_cloud_native_shared` tenant, quota update authorizes the shared physical
+pool and writes the Drive9-stored quota fields; any supplied spending-limit
+value, including `0`, is accepted and ignored. Quota GET responses are
+assembled from Drive9's local tenant, quota config, and usage tables after
+authorization.
 
 ## CLI
 
@@ -75,13 +82,16 @@ drive9 admin tenant get \
 Example output:
 
 ```text
-TENANT_ID   STATUS  KIND  MAX_STORAGE  MAX_FILE_SIZE  MAX_FILE_COUNT  SPENDING_LIMIT  STORAGE_USED  RESERVED  FILE_COUNT
-tnt_abc123  active  live  102400 Mi    1024 Mi        100000          10000           1.0 MiB       0 B       12
+TENANT_ID   STATUS  KIND  MAX_STORAGE  MAX_FILE_SIZE  MAX_FILE_COUNT  MAX_MEDIA_LLM_FILES  MAX_VIDEO_LLM_FILES  SPENDING_LIMIT  STORAGE_USED  RESERVED  FILE_COUNT  MEDIA_FILE_COUNT  VIDEO_FILE_COUNT
+tnt_abc123  active  live  102400 Mi    1024 Mi        100000          400                  50                   10000           1.0 MiB       0 B       12          20                3
 ```
 
-Set quota with `drive9 admin tenant set-quota`. Only TiDBCloud Mode supports
-quota set. Pass at least one of `--max-storage-size`, `--max-file-size`,
-`--max-file-count`, or `--tidbcloud-spending-limit`.
+Set quota with `drive9 admin tenant set-quota`. Pass at least one of
+`--max-storage-size`, `--max-file-size`, `--max-file-count`,
+`--max-media-llm-files`, `--max-video-llm-files`, or
+`--tidbcloud-spending-limit`. The two LLM quota fields can be modified only
+after the corresponding tenant-specific extract config is enabled; the CLI
+passes the values through and the server enforces that prerequisite.
 
 ```bash
 drive9 admin tenant set-quota \
@@ -92,6 +102,8 @@ drive9 admin tenant set-quota \
   --max-storage-size 102400 \
   --max-file-size 1024 \
   --max-file-count 100000 \
+  --max-media-llm-files 400 \
+  --max-video-llm-files 50 \
   --tidbcloud-spending-limit 10000
 ```
 
@@ -104,8 +116,11 @@ Validation rules:
 - `--max-file-size` must be positive and no larger than the server
   `DRIVE9_MAX_UPLOAD_BYTES` limit.
 - `--max-file-count` must be non-negative. `0` means unlimited.
+- `--max-media-llm-files` and `--max-video-llm-files` must be non-negative and
+  require the corresponding tenant-specific extract config on the server.
 - `--tidbcloud-spending-limit` must be a non-negative 32-bit integer. Drive9
-  passes `0` through to TiDB Cloud; TiDB Cloud may reject it.
+  passes it through for dedicated tenants. Shared tenants accept and ignore
+  this field.
 
 ## HTTP API
 
@@ -121,12 +136,16 @@ Tenant get returns tenant information with quota:
       "max_storage_size": 102400,
       "max_file_size": 1024,
       "max_file_count": 100000,
+      "max_media_llm_files": 400,
+      "max_video_llm_files": 50,
       "tidbcloud_spending_limit": 10000
     },
     "usage": {
       "storage_bytes": 1048576,
       "reserved_bytes": 0,
-      "file_count": 12
+      "file_count": 12,
+      "media_file_count": 20,
+      "video_file_count": 3
     }
   }
 }
@@ -157,7 +176,8 @@ curl -sS \
 
 ### POST /v1/admin/tenants/{tenant-id}/quota
 
-Set quota for a TiDBCloud Mode tenant using TiDB Cloud credentials.
+Set quota for a `tidb_cloud_native` or `tidb_cloud_native_shared` tenant using
+TiDB Cloud credentials.
 
 ```bash
 curl -sS \
@@ -169,16 +189,21 @@ curl -sS \
     "max_storage_size": 102400,
     "max_file_size": 1024,
     "max_file_count": 100000,
+    "max_media_llm_files": 400,
+    "max_video_llm_files": 50,
     "tidbcloud_spending_limit": 10000
   }'
 ```
 
-At least one of `max_storage_size`, `max_file_size`, `max_file_count`, or
-`tidbcloud_spending_limit` is required. `max_storage_size` and `max_file_size`
-are in Mi; `max_file_size` must not exceed the server `DRIVE9_MAX_UPLOAD_BYTES`
-limit. `max_file_count` must be non-negative, and `0` means unlimited. Drive9
-passes `tidbcloud_spending_limit: 0` through to TiDB Cloud; TiDB Cloud may
-reject it.
+At least one of `max_storage_size`, `max_file_size`, `max_file_count`,
+`max_media_llm_files`, `max_video_llm_files`, or `tidbcloud_spending_limit` is
+required. `max_storage_size` and `max_file_size` are in Mi;
+`max_file_size` must not exceed the server `DRIVE9_MAX_UPLOAD_BYTES` limit.
+`max_file_count`, `max_media_llm_files`, and `max_video_llm_files` must be
+non-negative, and `0` means unlimited for the corresponding limit. LLM quota
+updates require the matching tenant-specific extract config. Shared tenants
+accept and ignore `tidbcloud_spending_limit`, including `0`; dedicated tenants
+retain the existing TiDB Cloud spending-limit behavior.
 
 ## Error responses
 
@@ -189,7 +214,7 @@ The quota API returns JSON errors through the standard server error shape.
 | `400 Bad Request` | Invalid JSON, missing tenant id where required, missing or partial TiDB Cloud credentials, missing all settable quota fields in a set request, or an invalid quota value. |
 | `403 Forbidden` | TiDB Cloud returns unauthorized or forbidden for the supplied API key. |
 | `404 Not Found` | The Drive9 tenant does not exist, quota is not enabled on this server, or TiDB Cloud cannot find the backend cluster. For the backend-cluster case, check the TiDB Cloud starter/native cluster status. |
-| `409 Conflict` | The tenant provider is not `tidb_cloud_native`. |
+| `409 Conflict` | The tenant provider does not support quota updates. |
 | `502 Bad Gateway` | TiDB Cloud returned another upstream error while listing managed clusters, updating quota labels, or updating Spending Limit. |
 
 ## Notes for operators

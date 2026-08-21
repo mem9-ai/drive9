@@ -16,10 +16,10 @@ type QuotaConfig struct {
 	MaxFileCount           int64  `json:"max_file_count"`
 	MaxMediaLLMFiles       int64  `json:"max_media_llm_files"`
 	MaxVideoLLMFiles       int64  `json:"max_video_llm_files"`
-	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
+	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
 }
 
-// QuotaUsage is the tenant's current storage quota usage counters.
+// QuotaUsage is the tenant's current storage and extraction quota usage counters.
 type QuotaUsage struct {
 	StorageBytes   int64 `json:"storage_bytes"`
 	ReservedBytes  int64 `json:"reserved_bytes"`
