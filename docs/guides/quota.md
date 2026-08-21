@@ -124,7 +124,8 @@ Validation rules:
 
 ## HTTP API
 
-Tenant get returns tenant information with quota:
+Tenant get returns tenant information with quota. This dedicated-tenant example
+includes `tidbcloud_spending_limit`; shared-tenant responses omit that field:
 
 ```json
 {

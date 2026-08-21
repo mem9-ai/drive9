@@ -433,12 +433,18 @@ func adminQuotaMaxMediaLLMFiles(quota *client.AdminTenantQuota) string {
 	if quota == nil {
 		return "-"
 	}
+	if quota.Config.MaxMediaLLMFiles == 0 {
+		return "unlimited"
+	}
 	return fmt.Sprintf("%d", quota.Config.MaxMediaLLMFiles)
 }
 
 func adminQuotaMaxVideoLLMFiles(quota *client.AdminTenantQuota) string {
 	if quota == nil {
 		return "-"
+	}
+	if quota.Config.MaxVideoLLMFiles == 0 {
+		return "unlimited"
 	}
 	return fmt.Sprintf("%d", quota.Config.MaxVideoLLMFiles)
 }
@@ -887,8 +893,6 @@ flags:
   --max-storage-size Mi            max confirmed+reserved storage size in Mi
   --max-file-size Mi               max single file size in Mi; must not exceed server DRIVE9_MAX_UPLOAD_BYTES
   --max-file-count N               max confirmed file count; 0 means unlimited
-  --max-media-llm-files N          max media LLM extract files; non-negative; requires media extract config
-  --max-video-llm-files N          max video LLM extract files; non-negative; requires video extract config
   --tidbcloud-spending-limit N     TiDB Cloud Cluster Spending Limit; must be non-negative
   --json                           output result as JSON
 

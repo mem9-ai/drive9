@@ -341,6 +341,8 @@ func TestQuotaSetRejectsInvalidQuotaValues(t *testing.T) {
 		{name: "zero_file_size", flag: "--max-file-size", value: "0", wantErr: "--max-file-size must be positive"},
 		{name: "negative_file_size", flag: "--max-file-size", value: "-1", wantErr: "--max-file-size must be positive"},
 		{name: "negative_file_count", flag: "--max-file-count", value: "-1", wantErr: "--max-file-count must be non-negative"},
+		{name: "negative_media_llm_files", flag: "--max-media-llm-files", value: "-1", wantErr: "--max-media-llm-files must be non-negative"},
+		{name: "negative_video_llm_files", flag: "--max-video-llm-files", value: "-1", wantErr: "--max-video-llm-files must be non-negative"},
 		{name: "negative_spending_limit", flag: "--tidbcloud-spending-limit", value: "-1", wantErr: "--tidbcloud-spending-limit must be non-negative"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

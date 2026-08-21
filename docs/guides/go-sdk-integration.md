@@ -122,6 +122,8 @@ be enabled before they can be changed. Shared tenants accept and ignore
 storageSize := int64(102400)
 fileSize := int64(1024)
 fileCount := int64(100000)
+mediaLLMFiles := int64(400)
+videoLLMFiles := int64(50)
 spendingLimit := int64(10000)
 
 quota, err := drive9.New(serverURL, "").AdminSetTenantQuota(ctx, drive9.QuotaSetRequest{
@@ -131,6 +133,8 @@ quota, err := drive9.New(serverURL, "").AdminSetTenantQuota(ctx, drive9.QuotaSet
 	MaxStorageSize:         &storageSize,
 	MaxFileSize:            &fileSize,
 	MaxFileCount:           &fileCount,
+	MaxMediaLLMFiles:       &mediaLLMFiles,
+	MaxVideoLLMFiles:       &videoLLMFiles,
 	TiDBCloudSpendingLimit: &spendingLimit,
 })
 if err != nil {

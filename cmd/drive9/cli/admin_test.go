@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 func TestAdminTenantHelpIncludesCommandsFlagsAndExamples(t *testing.T) {
@@ -49,6 +51,27 @@ func TestAdminTenantHelpIncludesCommandsFlagsAndExamples(t *testing.T) {
 		if !strings.Contains(quotaHelp, want) {
 			t.Fatalf("set-quota help missing %q:\n%s", want, quotaHelp)
 		}
+	}
+	createHelp, err := captureStdoutE(t, func() error {
+		return Admin([]string{"tenant", "create", "--help"})
+	})
+	if err != nil {
+		t.Fatalf("tenant create help: %v", err)
+	}
+	for _, unsupported := range []string{"--max-media-llm-files", "--max-video-llm-files"} {
+		if strings.Contains(createHelp, unsupported) {
+			t.Fatalf("create help advertises unsupported flag %q:\n%s", unsupported, createHelp)
+		}
+	}
+}
+
+func TestAdminQuotaLLMLimitZeroPrintsUnlimited(t *testing.T) {
+	quota := &client.AdminTenantQuota{}
+	if got := adminQuotaMaxMediaLLMFiles(quota); got != "unlimited" {
+		t.Fatalf("media LLM limit = %q, want unlimited", got)
+	}
+	if got := adminQuotaMaxVideoLLMFiles(quota); got != "unlimited" {
+		t.Fatalf("video LLM limit = %q, want unlimited", got)
 	}
 }
 
