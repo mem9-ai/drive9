@@ -29,7 +29,7 @@ func TestNamespaceAuthorizationErrorsResetMountView(t *testing.T) {
 		{
 			name: "lookup list fallback",
 			call: func(fs *Dat9FS) error {
-				_, err := fs.lookupListWithRetry(nil, "/denied")
+				_, _, err := fs.lookupListWithRetry(nil, "/denied")
 				return err
 			},
 		},
@@ -241,6 +241,150 @@ func TestDirectoryPrefetchDiscardedWhenMountViewResetsInFlight(t *testing.T) {
 	}
 	if _, ok := fs.readCache.Get("/prefetch.txt", 7); ok {
 		t.Fatal("read cache was repopulated after reset")
+	}
+}
+
+func TestLookupListDiscardedWhenMountViewResetsInFlight(t *testing.T) {
+	listStarted := make(chan struct{})
+	releaseList := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(listStarted)
+		<-releaseList
+		_, _ = w.Write([]byte(`{"entries":[{"name":"stale","isdir":true}]}`))
+	}))
+	defer ts.Close()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := fs.lookupListWithRetry(nil, "/")
+		done <- err
+	}()
+	<-listStarted
+	fs.resetMountView()
+	close(releaseList)
+
+	if err := <-done; !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("lookupListWithRetry error = %v, want EAGAIN after reset", err)
+	}
+	if cached, ok := fs.dirCache.Get("/"); ok {
+		t.Fatalf("directory cache retained in-flight lookup entries after reset: %#v", cached)
+	}
+}
+
+func TestEmptyDirectoryHandleRemainsLoaded(t *testing.T) {
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		listCalls.Add(1)
+		_, _ = w.Write([]byte(`{"entries":[]}`))
+	}))
+	defer ts.Close()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+	dh := &DirHandle{Ino: 1, Path: "/", entriesGeneration: fs.mountViewGeneration.Load()}
+
+	if entries, _, err := fs.loadDirHandleEntries(context.Background(), dh); err != nil || len(entries) != 0 {
+		t.Fatalf("first load = %#v, %v; want empty loaded directory", entries, err)
+	}
+	if dh.Entries == nil {
+		t.Fatal("empty directory handle was not marked loaded")
+	}
+	fs.dirCache.Invalidate("/")
+	if entries, _, err := fs.loadDirHandleEntries(context.Background(), dh); err != nil || len(entries) != 0 {
+		t.Fatalf("second load = %#v, %v; want cached empty directory", entries, err)
+	}
+	if got := listCalls.Load(); got != 1 {
+		t.Fatalf("remote list calls = %d, want 1", got)
+	}
+}
+
+func TestResetMountViewInvalidatesPrefetchWithoutWaitingForHandle(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "http://fresh.example/object")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer ts.Close()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+	oldTarget := &client.ReadTarget{ObjectURL: "http://stale.example/object"}
+	prefetch := NewPrefetcher(fs.client, "/large.bin", 1024)
+	prefetch.SetReadTarget(oldTarget)
+	ready := make(chan struct{})
+	close(ready)
+	prefetch.mu.Lock()
+	prefetch.cache[0] = &prefetchBlock{offset: 0, data: []byte("stale"), ready: ready}
+	prefetch.mu.Unlock()
+	fh := &FileHandle{Ino: 2, Path: "/large.bin", ReadTarget: oldTarget, Prefetch: prefetch}
+	fs.fileHandles.Allocate(fh)
+
+	fh.Lock()
+	done := make(chan struct{})
+	go func() {
+		fs.resetMountView()
+		close(done)
+	}()
+	blocked := false
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		blocked = true
+	}
+	fh.Unlock()
+	if blocked {
+		<-done
+		t.Fatal("resetMountView waited for a locked file handle")
+	}
+	if data, ok := prefetch.Get(0, len("stale")); ok {
+		t.Fatalf("prefetch retained stale data after reset: %q", data)
+	}
+	target := fs.readTargetForHandle(context.Background(), fh)
+	if target == nil || target.ObjectURL != "http://fresh.example/object" {
+		t.Fatalf("read target = %+v, want refreshed target", target)
+	}
+	prefetch.mu.Lock()
+	prefetchClosed := prefetch.closed
+	prefetchTarget := prefetch.target
+	prefetch.mu.Unlock()
+	if prefetchClosed || prefetchTarget != target {
+		t.Fatalf("prefetch state = closed:%t target:%+v, want active refreshed target", prefetchClosed, prefetchTarget)
+	}
+}
+
+func TestRmdirRejectsDirectoryListWhenMountViewResetsInFlight(t *testing.T) {
+	prefetchStarted := make(chan struct{})
+	releasePrefetch := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"entries":[{"name":"child.txt","isdir":false,"size":5,"revision":7}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-read-small":
+			close(prefetchStarted)
+			<-releasePrefetch
+			_, _ = w.Write([]byte(`{"results":[{"path":"/dir/child.txt","status":200,"data":"aGVsbG8=","size":5,"revision":7}]}`))
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+	opts := &MountOptions{LayerRef: "layer", ReadDirPrefetch: true, PrefetchTimeout: time.Second}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	}()
+	<-prefetchStarted
+	fs.resetMountView()
+	close(releasePrefetch)
+
+	if got := <-done; got != gofuse.Status(syscall.EAGAIN) {
+		t.Fatalf("Rmdir status = %v, want EAGAIN after reset", got)
 	}
 }
 
