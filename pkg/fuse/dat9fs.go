@@ -1005,11 +1005,18 @@ func (fs *Dat9FS) resetMountView() {
 	if fs.diskReadCache != nil {
 		fs.diskReadCache.InvalidateAll()
 	}
-	fs.clearAllReadTargets()
+	if fs.fileHandles != nil {
+		for _, fh := range fs.fileHandles.Snapshot() {
+			if fh != nil && fh.Prefetch != nil {
+				fh.Prefetch.Invalidate()
+			}
+		}
+	}
 	if fs.dirCache != nil {
 		fs.dirCache.InvalidateAll()
 	}
 	fs.mountViewMu.Unlock()
+	fs.clearAllReadTargets()
 
 	// Best-effort kernel cache invalidation for all known inodes.
 	// Snapshot entries first so we don't hold the inode map lock during
@@ -4353,15 +4360,17 @@ func (fs *Dat9FS) readTargetForHandle(ctx context.Context, fh *FileHandle) *clie
 		return nil
 	}
 	fh.Lock()
+	generation := fs.mountViewGeneration.Load()
 	target := fh.ReadTarget
 	handlePath := fh.Path
 	remotePath := fs.remotePath(handlePath)
+	if target != nil && fh.readTargetGen != generation {
+		clearReadTargetForLockedHandle(fh)
+		target = nil
+	}
 	if fs.bypassStableRemoteReadCaches(handlePath) {
 		if target != nil {
-			fh.ReadTarget = nil
-			if fh.Prefetch != nil {
-				fh.Prefetch.SetReadTarget(nil)
-			}
+			clearReadTargetForLockedHandle(fh)
 		}
 		fh.Unlock()
 		return nil
@@ -4378,15 +4387,20 @@ func (fs *Dat9FS) readTargetForHandle(ctx context.Context, fh *FileHandle) *clie
 		return nil
 	}
 
+	if !fs.lockMountViewRead(generation) {
+		return nil
+	}
 	fh.Lock()
 	if fh.Path == handlePath && fh.Dirty == nil && fh.ReadTarget == nil {
 		fh.ReadTarget = resolved
+		fh.readTargetGen = generation
 		if fh.Prefetch != nil {
 			fh.Prefetch.SetReadTarget(resolved)
 		}
 	}
 	target = fh.ReadTarget
 	fh.Unlock()
+	fs.mountViewMu.RUnlock()
 	return target
 }
 
@@ -4395,10 +4409,7 @@ func clearReadTargetForHandle(fh *FileHandle) {
 		return
 	}
 	fh.Lock()
-	fh.ReadTarget = nil
-	if fh.Prefetch != nil {
-		fh.Prefetch.SetReadTarget(nil)
-	}
+	clearReadTargetForLockedHandle(fh)
 	fh.Unlock()
 }
 
@@ -4427,6 +4438,7 @@ func clearReadTargetForLockedHandle(fh *FileHandle) {
 		return
 	}
 	fh.ReadTarget = nil
+	fh.readTargetGen = 0
 	if fh.Prefetch != nil {
 		fh.Prefetch.SetReadTarget(nil)
 	}
@@ -4436,9 +4448,13 @@ func (fs *Dat9FS) clearAllReadTargets() {
 	if fs == nil || fs.fileHandles == nil {
 		return
 	}
-	fs.fileHandles.ForEach(func(_ uint64, fh *FileHandle) {
-		clearReadTargetForHandle(fh)
-	})
+	for _, fh := range fs.fileHandles.Snapshot() {
+		if fh == nil || !fh.TryLock() {
+			continue
+		}
+		clearReadTargetForLockedHandle(fh)
+		fh.Unlock()
+	}
 }
 
 func readUnlinkedData(fh *FileHandle, offset int64, size uint32) ([]byte, int, bool) {
@@ -5170,25 +5186,30 @@ func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
 	return cached
 }
 
-func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string) ([]client.FileInfo, error) {
+func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string) ([]client.FileInfo, uint64, error) {
 	// list-fallback retries are intentionally not counted in lookupStatRetry*;
 	// those counters remain scoped to the primary Lookup->Stat path.
 	ctx, cf := fuseCtx(cancel)
 	apiPath := fs.remotePath(parentPath)
+	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
 	items, err := fs.client.ListCtx(ctx, apiPath)
 	cf()
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err == nil {
+		if !fs.lockMountViewRead(generation) {
+			return nil, 0, syscall.EAGAIN
+		}
 		fs.dirCache.Put(parentPath, cachedFileInfos(items))
-		return items, nil
+		fs.mountViewMu.RUnlock()
+		return items, generation, nil
 	}
 	if !isTransientLookupErr(err) {
-		return items, fs.resetMountViewOnAuthorizationError(err)
+		return items, 0, fs.resetMountViewOnAuthorizationError(err)
 	}
 	retryCount := fs.lookupStatRetryCount()
 	if retryCount <= 0 {
-		return nil, err
+		return nil, 0, err
 	}
 
 	lastErr := err
@@ -5203,15 +5224,19 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		retryCancel()
 		fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 		if err == nil {
+			if !fs.lockMountViewRead(generation) {
+				return nil, 0, syscall.EAGAIN
+			}
 			fs.dirCache.Put(parentPath, cachedFileInfos(items))
-			return items, nil
+			fs.mountViewMu.RUnlock()
+			return items, generation, nil
 		}
 		if !isTransientLookupErr(err) {
-			return items, fs.resetMountViewOnAuthorizationError(err)
+			return items, 0, fs.resetMountViewOnAuthorizationError(err)
 		}
 		lastErr = err
 	}
-	return nil, lastErr
+	return nil, 0, lastErr
 }
 
 func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
@@ -5441,7 +5466,7 @@ func (fs *Dat9FS) maybeListOnNegativeLookupStorm(cancel <-chan struct{}, parentP
 	if fs.perf != nil {
 		fs.perf.lookupStormList.add(1)
 	}
-	items, err := fs.lookupListWithRetry(cancel, parentPath)
+	items, _, err := fs.lookupListWithRetry(cancel, parentPath)
 	if err != nil || !fs.dirCache.CanAnswerMisses(parentPath) {
 		// Listing failed or was too large to mark complete; cool down so a
 		// sustained probe storm cannot hammer the server with listings.
@@ -6203,30 +6228,50 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if fs.opts.LegacyDirStatFallback {
 			// Compatibility path for private legacy servers that do not support
 			// stat/HEAD on directories: list the parent and match by name.
-			items, listErr := fs.lookupListWithRetry(cancel, parentPath)
+			items, listGeneration, listErr := fs.lookupListWithRetry(cancel, parentPath)
 			if listErr != nil {
-				return httpToFuseStatus(listErr)
+				return listDirErrToFuseStatus(listErr)
 			}
+			var matched client.FileInfo
+			matchedFound := false
 			for _, item := range items {
-				if item.Name != name {
-					continue
+				if item.Name == name {
+					matched = item
+					matchedFound = true
+					break
 				}
-				mtime := time.Now()
-				if item.Mtime > 0 {
-					mtime = time.Unix(item.Mtime, 0)
-				}
-				ino := fs.inodes.LookupWithIdentity(childP, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
-				if item.HasMode {
-					fs.inodes.UpdateMode(ino, item.Mode)
-				}
-				entry, ok := fs.inodes.GetEntry(ino)
-				if !ok {
-					return gofuse.EIO
-				}
-				fs.applyLayerFileMode(childP, ino, entry)
-				fs.fillEntryOut(entry, out)
-				return gofuse.OK
 			}
+			if !matchedFound {
+				fs.maybeListOnNegativeLookupStorm(cancel, parentPath, childP)
+				if !fs.lockMountViewRead(listGeneration) {
+					return gofuse.Status(syscall.EAGAIN)
+				}
+				fs.cacheNegativePath(childP)
+				out.NodeId = 0
+				out.SetEntryTimeout(fs.negativeEntryTTL(childP))
+				fs.mountViewMu.RUnlock()
+				return gofuse.ENOENT
+			}
+			if !fs.lockMountViewRead(listGeneration) {
+				return gofuse.Status(syscall.EAGAIN)
+			}
+			mtime := time.Now()
+			if matched.Mtime > 0 {
+				mtime = time.Unix(matched.Mtime, 0)
+			}
+			ino := fs.inodes.LookupWithIdentity(childP, matched.ResourceID, matched.Nlink, matched.IsDir, matched.Size, mtime)
+			if matched.HasMode {
+				fs.inodes.UpdateMode(ino, matched.Mode)
+			}
+			entry, ok := fs.inodes.GetEntry(ino)
+			if !ok {
+				fs.mountViewMu.RUnlock()
+				return gofuse.EIO
+			}
+			fs.applyLayerFileMode(childP, ino, entry)
+			fs.fillEntryOut(entry, out)
+			fs.mountViewMu.RUnlock()
+			return gofuse.OK
 		}
 		// Cache negative lookup: tell kernel this entry doesn't exist
 		// for NegativeEntryTTL so it doesn't re-ask immediately.
@@ -8460,16 +8505,23 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		return status
 	}
 	if fs.layerEnabled() {
+		generation := fs.mountViewGeneration.Load()
 		entries, err := fs.listDir(ctx, childP)
 		if err != nil {
 			if _, ok := fs.layerDirMode(childP); ok && isNotFoundErr(err) {
 				entries = nil
 			} else {
-				status = httpToFuseStatus(err)
+				status = listDirErrToFuseStatus(err)
 				return status
 			}
 		}
-		if len(entries) > 0 {
+		if !fs.lockMountViewRead(generation) {
+			status = gofuse.Status(syscall.EAGAIN)
+			return status
+		}
+		hasEntries := len(entries) > 0
+		fs.mountViewMu.RUnlock()
+		if hasEntries {
 			// Remote/overlay listing shows children. If the local inode state
 			// is empty, the listing may be stale (eventual-consistency lag on
 			// just-completed Unlinks). Poll for up to 2 seconds (4 × 500ms), using
@@ -8862,6 +8914,7 @@ func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
 		fh.Lock()
 		fh.Path = currentPath
 		fh.ReadTarget = nil
+		fh.readTargetGen = 0
 		if fh.Dirty != nil {
 			fh.Dirty.path = currentPath
 		}
@@ -9105,7 +9158,7 @@ func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle) ([]Di
 	dh.mu.Lock()
 	generation := fs.mountViewGeneration.Load()
 	if dh.entriesGeneration == generation && dh.Entries != nil {
-		entries := append([]DirEntry(nil), dh.Entries...)
+		entries := cloneLoadedDirEntries(dh.Entries)
 		dh.mu.Unlock()
 		return entries, generation, nil
 	}
@@ -9121,9 +9174,15 @@ func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle) ([]Di
 	if fs.mountViewGeneration.Load() != generation {
 		return nil, 0, syscall.EAGAIN
 	}
-	dh.Entries = append([]DirEntry(nil), entries...)
+	dh.Entries = cloneLoadedDirEntries(entries)
 	dh.entriesGeneration = generation
-	return append([]DirEntry(nil), entries...), generation, nil
+	return cloneLoadedDirEntries(entries), generation, nil
+}
+
+func cloneLoadedDirEntries(entries []DirEntry) []DirEntry {
+	cloned := make([]DirEntry, len(entries))
+	copy(cloned, entries)
+	return cloned
 }
 
 func (dh *DirHandle) updateEntryIno(generation uint64, index int, ino uint64) {
