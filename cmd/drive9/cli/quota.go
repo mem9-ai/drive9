@@ -28,6 +28,8 @@ func quotaSet(args []string) error {
 	var maxStorageSize *int64
 	var maxFileSize *int64
 	var maxFileCount *int64
+	var maxMediaLLMFiles *int64
+	var maxVideoLLMFiles *int64
 	var tidbCloudSpendingLimit *int64
 	asJSON := false
 
@@ -101,6 +103,26 @@ func quotaSet(args []string) error {
 				return err
 			}
 			maxFileCount = &v
+		case "--max-media-llm-files":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--max-media-llm-files requires an argument")
+			}
+			i++
+			v, err := parseNonNegativeQuotaInt64Flag("--max-media-llm-files", args[i])
+			if err != nil {
+				return err
+			}
+			maxMediaLLMFiles = &v
+		case "--max-video-llm-files":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--max-video-llm-files requires an argument")
+			}
+			i++
+			v, err := parseNonNegativeQuotaInt64Flag("--max-video-llm-files", args[i])
+			if err != nil {
+				return err
+			}
+			maxVideoLLMFiles = &v
 		case "--tidbcloud-spending-limit":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--tidbcloud-spending-limit requires an argument")
@@ -132,8 +154,8 @@ func quotaSet(args []string) error {
 	if err := rejectEmptyFlag("tidbcloud-private-key", strings.TrimSpace(privateKeyFlag), privateKeyGiven); err != nil {
 		return err
 	}
-	if maxStorageSize == nil && maxFileSize == nil && maxFileCount == nil && tidbCloudSpendingLimit == nil {
-		return fmt.Errorf("tenant set-quota requires --max-storage-size, --max-file-size, --max-file-count, or --tidbcloud-spending-limit")
+	if maxStorageSize == nil && maxFileSize == nil && maxFileCount == nil && maxMediaLLMFiles == nil && maxVideoLLMFiles == nil && tidbCloudSpendingLimit == nil {
+		return fmt.Errorf("tenant set-quota requires --max-storage-size, --max-file-size, --max-file-count, --max-media-llm-files, --max-video-llm-files, or --tidbcloud-spending-limit")
 	}
 
 	r := ResolveCredentials()
@@ -162,6 +184,8 @@ func quotaSet(args []string) error {
 		MaxStorageSize:         maxStorageSize,
 		MaxFileSize:            maxFileSize,
 		MaxFileCount:           maxFileCount,
+		MaxMediaLLMFiles:       maxMediaLLMFiles,
+		MaxVideoLLMFiles:       maxVideoLLMFiles,
 		TiDBCloudSpendingLimit: tidbCloudSpendingLimit,
 	})
 	if err != nil {
@@ -255,19 +279,9 @@ func printQuotaCLIResponse(out *client.QuotaResponse, asJSON bool) error {
 		return enc.Encode(out)
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "TENANT_ID\tSTATUS\tMAX_STORAGE\tMAX_FILE_SIZE\tMAX_FILE_COUNT\tSPENDING_LIMIT\tSTORAGE_USED\tRESERVED\tFILE_COUNT")
 	quota := &client.AdminTenantQuota{Config: out.Config, Usage: out.Usage}
-	_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-		out.TenantID,
-		out.Status,
-		adminQuotaMaxStorage(quota),
-		adminQuotaMaxFileSize(quota),
-		adminQuotaMaxFileCount(quota),
-		adminQuotaSpendingLimit(quota),
-		adminQuotaStorageUsed(quota),
-		adminQuotaReserved(quota),
-		adminQuotaFileCount(quota),
-	)
+	_, _ = fmt.Fprintln(w, quotaTableHeader(false))
+	_, _ = fmt.Fprintln(w, quotaTableRow(out.TenantID, out.Status, "", quota, false))
 	return w.Flush()
 }
 
@@ -304,6 +318,8 @@ flags:
   --max-storage-size Mi           max confirmed+reserved storage size in Mi
   --max-file-size Mi              max single file size in Mi; must not exceed server DRIVE9_MAX_UPLOAD_BYTES
   --max-file-count N              max confirmed file count; 0 means unlimited
+  --max-media-llm-files N         max media LLM extract files; must be non-negative
+  --max-video-llm-files N         max video LLM extract files; must be non-negative
   --tidbcloud-spending-limit N    TiDB Cloud Cluster Spending Limit; must be non-negative; see https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit
   --json                          output result as JSON`
 }

@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 func TestAdminTenantHelpIncludesCommandsFlagsAndExamples(t *testing.T) {
@@ -38,6 +40,38 @@ func TestAdminTenantHelpIncludesCommandsFlagsAndExamples(t *testing.T) {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, stdout)
 		}
+	}
+	quotaHelp, err := captureStdoutE(t, func() error {
+		return Admin([]string{"tenant", "set-quota", "--help"})
+	})
+	if err != nil {
+		t.Fatalf("tenant set-quota help: %v", err)
+	}
+	for _, want := range []string{"--max-media-llm-files", "--max-video-llm-files"} {
+		if !strings.Contains(quotaHelp, want) {
+			t.Fatalf("set-quota help missing %q:\n%s", want, quotaHelp)
+		}
+	}
+	createHelp, err := captureStdoutE(t, func() error {
+		return Admin([]string{"tenant", "create", "--help"})
+	})
+	if err != nil {
+		t.Fatalf("tenant create help: %v", err)
+	}
+	for _, unsupported := range []string{"--max-media-llm-files", "--max-video-llm-files"} {
+		if strings.Contains(createHelp, unsupported) {
+			t.Fatalf("create help advertises unsupported flag %q:\n%s", unsupported, createHelp)
+		}
+	}
+}
+
+func TestAdminQuotaLLMLimitZeroPrintsUnlimited(t *testing.T) {
+	quota := &client.AdminTenantQuota{}
+	if got := adminQuotaMaxMediaLLMFiles(quota); got != "unlimited" {
+		t.Fatalf("media LLM limit = %q, want unlimited", got)
+	}
+	if got := adminQuotaMaxVideoLLMFiles(quota); got != "unlimited" {
+		t.Fatalf("video LLM limit = %q, want unlimited", got)
 	}
 }
 
@@ -297,7 +331,7 @@ func TestAdminTenantListPrintsTable(t *testing.T) {
 		t.Fatalf("Admin tenant list: %v", err)
 	}
 	for _, want := range []string{
-		"TENANT_ID", "STATUS", "KIND", "MAX_STORAGE", "MAX_FILE_SIZE", "MAX_FILE_COUNT", "SPENDING_LIMIT", "STORAGE_USED", "RESERVED", "FILE_COUNT",
+		"TENANT_ID", "STATUS", "KIND", "MAX_STORAGE", "MAX_FILE_SIZE", "MAX_FILE_COUNT", "MAX_MEDIA_LLM_FILES", "MAX_VIDEO_LLM_FILES", "SPENDING_LIMIT", "STORAGE_USED", "RESERVED", "FILE_COUNT", "MEDIA_FILE_COUNT", "VIDEO_FILE_COUNT",
 		"tenant-1", "active", "live",
 		"tenant-2", "provisioning",
 		"next_page=3", "page=2", "page_size=5",
@@ -331,12 +365,16 @@ func TestAdminTenantListIncludeQuotaPrintsQuotaTable(t *testing.T) {
 							"max_storage_size":         102400,
 							"max_file_size":            1024,
 							"max_file_count":           0,
+							"max_media_llm_files":      400,
+							"max_video_llm_files":      50,
 							"tidbcloud_spending_limit": spendingLimit,
 						},
 						"usage": map[string]any{
-							"storage_bytes":  123,
-							"reserved_bytes": 2048,
-							"file_count":     4,
+							"storage_bytes":    123,
+							"reserved_bytes":   2048,
+							"file_count":       4,
+							"media_file_count": 4,
+							"video_file_count": 5,
 						},
 					},
 				},
@@ -360,8 +398,8 @@ func TestAdminTenantListIncludeQuotaPrintsQuotaTable(t *testing.T) {
 		t.Fatalf("Admin tenant list --include-quota: %v", err)
 	}
 	for _, want := range []string{
-		"TENANT_ID", "MAX_STORAGE", "MAX_FILE_SIZE", "MAX_FILE_COUNT", "SPENDING_LIMIT", "STORAGE_USED", "RESERVED", "FILE_COUNT",
-		"tenant-1", "102400 Mi", "1024 Mi", "unlimited", "10000", "123 B", "2.0 KiB", "4",
+		"TENANT_ID", "MAX_STORAGE", "MAX_FILE_SIZE", "MAX_FILE_COUNT", "MAX_MEDIA_LLM_FILES", "MAX_VIDEO_LLM_FILES", "SPENDING_LIMIT", "STORAGE_USED", "RESERVED", "FILE_COUNT", "MEDIA_FILE_COUNT", "VIDEO_FILE_COUNT",
+		"tenant-1", "102400 Mi", "1024 Mi", "unlimited", "400", "50", "10000", "123 B", "2.0 KiB", "4", "4", "5",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, stdout)
@@ -396,12 +434,16 @@ func TestAdminTenantGetPrintsQuota(t *testing.T) {
 					"max_storage_size":         102400,
 					"max_file_size":            1024,
 					"max_file_count":           10,
+					"max_media_llm_files":      400,
+					"max_video_llm_files":      50,
 					"tidbcloud_spending_limit": 10000,
 				},
 				"usage": map[string]any{
-					"storage_bytes":  123,
-					"reserved_bytes": 0,
-					"file_count":     4,
+					"storage_bytes":    123,
+					"reserved_bytes":   0,
+					"file_count":       4,
+					"media_file_count": 4,
+					"video_file_count": 5,
 				},
 			},
 		})
@@ -421,8 +463,8 @@ func TestAdminTenantGetPrintsQuota(t *testing.T) {
 		t.Fatalf("Admin tenant get: %v", err)
 	}
 	for _, want := range []string{
-		"TENANT_ID", "STATUS", "KIND", "MAX_STORAGE", "MAX_FILE_SIZE", "MAX_FILE_COUNT", "SPENDING_LIMIT", "STORAGE_USED", "RESERVED", "FILE_COUNT",
-		"tenant-1", "active", "live", "102400 Mi", "1024 Mi", "10", "10000", "123 B", "0 B", "4",
+		"TENANT_ID", "STATUS", "KIND", "MAX_STORAGE", "MAX_FILE_SIZE", "MAX_FILE_COUNT", "MAX_MEDIA_LLM_FILES", "MAX_VIDEO_LLM_FILES", "SPENDING_LIMIT", "STORAGE_USED", "RESERVED", "FILE_COUNT", "MEDIA_FILE_COUNT", "VIDEO_FILE_COUNT",
+		"tenant-1", "active", "live", "102400 Mi", "1024 Mi", "10", "400", "50", "10000", "123 B", "0 B", "4", "4", "5",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, stdout)

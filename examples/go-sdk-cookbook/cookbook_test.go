@@ -361,8 +361,12 @@ func ExampleClient_quota() {
 		_ = quota.Config.MaxStorageSize
 		_ = quota.Config.MaxFileSize
 		_ = quota.Config.MaxFileCount
+		_ = quota.Config.MaxMediaLLMFiles
+		_ = quota.Config.MaxVideoLLMFiles
 		_ = quota.Config.TiDBCloudSpendingLimit
 		_ = quota.Usage.FileCount
+		_ = quota.Usage.MediaFileCount
+		_ = quota.Usage.VideoFileCount
 	}
 
 	storageSize := int64(100 * 1024) // Mi
