@@ -4138,7 +4138,7 @@ func httpToFuseStatus(err error) gofuse.Status {
 				return gofuse.Status(syscall.ENOTEMPTY)
 			}
 			return gofuse.Status(syscall.EEXIST)
-		case http.StatusForbidden:
+		case http.StatusUnauthorized, http.StatusForbidden:
 			return gofuse.EACCES
 		case http.StatusRequestEntityTooLarge:
 			return gofuse.Status(syscall.EFBIG)
@@ -4169,7 +4169,7 @@ func httpToFuseStatus(err error) gofuse.Status {
 		return gofuse.Status(syscall.ENOTEMPTY)
 	case strings.Contains(lowerMsg, "already exists") || strings.Contains(msg, "HTTP 409"):
 		return gofuse.Status(syscall.EEXIST)
-	case strings.Contains(msg, "HTTP 403"):
+	case strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "HTTP 403"):
 		return gofuse.EACCES
 	case strings.Contains(msg, "HTTP 413"):
 		return gofuse.Status(syscall.EFBIG)
@@ -4215,6 +4215,17 @@ func isForbiddenErr(err error) bool {
 		return true
 	}
 	return strings.Contains(err.Error(), "HTTP 403")
+}
+
+func isAuthorizationErr(err error) bool {
+	return client.IsUnauthorized(err) || client.IsForbidden(err)
+}
+
+func (fs *Dat9FS) resetMountViewOnAuthorizationError(err error) error {
+	if isAuthorizationErr(err) {
+		fs.resetMountView()
+	}
+	return err
 }
 
 func isTransientLookupErr(err error) bool {
@@ -5036,8 +5047,11 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 	stat, err := fs.client.StatCtx(ctx, apiPath)
 	cf()
 	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
-	if err == nil || isNotFoundErr(err) || !isTransientLookupErr(err) {
+	if err == nil || isNotFoundErr(err) {
 		return stat, err
+	}
+	if !isTransientLookupErr(err) {
+		return stat, fs.resetMountViewOnAuthorizationError(err)
 	}
 
 	// Mapping interruption to a retryable errno alone is insufficient for callers
@@ -5080,8 +5094,11 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 			}
 			return stat, nil
 		}
-		if isNotFoundErr(err) || !isTransientLookupErr(err) {
+		if isNotFoundErr(err) {
 			return nil, err
+		}
+		if !isTransientLookupErr(err) {
+			return nil, fs.resetMountViewOnAuthorizationError(err)
 		}
 		lastErr = err
 	}
@@ -5145,7 +5162,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		return items, nil
 	}
 	if !isTransientLookupErr(err) {
-		return items, err
+		return items, fs.resetMountViewOnAuthorizationError(err)
 	}
 	retryCount := fs.lookupStatRetryCount()
 	if retryCount <= 0 {
@@ -5168,7 +5185,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 			return items, nil
 		}
 		if !isTransientLookupErr(err) {
-			return items, err
+			return items, fs.resetMountViewOnAuthorizationError(err)
 		}
 		lastErr = err
 	}
@@ -9369,12 +9386,14 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
-		return nil, err
+		return nil, fs.resetMountViewOnAuthorizationError(err)
 	}
 
 	// Store in dir cache
 	cached := cachedFileInfos(items)
-	fs.applyBatchStats(ctx, dirPath, cached)
+	if err := fs.applyBatchStats(ctx, dirPath, cached); err != nil {
+		return nil, err
+	}
 	fs.dirCache.Put(dirPath, cached)
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached)
 
@@ -9382,9 +9401,9 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
 }
 
-func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []CachedFileInfo) {
+func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []CachedFileInfo) error {
 	if len(items) == 0 {
-		return
+		return nil
 	}
 
 	// Collect indices of items that need a BatchStat (revision unknown).
@@ -9407,7 +9426,7 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 		}
 	}
 	if len(needStat) == 0 {
-		return
+		return nil
 	}
 
 	for batchStart := 0; batchStart < len(needStat); batchStart += client.MaxBatchStatPaths {
@@ -9423,7 +9442,10 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 		results, err := fs.client.BatchStatCtx(ctx, paths)
 		if err != nil {
 			safeLogPrintf("batch stat failed for %s (needStat batch %d-%d of %d): %v", dirPath, batchStart, batchEnd, len(needStat), err)
-			return
+			if isAuthorizationErr(err) {
+				return fs.resetMountViewOnAuthorizationError(err)
+			}
+			return nil
 		}
 		for j, result := range results {
 			if !result.OK() {
@@ -9442,6 +9464,7 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 			item.Nlink = result.Nlink
 		}
 	}
+	return nil
 }
 
 // mergePendingDirEntries overlays pending write-back entries onto a directory
