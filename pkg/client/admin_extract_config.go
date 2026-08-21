@@ -56,6 +56,14 @@ type AdminTenantExtractConfigSetRequest struct {
 	Prompt     *string          `json:"prompt,omitempty"`
 }
 
+type adminTenantExtractConfigSetBody struct {
+	Enabled *bool   `json:"enabled,omitempty"`
+	APIBase *string `json:"api_base,omitempty"`
+	APIKey  *string `json:"api_key,omitempty"`
+	Model   *string `json:"model,omitempty"`
+	Prompt  *string `json:"prompt,omitempty"`
+}
+
 // AdminGetTenantExtractConfig returns the effective extract configuration for
 // one tenant and media type.
 func (c *Client) AdminGetTenantExtractConfig(ctx context.Context, query AdminTenantExtractConfigGetRequest) (*AdminTenantExtractConfig, error) {
@@ -78,7 +86,13 @@ func (c *Client) AdminSetTenantExtractConfig(ctx context.Context, update AdminTe
 	if err != nil {
 		return nil, err
 	}
-	raw, err := json.Marshal(update)
+	raw, err := json.Marshal(adminTenantExtractConfigSetBody{
+		Enabled: update.Enabled,
+		APIBase: update.APIBase,
+		APIKey:  update.APIKey,
+		Model:   update.Model,
+		Prompt:  update.Prompt,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal admin tenant extract config set request: %w", err)
 	}

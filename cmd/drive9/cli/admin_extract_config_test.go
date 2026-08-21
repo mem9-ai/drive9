@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 func TestAdminTenantExtractConfigHelp(t *testing.T) {
@@ -34,6 +36,8 @@ func TestAdminTenantExtractConfigHelp(t *testing.T) {
 		"--api-key KEY",
 		"--model MODEL",
 		"--prompt TEXT",
+		"non-empty when enabling",
+		"empty clears",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("help missing %q:\n%s", want, stdout)
@@ -55,7 +59,7 @@ func TestAdminTenantExtractConfigGetPrintsTableAndHeaders(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"enabled":    true,
 			"api_base":   "https://provider.example.com",
-			"api_key":    "prov********",
+			"api_key":    "plain-provider-key",
 			"model":      "audio-model",
 			"prompt":     "extract audio",
 			"source":     "custom",
@@ -77,13 +81,76 @@ func TestAdminTenantExtractConfigGetPrintsTableAndHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	for _, want := range []string{"MEDIA_TYPE", "ENABLED", "SOURCE", "API_BASE", "API_KEY", "MODEL", "PROMPT", "UPDATED_AT", "audio", "true", "custom", "prov********"} {
+	if strings.Contains(stdout, "plain-provider-key") {
+		t.Fatal("table output leaked the provider API key")
+	}
+	for _, want := range []string{"MEDIA_TYPE", "ENABLED", "SOURCE", "API_BASE", "API_KEY", "MODEL", "PROMPT", "UPDATED_AT", "audio", "true", "custom", "plai********"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("output missing %q:\n%s", want, stdout)
 		}
 	}
-	if strings.Contains(stdout, "provider-secret") {
-		t.Fatalf("output leaked provider key: %s", stdout)
+}
+
+func TestAdminTenantExtractConfigGetRedactsPlaintextAPIKeyInJSON(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"enabled": true,
+			"api_key": "plain-provider-key",
+			"source":  "custom",
+		})
+	}))
+	defer srv.Close()
+
+	stdout, err := captureStdoutE(t, func() error {
+		return Admin([]string{
+			"tenant", "extract-config", "get",
+			"--server", srv.URL,
+			"--tenant-id", "tenant-1",
+			"--media-type", "future-media",
+			"--tidbcloud-public-key", "public-1",
+			"--tidbcloud-private-key", "private-1",
+			"--json",
+		})
+	})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if strings.Contains(stdout, "plain-provider-key") {
+		t.Fatal("JSON output leaked the provider API key")
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("decode JSON output: %v", err)
+	}
+	if out["api_key"] != "plai********" {
+		t.Fatalf("api_key = %q, want redacted value", out["api_key"])
+	}
+}
+
+func TestRedactAdminTenantExtractConfigCopiesResponseAndKeepsMaskedKey(t *testing.T) {
+	plaintext := "plain-provider-key"
+	original := &client.AdminTenantExtractConfig{APIKey: &plaintext}
+	redacted := redactAdminTenantExtractConfig(original)
+	if original.APIKey == nil || *original.APIKey != "plain-provider-key" {
+		t.Fatal("redaction modified the SDK response")
+	}
+	if redacted == original || redacted.APIKey == original.APIKey || redacted.APIKey == nil || *redacted.APIKey != "plai********" {
+		t.Fatalf("redacted response = %#v", redacted)
+	}
+
+	alreadyMasked := "prov****"
+	masked := redactAdminTenantExtractConfig(&client.AdminTenantExtractConfig{APIKey: &alreadyMasked})
+	if masked.APIKey == nil || *masked.APIKey != alreadyMasked {
+		t.Fatalf("already-masked API key = %q", optionalExtractString(masked.APIKey))
+	}
+
+	embeddedAsterisk := "ab*c-remaining-value"
+	masked = redactAdminTenantExtractConfig(&client.AdminTenantExtractConfig{APIKey: &embeddedAsterisk})
+	if masked.APIKey == nil || *masked.APIKey != "ab*c********" {
+		t.Fatal("an embedded asterisk incorrectly bypassed redaction")
 	}
 }
 
@@ -129,7 +196,7 @@ func TestAdminTenantExtractConfigSetPreservesExplicitFields(t *testing.T) {
 		t.Fatalf("body = %#v, want explicit false and empty prompt", gotBody)
 	}
 	if strings.Contains(stdout, "provider-secret") {
-		t.Fatalf("output leaked provider key: %s", stdout)
+		t.Fatal("output leaked the provider API key")
 	}
 	var out map[string]any
 	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
@@ -223,7 +290,10 @@ func TestAdminTenantExtractConfigSetErrorDoesNotPrintProviderSecret(t *testing.T
 			"--tidbcloud-private-key", "private-1",
 		})
 	})
-	if err == nil || strings.Contains(err.Error(), "provider-secret") || strings.Contains(errOutput, "provider-secret") {
-		t.Fatalf("error/output leaked provider secret: err=%v output=%q", err, errOutput)
+	if err == nil {
+		t.Fatal("set error = nil")
+	}
+	if strings.Contains(err.Error(), "provider-secret") || strings.Contains(errOutput, "provider-secret") {
+		t.Fatal("error or output leaked the provider API key")
 	}
 }

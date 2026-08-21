@@ -31,25 +31,24 @@ func adminTenantExtractConfig(args []string) error {
 }
 
 type adminTenantExtractConfigFlags struct {
-	serverFlag       string
-	serverGiven      bool
-	regionCodeFlag   string
-	regionCodeGiven  bool
-	tenantID         string
-	tenantIDGiven    bool
-	mediaType        string
-	mediaTypeGiven   bool
-	publicKeyFlag    string
-	publicKeyGiven   bool
-	privateKeyFlag   string
-	privateKeyGiven  bool
-	asJSON           bool
-	enabled          *bool
-	apiBase          *string
-	apiKey           *string
-	model            *string
-	prompt           *string
-	configFieldCount int
+	serverFlag      string
+	serverGiven     bool
+	regionCodeFlag  string
+	regionCodeGiven bool
+	tenantID        string
+	tenantIDGiven   bool
+	mediaType       string
+	mediaTypeGiven  bool
+	publicKeyFlag   string
+	publicKeyGiven  bool
+	privateKeyFlag  string
+	privateKeyGiven bool
+	asJSON          bool
+	enabled         *bool
+	apiBase         *string
+	apiKey          *string
+	model           *string
+	prompt          *string
 }
 
 func parseAdminTenantExtractConfigFlags(args []string, usage string, allowConfig bool) (adminTenantExtractConfigFlags, error) {
@@ -110,7 +109,6 @@ func parseAdminTenantExtractConfigFlags(args []string, usage string, allowConfig
 				return flags, err
 			}
 			flags.enabled, i = &parsed, next
-			flags.configFieldCount++
 		case "--api-base":
 			if !allowConfig {
 				return flags, fmt.Errorf("unknown flag %q\n%s", args[i], usage)
@@ -120,7 +118,6 @@ func parseAdminTenantExtractConfigFlags(args []string, usage string, allowConfig
 				return flags, err
 			}
 			flags.apiBase, i = &value, next
-			flags.configFieldCount++
 		case "--api-key":
 			if !allowConfig {
 				return flags, fmt.Errorf("unknown flag %q\n%s", args[i], usage)
@@ -130,7 +127,6 @@ func parseAdminTenantExtractConfigFlags(args []string, usage string, allowConfig
 				return flags, err
 			}
 			flags.apiKey, i = &value, next
-			flags.configFieldCount++
 		case "--model":
 			if !allowConfig {
 				return flags, fmt.Errorf("unknown flag %q\n%s", args[i], usage)
@@ -140,7 +136,6 @@ func parseAdminTenantExtractConfigFlags(args []string, usage string, allowConfig
 				return flags, err
 			}
 			flags.model, i = &value, next
-			flags.configFieldCount++
 		case "--prompt":
 			if !allowConfig {
 				return flags, fmt.Errorf("unknown flag %q\n%s", args[i], usage)
@@ -150,7 +145,6 @@ func parseAdminTenantExtractConfigFlags(args []string, usage string, allowConfig
 				return flags, err
 			}
 			flags.prompt, i = &value, next
-			flags.configFieldCount++
 		default:
 			return flags, fmt.Errorf("unknown flag %q\n%s", args[i], usage)
 		}
@@ -181,7 +175,7 @@ func parseAdminTenantExtractConfigFlags(args []string, usage string, allowConfig
 	}
 	flags.tenantID = strings.TrimSpace(flags.tenantID)
 	flags.mediaType = strings.TrimSpace(flags.mediaType)
-	if allowConfig && flags.configFieldCount == 0 {
+	if allowConfig && flags.enabled == nil && flags.apiBase == nil && flags.apiKey == nil && flags.model == nil && flags.prompt == nil {
 		return flags, fmt.Errorf("at least one extract config field is required")
 	}
 	return flags, nil
@@ -205,17 +199,9 @@ func parseAdminExtractBool(value string) (bool, error) {
 	}
 }
 
-func (f adminTenantExtractConfigFlags) client(server string) *client.Client {
-	return client.New(server, "")
-}
-
-func (f adminTenantExtractConfigFlags) credentials() (string, string) {
-	return adminTiDBCloudKeys(f.publicKeyFlag, f.privateKeyFlag)
-}
-
 func (f adminTenantExtractConfigFlags) requestIdentity() (client.QuotaRequest, error) {
-	publicKey, privateKey := f.credentials()
-	return quotaRequest(strings.TrimSpace(f.tenantID), publicKey, privateKey)
+	publicKey, privateKey := adminTiDBCloudKeys(f.publicKeyFlag, f.privateKeyFlag)
+	return quotaRequest(f.tenantID, publicKey, privateKey)
 }
 
 func (f adminTenantExtractConfigFlags) server() (string, error) {
@@ -239,8 +225,8 @@ func adminTenantExtractConfigGet(args []string) error {
 	if err != nil {
 		return err
 	}
-	out, err := flags.client(server).AdminGetTenantExtractConfig(context.Background(), client.AdminTenantExtractConfigGetRequest{
-		TenantID: identity.TenantID, MediaType: client.ExtractMediaType(strings.TrimSpace(flags.mediaType)), PublicKey: identity.PublicKey, PrivateKey: identity.PrivateKey,
+	out, err := client.New(server, "").AdminGetTenantExtractConfig(context.Background(), client.AdminTenantExtractConfigGetRequest{
+		TenantID: identity.TenantID, MediaType: client.ExtractMediaType(flags.mediaType), PublicKey: identity.PublicKey, PrivateKey: identity.PrivateKey,
 	})
 	if err != nil {
 		return quotaAPIError("get tenant extract config", err)
@@ -264,8 +250,8 @@ func adminTenantExtractConfigSet(args []string) error {
 	if err != nil {
 		return err
 	}
-	out, err := flags.client(server).AdminSetTenantExtractConfig(context.Background(), client.AdminTenantExtractConfigSetRequest{
-		TenantID: identity.TenantID, MediaType: client.ExtractMediaType(strings.TrimSpace(flags.mediaType)), PublicKey: identity.PublicKey, PrivateKey: identity.PrivateKey,
+	out, err := client.New(server, "").AdminSetTenantExtractConfig(context.Background(), client.AdminTenantExtractConfigSetRequest{
+		TenantID: identity.TenantID, MediaType: client.ExtractMediaType(flags.mediaType), PublicKey: identity.PublicKey, PrivateKey: identity.PrivateKey,
 		Enabled: flags.enabled, APIBase: flags.apiBase, APIKey: flags.apiKey, Model: flags.model, Prompt: flags.prompt,
 	})
 	if err != nil {
@@ -278,6 +264,7 @@ func printAdminTenantExtractConfigResponse(out *client.AdminTenantExtractConfig,
 	if out == nil {
 		return fmt.Errorf("tenant extract config response is empty")
 	}
+	out = redactAdminTenantExtractConfig(out)
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -287,6 +274,48 @@ func printAdminTenantExtractConfigResponse(out *client.AdminTenantExtractConfig,
 	_, _ = fmt.Fprintln(w, "MEDIA_TYPE\tENABLED\tSOURCE\tAPI_BASE\tAPI_KEY\tMODEL\tPROMPT\tUPDATED_AT")
 	_, _ = fmt.Fprintf(w, "%s\t%t\t%s\t%s\t%s\t%s\t%s\t%s\n", mediaType, out.Enabled, emptyAsDash(out.Source), optionalExtractString(out.APIBase), optionalExtractString(out.APIKey), optionalExtractString(out.Model), optionalExtractString(out.Prompt), optionalExtractTime(out.UpdatedAt))
 	return w.Flush()
+}
+
+func redactAdminTenantExtractConfig(out *client.AdminTenantExtractConfig) *client.AdminTenantExtractConfig {
+	redacted := *out
+	if out.APIKey != nil {
+		apiKey := redactProviderAPIKey(*out.APIKey)
+		redacted.APIKey = &apiKey
+	}
+	return &redacted
+}
+
+func redactProviderAPIKey(apiKey string) string {
+	if apiKey == "" {
+		return apiKey
+	}
+	runes := []rune(apiKey)
+	if isMaskedProviderAPIKey(runes) {
+		return apiKey
+	}
+	if len(runes) <= 4 {
+		return "********"
+	}
+	return string(runes[:4]) + "********"
+}
+
+func isMaskedProviderAPIKey(runes []rune) bool {
+	firstMask := -1
+	for i, r := range runes {
+		if r == '*' {
+			firstMask = i
+			break
+		}
+	}
+	if firstMask < 0 || firstMask > 4 {
+		return false
+	}
+	for _, r := range runes[firstMask:] {
+		if r != '*' {
+			return false
+		}
+	}
+	return true
 }
 
 func optionalExtractString(value *string) string {
@@ -321,9 +350,9 @@ common flags:
 
 set flags:
   --enabled true|false             enable or disable this media type
-  --api-base URL                   provider base URL
-  --api-key KEY                    provider API key (sensitive)
-  --model MODEL                    provider model name
+  --api-base URL                   provider base URL; non-empty when enabling
+  --api-key KEY                    provider API key; non-empty when enabling (sensitive)
+  --model MODEL                    provider model name; non-empty when enabling
   --prompt TEXT                    custom extraction prompt; empty clears the override`
 }
 
@@ -354,9 +383,9 @@ flags:
   --tenant-id ID                   required
   --media-type TYPE                required
   --enabled true|false
-  --api-base URL
-  --api-key KEY                    sensitive
-  --model MODEL
+  --api-base URL                   non-empty when enabling
+  --api-key KEY                    non-empty when enabling (sensitive)
+  --model MODEL                    non-empty when enabling
   --prompt TEXT                    empty clears the custom prompt
   --tidbcloud-public-key KEY
   --tidbcloud-private-key KEY
