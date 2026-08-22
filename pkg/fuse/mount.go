@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -228,6 +229,9 @@ func validateRemoteRoot(ctx context.Context, c *client.Client, remoteRoot string
 	if client.IsNotFound(err) {
 		return ExitStartupPermanentErr(fmt.Sprintf("remote source %q does not exist", remoteRoot), err)
 	}
+	if !shouldFallbackRemoteRootList(err) {
+		return remoteRootValidationError(remoteRoot, err)
+	}
 	// Stat may fail when directory stat is unsupported or when a scoped token
 	// grants list without read. Fall back to List and classify its result as the
 	// authoritative non-root mount validation.
@@ -238,6 +242,22 @@ func validateRemoteRoot(ctx context.Context, c *client.Client, remoteRoot string
 		return remoteRootValidationError(remoteRoot, listErr)
 	}
 	return nil
+}
+
+func shouldFallbackRemoteRootList(err error) bool {
+	if client.IsForbidden(err) {
+		return true
+	}
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch statusErr.StatusCode {
+	case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+		return true
+	default:
+		return false
+	}
 }
 
 func remoteRootValidationError(remoteRoot string, err error) *MountExitError {

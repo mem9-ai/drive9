@@ -50,6 +50,89 @@ func TestValidateRemoteRootNonRootForbiddenFallsBackToList(t *testing.T) {
 	}
 }
 
+func TestValidateRemoteRootNonRootUnauthorizedDoesNotFallbackToList(t *testing.T) {
+	var statCalls atomic.Int32
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			statCalls.Add(1)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case http.MethodGet:
+			listCalls.Add(1)
+			_, _ = w.Write([]byte(`{"entries":[]}`))
+		default:
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	err := validateRemoteRoot(context.Background(), client.NewWithToken(ts.URL, "scoped"), "/team")
+	assertMountExit(t, err, ExitStartupPermanent, ExitReasonStartupPermanent)
+	if got := statCalls.Load(); got != 1 {
+		t.Fatalf("Stat calls = %d, want 1", got)
+	}
+	if got := listCalls.Load(); got != 0 {
+		t.Fatalf("List calls = %d, want 0 after Stat 401", got)
+	}
+}
+
+func TestValidateRemoteRootNonRootTransientStatDoesNotFallbackToList(t *testing.T) {
+	var statCalls atomic.Int32
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			statCalls.Add(1)
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		case http.MethodGet:
+			listCalls.Add(1)
+			_, _ = w.Write([]byte(`{"entries":[]}`))
+		default:
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	err := validateRemoteRoot(context.Background(), client.New(ts.URL, "owner"), "/team")
+	assertMountExit(t, err, ExitStartupTransient, ExitReasonStartupTransient)
+	if got := statCalls.Load(); got != 1 {
+		t.Fatalf("Stat calls = %d, want 1", got)
+	}
+	if got := listCalls.Load(); got != 0 {
+		t.Fatalf("List calls = %d, want 0 after transient Stat error", got)
+	}
+}
+
+func TestValidateRemoteRootNonRootUnsupportedStatFallsBackToList(t *testing.T) {
+	for _, status := range []int{
+		http.StatusBadRequest,
+		http.StatusMethodNotAllowed,
+		http.StatusNotImplemented,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var calls atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Method == http.MethodHead {
+					http.Error(w, http.StatusText(status), status)
+					return
+				}
+				_, _ = w.Write([]byte(`{"entries":[]}`))
+			}))
+			defer ts.Close()
+
+			err := validateRemoteRoot(context.Background(), client.New(ts.URL, "owner"), "/team")
+			if err != nil {
+				t.Fatalf("validateRemoteRoot: %v, want compatibility fallback", err)
+			}
+			if got := calls.Load(); got != 2 {
+				t.Fatalf("remote validation calls = %d, want HEAD plus List", got)
+			}
+		})
+	}
+}
+
 func TestValidateRemoteRootNonRootForbiddenListDeniedIsPermanent(t *testing.T) {
 	var calls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

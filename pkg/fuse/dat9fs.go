@@ -5182,7 +5182,7 @@ func (fs *Dat9FS) getAttrStatWithRetry(cancel <-chan struct{}, remotePath string
 	// Keep GetAttr retries out of lookupStatRetry* so that those counters retain
 	// a single meaning: Lookup path retry behavior.
 	stat, generation, err := fs.statWithTransientRetry(cancel, remotePath, false)
-	return stat, generation, fs.resetMountViewOnAuthorizationError(err)
+	return stat, generation, fs.resetMountViewOnUnauthorizedError(err)
 }
 
 func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
@@ -8603,6 +8603,10 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 						status = gofuse.Status(syscall.EAGAIN)
 						return status
 					}
+					if client.IsUnauthorized(listErr) {
+						status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(listErr))
+						return status
+					}
 					if listErr == nil && !fs.lockMountViewRead(listGeneration) {
 						status = gofuse.Status(syscall.EAGAIN)
 						return status
@@ -8650,6 +8654,10 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			status = gofuse.Status(syscall.EAGAIN)
 			return status
 		}
+		if client.IsUnauthorized(err) {
+			status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
+			return status
+		}
 		if err == nil && !fs.lockMountViewRead(listGeneration) {
 			status = gofuse.Status(syscall.EAGAIN)
 			return status
@@ -8680,6 +8688,10 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 						status = gofuse.Status(syscall.EAGAIN)
 						return status
 					}
+					if client.IsUnauthorized(err) {
+						status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
+						return status
+					}
 					if err == nil && !fs.lockMountViewRead(listGeneration) {
 						status = gofuse.Status(syscall.EAGAIN)
 						return status
@@ -8707,7 +8719,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	err := fs.deleteRemoteDirWithInterruptRecovery(ctx, childP)
 	fs.debugDurationf(deleteStart, 0, "rmdir remote delete done path=%s err=%v", childP, err)
 	if err != nil {
-		status = httpToFuseStatus(err)
+		status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
 		return status
 	}
 
