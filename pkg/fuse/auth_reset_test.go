@@ -22,13 +22,6 @@ func TestNamespaceAuthorizationErrorsResetMountView(t *testing.T) {
 		call func(*Dat9FS) error
 	}{
 		{
-			name: "stat",
-			call: func(fs *Dat9FS) error {
-				_, _, err := fs.getAttrStatWithRetry(nil, "/denied")
-				return err
-			},
-		},
-		{
 			name: "lookup list fallback",
 			call: func(fs *Dat9FS) error {
 				_, _, err := fs.lookupListWithRetry(nil, "/denied")
@@ -64,6 +57,56 @@ func TestNamespaceAuthorizationErrorsResetMountView(t *testing.T) {
 				assertMountViewCachesCleared(t, fs)
 			})
 		}
+	}
+}
+
+func TestGetAttrAuthorizationResetPolicy(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		wantReset bool
+	}{
+		{name: "unauthorized", status: http.StatusUnauthorized, wantReset: true},
+		{name: "list-only forbidden", status: http.StatusForbidden},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, http.StatusText(tt.status), tt.status)
+			}))
+			defer ts.Close()
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+			ino := fs.inodes.Lookup("/visible.txt", false, 5, time.Now())
+			seedMountViewCaches(fs)
+			generation := fs.mountViewGeneration.Load()
+
+			status := fs.GetAttr(nil, &gofuse.GetAttrIn{
+				InHeader: gofuse.InHeader{NodeId: ino},
+			}, &gofuse.AttrOut{})
+			if status != gofuse.EACCES {
+				t.Fatalf("GetAttr status = %v, want EACCES", status)
+			}
+			gotGeneration := fs.mountViewGeneration.Load()
+			if tt.wantReset {
+				if gotGeneration == generation {
+					t.Fatalf("mount-view generation = %d, want reset after 401", gotGeneration)
+				}
+				assertMountViewCachesCleared(t, fs)
+				return
+			}
+			if gotGeneration != generation {
+				t.Fatalf("mount-view generation = %d, want unchanged %d after 403", gotGeneration, generation)
+			}
+			if _, ok := fs.readCache.Get("/stale.txt", 1); !ok {
+				t.Fatal("read cache was cleared by GetAttr 403")
+			}
+			if _, ok := fs.dirCache.Get("/stale"); !ok {
+				t.Fatal("directory cache was cleared by GetAttr 403")
+			}
+		})
 	}
 }
 
@@ -727,6 +770,65 @@ func TestRmdirRejectsRemoteChildCheckWhenMountViewResetsInFlight(t *testing.T) {
 	}
 	if got := deleteCalls.Load(); got != 0 {
 		t.Fatalf("remote delete calls = %d, want 0", got)
+	}
+}
+
+func TestRmdirUnauthorizedErrorsResetMountView(t *testing.T) {
+	tests := []struct {
+		name            string
+		unauthorizedOn  string
+		wantDeleteCalls int32
+	}{
+		{name: "child list", unauthorizedOn: "list"},
+		{name: "delete", unauthorizedOn: "delete", wantDeleteCalls: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var listCalls atomic.Int32
+			var deleteCalls atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					listCalls.Add(1)
+					if tt.unauthorizedOn == "list" {
+						http.Error(w, "unauthorized", http.StatusUnauthorized)
+						return
+					}
+					_, _ = w.Write([]byte(`{"entries":[]}`))
+				case http.MethodDelete:
+					deleteCalls.Add(1)
+					if tt.unauthorizedOn == "delete" {
+						http.Error(w, "unauthorized", http.StatusUnauthorized)
+						return
+					}
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+				}
+			}))
+			defer ts.Close()
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+			seedMountViewCaches(fs)
+			generation := fs.mountViewGeneration.Load()
+
+			status := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+			if status != gofuse.EACCES {
+				t.Fatalf("Rmdir status = %v, want EACCES", status)
+			}
+			if got := listCalls.Load(); got != 1 {
+				t.Fatalf("List calls = %d, want 1", got)
+			}
+			if got := deleteCalls.Load(); got != tt.wantDeleteCalls {
+				t.Fatalf("Delete calls = %d, want %d", got, tt.wantDeleteCalls)
+			}
+			if got := fs.mountViewGeneration.Load(); got == generation {
+				t.Fatalf("mount-view generation = %d, want reset after Rmdir 401", got)
+			}
+			assertMountViewCachesCleared(t, fs)
+		})
 	}
 }
 
