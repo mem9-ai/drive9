@@ -32,6 +32,39 @@ func TestParseTokenAllowRejectsSearchWithoutRead(t *testing.T) {
 	}
 }
 
+func TestParseTokenOpsPseudorootDirective(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr string
+	}{
+		{name: "directive only", raw: "pseudoroot", want: "pseudoroot"},
+		{name: "canonical order", raw: "write,pseudoroot,list,read", want: "pseudoroot,read,list,write"},
+		{name: "duplicate directive", raw: "pseudoroot,pseudoroot", want: "pseudoroot"},
+		{name: "search still requires read", raw: "pseudoroot,search", wantErr: "search op requires read"},
+		{name: "legacy traverse rejected", raw: "traverse", wantErr: `unknown op "traverse"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ops, err := parseTokenOps(tt.raw)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseTokenOps(%q) error = %v, want containing %q", tt.raw, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseTokenOps(%q): %v", tt.raw, err)
+			}
+			if got := strings.Join(ops, ","); got != tt.want {
+				t.Fatalf("parseTokenOps(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestTokenIssueSendsScopedTokenRequest(t *testing.T) {
 	resetCredentialCacheForTest()
 	t.Cleanup(resetCredentialCacheForTest)
@@ -48,7 +81,7 @@ func TestTokenIssueSendsScopedTokenRequest(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"token":"dat9_scoped","token_id":"key_123","subject":"vm0-chat","scope_kind":"fs_scoped","expires_at":"2026-05-21T00:00:00Z","scopes":[{"prefix":"/scratch/run-123","ops":["read","list","write"]}]}`))
+		_, _ = w.Write([]byte(`{"token":"dat9_scoped","token_id":"key_123","subject":"vm0-chat","scope_kind":"fs_scoped","expires_at":"2026-05-21T00:00:00Z","scopes":[{"prefix":"/","ops":["pseudoroot"]},{"prefix":"/scratch/run-123","ops":["read","list","write"]}]}`))
 	}))
 	defer srv.Close()
 
@@ -57,7 +90,7 @@ func TestTokenIssueSendsScopedTokenRequest(t *testing.T) {
 	t.Setenv(EnvAPIKey, "owner-key")
 
 	out := captureStdout(t, func() {
-		if err := TokenIssue([]string{"vm0-chat", "--ttl", "24h", "--allow", ":/scratch/run-123/:write,read,list"}); err != nil {
+		if err := TokenIssue([]string{"vm0-chat", "--ttl", "24h", "--allow", "/:pseudoroot", "--allow", ":/scratch/run-123/:write,read,list"}); err != nil {
 			t.Fatalf("TokenIssue: %v", err)
 		}
 	})
@@ -71,16 +104,46 @@ func TestTokenIssueSendsScopedTokenRequest(t *testing.T) {
 		t.Fatalf("request body = %#v", gotBody)
 	}
 	scopes, _ := gotBody["scopes"].([]any)
-	if len(scopes) != 1 {
+	if len(scopes) != 2 {
 		t.Fatalf("scopes = %#v", gotBody["scopes"])
 	}
-	if !strings.Contains(out, "name=vm0-chat") || !strings.Contains(out, "token=dat9_scoped") || strings.Contains(out, "token_id=") || !strings.Contains(out, "scope=/scratch/run-123:read,list,write") {
+	rootScope, _ := scopes[0].(map[string]any)
+	rootOps, _ := rootScope["ops"].([]any)
+	if rootScope["prefix"] != "/" || len(rootOps) != 1 || rootOps[0] != "pseudoroot" {
+		t.Fatalf("root scope = %#v, want /:pseudoroot", rootScope)
+	}
+	if !strings.Contains(out, "name=vm0-chat") || !strings.Contains(out, "token=dat9_scoped") || strings.Contains(out, "token_id=") || !strings.Contains(out, "scope=/:pseudoroot") || !strings.Contains(out, "scope=/scratch/run-123:read,list,write") {
 		t.Fatalf("output = %q", out)
 	}
 	cfg := loadConfig()
 	ctx := cfg.Contexts["vm0-chat"]
-	if ctx == nil || ctx.Type != PrincipalFSScoped || ctx.APIKey != "dat9_scoped" || len(ctx.Scope) != 1 || ctx.Scope[0] != "/scratch/run-123:read,list,write" {
+	if ctx == nil || ctx.Type != PrincipalFSScoped || ctx.APIKey != "dat9_scoped" || len(ctx.Scope) != 2 || ctx.Scope[0] != "/:pseudoroot" || ctx.Scope[1] != "/scratch/run-123:read,list,write" {
 		t.Fatalf("saved context = %+v", ctx)
+	}
+}
+
+func TestTokenIssuePseudorootUnsupportedServerDoesNotDowngrade(t *testing.T) {
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"unknown fs scope op pseudoroot"}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(EnvServer, srv.URL)
+	t.Setenv(EnvAPIKey, "owner-key")
+
+	err := TokenIssue([]string{"--ttl", "1h", "--allow", "/:pseudoroot"})
+	if err == nil || !strings.Contains(err.Error(), "pseudoroot") {
+		t.Fatalf("TokenIssue error = %v, want server pseudoroot rejection", err)
+	}
+	if requests != 1 {
+		t.Fatalf("issue requests = %d, want 1 without list downgrade", requests)
 	}
 }
 

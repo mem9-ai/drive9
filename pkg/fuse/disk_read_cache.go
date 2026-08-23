@@ -80,6 +80,11 @@ type diskReadCachePending struct {
 	seq  uint64
 }
 
+type detachedDiskReadCacheEntry struct {
+	digest string
+	path   string
+}
+
 type DiskReadCache struct {
 	mu        sync.Mutex
 	ctx       context.Context
@@ -294,16 +299,37 @@ func (c *DiskReadCache) InvalidatePathPrefix(prefix string) {
 }
 
 func (c *DiskReadCache) InvalidateAll() {
+	c.removeDetached(c.detachAll())
+}
+
+func (c *DiskReadCache) detachAll() []detachedDiskReadCacheEntry {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	detached := make([]detachedDiskReadCacheEntry, 0, len(c.items))
+	for digest, entry := range c.items {
+		detached = append(detached, detachedDiskReadCacheEntry{digest: digest, path: entry.path})
+	}
+	c.items = make(map[string]*diskReadCacheEntry)
+	c.pending = make(map[string]diskReadCachePending)
+	c.order.Init()
+	c.size = 0
+	c.mu.Unlock()
+	return detached
+}
+
+func (c *DiskReadCache) removeDetached(detached []detachedDiskReadCacheEntry) {
 	if c == nil {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for digest, entry := range c.items {
-		c.removeEntryLocked(digest, entry)
-	}
-	for digest := range c.pending {
-		delete(c.pending, digest)
+	for _, entry := range detached {
+		c.mu.Lock()
+		_, replaced := c.items[entry.digest]
+		if !replaced {
+			_ = os.Remove(entry.path)
+		}
+		c.mu.Unlock()
 	}
 }
 

@@ -150,6 +150,7 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 		return nil, false
 	}
 	block, ok := p.cache[offset]
+	ctx := p.ctx
 	p.mu.Unlock()
 
 	if !ok {
@@ -161,7 +162,7 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	waitStart := time.Now()
 	select {
 	case <-block.ready:
-	case <-p.ctx.Done():
+	case <-ctx.Done():
 		p.debugf("wait canceled path=%s offset=%d size=%d wait=%s", p.pathString(), offset, size, time.Since(waitStart))
 		return nil, false
 	}
@@ -204,6 +205,29 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 
 	p.debugf("hit path=%s offset=%d req=%d got=%d wait=%s", p.pathString(), offset, size, len(data), wait)
 	return data, true
+}
+
+// Invalidate discards buffered data and read targets without closing the
+// prefetcher. Existing fetches are canceled and drain their inflight markers;
+// subsequent reads can start fresh fetches on the replacement context.
+func (p *Prefetcher) Invalidate() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return
+	}
+	p.cancel()
+	p.ctx, p.cancel = context.WithCancel(context.Background())
+	p.nextExpect = 0
+	p.window = prefetchMinWindow
+	p.readSize = 0
+	p.target = nil
+	for offset := range p.cache {
+		delete(p.cache, offset)
+	}
 }
 
 // OnRead should be called after each Read() to trigger prefetching.

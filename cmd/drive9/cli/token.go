@@ -14,6 +14,8 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
 
+const tokenScopeDirectivePseudoroot = "pseudoroot"
+
 // Token manages workspace-zone scoped filesystem tokens.
 //
 // Per task #11 / Plan B consensus (#drive9:f2a8e33e):
@@ -73,10 +75,14 @@ issue flags:
   --subject <name>    optional server-side audit label; not a revoke key
   --ttl <duration>    required positive duration, e.g. 1h, 24h
   --allow <prefix:ops>
-                       repeatable; ops are comma-separated read,list,search,write,delete
+                       repeatable; terms are pseudoroot or comma-separated
+                       read,list,search,write,delete operations
   --json              print full JSON response
   --print             print only the bearer token
   --token-only        alias for --print
+
+Projected root example:
+  drive9 token issue --ttl 1h --allow /:pseudoroot --allow /project:read,list
 
 To list local contexts (including fs_scoped tokens):
   drive9 ctx list                     all local contexts
@@ -434,7 +440,7 @@ func parseTokenOps(raw string) ([]string, error) {
 			return nil, fmt.Errorf("empty op")
 		}
 		switch op {
-		case "read", "list", "search", "write", "delete":
+		case tokenScopeDirectivePseudoroot, "read", "list", "search", "write", "delete":
 			seen[op] = true
 		default:
 			return nil, fmt.Errorf("unknown op %q", op)
@@ -447,7 +453,7 @@ func parseTokenOps(raw string) ([]string, error) {
 		return nil, fmt.Errorf("search op requires read")
 	}
 	out := make([]string, 0, len(seen))
-	for _, op := range []string{"read", "list", "search", "write", "delete"} {
+	for _, op := range []string{tokenScopeDirectivePseudoroot, "read", "list", "search", "write", "delete"} {
 		if seen[op] {
 			out = append(out, op)
 		}

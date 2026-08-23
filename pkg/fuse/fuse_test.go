@@ -3395,6 +3395,26 @@ func TestDiskReadCacheAsyncPutInvalidatedBeforeCommitDoesNotReappear(t *testing.
 	}
 }
 
+func TestDiskReadCacheDetachedRemovalPreservesReplacement(t *testing.T) {
+	cache := newTestDiskReadCache(t, 1<<20)
+	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}
+	cache.PutOwned(key, []byte("stale"))
+
+	detached := cache.detachAll()
+	if len(detached) != 1 {
+		t.Fatalf("detached entries = %d, want 1", len(detached))
+	}
+	if data, ok := cache.Get(key); ok {
+		t.Fatalf("detached cache entry remained visible: %q", data)
+	}
+	cache.PutOwned(key, []byte("fresh"))
+	cache.removeDetached(detached)
+
+	if data, ok := cache.Get(key); !ok || string(data) != "fresh" {
+		t.Fatalf("replacement cache entry = %q, %v; want fresh hit", data, ok)
+	}
+}
+
 func TestDiskReadCacheRevisionMismatchMisses(t *testing.T) {
 	cache := newTestDiskReadCache(t, 1<<20)
 	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}

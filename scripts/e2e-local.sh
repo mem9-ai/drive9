@@ -237,9 +237,13 @@ build_server() {
       echo "DRIVE9_SERVER_BIN is not executable: $SERVER_BIN" >&2
       exit 1
     fi
+    : "${DRIVE9_E2E_ALLOW_LEGACY_TOKEN_API:=0}"
+    export DRIVE9_E2E_ALLOW_LEGACY_TOKEN_API
     log "using DRIVE9_SERVER_BIN=$SERVER_BIN"
     return
   fi
+  : "${DRIVE9_E2E_ALLOW_LEGACY_TOKEN_API:=1}"
+  export DRIVE9_E2E_ALLOW_LEGACY_TOKEN_API
   if [ "$DO_BUILD" -eq 0 ] && [ -x "$SERVER_BIN" ]; then
     log "reusing existing $SERVER_BIN (--no-build)"
     return
