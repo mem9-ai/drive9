@@ -44,6 +44,7 @@ REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-8}"
 REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-2}"
 RUN_FOREGROUND_SMOKE="${RUN_FOREGROUND_SMOKE:-1}"
 RUN_ENSURE_SMOKE="${RUN_ENSURE_SMOKE:-1}"
+ALLOW_LEGACY_TOKEN_API="${DRIVE9_E2E_ALLOW_LEGACY_TOKEN_API:-0}"
 
 PASS=0
 FAIL=0
@@ -776,9 +777,9 @@ else
   echo "[10] SKIP foreground smoke (RUN_FOREGROUND_SMOKE=0)"
 fi
 
-# The CLI repo's local fallback server intentionally has no token-management
-# backend. Run this cross-repo contract only against an fs#83-compatible server;
-# keep unexpected probe failures fatal instead of silently skipping them.
+# Run this cross-repo contract only against an fs#83-compatible server. The CLI
+# repo's local fallback has a legacy token API where GET /v1/tokens returns 405;
+# only skip that response when the server launcher explicitly allows it.
 token_management_code="$(token_management_status)"
 if [[ "$token_management_code" == "200" ]]; then
 echo "[11] pseudoroot-scoped supervised mounts"
@@ -949,6 +950,10 @@ check_cmd "umount legacy root list" drive9 umount \
 check_cmd "legacy root list unmounted" wait_mount_state unmounted
 elif [[ "$token_management_code" == "404" ]]; then
 	echo "[11] SKIP pseudoroot mounts (token management unavailable; use compatible fs#83 server)"
+elif [[ "$token_management_code" == "405" &&
+	"$ALLOW_LEGACY_TOKEN_API" == "1" ]]; then
+	echo "[11] SKIP pseudoroot mounts (legacy local token API;" \
+		"use compatible fs#83 server)"
 else
 	check_eq "token management probe" "$token_management_code" "200 or 404"
 	exit 1

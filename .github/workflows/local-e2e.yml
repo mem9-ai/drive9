@@ -258,9 +258,11 @@ jobs:
               echo "DRIVE9_SERVER_BIN is not executable: $DRIVE9_SERVER_BIN" >&2
               exit 1
             fi
+            echo "DRIVE9_E2E_ALLOW_LEGACY_TOKEN_API=0" >> "$GITHUB_ENV"
             echo "starting pre-built server $DRIVE9_SERVER_BIN"
             nohup "$DRIVE9_SERVER_BIN" > /tmp/drive9-server.log 2>&1 &
           else
+            echo "DRIVE9_E2E_ALLOW_LEGACY_TOKEN_API=1" >> "$GITHUB_ENV"
             nohup make run-server-local > /tmp/drive9-server.log 2>&1 &
           fi
           echo $! > /tmp/drive9-server.pid
