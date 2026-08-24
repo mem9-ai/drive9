@@ -9,4 +9,5 @@ type Options struct {
 	Debug      bool
 	AllowOther bool
 	Supervised bool
+	Session    SessionCredentials
 }

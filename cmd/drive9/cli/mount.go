@@ -126,6 +126,11 @@ func fsMountCmd(args []string) error {
 }
 
 func fsMountCmdWithBackground(args []string, background bool) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
@@ -277,7 +282,6 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		return mountObjectStore(objectLoc, mountPoint, *cacheDir, *readOnly, *debug, *supervised, *allowOther)
 	}
 
-	var err error
 	remoteRoot, err = mountpath.NormalizeRoot(remoteRoot)
 	if err != nil {
 		return fmt.Errorf("drive9 mount: %w", err)

@@ -35,7 +35,7 @@ func TestConnectionString(t *testing.T) {
 		{"az://c/k?account=devstoreaccount1&endpoint=http://127.0.0.1:10000/devstoreaccount1", `:azureblob,env_auth=true,account=devstoreaccount1,endpoint="http://127.0.0.1:10000/devstoreaccount1":c/k`},
 	}
 	for _, tt := range tests {
-		got, err := connectionString(must(tt.in))
+		got, err := connectionString(must(tt.in), SessionCredentials{})
 		if err != nil {
 			t.Errorf("connectionString(%q) err=%v", tt.in, err)
 			continue
@@ -46,19 +46,40 @@ func TestConnectionString(t *testing.T) {
 	}
 }
 
+func TestConnectionStringSessionUsesExplicitKeys(t *testing.T) {
+	loc, err := Parse("s3://bucket/k?region=us-east-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := connectionString(loc, SessionCredentials{
+		AccessKeyID:     "AKIATEST",
+		SecretAccessKey: "secret",
+		SessionToken:    "token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "env_auth=false") || !strings.Contains(got, "access_key_id=AKIATEST") || !strings.Contains(got, "session_token=token") {
+		t.Fatalf("got %q, want explicit session keys", got)
+	}
+	if strings.Contains(got, "env_auth=true") {
+		t.Fatalf("session creds must not keep env_auth=true: %q", got)
+	}
+}
+
 func TestConnectionStringTOSRequiresRegion(t *testing.T) {
 	loc, err := Parse("tos://b/k")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = connectionString(loc)
+	_, err = connectionString(loc, SessionCredentials{})
 	if err == nil || !strings.Contains(err.Error(), "region required") {
 		t.Fatalf("err=%v, want region required", err)
 	}
 }
 
 func TestConnectionStringEmptyBucket(t *testing.T) {
-	_, err := connectionString(Location{Raw: "s3://", Scheme: SchemeS3})
+	_, err := connectionString(Location{Raw: "s3://", Scheme: SchemeS3}, SessionCredentials{})
 	if err == nil || !strings.Contains(err.Error(), "empty bucket") {
 		t.Fatalf("err=%v, want empty bucket", err)
 	}

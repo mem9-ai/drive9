@@ -505,6 +505,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/layers", business)
 	mux.Handle("/v1/layers/", business)
 	mux.Handle("/v1/layer-checkpoints/", business)
+	mux.Handle("/v1/object-credentials", business)
 	// Vault management API goes through tenant auth.
 	mux.Handle("/v1/vault/secrets", business)
 	mux.Handle("/v1/vault/secrets/", business)
@@ -532,6 +533,8 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/admin/tenant-pool", s.adminTenantPoolHandler())
 	mux.Handle("/v1/admin/tenants", s.adminTenantsRootHandler())
 	mux.Handle("/v1/admin/tenants/", s.adminTenantsItemHandler())
+	mux.Handle("/v1/admin/object-backends", s.adminObjectBackendsHandler())
+	mux.Handle("/v1/admin/object-backends/", s.adminObjectBackendsHandler())
 	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
@@ -1565,6 +1568,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleGitWorkspaces(w, r)
 	case r.URL.Path == "/v1/layers" || strings.HasPrefix(r.URL.Path, "/v1/layers/") || strings.HasPrefix(r.URL.Path, "/v1/layer-checkpoints/"):
 		s.handleFSLayers(w, r)
+	case r.URL.Path == "/v1/object-credentials":
+		s.handleObjectCredentials(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
@@ -1617,6 +1622,9 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 
 	// Batch FS endpoints (always POST). Handlers do per-path AuthorizeFS internally.
 	if path == "/v1/fs:batch-stat" || path == "/v1/fs:batch-read-small" || path == "/v1/fs:batch-write" {
+		return r.Method == http.MethodPost
+	}
+	if path == "/v1/object-credentials" {
 		return r.Method == http.MethodPost
 	}
 

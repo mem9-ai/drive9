@@ -74,6 +74,10 @@ func StreamCopy(ctx context.Context, srcB, dstB Backend, src, dst Location, srcI
 			return err
 		}
 	}
+	if size >= 0 && copied != size {
+		err = fmt.Errorf("read %s: short copy: got %d bytes, want %d", src.Raw, copied, size)
+		return err
+	}
 	if err = wh.Close(); err != nil {
 		return fmt.Errorf("close %s: %w", dst.Raw, err)
 	}

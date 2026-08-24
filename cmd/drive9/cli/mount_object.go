@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -17,7 +18,7 @@ func mountObjectStoreImpl(loc *Location, mountPoint, cacheDir string, readOnly, 
 	}
 	fmt.Fprintf(os.Stderr, "drive9: object mount %s (prefix emulation; %s; no chmod/chown; listing is billed)\n", loc.Raw, kind)
 
-	return objectfs.Mount(objectfs.Options{
+	opts := objectfs.Options{
 		MountPoint: mountPoint,
 		Location:   toObjectLocation(*loc),
 		CacheDir:   cacheDir,
@@ -25,17 +26,43 @@ func mountObjectStoreImpl(loc *Location, mountPoint, cacheDir string, readOnly, 
 		Debug:      debug || os.Getenv("DRIVE9_OBJECTFS_DEBUG") == "1",
 		AllowOther: allowOther,
 		Supervised: supervised,
-	})
+	}
+	if !objectAuthLocal {
+		c := NewFromEnv()
+		minted, err := c.MintObjectCredentials(context.Background(), loc.Raw, !readOnly)
+		if err != nil {
+			return err
+		}
+		if loc.Query == nil {
+			loc.Query = map[string]string{}
+		}
+		applyMintedQuery(loc.Query, minted)
+		opts.Location = toObjectLocation(*loc)
+		opts.Session = objectfs.SessionCredentials{
+			AccessKeyID:     minted.AccessKeyID,
+			SecretAccessKey: minted.SecretAccessKey,
+			SessionToken:    minted.SessionToken,
+		}
+	}
+	return objectfs.Mount(opts)
 }
 
 func validateObjectMount(goos, mode, layerRef, checkpointRef, profile string) error {
 	if goos == "windows" {
 		return fmt.Errorf("drive9 mount: object-store sources are not supported on Windows")
 	}
-	if strings.EqualFold(mode, "webdav") {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = string(MountModeAuto)
+	}
+	parsed, err := ParseMountMode(mode)
+	if err != nil {
+		return fmt.Errorf("drive9 mount: %w", err)
+	}
+	if parsed == MountModeWebDAV {
 		return fmt.Errorf("drive9 mount: object-store sources do not support --mode=webdav")
 	}
-	if goos == "darwin" && (mode == "" || mode == "auto") {
+	if goos == "darwin" && parsed == MountModeAuto {
 		return fmt.Errorf("drive9 mount: object-store sources on darwin require --mode=fuse (macFUSE or FUSE-T)")
 	}
 	if strings.TrimSpace(layerRef) != "" || strings.TrimSpace(checkpointRef) != "" {

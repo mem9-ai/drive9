@@ -10,6 +10,11 @@ import (
 )
 
 func Grep(c *client.Client, args []string) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	layerRef, jsonMode, args, err := parseGrepFlags(args)
 	if err != nil {
 		return err

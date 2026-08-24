@@ -10,6 +10,11 @@ import (
 
 // Chmod updates the permission bits of a remote file.
 func Chmod(c *client.Client, args []string) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	layerRef, args, err := parseLayerFlag(args)
 	if err != nil {
 		return err

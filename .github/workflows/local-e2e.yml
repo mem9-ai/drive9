@@ -292,8 +292,10 @@ jobs:
       - name: Run object-store smoke
         id: object-store-smoke
         continue-on-error: true
+        timeout-minutes: 20
         env:
           OBJECT_STRICT_MOUNT: "1"
+          OBJECT_STRICT_CROSS: "1"
         run: bash e2e/object-store-smoke-test.sh
 
       - name: Run layer FS smoke

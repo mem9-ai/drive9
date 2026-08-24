@@ -126,15 +126,20 @@ func TestRel(t *testing.T) {
 }
 
 func TestResolveObjectCacheDir(t *testing.T) {
-	got := resolveObjectCacheDir("/tmp/obj-cache")
-	if got != "/tmp/obj-cache" && !filepath.IsAbs(got) {
+	got := resolveObjectCacheDir("/tmp/obj-cache", "s3://bucket/prefix/")
+	if !filepath.IsAbs(got) || !strings.HasPrefix(got, "/tmp/obj-cache"+string(filepath.Separator)) {
 		t.Fatalf("got %q", got)
 	}
-	if !filepath.IsAbs(resolveObjectCacheDir("")) {
+	def := resolveObjectCacheDir("", "s3://bucket/prefix/")
+	if !filepath.IsAbs(def) {
 		t.Fatal("default cache dir should be absolute")
 	}
-	if !strings.HasSuffix(resolveObjectCacheDir(""), filepath.Join(".cache", "drive9", "object")) {
-		t.Fatalf("default = %q, want ~/.cache/drive9/object", resolveObjectCacheDir(""))
+	if !strings.Contains(def, filepath.Join(".cache", "drive9", "object")) {
+		t.Fatalf("default = %q, want under ~/.cache/drive9/object", def)
+	}
+	other := resolveObjectCacheDir("", "s3://other/prefix/")
+	if def == other {
+		t.Fatal("different URIs must not share a cache directory")
 	}
 }
 

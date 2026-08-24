@@ -37,11 +37,22 @@ func ensureRclone() {
 	})
 }
 
+// SessionCredentials are short-lived STS keys minted by drive9-server.
+type SessionCredentials struct {
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string
+}
+
 // OpenFs creates an rclone Fs rooted at loc.Bucket/loc.Path (the mount prefix).
 // If loc points at a single object, err may be nil and fileLeaf is set.
 func OpenFs(ctx context.Context, loc Location) (f fs.Fs, fileLeaf string, err error) {
+	return OpenFsWithSession(ctx, loc, SessionCredentials{})
+}
+
+func OpenFsWithSession(ctx context.Context, loc Location, sess SessionCredentials) (f fs.Fs, fileLeaf string, err error) {
 	ensureRclone()
-	spec, err := connectionString(loc)
+	spec, err := connectionString(loc, sess)
 	if err != nil {
 		return nil, "", err
 	}
@@ -60,7 +71,15 @@ func OpenFsBucket(ctx context.Context, loc Location) (fs.Fs, error) {
 	root := loc
 	root.Path = ""
 	root.DirHint = true
-	f, _, err := OpenFs(ctx, root)
+	f, _, err := OpenFsWithSession(ctx, root, SessionCredentials{})
+	return f, err
+}
+
+func OpenFsBucketWithSession(ctx context.Context, loc Location, sess SessionCredentials) (fs.Fs, error) {
+	root := loc
+	root.Path = ""
+	root.DirHint = true
+	f, _, err := OpenFsWithSession(ctx, root, sess)
 	return f, err
 }
 
@@ -72,21 +91,21 @@ func objectRoot(loc Location) string {
 	return root
 }
 
-func connectionString(loc Location) (string, error) {
+func connectionString(loc Location, sess SessionCredentials) (string, error) {
 	if loc.Bucket == "" {
 		return "", fmt.Errorf("objectfs: empty bucket in %s", loc.Raw)
 	}
 	switch CanonicalScheme(loc.Scheme) {
 	case SchemeGS:
-		return gcsConnectionString(loc)
+		return gcsConnectionString(loc, sess)
 	case SchemeAZ:
-		return azureConnectionString(loc)
+		return azureConnectionString(loc, sess)
 	default:
-		return s3ConnectionString(loc)
+		return s3ConnectionString(loc, sess)
 	}
 }
 
-func gcsConnectionString(loc Location) (string, error) {
+func gcsConnectionString(loc Location, sess SessionCredentials) (string, error) {
 	params := []string{"env_auth=true"}
 	if ep := loc.Query[QueryEndpoint]; ep != "" {
 		params = append(params, "endpoint="+quote(ep))
@@ -94,7 +113,7 @@ func gcsConnectionString(loc Location) (string, error) {
 	return ":gcs," + strings.Join(params, ",") + ":" + objectRoot(loc), nil
 }
 
-func azureConnectionString(loc Location) (string, error) {
+func azureConnectionString(loc Location, sess SessionCredentials) (string, error) {
 	params := []string{"env_auth=true"}
 	if acct := loc.Query[QueryAccount]; acct != "" {
 		params = append(params, "account="+quote(acct))
@@ -105,7 +124,7 @@ func azureConnectionString(loc Location) (string, error) {
 	return ":azureblob," + strings.Join(params, ",") + ":" + objectRoot(loc), nil
 }
 
-func s3ConnectionString(loc Location) (string, error) {
+func s3ConnectionString(loc Location, sess SessionCredentials) (string, error) {
 	provider := "AWS"
 	switch loc.Scheme {
 	case SchemeCOS:
@@ -130,8 +149,14 @@ func s3ConnectionString(loc Location) (string, error) {
 
 	params := []string{
 		"provider=" + provider,
-		"env_auth=true",
-		"directory_markers=true",
+	}
+	if sess.AccessKeyID != "" {
+		params = append(params, "env_auth=false", "directory_markers=true", "access_key_id="+quote(sess.AccessKeyID), "secret_access_key="+quote(sess.SecretAccessKey))
+		if sess.SessionToken != "" {
+			params = append(params, "session_token="+quote(sess.SessionToken))
+		}
+	} else {
+		params = append(params, "env_auth=true", "directory_markers=true")
 	}
 	region := loc.Query[QueryRegion]
 	if region != "" {

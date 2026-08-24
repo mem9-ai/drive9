@@ -13,6 +13,11 @@ import (
 //	drive9 fs rm -r /path/to/dir/
 //	drive9 fs rm --recursive :/path/to/dir/
 func Rm(c *client.Client, args []string) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	layerRef, args, err := parseLayerFlag(args)
 	if err != nil {
 		return err

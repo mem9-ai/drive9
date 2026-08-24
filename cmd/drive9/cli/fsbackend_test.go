@@ -13,8 +13,28 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
-func TestLsDoesNotSendRawS3ToClient(t *testing.T) {
+func TestPeelObjectAuth(t *testing.T) {
+	local, rest, err := peelObjectAuth([]string{"--auth=local", "s3://b/k"})
+	if err != nil || !local || strings.Join(rest, " ") != "s3://b/k" {
+		t.Fatalf("local=%v rest=%v err=%v", local, rest, err)
+	}
+	local, rest, err = peelObjectAuth([]string{"--auth", "server", "s3://b/k"})
+	if err != nil || local || strings.Join(rest, " ") != "s3://b/k" {
+		t.Fatalf("server local=%v rest=%v err=%v", local, rest, err)
+	}
+	if _, _, err := peelObjectAuth([]string{"--auth", "env"}); err == nil {
+		t.Fatal("expected invalid --auth")
+	}
+}
+
+func TestLsObjectURIMintsViaServerByDefault(t *testing.T) {
+	var sawMint bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/object-credentials" {
+			sawMint = true
+			http.Error(w, `{"error":"object namespace is not configured"}`, http.StatusForbidden)
+			return
+		}
 		if strings.Contains(r.URL.Path, "s3:") {
 			t.Errorf("client saw object URI path %s", r.URL.Path)
 		}
@@ -24,10 +44,32 @@ func TestLsDoesNotSendRawS3ToClient(t *testing.T) {
 	c := client.New(srv.URL, "k")
 	err := Ls(c, []string{"s3://bucket/key"})
 	if err == nil {
-		t.Fatal("expected error")
+		t.Fatal("expected mint error")
 	}
-	if strings.Contains(err.Error(), srv.URL) {
-		t.Fatalf("Ls hit drive9 client: %v", err)
+	if !sawMint {
+		t.Fatal("default object URI must mint via /v1/object-credentials")
+	}
+	if !strings.Contains(err.Error(), "object namespace") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestLsDoesNotSendRawS3ToClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "s3:") {
+			t.Errorf("client saw object URI path %s", r.URL.Path)
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, "k")
+	defer withObjectAuthLocal(true)()
+	h, err := fsHandleForArg(c, "s3://bucket/key")
+	if err != nil && strings.Contains(err.Error(), srv.URL) {
+		t.Fatalf("object open hit drive9 client: %v", err)
+	}
+	if err == nil && h.Client != nil {
+		t.Fatal("object handle must not carry a drive9 client")
 	}
 }
 
@@ -78,6 +120,7 @@ func TestFsClientForRemoteArgObjectNeverOKFalse(t *testing.T) {
 
 func TestFsHandleForArgObjectDoesNotUseClient(t *testing.T) {
 	c := client.New("http://127.0.0.1:1", "k")
+	defer withObjectAuthLocal(true)()
 	h, err := fsHandleForArg(c, "s3://bucket/k")
 	if err != nil {
 		if strings.Contains(err.Error(), c.BaseURL()) {

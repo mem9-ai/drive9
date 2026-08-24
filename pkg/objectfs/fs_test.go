@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "github.com/rclone/rclone/backend/local"
@@ -85,6 +86,35 @@ func TestAdapterRoundTrip(t *testing.T) {
 		t.Fatal("renamed source still present")
 	}
 	if err := a.Remove(ctx, Location{Path: "dir/moved.txt"}, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAdapterOpenWriteRejectsExistingWithoutOverwrite(t *testing.T) {
+	a, _ := testAdapter(t)
+	ctx := context.Background()
+	loc := Location{Path: "exists.txt", Raw: "s3://bucket/exists.txt"}
+	wh, err := a.OpenWrite(ctx, loc, WriteOpts{Size: 3, Overwrite: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wh.Write([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wh.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.OpenWrite(ctx, loc, WriteOpts{Size: 3}); err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("err=%v, want --force overwrite error", err)
+	}
+	wh, err = a.OpenWrite(ctx, loc, WriteOpts{Size: 3, Overwrite: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wh.Write([]byte("xyz")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wh.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -253,6 +283,22 @@ func TestAdapterListFile(t *testing.T) {
 	}
 	if len(page.Entries) != 1 || page.Entries[0].Name != "listed.txt" || page.Entries[0].IsDir {
 		t.Fatalf("list file = %+v", page.Entries)
+	}
+}
+
+func TestIdentityIncludesProvider(t *testing.T) {
+	a := &FS{loc: Location{
+		Scheme: SchemeS3,
+		Bucket: "b",
+		Query:  map[string]string{QueryProvider: "aws"},
+	}}
+	b := &FS{loc: Location{
+		Scheme: SchemeS3,
+		Bucket: "b",
+		Query:  map[string]string{QueryProvider: "aliyun"},
+	}}
+	if a.Identity() == b.Identity() {
+		t.Fatal("different providers must not share identity")
 	}
 }
 

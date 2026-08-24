@@ -10,6 +10,11 @@ import (
 )
 
 func Find(c *client.Client, args []string) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	path := "/"
 	params := url.Values{}
 	layerRef := ""

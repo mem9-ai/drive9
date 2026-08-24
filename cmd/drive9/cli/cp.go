@@ -36,9 +36,15 @@ const recursiveCopyConcurrency = 16
 //	drive9 fs cp :/remote/path -                  download to stdout
 //	drive9 fs cp --append tail.log :/remote/path  append local data to remote file
 func Cp(c *client.Client, args []string) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	resume := false
 	appendMode := false
 	recursive := false
+	force := false
 	layerRef := ""
 	var tags map[string]string
 	var description string
@@ -52,6 +58,8 @@ func Cp(c *client.Client, args []string) error {
 			appendMode = true
 		case a == "-r" || a == "--recursive":
 			recursive = true
+		case a == "-f" || a == "--force":
+			force = true
 		case a == "--layer":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--layer requires argument")
@@ -93,7 +101,7 @@ func Cp(c *client.Client, args []string) error {
 	}
 
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs cp [-r|--recursive] [--resume] [--append] [--tag key=value]... [--description <text>] <src> <dst>")
+		return fmt.Errorf("usage: drive9 fs cp [-r|--recursive] [-f|--force] [--auth=local|server] [--resume] [--append] [--tag key=value]... [--description <text>] <src> <dst>")
 	}
 	if resume && appendMode {
 		return fmt.Errorf("--resume and --append cannot be used together")
@@ -156,7 +164,7 @@ func Cp(c *client.Client, args []string) error {
 		if dstLoc.Kind != KindDrive9 && (len(tags) > 0 || description != "") {
 			return fmt.Errorf("--tag/--description are only supported for uploads to drive9")
 		}
-		return cpViaBackend(context.Background(), c, srcLoc, dstLoc, recursive, tags, description)
+		return cpViaBackend(context.Background(), c, srcLoc, dstLoc, recursive, force, tags, description)
 	}
 	// D14: cross-context drive9 copy streams through the laptop.
 	if srcLoc.Kind == KindDrive9 && dstLoc.Kind == KindDrive9 &&
@@ -170,7 +178,7 @@ func Cp(c *client.Client, args []string) error {
 		if resume {
 			return fmt.Errorf("--resume is not supported for cross-context copy")
 		}
-		return cpViaBackend(context.Background(), c, srcLoc, dstLoc, recursive, tags, description)
+		return cpViaBackend(context.Background(), c, srcLoc, dstLoc, recursive, force, tags, description)
 	}
 
 	if srcLoc.Scheme == SchemeFile && srcLoc.Local != "" {
@@ -540,7 +548,7 @@ func streamToStdout(ctx context.Context, c *client.Client, remotePath string) er
 	return err
 }
 
-func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Location, recursive bool, tags map[string]string, description string) error {
+func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Location, recursive bool, force bool, tags map[string]string, description string) error {
 	if src.Kind == KindStdin && dst.Kind == KindStdin {
 		return fmt.Errorf("cannot copy stdin to stdout via stream copy")
 	}
@@ -575,7 +583,7 @@ func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Lo
 	}
 
 	if recursive {
-		return cpTreeViaBackend(ctx, srcH, dstH)
+		return cpTreeViaBackend(ctx, srcH, dstH, force)
 	}
 
 	if src.Kind == KindStdin {
@@ -584,7 +592,7 @@ func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Lo
 		}
 		wh, err := dstH.Backend.OpenWrite(ctx, dstH.Loc, WriteOpts{
 			Size:        -1,
-			Overwrite:   true,
+			Overwrite:   objectCopyOverwrite(force, dstH.Loc),
 			Tags:        tags,
 			Description: description,
 		})
@@ -615,7 +623,7 @@ func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Lo
 		}
 	}
 	return Copy(ctx, srcH.Backend, dstH.Backend, srcH.Loc, finalDst, info, CopyOpts{
-		Overwrite:   true,
+		Overwrite:   objectCopyOverwrite(force, finalDst),
 		Tags:        tags,
 		Description: description,
 	})
@@ -664,7 +672,27 @@ func walkRoot(h fsHandle) string {
 	return h.Loc.Path
 }
 
-func cpTreeViaBackend(ctx context.Context, srcH, dstH fsHandle) error {
+func objectCopyOverwrite(force bool, dst Location) bool {
+	if dst.Kind == KindObject {
+		return force
+	}
+	return true
+}
+
+func safeCopyRel(rel string) error {
+	rel = strings.Trim(strings.TrimPrefix(rel, "/"), "/")
+	if rel == "" || rel == "." {
+		return nil
+	}
+	for _, part := range strings.Split(rel, "/") {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("refusing to copy unsafe relative path %q", rel)
+		}
+	}
+	return nil
+}
+
+func cpTreeViaBackend(ctx context.Context, srcH, dstH fsHandle, force bool) error {
 	st, err := srcH.Backend.Stat(ctx, srcH.Loc)
 	if err != nil {
 		return err
@@ -672,36 +700,58 @@ func cpTreeViaBackend(ctx context.Context, srcH, dstH fsHandle) error {
 	if !st.IsDir {
 		return fmt.Errorf("source %q is not a directory", srcH.Loc.Raw)
 	}
-	if dstSt, err := dstH.Backend.Stat(ctx, dstH.Loc); err == nil && !dstSt.IsDir {
-		return fmt.Errorf("destination %q is not a directory", dstH.Loc.Raw)
+	dstSt, destErr := dstH.Backend.Stat(ctx, dstH.Loc)
+	if destErr == nil {
+		if !dstSt.IsDir {
+			return fmt.Errorf("destination %q is not a directory", dstH.Loc.Raw)
+		}
+	} else if mkdirErr := dstH.Backend.Mkdir(ctx, dstH.Loc); mkdirErr != nil {
+		return mkdirErr
 	}
 	root := strings.TrimSuffix(walkRoot(srcH), string(filepath.Separator))
 	root = strings.TrimSuffix(root, "/")
-	return Walk(ctx, srcH.Backend, srcH.Loc, func(info FileInfo) error {
+	err = Walk(ctx, srcH.Backend, srcH.Loc, func(info FileInfo) error {
+		if info.HasMode && os.FileMode(info.Mode)&os.ModeSymlink != 0 {
+			return fmt.Errorf("cp -r: symlink %q is not supported", info.Path)
+		}
 		var rel string
 		if srcH.Loc.Kind == KindLocal {
-			rel, err = filepath.Rel(root, info.Path)
-			if err != nil {
-				return err
+			rel, relErr := filepath.Rel(root, info.Path)
+			if relErr != nil {
+				return relErr
 			}
 			rel = filepath.ToSlash(rel)
-		} else {
-			rel = strings.TrimPrefix(info.Path, root)
-			rel = strings.TrimPrefix(rel, "/")
+			if err := safeCopyRel(rel); err != nil {
+				return err
+			}
+			return copyTreeEntry(ctx, srcH, dstH, info, rel, force)
 		}
-		if rel == "" || rel == "." {
-			return nil
+		rel = strings.TrimPrefix(info.Path, root)
+		rel = strings.TrimPrefix(rel, "/")
+		if err := safeCopyRel(rel); err != nil {
+			return err
 		}
-		child := joinDest(dstH.Loc, rel)
-		child.DirHint = info.IsDir
-		if info.IsDir {
-			return dstH.Backend.Mkdir(ctx, child)
-		}
-		srcChild := srcH.Loc
-		srcChild.Path = info.Path
-		srcChild.DirHint = false
-		return Copy(ctx, srcH.Backend, dstH.Backend, srcChild, child, &info, CopyOpts{Overwrite: true})
+		return copyTreeEntry(ctx, srcH, dstH, info, rel, force)
 	})
+	if err != nil {
+		return fmt.Errorf("recursive copy stopped (%w); already-copied objects were left in place", err)
+	}
+	return nil
+}
+
+func copyTreeEntry(ctx context.Context, srcH, dstH fsHandle, info FileInfo, rel string, force bool) error {
+	if rel == "" || rel == "." {
+		return nil
+	}
+	child := joinDest(dstH.Loc, rel)
+	child.DirHint = info.IsDir
+	if info.IsDir {
+		return dstH.Backend.Mkdir(ctx, child)
+	}
+	srcChild := srcH.Loc
+	srcChild.Path = info.Path
+	srcChild.DirHint = false
+	return Copy(ctx, srcH.Backend, dstH.Backend, srcChild, child, &info, CopyOpts{Overwrite: objectCopyOverwrite(force, child)})
 }
 
 func printProgress(partNumber, totalParts int, bytesUploaded int64) {

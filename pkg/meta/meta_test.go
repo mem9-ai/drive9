@@ -1384,9 +1384,18 @@ func TestMetaSchemaSpecIncludesExternalBindings(t *testing.T) {
 	}
 }
 
+func TestMetaSchemaSpecIncludesOrgObjectBackends(t *testing.T) {
+	table := mustMetaTableSpec(t, mustMetaSpec(t), "org_object_backends")
+	for _, column := range []string{"id", "organization_id", "scheme", "bucket", "secret_cipher", "external_id_cipher"} {
+		if _, ok := table.columns[column]; !ok {
+			t.Fatalf("org_object_backends schema missing %s", column)
+		}
+	}
+}
+
 func TestMetaSchemaSpecIncludesTiDBCloudOrgBindings(t *testing.T) {
 	table := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_tidbcloud_org_bindings")
-	for _, column := range []string{"tenant_id", "organization_id", "cluster_id", "branch_id", "created_at", "updated_at"} {
+	for _, column := range []string{"tenant_id", "organization_id", "cluster_id", "branch_id", "object_namespace_id", "created_at", "updated_at"} {
 		if _, ok := table.columns[column]; !ok {
 			t.Fatalf("tenant_tidbcloud_org_bindings schema missing %s", column)
 		}

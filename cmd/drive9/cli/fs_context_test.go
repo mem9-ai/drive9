@@ -300,12 +300,20 @@ func TestCpRecursiveStreamsMixedExplicitAndCurrentRemoteContexts(t *testing.T) {
 				strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/sub")
 			w.Header().Set("X-Dat9-IsDir", fmt.Sprintf("%t", isDir))
 			if !isDir {
-				w.Header().Set("Content-Length", "5")
+				size := "5"
+				if strings.HasSuffix(r.URL.Path, "/n.txt") {
+					size = "6"
+				}
+				w.Header().Set("Content-Length", size)
 			}
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 		if r.Method == http.MethodGet {
+			if strings.HasSuffix(r.URL.Path, "/n.txt") {
+				_, _ = w.Write([]byte("hello!"))
+				return
+			}
 			_, _ = w.Write([]byte("hello"))
 			return
 		}

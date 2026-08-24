@@ -288,15 +288,16 @@ type ExternalBinding struct {
 }
 
 type TenantTiDBCloudOrgBinding struct {
-	TenantID       string
-	OrganizationID string
-	ClusterID      string
-	BranchID       string
-	PoolID         string
-	PoolStatus     TenantPoolBindingStatus
-	UsedAt         *time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	TenantID            string
+	OrganizationID      string
+	ClusterID           string
+	BranchID            string
+	PoolID              string
+	PoolStatus          TenantPoolBindingStatus
+	UsedAt              *time.Time
+	ObjectNamespaceID   string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 type TenantWithTiDBCloudOrgBinding struct {
@@ -664,6 +665,7 @@ func metaInitSchemaStatements() []string {
 				pool_id         VARCHAR(64) NOT NULL DEFAULT '',
 				pool_status     VARCHAR(20) NOT NULL DEFAULT 'used',
 				used_at         DATETIME(3) NULL,
+				object_namespace_id VARCHAR(255) NOT NULL DEFAULT '',
 				created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 				updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 				UNIQUE INDEX uk_tidbcloud_org_cluster_branch (organization_id, cluster_id, branch_id),
@@ -681,6 +683,27 @@ func metaInitSchemaStatements() []string {
 			UNIQUE INDEX uk_tidbcloud_pool_org (organization_id),
 			INDEX idx_tidbcloud_pool_status (status, created_at),
 			INDEX idx_tidbcloud_pool_status_id (status, pool_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS org_object_backends (
+			id                   VARCHAR(64) NOT NULL,
+			organization_id      VARCHAR(64) NOT NULL,
+			scheme               VARCHAR(16) NOT NULL,
+			endpoint             VARCHAR(512) NOT NULL DEFAULT '',
+			region               VARCHAR(64) NOT NULL DEFAULT '',
+			force_path_style     TINYINT(1) NOT NULL DEFAULT 0,
+			bucket               VARCHAR(255) NOT NULL,
+			prefix               VARCHAR(2048) NOT NULL DEFAULT '',
+			credential_kind      VARCHAR(16) NOT NULL,
+			role_arn             VARCHAR(2048) NOT NULL DEFAULT '',
+			access_key_id        VARCHAR(128) NOT NULL DEFAULT '',
+			secret_cipher        VARBINARY(2048) NULL,
+			external_id_cipher   VARBINARY(2048) NULL,
+			max_session_ttl_sec  INT UNSIGNED NOT NULL DEFAULT 3600,
+			created_at           DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at           DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (id),
+			UNIQUE INDEX uk_org_object_backend (organization_id, scheme, bucket),
+			INDEX idx_org_object_backends_org (organization_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_api_key_fs_scopes (
 			tenant_id   VARCHAR(64) NOT NULL,
@@ -1826,11 +1849,11 @@ func ensureTiDBCloudOrgBindingAvailable(ctx context.Context, q metaQueryExecer, 
 func (s *Store) GetTenantTiDBCloudOrgBinding(ctx context.Context, tenantID string) (out *TenantTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "get_tidbcloud_org_binding", start, &err)
-	row := s.db.QueryRowContext(ctx, `SELECT tenant_id, organization_id, cluster_id, branch_id, pool_id, pool_status, used_at, created_at, updated_at
+	row := s.db.QueryRowContext(ctx, `SELECT tenant_id, organization_id, cluster_id, branch_id, pool_id, pool_status, used_at, object_namespace_id, created_at, updated_at
 		FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID)
 	var rec TenantTiDBCloudOrgBinding
 	var usedAt sql.NullTime
-	if err = row.Scan(&rec.TenantID, &rec.OrganizationID, &rec.ClusterID, &rec.BranchID, &rec.PoolID, &rec.PoolStatus, &usedAt, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+	if err = row.Scan(&rec.TenantID, &rec.OrganizationID, &rec.ClusterID, &rec.BranchID, &rec.PoolID, &rec.PoolStatus, &usedAt, &rec.ObjectNamespaceID, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = ErrNotFound
 			return nil, err

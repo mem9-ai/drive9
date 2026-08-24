@@ -15,7 +15,9 @@ CLI_SOURCE="${CLI_SOURCE:-build}"
 CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
 CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
 OBJECT_STRICT_MOUNT="${OBJECT_STRICT_MOUNT:-0}"
-MINIO_IMAGE="${MINIO_IMAGE:-minio/minio:latest}"
+OBJECT_STRICT_CROSS="${OBJECT_STRICT_CROSS:-$OBJECT_STRICT_MOUNT}"
+OBJECT_CMD_TIMEOUT_S="${OBJECT_CMD_TIMEOUT_S:-120}"
+MINIO_IMAGE="${MINIO_IMAGE:-minio/minio:RELEASE.2024-12-18T13-15-44Z}"
 MINIO_PORT="${MINIO_PORT:-19000}"
 MINIO_ROOT_USER="${MINIO_ROOT_USER:-drive9minio}"
 MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-drive9minio}"
@@ -135,7 +137,24 @@ prepare_cli_binary() {
 }
 
 drive9() {
-  "$CLI_BIN" "$@"
+  local bin_args=("$@")
+  # Native MinIO uses process AWS env. Server mint is not configured in this
+  # smoke, so fs/mount object URIs always take --auth=local.
+  case "${1:-}" in
+    fs)
+      if [ "${#bin_args[@]}" -ge 2 ]; then
+        bin_args=("${1}" "${2}" --auth=local "${bin_args[@]:2}")
+      fi
+      ;;
+    mount)
+      bin_args=(mount --auth=local "${bin_args[@]:1}")
+      ;;
+  esac
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --signal=TERM --kill-after=5s "${OBJECT_CMD_TIMEOUT_S}s" "$CLI_BIN" "${bin_args[@]}"
+  else
+    "$CLI_BIN" "${bin_args[@]}"
+  fi
 }
 
 pick_runtime() {
@@ -541,21 +560,69 @@ else
   fi
 fi
 
-# --- optional drive9 ↔ object if a live tenant is configured ---
-if [ -n "${DRIVE9_BASE:-}" ] && [ -n "${DRIVE9_API_KEY:-}" ]; then
-  echo "[optional] drive9 ↔ object copy via $DRIVE9_BASE"
-  export DRIVE9_SERVER="$DRIVE9_BASE"
-  printf 'from-drive9' >"$WORKDIR/d9.txt"
-  if drive9 fs cp "$WORKDIR/d9.txt" ":/obj-e2e-${TS}.txt"; then
-    check_cmd "fs cp drive9 → object" drive9 fs cp ":/obj-e2e-${TS}.txt" "$(obj from-drive9.txt)"
-    check_eq "drive9-sourced object" "$(drive9 fs cat "$(obj from-drive9.txt)")" "from-drive9"
-    drive9 fs rm ":/obj-e2e-${TS}.txt" >/dev/null 2>&1 || true
-  else
-    skip_check "drive9 ↔ object (drive9 fs cp to :/ failed)"
+# --- drive9 ↔ object (required in CI when DRIVE9_BASE is up) ---
+run_drive9_object_cross() {
+  local base="${DRIVE9_BASE:-}"
+  local key="${DRIVE9_API_KEY:-}"
+  if [ -z "$base" ]; then
+    if [ "$OBJECT_STRICT_CROSS" = "1" ]; then
+      echo "FAIL drive9 ↔ object (DRIVE9_BASE is required when OBJECT_STRICT_CROSS=1)"
+      FAIL=$((FAIL + 1))
+      TOTAL=$((TOTAL + 1))
+    else
+      skip_check "drive9 ↔ object (set DRIVE9_BASE)"
+    fi
+    return
   fi
-else
-  skip_check "drive9 ↔ object (set DRIVE9_BASE and DRIVE9_API_KEY)"
-fi
+  if [ -z "$key" ]; then
+    local pfile
+    pfile="$(mktemp)"
+    local pcode
+    pcode=$(curl -sS -o "$pfile" -w "%{http_code}" -X POST "$base/v1/provision" || true)
+    if [ "$pcode" != "202" ] && [ "$pcode" != "200" ]; then
+      if [ "$OBJECT_STRICT_CROSS" = "1" ]; then
+        echo "FAIL provision for drive9 ↔ object (HTTP $pcode)"
+        FAIL=$((FAIL + 1))
+        TOTAL=$((TOTAL + 1))
+      else
+        skip_check "drive9 ↔ object (provision HTTP $pcode)"
+      fi
+      rm -f "$pfile"
+      return
+    fi
+    key=$(jq -r '.api_key // empty' "$pfile")
+    rm -f "$pfile"
+  fi
+  if [ -z "$key" ]; then
+    if [ "$OBJECT_STRICT_CROSS" = "1" ]; then
+      echo "FAIL drive9 ↔ object (empty api_key)"
+      FAIL=$((FAIL + 1))
+      TOTAL=$((TOTAL + 1))
+    else
+      skip_check "drive9 ↔ object (empty api_key)"
+    fi
+    return
+  fi
+  echo "[cross] drive9 ↔ object copy via $base"
+  export DRIVE9_SERVER="$base"
+  export DRIVE9_API_KEY="$key"
+  printf 'from-drive9' >"$WORKDIR/d9.txt"
+  local remote=":/obj-e2e-${TS}.txt"
+  if ! drive9 fs cp "$WORKDIR/d9.txt" "$remote"; then
+    echo "FAIL fs cp local → drive9 for cross-backend"
+    FAIL=$((FAIL + 1))
+    TOTAL=$((TOTAL + 1))
+    return
+  fi
+  check_cmd "fs cp drive9 → object" drive9 fs cp "$remote" "$(obj from-drive9.txt)"
+  check_eq "drive9-sourced object" "$(drive9 fs cat "$(obj from-drive9.txt)")" "from-drive9"
+  check_cmd "fs cp object → drive9" drive9 fs cp "$(obj hello.txt)" ":/obj-e2e-${TS}-from-s3.txt"
+  check_eq "object-sourced drive9 file" "$(drive9 fs cat ":/obj-e2e-${TS}-from-s3.txt")" "hello"
+  drive9 fs rm "$remote" >/dev/null 2>&1 || true
+  drive9 fs rm ":/obj-e2e-${TS}-from-s3.txt" >/dev/null 2>&1 || true
+}
+
+run_drive9_object_cross()
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"

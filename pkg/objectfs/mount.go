@@ -4,6 +4,8 @@ package objectfs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -20,21 +22,33 @@ import (
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
+	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
 // Mount blocks until the filesystem is unmounted.
 func Mount(opts Options) error {
-	ctx := context.Background()
-	f, _, err := OpenFs(ctx, opts.Location)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	f, fileLeaf, err := OpenFsWithSession(ctx, opts.Location, opts.Session)
+	cancel()
 	if err != nil {
 		return err
+	}
+	if fileLeaf != "" {
+		return fmt.Errorf("object-store mount requires a directory prefix, not a file key %q", fileLeaf)
 	}
 	vopt := vfscommon.Opt
 	vopt.CacheMode = vfscommon.CacheModeWrites
 	vopt.ReadOnly = opts.ReadOnly
-	cacheDir := resolveObjectCacheDir(opts.CacheDir)
+	cacheDir := resolveObjectCacheDir(opts.CacheDir, opts.Location.Raw)
+	unlock, err := lockObjectCacheDir(cacheDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if cacheDir != "" {
 		_ = config.SetCacheDir(cacheDir)
 	}
@@ -94,18 +108,40 @@ func Mount(opts Options) error {
 
 // resolveObjectCacheDir uses --cache-dir when set, otherwise
 // ~/.cache/drive9/object so rclone VFS data stays off the Dat9FS tree.
-func resolveObjectCacheDir(user string) string {
-	user = strings.TrimSpace(user)
-	if user != "" {
-		if abs, err := filepath.Abs(user); err == nil {
-			return abs
+func resolveObjectCacheDir(user, rawURI string) string {
+	base := strings.TrimSpace(user)
+	if base != "" {
+		if abs, err := filepath.Abs(base); err == nil {
+			base = abs
 		}
-		return user
+	} else if home, err := os.UserHomeDir(); err == nil && home != "" {
+		base = filepath.Join(home, ".cache", "drive9", "object")
+	} else {
+		return ""
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, ".cache", "drive9", "object")
+	sum := sha256.Sum256([]byte(rawURI))
+	return filepath.Join(base, hex.EncodeToString(sum[:8]))
+}
+
+func lockObjectCacheDir(dir string) (func(), error) {
+	if dir == "" {
+		return func() {}, nil
 	}
-	return ""
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, ".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("object cache %s is already in use by another mount", dir)
+	}
+	return func() {
+		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+		_ = f.Close()
+	}, nil
 }
 
 func shutdownObjectVFS(v *vfs.VFS, cacheDir string) {
@@ -114,7 +150,8 @@ func shutdownObjectVFS(v *vfs.VFS, cacheDir string) {
 	// files that did not finish uploading. Leave them for the next mount
 	// of the same URI to reload and resume.
 	if objectCacheHasPending(v) && cacheDir != "" {
-		fmt.Fprintf(os.Stderr, "drive9: unfinished object writes remain in %s; remount the same URI to resume\n", cacheDir)
+		logger.Warn(context.Background(), "unfinished object writes remain; remount the same URI to resume",
+			zap.String("cache_dir", cacheDir))
 	}
 	v.Shutdown()
 }
@@ -331,7 +368,7 @@ func (fs *rcloneFUSE) Create(cancel <-chan struct{}, input *gofuse.CreateIn, nam
 	p := fs.rel(parent, name)
 	fh, err := fs.v.Create(p)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "drive9-object: create %s: %v\n", p, err)
+		logger.Error(context.Background(), "object mount create failed", zap.String("path", p), zap.Error(err))
 		return mapVFSErr(err)
 	}
 	if node, statErr := fs.v.Stat(p); statErr == nil {
@@ -373,7 +410,10 @@ func (fs *rcloneFUSE) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofus
 	if h == nil {
 		return gofuse.OK
 	}
-	return mapVFSErr(h.Flush())
+	if st := mapVFSErr(h.Flush()); st != gofuse.OK {
+		return st
+	}
+	return mapVFSErr(h.Sync())
 }
 
 func (fs *rcloneFUSE) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.Status {
@@ -386,7 +426,9 @@ func (fs *rcloneFUSE) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofus
 
 func (fs *rcloneFUSE) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	if h := fs.takeHandle(input.Fh); h != nil {
-		_ = h.Close()
+		if err := h.Close(); err != nil {
+			logger.Error(context.Background(), "object mount release close failed", zap.Error(err))
+		}
 	}
 }
 
@@ -401,6 +443,9 @@ func (fs *rcloneFUSE) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, o
 	node, err := fs.v.Stat(p)
 	if err != nil {
 		return mapVFSErr(err)
+	}
+	if input.Valid&(gofuse.FATTR_MODE|gofuse.FATTR_UID|gofuse.FATTR_GID) != 0 {
+		return gofuse.ENOSYS
 	}
 	if size, ok := input.GetSize(); ok {
 		if file, isFile := node.(*vfs.File); isFile {

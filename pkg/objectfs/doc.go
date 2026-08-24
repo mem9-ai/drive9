@@ -5,4 +5,8 @@
 //
 // Dat9FS / VaultFS stay in pkg/fuse. This package only translates FUSE
 // lookup/readdir/read/write into rclone VFS calls.
+//
+// Object mounts use the same go-fuse replace as Dat9FS
+// (github.com/mornyx/go-fuse/v2 in go.mod) so inode/nlookup behavior
+// matches the rest of the CLI. Pin that replace; do not drop it.
 package objectfs

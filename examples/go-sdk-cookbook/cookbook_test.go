@@ -415,6 +415,27 @@ func ExampleClient_quota() {
 		PublicKey:  tidbCloudPublicKey,
 		PrivateKey: tidbCloudPrivateKey,
 	})
+
+	_, _ = credentialClient.AdminListObjectBackends(ctx, tidbCloudPublicKey, tidbCloudPrivateKey)
+	created, err := credentialClient.AdminCreateObjectBackend(ctx, drive9.AdminObjectBackendCreateRequest{
+		PublicKey:      tidbCloudPublicKey,
+		PrivateKey:     tidbCloudPrivateKey,
+		Scheme:         "s3",
+		Bucket:         "example",
+		CredentialKind: "role",
+		RoleARN:        "arn:aws:iam::123:role/drive9-object",
+		MaxSessionTTL:  3600,
+	})
+	if err == nil && created != nil {
+		_ = created.ID
+		_ = credentialClient.AdminDeleteObjectBackend(ctx, created.ID, tidbCloudPublicKey, tidbCloudPrivateKey)
+	}
+	_, _ = credentialClient.AdminGetObjectNamespace(ctx, tenantID, tidbCloudPublicKey, tidbCloudPrivateKey)
+	_, _ = credentialClient.AdminSetObjectNamespace(ctx, tenantID, "customer-prefix", tidbCloudPublicKey, tidbCloudPrivateKey)
+	_ = credentialClient.AdminClearObjectNamespace(ctx, tenantID, tidbCloudPublicKey, tidbCloudPrivateKey)
+
+	fsClient := drive9.New(serverURL, "api-key")
+	_, _ = fsClient.MintObjectCredentials(ctx, "s3://example/customer-prefix/a.txt", false)
 }
 
 func ExampleClient_eventsLayersGitAndJournal() {
@@ -600,6 +621,12 @@ var coveredClientMethods = map[string]bool{
 	"AdminSetTenantQuota":                  true,
 	"AdminGetTenantExtractConfig":          true,
 	"AdminSetTenantExtractConfig":          true,
+	"AdminClearObjectNamespace":            true,
+	"AdminCreateObjectBackend":             true,
+	"AdminDeleteObjectBackend":             true,
+	"AdminGetObjectNamespace":              true,
+	"AdminListObjectBackends":              true,
+	"AdminSetObjectNamespace":              true,
 	"AdminUpdateTenantPool":                true,
 	"AppendJournalEntries":                 true,
 	"AppendStream":                         true,
@@ -665,6 +692,7 @@ var coveredClientMethods = map[string]bool{
 	"ListReadableVaultSecrets":             true,
 	"ListVaultSecrets":                     true,
 	"MaxUploadBytes":                       true,
+	"MintObjectCredentials":                true,
 	"Mkdir":                                true,
 	"MkdirCtx":                             true,
 	"NewStreamWriter":                      true,

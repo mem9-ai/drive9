@@ -20,6 +20,11 @@ func Cat(c *client.Client, args []string) error {
 }
 
 func catWithWriter(c *client.Client, args []string, out io.Writer) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	fs := flag.NewFlagSet("fs cat", flag.ContinueOnError)
 	offset := fs.Int64("offset", 0, "byte offset for a positional read; requires --length")
 	length := fs.Int64("length", 0, "byte length for a positional read; requires --offset")

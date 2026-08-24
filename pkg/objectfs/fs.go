@@ -25,7 +25,11 @@ type FS struct {
 // Open builds a backend for loc. The rclone Fs is always the bucket root;
 // loc.Path is the object key.
 func Open(ctx context.Context, loc Location) (*FS, error) {
-	f, err := OpenFsBucket(ctx, loc)
+	return OpenWithSession(ctx, loc, SessionCredentials{})
+}
+
+func OpenWithSession(ctx context.Context, loc Location, sess SessionCredentials) (*FS, error) {
+	f, err := OpenFsBucketWithSession(ctx, loc, sess)
 	if err != nil {
 		return nil, err
 	}
@@ -35,8 +39,8 @@ func Open(ctx context.Context, loc Location) (*FS, error) {
 func (a *FS) Scheme() Scheme { return a.loc.Scheme }
 func (a *FS) Close() error   { return nil }
 
-// Identity is scheme+account+bucket+endpoint+region so two keys in the
-// same bucket (or Azure container+account) share a server-side copy identity.
+// Identity is scheme+account+bucket+endpoint+region+provider so two keys
+// in the same bucket share a server-side copy identity.
 func (a *FS) Identity() string {
 	endpoint, region, account := "", "", ""
 	if a.loc.Query != nil {
@@ -44,7 +48,11 @@ func (a *FS) Identity() string {
 		region = a.loc.Query[QueryRegion]
 		account = a.loc.Query[QueryAccount]
 	}
-	return string(CanonicalScheme(a.loc.Scheme)) + "\n" + account + "\n" + a.loc.Bucket + "\n" + endpoint + "\n" + region
+	provider := ""
+	if a.loc.Query != nil {
+		provider = a.loc.Query[QueryProvider]
+	}
+	return string(CanonicalScheme(a.loc.Scheme)) + "\n" + account + "\n" + a.loc.Bucket + "\n" + endpoint + "\n" + region + "\n" + provider
 }
 
 func (a *FS) Fs() fs.Fs { return a.f }
@@ -96,6 +104,9 @@ func (a *FS) Stat(ctx context.Context, loc Location) (*FileInfo, error) {
 func (a *FS) List(ctx context.Context, loc Location, opts ListOpts) (ListPage, error) {
 	if opts.Cursor != "" {
 		return ListPage{}, fmt.Errorf("list %s: cursor pagination is not supported", loc.Raw)
+	}
+	if opts.Limit > 0 {
+		return ListPage{}, fmt.Errorf("list %s: limit pagination is not supported", loc.Raw)
 	}
 	dir := a.remoteOf(loc)
 	var entries fs.DirEntries
@@ -169,13 +180,30 @@ func (a *FS) OpenReadRange(ctx context.Context, loc Location, offset, length int
 }
 
 func (a *FS) OpenWrite(ctx context.Context, loc Location, opts WriteOpts) (WriteHandle, error) {
+	if !opts.Overwrite {
+		st, err := a.Stat(ctx, loc)
+		if err == nil && st != nil && !st.IsDir {
+			return nil, fmt.Errorf("object exists (use --force to overwrite): %s", loc.Raw)
+		}
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+	}
 	remote := a.remoteOf(loc)
 	pr, pw := io.Pipe()
 	errc := make(chan error, 1)
 	size := opts.Size
+	putCtx := ctx
+	var cancel context.CancelFunc
+	if _, ok := ctx.Deadline(); !ok {
+		putCtx, cancel = context.WithTimeout(ctx, 15*time.Minute)
+	}
 	go func() {
+		if cancel != nil {
+			defer cancel()
+		}
 		info := object.NewStaticObjectInfo(remote, time.Now(), size, true, nil, a.f)
-		_, err := a.f.Put(ctx, pr, info)
+		_, err := a.f.Put(putCtx, pr, info)
 		if err != nil {
 			_ = pr.CloseWithError(err)
 		} else {
@@ -183,11 +211,14 @@ func (a *FS) OpenWrite(ctx context.Context, loc Location, opts WriteOpts) (Write
 		}
 		errc <- err
 	}()
-	return &writeHandle{pw: pw, errc: errc}, nil
+	return &writeHandle{ctx: putCtx, pw: pw, errc: errc}, nil
 }
 
 func (a *FS) Remove(ctx context.Context, loc Location, recursive bool) error {
 	if !recursive {
+		if loc.DirHint || strings.HasSuffix(loc.Path, "/") {
+			return fmt.Errorf("rm %s: directory removal requires -r", loc.Raw)
+		}
 		obj, err := a.f.NewObject(ctx, a.remoteOf(loc))
 		if err != nil {
 			return fmt.Errorf("rm %s: %w", loc.Raw, mapNotFound(err))
@@ -308,6 +339,7 @@ func mapNotFound(err error) error {
 }
 
 type writeHandle struct {
+	ctx       context.Context
 	pw        *io.PipeWriter
 	errc      chan error
 	closeOnce sync.Once
@@ -325,7 +357,18 @@ func (w *writeHandle) finish(writeErr error) error {
 		} else {
 			_ = w.pw.Close()
 		}
-		w.closeErr = <-w.errc
+		select {
+		case w.closeErr = <-w.errc:
+		case <-w.ctx.Done():
+			w.closeErr = fmt.Errorf("object write: %w", w.ctx.Err())
+			select {
+			case err := <-w.errc:
+				if err != nil {
+					w.closeErr = err
+				}
+			case <-time.After(5 * time.Second):
+			}
+		}
 	})
 	return w.closeErr
 }

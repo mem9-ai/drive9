@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -120,6 +121,20 @@ func (w *shortWrite) Write(p []byte) (int, error) {
 }
 func (w *shortWrite) Close() error                { return nil }
 func (w *shortWrite) Abort(context.Context) error { return nil }
+
+func TestStreamCopyShortRead(t *testing.T) {
+	src := newMem(SchemeDrive9, "a")
+	dst := newMem(SchemeS3, "b")
+	src.files["a.txt"] = []byte("short")
+	err := StreamCopy(context.Background(), src, dst,
+		Location{Raw: "src", Path: "a.txt"},
+		Location{Raw: "dst", Path: "b.txt"},
+		&FileInfo{Size: 11},
+		CopyOpts{})
+	if err == nil || !strings.Contains(err.Error(), "short copy") {
+		t.Fatalf("err=%v, want short copy", err)
+	}
+}
 
 func TestStreamCopyAbortOnReadError(t *testing.T) {
 	src := &errReadBackend{}

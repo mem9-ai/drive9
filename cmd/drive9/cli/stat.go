@@ -18,6 +18,11 @@ import (
 //	drive9 fs stat -o json /path/to/file
 //	drive9 fs stat :/path/to/file
 func Stat(c *client.Client, args []string) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	outputFormat := "text"
 	path := ""
 	for i := 0; i < len(args); i++ {

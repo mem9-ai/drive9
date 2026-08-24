@@ -16,6 +16,11 @@ import (
 //	drive9 fs ls -l /path  long format with size
 //	drive9 fs ls :/path    list using remote path prefix
 func Ls(c *client.Client, args []string) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	long := false
 	path := "/"
 

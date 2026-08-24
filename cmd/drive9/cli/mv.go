@@ -13,6 +13,11 @@ import (
 //	drive9 fs mv /old/path /new/path
 //	drive9 fs mv :/old/path :/new/path
 func Mv(c *client.Client, args []string) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	layerRef, args, err := parseLayerFlag(args)
 	if err != nil {
 		return err
