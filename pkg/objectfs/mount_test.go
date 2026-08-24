@@ -73,6 +73,40 @@ func TestRcloneFUSELookupRead(t *testing.T) {
 	ofs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
 }
 
+func TestRcloneFUSECreateFlushThenWrite(t *testing.T) {
+	ofs, dir := testVFS(t)
+	var createOut gofuse.CreateOut
+	st := ofs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(os.O_WRONLY | os.O_CREATE | os.O_TRUNC),
+		Mode:     0o644,
+	}, "from-mount.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if st := ofs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush after Create: %v", st)
+	}
+	n, st := ofs.Write(nil, &gofuse.WriteIn{Fh: createOut.Fh}, []byte("via-fuse"))
+	if st != gofuse.OK {
+		t.Fatalf("Write after Flush: %v (kernel FLUSH after create must leave the handle writable)", st)
+	}
+	if n != 8 {
+		t.Fatalf("n=%d", n)
+	}
+	if st := ofs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush after Write: %v", st)
+	}
+	ofs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+	got, err := os.ReadFile(filepath.Join(dir, "from-mount.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "via-fuse" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestRcloneFUSEReadDir(t *testing.T) {
 	ofs, _ := testVFS(t)
 	buf := make([]byte, 4096)
