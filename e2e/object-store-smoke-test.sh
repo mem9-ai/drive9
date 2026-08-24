@@ -17,6 +17,8 @@ CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
 OBJECT_STRICT_MOUNT="${OBJECT_STRICT_MOUNT:-0}"
 OBJECT_STRICT_CROSS="${OBJECT_STRICT_CROSS:-$OBJECT_STRICT_MOUNT}"
 OBJECT_CMD_TIMEOUT_S="${OBJECT_CMD_TIMEOUT_S:-120}"
+POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
+POLL_INTERVAL_S="${POLL_INTERVAL_S:-2}"
 MINIO_IMAGE="${MINIO_IMAGE:-minio/minio:RELEASE.2024-12-18T13-15-44Z}"
 MINIO_PORT="${MINIO_PORT:-19000}"
 MINIO_ROOT_USER="${MINIO_ROOT_USER:-drive9minio}"
@@ -605,6 +607,34 @@ run_drive9_object_cross() {
       TOTAL=$((TOTAL + 1))
     else
       skip_check "drive9 ↔ object (empty api_key)"
+    fi
+    return
+  fi
+  # POST /v1/provision returns 202 while schema init is still running.
+  # Auth on /v1/fs then 503s with tenant_provisioning until status=active.
+  local deadline state scode sfile
+  deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
+  state=""
+  while :; do
+    sfile="$(mktemp)"
+    scode=$(curl -sS -o "$sfile" -w "%{http_code}" -H "Authorization: Bearer $key" "$base/v1/status" || true)
+    state=$(jq -r '.status // empty' "$sfile" 2>/dev/null || true)
+    rm -f "$sfile"
+    if [ "$scode" = "200" ] && [ "$state" = "active" ]; then
+      break
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      break
+    fi
+    sleep "$POLL_INTERVAL_S"
+  done
+  if [ "$state" != "active" ]; then
+    if [ "$OBJECT_STRICT_CROSS" = "1" ]; then
+      echo "FAIL drive9 ↔ object (tenant status=$state, want active)"
+      FAIL=$((FAIL + 1))
+      TOTAL=$((TOTAL + 1))
+    else
+      skip_check "drive9 ↔ object (tenant status=$state)"
     fi
     return
   fi
