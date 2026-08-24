@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -48,9 +49,8 @@ func Mount(opts Options) error {
 	}
 	vopt := vfscommon.Opt
 	vopt.CacheMode = vfscommon.CacheModeWrites
-	// Upload on handle Close (FUSE Release). Do not Close in Flush: the
-	// kernel FLUSHes after Create and on dup/close, and the fd must stay
-	// writable for the subsequent Write (e.g. `printf > file`).
+	// Upload on Close (WriteBack=0). Flush for write handles Close+reopens
+	// so close/fsync can return PUT errors while the kernel fd stays usable.
 	vopt.WriteBack = 0
 	vopt.ReadOnly = opts.ReadOnly
 	cacheDir := resolveObjectCacheDir(opts.CacheDir, opts.Location.Raw)
@@ -215,6 +215,15 @@ func writeObjectMountState(mountPoint, remote string, supervised bool) (string, 
 	})
 }
 
+const fuseOpTimeout = 5 * time.Minute
+
+type fuseHandle struct {
+	h     vfs.Handle
+	path  string
+	flags int
+	write bool
+}
+
 type rcloneFUSE struct {
 	gofuse.RawFileSystem
 	v        *vfs.VFS
@@ -224,7 +233,7 @@ type rcloneFUSE struct {
 	mu           sync.Mutex
 	inodePath    map[uint64]string
 	inodeLookups map[uint64]uint64
-	handles      map[uint64]vfs.Handle
+	handles      map[uint64]*fuseHandle
 	handleSeq    uint64
 }
 
@@ -237,7 +246,7 @@ func newRcloneFUSE(v *vfs.VFS, readOnly bool) *rcloneFUSE {
 		gid:           uint32(os.Getegid()),
 		inodePath:     map[uint64]string{},
 		inodeLookups:  map[uint64]uint64{},
-		handles:       map[uint64]vfs.Handle{},
+		handles:       map[uint64]*fuseHandle{},
 	}
 }
 
@@ -254,9 +263,13 @@ func (fs *rcloneFUSE) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, na
 	if status != gofuse.OK {
 		return status
 	}
-	node, err := fs.v.Stat(fs.rel(parent, name))
-	if err != nil {
-		return mapVFSErr(err)
+	var node vfs.Node
+	if st := fs.withOp(cancel, func(context.Context) error {
+		var err error
+		node, err = fs.v.Stat(fs.rel(parent, name))
+		return err
+	}); st != gofuse.OK {
+		return st
 	}
 	fs.fillEntry(out, node)
 	return gofuse.OK
@@ -267,9 +280,13 @@ func (fs *rcloneFUSE) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, o
 	if status != gofuse.OK {
 		return status
 	}
-	node, err := fs.v.Stat(p)
-	if err != nil {
-		return mapVFSErr(err)
+	var node vfs.Node
+	if st := fs.withOp(cancel, func(context.Context) error {
+		var err error
+		node, err = fs.v.Stat(p)
+		return err
+	}); st != gofuse.OK {
+		return st
 	}
 	fs.fillAttr(&out.Attr, node)
 	return gofuse.OK
@@ -292,9 +309,13 @@ func (fs *rcloneFUSE) readDir(input *gofuse.ReadIn, out *gofuse.DirEntryList, pl
 	if status != gofuse.OK {
 		return status
 	}
-	node, err := fs.v.Stat(p)
-	if err != nil {
-		return mapVFSErr(err)
+	var node vfs.Node
+	if st := fs.withOp(nil, func(context.Context) error {
+		var err error
+		node, err = fs.v.Stat(p)
+		return err
+	}); st != gofuse.OK {
+		return st
 	}
 	dir, ok := node.(*vfs.Dir)
 	if !ok {
@@ -358,15 +379,19 @@ func (fs *rcloneFUSE) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *go
 	if status != gofuse.OK {
 		return status
 	}
-	node, err := fs.v.Stat(p)
-	if err != nil {
-		return mapVFSErr(err)
+	flags := fuseOpenFlags(input.Flags)
+	var fh vfs.Handle
+	if st := fs.withOp(cancel, func(context.Context) error {
+		node, err := fs.v.Stat(p)
+		if err != nil {
+			return err
+		}
+		fh, err = node.Open(flags)
+		return err
+	}); st != gofuse.OK {
+		return st
 	}
-	fh, err := node.Open(fuseOpenFlags(input.Flags))
-	if err != nil {
-		return mapVFSErr(err)
-	}
-	out.Fh = fs.storeHandle(fh)
+	out.Fh = fs.storeHandle(fh, p, flags, writeFlags(input.Flags))
 	return gofuse.OK
 }
 
@@ -379,26 +404,41 @@ func (fs *rcloneFUSE) Create(cancel <-chan struct{}, input *gofuse.CreateIn, nam
 		return status
 	}
 	p := fs.rel(parent, name)
-	fh, err := fs.v.Create(p)
-	if err != nil {
-		logger.Error(context.Background(), "object mount create failed", zap.String("path", p), zap.Error(err))
-		return mapVFSErr(err)
+	flags := os.O_RDWR | os.O_CREATE | os.O_TRUNC
+	var fh vfs.Handle
+	if st := fs.withOp(cancel, func(context.Context) error {
+		var err error
+		fh, err = fs.v.Create(p)
+		if err != nil {
+			logger.Error(context.Background(), "object mount create failed", zap.String("path", p), zap.Error(err))
+		}
+		return err
+	}); st != gofuse.OK {
+		return st
 	}
 	if node, statErr := fs.v.Stat(p); statErr == nil {
 		fs.fillEntry(&out.EntryOut, node)
 	}
-	out.Fh = fs.storeHandle(fh)
+	out.Fh = fs.storeHandle(fh, p, flags, true)
 	return gofuse.OK
 }
 
 func (fs *rcloneFUSE) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gofuse.ReadResult, gofuse.Status) {
-	h := fs.getHandle(input.Fh)
-	if h == nil {
+	ent := fs.getHandle(input.Fh)
+	if ent == nil || ent.h == nil {
 		return nil, gofuse.EBADF
 	}
-	n, err := h.ReadAt(buf, int64(input.Offset))
-	if err != nil && err != io.EOF {
-		return nil, mapVFSErr(err)
+	var n int
+	st := fs.withOp(cancel, func(context.Context) error {
+		var err error
+		n, err = ent.h.ReadAt(buf, int64(input.Offset))
+		if err == io.EOF {
+			return nil
+		}
+		return err
+	})
+	if st != gofuse.OK {
+		return nil, st
 	}
 	return gofuse.ReadResultData(buf[:n]), gofuse.OK
 }
@@ -407,41 +447,75 @@ func (fs *rcloneFUSE) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data 
 	if fs.readOnly {
 		return 0, gofuse.EROFS
 	}
-	h := fs.getHandle(input.Fh)
-	if h == nil {
+	ent := fs.getHandle(input.Fh)
+	if ent == nil || ent.h == nil {
 		return 0, gofuse.EBADF
 	}
-	n, err := h.WriteAt(data, int64(input.Offset))
-	if err != nil {
-		return uint32(n), mapVFSErr(err)
-	}
-	return uint32(n), gofuse.OK
+	var n int
+	st := fs.withOp(cancel, func(context.Context) error {
+		var err error
+		n, err = ent.h.WriteAt(data, int64(input.Offset))
+		return err
+	})
+	return uint32(n), st
 }
 
 func (fs *rcloneFUSE) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status {
-	h := fs.getHandle(input.Fh)
-	if h == nil {
-		return gofuse.OK
-	}
-	if st := mapVFSErr(h.Flush()); st != gofuse.OK {
-		return st
-	}
-	return mapVFSErr(h.Sync())
+	return fs.flushHandle(cancel, input.Fh)
 }
 
 func (fs *rcloneFUSE) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.Status {
-	h := fs.getHandle(input.Fh)
-	if h == nil {
+	return fs.flushHandle(cancel, input.Fh)
+}
+
+func (fs *rcloneFUSE) flushHandle(cancel <-chan struct{}, fh uint64) gofuse.Status {
+	ent := fs.getHandle(fh)
+	if ent == nil || ent.h == nil {
 		return gofuse.OK
 	}
-	return mapVFSErr(h.Sync())
+	return fs.withOp(cancel, func(context.Context) error {
+		if err := ent.h.Flush(); err != nil {
+			return err
+		}
+		if err := ent.h.Sync(); err != nil {
+			return err
+		}
+		if !ent.write {
+			return nil
+		}
+		closeErr := ent.h.Close()
+		reopenFlags := ent.flags &^ (os.O_TRUNC | os.O_EXCL | os.O_CREATE)
+		if reopenFlags&0x3 == 0 {
+			reopenFlags |= os.O_RDWR
+		}
+		node, err := fs.v.Stat(ent.path)
+		if err != nil {
+			if closeErr != nil {
+				return closeErr
+			}
+			return err
+		}
+		next, err := node.Open(reopenFlags)
+		if err != nil {
+			if closeErr != nil {
+				return closeErr
+			}
+			return err
+		}
+		fs.replaceHandle(fh, next)
+		return closeErr
+	})
 }
 
 func (fs *rcloneFUSE) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
-	if h := fs.takeHandle(input.Fh); h != nil {
-		if err := h.Close(); err != nil {
-			logger.Error(context.Background(), "object mount release close failed", zap.Error(err))
-		}
+	ent := fs.takeHandle(input.Fh)
+	if ent == nil || ent.h == nil {
+		return
+	}
+	if st := fs.withOp(cancel, func(context.Context) error {
+		return ent.h.Close()
+	}); st != gofuse.OK {
+		logger.Error(context.Background(), "object mount release close failed", zap.Int("status", int(st)))
 	}
 }
 
@@ -485,12 +559,16 @@ func (fs *rcloneFUSE) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name 
 		return status
 	}
 	p := fs.rel(parent, name)
-	if err := fs.v.Mkdir(p, os.FileMode(input.Mode)); err != nil {
-		return mapVFSErr(err)
-	}
-	node, err := fs.v.Stat(p)
-	if err != nil {
-		return mapVFSErr(err)
+	var node vfs.Node
+	if st := fs.withOp(cancel, func(context.Context) error {
+		if err := fs.v.Mkdir(p, os.FileMode(input.Mode)); err != nil {
+			return err
+		}
+		var err error
+		node, err = fs.v.Stat(p)
+		return err
+	}); st != gofuse.OK {
+		return st
 	}
 	fs.fillEntry(out, node)
 	return gofuse.OK
@@ -504,7 +582,9 @@ func (fs *rcloneFUSE) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, na
 	if status != gofuse.OK {
 		return status
 	}
-	return mapVFSErr(fs.v.Remove(fs.rel(parent, name)))
+	return fs.withOp(cancel, func(context.Context) error {
+		return fs.v.Remove(fs.rel(parent, name))
+	})
 }
 
 func (fs *rcloneFUSE) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string) gofuse.Status {
@@ -525,13 +605,20 @@ func (fs *rcloneFUSE) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, old
 	}
 	oldPath := fs.rel(oldParent, oldName)
 	newPath := fs.rel(newParent, newName)
-	if err := fs.v.Rename(oldPath, newPath); err != nil {
-		return mapVFSErr(err)
+	if st := fs.withOp(cancel, func(context.Context) error {
+		return fs.v.Rename(oldPath, newPath)
+	}); st != gofuse.OK {
+		return st
 	}
 	fs.mu.Lock()
 	for ino, p := range fs.inodePath {
 		if p == oldPath || strings.HasPrefix(p, oldPath+"/") {
 			fs.inodePath[ino] = newPath + strings.TrimPrefix(p, oldPath)
+		}
+	}
+	for _, ent := range fs.handles {
+		if ent.path == oldPath || strings.HasPrefix(ent.path, oldPath+"/") {
+			ent.path = newPath + strings.TrimPrefix(ent.path, oldPath)
 		}
 	}
 	fs.mu.Unlock()
@@ -607,27 +694,58 @@ func (fs *rcloneFUSE) remember(ino uint64, p string, lookup bool) {
 	fs.mu.Unlock()
 }
 
-func (fs *rcloneFUSE) storeHandle(h vfs.Handle) uint64 {
+func (fs *rcloneFUSE) storeHandle(h vfs.Handle, path string, flags int, write bool) uint64 {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	fs.handleSeq++
 	id := fs.handleSeq
-	fs.handles[id] = h
+	fs.handles[id] = &fuseHandle{h: h, path: strings.Trim(path, "/"), flags: flags, write: write}
 	return id
 }
 
-func (fs *rcloneFUSE) getHandle(id uint64) vfs.Handle {
+func (fs *rcloneFUSE) getHandle(id uint64) *fuseHandle {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	return fs.handles[id]
 }
 
-func (fs *rcloneFUSE) takeHandle(id uint64) vfs.Handle {
+func (fs *rcloneFUSE) replaceHandle(id uint64, h vfs.Handle) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if ent := fs.handles[id]; ent != nil {
+		ent.h = h
+	}
+}
+
+func (fs *rcloneFUSE) takeHandle(id uint64) *fuseHandle {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	h := fs.handles[id]
 	delete(fs.handles, id)
 	return h
+}
+
+func (fs *rcloneFUSE) withOp(cancel <-chan struct{}, fn func(context.Context) error) gofuse.Status {
+	ctx, stop := context.WithTimeout(context.Background(), fuseOpTimeout)
+	defer stop()
+	done := make(chan error, 1)
+	go func() { done <- fn(ctx) }()
+	select {
+	case err := <-done:
+		return mapVFSErr(err)
+	case <-ctx.Done():
+		return mapVFSErr(ctx.Err())
+	case <-cancelOrNil(cancel):
+		stop()
+		return mapVFSErr(context.Canceled)
+	}
+}
+
+func cancelOrNil(cancel <-chan struct{}) <-chan struct{} {
+	if cancel != nil {
+		return cancel
+	}
+	return nil
 }
 
 func writeFlags(flags uint32) bool {
@@ -646,6 +764,9 @@ func mapVFSErr(err error) gofuse.Status {
 	}
 	if os.IsPermission(err) {
 		return gofuse.EACCES
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return gofuse.Status(syscall.ETIMEDOUT)
 	}
 	return gofuse.EIO
 }

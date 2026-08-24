@@ -4,10 +4,13 @@ package objectfs
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	_ "github.com/rclone/rclone/backend/local"
@@ -73,8 +76,22 @@ func TestRcloneFUSELookupRead(t *testing.T) {
 	ofs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
 }
 
+func testWriteVFS(t *testing.T) (*rcloneFUSE, string) {
+	t.Helper()
+	configfile.Install()
+	dir := t.TempDir()
+	f, err := fs.NewFs(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeWrites
+	opt.WriteBack = 0
+	return newRcloneFUSE(vfs.New(f, &opt), false), dir
+}
+
 func TestRcloneFUSECreateFlushThenWrite(t *testing.T) {
-	ofs, dir := testVFS(t)
+	ofs, dir := testWriteVFS(t)
 	var createOut gofuse.CreateOut
 	st := ofs.Create(nil, &gofuse.CreateIn{
 		InHeader: gofuse.InHeader{NodeId: 1},
@@ -104,6 +121,55 @@ func TestRcloneFUSECreateFlushThenWrite(t *testing.T) {
 	}
 	if string(got) != "via-fuse" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+type failPutFs struct{ fs.Fs }
+
+func (f failPutFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	_, _ = io.Copy(io.Discard, in)
+	return nil, io.ErrUnexpectedEOF
+}
+
+func TestRcloneFUSEFlushReportsPutFailure(t *testing.T) {
+	configfile.Install()
+	dir := t.TempDir()
+	inner, err := fs.NewFs(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeWrites
+	opt.WriteBack = 0
+	ofs := newRcloneFUSE(vfs.New(failPutFs{inner}, &opt), false)
+	var createOut gofuse.CreateOut
+	st := ofs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(os.O_WRONLY | os.O_CREATE | os.O_TRUNC),
+		Mode:     0o644,
+	}, "fail.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if _, st := ofs.Write(nil, &gofuse.WriteIn{Fh: createOut.Fh}, []byte("data")); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	st = ofs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh})
+	if st == gofuse.OK {
+		t.Fatal("Flush must surface the remote PUT failure")
+	}
+}
+
+func TestRcloneFUSEOpCancel(t *testing.T) {
+	ofs, _ := testVFS(t)
+	ch := make(chan struct{})
+	close(ch)
+	st := ofs.withOp(ch, func(context.Context) error {
+		time.Sleep(time.Hour)
+		return nil
+	})
+	if st != gofuse.Status(syscall.ETIMEDOUT) {
+		t.Fatalf("status=%v want ETIMEDOUT", st)
 	}
 }
 

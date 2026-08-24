@@ -190,10 +190,12 @@ drive9 umount ./mnt
 - The VFS root is the URI prefix, not the whole bucket.
 - Default write-back cache is under `~/.cache/drive9/object`, namespaced per
   URI. Two mounts of the same URI cannot share one cache directory.
-  Dirty data is uploaded when the kernel releases the handle (`WriteBack=0`,
-  so rclone Close is a synchronous PUT). FUSE `Flush` does not close the
-  handle, because the kernel FLUSHes after create and on dup/close before
-  later writes. `--allow-other` enables kernel `default_permissions`.
+  Dirty data is uploaded on write-handle `Flush`/`Fsync` (`WriteBack=0` so
+  rclone Close is a synchronous PUT). The handle is then reopened so later
+  writes still work after the kernel FLUSHes following create. A failed
+  object PUT is returned from that flush/fsync/close. Mount operations
+  are bounded by a 5-minute deadline and the kernel interrupt channel.
+  `--allow-other` enables kernel `default_permissions`.
 - Umount waits briefly for in-flight uploads and does **not** wipe a dirty
   cache, so a remount of the same URI can resume.
 - `mount drain` is drive9-only; object mounts reject it.
