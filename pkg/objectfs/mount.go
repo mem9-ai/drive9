@@ -40,6 +40,12 @@ func Mount(opts Options) error {
 	if fileLeaf != "" {
 		return fmt.Errorf("object-store mount requires a directory prefix, not a file key %q", fileLeaf)
 	}
+	if opts.Mint != nil {
+		wrapped := newSessionFs(f, "drive9-object", objectRoot(opts.Location))
+		stopRefresh := startSessionRefresh(context.Background(), wrapped, opts.Location, opts.Mint, opts.SessionExpiry)
+		defer stopRefresh()
+		f = wrapped
+	}
 	vopt := vfscommon.Opt
 	vopt.CacheMode = vfscommon.CacheModeWrites
 	vopt.ReadOnly = opts.ReadOnly

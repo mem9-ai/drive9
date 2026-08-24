@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/objectfs"
 )
 
@@ -38,15 +40,31 @@ func mountObjectStoreImpl(loc *Location, mountPoint, cacheDir string, readOnly, 
 		}
 		applyMintedQuery(loc.Query, minted)
 		opts.Location = toObjectLocation(*loc)
-		opts.Session = objectfs.SessionCredentials{
-			AccessKeyID:     minted.AccessKeyID,
-			SecretAccessKey: minted.SecretAccessKey,
-			SessionToken:    minted.SessionToken,
-			SASURL:          minted.SASURL,
-			AccessToken:     minted.AccessToken,
+		opts.Session = sessionFromMinted(minted)
+		opts.SessionExpiry = objectfs.ParseSessionExpiry(minted.Expiration)
+		opts.Mint = func(ctx context.Context) (objectfs.SessionCredentials, time.Time, error) {
+			next, mintErr := c.MintObjectCredentials(ctx, loc.Raw, !readOnly)
+			if mintErr != nil {
+				return objectfs.SessionCredentials{}, time.Time{}, mintErr
+			}
+			applyMintedQuery(loc.Query, next)
+			return sessionFromMinted(next), objectfs.ParseSessionExpiry(next.Expiration), nil
 		}
 	}
 	return objectfs.Mount(opts)
+}
+
+func sessionFromMinted(m *client.ObjectCredentials) objectfs.SessionCredentials {
+	if m == nil {
+		return objectfs.SessionCredentials{}
+	}
+	return objectfs.SessionCredentials{
+		AccessKeyID:     m.AccessKeyID,
+		SecretAccessKey: m.SecretAccessKey,
+		SessionToken:    m.SessionToken,
+		SASURL:          m.SASURL,
+		AccessToken:     m.AccessToken,
+	}
 }
 
 func validateObjectMount(goos, mode, layerRef, checkpointRef, profile string) error {

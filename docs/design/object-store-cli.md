@@ -193,10 +193,11 @@ drive9 umount ./mnt
 - Umount waits briefly for in-flight uploads and does **not** wipe a dirty
   cache, so a remount of the same URI can resume.
 - `mount drain` is drive9-only; object mounts reject it.
-- Server-minted mounts capture one session at start. That session expires
-  (`--max-session-ttl`, default 1 hour; GCS tokens are typically ~1 hour).
-  After expiry, remount to mint again. The supervisor health probe is local
-  and will not restart the worker on object-store 403s.
+- Server-minted mounts keep themselves valid. Each STS/SAS/OAuth session is
+  still short-lived (`--max-session-ttl`, default 1 hour; GCS tokens are
+  typically ~1 hour), but the mount process remints before expiry and swaps
+  the object-store client in place. A mint failure is retried; the previous
+  session is kept until it expires. `--auth=local` does not remint.
 
 ---
 
