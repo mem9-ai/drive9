@@ -29,6 +29,45 @@ func TestMatchOrgObjectBackendLongestPrefix(t *testing.T) {
 	}
 }
 
+func TestMatchOrgObjectBackendEmptyEndpointDoesNotMatchCustomURI(t *testing.T) {
+	rows := []meta.OrgObjectBackend{
+		{Scheme: "s3", Bucket: "b", Endpoint: "", CredentialKind: meta.ObjectCredentialStatic},
+		{Scheme: "s3", Bucket: "b", Endpoint: "http://127.0.0.1:9000", CredentialKind: meta.ObjectCredentialStatic},
+	}
+	got, err := matchOrgObjectBackend(rows, "s3", "b", "cust/a", "http://127.0.0.1:9000", "cust")
+	if err != nil || got.Backend.Endpoint != "http://127.0.0.1:9000" {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
+	got, err = matchOrgObjectBackend(rows, "s3", "b", "cust/a", "", "cust")
+	if err != nil || got.Backend.Endpoint != "" {
+		t.Fatalf("empty uri endpoint should prefer empty backend: %+v err=%v", got, err)
+	}
+}
+
+func TestValidateSTSEndpoint(t *testing.T) {
+	if err := validateSTSEndpoint(""); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSTSEndpoint("https://sts.amazonaws.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSTSEndpoint("sts.tencentcloudapi.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSTSEndpoint("http://127.0.0.1:9000"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSTSEndpoint("http://169.254.169.254/"); err == nil {
+		t.Fatal("metadata http must fail")
+	}
+	if err := validateSTSEndpoint("https://169.254.169.254/"); err == nil {
+		t.Fatal("metadata https must fail")
+	}
+	if err := validateSTSEndpoint("http://sts.example.com"); err == nil {
+		t.Fatal("plain http remote must fail")
+	}
+}
+
 func TestMatchOrgObjectBackendEndpointDisambiguate(t *testing.T) {
 	rows := []meta.OrgObjectBackend{
 		{Scheme: "s3", Bucket: "b", Endpoint: "https://s3.amazonaws.com", CredentialKind: meta.ObjectCredentialStatic},
@@ -73,6 +112,9 @@ func TestCOSAndTOSAndOSSPolicies(t *testing.T) {
 	oss := ossSessionPolicy("obkt", "cust", true)
 	if !strings.Contains(oss, "acs:oss:*:*:obkt/cust/*") || !strings.Contains(oss, "oss:PutObject") {
 		t.Fatalf("oss policy=%s", oss)
+	}
+	if !strings.Contains(oss, "oss:InitiateMultipartUpload") || !strings.Contains(oss, "oss:UploadPart") || !strings.Contains(oss, "oss:CompleteMultipartUpload") {
+		t.Fatalf("oss multipart missing: %s", oss)
 	}
 }
 
@@ -124,5 +166,24 @@ func TestCanonicalQueryStable(t *testing.T) {
 	got := canonicalQuery(url.Values{"Action": {"AssumeRole"}, "Version": {"2018-01-01"}})
 	if got != "Action=AssumeRole&Version=2018-01-01" {
 		t.Fatalf("got %q", got)
+	}
+	spaced := canonicalQuery(url.Values{"Policy": {`{"Statement": []}`}})
+	if strings.Contains(spaced, "+") || !strings.Contains(spaced, "%20") {
+		t.Fatalf("spaces must be %%20 not +: %q", spaced)
+	}
+}
+
+func TestValidateAdminObjectBackend(t *testing.T) {
+	err := validateAdminObjectBackend(&meta.OrgObjectBackend{
+		Scheme: "tos", Bucket: "b", CredentialKind: meta.ObjectCredentialStatic, AccessKeyID: "ak",
+	})
+	if err == nil || !strings.Contains(err.Error(), "role_arn") {
+		t.Fatalf("err=%v", err)
+	}
+	err = validateAdminObjectBackend(&meta.OrgObjectBackend{
+		Scheme: "gcs", Bucket: "b", Prefix: "x", CredentialKind: meta.ObjectCredentialStatic,
+	})
+	if err == nil || !strings.Contains(err.Error(), "prefix") {
+		t.Fatalf("err=%v", err)
 	}
 }

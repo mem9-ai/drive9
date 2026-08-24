@@ -18,6 +18,8 @@ import (
 	"github.com/mem9-ai/drive9/pkg/meta"
 )
 
+var volcengineHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
 func mintVolcengineTOSSession(ctx context.Context, backend *meta.OrgObjectBackend, secret, externalID, prefix string, write bool, ttl int) (*objectCredentialsResponse, error) {
 	if strings.TrimSpace(backend.RoleARN) == "" {
 		return nil, fmt.Errorf("tos mint requires role_arn (Volcengine AssumeRole)")
@@ -47,7 +49,8 @@ func mintVolcengineTOSSession(ctx context.Context, backend *meta.OrgObjectBacken
 	if err != nil || u.Host == "" {
 		return nil, fmt.Errorf("invalid tos sts_endpoint")
 	}
-	u.RawQuery = query.Encode()
+	signedQuery := canonicalQuery(query)
+	u.RawQuery = signedQuery
 	region := volcengineSTSRegion(backend.Region, u.Host)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -56,13 +59,13 @@ func mintVolcengineTOSSession(ctx context.Context, backend *meta.OrgObjectBacken
 	}
 	now := time.Now().UTC()
 	payloadHash := hashSHA256Hex(nil)
-	xDate, auth := signVolcengine(backend.AccessKeyID, secret, region, "sts", http.MethodGet, u.Host, "/", canonicalQuery(query), payloadHash, now)
+	xDate, auth := signVolcengine(backend.AccessKeyID, secret, region, "sts", http.MethodGet, u.Host, "/", signedQuery, payloadHash, now)
 	req.Header.Set("Host", u.Host)
 	req.Header.Set("X-Date", xDate)
 	req.Header.Set("Authorization", auth)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := volcengineHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("tos assume role: %w", err)
 	}

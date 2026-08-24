@@ -288,6 +288,50 @@ func TestAdminObjectBackendRejectsStaticWithoutSecret(t *testing.T) {
 	}
 }
 
+func TestAdminObjectBackendRejectsUnmintableConfigs(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+	post := func(body map[string]any) int {
+		t.Helper()
+		raw, _ := json.Marshal(body)
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/admin/object-backends", bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(quotaPublicKeyHeader, "public-1")
+		req.Header.Set(quotaPrivateKeyHeader, "private-1")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return resp.StatusCode
+	}
+	if code := post(map[string]any{
+		"public_key": "public-1", "private_key": "private-1",
+		"scheme": "tos", "bucket": "tb", "region": "cn-beijing",
+		"credential_kind": "static", "access_key_id": "ak", "secret_access_key": "sk",
+	}); code != http.StatusBadRequest {
+		t.Fatalf("tos without role status=%d", code)
+	}
+	if code := post(map[string]any{
+		"public_key": "public-1", "private_key": "private-1",
+		"scheme": "gs", "bucket": "gb", "prefix": "nested",
+		"credential_kind": "static", "secret_access_key": `{"type":"service_account"}`,
+	}); code != http.StatusBadRequest {
+		t.Fatalf("gs prefix status=%d", code)
+	}
+	if code := post(map[string]any{
+		"public_key": "public-1", "private_key": "private-1",
+		"scheme": "az", "bucket": "cb", "credential_kind": "role",
+		"role_arn": "arn:azure:unused", "access_key_id": "acct", "secret_access_key": "key",
+	}); code != http.StatusBadRequest {
+		t.Fatalf("az role status=%d", code)
+	}
+}
+
 func TestAdminObjectBackendUpdateAndMultiple(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ts := httptest.NewServer(rt.server)

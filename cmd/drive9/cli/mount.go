@@ -255,11 +255,22 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		if err := validateObjectMount(runtime.GOOS, *mode, *layerRef, *checkpointRef, *profile); err != nil {
 			return err
 		}
+		var serverVal, apiKeyVal, tokenVal string
+		if !authLocal {
+			var credErr error
+			serverVal, apiKeyVal, tokenVal, credErr = resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
+			if credErr != nil {
+				return credErr
+			}
+		}
 		envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
 		wantSupervise := !*noSupervise && !envSuperviseOff
 		supReq := mountSuperviseStartRequest{
 			OriginalArgs:      append([]string(nil), originalArgs...),
 			MountPoint:        mountPoint,
+			Server:            serverVal,
+			APIKey:            apiKeyVal,
+			Token:             tokenVal,
 			RemoteRoot:        objectLoc.Raw,
 			Profile:           "none",
 			MountKind:         mountstate.MountKindObject,
@@ -281,11 +292,16 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 				return startMountSupervisedBackground(supReq)
 			}
 			return startMountBackground(mountBackgroundRequest{
-				Args:       append([]string(nil), args...),
+				Args:       append([]string(nil), originalArgs...),
 				MountPoint: mountPoint,
+				Server:     serverVal,
+				APIKey:     apiKeyVal,
+				Token:      tokenVal,
 			})
 		}
-		return mountObjectStore(objectLoc, mountPoint, *cacheDir, *readOnly, *debug, *supervised, *allowOther)
+		return withEnsureCredentialEnv(serverVal, apiKeyVal, tokenVal, func() error {
+			return mountObjectStore(objectLoc, mountPoint, *cacheDir, *readOnly, *debug, *supervised, *allowOther)
+		})
 	}
 
 	remoteRoot, err = mountpath.NormalizeRoot(remoteRoot)

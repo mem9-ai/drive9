@@ -64,6 +64,7 @@ flags:
   --role-arn ARN                   required for --credential-kind=role; also TOS/OSS
   --access-key-id KEY              required for static HMAC; Azure account name
   --secret-access-key SECRET       HMAC secret, Azure account key, or GCS SA JSON
+                                   (or $DRIVE9_OBJECT_SECRET_ACCESS_KEY)
   --external-id ID
   --max-session-ttl SECONDS
   --force-path-style
@@ -488,6 +489,11 @@ func parseObjectBackendFieldFlags(args []string, allowPositionalID bool) (object
 		f.id = filtered[0]
 		f.idSet = true
 		filtered = filtered[1:]
+	}
+	if !f.secretSet {
+		if v := strings.TrimSpace(os.Getenv("DRIVE9_OBJECT_SECRET_ACCESS_KEY")); v != "" {
+			f.secret, f.secretSet = v, true
+		}
 	}
 	return f, filtered, nil
 }

@@ -75,11 +75,13 @@ Server mint covers **S3, COS, TOS, OSS, GCS, and Azure**.
 - **TOS / OSS**: Volcengine / Aliyun **AssumeRole** only (`--role-arn` is
   required). Those clouds have no AWS-style federation token.
 - **GCS**: server holds a service-account JSON and mints a short-lived OAuth
-  access token. Isolation is **one bucket per tenant** (namespace must match
-  the bucket; backend prefix must be empty).
-- **Azure**: server holds the storage account key and mints a container SAS.
-  Isolation is **one container per tenant** (namespace must match the
-  container; backend prefix must be empty).
+  access token. The token has the **same IAM as that service account** — it is
+  not downscoped to one bucket. Register one SA per bucket (or an SA that can
+  only access that bucket). Namespace must match the bucket; backend prefix
+  must be empty.
+- **Azure**: server holds the storage account key and mints a container SAS
+  cryptographically scoped to that container. Isolation is **one container per
+  tenant** (namespace must match the container; backend prefix must be empty).
 
 ### Escape hatch: `--auth=local`
 
@@ -191,6 +193,10 @@ drive9 umount ./mnt
 - Umount waits briefly for in-flight uploads and does **not** wipe a dirty
   cache, so a remount of the same URI can resume.
 - `mount drain` is drive9-only; object mounts reject it.
+- Server-minted mounts capture one session at start. That session expires
+  (`--max-session-ttl`, default 1 hour; GCS tokens are typically ~1 hour).
+  After expiry, remount to mint again. The supervisor health probe is local
+  and will not restart the worker on object-store 403s.
 
 ---
 
@@ -239,8 +245,9 @@ schema self-repair (add column / create table only).
 
 ## Limits and non-goals
 
-- Azure and GCS mint isolate at container/bucket scope, not a key prefix
-  inside a shared container/bucket. Use one container or bucket per tenant.
+- Azure SAS isolates at container scope. GCS minted tokens are **not**
+  bucket-scoped: isolation is the service account's IAM. Use one dedicated
+  SA (or IAM-limited SA) per bucket, and one container/bucket per tenant.
 - TOS and OSS mint require a role ARN (AssumeRole). COS static keys use
   GetFederationToken.
 - Scoped (workspace-zone) tokens cannot mint object credentials.

@@ -622,7 +622,7 @@ run_drive9_object_cross() {
   check_cmd "fs cp drive9 → object" drive9 fs cp "$remote" "$(obj from-drive9.txt)"
   check_eq "drive9-sourced object" "$(drive9 fs cat "$(obj from-drive9.txt)")" "from-drive9"
   check_cmd "fs cp object → drive9" drive9 fs cp "$(obj hello.txt)" ":/obj-e2e-${TS}-from-s3.txt"
-  check_eq "object-sourced drive9 file" "$(drive9 fs cat ":/obj-e2e-${TS}-from-s3.txt")" "hello"
+  check_eq "object-sourced drive9 file" "$(drive9 fs cat ":/obj-e2e-${TS}-from-s3.txt")" "hello-object"
   drive9 fs rm "$remote" >/dev/null 2>&1 || true
   drive9 fs rm ":/obj-e2e-${TS}-from-s3.txt" >/dev/null 2>&1 || true
 }

@@ -187,7 +187,7 @@ func (s *Server) handleAdminObjectBackendCreate(w http.ResponseWriter, r *http.R
 		ID:               "obb_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
 		OrganizationID:   access.OrganizationID,
 		Name:             strings.TrimSpace(req.Name),
-		Scheme:           strings.ToLower(strings.TrimSpace(req.Scheme)),
+		Scheme:           canonicalObjectScheme(req.Scheme),
 		Endpoint:         strings.TrimSpace(req.Endpoint),
 		STSEndpoint:      strings.TrimSpace(req.STSEndpoint),
 		Region:           strings.TrimSpace(req.Region),
@@ -200,22 +200,8 @@ func (s *Server) handleAdminObjectBackendCreate(w http.ResponseWriter, r *http.R
 		AccessKeyID:      strings.TrimSpace(req.AccessKeyID),
 		MaxSessionTTLSec: req.MaxSessionTTL,
 	}
-	switch rec.Scheme {
-	case "gcs":
-		rec.Scheme = "gs"
-	case "azure":
-		rec.Scheme = "az"
-	}
-	if rec.Scheme == "" || rec.Bucket == "" {
-		errJSON(w, http.StatusBadRequest, "scheme and bucket are required")
-		return
-	}
-	if !mintableObjectScheme(rec.Scheme) {
-		errJSON(w, http.StatusBadRequest, "scheme must be s3, cos, tos, oss, gs, or az")
-		return
-	}
-	if strings.Contains(rec.Prefix, "..") {
-		errJSON(w, http.StatusBadRequest, "prefix must not contain ..")
+	if err := validateAdminObjectBackend(rec); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if rec.MaxSessionTTLSec > 43200 {
@@ -316,7 +302,7 @@ func (s *Server) handleAdminObjectBackendUpdate(w http.ResponseWriter, r *http.R
 		row.Name = strings.TrimSpace(*req.Name)
 	}
 	if req.Scheme != nil {
-		row.Scheme = strings.ToLower(strings.TrimSpace(*req.Scheme))
+		row.Scheme = canonicalObjectScheme(*req.Scheme)
 	}
 	if req.Endpoint != nil {
 		row.Endpoint = strings.TrimSpace(*req.Endpoint)
@@ -354,16 +340,8 @@ func (s *Server) handleAdminObjectBackendUpdate(w http.ResponseWriter, r *http.R
 			row.MaxSessionTTLSec = 43200
 		}
 	}
-	if row.Scheme == "" || row.Bucket == "" {
-		errJSON(w, http.StatusBadRequest, "scheme and bucket are required")
-		return
-	}
-	if !mintableObjectScheme(row.Scheme) {
-		errJSON(w, http.StatusBadRequest, "scheme must be s3, cos, tos, oss, gs, or az")
-		return
-	}
-	if strings.Contains(row.Prefix, "..") {
-		errJSON(w, http.StatusBadRequest, "prefix must not contain ..")
+	if err := validateAdminObjectBackend(row); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if req.SecretAccessKey != nil {

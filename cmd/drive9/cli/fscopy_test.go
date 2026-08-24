@@ -69,6 +69,59 @@ func (w *memWrite) Abort(context.Context) error {
 	return nil
 }
 
+type sameCopyBackend struct {
+	*memBackend
+	copies int
+}
+
+func (s *sameCopyBackend) Stat(_ context.Context, loc Location) (*FileInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.files[loc.Path]; !ok {
+		return nil, ErrNotFound
+	}
+	return &FileInfo{Name: loc.Path, Path: loc.Path, Size: int64(len(s.files[loc.Path]))}, nil
+}
+
+func (s *sameCopyBackend) Copy(_ context.Context, src, dst Location) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.files[src.Path]
+	if !ok {
+		return ErrNotFound
+	}
+	s.files[dst.Path] = append([]byte(nil), b...)
+	s.copies++
+	return nil
+}
+
+func TestCopySameBackendRefusesOverwriteWithoutForce(t *testing.T) {
+	b := &sameCopyBackend{memBackend: newMem(SchemeS3, "one")}
+	b.files["a.txt"] = []byte("src")
+	b.files["b.txt"] = []byte("existing")
+	src := Location{Raw: "s3://bucket/a.txt", Bucket: "bucket", Path: "a.txt"}
+	dst := Location{Raw: "s3://bucket/b.txt", Bucket: "bucket", Path: "b.txt"}
+	err := Copy(context.Background(), b, b, src, dst, &FileInfo{Size: 3}, CopyOpts{})
+	if err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("err=%v, want --force", err)
+	}
+	if b.copies != 0 {
+		t.Fatal("SameCopier must not run when overwrite is refused")
+	}
+	if got := string(b.files["b.txt"]); got != "existing" {
+		t.Fatalf("dest mutated: %q", got)
+	}
+	if err := Copy(context.Background(), b, b, src, dst, &FileInfo{Size: 3}, CopyOpts{Overwrite: true}); err != nil {
+		t.Fatal(err)
+	}
+	if b.copies != 1 {
+		t.Fatalf("copies=%d", b.copies)
+	}
+	if got := string(b.files["b.txt"]); got != "src" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestStreamCopyNonSeeker(t *testing.T) {
 	src := newMem(SchemeDrive9, "a")
 	dst := newMem(SchemeS3, "b")

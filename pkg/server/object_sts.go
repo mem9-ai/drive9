@@ -71,6 +71,9 @@ func (s *Server) mintObjectSession(ctx context.Context, backend *meta.OrgObjectB
 }
 
 func mintObjectSessionWithSecret(ctx context.Context, backend *meta.OrgObjectBackend, secret, externalID, prefix string, write bool, ttl int) (*objectCredentialsResponse, error) {
+	if err := validateSTSEndpoint(backend.STSEndpoint); err != nil {
+		return nil, err
+	}
 	switch strings.ToLower(strings.TrimSpace(backend.Scheme)) {
 	case "s3":
 		return mintAWSS3Session(ctx, backend, secret, externalID, prefix, write, ttl)
@@ -392,7 +395,7 @@ func matchOrgObjectBackend(rows []meta.OrgObjectBackend, scheme, bucket, key, en
 			if requireEmptyEndpoint && be != "" {
 				continue
 			}
-			if requireEndpoint != "" && be != "" && be != requireEndpoint {
+			if requireEndpoint != "" && be != requireEndpoint {
 				continue
 			}
 			allowed, ok := backendAllowedPrefix(scheme, bucket, ns, b)
@@ -479,22 +482,49 @@ func objectURIInScope(scheme, bucket, key, ns string, b *meta.OrgObjectBackend) 
 	}
 }
 
-func normalizeObjectEndpoint(raw string) string {
+func validateSTSEndpoint(raw string) error {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return ""
+		return nil
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
 	}
 	u, err := url.Parse(raw)
-	if err == nil && u.Host != "" {
-		host := strings.ToLower(u.Host)
-		path := strings.TrimRight(u.Path, "/")
-		scheme := strings.ToLower(u.Scheme)
-		if scheme == "" {
-			scheme = "https"
-		}
-		return strings.TrimRight(scheme+"://"+host+path, "/")
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("sts_endpoint must be an absolute URL")
 	}
-	return strings.TrimRight(strings.ToLower(raw), "/")
+	if u.User != nil {
+		return fmt.Errorf("sts_endpoint must not contain userinfo")
+	}
+	host := strings.ToLower(u.Hostname())
+	if isBlockedSTSHost(host) {
+		return fmt.Errorf("sts_endpoint host is not allowed")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if host == "127.0.0.1" || host == "localhost" || host == "::1" {
+			return nil
+		}
+		return fmt.Errorf("sts_endpoint must use https:// (http:// is only allowed for loopback)")
+	default:
+		return fmt.Errorf("sts_endpoint scheme %q is not allowed", u.Scheme)
+	}
+}
+
+func isBlockedSTSHost(host string) bool {
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	switch host {
+	case "169.254.169.254", "metadata.google.internal", "metadata", "metadata.google.com":
+		return true
+	}
+	return strings.HasPrefix(host, "169.254.") || strings.HasPrefix(host, "fe80:")
+}
+
+func normalizeObjectEndpoint(raw string) string {
+	return meta.NormalizeObjectStoreEndpoint(raw)
 }
 
 func stsHost(raw string) string {
@@ -557,7 +587,8 @@ func ossSessionPolicy(bucket, prefix string, write bool) string {
 	prefix = strings.Trim(prefix, "/")
 	actions := []string{`"oss:GetObject"`, `"oss:GetObjectMeta"`, `"oss:HeadObject"`}
 	if write {
-		actions = append(actions, `"oss:PutObject"`, `"oss:DeleteObject"`, `"oss:AbortMultipartUpload"`,
+		actions = append(actions, `"oss:PutObject"`, `"oss:DeleteObject"`, `"oss:InitiateMultipartUpload"`,
+			`"oss:UploadPart"`, `"oss:CompleteMultipartUpload"`, `"oss:AbortMultipartUpload"`,
 			`"oss:ListParts"`, `"oss:ListMultipartUploads"`)
 	}
 	objARN := fmt.Sprintf("acs:oss:*:*:%s/%s/*", bucket, prefix)
@@ -577,6 +608,51 @@ func tosSessionPolicy(bucket, prefix string, write bool) string {
 	bucketARN := fmt.Sprintf("trn:tos:::%s", bucket)
 	return fmt.Sprintf(`{"Statement":[{"Effect":"Allow","Action":[%s],"Resource":[%q]},{"Effect":"Allow","Action":["tos:ListBucket"],"Resource":[%q],"Condition":{"StringLike":{"tos:prefix":[%q,%q]}}}]}`,
 		strings.Join(actions, ","), objARN, bucketARN, prefix, prefix+"/*")
+}
+
+func canonicalObjectScheme(scheme string) string {
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	switch scheme {
+	case "gcs":
+		return "gs"
+	case "azure":
+		return "az"
+	default:
+		return scheme
+	}
+}
+
+func validateAdminObjectBackend(rec *meta.OrgObjectBackend) error {
+	if rec == nil {
+		return fmt.Errorf("org object backend is required")
+	}
+	rec.Scheme = canonicalObjectScheme(rec.Scheme)
+	if rec.Scheme == "" || strings.TrimSpace(rec.Bucket) == "" {
+		return fmt.Errorf("scheme and bucket are required")
+	}
+	if !mintableObjectScheme(rec.Scheme) {
+		return fmt.Errorf("scheme must be s3, cos, tos, oss, gs, or az")
+	}
+	if strings.Contains(rec.Prefix, "..") {
+		return fmt.Errorf("prefix must not contain ..")
+	}
+	if err := validateSTSEndpoint(rec.STSEndpoint); err != nil {
+		return err
+	}
+	switch rec.Scheme {
+	case "tos", "oss":
+		if strings.TrimSpace(rec.RoleARN) == "" {
+			return fmt.Errorf("%s mint requires role_arn", rec.Scheme)
+		}
+	case "az", "gs":
+		if rec.CredentialKind == meta.ObjectCredentialRole {
+			return fmt.Errorf("%s backends do not support credential_kind=role", rec.Scheme)
+		}
+		if strings.TrimSpace(rec.Prefix) != "" {
+			return fmt.Errorf("%s isolation is per-container/bucket; backend prefix must be empty", rec.Scheme)
+		}
+	}
+	return nil
 }
 
 func mintableObjectScheme(scheme string) bool {

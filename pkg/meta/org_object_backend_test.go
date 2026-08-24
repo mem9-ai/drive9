@@ -133,6 +133,18 @@ func TestSetTenantObjectNamespaceID(t *testing.T) {
 	}
 }
 
+func TestOrgObjectBackendIdentityHashNormalizesEndpoint(t *testing.T) {
+	a := orgObjectBackendIdentityHash(&OrgObjectBackend{
+		OrganizationID: "org", Scheme: "s3", Bucket: "b", Endpoint: "https://S3.Example.com/",
+	})
+	b := orgObjectBackendIdentityHash(&OrgObjectBackend{
+		OrganizationID: "org", Scheme: "s3", Bucket: "b", Endpoint: "https://s3.example.com",
+	})
+	if a == "" || a != b {
+		t.Fatalf("hash %q vs %q", a, b)
+	}
+}
+
 func TestValidateOrgObjectBackend(t *testing.T) {
 	err := validateOrgObjectBackend(&OrgObjectBackend{
 		ID: "obb_1", OrganizationID: "org", Scheme: "s3", Bucket: "b",

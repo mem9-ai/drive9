@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -90,6 +91,15 @@ func Copy(ctx context.Context, srcB, dstB Backend, src, dst Location, srcInfo *F
 	if len(opts.Tags) == 0 && opts.Description == "" &&
 		SameIdentity(srcB, dstB) && src.Bucket == dst.Bucket {
 		if sc, ok := dstB.(SameCopier); ok {
+			if !opts.Overwrite {
+				st, statErr := dstB.Stat(ctx, dst)
+				if statErr == nil && st != nil && !st.IsDir {
+					return fmt.Errorf("object exists (use --force to overwrite): %s", dst.Raw)
+				}
+				if statErr != nil && !errors.Is(statErr, ErrNotFound) {
+					return fmt.Errorf("stat %s: %w", dst.Raw, statErr)
+				}
+			}
 			return sc.Copy(ctx, src, dst)
 		}
 	}

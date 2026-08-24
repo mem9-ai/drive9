@@ -193,17 +193,9 @@ func (a *FS) OpenWrite(ctx context.Context, loc Location, opts WriteOpts) (Write
 	pr, pw := io.Pipe()
 	errc := make(chan error, 1)
 	size := opts.Size
-	putCtx := ctx
-	var cancel context.CancelFunc
-	if _, ok := ctx.Deadline(); !ok {
-		putCtx, cancel = context.WithTimeout(ctx, 15*time.Minute)
-	}
 	go func() {
-		if cancel != nil {
-			defer cancel()
-		}
 		info := object.NewStaticObjectInfo(remote, time.Now(), size, true, nil, a.f)
-		_, err := a.f.Put(putCtx, pr, info)
+		_, err := a.f.Put(ctx, pr, info)
 		if err != nil {
 			_ = pr.CloseWithError(err)
 		} else {
@@ -211,7 +203,7 @@ func (a *FS) OpenWrite(ctx context.Context, loc Location, opts WriteOpts) (Write
 		}
 		errc <- err
 	}()
-	return &writeHandle{ctx: putCtx, pw: pw, errc: errc}, nil
+	return &writeHandle{ctx: ctx, pw: pw, errc: errc}, nil
 }
 
 func (a *FS) Remove(ctx context.Context, loc Location, recursive bool) error {
@@ -273,6 +265,13 @@ func (a *FS) Rename(ctx context.Context, old, new Location) error {
 	}
 	if a.remoteOf(old) == a.remoteOf(new) {
 		return nil
+	}
+	st, err := a.Stat(ctx, new)
+	if err == nil && st != nil && !st.IsDir {
+		return fmt.Errorf("object exists (use --force to overwrite): %s", new.Raw)
+	}
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
 	}
 	if err := a.Copy(ctx, old, new); err != nil {
 		return err

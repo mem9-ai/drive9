@@ -60,6 +60,9 @@ func TestMountObjectStartsSupervisedByDefault(t *testing.T) {
 		return nil
 	}
 
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(EnvServer, "https://drive9.example")
+	t.Setenv(EnvAPIKey, "sk-test")
 	mountPoint := t.TempDir()
 	err := MountCmd([]string{
 		"--mode", "fuse",
@@ -83,6 +86,9 @@ func TestMountObjectStartsSupervisedByDefault(t *testing.T) {
 	}
 	if gotLegacy.MountPoint != "" {
 		t.Fatal("legacy startMountBackground should not run for default supervised object mount")
+	}
+	if gotSupervised.Server != "https://drive9.example" || gotSupervised.APIKey != "sk-test" {
+		t.Fatalf("supervised creds server=%q api=%q, want env snapshot so the worker can mint", gotSupervised.Server, gotSupervised.APIKey)
 	}
 }
 
@@ -142,6 +148,9 @@ func TestMountObjectNoSuperviseUsesLegacyBackground(t *testing.T) {
 		return nil
 	}
 
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(EnvServer, "https://drive9.example")
+	t.Setenv(EnvAPIKey, "sk-test")
 	mountPoint := t.TempDir()
 	err := MountCmd([]string{
 		"--mode", "fuse",
@@ -154,6 +163,9 @@ func TestMountObjectNoSuperviseUsesLegacyBackground(t *testing.T) {
 	}
 	if got.MountPoint != mountPoint {
 		t.Fatalf("MountPoint = %q, want %q", got.MountPoint, mountPoint)
+	}
+	if got.Server != "https://drive9.example" || got.APIKey != "sk-test" {
+		t.Fatalf("legacy background creds server=%q api=%q", got.Server, got.APIKey)
 	}
 }
 
@@ -173,6 +185,9 @@ func TestMountObjectForegroundPassesCacheDir(t *testing.T) {
 		return nil
 	}
 
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(EnvServer, "https://drive9.example")
+	t.Setenv(EnvAPIKey, "sk-test")
 	err := MountCmd([]string{
 		"--foreground",
 		"--mode", "fuse",

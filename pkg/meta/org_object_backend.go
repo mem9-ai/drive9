@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -229,7 +230,7 @@ func normalizeOrgObjectBackend(b *OrgObjectBackend) {
 	case "azure":
 		b.Scheme = "az"
 	}
-	b.Endpoint = strings.TrimRight(strings.TrimSpace(b.Endpoint), "/")
+	b.Endpoint = NormalizeObjectStoreEndpoint(b.Endpoint)
 	b.STSEndpoint = strings.TrimSpace(b.STSEndpoint)
 	b.Region = strings.TrimSpace(b.Region)
 	b.AccountID = strings.TrimSpace(b.AccountID)
@@ -244,14 +245,41 @@ func orgObjectBackendIdentityHash(b *OrgObjectBackend) string {
 	if b == nil {
 		return ""
 	}
+	scheme := strings.ToLower(strings.TrimSpace(b.Scheme))
+	switch scheme {
+	case "gcs":
+		scheme = "gs"
+	case "azure":
+		scheme = "az"
+	}
 	sum := sha256.Sum256([]byte(strings.Join([]string{
 		strings.TrimSpace(b.OrganizationID),
-		strings.ToLower(strings.TrimSpace(b.Scheme)),
+		scheme,
 		strings.TrimSpace(b.Bucket),
 		strings.Trim(strings.TrimSpace(b.Prefix), "/"),
-		strings.TrimRight(strings.TrimSpace(b.Endpoint), "/"),
+		NormalizeObjectStoreEndpoint(b.Endpoint),
 	}, "\n")))
 	return hex.EncodeToString(sum[:])
+}
+
+// NormalizeObjectStoreEndpoint canonicalizes a data-plane object endpoint for
+// identity matching (scheme default https, lowercase host, no trailing slash).
+func NormalizeObjectStoreEndpoint(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err == nil && u.Host != "" {
+		host := strings.ToLower(u.Host)
+		path := strings.TrimRight(u.Path, "/")
+		scheme := strings.ToLower(u.Scheme)
+		if scheme == "" {
+			scheme = "https"
+		}
+		return strings.TrimRight(scheme+"://"+host+path, "/")
+	}
+	return strings.TrimRight(strings.ToLower(raw), "/")
 }
 
 func validateOrgObjectBackend(b *OrgObjectBackend) error {
