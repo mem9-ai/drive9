@@ -31,9 +31,11 @@ import (
 
 // Mount blocks until the filesystem is unmounted.
 func Mount(opts Options) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	f, fileLeaf, err := OpenFsWithSession(ctx, opts.Location, opts.Session)
-	cancel()
+	// rclone S3 stores this context and uses it for backend Command("set")
+	// when refreshing STS. It must outlive the mount, not the initial open.
+	fsCtx, stopFs := context.WithCancel(context.Background())
+	defer stopFs()
+	f, fileLeaf, err := OpenFsWithSession(fsCtx, opts.Location, opts.Session)
 	if err != nil {
 		return err
 	}
@@ -41,10 +43,8 @@ func Mount(opts Options) error {
 		return fmt.Errorf("object-store mount requires a directory prefix, not a file key %q", fileLeaf)
 	}
 	if opts.Mint != nil {
-		wrapped := newSessionFs(f, "drive9-object", objectRoot(opts.Location))
-		stopRefresh := startSessionRefresh(context.Background(), wrapped, opts.Location, opts.Mint, opts.SessionExpiry)
+		stopRefresh := startSessionRefresh(fsCtx, f, opts.Mint, opts.SessionExpiry)
 		defer stopRefresh()
-		f = wrapped
 	}
 	vopt := vfscommon.Opt
 	vopt.CacheMode = vfscommon.CacheModeWrites

@@ -54,6 +54,7 @@ func OpenFs(ctx context.Context, loc Location) (f fs.Fs, fileLeaf string, err er
 
 func OpenFsWithSession(ctx context.Context, loc Location, sess SessionCredentials) (f fs.Fs, fileLeaf string, err error) {
 	ensureRclone()
+	ctx = attachSessionTransport(ctx, sess)
 	spec, err := connectionString(loc, sess)
 	if err != nil {
 		return nil, "", err

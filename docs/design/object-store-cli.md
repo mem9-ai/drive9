@@ -195,9 +195,13 @@ drive9 umount ./mnt
 - `mount drain` is drive9-only; object mounts reject it.
 - Server-minted mounts keep themselves valid. Each STS/SAS/OAuth session is
   still short-lived (`--max-session-ttl`, default 1 hour; GCS tokens are
-  typically ~1 hour), but the mount process remints before expiry and swaps
-  the object-store client in place. A mint failure is retried; the previous
-  session is kept until it expires. `--auth=local` does not remint.
+  typically ~1 hour), but the mount process remints before expiry and
+  refreshes credentials on the **same** rclone Fs (S3/COS/TOS/OSS via rclone's
+  `backend set`; GCS/Azure by rotating the token/SAS on the existing HTTP
+  client). The Fs pointer and `Name()` stay stable so same-bucket copy/rename
+  keep using server-side CopyObject instead of download+upload, and the old
+  client is not leaked. A mint failure is retried; the previous session is
+  kept until it expires. `--auth=local` does not remint.
 
 ---
 

@@ -2,14 +2,12 @@ package objectfs
 
 import (
 	"context"
-	"io"
+	"errors"
+	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/hash"
-	"github.com/rclone/rclone/fs/walk"
 	"go.uber.org/zap"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -28,134 +26,13 @@ const (
 	sessionDefaultTTL      = 50 * time.Minute
 )
 
-type sessionFs struct {
-	mu    sync.RWMutex
-	inner fs.Fs
-	name  string
-	root  string
-}
-
-func newSessionFs(inner fs.Fs, name, root string) *sessionFs {
-	return &sessionFs{inner: inner, name: name, root: root}
-}
-
-func (s *sessionFs) current() fs.Fs {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.inner
-}
-
-func (s *sessionFs) replace(inner fs.Fs) {
-	s.mu.Lock()
-	s.inner = inner
-	s.mu.Unlock()
-}
-
-func (s *sessionFs) Name() string {
-	return s.name
-}
-
-func (s *sessionFs) Root() string {
-	return s.root
-}
-
-func (s *sessionFs) String() string {
-	return s.name + ":" + s.root
-}
-
-func (s *sessionFs) Precision() time.Duration {
-	return s.current().Precision()
-}
-
-func (s *sessionFs) Hashes() hash.Set {
-	return s.current().Hashes()
-}
-
-func (s *sessionFs) Features() *fs.Features {
-	inner := s.current().Features()
-	ft := &fs.Features{
-		BucketBased:             inner.BucketBased,
-		BucketBasedRootOK:       inner.BucketBasedRootOK,
-		CanHaveEmptyDirectories: inner.CanHaveEmptyDirectories,
-		ReadMimeType:            inner.ReadMimeType,
-		WriteMimeType:           inner.WriteMimeType,
-		SlowHash:                inner.SlowHash,
-		SlowModTime:             inner.SlowModTime,
-	}
-	return ft.Fill(context.Background(), s)
-}
-
-func (s *sessionFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
-	return s.current().List(ctx, dir)
-}
-
-func (s *sessionFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	return s.current().NewObject(ctx, remote)
-}
-
-func (s *sessionFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	return s.current().Put(ctx, in, src, options...)
-}
-
-func (s *sessionFs) Mkdir(ctx context.Context, dir string) error {
-	return s.current().Mkdir(ctx, dir)
-}
-
-func (s *sessionFs) Rmdir(ctx context.Context, dir string) error {
-	return s.current().Rmdir(ctx, dir)
-}
-
-func (s *sessionFs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
-	if c, ok := s.current().(fs.Copier); ok {
-		return c.Copy(ctx, src, remote)
-	}
-	return nil, fs.ErrorCantCopy
-}
-
-func (s *sessionFs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
-	if m, ok := s.current().(fs.Mover); ok {
-		return m.Move(ctx, src, remote)
-	}
-	return nil, fs.ErrorCantMove
-}
-
-func (s *sessionFs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	if p, ok := s.current().(fs.PutStreamer); ok {
-		return p.PutStream(ctx, in, src, options...)
-	}
-	return s.Put(ctx, in, src, options...)
-}
-
-func (s *sessionFs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) error {
-	if lr, ok := s.current().(fs.ListRer); ok {
-		return lr.ListR(ctx, dir, callback)
-	}
-	return walk.ErrorCantListR
-}
-
-func (s *sessionFs) Purge(ctx context.Context, dir string) error {
-	if p, ok := s.current().(fs.Purger); ok {
-		return p.Purge(ctx, dir)
-	}
-	return fs.ErrorCantPurge
-}
-
-var (
-	_ fs.Fs          = (*sessionFs)(nil)
-	_ fs.Copier      = (*sessionFs)(nil)
-	_ fs.Mover       = (*sessionFs)(nil)
-	_ fs.PutStreamer = (*sessionFs)(nil)
-	_ fs.ListRer     = (*sessionFs)(nil)
-	_ fs.Purger      = (*sessionFs)(nil)
-)
-
-func startSessionRefresh(parent context.Context, s *sessionFs, loc Location, mint MintSession, expiry time.Time) context.CancelFunc {
+func startSessionRefresh(parent context.Context, f fs.Fs, mint MintSession, expiry time.Time) context.CancelFunc {
 	ctx, cancel := context.WithCancel(parent)
-	go runSessionRefresh(ctx, s, loc, mint, expiry)
+	go runSessionRefresh(ctx, f, mint, expiry)
 	return cancel
 }
 
-func runSessionRefresh(ctx context.Context, s *sessionFs, loc Location, mint MintSession, expiry time.Time) {
+func runSessionRefresh(ctx context.Context, f fs.Fs, mint MintSession, expiry time.Time) {
 	failWait := sessionRefreshFailWait
 	for {
 		wait := sessionRefreshWait(effectiveSessionExpiry(expiry, time.Now()), time.Now())
@@ -181,18 +58,59 @@ func runSessionRefresh(ctx context.Context, s *sessionFs, loc Location, mint Min
 			continue
 		}
 		failWait = sessionRefreshFailWait
-		openCtx, openCancel := context.WithTimeout(ctx, sessionRefreshMintWait)
-		next, err := OpenFsBucketWithSession(openCtx, loc, sess)
-		openCancel()
+		applyCtx, applyCancel := context.WithTimeout(ctx, sessionRefreshMintWait)
+		err = applySession(applyCtx, f, sess)
+		applyCancel()
 		if err != nil {
-			logger.Warn(ctx, "object mount failed to open refreshed session; will retry", zap.Error(err))
+			logger.Warn(ctx, "object mount failed to apply refreshed session; will retry", zap.Error(err), zap.Duration("retry_in", failWait))
 			expiry = time.Now().Add(failWait)
 			continue
 		}
-		s.replace(next)
 		expiry = nextExp
 		logger.Info(ctx, "object mount session refreshed", zap.Time("expiration", effectiveSessionExpiry(expiry, time.Now())))
 	}
+}
+
+// applySession updates credentials on the existing rclone Fs. It never
+// constructs a replacement Fs: rclone S3 Copy/Move only run server-side
+// when src.Fs().Name() == dst.Name(), and on-the-fly remotes put a hash of
+// the keys in Name().
+func applySession(ctx context.Context, f fs.Fs, sess SessionCredentials) error {
+	if sess.AccessKeyID == "" && sess.AccessToken == "" && sess.SASURL == "" {
+		return fmt.Errorf("objectfs: refreshed session has no credentials")
+	}
+	if sess.AccessKeyID != "" {
+		if err := applyS3Session(ctx, f, sess); err != nil {
+			return err
+		}
+	}
+	if sess.AccessToken != "" {
+		setGCSAccessToken(sess.AccessToken)
+	}
+	if sess.SASURL != "" {
+		installAzureSASFilter(sess.SASURL)
+	}
+	return nil
+}
+
+func applyS3Session(ctx context.Context, f fs.Fs, sess SessionCredentials) error {
+	cmd, ok := f.(fs.Commander)
+	if !ok {
+		return fmt.Errorf("objectfs: rclone %s does not support in-place credential refresh", f.Name())
+	}
+	_, err := cmd.Command(ctx, "set", nil, map[string]string{
+		"env_auth":          "false",
+		"access_key_id":     sess.AccessKeyID,
+		"secret_access_key": sess.SecretAccessKey,
+		"session_token":     sess.SessionToken,
+	})
+	if err != nil {
+		if errors.Is(err, fs.ErrorCommandNotFound) {
+			return fmt.Errorf("objectfs: rclone %s does not support in-place credential refresh", f.Name())
+		}
+		return fmt.Errorf("rclone backend set: %w", err)
+	}
+	return nil
 }
 
 func effectiveSessionExpiry(exp, now time.Time) time.Time {
