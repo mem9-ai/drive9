@@ -147,7 +147,12 @@ drive9() {
       fi
       ;;
     mount)
-      bin_args=(mount --auth=local "${bin_args[@]:1}")
+      case "${2:-}" in
+        status | health | drain | ensure | supervise | vault | systemd-unit) ;;
+        *)
+          bin_args=(mount --auth=local "${bin_args[@]:1}")
+          ;;
+      esac
       ;;
   esac
   if command -v timeout >/dev/null 2>&1; then
@@ -622,7 +627,7 @@ run_drive9_object_cross() {
   drive9 fs rm ":/obj-e2e-${TS}-from-s3.txt" >/dev/null 2>&1 || true
 }
 
-run_drive9_object_cross()
+run_drive9_object_cross
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"

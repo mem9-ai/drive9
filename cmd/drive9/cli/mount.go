@@ -131,6 +131,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
+	// Re-exec the supervised worker with the same --auth flag. peelObjectAuth
+	// strips it before flag.Parse, so restore it on OriginalArgs.
+	originalArgs := append([]string(nil), args...)
+	if authLocal {
+		originalArgs = append([]string{"--auth=local"}, args...)
+	}
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
@@ -252,7 +258,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
 		wantSupervise := !*noSupervise && !envSuperviseOff
 		supReq := mountSuperviseStartRequest{
-			OriginalArgs:      append([]string(nil), args...),
+			OriginalArgs:      append([]string(nil), originalArgs...),
 			MountPoint:        mountPoint,
 			RemoteRoot:        objectLoc.Raw,
 			Profile:           "none",
@@ -536,7 +542,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if *superviseForeground {
 		// This process becomes the supervisor (blocks).
 		return runSuperviseForeground(mountSuperviseStartRequest{
-			OriginalArgs:      append([]string(nil), args...),
+			OriginalArgs:      append([]string(nil), originalArgs...),
 			MountPoint:        mountPoint,
 			Server:            serverVal,
 			APIKey:            apiKeyVal,
@@ -559,7 +565,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if background && !*foreground {
 		if wantSupervise && resolved == MountModeFUSE && runtime.GOOS != "windows" {
 			return startMountSupervisedBackground(mountSuperviseStartRequest{
-				OriginalArgs:      append([]string(nil), args...),
+				OriginalArgs:      append([]string(nil), originalArgs...),
 				MountPoint:        mountPoint,
 				Server:            serverVal,
 				APIKey:            apiKeyVal,

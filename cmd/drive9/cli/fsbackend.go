@@ -44,12 +44,12 @@ func peelObjectAuth(args []string) (authLocal bool, rest []string, err error) {
 	rest = make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		switch {
-		case a == "--auth=local":
+		switch a {
+		case "--auth=local":
 			authLocal = true
-		case a == "--auth=server":
+		case "--auth=server":
 			authLocal = false
-		case a == "--auth":
+		case "--auth":
 			if i+1 >= len(args) {
 				return false, nil, fmt.Errorf("--auth requires local or server")
 			}
@@ -501,10 +501,6 @@ type objectBackend struct {
 	client    *client.Client
 	authLocal bool
 	write     bool
-}
-
-func openObject(ctx context.Context, loc Location) (*objectBackend, error) {
-	return openObjectAuthenticated(ctx, nil, loc, true)
 }
 
 func openObjectAuthenticated(ctx context.Context, c *client.Client, loc Location, authLocal bool) (*objectBackend, error) {

@@ -288,7 +288,7 @@ func adminTenantObjectNamespaceSet(args []string) error {
 		return fmt.Errorf("--namespace-id is required")
 	}
 	if strings.ContainsAny(ns, "/\\") || strings.Contains(ns, "..") {
-		return fmt.Errorf("namespace_id must not contain slashes or ..")
+		return fmt.Errorf("namespace_id must not contain slashes or parent-directory segments")
 	}
 	out, err := c.AdminSetObjectNamespace(context.Background(), tenantID, ns, publicKey, privateKey)
 	if err != nil {

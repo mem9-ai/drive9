@@ -95,7 +95,7 @@ func TestAdminTenantObjectNamespaceSetRejectsSlash(t *testing.T) {
 		"--tidbcloud-private-key", "private-1",
 		"--server", "http://127.0.0.1:1",
 	})
-	if err == nil || !strings.Contains(err.Error(), "slashes") {
+	if err == nil || !strings.Contains(err.Error(), "slashes") || !strings.Contains(err.Error(), "parent-directory") {
 		t.Fatalf("err=%v", err)
 	}
 }

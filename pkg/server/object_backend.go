@@ -528,7 +528,7 @@ func normalizeObjectNamespaceID(ns string) (string, error) {
 		return "", fmt.Errorf("namespace_id is required")
 	}
 	if strings.ContainsAny(ns, "/\\") || strings.Contains(ns, "..") {
-		return "", fmt.Errorf("namespace_id must not contain slashes or ..")
+		return "", fmt.Errorf("namespace_id must not contain slashes or parent-directory segments")
 	}
 	if len(ns) > 255 {
 		return "", fmt.Errorf("namespace_id is too long")

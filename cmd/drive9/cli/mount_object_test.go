@@ -86,6 +86,41 @@ func TestMountObjectStartsSupervisedByDefault(t *testing.T) {
 	}
 }
 
+func TestMountObjectSupervisedKeepsAuthLocal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("object mounts are unsupported on Windows")
+	}
+	oldStartSupervised := startMountSupervisedBackground
+	t.Cleanup(func() { startMountSupervisedBackground = oldStartSupervised })
+
+	var got mountSuperviseStartRequest
+	startMountSupervisedBackground = func(req mountSuperviseStartRequest) error {
+		got = req
+		return nil
+	}
+
+	mountPoint := t.TempDir()
+	err := MountCmd([]string{
+		"--auth=local",
+		"--mode", "fuse",
+		"s3://bucket/prefix/",
+		mountPoint,
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	found := false
+	for _, a := range got.OriginalArgs {
+		if a == "--auth=local" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("OriginalArgs = %v, want --auth=local so the supervised worker does not mint", got.OriginalArgs)
+	}
+}
+
 func TestMountObjectNoSuperviseUsesLegacyBackground(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("object mounts are unsupported on Windows")
