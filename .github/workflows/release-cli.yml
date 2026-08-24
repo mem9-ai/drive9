@@ -9,7 +9,7 @@ concurrency:
 
 jobs:
   release:
-    name: Build and publish CLI
+    name: Build and Publish CLI
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20

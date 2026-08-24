@@ -14,7 +14,6 @@ APP_NAME ?= drive9-server
 CLI_NAME ?= drive9
 MIGRATION_NAME ?= drive9-migration
 KUBE_PLUGIN_NAME ?= kubectl-drive9-migration
-LOCAL_SERVER_NAME ?= drive9-server-local
 
 BIN_DIR ?= bin
 # Use an absolute GOBIN for tool installation; `go install` is more predictable
@@ -25,7 +24,6 @@ SERVER_BIN ?= $(BIN_DIR)/$(APP_NAME)
 CLI_BIN ?= $(BIN_DIR)/$(CLI_NAME)
 MIGRATION_BIN ?= $(BIN_DIR)/$(MIGRATION_NAME)
 KUBE_PLUGIN_BIN ?= $(BIN_DIR)/$(KUBE_PLUGIN_NAME)
-LOCAL_SERVER_BIN ?= $(BIN_DIR)/$(LOCAL_SERVER_NAME)
 
 VERSION ?=
 GIT_HASH ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
@@ -56,13 +54,13 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
 	$(GO) mod download
 
-# Run tests. MySQL-backed suites reuse DRIVE9_TEST_MYSQL_DSN when provided. When
+# Run tests. TiDB-backed suites reuse DRIVE9_TEST_TIDB_DSN when provided. When
 # it is unset and podman is available locally, automatically configure the
 # podman-backed testcontainers environment before running go test.
 # - TEST_P to pass `-p <value>` to `go test`
@@ -78,7 +76,7 @@ test:
 	if [ -n "$(TEST_RUN)" ]; then \
 		test_run_flag="-run $(TEST_RUN)"; \
 	fi; \
-	if [ -z "$${DRIVE9_TEST_MYSQL_DSN:-}" ] && command -v podman >/dev/null 2>&1; then \
+	if [ -z "$${DRIVE9_TEST_TIDB_DSN:-}" ] && command -v podman >/dev/null 2>&1; then \
 		if podman_env="$$(bash -lc 'source ./scripts/test-podman.sh && env | grep -E "^(DOCKER_HOST|TESTCONTAINERS_RYUK_DISABLED)="')"; then \
 			while IFS= read -r line; do \
 				export "$$line"; \
@@ -119,19 +117,22 @@ build-server:
 	mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(SERVER_BIN) ./cmd/drive9-server
 
-build-server-local:
-	mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(LOCAL_SERVER_BIN) ./cmd/drive9-server-local
+run-server-local: build-server
+	@DRIVE9_TENANT_PROVIDER="$${DRIVE9_TENANT_PROVIDER:-local}" "./$(SERVER_BIN)"
 
-run-server-local: build-server-local
-	@source ./scripts/drive9-server-local-env.sh && "./$(LOCAL_SERVER_BIN)"
-
+# One-shot local e2e: start TiDB if needed, start drive9-server (provider=local),
+# run e2e/smoke-all.sh (local-e2e.yml PR set, including FUSE). Extra flags:
+#   make e2e-local
+#   make e2e-local E2E_LOCAL_ARGS="--keep-server"
+#   RUN_API_ONLY=1 make e2e-local
+#   RUN_FUSE_SMOKE=0 make e2e-local
 e2e-local:
-	bash e2e/local-smoke.sh
+	bash scripts/e2e-local.sh $(E2E_LOCAL_ARGS)
 
 # Run the cross-SDK live-server integration suites for all drive9 SDKs
-# (Go, TypeScript, Rust, Python, Kotlin, Swift). Boots a disposable Docker MySQL
-# container, starts drive9-server-local, points each SDK at it via
+# (Go, TypeScript, Rust, Python, Kotlin, Swift). Expects TiDB on
+# DRIVE9_LOCAL_DSN (default 127.0.0.1:4000), starts drive9-server (provider=local),
+# points each SDK at it via
 # DRIVE9_SERVER/DRIVE9_API_KEY, runs every suite, and tears it all down.
 # Pass extra args through to the runner via SDK_INTEGRATION_ARGS, e.g.:
 #   make sdk-integration-tests

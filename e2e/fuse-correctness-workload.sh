@@ -177,7 +177,7 @@ start_mount() {
     echo "=== drive9 correctness mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
     echo "remote_root=$ROOT_REMOTE"
   } >>"$MOUNT_LOG"
-  drive9 mount --read-only ":$ROOT_REMOTE" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+  drive9 mount --mode=fuse --read-only ":$ROOT_REMOTE" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
 
   if wait_mount_state mounted; then

@@ -200,7 +200,7 @@ wait_mount_state() {
 }
 
 start_mount() {
-  local mount_args=(mount)
+  local mount_args=(mount --mode=fuse)
   if [ "$FUSE_SQLITE_MOUNT_DEBUG" = "1" ]; then
     mount_args+=(--debug)
   fi

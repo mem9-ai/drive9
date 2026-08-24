@@ -47,17 +47,29 @@ func TestPatchFileSendsExplicitPartSize(t *testing.T) {
 				UploadID: "patch-123",
 				PartSize: 6,
 				UploadParts: []*PatchPartURL{{
-					Number:      2,
-					URL:         fmt.Sprintf("http://%s/upload/2", r.Host),
-					Size:        6,
-					Headers:     map[string]string{"X-Upload-Token": "upload-token"},
-					ReadURL:     fmt.Sprintf("http://%s/read/2", r.Host),
-					ReadHeaders: map[string]string{"Range": "bytes=6-11"},
+					Number: 2,
+					URL:    fmt.Sprintf("http://%s/upload/2", r.Host),
+					Size:   6,
+					Headers: map[string]string{
+						"X-Upload-Token": "upload-token",
+						"authorization":  "Bearer leaked",
+						"x-dAt9-aCtOr":   "actor-leaked",
+					},
+					ReadURL: fmt.Sprintf("http://%s/read/2", r.Host),
+					ReadHeaders: map[string]string{
+						"Range":         "bytes=6-11",
+						"Authorization": "Bearer leaked",
+						"X-Dat9-Actor":  "actor-leaked",
+					},
 				}},
 				CopiedParts: []int{1},
 			})
 
 		case r.Method == http.MethodGet && r.URL.Path == "/read/2":
+			if r.Header.Get("Authorization") != "" || r.Header.Get("X-Dat9-Actor") != "" {
+				http.Error(w, "read target received Drive9 credentials", http.StatusBadRequest)
+				return
+			}
 			if got := r.Header.Get("Range"); got != "bytes=6-11" {
 				http.Error(w, "missing range header", http.StatusBadRequest)
 				return
@@ -65,6 +77,10 @@ func TestPatchFileSendsExplicitPartSize(t *testing.T) {
 			_, _ = w.Write([]byte("orig!!"))
 
 		case r.Method == http.MethodPut && r.URL.Path == "/upload/2":
+			if r.Header.Get("Authorization") != "" || r.Header.Get("X-Dat9-Actor") != "" {
+				http.Error(w, "upload target received Drive9 credentials", http.StatusBadRequest)
+				return
+			}
 			if got := r.Header.Get("X-Upload-Token"); got != "upload-token" {
 				http.Error(w, "missing upload token", http.StatusBadRequest)
 				return
@@ -387,5 +403,24 @@ func TestPatchUploadRespectsPresignedChecksumHeader(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPatchUploadPartLimitsErrorBody(t *testing.T) {
+	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, strings.Repeat("x", 65<<10))
+	}))
+	defer s3.Close()
+
+	c := New("http://drive9.test", "")
+	err := c.uploadPatchPart(context.Background(), &PatchPartURL{Number: 1, URL: s3.URL, Size: 7}, func(int, int64, []byte) ([]byte, error) {
+		return []byte("payload"), nil
+	})
+	if err == nil {
+		t.Fatal("uploadPatchPart error = nil, want S3 error")
+	}
+	if len(err.Error()) > (64<<10)+64 {
+		t.Fatalf("uploadPatchPart error length = %d, want bounded S3 response", len(err.Error()))
 	}
 }

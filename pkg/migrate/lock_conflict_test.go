@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 )
 
@@ -46,7 +46,7 @@ func TestSplitTablesMigratorConcurrentRuns(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 	ctx := context.Background()
-	testmysql.ResetDB(t, s.DB())
+	testtidb.ResetDB(t, s.DB())
 
 	const fileCount = 300
 	var fileVals, nodeVals strings.Builder

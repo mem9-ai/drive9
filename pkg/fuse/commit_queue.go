@@ -19,7 +19,7 @@ import (
 var errCommitPostUpload = errors.New("commit post-upload step failed")
 
 const (
-	maxInlineLayerEntryBytes     = 96 << 20
+	maxInlineLayerEntryBytes     = client.DefaultFSLayerInlineEntryBytes
 	zeroTruncateCommitQueueDelay = 50 * time.Millisecond
 	defaultCommitBatchMaxItems   = 64
 	defaultCommitBatchMaxBytes   = client.MaxBatchWriteBytes

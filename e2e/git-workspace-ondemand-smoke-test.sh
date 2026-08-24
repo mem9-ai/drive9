@@ -12,11 +12,11 @@
 #   AC5 delete suite workspaces + filter index for root → remount refresh=0
 #
 # Not covered here (no client-visible counter yet): AC1 "index Stat ≤1".
-# Tenant isolation: all index/list asserts filter by suite RemoteRoot (shared
-# local-dev-key may already have other roots' entries; never require global 404).
+# Tenant isolation: all index/list asserts filter by suite RemoteRoot (a
+# reused tenant may already have other roots' entries; never require global 404).
 #
 # Usage:
-#   DRIVE9_BASE=http://127.0.0.1:9009 DRIVE9_API_KEY=local-dev-key \
+#   DRIVE9_BASE=http://127.0.0.1:9009 DRIVE9_API_KEY=<provisioned-jwt> \
 #     bash e2e/git-workspace-ondemand-smoke-test.sh
 
 set -euo pipefail
@@ -875,7 +875,7 @@ precheck_fuse() {
 cleanup() {
   local rc=$?
   stop_mount >/dev/null 2>&1 || true
-  # Existing-tenant CI (local-dev-key) accumulates timestamped remote trees; always
+  # Existing-tenant CI accumulates timestamped remote trees; always
   # best-effort delete the suite RemoteRoot when API credentials are known.
   if [ -n "${API_KEY:-}" ] && [ -n "${REMOTE_ROOT:-}" ] && [ -n "${CLI_BIN:-}" ] && [ -x "${CLI_BIN:-}" ]; then
     drive9 fs rm -r --force ":$REMOTE_ROOT" >/dev/null 2>&1 || \

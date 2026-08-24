@@ -11,7 +11,10 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
-const cliLayerInlineLimit = 96 << 20
+// Inline layer entries are JSON/base64 encoded and the server caps that
+// request body at 128 MiB. Leave room for the JSON envelope below the 96 MiB
+// raw-content boundary implied by base64 expansion.
+const cliLayerInlineLimit = client.DefaultFSLayerInlineEntryBytes
 
 func layerBaseRevision(ctx context.Context, c *client.Client, remotePath string) (int64, error) {
 	stat, err := c.StatCtx(ctx, remotePath)
@@ -49,7 +52,12 @@ func uploadReaderToLayer(ctx context.Context, c *client.Client, layerRef, remote
 	if err != nil {
 		return err
 	}
-	if size <= cliLayerInlineLimit {
+	inlineLimit := c.CachedSmallFileThreshold()
+	if inlineLimit <= 0 {
+		inlineLimit = client.DefaultSmallFileThreshold
+	}
+	inlineLimit = min(inlineLimit, cliLayerInlineLimit)
+	if size <= inlineLimit {
 		data, err := io.ReadAll(r)
 		if err != nil {
 			return fmt.Errorf("read layer upload: %w", err)

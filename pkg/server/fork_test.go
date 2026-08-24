@@ -240,6 +240,11 @@ func newForkCleanupTestRuntimeWithProvisioner(t *testing.T, override tenant.Prov
 	}
 	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: configuredProvisioner,
 		TokenSecret: []byte("ctx-fork-test-secret")})
+	select {
+	case <-server.forkStartupResumeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for startup fork cleanup resume")
+	}
 	t.Cleanup(server.Close)
 	return &forkCleanupTestRuntime{server: server, meta: db.Meta, pool: db.Pool, prov: prov, dbHost: db.DBHost, dbPort: db.DBPort, dbUser: db.DBUser, dbPass: db.DBPass, dbName: db.DBName}
 }
@@ -1098,7 +1103,18 @@ func TestCreateForkTenantPersistsPrivateEndpointDBTLS(t *testing.T) {
 				t.Fatalf("decrypt fork password: %v", err)
 			}
 			dsn := tenantDSN(forkTenant.DBUser, string(plain), forkTenant.DBHost, forkTenant.DBPort, forkTenant.DBName, forkTenant.DBTLS, forkTenant.Provider)
-			if !strings.Contains(dsn, tc.wantDSNTLS) {
+			switch {
+			case tc.wantDBTLS:
+				if !strings.Contains(dsn, "tls=true") {
+					t.Fatalf("fork DSN = %q, want tls=true", dsn)
+				}
+			case strings.Contains(dsn, "tls=true"):
+				t.Fatalf("fork DSN = %q, private endpoint should not use tls=true", dsn)
+			case tenant.IsLoopbackDBHost(forkTenant.DBHost):
+				if strings.Contains(dsn, "tls=") {
+					t.Fatalf("fork DSN = %q, loopback TiDB should not request TLS", dsn)
+				}
+			case !strings.Contains(dsn, tc.wantDSNTLS):
 				t.Fatalf("fork DSN = %q, want it to contain %q", dsn, tc.wantDSNTLS)
 			}
 		})

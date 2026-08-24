@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 )
 
 func TestLeaderDisabledAlwaysLeader(t *testing.T) {
@@ -37,11 +37,11 @@ func TestLeaderNilDBIsDisabled(t *testing.T) {
 
 func newTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db := testmysql.OpenDB(t, testDSN)
+	db := testtidb.OpenDB(t, testDSN)
 	// Leader election is connection-scoped (GET_LOCK/IS_USED_LOCK/RELEASE_LOCK)
 	// and does not touch any tables, but reset keeps the package consistent with
 	// the repo's shared-MySQL convention.
-	testmysql.ResetDB(t, db)
+	testtidb.ResetDB(t, db)
 	return db
 }
 

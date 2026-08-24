@@ -35,6 +35,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/slockoauth"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/db9"
+	"github.com/mem9-ai/drive9/pkg/tenant/local"
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 	"github.com/mem9-ai/drive9/pkg/tenant/starter"
 	"github.com/mem9-ai/drive9/pkg/tenant/tidbcloudnative"
@@ -86,9 +87,15 @@ func main() {
 	die(err)
 	die(schema.ConfigureTiDBAutoEmbedding(autoEmbeddingConfig))
 
-	addr := envOr("DRIVE9_LISTEN_ADDR", defaultListenAddr)
+	cliAddr := ""
 	if len(os.Args) == 2 {
-		addr = os.Args[1]
+		cliAddr = os.Args[1]
+	}
+	localProvider := strings.TrimSpace(os.Getenv("DRIVE9_TENANT_PROVIDER")) == tenant.ProviderLocal
+	addr := resolveServerListenAddr(cliAddr, os.Getenv("DRIVE9_LISTEN_ADDR"), localProvider)
+	if localProvider {
+		applyLocalProviderEnvDefaults(addr)
+		die(rejectLocalProviderNonLoopbackDefaults(addr))
 	}
 
 	srvLogger, err := logger.NewServerLogger()
@@ -237,9 +244,11 @@ func main() {
 		provisioner, provisionerErr = tidbcloudnative.NewProvisionerFromEnv(providerType)
 	case tenant.ProviderDB9:
 		provisioner, provisionerErr = db9.NewProvisionerFromEnv()
+	case tenant.ProviderLocal:
+		provisioner, provisionerErr = local.NewProvisionerFromEnv()
 	}
 	if provisionerErr != nil {
-		if tenant.UsesTiDBCloudNativeCredentials(providerType) {
+		if tenant.UsesTiDBCloudNativeCredentials(providerType) || providerType == tenant.ProviderLocal {
 			logger.Error(context.Background(), "provisioner_failed", zap.String("provider", providerType), zap.Error(provisionerErr))
 			os.Exit(1)
 		}
@@ -580,7 +589,7 @@ func usage(out io.Writer, exitCode int) {
 	_, _ = fmt.Fprintf(out, `usage:
   drive9-server [listen-addr]
   drive9-server version
-  drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_native>
+  drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_native|local>
 
 environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
@@ -634,7 +643,9 @@ environment:
                                     required by openai, cohere, jina_ai, gemini, huggingface, nvidia_nim, nvidia
   DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE provider base endpoint for models that require it
                                      optional for openai models; set it for Azure OpenAI endpoints
-  DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_native (default for provisioning)
+  DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_native|local (default tidb_zero; local = TiDB CREATE DATABASE provisioner)
+  DRIVE9_LOCAL_MYSQL_DSN admin DSN for provider=local (falls back to DRIVE9_LOCAL_DSN or DRIVE9_META_DSN)
+  DRIVE9_LOCAL_EMBEDDING_MODE app for provider=local tenant schema (default app)
   DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default TiDB Cloud Cluster spendingLimit.monthly; native defaults to 1000 when unset
   DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Cluster API base URL for tidb_cloud_native
   DRIVE9_TIDBCLOUD_IAM_API_URL TiDB Cloud IAM API base URL; required for tidb_cloud_native
@@ -933,6 +944,15 @@ func buildAudioExtractOptionsFromEnv() (backend.AsyncAudioExtractOptions, error)
 	if audioMode == "" {
 		audioMode = "openai"
 	}
+	if audioMode == "stub" {
+		return backend.AsyncAudioExtractOptions{
+			Enabled:             true,
+			MaxAudioBytes:       envInt64("DRIVE9_AUDIO_EXTRACT_MAX_BYTES", 0),
+			TaskTimeout:         time.Duration(envInt("DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS", 0)) * time.Second,
+			MaxExtractTextBytes: envInt("DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES", 0),
+			Extractor:           stubAudioTextExtractor{},
+		}, nil
+	}
 	audioBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_AUDIO_EXTRACT_API_BASE"))
 	audioAPIKey := strings.TrimSpace(os.Getenv("DRIVE9_AUDIO_EXTRACT_API_KEY"))
 	audioModel := strings.TrimSpace(os.Getenv("DRIVE9_AUDIO_EXTRACT_MODEL"))
@@ -974,7 +994,7 @@ func buildAudioExtractOptionsFromEnv() (backend.AsyncAudioExtractOptions, error)
 		}
 		audioExtractor = extractor
 	default:
-		return backend.AsyncAudioExtractOptions{}, fmt.Errorf("DRIVE9_AUDIO_EXTRACT_MODE must be %q or %q when DRIVE9_AUDIO_EXTRACT_ENABLED=true (got %q)", "openai", "qwen-asr", audioMode)
+		return backend.AsyncAudioExtractOptions{}, fmt.Errorf("DRIVE9_AUDIO_EXTRACT_MODE must be %q, %q, or %q when DRIVE9_AUDIO_EXTRACT_ENABLED=true (got %q)", "stub", "openai", "qwen-asr", audioMode)
 	}
 
 	async := backend.AsyncAudioExtractOptions{

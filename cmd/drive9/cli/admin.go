@@ -47,6 +47,8 @@ func adminTenant(args []string) error {
 		return adminTenantDelete(args[1:])
 	case "set-quota":
 		return quotaSet(args[1:])
+	case "extract-config":
+		return adminTenantExtractConfig(args[1:])
 	case "pool":
 		return adminTenantPool(args[1:])
 	default:
@@ -736,6 +738,7 @@ commands:
   tenant get --tenant-id ID         show one tenant and quota
   tenant delete --tenant-id ID      delete one tenant
   tenant set-quota --tenant-id ID   set quota for one tenant
+  tenant extract-config <get|set>   get or update media extract config
   pool <command> [flags]            manage the tenant pool
 
 global admin flags:
@@ -780,11 +783,12 @@ commands:
   get --tenant-id ID               show one tenant and quota
   delete --tenant-id ID            delete one tenant
   set-quota --tenant-id ID         set quota for one tenant
+  extract-config <get|set>         get or update media extract config
 
 flags:
   --server URL                     server URL (default: active context server)
   --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
-  --tenant-id ID                   drive9 tenant id for get/delete/set-quota
+  --tenant-id ID                   drive9 tenant id for get/delete/set-quota/extract-config
   --tidbcloud-public-key KEY       TiDB Cloud public key
   --tidbcloud-private-key KEY      TiDB Cloud private key
   --max-storage-size Mi            set-quota: max confirmed+reserved storage size in Mi

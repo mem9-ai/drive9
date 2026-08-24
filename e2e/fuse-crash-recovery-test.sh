@@ -125,7 +125,7 @@ start_mount() {
   # --foreground keeps the daemon as our child: plain `drive9 mount`
   # daemonizes (re-execs a --foreground child and the parent exits), which
   # would make $! useless for kill -9.
-  drive9 mount --foreground --cache-dir "$CACHE_DIR" --durability interactive "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+  drive9 mount --mode=fuse --foreground --cache-dir "$CACHE_DIR" --durability interactive "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
   if wait_mount_state mounted; then
     DAEMON_PID="$(pgrep -f "$CLI_BIN mount" 2>/dev/null | head -1)"

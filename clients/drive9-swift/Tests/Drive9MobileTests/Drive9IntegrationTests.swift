@@ -7,7 +7,7 @@ import FoundationNetworking
 /// Live-server integration tests for the Drive9 Swift SDK.
 ///
 /// Exercises every public `Drive9Client` / `Drive9StreamUpload` method against
-/// a real drive9-server-local. The client is built via `Drive9Client.defaultClient()`,
+/// a real local drive9-server. The client is built via `Drive9Client.defaultClient()`,
 /// which reads `DRIVE9_SERVER` / `DRIVE9_API_KEY` env vars first and
 /// `~/.drive9/config` second, so the real config-resolution path is exercised.
 ///
@@ -25,7 +25,7 @@ final class Drive9IntegrationTests: XCTestCase {
     }
 
     private var apiKey: String {
-        ProcessInfo.processInfo.environment["DRIVE9_API_KEY"] ?? "local-dev-key"
+        ProcessInfo.processInfo.environment["DRIVE9_API_KEY"] ?? ""
     }
 
     private func makeClient() -> Drive9Client {
@@ -337,7 +337,7 @@ final class Drive9IntegrationTests: XCTestCase {
         let c = makeClient()
         let secName = "it-swift-secret-\(ts())"
 
-        // The vault backend may not be enabled on drive9-server-local; treat
+        // The vault backend may not be enabled on local drive9-server; treat
         // the suite as best-effort and return early when create fails.
         let sec: Drive9VaultSecret
         do {

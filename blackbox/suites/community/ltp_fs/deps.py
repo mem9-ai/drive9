@@ -138,7 +138,7 @@ DEFAULT_LTP_FS_EXCLUDE = (
     # filesystem concern.
     "binfmt_misc01", "binfmt_misc02",
     # inode02 — creates thousands of deeply nested directories concurrently,
-    # overwhelming drive9-server-local with readdir storms ("backend
+    # overwhelming local drive9-server with readdir storms ("backend
     # unavailable"). Too heavy for a local server under blackbox CI.
     "inode02",
     # squashfs01 — requires squashfs kernel module and loop device; skips in

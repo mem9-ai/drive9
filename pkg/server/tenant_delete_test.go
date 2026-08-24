@@ -15,7 +15,7 @@ import (
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/go-sql-driver/mysql"
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/encrypt"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/s3client"
@@ -36,11 +36,11 @@ type tenantDeleteRuntime struct {
 func newTenantDeleteRuntime(t *testing.T, provider string, scopeKind meta.APIKeyScopeKind) *tenantDeleteRuntime {
 	t.Helper()
 	db := newTenantDeleteDBInfo(t)
-	testmysql.ResetMetaDB(t, db.Meta.DB())
-	testmysql.ResetDB(t, db.Meta.DB())
+	testtidb.ResetMetaDB(t, db.Meta.DB())
+	testtidb.ResetDB(t, db.Meta.DB())
 	t.Cleanup(func() {
-		testmysql.ResetMetaDB(t, db.Meta.DB())
-		testmysql.ResetDB(t, db.Meta.DB())
+		testtidb.ResetMetaDB(t, db.Meta.DB())
+		testtidb.ResetDB(t, db.Meta.DB())
 	})
 	tenantID := token.NewID()
 	tokenSecret := make([]byte, 32)
@@ -160,7 +160,7 @@ func newTenantDeleteDBInfo(t *testing.T) *testDBInfo {
 
 func dropTenantSchemaLLMUsage(t *testing.T) {
 	t.Helper()
-	db := testmysql.OpenDB(t, testDSN)
+	db := testtidb.OpenDB(t, testDSN)
 	var tableCount int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'llm_usage'`).Scan(&tableCount); err != nil {
 		t.Fatalf("check llm_usage table: %v", err)

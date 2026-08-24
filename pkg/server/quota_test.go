@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
@@ -415,9 +415,9 @@ func quotaConfigRowExists(t *testing.T, rt *quotaRuntime) bool {
 func newQuotaRuntimeWithOptions(t *testing.T, provider string, opts quotaRuntimeOptions) *quotaRuntime {
 	t.Helper()
 	db := newTenantDeleteDBInfo(t)
-	testmysql.ResetMetaDB(t, db.Meta.DB())
+	testtidb.ResetMetaDB(t, db.Meta.DB())
 	t.Cleanup(func() {
-		testmysql.ResetMetaDB(t, db.Meta.DB())
+		testtidb.ResetMetaDB(t, db.Meta.DB())
 	})
 
 	tenantID := token.NewID()
@@ -1006,6 +1006,10 @@ func TestDeprecatedQuotaSetWorksWithoutTiDBCloudOrgBinding(t *testing.T) {
 
 func TestQuotaSetRejectsProvisioningTenant(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	// Startup resume lists provisioning tenants and can finish schema init
+	// (fake InitSchema is a no-op) before the quota POST. Freeze workers so
+	// the status fixture stays provisioning.
+	rt.server.stopLeaderWorkers()
 	if err := rt.meta.UpdateTenantStatus(context.Background(), rt.tenantID, meta.TenantProvisioning); err != nil {
 		t.Fatal(err)
 	}
@@ -3406,6 +3410,10 @@ func TestAdminTenantQuotaSetRequiresIAMOrganizationAuthorization(t *testing.T) {
 func TestAdminTenantQuotaSetRejectsProvisioningTenant(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
+	// Startup resume lists provisioning tenants and can finish schema init
+	// (fake InitSchema is a no-op) before the quota POST. Freeze workers so
+	// the status fixture stays provisioning.
+	rt.server.stopLeaderWorkers()
 	if err := rt.meta.UpdateTenantStatus(ctx, rt.tenantID, meta.TenantProvisioning); err != nil {
 		t.Fatal(err)
 	}

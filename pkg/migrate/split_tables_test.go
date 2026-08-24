@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 )
 
@@ -17,7 +17,7 @@ func TestSplitTablesMigrator(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 	ctx := context.Background()
-	testmysql.ResetDB(t, s.DB())
+	testtidb.ResetDB(t, s.DB())
 
 	// Insert a file via the old path (this also dual-writes to split tables)
 	f := &datastore.File{
@@ -97,7 +97,7 @@ func TestSplitTablesMigratorDirectoryInodes(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 	ctx := context.Background()
-	testmysql.ResetDB(t, s.DB())
+	testtidb.ResetDB(t, s.DB())
 
 	// Insert a directory node (no files row)
 	if err := s.InsertNode(ctx, &datastore.FileNode{
@@ -140,7 +140,7 @@ func TestSplitTablesMigratorPartialMigrationRerun(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 	ctx := context.Background()
-	testmysql.ResetDB(t, s.DB())
+	testtidb.ResetDB(t, s.DB())
 
 	// Insert a file via the old path
 	f := &datastore.File{
@@ -189,7 +189,7 @@ func TestSplitTablesMigratorAlreadyComplete(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 	ctx := context.Background()
-	testmysql.ResetDB(t, s.DB())
+	testtidb.ResetDB(t, s.DB())
 
 	// Insert a file via the old path (this also dual-writes to split tables)
 	f := &datastore.File{
@@ -257,7 +257,7 @@ func TestSplitTablesMigratorPartialStep5(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 	ctx := context.Background()
-	testmysql.ResetDB(t, s.DB())
+	testtidb.ResetDB(t, s.DB())
 
 	// Insert a file via the old path (this creates files + inodes + contents + semantic)
 	f := &datastore.File{
@@ -332,7 +332,7 @@ func TestSplitTablesMigratorMissingTables(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 	ctx := context.Background()
-	testmysql.ResetDB(t, s.DB())
+	testtidb.ResetDB(t, s.DB())
 
 	db := s.DB()
 

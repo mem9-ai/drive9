@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
@@ -21,7 +21,7 @@ func newControlStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	testmysql.ResetMetaDB(t, s.DB())
+	testtidb.ResetMetaDB(t, s.DB())
 	return s
 }
 

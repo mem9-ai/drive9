@@ -88,6 +88,13 @@ type ProgressFunc func(partNumber, totalParts int, bytesUploaded int64)
 // no server value has been negotiated.
 const DefaultSmallFileThreshold = 50_000
 
+const maxPresignedErrorBodyBytes = 64 << 10
+
+func readPresignedErrorBody(resp *http.Response) []byte {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxPresignedErrorBodyBytes))
+	return body
+}
+
 // uploadThreshold returns the cutoff between direct PUT and V2 multipart
 // upload. Resolution order:
 //  1. Per-Client override (c.smallFileThreshold > 0): used as-is. Tests pin
@@ -227,6 +234,12 @@ func uploadParallelism(partSize int64) int {
 		byMemory = 1
 	}
 	return min(byMemory, uploadMaxConcurrency)
+}
+
+func isForbiddenPresignedHeader(key string) bool {
+	return strings.EqualFold(key, "host") ||
+		strings.EqualFold(key, "authorization") ||
+		strings.EqualFold(key, "x-dat9-actor")
 }
 
 func boundedUploadParallelism(partSize int64, partCount int) int {
@@ -879,7 +892,7 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 		return "", err
 	}
 	for k, v := range part.Headers {
-		if strings.EqualFold(k, "host") {
+		if isForbiddenPresignedHeader(k) {
 			continue
 		}
 		req.Header.Set(k, v)
@@ -894,7 +907,7 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body := readPresignedErrorBody(resp)
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -1203,7 +1216,7 @@ func (c *Client) uploadOnePartV2(ctx context.Context, part presignedPart, data [
 		return "", err
 	}
 	for k, v := range part.Headers {
-		if strings.EqualFold(k, "host") {
+		if isForbiddenPresignedHeader(k) {
 			continue
 		}
 		req.Header.Set(k, v)
@@ -1220,7 +1233,7 @@ func (c *Client) uploadOnePartV2(ctx context.Context, part presignedPart, data [
 		return "", errPresignExpired
 	}
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body := readPresignedErrorBody(resp)
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 

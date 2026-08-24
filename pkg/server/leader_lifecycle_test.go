@@ -309,6 +309,32 @@ func TestLeaderGatedWorkersOnLoseRacesOnLead(t *testing.T) {
 	}
 }
 
+func TestForkStartupResumeDoneSurvivesLeadershipRestart(t *testing.T) {
+	srv, _, _ := newLeaderLifecycleServer(t)
+
+	select {
+	case <-srv.forkStartupResumeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for first startup fork cleanup resume")
+	}
+	first := srv.forkStartupResumeDone
+
+	srv.onLose()
+	srv.onLead()
+	second := srv.forkStartupResumeDone
+	if first == nil || second == nil {
+		t.Fatal("forkStartupResumeDone should be set on every leadership generation")
+	}
+	if first == second {
+		t.Fatal("expected a new forkStartupResumeDone channel after re-gaining leadership")
+	}
+	select {
+	case <-second:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for resumed startup fork cleanup")
+	}
+}
+
 func TestStopLeaderWorkersDoesNotHoldLifecycleLockWhileWaiting(t *testing.T) {
 	mgr := leader.NewManager(nil, leader.WithDisabled())
 	mgr.Start(context.Background())

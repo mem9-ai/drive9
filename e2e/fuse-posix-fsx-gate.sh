@@ -168,7 +168,7 @@ start_mount() {
     echo "=== drive9 posix/fsx mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
     echo "root_remote=$ROOT_REMOTE"
   } >>"$MOUNT_LOG"
-  drive9 mount "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+  drive9 mount --mode=fuse "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
   if wait_mount_state mounted; then
     return 0

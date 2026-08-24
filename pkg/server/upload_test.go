@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/s3client"
@@ -50,7 +50,7 @@ func newTestServerWithS3Config(t *testing.T, backendOpts backend.Options, worker
 	if err != nil {
 		t.Fatal(err)
 	}
-	testmysql.ResetDB(t, store.DB())
+	testtidb.ResetDB(t, store.DB())
 	t.Cleanup(func() { _ = store.Close() })
 
 	s3c, err := s3client.NewLocal(s3Dir, "http://localhost:9091/s3")
@@ -94,7 +94,7 @@ func newTestServerWithCreateMultipartError(t *testing.T, err error) *Server {
 	if err2 != nil {
 		t.Fatal(err2)
 	}
-	testmysql.ResetDB(t, store.DB())
+	testtidb.ResetDB(t, store.DB())
 	t.Cleanup(func() { _ = store.Close() })
 
 	localS3, err2 := s3client.NewLocal(s3Dir, "http://localhost:9091/s3")

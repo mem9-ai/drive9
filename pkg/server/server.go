@@ -176,7 +176,7 @@ func (s *Server) provisionerForTenantProvider(provider string) tenant.Provisione
 	switch provider {
 	case tenant.ProviderTiDBCloudStarterLegacy:
 		return s.legacyStarterProvisioner
-	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBZero, tenant.ProviderDB9:
+	case tenant.ProviderTiDBCloudNative, tenant.ProviderTiDBZero, tenant.ProviderDB9, tenant.ProviderLocal:
 		return s.provisioner
 	default:
 		return nil
@@ -216,6 +216,13 @@ type Server struct {
 	forkWorkerWG              sync.WaitGroup
 	forkWorkerMu              sync.Mutex
 	forkWorkerClosed          bool
+	// forkStartupResumeDone is closed after the one-shot deleting/failed fork
+	// resume launched from the current startLeaderWorkers generation returns
+	// (or immediately when that resume is not scheduled). Each leadership
+	// generation gets a new channel so a later onLead cannot close the previous
+	// generation's channel. Tests wait on it so later inserts cannot race the
+	// startup list.
+	forkStartupResumeDone     chan struct{}
 	tenantPoolLocks           sync.Map
 	tenantPoolReplenishJobs   sync.Map
 	tenantPoolCreateLocks     sync.Map
@@ -430,6 +437,7 @@ func NewWithConfig(cfg Config) *Server {
 		journalCursorSecret:     newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:           forkWorkerCtx,
 		forkWorkerCancel:        forkWorkerCancel,
+		forkStartupResumeDone:   make(chan struct{}),
 		sweepCtx:                sweepCtx,
 		sweepCancel:             sweepCancel,
 		tidbCloudRBACCache:      newTiDBCloudRBACCache(tidbCloudRBACCacheTTL),
@@ -914,6 +922,12 @@ func (s *Server) startLeaderWorkers() {
 	}
 	defer s.leaderWorkerMu.Unlock()
 	s.leaderWorkersStarted = true
+	// Capture a per-generation done channel. The previous generation (if any)
+	// already closed its own captured channel after stopLeaderWorkers waited
+	// out its goroutines; closing s.forkStartupResumeDone directly would panic
+	// on the next onLead after an onLose.
+	forkStartupResumeDone := make(chan struct{})
+	s.forkStartupResumeDone = forkStartupResumeDone
 	// Create a fresh leaderWorkerCtx for the fork-worker group and one-time
 	// resume tasks. These use leaderWorkerCtx (not forkWorkerCtx, which is
 	// reserved for API-triggered fork operations that must run on any pod).
@@ -930,6 +944,7 @@ func (s *Server) startLeaderWorkers() {
 			s.resumeProvisioningTenantsWithCtx(workerCtx)
 		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			defer close(forkStartupResumeDone)
 			s.resumeDeletingForkTenantsWithCtx(workerCtx)
 		})
 		// Periodic tenant delete cleanup.
@@ -984,6 +999,8 @@ func (s *Server) startLeaderWorkers() {
 				}
 			}
 		})
+	} else {
+		close(forkStartupResumeDone)
 	}
 	// Per-tenant FileGC and quota outbox workers are no longer per-backend
 	// goroutines — they are driven by kicks through the unified tenant worker.
@@ -1460,13 +1477,7 @@ func contextWithTrace(parent, traceSource context.Context) context.Context {
 }
 
 func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled bool, provider string) string {
-	query := "parseTime=true"
-	if tlsEnabled {
-		query += "&tls=true"
-	} else if tenant.UsesTiDBCloudNativeCredentials(provider) {
-		query += "&tls=skip-verify"
-	}
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", user, password, host, port, dbName, query)
+	return tenant.FormatTenantMySQLDSN(user, password, host, port, dbName, tlsEnabled, provider)
 }
 
 func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handler {
@@ -2032,8 +2043,8 @@ func (s *Server) localTenantShimEnabled() bool {
 	return s.fallback != nil && s.meta == nil && s.pool == nil && len(s.tokenSecret) == 0 && s.localTenantAPIKey != ""
 }
 
-// handleLocalTenantStatus serves drive9-server-local's single-tenant compatibility
-// path so e2e scripts can probe tenant status without enabling the multi-tenant
+// handleLocalTenantStatus serves the legacy single-tenant compatibility
+// path so unit tests can probe tenant status without enabling the multi-tenant
 // control plane.
 func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request) {
 	tok := bearerToken(r)
@@ -5751,6 +5762,9 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 }
 
 func dbTLSForProvisionedTenant(provider string) bool {
+	if provider == tenant.ProviderLocal {
+		return false
+	}
 	if !tenant.UsesTiDBCloudNativeCredentials(provider) {
 		return true
 	}
@@ -5829,8 +5843,8 @@ func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string,
 	return rawToken, apiKeyID, nil
 }
 
-// handleLocalTenantProvision serves drive9-server-local's single-tenant
-// compatibility path so e2e scripts can obtain one stable API key without
+// handleLocalTenantProvision serves the legacy single-tenant
+// compatibility path so unit tests can obtain one stable API key without
 // enabling the multi-tenant provision flow.
 func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Request) {
 	setRequestMetricTenant(r.Context(), "local", "local", "local", "", classifyTenantRequest(r))

@@ -18,7 +18,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/encrypt"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
@@ -624,7 +624,7 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -722,7 +722,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -841,7 +841,7 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -1522,7 +1522,7 @@ func newTiDBCloudFreeProvisionRuntime(t *testing.T, tenantLimit int) *tiDBCloudF
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = metaStore.Close() })
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -1597,7 +1597,7 @@ func TestProvisionTiDBCloudNativeCreateQuotaSkipsQuotaPatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -1684,7 +1684,7 @@ func TestProvisionSeedsQuotaConfigWithoutExplicitQuota(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -1784,7 +1784,7 @@ func TestProvisionTiDBCloudNativeRequiresEarlyBindingProvisioner(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -1858,7 +1858,7 @@ func TestProvisionTiDBCloudNativeCreateTimeQuotaLocalPersistenceErrorIsInternal(
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	if _, err := metaStore.DB().Exec("RENAME TABLE tenant_quota_config TO tenant_quota_config_unavailable"); err != nil {
 		t.Fatal(err)
@@ -1939,7 +1939,7 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenOrgBindingMissing(t *testing.T
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -2021,7 +2021,7 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenProvisionReturnsClusterAndErro
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -2095,7 +2095,7 @@ func TestProvisionTiDBCloudNativePersistsClusterReferenceWhenCleanupFails(t *tes
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -2169,7 +2169,7 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenPasswordEncryptFails(t *testin
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, failingEncryptor{err: fmt.Errorf("kms unavailable")})
 	defer pool.Close()
@@ -2245,7 +2245,7 @@ func TestProvisionTiDBCloudNativeRequiresRequestCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -2326,7 +2326,7 @@ func TestProvisionTiDBCloudNativeRejectsQuotaWithoutCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -2397,7 +2397,7 @@ func TestProvisionTenantRejectsMissingNativeCredentialsBeforeInsert(t *testing.T
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -2445,7 +2445,7 @@ func TestProvisionRejectsCredentialsForNonNativeProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -2495,7 +2495,7 @@ func TestProvisionPersistsEncryptedAutoEmbeddingProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -2571,7 +2571,7 @@ func TestProvisionPersistsAutoEmbeddingProfileWhenDatabaseAutoEmbeddingDisabled(
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -2686,7 +2686,7 @@ func TestInitTenantSchemaAsyncPersistsTargetSchemaVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	tenantID := token.NewID()
 	now := time.Now().UTC()
@@ -2750,7 +2750,7 @@ func TestInitTenantSchemaAsyncPersistsTargetSchemaVersion(t *testing.T) {
 func TestInitTenantSchemaAsyncRecordsOrgScopedEvent(t *testing.T) {
 	db := newTenantDeleteDBInfo(t)
 	metaStore := db.Meta
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	const (
 		tenantID = "tenant-schema-init-event"
@@ -2808,7 +2808,7 @@ func TestAutoEmbeddingProfileForTenantEnsuresDefaultProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	srv := NewWithConfig(Config{Meta: metaStore})
 	defer srv.Close()
@@ -2863,7 +2863,7 @@ func TestProvisionPersistsTenantBeforeProvisionFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -2934,7 +2934,7 @@ func TestProvisionCleansPartialClusterBeforeMarkingFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -3014,7 +3014,7 @@ func TestStartupResumesProvisioningTenantInit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -3091,7 +3091,7 @@ func TestStartupMarksPendingTenantFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -3157,7 +3157,7 @@ func TestStartupKeepsFreshPendingTenant(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -3217,7 +3217,7 @@ func TestReconcilePendingDirectNativeClusterWithoutPoolOwnershipBecomesFailed(t 
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	tenantID := token.NewID()
 	now := time.Now().UTC().Add(-2 * time.Minute)
@@ -3258,7 +3258,7 @@ func TestReconcilePendingNativePoolBindingWithoutConnectionStaysPending(t *testi
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	tenantID := token.NewID()
 	now := time.Now().UTC().Add(-2 * time.Minute)
@@ -3305,7 +3305,7 @@ func TestReconcilePendingReservationOnlyFreeTenantBecomesDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	tenantID := token.NewID()
 	now := time.Now().UTC().Add(-2 * time.Minute)
@@ -3349,7 +3349,7 @@ func TestReconcilePendingReloadsTenantAfterConcurrentEarlyBinding(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	tenantID := token.NewID()
 	staleAt := time.Now().UTC().Add(-2 * time.Minute)
@@ -3392,7 +3392,7 @@ func TestReconcilePendingNativeTenantWithConnectionResumesSchemaInit(t *testing.
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -3463,7 +3463,7 @@ func TestReconcilePendingTenantDoesNotOverwriteChangedStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	tenantID := token.NewID()
 	now := time.Now().UTC().Add(-2 * time.Minute)
@@ -3549,7 +3549,7 @@ func TestProvisionTiDBCloudNativeRejectsPartialCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -3598,7 +3598,7 @@ func TestProvisionTiDBCloudNativeUsesDefaultCredentialsWhenOmitted(t *testing.T)
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {

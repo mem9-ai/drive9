@@ -216,7 +216,6 @@ Build the binaries:
 ```bash
 go build -o bin/drive9 ./cmd/drive9
 go build -o bin/drive9-server ./cmd/drive9-server
-go build -o bin/drive9-server-local ./cmd/drive9-server-local
 ```
 
 Connect to a Drive9 server and mount a workspace:

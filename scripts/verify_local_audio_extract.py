@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Verify local durable audio_extract_text flows against drive9-server-local.
+"""Verify local durable audio_extract_text flows against drive9-server (provider=local).
 
 Exercises HTTP paths aligned with docs/impl/audio-extract-local-e2e-validation-impl.zh.md:
 
@@ -465,7 +465,7 @@ def parse_args() -> argparse.Namespace:
         help="local audio file to upload when --mode=openai (must be decodable by your ASR)",
     )
     p.add_argument(
-        "--base-url", default=DEFAULT_BASE_URL, help="drive9-server-local base URL"
+        "--base-url", default=DEFAULT_BASE_URL, help="drive9-server base URL"
     )
     p.add_argument(
         "--timeout-seconds",

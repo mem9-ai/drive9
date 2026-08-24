@@ -379,6 +379,18 @@ func ExampleClient_quota() {
 		TiDBCloudSpendingLimit: &spendingLimit,
 	})
 
+	enabled := true
+	prompt := "extract structured attributes"
+	_, _ = credentialClient.AdminGetTenantExtractConfig(ctx, drive9.AdminTenantExtractConfigGetRequest{
+		TenantID: tenantID, MediaType: drive9.ExtractMediaTypeImage,
+		PublicKey: tidbCloudPublicKey, PrivateKey: tidbCloudPrivateKey,
+	})
+	_, _ = credentialClient.AdminSetTenantExtractConfig(ctx, drive9.AdminTenantExtractConfigSetRequest{
+		TenantID: tenantID, MediaType: drive9.ExtractMediaTypeImage,
+		PublicKey: tidbCloudPublicKey, PrivateKey: tidbCloudPrivateKey,
+		Enabled: &enabled, Prompt: &prompt,
+	})
+
 	poolSize := 10
 	_, _ = credentialClient.AdminCreateTenantPool(ctx, drive9.AdminTenantPoolRequest{
 		PublicKey:  tidbCloudPublicKey,
@@ -586,6 +598,8 @@ var coveredClientMethods = map[string]bool{
 	"AdminGetTenantPool":                   true,
 	"AdminListTenants":                     true,
 	"AdminSetTenantQuota":                  true,
+	"AdminGetTenantExtractConfig":          true,
+	"AdminSetTenantExtractConfig":          true,
 	"AdminUpdateTenantPool":                true,
 	"AppendJournalEntries":                 true,
 	"AppendStream":                         true,

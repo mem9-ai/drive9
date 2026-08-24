@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
@@ -20,7 +20,7 @@ func TestObserveTenantPoolBindingCountsRecordsUsedAndFreeByPoolAndOrg(t *testing
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = metaStore.Close() })
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -94,7 +94,7 @@ func TestObserveTenantCountsRecordsAllRealStatuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = metaStore.Close() })
-	testmysql.ResetMetaDB(t, metaStore.DB())
+	testtidb.ResetMetaDB(t, metaStore.DB())
 
 	now := time.Now().UTC()
 	for _, tc := range []struct {

@@ -2,7 +2,8 @@
 #
 # sdk-integration-tests.sh — one-click cross-SDK integration suite for drive9.
 #
-# Boots a disposable MySQL 8 container, starts drive9-server-local against it,
+# Expects TiDB on DRIVE9_LOCAL_DSN (default 127.0.0.1:4000), starts drive9-server
+# (provider=local, embedding mode app) against it,
 # points every drive9 SDK (Go, TypeScript, Rust, Python, Kotlin, Swift) at the
 # live server via DRIVE9_SERVER/DRIVE9_API_KEY, runs each SDK's integration
 # suite, prints a summary, and tears everything down on exit.
@@ -18,7 +19,8 @@
 #   bash scripts/sdk-integration-tests.sh --only go,ts
 #   bash scripts/sdk-integration-tests.sh --keep-server        # leave server up for debugging
 #   bash scripts/sdk-integration-tests.sh --port 19009         # override listen port
-#   bash scripts/sdk-integration-tests.sh --no-build           # reuse bin/drive9-server-local
+#   bash scripts/sdk-integration-tests.sh --no-build           # reuse bin/drive9-server
+#   DRIVE9_SERVER_BIN=/path/to/drive9-server bash scripts/sdk-integration-tests.sh --no-build
 #
 # Exit code is non-zero if any enabled SDK suite fails.
 #
@@ -35,13 +37,11 @@ cd "$ROOT"
 # ---------------------------------------------------------------------------
 LISTEN_PORT="${DRIVE9_SDK_INTG_PORT:-19009}"
 LISTEN_ADDR="127.0.0.1:${LISTEN_PORT}"
-MYSQL_CONTAINER_NAME="drive9-sdk-intg-mysql"
-MYSQL_CONTAINER_PORT="${DRIVE9_SDK_INTG_MYSQL_PORT:-13306}"
-MYSQL_ROOT_PASSWORD="drive9root"
-MYSQL_DB="drive9_local"
-API_KEY="local-dev-key"
+DEFAULT_LOCAL_DSN="root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true"
+API_KEY=""
 KEEP_SERVER=0
 DO_BUILD=1
+SERVER_BIN="${DRIVE9_SERVER_BIN:-$ROOT/bin/drive9-server}"
 ONLY=""
 ALL_SDKS="go ts rs py kt swift"
 
@@ -79,7 +79,6 @@ fi
 # State that needs cleanup
 # ---------------------------------------------------------------------------
 SERVER_PID=""
-MYSQL_CID=""
 S3_DIR=""
 WORK_DIR="$(mktemp -d -t drive9-sdk-intg-XXXXXX)"
 cleanup_done=0
@@ -94,16 +93,13 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
-  if [ -n "$MYSQL_CID" ]; then
-    echo "stopping mysql container ($MYSQL_CID)"
-    docker stop "$MYSQL_CID" >/dev/null 2>&1 || true
-  fi
   if [ -n "$S3_DIR" ] && [ -d "$S3_DIR" ]; then
     rm -rf "$S3_DIR" || true
   fi
   rm -rf "$WORK_DIR" || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -122,11 +118,51 @@ wait_for_http() {
   return 1
 }
 
-wait_for_mysql() {
-  local cid="$1" tries="${2:-90}"
+provision_owner_key() {
+  local base="$1" body code key status tries=90
+  body="$(mktemp)"
+  code="$(curl -sS -o "$body" -w "%{http_code}" -X POST "$base/v1/provision" || true)"
+  if [ "$code" != "202" ] && [ "$code" != "200" ]; then
+    echo "POST $base/v1/provision failed: HTTP ${code:-000}" >&2
+    cat "$body" >&2 || true
+    rm -f "$body"
+    exit 1
+  fi
+  key="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("api_key") or "")' "$body")"
+  rm -f "$body"
+  if [ -z "$key" ]; then
+    echo "provision response missing api_key" >&2
+    exit 1
+  fi
+  while [ "$tries" -gt 0 ]; do
+    status="$(curl -sS -H "Authorization: Bearer ${key}" "$base/v1/status" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status") or "")' 2>/dev/null || true)"
+    if [ "$status" = "active" ]; then
+      printf '%s\n' "$key"
+      return
+    fi
+    tries=$((tries - 1))
+    sleep 1
+  done
+  echo "tenant not active after provision (status=${status:-unknown})" >&2
+  exit 1
+}
+
+wait_for_tidb() {
+  local dsn="$1" tries="${2:-90}"
+  local host port
+  host="$(python3 -c 'import re,sys; m=re.search(r"@tcp\(([^:]+):(\d+)\)/", sys.argv[1]); print(m.group(1) if m else "")' "$dsn")"
+  port="$(python3 -c 'import re,sys; m=re.search(r"@tcp\(([^:]+):(\d+)\)/", sys.argv[1]); print(m.group(2) if m else "")' "$dsn")"
+  [ -n "$host" ] && [ -n "$port" ] || return 1
   for _ in $(seq 1 "$tries"); do
-    if docker exec "$cid" mysqladmin ping -h 127.0.0.1 -u root -p"$MYSQL_ROOT_PASSWORD" \
-         --silent 2>/dev/null; then
+    if python3 - "$host" "$port" <<'PY' >/dev/null 2>&1
+import socket, sys
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+s.settimeout(3)
+data = s.recv(64)
+s.close()
+sys.exit(0 if len(data) > 4 else 1)
+PY
+    then
       return 0
     fi
     sleep 1
@@ -194,60 +230,63 @@ probe_toolchains() {
 }
 
 # ---------------------------------------------------------------------------
-# Bootstrap: Docker MySQL, server build, server start
+# Bootstrap: TiDB, server build, server start
 # ---------------------------------------------------------------------------
 bootstrap_db() {
-  log "starting disposable MySQL 8 container on port $MYSQL_CONTAINER_PORT"
-  if ! have docker; then
-    echo "docker is required to bootstrap MySQL but was not found" >&2
+  : "${DRIVE9_LOCAL_DSN:=$DEFAULT_LOCAL_DSN}"
+  export DRIVE9_LOCAL_DSN
+  log "waiting for TiDB at $DRIVE9_LOCAL_DSN"
+  if ! wait_for_tidb "$DRIVE9_LOCAL_DSN" 90; then
+    echo "TiDB is not reachable; start playground on 127.0.0.1:4000 or set DRIVE9_LOCAL_DSN" >&2
     exit 1
   fi
-  # Remove any stale container from a previous run (--keep-server, a crash
-  # where --rm didn't fire, etc.) before starting a fresh one. docker run
-  # fails immediately on a name conflict, so this prevents a confusing
-  # "container name already in use" exit.
-  docker rm -f "$MYSQL_CONTAINER_NAME" >/dev/null 2>&1 || true
-  MYSQL_CID="$(docker run -d --rm \
-    --name "$MYSQL_CONTAINER_NAME" \
-    -p "127.0.0.1:${MYSQL_CONTAINER_PORT}:3306" \
-    -e MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PASSWORD" \
-    -e MYSQL_DATABASE="$MYSQL_DB" \
-    mysql:8.0)"
-  echo "mysql container: $MYSQL_CID"
-  if ! wait_for_mysql "$MYSQL_CID" 90; then
-    echo "mysql did not become ready in time" >&2
-    docker logs "$MYSQL_CID" | tail -30 >&2 || true
+  local host port db
+  host="$(python3 -c 'import re,sys; m=re.search(r"@tcp\(([^:]+):(\d+)\)/([^?]*)", sys.argv[1]); print(m.group(1) if m else "")' "$DRIVE9_LOCAL_DSN")"
+  port="$(python3 -c 'import re,sys; m=re.search(r"@tcp\(([^:]+):(\d+)\)/([^?]*)", sys.argv[1]); print(m.group(2) if m else "")' "$DRIVE9_LOCAL_DSN")"
+  db="$(python3 -c 'import re,sys; m=re.search(r"@tcp\(([^:]+):(\d+)\)/([^?]*)", sys.argv[1]); print(m.group(3) if m else "drive9_local")' "$DRIVE9_LOCAL_DSN")"
+  if ! have mysql; then
+    echo "mysql client is required to CREATE DATABASE \`$db\` (install mysql or start TiDB with drive9_local already created)" >&2
     exit 1
   fi
-  echo "mysql is ready"
+  mysql --protocol=tcp -h "$host" -P "$port" -u root -e "CREATE DATABASE IF NOT EXISTS \`$db\`;" >/dev/null
+  echo "TiDB is ready"
 }
 
 build_server() {
-  if [ "$DO_BUILD" -eq 0 ] && [ -x "$ROOT/bin/drive9-server-local" ]; then
-    log "reusing existing bin/drive9-server-local (--no-build)"
+  if [ -n "${DRIVE9_SERVER_BIN:-}" ]; then
+    if [ ! -x "$SERVER_BIN" ]; then
+      echo "DRIVE9_SERVER_BIN is not executable: $SERVER_BIN" >&2
+      exit 1
+    fi
+    log "using DRIVE9_SERVER_BIN=$SERVER_BIN"
     return
   fi
-  log "building drive9-server-local"
-  make build-server-local
+  if [ "$DO_BUILD" -eq 0 ] && [ -x "$SERVER_BIN" ]; then
+    log "reusing existing $SERVER_BIN (--no-build)"
+    return
+  fi
+  log "building drive9-server"
+  make build-server
+  SERVER_BIN="$ROOT/bin/drive9-server"
 }
 
 start_server() {
-  log "starting drive9-server-local on $LISTEN_ADDR"
+  log "starting drive9-server on $LISTEN_ADDR"
   S3_DIR="$WORK_DIR/s3"
   mkdir -p "$S3_DIR"
 
-  # Compose the env. We bypass the env script and set everything explicitly so
-  # the run is hermetic and does not depend on the caller's shell state.
+  # Compose the env explicitly so the run is hermetic.
   export DRIVE9_LISTEN_ADDR="$LISTEN_ADDR"
   export DRIVE9_PUBLIC_URL="http://$LISTEN_ADDR"
-  export DRIVE9_LOCAL_DSN="root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_CONTAINER_PORT})/${MYSQL_DB}?parseTime=true"
-  export DRIVE9_LOCAL_API_KEY="$API_KEY"
-  export DRIVE9_LOCAL_INIT_SCHEMA=true
-  export DRIVE9_LOCAL_EMBEDDING_MODE=none
+  export DRIVE9_TENANT_PROVIDER="${DRIVE9_TENANT_PROVIDER:-local}"
+  export DRIVE9_LOCAL_DSN="${DRIVE9_LOCAL_DSN:-$DEFAULT_LOCAL_DSN}"
+  export DRIVE9_META_DSN="${DRIVE9_META_DSN:-$DRIVE9_LOCAL_DSN}"
+  export DRIVE9_LOCAL_MYSQL_DSN="${DRIVE9_LOCAL_MYSQL_DSN:-$DRIVE9_LOCAL_DSN}"
+  export DRIVE9_LOCAL_EMBEDDING_MODE="${DRIVE9_LOCAL_EMBEDDING_MODE:-app}"
   export DRIVE9_S3_DIR="$S3_DIR"
 
   # Redirect server logs to a file for debugging.
-  "$ROOT/bin/drive9-server-local" >"$WORK_DIR/server.log" 2>&1 &
+  "$SERVER_BIN" >"$WORK_DIR/server.log" 2>&1 &
   SERVER_PID=$!
   echo "server pid: $SERVER_PID  (logs: $WORK_DIR/server.log)"
 
@@ -257,6 +296,10 @@ start_server() {
     exit 1
   fi
   echo "server is healthy"
+
+  API_KEY="$(provision_owner_key "http://$LISTEN_ADDR")"
+  export DRIVE9_API_KEY="$API_KEY"
+  echo "provisioned owner API key"
 }
 
 # ---------------------------------------------------------------------------
@@ -265,7 +308,6 @@ start_server() {
 # Result vars: RESULT_<sdk> = pass|fail
 # ---------------------------------------------------------------------------
 export DRIVE9_SERVER="http://$LISTEN_ADDR"
-export DRIVE9_API_KEY="$API_KEY"
 export DRIVE9_INTEGRATION=1   # TS gate; harmless elsewhere
 
 RESULT_GO=""; RESULT_TS=""; RESULT_RS=""; RESULT_PY=""; RESULT_KT=""; RESULT_SWIFT=""
@@ -379,13 +421,12 @@ done
 echo "================================================================"
 
 if [ "$KEEP_SERVER" -eq 1 ]; then
-  echo "--keep-server: leaving server (pid $SERVER_PID) and mysql ($MYSQL_CID) running"
+  echo "--keep-server: leaving server (pid $SERVER_PID) running"
   echo "  DRIVE9_SERVER=$DRIVE9_SERVER  DRIVE9_API_KEY=$DRIVE9_API_KEY"
   echo "  server logs: $WORK_DIR/server.log"
   # Detach cleanup so the trap does not kill them.
   cleanup_done=1
   SERVER_PID=""
-  MYSQL_CID=""
 fi
 
 exit "$exit_code"

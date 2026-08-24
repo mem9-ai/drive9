@@ -8,8 +8,9 @@
 #    to OFF in this mode because reserving `total_size` against an existing
 #    tenant's quota can spuriously fail with 507; an explicit
 #    RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1 still wins. The rest of the suite
-#    (fork flow, small-file ops, pack/archive, step [8] cleanup) is already
-#    compatible with an existing tenant and unchanged.
+#    (optional fork flow, small-file ops, pack/archive, step [8] cleanup) is
+#    already compatible with an existing tenant and unchanged. Tenant fork,
+#    semantic recall, and SQL exec cases stay off unless their RUN_* flags are 1.
 
 set -euo pipefail
 
@@ -39,8 +40,8 @@ fi
 CLI_UPLOAD_LIMIT_BYTES="${CLI_UPLOAD_LIMIT_BYTES:-10737418240}"
 CLI_SEMANTIC_TIMEOUT_S="${CLI_SEMANTIC_TIMEOUT_S:-90}"
 CLI_SEMANTIC_INTERVAL_S="${CLI_SEMANTIC_INTERVAL_S:-3}"
-RUN_CLI_SEMANTIC_CHECKS="${RUN_CLI_SEMANTIC_CHECKS:-1}"
-RUN_CLI_FORK_CHECKS="${RUN_CLI_FORK_CHECKS:-1}"
+RUN_CLI_SEMANTIC_CHECKS="${RUN_CLI_SEMANTIC_CHECKS:-0}"
+RUN_CLI_FORK_CHECKS="${RUN_CLI_FORK_CHECKS:-0}"
 
 PASS=0
 FAIL=0

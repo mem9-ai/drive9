@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -210,6 +211,65 @@ func (o *MountOptions) setDefaults() {
 	}
 }
 
+func validateRemoteRoot(ctx context.Context, c *client.Client, remoteRoot string) error {
+	if remoteRoot == "/" {
+		if _, err := c.ListCtx(ctx, remoteRoot); err != nil {
+			return remoteRootValidationError(remoteRoot, err)
+		}
+		return nil
+	}
+
+	stat, err := c.StatCtx(ctx, remoteRoot)
+	if err == nil {
+		if !stat.IsDir {
+			return ExitStartupPermanentErr(fmt.Sprintf("remote root %q is not a directory", remoteRoot), nil)
+		}
+		return nil
+	}
+	if client.IsNotFound(err) {
+		return ExitStartupPermanentErr(fmt.Sprintf("remote source %q does not exist", remoteRoot), err)
+	}
+	if !shouldFallbackRemoteRootList(err) {
+		return remoteRootValidationError(remoteRoot, err)
+	}
+	// Stat may fail when directory stat is unsupported or when a scoped token
+	// grants list without read. Fall back to List and classify its result as the
+	// authoritative non-root mount validation.
+	if _, listErr := c.ListCtx(ctx, remoteRoot); listErr != nil {
+		if client.IsNotFound(listErr) {
+			return ExitStartupPermanentErr(fmt.Sprintf("remote source %q does not exist", remoteRoot), listErr)
+		}
+		return remoteRootValidationError(remoteRoot, listErr)
+	}
+	return nil
+}
+
+func shouldFallbackRemoteRootList(err error) bool {
+	if client.IsForbidden(err) {
+		return true
+	}
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch statusErr.StatusCode {
+	case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+		return true
+	default:
+		return false
+	}
+}
+
+func remoteRootValidationError(remoteRoot string, err error) *MountExitError {
+	if client.IsUnauthorized(err) || client.IsForbidden(err) {
+		return ExitStartupPermanentErr(fmt.Sprintf("remote root %q authorization denied", remoteRoot), err)
+	}
+	if remoteRoot == "/" {
+		return ExitStartupTransientErr("cannot reach drive9 server", err)
+	}
+	return ExitStartupTransientErr(fmt.Sprintf("remote root %q", remoteRoot), err)
+}
+
 // Mount creates and serves a FUSE mount. It blocks until the filesystem
 // is unmounted or a signal (SIGINT, SIGTERM) is received.
 func Mount(opts *MountOptions) (err error) {
@@ -303,29 +363,8 @@ func Mount(opts *MountOptions) (err error) {
 		return ExitStartupPermanentErr("normalize remote root", err)
 	}
 	opts.RemoteRoot = remoteRoot
-	if remoteRoot == "/" {
-		if _, err := c.List("/"); err != nil {
-			return ExitStartupTransientErr("cannot reach drive9 server", err)
-		}
-	} else {
-		stat, err := c.Stat(remoteRoot)
-		if err != nil {
-			// If Stat explicitly says "not found", trust it — don't fall back
-			// to List which may return empty success for non-existent paths.
-			if client.IsNotFound(err) {
-				return ExitStartupPermanentErr(fmt.Sprintf("remote source %q does not exist", remoteRoot), err)
-			}
-			// Stat may fail on backends where directory stat is unsupported
-			// (non-404 error). Fall back to List to verify existence.
-			if _, listErr := c.List(remoteRoot); listErr != nil {
-				if client.IsNotFound(listErr) {
-					return ExitStartupPermanentErr(fmt.Sprintf("remote source %q does not exist", remoteRoot), listErr)
-				}
-				return ExitStartupTransientErr(fmt.Sprintf("remote root %q", remoteRoot), listErr)
-			}
-		} else if !stat.IsDir {
-			return ExitStartupPermanentErr(fmt.Sprintf("remote root %q is not a directory", remoteRoot), nil)
-		}
+	if err := validateRemoteRoot(context.Background(), c, remoteRoot); err != nil {
+		return err
 	}
 	if opts.LayerRef != "" {
 		layer, err := c.GetFSLayer(context.Background(), opts.LayerRef)

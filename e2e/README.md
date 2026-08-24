@@ -1,7 +1,7 @@
 # drive9 E2E tests
 
 Live end-to-end scripts for validating deployed `drive9-server` behavior,
-including local single-tenant validation via `drive9-server-local`.
+including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=local`.
 
 ## Prerequisites
 
@@ -16,7 +16,7 @@ including local single-tenant validation via `drive9-server-local`.
 | `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download; set `DRIVE9_API_KEY` to skip provision and reuse an existing tenant (cleans up its test tree in that mode) |
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, default-slot `pack`/`unpack`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download; honors `DRIVE9_API_KEY` to skip provision and reuse an existing tenant |
 | `object-store-smoke-test.sh` | Local MinIO (docker/podman) or `OBJECT_S3_URI`: `fs mkdir/cp/ls/stat/cat/mv/rm`, stdin/stdout, rejected object ops, object FUSE mount writeback + remount, `mount status/health`, drain rejected. Does not need drive9-server. Set `OBJECT_STRICT_MOUNT=1` to fail if FUSE is missing |
-| `layer-fs-smoke-test.sh` | Layer filesystem API+CLI+FUSE workflow: create by name/tag, diff/checkpoint lookup, rollback, commit, scope rejection, conflict detection, mkdir/upsert/whiteout/rename/symlink/chmod entries, CoW fork (tip/checkpoint pin, chain read, child/parent commit, delete/cascade, depth cap), and checkpoint/full restore into fresh local roots. Point at any backend with `DRIVE9_BASE`; set `RUN_LAYER_FUSE_SMOKE=1` (and optionally `LAYER_FUSE_STRICT_PREREQS=1`) for FUSE restore coverage |
+| `layer-fs-smoke-test.sh` | Layer filesystem API+CLI+FUSE workflow: create by name/tag, diff/checkpoint lookup, rollback, commit, scope rejection, conflict detection, mkdir/upsert/whiteout/rename/symlink/chmod entries, CoW fork (tip/checkpoint pin, chain read, child/parent commit, delete/cascade, depth cap), HTTP CoW (POST /v1/layers + fork/chain, child GET objects falling back to a main-tree PUT, HTTP commit, DELETE ?cascade=1), and checkpoint/full restore into fresh local roots. Point at any backend with `DRIVE9_BASE`; set `RUN_LAYER_FUSE_SMOKE=1` (and optionally `LAYER_FUSE_STRICT_PREREQS=1`) for FUSE restore coverage |
 | `pack-smoke-test.sh` | Portable profile pack/unpack over a deterministic local repo: offline npm `file:` install creates `node_modules`, Git staged/unstaged/untracked status changes are captured, pack writes the default hidden archive, fresh local-root unpack restores overlay files, symlinks, `.git`, `node_modules`, branch, HEAD, and `git status` |
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/hardlink/rename/stat semantics, cross-channel consistency, `mount drain`/native `sync -f` drain checks, mounted 10KiB→8MiB→10KiB tier-transition parity, read-only and error-path checks |
 | `fuse-correctness-workload.sh` | Real read-only FUSE workload over a manifest fixture: `find`, `grep`, `stat`, `cat`, `sha256`, symlink, hardlink, unicode/space paths, empty files, binary files, and 8MiB+ files |
@@ -29,14 +29,16 @@ including local single-tenant validation via `drive9-server-local`.
 | `git-ops-smoke-test.sh` | Lightweight local Git gate using a local bare fixture: native clone, `drive9 git clone --fast`, and `drive9 git clone --fast --blobless` across `coding-agent` and `portable` profiles, followed by edit/add/commit/stash, remount into a fresh local root, and Git state/content verification |
 | `git-workspace-ondemand-smoke-test.sh` | On-demand git-workspace discovery (G0–G4/AC5): never-`--fast` mount asserts zero `ListGitWorkspaces` (perf `refresh=0`, incl. `.git` path activity), live `--fast` arms with bounded refresh + wall-clock armed idle, fresh LocalRoot remount via `/.drive9/git-workspaces/index.json`, second `--fast` forces list (`forced_refresh≥2`), cleanup + remount stays dormant |
 | `fuse-crash-recovery-test.sh` | FUSE crash-recovery gate: fsync'd small files plus a large mid-upload ShadowSpill survive `kill -9` of the mount daemon, recovered commits converge remotely, unlinked files do not resurrect, and the journal WAL compacts after a clean remount |
-| `fuse-supervision-test.sh` | FUSE supervision PR gate: supervised mount ready + status/health; worker `kill -9` auto-heal; `umount` no-restart; remount after umount; `mount ensure` after whole-tree death; `--supervise-foreground` smoke |
+| `fuse-supervision-test.sh` | FUSE supervision PR gate: supervised mount ready + status/health; worker `kill -9` auto-heal; `umount` no-restart; remount after umount; `mount ensure` after whole-tree death; `--supervise-foreground` smoke; root/non-root `pseudoroot` projection and fast authorization failure when `/v1/tokens` is available (404 capability absence skips only the cross-repo pseudoroot block) |
 | `fuse-write-perf-budget-test.sh` | FUSE write-path perf budgets: fsync-heavy workload with deterministic op-count budgets (remote writes/stats/lists/mutations, commit retries/failures) plus an fsync latency ceiling, asserted from mount perf counters |
 | `fuse-patch-storage-class.sh` | PATCH-vs-storage-class mismatch (`patch_unsupported_target`) regression: seeds a db9-stored file above the restarted server's inline threshold, then partially overwrites it through a FUSE mount. Default `fixed` scenario asserts zero PATCH attempts, correct committed bytes, and storage heal to S3; `SCENARIO=repro`/`fallback` with `DRIVE9_SERVER_BIN`/`DRIVE9_CLI_BIN` overrides replay the pre-fix EINVAL loop and the old-server fallback locally |
 | `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
+| `tokens-smoke-test.sh` | `/v1/tokens` management: dispatcher, scoped lifecycle/refresh, pseudoroot projected listing and hidden siblings, scoped gate, control-plane generate/list/status (needs `provider=local` mock IAM). Off in default `smoke-all.sh`; set `RUN_TOKENS_SMOKE=1` |
+| `sse-retention-smoke-test.sh` | SSE `/v1/events` initial sync, live `file_changed` delivery + cursor replay, >1000-event backlog drain; optional long-window replay and short-retention sweep (`SSE_SWEEP_TEST=1`). Off in default `smoke-all.sh`; set `RUN_SSE_SMOKE=1` |
+| `image-extract-config-smoke-test.sh` | Opt-in hosted HTTP test: provision a disposable tenant, validate tenant image-extract config (reject invalid key / unreachable base, persist a masked custom config), upload an image, assert a generated attribute tag via stat/find, disable the config, and delete the tenant. Manual-only: needs control-plane keys and a billable vision provider |
 | `native-smoke-test.sh` | TiDB Cloud Native tenant lifecycle: CLI provision with credentials, status poll, basic fs ops (mkdir/cp/cat/ls/rm), delete + verification, trap cleanup on failure |
-| `smoke-all.sh` | Runs API + CLI + journal + layer FS + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; re-exports `DRIVE9_API_KEY` so every sub-suite runs in existing-tenant mode when set; set `RUN_FUSE_SMOKE=0` to skip FUSE symlink/hardlink coverage, `RUN_API_ONLY=1` to run only the core api + cli pair, `RUN_GIT_OPS_SMOKE=1` to include lightweight Git coverage, `RUN_GIT_WORKSPACE_SMOKE=1` to include heavier Git workspace coverage, `RUN_GIT_ONDEMAND_SMOKE=1` to include on-demand discovery coverage, and `RUN_PACK_SMOKE=1` to include portable pack/unpack coverage |
-| `local-smoke.sh` | Starts `drive9-server-local` with a disposable local DB by default, then runs `smoke-all.sh` with semantic checks disabled and FUSE smoke skipped unless `RUN_FUSE_SMOKE=1` |
+| `smoke-all.sh` | PR-gate aggregator aligned with `local-e2e.yml`: api, cli, layer-fs, fuse-release-gate, fuse-patch-storage-class, git-ops, git-workspace-ondemand, pack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget. Re-exports `DRIVE9_API_KEY` for existing-tenant mode. `RUN_FUSE_SMOKE=0` skips FUSE-related suites; `RUN_API_ONLY=1` keeps only api + cli; `RUN_JOURNAL_SMOKE=1` / `RUN_POSIX_SMOKE=1` / `RUN_GIT_WORKSPACE_SMOKE=1` add post-merge extras; `RUN_TOKENS_SMOKE=1` / `RUN_SSE_SMOKE=1` add HTTP tokens and SSE retention (off even on post-merge) |
 
 ## CI automation tiers
 
@@ -47,10 +49,10 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Tier | Trigger | What runs |
 |------|---------|-----------|
 | PR gate | `pull_request` to `main` (local-e2e) | api, cli, object-store, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback), fuse-patch-storage-class, git-ops, git-workspace-ondemand, portable pack/unpack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget |
-| Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, full `smoke-all.sh` (journal, posix-permission, git-workspace), git feature smoke |
+| Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
-| Manual all | `e2e-all` workflow (`Run workflow` button) | Everything above via `run_all_e2e=1` |
-| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `local-smoke.sh` (`make e2e-local` wrapper) |
+| Manual all | Local E2E `workflow_dispatch` with `run_all_e2e=1` | Everything above |
+| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `image-extract-config-smoke-test.sh` (hosted control-plane + billable vision provider) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
@@ -86,7 +88,7 @@ in place of the synthesized-from-outcome summary. When adding a suite to
 ## Run
 
 Use a hosted deployment by default. For local development on this machine, use
-`drive9-server-local` instead.
+`drive9-server` with `DRIVE9_TENANT_PROVIDER=local` instead.
 
 ### Hosted endpoints
 
@@ -196,10 +198,22 @@ bash e2e/posix-permission-smoke-test.sh
 # TiDB Cloud Native tenant lifecycle smoke (requires credentials, manual-only).
 DRIVE9_TIDBCLOUD_PUBLIC_KEY=xxx DRIVE9_TIDBCLOUD_PRIVATE_KEY=xxx bash e2e/native-smoke-test.sh
 
+# Tenant image-extract config smoke (hosted control-plane + billable vision
+# provider). Skips before any HTTP call when a required variable is missing.
+# Must target a multi-tenant drive9-server; DRIVE9_TENANT_PROVIDER=local uses
+# env-only image extract and cannot validate tenant config resolution.
+export DRIVE9_BASE="https://..."
+export DRIVE9_TIDBCLOUD_PUBLIC_KEY="..."
+export DRIVE9_TIDBCLOUD_PRIVATE_KEY="..."
+export DRIVE9_E2E_IMAGE_EXTRACT_API_BASE="https://..."
+export DRIVE9_E2E_IMAGE_EXTRACT_API_KEY="..."
+export DRIVE9_E2E_IMAGE_EXTRACT_MODEL="..."
+bash e2e/image-extract-config-smoke-test.sh
+
 bash e2e/smoke-all.sh
 
-# Include portable profile pack/unpack coverage in smoke-all.
-RUN_PACK_SMOKE=1 bash e2e/smoke-all.sh
+# Skip FUSE-related suites.
+RUN_FUSE_SMOKE=0 bash e2e/smoke-all.sh
 ```
 
 #### Existing-tenant regression
@@ -234,37 +248,66 @@ bash e2e/cli-smoke-test.sh
 
 Useful knobs for existing-tenant runs:
 
-- `RUN_CLI_FORK_CHECKS=0` — skip the fork flow (very large tenants should not
-  be forked).
+- `RUN_CLI_FORK_CHECKS=1` — enable the tenant fork flow (off by default).
 - `RUN_LARGE_FILE=0` — skip the 100MB API large-file upload.
-- `RUN_SEMANTIC_CHECKS=0` / `RUN_CLI_SEMANTIC_CHECKS=0` — skip semantic recall
-  checks when no embedding endpoint is available.
+- `RUN_SEMANTIC_CHECKS=1` / `RUN_CLI_SEMANTIC_CHECKS=1` — enable semantic recall
+  checks (off by default; needs an embedding endpoint).
+- `RUN_SQL_CHECKS=1` — enable API `POST /v1/sql` checks (off by default).
 - `RUN_UPLOAD_LIMIT_BOUNDARY=1` / `RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1` — force the
   upload-limit boundary checks back on in existing-tenant mode.
 
-#### `drive9-server-local` notes
+#### Local `drive9-server` (`DRIVE9_TENANT_PROVIDER=local`) notes
 
-- `drive9-server-local` serves a single local tenant with API key
-  `${DRIVE9_LOCAL_API_KEY:-local-dev-key}` by default.
-- `api-smoke-test.sh`, `cli-smoke-test.sh`, and `fuse-smoke-test.sh` still
-  provision fresh timestamped test paths as part of the smoke flow by default.
-  Point them at the built-in local tenant with
-  `DRIVE9_API_KEY=${DRIVE9_LOCAL_API_KEY:-local-dev-key}`.
+- Prefer `POST /v1/provision` and the returned `api_key` (a JWT). Do not
+  assume `local-dev-key` authenticates.
+- `api-smoke-test.sh`, `cli-smoke-test.sh`, and `fuse-smoke-test.sh` provision
+  unless `DRIVE9_API_KEY` is already set, then poll `/v1/status` until `active`.
 - If the final upload-limit boundary check unexpectedly returns `507` instead of
   `202`, inspect tenant `uploads` records before blaming the test itself.
   Stale `INITIATED` / `UPLOADING` multipart rows can consume reserved quota even
   when the file tree looks empty.
 
+#### Local server binary
+
+`make e2e-local` (`scripts/e2e-local.sh`) starts TiDB if needed, then in-tree
+`drive9-server` with `DRIVE9_TENANT_PROVIDER=local`, then `e2e/smoke-all.sh`.
+`local-e2e.yml` and `make run-server-local` also use `provider=local` unless
+`DRIVE9_SERVER_BIN` points at a pre-built executable. Blackbox
+`--server-mode local` uses `--local-server`, which defaults to
+`DRIVE9_SERVER_BIN`.
+
 ## Notes
 
 - `api-smoke-test.sh` expects `POST /v1/provision` to return `tenant_id`, `api_key`, and `status`.
+- `image-extract-config-smoke-test.sh` always provisions a disposable tenant
+  with `DRIVE9_TIDBCLOUD_PUBLIC_KEY` / `DRIVE9_TIDBCLOUD_PRIVATE_KEY`. Provider
+  configuration requires `DRIVE9_E2E_IMAGE_EXTRACT_API_BASE`,
+  `DRIVE9_E2E_IMAGE_EXTRACT_API_KEY`, and `DRIVE9_E2E_IMAGE_EXTRACT_MODEL`.
+  The config PUT performs a real validation request before storing the config,
+  and the uploaded fixture causes a second provider request in the image
+  worker. The custom prompt fixes the attribute key `e2e_marker`; its value is
+  a short lowercase English noun chosen by the model from the image. The test
+  never prints either private key. Exit trap disables the custom config first,
+  then removes the test file tree and deletes the tenant. `POLL_TIMEOUT_S`
+  controls tenant readiness (default `600`); `IMAGE_EXTRACT_TIMEOUT_S` and
+  `IMAGE_EXTRACT_INTERVAL_S` control tag polling (defaults `180` and `3`).
+  After the positive path, the test disables the custom config, uploads a new
+  image, and requires its semantic text and tags to stay empty for
+  `DISABLED_EXTRACT_WAIT_S` (default `30`). Individual HTTP calls use
+  `CURL_CONNECT_TIMEOUT_S=10` and `CURL_MAX_TIME_S=120` by default. Before
+  storing a valid provider config, the test verifies that an invalid API key
+  and an unreachable API base are rejected without changing the tenant's
+  config. Override `DRIVE9_E2E_UNREACHABLE_API_BASE` only when the default
+  public, closed-port endpoint is unsuitable.
 - Tenant readiness is checked through `GET /v1/status`.
 - `api-smoke-test.sh` defaults `POLL_TIMEOUT_S` to 300s because schema initialization can exceed 120s in some regions.
 - File operations use `/v1/fs/*` and include nested directory coverage.
 - Semantic recall polling knobs for API smoke are `SEMANTIC_TIMEOUT_S` and `SEMANTIC_INTERVAL_S`.
-- Set `RUN_SEMANTIC_CHECKS=0` to skip semantic text recall and image-associated recall in `api-smoke-test.sh`.
+- Semantic text recall and image-associated recall in `api-smoke-test.sh` are off by default; set `RUN_SEMANTIC_CHECKS=1` to enable them.
 - Semantic recall polling knobs for CLI smoke are `CLI_SEMANTIC_TIMEOUT_S` and `CLI_SEMANTIC_INTERVAL_S`.
-- Set `RUN_CLI_SEMANTIC_CHECKS=0` to skip semantic text recall and image-associated recall in `cli-smoke-test.sh`.
+- Semantic text recall and image-associated recall in `cli-smoke-test.sh` are off by default; set `RUN_CLI_SEMANTIC_CHECKS=1` to enable them.
+- API `POST /v1/sql` checks are off by default; set `RUN_SQL_CHECKS=1` to enable them.
+- CLI tenant fork checks are off by default; set `RUN_CLI_FORK_CHECKS=1` to enable them.
 - Image fixture path is `DRIVE9_IMAGE_FIXTURE_PATH` (default `e2e/fixtures/cat03.jpg`) and uses the repo-local fixture.
 - Large-file scenario is enabled by default (`RUN_LARGE_FILE=1`) and runs a multipart upload using checksum-bound presigned parts.
 - You can tune size with `LARGE_FILE_MB` (default `100`).
@@ -279,9 +322,9 @@ Useful knobs for existing-tenant runs:
 - FUSE concurrency workload knobs are `FUSE_CONCURRENCY_WORKERS`, `FUSE_CONCURRENCY_FILES_PER_WORKER`, `FUSE_CONCURRENCY_READER_WORKERS`, `FUSE_CONCURRENCY_PAYLOAD_KB`, `FUSE_CONCURRENCY_TIMEOUT_S`, and `FUSE_CONCURRENCY_KEEP_ARTIFACTS`.
 - FUSE POSIX/fsx workload knobs are `FUSE_POSIX_FSX_OPS`, `FUSE_POSIX_FSX_MAX_BYTES`, `FUSE_POSIX_FSX_SEED`, `FUSE_POSIX_FSX_TIMEOUT_S`, and `FUSE_POSIX_FSX_KEEP_ARTIFACTS`. When enabled in CI, failures are hard failures.
 - FUSE performance baseline knobs are `FUSE_PERF_SMALL_FILES`, `FUSE_PERF_SMALL_BYTES`, `FUSE_PERF_LARGE_MB`, `FUSE_PERF_READ_PASSES`, `FUSE_PERF_SQLITE_ROWS`, `FUSE_PERF_KEEP_ARTIFACTS`, `FUSE_PERF_ARTIFACT_DIR`, `FUSE_PERF_COMPARE_WARN_RATIO`, and `FUSE_PERF_COMPARE_FAIL_ON_REGRESSION`. The baseline records small-file, large-file, rollback-journal SQLite, WAL SQLite, and WAL checkpoint metrics; SQLite rows are read back as payload bytes and SHA-256 verified before metrics are accepted.
-- Layer filesystem knobs are `RUN_LAYER_FUSE_SMOKE`, `LAYER_FUSE_STRICT_PREREQS`, `LAYER_DIFF_TIMEOUT_S`, and `LAYER_DIFF_INTERVAL_S`. Ordinary PR `local-e2e.yml` runs `layer-fs-smoke-test.sh` with `RUN_LAYER_FUSE_SMOKE=1` against `drive9-server-local`, so layer schema/API/FUSE restore coverage does not depend on a dedicated dev backend. Point at any deployment with `DRIVE9_BASE`. `smoke-all.sh` defaults `RUN_LAYER_FUSE_SMOKE` from `RUN_FUSE_SMOKE`.
+- Layer filesystem knobs are `RUN_LAYER_FUSE_SMOKE`, `LAYER_FUSE_STRICT_PREREQS`, `LAYER_DIFF_TIMEOUT_S`, and `LAYER_DIFF_INTERVAL_S`. Ordinary PR `local-e2e.yml` runs `layer-fs-smoke-test.sh` with `RUN_LAYER_FUSE_SMOKE=1` against local `drive9-server`, so layer schema/API/FUSE restore coverage does not depend on a dedicated dev backend. Point at any deployment with `DRIVE9_BASE`. `smoke-all.sh` defaults `RUN_LAYER_FUSE_SMOKE` from `RUN_FUSE_SMOKE`. FUSE mounts in these suites pass `--mode=fuse` (required on macOS, where `auto` is WebDAV).
 - Full daily local-e2e knobs are `RUN_E2E_SMOKE_ALL` and `RUN_GIT_FEATURE_SMOKE`; the scheduled run sets both to `1`, and manual `workflow_dispatch` runs can enable them with `run_e2e_smoke_all=1` and `run_git_feature_smoke=1`.
-- `local-e2e.yml` runs the lightweight pack smoke on ordinary PR triggers. It does not run the performance baseline or heavy FUSE/Git detectors on ordinary PR triggers. Use manual `workflow_dispatch` inputs `run_fuse_concurrency_stress=1`, `run_fuse_posix_fsx=1`, `run_fuse_sqlite_wal=1`, `run_fuse_sqlite_churn=1`, `run_fuse_sqlite_concurrency=1`, `run_fuse_performance_baseline=1`, `compare_fuse_performance_metrics=1`, `run_e2e_smoke_all=1`, and `run_git_feature_smoke=1` to enable them on demand. The scheduled daily run enables all of these flags; concurrency stress, POSIX/fsx, full smoke-all, and Git feature smoke run as separate hard-fail steps after the release gate and metrics archive, and all are attempted so one failure does not hide another workload's result. `run_e2e_smoke_all=1` also enables Git workspace smoke coverage.
+- `local-e2e.yml` runs the lightweight pack smoke on ordinary PR triggers. It does not run the performance baseline or heavy FUSE/Git detectors on ordinary PR triggers. Use manual `workflow_dispatch` inputs `run_fuse_concurrency_stress=1`, `run_fuse_posix_fsx=1`, `run_fuse_sqlite_wal=1`, `run_fuse_sqlite_churn=1`, `run_fuse_sqlite_concurrency=1`, `run_fuse_performance_baseline=1`, `compare_fuse_performance_metrics=1`, `run_e2e_smoke_all=1`, and `run_git_feature_smoke=1` to enable them on demand. The scheduled daily run enables all of these flags; concurrency stress, POSIX/fsx, full smoke-all, and Git feature smoke run as separate hard-fail steps after the release gate and metrics archive, and all are attempted so one failure does not hide another workload's result. `run_e2e_smoke_all=1` also enables journal, posix-permission, and Git workspace smoke coverage.
 - Set `archive_fuse_performance_metrics=1` on manual `local-e2e` runs, or use the daily scheduled run, to copy `performance-metrics-*.json`, `performance-compare-*.json`, `performance-compare-*.md`, mount logs, and an archive manifest to the Drive9 CI workspace under `/benchmarks/fuse-performance/<YYYY>/<MM>/<DD>/<branch>/<sha>/<run_id>-<attempt>/`. The same files are still uploaded as the GitHub artifact `fuse-performance-baseline`.
 - Set `compare_fuse_performance_metrics=1` on manual `local-e2e` runs, or use the daily scheduled run, to compare current metrics against the latest Drive9 archive before archiving the current run. By default, `FUSE_PERF_COMPARE_FAIL_ON_REGRESSION=1` makes any metric below `1 - FUSE_PERF_COMPARE_WARN_RATIO` fail the compare step after writing JSON/Markdown reports. Missing historical baselines, parameter mismatches, and legacy baselines missing newly added workloads still produce non-failing warnings; invalid current metrics, broken Drive9 compare configuration, malformed archived manifests, and structurally invalid baseline metrics fail closed.
 - The daily local-e2e gate intentionally covers the local CI-safe SQLite/Git/FUSE scripts. `description-smoke-test.sh` remains a manual environment-specific run (Docker + Ollama or stub embedder). Full pjdfstest lives under `blackbox` (`community.pjdfstest`).
@@ -292,7 +335,7 @@ Useful knobs for existing-tenant runs:
 - Git workspace timeout knobs are `GIT_WORKSPACE_CLONE_TIMEOUT_S` and `GIT_WORKSPACE_GIT_TIMEOUT_S`.
 - Git workspace clone uses `drive9 git clone --fast --blobless --hydrate=${GIT_WORKSPACE_HYDRATE:-sync}` inside a `--profile=coding-agent` FUSE mount.
 - Git ops smoke uses `tools/git_fixture.py` to create a local bare remote, so it
-  is suitable for `drive9-server-local` and does not depend on dev/prod tenant
+  is suitable for local `drive9-server` and does not depend on dev/prod tenant
   schema rollout. It runs the matrix from `GIT_OPS_PROFILES`
   (`coding-agent,portable`) and `GIT_OPS_CLONE_MODES`
   (`native,fast,blobless`).
