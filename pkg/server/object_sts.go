@@ -689,13 +689,21 @@ func validateAdminObjectBackend(rec *meta.OrgObjectBackend) error {
 	return nil
 }
 
-func validateObjectStoreEndpoint(raw string) error {
+func canonicalizeObjectStoreEndpoint(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return nil
+		return ""
 	}
 	if !strings.Contains(raw, "://") {
-		raw = "https://" + raw
+		return "https://" + raw
+	}
+	return raw
+}
+
+func validateObjectStoreEndpoint(raw string) error {
+	raw = canonicalizeObjectStoreEndpoint(raw)
+	if raw == "" {
+		return nil
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" {

@@ -59,8 +59,12 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := withObjectOpTimeout(context.Background())
-	defer cancel()
+	ctx := context.Background()
+	if h.Loc.Kind == KindObject {
+		var cancel context.CancelFunc
+		ctx, cancel = withObjectOpTimeout(ctx)
+		defer cancel()
+	}
 	var (
 		rc io.ReadCloser
 	)

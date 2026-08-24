@@ -154,6 +154,9 @@ func (a *drive9FS) Client() *client.Client {
 func (a *drive9FS) Stat(ctx context.Context, loc Location) (*FileInfo, error) {
 	st, err := a.c.StatCtx(ctx, loc.Path)
 	if err != nil {
+		if client.IsNotFound(err) {
+			return nil, fmt.Errorf("stat %s: %w", loc.Raw, ErrNotFound)
+		}
 		return nil, fmt.Errorf("stat %s: %w", loc.Raw, err)
 	}
 	name := path.Base(strings.TrimSuffix(loc.Path, "/"))
@@ -514,16 +517,27 @@ type objectBackend struct {
 	write     bool
 }
 
-const objectOpTimeout = 5 * time.Minute
+const (
+	objectOpTimeout   = 5 * time.Minute
+	objectCopyTimeout = 30 * time.Minute
+)
 
 func withObjectOpTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	return withDeadlineIfNone(ctx, objectOpTimeout)
+}
+
+func withObjectCopyTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	return withDeadlineIfNone(ctx, objectCopyTimeout)
+}
+
+func withDeadlineIfNone(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if _, ok := ctx.Deadline(); ok {
 		return ctx, func() {}
 	}
-	return context.WithTimeout(ctx, objectOpTimeout)
+	return context.WithTimeout(ctx, d)
 }
 
 func openObjectAuthenticated(ctx context.Context, c *client.Client, loc Location, authLocal bool) (*objectBackend, error) {

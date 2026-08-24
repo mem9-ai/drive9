@@ -222,4 +222,7 @@ func TestValidateAdminObjectBackend(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "endpoint") {
 		t.Fatalf("blocked endpoint err=%v", err)
 	}
+	if got := canonicalizeObjectStoreEndpoint("minio.example:9000"); got != "https://minio.example:9000" {
+		t.Fatalf("canonicalize=%q", got)
+	}
 }

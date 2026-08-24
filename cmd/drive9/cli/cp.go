@@ -551,8 +551,11 @@ func streamToStdout(ctx context.Context, c *client.Client, remotePath string) er
 }
 
 func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Location, recursive bool, force bool, tags map[string]string, description string) error {
-	ctx, cancel := withObjectOpTimeout(ctx)
-	defer cancel()
+	if src.Kind == KindObject || dst.Kind == KindObject {
+		var cancel context.CancelFunc
+		ctx, cancel = withObjectCopyTimeout(ctx)
+		defer cancel()
+	}
 	if src.Kind == KindStdin && dst.Kind == KindStdin {
 		return fmt.Errorf("cannot copy stdin to stdout via stream copy")
 	}
@@ -624,7 +627,7 @@ func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Lo
 		st, err := dstH.Backend.Stat(ctx, dstH.Loc)
 		if err == nil && st.IsDir {
 			finalDst = joinDest(dstH.Loc, copyLeafName(srcH.Loc))
-		} else if err != nil && !errors.Is(err, objectfs.ErrNotFound) && !errors.Is(err, ErrNotFound) && !os.IsNotExist(err) {
+		} else if err != nil && !errors.Is(err, objectfs.ErrNotFound) && !errors.Is(err, ErrNotFound) && !client.IsNotFound(err) && !os.IsNotExist(err) {
 			return err
 		}
 	}

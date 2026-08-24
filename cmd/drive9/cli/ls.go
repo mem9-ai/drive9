@@ -39,8 +39,12 @@ func Ls(c *client.Client, args []string) error {
 		return err
 	}
 
-	ctx, cancel := withObjectOpTimeout(context.Background())
-	defer cancel()
+	ctx := context.Background()
+	if h.Loc.Kind == KindObject {
+		var cancel context.CancelFunc
+		ctx, cancel = withObjectOpTimeout(ctx)
+		defer cancel()
+	}
 	page, err := h.Backend.List(ctx, h.Loc, ListOpts{})
 	if err != nil {
 		return err

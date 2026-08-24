@@ -192,6 +192,7 @@ drive9 umount ./mnt
   URI. Two mounts of the same URI cannot share one cache directory.
   Dirty data is uploaded on close (`Flush`); a successful close means the
   object PUT finished. `--allow-other` enables kernel `default_permissions`.
+  Duplicated file descriptors on the same mount handle are not supported.
 - Umount waits briefly for in-flight uploads and does **not** wipe a dirty
   cache, so a remount of the same URI can resume.
 - `mount drain` is drive9-only; object mounts reject it.

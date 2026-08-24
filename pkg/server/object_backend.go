@@ -188,7 +188,7 @@ func (s *Server) handleAdminObjectBackendCreate(w http.ResponseWriter, r *http.R
 		OrganizationID:   access.OrganizationID,
 		Name:             strings.TrimSpace(req.Name),
 		Scheme:           canonicalObjectScheme(req.Scheme),
-		Endpoint:         strings.TrimSpace(req.Endpoint),
+		Endpoint:         canonicalizeObjectStoreEndpoint(req.Endpoint),
 		STSEndpoint:      strings.TrimSpace(req.STSEndpoint),
 		Region:           strings.TrimSpace(req.Region),
 		AccountID:        strings.TrimSpace(req.AccountID),
@@ -280,7 +280,7 @@ func (s *Server) handleAdminObjectBackendUpdate(w http.ResponseWriter, r *http.R
 		row.Scheme = canonicalObjectScheme(*req.Scheme)
 	}
 	if req.Endpoint != nil {
-		row.Endpoint = strings.TrimSpace(*req.Endpoint)
+		row.Endpoint = canonicalizeObjectStoreEndpoint(*req.Endpoint)
 	}
 	if req.STSEndpoint != nil {
 		row.STSEndpoint = strings.TrimSpace(*req.STSEndpoint)
