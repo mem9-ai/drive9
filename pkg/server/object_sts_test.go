@@ -181,9 +181,45 @@ func TestValidateAdminObjectBackend(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 	err = validateAdminObjectBackend(&meta.OrgObjectBackend{
+		Scheme: "tos", Bucket: "b", CredentialKind: meta.ObjectCredentialRole, RoleARN: "arn:tos", AccessKeyID: "ak",
+	})
+	if err == nil || !strings.Contains(err.Error(), "secret_access_key") {
+		t.Fatalf("tos role without secret err=%v", err)
+	}
+	err = validateAdminObjectBackend(&meta.OrgObjectBackend{
+		Scheme: "oss", Bucket: "b", CredentialKind: meta.ObjectCredentialRole, RoleARN: "arn:oss", AccessKeyID: "ak",
+	})
+	if err == nil || !strings.Contains(err.Error(), "secret_access_key") {
+		t.Fatalf("oss role without secret err=%v", err)
+	}
+	err = validateAdminObjectBackend(&meta.OrgObjectBackend{
+		Scheme: "cos", Bucket: "b", CredentialKind: meta.ObjectCredentialRole, RoleARN: "arn:cos", AccessKeyID: "ak",
+	})
+	if err == nil || !strings.Contains(err.Error(), "secret_access_key") {
+		t.Fatalf("cos role without secret err=%v", err)
+	}
+	err = validateAdminObjectBackend(&meta.OrgObjectBackend{
+		Scheme: "s3", Bucket: "b", CredentialKind: meta.ObjectCredentialRole, RoleARN: "arn:aws:iam::1:role/r",
+	})
+	if err != nil {
+		t.Fatalf("aws role without stored keys should be allowed: %v", err)
+	}
+	err = validateAdminObjectBackend(&meta.OrgObjectBackend{
 		Scheme: "gcs", Bucket: "b", Prefix: "x", CredentialKind: meta.ObjectCredentialStatic,
 	})
 	if err == nil || !strings.Contains(err.Error(), "prefix") {
 		t.Fatalf("err=%v", err)
+	}
+	err = validateAdminObjectBackend(&meta.OrgObjectBackend{
+		Scheme: "s3", Bucket: "b", Prefix: "ten*", CredentialKind: meta.ObjectCredentialStatic, AccessKeyID: "ak", SecretCipher: []byte{1},
+	})
+	if err == nil || !strings.Contains(err.Error(), "wildcard") {
+		t.Fatalf("prefix wildcard err=%v", err)
+	}
+	err = validateAdminObjectBackend(&meta.OrgObjectBackend{
+		Scheme: "s3", Bucket: "b", Endpoint: "http://169.254.169.254/", CredentialKind: meta.ObjectCredentialStatic, AccessKeyID: "ak", SecretCipher: []byte{1},
+	})
+	if err == nil || !strings.Contains(err.Error(), "endpoint") {
+		t.Fatalf("blocked endpoint err=%v", err)
 	}
 }

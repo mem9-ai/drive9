@@ -48,6 +48,9 @@ func Mount(opts Options) error {
 	}
 	vopt := vfscommon.Opt
 	vopt.CacheMode = vfscommon.CacheModeWrites
+	// Upload on close so FUSE Flush can return PUT errors. The kernel
+	// ignores Release errors.
+	vopt.WriteBack = 0
 	vopt.ReadOnly = opts.ReadOnly
 	cacheDir := resolveObjectCacheDir(opts.CacheDir, opts.Location.Raw)
 	unlock, err := lockObjectCacheDir(cacheDir)
@@ -78,8 +81,11 @@ func Mount(opts Options) error {
 		Debug:      opts.Debug,
 		AllowOther: opts.AllowOther,
 	}
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" && !opts.AllowOther {
 		fuseOpts.Options = append(fuseOpts.Options, "defer_permissions", "local")
+	}
+	if opts.AllowOther {
+		fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
 	}
 	if opts.ReadOnly {
 		fuseOpts.Options = append(fuseOpts.Options, "ro")
@@ -419,7 +425,16 @@ func (fs *rcloneFUSE) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofus
 	if st := mapVFSErr(h.Flush()); st != gofuse.OK {
 		return st
 	}
-	return mapVFSErr(h.Sync())
+	if st := mapVFSErr(h.Sync()); st != gofuse.OK {
+		return st
+	}
+	// WriteBack=0: Close waits for the object PUT. Report that error here
+	// because Release has no FUSE status.
+	if err := h.Close(); err != nil {
+		return mapVFSErr(err)
+	}
+	_ = fs.takeHandle(input.Fh)
+	return gofuse.OK
 }
 
 func (fs *rcloneFUSE) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.Status {

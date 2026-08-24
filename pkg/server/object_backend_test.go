@@ -50,6 +50,9 @@ func TestNormalizeObjectNamespaceID(t *testing.T) {
 	if _, err := normalizeObjectNamespaceID(".."); err == nil {
 		t.Fatal(".. should fail")
 	}
+	if _, err := normalizeObjectNamespaceID("tenant*"); err == nil {
+		t.Fatal("wildcard should fail")
+	}
 }
 
 func TestObjectSessionPolicyReadVsWrite(t *testing.T) {
@@ -330,6 +333,27 @@ func TestAdminObjectBackendRejectsUnmintableConfigs(t *testing.T) {
 	}); code != http.StatusBadRequest {
 		t.Fatalf("az role status=%d", code)
 	}
+	if code := post(map[string]any{
+		"public_key": "public-1", "private_key": "private-1",
+		"scheme": "tos", "bucket": "tb2", "region": "cn-beijing",
+		"credential_kind": "role", "role_arn": "trn:iam::1:role/r", "access_key_id": "ak",
+	}); code != http.StatusBadRequest {
+		t.Fatalf("tos role without secret status=%d", code)
+	}
+	if code := post(map[string]any{
+		"public_key": "public-1", "private_key": "private-1",
+		"scheme": "oss", "bucket": "ob", "region": "cn-hangzhou",
+		"credential_kind": "role", "role_arn": "acs:ram::1:role/r", "access_key_id": "ak",
+	}); code != http.StatusBadRequest {
+		t.Fatalf("oss role without secret status=%d", code)
+	}
+	if code := post(map[string]any{
+		"public_key": "public-1", "private_key": "private-1",
+		"scheme": "cos", "bucket": "cbkt-123", "region": "ap-guangzhou", "account_id": "123",
+		"credential_kind": "role", "role_arn": "qcs::cam::uin/1:roleName/r", "access_key_id": "ak",
+	}); code != http.StatusBadRequest {
+		t.Fatalf("cos role without secret status=%d", code)
+	}
 }
 
 func TestAdminObjectBackendUpdateAndMultiple(t *testing.T) {
@@ -406,6 +430,28 @@ func TestAdminObjectBackendUpdateAndMultiple(t *testing.T) {
 	}
 	if updated.Name != "rotated" || updated.Region != "us-west-2" || !updated.HasSecret {
 		t.Fatalf("updated=%+v", updated)
+	}
+
+	clear := map[string]any{
+		"public_key": "public-1", "private_key": "private-1",
+		"secret_access_key": "",
+	}
+	raw, _ = json.Marshal(clear)
+	req, err = http.NewRequest(http.MethodPatch, ts.URL+"/v1/admin/object-backends/"+a.ID, bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(quotaPublicKeyHeader, "public-1")
+	req.Header.Set(quotaPrivateKeyHeader, "private-1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("clear secret status=%d body=%s", resp.StatusCode, body)
 	}
 
 	req, err = http.NewRequest(http.MethodGet, ts.URL+"/v1/admin/object-backends/"+a.ID, nil)

@@ -79,9 +79,10 @@ func (a *FS) Stat(ctx context.Context, loc Location) (*FileInfo, error) {
 		}
 		return nil, fmt.Errorf("stat %s: %w", loc.Raw, err)
 	}
-	// S3 List of a missing prefix is empty + nil. Do not treat that as a
-	// directory or `cp dest` will write dest/basename instead of dest.
-	if len(entries) == 0 && !loc.DirHint && remote != "" && !strings.HasSuffix(loc.Path, "/") {
+	// S3 List of a missing prefix is empty + nil, including URIs that end
+	// in `/`. Do not treat that as a directory or `cp -r` will create an
+	// empty destination from a missing source.
+	if len(entries) == 0 && remote != "" {
 		if dir := parentDirEntry(ctx, a.f, remote); dir {
 			name := path.Base(remote)
 			return &FileInfo{Name: name, Path: loc.Path, IsDir: true}, nil
@@ -267,6 +268,9 @@ func (a *FS) Rename(ctx context.Context, old, new Location) error {
 		return nil
 	}
 	st, err := a.Stat(ctx, new)
+	if err == nil && st != nil && st.IsDir {
+		return fmt.Errorf("mv: destination is a directory: %s", new.Raw)
+	}
 	if err == nil && st != nil && !st.IsDir {
 		return fmt.Errorf("object exists (use --force to overwrite): %s", new.Raw)
 	}

@@ -59,8 +59,8 @@ func TestConnectionStringSessionUsesExplicitKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(got, "env_auth=false") || !strings.Contains(got, "access_key_id=AKIATEST") || !strings.Contains(got, "session_token=token") {
-		t.Fatalf("got %q, want explicit session keys", got)
+	if !strings.Contains(got, "env_auth=false") || !strings.Contains(got, "access_key_id=AKIATEST") || !strings.Contains(got, "session_token=token") || !strings.Contains(got, "no_check_bucket=true") {
+		t.Fatalf("got %q, want explicit session keys and no_check_bucket", got)
 	}
 	if strings.Contains(got, "env_auth=true") {
 		t.Fatalf("session creds must not keep env_auth=true: %q", got)

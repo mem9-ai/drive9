@@ -39,12 +39,14 @@ func Ls(c *client.Client, args []string) error {
 		return err
 	}
 
-	page, err := h.Backend.List(context.Background(), h.Loc, ListOpts{})
+	ctx, cancel := withObjectOpTimeout(context.Background())
+	defer cancel()
+	page, err := h.Backend.List(ctx, h.Loc, ListOpts{})
 	if err != nil {
 		return err
 	}
 	for page.NextCursor != "" {
-		more, err := h.Backend.List(context.Background(), h.Loc, ListOpts{Cursor: page.NextCursor})
+		more, err := h.Backend.List(ctx, h.Loc, ListOpts{Cursor: page.NextCursor})
 		if err != nil {
 			return err
 		}

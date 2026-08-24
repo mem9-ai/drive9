@@ -34,7 +34,9 @@ func Mkdir(c *client.Client, args []string) error {
 		if layerRef != "" {
 			return fmt.Errorf("--layer is drive9-only")
 		}
-		if err := h.Backend.Mkdir(context.Background(), h.Loc); err != nil {
+		ctx, cancel := withObjectOpTimeout(context.Background())
+		defer cancel()
+		if err := h.Backend.Mkdir(ctx, h.Loc); err != nil {
 			return err
 		}
 		fmt.Printf("created %s\n", path)

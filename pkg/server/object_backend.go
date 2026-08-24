@@ -200,39 +200,10 @@ func (s *Server) handleAdminObjectBackendCreate(w http.ResponseWriter, r *http.R
 		AccessKeyID:      strings.TrimSpace(req.AccessKeyID),
 		MaxSessionTTLSec: req.MaxSessionTTL,
 	}
-	if err := validateAdminObjectBackend(rec); err != nil {
-		errJSON(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	if rec.MaxSessionTTLSec > 43200 {
 		rec.MaxSessionTTLSec = 43200
 	}
 	secret := strings.TrimSpace(req.SecretAccessKey)
-	switch kind {
-	case meta.ObjectCredentialRole:
-		if rec.RoleARN == "" {
-			errJSON(w, http.StatusBadRequest, "role_arn is required for credential_kind=role")
-			return
-		}
-	case meta.ObjectCredentialStatic:
-		switch rec.Scheme {
-		case "gs":
-			if secret == "" {
-				errJSON(w, http.StatusBadRequest, "secret_access_key must be the GCS service-account JSON")
-				return
-			}
-		case "az":
-			if (rec.AccessKeyID == "" && rec.AccountID == "") || secret == "" {
-				errJSON(w, http.StatusBadRequest, "azure requires account name (access_key_id or account_id) and account key")
-				return
-			}
-		default:
-			if rec.AccessKeyID == "" || secret == "" {
-				errJSON(w, http.StatusBadRequest, "access_key_id and secret_access_key are required for credential_kind=static")
-				return
-			}
-		}
-	}
 	if secret != "" {
 		cipher, encErr := s.pool.Encrypt(r.Context(), []byte(secret))
 		if encErr != nil {
@@ -248,6 +219,10 @@ func (s *Server) handleAdminObjectBackendCreate(w http.ResponseWriter, r *http.R
 			return
 		}
 		rec.ExternalIDCipher = cipher
+	}
+	if err := validateAdminObjectBackend(rec); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if err := s.meta.InsertOrgObjectBackend(r.Context(), rec); err != nil {
 		if errors.Is(err, meta.ErrDuplicate) {
@@ -340,10 +315,6 @@ func (s *Server) handleAdminObjectBackendUpdate(w http.ResponseWriter, r *http.R
 			row.MaxSessionTTLSec = 43200
 		}
 	}
-	if err := validateAdminObjectBackend(row); err != nil {
-		errJSON(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	if req.SecretAccessKey != nil {
 		secret := strings.TrimSpace(*req.SecretAccessKey)
 		if secret == "" {
@@ -369,6 +340,10 @@ func (s *Server) handleAdminObjectBackendUpdate(w http.ResponseWriter, r *http.R
 			}
 			row.ExternalIDCipher = cipher
 		}
+	}
+	if err := validateAdminObjectBackend(row); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if err := s.meta.UpdateOrgObjectBackend(r.Context(), row); err != nil {
 		if errors.Is(err, meta.ErrDuplicate) {
@@ -512,7 +487,7 @@ func (s *Server) handleObjectCredentials(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var req objectCredentialsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid json")
 		return
 	}
@@ -602,6 +577,9 @@ func normalizeObjectNamespaceID(ns string) (string, error) {
 	}
 	if strings.ContainsAny(ns, "/\\") || strings.Contains(ns, "..") {
 		return "", fmt.Errorf("namespace_id must not contain slashes or parent-directory segments")
+	}
+	if strings.ContainsAny(ns, "*?") {
+		return "", fmt.Errorf("namespace_id must not contain wildcard characters")
 	}
 	if len(ns) > 255 {
 		return "", fmt.Errorf("namespace_id is too long")

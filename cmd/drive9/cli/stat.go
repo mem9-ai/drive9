@@ -55,7 +55,9 @@ func Stat(c *client.Client, args []string) error {
 		return err
 	}
 	if h.Loc.Kind == KindObject {
-		info, err := h.Backend.Stat(context.Background(), h.Loc)
+		ctx, cancel := withObjectOpTimeout(context.Background())
+		defer cancel()
+		info, err := h.Backend.Stat(ctx, h.Loc)
 		if err != nil {
 			return err
 		}

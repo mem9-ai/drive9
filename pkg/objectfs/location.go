@@ -274,6 +274,11 @@ func canonicalQueryKey(k string) string {
 	}
 }
 
+// ValidateEndpoint rejects non-absolute endpoints and remote http:// URLs.
+func ValidateEndpoint(ep string) error {
+	return validateEndpoint(ep)
+}
+
 func validateEndpoint(ep string) error {
 	u, err := url.Parse(ep)
 	if err != nil || u.Scheme == "" || u.Host == "" {

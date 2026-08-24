@@ -59,13 +59,15 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	ctx, cancel := withObjectOpTimeout(context.Background())
+	defer cancel()
 	var (
 		rc io.ReadCloser
 	)
 	if offsetSet {
-		rc, err = h.Backend.OpenReadRange(context.Background(), h.Loc, *offset, *length)
+		rc, err = h.Backend.OpenReadRange(ctx, h.Loc, *offset, *length)
 	} else {
-		rc, err = h.Backend.OpenRead(context.Background(), h.Loc)
+		rc, err = h.Backend.OpenRead(ctx, h.Loc)
 	}
 	if err != nil {
 		return err

@@ -64,7 +64,9 @@ func Mv(c *client.Client, args []string) error {
 		if !ok {
 			return fmt.Errorf("mv: object-store URIs not supported (use cp + rm)")
 		}
-		return ren.Rename(context.Background(), oldLoc, newLoc)
+		ctx, cancel := withObjectOpTimeout(context.Background())
+		defer cancel()
+		return ren.Rename(ctx, oldLoc, newLoc)
 	}
 
 	oldRP, _ := locationAsRemotePath(oldLoc)

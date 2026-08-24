@@ -54,6 +54,67 @@ func TestLsObjectURIMintsViaServerByDefault(t *testing.T) {
 	}
 }
 
+func TestLsObjectURIDoesNotFallBackToLocalAWSEnv(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKILOCAL")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "local-secret")
+	t.Setenv("AWS_SESSION_TOKEN", "local-token")
+	var sawMint bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/object-credentials" {
+			sawMint = true
+			http.Error(w, `{"error":"object namespace is not configured"}`, http.StatusForbidden)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, "k")
+	err := Ls(c, []string{"s3://bucket/key"})
+	if err == nil {
+		t.Fatal("mint failure must not fall back to AWS env credentials")
+	}
+	if !sawMint {
+		t.Fatal("expected server mint")
+	}
+	if !strings.Contains(err.Error(), "object namespace") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestLocalWritePreservesDestMode(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "out.txt")
+	if err := os.WriteFile(dest, []byte("old"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	fs := newLocalFS()
+	wh, err := fs.OpenWrite(context.Background(), Location{Kind: KindLocal, Path: dest, Local: dest, Raw: dest}, WriteOpts{Overwrite: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wh.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wh.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o640 {
+		t.Fatalf("mode=%o", st.Mode().Perm())
+	}
+}
+
+func TestApplyMintedQueryRejectsPlaintextRemoteEndpoint(t *testing.T) {
+	q := map[string]string{}
+	err := applyMintedQuery(q, &client.ObjectCredentials{Endpoint: "http://evil.example"})
+	if err == nil {
+		t.Fatal("expected endpoint error")
+	}
+}
+
 func TestLsDoesNotSendRawS3ToClient(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "s3:") {

@@ -31,14 +31,18 @@ func mountObjectStoreImpl(loc *Location, mountPoint, cacheDir string, readOnly, 
 	}
 	if !objectAuthLocal {
 		c := NewFromEnv()
-		minted, err := c.MintObjectCredentials(context.Background(), loc.Raw, !readOnly)
+		mintCtx, mintCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		minted, err := c.MintObjectCredentials(mintCtx, loc.Raw, !readOnly)
+		mintCancel()
 		if err != nil {
 			return err
 		}
 		if loc.Query == nil {
 			loc.Query = map[string]string{}
 		}
-		applyMintedQuery(loc.Query, minted)
+		if err := applyMintedQuery(loc.Query, minted); err != nil {
+			return err
+		}
 		opts.Location = toObjectLocation(*loc)
 		opts.Session = sessionFromMinted(minted)
 		opts.SessionExpiry = objectfs.ParseSessionExpiry(minted.Expiration)
@@ -47,7 +51,9 @@ func mountObjectStoreImpl(loc *Location, mountPoint, cacheDir string, readOnly, 
 			if mintErr != nil {
 				return objectfs.SessionCredentials{}, time.Time{}, mintErr
 			}
-			applyMintedQuery(loc.Query, next)
+			if qerr := applyMintedQuery(loc.Query, next); qerr != nil {
+				return objectfs.SessionCredentials{}, time.Time{}, qerr
+			}
 			return sessionFromMinted(next), objectfs.ParseSessionExpiry(next.Expiration), nil
 		}
 	}

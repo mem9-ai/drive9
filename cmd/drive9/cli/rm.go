@@ -60,7 +60,9 @@ func Rm(c *client.Client, args []string) error {
 		if layerRef != "" {
 			return fmt.Errorf("--layer is drive9-only")
 		}
-		if err := h.Backend.Remove(context.Background(), h.Loc, recursive); err != nil {
+		ctx, cancel := withObjectOpTimeout(context.Background())
+		defer cancel()
+		if err := h.Backend.Remove(ctx, h.Loc, recursive); err != nil {
 			return err
 		}
 		return nil

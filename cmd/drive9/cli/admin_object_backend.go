@@ -340,6 +340,9 @@ func adminTenantObjectNamespaceSet(args []string) error {
 	if strings.ContainsAny(ns, "/\\") || strings.Contains(ns, "..") {
 		return fmt.Errorf("namespace_id must not contain slashes or parent-directory segments")
 	}
+	if strings.ContainsAny(ns, "*?") {
+		return fmt.Errorf("namespace_id must not contain wildcard characters")
+	}
 	out, err := c.AdminSetObjectNamespace(context.Background(), tenantID, ns, publicKey, privateKey)
 	if err != nil {
 		return err

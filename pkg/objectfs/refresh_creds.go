@@ -2,52 +2,69 @@ package objectfs
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fshttp"
-	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
 )
 
-// rclone GCS builds oauth2.NewClient(ctx, StaticTokenSource(snapshot)).
-// The snapshot cannot be updated, but oauth2 uses ctx's HTTPClient as the
-// Base transport and sets Authorization before calling it. Overwriting the
-// header here refreshes GCS without NewFs.
-//
-// rclone Azure bakes the SAS into the service client URL. It talks HTTP
-// through the process-wide fshttp transport; a request filter rewrites the
-// SAS query on matching hosts.
+type sessionAuthCtxKey struct{}
+
+type sessionAuth struct {
+	gcs bearerTransport
+}
 
 var (
-	gcsBearer       bearerTransport
+	sessionAuthByFs sync.Map // fs.Fs -> *sessionAuth
+
 	azureSASMu      sync.RWMutex
-	azureSASURL     *url.URL
+	azureSASByKey   = map[string]*url.URL{}
 	azureFilterOnce sync.Once
 )
 
 func attachSessionTransport(ctx context.Context, sess SessionCredentials) context.Context {
+	auth := &sessionAuth{}
 	if sess.AccessToken != "" {
-		ctx = withGCSTokenTransport(ctx, sess.AccessToken)
+		auth.gcs.set(sess.AccessToken)
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, &http.Client{Transport: &auth.gcs})
 	}
 	if sess.SASURL != "" {
 		installAzureSASFilter(sess.SASURL)
 	}
-	return ctx
+	return context.WithValue(ctx, sessionAuthCtxKey{}, auth)
 }
 
-func withGCSTokenTransport(ctx context.Context, token string) context.Context {
-	setGCSAccessToken(token)
-	return context.WithValue(ctx, oauth2.HTTPClient, &http.Client{Transport: &gcsBearer})
+func bindSessionAuth(ctx context.Context, f fs.Fs) {
+	if f == nil {
+		return
+	}
+	auth, _ := ctx.Value(sessionAuthCtxKey{}).(*sessionAuth)
+	if auth == nil {
+		return
+	}
+	sessionAuthByFs.Store(f, auth)
 }
 
-func setGCSAccessToken(token string) {
-	gcsBearer.set(token)
+func setGCSAccessTokenOn(f fs.Fs, token string) error {
+	if f == nil {
+		return errGCSAuthUnbound
+	}
+	v, ok := sessionAuthByFs.Load(f)
+	if !ok {
+		return errGCSAuthUnbound
+	}
+	v.(*sessionAuth).gcs.set(token)
+	return nil
 }
+
+var errGCSAuthUnbound = errors.New("objectfs: no GCS session transport bound to this filesystem")
 
 type bearerTransport struct {
 	mu    sync.RWMutex
@@ -58,6 +75,12 @@ func (t *bearerTransport) set(token string) {
 	t.mu.Lock()
 	t.token = token
 	t.mu.Unlock()
+}
+
+func (t *bearerTransport) get() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.token
 }
 
 func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -87,34 +110,52 @@ func installAzureSASFilter(sasURL string) {
 func setAzureSAS(sasURL string) {
 	parsed, err := url.Parse(strings.TrimSpace(sasURL))
 	if err != nil || parsed == nil || parsed.Host == "" {
-		if err != nil {
-			logger.Warn(context.Background(), "object mount ignoring unparseable Azure SAS URL", zap.Error(err))
-		}
+		logger.Warn(context.Background(), "object mount ignoring unparseable Azure SAS URL")
 		return
 	}
+	key := azureSASKey(parsed.Host, parsed.Path)
 	azureSASMu.Lock()
-	azureSASURL = parsed
+	azureSASByKey[key] = parsed
 	azureSASMu.Unlock()
+}
+
+func azureSASKey(host, path string) string {
+	return strings.ToLower(strings.TrimSpace(host)) + "|" + strings.Trim(path, "/")
+}
+
+func lookupAzureSAS(reqURL *url.URL) *url.URL {
+	if reqURL == nil {
+		return nil
+	}
+	host := strings.ToLower(reqURL.Host)
+	segs := strings.Split(strings.Trim(reqURL.Path, "/"), "/")
+	azureSASMu.RLock()
+	defer azureSASMu.RUnlock()
+	n := len(segs)
+	if n > 2 {
+		n = 2
+	}
+	for ; n >= 1; n-- {
+		if segs[0] == "" {
+			break
+		}
+		key := host + "|" + strings.Join(segs[:n], "/")
+		if sas := azureSASByKey[key]; sas != nil {
+			return sas
+		}
+	}
+	return nil
 }
 
 func rewriteAzureSASRequest(req *http.Request) {
 	if req == nil || req.URL == nil {
 		return
 	}
-	azureSASMu.RLock()
-	sas := azureSASURL
-	azureSASMu.RUnlock()
+	sas := lookupAzureSAS(req.URL)
 	if sas == nil {
 		return
 	}
-	if !azureSASHostMatch(req.URL.Host, sas.Host) {
-		return
-	}
 	rewriteAzureSASQuery(req.URL, sas)
-}
-
-func azureSASHostMatch(reqHost, sasHost string) bool {
-	return strings.EqualFold(reqHost, sasHost)
 }
 
 func rewriteAzureSASQuery(reqURL *url.URL, sas *url.URL) {

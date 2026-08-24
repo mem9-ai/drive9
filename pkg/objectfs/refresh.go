@@ -85,7 +85,9 @@ func applySession(ctx context.Context, f fs.Fs, sess SessionCredentials) error {
 		}
 	}
 	if sess.AccessToken != "" {
-		setGCSAccessToken(sess.AccessToken)
+		if err := setGCSAccessTokenOn(f, sess.AccessToken); err != nil {
+			return err
+		}
 	}
 	if sess.SASURL != "" {
 		installAzureSASFilter(sess.SASURL)

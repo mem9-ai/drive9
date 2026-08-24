@@ -60,6 +60,9 @@ func OpenFsWithSession(ctx context.Context, loc Location, sess SessionCredential
 		return nil, "", err
 	}
 	f, err = fs.NewFs(ctx, spec)
+	if f != nil {
+		bindSessionAuth(ctx, f)
+	}
 	if err == fs.ErrorIsFile {
 		return f, path.Base(strings.TrimSuffix(loc.Path, "/")), nil
 	}
@@ -164,7 +167,7 @@ func s3ConnectionString(loc Location, sess SessionCredentials) (string, error) {
 		"provider=" + provider,
 	}
 	if sess.AccessKeyID != "" {
-		params = append(params, "env_auth=false", "directory_markers=true", "access_key_id="+quote(sess.AccessKeyID), "secret_access_key="+quote(sess.SecretAccessKey))
+		params = append(params, "env_auth=false", "directory_markers=true", "no_check_bucket=true", "access_key_id="+quote(sess.AccessKeyID), "secret_access_key="+quote(sess.SecretAccessKey))
 		if sess.SessionToken != "" {
 			params = append(params, "session_token="+quote(sess.SessionToken))
 		}

@@ -264,15 +264,50 @@ func TestRewriteAzureSASRequestHostMatch(t *testing.T) {
 	}
 }
 
-func TestApplySessionGCSAndAzureSkipCommander(t *testing.T) {
+func TestApplySessionGCSRequiresBoundFs(t *testing.T) {
 	err := applySession(context.Background(), nil, SessionCredentials{AccessToken: "ya29.tok"})
+	if !errors.Is(err, errGCSAuthUnbound) {
+		t.Fatalf("err=%v", err)
+	}
+	rec := &setRecorder{name: "gcs"}
+	auth := &sessionAuth{}
+	sessionAuthByFs.Store(rec, auth)
+	t.Cleanup(func() { sessionAuthByFs.Delete(rec) })
+	err = applySession(context.Background(), rec, SessionCredentials{AccessToken: "ya29.fresh"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = applySession(context.Background(), nil, SessionCredentials{
+	if auth.gcs.get() != "ya29.fresh" {
+		t.Fatalf("token=%q", auth.gcs.get())
+	}
+}
+
+func TestApplySessionAzureSkipCommander(t *testing.T) {
+	err := applySession(context.Background(), nil, SessionCredentials{
 		SASURL: "https://acct.blob.core.windows.net/c?sv=1&sig=n",
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAzureSASIsPerContainer(t *testing.T) {
+	installAzureSASFilter("https://acct.blob.core.windows.net/a?sv=1&sig=sa")
+	installAzureSASFilter("https://acct.blob.core.windows.net/b?sv=1&sig=sb")
+	reqA, err := http.NewRequest(http.MethodGet, "https://acct.blob.core.windows.net/a/blob?comp=list", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewriteAzureSASRequest(reqA)
+	if reqA.URL.Query().Get("sig") != "sa" {
+		t.Fatalf("a sig=%q", reqA.URL.Query().Get("sig"))
+	}
+	reqB, err := http.NewRequest(http.MethodGet, "https://acct.blob.core.windows.net/b/blob?comp=list", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewriteAzureSASRequest(reqB)
+	if reqB.URL.Query().Get("sig") != "sb" {
+		t.Fatalf("b sig=%q", reqB.URL.Query().Get("sig"))
 	}
 }

@@ -302,6 +302,37 @@ func TestIdentityIncludesProvider(t *testing.T) {
 	}
 }
 
+func TestAdapterRenameRejectsDirectoryDest(t *testing.T) {
+	a, _ := testAdapter(t)
+	ctx := context.Background()
+	src := Location{Path: "file.txt", Raw: "s3://bucket/file.txt"}
+	wh, err := a.OpenWrite(ctx, src, WriteOpts{Size: 1, Overwrite: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wh.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wh.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Mkdir(ctx, Location{Path: "dir", DirHint: true, Raw: "s3://bucket/dir/"}); err != nil {
+		t.Fatal(err)
+	}
+	err = a.Rename(ctx, src, Location{Path: "dir", Raw: "s3://bucket/dir"})
+	if err == nil || !strings.Contains(err.Error(), "directory") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestAdapterStatMissingDirHint(t *testing.T) {
+	a, _ := testAdapter(t)
+	_, err := a.Stat(context.Background(), Location{Path: "missing", DirHint: true, Raw: "s3://bucket/missing/"})
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestAdapterRejectsVersionID(t *testing.T) {
 	a, _ := testAdapter(t)
 	loc := Location{Path: "x", Query: map[string]string{QueryVersionID: "v1"}}

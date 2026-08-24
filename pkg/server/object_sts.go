@@ -639,10 +639,35 @@ func validateAdminObjectBackend(rec *meta.OrgObjectBackend) error {
 	if err := validateSTSEndpoint(rec.STSEndpoint); err != nil {
 		return err
 	}
+	if err := validateObjectStoreEndpoint(rec.Endpoint); err != nil {
+		return err
+	}
+	if strings.ContainsAny(rec.Prefix, "*?") {
+		return fmt.Errorf("prefix must not contain wildcard characters")
+	}
+	hasSecret := len(rec.SecretCipher) > 0
 	switch rec.Scheme {
 	case "tos", "oss":
 		if strings.TrimSpace(rec.RoleARN) == "" {
 			return fmt.Errorf("%s mint requires role_arn", rec.Scheme)
+		}
+		if strings.TrimSpace(rec.AccessKeyID) == "" || !hasSecret {
+			return fmt.Errorf("%s mint requires access_key_id and secret_access_key", rec.Scheme)
+		}
+	case "cos":
+		if strings.TrimSpace(rec.AccessKeyID) == "" || !hasSecret {
+			return fmt.Errorf("cos mint requires access_key_id and secret_access_key")
+		}
+		if rec.CredentialKind == meta.ObjectCredentialRole && strings.TrimSpace(rec.RoleARN) == "" {
+			return fmt.Errorf("cos role mint requires role_arn")
+		}
+	case "s3":
+		if rec.CredentialKind == meta.ObjectCredentialRole {
+			if strings.TrimSpace(rec.RoleARN) == "" {
+				return fmt.Errorf("role_arn is required for credential_kind=role")
+			}
+		} else if strings.TrimSpace(rec.AccessKeyID) == "" || !hasSecret {
+			return fmt.Errorf("access_key_id and secret_access_key are required for credential_kind=static")
 		}
 	case "az", "gs":
 		if rec.CredentialKind == meta.ObjectCredentialRole {
@@ -651,8 +676,49 @@ func validateAdminObjectBackend(rec *meta.OrgObjectBackend) error {
 		if strings.TrimSpace(rec.Prefix) != "" {
 			return fmt.Errorf("%s isolation is per-container/bucket; backend prefix must be empty", rec.Scheme)
 		}
+		if !hasSecret {
+			if rec.Scheme == "gs" {
+				return fmt.Errorf("secret_access_key must be the GCS service-account JSON")
+			}
+			return fmt.Errorf("azure requires account name (access_key_id or account_id) and account key")
+		}
+		if rec.Scheme == "az" && strings.TrimSpace(rec.AccessKeyID) == "" && strings.TrimSpace(rec.AccountID) == "" {
+			return fmt.Errorf("azure requires account name (access_key_id or account_id) and account key")
+		}
 	}
 	return nil
+}
+
+func validateObjectStoreEndpoint(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("endpoint must be an absolute URL")
+	}
+	if u.User != nil {
+		return fmt.Errorf("endpoint must not contain userinfo")
+	}
+	host := strings.ToLower(u.Hostname())
+	if isBlockedSTSHost(host) {
+		return fmt.Errorf("endpoint host is not allowed")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if host == "127.0.0.1" || host == "localhost" || host == "::1" {
+			return nil
+		}
+		return fmt.Errorf("endpoint must use https:// (http:// is only allowed for loopback)")
+	default:
+		return fmt.Errorf("endpoint scheme %q is not allowed", u.Scheme)
+	}
 }
 
 func mintableObjectScheme(scheme string) bool {

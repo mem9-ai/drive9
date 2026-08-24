@@ -447,11 +447,15 @@ func (a *localFS) OpenWrite(_ context.Context, loc Location, _ WriteOpts) (Write
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
+	mode := os.FileMode(0o644)
+	if st, err := os.Stat(p); err == nil {
+		mode = st.Mode().Perm()
+	}
 	tmp, err := os.CreateTemp(dir, ".drive9-cp-*")
 	if err != nil {
 		return nil, err
 	}
-	return &fileWrite{f: tmp, dest: p, tmp: tmp.Name()}, nil
+	return &fileWrite{f: tmp, dest: p, tmp: tmp.Name(), mode: mode}, nil
 }
 
 func (a *localFS) Remove(_ context.Context, loc Location, recursive bool) error {
@@ -470,6 +474,7 @@ type fileWrite struct {
 	f    *os.File
 	dest string
 	tmp  string
+	mode os.FileMode
 }
 
 func (w *fileWrite) Write(p []byte) (int, error) { return w.f.Write(p) }
@@ -482,6 +487,12 @@ func (w *fileWrite) Close() error {
 	if err := w.f.Close(); err != nil {
 		_ = os.Remove(w.tmp)
 		return err
+	}
+	if w.mode != 0 {
+		if err := os.Chmod(w.tmp, w.mode); err != nil {
+			_ = os.Remove(w.tmp)
+			return err
+		}
 	}
 	if err := os.Rename(w.tmp, w.dest); err != nil {
 		_ = os.Remove(w.tmp)
@@ -501,6 +512,18 @@ type objectBackend struct {
 	client    *client.Client
 	authLocal bool
 	write     bool
+}
+
+const objectOpTimeout = 5 * time.Minute
+
+func withObjectOpTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, objectOpTimeout)
 }
 
 func openObjectAuthenticated(ctx context.Context, c *client.Client, loc Location, authLocal bool) (*objectBackend, error) {
@@ -530,7 +553,9 @@ func openObjectMinted(ctx context.Context, c *client.Client, loc Location, write
 	if err != nil {
 		return nil, err
 	}
-	applyMintedQuery(loc.Query, minted)
+	if err := applyMintedQuery(loc.Query, minted); err != nil {
+		return nil, err
+	}
 	inner, err := objectfs.OpenWithSession(ctx, toObjectLocation(loc), objectfs.SessionCredentials{
 		AccessKeyID:     minted.AccessKeyID,
 		SecretAccessKey: minted.SecretAccessKey,
@@ -558,11 +583,14 @@ func (a *objectBackend) ensureWrite(ctx context.Context) error {
 	return nil
 }
 
-func applyMintedQuery(q map[string]string, minted *client.ObjectCredentials) {
+func applyMintedQuery(q map[string]string, minted *client.ObjectCredentials) error {
 	if q == nil || minted == nil {
-		return
+		return nil
 	}
 	if minted.Endpoint != "" && q[objectfs.QueryEndpoint] == "" {
+		if err := objectfs.ValidateEndpoint(minted.Endpoint); err != nil {
+			return fmt.Errorf("minted endpoint: %w", err)
+		}
 		q[objectfs.QueryEndpoint] = minted.Endpoint
 	}
 	if minted.Region != "" && q[objectfs.QueryRegion] == "" {
@@ -574,6 +602,7 @@ func applyMintedQuery(q map[string]string, minted *client.ObjectCredentials) {
 	if minted.Account != "" && q[objectfs.QueryAccount] == "" {
 		q[objectfs.QueryAccount] = minted.Account
 	}
+	return nil
 }
 
 func toObjectLocation(loc Location) objectfs.Location {
