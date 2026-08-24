@@ -67,6 +67,31 @@ func TestConnectionStringSessionUsesExplicitKeys(t *testing.T) {
 	}
 }
 
+func TestConnectionStringGCSAccessTokenAndAzureSAS(t *testing.T) {
+	gcs, err := Parse("gs://bucket/k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := connectionString(gcs, SessionCredentials{AccessToken: "ya29.tok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "env_auth=false") || !strings.Contains(got, "access_token=ya29.tok") {
+		t.Fatalf("gcs got %q", got)
+	}
+	az, err := Parse("az://container/k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = connectionString(az, SessionCredentials{SASURL: "https://acct.blob.core.windows.net/container?sig=1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "env_auth=false") || !strings.Contains(got, "sas_url=") {
+		t.Fatalf("azure got %q", got)
+	}
+}
+
 func TestConnectionStringTOSRequiresRegion(t *testing.T) {
 	loc, err := Parse("tos://b/k")
 	if err != nil {

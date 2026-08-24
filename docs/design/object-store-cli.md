@@ -65,8 +65,21 @@ Minted credentials are scoped to that tenant’s prefix. A key minted for
 Reads get a read-only session. Writes, deletes, mkdir, and a writable mount
 get a write session.
 
-Server mint currently covers **S3 / COS / TOS / OSS**. GCS and Azure still use
-`--auth=local`.
+Server mint covers **S3, COS, TOS, OSS, GCS, and Azure**.
+
+- **S3** (and S3-compatible STS): `GetFederationToken` for static keys,
+  `AssumeRole` for a role. `--sts-endpoint` overrides the STS URL (MinIO STS,
+  custom gateways).
+- **COS**: Tencent CAM `GetFederationToken` (static) or `AssumeRole`. Set
+  `--account-id` to the APPID, or use a `bucket-appid` name.
+- **TOS / OSS**: Volcengine / Aliyun **AssumeRole** only (`--role-arn` is
+  required). Those clouds have no AWS-style federation token.
+- **GCS**: server holds a service-account JSON and mints a short-lived OAuth
+  access token. Isolation is **one bucket per tenant** (namespace must match
+  the bucket; backend prefix must be empty).
+- **Azure**: server holds the storage account key and mints a container SAS.
+  Isolation is **one container per tenant** (namespace must match the
+  container; backend prefix must be empty).
 
 ### Escape hatch: `--auth=local`
 
@@ -110,10 +123,16 @@ drive9 admin object-backend add \
 `--credential-kind role` with `--role-arn` is the other option (optional
 access key; otherwise the server’s own IAM is used to assume the role).
 
-`ls` never prints secrets. `rm --id` deletes a backend.
+An org may register **more than one backend** for the same bucket (different
+`--prefix` or `--endpoint`). Mint picks the longest matching prefix; pass
+`?endpoint=` on the URI when two endpoints share a bucket name.
 
-An optional `--prefix` on the backend is an extra path **above** every tenant
-namespace in that bucket (for example a shared `drive9/` folder).
+`ls` never prints secrets. `get --id` shows one row. `update --id` patches
+fields in place — use it to rotate `--secret-access-key` without delete+add.
+`rm --id` deletes a backend.
+
+Optional flags: `--name`, `--sts-endpoint`, `--account-id`, `--max-session-ttl`,
+`--prefix` (extra path **above** every tenant namespace in that bucket).
 
 ### 2. Bind this tenant to a customer prefix
 
@@ -200,12 +219,14 @@ I/O stack. Isolation is the minted session, not a rewrite of `/v1/fs`.
 
 Control-plane metadata, not the tenant filesystem database.
 
-**`org_object_backends`** — one row per org + scheme + bucket.
+**`org_object_backends`** — one row per org identity (scheme + bucket +
+prefix + endpoint). Multiple rows per bucket are allowed.
 
-Holds endpoint/region, optional extra prefix, credential kind (`static` or
-`role`), role ARN, access key id, and encrypted secret / external id. Secrets
-use the same org KMS wrapping as other control-plane secrets. List APIs return
-“has secret”, never the plaintext.
+Holds optional name, data-plane endpoint, STS endpoint, region, account id,
+optional extra prefix, credential kind (`static` or `role`), role ARN, access
+key id, and encrypted secret / external id. Secrets use the same org KMS
+wrapping as other control-plane secrets. List APIs return “has secret”, never
+the plaintext. `update` rotates the secret in place.
 
 **`tenant_tidbcloud_org_bindings.object_namespace_id`** — customer prefix id
 for that tenant. Empty means “object mint not allowed”. This is not a user ACL
@@ -218,8 +239,11 @@ schema self-repair (add column / create table only).
 
 ## Limits and non-goals
 
-- Server mint is S3-compatible only (`s3` / `cos` / `tos` / `oss`). GCS and
-  Azure: `--auth=local`.
+- Azure and GCS mint isolate at container/bucket scope, not a key prefix
+  inside a shared container/bucket. Use one container or bucket per tenant.
+- TOS and OSS mint require a role ARN (AssumeRole). COS static keys use
+  GetFederationToken.
+- Scoped (workspace-zone) tokens cannot mint object credentials.
 - No `?profile=` and no rclone remote names. Credentials are either minted or
   the process-native chain.
 - `chmod`, `find`, `grep`, `symlink`, and `hardlink` stay drive9-only.

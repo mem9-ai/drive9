@@ -212,7 +212,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	perfAddr := fs.String("perf-addr", "", "serve live pprof on this address, e.g. 127.0.0.1:6060")
 
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: drive9 mount [flags] [:/remote|s3://bucket/prefix/|gs://bucket/prefix/|az://container/prefix/] <mountpoint>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: drive9 mount [flags] [--auth=local|server] [:/remote|s3://bucket/prefix/|gs://bucket/prefix/|az://container/prefix/] <mountpoint>\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 

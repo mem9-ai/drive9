@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -21,8 +22,12 @@ func adminObjectBackend(args []string) error {
 		return nil
 	case "ls", "list":
 		return adminObjectBackendList(args[1:])
+	case "get":
+		return adminObjectBackendGet(args[1:])
 	case "add":
 		return adminObjectBackendAdd(args[1:])
+	case "update":
+		return adminObjectBackendUpdate(args[1:])
 	case "rm", "delete":
 		return adminObjectBackendDelete(args[1:])
 	default:
@@ -31,28 +36,38 @@ func adminObjectBackend(args []string) error {
 }
 
 func adminObjectBackendUsage() string {
-	return `usage: drive9 admin object-backend <add|ls|rm> [flags]
+	return `usage: drive9 admin object-backend <add|get|ls|update|rm> [flags]
 
 manage org-level object-store credentials (TiDB Cloud AK/SK required).
 Secrets are never printed. Tenant API keys cannot change this mapping.
+An org may register multiple backends for the same bucket (different prefix
+or endpoint). update rotates keys without delete+add.
 
 commands:
   add     register a bucket + credential
+  get     show one backend by id (no secrets)
   ls      list backends (no secrets)
+  update  patch a backend by id (key rotation)
   rm      delete a backend by id
 
 flags:
-  --scheme s3|cos|tos|oss
+  --id ID
+  --name LABEL
+  --scheme s3|cos|tos|oss|gs|az
   --bucket NAME
-  --endpoint URL
+  --endpoint URL                   object data-plane endpoint
+  --sts-endpoint URL               STS/RAM/CAM endpoint (MinIO STS, custom)
   --region NAME
+  --account-id ID                  Tencent APPID, Azure account, etc.
   --prefix PATH                    optional extra prefix above the tenant namespace
   --credential-kind static|role
-  --role-arn ARN                   required for --credential-kind=role
-  --access-key-id KEY              required for static; optional for role (else server IAM)
-  --secret-access-key SECRET       required for static
+  --role-arn ARN                   required for --credential-kind=role; also TOS/OSS
+  --access-key-id KEY              required for static HMAC; Azure account name
+  --secret-access-key SECRET       HMAC secret, Azure account key, or GCS SA JSON
   --external-id ID
+  --max-session-ttl SECONDS
   --force-path-style
+  --no-force-path-style            update only
   --tidbcloud-public-key KEY
   --tidbcloud-private-key KEY
   --json
@@ -74,86 +89,17 @@ func adminObjectBackendList(args []string) error {
 		return enc.Encode(map[string]any{"backends": rows})
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "ID\tSCHEME\tBUCKET\tKIND\tENDPOINT")
+	_, _ = fmt.Fprintln(w, "ID\tNAME\tSCHEME\tBUCKET\tPREFIX\tKIND\tENDPOINT")
 	for _, row := range rows {
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", row.ID, row.Scheme, row.Bucket, row.CredentialKind, row.Endpoint)
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", row.ID, row.Name, row.Scheme, row.Bucket, row.Prefix, row.CredentialKind, row.Endpoint)
 	}
 	return w.Flush()
 }
 
 func adminObjectBackendAdd(args []string) error {
-	var (
-		scheme, bucket, endpoint, region, kind, roleARN, accessKey, secret, external, prefix string
-		forcePathStyle                                                                       bool
-	)
-	filtered := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--scheme":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--scheme requires an argument")
-			}
-			scheme = args[i]
-		case "--bucket":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--bucket requires an argument")
-			}
-			bucket = args[i]
-		case "--endpoint":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--endpoint requires an argument")
-			}
-			endpoint = args[i]
-		case "--region":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--region requires an argument")
-			}
-			region = args[i]
-		case "--prefix":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--prefix requires an argument")
-			}
-			prefix = args[i]
-		case "--credential-kind":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--credential-kind requires an argument")
-			}
-			kind = args[i]
-		case "--role-arn":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--role-arn requires an argument")
-			}
-			roleARN = args[i]
-		case "--access-key-id":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--access-key-id requires an argument")
-			}
-			accessKey = args[i]
-		case "--secret-access-key":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--secret-access-key requires an argument")
-			}
-			secret = args[i]
-		case "--external-id":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--external-id requires an argument")
-			}
-			external = args[i]
-		case "--force-path-style":
-			forcePathStyle = true
-		default:
-			filtered = append(filtered, args[i])
-		}
+	f, filtered, err := parseObjectBackendFieldFlags(args, false)
+	if err != nil {
+		return err
 	}
 	c, publicKey, privateKey, asJSON, err := resolveAdminObjectFlags(filtered, false, "")
 	if err != nil {
@@ -162,18 +108,121 @@ func adminObjectBackendAdd(args []string) error {
 	out, err := c.AdminCreateObjectBackend(context.Background(), client.AdminObjectBackendCreateRequest{
 		PublicKey:       publicKey,
 		PrivateKey:      privateKey,
-		Scheme:          scheme,
-		Endpoint:        endpoint,
-		Region:          region,
-		ForcePathStyle:  forcePathStyle,
-		Bucket:          bucket,
-		Prefix:          prefix,
-		CredentialKind:  kind,
-		RoleARN:         roleARN,
-		AccessKeyID:     accessKey,
-		SecretAccessKey: secret,
-		ExternalID:      external,
+		Name:            f.name,
+		Scheme:          f.scheme,
+		Endpoint:        f.endpoint,
+		STSEndpoint:     f.stsEndpoint,
+		Region:          f.region,
+		AccountID:       f.accountID,
+		ForcePathStyle:  f.forcePathStyle,
+		Bucket:          f.bucket,
+		Prefix:          f.prefix,
+		CredentialKind:  f.kind,
+		RoleARN:         f.roleARN,
+		AccessKeyID:     f.accessKey,
+		SecretAccessKey: f.secret,
+		ExternalID:      f.external,
+		MaxSessionTTL:   f.maxTTL,
 	})
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+	fmt.Printf("id: %s\nscheme: %s\nbucket: %s\n", out.ID, out.Scheme, out.Bucket)
+	return nil
+}
+
+func adminObjectBackendGet(args []string) error {
+	f, filtered, err := parseObjectBackendFieldFlags(args, true)
+	if err != nil {
+		return err
+	}
+	c, publicKey, privateKey, asJSON, err := resolveAdminObjectFlags(filtered, false, "")
+	if err != nil {
+		return err
+	}
+	if f.id == "" {
+		return fmt.Errorf("usage: drive9 admin object-backend get --id ID")
+	}
+	out, err := c.AdminGetObjectBackend(context.Background(), f.id, publicKey, privateKey)
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+	fmt.Printf("id: %s\nname: %s\nscheme: %s\nbucket: %s\nprefix: %s\nendpoint: %s\nsts_endpoint: %s\nregion: %s\naccount_id: %s\nkind: %s\nrole_arn: %s\nmax_session_ttl_sec: %d\n",
+		out.ID, out.Name, out.Scheme, out.Bucket, out.Prefix, out.Endpoint, out.STSEndpoint, out.Region, out.AccountID, out.CredentialKind, out.RoleARN, out.MaxSessionTTL)
+	return nil
+}
+
+func adminObjectBackendUpdate(args []string) error {
+	f, filtered, err := parseObjectBackendFieldFlags(args, true)
+	if err != nil {
+		return err
+	}
+	c, publicKey, privateKey, asJSON, err := resolveAdminObjectFlags(filtered, false, "")
+	if err != nil {
+		return err
+	}
+	if f.id == "" {
+		return fmt.Errorf("usage: drive9 admin object-backend update --id ID [flags]")
+	}
+	in := client.AdminObjectBackendUpdateRequest{PublicKey: publicKey, PrivateKey: privateKey}
+	if f.nameSet {
+		in.Name = &f.name
+	}
+	if f.schemeSet {
+		in.Scheme = &f.scheme
+	}
+	if f.endpointSet {
+		in.Endpoint = &f.endpoint
+	}
+	if f.stsEndpointSet {
+		in.STSEndpoint = &f.stsEndpoint
+	}
+	if f.regionSet {
+		in.Region = &f.region
+	}
+	if f.accountIDSet {
+		in.AccountID = &f.accountID
+	}
+	if f.forcePathStyleSet {
+		v := f.forcePathStyle
+		in.ForcePathStyle = &v
+	}
+	if f.bucketSet {
+		in.Bucket = &f.bucket
+	}
+	if f.prefixSet {
+		in.Prefix = &f.prefix
+	}
+	if f.kindSet {
+		in.CredentialKind = &f.kind
+	}
+	if f.roleARNSet {
+		in.RoleARN = &f.roleARN
+	}
+	if f.accessKeySet {
+		in.AccessKeyID = &f.accessKey
+	}
+	if f.secretSet {
+		in.SecretAccessKey = &f.secret
+	}
+	if f.externalSet {
+		in.ExternalID = &f.external
+	}
+	if f.maxTTLSet {
+		v := f.maxTTL
+		in.MaxSessionTTL = &v
+	}
+	out, err := c.AdminUpdateObjectBackend(context.Background(), f.id, in)
 	if err != nil {
 		return err
 	}
@@ -309,6 +358,138 @@ func adminTenantObjectNamespaceClear(args []string) error {
 		return err
 	}
 	return c.AdminClearObjectNamespace(context.Background(), tenantID, publicKey, privateKey)
+}
+
+type objectBackendFieldFlags struct {
+	id, name, scheme, bucket, endpoint, stsEndpoint, region, accountID string
+	kind, roleARN, accessKey, secret, external, prefix                 string
+	forcePathStyle                                                     bool
+	maxTTL                                                             int
+	idSet, nameSet, schemeSet, bucketSet, endpointSet, stsEndpointSet  bool
+	regionSet, accountIDSet, kindSet, roleARNSet, accessKeySet         bool
+	secretSet, externalSet, prefixSet, forcePathStyleSet, maxTTLSet    bool
+}
+
+func parseObjectBackendFieldFlags(args []string, allowPositionalID bool) (objectBackendFieldFlags, []string, error) {
+	var f objectBackendFieldFlags
+	filtered := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		need := func(flag string) (string, error) {
+			i++
+			if i >= len(args) {
+				return "", fmt.Errorf("%s requires an argument", flag)
+			}
+			return args[i], nil
+		}
+		switch args[i] {
+		case "--id":
+			v, err := need("--id")
+			if err != nil {
+				return f, nil, err
+			}
+			f.id, f.idSet = v, true
+		case "--name":
+			v, err := need("--name")
+			if err != nil {
+				return f, nil, err
+			}
+			f.name, f.nameSet = v, true
+		case "--scheme":
+			v, err := need("--scheme")
+			if err != nil {
+				return f, nil, err
+			}
+			f.scheme, f.schemeSet = v, true
+		case "--bucket":
+			v, err := need("--bucket")
+			if err != nil {
+				return f, nil, err
+			}
+			f.bucket, f.bucketSet = v, true
+		case "--endpoint":
+			v, err := need("--endpoint")
+			if err != nil {
+				return f, nil, err
+			}
+			f.endpoint, f.endpointSet = v, true
+		case "--sts-endpoint":
+			v, err := need("--sts-endpoint")
+			if err != nil {
+				return f, nil, err
+			}
+			f.stsEndpoint, f.stsEndpointSet = v, true
+		case "--region":
+			v, err := need("--region")
+			if err != nil {
+				return f, nil, err
+			}
+			f.region, f.regionSet = v, true
+		case "--account-id":
+			v, err := need("--account-id")
+			if err != nil {
+				return f, nil, err
+			}
+			f.accountID, f.accountIDSet = v, true
+		case "--prefix":
+			v, err := need("--prefix")
+			if err != nil {
+				return f, nil, err
+			}
+			f.prefix, f.prefixSet = v, true
+		case "--credential-kind":
+			v, err := need("--credential-kind")
+			if err != nil {
+				return f, nil, err
+			}
+			f.kind, f.kindSet = v, true
+		case "--role-arn":
+			v, err := need("--role-arn")
+			if err != nil {
+				return f, nil, err
+			}
+			f.roleARN, f.roleARNSet = v, true
+		case "--access-key-id":
+			v, err := need("--access-key-id")
+			if err != nil {
+				return f, nil, err
+			}
+			f.accessKey, f.accessKeySet = v, true
+		case "--secret-access-key":
+			v, err := need("--secret-access-key")
+			if err != nil {
+				return f, nil, err
+			}
+			f.secret, f.secretSet = v, true
+		case "--external-id":
+			v, err := need("--external-id")
+			if err != nil {
+				return f, nil, err
+			}
+			f.external, f.externalSet = v, true
+		case "--max-session-ttl":
+			v, err := need("--max-session-ttl")
+			if err != nil {
+				return f, nil, err
+			}
+			n, convErr := strconv.Atoi(v)
+			if convErr != nil {
+				return f, nil, fmt.Errorf("--max-session-ttl must be an integer")
+			}
+			f.maxTTL, f.maxTTLSet = n, true
+		case "--force-path-style":
+			f.forcePathStyle, f.forcePathStyleSet = true, true
+		case "--no-force-path-style":
+			f.forcePathStyle, f.forcePathStyleSet = false, true
+		default:
+			filtered = append(filtered, args[i])
+		}
+	}
+	if allowPositionalID && f.id == "" && len(filtered) > 0 && filtered[0] != "" && filtered[0][0] != '-' {
+		f.id = filtered[0]
+		f.idSet = true
+		filtered = filtered[1:]
+	}
+	return f, filtered, nil
 }
 
 func resolveAdminObjectFlags(args []string, requireTenant bool, _ string) (*client.Client, string, string, bool, error) {

@@ -15,6 +15,7 @@ import (
 //	drive9 fs ls /path/    list /path/
 //	drive9 fs ls -l /path  long format with size
 //	drive9 fs ls :/path    list using remote path prefix
+//	drive9 fs ls [--auth=local|server] s3://bucket/prefix/
 func Ls(c *client.Client, args []string) error {
 	authLocal, args, err := peelObjectAuth(args)
 	if err != nil {

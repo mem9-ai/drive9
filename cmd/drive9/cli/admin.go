@@ -744,7 +744,7 @@ commands:
   tenant set-quota --tenant-id ID   set quota for one tenant
   tenant extract-config <get|set>   get or update media extract config
   tenant object-namespace <get|set|clear>  bind a customer object prefix id
-  object-backend <add|ls|rm>        org object-store credentials
+  object-backend <add|get|ls|update|rm>  org object-store credentials
   pool <command> [flags]            manage the tenant pool
 
 global admin flags:

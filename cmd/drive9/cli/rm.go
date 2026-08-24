@@ -43,13 +43,13 @@ func Rm(c *client.Client, args []string) error {
 			}
 		}
 		if path != "" {
-			return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] <path>")
+			return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] [--auth=local|server] <path>")
 		}
 		path = arg
 	}
 
 	if path == "" {
-		return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] <path>")
+		return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] [--auth=local|server] <path>")
 	}
 
 	h, herr := fsHandleForArg(c, path)

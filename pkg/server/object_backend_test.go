@@ -15,14 +15,14 @@ import (
 )
 
 func TestParseMintObjectURI(t *testing.T) {
-	scheme, bucket, key, err := parseMintObjectURI("s3://example/customer/a.txt")
-	if err != nil || scheme != "s3" || bucket != "example" || key != "customer/a.txt" {
-		t.Fatalf("got %s %s %s err=%v", scheme, bucket, key, err)
+	scheme, bucket, key, endpoint, err := parseMintObjectURI("s3://example/customer/a.txt?endpoint=https://minio.example")
+	if err != nil || scheme != "s3" || bucket != "example" || key != "customer/a.txt" || endpoint != "https://minio.example" {
+		t.Fatalf("got %s %s %s %s err=%v", scheme, bucket, key, endpoint, err)
 	}
-	if _, _, _, err := parseMintObjectURI("not-a-uri"); err == nil {
+	if _, _, _, _, err := parseMintObjectURI("not-a-uri"); err == nil {
 		t.Fatal("expected invalid uri")
 	}
-	if _, _, _, err := parseMintObjectURI("webdav://x/y"); err == nil {
+	if _, _, _, _, err := parseMintObjectURI("webdav://x/y"); err == nil {
 		t.Fatal("expected unsupported scheme")
 	}
 }
@@ -104,12 +104,20 @@ func TestHandleObjectCredentialsRejectsOutsideNamespaceAndUnsupportedScheme(t *t
 		t.Fatalf("outside ns status=%d body=%s", rr.Code, rr.Body.String())
 	}
 
-	req = httptest.NewRequest(http.MethodPost, "/v1/object-credentials", strings.NewReader(`{"uri":"gs://mint-deny/cust/a.txt"}`))
+	req = httptest.NewRequest(http.MethodPost, "/v1/object-credentials", strings.NewReader(`{"uri":"webdav://mint-deny/cust/a.txt"}`))
 	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: rt.tenantID, TiDBCloudOrgID: "org-1"}))
 	rr = httptest.NewRecorder()
 	rt.server.handleObjectCredentials(rr, req)
-	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "--auth=local") {
-		t.Fatalf("gs mint status=%d body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "unsupported") {
+		t.Fatalf("webdav mint status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/object-credentials", strings.NewReader(`{"uri":"s3://mint-deny/cust/a.txt"}`))
+	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: rt.tenantID, TiDBCloudOrgID: "org-1", IsScoped: true}))
+	rr = httptest.NewRecorder()
+	rt.server.handleObjectCredentials(rr, req)
+	if rr.Code != http.StatusForbidden || !strings.Contains(rr.Body.String(), "scoped token") {
+		t.Fatalf("scoped mint status=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -277,5 +285,98 @@ func TestAdminObjectBackendRejectsStaticWithoutSecret(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status=%d body=%s", resp.StatusCode, b)
+	}
+}
+
+func TestAdminObjectBackendUpdateAndMultiple(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	create := func(bucket, prefix string) adminObjectBackendView {
+		t.Helper()
+		body := map[string]any{
+			"public_key": "public-1", "private_key": "private-1",
+			"scheme": "s3", "bucket": bucket, "prefix": prefix,
+			"credential_kind": "static", "access_key_id": "AKIATEST",
+			"secret_access_key": "secret", "region": "us-east-1",
+			"sts_endpoint": "https://sts.example.com",
+		}
+		raw, _ := json.Marshal(body)
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/admin/object-backends", bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(quotaPublicKeyHeader, "public-1")
+		req.Header.Set(quotaPrivateKeyHeader, "private-1")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusCreated {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("create status=%d body=%s", resp.StatusCode, b)
+		}
+		var created adminObjectBackendView
+		if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+			t.Fatal(err)
+		}
+		return created
+	}
+
+	a := create("multi-bkt", "east")
+	b := create("multi-bkt", "west")
+	if a.ID == b.ID || a.Prefix != "east" || b.Prefix != "west" {
+		t.Fatalf("a=%+v b=%+v", a, b)
+	}
+	if a.STSEndpoint != "https://sts.example.com" {
+		t.Fatalf("sts endpoint=%q", a.STSEndpoint)
+	}
+
+	patch := map[string]any{
+		"public_key": "public-1", "private_key": "private-1",
+		"name": "rotated", "secret_access_key": "new-secret", "region": "us-west-2",
+	}
+	raw, _ := json.Marshal(patch)
+	req, err := http.NewRequest(http.MethodPatch, ts.URL+"/v1/admin/object-backends/"+a.ID, bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(quotaPublicKeyHeader, "public-1")
+	req.Header.Set(quotaPrivateKeyHeader, "private-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("patch status=%d body=%s", resp.StatusCode, body)
+	}
+	var updated adminObjectBackendView
+	if err := json.NewDecoder(resp.Body).Decode(&updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != "rotated" || updated.Region != "us-west-2" || !updated.HasSecret {
+		t.Fatalf("updated=%+v", updated)
+	}
+
+	req, err = http.NewRequest(http.MethodGet, ts.URL+"/v1/admin/object-backends/"+a.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(quotaPublicKeyHeader, "public-1")
+	req.Header.Set(quotaPrivateKeyHeader, "private-1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("get status=%d body=%s", resp.StatusCode, body)
 	}
 }

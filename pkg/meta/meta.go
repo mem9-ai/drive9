@@ -288,16 +288,16 @@ type ExternalBinding struct {
 }
 
 type TenantTiDBCloudOrgBinding struct {
-	TenantID            string
-	OrganizationID      string
-	ClusterID           string
-	BranchID            string
-	PoolID              string
-	PoolStatus          TenantPoolBindingStatus
-	UsedAt              *time.Time
-	ObjectNamespaceID   string
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	TenantID          string
+	OrganizationID    string
+	ClusterID         string
+	BranchID          string
+	PoolID            string
+	PoolStatus        TenantPoolBindingStatus
+	UsedAt            *time.Time
+	ObjectNamespaceID string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 type TenantWithTiDBCloudOrgBinding struct {
@@ -416,6 +416,12 @@ func (s *Store) migrate() (err error) {
 		return err
 	}
 	if err := ensureTiDBCloudOrgBindingUniqueIndex(ctx, s.db); err != nil {
+		return err
+	}
+	if err := backfillOrgObjectBackendIdentityHashes(ctx, s.db); err != nil {
+		return err
+	}
+	if err := ensureOrgObjectBackendIdentityIndex(ctx, s.db); err != nil {
 		return err
 	}
 	diffs, err = diffMetaSchema(ctx, s.db, spec)
@@ -687,22 +693,26 @@ func metaInitSchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS org_object_backends (
 			id                   VARCHAR(64) NOT NULL,
 			organization_id      VARCHAR(64) NOT NULL,
+			name                 VARCHAR(128) NOT NULL DEFAULT '',
 			scheme               VARCHAR(16) NOT NULL,
 			endpoint             VARCHAR(512) NOT NULL DEFAULT '',
+			sts_endpoint         VARCHAR(512) NOT NULL DEFAULT '',
 			region               VARCHAR(64) NOT NULL DEFAULT '',
+			account_id           VARCHAR(128) NOT NULL DEFAULT '',
 			force_path_style     TINYINT(1) NOT NULL DEFAULT 0,
 			bucket               VARCHAR(255) NOT NULL,
 			prefix               VARCHAR(2048) NOT NULL DEFAULT '',
 			credential_kind      VARCHAR(16) NOT NULL,
 			role_arn             VARCHAR(2048) NOT NULL DEFAULT '',
 			access_key_id        VARCHAR(128) NOT NULL DEFAULT '',
-			secret_cipher        VARBINARY(2048) NULL,
+			secret_cipher        VARBINARY(8192) NULL,
 			external_id_cipher   VARBINARY(2048) NULL,
 			max_session_ttl_sec  INT UNSIGNED NOT NULL DEFAULT 3600,
+			identity_hash        CHAR(64) NOT NULL DEFAULT '',
 			created_at           DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at           DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			PRIMARY KEY (id),
-			UNIQUE INDEX uk_org_object_backend (organization_id, scheme, bucket),
+			UNIQUE INDEX uk_org_object_backend_identity (identity_hash),
 			INDEX idx_org_object_backends_org (organization_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_api_key_fs_scopes (
@@ -850,6 +860,9 @@ func dropObsoleteMetaIndexes(ctx context.Context, db *sql.DB) error {
 	if err := dropMetaIndexIfColumns(ctx, db, "tenant_tidbcloud_org_bindings", "idx_tidbcloud_org_cluster",
 		[]string{"organization_id", "cluster_id", "created_at", "tenant_id"}); err != nil {
 		return fmt.Errorf("drop obsolete meta index idx_tidbcloud_org_cluster: %w", err)
+	}
+	if err := dropMetaIndexIfExists(ctx, db, "org_object_backends", "uk_org_object_backend"); err != nil {
+		return fmt.Errorf("drop obsolete meta index uk_org_object_backend: %w", err)
 	}
 	return nil
 }
@@ -1052,11 +1065,14 @@ func diffMetaTableMetaWithObservedIndexes(table metaTableSpec, meta metaTableMet
 		observedType := normalizeMetaSQLFragment(col.columnType)
 		desiredType := normalizeMetaSQLFragment(spec.columnType)
 		if observedType != desiredType {
-			// Only generate repair SQL for the one known-safe widening:
-			// tenants.schema_version INT → INT UNSIGNED.
+			// Only generate repair SQL for known-safe widenings.
 			var repairSQL string
 			if table.name == "tenants" && name == "schema_version" &&
 				observedType == "int" && desiredType == "int unsigned" {
+				repairSQL = spec.modifySQL
+			}
+			if table.name == "org_object_backends" && name == "secret_cipher" &&
+				observedType == "varbinary(2048)" && desiredType == "varbinary(8192)" {
 				repairSQL = spec.modifySQL
 			}
 			diffs = append(diffs, metaSchemaDiff{
@@ -1205,6 +1221,97 @@ func ensureTiDBCloudOrgBindingUniqueIndex(ctx context.Context, db *sql.DB) error
 		return fmt.Errorf("create tidbcloud org binding unique index: %w", err)
 	}
 	return nil
+}
+
+func backfillOrgObjectBackendIdentityHashes(ctx context.Context, db *sql.DB) error {
+	exists, err := metaTableExists(ctx, db, "org_object_backends")
+	if err != nil {
+		return fmt.Errorf("check org_object_backends exists: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+	rows, err := db.QueryContext(ctx, `SELECT id, organization_id, scheme, bucket, prefix, endpoint, identity_hash FROM org_object_backends`)
+	if err != nil {
+		return fmt.Errorf("list org object backends for identity hash backfill: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	type row struct {
+		id, org, scheme, bucket, prefix, endpoint, hash string
+	}
+	var pending []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.org, &r.scheme, &r.bucket, &r.prefix, &r.endpoint, &r.hash); err != nil {
+			return fmt.Errorf("scan org object backend identity hash: %w", err)
+		}
+		want := orgObjectBackendIdentityHash(&OrgObjectBackend{
+			OrganizationID: r.org,
+			Scheme:         r.scheme,
+			Bucket:         r.bucket,
+			Prefix:         r.prefix,
+			Endpoint:       r.endpoint,
+		})
+		if r.hash != want {
+			pending = append(pending, row{id: r.id, hash: want})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate org object backend identity hashes: %w", err)
+	}
+	for _, r := range pending {
+		if _, err := db.ExecContext(ctx, `UPDATE org_object_backends SET identity_hash = ? WHERE id = ?`, r.hash, r.id); err != nil {
+			return fmt.Errorf("backfill org object backend identity hash %s: %w", r.id, err)
+		}
+	}
+	return nil
+}
+
+func ensureOrgObjectBackendIdentityIndex(ctx context.Context, db *sql.DB) error {
+	exists, err := metaTableExists(ctx, db, "org_object_backends")
+	if err != nil {
+		return fmt.Errorf("check org_object_backends exists: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+	hasIndex, err := metaIndexExists(ctx, db, "org_object_backends", "uk_org_object_backend_identity")
+	if err != nil {
+		return fmt.Errorf("check org object backend identity index: %w", err)
+	}
+	if hasIndex {
+		return nil
+	}
+	var dupes int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM (
+		SELECT identity_hash FROM org_object_backends GROUP BY identity_hash HAVING COUNT(*) > 1
+	) d`).Scan(&dupes); err != nil {
+		return fmt.Errorf("preflight org object backend identity index: %w", err)
+	}
+	if dupes > 0 {
+		return fmt.Errorf("cannot create org object backend identity index: found %d duplicate identity_hash group(s)", dupes)
+	}
+	_, err = db.ExecContext(ctx, `CREATE UNIQUE INDEX uk_org_object_backend_identity ON org_object_backends(identity_hash)`)
+	if err != nil {
+		if isIgnorableMetaSchemaError(err) {
+			return nil
+		}
+		return fmt.Errorf("create org object backend identity index: %w", err)
+	}
+	return nil
+}
+
+func metaTableExists(ctx context.Context, db *sql.DB, tableName string) (bool, error) {
+	if err := validateMetaIdentifier(tableName); err != nil {
+		return false, err
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM information_schema.tables
+		WHERE table_schema = DATABASE() AND table_name = ?`, tableName).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func metaIndexExists(ctx context.Context, db *sql.DB, tableName, indexName string) (bool, error) {
@@ -1395,11 +1502,14 @@ func isSafeAddColumnRepairSQL(sqlText string) bool {
 // widening from INT to INT UNSIGNED is data-preserving for this column.
 // General MODIFY COLUMN is not considered safe without an explicit entry here.
 func isSafeModifyColumnRepairSQL(diff metaSchemaDiff) bool {
-	if diff.tableName != "tenants" || diff.columnName != "schema_version" {
-		return false
-	}
 	n := strings.TrimSuffix(normalizeMetaSQLFragment(diff.repairSQL), ";")
-	return n == "alter table tenants modify column schema_version int unsigned not null default 1"
+	if diff.tableName == "tenants" && diff.columnName == "schema_version" {
+		return n == "alter table tenants modify column schema_version int unsigned not null default 1"
+	}
+	if diff.tableName == "org_object_backends" && diff.columnName == "secret_cipher" {
+		return n == "alter table org_object_backends modify column secret_cipher varbinary(8192) null"
+	}
+	return false
 }
 
 func isIgnorableMetaSchemaError(err error) bool {

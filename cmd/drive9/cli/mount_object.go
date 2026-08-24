@@ -42,6 +42,8 @@ func mountObjectStoreImpl(loc *Location, mountPoint, cacheDir string, readOnly, 
 			AccessKeyID:     minted.AccessKeyID,
 			SecretAccessKey: minted.SecretAccessKey,
 			SessionToken:    minted.SessionToken,
+			SASURL:          minted.SASURL,
+			AccessToken:     minted.AccessToken,
 		}
 	}
 	return objectfs.Mount(opts)

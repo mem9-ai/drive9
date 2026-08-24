@@ -30,7 +30,7 @@ func Stat(c *client.Client, args []string) error {
 		switch arg {
 		case "-o", "--output":
 			if i+1 >= len(args) {
-				return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+				return fmt.Errorf("usage: drive9 fs stat [-o text|json] [--auth=local|server] <path>")
 			}
 			i++
 			outputFormat = args[i]
@@ -39,16 +39,16 @@ func Stat(c *client.Client, args []string) error {
 			}
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+				return fmt.Errorf("usage: drive9 fs stat [-o text|json] [--auth=local|server] <path>")
 			}
 			if path != "" {
-				return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+				return fmt.Errorf("usage: drive9 fs stat [-o text|json] [--auth=local|server] <path>")
 			}
 			path = arg
 		}
 	}
 	if path == "" {
-		return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+		return fmt.Errorf("usage: drive9 fs stat [-o text|json] [--auth=local|server] <path>")
 	}
 	h, err := fsHandleForArg(c, path)
 	if err != nil {

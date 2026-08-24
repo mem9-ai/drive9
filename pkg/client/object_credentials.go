@@ -10,9 +10,12 @@ import (
 
 // ObjectCredentials is a short-lived object-store session minted by the server.
 type ObjectCredentials struct {
-	AccessKeyID     string `json:"access_key_id"`
-	SecretAccessKey string `json:"secret_access_key"`
+	AccessKeyID     string `json:"access_key_id,omitempty"`
+	SecretAccessKey string `json:"secret_access_key,omitempty"`
 	SessionToken    string `json:"session_token,omitempty"`
+	SASURL          string `json:"sas_url,omitempty"`
+	AccessToken     string `json:"access_token,omitempty"`
+	Account         string `json:"account,omitempty"`
 	Expiration      string `json:"expiration,omitempty"`
 	Endpoint        string `json:"endpoint,omitempty"`
 	Region          string `json:"region,omitempty"`
@@ -45,7 +48,8 @@ func (c *Client) MintObjectCredentials(ctx context.Context, uri string, write bo
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode object credentials: %w", err)
 	}
-	if out.AccessKeyID == "" || out.SecretAccessKey == "" {
+	hasHMAC := out.AccessKeyID != "" && out.SecretAccessKey != ""
+	if !hasHMAC && out.SASURL == "" && out.AccessToken == "" {
 		return nil, fmt.Errorf("server returned empty object credentials")
 	}
 	return &out, nil

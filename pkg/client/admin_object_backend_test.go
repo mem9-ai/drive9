@@ -19,9 +19,13 @@ func TestAdminObjectBackendClientSendsHeaders(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/admin/object-backends":
 			_ = json.NewEncoder(w).Encode(map[string]any{"backends": []any{}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/admin/object-backends/obb_1":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "obb_1", "scheme": "s3", "bucket": "b", "name": "prod"})
 		case r.Method == http.MethodPost:
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "obb_1", "scheme": "s3", "bucket": "b"})
+		case r.Method == http.MethodPatch:
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "obb_1", "scheme": "s3", "bucket": "b", "region": "us-west-2"})
 		case r.Method == http.MethodDelete:
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "obb_1", "status": "deleted"})
 		default:
@@ -47,6 +51,24 @@ func TestAdminObjectBackendClientSendsHeaders(t *testing.T) {
 	}
 	if out.ID != "obb_1" || gotPub != "pub" {
 		t.Fatalf("create out=%+v headers pub=%s", out, gotPub)
+	}
+
+	got, err := c.AdminGetObjectBackend(context.Background(), "obb_1", "pub", "priv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "prod" || gotPath != "/v1/admin/object-backends/obb_1" {
+		t.Fatalf("get %+v path=%s", got, gotPath)
+	}
+	region := "us-west-2"
+	updated, err := c.AdminUpdateObjectBackend(context.Background(), "obb_1", AdminObjectBackendUpdateRequest{
+		PublicKey: "pub", PrivateKey: "priv", Region: &region,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Region != "us-west-2" || gotMethod != http.MethodPatch {
+		t.Fatalf("update %+v method=%s", updated, gotMethod)
 	}
 
 	if err := c.AdminDeleteObjectBackend(context.Background(), "obb_1", "pub", "priv"); err != nil {

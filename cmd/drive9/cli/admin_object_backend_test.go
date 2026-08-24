@@ -15,7 +15,7 @@ func TestAdminObjectBackendHelp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admin help: %v", err)
 	}
-	if !strings.Contains(help, "object-backend <add|ls|rm>") {
+	if !strings.Contains(help, "object-backend <add|get|ls|update|rm>") {
 		t.Fatalf("admin help missing object-backend:\n%s", help)
 	}
 	if !strings.Contains(help, "object-namespace <get|set|clear>") {
@@ -29,7 +29,8 @@ func TestAdminObjectBackendHelp(t *testing.T) {
 		t.Fatalf("help: %v", err)
 	}
 	for _, want := range []string{
-		"usage: drive9 admin object-backend <add|ls|rm>",
+		"usage: drive9 admin object-backend <add|get|ls|update|rm>",
+		"--sts-endpoint",
 		"--scheme",
 		"--bucket",
 		"--credential-kind",

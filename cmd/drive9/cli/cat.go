@@ -43,7 +43,7 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 	})
 
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 fs cat [--offset N --length N] <path>")
+		return fmt.Errorf("usage: drive9 fs cat [--offset N --length N] [--auth=local|server] <path>")
 	}
 	if offsetSet != lengthSet {
 		return fmt.Errorf("--offset and --length must be provided together")

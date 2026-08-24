@@ -424,10 +424,17 @@ func ExampleClient_quota() {
 		Bucket:         "example",
 		CredentialKind: "role",
 		RoleARN:        "arn:aws:iam::123:role/drive9-object",
+		STSEndpoint:    "https://sts.amazonaws.com",
 		MaxSessionTTL:  3600,
 	})
 	if err == nil && created != nil {
 		_ = created.ID
+		_, _ = credentialClient.AdminGetObjectBackend(ctx, created.ID, tidbCloudPublicKey, tidbCloudPrivateKey)
+		region := "us-west-2"
+		secret := "rotated-secret"
+		_, _ = credentialClient.AdminUpdateObjectBackend(ctx, created.ID, drive9.AdminObjectBackendUpdateRequest{
+			PublicKey: tidbCloudPublicKey, PrivateKey: tidbCloudPrivateKey, Region: &region, SecretAccessKey: &secret,
+		})
 		_ = credentialClient.AdminDeleteObjectBackend(ctx, created.ID, tidbCloudPublicKey, tidbCloudPrivateKey)
 	}
 	_, _ = credentialClient.AdminGetObjectNamespace(ctx, tenantID, tidbCloudPublicKey, tidbCloudPrivateKey)
@@ -624,8 +631,10 @@ var coveredClientMethods = map[string]bool{
 	"AdminClearObjectNamespace":            true,
 	"AdminCreateObjectBackend":             true,
 	"AdminDeleteObjectBackend":             true,
+	"AdminGetObjectBackend":                true,
 	"AdminGetObjectNamespace":              true,
 	"AdminListObjectBackends":              true,
+	"AdminUpdateObjectBackend":             true,
 	"AdminSetObjectNamespace":              true,
 	"AdminUpdateTenantPool":                true,
 	"AppendJournalEntries":                 true,

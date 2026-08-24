@@ -48,6 +48,58 @@ func TestOrgObjectBackendCRUD(t *testing.T) {
 	}
 }
 
+func TestOrgObjectBackendMultipleSameBucketAndUpdate(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	a := &OrgObjectBackend{
+		ID: "obb_multi_a", OrganizationID: "org-1", Scheme: "s3", Bucket: "shared",
+		Prefix: "east", CredentialKind: ObjectCredentialStatic, AccessKeyID: "AKIAA",
+		SecretCipher: []byte("cipher-a"), Region: "us-east-1",
+	}
+	b := &OrgObjectBackend{
+		ID: "obb_multi_b", OrganizationID: "org-1", Scheme: "s3", Bucket: "shared",
+		Prefix: "west", CredentialKind: ObjectCredentialStatic, AccessKeyID: "AKIAB",
+		SecretCipher: []byte("cipher-b"), Endpoint: "https://s3.example.com",
+	}
+	if err := s.InsertOrgObjectBackend(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertOrgObjectBackend(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.ListOrgObjectBackendsByBucket(ctx, "org-1", "s3", "shared")
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("list by bucket=%d err=%v", len(rows), err)
+	}
+	got, err := s.GetOrgObjectBackend(ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.AccessKeyID = "AKIAA2"
+	got.Region = "us-west-2"
+	got.STSEndpoint = "https://sts.example.com"
+	got.Name = "prod-east"
+	got.SecretCipher = []byte("cipher-a2")
+	if err := s.UpdateOrgObjectBackend(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.GetOrgObjectBackend(ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.AccessKeyID != "AKIAA2" || updated.Region != "us-west-2" || updated.Name != "prod-east" || updated.STSEndpoint != "https://sts.example.com" {
+		t.Fatalf("updated=%+v", updated)
+	}
+	if string(updated.SecretCipher) != "cipher-a2" {
+		t.Fatalf("secret not rotated")
+	}
+	dup := *b
+	dup.ID = "obb_multi_dup"
+	if err := s.InsertOrgObjectBackend(ctx, &dup); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("same identity duplicate err=%v", err)
+	}
+}
+
 func TestSetTenantObjectNamespaceID(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()

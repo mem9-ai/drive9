@@ -535,6 +535,8 @@ func openObjectMinted(ctx context.Context, c *client.Client, loc Location, write
 		AccessKeyID:     minted.AccessKeyID,
 		SecretAccessKey: minted.SecretAccessKey,
 		SessionToken:    minted.SessionToken,
+		SASURL:          minted.SASURL,
+		AccessToken:     minted.AccessToken,
 	})
 	if err != nil {
 		return nil, mapObjectErr(err)
@@ -568,6 +570,9 @@ func applyMintedQuery(q map[string]string, minted *client.ObjectCredentials) {
 	}
 	if minted.ForcePathStyle {
 		q[objectfs.QueryForcePathStyle] = "true"
+	}
+	if minted.Account != "" && q[objectfs.QueryAccount] == "" {
+		q[objectfs.QueryAccount] = minted.Account
 	}
 }
 

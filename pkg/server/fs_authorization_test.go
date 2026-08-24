@@ -199,6 +199,7 @@ func TestIsScopedBusinessRequestAllowed(t *testing.T) {
 			{http.MethodGet, "/v1/events", ""},              // out of scope
 			{http.MethodGet, "/v1/journals", ""},            // out of scope
 			{http.MethodGet, "/v1/vault/secrets", ""},       // out of scope
+			{http.MethodPost, "/v1/object-credentials", ""}, // owner-only mint
 		}
 		for _, tc := range cases {
 			r := newScopedRequest(t, tc.method, tc.path, tc.query)

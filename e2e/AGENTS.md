@@ -111,8 +111,16 @@ RUN_SSE_SMOKE=1 bash e2e/sse-retention-smoke-test.sh
 
 # Object-store CLI + mount against a local MinIO (docker/podman).
 # Does not need drive9-server. OBJECT_STRICT_MOUNT=1 fails if FUSE is missing.
+# This suite injects --auth=local; it does not exercise server mint.
 bash e2e/object-store-smoke-test.sh
 OBJECT_STRICT_MOUNT=1 bash e2e/object-store-smoke-test.sh
+
+# Manual --auth=server mint against hosted tidbcloud-native + a real bucket.
+# Not wired into CI/local-e2e. Skips if required env is unset.
+# DRIVE9_E2E_OBJECT_BUCKET / ACCESS_KEY_ID / SECRET_ACCESS_KEY plus
+# DRIVE9_TIDBCLOUD_PUBLIC_KEY / PRIVATE_KEY. Optional: SCHEME, REGION,
+# ENDPOINT, STS_ENDPOINT, ACCOUNT_ID, PREFIX, ROLE_ARN.
+bash e2e/object-auth-smoke-test.sh
 
 # Optional extra object step inside cli-smoke-test.sh against a real bucket.
 DRIVE9_E2E_S3_URI='s3://bucket/prefix/?region=us-east-1' bash e2e/cli-smoke-test.sh

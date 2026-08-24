@@ -23,7 +23,7 @@ func Mv(c *client.Client, args []string) error {
 		return err
 	}
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs mv [--layer <ref>] <old> <new>")
+		return fmt.Errorf("usage: drive9 fs mv [--layer <ref>] [--auth=local|server] <old> <new>")
 	}
 	oldLoc, err := Parse(args[0])
 	if err != nil {

@@ -1599,9 +1599,9 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 // chmod (POST /v1/fs/<path>?chmod=1) is explicitly NOT and never will be in
 // the scoped allowlist — chmod escalates ACLs and is owner-token-only.
 //
-// SQL, fork, events, journals, vault are permanently out of scope for
-// workspace zones (they don't take a path argument, so the prefix model
-// doesn't apply); these stay default-deny here.
+// SQL, fork, events, journals, vault, and object-credentials are
+// permanently out of scope for workspace zones (they don't take a path
+// argument, so the prefix model doesn't apply); these stay default-deny here.
 //
 // The GET branch uses an **action-specific** accept-list (per @adversary-1
 // msg 00efe734 / @adversary-2 msg cbedd30a): the chosen action selector
@@ -1622,9 +1622,6 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 
 	// Batch FS endpoints (always POST). Handlers do per-path AuthorizeFS internally.
 	if path == "/v1/fs:batch-stat" || path == "/v1/fs:batch-read-small" || path == "/v1/fs:batch-write" {
-		return r.Method == http.MethodPost
-	}
-	if path == "/v1/object-credentials" {
 		return r.Method == http.MethodPost
 	}
 

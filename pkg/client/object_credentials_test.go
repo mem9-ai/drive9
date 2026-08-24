@@ -52,3 +52,23 @@ func TestMintObjectCredentialsRejectsEmptyKeys(t *testing.T) {
 		t.Fatal("expected empty credentials error")
 	}
 }
+
+func TestMintObjectCredentialsAcceptsAzureSASAndGCSToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"sas_url": "https://acct.blob.core.windows.net/c?sig=1", "scheme": "az"})
+	}))
+	defer srv.Close()
+	out, err := New(srv.URL, "k").MintObjectCredentials(context.Background(), "az://c/", false)
+	if err != nil || out.SASURL == "" {
+		t.Fatalf("out=%+v err=%v", out, err)
+	}
+
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "ya29.tok", "scheme": "gs"})
+	}))
+	defer srv2.Close()
+	out, err = New(srv2.URL, "k").MintObjectCredentials(context.Background(), "gs://b/", false)
+	if err != nil || out.AccessToken != "ya29.tok" {
+		t.Fatalf("gcs out=%+v err=%v", out, err)
+	}
+}

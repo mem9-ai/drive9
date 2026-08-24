@@ -42,6 +42,8 @@ type SessionCredentials struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	SessionToken    string
+	SASURL          string
+	AccessToken     string
 }
 
 // OpenFs creates an rclone Fs rooted at loc.Bucket/loc.Path (the mount prefix).
@@ -106,7 +108,12 @@ func connectionString(loc Location, sess SessionCredentials) (string, error) {
 }
 
 func gcsConnectionString(loc Location, sess SessionCredentials) (string, error) {
-	params := []string{"env_auth=true"}
+	var params []string
+	if sess.AccessToken != "" {
+		params = append(params, "env_auth=false", "access_token="+quote(sess.AccessToken))
+	} else {
+		params = append(params, "env_auth=true")
+	}
 	if ep := loc.Query[QueryEndpoint]; ep != "" {
 		params = append(params, "endpoint="+quote(ep))
 	}
@@ -114,7 +121,12 @@ func gcsConnectionString(loc Location, sess SessionCredentials) (string, error) 
 }
 
 func azureConnectionString(loc Location, sess SessionCredentials) (string, error) {
-	params := []string{"env_auth=true"}
+	var params []string
+	if sess.SASURL != "" {
+		params = append(params, "env_auth=false", "sas_url="+quote(sess.SASURL))
+	} else {
+		params = append(params, "env_auth=true")
+	}
 	if acct := loc.Query[QueryAccount]; acct != "" {
 		params = append(params, "account="+quote(acct))
 	}

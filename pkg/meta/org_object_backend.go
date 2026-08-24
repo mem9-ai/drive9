@@ -2,7 +2,9 @@ package meta
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -18,9 +20,12 @@ const (
 type OrgObjectBackend struct {
 	ID               string
 	OrganizationID   string
+	Name             string
 	Scheme           string
 	Endpoint         string
+	STSEndpoint      string
 	Region           string
+	AccountID        string
 	ForcePathStyle   bool
 	Bucket           string
 	Prefix           string
@@ -30,6 +35,7 @@ type OrgObjectBackend struct {
 	SecretCipher     []byte
 	ExternalIDCipher []byte
 	MaxSessionTTLSec int
+	IdentityHash     string
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 }
@@ -37,7 +43,7 @@ type OrgObjectBackend struct {
 func (s *Store) InsertOrgObjectBackend(ctx context.Context, b *OrgObjectBackend) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "insert_org_object_backend", start, &err)
-	if err := validateOrgObjectBackend(b); err != nil {
+	if err := prepareOrgObjectBackend(b); err != nil {
 		return err
 	}
 	now := time.Now().UTC()
@@ -47,17 +53,38 @@ func (s *Store) InsertOrgObjectBackend(ctx context.Context, b *OrgObjectBackend)
 	if b.UpdatedAt.IsZero() {
 		b.UpdatedAt = now
 	}
-	if b.MaxSessionTTLSec <= 0 {
-		b.MaxSessionTTLSec = 3600
-	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO org_object_backends
-		(id, organization_id, scheme, endpoint, region, force_path_style, bucket, prefix, credential_kind, role_arn, access_key_id, secret_cipher, external_id_cipher, max_session_ttl_sec, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		b.ID, b.OrganizationID, b.Scheme, b.Endpoint, b.Region, boolToTiny(b.ForcePathStyle), b.Bucket, b.Prefix, b.CredentialKind, b.RoleARN, b.AccessKeyID, nullableBytes(b.SecretCipher), nullableBytes(b.ExternalIDCipher), b.MaxSessionTTLSec, b.CreatedAt, b.UpdatedAt)
+		(id, organization_id, name, scheme, endpoint, sts_endpoint, region, account_id, force_path_style, bucket, prefix, credential_kind, role_arn, access_key_id, secret_cipher, external_id_cipher, max_session_ttl_sec, identity_hash, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		b.ID, b.OrganizationID, b.Name, b.Scheme, b.Endpoint, b.STSEndpoint, b.Region, b.AccountID, boolToTiny(b.ForcePathStyle), b.Bucket, b.Prefix, b.CredentialKind, b.RoleARN, b.AccessKeyID, nullableBytes(b.SecretCipher), nullableBytes(b.ExternalIDCipher), b.MaxSessionTTLSec, b.IdentityHash, b.CreatedAt, b.UpdatedAt)
 	if isDuplicateEntry(err) {
 		return ErrDuplicate
 	}
 	return err
+}
+
+func (s *Store) UpdateOrgObjectBackend(ctx context.Context, b *OrgObjectBackend) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_org_object_backend", start, &err)
+	if err := prepareOrgObjectBackend(b); err != nil {
+		return err
+	}
+	b.UpdatedAt = time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `UPDATE org_object_backends SET
+		name = ?, scheme = ?, endpoint = ?, sts_endpoint = ?, region = ?, account_id = ?, force_path_style = ?, bucket = ?, prefix = ?, credential_kind = ?, role_arn = ?, access_key_id = ?, secret_cipher = ?, external_id_cipher = ?, max_session_ttl_sec = ?, identity_hash = ?, updated_at = ?
+		WHERE id = ?`,
+		b.Name, b.Scheme, b.Endpoint, b.STSEndpoint, b.Region, b.AccountID, boolToTiny(b.ForcePathStyle), b.Bucket, b.Prefix, b.CredentialKind, b.RoleARN, b.AccessKeyID, nullableBytes(b.SecretCipher), nullableBytes(b.ExternalIDCipher), b.MaxSessionTTLSec, b.IdentityHash, b.UpdatedAt, b.ID)
+	if err != nil {
+		if isDuplicateEntry(err) {
+			return ErrDuplicate
+		}
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) GetOrgObjectBackend(ctx context.Context, id string) (*OrgObjectBackend, error) {
@@ -65,25 +92,31 @@ func (s *Store) GetOrgObjectBackend(ctx context.Context, id string) (*OrgObjectB
 }
 
 func (s *Store) GetOrgObjectBackendByBucket(ctx context.Context, organizationID, scheme, bucket string) (*OrgObjectBackend, error) {
-	return scanOrgObjectBackend(s.db.QueryRowContext(ctx, orgObjectBackendSelect+` WHERE organization_id = ? AND scheme = ? AND bucket = ?`,
-		strings.TrimSpace(organizationID), strings.TrimSpace(scheme), strings.TrimSpace(bucket)))
-}
-
-func (s *Store) ListOrgObjectBackends(ctx context.Context, organizationID string) ([]OrgObjectBackend, error) {
-	rows, err := s.db.QueryContext(ctx, orgObjectBackendSelect+` WHERE organization_id = ? ORDER BY scheme, bucket`, strings.TrimSpace(organizationID))
+	rows, err := s.ListOrgObjectBackendsByBucket(ctx, organizationID, scheme, bucket)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-	var out []OrgObjectBackend
-	for rows.Next() {
-		rec, err := scanOrgObjectBackendRow(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, rec)
+	if len(rows) == 0 {
+		return nil, ErrNotFound
 	}
-	return out, rows.Err()
+	return &rows[0], nil
+}
+
+func (s *Store) ListOrgObjectBackendsByBucket(ctx context.Context, organizationID, scheme, bucket string) ([]OrgObjectBackend, error) {
+	rows, err := s.db.QueryContext(ctx, orgObjectBackendSelect+` WHERE organization_id = ? AND scheme = ? AND bucket = ? ORDER BY CHAR_LENGTH(prefix) DESC, prefix, endpoint`,
+		strings.TrimSpace(organizationID), strings.ToLower(strings.TrimSpace(scheme)), strings.TrimSpace(bucket))
+	if err != nil {
+		return nil, err
+	}
+	return scanOrgObjectBackendRows(rows)
+}
+
+func (s *Store) ListOrgObjectBackends(ctx context.Context, organizationID string) ([]OrgObjectBackend, error) {
+	rows, err := s.db.QueryContext(ctx, orgObjectBackendSelect+` WHERE organization_id = ? ORDER BY scheme, bucket, prefix, name`, strings.TrimSpace(organizationID))
+	if err != nil {
+		return nil, err
+	}
+	return scanOrgObjectBackendRows(rows)
 }
 
 func (s *Store) DeleteOrgObjectBackend(ctx context.Context, id string) error {
@@ -115,7 +148,7 @@ func (s *Store) SetTenantObjectNamespaceID(ctx context.Context, tenantID, namesp
 	return nil
 }
 
-const orgObjectBackendSelect = `SELECT id, organization_id, scheme, endpoint, region, force_path_style, bucket, prefix, credential_kind, role_arn, access_key_id, secret_cipher, external_id_cipher, max_session_ttl_sec, created_at, updated_at FROM org_object_backends`
+const orgObjectBackendSelect = `SELECT id, organization_id, name, scheme, endpoint, sts_endpoint, region, account_id, force_path_style, bucket, prefix, credential_kind, role_arn, access_key_id, secret_cipher, external_id_cipher, max_session_ttl_sec, identity_hash, created_at, updated_at FROM org_object_backends`
 
 type orgObjectScanner interface {
 	Scan(dest ...any) error
@@ -132,11 +165,24 @@ func scanOrgObjectBackend(row orgObjectScanner) (*OrgObjectBackend, error) {
 	return &rec, nil
 }
 
+func scanOrgObjectBackendRows(rows *sql.Rows) ([]OrgObjectBackend, error) {
+	defer func() { _ = rows.Close() }()
+	var out []OrgObjectBackend
+	for rows.Next() {
+		rec, err := scanOrgObjectBackendRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
 func scanOrgObjectBackendRow(row orgObjectScanner) (OrgObjectBackend, error) {
 	var rec OrgObjectBackend
 	var force int
 	var secret, ext []byte
-	err := row.Scan(&rec.ID, &rec.OrganizationID, &rec.Scheme, &rec.Endpoint, &rec.Region, &force, &rec.Bucket, &rec.Prefix, &rec.CredentialKind, &rec.RoleARN, &rec.AccessKeyID, &secret, &ext, &rec.MaxSessionTTLSec, &rec.CreatedAt, &rec.UpdatedAt)
+	err := row.Scan(&rec.ID, &rec.OrganizationID, &rec.Name, &rec.Scheme, &rec.Endpoint, &rec.STSEndpoint, &rec.Region, &rec.AccountID, &force, &rec.Bucket, &rec.Prefix, &rec.CredentialKind, &rec.RoleARN, &rec.AccessKeyID, &secret, &ext, &rec.MaxSessionTTLSec, &rec.IdentityHash, &rec.CreatedAt, &rec.UpdatedAt)
 	if err != nil {
 		return OrgObjectBackend{}, err
 	}
@@ -157,6 +203,57 @@ func boolToTiny(v bool) int {
 	return 0
 }
 
+func prepareOrgObjectBackend(b *OrgObjectBackend) error {
+	if b == nil {
+		return fmt.Errorf("org object backend is required")
+	}
+	normalizeOrgObjectBackend(b)
+	if b.MaxSessionTTLSec <= 0 {
+		b.MaxSessionTTLSec = 3600
+	}
+	if b.MaxSessionTTLSec > 43200 {
+		b.MaxSessionTTLSec = 43200
+	}
+	b.IdentityHash = orgObjectBackendIdentityHash(b)
+	return validateOrgObjectBackend(b)
+}
+
+func normalizeOrgObjectBackend(b *OrgObjectBackend) {
+	b.ID = strings.TrimSpace(b.ID)
+	b.OrganizationID = strings.TrimSpace(b.OrganizationID)
+	b.Name = strings.TrimSpace(b.Name)
+	b.Scheme = strings.ToLower(strings.TrimSpace(b.Scheme))
+	switch b.Scheme {
+	case "gcs":
+		b.Scheme = "gs"
+	case "azure":
+		b.Scheme = "az"
+	}
+	b.Endpoint = strings.TrimRight(strings.TrimSpace(b.Endpoint), "/")
+	b.STSEndpoint = strings.TrimSpace(b.STSEndpoint)
+	b.Region = strings.TrimSpace(b.Region)
+	b.AccountID = strings.TrimSpace(b.AccountID)
+	b.Bucket = strings.TrimSpace(b.Bucket)
+	b.Prefix = strings.Trim(strings.TrimSpace(b.Prefix), "/")
+	b.CredentialKind = strings.TrimSpace(b.CredentialKind)
+	b.RoleARN = strings.TrimSpace(b.RoleARN)
+	b.AccessKeyID = strings.TrimSpace(b.AccessKeyID)
+}
+
+func orgObjectBackendIdentityHash(b *OrgObjectBackend) string {
+	if b == nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		strings.TrimSpace(b.OrganizationID),
+		strings.ToLower(strings.TrimSpace(b.Scheme)),
+		strings.TrimSpace(b.Bucket),
+		strings.Trim(strings.TrimSpace(b.Prefix), "/"),
+		strings.TrimRight(strings.TrimSpace(b.Endpoint), "/"),
+	}, "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
 func validateOrgObjectBackend(b *OrgObjectBackend) error {
 	if b == nil {
 		return fmt.Errorf("org object backend is required")
@@ -175,7 +272,7 @@ func validateOrgObjectBackend(b *OrgObjectBackend) error {
 	}
 	switch b.CredentialKind {
 	case ObjectCredentialStatic:
-		if strings.TrimSpace(b.AccessKeyID) == "" {
+		if b.Scheme != "gs" && strings.TrimSpace(b.AccessKeyID) == "" && strings.TrimSpace(b.AccountID) == "" {
 			return fmt.Errorf("access_key_id is required for static credentials")
 		}
 	case ObjectCredentialRole:

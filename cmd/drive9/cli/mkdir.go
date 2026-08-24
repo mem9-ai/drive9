@@ -23,7 +23,7 @@ func Mkdir(c *client.Client, args []string) error {
 		return err
 	}
 	if len(args) != 1 {
-		return fmt.Errorf("usage: drive9 fs mkdir [--layer <ref>] <path>")
+		return fmt.Errorf("usage: drive9 fs mkdir [--layer <ref>] [--auth=local|server] <path>")
 	}
 	path := args[0]
 	h, err := fsHandleForArg(c, path)
