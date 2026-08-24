@@ -65,6 +65,35 @@ func TestAdminTenantHelpIncludesCommandsFlagsAndExamples(t *testing.T) {
 	}
 }
 
+func TestAdminQuotaHelpDocumentsLLMZeroAndOmissionSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "tenant", args: []string{"tenant", "--help"}},
+		{name: "set_quota", args: []string{"tenant", "set-quota", "--help"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, err := captureStdoutE(t, func() error {
+				return Admin(tc.args)
+			})
+			if err != nil {
+				t.Fatalf("Admin(%q): %v", tc.args, err)
+			}
+			for _, want := range []string{
+				"--max-media-llm-files",
+				"media LLM extract files; non-negative; 0 means unlimited; omit to keep current; requires media extract config",
+				"--max-video-llm-files",
+				"video LLM extract files; non-negative; 0 means unlimited; omit to keep current; requires video extract config",
+			} {
+				if !strings.Contains(stdout, want) {
+					t.Fatalf("stdout missing %q:\n%s", want, stdout)
+				}
+			}
+		})
+	}
+}
+
 func TestAdminQuotaLLMLimitZeroPrintsUnlimited(t *testing.T) {
 	quota := &client.AdminTenantQuota{}
 	if got := adminQuotaMaxMediaLLMFiles(quota); got != "unlimited" {

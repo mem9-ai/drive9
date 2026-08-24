@@ -1,6 +1,6 @@
 # drive9 quota guide
 
-Last verified: 2026-08-22.
+Last verified: 2026-08-25.
 
 This guide shows how to read and update Drive9 tenant quota from the CLI and
 HTTP API in TiDBCloud Mode.
@@ -14,8 +14,8 @@ Drive9 exposes these user-settable quota settings:
 | `max_storage_size` | Maximum confirmed plus reserved file storage size, in Mi. Stored in Drive9. |
 | `max_file_size` | Maximum single file size, in Mi. Stored in Drive9. Must not exceed the server `DRIVE9_MAX_UPLOAD_BYTES` limit. |
 | `max_file_count` | Maximum file count. Stored in Drive9. `0` means unlimited. |
-| `max_media_llm_files` | Maximum number of media (image/audio) LLM extraction files admitted for the tenant. Stored in Drive9. Updating it requires the tenant-specific media extract config to be enabled. |
-| `max_video_llm_files` | Maximum number of video LLM extraction tasks admitted for the tenant. Stored in Drive9. Updating it requires the tenant-specific video extract config to be enabled. |
+| `max_media_llm_files` | Maximum number of media (image/audio) LLM extraction files admitted for the tenant. Stored in Drive9. `0` means unlimited. Omitting the field leaves the current value unchanged. Updating it requires the tenant-specific media extract config to be enabled. |
+| `max_video_llm_files` | Maximum number of video LLM extraction tasks admitted for the tenant. Stored in Drive9. `0` means unlimited. Omitting the field leaves the current value unchanged. Updating it requires the tenant-specific video extract config to be enabled. |
 | `tidbcloud_spending_limit` | TiDB Cloud Cluster Spending Limit for dedicated native tenants. Shared tenants omit this response field and ignore it when supplied. `0` remains a valid explicit input for dedicated compatibility. See the [TiDB Cloud Spending Limit guide](https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit). |
 
 Quota responses include these storage usage counters:
@@ -91,7 +91,10 @@ Set quota with `drive9 admin tenant set-quota`. Pass at least one of
 `--max-media-llm-files`, `--max-video-llm-files`, or
 `--tidbcloud-spending-limit`. The two LLM quota fields can be modified only
 after the corresponding tenant-specific extract config is enabled; the CLI
-passes the values through and the server enforces that prerequisite.
+passes the values through and the server enforces that prerequisite. For either
+LLM quota, `0` means unlimited and omitting its flag leaves the current value
+unchanged. The extract config, rather than a nonzero quota, enables or disables
+extraction.
 
 ```bash
 drive9 admin tenant set-quota \
@@ -116,8 +119,10 @@ Validation rules:
 - `--max-file-size` must be positive and no larger than the server
   `DRIVE9_MAX_UPLOAD_BYTES` limit.
 - `--max-file-count` must be non-negative. `0` means unlimited.
-- `--max-media-llm-files` and `--max-video-llm-files` must be non-negative and
-  require the corresponding tenant-specific extract config on the server.
+- `--max-media-llm-files` and `--max-video-llm-files` must be non-negative.
+  `0` means unlimited, and omitting a flag leaves its current value unchanged.
+  Updating either limit requires the corresponding tenant-specific extract
+  config on the server; the extract config enables or disables extraction.
 - `--tidbcloud-spending-limit` must be a non-negative 32-bit integer. Drive9
   passes it through for dedicated tenants. Shared tenants accept and ignore
   this field.
@@ -202,9 +207,11 @@ required. `max_storage_size` and `max_file_size` are in Mi;
 `max_file_size` must not exceed the server `DRIVE9_MAX_UPLOAD_BYTES` limit.
 `max_file_count`, `max_media_llm_files`, and `max_video_llm_files` must be
 non-negative, and `0` means unlimited for the corresponding limit. LLM quota
-updates require the matching tenant-specific extract config. Shared tenants
-accept and ignore `tidbcloud_spending_limit`, including `0`; dedicated tenants
-retain the existing TiDB Cloud spending-limit behavior.
+updates require the matching tenant-specific extract config. Omitting a field
+leaves its current value unchanged. The extract config, rather than a nonzero
+quota, enables or disables extraction. Shared tenants accept and ignore
+`tidbcloud_spending_limit`, including `0`; dedicated tenants retain the existing
+TiDB Cloud spending-limit behavior.
 
 ## Error responses
 

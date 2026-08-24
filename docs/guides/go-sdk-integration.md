@@ -113,10 +113,13 @@ _ = quota.Usage.VideoFileCount
 Set quota for a `tidb_cloud_native` or `tidb_cloud_native_shared` tenant with
 TiDB Cloud credentials. `MaxStorageSize` and `MaxFileSize` are in Mi.
 `MaxFileSize` must be no larger than the server `DRIVE9_MAX_UPLOAD_BYTES` limit.
-`MaxFileCount` uses `0` for unlimited. `MaxMediaLLMFiles` and
-`MaxVideoLLMFiles` require the corresponding tenant-specific extract config to
-be enabled before they can be changed. Shared tenants accept and ignore
-`TiDBCloudSpendingLimit`; dedicated tenants retain the TiDB Cloud behavior.
+`MaxFileCount`, `MaxMediaLLMFiles`, and `MaxVideoLLMFiles` use `0` for
+unlimited. A nil pointer omits that request field and leaves the current value
+unchanged. `MaxMediaLLMFiles` and `MaxVideoLLMFiles` require the corresponding
+tenant-specific extract config to be enabled before they can be changed. The
+extract config, rather than a nonzero quota, enables or disables extraction.
+Shared tenants accept and ignore `TiDBCloudSpendingLimit`; dedicated tenants
+retain the TiDB Cloud behavior.
 
 ```go
 storageSize := int64(102400)

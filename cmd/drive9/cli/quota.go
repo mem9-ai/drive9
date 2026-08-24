@@ -318,8 +318,8 @@ flags:
   --max-storage-size Mi           max confirmed+reserved storage size in Mi
   --max-file-size Mi              max single file size in Mi; must not exceed server DRIVE9_MAX_UPLOAD_BYTES
   --max-file-count N              max confirmed file count; 0 means unlimited
-  --max-media-llm-files N         max media LLM extract files; must be non-negative
-  --max-video-llm-files N         max video LLM extract files; must be non-negative
+  --max-media-llm-files N         max media LLM extract files; non-negative; 0 means unlimited; omit to keep current; requires media extract config
+  --max-video-llm-files N         max video LLM extract files; non-negative; 0 means unlimited; omit to keep current; requires video extract config
   --tidbcloud-spending-limit N    TiDB Cloud Cluster Spending Limit; must be non-negative; see https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit
   --json                          output result as JSON`
 }
