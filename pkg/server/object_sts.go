@@ -634,7 +634,7 @@ func validateAdminObjectBackend(rec *meta.OrgObjectBackend) error {
 		return fmt.Errorf("scheme must be s3, cos, tos, oss, gs, or az")
 	}
 	if strings.Contains(rec.Prefix, "..") {
-		return fmt.Errorf("prefix must not contain ..")
+		return fmt.Errorf("prefix must not contain parent-directory segments")
 	}
 	if err := validateSTSEndpoint(rec.STSEndpoint); err != nil {
 		return err
