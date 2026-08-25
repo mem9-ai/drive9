@@ -21,14 +21,6 @@ jobs:
       build_time: ${{ steps.metadata.outputs.build_time }}
       trace_tag: ${{ steps.metadata.outputs.trace_tag }}
     steps:
-      - name: Require the main branch
-        shell: bash
-        run: |
-          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
-            echo "Migration images may only be published from main" >&2
-            exit 1
-          fi
-
       - name: Resolve image metadata
         id: metadata
         shell: bash
@@ -200,6 +192,7 @@ jobs:
         run: |
           {
             printf '### Published Drive9 Migration image\n\n'
+            printf -- "- Source ref: \`%s\`\n" "$GITHUB_REF_NAME"
             printf -- "- Source commit: \`%s\`\n" "$GITHUB_SHA"
             printf -- "- Tag: \`%s:%s\`\n" "$IMAGE" "$TRACE_TAG"
             printf -- "- Digest: \`%s\`\n" "$DIGEST"
