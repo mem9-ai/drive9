@@ -194,13 +194,15 @@ drive9 umount ./mnt
   rclone Close is a synchronous PUT). The handle is then reopened so later
   writes still work after the kernel FLUSHes following create. A failed
   object PUT is returned from that flush/fsync/close. Reads honor the
-  kernel interrupt channel immediately (`EINTR`). Mutating ops (write,
-  flush, create, setattr, mkdir, unlink, rename) wait until the rclone
-  call finishes before returning, so a syscall never fails while a delayed
-  PUT/delete/rename still commits. rclone still cannot abort in-flight
-  HTTP; a hung provider can stall a mutating syscall until the provider
-  or the 5-minute op deadline unblocks. `--allow-other` enables kernel
-  `default_permissions`.
+  kernel interrupt channel immediately (`EINTR`) and the 5-minute
+  deadline (`ETIMEDOUT`); the read callback may keep running. Mutating
+  ops (write, flush, create, setattr, mkdir, unlink, rename) wait until
+  the rclone call finishes before returning, so a syscall never fails
+  while a delayed PUT/delete/rename still commits. rclone cannot abort
+  in-flight HTTP. The 5-minute op context is only a cancel hint: if the
+  provider/VFS ignores it, a mutating syscall stays blocked until that
+  call returns. That is the product contract (correctness over a hard
+  FUSE return bound). `--allow-other` enables kernel `default_permissions`.
 - Umount waits briefly for in-flight uploads and does **not** wipe a dirty
   cache, so a remount of the same URI can resume.
 - `mount drain` is drive9-only; object mounts reject it.

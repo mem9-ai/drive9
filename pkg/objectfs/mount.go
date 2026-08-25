@@ -216,7 +216,10 @@ func writeObjectMountState(mountPoint, remote string, supervised bool) (string, 
 	})
 }
 
-const fuseOpTimeout = 5 * time.Minute
+// fuseOpTimeout bounds non-mutating FUSE replies and is passed to mutating
+// callbacks as a cancel hint. Mutating syscalls still wait for the rclone
+// call; rclone VFS does not abort in-flight HTTP when this fires.
+var fuseOpTimeout = 5 * time.Minute
 
 type fuseHandle struct {
 	mu    sync.Mutex
@@ -832,7 +835,9 @@ func (fs *rcloneFUSE) withOp(cancel <-chan struct{}, fn func(context.Context) er
 
 // withMutatingOp runs a mutating FUSE request and does not return until fn
 // finishes. Cancel/timeout still cancel ctx, but a successful mutation is
-// reported as OK so the caller never sees failure followed by a delayed commit.
+// reported as OK so the caller never sees failure followed by a delayed
+// commit. If fn ignores ctx, the FUSE syscall stays blocked until fn
+// returns; fuseOpTimeout is not a hard return bound.
 func (fs *rcloneFUSE) withMutatingOp(cancel <-chan struct{}, fn func(context.Context) error) gofuse.Status {
 	return fs.runOp(cancel, fn, true)
 }

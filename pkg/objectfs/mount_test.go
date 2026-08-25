@@ -242,6 +242,48 @@ func TestRcloneFUSEMutatingOpWaitsAndReportsSuccess(t *testing.T) {
 	}
 }
 
+func TestRcloneFUSEMutatingOpDeadlineDoesNotUnblockIgnoredCtx(t *testing.T) {
+	ofs, _ := testWriteVFS(t)
+	old := fuseOpTimeout
+	fuseOpTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { fuseOpTimeout = old })
+
+	started := make(chan struct{})
+	block := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- ofs.withMutatingOp(nil, func(ctx context.Context) error {
+			close(started)
+			select {
+			case <-block:
+				return nil
+			case <-ctx.Done():
+				<-block
+				return nil
+			}
+		})
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fn did not start")
+	}
+	select {
+	case <-done:
+		t.Fatal("mutating op must stay blocked after fuseOpTimeout when fn ignores ctx")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(block)
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("status=%v want OK after fn returns", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mutating op did not return after fn finished")
+	}
+}
+
 func TestRcloneFUSESetAttrSize(t *testing.T) {
 	ofs, dir := testWriteVFS(t)
 	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("hello"), 0o644); err != nil {
