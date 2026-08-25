@@ -10,8 +10,9 @@ import (
 
 func renderedJob(namespace, batch, pod, volumeID string) jobResult {
 	status := &workerStatus{
-		VolumeID: volumeID, NodeName: "node-a", SpaceRef: "space-a", Prefix: "/data",
-		Phase: "SYNCING", StartupPhase: "SYNCING", SourceCount: 42,
+		JobID: "job-" + volumeID, VolumeID: volumeID, NodeName: "node-a", SpaceRef: "space-a", Prefix: "/data",
+		RuntimeState: "RUNNING",
+		Phase:        "SYNCING", StartupPhase: "SYNCING", SourceCount: 42,
 		Conditions: workerConditions{ReadyForRollout: true},
 		CandidateCounts: workerCandidates{
 			Mtime: 3, SourceTokenChanged: 5, NewPath: 7, Filtered: 11,
@@ -24,7 +25,7 @@ func renderedJob(namespace, batch, pod, volumeID string) jobResult {
 	}
 	return jobResult{
 		Namespace: namespace, Batch: batch, Pod: pod, Node: "node-a", PodPhase: "Running",
-		JobID: volumeID, Phase: "SYNCING", DisplayStatus: "READY_FOR_ROLLOUT",
+		JobID: status.JobID, VolumeID: volumeID, Phase: "SYNCING", DisplayStatus: "READY_FOR_ROLLOUT",
 		Worker: json.RawMessage(`{"volume_id":"` + volumeID + `","future_field":true}`),
 		parsed: status,
 	}

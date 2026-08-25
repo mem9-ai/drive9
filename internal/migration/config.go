@@ -1,4 +1,4 @@
-// Package migration implements the single-Job Drive9 Migration V1 worker.
+// Package migration implements Drive9 Migration V1 EBS subpath workers.
 package migration
 
 import (
@@ -16,11 +16,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	ConfigVersion               = "v3"
+	ConfigVersion               = "v4"
 	DefaultGracePeriod          = time.Minute
 	DefaultCredentialRoot       = "/var/run/secrets/drive9-migration"
 	MigrationNodeNameEnv        = "DRIVE9_MIGRATION_NODE_NAME"
@@ -33,6 +34,7 @@ const (
 var (
 	volumeIDPattern      = regexp.MustCompile(`^vol-[0-9a-f]+$`)
 	credentialRefPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	jobIDPattern         = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	// ErrInvalidPhase classifies illegal, ambiguous, or regressive startup phases.
 	ErrInvalidPhase = errors.New("invalid migration phase")
 	// ErrIllegalAction classifies a phase-incompatible control operation.
@@ -88,24 +90,43 @@ type TargetConfig struct {
 	Prefix   string `yaml:"prefix" json:"prefix"`
 }
 
-// Job is one stable EBS volume to Drive9 Space/Prefix mapping.
-type Job struct {
-	VolumeID string       `yaml:"volume_id" json:"volume_id"`
-	NodeName string       `yaml:"node_name" json:"node_name"`
-	Source   SourceConfig `yaml:"source" json:"source"`
-	Target   TargetConfig `yaml:"target" json:"target"`
+// JobConfig is one configured EBS subpath to Drive9 target mapping.
+type JobConfig struct {
+	JobID   string       `yaml:"job_id" json:"job_id"`
+	Subpath string       `yaml:"subpath" json:"subpath"`
+	Target  TargetConfig `yaml:"target" json:"target"`
 }
 
-// Config is the strict version-v3 static startup configuration.
+// EBSSourceConfig groups all independent Jobs beneath one mounted EBS root.
+type EBSSourceConfig struct {
+	VolumeID string      `yaml:"volume_id" json:"volume_id"`
+	NodeName string      `yaml:"node_name" json:"node_name"`
+	Root     string      `yaml:"root" json:"root"`
+	Jobs     []JobConfig `yaml:"jobs" json:"jobs"`
+}
+
+// Job is one resolved EBS subpath to Drive9 Space/Prefix mapping.
+type Job struct {
+	JobID    string       `json:"job_id"`
+	VolumeID string       `json:"volume_id"`
+	NodeName string       `json:"node_name"`
+	EBSRoot  string       `json:"ebs_root"`
+	Subpath  string       `json:"subpath"`
+	Source   SourceConfig `json:"source"`
+	Target   TargetConfig `json:"target"`
+}
+
+// Config is the strict version-v4 static startup configuration.
 type Config struct {
 	Version     string                 `yaml:"version" json:"version"`
 	Drive9      Drive9Config           `yaml:"drive9" json:"drive9"`
 	JobDefaults JobDefaults            `yaml:"job_defaults" json:"job_defaults"`
 	Spaces      map[string]SpaceConfig `yaml:"spaces" json:"spaces"`
-	Jobs        []Job                  `yaml:"jobs" json:"jobs"`
+	EBSSources  []EBSSourceConfig      `yaml:"ebs_sources" json:"ebs_sources"`
+	Jobs        []Job                  `yaml:"-" json:"-"`
 }
 
-// LoadConfig decodes exactly one bounded YAML document and validates V3 fields.
+// LoadConfig decodes exactly one bounded YAML document and validates V4 fields.
 func LoadConfig(configPath string) (*Config, error) {
 	file, err := os.Open(configPath)
 	if err != nil {
@@ -159,8 +180,8 @@ func (c *Config) validate() error {
 	if performance.MaxBytesPerSecond <= 0 || performance.SmallFileWorkers <= 0 || performance.LargeFileWorkers <= 0 {
 		return fmt.Errorf("job performance limits and worker counts must be positive")
 	}
-	if len(c.Spaces) == 0 || len(c.Jobs) == 0 {
-		return fmt.Errorf("config must declare at least one Space and Job")
+	if len(c.Spaces) == 0 || len(c.EBSSources) == 0 {
+		return fmt.Errorf("config must declare at least one Space and EBS source")
 	}
 	for name, space := range c.Spaces {
 		if name == "" {
@@ -170,51 +191,124 @@ func (c *Config) validate() error {
 			return fmt.Errorf("space %q: %w", name, err)
 		}
 	}
-	seenVolumes := make(map[string]struct{}, len(c.Jobs))
-	for i := range c.Jobs {
-		job := &c.Jobs[i]
-		if !volumeIDPattern.MatchString(job.VolumeID) {
-			return fmt.Errorf("job %d has invalid volume_id", i)
+	seenVolumes := make(map[string]struct{}, len(c.EBSSources))
+	seenNodes := make(map[string]struct{}, len(c.EBSSources))
+	seenJobs := make(map[string]struct{})
+	resolved := make([]Job, 0)
+	for sourceIndex := range c.EBSSources {
+		source := &c.EBSSources[sourceIndex]
+		if !volumeIDPattern.MatchString(source.VolumeID) {
+			return fmt.Errorf("EBS source %d has invalid volume_id", sourceIndex)
 		}
-		if _, exists := seenVolumes[job.VolumeID]; exists {
-			return fmt.Errorf("duplicate volume_id %q", job.VolumeID)
+		if _, exists := seenVolumes[source.VolumeID]; exists {
+			return fmt.Errorf("duplicate volume_id %q", source.VolumeID)
 		}
-		seenVolumes[job.VolumeID] = struct{}{}
-		if job.NodeName == "" {
-			return fmt.Errorf("job %q has empty node_name", job.VolumeID)
+		seenVolumes[source.VolumeID] = struct{}{}
+		if source.NodeName == "" {
+			return fmt.Errorf("EBS source %q has empty node_name", source.VolumeID)
 		}
-		if job.Source.Type != "ebs" || !filepath.IsAbs(job.Source.Root) || filepath.Clean(job.Source.Root) != job.Source.Root {
-			return fmt.Errorf("job %q requires a clean absolute EBS source root", job.VolumeID)
+		if _, exists := seenNodes[source.NodeName]; exists {
+			return fmt.Errorf("duplicate node_name %q", source.NodeName)
 		}
-		if _, ok := c.Spaces[job.Target.SpaceRef]; !ok {
-			return fmt.Errorf("job %q references unknown Space %q", job.VolumeID, job.Target.SpaceRef)
+		seenNodes[source.NodeName] = struct{}{}
+		if !filepath.IsAbs(source.Root) || filepath.Clean(source.Root) != source.Root {
+			return fmt.Errorf("EBS source %q requires a clean absolute root", source.VolumeID)
 		}
-		if !strings.HasPrefix(job.Target.Prefix, "/") || path.Clean(job.Target.Prefix) != job.Target.Prefix {
-			return fmt.Errorf("job %q requires a clean absolute target prefix", job.VolumeID)
+		if len(source.Jobs) == 0 {
+			return fmt.Errorf("EBS source %q must declare at least one Job", source.VolumeID)
 		}
+		for jobIndex := range source.Jobs {
+			configured := &source.Jobs[jobIndex]
+			if err := validateJobID(configured.JobID); err != nil {
+				return fmt.Errorf("EBS source %q Job %d: %w", source.VolumeID, jobIndex, err)
+			}
+			if _, exists := seenJobs[configured.JobID]; exists {
+				return fmt.Errorf("duplicate job_id %q", configured.JobID)
+			}
+			seenJobs[configured.JobID] = struct{}{}
+			if err := validateSourceSubpath(configured.Subpath); err != nil {
+				return fmt.Errorf("job %q: %w", configured.JobID, err)
+			}
+			if _, ok := c.Spaces[configured.Target.SpaceRef]; !ok {
+				return fmt.Errorf("job %q references unknown Space %q", configured.JobID, configured.Target.SpaceRef)
+			}
+			if !strings.HasPrefix(configured.Target.Prefix, "/") || path.Clean(configured.Target.Prefix) != configured.Target.Prefix {
+				return fmt.Errorf("job %q requires a clean absolute target prefix", configured.JobID)
+			}
+			for prior := range jobIndex {
+				if prefixesOverlap(source.Jobs[prior].Subpath, configured.Subpath) {
+					return fmt.Errorf("EBS source %q has overlapping source subpaths %q and %q", source.VolumeID, source.Jobs[prior].Subpath, configured.Subpath)
+				}
+			}
+			resolved = append(resolved, resolveJob(*source, *configured))
+		}
+	}
+	c.Jobs = resolved
+	return nil
+}
+
+func validateJobID(jobID string) error {
+	if !jobIDPattern.MatchString(jobID) || jobID == "." || jobID == ".." {
+		return fmt.Errorf("invalid job_id")
 	}
 	return nil
 }
 
-// SelectJob resolves exactly one Job assigned to nodeName.
-func (c *Config) SelectJob(nodeName string) (Job, error) {
-	if nodeName == "" {
-		return Job{}, fmt.Errorf("%s is required", MigrationNodeNameEnv)
+func validateSourceSubpath(subpath string) error {
+	canonical, err := pathutil.Canonicalize(subpath)
+	if err != nil || canonical != subpath {
+		return fmt.Errorf("requires an absolute clean UTF-8 NFC subpath")
 	}
-	var selected *Job
-	for i := range c.Jobs {
-		if c.Jobs[i].NodeName != nodeName {
+	return nil
+}
+
+func effectiveSourceRoot(root, subpath string) string {
+	if subpath == "/" {
+		return root
+	}
+	return filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(subpath, "/")))
+}
+
+func resolveJob(source EBSSourceConfig, configured JobConfig) Job {
+	return Job{
+		JobID: configured.JobID, VolumeID: source.VolumeID, NodeName: source.NodeName,
+		EBSRoot: source.Root, Subpath: configured.Subpath,
+		Source: SourceConfig{Type: "ebs", Root: effectiveSourceRoot(source.Root, configured.Subpath)},
+		Target: configured.Target,
+	}
+}
+
+// SelectSource resolves exactly one EBS Source assigned to nodeName.
+func (c *Config) SelectSource(nodeName string) (EBSSourceConfig, error) {
+	if nodeName == "" {
+		return EBSSourceConfig{}, fmt.Errorf("%s is required", MigrationNodeNameEnv)
+	}
+	var selected *EBSSourceConfig
+	for i := range c.EBSSources {
+		if c.EBSSources[i].NodeName != nodeName {
 			continue
 		}
 		if selected != nil {
-			return Job{}, fmt.Errorf("node %q resolves more than one Job", nodeName)
+			return EBSSourceConfig{}, fmt.Errorf("node %q resolves more than one EBS source", nodeName)
 		}
-		selected = &c.Jobs[i]
+		selected = &c.EBSSources[i]
 	}
 	if selected == nil {
-		return Job{}, fmt.Errorf("node %q resolves no Job", nodeName)
+		return EBSSourceConfig{}, fmt.Errorf("node %q resolves no EBS source", nodeName)
 	}
 	return *selected, nil
+}
+
+// SelectJob retains the single-Job helper for Job-local tests and callers.
+func (c *Config) SelectJob(nodeName string) (Job, error) {
+	source, err := c.SelectSource(nodeName)
+	if err != nil {
+		return Job{}, err
+	}
+	if len(source.Jobs) != 1 {
+		return Job{}, fmt.Errorf("node %q resolves %d Jobs", nodeName, len(source.Jobs))
+	}
+	return resolveJob(source, source.Jobs[0]), nil
 }
 
 // Phase is the non-regressible per-Job migration phase.
@@ -316,6 +410,14 @@ type Startup struct {
 	mountProbe     sourceMountProbe
 }
 
+// RuntimeStartup is the secret-free startup snapshot for one EBS process.
+type RuntimeStartup struct {
+	Config *Config         `json:"config"`
+	Source EBSSourceConfig `json:"source"`
+	Phase  Phase           `json:"phase"`
+	Jobs   []*Startup      `json:"jobs"`
+}
+
 // ConfigHash hashes only one Job's normalized immutable configuration.
 func ConfigHash(cfg *Config, job Job) (string, error) {
 	space, ok := cfg.Spaces[job.Target.SpaceRef]
@@ -323,7 +425,10 @@ func ConfigHash(cfg *Config, job Job) (string, error) {
 		return "", fmt.Errorf("config hash references unknown Space %q", job.Target.SpaceRef)
 	}
 	type stableJob struct {
+		JobID    string       `json:"job_id"`
 		VolumeID string       `json:"volume_id"`
+		EBSRoot  string       `json:"ebs_root"`
+		Subpath  string       `json:"subpath"`
 		Source   SourceConfig `json:"source"`
 		Target   TargetConfig `json:"target"`
 	}
@@ -335,7 +440,10 @@ func ConfigHash(cfg *Config, job Job) (string, error) {
 		Space       SpaceConfig  `json:"space"`
 	}{
 		Version: cfg.Version, Drive9: cfg.Drive9, JobDefaults: cfg.JobDefaults,
-		Job:   stableJob{VolumeID: job.VolumeID, Source: job.Source, Target: job.Target},
+		Job: stableJob{
+			JobID: job.JobID, VolumeID: job.VolumeID, EBSRoot: job.EBSRoot,
+			Subpath: job.Subpath, Source: job.Source, Target: job.Target,
+		},
 		Space: space,
 	})
 	if err != nil {
@@ -345,13 +453,13 @@ func ConfigHash(cfg *Config, job Job) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// LoadStartup resolves and validates one local Job without retaining its key.
-func LoadStartup(configPath, nodeName, environmentPhase, credentialRoot string, highestApplied Phase) (*Startup, error) {
+// LoadRuntimeStartup resolves all Jobs for one local EBS without retaining keys.
+func LoadRuntimeStartup(configPath, nodeName, environmentPhase, credentialRoot string, highestApplied Phase) (*RuntimeStartup, error) {
 	cfg, err := LoadConfig(configPath)
 	if err != nil {
 		return nil, err
 	}
-	job, err := cfg.SelectJob(nodeName)
+	source, err := cfg.SelectSource(nodeName)
 	if err != nil {
 		return nil, err
 	}
@@ -359,17 +467,38 @@ func LoadStartup(configPath, nodeName, environmentPhase, credentialRoot string, 
 	if err != nil {
 		return nil, err
 	}
-	space := cfg.Spaces[job.Target.SpaceRef]
-	credential, err := NewCredentialSource(credentialRoot, space.CredentialRef)
-	if err != nil {
-		return nil, fmt.Errorf("resolve credential: %w", err)
+	runtime := &RuntimeStartup{Config: cfg, Source: source, Phase: phase, Jobs: make([]*Startup, 0, len(source.Jobs))}
+	for _, configured := range source.Jobs {
+		job := resolveJob(source, configured)
+		space := cfg.Spaces[job.Target.SpaceRef]
+		credential, err := NewCredentialSource(credentialRoot, space.CredentialRef)
+		if err != nil {
+			return nil, fmt.Errorf("resolve credential for Job %q: %w", job.JobID, err)
+		}
+		hash, err := ConfigHash(cfg, job)
+		if err != nil {
+			return nil, err
+		}
+		runtime.Jobs = append(runtime.Jobs, &Startup{
+			Config: cfg, Job: job, Space: space, Phase: phase,
+			ConfigHash: hash, Credential: credential,
+		})
 	}
-	if _, err := credential.Read(); err != nil {
+	return runtime, nil
+}
+
+// LoadStartup resolves one local Job for Job-local tests and callers.
+func LoadStartup(configPath, nodeName, environmentPhase, credentialRoot string, highestApplied Phase) (*Startup, error) {
+	runtime, err := LoadRuntimeStartup(configPath, nodeName, environmentPhase, credentialRoot, highestApplied)
+	if err != nil {
 		return nil, err
 	}
-	hash, err := ConfigHash(cfg, job)
-	if err != nil {
+	if len(runtime.Jobs) != 1 {
+		return nil, fmt.Errorf("node %q resolves %d Jobs", nodeName, len(runtime.Jobs))
+	}
+	startup := runtime.Jobs[0]
+	if _, err := startup.Credential.Read(); err != nil {
 		return nil, err
 	}
-	return &Startup{Config: cfg, Job: job, Space: space, Phase: phase, ConfigHash: hash, Credential: credential}, nil
+	return startup, nil
 }

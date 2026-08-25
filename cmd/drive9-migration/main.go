@@ -27,9 +27,9 @@ type dependencies struct {
 	ctx            context.Context
 	getenv         func(string) string
 	credentialRoot string
-	load           func(string, string, string, string, migration.Phase) (*migration.Startup, error)
-	preflight      func(context.Context, *migration.Startup) (migration.PreflightResult, error)
-	start          func(context.Context, *migration.Startup) error
+	load           func(string, string, string, string, migration.Phase) (*migration.RuntimeStartup, error)
+	plan           func(context.Context, *migration.RuntimeStartup) (migration.PlanResult, error)
+	start          func(context.Context, *migration.RuntimeStartup) error
 	control        func(context.Context, controlRequest) error
 }
 
@@ -40,9 +40,9 @@ func main() {
 		ctx:            ctx,
 		getenv:         os.Getenv,
 		credentialRoot: migration.DefaultCredentialRoot,
-		load:           migration.LoadStartup,
-		preflight:      migration.Preflight,
-		start:          migration.RunWorker,
+		load:           migration.LoadRuntimeStartup,
+		plan:           migration.Plan,
+		start:          migration.RunManager,
 		control: func(ctx context.Context, request controlRequest) error {
 			return migration.Control(ctx, migration.DefaultControlSocket, request, os.Stdout)
 		},
@@ -79,10 +79,10 @@ func execute(args []string, stdout, stderr io.Writer, deps dependencies) int {
 			err = deps.control(ctx, request)
 		}
 	case "verify-full", "prepare-drive9-cutover":
-		if len(args) != 1 {
-			err = fmt.Errorf("%s accepts no arguments", args[0])
-		} else {
-			err = deps.control(ctx, controlRequest{Command: args[0]})
+		var request controlRequest
+		request, err = parseJobMutation(args[0], args[1:], stderr)
+		if err == nil {
+			err = deps.control(ctx, request)
 		}
 	default:
 		err = fmt.Errorf("unknown command %q", args[0])
@@ -124,50 +124,65 @@ func executeStartupCommand(ctx context.Context, command string, args []string, s
 	if err != nil {
 		return err
 	}
-	result, err := deps.preflight(ctx, startup)
-	if err != nil {
-		return err
-	}
 	if command == "run" {
 		return deps.start(ctx, startup)
 	}
-	return json.NewEncoder(stdout).Encode(result)
+	result, planErr := deps.plan(ctx, startup)
+	if err := json.NewEncoder(stdout).Encode(result); err != nil {
+		return err
+	}
+	return planErr
 }
 
 func parseStatus(args []string, stderr io.Writer) (controlRequest, error) {
 	flags := flag.NewFlagSet("status", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	output := flags.String("output", "", "output format")
+	jobID := flags.String("job-id", "", "Job ID filter")
 	if err := flags.Parse(args); err != nil {
 		return controlRequest{}, err
 	}
 	if flags.NArg() != 0 || *output != "json" {
 		return controlRequest{}, errors.New("status requires --output json")
 	}
-	return controlRequest{Command: "status", Output: *output}, nil
+	return controlRequest{Command: "status", JobID: *jobID, Output: *output}, nil
 }
 
 func parseDiff(args []string, stderr io.Writer) (controlRequest, error) {
 	flags := flag.NewFlagSet("diff", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	output := flags.String("output", "", "output format")
+	jobID := flags.String("job-id", "", "Job ID")
 	typeFilter := flags.String("type", "", "finding type")
 	limit := flags.Int("limit", 0, "maximum findings; zero is unlimited")
 	if err := flags.Parse(args); err != nil {
 		return controlRequest{}, err
 	}
-	if flags.NArg() != 0 || *output != "jsonl" || *limit < 0 {
-		return controlRequest{}, errors.New("diff requires --output jsonl and a non-negative --limit")
+	if flags.NArg() != 0 || *jobID == "" || *output != "jsonl" || *limit < 0 {
+		return controlRequest{}, errors.New("diff requires --job-id, --output jsonl, and a non-negative --limit")
 	}
-	return controlRequest{Command: "diff", Output: *output, Type: *typeFilter, Limit: *limit}, nil
+	return controlRequest{Command: "diff", JobID: *jobID, Output: *output, Type: *typeFilter, Limit: *limit}, nil
+}
+
+func parseJobMutation(command string, args []string, stderr io.Writer) (controlRequest, error) {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	jobID := flags.String("job-id", "", "Job ID")
+	if err := flags.Parse(args); err != nil {
+		return controlRequest{}, err
+	}
+	if flags.NArg() != 0 || *jobID == "" {
+		return controlRequest{}, fmt.Errorf("%s requires --job-id", command)
+	}
+	return controlRequest{Command: command, JobID: *jobID}, nil
 }
 
 func writeUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "usage: drive9-migration <plan|run|status|diff|verify-full|prepare-drive9-cutover> [options]")
-	_, _ = fmt.Fprintln(w, "  plan -f <config.yaml>                 validate one local Job and print its non-sensitive mapping")
-	_, _ = fmt.Fprintln(w, "  run -f <config.yaml>                  run one foreground Worker")
-	_, _ = fmt.Fprintln(w, "  status --output json                  print process-local status")
-	_, _ = fmt.Fprintln(w, "  diff --output jsonl [--type T] [--limit N]")
-	_, _ = fmt.Fprintln(w, "  verify-full                           run serialized in-memory full verification")
-	_, _ = fmt.Fprintln(w, "  prepare-drive9-cutover                write the irreversible cutover fence")
+	_, _ = fmt.Fprintln(w, "  plan -f <config.yaml>                 validate all Jobs for one local EBS")
+	_, _ = fmt.Fprintln(w, "  run -f <config.yaml>                  run all Jobs for one local EBS")
+	_, _ = fmt.Fprintln(w, "  status [--job-id ID] --output json    print process-local status")
+	_, _ = fmt.Fprintln(w, "  diff --job-id ID --output jsonl [--type T] [--limit N]")
+	_, _ = fmt.Fprintln(w, "  verify-full --job-id ID               run full verification for one Job")
+	_, _ = fmt.Fprintln(w, "  prepare-drive9-cutover --job-id ID    fence one Job")
 }

@@ -7,12 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 const (
-	CheckpointVersion  = "v1"
+	CheckpointVersion  = "v2"
 	maxCheckpointBytes = 64 << 10
 )
 
@@ -27,6 +28,8 @@ type Checkpoint struct {
 	JobID         string `json:"job_id"`
 	ConfigHash    string `json:"config_hash"`
 	VolumeID      string `json:"volume_id"`
+	EBSRoot       string `json:"ebs_root"`
+	SourceSubpath string `json:"source_subpath"`
 	SourceRoot    string `json:"source_root"`
 	Endpoint      string `json:"endpoint"`
 	SpaceRef      string `json:"space_ref"`
@@ -61,7 +64,7 @@ func NewCheckpointStore(api *client.Client) *CheckpointStore {
 }
 
 func CheckpointPath(jobID string) (string, error) {
-	if !volumeIDPattern.MatchString(jobID) {
+	if err := validateJobID(jobID); err != nil {
 		return "", fmt.Errorf("invalid checkpoint job ID")
 	}
 	return ControlPrefix + "/jobs/" + jobID + "/checkpoint.json", nil
@@ -69,8 +72,9 @@ func CheckpointPath(jobID string) (string, error) {
 
 func checkpointFromStartup(startup *Startup) Checkpoint {
 	return Checkpoint{
-		Version: CheckpointVersion, JobID: startup.Job.VolumeID,
+		Version: CheckpointVersion, JobID: startup.Job.JobID,
 		ConfigHash: startup.ConfigHash, VolumeID: startup.Job.VolumeID,
+		EBSRoot: startup.Job.EBSRoot, SourceSubpath: startup.Job.Subpath,
 		SourceRoot: startup.Job.Source.Root, Endpoint: startup.Config.Drive9.Endpoint,
 		SpaceRef: startup.Job.Target.SpaceRef, Prefix: startup.Job.Target.Prefix,
 		CredentialRef: startup.Space.CredentialRef, HighestPhase: startup.Phase,
@@ -143,8 +147,11 @@ func decodeCheckpoint(body []byte) (Checkpoint, error) {
 }
 
 func validateCheckpoint(checkpoint Checkpoint) error {
-	if checkpoint.Version != CheckpointVersion || !volumeIDPattern.MatchString(checkpoint.JobID) || checkpoint.JobID != checkpoint.VolumeID || checkpoint.ConfigHash == "" || checkpoint.SourceRoot == "" || checkpoint.Endpoint == "" || checkpoint.SpaceRef == "" || checkpoint.Prefix == "" || checkpoint.CredentialRef == "" {
+	if checkpoint.Version != CheckpointVersion || validateJobID(checkpoint.JobID) != nil || !volumeIDPattern.MatchString(checkpoint.VolumeID) || checkpoint.ConfigHash == "" || checkpoint.EBSRoot == "" || checkpoint.SourceSubpath == "" || checkpoint.SourceRoot == "" || checkpoint.Endpoint == "" || checkpoint.SpaceRef == "" || checkpoint.Prefix == "" || checkpoint.CredentialRef == "" {
 		return fmt.Errorf("%w: incomplete immutable identity", ErrCheckpointMismatch)
+	}
+	if validateSourceSubpath(checkpoint.SourceSubpath) != nil || !filepath.IsAbs(checkpoint.EBSRoot) || filepath.Clean(checkpoint.EBSRoot) != checkpoint.EBSRoot || checkpoint.SourceRoot != effectiveSourceRoot(checkpoint.EBSRoot, checkpoint.SourceSubpath) {
+		return fmt.Errorf("%w: invalid source identity", ErrCheckpointMismatch)
 	}
 	if phaseRank(checkpoint.HighestPhase) == 0 || (checkpoint.FenceIntent && phaseRank(checkpoint.HighestPhase) < phaseRank(PhaseDualWriteRepairing)) || (checkpoint.HighestPhase == PhaseCutoverReady && !checkpoint.FenceComplete) || (checkpoint.FenceComplete && (!checkpoint.FenceIntent || checkpoint.HighestPhase != PhaseCutoverReady)) {
 		return fmt.Errorf("%w: invalid phase or fence state", ErrCheckpointMismatch)
@@ -153,7 +160,7 @@ func validateCheckpoint(checkpoint Checkpoint) error {
 }
 
 func sameCheckpointIdentity(left, right Checkpoint) bool {
-	return left.Version == right.Version && left.JobID == right.JobID && left.ConfigHash == right.ConfigHash && left.VolumeID == right.VolumeID && left.SourceRoot == right.SourceRoot && left.Endpoint == right.Endpoint && left.SpaceRef == right.SpaceRef && left.Prefix == right.Prefix && left.CredentialRef == right.CredentialRef
+	return left.Version == right.Version && left.JobID == right.JobID && left.ConfigHash == right.ConfigHash && left.VolumeID == right.VolumeID && left.EBSRoot == right.EBSRoot && left.SourceSubpath == right.SourceSubpath && left.SourceRoot == right.SourceRoot && left.Endpoint == right.Endpoint && left.SpaceRef == right.SpaceRef && left.Prefix == right.Prefix && left.CredentialRef == right.CredentialRef
 }
 
 func validateCheckpointTransition(current, next Checkpoint, creating bool) error {

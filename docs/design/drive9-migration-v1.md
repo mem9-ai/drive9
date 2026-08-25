@@ -56,14 +56,14 @@ switches to Drive9-only writes.
 | Area | V1 contract |
 | --- | --- |
 | Source | One EBS filesystem already mounted as a local directory on an eligible EKS node |
-| Job | One EBS Source Root to one Drive9 `(Space, Prefix)` |
+| Job | One configured EBS subpath Source Root to one Drive9 `(Space, Prefix)` |
 | Parallelism | Multiple independent Jobs may run concurrently |
 | Target layouts | One EBS per Space, or multiple EBS Jobs in one Space under disjoint Prefixes |
 | Synchronization | Repeated full namespace rounds, incremental convergence, complete deep recovery after restart, and fresh conditional uploads |
 | Handoff | `SYNCING -> DUAL_WRITE_REPAIRING -> CUTOVER_READY` |
 | Verification | EBS-to-Drive9 one-way coverage using whole-file SHA-256 and supported metadata |
 | Runtime control | Startup configuration plus local single-Job Unix socket commands |
-| Deployment assumption | Existing Kubernetes operations manage a DaemonSet; one eligible node, one EBS, one Worker, one Job |
+| Deployment assumption | Existing Kubernetes operations manage a DaemonSet; one eligible node, one EBS, one Worker process, multiple independent Jobs |
 | CSI | Reuse the existing CSI driver and its Secret/`remote-root`/RWX behavior without code changes |
 
 ### 1.2 Explicitly out of scope
@@ -139,8 +139,10 @@ Delete/Rename primitive is scope expansion.
 | Term | Definition |
 | --- | --- |
 | Job | The smallest state, recovery, rate-limit, verification, and fence unit |
-| `job_id` | Stable V1 Job identifier; exactly equal to `volume_id` |
-| `volume_id` | AWS EBS volume ID in `vol-xxxx` form; no separate Job ID is configured |
+| `job_id` | Stable, explicit V1 Job identifier for one EBS subpath mapping |
+| `volume_id` | AWS EBS volume ID in `vol-xxxx` form; multiple Jobs may share it |
+| EBS Root | The mounted EBS directory selected for one Worker process |
+| Subpath | Absolute logical path beneath EBS Root; configured subpaths are disjoint |
 | Source Root | The mounted EBS directory included in the migration |
 | Space | Configuration reference to one Drive9 Tenant filesystem |
 | Prefix | The Job-owned business path inside a Space; not an authorization boundary |
@@ -153,7 +155,7 @@ Delete/Rename primitive is scope expansion.
 
 ### 3.2 Path mapping
 
-For a source entry `sourceRoot/relative/path`:
+For a source entry `ebsRoot/subpath/relative/path`:
 
 ~~~text
 target path = normalize(target Prefix + relative/path)
@@ -222,15 +224,16 @@ Operator-managed Kubernetes
 Runtime boundaries:
 
 1. `drive9-migration run` is a foreground Worker process.
-2. A Worker selects exactly one declared Job using
+2. A Worker process selects exactly one declared EBS Source using
    `DRIVE9_MIGRATION_NODE_NAME`, populated from `spec.nodeName` through the
-   Downward API. `volume_id`, not `node_name`, is the stable Job identity.
+   Downward API, then starts every nested subpath Job. `job_id` is the stable
+   Job identity; `volume_id` groups Jobs by EBS.
 3. The Worker does not call the Kubernetes API and needs no Migration-specific
    RBAC.
 4. The Worker exposes no network listener. Local commands use one mode-0600
    Unix Domain Socket with bounded JSON, deadlines, and serialized mutations.
-5. One Worker owns one Job. Internal small-file, large-file, and Multipart work
-   may be concurrent.
+5. One Worker process owns multiple independent Job Workers. Each Job's internal
+   small-file, large-file, and Multipart work may be concurrent.
 6. V1 has no SQLite, local database, or PVC requirement. Per-round, per-path,
    finding, verification, and upload state lives only in process memory.
 7. The remote Checkpoint contains only immutable identity and non-regressible
@@ -246,22 +249,23 @@ Runtime boundaries:
 ~~~bash
 drive9-migration plan -f /etc/drive9-migration/config.yaml
 drive9-migration run -f /etc/drive9-migration/config.yaml
-drive9-migration status --output json
-drive9-migration diff [--type <type>] [--limit <n>] --output jsonl
-drive9-migration verify-full
-drive9-migration prepare-drive9-cutover
+drive9-migration status [--job-id <id>] --output json
+drive9-migration diff --job-id <id> [--type <type>] [--limit <n>] --output jsonl
+drive9-migration verify-full --job-id <id>
+drive9-migration prepare-drive9-cutover --job-id <id>
 ~~~
 
 | Command | Contract |
 | --- | --- |
-| `plan` | Read-only batch-static validation plus dynamic preflight for the selected local Job; no Drive9 business-data mutation |
-| `run` | Start the foreground Worker for the Job selected on this node |
-| `status` | Query current local Job state and summaries; differences still return success |
+| `plan` | Read-only static validation plus sequential dynamic preflight for every Job in the selected EBS; no Drive9 business-data mutation |
+| `run` | Start one foreground process supervising every Job in the selected EBS |
+| `status` | Query all current local Job states or filter one Job; differences still return success |
 | `diff` | Stream detailed findings as JSONL |
 | `verify-full` | Run one in-memory full verification inside `DUAL_WRITE_REPAIRING`; phase does not change |
 | `prepare-drive9-cutover` | Execute the irreversible per-Job fence protocol |
 
-The four local commands do not accept `job_id` because one Pod contains one Job.
+Job-specific `diff`, `verify-full`, and `prepare-drive9-cutover` require an exact
+`job_id`. `status` accepts an optional Job filter. No mutation-all command exists.
 
 ### 5.2 Exit codes
 
@@ -284,7 +288,7 @@ metadata:
 data:
   phase: SYNCING
   config.yaml: |
-    version: v3
+    version: v4
     drive9:
       endpoint: https://drive9.example.com
     job_defaults:
@@ -297,19 +301,20 @@ data:
     spaces:
       space-001:
         credential_ref: space-001-key
-    jobs:
+    ebs_sources:
       - volume_id: vol-001
         node_name: ip-10-0-1-10
-        source:
-          type: ebs
-          root: /ebs/xxxx
-        target:
-          space_ref: space-001
-          prefix: /
+        root: /ebs/xxxx
+        jobs:
+          - job_id: vol-001-user-a
+            subpath: /A
+            target:
+              space_ref: space-001
+              prefix: /
 ~~~
 
-Shared-Space Jobs use the same schema and distinct Prefixes such as
-`/vol-001` and `/vol-002`.
+Additional Jobs use distinct, non-overlapping EBS subpaths and may target
+different Spaces or disjoint Prefixes in one Space.
 
 Configuration rules:
 
@@ -329,9 +334,9 @@ Configuration rules:
    and is immutable while a Job runs.
 6. `max_bytes_per_second` is the total upload limit for each Job, not each
    internal worker and not the batch.
-7. `config_hash` covers the parsed static Source, Target, endpoint,
-   `space_ref -> credential_ref` mapping, and `job_defaults`. It excludes phase
-   and API-key values.
+7. `config_hash` covers `job_id`, `volume_id`, EBS Root, subpath, parsed static
+   Source/Target, endpoint, `space_ref -> credential_ref` mapping, and
+   `job_defaults`. It excludes node assignment, phase, and API-key values.
 8. A recovered Job whose static configuration or Source/Target identity differs
    from its Checkpoint fails closed.
 9. Repeating the current phase is idempotent. Before fence intent, requesting a
@@ -373,16 +378,15 @@ trusted as a startup authorization.
 Batch-static checks use only configuration and therefore cover every declared
 Job:
 
-1. Strictly decode schema version v3 and reject unknown fields, duplicate IDs,
-   malformed `volume_id` values, unsupported Source types, and per-Job default
-   overrides.
-2. Resolve exactly one Job for `DRIVE9_MIGRATION_NODE_NAME` and reject duplicate
-   active Job identity.
-3. Normalize and validate every Space/Prefix mapping, including cross-Job
-   overlap and the control Prefix carve-out.
+1. Strictly decode schema version v4 and reject v3, unknown fields, duplicate
+   IDs, malformed `volume_id` or `job_id` values, and per-Job default overrides.
+2. Resolve exactly one EBS Source for `DRIVE9_MIGRATION_NODE_NAME`, then resolve
+   every nested Job and reject duplicate Job identity or overlapping subpaths.
+3. Normalize and validate every subpath and Space/Prefix mapping, including
+   cross-Job overlap and the control Prefix carve-out.
 
-Dynamic probes cover only the selected local Job because a Worker cannot access
-another node's EBS:
+Dynamic probes cover every Job beneath the selected local EBS Source. `plan`
+runs them sequentially; `run` initializes and retries them independently:
 
 1. Validate Source Root existence, traversal, and read access.
 2. Verify EBS serial or `/dev/disk/by-id` against `volume_id` when available.
@@ -394,7 +398,8 @@ another node's EBS:
 5. Confirm first-run Target Prefix emptiness or valid same-Job recovery state.
 6. Count source entries and logical bytes and report the observed namespace
    size. `plan` does not retain that inventory after returning.
-7. Emit the selected Job's non-sensitive CSI handoff mapping.
+7. Emit every selected Job's non-sensitive CSI handoff mapping and retain
+   partial plan results.
 
 Batch readiness is external: the Kubernetes operations layer runs this dynamic
 preflight on every eligible node and aggregates the per-Job results.
@@ -846,10 +851,10 @@ Each Job owns one conditionally updated control record beneath:
 /.drive9-migration/jobs/<job-id>/
 ~~~
 
-The Checkpoint contains only:
+The strict checkpoint schema is v2; checkpoint v1 is rejected. It contains only:
 
-1. Stable Job identity and immutable `config_hash`, Source, Target, Space, and
-   Prefix identity.
+1. Stable `job_id`, EBS `volume_id`, EBS Root, subpath, and immutable
+   `config_hash`, Source, Target, Space, and Prefix identity.
 2. Highest applied phase.
 3. Irreversible fence intent.
 4. Complete write fence.
@@ -932,9 +937,11 @@ new token type or Prefix scope is added.
 
 ### 14.1 `status`
 
-`status --output json` returns current facts for one Job:
+`status --output json` returns one EBS envelope containing every configured Job;
+`--job-id` filters it to one item. A Job item includes:
 
-1. Actual phase and startup-configured phase.
+1. Runtime state (`INITIALIZING`, `RETRYING`, `RUNNING`, or `STOPPED`), actual
+   phase when available, and startup-configured phase.
 2. `ReadyForRollout`, `CurrentConverged`, and `Attention` with reasons.
 3. Fence intent and complete-fence state.
 4. Current in-memory `repair_mtime_floor`, startup recovery state, and latest
@@ -950,9 +957,9 @@ contain the full path list.
 
 ### 14.2 `diff`
 
-`diff --output jsonl` streams detailed findings through the local UDS. It is the
-explicit interface for per-path diagnosis. Reads may run concurrently; state
-mutations are serialized.
+`diff --job-id <id> --output jsonl` streams detailed findings through the local
+UDS. It is the explicit interface for per-path diagnosis. Reads may run
+concurrently; state mutations are serialized per Job.
 
 ### 14.3 Post-grace CAS events
 
@@ -986,7 +993,7 @@ volume, node, Pod, tenant, and Space MUST NOT be metric labels.
 
 ## 15. Concurrency, rate, and capacity
 
-1. One Worker process owns one Job.
+1. One Worker process owns one selected EBS and supervises all configured Jobs.
 2. Small-file, large-file, and Multipart workers share one Job-level byte token
    bucket.
 3. `max_bytes_per_second` is the aggregate upload ceiling for that Job.
@@ -1092,8 +1099,9 @@ acceptance must prove the following behavior.
 
 ### 19.2 Migration CLI and Worker
 
-1. Strict config parsing, one-Job node selection, phase-source exclusivity,
-   phase rollback rejection, and Secret rotation are tested.
+1. Strict v4 config parsing, one-EBS node selection, nested Job resolution,
+   phase-source exclusivity, phase rollback rejection, and Secret rotation are
+   tested.
 2. Preflight is read-only and rejects every invalid mapping before Drive9
    business mutation.
 3. EBS fixtures cover all supported and blocked object/metadata cases.
@@ -1128,8 +1136,12 @@ acceptance must prove the following behavior.
     same fence.
 19. Fence failures before and after intent prove the irreversible recovery
     split; no post-intent write is possible.
-20. Keys and file contents are absent from every forbidden sink.
-21. Existing binaries build unchanged; `drive9-migration` builds with
+20. One transiently failing Job retries without cancelling healthy siblings;
+    one permanently stopped Job remains visible in process status.
+21. Job-specific controls require an exact `job_id`, and no mutation-all command
+    is exposed.
+22. Keys and file contents are absent from every forbidden sink.
+23. Existing binaries build unchanged; `drive9-migration` builds with
     `CGO_ENABLED=0` for Linux AMD64 and ARM64.
 
 No acceptance test may claim strict consistency, No Extras, maximum RPO,

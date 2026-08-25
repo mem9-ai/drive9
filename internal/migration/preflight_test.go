@@ -15,26 +15,38 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"golang.org/x/sys/unix"
+	"gopkg.in/yaml.v3"
 )
 
 func mappingConfig(t *testing.T, jobs string) *Config {
 	t.Helper()
-	body := strings.Replace(validConfigYAML, `jobs:
-  - volume_id: vol-001
-    node_name: node-a
-    source:
-      type: ebs
-      root: /ebs/001
-    target:
-      space_ref: space-001
-      prefix: /
-`, "jobs:\n"+jobs, 1)
-	if body == validConfigYAML {
-		t.Fatal("jobs block was not replaced; validConfigYAML drifted")
+	var legacy []struct {
+		VolumeID string       `yaml:"volume_id"`
+		NodeName string       `yaml:"node_name"`
+		Source   SourceConfig `yaml:"source"`
+		Target   TargetConfig `yaml:"target"`
 	}
-	cfg, err := LoadConfig(writeConfig(t, body))
-	if err != nil {
+	if err := yaml.Unmarshal([]byte(jobs), &legacy); err != nil {
 		t.Fatal(err)
+	}
+	cfg := &Config{
+		Version: ConfigVersion, Drive9: Drive9Config{Endpoint: "https://drive9.example.com"},
+		JobDefaults: JobDefaults{
+			Sync: SyncDefaults{GracePeriod: Duration(DefaultGracePeriod)},
+			Performance: PerformanceDefaults{
+				MaxBytesPerSecond: 1024, SmallFileWorkers: 2, LargeFileWorkers: 1,
+			},
+		},
+		Spaces:     map[string]SpaceConfig{"space-001": {CredentialRef: "space-001-key"}},
+		EBSSources: make([]EBSSourceConfig, 0, len(legacy)),
+	}
+	for _, job := range legacy {
+		cfg.EBSSources = append(cfg.EBSSources, EBSSourceConfig{
+			VolumeID: job.VolumeID, NodeName: job.NodeName, Root: job.Source.Root,
+			Jobs: []JobConfig{{
+				JobID: job.VolumeID + "-root", Subpath: "/", Target: job.Target,
+			}},
+		})
 	}
 	return cfg
 }
@@ -141,7 +153,7 @@ func TestValidateMappingsUsesCredentialMappingForSpaceAliases(t *testing.T) {
     target: {space_ref: space-001, prefix: /other}
 `)
 		cfg.Spaces["alias"] = SpaceConfig{CredentialRef: aliasCredential}
-		cfg.Jobs[1].Target = TargetConfig{SpaceRef: "alias", Prefix: aliasPrefix}
+		cfg.EBSSources[1].Jobs[0].Target = TargetConfig{SpaceRef: "alias", Prefix: aliasPrefix}
 		return cfg
 	}
 
@@ -535,9 +547,12 @@ func TestPreflightStaticMappingFailsBeforeRemoteCall(t *testing.T) {
 	}))
 	defer srv.Close()
 	startup := preflightStartup(t, srv.URL, root)
-	startup.Config.Jobs = append(startup.Config.Jobs, Job{
-		VolumeID: "vol-002", NodeName: "node-b", Source: SourceConfig{Type: "ebs", Root: "/ebs/002"},
-		Target: TargetConfig{SpaceRef: "space-001", Prefix: "/sub"},
+	startup.Config.EBSSources = append(startup.Config.EBSSources, EBSSourceConfig{
+		VolumeID: "vol-002", NodeName: "node-a", Root: "/ebs/002",
+		Jobs: []JobConfig{{
+			JobID: "vol-002-root", Subpath: "/",
+			Target: TargetConfig{SpaceRef: "space-001", Prefix: "/sub"},
+		}},
 	})
 	_, err := Preflight(context.Background(), startup)
 	if !errors.Is(err, ErrPreflight) || hits.Load() != 0 {
@@ -569,5 +584,50 @@ func TestPreflightPreservesOldServerAndTypedClientErrors(t *testing.T) {
 				t.Fatalf("typed error=%T %v", err, err)
 			}
 		})
+	}
+}
+
+func TestPlanRetainsAllJobResultsOnPartialFailure(t *testing.T) {
+	root := t.TempDir()
+	for _, subpath := range []string{"A", "B"} {
+		if err := os.Mkdir(filepath.Join(root, subpath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, subpath, "file"), []byte(subpath), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/status":
+			_, _ = w.Write([]byte(`{"max_upload_bytes":1048576,"inline_threshold":1024,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
+		case r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/checkpoint.json"):
+			http.NotFound(w, r)
+		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FileInfo{{Name: ".drive9-migration", IsDir: true}}})
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+	body := strings.Replace(validV4ConfigYAML, "https://drive9.example.com", server.URL, 1)
+	body = strings.Replace(body, "/ebs/001", root, 1)
+	secretRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(secretRoot, "space-a-key"), []byte("owner-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := LoadRuntimeStartup(writeConfig(t, body), "node-a", string(PhaseSyncing), secretRoot, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range runtime.Jobs {
+		job.mountProbe = testMountedSourceProbe
+	}
+	result, err := Plan(context.Background(), runtime)
+	if !errors.Is(err, ErrPlanFailed) {
+		t.Fatalf("plan error=%v", err)
+	}
+	if len(result.Jobs) != 2 || result.Jobs[0].Result == nil || result.Jobs[0].Error != "" || result.Jobs[1].Result != nil || result.Jobs[1].Error == "" {
+		t.Fatalf("plan=%+v", result)
 	}
 }

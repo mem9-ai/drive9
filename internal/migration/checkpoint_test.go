@@ -20,6 +20,7 @@ import (
 
 type checkpointFake struct {
 	mu             sync.Mutex
+	jobID          string
 	revision       int64
 	body           []byte
 	failCAS        bool
@@ -40,7 +41,11 @@ func (f *checkpointFake) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if r.URL.Path != "/v1/fs/.drive9-migration/jobs/vol-001/checkpoint.json" {
+	jobID := f.jobID
+	if jobID == "" {
+		jobID = "vol-001"
+	}
+	if r.URL.Path != "/v1/fs/.drive9-migration/jobs/"+jobID+"/checkpoint.json" {
 		if r.Method == http.MethodHead && f.dirConflict {
 			w.Header().Set("X-Dat9-IsDir", strconv.FormatBool(f.dirIsDir))
 			w.Header().Set("X-Dat9-Revision", "1")
@@ -88,14 +93,15 @@ func (f *checkpointFake) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 func newCheckpointFixture(t *testing.T) (*CheckpointStore, *checkpointFake, *Startup) {
 	t.Helper()
-	fake := &checkpointFake{}
+	fake := &checkpointFake{jobID: "vol-001-user-a"}
 	server := httptest.NewServer(http.HandlerFunc(fake.serveHTTP))
 	t.Cleanup(server.Close)
 	startup := &Startup{
 		Config: &Config{Drive9: Drive9Config{Endpoint: server.URL}},
 		Job: Job{
-			VolumeID: "vol-001", NodeName: "node-a",
-			Source: SourceConfig{Type: "ebs", Root: "/ebs/001"},
+			JobID: "vol-001-user-a", VolumeID: "vol-001", NodeName: "node-a",
+			EBSRoot: "/ebs/001", Subpath: "/A",
+			Source: SourceConfig{Type: "ebs", Root: "/ebs/001/A"},
 			Target: TargetConfig{SpaceRef: "space-001", Prefix: "/data"},
 		},
 		Space: SpaceConfig{CredentialRef: "space-001-key"}, Phase: PhaseSyncing, ConfigHash: "config-hash",
@@ -281,9 +287,9 @@ func TestCheckpointRejectsForbiddenTransitionAndCorruptPayload(t *testing.T) {
 		t.Fatalf("complete-without-intent error=%v", err)
 	}
 	fake.mu.Lock()
-	fake.body = []byte(`{"version":"v1","job_id":"vol-001","unknown":true}`)
+	fake.body = []byte(`{"version":"v1","job_id":"vol-001-user-a","unknown":true}`)
 	fake.mu.Unlock()
-	if _, err := store.Load(context.Background(), "vol-001"); err == nil {
+	if _, err := store.Load(context.Background(), "vol-001-user-a"); err == nil {
 		t.Fatal("unknown checkpoint field accepted")
 	}
 }
@@ -302,7 +308,7 @@ func TestCheckpointStrictPathDecodeAndShapeValidation(t *testing.T) {
 		t.Fatalf("trailing error=%v", err)
 	}
 	for _, mutate := range []func(*Checkpoint){
-		func(value *Checkpoint) { value.Version = "v2" },
+		func(value *Checkpoint) { value.Version = "v1" },
 		func(value *Checkpoint) { value.ConfigHash = "" },
 		func(value *Checkpoint) { value.HighestPhase = "UNKNOWN" },
 		func(value *Checkpoint) { value.FenceIntent = true },
@@ -353,7 +359,7 @@ func TestCheckpointLoadRejectsUnstableAndOversizedReads(t *testing.T) {
 			}))
 			defer server.Close()
 			store := NewCheckpointStore(driveclient.New(server.URL, ""))
-			if _, err := store.Load(context.Background(), "vol-001"); !errors.Is(err, tc.want) {
+			if _, err := store.Load(context.Background(), "vol-001-user-a"); !errors.Is(err, tc.want) {
 				t.Fatalf("load error=%v, want %v", err, tc.want)
 			}
 			if got := reads.Load(); got != tc.wantReads {

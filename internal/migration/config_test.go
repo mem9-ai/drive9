@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const validConfigYAML = `version: v3
+const validConfigYAML = `version: v4
 drive9:
   endpoint: https://drive9.example.com
 job_defaults:
@@ -23,15 +23,16 @@ job_defaults:
 spaces:
   space-001:
     credential_ref: space-001-key
-jobs:
+ebs_sources:
   - volume_id: vol-001
     node_name: node-a
-    source:
-      type: ebs
-      root: /ebs/001
-    target:
-      space_ref: space-001
-      prefix: /
+    root: /ebs/001
+    jobs:
+      - job_id: vol-001
+        subpath: /
+        target:
+          space_ref: space-001
+          prefix: /
 `
 
 func writeConfig(t *testing.T, body string) string {
@@ -49,7 +50,7 @@ func TestLoadConfigStrictAndDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Version != "v3" || cfg.Drive9.Endpoint != "https://drive9.example.com" {
+	if cfg.Version != "v4" || cfg.Drive9.Endpoint != "https://drive9.example.com" {
 		t.Fatalf("config = %+v", cfg)
 	}
 	if time.Duration(cfg.JobDefaults.Sync.GracePeriod) != time.Minute {
@@ -67,9 +68,9 @@ func TestLoadConfigRejectsMalformedUnknownAndUnsupportedFields(t *testing.T) {
 	}{
 		{name: "malformed", body: "version: ["},
 		{name: "unknown top level", body: validConfigYAML + "extra: true\n"},
-		{name: "per-job override", body: strings.Replace(validConfigYAML, "    target:\n", "    grace_period: 30s\n    target:\n", 1)},
-		{name: "wrong version", body: strings.Replace(validConfigYAML, "version: v3", "version: v2", 1)},
-		{name: "multiple documents", body: validConfigYAML + "---\nversion: v3\n"},
+		{name: "per-job override", body: strings.Replace(validConfigYAML, "        target:\n", "        grace_period: 30s\n        target:\n", 1)},
+		{name: "wrong version", body: strings.Replace(validConfigYAML, "version: v4", "version: v2", 1)},
+		{name: "multiple documents", body: validConfigYAML + "---\nversion: v4\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := LoadConfig(writeConfig(t, tc.body)); err == nil {
@@ -82,8 +83,11 @@ func TestLoadConfigRejectsMalformedUnknownAndUnsupportedFields(t *testing.T) {
 func TestLoadConfigRejectsDuplicateAndInvalidJobIdentity(t *testing.T) {
 	duplicate := validConfigYAML + `  - volume_id: vol-001
     node_name: node-b
-    source: {type: ebs, root: /ebs/002}
-    target: {space_ref: space-001, prefix: /other}
+    root: /ebs/002
+    jobs:
+      - job_id: vol-001-other
+        subpath: /
+        target: {space_ref: space-001, prefix: /other}
 `
 	if _, err := LoadConfig(writeConfig(t, duplicate)); err == nil || !strings.Contains(err.Error(), "duplicate volume_id") {
 		t.Fatalf("duplicate error = %v", err)
@@ -96,21 +100,19 @@ func TestLoadConfigRejectsDuplicateAndInvalidJobIdentity(t *testing.T) {
 	}
 }
 
-func TestSelectJobRequiresExactlyOneNodeMatch(t *testing.T) {
+func TestSelectSourceRequiresExactlyOneNodeMatch(t *testing.T) {
 	cfg, err := LoadConfig(writeConfig(t, validConfigYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cfg.SelectJob("missing"); err == nil {
+	if _, err := cfg.SelectSource("missing"); err == nil {
 		t.Fatal("missing node match accepted")
 	}
-	cfg.Jobs = append(cfg.Jobs, Job{
-		VolumeID: "vol-002",
-		NodeName: "node-a",
-		Source:   SourceConfig{Type: "ebs", Root: "/ebs/002"},
-		Target:   TargetConfig{SpaceRef: "space-001", Prefix: "/other"},
+	cfg.EBSSources = append(cfg.EBSSources, EBSSourceConfig{
+		VolumeID: "vol-002", NodeName: "node-a", Root: "/ebs/002",
+		Jobs: []JobConfig{{JobID: "vol-002-root", Subpath: "/", Target: TargetConfig{SpaceRef: "space-001", Prefix: "/other"}}},
 	})
-	if _, err := cfg.SelectJob("node-a"); err == nil {
+	if _, err := cfg.SelectSource("node-a"); err == nil {
 		t.Fatal("multiple node matches accepted")
 	}
 }
@@ -221,8 +223,11 @@ func TestLoadStartupHashExcludesPhaseAndSecret(t *testing.T) {
 func TestConfigHashCoversOnlySelectedEffectiveJob(t *testing.T) {
 	extraJob := `  - volume_id: vol-002
     node_name: node-b
-    source: {type: ebs, root: /ebs/002}
-    target: {space_ref: space-001, prefix: /other}
+    root: /ebs/002
+    jobs:
+      - job_id: vol-002-root
+        subpath: /
+        target: {space_ref: space-001, prefix: /other}
 `
 	first, err := LoadConfig(writeConfig(t, validConfigYAML+extraJob))
 	if err != nil {

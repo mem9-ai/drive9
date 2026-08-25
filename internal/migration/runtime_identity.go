@@ -31,6 +31,57 @@ func sourceMountProbeFor(startup *Startup) sourceMountProbe {
 	return observeMountedSource
 }
 
+func observeJobSource(startup *Startup, probe sourceMountProbe) (sourceMountIdentity, error) {
+	if startup == nil {
+		return sourceMountIdentity{}, errors.New("missing startup")
+	}
+	ebsRoot := startup.Job.EBSRoot
+	if ebsRoot == "" {
+		ebsRoot = startup.Job.Source.Root
+	}
+	ebsIdentity, err := probe(ebsRoot, startup.Job.VolumeID)
+	if err != nil {
+		return sourceMountIdentity{}, err
+	}
+	if ebsRoot == startup.Job.Source.Root {
+		return ebsIdentity, nil
+	}
+	sourceIdentity, err := observeSubpathRoot(ebsRoot, startup.Job.Source.Root)
+	if err != nil {
+		return sourceMountIdentity{}, err
+	}
+	if sourceIdentity.Device != ebsIdentity.Device {
+		return sourceMountIdentity{}, fmt.Errorf("%w: source subpath is on another device", ErrSourceMountChanged)
+	}
+	sourceIdentity.VolumeSerial = ebsIdentity.VolumeSerial
+	sourceIdentity.VolumeIdentityVerified = ebsIdentity.VolumeIdentityVerified
+	return sourceIdentity, nil
+}
+
+func observeSubpathRoot(ebsRoot, sourceRoot string) (sourceMountIdentity, error) {
+	relative, err := filepath.Rel(ebsRoot, sourceRoot)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return sourceMountIdentity{}, fmt.Errorf("%w: source subpath escapes EBS root", ErrSourceMountChanged)
+	}
+	root, err := os.OpenRoot(ebsRoot)
+	if err != nil {
+		return sourceMountIdentity{}, fmt.Errorf("open EBS root: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	info, err := root.Lstat(relative)
+	if err != nil {
+		return sourceMountIdentity{}, fmt.Errorf("lstat source subpath root: %w", err)
+	}
+	if !info.IsDir() {
+		return sourceMountIdentity{}, errors.New("source subpath root is not a directory")
+	}
+	identity, err := defaultFileIdentity(sourceRoot, info)
+	if err != nil {
+		return sourceMountIdentity{}, fmt.Errorf("source subpath root identity: %w", err)
+	}
+	return sourceMountIdentity{Device: identity.version.Device, Inode: identity.version.Inode}, nil
+}
+
 func observeSourceRoot(root string) (sourceMountIdentity, error) {
 	info, err := os.Lstat(root)
 	if err != nil {

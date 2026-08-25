@@ -494,7 +494,10 @@ func newWorkerStartup(t *testing.T, root string, server *httptest.Server) *Start
 		},
 		Spaces: map[string]SpaceConfig{"space": {CredentialRef: "owner-key"}},
 	}
-	job := Job{VolumeID: "vol-001", NodeName: "node", Source: SourceConfig{Type: "ebs", Root: root}, Target: TargetConfig{SpaceRef: "space", Prefix: "/data"}}
+	configured := JobConfig{JobID: "vol-001", Subpath: "/", Target: TargetConfig{SpaceRef: "space", Prefix: "/data"}}
+	source := EBSSourceConfig{VolumeID: "vol-001", NodeName: "node", Root: root, Jobs: []JobConfig{configured}}
+	config.EBSSources = []EBSSourceConfig{source}
+	job := resolveJob(source, configured)
 	config.Jobs = []Job{job}
 	hash, err := ConfigHash(config, job)
 	if err != nil {

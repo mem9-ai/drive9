@@ -6,16 +6,19 @@ title: Drive9 Migration V1 Operator Runbook
 
 ## Safety boundary
 
-Drive9 Migration V1 moves one mounted, read-only EBS Source per Job to one
-Drive9 Space/Prefix. It has no rollback or unfence. After T0 it never propagates
-Delete or Rename, so old target paths can remain as non-blocking residue.
+Drive9 Migration V1 moves configured subpaths from one mounted, read-only EBS
+Source into independent Drive9 Space/Prefix Jobs. It has no rollback or unfence.
+After T0 it never propagates Delete or Rename, so old target paths can remain as
+non-blocking residue.
 
 The prominent V1 limits are post-T0 residue, metadata loss, per-Job throttling,
-residual ABA risk, one Source per Job, and no rollback. V1 preserves supported
-path, link, content, and `mode & 0777` semantics. It does not preserve UID/GID,
+residual ABA risk, one subpath Source Root per Job, and no rollback. V1
+preserves supported path, link, content, and `mode & 0777` semantics. It does
+not preserve UID/GID,
 timestamps, xattrs, ACLs, special bits, or sparse layout. Revision reuse after
 delete/recreate retains a residual ABA overwrite risk. Throttling is per Job,
-not batch-wide, and Jobs have no cross-Job transaction.
+not EBS-wide, and Jobs have no cross-Job transaction. With N active Jobs, the
+process may use up to N times the configured per-Job bandwidth and worker count.
 
 ## Public container image
 
@@ -29,11 +32,10 @@ ghcr.io/drive9-ai/drive9-migration:<source-sha7>
 
 The workflow does not publish `latest`. Use the published commit tag directly.
 
-The Kubernetes example remains pinned to `3a6d226` for its tested T0/T1 trial.
-That image predates ConfigMap-driven `CUTOVER_READY`. Before T2, replace both
-image fields with a published source tag that contains ConfigMap-driven cutover;
-otherwise the init container and Worker reject the requested phase. A failed
-rollout is never evidence that T2 completed.
+The Kubernetes example uses `REPLACE_WITH_V4_SOURCE_TAG`. Replace both image
+fields with the same published source tag containing the strict v4 subpath
+contract. A v3 binary rejects the v4 example, and a failed rollout is never
+evidence that T2 completed.
 
 The `mem9-ai/drive9` repository must provide the Actions secrets
 `DRIVE9_AI_GHCR_USERNAME` and `DRIVE9_AI_GHCR_TOKEN`. The token must belong to an
@@ -59,43 +61,52 @@ described below remain required.
 ## Inputs and handoff mapping
 
 Use [the sample configuration](../examples/drive9-migration/config.yaml) as the
-strict `version: v3` shape. Every node name must select exactly one Job. The
+strict `version: v4` shape. Every node name selects exactly one EBS Source, and
+one process runs all Jobs nested beneath that Source. v3 configuration and
+checkpoint v1 are not accepted or converted. The
 credential reference is only a Secret-volume filename; the API key itself must
 exist only in the read-only Secret volume at
 `/var/run/secrets/drive9-migration/<credential_ref>`.
 
-The sample demonstrates both accepted CSI handoff layouts:
+The sample demonstrates one EBS with three customer subpath mappings:
 
-| EBS Source | Drive9 target | Layout |
+| EBS subpath | Drive9 target | Job ID |
 | --- | --- | --- |
-| `/mnt/ebs/vol-0a` | Space `volume-a`, Prefix `/` | One EBS per Space |
-| `/mnt/ebs/vol-0b` | Space `shared`, Prefix `/vol-0b` | Shared Space, disjoint Prefix |
-| `/mnt/ebs/vol-0c` | Space `shared`, Prefix `/vol-0c` | Shared Space, disjoint Prefix |
+| `/mnt/ebs/vol-0a/A` | Space `user-a`, Prefix `/` | `vol-0a-user-a` |
+| `/mnt/ebs/vol-0a/B` | Space `user-b`, Prefix `/` | `vol-0a-user-b` |
+| `/mnt/ebs/vol-0a/C` | Space `user-c`, Prefix `/` | `vol-0a-user-c` |
+
+Subpath names are not copied into target paths. Configured subpaths must be
+disjoint; unconfigured EBS paths are ignored. A subpath root must be a real
+directory on the EBS device. Hardlinks spanning different subpath Jobs become
+independent target files.
 
 Set `DRIVE9_MIGRATION_NODE_NAME` to the local node name. Supply the phase from
 exactly one source: a sibling `phase` file beside `config.yaml`, or the accepted
 `DRIVE9_MIGRATION_PHASE` fallback. Never place a key in config, argv, or an
 environment variable.
 
-Before starting a Job, mount its EBS Source read-only, provision the referenced
-Secret file with mode `0600`, write `SYNCING` to the phase source, and run:
+Before starting the process, mount its EBS Source read-only, provision every
+referenced Secret file with mode `0600`, write `SYNCING` to the phase source,
+and run:
 
 ```text
 drive9-migration plan -f /etc/drive9-migration/config.yaml
 drive9-migration run -f /etc/drive9-migration/config.yaml
 ```
 
-The `plan` JSON is the non-sensitive CSI handoff record: verify `volume_id`,
-`node_name`, `source_root`, `space_ref`, `prefix`, `credential_ref`, source
-identity, limits, target emptiness, and required capabilities. It never returns
-the API key.
+The `plan` JSON is the non-sensitive CSI handoff record: verify `job_id`,
+`volume_id`, `node_name`, `ebs_root`, `subpath`, `source_root`, `space_ref`,
+`prefix`, `credential_ref`, source identity, limits, target emptiness, and
+required capabilities for every Job. It never returns an API key. Plan retains
+all Job results and exits nonzero if any Job fails.
 
 ## Kubernetes single-PVC trial
 
 Use the [single-file Kubernetes manifest](../examples/drive9-migration/kubernetes.yaml)
 for one existing EBS PVC on one Node. Before applying it:
 
-1. Set the Drive9 endpoint and Owner API key for an empty test Space.
+1. Set the Drive9 endpoint and one Owner API key for each empty test Space.
 2. Replace `volume_id` with the EBS PV's `.spec.csi.volumeHandle`.
 3. Set both `node_name` and `kubernetes.io/hostname` to the Node that owns the
    PVC.
@@ -227,7 +238,7 @@ Inspect each Job independently:
 
 ```text
 drive9-migration status --output json
-drive9-migration diff --output jsonl
+drive9-migration diff --job-id <job-id> --output jsonl
 ```
 
 Proceed only when the latest complete round reports `ready_for_rollout=true`,
@@ -271,8 +282,8 @@ T1 is an external customer signal that every business Pod runs the dual-write
 version; it is not a Migration phase. For every Job, invoke:
 
 ```text
-drive9-migration verify-full
-drive9-migration status --output json
+drive9-migration verify-full --job-id <job-id>
+drive9-migration status --job-id <job-id> --output json
 ```
 
 From the Kubernetes Worker, run:
@@ -280,7 +291,7 @@ From the Kubernetes Worker, run:
 ```bash
 kubectl -n "$migration_namespace" exec daemonset/drive9-migration \
   -c drive9-migration -- \
-  /drive9-migration verify-full
+  /drive9-migration verify-full --job-id <job-id>
 kubectl -n "$migration_namespace" exec daemonset/drive9-migration \
   -c drive9-migration -- \
   /drive9-migration status --output json
@@ -331,7 +342,7 @@ an exact unique ID-set match plus completed fencing:
   expected_job_ids_json="$(
     kubectl -n "$migration_namespace" get configmap drive9-migration \
       -o jsonpath='{.data.config\.yaml}' | \
-      yq -o=json '.jobs | map(.volume_id)'
+      yq -o=json '[.ebs_sources[].jobs[].job_id]'
   )"
   kubectl drive9 migration status \
     -n "$migration_namespace" \
@@ -360,8 +371,8 @@ a current passed full verification, a converged latest round, no Attention, and
 no grace, retry, pending, or in-flight repair work:
 
 ```text
-drive9-migration prepare-drive9-cutover
-drive9-migration status --output json
+drive9-migration prepare-drive9-cutover --job-id <job-id>
+drive9-migration status --job-id <job-id> --output json
 ```
 
 The Worker drains in-flight Migration work, persists Fence Intent, completes
@@ -372,7 +383,7 @@ rollback, phase regression, or unfence.
 ## Retained control data
 
 V1 has no automatic cleanup or cleanup command. Keep
-`/.drive9-migration/jobs/<volume_id>/` while fence recovery might be needed.
+`/.drive9-migration/jobs/<job_id>/` while fence recovery might be needed.
 Manual deletion is allowed only after every Job is `CUTOVER_READY`, the
 Migration Worker has been permanently removed or disabled, and recovery data
 is no longer needed. Use approved Drive9 administration tooling and target only

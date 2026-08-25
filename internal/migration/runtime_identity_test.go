@@ -2,6 +2,8 @@ package migration
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -47,6 +49,50 @@ func TestExtractEBSVolumeIDRequiresExactToken(t *testing.T) {
 		if got := extractEBSVolumeID(tc.serial); got != tc.want {
 			t.Fatalf("extractEBSVolumeID(%q)=%q, want %q", tc.serial, got, tc.want)
 		}
+	}
+}
+
+func TestObserveJobSourceUsesRealSubpathDirectoryAndRejectsSymlinkRoot(t *testing.T) {
+	ebsRoot := t.TempDir()
+	subpath := filepath.Join(ebsRoot, "A")
+	if err := os.Mkdir(subpath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	startup := &Startup{Job: Job{
+		VolumeID: "vol-001", EBSRoot: ebsRoot, Subpath: "/A",
+		Source: SourceConfig{Type: "ebs", Root: subpath},
+	}}
+	identity, err := observeJobSource(startup, testMountedSourceProbe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := observeSourceRoot(subpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.Device != want.Device || identity.Inode != want.Inode {
+		t.Fatalf("identity=%+v want=%+v", identity, want)
+	}
+	symlink := filepath.Join(ebsRoot, "link")
+	if err := os.Symlink(subpath, symlink); err != nil {
+		t.Fatal(err)
+	}
+	startup.Job.Subpath, startup.Job.Source.Root = "/link", symlink
+	if _, err := observeJobSource(startup, testMountedSourceProbe); err == nil {
+		t.Fatal("symlink subpath root accepted")
+	}
+	outside := t.TempDir()
+	if err := os.Mkdir(filepath.Join(outside, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ancestor := filepath.Join(ebsRoot, "ancestor")
+	if err := os.Symlink(outside, ancestor); err != nil {
+		t.Fatal(err)
+	}
+	startup.Job.Subpath = "/ancestor/nested"
+	startup.Job.Source.Root = filepath.Join(ancestor, "nested")
+	if _, err := observeJobSource(startup, testMountedSourceProbe); err == nil {
+		t.Fatal("ancestor symlink escape accepted")
 	}
 }
 

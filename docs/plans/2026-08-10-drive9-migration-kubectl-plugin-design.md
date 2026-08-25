@@ -29,8 +29,9 @@ batch-aware and does not introduce a Kubernetes or Drive9 control plane.
    a selected namespace, or all namespaces.
 2. Optionally select one migration batch through
    `app.kubernetes.io/instance`.
-3. Query each existing Worker through bounded concurrent `kubectl exec` calls to
-   its existing local `status --output json` command.
+3. Query each existing Worker Pod through bounded concurrent `kubectl exec`
+   calls to its local `status --output json` command and expand the returned EBS
+   envelope into one row per Job.
 4. Render deterministic `table`, `wide`, and aggregate `json` output.
 5. Derive a concise per-Job display status and one observed-status summary per
    `(namespace, batch)`.
@@ -48,7 +49,7 @@ batch-aware and does not introduce a Kubernetes or Drive9 control plane.
 3. Watch mode, TUI, Web UI, history, persistence, alerting, or notifications.
 4. CRDs, Controllers, Operators, Services, network APIs, Kubernetes Conditions,
    or new RBAC resources.
-5. Changes to the Worker status wire contract or the Worker image.
+5. Additional Worker status mutations or Worker-image lifecycle management.
 6. Krew publication or a separate plugin distribution service.
 
 ### 2.3 Accepted completeness boundary
@@ -72,8 +73,8 @@ metadata:
 
 `app.kubernetes.io/instance` is the customer-selected migration batch name.
 The Worker container name is `drive9-migration`. The plugin does not require a
-per-Job label because `volume_id` is returned by the Worker status payload at
-`internal/migration/control.go:79`.
+per-Job label because every nested status item returns explicit `job_id` and
+`volume_id` fields from `internal/migration/control.go`.
 
 The fixed discovery selector is:
 
@@ -117,13 +118,14 @@ kubectl-drive9-migration
   -> validate labels and Kubernetes Pod state
   -> at most 8 concurrent kubectl exec calls
        /drive9-migration status --output json
-  -> validate and parse the Worker payload
+  -> validate and parse the multi-Job EBS Worker payload
+  -> expand one Pod into Job rows
   -> derive per-Job display states and batch summaries
   -> stable sort
   -> render table, wide, or JSON
 ```
 
-Every exec has a 10-second timeout. Commands are executed with argument arrays,
+Every Pod exec has a 10-second timeout. Commands are executed with argument arrays,
 never through a shell. The plugin uses a small injected command function for
 unit tests, following the existing CLI dependency-injection pattern at
 `cmd/drive9-migration/main.go:26`; it does not introduce a general command
@@ -132,7 +134,7 @@ runner interface.
 ## 6. Display-state derivation
 
 Kubernetes availability is evaluated before Worker state. After all responses
-are collected, duplicate `(namespace, batch, volume_id)` results are marked as
+are collected, duplicate `(namespace, batch, job_id)` results are marked as
 ambiguous.
 
 | Display status | Derivation |
@@ -218,7 +220,7 @@ not replace external T1 confirmation.
 ## 11. Acceptance criteria
 
 1. Zero-argument status discovers all correctly labeled Worker Pods in the
-   current kubectl namespace and renders one row per Pod.
+   current kubectl namespace and renders one row per reported Job.
 2. Namespace, all-namespace, batch, context, kubeconfig, and output flags produce
    the exact child kubectl arguments required by this design.
 3. No more than eight exec calls run concurrently, and one hung Pod is cancelled

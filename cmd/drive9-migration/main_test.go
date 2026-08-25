@@ -26,20 +26,20 @@ func testDependencies(t *testing.T) (dependencies, *[]string) {
 			}
 		},
 		credentialRoot: "/secret-root",
-		load: func(configPath, nodeName, phase, secretRoot string, highest migration.Phase) (*migration.Startup, error) {
+		load: func(configPath, nodeName, phase, secretRoot string, highest migration.Phase) (*migration.RuntimeStartup, error) {
 			calls = append(calls, "load:"+configPath+":"+nodeName+":"+phase+":"+secretRoot+":"+string(highest))
-			return &migration.Startup{Job: migration.Job{VolumeID: "vol-001"}, Phase: migration.PhaseSyncing, ConfigHash: "hash"}, nil
+			return &migration.RuntimeStartup{Source: migration.EBSSourceConfig{VolumeID: "vol-001"}, Phase: migration.PhaseSyncing}, nil
 		},
-		preflight: func(context.Context, *migration.Startup) (migration.PreflightResult, error) {
-			calls = append(calls, "preflight")
-			return migration.PreflightResult{VolumeID: "vol-001", RequiredCapabilities: true}, nil
+		plan: func(context.Context, *migration.RuntimeStartup) (migration.PlanResult, error) {
+			calls = append(calls, "plan")
+			return migration.PlanResult{VolumeID: "vol-001"}, nil
 		},
-		start: func(context.Context, *migration.Startup) error {
+		start: func(context.Context, *migration.RuntimeStartup) error {
 			calls = append(calls, "run")
 			return nil
 		},
 		control: func(_ context.Context, request controlRequest) error {
-			calls = append(calls, "control:"+request.Command+":"+request.Output+":"+request.Type)
+			calls = append(calls, "control:"+request.Command+":"+request.JobID+":"+request.Output+":"+request.Type)
 			return nil
 		},
 	}, &calls
@@ -53,10 +53,10 @@ func TestExecuteDispatchesSixCommands(t *testing.T) {
 	}{
 		{name: "plan", args: []string{"plan", "-f", "/config.yaml"}, wantCall: "load:/config.yaml:node-a:SYNCING:/secret-root:"},
 		{name: "run", args: []string{"run", "-f", "/config.yaml"}, wantCall: "run"},
-		{name: "status", args: []string{"status", "--output", "json"}, wantCall: "control:status:json:"},
-		{name: "diff", args: []string{"diff", "--type", "content", "--limit", "10", "--output", "jsonl"}, wantCall: "control:diff:jsonl:content"},
-		{name: "verify", args: []string{"verify-full"}, wantCall: "control:verify-full::"},
-		{name: "cutover", args: []string{"prepare-drive9-cutover"}, wantCall: "control:prepare-drive9-cutover::"},
+		{name: "status", args: []string{"status", "--output", "json"}, wantCall: "control:status::json:"},
+		{name: "diff", args: []string{"diff", "--job-id", "job-a", "--type", "content", "--limit", "10", "--output", "jsonl"}, wantCall: "control:diff:job-a:jsonl:content"},
+		{name: "verify", args: []string{"verify-full", "--job-id", "job-a"}, wantCall: "control:verify-full:job-a::"},
+		{name: "cutover", args: []string{"prepare-drive9-cutover", "--job-id", "job-a"}, wantCall: "control:prepare-drive9-cutover:job-a::"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			deps, calls := testDependencies(t)
@@ -67,8 +67,8 @@ func TestExecuteDispatchesSixCommands(t *testing.T) {
 			if !containsCall(*calls, tc.wantCall) {
 				t.Fatalf("calls=%v, want %q", *calls, tc.wantCall)
 			}
-			if (tc.name == "plan" || tc.name == "run") && !containsCall(*calls, "preflight") {
-				t.Fatalf("calls=%v, startup command skipped preflight", *calls)
+			if tc.name == "plan" && !containsCall(*calls, "plan") {
+				t.Fatalf("calls=%v, plan command skipped planning", *calls)
 			}
 			if strings.Contains(stdout.String(), "secret") {
 				t.Fatalf("stdout leaked secret: %q", stdout.String())
@@ -97,13 +97,15 @@ func TestExecuteExitCodes(t *testing.T) {
 		{name: "unknown command", args: []string{"unknown"}, want: exitFailure},
 		{name: "invalid phase", args: []string{"plan", "-f", "/config.yaml"}, err: migration.ErrInvalidPhase, want: exitIllegalOperation},
 		{name: "configuration", args: []string{"plan", "-f", "/config.yaml"}, err: errors.New("bad config"), want: exitFailure},
-		{name: "illegal action", args: []string{"verify-full"}, err: migration.ErrIllegalAction, want: exitIllegalOperation},
+		{name: "illegal action", args: []string{"verify-full", "--job-id", "job-a"}, err: migration.ErrIllegalAction, want: exitIllegalOperation},
 		{name: "socket unavailable", args: []string{"status", "--output", "json"}, err: migration.ErrControlUnavailable, want: exitControlUnavailable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			deps, _ := testDependencies(t)
 			if len(tc.args) > 0 && (tc.args[0] == "plan" || tc.args[0] == "run") {
-				deps.load = func(string, string, string, string, migration.Phase) (*migration.Startup, error) { return nil, tc.err }
+				deps.load = func(string, string, string, string, migration.Phase) (*migration.RuntimeStartup, error) {
+					return nil, tc.err
+				}
 			} else if tc.err != nil {
 				deps.control = func(context.Context, controlRequest) error { return tc.err }
 			}
@@ -120,10 +122,10 @@ func TestExecuteRejectsInvalidCommandOptions(t *testing.T) {
 		{"plan"},
 		{"run", "-f", "config", "extra"},
 		{"status", "--output", "yaml"},
-		{"diff", "--output", "json"},
-		{"diff", "--output", "jsonl", "--limit", "-1"},
-		{"verify-full", "extra"},
-		{"prepare-drive9-cutover", "extra"},
+		{"diff", "--job-id", "job-a", "--output", "json"},
+		{"diff", "--job-id", "job-a", "--output", "jsonl", "--limit", "-1"},
+		{"verify-full"},
+		{"prepare-drive9-cutover"},
 	} {
 		if code := execute(args, io.Discard, io.Discard, deps); code != exitFailure {
 			t.Fatalf("args=%v exit=%d", args, code)
@@ -131,23 +133,23 @@ func TestExecuteRejectsInvalidCommandOptions(t *testing.T) {
 	}
 }
 
-func TestExecuteHelpAndPreflightFailure(t *testing.T) {
+func TestExecuteHelpAndPlanFailure(t *testing.T) {
 	deps, _ := testDependencies(t)
 	var output bytes.Buffer
 	if code := execute([]string{"--help"}, &output, io.Discard, deps); code != exitSuccess || !strings.Contains(output.String(), "drive9-migration") {
 		t.Fatalf("help exit=%d output=%q", code, output.String())
 	}
-	deps.preflight = func(context.Context, *migration.Startup) (migration.PreflightResult, error) {
-		return migration.PreflightResult{}, migration.ErrPreflight
+	deps.plan = func(context.Context, *migration.RuntimeStartup) (migration.PlanResult, error) {
+		return migration.PlanResult{VolumeID: "vol-001"}, migration.ErrPlanFailed
 	}
 	if code := execute([]string{"plan", "-f", "/config.yaml"}, io.Discard, io.Discard, deps); code != exitFailure {
-		t.Fatalf("preflight failure exit=%d", code)
+		t.Fatalf("plan failure exit=%d", code)
 	}
-	deps.preflight = func(context.Context, *migration.Startup) (migration.PreflightResult, error) {
-		return migration.PreflightResult{}, errors.Join(migration.ErrPreflight, migration.ErrInvalidPhase)
+	deps.load = func(string, string, string, string, migration.Phase) (*migration.RuntimeStartup, error) {
+		return nil, errors.Join(migration.ErrPreflight, migration.ErrInvalidPhase)
 	}
 	if code := execute([]string{"run", "-f", "/config.yaml"}, io.Discard, io.Discard, deps); code != exitIllegalOperation {
-		t.Fatalf("illegal preflight phase exit=%d", code)
+		t.Fatalf("illegal startup phase exit=%d", code)
 	}
 }
 
