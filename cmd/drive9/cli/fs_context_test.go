@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -222,43 +223,132 @@ func TestExplicitContextUsesResolverConfigSnapshot(t *testing.T) {
 	}
 }
 
-func TestCpRejectsMixedExplicitAndCurrentRemoteContexts(t *testing.T) {
+func TestCpStreamsMixedExplicitAndCurrentRemoteContexts(t *testing.T) {
 	withIsolatedHome(t)
 
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "5")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write([]byte("hello"))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer src.Close()
+
+	var putPath string
+	dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/status" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": 1 << 20})
+			return
+		}
+		if r.Method == http.MethodPut {
+			putPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 1})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer dst.Close()
+
 	cfg := loadConfig()
-	if _, err := ctxAdd(cfg, "current", &Context{Type: PrincipalOwner, APIKey: "current-key", Server: "https://current.example"}); err != nil {
+	if _, err := ctxAdd(cfg, "current", &Context{Type: PrincipalOwner, APIKey: "current-key", Server: dst.URL}); err != nil {
 		t.Fatalf("ctxAdd current: %v", err)
 	}
-	if _, err := ctxAdd(cfg, "prod", &Context{Type: PrincipalOwner, APIKey: "prod-key", Server: "https://prod.example"}); err != nil {
+	if _, err := ctxAdd(cfg, "prod", &Context{Type: PrincipalOwner, APIKey: "prod-key", Server: src.URL}); err != nil {
 		t.Fatalf("ctxAdd prod: %v", err)
 	}
 	if err := saveConfig(cfg); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
 
-	err := Cp(client.New("https://current.example", "current-key"), []string{"prod:/a", ":/b"})
-	if err == nil || !strings.Contains(err.Error(), "cross-context copy not supported") {
-		t.Fatalf("Cp error = %v, want cross-context rejection", err)
+	if err := Cp(client.New(dst.URL, "current-key"), []string{"prod:/a", ":/b"}); err != nil {
+		t.Fatalf("Cp cross-context stream: %v", err)
+	}
+	if putPath != "/v1/fs/b" {
+		t.Fatalf("dst PUT path = %q, want /v1/fs/b", putPath)
 	}
 }
 
-func TestCpRecursiveRejectsMixedExplicitAndCurrentRemoteContexts(t *testing.T) {
+func TestCpRecursiveStreamsMixedExplicitAndCurrentRemoteContexts(t *testing.T) {
 	withIsolatedHome(t)
 
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Query().Get("list") == "1" {
+			w.Header().Set("Content-Type", "application/json")
+			entries := []map[string]any{{"name": "f", "isDir": false, "size": 5}}
+			if strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/dir") {
+				entries = []map[string]any{
+					{"name": "f", "isDir": false, "size": 5},
+					{"name": "sub", "isDir": true, "size": 0},
+				}
+			}
+			if strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/sub") {
+				entries = []map[string]any{{"name": "n.txt", "isDir": false, "size": 6}}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries})
+			return
+		}
+		if r.Method == http.MethodHead {
+			isDir := strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/dir") ||
+				strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/sub")
+			w.Header().Set("X-Dat9-IsDir", fmt.Sprintf("%t", isDir))
+			if !isDir {
+				size := "5"
+				if strings.HasSuffix(r.URL.Path, "/n.txt") {
+					size = "6"
+				}
+				w.Header().Set("Content-Length", size)
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodGet {
+			if strings.HasSuffix(r.URL.Path, "/n.txt") {
+				_, _ = w.Write([]byte("hello!"))
+				return
+			}
+			_, _ = w.Write([]byte("hello"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer src.Close()
+
+	dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/status" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": 1 << 20})
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"revision": 1})
+	}))
+	defer dst.Close()
+
 	cfg := loadConfig()
-	if _, err := ctxAdd(cfg, "current", &Context{Type: PrincipalOwner, APIKey: "current-key", Server: "https://current.example"}); err != nil {
+	if _, err := ctxAdd(cfg, "current", &Context{Type: PrincipalOwner, APIKey: "current-key", Server: dst.URL}); err != nil {
 		t.Fatalf("ctxAdd current: %v", err)
 	}
-	if _, err := ctxAdd(cfg, "prod", &Context{Type: PrincipalOwner, APIKey: "prod-key", Server: "https://prod.example"}); err != nil {
+	if _, err := ctxAdd(cfg, "prod", &Context{Type: PrincipalOwner, APIKey: "prod-key", Server: src.URL}); err != nil {
 		t.Fatalf("ctxAdd prod: %v", err)
 	}
 	if err := saveConfig(cfg); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
 
-	err := Cp(client.New("https://current.example", "current-key"), []string{"-r", "prod:/dir", ":/dir"})
-	if err == nil || !strings.Contains(err.Error(), "cross-context copy not supported") {
-		t.Fatalf("Cp recursive error = %v, want cross-context rejection", err)
+	if err := Cp(client.New(dst.URL, "current-key"), []string{"-r", "prod:/dir", ":/dir"}); err != nil {
+		t.Fatalf("Cp -r cross-context stream: %v", err)
 	}
 }
 

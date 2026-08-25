@@ -20,6 +20,11 @@ func Cat(c *client.Client, args []string) error {
 }
 
 func catWithWriter(c *client.Client, args []string, out io.Writer) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	fs := flag.NewFlagSet("fs cat", flag.ContinueOnError)
 	offset := fs.Int64("offset", 0, "byte offset for a positional read; requires --length")
 	length := fs.Int64("length", 0, "byte length for a positional read; requires --offset")
@@ -38,7 +43,7 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 	})
 
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 fs cat [--offset N --length N] <path>")
+		return fmt.Errorf("usage: drive9 fs cat [--offset N --length N] [--auth=local|server] <path>")
 	}
 	if offsetSet != lengthSet {
 		return fmt.Errorf("--offset and --length must be provided together")
@@ -50,18 +55,23 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 		return fmt.Errorf("--length must be >= 0")
 	}
 	path := fs.Arg(0)
-	var err error
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
+	}
+	ctx := context.Background()
+	if h.Loc.Kind == KindObject {
+		var cancel context.CancelFunc
+		ctx, cancel = withObjectOpTimeout(ctx)
+		defer cancel()
 	}
 	var (
 		rc io.ReadCloser
 	)
 	if offsetSet {
-		rc, err = c.ReadStreamRange(context.Background(), path, *offset, *length)
+		rc, err = h.Backend.OpenReadRange(ctx, h.Loc, *offset, *length)
 	} else {
-		rc, err = c.ReadStream(context.Background(), path)
+		rc, err = h.Backend.OpenRead(ctx, h.Loc)
 	}
 	if err != nil {
 		return err

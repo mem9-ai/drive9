@@ -22,7 +22,15 @@ func Symlink(c *client.Client, args []string) error {
 	}
 	target := args[0]
 	linkPath := args[1]
-	linkRP, linkIsRemote := ParseRemote(linkPath)
+	linkLoc, err := Parse(linkPath)
+	if err != nil {
+		return err
+	}
+	if linkLoc.Kind == KindObject {
+		return fmt.Errorf("symlink: object-store URIs are not supported")
+	}
+	linkLoc = promoteBareFSArg(linkLoc)
+	linkRP, linkIsRemote := locationAsRemotePath(linkLoc)
 
 	target, err = symlinkTargetForCLI(target, linkRP, linkIsRemote)
 	if err != nil {
@@ -39,8 +47,19 @@ func Symlink(c *client.Client, args []string) error {
 }
 
 func symlinkTargetForCLI(target string, linkRP RemotePath, linkIsRemote bool) (string, error) {
-	targetRP, targetIsRemote := ParseRemote(target)
+	targetLoc, err := Parse(target)
+	if err != nil {
+		return "", err
+	}
+	if targetLoc.Kind == KindObject {
+		return "", fmt.Errorf("symlink: object-store target URIs are not supported")
+	}
+	targetLoc = promoteBareFSArg(targetLoc)
+	targetRP, targetIsRemote := locationAsRemotePath(targetLoc)
 	if !targetIsRemote {
+		if targetLoc.Kind == KindLocal {
+			return targetLoc.Raw, nil
+		}
 		return target, nil
 	}
 	if targetRP.Context == "" {

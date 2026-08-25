@@ -10,6 +10,11 @@ import (
 
 // Chmod updates the permission bits of a remote file.
 func Chmod(c *client.Client, args []string) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	layerRef, args, err := parseLayerFlag(args)
 	if err != nil {
 		return err
@@ -22,10 +27,14 @@ func Chmod(c *client.Client, args []string) error {
 	if err != nil {
 		return fmt.Errorf("invalid mode %q: %w", modeStr, err)
 	}
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
 	}
+	if err := requireCapOnHandle(h, CapChmod, "chmod"); err != nil {
+		return err
+	}
+	c, path = h.Client, h.Path
 	if layerRef != "" {
 		return chmodLayerPath(context.Background(), c, layerRef, path, uint32(mode64))
 	}

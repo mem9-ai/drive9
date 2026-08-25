@@ -94,17 +94,29 @@ func newFSClientForContext(name string) (*client.Client, error) {
 }
 
 func fsClientForRemoteArg(defaultClient *client.Client, raw string) (*client.Client, string, string, bool, error) {
-	rp, isRemote := ParseRemote(raw)
-	if !isRemote {
+	loc, err := Parse(raw)
+	if err != nil {
+		return nil, "", "", false, err
+	}
+	if loc.Kind == KindObject {
+		return nil, "", "", true, objectSchemeError(loc)
+	}
+	if loc.Kind == KindStdin {
 		return defaultClient, raw, "", false, nil
 	}
-	if rp.Context == "" {
-		return defaultClient, rp.Path, "", true, nil
+	if loc.Kind == KindLocal {
+		loc = promoteBareFSArg(loc)
+		if loc.Kind == KindLocal {
+			// relative / C:/ : same as legacy ParseRemote ok=false
+			return defaultClient, raw, "", false, nil
+		}
 	}
-
-	c, err := newFSClientForContext(rp.Context)
+	if loc.Context == "" {
+		return defaultClient, loc.Path, "", true, nil
+	}
+	c, err := newFSClientForContext(loc.Context)
 	if err != nil {
 		return nil, "", "", true, err
 	}
-	return c, rp.Path, rp.Context, true, nil
+	return c, loc.Path, loc.Context, true, nil
 }

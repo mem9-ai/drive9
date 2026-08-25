@@ -505,6 +505,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/layers", business)
 	mux.Handle("/v1/layers/", business)
 	mux.Handle("/v1/layer-checkpoints/", business)
+	mux.Handle("/v1/object-credentials", business)
 	// Vault management API goes through tenant auth.
 	mux.Handle("/v1/vault/secrets", business)
 	mux.Handle("/v1/vault/secrets/", business)
@@ -532,6 +533,8 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/admin/tenant-pool", s.adminTenantPoolHandler())
 	mux.Handle("/v1/admin/tenants", s.adminTenantsRootHandler())
 	mux.Handle("/v1/admin/tenants/", s.adminTenantsItemHandler())
+	mux.Handle("/v1/admin/object-backends", s.adminObjectBackendsHandler())
+	mux.Handle("/v1/admin/object-backends/", s.adminObjectBackendsHandler())
 	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
@@ -1565,6 +1568,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleGitWorkspaces(w, r)
 	case r.URL.Path == "/v1/layers" || strings.HasPrefix(r.URL.Path, "/v1/layers/") || strings.HasPrefix(r.URL.Path, "/v1/layer-checkpoints/"):
 		s.handleFSLayers(w, r)
+	case r.URL.Path == "/v1/object-credentials":
+		s.handleObjectCredentials(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
@@ -1594,9 +1599,9 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 // chmod (POST /v1/fs/<path>?chmod=1) is explicitly NOT and never will be in
 // the scoped allowlist — chmod escalates ACLs and is owner-token-only.
 //
-// SQL, fork, events, journals, vault are permanently out of scope for
-// workspace zones (they don't take a path argument, so the prefix model
-// doesn't apply); these stay default-deny here.
+// SQL, fork, events, journals, vault, and object-credentials are
+// permanently out of scope for workspace zones (they don't take a path
+// argument, so the prefix model doesn't apply); these stay default-deny here.
 //
 // The GET branch uses an **action-specific** accept-list (per @adversary-1
 // msg 00efe734 / @adversary-2 msg cbedd30a): the chosen action selector

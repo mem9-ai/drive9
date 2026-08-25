@@ -15,6 +15,13 @@
       "owner_hint": "cli",
       "failure_class": "correctness"
     },
+    "object-store-smoke": {
+      "title": "Object-store CLI/mount smoke",
+      "product_area": "cli",
+      "product_promise": "s3:// fs cp/ls and object mounts work against S3-compatible storage",
+      "owner_hint": "cli",
+      "failure_class": "correctness"
+    },
     "layer-fs-smoke": {
       "title": "Layer FS smoke",
       "product_area": "filesystem",

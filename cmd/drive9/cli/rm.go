@@ -13,6 +13,11 @@ import (
 //	drive9 fs rm -r /path/to/dir/
 //	drive9 fs rm --recursive :/path/to/dir/
 func Rm(c *client.Client, args []string) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	layerRef, args, err := parseLayerFlag(args)
 	if err != nil {
 		return err
@@ -38,19 +43,31 @@ func Rm(c *client.Client, args []string) error {
 			}
 		}
 		if path != "" {
-			return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] <path>")
+			return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] [--auth=local|server] <path>")
 		}
 		path = arg
 	}
 
 	if path == "" {
-		return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] <path>")
+		return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] [--auth=local|server] <path>")
 	}
 
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
-	if err != nil {
-		return err
+	h, herr := fsHandleForArg(c, path)
+	if herr != nil {
+		return herr
 	}
+	if h.Loc.Kind == KindObject {
+		if layerRef != "" {
+			return fmt.Errorf("--layer is drive9-only")
+		}
+		ctx, cancel := withObjectOpTimeout(context.Background())
+		defer cancel()
+		if err := h.Backend.Remove(ctx, h.Loc, recursive); err != nil {
+			return err
+		}
+		return nil
+	}
+	c, path = h.Client, h.Path
 	if layerRef != "" {
 		return whiteoutLayerPath(context.Background(), c, layerRef, path, recursive)
 	}

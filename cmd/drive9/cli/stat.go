@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -17,6 +18,11 @@ import (
 //	drive9 fs stat -o json /path/to/file
 //	drive9 fs stat :/path/to/file
 func Stat(c *client.Client, args []string) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	outputFormat := "text"
 	path := ""
 	for i := 0; i < len(args); i++ {
@@ -24,7 +30,7 @@ func Stat(c *client.Client, args []string) error {
 		switch arg {
 		case "-o", "--output":
 			if i+1 >= len(args) {
-				return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+				return fmt.Errorf("usage: drive9 fs stat [-o text|json] [--auth=local|server] <path>")
 			}
 			i++
 			outputFormat = args[i]
@@ -33,22 +39,50 @@ func Stat(c *client.Client, args []string) error {
 			}
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+				return fmt.Errorf("usage: drive9 fs stat [-o text|json] [--auth=local|server] <path>")
 			}
 			if path != "" {
-				return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+				return fmt.Errorf("usage: drive9 fs stat [-o text|json] [--auth=local|server] <path>")
 			}
 			path = arg
 		}
 	}
 	if path == "" {
-		return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+		return fmt.Errorf("usage: drive9 fs stat [-o text|json] [--auth=local|server] <path>")
 	}
-	var err error
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
 	}
+	if h.Loc.Kind == KindObject {
+		ctx, cancel := withObjectOpTimeout(context.Background())
+		defer cancel()
+		info, err := h.Backend.Stat(ctx, h.Loc)
+		if err != nil {
+			return err
+		}
+		if outputFormat == "json" {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(info)
+		}
+		kind := "file"
+		if info.IsDir {
+			kind = "dir"
+		}
+		fmt.Printf("path:\t%s\nkind:\t%s\nsize:\t%d\n", h.Loc.Raw, kind, info.Size)
+		if !info.Mtime.IsZero() {
+			fmt.Printf("mtime:\t%s\n", info.Mtime.Format(time.RFC3339))
+		}
+		if info.ETag != "" {
+			fmt.Printf("etag:\t%s\n", info.ETag)
+		}
+		if info.ContentType != "" {
+			fmt.Printf("content-type:\t%s\n", info.ContentType)
+		}
+		return nil
+	}
+	c, path = h.Client, h.Path
 	m, err := c.StatMetadataCompat(path)
 	if err != nil {
 		return err

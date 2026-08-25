@@ -47,6 +47,7 @@ type Config struct {
 	Server        string
 	RemoteRoot    string
 	Profile       string
+	MountKind     string
 	LocalRoot     string
 	PackPaths     []string
 	// Adopt-by-monitor: poll an existing worker without waitpid (orphan recovery).
@@ -741,7 +742,11 @@ func (s *supervisor) writeAuthoritativeProcessState() error {
 	}
 	// Component / kind always reflect this supervisor (never keep stale vault/webdav).
 	base.Component = "drive9-fuse-supervisor"
-	base.MountKind = mountstate.MountKindFUSE
+	if s.cfg.MountKind != "" {
+		base.MountKind = s.cfg.MountKind
+	} else {
+		base.MountKind = mountstate.MountKindFUSE
+	}
 	if base.StartedAt == "" {
 		base.StartedAt = s.cfg.Now().UTC().Format(time.RFC3339Nano)
 	}

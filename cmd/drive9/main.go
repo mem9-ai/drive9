@@ -449,8 +449,8 @@ func usage(code int) {
 			"                         restore a drive9 pack archive to a local overlay\n"+
 			"  profile show [profile]\n"+
 			"                         print mount profile configuration\n"+
-			"  mount [flags] [:/remote] <mountpoint>\n"+
-			"                         mount drive9 filesystem (background FUSE supervised by default on Linux/macOS)\n"+
+			"  mount [flags] [:/remote|s3://bucket/prefix/|gs://bucket/prefix/|az://container/prefix/] <mountpoint>\n"+
+			"                         mount drive9 or an object prefix (background FUSE by default)\n"+
 			"  mount drain [--timeout duration] [--json] <mountpoint>\n"+
 			"                         drain pending writes for a live FUSE mount\n"+
 			"  mount status [--json] <mountpoint>\n"+
@@ -482,7 +482,9 @@ func fsUsage(code int) {
 
 commands:
   cp [flags] <src> <dst>
-                       copy files between local, remote, stdin, and stdout
+                       copy files between local, drive9, stdin/stdout, and
+                       object stores (s3://, cos://, tos://, oss://, gs://, az://)
+                       :/path is short for drive9://path
     --resume          resume an incomplete local-to-remote upload
     --append          append a local file to a remote file
     --tag <key=value> set file tag (repeatable, upload only; not with --append;

@@ -31,6 +31,7 @@ type Config struct {
 	Server              string
 	RemoteRoot          string
 	Profile             string
+	MountKind           string
 	LocalRoot           string
 	PackPaths           []string
 	Adopt               bool

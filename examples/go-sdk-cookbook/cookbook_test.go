@@ -424,6 +424,34 @@ func ExampleClient_quota() {
 		PublicKey:  tidbCloudPublicKey,
 		PrivateKey: tidbCloudPrivateKey,
 	})
+
+	_, _ = credentialClient.AdminListObjectBackends(ctx, tidbCloudPublicKey, tidbCloudPrivateKey)
+	created, err := credentialClient.AdminCreateObjectBackend(ctx, drive9.AdminObjectBackendCreateRequest{
+		PublicKey:      tidbCloudPublicKey,
+		PrivateKey:     tidbCloudPrivateKey,
+		Scheme:         "s3",
+		Bucket:         "example",
+		CredentialKind: "role",
+		RoleARN:        "arn:aws:iam::123:role/drive9-object",
+		STSEndpoint:    "https://sts.amazonaws.com",
+		MaxSessionTTL:  3600,
+	})
+	if err == nil && created != nil {
+		_ = created.ID
+		_, _ = credentialClient.AdminGetObjectBackend(ctx, created.ID, tidbCloudPublicKey, tidbCloudPrivateKey)
+		region := "us-west-2"
+		secret := "rotated-secret"
+		_, _ = credentialClient.AdminUpdateObjectBackend(ctx, created.ID, drive9.AdminObjectBackendUpdateRequest{
+			PublicKey: tidbCloudPublicKey, PrivateKey: tidbCloudPrivateKey, Region: &region, SecretAccessKey: &secret,
+		})
+		_ = credentialClient.AdminDeleteObjectBackend(ctx, created.ID, tidbCloudPublicKey, tidbCloudPrivateKey)
+	}
+	_, _ = credentialClient.AdminGetObjectNamespace(ctx, tenantID, tidbCloudPublicKey, tidbCloudPrivateKey)
+	_, _ = credentialClient.AdminSetObjectNamespace(ctx, tenantID, "customer-prefix", tidbCloudPublicKey, tidbCloudPrivateKey)
+	_ = credentialClient.AdminClearObjectNamespace(ctx, tenantID, tidbCloudPublicKey, tidbCloudPrivateKey)
+
+	fsClient := drive9.New(serverURL, "api-key")
+	_, _ = fsClient.MintObjectCredentials(ctx, "s3://example/customer-prefix/a.txt", false)
 }
 
 func ExampleClient_eventsLayersGitAndJournal() {
@@ -609,6 +637,14 @@ var coveredClientMethods = map[string]bool{
 	"AdminSetTenantQuota":                  true,
 	"AdminGetTenantExtractConfig":          true,
 	"AdminSetTenantExtractConfig":          true,
+	"AdminClearObjectNamespace":            true,
+	"AdminCreateObjectBackend":             true,
+	"AdminDeleteObjectBackend":             true,
+	"AdminGetObjectBackend":                true,
+	"AdminGetObjectNamespace":              true,
+	"AdminListObjectBackends":              true,
+	"AdminUpdateObjectBackend":             true,
+	"AdminSetObjectNamespace":              true,
 	"AdminUpdateTenantPool":                true,
 	"AppendJournalEntries":                 true,
 	"AppendStream":                         true,
@@ -674,6 +710,7 @@ var coveredClientMethods = map[string]bool{
 	"ListReadableVaultSecrets":             true,
 	"ListVaultSecrets":                     true,
 	"MaxUploadBytes":                       true,
+	"MintObjectCredentials":                true,
 	"Mkdir":                                true,
 	"MkdirCtx":                             true,
 	"NewStreamWriter":                      true,

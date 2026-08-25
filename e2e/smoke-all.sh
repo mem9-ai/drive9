@@ -7,8 +7,8 @@
 #    and reuse that tenant. The key is re-exported so run_case cannot drop it.
 #
 # Default set matches `.github/workflows/local-e2e.yml` PR steps:
-#  api, cli, layer-fs, fuse-release-gate, fuse-patch-storage-class, git-ops,
-#  git-workspace-ondemand, pack, fuse-crash-recovery, fuse-supervision,
+#  api, cli, object-store, layer-fs, fuse-release-gate, fuse-patch-storage-class,
+#  git-ops, git-workspace-ondemand, pack, fuse-crash-recovery, fuse-supervision,
 #  fuse-write-perf-budget.
 #
 # Subset knobs:
@@ -32,6 +32,11 @@ RUN_API_ONLY="${RUN_API_ONLY:-0}"
 RUN_FUSE_SMOKE="${RUN_FUSE_SMOKE:-1}"
 RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-$RUN_FUSE_SMOKE}"
 export RUN_LAYER_FUSE_SMOKE
+if [ "$RUN_API_ONLY" = "1" ]; then
+  RUN_OBJECT_STORE_SMOKE="${RUN_OBJECT_STORE_SMOKE:-0}"
+else
+  RUN_OBJECT_STORE_SMOKE="${RUN_OBJECT_STORE_SMOKE:-1}"
+fi
 RUN_JOURNAL_SMOKE="${RUN_JOURNAL_SMOKE:-0}"
 RUN_POSIX_SMOKE="${RUN_POSIX_SMOKE:-0}"
 RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
@@ -100,6 +105,11 @@ echo "RUN_API_ONLY=$RUN_API_ONLY RUN_FUSE_SMOKE=$RUN_FUSE_SMOKE"
 
 run_case "api" "e2e/api-smoke-test.sh"
 run_case "cli" "e2e/cli-smoke-test.sh"
+if [ "$RUN_OBJECT_STORE_SMOKE" = "1" ]; then
+  run_case "object-store" "e2e/object-store-smoke-test.sh"
+else
+  skip_case "object-store" "e2e/object-store-smoke-test.sh" "set RUN_OBJECT_STORE_SMOKE=1 to run MinIO fs/mount coverage"
+fi
 
 if [ "$RUN_API_ONLY" = "1" ]; then
   skip_case "layer-fs" "e2e/layer-fs-smoke-test.sh" "set RUN_API_ONLY=0"

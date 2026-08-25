@@ -10,6 +10,11 @@ import (
 )
 
 func Find(c *client.Client, args []string) error {
+	authLocal, args, err := peelObjectAuth(args)
+	if err != nil {
+		return err
+	}
+	defer withObjectAuthLocal(authLocal)()
 	path := "/"
 	params := url.Values{}
 	layerRef := ""
@@ -71,11 +76,14 @@ func Find(c *client.Client, args []string) error {
 		}
 	}
 
-	var err error
-	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
 	}
+	if err := requireCapOnHandle(h, CapSearch, "find"); err != nil {
+		return err
+	}
+	c, path = h.Client, h.Path
 	if layerRef != "" {
 		params.Set("layer", layerRef)
 	}

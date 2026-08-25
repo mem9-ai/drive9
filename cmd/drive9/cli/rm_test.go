@@ -142,7 +142,7 @@ func TestRmInvalidArgs(t *testing.T) {
 		{
 			name:    "missing_path",
 			args:    nil,
-			wantErr: "usage: drive9 fs rm [-r|--recursive] <path>",
+			wantErr: "usage: drive9 fs rm [-r|--recursive] [--auth=local|server] <path>",
 		},
 		{
 			name:    "unknown_flag",
@@ -152,7 +152,7 @@ func TestRmInvalidArgs(t *testing.T) {
 		{
 			name:    "extra_path",
 			args:    []string{"-r", "/dir/", "/extra"},
-			wantErr: "usage: drive9 fs rm [-r|--recursive] <path>",
+			wantErr: "usage: drive9 fs rm [-r|--recursive] [--auth=local|server] <path>",
 		},
 	}
 

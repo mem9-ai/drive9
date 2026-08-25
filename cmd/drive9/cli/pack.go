@@ -122,7 +122,7 @@ func Pack(c *client.Client, args []string) error {
 	archiveArg := ""
 	paths := append([]string(nil), fs.Args()...)
 	if fs.NArg() > 0 {
-		if _, ok := ParseRemote(fs.Arg(0)); ok {
+		if loc, err := Parse(fs.Arg(0)); err == nil && loc.Kind == KindDrive9 {
 			archiveArg = fs.Arg(0)
 			paths = append([]string(nil), fs.Args()[1:]...)
 		}
@@ -1380,10 +1380,17 @@ func safeOverlayTarget(localRoot, rel string) (string, error) {
 }
 
 func clientForRemoteArchiveArg(defaultClient *client.Client, raw string) (*client.Client, string, error) {
-	rp, ok := ParseRemote(raw)
-	if !ok {
+	loc, err := Parse(raw)
+	if err != nil {
+		return nil, "", err
+	}
+	if loc.Kind == KindObject {
+		return nil, "", fmt.Errorf("pack: object-store URIs are not supported")
+	}
+	if loc.Kind != KindDrive9 {
 		return nil, "", fmt.Errorf("remote archive path required (use :/path/to/archive.tar.gz)")
 	}
+	rp := RemotePath{Context: loc.Context, Path: loc.Path}
 	if rp.Path == "/" || strings.HasSuffix(rp.Path, "/") {
 		return nil, "", fmt.Errorf("remote archive path must be a file, got %q", raw)
 	}

@@ -24,6 +24,8 @@ func Admin(args []string) error {
 		return adminTenant(args[1:])
 	case "pool":
 		return adminTenantPool(args[1:])
+	case "object-backend":
+		return adminObjectBackend(args[1:])
 	default:
 		return fmt.Errorf("unknown admin command %q\n%s", args[0], adminUsage())
 	}
@@ -49,6 +51,8 @@ func adminTenant(args []string) error {
 		return quotaSet(args[1:])
 	case "extract-config":
 		return adminTenantExtractConfig(args[1:])
+	case "object-namespace":
+		return adminTenantObjectNamespace(args[1:])
 	case "pool":
 		return adminTenantPool(args[1:])
 	default:
@@ -675,6 +679,8 @@ commands:
   tenant delete --tenant-id ID      delete one tenant
   tenant set-quota --tenant-id ID   set quota for one tenant
   tenant extract-config <get|set>   get or update media extract config
+  tenant object-namespace <get|set|clear>  bind a customer object prefix id
+  object-backend <add|get|ls|update|rm>  org object-store credentials
   pool <command> [flags]            manage the tenant pool
 
 global admin flags:
@@ -707,7 +713,15 @@ examples:
 
   drive9 admin pool create --pool-size 10 \
     --tidbcloud-public-key <public-key> \
-    --tidbcloud-private-key <private-key>`
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin object-backend add --scheme s3 --bucket example \
+    --credential-kind static --access-key-id AKI... --secret-access-key ... \
+    --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>
+
+  drive9 admin tenant object-namespace set --tenant-id tnt_xxx \
+    --namespace-id customer-prefix \
+    --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>`
 }
 
 func adminTenantUsage() string {
@@ -720,11 +734,12 @@ commands:
   delete --tenant-id ID            delete one tenant
   set-quota --tenant-id ID         set quota for one tenant
   extract-config <get|set>         get or update media extract config
+  object-namespace <get|set|clear> bind customer object prefix id
 
 flags:
   --server URL                     server URL (default: active context server)
   --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
-  --tenant-id ID                   drive9 tenant id for get/delete/set-quota/extract-config
+  --tenant-id ID                   drive9 tenant id for get/delete/set-quota/extract-config/object-namespace
   --tidbcloud-public-key KEY       TiDB Cloud public key
   --tidbcloud-private-key KEY      TiDB Cloud private key
   --max-storage-size Mi            set-quota: max confirmed+reserved storage size in Mi

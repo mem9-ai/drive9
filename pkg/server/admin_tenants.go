@@ -129,6 +129,10 @@ func (s *Server) adminTenantsItemHandler() http.Handler {
 			}
 			return
 		}
+		if len(parts) == 2 && parts[1] == "object-namespace" {
+			s.handleAdminTenantObjectNamespace(w, r, tenantID)
+			return
+		}
 		errJSON(w, http.StatusNotFound, "not found")
 	})
 }
