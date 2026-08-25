@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -168,9 +169,39 @@ func TestRcloneFUSEOpCancel(t *testing.T) {
 		time.Sleep(time.Hour)
 		return nil
 	})
-	if st != gofuse.Status(syscall.ETIMEDOUT) {
-		t.Fatalf("status=%v want ETIMEDOUT", st)
+	if st != gofuse.Status(syscall.EINTR) {
+		t.Fatalf("status=%v want EINTR", st)
 	}
+}
+
+func TestRcloneFUSEOpCancelDoesNotWait(t *testing.T) {
+	ofs, _ := testVFS(t)
+	started := make(chan struct{})
+	block := make(chan struct{})
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- ofs.withOp(cancel, func(context.Context) error {
+			close(started)
+			<-block
+			return nil
+		})
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fn did not start")
+	}
+	close(cancel)
+	select {
+	case st := <-done:
+		if st != gofuse.Status(syscall.EINTR) {
+			t.Fatalf("status=%v want EINTR", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("withOp must return EINTR without waiting for in-flight I/O")
+	}
+	close(block)
 }
 
 func TestRcloneFUSESetAttrSize(t *testing.T) {
@@ -222,8 +253,167 @@ func TestRcloneFUSESetAttrCancel(t *testing.T) {
 		Valid:    gofuse.FATTR_SIZE,
 		Size:     1,
 	}}, &out)
-	if st != gofuse.Status(syscall.ETIMEDOUT) {
-		t.Fatalf("status=%v want ETIMEDOUT (SetAttr must honor kernel cancel)", st)
+	if st != gofuse.Status(syscall.EINTR) {
+		t.Fatalf("status=%v want EINTR (SetAttr must honor kernel cancel)", st)
+	}
+}
+
+func TestRcloneFUSEReadDirCancel(t *testing.T) {
+	ofs, _ := testVFS(t)
+	ch := make(chan struct{})
+	close(ch)
+	buf := make([]byte, 4096)
+	out := gofuse.NewDirEntryList(buf, 0)
+	st := ofs.ReadDir(ch, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: 1}}, out)
+	if st != gofuse.Status(syscall.EINTR) {
+		t.Fatalf("status=%v want EINTR", st)
+	}
+}
+
+func TestRcloneFUSECreateCancel(t *testing.T) {
+	ofs, dir := testWriteVFS(t)
+	ch := make(chan struct{})
+	close(ch)
+	var createOut gofuse.CreateOut
+	st := ofs.Create(ch, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(os.O_WRONLY | os.O_CREATE | os.O_TRUNC),
+		Mode:     0o644,
+	}, "canceled.txt", &createOut)
+	if st != gofuse.Status(syscall.EINTR) {
+		t.Fatalf("status=%v want EINTR", st)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "canceled.txt")); !os.IsNotExist(err) {
+		t.Fatalf("canceled Create must not leave a file: %v", err)
+	}
+}
+
+func TestRcloneFUSEDuplicateFlush(t *testing.T) {
+	ofs, dir := testWriteVFS(t)
+	var createOut gofuse.CreateOut
+	st := ofs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(os.O_WRONLY | os.O_CREATE | os.O_TRUNC),
+		Mode:     0o644,
+	}, "dup-flush.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if _, st := ofs.Write(nil, &gofuse.WriteIn{Fh: createOut.Fh}, []byte("hello")); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	var st1, st2 gofuse.Status
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		st1 = ofs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh})
+	}()
+	go func() {
+		defer wg.Done()
+		st2 = ofs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh})
+	}()
+	wg.Wait()
+	if st1 != gofuse.OK || st2 != gofuse.OK {
+		t.Fatalf("Flush statuses %v %v", st1, st2)
+	}
+	ofs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+	got, err := os.ReadFile(filepath.Join(dir, "dup-flush.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestRcloneFUSEConcurrentFlushAndWrite(t *testing.T) {
+	ofs, dir := testWriteVFS(t)
+	var createOut gofuse.CreateOut
+	st := ofs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(os.O_WRONLY | os.O_CREATE | os.O_TRUNC),
+		Mode:     0o644,
+	}, "flush-write.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if _, st := ofs.Write(nil, &gofuse.WriteIn{Fh: createOut.Fh}, []byte("hello")); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	var flushSt, writeSt gofuse.Status
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		flushSt = ofs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh})
+	}()
+	go func() {
+		defer wg.Done()
+		_, writeSt = ofs.Write(nil, &gofuse.WriteIn{Fh: createOut.Fh, Offset: 5}, []byte("!"))
+	}()
+	wg.Wait()
+	if flushSt != gofuse.OK {
+		t.Fatalf("Flush: %v", flushSt)
+	}
+	if writeSt != gofuse.OK {
+		t.Fatalf("Write: %v", writeSt)
+	}
+	if st := ofs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
+		t.Fatalf("final Flush: %v", st)
+	}
+	ofs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+	got, err := os.ReadFile(filepath.Join(dir, "flush-write.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(got), "hello") {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestRcloneFUSERenameDuringFlush(t *testing.T) {
+	ofs, dir := testWriteVFS(t)
+	var createOut gofuse.CreateOut
+	st := ofs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(os.O_WRONLY | os.O_CREATE | os.O_TRUNC),
+		Mode:     0o644,
+	}, "before.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if _, st := ofs.Write(nil, &gofuse.WriteIn{Fh: createOut.Fh}, []byte("moved")); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	var flushSt, renameSt gofuse.Status
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		flushSt = ofs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh})
+	}()
+	go func() {
+		defer wg.Done()
+		renameSt = ofs.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "before.txt", "after.txt")
+	}()
+	wg.Wait()
+	if flushSt != gofuse.OK {
+		t.Fatalf("Flush: %v", flushSt)
+	}
+	if renameSt != gofuse.OK {
+		t.Fatalf("Rename: %v", renameSt)
+	}
+	ofs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+	got, err := os.ReadFile(filepath.Join(dir, "after.txt"))
+	if os.IsNotExist(err) {
+		got, err = os.ReadFile(filepath.Join(dir, "before.txt"))
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "moved" {
+		t.Fatalf("got %q", got)
 	}
 }
 
@@ -266,6 +456,15 @@ func TestMapVFSErr(t *testing.T) {
 	}
 	if mapVFSErr(os.ErrNotExist) != gofuse.ENOENT {
 		t.Fatal("not exist")
+	}
+	if mapVFSErr(context.Canceled) != gofuse.Status(syscall.EINTR) {
+		t.Fatal("canceled")
+	}
+	if mapVFSErr(context.DeadlineExceeded) != gofuse.Status(syscall.ETIMEDOUT) {
+		t.Fatal("deadline")
+	}
+	if mapVFSErr(syscall.ENOTDIR) != gofuse.Status(syscall.ENOTDIR) {
+		t.Fatal("ENOTDIR")
 	}
 }
 
