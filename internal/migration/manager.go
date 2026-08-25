@@ -65,8 +65,11 @@ func newManagerWithDependencies(startup *RuntimeStartup, deps managerDependencie
 	if startup == nil || startup.Config == nil || len(startup.Jobs) == 0 {
 		return nil, errors.New("Manager requires runtime startup configuration")
 	}
+	if err := ValidateMappings(startup.Config); err != nil {
+		return nil, fmt.Errorf("Manager static mapping: %w", err)
+	}
 	if deps.preflight == nil {
-		deps.preflight = Preflight
+		deps.preflight = preflightJob
 	}
 	if deps.newWorker == nil {
 		deps.newWorker = NewWorker
