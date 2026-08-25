@@ -15,7 +15,28 @@ import (
 )
 
 func testRuntimeStartup(jobIDs ...string) *RuntimeStartup {
-	config := &Config{Version: ConfigVersion}
+	configuredJobs := make([]JobConfig, 0, len(jobIDs))
+	spaces := make(map[string]SpaceConfig, len(jobIDs))
+	for _, jobID := range jobIDs {
+		configuredJobs = append(configuredJobs, JobConfig{
+			JobID: jobID, Subpath: "/" + jobID,
+			Target: TargetConfig{SpaceRef: jobID, Prefix: "/"},
+		})
+		spaces[jobID] = SpaceConfig{CredentialRef: jobID + "-key"}
+	}
+	config := &Config{
+		Version: ConfigVersion, Drive9: Drive9Config{Endpoint: "https://drive9.example.com"},
+		JobDefaults: JobDefaults{
+			Sync: SyncDefaults{GracePeriod: Duration(DefaultGracePeriod)},
+			Performance: PerformanceDefaults{
+				MaxBytesPerSecond: 1024, SmallFileWorkers: 1, LargeFileWorkers: 1,
+			},
+		},
+		Spaces: spaces,
+		EBSSources: []EBSSourceConfig{{
+			VolumeID: "vol-001", NodeName: "node-a", Root: "/ebs", Jobs: configuredJobs,
+		}},
+	}
 	runtime := &RuntimeStartup{
 		Config: config, Source: EBSSourceConfig{VolumeID: "vol-001", NodeName: "node-a", Root: "/ebs"},
 		Phase: PhaseSyncing,
@@ -23,11 +44,34 @@ func testRuntimeStartup(jobIDs ...string) *RuntimeStartup {
 	for _, jobID := range jobIDs {
 		runtime.Jobs = append(runtime.Jobs, &Startup{
 			Config: config,
-			Job:    Job{JobID: jobID, VolumeID: "vol-001", NodeName: "node-a", EBSRoot: "/ebs", Subpath: "/" + jobID, Source: SourceConfig{Type: "ebs", Root: "/ebs/" + jobID}},
-			Phase:  PhaseSyncing,
+			Job: Job{
+				JobID: jobID, VolumeID: "vol-001", NodeName: "node-a", EBSRoot: "/ebs",
+				Subpath: "/" + jobID, Source: SourceConfig{Type: "ebs", Root: "/ebs/" + jobID},
+				Target: TargetConfig{SpaceRef: jobID, Prefix: "/"},
+			},
+			Space: spaces[jobID],
+			Phase: PhaseSyncing,
 		})
 	}
 	return runtime
+}
+
+func TestManagerValidatesSharedMappingsBeforeJobLoops(t *testing.T) {
+	runtime := testRuntimeStartup("job-a", "job-b")
+	runtime.Config.EBSSources[0].Jobs[1].Target.Prefix = ControlPrefix + "/unsafe"
+	preflightCalls := 0
+	manager, err := newManagerWithDependencies(runtime, managerDependencies{
+		preflight: func(context.Context, *Startup) (PreflightResult, error) {
+			preflightCalls++
+			return PreflightResult{}, nil
+		},
+	})
+	if err == nil || manager != nil {
+		t.Fatalf("invalid shared mapping manager=%+v error=%v", manager, err)
+	}
+	if preflightCalls != 0 {
+		t.Fatalf("preflight calls=%d, want 0", preflightCalls)
+	}
 }
 
 func TestManagerRetriesOneJobWithoutBlockingSibling(t *testing.T) {

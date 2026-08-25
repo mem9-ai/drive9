@@ -88,7 +88,7 @@ func Plan(ctx context.Context, startup *RuntimeStartup) (PlanResult, error) {
 	failed := false
 	for _, job := range startup.Jobs {
 		planned := PlanJobResult{JobID: job.Job.JobID, Subpath: job.Job.Subpath, Target: job.Job.Target}
-		preflight, err := Preflight(ctx, job)
+		preflight, err := preflightJob(ctx, job)
 		if err != nil {
 			planned.Error = boundedRuntimeError(err)
 			failed = true
@@ -155,6 +155,10 @@ func Preflight(ctx context.Context, startup *Startup) (PreflightResult, error) {
 	return preflightWithProbe(ctx, startup, sourceMountProbeFor(startup), nil)
 }
 
+func preflightJob(ctx context.Context, startup *Startup) (PreflightResult, error) {
+	return preflightWithProbeValidation(ctx, startup, sourceMountProbeFor(startup), nil, false)
+}
+
 func preflightWithVerifier(ctx context.Context, startup *Startup, verifyVolume func(string, string) (bool, error)) (PreflightResult, error) {
 	return preflightWithChecks(ctx, startup, verifyVolume, nil)
 }
@@ -172,11 +176,17 @@ func preflightWithChecks(ctx context.Context, startup *Startup, verifyVolume fun
 }
 
 func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string, string) (sourceMountIdentity, error), openFile func(*os.Root, string) (*os.File, error)) (PreflightResult, error) {
+	return preflightWithProbeValidation(ctx, startup, probe, openFile, true)
+}
+
+func preflightWithProbeValidation(ctx context.Context, startup *Startup, probe func(string, string) (sourceMountIdentity, error), openFile func(*os.Root, string) (*os.File, error), validateMappings bool) (PreflightResult, error) {
 	if startup == nil || startup.Config == nil {
 		return PreflightResult{}, fmt.Errorf("%w: missing startup snapshot", ErrPreflight)
 	}
-	if err := ValidateMappings(startup.Config); err != nil {
-		return PreflightResult{}, fmt.Errorf("%w: static mapping: %v", ErrPreflight, err)
+	if validateMappings {
+		if err := ValidateMappings(startup.Config); err != nil {
+			return PreflightResult{}, fmt.Errorf("%w: static mapping: %v", ErrPreflight, err)
+		}
 	}
 	initialMountIdentity, err := observeJobSource(startup, probe)
 	if err != nil {

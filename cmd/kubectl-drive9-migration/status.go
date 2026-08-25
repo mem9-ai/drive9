@@ -387,6 +387,9 @@ func deriveBatchStatus(jobs []jobResult) string {
 		}
 		phases[job.Phase] = struct{}{}
 	}
+	if len(phases) > 1 {
+		return "MIXED_PHASE"
+	}
 	if initializing {
 		return "SYNCING"
 	}

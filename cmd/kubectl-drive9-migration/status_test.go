@@ -140,6 +140,18 @@ func batchJob(pod, phase, display string) jobResult {
 	}
 }
 
+func initializingBatchJob(pod string) jobResult {
+	status := &workerStatus{
+		JobID: "job-" + pod, VolumeID: "vol-" + pod,
+		RuntimeState: "INITIALIZING", StartupPhase: "SYNCING",
+	}
+	return jobResult{
+		Namespace: "migration", Batch: "batch-a", Pod: pod,
+		JobID: status.JobID, VolumeID: status.VolumeID,
+		DisplayStatus: "INITIALIZING", parsed: status,
+	}
+}
+
 func TestDeriveBatchStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -151,6 +163,19 @@ func TestDeriveBatchStatus(t *testing.T) {
 			batchJob("a", "SYNCING", "SYNCING"),
 			batchJob("b", "DUAL_WRITE_REPAIRING", "REPAIRING"),
 		}, want: "MIXED_PHASE"},
+		{name: "initializing preserves mixed phase", jobs: []jobResult{
+			initializingBatchJob("initializing"),
+			batchJob("a", "SYNCING", "SYNCING"),
+			batchJob("b", "DUAL_WRITE_REPAIRING", "REPAIRING"),
+		}, want: "MIXED_PHASE"},
+		{name: "all initializing", jobs: []jobResult{
+			initializingBatchJob("a"),
+			initializingBatchJob("b"),
+		}, want: "SYNCING"},
+		{name: "initializing with one observed phase", jobs: []jobResult{
+			initializingBatchJob("initializing"),
+			batchJob("a", "DUAL_WRITE_REPAIRING", "REPAIRING"),
+		}, want: "SYNCING"},
 		{name: "syncing", jobs: []jobResult{
 			batchJob("a", "SYNCING", "READY_FOR_ROLLOUT"),
 			batchJob("b", "SYNCING", "SYNCING"),
