@@ -63,7 +63,7 @@ func NewWorker(ctx context.Context, startup *Startup) (*Worker, error) {
 	if err != nil {
 		return nil, err
 	}
-	observedSource, err := sourceMountProbeFor(startup)(startup.Job.Source.Root, startup.Job.VolumeID)
+	observedSource, err := observeJobSource(startup, sourceMountProbeFor(startup))
 	if err != nil {
 		return nil, fmt.Errorf("observe mounted source: %w", err)
 	}
@@ -145,7 +145,7 @@ func (w *Worker) refreshClientLocked(ctx context.Context) error {
 		api: api, inventory: inventory, checkpoint: NewCheckpointStore(api), eventIngest: caps.EventIngest,
 	}
 	if w.recovery != nil {
-		observed, loadErr := candidate.checkpoint.Load(ctx, w.startup.Job.VolumeID)
+		observed, loadErr := candidate.checkpoint.Load(ctx, w.startup.Job.JobID)
 		if loadErr != nil {
 			return fmt.Errorf("validate refreshed credential checkpoint: %w", loadErr)
 		}
@@ -215,7 +215,7 @@ func (w *Worker) validateSourceMount() error {
 		err      error
 	)
 	if w.startup != nil && w.startup.Job.Source.Root != "" {
-		observed, err = sourceMountProbeFor(w.startup)(w.startup.Job.Source.Root, w.startup.Job.VolumeID)
+		observed, err = observeJobSource(w.startup, sourceMountProbeFor(w.startup))
 	} else if w.scanner != nil {
 		observed, err = observeSourceRoot(w.scanner.root)
 	} else {
@@ -260,7 +260,7 @@ func (w *Worker) validateRemoteCheckpoint(ctx context.Context) error {
 	if w.startup == nil || w.recovery == nil || w.checkpoint == nil {
 		return nil
 	}
-	observed, err := w.checkpoint.Load(ctx, w.startup.Job.VolumeID)
+	observed, err := w.checkpoint.Load(ctx, w.startup.Job.JobID)
 	if err != nil {
 		return err
 	}
@@ -665,7 +665,7 @@ func (w *Worker) reportCAS(source SourceEntry, target *client.StatResult, expect
 	event := client.MigrationEvent{
 		EventID: fmt.Sprintf("%s-%d-%d", eventContext.RoundID, attempt, now.UnixNano()), EmittedAt: now.UTC().Format(time.RFC3339Nano),
 		Phase: string(eventContext.Phase), RoundID: eventContext.RoundID, CASAttempt: attempt, FirstSeenAt: firstSeen.UTC().Format(time.RFC3339Nano), GraceSeconds: int64(w.graceWindow().Seconds()),
-		JobID: w.startup.Job.VolumeID, VolumeID: w.startup.Job.VolumeID, NodeName: w.startup.Job.NodeName, SpaceID: w.startup.Job.Target.SpaceRef,
+		JobID: w.startup.Job.JobID, VolumeID: w.startup.Job.VolumeID, NodeName: w.startup.Job.NodeName, SpaceID: w.startup.Job.Target.SpaceRef,
 		SourcePath: source.Path, TargetPath: targetRemotePath(w.startup.Job.Target.Prefix, source.Path, false), SourceVersionToken: token,
 		Size: source.Version.Size, Mtime: source.Version.MtimeNS, SourceChecksumSHA256: source.ChecksumSHA256, ExpectedRevision: expected,
 		Operation: "update", Result: result, ErrorClass: class, LatencyMS: time.Since(started).Milliseconds(),

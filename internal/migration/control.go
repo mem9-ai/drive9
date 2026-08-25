@@ -27,6 +27,7 @@ var controlIODeadline = 5 * time.Second
 
 type ControlRequest struct {
 	Command string `json:"command"`
+	JobID   string `json:"job_id,omitempty"`
 	Output  string `json:"output,omitempty"`
 	Type    string `json:"type,omitempty"`
 	Limit   int    `json:"limit,omitempty"`
@@ -77,12 +78,18 @@ func (g *serialGate) Release() {
 }
 
 type StatusOutput struct {
+	JobID            string              `json:"job_id,omitempty"`
 	VolumeID         string              `json:"volume_id,omitempty"`
 	NodeName         string              `json:"node_name,omitempty"`
+	EBSRoot          string              `json:"ebs_root,omitempty"`
+	Subpath          string              `json:"subpath,omitempty"`
 	SpaceRef         string              `json:"space_ref,omitempty"`
 	Prefix           string              `json:"prefix,omitempty"`
 	CredentialRef    string              `json:"credential_ref,omitempty"`
-	Phase            Phase               `json:"phase"`
+	RuntimeState     RuntimeState        `json:"runtime_state,omitempty"`
+	RuntimeAttempts  int                 `json:"runtime_attempts,omitempty"`
+	RuntimeError     string              `json:"runtime_error,omitempty"`
+	Phase            Phase               `json:"phase,omitempty"`
 	StartupPhase     Phase               `json:"startup_phase"`
 	RecoveryComplete bool                `json:"recovery_complete"`
 	Current          RoundStatus         `json:"round"`
@@ -103,16 +110,28 @@ type StatusOutput struct {
 	AttentionReason  string              `json:"attention_reason,omitempty"`
 }
 
+type EBSStatusOutput struct {
+	VolumeID string         `json:"volume_id"`
+	NodeName string         `json:"node_name"`
+	EBSRoot  string         `json:"ebs_root"`
+	Jobs     []StatusOutput `json:"jobs"`
+}
+
+type controlTarget interface {
+	prepareControl(context.Context, ControlRequest) (func(), error)
+	handlePreparedControl(context.Context, io.Writer, ControlRequest) error
+}
+
 type controlServer struct {
 	ctx      context.Context
 	listener net.Listener
 	path     string
-	worker   *Worker
+	target   controlTarget
 	once     sync.Once
 	wait     sync.WaitGroup
 }
 
-func startControl(ctx context.Context, path string, worker *Worker) (*controlServer, error) {
+func startControl(ctx context.Context, path string, target controlTarget) (*controlServer, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
@@ -124,7 +143,7 @@ func startControl(ctx context.Context, path string, worker *Worker) (*controlSer
 		_ = listener.Close()
 		return nil, err
 	}
-	server := &controlServer{ctx: ctx, listener: listener, path: path, worker: worker}
+	server := &controlServer{ctx: ctx, listener: listener, path: path, target: target}
 	server.wait.Add(1)
 	go server.serve()
 	go func() { <-ctx.Done(); server.close() }()
@@ -195,17 +214,19 @@ func (s *controlServer) handle(conn net.Conn) {
 			_, _ = conn.Read(extra[:])
 			cancelWait()
 		}()
-		if err := s.worker.controlGate.Acquire(waitCtx); err != nil {
+		release, err := s.target.prepareControl(waitCtx, request)
+		if err != nil {
 			cancelWait()
+			_ = writeControlTerminal(output, request.Command, err)
 			return
 		}
 		cancelWait()
-		defer s.worker.controlGate.Release()
+		defer release()
 		if err := writeControlFrame(output, controlFrame{Type: controlFrameAccepted, Command: request.Command}); err != nil {
 			return
 		}
 	}
-	err = s.worker.handleControlLocked(s.ctx, output, request)
+	err = s.target.handlePreparedControl(s.ctx, output, request)
 	_ = writeControlTerminal(output, request.Command, err)
 }
 
@@ -226,6 +247,107 @@ func (s *controlServer) close() {
 		s.wait.Wait()
 		_ = os.Remove(s.path)
 	})
+}
+
+func (w *Worker) prepareControl(ctx context.Context, request ControlRequest) (func(), error) {
+	if !isControlMutation(request.Command) {
+		return func() {}, nil
+	}
+	if err := w.controlGate.Acquire(ctx); err != nil {
+		return nil, err
+	}
+	return w.controlGate.Release, nil
+}
+
+func (w *Worker) handlePreparedControl(ctx context.Context, output io.Writer, request ControlRequest) error {
+	return w.handleControlLocked(ctx, output, request)
+}
+
+func (m *Manager) prepareControl(ctx context.Context, request ControlRequest) (func(), error) {
+	if !isControlMutation(request.Command) {
+		return func() {}, nil
+	}
+	if request.JobID == "" {
+		return nil, ErrIllegalAction
+	}
+	snapshot, ok := m.snapshot(request.JobID)
+	if !ok || snapshot.Worker == nil || snapshot.State != RuntimeRunning {
+		return nil, ErrIllegalAction
+	}
+	if err := snapshot.Worker.controlGate.Acquire(ctx); err != nil {
+		return nil, err
+	}
+	current, ok := m.snapshot(request.JobID)
+	if !ok || current.Worker != snapshot.Worker || current.State != RuntimeRunning {
+		snapshot.Worker.controlGate.Release()
+		return nil, ErrIllegalAction
+	}
+	return snapshot.Worker.controlGate.Release, nil
+}
+
+func (m *Manager) handlePreparedControl(ctx context.Context, output io.Writer, request ControlRequest) error {
+	if request.Command == "status" {
+		if request.Output != "json" {
+			return ErrIllegalAction
+		}
+		status, err := m.statusOutput(request.JobID)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(output).Encode(status)
+	}
+	if request.JobID == "" {
+		return ErrIllegalAction
+	}
+	snapshot, ok := m.snapshot(request.JobID)
+	if !ok || snapshot.Worker == nil || snapshot.State != RuntimeRunning {
+		return ErrIllegalAction
+	}
+	return snapshot.Worker.handleControlLocked(ctx, output, request)
+}
+
+func (m *Manager) statusOutput(jobID string) (EBSStatusOutput, error) {
+	snapshots, err := m.snapshots(jobID)
+	if err != nil {
+		return EBSStatusOutput{}, err
+	}
+	status := EBSStatusOutput{
+		VolumeID: m.startup.Source.VolumeID, NodeName: m.startup.Source.NodeName,
+		EBSRoot: m.startup.Source.Root, Jobs: make([]StatusOutput, 0, len(snapshots)),
+	}
+	for _, snapshot := range snapshots {
+		var job StatusOutput
+		if snapshot.Worker != nil {
+			job = snapshot.Worker.statusOutput()
+		} else {
+			job = startupStatusOutput(snapshot.Startup)
+		}
+		job.RuntimeState = snapshot.State
+		job.RuntimeAttempts = snapshot.Attempts
+		job.RuntimeError = snapshot.Error
+		if snapshot.Error != "" {
+			job.AttentionReason = snapshot.Error
+		}
+		status.Jobs = append(status.Jobs, job)
+	}
+	return status, nil
+}
+
+func startupStatusOutput(startup *Startup) StatusOutput {
+	status := StatusOutput{Findings: make(map[FindingKind]int)}
+	if startup == nil {
+		return status
+	}
+	status.JobID = startup.Job.JobID
+	status.VolumeID = startup.Job.VolumeID
+	status.NodeName = startup.Job.NodeName
+	status.EBSRoot = startup.Job.EBSRoot
+	status.Subpath = startup.Job.Subpath
+	status.SpaceRef = startup.Job.Target.SpaceRef
+	status.Prefix = startup.Job.Target.Prefix
+	status.CredentialRef = startup.Space.CredentialRef
+	status.StartupPhase = startup.Phase
+	return status
 }
 
 func (w *Worker) handleControl(ctx context.Context, output io.Writer, request ControlRequest) error {
@@ -287,9 +409,12 @@ func (w *Worker) statusOutput() StatusOutput {
 	snapshot := w.state.Snapshot()
 	status := StatusOutput{Phase: snapshot.Phase, StartupPhase: snapshot.Phase, RecoveryComplete: snapshot.RecoveryComplete, Current: snapshot.Current, Conditions: snapshot.Conditions, RepairMtimeFloor: snapshot.RepairMtimeFloor, CandidateCounts: snapshot.CandidateCounts, GraceCandidates: len(snapshot.Grace), CASRetry: len(snapshot.Retry), Backlog: len(snapshot.Retry), PendingRepairs: snapshot.PendingRepairs, InFlight: snapshot.ActiveOperations, Verification: snapshot.Verification, Findings: make(map[FindingKind]int)}
 	if w.startup != nil {
+		status.JobID = w.startup.Job.JobID
 		status.StartupPhase = w.startup.Phase
 		status.VolumeID = w.startup.Job.VolumeID
 		status.NodeName = w.startup.Job.NodeName
+		status.EBSRoot = w.startup.Job.EBSRoot
+		status.Subpath = w.startup.Job.Subpath
 		status.SpaceRef = w.startup.Job.Target.SpaceRef
 		status.Prefix = w.startup.Job.Target.Prefix
 		status.CredentialRef = w.startup.Space.CredentialRef
@@ -402,11 +527,11 @@ func Control(ctx context.Context, socket string, request ControlRequest, output 
 				}
 				accepted = true
 			case controlFrameTerminal:
-				if isControlMutation(request.Command) && !accepted {
-					return errors.New("mutation terminated before acceptance")
-				}
 				if !frame.OK {
 					return controlFrameError(frame)
+				}
+				if isControlMutation(request.Command) && !accepted {
+					return errors.New("mutation succeeded before acceptance")
 				}
 				if frame.Error != "" || frame.Code != 0 || !validControlPayloadCount(request.Command, payloads) {
 					return errors.New("invalid successful control terminal")
@@ -461,14 +586,30 @@ func decodeControlJSON(body []byte, destination any) error {
 func validateControlPayload(command string, body []byte) error {
 	switch command {
 	case "status":
+		var fields map[string]json.RawMessage
+		if err := decodeControlJSON(body, &fields); err != nil {
+			return fmt.Errorf("invalid status response: %w", err)
+		}
+		if _, ok := fields["jobs"]; ok {
+			status := &EBSStatusOutput{}
+			if err := decodeControlJSON(body, status); err != nil {
+				return fmt.Errorf("invalid EBS status response: %w", err)
+			}
+			if status.VolumeID == "" || status.NodeName == "" || status.EBSRoot == "" || len(status.Jobs) == 0 {
+				return errors.New("invalid EBS status identity")
+			}
+			for _, job := range status.Jobs {
+				if err := validateStatusOutput(job); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		status := &StatusOutput{}
 		if err := decodeControlJSON(body, status); err != nil {
 			return fmt.Errorf("invalid status response: %w", err)
 		}
-		if phaseRank(status.Phase) == 0 || phaseRank(status.StartupPhase) == 0 {
-			return errors.New("invalid status phase")
-		}
-		return nil
+		return validateStatusOutput(*status)
 	case "diff":
 		finding := &Finding{}
 		if err := decodeControlJSON(body, finding); err != nil {
@@ -499,6 +640,22 @@ func validateControlPayload(command string, body []byte) error {
 	default:
 		return ErrIllegalAction
 	}
+}
+
+func validateStatusOutput(status StatusOutput) error {
+	if status.RuntimeState != "" && status.RuntimeState != RuntimeInitializing && status.RuntimeState != RuntimeRetrying && status.RuntimeState != RuntimeRunning && status.RuntimeState != RuntimeStopped {
+		return errors.New("invalid runtime state")
+	}
+	if status.RuntimeState == RuntimeInitializing || status.RuntimeState == RuntimeRetrying || status.RuntimeState == RuntimeStopped {
+		if status.JobID == "" || phaseRank(status.StartupPhase) == 0 {
+			return errors.New("invalid startup-only status")
+		}
+		return nil
+	}
+	if phaseRank(status.Phase) == 0 || phaseRank(status.StartupPhase) == 0 {
+		return errors.New("invalid status phase")
+	}
+	return nil
 }
 
 func validControlPayloadCount(command string, count int) bool {

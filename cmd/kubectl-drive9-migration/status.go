@@ -25,7 +25,7 @@ func collectStatus(ctx context.Context, opts options, deps dependencies) ([]jobR
 		return nil, nil, false, errors.New("no Drive9 Migration Worker Pods matched the requested scope")
 	}
 
-	jobs := make([]jobResult, len(pods.Items))
+	podJobs := make([][]jobResult, len(pods.Items))
 	execIndexes := make([]int, 0, len(pods.Items))
 	for i := range pods.Items {
 		item := &pods.Items[i]
@@ -33,7 +33,7 @@ func collectStatus(ctx context.Context, opts options, deps dependencies) ([]jobR
 		if batch == "" {
 			batch = missingBatch
 		}
-		jobs[i] = jobResult{
+		base := jobResult{
 			Namespace: item.Metadata.Namespace,
 			Batch:     batch,
 			Pod:       item.Metadata.Name,
@@ -42,20 +42,21 @@ func collectStatus(ctx context.Context, opts options, deps dependencies) ([]jobR
 		}
 		switch {
 		case item.Metadata.Name == "" || item.Metadata.Namespace == "":
-			markCollectionFailure(&jobs[i], "UNAVAILABLE", "Pod identity is incomplete")
+			markCollectionFailure(&base, "UNAVAILABLE", "Pod identity is incomplete")
 		case item.Metadata.DeletionTimestamp != nil:
-			markCollectionFailure(&jobs[i], "TERMINATING", "Pod is terminating")
+			markCollectionFailure(&base, "TERMINATING", "Pod is terminating")
 		case item.Status.Phase != "Running":
 			phase := strings.ToUpper(item.Status.Phase)
 			if phase == "" {
 				phase = "UNKNOWN"
 			}
-			markCollectionFailure(&jobs[i], "POD_"+phase, "Pod phase is "+emptyAsUnknown(item.Status.Phase))
+			markCollectionFailure(&base, "POD_"+phase, "Pod phase is "+emptyAsUnknown(item.Status.Phase))
 		case !hasContainer(*item, workerContainer):
-			markCollectionFailure(&jobs[i], "UNAVAILABLE", "Pod has no drive9-migration container")
+			markCollectionFailure(&base, "UNAVAILABLE", "Pod has no drive9-migration container")
 		default:
 			execIndexes = append(execIndexes, i)
 		}
+		podJobs[i] = []jobResult{base}
 	}
 
 	semaphore := make(chan struct{}, deps.concurrency)
@@ -69,19 +70,24 @@ func collectStatus(ctx context.Context, opts options, deps dependencies) ([]jobR
 			case semaphore <- struct{}{}:
 				defer func() { <-semaphore }()
 			case <-ctx.Done():
-				markCollectionFailure(&jobs[index], "UNAVAILABLE", normalizeMessage(ctx.Err().Error()))
+				markCollectionFailure(&podJobs[index][0], "UNAVAILABLE", normalizeMessage(ctx.Err().Error()))
 				return
 			}
-			queryWorker(ctx, opts, deps, &jobs[index])
+			podJobs[index] = queryWorker(ctx, opts, deps, podJobs[index][0])
 		}()
 	}
 	wait.Wait()
 
+	jobs := make([]jobResult, 0, len(pods.Items))
+	for _, results := range podJobs {
+		jobs = append(jobs, results...)
+	}
 	for i := range jobs {
 		if jobs[i].parsed == nil {
 			continue
 		}
-		jobs[i].JobID = jobs[i].parsed.VolumeID
+		jobs[i].JobID = jobs[i].parsed.JobID
+		jobs[i].VolumeID = jobs[i].parsed.VolumeID
 		jobs[i].Phase = jobs[i].parsed.Phase
 		if jobs[i].Batch == missingBatch {
 			markCollectionFailure(&jobs[i], "UNAVAILABLE", "Pod is missing "+instanceLabel)
@@ -134,63 +140,115 @@ func kubectlGlobalArgs(opts options) []string {
 	return args
 }
 
-func queryWorker(parent context.Context, opts options, deps dependencies, job *jobResult) {
+func queryWorker(parent context.Context, opts options, deps dependencies, base jobResult) []jobResult {
 	ctx, cancel := context.WithTimeout(parent, deps.execTimeout)
 	defer cancel()
-	result := deps.run(ctx, "kubectl", execWorkerArgs(opts, *job)...)
+	result := deps.run(ctx, "kubectl", execWorkerArgs(opts, base)...)
 	if result.err != nil {
-		markCollectionFailure(job, "UNAVAILABLE", commandError(result, ctx.Err()))
-		return
+		markCollectionFailure(&base, "UNAVAILABLE", commandError(result, ctx.Err()))
+		return []jobResult{base}
 	}
-	status, raw, err := decodeWorkerStatus(result.stdout)
+	_, statuses, err := decodeWorkerStatus(result.stdout)
 	if err != nil {
-		markCollectionFailure(job, "UNAVAILABLE", "invalid Worker status: "+err.Error())
-		return
+		markCollectionFailure(&base, "UNAVAILABLE", "invalid Worker status: "+err.Error())
+		return []jobResult{base}
 	}
-	job.parsed = &status
-	job.Worker = raw
+	jobs := make([]jobResult, 0, len(statuses))
+	for i := range statuses {
+		job := base
+		job.parsed = &statuses[i].status
+		job.Worker = statuses[i].raw
+		jobs = append(jobs, job)
+	}
+	return jobs
 }
 
-func decodeWorkerStatus(body []byte) (workerStatus, json.RawMessage, error) {
+type decodedWorkerStatus struct {
+	status workerStatus
+	raw    json.RawMessage
+}
+
+func decodeWorkerStatus(body []byte) (workerStatusEnvelope, []decodedWorkerStatus, error) {
 	trimmed := bytes.TrimSpace(body)
 	var fields map[string]json.RawMessage
 	if err := decodeOneJSON(trimmed, &fields); err != nil {
-		return workerStatus{}, nil, err
+		return workerStatusEnvelope{}, nil, err
 	}
-	for _, name := range []string{"volume_id", "phase", "startup_phase", "conditions", "fence_intent", "fence_complete"} {
+	for _, name := range []string{"volume_id", "node_name", "ebs_root", "jobs"} {
 		if _, ok := fields[name]; !ok {
-			return workerStatus{}, nil, fmt.Errorf("missing %s", name)
+			return workerStatusEnvelope{}, nil, fmt.Errorf("missing %s", name)
+		}
+	}
+	var envelope workerStatusEnvelope
+	if err := json.Unmarshal(trimmed, &envelope); err != nil {
+		return workerStatusEnvelope{}, nil, err
+	}
+	if envelope.VolumeID == "" || envelope.NodeName == "" || envelope.EBSRoot == "" || len(envelope.Jobs) == 0 {
+		return workerStatusEnvelope{}, nil, errors.New("invalid EBS status identity")
+	}
+	decoded := make([]decodedWorkerStatus, 0, len(envelope.Jobs))
+	for _, raw := range envelope.Jobs {
+		status, err := decodeJobStatus(raw)
+		if err != nil {
+			return workerStatusEnvelope{}, nil, err
+		}
+		if status.VolumeID != envelope.VolumeID || status.NodeName != envelope.NodeName {
+			return workerStatusEnvelope{}, nil, fmt.Errorf("job %q EBS identity mismatch", status.JobID)
+		}
+		decoded = append(decoded, decodedWorkerStatus{status: status, raw: append(json.RawMessage(nil), raw...)})
+	}
+	return envelope, decoded, nil
+}
+
+func decodeJobStatus(raw json.RawMessage) (workerStatus, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return workerStatus{}, err
+	}
+	for _, name := range []string{"job_id", "volume_id", "node_name", "runtime_state", "startup_phase"} {
+		if _, ok := fields[name]; !ok {
+			return workerStatus{}, fmt.Errorf("missing Jobs[].%s", name)
+		}
+	}
+	var status workerStatus
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return workerStatus{}, err
+	}
+	if status.JobID == "" || status.VolumeID == "" {
+		return workerStatus{}, errors.New("empty Job identity")
+	}
+	if status.RuntimeState != "INITIALIZING" && status.RuntimeState != "RETRYING" && status.RuntimeState != "RUNNING" && status.RuntimeState != "STOPPED" {
+		return workerStatus{}, fmt.Errorf("invalid runtime_state %q", status.RuntimeState)
+	}
+	if !validPhase(status.StartupPhase) {
+		return workerStatus{}, fmt.Errorf("invalid startup_phase %q", status.StartupPhase)
+	}
+	if status.RuntimeState != "RUNNING" {
+		return status, nil
+	}
+	for _, name := range []string{"phase", "conditions", "fence_intent", "fence_complete"} {
+		if _, ok := fields[name]; !ok {
+			return workerStatus{}, fmt.Errorf("missing Jobs[].%s", name)
 		}
 	}
 	for _, name := range []string{"fence_intent", "fence_complete"} {
-		if err := validateBooleanField(fields, name, name); err != nil {
-			return workerStatus{}, nil, err
+		if err := validateBooleanField(fields, name, "Jobs[]."+name); err != nil {
+			return workerStatus{}, err
 		}
 	}
 	var conditionFields map[string]json.RawMessage
 	if err := json.Unmarshal(fields["conditions"], &conditionFields); err != nil {
-		return workerStatus{}, nil, fmt.Errorf("decode conditions: %w", err)
+		return workerStatus{}, fmt.Errorf("decode conditions: %w", err)
 	}
 	for _, name := range []string{"ready_for_rollout", "current_converged", "attention"} {
-		if err := validateBooleanField(conditionFields, name, "conditions."+name); err != nil {
-			return workerStatus{}, nil, err
+		if err := validateBooleanField(conditionFields, name, "Jobs[].conditions."+name); err != nil {
+			return workerStatus{}, err
 		}
 	}
-	var status workerStatus
-	if err := json.Unmarshal(trimmed, &status); err != nil {
-		return workerStatus{}, nil, err
-	}
-	if status.VolumeID == "" {
-		return workerStatus{}, nil, errors.New("empty volume_id")
-	}
 	if !validPhase(status.Phase) {
-		return workerStatus{}, nil, fmt.Errorf("invalid phase %q", status.Phase)
+		return workerStatus{}, fmt.Errorf("invalid phase %q", status.Phase)
 	}
-	if !validPhase(status.StartupPhase) {
-		return workerStatus{}, nil, fmt.Errorf("invalid startup_phase %q", status.StartupPhase)
-	}
-	raw := append(json.RawMessage(nil), trimmed...)
-	return status, raw, nil
+	return status, nil
 }
 
 func validateBooleanField(fields map[string]json.RawMessage, name, path string) error {
@@ -237,6 +295,10 @@ func hasContainer(item pod, name string) bool {
 
 func deriveJobStatus(status workerStatus) string {
 	switch {
+	case status.RuntimeState == "RETRYING" || status.RuntimeState == "STOPPED":
+		return "ATTENTION"
+	case status.RuntimeState == "INITIALIZING":
+		return "INITIALIZING"
 	case status.Conditions.Attention:
 		return "ATTENTION"
 	case status.Phase == "CUTOVER_READY" && status.FenceComplete:
@@ -310,6 +372,7 @@ func summarizeBatches(jobs []jobResult) []batchSummary {
 
 func deriveBatchStatus(jobs []jobResult) string {
 	phases := make(map[string]struct{})
+	initializing := false
 	for _, job := range jobs {
 		switch job.DisplayStatus {
 		case "UNAVAILABLE", "DUPLICATE", "ATTENTION", "TERMINATING":
@@ -318,7 +381,14 @@ func deriveBatchStatus(jobs []jobResult) string {
 		if strings.HasPrefix(job.DisplayStatus, "POD_") || job.Batch == missingBatch || job.parsed == nil {
 			return "NEEDS_ATTENTION"
 		}
+		if job.DisplayStatus == "INITIALIZING" {
+			initializing = true
+			continue
+		}
 		phases[job.Phase] = struct{}{}
+	}
+	if initializing {
+		return "SYNCING"
 	}
 	if len(phases) != 1 {
 		return "MIXED_PHASE"

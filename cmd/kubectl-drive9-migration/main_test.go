@@ -105,11 +105,15 @@ func podJSON(namespace, name, batch, phase string) map[string]any {
 
 func statusJSON(t *testing.T, volumeID, phase string, conditions map[string]bool) []byte {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{
+	job := map[string]any{
+		"job_id":            volumeID,
 		"volume_id":         volumeID,
 		"node_name":         "node-a",
+		"ebs_root":          "/ebs",
+		"subpath":           "/data",
 		"space_ref":         "space-a",
 		"prefix":            "/data",
+		"runtime_state":     "RUNNING",
 		"phase":             phase,
 		"startup_phase":     phase,
 		"recovery_complete": true,
@@ -127,6 +131,12 @@ func statusJSON(t *testing.T, volumeID, phase string, conditions map[string]bool
 		"full_verification": map[string]any{"status": "pending"},
 		"fence_intent":      phase == "CUTOVER_READY",
 		"fence_complete":    phase == "CUTOVER_READY",
+	}
+	body, err := json.Marshal(map[string]any{
+		"volume_id": volumeID,
+		"node_name": "node-a",
+		"ebs_root":  "/ebs",
+		"jobs":      []any{job},
 	})
 	if err != nil {
 		t.Fatal(err)
