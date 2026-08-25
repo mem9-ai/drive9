@@ -23,14 +23,19 @@ process may use up to N times the configured per-Job bandwidth and worker count.
 ## Public container image
 
 The manually triggered `publish-migration-image.yml` workflow builds Linux
-AMD64 and ARM64 images from `main` and publishes one multi-architecture manifest
-to:
+AMD64 and ARM64 images from the selected repository branch and publishes one
+multi-architecture manifest to:
 
 ```text
 ghcr.io/drive9-ai/drive9-migration:<source-sha7>
 ```
 
-The workflow does not publish `latest`. Use the published commit tag directly.
+The workflow does not publish `latest`. It reports the source ref and commit;
+use the published commit tag directly. Non-main publication is intended for
+explicitly selected development and E2E refs.
+
+Dispatch only a trusted repository ref: the workflow executes that ref's
+workflow and Dockerfile while using a GHCR write credential.
 
 The Kubernetes example uses `REPLACE_WITH_V4_SOURCE_TAG`. Replace both image
 fields with the same published source tag containing the strict v4 subpath
