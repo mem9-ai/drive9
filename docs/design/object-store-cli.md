@@ -193,9 +193,14 @@ drive9 umount ./mnt
   Dirty data is uploaded on write-handle `Flush`/`Fsync` (`WriteBack=0` so
   rclone Close is a synchronous PUT). The handle is then reopened so later
   writes still work after the kernel FLUSHes following create. A failed
-  object PUT is returned from that flush/fsync/close. Mount operations
-  are bounded by a 5-minute deadline and the kernel interrupt channel.
-  `--allow-other` enables kernel `default_permissions`.
+  object PUT is returned from that flush/fsync/close. Reads honor the
+  kernel interrupt channel immediately (`EINTR`). Mutating ops (write,
+  flush, create, setattr, mkdir, unlink, rename) wait until the rclone
+  call finishes before returning, so a syscall never fails while a delayed
+  PUT/delete/rename still commits. rclone still cannot abort in-flight
+  HTTP; a hung provider can stall a mutating syscall until the provider
+  or the 5-minute op deadline unblocks. `--allow-other` enables kernel
+  `default_permissions`.
 - Umount waits briefly for in-flight uploads and does **not** wipe a dirty
   cache, so a remount of the same URI can resume.
 - `mount drain` is drive9-only; object mounts reject it.

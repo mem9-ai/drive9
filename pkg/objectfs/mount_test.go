@@ -204,6 +204,44 @@ func TestRcloneFUSEOpCancelDoesNotWait(t *testing.T) {
 	close(block)
 }
 
+func TestRcloneFUSEMutatingOpWaitsAndReportsSuccess(t *testing.T) {
+	ofs, dir := testWriteVFS(t)
+	started := make(chan struct{})
+	block := make(chan struct{})
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- ofs.withMutatingOp(cancel, func(context.Context) error {
+			close(started)
+			<-block
+			return ofs.v.Mkdir("late-dir", 0o755)
+		})
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fn did not start")
+	}
+	close(cancel)
+	select {
+	case <-done:
+		t.Fatal("mutating op returned before settlement")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(block)
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("status=%v want OK after settled success", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mutating op did not return after settlement")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "late-dir")); err != nil {
+		t.Fatalf("mkdir should be visible after OK: %v", err)
+	}
+}
+
 func TestRcloneFUSESetAttrSize(t *testing.T) {
 	ofs, dir := testWriteVFS(t)
 	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("hello"), 0o644); err != nil {
@@ -367,7 +405,7 @@ func TestRcloneFUSEConcurrentFlushAndWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(got), "hello") {
+	if string(got) != "hello!" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -405,14 +443,130 @@ func TestRcloneFUSERenameDuringFlush(t *testing.T) {
 		t.Fatalf("Rename: %v", renameSt)
 	}
 	ofs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
-	got, err := os.ReadFile(filepath.Join(dir, "after.txt"))
-	if os.IsNotExist(err) {
-		got, err = os.ReadFile(filepath.Join(dir, "before.txt"))
+	if _, err := os.Stat(filepath.Join(dir, "before.txt")); !os.IsNotExist(err) {
+		t.Fatal("successful rename must not leave before.txt")
 	}
+	got, err := os.ReadFile(filepath.Join(dir, "after.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(got) != "moved" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestRcloneFUSEOpenThenRenamePublishesNewPath(t *testing.T) {
+	ofs, dir := testWriteVFS(t)
+	if err := os.WriteFile(filepath.Join(dir, "before.txt"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var ent gofuse.EntryOut
+	if st := ofs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "before.txt", &ent); st != gofuse.OK {
+		t.Fatalf("Lookup: %v", st)
+	}
+	started := make(chan struct{})
+	resume := make(chan struct{})
+	ofs.afterRemoteOpen = func() {
+		close(started)
+		<-resume
+	}
+	defer func() { ofs.afterRemoteOpen = nil }()
+
+	var openOut gofuse.OpenOut
+	openDone := make(chan gofuse.Status, 1)
+	go func() {
+		openDone <- ofs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: ent.NodeId},
+			Flags:    uint32(os.O_RDWR),
+		}, &openOut)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Open did not reach publication fence")
+	}
+	if st := ofs.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "before.txt", "after.txt"); st != gofuse.OK {
+		t.Fatalf("Rename: %v", st)
+	}
+	close(resume)
+	select {
+	case st := <-openDone:
+		if st != gofuse.OK {
+			t.Fatalf("Open: %v", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Open did not return")
+	}
+	if _, st := ofs.Write(nil, &gofuse.WriteIn{Fh: openOut.Fh}, []byte("data!")); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	if st := ofs.Flush(nil, &gofuse.FlushIn{Fh: openOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+	ofs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+	if _, err := os.Stat(filepath.Join(dir, "before.txt")); !os.IsNotExist(err) {
+		t.Fatal("Flush after rename must not recreate before.txt")
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "after.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "data!" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestRcloneFUSECreateThenRenamePublishesNewPath(t *testing.T) {
+	ofs, dir := testWriteVFS(t)
+	started := make(chan struct{})
+	resume := make(chan struct{})
+	ofs.afterRemoteOpen = func() {
+		close(started)
+		<-resume
+	}
+	defer func() { ofs.afterRemoteOpen = nil }()
+
+	var createOut gofuse.CreateOut
+	createDone := make(chan gofuse.Status, 1)
+	go func() {
+		createDone <- ofs.Create(nil, &gofuse.CreateIn{
+			InHeader: gofuse.InHeader{NodeId: 1},
+			Flags:    uint32(os.O_WRONLY | os.O_CREATE | os.O_TRUNC),
+			Mode:     0o644,
+		}, "before.txt", &createOut)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Create did not reach publication fence")
+	}
+	if st := ofs.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "before.txt", "after.txt"); st != gofuse.OK {
+		t.Fatalf("Rename: %v", st)
+	}
+	close(resume)
+	select {
+	case st := <-createDone:
+		if st != gofuse.OK {
+			t.Fatalf("Create: %v", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Create did not return")
+	}
+	if _, st := ofs.Write(nil, &gofuse.WriteIn{Fh: createOut.Fh}, []byte("created")); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	if st := ofs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+	ofs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+	if _, err := os.Stat(filepath.Join(dir, "before.txt")); !os.IsNotExist(err) {
+		t.Fatal("Flush after rename must not recreate before.txt")
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "after.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "created" {
 		t.Fatalf("got %q", got)
 	}
 }
