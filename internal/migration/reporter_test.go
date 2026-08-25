@@ -103,7 +103,10 @@ func TestDualCASReportsExactlyOneLogicalEventAndNeverBlocksRepair(t *testing.T) 
 			now := time.Now()
 			worker, server := newDualWorker(t, root, target, time.Minute, &now)
 			defer server.Close()
-			worker.startup = &Startup{Job: Job{VolumeID: "vol-001", NodeName: "node", Target: TargetConfig{SpaceRef: "space", Prefix: "/data"}}}
+			worker.startup = &Startup{
+				Job:              Job{VolumeID: "vol-001", NodeName: "node", Target: TargetConfig{SpaceRef: "space", Prefix: "/data"}},
+				acceptedTenantID: "tenant-a",
+			}
 			worker.reporter = newEventReporter(worker.api, 4)
 			worker.apply.onCAS = worker.reportCAS
 			ctx, cancel := context.WithCancel(context.Background())
@@ -134,7 +137,7 @@ func TestDualCASReportsExactlyOneLogicalEventAndNeverBlocksRepair(t *testing.T) 
 			target.mu.Lock()
 			events := append([]client.MigrationEvent(nil), target.events...)
 			target.mu.Unlock()
-			if len(events) == 0 || events[0].CASAttempt != 1 || events[0].Phase != string(PhaseDualWriteRepairing) || events[0].SourceVersionToken == "" || events[0].Operation != "create" || events[0].SourceChecksumSHA256 == "" || events[0].ErrorClass != "none" {
+			if len(events) == 0 || events[0].CASAttempt != 1 || events[0].Phase != string(PhaseDualWriteRepairing) || events[0].SpaceID != "tenant-a" || events[0].SourceVersionToken == "" || events[0].Operation != "create" || events[0].SourceChecksumSHA256 == "" || events[0].ErrorClass != "none" {
 				t.Fatalf("events=%+v", events)
 			}
 			for _, event := range events[1:] {

@@ -43,10 +43,11 @@ type jobRuntimeSnapshot struct {
 }
 
 type managerDependencies struct {
-	preflight func(context.Context, *Startup) (PreflightResult, error)
-	newWorker func(context.Context, *Startup) (*Worker, error)
-	runWorker func(context.Context, *Worker) error
-	wait      func(context.Context, time.Duration) error
+	validateTargets func(context.Context, *RuntimeStartup) error
+	preflight       func(context.Context, *Startup) (PreflightResult, error)
+	newWorker       func(context.Context, *Startup) (*Worker, error)
+	runWorker       func(context.Context, *Worker) error
+	wait            func(context.Context, time.Duration) error
 }
 
 // Manager supervises independent Job Workers for one selected EBS process.
@@ -70,6 +71,9 @@ func newManagerWithDependencies(startup *RuntimeStartup, deps managerDependencie
 	}
 	if deps.preflight == nil {
 		deps.preflight = preflightJob
+	}
+	if deps.validateTargets == nil {
+		deps.validateTargets = validateAuthenticatedTargets
 	}
 	if deps.newWorker == nil {
 		deps.newWorker = NewWorker
@@ -98,6 +102,9 @@ func newManagerWithDependencies(startup *RuntimeStartup, deps managerDependencie
 }
 
 func (m *Manager) Run(ctx context.Context) error {
+	if err := m.deps.validateTargets(ctx, m.startup); err != nil {
+		return err
+	}
 	var wait sync.WaitGroup
 	for _, jobID := range m.order {
 		slot := m.jobs[jobID]

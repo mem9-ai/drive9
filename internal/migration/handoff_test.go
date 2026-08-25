@@ -54,7 +54,7 @@ func TestPlanHandoffSchemaIsNonSensitiveAndRunbookCoversAcceptedWorkflow(t *test
 		t.Fatal(err)
 	}
 	text := string(runbook)
-	for _, required := range []string{"T0", "T1", "T2", "ConfigMap", "rollout-restart", "verify-full", "prepare-drive9-cutover", "post-T0", "residue", "metadata", "per Job", "residual ABA", "configured subpaths from one mounted, read-only EBS", "version: v4", "checkpoint v1", "no rollback", "exact per-Job control directory", "kubectl-drive9-migration", "expected_job_ids_json", ".worker_status.fence_complete == true", "fsGroup", "recursively change Source ownership"} {
+	for _, required := range []string{"T0", "T1", "T2", "ConfigMap", "rollout-restart", "verify-full", "prepare-drive9-cutover", "post-T0", "residue", "metadata", "per Job", "residual ABA", "configured subpaths from one mounted, read-only EBS", "version: v4", "checkpoint v1", "no rollback", "exact per-Job control directory", "kubectl-drive9-migration", "expected_job_ids_json", ".worker_status.fence_complete == true", "fsGroup", "recursively change Source ownership", "/v1/status.tenant_id", "does not contain `tenant_id`", "batch safety gate", "process-lifetime `tenant_id`"} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("runbook omitted %q", required)
 		}

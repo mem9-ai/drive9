@@ -131,6 +131,7 @@ Delete/Rename primitive is scope expansion.
 | `INV-14` | Post-T0 verification is one-way coverage: every current EBS path must match Drive9; target-only residue is a warning, not a failure by itself. |
 | `INV-15` | Jobs are independent. Partial batch progress never rolls back a successful Job. |
 | `INV-16` | Migration reuses `pkg/client` transfer, fresh Multipart, filesystem, and CAS code. It never resumes or adopts a prior Multipart session, shells out to `drive9 cp`, or reimplements the upload protocol. |
+| `INV-17` | Before Worker fan-out, every configured credential resolves an authenticated `tenant_id`; target Prefix overlap is evaluated by that actual Tenant/Space identity. |
 
 ## 3. Domain model and target mapping
 
@@ -179,7 +180,8 @@ Prefix rules:
 
 1. Paths MUST use Drive9 absolute, UTF-8, NFC-normalized path semantics.
 2. Backslashes, `.`, and `..` segments are invalid.
-3. Two Jobs in one Space MUST NOT use equal or ancestor/descendant Prefixes.
+3. Two Jobs whose credentials authenticate to one Space MUST NOT use equal or
+   ancestor/descendant Prefixes, even when their `credential_ref` values differ.
 4. If two or more Jobs share a Space, no Job may target `/`.
 5. A first run requires an absent or empty business Target Prefix. A restart
    may continue only when the remote Checkpoint identifies the same Job and
@@ -347,6 +349,8 @@ Configuration rules:
 11. A configured `CUTOVER_READY` request does not directly update
     `highest_phase`. Actual phase remains `DUAL_WRITE_REPAIRING` until durable
     Fence Intent and Fence Complete succeed.
+12. Authenticated target identity does not add a ConfigMap field and is excluded
+    from `config_hash` and Checkpoint v2.
 
 ### 5.4 Credentials
 
@@ -361,7 +365,8 @@ Rules:
 1. The Secret Volume is read-only and MUST NOT use `subPath`, so kubelet can
    update projected files.
 2. The Worker reloads the current Job's key after file change or authentication
-   failure.
+   failure, but publishes the replacement client only when `/v1/status` returns
+   the same process-lifetime `tenant_id`.
 3. A batch Secret may contain multiple keys. Every DaemonSet Pod can
    technically read all mounted keys; V1 accepts this because the Worker is
    trusted.
@@ -383,7 +388,16 @@ Job:
 2. Resolve exactly one EBS Source for `DRIVE9_MIGRATION_NODE_NAME`, then resolve
    every nested Job and reject duplicate Job identity or overlapping subpaths.
 3. Normalize and validate every subpath and Space/Prefix mapping, including
-   cross-Job overlap and the control Prefix carve-out.
+   definite same-credential overlap and the control Prefix carve-out.
+
+Before any Worker fan-out, a read-only batch safety gate authenticates every
+Space referenced by the complete configuration, including Jobs assigned to
+other nodes. It resolves `/v1/status.tenant_id`, groups Jobs by
+`(endpoint, tenant_id)`, and rejects equal or ancestor/descendant Prefixes in
+one actual Tenant/Space. An unresolved credential, missing `tenant_id`, or
+overlap prevents every Worker from starting because the unknown destination
+cannot be proven disjoint. Each selected local Job freezes its accepted
+`tenant_id` only for the process lifetime.
 
 Dynamic probes cover every Job beneath the selected local EBS Source. `plan`
 runs them sequentially; `run` initializes and retries them independently:
@@ -913,6 +927,7 @@ Migration adapter before any Worker task consumes Drive9 APIs.
 | Conditional upload | Preserve Revision 0 create and exact positive-Revision update; no unconditional fallback |
 | Fresh upload | Carry the whole checksum through a new V1/V2 conditional Multipart completion; Migration does not call Resume |
 | Capabilities | Expose bounded Migration-required checksum read/complete capabilities |
+| Target identity | Authenticated `GET /v1/status` returns a stable non-empty `tenant_id`; distinct valid keys for one tenant return the same value |
 | Event endpoint | Owner-authenticated `POST /v1/migration/events` with bounded JSON; Server derives Tenant identity from the authenticated Owner API key |
 | Event storage | One structured log and low-cardinality metrics only; no database table |
 
@@ -920,10 +935,10 @@ Required data capabilities are fail-fast preflight gates. Event availability is
 reported separately and is optional for data correctness.
 
 The external Server repository owns and freezes exact capability names,
-request-model names, payload-size constant, and wire behavior. The current
-CLI/Worker plan owns only the matching `pkg/client` adapter described above.
-It MUST NOT guess names, duplicate Server wire structs in the Worker, or add a
-new Server Wire Contract.
+`tenant_id`, request-model names, payload-size constant, and wire behavior. The
+Server identity prerequisite is tracked by `tidbcloud/fs#104`; this repository
+owns only the matching `pkg/client` adapter and MUST NOT duplicate Server wire
+structs in the Worker.
 
 The event endpoint rejects scoped tokens in production deployments. Production
 requests use tenant authentication, and caller-supplied checksums and Migration
@@ -1096,6 +1111,8 @@ acceptance must prove the following behavior.
 9. Production Server mode validates the configured Owner API key before
    accepting events or caller-supplied checksums. Local/fallback mode is
    test-only and excluded from this production acceptance requirement.
+10. Authenticated status returns a stable non-empty `tenant_id`; missing or
+    malformed identity remains distinguishable from transport and auth errors.
 
 ### 19.2 Migration CLI and Worker
 
@@ -1143,6 +1160,11 @@ acceptance must prove the following behavior.
 22. Keys and file contents are absent from every forbidden sink.
 23. Existing binaries build unchanged; `drive9-migration` builds with
     `CGO_ENABLED=0` for Linux AMD64 and ARM64.
+24. Different credential references resolving to one `tenant_id` reject equal
+    or ancestor/descendant Prefixes before Worker fan-out; disjoint Prefixes in
+    that tenant and identical Prefixes in distinct tenants pass.
+25. Credential refresh cannot atomically swap a client that resolves to another
+    tenant.
 
 No acceptance test may claim strict consistency, No Extras, maximum RPO,
 undetectable-ABA safety, automatic rollback, or cross-Job atomicity.
@@ -1177,9 +1199,10 @@ moves.
 
 The CLI/Worker delivery may modify `pkg/client` only for the Migration Contract
 listed in section 13 and accepted by its Client prerequisite task. It must not
-modify Server or datastore/backend code. Any required new Server Wire Contract
-is a `SERVER_BLOCKER`; do not hide it in the current repository. Do not
-introduce a public Migration SDK or a generalized reconciliation framework.
+modify Server or datastore/backend code. `/v1/status.tenant_id` is the accepted
+external prerequisite tracked by `tidbcloud/fs#104`; any additional Server Wire
+Contract is a `SERVER_BLOCKER`. Do not introduce a public Migration SDK or a
+generalized reconciliation framework.
 
 ## 21. Deployment inputs, not design gaps
 

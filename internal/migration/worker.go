@@ -137,6 +137,9 @@ func (w *Worker) refreshClientLocked(ctx context.Context) error {
 	if missing := missingCapabilities(caps); missing != "" {
 		return fmt.Errorf("required capability %s is unavailable", missing)
 	}
+	if err := verifyAuthenticatedTenant(ctx, api, w.startup); err != nil {
+		return err
+	}
 	inventory, err := NewTargetScanner(api, w.startup.Job.Target.Prefix)
 	if err != nil {
 		return err
@@ -637,6 +640,8 @@ func newWorkerRunError(err error) error {
 		result.class, result.cause = "unsafe_source", ErrUnsafeSourcePath
 	case errors.Is(err, ErrCheckpointMismatch):
 		result.class, result.cause = "checkpoint_mismatch", ErrCheckpointMismatch
+	case errors.Is(err, ErrTargetIdentityMismatch):
+		result.class, result.cause = "target_identity_mismatch", ErrTargetIdentityMismatch
 	}
 	return result
 }
@@ -662,10 +667,11 @@ func (w *Worker) reportCAS(source SourceEntry, target *client.StatResult, expect
 		result, class = "failure", classifyRetry(err)
 	}
 	attempt := w.eventID.Add(1)
+	spaceID := w.startup.acceptedTenantID
 	event := client.MigrationEvent{
 		EventID: fmt.Sprintf("%s-%d-%d", eventContext.RoundID, attempt, now.UnixNano()), EmittedAt: now.UTC().Format(time.RFC3339Nano),
 		Phase: string(eventContext.Phase), RoundID: eventContext.RoundID, CASAttempt: attempt, FirstSeenAt: firstSeen.UTC().Format(time.RFC3339Nano), GraceSeconds: int64(w.graceWindow().Seconds()),
-		JobID: w.startup.Job.JobID, VolumeID: w.startup.Job.VolumeID, NodeName: w.startup.Job.NodeName, SpaceID: w.startup.Job.Target.SpaceRef,
+		JobID: w.startup.Job.JobID, VolumeID: w.startup.Job.VolumeID, NodeName: w.startup.Job.NodeName, SpaceID: spaceID,
 		SourcePath: source.Path, TargetPath: targetRemotePath(w.startup.Job.Target.Prefix, source.Path, false), SourceVersionToken: token,
 		Size: source.Version.Size, Mtime: source.Version.MtimeNS, SourceChecksumSHA256: source.ChecksumSHA256, ExpectedRevision: expected,
 		Operation: "update", Result: result, ErrorClass: class, LatencyMS: time.Since(started).Milliseconds(),
