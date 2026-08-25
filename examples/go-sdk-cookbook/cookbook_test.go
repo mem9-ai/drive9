@@ -361,14 +361,33 @@ func ExampleClient_quota() {
 		_ = quota.Config.MaxStorageSize
 		_ = quota.Config.MaxFileSize
 		_ = quota.Config.MaxFileCount
+		_ = quota.Config.MaxMediaLLMFiles
+		_ = quota.Config.MaxVideoLLMFiles
 		_ = quota.Config.TiDBCloudSpendingLimit
 		_ = quota.Usage.FileCount
+		_ = quota.Usage.MediaFileCount
+		_ = quota.Usage.VideoFileCount
 	}
 
 	storageSize := int64(100 * 1024) // Mi
 	fileSize := int64(1024)          // Mi
 	fileCount := int64(100000)
+	mediaLLMFiles := int64(400)
+	videoLLMFiles := int64(50)
 	spendingLimit := int64(10000)
+	enabled := true
+	prompt := "extract structured attributes"
+	_, _ = credentialClient.AdminGetTenantExtractConfig(ctx, drive9.AdminTenantExtractConfigGetRequest{
+		TenantID: tenantID, MediaType: drive9.ExtractMediaTypeImage,
+		PublicKey: tidbCloudPublicKey, PrivateKey: tidbCloudPrivateKey,
+	})
+	for _, mediaType := range []drive9.ExtractMediaType{drive9.ExtractMediaTypeImage, drive9.ExtractMediaTypeVideo} {
+		_, _ = credentialClient.AdminSetTenantExtractConfig(ctx, drive9.AdminTenantExtractConfigSetRequest{
+			TenantID: tenantID, MediaType: mediaType,
+			PublicKey: tidbCloudPublicKey, PrivateKey: tidbCloudPrivateKey,
+			Enabled: &enabled, Prompt: &prompt,
+		})
+	}
 	_, _ = credentialClient.AdminSetTenantQuota(ctx, drive9.QuotaSetRequest{
 		TenantID:               tenantID,
 		PublicKey:              tidbCloudPublicKey,
@@ -376,19 +395,9 @@ func ExampleClient_quota() {
 		MaxStorageSize:         &storageSize,
 		MaxFileSize:            &fileSize,
 		MaxFileCount:           &fileCount,
+		MaxMediaLLMFiles:       &mediaLLMFiles,
+		MaxVideoLLMFiles:       &videoLLMFiles,
 		TiDBCloudSpendingLimit: &spendingLimit,
-	})
-
-	enabled := true
-	prompt := "extract structured attributes"
-	_, _ = credentialClient.AdminGetTenantExtractConfig(ctx, drive9.AdminTenantExtractConfigGetRequest{
-		TenantID: tenantID, MediaType: drive9.ExtractMediaTypeImage,
-		PublicKey: tidbCloudPublicKey, PrivateKey: tidbCloudPrivateKey,
-	})
-	_, _ = credentialClient.AdminSetTenantExtractConfig(ctx, drive9.AdminTenantExtractConfigSetRequest{
-		TenantID: tenantID, MediaType: drive9.ExtractMediaTypeImage,
-		PublicKey: tidbCloudPublicKey, PrivateKey: tidbCloudPrivateKey,
-		Enabled: &enabled, Prompt: &prompt,
 	})
 
 	poolSize := 10

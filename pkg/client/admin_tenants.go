@@ -254,20 +254,5 @@ func (c *Client) AdminDeleteTenant(ctx context.Context, req AdminTenantDeleteReq
 }
 
 func (c *Client) AdminSetTenantQuota(ctx context.Context, req QuotaSetRequest) (*QuotaResponse, error) {
-	body := struct {
-		PublicKey              string `json:"public_key"`
-		PrivateKey             string `json:"private_key"`
-		MaxStorageSize         *int64 `json:"max_storage_size,omitempty"`
-		MaxFileSize            *int64 `json:"max_file_size,omitempty"`
-		MaxFileCount           *int64 `json:"max_file_count,omitempty"`
-		TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
-	}{
-		PublicKey:              req.PublicKey,
-		PrivateKey:             req.PrivateKey,
-		MaxStorageSize:         req.MaxStorageSize,
-		MaxFileSize:            req.MaxFileSize,
-		MaxFileCount:           req.MaxFileCount,
-		TiDBCloudSpendingLimit: req.TiDBCloudSpendingLimit,
-	}
-	return c.postQuota(ctx, "/v1/admin/tenants/"+url.PathEscape(req.TenantID)+"/quota", body, "admin tenant quota set")
+	return c.postQuota(ctx, "/v1/admin/tenants/"+url.PathEscape(req.TenantID)+"/quota", quotaSetPayloadFromRequest(req, false), "admin tenant quota set")
 }

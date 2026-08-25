@@ -14,14 +14,18 @@ type QuotaConfig struct {
 	MaxStorageSize         int64  `json:"max_storage_size"`
 	MaxFileSize            int64  `json:"max_file_size"`
 	MaxFileCount           int64  `json:"max_file_count"`
-	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
+	MaxMediaLLMFiles       int64  `json:"max_media_llm_files"`
+	MaxVideoLLMFiles       int64  `json:"max_video_llm_files"`
+	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
 }
 
-// QuotaUsage is the tenant's current storage quota usage counters.
+// QuotaUsage is the tenant's current storage and extraction quota usage counters.
 type QuotaUsage struct {
-	StorageBytes  int64 `json:"storage_bytes"`
-	ReservedBytes int64 `json:"reserved_bytes"`
-	FileCount     int64 `json:"file_count"`
+	StorageBytes   int64 `json:"storage_bytes"`
+	ReservedBytes  int64 `json:"reserved_bytes"`
+	FileCount      int64 `json:"file_count"`
+	MediaFileCount int64 `json:"media_file_count"`
+	VideoFileCount int64 `json:"video_file_count"`
 }
 
 // QuotaResponse is returned by all quota query and update APIs.
@@ -52,6 +56,8 @@ type QuotaSetRequest struct {
 	MaxStorageSize         *int64 `json:"max_storage_size,omitempty"`
 	MaxFileSize            *int64 `json:"max_file_size,omitempty"`
 	MaxFileCount           *int64 `json:"max_file_count,omitempty"`
+	MaxMediaLLMFiles       *int64 `json:"max_media_llm_files,omitempty"`
+	MaxVideoLLMFiles       *int64 `json:"max_video_llm_files,omitempty"`
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
 }
 
@@ -81,7 +87,36 @@ func (c *Client) GetQuota(ctx context.Context, query QuotaRequest) (*QuotaRespon
 //
 // Deprecated: use AdminSetTenantQuota.
 func (c *Client) SetQuota(ctx context.Context, req QuotaSetRequest) (*QuotaResponse, error) {
-	return c.postQuota(ctx, "/v1/quota", req, "quota set")
+	return c.postQuota(ctx, "/v1/quota", quotaSetPayloadFromRequest(req, true), "quota set")
+}
+
+type quotaSetPayload struct {
+	TenantID               string `json:"tenant_id,omitempty"`
+	PublicKey              string `json:"public_key"`
+	PrivateKey             string `json:"private_key"`
+	MaxStorageSize         *int64 `json:"max_storage_size,omitempty"`
+	MaxFileSize            *int64 `json:"max_file_size,omitempty"`
+	MaxFileCount           *int64 `json:"max_file_count,omitempty"`
+	MaxMediaLLMFiles       *int64 `json:"max_media_llm_files,omitempty"`
+	MaxVideoLLMFiles       *int64 `json:"max_video_llm_files,omitempty"`
+	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
+}
+
+func quotaSetPayloadFromRequest(req QuotaSetRequest, includeTenantID bool) quotaSetPayload {
+	out := quotaSetPayload{
+		PublicKey:              req.PublicKey,
+		PrivateKey:             req.PrivateKey,
+		MaxStorageSize:         req.MaxStorageSize,
+		MaxFileSize:            req.MaxFileSize,
+		MaxFileCount:           req.MaxFileCount,
+		MaxMediaLLMFiles:       req.MaxMediaLLMFiles,
+		MaxVideoLLMFiles:       req.MaxVideoLLMFiles,
+		TiDBCloudSpendingLimit: req.TiDBCloudSpendingLimit,
+	}
+	if includeTenantID {
+		out.TenantID = req.TenantID
+	}
+	return out
 }
 
 func setQuotaHeaders(req *http.Request, publicKey, privateKey string) {

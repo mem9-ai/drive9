@@ -309,6 +309,20 @@ func TestRenderDrive9VisualHelpColor(t *testing.T) {
 	}
 }
 
+func TestRenderDrive9VisualHelpDocumentsLLMZeroAndOmissionSemantics(t *testing.T) {
+	out := renderDrive9VisualHelp(false)
+	for _, want := range []string{
+		"media LLM extract files; non-negative; 0 means unlimited;",
+		"omit to keep current; requires media extract config",
+		"video LLM extract files; non-negative; 0 means unlimited;",
+		"omit to keep current; requires video extract config",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("rendered help missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestIsPagerClosedPipe(t *testing.T) {
 	for _, err := range []error{
 		io.ErrClosedPipe,

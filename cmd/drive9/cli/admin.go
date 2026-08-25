@@ -350,21 +350,9 @@ func printAdminTenantList(out *client.AdminTenantListResponse, includeQuota bool
 func printAdminTenantTable(tenants []client.AdminTenant, includeQuota bool) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	if includeQuota {
-		_, _ = fmt.Fprintln(w, "TENANT_ID\tSTATUS\tKIND\tMAX_STORAGE\tMAX_FILE_SIZE\tMAX_FILE_COUNT\tSPENDING_LIMIT\tSTORAGE_USED\tRESERVED\tFILE_COUNT")
+		_, _ = fmt.Fprintln(w, quotaTableHeader(true))
 		for _, t := range tenants {
-			quota := t.Quota
-			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				t.TenantID,
-				t.Status,
-				t.Kind,
-				adminQuotaMaxStorage(quota),
-				adminQuotaMaxFileSize(quota),
-				adminQuotaMaxFileCount(quota),
-				adminQuotaSpendingLimit(quota),
-				adminQuotaStorageUsed(quota),
-				adminQuotaReserved(quota),
-				adminQuotaFileCount(quota),
-			)
+			_, _ = fmt.Fprintln(w, quotaTableRow(t.TenantID, t.Status, t.Kind, t.Quota, true))
 		}
 	} else {
 		_, _ = fmt.Fprintln(w, "TENANT_ID\tSTATUS\tKIND")
@@ -373,58 +361,6 @@ func printAdminTenantTable(tenants []client.AdminTenant, includeQuota bool) erro
 		}
 	}
 	return w.Flush()
-}
-
-func adminQuotaMaxStorage(quota *client.AdminTenantQuota) string {
-	if quota == nil {
-		return "-"
-	}
-	return fmt.Sprintf("%d Mi", quota.Config.MaxStorageSize)
-}
-
-func adminQuotaMaxFileSize(quota *client.AdminTenantQuota) string {
-	if quota == nil {
-		return "-"
-	}
-	return fmt.Sprintf("%d Mi", quota.Config.MaxFileSize)
-}
-
-func adminQuotaMaxFileCount(quota *client.AdminTenantQuota) string {
-	if quota == nil {
-		return "-"
-	}
-	if quota.Config.MaxFileCount == 0 {
-		return "unlimited"
-	}
-	return fmt.Sprintf("%d", quota.Config.MaxFileCount)
-}
-
-func adminQuotaSpendingLimit(quota *client.AdminTenantQuota) string {
-	if quota == nil || quota.Config.TiDBCloudSpendingLimit == nil {
-		return "-"
-	}
-	return fmt.Sprintf("%d", *quota.Config.TiDBCloudSpendingLimit)
-}
-
-func adminQuotaStorageUsed(quota *client.AdminTenantQuota) string {
-	if quota == nil {
-		return "-"
-	}
-	return formatBytes(quota.Usage.StorageBytes)
-}
-
-func adminQuotaReserved(quota *client.AdminTenantQuota) string {
-	if quota == nil {
-		return "-"
-	}
-	return formatBytes(quota.Usage.ReservedBytes)
-}
-
-func adminQuotaFileCount(quota *client.AdminTenantQuota) string {
-	if quota == nil {
-		return "-"
-	}
-	return fmt.Sprintf("%d", quota.Usage.FileCount)
 }
 
 func adminTenantDelete(args []string) error {
@@ -794,6 +730,8 @@ flags:
   --max-storage-size Mi            set-quota: max confirmed+reserved storage size in Mi
   --max-file-size Mi               set-quota: max single file size in Mi
   --max-file-count N               set-quota: max confirmed file count; 0 means unlimited
+  --max-media-llm-files N          set-quota: max media LLM extract files; non-negative; 0 means unlimited; omit to keep current; requires media extract config
+  --max-video-llm-files N          set-quota: max video LLM extract files; non-negative; 0 means unlimited; omit to keep current; requires video extract config
   --tidbcloud-spending-limit N     set-quota: TiDB Cloud Cluster Spending Limit
   --json                           output result as JSON when supported
 

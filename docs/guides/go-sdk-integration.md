@@ -87,7 +87,7 @@ capability token, such as a vault JWT. Filesystem commands normally use
 The SDK exposes typed admin tenant and quota helpers in `pkg/client`. See
 [`docs/guides/quota.md`](quota.md) for the full CLI and HTTP reference.
 
-Get a `tidb_cloud_native` tenant with quota:
+Get a `tidb_cloud_native` or `tidb_cloud_native_shared` tenant with quota:
 
 ```go
 tenant, err := drive9.New(serverURL, "").AdminGetTenant(ctx, drive9.QuotaRequest{
@@ -102,20 +102,31 @@ quota := tenant.Quota
 _ = quota.Config.MaxStorageSize
 _ = quota.Config.MaxFileSize
 _ = quota.Config.MaxFileCount
+_ = quota.Config.MaxMediaLLMFiles
+_ = quota.Config.MaxVideoLLMFiles
 _ = quota.Config.TiDBCloudSpendingLimit
 _ = quota.Usage.FileCount
+_ = quota.Usage.MediaFileCount
+_ = quota.Usage.VideoFileCount
 ```
 
-Set quota for a `tidb_cloud_native` tenant with TiDB Cloud credentials.
-`MaxStorageSize` and `MaxFileSize` are in Mi. `MaxFileSize` must be no larger
-than the server `DRIVE9_MAX_UPLOAD_BYTES` limit. `MaxFileCount` uses `0` for
-unlimited. `TiDBCloudSpendingLimit` updates the TiDB Cloud Cluster Spending
-Limit.
+Set quota for a `tidb_cloud_native` or `tidb_cloud_native_shared` tenant with
+TiDB Cloud credentials. `MaxStorageSize` and `MaxFileSize` are in Mi.
+`MaxFileSize` must be no larger than the server `DRIVE9_MAX_UPLOAD_BYTES` limit.
+`MaxFileCount`, `MaxMediaLLMFiles`, and `MaxVideoLLMFiles` use `0` for
+unlimited. A nil pointer omits that request field and leaves the current value
+unchanged. `MaxMediaLLMFiles` and `MaxVideoLLMFiles` require the corresponding
+tenant-specific extract config to be enabled before they can be changed. The
+extract config, rather than a nonzero quota, enables or disables extraction.
+Shared tenants accept and ignore `TiDBCloudSpendingLimit`; dedicated tenants
+retain the TiDB Cloud behavior.
 
 ```go
 storageSize := int64(102400)
 fileSize := int64(1024)
 fileCount := int64(100000)
+mediaLLMFiles := int64(400)
+videoLLMFiles := int64(50)
 spendingLimit := int64(10000)
 
 quota, err := drive9.New(serverURL, "").AdminSetTenantQuota(ctx, drive9.QuotaSetRequest{
@@ -125,6 +136,8 @@ quota, err := drive9.New(serverURL, "").AdminSetTenantQuota(ctx, drive9.QuotaSet
 	MaxStorageSize:         &storageSize,
 	MaxFileSize:            &fileSize,
 	MaxFileCount:           &fileCount,
+	MaxMediaLLMFiles:       &mediaLLMFiles,
+	MaxVideoLLMFiles:       &videoLLMFiles,
 	TiDBCloudSpendingLimit: &spendingLimit,
 })
 if err != nil {
