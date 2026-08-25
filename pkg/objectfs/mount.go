@@ -527,24 +527,31 @@ func (fs *rcloneFUSE) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, o
 	if status != gofuse.OK {
 		return status
 	}
-	node, err := fs.v.Stat(p)
-	if err != nil {
-		return mapVFSErr(err)
-	}
 	if input.Valid&(gofuse.FATTR_MODE|gofuse.FATTR_UID|gofuse.FATTR_GID) != 0 {
 		return gofuse.ENOSYS
 	}
-	if size, ok := input.GetSize(); ok {
-		if file, isFile := node.(*vfs.File); isFile {
-			if err := file.Truncate(int64(size)); err != nil {
-				return mapVFSErr(err)
+	var node vfs.Node
+	if st := fs.withOp(cancel, func(context.Context) error {
+		var err error
+		node, err = fs.v.Stat(p)
+		if err != nil {
+			return err
+		}
+		if size, ok := input.GetSize(); ok {
+			if file, isFile := node.(*vfs.File); isFile {
+				if err := file.Truncate(int64(size)); err != nil {
+					return err
+				}
 			}
 		}
-	}
-	if mtime, ok := input.GetMTime(); ok {
-		if err := node.SetModTime(mtime); err != nil {
-			return mapVFSErr(err)
+		if mtime, ok := input.GetMTime(); ok {
+			if err := node.SetModTime(mtime); err != nil {
+				return err
+			}
 		}
+		return nil
+	}); st != gofuse.OK {
+		return st
 	}
 	fs.fillAttr(&out.Attr, node)
 	return gofuse.OK
@@ -726,6 +733,11 @@ func (fs *rcloneFUSE) takeHandle(id uint64) *fuseHandle {
 }
 
 func (fs *rcloneFUSE) withOp(cancel <-chan struct{}, fn func(context.Context) error) gofuse.Status {
+	select {
+	case <-cancelOrNil(cancel):
+		return mapVFSErr(context.Canceled)
+	default:
+	}
 	ctx, stop := context.WithTimeout(context.Background(), fuseOpTimeout)
 	defer stop()
 	done := make(chan error, 1)

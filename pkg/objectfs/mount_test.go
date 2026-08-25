@@ -173,6 +173,60 @@ func TestRcloneFUSEOpCancel(t *testing.T) {
 	}
 }
 
+func TestRcloneFUSESetAttrSize(t *testing.T) {
+	ofs, dir := testWriteVFS(t)
+	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var ent gofuse.EntryOut
+	if st := ofs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "hello.txt", &ent); st != gofuse.OK {
+		t.Fatalf("Lookup: %v", st)
+	}
+	var openOut gofuse.OpenOut
+	if st := ofs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ent.NodeId},
+		Flags:    uint32(os.O_RDWR),
+	}, &openOut); st != gofuse.OK {
+		t.Fatalf("Open: %v", st)
+	}
+	defer ofs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+	var out gofuse.AttrOut
+	st := ofs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ent.NodeId},
+		Valid:    gofuse.FATTR_SIZE,
+		Size:     1,
+	}}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr: %v", st)
+	}
+	var attr gofuse.AttrOut
+	if st := ofs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ent.NodeId}}, &attr); st != gofuse.OK {
+		t.Fatalf("GetAttr: %v", st)
+	}
+	if attr.Size != 1 {
+		t.Fatalf("size=%d", attr.Size)
+	}
+}
+
+func TestRcloneFUSESetAttrCancel(t *testing.T) {
+	ofs, _ := testVFS(t)
+	var ent gofuse.EntryOut
+	if st := ofs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "hello.txt", &ent); st != gofuse.OK {
+		t.Fatalf("Lookup: %v", st)
+	}
+	ch := make(chan struct{})
+	close(ch)
+	var out gofuse.AttrOut
+	st := ofs.SetAttr(ch, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ent.NodeId},
+		Valid:    gofuse.FATTR_SIZE,
+		Size:     1,
+	}}, &out)
+	if st != gofuse.Status(syscall.ETIMEDOUT) {
+		t.Fatalf("status=%v want ETIMEDOUT (SetAttr must honor kernel cancel)", st)
+	}
+}
+
 func TestRcloneFUSEReadDir(t *testing.T) {
 	ofs, _ := testVFS(t)
 	buf := make([]byte, 4096)
