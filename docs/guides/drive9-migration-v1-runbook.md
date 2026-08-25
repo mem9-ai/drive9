@@ -73,6 +73,14 @@ credential reference is only a Secret-volume filename; the API key itself must
 exist only in the read-only Secret volume at
 `/var/run/secrets/drive9-migration/<credential_ref>`.
 
+The ConfigMap does not contain `tenant_id`. At each `plan` and `run` startup,
+Migration authenticates every configured credential against `/v1/status`,
+resolves its actual `tenant_id`, and rejects overlapping Prefixes across
+different credential filenames that reach the same Tenant/Space. Every
+configured credential must resolve before any Worker starts. After that
+batch safety gate succeeds, Job initialization and runtime failures remain per
+Job.
+
 The sample demonstrates one EBS with three customer subpath mappings:
 
 | EBS subpath | Drive9 target | Job ID |
@@ -105,6 +113,11 @@ The `plan` JSON is the non-sensitive CSI handoff record: verify `job_id`,
 `prefix`, `credential_ref`, source identity, limits, target emptiness, and
 required capabilities for every Job. It never returns an API key. Plan retains
 all Job results and exits nonzero if any Job fails.
+
+An older Server that omits `/v1/status.tenant_id` is unsupported for this v4
+multi-Job flow. Credential rotation is accepted only when the replacement key
+returns the same process-lifetime `tenant_id`; a different tenant fails the Job
+closed before the client is swapped.
 
 ## Kubernetes single-PVC trial
 

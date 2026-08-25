@@ -201,6 +201,81 @@ func TestMigrationCapabilityOldServerIsRecognizablyUnsupported(t *testing.T) {
 	}
 }
 
+func TestMigrationTenantIdentityContract(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		body        string
+		want        string
+		unsupported bool
+		wantError   bool
+	}{
+		{name: "present", body: `{"tenant_id":"tenant-a","unknown":"ignored"}`, want: "tenant-a"},
+		{name: "missing", body: `{"status":"active"}`, unsupported: true},
+		{name: "empty", body: `{"tenant_id":""}`, unsupported: true},
+		{name: "whitespace padded", body: `{"tenant_id":" tenant-a "}`, unsupported: true},
+		{name: "malformed", body: `{"tenant_id":42}`, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			got, err := New(srv.URL, "").GetMigrationTenantID(context.Background())
+			switch {
+			case tc.unsupported && !errors.Is(err, ErrMigrationUnsupported):
+				t.Fatalf("error = %v, want ErrMigrationUnsupported", err)
+			case tc.wantError && err == nil:
+				t.Fatal("error = nil, want decode error")
+			case !tc.unsupported && !tc.wantError && err != nil:
+				t.Fatal(err)
+			case err == nil && got != tc.want:
+				t.Fatalf("tenant ID = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMigrationTenantIdentitySharesStatusCacheWithCapabilities(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(`{"tenant_id":"tenant-a","max_upload_bytes":1048576,"inline_threshold":7,"migration_capabilities":{"checksum_read":true}}`))
+	}))
+	defer srv.Close()
+
+	client := New(srv.URL, "")
+	tenantID, err := client.GetMigrationTenantID(context.Background())
+	if err != nil || tenantID != "tenant-a" {
+		t.Fatalf("tenant ID = %q, error = %v", tenantID, err)
+	}
+	caps, err := client.GetMigrationCapabilities(context.Background())
+	if err != nil || !caps.ChecksumRead || hits.Load() != 1 {
+		t.Fatalf("capabilities = %+v, hits = %d, error = %v", caps, hits.Load(), err)
+	}
+}
+
+func TestMigrationTenantIdentityStatusFailureRetries(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) == 1 {
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`{"tenant_id":"tenant-a"}`))
+	}))
+	defer srv.Close()
+
+	client := New(srv.URL, "")
+	if _, err := client.GetMigrationTenantID(context.Background()); err == nil {
+		t.Fatal("status failure error = nil")
+	}
+	tenantID, err := client.GetMigrationTenantID(context.Background())
+	if err != nil || tenantID != "tenant-a" || hits.Load() != 2 {
+		t.Fatalf("tenant ID = %q, hits = %d, error = %v", tenantID, hits.Load(), err)
+	}
+}
+
 func TestMigrationCapabilityStatusErrorsAreTypedAndRetryable(t *testing.T) {
 	for _, status := range []int{
 		http.StatusUnauthorized,

@@ -74,6 +74,31 @@ func TestManagerValidatesSharedMappingsBeforeJobLoops(t *testing.T) {
 	}
 }
 
+func TestManagerAuthenticatedTargetGateFailsBeforeJobLoops(t *testing.T) {
+	gateErr := errors.New("authenticated target overlap")
+	var preflightCalls, workerCalls int
+	manager, err := newManagerWithDependencies(testRuntimeStartup("job-a", "job-b"), managerDependencies{
+		validateTargets: func(context.Context, *RuntimeStartup) error { return gateErr },
+		preflight: func(context.Context, *Startup) (PreflightResult, error) {
+			preflightCalls++
+			return PreflightResult{}, nil
+		},
+		newWorker: func(context.Context, *Startup) (*Worker, error) {
+			workerCalls++
+			return &Worker{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Run(context.Background()); !errors.Is(err, gateErr) {
+		t.Fatalf("manager error = %v, want target gate error", err)
+	}
+	if preflightCalls != 0 || workerCalls != 0 {
+		t.Fatalf("target gate failure reached preflight=%d worker=%d", preflightCalls, workerCalls)
+	}
+}
+
 func TestManagerRetriesOneJobWithoutBlockingSibling(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -81,6 +106,7 @@ func TestManagerRetriesOneJobWithoutBlockingSibling(t *testing.T) {
 	calls := make(map[string]int)
 	running := make(chan string, 2)
 	manager, err := newManagerWithDependencies(testRuntimeStartup("job-a", "job-b"), managerDependencies{
+		validateTargets: func(context.Context, *RuntimeStartup) error { return nil },
 		preflight: func(_ context.Context, startup *Startup) (PreflightResult, error) {
 			mu.Lock()
 			calls[startup.Job.JobID]++
@@ -132,6 +158,7 @@ func TestManagerPermanentFailureStopsOnlyOneJob(t *testing.T) {
 	failed := make(chan struct{}, 1)
 	running := make(chan struct{}, 1)
 	manager, err := newManagerWithDependencies(testRuntimeStartup("job-a", "job-b"), managerDependencies{
+		validateTargets: func(context.Context, *RuntimeStartup) error { return nil },
 		preflight: func(_ context.Context, startup *Startup) (PreflightResult, error) {
 			if startup.Job.JobID == "job-a" {
 				failed <- struct{}{}

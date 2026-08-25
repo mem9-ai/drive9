@@ -91,6 +91,9 @@ func TestLoadRuntimeStartupResolvesEverySubpathWithoutReadingCredentials(t *test
 	if len(runtime.Jobs) != 2 {
 		t.Fatalf("Jobs=%d", len(runtime.Jobs))
 	}
+	if len(runtime.targetCredentials) != 2 {
+		t.Fatalf("target credentials=%d, want 2", len(runtime.targetCredentials))
+	}
 	for index, expected := range []struct {
 		jobID   string
 		subpath string
@@ -100,6 +103,33 @@ func TestLoadRuntimeStartupResolvesEverySubpathWithoutReadingCredentials(t *test
 		if job.JobID != expected.jobID || job.Subpath != expected.subpath || job.EBSRoot != "/ebs/001" || job.Source.Root != filepath.Clean(expected.root) {
 			t.Fatalf("Job %d=%+v", index, job)
 		}
+		if runtime.Jobs[index].Credential.path != runtime.targetCredentials[job.Target.SpaceRef].path {
+			t.Fatalf("Job %d credential does not reuse complete target mapping", index)
+		}
+	}
+}
+
+func TestLoadRuntimeStartupRetainsCredentialsForOtherConfiguredSources(t *testing.T) {
+	body := strings.Replace(validV4ConfigYAML, "ebs_sources:\n", "  space-c:\n    credential_ref: space-c-key\nebs_sources:\n", 1)
+	body += `  - volume_id: vol-002
+    node_name: node-b
+    root: /ebs/002
+    jobs:
+      - job_id: vol-002-user-c
+        subpath: /C
+        target:
+          space_ref: space-c
+          prefix: /
+`
+	runtime, err := LoadRuntimeStartup(writeConfig(t, body), "node-a", string(PhaseSyncing), t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runtime.Jobs) != 2 || len(runtime.targetCredentials) != 3 {
+		t.Fatalf("local Jobs=%d target credentials=%d", len(runtime.Jobs), len(runtime.targetCredentials))
+	}
+	if filepath.Base(runtime.targetCredentials["space-c"].path) != "space-c-key" {
+		t.Fatalf("other-source credential=%q", runtime.targetCredentials["space-c"].path)
 	}
 }
 

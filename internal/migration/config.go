@@ -400,22 +400,24 @@ func (s CredentialSource) Read() (string, error) {
 
 // Startup is a secret-free immutable startup snapshot plus a reloadable source.
 type Startup struct {
-	Config         *Config          `json:"config"`
-	Job            Job              `json:"job"`
-	Space          SpaceConfig      `json:"space"`
-	Phase          Phase            `json:"phase"`
-	ConfigHash     string           `json:"config_hash"`
-	Credential     CredentialSource `json:"-"`
-	acceptedSource sourceMountIdentity
-	mountProbe     sourceMountProbe
+	Config           *Config          `json:"config"`
+	Job              Job              `json:"job"`
+	Space            SpaceConfig      `json:"space"`
+	Phase            Phase            `json:"phase"`
+	ConfigHash       string           `json:"config_hash"`
+	Credential       CredentialSource `json:"-"`
+	acceptedTenantID string
+	acceptedSource   sourceMountIdentity
+	mountProbe       sourceMountProbe
 }
 
 // RuntimeStartup is the secret-free startup snapshot for one EBS process.
 type RuntimeStartup struct {
-	Config *Config         `json:"config"`
-	Source EBSSourceConfig `json:"source"`
-	Phase  Phase           `json:"phase"`
-	Jobs   []*Startup      `json:"jobs"`
+	Config            *Config         `json:"config"`
+	Source            EBSSourceConfig `json:"source"`
+	Phase             Phase           `json:"phase"`
+	Jobs              []*Startup      `json:"jobs"`
+	targetCredentials map[string]CredentialSource
 }
 
 // ConfigHash hashes only one Job's normalized immutable configuration.
@@ -467,14 +469,26 @@ func LoadRuntimeStartup(configPath, nodeName, environmentPhase, credentialRoot s
 	if err != nil {
 		return nil, err
 	}
-	runtime := &RuntimeStartup{Config: cfg, Source: source, Phase: phase, Jobs: make([]*Startup, 0, len(source.Jobs))}
+	runtime := &RuntimeStartup{
+		Config: cfg, Source: source, Phase: phase, Jobs: make([]*Startup, 0, len(source.Jobs)),
+		targetCredentials: make(map[string]CredentialSource),
+	}
+	for _, job := range cfg.Jobs {
+		spaceRef := job.Target.SpaceRef
+		if _, exists := runtime.targetCredentials[spaceRef]; exists {
+			continue
+		}
+		space := cfg.Spaces[spaceRef]
+		credential, err := NewCredentialSource(credentialRoot, space.CredentialRef)
+		if err != nil {
+			return nil, fmt.Errorf("resolve credential for Space %q: %w", spaceRef, err)
+		}
+		runtime.targetCredentials[spaceRef] = credential
+	}
 	for _, configured := range source.Jobs {
 		job := resolveJob(source, configured)
 		space := cfg.Spaces[job.Target.SpaceRef]
-		credential, err := NewCredentialSource(credentialRoot, space.CredentialRef)
-		if err != nil {
-			return nil, fmt.Errorf("resolve credential for Job %q: %w", job.JobID, err)
-		}
+		credential := runtime.targetCredentials[job.Target.SpaceRef]
 		hash, err := ConfigHash(cfg, job)
 		if err != nil {
 			return nil, err
