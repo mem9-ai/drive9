@@ -2783,12 +2783,12 @@ func TestInitTenantSchemaAsyncRecordsOrgScopedEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := NewWithConfig(Config{
-		Meta:        metaStore,
-		Pool:        db.Pool,
-		Provisioner: &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
-	})
-	defer srv.Close()
+	srv := &Server{
+		meta:        metaStore,
+		pool:        db.Pool,
+		provisioner: &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
+		metrics:     newServerMetrics(),
+	}
 	dsn := tenantDSN(db.DBUser, db.DBPass, db.DBHost, db.DBPort, db.DBName, false, tenant.ProviderTiDBCloudNative)
 	srv.initTenantSchemaAsync(context.Background(), tenantID, dsn, tenant.ProviderTiDBCloudNative, func(context.Context, string) error {
 		return nil
