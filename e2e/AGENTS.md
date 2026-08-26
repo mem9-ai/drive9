@@ -122,6 +122,14 @@ OBJECT_STRICT_MOUNT=1 bash e2e/object-store-smoke-test.sh
 # ENDPOINT, STS_ENDPOINT, ACCOUNT_ID, PREFIX, ROLE_ARN.
 bash e2e/object-auth-smoke-test.sh
 
+# Hosted first-wave isolation / mount / STS-refresh coverage (manual-only).
+# Same admin keys + bucket as object-auth-smoke-test.sh. COS needs REGION +
+# ACCOUNT_ID (APPID). TOS needs ROLE_ARN + REGION. Refresh uses
+# DRIVE9_OBJECT_SESSION_REFRESH_{MIN,MAX}_LEAD so remint is seconds, not ~45m.
+bash e2e/object-auth-s3-hosted-test.sh
+bash e2e/object-auth-cos-hosted-test.sh
+bash e2e/object-auth-tos-hosted-test.sh
+
 # Optional extra object step inside cli-smoke-test.sh against a real bucket.
 DRIVE9_E2E_S3_URI='s3://bucket/prefix/?region=us-east-1' bash e2e/cli-smoke-test.sh
 

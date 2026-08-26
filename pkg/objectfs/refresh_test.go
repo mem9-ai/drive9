@@ -35,6 +35,14 @@ func TestSessionRefreshWait(t *testing.T) {
 	}
 }
 
+func TestSessionRefreshWaitLargeLeadRefreshesSoon(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	got := sessionRefreshWaitLeads(now.Add(time.Hour), now, 59*time.Minute+50*time.Second, 59*time.Minute+50*time.Second)
+	if got != 10*time.Second {
+		t.Fatalf("aggressive lead wait=%s want 10s", got)
+	}
+}
+
 func TestParseSessionExpiry(t *testing.T) {
 	got := ParseSessionExpiry("2026-08-24T13:00:00Z")
 	if got.UTC().Format(time.RFC3339) != "2026-08-24T13:00:00Z" {

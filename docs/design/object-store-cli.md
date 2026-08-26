@@ -1,7 +1,7 @@
 # Object-store access from the drive9 CLI
 
 **Status:** implemented
-**Date:** 2026-08-24
+**Date:** 2026-08-26
 **Audience:** operators and users of `drive9 fs` / `drive9 mount`
 
 ---
@@ -50,66 +50,57 @@ There are two modes. **Server mint is the default.**
 
 The CLI asks drive9-server for short-lived credentials, then the **laptop talks
 to the object store directly**. File bytes do not pass through drive9-server.
+AWS / TOS / COS environment variables already on the laptop are ignored.
 
 That only works after an org admin has configured:
 
-1. An **object backend** for the bucket (the high-privilege identity).
-2. An **object namespace** for this tenant (the customer’s own prefix id).
+1. An **object backend** for the bucket — the high-privilege identity Drive9
+   uses to mint.
+2. An **object namespace** for this tenant — the customer’s own prefix id,
+   not the Drive9 tenant id.
 
 If either is missing, the command fails closed. A tenant API key cannot change
-the mapping; it can only request a minted session.
+the mapping; it can only request a minted session. Scoped (workspace-zone)
+tokens cannot mint.
 
-Minted credentials are scoped to that tenant’s prefix. A key minted for
-`s3://bucket/acme-prod/` cannot list or write `s3://bucket/acme-other/`.
+On **S3, COS, and TOS**, a minted session is prefix-scoped to the namespace
+bound to that tenant. A session minted for `s3://bucket/acme-prod/` cannot
+list or write `s3://bucket/acme-other/`, and cannot list a sibling such as
+`acme-prod-evil/`. Isolation is a mint-time URI check plus a vendor session
+policy (`prefix/` and `prefix/*`). GCS and Azure are not prefix-scoped; see
+[Other schemes](#other-schemes-oss-gcs-azure).
+
+The namespace id is an operator choice. The server does not require it to be
+unique: two tenants bound to the same non-empty id receive credentials for
+the same prefix and can see each other’s objects. Bind distinct ids unless
+you intend that sharing.
 
 Reads get a read-only session. Writes, deletes, mkdir, and a writable mount
-get a write session.
+get a write session. A read that later needs to write remints.
 
-Server mint covers **S3, COS, TOS, OSS, GCS, and Azure**.
-
-- **S3** (and S3-compatible STS): `GetFederationToken` for static keys,
-  `AssumeRole` for a role. `--sts-endpoint` overrides the STS URL (MinIO STS,
-  custom gateways).
-- **COS**: Tencent CAM `GetFederationToken` (static) or `AssumeRole`. Set
-  `--account-id` to the APPID, or use a `bucket-appid` name.
-- **TOS / OSS**: Volcengine / Aliyun **AssumeRole** only (`--role-arn` is
-  required). Those clouds have no AWS-style federation token.
-- **GCS**: server holds a service-account JSON and mints a short-lived OAuth
-  access token. The token has the **same IAM as that service account** — it is
-  not downscoped to one bucket. Register one SA per bucket (or an SA that can
-  only access that bucket). Namespace must match the bucket; backend prefix
-  must be empty.
-- **Azure**: server holds the storage account key and mints a container SAS
-  cryptographically scoped to that container. Isolation is **one container per
-  tenant** (namespace must match the container; backend prefix must be empty).
-
-### Escape hatch: `--auth=local`
-
-Use the cloud’s native credential chain on this machine (environment variables,
-shared config, instance role, gcloud/Azure CLI, and so on). drive9-server is
-not involved.
-
-```bash
-drive9 fs ls --auth=local s3://bucket/prefix/
-AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
-  drive9 fs cp --auth=local ./file s3://minio-bucket/file?endpoint=http://127.0.0.1:9000&forcePathStyle=true
-```
-
-Local auth is for laptops, CI against MinIO, and stores that are not wired up
-on the server. It is **not** a silent fallback: if you omit `--auth=local`,
-existing AWS/TOS env vars are ignored.
-
-`--auth` is accepted on `fs` commands and on `mount`.
-
----
-
-## How an org admin sets this up
+Default session TTL is 1 hour (`--max-session-ttl` on the backend, capped at
+12 hours). Server-minted mounts remint before expiry and refresh credentials
+on the **same** rclone remote, so copy/rename inside the bucket stay
+server-side.
 
 Admin commands use **TiDB Cloud public/private keys**, the same identity as
 `drive9 admin tenant create` and `extract-config`. They sit next to `tenant`
-and `pool`, not under a tenant API key.
+and `pool`, not under a tenant API key. Tenant users then use a normal tenant
+API key with `drive9 fs` / `drive9 mount`.
 
-### 1. Register the bucket
+The common workflow:
+
+1. In the cloud console, create a bucket and an identity Drive9 can use to
+   mint (see the S3 / COS / TOS sections below).
+2. Register that identity as an object backend. Secrets are stored encrypted;
+   `ls` / `get` never print them. `update --id` rotates a key in place.
+3. Bind each drive9 tenant to a prefix id
+   (`drive9 admin tenant object-namespace set`). Distinct ids isolate
+   tenants; the same id is allowed and means they share that prefix.
+   Empty namespace (the default, or `object-namespace clear`) means mint is
+   refused.
+4. Give the tenant its API key. Users talk to URIs under that prefix — no
+   long-lived cloud keys on the laptop.
 
 ```bash
 drive9 admin object-backend add \
@@ -120,47 +111,307 @@ drive9 admin object-backend add \
   --secret-access-key ... \
   --tidbcloud-public-key <public-key> \
   --tidbcloud-private-key <private-key>
-```
 
-`--credential-kind role` with `--role-arn` is the other option (optional
-access key; otherwise the server’s own IAM is used to assume the role).
-
-An org may register **more than one backend** for the same bucket (different
-`--prefix` or `--endpoint`). Mint picks the longest matching prefix; pass
-`?endpoint=` on the URI when two endpoints share a bucket name.
-
-`ls` never prints secrets. `get --id` shows one row. `update --id` patches
-fields in place — use it to rotate `--secret-access-key` without delete+add.
-`rm --id` deletes a backend.
-
-Optional flags: `--name`, `--sts-endpoint`, `--account-id`, `--max-session-ttl`,
-`--prefix` (extra path **above** every tenant namespace in that bucket).
-
-### 2. Bind this tenant to a customer prefix
-
-The prefix is the **customer’s own id**, not the drive9 tenant id.
-
-```bash
 drive9 admin tenant object-namespace set \
   --tenant-id tnt_xxx \
   --namespace-id acme-prod \
   --tidbcloud-public-key <public-key> \
   --tidbcloud-private-key <private-key>
-```
 
-After this, the tenant may mint sessions only under `s3://example/acme-prod/`.
-Empty namespace (the default, or `object-namespace clear`) means mint is
-refused.
-
-`get` / `set` / `clear` are the same shape as `admin tenant extract-config`.
-
-Typical tenant command after setup:
-
-```bash
+# tenant API key from here on — omit --auth, or pass --auth=server
 drive9 fs ls s3://example/acme-prod/
 drive9 fs cp ./report.pdf s3://example/acme-prod/report.pdf --force
+drive9 mount s3://example/acme-prod/ ./mnt   # macOS: --mode=fuse
+```
+
+Optional backend flags: `--name`, `--sts-endpoint`, `--account-id`,
+`--max-session-ttl`, `--endpoint`, `--force-path-style`, `--prefix` (extra
+path **above** every tenant namespace in that bucket). An org may register
+**more than one backend** for the same bucket (different `--prefix` or
+`--endpoint`). Mint picks the longest matching prefix; pass `?endpoint=` on
+the URI when two endpoints share a bucket name.
+
+The mint response fills region, endpoint, account id, and path-style from the
+registered backend, so tenant URIs usually do not need `?region=` /
+`?endpoint=`.
+
+First-wave customer storage is **Amazon S3, Tencent COS, and Volcengine TOS**.
+OSS, GCS, and Azure also mint; see [Other schemes](#other-schemes-oss-gcs-azure).
+
+### Amazon S3 (`s3://`)
+
+Drive9 mints an AWS STS session and downscopes it to this tenant’s prefix.
+Static keys use `GetFederationToken`. A role uses `AssumeRole`.
+
+**What to prepare in AWS**
+
+1. Create a dedicated bucket (or a prefix you will isolate per tenant).
+2. Create an IAM user (recommended for hosted Drive9) whose keys Drive9 will
+   hold. Do **not** hand those keys to tenant users.
+3. Attach a policy that already allows every S3 action the minted session
+   will need on this bucket, plus `sts:GetFederationToken`. STS can only
+   **narrow** permissions; it cannot grant what the caller does not have.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:GetFederationToken",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::example",
+        "arn:aws:s3:::example/*"
+      ]
+    }
+  ]
+}
+```
+
+4. Create an access key for that user.
+
+**Register the backend**
+
+```bash
+drive9 admin object-backend add \
+  --scheme s3 --bucket example \
+  --region ap-southeast-1 \
+  --credential-kind static \
+  --access-key-id AKI... \
+  --secret-access-key ... \
+  --tidbcloud-public-key <public-key> \
+  --tidbcloud-private-key <private-key>
+```
+
+To mint via a role instead: create a role with the S3 permissions above, let
+the IAM user (or Drive9’s own instance role, self-hosted only) assume it, and
+register `--credential-kind role --role-arn arn:aws:iam::ACCOUNT:role/NAME`.
+Hosted Drive9 still needs `--access-key-id` / `--secret-access-key` of a
+caller that can assume that role. `--external-id` is supported when the role
+trust policy requires it.
+
+S3-compatible endpoints (MinIO and similar): set `--endpoint` and
+`--sts-endpoint`, and usually `--force-path-style`.
+
+**Bind the tenant and use it**
+
+```bash
+drive9 admin tenant object-namespace set \
+  --tenant-id tnt_xxx --namespace-id acme-prod \
+  --tidbcloud-public-key <public-key> \
+  --tidbcloud-private-key <private-key>
+
+drive9 fs ls s3://example/acme-prod/
+drive9 fs cat s3://example/acme-prod/readme.txt
+drive9 fs cp ./file s3://example/acme-prod/file --force
 drive9 mount s3://example/acme-prod/ ./mnt
 ```
+
+A tenant URI outside `acme-prod/` is refused at mint time. A minted session
+that is asked to `ListBucket` under another prefix is refused by AWS.
+
+AWS `GetFederationToken` requires a session of at least 15 minutes; leave
+`--max-session-ttl` at the default (1 hour) unless you have a reason not to.
+
+### Tencent COS (`cos://`)
+
+Drive9 mints a Tencent CAM STS session. Static keys use `GetFederationToken`.
+A role uses `AssumeRole`. Region and APPID are required for mint.
+
+**What to prepare in Tencent Cloud**
+
+1. Create a COS bucket. The bucket name includes the APPID, for example
+   `example-1250000000`.
+2. Create a CAM user whose SecretId / SecretKey Drive9 will hold. Do **not**
+   hand those keys to tenant users.
+3. Grant that user `name/sts:GetFederationToken` (or `name/sts:AssumeRole`
+   if you will register a role) **and** COS object/bucket actions on this
+   bucket. CAM federation, like AWS, can only downscope.
+
+A working CAM policy for static mint looks like:
+
+```json
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "effect": "allow",
+      "action": ["name/sts:GetFederationToken"],
+      "resource": ["*"]
+    },
+    {
+      "effect": "allow",
+      "action": [
+        "name/cos:GetObject",
+        "name/cos:HeadObject",
+        "name/cos:PutObject",
+        "name/cos:PostObject",
+        "name/cos:DeleteObject",
+        "name/cos:GetBucket",
+        "name/cos:HeadBucket",
+        "name/cos:InitiateMultipartUpload",
+        "name/cos:ListMultipartUploads",
+        "name/cos:ListParts",
+        "name/cos:UploadPart",
+        "name/cos:CompleteMultipartUpload",
+        "name/cos:AbortMultipartUpload"
+      ],
+      "resource": [
+        "qcs::cos:ap-beijing:uid/1250000000:example-1250000000",
+        "qcs::cos:ap-beijing:uid/1250000000:example-1250000000/*"
+      ]
+    }
+  ]
+}
+```
+
+Replace region, APPID, and bucket with yours. Create an API key for the CAM
+user.
+
+**Register the backend**
+
+```bash
+drive9 admin object-backend add \
+  --scheme cos --bucket example-1250000000 \
+  --region ap-beijing \
+  --account-id 1250000000 \
+  --credential-kind static \
+  --access-key-id AKI... \
+  --secret-access-key ... \
+  --tidbcloud-public-key <public-key> \
+  --tidbcloud-private-key <private-key>
+```
+
+`--region` is required (the COS region, for example `ap-beijing` or
+`ap-guangzhou`). `--account-id` is the numeric APPID; if you omit it, Drive9
+takes it from a `bucket-appid` name. You do not need `--endpoint` for public
+COS: when region is set, the CLI uses `https://cos.<region>.myqcloud.com`.
+
+Role mint: `--credential-kind role --role-arn qcs::cam::uin/<UIN>:roleName/<NAME>`
+plus the CAM user’s SecretId / SecretKey (COS mint always needs those keys).
+
+**Bind the tenant and use it**
+
+```bash
+drive9 admin tenant object-namespace set \
+  --tenant-id tnt_xxx --namespace-id acme-prod \
+  --tidbcloud-public-key <public-key> \
+  --tidbcloud-private-key <private-key>
+
+drive9 fs ls cos://example-1250000000/acme-prod/
+drive9 fs cp ./file cos://example-1250000000/acme-prod/file --force
+drive9 mount cos://example-1250000000/acme-prod/ ./mnt
+```
+
+Use the `cos://` scheme, not `s3://`, even though the wire protocol is
+S3-compatible. A wrong region or APPID fails at mint. Listing is authorized
+on the tenant prefix (so `acme-prod/` cannot list `acme-prod-evil/`).
+
+### Volcengine TOS (`tos://`)
+
+Volcengine has no AWS-style federation token. Drive9 **always** mints with
+`AssumeRole`. You must register both a **RoleTrn** and the permanent Access
+Key of an IAM user that is allowed to assume that role.
+
+**What to prepare in Volcengine**
+
+1. Enable TOS and create a bucket in a region (for example `cn-beijing`).
+2. Create an IAM role with TOS read/write on that bucket
+   (`tos:GetObject`, `tos:PutObject`, `tos:DeleteObject`, `tos:ListBucket`,
+   and the multipart actions). Note the RoleTrn:
+   `trn:iam::<account-id>:role/<role-name>`.
+3. Create an IAM user whose access key Drive9 will hold. Allow that user to
+   `sts:AssumeRole` on the role (the role’s trust policy must accept this
+   user). Do **not** hand those keys to tenant users.
+
+**Register the backend**
+
+```bash
+drive9 admin object-backend add \
+  --scheme tos --bucket example \
+  --region cn-beijing \
+  --credential-kind role \
+  --role-arn trn:iam::2100000000:role/drive9-object \
+  --access-key-id AKLT... \
+  --secret-access-key ... \
+  --tidbcloud-public-key <public-key> \
+  --tidbcloud-private-key <private-key>
+```
+
+`--region` is required. `--role-arn` is required. Static-only registration
+(`--credential-kind static` without a role) is rejected at mint. You do not
+need `--endpoint` for public TOS: the CLI talks to the S3-compatible gateway
+`https://tos-s3-<region>.volces.com` with **virtual-host** addressing
+(`force_path_style=false`). Path-style requests fail with `InvalidPathAccess`.
+`--sts-endpoint` is only needed if you do not use the default
+`https://sts.volcengineapi.com`. `--external-id` is supported when the role
+trust policy requires it.
+
+**Bind the tenant and use it**
+
+```bash
+drive9 admin tenant object-namespace set \
+  --tenant-id tnt_xxx --namespace-id acme-prod \
+  --tidbcloud-public-key <public-key> \
+  --tidbcloud-private-key <private-key>
+
+drive9 fs ls tos://example/acme-prod/
+drive9 fs cp ./file tos://example/acme-prod/file --force
+drive9 mount tos://example/acme-prod/ ./mnt
+```
+
+Use the `tos://` scheme. After mint, region and endpoint come from the
+backend; tenant URIs do not need `?region=` unless you are using
+`--auth=local`.
+
+### Other schemes (OSS, GCS, Azure)
+
+These mint as well; first-wave customer storage is S3 / COS / TOS.
+
+- **OSS** (`oss://`): Aliyun **AssumeRole** only (`--role-arn` is required),
+  same shape as TOS. Isolation is prefix-scoped, but list matching is a
+  string prefix rather than the directory form used by S3 / COS / TOS.
+- **GCS** (`gs://` / `gcs://`): server holds a service-account JSON and mints
+  a short-lived OAuth access token. The token has the **same IAM as that
+  service account** — it is not downscoped to one bucket. Register one SA per
+  bucket (or an SA that can only access that bucket). Namespace must match
+  the bucket; backend prefix must be empty.
+- **Azure** (`az://` / `azure://`): server holds the storage account key and
+  mints a container SAS cryptographically scoped to that container. Isolation
+  is **one container per tenant** (namespace must match the container;
+  backend prefix must be empty). `--account-id` is the storage account name.
+
+### Escape hatch: `--auth=local`
+
+Use the cloud’s native credential chain on this machine (environment variables,
+shared config, instance role, gcloud/Azure CLI, and so on). drive9-server is
+not involved.
+
+```bash
+drive9 fs ls --auth=local s3://bucket/prefix/
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+  drive9 fs cp --auth=local ./file 's3://minio-bucket/file?endpoint=http://127.0.0.1:9000&forcePathStyle=true'
+```
+
+Local auth is for laptops, CI against MinIO, and stores that are not wired up
+on the server. It is **not** a silent fallback: if you omit `--auth=local`,
+existing AWS/TOS env vars are ignored.
+
+`--auth` is accepted on `fs` commands and on `mount`. For COS and TOS with
+local auth you typically pass `?region=` yourself (and TOS still needs
+virtual-host addressing, which the CLI sets for `tos://`).
 
 ---
 
@@ -226,7 +477,7 @@ Admin (TiDB Cloud AK/SK)
   │  bind tenant → customer prefix id
   ▼
 drive9-server (control plane)
-  │  mints a short-lived, prefix-scoped session
+  │  mints a short-lived session (prefix-scoped on S3/COS/TOS)
   ▼
 CLI / mount on the laptop
   │  uses that session (or --auth=local)
@@ -252,20 +503,27 @@ key id, and encrypted secret / external id. Secrets use the same org KMS
 wrapping as other control-plane secrets. List APIs return “has secret”, never
 the plaintext. `update` rotates the secret in place.
 
-**`tenant_tidbcloud_org_bindings.object_namespace_id`** — customer prefix id
-for that tenant. Empty means “object mint not allowed”. This is not a user ACL
-table and is not the drive9 `tenant_id`.
+**`tenant_object_namespaces`** — one row per tenant. `namespace_id` is the
+customer prefix id. It is **not unique**: the operator decides whether two
+tenants share a prefix. Empty means “object mint not allowed”. This is not a
+user ACL table and is not the drive9 `tenant_id`. Shared tenants keep
+namespace here; they never write `tenant_tidbcloud_org_bindings`.
 
-Existing databases pick up the new table and column through the usual meta
-schema self-repair (add column / create table only).
+Existing databases pick up the new tables through the usual meta schema
+self-repair (add column / create table only).
 
 ---
 
 ## Limits and non-goals
 
-- Azure SAS isolates at container scope. GCS minted tokens are **not**
-  bucket-scoped: isolation is the service account's IAM. Use one dedicated
-  SA (or IAM-limited SA) per bucket, and one container/bucket per tenant.
+- Prefix-scoped minted sessions apply to **S3 / COS / TOS** (OSS is
+  prefix-scoped with string-prefix list matching). Azure SAS isolates at
+  container scope. GCS minted tokens are **not** bucket-scoped: isolation is
+  the service account's IAM. Use one dedicated SA (or IAM-limited SA) per
+  bucket, and one container/bucket per tenant.
+- Namespace uniqueness is not enforced. Two tenants with the same
+  `namespace_id` share the minted prefix. Distinct ids are an operator
+  choice.
 - TOS and OSS mint require a role ARN (AssumeRole). COS static keys use
   GetFederationToken.
 - Scoped (workspace-zone) tokens cannot mint object credentials.
