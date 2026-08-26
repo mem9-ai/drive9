@@ -19,7 +19,8 @@ func mutateStatusJSON(t *testing.T, mutate func(map[string]any)) []byte {
 	}), &document); err != nil {
 		t.Fatal(err)
 	}
-	mutate(document)
+	jobs := document["jobs"].([]any)
+	mutate(jobs[0].(map[string]any))
 	body, err := json.Marshal(document)
 	if err != nil {
 		t.Fatal(err)
@@ -31,12 +32,12 @@ func TestDecodeWorkerStatusValidation(t *testing.T) {
 	withFutureField := mutateStatusJSON(t, func(document map[string]any) {
 		document["future_field"] = map[string]any{"kept": true}
 	})
-	status, raw, err := decodeWorkerStatus(withFutureField)
+	envelope, statuses, err := decodeWorkerStatus(withFutureField)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.VolumeID != "vol-001" || !strings.Contains(string(raw), "future_field") {
-		t.Fatalf("status=%+v raw=%s", status, raw)
+	if envelope.VolumeID != "vol-001" || len(statuses) != 1 || !strings.Contains(string(statuses[0].raw), "future_field") {
+		t.Fatalf("envelope=%+v statuses=%+v", envelope, statuses)
 	}
 
 	for _, tc := range []struct {
@@ -51,19 +52,19 @@ func TestDecodeWorkerStatusValidation(t *testing.T) {
 		}), []byte("\n{}")...), want: "trailing JSON"},
 		{name: "missing identity", body: mutateStatusJSON(t, func(document map[string]any) {
 			delete(document, "volume_id")
-		}), want: "missing volume_id"},
+		}), want: "missing Jobs[].volume_id"},
 		{name: "empty identity", body: mutateStatusJSON(t, func(document map[string]any) {
 			document["volume_id"] = ""
-		}), want: "empty volume_id"},
+		}), want: "empty Job identity"},
 		{name: "invalid phase", body: mutateStatusJSON(t, func(document map[string]any) {
 			document["phase"] = "UNKNOWN"
 		}), want: "invalid phase"},
 		{name: "missing condition", body: mutateStatusJSON(t, func(document map[string]any) {
 			delete(document["conditions"].(map[string]any), "attention")
-		}), want: "missing conditions.attention"},
+		}), want: "missing Jobs[].conditions.attention"},
 		{name: "missing fence", body: mutateStatusJSON(t, func(document map[string]any) {
 			delete(document, "fence_complete")
-		}), want: "missing fence_complete"},
+		}), want: "missing Jobs[].fence_complete"},
 		{name: "null fence", body: mutateStatusJSON(t, func(document map[string]any) {
 			document["fence_complete"] = nil
 		}), want: "fence_complete must be a boolean"},
@@ -84,13 +85,19 @@ func TestDecodeWorkerStatusValidation(t *testing.T) {
 }
 
 func TestDeriveJobStatus(t *testing.T) {
-	base := workerStatus{Phase: "SYNCING", StartupPhase: "SYNCING"}
+	base := workerStatus{RuntimeState: "RUNNING", Phase: "SYNCING", StartupPhase: "SYNCING"}
 	for _, tc := range []struct {
 		name   string
 		mutate func(*workerStatus)
 		want   string
 	}{
 		{name: "syncing", want: "SYNCING"},
+		{name: "initializing", mutate: func(status *workerStatus) {
+			status.RuntimeState, status.Phase = "INITIALIZING", ""
+		}, want: "INITIALIZING"},
+		{name: "retrying", mutate: func(status *workerStatus) {
+			status.RuntimeState, status.Phase = "RETRYING", ""
+		}, want: "ATTENTION"},
 		{name: "ready for rollout", mutate: func(status *workerStatus) {
 			status.Conditions.ReadyForRollout = true
 		}, want: "READY_FOR_ROLLOUT"},
@@ -126,10 +133,22 @@ func TestDeriveJobStatus(t *testing.T) {
 }
 
 func batchJob(pod, phase, display string) jobResult {
-	status := &workerStatus{VolumeID: "vol-" + pod, Phase: phase, StartupPhase: phase}
+	status := &workerStatus{JobID: "job-" + pod, VolumeID: "vol-" + pod, RuntimeState: "RUNNING", Phase: phase, StartupPhase: phase}
 	return jobResult{
-		Namespace: "migration", Batch: "batch-a", Pod: pod, JobID: status.VolumeID,
+		Namespace: "migration", Batch: "batch-a", Pod: pod, JobID: status.JobID, VolumeID: status.VolumeID,
 		Phase: phase, DisplayStatus: display, parsed: status,
+	}
+}
+
+func initializingBatchJob(pod string) jobResult {
+	status := &workerStatus{
+		JobID: "job-" + pod, VolumeID: "vol-" + pod,
+		RuntimeState: "INITIALIZING", StartupPhase: "SYNCING",
+	}
+	return jobResult{
+		Namespace: "migration", Batch: "batch-a", Pod: pod,
+		JobID: status.JobID, VolumeID: status.VolumeID,
+		DisplayStatus: "INITIALIZING", parsed: status,
 	}
 }
 
@@ -144,6 +163,19 @@ func TestDeriveBatchStatus(t *testing.T) {
 			batchJob("a", "SYNCING", "SYNCING"),
 			batchJob("b", "DUAL_WRITE_REPAIRING", "REPAIRING"),
 		}, want: "MIXED_PHASE"},
+		{name: "initializing preserves mixed phase", jobs: []jobResult{
+			initializingBatchJob("initializing"),
+			batchJob("a", "SYNCING", "SYNCING"),
+			batchJob("b", "DUAL_WRITE_REPAIRING", "REPAIRING"),
+		}, want: "MIXED_PHASE"},
+		{name: "all initializing", jobs: []jobResult{
+			initializingBatchJob("a"),
+			initializingBatchJob("b"),
+		}, want: "SYNCING"},
+		{name: "initializing with one observed phase", jobs: []jobResult{
+			initializingBatchJob("initializing"),
+			batchJob("a", "DUAL_WRITE_REPAIRING", "REPAIRING"),
+		}, want: "SYNCING"},
 		{name: "syncing", jobs: []jobResult{
 			batchJob("a", "SYNCING", "READY_FOR_ROLLOUT"),
 			batchJob("b", "SYNCING", "SYNCING"),
@@ -186,6 +218,47 @@ func TestSummarizeBatchesCountsCollectionFailuresAsUnavailable(t *testing.T) {
 	summary := summaries[0]
 	if summary.Available != 2 || summary.Attention != 1 || summary.Unavailable != 1 {
 		t.Fatalf("summary=%+v", summary)
+	}
+}
+
+func TestCollectStatusExpandsOnePodIntoMultipleJobs(t *testing.T) {
+	var document map[string]any
+	if err := json.Unmarshal(statusJSON(t, "vol-001", "SYNCING", map[string]bool{
+		"ready_for_rollout": false, "current_converged": false, "attention": false,
+	}), &document); err != nil {
+		t.Fatal(err)
+	}
+	first := document["jobs"].([]any)[0].(map[string]any)
+	first["job_id"], first["subpath"] = "job-a", "/A"
+	body, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var second map[string]any
+	if err := json.Unmarshal(body, &second); err != nil {
+		t.Fatal(err)
+	}
+	second["job_id"], second["subpath"] = "job-b", "/B"
+	document["jobs"] = []any{first, second}
+	status, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeKubectl{
+		podList: podListJSON(t, podJSON("migration", "worker-a", "batch-a", "Running")),
+		statuses: map[string][]byte{
+			"migration/worker-a": status,
+		},
+	}
+	jobs, batches, partial, err := collectStatus(context.Background(), options{}, normalizeDependencies(testDeps(fake)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial || len(jobs) != 2 || len(batches) != 1 || batches[0].ObservedJobs != 2 {
+		t.Fatalf("partial=%v jobs=%+v batches=%+v", partial, jobs, batches)
+	}
+	if jobs[0].JobID != "job-a" || jobs[1].JobID != "job-b" || jobs[0].VolumeID != "vol-001" || jobs[0].Pod != jobs[1].Pod {
+		t.Fatalf("expanded jobs=%+v", jobs)
 	}
 }
 

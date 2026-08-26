@@ -4098,7 +4098,8 @@ func createGitRepoWithReadme(t *testing.T, content []byte) string {
 
 func runFuseTestGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	gitArgs := append([]string{"-c", "maintenance.auto=false"}, args...)
+	cmd := exec.Command("git", gitArgs...)
 	if dir != "" {
 		cmd.Dir = dir
 	}

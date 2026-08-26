@@ -51,6 +51,7 @@ type Client struct {
 // Forward-compatible: unknown fields decode-and-ignore cleanly.
 type tenantStatusResponse struct {
 	Status                string                 `json:"status"`
+	TenantID              string                 `json:"tenant_id,omitempty"`
 	MaxUploadBytes        int64                  `json:"max_upload_bytes"`
 	InlineThreshold       int64                  `json:"inline_threshold,omitempty"`
 	MigrationCapabilities *MigrationCapabilities `json:"migration_capabilities,omitempty"`
@@ -601,6 +602,18 @@ func (c *Client) GetMigrationCapabilities(ctx context.Context) (MigrationCapabil
 		return MigrationCapabilities{}, fmt.Errorf("%w: status omitted migration_capabilities", ErrMigrationUnsupported)
 	}
 	return *body.MigrationCapabilities, nil
+}
+
+// GetMigrationTenantID returns the stable identity of the authenticated target.
+func (c *Client) GetMigrationTenantID(ctx context.Context) (string, error) {
+	body, err := c.tenantStatus(ctx)
+	if err != nil {
+		return "", fmt.Errorf("fetch migration tenant identity: %w", err)
+	}
+	if body.TenantID == "" || strings.TrimSpace(body.TenantID) != body.TenantID {
+		return "", fmt.Errorf("%w: status omitted a valid tenant_id", ErrMigrationUnsupported)
+	}
+	return body.TenantID, nil
 }
 
 // PostMigrationEvent sends one diagnostic event to the optional Server

@@ -1,9 +1,7 @@
 # Single-PVC trial manifest. Apply it to the namespace that contains the PVC.
 # Replace the endpoint, volume ID, Node name, PVC name, and Owner API key.
 # Do not commit a real API key.
-# The pinned 3a6d226 image supports the tested T0/T1 trial but predates
-# ConfigMap-driven CUTOVER_READY. Replace both image fields with a published
-# cutover-capable source tag before T2.
+# Replace both image fields with one published v4-capable source tag.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -13,7 +11,7 @@ data:
   # Patch this value and rollout-restart the DaemonSet for each transition.
   phase: SYNCING
   config.yaml: |
-    version: v3
+    version: v4
     drive9:
       endpoint: https://drive9.example.com
     job_defaults:
@@ -24,17 +22,25 @@ data:
         small_file_workers: 8
         large_file_workers: 2
     spaces:
-      migration-target:
-        credential_ref: owner-api-key
-    jobs:
+      user-a:
+        credential_ref: user-a-owner-api-key
+      user-b:
+        credential_ref: user-b-owner-api-key
+    ebs_sources:
       - volume_id: vol-00000000000000000
         node_name: REPLACE_WITH_KUBERNETES_NODE_NAME
-        source:
-          type: ebs
-          root: /mnt/ebs/source
-        target:
-          space_ref: migration-target
-          prefix: /
+        root: /mnt/ebs/source
+        jobs:
+          - job_id: vol-00000000000000000-user-a
+            subpath: /A
+            target:
+              space_ref: user-a
+              prefix: /
+          - job_id: vol-00000000000000000-user-b
+            subpath: /B
+            target:
+              space_ref: user-b
+              prefix: /
 ---
 apiVersion: v1
 kind: Secret
@@ -42,7 +48,8 @@ metadata:
   name: drive9-migration-credentials
 type: Opaque
 stringData:
-  owner-api-key: REPLACE_WITH_DRIVE9_OWNER_API_KEY
+  user-a-owner-api-key: REPLACE_WITH_USER_A_DRIVE9_OWNER_API_KEY
+  user-b-owner-api-key: REPLACE_WITH_USER_B_DRIVE9_OWNER_API_KEY
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -80,7 +87,7 @@ spec:
           type: RuntimeDefault
       initContainers:
         - name: plan
-          image: ghcr.io/drive9-ai/drive9-migration:3a6d226
+          image: ghcr.io/drive9-ai/drive9-migration:REPLACE_WITH_V4_SOURCE_TAG
           imagePullPolicy: IfNotPresent
           args:
             - plan
@@ -113,7 +120,7 @@ spec:
               readOnly: true
       containers:
         - name: drive9-migration
-          image: ghcr.io/drive9-ai/drive9-migration:3a6d226
+          image: ghcr.io/drive9-ai/drive9-migration:REPLACE_WITH_V4_SOURCE_TAG
           imagePullPolicy: IfNotPresent
           args:
             - run

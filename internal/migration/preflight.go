@@ -13,11 +13,18 @@ import (
 
 const ControlPrefix = "/.drive9-migration"
 
-var ErrPreflight = errors.New("migration preflight failed")
+var (
+	ErrPreflight              = errors.New("migration preflight failed")
+	ErrPlanFailed             = errors.New("migration plan has failed Jobs")
+	ErrTargetIdentityMismatch = errors.New("authenticated target identity mismatch")
+)
 
 type PreflightResult struct {
+	JobID                   string  `json:"job_id"`
 	VolumeID                string  `json:"volume_id"`
 	NodeName                string  `json:"node_name"`
+	EBSRoot                 string  `json:"ebs_root"`
+	Subpath                 string  `json:"subpath"`
 	SourceRoot              string  `json:"source_root"`
 	SpaceRef                string  `json:"space_ref"`
 	Prefix                  string  `json:"prefix"`
@@ -43,6 +50,130 @@ type PreflightResult struct {
 	RecoveryControlPresent  bool    `json:"recovery_control_present"`
 }
 
+type PlanJobResult struct {
+	JobID   string           `json:"job_id"`
+	Subpath string           `json:"subpath"`
+	Target  TargetConfig     `json:"target"`
+	Result  *PreflightResult `json:"result,omitempty"`
+	Error   string           `json:"error,omitempty"`
+}
+
+type PlanResult struct {
+	VolumeID string          `json:"volume_id"`
+	NodeName string          `json:"node_name"`
+	EBSRoot  string          `json:"ebs_root"`
+	Jobs     []PlanJobResult `json:"jobs"`
+}
+
+// Plan checks every configured Job for one selected EBS and retains partial results.
+func Plan(ctx context.Context, startup *RuntimeStartup) (PlanResult, error) {
+	if startup == nil || startup.Config == nil || len(startup.Jobs) == 0 {
+		return PlanResult{}, fmt.Errorf("%w: missing runtime startup", ErrPreflight)
+	}
+	result := PlanResult{
+		VolumeID: startup.Source.VolumeID, NodeName: startup.Source.NodeName,
+		EBSRoot: startup.Source.Root, Jobs: make([]PlanJobResult, 0, len(startup.Jobs)),
+	}
+	if err := ValidateMappings(startup.Config); err != nil {
+		return result, fmt.Errorf("%w: static mapping: %v", ErrPreflight, err)
+	}
+	if err := validateAuthenticatedTargets(ctx, startup); err != nil {
+		message := boundedRuntimeError(err)
+		for _, job := range startup.Jobs {
+			result.Jobs = append(result.Jobs, PlanJobResult{
+				JobID: job.Job.JobID, Subpath: job.Job.Subpath, Target: job.Job.Target, Error: message,
+			})
+		}
+		return result, ErrPlanFailed
+	}
+	if _, err := sourceMountProbeFor(startup.Jobs[0])(startup.Source.Root, startup.Source.VolumeID); err != nil {
+		message := boundedRuntimeError(err)
+		for _, job := range startup.Jobs {
+			result.Jobs = append(result.Jobs, PlanJobResult{
+				JobID: job.Job.JobID, Subpath: job.Job.Subpath, Target: job.Job.Target, Error: message,
+			})
+		}
+		return result, ErrPlanFailed
+	}
+	failed := false
+	for _, job := range startup.Jobs {
+		planned := PlanJobResult{JobID: job.Job.JobID, Subpath: job.Job.Subpath, Target: job.Job.Target}
+		preflight, err := preflightJob(ctx, job)
+		if err != nil {
+			planned.Error = boundedRuntimeError(err)
+			failed = true
+		} else {
+			planned.Result = &preflight
+		}
+		result.Jobs = append(result.Jobs, planned)
+	}
+	if failed {
+		return result, ErrPlanFailed
+	}
+	return result, nil
+}
+
+func validateAuthenticatedTargets(ctx context.Context, startup *RuntimeStartup) error {
+	if startup == nil || startup.Config == nil {
+		return fmt.Errorf("%w: missing runtime startup", ErrPreflight)
+	}
+	if err := ValidateMappings(startup.Config); err != nil {
+		return fmt.Errorf("%w: static mapping: %v", ErrPreflight, err)
+	}
+	resolved := make(map[string]string, len(startup.targetCredentials))
+	for _, job := range startup.Config.Jobs {
+		spaceRef := job.Target.SpaceRef
+		if _, exists := resolved[spaceRef]; exists {
+			continue
+		}
+		credential, exists := startup.targetCredentials[spaceRef]
+		if !exists {
+			return fmt.Errorf("%w: missing credential source for Space %q", ErrPreflight, spaceRef)
+		}
+		key, _, err := credential.readStable()
+		if err != nil {
+			return fmt.Errorf("%w: credential for Space %q: %w", ErrPreflight, spaceRef, err)
+		}
+		tenantID, err := client.New(startup.Config.Drive9.Endpoint, key).GetMigrationTenantID(ctx)
+		if err != nil {
+			return fmt.Errorf("%w: target identity for Space %q: %w", ErrPreflight, spaceRef, err)
+		}
+		resolved[spaceRef] = tenantID
+	}
+
+	byTarget := make(map[string][]string)
+	targetOrder := make([]string, 0, len(resolved))
+	for _, job := range startup.Config.Jobs {
+		tenantID, exists := resolved[job.Target.SpaceRef]
+		if !exists {
+			return fmt.Errorf("%w: unresolved target identity for Space %q", ErrPreflight, job.Target.SpaceRef)
+		}
+		identity := startup.Config.Drive9.Endpoint + "\x00" + tenantID
+		if _, exists := byTarget[identity]; !exists {
+			targetOrder = append(targetOrder, identity)
+		}
+		byTarget[identity] = append(byTarget[identity], job.Target.Prefix)
+	}
+	for _, identity := range targetOrder {
+		prefixes := byTarget[identity]
+		for index, left := range prefixes {
+			if left == "/" && len(prefixes) > 1 {
+				return fmt.Errorf("%w: authenticated target root prefix cannot be shared", ErrPreflight)
+			}
+			for _, right := range prefixes[index+1:] {
+				if prefixesOverlap(left, right) {
+					return fmt.Errorf("%w: authenticated target has overlapping prefixes %q and %q", ErrPreflight, left, right)
+				}
+			}
+		}
+	}
+
+	for _, job := range startup.Jobs {
+		job.acceptedTenantID = resolved[job.Job.Target.SpaceRef]
+	}
+	return nil
+}
+
 // ValidateMappings checks the complete batch before any selected-Job probe.
 func ValidateMappings(cfg *Config) error {
 	if cfg == nil {
@@ -52,12 +183,7 @@ func ValidateMappings(cfg *Config) error {
 		return err
 	}
 	byCredential := make(map[string][]string)
-	nodes := make(map[string]struct{})
 	for _, job := range cfg.Jobs {
-		if _, exists := nodes[job.NodeName]; exists {
-			return fmt.Errorf("duplicate node_name %q", job.NodeName)
-		}
-		nodes[job.NodeName] = struct{}{}
 		prefix, err := validateTargetPrefix(job.Target.Prefix)
 		if err != nil {
 			return fmt.Errorf("job %q: %w", job.VolumeID, err)
@@ -100,6 +226,10 @@ func Preflight(ctx context.Context, startup *Startup) (PreflightResult, error) {
 	return preflightWithProbe(ctx, startup, sourceMountProbeFor(startup), nil)
 }
 
+func preflightJob(ctx context.Context, startup *Startup) (PreflightResult, error) {
+	return preflightWithProbeValidation(ctx, startup, sourceMountProbeFor(startup), nil, false)
+}
+
 func preflightWithVerifier(ctx context.Context, startup *Startup, verifyVolume func(string, string) (bool, error)) (PreflightResult, error) {
 	return preflightWithChecks(ctx, startup, verifyVolume, nil)
 }
@@ -117,13 +247,19 @@ func preflightWithChecks(ctx context.Context, startup *Startup, verifyVolume fun
 }
 
 func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string, string) (sourceMountIdentity, error), openFile func(*os.Root, string) (*os.File, error)) (PreflightResult, error) {
+	return preflightWithProbeValidation(ctx, startup, probe, openFile, true)
+}
+
+func preflightWithProbeValidation(ctx context.Context, startup *Startup, probe func(string, string) (sourceMountIdentity, error), openFile func(*os.Root, string) (*os.File, error), validateMappings bool) (PreflightResult, error) {
 	if startup == nil || startup.Config == nil {
 		return PreflightResult{}, fmt.Errorf("%w: missing startup snapshot", ErrPreflight)
 	}
-	if err := ValidateMappings(startup.Config); err != nil {
-		return PreflightResult{}, fmt.Errorf("%w: static mapping: %v", ErrPreflight, err)
+	if validateMappings {
+		if err := ValidateMappings(startup.Config); err != nil {
+			return PreflightResult{}, fmt.Errorf("%w: static mapping: %v", ErrPreflight, err)
+		}
 	}
-	initialMountIdentity, err := probe(startup.Job.Source.Root, startup.Job.VolumeID)
+	initialMountIdentity, err := observeJobSource(startup, probe)
 	if err != nil {
 		return PreflightResult{}, fmt.Errorf("%w: initial volume identity: %w", ErrPreflight, err)
 	}
@@ -153,7 +289,7 @@ func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string
 			}
 		}
 	}
-	mountIdentity, err := probe(startup.Job.Source.Root, startup.Job.VolumeID)
+	mountIdentity, err := observeJobSource(startup, probe)
 	if err != nil {
 		return PreflightResult{}, fmt.Errorf("%w: final volume identity: %w", ErrPreflight, err)
 	}
@@ -173,12 +309,15 @@ func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string
 	if missing != "" {
 		return PreflightResult{}, fmt.Errorf("%w: required capability %s is unavailable", ErrPreflight, missing)
 	}
+	if err := verifyAuthenticatedTenant(ctx, api, startup); err != nil {
+		return PreflightResult{}, fmt.Errorf("%w: %w", ErrPreflight, err)
+	}
 	maxUploadBytes, inlineThreshold := api.MaxUploadBytes(ctx), api.CachedSmallFileThreshold()
 	distribution, err := fileDistribution(scan, maxUploadBytes, inlineThreshold)
 	if err != nil {
 		return PreflightResult{}, fmt.Errorf("%w: %w", ErrPreflight, err)
 	}
-	checkpoint, err := NewCheckpointStore(api).Load(ctx, startup.Job.VolumeID)
+	checkpoint, err := NewCheckpointStore(api).Load(ctx, startup.Job.JobID)
 	if err != nil {
 		return PreflightResult{}, fmt.Errorf("%w: checkpoint: %w", ErrPreflight, err)
 	}
@@ -211,7 +350,8 @@ func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string
 	}
 	startup.acceptedSource = initialMountIdentity
 	return PreflightResult{
-		VolumeID: startup.Job.VolumeID, NodeName: startup.Job.NodeName,
+		JobID: startup.Job.JobID, VolumeID: startup.Job.VolumeID, NodeName: startup.Job.NodeName,
+		EBSRoot: startup.Job.EBSRoot, Subpath: startup.Job.Subpath,
 		SourceRoot: startup.Job.Source.Root, SpaceRef: startup.Job.Target.SpaceRef,
 		Prefix: startup.Job.Target.Prefix, CredentialRef: startup.Space.CredentialRef,
 		ConfigHash: startup.ConfigHash, ControlPrefix: ControlPrefix,
@@ -224,6 +364,23 @@ func preflightWithProbe(ctx context.Context, startup *Startup, probe func(string
 		MaxUploadBytes: maxUploadBytes, InlineThreshold: inlineThreshold,
 		TargetEmpty: targetEmpty, RecoveryControlPresent: recoveryControlPresent,
 	}, nil
+}
+
+func verifyAuthenticatedTenant(ctx context.Context, api *client.Client, startup *Startup) error {
+	if api == nil || startup == nil {
+		return fmt.Errorf("%w: missing target identity input", ErrTargetIdentityMismatch)
+	}
+	if startup.acceptedTenantID == "" {
+		return fmt.Errorf("%w: batch gate did not accept a tenant", ErrTargetIdentityMismatch)
+	}
+	tenantID, err := api.GetMigrationTenantID(ctx)
+	if err != nil {
+		return fmt.Errorf("target identity: %w", err)
+	}
+	if tenantID != startup.acceptedTenantID {
+		return fmt.Errorf("%w: credential resolved to another tenant", ErrTargetIdentityMismatch)
+	}
+	return nil
 }
 
 func verifySourceReadAccess(ctx context.Context, scanner *Scanner, scan ScanResult) error {

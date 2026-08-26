@@ -197,6 +197,11 @@ func ExampleClient_migrationContract() {
 	ctx := context.Background()
 	c := drive9.New("https://drive9.example.com", "owner-api-key")
 
+	tenantID, err := c.GetMigrationTenantID(ctx)
+	if err != nil || tenantID == "" {
+		return
+	}
+
 	capabilities, err := c.GetMigrationCapabilities(ctx)
 	if err != nil ||
 		!capabilities.ChecksumRead ||
@@ -798,6 +803,7 @@ var coveredClientMethods = map[string]bool{
 	// Migration V1 client contract.
 	"BatchStatWithOptionsCtx":                               true,
 	"GetMigrationCapabilities":                              true,
+	"GetMigrationTenantID":                                  true,
 	"PostMigrationEvent":                                    true,
 	"WriteStreamConditionalWithChecksum":                    true,
 	"WriteStreamConditionalWithChecksumAndPreCompleteCheck": true,

@@ -48,11 +48,17 @@ type podStatus struct {
 }
 
 type workerStatus struct {
+	JobID            string             `json:"job_id"`
 	VolumeID         string             `json:"volume_id"`
 	NodeName         string             `json:"node_name,omitempty"`
+	EBSRoot          string             `json:"ebs_root,omitempty"`
+	Subpath          string             `json:"subpath,omitempty"`
 	SpaceRef         string             `json:"space_ref,omitempty"`
 	Prefix           string             `json:"prefix,omitempty"`
-	Phase            string             `json:"phase"`
+	RuntimeState     string             `json:"runtime_state"`
+	RuntimeAttempts  int                `json:"runtime_attempts,omitempty"`
+	RuntimeError     string             `json:"runtime_error,omitempty"`
+	Phase            string             `json:"phase,omitempty"`
 	StartupPhase     string             `json:"startup_phase"`
 	RecoveryComplete bool               `json:"recovery_complete"`
 	Round            workerRound        `json:"round"`
@@ -69,6 +75,13 @@ type workerStatus struct {
 	FenceIntent      bool               `json:"fence_intent"`
 	FenceComplete    bool               `json:"fence_complete"`
 	AttentionReason  string             `json:"attention_reason,omitempty"`
+}
+
+type workerStatusEnvelope struct {
+	VolumeID string            `json:"volume_id"`
+	NodeName string            `json:"node_name"`
+	EBSRoot  string            `json:"ebs_root"`
+	Jobs     []json.RawMessage `json:"jobs"`
 }
 
 type workerRound struct {
@@ -109,6 +122,7 @@ type jobResult struct {
 	Node          string          `json:"node,omitempty"`
 	PodPhase      string          `json:"pod_phase,omitempty"`
 	JobID         string          `json:"job_id,omitempty"`
+	VolumeID      string          `json:"volume_id,omitempty"`
 	Phase         string          `json:"phase,omitempty"`
 	DisplayStatus string          `json:"status"`
 	Error         string          `json:"error,omitempty"`

@@ -15,26 +15,38 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"golang.org/x/sys/unix"
+	"gopkg.in/yaml.v3"
 )
 
 func mappingConfig(t *testing.T, jobs string) *Config {
 	t.Helper()
-	body := strings.Replace(validConfigYAML, `jobs:
-  - volume_id: vol-001
-    node_name: node-a
-    source:
-      type: ebs
-      root: /ebs/001
-    target:
-      space_ref: space-001
-      prefix: /
-`, "jobs:\n"+jobs, 1)
-	if body == validConfigYAML {
-		t.Fatal("jobs block was not replaced; validConfigYAML drifted")
+	var legacy []struct {
+		VolumeID string       `yaml:"volume_id"`
+		NodeName string       `yaml:"node_name"`
+		Source   SourceConfig `yaml:"source"`
+		Target   TargetConfig `yaml:"target"`
 	}
-	cfg, err := LoadConfig(writeConfig(t, body))
-	if err != nil {
+	if err := yaml.Unmarshal([]byte(jobs), &legacy); err != nil {
 		t.Fatal(err)
+	}
+	cfg := &Config{
+		Version: ConfigVersion, Drive9: Drive9Config{Endpoint: "https://drive9.example.com"},
+		JobDefaults: JobDefaults{
+			Sync: SyncDefaults{GracePeriod: Duration(DefaultGracePeriod)},
+			Performance: PerformanceDefaults{
+				MaxBytesPerSecond: 1024, SmallFileWorkers: 2, LargeFileWorkers: 1,
+			},
+		},
+		Spaces:     map[string]SpaceConfig{"space-001": {CredentialRef: "space-001-key"}},
+		EBSSources: make([]EBSSourceConfig, 0, len(legacy)),
+	}
+	for _, job := range legacy {
+		cfg.EBSSources = append(cfg.EBSSources, EBSSourceConfig{
+			VolumeID: job.VolumeID, NodeName: job.NodeName, Root: job.Source.Root,
+			Jobs: []JobConfig{{
+				JobID: job.VolumeID + "-root", Subpath: "/", Target: job.Target,
+			}},
+		})
 	}
 	return cfg
 }
@@ -141,7 +153,7 @@ func TestValidateMappingsUsesCredentialMappingForSpaceAliases(t *testing.T) {
     target: {space_ref: space-001, prefix: /other}
 `)
 		cfg.Spaces["alias"] = SpaceConfig{CredentialRef: aliasCredential}
-		cfg.Jobs[1].Target = TargetConfig{SpaceRef: "alias", Prefix: aliasPrefix}
+		cfg.EBSSources[1].Jobs[0].Target = TargetConfig{SpaceRef: "alias", Prefix: aliasPrefix}
 		return cfg
 	}
 
@@ -155,6 +167,142 @@ func TestValidateMappingsUsesCredentialMappingForSpaceAliases(t *testing.T) {
 	if err := ValidateMappings(newConfig(t, "other-space-key", "/team/sub")); err != nil {
 		t.Fatalf("independent credentials were treated as one Space: %v", err)
 	}
+}
+
+func TestValidateAuthenticatedTargetsUsesTenantIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		tenantA     string
+		tenantB     string
+		prefixA     string
+		prefixB     string
+		wantErr     bool
+		crossSource bool
+	}{
+		{name: "same tenant equal", tenantA: "tenant-1", tenantB: "tenant-1", prefixA: "/team", prefixB: "/team", wantErr: true},
+		{name: "same tenant ancestor", tenantA: "tenant-1", tenantB: "tenant-1", prefixA: "/team", prefixB: "/team/sub", wantErr: true},
+		{name: "same tenant segment distinct", tenantA: "tenant-1", tenantB: "tenant-1", prefixA: "/team", prefixB: "/team-2"},
+		{name: "different tenants equal", tenantA: "tenant-1", tenantB: "tenant-2", prefixA: "/team", prefixB: "/team"},
+		{name: "cross source overlap", tenantA: "tenant-1", tenantB: "tenant-1", prefixA: "/team", prefixB: "/team/sub", wantErr: true, crossSource: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runtime, closeServer := authenticatedTargetRuntime(t, tc.tenantA, tc.tenantB, tc.prefixA, tc.prefixB, tc.crossSource)
+			defer closeServer()
+
+			err := validateAuthenticatedTargets(context.Background(), runtime)
+			if tc.wantErr && err == nil {
+				t.Fatal("overlapping authenticated targets were accepted")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatal(err)
+			}
+			if !tc.wantErr {
+				if runtime.Jobs[0].acceptedTenantID != tc.tenantA {
+					t.Fatalf("accepted tenant ID = %q, want %q", runtime.Jobs[0].acceptedTenantID, tc.tenantA)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateAuthenticatedTargetsRejectsMissingTenantIdentity(t *testing.T) {
+	runtime, closeServer := authenticatedTargetRuntime(t, "", "tenant-2", "/a", "/b", false)
+	defer closeServer()
+
+	err := validateAuthenticatedTargets(context.Background(), runtime)
+	if !errors.Is(err, client.ErrMigrationUnsupported) {
+		t.Fatalf("error = %v, want ErrMigrationUnsupported", err)
+	}
+	for _, job := range runtime.Jobs {
+		if job.acceptedTenantID != "" {
+			t.Fatalf("partially accepted tenant identity for %s", job.Job.JobID)
+		}
+	}
+}
+
+func TestPlanAuthenticatedTargetGateFailureMarksEverySelectedJob(t *testing.T) {
+	runtime, closeServer := authenticatedTargetRuntime(t, "tenant-1", "tenant-1", "/team", "/team/sub", false)
+	defer closeServer()
+	root := t.TempDir()
+	runtime.Source.Root = root
+	runtime.Config.EBSSources[0].Root = root
+	for _, job := range runtime.Jobs {
+		if err := os.Mkdir(filepath.Join(root, strings.TrimPrefix(job.Job.Subpath, "/")), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		job.Job.EBSRoot = root
+		job.Job.Source.Root = effectiveSourceRoot(root, job.Job.Subpath)
+		job.mountProbe = testMountedSourceProbe
+	}
+
+	result, err := Plan(context.Background(), runtime)
+	if !errors.Is(err, ErrPlanFailed) || len(result.Jobs) != 2 {
+		t.Fatalf("plan error = %v, result = %+v", err, result)
+	}
+	for _, job := range result.Jobs {
+		if job.Result != nil || !strings.Contains(job.Error, "overlapping prefixes") {
+			t.Fatalf("plan Job = %+v", job)
+		}
+	}
+}
+
+func authenticatedTargetRuntime(t *testing.T, tenantA, tenantB, prefixA, prefixB string, crossSource bool) (*RuntimeStartup, func()) {
+	t.Helper()
+	tenantByAuth := map[string]string{"Bearer key-a": tenantA, "Bearer key-b": tenantB}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/status" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"tenant_id": tenantByAuth[r.Header.Get("Authorization")]})
+	}))
+	secretRoot := t.TempDir()
+	for name, key := range map[string]string{"key-a-file": "key-a\n", "key-b-file": "key-b\n"} {
+		if err := os.WriteFile(filepath.Join(secretRoot, name), []byte(key), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spaces := map[string]SpaceConfig{
+		"space-a": {CredentialRef: "key-a-file"},
+		"space-b": {CredentialRef: "key-b-file"},
+	}
+	jobsA := []JobConfig{
+		{JobID: "job-a", Subpath: "/A", Target: TargetConfig{SpaceRef: "space-a", Prefix: prefixA}},
+	}
+	sources := []EBSSourceConfig{{VolumeID: "vol-001", NodeName: "node-a", Root: "/ebs/a", Jobs: jobsA}}
+	if crossSource {
+		sources = append(sources, EBSSourceConfig{VolumeID: "vol-002", NodeName: "node-b", Root: "/ebs/b", Jobs: []JobConfig{
+			{JobID: "job-b", Subpath: "/B", Target: TargetConfig{SpaceRef: "space-b", Prefix: prefixB}},
+		}})
+	} else {
+		sources[0].Jobs = append(sources[0].Jobs, JobConfig{
+			JobID: "job-b", Subpath: "/B", Target: TargetConfig{SpaceRef: "space-b", Prefix: prefixB},
+		})
+	}
+	cfg := &Config{
+		Version: ConfigVersion, Drive9: Drive9Config{Endpoint: server.URL},
+		JobDefaults: JobDefaults{
+			Sync:        SyncDefaults{GracePeriod: Duration(DefaultGracePeriod)},
+			Performance: PerformanceDefaults{MaxBytesPerSecond: 1024, SmallFileWorkers: 1, LargeFileWorkers: 1},
+		},
+		Spaces: spaces, EBSSources: sources,
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &RuntimeStartup{Config: cfg, Source: sources[0], Phase: PhaseSyncing, targetCredentials: make(map[string]CredentialSource)}
+	for spaceRef, space := range spaces {
+		credential, err := NewCredentialSource(secretRoot, space.CredentialRef)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime.targetCredentials[spaceRef] = credential
+	}
+	for _, configured := range sources[0].Jobs {
+		job := resolveJob(sources[0], configured)
+		runtime.Jobs = append(runtime.Jobs, &Startup{Config: cfg, Job: job, Space: spaces[job.Target.SpaceRef], Phase: PhaseSyncing})
+	}
+	return runtime, server.Close
 }
 
 func TestValidateTargetPrefixUsesDrive9PathRules(t *testing.T) {
@@ -200,6 +348,7 @@ func preflightStartup(t *testing.T, endpoint, root string) *Startup {
 	if err != nil {
 		t.Fatal(err)
 	}
+	startup.acceptedTenantID = "tenant-a"
 	startup.mountProbe = testMountedSourceProbe
 	return startup
 }
@@ -218,7 +367,7 @@ func TestPreflightChecksSelectedSourceClientCapabilitiesAndEmptyTarget(t *testin
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
 			statusHits.Add(1)
-			_, _ = w.Write([]byte(`{"max_upload_bytes":1048576,"inline_threshold":1024,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true,"event_ingest":false}}`))
+			_, _ = w.Write([]byte(`{"tenant_id":"tenant-a","max_upload_bytes":1048576,"inline_threshold":1024,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true,"event_ingest":false}}`))
 		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
 			listHits.Add(1)
 			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FileInfo{{Name: ".drive9-migration", IsDir: true}}})
@@ -250,6 +399,51 @@ func TestPreflightChecksSelectedSourceClientCapabilitiesAndEmptyTarget(t *testin
 	}
 }
 
+func TestPreflightRejectsAuthenticatedTenantMismatchBeforeTargetAccess(t *testing.T) {
+	root := t.TempDir()
+	var targetHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/status" {
+			_, _ = w.Write([]byte(`{"tenant_id":"tenant-b","max_upload_bytes":1048576,"inline_threshold":1024,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
+			return
+		}
+		targetHits.Add(1)
+		http.Error(w, "unexpected target access", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	startup := preflightStartup(t, server.URL, root)
+	startup.acceptedTenantID = "tenant-a"
+	_, err := Preflight(context.Background(), startup)
+	if !errors.Is(err, ErrTargetIdentityMismatch) {
+		t.Fatalf("error = %v, want ErrTargetIdentityMismatch", err)
+	}
+	if targetHits.Load() != 0 {
+		t.Fatalf("tenant mismatch made %d target requests", targetHits.Load())
+	}
+}
+
+func TestPreflightRequiresBatchAcceptedTenantIdentity(t *testing.T) {
+	root := t.TempDir()
+	var targetHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/status" {
+			_, _ = w.Write([]byte(`{"tenant_id":"tenant-a","max_upload_bytes":1048576,"inline_threshold":1024,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
+			return
+		}
+		targetHits.Add(1)
+		http.Error(w, "unexpected target access", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	startup := preflightStartup(t, server.URL, root)
+	startup.acceptedTenantID = ""
+	_, err := Preflight(context.Background(), startup)
+	if !errors.Is(err, ErrTargetIdentityMismatch) || targetHits.Load() != 0 {
+		t.Fatalf("error = %v, target hits = %d", err, targetHits.Load())
+	}
+}
+
 func TestPreflightSourceIdentityIsRequiredByWorkerConstruction(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "source")
@@ -259,7 +453,7 @@ func TestPreflightSourceIdentityIsRequiredByWorkerConstruction(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/status":
-			_, _ = w.Write([]byte(`{"max_upload_bytes":1048576,"inline_threshold":1024,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
+			_, _ = w.Write([]byte(`{"tenant_id":"tenant-a","max_upload_bytes":1048576,"inline_threshold":1024,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
 		case r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/checkpoint.json"):
 			http.NotFound(w, r)
 		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
@@ -294,7 +488,7 @@ func TestPreflightRejectsSourceIdentityChangeDuringValidation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/status":
-			_, _ = w.Write([]byte(`{"max_upload_bytes":1048576,"inline_threshold":1024,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
+			_, _ = w.Write([]byte(`{"tenant_id":"tenant-a","max_upload_bytes":1048576,"inline_threshold":1024,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
 		case r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/checkpoint.json"):
 			http.NotFound(w, r)
 		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
@@ -337,7 +531,7 @@ func TestPreflightRejectsUnreadableAndOversizedRegularFiles(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		remoteHits.Add(1)
 		if r.URL.Path == "/v1/status" {
-			_, _ = w.Write([]byte(`{"max_upload_bytes":2,"inline_threshold":1,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
+			_, _ = w.Write([]byte(`{"tenant_id":"tenant-a","max_upload_bytes":2,"inline_threshold":1,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
 			return
 		}
 		http.Error(w, "unexpected", http.StatusInternalServerError)
@@ -406,7 +600,7 @@ func TestPreflightAllowsNonEmptyTargetOnlyForMatchingCheckpoint(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/status":
-			_, _ = w.Write([]byte(`{"max_upload_bytes":1048576,"inline_threshold":1024,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
+			_, _ = w.Write([]byte(`{"tenant_id":"tenant-a","max_upload_bytes":1048576,"inline_threshold":1024,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
 		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
 			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FileInfo{{Name: "business", IsDir: false}, {Name: ".drive9-migration", IsDir: true}}})
 		case r.URL.Path == "/v1/fs/.drive9-migration/jobs/vol-001/checkpoint.json" && r.Method == http.MethodHead:
@@ -475,7 +669,7 @@ func TestPreflightRequiredCapabilitiesFailClosedAndEventIsOptional(t *testing.T)
 			caps[missing] = false
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/v1/status" {
-					_ = json.NewEncoder(w).Encode(map[string]any{"max_upload_bytes": 10, "inline_threshold": 5, "migration_capabilities": caps})
+					_ = json.NewEncoder(w).Encode(map[string]any{"tenant_id": "tenant-a", "max_upload_bytes": 10, "inline_threshold": 5, "migration_capabilities": caps})
 					return
 				}
 				t.Error("target listing reached with missing required capability")
@@ -499,7 +693,7 @@ func TestPreflightRejectsBusinessTargetAndRootControlCollision(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		if r.URL.Path == "/v1/status" {
-			_, _ = w.Write([]byte(`{"max_upload_bytes":10,"inline_threshold":5,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
+			_, _ = w.Write([]byte(`{"tenant_id":"tenant-a","max_upload_bytes":10,"inline_threshold":5,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
 			return
 		}
 		if r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/checkpoint.json") {
@@ -535,9 +729,12 @@ func TestPreflightStaticMappingFailsBeforeRemoteCall(t *testing.T) {
 	}))
 	defer srv.Close()
 	startup := preflightStartup(t, srv.URL, root)
-	startup.Config.Jobs = append(startup.Config.Jobs, Job{
-		VolumeID: "vol-002", NodeName: "node-b", Source: SourceConfig{Type: "ebs", Root: "/ebs/002"},
-		Target: TargetConfig{SpaceRef: "space-001", Prefix: "/sub"},
+	startup.Config.EBSSources = append(startup.Config.EBSSources, EBSSourceConfig{
+		VolumeID: "vol-002", NodeName: "node-a", Root: "/ebs/002",
+		Jobs: []JobConfig{{
+			JobID: "vol-002-root", Subpath: "/",
+			Target: TargetConfig{SpaceRef: "space-001", Prefix: "/sub"},
+		}},
 	})
 	_, err := Preflight(context.Background(), startup)
 	if !errors.Is(err, ErrPreflight) || hits.Load() != 0 {
@@ -569,5 +766,67 @@ func TestPreflightPreservesOldServerAndTypedClientErrors(t *testing.T) {
 				t.Fatalf("typed error=%T %v", err, err)
 			}
 		})
+	}
+}
+
+func TestPlanRetainsAllJobResultsOnPartialFailure(t *testing.T) {
+	root := t.TempDir()
+	for _, subpath := range []string{"A", "B"} {
+		if err := os.Mkdir(filepath.Join(root, subpath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, subpath, "file"), []byte(subpath), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/status":
+			tenantID := "tenant-a"
+			if r.Header.Get("Authorization") == "Bearer owner-key-b" {
+				tenantID = "tenant-b"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tenant_id": tenantID, "max_upload_bytes": 1048576, "inline_threshold": 1024,
+				"migration_capabilities": map[string]bool{
+					"checksum_read": true, "checksum_complete": true,
+					"conditional_create": true, "conditional_update": true,
+				},
+			})
+		case r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/checkpoint.json"):
+			http.NotFound(w, r)
+		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+			if r.Header.Get("Authorization") == "Bearer owner-key-b" {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FileInfo{{Name: ".drive9-migration", IsDir: true}}})
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+	body := strings.Replace(validV4ConfigYAML, "https://drive9.example.com", server.URL, 1)
+	body = strings.Replace(body, "/ebs/001", root, 1)
+	secretRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(secretRoot, "space-a-key"), []byte("owner-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(secretRoot, "space-b-key"), []byte("owner-key-b\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := LoadRuntimeStartup(writeConfig(t, body), "node-a", string(PhaseSyncing), secretRoot, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range runtime.Jobs {
+		job.mountProbe = testMountedSourceProbe
+	}
+	result, err := Plan(context.Background(), runtime)
+	if !errors.Is(err, ErrPlanFailed) {
+		t.Fatalf("plan error=%v", err)
+	}
+	if len(result.Jobs) != 2 || result.Jobs[0].Result == nil || result.Jobs[0].Error != "" || result.Jobs[1].Result != nil || result.Jobs[1].Error == "" {
+		t.Fatalf("plan=%+v", result)
 	}
 }

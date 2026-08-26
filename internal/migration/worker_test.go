@@ -57,6 +57,7 @@ type workerServer struct {
 	target           *memoryTarget
 	checkpoint       *checkpointFake
 	checkpointByAuth map[string]*checkpointFake
+	tenantByAuth     map[string]string
 	rejectAuth       map[string]bool
 	rejectStatus     int
 	onReject         func()
@@ -157,7 +158,12 @@ func (s *workerServer) handler(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.URL.Path == "/v1/status":
+		tenantID := "tenant-a"
+		if candidate := s.tenantByAuth[authorization]; candidate != "" {
+			tenantID = candidate
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tenant_id":        tenantID,
 			"max_upload_bytes": 1 << 20, "inline_threshold": 1 << 10,
 			"migration_capabilities": s.caps,
 		})
@@ -494,7 +500,10 @@ func newWorkerStartup(t *testing.T, root string, server *httptest.Server) *Start
 		},
 		Spaces: map[string]SpaceConfig{"space": {CredentialRef: "owner-key"}},
 	}
-	job := Job{VolumeID: "vol-001", NodeName: "node", Source: SourceConfig{Type: "ebs", Root: root}, Target: TargetConfig{SpaceRef: "space", Prefix: "/data"}}
+	configured := JobConfig{JobID: "vol-001", Subpath: "/", Target: TargetConfig{SpaceRef: "space", Prefix: "/data"}}
+	source := EBSSourceConfig{VolumeID: "vol-001", NodeName: "node", Root: root, Jobs: []JobConfig{configured}}
+	config.EBSSources = []EBSSourceConfig{source}
+	job := resolveJob(source, configured)
 	config.Jobs = []Job{job}
 	hash, err := ConfigHash(config, job)
 	if err != nil {
@@ -502,7 +511,7 @@ func newWorkerStartup(t *testing.T, root string, server *httptest.Server) *Start
 	}
 	return &Startup{
 		Config: config, Job: job, Space: config.Spaces["space"], Phase: PhaseSyncing,
-		ConfigHash: hash, Credential: credential, mountProbe: testMountedSourceProbe,
+		ConfigHash: hash, Credential: credential, acceptedTenantID: "tenant-a", mountProbe: testMountedSourceProbe,
 	}
 }
 
@@ -712,6 +721,11 @@ func TestNewWorkerBuildsRuntimeAndReloadsCredential(t *testing.T) {
 	if _, err := NewWorker(context.Background(), nil); err == nil {
 		t.Fatal("nil startup accepted")
 	}
+	startup.acceptedTenantID = ""
+	if _, err := NewWorker(context.Background(), startup); !errors.Is(err, ErrTargetIdentityMismatch) {
+		t.Fatalf("empty accepted tenant error = %v", err)
+	}
+	startup.acceptedTenantID = "tenant-a"
 	backend.caps.ConditionalUpdate = false
 	if _, err := NewWorker(context.Background(), startup); err == nil {
 		t.Fatal("missing capability accepted")
@@ -1087,6 +1101,38 @@ func TestCredentialRefreshValidatesCheckpointBeforeAtomicSwap(t *testing.T) {
 	}
 	if worker.api != oldAPI || worker.inventory != oldInventory || worker.checkpoint != oldCheckpoint || worker.apply != oldApply {
 		t.Fatal("identity mismatch partially replaced the active runtime")
+	}
+}
+
+func TestCredentialRefreshRejectsAuthenticatedTenantMismatchBeforeAtomicSwap(t *testing.T) {
+	root := t.TempDir()
+	backend := &workerServer{
+		target: &memoryTarget{nodes: make(map[string]memoryTargetNode)}, checkpoint: &checkpointFake{},
+		tenantByAuth: map[string]string{"Bearer wrong-tenant-key": "tenant-b"}, caps: allWorkerCapabilities(),
+	}
+	server := httptest.NewServer(http.HandlerFunc(backend.handler))
+	defer server.Close()
+	startup := newWorkerStartup(t, root, server)
+	worker, err := NewWorker(context.Background(), startup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAPI, oldInventory, oldCheckpoint, oldApply := worker.api, worker.inventory, worker.checkpoint, worker.apply
+	if err := os.WriteFile(startup.Credential.path, []byte("wrong-tenant-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.refreshClient(context.Background()); !errors.Is(err, ErrTargetIdentityMismatch) {
+		t.Fatalf("wrong-tenant refresh error = %v", err)
+	}
+	if worker.api != oldAPI || worker.inventory != oldInventory || worker.checkpoint != oldCheckpoint || worker.apply != oldApply {
+		t.Fatal("tenant mismatch partially replaced the active runtime")
+	}
+}
+
+func TestWorkerRunErrorClassifiesTargetIdentityMismatch(t *testing.T) {
+	err := newWorkerRunError(fmt.Errorf("refresh: %w", ErrTargetIdentityMismatch))
+	if !errors.Is(err, ErrTargetIdentityMismatch) || !strings.Contains(err.Error(), "target_identity_mismatch") {
+		t.Fatalf("classified error = %v", err)
 	}
 }
 
