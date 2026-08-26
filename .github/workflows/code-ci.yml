@@ -56,3 +56,6 @@ jobs:
 
       - name: Build (server and cli)
         run: make build
+
+      - name: Build Windows CLI
+        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o /tmp/drive9-windows-amd64.exe ./cmd/drive9
