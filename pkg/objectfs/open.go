@@ -185,11 +185,17 @@ func s3ConnectionString(loc Location, sess SessionCredentials) (string, error) {
 		}
 		endpoint = "https://tos-s3-" + region + ".volces.com"
 	}
+	if endpoint == "" && loc.Scheme == SchemeCOS && region != "" {
+		endpoint = "https://cos." + region + ".myqcloud.com"
+	}
 	if endpoint != "" {
 		params = append(params, "endpoint="+quote(endpoint))
 	}
 	if loc.Query[QueryForcePathStyle] == "true" {
 		params = append(params, "force_path_style=true")
+	} else if loc.Scheme == SchemeTOS {
+		// TOS S3-compatible gateway rejects path-style (InvalidPathAccess).
+		params = append(params, "force_path_style=false")
 	}
 	// HTTP endpoints cannot use AWS SDK trailer checksums (needs TLS).
 	if strings.HasPrefix(endpoint, "http://") {

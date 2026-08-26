@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -34,8 +35,9 @@ func startSessionRefresh(parent context.Context, f fs.Fs, mint MintSession, expi
 
 func runSessionRefresh(ctx context.Context, f fs.Fs, mint MintSession, expiry time.Time) {
 	failWait := sessionRefreshFailWait
+	minLead, maxLead := sessionRefreshLeadBounds()
 	for {
-		wait := sessionRefreshWait(effectiveSessionExpiry(expiry, time.Now()), time.Now())
+		wait := sessionRefreshWaitLeads(effectiveSessionExpiry(expiry, time.Now()), time.Now(), minLead, maxLead)
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
@@ -67,7 +69,9 @@ func runSessionRefresh(ctx context.Context, f fs.Fs, mint MintSession, expiry ti
 			continue
 		}
 		expiry = nextExp
-		logger.Info(ctx, "object mount session refreshed", zap.Time("expiration", effectiveSessionExpiry(expiry, time.Now())))
+		logger.Info(ctx, "object mount session refreshed",
+			zap.Time("expiration", effectiveSessionExpiry(expiry, time.Now())),
+			zap.String("access_key_id", truncateAccessKeyID(sess.AccessKeyID)))
 	}
 }
 
@@ -122,7 +126,39 @@ func effectiveSessionExpiry(exp, now time.Time) time.Time {
 	return exp
 }
 
+func sessionRefreshLeadBounds() (minLead, maxLead time.Duration) {
+	minLead = durationEnv("DRIVE9_OBJECT_SESSION_REFRESH_MIN_LEAD", sessionRefreshMinLead)
+	maxLead = durationEnv("DRIVE9_OBJECT_SESSION_REFRESH_MAX_LEAD", sessionRefreshMaxLead)
+	if maxLead < minLead {
+		maxLead = minLead
+	}
+	return minLead, maxLead
+}
+
+func durationEnv(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
+}
+
+func truncateAccessKeyID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:8] + "…" + id[len(id)-4:]
+}
+
 func sessionRefreshWait(exp, now time.Time) time.Duration {
+	return sessionRefreshWaitLeads(exp, now, sessionRefreshMinLead, sessionRefreshMaxLead)
+}
+
+func sessionRefreshWaitLeads(exp, now time.Time, minLead, maxLead time.Duration) time.Duration {
 	until := exp.Sub(now)
 	if until <= 0 {
 		return sessionRefreshMinWait
@@ -135,11 +171,11 @@ func sessionRefreshWait(exp, now time.Time) time.Duration {
 		return half
 	}
 	lead := until / 4
-	if lead > sessionRefreshMaxLead {
-		lead = sessionRefreshMaxLead
+	if maxLead > 0 && lead > maxLead {
+		lead = maxLead
 	}
-	if lead < sessionRefreshMinLead {
-		lead = sessionRefreshMinLead
+	if minLead > 0 && lead < minLead {
+		lead = minLead
 	}
 	wait := until - lead
 	if wait < sessionRefreshMinWait {
