@@ -164,6 +164,33 @@ uri_for() {
   printf '%s%s' "$uri" "$ns"
 }
 
+# Raw object-store key/prefix for native SDK checks. Drive9 URIs already
+# include --prefix via uri_for; list/get/put against the cloud must too.
+native_prefix() {
+  local ns="$1"
+  local trail="${2:-}"
+  local out=""
+  ns="${ns#/}"
+  ns="${ns%/}"
+  if [ -n "$PREFIX" ]; then
+    out="${PREFIX#/}"
+    out="${out%/}"
+    if [ -n "$ns" ]; then
+      out="${out}/${ns}"
+    fi
+  else
+    out="$ns"
+  fi
+  if [ "$trail" = "/" ] && [ -n "$out" ]; then
+    out="${out}/"
+  fi
+  printf '%s' "$out"
+}
+
+native_key() {
+  printf '%s/%s' "$(native_prefix "$1")" "$2"
+}
+
 wait_active() {
   local key="$1"
   local deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
@@ -425,12 +452,12 @@ code_b="$(mint_creds "$API_B" "${URI_B}/other.txt" true "$mint_b")"
 check_eq "mint A write 200" "$code_a" "200"
 check_eq "mint B write 200" "$code_b" "200"
 
-keys_cust_slash="$(list_keys "$mint_a" "${NS_A}/")"
-keys_cust="$(list_keys "$mint_a" "$NS_A")"
-keys_evil_as_a="$(list_keys "$mint_a" "${NS_B}/")"
+keys_cust_slash="$(list_keys "$mint_a" "$(native_prefix "$NS_A" /)")"
+keys_cust="$(list_keys "$mint_a" "$(native_prefix "$NS_A")")"
+keys_evil_as_a="$(list_keys "$mint_a" "$(native_prefix "$NS_B" /)")"
 keys_root_as_a="$(list_keys "$mint_a" "")"
-keys_evil_as_b="$(list_keys "$mint_b" "${NS_B}/")"
-check_cmd "STS A ListBucket cust/ sees hello.txt" contains "$keys_cust_slash" "${NS_A}/hello.txt"
+keys_evil_as_b="$(list_keys "$mint_b" "$(native_prefix "$NS_B" /)")"
+check_cmd "STS A ListBucket cust/ sees hello.txt" contains "$keys_cust_slash" "$(native_key "$NS_A" hello.txt)"
 check_cmd "STS A ListBucket cust/ hides cust-evil" bash -c '! printf %s "$1" | grep -Fq cust-evil' _ "$keys_cust_slash"
 check_eq "STS A ListBucket prefix=cust (no slash) denied or empty" \
   "$(if [ "$keys_cust" = "ACCESS_DENIED" ] || [ -z "$keys_cust" ]; then echo isolated; else echo "$keys_cust"; fi)" \
@@ -441,7 +468,7 @@ check_eq "STS A ListBucket cust-evil/ denied or empty" \
 check_eq "STS A ListBucket bucket root denied or empty" \
   "$(if [ "$keys_root_as_a" = "ACCESS_DENIED" ] || [ -z "$keys_root_as_a" ]; then echo isolated; else echo "$keys_root_as_a"; fi)" \
   "isolated"
-check_cmd "STS B ListBucket cust-evil/ sees other.txt" contains "$keys_evil_as_b" "${NS_B}/other.txt"
+check_cmd "STS B ListBucket cust-evil/ sees other.txt" contains "$keys_evil_as_b" "$(native_key "$NS_B" other.txt)"
 
 echo "--- read-only mint ---"
 mint_ro="$(mktemp "$WORKDIR/mint-ro.XXXXXX")"
@@ -451,14 +478,14 @@ got_body="$(mktemp)"
 ro_conf="$(mktemp)"
 tos_conf_from_creds "$mint_ro" "$ro_conf"
 set +e
-tosutil cp "tos://${BUCKET}/${NS_A}/hello.txt" "$got_body" -conf="$ro_conf" >"$got_body.log" 2>&1
+tosutil cp "tos://${BUCKET}/$(native_key "$NS_A" hello.txt)" "$got_body" -conf="$ro_conf" >"$got_body.log" 2>&1
 ro_get_rc=$?
 set -e
 check_cmd "read-only session can GetObject" test "$ro_get_rc" -eq 0
 check_cmd "read-only GetObject body matches" contains "$(cat "$got_body" 2>/dev/null || true)" "alpha-"
 ro_put="$(mktemp)"
 set +e
-tosutil cp "$FILE_A" "tos://${BUCKET}/${NS_A}/from-ro.txt" -conf="$ro_conf" >"$ro_put" 2>"$ro_put.err"
+tosutil cp "$FILE_A" "tos://${BUCKET}/$(native_key "$NS_A" from-ro.txt)" -conf="$ro_conf" >"$ro_put" 2>"$ro_put.err"
 ro_rc=$?
 set -e
 if grep -Eqi 'AccessDenied|Access Denied|Forbidden|0003-00000008' "$ro_put" "$ro_put.err"; then

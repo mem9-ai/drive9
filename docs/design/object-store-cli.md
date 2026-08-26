@@ -63,10 +63,17 @@ If either is missing, the command fails closed. A tenant API key cannot change
 the mapping; it can only request a minted session. Scoped (workspace-zone)
 tokens cannot mint.
 
-Minted credentials are scoped to that tenant’s prefix. A session minted for
-`s3://bucket/acme-prod/` cannot list or write `s3://bucket/acme-other/`, and
-cannot list a sibling such as `acme-prod-evil/`. Isolation is both a mint-time
-URI check and a vendor session policy (`prefix/` and `prefix/*`).
+On **S3, COS, and TOS**, a minted session is prefix-scoped to the namespace
+bound to that tenant. A session minted for `s3://bucket/acme-prod/` cannot
+list or write `s3://bucket/acme-other/`, and cannot list a sibling such as
+`acme-prod-evil/`. Isolation is a mint-time URI check plus a vendor session
+policy (`prefix/` and `prefix/*`). GCS and Azure are not prefix-scoped; see
+[Other schemes](#other-schemes-oss-gcs-azure).
+
+The namespace id is an operator choice. The server does not require it to be
+unique: two tenants bound to the same non-empty id receive credentials for
+the same prefix and can see each other’s objects. Bind distinct ids unless
+you intend that sharing.
 
 Reads get a read-only session. Writes, deletes, mkdir, and a writable mount
 get a write session. A read that later needs to write remints.
@@ -87,9 +94,11 @@ The common workflow:
    mint (see the S3 / COS / TOS sections below).
 2. Register that identity as an object backend. Secrets are stored encrypted;
    `ls` / `get` never print them. `update --id` rotates a key in place.
-3. Bind each Drive9 tenant to a unique prefix id
-   (`drive9 admin tenant object-namespace set`). Empty namespace (the default,
-   or `object-namespace clear`) means mint is refused.
+3. Bind each drive9 tenant to a prefix id
+   (`drive9 admin tenant object-namespace set`). Distinct ids isolate
+   tenants; the same id is allowed and means they share that prefix.
+   Empty namespace (the default, or `object-namespace clear`) means mint is
+   refused.
 4. Give the tenant its API key. Users talk to URIs under that prefix — no
    long-lived cloud keys on the laptop.
 
@@ -393,7 +402,7 @@ not involved.
 ```bash
 drive9 fs ls --auth=local s3://bucket/prefix/
 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
-  drive9 fs cp --auth=local ./file s3://minio-bucket/file?endpoint=http://127.0.0.1:9000&forcePathStyle=true
+  drive9 fs cp --auth=local ./file 's3://minio-bucket/file?endpoint=http://127.0.0.1:9000&forcePathStyle=true'
 ```
 
 Local auth is for laptops, CI against MinIO, and stores that are not wired up
@@ -468,7 +477,7 @@ Admin (TiDB Cloud AK/SK)
   │  bind tenant → customer prefix id
   ▼
 drive9-server (control plane)
-  │  mints a short-lived, prefix-scoped session
+  │  mints a short-lived session (prefix-scoped on S3/COS/TOS)
   ▼
 CLI / mount on the laptop
   │  uses that session (or --auth=local)
@@ -495,9 +504,10 @@ wrapping as other control-plane secrets. List APIs return “has secret”, neve
 the plaintext. `update` rotates the secret in place.
 
 **`tenant_object_namespaces`** — one row per tenant. `namespace_id` is the
-customer prefix id. Empty means “object mint not allowed”. This is not a user
-ACL table and is not the drive9 `tenant_id`. Shared tenants keep namespace
-here; they never write `tenant_tidbcloud_org_bindings`.
+customer prefix id. It is **not unique**: the operator decides whether two
+tenants share a prefix. Empty means “object mint not allowed”. This is not a
+user ACL table and is not the drive9 `tenant_id`. Shared tenants keep
+namespace here; they never write `tenant_tidbcloud_org_bindings`.
 
 Existing databases pick up the new tables through the usual meta schema
 self-repair (add column / create table only).
@@ -506,9 +516,14 @@ self-repair (add column / create table only).
 
 ## Limits and non-goals
 
-- Azure SAS isolates at container scope. GCS minted tokens are **not**
-  bucket-scoped: isolation is the service account's IAM. Use one dedicated
-  SA (or IAM-limited SA) per bucket, and one container/bucket per tenant.
+- Prefix-scoped minted sessions apply to **S3 / COS / TOS** (OSS is
+  prefix-scoped with string-prefix list matching). Azure SAS isolates at
+  container scope. GCS minted tokens are **not** bucket-scoped: isolation is
+  the service account's IAM. Use one dedicated SA (or IAM-limited SA) per
+  bucket, and one container/bucket per tenant.
+- Namespace uniqueness is not enforced. Two tenants with the same
+  `namespace_id` share the minted prefix. Distinct ids are an operator
+  choice.
 - TOS and OSS mint require a role ARN (AssumeRole). COS static keys use
   GetFederationToken.
 - Scoped (workspace-zone) tokens cannot mint object credentials.
