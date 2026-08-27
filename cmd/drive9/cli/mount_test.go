@@ -955,7 +955,8 @@ func TestMountCmdNoSuperviseUsesLegacyBackground(t *testing.T) {
 		mountFuse = oldMountFuse
 	})
 
-	t.Setenv(EnvMountRemoteOnlyPatterns, "**/tmp/**\n**/.tmp/**")
+	t.Setenv(EnvMountLocalOnlyPatterns, "--api-key")
+	t.Setenv(EnvMountRemoteOnlyPatterns, "**/tmp/**")
 	var got mountBackgroundRequest
 	startMountBackground = func(req mountBackgroundRequest) error {
 		got = req
@@ -986,9 +987,12 @@ func TestMountCmdNoSuperviseUsesLegacyBackground(t *testing.T) {
 	if got.MountPoint != mountPoint {
 		t.Fatalf("MountPoint = %q, want %q", got.MountPoint, mountPoint)
 	}
-	wantPrefix := []string{"--remote-only", "**/tmp/**", "--remote-only", "**/.tmp/**"}
+	wantPrefix := []string{"--local-only=--api-key", "--remote-only=**/tmp/**"}
 	if len(got.Args) < len(wantPrefix) || !reflect.DeepEqual(got.Args[:len(wantPrefix)], wantPrefix) {
 		t.Fatalf("Args = %v, want policy prefix %v", got.Args, wantPrefix)
+	}
+	if childArgs := foregroundMountCommandArgs(got.Args); !containsString(childArgs, "--local-only=--api-key") {
+		t.Fatalf("foreground args = %v, want flag-like policy pattern preserved", childArgs)
 	}
 }
 
@@ -2609,7 +2613,7 @@ func TestMountCmdMaterializesPolicyEnvironmentInSupervisedArgs(t *testing.T) {
 		mountFuse = oldMountFuse
 	})
 
-	t.Setenv(EnvMountRemoteOnlyPatterns, "**/tmp/**\n**/.tmp/**")
+	t.Setenv(EnvMountRemoteOnlyPatterns, "**/tmp/**\n--foreground")
 	var got mountSuperviseStartRequest
 	startMountSupervisedBackground = func(req mountSuperviseStartRequest) error {
 		got = req
@@ -2630,9 +2634,12 @@ func TestMountCmdMaterializesPolicyEnvironmentInSupervisedArgs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MountCmd: %v", err)
 	}
-	wantPrefix := []string{"--remote-only", "**/tmp/**", "--remote-only", "**/.tmp/**"}
+	wantPrefix := []string{"--remote-only=**/tmp/**", "--remote-only=--foreground"}
 	if len(got.OriginalArgs) < len(wantPrefix) || !reflect.DeepEqual(got.OriginalArgs[:len(wantPrefix)], wantPrefix) {
 		t.Fatalf("OriginalArgs = %v, want policy prefix %v", got.OriginalArgs, wantPrefix)
+	}
+	if workerArgs := workerArgsForSupervise(got.OriginalArgs); !containsString(workerArgs, "--remote-only=--foreground") {
+		t.Fatalf("worker args = %v, want flag-like policy pattern preserved", workerArgs)
 	}
 }
 
