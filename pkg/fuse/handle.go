@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"os"
 	"sync"
 	"time"
@@ -127,12 +128,37 @@ func (fh *FileHandle) LockWithTimeout(timeout time.Duration) bool {
 
 // DirHandle represents an open directory in the FUSE filesystem.
 type DirHandle struct {
-	readMu            sync.Mutex // serializes directory reads for this handle
+	readOnce          sync.Once
+	readToken         chan struct{}
 	mu                sync.Mutex
 	Ino               uint64
 	Path              string
 	Entries           []DirEntry // guarded by mu; stable snapshot for one directory enumeration sequence
 	entriesGeneration uint64
+}
+
+func (dh *DirHandle) lockRead(ctx context.Context) bool {
+	dh.readOnce.Do(func() {
+		dh.readToken = make(chan struct{}, 1)
+		dh.readToken <- struct{}{}
+	})
+	if ctx.Err() != nil {
+		return false
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-dh.readToken:
+		if ctx.Err() != nil {
+			dh.readToken <- struct{}{}
+			return false
+		}
+		return true
+	}
+}
+
+func (dh *DirHandle) unlockRead() {
+	dh.readToken <- struct{}{}
 }
 
 // DirEntry is a simplified directory entry for FUSE readdir.

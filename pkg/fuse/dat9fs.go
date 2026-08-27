@@ -9306,10 +9306,12 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	if !ok {
 		return gofuse.ENOENT
 	}
-	dh.readMu.Lock()
-	defer dh.readMu.Unlock()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	if !dh.lockRead(ctx) {
+		return gofuse.EINTR
+	}
+	defer dh.unlockRead()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
 
 	entries, generation, err := fs.loadDirHandleEntries(ctx, dh, fs.opts.GVisorCompat && input.Offset == 0)
@@ -9362,10 +9364,12 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	if !ok {
 		return gofuse.ENOENT
 	}
-	dh.readMu.Lock()
-	defer dh.readMu.Unlock()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	if !dh.lockRead(ctx) {
+		return gofuse.EINTR
+	}
+	defer dh.unlockRead()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
 
 	entries, generation, err := fs.loadDirHandleEntries(ctx, dh, fs.opts.GVisorCompat && input.Offset == 0)
