@@ -44,12 +44,13 @@ func TestValidateFSPath(t *testing.T) {
 			err := validateFSPath(tc.path)
 			if tc.wantSub == "" {
 				if err != nil {
-					t.Fatalf("validateFSPath(%q) = %v, want nil", tc.path, err)
+					t.Errorf("validateFSPath(%q) = %v, want nil", tc.path, err)
 				}
 				return
 			}
 			if err == nil {
-				t.Fatalf("validateFSPath(%q) = nil, want error containing %q", tc.path, tc.wantSub)
+				t.Errorf("validateFSPath(%q) = nil, want error containing %q", tc.path, tc.wantSub)
+				return
 			}
 			if !strings.Contains(err.Error(), "invalid drive9 path") {
 				t.Errorf("error = %v, want invalid drive9 path prefix", err)
@@ -112,6 +113,6 @@ func TestFSMethodsRejectWindowsPathBeforeRequest(t *testing.T) {
 		}
 	}
 	if called.Load() {
-		t.Fatal("server was called despite client-side path validation")
+		t.Error("server was called despite client-side path validation")
 	}
 }
