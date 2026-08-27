@@ -20,7 +20,7 @@ var windowsDriveSegment = regexp.MustCompile(`(?:^|/)[A-Za-z]:[\\/]`)
 // and the original path is sent unchanged when valid.
 func validateFSPath(path string) error {
 	if _, err := pathutil.Canonicalize(path); err != nil {
-		return fmt.Errorf("invalid drive9 path %q: %v%s", path, err, windowsPathHint(path))
+		return fmt.Errorf("invalid drive9 path %q: %w%s", path, err, windowsPathHint(path))
 	}
 	return nil
 }
