@@ -753,7 +753,11 @@ func (c *Client) initiateUploadByBody(ctx context.Context, path string, size int
 }
 
 func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64, description string) (UploadPlan, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), http.NoBody)
+	reqURL, err := c.url(path)
+	if err != nil {
+		return UploadPlan{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, http.NoBody)
 	if err != nil {
 		return UploadPlan{}, err
 	}
@@ -1389,7 +1393,11 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path string) (*http.Re
 		return http.ErrUseLastResponse
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path), nil)
+	reqURL, err := c.url(path)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
