@@ -65,6 +65,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		ParallelReadBlockSize:   opts.ParallelReadBlockSize,
 		SyncRead:                opts.SyncRead,
 		DirectMountStrict:       opts.DirectMountStrict,
+		GVisorCompat:            opts.GVisorCompat,
 		AllowOther:              opts.AllowOther,
 		ReadOnly:                opts.ReadOnly,
 		Debug:                   opts.Debug,

@@ -72,6 +72,7 @@ type mountFuseOptions struct {
 	ParallelReadBlockSize   int64
 	SyncRead                bool
 	DirectMountStrict       bool
+	GVisorCompat            bool
 	AllowOther              bool
 	ReadOnly                bool
 	Debug                   bool
