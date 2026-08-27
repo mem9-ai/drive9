@@ -221,7 +221,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if !flagProvided(fs, "gvisor-compat") {
+	gvisorCompatGiven := flagProvided(fs, "gvisor-compat")
+	if !gvisorCompatGiven {
 		*gvisorCompat, err = mountGVisorCompatFromEnv()
 		if err != nil {
 			return err
@@ -260,7 +261,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 
 	if objectLoc != nil {
-		if *gvisorCompat {
+		if gvisorCompatGiven && *gvisorCompat {
 			return fmt.Errorf("drive9 mount: --gvisor-compat is only supported with Drive9 FUSE mounts")
 		}
 		if err := validateObjectMount(runtime.GOOS, *mode, *layerRef, *checkpointRef, *profile); err != nil {
@@ -494,7 +495,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if resolved == MountModeWebDAV && *readOnly {
 		return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
 	}
-	if resolved == MountModeWebDAV && *gvisorCompat {
+	if resolved == MountModeWebDAV && gvisorCompatGiven && *gvisorCompat {
 		return fmt.Errorf("drive9 mount: --gvisor-compat is only supported with --mode=fuse")
 	}
 	if resolved == MountModeWebDAV && trustProcessLocalEventsGiven {

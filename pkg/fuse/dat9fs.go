@@ -9306,6 +9306,8 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	if !ok {
 		return gofuse.ENOENT
 	}
+	dh.readMu.Lock()
+	defer dh.readMu.Unlock()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
@@ -9360,6 +9362,8 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	if !ok {
 		return gofuse.ENOENT
 	}
+	dh.readMu.Lock()
+	defer dh.readMu.Unlock()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
