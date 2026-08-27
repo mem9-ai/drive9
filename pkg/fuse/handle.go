@@ -130,7 +130,7 @@ type DirHandle struct {
 	mu                sync.Mutex
 	Ino               uint64
 	Path              string
-	Entries           []DirEntry // guarded by mu; cached directory entries for ReadDir
+	Entries           []DirEntry // guarded by mu; stable snapshot for one directory enumeration sequence
 	entriesGeneration uint64
 }
 

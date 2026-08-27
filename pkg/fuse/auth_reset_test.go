@@ -301,7 +301,7 @@ func TestDirectoryListDiscardedWhenMountViewResetsInFlight(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := fs.loadDirHandleEntries(context.Background(), dh)
+		_, _, err := fs.loadDirHandleEntries(context.Background(), dh, false)
 		done <- err
 	}()
 	<-listStarted
@@ -405,14 +405,14 @@ func TestEmptyDirectoryHandleRemainsLoaded(t *testing.T) {
 	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
 	dh := &DirHandle{Ino: 1, Path: "/", entriesGeneration: fs.mountViewGeneration.Load()}
 
-	if entries, _, err := fs.loadDirHandleEntries(context.Background(), dh); err != nil || len(entries) != 0 {
+	if entries, _, err := fs.loadDirHandleEntries(context.Background(), dh, false); err != nil || len(entries) != 0 {
 		t.Fatalf("first load = %#v, %v; want empty loaded directory", entries, err)
 	}
 	if dh.Entries == nil {
 		t.Fatal("empty directory handle was not marked loaded")
 	}
 	fs.dirCache.Invalidate("/")
-	if entries, _, err := fs.loadDirHandleEntries(context.Background(), dh); err != nil || len(entries) != 0 {
+	if entries, _, err := fs.loadDirHandleEntries(context.Background(), dh, false); err != nil || len(entries) != 0 {
 		t.Fatalf("second load = %#v, %v; want cached empty directory", entries, err)
 	}
 	if got := listCalls.Load(); got != 1 {

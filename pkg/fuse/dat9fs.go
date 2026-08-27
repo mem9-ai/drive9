@@ -9256,10 +9256,13 @@ func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gof
 	return gofuse.OK
 }
 
-func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle) ([]DirEntry, uint64, error) {
+func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle, refresh bool) ([]DirEntry, uint64, error) {
 	dh.mu.Lock()
 	generation := fs.mountViewGeneration.Load()
-	if dh.entriesGeneration == generation && dh.Entries != nil {
+	// gVisor directfs rewinds and reuses one host directory FD. Treat its
+	// offset-zero request as a new enumeration sequence, while preserving the
+	// current snapshot for nonzero pagination and for all other callers.
+	if !refresh && dh.entriesGeneration == generation && dh.Entries != nil {
 		entries := cloneLoadedDirEntries(dh.Entries)
 		dh.mu.Unlock()
 		return entries, generation, nil
@@ -9307,7 +9310,7 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
 
-	entries, generation, err := fs.loadDirHandleEntries(ctx, dh)
+	entries, generation, err := fs.loadDirHandleEntries(ctx, dh, fs.opts.GVisorCompat && input.Offset == 0)
 	if err != nil {
 		safeLogPrintf("list dir failed for %s: %v", dh.Path, err)
 		return listDirErrToFuseStatus(err)
@@ -9361,7 +9364,7 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
 
-	entries, generation, err := fs.loadDirHandleEntries(ctx, dh)
+	entries, generation, err := fs.loadDirHandleEntries(ctx, dh, fs.opts.GVisorCompat && input.Offset == 0)
 	if err != nil {
 		safeLogPrintf("list dir plus failed for %s: %v", dh.Path, err)
 		return listDirErrToFuseStatus(err)

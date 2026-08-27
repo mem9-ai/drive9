@@ -37,6 +37,7 @@ const (
 	defaultMountPerfCPUDuration        = 30 * time.Second
 	defaultMountPerfCPUInterval        = 10 * time.Minute
 	defaultMountPerfHeapInterval       = 10 * time.Minute
+	envMountGVisorCompat               = "DRIVE9_MOUNT_GVISOR_COMPAT"
 )
 
 var (
@@ -171,6 +172,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	parallelReadBlockSize := fs.Int64("parallel-read-block-size-mb", defaultFuseParallelReadBlockSizeMB, "block size in MB for parallel large-file reads")
 	syncRead := fs.Bool("fuse-sync-read", false, "disable kernel async read dispatch; at most one read in flight per file handle")
 	directMountStrict := fs.Bool("direct-mount-strict", false, "Linux only: mount directly with mount(2) and do not fall back to fusermount")
+	gvisorCompat := fs.Bool("gvisor-compat", false, "enable gVisor-specific FUSE compatibility behavior (default from $DRIVE9_MOUNT_GVISOR_COMPAT)")
 	legacyDirStatFallback := fs.Bool("legacy-dir-stat-fallback", false, "on Lookup stat 404, list parent to support legacy servers without directory stat")
 	readDirPrefetch := fs.Bool("readdir-prefetch", false, "prefetch small files after directory reads into the read cache")
 	prefetchMaxFiles := fs.Int("readdir-prefetch-max-files", 32, "maximum small files prefetched per directory read")
@@ -219,6 +221,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if !flagProvided(fs, "gvisor-compat") {
+		*gvisorCompat, err = mountGVisorCompatFromEnv()
+		if err != nil {
+			return err
+		}
+	}
 
 	// Parse positional args: 1-arg = mountpoint; 2-arg = remote mountpoint.
 	var remoteRoot, mountPoint string
@@ -252,6 +260,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 
 	if objectLoc != nil {
+		if *gvisorCompat {
+			return fmt.Errorf("drive9 mount: --gvisor-compat is only supported with Drive9 FUSE mounts")
+		}
 		if err := validateObjectMount(runtime.GOOS, *mode, *layerRef, *checkpointRef, *profile); err != nil {
 			return err
 		}
@@ -483,6 +494,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if resolved == MountModeWebDAV && *readOnly {
 		return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
 	}
+	if resolved == MountModeWebDAV && *gvisorCompat {
+		return fmt.Errorf("drive9 mount: --gvisor-compat is only supported with --mode=fuse")
+	}
 	if resolved == MountModeWebDAV && trustProcessLocalEventsGiven {
 		return fmt.Errorf("drive9 mount: --trust-process-local-events is only supported with --mode=fuse")
 	}
@@ -548,6 +562,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			PackPaths:          append([]string(nil), effectivePackPaths...),
 			ReadOnly:           *readOnly,
 			Debug:              *debug,
+			GVisorCompat:       *gvisorCompat,
 		})
 	}
 
@@ -677,6 +692,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			PackPaths:          append([]string(nil), effectivePackPaths...),
 			ReadOnly:           *readOnly,
 			Debug:              *debug,
+			GVisorCompat:       *gvisorCompat,
 		})
 	}
 
@@ -728,6 +744,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		ParallelReadBlockSize:   *parallelReadBlockSize << 20,
 		SyncRead:                *syncRead,
 		DirectMountStrict:       *directMountStrict,
+		GVisorCompat:            *gvisorCompat,
 		AllowOther:              *allowOther,
 		ReadOnly:                *readOnly,
 		Debug:                   *debug,
@@ -1602,6 +1619,21 @@ func durationFlagValue(fs *flag.FlagSet, name string, value time.Duration) time.
 		return value
 	}
 	return 0
+}
+
+func mountGVisorCompatFromEnv() (bool, error) {
+	raw, ok := os.LookupEnv(envMountGVisorCompat)
+	if !ok {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("drive9 mount: %s must be true or false, got %q", envMountGVisorCompat, raw)
+	}
 }
 
 func readCacheTTLFlagValue(given bool, value time.Duration) (time.Duration, error) {
