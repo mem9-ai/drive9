@@ -641,7 +641,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			})
 		}
 		return startMountBackground(mountBackgroundRequest{
-			Args:       append([]string(nil), args...),
+			Args:       append([]string(nil), originalArgs...),
 			MountPoint: mountPoint,
 			Server:     serverVal,
 			APIKey:     apiKeyVal,
