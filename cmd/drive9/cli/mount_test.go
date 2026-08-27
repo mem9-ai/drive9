@@ -955,6 +955,7 @@ func TestMountCmdNoSuperviseUsesLegacyBackground(t *testing.T) {
 		mountFuse = oldMountFuse
 	})
 
+	t.Setenv(EnvMountRemoteOnlyPatterns, "**/tmp/**\n**/.tmp/**")
 	var got mountBackgroundRequest
 	startMountBackground = func(req mountBackgroundRequest) error {
 		got = req
@@ -975,7 +976,8 @@ func TestMountCmdNoSuperviseUsesLegacyBackground(t *testing.T) {
 		"--no-supervise",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
-		"--profile", "interactive",
+		"--profile", "coding-agent",
+		"--local-root", t.TempDir(),
 		mountPoint,
 	})
 	if err != nil {
@@ -983,6 +985,10 @@ func TestMountCmdNoSuperviseUsesLegacyBackground(t *testing.T) {
 	}
 	if got.MountPoint != mountPoint {
 		t.Fatalf("MountPoint = %q, want %q", got.MountPoint, mountPoint)
+	}
+	wantPrefix := []string{"--remote-only", "**/tmp/**", "--remote-only", "**/.tmp/**"}
+	if len(got.Args) < len(wantPrefix) || !reflect.DeepEqual(got.Args[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("Args = %v, want policy prefix %v", got.Args, wantPrefix)
 	}
 }
 
