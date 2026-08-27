@@ -36,6 +36,7 @@ KUBE_PLUGIN_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows
 
 GOLANGCI_LINT_VERSION ?= v2.5.0
 GOLANGCI_LINT_BIN ?= $(BIN_DIR)/golangci-lint
+GOLANGCI_LINT_GO_VERSION ?= $(shell $(GO) env GOVERSION)
 
 IMAGE_REPO ?= drive9-server
 IMAGE_TAG ?= latest
@@ -106,7 +107,7 @@ install-lint:
 	@if [ ! -x "$(GOLANGCI_LINT_BIN)" ]; then \
 		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION) to $(BIN_DIR)..."; \
 		mkdir -p "$(BIN_DIR)"; \
-		GOBIN="$(BIN_DIR_ABS)" $(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
+		GOTOOLCHAIN="$(GOLANGCI_LINT_GO_VERSION)" GOBIN="$(BIN_DIR_ABS)" $(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
 	else \
 		echo "golangci-lint already installed at $(GOLANGCI_LINT_BIN)"; \
 	fi
