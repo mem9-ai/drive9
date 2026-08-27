@@ -42,6 +42,17 @@ func TestLocalPolicyRemoteOnlyOverridesLocalOnly(t *testing.T) {
 	}
 }
 
+func TestLocalPolicyRemoteOnlyOverridesBuiltinTmpRule(t *testing.T) {
+	policy := NewLocalPolicy(MountProfileCodingAgent, nil, []string{"**/tmp/**"})
+
+	if got := policy.Classify("/repo/tmp/object.blob"); got != PathLayerRemotePersistent {
+		t.Fatalf("tmp object policy = %s, want remote persistent", got)
+	}
+	if got := policy.Classify("/repo/blobs/aa/object.blob"); got != PathLayerRemotePersistent {
+		t.Fatalf("blob object policy = %s, want remote persistent", got)
+	}
+}
+
 func TestLocalPolicyDisabledForOrdinaryMount(t *testing.T) {
 	policy := NewLocalPolicy("", nil, nil)
 	if policy.Enabled() {

@@ -110,6 +110,8 @@ func TestApplyScrubbedMountEnvUnsetsOmitted(t *testing.T) {
 	t.Setenv(EnvAPIKey, "old")
 	t.Setenv(EnvServer, "https://old")
 	t.Setenv(EnvVaultToken, "old-tok")
+	t.Setenv(EnvMountLocalOnlyPatterns, "**/.cache/**")
+	t.Setenv(EnvMountRemoteOnlyPatterns, "**/tmp/**")
 	scrubbed := mountBackgroundEnv(os.Environ(), mountBackgroundRequest{
 		Server: "https://s",
 		APIKey: "new",
@@ -129,6 +131,12 @@ func TestApplyScrubbedMountEnvUnsetsOmitted(t *testing.T) {
 	}
 	if _, ok := os.LookupEnv(EnvVaultToken); ok {
 		t.Fatal("vault token should be unset when using api key snapshot")
+	}
+	if _, ok := os.LookupEnv(EnvMountLocalOnlyPatterns); ok {
+		t.Fatalf("%s should be unset after policy snapshot", EnvMountLocalOnlyPatterns)
+	}
+	if _, ok := os.LookupEnv(EnvMountRemoteOnlyPatterns); ok {
+		t.Fatalf("%s should be unset after policy snapshot", EnvMountRemoteOnlyPatterns)
 	}
 }
 

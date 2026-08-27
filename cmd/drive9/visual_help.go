@@ -772,8 +772,8 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Title: "Overlay profiles", Flags: []visualHelpFlag{
 					{Name: "--profile NAME", Desc: "mount profile: coding-agent, portable, none, interactive, or a custom profile file"},
 					{Name: "--local-root DIR", Desc: "local-only overlay storage root; auto-generated for overlay profiles"},
-					{Name: "--local-only PATTERN", Desc: "additional local-only path pattern; repeatable"},
-					{Name: "--remote-only PATTERN", Desc: "remote-persistent override path pattern; repeatable"},
+					{Name: "--local-only PATTERN", Desc: "add a local-only rule; repeatable; env DRIVE9_MOUNT_LOCAL_ONLY_PATTERNS is newline-delimited"},
+					{Name: "--remote-only PATTERN", Desc: "force remote-persistent routing over local rules; repeatable; env DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS is newline-delimited"},
 					{Name: "--unpack :/archive.tar.gz", Desc: "restore a drive9 pack archive into local-root before mounting; repeatable"},
 					{Name: "--no-auto-unpack", Desc: "disable automatic profile pack restore before mounting"},
 				}},
@@ -805,6 +805,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Command: "drive9 mount :/ ./mnt", Desc: "supervised background mount (default)"},
 				{Command: "drive9 mount --supervise-foreground :/ ./mnt", Desc: "block as supervisor (sandbox entrypoint)"},
 				{Command: "drive9 mount --profile coding-agent :/workspace ./mnt", Desc: "profile mount"},
+				{Command: "DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS='**/tmp/**' drive9 mount :/workspace ./mnt", Desc: "keep tmp paths remote-persistent"},
 				{Command: "drive9 mount --layer layer_123 --checkpoint cp_456 :/team ./mnt", Desc: "restore a layer checkpoint before mounting"},
 				{Command: "drive9 mount --perf-dir ./perf --foreground :/ ./mnt", Desc: "foreground worker only with profiling outputs"},
 			},
