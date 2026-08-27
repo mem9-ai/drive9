@@ -38,6 +38,10 @@ const (
 	defaultMountPerfCPUInterval        = 10 * time.Minute
 	defaultMountPerfHeapInterval       = 10 * time.Minute
 	envMountGVisorCompat               = "DRIVE9_MOUNT_GVISOR_COMPAT"
+	// EnvMountLocalOnlyPatterns adds newline-delimited local-only mount rules.
+	EnvMountLocalOnlyPatterns = "DRIVE9_MOUNT_LOCAL_ONLY_PATTERNS"
+	// EnvMountRemoteOnlyPatterns adds newline-delimited remote-only mount rules.
+	EnvMountRemoteOnlyPatterns = "DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS"
 )
 
 var (
@@ -189,8 +193,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	var remoteOnlyPatterns stringListFlag
 	var unpackArchives stringListFlag
 	noAutoUnpack := fs.Bool("no-auto-unpack", false, "disable automatic profile pack restore before mounting")
-	fs.Var(&localOnlyPatterns, "local-only", "additional local-only path pattern for overlay routing (repeatable, e.g. **/node_modules/**)")
-	fs.Var(&remoteOnlyPatterns, "remote-only", "remote-persistent override path pattern for overlay routing (repeatable)")
+	fs.Var(&localOnlyPatterns, "local-only", "route matching paths to the local-only overlay; adds to profile rules; repeatable; env $DRIVE9_MOUNT_LOCAL_ONLY_PATTERNS uses one pattern per line")
+	fs.Var(&remoteOnlyPatterns, "remote-only", "force matching paths to remote-persistent storage; overrides local-only routing; repeatable; env $DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS uses one pattern per line")
 	fs.Var(&unpackArchives, "unpack", "restore a drive9 pack archive into --local-root before mounting (repeatable)")
 	uploadConcurrency := fs.Int("upload-concurrency", 16, "maximum concurrent background uploads issued by FUSE")
 	dirCacheMaxEntries := fs.Int("dir-cache-max-entries", 200000, "maximum entries per directory in namespace cache before complete marking is disabled")
@@ -316,6 +320,25 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		})
 	}
 
+	envLocalOnlyPatterns, err := consumeMountPolicyPatternsEnv(EnvMountLocalOnlyPatterns)
+	if err != nil {
+		return err
+	}
+	envRemoteOnlyPatterns, err := consumeMountPolicyPatternsEnv(EnvMountRemoteOnlyPatterns)
+	if err != nil {
+		return err
+	}
+	policyEnvArgs := make([]string, 0, len(envLocalOnlyPatterns)+len(envRemoteOnlyPatterns))
+	for _, pattern := range envLocalOnlyPatterns {
+		policyEnvArgs = append(policyEnvArgs, "--local-only="+pattern)
+	}
+	for _, pattern := range envRemoteOnlyPatterns {
+		policyEnvArgs = append(policyEnvArgs, "--remote-only="+pattern)
+	}
+	// Snapshot environment-derived policy in argv so supervised restarts and
+	// later adoption keep the original mount contract without re-reading env.
+	originalArgs = append(policyEnvArgs, originalArgs...)
+
 	remoteRoot, err = mountpath.NormalizeRoot(remoteRoot)
 	if err != nil {
 		return fmt.Errorf("drive9 mount: %w", err)
@@ -434,8 +457,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		}
 	}
 	*profile = profileCfg.Name
-	effectiveLocalOnlyPatterns := mergeProfileValues(profileCfg.LocalOnlyPatterns, localOnlyPatterns)
-	effectiveRemoteOnlyPatterns := mergeProfileValues(profileCfg.RemoteOnlyPatterns, remoteOnlyPatterns)
+	effectiveLocalOnlyPatterns := mergeProfileValues(profileCfg.LocalOnlyPatterns, envLocalOnlyPatterns, localOnlyPatterns)
+	effectiveRemoteOnlyPatterns := mergeProfileValues(profileCfg.RemoteOnlyPatterns, envRemoteOnlyPatterns, remoteOnlyPatterns)
 	effectivePackPaths := mergeProfileValues(profileCfg.PackPaths)
 	normalizedLocalRoot := strings.TrimSpace(*localRoot)
 	syncModeVal, writePolicyVal, err := parseFuseDurability(*durability)
@@ -618,7 +641,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			})
 		}
 		return startMountBackground(mountBackgroundRequest{
-			Args:       append([]string(nil), args...),
+			Args:       append([]string(nil), originalArgs...),
 			MountPoint: mountPoint,
 			Server:     serverVal,
 			APIKey:     apiKeyVal,
@@ -942,6 +965,8 @@ func applyScrubbedMountEnv(scrubbed []string) {
 		EnvVaultToken,
 		EnvTiDBCloudPublicKey,
 		EnvTiDBCloudPrivateKey,
+		EnvMountLocalOnlyPatterns,
+		EnvMountRemoteOnlyPatterns,
 	} {
 		_ = os.Unsetenv(key)
 	}
@@ -1198,7 +1223,9 @@ func mountBackgroundEnv(environ []string, req mountBackgroundRequest) []string {
 			strings.HasPrefix(kv, EnvAPIKey+"=") ||
 			strings.HasPrefix(kv, EnvVaultToken+"=") ||
 			strings.HasPrefix(kv, EnvTiDBCloudPublicKey+"=") ||
-			strings.HasPrefix(kv, EnvTiDBCloudPrivateKey+"=") {
+			strings.HasPrefix(kv, EnvTiDBCloudPrivateKey+"=") ||
+			strings.HasPrefix(kv, EnvMountLocalOnlyPatterns+"=") ||
+			strings.HasPrefix(kv, EnvMountRemoteOnlyPatterns+"=") {
 			continue
 		}
 		out = append(out, kv)
@@ -1595,6 +1622,32 @@ func validateMountPolicyPatterns(patternGroups ...[]string) error {
 		}
 	}
 	return nil
+}
+
+func consumeMountPolicyPatternsEnv(name string) ([]string, error) {
+	raw, ok := os.LookupEnv(name)
+	if !ok {
+		return nil, nil
+	}
+	_ = os.Unsetenv(name)
+
+	patterns := make([]string, 0)
+	seen := make(map[string]struct{})
+	for lineNo, line := range strings.Split(raw, "\n") {
+		pattern := strings.TrimSpace(line)
+		if pattern == "" {
+			continue
+		}
+		if err := validateMountPolicyPatterns([]string{pattern}); err != nil {
+			return nil, fmt.Errorf("%s line %d: %w", name, lineNo+1, err)
+		}
+		if _, ok := seen[pattern]; ok {
+			continue
+		}
+		seen[pattern] = struct{}{}
+		patterns = append(patterns, pattern)
+	}
+	return patterns, nil
 }
 
 type stringListFlag []string

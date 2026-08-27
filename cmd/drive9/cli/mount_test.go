@@ -955,6 +955,8 @@ func TestMountCmdNoSuperviseUsesLegacyBackground(t *testing.T) {
 		mountFuse = oldMountFuse
 	})
 
+	t.Setenv(EnvMountLocalOnlyPatterns, "--api-key")
+	t.Setenv(EnvMountRemoteOnlyPatterns, "**/tmp/**")
 	var got mountBackgroundRequest
 	startMountBackground = func(req mountBackgroundRequest) error {
 		got = req
@@ -975,7 +977,8 @@ func TestMountCmdNoSuperviseUsesLegacyBackground(t *testing.T) {
 		"--no-supervise",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
-		"--profile", "interactive",
+		"--profile", "coding-agent",
+		"--local-root", t.TempDir(),
 		mountPoint,
 	})
 	if err != nil {
@@ -983,6 +986,13 @@ func TestMountCmdNoSuperviseUsesLegacyBackground(t *testing.T) {
 	}
 	if got.MountPoint != mountPoint {
 		t.Fatalf("MountPoint = %q, want %q", got.MountPoint, mountPoint)
+	}
+	wantPrefix := []string{"--local-only=--api-key", "--remote-only=**/tmp/**"}
+	if len(got.Args) < len(wantPrefix) || !reflect.DeepEqual(got.Args[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("Args = %v, want policy prefix %v", got.Args, wantPrefix)
+	}
+	if childArgs := foregroundMountCommandArgs(got.Args); !containsString(childArgs, "--local-only=--api-key") {
+		t.Fatalf("foreground args = %v, want flag-like policy pattern preserved", childArgs)
 	}
 }
 
@@ -1129,6 +1139,8 @@ func TestMountBackgroundEnvSnapshotsCredentials(t *testing.T) {
 		EnvVaultToken + "=old-token",
 		EnvTiDBCloudPublicKey + "=tidb-public",
 		EnvTiDBCloudPrivateKey + "=tidb-private",
+		EnvMountLocalOnlyPatterns + "=**/.cache/**",
+		EnvMountRemoteOnlyPatterns + "=**/tmp/**",
 	}, mountBackgroundRequest{
 		Server: "https://drive9.example",
 		Token:  "jwt-token",
@@ -1148,6 +1160,31 @@ func TestWorkerArgsForSupervisePreservesGVisorCompat(t *testing.T) {
 	got := workerArgsForSupervise([]string{"--gvisor-compat=false", "/mnt/drive9"})
 	if !containsString(got, "--gvisor-compat=false") {
 		t.Fatalf("worker args = %v, want explicit gVisor compatibility flag", got)
+	}
+}
+
+func TestConsumeMountPolicyPatternsEnv(t *testing.T) {
+	t.Setenv(EnvMountRemoteOnlyPatterns, " **/tmp/** \r\n\n**/.tmp/**\n**/tmp/**\n**/with space/** ")
+
+	got, err := consumeMountPolicyPatternsEnv(EnvMountRemoteOnlyPatterns)
+	if err != nil {
+		t.Fatalf("consumeMountPolicyPatternsEnv: %v", err)
+	}
+	want := []string{"**/tmp/**", "**/.tmp/**", "**/with space/**"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("patterns = %v, want %v", got, want)
+	}
+	if _, ok := os.LookupEnv(EnvMountRemoteOnlyPatterns); ok {
+		t.Fatalf("%s should be consumed", EnvMountRemoteOnlyPatterns)
+	}
+}
+
+func TestConsumeMountPolicyPatternsEnvReportsVariableAndLine(t *testing.T) {
+	t.Setenv(EnvMountRemoteOnlyPatterns, "**/tmp/**\n**/../bad/**")
+
+	_, err := consumeMountPolicyPatternsEnv(EnvMountRemoteOnlyPatterns)
+	if err == nil || !strings.Contains(err.Error(), EnvMountRemoteOnlyPatterns+" line 2") || !strings.Contains(err.Error(), `".." segment`) {
+		t.Fatalf("error = %v, want variable, line, and invalid segment", err)
 	}
 }
 
@@ -2519,6 +2556,90 @@ func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.RemoteOnlyPatterns, []string{"**/node_modules/keep/**"}) {
 		t.Fatalf("RemoteOnlyPatterns = %v", got.RemoteOnlyPatterns)
+	}
+}
+
+func TestMountCmdCodingAgentProfileMergesPolicyEnvironment(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	t.Setenv(EnvMountLocalOnlyPatterns, "**/.agent-cache/**\n**/.shared/**")
+	t.Setenv(EnvMountRemoteOnlyPatterns, "**/tmp/**\n**/.shared/**")
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "coding-agent",
+		"--local-root", t.TempDir(),
+		"--local-only", "**/.cli-cache/**",
+		"--remote-only", "**/uploads/**",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	wantLocal := mergeProfileValues(
+		builtinCodingAgentLocalOnlyPatterns(),
+		[]string{"**/.agent-cache/**", "**/.shared/**", "**/.cli-cache/**"},
+	)
+	if !reflect.DeepEqual(got.LocalOnlyPatterns, wantLocal) {
+		t.Fatalf("LocalOnlyPatterns = %v, want %v", got.LocalOnlyPatterns, wantLocal)
+	}
+	wantRemote := []string{"**/tmp/**", "**/.shared/**", "**/uploads/**"}
+	if !reflect.DeepEqual(got.RemoteOnlyPatterns, wantRemote) {
+		t.Fatalf("RemoteOnlyPatterns = %v, want %v", got.RemoteOnlyPatterns, wantRemote)
+	}
+}
+
+func TestMountCmdMaterializesPolicyEnvironmentInSupervisedArgs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("supervised mounts are disabled on Windows")
+	}
+	oldStartSupervised := startMountSupervisedBackground
+	oldMountFuse := mountFuse
+	t.Cleanup(func() {
+		startMountSupervisedBackground = oldStartSupervised
+		mountFuse = oldMountFuse
+	})
+
+	t.Setenv(EnvMountRemoteOnlyPatterns, "**/tmp/**\n--foreground")
+	var got mountSuperviseStartRequest
+	startMountSupervisedBackground = func(req mountSuperviseStartRequest) error {
+		got = req
+		return nil
+	}
+	mountFuse = func(*mountFuseOptions) error {
+		t.Fatal("mountFuse should not run in-process")
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "coding-agent",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	wantPrefix := []string{"--remote-only=**/tmp/**", "--remote-only=--foreground"}
+	if len(got.OriginalArgs) < len(wantPrefix) || !reflect.DeepEqual(got.OriginalArgs[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("OriginalArgs = %v, want policy prefix %v", got.OriginalArgs, wantPrefix)
+	}
+	if workerArgs := workerArgsForSupervise(got.OriginalArgs); !containsString(workerArgs, "--remote-only=--foreground") {
+		t.Fatalf("worker args = %v, want flag-like policy pattern preserved", workerArgs)
 	}
 }
 
