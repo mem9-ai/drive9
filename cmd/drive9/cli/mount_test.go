@@ -1043,6 +1043,11 @@ func TestForegroundMountCommandArgs(t *testing.T) {
 			want: []string{"mount", "--foreground", "--direct-mount-strict", "/mnt/drive9"},
 		},
 		{
+			name: "fs preserve gvisor compatibility",
+			in:   []string{"--gvisor-compat=false", "/mnt/drive9"},
+			want: []string{"mount", "--foreground", "--gvisor-compat=false", "/mnt/drive9"},
+		},
+		{
 			name: "vault",
 			in:   []string{"vault", "--dir-ttl", "1s", "/mnt/vault"},
 			want: []string{"mount", "vault", "--foreground", "--dir-ttl", "1s", "/mnt/vault"},
@@ -1118,6 +1123,7 @@ func TestWaitForBackgroundMountReadyStopsChildOnStateReadError(t *testing.T) {
 func TestMountBackgroundEnvSnapshotsCredentials(t *testing.T) {
 	got := mountBackgroundEnv([]string{
 		"PATH=/bin",
+		envMountGVisorCompat + "=true",
 		EnvServer + "=https://old.example",
 		EnvAPIKey + "=old-key",
 		EnvVaultToken + "=old-token",
@@ -1129,11 +1135,19 @@ func TestMountBackgroundEnvSnapshotsCredentials(t *testing.T) {
 	})
 	want := []string{
 		"PATH=/bin",
+		envMountGVisorCompat + "=true",
 		EnvServer + "=https://drive9.example",
 		EnvVaultToken + "=jwt-token",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("env = %v, want %v", got, want)
+	}
+}
+
+func TestWorkerArgsForSupervisePreservesGVisorCompat(t *testing.T) {
+	got := workerArgsForSupervise([]string{"--gvisor-compat=false", "/mnt/drive9"})
+	if !containsString(got, "--gvisor-compat=false") {
+		t.Fatalf("worker args = %v, want explicit gVisor compatibility flag", got)
 	}
 }
 
@@ -1197,6 +1211,146 @@ func TestMountCmdLeavesLegacyDirStatFallbackDisabledByDefault(t *testing.T) {
 	}
 	if got.LegacyDirStatFallback {
 		t.Fatal("LegacyDirStatFallback = true, want false")
+	}
+}
+
+func TestMountCmdResolvesGVisorCompat(t *testing.T) {
+	tests := []struct {
+		name     string
+		env      string
+		unsetEnv bool
+		args     []string
+		want     bool
+	}{
+		{name: "disabled by default", unsetEnv: true, want: false},
+		{name: "enabled by environment", env: "true", want: true},
+		{name: "flag enables over environment", env: "false", args: []string{"--gvisor-compat"}, want: true},
+		{name: "explicit flag disables over environment", env: "true", args: []string{"--gvisor-compat=false"}, want: false},
+		{name: "explicit flag overrides invalid environment", env: "invalid", args: []string{"--gvisor-compat=false"}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.unsetEnv {
+				t.Setenv(envMountGVisorCompat, "temporary")
+				if err := os.Unsetenv(envMountGVisorCompat); err != nil {
+					t.Fatalf("unset %s: %v", envMountGVisorCompat, err)
+				}
+			} else {
+				t.Setenv(envMountGVisorCompat, tt.env)
+			}
+			oldMountFuse := mountFuse
+			t.Cleanup(func() { mountFuse = oldMountFuse })
+
+			var got *mountFuseOptions
+			mountFuse = func(opts *mountFuseOptions) error {
+				copied := *opts
+				got = &copied
+				return nil
+			}
+
+			args := []string{
+				"--foreground",
+				"--mode", "fuse",
+				"--server", "https://drive9.example",
+				"--api-key", "sk-test",
+			}
+			args = append(args, tt.args...)
+			args = append(args, t.TempDir())
+			if err := MountCmd(args); err != nil {
+				t.Fatalf("MountCmd: %v", err)
+			}
+			if got == nil {
+				t.Fatal("mountFuse was not called")
+			}
+			if got.GVisorCompat != tt.want {
+				t.Fatalf("GVisorCompat = %t, want %t", got.GVisorCompat, tt.want)
+			}
+		})
+	}
+}
+
+func TestMountCmdRejectsGVisorCompatForNonFUSEMounts(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "WebDAV", args: []string{"--foreground", "--mode", "webdav", "--gvisor-compat"}},
+		{name: "object", args: []string{"--foreground", "--gvisor-compat", "s3://bucket/prefix/"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append(append([]string(nil), tt.args...), t.TempDir())
+			err := MountCmd(args)
+			if err == nil {
+				t.Fatal("MountCmd error = nil, want unsupported compatibility-mode error")
+			}
+			if !strings.Contains(err.Error(), "--gvisor-compat") || !strings.Contains(err.Error(), "only supported") {
+				t.Fatalf("MountCmd error = %q, want gVisor compatibility scope error", err)
+			}
+		})
+	}
+}
+
+func TestMountCmdIgnoresGVisorCompatEnvironmentForNonFUSEMounts(t *testing.T) {
+	t.Setenv(envMountGVisorCompat, "true")
+
+	t.Run("WebDAV", func(t *testing.T) {
+		err := MountCmd([]string{
+			"--foreground",
+			"--mode", "webdav",
+			"--trust-process-local-events",
+			t.TempDir(),
+		})
+		if err == nil {
+			t.Fatal("MountCmd error = nil, want WebDAV option error")
+		}
+		if strings.Contains(err.Error(), "--gvisor-compat") {
+			t.Fatalf("MountCmd error = %q, ambient gVisor compatibility must be ignored", err)
+		}
+		if !strings.Contains(err.Error(), "--trust-process-local-events") {
+			t.Fatalf("MountCmd error = %q, want WebDAV option error", err)
+		}
+	})
+
+	t.Run("object", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("object mounts are unsupported on Windows")
+		}
+		oldMountObjectStore := mountObjectStore
+		t.Cleanup(func() { mountObjectStore = oldMountObjectStore })
+		called := false
+		mountObjectStore = func(*Location, string, string, bool, bool, bool, bool) error {
+			called = true
+			return nil
+		}
+		t.Setenv("HOME", t.TempDir())
+		t.Setenv(EnvServer, "https://drive9.example")
+		t.Setenv(EnvAPIKey, "sk-test")
+
+		if err := MountCmd([]string{
+			"--foreground",
+			"--mode", "fuse",
+			"s3://bucket/prefix/",
+			t.TempDir(),
+		}); err != nil {
+			t.Fatalf("MountCmd: %v", err)
+		}
+		if !called {
+			t.Fatal("mountObjectStore was not called")
+		}
+	})
+}
+
+func TestMountCmdRejectsInvalidGVisorCompatEnvironment(t *testing.T) {
+	t.Setenv(envMountGVisorCompat, "enabled")
+	err := MountCmd([]string{"--foreground", "--mode", "fuse", t.TempDir()})
+	if err == nil {
+		t.Fatal("MountCmd error = nil, want invalid environment error")
+	}
+	if !strings.Contains(err.Error(), envMountGVisorCompat) {
+		t.Fatalf("MountCmd error = %q, want %s", err, envMountGVisorCompat)
 	}
 }
 

@@ -6461,6 +6461,315 @@ func TestReadDirEmitsDotAndDotDot(t *testing.T) {
 	}
 }
 
+func TestReadDirGVisorCompatControlsOffsetZeroRefresh(t *testing.T) {
+	tests := []struct {
+		name         string
+		gvisorCompat bool
+		want         []string
+	}{
+		{name: "disabled", want: []string{".", "..", "before.txt"}},
+		{name: "enabled", gvisorCompat: true, want: []string{".", "..", "before.txt", "after.txt"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &MountOptions{GVisorCompat: tt.gvisorCompat}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient("http://localhost"), opts)
+			dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+			fs.dirCache.Put("/dir", []CachedFileInfo{{Name: "before.txt"}})
+			dh := &DirHandle{Ino: dirIno, Path: "/dir"}
+			fh := fs.dirHandles.Allocate(dh)
+
+			read := func() []string {
+				out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+				if st := fs.ReadDir(nil, &gofuse.ReadIn{
+					InHeader: gofuse.InHeader{NodeId: dirIno},
+					Fh:       fh,
+					Offset:   0,
+					Size:     4096,
+				}, out); st != gofuse.OK {
+					t.Fatalf("ReadDir status = %v, want OK", st)
+				}
+				return parseDirEntryNames(t, out)
+			}
+
+			if got := read(); !reflect.DeepEqual(got, []string{".", "..", "before.txt"}) {
+				t.Fatalf("first ReadDir = %v, want [. .. before.txt]", got)
+			}
+			fs.dirCache.Upsert("/dir", CachedFileInfo{Name: "after.txt"})
+			if got := read(); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("second ReadDir = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReadDirGVisorCompatKeepsSnapshotForNonzeroOffset(t *testing.T) {
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+	fs.dirCache.Put("/dir", []CachedFileInfo{{Name: "before.txt"}})
+	dh := &DirHandle{Ino: dirIno, Path: "/dir"}
+	fh := fs.dirHandles.Allocate(dh)
+
+	first := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Offset:   0,
+		Size:     4096,
+	}, first); st != gofuse.OK {
+		t.Fatalf("initial ReadDir status = %v, want OK", st)
+	}
+
+	fs.dirCache.Upsert("/dir", CachedFileInfo{Name: "after.txt"})
+	continued := gofuse.NewDirEntryList(make([]byte, 4096), 2)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Offset:   2,
+		Size:     4096,
+	}, continued); st != gofuse.OK {
+		t.Fatalf("continued ReadDir status = %v, want OK", st)
+	}
+	if got, want := parseDirEntryNames(t, continued), []string{"before.txt"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("continued ReadDir = %v, want %v", got, want)
+	}
+}
+
+func TestReadDirSerializesConcurrentRequestsPerHandle(t *testing.T) {
+	for _, readDirPlus := range []bool{false, true} {
+		name := "ReadDir"
+		if readDirPlus {
+			name = "ReadDirPlus"
+		}
+		t.Run(name, func(t *testing.T) {
+			firstListStarted := make(chan struct{})
+			secondListStarted := make(chan struct{})
+			releaseFirstList := make(chan struct{})
+			var listCalls atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				switch listCalls.Add(1) {
+				case 1:
+					close(firstListStarted)
+					<-releaseFirstList
+				case 2:
+					close(secondListStarted)
+				}
+				_, _ = w.Write([]byte(`{"entries":[]}`))
+			}))
+			defer ts.Close()
+			t.Cleanup(func() {
+				select {
+				case <-releaseFirstList:
+				default:
+					close(releaseFirstList)
+				}
+			})
+
+			opts := &MountOptions{GVisorCompat: true}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+			dh := &DirHandle{Ino: dirIno, Path: "/dir"}
+			fh := fs.dirHandles.Allocate(dh)
+			read := func() gofuse.Status {
+				input := &gofuse.ReadIn{
+					InHeader: gofuse.InHeader{NodeId: dirIno},
+					Fh:       fh,
+					Offset:   0,
+					Size:     4096,
+				}
+				out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+				if readDirPlus {
+					return fs.ReadDirPlus(nil, input, out)
+				}
+				return fs.ReadDir(nil, input, out)
+			}
+
+			firstDone := make(chan gofuse.Status, 1)
+			go func() { firstDone <- read() }()
+			<-firstListStarted
+			secondCallStarted := make(chan struct{})
+			secondDone := make(chan gofuse.Status, 1)
+			go func() {
+				close(secondCallStarted)
+				secondDone <- read()
+			}()
+			<-secondCallStarted
+
+			select {
+			case <-secondListStarted:
+				close(releaseFirstList)
+				<-firstDone
+				<-secondDone
+				t.Fatal("second directory request overlapped the first on one handle")
+			case <-time.After(200 * time.Millisecond):
+			}
+
+			close(releaseFirstList)
+			if st := <-firstDone; st != gofuse.OK {
+				t.Fatalf("first directory request status = %v, want OK", st)
+			}
+			if st := <-secondDone; st != gofuse.OK {
+				t.Fatalf("second directory request status = %v, want OK", st)
+			}
+		})
+	}
+}
+
+func TestReadDirCanceledWhileWaitingForHandle(t *testing.T) {
+	for _, readDirPlus := range []bool{false, true} {
+		name := "ReadDir"
+		if readDirPlus {
+			name = "ReadDirPlus"
+		}
+		t.Run(name, func(t *testing.T) {
+			listStarted := make(chan struct{})
+			releaseList := make(chan struct{})
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				close(listStarted)
+				<-releaseList
+				_, _ = w.Write([]byte(`{"entries":[]}`))
+			}))
+			defer ts.Close()
+			t.Cleanup(func() {
+				select {
+				case <-releaseList:
+				default:
+					close(releaseList)
+				}
+			})
+
+			opts := &MountOptions{GVisorCompat: true}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+			dh := &DirHandle{Ino: dirIno, Path: "/dir"}
+			fh := fs.dirHandles.Allocate(dh)
+			read := func(cancel <-chan struct{}) gofuse.Status {
+				input := &gofuse.ReadIn{
+					InHeader: gofuse.InHeader{NodeId: dirIno},
+					Fh:       fh,
+					Offset:   0,
+					Size:     4096,
+				}
+				out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+				if readDirPlus {
+					return fs.ReadDirPlus(cancel, input, out)
+				}
+				return fs.ReadDir(cancel, input, out)
+			}
+
+			firstDone := make(chan gofuse.Status, 1)
+			go func() { firstDone <- read(nil) }()
+			<-listStarted
+
+			cancel := make(chan struct{})
+			secondStarted := make(chan struct{})
+			secondDone := make(chan gofuse.Status, 1)
+			go func() {
+				close(secondStarted)
+				secondDone <- read(cancel)
+			}()
+			<-secondStarted
+			close(cancel)
+
+			select {
+			case st := <-secondDone:
+				if st != gofuse.EINTR {
+					t.Fatalf("canceled directory request status = %v, want EINTR", st)
+				}
+			case <-time.After(200 * time.Millisecond):
+				close(releaseList)
+				<-firstDone
+				<-secondDone
+				t.Fatal("canceled directory request stayed blocked on the handle")
+			}
+
+			close(releaseList)
+			if st := <-firstDone; st != gofuse.OK {
+				t.Fatalf("first directory request status = %v, want OK", st)
+			}
+		})
+	}
+}
+
+func TestReadDirPlusGVisorCompatKeepsSnapshotForNonzeroOffset(t *testing.T) {
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+	fs.dirCache.Put("/dir", []CachedFileInfo{{Name: "before.txt"}})
+	dh := &DirHandle{Ino: dirIno, Path: "/dir"}
+	fh := fs.dirHandles.Allocate(dh)
+
+	first := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Offset:   0,
+		Size:     4096,
+	}, first); st != gofuse.OK {
+		t.Fatalf("initial ReadDirPlus status = %v, want OK", st)
+	}
+
+	fs.dirCache.Upsert("/dir", CachedFileInfo{Name: "after.txt"})
+	continued := gofuse.NewDirEntryList(make([]byte, 4096), 2)
+	if st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Offset:   2,
+		Size:     4096,
+	}, continued); st != gofuse.OK {
+		t.Fatalf("continued ReadDirPlus status = %v, want OK", st)
+	}
+
+	dh.mu.Lock()
+	defer dh.mu.Unlock()
+	if got := len(dh.Entries); got != 1 || dh.Entries[0].Name != "before.txt" {
+		t.Fatalf("continued snapshot = %+v, want only before.txt", dh.Entries)
+	}
+}
+
+func TestReadDirPlusGVisorCompatRefreshesOffsetZero(t *testing.T) {
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+	fs.dirCache.Put("/dir", []CachedFileInfo{{Name: "before.txt"}})
+	dh := &DirHandle{Ino: dirIno, Path: "/dir"}
+	fh := fs.dirHandles.Allocate(dh)
+
+	read := func() {
+		out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+		if st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
+			InHeader: gofuse.InHeader{NodeId: dirIno},
+			Fh:       fh,
+			Offset:   0,
+			Size:     4096,
+		}, out); st != gofuse.OK {
+			t.Fatalf("ReadDirPlus status = %v, want OK", st)
+		}
+	}
+
+	read()
+	fs.dirCache.Upsert("/dir", CachedFileInfo{Name: "after.txt"})
+	read()
+
+	dh.mu.Lock()
+	defer dh.mu.Unlock()
+	got := make([]string, 0, len(dh.Entries))
+	for _, entry := range dh.Entries {
+		got = append(got, entry.Name)
+	}
+	if want := []string{"before.txt", "after.txt"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("directory snapshot = %v, want %v", got, want)
+	}
+}
+
 // TestReadDirEmitsDotAndDotDotAtRoot verifies ".." at the root resolves to the
 // root inode itself rather than a missing parent.
 func TestReadDirEmitsDotAndDotDotAtRoot(t *testing.T) {
