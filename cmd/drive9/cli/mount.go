@@ -328,12 +328,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
-	policyEnvArgs := make([]string, 0, 2*(len(envLocalOnlyPatterns)+len(envRemoteOnlyPatterns)))
+	policyEnvArgs := make([]string, 0, len(envLocalOnlyPatterns)+len(envRemoteOnlyPatterns))
 	for _, pattern := range envLocalOnlyPatterns {
-		policyEnvArgs = append(policyEnvArgs, "--local-only", pattern)
+		policyEnvArgs = append(policyEnvArgs, "--local-only="+pattern)
 	}
 	for _, pattern := range envRemoteOnlyPatterns {
-		policyEnvArgs = append(policyEnvArgs, "--remote-only", pattern)
+		policyEnvArgs = append(policyEnvArgs, "--remote-only="+pattern)
 	}
 	// Snapshot environment-derived policy in argv so supervised restarts and
 	// later adoption keep the original mount contract without re-reading env.
