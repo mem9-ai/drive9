@@ -6620,6 +6620,83 @@ func TestReadDirSerializesConcurrentRequestsPerHandle(t *testing.T) {
 	}
 }
 
+func TestReadDirCanceledWhileWaitingForHandle(t *testing.T) {
+	for _, readDirPlus := range []bool{false, true} {
+		name := "ReadDir"
+		if readDirPlus {
+			name = "ReadDirPlus"
+		}
+		t.Run(name, func(t *testing.T) {
+			listStarted := make(chan struct{})
+			releaseList := make(chan struct{})
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				close(listStarted)
+				<-releaseList
+				_, _ = w.Write([]byte(`{"entries":[]}`))
+			}))
+			defer ts.Close()
+			t.Cleanup(func() {
+				select {
+				case <-releaseList:
+				default:
+					close(releaseList)
+				}
+			})
+
+			opts := &MountOptions{GVisorCompat: true}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+			dh := &DirHandle{Ino: dirIno, Path: "/dir"}
+			fh := fs.dirHandles.Allocate(dh)
+			read := func(cancel <-chan struct{}) gofuse.Status {
+				input := &gofuse.ReadIn{
+					InHeader: gofuse.InHeader{NodeId: dirIno},
+					Fh:       fh,
+					Offset:   0,
+					Size:     4096,
+				}
+				out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+				if readDirPlus {
+					return fs.ReadDirPlus(cancel, input, out)
+				}
+				return fs.ReadDir(cancel, input, out)
+			}
+
+			firstDone := make(chan gofuse.Status, 1)
+			go func() { firstDone <- read(nil) }()
+			<-listStarted
+
+			cancel := make(chan struct{})
+			secondStarted := make(chan struct{})
+			secondDone := make(chan gofuse.Status, 1)
+			go func() {
+				close(secondStarted)
+				secondDone <- read(cancel)
+			}()
+			<-secondStarted
+			close(cancel)
+
+			select {
+			case st := <-secondDone:
+				if st != gofuse.EINTR {
+					t.Fatalf("canceled directory request status = %v, want EINTR", st)
+				}
+			case <-time.After(200 * time.Millisecond):
+				close(releaseList)
+				<-firstDone
+				<-secondDone
+				t.Fatal("canceled directory request stayed blocked on the handle")
+			}
+
+			close(releaseList)
+			if st := <-firstDone; st != gofuse.OK {
+				t.Fatalf("first directory request status = %v, want OK", st)
+			}
+		})
+	}
+}
+
 func TestReadDirPlusGVisorCompatKeepsSnapshotForNonzeroOffset(t *testing.T) {
 	opts := &MountOptions{GVisorCompat: true}
 	opts.setDefaults()
