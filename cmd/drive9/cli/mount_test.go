@@ -1293,6 +1293,56 @@ func TestMountCmdRejectsGVisorCompatForNonFUSEMounts(t *testing.T) {
 	}
 }
 
+func TestMountCmdIgnoresGVisorCompatEnvironmentForNonFUSEMounts(t *testing.T) {
+	t.Setenv(envMountGVisorCompat, "true")
+
+	t.Run("WebDAV", func(t *testing.T) {
+		err := MountCmd([]string{
+			"--foreground",
+			"--mode", "webdav",
+			"--trust-process-local-events",
+			t.TempDir(),
+		})
+		if err == nil {
+			t.Fatal("MountCmd error = nil, want WebDAV option error")
+		}
+		if strings.Contains(err.Error(), "--gvisor-compat") {
+			t.Fatalf("MountCmd error = %q, ambient gVisor compatibility must be ignored", err)
+		}
+		if !strings.Contains(err.Error(), "--trust-process-local-events") {
+			t.Fatalf("MountCmd error = %q, want WebDAV option error", err)
+		}
+	})
+
+	t.Run("object", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("object mounts are unsupported on Windows")
+		}
+		oldMountObjectStore := mountObjectStore
+		t.Cleanup(func() { mountObjectStore = oldMountObjectStore })
+		called := false
+		mountObjectStore = func(*Location, string, string, bool, bool, bool, bool) error {
+			called = true
+			return nil
+		}
+		t.Setenv("HOME", t.TempDir())
+		t.Setenv(EnvServer, "https://drive9.example")
+		t.Setenv(EnvAPIKey, "sk-test")
+
+		if err := MountCmd([]string{
+			"--foreground",
+			"--mode", "fuse",
+			"s3://bucket/prefix/",
+			t.TempDir(),
+		}); err != nil {
+			t.Fatalf("MountCmd: %v", err)
+		}
+		if !called {
+			t.Fatal("mountObjectStore was not called")
+		}
+	})
+}
+
 func TestMountCmdRejectsInvalidGVisorCompatEnvironment(t *testing.T) {
 	t.Setenv(envMountGVisorCompat, "enabled")
 	err := MountCmd([]string{"--foreground", "--mode", "fuse", t.TempDir()})
