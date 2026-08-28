@@ -8,7 +8,6 @@
 set -euo pipefail
 
 required_env=(
-  DRIVE9_BASE
   DRIVE9_TIDBCLOUD_PUBLIC_KEY
   DRIVE9_TIDBCLOUD_PRIVATE_KEY
   DRIVE9_E2E_VIDEO_EXTRACT_API_BASE
@@ -27,7 +26,8 @@ if [ "${#missing_env[@]}" -gt 0 ]; then
   exit 0
 fi
 
-BASE="${DRIVE9_BASE%/}"
+BASE="${DRIVE9_BASE:-http://k8s-dat9-dat9serv-d5e02e7d07-1645488597.ap-southeast-1.elb.amazonaws.com}"
+BASE="${BASE%/}"
 VIDEO_FIXTURE="$DRIVE9_E2E_VIDEO_FIXTURE_PATH"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-600}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"

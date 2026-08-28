@@ -187,9 +187,10 @@ func adminTenantEmbeddingConfigGet(args []string) error {
 	if err != nil {
 		return err
 	}
-	out, err := client.New(server, "").AdminGetTenantEmbeddingConfig(context.Background(), client.AdminTenantEmbeddingConfigGetRequest{
-		TenantID: identity.TenantID, PublicKey: identity.PublicKey, PrivateKey: identity.PrivateKey,
-	})
+	out, err := client.New(server, "").AdminGetTenantEmbeddingConfig(
+		context.Background(),
+		client.AdminTenantEmbeddingConfigGetRequest(identity),
+	)
 	if err != nil {
 		return quotaAPIError("get tenant embedding config", err)
 	}

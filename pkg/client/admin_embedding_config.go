@@ -97,7 +97,7 @@ func adminTenantEmbeddingConfigPath(tenantID string) (string, error) {
 }
 
 func (c *Client) doAdminTenantEmbeddingConfig(req *http.Request, operation string) (*AdminTenantEmbeddingConfig, error) {
-	resp, err := c.do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("admin tenant embedding config %s request: %w", operation, err)
 	}

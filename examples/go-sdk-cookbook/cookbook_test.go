@@ -393,6 +393,16 @@ func ExampleClient_quota() {
 			Enabled: &enabled, Prompt: &prompt,
 		})
 	}
+	_, _ = credentialClient.AdminGetTenantEmbeddingConfig(ctx, drive9.AdminTenantEmbeddingConfigGetRequest{
+		TenantID: tenantID, PublicKey: tidbCloudPublicKey, PrivateKey: tidbCloudPrivateKey,
+	})
+	embedAPIBase := "https://embedding.example.com/v1"
+	embedAPIKey := "embedding-provider-key"
+	embedModel := "embedding-model"
+	_, _ = credentialClient.AdminSetTenantEmbeddingConfig(ctx, drive9.AdminTenantEmbeddingConfigSetRequest{
+		TenantID: tenantID, PublicKey: tidbCloudPublicKey, PrivateKey: tidbCloudPrivateKey,
+		Enabled: true, APIBase: &embedAPIBase, APIKey: &embedAPIKey, Model: &embedModel,
+	})
 	_, _ = credentialClient.AdminSetTenantQuota(ctx, drive9.QuotaSetRequest{
 		TenantID:               tenantID,
 		PublicKey:              tidbCloudPublicKey,
@@ -637,11 +647,13 @@ var coveredClientMethods = map[string]bool{
 	"AdminDeleteTenant":                    true,
 	"AdminDeleteTenantPool":                true,
 	"AdminGetTenant":                       true,
+	"AdminGetTenantEmbeddingConfig":        true,
 	"AdminGetTenantPool":                   true,
 	"AdminListTenants":                     true,
 	"AdminSetTenantQuota":                  true,
 	"AdminGetTenantExtractConfig":          true,
 	"AdminSetTenantExtractConfig":          true,
+	"AdminSetTenantEmbeddingConfig":        true,
 	"AdminClearObjectNamespace":            true,
 	"AdminCreateObjectBackend":             true,
 	"AdminDeleteObjectBackend":             true,

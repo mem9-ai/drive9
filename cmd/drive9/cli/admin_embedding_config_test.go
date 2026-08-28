@@ -77,6 +77,9 @@ func TestAdminTenantEmbeddingConfigSetEnabledSendsCompleteBody(t *testing.T) {
 		if r.Method != http.MethodPut || r.URL.Path != "/v1/admin/tenants/tenant-1/embedding-config" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
+		if r.Header.Get("X-TiDBCloud-Public-Key") != "public-1" || r.Header.Get("X-TiDBCloud-Private-Key") != "private-1" {
+			t.Errorf("missing TiDB Cloud headers")
+		}
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Errorf("decode body: %v", err)
 		}
@@ -108,6 +111,12 @@ func TestAdminTenantEmbeddingConfigSetDisabledSendsEnabledOnly(t *testing.T) {
 
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/v1/admin/tenants/tenant-1/embedding-config" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("X-TiDBCloud-Public-Key") != "public-1" || r.Header.Get("X-TiDBCloud-Private-Key") != "private-1" {
+			t.Errorf("missing TiDB Cloud headers")
+		}
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Errorf("decode body: %v", err)
 		}
