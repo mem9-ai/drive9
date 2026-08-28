@@ -142,7 +142,9 @@ syscall coverage against a full LTP install.
 `community.mdtest` auto-fetches and builds IOR/mdtest when `mdtest` is not
 already available; IOR requires an MPI compiler, so with auto system-deps the
 harness installs `mpich`/`libmpich-dev` (Debian) or `openmpi` (Arch) when
-`mpicc` is missing. The IOR source is patched in-cache for newer compiler
+`mpicc` is missing. The run sets `UCX_TLS=tcp,sm,self` (and OpenMPI
+`btl=tcp,self`) so MPI_Init does not probe InfiniBand — GitHub-hosted
+runners have no IB and MPICH/UCX otherwise fails with `ibv_create_srq`. The IOR source is patched in-cache for newer compiler
 compatibility before building mdtest. `community.fsx` fetches and builds
 `secfs.test` to obtain the `fsx` binary, and patches `fsx.c` for glibc builds
 that already provide `strlcpy`/`strlcat` (common on Arch).
