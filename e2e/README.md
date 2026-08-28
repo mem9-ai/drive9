@@ -37,6 +37,8 @@ including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=loca
 | `tokens-smoke-test.sh` | `/v1/tokens` management: dispatcher, scoped lifecycle/refresh, pseudoroot projected listing and hidden siblings, scoped gate, control-plane generate/list/status (needs `provider=local` mock IAM). Off in default `smoke-all.sh`; set `RUN_TOKENS_SMOKE=1` |
 | `sse-retention-smoke-test.sh` | SSE `/v1/events` initial sync, live `file_changed` delivery + cursor replay, >1000-event backlog drain; optional long-window replay and short-retention sweep (`SSE_SWEEP_TEST=1`). Off in default `smoke-all.sh`; set `RUN_SSE_SMOKE=1` |
 | `image-extract-config-smoke-test.sh` | Opt-in hosted HTTP test: provision a disposable tenant, validate tenant image-extract config (reject invalid key / unreachable base, persist a masked custom config), upload an image, assert a generated attribute tag via stat/find, disable the config, and delete the tenant. Manual-only: needs control-plane keys and a billable vision provider |
+| `video-extract-config-smoke-test.sh` | Opt-in hosted HTTP test: provision a disposable tenant, persist an OpenAI-protocol video config, upload a caller-provided MP4, assert worker-generated semantic text, disable extraction, and verify a later upload stays unprocessed. Manual-only: needs control-plane keys, a billable vision provider, and an MP4 fixture |
+| `embedding-config-smoke-test.sh` | Opt-in hosted HTTP test: provision a disposable tenant, reject invalid/unreachable providers without persistence, persist a masked custom embedding config, upload target/distractor text, and assert semantic recall through the app-managed embedding worker. Manual-only: needs control-plane keys and a billable 1024-dimension embedding provider |
 | `object-auth-smoke-test.sh` | Manual `--auth=server` STS mint: admin object-backend add/get/update, tenant object-namespace, then `fs cp/ls/cat` against a real bucket without `--auth=local`, plus outside-namespace deny. Not wired into CI/local-e2e; skip-if-env-missing. Needs tidbcloud-native plus a dedicated test bucket |
 | `object-auth-s3-hosted-test.sh` | Manual hosted S3 `--auth=server` coverage: two-tenant `cust` vs `cust-evil` isolation (CLI + STS ListBucket), fail-closed mint, tenant key cannot register backends, read-only vs write mint, drive9↔S3 copy, object FUSE mount, and in-place STS refresh with `DRIVE9_OBJECT_SESSION_REFRESH_*_LEAD`. Same credentials as `object-auth-smoke-test.sh` |
 | `object-auth-cos-hosted-test.sh` | Same 44-check hosted coverage as S3, against Tencent COS (`tccli`). Needs a dedicated test bucket + CAM user; never point at prod COS. Set `DRIVE9_E2E_OBJECT_REGION` and `DRIVE9_E2E_OBJECT_ACCOUNT_ID` (APPID) |
@@ -56,7 +58,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | Local E2E `workflow_dispatch` with `run_all_e2e=1` | Everything above |
-| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `image-extract-config-smoke-test.sh` (hosted control-plane + billable vision provider), `object-auth-smoke-test.sh` (tidbcloud-native + real object-store STS mint; `--auth=server` cannot run in local-e2e), `object-auth-s3-hosted-test.sh` / `object-auth-cos-hosted-test.sh` / `object-auth-tos-hosted-test.sh` (hosted S3/COS/TOS isolation/mount/refresh; same reason) |
+| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `image-extract-config-smoke-test.sh` / `video-extract-config-smoke-test.sh` (hosted control-plane + billable vision provider), `embedding-config-smoke-test.sh` (hosted control-plane + billable embedding provider), `object-auth-smoke-test.sh` (tidbcloud-native + real object-store STS mint; `--auth=server` cannot run in local-e2e), `object-auth-s3-hosted-test.sh` / `object-auth-cos-hosted-test.sh` / `object-auth-tos-hosted-test.sh` (hosted S3/COS/TOS isolation/mount/refresh; same reason) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
@@ -214,6 +216,19 @@ export DRIVE9_E2E_IMAGE_EXTRACT_API_KEY="..."
 export DRIVE9_E2E_IMAGE_EXTRACT_MODEL="..."
 bash e2e/image-extract-config-smoke-test.sh
 
+# Tenant video-extract config + worker smoke. The fixture must be an MP4.
+export DRIVE9_E2E_VIDEO_EXTRACT_API_BASE="https://..."
+export DRIVE9_E2E_VIDEO_EXTRACT_API_KEY="..."
+export DRIVE9_E2E_VIDEO_EXTRACT_MODEL="..."
+export DRIVE9_E2E_VIDEO_FIXTURE_PATH="/path/to/fixture.mp4"
+bash e2e/video-extract-config-smoke-test.sh
+
+# Tenant embedding-config + worker/query smoke. The model must return 1024 dimensions.
+export DRIVE9_E2E_EMBED_API_BASE="https://..."
+export DRIVE9_E2E_EMBED_API_KEY="..."
+export DRIVE9_E2E_EMBED_MODEL="..."
+bash e2e/embedding-config-smoke-test.sh
+
 bash e2e/smoke-all.sh
 
 # Skip FUSE-related suites.
@@ -303,6 +318,18 @@ Useful knobs for existing-tenant runs:
   and an unreachable API base are rejected without changing the tenant's
   config. Override `DRIVE9_E2E_UNREACHABLE_API_BASE` only when the default
   public, closed-port endpoint is unsuitable.
+- `video-extract-config-smoke-test.sh` requires a caller-provided MP4 through
+  `DRIVE9_E2E_VIDEO_FIXTURE_PATH`. It sets `protocol:openai`, validates masked
+  config output, polls `semantic_text` for model-derived visual output, then
+  disables the config and verifies that a subsequent upload remains empty.
+- `embedding-config-smoke-test.sh` requires an OpenAI-compatible model that
+  returns exactly 1024 dimensions. It can configure shared or native
+  `fts_only` tenants; database auto-embedding tenants are rejected explicitly.
+  After PUT it waits two seconds by default for cross-Pod config invalidation
+  (`EMBED_CONFIG_PROPAGATION_WAIT_S`) before uploading the test documents.
+  The semantic query deliberately avoids the target text's vocabulary so a
+  successful match exercises vector generation and query embedding rather
+  than plain FTS.
 - Tenant readiness is checked through `GET /v1/status`.
 - `api-smoke-test.sh` defaults `POLL_TIMEOUT_S` to 300s because schema initialization can exceed 120s in some regions.
 - File operations use `/v1/fs/*` and include nested directory coverage.

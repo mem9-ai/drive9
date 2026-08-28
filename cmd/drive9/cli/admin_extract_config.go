@@ -48,6 +48,7 @@ type adminTenantExtractConfigFlags struct {
 	apiBase         *string
 	apiKey          *string
 	model           *string
+	protocol        *string
 	prompt          *string
 }
 
@@ -136,6 +137,15 @@ func parseAdminTenantExtractConfigFlags(args []string, usage string, allowConfig
 				return flags, err
 			}
 			flags.model, i = &value, next
+		case "--protocol":
+			if !allowConfig {
+				return flags, fmt.Errorf("unknown flag %q\n%s", args[i], usage)
+			}
+			value, next, err := nextAdminExtractFlag(args, i, "--protocol")
+			if err != nil {
+				return flags, err
+			}
+			flags.protocol, i = &value, next
 		case "--prompt":
 			if !allowConfig {
 				return flags, fmt.Errorf("unknown flag %q\n%s", args[i], usage)
@@ -175,7 +185,7 @@ func parseAdminTenantExtractConfigFlags(args []string, usage string, allowConfig
 	}
 	flags.tenantID = strings.TrimSpace(flags.tenantID)
 	flags.mediaType = strings.TrimSpace(flags.mediaType)
-	if allowConfig && flags.enabled == nil && flags.apiBase == nil && flags.apiKey == nil && flags.model == nil && flags.prompt == nil {
+	if allowConfig && flags.enabled == nil && flags.apiBase == nil && flags.apiKey == nil && flags.model == nil && flags.protocol == nil && flags.prompt == nil {
 		return flags, fmt.Errorf("at least one extract config field is required")
 	}
 	return flags, nil
@@ -252,7 +262,7 @@ func adminTenantExtractConfigSet(args []string) error {
 	}
 	out, err := client.New(server, "").AdminSetTenantExtractConfig(context.Background(), client.AdminTenantExtractConfigSetRequest{
 		TenantID: identity.TenantID, MediaType: client.ExtractMediaType(flags.mediaType), PublicKey: identity.PublicKey, PrivateKey: identity.PrivateKey,
-		Enabled: flags.enabled, APIBase: flags.apiBase, APIKey: flags.apiKey, Model: flags.model, Prompt: flags.prompt,
+		Enabled: flags.enabled, APIBase: flags.apiBase, APIKey: flags.apiKey, Model: flags.model, Protocol: flags.protocol, Prompt: flags.prompt,
 	})
 	if err != nil {
 		return quotaAPIError("set tenant extract config", err)
@@ -271,8 +281,8 @@ func printAdminTenantExtractConfigResponse(out *client.AdminTenantExtractConfig,
 		return enc.Encode(out)
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "MEDIA_TYPE\tENABLED\tSOURCE\tAPI_BASE\tAPI_KEY\tMODEL\tPROMPT\tUPDATED_AT")
-	_, _ = fmt.Fprintf(w, "%s\t%t\t%s\t%s\t%s\t%s\t%s\t%s\n", mediaType, out.Enabled, emptyAsDash(out.Source), optionalExtractString(out.APIBase), optionalExtractString(out.APIKey), optionalExtractString(out.Model), optionalExtractString(out.Prompt), optionalExtractTime(out.UpdatedAt))
+	_, _ = fmt.Fprintln(w, "MEDIA_TYPE\tENABLED\tSOURCE\tAPI_BASE\tAPI_KEY\tMODEL\tPROTOCOL\tPROMPT\tUPDATED_AT")
+	_, _ = fmt.Fprintf(w, "%s\t%t\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", mediaType, out.Enabled, emptyAsDash(out.Source), optionalExtractString(out.APIBase), optionalExtractString(out.APIKey), optionalExtractString(out.Model), optionalExtractString(out.Protocol), optionalExtractString(out.Prompt), optionalExtractTime(out.UpdatedAt))
 	return w.Flush()
 }
 
@@ -353,6 +363,7 @@ set flags:
   --api-base URL                   provider base URL; non-empty when enabling
   --api-key KEY                    provider API key; non-empty when enabling (sensitive)
   --model MODEL                    provider model name; non-empty when enabling
+  --protocol PROTOCOL             provider wire protocol (default: openai)
   --prompt TEXT                    custom extraction prompt; empty clears the override`
 }
 
@@ -386,6 +397,7 @@ flags:
   --api-base URL                   non-empty when enabling
   --api-key KEY                    non-empty when enabling (sensitive)
   --model MODEL                    non-empty when enabling
+  --protocol PROTOCOL             provider wire protocol (openai or qwen-asr for audio)
   --prompt TEXT                    empty clears the custom prompt
   --tidbcloud-public-key KEY
   --tidbcloud-private-key KEY

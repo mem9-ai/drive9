@@ -147,6 +147,19 @@ export DRIVE9_E2E_IMAGE_EXTRACT_API_BASE="https://..."
 export DRIVE9_E2E_IMAGE_EXTRACT_API_KEY="..."
 export DRIVE9_E2E_IMAGE_EXTRACT_MODEL="..."
 bash e2e/image-extract-config-smoke-test.sh
+
+# Tenant video-extract config smoke. Manual-only and skip-if-env-missing.
+export DRIVE9_E2E_VIDEO_EXTRACT_API_BASE="https://..."
+export DRIVE9_E2E_VIDEO_EXTRACT_API_KEY="..."
+export DRIVE9_E2E_VIDEO_EXTRACT_MODEL="..."
+export DRIVE9_E2E_VIDEO_FIXTURE_PATH="/path/to/fixture.mp4"
+bash e2e/video-extract-config-smoke-test.sh
+
+# Tenant embedding config/processing smoke. Model output must be 1024 dimensions.
+export DRIVE9_E2E_EMBED_API_BASE="https://..."
+export DRIVE9_E2E_EMBED_API_KEY="..."
+export DRIVE9_E2E_EMBED_MODEL="..."
+bash e2e/embedding-config-smoke-test.sh
 ```
 
 #### Existing-tenant regression
@@ -640,6 +653,30 @@ suite: local image extract is env-only and does not validate tenant config.
 7. Disable config (`enabled:false` clears provider fields); upload a second image and require empty semantic text/tags for `DISABLED_EXTRACT_WAIT_S`
 8. Exit trap disables config, deletes the test tree, then `DELETE /v1/admin/tenants/{id}`
 
+### `video-extract-config-smoke-test.sh`
+
+Manual-only: hosted control-plane credentials, a billable OpenAI-compatible
+vision provider, and a caller-provided MP4. Not wired into CI; skips before any
+HTTP request when a required variable is missing.
+
+1. Provision a disposable tenant and wait for `active`
+2. PUT a custom video config with `protocol:openai`; verify masked provider output
+3. Upload the MP4 and poll `?stat` until model-derived `semantic_text` is written
+4. Disable the config, upload the MP4 again, and assert no extracted text appears
+5. Exit trap disables config, deletes the test tree, and deletes the tenant
+
+### `embedding-config-smoke-test.sh`
+
+Manual-only: hosted control-plane credentials plus a billable OpenAI-compatible
+embedding provider returning exactly 1024 dimensions. Not wired into CI; skips
+before any HTTP request when a required variable is missing.
+
+1. Provision a disposable tenant and wait for `active`; reject database-auto mode
+2. Reject an invalid key and unreachable API base, verifying config is unchanged
+3. PUT a valid custom config and verify masked provider output and generation
+4. Upload target/distractor text and poll a vocabulary-disjoint query for the target
+5. Disable the config; exit trap deletes the test tree and tenant
+
 ### `native-smoke-test.sh`
 
 Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
@@ -673,7 +710,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `DRIVE9_API_KEY` | - | `cli-smoke-test.sh` (optional; when set, skip provision and reuse the tenant) |
 | `DRIVE9_API_KEY` | - | `fuse-smoke-test.sh` (optional; skip provision when set) |
 | `DRIVE9_API_KEY` | - | `posix-permission-smoke-test.sh` (optional; skip provision when set) |
-| `POLL_TIMEOUT_S` | `300` (api smoke), `600` (image-extract), `120` (other smoke) | polling scripts |
+| `POLL_TIMEOUT_S` | `300` (api smoke), `600` (hosted config smokes), `120` (other smoke) | polling scripts |
 | `POLL_INTERVAL_S` | `5` | polling scripts |
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
 | `LARGE_FILE_MB` | `100` | `api-smoke-test.sh` |
@@ -764,15 +801,27 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `GIT_FEATURE_TIMEOUT_S` | `240` | `git-feature-smoke-test.sh` |
 | `GIT_FEATURE_RUN_OVERSIZED` | `1` | `git-feature-smoke-test.sh` |
 | `GIT_WORKSPACE_HYDRATE` | `sync` | `git-workspace-smoke-test.sh` |
-| `DRIVE9_TIDBCLOUD_PUBLIC_KEY` | *(required)* | `native-smoke-test.sh`, `image-extract-config-smoke-test.sh` |
-| `DRIVE9_TIDBCLOUD_PRIVATE_KEY` | *(required)* | `native-smoke-test.sh`, `image-extract-config-smoke-test.sh` |
+| `DRIVE9_TIDBCLOUD_PUBLIC_KEY` | *(required)* | `native-smoke-test.sh`, hosted config smoke tests |
+| `DRIVE9_TIDBCLOUD_PRIVATE_KEY` | *(required)* | `native-smoke-test.sh`, hosted config smoke tests |
 | `DRIVE9_E2E_IMAGE_EXTRACT_API_BASE` | *(required)* | `image-extract-config-smoke-test.sh` |
 | `DRIVE9_E2E_IMAGE_EXTRACT_API_KEY` | *(required)* | `image-extract-config-smoke-test.sh` |
 | `DRIVE9_E2E_IMAGE_EXTRACT_MODEL` | *(required)* | `image-extract-config-smoke-test.sh` |
 | `DRIVE9_E2E_UNREACHABLE_API_BASE` | `https://example.com:81/v1` | `image-extract-config-smoke-test.sh` |
 | `IMAGE_EXTRACT_TIMEOUT_S` | `180` | `image-extract-config-smoke-test.sh` |
 | `IMAGE_EXTRACT_INTERVAL_S` | `3` | `image-extract-config-smoke-test.sh` |
-| `DISABLED_EXTRACT_WAIT_S` | `30` | `image-extract-config-smoke-test.sh` |
+| `DISABLED_EXTRACT_WAIT_S` | `30` | image/video extract config smoke tests |
+| `DRIVE9_E2E_VIDEO_EXTRACT_API_BASE` | *(required)* | `video-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_VIDEO_EXTRACT_API_KEY` | *(required)* | `video-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_VIDEO_EXTRACT_MODEL` | *(required)* | `video-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_VIDEO_FIXTURE_PATH` | *(required MP4)* | `video-extract-config-smoke-test.sh` |
+| `VIDEO_EXTRACT_TIMEOUT_S` | `600` | `video-extract-config-smoke-test.sh` |
+| `VIDEO_EXTRACT_INTERVAL_S` | `5` | `video-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_EMBED_API_BASE` | *(required)* | `embedding-config-smoke-test.sh` |
+| `DRIVE9_E2E_EMBED_API_KEY` | *(required)* | `embedding-config-smoke-test.sh` |
+| `DRIVE9_E2E_EMBED_MODEL` | *(required, 1024 dimensions)* | `embedding-config-smoke-test.sh` |
+| `EMBED_TIMEOUT_S` | `180` | `embedding-config-smoke-test.sh` |
+| `EMBED_INTERVAL_S` | `3` | `embedding-config-smoke-test.sh` |
+| `EMBED_CONFIG_PROPAGATION_WAIT_S` | `2` | `embedding-config-smoke-test.sh` |
 | `SKIP_CLEANUP` | `0` | `native-smoke-test.sh` |
 
 ## Conventions
