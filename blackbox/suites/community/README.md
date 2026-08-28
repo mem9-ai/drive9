@@ -117,8 +117,8 @@ install` installs kirk into the tree.
 The fs and syscall test selections use **deny-lists** aligned with the
 [JuiceFS LTP CI](https://github.com/juicedata/juicefs/blob/main/.github/workflows/ltpfs.yml)
 intent — long-running tests (`growfiles`, `rwtest`, `iogen`, `fs_fill`,
-`fsx-linux`) and host-specific tests (`isofs`, `quota_remount`, `read_all_*`,
-`proc01`) are excluded. `lftest01` is retained (JuiceFS's `rm_list.sh` had a
+`fsx-linux`, `fs_racer`, `open04`) and host-specific tests (`isofs`,
+`quota_remount`, `read_all_*`, `proc01`) are excluded. `lftest01` is retained (JuiceFS's `rm_list.sh` had a
 tokenisation bug that incidentally stripped it; we do not replicate that bug).
 `read_all_dev/proc/sys` and `proc01` are explicitly excluded because they read
 host `/dev`, `/proc`, `/sys` (not the FUSE mount) and `read_all_dev` can hang
