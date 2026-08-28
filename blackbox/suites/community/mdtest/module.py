@@ -20,7 +20,20 @@ class CommunityMdtest(BaseModule):
         handle = ctx.target.mount("community_mdtest", remote, profile="none")
         try:
             files = str(os.environ.get("MDTEST_FILES", "1000"))
-            result = ctx.target.run_cmd("community-mdtest", [mdtest, "-d", str(handle.mountpoint / "mdtest"), "-n", files, "-u", "-L", "-F"], timeout=int(os.environ.get("MDTEST_TIMEOUT_S", str(self.timeout))))
+            # IOR/mdtest always MPI_Init. MPICH's UCX netmod probes InfiniBand
+            # (ibv_create_srq) even for 1 rank; GitHub-hosted VMs have no IB
+            # and fail at init. Force TCP / shared-memory transports.
+            env = ctx.target.base_env()
+            env.setdefault("UCX_TLS", "tcp,sm,self")
+            env.setdefault("FI_PROVIDER", "tcp")
+            env.setdefault("OMPI_MCA_btl", "tcp,self")
+            env.setdefault("OMPI_MCA_pml", "ob1")
+            result = ctx.target.run_cmd(
+                "community-mdtest",
+                [mdtest, "-d", str(handle.mountpoint / "mdtest"), "-n", files, "-u", "-L", "-F"],
+                timeout=int(os.environ.get("MDTEST_TIMEOUT_S", str(self.timeout))),
+                env=env,
+            )
             if not result.ok:
                 raise BlackboxError(f"mdtest failed; see {result.stderr}")
             return {"files": int(files), "stdout": str(result.stdout)}
