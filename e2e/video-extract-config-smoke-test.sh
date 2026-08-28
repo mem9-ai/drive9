@@ -56,7 +56,7 @@ die() {
 
 [[ "$BASE" == https://* ]] || die "DRIVE9_BASE must use https:// for hosted video extract smoke"
 
-for command in curl jq; do
+for command in curl jq python3; do
   command -v "$command" >/dev/null || die "$command is required"
 done
 [ -s "$VIDEO_FIXTURE" ] || die "video fixture not found or empty: $VIDEO_FIXTURE"
@@ -118,6 +118,68 @@ http_failure() {
     die "$action returned HTTP $code: $reason"
   fi
   die "$action returned HTTP $code"
+}
+
+upload_video_fixture() {
+  local remote_path="$1"
+  local response code body upload_id plan_file complete_response complete_code complete_body
+
+  response="$(curl_response PUT "$BASE/v1/fs/$remote_path" owner \
+    -H 'Content-Type: video/mp4' \
+    -H "X-Dat9-Part-Checksums: $VIDEO_PART_CHECKSUMS" \
+    --data-binary "@$VIDEO_FIXTURE")" || die "video upload request failed"
+  code="$(http_code "$response")"
+  body="$(json_body "$response")"
+  if [ "$code" = "200" ]; then
+    return 0
+  fi
+  [ "$code" = "202" ] || http_failure "video upload" "$code" "$body"
+
+  upload_id="$(printf '%s' "$body" | jq -r '.upload_id // empty')"
+  [ -n "$upload_id" ] || die "video upload response omitted upload_id"
+  plan_file="$(mktemp)"
+  printf '%s' "$body" >"$plan_file"
+  if ! python3 - "$plan_file" "$VIDEO_FIXTURE" <<'PY'
+import json
+import sys
+import urllib.request
+
+plan_path, file_path = sys.argv[1], sys.argv[2]
+with open(plan_path, "r", encoding="utf-8") as f:
+    plan = json.load(f)
+
+parts = plan.get("parts", [])
+if not parts:
+    raise SystemExit("video upload plan has no parts")
+with open(file_path, "rb") as data_file:
+    for idx, part in enumerate(parts, 1):
+        size = int(part["size"])
+        data = data_file.read(size)
+        if len(data) != size:
+            raise SystemExit(f"short read for part {idx}: got {len(data)} expected {size}")
+        req = urllib.request.Request(part["url"], data=data, method="PUT")
+        req.add_header("Content-Length", str(size))
+        for key, value in (part.get("headers") or {}).items():
+            req.add_header(key, value)
+        if part.get("checksum_crc32c"):
+            req.add_header("x-amz-checksum-crc32c", part["checksum_crc32c"])
+        elif part.get("checksum_sha256"):
+            req.add_header("x-amz-checksum-sha256", part["checksum_sha256"])
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            if getattr(resp, "status", 200) >= 300:
+                raise SystemExit(f"part {idx} failed: HTTP {resp.status}")
+PY
+  then
+    rm -f "$plan_file"
+    die "video multipart part upload failed"
+  fi
+  rm -f "$plan_file"
+
+  complete_response="$(curl_response POST "$BASE/v1/uploads/$upload_id/complete" owner)" || die "video upload complete request failed"
+  complete_code="$(http_code "$complete_response")"
+  complete_body="$(json_body "$complete_response")"
+  [ "$complete_code" = "200" ] || http_failure "video upload complete" "$complete_code" "$complete_body"
+  [ "$(printf '%s' "$complete_body" | jq -r '.status // empty')" = "ok" ] || die "video upload complete response was unexpected"
 }
 
 cleanup() {
@@ -228,10 +290,36 @@ mkdir_body="$(json_body "$mkdir_response")"
 [ "$mkdir_code" = "200" ] || http_failure "test directory creation" "$mkdir_code" "$mkdir_body"
 TREE_CREATED=1
 
-upload_response="$(curl_response PUT "$BASE/v1/fs/$VIDEO_PATH" owner -H 'Content-Type: video/mp4' --data-binary "@$VIDEO_FIXTURE")" || die "video upload request failed"
-upload_code="$(http_code "$upload_response")"
-upload_body="$(json_body "$upload_response")"
-[ "$upload_code" = "200" ] || http_failure "video upload" "$upload_code" "$upload_body"
+VIDEO_PART_CHECKSUMS="$(python3 - "$VIDEO_FIXTURE" <<'PY'
+import base64
+import struct
+import sys
+
+def _crc32c_table():
+    poly = 0x82F63B78
+    table = []
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            crc = (crc >> 1) ^ poly if crc & 1 else crc >> 1
+        table.append(crc)
+    return table
+
+table = _crc32c_table()
+part_size = 8 * 1024 * 1024
+checksums = []
+with open(sys.argv[1], "rb") as f:
+    while chunk := f.read(part_size):
+        crc = 0xFFFFFFFF
+        for byte in chunk:
+            crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+        crc ^= 0xFFFFFFFF
+        checksums.append(base64.b64encode(struct.pack(">I", crc)).decode())
+print(",".join(checksums))
+PY
+)" || die "video checksum calculation failed"
+
+upload_video_fixture "$VIDEO_PATH"
 printf 'PASS: uploaded video fixture\n'
 
 extract_deadline=$(( $(date +%s) + VIDEO_EXTRACT_TIMEOUT_S ))
@@ -261,10 +349,7 @@ if ! printf '%s' "$disable_body" | jq -e '.enabled == false and .source == "cust
 fi
 CONFIG_ENABLED=0
 
-disabled_upload_response="$(curl_response PUT "$BASE/v1/fs/$DISABLED_VIDEO_PATH" owner -H 'Content-Type: video/mp4' --data-binary "@$VIDEO_FIXTURE")" || die "disabled video upload request failed"
-disabled_upload_code="$(http_code "$disabled_upload_response")"
-disabled_upload_body="$(json_body "$disabled_upload_response")"
-[ "$disabled_upload_code" = "200" ] || http_failure "disabled video upload" "$disabled_upload_code" "$disabled_upload_body"
+upload_video_fixture "$DISABLED_VIDEO_PATH"
 
 disabled_deadline=$(( $(date +%s) + DISABLED_EXTRACT_WAIT_S ))
 while :; do
