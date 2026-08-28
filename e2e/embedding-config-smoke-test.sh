@@ -53,6 +53,8 @@ die() {
   exit 1
 }
 
+[[ "$BASE" == https://* ]] || die "DRIVE9_BASE must use https:// for hosted embedding config smoke"
+
 for command in curl jq; do
   command -v "$command" >/dev/null || die "$command is required"
 done
@@ -207,7 +209,8 @@ before_body="$(json_body "$before_response")"
 [ "$before_code" = "200" ] || http_failure "initial embedding config GET" "$before_code" "$before_body"
 before_source="$(printf '%s' "$before_body" | jq -r '.source // empty')"
 case "$before_source" in
-  none|default) ;;
+  none) ;;
+  default) die "tenant has a process default embedding provider; hosted embedding-config smoke requires source=none to prove tenant config usage" ;;
   database_auto) die "tenant uses database auto-embedding; hosted embedding-config smoke requires shared or native fts_only mode" ;;
   *) die "new tenant unexpectedly has embedding config source ${before_source:-unknown}" ;;
 esac

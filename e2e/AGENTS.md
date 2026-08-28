@@ -149,13 +149,17 @@ export DRIVE9_E2E_IMAGE_EXTRACT_MODEL="..."
 bash e2e/image-extract-config-smoke-test.sh
 
 # Tenant video-extract config smoke. Manual-only and skip-if-env-missing.
+export DRIVE9_BASE="https://..."
 export DRIVE9_E2E_VIDEO_EXTRACT_API_BASE="https://..."
 export DRIVE9_E2E_VIDEO_EXTRACT_API_KEY="..."
 export DRIVE9_E2E_VIDEO_EXTRACT_MODEL="..."
 export DRIVE9_E2E_VIDEO_FIXTURE_PATH="/path/to/fixture.mp4"
+# The MP4 must visibly contain this marker; the script does not put it in the prompt.
+export DRIVE9_E2E_VIDEO_EXPECTED_MARKER="..."
 bash e2e/video-extract-config-smoke-test.sh
 
 # Tenant embedding config/processing smoke. Model output must be 1024 dimensions.
+export DRIVE9_BASE="https://..."
 export DRIVE9_E2E_EMBED_API_BASE="https://..."
 export DRIVE9_E2E_EMBED_API_KEY="..."
 export DRIVE9_E2E_EMBED_MODEL="..."
@@ -661,7 +665,7 @@ HTTP request when a required variable is missing.
 
 1. Provision a disposable tenant and wait for `active`
 2. PUT a custom video config with `protocol:openai`; verify masked provider output
-3. Upload the MP4 and poll `?stat` until model-derived `semantic_text` is written
+3. Upload the MP4 and poll `?stat` until model-derived `semantic_text` containing the fixture's expected marker is written
 4. Disable the config, upload the MP4 again, and assert no extracted text appears
 5. Exit trap disables config, deletes the test tree, and deletes the tenant
 
@@ -671,7 +675,7 @@ Manual-only: hosted control-plane credentials plus a billable OpenAI-compatible
 embedding provider returning exactly 1024 dimensions. Not wired into CI; skips
 before any HTTP request when a required variable is missing.
 
-1. Provision a disposable tenant and wait for `active`; reject database-auto mode
+1. Provision a disposable tenant and wait for `active`; require `source=none` and reject database-auto mode
 2. Reject an invalid key and unreachable API base, verifying config is unchanged
 3. PUT a valid custom config and verify masked provider output and generation
 4. Upload target/distractor text and poll a vocabulary-disjoint query for the target
@@ -814,6 +818,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `DRIVE9_E2E_VIDEO_EXTRACT_API_KEY` | *(required)* | `video-extract-config-smoke-test.sh` |
 | `DRIVE9_E2E_VIDEO_EXTRACT_MODEL` | *(required)* | `video-extract-config-smoke-test.sh` |
 | `DRIVE9_E2E_VIDEO_FIXTURE_PATH` | *(required MP4)* | `video-extract-config-smoke-test.sh` |
+| `DRIVE9_E2E_VIDEO_EXPECTED_MARKER` | *(required visible fixture fact)* | `video-extract-config-smoke-test.sh` |
 | `VIDEO_EXTRACT_TIMEOUT_S` | `600` | `video-extract-config-smoke-test.sh` |
 | `VIDEO_EXTRACT_INTERVAL_S` | `5` | `video-extract-config-smoke-test.sh` |
 | `DRIVE9_E2E_EMBED_API_BASE` | *(required)* | `embedding-config-smoke-test.sh` |

@@ -37,8 +37,8 @@ including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=loca
 | `tokens-smoke-test.sh` | `/v1/tokens` management: dispatcher, scoped lifecycle/refresh, pseudoroot projected listing and hidden siblings, scoped gate, control-plane generate/list/status (needs `provider=local` mock IAM). Off in default `smoke-all.sh`; set `RUN_TOKENS_SMOKE=1` |
 | `sse-retention-smoke-test.sh` | SSE `/v1/events` initial sync, live `file_changed` delivery + cursor replay, >1000-event backlog drain; optional long-window replay and short-retention sweep (`SSE_SWEEP_TEST=1`). Off in default `smoke-all.sh`; set `RUN_SSE_SMOKE=1` |
 | `image-extract-config-smoke-test.sh` | Opt-in hosted HTTP test: provision a disposable tenant, validate tenant image-extract config (reject invalid key / unreachable base, persist a masked custom config), upload an image, assert a generated attribute tag via stat/find, disable the config, and delete the tenant. Manual-only: needs control-plane keys and a billable vision provider |
-| `video-extract-config-smoke-test.sh` | Opt-in hosted HTTP test: provision a disposable tenant, persist an OpenAI-protocol video config, upload a caller-provided MP4, assert worker-generated semantic text, disable extraction, and verify a later upload stays unprocessed. Manual-only: needs control-plane keys, a billable vision provider, and an MP4 fixture |
-| `embedding-config-smoke-test.sh` | Opt-in hosted HTTP test: provision a disposable tenant, reject invalid/unreachable providers without persistence, persist a masked custom embedding config, upload target/distractor text, and assert semantic recall through the app-managed embedding worker. Manual-only: needs control-plane keys and a billable 1024-dimension embedding provider |
+| `video-extract-config-smoke-test.sh` | Opt-in hosted HTTPS test: provision a disposable tenant, persist an OpenAI-protocol video config, upload a caller-provided MP4 with a fixture-visible expected marker, assert worker-generated semantic text, disable extraction, and verify a later upload stays unprocessed. Manual-only: needs control-plane keys, a billable vision provider, and an MP4 fixture |
+| `embedding-config-smoke-test.sh` | Opt-in hosted HTTPS test: require no process-default embedding provider, provision a disposable tenant, reject invalid/unreachable providers without persistence, persist a masked custom embedding config, upload target/distractor text, and assert semantic recall through the app-managed embedding worker. Manual-only: needs control-plane keys and a billable 1024-dimension embedding provider |
 | `object-auth-smoke-test.sh` | Manual `--auth=server` STS mint: admin object-backend add/get/update, tenant object-namespace, then `fs cp/ls/cat` against a real bucket without `--auth=local`, plus outside-namespace deny. Not wired into CI/local-e2e; skip-if-env-missing. Needs tidbcloud-native plus a dedicated test bucket |
 | `object-auth-s3-hosted-test.sh` | Manual hosted S3 `--auth=server` coverage: two-tenant `cust` vs `cust-evil` isolation (CLI + STS ListBucket), fail-closed mint, tenant key cannot register backends, read-only vs write mint, drive9↔S3 copy, object FUSE mount, and in-place STS refresh with `DRIVE9_OBJECT_SESSION_REFRESH_*_LEAD`. Same credentials as `object-auth-smoke-test.sh` |
 | `object-auth-cos-hosted-test.sh` | Same 44-check hosted coverage as S3, against Tencent COS (`tccli`). Needs a dedicated test bucket + CAM user; never point at prod COS. Set `DRIVE9_E2E_OBJECT_REGION` and `DRIVE9_E2E_OBJECT_ACCOUNT_ID` (APPID) |
@@ -217,13 +217,17 @@ export DRIVE9_E2E_IMAGE_EXTRACT_MODEL="..."
 bash e2e/image-extract-config-smoke-test.sh
 
 # Tenant video-extract config + worker smoke. The fixture must be an MP4.
+export DRIVE9_BASE="https://..."
 export DRIVE9_E2E_VIDEO_EXTRACT_API_BASE="https://..."
 export DRIVE9_E2E_VIDEO_EXTRACT_API_KEY="..."
 export DRIVE9_E2E_VIDEO_EXTRACT_MODEL="..."
 export DRIVE9_E2E_VIDEO_FIXTURE_PATH="/path/to/fixture.mp4"
+# The fixture must visibly contain this marker; it is not included in the prompt.
+export DRIVE9_E2E_VIDEO_EXPECTED_MARKER="..."
 bash e2e/video-extract-config-smoke-test.sh
 
 # Tenant embedding-config + worker/query smoke. The model must return 1024 dimensions.
+export DRIVE9_BASE="https://..."
 export DRIVE9_E2E_EMBED_API_BASE="https://..."
 export DRIVE9_E2E_EMBED_API_KEY="..."
 export DRIVE9_E2E_EMBED_MODEL="..."
@@ -319,11 +323,15 @@ Useful knobs for existing-tenant runs:
   config. Override `DRIVE9_E2E_UNREACHABLE_API_BASE` only when the default
   public, closed-port endpoint is unsuitable.
 - `video-extract-config-smoke-test.sh` requires a caller-provided MP4 through
-  `DRIVE9_E2E_VIDEO_FIXTURE_PATH`. It sets `protocol:openai`, validates masked
-  config output, polls `semantic_text` for model-derived visual output, then
-  disables the config and verifies that a subsequent upload remains empty.
+  `DRIVE9_E2E_VIDEO_FIXTURE_PATH` and a visible fixture fact through
+  `DRIVE9_E2E_VIDEO_EXPECTED_MARKER`. It requires an explicit HTTPS
+  `DRIVE9_BASE`, sets `protocol:openai`, validates masked config output, polls
+  `semantic_text` for model-derived visual output containing that fixture fact,
+  then disables the config and verifies that a subsequent upload remains empty.
 - `embedding-config-smoke-test.sh` requires an OpenAI-compatible model that
-  returns exactly 1024 dimensions. It can configure shared or native
+  returns exactly 1024 dimensions, an explicit HTTPS `DRIVE9_BASE`, and an
+  initial `source=none` config so the smoke proves the persisted tenant config
+  is used rather than a process default. It can configure shared or native
   `fts_only` tenants; database auto-embedding tenants are rejected explicitly.
   After PUT it waits two seconds by default for cross-Pod config invalidation
   (`EMBED_CONFIG_PROPAGATION_WAIT_S`) before uploading the test documents.

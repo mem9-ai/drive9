@@ -8,12 +8,14 @@
 set -euo pipefail
 
 required_env=(
+  DRIVE9_BASE
   DRIVE9_TIDBCLOUD_PUBLIC_KEY
   DRIVE9_TIDBCLOUD_PRIVATE_KEY
   DRIVE9_E2E_VIDEO_EXTRACT_API_BASE
   DRIVE9_E2E_VIDEO_EXTRACT_API_KEY
   DRIVE9_E2E_VIDEO_EXTRACT_MODEL
   DRIVE9_E2E_VIDEO_FIXTURE_PATH
+  DRIVE9_E2E_VIDEO_EXPECTED_MARKER
 )
 missing_env=()
 for name in "${required_env[@]}"; do
@@ -26,7 +28,7 @@ if [ "${#missing_env[@]}" -gt 0 ]; then
   exit 0
 fi
 
-BASE="${DRIVE9_BASE:-http://k8s-dat9-dat9serv-d5e02e7d07-1645488597.ap-southeast-1.elb.amazonaws.com}"
+BASE="${DRIVE9_BASE}"
 BASE="${BASE%/}"
 VIDEO_FIXTURE="$DRIVE9_E2E_VIDEO_FIXTURE_PATH"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-600}"
@@ -40,7 +42,7 @@ CURL_MAX_TIME_S="${CURL_MAX_TIME_S:-180}"
 ROOT_PATH="video-extract-e2e"
 VIDEO_PATH="$ROOT_PATH/fixture.mp4"
 DISABLED_VIDEO_PATH="$ROOT_PATH/disabled.mp4"
-MARKER="drive9_video_e2e"
+MARKER="$DRIVE9_E2E_VIDEO_EXPECTED_MARKER"
 
 TENANT_ID=""
 OWNER_API_KEY=""
@@ -51,6 +53,8 @@ die() {
   printf 'FAIL: %s\n' "$*" >&2
   exit 1
 }
+
+[[ "$BASE" == https://* ]] || die "DRIVE9_BASE must use https:// for hosted video extract smoke"
 
 for command in curl jq; do
   command -v "$command" >/dev/null || die "$command is required"
@@ -194,13 +198,13 @@ printf 'PASS: tenant became active\n'
 
 config_url="$BASE/v1/admin/tenants/$TENANT_ID/extract-config/video"
 config_response="$(
-  jq -nc --arg marker "$MARKER" '{
+  jq -nc '{
     enabled: true,
     api_base: env.DRIVE9_E2E_VIDEO_EXTRACT_API_BASE,
     api_key: env.DRIVE9_E2E_VIDEO_EXTRACT_API_KEY,
     model: env.DRIVE9_E2E_VIDEO_EXTRACT_MODEL,
     protocol: "openai",
-    prompt: ("Describe the actual visible content across the supplied video frames in one concise English sentence. Include the exact token " + $marker + " in the sentence. Do not invent details.")
+    prompt: "Describe the actual visible content across the supplied video frames in one concise English sentence. Do not invent details."
   }' |
     curl_response PUT "$config_url" control-plane -H 'Content-Type: application/json' --data-binary @-
 )" || die "video extract config PUT request failed"
