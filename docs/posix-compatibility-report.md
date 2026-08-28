@@ -5,14 +5,14 @@
 | Suite | Cases | PASS/ALL |
 |---|---:|---:|
 | pjdfstest | 238 files / 8,798 tests | 8798/8798 |
-| LTP filesystem | 18 | 18/18 |
-| LTP syscalls | 117 | 117/117 |
+| LTP filesystem | 17 | 17/17 |
+| LTP syscalls | 116 | 116/116 |
 | POSIX flock | 1 | 1/1 |
 | pyxattr | 4 | 4/4 |
 | fsx | 1 | 1/1 |
 | fio | 3 | 3/3 |
 | mdtest | 1 | 1/1 |
-| **Total** | **8,943** | **8943/8943** |
+| **Total** | **8,941** | **8941/8941** |
 
 ### pjdfstest by directory
 
@@ -54,7 +54,7 @@
 | `lseek` | 4 | 4/4 |
 | `lstat` | 6 | 6/6 |
 | `mkdir` | 5 | 5/5 |
-| `open` | 12 | 12/12 |
+| `open` | 11 | 11/11 |
 | `read` | 4 | 4/4 |
 | `rename` | 14 | 14/14 |
 | `rmdir` | 3 | 3/3 |
@@ -64,7 +64,7 @@
 | `truncate` | 4 | 4/4 |
 | `unlink` | 4 | 4/4 |
 | `write` | 6 | 6/6 |
-| **Total** | **117** | **117/117** |
+| **Total** | **116** | **116/116** |
 
 ## Details
 
@@ -333,8 +333,7 @@
 | `lftest01` | 1/1 |
 | `writetest01` | 1/1 |
 | `fs_di` | 1/1 |
-| `fs_racer` | 1/1 |
-| **Total** | **18/18** |
+| **Total** | **17/17** |
 
 ### LTP syscalls
 
@@ -399,7 +398,6 @@
 | `open01` | 1/1 |
 | `open02` | 1/1 |
 | `open03` | 1/1 |
-| `open04` | 1/1 |
 | `open06` | 1/1 |
 | `open07` | 1/1 |
 | `open08` | 1/1 |
@@ -457,7 +455,7 @@
 | `write04` | 1/1 |
 | `write05` | 1/1 |
 | `write06` | 1/1 |
-| **Total** | **117/117** |
+| **Total** | **116/116** |
 
 ### POSIX flock
 
