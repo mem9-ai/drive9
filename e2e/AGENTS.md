@@ -650,7 +650,7 @@ suite: local image extract is env-only and does not validate tenant config.
 
 1. `POST /v1/provision` with control-plane keys; capture `tenant_id` / `api_key`
 2. Poll `GET /v1/status` until `active`
-3. `GET /v1/admin/tenants/{id}/extract-config/image` — new tenant source is `none` or `default`
+3. `GET /v1/admin/tenants/{id}/extract-config/image` — require new tenant source `none` (a process default would make provider usage ambiguous)
 4. Invalid provider API key → 400, config unchanged; unreachable API base → 502/504, config unchanged
 5. Valid custom config PUT — provider validated, response/GET mask the API key
 6. Upload `e2e/fixtures/cat03.jpg`; poll `?stat` until `tags.e2e_marker` appears; `find` by that tag

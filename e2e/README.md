@@ -36,7 +36,7 @@ including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=loca
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
 | `tokens-smoke-test.sh` | `/v1/tokens` management: dispatcher, scoped lifecycle/refresh, pseudoroot projected listing and hidden siblings, scoped gate, control-plane generate/list/status (needs `provider=local` mock IAM). Off in default `smoke-all.sh`; set `RUN_TOKENS_SMOKE=1` |
 | `sse-retention-smoke-test.sh` | SSE `/v1/events` initial sync, live `file_changed` delivery + cursor replay, >1000-event backlog drain; optional long-window replay and short-retention sweep (`SSE_SWEEP_TEST=1`). Off in default `smoke-all.sh`; set `RUN_SSE_SMOKE=1` |
-| `image-extract-config-smoke-test.sh` | Opt-in hosted HTTP test: provision a disposable tenant, validate tenant image-extract config (reject invalid key / unreachable base, persist a masked custom config), upload an image, assert a generated attribute tag via stat/find, disable the config, and delete the tenant. Manual-only: needs control-plane keys and a billable vision provider |
+| `image-extract-config-smoke-test.sh` | Opt-in hosted HTTPS test: require no process-default image provider, provision a disposable tenant, validate tenant image-extract config (reject invalid key / unreachable base, persist a masked custom config), upload an image, assert a generated attribute tag via stat/find, disable the config, and delete the tenant. Manual-only: needs control-plane keys and a billable vision provider |
 | `video-extract-config-smoke-test.sh` | Opt-in hosted HTTPS test: provision a disposable tenant, persist an OpenAI-protocol video config, upload a caller-provided MP4 with a fixture-visible expected marker, assert worker-generated semantic text, disable extraction, and verify a later upload stays unprocessed. Manual-only: needs control-plane keys, a billable vision provider, and an MP4 fixture |
 | `embedding-config-smoke-test.sh` | Opt-in hosted HTTPS test: require no process-default embedding provider, provision a disposable tenant, reject invalid/unreachable providers without persistence, persist a masked custom embedding config, upload target/distractor text, and assert semantic recall through the app-managed embedding worker. Manual-only: needs control-plane keys and a billable 1024-dimension embedding provider |
 | `object-auth-smoke-test.sh` | Manual `--auth=server` STS mint: admin object-backend add/get/update, tenant object-namespace, then `fs cp/ls/cat` against a real bucket without `--auth=local`, plus outside-namespace deny. Not wired into CI/local-e2e; skip-if-env-missing. Needs tidbcloud-native plus a dedicated test bucket |
@@ -304,7 +304,8 @@ Useful knobs for existing-tenant runs:
 - `api-smoke-test.sh` expects `POST /v1/provision` to return `tenant_id`, `api_key`, and `status`.
 - `image-extract-config-smoke-test.sh` always provisions a disposable tenant
   with `DRIVE9_TIDBCLOUD_PUBLIC_KEY` / `DRIVE9_TIDBCLOUD_PRIVATE_KEY`. Provider
-  configuration requires `DRIVE9_E2E_IMAGE_EXTRACT_API_BASE`,
+  configuration requires an explicit HTTPS `DRIVE9_BASE` and
+  `DRIVE9_E2E_IMAGE_EXTRACT_API_BASE`,
   `DRIVE9_E2E_IMAGE_EXTRACT_API_KEY`, and `DRIVE9_E2E_IMAGE_EXTRACT_MODEL`.
   The config PUT performs a real validation request before storing the config,
   and the uploaded fixture causes a second provider request in the image
@@ -312,7 +313,9 @@ Useful knobs for existing-tenant runs:
   a short lowercase English noun chosen by the model from the image. The test
   never prints either private key. Exit trap disables the custom config first,
   then removes the test file tree and deletes the tenant. `POLL_TIMEOUT_S`
-  controls tenant readiness (default `600`); `IMAGE_EXTRACT_TIMEOUT_S` and
+  controls tenant readiness (default `600`); the initial config must report
+  `source=none` so the smoke cannot pass through a process default.
+  `IMAGE_EXTRACT_TIMEOUT_S` and
   `IMAGE_EXTRACT_INTERVAL_S` control tag polling (defaults `180` and `3`).
   After the positive path, the test disables the custom config, uploads a new
   image, and requires its semantic text and tags to stay empty for
