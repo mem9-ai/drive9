@@ -204,11 +204,12 @@ work-dir, keeping the repo tree clean. Use `--work-dir` to specify; defaults to
 
 Three GitHub Actions workflows are provided:
 
-- **`blackbox.yml`** — manual trigger only (`workflow_dispatch`). User specifies
-  a group (community, juicefs, drive9, git, customer, or all). No push/PR
-  triggers.
-- **`blackbox-daily.yml`** — runs at 06:00 UTC daily, community group only.
-- **`blackbox-weekly.yml`** — runs at 06:00 UTC every Monday, community group only.
+- **`blackbox.yml`** — the blackbox job. Manual `workflow_dispatch` (choose a
+  group: community, juicefs, drive9, git, customer, or all) and reusable via
+  `workflow_call` for the scheduled wrappers. No push/PR triggers.
+- **`blackbox-daily.yml`** — runs at 06:00 UTC daily; calls `blackbox.yml` with
+  `group=community`.
+- **`blackbox-weekly.yml`** — runs at 06:00 UTC every Monday; same call.
 
-All three use `--server-mode local` against TiDB playground and
-`drive9-server` (`provider=local`), then run `python3 blackbox/run.py` directly.
+The job uses `--server-mode local` against TiDB playground and
+`drive9-server` (`provider=local`), then runs `python3 blackbox/run.py` directly.

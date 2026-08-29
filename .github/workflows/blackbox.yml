@@ -1,7 +1,20 @@
 name: Blackbox
 
-# Manual trigger only — no push, no schedule, no PR.
+# The blackbox job. Manual trigger, plus reusable entry for daily/weekly
+# wrappers. No push, no schedule, no PR on this file itself.
 on:
+  workflow_call:
+    inputs:
+      group:
+        description: "Module group to run (community, juicefs, drive9, git, customer, or all)"
+        required: false
+        default: "community"
+        type: string
+      runs:
+        description: "Performance run count"
+        required: false
+        default: "1"
+        type: string
   workflow_dispatch:
     inputs:
       group:
@@ -18,8 +31,11 @@ on:
 permissions:
   contents: read
 
+# Serializes the same module group across manual / daily / weekly callers.
+# Caller workflows keep their own groups (blackbox-daily, blackbox-weekly)
+# so a manual run does not share the scheduled-workflow concurrency key.
 concurrency:
-  group: blackbox-manual
+  group: blackbox-${{ inputs.group || 'community' }}
   cancel-in-progress: false
 
 env:
