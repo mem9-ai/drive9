@@ -48,6 +48,7 @@ type managerDependencies struct {
 	newWorker       func(context.Context, *Startup) (*Worker, error)
 	runWorker       func(context.Context, *Worker) error
 	wait            func(context.Context, time.Duration) error
+	retryJitter     func(time.Duration) time.Duration
 }
 
 // Manager supervises independent Job Workers for one selected EBS process.
@@ -83,6 +84,9 @@ func newManagerWithDependencies(startup *RuntimeStartup, deps managerDependencie
 	}
 	if deps.wait == nil {
 		deps.wait = waitForManagerRetry
+	}
+	if deps.retryJitter == nil {
+		deps.retryJitter = randomRetryJitter
 	}
 	manager := &Manager{
 		startup: startup, jobs: make(map[string]*jobRuntimeSlot, len(startup.Jobs)),
@@ -132,7 +136,7 @@ func (m *Manager) runJob(ctx context.Context, slot *jobRuntimeSlot) {
 				return
 			}
 			slot.setRetrying(attempt+1, err)
-			if err := m.deps.wait(ctx, retryDelay(attempt, maxRetryDelay)); err != nil {
+			if err := m.deps.wait(ctx, boundedRetryJitter(retryDelay(attempt, maxRetryDelay), m.deps.retryJitter)); err != nil {
 				return
 			}
 			attempt++
@@ -148,7 +152,7 @@ func (m *Manager) runJob(ctx context.Context, slot *jobRuntimeSlot) {
 				return
 			}
 			slot.setRetrying(attempt+1, err)
-			if err := m.deps.wait(ctx, retryDelay(attempt, maxRetryDelay)); err != nil {
+			if err := m.deps.wait(ctx, boundedRetryJitter(retryDelay(attempt, maxRetryDelay), m.deps.retryJitter)); err != nil {
 				return
 			}
 			attempt++

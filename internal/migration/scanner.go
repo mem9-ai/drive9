@@ -61,6 +61,15 @@ type ScanResult struct {
 	rootVersion    SourceVersion
 }
 
+type sourceWalkResult struct {
+	Findings       []Finding
+	EntryCount     int
+	DirectoryCount int
+	FileCount      int
+	LogicalBytes   int64
+	RootVersion    SourceVersion
+}
+
 // Scanner reads one mounted EBS Source Root without mutating it.
 type Scanner struct {
 	root        string
@@ -113,6 +122,53 @@ func entryKind(mode os.FileMode) EntryKind {
 
 func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 	result := ScanResult{Entries: make(map[string]SourceEntry)}
+	accumulator := newScanAccumulator()
+	hardlinks := make(map[string]struct{})
+	var directories []scannedDirectory
+	walk, err := s.walkSource(ctx, func(entry SourceEntry) error {
+		accumulator.add(entry.Path, entry.LocalPath, entry)
+		return nil
+	}, func(directory scannedDirectory) error {
+		directories = append(directories, directory)
+		return nil
+	}, nil, func(key string) bool {
+		if _, exists := hardlinks[key]; exists {
+			return false
+		}
+		hardlinks[key] = struct{}{}
+		return true
+	})
+	result.rootVersion = walk.RootVersion
+	result.Findings = append(walk.Findings, accumulator.findings...)
+	if err != nil {
+		return result, err
+	}
+	if err := s.validateScannedDirectories(ctx, directories, walk.RootVersion); err != nil {
+		return result, err
+	}
+	result.Entries = accumulator.entries
+	result.EntryCount = len(result.Entries)
+	for _, entry := range result.Entries {
+		if entry.Kind == EntryDirectory {
+			result.DirectoryCount++
+		}
+		if entry.Kind == EntryRegular {
+			result.LogicalBytes += entry.Version.Size
+		}
+	}
+	result.Complete = true
+	return result, nil
+}
+
+func (s *Scanner) walkSource(ctx context.Context, visitEntry func(SourceEntry) error, visitDirectory func(scannedDirectory) error, visitFinding func(Finding) error, selectHardlinkPrimary func(string) bool) (sourceWalkResult, error) {
+	var result sourceWalkResult
+	recordFinding := func(finding Finding) error {
+		if visitFinding != nil {
+			return visitFinding(finding)
+		}
+		result.Findings = append(result.Findings, finding)
+		return nil
+	}
 	root, rootInfo, err := s.openRoot()
 	if err != nil {
 		return result, err
@@ -122,10 +178,12 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 	if err != nil {
 		return result, fmt.Errorf("source root identity: %w", err)
 	}
-	result.rootVersion = rootIdentity.version
-	accumulator := newScanAccumulator()
-	hardlinks := make(map[string]struct{})
-	directories := []scannedDirectory{{name: ".", version: rootIdentity.version}}
+	result.RootVersion = rootIdentity.version
+	if visitDirectory != nil {
+		if err := visitDirectory(scannedDirectory{name: ".", version: rootIdentity.version}); err != nil {
+			return result, err
+		}
+	}
 	err = fs.WalkDir(root.FS(), ".", func(relative string, directory fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return rootedSourceChangeError(walkErr)
@@ -142,7 +200,9 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 		}
 		canonical, ok := canonicalSourcePath(relative)
 		if !ok {
-			accumulator.findings = append(accumulator.findings, Finding{Kind: FindingInvalidUTF8, Severity: SeverityBlocker})
+			if err := recordFinding(Finding{Kind: FindingInvalidUTF8, Severity: SeverityBlocker}); err != nil {
+				return err
+			}
 			if directory.IsDir() {
 				return filepath.SkipDir
 			}
@@ -155,21 +215,29 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 		}
 		identity, err := s.identity(name, info)
 		if err != nil {
-			accumulator.findings = append(accumulator.findings, Finding{Path: canonical, Kind: FindingSourceIdentity, Severity: SeverityBlocker})
+			if err := recordFinding(Finding{Path: canonical, Kind: FindingSourceIdentity, Severity: SeverityBlocker}); err != nil {
+				return err
+			}
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		if identity.version.Device != rootIdentity.version.Device {
-			accumulator.findings = append(accumulator.findings, Finding{Path: canonical, Kind: FindingNestedMount, Severity: SeverityBlocker})
+			if err := recordFinding(Finding{Path: canonical, Kind: FindingNestedMount, Severity: SeverityBlocker}); err != nil {
+				return err
+			}
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		if identity.version.Kind == EntryDirectory {
-			directories = append(directories, scannedDirectory{name: rootName, version: identity.version})
+			if visitDirectory != nil {
+				if err := visitDirectory(scannedDirectory{name: rootName, version: identity.version}); err != nil {
+					return err
+				}
+			}
 		}
 		localPath := "/" + filepath.ToSlash(relative)
 		entry := SourceEntry{Path: canonical, LocalPath: localPath, Kind: identity.version.Kind, Version: identity.version, Mode: uint32(info.Mode().Perm())}
@@ -177,13 +245,14 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 		case EntryRegular:
 			if identity.nlink > 1 {
 				entry.HardlinkKey = fmt.Sprintf("%d:%d", identity.version.Device, identity.version.Inode)
-				if _, exists := hardlinks[entry.HardlinkKey]; !exists {
-					entry.HardlinkPrimary = true
-					hardlinks[entry.HardlinkKey] = struct{}{}
+				if selectHardlinkPrimary != nil {
+					entry.HardlinkPrimary = selectHardlinkPrimary(entry.HardlinkKey)
 				}
 			}
 			if info.Size() > 0 && identity.blocks >= 0 && identity.blocks*512 < info.Size() {
-				accumulator.findings = append(accumulator.findings, Finding{Path: canonical, Kind: FindingSparseFile, Severity: SeverityWarning})
+				if err := recordFinding(Finding{Path: canonical, Kind: FindingSparseFile, Severity: SeverityWarning}); err != nil {
+					return err
+				}
 			}
 		case EntryDirectory:
 		case EntrySymlink:
@@ -195,27 +264,66 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 			sum := sha256.Sum256([]byte(target))
 			entry.ChecksumSHA256 = hex.EncodeToString(sum[:])
 			if !utf8.ValidString(target) {
-				accumulator.findings = append(accumulator.findings, Finding{Path: canonical, Kind: FindingInvalidUTF8, Severity: SeverityBlocker})
+				if err := recordFinding(Finding{Path: canonical, Kind: FindingInvalidUTF8, Severity: SeverityBlocker}); err != nil {
+					return err
+				}
 			} else if s.symlinkTargetNeedsWarning(root, rootName, target) {
-				accumulator.findings = append(accumulator.findings, Finding{Path: canonical, Kind: FindingSymlinkTarget, Severity: SeverityWarning})
+				if err := recordFinding(Finding{Path: canonical, Kind: FindingSymlinkTarget, Severity: SeverityWarning}); err != nil {
+					return err
+				}
 			}
 		case EntrySpecial:
-			accumulator.findings = append(accumulator.findings, Finding{Path: canonical, Kind: FindingSpecialFile, Severity: SeverityBlocker})
+			if err := recordFinding(Finding{Path: canonical, Kind: FindingSpecialFile, Severity: SeverityBlocker}); err != nil {
+				return err
+			}
 		}
 		if info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
-			accumulator.findings = append(accumulator.findings, Finding{Path: canonical, Kind: FindingModeBits, Severity: SeverityWarning})
+			if err := recordFinding(Finding{Path: canonical, Kind: FindingModeBits, Severity: SeverityWarning}); err != nil {
+				return err
+			}
 		}
-		accumulator.add(canonical, localPath, entry)
+		if visitEntry != nil {
+			if err := visitEntry(entry); err != nil {
+				return err
+			}
+		}
+		result.EntryCount++
+		if entry.Kind == EntryDirectory {
+			result.DirectoryCount++
+		}
+		if entry.Kind == EntryRegular {
+			result.FileCount++
+			result.LogicalBytes += entry.Version.Size
+		}
 		return nil
 	})
 	if err != nil {
-		result.Findings = accumulator.findings
 		return result, fmt.Errorf("scan source namespace: %w", err)
 	}
+	rootAfter, statErr := os.Lstat(s.root)
+	if statErr != nil || !rootAfter.IsDir() || !os.SameFile(rootInfo, rootAfter) {
+		return result, ErrSourceChanged
+	}
+	return result, nil
+}
+
+func (s *Scanner) validateScannedDirectories(ctx context.Context, directories []scannedDirectory, rootVersion SourceVersion) error {
+	root, rootInfo, err := s.openRoot()
+	if err != nil {
+		return ErrSourceChanged
+	}
+	defer func() { _ = root.Close() }()
+	rootIdentity, err := s.identity(s.root, rootInfo)
+	if err != nil || rootIdentity.version != rootVersion {
+		return ErrSourceChanged
+	}
 	for _, directory := range directories {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		info, statErr := root.Lstat(directory.name)
 		if statErr != nil {
-			return result, ErrSourceChanged
+			return ErrSourceChanged
 		}
 		name := s.root
 		if directory.name != "." {
@@ -223,26 +331,14 @@ func (s *Scanner) Scan(ctx context.Context) (ScanResult, error) {
 		}
 		identity, identityErr := s.identity(name, info)
 		if identityErr != nil || identity.version != directory.version {
-			return result, ErrSourceChanged
+			return ErrSourceChanged
 		}
 	}
 	rootAfter, statErr := os.Lstat(s.root)
 	if statErr != nil || !rootAfter.IsDir() || !os.SameFile(rootInfo, rootAfter) {
-		return result, ErrSourceChanged
+		return ErrSourceChanged
 	}
-	result.Entries = accumulator.entries
-	result.Findings = accumulator.findings
-	result.EntryCount = len(result.Entries)
-	for _, entry := range result.Entries {
-		if entry.Kind == EntryDirectory {
-			result.DirectoryCount++
-		}
-		if entry.Kind == EntryRegular {
-			result.LogicalBytes += entry.Version.Size
-		}
-	}
-	result.Complete = true
-	return result, nil
+	return nil
 }
 
 func (s *Scanner) validateSnapshot(ctx context.Context, snapshot ScanResult) error {

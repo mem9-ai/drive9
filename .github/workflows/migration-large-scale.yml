@@ -1,0 +1,74 @@
+name: Migration Large-Scale Gates
+
+on:
+  workflow_dispatch:
+    inputs:
+      check_event_persistence:
+        description: Require dedicated-shape fs_events verification
+        required: true
+        type: boolean
+        default: true
+      run_synthetic_6m:
+        description: Run 300k sizing first, then the full 6M synthetic gate
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  server-contract:
+    name: Live Server #115 contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DRIVE9_BASE: ${{ secrets.DRIVE9_MIGRATION_CONTRACT_BASE }}
+      DRIVE9_API_KEY: ${{ secrets.DRIVE9_MIGRATION_CONTRACT_API_KEY }}
+      DRIVE9_MIGRATION_CONTRACT: "1"
+      DRIVE9_MIGRATION_CONTRACT_SQL: ${{ inputs.check_event_persistence && '1' || '0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate live gate configuration
+        run: test -n "$DRIVE9_BASE" && test -n "$DRIVE9_API_KEY"
+
+      - name: Run Client against live Server #115
+        run: go test ./e2e -run '^TestMigrationBulkLiveServerContract$' -count=1 -v
+
+  synthetic-scale:
+    name: Ordered 300k and 6M synthetic scale
+    if: ${{ inputs.run_synthetic_6m }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run 300k sizing gate
+        run: make migration-scale-bench MIGRATION_SCALE_ENTRIES=300000 MIGRATION_SCALE_RESULT="$RUNNER_TEMP/migration-scale-300k.jsonl"
+
+      - name: Run 6M synthetic gate
+        run: make migration-scale-bench-full MIGRATION_SCALE_RESULT="$RUNNER_TEMP/migration-scale-6m.jsonl"
+
+      - name: Upload benchmark JSONL
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-large-scale-jsonl
+          path: |
+            ${{ runner.temp }}/migration-scale-300k.jsonl
+            ${{ runner.temp }}/migration-scale-6m.jsonl

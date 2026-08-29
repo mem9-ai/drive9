@@ -27,6 +27,7 @@ import (
 )
 
 const migrationTestFaultFailpoint = "github.com/mem9-ai/drive9/internal/migration/migrationTestFault"
+const migrationLargeStageFaultFailpoint = "github.com/mem9-ai/drive9/internal/migration/migrationLargeStageFault"
 
 func enableMigrationTestFault(t *testing.T, boundary string) func() {
 	t.Helper()
@@ -43,6 +44,83 @@ func enableMigrationTestFault(t *testing.T, boundary string) func() {
 	}
 	t.Cleanup(disable)
 	return disable
+}
+
+func enableMigrationLargeStageFault(t *testing.T, boundary string) func() {
+	t.Helper()
+	if err := failpoint.Enable(migrationLargeStageFaultFailpoint, `return("`+boundary+`")`); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	disable := func() {
+		once.Do(func() {
+			if err := failpoint.Disable(migrationLargeStageFaultFailpoint); err != nil {
+				t.Errorf("disable failpoint: %v", err)
+			}
+		})
+	}
+	t.Cleanup(disable)
+	return disable
+}
+
+func TestMigrationLargeScaleStageCrashMatrixFailsClosed(t *testing.T) {
+	for _, boundary := range []string{
+		"source_scan", "source_hash_sort", "source_publish",
+		"target_raw_page", "target_sort", "target_publish",
+		"diff_sort", "diff_publish",
+		"apply_mkdir_after", "apply_files_after", "apply_links_after", "apply_modes_after", "apply_delete_after",
+		"post_apply_gate", "prune_before",
+	} {
+		t.Run(boundary, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "file"), []byte("content"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			worker, _ := newLargeRoundWorker(t, root)
+			disable := enableMigrationLargeStageFault(t, boundary)
+			if err := worker.DeepRecovery(context.Background()); err == nil {
+				t.Fatalf("injected %s crash succeeded", boundary)
+			}
+			snapshot := worker.State()
+			if snapshot.LastGeneration != nil || snapshot.Current.ScanComplete || snapshot.Conditions.ReadyForRollout || snapshot.Conditions.CurrentConverged {
+				t.Fatalf("crash boundary %s published progress: %+v", boundary, snapshot)
+			}
+			disable()
+			if err := worker.DeepRecovery(context.Background()); err != nil {
+				t.Fatalf("fresh recovery after %s: %v", boundary, err)
+			}
+			snapshot = worker.State()
+			if snapshot.LastGeneration == nil || !snapshot.Current.Converged || !snapshot.Conditions.ReadyForRollout {
+				t.Fatalf("fresh recovery after %s did not converge: %+v", boundary, snapshot)
+			}
+		})
+	}
+}
+
+func TestMigrationFenceCleanupCrashKeepsFenceAndRetriesSafely(t *testing.T) {
+	worker, _, _, server := newFenceWorker(t)
+	defer server.Close()
+	store, err := newGenerationStore(newMemoryGenerationObjects(), worker.startup.Job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.generation = store
+	disable := enableMigrationLargeStageFault(t, "fence_cleanup")
+	checkpoint, err := worker.PrepareCutover(context.Background())
+	if err != nil || !checkpoint.FenceComplete || !worker.writesFenced.Load() || !worker.fenceComplete.Load() {
+		t.Fatalf("checkpoint=%+v status=%+v err=%v", checkpoint, worker.statusOutput(), err)
+	}
+	status := worker.statusOutput()
+	if !status.Conditions.Attention || status.AttentionReason != "generation_cleanup" {
+		t.Fatalf("cleanup crash status=%+v", status)
+	}
+	disable()
+	if _, err := worker.PrepareCutover(context.Background()); err != nil {
+		t.Fatalf("retry cleanup after durable fence: %v", err)
+	}
+	if !worker.writesFenced.Load() || !worker.fenceComplete.Load() {
+		t.Fatalf("cleanup retry reversed fence: %+v", worker.statusOutput())
+	}
 }
 
 func injectedMigrationTestFault(boundary string) error {

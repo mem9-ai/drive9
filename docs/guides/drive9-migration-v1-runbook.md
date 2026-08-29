@@ -108,6 +108,72 @@ drive9-migration plan -f /etc/drive9-migration/config.yaml
 drive9-migration run -f /etc/drive9-migration/config.yaml
 ```
 
+For the approximately six-million-path workflow, add `--large-scale` to both
+commands. The option is default-off, is not part of ConfigHash or Checkpoint
+identity, and requires the Target Manifest, BatchMkdir, and BatchChmod contracts
+from Server issue 115:
+
+```text
+drive9-migration plan -f /etc/drive9-migration/config.yaml --large-scale
+drive9-migration run -f /etc/drive9-migration/config.yaml --large-scale
+```
+
+Large-scale preflight probes Manifest with `limit=1` and fails before mutation
+when the contract is unavailable or malformed. To roll back the implementation
+path, remove `--large-scale` and rollout-restart. This does not roll back phase,
+Checkpoint, fence intent, or fence completion.
+
+Large-scale generations live under
+`/.drive9-migration/jobs/<job_id>/verification/<generation_id>/`. They are
+versioned, checksum-validated caches rather than phase authority. Missing,
+incomplete, corrupt, incompatible, or quota-blocked artifacts force rebuild or
+Attention and cannot authorize target-only removal or convergence. Ordinary
+Drive9 list/search/event behavior may expose these artifacts and they consume
+the Job's target quota.
+
+The `generation` status object contains complete flags and IDs for Source,
+Target, and Diff; hash reuse/new counts; Manifest pages, raw/returned entries,
+response bytes, empty pages, cursor advances, sort runs, and last-page time;
+apply verified/pending/in-flight/retry/failed/unknown counts; inline/multipart
+distribution and current worker limits; batch latency/payload; artifact bytes;
+the shared-memory current/peak/limit; last progress; cache state; and rebuild
+reason. All are bounded aggregates. Paths remain available only through the
+explicit `diff --output jsonl` stream.
+
+Large-scale stages share a 3 GiB accounted process budget. The configured
+`small_file_workers` and `large_file_workers` are caps rather than guaranteed
+concurrency: backpressure can reduce active inline or multipart work. Missing
+or invalid authenticated `inline_threshold` routes content to multipart.
+
+Use the opt-in sizing tools outside ordinary unit tests:
+
+```text
+go run ./scripts/migration-scale-fixture --profile observed --root /absolute/empty/path
+go run ./scripts/migration-scale-fixture --profile full --root /absolute/empty/path --sparse
+make migration-scale-bench MIGRATION_SCALE_ENTRIES=300000
+make migration-scale-bench-full
+make migration-server-contract \
+  MIGRATION_CONTRACT_BASE="$DRIVE9_BASE" \
+  MIGRATION_CONTRACT_API_KEY="$DRIVE9_API_KEY" \
+  MIGRATION_CONTRACT_SQL=1
+```
+
+The fixture generator requires a new or empty exact root and never deletes
+existing data. `observed` is 299,853 entries and 3,328,748,350 logical bytes;
+`full` is 6,000,000 entries, 5,140,000 files, and 62 GiB logical bytes. Omit
+`--sparse` when physical write/read throughput is part of the acceptance run.
+The Make targets print parameters, CLI commit/worktree state, optional Server
+commit (`MIGRATION_SCALE_SERVER_DIR`), thresholds, and the JSONL result path
+(`MIGRATION_SCALE_RESULT`, default `/tmp/drive9-migration-scale-benchmark.jsonl`).
+Synthetic results establish bounded CLI observation/diff memory only. Rollout
+still requires a Server-backed fixture run for Manifest, directory, inline,
+multipart, event persistence, retry, and end-to-end apply SLOs.
+The manual `Migration Large-Scale Gates` workflow runs the same live contract
+and can optionally enforce the ordered 300k-then-6M synthetic gate. Its live
+job requires repository secrets `DRIVE9_MIGRATION_CONTRACT_BASE` and
+`DRIVE9_MIGRATION_CONTRACT_API_KEY` pointing at a disposable Server #115
+tenant; dedicated-shape event persistence is enabled by default.
+
 The `plan` JSON is the non-sensitive CSI handoff record: verify `job_id`,
 `volume_id`, `node_name`, `ebs_root`, `subpath`, `source_root`, `space_ref`,
 `prefix`, `credential_ref`, source identity, limits, target emptiness, and
@@ -261,6 +327,9 @@ drive9-migration diff --job-id <job-id> --output jsonl
 
 Proceed only when the latest complete round reports `ready_for_rollout=true`,
 no Attention condition, and no blockers. This signal does not change phase.
+For large-scale Jobs, also inspect the additive `generation` status object: its
+Source, Target, and Diff IDs must be non-empty, all three stages must be listed,
+and blocker/pending counts must be zero.
 
 ## T0: start dual-write repair
 
@@ -400,9 +469,14 @@ rollback, phase regression, or unfence.
 
 ## Retained control data
 
-V1 has no automatic cleanup or cleanup command. Keep
-`/.drive9-migration/jobs/<job_id>/` while fence recovery might be needed.
-Manual deletion is allowed only after every Job is `CUTOVER_READY`, the
-Migration Worker has been permanently removed or disabled, and recovery data
-is no longer needed. Use approved Drive9 administration tooling and target only
-the exact per-Job control directory; never delete the shared control root.
+Checkpoint and fence data under `/.drive9-migration/jobs/<job_id>/` remain
+retained while recovery might be needed. After durable fence completion, a
+large-scale Worker removes only that Job's `verification/` subtree; cleanup
+failure is reported but never reverses the fence or re-enables writes. The
+Checkpoint and other Jobs are not removed.
+
+Manual deletion of retained control data is allowed only after every Job is
+`CUTOVER_READY`, the Migration Worker has been permanently removed or disabled,
+and recovery data is no longer needed. Use approved Drive9 administration
+tooling and target only the exact per-Job control directory; never delete the
+shared control root.

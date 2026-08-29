@@ -158,3 +158,22 @@ func TestConfigHashCoversJobIDAndSubpath(t *testing.T) {
 		t.Fatalf("hashes original=%s id=%s subpath=%s", original, changedID, changedSubpath)
 	}
 }
+
+func TestLargeScaleRolloutModeDoesNotChangeConfigHash(t *testing.T) {
+	runtime, err := LoadRuntimeStartup(writeConfig(t, validV4ConfigYAML), "node-a", string(PhaseSyncing), t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runtime.Jobs) == 0 {
+		t.Fatal("runtime has no Jobs")
+	}
+	before := runtime.Jobs[0].ConfigHash
+	runtime.SetLargeScale(true)
+	after, err := ConfigHash(runtime.Config, runtime.Jobs[0].Job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !runtime.LargeScale || !runtime.Jobs[0].LargeScale || before != after {
+		t.Fatalf("runtime=%t job=%t hashes=%s/%s", runtime.LargeScale, runtime.Jobs[0].LargeScale, before, after)
+	}
+}

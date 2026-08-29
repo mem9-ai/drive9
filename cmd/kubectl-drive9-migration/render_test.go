@@ -22,6 +22,11 @@ func renderedJob(namespace, batch, pod, volumeID string) jobResult {
 			ScanComplete: true, Converged: true,
 		},
 		Verification: workerVerification{Status: "pending"},
+		LargeScale:   true,
+		Generation: &workerGeneration{
+			Stage: "apply_files", ApplyPending: 2, ApplyUnknown: 1,
+			InlineWorkers: 3, MultipartWorkers: 2, RebuildReason: "cache_miss",
+		},
 	}
 	return jobResult{
 		Namespace: namespace, Batch: batch, Pod: pod, Node: "node-a", PodPhase: "Running",
@@ -49,7 +54,7 @@ func TestRenderCompactTableAndSummaries(t *testing.T) {
 	if strings.Index(text, "vol-001") > strings.Index(text, "vol-002") {
 		t.Fatalf("rows are not sorted: %s", text)
 	}
-	for _, want := range []string{"READY_FOR_ROLLOUT", "full/ok", "42", "Batch migration/batch-a: READY_FOR_ROLLOUT", "observed 2 jobs"} {
+	for _, want := range []string{"READY_FOR_ROLLOUT", "full/ok", "apply_files", "42", "Batch migration/batch-a: READY_FOR_ROLLOUT", "observed 2 jobs"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("output omitted %q:\n%s", want, text)
 		}
@@ -75,8 +80,9 @@ func TestRenderWideIncludesOperationalDetails(t *testing.T) {
 	}
 	for _, want := range []string{
 		"NAMESPACE", "NODE", "SPACE", "PREFIX", "CAND_MTIME", "CAND_SOURCE_TOKEN_CHANGED",
-		"CAND_NEW_PATH", "CAND_FILTERED", "IN_FLIGHT", "migration", "node-a",
-		"space-a", "/data", "3", "5", "7", "11", "bounded detail",
+		"CAND_NEW_PATH", "CAND_FILTERED", "IN_FLIGHT", "GEN_STAGE", "GEN_PENDING", "GEN_UNKNOWN",
+		"INLINE_W", "MULTIPART_W", "REBUILD", "migration", "node-a", "apply_files",
+		"space-a", "/data", "3", "5", "7", "11", "2", "1", "cache_miss", "bounded detail",
 	} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("wide output omitted %q:\n%s", want, output.String())

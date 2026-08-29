@@ -5,6 +5,8 @@ job_defaults:
   sync:
     grace_period: 60s
   performance:
+    # In --large-scale mode these remain hard worker caps; all stages also
+    # share the process-wide 3 GiB accounted memory budget.
     max_bytes_per_second: 104857600
     small_file_workers: 8
     large_file_workers: 2

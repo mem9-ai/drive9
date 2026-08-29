@@ -105,6 +105,7 @@ func TestManagerRetriesOneJobWithoutBlockingSibling(t *testing.T) {
 	var mu sync.Mutex
 	calls := make(map[string]int)
 	running := make(chan string, 2)
+	retryDelaySeen := make(chan time.Duration, 1)
 	manager, err := newManagerWithDependencies(testRuntimeStartup("job-a", "job-b"), managerDependencies{
 		validateTargets: func(context.Context, *RuntimeStartup) error { return nil },
 		preflight: func(_ context.Context, startup *Startup) (PreflightResult, error) {
@@ -125,7 +126,11 @@ func TestManagerRetriesOneJobWithoutBlockingSibling(t *testing.T) {
 			<-ctx.Done()
 			return nil
 		},
-		wait: func(context.Context, time.Duration) error { return nil },
+		retryJitter: func(delay time.Duration) time.Duration { return delay / 2 },
+		wait: func(_ context.Context, delay time.Duration) error {
+			retryDelaySeen <- delay
+			return nil
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -146,6 +151,14 @@ func TestManagerRetriesOneJobWithoutBlockingSibling(t *testing.T) {
 		t.Fatalf("preflight calls=%v", calls)
 	}
 	mu.Unlock()
+	select {
+	case delay := <-retryDelaySeen:
+		if delay != retryBase/2 {
+			t.Fatalf("retry delay=%s, want %s", delay, retryBase/2)
+		}
+	default:
+		t.Fatal("retry jitter was not observed")
+	}
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)

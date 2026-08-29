@@ -2,6 +2,8 @@ package migration
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -24,33 +26,47 @@ const (
 
 // Worker owns the process-local execution state for one Job.
 type Worker struct {
-	startup        *Startup
-	api            *client.Client
-	scanner        *Scanner
-	inventory      *TargetScanner
-	apply          *ApplyEngine
-	checkpoint     *CheckpointStore
-	recovery       *Recovery
-	state          *State
-	roundID        atomic.Uint64
-	eventID        atomic.Int64
-	gracePeriod    time.Duration
-	now            func() time.Time
-	retryWait      func(context.Context, time.Duration) error
-	reporter       *eventReporter
-	eventIngest    bool
-	controlGate    serialGate
-	sourceIdentity sourceMountIdentity
-	credentialID   credentialFingerprint
-	writesFenced   atomic.Bool
-	fenceIntent    atomic.Bool
-	fenceComplete  atomic.Bool
+	startup         *Startup
+	api             *client.Client
+	scanner         *Scanner
+	inventory       *TargetScanner
+	apply           *ApplyEngine
+	generation      *generationStore
+	manifestAPI     manifestPageClient
+	batchApply      *batchApplyEngine
+	fileApply       *filePipeline
+	previousSource  *generationMetadata
+	checkpoint      *CheckpointStore
+	recovery        *Recovery
+	state           *State
+	roundID         atomic.Uint64
+	eventID         atomic.Int64
+	gracePeriod     time.Duration
+	now             func() time.Time
+	retryWait       func(context.Context, time.Duration) error
+	retryJitter     func(time.Duration) time.Duration
+	reporter        *eventReporter
+	eventIngest     bool
+	controlGate     serialGate
+	sourceIdentity  sourceMountIdentity
+	credentialID    credentialFingerprint
+	writesFenced    atomic.Bool
+	fenceIntent     atomic.Bool
+	fenceComplete   atomic.Bool
+	largeProgress   atomic.Pointer[GenerationStatus]
+	generationNonce string
+	largeDualApply  func(context.Context, map[string]SourceEntry, map[string]SourceEntry, map[string]TargetEntry) error
+	memoryBudget    *memoryBudget
 }
 
 type workerClientRuntime struct {
 	api         *client.Client
 	inventory   *TargetScanner
 	apply       *ApplyEngine
+	generation  *generationStore
+	manifestAPI manifestPageClient
+	batchApply  *batchApplyEngine
+	fileApply   *filePipeline
 	checkpoint  *CheckpointStore
 	eventIngest bool
 }
@@ -75,6 +91,17 @@ func NewWorker(ctx context.Context, startup *Startup) (*Worker, error) {
 	w := &Worker{
 		startup: startup, scanner: scanner, sourceIdentity: startup.acceptedSource,
 		gracePeriod: time.Duration(startup.Config.JobDefaults.Sync.GracePeriod),
+		retryJitter: randomRetryJitter,
+	}
+	w.generationNonce, err = newGenerationNonce()
+	if err != nil {
+		return nil, err
+	}
+	if startup.LargeScale {
+		w.memoryBudget, err = newMemoryBudget(3 << 30)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := w.refreshClient(ctx); err != nil {
 		return nil, err
@@ -97,6 +124,14 @@ func NewWorker(ctx context.Context, startup *Startup) (*Worker, error) {
 		}
 	}
 	return w, nil
+}
+
+func newGenerationNonce() (string, error) {
+	var value [8]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("create generation nonce: %w", err)
+	}
+	return hex.EncodeToString(value[:]), nil
 }
 
 func RunWorker(ctx context.Context, startup *Startup) error {
@@ -147,6 +182,13 @@ func (w *Worker) refreshClientLocked(ctx context.Context) error {
 	candidate := workerClientRuntime{
 		api: api, inventory: inventory, checkpoint: NewCheckpointStore(api), eventIngest: caps.EventIngest,
 	}
+	if w.startup.LargeScale {
+		candidate.generation, err = NewGenerationStore(api, w.startup.Job.JobID)
+		if err != nil {
+			return err
+		}
+		candidate.manifestAPI = api
+	}
 	if w.recovery != nil {
 		observed, loadErr := candidate.checkpoint.Load(ctx, w.startup.Job.JobID)
 		if loadErr != nil {
@@ -161,10 +203,16 @@ func (w *Worker) refreshClientLocked(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
+			candidate.batchApply, candidate.fileApply, err = w.newLargeApplyEngines(api)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	w.api, w.inventory, w.checkpoint = candidate.api, candidate.inventory, candidate.checkpoint
 	w.apply, w.eventIngest = candidate.apply, candidate.eventIngest
+	w.generation, w.manifestAPI = candidate.generation, candidate.manifestAPI
+	w.batchApply, w.fileApply = candidate.batchApply, candidate.fileApply
 	w.credentialID = credentialID
 	if w.reporter != nil {
 		w.reporter.api.Store(candidate.api)
@@ -191,10 +239,51 @@ func (w *Worker) rebuildApply() error {
 		return err
 	}
 	w.apply = apply
+	w.batchApply, w.fileApply, err = w.newLargeApplyEngines(w.api)
+	if err != nil {
+		return err
+	}
 	if w.reporter != nil && w.eventIngest && w.state.Snapshot().Phase == PhaseDualWriteRepairing {
 		w.apply.onCAS = w.reportCAS
 	}
 	return nil
+}
+
+func (w *Worker) newLargeApplyEngines(api *client.Client) (*batchApplyEngine, *filePipeline, error) {
+	if w.startup == nil || !w.startup.LargeScale {
+		return nil, nil, nil
+	}
+	performance := w.startup.Config.JobDefaults.Performance
+	phase := w.state.Snapshot().Phase
+	batch, err := newBatchApplyEngine(api, w.scanner, batchApplyConfig{
+		Prefix: w.startup.Job.Target.Prefix, Phase: phase, Workers: performance.SmallFileWorkers, Budget: w.memoryBudget,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	files, err := newFilePipeline(api, w.scanner, filePipelineConfig{
+		Prefix: w.startup.Job.Target.Prefix, Phase: phase, InlineThreshold: api.CachedSmallFileThreshold(),
+		InlineWorkers: performance.SmallFileWorkers, MultipartWorkers: performance.LargeFileWorkers,
+		MaxBytesPerSecond: performance.MaxBytesPerSecond, Budget: w.memoryBudget,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	files.onProgress = w.recordFileProgress
+	return batch, files, nil
+}
+
+func (w *Worker) recordFileProgress(progress filePipelineProgress) {
+	w.markLargeProgress(func(status *GenerationStatus) {
+		status.BatchCount += progress.BatchCount
+		status.BatchPayloadBytes += progress.PayloadBytes
+		status.BatchLatencyMS = progress.LastLatencyMS
+		status.InlineFiles += progress.InlineFiles
+		status.InlineBytes += progress.InlineBytes
+		status.MultipartFiles += progress.MultipartFiles
+		status.MultipartBytes += progress.MultipartBytes
+		status.RetryableErrors += progress.RetryableErrors
+	})
 }
 
 func (w *Worker) newApplyEngine(api *client.Client) (*ApplyEngine, error) {
@@ -319,6 +408,13 @@ func (w *Worker) Round(ctx context.Context, mode RoundMode) error {
 			failureClass = "scan"
 		}
 		w.state.FailRound(id, failureClass)
+		return err
+	}
+	if w.startup != nil && w.startup.LargeScale {
+		err := w.largeScaleRound(ctx, mode, id, started)
+		if err != nil {
+			w.recordLargeError(err)
+		}
 		return err
 	}
 	if w.state.Snapshot().Phase == PhaseDualWriteRepairing {
@@ -557,10 +653,16 @@ func (w *Worker) Run(ctx context.Context) error {
 			} else if w.clock().Sub(blockedAt) >= attentionAfter {
 				w.state.SetAttention(true)
 			}
-			delay = retryDelay(attempt, maxRetryDelay)
+			delay = w.nextRetryDelay(attempt, maxRetryDelay)
 			attempt++
 		} else {
 			attempt, blockedAt = 0, time.Time{}
+		}
+		if err != nil {
+			if waitErr := w.waitForRetry(ctx, delay); waitErr != nil {
+				return nil
+			}
+			continue
 		}
 		timer := time.NewTimer(delay)
 		select {
@@ -611,7 +713,7 @@ func (w *Worker) recoverRequestedCutoverLocked(ctx context.Context) error {
 		} else if w.clock().Sub(blockedAt) >= attentionAfter {
 			w.state.SetAttention(true)
 		}
-		if err := w.waitForRetry(ctx, retryDelay(attempt, maxRetryDelay)); err != nil {
+		if err := w.waitForRetry(ctx, w.nextRetryDelay(attempt, maxRetryDelay)); err != nil {
 			return err
 		}
 		attempt++
@@ -694,17 +796,65 @@ func (w *Worker) clock() time.Time {
 }
 
 func (w *Worker) waitForRetry(ctx context.Context, delay time.Duration) error {
+	w.setRetryBackoff(delay)
+	defer w.setRetryBackoff(0)
 	if w.retryWait != nil {
 		return w.retryWait(ctx, delay)
 	}
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+	interval := min(time.Second, max(10*time.Millisecond, delay/4))
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	deadline := time.Now().Add(delay)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		case <-ticker.C:
+			w.setRetryBackoff(max(time.Duration(0), time.Until(deadline)))
+		}
 	}
+}
+
+func (w *Worker) setRetryBackoff(delay time.Duration) {
+	if w.largeProgress.Load() == nil && (w.startup == nil || !w.startup.LargeScale) {
+		return
+	}
+	w.updateLargeProgress(func(status *GenerationStatus) {
+		status.RetryDelayMS = delay.Milliseconds()
+		if delay > 0 {
+			status.BackoffUntil = time.Now().Add(delay).UTC()
+		} else {
+			status.BackoffUntil = time.Time{}
+		}
+	})
+}
+
+func (w *Worker) nextRetryDelay(attempt int, maximum time.Duration) time.Duration {
+	base := retryDelay(attempt, maximum)
+	return boundedRetryJitter(base, w.retryJitter)
+}
+
+func boundedRetryJitter(base time.Duration, jitter func(time.Duration) time.Duration) time.Duration {
+	if jitter == nil {
+		return base
+	}
+	return min(base, max(base/2, jitter(base)))
+}
+
+func randomRetryJitter(delay time.Duration) time.Duration {
+	half := delay / 2
+	if half <= 0 {
+		return delay
+	}
+	var value [1]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return delay
+	}
+	return half + time.Duration(int64(half)*int64(value[0])/255)
 }
 
 func retryDelay(attempt int, maximum time.Duration) time.Duration {

@@ -249,8 +249,8 @@ Runtime boundaries:
 ### 5.1 Commands
 
 ~~~bash
-drive9-migration plan -f /etc/drive9-migration/config.yaml
-drive9-migration run -f /etc/drive9-migration/config.yaml
+drive9-migration plan -f /etc/drive9-migration/config.yaml [--large-scale]
+drive9-migration run -f /etc/drive9-migration/config.yaml [--large-scale]
 drive9-migration status [--job-id <id>] --output json
 drive9-migration diff --job-id <id> [--type <type>] [--limit <n>] --output jsonl
 drive9-migration verify-full --job-id <id>
@@ -1026,6 +1026,35 @@ volume, node, Pod, tenant, and Space MUST NOT be metric labels.
 10. `plan` reports observed entry/byte distribution and Round timing inputs.
     V1 makes no completion-time, memory ceiling, or stop-window promise from
     unknown file-count data.
+
+### 15.1 Opt-in large-scale path
+
+1. `--large-scale` is default-off and excluded from ConfigHash and Checkpoint
+   identity. Removing it and rollout-restarting returns to the legacy execution
+   path without phase or fence rollback.
+2. The large-scale path replaces full Source/Target/findings maps with bounded
+   queues, versioned compressed chunks, external canonical-path sort, streaming
+   diff, and summary-only State.
+3. Source checksum reuse requires exact equality of device, inode, kind, size,
+   mtime_ns, ctime_ns, and mode. Every phase gate still performs a complete
+   Source namespace census.
+4. Target Manifest uses an opaque `path_hash` cursor and has no snapshot
+   guarantee. CLI external sort is the canonical ordering boundary.
+5. BatchMkdir, BatchWrite, and BatchChmod are reachable only in exclusive
+   `SYNCING`. Live-write mismatch repair retains the existing grace and
+   per-path CAS algorithm.
+6. Generation artifacts live under the Job's `verification/` subtree and are
+   non-authoritative caches. Only checksum-valid complete generations may
+   authorize absence, removal, verification, or convergence.
+7. The process memory acceptance target is at most 3 GiB for the six-million-
+   entry sizing fixture. Queue, sort, gzip, BatchWrite, multipart, and post-stat
+   buffers share this budget.
+8. After durable fence completion, Migration removes only the current Job's
+   `verification/` subtree. Checkpoint/fence records and other Jobs remain.
+9. `make migration-scale-bench` emits Go benchmark events as JSONL with
+   parameters, repository identity, result path, and thresholds. The 6M
+   synthetic gate covers bounded observation/diff and stage schedulers; only a
+   Server-backed real-filesystem run can satisfy rollout throughput SLOs.
 
 ## 16. Security contract
 

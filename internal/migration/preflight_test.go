@@ -399,6 +399,58 @@ func TestPreflightChecksSelectedSourceClientCapabilitiesAndEmptyTarget(t *testin
 	}
 }
 
+func TestPreflightLargeScaleProbesManifestContractBeforeTargetList(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		manifestBody string
+		wantErr      bool
+		wantListHits int32
+	}{
+		{name: "complete", manifestBody: `{"entries":[],"next_cursor":"","done":true}`, wantListHits: 1},
+		{name: "complete null cursor", manifestBody: `{"entries":[],"next_cursor":null,"done":true}`, wantListHits: 1},
+		{name: "malformed", manifestBody: `{"entries":[],"next_cursor":""}`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "file"), []byte("abc"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var manifestHits, listHits, mutations atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+					_, _ = w.Write([]byte(`{"tenant_id":"tenant-a","max_upload_bytes":1048576,"inline_threshold":1024,"migration_capabilities":{"checksum_read":true,"checksum_complete":true,"conditional_create":true,"conditional_update":true}}`))
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/migration/manifest":
+					manifestHits.Add(1)
+					if r.URL.Query().Get("prefix") != "/" || r.URL.Query().Get("limit") != "1" {
+						t.Fatalf("manifest query = %v", r.URL.Query())
+					}
+					_, _ = w.Write([]byte(tc.manifestBody))
+				case r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/checkpoint.json"):
+					http.NotFound(w, r)
+				case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+					listHits.Add(1)
+					_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FileInfo{{Name: ".drive9-migration", IsDir: true}}})
+				default:
+					mutations.Add(1)
+					http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+				}
+			}))
+			defer server.Close()
+
+			startup := preflightStartup(t, server.URL, root)
+			startup.LargeScale = true
+			_, err := preflightWithVerifier(context.Background(), startup, func(string, string) (bool, error) { return true, nil })
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr=%t", err, tc.wantErr)
+			}
+			if manifestHits.Load() != 1 || listHits.Load() != tc.wantListHits || mutations.Load() != 0 {
+				t.Fatalf("hits manifest/list/mutation = %d/%d/%d", manifestHits.Load(), listHits.Load(), mutations.Load())
+			}
+		})
+	}
+}
+
 func TestPreflightRejectsAuthenticatedTenantMismatchBeforeTargetAccess(t *testing.T) {
 	root := t.TempDir()
 	var targetHits atomic.Int32

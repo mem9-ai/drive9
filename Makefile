@@ -55,7 +55,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
+.PHONY: mod test test-failpoint test-podman migration-server-contract migration-scale-bench migration-scale-bench-full fmt lint install-lint build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
@@ -93,6 +93,33 @@ test:
 # rewrites the source tree while the tests are running.
 test-failpoint:
 	./scripts/run_failpoint_tests.py
+
+MIGRATION_SCALE_ENTRIES ?= 100000
+MIGRATION_SCALE_RESULT ?= /tmp/drive9-migration-scale-benchmark.jsonl
+MIGRATION_SCALE_SERVER_DIR ?=
+DRIVE9_MIGRATION_SCALE_ASSERT ?= 0
+MIGRATION_CONTRACT_BASE ?= $(DRIVE9_BASE)
+MIGRATION_CONTRACT_API_KEY ?= $(DRIVE9_API_KEY)
+MIGRATION_CONTRACT_SQL ?= 0
+
+migration-server-contract:
+	@test -n "$(MIGRATION_CONTRACT_BASE)" || (echo "MIGRATION_CONTRACT_BASE is required" >&2; exit 2)
+	@DRIVE9_MIGRATION_CONTRACT=1 DRIVE9_MIGRATION_CONTRACT_SQL=$(MIGRATION_CONTRACT_SQL) DRIVE9_BASE="$(MIGRATION_CONTRACT_BASE)" DRIVE9_API_KEY="$(MIGRATION_CONTRACT_API_KEY)" $(GO) test ./e2e -run '^TestMigrationBulkLiveServerContract$$' -count=1 -v
+	@if [ -n "$(MIGRATION_SERVER_DIR)" ]; then \
+		cd "$(MIGRATION_SERVER_DIR)" && $(GO) test ./pkg/server -run 'Test(MigrationManifest|BatchMkdir|BatchChmod|MigrationBatch|ScopedBusinessMigrationBulk)' -count=1; \
+	fi
+
+migration-scale-bench:
+	@mkdir -p "$(dir $(MIGRATION_SCALE_RESULT))"
+	@echo "entries=$(MIGRATION_SCALE_ENTRIES) result=$(MIGRATION_SCALE_RESULT)"
+	@echo "cli_commit=$$(git rev-parse HEAD) worktree_changes=$$(git status --porcelain | wc -l | tr -d ' ')"
+	@if [ -n "$(MIGRATION_SCALE_SERVER_DIR)" ]; then echo "server_commit=$$(git -C '$(MIGRATION_SCALE_SERVER_DIR)' rev-parse HEAD)"; fi
+	@echo "thresholds: process_rss<=3221225472B full_external_sort<=30m full_generation_diff<=5h"
+	@DRIVE9_MIGRATION_SCALE_ASSERT=$(DRIVE9_MIGRATION_SCALE_ASSERT) DRIVE9_MIGRATION_SCALE_ENTRIES=$(MIGRATION_SCALE_ENTRIES) $(GO) test -json ./internal/migration -run '^$$' -bench '^BenchmarkMigration' -benchtime=1x -benchmem > "$(MIGRATION_SCALE_RESULT)"
+	@echo "benchmark_result=$(MIGRATION_SCALE_RESULT)"
+
+migration-scale-bench-full:
+	@$(MAKE) migration-scale-bench MIGRATION_SCALE_ENTRIES=6000000 DRIVE9_MIGRATION_SCALE_ASSERT=1
 
 fmt:
 	$(MAKE) install-lint

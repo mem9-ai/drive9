@@ -106,6 +106,29 @@ type Round struct {
 	Findings     []Finding
 }
 
+type generationRoundSummary struct {
+	ID                 string
+	Mode               RoundMode
+	StartedAt          time.Time
+	CompletedAt        time.Time
+	SourceGenerationID string
+	TargetGenerationID string
+	DiffGenerationID   string
+	SourceComplete     bool
+	TargetComplete     bool
+	DiffComplete       bool
+	ScanComplete       bool
+	Converged          bool
+	SourceCount        int64
+	TargetCount        int64
+	FindingCounts      map[FindingKind]int64
+	WorkCounts         map[string]int64
+	BlockerCount       int64
+	PendingCount       int64
+	ActiveCount        int64
+	UnknownCount       int64
+}
+
 type RoundStatus struct {
 	ID           string    `json:"id,omitempty"`
 	Mode         RoundMode `json:"mode,omitempty"`
@@ -153,6 +176,7 @@ type StateSnapshot struct {
 	InitialCopyComplete bool
 	Current             RoundStatus
 	LastComplete        *Round
+	LastGeneration      *generationRoundSummary
 	Conditions          Conditions
 	Grace               map[string]GraceCandidate
 	Retry               map[string]RetryItem
@@ -175,6 +199,7 @@ type State struct {
 	conditions          Conditions
 	current             RoundStatus
 	lastComplete        *Round
+	lastGeneration      *generationRoundSummary
 	grace               map[string]GraceCandidate
 	retry               map[string]RetryItem
 	observed            map[string]SourceVersion
@@ -239,11 +264,51 @@ func (s *State) PublishRound(round Round) error {
 	return nil
 }
 
+func (s *State) PublishGeneration(summary generationRoundSummary) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if summary.ID == "" || summary.ID != s.current.ID {
+		return ErrStaleRound
+	}
+	if !summary.ScanComplete {
+		s.current.ScanComplete = false
+		s.current.Converged = false
+		s.recomputeLocked()
+		return ErrIncompleteRound
+	}
+	if summary.SourceGenerationID == "" || summary.TargetGenerationID == "" || summary.DiffGenerationID == "" {
+		return ErrIncompleteRound
+	}
+	if !summary.SourceComplete || !summary.TargetComplete || !summary.DiffComplete {
+		s.current.ScanComplete = false
+		s.current.Converged = false
+		s.recomputeLocked()
+		return ErrIncompleteRound
+	}
+	copy := cloneGenerationSummary(summary)
+	copy.Converged = copy.Converged && copy.BlockerCount == 0 && copy.PendingCount == 0 && copy.ActiveCount == 0 && copy.UnknownCount == 0
+	s.lastGeneration = &copy
+	s.current = RoundStatus{
+		ID: summary.ID, Mode: summary.Mode, StartedAt: summary.StartedAt,
+		CompletedAt: summary.CompletedAt, ScanComplete: true, Converged: copy.Converged,
+	}
+	s.recomputeLocked()
+	return nil
+}
+
 // MarkReconciled advances one token only after successful deep work.
 func (s *State) MarkReconciled(path string, version SourceVersion) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reconciled[path] = version
+	s.clearPathLocked(path)
+	s.recomputeLocked()
+}
+
+func (s *State) clearPath(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.reconciled, path)
 	s.clearPathLocked(path)
 	s.recomputeLocked()
 }
@@ -408,8 +473,11 @@ func (s *State) endOperation() {
 }
 
 func (s *State) recomputeLocked() {
-	latestConverged := s.lastComplete != nil && s.current.ID == s.lastComplete.ID && s.current.ScanComplete && s.current.Converged
-	syncReady := s.phase == PhaseSyncing && s.recoveryComplete && s.initialCopyComplete && latestConverged && !s.attention
+	latestLegacy := s.lastComplete != nil && s.current.ID == s.lastComplete.ID
+	latestGeneration := s.lastGeneration != nil && s.current.ID == s.lastGeneration.ID
+	latestConverged := (latestLegacy || latestGeneration) && s.current.ScanComplete && s.current.Converged
+	generationRuntimeClear := !latestGeneration || len(s.grace) == 0 && len(s.retry) == 0 && s.pendingRepairs == 0 && s.activeOperations == 0
+	syncReady := s.phase == PhaseSyncing && s.recoveryComplete && s.initialCopyComplete && latestConverged && generationRuntimeClear && !s.attention
 	dualReady := s.phase == PhaseDualWriteRepairing && s.recoveryComplete && latestConverged && len(s.grace) == 0 && len(s.retry) == 0 && s.pendingRepairs == 0 && s.activeOperations == 0 && !s.attention
 	// Conditions are derived rather than independently mutable.
 	s.conditions = Conditions{ReadyForRollout: syncReady, CurrentConverged: dualReady, Attention: s.attention}
@@ -423,13 +491,24 @@ func (s *State) Snapshot() StateSnapshot {
 		copy := cloneRound(*s.lastComplete)
 		last = &copy
 	}
+	var generation *generationRoundSummary
+	if s.lastGeneration != nil {
+		copy := cloneGenerationSummary(*s.lastGeneration)
+		generation = &copy
+	}
 	return StateSnapshot{
 		Phase: s.phase, RecoveryComplete: s.recoveryComplete, InitialCopyComplete: s.initialCopyComplete,
-		Current: s.current, LastComplete: last, Conditions: s.conditions,
+		Current: s.current, LastComplete: last, LastGeneration: generation, Conditions: s.conditions,
 		Grace: cloneMap(s.grace), Retry: cloneMap(s.retry), Observed: cloneMap(s.observed), Reconciled: cloneMap(s.reconciled),
 		CandidateCounts: s.candidateCounts, PendingRepairs: s.pendingRepairs, ActiveOperations: s.activeOperations,
 		RepairMtimeFloor: cloneTime(s.repairMtimeFloor), Verification: s.verification,
 	}
+}
+
+func cloneGenerationSummary(summary generationRoundSummary) generationRoundSummary {
+	summary.FindingCounts = cloneMap(summary.FindingCounts)
+	summary.WorkCounts = cloneMap(summary.WorkCounts)
+	return summary
 }
 
 func cloneRound(round Round) Round {

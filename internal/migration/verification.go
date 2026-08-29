@@ -71,7 +71,7 @@ func (w *Worker) verifyFullLocked(ctx context.Context) (VerificationState, error
 				w.state.SetAttention(true)
 			}
 		}
-		if err := w.waitForRetry(ctx, retryDelay(attempt, maxRetryDelay)); err != nil {
+		if err := w.waitForRetry(ctx, w.nextRetryDelay(attempt, maxRetryDelay)); err != nil {
 			return w.resetVerification(), err
 		}
 		attempt++
@@ -87,6 +87,9 @@ func (w *Worker) finishVerification(current VerificationState, snapshot StateSna
 				current.MismatchCount++
 			}
 		}
+	} else if snapshot.LastGeneration != nil {
+		current.SourceCount = snapshot.LastGeneration.SourceCount
+		current.MismatchCount = snapshot.LastGeneration.BlockerCount
 	}
 	if !snapshot.Current.Converged || snapshot.Conditions.Attention {
 		current.Status = "failed"

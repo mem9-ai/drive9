@@ -312,6 +312,15 @@ func preflightWithProbeValidation(ctx context.Context, startup *Startup, probe f
 	if err := verifyAuthenticatedTenant(ctx, api, startup); err != nil {
 		return PreflightResult{}, fmt.Errorf("%w: %w", ErrPreflight, err)
 	}
+	if startup.LargeScale {
+		manifestPrefix := startup.Job.Target.Prefix
+		if manifestPrefix != "/" {
+			manifestPrefix += "/"
+		}
+		if _, err := api.ManifestPageCtx(ctx, manifestPrefix, "", 1); err != nil {
+			return PreflightResult{}, fmt.Errorf("%w: large-scale manifest contract: %w", ErrPreflight, err)
+		}
+	}
 	maxUploadBytes, inlineThreshold := api.MaxUploadBytes(ctx), api.CachedSmallFileThreshold()
 	distribution, err := fileDistribution(scan, maxUploadBytes, inlineThreshold)
 	if err != nil {

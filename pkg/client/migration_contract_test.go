@@ -1031,3 +1031,232 @@ func TestMigrationEventErrorIsTypedAndDoesNotLeakCredential(t *testing.T) {
 		t.Fatal("event error leaked API key")
 	}
 }
+
+func TestMigrationManifestPageContract(t *testing.T) {
+	const apiKey = "owner-key"
+	checksum := strings.Repeat("a", 64)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/migration/manifest" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+apiKey {
+			t.Fatalf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		query := r.URL.Query()
+		if query.Get("prefix") != "/" || query.Get("cursor") != "cursor-0" || query.Get("limit") != "2" {
+			t.Fatalf("query = %v", query)
+		}
+		_, _ = io.WriteString(w, `{
+			"entries":[
+				{"path":"/a.txt","type":"regular","metadata_complete":true,"identity_kind":"inode","mode":420,"size":7,"checksum_sha256":"`+checksum+`","revision":3,"resource_id":"inode-a","nlink":2},
+				{"path":"/legacy/","type":"directory","metadata_complete":false,"identity_kind":"legacy_dentry","mode":null,"size":0,"checksum_sha256":null,"revision":null,"resource_id":"node-legacy","nlink":2}
+			],
+			"next_cursor":"cursor-1",
+			"done":false
+		}`)
+	}))
+	defer server.Close()
+
+	page, err := New(server.URL, apiKey).ManifestPageCtx(context.Background(), "/", "cursor-0", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Done || page.NextCursor != "cursor-1" || len(page.Entries) != 2 || page.ResponseBytes == 0 {
+		t.Fatalf("page = %+v", page)
+	}
+	regular := page.Entries[0]
+	if regular.Type != ManifestEntryRegular || !regular.MetadataComplete || regular.IdentityKind != ManifestIdentityInode ||
+		regular.Mode == nil || *regular.Mode != 0o644 || regular.ChecksumSHA256 == nil || *regular.ChecksumSHA256 != checksum ||
+		regular.Revision == nil || *regular.Revision != 3 || regular.ResourceID != "inode-a" || regular.Nlink != 2 {
+		t.Fatalf("regular = %+v", regular)
+	}
+	legacy := page.Entries[1]
+	if legacy.Type != ManifestEntryDirectory || legacy.MetadataComplete || legacy.IdentityKind != ManifestIdentityLegacyDentry ||
+		legacy.Mode != nil || legacy.ChecksumSHA256 != nil || legacy.Revision != nil || legacy.ResourceID != "node-legacy" {
+		t.Fatalf("legacy = %+v", legacy)
+	}
+}
+
+func TestMigrationManifestPageAcceptsTerminalNullCursor(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"entries":[],"next_cursor":null,"done":true}`)
+	}))
+	defer server.Close()
+
+	page, err := New(server.URL, "").ManifestPageCtx(context.Background(), "/", "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.Done || page.NextCursor != "" || len(page.Entries) != 0 {
+		t.Fatalf("page = %+v", page)
+	}
+}
+
+func TestMigrationManifestPageRejectsMalformedContracts(t *testing.T) {
+	validEntry := `{"path":"/a.txt","type":"regular","metadata_complete":true,"identity_kind":"inode","mode":420,"size":1,"checksum_sha256":"` + strings.Repeat("a", 64) + `","revision":1,"resource_id":"inode-a","nlink":1}`
+	for _, tc := range []struct {
+		name   string
+		body   string
+		cursor string
+		limit  int
+	}{
+		{name: "null entries", body: `{"entries":null,"next_cursor":"","done":true}`, limit: 1},
+		{name: "missing done", body: `{"entries":[],"next_cursor":""}`, limit: 1},
+		{name: "missing entry field", body: `{"entries":[{"path":"/a.txt","type":"regular","metadata_complete":true,"identity_kind":"inode","size":1,"checksum_sha256":null,"revision":1,"resource_id":"inode-a","nlink":1}],"next_cursor":"","done":true}`, limit: 1},
+		{name: "invalid path", body: `{"entries":[{"path":"/a/../b","type":"regular","metadata_complete":false,"identity_kind":"inode","mode":420,"size":1,"checksum_sha256":null,"revision":1,"resource_id":"inode-a","nlink":1}],"next_cursor":"","done":true}`, limit: 1},
+		{name: "non advancing cursor", body: `{"entries":[],"next_cursor":"same","done":false}`, cursor: "same", limit: 1},
+		{name: "terminal cursor", body: `{"entries":[],"next_cursor":"unexpected","done":true}`, limit: 1},
+		{name: "too many entries", body: `{"entries":[` + validEntry + `,` + validEntry + `],"next_cursor":"","done":true}`, limit: 1},
+		{name: "trailing json", body: `{"entries":[],"next_cursor":"","done":true} {}`, limit: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+			if _, err := New(server.URL, "").ManifestPageCtx(context.Background(), "/", tc.cursor, tc.limit); err == nil {
+				t.Fatal("malformed Manifest response accepted")
+			}
+		})
+	}
+}
+
+func TestMigrationManifestPageRejectsInvalidRequestBeforeNetwork(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		calls.Add(1)
+	}))
+	defer server.Close()
+	c := New(server.URL, "")
+	for _, tc := range []struct {
+		prefix string
+		limit  int
+	}{
+		{prefix: "relative", limit: 1},
+		{prefix: "/not-a-dir", limit: 1},
+		{prefix: "/", limit: MaxManifestPageEntries + 1},
+		{prefix: "/", limit: -1},
+	} {
+		if _, err := c.ManifestPageCtx(context.Background(), tc.prefix, "", tc.limit); err == nil {
+			t.Fatalf("request prefix=%q limit=%d accepted", tc.prefix, tc.limit)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("invalid requests made %d network calls", calls.Load())
+	}
+}
+
+func TestMigrationBatchMkdirContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs:batch-mkdir" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var request struct {
+			Items []BatchMkdirItem `json:"items"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if len(request.Items) != 2 || request.Items[0].Path != "/a/" || request.Items[0].Mode != 0o755 || request.Items[1].Mode != 0 {
+			t.Fatalf("request = %+v", request)
+		}
+		_, _ = io.WriteString(w, `{"results":[
+			{"path":"/a/","status":201,"error":null,"created":true,"resource_id":"dir-a"},
+			{"path":"/b/","status":409,"error":"path conflict","created":null,"resource_id":null}
+		]}`)
+	}))
+	defer server.Close()
+
+	results, err := New(server.URL, "").BatchMkdirCtx(context.Background(), []BatchMkdirItem{
+		{Path: "/a/", Mode: 0o755},
+		{Path: "/b/", Mode: 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || !results[0].OK() || results[0].Created == nil || !*results[0].Created ||
+		results[0].ResourceID == nil || *results[0].ResourceID != "dir-a" {
+		t.Fatalf("success = %+v", results)
+	}
+	if results[1].OK() || results[1].Error == nil || *results[1].Error != "path conflict" ||
+		results[1].Created != nil || results[1].ResourceID != nil {
+		t.Fatalf("conflict = %+v", results[1])
+	}
+}
+
+func TestMigrationBatchChmodContract(t *testing.T) {
+	revision := int64(7)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs:batch-chmod" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var request struct {
+			Items []map[string]json.RawMessage `json:"items"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if len(request.Items) != 2 {
+			t.Fatalf("request = %+v", request)
+		}
+		if _, exists := request.Items[0]["expected_revision"]; !exists {
+			t.Fatal("regular item omitted expected_revision")
+		}
+		if _, exists := request.Items[1]["expected_revision"]; exists {
+			t.Fatal("directory item unexpectedly included expected_revision")
+		}
+		_, _ = io.WriteString(w, `{"results":[
+			{"path":"/a.txt","status":200,"error":null,"resource_id":"inode-a","revision":7,"mode":384},
+			{"path":"/dir/","status":404,"error":"not found","resource_id":null,"revision":null,"mode":null}
+		]}`)
+	}))
+	defer server.Close()
+
+	results, err := New(server.URL, "").BatchChmodCtx(context.Background(), []BatchChmodItem{
+		{Path: "/a.txt", Mode: 0o600, ExpectedResourceID: "inode-a", ExpectedRevision: &revision},
+		{Path: "/dir/", Mode: 0o700, ExpectedResourceID: "inode-dir"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || !results[0].OK() || results[0].ResourceID == nil || *results[0].ResourceID != "inode-a" ||
+		results[0].Revision == nil || *results[0].Revision != revision || results[0].Mode == nil || *results[0].Mode != 0o600 {
+		t.Fatalf("success = %+v", results)
+	}
+	if results[1].OK() || results[1].Error == nil || results[1].ResourceID != nil || results[1].Revision != nil || results[1].Mode != nil {
+		t.Fatalf("not found = %+v", results[1])
+	}
+}
+
+func TestMigrationBatchMutationRejectsInvalidContracts(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = io.WriteString(w, `{"results":null}`)
+	}))
+	defer server.Close()
+	c := New(server.URL, "")
+
+	if _, err := c.BatchMkdirCtx(context.Background(), nil); err == nil {
+		t.Fatal("empty BatchMkdir accepted")
+	}
+	if _, err := c.BatchMkdirCtx(context.Background(), make([]BatchMkdirItem, MaxBatchMkdirItems+1)); err == nil {
+		t.Fatal("oversized BatchMkdir accepted")
+	}
+	if _, err := c.BatchMkdirCtx(context.Background(), []BatchMkdirItem{{Path: "/file", Mode: 0o755}}); err == nil {
+		t.Fatal("non-directory BatchMkdir path accepted")
+	}
+	if _, err := c.BatchChmodCtx(context.Background(), []BatchChmodItem{{Path: "/a.txt", Mode: 0o600, ExpectedResourceID: "inode-a"}}); err == nil {
+		t.Fatal("regular BatchChmod without revision accepted")
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("invalid requests made %d network calls", calls.Load())
+	}
+
+	if _, err := c.BatchMkdirCtx(context.Background(), []BatchMkdirItem{{Path: "/a/", Mode: 0o755}}); err == nil {
+		t.Fatal("null BatchMkdir results accepted")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("valid request made %d network calls", calls.Load())
+	}
+}
