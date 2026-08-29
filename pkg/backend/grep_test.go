@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
 type staticQueryEmbedder struct {
@@ -205,5 +206,44 @@ func TestGrepAutoEmbeddingSkipsApplicationQueryEmbedder(t *testing.T) {
 	case got := <-seen:
 		t.Fatalf("query embedder was called in auto mode with %q", got)
 	default:
+	}
+}
+
+func TestGrepReturnsVectorHitWithApplicationEmbedder(t *testing.T) {
+	// Regression for the VEC_EMBED_COSINE_DISTANCE -> VEC_COSINE_DISTANCE fix:
+	// an application-computed embedding stored via UpdateFileEmbedding must be
+	// findable through the queryEmbedder branch of Grep, with no FTS overlap.
+	vec := make([]float32, schema.TiDBAutoEmbeddingDimensions)
+	vec[0] = 1.0
+
+	b := newTestBackendWithOptions(t, Options{
+		QueryEmbedding: QueryEmbeddingOptions{
+			Client: staticQueryEmbedder{vec: vec},
+		},
+	})
+	if _, err := b.Write("/notes/vecmatch.txt", []byte("no shared keywords here"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	node, err := b.store.GetNode(context.Background(), "/notes/vecmatch.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := b.store.GetFile(context.Background(), node.FileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated, err := b.store.UpdateFileEmbedding(context.Background(), node.FileID, file.Revision, vec); err != nil {
+		t.Fatal(err)
+	} else if !updated {
+		t.Fatal("expected embedding update to succeed")
+	}
+
+	results, err := b.Grep(context.Background(), "totally unrelated query text", "/notes/", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Path != "/notes/vecmatch.txt" {
+		t.Fatalf("unexpected grep results: %+v", results)
 	}
 }
