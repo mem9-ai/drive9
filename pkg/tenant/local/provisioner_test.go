@@ -2,7 +2,7 @@ package local
 
 import (
 	"context"
-	"strconv"
+	"crypto/tls"
 	"strings"
 	"testing"
 
@@ -28,6 +28,38 @@ func TestDatabaseName(t *testing.T) {
 	}
 	if validTenantDatabaseName("mysql") || validTenantDatabaseName("drive9_") {
 		t.Fatal("validTenantDatabaseName accepted a non-tenant name")
+	}
+}
+
+func TestAdminTLSEnabled(t *testing.T) {
+	if err := mysql.RegisterTLSConfig("drive9-local-test", &tls.Config{MinVersion: tls.VersionTLS12}); err != nil {
+		t.Fatalf("RegisterTLSConfig: %v", err)
+	}
+
+	if adminTLSEnabled(nil) {
+		t.Fatal("adminTLSEnabled(nil) = true, want false")
+	}
+
+	cases := []struct {
+		dsn  string
+		want bool
+	}{
+		{"root@tcp(127.0.0.1:4000)/db", false},
+		{"root@tcp(127.0.0.1:4000)/db?tls=false", false},
+		{"root@tcp(127.0.0.1:4000)/db?tls=0", false},
+		{"root@tcp(127.0.0.1:4000)/db?tls=true", true},
+		{"root@tcp(127.0.0.1:4000)/db?tls=skip-verify", true},
+		{"root@tcp(127.0.0.1:4000)/db?tls=preferred", true},
+		{"root@tcp(127.0.0.1:4000)/db?tls=drive9-local-test", true},
+	}
+	for _, tc := range cases {
+		cfg, err := mysql.ParseDSN(tc.dsn)
+		if err != nil {
+			t.Fatalf("ParseDSN(%q): %v", tc.dsn, err)
+		}
+		if got := adminTLSEnabled(cfg); got != tc.want {
+			t.Fatalf("adminTLSEnabled(%q) = %v, want %v", tc.dsn, got, tc.want)
+		}
 	}
 }
 
@@ -128,7 +160,10 @@ func TestProvisionAndDeprovision(t *testing.T) {
 	if !strings.HasPrefix(info.DBName, dbNamePrefix) {
 		t.Fatalf("DBName = %q", info.DBName)
 	}
-	tenantDSN := info.Username + ":" + info.Password + "@tcp(" + info.Host + ":" + strconv.Itoa(info.Port) + ")/" + info.DBName + "?parseTime=true"
+	if info.DBTLS != adminTLSEnabled(p.admin) {
+		t.Fatalf("info.DBTLS = %v, want %v", info.DBTLS, adminTLSEnabled(p.admin))
+	}
+	tenantDSN := tenant.FormatTenantMySQLDSN(info.Username, info.Password, info.Host, info.Port, info.DBName, info.DBTLS, info.Provider)
 	if err := p.InitSchema(ctx, tenantDSN); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

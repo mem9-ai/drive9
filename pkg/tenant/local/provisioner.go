@@ -2,7 +2,11 @@
 //
 // It replaces drive9-server-local: each POST /v1/provision creates a database
 // on an existing TiDB instance, inits the tenant schema, and returns
-// coordinates for the production pool.Acquire path.
+// coordinates for the production pool.Acquire path. Tenant DB connections
+// inherit the TLS setting of the admin DSN this provisioner was configured
+// with (see adminTLSEnabled), so pointing it at a TiDB Cloud public gateway
+// with tls=true or tls=skip-verify in the admin DSN produces tenants that
+// also connect over TLS.
 package local
 
 import (
@@ -107,6 +111,7 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 		Password:       p.admin.Passwd,
 		DBName:         dbName,
 		Provider:       tenant.ProviderLocal,
+		DBTLS:          adminTLSEnabled(p.admin),
 	}, nil
 }
 
@@ -171,6 +176,24 @@ func (p *Provisioner) openAdmin() (*sql.DB, error) {
 		return nil, fmt.Errorf("open local mysql admin: %w", err)
 	}
 	return db, nil
+}
+
+// adminTLSEnabled reports whether the admin DSN requests TLS, so that
+// provisioned tenants inherit the same TLS posture as the admin connection
+// (needed to provision local tenants against TiDB Cloud's public gateway,
+// which requires TLS). An empty or "false" tls= value (or no admin config)
+// means TLS is off; any other value ("true", "skip-verify", "preferred", or
+// a name registered via mysql.RegisterTLSConfig) means TLS is on.
+func adminTLSEnabled(cfg *mysql.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.TLSConfig)) {
+	case "", "false":
+		return false
+	default:
+		return true
+	}
 }
 
 func embeddingModeFromEnv() (string, error) {

@@ -32,6 +32,10 @@ type ClusterInfo struct {
 	Provider       string
 	ClaimURL       string
 	ClaimExpiresAt *time.Time
+	// DBTLS reports whether tenant DB connections must request TLS. Only the
+	// local provisioner sets this (from its admin DSN's TLS setting); other
+	// providers derive TLS from provider rules in the server instead.
+	DBTLS bool
 }
 
 type Provisioner interface {
