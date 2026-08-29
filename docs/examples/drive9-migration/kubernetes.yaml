@@ -93,6 +93,8 @@ spec:
             - plan
             - -f
             - /etc/drive9-migration/config.yaml
+            # Remove this flag and rollout-restart to return to the legacy path.
+            - --large-scale
           env:
             - name: DRIVE9_MIGRATION_NODE_NAME
               valueFrom:
@@ -126,6 +128,8 @@ spec:
             - run
             - -f
             - /etc/drive9-migration/config.yaml
+            # The large-scale path is default-off and requires Server issue 115.
+            - --large-scale
           env:
             - name: DRIVE9_MIGRATION_NODE_NAME
               valueFrom:

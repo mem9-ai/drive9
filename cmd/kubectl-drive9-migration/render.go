@@ -33,18 +33,20 @@ func renderTable(output io.Writer, wide bool, jobs []jobResult, batches []batchS
 	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
 	showBatch := shouldShowBatch(jobs)
 	if wide {
-		if _, err := fmt.Fprintln(table, "NAMESPACE\tBATCH\tJOB\tVOLUME\tPHASE\tSTATUS\tROUND\tFILES\tDIFF\tRETRY\tVERIFY\tNODE\tPOD\tSPACE\tPREFIX\tCAND_MTIME\tCAND_SOURCE_TOKEN_CHANGED\tCAND_NEW_PATH\tCAND_FILTERED\tPENDING\tIN_FLIGHT\tERROR"); err != nil {
+		if _, err := fmt.Fprintln(table, "NAMESPACE\tBATCH\tJOB\tVOLUME\tPHASE\tSTATUS\tROUND\tGEN_STAGE\tFILES\tDIFF\tRETRY\tVERIFY\tNODE\tPOD\tSPACE\tPREFIX\tCAND_MTIME\tCAND_SOURCE_TOKEN_CHANGED\tCAND_NEW_PATH\tCAND_FILTERED\tPENDING\tIN_FLIGHT\tGEN_PENDING\tGEN_UNKNOWN\tINLINE_W\tMULTIPART_W\tREBUILD\tERROR"); err != nil {
 			return err
 		}
 		for _, job := range jobs {
 			status := job.parsed
 			candidateMtime, candidateSourceToken, candidateNewPath, candidateFiltered := candidateCounts(status)
-			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			if _, err := fmt.Fprintln(table, strings.Join([]string{
 				valueOrDash(job.Namespace), valueOrDash(job.Batch), valueOrDash(job.JobID), valueOrDash(job.VolumeID), valueOrDash(job.Phase),
-				job.DisplayStatus, roundDisplay(status), sourceCount(status), findingCount(status), retryCount(status),
+				job.DisplayStatus, roundDisplay(status), generationStage(status), sourceCount(status), findingCount(status), retryCount(status),
 				verificationDisplay(status), valueOrDash(job.Node), valueOrDash(job.Pod), spaceRef(status), prefix(status),
 				candidateMtime, candidateSourceToken, candidateNewPath, candidateFiltered,
-				pendingRepairs(status), inFlight(status), valueOrDash(job.Error)); err != nil {
+				pendingRepairs(status), inFlight(status), generationPending(status), generationUnknown(status),
+				generationInlineWorkers(status), generationMultipartWorkers(status), generationRebuildReason(status), valueOrDash(job.Error),
+			}, "\t")); err != nil {
 				return err
 			}
 		}
@@ -53,7 +55,7 @@ func renderTable(output io.Writer, wide bool, jobs []jobResult, batches []batchS
 		if showBatch {
 			headers = append(headers, "BATCH")
 		}
-		headers = append(headers, "JOB", "PHASE", "STATUS", "ROUND", "FILES", "DIFF", "RETRY", "VERIFY", "POD")
+		headers = append(headers, "JOB", "PHASE", "STATUS", "ROUND", "STAGE", "FILES", "DIFF", "RETRY", "VERIFY", "POD")
 		if _, err := fmt.Fprintln(table, strings.Join(headers, "\t")); err != nil {
 			return err
 		}
@@ -65,7 +67,7 @@ func renderTable(output io.Writer, wide bool, jobs []jobResult, batches []batchS
 			status := job.parsed
 			fields = append(fields,
 				valueOrDash(job.JobID), valueOrDash(job.Phase), job.DisplayStatus,
-				roundDisplay(status), sourceCount(status), findingCount(status), retryCount(status),
+				roundDisplay(status), generationStage(status), sourceCount(status), findingCount(status), retryCount(status),
 				verificationDisplay(status), valueOrDash(job.Pod),
 			)
 			if _, err := fmt.Fprintln(table, strings.Join(fields, "\t")); err != nil {
@@ -191,6 +193,48 @@ func inFlight(status *workerStatus) string {
 		return "-"
 	}
 	return strconv.Itoa(status.InFlight)
+}
+
+func generationStage(status *workerStatus) string {
+	if status == nil || status.Generation == nil {
+		return "-"
+	}
+	return valueOrDash(status.Generation.Stage)
+}
+
+func generationPending(status *workerStatus) string {
+	if status == nil || status.Generation == nil {
+		return "-"
+	}
+	return strconv.FormatInt(max(status.Generation.PendingCount, status.Generation.ApplyPending), 10)
+}
+
+func generationUnknown(status *workerStatus) string {
+	if status == nil || status.Generation == nil {
+		return "-"
+	}
+	return strconv.FormatInt(status.Generation.UnknownCount+status.Generation.ApplyUnknown, 10)
+}
+
+func generationInlineWorkers(status *workerStatus) string {
+	if status == nil || status.Generation == nil {
+		return "-"
+	}
+	return strconv.Itoa(status.Generation.InlineWorkers)
+}
+
+func generationMultipartWorkers(status *workerStatus) string {
+	if status == nil || status.Generation == nil {
+		return "-"
+	}
+	return strconv.Itoa(status.Generation.MultipartWorkers)
+}
+
+func generationRebuildReason(status *workerStatus) string {
+	if status == nil || status.Generation == nil {
+		return "-"
+	}
+	return valueOrDash(status.Generation.RebuildReason)
 }
 
 func valueOrDash(value string) string {

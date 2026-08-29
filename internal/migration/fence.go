@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"go.uber.org/zap"
+
+	"github.com/mem9-ai/drive9/pkg/logger"
 )
 
 func (w *Worker) PrepareCutover(ctx context.Context) (Checkpoint, error) {
@@ -33,7 +37,7 @@ func (w *Worker) prepareCutoverLocked(ctx context.Context) (Checkpoint, error) {
 			return Checkpoint{}, fmt.Errorf("%w: fence intent update: %w; reconcile: %w", ErrControlOutcomeUnknown, err, loadErr)
 		}
 		if sameCheckpointIdentity(observed.Checkpoint, next) && observed.Checkpoint.FenceComplete {
-			return w.adoptCompletedFence(observed)
+			return w.adoptCompletedFence(ctx, observed)
 		}
 		if sameCheckpointIdentity(observed.Checkpoint, next) && observed.Checkpoint.FenceIntent {
 			w.recovery.Record, w.recovery.WritesAllowed = observed, false
@@ -50,6 +54,7 @@ func (w *Worker) prepareCutoverLocked(ctx context.Context) (Checkpoint, error) {
 
 func (w *Worker) completeFenceLocked(ctx context.Context) (Checkpoint, error) {
 	if w.fenceComplete.Load() {
+		w.cleanupGenerations(ctx)
 		return w.recovery.Record.Checkpoint, nil
 	}
 	for attempt := 0; attempt < 2; attempt++ {
@@ -60,7 +65,7 @@ func (w *Worker) completeFenceLocked(ctx context.Context) (Checkpoint, error) {
 		next.FenceComplete, next.HighestPhase = true, PhaseCutoverReady
 		record, err := w.checkpoint.Update(ctx, w.recovery.Record, next)
 		if err == nil {
-			return w.adoptCompletedFence(record)
+			return w.adoptCompletedFence(ctx, record)
 		}
 		observed, loadErr := w.checkpoint.Load(ctx, next.JobID)
 		if loadErr != nil {
@@ -72,7 +77,7 @@ func (w *Worker) completeFenceLocked(ctx context.Context) (Checkpoint, error) {
 		w.recovery.Record, w.recovery.WritesAllowed = observed, false
 		w.fenceIntent.Store(true)
 		if observed.Checkpoint.FenceComplete {
-			return w.adoptCompletedFence(observed)
+			return w.adoptCompletedFence(ctx, observed)
 		}
 		if attempt == 1 {
 			return Checkpoint{}, err
@@ -81,7 +86,7 @@ func (w *Worker) completeFenceLocked(ctx context.Context) (Checkpoint, error) {
 	return Checkpoint{}, ErrCheckpointConflict
 }
 
-func (w *Worker) adoptCompletedFence(record CheckpointRecord) (Checkpoint, error) {
+func (w *Worker) adoptCompletedFence(ctx context.Context, record CheckpointRecord) (Checkpoint, error) {
 	w.recovery.Record = record
 	w.recovery.WritesAllowed = false
 	w.writesFenced.Store(true)
@@ -91,5 +96,20 @@ func (w *Worker) adoptCompletedFence(record CheckpointRecord) (Checkpoint, error
 	w.state.phase = PhaseCutoverReady
 	w.state.recomputeLocked()
 	w.state.mu.Unlock()
+	w.cleanupGenerations(ctx)
 	return record.Checkpoint, nil
+}
+
+func (w *Worker) cleanupGenerations(ctx context.Context) {
+	if w.generation == nil {
+		return
+	}
+	err := injectMigrationLargeStageFault("fence_cleanup")
+	if err == nil {
+		err = w.generation.CleanupVerification(ctx)
+	}
+	if err != nil {
+		w.state.setAttentionReason("generation_cleanup")
+		logger.Warn(ctx, "migration generation cleanup failed after fence", zap.Error(err))
+	}
 }

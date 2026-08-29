@@ -141,6 +141,74 @@ func TestCheckpointRecoverCreatesMinimalRecordAndFreshState(t *testing.T) {
 	}
 }
 
+func TestCheckpointRecoveryAuthorityIgnoresGenerationCaches(t *testing.T) {
+	ctx := context.Background()
+	checkpoint, _, startup := newCheckpointFixture(t)
+	recovery, err := checkpoint.Recover(ctx, startup)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	objects := newMemoryGenerationObjects()
+	generations, err := newGenerationStore(objects, startup.Job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, descriptor := testChunk(t)
+	descriptor.Stage = stageSource
+	if err := generations.SaveChunk(ctx, "cache-cutover", stageSource, descriptor.ID, body, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	metadata := generationMetadata{
+		FormatVersion: generationFormatVersion,
+		GenerationID:  "cache-cutover",
+		RoundID:       "round-cache-cutover",
+		Phase:         PhaseCutoverReady,
+		Identity:      generationIdentityFromStartup(startup),
+		CreatedAt:     time.Unix(100, 0).UTC(),
+		Stages: map[generationStage]generationStageMetadata{
+			stageSource: completedStage([]chunkDescriptor{descriptor}),
+		},
+	}
+	if _, err := generations.SaveMetadata(ctx, metadata, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := generations.PublishComplete(ctx, metadata); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := checkpoint.Recover(ctx, startup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Record.Checkpoint.HighestPhase != PhaseSyncing || restarted.State.Snapshot().Phase != PhaseSyncing ||
+		!restarted.WritesAllowed || restarted.State.Snapshot().LastGeneration != nil {
+		t.Fatalf("generation cache changed checkpoint recovery: %+v", restarted)
+	}
+
+	startup.Phase = PhaseDualWriteRepairing
+	advanced, err := checkpoint.Recover(ctx, startup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := advanced.Record.Checkpoint
+	next.FenceIntent = true
+	if _, err := checkpoint.Update(ctx, advanced.Record, next); err != nil {
+		t.Fatal(err)
+	}
+	fenced, err := checkpoint.Recover(ctx, startup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fenced.WritesAllowed || !fenced.FenceRecoveryOnly || fenced.State.Snapshot().Phase != PhaseDualWriteRepairing ||
+		fenced.State.Snapshot().LastGeneration != nil {
+		t.Fatalf("generation cache bypassed durable fence: %+v", fenced)
+	}
+	if recovery.Record.Checkpoint.HighestPhase != PhaseSyncing {
+		t.Fatalf("initial recovery mutated after restart: %+v", recovery.Record.Checkpoint)
+	}
+}
+
 func TestCheckpointPhaseAdvanceRejectsRollbackAndIdentityMismatch(t *testing.T) {
 	store, fake, startup := newCheckpointFixture(t)
 	if _, err := store.Recover(context.Background(), startup); err != nil {

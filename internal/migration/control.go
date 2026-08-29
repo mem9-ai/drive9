@@ -108,6 +108,81 @@ type StatusOutput struct {
 	FenceIntent      bool                `json:"fence_intent"`
 	FenceComplete    bool                `json:"fence_complete"`
 	AttentionReason  string              `json:"attention_reason,omitempty"`
+	LargeScale       bool                `json:"large_scale,omitempty"`
+	Generation       *GenerationStatus   `json:"generation,omitempty"`
+}
+
+type GenerationStatus struct {
+	Stage                  string                  `json:"stage,omitempty"`
+	SourceGenerationID     string                  `json:"source_generation_id"`
+	TargetGenerationID     string                  `json:"target_generation_id"`
+	DiffGenerationID       string                  `json:"diff_generation_id"`
+	SourceComplete         bool                    `json:"source_complete"`
+	TargetComplete         bool                    `json:"target_complete"`
+	DiffComplete           bool                    `json:"diff_complete"`
+	SourceCount            int64                   `json:"source_count"`
+	TargetCount            int64                   `json:"target_count"`
+	BlockerCount           int64                   `json:"blocker_count"`
+	PendingCount           int64                   `json:"pending_count"`
+	ActiveCount            int64                   `json:"active_count"`
+	UnknownCount           int64                   `json:"unknown_count"`
+	FindingCounts          map[FindingKind]int64   `json:"finding_counts,omitempty"`
+	WorkCounts             map[string]int64        `json:"work_counts,omitempty"`
+	Stages                 []string                `json:"stages"`
+	MemoryUsedBytes        int64                   `json:"memory_used_bytes"`
+	MemoryPeakBytes        int64                   `json:"memory_peak_bytes"`
+	MemoryLimitBytes       int64                   `json:"memory_limit_bytes"`
+	HashReuseCount         int64                   `json:"hash_reuse_count"`
+	HashNewCount           int64                   `json:"hash_new_count"`
+	SourceDirectories      int64                   `json:"source_directories"`
+	SourceFiles            int64                   `json:"source_files"`
+	SourceLogicalBytes     int64                   `json:"source_logical_bytes"`
+	SourceWarnings         int64                   `json:"source_warnings"`
+	SourceBlockers         int64                   `json:"source_blockers"`
+	SourceScanDurationMS   int64                   `json:"source_scan_duration_ms"`
+	SourceHashDurationMS   int64                   `json:"source_hash_duration_ms"`
+	SourceScanRate         float64                 `json:"source_scan_rate"`
+	SourceHashRate         float64                 `json:"source_hash_rate"`
+	SourceQueueCapacity    int64                   `json:"source_queue_capacity"`
+	ManifestPages          int64                   `json:"manifest_pages"`
+	ManifestCursor         string                  `json:"manifest_cursor,omitempty"`
+	ManifestRawEntries     int64                   `json:"manifest_raw_entries"`
+	ManifestResponseBytes  int64                   `json:"manifest_response_bytes"`
+	ManifestEmptyPages     int64                   `json:"manifest_empty_pages"`
+	ManifestCursorAdvances int64                   `json:"manifest_cursor_advances"`
+	ManifestSortRuns       int64                   `json:"manifest_sort_runs"`
+	ManifestLastPageAt     time.Time               `json:"manifest_last_page_at,omitempty"`
+	ArtifactBytes          int64                   `json:"artifact_bytes"`
+	ApplyTotal             int64                   `json:"apply_total"`
+	ApplyVerified          int64                   `json:"apply_verified"`
+	ApplyPending           int64                   `json:"apply_pending"`
+	ApplyUnknown           int64                   `json:"apply_unknown"`
+	ApplyInFlight          int64                   `json:"apply_in_flight"`
+	ApplyRetry             int64                   `json:"apply_retry"`
+	ApplyFailed            int64                   `json:"apply_failed"`
+	InlineWorkers          int                     `json:"inline_workers"`
+	MultipartWorkers       int                     `json:"multipart_workers"`
+	CacheStatus            string                  `json:"cache_status,omitempty"`
+	RebuildReason          string                  `json:"rebuild_reason,omitempty"`
+	LastProgressAt         time.Time               `json:"last_progress_at,omitempty"`
+	LastStatusAt           time.Time               `json:"last_status_at,omitempty"`
+	BatchCount             int64                   `json:"batch_count"`
+	BatchPayloadBytes      int64                   `json:"batch_payload_bytes"`
+	BatchLatencyMS         int64                   `json:"batch_latency_ms"`
+	InlineFiles            int64                   `json:"inline_files"`
+	InlineBytes            int64                   `json:"inline_bytes"`
+	MultipartFiles         int64                   `json:"multipart_files"`
+	MultipartBytes         int64                   `json:"multipart_bytes"`
+	RetryableErrors        int64                   `json:"retryable_errors"`
+	RetryDelayMS           int64                   `json:"retry_delay_ms"`
+	BackoffUntil           time.Time               `json:"backoff_until,omitempty"`
+	RecentErrors           []GenerationRecentError `json:"recent_errors,omitempty"`
+}
+
+type GenerationRecentError struct {
+	Stage string    `json:"stage"`
+	Class string    `json:"class"`
+	At    time.Time `json:"at"`
 }
 
 type EBSStatusOutput struct {
@@ -372,6 +447,9 @@ func (w *Worker) handleControlLocked(ctx context.Context, output io.Writer, requ
 			return ErrIllegalAction
 		}
 		snapshot, written := w.state.Snapshot(), 0
+		if snapshot.LastGeneration != nil {
+			return w.writeGenerationDiff(ctx, output, request, snapshot.LastGeneration.DiffGenerationID)
+		}
 		if snapshot.LastComplete == nil {
 			return nil
 		}
@@ -405,6 +483,43 @@ func (w *Worker) handleControlLocked(ctx context.Context, output io.Writer, requ
 	}
 }
 
+func (w *Worker) writeGenerationDiff(ctx context.Context, output io.Writer, request ControlRequest, generationID string) error {
+	if w.generation == nil || w.startup == nil {
+		return ErrGenerationIncomplete
+	}
+	metadata, err := w.generation.LoadComplete(ctx, generationID, generationIdentityFromStartup(w.startup))
+	if err != nil {
+		return err
+	}
+	stage, exists := metadata.Stages[stageDiff]
+	if !exists || !stage.Complete {
+		return ErrGenerationIncomplete
+	}
+	reader := &sortRunReader{ctx: ctx, store: w.generation, generationID: generationID, chunks: stage.Chunks}
+	encoder := json.NewEncoder(output)
+	written := 0
+	for {
+		record, ok, err := reader.Next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		if record.Diff == nil || record.Diff.Finding == "" || request.Type != "" && request.Type != string(record.Diff.Finding) {
+			continue
+		}
+		finding := Finding{Path: record.Diff.Path, Kind: record.Diff.Finding, Severity: record.Diff.Severity}
+		if err := encoder.Encode(finding); err != nil {
+			return err
+		}
+		written++
+		if request.Limit > 0 && written == request.Limit {
+			return nil
+		}
+	}
+}
+
 func (w *Worker) statusOutput() StatusOutput {
 	snapshot := w.state.Snapshot()
 	status := StatusOutput{Phase: snapshot.Phase, StartupPhase: snapshot.Phase, RecoveryComplete: snapshot.RecoveryComplete, Current: snapshot.Current, Conditions: snapshot.Conditions, RepairMtimeFloor: snapshot.RepairMtimeFloor, CandidateCounts: snapshot.CandidateCounts, GraceCandidates: len(snapshot.Grace), CASRetry: len(snapshot.Retry), Backlog: len(snapshot.Retry), PendingRepairs: snapshot.PendingRepairs, InFlight: snapshot.ActiveOperations, Verification: snapshot.Verification, Findings: make(map[FindingKind]int)}
@@ -418,12 +533,46 @@ func (w *Worker) statusOutput() StatusOutput {
 		status.SpaceRef = w.startup.Job.Target.SpaceRef
 		status.Prefix = w.startup.Job.Target.Prefix
 		status.CredentialRef = w.startup.Space.CredentialRef
+		status.LargeScale = w.startup.LargeScale
 	}
 	if snapshot.LastComplete != nil {
 		status.SourceCount = len(snapshot.LastComplete.Source)
 		for _, finding := range snapshot.LastComplete.Findings {
 			status.Findings[finding.Kind]++
 		}
+	}
+	if snapshot.LastGeneration != nil {
+		status.SourceCount = saturatingInt(snapshot.LastGeneration.SourceCount)
+		for kind, count := range snapshot.LastGeneration.FindingCounts {
+			status.Findings[kind] = saturatingInt(count)
+		}
+		var generation GenerationStatus
+		if progress := w.largeProgress.Load(); progress != nil {
+			generation = *progress
+		}
+		generation.SourceGenerationID = snapshot.LastGeneration.SourceGenerationID
+		generation.TargetGenerationID = snapshot.LastGeneration.TargetGenerationID
+		generation.DiffGenerationID = snapshot.LastGeneration.DiffGenerationID
+		generation.SourceComplete = snapshot.LastGeneration.SourceComplete
+		generation.TargetComplete = snapshot.LastGeneration.TargetComplete
+		generation.DiffComplete = snapshot.LastGeneration.DiffComplete
+		generation.SourceCount = snapshot.LastGeneration.SourceCount
+		generation.TargetCount = snapshot.LastGeneration.TargetCount
+		generation.BlockerCount = snapshot.LastGeneration.BlockerCount
+		generation.PendingCount = snapshot.LastGeneration.PendingCount
+		generation.ActiveCount = snapshot.LastGeneration.ActiveCount
+		generation.UnknownCount = snapshot.LastGeneration.UnknownCount
+		generation.FindingCounts = cloneMap(snapshot.LastGeneration.FindingCounts)
+		generation.WorkCounts = cloneMap(snapshot.LastGeneration.WorkCounts)
+		generation.Stages = []string{"source", "target", "diff"}
+		copy := cloneGenerationStatus(generation)
+		status.Generation = &copy
+		if w.memoryBudget != nil {
+			status.Generation.MemoryUsedBytes, status.Generation.MemoryPeakBytes, status.Generation.MemoryLimitBytes = w.memoryBudget.Snapshot()
+		}
+	} else if progress := w.largeProgress.Load(); progress != nil {
+		copy := cloneGenerationStatus(*progress)
+		status.Generation = &copy
 	}
 	if w.reporter != nil {
 		status.Reporter = w.reporter.snapshot()

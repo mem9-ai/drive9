@@ -77,6 +77,33 @@ func TestExecuteDispatchesSixCommands(t *testing.T) {
 	}
 }
 
+func TestExecuteLargeScaleIsDefaultOffAndExplicitlyPropagated(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "default off", args: []string{"plan", "-f", "/config.yaml"}},
+		{name: "explicit on", args: []string{"plan", "-f", "/config.yaml", "--large-scale"}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, _ := testDependencies(t)
+			deps.load = func(string, string, string, string, migration.Phase) (*migration.RuntimeStartup, error) {
+				return &migration.RuntimeStartup{Jobs: []*migration.Startup{{}}}, nil
+			}
+			deps.plan = func(_ context.Context, startup *migration.RuntimeStartup) (migration.PlanResult, error) {
+				if startup.LargeScale != tc.want || len(startup.Jobs) != 1 || startup.Jobs[0].LargeScale != tc.want {
+					t.Fatalf("large-scale propagation runtime=%t job=%t want=%t", startup.LargeScale, startup.Jobs[0].LargeScale, tc.want)
+				}
+				return migration.PlanResult{}, nil
+			}
+			if code := execute(tc.args, io.Discard, io.Discard, deps); code != exitSuccess {
+				t.Fatalf("exit = %d", code)
+			}
+		})
+	}
+}
+
 func containsCall(calls []string, want string) bool {
 	for _, call := range calls {
 		if call == want {
@@ -170,5 +197,8 @@ func TestExecuteUsesProvidedContextAndHelpDocumentsEveryCommand(t *testing.T) {
 		if !strings.Contains(output.String(), command) {
 			t.Fatalf("help omitted %q: %s", command, output.String())
 		}
+	}
+	if !strings.Contains(output.String(), "--large-scale") {
+		t.Fatalf("help omitted --large-scale: %s", output.String())
 	}
 }

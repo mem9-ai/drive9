@@ -404,6 +404,7 @@ type Startup struct {
 	Job              Job              `json:"job"`
 	Space            SpaceConfig      `json:"space"`
 	Phase            Phase            `json:"phase"`
+	LargeScale       bool             `json:"large_scale"`
 	ConfigHash       string           `json:"config_hash"`
 	Credential       CredentialSource `json:"-"`
 	acceptedTenantID string
@@ -416,8 +417,23 @@ type RuntimeStartup struct {
 	Config            *Config         `json:"config"`
 	Source            EBSSourceConfig `json:"source"`
 	Phase             Phase           `json:"phase"`
+	LargeScale        bool            `json:"large_scale"`
 	Jobs              []*Startup      `json:"jobs"`
 	targetCredentials map[string]CredentialSource
+}
+
+// SetLargeScale applies one process-local rollout mode to every resolved Job.
+// It intentionally does not alter ConfigHash or Checkpoint identity.
+func (s *RuntimeStartup) SetLargeScale(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.LargeScale = enabled
+	for _, job := range s.Jobs {
+		if job != nil {
+			job.LargeScale = enabled
+		}
+	}
 }
 
 // ConfigHash hashes only one Job's normalized immutable configuration.

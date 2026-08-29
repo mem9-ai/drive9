@@ -75,6 +75,80 @@ type workerStatus struct {
 	FenceIntent      bool               `json:"fence_intent"`
 	FenceComplete    bool               `json:"fence_complete"`
 	AttentionReason  string             `json:"attention_reason,omitempty"`
+	LargeScale       bool               `json:"large_scale,omitempty"`
+	Generation       *workerGeneration  `json:"generation,omitempty"`
+}
+
+type workerGeneration struct {
+	Stage                  string                  `json:"stage,omitempty"`
+	SourceGenerationID     string                  `json:"source_generation_id"`
+	TargetGenerationID     string                  `json:"target_generation_id"`
+	DiffGenerationID       string                  `json:"diff_generation_id"`
+	SourceComplete         bool                    `json:"source_complete"`
+	TargetComplete         bool                    `json:"target_complete"`
+	DiffComplete           bool                    `json:"diff_complete"`
+	SourceCount            int64                   `json:"source_count"`
+	TargetCount            int64                   `json:"target_count"`
+	BlockerCount           int64                   `json:"blocker_count"`
+	PendingCount           int64                   `json:"pending_count"`
+	ActiveCount            int64                   `json:"active_count"`
+	UnknownCount           int64                   `json:"unknown_count"`
+	FindingCounts          map[string]int64        `json:"finding_counts,omitempty"`
+	WorkCounts             map[string]int64        `json:"work_counts,omitempty"`
+	Stages                 []string                `json:"stages"`
+	MemoryUsedBytes        int64                   `json:"memory_used_bytes"`
+	MemoryPeakBytes        int64                   `json:"memory_peak_bytes"`
+	MemoryLimitBytes       int64                   `json:"memory_limit_bytes"`
+	HashReuseCount         int64                   `json:"hash_reuse_count"`
+	HashNewCount           int64                   `json:"hash_new_count"`
+	SourceDirectories      int64                   `json:"source_directories"`
+	SourceFiles            int64                   `json:"source_files"`
+	SourceLogicalBytes     int64                   `json:"source_logical_bytes"`
+	SourceWarnings         int64                   `json:"source_warnings"`
+	SourceBlockers         int64                   `json:"source_blockers"`
+	SourceScanDurationMS   int64                   `json:"source_scan_duration_ms"`
+	SourceHashDurationMS   int64                   `json:"source_hash_duration_ms"`
+	SourceScanRate         float64                 `json:"source_scan_rate"`
+	SourceHashRate         float64                 `json:"source_hash_rate"`
+	SourceQueueCapacity    int64                   `json:"source_queue_capacity"`
+	ManifestPages          int64                   `json:"manifest_pages"`
+	ManifestCursor         string                  `json:"manifest_cursor,omitempty"`
+	ManifestRawEntries     int64                   `json:"manifest_raw_entries"`
+	ManifestResponseBytes  int64                   `json:"manifest_response_bytes"`
+	ManifestEmptyPages     int64                   `json:"manifest_empty_pages"`
+	ManifestCursorAdvances int64                   `json:"manifest_cursor_advances"`
+	ManifestSortRuns       int64                   `json:"manifest_sort_runs"`
+	ManifestLastPageAt     time.Time               `json:"manifest_last_page_at,omitempty"`
+	ArtifactBytes          int64                   `json:"artifact_bytes"`
+	ApplyTotal             int64                   `json:"apply_total"`
+	ApplyVerified          int64                   `json:"apply_verified"`
+	ApplyPending           int64                   `json:"apply_pending"`
+	ApplyUnknown           int64                   `json:"apply_unknown"`
+	ApplyInFlight          int64                   `json:"apply_in_flight"`
+	ApplyRetry             int64                   `json:"apply_retry"`
+	ApplyFailed            int64                   `json:"apply_failed"`
+	InlineWorkers          int                     `json:"inline_workers"`
+	MultipartWorkers       int                     `json:"multipart_workers"`
+	CacheStatus            string                  `json:"cache_status,omitempty"`
+	RebuildReason          string                  `json:"rebuild_reason,omitempty"`
+	LastProgressAt         time.Time               `json:"last_progress_at,omitempty"`
+	BatchCount             int64                   `json:"batch_count"`
+	BatchPayloadBytes      int64                   `json:"batch_payload_bytes"`
+	BatchLatencyMS         int64                   `json:"batch_latency_ms"`
+	InlineFiles            int64                   `json:"inline_files"`
+	InlineBytes            int64                   `json:"inline_bytes"`
+	MultipartFiles         int64                   `json:"multipart_files"`
+	MultipartBytes         int64                   `json:"multipart_bytes"`
+	RetryableErrors        int64                   `json:"retryable_errors"`
+	RetryDelayMS           int64                   `json:"retry_delay_ms"`
+	BackoffUntil           time.Time               `json:"backoff_until,omitempty"`
+	RecentErrors           []workerGenerationError `json:"recent_errors,omitempty"`
+}
+
+type workerGenerationError struct {
+	Stage string    `json:"stage"`
+	Class string    `json:"class"`
+	At    time.Time `json:"at"`
 }
 
 type workerStatusEnvelope struct {

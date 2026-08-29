@@ -45,6 +45,24 @@ func TestVerifyFullUnfilteredIdempotentAndRestartLocal(t *testing.T) {
 	}
 }
 
+func TestFinishVerificationUsesLargeScaleGenerationSummary(t *testing.T) {
+	worker := &Worker{state: NewState(PhaseDualWriteRepairing), now: func() time.Time { return testNow }}
+	snapshot := StateSnapshot{
+		Current:    RoundStatus{ScanComplete: true, Converged: false},
+		Conditions: Conditions{},
+		LastGeneration: &generationRoundSummary{
+			SourceCount: 6000000, BlockerCount: 2,
+		},
+	}
+	result, err := worker.finishVerification(VerificationState{RequestedAt: testNow}, snapshot)
+	if !errors.Is(err, ErrVerificationFailed) {
+		t.Fatalf("error = %v, want ErrVerificationFailed", err)
+	}
+	if result.SourceCount != 6000000 || result.MismatchCount != 2 || result.Status != "failed" {
+		t.Fatalf("verification = %+v", result)
+	}
+}
+
 func TestVerifyFullFailureOverlapAndControl(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a"), []byte("missing"), 0o600); err != nil {

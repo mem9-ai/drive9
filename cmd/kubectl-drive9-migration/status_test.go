@@ -84,6 +84,37 @@ func TestDecodeWorkerStatusValidation(t *testing.T) {
 	}
 }
 
+func TestDecodeWorkerStatusAcceptsLargeScaleGenerationSummary(t *testing.T) {
+	body := mutateStatusJSON(t, func(document map[string]any) {
+		document["large_scale"] = true
+		document["generation"] = map[string]any{
+			"source_generation_id": "source-a", "target_generation_id": "target-a", "diff_generation_id": "diff-a",
+			"source_count": 6000000, "target_count": 6000000, "blocker_count": 0, "pending_count": 0,
+			"source_complete": true, "target_complete": true, "diff_complete": true,
+			"manifest_raw_entries": 6000010, "manifest_response_bytes": 123456789,
+			"apply_in_flight": 0, "apply_retry": 3, "apply_failed": 1, "rebuild_reason": "cache_miss",
+			"active_count": 0, "unknown_count": 1, "retry_delay_ms": 2000,
+			"finding_counts": map[string]any{"content": 2}, "work_counts": map[string]any{"write": 2},
+			"recent_errors": []map[string]any{{"stage": "files", "class": "apply_rescan", "at": "2026-08-29T00:00:00Z"}},
+			"source_files":  5140000, "source_directories": 852800, "source_logical_bytes": 66571993088,
+			"source_scan_rate": 12000.5, "source_hash_rate": 9000.25, "source_queue_capacity": 32,
+			"stages": []string{"source", "target", "diff"},
+		}
+	})
+	_, statuses, err := decodeWorkerStatus(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := statuses[0].status
+	if !status.LargeScale || status.Generation == nil || status.Generation.SourceCount != 6000000 || status.Generation.DiffGenerationID != "diff-a" ||
+		!status.Generation.SourceComplete || status.Generation.ManifestRawEntries != 6000010 || status.Generation.ApplyRetry != 3 ||
+		status.Generation.RebuildReason != "cache_miss" || status.Generation.SourceFiles != 5140000 || status.Generation.SourceQueueCapacity != 32 ||
+		status.Generation.UnknownCount != 1 || status.Generation.RetryDelayMS != 2000 || status.Generation.WorkCounts["write"] != 2 ||
+		len(status.Generation.RecentErrors) != 1 {
+		t.Fatalf("status = %+v", status)
+	}
+}
+
 func TestDeriveJobStatus(t *testing.T) {
 	base := workerStatus{RuntimeState: "RUNNING", Phase: "SYNCING", StartupPhase: "SYNCING"}
 	for _, tc := range []struct {

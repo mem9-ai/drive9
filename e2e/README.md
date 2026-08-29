@@ -13,6 +13,7 @@ including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=loca
 
 | Script | What it validates |
 |--------|--------------------|
+| `migration_bulk_contract_test.go` | Opt-in live Client→Server #115 gate for Manifest cursor/empty-page behavior, partial BatchMkdir, duplicate delivery, commit-unknown re-observation, systemic failure, BatchChmod identity, and optional dedicated-shape fs_events persistence. Run through `make migration-server-contract` or the manual `Migration Large-Scale Gates` workflow |
 | `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download; set `DRIVE9_API_KEY` to skip provision and reuse an existing tenant (cleans up its test tree in that mode) |
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, default-slot `pack`/`unpack`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download; honors `DRIVE9_API_KEY` to skip provision and reuse an existing tenant |
 | `object-store-smoke-test.sh` | Local MinIO (docker/podman) or `OBJECT_S3_URI`: `fs mkdir/cp/ls/stat/cat/mv/rm`, stdin/stdout, rejected object ops, object FUSE mount writeback + remount, `mount status/health`, drain rejected. Does not need drive9-server. Set `OBJECT_STRICT_MOUNT=1` to fail if FUSE is missing |
@@ -57,6 +58,19 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | Local E2E `workflow_dispatch` with `run_all_e2e=1` | Everything above |
 | Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `image-extract-config-smoke-test.sh` (hosted control-plane + billable vision provider), `object-auth-smoke-test.sh` (tidbcloud-native + real object-store STS mint; `--auth=server` cannot run in local-e2e), `object-auth-s3-hosted-test.sh` / `object-auth-cos-hosted-test.sh` / `object-auth-tos-hosted-test.sh` (hosted S3/COS/TOS isolation/mount/refresh; same reason) |
+
+The live Migration #865/#115 contract is wired to the separate manual
+`Migration Large-Scale Gates` workflow because it requires a deployment that
+already contains Server #115 plus repository secrets
+`DRIVE9_MIGRATION_CONTRACT_BASE` and `DRIVE9_MIGRATION_CONTRACT_API_KEY`.
+For a local Server binary or an existing tenant, run:
+
+```bash
+make migration-server-contract \
+  MIGRATION_CONTRACT_BASE="$DRIVE9_BASE" \
+  MIGRATION_CONTRACT_API_KEY="$DRIVE9_API_KEY" \
+  MIGRATION_CONTRACT_SQL=1
+```
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.

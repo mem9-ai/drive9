@@ -108,6 +108,7 @@ func executeStartupCommand(ctx context.Context, command string, args []string, s
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("f", "", "path to config.yaml")
+	largeScale := flags.Bool("large-scale", false, "enable the large-scale bounded migration pipeline")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -124,6 +125,7 @@ func executeStartupCommand(ctx context.Context, command string, args []string, s
 	if err != nil {
 		return err
 	}
+	startup.SetLargeScale(*largeScale)
 	if command == "run" {
 		return deps.start(ctx, startup)
 	}
@@ -179,8 +181,8 @@ func parseJobMutation(command string, args []string, stderr io.Writer) (controlR
 
 func writeUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "usage: drive9-migration <plan|run|status|diff|verify-full|prepare-drive9-cutover> [options]")
-	_, _ = fmt.Fprintln(w, "  plan -f <config.yaml>                 validate all Jobs for one local EBS")
-	_, _ = fmt.Fprintln(w, "  run -f <config.yaml>                  run all Jobs for one local EBS")
+	_, _ = fmt.Fprintln(w, "  plan -f <config.yaml> [--large-scale] validate all Jobs for one local EBS")
+	_, _ = fmt.Fprintln(w, "  run -f <config.yaml> [--large-scale]  run all Jobs for one local EBS")
 	_, _ = fmt.Fprintln(w, "  status [--job-id ID] --output json    print process-local status")
 	_, _ = fmt.Fprintln(w, "  diff --job-id ID --output jsonl [--type T] [--limit N]")
 	_, _ = fmt.Fprintln(w, "  verify-full --job-id ID               run full verification for one Job")
