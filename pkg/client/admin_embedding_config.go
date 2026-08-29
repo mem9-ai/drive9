@@ -42,13 +42,6 @@ type AdminTenantEmbeddingConfigSetRequest struct {
 	Model      *string `json:"model,omitempty"`
 }
 
-type adminTenantEmbeddingConfigSetBody struct {
-	Enabled bool    `json:"enabled"`
-	APIBase *string `json:"api_base,omitempty"`
-	APIKey  *string `json:"api_key,omitempty"`
-	Model   *string `json:"model,omitempty"`
-}
-
 // AdminGetTenantEmbeddingConfig returns the effective embedding configuration
 // for one tenant.
 func (c *Client) AdminGetTenantEmbeddingConfig(ctx context.Context, query AdminTenantEmbeddingConfigGetRequest) (*AdminTenantEmbeddingConfig, error) {
@@ -70,12 +63,7 @@ func (c *Client) AdminSetTenantEmbeddingConfig(ctx context.Context, update Admin
 	if err != nil {
 		return nil, err
 	}
-	raw, err := json.Marshal(adminTenantEmbeddingConfigSetBody{
-		Enabled: update.Enabled,
-		APIBase: update.APIBase,
-		APIKey:  update.APIKey,
-		Model:   update.Model,
-	})
+	raw, err := json.Marshal(update)
 	if err != nil {
 		return nil, fmt.Errorf("marshal admin tenant embedding config set request: %w", err)
 	}
@@ -97,6 +85,7 @@ func adminTenantEmbeddingConfigPath(tenantID string) (string, error) {
 }
 
 func (c *Client) doAdminTenantEmbeddingConfig(req *http.Request, operation string) (*AdminTenantEmbeddingConfig, error) {
+	// Admin control-plane requests use TiDB Cloud headers; c.do would also attach the tenant Bearer credential.
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("admin tenant embedding config %s request: %w", operation, err)

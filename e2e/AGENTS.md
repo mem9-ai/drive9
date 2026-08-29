@@ -28,17 +28,19 @@ Use a hosted deployment by default. For local development on this machine, use
 Current dev deployments:
 
 ```bash
-# Dev
+# Dev (HTTP only; never use for credential-bearing hosted config smokes)
 export DRIVE9_BASE="http://k8s-dat9-dat9serv-d5e02e7d07-1645488597.ap-southeast-1.elb.amazonaws.com"
 
-# Dev (tidbcloud-native)
+# Dev, tidbcloud-native (HTTP only; same restriction)
 export DRIVE9_BASE="http://k8s-drive9ti-drive9se-b6bbe5ba6e-cee81207452d1185.elb.ap-southeast-1.amazonaws.com"
 
 # Prod
 export DRIVE9_BASE="https://api.drive9.ai"
 ```
 
-Use the dev value unless the environment owner announces a new endpoint.
+Use the dev values only for scripts that do not send control-plane or provider
+credentials. Image/video extract-config and embedding-config smokes require an
+explicit HTTPS endpoint.
 
 #### Run smoke scripts
 
@@ -150,6 +152,8 @@ bash e2e/image-extract-config-smoke-test.sh
 
 # Tenant video-extract config smoke. Manual-only and skip-if-env-missing.
 export DRIVE9_BASE="https://..."
+export DRIVE9_TIDBCLOUD_PUBLIC_KEY="..."
+export DRIVE9_TIDBCLOUD_PRIVATE_KEY="..."
 export DRIVE9_E2E_VIDEO_EXTRACT_API_BASE="https://..."
 export DRIVE9_E2E_VIDEO_EXTRACT_API_KEY="..."
 export DRIVE9_E2E_VIDEO_EXTRACT_MODEL="..."
@@ -160,6 +164,8 @@ bash e2e/video-extract-config-smoke-test.sh
 
 # Tenant embedding config/processing smoke. Model output must be 1024 dimensions.
 export DRIVE9_BASE="https://..."
+export DRIVE9_TIDBCLOUD_PUBLIC_KEY="..."
+export DRIVE9_TIDBCLOUD_PRIVATE_KEY="..."
 export DRIVE9_E2E_EMBED_API_BASE="https://..."
 export DRIVE9_E2E_EMBED_API_KEY="..."
 export DRIVE9_E2E_EMBED_MODEL="..."
@@ -664,8 +670,8 @@ vision provider, and a caller-provided MP4. Not wired into CI; skips before any
 HTTP request when a required variable is missing.
 
 1. Provision a disposable tenant and wait for `active`
-2. PUT a custom video config with `protocol:openai`; verify masked provider output
-3. Upload the MP4 and poll `?stat` until model-derived `semantic_text` containing the fixture's expected marker is written
+2. Require initial config `source=none`, then PUT a custom video config with `protocol:openai`; verify masked provider output
+3. Reject a marker present in the prompt; upload the MP4 via multipart and poll `?stat` until model-derived `semantic_text` containing the fixture's expected marker is written
 4. Disable the config, upload the MP4 again, and assert no extracted text appears
 5. Exit trap disables config, deletes the test tree, and deletes the tenant
 

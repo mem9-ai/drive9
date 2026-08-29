@@ -43,6 +43,7 @@ ROOT_PATH="video-extract-e2e"
 VIDEO_PATH="$ROOT_PATH/fixture.mp4"
 DISABLED_VIDEO_PATH="$ROOT_PATH/disabled.mp4"
 MARKER="$DRIVE9_E2E_VIDEO_EXPECTED_MARKER"
+VIDEO_PROMPT="Describe the actual visible content across the supplied video frames in one concise English sentence. Do not invent details."
 
 TENANT_ID=""
 OWNER_API_KEY=""
@@ -55,6 +56,7 @@ die() {
 }
 
 [[ "$BASE" == https://* ]] || die "DRIVE9_BASE must use https:// for hosted video extract smoke"
+[[ "${VIDEO_PROMPT,,}" != *"${MARKER,,}"* ]] || die "DRIVE9_E2E_VIDEO_EXPECTED_MARKER must not appear in the video prompt"
 
 for command in curl jq python3; do
   command -v "$command" >/dev/null || die "$command is required"
@@ -124,16 +126,14 @@ upload_video_fixture() {
   local remote_path="$1"
   local response code body upload_id plan_file complete_response complete_code complete_body
 
-  response="$(curl_response PUT "$BASE/v1/fs/$remote_path" owner \
-    -H 'Content-Type: video/mp4' \
-    -H "X-Dat9-Part-Checksums: $VIDEO_PART_CHECKSUMS" \
-    --data-binary "@$VIDEO_FIXTURE")" || die "video upload request failed"
+  response="$(
+    jq -nc --arg path "/$remote_path" --argjson total_size "$VIDEO_BYTES" --arg checksums "$VIDEO_PART_CHECKSUMS" \
+      '{path:$path,total_size:$total_size,part_checksums:($checksums|split(","))}' |
+      curl_response POST "$BASE/v1/uploads/initiate" owner -H 'Content-Type: application/json' --data-binary @-
+  )" || die "video multipart initiate request failed"
   code="$(http_code "$response")"
   body="$(json_body "$response")"
-  if [ "$code" = "200" ]; then
-    return 0
-  fi
-  [ "$code" = "202" ] || http_failure "video upload" "$code" "$body"
+  [ "$code" = "202" ] || http_failure "video multipart initiate" "$code" "$body"
 
   upload_id="$(printf '%s' "$body" | jq -r '.upload_id // empty')"
   [ -n "$upload_id" ] || die "video upload response omitted upload_id"
@@ -259,14 +259,25 @@ done
 printf 'PASS: tenant became active\n'
 
 config_url="$BASE/v1/admin/tenants/$TENANT_ID/extract-config/video"
+before_response="$(curl_response GET "$config_url" control-plane)" || die "initial video extract config request failed"
+before_code="$(http_code "$before_response")"
+before_body="$(json_body "$before_response")"
+[ "$before_code" = "200" ] || http_failure "initial video extract config GET" "$before_code" "$before_body"
+before_source="$(printf '%s' "$before_body" | jq -r '.source // empty')"
+case "$before_source" in
+  none) ;;
+  default) die "tenant has a process default video provider; hosted video-extract smoke requires source=none to prove tenant config usage" ;;
+  *) die "new tenant unexpectedly has video extract config source ${before_source:-unknown}" ;;
+esac
+
 config_response="$(
-  jq -nc '{
+  jq -nc --arg prompt "$VIDEO_PROMPT" '{
     enabled: true,
     api_base: env.DRIVE9_E2E_VIDEO_EXTRACT_API_BASE,
     api_key: env.DRIVE9_E2E_VIDEO_EXTRACT_API_KEY,
     model: env.DRIVE9_E2E_VIDEO_EXTRACT_MODEL,
     protocol: "openai",
-    prompt: "Describe the actual visible content across the supplied video frames in one concise English sentence. Do not invent details."
+    prompt: $prompt
   }' |
     curl_response PUT "$config_url" control-plane -H 'Content-Type: application/json' --data-binary @-
 )" || die "video extract config PUT request failed"
@@ -318,6 +329,7 @@ with open(sys.argv[1], "rb") as f:
 print(",".join(checksums))
 PY
 )" || die "video checksum calculation failed"
+VIDEO_BYTES="$(wc -c <"$VIDEO_FIXTURE" | tr -d '[:space:]')"
 
 upload_video_fixture "$VIDEO_PATH"
 printf 'PASS: uploaded video fixture\n'

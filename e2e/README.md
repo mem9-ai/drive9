@@ -101,15 +101,19 @@ Use a hosted deployment by default. For local development on this machine, use
 #### Deployment endpoints
 
 ```bash
-# Dev
+# Dev (HTTP only; never use for credential-bearing hosted config smokes)
 export DRIVE9_BASE="http://k8s-dat9-dat9serv-d5e02e7d07-1645488597.ap-southeast-1.elb.amazonaws.com"
 
-# Dev (tidbcloud-native)
+# Dev, tidbcloud-native (HTTP only; same restriction)
 export DRIVE9_BASE="http://k8s-drive9ti-drive9se-b6bbe5ba6e-cee81207452d1185.elb.ap-southeast-1.amazonaws.com"
 
 # Prod
 export DRIVE9_BASE="https://api.drive9.ai"
 ```
+
+The hosted image/video extract-config and embedding-config smokes send
+control-plane and provider credentials, so they require an explicit HTTPS
+endpoint and reject both HTTP dev endpoints above.
 
 #### Run smoke scripts
 
@@ -218,6 +222,8 @@ bash e2e/image-extract-config-smoke-test.sh
 
 # Tenant video-extract config + worker smoke. The fixture must be an MP4.
 export DRIVE9_BASE="https://..."
+export DRIVE9_TIDBCLOUD_PUBLIC_KEY="..."
+export DRIVE9_TIDBCLOUD_PRIVATE_KEY="..."
 export DRIVE9_E2E_VIDEO_EXTRACT_API_BASE="https://..."
 export DRIVE9_E2E_VIDEO_EXTRACT_API_KEY="..."
 export DRIVE9_E2E_VIDEO_EXTRACT_MODEL="..."
@@ -228,6 +234,8 @@ bash e2e/video-extract-config-smoke-test.sh
 
 # Tenant embedding-config + worker/query smoke. The model must return 1024 dimensions.
 export DRIVE9_BASE="https://..."
+export DRIVE9_TIDBCLOUD_PUBLIC_KEY="..."
+export DRIVE9_TIDBCLOUD_PRIVATE_KEY="..."
 export DRIVE9_E2E_EMBED_API_BASE="https://..."
 export DRIVE9_E2E_EMBED_API_KEY="..."
 export DRIVE9_E2E_EMBED_MODEL="..."
@@ -328,9 +336,11 @@ Useful knobs for existing-tenant runs:
 - `video-extract-config-smoke-test.sh` requires a caller-provided MP4 through
   `DRIVE9_E2E_VIDEO_FIXTURE_PATH` and a visible fixture fact through
   `DRIVE9_E2E_VIDEO_EXPECTED_MARKER`. It requires an explicit HTTPS
-  `DRIVE9_BASE`, sets `protocol:openai`, validates masked config output, polls
-  `semantic_text` for model-derived visual output containing that fixture fact,
-  then disables the config and verifies that a subsequent upload remains empty.
+  `DRIVE9_BASE` and initial `source=none`, rejects a marker already present in
+  its prompt, sets `protocol:openai`, validates masked config output, uploads by
+  the multipart protocol, polls `semantic_text` for model-derived visual output
+  containing that fixture fact, then disables the config and verifies that a
+  subsequent upload remains empty.
 - `embedding-config-smoke-test.sh` requires an OpenAI-compatible model that
   returns exactly 1024 dimensions, an explicit HTTPS `DRIVE9_BASE`, and an
   initial `source=none` config so the smoke proves the persisted tenant config
