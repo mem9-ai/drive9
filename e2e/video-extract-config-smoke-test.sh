@@ -56,7 +56,9 @@ die() {
 }
 
 [[ "$BASE" == https://* ]] || die "DRIVE9_BASE must use https:// for hosted video extract smoke"
-[[ "${VIDEO_PROMPT,,}" != *"${MARKER,,}"* ]] || die "DRIVE9_E2E_VIDEO_EXPECTED_MARKER must not appear in the video prompt"
+shopt -s nocasematch
+[[ "$VIDEO_PROMPT" != *"$MARKER"* ]] || die "DRIVE9_E2E_VIDEO_EXPECTED_MARKER must not appear in the video prompt"
+shopt -u nocasematch
 
 for command in curl jq python3; do
   command -v "$command" >/dev/null || die "$command is required"

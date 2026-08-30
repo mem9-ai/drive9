@@ -14,6 +14,14 @@ printf '%s\n' \
   'exit 99' >"$FAKE_BIN/curl"
 chmod +x "$FAKE_BIN/curl"
 
+fail_with_output() {
+  local output_file="$1"
+  shift
+  [ ! -f "$output_file" ] || cat "$output_file" >&2
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
 common_env=(
   "PATH=$FAKE_BIN:$PATH"
   "CURL_CALLED_FILE=$CURL_CALLED_FILE"
@@ -46,46 +54,40 @@ for script in "${scripts[@]}"; do
     rm -f "$CURL_CALLED_FILE"
     output_file="$FAKE_BIN/output"
     if env "${common_env[@]}" DRIVE9_BASE="$base" bash "$REPO_ROOT/$script" >"$output_file" 2>&1; then
-      printf 'FAIL: %s accepted insecure DRIVE9_BASE=%s\n' "$script" "$base" >&2
-      exit 1
+      fail_with_output "$output_file" "$script accepted insecure DRIVE9_BASE=$base"
     fi
     grep -q 'DRIVE9_BASE must use https://' "$output_file" || {
-      printf 'FAIL: %s did not report the HTTPS requirement\n' "$script" >&2
-      exit 1
+      fail_with_output "$output_file" "$script did not report the HTTPS requirement"
     }
     [ ! -e "$CURL_CALLED_FILE" ] || {
-      printf 'FAIL: %s called curl for insecure DRIVE9_BASE=%s\n' "$script" "$base" >&2
-      exit 1
+      fail_with_output "$output_file" "$script called curl for insecure DRIVE9_BASE=$base"
     }
   done
 
   rm -f "$CURL_CALLED_FILE"
   output_file="$FAKE_BIN/output"
-  env -u DRIVE9_BASE "${common_env[@]}" bash "$REPO_ROOT/$script" >"$output_file" 2>&1
+  if ! env -u DRIVE9_BASE "${common_env[@]}" bash "$REPO_ROOT/$script" >"$output_file" 2>&1; then
+    fail_with_output "$output_file" "$script did not skip successfully when DRIVE9_BASE was absent"
+  fi
   grep -q '^SKIP:' "$output_file" || {
-    printf 'FAIL: %s did not skip when DRIVE9_BASE was absent\n' "$script" >&2
-    exit 1
+    fail_with_output "$output_file" "$script did not report SKIP when DRIVE9_BASE was absent"
   }
   [ ! -e "$CURL_CALLED_FILE" ] || {
-    printf 'FAIL: %s called curl when DRIVE9_BASE was absent\n' "$script" >&2
-    exit 1
+    fail_with_output "$output_file" "$script called curl when DRIVE9_BASE was absent"
   }
 done
 
 rm -f "$CURL_CALLED_FILE"
 output_file="$FAKE_BIN/output"
-if env "${common_env[@]}" DRIVE9_BASE=https://drive9.invalid DRIVE9_E2E_VIDEO_EXPECTED_MARKER=video \
+if env "${common_env[@]}" DRIVE9_BASE=https://drive9.invalid DRIVE9_E2E_VIDEO_EXPECTED_MARKER=ViDeO \
   bash "$REPO_ROOT/e2e/video-extract-config-smoke-test.sh" >"$output_file" 2>&1; then
-  printf 'FAIL: video smoke accepted a marker present in its prompt\n' >&2
-  exit 1
+  fail_with_output "$output_file" "video smoke accepted a marker present in its prompt"
 fi
 grep -q 'must not appear in the video prompt' "$output_file" || {
-  printf 'FAIL: video smoke did not report the marker/prompt conflict\n' >&2
-  exit 1
+  fail_with_output "$output_file" "video smoke did not report the marker/prompt conflict"
 }
 [ ! -e "$CURL_CALLED_FILE" ] || {
-  printf 'FAIL: video smoke called curl for a marker/prompt conflict\n' >&2
-  exit 1
+  fail_with_output "$output_file" "video smoke called curl for a marker/prompt conflict"
 }
 
 printf 'PASS: hosted config smoke guards fail closed without network access\n'
