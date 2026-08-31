@@ -28,6 +28,7 @@ func TestAdminGetTenantExtractConfigSendsHeadersAndDecodesResponse(t *testing.T)
 			"api_base":   "https://provider.example.com",
 			"api_key":    "sk-a********",
 			"model":      "vision-model",
+			"protocol":   "openai",
 			"prompt":     "custom prompt",
 			"source":     "custom",
 			"updated_at": "2026-08-21T01:02:03Z",
@@ -54,7 +55,7 @@ func TestAdminGetTenantExtractConfigSendsHeadersAndDecodesResponse(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.APIBase == nil || *out.APIBase != "https://provider.example.com" || out.APIKey == nil || *out.APIKey != "sk-a********" || out.Model == nil || *out.Model != "vision-model" || out.Prompt == nil || *out.Prompt != "custom prompt" || out.UpdatedAt == nil || !out.UpdatedAt.Equal(updatedAt) || !out.Enabled || out.Source != "custom" {
+	if out.APIBase == nil || *out.APIBase != "https://provider.example.com" || out.APIKey == nil || *out.APIKey != "sk-a********" || out.Model == nil || *out.Model != "vision-model" || out.Protocol == nil || *out.Protocol != "openai" || out.Prompt == nil || *out.Prompt != "custom prompt" || out.UpdatedAt == nil || !out.UpdatedAt.Equal(updatedAt) || !out.Enabled || out.Source != "custom" {
 		t.Fatalf("response = %#v", out)
 	}
 }
@@ -64,6 +65,7 @@ func TestAdminSetTenantExtractConfigPreservesPartialFieldPresence(t *testing.T) 
 
 	enabled := false
 	prompt := ""
+	protocol := "qwen-asr"
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
@@ -91,13 +93,14 @@ func TestAdminSetTenantExtractConfigPreservesPartialFieldPresence(t *testing.T) 
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 		Enabled:    &enabled,
+		Protocol:   &protocol,
 		Prompt:     &prompt,
 	})
 	if err != nil {
 		t.Fatalf("AdminSetTenantExtractConfig: %v", err)
 	}
-	if len(gotBody) != 2 || gotBody["enabled"] != false || gotBody["prompt"] != "" {
-		t.Fatalf("request body = %#v, want explicit false and empty prompt only", gotBody)
+	if len(gotBody) != 3 || gotBody["enabled"] != false || gotBody["protocol"] != "qwen-asr" || gotBody["prompt"] != "" {
+		t.Fatalf("request body = %#v, want explicit false, protocol, and empty prompt only", gotBody)
 	}
 	for _, omitted := range []string{"api_base", "api_key", "model", "tenant_id", "media_type", "public_key", "private_key"} {
 		if _, ok := gotBody[omitted]; ok {
@@ -138,7 +141,7 @@ func TestAdminTenantExtractConfigPreservesOptionalResponsePresence(t *testing.T)
 	if out.APIBase == nil || *out.APIBase != "" || out.Prompt == nil || *out.Prompt != "" {
 		t.Fatalf("explicit empty values lost: %#v", out)
 	}
-	if out.APIKey != nil || out.Model != nil || out.UpdatedAt != nil {
+	if out.APIKey != nil || out.Model != nil || out.Protocol != nil || out.UpdatedAt != nil {
 		t.Fatalf("absent values decoded as present: %#v", out)
 	}
 }

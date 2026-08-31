@@ -61,6 +61,8 @@ die() {
   exit 1
 }
 
+[[ "$BASE" == https://* ]] || die "DRIVE9_BASE must use https:// for hosted image extract smoke"
+
 for command in curl jq; do
   command -v "$command" >/dev/null || die "$command is required"
 done
@@ -223,7 +225,8 @@ before_body="$(json_body "$before_response")"
 [ "$before_code" = "200" ] || http_failure "initial extract config GET" "$before_code" "$before_body"
 before_source="$(printf '%s' "$before_body" | jq -r '.source // empty')"
 case "$before_source" in
-  none|default) ;;
+  none) ;;
+  default) die "tenant has a process default image provider; hosted image-extract smoke requires source=none to prove tenant config usage" ;;
   *) die "new tenant unexpectedly has extract config source ${before_source:-unknown}" ;;
 esac
 before_canonical="$(printf '%s' "$before_body" | jq -S -c .)" || die "initial extract config GET returned invalid JSON"

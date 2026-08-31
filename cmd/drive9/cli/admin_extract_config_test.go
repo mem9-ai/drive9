@@ -35,6 +35,7 @@ func TestAdminTenantExtractConfigHelp(t *testing.T) {
 		"--api-base URL",
 		"--api-key KEY",
 		"--model MODEL",
+		"--protocol PROTOCOL",
 		"--prompt TEXT",
 		"non-empty when enabling",
 		"empty clears",
@@ -61,6 +62,7 @@ func TestAdminTenantExtractConfigGetPrintsTableAndHeaders(t *testing.T) {
 			"api_base":   "https://provider.example.com",
 			"api_key":    "plain-provider-key",
 			"model":      "audio-model",
+			"protocol":   "qwen-asr",
 			"prompt":     "extract audio",
 			"source":     "custom",
 			"updated_at": "2026-08-21T01:02:03Z",
@@ -84,7 +86,7 @@ func TestAdminTenantExtractConfigGetPrintsTableAndHeaders(t *testing.T) {
 	if strings.Contains(stdout, "plain-provider-key") {
 		t.Fatal("table output leaked the provider API key")
 	}
-	for _, want := range []string{"MEDIA_TYPE", "ENABLED", "SOURCE", "API_BASE", "API_KEY", "MODEL", "PROMPT", "UPDATED_AT", "audio", "true", "custom", "plai********"} {
+	for _, want := range []string{"MEDIA_TYPE", "ENABLED", "SOURCE", "API_BASE", "API_KEY", "MODEL", "PROTOCOL", "PROMPT", "UPDATED_AT", "audio", "true", "custom", "qwen-asr", "plai********"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("output missing %q:\n%s", want, stdout)
 		}
@@ -236,6 +238,7 @@ func TestAdminTenantExtractConfigSetFullProviderBody(t *testing.T) {
 			"--api-base", "https://provider.example.com",
 			"--api-key", "provider-secret",
 			"--model", "vision-model",
+			"--protocol", "openai",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
 			"--json",
@@ -244,7 +247,7 @@ func TestAdminTenantExtractConfigSetFullProviderBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("set: %v", err)
 	}
-	if gotBody["enabled"] != true || gotBody["api_base"] != "https://provider.example.com" || gotBody["api_key"] != "provider-secret" || gotBody["model"] != "vision-model" || len(gotBody) != 4 {
+	if gotBody["enabled"] != true || gotBody["api_base"] != "https://provider.example.com" || gotBody["api_key"] != "provider-secret" || gotBody["model"] != "vision-model" || gotBody["protocol"] != "openai" || len(gotBody) != 5 {
 		t.Fatalf("body = %#v", gotBody)
 	}
 }
