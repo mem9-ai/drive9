@@ -137,7 +137,10 @@ func buildVectorSearchQuery(queryEmbedding []float32, pathPrefix string, limit i
 }
 
 // buildVectorSearchQueryScoped builds the vector search query for the given
-// scope.
+// scope. Callers pass an application-computed vector literal, so this uses
+// VEC_COSINE_DISTANCE (two-vector distance, works on plain VECTOR(n) columns
+// and self-hosted TiDB) rather than the TiDB Cloud VEC_EMBED_* auto-embedding
+// functions used by the *ByText builders below, which operate on query text.
 func buildVectorSearchQueryScoped(scope Scope, queryEmbedding []float32, pathPrefix string, limit int) (string, []any, bool) {
 	if len(queryEmbedding) == 0 {
 		return "", nil, false
@@ -156,10 +159,10 @@ func buildVectorSearchQueryScoped(scope Scope, queryEmbedding []float32, pathPre
 	args = append(args, vecParam, limit)
 
 	q := `SELECT fn.path, fn.name, i.size_bytes,
-		VEC_EMBED_COSINE_DISTANCE(s.embedding, ?) AS distance
+		VEC_COSINE_DISTANCE(s.embedding, ?) AS distance
 		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
-		ORDER BY VEC_EMBED_COSINE_DISTANCE(s.embedding, ?)
+		ORDER BY VEC_COSINE_DISTANCE(s.embedding, ?)
 	LIMIT ?`
 	return q, args, true
 }
@@ -212,6 +215,12 @@ func (s *Store) VectorSearchDescriptionByText(ctx context.Context, queryText, pa
 	return s.runVectorSearch(ctx, q, args)
 }
 
+// buildVectorSearchDescriptionQueryScoped builds the description-embedding
+// vector search query for the given scope. Callers pass an
+// application-computed vector literal, so this uses VEC_COSINE_DISTANCE
+// (two-vector distance, works on plain VECTOR(n) columns and self-hosted
+// TiDB) rather than the TiDB Cloud VEC_EMBED_* auto-embedding functions used
+// by the *ByText builder below, which operates on query text.
 func buildVectorSearchDescriptionQueryScoped(scope Scope, queryEmbedding []float32, pathPrefix string, limit int) (string, []any, bool) {
 	if len(queryEmbedding) == 0 {
 		return "", nil, false
@@ -230,10 +239,10 @@ func buildVectorSearchDescriptionQueryScoped(scope Scope, queryEmbedding []float
 	args = append(args, vecParam, limit)
 
 	q := `SELECT fn.path, fn.name, i.size_bytes,
-		VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?) AS distance
+		VEC_COSINE_DISTANCE(s.description_embedding, ?) AS distance
 		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
-		ORDER BY VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?)
+		ORDER BY VEC_COSINE_DISTANCE(s.description_embedding, ?)
 	LIMIT ?`
 	return q, args, true
 }
