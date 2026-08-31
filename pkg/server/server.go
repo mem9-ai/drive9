@@ -5582,7 +5582,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to encrypt db password", err)
 	}
 	logProvisionStage(ctx, "provision_db_password_encrypted", tenantID, provider, stageStarted)
-	dbtls := dbTLSForProvisionedTenant(provider)
+	dbtls := dbTLSForProvisionedCluster(provider, cluster)
 	stageStarted = time.Now()
 	connection := &meta.Tenant{
 		DBHost:           cluster.Host,
@@ -5733,7 +5733,7 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 		DBPort:         cluster.Port,
 		DBUser:         cluster.Username,
 		DBName:         cluster.DBName,
-		DBTLS:          dbTLSForProvisionedTenant(provider),
+		DBTLS:          dbTLSForProvisionedCluster(provider, cluster),
 		ClaimURL:       cluster.ClaimURL,
 		ClaimExpiresAt: cluster.ClaimExpiresAt,
 	}
@@ -5775,6 +5775,16 @@ func dbTLSForProvisionedTenant(provider string) bool {
 	}
 	v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
 	return v != "1" && v != "true" && v != "yes"
+}
+
+// dbTLSForProvisionedCluster resolves the persisted db_tls bit for a freshly
+// provisioned cluster. Local tenants inherit the TLS setting of the admin DSN
+// the local provisioner connected with; other providers keep provider rules.
+func dbTLSForProvisionedCluster(provider string, cluster *tenant.ClusterInfo) bool {
+	if provider == tenant.ProviderLocal {
+		return cluster != nil && cluster.DBTLS
+	}
+	return dbTLSForProvisionedTenant(provider)
 }
 
 func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {

@@ -716,6 +716,66 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 	}
 }
 
+func TestDBTLSForProvisionedCluster(t *testing.T) {
+	cases := []struct {
+		name     string
+		provider string
+		cluster  *tenant.ClusterInfo
+		setup    func(t *testing.T)
+		want     bool
+	}{
+		{
+			name:     "local with DBTLS true",
+			provider: tenant.ProviderLocal,
+			cluster:  &tenant.ClusterInfo{DBTLS: true},
+			want:     true,
+		},
+		{
+			name:     "local with DBTLS false",
+			provider: tenant.ProviderLocal,
+			cluster:  &tenant.ClusterInfo{DBTLS: false},
+			want:     false,
+		},
+		{
+			name:     "local with nil cluster",
+			provider: tenant.ProviderLocal,
+			cluster:  nil,
+			want:     false,
+		},
+		{
+			name:     "tidb_zero",
+			provider: tenant.ProviderTiDBZero,
+			cluster:  &tenant.ClusterInfo{},
+			want:     true,
+		},
+		{
+			name:     "tidb_cloud_native with env unset",
+			provider: tenant.ProviderTiDBCloudNative,
+			cluster:  &tenant.ClusterInfo{},
+			want:     true,
+		},
+		{
+			name:     "tidb_cloud_native with private endpoint env set",
+			provider: tenant.ProviderTiDBCloudNative,
+			cluster:  &tenant.ClusterInfo{},
+			setup: func(t *testing.T) {
+				t.Setenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT", "1")
+			},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.setup != nil {
+				tc.setup(t)
+			}
+			if got := dbTLSForProvisionedCluster(tc.provider, tc.cluster); got != tc.want {
+				t.Fatalf("dbTLSForProvisionedCluster(%q, %+v) = %v, want %v", tc.provider, tc.cluster, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -833,6 +893,102 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	if provider != tenant.ProviderTiDBZero || clusterID != "cluster-1" {
 		t.Fatalf("unexpected tenant row: status=%s provider=%s cluster_id=%s", status, provider, clusterID)
 	}
+}
+
+func TestProvisionLocalProviderPersistsClusterDBTLS(t *testing.T) {
+	parsed, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := "127.0.0.1"
+	port := 4000
+	if parsed.Addr != "" {
+		h, p, ok := strings.Cut(parsed.Addr, ":")
+		if ok {
+			host = h
+			_, _ = fmt.Sscanf(p, "%d", &port)
+		}
+	}
+
+	run := func(t *testing.T, dbtls bool, dbName string) {
+		metaStore, err := meta.Open(testDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = metaStore.Close() }()
+		testtidb.ResetMetaDB(t, metaStore.DB())
+
+		master := make([]byte, 32)
+		if _, err := rand.Read(master); err != nil {
+			t.Fatal(err)
+		}
+		enc, err := encrypt.NewLocalAESEncryptor(master)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+		defer pool.Close()
+
+		tokenSecret := make([]byte, 32)
+		if _, err := rand.Read(tokenSecret); err != nil {
+			t.Fatal(err)
+		}
+
+		prov := &fakeProvisioner{provider: tenant.ProviderLocal, cluster: &tenant.ClusterInfo{
+			ClusterID: dbName,
+			Host:      host,
+			Port:      port,
+			Username:  parsed.User,
+			Password:  parsed.Passwd,
+			DBName:    dbName,
+			DBTLS:     dbtls,
+		}}
+
+		srv := NewWithConfig(Config{
+			Meta:        metaStore,
+			Pool:        pool,
+			Provisioner: prov,
+			TokenSecret: tokenSecret,
+		})
+		defer srv.Close()
+
+		res, err := srv.provisionTenant(context.Background(), provisionTenantOptions{
+			Provider:     tenant.ProviderLocal,
+			KeyName:      "default",
+			TokenVersion: 1,
+		})
+		if err != nil {
+			t.Fatalf("provisionTenant: %v", err)
+		}
+
+		// db_tls and the tenant DSN are both finalized synchronously inside
+		// provisionTenant (connection persist happens before it returns), so
+		// there is no need to wait for the async schema-init worker to flip
+		// the tenant to active before asserting on either.
+		if dbtls {
+			if !strings.Contains(res.TenantDSN, "tls=true") {
+				t.Fatalf("TenantDSN = %q, want it to contain tls=true", res.TenantDSN)
+			}
+		} else if strings.Contains(res.TenantDSN, "tls=") {
+			t.Fatalf("TenantDSN = %q, want no tls= param", res.TenantDSN)
+		}
+
+		var dbTLSInt int
+		row := metaStore.DB().QueryRow("SELECT db_tls FROM tenants WHERE id = ?", res.TenantID)
+		if err := row.Scan(&dbTLSInt); err != nil {
+			t.Fatal(err)
+		}
+		if gotDBTLS := dbTLSInt != 0; gotDBTLS != dbtls {
+			t.Fatalf("persisted db_tls = %v, want %v", gotDBTLS, dbtls)
+		}
+	}
+
+	t.Run("DBTLS true", func(t *testing.T) {
+		run(t, true, "drive9_local_dbtls_true")
+	})
+	t.Run("DBTLS false", func(t *testing.T) {
+		run(t, false, "drive9_local_dbtls_false")
+	})
 }
 
 func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
