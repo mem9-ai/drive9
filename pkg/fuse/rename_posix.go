@@ -7,6 +7,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 const stickyPermissionBit uint32 = 0o1000
@@ -95,9 +96,12 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 		return oldInfo, renamePathInfo{}, st
 	}
 
-	newInfo, err := fs.renamePathInfo(ctx, newP)
-	if err != nil {
-		return oldInfo, newInfo, httpToFuseStatus(err)
+	newInfo := renamePathInfo{path: newP}
+	if !fs.gvisorCompatibilityEnabled() || !fs.hasNegativePathCache(newP) {
+		newInfo, err = fs.renamePathInfo(ctx, newP)
+		if err != nil {
+			return oldInfo, newInfo, httpToFuseStatus(err)
+		}
 	}
 
 	if newInfo.exists {
@@ -186,9 +190,7 @@ func (fs *Dat9FS) renamePathInfo(ctx context.Context, p string) (renamePathInfo,
 		return renameInfoFromEntry(p, entry, false), nil
 	}
 
-	statStart := fs.perfStart()
-	stat, err := fs.client.StatCtx(ctx, fs.remotePath(p))
-	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
+	stat, err := fs.renameStatWithTransientRetry(ctx, p)
 	if err != nil {
 		if isNotFoundErr(err) {
 			return info, nil
@@ -211,6 +213,49 @@ func (fs *Dat9FS) renamePathInfo(ctx context.Context, p string) (renamePathInfo,
 		return info, syscall.EIO
 	}
 	return renameInfoFromEntry(p, entry, false), nil
+}
+
+func (fs *Dat9FS) renameStatWithTransientRetry(ctx context.Context, p string) (*client.StatResult, error) {
+	gvisorCompat := fs.gvisorCompatibilityEnabled()
+	generation := fs.mountViewGeneration.Load()
+	statPath := func(statCtx context.Context) (*client.StatResult, error) {
+		statStart := fs.perfStart()
+		stat, err := fs.client.StatCtx(statCtx, fs.remotePath(p))
+		fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
+		return stat, err
+	}
+	viewCurrent := func() bool {
+		return fs.mountViewGeneration.Load() == generation
+	}
+
+	stat, err := statPath(ctx)
+	if gvisorCompat && !viewCurrent() {
+		return nil, context.Canceled
+	}
+	if err == nil || isNotFoundErr(err) || !gvisorCompat || !isTransientLookupErr(err) {
+		return stat, err
+	}
+
+	lastErr := err
+	for range fs.lookupStatRetryCount() {
+		if !viewCurrent() {
+			return nil, context.Canceled
+		}
+		retryCtx, retryCancel := context.WithTimeout(context.WithoutCancel(ctx), fs.lookupStatRetryTimeout())
+		stat, err = statPath(retryCtx)
+		retryCancel()
+		if !viewCurrent() {
+			return nil, context.Canceled
+		}
+		if err == nil || isNotFoundErr(err) {
+			return stat, err
+		}
+		if !isTransientLookupErr(err) {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 func renameInfoFromEntry(p string, entry *InodeEntry, special bool) renamePathInfo {

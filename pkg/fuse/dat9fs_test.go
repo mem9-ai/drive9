@@ -25812,7 +25812,7 @@ func TestReadOpenHandleSnapshotRetriesTransientRangeRead(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	got, err := fs.readOpenHandleSnapshot(ctx, "/snapshot.bin", int64(len(data)))
+	got, err := fs.readOpenHandleSnapshot(ctx, "/snapshot.bin", int64(len(data)), 0)
 	if err != nil {
 		t.Fatalf("readOpenHandleSnapshot: %v", err)
 	}

@@ -51,6 +51,7 @@ func (cq *CommitQueue) directPutThreshold() int64 {
 type CommitEntry struct {
 	Path                 string
 	Inode                uint64
+	MutationSeq          uint64
 	BaseRev              int64 // revision when we started editing
 	Size                 int64
 	Kind                 PendingKind
