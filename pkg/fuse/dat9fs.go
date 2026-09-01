@@ -1966,8 +1966,19 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 		return false
 	}
 	state, ok := fs.committedMutation(fh.Ino)
-	if !ok || state.committedRevision <= 0 || fh.DirtySeq > state.committedSeq {
+	if !ok || fh.DirtySeq > state.committedSeq || state.committedRevision <= 0 && !fs.layerEnabled() {
 		return false
+	}
+	var layerData []byte
+	if state.committedRevision <= 0 && fs.layerEnabled() {
+		if fs.shadowStore == nil {
+			return false
+		}
+		var err error
+		layerData, err = fs.shadowStore.ReadAll(fh.Path)
+		if err != nil || int64(len(layerData)) != state.committedSize {
+			return false
+		}
 	}
 
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
@@ -1991,8 +2002,18 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 		}
 	}
 	fs.inodes.UpdateSize(fh.Ino, state.committedSize)
-	if fh.Dirty != nil && state.committedRevision > 0 {
-		fs.rebindCleanWriteBufferToRemoteLocked(fh, state.committedSize)
+	if fh.Dirty != nil {
+		if state.committedRevision > 0 {
+			fs.rebindCleanWriteBufferToRemoteLocked(fh, state.committedSize)
+		} else {
+			next := fs.newWriteBuffer(fh.Path, maxPreloadSize, fh.Dirty.PartSize())
+			if len(layerData) > 0 {
+				_, _ = next.Write(0, layerData)
+			}
+			next.ClearDirty()
+			fh.Dirty = next
+			fh.OrigSize = state.committedSize
+		}
 	}
 	clearReadTargetForLockedHandle(fh)
 	return true
@@ -14107,6 +14128,13 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 
 	size := fh.Dirty.Size()
 	if fs.layerEnabled() {
+		unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
+		defer unlockRemoteCommit()
+		if fs.discardSupersededMutationLocked(fh) {
+			fs.removeHandleOwnedStagingLocked(fh)
+			phase = "superseded-layer-mutation"
+			return gofuse.OK
+		}
 		// Freeze the upsert base BEFORE any lazy fetch. The layer branch
 		// deliberately reads the un-adopted BaseRev (expectedRevisionForHandle,
 		// not the Locked variant) and holds fh.mu for the whole branch, so a
@@ -14132,6 +14160,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			safeLogPrintf("layer flush failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
+		fs.recordCommittedMutation(fh.Ino, fh.DirtySeq, expectedRevision, size)
 		if fh.Dirty != nil {
 			fh.Dirty.ClearDirty()
 		}
@@ -15036,10 +15065,15 @@ func (fs *Dat9FS) captureHandleStagingGensLocked(fh *FileHandle) StagingGens {
 }
 
 func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) {
-	if fs == nil || entry == nil || fs.layerEnabled() {
+	if fs == nil || entry == nil {
 		return
 	}
 	if entry.mutationPublished {
+		return
+	}
+	if fs.layerEnabled() {
+		entry.mutationPublished = true
+		fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, entry.BaseRev, entry.Size)
 		return
 	}
 	committedRev = fs.resolveCommittedMutationRevision(entry.Path, committedRev, entry.BaseRev)
