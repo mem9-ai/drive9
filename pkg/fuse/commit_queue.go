@@ -85,6 +85,7 @@ type CommitEntry struct {
 	canceled              bool
 	cancelCommit          context.CancelFunc
 	cancelUpload          context.CancelFunc
+	mutationPublished     bool
 	payload               []byte
 	payloadBound          bool
 }

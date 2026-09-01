@@ -15039,7 +15039,14 @@ func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) 
 	if fs == nil || entry == nil || fs.layerEnabled() {
 		return
 	}
+	if entry.mutationPublished {
+		return
+	}
 	committedRev = fs.resolveCommittedMutationRevision(entry.Path, committedRev, entry.BaseRev)
+	if committedRev <= 0 {
+		return
+	}
+	entry.mutationPublished = true
 	fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, committedRev, entry.Size)
 	if committedRev > 0 {
 		fs.refreshCommittedRevisionForOpenHandlesWithSize(entry.Path, committedRev, nil, entry.Size)
