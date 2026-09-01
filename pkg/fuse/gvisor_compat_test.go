@@ -731,6 +731,37 @@ func TestGVisorCompatDiscardSupersededMutationRemovesOwnedStaging(t *testing.T) 
 	}
 }
 
+func TestGVisorCompatLayerDiscardRebindsCommittedShadow(t *testing.T) {
+	const filePath = "/layer-file.txt"
+	want := []byte("layer committed content")
+	opts := &MountOptions{GVisorCompat: true, LayerRef: "layer-test"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	_, stale := newGVisorMutationHandle(t, fs, filePath, ino)
+	if err := shadow.WriteFull(filePath, want, 0); err != nil {
+		t.Fatal(err)
+	}
+	newerSeq := fs.markDirtySize(ino, int64(len(want)))
+	fs.recordCommittedMutation(ino, newerSeq, 0, int64(len(want)))
+	stale.Lock()
+	discarded := fs.discardSupersededMutationLocked(stale)
+	got := stale.Dirty.Bytes()
+	stale.Unlock()
+	if !discarded {
+		t.Fatal("layer sibling was not discarded")
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("layer rebound content = %q, want %q", got, want)
+	}
+}
+
 func TestGVisorCompatQueueSuccessSynthesizesUnknownRevision(t *testing.T) {
 	const filePath = "/unknown-revision.txt"
 	opts := &MountOptions{GVisorCompat: true}
