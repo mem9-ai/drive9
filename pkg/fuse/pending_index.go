@@ -564,6 +564,50 @@ func (idx *PendingIndex) MarkConflict(remotePath string) error {
 	return nil
 }
 
+// MarkConflictIfGeneration is MarkConflict scoped to a specific pending-entry
+// generation. It returns false without touching disk or memory when a newer
+// same-path Put has already replaced the entry, so a stale commit failure does
+// not poison fresher pending data.
+func (idx *PendingIndex) MarkConflictIfGeneration(remotePath string, expectedGen uint64) (bool, error) {
+	if expectedGen == 0 {
+		return true, idx.MarkConflict(remotePath)
+	}
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
+	idx.mu.RLock()
+	meta, ok := idx.items[remotePath]
+	if !ok {
+		idx.mu.RUnlock()
+		return true, nil
+	}
+	if meta.Generation != expectedGen {
+		idx.mu.RUnlock()
+		return false, nil
+	}
+	conflicted := *meta
+	conflicted.Kind = PendingConflict
+	idx.mu.RUnlock()
+
+	metaBytes, err := json.Marshal(&conflicted)
+	if err != nil {
+		return false, fmt.Errorf("pending index marshal conflict: %w", err)
+	}
+	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
+	if err := atomicWrite(metaPath, metaBytes); err != nil {
+		return false, fmt.Errorf("pending index write conflict: %w", err)
+	}
+
+	idx.mu.Lock()
+	if m, exists := idx.items[remotePath]; exists && m.Generation == expectedGen {
+		m.Kind = PendingConflict
+		idx.mu.Unlock()
+		return true, nil
+	}
+	idx.mu.Unlock()
+	return false, nil
+}
+
 // Count returns the number of pending entries.
 func (idx *PendingIndex) Count() int {
 	idx.mu.RLock()
