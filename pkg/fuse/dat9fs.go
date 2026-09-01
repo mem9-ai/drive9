@@ -322,6 +322,7 @@ type dirtyInodeState struct {
 
 type inodeMutationState struct {
 	latestSeq         uint64
+	stagedSeq         uint64
 	committedSeq      uint64
 	committedRevision int64
 	committedSize     int64
@@ -1890,6 +1891,19 @@ func (fs *Dat9FS) clearDirtySize(ino uint64, seq uint64) {
 	}
 }
 
+func (fs *Dat9FS) recordStagedMutation(ino, seq uint64) {
+	if !fs.gvisorCompatibilityEnabled() || ino == 0 || seq == 0 {
+		return
+	}
+	fs.dirtyMu.Lock()
+	state := fs.mutationInodes[ino]
+	if seq > state.stagedSeq {
+		state.stagedSeq = seq
+	}
+	fs.mutationInodes[ino] = state
+	fs.dirtyMu.Unlock()
+}
+
 func (fs *Dat9FS) gvisorCompatibilityEnabled() bool {
 	return fs != nil && fs.opts != nil && fs.opts.GVisorCompat
 }
@@ -1919,6 +1933,20 @@ func (fs *Dat9FS) recordCommittedMutation(ino uint64, seq uint64, revision int64
 	fs.dirtyMu.Unlock()
 }
 
+func (fs *Dat9FS) resolveCommittedMutationRevision(localPath string, committedRev, expectedRevision int64) int64 {
+	if committedRev > 0 {
+		return committedRev
+	}
+	if revision, ok := committedRevisionFromExpectedRevision(expectedRevision); ok && revision > 0 {
+		return revision
+	}
+	stat, err := fs.remotePathStatDetached(localPath)
+	if err == nil && stat != nil && stat.Revision > 0 {
+		return stat.Revision
+	}
+	return 0
+}
+
 func (fs *Dat9FS) committedMutation(ino uint64) (inodeMutationState, bool) {
 	if !fs.gvisorCompatibilityEnabled() || ino == 0 {
 		return inodeMutationState{}, false
@@ -1940,7 +1968,7 @@ func (fs *Dat9FS) commitEntrySuperseded(entry *CommitEntry) bool {
 	if !ok {
 		return false
 	}
-	return entry.MutationSeq < state.latestSeq || entry.MutationSeq <= state.committedSeq
+	return entry.MutationSeq < state.stagedSeq || entry.MutationSeq <= state.committedSeq
 }
 
 // discardSupersededMutationLocked turns a handle snapshot that is no newer
@@ -1951,11 +1979,12 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 		return false
 	}
 	state, ok := fs.committedMutation(fh.Ino)
-	if !ok || fh.DirtySeq > state.committedSeq {
+	if !ok || state.committedRevision <= 0 || fh.DirtySeq > state.committedSeq {
 		return false
 	}
 
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+	fs.removeHandleOwnedStagingLocked(fh)
 	if fh.Dirty != nil {
 		fh.Dirty.ClearDirty()
 	}
@@ -3685,6 +3714,9 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 	// its cleanup to this handle's staging generation.
 	if fs.shadowStore != nil {
 		fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
+	}
+	if durable {
+		fs.recordStagedMutation(fh.Ino, fh.DirtySeq)
 	}
 	return nil
 }
@@ -9716,10 +9748,10 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 
 	renameCtx, renameCancel := fs.namespaceMutationCommitContext(ctx)
+	defer renameCancel()
 	renameErr := fs.renameRemoteWithTransientRetry(renameCtx, oldP, newP)
-	renameCancel()
 	if renameErr != nil {
-		if handled, st := fs.renameRemoteFileToMissingTargetFallback(ctx, input, oldInfo, newInfo, renameErr); handled {
+		if handled, st := fs.renameRemoteFileToMissingTargetFallback(renameCtx, input, oldInfo, newInfo, renameErr); handled {
 			return st
 		}
 		return httpToFuseStatus(renameErr)
@@ -12630,6 +12662,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			}
 			phase = "large-shadowspill-sync-upload"
 			expectedRevision := fs.expectedRevisionForHandleLocked(fh)
+			mutationSeq := fh.DirtySeq
 			handleIsNew := fh.IsNew
 			handlePath := fh.Path
 			stagingGens := fs.captureHandleStagingGensLocked(fh)
@@ -12667,6 +12700,11 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			if err != nil {
 				safeLogPrintf("flush: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
 				return gofuse.EIO
+			}
+			mutationRevision := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
+			fs.recordCommittedMutation(fh.Ino, mutationSeq, mutationRevision, size)
+			if mutationRevision > 0 {
+				fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, mutationRevision, fh, size)
 			}
 			// If Unlink completed while remoteCommitLock was released (it
 			// serializes DELETE after our PUT via the same lock), the path is
@@ -13075,6 +13113,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 
 		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
+		mutationSeq := fh.DirtySeq
 		uploadStart := time.Now()
 		fs.debugf("fsync writeback upload start path=%s", fh.Path)
 		committedRev, err := fs.uploader.UploadSyncWithRevision(ctx, fh.Path)
@@ -13082,6 +13121,11 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		if err != nil {
 			safeLogPrintf("fsync writeback upload failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
+		}
+		mutationRevision := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
+		fs.recordCommittedMutation(fh.Ino, mutationSeq, mutationRevision, size)
+		if mutationRevision > 0 {
+			fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, mutationRevision, fh, size)
 		}
 		if fh.HasPendingMode {
 			ino := fh.Ino
@@ -14771,6 +14815,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		return
 	}
 	if !fs.layerEnabled() {
+		committedRev = fs.resolveCommittedMutationRevision(entry.Path, committedRev, entry.BaseRev)
 		fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, committedRev, entry.Size)
 	}
 	if fs.layerEnabled() {

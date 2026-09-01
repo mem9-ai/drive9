@@ -318,7 +318,8 @@ func TestGVisorCompatCommitQueueSkipsSupersededEntryBeforeUpload(t *testing.T) {
 
 	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
 	staleSeq := fs.markDirtySize(ino, int64(len("stale")))
-	fs.markDirtySize(ino, int64(len("newer")))
+	newerSeq := fs.markDirtySize(ino, int64(len("newer")))
+	fs.recordStagedMutation(ino, newerSeq)
 	if err := shadow.WriteFull(filePath, []byte("stale"), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +389,8 @@ func TestGVisorCompatSupersededEntryDoesNotRemoveNewerStaging(t *testing.T) {
 		Kind:            PendingNew,
 	}
 
-	fs.markDirtySize(ino, int64(len("newer")))
+	newerSeq := fs.markDirtySize(ino, int64(len("newer")))
+	fs.recordStagedMutation(ino, newerSeq)
 	if err := shadow.WriteFull(filePath, []byte("newer"), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +499,8 @@ func TestGVisorCompatCommitQueueSkipsEntrySupersededBeforeLWW(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for conflict read")
 	}
-	fs.markDirtySize(ino, int64(len("latest local")))
+	newerSeq := fs.markDirtySize(ino, int64(len("latest local")))
+	fs.recordStagedMutation(ino, newerSeq)
 	releaseOnce.Do(func() { close(releaseRead) })
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer waitCancel()
@@ -551,7 +554,8 @@ func TestGVisorCompatCommitQueueFiltersSupersededBatchEntry(t *testing.T) {
 
 	staleIno := fs.inodes.Lookup(stalePath, false, 5, time.Now())
 	staleSeq := fs.markDirtySize(staleIno, 5)
-	fs.markDirtySize(staleIno, 6)
+	newerSeq := fs.markDirtySize(staleIno, 6)
+	fs.recordStagedMutation(staleIno, newerSeq)
 	validIno := fs.inodes.Lookup(validPath, false, 5, time.Now())
 	validSeq := fs.markDirtySize(validIno, 5)
 	if err := shadow.WriteFull(stalePath, []byte("stale"), 0); err != nil {
@@ -671,6 +675,78 @@ func TestGVisorCompatDisabledCommitQueueDoesNotFilterMutationSequence(t *testing
 	}
 	if got := putCalls.Load(); got != 1 {
 		t.Fatalf("PUT calls = %d, want 1 with GVisorCompat disabled", got)
+	}
+}
+
+func TestGVisorCompatUnstagedWriteDoesNotSupersedeDurableEntry(t *testing.T) {
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	ino := fs.inodes.Lookup("/durable-before-private.txt", false, 0, time.Now())
+	durableSeq := fs.markDirtySize(ino, 7)
+	fs.recordStagedMutation(ino, durableSeq)
+	newerSeq := fs.markDirtySize(ino, 8)
+	entry := &CommitEntry{Inode: ino, MutationSeq: durableSeq}
+	if fs.commitEntrySuperseded(entry) {
+		t.Fatal("unstaged private write superseded an older durable entry")
+	}
+	fs.recordStagedMutation(ino, newerSeq)
+	if !fs.commitEntrySuperseded(entry) {
+		t.Fatal("newer durable staging did not supersede the older entry")
+	}
+}
+
+func TestGVisorCompatDiscardSupersededMutationRemovesOwnedStaging(t *testing.T) {
+	const filePath = "/owned-staging.txt"
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	_, stale := newGVisorMutationHandle(t, fs, filePath, ino)
+	if err := shadow.WriteFull(filePath, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	pendingGen, err := pending.PutWithBaseRev(filePath, 0, PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.ShadowStageGen = shadow.ActiveGeneration(filePath)
+	stale.PendingIndexGen = pendingGen
+	newerSeq := fs.markDirtySize(ino, 9)
+	fs.recordCommittedMutation(ino, newerSeq, 1, 9)
+	stale.Lock()
+	discarded := fs.discardSupersededMutationLocked(stale)
+	stale.Unlock()
+	if !discarded {
+		t.Fatal("stale mutation was not discarded")
+	}
+	if shadow.Has(filePath) || pending.HasPending(filePath) {
+		t.Fatal("discarded handle left generation-owned staging behind")
+	}
+}
+
+func TestGVisorCompatQueueSuccessSynthesizesUnknownRevision(t *testing.T) {
+	const filePath = "/unknown-revision.txt"
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	ino := fs.inodes.Lookup(filePath, false, 11, time.Now())
+	seq := fs.markDirtySize(ino, 11)
+	fs.onCommitQueueSuccess(&CommitEntry{Path: filePath, Inode: ino, MutationSeq: seq, Size: 11, Kind: PendingNew}, 0)
+	state, ok := fs.committedMutation(ino)
+	if !ok || state.committedRevision != 1 {
+		t.Fatalf("committed mutation state = %+v, %t; want synthesized revision 1", state, ok)
 	}
 }
 
