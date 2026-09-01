@@ -170,6 +170,510 @@ func TestGVisorCompatReleaseDiscardsSupersededCrossHandleTruncate(t *testing.T) 
 	}
 }
 
+func TestGVisorCompatStageAfterCommitFenceDiscardsSupersededHandle(t *testing.T) {
+	const filePath = "/commit-fence.txt"
+	newer := []byte("newer committed content")
+	putStarted := make(chan struct{})
+	releasePut := make(chan struct{})
+	var releaseOnce sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/v1/fs"+filePath {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !bytes.Equal(body, newer) {
+			t.Errorf("PUT body = %q, want %q", body, newer)
+		}
+		close(putStarted)
+		<-releasePut
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: true, SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.PathLock = fs.lockRemoteCommitPath
+	cq.OnSuccess = fs.onCommitQueueSuccess
+	cq.OnCleanup = fs.onCommitQueueCleanup
+	fs.commitQueue = cq
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releasePut) })
+		cq.DrainAll()
+	})
+
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	_, stale := newGVisorMutationHandle(t, fs, filePath, ino)
+	newerSeq := fs.markDirtySize(ino, int64(len(newer)))
+	if err := shadow.WriteFull(filePath, newer, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(filePath, int64(len(newer)), PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:        filePath,
+		Inode:       ino,
+		MutationSeq: newerSeq,
+		Size:        int64(len(newer)),
+		Kind:        PendingNew,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-putStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for newer upload")
+	}
+
+	staleLocked := make(chan struct{})
+	stageDone := make(chan error, 1)
+	go func() {
+		stale.Lock()
+		close(staleLocked)
+		err := fs.stageShadowForQueuedCommitLocked(stale, true)
+		stale.Unlock()
+		stageDone <- err
+	}()
+	<-staleLocked
+	releaseOnce.Do(func() { close(releasePut) })
+
+	select {
+	case err := <-stageDone:
+		if err != nil {
+			t.Fatalf("stage stale handle: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stale handle did not resume after newer commit")
+	}
+
+	stale.Lock()
+	defer stale.Unlock()
+	if stale.DirtySeq != 0 || stale.Dirty.HasDirtyParts() {
+		t.Fatalf("stale handle remains dirty after commit-fence wait: seq=%d dirty=%t", stale.DirtySeq, stale.Dirty.HasDirtyParts())
+	}
+	if stale.BaseRev != 1 || stale.Dirty.Size() != int64(len(newer)) {
+		t.Fatalf("stale handle base/size = %d/%d, want 1/%d", stale.BaseRev, stale.Dirty.Size(), len(newer))
+	}
+	if shadow.Has(filePath) {
+		staged, err := shadow.ReadAll(filePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(staged, newer) {
+			t.Fatalf("superseded handle replaced newer shadow with %q", staged)
+		}
+	}
+}
+
+func TestGVisorCompatCommitQueueSkipsSupersededEntryBeforeUpload(t *testing.T) {
+	const filePath = "/superseded-before-upload.txt"
+	var putCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			putCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+			return
+		}
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	staleSeq := fs.markDirtySize(ino, int64(len("stale")))
+	fs.markDirtySize(ino, int64(len("newer")))
+	if err := shadow.WriteFull(filePath, []byte("stale"), 0); err != nil {
+		t.Fatal(err)
+	}
+	pendingGen, err := pending.PutWithBaseRev(filePath, int64(len("stale")), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.IsSuperseded = fs.commitEntrySuperseded
+	defer cq.DrainAll()
+	if err := cq.Enqueue(&CommitEntry{
+		Path:            filePath,
+		Inode:           ino,
+		MutationSeq:     staleSeq,
+		PendingIndexGen: pendingGen,
+		ShadowGen:       shadow.ActiveGeneration(filePath),
+		Size:            int64(len("stale")),
+		Kind:            PendingNew,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer waitCancel()
+	if err := cq.WaitIdle(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("PUT calls = %d, want 0", got)
+	}
+	if shadow.Has(filePath) || pending.HasPending(filePath) {
+		t.Fatal("superseded entry staging was not removed")
+	}
+}
+
+func TestGVisorCompatSupersededEntryDoesNotRemoveNewerStaging(t *testing.T) {
+	const filePath = "/superseded-generation.txt"
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	staleSeq := fs.markDirtySize(ino, int64(len("stale")))
+	if err := shadow.WriteFull(filePath, []byte("stale"), 0); err != nil {
+		t.Fatal(err)
+	}
+	stalePendingGen, err := pending.PutWithBaseRev(filePath, int64(len("stale")), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := &CommitEntry{
+		Path:            filePath,
+		Inode:           ino,
+		MutationSeq:     staleSeq,
+		PendingIndexGen: stalePendingGen,
+		ShadowGen:       shadow.ActiveGeneration(filePath),
+		Size:            int64(len("stale")),
+		Kind:            PendingNew,
+	}
+
+	fs.markDirtySize(ino, int64(len("newer")))
+	if err := shadow.WriteFull(filePath, []byte("newer"), 0); err != nil {
+		t.Fatal(err)
+	}
+	newPendingGen, err := pending.PutWithBaseRev(filePath, int64(len("newer")), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient("http://127.0.0.1"), shadow, pending, nil, 1, 8)
+	cq.IsSuperseded = fs.commitEntrySuperseded
+	defer cq.DrainAll()
+	if err := cq.CommitNow(context.Background(), entry); err != nil {
+		t.Fatal(err)
+	}
+	got, err := shadow.ReadAll(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("newer")) {
+		t.Fatalf("shadow content = %q, want newer", got)
+	}
+	if gotGen := pending.Generation(filePath); gotGen != newPendingGen {
+		t.Fatalf("pending generation = %d, want newer generation %d", gotGen, newPendingGen)
+	}
+}
+
+func TestGVisorCompatCommitQueueSkipsEntrySupersededBeforeLWW(t *testing.T) {
+	const filePath = "/superseded-before-lww.txt"
+	localData := []byte("stale local")
+	remoteData := []byte("newer remote")
+	readStarted := make(chan struct{})
+	releaseRead := make(chan struct{})
+	var releaseOnce sync.Once
+	var putCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			if putCalls.Add(1) == 1 {
+				http.Error(w, "revision conflict", http.StatusConflict)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 3})
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(remoteData)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			close(readStarted)
+			<-releaseRead
+			_, _ = w.Write(remoteData)
+		default:
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ino := fs.inodes.Lookup(filePath, false, int64(len(localData)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	seq := fs.markDirtySize(ino, int64(len(localData)))
+	if err := shadow.WriteFull(filePath, localData, 1); err != nil {
+		t.Fatal(err)
+	}
+	pendingGen, err := pending.PutWithBaseRev(filePath, int64(len(localData)), PendingOverwrite, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.IsSuperseded = fs.commitEntrySuperseded
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseRead) })
+		cq.DrainAll()
+	})
+	if err := cq.Enqueue(&CommitEntry{
+		Path:            filePath,
+		Inode:           ino,
+		MutationSeq:     seq,
+		PendingIndexGen: pendingGen,
+		ShadowGen:       shadow.ActiveGeneration(filePath),
+		BaseRev:         1,
+		Size:            int64(len(localData)),
+		Kind:            PendingOverwrite,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-readStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for conflict read")
+	}
+	fs.markDirtySize(ino, int64(len("latest local")))
+	releaseOnce.Do(func() { close(releaseRead) })
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer waitCancel()
+	if err := cq.WaitIdle(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("PUT calls = %d, want only initial conflicting PUT", got)
+	}
+	if shadow.Has(filePath) || pending.HasPending(filePath) {
+		t.Fatal("superseded LWW entry staging was not removed")
+	}
+}
+
+func TestGVisorCompatCommitQueueFiltersSupersededBatchEntry(t *testing.T) {
+	const (
+		stalePath = "/batch-stale.txt"
+		validPath = "/batch-valid.txt"
+	)
+	var batchCalls atomic.Int32
+	var putCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-write":
+			batchCalls.Add(1)
+			http.Error(w, "superseded entry must be filtered before batching", http.StatusInternalServerError)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+validPath:
+			putCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+		default:
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	staleIno := fs.inodes.Lookup(stalePath, false, 5, time.Now())
+	staleSeq := fs.markDirtySize(staleIno, 5)
+	fs.markDirtySize(staleIno, 6)
+	validIno := fs.inodes.Lookup(validPath, false, 5, time.Now())
+	validSeq := fs.markDirtySize(validIno, 5)
+	if err := shadow.WriteFull(stalePath, []byte("stale"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(validPath, []byte("valid"), 0); err != nil {
+		t.Fatal(err)
+	}
+	stalePendingGen, err := pending.PutWithBaseRev(stalePath, 5, PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validPendingGen, err := pending.PutWithBaseRev(validPath, 5, PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.IsSuperseded = fs.commitEntrySuperseded
+	cq.ConfigureBatchWrite(20*time.Millisecond, 8, 1<<20)
+	defer cq.DrainAll()
+	if err := cq.Enqueue(&CommitEntry{
+		Path:            stalePath,
+		Inode:           staleIno,
+		MutationSeq:     staleSeq,
+		PendingIndexGen: stalePendingGen,
+		ShadowGen:       shadow.ActiveGeneration(stalePath),
+		Size:            5,
+		Kind:            PendingNew,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:            validPath,
+		Inode:           validIno,
+		MutationSeq:     validSeq,
+		PendingIndexGen: validPendingGen,
+		ShadowGen:       shadow.ActiveGeneration(validPath),
+		Size:            5,
+		Kind:            PendingNew,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer waitCancel()
+	if err := cq.WaitIdle(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	if got := batchCalls.Load(); got != 0 {
+		t.Fatalf("batch calls = %d, want 0 after filtering to one entry", got)
+	}
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("valid PUT calls = %d, want 1", got)
+	}
+	if shadow.Has(stalePath) || pending.HasPending(stalePath) {
+		t.Fatal("superseded batch staging was not removed")
+	}
+}
+
+func TestGVisorCompatDisabledCommitQueueDoesNotFilterMutationSequence(t *testing.T) {
+	const filePath = "/disabled-sequence-filter.txt"
+	var putCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		putCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(filePath, []byte("stale"), 0); err != nil {
+		t.Fatal(err)
+	}
+	pendingGen, err := pending.PutWithBaseRev(filePath, 5, PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino := fs.inodes.Lookup(filePath, false, 5, time.Now())
+	staleSeq := fs.markDirtySize(ino, 5)
+	fs.markDirtySize(ino, 6)
+
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.IsSuperseded = fs.commitEntrySuperseded
+	defer cq.DrainAll()
+	if err := cq.Enqueue(&CommitEntry{
+		Path:            filePath,
+		Inode:           ino,
+		MutationSeq:     staleSeq,
+		PendingIndexGen: pendingGen,
+		ShadowGen:       shadow.ActiveGeneration(filePath),
+		Size:            5,
+		Kind:            PendingNew,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer waitCancel()
+	if err := cq.WaitIdle(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("PUT calls = %d, want 1 with GVisorCompat disabled", got)
+	}
+}
+
 func TestGVisorCompatSameHandleTruncateThenWriteRemainsCorrect(t *testing.T) {
 	want := []byte("same handle content")
 	var (
@@ -459,6 +963,125 @@ func TestGVisorCompatRenamePreflightUsesNegativeTargetCache(t *testing.T) {
 	}
 	if got := remoteCalls.Load(); got != 0 {
 		t.Fatalf("remote calls = %d, want 0", got)
+	}
+}
+
+func TestGVisorCompatRenamePreflightRevalidatesNegativeTargetInStickyDirectory(t *testing.T) {
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/v1/fs/dst" {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", "1")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "1")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.uid = 0
+	fs.gid = 0
+	fs.inodes.UpdateMode(1, uint32(syscall.S_IFDIR)|0o1777)
+	fs.inodes.UpdateOwner(1, 0, 0, true, true)
+	srcIno := fs.inodes.Lookup("/src", false, 3, time.Now())
+	fs.inodes.UpdateMode(srcIno, uint32(syscall.S_IFREG)|0o644)
+	fs.inodes.UpdateOwner(srcIno, 65534, 65534, true, true)
+	fs.cacheNegativePath("/dst")
+
+	_, target, st := fs.renamePreflight(context.Background(), &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{
+			NodeId: 1,
+			Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 65534, Gid: 65534}},
+		},
+		Newdir: 1,
+	}, "/src", "/dst")
+	if st != gofuse.EPERM {
+		t.Fatalf("renamePreflight status = %v, want EPERM", st)
+	}
+	if !target.exists {
+		t.Fatal("revalidated target unexpectedly missing")
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("target HEAD calls = %d, want 1", got)
+	}
+}
+
+func TestGVisorCompatRenamePreflightRevalidatesNegativeTargetForDirectorySource(t *testing.T) {
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/v1/fs/dst" {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", "1")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "1")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcIno := fs.inodes.Lookup("/src", true, 0, time.Now())
+	fs.inodes.UpdateMode(srcIno, uint32(syscall.S_IFDIR)|0o755)
+	fs.cacheNegativePath("/dst")
+
+	_, target, st := fs.renamePreflight(context.Background(), &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Newdir:   1,
+	}, "/src", "/dst")
+	if st != gofuse.Status(syscall.ENOTDIR) {
+		t.Fatalf("renamePreflight status = %v, want ENOTDIR", st)
+	}
+	if !target.exists {
+		t.Fatal("revalidated target unexpectedly missing")
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("target HEAD calls = %d, want 1", got)
+	}
+}
+
+func TestGVisorCompatRenamePreflightRevalidatesNegativeTargetForSpecialSource(t *testing.T) {
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/v1/fs/dst" {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", "1")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "1")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcIno := fs.inodes.Lookup("/src", false, 0, time.Now())
+	fs.inodes.UpdateMode(srcIno, uint32(syscall.S_IFIFO)|0o644)
+	fs.cacheNegativePath("/dst")
+
+	_, target, st := fs.renamePreflight(context.Background(), &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Newdir:   1,
+	}, "/src", "/dst")
+	if st != gofuse.OK {
+		t.Fatalf("renamePreflight status = %v, want OK", st)
+	}
+	if !target.exists {
+		t.Fatal("revalidated target unexpectedly missing")
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("target HEAD calls = %d, want 1", got)
 	}
 }
 
