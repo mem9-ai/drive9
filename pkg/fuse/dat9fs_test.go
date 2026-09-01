@@ -3268,7 +3268,7 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 	}
 }
 
-func TestFlushSmallNewFileRefreshesSiblingHandleRevision(t *testing.T) {
+func TestFlushSmallNewSQLiteJournalDirtySiblingKeepsOriginalBaseRev(t *testing.T) {
 	const filePath = "/sqlite/workload.db-journal"
 
 	var (
@@ -3360,14 +3360,14 @@ func TestFlushSmallNewFileRefreshesSiblingHandleRevision(t *testing.T) {
 		t.Fatalf("second handle BaseRev before flush = %d, want 0", fh2.BaseRev)
 	}
 
-	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fh2ID}); st != gofuse.OK {
-		t.Fatalf("second Flush status = %v, want OK", st)
+	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fh2ID}); st == gofuse.OK {
+		t.Fatal("second Flush status = OK, want CAS conflict for stale dirty journal payload")
 	}
-	if fh2.IsNew {
-		t.Fatal("second handle should no longer be create-if-absent after its remote-sync flush")
+	if !fh2.IsNew {
+		t.Fatal("second dirty sibling handle adopted committed revision after failed stale flush")
 	}
-	if fh2.BaseRev != 2 {
-		t.Fatalf("second handle BaseRev after flush = %d, want 2", fh2.BaseRev)
+	if fh2.BaseRev != 0 {
+		t.Fatalf("second handle BaseRev after failed flush = %d, want 0", fh2.BaseRev)
 	}
 
 	mu.Lock()
@@ -3375,14 +3375,14 @@ func TestFlushSmallNewFileRefreshesSiblingHandleRevision(t *testing.T) {
 	if serverErr != nil {
 		t.Fatal(serverErr)
 	}
-	if !reflect.DeepEqual(expected, []int64{0, 1}) {
-		t.Fatalf("expected revisions = %v, want [0 1]", expected)
+	if !reflect.DeepEqual(expected, []int64{0, 0}) {
+		t.Fatalf("expected revisions = %v, want [0 0]", expected)
 	}
-	if revision != 2 {
-		t.Fatalf("server revision = %d, want 2", revision)
+	if revision != 1 {
+		t.Fatalf("server revision = %d, want 1", revision)
 	}
-	if string(content) != "second" {
-		t.Fatalf("server content = %q, want second", content)
+	if string(content) != "first" {
+		t.Fatalf("server content = %q, want first", content)
 	}
 }
 
@@ -14641,7 +14641,7 @@ func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 	}
 }
 
-func TestFlushHandle_AdoptsSameMountCommittedRevision(t *testing.T) {
+func TestFlushHandle_RejectsStaleSQLiteJournalDirtyPayloadAfterSameMountCommit(t *testing.T) {
 	var gotExpected string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -14680,35 +14680,66 @@ func TestFlushHandle_AdoptsSameMountCommittedRevision(t *testing.T) {
 	fh.Lock()
 	st := fs.flushHandle(context.Background(), fh)
 	fh.Unlock()
-	if st != gofuse.OK {
-		t.Fatalf("flushHandle status = %v, want OK", st)
+	if st == gofuse.OK {
+		t.Fatal("flushHandle status = OK, want CAS conflict for stale dirty journal payload")
 	}
-	if gotExpected != "8" {
-		t.Fatalf("X-Dat9-Expected-Revision = %q, want 8", gotExpected)
+	if gotExpected != "7" {
+		t.Fatalf("X-Dat9-Expected-Revision = %q, want 7", gotExpected)
 	}
-	if fh.BaseRev != 9 {
-		t.Fatalf("fh.BaseRev = %d, want 9", fh.BaseRev)
+	if fh.BaseRev != 7 {
+		t.Fatalf("fh.BaseRev = %d, want 7", fh.BaseRev)
 	}
 }
 
-func TestFlushHandle_RefreshesStartedStreamerRevision(t *testing.T) {
+func TestFlushHandle_StartedSQLiteJournalStreamerKeepsStaleBaseRev(t *testing.T) {
 	data := bytes.Repeat([]byte("x"), s3client.PartSize+32)
-	expectedRevision := int64(8)
-	rec := newMultipartUploadRecorder(t, "/stream.db-wal", int64(len(data)), &expectedRevision)
+	var gotExpected atomic.Int64
+	gotExpected.Store(-999)
+	var initiateCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v2/uploads/initiate" {
+			http.NotFound(w, r)
+			return
+		}
+		initiateCalls.Add(1)
+		var req struct {
+			Path             string `json:"path"`
+			TotalSize        int64  `json:"total_size"`
+			ExpectedRevision *int64 `json:"expected_revision"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode initiate request: %v", err)
+		}
+		if req.Path != "/stream.db-wal" {
+			t.Fatalf("initiate path = %q, want /stream.db-wal", req.Path)
+		}
+		if req.TotalSize != int64(len(data)) {
+			t.Fatalf("initiate total size = %d, want %d", req.TotalSize, len(data))
+		}
+		if req.ExpectedRevision != nil {
+			gotExpected.Store(*req.ExpectedRevision)
+		}
+		if req.ExpectedRevision == nil || *req.ExpectedRevision != 8 {
+			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+			return
+		}
+		t.Fatal("stale SQLite journal streamer unexpectedly adopted rev8")
+	}))
+	defer ts.Close()
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(rec.client(), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/stream.db-wal", false, int64(len(data)), time.Now())
 	fs.inodes.UpdateRevision(ino, 7)
-	fs.recordCommittedRevision("/stream.db-wal", expectedRevision)
+	fs.recordCommittedRevision("/stream.db-wal", 8)
 
 	fh := &FileHandle{
 		Ino:      ino,
 		Path:     "/stream.db-wal",
 		Dirty:    NewWriteBuffer("/stream.db-wal", maxPreloadSize, 0),
 		BaseRev:  7,
-		Streamer: NewStreamUploader(rec.client(), "/stream.db-wal", 7),
+		Streamer: NewStreamUploader(newTestClient(ts.URL), "/stream.db-wal", 7),
 	}
 	if _, err := fh.Dirty.Write(0, data); err != nil {
 		t.Fatal(err)
@@ -14721,14 +14752,17 @@ func TestFlushHandle_RefreshesStartedStreamerRevision(t *testing.T) {
 	fh.Lock()
 	st := fs.flushHandle(context.Background(), fh)
 	fh.Unlock()
-	if st != gofuse.OK {
-		t.Fatalf("flushHandle status = %v, want OK", st)
+	if st == gofuse.OK {
+		t.Fatal("flushHandle status = OK, want CAS conflict for stale SQLite journal streamer payload")
 	}
-	if got := rec.initiateCalls.Load(); got != 1 {
+	if got := initiateCalls.Load(); got != 1 {
 		t.Fatalf("initiate calls = %d, want 1", got)
 	}
-	if fh.BaseRev != expectedRevision+1 {
-		t.Fatalf("fh.BaseRev = %d, want %d", fh.BaseRev, expectedRevision+1)
+	if got := gotExpected.Load(); got != 7 {
+		t.Fatalf("initiate expected revision = %d, want 7", got)
+	}
+	if fh.BaseRev != 7 {
+		t.Fatalf("fh.BaseRev = %d, want 7", fh.BaseRev)
 	}
 }
 
@@ -14933,13 +14967,15 @@ func TestAdoptPathTruncateZeroResetsStartedStreamerBeforeFlush(t *testing.T) {
 	}
 }
 
-func TestFlushHandle_SerializesSamePathRemoteCommits(t *testing.T) {
+func TestFlushHandle_SerializesSamePathSQLiteJournalCommitsWithoutAdoptingStalePayload(t *testing.T) {
 	var (
 		mu         sync.Mutex
 		revision   int64 = 7
 		handlerErr error
 		putCalls   atomic.Int32
 		inFlight   atomic.Int32
+		okFlushes  atomic.Int32
+		badFlushes atomic.Int32
 		gotHeaders []string
 	)
 	recordHandlerErr := func(err error) {
@@ -15004,9 +15040,10 @@ func TestFlushHandle_SerializesSamePathRemoteCommits(t *testing.T) {
 			fh.Lock()
 			st := fs.flushHandle(context.Background(), fh)
 			fh.Unlock()
-			if st != gofuse.OK {
-				errCh <- fmt.Errorf("flushHandle status = %v, want OK", st)
-				return
+			if st == gofuse.OK {
+				okFlushes.Add(1)
+			} else {
+				badFlushes.Add(1)
 			}
 			errCh <- nil
 		}(fh)
@@ -15020,6 +15057,12 @@ func TestFlushHandle_SerializesSamePathRemoteCommits(t *testing.T) {
 	if got := putCalls.Load(); got != 2 {
 		t.Fatalf("PUT calls = %d, want 2", got)
 	}
+	if got := okFlushes.Load(); got != 1 {
+		t.Fatalf("successful flushes = %d, want 1", got)
+	}
+	if got := badFlushes.Load(); got != 1 {
+		t.Fatalf("failed stale flushes = %d, want 1", got)
+	}
 	mu.Lock()
 	err := handlerErr
 	headers := append([]string(nil), gotHeaders...)
@@ -15028,14 +15071,14 @@ func TestFlushHandle_SerializesSamePathRemoteCommits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(headers) != 2 || headers[0] != "7" || headers[1] != "8" {
-		t.Fatalf("expected revision headers = %v, want [7 8]", headers)
+	if len(headers) != 2 || headers[0] != "7" || headers[1] != "7" {
+		t.Fatalf("expected revision headers = %v, want [7 7]", headers)
 	}
-	if finalRevision != 9 {
-		t.Fatalf("server revision = %d, want 9", finalRevision)
+	if finalRevision != 8 {
+		t.Fatalf("server revision = %d, want 8", finalRevision)
 	}
-	if got := fs.latestCommittedRevision("/wal.db-wal"); got != 9 {
-		t.Fatalf("latest committed revision = %d, want 9", got)
+	if got := fs.latestCommittedRevision("/wal.db-wal"); got != 8 {
+		t.Fatalf("latest committed revision = %d, want 8", got)
 	}
 }
 

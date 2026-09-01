@@ -740,6 +740,110 @@ func TestSQLitePersistentJournalUnstagedShadowSpillCannotAdoptDuringStaging(t *t
 	}
 }
 
+func TestSQLitePersistentJournalImmediateRemoteSyncCannotAdoptStalePayload(t *testing.T) {
+	for _, path := range []string{"/app.db-wal", "/app.db-journal"} {
+		t.Run(path, func(t *testing.T) {
+			var (
+				mu       sync.Mutex
+				revision int64 = 3
+				body           = []byte("rev3 sqlite sidecar bytes")
+				attempts []struct {
+					expected string
+					body     []byte
+				}
+			)
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPut || r.URL.Path != "/v1/fs"+path {
+					http.NotFound(w, r)
+					return
+				}
+				data, err := io.ReadAll(r.Body)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				expected := r.Header.Get("X-Dat9-Expected-Revision")
+				attempts = append(attempts, struct {
+					expected string
+					body     []byte
+				}{expected: expected, body: append([]byte(nil), data...)})
+				if expected != fmt.Sprintf("%d", revision) {
+					http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+					return
+				}
+				revision++
+				body = append([]byte(nil), data...)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": revision})
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+			ino := fs.inodes.Lookup(path, false, int64(len(body)), time.Now())
+			fs.inodes.UpdateRevision(ino, 2)
+			// A newer same-path sidecar revision has already become durable
+			// in this mount, but this handle still owns rev2-era dirty bytes.
+			// Immediate remote-sync must let the server CAS reject that stale
+			// payload instead of swapping in the newer BaseRev and accepting it
+			// as rev4.
+			fs.recordCommittedRevision(path, 3)
+
+			oldPayload := []byte("rev2 stale sqlite sidecar bytes")
+			fh := &FileHandle{
+				Ino:      ino,
+				Path:     path,
+				Dirty:    fs.newWriteBuffer(path, maxPreloadSize, 0),
+				OrigSize: int64(len(oldPayload)),
+				BaseRev:  2,
+			}
+			if _, err := fh.Dirty.Write(0, oldPayload); err != nil {
+				t.Fatal(err)
+			}
+			fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+
+			fh.Lock()
+			st := fs.flushHandle(context.Background(), fh)
+			fh.Unlock()
+			if st == gofuse.OK {
+				t.Fatal("stale SQLite sidecar remote-sync unexpectedly succeeded")
+			}
+			if fh.BaseRev != 2 {
+				t.Fatalf("stale SQLite sidecar BaseRev = %d, want 2", fh.BaseRev)
+			}
+
+			mu.Lock()
+			finalRev := revision
+			finalBody := append([]byte(nil), body...)
+			gotAttempts := append([]struct {
+				expected string
+				body     []byte
+			}(nil), attempts...)
+			mu.Unlock()
+
+			if finalRev != 3 {
+				t.Fatalf("server revision = %d, want 3; stale payload must not be accepted as rev4", finalRev)
+			}
+			if string(finalBody) != "rev3 sqlite sidecar bytes" {
+				t.Fatalf("server body = %q, want rev3 bytes", finalBody)
+			}
+			if len(gotAttempts) != 1 {
+				t.Fatalf("PUT attempts = %d, want 1", len(gotAttempts))
+			}
+			if gotAttempts[0].expected != "2" {
+				t.Fatalf("PUT expected revision = %q, want stale base rev 2", gotAttempts[0].expected)
+			}
+			if string(gotAttempts[0].body) != string(oldPayload) {
+				t.Fatalf("PUT body = %q, want stale payload attempt for CAS rejection", gotAttempts[0].body)
+			}
+		})
+	}
+}
+
 func TestReleaseWriteBackCleanupKeepsNewerGeneration(t *testing.T) {
 	var putCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
