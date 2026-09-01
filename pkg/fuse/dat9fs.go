@@ -12313,14 +12313,14 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 			fs.discardUnlinkedHandleStateLocked(fh)
 			return gofuse.OK
 		}
+		committedMutationRev := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
+		fs.recordCommittedMutation(fh.Ino, mutationSeq, committedMutationRev, size)
+		if committedMutationRev > 0 {
+			fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, committedMutationRev, fh, size)
+		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			safeLogPrintf("sync handle shadowspill pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
-		}
-		committedMutationRev := sqliteCommittedRevision(committedRev, expectedRevision)
-		fs.recordCommittedMutation(fh.Ino, mutationSeq, committedMutationRev, size)
-		if fs.gvisorCompatibilityEnabled() && committedMutationRev > 0 {
-			fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, committedMutationRev, fh, size)
 		}
 		fh.Dirty.ClearDirty()
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
@@ -12399,16 +12399,15 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 		safeLogPrintf("sync empty create failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
+	committedMutationRev := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
+	fs.recordCommittedMutation(fh.Ino, mutationSeq, committedMutationRev, 0)
+	if committedMutationRev > 0 {
+		fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, committedMutationRev, fh, 0)
+	}
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 		safeLogPrintf("sync empty create pending chmod failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
-	committedMutationRev := sqliteCommittedRevision(committedRev, expectedRevision)
-	fs.recordCommittedMutation(fh.Ino, mutationSeq, committedMutationRev, 0)
-	if fs.gvisorCompatibilityEnabled() && committedMutationRev > 0 {
-		fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, committedMutationRev, fh, 0)
-	}
-
 	if fh.DirtySeq != 0 {
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
@@ -13643,9 +13642,21 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 							safeLogPrintf("release: layer commitQueue enqueue failed for %s: %v", fh.Path, err)
 							return
 						}
-						// Backpressure — fall back to legacy uploader.
-						fs.debugf("release uploader submit fallback path=%s", fh.Path)
-						fs.uploader.Submit(fh.Path)
+						if fs.gvisorCompatibilityEnabled() {
+							uploadCtx, uploadCancel := context.WithTimeout(context.Background(), releaseTimeout(commitSize))
+							commitErr := fs.commitQueue.commitNowPathLocked(uploadCtx, entry)
+							uploadCancel()
+							if commitErr != nil {
+								flushStatus = httpToFuseStatus(commitErr)
+								safeLogPrintf("release: synchronous sequence-preserving fallback failed for %s: %v", fh.Path, commitErr)
+								return
+							}
+							fs.writeBack.Remove(fh.Path)
+						} else {
+							// Preserve the legacy non-gVisor backpressure behavior.
+							fs.debugf("release uploader submit fallback path=%s", fh.Path)
+							fs.uploader.Submit(fh.Path)
+						}
 					} else {
 						// CommitQueue owns the upload via shadow; remove the
 						// writeBack .dat/.meta snapshot so it doesn't leak or
