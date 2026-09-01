@@ -532,6 +532,7 @@ func Mount(opts *MountOptions) (err error) {
 				cq.OnCleanup = dat9fs.onCommitQueueCleanup
 				cq.OnDiscard = dat9fs.onCommitQueueDiscard
 				cq.IsSuperseded = dat9fs.commitEntrySuperseded
+				cq.serializeMutationInodes = opts.GVisorCompat
 				cq.PathLock = dat9fs.lockRemoteCommitPath
 				cq.DurableWatermark = dat9fs.latestCommittedRevision
 				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {
