@@ -1008,11 +1008,11 @@ func TestGVisorCompatRenamePreflightRetriesInterruptedTargetStat(t *testing.T) {
 	}
 }
 
-func TestGVisorCompatRenamePreflightUsesNegativeTargetCache(t *testing.T) {
+func TestGVisorCompatRenamePreflightRevalidatesNegativeTargetCache(t *testing.T) {
 	var remoteCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		remoteCalls.Add(1)
-		http.Error(w, "target stat should use negative cache", http.StatusInternalServerError)
+		http.NotFound(w, r)
 	}))
 	defer ts.Close()
 
@@ -1032,8 +1032,8 @@ func TestGVisorCompatRenamePreflightUsesNegativeTargetCache(t *testing.T) {
 	if target.exists {
 		t.Fatal("negative cached target unexpectedly exists")
 	}
-	if got := remoteCalls.Load(); got != 0 {
-		t.Fatalf("remote calls = %d, want 0", got)
+	if got := remoteCalls.Load(); got != 1 {
+		t.Fatalf("remote calls = %d, want 1", got)
 	}
 }
 

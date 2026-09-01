@@ -97,12 +97,9 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 		return oldInfo, renamePathInfo{}, st
 	}
 
-	newInfo := renamePathInfo{path: newP}
-	if !fs.canUseNegativeRenameTarget(oldInfo, newParentInfo, newP) {
-		newInfo, err = fs.renamePathInfo(ctx, newP)
-		if err != nil {
-			return oldInfo, newInfo, httpToFuseStatus(err)
-		}
+	newInfo, err := fs.renamePathInfo(ctx, newP)
+	if err != nil {
+		return oldInfo, newInfo, httpToFuseStatus(err)
 	}
 
 	if newInfo.exists {
@@ -126,16 +123,6 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 	}
 
 	return oldInfo, newInfo, gofuse.OK
-}
-
-func (fs *Dat9FS) canUseNegativeRenameTarget(oldInfo, newParentInfo renamePathInfo, newP string) bool {
-	if !fs.gvisorCompatibilityEnabled() || !fs.hasNegativePathCache(newP) {
-		return false
-	}
-	if oldInfo.isDir || oldInfo.special {
-		return false
-	}
-	return newParentInfo.modeOrDefault()&stickyPermissionBit == 0
 }
 
 func (fs *Dat9FS) renameCheckParentAccess(caller gofuse.Owner, parent renamePathInfo) gofuse.Status {

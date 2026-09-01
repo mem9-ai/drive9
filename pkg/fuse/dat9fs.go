@@ -12043,7 +12043,11 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		}
 		if st != gofuse.OK {
 			if fh.Layer != PathLayerGitWorkspace {
-				fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot)
+				if state, ok := fs.committedMutation(fh.Ino); ok && fh.DirtySeq != 0 && fh.DirtySeq <= state.committedSeq {
+					fs.discardSupersededMutationLocked(fh)
+				} else {
+					fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot)
+				}
 			}
 			return 0, st
 		}
@@ -13004,7 +13008,6 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	// ShadowSpill strict: synchronous streaming upload from shadow.
 	if fh.ShadowSpill && fs.shadowStore != nil {
 		size := fh.Dirty.Size()
-		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 		defer uploadCancel()
 		if fs.layerEnabled() {
@@ -13024,12 +13027,19 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		handlePath := fh.Path
 		stagingGens := fs.captureHandleStagingGensLocked(fh)
 		handleIno := fh.Ino
-		mutationSeq := fh.DirtySeq
 		// B4: serialize with Unlink's remote DELETE — hold the per-path
 		// remoteCommitLock across the network upload while releasing fh.mu,
 		// exactly like flushHandle Path 2. Without it Unlink can DELETE and
 		// return while this large-file PUT is still in flight.
 		unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
+		if fs.discardSupersededMutationLocked(fh) {
+			fs.removeHandleOwnedStagingLocked(fh)
+			unlockRemoteCommit()
+			phase = "superseded-after-commit-fence"
+			return gofuse.OK
+		}
+		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
+		mutationSeq := fh.DirtySeq
 		uploadStart := time.Now()
 		fs.debugf("fsync shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 		fh.Unlock()
