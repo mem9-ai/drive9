@@ -2581,20 +2581,6 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	fh.ShadowCommitSeq = 0
 }
 
-func (fs *Dat9FS) seedReadCacheFromShadowLocked(path string, size int64, revision int64) {
-	if fs == nil || fs.shadowStore == nil || fs.readCache == nil || revision <= 0 {
-		return
-	}
-	if size > fs.readCache.MaxFileSize() {
-		return
-	}
-	data, err := fs.shadowStore.ReadAll(path)
-	if err != nil {
-		return
-	}
-	fs.readCache.PutOwned(path, data, revision)
-}
-
 func (fs *Dat9FS) seedReadCacheFromShadowGenerationLocked(path string, size int64, revision int64, shadowGen uint64) bool {
 	if fs == nil || fs.shadowStore == nil || fs.readCache == nil || revision <= 0 || shadowGen == 0 {
 		return false
