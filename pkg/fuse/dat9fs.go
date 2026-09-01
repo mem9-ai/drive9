@@ -1392,37 +1392,24 @@ func (fs *Dat9FS) discardUnlinkedHandleStateLocked(fh *FileHandle) {
 // handle close/release from deleting a fresher same-path write that appeared
 // after the stale handle captured its snapshot.
 //
-// Some legacy/setup paths create staging before the handle has recorded a
-// generation (for example an empty create shadow). For those, only fall back to
-// path-wide cleanup when no other open handle still has pending state for this
-// path; otherwise leaking stale staging is safer than deleting another handle's
-// data.
+// Handles without recorded generations deliberately do not fall back to
+// path-wide cleanup. CommitQueue can own path-keyed staging after clearing a
+// handle's generation fields, and a gen-0 path-wide Remove could delete that
+// queued payload. Leaking ambiguous legacy staging is safer than deleting a
+// newer same-path generation.
 func (fs *Dat9FS) removeHandleStagingLocked(fh *FileHandle) {
 	if fs == nil || fh == nil || fh.Path == "" {
 		return
 	}
 	path := fh.Path
-	ownedOrUncontended := !fs.hasOtherPendingOpenHandleState(path, fh)
-	if fs.writeBack != nil {
-		if fh.WriteBackGen != 0 {
-			fs.writeBack.RemoveIfGeneration(path, fh.WriteBackGen)
-		} else if ownedOrUncontended {
-			fs.writeBack.Remove(path)
-		}
+	if fs.writeBack != nil && fh.WriteBackGen != 0 {
+		fs.writeBack.RemoveIfGeneration(path, fh.WriteBackGen)
 	}
-	if fs.pendingIndex != nil {
-		if fh.PendingIndexGen != 0 {
-			fs.pendingIndex.RemoveIfGeneration(path, fh.PendingIndexGen)
-		} else if ownedOrUncontended {
-			fs.pendingIndex.Remove(path)
-		}
+	if fs.pendingIndex != nil && fh.PendingIndexGen != 0 {
+		fs.pendingIndex.RemoveIfGeneration(path, fh.PendingIndexGen)
 	}
-	if fs.shadowStore != nil {
-		if fh.ShadowStageGen != 0 {
-			fs.shadowStore.RemoveIfGeneration(path, fh.ShadowStageGen)
-		} else if ownedOrUncontended {
-			fs.shadowStore.Remove(path)
-		}
+	if fs.shadowStore != nil && fh.ShadowStageGen != 0 {
+		fs.shadowStore.RemoveIfGeneration(path, fh.ShadowStageGen)
 	}
 	fh.WriteBackGen = 0
 	fh.PendingIndexGen = 0
@@ -1844,8 +1831,10 @@ func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) (f
 				safeLogPrintf("shadow truncate failed for %s: %v", fh.Path, err)
 				fs.shadowStore.Remove(fh.Path)
 				fh.ShadowReady = false
+				fh.ShadowStageGen = 0
 			} else {
 				fh.ShadowReady = true
+				fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
 			}
 		}
 	}
@@ -2176,6 +2165,9 @@ func (fs *Dat9FS) canRemoveActiveStaleShadowForCleanRefreshLocked(fh *FileHandle
 	if fs.hasPendingLocalStateExceptShadow(fh.Path) {
 		return false
 	}
+	if fs.hasQueuedCommit(fh.Path) {
+		return false
+	}
 	if fs.hasOtherPendingOpenHandleState(fh.Path, fh) {
 		return false
 	}
@@ -2504,6 +2496,7 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 		return
 	}
 	advanced := revision > fh.BaseRev
+	committedSize := fs.committedHandleSizeLocked(fh)
 	if advanced {
 		if !fs.handleCanAdoptCommittedRevisionLocked(fh) {
 			return
@@ -2513,16 +2506,18 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 		if fh.Streamer != nil {
 			fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
 		}
+		// A clean writable handle may still hold a WriteBuffer image from its
+		// previous BaseRev. Rebind it when lazily adopting a sibling revision so a
+		// future write cannot pair old cached bytes with the newer CAS base.
+		if fh.Dirty != nil {
+			fs.rebindCleanWriteBufferToRemoteLocked(fh, committedSize)
+		}
 	}
-	if fs.clearRemovedCommittedShadowLocked(fh, revision, fs.committedHandleSizeLocked(fh), false) {
+	if fs.clearRemovedCommittedShadowLocked(fh, revision, committedSize, false) {
 		return
 	}
 	if advanced && fh.ShadowReady && fs.shadowStore != nil {
-		size := int64(0)
-		if fh.Dirty != nil {
-			size = fh.Dirty.Size()
-		}
-		if err := fs.shadowStore.Ensure(fh.Path, size, revision); err != nil {
+		if err := fs.shadowStore.Ensure(fh.Path, committedSize, revision); err != nil {
 			safeLogPrintf("shadow base revision adopt failed for %s: %v", fh.Path, err)
 		}
 	}
@@ -2598,6 +2593,21 @@ func (fs *Dat9FS) seedReadCacheFromShadowLocked(path string, size int64, revisio
 		return
 	}
 	fs.readCache.PutOwned(path, data, revision)
+}
+
+func (fs *Dat9FS) seedReadCacheFromShadowGenerationLocked(path string, size int64, revision int64, shadowGen uint64) bool {
+	if fs == nil || fs.shadowStore == nil || fs.readCache == nil || revision <= 0 || shadowGen == 0 {
+		return false
+	}
+	if size > fs.readCache.MaxFileSize() {
+		return false
+	}
+	data, err := fs.shadowStore.ReadAllIfGeneration(path, shadowGen)
+	if err != nil {
+		return false
+	}
+	fs.readCache.PutOwned(path, data, revision)
+	return true
 }
 
 func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
@@ -3473,15 +3483,10 @@ func (fs *Dat9FS) bindCommitEntryToHandleLocked(entry *CommitEntry, fh *FileHand
 	}
 	entry.PayloadBaseRev = payloadBaseRev
 	entry.PayloadBaseRevSet = true
-	entry.WriteBackGen = fh.WriteBackGen
-	entry.ShadowGen = fh.ShadowStageGen
-	if entry.ShadowGen == 0 && fs.shadowStore != nil {
-		entry.ShadowGen = fs.shadowStore.ActiveGeneration(fh.Path)
-	}
-	entry.PendingIndexGen = fh.PendingIndexGen
-	if entry.PendingIndexGen == 0 && fs.pendingIndex != nil {
-		entry.PendingIndexGen = fs.pendingIndex.Generation(fh.Path)
-	}
+	gens := fs.captureHandleStagingGensLocked(fh)
+	entry.WriteBackGen = gens.WriteBackGen
+	entry.ShadowGen = gens.ShadowGen
+	entry.PendingIndexGen = gens.PendingIndexGen
 	if watermark := fs.latestCommittedRevision(fh.Path); watermark > payloadBaseRev && payloadBaseRev >= 0 {
 		entry.DurableWatermarkRev = watermark
 		entry.DisableAutoResolveLWW = true
@@ -10318,6 +10323,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		} else {
 			fh.ShadowReady = true
 			fh.ShadowSpill = true
+			fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(childP)
 		}
 	}
 
@@ -11464,6 +11470,9 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		shadowStart := time.Now()
 		unlockShadowWrite := fs.lockHandleRemoteCommitPathLocked(fh)
 		_, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev)
+		if err == nil {
+			fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
+		}
 		unlockShadowWrite()
 		if err != nil {
 			if errors.Is(err, syscall.ENOSPC) {
@@ -11494,6 +11503,9 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		shadowStart := time.Now()
 		unlockShadowWrite := fs.lockHandleRemoteCommitPathLocked(fh)
 		_, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev)
+		if err == nil {
+			fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
+		}
 		unlockShadowWrite()
 		if err != nil {
 			if errors.Is(err, syscall.ENOSPC) {
@@ -11503,6 +11515,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			safeLogPrintf("shadow write-through failed for %s: %v", fh.Path, err)
 			fs.shadowStore.Remove(fh.Path)
 			fh.ShadowReady = false
+			fh.ShadowStageGen = 0
 			source = "shadow-through-error"
 		} else {
 			source = "shadow-through"
@@ -11566,6 +11579,7 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 		fh.ShadowSpill = false
 		fh.ShadowCommitReady = false
 		fh.ShadowCommitSeq = 0
+		fh.ShadowStageGen = 0
 	}
 }
 
@@ -11791,18 +11805,11 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 		unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
 		defer unlockRemoteCommit()
 		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
-		shadowGen := fh.ShadowStageGen
-		if shadowGen == 0 {
-			shadowGen = fs.shadowStore.ActiveGeneration(fh.Path)
-		}
-		pendingIndexGen := fh.PendingIndexGen
-		if pendingIndexGen == 0 && fs.pendingIndex != nil {
-			pendingIndexGen = fs.pendingIndex.Generation(fh.Path)
-		}
+		stagingGens := fs.captureHandleStagingGensLocked(fh)
 		uploadStart := time.Now()
 		fs.debugf("sync handle shadowspill upload start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
 		fh.Unlock()
-		committedRev, err := uploadFromShadowRemoteWithRevisionAndGeneration(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevision, shadowGen)
+		committedRev, err := uploadFromShadowRemoteWithRevisionAndGeneration(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevision, stagingGens.ShadowGen)
 		fh.Lock()
 		var uploadBytes uint64
 		if size > 0 {
@@ -11829,13 +11836,17 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 		fh.ShadowCommitSeq = 0
 		clearReadTargetForLockedHandle(fh)
 		if committedRev > 0 {
-			fs.clearReadTargetsForPathExcept(fh.Path, fh)
-			fs.seedReadCacheFromShadowLocked(fh.Path, size, committedRev)
+			if fs.seedReadCacheFromShadowGenerationLocked(fh.Path, size, committedRev, stagingGens.ShadowGen) {
+				fs.clearReadTargetsForPathExcept(fh.Path, fh)
+			} else {
+				fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+			}
 			fs.markHandleRemoteCommittedLocked(fh, committedRev)
+			fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
 		} else {
 			fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
 			fs.finalizeHandleFlushLocked(fh, expectedRevision)
-			fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, shadowGen, pendingIndexGen)
+			fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
 		}
 		fs.inodes.UpdateSize(fh.Ino, size)
 		fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
@@ -11847,6 +11858,7 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 
 func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
+	stagingGens := fs.captureHandleStagingGensLocked(fh)
 	if fs.layerEnabled() {
 		if err := fs.upsertLayerFile(ctx, fh.Path, nil, expectedRevision, 0, false); err != nil {
 			safeLogPrintf("sync empty layer create failed for %s: %v", fh.Path, err)
@@ -11906,16 +11918,13 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 	}
 	fs.inodes.UpdateSize(fh.Ino, 0)
 	fs.cacheFileForPath(fh.Path, 0, time.Now(), committedRev)
-	if fs.shadowStore != nil {
-		fs.shadowStore.Remove(fh.Path)
-		fh.ShadowReady = false
-		fh.ShadowSpill = false
-		fh.ShadowCommitReady = false
-		fh.ShadowCommitSeq = 0
-	}
-	if fs.pendingIndex != nil {
-		fs.pendingIndex.Remove(fh.Path)
-	}
+	fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
+	fh.ShadowReady = false
+	fh.ShadowSpill = false
+	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
+	fh.ShadowStageGen = 0
+	fh.PendingIndexGen = 0
 	return gofuse.OK
 }
 
@@ -12149,14 +12158,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 			handleIsNew := fh.IsNew
 			handlePath := fh.Path
-			shadowGen := fh.ShadowStageGen
-			if shadowGen == 0 {
-				shadowGen = fs.shadowStore.ActiveGeneration(fh.Path)
-			}
-			pendingIndexGen := fh.PendingIndexGen
-			if pendingIndexGen == 0 && fs.pendingIndex != nil {
-				pendingIndexGen = fs.pendingIndex.Generation(fh.Path)
-			}
+			stagingGens := fs.captureHandleStagingGensLocked(fh)
 			// B4: serialize with Unlink's remote DELETE — hold the per-path
 			// remoteCommitLock across the network upload while releasing fh.mu,
 			// exactly like flushHandle Path 2. Without it Unlink can DELETE and
@@ -12165,7 +12167,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			uploadStart := time.Now()
 			fs.debugf("flush shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 			fh.Unlock()
-			committedRev, err := uploadFromShadowRemoteWithRevisionAndGeneration(uploadCtx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, shadowGen)
+			committedRev, err := uploadFromShadowRemoteWithRevisionAndGeneration(uploadCtx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen)
 			// Record the committed revision while still holding remoteCommitLock
 			// so a waiting Unlink re-check observes the upload and issues a DELETE.
 			if err == nil && committedRev > 0 {
@@ -12210,9 +12212,13 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			fh.DirtySeq = 0
 			if committedRev > 0 {
 				clearReadTargetForLockedHandle(fh)
-				fs.clearReadTargetsForPathExcept(fh.Path, fh)
-				fs.seedReadCacheFromShadowLocked(fh.Path, size, committedRev)
+				if fs.seedReadCacheFromShadowGenerationLocked(fh.Path, size, committedRev, stagingGens.ShadowGen) {
+					fs.clearReadTargetsForPathExcept(fh.Path, fh)
+				} else {
+					fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+				}
 				fs.markHandleRemoteCommittedLocked(fh, committedRev)
+				fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
 				fs.inodes.UpdateSize(fh.Ino, size)
 				fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
 				return gofuse.OK
@@ -12222,7 +12228,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			fs.inodes.UpdateSize(fh.Ino, size)
 			fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 			fs.finalizeHandleFlushLocked(fh, expectedRevision)
-			fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, shadowGen, pendingIndexGen)
+			fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
 			return gofuse.OK
 		}
 
@@ -12450,14 +12456,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		phase = "shadowspill-sync-upload"
 		handleIsNew := fh.IsNew
 		handlePath := fh.Path
-		shadowGen := fh.ShadowStageGen
-		if shadowGen == 0 {
-			shadowGen = fs.shadowStore.ActiveGeneration(fh.Path)
-		}
-		pendingIndexGen := fh.PendingIndexGen
-		if pendingIndexGen == 0 && fs.pendingIndex != nil {
-			pendingIndexGen = fs.pendingIndex.Generation(fh.Path)
-		}
+		stagingGens := fs.captureHandleStagingGensLocked(fh)
 		// B4: serialize with Unlink's remote DELETE — hold the per-path
 		// remoteCommitLock across the network upload while releasing fh.mu,
 		// exactly like flushHandle Path 2. Without it Unlink can DELETE and
@@ -12466,7 +12465,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		uploadStart := time.Now()
 		fs.debugf("fsync shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 		fh.Unlock()
-		committedRev, err := uploadFromShadowRemoteWithRevisionAndGeneration(uploadCtx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, shadowGen)
+		committedRev, err := uploadFromShadowRemoteWithRevisionAndGeneration(uploadCtx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen)
 		// Record the committed revision while still holding remoteCommitLock
 		// so a waiting Unlink re-check observes the upload and issues a DELETE.
 		if err == nil && committedRev > 0 {
@@ -12513,16 +12512,20 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 		if committedRev > 0 {
 			clearReadTargetForLockedHandle(fh)
-			fs.clearReadTargetsForPathExcept(fh.Path, fh)
-			fs.seedReadCacheFromShadowLocked(fh.Path, size, committedRev)
+			if fs.seedReadCacheFromShadowGenerationLocked(fh.Path, size, committedRev, stagingGens.ShadowGen) {
+				fs.clearReadTargetsForPathExcept(fh.Path, fh)
+			} else {
+				fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+			}
 			fs.markHandleRemoteCommittedLocked(fh, committedRev)
+			fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
 			fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
 		} else {
 			clearReadTargetForLockedHandle(fh)
 			fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
 			fs.finalizeHandleFlushLocked(fh, expectedRevision)
 			fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
-			fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, shadowGen, pendingIndexGen)
+			fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
 		}
 		fs.inodes.UpdateSize(fh.Ino, size)
 		return gofuse.OK
@@ -12571,12 +12574,11 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			if fh.Dirty != nil {
 				fh.Dirty.ClearDirty()
 				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+				fh.DirtySeq = 0
 			}
-			// Keep DirtySeq as an open-handle lifetime fence after a strict
-			// fsync. The buffer may still contain the pre-fsync image, so this
-			// handle must not adopt a sibling's newer BaseRev until it is
-			// reloaded or closed; otherwise old bytes could be paired with a
-			// newer CAS base.
+			// The handle is now clean. Future sibling-revision adoption will rebind
+			// the writable buffer to the adopted revision before any new write can
+			// use the updated BaseRev.
 			fh.WriteBackSeq = 0
 			return gofuse.OK
 		}
@@ -12605,12 +12607,12 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		if fh.Dirty != nil {
 			fh.Dirty.ClearDirty()
 			fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+			fh.DirtySeq = 0
 			fh.WriteBackSeq = 0
 		}
-		// Keep DirtySeq as an open-handle lifetime fence after a strict
-		// fsync. The writeback snapshot has been committed, but the handle's
-		// in-memory image is not proven rebased to any later sibling
-		// revision, so adoption remains disabled until reload/close.
+		// The handle is now clean. Future sibling-revision adoption will rebind
+		// the writable buffer to the adopted revision before any new write can
+		// use the updated BaseRev.
 		if committedRev > 0 {
 			fs.markHandleRemoteCommittedLocked(fh, committedRev)
 		} else {
@@ -12957,8 +12959,13 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 						} else {
 							clearReadTargetForLockedHandle(fh)
 							if committedRev > 0 {
-								fs.clearReadTargetsForPathExcept(fh.Path, fh)
+								if fs.seedReadCacheFromShadowGenerationLocked(fh.Path, size, committedRev, entry.ShadowGen) {
+									fs.clearReadTargetsForPathExcept(fh.Path, fh)
+								} else {
+									fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+								}
 								fs.markHandleRemoteCommittedLocked(fh, committedRev)
+								fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, entry.ShadowGen, entry.PendingIndexGen)
 							} else {
 								fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
 								fs.finalizeHandleFlushLocked(fh, expectedRevision)
@@ -13485,14 +13492,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 
 		// Collect dirty parts that need re-upload (back-written after eviction)
 		dirtyParts := fh.Dirty.DirtyStreamedParts()
-		shadowGen := fh.ShadowStageGen
-		if shadowGen == 0 && fs.shadowStore != nil {
-			shadowGen = fs.shadowStore.ActiveGeneration(fh.Path)
-		}
-		pendingIndexGen := fh.PendingIndexGen
-		if pendingIndexGen == 0 && fs.pendingIndex != nil {
-			pendingIndexGen = fs.pendingIndex.Generation(fh.Path)
-		}
+		stagingGens := fs.captureHandleStagingGensLocked(fh)
 
 		streamer := fh.Streamer
 		streamer.RefreshExpectedRevision(expectedRevision)
@@ -13542,7 +13542,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		// Remove stale shadow so subsequent read-only opens don't serve
 		// the empty placeholder created at Create/Open time.
-		fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, shadowGen, pendingIndexGen)
+		fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		// Local flush — kernel receives the Flush reply with status.
 		// No notifyInode needed; kernel will refresh attrs on next access.
@@ -13564,14 +13564,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 				partSnapshots[pn] = cp
 			}
 		}
-		shadowGen := fh.ShadowStageGen
-		if shadowGen == 0 && fs.shadowStore != nil {
-			shadowGen = fs.shadowStore.ActiveGeneration(fh.Path)
-		}
-		pendingIndexGen := fh.PendingIndexGen
-		if pendingIndexGen == 0 && fs.pendingIndex != nil {
-			pendingIndexGen = fs.pendingIndex.Generation(fh.Path)
-		}
+		stagingGens := fs.captureHandleStagingGensLocked(fh)
 
 		streamer := fh.Streamer
 		streamer.RefreshExpectedRevision(expectedRevision)
@@ -13618,7 +13611,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.inodes.UpdateSize(fh.Ino, size)
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		// Remove stale shadow (same reason as Path 1a above).
-		fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, shadowGen, pendingIndexGen)
+		fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		// Local flush — kernel receives the Flush reply with status.
 		// No notifyInode needed; kernel will refresh attrs on next access.
@@ -14258,6 +14251,22 @@ func (fs *Dat9FS) readCommitEntryPayloadForCache(entry *CommitEntry) ([]byte, er
 		return nil, err
 	}
 	return data, nil
+}
+
+// captureHandleStagingGensLocked returns only the generations explicitly owned
+// by fh. It intentionally does not fall back to ActiveGeneration(path): handles
+// with zero generation fields may be racing with CommitQueue-owned staging, and
+// using the path's current generation would let an older handle clean up or bind
+// a newer payload it did not create.
+func (fs *Dat9FS) captureHandleStagingGensLocked(fh *FileHandle) StagingGens {
+	if fs == nil || fh == nil {
+		return StagingGens{}
+	}
+	return StagingGens{
+		WriteBackGen:    fh.WriteBackGen,
+		PendingIndexGen: fh.PendingIndexGen,
+		ShadowGen:       fh.ShadowStageGen,
+	}
 }
 
 // snapshotStagingGens captures the pendingIndex and shadowStore content

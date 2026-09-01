@@ -4764,13 +4764,13 @@ func TestUnlink_PendingNewCommitQueueUploadedDeletesRemote(t *testing.T) {
 	fs.commitQueue = cq
 	fs.inodes.Lookup(p, false, int64(len(data)), time.Now())
 
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:    p,
 		Inode:   2,
 		Size:    int64(len(data)),
 		Kind:    PendingNew,
 		BaseRev: 0,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 

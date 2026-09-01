@@ -1421,3 +1421,148 @@ func TestShadowSpillSyncCleanupKeepsNewerGeneration(t *testing.T) {
 	}
 	handlerErrors.Check(t)
 }
+
+func TestRemoveHandleStagingWithoutGenerationPreservesQueueOwnedStaging(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	writeBack, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.writeBack = writeBack
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const path = "/queued.db"
+	payload := []byte("queue-owned generation")
+	writeBackGen, _, err := writeBack.PutWithBaseRevAndModeTimings(path, payload, int64(len(payload)), PendingOverwrite, 3, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(path, payload, 3); err != nil {
+		t.Fatal(err)
+	}
+	shadowGen := shadow.ActiveGeneration(path)
+	pendingGen, err := pending.PutWithBaseRev(path, int64(len(payload)), PendingOverwrite, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// This mirrors the queue-owned state after a CommitEntry has taken over and
+	// the producing handle's generation fields have been cleared. A later gen-0
+	// handle cleanup must not path-wide delete that queued payload.
+	fs.removeHandleStagingLocked(&FileHandle{Path: path})
+
+	wbMeta, ok := writeBack.GetMeta(path)
+	if !ok {
+		t.Fatal("queue-owned writeback entry was removed by gen-0 handle cleanup")
+	}
+	if wbMeta.Generation != writeBackGen {
+		t.Fatalf("writeback generation = %d, want %d", wbMeta.Generation, writeBackGen)
+	}
+	pendingMeta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("queue-owned pending entry was removed by gen-0 handle cleanup")
+	}
+	if pendingMeta.Generation != pendingGen {
+		t.Fatalf("pending generation = %d, want %d", pendingMeta.Generation, pendingGen)
+	}
+	data, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(payload) {
+		t.Fatalf("shadow data = %q, want queue-owned payload", data)
+	}
+	if got := shadow.ActiveGeneration(path); got != shadowGen {
+		t.Fatalf("shadow generation = %d, want %d", got, shadowGen)
+	}
+}
+
+func TestShadowSpillDirectPUTCleanupKeepsNewerGeneration(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const path = "/small.db-wal"
+	oldPayload := []byte("old checkpoint A")
+	freshPayload := []byte("fresh checkpoint B")
+	if err := shadow.WriteFull(path, oldPayload, 2); err != nil {
+		t.Fatal(err)
+	}
+	oldShadowGen := shadow.ActiveGeneration(path)
+	oldPendingGen, err := pending.PutShadowSpill(path, int64(len(oldPayload)), PendingOverwrite, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Path:              path,
+		ShadowReady:       true,
+		ShadowSpill:       true,
+		ShadowCommitReady: true,
+		ShadowStageGen:    oldShadowGen,
+		PendingIndexGen:   oldPendingGen,
+	}
+
+	if err := shadow.WriteFull(path, freshPayload, 3); err != nil {
+		t.Fatal(err)
+	}
+	freshShadowGen := shadow.ActiveGeneration(path)
+	freshPendingGen, err := pending.PutShadowSpill(path, int64(len(freshPayload)), PendingOverwrite, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the direct-PUT ShadowSpill success tail after H1 uploaded gen 1
+	// but H2 staged gen 2 before H1's cleanup. The cache seed must not live-read
+	// gen 2 as if it were H1's uploaded payload, and cleanup must only target
+	// H1's captured generations.
+	if fs.seedReadCacheFromShadowGenerationLocked(path, int64(len(oldPayload)), 4, oldShadowGen) {
+		t.Fatal("stale direct-PUT success tail seeded read cache from newer shadow generation")
+	}
+	fs.markHandleRemoteCommittedLocked(fh, 4)
+	fs.removeShadowPendingStagingGenerationLocked(fh, path, oldShadowGen, oldPendingGen)
+
+	if cached, ok := fs.readCache.Get(path, 4); ok {
+		t.Fatalf("read cache contains %q for rev4; stale success tail must not cache a live newer generation", cached)
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("newer pending generation was removed by stale direct-PUT cleanup")
+	}
+	if meta.Generation != freshPendingGen {
+		t.Fatalf("pending generation = %d, want fresh generation %d", meta.Generation, freshPendingGen)
+	}
+	data, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(freshPayload) {
+		t.Fatalf("shadow data = %q, want fresh payload", data)
+	}
+	if got := shadow.ActiveGeneration(path); got != freshShadowGen {
+		t.Fatalf("shadow generation = %d, want fresh generation %d", got, freshShadowGen)
+	}
+}

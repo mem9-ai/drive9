@@ -661,7 +661,14 @@ func (cq *CommitQueue) RecoverPending() {
 			PendingIndexGen:   meta.Generation,
 		}
 		if cq.shadows != nil {
-			entry.ShadowGen = cq.shadows.ActiveGeneration(path)
+			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path, meta.BaseRev)
+			if entry.ShadowGen == 0 {
+				safeLogPrintf("commit queue: skipping recovered pending entry for %s (shadow generation unavailable)", path)
+				if _, err := cq.index.MarkConflictIfGeneration(path, meta.Generation); err != nil {
+					safeLogPrintf("commit queue: mark recovered pending conflict failed for %s: %v", path, err)
+				}
+				continue
+			}
 		}
 		if err := cq.Enqueue(entry); err != nil {
 			safeLogPrintf("commit queue: recover enqueue failed for %s: %v", path, err)
@@ -1989,15 +1996,11 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	if cq.shadows != nil && cq.layerRefSnapshot() == "" {
 		if entry.ShadowGen != 0 {
 			cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
-		} else {
-			cq.shadows.Remove(entry.Path)
 		}
 	}
 	if cq.index != nil && cq.layerRefSnapshot() == "" {
 		if entry.PendingIndexGen != 0 {
 			cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
-		} else {
-			cq.index.Remove(entry.Path)
 		}
 	}
 	if cq.index != nil && cq.layerRefSnapshot() != "" {
@@ -2310,8 +2313,14 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		cq.onCommitTerminalFailure(entry)
 		return
 	}
-	defer release()
-	defer func() { _ = fd.Close() }()
+	defer func() {
+		if fd != nil {
+			_ = fd.Close()
+		}
+		if release != nil {
+			release()
+		}
+	}()
 	if stat.Size != localSize {
 		safeLogPrintf("commit queue: ShadowSpill conflict for %s is genuine (local %d bytes vs server %d bytes), terminal failure", entry.Path, localSize, stat.Size)
 		cq.onCommitTerminalFailure(entry)
@@ -2362,6 +2371,12 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 	}
 
 	safeLogPrintf("commit queue: auto-resolved ShadowSpill conflict for %s (idempotent, %d bytes match server rev %d)", entry.Path, localSize, stat.Revision)
+	// onCommitSuccess removes the shadow generation. Release the OpenIfGeneration
+	// path lock first to avoid self-deadlock on generation-scoped cleanup.
+	_ = fd.Close()
+	fd = nil
+	release()
+	release = nil
 	if err := cq.onCommitSuccess(entry, stat.Revision, stat.Revision); err != nil {
 		cq.onCommitPostUploadFailure(entry, err)
 	}

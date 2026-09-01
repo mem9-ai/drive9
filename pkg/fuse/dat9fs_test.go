@@ -20100,12 +20100,12 @@ func TestRenamePendingNewCommitSyncCommitsGitLooseObjectFinalPath(t *testing.T) 
 	oldIno := fs.inodes.Lookup(oldP, false, int64(len(data)), time.Now())
 	dirIno := fs.inodes.Lookup("/repo/.git/objects/70", true, 0, time.Now())
 
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:  oldP,
 		Inode: oldIno,
 		Size:  int64(len(data)),
 		Kind:  PendingNew,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("enqueue old temp upload: %v", err)
 	}
 	select {
@@ -20352,12 +20352,12 @@ func TestRenamePendingNewCommitFallsBackWhenFinalTargetExists(t *testing.T) {
 	dirIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
 	fs.inodes.Lookup(newP, false, 36, time.Now())
 
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:  oldP,
 		Inode: oldIno,
 		Size:  int64(len(data)),
 		Kind:  PendingNew,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("enqueue old temp upload: %v", err)
 	}
 

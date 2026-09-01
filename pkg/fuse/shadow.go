@@ -1305,6 +1305,54 @@ func (s *ShadowStore) ActiveGeneration(remotePath string) uint64 {
 	return s.writeGen[remotePath]
 }
 
+// EnsureActiveGeneration loads the active shadow for remotePath, including a
+// hash-keyed shadow recovered from disk, and returns a nonzero content
+// generation for it. Recovered shadows start without memory-only writeGen
+// state; CommitQueue must mint one before binding a recovered CommitEntry so
+// later uploads and cleanup remain generation-scoped instead of path-wide.
+func (s *ShadowStore) EnsureActiveGeneration(remotePath string, baseRev int64) uint64 {
+	if s == nil || remotePath == "" {
+		return 0
+	}
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sf, ok := s.files[remotePath]
+	if !ok {
+		hashKey := "__hash:" + hashPath(remotePath)
+		if recovered, recoveredOK := s.files[hashKey]; recoveredOK {
+			sf = recovered
+			delete(s.files, hashKey)
+			s.files[remotePath] = sf
+		} else {
+			fd, err := os.OpenFile(s.shadowPath(remotePath), os.O_RDWR, 0o644)
+			if err != nil {
+				return 0
+			}
+			fi, err := fd.Stat()
+			if err != nil {
+				_ = fd.Close()
+				return 0
+			}
+			sf = &ShadowFile{fd: fd, size: fi.Size()}
+			s.files[remotePath] = sf
+		}
+	}
+	if sf == nil {
+		return 0
+	}
+	if baseRev != 0 {
+		sf.baseRev = baseRev
+	}
+	if gen := s.writeGen[remotePath]; gen != 0 {
+		return gen
+	}
+	return s.bumpWriteGenLocked(remotePath)
+}
+
 // bumpWriteGenLocked increments the content generation for remotePath. Called
 // under s.mu on every mutating write so ActiveGeneration reflects the latest
 // write. Returns the new generation.

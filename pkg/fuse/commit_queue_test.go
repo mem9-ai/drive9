@@ -18,6 +18,19 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
+func attachTestStagingGens(shadow *ShadowStore, pending *PendingIndex, entry *CommitEntry) *CommitEntry {
+	if entry == nil {
+		return nil
+	}
+	if shadow != nil && entry.ShadowGen == 0 {
+		entry.ShadowGen = shadow.ActiveGeneration(entry.Path)
+	}
+	if pending != nil && entry.PendingIndexGen == 0 {
+		entry.PendingIndexGen = pending.Generation(entry.Path)
+	}
+	return entry
+}
+
 func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 	var gotExpected string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -41,7 +54,9 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 	if err := shadow.WriteFull("/ok.txt", []byte("data"), 7); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pending.PutWithBaseRev("/ok.txt", 4, PendingOverwrite, 7); err != nil {
+	shadowGen := shadow.ActiveGeneration("/ok.txt")
+	pendingGen, err := pending.PutWithBaseRev("/ok.txt", 4, PendingOverwrite, 7)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -54,10 +69,12 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 		successRev = committedRev
 	}
 	if err := cq.Enqueue(&CommitEntry{
-		Path:    "/ok.txt",
-		BaseRev: 7,
-		Size:    4,
-		Kind:    PendingOverwrite,
+		Path:            "/ok.txt",
+		BaseRev:         7,
+		Size:            4,
+		Kind:            PendingOverwrite,
+		ShadowGen:       shadowGen,
+		PendingIndexGen: pendingGen,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -126,23 +143,27 @@ func TestCommitQueueBatchWriteUsesBatchEndpoint(t *testing.T) {
 	if err := shadow.WriteFull("/a.txt", []byte("a"), 0); err != nil {
 		t.Fatal(err)
 	}
+	aShadowGen := shadow.ActiveGeneration("/a.txt")
 	if err := shadow.WriteFull("/b.txt", []byte("b"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pending.PutWithBaseRev("/a.txt", 1, PendingNew, 0); err != nil {
+	bShadowGen := shadow.ActiveGeneration("/b.txt")
+	aPendingGen, err := pending.PutWithBaseRev("/a.txt", 1, PendingNew, 0)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pending.PutWithBaseRev("/b.txt", 1, PendingNew, 0); err != nil {
+	bPendingGen, err := pending.PutWithBaseRev("/b.txt", 1, PendingNew, 0)
+	if err != nil {
 		t.Fatal(err)
 	}
 	c := newTestClient(ts.URL)
 	c.Warm(context.Background())
 	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	cq.ConfigureBatchWrite(10*time.Millisecond, 64, client.MaxBatchWriteBytes)
-	if err := cq.Enqueue(&CommitEntry{Path: "/a.txt", Size: 1, Kind: PendingNew}); err != nil {
+	if err := cq.Enqueue(&CommitEntry{Path: "/a.txt", Size: 1, Kind: PendingNew, ShadowGen: aShadowGen, PendingIndexGen: aPendingGen}); err != nil {
 		t.Fatal(err)
 	}
-	if err := cq.Enqueue(&CommitEntry{Path: "/b.txt", Size: 1, Kind: PendingNew}); err != nil {
+	if err := cq.Enqueue(&CommitEntry{Path: "/b.txt", Size: 1, Kind: PendingNew, ShadowGen: bShadowGen, PendingIndexGen: bPendingGen}); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -350,22 +371,30 @@ func TestCommitQueueBatchWriteFallsBackWhenUnsupported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	type stagingGen struct {
+		shadow  uint64
+		pending uint64
+	}
+	gens := make(map[string]stagingGen)
 	for _, path := range []string{"/a.txt", "/b.txt"} {
 		if err := shadow.WriteFull(path, []byte("x"), 0); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pending.PutWithBaseRev(path, 1, PendingNew, 0); err != nil {
+		shadowGen := shadow.ActiveGeneration(path)
+		pendingGen, err := pending.PutWithBaseRev(path, 1, PendingNew, 0)
+		if err != nil {
 			t.Fatal(err)
 		}
+		gens[path] = stagingGen{shadow: shadowGen, pending: pendingGen}
 	}
 	c := newTestClient(ts.URL)
 	c.Warm(context.Background())
 	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	cq.ConfigureBatchWrite(10*time.Millisecond, 64, client.MaxBatchWriteBytes)
-	if err := cq.Enqueue(&CommitEntry{Path: "/a.txt", Size: 1, Kind: PendingNew}); err != nil {
+	if err := cq.Enqueue(&CommitEntry{Path: "/a.txt", Size: 1, Kind: PendingNew, ShadowGen: gens["/a.txt"].shadow, PendingIndexGen: gens["/a.txt"].pending}); err != nil {
 		t.Fatal(err)
 	}
-	if err := cq.Enqueue(&CommitEntry{Path: "/b.txt", Size: 1, Kind: PendingNew}); err != nil {
+	if err := cq.Enqueue(&CommitEntry{Path: "/b.txt", Size: 1, Kind: PendingNew, ShadowGen: gens["/b.txt"].shadow, PendingIndexGen: gens["/b.txt"].pending}); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -419,22 +448,30 @@ func TestCommitQueueBatchWriteFallsBackPerItemFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	type stagingGen struct {
+		shadow  uint64
+		pending uint64
+	}
+	gens := make(map[string]stagingGen)
 	for _, path := range []string{"/a.txt", "/b.txt"} {
 		if err := shadow.WriteFull(path, []byte("x"), 0); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pending.PutWithBaseRev(path, 1, PendingNew, 0); err != nil {
+		shadowGen := shadow.ActiveGeneration(path)
+		pendingGen, err := pending.PutWithBaseRev(path, 1, PendingNew, 0)
+		if err != nil {
 			t.Fatal(err)
 		}
+		gens[path] = stagingGen{shadow: shadowGen, pending: pendingGen}
 	}
 	c := newTestClient(ts.URL)
 	c.Warm(context.Background())
 	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	cq.ConfigureBatchWrite(10*time.Millisecond, 64, client.MaxBatchWriteBytes)
-	if err := cq.Enqueue(&CommitEntry{Path: "/a.txt", Size: 1, Kind: PendingNew}); err != nil {
+	if err := cq.Enqueue(&CommitEntry{Path: "/a.txt", Size: 1, Kind: PendingNew, ShadowGen: gens["/a.txt"].shadow, PendingIndexGen: gens["/a.txt"].pending}); err != nil {
 		t.Fatal(err)
 	}
-	if err := cq.Enqueue(&CommitEntry{Path: "/b.txt", Size: 1, Kind: PendingNew}); err != nil {
+	if err := cq.Enqueue(&CommitEntry{Path: "/b.txt", Size: 1, Kind: PendingNew, ShadowGen: gens["/b.txt"].shadow, PendingIndexGen: gens["/b.txt"].pending}); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -992,13 +1029,13 @@ func TestCommitQueueSkipsDefaultModeForPendingNew(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:    "/plain.txt",
 		Size:    4,
 		Kind:    PendingNew,
 		Mode:    defaultRegularFileMode,
 		HasMode: true,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -1062,13 +1099,13 @@ func TestCommitQueueRetriesPostUploadChmodNotFound(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:    "/exec-retry.sh",
 		Size:    4,
 		Kind:    PendingNew,
 		Mode:    0o755,
 		HasMode: true,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -1252,7 +1289,7 @@ func TestCommitQueueCancelPathDoesNotPoisonFutureSamePath(t *testing.T) {
 	if _, err := pending.PutWithBaseRev(path, int64(len(newData)), PendingNew, 0); err != nil {
 		t.Fatal(err)
 	}
-	newEntry := &CommitEntry{Path: path, Size: int64(len(newData)), Kind: PendingNew}
+	newEntry := attachTestStagingGens(shadow, pending, &CommitEntry{Path: path, Size: int64(len(newData)), Kind: PendingNew})
 	if cq.isEntryCanceled(newEntry) {
 		t.Fatal("new entry for same path must not inherit old cancellation")
 	}
@@ -1419,12 +1456,12 @@ func TestCommitQueueDirectPutRouting(t *testing.T) {
 		}
 
 		cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
-		if err := cq.Enqueue(&CommitEntry{
+		if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 			Path:    "/small.bin",
 			BaseRev: 5,
 			Size:    int64(len(data)),
 			Kind:    PendingOverwrite,
-		}); err != nil {
+		})); err != nil {
 			t.Fatal(err)
 		}
 		cq.DrainAll()
@@ -1622,12 +1659,12 @@ func TestCommitQueueAutoResolveLWW(t *testing.T) {
 		}
 		successRev = committedRev
 	}
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:    "/lww.txt",
 		BaseRev: 5,
 		Size:    12,
 		Kind:    PendingOverwrite,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -1699,12 +1736,12 @@ func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
 		}
 		successRev = committedRev
 	}
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:    "/idem.txt",
 		BaseRev: 5,
 		Size:    int64(len(sameContent)),
 		Kind:    PendingOverwrite,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -1968,13 +2005,13 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 		}
 		successRev = committedRev
 	}
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:        "/big.bin",
 		BaseRev:     12,
 		Size:        int64(len(data)),
 		Kind:        PendingOverwrite,
 		ShadowSpill: true,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -2043,7 +2080,9 @@ func TestCommitQueueShadowSpillSmallFileDirectPUTCleansState(t *testing.T) {
 	if err := shadow.WriteFull(path, data, 12); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pending.PutShadowSpill(path, int64(len(data)), PendingOverwrite, 12); err != nil {
+	shadowGen := shadow.ActiveGeneration(path)
+	pendingGen, err := pending.PutShadowSpill(path, int64(len(data)), PendingOverwrite, 12)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -2055,11 +2094,13 @@ func TestCommitQueueShadowSpillSmallFileDirectPUTCleansState(t *testing.T) {
 		successRev = committedRev
 	}
 	if err := cq.Enqueue(&CommitEntry{
-		Path:        path,
-		BaseRev:     12,
-		Size:        int64(len(data)),
-		Kind:        PendingOverwrite,
-		ShadowSpill: true,
+		Path:            path,
+		BaseRev:         12,
+		Size:            int64(len(data)),
+		Kind:            PendingOverwrite,
+		ShadowSpill:     true,
+		ShadowGen:       shadowGen,
+		PendingIndexGen: pendingGen,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -2183,14 +2224,14 @@ func TestCommitQueueMultipartCreateInfersRevisionForOpenHandle(t *testing.T) {
 	fhID := fs.allocateFileHandle(fh)
 	defer fs.deleteFileHandle(fhID, fh)
 
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:        path,
 		Inode:       ino,
 		BaseRev:     0,
 		Size:        int64(len(data)),
 		Kind:        PendingNew,
 		ShadowSpill: true,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -2328,13 +2369,13 @@ func TestCommitQueueShadowSpillConflictIdempotent(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:        "/big.bin",
 		BaseRev:     5,
 		Size:        int64(len(data)),
 		Kind:        PendingOverwrite,
 		ShadowSpill: true,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -2402,12 +2443,12 @@ func TestCommitQueueAutoResolveNotFoundRetriesAsCreate(t *testing.T) {
 	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
 		successRev = committedRev
 	}
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:    "/recovered.txt",
 		BaseRev: 0,
 		Size:    14,
 		Kind:    PendingNew,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -2514,13 +2555,13 @@ func TestCommitQueueShadowSpillConflictNotFoundRetriesAsCreate(t *testing.T) {
 	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
 		successRev = committedRev
 	}
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:        "/recovered-spill.bin",
 		BaseRev:     0,
 		Size:        int64(len(data)),
 		Kind:        PendingNew,
 		ShadowSpill: true,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -2737,6 +2778,169 @@ func TestCommitQueueRecoverPendingUsesShadowSize(t *testing.T) {
 	}
 	if pending.HasPending("/stale.bin") {
 		t.Error("pending entry not cleaned up after recovered commit")
+	}
+}
+
+func TestCommitQueueRecoverPendingBindsGenerationAndPreservesNewerRestage(t *testing.T) {
+	const path = "/recover-restage.db"
+	oldPayload := []byte("recovered old payload")
+	freshPayload := []byte("newer restaged payload")
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "stale recovered payload must be rejected before remote I/O", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	shadowDir := t.TempDir()
+	pendingDir := t.TempDir()
+
+	shadow1, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending1, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow1.WriteFull(path, oldPayload, 5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending1.PutWithBaseRev(path, int64(len(oldPayload)), PendingOverwrite, 5); err != nil {
+		t.Fatal(err)
+	}
+	shadow1.Close()
+
+	shadow2, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow2.Close()
+	if err := shadow2.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	pending2, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pending2.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(50000)
+	cq := NewCommitQueue(c, shadow2, pending2, nil, 1, 8)
+	lockEntered := make(chan struct{})
+	releaseLock := make(chan struct{})
+	var enterOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseLock) })
+	}
+	defer release()
+	cq.PathLock = func(p string) func() {
+		if p == path {
+			enterOnce.Do(func() {
+				close(lockEntered)
+				<-releaseLock
+			})
+		}
+		return func() {}
+	}
+	cq.RecoverPending()
+	select {
+	case <-lockEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovered commit did not enter path lock")
+	}
+	if gen := shadow2.ActiveGeneration(path); gen == 0 {
+		t.Fatal("RecoverPending did not mint a shadow generation for recovered payload")
+	}
+
+	if err := shadow2.WriteFull(path, freshPayload, 6); err != nil {
+		t.Fatal(err)
+	}
+	freshShadowGen := shadow2.ActiveGeneration(path)
+	freshPendingGen, err := pending2.PutWithBaseRev(path, int64(len(freshPayload)), PendingOverwrite, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	release()
+	cq.DrainAll()
+
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote requests = %d, want 0; stale recovered generation must fail locally", got)
+	}
+	meta, ok := pending2.GetMeta(path)
+	if !ok {
+		t.Fatal("newer restaged pending generation was removed")
+	}
+	if meta.Generation != freshPendingGen || meta.Kind == PendingConflict {
+		t.Fatalf("pending meta = %+v, want fresh generation %d and not conflict", meta, freshPendingGen)
+	}
+	data, err := shadow2.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(freshPayload) {
+		t.Fatalf("shadow data = %q, want fresh restaged payload", data)
+	}
+	if got := shadow2.ActiveGeneration(path); got != freshShadowGen {
+		t.Fatalf("shadow generation = %d, want fresh generation %d", got, freshShadowGen)
+	}
+}
+
+func TestCommitQueueGenZeroSuccessCleanupPreservesStaging(t *testing.T) {
+	const path = "/gen-zero-cleanup.db"
+	payload := []byte("fresh staged payload")
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(path, payload, 6); err != nil {
+		t.Fatal(err)
+	}
+	shadowGen := shadow.ActiveGeneration(path)
+	pendingGen, err := pending.PutWithBaseRev(path, int64(len(payload)), PendingOverwrite, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient("http://localhost"), shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	if err := cq.onCommitSuccessWithOptions(&CommitEntry{
+		Path:         path,
+		BaseRev:      5,
+		Size:         int64(len(payload)),
+		Kind:         PendingOverwrite,
+		ShadowGen:    0,
+		WriteBackGen: 0,
+	}, 5, 6, false); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("gen-0 success cleanup removed pending state")
+	}
+	if meta.Generation != pendingGen {
+		t.Fatalf("pending generation = %d, want %d", meta.Generation, pendingGen)
+	}
+	data, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(payload) {
+		t.Fatalf("shadow data = %q, want staged payload", data)
+	}
+	if got := shadow.ActiveGeneration(path); got != shadowGen {
+		t.Fatalf("shadow generation = %d, want %d", got, shadowGen)
 	}
 }
 
@@ -3065,7 +3269,7 @@ func TestCommitQueueDelayedZeroTruncateTimerDispatches(t *testing.T) {
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	cq.zeroTruncateDelay = 20 * time.Millisecond
 	defer cq.DrainAll()
-	if err := cq.Enqueue(&CommitEntry{Path: "/standalone.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}); err != nil {
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{Path: "/standalone.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true})); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -3355,7 +3559,7 @@ func TestCommitQueueDrainAllForcesDelayedZeroTruncate(t *testing.T) {
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	cq.zeroTruncateDelay = time.Hour
-	if err := cq.Enqueue(&CommitEntry{Path: "/drain.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}); err != nil {
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{Path: "/drain.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
