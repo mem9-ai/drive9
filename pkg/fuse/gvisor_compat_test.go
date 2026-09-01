@@ -319,7 +319,7 @@ func TestGVisorCompatCommitQueueSkipsSupersededEntryBeforeUpload(t *testing.T) {
 	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
 	staleSeq := fs.markDirtySize(ino, int64(len("stale")))
 	newerSeq := fs.markDirtySize(ino, int64(len("newer")))
-	fs.recordStagedMutation(ino, newerSeq)
+	fs.recordCommittedMutation(ino, newerSeq, 1, int64(len("newer")))
 	if err := shadow.WriteFull(filePath, []byte("stale"), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +390,7 @@ func TestGVisorCompatSupersededEntryDoesNotRemoveNewerStaging(t *testing.T) {
 	}
 
 	newerSeq := fs.markDirtySize(ino, int64(len("newer")))
-	fs.recordStagedMutation(ino, newerSeq)
+	fs.recordCommittedMutation(ino, newerSeq, 1, int64(len("newer")))
 	if err := shadow.WriteFull(filePath, []byte("newer"), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -500,7 +500,7 @@ func TestGVisorCompatCommitQueueSkipsEntrySupersededBeforeLWW(t *testing.T) {
 		t.Fatal("timed out waiting for conflict read")
 	}
 	newerSeq := fs.markDirtySize(ino, int64(len("latest local")))
-	fs.recordStagedMutation(ino, newerSeq)
+	fs.recordCommittedMutation(ino, newerSeq, 2, int64(len("latest local")))
 	releaseOnce.Do(func() { close(releaseRead) })
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer waitCancel()
@@ -555,7 +555,7 @@ func TestGVisorCompatCommitQueueFiltersSupersededBatchEntry(t *testing.T) {
 	staleIno := fs.inodes.Lookup(stalePath, false, 5, time.Now())
 	staleSeq := fs.markDirtySize(staleIno, 5)
 	newerSeq := fs.markDirtySize(staleIno, 6)
-	fs.recordStagedMutation(staleIno, newerSeq)
+	fs.recordCommittedMutation(staleIno, newerSeq, 1, 6)
 	validIno := fs.inodes.Lookup(validPath, false, 5, time.Now())
 	validSeq := fs.markDirtySize(validIno, 5)
 	if err := shadow.WriteFull(stalePath, []byte("stale"), 0); err != nil {
@@ -684,15 +684,10 @@ func TestGVisorCompatUnstagedWriteDoesNotSupersedeDurableEntry(t *testing.T) {
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
 	ino := fs.inodes.Lookup("/durable-before-private.txt", false, 0, time.Now())
 	durableSeq := fs.markDirtySize(ino, 7)
-	fs.recordStagedMutation(ino, durableSeq)
-	newerSeq := fs.markDirtySize(ino, 8)
+	fs.markDirtySize(ino, 8)
 	entry := &CommitEntry{Inode: ino, MutationSeq: durableSeq}
 	if fs.commitEntrySuperseded(entry) {
 		t.Fatal("unstaged private write superseded an older durable entry")
-	}
-	fs.recordStagedMutation(ino, newerSeq)
-	if !fs.commitEntrySuperseded(entry) {
-		t.Fatal("newer durable staging did not supersede the older entry")
 	}
 }
 

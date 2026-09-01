@@ -735,6 +735,24 @@ func (cq *CommitQueue) HasPath(path string) bool {
 	return cq.hasQueuedPathLocked(path)
 }
 
+func (cq *CommitQueue) mutationSeqForPath(path string) uint64 {
+	if cq == nil || path == "" {
+		return 0
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	var seq uint64
+	if entry := cq.inFlight[path]; entry != nil && entry.MutationSeq > seq {
+		seq = entry.MutationSeq
+	}
+	for entry := range cq.queuedByPath[path] {
+		if entry != nil && entry.MutationSeq > seq {
+			seq = entry.MutationSeq
+		}
+	}
+	return seq
+}
+
 // WaitPrefix blocks until all in-flight or queued commits under the given
 // prefix complete. Used by Rename to wait for descendant commits.
 func (cq *CommitQueue) WaitPrefix(prefix string) {
