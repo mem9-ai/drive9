@@ -5009,6 +5009,20 @@ func (fs *Dat9FS) inodeSnapshotSize(ino uint64) int64 {
 	return entry.Size
 }
 
+func (fs *Dat9FS) committedOpenHandleSnapshotState(ino uint64, localPath string, size, revision int64) (int64, int64) {
+	if !fs.gvisorCompatibilityEnabled() {
+		return size, revision
+	}
+	if state, ok := fs.committedMutation(ino); ok && state.committedRevision > revision {
+		size = state.committedSize
+		revision = state.committedRevision
+	}
+	if committedRevision := fs.latestCommittedRevision(localPath); committedRevision > revision {
+		revision = committedRevision
+	}
+	return size, revision
+}
+
 func (fs *Dat9FS) snapshotOpenHandlesBeforeUnlink(ctx context.Context, localPath string) error {
 	return fs.snapshotOpenHandlesForPath(ctx, localPath, nil)
 }
@@ -5061,6 +5075,7 @@ func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath stri
 		if !eligible || handlePath != localPath || size < 0 || size > maxPathTruncateInMemoryBytes {
 			continue
 		}
+		size, inodeRevision = fs.committedOpenHandleSnapshotState(fh.Ino, localPath, size, inodeRevision)
 		candidates = append(candidates, candidate{fh: fh, size: size, revision: inodeRevision})
 	}
 	if len(candidates) == 0 {

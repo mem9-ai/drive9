@@ -166,6 +166,10 @@ type CommitQueue struct {
 	// recovery entries remain unfiltered by the Dat9FS implementation.
 	IsSuperseded CommitSupersededFunc
 
+	// serializeMutationInodes extends queue dispatch ordering across hardlink
+	// aliases for live-handle mutations. It is enabled only for gVisor mounts.
+	serializeMutationInodes bool
+
 	// PathLock serializes upload and cleanup against Dat9FS same-path shadow
 	// mutations. When unset, the queue still serializes same-path entries.
 	PathLock func(path string) func()
@@ -767,6 +771,19 @@ func (cq *CommitQueue) hasNewerMutation(path string, ino, seq uint64) bool {
 	newer := func(entry *CommitEntry) bool {
 		return entry != nil && !entry.canceled && entry.Inode == ino && entry.MutationSeq > seq
 	}
+	if cq.serializeMutationInodes {
+		for _, entry := range cq.inFlight {
+			if newer(entry) {
+				return true
+			}
+		}
+		for _, entry := range cq.queue {
+			if newer(entry) {
+				return true
+			}
+		}
+		return false
+	}
 	if newer(cq.inFlight[path]) {
 		return true
 	}
@@ -1190,8 +1207,7 @@ func (cq *CommitQueue) beginInFlight(entry *CommitEntry) bool {
 		if cq.inFlight == nil {
 			cq.inFlight = make(map[string]*CommitEntry)
 		}
-		oldest := cq.oldestQueuedForPathLocked(entry.Path)
-		if cq.inFlight[entry.Path] == nil && (oldest == nil || oldest == entry) {
+		if cq.canBeginInFlightLocked(entry) {
 			cq.inFlight[entry.Path] = entry
 			cq.mu.Unlock()
 			return true
@@ -1213,11 +1229,34 @@ func (cq *CommitQueue) tryBeginInFlight(entry *CommitEntry) bool {
 	if cq.inFlight == nil {
 		cq.inFlight = make(map[string]*CommitEntry)
 	}
-	oldest := cq.oldestQueuedForPathLocked(entry.Path)
-	if cq.inFlight[entry.Path] != nil || (oldest != nil && oldest != entry) {
+	if !cq.canBeginInFlightLocked(entry) {
 		return false
 	}
 	cq.inFlight[entry.Path] = entry
+	return true
+}
+
+func (cq *CommitQueue) canBeginInFlightLocked(entry *CommitEntry) bool {
+	if cq == nil || entry == nil || cq.inFlight[entry.Path] != nil {
+		return false
+	}
+	if oldest := cq.oldestQueuedForPathLocked(entry.Path); oldest != nil && oldest != entry {
+		return false
+	}
+	if !cq.serializeMutationInodes || entry.Inode == 0 || entry.MutationSeq == 0 {
+		return true
+	}
+	for _, active := range cq.inFlight {
+		if active != nil && active != entry && active.Inode == entry.Inode && active.MutationSeq != 0 {
+			return false
+		}
+	}
+	for _, queued := range cq.queue {
+		if queued == nil || queued.canceled || queued.Inode != entry.Inode || queued.MutationSeq == 0 {
+			continue
+		}
+		return queued == entry
+	}
 	return true
 }
 

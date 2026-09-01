@@ -355,6 +355,56 @@ func TestGVisorCompatCommitQueueSkipsSupersededEntryBeforeUpload(t *testing.T) {
 	}
 }
 
+func TestGVisorCompatCommitQueueOrdersHardlinkAliasesByInode(t *testing.T) {
+	const ino = uint64(42)
+	older := &CommitEntry{Path: "/alias-b", Inode: ino, MutationSeq: 1}
+	newer := &CommitEntry{Path: "/alias-a", Inode: ino, MutationSeq: 2}
+
+	cq := &CommitQueue{
+		queue:                   []*CommitEntry{newer, older},
+		queuedByPath:            map[string]map[*CommitEntry]struct{}{newer.Path: {newer: {}}, older.Path: {older: {}}},
+		inFlight:                map[string]*CommitEntry{newer.Path: newer},
+		serializeMutationInodes: true,
+	}
+	if !cq.hasNewerMutation(older.Path, ino, older.MutationSeq) {
+		t.Fatal("newer queued hardlink alias was not visible to stale staging")
+	}
+	if cq.tryBeginInFlight(older) {
+		t.Fatal("hardlink alias upload began while the same inode was already in flight")
+	}
+
+	cq = &CommitQueue{
+		queue:                   []*CommitEntry{older, newer},
+		queuedByPath:            map[string]map[*CommitEntry]struct{}{newer.Path: {newer: {}}, older.Path: {older: {}}},
+		inFlight:                make(map[string]*CommitEntry),
+		serializeMutationInodes: true,
+	}
+	if cq.tryBeginInFlight(newer) {
+		t.Fatal("newer hardlink alias bypassed the older queued inode mutation")
+	}
+	if !cq.tryBeginInFlight(older) {
+		t.Fatal("oldest queued inode mutation did not begin")
+	}
+}
+
+func TestGVisorCompatDisabledCommitQueueDoesNotOrderHardlinkAliases(t *testing.T) {
+	const ino = uint64(42)
+	older := &CommitEntry{Path: "/alias-b", Inode: ino, MutationSeq: 1}
+	newer := &CommitEntry{Path: "/alias-a", Inode: ino, MutationSeq: 2}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{newer, older},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{newer.Path: {newer: {}}, older.Path: {older: {}}},
+		inFlight:     map[string]*CommitEntry{newer.Path: newer},
+	}
+
+	if cq.hasNewerMutation(older.Path, ino, older.MutationSeq) {
+		t.Fatal("disabled compatibility mode inspected another hardlink path")
+	}
+	if !cq.tryBeginInFlight(older) {
+		t.Fatal("disabled compatibility mode serialized hardlink aliases")
+	}
+}
+
 func TestGVisorCompatSupersededEntryDoesNotRemoveNewerStaging(t *testing.T) {
 	const filePath = "/superseded-generation.txt"
 	opts := &MountOptions{GVisorCompat: true}
@@ -1498,5 +1548,56 @@ func TestGVisorCompatOpenHandleSnapshotUsesRevisionMatchingReadCache(t *testing.
 				t.Fatalf("remote GET calls = %d, want %d", got, tc.wantGets)
 			}
 		})
+	}
+}
+
+func TestGVisorCompatOpenHandleSnapshotRejectsRevisionBehindCommittedFrontier(t *testing.T) {
+	const (
+		filePath          = "/committed-frontier-snapshot.txt"
+		inodeRevision     = int64(1)
+		committedRevision = int64(2)
+	)
+	oldData := []byte("old bytes")
+	newData := []byte("new bytes")
+	var getCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "unexpected request", http.StatusMethodNotAllowed)
+			return
+		}
+		getCalls.Add(1)
+		_, _ = w.Write(newData)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(oldData)), time.Now())
+	fs.inodes.UpdateRevision(ino, inodeRevision)
+	fs.readCache.Put(filePath, oldData, inodeRevision)
+	seq := fs.markDirtySize(ino, int64(len(newData)))
+	fs.recordCommittedRevision(filePath, committedRevision)
+	fs.recordCommittedMutation(ino, seq, committedRevision, int64(len(newData)))
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: int64(len(oldData)),
+		BaseRev:  inodeRevision,
+	}
+	fs.allocateFileHandle(fh)
+
+	if err := fs.snapshotOpenHandlesBeforeUnlink(context.Background(), filePath); err != nil {
+		t.Fatalf("snapshotOpenHandlesBeforeUnlink: %v", err)
+	}
+	fh.Lock()
+	got := append([]byte(nil), fh.UnlinkedData...)
+	fh.Unlock()
+	if !bytes.Equal(got, newData) {
+		t.Fatalf("snapshot = %q, want latest committed %q", got, newData)
+	}
+	if got := getCalls.Load(); got != 1 {
+		t.Fatalf("remote GET calls = %d, want 1 after rejecting stale cache", got)
 	}
 }
