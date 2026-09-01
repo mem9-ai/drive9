@@ -529,6 +529,8 @@ func Mount(opts *MountOptions) (err error) {
 				cq.SetPerfCounters(dat9fs.perf)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
 				cq.OnCleanup = dat9fs.onCommitQueueCleanup
+				cq.OnDiscard = dat9fs.onCommitQueueDiscard
+				cq.IsSuperseded = dat9fs.commitEntrySuperseded
 				cq.PathLock = dat9fs.lockRemoteCommitPath
 				cq.DurableWatermark = dat9fs.latestCommittedRevision
 				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {

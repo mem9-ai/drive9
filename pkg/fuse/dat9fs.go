@@ -1930,6 +1930,19 @@ func (fs *Dat9FS) committedMutation(ino uint64) (inodeMutationState, bool) {
 	return state, ok && state.committedSeq != 0
 }
 
+func (fs *Dat9FS) commitEntrySuperseded(entry *CommitEntry) bool {
+	if !fs.gvisorCompatibilityEnabled() || entry == nil || entry.Inode == 0 || entry.MutationSeq == 0 {
+		return false
+	}
+	fs.dirtyMu.Lock()
+	state, ok := fs.mutationInodes[entry.Inode]
+	fs.dirtyMu.Unlock()
+	if !ok {
+		return false
+	}
+	return entry.MutationSeq < state.latestSeq || entry.MutationSeq <= state.committedSeq
+}
+
 // discardSupersededMutationLocked turns a handle snapshot that is no newer
 // than the committed inode watermark into a clean view of the committed file.
 // Caller must hold fh.mu. Shared path-keyed staging is intentionally untouched.
@@ -1967,6 +1980,24 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 	}
 	clearReadTargetForLockedHandle(fh)
 	return true
+}
+
+func (fs *Dat9FS) removeHandleOwnedStagingLocked(fh *FileHandle) {
+	if fh == nil || fh.Path == "" {
+		return
+	}
+	if fs.writeBack != nil && fh.WriteBackGen != 0 {
+		fs.writeBack.RemoveIfGeneration(fh.Path, fh.WriteBackGen)
+	}
+	if fs.pendingIndex != nil && fh.PendingIndexGen != 0 {
+		fs.pendingIndex.RemoveIfGeneration(fh.Path, fh.PendingIndexGen)
+	}
+	if fs.shadowStore != nil && fh.ShadowStageGen != 0 {
+		fs.shadowStore.RemoveIfGeneration(fh.Path, fh.ShadowStageGen)
+	}
+	fh.WriteBackGen = 0
+	fh.PendingIndexGen = 0
+	fh.ShadowStageGen = 0
 }
 
 func (fs *Dat9FS) forgetMutationState(ino uint64) {
@@ -3662,6 +3693,11 @@ func (fs *Dat9FS) stageShadowForQueuedCommitLocked(fh *FileHandle, durable bool)
 	acquired := fh != nil && fh.RemoteCommitUnlock == nil
 	if fh != nil {
 		_ = fs.lockHandleRemoteCommitPathLocked(fh)
+		if fs.discardSupersededMutationLocked(fh) {
+			fs.removeHandleOwnedStagingLocked(fh)
+			fs.releaseHandleRemoteCommitPathLocked(fh)
+			return nil
+		}
 	}
 	err := fs.stageShadowLocked(fh, durable)
 	if err != nil && acquired {
@@ -3705,7 +3741,14 @@ func (fs *Dat9FS) bindCommitEntryToPath(entry *CommitEntry, remotePath string, p
 }
 
 func (fs *Dat9FS) enqueueStagedShadowCommitLocked(fh *FileHandle) error {
-	if fs == nil || fh == nil || fh.Dirty == nil || fs.commitQueue == nil || fs.shadowStore == nil || !fs.shadowStore.Has(fh.Path) {
+	if fs == nil || fh == nil || fh.Dirty == nil || fs.commitQueue == nil || fs.shadowStore == nil {
+		return syscall.ENOTSUP
+	}
+	if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+		fs.releaseHandleRemoteCommitPathLocked(fh)
+		return nil
+	}
+	if !fs.shadowStore.Has(fh.Path) {
 		return syscall.ENOTSUP
 	}
 	size := fh.Dirty.Size()
@@ -3713,15 +3756,17 @@ func (fs *Dat9FS) enqueueStagedShadowCommitLocked(fh *FileHandle) error {
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	payloadBaseRev := fh.BaseRev
 	entry := &CommitEntry{
-		Path:        fh.Path,
-		Inode:       fh.Ino,
-		MutationSeq: fh.DirtySeq,
-		BaseRev:     expectedRevision,
-		Size:        size,
-		Kind:        fs.pendingKindForHandle(fh),
-		ShadowSpill: fh.ShadowSpill,
-		Mode:        mode,
-		HasMode:     hasMode,
+		Path:            fh.Path,
+		Inode:           fh.Ino,
+		MutationSeq:     fh.DirtySeq,
+		PendingIndexGen: fh.PendingIndexGen,
+		ShadowGen:       fh.ShadowStageGen,
+		BaseRev:         expectedRevision,
+		Size:            size,
+		Kind:            fs.pendingKindForHandle(fh),
+		ShadowSpill:     fh.ShadowSpill,
+		Mode:            mode,
+		HasMode:         hasMode,
 	}
 	fs.bindCommitEntryToHandleLocked(entry, fh, payloadBaseRev)
 	if err := fs.commitQueue.Enqueue(entry); err != nil {
@@ -12479,6 +12524,10 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					if err != nil {
 						safeLogPrintf("shadow stage failed for %s: %v, falling through", fh.Path, err)
 					} else {
+						if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+							phase = "superseded-after-commit-fence"
+							return gofuse.OK
+						}
 						phase = "small-snapshot-writeback"
 						snapWBStart := time.Now()
 						// Advance WriteBackSeq only when the snapshot actually
@@ -12552,6 +12601,10 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			if err != nil {
 				safeLogPrintf("flush: shadow stage failed for ShadowSpill %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
 			} else {
+				if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+					phase = "superseded-after-commit-fence"
+					return gofuse.OK
+				}
 				fh.ShadowCommitReady = true
 				fh.ShadowCommitSeq = fh.DirtySeq
 				return gofuse.OK
@@ -12664,6 +12717,10 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				if err != nil {
 					safeLogPrintf("flush: shadow stage failed for %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
 				} else {
+					if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+						phase = "superseded-after-commit-fence"
+						return gofuse.OK
+					}
 					phase = "large-snapshot-writeback"
 					if err := fs.snapshotWriteBackLocked(fh); err != nil {
 						safeLogPrintf("flush: writeback snapshot failed for %s: %v", fh.Path, err)
@@ -12792,6 +12849,10 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			err := fs.stageShadowForQueuedCommitLocked(fh, true)
 			fs.debugDurationf(stageStart, 0, "fsync shadowspill stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
+				if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+					phase = "superseded-after-commit-fence"
+					return gofuse.OK
+				}
 				// Journal before enqueue: the async commit appends a
 				// JournalCommit marker, which must get a higher Seq than
 				// this fsync frame or replay resurrects a committed path.
@@ -12825,6 +12886,10 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			err := fs.stageShadowForQueuedCommitLocked(fh, true)
 			fs.debugDurationf(stageStart, 0, "fsync stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
+				if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+					phase = "superseded-after-commit-fence"
+					return gofuse.OK
+				}
 				// Journal before enqueue: the async commit appends a
 				// JournalCommit marker, which must get a higher Seq than
 				// this fsync frame or replay resurrects a committed path.
@@ -13327,6 +13392,14 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				fh.Unlock()
 				return
 			}
+			unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
+			if fs.discardSupersededMutationLocked(fh) {
+				fs.removeHandleOwnedStagingLocked(fh)
+				unlockRemoteCommit()
+				fh.Unlock()
+				phase = "superseded-after-commit-fence"
+				return
+			}
 			mutationSeq := fh.DirtySeq
 			size := fh.Dirty.Size()
 			mode, hasMode := fs.modeForPendingHandle(fh)
@@ -13352,7 +13425,6 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			fh.DirtySeq = 0
 			fh.ShadowCommitReady = false
 			fh.ShadowCommitSeq = 0
-			unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
 			fh.Unlock()
 
 			enqueueStart := time.Now()
@@ -13454,16 +13526,29 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			fs.debugf("release writeback check path=%s streamer_active=%t writeback_seq=%d dirty_seq=%d can_use_cache=%t", fh.Path, streamerActive, fh.WriteBackSeq, fh.DirtySeq, canUseCache)
 			if canUseCache {
 				phase = "writeback-cache-release"
+				useCommitQueue := fs.commitQueue != nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path)
+				var unlockRemoteCommit func()
+				if useCommitQueue {
+					unlockRemoteCommit = fs.takeHandleRemoteCommitPathLocked(fh)
+					if fs.discardSupersededMutationLocked(fh) {
+						fs.removeHandleOwnedStagingLocked(fh)
+						unlockRemoteCommit()
+						fh.Unlock()
+						phase = "superseded-after-commit-fence"
+						return
+					}
+				}
 				mode, hasMode := fs.modeForPendingHandle(fh)
 				expectedRevision := fs.expectedRevisionForHandleLocked(fh)
+				mutationSeq := fh.DirtySeq
+				commitSize := fh.Dirty.Size()
 				payloadBaseRev := fh.BaseRev
-				size := fh.Dirty.Size()
 				entry := &CommitEntry{
 					Path:        fh.Path,
 					Inode:       fh.Ino,
-					MutationSeq: fh.DirtySeq,
+					MutationSeq: mutationSeq,
 					BaseRev:     expectedRevision,
-					Size:        size,
+					Size:        commitSize,
 					Kind:        PendingOverwrite,
 					Mode:        mode,
 					HasMode:     hasMode,
@@ -13476,11 +13561,6 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 				fh.DirtySeq = 0
 				fh.WriteBackSeq = 0
-				useCommitQueue := fs.commitQueue != nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path)
-				var unlockRemoteCommit func()
-				if useCommitQueue {
-					unlockRemoteCommit = fs.takeHandleRemoteCommitPathLocked(fh)
-				}
 				fh.Unlock()
 
 				// Enqueue to CommitQueue if available (P1), otherwise
@@ -13524,7 +13604,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 
 				// Invalidate caches so subsequent reads see fresh data.
 				fs.invalidateReadCacheAndTargets(fh.Path)
-				fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
+				fs.cacheFileForPath(fh.Path, commitSize, time.Now(), 0)
 				// Local release — kernel already knows about this close.
 				// No notifyInode needed; userspace caches are invalidated above.
 				return
@@ -13853,16 +13933,6 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	mutationIno := fh.Ino
 	mutationSeq := fh.DirtySeq
 	mutationSize := fh.Dirty.Size()
-	defer func() {
-		if !fs.gvisorCompatibilityEnabled() || status != gofuse.OK || fs.layerEnabled() || mutationSeq == 0 || fh.Path != mutationPath {
-			return
-		}
-		revision := fs.latestCommittedRevision(mutationPath)
-		fs.recordCommittedMutation(mutationIno, mutationSeq, revision, mutationSize)
-		if revision > 0 {
-			fs.refreshCommittedRevisionForOpenHandlesWithSize(mutationPath, revision, fh, mutationSize)
-		}
-	}()
 
 	size := fh.Dirty.Size()
 	if fs.layerEnabled() {
@@ -13926,6 +13996,25 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}()
 
 	var err error
+	if fs.discardSupersededMutationLocked(fh) {
+		fs.removeHandleOwnedStagingLocked(fh)
+		phase = "superseded-after-commit-fence"
+		return gofuse.OK
+	}
+	mutationRecorded := false
+	recordMutationBeforeFenceRelease := func() {
+		if mutationRecorded || !fs.gvisorCompatibilityEnabled() || status != gofuse.OK || err != nil || mutationSeq == 0 || fh.Unlinked || fh.Path != mutationPath {
+			return
+		}
+		revision := fs.latestCommittedRevision(mutationPath)
+		fs.recordCommittedMutation(mutationIno, mutationSeq, revision, mutationSize)
+		if revision > 0 {
+			fs.refreshCommittedRevisionForOpenHandlesWithSize(mutationPath, revision, fh, mutationSize)
+		}
+		mutationRecorded = true
+	}
+	defer recordMutationBeforeFenceRelease()
+
 	// Path 1a: Streaming mode — parts were submitted during Write() and are
 	// buffered in the StreamUploader's pendingParts. We must finalize via
 	// FinishStreaming (which initiates the server upload with the actual total
@@ -14298,6 +14387,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	if err == nil {
 		fs.removeSupersededZeroTruncateStagingLocked(handlePath, committedBarrierRev, size)
 	}
+	recordMutationBeforeFenceRelease()
 
 	// Release remoteCommitLock AFTER upload + revision recording but
 	// BEFORE re-acquiring fh.mu. This preserves same-path serialization
@@ -14832,6 +14922,13 @@ func (fs *Dat9FS) onCommitQueueCleanup(entry *CommitEntry) {
 		return
 	}
 	fs.clearRemovedCommittedShadowForOpenHandles(entry.Path, fs.latestCommittedRevision(entry.Path), entry.Size)
+	fs.cleanupCommittedInode(entry.Inode, entry.Path)
+}
+
+func (fs *Dat9FS) onCommitQueueDiscard(entry *CommitEntry) {
+	if entry == nil || entry.Inode == 0 {
+		return
+	}
 	fs.cleanupCommittedInode(entry.Inode, entry.Path)
 }
 

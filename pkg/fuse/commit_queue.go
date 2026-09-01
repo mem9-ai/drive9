@@ -119,6 +119,10 @@ type CommitSuccessFunc func(entry *CommitEntry, committedRev int64)
 // state has been removed but before the queue entry is dequeued.
 type CommitCleanupFunc func(entry *CommitEntry)
 
+// CommitSupersededFunc reports whether a queued live-handle snapshot has been
+// overtaken by a newer mutation and must not reach remote storage.
+type CommitSupersededFunc func(entry *CommitEntry) bool
+
 // CommitQueue manages ordered background remote commits with baseRev tracking.
 // It provides backpressure when the queue exceeds maxPending items.
 type CommitQueue struct {
@@ -148,6 +152,14 @@ type CommitQueue struct {
 
 	// OnCleanup is called after local commit state has been removed.
 	OnCleanup CommitCleanupFunc
+
+	// OnDiscard is called after a superseded entry's owned staging and queue
+	// state have been removed without publishing commit success.
+	OnDiscard CommitCleanupFunc
+
+	// IsSuperseded is an optional upload-boundary guard. Sequence-zero path and
+	// recovery entries remain unfiltered by the Dat9FS implementation.
+	IsSuperseded CommitSupersededFunc
 
 	// PathLock serializes upload and cleanup against Dat9FS same-path shadow
 	// mutations. When unset, the queue still serializes same-path entries.
@@ -1072,6 +1084,24 @@ func (cq *CommitQueue) isEntryCanceled(entry *CommitEntry) bool {
 	return entry.canceled
 }
 
+func (cq *CommitQueue) discardSupersededEntry(entry *CommitEntry) bool {
+	if cq == nil || entry == nil || cq.IsSuperseded == nil || !cq.IsSuperseded(entry) {
+		return false
+	}
+	if cq.index != nil && entry.PendingIndexGen != 0 {
+		cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
+	}
+	if cq.shadows != nil && entry.ShadowGen != 0 {
+		cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
+	}
+	cq.removeFromQueue(entry)
+	if cq.OnDiscard != nil {
+		cq.OnDiscard(entry)
+	}
+	safeLogPrintf("commit queue: discarded superseded entry for %s (inode=%d seq=%d)", entry.Path, entry.Inode, entry.MutationSeq)
+	return true
+}
+
 func (cq *CommitQueue) worker() {
 	defer cq.wg.Done()
 	for entry := range cq.workCh {
@@ -1238,6 +1268,10 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cq.mu.Unlock()
 
 		unlockPath := cq.lockPath(entry.Path)
+		if cq.discardSupersededEntry(entry) {
+			unlockPath()
+			return
+		}
 		committedRev, err := cq.uploadEntry(ctx, entry)
 		cq.mu.Lock()
 		entry.cancelUpload = nil
@@ -1419,15 +1453,16 @@ func (cq *CommitQueue) batchWriteEligible(entry *CommitEntry) bool {
 }
 
 func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
+	allEntries := append([]*CommitEntry(nil), entries...)
 	entryCtx, entryCancel := context.WithCancel(context.Background())
 	cq.mu.Lock()
-	for _, entry := range entries {
+	for _, entry := range allEntries {
 		entry.cancelCommit = entryCancel
 	}
 	cq.mu.Unlock()
 	defer func() {
 		cq.mu.Lock()
-		for _, entry := range entries {
+		for _, entry := range allEntries {
 			entry.cancelCommit = nil
 			entry.cancelUpload = nil
 		}
@@ -1452,6 +1487,27 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 	}
 	cq.mu.Unlock()
 	unlockPaths := cq.lockBatchPaths(entries)
+	active := entries[:0]
+	for _, entry := range entries {
+		if cq.discardSupersededEntry(entry) {
+			cq.endInFlight(entry)
+			continue
+		}
+		active = append(active, entry)
+	}
+	entries = active
+	if len(entries) == 0 {
+		cancel()
+		unlockPaths()
+		return
+	}
+	if len(entries) == 1 {
+		cancel()
+		unlockPaths()
+		cq.fallbackBatchEntries(entries)
+		return
+	}
+
 	remoteItems, err := cq.prepareBatchWriteItems(entries)
 	if err != nil {
 		unlockPaths()
@@ -1721,6 +1777,9 @@ func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error 
 }
 
 func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEntry) error {
+	if cq.discardSupersededEntry(entry) {
+		return nil
+	}
 	committedRev, err := cq.uploadEntry(ctx, entry)
 	if err != nil {
 		if cq.perf != nil {
@@ -2033,6 +2092,9 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 // This covers ~80% of agent conflict scenarios (whole-file overwrites) without
 // requiring 3-way merge. Max 1 retry to avoid write amplification.
 func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *CommitEntry) {
+	if cq.discardSupersededEntry(entry) {
+		return
+	}
 	// Bail early if the file was deleted locally while queued.
 	if cq.isEntryCanceled(entry) {
 		cq.removeFromQueue(entry)
@@ -2182,6 +2244,9 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	if err := cq.validateEntryPayloadFresh(entry); err != nil {
 		safeLogPrintf("commit queue: auto-resolve rejected stale payload for %s before LWW: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
+		return
+	}
+	if cq.discardSupersededEntry(entry) {
 		return
 	}
 	// Re-check cancelation before the potentially expensive upload.
