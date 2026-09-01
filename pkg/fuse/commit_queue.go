@@ -70,8 +70,6 @@ type CommitEntry struct {
 	// shadow bytes or have its pending metadata removed by an older entry.
 	ShadowGen       uint64
 	PendingIndexGen uint64
-	DirtySeq        uint64
-	WriteBackSeq    uint64
 	WriteBackGen    uint64
 	// DurableWatermarkRev is the newest revision that Dat9FS knows was already
 	// made durable (for example by a strict fsync). Entries whose payload was
@@ -153,6 +151,11 @@ type CommitQueue struct {
 	// PathLock serializes upload and cleanup against Dat9FS same-path shadow
 	// mutations. When unset, the queue still serializes same-path entries.
 	PathLock func(path string) func()
+	// DurableWatermark returns the latest path revision that Dat9FS has
+	// observed as committed/durable. It is consulted while the path lock is
+	// held so an entry that was fresh at enqueue time cannot LWW-rebase stale
+	// payload bytes after a sibling strict fsync advances the same path.
+	DurableWatermark func(path string) int64
 
 	// workCh dispatches entries to upload workers. The buffer is always
 	// larger than maxPending so Enqueue never blocks.
@@ -1288,6 +1291,12 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 				unlockPath()
 				return
 			}
+			if err := cq.validateEntryPayloadFresh(entry); err != nil {
+				safeLogPrintf("commit queue: conflict auto-resolve rejected stale payload for %s: %v", entry.Path, err)
+				cq.onCommitTerminalFailure(entry)
+				unlockPath()
+				return
+			}
 			safeLogPrintf("commit queue: conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
 			cq.tryAutoResolveConflict(entryCtx, entry)
 			unlockPath()
@@ -1434,8 +1443,10 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 		entry.cancelUpload = cancel
 	}
 	cq.mu.Unlock()
+	unlockPaths := cq.lockBatchPaths(entries)
 	remoteItems, err := cq.prepareBatchWriteItems(entries)
 	if err != nil {
+		unlockPaths()
 		cancel()
 		if errors.Is(err, errCommitPayloadStale) {
 			for _, entry := range entries {
@@ -1456,7 +1467,6 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 		return
 	}
 
-	unlockPaths := cq.lockBatchPaths(entries)
 	start := time.Now()
 	results, err := cq.client.BatchWriteCtx(ctx, remoteItems)
 	if cq.perf != nil {
@@ -1504,20 +1514,25 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 			continue
 		}
 		resultErr := batchWriteResultError(result)
-		if errors.Is(resultErr, errCommitPayloadStale) {
-			cq.onCommitTerminalFailure(entry)
-			cq.endInFlight(entry)
-			continue
-		}
 		if errors.Is(resultErr, client.ErrConflict) {
+			unlockPath := cq.lockPath(entry.Path)
 			if entry.DisableAutoResolveLWW {
 				safeLogPrintf("commit queue: fenced batch conflict for %s at base revision %d, keeping terminal", entry.Path, entry.BaseRev)
 				cq.onCommitTerminalFailure(entry)
+				unlockPath()
+				cq.endInFlight(entry)
+				continue
+			}
+			if err := cq.validateEntryPayloadFresh(entry); err != nil {
+				safeLogPrintf("commit queue: batch conflict auto-resolve rejected stale payload for %s: %v", entry.Path, err)
+				cq.onCommitTerminalFailure(entry)
+				unlockPath()
 				cq.endInFlight(entry)
 				continue
 			}
 			safeLogPrintf("commit queue: batch conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
 			cq.tryAutoResolveConflict(entryCtx, entry)
+			unlockPath()
 			cq.endInFlight(entry)
 			continue
 		}
@@ -1610,9 +1625,11 @@ func (cq *CommitQueue) validateEntryPayloadFresh(entry *CommitEntry) error {
 		return nil
 	}
 	payloadBaseRev := entry.payloadBaseRevision()
-	if entry.DurableWatermarkRev > 0 && payloadBaseRev >= 0 && payloadBaseRev < entry.DurableWatermarkRev {
+	watermark := cq.effectiveDurableWatermark(entry)
+	if watermark > 0 && payloadBaseRev >= 0 && payloadBaseRev < watermark {
+		entry.DisableAutoResolveLWW = true
 		return fmt.Errorf("%w: %s payload base rev %d is older than durable watermark rev %d",
-			errCommitPayloadStale, entry.Path, payloadBaseRev, entry.DurableWatermarkRev)
+			errCommitPayloadStale, entry.Path, payloadBaseRev, watermark)
 	}
 	if entry.ShadowGen != 0 && cq != nil && cq.shadows != nil {
 		if activeGen := cq.shadows.ActiveGeneration(entry.Path); activeGen != entry.ShadowGen {
@@ -1621,6 +1638,24 @@ func (cq *CommitQueue) validateEntryPayloadFresh(entry *CommitEntry) error {
 		}
 	}
 	return nil
+}
+
+// effectiveDurableWatermark returns the freshest known durable revision for
+// entry.Path, combining the enqueue-time fence stored on the entry with the
+// live filesystem tracker. It also writes the live watermark back to the entry
+// so later conflict handling cannot auto-resolve with a stale snapshot.
+func (cq *CommitQueue) effectiveDurableWatermark(entry *CommitEntry) int64 {
+	if entry == nil {
+		return 0
+	}
+	watermark := entry.DurableWatermarkRev
+	if cq != nil && cq.DurableWatermark != nil {
+		if live := cq.DurableWatermark(entry.Path); live > watermark {
+			watermark = live
+			entry.DurableWatermarkRev = live
+		}
+	}
+	return watermark
 }
 
 func (cq *CommitQueue) readEntryPayload(entry *CommitEntry) ([]byte, error) {
@@ -2132,6 +2167,16 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	// Branch 2: LWW — re-upload local shadow with new base revision.
 	if entry.DisableAutoResolveLWW {
 		safeLogPrintf("commit queue: fenced conflict for %s will not LWW-rebase payload from base rev %d onto server rev %d", entry.Path, entry.payloadBaseRevision(), serverRev)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+	if entry.PayloadBaseRevSet && entry.payloadBaseRevision() < serverRev {
+		safeLogPrintf("commit queue: refusing LWW rebase for %s: payload base rev %d is older than server rev %d", entry.Path, entry.payloadBaseRevision(), serverRev)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+	if err := cq.validateEntryPayloadFresh(entry); err != nil {
+		safeLogPrintf("commit queue: auto-resolve rejected stale payload for %s before LWW: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
 		return
 	}

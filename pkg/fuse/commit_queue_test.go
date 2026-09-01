@@ -164,6 +164,162 @@ func TestCommitQueueBatchWriteUsesBatchEndpoint(t *testing.T) {
 	}
 }
 
+func TestCommitQueueBatchWriteValidatesPayloadUnderPathLocks(t *testing.T) {
+	var batchCalls atomic.Int32
+	var putACalls atomic.Int32
+	var putBCalls atomic.Int32
+	var putBBody []byte
+	var handlerMu sync.Mutex
+	var handlerErr error
+	recordHandlerErr := func(err error) {
+		handlerMu.Lock()
+		defer handlerMu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": 50000})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-write":
+			batchCalls.Add(1)
+			http.Error(w, "stale batch must be filtered before BatchWriteCtx", http.StatusInternalServerError)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/a.txt":
+			putACalls.Add(1)
+			http.Error(w, "stale /a.txt must not fall back to single PUT", http.StatusInternalServerError)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/b.txt":
+			putBCalls.Add(1)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				recordHandlerErr(fmt.Errorf("read b.txt body: %w", err))
+				http.Error(w, "read b body", http.StatusInternalServerError)
+				return
+			}
+			if r.Header.Get("X-Dat9-Expected-Revision") != "0" {
+				recordHandlerErr(fmt.Errorf("b.txt expected revision = %q, want create revision 0", r.Header.Get("X-Dat9-Expected-Revision")))
+				http.Error(w, "unexpected b expected revision", http.StatusInternalServerError)
+				return
+			}
+			handlerMu.Lock()
+			putBBody = append([]byte(nil), body...)
+			handlerMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","revision":1}`))
+		default:
+			recordHandlerErr(fmt.Errorf("unexpected request: %s %s", r.Method, r.URL.String()))
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/a.txt", []byte("stale-a"), 2); err != nil {
+		t.Fatal(err)
+	}
+	oldAShadowGen := shadow.ActiveGeneration("/a.txt")
+	oldAPendingGen, err := pending.PutWithBaseRev("/a.txt", int64(len("stale-a")), PendingOverwrite, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/b.txt", []byte("fresh-b"), 0); err != nil {
+		t.Fatal(err)
+	}
+	bShadowGen := shadow.ActiveGeneration("/b.txt")
+	bPendingGen, err := pending.PutWithBaseRev("/b.txt", int64(len("fresh-b")), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestClient(ts.URL)
+	c.Warm(context.Background())
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.ConfigureBatchWrite(10*time.Millisecond, 64, client.MaxBatchWriteBytes)
+	var restageOnce sync.Once
+	cq.PathLock = func(path string) func() {
+		if path == "/a.txt" {
+			restageOnce.Do(func() {
+				if err := shadow.WriteFull("/a.txt", []byte("fresh-a"), 3); err != nil {
+					recordHandlerErr(fmt.Errorf("restage a shadow: %w", err))
+					return
+				}
+				if _, err := pending.PutWithBaseRev("/a.txt", int64(len("fresh-a")), PendingOverwrite, 3); err != nil {
+					recordHandlerErr(fmt.Errorf("restage a pending: %w", err))
+					return
+				}
+			})
+		}
+		return func() {}
+	}
+
+	if err := cq.Enqueue(&CommitEntry{
+		Path:              "/a.txt",
+		BaseRev:           2,
+		PayloadBaseRev:    2,
+		PayloadBaseRevSet: true,
+		Size:              int64(len("stale-a")),
+		Kind:              PendingOverwrite,
+		ShadowGen:         oldAShadowGen,
+		PendingIndexGen:   oldAPendingGen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:              "/b.txt",
+		BaseRev:           0,
+		PayloadBaseRev:    0,
+		PayloadBaseRevSet: true,
+		Size:              int64(len("fresh-b")),
+		Kind:              PendingNew,
+		ShadowGen:         bShadowGen,
+		PendingIndexGen:   bPendingGen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if got := batchCalls.Load(); got != 0 {
+		t.Fatalf("batch calls = %d, want 0; stale item must be omitted before BatchWriteCtx", got)
+	}
+	if got := putACalls.Load(); got != 0 {
+		t.Fatalf("a.txt PUT calls = %d, want 0; stale item must not fallback-upload", got)
+	}
+	if got := putBCalls.Load(); got != 1 {
+		t.Fatalf("b.txt PUT calls = %d, want 1 fallback commit for fresh batch member", got)
+	}
+	handlerMu.Lock()
+	gotPutBBody := append([]byte(nil), putBBody...)
+	err = handlerErr
+	handlerMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotPutBBody) != "fresh-b" {
+		t.Fatalf("b.txt PUT body = %q, want fresh-b", gotPutBBody)
+	}
+	meta, ok := pending.GetMeta("/a.txt")
+	if !ok {
+		t.Fatal("newer a.txt pending entry should survive stale batch entry")
+	}
+	if meta.Generation == oldAPendingGen || meta.Kind == PendingConflict || meta.BaseRev != 3 {
+		t.Fatalf("a.txt pending meta = %+v, want newer non-conflict base rev 3", meta)
+	}
+	if data, err := shadow.ReadAll("/a.txt"); err != nil || string(data) != "fresh-a" {
+		t.Fatalf("a.txt shadow = %q err=%v, want fresh-a", data, err)
+	}
+	if pending.HasPending("/b.txt") || shadow.Has("/b.txt") {
+		t.Fatal("b.txt staging should be cleaned after fallback commit")
+	}
+}
+
 func TestCommitQueueBatchWriteFallsBackWhenUnsupported(t *testing.T) {
 	var batchCalls atomic.Int32
 	var putCalls atomic.Int32

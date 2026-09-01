@@ -14696,6 +14696,7 @@ func TestFlushHandle_StartedSQLiteJournalStreamerKeepsStaleBaseRev(t *testing.T)
 	var gotExpected atomic.Int64
 	gotExpected.Store(-999)
 	var initiateCalls atomic.Int32
+	var handlerErrors testErrorRecorder
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v2/uploads/initiate" {
 			http.NotFound(w, r)
@@ -14708,13 +14709,19 @@ func TestFlushHandle_StartedSQLiteJournalStreamerKeepsStaleBaseRev(t *testing.T)
 			ExpectedRevision *int64 `json:"expected_revision"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode initiate request: %v", err)
+			handlerErrors.Recordf("decode initiate request: %v", err)
+			http.Error(w, "bad initiate request", http.StatusBadRequest)
+			return
 		}
 		if req.Path != "/stream.db-wal" {
-			t.Fatalf("initiate path = %q, want /stream.db-wal", req.Path)
+			handlerErrors.Recordf("initiate path = %q, want /stream.db-wal", req.Path)
+			http.Error(w, "unexpected initiate path", http.StatusInternalServerError)
+			return
 		}
 		if req.TotalSize != int64(len(data)) {
-			t.Fatalf("initiate total size = %d, want %d", req.TotalSize, len(data))
+			handlerErrors.Recordf("initiate total size = %d, want %d", req.TotalSize, len(data))
+			http.Error(w, "unexpected initiate size", http.StatusInternalServerError)
+			return
 		}
 		if req.ExpectedRevision != nil {
 			gotExpected.Store(*req.ExpectedRevision)
@@ -14723,7 +14730,8 @@ func TestFlushHandle_StartedSQLiteJournalStreamerKeepsStaleBaseRev(t *testing.T)
 			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
 			return
 		}
-		t.Fatal("stale SQLite journal streamer unexpectedly adopted rev8")
+		handlerErrors.Recordf("stale SQLite journal streamer unexpectedly adopted rev8")
+		http.Error(w, "stale SQLite journal streamer unexpectedly adopted latest revision", http.StatusInternalServerError)
 	}))
 	defer ts.Close()
 
@@ -14764,6 +14772,7 @@ func TestFlushHandle_StartedSQLiteJournalStreamerKeepsStaleBaseRev(t *testing.T)
 	if fh.BaseRev != 7 {
 		t.Fatalf("fh.BaseRev = %d, want 7", fh.BaseRev)
 	}
+	handlerErrors.Check(t)
 }
 
 func TestTruncateWritableHandleLockedZeroResetsStreamingStateBeforeContinuedWrite(t *testing.T) {

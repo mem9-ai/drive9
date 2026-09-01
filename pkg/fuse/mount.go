@@ -530,6 +530,7 @@ func Mount(opts *MountOptions) (err error) {
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
 				cq.OnCleanup = dat9fs.onCommitQueueCleanup
 				cq.PathLock = dat9fs.lockRemoteCommitPath
+				cq.DurableWatermark = dat9fs.latestCommittedRevision
 				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {
 					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
 				}

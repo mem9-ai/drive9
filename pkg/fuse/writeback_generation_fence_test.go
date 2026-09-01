@@ -325,10 +325,20 @@ func TestCommitQueueRejectsPayloadOlderThanDurableWatermark(t *testing.T) {
 
 func TestSQLiteCheckpointABStaleHandleCannotOverwriteDurableMainDB(t *testing.T) {
 	var putCalls atomic.Int32
+	var handlerMu sync.Mutex
+	var handlerErr error
+	recordHandlerErr := func(err error) {
+		handlerMu.Lock()
+		defer handlerMu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		putCalls.Add(1)
 		body, _ := io.ReadAll(r.Body)
-		t.Fatalf("stale checkpoint-A payload reached server: expected_rev=%q body=%q", r.Header.Get("X-Dat9-Expected-Revision"), body)
+		recordHandlerErr(fmt.Errorf("stale checkpoint-A payload reached server: expected_rev=%q body=%q", r.Header.Get("X-Dat9-Expected-Revision"), body))
+		http.Error(w, "stale payload reached server", http.StatusInternalServerError)
 	}))
 	defer ts.Close()
 
@@ -403,6 +413,12 @@ func TestSQLiteCheckpointABStaleHandleCannotOverwriteDurableMainDB(t *testing.T)
 	}
 	if got := putCalls.Load(); got != 0 {
 		t.Fatalf("server saw %d uploads; stale checkpoint-A must not become a newer revision after checkpoint-B", got)
+	}
+	handlerMu.Lock()
+	err = handlerErr
+	handlerMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1026,6 +1042,15 @@ func TestCommitQueueFencedConflictDoesNotLWWRebaseOldPayload(t *testing.T) {
 	var putCalls atomic.Int32
 	var headCalls atomic.Int32
 	var getCalls atomic.Int32
+	var handlerMu sync.Mutex
+	var handlerErr error
+	recordHandlerErr := func(err error) {
+		handlerMu.Lock()
+		defer handlerMu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
@@ -1038,7 +1063,9 @@ func TestCommitQueueFencedConflictDoesNotLWWRebaseOldPayload(t *testing.T) {
 			putCalls.Add(1)
 			body, _ := io.ReadAll(r.Body)
 			if r.Header.Get("X-Dat9-Expected-Revision") != "2" {
-				t.Fatalf("unexpected expected revision %q body=%q", r.Header.Get("X-Dat9-Expected-Revision"), body)
+				recordHandlerErr(fmt.Errorf("unexpected expected revision %q body=%q", r.Header.Get("X-Dat9-Expected-Revision"), body))
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
 			}
 			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
 		}
@@ -1100,4 +1127,297 @@ func TestCommitQueueFencedConflictDoesNotLWWRebaseOldPayload(t *testing.T) {
 	if meta.Kind != PendingConflict {
 		t.Fatalf("pending kind = %v, want PendingConflict", meta.Kind)
 	}
+	handlerMu.Lock()
+	err = handlerErr
+	handlerMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCommitQueueLiveDurableWatermarkRejectsEntryThatBecameStaleAfterEnqueue(t *testing.T) {
+	var requestCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCalls.Add(1)
+		http.Error(w, "stale payload must be rejected before remote I/O", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const path = "/checkpoint.db"
+	oldPayload := []byte("checkpoint A")
+	if err := shadow.WriteFull(path, oldPayload, 2); err != nil {
+		t.Fatal(err)
+	}
+	shadowGen := shadow.ActiveGeneration(path)
+	pendingGen, err := pending.PutWithBaseRev(path, int64(len(oldPayload)), PendingOverwrite, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	var liveWatermark atomic.Int64
+	lockEntered := make(chan struct{})
+	releaseLock := make(chan struct{})
+	var enterOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseLock)
+		})
+	}
+	defer release()
+	cq.DurableWatermark = func(string) int64 {
+		return liveWatermark.Load()
+	}
+	cq.PathLock = func(string) func() {
+		enterOnce.Do(func() {
+			close(lockEntered)
+			<-releaseLock
+		})
+		return func() {}
+	}
+
+	entry := &CommitEntry{
+		Path:              path,
+		BaseRev:           2,
+		PayloadBaseRev:    2,
+		PayloadBaseRevSet: true,
+		Size:              int64(len(oldPayload)),
+		Kind:              PendingOverwrite,
+		ShadowGen:         shadowGen,
+		PendingIndexGen:   pendingGen,
+	}
+	if err := cq.Enqueue(entry); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-lockEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("commit worker did not enter path lock")
+	}
+
+	// Simulate a sibling strict fsync making checkpoint B durable after this
+	// entry was already enqueued but before it dispatches its payload.
+	liveWatermark.Store(3)
+	release()
+	cq.DrainAll()
+
+	if got := requestCalls.Load(); got != 0 {
+		t.Fatalf("remote requests = %d, want 0; stale payload must be fenced at dispatch", got)
+	}
+	if entry.DurableWatermarkRev != 3 || !entry.DisableAutoResolveLWW {
+		t.Fatalf("entry watermark/lww = %d/%t, want 3/true", entry.DurableWatermarkRev, entry.DisableAutoResolveLWW)
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending stale entry should remain for manual recovery")
+	}
+	if meta.Kind != PendingConflict {
+		t.Fatalf("pending kind = %v, want PendingConflict", meta.Kind)
+	}
+}
+
+func TestCommitQueueRefusesLWWWhenPayloadBaseOlderThanServerRevision(t *testing.T) {
+	const path = "/checkpoint.db"
+	oldPayload := []byte("checkpoint A: 5 rows")
+	freshPayload := []byte("checkpoint B: 12 rows")
+	server, ts := newCASFileServer(t, path, 3, freshPayload)
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(path, oldPayload, 2); err != nil {
+		t.Fatal(err)
+	}
+	shadowGen := shadow.ActiveGeneration(path)
+	pendingGen, err := pending.PutWithBaseRev(path, int64(len(oldPayload)), PendingOverwrite, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(50000)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	if err := cq.Enqueue(&CommitEntry{
+		Path:              path,
+		BaseRev:           2,
+		PayloadBaseRev:    2,
+		PayloadBaseRevSet: true,
+		Size:              int64(len(oldPayload)),
+		Kind:              PendingOverwrite,
+		ShadowGen:         shadowGen,
+		PendingIndexGen:   pendingGen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	rev, body, puts := server.snapshot()
+	if rev != 3 {
+		t.Fatalf("server revision = %d, want 3; stale payload must not LWW into rev4", rev)
+	}
+	if string(body) != string(freshPayload) {
+		t.Fatalf("server body = %q, want checkpoint B payload", body)
+	}
+	if len(puts) != 0 {
+		t.Fatalf("successful PUT history = %+v, want no stale LWW write", puts)
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending entry should remain for manual recovery")
+	}
+	if meta.Kind != PendingConflict {
+		t.Fatalf("pending kind = %v, want PendingConflict", meta.Kind)
+	}
+}
+
+func TestShadowSpillSyncCleanupKeepsNewerGeneration(t *testing.T) {
+	const path = "/large.db-wal"
+	freshPayload := []byte("checkpoint B fresh shadow generation")
+	var putCalls atomic.Int32
+	var putMu sync.Mutex
+	var gotBody []byte
+	var handlerErrors testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/v1/fs"+path {
+			http.NotFound(w, r)
+			return
+		}
+		putCalls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			handlerErrors.Recordf("read PUT body: %v", err)
+			http.Error(w, "read body", http.StatusInternalServerError)
+			return
+		}
+		if r.Header.Get("X-Dat9-Expected-Revision") != "3" {
+			handlerErrors.Recordf("expected revision = %q, want 3", r.Header.Get("X-Dat9-Expected-Revision"))
+			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+			return
+		}
+		if string(body) != string(freshPayload) {
+			handlerErrors.Recordf("PUT body = %q, want fresh payload", body)
+			http.Error(w, "stale shadow payload", http.StatusInternalServerError)
+			return
+		}
+		putMu.Lock()
+		gotBody = append([]byte(nil), body...)
+		putMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":4}`))
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	oldPayload := []byte("checkpoint A old shadow generation")
+	if err := shadow.WriteFull(path, oldPayload, 2); err != nil {
+		t.Fatal(err)
+	}
+	oldShadowGen := shadow.ActiveGeneration(path)
+	oldPendingGen, err := pending.PutShadowSpillWithMode(path, int64(len(oldPayload)), PendingOverwrite, 2, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Path:              path,
+		ShadowReady:       true,
+		ShadowSpill:       true,
+		ShadowCommitReady: true,
+		ShadowStageGen:    oldShadowGen,
+		PendingIndexGen:   oldPendingGen,
+	}
+
+	// H2 stages a newer generation after H1's upload has returned but before
+	// H1 runs cleanup. H1 must not path-wide delete H2's only staged copy.
+	if err := shadow.WriteFull(path, freshPayload, 3); err != nil {
+		t.Fatal(err)
+	}
+	freshShadowGen := shadow.ActiveGeneration(path)
+	freshPendingGen, err := pending.PutShadowSpillWithMode(path, int64(len(freshPayload)), PendingOverwrite, 3, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fs.removeShadowPendingStagingGenerationLocked(fh, path, oldShadowGen, oldPendingGen)
+
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("newer pending generation was removed by stale cleanup")
+	}
+	if meta.Generation != freshPendingGen {
+		t.Fatalf("pending generation = %d, want fresh generation %d", meta.Generation, freshPendingGen)
+	}
+	data, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(freshPayload) {
+		t.Fatalf("shadow data after cleanup = %q, want fresh payload", data)
+	}
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(50000)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	if err := cq.Enqueue(&CommitEntry{
+		Path:              path,
+		BaseRev:           3,
+		PayloadBaseRev:    3,
+		PayloadBaseRevSet: true,
+		Size:              int64(len(freshPayload)),
+		Kind:              PendingOverwrite,
+		ShadowSpill:       true,
+		ShadowGen:         freshShadowGen,
+		PendingIndexGen:   freshPendingGen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("PUT calls = %d, want fresh generation commit", got)
+	}
+	putMu.Lock()
+	committedBody := append([]byte(nil), gotBody...)
+	putMu.Unlock()
+	if string(committedBody) != string(freshPayload) {
+		t.Fatalf("committed body = %q, want fresh payload", committedBody)
+	}
+	if pending.HasPending(path) {
+		t.Fatal("pending entry should be removed after fresh generation commit")
+	}
+	if shadow.Has(path) {
+		t.Fatal("shadow entry should be removed after fresh generation commit")
+	}
+	handlerErrors.Check(t)
 }
