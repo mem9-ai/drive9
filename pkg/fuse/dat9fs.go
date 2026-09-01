@@ -2101,15 +2101,58 @@ func (fs *Dat9FS) handleCanAdoptCommittedRevisionLocked(fh *FileHandle) bool {
 	}
 	// A dirty handle's bytes were prepared against its current BaseRev.
 	// Advancing only the revision token after a sibling commit would create
-	// the silent-rollback shape: old payload + new CAS base. SQLite sidecar
-	// journals keep their historical same-mount adoption path only while they
-	// are still pure in-memory buffers; once they have path-keyed staging in
-	// shadow/writeBack/pendingIndex, the generation checks above fence them
-	// like any other dirty payload.
-	if !isSQLitePersistentJournalPath(fh.Path) && (fh.DirtySeq != 0 || (fh.Dirty != nil && fh.Dirty.HasDirtyParts())) {
+	// the silent-rollback shape: old payload + new CAS base. This applies to
+	// SQLite sidecar journals too: before staging, a dirty app.db-wal handle
+	// is still old WAL payload and must not silently become "based on" a newer
+	// sibling checkpoint revision.
+	if fh.DirtySeq != 0 || (fh.Dirty != nil && fh.Dirty.HasDirtyParts()) {
 		return false
 	}
 	return true
+}
+
+func (fs *Dat9FS) sqlitePersistentJournalCanAdoptForImmediateRemoteSyncLocked(fh *FileHandle) bool {
+	if fs == nil || fh == nil || !isSQLitePersistentJournalPath(fh.Path) {
+		return false
+	}
+	if fh.Dirty == nil || (fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts()) {
+		return false
+	}
+	if fh.WriteBackSeq != 0 || fh.WriteBackGen != 0 || fh.ShadowCommitReady || fh.ShadowCommitSeq != 0 {
+		return false
+	}
+	if fh.ShadowReady || fh.ShadowSpill {
+		return false
+	}
+	if fs.pendingIndex != nil && fh.PendingIndexGen != 0 && fs.pendingIndex.Generation(fh.Path) == fh.PendingIndexGen {
+		return false
+	}
+	if fs.shadowStore != nil && fh.ShadowStageGen != 0 && fs.shadowStore.ActiveGeneration(fh.Path) == fh.ShadowStageGen {
+		return false
+	}
+	return true
+}
+
+// adoptCommittedRevisionForSQLitePersistentJournalRemoteSyncLocked is the only
+// dirty SQLite sidecar revision-adopt path. It is used immediately before a
+// synchronous remote upload while the caller serializes same-path commits with
+// remoteCommitLock. It must not be used by staging/writeback paths: staged
+// CommitEntry payloads need their original payload/base generation preserved so
+// an old app.db-wal/app.db-journal snapshot cannot be paired with a newer CAS
+// BaseRev after another handle made a checkpoint durable.
+func (fs *Dat9FS) adoptCommittedRevisionForSQLitePersistentJournalRemoteSyncLocked(fh *FileHandle) {
+	if !fs.sqlitePersistentJournalCanAdoptForImmediateRemoteSyncLocked(fh) {
+		return
+	}
+	revision := fs.latestCommittedRevision(fh.Path)
+	if revision <= 0 || revision <= fh.BaseRev {
+		return
+	}
+	fh.IsNew = false
+	fh.BaseRev = revision
+	if fh.Streamer != nil {
+		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+	}
 }
 
 func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) bool {
@@ -13445,6 +13488,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			unlockRemoteCommit()
 		}
 	}()
+
+	fs.adoptCommittedRevisionForSQLitePersistentJournalRemoteSyncLocked(fh)
 
 	var err error
 	// Path 1a: Streaming mode — parts were submitted during Write() and are

@@ -3353,15 +3353,21 @@ func TestFlushSmallNewFileRefreshesSiblingHandleRevision(t *testing.T) {
 	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fh1ID}); st != gofuse.OK {
 		t.Fatalf("first Flush status = %v, want OK", st)
 	}
-	if fh2.IsNew {
-		t.Fatal("second handle should no longer be create-if-absent after sibling commit")
+	if !fh2.IsNew {
+		t.Fatal("dirty sibling handle adopted committed revision before its remote-sync boundary")
 	}
-	if fh2.BaseRev != 1 {
-		t.Fatalf("second handle BaseRev = %d, want 1", fh2.BaseRev)
+	if fh2.BaseRev != 0 {
+		t.Fatalf("second handle BaseRev before flush = %d, want 0", fh2.BaseRev)
 	}
 
 	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fh2ID}); st != gofuse.OK {
 		t.Fatalf("second Flush status = %v, want OK", st)
+	}
+	if fh2.IsNew {
+		t.Fatal("second handle should no longer be create-if-absent after its remote-sync flush")
+	}
+	if fh2.BaseRev != 2 {
+		t.Fatalf("second handle BaseRev after flush = %d, want 2", fh2.BaseRev)
 	}
 
 	mu.Lock()

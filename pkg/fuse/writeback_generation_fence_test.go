@@ -588,6 +588,158 @@ func TestSQLitePersistentJournalStagedDirtyHandleCannotAdoptCommittedRevision(t 
 	}
 }
 
+func TestSQLitePersistentJournalUnstagedDirtyHandleCannotAdoptDuringStaging(t *testing.T) {
+	for _, path := range []string{"/app.db-wal", "/app.db-journal"} {
+		t.Run(path, func(t *testing.T) {
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient("http://localhost"), opts)
+			shadow, err := NewShadowStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer shadow.Close()
+			pending, err := NewPendingIndex(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			fs.shadowStore = shadow
+			fs.pendingIndex = pending
+
+			ino := fs.inodes.Lookup(path, false, 32, time.Now())
+			fs.inodes.UpdateRevision(ino, 2)
+			fs.recordCommittedRevision(path, 2)
+			fh := &FileHandle{
+				Ino:      ino,
+				Path:     path,
+				Dirty:    fs.newWriteBuffer(path, maxPreloadSize, 0),
+				OrigSize: 32,
+				BaseRev:  2,
+			}
+			oldPayload := []byte("old sqlite sidecar payload")
+			if _, err := fh.Dirty.Write(0, oldPayload); err != nil {
+				t.Fatal(err)
+			}
+			fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+			fs.openHandles.Add(fh)
+
+			// This is the pre-staging race from the production RCA: a sibling
+			// has already made rev3 durable, but this sidecar handle still
+			// carries rev2-era dirty bytes and has not recorded ShadowStageGen or
+			// PendingIndexGen yet. Neither the sibling-revision refresh nor
+			// stageShadowLocked may adopt rev3 before staging those bytes.
+			fs.recordCommittedRevision(path, 3)
+			fs.refreshCommittedRevisionForOpenHandles(path, 3, nil)
+			if fh.BaseRev != 2 {
+				t.Fatalf("unstaged dirty journal BaseRev = %d after sibling refresh, want 2", fh.BaseRev)
+			}
+			fh.Lock()
+			if err := fs.stageShadowLocked(fh, true); err != nil {
+				fh.Unlock()
+				t.Fatal(err)
+			}
+			fh.Unlock()
+
+			if fh.BaseRev != 2 {
+				t.Fatalf("unstaged dirty journal BaseRev = %d, want 2 after stageShadowLocked", fh.BaseRev)
+			}
+			if got := shadow.BaseRev(path); got != 2 {
+				t.Fatalf("shadow base rev = %d, want 2", got)
+			}
+			meta, ok := pending.GetMeta(path)
+			if !ok {
+				t.Fatal("pending meta missing after staging")
+			}
+			if meta.BaseRev != 2 {
+				t.Fatalf("pending base rev = %d, want 2", meta.BaseRev)
+			}
+			fh.Lock()
+			entry := &CommitEntry{Path: path, Inode: ino, BaseRev: fs.expectedRevisionForHandleLocked(fh), Size: fh.Dirty.Size(), Kind: PendingOverwrite}
+			fs.bindCommitEntryToHandleLocked(entry, fh, fh.BaseRev)
+			fh.Unlock()
+			if entry.PayloadBaseRev != 2 || !entry.PayloadBaseRevSet {
+				t.Fatalf("entry payload base = %d set=%t, want rev2", entry.PayloadBaseRev, entry.PayloadBaseRevSet)
+			}
+			if entry.DurableWatermarkRev != 3 || !entry.DisableAutoResolveLWW {
+				t.Fatalf("entry watermark = %d disable_lww=%t, want rev3 fence", entry.DurableWatermarkRev, entry.DisableAutoResolveLWW)
+			}
+		})
+	}
+}
+
+func TestSQLitePersistentJournalUnstagedShadowSpillCannotAdoptDuringStaging(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const path = "/app.db-wal"
+	ino := fs.inodes.Lookup(path, false, 0, time.Now())
+	fs.inodes.UpdateRevision(ino, 2)
+	fs.recordCommittedRevision(path, 2)
+	oldPayload := []byte("old sqlite wal shadowspill payload")
+	if err := shadow.WriteFull(path, oldPayload, 2); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        path,
+		Dirty:       fs.newWriteBuffer(path, maxPreloadSize, 0),
+		OrigSize:    int64(len(oldPayload)),
+		BaseRev:     2,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+	if _, err := fh.Dirty.Write(0, oldPayload); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fs.openHandles.Add(fh)
+
+	fs.recordCommittedRevision(path, 3)
+	fs.refreshCommittedRevisionForOpenHandles(path, 3, nil)
+	if fh.BaseRev != 2 {
+		t.Fatalf("unstaged ShadowSpill journal BaseRev = %d after sibling refresh, want 2", fh.BaseRev)
+	}
+	fh.Lock()
+	if err := fs.stageShadowLocked(fh, true); err != nil {
+		fh.Unlock()
+		t.Fatal(err)
+	}
+	fh.Unlock()
+
+	if fh.BaseRev != 2 {
+		t.Fatalf("unstaged ShadowSpill journal BaseRev = %d, want 2 after stageShadowLocked", fh.BaseRev)
+	}
+	if got := shadow.BaseRev(path); got != 2 {
+		t.Fatalf("shadow base rev = %d, want 2", got)
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending meta missing after ShadowSpill staging")
+	}
+	if meta.BaseRev != 2 || !meta.ShadowSpill {
+		t.Fatalf("pending meta base/shadowspill = %d/%t, want 2/true", meta.BaseRev, meta.ShadowSpill)
+	}
+	fh.Lock()
+	entry := &CommitEntry{Path: path, Inode: ino, BaseRev: fs.expectedRevisionForHandleLocked(fh), Size: fh.Dirty.Size(), Kind: PendingOverwrite, ShadowSpill: true}
+	fs.bindCommitEntryToHandleLocked(entry, fh, fh.BaseRev)
+	fh.Unlock()
+	if entry.PayloadBaseRev != 2 || entry.DurableWatermarkRev != 3 || !entry.DisableAutoResolveLWW {
+		t.Fatalf("entry payload/watermark/lww = %d/%d/%t, want 2/3/true", entry.PayloadBaseRev, entry.DurableWatermarkRev, entry.DisableAutoResolveLWW)
+	}
+}
+
 func TestReleaseWriteBackCleanupKeepsNewerGeneration(t *testing.T) {
 	var putCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
