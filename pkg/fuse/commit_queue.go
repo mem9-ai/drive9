@@ -757,6 +757,26 @@ func (cq *CommitQueue) mutationSeqForPath(path string) uint64 {
 	return seq
 }
 
+func (cq *CommitQueue) hasNewerMutation(path string, ino, seq uint64) bool {
+	if cq == nil || path == "" || ino == 0 || seq == 0 {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	newer := func(entry *CommitEntry) bool {
+		return entry != nil && !entry.canceled && entry.Inode == ino && entry.MutationSeq > seq
+	}
+	if newer(cq.inFlight[path]) {
+		return true
+	}
+	for entry := range cq.queuedByPath[path] {
+		if newer(entry) {
+			return true
+		}
+	}
+	return false
+}
+
 // WaitPrefix blocks until all in-flight or queued commits under the given
 // prefix complete. Used by Rename to wait for descendant commits.
 func (cq *CommitQueue) WaitPrefix(prefix string) {

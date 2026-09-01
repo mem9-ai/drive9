@@ -3711,6 +3711,10 @@ func (fs *Dat9FS) stageShadowForQueuedCommitLocked(fh *FileHandle, durable bool)
 	acquired := fh != nil && fh.RemoteCommitUnlock == nil
 	if fh != nil {
 		_ = fs.lockHandleRemoteCommitPathLocked(fh)
+		if fs.gvisorCompatibilityEnabled() && fs.commitQueue != nil && fs.commitQueue.hasNewerMutation(fh.Path, fh.Ino, fh.DirtySeq) {
+			fs.releaseHandleRemoteCommitPathLocked(fh)
+			return syscall.EAGAIN
+		}
 		if fs.discardSupersededMutationLocked(fh) {
 			fs.removeHandleOwnedStagingLocked(fh)
 			fs.releaseHandleRemoteCommitPathLocked(fh)
@@ -12625,6 +12629,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					stageStart := time.Now()
 					fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
 					err := fs.stageShadowForQueuedCommitLocked(fh, true)
+					if errors.Is(err, syscall.EAGAIN) {
+						return gofuse.EAGAIN
+					}
 					stageDur := time.Since(stageStart)
 					fs.debugDurationf(stageStart, 0, "flush stage shadow done path=%s size=%d err=%v", fh.Path, size, err)
 					fs.perf.recordFlushStageShadow(stageDur)
@@ -12702,6 +12709,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			stageStart := time.Now()
 			fs.debugf("flush shadowspill stage start path=%s size=%d durable=true", fh.Path, size)
 			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			if errors.Is(err, syscall.EAGAIN) {
+				return gofuse.EAGAIN
+			}
 			largeStageDur := time.Since(stageStart)
 			fs.debugDurationf(stageStart, 0, "flush shadowspill stage done path=%s size=%d err=%v", fh.Path, size, err)
 			fs.perf.recordFlushStageShadow(largeStageDur)
@@ -12826,6 +12836,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				stageStart := time.Now()
 				fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
 				err := fs.stageShadowForQueuedCommitLocked(fh, true)
+				if errors.Is(err, syscall.EAGAIN) {
+					return gofuse.EAGAIN
+				}
 				fs.debugDurationf(stageStart, 0, "flush stage shadow done path=%s size=%d err=%v", fh.Path, size, err)
 				if err != nil {
 					safeLogPrintf("flush: shadow stage failed for %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
@@ -12960,6 +12973,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			phase = "interactive-shadowspill-stage"
 			stageStart := time.Now()
 			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			if errors.Is(err, syscall.EAGAIN) {
+				return gofuse.EAGAIN
+			}
 			fs.debugDurationf(stageStart, 0, "fsync shadowspill stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
 				if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
@@ -12997,6 +13013,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			phase = "interactive-stage"
 			stageStart := time.Now()
 			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			if errors.Is(err, syscall.EAGAIN) {
+				return gofuse.EAGAIN
+			}
 			fs.debugDurationf(stageStart, 0, "fsync stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
 				if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
