@@ -1419,6 +1419,7 @@ func (fs *Dat9FS) discardUnlinkedHandleStateLocked(fh *FileHandle) {
 	fh.WriteBackGen = 0
 	fh.PendingIndexGen = 0
 	fh.ShadowStageGen = 0
+	fh.ShadowStageSeq = 0
 	if fs.commitQueue != nil {
 		fs.commitQueue.CancelPathIfInode(path, fh.Ino)
 	}
@@ -2013,6 +2014,7 @@ func (fs *Dat9FS) removeHandleOwnedStagingLocked(fh *FileHandle) {
 	fh.WriteBackGen = 0
 	fh.PendingIndexGen = 0
 	fh.ShadowStageGen = 0
+	fh.ShadowStageSeq = 0
 }
 
 func (fs *Dat9FS) forgetMutationState(ino uint64) {
@@ -3700,6 +3702,7 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 	// its cleanup to this handle's staging generation.
 	if fs.shadowStore != nil {
 		fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
+		fh.ShadowStageSeq = fh.DirtySeq
 	}
 	return nil
 }
@@ -6923,13 +6926,13 @@ func (fs *Dat9FS) hasOpenHandle(ino uint64, p string) bool {
 // it marked (for rollback on a failed remote DELETE/whiteout — a separate
 // pre-snapshot would race with handles opened in between) and whether that
 // set is non-empty.
-func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapshotRemote bool) (marked []*FileHandle, anyOpen bool) {
+func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapshotRemote bool) (marked []*FileHandle, anyOpen bool, snapshotErr error) {
 	if fs.openHandles == nil || p == "" {
-		return nil, false
+		return nil, false, nil
 	}
 	handles := fs.openHandles.SnapshotPath(p)
 	if len(handles) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 
 	var size int64
@@ -6970,8 +6973,10 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 					snapshotOK = true
 				} else if err == nil {
 					err = io.ErrUnexpectedEOF
+					snapshotErr = err
 					safeLogPrintf("open-unlink snapshot short read for %s: got=%d want=%d", p, len(data), size)
 				} else {
+					snapshotErr = err
 					safeLogPrintf("open-unlink snapshot failed for %s: %v", p, err)
 				}
 				fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(data)))
@@ -6981,8 +6986,15 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 					snapshotShadowGen = gen
 					snapshotOK = true
 				} else {
+					snapshotErr = err
 					safeLogPrintf("open-unlink large snapshot failed for %s: %v", p, err)
 				}
+			}
+			if needsSnapshot && !snapshotOK {
+				if snapshotErr == nil {
+					snapshotErr = syscall.EIO
+				}
+				return nil, false, snapshotErr
 			}
 		}
 	}
@@ -7024,7 +7036,7 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		fh.Unlock()
 	}
 	fs.openHandles.UnlinkPath(p)
-	return handles, true
+	return handles, true, nil
 }
 
 func cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
@@ -8771,7 +8783,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if info.IsDir() {
 			return gofuse.Status(syscall.EISDIR)
 		}
-		_, preserveOpen := fs.markOpenHandlesUnlinked(ctx, childP, false)
+		_, preserveOpen, _ := fs.markOpenHandlesUnlinked(ctx, childP, false)
 		if err := overlay.Remove(childP); err != nil {
 			return localErrToFuseStatus(err)
 		}
@@ -8806,7 +8818,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// write fails, the directory entry still exists authoritatively, so
 		// the marking is rolled back — otherwise every later write/flush on
 		// those handles would keep being suppressed and silently drop data.
-		markedGitHandles, _ := fs.markOpenHandlesUnlinked(ctx, childP, false)
+		markedGitHandles, _, _ := fs.markOpenHandlesUnlinked(ctx, childP, false)
 		st := fs.putGitWhiteout(ctx, childP)
 		if st != gofuse.OK {
 			fs.unmarkOpenHandlesAfterFailedUnlink(childP, markedGitHandles)
@@ -8869,8 +8881,16 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// remote DELETE can roll precisely those handles back (the entry still
 	// exists remotely in that case).
 	markCtx, markCf := fuseCtx(cancel)
-	markedHandles, markedAny := fs.markOpenHandlesUnlinked(markCtx, childP, true)
+	if fs.gvisorCompatibilityEnabled() {
+		markCf()
+		markCtx, markCf = fs.namespaceMutationCommitContext(ctx)
+	}
+	markedHandles, markedAny, markErr := fs.markOpenHandlesUnlinked(markCtx, childP, true)
 	markCf()
+	if markErr != nil {
+		status = httpToFuseStatus(markErr)
+		return status
+	}
 	preserveOpen = markedAny
 
 	if fs.writeBack != nil && fs.uploader != nil {
@@ -9010,7 +9030,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// marking; mark them now (no remote snapshot — the path is already gone)
 	// so their Flush/Fsync/Release guards see fh.Unlinked and cannot
 	// resurrect the path.
-	if _, anyOpen := fs.markOpenHandlesUnlinked(ctx, childP, false); anyOpen {
+	if _, anyOpen, _ := fs.markOpenHandlesUnlinked(ctx, childP, false); anyOpen {
 		preserveOpen = true
 	}
 
@@ -9375,15 +9395,20 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 	if fs.commitQueue != nil {
 		mutationSeq = fs.commitQueue.mutationSeqForPath(oldP)
 	}
-	for _, fh := range fs.openHandles.SnapshotPath(oldP) {
-		if fh == nil {
-			continue
+	if mutationSeq == 0 && fs.shadowStore != nil {
+		shadowGen := fs.shadowStore.ActiveGeneration(oldP)
+		for _, fh := range fs.openHandles.SnapshotPath(oldP) {
+			if fh == nil {
+				continue
+			}
+			fh.Lock()
+			if shadowGen != 0 && fh.ShadowStageGen == shadowGen {
+				mutationSeq = fh.ShadowStageSeq
+				fh.Unlock()
+				break
+			}
+			fh.Unlock()
 		}
-		fh.Lock()
-		if fh.DirtySeq > mutationSeq {
-			mutationSeq = fh.DirtySeq
-		}
-		fh.Unlock()
 	}
 
 	// Only use the local fast path when the final path is truly absent.

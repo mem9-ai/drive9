@@ -81,6 +81,7 @@ type FileHandle struct {
 	WriteBackGen       uint64 // writeBack generation staged by this handle (0 = none)
 	PendingIndexGen    uint64 // pendingIndex generation staged by this handle (0 = none)
 	ShadowStageGen     uint64 // shadowStore content generation staged by this handle (0 = none)
+	ShadowStageSeq     uint64 // DirtySeq represented by ShadowStageGen
 	RemoteCommitUnlock func() // held same-path commit lock while local shadow state is reserved
 	mu                 sync.Mutex
 }
