@@ -7393,8 +7393,20 @@ func (fs *Dat9FS) openHandleEntry(p string) (*InodeEntry, bool) {
 	return nil, false
 }
 
+func (fs *Dat9FS) inodeHasPendingMutationState(ino uint64, fallbackPath string, includeFallbackQueue bool) bool {
+	if entry, ok := fs.inodes.GetEntry(ino); ok && entry != nil {
+		for alias := range entry.Paths {
+			if fs.hasPendingLocalState(alias) || (alias != fallbackPath || includeFallbackQueue) && fs.hasQueuedCommit(alias) {
+				return true
+			}
+		}
+		return false
+	}
+	return fs.hasPendingLocalState(fallbackPath) || includeFallbackQueue && fs.hasQueuedCommit(fallbackPath)
+}
+
 func (fs *Dat9FS) cleanupReleasedInode(ino uint64, p string) {
-	if fs.hasOpenHandle(ino, p) || fs.hasPendingLocalState(p) || fs.hasQueuedCommit(p) {
+	if fs.hasOpenHandle(ino, p) || fs.inodeHasPendingMutationState(ino, p, true) {
 		return
 	}
 	fs.forgetMutationState(ino)
@@ -7405,7 +7417,7 @@ func (fs *Dat9FS) cleanupReleasedInode(ino uint64, p string) {
 }
 
 func (fs *Dat9FS) cleanupCommittedInode(ino uint64, p string) {
-	if fs.hasOpenHandle(ino, p) || fs.hasPendingLocalState(p) {
+	if fs.hasOpenHandle(ino, p) || fs.inodeHasPendingMutationState(ino, p, false) {
 		return
 	}
 	fs.forgetMutationState(ino)
@@ -12208,17 +12220,17 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 	// The commit is authoritative for the storage class: direct PUT lands
 	// inline, PATCH keeps S3, and a full upload re-splits by size.
 	fs.adoptCommittedStorageClassLocked(fh, size)
+	sidecarRevision := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
+	fs.recordCommittedMutation(fh.Ino, mutationSeq, sidecarRevision, size)
+	if sidecarRevision > 0 {
+		fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, sidecarRevision, fh, size)
+	}
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 		safeLogPrintf("write-sync pending chmod failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
 
-	sidecarRevision := sqliteCommittedRevision(committedRev, expectedRevision)
 	sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
-	fs.recordCommittedMutation(fh.Ino, mutationSeq, sidecarRevision, size)
-	if fs.gvisorCompatibilityEnabled() && sidecarRevision > 0 {
-		fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, sidecarRevision, fh, size)
-	}
 	fh.Dirty.ClearDirty()
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fh.DirtySeq = 0
@@ -12985,6 +12997,8 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		handleIsNew := fh.IsNew
 		handlePath := fh.Path
 		stagingGens := fs.captureHandleStagingGensLocked(fh)
+		handleIno := fh.Ino
+		mutationSeq := fh.DirtySeq
 		// B4: serialize with Unlink's remote DELETE — hold the per-path
 		// remoteCommitLock across the network upload while releasing fh.mu,
 		// exactly like flushHandle Path 2. Without it Unlink can DELETE and
@@ -13006,6 +13020,13 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		if err == nil && committedRev == 0 {
 			if syntheticRev, ok := committedRevisionFromExpectedRevision(expectedRevision); ok && syntheticRev > 0 {
 				fs.recordCommittedRevision(handlePath, syntheticRev)
+			}
+		}
+		if err == nil {
+			mutationRevision := fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
+			fs.recordCommittedMutation(handleIno, mutationSeq, mutationRevision, size)
+			if mutationRevision > 0 {
+				fs.refreshCommittedRevisionForOpenHandlesWithSize(handlePath, mutationRevision, fh, size)
 			}
 		}
 		unlockRemoteCommit()
