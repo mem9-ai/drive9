@@ -1546,9 +1546,9 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 	}
 	cq.mu.Unlock()
 	cancel()
-	unlockPaths()
 
 	if err != nil {
+		unlockPaths()
 		if isBatchWriteUnsupported(err) {
 			cq.ConfigureBatchWrite(0, 0, 0)
 		}
@@ -1557,10 +1557,16 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 		return
 	}
 	if len(results) != len(entries) {
+		unlockPaths()
 		safeLogPrintf("commit queue: batch write returned %d results for %d entries, falling back to single commits", len(results), len(entries))
 		cq.fallbackBatchEntries(entries)
 		return
 	}
+	type failedBatchEntry struct {
+		entry *CommitEntry
+		err   error
+	}
+	failed := make([]failedBatchEntry, 0)
 	for i, result := range results {
 		entry := entries[i]
 		if cq.isEntryCanceled(entry) {
@@ -1578,6 +1584,12 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 			continue
 		}
 		resultErr := batchWriteResultError(result)
+		failed = append(failed, failedBatchEntry{entry: entry, err: resultErr})
+	}
+	unlockPaths()
+	for _, failure := range failed {
+		entry := failure.entry
+		resultErr := failure.err
 		if errors.Is(resultErr, client.ErrConflict) {
 			unlockPath := cq.lockPath(entry.Path)
 			if entry.DisableAutoResolveLWW {
