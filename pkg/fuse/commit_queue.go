@@ -150,6 +150,10 @@ type CommitQueue struct {
 	// revision. Used by dat9fs to seed readCache and update inode revision.
 	OnSuccess CommitSuccessFunc
 
+	// OnUploaded is called at the data-commit boundary before fallible mode,
+	// journal, or cleanup bookkeeping.
+	OnUploaded CommitSuccessFunc
+
 	// OnCleanup is called after local commit state has been removed.
 	OnCleanup CommitCleanupFunc
 
@@ -2026,6 +2030,9 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	layerRef := cq.layerRefSnapshot()
 	if layerRef == "" {
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+	}
+	if cq.OnUploaded != nil {
+		cq.OnUploaded(entry, committedRev)
 	}
 
 	if layerRef == "" && !remoteModeAlreadyApplied && shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {

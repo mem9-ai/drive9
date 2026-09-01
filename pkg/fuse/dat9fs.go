@@ -1987,7 +1987,7 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 		fh.BaseRev = state.committedRevision
 		fs.inodes.UpdateRevision(fh.Ino, state.committedRevision)
 		if fh.Streamer != nil {
-			fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+			fh.Streamer.ResetForNextWrite(expectedRevisionForHandle(fh))
 		}
 	}
 	fs.inodes.UpdateSize(fh.Ino, state.committedSize)
@@ -9472,9 +9472,37 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 
 	unlockRemoteCommit := func() {}
 	if fs.commitQueue != nil {
-		unlockRemoteCommit = fs.lockWritableRemoteCommitPath(newP)
+		first, second := oldP, newP
+		if second < first {
+			first, second = second, first
+		}
+		unlockFirst := fs.lockWritableRemoteCommitPath(first)
+		if first == second {
+			unlockRemoteCommit = unlockFirst
+		} else {
+			unlockSecond := fs.lockWritableRemoteCommitPath(second)
+			unlockRemoteCommit = func() {
+				unlockSecond()
+				unlockFirst()
+			}
+		}
 	}
 	defer unlockRemoteCommit()
+	if fs.shadowStore != nil {
+		shadowGen := fs.shadowStore.ActiveGeneration(oldP)
+		for _, fh := range fs.openHandles.SnapshotPath(oldP) {
+			if fh == nil {
+				continue
+			}
+			fh.Lock()
+			if shadowGen != 0 && fh.ShadowStageGen == shadowGen {
+				mutationSeq = fh.ShadowStageSeq
+				fh.Unlock()
+				break
+			}
+			fh.Unlock()
+		}
+	}
 
 	if fs.layerEnabled() && fs.shadowStore != nil && !fs.shadowStore.Has(oldP) {
 		return pendingRenameRemoteFallback, nil
@@ -12321,6 +12349,11 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 		mutationSeq := fh.DirtySeq
 		unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
 		defer unlockRemoteCommit()
+		if fs.discardSupersededMutationLocked(fh) {
+			fs.removeHandleOwnedStagingLocked(fh)
+			return gofuse.OK
+		}
+		mutationSeq = fh.DirtySeq
 		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		stagingGens := fs.captureHandleStagingGensLocked(fh)
 		uploadStart := time.Now()
@@ -13558,6 +13591,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					} else {
 						fallbackCommittedRev = committedRev
 						fh.Lock()
+						mutationRevision := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
+						fs.recordCommittedMutation(fh.Ino, mutationSeq, mutationRevision, size)
+						if mutationRevision > 0 {
+							fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, mutationRevision, fh, size)
+						}
 						if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 							flushStatus = httpToFuseStatus(err)
 							preservePendingModeOnReleaseFailure = true
@@ -13902,6 +13940,11 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 			safeLogPrintf("debounced flush failed for %s: %v", filePath, err)
 			return
 		}
+		mutationRevision := fs.resolveCommittedMutationRevision(filePath, committedRev, expectedRevision)
+		fs.recordCommittedMutation(ino, snapshotSeq, mutationRevision, int64(len(data)))
+		if mutationRevision > 0 {
+			fs.refreshCommittedRevisionForOpenHandlesWithSize(filePath, mutationRevision, handle, int64(len(data)))
+		}
 		modeCtx, modeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		modeErr := fs.applyPendingModeForHandleLocked(modeCtx, handle)
 		modeCancel()
@@ -13915,7 +13958,6 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		// with Path 2's approach (lines 11754-11770).
 		if committedRev > 0 {
 			fs.recordCommittedRevision(filePath, committedRev)
-			fs.recordCommittedMutation(ino, snapshotSeq, committedRev, int64(len(data)))
 			handle.IsNew = false
 			handle.BaseRev = committedRev
 			fs.inodes.UpdateSize(ino, int64(len(data)))
@@ -13926,9 +13968,6 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 				handle.ZeroBase = false
 			}
 		} else {
-			if syntheticRev, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
-				fs.recordCommittedMutation(ino, snapshotSeq, syntheticRev, int64(len(data)))
-			}
 			fs.finalizeHandleFlushLocked(handle, expectedRevision)
 		}
 		// Release remoteCommitLock after recording revision, before
@@ -14884,9 +14923,9 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 	if entry == nil {
 		return
 	}
+	fs.onCommitQueueUploaded(entry, committedRev)
 	if !fs.layerEnabled() {
 		committedRev = fs.resolveCommittedMutationRevision(entry.Path, committedRev, entry.BaseRev)
-		fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, committedRev, entry.Size)
 	}
 	if fs.layerEnabled() {
 		fs.clearReadTargetsForPath(entry.Path)
@@ -14974,6 +15013,17 @@ func (fs *Dat9FS) captureHandleStagingGensLocked(fh *FileHandle) StagingGens {
 		WriteBackGen:    fh.WriteBackGen,
 		PendingIndexGen: fh.PendingIndexGen,
 		ShadowGen:       fh.ShadowStageGen,
+	}
+}
+
+func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) {
+	if fs == nil || entry == nil || fs.layerEnabled() {
+		return
+	}
+	committedRev = fs.resolveCommittedMutationRevision(entry.Path, committedRev, entry.BaseRev)
+	fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, committedRev, entry.Size)
+	if committedRev > 0 {
+		fs.refreshCommittedRevisionForOpenHandlesWithSize(entry.Path, committedRev, nil, entry.Size)
 	}
 }
 

@@ -528,6 +528,7 @@ func Mount(opts *MountOptions) (err error) {
 				cq.SetLayerRef(opts.LayerRef)
 				cq.SetPerfCounters(dat9fs.perf)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
+				cq.OnUploaded = dat9fs.onCommitQueueUploaded
 				cq.OnCleanup = dat9fs.onCommitQueueCleanup
 				cq.OnDiscard = dat9fs.onCommitQueueDiscard
 				cq.IsSuperseded = dat9fs.commitEntrySuperseded
