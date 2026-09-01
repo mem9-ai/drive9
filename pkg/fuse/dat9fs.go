@@ -322,7 +322,6 @@ type dirtyInodeState struct {
 
 type inodeMutationState struct {
 	latestSeq         uint64
-	stagedSeq         uint64
 	committedSeq      uint64
 	committedRevision int64
 	committedSize     int64
@@ -1891,19 +1890,6 @@ func (fs *Dat9FS) clearDirtySize(ino uint64, seq uint64) {
 	}
 }
 
-func (fs *Dat9FS) recordStagedMutation(ino, seq uint64) {
-	if !fs.gvisorCompatibilityEnabled() || ino == 0 || seq == 0 {
-		return
-	}
-	fs.dirtyMu.Lock()
-	state := fs.mutationInodes[ino]
-	if seq > state.stagedSeq {
-		state.stagedSeq = seq
-	}
-	fs.mutationInodes[ino] = state
-	fs.dirtyMu.Unlock()
-}
-
 func (fs *Dat9FS) gvisorCompatibilityEnabled() bool {
 	return fs != nil && fs.opts != nil && fs.opts.GVisorCompat
 }
@@ -1968,7 +1954,7 @@ func (fs *Dat9FS) commitEntrySuperseded(entry *CommitEntry) bool {
 	if !ok {
 		return false
 	}
-	return entry.MutationSeq < state.stagedSeq || entry.MutationSeq <= state.committedSeq
+	return entry.MutationSeq <= state.committedSeq
 }
 
 // discardSupersededMutationLocked turns a handle snapshot that is no newer
@@ -3714,9 +3700,6 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 	// its cleanup to this handle's staging generation.
 	if fs.shadowStore != nil {
 		fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
-	}
-	if durable {
-		fs.recordStagedMutation(fh.Ino, fh.DirtySeq)
 	}
 	return nil
 }
@@ -9388,6 +9371,20 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 	if !ok || meta.Kind != PendingNew {
 		return pendingRenameNotApplicable, nil
 	}
+	mutationSeq := uint64(0)
+	if fs.commitQueue != nil {
+		mutationSeq = fs.commitQueue.mutationSeqForPath(oldP)
+	}
+	for _, fh := range fs.openHandles.SnapshotPath(oldP) {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		if fh.DirtySeq > mutationSeq {
+			mutationSeq = fh.DirtySeq
+		}
+		fh.Unlock()
+	}
 
 	// Only use the local fast path when the final path is truly absent.
 	// Git lockfile replacement (for example config.lock -> config) must keep
@@ -9480,14 +9477,19 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 	if fs.commitQueue != nil {
 		ino, _ := fs.inodes.GetInode(newP)
 		entry := &CommitEntry{
-			Path:        newP,
-			Inode:       ino,
-			BaseRev:     meta.BaseRev,
-			Size:        meta.Size,
-			Kind:        meta.Kind,
-			ShadowSpill: meta.ShadowSpill,
-			Mode:        meta.Mode,
-			HasMode:     meta.HasMode,
+			Path:            newP,
+			Inode:           ino,
+			MutationSeq:     mutationSeq,
+			PendingIndexGen: fs.pendingIndex.Generation(newP),
+			BaseRev:         meta.BaseRev,
+			Size:            meta.Size,
+			Kind:            meta.Kind,
+			ShadowSpill:     meta.ShadowSpill,
+			Mode:            meta.Mode,
+			HasMode:         meta.HasMode,
+		}
+		if fs.shadowStore != nil {
+			entry.ShadowGen = fs.shadowStore.ActiveGeneration(newP)
 		}
 		fs.bindCommitEntryToPath(entry, newP, meta.BaseRev)
 		if isGitLooseObjectFinalPath(newP) {
@@ -14066,12 +14068,13 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		phase = "superseded-after-commit-fence"
 		return gofuse.OK
 	}
+	mutationExpectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	mutationRecorded := false
 	recordMutationBeforeFenceRelease := func() {
-		if mutationRecorded || !fs.gvisorCompatibilityEnabled() || status != gofuse.OK || err != nil || mutationSeq == 0 || fh.Unlinked || fh.Path != mutationPath {
+		if mutationRecorded || !fs.gvisorCompatibilityEnabled() || err != nil || mutationSeq == 0 || fh.Unlinked || fh.Path != mutationPath {
 			return
 		}
-		revision := fs.latestCommittedRevision(mutationPath)
+		revision := fs.resolveCommittedMutationRevision(mutationPath, fs.latestCommittedRevision(mutationPath), mutationExpectedRevision)
 		fs.recordCommittedMutation(mutationIno, mutationSeq, revision, mutationSize)
 		if revision > 0 {
 			fs.refreshCommittedRevisionForOpenHandlesWithSize(mutationPath, revision, fh, mutationSize)
