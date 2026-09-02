@@ -1970,13 +1970,10 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 		return false
 	}
 	var layerData []byte
-	if state.committedRevision <= 0 && fs.layerEnabled() {
-		if fs.shadowStore == nil {
-			return false
-		}
-		var err error
-		layerData, err = fs.shadowStore.ReadAll(fh.Path)
-		if err != nil || int64(len(layerData)) != state.committedSize {
+	if fs.layerEnabled() {
+		var ok bool
+		layerData, ok = fs.readCommittedLayerData(fh.Path, state.committedSize)
+		if !ok {
 			return false
 		}
 	}
@@ -2003,9 +2000,7 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 	}
 	fs.inodes.UpdateSize(fh.Ino, state.committedSize)
 	if fh.Dirty != nil {
-		if state.committedRevision > 0 {
-			fs.rebindCleanWriteBufferToRemoteLocked(fh, state.committedSize)
-		} else {
+		if fs.layerEnabled() {
 			next := fs.newWriteBuffer(fh.Path, maxPreloadSize, fh.Dirty.PartSize())
 			if len(layerData) > 0 {
 				_, _ = next.Write(0, layerData)
@@ -2013,10 +2008,35 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 			next.ClearDirty()
 			fh.Dirty = next
 			fh.OrigSize = state.committedSize
+		} else if state.committedRevision > 0 {
+			fs.rebindCleanWriteBufferToRemoteLocked(fh, state.committedSize)
 		}
 	}
 	clearReadTargetForLockedHandle(fh)
 	return true
+}
+
+func (fs *Dat9FS) readCommittedLayerData(localPath string, size int64) ([]byte, bool) {
+	if fs == nil || !fs.layerEnabled() || size < 0 {
+		return nil, false
+	}
+	if fs.shadowStore != nil && fs.shadowStore.Has(localPath) {
+		if data, err := fs.shadowStore.ReadAll(localPath); err == nil && int64(len(data)) == size {
+			return data, true
+		}
+	}
+	if fs.readCache != nil {
+		if data, ok := fs.readCache.Get(localPath, 0); ok && int64(len(data)) == size {
+			return cloneBytes(data), true
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), fuseTimeout)
+	defer cancel()
+	data, err := fs.client.ReadFSLayerFile(ctx, fs.layerRef(), fs.remotePath(localPath), nil)
+	if err != nil || int64(len(data)) != size {
+		return nil, false
+	}
+	return data, true
 }
 
 func (fs *Dat9FS) removeHandleOwnedStagingLocked(fh *FileHandle) {
@@ -7030,7 +7050,7 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 					safeLogPrintf("open-unlink large snapshot failed for %s: %v", p, err)
 				}
 			}
-			if needsSnapshot && !snapshotOK {
+			if needsSnapshot && !snapshotOK && fs.gvisorCompatibilityEnabled() {
 				if snapshotErr == nil {
 					snapshotErr = syscall.EIO
 				}
@@ -13768,6 +13788,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 						if fs.layerEnabled() {
 							flushStatus = gofuse.EIO
 							safeLogPrintf("release: layer commitQueue enqueue failed for %s: %v", fh.Path, err)
+							unlockRemoteCommit()
 							return
 						}
 						if fs.gvisorCompatibilityEnabled() {
@@ -13777,6 +13798,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 							if commitErr != nil {
 								flushStatus = httpToFuseStatus(commitErr)
 								safeLogPrintf("release: synchronous sequence-preserving fallback failed for %s: %v", fh.Path, commitErr)
+								unlockRemoteCommit()
 								return
 							}
 							fs.writeBack.Remove(fh.Path)
@@ -14175,7 +14197,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			safeLogPrintf("layer flush failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
-		fs.recordCommittedMutation(fh.Ino, fh.DirtySeq, expectedRevision, size)
+		fs.recordCommittedMutation(fh.Ino, fh.DirtySeq, 0, size)
 		if fh.Dirty != nil {
 			fh.Dirty.ClearDirty()
 		}
@@ -14987,9 +15009,6 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		return
 	}
 	fs.onCommitQueueUploaded(entry, committedRev)
-	if !fs.layerEnabled() {
-		committedRev = fs.resolveCommittedMutationRevision(entry.Path, committedRev, entry.BaseRev)
-	}
 	if fs.layerEnabled() {
 		fs.clearReadTargetsForPath(entry.Path)
 		if fs.shadowStore != nil && entry.Size <= fs.readCache.MaxFileSize() {
@@ -15080,7 +15099,7 @@ func (fs *Dat9FS) captureHandleStagingGensLocked(fh *FileHandle) StagingGens {
 }
 
 func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) {
-	if fs == nil || entry == nil {
+	if fs == nil || entry == nil || !fs.gvisorCompatibilityEnabled() {
 		return
 	}
 	if entry.mutationPublished {
@@ -15088,7 +15107,7 @@ func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) 
 	}
 	if fs.layerEnabled() {
 		entry.mutationPublished = true
-		fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, entry.BaseRev, entry.Size)
+		fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, 0, entry.Size)
 		return
 	}
 	committedRev = fs.resolveCommittedMutationRevision(entry.Path, committedRev, entry.BaseRev)
