@@ -25,6 +25,10 @@ import (
 	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
+// testHookAfterSamePathDirtyHandleScan lets race-focused unit tests lock a
+// candidate after discovery but before the second TryLock in candidateLoop.
+var testHookAfterSamePathDirtyHandleScan func(path string)
+
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
 // operations to the dat9 HTTP API via the Go SDK client.
 type Dat9FS struct {
@@ -3978,6 +3982,7 @@ restartLoop:
 		for _, c := range candidates {
 			src := c.fh
 			if !src.TryLock() {
+				pending = true
 				continue
 			}
 			if src.Dirty == nil || src.DirtySeq == 0 {
@@ -4095,11 +4100,15 @@ restartLoop:
 		sort.SliceStable(candidates, func(i, j int) bool {
 			return candidates[i].dirtySeq > candidates[j].dirtySeq
 		})
+		if len(candidates) > 0 && testHookAfterSamePathDirtyHandleScan != nil {
+			testHookAfterSamePathDirtyHandleScan(path)
+		}
 
 	candidateLoop:
 		for _, c := range candidates {
 			src := c.fh
 			if !src.TryLock() {
+				pending = true
 				continue
 			}
 			if src.Dirty == nil || src.DirtySeq == 0 {
