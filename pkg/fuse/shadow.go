@@ -1344,11 +1344,11 @@ func (s *ShadowStore) EnsureActiveGeneration(remotePath string, baseRev int64) u
 	if sf == nil {
 		return 0
 	}
-	if baseRev != 0 {
-		sf.baseRev = baseRev
-	}
 	if gen := s.writeGen[remotePath]; gen != 0 {
 		return gen
+	}
+	if baseRev != 0 {
+		sf.baseRev = baseRev
 	}
 	return s.bumpWriteGenLocked(remotePath)
 }

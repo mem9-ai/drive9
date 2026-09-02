@@ -9925,6 +9925,132 @@ func TestOpenWritablePreloadChoosesNewestOpenHandle(t *testing.T) {
 	}
 }
 
+func TestLoadWritableHandleFromShadowBindsStagingGenerations(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const filePath = "/shadow-adopt.txt"
+	data := []byte("pending shadow bytes")
+	if err := shadow.WriteFull(filePath, data, 7); err != nil {
+		t.Fatal(err)
+	}
+	shadowGen := shadow.ActiveGeneration(filePath)
+	pendingGen, err := pending.PutWithBaseRev(filePath, int64(len(data)), PendingOverwrite, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := pending.GetMeta(filePath)
+	if !ok {
+		t.Fatal("pending metadata missing")
+	}
+
+	ino := fs.inodes.Lookup(filePath, false, int64(len(data)), time.Now())
+	target := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if err := fs.loadWritableHandleFromShadowLocked(target, meta); err != nil {
+		t.Fatalf("loadWritableHandleFromShadowLocked: %v", err)
+	}
+	if got := target.ShadowStageGen; got != shadowGen {
+		t.Fatalf("ShadowStageGen = %d, want %d", got, shadowGen)
+	}
+	if got := target.PendingIndexGen; got != pendingGen {
+		t.Fatalf("PendingIndexGen = %d, want %d", got, pendingGen)
+	}
+	if got := target.BaseRev; got != 7 {
+		t.Fatalf("BaseRev = %d, want 7", got)
+	}
+	if got := target.Dirty.Bytes(); !bytes.Equal(got, data) {
+		t.Fatalf("dirty bytes = %q, want %q", got, data)
+	}
+}
+
+func TestLoadWritableHandleFromOpenHandleCopiesStagingGenerations(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const filePath = "/open-shadow-adopt.txt"
+	data := []byte("source shadow bytes")
+	if err := shadow.WriteFull(filePath, data, 3); err != nil {
+		t.Fatal(err)
+	}
+	shadowGen := shadow.ActiveGeneration(filePath)
+	pendingGen, err := pending.PutWithBaseRev(filePath, int64(len(data)), PendingOverwrite, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ino := fs.inodes.Lookup(filePath, false, int64(len(data)), time.Now())
+	source := &FileHandle{
+		Ino:             ino,
+		Path:            filePath,
+		Dirty:           fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		BaseRev:         3,
+		OrigSize:        int64(len(data)),
+		ShadowReady:     true,
+		ShadowStageGen:  shadowGen,
+		PendingIndexGen: pendingGen,
+		WriteBackGen:    44,
+	}
+	if _, err := source.Dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	source.DirtySeq = fs.markDirtySize(ino, source.Dirty.Size())
+	fs.openHandles.Add(source)
+
+	target := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if !fs.loadWritableHandleFromOpenHandleLocked(target) {
+		t.Fatal("loadWritableHandleFromOpenHandleLocked returned false")
+	}
+	if !target.ShadowReady {
+		t.Fatal("target did not preserve shadow-backed source state")
+	}
+	if got := target.ShadowStageGen; got != shadowGen {
+		t.Fatalf("ShadowStageGen = %d, want %d", got, shadowGen)
+	}
+	if got := target.PendingIndexGen; got != pendingGen {
+		t.Fatalf("PendingIndexGen = %d, want %d", got, pendingGen)
+	}
+	if got := target.WriteBackGen; got != uint64(44) {
+		t.Fatalf("WriteBackGen = %d, want 44", got)
+	}
+	if got := target.Dirty.Bytes(); !bytes.Equal(got, data) {
+		t.Fatalf("dirty bytes = %q, want %q", got, data)
+	}
+}
+
 func TestOpenWritablePreloadSkipsCleanSiblingReboundToNewRevision(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
@@ -12418,6 +12544,219 @@ func TestReadCloseSyncSamePathDirtyWriterWaitsForCandidateLoopLockedHandle(t *te
 	}
 }
 
+func TestReadCloseSyncSamePathNewestLockedCandidateBlocksOlderDirtySibling(t *testing.T) {
+	var remoteReads atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteReads.Add(1)
+		http.Error(w, "remote should not be consulted while newest same-path dirty writer is locked", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/supervise-probe.txt"
+	olderData := []byte("older-dirty-candidate")
+	newestData := []byte("newest-dirty-candidate")
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	older := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		WritePolicy: WritePolicyCloseSync,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := older.Dirty.Write(0, olderData); err != nil {
+		t.Fatal(err)
+	}
+	older.DirtySeq = fs.markDirtySize(ino, int64(len(olderData)))
+	fs.openHandles.Add(older)
+
+	newest := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		WritePolicy: WritePolicyCloseSync,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := newest.Dirty.Write(0, newestData); err != nil {
+		t.Fatal(err)
+	}
+	newest.DirtySeq = fs.markDirtySize(ino, int64(len(newestData)))
+	fs.openHandles.Add(newest)
+
+	lockedInCandidateWindow := make(chan struct{})
+	releaseLockedWriter := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWriter := func() {
+		releaseOnce.Do(func() {
+			close(releaseLockedWriter)
+		})
+	}
+	t.Cleanup(func() {
+		testHookAfterSamePathDirtyHandleScan = nil
+		releaseWriter()
+	})
+
+	var hookOnce sync.Once
+	testHookAfterSamePathDirtyHandleScan = func(path string) {
+		if path != filePath {
+			return
+		}
+		hookOnce.Do(func() {
+			newest.Lock()
+			close(lockedInCandidateWindow)
+			go func() {
+				<-releaseLockedWriter
+				newest.Unlock()
+			}()
+		})
+	}
+
+	reader := &FileHandle{Ino: ino, Path: filePath, WritePolicy: WritePolicyCloseSync}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	type readResult struct {
+		data []byte
+		st   gofuse.Status
+		err  error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		got, st, err := readDat9FSTestRange(fs, ino, readerID, 0, len(newestData))
+		done <- readResult{data: got, st: st, err: err}
+	}()
+
+	select {
+	case <-lockedInCandidateWindow:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for newest same-path dirty candidate lock window")
+	}
+	select {
+	case res := <-done:
+		t.Fatalf("read completed while newest dirty candidate was locked: data=%q status=%v err=%v", res.data, res.st, res.err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	if gotRemote := remoteReads.Load(); gotRemote != 0 {
+		t.Fatalf("remote reads while newest candidate lock was pending = %d, want 0", gotRemote)
+	}
+	releaseWriter()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		if res.st != gofuse.OK {
+			t.Fatalf("Read status = %v, want OK", res.st)
+		}
+		if !bytes.Equal(res.data, newestData) {
+			t.Fatalf("read bytes = %q, want newest %q", res.data, newestData)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for close-sync same-path dirty read")
+	}
+}
+
+func TestReadSQLiteSidecarNewestLockedCandidateBlocksOlderDirtySibling(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	const filePath = "/app.db-wal"
+	olderData := []byte("older-wal-frame")
+	newestData := []byte("newest-wal-data")
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	older := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := older.Dirty.Write(0, olderData); err != nil {
+		t.Fatal(err)
+	}
+	older.DirtySeq = fs.markDirtySize(ino, int64(len(olderData)))
+	fs.openHandles.Add(older)
+
+	newest := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := newest.Dirty.Write(0, newestData); err != nil {
+		t.Fatal(err)
+	}
+	newest.DirtySeq = fs.markDirtySize(ino, int64(len(newestData)))
+	fs.openHandles.Add(newest)
+
+	lockedInCandidateWindow := make(chan struct{})
+	releaseLockedWriter := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWriter := func() {
+		releaseOnce.Do(func() {
+			close(releaseLockedWriter)
+		})
+	}
+	t.Cleanup(func() {
+		testHookAfterSamePathDirtyHandleScan = nil
+		releaseWriter()
+	})
+
+	var hookOnce sync.Once
+	testHookAfterSamePathDirtyHandleScan = func(path string) {
+		if path != filePath {
+			return
+		}
+		hookOnce.Do(func() {
+			newest.Lock()
+			close(lockedInCandidateWindow)
+			go func() {
+				<-releaseLockedWriter
+				newest.Unlock()
+			}()
+		})
+	}
+
+	type readResult struct {
+		data []byte
+		n    int
+		ok   bool
+		st   gofuse.Status
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		got, n, ok, st, _ := fs.readSQLitePersistentJournalVisibleRange(filePath, nil, 0, 0, uint32(len(newestData)))
+		done <- readResult{data: got, n: n, ok: ok, st: st}
+	}()
+
+	select {
+	case <-lockedInCandidateWindow:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for newest sqlite sidecar dirty candidate lock window")
+	}
+	select {
+	case res := <-done:
+		t.Fatalf("sqlite sidecar read completed while newest dirty candidate was locked: data=%q n=%d ok=%t status=%v", res.data, res.n, res.ok, res.st)
+	case <-time.After(10 * time.Millisecond):
+	}
+	releaseWriter()
+
+	select {
+	case res := <-done:
+		if res.st != gofuse.OK {
+			t.Fatalf("Read status = %v, want OK", res.st)
+		}
+		if !res.ok {
+			t.Fatal("sqlite sidecar dirty reader should return newest bytes after lock releases")
+		}
+		if !bytes.Equal(res.data, newestData) {
+			t.Fatalf("read bytes = %q, want newest %q", res.data, newestData)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for sqlite sidecar dirty read")
+	}
+}
+
 func TestReadSQLiteSamePathDirtyShadowEOFIsShortRead(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "remote should not be consulted for same-mount sqlite shadow data", http.StatusInternalServerError)
@@ -14262,6 +14601,77 @@ func TestSetAttr_WriteBackStrictPathTruncateStagesAndReturnsBeforeRemoteCommit(t
 	}
 	close(releasePut)
 	cq.DrainAll()
+}
+
+func TestSetAttr_WriteBackPathTruncateSyncFallbackMarksStaleConflict(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	c := newTestClient("http://127.0.0.1")
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:       0,
+		client:           c,
+		shadows:          shadow,
+		index:            pending,
+		queue:            []*CommitEntry{},
+		queuedByPath:     map[string]map[*CommitEntry]struct{}{},
+		inFlight:         map[string]*CommitEntry{},
+		delayed:          map[*CommitEntry]*time.Timer{},
+		workCh:           make(chan *CommitEntry, 1),
+		DurableWatermark: fs.latestCommittedRevision,
+	}
+
+	const filePath = "/stale-truncate.txt"
+	ino := fs.inodes.Lookup(filePath, false, 4096, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.recordCommittedRevision(filePath, 2)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	entry.Revision = 1
+
+	unlockRemoteCommit := fs.lockRemoteCommitPath(filePath)
+	st := fs.stagePathTruncateToZeroLocked(context.Background(), entry, ino)
+	unlockRemoteCommit()
+	if st == gofuse.OK {
+		t.Fatal("stale path truncate fallback unexpectedly succeeded")
+	}
+	meta, ok := pending.GetMeta(filePath)
+	if !ok {
+		t.Fatal("stale truncate pending metadata should be preserved as a conflict")
+	}
+	if meta.Kind != PendingConflict {
+		t.Fatalf("pending kind = %v, want PendingConflict", meta.Kind)
+	}
+	if meta.BaseRev != 1 {
+		t.Fatalf("pending base revision = %d, want 1", meta.BaseRev)
+	}
+	if meta.Size != 0 {
+		t.Fatalf("pending size = %d, want 0", meta.Size)
+	}
+	if !shadow.Has(filePath) {
+		t.Fatal("stale truncate shadow should be preserved for manual recovery")
+	}
+	data, err := shadow.ReadAll(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("stale truncate shadow length = %d, want 0", len(data))
+	}
 }
 
 func TestOpenTruncateCancelsQueuedPathTruncateWithoutCancelingInFlight(t *testing.T) {
@@ -20806,12 +21216,12 @@ func TestRenamePendingNewCommitUsesRemoteRenameWhenCanceledUploadBecameVisible(t
 	oldIno := fs.inodes.Lookup(oldP, false, int64(len(data)), time.Now())
 	dirIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
 
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:  oldP,
 		Inode: oldIno,
 		Size:  int64(len(data)),
 		Kind:  PendingNew,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("enqueue old temp upload: %v", err)
 	}
 
@@ -25723,6 +26133,20 @@ func TestDebouncedFlushRemovesPendingIndexAfterUpload(t *testing.T) {
 	// The shadowStore entry should be removed.
 	if shadow.Has(filePath) {
 		t.Fatal("shadowStore should be removed after debounced upload")
+	}
+	fh.Lock()
+	dirtySeq := fh.DirtySeq
+	writeBackSeq := fh.WriteBackSeq
+	dirtyParts := fh.Dirty != nil && fh.Dirty.HasDirtyParts()
+	fh.Unlock()
+	if dirtySeq != 0 {
+		t.Fatalf("DirtySeq after debounced upload = %d, want 0", dirtySeq)
+	}
+	if writeBackSeq != 0 {
+		t.Fatalf("WriteBackSeq after debounced upload = %d, want 0", writeBackSeq)
+	}
+	if dirtyParts {
+		t.Fatal("dirty parts should be clear after debounced upload")
 	}
 }
 
