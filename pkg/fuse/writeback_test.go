@@ -1353,11 +1353,15 @@ func TestCloseSyncOpenTruncateOverwriteReadSeesLatestBytes(t *testing.T) {
 	}, updated); st != gofuse.OK {
 		t.Fatalf("Write status = %v, want OK", st)
 	}
+	beforeFlushNotify := fs.notifyCount.Load()
 	if st := fs.Flush(nil, &gofuse.FlushIn{
 		InHeader: gofuse.InHeader{NodeId: ino},
 		Fh:       writeOut.Fh,
 	}); st != gofuse.OK {
 		t.Fatalf("Flush status = %v, want OK", st)
+	}
+	if got := fs.notifyCount.Load() - beforeFlushNotify; got != 1 {
+		t.Fatalf("close-sync truncate overwrite flush sent %d inode invalidations, want 1", got)
 	}
 	fs.Release(nil, &gofuse.ReleaseIn{
 		InHeader: gofuse.InHeader{NodeId: ino},

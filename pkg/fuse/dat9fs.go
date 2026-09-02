@@ -6271,6 +6271,23 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 	}()
 }
 
+// notifyInodeSync invalidates cached inode attrs/data before returning to the
+// kernel. Most local mutations must use notifyInode's asynchronous path to
+// avoid go-fuse worker-pool re-entry deadlocks, but close-sync/write-sync
+// remote commits are close-to-open barriers: the next opener may otherwise
+// observe stale size/page-cache state even though the remote commit has
+// completed.
+func (fs *Dat9FS) notifyInodeSync(ino uint64) {
+	fs.notifyCount.Add(1)
+	if fs.perf != nil {
+		fs.perf.notifyInode.add(1)
+	}
+	if fs.server == nil {
+		return
+	}
+	_ = fs.server.InodeNotify(ino, 0, 0)
+}
+
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseLookup, perfStart, status, 0) }()
@@ -11759,6 +11776,13 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 	}
 	fs.inodes.UpdateSize(fh.Ino, size)
 	fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
+	if fh.WritePolicy == WritePolicyWriteSync {
+		// write-sync completes the remote commit before Write returns. If this
+		// handle was opened O_TRUNC + FOPEN_DIRECT_IO, invalidate kernel
+		// size/data state immediately so the next read cannot observe the
+		// truncation's stale 0-byte view.
+		fs.notifyInodeSync(fh.Ino)
+	}
 	return gofuse.OK
 }
 
@@ -11837,6 +11861,9 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 		}
 		fs.inodes.UpdateSize(fh.Ino, size)
 		fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
+		if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync {
+			fs.notifyInodeSync(fh.Ino)
+		}
 		return gofuse.OK
 	}
 
@@ -13982,9 +14009,20 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			}
 		}
 	}
-	// Local flush — kernel receives the Flush reply with status.
-	// No notifyInode/notifyEntry needed; userspace caches are updated
-	// above and kernel will refresh attrs on next getattr/lookup.
+	if !pathRetargeted && fh.DirtySeq == 0 &&
+		(fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync) {
+		// close-sync/write-sync are remote durability barriers. The writer may
+		// have been opened with O_TRUNC + FOPEN_DIRECT_IO, so Linux can retain a
+		// kernel-side size/page-cache view from the truncation (0 bytes) while
+		// the just-committed bytes live only in userspace/remote caches. Invalidate
+		// synchronously before returning Flush so an immediate close-to-open read
+		// cannot serve stale/empty data from the kernel cache.
+		fs.notifyInodeSync(handleIno)
+	}
+	// Local flush — kernel receives the Flush reply with status. Most paths do
+	// not need notifyInode/notifyEntry because userspace caches are updated
+	// above and kernel will refresh attrs on next getattr/lookup. Synchronous
+	// close-sync/write-sync uploads are the exception handled just above.
 	return gofuse.OK
 }
 
