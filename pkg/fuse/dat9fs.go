@@ -8888,7 +8888,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// whiteout request was in flight escaped the first mark; mark them
 		// now so their later write/flush/release is suppressed too and the
 		// overlay entry cannot be upserted back over the whiteout.
-		fs.markOpenHandlesUnlinked(ctx, childP, false)
+		_, _, _ = fs.markOpenHandlesUnlinked(ctx, childP, false)
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
 		fs.touchDirectoryChangeTime(parentPath, time.Now())
@@ -12406,14 +12406,13 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 
 	size := fh.Dirty.Size()
 	if fh.ShadowSpill && fs.shadowStore != nil {
-		mutationSeq := fh.DirtySeq
 		unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
 		defer unlockRemoteCommit()
 		if fs.discardSupersededMutationLocked(fh) {
 			fs.removeHandleOwnedStagingLocked(fh)
 			return gofuse.OK
 		}
-		mutationSeq = fh.DirtySeq
+		mutationSeq := fh.DirtySeq
 		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		stagingGens := fs.captureHandleStagingGensLocked(fh)
 		uploadStart := time.Now()
