@@ -12207,6 +12207,117 @@ func TestReadSQLiteSamePathDirtyHandleSkipsIncompleteCandidate(t *testing.T) {
 	}
 }
 
+func TestReadCloseSyncSamePathDirtyWriterUsesDirtyBuffer(t *testing.T) {
+	var remoteReads atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteReads.Add(1)
+		http.Error(w, "remote should not be consulted while a same-path close-sync writer is dirty", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/supervise-probe.txt"
+	want := []byte("before-crash")
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		WritePolicy: WritePolicyCloseSync,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(writer)
+
+	reader := &FileHandle{Ino: ino, Path: filePath, WritePolicy: WritePolicyCloseSync}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	got, st, err := readDat9FSTestRange(fs, ino, readerID, 0, len(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes = %q, want %q", got, want)
+	}
+	if gotRemote := remoteReads.Load(); gotRemote != 0 {
+		t.Fatalf("remote reads = %d, want 0", gotRemote)
+	}
+}
+
+func TestReadCloseSyncSamePathDirtyWriterWaitsForLockedHandle(t *testing.T) {
+	var remoteReads atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteReads.Add(1)
+		http.Error(w, "remote should not be consulted while waiting for same-path dirty writer", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/supervise-probe.txt"
+	want := []byte("after-heal")
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		WritePolicy: WritePolicyCloseSync,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(writer)
+	writer.Lock()
+
+	reader := &FileHandle{Ino: ino, Path: filePath, WritePolicy: WritePolicyCloseSync}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	type readResult struct {
+		data []byte
+		st   gofuse.Status
+		err  error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		got, st, err := readDat9FSTestRange(fs, ino, readerID, 0, len(want))
+		done <- readResult{data: got, st: st, err: err}
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	writer.Unlock()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		if res.st != gofuse.OK {
+			t.Fatalf("Read status = %v, want OK", res.st)
+		}
+		if !bytes.Equal(res.data, want) {
+			t.Fatalf("read bytes = %q, want %q", res.data, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for close-sync same-path dirty read")
+	}
+	if gotRemote := remoteReads.Load(); gotRemote != 0 {
+		t.Fatalf("remote reads = %d, want 0", gotRemote)
+	}
+}
+
 func TestReadSQLiteSamePathDirtyShadowEOFIsShortRead(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "remote should not be consulted for same-mount sqlite shadow data", http.StatusInternalServerError)

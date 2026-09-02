@@ -397,6 +397,8 @@ const (
 
 	sqliteSidecarDirtyWaitTimeout  = 250 * time.Millisecond
 	sqliteSidecarDirtyWaitInterval = time.Millisecond
+	samePathDirtyWaitTimeout       = 250 * time.Millisecond
+	samePathDirtyWaitInterval      = time.Millisecond
 
 	// namespaceMutationRetryTimeout bounds detached retries for idempotent-ish
 	// namespace mutations after a FUSE interrupt or transient backend error.
@@ -3895,7 +3897,8 @@ func (fs *Dat9FS) readSamePathDirtyHandle(path string, skip *FileHandle, offset 
 	if isSQLitePersistentJournalPath(path) {
 		return nil, 0, false, gofuse.OK
 	}
-	return fs.readSamePathDirtyHandleAllowJournals(path, skip, offset, reqSize)
+	data, n, ok, st, _ := fs.readSamePathDirtyHandleAllowJournalsOnce(path, skip, offset, reqSize)
+	return data, n, ok, st
 }
 
 func (fs *Dat9FS) readSQLitePersistentJournalDirtyRange(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
@@ -4029,9 +4032,9 @@ func (fs *Dat9FS) readSQLitePersistentJournalVisibleRange(path string, skip *Fil
 	return nil, 0, false, gofuse.OK, ""
 }
 
-func (fs *Dat9FS) readSamePathDirtyHandleAllowJournals(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+func (fs *Dat9FS) readSamePathDirtyHandleAllowJournalsOnce(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, bool) {
 	if fs == nil || fs.openHandles == nil || path == "" || reqSize == 0 {
-		return nil, 0, false, gofuse.OK
+		return nil, 0, false, gofuse.OK, false
 	}
 
 	type candidate struct {
@@ -4042,11 +4045,13 @@ func (fs *Dat9FS) readSamePathDirtyHandleAllowJournals(path string, skip *FileHa
 restartLoop:
 	for {
 		var candidates []candidate
+		pending := false
 		for _, src := range fs.openHandles.SnapshotPath(path) {
 			if src == nil || src == skip {
 				continue
 			}
 			if !src.TryLock() {
+				pending = true
 				continue
 			}
 			if src.Dirty != nil && src.DirtySeq > 0 {
@@ -4070,12 +4075,13 @@ restartLoop:
 			}
 			if src.DirtySeq != c.dirtySeq {
 				src.Unlock()
+				pending = true
 				continue restartLoop
 			}
 			size := src.Dirty.Size()
 			if offset >= size {
 				src.Unlock()
-				return nil, 0, true, gofuse.OK
+				return nil, 0, true, gofuse.OK, false
 			}
 			end := offset + int64(reqSize)
 			if end > size {
@@ -4083,7 +4089,7 @@ restartLoop:
 			}
 			if end <= offset {
 				src.Unlock()
-				return nil, 0, true, gofuse.OK
+				return nil, 0, true, gofuse.OK, false
 			}
 			buf := make([]byte, end-offset)
 
@@ -4092,9 +4098,10 @@ restartLoop:
 				n, err := fs.shadowStore.ReadAt(path, offset, buf)
 				if err != nil && !errors.Is(err, io.EOF) {
 					fs.debugf("read same-path shadow miss path=%s off=%d req=%d err=%v", path, offset, reqSize, err)
+					pending = true
 					continue
 				}
-				return buf[:n], n, true, gofuse.OK
+				return buf[:n], n, true, gofuse.OK, false
 			}
 
 			ps := src.Dirty.PartSize()
@@ -4111,6 +4118,7 @@ restartLoop:
 			}
 			if touchesEvicted {
 				src.Unlock()
+				pending = true
 				continue
 			}
 			for p := firstPart; p <= lastPart; p++ {
@@ -4118,16 +4126,36 @@ restartLoop:
 					if err := src.Dirty.EnsureLoaded(p); err != nil {
 						src.Unlock()
 						fs.debugf("read same-path dirty incomplete path=%s part=%d err=%v", path, p, err)
+						pending = true
 						continue candidateLoop
 					}
 				}
 			}
 			src.Dirty.ReadAt(offset, buf)
 			src.Unlock()
-			return buf, len(buf), true, gofuse.OK
+			return buf, len(buf), true, gofuse.OK, false
 		}
-		return nil, 0, false, gofuse.OK
+		return nil, 0, false, gofuse.OK, pending
 	}
+}
+
+func (fs *Dat9FS) readSamePathDirtyHandleVisibleRange(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, string) {
+	deadline := time.Now().Add(samePathDirtyWaitTimeout)
+	for {
+		data, n, ok, st, pending := fs.readSamePathDirtyHandleAllowJournalsOnce(path, skip, offset, reqSize)
+		if ok || st != gofuse.OK {
+			return data, n, ok, st, "same-path-dirty"
+		}
+		if !pending {
+			break
+		}
+		if time.Now().After(deadline) {
+			fs.debugf("read same-path dirty wait expired path=%s off=%d req=%d", path, offset, reqSize)
+			break
+		}
+		time.Sleep(samePathDirtyWaitInterval)
+	}
+	return nil, 0, false, gofuse.OK, ""
 }
 
 func (fs *Dat9FS) readSQLitePersistentJournalCommittedCache(path string, fallbackRevision int64, offset int64, reqSize uint32) ([]byte, int, bool) {
@@ -11003,14 +11031,30 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		return gofuse.ReadResultData(data), gofuse.OK
 	}
 
-	if fh.Dirty == nil && isSQLiteVisibleSamePathDirtyPath(fh.Path) {
-		if data, n, ok, st := fs.readSamePathDirtyHandle(fh.Path, fh, int64(input.Offset), input.Size); ok {
-			source = "same-path-dirty"
-			bytesRead = n
-			if st != gofuse.OK {
-				return nil, st
+	if fh.Dirty == nil && !isSQLitePersistentJournalPath(fh.Path) {
+		if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync {
+			// A close-sync/write-sync writer can still be in userspace Release
+			// after close(2) returns to the caller. Preserve same-mount
+			// close-to-open visibility by reading from that open dirty handle
+			// instead of racing the remote object, which may temporarily hold
+			// the preceding O_TRUNC image.
+			if data, n, ok, st, src := fs.readSamePathDirtyHandleVisibleRange(fh.Path, fh, int64(input.Offset), input.Size); ok || st != gofuse.OK {
+				source = src
+				bytesRead = n
+				if st != gofuse.OK {
+					return nil, st
+				}
+				return gofuse.ReadResultData(data), gofuse.OK
 			}
-			return gofuse.ReadResultData(data), gofuse.OK
+		} else if isSQLiteVisibleSamePathDirtyPath(fh.Path) {
+			if data, n, ok, st := fs.readSamePathDirtyHandle(fh.Path, fh, int64(input.Offset), input.Size); ok || st != gofuse.OK {
+				source = "same-path-dirty"
+				bytesRead = n
+				if st != gofuse.OK {
+					return nil, st
+				}
+				return gofuse.ReadResultData(data), gofuse.OK
+			}
 		}
 	}
 
