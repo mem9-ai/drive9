@@ -1148,6 +1148,14 @@ func (cq *CommitQueue) discardSupersededEntry(entry *CommitEntry) bool {
 	if cq == nil || entry == nil || cq.IsSuperseded == nil || !cq.IsSuperseded(entry) {
 		return false
 	}
+	cq.discardEntry(entry)
+	return true
+}
+
+func (cq *CommitQueue) discardEntry(entry *CommitEntry) {
+	if cq == nil || entry == nil {
+		return
+	}
 	if cq.index != nil && entry.PendingIndexGen != 0 {
 		cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
 	}
@@ -1159,7 +1167,6 @@ func (cq *CommitQueue) discardSupersededEntry(entry *CommitEntry) bool {
 		cq.OnDiscard(entry)
 	}
 	safeLogPrintf("commit queue: discarded superseded entry for %s (inode=%d seq=%d)", entry.Path, entry.Inode, entry.MutationSeq)
-	return true
 }
 
 func (cq *CommitQueue) worker() {
@@ -1871,6 +1878,17 @@ func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error 
 }
 
 func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEntry) error {
+	release, discard, err := cq.beginImmediateMutationCommit(ctx, entry)
+	if err != nil {
+		return err
+	}
+	if discard {
+		cq.discardEntry(entry)
+		return nil
+	}
+	if release != nil {
+		defer release()
+	}
 	if cq.discardSupersededEntry(entry) {
 		return nil
 	}
@@ -1888,6 +1906,52 @@ func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEnt
 		return err
 	}
 	return nil
+}
+
+func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *CommitEntry) (func(), bool, error) {
+	if cq == nil || entry == nil || !cq.serializeMutationInodes || entry.Inode == 0 || entry.MutationSeq == 0 {
+		return nil, false, nil
+	}
+	for {
+		cq.mu.Lock()
+		newer := false
+		older := false
+		for _, active := range cq.inFlight {
+			if active == nil || active == entry || active.Path == entry.Path || active.Inode != entry.Inode || active.MutationSeq == 0 {
+				continue
+			}
+			if active.MutationSeq > entry.MutationSeq {
+				newer = true
+			} else if active.MutationSeq < entry.MutationSeq {
+				older = true
+			}
+		}
+		for _, queued := range cq.queue {
+			if queued == nil || queued.canceled || queued == entry || queued.Path == entry.Path || queued.Inode != entry.Inode || queued.MutationSeq == 0 {
+				continue
+			}
+			if queued.MutationSeq > entry.MutationSeq {
+				newer = true
+			} else if queued.MutationSeq < entry.MutationSeq {
+				older = true
+			}
+		}
+		if newer {
+			cq.mu.Unlock()
+			return nil, true, nil
+		}
+		if !older && cq.inFlight[entry.Path] == nil {
+			cq.inFlight[entry.Path] = entry
+			cq.mu.Unlock()
+			return func() { cq.endInFlight(entry) }, false, nil
+		}
+		cq.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 func committedRevisionForExpectedRevision(expectedRevision, committedRev int64) int64 {

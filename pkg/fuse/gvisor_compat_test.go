@@ -812,6 +812,197 @@ func TestGVisorCompatLayerDiscardRebindsCommittedShadow(t *testing.T) {
 	}
 }
 
+func TestGVisorCompatLayerQueueUploadRebindsExistingFileFromShadow(t *testing.T) {
+	const filePath = "/layer-existing.txt"
+	committed := []byte("layer committed content")
+	opts := &MountOptions{GVisorCompat: true, LayerRef: "layer-test"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	ino := fs.inodes.Lookup(filePath, false, int64(len(committed)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	_, stale := newGVisorMutationHandle(t, fs, filePath, ino)
+	if err := shadow.WriteFull(filePath, committed, 7); err != nil {
+		t.Fatal(err)
+	}
+	newerSeq := fs.markDirtySize(ino, int64(len(committed)))
+	fs.onCommitQueueUploaded(&CommitEntry{
+		Path:        filePath,
+		Inode:       ino,
+		MutationSeq: newerSeq,
+		BaseRev:     7,
+		Size:        int64(len(committed)),
+	}, 0)
+
+	stale.Lock()
+	discarded := fs.discardSupersededMutationLocked(stale)
+	got := stale.Dirty.Bytes()
+	stale.Unlock()
+	if !discarded {
+		t.Fatal("layer sibling was not discarded")
+	}
+	if !bytes.Equal(got, committed) {
+		t.Fatalf("layer rebound content = %q, want %q", got, committed)
+	}
+}
+
+func TestGVisorCompatMarkOpenHandlesUnlinkedSnapshotFailureIsGated(t *testing.T) {
+	const filePath = "/snapshot-failure.txt"
+	for _, tc := range []struct {
+		name         string
+		gvisorCompat bool
+		wantErr      bool
+		wantMarked   bool
+	}{
+		{name: "disabled", wantMarked: true},
+		{name: "enabled", gvisorCompat: true, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "snapshot read failed", http.StatusInternalServerError)
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{GVisorCompat: tc.gvisorCompat}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			ino := fs.inodes.Lookup(filePath, false, 4, time.Now())
+			fh := &FileHandle{Ino: ino, Path: filePath}
+			fs.allocateFileHandle(fh)
+
+			marked, anyOpen, err := fs.markOpenHandlesUnlinked(context.Background(), filePath, true)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("markOpenHandlesUnlinked error = %v, want error=%t", err, tc.wantErr)
+			}
+			if anyOpen != tc.wantMarked || len(marked) != map[bool]int{false: 0, true: 1}[tc.wantMarked] {
+				t.Fatalf("marked/anyOpen = %d/%t, want %t", len(marked), anyOpen, tc.wantMarked)
+			}
+			fh.Lock()
+			gotUnlinked := fh.Unlinked
+			fh.Unlock()
+			if gotUnlinked != tc.wantMarked {
+				t.Fatalf("handle unlinked = %t, want %t", gotUnlinked, tc.wantMarked)
+			}
+		})
+	}
+}
+
+func TestGVisorCompatCommitNowOrdersHardlinkAliasesByInode(t *testing.T) {
+	const ino = uint64(42)
+	older := &CommitEntry{Path: "/alias-b", Inode: ino, MutationSeq: 1}
+	newer := &CommitEntry{Path: "/alias-a", Inode: ino, MutationSeq: 2}
+	cq := &CommitQueue{
+		queue:                   []*CommitEntry{older},
+		queuedByPath:            map[string]map[*CommitEntry]struct{}{older.Path: {older: {}}},
+		inFlight:                map[string]*CommitEntry{older.Path: older},
+		serializeMutationInodes: true,
+	}
+
+	type result struct {
+		release func()
+		discard bool
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		release, discard, err := cq.beginImmediateMutationCommit(context.Background(), newer)
+		done <- result{release: release, discard: discard, err: err}
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("newer immediate commit started before older alias drained: %+v", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cq.mu.Lock()
+	delete(cq.inFlight, older.Path)
+	cq.queue = nil
+	cq.queuedByPath = map[string]map[*CommitEntry]struct{}{}
+	cq.mu.Unlock()
+
+	select {
+	case got := <-done:
+		if got.err != nil || got.discard || got.release == nil {
+			t.Fatalf("newer immediate result = %+v, want acquired release", got)
+		}
+		got.release()
+	case <-time.After(time.Second):
+		t.Fatal("newer immediate commit did not resume after older alias drained")
+	}
+
+	cq = &CommitQueue{
+		queue:                   []*CommitEntry{newer},
+		queuedByPath:            map[string]map[*CommitEntry]struct{}{newer.Path: {newer: {}}},
+		inFlight:                make(map[string]*CommitEntry),
+		serializeMutationInodes: true,
+	}
+	release, discard, err := cq.beginImmediateMutationCommit(context.Background(), older)
+	if err != nil || !discard || release != nil {
+		t.Fatalf("older immediate result = release:%v discard:%t err:%v, want discarded", release != nil, discard, err)
+	}
+}
+
+func TestGVisorCompatReleaseFallbackUnlocksCommitPath(t *testing.T) {
+	const filePath = "/release-fallback.txt"
+	opts := &MountOptions{GVisorCompat: true, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	c := newTestClient("http://127.0.0.1")
+	fs := NewDat9FS(c, opts)
+	cache, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploader := NewWriteBackUploader(c, cache, 1)
+	t.Cleanup(uploader.DrainAll)
+	fs.SetWriteBack(cache, uploader)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(filePath, []byte("data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	t.Cleanup(cq.DrainAll)
+	cq.mu.Lock()
+	cq.maxPending = 0
+	cq.mu.Unlock()
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = cq
+
+	ino := fs.inodes.Lookup(filePath, false, 4, time.Now())
+	dirty := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	if _, err := dirty.Write(0, []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	var unlocks atomic.Int32
+	fh := &FileHandle{
+		Ino:                ino,
+		Path:               filePath,
+		Dirty:              dirty,
+		DirtySeq:           1,
+		WriteBackSeq:       1,
+		RemoteCommitUnlock: func() { unlocks.Add(1) },
+	}
+	fhID := fs.allocateFileHandle(fh)
+
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fhID})
+	if got := unlocks.Load(); got != 1 {
+		t.Fatalf("commit-path unlock calls = %d, want 1 after fallback failure", got)
+	}
+}
+
 func TestGVisorCompatQueueSuccessSynthesizesUnknownRevision(t *testing.T) {
 	const filePath = "/unknown-revision.txt"
 	opts := &MountOptions{GVisorCompat: true}
@@ -823,6 +1014,29 @@ func TestGVisorCompatQueueSuccessSynthesizesUnknownRevision(t *testing.T) {
 	state, ok := fs.committedMutation(ino)
 	if !ok || state.committedRevision != 1 {
 		t.Fatalf("committed mutation state = %+v, %t; want synthesized revision 1", state, ok)
+	}
+}
+
+func TestGVisorCompatDisabledQueueUploadDoesNotSynthesizeRevision(t *testing.T) {
+	const filePath = "/disabled-unknown-revision.txt"
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	ino := fs.inodes.Lookup(filePath, false, 11, time.Now())
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    filePath,
+		Dirty:   fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		BaseRev: 0,
+	}
+	fs.allocateFileHandle(fh)
+	fs.onCommitQueueUploaded(&CommitEntry{Path: filePath, Inode: ino, MutationSeq: 1, Size: 11, Kind: PendingNew}, 0)
+
+	fh.Lock()
+	gotRevision := fh.BaseRev
+	fh.Unlock()
+	if gotRevision != 0 {
+		t.Fatalf("non-gVisor queue upload synthesized handle revision %d, want 0", gotRevision)
 	}
 }
 
