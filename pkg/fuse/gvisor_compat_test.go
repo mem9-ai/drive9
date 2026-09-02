@@ -910,7 +910,7 @@ func TestGVisorCompatCommitNowOrdersHardlinkAliasesByInode(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		release, discard, err := cq.beginImmediateMutationCommit(context.Background(), newer)
+		release, discard, err := cq.beginImmediateMutationCommit(context.Background(), newer, false)
 		done <- result{release: release, discard: discard, err: err}
 	}()
 	select {
@@ -941,9 +941,114 @@ func TestGVisorCompatCommitNowOrdersHardlinkAliasesByInode(t *testing.T) {
 		inFlight:                make(map[string]*CommitEntry),
 		serializeMutationInodes: true,
 	}
-	release, discard, err := cq.beginImmediateMutationCommit(context.Background(), older)
+	release, discard, err := cq.beginImmediateMutationCommit(context.Background(), older, false)
 	if err != nil || !discard || release != nil {
 		t.Fatalf("older immediate result = release:%v discard:%t err:%v, want discarded", release != nil, discard, err)
+	}
+}
+
+func TestGVisorCompatPathLockedImmediateCommitDoesNotWaitForSamePathWorker(t *testing.T) {
+	const ino = uint64(42)
+	older := &CommitEntry{Path: "/same-path", Inode: ino, MutationSeq: 1}
+	newer := &CommitEntry{Path: "/same-path", Inode: ino, MutationSeq: 2}
+	cq := &CommitQueue{
+		inFlight:                map[string]*CommitEntry{older.Path: older},
+		queuedByPath:            make(map[string]map[*CommitEntry]struct{}),
+		immediate:               make(map[*CommitEntry]struct{}),
+		serializeMutationInodes: true,
+	}
+
+	done := make(chan struct {
+		release func()
+		discard bool
+		err     error
+	}, 1)
+	go func() {
+		release, discard, err := cq.beginImmediateMutationCommit(context.Background(), newer, true)
+		done <- struct {
+			release func()
+			discard bool
+			err     error
+		}{release: release, discard: discard, err: err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil || got.discard || got.release == nil {
+			t.Fatalf("path-locked immediate result = %+v, want acquired release", got)
+		}
+		got.release()
+	case <-time.After(time.Second):
+		t.Fatal("path-locked immediate commit waited for same-path in-flight worker")
+	}
+}
+
+func TestGVisorCompatLayerShadowCommitDoesNotRelockPathFence(t *testing.T) {
+	const filePath = "/layer-shadow.txt"
+	data := []byte("layer shadow data")
+	var pathLockCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-test/entries" {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"layer_id": "layer-test", "path": filePath, "op": "upsert", "kind": "file"})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: true, LayerRef: "layer-test"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(filePath, data, 0); err != nil {
+		t.Fatal(err)
+	}
+	pendingGen, err := pending.PutWithBaseRev(filePath, int64(len(data)), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.SetLayerRef("layer-test")
+	cq.serializeMutationInodes = true
+	cq.PathLock = func(string) func() {
+		pathLockCalls.Add(1)
+		return func() {}
+	}
+	defer cq.DrainAll()
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = cq
+	ino := fs.inodes.Lookup(filePath, false, int64(len(data)), time.Now())
+	dirty := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	if _, err := dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:             ino,
+		Path:            filePath,
+		Dirty:           dirty,
+		DirtySeq:        fs.markDirtySize(ino, int64(len(data))),
+		ShadowSpill:     true,
+		ShadowStageGen:  shadow.ActiveGeneration(filePath),
+		PendingIndexGen: pendingGen,
+		IsNew:           true,
+	}
+	fh.Lock()
+	err = fs.commitLayerShadowLocked(context.Background(), fh, false, true)
+	fh.Unlock()
+	if err != nil {
+		t.Fatalf("commitLayerShadowLocked: %v", err)
+	}
+	if got := pathLockCalls.Load(); got != 0 {
+		t.Fatalf("path fence locks = %d, want 0 while already held", got)
 	}
 }
 
