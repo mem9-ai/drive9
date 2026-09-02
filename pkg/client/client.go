@@ -384,6 +384,7 @@ type StatMetadataResult struct {
 	Mtime        *int64            `json:"mtime,omitempty"` // Unix seconds when known
 	ContentType  string            `json:"content_type"`
 	SemanticText string            `json:"semantic_text"`
+	Description  string            `json:"description"`
 	Tags         map[string]string `json:"tags"`
 	Degraded     bool              `json:"degraded,omitempty"`
 }
