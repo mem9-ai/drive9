@@ -8083,6 +8083,30 @@ func TestOpenWritableSQLiteUsesDirectIO(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlySyncDurabilityUsesDirectIO(t *testing.T) {
+	for _, policy := range []WritePolicy{WritePolicyCloseSync, WritePolicyWriteSync} {
+		t.Run(string(policy), func(t *testing.T) {
+			opts := &MountOptions{}
+			opts.setDefaults()
+			opts.WritePolicy = policy
+			fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+			ino := fs.inodes.Lookup("/sync-visible.txt", false, 17, time.Now())
+
+			var out gofuse.OpenOut
+			st := fs.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Flags:    uint32(syscall.O_RDONLY),
+			}, &out)
+			if st != gofuse.OK {
+				t.Fatalf("Open status = %v, want OK", st)
+			}
+			if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+				t.Fatalf("open flags = %d, want FOPEN_DIRECT_IO for %s close-to-open coherence", out.OpenFlags, policy)
+			}
+		})
+	}
+}
+
 func TestOpenReadOnlyCacheableFileSkipsPrefetcher(t *testing.T) {
 	size := int64(defaultReadCacheMaxFileSize)
 	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {

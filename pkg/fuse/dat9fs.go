@@ -1628,6 +1628,14 @@ func remoteOpenFlagsForHandle(fh *FileHandle) uint32 {
 	if fh.ShadowPinned || fh.ShadowReady || fh.ShadowSpill {
 		return gofuse.FOPEN_DIRECT_IO
 	}
+	if fh.Dirty == nil && (fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync) {
+		// close-sync/write-sync are close-to-open durability barriers. On
+		// Linux, a previous O_TRUNC writer can leave a stale 0-byte page/attr
+		// cache view even after the remote commit succeeds; make clean sync-mode
+		// readers enter userspace so they can observe the freshly committed
+		// read cache/remote revision instead of a kernel-side stale view.
+		return gofuse.FOPEN_DIRECT_IO
+	}
 	if fh.Dirty != nil {
 		if fh.Flags&syscall.O_TRUNC != 0 || fh.OrigSize >= smallFileShadowThreshold {
 			return gofuse.FOPEN_DIRECT_IO
