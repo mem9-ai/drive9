@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"unicode/utf8"
@@ -12,6 +13,7 @@ import (
 // SetMeta updates tags and/or description of an existing remote file without
 // rewriting its content.
 func SetMeta(c *client.Client, args []string) error {
+	const usage = "usage: drive9 fs setmeta [--tag key=value]... [--clear-tags] [--description <text>] [--clear-description] <path>"
 	authLocal, args, err := peelObjectAuth(args)
 	if err != nil {
 		return err
@@ -75,10 +77,10 @@ func SetMeta(c *client.Client, args []string) error {
 		return fmt.Errorf("--description and --clear-description are mutually exclusive")
 	}
 	if !tagsSet && !clearTags && !descriptionSet && !clearDescription {
-		return fmt.Errorf("usage: drive9 fs setmeta [--tag key=value]... [--clear-tags] [--description <text>] [--clear-description] <path>")
+		return errors.New(usage)
 	}
 	if len(positional) != 1 {
-		return fmt.Errorf("usage: drive9 fs setmeta [--tag key=value]... [--clear-tags] [--description <text>] [--clear-description] <path>")
+		return errors.New(usage)
 	}
 	if descriptionSet && utf8.RuneCountInString(description) > backend.MaxDescriptionLen {
 		return fmt.Errorf("description exceeds %d characters", backend.MaxDescriptionLen)
@@ -88,8 +90,18 @@ func SetMeta(c *client.Client, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := requireCapOnHandle(h, CapWrite, "setmeta"); err != nil {
-		return err
+	// Object backends advertise CapWrite but carry no drive9 client and have
+	// no file metadata; gate on the metadata caps so object URIs fail closed
+	// instead of dereferencing a nil client.
+	if tagsSet || clearTags {
+		if err := requireCapOnHandle(h, CapTags, "setmeta"); err != nil {
+			return err
+		}
+	}
+	if descriptionSet || clearDescription {
+		if err := requireCapOnHandle(h, CapDescription, "setmeta"); err != nil {
+			return err
+		}
 	}
 	c, path := h.Client, h.Path
 

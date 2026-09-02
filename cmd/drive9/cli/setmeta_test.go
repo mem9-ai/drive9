@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
@@ -83,6 +84,69 @@ func TestSetMetaValidation(t *testing.T) {
 		if err := SetMeta(c, args); err == nil {
 			t.Fatalf("SetMeta(%v) succeeded, want error", args)
 		}
+	}
+}
+
+func TestSetMetaOmitsUnsetFields(t *testing.T) {
+	cases := []struct {
+		name        string
+		args        []string
+		wantTags    bool
+		wantDescKey bool
+	}{
+		{"description only omits tags", []string{"--description", "x", "/a.txt"}, false, true},
+		{"tags only omit description", []string{"--tag", "a=b", "/a.txt"}, true, false},
+		{"description= empty clears", []string{"--description=", "/a.txt"}, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotBody, _ = io.ReadAll(r.Body)
+				_, _ = w.Write([]byte(`{"status":"ok"}`))
+			}))
+			defer srv.Close()
+
+			c := client.New(srv.URL, "")
+			if err := SetMeta(c, tc.args); err != nil {
+				t.Fatalf("SetMeta: %v", err)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(gotBody, &body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			_, hasTags := body["tags"]
+			_, hasDesc := body["description"]
+			if hasTags != tc.wantTags || hasDesc != tc.wantDescKey {
+				t.Fatalf("body keys: tags=%v description=%v, want tags=%v description=%v (body %s)",
+					hasTags, hasDesc, tc.wantTags, tc.wantDescKey, gotBody)
+			}
+		})
+	}
+}
+
+// Object-store URIs have no drive9 client behind them; setmeta must fail
+// closed with an unsupported-capability error instead of panicking.
+func TestSetMetaRejectsObjectURI(t *testing.T) {
+	c := client.New("http://127.0.0.1:0", "")
+	err := SetMeta(c, []string{"--auth=local", "--tag", "a=b", "s3://bucket/key"})
+	if err == nil {
+		t.Fatal("SetMeta on s3:// URI succeeded, want fail-closed error")
+	}
+	if !strings.Contains(err.Error(), `backend "s3" does not support tags`) {
+		t.Fatalf("SetMeta on s3:// err = %v, want unsupported-tags error", err)
+	}
+	err = SetMeta(c, []string{"--auth=local", "--description", "x", "s3://bucket/key"})
+	if err == nil || !strings.Contains(err.Error(), `backend "s3" does not support description`) {
+		t.Fatalf("SetMeta --description on s3:// err = %v, want unsupported-description error", err)
+	}
+}
+
+func TestSetMetaDescriptionTooLong(t *testing.T) {
+	c := client.New("http://127.0.0.1:0", "")
+	long := strings.Repeat("x", backend.MaxDescriptionLen+1)
+	if err := SetMeta(c, []string{"--description", long, "/a.txt"}); err == nil {
+		t.Fatal("SetMeta with oversized description succeeded, want error")
 	}
 }
 
