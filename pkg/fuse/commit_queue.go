@@ -130,7 +130,8 @@ type CommitQueue struct {
 	mu           sync.Mutex
 	queue        []*CommitEntry
 	queuedByPath map[string]map[*CommitEntry]struct{}
-	inFlight     map[string]*CommitEntry // paths currently being processed by workers
+	inFlight     map[string]*CommitEntry   // paths currently being processed by workers
+	immediate    map[*CommitEntry]struct{} // synchronous gVisor commits participating in inode ordering
 	delayed      map[*CommitEntry]*time.Timer
 	maxPending   int
 	client       *client.Client
@@ -216,6 +217,7 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 		index:             index,
 		journal:           journal,
 		inFlight:          make(map[string]*CommitEntry),
+		immediate:         make(map[*CommitEntry]struct{}),
 		queuedByPath:      make(map[string]map[*CommitEntry]struct{}),
 		delayed:           make(map[*CommitEntry]*time.Timer),
 		workCh:            make(chan *CommitEntry, bufSize),
@@ -777,6 +779,11 @@ func (cq *CommitQueue) hasNewerMutation(path string, ino, seq uint64) bool {
 				return true
 			}
 		}
+		for entry := range cq.immediate {
+			if newer(entry) {
+				return true
+			}
+		}
 		for _, entry := range cq.queue {
 			if newer(entry) {
 				return true
@@ -1255,6 +1262,11 @@ func (cq *CommitQueue) canBeginInFlightLocked(entry *CommitEntry) bool {
 	}
 	for _, active := range cq.inFlight {
 		if active != nil && active != entry && active.Inode == entry.Inode && active.MutationSeq != 0 {
+			return false
+		}
+	}
+	for active := range cq.immediate {
+		if active != nil && !active.canceled && active != entry && active.Inode == entry.Inode && active.MutationSeq != 0 {
 			return false
 		}
 	}
@@ -1872,13 +1884,7 @@ func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error 
 	if abandoned {
 		return errLayerRolledBack
 	}
-	unlockPath := cq.lockPath(entry.Path)
-	defer unlockPath()
-	return cq.commitNowPathLocked(ctx, entry)
-}
-
-func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEntry) error {
-	release, discard, err := cq.beginImmediateMutationCommit(ctx, entry)
+	release, discard, err := cq.beginImmediateMutationCommit(ctx, entry, false)
 	if err != nil {
 		return err
 	}
@@ -1889,6 +1895,27 @@ func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEnt
 	if release != nil {
 		defer release()
 	}
+	unlockPath := cq.lockPath(entry.Path)
+	defer unlockPath()
+	return cq.commitNowClaimedPathLocked(ctx, entry)
+}
+
+func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEntry) error {
+	release, discard, err := cq.beginImmediateMutationCommit(ctx, entry, true)
+	if err != nil {
+		return err
+	}
+	if discard {
+		cq.discardEntry(entry)
+		return nil
+	}
+	if release != nil {
+		defer release()
+	}
+	return cq.commitNowClaimedPathLocked(ctx, entry)
+}
+
+func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *CommitEntry) error {
 	if cq.discardSupersededEntry(entry) {
 		return nil
 	}
@@ -1908,7 +1935,7 @@ func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEnt
 	return nil
 }
 
-func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *CommitEntry) (func(), bool, error) {
+func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *CommitEntry, pathLocked bool) (func(), bool, error) {
 	if cq == nil || entry == nil || !cq.serializeMutationInodes || entry.Inode == 0 || entry.MutationSeq == 0 {
 		return nil, false, nil
 	}
@@ -1917,7 +1944,17 @@ func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *
 		newer := false
 		older := false
 		for _, active := range cq.inFlight {
-			if active == nil || active == entry || active.Path == entry.Path || active.Inode != entry.Inode || active.MutationSeq == 0 {
+			if active == nil || active.canceled || active == entry || (pathLocked && active.Path == entry.Path) || active.Inode != entry.Inode || active.MutationSeq == 0 {
+				continue
+			}
+			if active.MutationSeq > entry.MutationSeq {
+				newer = true
+			} else if active.MutationSeq < entry.MutationSeq {
+				older = true
+			}
+		}
+		for active := range cq.immediate {
+			if active == nil || active.canceled || active == entry || (pathLocked && active.Path == entry.Path) || active.Inode != entry.Inode || active.MutationSeq == 0 {
 				continue
 			}
 			if active.MutationSeq > entry.MutationSeq {
@@ -1927,7 +1964,7 @@ func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *
 			}
 		}
 		for _, queued := range cq.queue {
-			if queued == nil || queued.canceled || queued == entry || queued.Path == entry.Path || queued.Inode != entry.Inode || queued.MutationSeq == 0 {
+			if queued == nil || queued.canceled || queued == entry || (pathLocked && queued.Path == entry.Path) || queued.Inode != entry.Inode || queued.MutationSeq == 0 {
 				continue
 			}
 			if queued.MutationSeq > entry.MutationSeq {
@@ -1940,10 +1977,13 @@ func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *
 			cq.mu.Unlock()
 			return nil, true, nil
 		}
-		if !older && cq.inFlight[entry.Path] == nil {
-			cq.inFlight[entry.Path] = entry
+		if !older && (pathLocked || cq.inFlight[entry.Path] == nil) {
+			if cq.immediate == nil {
+				cq.immediate = make(map[*CommitEntry]struct{})
+			}
+			cq.immediate[entry] = struct{}{}
 			cq.mu.Unlock()
-			return func() { cq.endInFlight(entry) }, false, nil
+			return func() { cq.endImmediate(entry) }, false, nil
 		}
 		cq.mu.Unlock()
 		select {
@@ -1952,6 +1992,15 @@ func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+}
+
+func (cq *CommitQueue) endImmediate(entry *CommitEntry) {
+	if cq == nil || entry == nil {
+		return
+	}
+	cq.mu.Lock()
+	delete(cq.immediate, entry)
+	cq.mu.Unlock()
 }
 
 func committedRevisionForExpectedRevision(expectedRevision, committedRev int64) int64 {

@@ -956,7 +956,7 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 	return nil
 }
 
-func (fs *Dat9FS) commitLayerShadowLocked(ctx context.Context, fh *FileHandle, shadowSpill bool) error {
+func (fs *Dat9FS) commitLayerShadowLocked(ctx context.Context, fh *FileHandle, shadowSpill, pathLocked bool) error {
 	if fs.commitQueue == nil {
 		return fmt.Errorf("missing commit queue")
 	}
@@ -983,7 +983,12 @@ func (fs *Dat9FS) commitLayerShadowLocked(ctx context.Context, fh *FileHandle, s
 	}
 	fs.bindCommitEntryToHandleLocked(entry, fh, payloadBaseRev)
 	fh.Unlock()
-	err := fs.commitQueue.CommitNow(ctx, entry)
+	var err error
+	if pathLocked {
+		err = fs.commitQueue.commitNowPathLocked(ctx, entry)
+	} else {
+		err = fs.commitQueue.CommitNow(ctx, entry)
+	}
 	fh.Lock()
 	if err != nil {
 		return err
@@ -12792,7 +12797,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				phase = "large-shadowspill-layer-sync-upload"
 				uploadStart := time.Now()
 				fs.debugf("flush layer shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
-				err := fs.commitLayerShadowLocked(uploadCtx, fh, true)
+				err := fs.commitLayerShadowLocked(uploadCtx, fh, true, false)
 				fs.debugDurationf(uploadStart, 0, "flush layer shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 				if err != nil {
 					safeLogPrintf("flush: layer ShadowSpill sync upload failed for %s: %v", fh.Path, err)
@@ -13121,7 +13126,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			phase = "shadowspill-layer-sync-upload"
 			uploadStart := time.Now()
 			fs.debugf("fsync layer shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
-			err := fs.commitLayerShadowLocked(uploadCtx, fh, true)
+			err := fs.commitLayerShadowLocked(uploadCtx, fh, true, false)
 			fs.debugDurationf(uploadStart, 0, "fsync layer shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 			if err != nil {
 				safeLogPrintf("fsync: layer ShadowSpill sync upload failed for %s: %v", fh.Path, err)
@@ -14181,7 +14186,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		expectedRevision := expectedRevisionForHandle(fh)
 		if fh.ShadowSpill || (fh.Streamer != nil && fh.Streamer.Started()) || !fs.materializeFullForUploadLocked(fh) {
 			if fh.ShadowSpill {
-				if err := fs.commitLayerShadowLocked(ctx, fh, true); err != nil {
+				if err := fs.commitLayerShadowLocked(ctx, fh, true, true); err != nil {
 					safeLogPrintf("layer shadowspill flush failed for %s: %v", fh.Path, err)
 					return httpToFuseStatus(err)
 				}
