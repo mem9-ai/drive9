@@ -364,6 +364,8 @@ func runFS(args []string) {
 		err = cli.Mkdir(c, rest)
 	case "chmod":
 		err = cli.Chmod(c, rest)
+	case "setmeta":
+		err = cli.SetMeta(c, rest)
 	case "symlink":
 		err = cli.Symlink(c, rest)
 	case "hardlink":
@@ -499,6 +501,14 @@ commands:
   mv <old> <new>      rename/move
   mkdir <path>        create directory (parents auto-created)
   chmod <mode> <path>  change file permissions (octal, e.g. 644)
+  setmeta [flags] <path>
+                       update tags/description without re-uploading
+    --tag <key=value>  replace the tag set (repeatable)
+    --clear-tags       remove all user tags
+    --description <text>
+                       set file description
+    --clear-description
+                       remove the description
   symlink <target> <link>
                        create symbolic link
   hardlink <target> <link>
