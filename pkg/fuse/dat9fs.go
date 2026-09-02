@@ -6290,8 +6290,22 @@ func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
 	}()
 }
 
+// invalidateInodeKernelCaches asks the kernel to drop both inode attributes
+// (notably i_size) and cached file data. Linux treats off=-1 as the attribute
+// invalidation form, while off=0/len=0 invalidates cached data. A data-only
+// invalidation can leave a just-truncated 0-byte i_size cached across a later
+// close-sync remote commit, making immediate close-to-open reads observe EOF.
+func (fs *Dat9FS) invalidateInodeKernelCaches(ino uint64) {
+	if fs.server == nil {
+		return
+	}
+	_ = fs.server.InodeNotify(ino, -1, 0)
+	_ = fs.server.InodeNotify(ino, 0, 0)
+}
+
 // notifyInode tells the kernel to invalidate cached attributes and data
-// for an inode. off=0, sz=0 means invalidate all cached data.
+// for an inode. The notification is asynchronous to avoid re-entry deadlocks
+// from mutation handlers.
 func (fs *Dat9FS) notifyInode(ino uint64) {
 	fs.notifyCount.Add(1)
 	if fs.perf != nil {
@@ -6303,7 +6317,7 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 	fs.notifyWg.Add(1)
 	go func() {
 		defer fs.notifyWg.Done()
-		_ = fs.server.InodeNotify(ino, 0, 0)
+		fs.invalidateInodeKernelCaches(ino)
 	}()
 }
 
@@ -6318,10 +6332,7 @@ func (fs *Dat9FS) notifyInodeSync(ino uint64) {
 	if fs.perf != nil {
 		fs.perf.notifyInode.add(1)
 	}
-	if fs.server == nil {
-		return
-	}
-	_ = fs.server.InodeNotify(ino, 0, 0)
+	fs.invalidateInodeKernelCaches(ino)
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
@@ -7533,6 +7544,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	if !ok {
 		return gofuse.ENOENT
 	}
+	sizeChanged := false
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if entryIsMetadataOnlySpecial(entry) {
@@ -7610,6 +7622,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			fs.inodes.UpdateSize(input.NodeId, int64(input.Size))
 			if entry.Size != oldSize {
 				metadataChanged = true
+				sizeChanged = true
 			}
 		}
 		info, err := overlay.Lstat(entry.Path)
@@ -7625,7 +7638,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			fs.cacheEntryForPath(entry.Path, entry)
 		}
 		fs.fillAttr(entry, &out.Attr)
-		out.SetTimeout(fs.opts.AttrTTL)
+		fs.setAttrOutTimeout(out, sizeChanged)
 		return gofuse.OK
 	}
 	if _, rel, ok := fs.gitWorkspaceForPath(ctx, entry.Path); ok && rel != "" {
@@ -7777,6 +7790,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		fs.inodes.UpdateSize(input.NodeId, newSize)
 		if newSize != oldSize {
 			metadataChanged = true
+			sizeChanged = true
 			// POSIX: truncation updates mtime (not just ctime). The trailing
 			// metadataChanged block only updates ctime, so update mtime
 			// explicitly here. Without this, open(O_TRUNC) — which the
@@ -7798,8 +7812,19 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		fs.cacheEntryForPath(entry.Path, entry)
 	}
 	fs.fillAttr(entry, &out.Attr)
-	out.SetTimeout(fs.opts.AttrTTL)
+	fs.setAttrOutTimeout(out, sizeChanged)
 	return gofuse.OK
+}
+
+func (fs *Dat9FS) setAttrOutTimeout(out *gofuse.AttrOut, sizeChanged bool) {
+	if sizeChanged {
+		// Size-changing SetAttr can be an intermediate truncate from shell
+		// redirection before the writer's close-sync commit publishes the final
+		// bytes. Do not let the kernel cache that transient i_size.
+		out.SetTimeout(0)
+		return
+	}
+	out.SetTimeout(fs.opts.AttrTTL)
 }
 
 func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out []byte, status gofuse.Status) {
@@ -10569,9 +10594,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			// open/00.t test 43). Use a synchronous InodeNotify (not the
 			// async notifyInode goroutine) to guarantee the cache is
 			// invalidated before Open returns to the kernel.
-			if fs.server != nil {
-				_ = fs.server.InodeNotify(input.NodeId, 0, 0)
-			}
+			fs.invalidateInodeKernelCaches(input.NodeId)
 			if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 				if err := fs.shadowStore.WriteFull(p, nil, fh.BaseRev); err != nil {
 					safeLogPrintf("shadow reset failed for truncate-open %s: %v", p, err)

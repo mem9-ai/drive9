@@ -12895,6 +12895,9 @@ func TestSetAttr_MtimeUpdate(t *testing.T) {
 	if out.Mtime != uint64(mtime.Unix()) {
 		t.Fatalf("out.Mtime = %d, want %d", out.Mtime, mtime.Unix())
 	}
+	if got := out.Timeout(); got != fs.opts.AttrTTL {
+		t.Fatalf("attr timeout = %v, want %v", got, fs.opts.AttrTTL)
+	}
 }
 
 func TestSetAttr_MtimeNow(t *testing.T) {
@@ -13244,6 +13247,78 @@ func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 	}
 	if fh.BaseRev != 2 {
 		t.Fatalf("open base revision = %d, want 2", fh.BaseRev)
+	}
+}
+
+func TestSetAttr_SizeChangeDisablesAttrCache(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		revision int64 = 1
+		content        = bytes.Repeat([]byte{0x41}, 42)
+		recorder testErrorRecorder
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(content)), 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				recorder.Recordf("read truncate body: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if len(body) != 0 {
+				recorder.Recordf("truncate body len = %d, want 0", len(body))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			content = append(content[:0], body...)
+			revision = 2
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			http.NotFound(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{AttrTTL: time.Minute}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, 42, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	recorder.Check(t)
+	if got := out.Timeout(); got != 0 {
+		t.Fatalf("attr timeout after size change = %v, want 0", got)
+	}
+	if out.Size != 0 {
+		t.Fatalf("out.Size = %d, want 0", out.Size)
 	}
 }
 
