@@ -1276,6 +1276,127 @@ func TestFlush_CloseSyncUploadsBeforeReturning(t *testing.T) {
 	}
 }
 
+func TestCloseSyncOpenTruncateOverwriteReadSeesLatestBytes(t *testing.T) {
+	const path = "/supervise-probe.txt"
+	initial := []byte("ready\n")
+	updated := []byte("before-crash\n")
+
+	var (
+		mu      sync.Mutex
+		content       = append([]byte(nil), initial...)
+		rev     int64 = 1
+		puts    int
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			_, _ = w.Write(content)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "1" {
+				t.Errorf("expected revision header = %q, want 1", got)
+			}
+			puts++
+			rev++
+			content = append(content[:0], body...)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": rev})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict, WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	ino := fs.inodes.Lookup(path, false, int64(len(initial)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.inodes.UpdateSize(ino, int64(len(initial)))
+
+	var writeOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &writeOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open truncate status = %v, want OK", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       writeOut.Fh,
+		Offset:   0,
+	}, updated); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       writeOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       writeOut.Fh,
+	})
+
+	var readOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &readOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open read status = %v, want OK", st)
+	}
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readOut.Fh,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, _ := result.Bytes(buf)
+	if !bytes.Equal(got, updated) {
+		t.Fatalf("Read = %q, want %q", got, updated)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if puts != 1 {
+		t.Fatalf("PUT calls = %d, want 1", puts)
+	}
+	if !bytes.Equal(content, updated) || rev != 2 {
+		t.Fatalf("server content/rev = %q/%d, want %q/2", content, rev, updated)
+	}
+}
+
 func TestWriteSyncUploadsBeforeWriteReturns(t *testing.T) {
 	var putCalls atomic.Int32
 	var uploaded []byte

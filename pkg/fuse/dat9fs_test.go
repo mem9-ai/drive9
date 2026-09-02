@@ -14468,6 +14468,9 @@ func TestStageShadowReadyNonSpillRewritesShadowWithDirtyBuffer(t *testing.T) {
 	if err := fs.stageShadowForQueuedCommitLocked(fh, true); err != nil {
 		t.Fatal(err)
 	}
+	if fh.ShadowStageGen == 0 {
+		t.Fatal("staged shadow rewrite lost shadow staging generation")
+	}
 	defer fs.releaseHandleRemoteCommitPathLocked(fh)
 
 	got, err := shadow.ReadAll(path)
@@ -14526,6 +14529,9 @@ func TestOpenTruncateResetShadowStagesDirtyBuffer(t *testing.T) {
 	if !fh.ShadowReady {
 		t.Fatal("truncate-open did not reset shadow")
 	}
+	if fh.ShadowStageGen == 0 {
+		t.Fatal("truncate-open reset shadow did not record staging generation")
+	}
 	if fh.ShadowSpill {
 		t.Fatal("truncate-open shadow must stay dirty-buffer backed, not ShadowSpill")
 	}
@@ -14540,6 +14546,9 @@ func TestOpenTruncateResetShadowStagesDirtyBuffer(t *testing.T) {
 	}
 	if err := fs.stageShadowForQueuedCommitLocked(fh, true); err != nil {
 		t.Fatal(err)
+	}
+	if fh.ShadowStageGen == 0 {
+		t.Fatal("staged truncate-open rewrite lost shadow staging generation")
 	}
 	defer fs.releaseHandleRemoteCommitPathLocked(fh)
 
