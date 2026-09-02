@@ -1447,6 +1447,39 @@ func (fs *Dat9FS) removeShadowPendingStagingGenerationLocked(fh *FileHandle, loc
 	}
 }
 
+// removeSupersededZeroTruncateStagingLocked retires a path-level zero-byte
+// truncate shadow after a later same-path remote commit has durably published
+// non-empty bytes. This is intentionally narrower than path-wide cleanup: it
+// only removes the currently active 0-byte shadow/pending generation when that
+// staging is based on a revision older than the just-committed revision. The
+// caller must hold the path's remoteCommitLock so no same-path writer can stage
+// newer bytes between the generation checks and the removals.
+func (fs *Dat9FS) removeSupersededZeroTruncateStagingLocked(localPath string, committedRev, uploadedSize int64) {
+	if fs == nil || localPath == "" || committedRev <= 0 || uploadedSize <= 0 || fs.shadowStore == nil {
+		return
+	}
+	shadowGen := fs.shadowStore.ActiveGeneration(localPath)
+	if shadowGen == 0 {
+		return
+	}
+	if fs.shadowStore.Size(localPath) != 0 {
+		return
+	}
+	shadowBaseRev := fs.shadowStore.BaseRev(localPath)
+	if shadowBaseRev >= committedRev {
+		return
+	}
+	if fs.pendingIndex != nil {
+		if meta, ok := fs.pendingIndex.GetMeta(localPath); ok {
+			if meta.Kind != PendingOverwrite || meta.Size != 0 || meta.BaseRev >= committedRev {
+				return
+			}
+			fs.pendingIndex.RemoveIfGeneration(localPath, meta.Generation)
+		}
+	}
+	fs.shadowStore.RemoveIfGeneration(localPath, shadowGen)
+}
+
 func (fs *Dat9FS) lookupLayerNamespaceEntry(parentIno uint64, childP, name string, out *gofuse.EntryOut) (bool, gofuse.Status) {
 	if fs == nil || !fs.layerEnabled() {
 		return false, gofuse.OK
@@ -13718,6 +13751,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	handleOrigSize := fh.OrigSize
 	handleDirtyPartSize := fh.Dirty.PartSize()
 	handleFullRangeLoaded := writeBufferHasLoadedFullRange(fh.Dirty)
+	stagingGens := fs.captureHandleStagingGensLocked(fh)
 	var committedRev int64
 
 	// Use the negotiated server threshold (not the heuristic-only inline
@@ -13892,6 +13926,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// will see the updated revision via adoptCommittedRevisionLocked.
 	// This must happen before releasing remoteCommitLock to prevent a
 	// same-path flush from snapshotting a stale expectedRevision.
+	committedBarrierRev := committedRev
 	if err == nil && committedRev > 0 {
 		if handleIsNew {
 			fs.replaceCommittedRevision(handlePath, committedRev)
@@ -13908,7 +13943,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	if err == nil && committedRev == 0 {
 		if syntheticRev, ok := committedRevisionFromExpectedRevision(expectedRevision); ok && syntheticRev > 0 {
 			fs.recordCommittedRevision(handlePath, syntheticRev)
+			committedBarrierRev = syntheticRev
 		}
+	}
+	if err == nil {
+		fs.removeSupersededZeroTruncateStagingLocked(handlePath, committedBarrierRev, size)
 	}
 
 	// Release remoteCommitLock AFTER upload + revision recording but
@@ -14083,6 +14122,16 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 				fs.inodes.UpdateMtime(handleIno, commitTime)
 			}
 		}
+	}
+	if !pathRetargeted {
+		// Open(O_TRUNC) and other truncate-first flows may leave a 0-byte shadow
+		// pinned for this writer while the close-sync small-write path uploads the
+		// final bytes directly to the remote server. Retire only the exact staging
+		// generations captured from this handle; otherwise an immediate reader can
+		// pin the stale truncate shadow and observe EOF even though the remote commit
+		// has completed. Generation guards preserve the writeback fence invariant: a
+		// stale handle must never delete a newer same-path payload.
+		fs.removeShadowPendingStagingGenerationLocked(fh, handlePath, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
 	}
 	if !pathRetargeted && fh.DirtySeq == 0 &&
 		(fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync) {
