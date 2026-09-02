@@ -16885,6 +16885,179 @@ func TestFlushHandle_Path2_NoDeadlockWithConcurrentWrite(t *testing.T) {
 	_ = fhID // keep allocated for the duration of the test
 }
 
+func TestSyncHandleShadowSpillConcurrentWritePreservesDirtyState(t *testing.T) {
+	const filePath = "/shadowspill-concurrent.txt"
+	original := []byte("original shadow data")
+	updated := []byte("updated shadow data")
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "unexpected request", http.StatusMethodNotAllowed)
+			return
+		}
+		_, _ = io.ReadAll(r.Body)
+		close(uploadStarted)
+		<-uploadResume
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	ino := fs.inodes.Lookup(filePath, false, int64(len(original)), time.Now())
+	dirty := NewWriteBuffer(filePath, maxPreloadSize, 0)
+	if _, err := dirty.Write(0, original); err != nil {
+		t.Fatal(err)
+	}
+	dirty.maxSize = streamingWriteMaxSize
+	if err := shadow.WriteFull(filePath, original, 0); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       dirty,
+		DirtySeq:    fs.markDirtySize(ino, int64(len(original))),
+		ShadowSpill: true,
+		ShadowReady: true,
+		IsNew:       true,
+	}
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.syncHandleToRemoteLocked(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shadowspill upload did not start")
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		fh.Lock()
+		unlockRemoteCommit := fs.lockHandleRemoteCommitPathLocked(fh)
+		_, err := fh.Dirty.Write(0, updated)
+		if err == nil {
+			fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+		}
+		unlockRemoteCommit()
+		fh.Unlock()
+		writeDone <- err
+	}()
+	close(uploadResume)
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("syncHandleToRemoteLocked status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("syncHandleToRemoteLocked deadlocked with concurrent Write")
+	}
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("concurrent Write failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent Write did not complete")
+	}
+	fh.Lock()
+	dirtySeq := fh.DirtySeq
+	hasDirty := fh.Dirty.HasDirtyParts()
+	fh.Unlock()
+	if dirtySeq == 0 || !hasDirty {
+		t.Fatalf("concurrent shadowspill write was cleared: seq=%d dirty=%t", dirtySeq, hasDirty)
+	}
+}
+
+func TestFlushHandleUploadAllConcurrentWritePreservesDirtyState(t *testing.T) {
+	const filePath = "/uploadall-concurrent.txt"
+	data := bytes.Repeat([]byte("a"), int(DefaultPartSize)+1024)
+	updated := []byte("updated after uploadall snapshot")
+	expectedRevision := int64(0)
+	rec := newMultipartUploadRecorder(t, filePath, int64(len(data)), &expectedRevision)
+	rec.completeStarted = make(chan struct{})
+	rec.allowComplete = make(chan struct{})
+	var allowCompleteOnce sync.Once
+	t.Cleanup(func() { allowCompleteOnce.Do(func() { close(rec.allowComplete) }) })
+
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(rec.client(), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	dirty := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	if _, err := dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    dirty,
+		DirtySeq: fs.markDirtySize(ino, int64(len(data))),
+		Streamer: NewStreamUploader(rec.client(), filePath, expectedRevision),
+		IsNew:    true,
+	}
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+	select {
+	case <-rec.completeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("UploadAll did not reach complete")
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		fh.Lock()
+		unlockRemoteCommit := fs.lockHandleRemoteCommitPathLocked(fh)
+		_, err := fh.Dirty.Write(0, updated)
+		if err == nil {
+			fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+		}
+		unlockRemoteCommit()
+		fh.Unlock()
+		writeDone <- err
+	}()
+	allowCompleteOnce.Do(func() { close(rec.allowComplete) })
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("UploadAll flush deadlocked with concurrent Write")
+	}
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("concurrent Write failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent Write did not complete")
+	}
+	fh.Lock()
+	dirtySeq := fh.DirtySeq
+	hasDirty := fh.Dirty.HasDirtyParts()
+	fh.Unlock()
+	if dirtySeq == 0 || !hasDirty {
+		t.Fatalf("concurrent UploadAll write was cleared: seq=%d dirty=%t", dirtySeq, hasDirty)
+	}
+}
+
 // TestFlushHandle_Path2_RenameRetargetDuringUpload verifies that when
 // retargetOpenHandlesForRename changes fh.Path while a Path 2 upload is
 // in-flight, the committed revision is NOT misattributed to the new path.

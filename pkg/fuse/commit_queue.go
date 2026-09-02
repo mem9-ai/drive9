@@ -477,6 +477,14 @@ func (cq *CommitQueue) PendingStats() (count int, bytes int64) {
 		count++
 		bytes += e.Size
 	}
+	for e := range cq.immediate {
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		count++
+		bytes += e.Size
+	}
 	return
 }
 
@@ -530,12 +538,26 @@ func (cq *CommitQueue) snapshotLocked() CommitQueueSnapshot {
 		snap.Pending++
 		snap.Bytes += e.Size
 	}
+	for e := range cq.immediate {
+		if e == nil {
+			continue
+		}
+		if snap.FirstPath == "" {
+			snap.FirstPath = e.Path
+		}
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		snap.Pending++
+		snap.Bytes += e.Size
+	}
 	for e := range cq.delayed {
 		if e != nil && snap.FirstPath == "" {
 			snap.FirstPath = e.Path
 		}
 	}
-	snap.InFlight = len(cq.inFlight)
+	snap.InFlight = len(cq.inFlight) + len(cq.immediate)
 	snap.Delayed = len(cq.delayed)
 	if cq.index != nil {
 		var firstConflictPath string
@@ -709,8 +731,9 @@ func (cq *CommitQueue) WaitPath(path string) {
 		cq.forceDelayedPathLocked(path)
 		_, inflight := cq.inFlight[path]
 		queued := cq.hasQueuedPathLocked(path)
+		immediate := cq.hasImmediatePathLocked(path)
 		cq.mu.Unlock()
-		if !inflight && !queued {
+		if !inflight && !queued && !immediate {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -725,8 +748,9 @@ func (cq *CommitQueue) WaitPathTimeout(path string, pollInterval time.Duration) 
 	cq.forceDelayedPathLocked(path)
 	_, inflight := cq.inFlight[path]
 	queued := cq.hasQueuedPathLocked(path)
+	immediate := cq.hasImmediatePathLocked(path)
 	cq.mu.Unlock()
-	if !inflight && !queued {
+	if !inflight && !queued && !immediate {
 		return true
 	}
 	time.Sleep(pollInterval)
@@ -743,7 +767,25 @@ func (cq *CommitQueue) HasPath(path string) bool {
 	if _, inflight := cq.inFlight[path]; inflight {
 		return true
 	}
-	return cq.hasQueuedPathLocked(path)
+	return cq.hasQueuedPathLocked(path) || cq.hasImmediatePathLocked(path)
+}
+
+func (cq *CommitQueue) hasImmediatePathLocked(path string) bool {
+	for entry := range cq.immediate {
+		if entry != nil && entry.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+func (cq *CommitQueue) hasImmediatePrefixLocked(prefix string) bool {
+	for entry := range cq.immediate {
+		if entry != nil && strings.HasPrefix(entry.Path, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (cq *CommitQueue) mutationSeqForPath(path string) uint64 {
@@ -755,6 +797,11 @@ func (cq *CommitQueue) mutationSeqForPath(path string) uint64 {
 	var seq uint64
 	if entry := cq.inFlight[path]; entry != nil && entry.MutationSeq > seq {
 		seq = entry.MutationSeq
+	}
+	for entry := range cq.immediate {
+		if entry != nil && entry.Path == path && entry.MutationSeq > seq {
+			seq = entry.MutationSeq
+		}
 	}
 	for entry := range cq.queuedByPath[path] {
 		if entry != nil && entry.MutationSeq > seq {
@@ -823,6 +870,9 @@ func (cq *CommitQueue) WaitPrefix(prefix string) {
 				}
 			}
 		}
+		if !found {
+			found = cq.hasImmediatePrefixLocked(prefix)
+		}
 		cq.mu.Unlock()
 		if !found {
 			return
@@ -854,6 +904,9 @@ func (cq *CommitQueue) WaitPrefixTimeout(prefix string, timeout time.Duration) b
 					break
 				}
 			}
+		}
+		if !found {
+			found = cq.hasImmediatePrefixLocked(prefix)
 		}
 		cq.mu.Unlock()
 		if !found {
@@ -915,6 +968,11 @@ func (cq *CommitQueue) CancelPathIfInode(path string, ino uint64) {
 	if e, ok := cq.inFlight[path]; ok {
 		markCanceled(e)
 	}
+	for e := range cq.immediate {
+		if e != nil && e.Path == path {
+			markCanceled(e)
+		}
+	}
 	if cq.queuedByPath != nil {
 		for e := range cq.queuedByPath[path] {
 			markCanceled(e)
@@ -964,7 +1022,7 @@ func (cq *CommitQueue) CancelQueuedZeroTruncatePreserveLocal(path string) bool {
 	}
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
-	if cq.inFlight[path] != nil {
+	if cq.inFlight[path] != nil || cq.hasImmediatePathLocked(path) {
 		return false
 	}
 	otherQueued := false
@@ -1013,6 +1071,11 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	cq.mu.Lock()
 	if e, ok := cq.inFlight[path]; ok {
 		markCanceled(e)
+	}
+	for e := range cq.immediate {
+		if e != nil && e.Path == path {
+			markCanceled(e)
+		}
 	}
 	if cq.queuedByPath != nil {
 		for e := range cq.queuedByPath[path] {
@@ -1102,6 +1165,12 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		if strings.HasPrefix(p, prefix) {
 			markCanceled(e)
 			cancelled = append(cancelled, p)
+		}
+	}
+	for e := range cq.immediate {
+		if e != nil && strings.HasPrefix(e.Path, prefix) {
+			markCanceled(e)
+			cancelled = append(cancelled, e.Path)
 		}
 	}
 	for _, e := range cq.queue {
@@ -1916,6 +1985,10 @@ func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEnt
 }
 
 func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *CommitEntry) error {
+	if cq.isEntryCanceled(entry) {
+		cq.discardEntry(entry)
+		return nil
+	}
 	if cq.discardSupersededEntry(entry) {
 		return nil
 	}
@@ -1925,6 +1998,10 @@ func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *Co
 			cq.perf.commitFailure.add(1)
 		}
 		return err
+	}
+	if cq.isEntryCanceled(entry) {
+		cq.discardEntry(entry)
+		return nil
 	}
 	if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err != nil {
 		if cq.perf != nil {
@@ -1943,6 +2020,7 @@ func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *
 		cq.mu.Lock()
 		newer := false
 		older := false
+		skipQueuedAliases := pathLocked && cq.inFlight[entry.Path] != nil
 		for _, active := range cq.inFlight {
 			if active == nil || active.canceled || active == entry || (pathLocked && active.Path == entry.Path) || active.Inode != entry.Inode || active.MutationSeq == 0 {
 				continue
@@ -1964,7 +2042,7 @@ func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *
 			}
 		}
 		for _, queued := range cq.queue {
-			if queued == nil || queued.canceled || queued == entry || (pathLocked && queued.Path == entry.Path) || queued.Inode != entry.Inode || queued.MutationSeq == 0 {
+			if queued == nil || queued.canceled || queued == entry || (pathLocked && queued.Path == entry.Path) || skipQueuedAliases || queued.Inode != entry.Inode || queued.MutationSeq == 0 {
 				continue
 			}
 			if queued.MutationSeq > entry.MutationSeq {

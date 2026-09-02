@@ -951,9 +951,11 @@ func TestGVisorCompatPathLockedImmediateCommitDoesNotWaitForSamePathWorker(t *te
 	const ino = uint64(42)
 	older := &CommitEntry{Path: "/same-path", Inode: ino, MutationSeq: 1}
 	newer := &CommitEntry{Path: "/same-path", Inode: ino, MutationSeq: 2}
+	queuedAlias := &CommitEntry{Path: "/alias-path", Inode: ino, MutationSeq: 1}
 	cq := &CommitQueue{
 		inFlight:                map[string]*CommitEntry{older.Path: older},
-		queuedByPath:            make(map[string]map[*CommitEntry]struct{}),
+		queue:                   []*CommitEntry{queuedAlias},
+		queuedByPath:            map[string]map[*CommitEntry]struct{}{queuedAlias.Path: {queuedAlias: {}}},
 		immediate:               make(map[*CommitEntry]struct{}),
 		serializeMutationInodes: true,
 	}
@@ -979,6 +981,41 @@ func TestGVisorCompatPathLockedImmediateCommitDoesNotWaitForSamePathWorker(t *te
 		got.release()
 	case <-time.After(time.Second):
 		t.Fatal("path-locked immediate commit waited for same-path in-flight worker")
+	}
+}
+
+func TestGVisorCompatImmediateCommitOccupiesPathAndCanBeCanceled(t *testing.T) {
+	const filePath = "/immediate.txt"
+	entry := &CommitEntry{Path: filePath, Inode: 42, MutationSeq: 1}
+	cq := &CommitQueue{
+		inFlight:                make(map[string]*CommitEntry),
+		queuedByPath:            make(map[string]map[*CommitEntry]struct{}),
+		immediate:               make(map[*CommitEntry]struct{}),
+		serializeMutationInodes: true,
+	}
+	release, discard, err := cq.beginImmediateMutationCommit(context.Background(), entry, false)
+	if err != nil || discard || release == nil {
+		t.Fatalf("begin immediate = release:%t discard:%t err:%v", release != nil, discard, err)
+	}
+	if !cq.HasPath(filePath) {
+		t.Fatal("immediate commit was invisible to HasPath")
+	}
+	if cq.WaitPathTimeout(filePath, 0) {
+		t.Fatal("immediate commit was invisible to WaitPathTimeout")
+	}
+	if cq.WaitPrefixTimeout("/", 0) {
+		t.Fatal("immediate commit was invisible to WaitPrefixTimeout")
+	}
+	if snap := cq.Snapshot(); snap.InFlight != 1 || snap.Pending != 1 {
+		t.Fatalf("immediate commit snapshot = %+v, want one in-flight pending entry", snap)
+	}
+	cq.CancelPath(filePath)
+	if !entry.canceled {
+		t.Fatal("CancelPath did not mark immediate commit canceled")
+	}
+	release()
+	if cq.HasPath(filePath) {
+		t.Fatal("released immediate commit remained visible to HasPath")
 	}
 }
 
@@ -1672,7 +1709,10 @@ func TestGVisorCompatUnlinkKeepsRemoteMutationAliveAfterInterrupt(t *testing.T) 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodDelete:
-			deleteCalls.Add(1)
+			if deleteCalls.Add(1) != 1 {
+				http.Error(w, "unexpected retry", http.StatusInternalServerError)
+				return
+			}
 			close(deleteStarted)
 			select {
 			case <-r.Context().Done():

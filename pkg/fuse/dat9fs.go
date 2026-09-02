@@ -963,6 +963,7 @@ func (fs *Dat9FS) commitLayerShadowLocked(ctx context.Context, fh *FileHandle, s
 	if fs.shadowStore == nil || !fs.shadowStore.Has(fh.Path) {
 		return fmt.Errorf("missing shadow for %s", fh.Path)
 	}
+	pathLocked = pathLocked || fh.RemoteCommitUnlock != nil
 	size := int64(0)
 	if fh.Dirty != nil {
 		size = fh.Dirty.Size()
@@ -12411,19 +12412,36 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 
 	size := fh.Dirty.Size()
 	if fh.ShadowSpill && fs.shadowStore != nil {
+		handlePath := fh.Path
+		handleIno := fh.Ino
+		mutationSeq := fh.DirtySeq
 		unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
-		defer unlockRemoteCommit()
+		remoteCommitReleased := false
+		defer func() {
+			if !remoteCommitReleased {
+				unlockRemoteCommit()
+			}
+		}()
 		if fs.discardSupersededMutationLocked(fh) {
 			fs.removeHandleOwnedStagingLocked(fh)
 			return gofuse.OK
 		}
-		mutationSeq := fh.DirtySeq
 		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		stagingGens := fs.captureHandleStagingGensLocked(fh)
 		uploadStart := time.Now()
 		fs.debugf("sync handle shadowspill upload start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
 		fh.Unlock()
-		committedRev, err := uploadFromShadowRemoteWithRevisionAndGeneration(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevision, stagingGens.ShadowGen)
+		committedRev, err := uploadFromShadowRemoteWithRevisionAndGeneration(ctx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen)
+		var committedMutationRev int64
+		if err == nil {
+			committedMutationRev = fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
+			fs.recordCommittedMutation(handleIno, mutationSeq, committedMutationRev, size)
+			if committedMutationRev > 0 {
+				fs.refreshCommittedRevisionForOpenHandlesWithSize(handlePath, committedMutationRev, fh, size)
+			}
+		}
+		unlockRemoteCommit()
+		remoteCommitReleased = true
 		fh.Lock()
 		var uploadBytes uint64
 		if size > 0 {
@@ -12439,14 +12457,15 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 			fs.discardUnlinkedHandleStateLocked(fh)
 			return gofuse.OK
 		}
-		committedMutationRev := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
-		fs.recordCommittedMutation(fh.Ino, mutationSeq, committedMutationRev, size)
-		if committedMutationRev > 0 {
-			fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, committedMutationRev, fh, size)
+		if fh.Path != handlePath || fh.DirtySeq != mutationSeq {
+			return gofuse.OK
 		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			safeLogPrintf("sync handle shadowspill pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
+		}
+		if fh.Path != handlePath || fh.DirtySeq != mutationSeq {
+			return gofuse.OK
 		}
 		fh.Dirty.ClearDirty()
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
@@ -14297,6 +14316,9 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		perfUploadStart := fs.perfStart()
 		err = streamer.FinishStreaming(ctx, size,
 			lastPartNum, lastCp, dirtyParts)
+		recordMutationBeforeFenceRelease()
+		unlockRemoteCommit()
+		remoteCommitReleased = true
 		fh.Lock()
 		var perfUploadBytes uint64
 		if size > 0 {
@@ -14314,9 +14336,15 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			fs.discardUnlinkedHandleStateLocked(fh)
 			return gofuse.OK
 		}
+		if fh.Path != mutationPath || fh.DirtySeq != mutationSeq {
+			return gofuse.OK
+		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			safeLogPrintf("finish streaming pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
+		}
+		if fh.Path != mutationPath || fh.DirtySeq != mutationSeq {
+			return gofuse.OK
 		}
 
 		sidecarRevision := sqliteCommittedRevision(0, expectedRevision)
@@ -14372,6 +14400,9 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fh.Unlock()
 		perfUploadStart := fs.perfStart()
 		err = streamer.UploadAll(ctx, size, partSnapshots)
+		recordMutationBeforeFenceRelease()
+		unlockRemoteCommit()
+		remoteCommitReleased = true
 		fh.Lock()
 		var perfUploadBytes uint64
 		if size > 0 {
@@ -14389,9 +14420,15 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			fs.discardUnlinkedHandleStateLocked(fh)
 			return gofuse.OK
 		}
+		if fh.Path != mutationPath || fh.DirtySeq != mutationSeq {
+			return gofuse.OK
+		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			safeLogPrintf("upload all pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
+		}
+		if fh.Path != mutationPath || fh.DirtySeq != mutationSeq {
+			return gofuse.OK
 		}
 
 		sidecarRevision := sqliteCommittedRevision(0, expectedRevision)
