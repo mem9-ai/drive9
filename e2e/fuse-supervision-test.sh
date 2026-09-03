@@ -247,9 +247,10 @@ for i in range(8):
         raise SystemExit(f"concurrent read {got!r}, want {want!r}")
 PY
 
-    # Short-window recovery: after the 2s per-inode bypass TTL expires, ordinary
-    # clean reads must still see committed bytes. This catches designs that only
-    # work while every clean reader is forced through DIRECT_IO.
+    # Short-window liveness canary: kernelCacheBypassFallbackTTL is 2s, so sleep
+    # 3s before checking post-TTL reads still see committed bytes. Content
+    # assertions here cannot prove the reader used KEEP_CACHE rather than
+    # DIRECT_IO forever; unit open-flag tests enforce that policy boundary.
     sleep 3
     got="$(tr -d "\n" <"$f")"
     [ "$got" = "o-trunc-${marker}-3" ]
