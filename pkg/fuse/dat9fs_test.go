@@ -5978,6 +5978,7 @@ func TestLookupUsesDirCacheNegativeEntryWithoutRemoteStat(t *testing.T) {
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	fs.dirCache.Put("/", []CachedFileInfo{{Name: "other.txt", Size: 1}})
+	fs.recordCommittedRevision("/missing.txt", 7)
 
 	var out gofuse.EntryOut
 	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "missing.txt", &out)
@@ -5989,6 +5990,9 @@ func TestLookupUsesDirCacheNegativeEntryWithoutRemoteStat(t *testing.T) {
 	}
 	if out.NodeId != 0 {
 		t.Fatalf("negative lookup NodeId = %d, want 0", out.NodeId)
+	}
+	if got := fs.latestCommittedRevision("/missing.txt"); got != 0 {
+		t.Fatalf("committed revision after cached ENOENT = %d, want 0", got)
 	}
 }
 
@@ -6047,6 +6051,167 @@ func TestLookupStatNotFoundSeedsShortNegativeNamespaceCache(t *testing.T) {
 	}
 	if got := headCalls.Load(); got != 1 {
 		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+}
+
+func TestLookupRemoteNotFoundClearsCommittedRevisionForPendingNewRecreate(t *testing.T) {
+	const filePath = "/recreate.txt"
+	newData := []byte("new incarnation")
+	staleData := []byte("old payload")
+
+	var (
+		mu          sync.Mutex
+		rec         testErrorRecorder
+		putBodies   [][]byte
+		putExpected []string
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			if r.URL.Path != "/v1/fs"+filePath {
+				rec.Recordf("HEAD path = %s, want /v1/fs%s", r.URL.Path, filePath)
+				http.Error(w, "bad path", http.StatusBadRequest)
+				return
+			}
+			// Simulate another client deleting a file this mount previously knew
+			// at rev 7. Lookup has now authoritatively observed a new empty
+			// incarnation slot for this path.
+			http.Error(w, "not found", http.StatusNotFound)
+		case http.MethodPut:
+			if r.URL.Path != "/v1/fs"+filePath {
+				rec.Recordf("PUT path = %s, want /v1/fs%s", r.URL.Path, filePath)
+				http.Error(w, "bad path", http.StatusBadRequest)
+				return
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				rec.Recordf("read PUT body: %v", err)
+				http.Error(w, "read body", http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			putBodies = append(putBodies, append([]byte(nil), body...))
+			putExpected = append(putExpected, r.Header.Get("X-Dat9-Expected-Revision"))
+			mu.Unlock()
+			if r.Header.Get("X-Dat9-Expected-Revision") != "0" {
+				http.Error(w, "revision conflict", http.StatusConflict)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(8)})
+		default:
+			rec.Recordf("unexpected method %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+	defer rec.Check(t)
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.PathLock = fs.lockRemoteCommitPath
+	cq.DurableWatermark = fs.latestCommittedRevision
+	cq.OnSuccess = fs.onCommitQueueSuccess
+	cq.OnCleanup = fs.onCommitQueueCleanup
+	fs.commitQueue = cq
+	defer cq.DrainAll()
+
+	fs.recordCommittedRevision(filePath, 7)
+	var lookupOut gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "recreate.txt", &lookupOut)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
+	}
+	if got := fs.latestCommittedRevision(filePath); got != 0 {
+		t.Fatalf("committed revision after remote ENOENT = %d, want 0", got)
+	}
+	if !fs.hasNegativePathCache(filePath) {
+		t.Fatal("remote ENOENT did not seed negative lookup cache")
+	}
+
+	if err := shadow.WriteFull(filePath, newData, 0); err != nil {
+		t.Fatal(err)
+	}
+	pendingGen, err := pending.PutWithBaseRev(filePath, int64(len(newData)), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino := fs.inodes.Lookup(filePath, false, int64(len(newData)), time.Now())
+	entry := &CommitEntry{
+		Path:            filePath,
+		Inode:           ino,
+		BaseRev:         0,
+		Size:            int64(len(newData)),
+		Kind:            PendingNew,
+		PendingIndexGen: pendingGen,
+	}
+	fs.bindCommitEntryToPath(entry, filePath, 0)
+	if entry.DurableWatermarkRev != 0 {
+		t.Fatalf("recreate entry durable watermark = %d, want 0 after remote ENOENT", entry.DurableWatermarkRev)
+	}
+	if err := cq.CommitNow(context.Background(), entry); err != nil {
+		t.Fatalf("PendingNew recreate commit: %v", err)
+	}
+
+	mu.Lock()
+	gotExpected := append([]string(nil), putExpected...)
+	gotBodies := append([][]byte(nil), putBodies...)
+	mu.Unlock()
+	if len(gotExpected) != 1 || gotExpected[0] != "0" {
+		t.Fatalf("PUT expected revisions = %v, want [0]", gotExpected)
+	}
+	if len(gotBodies) != 1 || !bytes.Equal(gotBodies[0], newData) {
+		t.Fatalf("PUT bodies = %q, want %q", gotBodies, newData)
+	}
+	if got := fs.latestCommittedRevision(filePath); got != 8 {
+		t.Fatalf("committed revision after recreate = %d, want 8", got)
+	}
+
+	// The new-incarnation fix must not relax the old-payload fence: once the
+	// recreate is durable at rev 8, rev-0 payload cannot be paired with a newer
+	// BaseRev and overwrite it as another revision.
+	if err := shadow.WriteFull(filePath, staleData, 0); err != nil {
+		t.Fatal(err)
+	}
+	stalePendingGen, err := pending.PutWithBaseRev(filePath, int64(len(staleData)), PendingOverwrite, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleEntry := &CommitEntry{
+		Path:            filePath,
+		Inode:           ino,
+		BaseRev:         8,
+		Size:            int64(len(staleData)),
+		Kind:            PendingOverwrite,
+		PendingIndexGen: stalePendingGen,
+	}
+	fs.bindCommitEntryToPath(staleEntry, filePath, 0)
+	if staleEntry.DurableWatermarkRev != 8 {
+		t.Fatalf("stale entry durable watermark = %d, want 8", staleEntry.DurableWatermarkRev)
+	}
+	if err := cq.CommitNow(context.Background(), staleEntry); !errors.Is(err, errCommitPayloadStale) {
+		t.Fatalf("stale payload commit error = %v, want errCommitPayloadStale", err)
+	}
+	mu.Lock()
+	gotPutCount := len(putExpected)
+	mu.Unlock()
+	if gotPutCount != 1 {
+		t.Fatalf("PUT calls after stale payload = %d, want 1", gotPutCount)
 	}
 }
 

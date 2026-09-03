@@ -5814,6 +5814,20 @@ func (fs *Dat9FS) cacheNegativePath(p string) {
 	fs.dirCache.MarkNegative(parentPath, name)
 }
 
+func (fs *Dat9FS) cacheRemoteNotFoundPath(p string) {
+	if fs == nil || p == "/" || isLockFilePath(p) {
+		return
+	}
+	// A remote-confirmed ENOENT starts a fresh path incarnation. Any
+	// committed-revision watermark from a prior incarnation must not fence a
+	// later PendingNew recreate before the request reaches the server. Older
+	// dirty payloads are still fenced by their own generation/base-revision
+	// checks; this only clears the path epoch after the mount has observed that
+	// the remote object no longer exists.
+	fs.forgetCommittedRevision(p)
+	fs.cacheNegativePath(p)
+}
+
 func (fs *Dat9FS) hasNegativePathCache(p string) bool {
 	if fs == nil || fs.dirCache == nil || p == "/" {
 		return false
@@ -6368,6 +6382,11 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 				fs.perf.namespaceSessionMiss.add(1)
 			}
 		}
+		// Returning ENOENT from namespace cache means this mount currently
+		// observes the path as absent. Do not let a committed-revision watermark
+		// from a previous incarnation make a later same-name PendingNew look
+		// stale before it reaches the server.
+		fs.forgetCommittedRevision(childP)
 		out.NodeId = 0
 		out.SetEntryTimeout(fs.negativeEntryTTL(childP))
 		return true, gofuse.ENOENT
@@ -6666,7 +6685,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 				if !fs.lockMountViewRead(listGeneration) {
 					return gofuse.Status(syscall.EAGAIN)
 				}
-				fs.cacheNegativePath(childP)
+				fs.cacheRemoteNotFoundPath(childP)
 				out.NodeId = 0
 				out.SetEntryTimeout(fs.negativeEntryTTL(childP))
 				fs.mountViewMu.RUnlock()
@@ -6702,7 +6721,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if !fs.lockMountViewRead(statGeneration) {
 			return gofuse.Status(syscall.EAGAIN)
 		}
-		fs.cacheNegativePath(childP)
+		fs.cacheRemoteNotFoundPath(childP)
 		out.NodeId = 0
 		out.SetEntryTimeout(fs.negativeEntryTTL(childP))
 		fs.mountViewMu.RUnlock()
