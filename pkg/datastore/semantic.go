@@ -65,6 +65,65 @@ func (s *Store) updateSemanticNoEmbedTx(db execer, inodeID string, contentText, 
 	return err
 }
 
+// LockConfirmedFileRevisionTx locks the confirmed inode row for fileID inside
+// an existing transaction and returns its current revision.
+func (s *Store) LockConfirmedFileRevisionTx(db execer, fileID string) (int64, error) {
+	var rev int64
+	if err := db.QueryRow(`SELECT revision FROM inodes WHERE `+s.scope.And(`inode_id = ? AND status = 'CONFIRMED'`)+` FOR UPDATE`, s.scope.Args(fileID)...).Scan(&rev); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, fmt.Errorf("read current revision: %w", err)
+	}
+	return rev, nil
+}
+
+// UpdateFileDescriptionTx updates only the description of a confirmed file,
+// clearing the description embedding so app-managed semantic processing
+// recomputes it. Callers that serialize against concurrent content writes
+// must hold the inode lock (LockConfirmedFileRevisionTx) first.
+func (s *Store) UpdateFileDescriptionTx(db execer, fileID, description string) error {
+	return s.updateFileDescriptionTx(db, fileID, description, false)
+}
+
+// UpdateFileDescriptionAutoEmbeddingTx updates only the description of a
+// confirmed file without touching vector columns. Auto-embedding mode relies
+// on the database to derive vectors from description. Callers that serialize
+// against concurrent content writes must hold the inode lock
+// (LockConfirmedFileRevisionTx) first.
+func (s *Store) UpdateFileDescriptionAutoEmbeddingTx(db execer, fileID, description string) error {
+	return s.updateFileDescriptionTx(db, fileID, description, true)
+}
+
+func (s *Store) updateFileDescriptionTx(db execer, fileID, description string, autoEmbedding bool) error {
+	if s.useLegacyFiles {
+		query := `UPDATE files SET description = ?`
+		if !autoEmbedding {
+			query += `, description_embedding = NULL, description_embedding_revision = NULL`
+		}
+		query += ` WHERE file_id = ?`
+		if _, err := db.Exec(query, nullStr(description), fileID); err != nil {
+			return err
+		}
+	}
+	if autoEmbedding {
+		if _, err := db.Exec(`UPDATE semantic SET description = ?
+			WHERE `+s.scope.And(`inode_id = ?`),
+			append([]any{nullStr(description)}, s.scope.Args(fileID)...)...); err != nil {
+			return err
+		}
+		return nil
+	}
+	if _, err := db.Exec(`UPDATE semantic SET
+		description = ?,
+		description_embedding = NULL, description_embedding_revision = NULL
+		WHERE `+s.scope.And(`inode_id = ?`),
+		append([]any{nullStr(description)}, s.scope.Args(fileID)...)...); err != nil {
+		return err
+	}
+	return nil
+}
+
 func scanSemantic(row *sql.Row) (*Semantic, error) {
 	var sem Semantic
 	var contentText, description sql.NullString

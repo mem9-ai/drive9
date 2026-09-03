@@ -1740,6 +1740,28 @@ func (s *Store) StatTx(ctx context.Context, db execer, path string) (out *NodeWi
 	return scanNodeWithFileWithBlob(row)
 }
 
+// LockDentryFileIDTx locks the file_nodes row for path inside an existing
+// transaction and returns the dentry's current file identity
+// (COALESCE(inode_id, file_id)). It returns ErrNotFound when the dentry does
+// not exist. Callers use it to fence path→inode resolution races: a dentry
+// deleted and recreated after resolution points at a different identity.
+func (s *Store) LockDentryFileIDTx(db execer, path string) (string, error) {
+	var id sql.NullString
+	err := db.QueryRow(`SELECT COALESCE(inode_id, file_id) FROM file_nodes WHERE `+
+		s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+		s.scope.Args(fileNodePathHash(path), path)...).Scan(&id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	if !id.Valid || id.String == "" {
+		return "", ErrNotFound
+	}
+	return id.String, nil
+}
+
 func (s *Store) StatPathFallback(ctx context.Context, primaryPath, fallbackPath string) (out *NodeWithFile, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "stat_path_fallback", start, &err)

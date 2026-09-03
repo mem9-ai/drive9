@@ -177,7 +177,22 @@ func (s *Store) enqueueSemanticTask(db execer, task *semantic.Task) (bool, error
 	return false, err
 }
 
+// ForceRequeueSemanticTaskTx is EnsureSemanticTaskQueuedTx except that a row
+// being processed under an active lease is also reset to queued: clearing the
+// receipt invalidates the in-flight owner's lease fence, so its
+// writeback/ack/retry become no-ops and the queued row re-processes with
+// fresh state. Used by metadata-only updates (setmeta) that change the
+// description without bumping the revision, where the revision check alone
+// cannot invalidate in-flight embed work.
+func (s *Store) ForceRequeueSemanticTaskTx(tx *sql.Tx, task *semantic.Task) (bool, error) {
+	return s.ensureSemanticTaskQueuedTxForce(tx, task, true)
+}
+
 func (s *Store) ensureSemanticTaskQueuedTx(tx *sql.Tx, task *semantic.Task) (bool, error) {
+	return s.ensureSemanticTaskQueuedTxForce(tx, task, false)
+}
+
+func (s *Store) ensureSemanticTaskQueuedTxForce(tx *sql.Tx, task *semantic.Task, force bool) (bool, error) {
 	if task == nil {
 		return false, fmt.Errorf("semantic task is required")
 	}
@@ -200,7 +215,7 @@ func (s *Store) ensureSemanticTaskQueuedTx(tx *sql.Tx, task *semantic.Task) (boo
 	if err != nil {
 		return false, err
 	}
-	if existing.Status == semantic.TaskProcessing && existing.LeaseUntil != nil && existing.LeaseUntil.After(now) {
+	if !force && existing.Status == semantic.TaskProcessing && existing.LeaseUntil != nil && existing.LeaseUntil.After(now) {
 		return false, nil
 	}
 

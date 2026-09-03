@@ -650,6 +650,7 @@ func TestC2aDispatcherWriteSideAllowed(t *testing.T) {
 			{http.MethodPost, "rename=1"},
 			{http.MethodPost, "mkdir=1"},
 			{http.MethodPost, "mkdir=1&mode=755"},
+			{http.MethodPost, "setmeta=1"},
 			{http.MethodPost, "create=1"},
 			{http.MethodPost, "symlink=1"},
 		}
