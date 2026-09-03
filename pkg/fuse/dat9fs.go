@@ -963,7 +963,11 @@ func (fs *Dat9FS) commitLayerShadowLocked(ctx context.Context, fh *FileHandle, s
 	if fs.shadowStore == nil || !fs.shadowStore.Has(fh.Path) {
 		return fmt.Errorf("missing shadow for %s", fh.Path)
 	}
-	pathLocked = pathLocked || fh.RemoteCommitUnlock != nil
+	gvisorCompat := fs.gvisorCompatibilityEnabled()
+	pathLocked = pathLocked || gvisorCompat && fh.RemoteCommitUnlock != nil
+	handlePath := fh.Path
+	handleIno := fh.Ino
+	mutationSeq := fh.DirtySeq
 	size := int64(0)
 	if fh.Dirty != nil {
 		size = fh.Dirty.Size()
@@ -994,13 +998,20 @@ func (fs *Dat9FS) commitLayerShadowLocked(ctx context.Context, fh *FileHandle, s
 	if err != nil {
 		return err
 	}
+	if gvisorCompat && (fh.Unlinked || fh.Path != handlePath || fh.DirtySeq != mutationSeq) {
+		return nil
+	}
 	if hasMode {
 		fs.clearPendingModeForInodeGeneration(fh.Ino, fh, mode&0o777, fh.PendingModeGen)
 		clearPendingModeLocked(fh)
 	}
 	if fh.Dirty != nil {
 		fh.Dirty.ClearDirty()
-		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		if gvisorCompat {
+			fs.clearDirtySize(handleIno, mutationSeq)
+		} else {
+			fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		}
 		fh.DirtySeq = 0
 	}
 	fh.WriteBackSeq = 0
@@ -14264,7 +14275,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	mutationExpectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	mutationRecorded := false
 	recordMutationBeforeFenceRelease := func() {
-		if mutationRecorded || !fs.gvisorCompatibilityEnabled() || err != nil || mutationSeq == 0 || fh.Unlinked || fh.Path != mutationPath {
+		if mutationRecorded || !fs.gvisorCompatibilityEnabled() || err != nil || mutationSeq == 0 {
 			return
 		}
 		revision := fs.resolveCommittedMutationRevision(mutationPath, fs.latestCommittedRevision(mutationPath), mutationExpectedRevision)
