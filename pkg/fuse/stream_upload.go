@@ -65,9 +65,11 @@ func (su *StreamUploader) Started() bool {
 }
 
 // RefreshExpectedRevision updates the conditional revision used for future
-// upload initiation while the remote upload has not started yet. SubmitPart
-// only buffers bytes locally for a later FinishStreaming call, so pending
-// buffered parts can still safely adopt a newer same-mount committed revision.
+// upload initiation while the remote upload has not started yet. Callers must
+// only use it after proving the buffered payload is compatible with the newer
+// revision; dirty SQLite sidecar payloads keep their original base so server
+// CAS can reject stale WAL/journal bytes instead of accepting old content as a
+// newer revision.
 func (su *StreamUploader) RefreshExpectedRevision(revision int64) bool {
 	if revision < 0 {
 		return false

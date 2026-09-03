@@ -1421,6 +1421,46 @@ func TestShadowStoreRemoveIfGenerationRaceStaleVsNewerWrite(t *testing.T) {
 	}
 }
 
+func TestShadowStoreEnsureActiveGenerationKeepsExistingBaseRevision(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	const path = "/base-rev.txt"
+	if err := ss.WriteFull(path, []byte("payload"), 7); err != nil {
+		t.Fatal(err)
+	}
+	gen := ss.ActiveGeneration(path)
+	if gen == 0 {
+		t.Fatal("expected nonzero active generation")
+	}
+	if got := ss.BaseRev(path); got != 7 {
+		t.Fatalf("initial base revision = %d, want 7", got)
+	}
+
+	if gotGen := ss.EnsureActiveGeneration(path, 9); gotGen != gen {
+		t.Fatalf("EnsureActiveGeneration returned gen %d, want existing gen %d", gotGen, gen)
+	}
+	if got := ss.BaseRev(path); got != 7 {
+		t.Fatalf("base revision after EnsureActiveGeneration = %d, want existing 7", got)
+	}
+
+	const recoveredPath = "/recovered-base-rev.txt"
+	if err := os.WriteFile(ss.shadowPath(recoveredPath), []byte("recovered"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recoveredGen := ss.EnsureActiveGeneration(recoveredPath, 11)
+	if recoveredGen == 0 {
+		t.Fatal("expected recovered shadow to get an active generation")
+	}
+	if got := ss.BaseRev(recoveredPath); got != 11 {
+		t.Fatalf("recovered base revision = %d, want 11", got)
+	}
+}
+
 // TestShadowStoreRemoveIfGenerationWriteFullRaceConsistency races replacement
 // WriteFulls against a stale-generation removal and asserts that whenever an
 // active shadow generation exists, its disk file is present and readable.
