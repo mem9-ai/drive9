@@ -29,6 +29,10 @@ import (
 // candidate after discovery but before the second TryLock in candidateLoop.
 var testHookAfterSamePathDirtyHandleScan func(path string)
 
+// testHookNotifyInodeSyncResult lets cache-boundary tests cover the production
+// notify-success branch without mounting a real FUSE server.
+var testHookNotifyInodeSyncResult func(ino uint64) bool
+
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
 // operations to the dat9 HTTP API via the Go SDK client.
 type Dat9FS struct {
@@ -323,6 +327,7 @@ type kernelCacheBypassMarker struct {
 	size       int64
 	reason     string
 	expiresAt  time.Time
+	timer      *time.Timer
 }
 
 type layerSymlinkState struct {
@@ -1702,7 +1707,17 @@ func (fs *Dat9FS) openFlagsForHandle(fh *FileHandle) uint32 {
 	return flags
 }
 
+// armKernelCacheBypass records a short-lived per-inode cache-bypass marker for
+// close-to-open readers that must not trust stale kernel pages immediately
+// after a truncate-first sync commit.
 func (fs *Dat9FS) armKernelCacheBypass(ino uint64, localPath string, revision, size int64, reason string) uint64 {
+	return fs.armKernelCacheBypassUntil(ino, localPath, revision, size, reason, time.Now().Add(kernelCacheBypassFallbackTTL))
+}
+
+// armKernelCacheBypassUntil is the testable form of armKernelCacheBypass with
+// an explicit expiry. Re-arming the same inode reuses its cleanup timer so a
+// hot write-sync path has one bounded timer instead of one timer per commit.
+func (fs *Dat9FS) armKernelCacheBypassUntil(ino uint64, localPath string, revision, size int64, reason string, expiresAt time.Time) uint64 {
 	if fs == nil || ino == 0 {
 		return 0
 	}
@@ -1713,6 +1728,10 @@ func (fs *Dat9FS) armKernelCacheBypass(ino uint64, localPath string, revision, s
 	}
 	fs.kernelCacheBypassSeq++
 	gen := fs.kernelCacheBypassSeq
+	var timer *time.Timer
+	if previous, ok := fs.kernelCacheBypass[ino]; ok {
+		timer = previous.timer
+	}
 	fs.kernelCacheBypass[ino] = kernelCacheBypassMarker{
 		ino:        ino,
 		path:       localPath,
@@ -1720,12 +1739,64 @@ func (fs *Dat9FS) armKernelCacheBypass(ino uint64, localPath string, revision, s
 		revision:   revision,
 		size:       size,
 		reason:     reason,
-		expiresAt:  time.Now().Add(kernelCacheBypassFallbackTTL),
+		expiresAt:  expiresAt,
+		timer:      timer,
 	}
 	fs.debugf("kernel cache bypass armed path=%s ino=%d gen=%d rev=%d size=%d reason=%s", localPath, ino, gen, revision, size, reason)
+	fs.scheduleKernelCacheBypassCleanupLocked(ino, expiresAt)
 	return gen
 }
 
+// scheduleKernelCacheBypassCleanupLocked schedules or resets the per-inode
+// cleanup timer for the marker currently stored in kernelCacheBypass. Caller
+// must hold kernelCacheBypassMu.
+func (fs *Dat9FS) scheduleKernelCacheBypassCleanupLocked(ino uint64, expiresAt time.Time) {
+	if fs == nil || ino == 0 || expiresAt.IsZero() {
+		return
+	}
+	marker, ok := fs.kernelCacheBypass[ino]
+	if !ok {
+		return
+	}
+	delay := time.Until(expiresAt)
+	if delay < 0 {
+		delay = 0
+	}
+	if marker.timer == nil {
+		marker.timer = time.AfterFunc(delay, func() {
+			fs.expireKernelCacheBypass(ino)
+		})
+		fs.kernelCacheBypass[ino] = marker
+		return
+	}
+	marker.timer.Reset(delay)
+	fs.kernelCacheBypass[ino] = marker
+}
+
+// expireKernelCacheBypass removes an expired marker from the timer callback.
+// If a race re-armed the inode to a later expiry before this callback acquired
+// the lock, the same coalesced timer is reset to the newer deadline.
+func (fs *Dat9FS) expireKernelCacheBypass(ino uint64) {
+	if fs == nil || ino == 0 {
+		return
+	}
+	now := time.Now()
+	fs.kernelCacheBypassMu.Lock()
+	defer fs.kernelCacheBypassMu.Unlock()
+	marker, ok := fs.kernelCacheBypass[ino]
+	if !ok {
+		return
+	}
+	if !marker.expiresAt.IsZero() && now.Before(marker.expiresAt) {
+		fs.scheduleKernelCacheBypassCleanupLocked(ino, marker.expiresAt)
+		return
+	}
+	delete(fs.kernelCacheBypass, ino)
+	fs.debugf("kernel cache bypass expired path=%s ino=%d gen=%d rev=%d size=%d reason=%s", marker.path, marker.ino, marker.generation, marker.revision, marker.size, marker.reason)
+}
+
+// clearKernelCacheBypassGeneration removes only the named marker generation.
+// This protects a newer same-inode marker from an older timer or cleanup path.
 func (fs *Dat9FS) clearKernelCacheBypassGeneration(ino, generation uint64) {
 	if fs == nil || ino == 0 || generation == 0 {
 		return
@@ -1736,10 +1807,32 @@ func (fs *Dat9FS) clearKernelCacheBypassGeneration(ino, generation uint64) {
 	if !ok || marker.generation != generation {
 		return
 	}
+	if marker.timer != nil {
+		marker.timer.Stop()
+	}
 	delete(fs.kernelCacheBypass, ino)
 	fs.debugf("kernel cache bypass cleared path=%s ino=%d gen=%d rev=%d size=%d reason=%s", marker.path, marker.ino, marker.generation, marker.revision, marker.size, marker.reason)
 }
 
+// clearKernelCacheBypassMarkers stops all marker timers and drops their state
+// during graceful shutdown.
+func (fs *Dat9FS) clearKernelCacheBypassMarkers() {
+	if fs == nil {
+		return
+	}
+	fs.kernelCacheBypassMu.Lock()
+	defer fs.kernelCacheBypassMu.Unlock()
+	for ino, marker := range fs.kernelCacheBypass {
+		if marker.timer != nil {
+			marker.timer.Stop()
+		}
+		delete(fs.kernelCacheBypass, ino)
+	}
+}
+
+// kernelCacheBypassActive reports whether a clean read-only open on fh should
+// temporarily bypass the kernel page cache. Expired markers are reclaimed
+// opportunistically here in addition to the timer-driven cleanup path.
 func (fs *Dat9FS) kernelCacheBypassActive(fh *FileHandle) bool {
 	if fs == nil || fh == nil || fh.Ino == 0 {
 		return false
@@ -1752,6 +1845,9 @@ func (fs *Dat9FS) kernelCacheBypassActive(fh *FileHandle) bool {
 		return false
 	}
 	if !marker.expiresAt.IsZero() && now.After(marker.expiresAt) {
+		if marker.timer != nil {
+			marker.timer.Stop()
+		}
 		delete(fs.kernelCacheBypass, fh.Ino)
 		fs.debugf("kernel cache bypass expired path=%s ino=%d gen=%d rev=%d size=%d reason=%s", marker.path, marker.ino, marker.generation, marker.revision, marker.size, marker.reason)
 		return false
@@ -1763,10 +1859,13 @@ func (fs *Dat9FS) finishSyncCommitKernelCacheBoundary(ino uint64, localPath stri
 	if fs == nil || ino == 0 {
 		return
 	}
-	gen := fs.armKernelCacheBypass(ino, localPath, revision, size, "sync-commit")
-	if fs.notifyInodeSync(ino) {
-		fs.clearKernelCacheBypassGeneration(ino, gen)
-	}
+	// InodeNotify is best-effort: Linux may still serve stale page/attr cache
+	// immediately after a truncate-first close-sync/write-sync commit even when
+	// the notification call reports success. Keep the per-inode/generation
+	// short-window bypass armed until its TTL expires; this remains narrower
+	// than making every clean reader on sync-durability mounts DIRECT_IO.
+	fs.armKernelCacheBypass(ino, localPath, revision, size, "sync-commit")
+	_ = fs.notifyInodeSync(ino)
 }
 
 func (fs *Dat9FS) localEntry(localPath string, info os.FileInfo, incrementLookup bool) (*InodeEntry, gofuse.Status) {
@@ -6543,6 +6642,9 @@ func (fs *Dat9FS) notifyInodeSync(ino uint64) bool {
 	fs.notifyCount.Add(1)
 	if fs.perf != nil {
 		fs.perf.notifyInode.add(1)
+	}
+	if testHookNotifyInodeSyncResult != nil {
+		return testHookNotifyInodeSyncResult(ino)
 	}
 	return fs.invalidateInodeKernelCaches(ino)
 }
@@ -14435,6 +14537,8 @@ func (fs *Dat9FS) FlushAll() {
 
 	// Wait for any inflight async kernel notifications to complete.
 	fs.notifyWg.Wait()
+
+	fs.clearKernelCacheBypassMarkers()
 
 	// Stop git-workspace background probe/retry loops before exit.
 	fs.stopGitWorkspaceBackground()
