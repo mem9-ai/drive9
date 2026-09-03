@@ -55,21 +55,25 @@ type Dat9FS struct {
 	// stream is current, revision-bound file stat hits are enabled only when
 	// MountOptions.TrustLocalEvents explicitly allows process-local SSE
 	// freshness for this deployment.
-	statCacheUnverified  atomic.Bool
-	readSlots            chan struct{}
-	dirtyMu              sync.Mutex
-	dirtyInodes          map[uint64]dirtyInodeState
-	dirtySeq             uint64
-	kernelCacheBypassMu  sync.Mutex
-	kernelCacheBypass    map[uint64]kernelCacheBypassMarker
-	kernelCacheBypassSeq uint64
-	modeSeq              atomic.Uint64
-	specialMu            sync.RWMutex
-	specialByPath        map[string]uint64
-	uid                  uint32
-	gid                  uint32
-	opts                 *MountOptions
-	debouncer            *flushDebouncer
+	statCacheUnverified atomic.Bool
+	readSlots           chan struct{}
+	dirtyMu             sync.Mutex
+	dirtyInodes         map[uint64]dirtyInodeState
+	dirtySeq            uint64
+	kernelCacheBypassMu sync.Mutex
+	kernelCacheBypass   map[uint64]kernelCacheBypassMarker
+	// A single coalesced timer sweeps expired kernelCacheBypass markers. Readers
+	// also reclaim expired markers lazily; this timer only bounds map growth when
+	// a sync-written inode is never reopened.
+	kernelCacheBypassSweepTimer *time.Timer
+	kernelCacheBypassSweepAt    time.Time
+	modeSeq                     atomic.Uint64
+	specialMu                   sync.RWMutex
+	specialByPath               map[string]uint64
+	uid                         uint32
+	gid                         uint32
+	opts                        *MountOptions
+	debouncer                   *flushDebouncer
 
 	// Write-back cache: Flush writes small files to local disk, Release
 	// triggers async upload. Nil when CacheDir is not configured.
@@ -315,16 +319,6 @@ type dirtyInodeState struct {
 	seq  uint64
 }
 
-type kernelCacheBypassMarker struct {
-	ino        uint64
-	path       string
-	generation uint64
-	revision   int64
-	size       int64
-	reason     string
-	expiresAt  time.Time
-}
-
 type layerSymlinkState struct {
 	Target string
 	Mode   uint32
@@ -417,7 +411,6 @@ const (
 	sqliteSidecarDirtyWaitInterval = time.Millisecond
 	samePathDirtyWaitTimeout       = 250 * time.Millisecond
 	samePathDirtyWaitInterval      = time.Millisecond
-	kernelCacheBypassFallbackTTL   = 2 * time.Second
 
 	// namespaceMutationRetryTimeout bounds detached retries for idempotent-ish
 	// namespace mutations after a FUSE interrupt or transient backend error.
@@ -1700,73 +1693,6 @@ func (fs *Dat9FS) openFlagsForHandle(fh *FileHandle) uint32 {
 		return gofuse.FOPEN_DIRECT_IO
 	}
 	return flags
-}
-
-func (fs *Dat9FS) armKernelCacheBypass(ino uint64, localPath string, revision, size int64, reason string) uint64 {
-	if fs == nil || ino == 0 {
-		return 0
-	}
-	fs.kernelCacheBypassMu.Lock()
-	defer fs.kernelCacheBypassMu.Unlock()
-	if fs.kernelCacheBypass == nil {
-		fs.kernelCacheBypass = make(map[uint64]kernelCacheBypassMarker)
-	}
-	fs.kernelCacheBypassSeq++
-	gen := fs.kernelCacheBypassSeq
-	fs.kernelCacheBypass[ino] = kernelCacheBypassMarker{
-		ino:        ino,
-		path:       localPath,
-		generation: gen,
-		revision:   revision,
-		size:       size,
-		reason:     reason,
-		expiresAt:  time.Now().Add(kernelCacheBypassFallbackTTL),
-	}
-	fs.debugf("kernel cache bypass armed path=%s ino=%d gen=%d rev=%d size=%d reason=%s", localPath, ino, gen, revision, size, reason)
-	return gen
-}
-
-func (fs *Dat9FS) clearKernelCacheBypassGeneration(ino, generation uint64) {
-	if fs == nil || ino == 0 || generation == 0 {
-		return
-	}
-	fs.kernelCacheBypassMu.Lock()
-	defer fs.kernelCacheBypassMu.Unlock()
-	marker, ok := fs.kernelCacheBypass[ino]
-	if !ok || marker.generation != generation {
-		return
-	}
-	delete(fs.kernelCacheBypass, ino)
-	fs.debugf("kernel cache bypass cleared path=%s ino=%d gen=%d rev=%d size=%d reason=%s", marker.path, marker.ino, marker.generation, marker.revision, marker.size, marker.reason)
-}
-
-func (fs *Dat9FS) kernelCacheBypassActive(fh *FileHandle) bool {
-	if fs == nil || fh == nil || fh.Ino == 0 {
-		return false
-	}
-	now := time.Now()
-	fs.kernelCacheBypassMu.Lock()
-	defer fs.kernelCacheBypassMu.Unlock()
-	marker, ok := fs.kernelCacheBypass[fh.Ino]
-	if !ok {
-		return false
-	}
-	if !marker.expiresAt.IsZero() && now.After(marker.expiresAt) {
-		delete(fs.kernelCacheBypass, fh.Ino)
-		fs.debugf("kernel cache bypass expired path=%s ino=%d gen=%d rev=%d size=%d reason=%s", marker.path, marker.ino, marker.generation, marker.revision, marker.size, marker.reason)
-		return false
-	}
-	return marker.ino == fh.Ino
-}
-
-func (fs *Dat9FS) finishSyncCommitKernelCacheBoundary(ino uint64, localPath string, revision, size int64) {
-	if fs == nil || ino == 0 {
-		return
-	}
-	gen := fs.armKernelCacheBypass(ino, localPath, revision, size, "sync-commit")
-	if fs.notifyInodeSync(ino) {
-		fs.clearKernelCacheBypassGeneration(ino, gen)
-	}
 }
 
 func (fs *Dat9FS) localEntry(localPath string, info os.FileInfo, incrementLookup bool) (*InodeEntry, gofuse.Status) {
@@ -6506,13 +6432,12 @@ func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
 // invalidation form, while off=0/len=0 invalidates cached data. A data-only
 // invalidation can leave a just-truncated 0-byte i_size cached across a later
 // close-sync remote commit, making immediate close-to-open reads observe EOF.
-func (fs *Dat9FS) invalidateInodeKernelCaches(ino uint64) bool {
+func (fs *Dat9FS) invalidateInodeKernelCaches(ino uint64) {
 	if fs.server == nil {
-		return false
+		return
 	}
-	attrErr := fs.server.InodeNotify(ino, -1, 0)
-	dataErr := fs.server.InodeNotify(ino, 0, 0)
-	return attrErr == gofuse.OK && dataErr == gofuse.OK
+	_ = fs.server.InodeNotify(ino, -1, 0)
+	_ = fs.server.InodeNotify(ino, 0, 0)
 }
 
 // notifyInode tells the kernel to invalidate cached attributes and data
@@ -6529,7 +6454,7 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 	fs.notifyWg.Add(1)
 	go func() {
 		defer fs.notifyWg.Done()
-		_ = fs.invalidateInodeKernelCaches(ino)
+		fs.invalidateInodeKernelCaches(ino)
 	}()
 }
 
@@ -6539,12 +6464,16 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 // remote commits are close-to-open barriers: the next opener may otherwise
 // observe stale size/page-cache state even though the remote commit has
 // completed.
-func (fs *Dat9FS) notifyInodeSync(ino uint64) bool {
+func (fs *Dat9FS) notifyInodeSync(ino uint64) {
 	fs.notifyCount.Add(1)
 	if fs.perf != nil {
 		fs.perf.notifyInode.add(1)
 	}
-	return fs.invalidateInodeKernelCaches(ino)
+	if testHookNotifyInodeSync != nil {
+		testHookNotifyInodeSync(ino)
+		return
+	}
+	fs.invalidateInodeKernelCaches(ino)
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
@@ -10809,7 +10738,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			// open/00.t test 43). Use a synchronous InodeNotify (not the
 			// async notifyInode goroutine) to guarantee the cache is
 			// invalidated before Open returns to the kernel.
-			_ = fs.invalidateInodeKernelCaches(input.NodeId)
+			fs.invalidateInodeKernelCaches(input.NodeId)
 			fs.armKernelCacheBypass(input.NodeId, p, fh.BaseRev, 0, "open-truncate")
 			if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 				if err := fs.shadowStore.WriteFull(p, nil, fh.BaseRev); err != nil {
@@ -14435,6 +14364,8 @@ func (fs *Dat9FS) FlushAll() {
 
 	// Wait for any inflight async kernel notifications to complete.
 	fs.notifyWg.Wait()
+
+	fs.clearKernelCacheBypassMarkers()
 
 	// Stop git-workspace background probe/retry loops before exit.
 	fs.stopGitWorkspaceBackground()

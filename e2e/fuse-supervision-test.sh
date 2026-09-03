@@ -177,6 +177,8 @@ probe_cache_invalidation_io() {
     marker="$1"
     dir="$2"
     mkdir -p "$dir"
+    unrelated="$dir/unrelated.txt"
+    printf "unrelated-%s\n" "$marker" >"$unrelated"
 
     # O_TRUNC / shell-redirection path: the immediate close-to-open read must
     # not observe the transient 0-byte truncate image or older kernel pages.
@@ -188,6 +190,8 @@ probe_cache_invalidation_io() {
       got="$(tr -d "\n" <"$f")"
       [ "$got" = "$want" ]
     done
+    got="$(tr -d "\n" <"$unrelated")"
+    [ "$got" = "unrelated-${marker}" ]
 
     # SetAttr truncate path: exercise truncate(2) separately from open(O_TRUNC),
     # then write final bytes and immediately reopen/read.
@@ -242,6 +246,18 @@ for i in range(8):
     if got != want:
         raise SystemExit(f"concurrent read {got!r}, want {want!r}")
 PY
+
+    # Short-window liveness canary: kernelCacheBypassFallbackTTL is 2s, so sleep
+    # 3s before checking post-TTL reads still see committed bytes. Content
+    # assertions here cannot prove the reader used KEEP_CACHE rather than
+    # DIRECT_IO forever; unit open-flag tests enforce that policy boundary.
+    sleep 3
+    got="$(tr -d "\n" <"$f")"
+    [ "$got" = "o-trunc-${marker}-3" ]
+    got="$(tr -d "\n" <"$dst")"
+    [ "$got" = "recreated-${marker}" ]
+    got="$(tr -d "\n" <"$unrelated")"
+    [ "$got" = "unrelated-${marker}" ]
   ' _ "$marker" "$dir"
 }
 
