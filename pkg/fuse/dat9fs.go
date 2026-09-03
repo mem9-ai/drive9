@@ -55,18 +55,21 @@ type Dat9FS struct {
 	// stream is current, revision-bound file stat hits are enabled only when
 	// MountOptions.TrustLocalEvents explicitly allows process-local SSE
 	// freshness for this deployment.
-	statCacheUnverified atomic.Bool
-	readSlots           chan struct{}
-	dirtyMu             sync.Mutex
-	dirtyInodes         map[uint64]dirtyInodeState
-	dirtySeq            uint64
-	modeSeq             atomic.Uint64
-	specialMu           sync.RWMutex
-	specialByPath       map[string]uint64
-	uid                 uint32
-	gid                 uint32
-	opts                *MountOptions
-	debouncer           *flushDebouncer
+	statCacheUnverified  atomic.Bool
+	readSlots            chan struct{}
+	dirtyMu              sync.Mutex
+	dirtyInodes          map[uint64]dirtyInodeState
+	dirtySeq             uint64
+	kernelCacheBypassMu  sync.Mutex
+	kernelCacheBypass    map[uint64]kernelCacheBypassMarker
+	kernelCacheBypassSeq uint64
+	modeSeq              atomic.Uint64
+	specialMu            sync.RWMutex
+	specialByPath        map[string]uint64
+	uid                  uint32
+	gid                  uint32
+	opts                 *MountOptions
+	debouncer            *flushDebouncer
 
 	// Write-back cache: Flush writes small files to local disk, Release
 	// triggers async upload. Nil when CacheDir is not configured.
@@ -312,6 +315,16 @@ type dirtyInodeState struct {
 	seq  uint64
 }
 
+type kernelCacheBypassMarker struct {
+	ino        uint64
+	path       string
+	generation uint64
+	revision   int64
+	size       int64
+	reason     string
+	expiresAt  time.Time
+}
+
 type layerSymlinkState struct {
 	Target string
 	Mode   uint32
@@ -333,6 +346,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, dirCacheMaxEntriesOrDefault(opts.DirCacheMaxEntries)),
 		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
 		dirtyInodes:       make(map[uint64]dirtyInodeState),
+		kernelCacheBypass: make(map[uint64]kernelCacheBypassMarker),
 		specialByPath:     make(map[string]uint64),
 		uid:               uint32(os.Getuid()),
 		gid:               uint32(os.Getgid()),
@@ -403,6 +417,7 @@ const (
 	sqliteSidecarDirtyWaitInterval = time.Millisecond
 	samePathDirtyWaitTimeout       = 250 * time.Millisecond
 	samePathDirtyWaitInterval      = time.Millisecond
+	kernelCacheBypassFallbackTTL   = 2 * time.Second
 
 	// namespaceMutationRetryTimeout bounds detached retries for idempotent-ish
 	// namespace mutations after a FUSE interrupt or transient backend error.
@@ -1667,14 +1682,6 @@ func remoteOpenFlagsForHandle(fh *FileHandle) uint32 {
 	if fh.ShadowPinned || fh.ShadowReady || fh.ShadowSpill {
 		return gofuse.FOPEN_DIRECT_IO
 	}
-	if fh.Dirty == nil && (fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync) {
-		// close-sync/write-sync are close-to-open durability barriers. On
-		// Linux, a previous O_TRUNC writer can leave a stale 0-byte page/attr
-		// cache view even after the remote commit succeeds; make clean sync-mode
-		// readers enter userspace so they can observe the freshly committed
-		// read cache/remote revision instead of a kernel-side stale view.
-		return gofuse.FOPEN_DIRECT_IO
-	}
 	if fh.Dirty != nil {
 		if fh.Flags&syscall.O_TRUNC != 0 || fh.OrigSize >= smallFileShadowThreshold {
 			return gofuse.FOPEN_DIRECT_IO
@@ -1682,6 +1689,84 @@ func remoteOpenFlagsForHandle(fh *FileHandle) uint32 {
 		return gofuse.FOPEN_KEEP_CACHE
 	}
 	return gofuse.FOPEN_KEEP_CACHE
+}
+
+func (fs *Dat9FS) openFlagsForHandle(fh *FileHandle) uint32 {
+	flags := remoteOpenFlagsForHandle(fh)
+	if flags != gofuse.FOPEN_KEEP_CACHE || fh == nil || fh.Dirty != nil {
+		return flags
+	}
+	if fs.kernelCacheBypassActive(fh) {
+		return gofuse.FOPEN_DIRECT_IO
+	}
+	return flags
+}
+
+func (fs *Dat9FS) armKernelCacheBypass(ino uint64, localPath string, revision, size int64, reason string) uint64 {
+	if fs == nil || ino == 0 {
+		return 0
+	}
+	fs.kernelCacheBypassMu.Lock()
+	defer fs.kernelCacheBypassMu.Unlock()
+	if fs.kernelCacheBypass == nil {
+		fs.kernelCacheBypass = make(map[uint64]kernelCacheBypassMarker)
+	}
+	fs.kernelCacheBypassSeq++
+	gen := fs.kernelCacheBypassSeq
+	fs.kernelCacheBypass[ino] = kernelCacheBypassMarker{
+		ino:        ino,
+		path:       localPath,
+		generation: gen,
+		revision:   revision,
+		size:       size,
+		reason:     reason,
+		expiresAt:  time.Now().Add(kernelCacheBypassFallbackTTL),
+	}
+	fs.debugf("kernel cache bypass armed path=%s ino=%d gen=%d rev=%d size=%d reason=%s", localPath, ino, gen, revision, size, reason)
+	return gen
+}
+
+func (fs *Dat9FS) clearKernelCacheBypassGeneration(ino, generation uint64) {
+	if fs == nil || ino == 0 || generation == 0 {
+		return
+	}
+	fs.kernelCacheBypassMu.Lock()
+	defer fs.kernelCacheBypassMu.Unlock()
+	marker, ok := fs.kernelCacheBypass[ino]
+	if !ok || marker.generation != generation {
+		return
+	}
+	delete(fs.kernelCacheBypass, ino)
+	fs.debugf("kernel cache bypass cleared path=%s ino=%d gen=%d rev=%d size=%d reason=%s", marker.path, marker.ino, marker.generation, marker.revision, marker.size, marker.reason)
+}
+
+func (fs *Dat9FS) kernelCacheBypassActive(fh *FileHandle) bool {
+	if fs == nil || fh == nil || fh.Ino == 0 {
+		return false
+	}
+	now := time.Now()
+	fs.kernelCacheBypassMu.Lock()
+	defer fs.kernelCacheBypassMu.Unlock()
+	marker, ok := fs.kernelCacheBypass[fh.Ino]
+	if !ok {
+		return false
+	}
+	if !marker.expiresAt.IsZero() && now.After(marker.expiresAt) {
+		delete(fs.kernelCacheBypass, fh.Ino)
+		fs.debugf("kernel cache bypass expired path=%s ino=%d gen=%d rev=%d size=%d reason=%s", marker.path, marker.ino, marker.generation, marker.revision, marker.size, marker.reason)
+		return false
+	}
+	return marker.ino == fh.Ino
+}
+
+func (fs *Dat9FS) finishSyncCommitKernelCacheBoundary(ino uint64, localPath string, revision, size int64) {
+	if fs == nil || ino == 0 {
+		return
+	}
+	gen := fs.armKernelCacheBypass(ino, localPath, revision, size, "sync-commit")
+	if fs.notifyInodeSync(ino) {
+		fs.clearKernelCacheBypassGeneration(ino, gen)
+	}
 }
 
 func (fs *Dat9FS) localEntry(localPath string, info os.FileInfo, incrementLookup bool) (*InodeEntry, gofuse.Status) {
@@ -6397,12 +6482,13 @@ func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
 // invalidation form, while off=0/len=0 invalidates cached data. A data-only
 // invalidation can leave a just-truncated 0-byte i_size cached across a later
 // close-sync remote commit, making immediate close-to-open reads observe EOF.
-func (fs *Dat9FS) invalidateInodeKernelCaches(ino uint64) {
+func (fs *Dat9FS) invalidateInodeKernelCaches(ino uint64) bool {
 	if fs.server == nil {
-		return
+		return false
 	}
-	_ = fs.server.InodeNotify(ino, -1, 0)
-	_ = fs.server.InodeNotify(ino, 0, 0)
+	attrErr := fs.server.InodeNotify(ino, -1, 0)
+	dataErr := fs.server.InodeNotify(ino, 0, 0)
+	return attrErr == gofuse.OK && dataErr == gofuse.OK
 }
 
 // notifyInode tells the kernel to invalidate cached attributes and data
@@ -6419,7 +6505,7 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 	fs.notifyWg.Add(1)
 	go func() {
 		defer fs.notifyWg.Done()
-		fs.invalidateInodeKernelCaches(ino)
+		_ = fs.invalidateInodeKernelCaches(ino)
 	}()
 }
 
@@ -6429,12 +6515,12 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 // remote commits are close-to-open barriers: the next opener may otherwise
 // observe stale size/page-cache state even though the remote commit has
 // completed.
-func (fs *Dat9FS) notifyInodeSync(ino uint64) {
+func (fs *Dat9FS) notifyInodeSync(ino uint64) bool {
 	fs.notifyCount.Add(1)
 	if fs.perf != nil {
 		fs.perf.notifyInode.add(1)
 	}
-	fs.invalidateInodeKernelCaches(ino)
+	return fs.invalidateInodeKernelCaches(ino)
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
@@ -7902,6 +7988,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			truncMtime := time.Now()
 			entry.Mtime = truncMtime
 			fs.inodes.UpdateMtime(input.NodeId, truncMtime)
+		}
+		if sizeChanged {
+			fs.armKernelCacheBypass(input.NodeId, entry.Path, entry.Revision, newSize, "setattr-size")
 		}
 		// Kernel already receives updated attrs via the SetAttr reply —
 		// no need for an explicit notifyInode here.
@@ -10513,7 +10602,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
 	out.Fh = fs.allocateFileHandle(fh)
-	out.OpenFlags = remoteOpenFlagsForHandle(fh)
+	out.OpenFlags = fs.openFlagsForHandle(fh)
 	fs.fillEntryOut(entry, &out.EntryOut)
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
@@ -10696,7 +10785,8 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			// open/00.t test 43). Use a synchronous InodeNotify (not the
 			// async notifyInode goroutine) to guarantee the cache is
 			// invalidated before Open returns to the kernel.
-			fs.invalidateInodeKernelCaches(input.NodeId)
+			_ = fs.invalidateInodeKernelCaches(input.NodeId)
+			fs.armKernelCacheBypass(input.NodeId, p, fh.BaseRev, 0, "open-truncate")
 			if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 				if err := fs.shadowStore.WriteFull(p, nil, fh.BaseRev); err != nil {
 					safeLogPrintf("shadow reset failed for truncate-open %s: %v", p, err)
@@ -10751,7 +10841,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	}
 
 	out.Fh = fs.allocateFileHandle(fh)
-	out.OpenFlags = remoteOpenFlagsForHandle(fh)
+	out.OpenFlags = fs.openFlagsForHandle(fh)
 	fs.debugf("open path=%s fh=%d ino=%d flags=0x%x open_flags=%d dirty=%t prefetch=%t orig_size=%d base_rev=%d shadow_ready=%t shadow_spill=%t write_policy=%s", p, out.Fh, fh.Ino, input.Flags, out.OpenFlags, fh.Dirty != nil, fh.Prefetch != nil, fh.OrigSize, fh.BaseRev, fh.ShadowReady, fh.ShadowSpill, fh.WritePolicy)
 	return gofuse.OK
 }
@@ -11710,6 +11800,9 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
+	if fh.Flags&syscall.O_TRUNC != 0 {
+		fs.armKernelCacheBypass(fh.Ino, fh.Path, fh.BaseRev, fh.Dirty.Size(), "truncate-write")
+	}
 	if fh.WritePolicy == WritePolicyWriteSync {
 		size := fh.Dirty.Size()
 		writeCtx, writeCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
@@ -11958,7 +12051,7 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 		// handle was opened O_TRUNC + FOPEN_DIRECT_IO, invalidate kernel
 		// size/data state immediately so the next read cannot observe the
 		// truncation's stale 0-byte view.
-		fs.notifyInodeSync(fh.Ino)
+		fs.finishSyncCommitKernelCacheBoundary(fh.Ino, fh.Path, committedRev, size)
 	}
 	return gofuse.OK
 }
@@ -12039,7 +12132,7 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 		fs.inodes.UpdateSize(fh.Ino, size)
 		fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
 		if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync {
-			fs.notifyInodeSync(fh.Ino)
+			fs.finishSyncCommitKernelCacheBoundary(fh.Ino, fh.Path, committedRev, size)
 		}
 		return gofuse.OK
 	}
@@ -12067,6 +12160,9 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 		fs.readCache.Put(fh.Path, nil, 0)
 		fs.inodes.UpdateSize(fh.Ino, 0)
 		fs.cacheFileForPath(fh.Path, 0, time.Now(), 0)
+		if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync {
+			fs.finishSyncCommitKernelCacheBoundary(fh.Ino, fh.Path, 0, 0)
+		}
 		if fs.pendingIndex != nil {
 			if gen, putErr := fs.pendingIndex.PutWithBaseRev(fh.Path, 0, fs.pendingKindForHandle(fh), expectedRevision); putErr == nil {
 				fh.PendingIndexGen = gen
@@ -12116,6 +12212,9 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 	fh.ShadowCommitSeq = 0
 	fh.ShadowStageGen = 0
 	fh.PendingIndexGen = 0
+	if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync {
+		fs.finishSyncCommitKernelCacheBoundary(fh.Ino, fh.Path, committedRev, 0)
+	}
 	return gofuse.OK
 }
 
@@ -13741,7 +13840,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync {
-			fs.notifyInodeSync(fh.Ino)
+			if syntheticRev, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
+				fs.finishSyncCommitKernelCacheBoundary(fh.Ino, fh.Path, syntheticRev, size)
+			} else {
+				fs.finishSyncCommitKernelCacheBoundary(fh.Ino, fh.Path, 0, size)
+			}
 		}
 		return gofuse.OK
 	}
@@ -13811,7 +13914,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync {
-			fs.notifyInodeSync(fh.Ino)
+			if syntheticRev, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
+				fs.finishSyncCommitKernelCacheBoundary(fh.Ino, fh.Path, syntheticRev, size)
+			} else {
+				fs.finishSyncCommitKernelCacheBoundary(fh.Ino, fh.Path, 0, size)
+			}
 		}
 		return gofuse.OK
 	}
@@ -14217,7 +14324,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		// the just-committed bytes live only in userspace/remote caches. Invalidate
 		// synchronously before returning Flush so an immediate close-to-open read
 		// cannot serve stale/empty data from the kernel cache.
-		fs.notifyInodeSync(handleIno)
+		fs.finishSyncCommitKernelCacheBoundary(handleIno, handlePath, committedBarrierRev, publishSize)
 	}
 	// Local flush — kernel receives the Flush reply with status. Most paths do
 	// not need notifyInode/notifyEntry because userspace caches are updated

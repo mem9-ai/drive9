@@ -1379,6 +1379,9 @@ func TestCloseSyncOpenTruncateOverwriteReadSeesLatestBytes(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Open read before writer Release status = %v, want OK", st)
 	}
+	if readBeforeReleaseOut.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("Open read before writer Release flags = %d, want FOPEN_DIRECT_IO while per-inode bypass fallback is active", readBeforeReleaseOut.OpenFlags)
+	}
 	bufBeforeRelease := make([]byte, 64)
 	resultBeforeRelease, st := fs.Read(nil, &gofuse.ReadIn{
 		InHeader: gofuse.InHeader{NodeId: ino},
@@ -1410,6 +1413,9 @@ func TestCloseSyncOpenTruncateOverwriteReadSeesLatestBytes(t *testing.T) {
 	}, &readOut)
 	if st != gofuse.OK {
 		t.Fatalf("Open read status = %v, want OK", st)
+	}
+	if readOut.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("Open read flags = %d, want FOPEN_DIRECT_IO while per-inode bypass fallback is active", readOut.OpenFlags)
 	}
 	buf := make([]byte, 64)
 	result, st := fs.Read(nil, &gofuse.ReadIn{
@@ -1542,6 +1548,9 @@ func TestCloseSyncFlushSupersedesPathZeroShadowBeforeRelease(t *testing.T) {
 	}, &readOut)
 	if st != gofuse.OK {
 		t.Fatalf("Open read status = %v, want OK", st)
+	}
+	if readOut.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("Open read flags = %d, want FOPEN_DIRECT_IO while per-inode bypass fallback is active", readOut.OpenFlags)
 	}
 	buf := make([]byte, 64)
 	result, st := fs.Read(nil, &gofuse.ReadIn{

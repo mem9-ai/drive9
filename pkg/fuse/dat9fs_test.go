@@ -8083,7 +8083,7 @@ func TestOpenWritableSQLiteUsesDirectIO(t *testing.T) {
 	}
 }
 
-func TestOpenReadOnlySyncDurabilityUsesDirectIO(t *testing.T) {
+func TestOpenReadOnlySyncDurabilityKeepsCacheWithoutBypassMarker(t *testing.T) {
 	for _, policy := range []WritePolicy{WritePolicyCloseSync, WritePolicyWriteSync} {
 		t.Run(string(policy), func(t *testing.T) {
 			opts := &MountOptions{}
@@ -8100,11 +8100,151 @@ func TestOpenReadOnlySyncDurabilityUsesDirectIO(t *testing.T) {
 			if st != gofuse.OK {
 				t.Fatalf("Open status = %v, want OK", st)
 			}
-			if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
-				t.Fatalf("open flags = %d, want FOPEN_DIRECT_IO for %s close-to-open coherence", out.OpenFlags, policy)
+			if out.OpenFlags != gofuse.FOPEN_KEEP_CACHE {
+				t.Fatalf("open flags = %d, want FOPEN_KEEP_CACHE for clean %s reader", out.OpenFlags, policy)
 			}
 		})
 	}
+}
+
+func TestOpenReadOnlySyncDurabilityBypassMarkerUsesDirectIO(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	markedIno := fs.inodes.Lookup("/sync-visible.txt", false, 17, time.Now())
+	fs.inodes.UpdateRevision(markedIno, 7)
+	otherIno := fs.inodes.Lookup("/other.txt", false, 11, time.Now())
+	fs.inodes.UpdateRevision(otherIno, 3)
+
+	fs.armKernelCacheBypass(markedIno, "/sync-visible.txt", 7, 17, "test")
+
+	var markedOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: markedIno},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &markedOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open marked status = %v, want OK", st)
+	}
+	if markedOut.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("marked open flags = %d, want FOPEN_DIRECT_IO", markedOut.OpenFlags)
+	}
+
+	var otherOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: otherIno},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &otherOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open other status = %v, want OK", st)
+	}
+	if otherOut.OpenFlags != gofuse.FOPEN_KEEP_CACHE {
+		t.Fatalf("other open flags = %d, want FOPEN_KEEP_CACHE", otherOut.OpenFlags)
+	}
+}
+
+func TestKernelCacheBypassMarkerIsInodeScopedAcrossRecreate(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	oldIno := fs.inodes.Lookup("/recreate.txt", false, 0, time.Now())
+	fs.armKernelCacheBypass(oldIno, "/recreate.txt", 1, 0, "test")
+	fs.inodes.Remove("/recreate.txt")
+
+	newIno := fs.inodes.Lookup("/recreate.txt", false, 19, time.Now())
+	if newIno == oldIno {
+		t.Fatalf("recreated inode = %d, want a different inode", newIno)
+	}
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: newIno},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open recreated status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_KEEP_CACHE {
+		t.Fatalf("recreated open flags = %d, want FOPEN_KEEP_CACHE", out.OpenFlags)
+	}
+}
+
+func TestKernelCacheBypassMarkerFollowsRenamedInode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	ino := fs.inodes.Lookup("/old.txt", false, 5, time.Now())
+	fs.armKernelCacheBypass(ino, "/old.txt", 2, 5, "test")
+	fs.inodes.Rename("/old.txt", "/new.txt")
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open renamed status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("renamed open flags = %d, want FOPEN_DIRECT_IO for same inode marker", out.OpenFlags)
+	}
+}
+
+func TestSyncCommitNotifyFailureLeavesPerInodeBypass(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	ino := fs.inodes.Lookup("/notify-fallback.txt", false, 21, time.Now())
+	fs.inodes.UpdateRevision(ino, 9)
+	fs.finishSyncCommitKernelCacheBoundary(ino, "/notify-fallback.txt", 9, 21)
+
+	if !fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/notify-fallback.txt"}) {
+		t.Fatal("notify failure did not leave per-inode bypass marker active")
+	}
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("open flags = %d, want FOPEN_DIRECT_IO while notify fallback is active", out.OpenFlags)
+	}
+}
+
+func TestKernelCacheBypassMarkerExpiresAndClearsByGeneration(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	ino := fs.inodes.Lookup("/short-window.txt", false, 8, time.Now())
+	oldGen := fs.armKernelCacheBypass(ino, "/short-window.txt", 1, 8, "old")
+	newGen := fs.armKernelCacheBypass(ino, "/short-window.txt", 2, 8, "new")
+	fs.clearKernelCacheBypassGeneration(ino, oldGen)
+	if !fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/short-window.txt"}) {
+		t.Fatal("clearing an older generation removed the active marker")
+	}
+
+	fs.kernelCacheBypassMu.Lock()
+	marker := fs.kernelCacheBypass[ino]
+	marker.expiresAt = time.Now().Add(-time.Second)
+	fs.kernelCacheBypass[ino] = marker
+	fs.kernelCacheBypassMu.Unlock()
+
+	if fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/short-window.txt"}) {
+		t.Fatal("expired marker stayed active")
+	}
+	fs.clearKernelCacheBypassGeneration(ino, newGen)
 }
 
 func TestOpenReadOnlyCacheableFileSkipsPrefetcher(t *testing.T) {
@@ -25874,6 +26014,9 @@ func TestSetAttr_NoKernelNotify(t *testing.T) {
 	after := fs.notifyCount.Load()
 	if delta := after - before; delta != 0 {
 		t.Fatalf("SetAttr produced %d kernel notify calls, want 0", delta)
+	}
+	if !fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/trunc.txt"}) {
+		t.Fatal("SetAttr size change did not arm per-inode cache bypass marker")
 	}
 }
 
