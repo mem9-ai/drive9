@@ -964,7 +964,7 @@ func (fs *Dat9FS) commitLayerShadowLocked(ctx context.Context, fh *FileHandle, s
 		return fmt.Errorf("missing shadow for %s", fh.Path)
 	}
 	gvisorCompat := fs.gvisorCompatibilityEnabled()
-	pathLocked = pathLocked || gvisorCompat && fh.RemoteCommitUnlock != nil
+	pathLocked = pathLocked || fh.RemoteCommitUnlock != nil
 	handlePath := fh.Path
 	handleIno := fh.Ino
 	mutationSeq := fh.DirtySeq
