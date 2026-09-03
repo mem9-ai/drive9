@@ -596,7 +596,8 @@ func classifyFSAction(r *http.Request) string {
 		return "delete"
 	case http.MethodPost:
 		q := r.URL.Query()
-		for _, key := range []string{"append", "copy", "rename", "mkdir", "chmod", "create", "symlink", "hardlink"} {
+		// Keep the key set and order in sync with handleFS's POST dispatcher.
+		for _, key := range []string{"append", "copy", "rename", "mkdir", "chmod", "setmeta", "create", "symlink", "hardlink"} {
 			if q.Has(key) {
 				return key
 			}

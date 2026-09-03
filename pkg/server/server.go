@@ -1810,7 +1810,7 @@ func isScopedFSPostQueryAllowed(q url.Values) bool {
 	// no selector = deny (no handler matches the dispatcher's else branch
 	// for scoped tokens — that's "unknown POST action" which is a 400 for
 	// owner today, and we don't want to silently widen for scoped).
-	selectors := []string{"append", "copy", "rename", "mkdir", "chmod", "create", "symlink", "hardlink"}
+	selectors := []string{"append", "copy", "rename", "mkdir", "chmod", "setmeta", "create", "symlink", "hardlink"}
 	selectorCount := 0
 	var selectorKey string
 	for _, k := range selectors {
@@ -1844,6 +1844,10 @@ func isScopedFSPostQueryAllowed(q url.Values) bool {
 		// the dispatcher gate makes the policy decision explicit at the
 		// allowlist boundary.
 		return false
+	case "setmeta":
+		// handleSetMeta reads only ?setmeta; tags/description are in the
+		// JSON body.
+		return queryKeysSubsetOf(q, []string{"setmeta"})
 	case "create":
 		// handleCreate reads only ?create.
 		return queryKeysSubsetOf(q, []string{"create"})
@@ -2117,6 +2121,8 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 			s.handleMkdir(w, r, path)
 		} else if r.URL.Query().Has("chmod") {
 			s.handleChmod(w, r, path)
+		} else if r.URL.Query().Has("setmeta") {
+			s.handleSetMeta(w, r, path)
 		} else if r.URL.Query().Has("create") {
 			s.handleCreate(w, r, path)
 		} else if r.URL.Query().Has("symlink") {
@@ -2308,6 +2314,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 			Mtime        *int64            `json:"mtime,omitempty"`
 			ContentType  string            `json:"content_type"`
 			SemanticText string            `json:"semantic_text"`
+			Description  string            `json:"description"`
 			Tags         map[string]string `json:"tags"`
 		}{
 			IsDir: true,
@@ -2336,6 +2343,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	var mtime *int64
 	var contentType string
 	var semanticText string
+	var description string
 	resourceID := nf.Node.NodeID
 	nlink, err := nodeLinkCount(r.Context(), b, nf)
 	if err != nil {
@@ -2356,6 +2364,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 		}
 		contentType = nf.File.ContentType
 		semanticText = nf.File.ContentText
+		description = nf.File.Description
 
 		tags, err = b.Store().GetFileTags(r.Context(), nf.File.FileID)
 		if err != nil {
@@ -2380,6 +2389,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 		Mtime        *int64            `json:"mtime,omitempty"`
 		ContentType  string            `json:"content_type"`
 		SemanticText string            `json:"semantic_text"`
+		Description  string            `json:"description"`
 		Tags         map[string]string `json:"tags"`
 	}{
 		Size:         size,
@@ -2390,6 +2400,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 		Mtime:        mtime,
 		ContentType:  contentType,
 		SemanticText: semanticText,
+		Description:  description,
 		Tags:         tags,
 	})
 }

@@ -11,6 +11,52 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
+func TestUpdateFileDescriptionEmbeddingIfText(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := s.InsertFile(ctx, &File{
+		FileID: "f-desc-text", StorageType: StorageDB9, StorageRef: "/blobs/f-desc-text",
+		Revision: 1, Status: StatusConfirmed, Description: "old description",
+		CreatedAt: now, ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Matching text writes.
+	updated, err := s.UpdateFileDescriptionEmbeddingIfText(ctx, "f-desc-text", 1, "old description", testEmbeddingVector(0.4))
+	if err != nil || !updated {
+		t.Fatalf("matching writeback updated=%v err=%v", updated, err)
+	}
+
+	// Simulate setmeta changing the description without a revision bump.
+	if err := s.InTx(ctx, func(tx *sql.Tx) error {
+		return s.UpdateFileDescriptionTx(tx, "f-desc-text", "new description")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stale text is skipped and does not overwrite the cleared state.
+	updated, err = s.UpdateFileDescriptionEmbeddingIfText(ctx, "f-desc-text", 1, "old description", testEmbeddingVector(0.5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated {
+		t.Fatal("stale description writeback succeeded")
+	}
+	file := mustFile(t, s, "f-desc-text")
+	if file.Description != "new description" || file.DescriptionEmbeddingRevision != nil {
+		t.Fatalf("file description=%q description_embedding_revision=%v, want new description and no embedding",
+			file.Description, file.DescriptionEmbeddingRevision)
+	}
+
+	// Fresh text writes again.
+	updated, err = s.UpdateFileDescriptionEmbeddingIfText(ctx, "f-desc-text", 1, "new description", testEmbeddingVector(0.6))
+	if err != nil || !updated {
+		t.Fatalf("fresh writeback updated=%v err=%v", updated, err)
+	}
+}
+
 func TestUpdateFileEmbedding(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now().UTC()
