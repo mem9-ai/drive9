@@ -36,6 +36,7 @@ NO_RESTART_OBSERVE_S="${NO_RESTART_OBSERVE_S:-12}"
 FUSE_PROBE_TIMEOUT_S="${FUSE_PROBE_TIMEOUT_S:-10}"
 # close-sync write+read can exceed 10s under CI load; keep mountpoint/health shorter.
 FUSE_IO_PROBE_TIMEOUT_S="${FUSE_IO_PROBE_TIMEOUT_S:-30}"
+CACHE_PROBE_TIMEOUT_S="${CACHE_PROBE_TIMEOUT_S:-90}"
 FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
 FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-45s}"
@@ -166,6 +167,82 @@ probe_mount_io() {
     got="$(tr -d "\n" <"$f" 2>/dev/null || true)"
     [ "$got" = "$marker" ]
   ' _ "$marker" "$f"
+}
+
+probe_cache_invalidation_io() {
+  local marker="$1"
+  local dir="$MOUNT_POINT/cache-invalidation-$marker"
+  with_timeout "$CACHE_PROBE_TIMEOUT_S" bash -c '
+    set -euo pipefail
+    marker="$1"
+    dir="$2"
+    mkdir -p "$dir"
+
+    # O_TRUNC / shell-redirection path: the immediate close-to-open read must
+    # not observe the transient 0-byte truncate image or older kernel pages.
+    f="$dir/o-trunc.txt"
+    printf "seed-%s\n" "$marker" >"$f"
+    for i in 1 2 3; do
+      want="o-trunc-${marker}-${i}"
+      printf "%s\n" "$want" >"$f"
+      got="$(tr -d "\n" <"$f")"
+      [ "$got" = "$want" ]
+    done
+
+    # SetAttr truncate path: exercise truncate(2) separately from open(O_TRUNC),
+    # then write final bytes and immediately reopen/read.
+    python3 - "$dir/setattr.txt" "$marker" <<'"'"'PY'"'"'
+import os
+import pathlib
+import sys
+
+p = pathlib.Path(sys.argv[1])
+marker = sys.argv[2]
+p.write_text(f"seed-setattr-{marker}\n")
+os.truncate(p, 0)
+want = f"setattr-{marker}\n"
+p.write_text(want)
+got = p.read_text()
+if got != want:
+    raise SystemExit(f"setattr truncate read {got!r}, want {want!r}")
+PY
+
+    # Rename, unlink, recreate: any short-window cache-bypass state must be
+    # scoped to the inode/generation, not just the path string.
+    src="$dir/rename-src.txt"
+    dst="$dir/recreate.txt"
+    printf "old-%s\n" "$marker" >"$dst"
+    printf "renamed-%s\n" "$marker" >"$src"
+    mv -f "$src" "$dst"
+    got="$(tr -d "\n" <"$dst")"
+    [ "$got" = "renamed-${marker}" ]
+    rm -f "$dst"
+    printf "recreated-%s\n" "$marker" >"$dst"
+    got="$(tr -d "\n" <"$dst")"
+    [ "$got" = "recreated-${marker}" ]
+
+    # Concurrent close/read shape: the writer close/release window must not let
+    # an immediate reader see an older same-path dirty sibling or a 0-byte
+    # truncate shadow.
+    python3 - "$dir/concurrent.txt" "$marker" <<'"'"'PY'"'"'
+import pathlib
+import sys
+import threading
+
+p = pathlib.Path(sys.argv[1])
+marker = sys.argv[2]
+for i in range(8):
+    want = f"concurrent-{marker}-{i}\n"
+    def writer():
+        p.write_text(want)
+    t = threading.Thread(target=writer)
+    t.start()
+    t.join()
+    got = p.read_text()
+    if got != want:
+        raise SystemExit(f"concurrent read {got!r}, want {want!r}")
+PY
+  ' _ "$marker" "$dir"
 }
 
 mount_status_json() {
@@ -395,6 +472,7 @@ require_cmd curl
 require_cmd jq
 require_cmd go
 require_cmd make
+require_cmd python3
 
 if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
   skip_or_fail "unsupported OS for this workload"
@@ -589,6 +667,12 @@ check_cmd "mount status reports supervised" \
 check_cmd "mount status reports healthy" \
   bash -c 'printf "%s" "$1" | jq -e ".healthy == true" >/dev/null' _ "$STATUS_JSON"
 check_cmd "initial IO through supervised mount" probe_mount_io "before-crash"
+check_cmd "initial close-sync cache invalidation IO" probe_cache_invalidation_io "before-crash"
+CACHE_FRESH_REL="cache-invalidation-fresh.txt"
+CACHE_FRESH_WANT="fresh-cache-boundary-$RUN_ID"
+check_cmd "seed fresh-mount cache probe" \
+  bash -c 'printf "%s\n" "$2" >"$1"' _ \
+  "$MOUNT_POINT/$CACHE_FRESH_REL" "$CACHE_FRESH_WANT"
 check_cmd "resolved worker pid before kill" test -n "${WORKER_PID:-}"
 check_cmd "resolved supervisor pid before kill" test -n "${SUPERVISOR_PID:-}"
 if [ -z "${WORKER_PID:-}" ] || [ -z "${SUPERVISOR_PID:-}" ]; then
@@ -607,6 +691,7 @@ echo "INFO post-heal status: $STATUS_JSON"
 # Settle briefly: status can still show "starting" for a moment after heal.
 sleep 1
 check_cmd "post-heal IO works" wait_healthy_io "after-heal"
+check_cmd "post-heal close-sync cache invalidation IO" probe_cache_invalidation_io "after-heal"
 check_cmd "post-heal health ok" drive9 mount health "$MOUNT_POINT"
 
 HEALED_SUPERVISOR="$(supervisor_pid_from_status)"
@@ -650,6 +735,10 @@ echo "[8] remount after umount (stop token must not stick)"
 if start_supervised_mount; then
   check_eq "remount after umount ready" "true" "true"
   check_cmd "IO works on remount" probe_mount_io "after-remount"
+  check_cmd "fresh mount reads seeded cache probe bytes" \
+    bash -c 'got="$(tr -d "\n" <"$1")"; [ "$got" = "$2" ]' _ \
+    "$MOUNT_POINT/$CACHE_FRESH_REL" "$CACHE_FRESH_WANT"
+  check_cmd "remount close-sync cache invalidation IO" probe_cache_invalidation_io "after-remount"
 else
   check_eq "remount after umount ready" "false" "true"
   cat "$MOUNT_LOG" >&2 || true

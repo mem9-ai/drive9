@@ -377,12 +377,12 @@ func TestCommitQueueLargeOverwriteUsesMultipartUpload(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(rec.client(), shadow, pending, nil, 1, 8)
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:    remotePath,
 		BaseRev: expectedRevision,
 		Size:    int64(len(data)),
 		Kind:    PendingOverwrite,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -496,12 +496,12 @@ func TestCommitQueueMapsRemoteRoot(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(rec.client(), shadow, pending, nil, 1, 8, "/remote")
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:    localPath,
 		BaseRev: expectedRevision,
 		Size:    int64(len(data)),
 		Kind:    PendingOverwrite,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()

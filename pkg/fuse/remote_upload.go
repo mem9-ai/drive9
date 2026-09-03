@@ -28,27 +28,32 @@ func uploadBufferedRemoteFileWithRevision(ctx context.Context, c *client.Client,
 // the entire file into memory. localPath identifies the shadow entry;
 // remotePath is the API destination (may differ when using RemoteRoot).
 func uploadFromShadowRemoteWithRevision(ctx context.Context, c *client.Client, shadows *ShadowStore, localPath, remotePath string, expectedRevision int64) (int64, error) {
+	return uploadFromShadowRemoteWithRevisionAndGeneration(ctx, c, shadows, localPath, remotePath, expectedRevision, 0)
+}
+
+func uploadFromShadowRemoteWithRevisionAndGeneration(ctx context.Context, c *client.Client, shadows *ShadowStore, localPath, remotePath string, expectedRevision int64, expectedGen uint64) (int64, error) {
 	// Sync shadow to disk before uploading to ensure all data is durable.
-	if err := shadows.Sync(localPath); err != nil {
+	if err := shadows.SyncIfGeneration(localPath, expectedGen); err != nil {
 		return 0, err
 	}
-	size := shadows.Size(localPath)
-	if size < 0 {
-		return 0, io.ErrUnexpectedEOF
+	fd, size, release, err := shadows.OpenIfGeneration(localPath, expectedGen)
+	if err != nil {
+		return 0, err
 	}
+	defer release()
+	defer func() { _ = fd.Close() }()
 	if size == 0 {
 		return c.WriteCtxConditionalWithRevision(ctx, remotePath, nil, expectedRevision)
 	}
 	threshold := c.CachedSmallFileThreshold()
 	if threshold > 0 && size < threshold {
-		data, err := shadows.ReadAll(localPath)
-		if err != nil {
+		data := make([]byte, size)
+		if _, err := fd.ReadAt(data, 0); err != nil {
 			return 0, err
 		}
 		return c.WriteCtxConditionalWithRevision(ctx, remotePath, data, expectedRevision)
 	}
-	ra := &shadowReaderAt{store: shadows, path: localPath}
-	sr := io.NewSectionReader(ra, 0, size)
+	sr := io.NewSectionReader(fd, 0, size)
 	if err := c.WriteMultipartStreamConditional(ctx, remotePath, sr, size, nil, expectedRevision); err != nil {
 		return 0, err
 	}

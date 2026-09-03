@@ -902,6 +902,70 @@ func (s *ShadowStore) ReadAll(remotePath string) ([]byte, error) {
 	return os.ReadFile(sp)
 }
 
+// ReadAllIfGeneration reads the active shadow only if its current content
+// generation still matches expectedGen. Generation 0 preserves the historical
+// path-based fallback for recovered legacy entries that were created before
+// CommitEntry carried generation tokens.
+func (s *ShadowStore) ReadAllIfGeneration(remotePath string, expectedGen uint64) ([]byte, error) {
+	if expectedGen == 0 {
+		return s.ReadAll(remotePath)
+	}
+	if s == nil {
+		return nil, fmt.Errorf("nil shadow store")
+	}
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	s.mu.RLock()
+	if s.writeGen[remotePath] != expectedGen {
+		s.mu.RUnlock()
+		return nil, fmt.Errorf("%w: shadow %s generation changed", errCommitPayloadStale, remotePath)
+	}
+	sf, ok := s.files[remotePath]
+	if !ok {
+		s.mu.RUnlock()
+		return nil, fmt.Errorf("%w: shadow %s generation not active", errCommitPayloadStale, remotePath)
+	}
+	data := make([]byte, sf.size)
+	_, err := sf.fd.ReadAt(data, 0)
+	s.mu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// SyncIfGeneration fsyncs the active shadow only if its current content
+// generation still matches expectedGen. Generation 0 preserves the historical
+// path-based fallback for recovered legacy entries.
+func (s *ShadowStore) SyncIfGeneration(remotePath string, expectedGen uint64) error {
+	if s == nil {
+		return fmt.Errorf("nil shadow store")
+	}
+	if expectedGen == 0 {
+		return s.Sync(remotePath)
+	}
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	s.mu.RLock()
+	if s.writeGen[remotePath] != expectedGen {
+		s.mu.RUnlock()
+		return fmt.Errorf("%w: shadow %s generation changed", errCommitPayloadStale, remotePath)
+	}
+	sf, ok := s.files[remotePath]
+	if !ok {
+		s.mu.RUnlock()
+		return fmt.Errorf("%w: shadow %s generation not active", errCommitPayloadStale, remotePath)
+	}
+	err := sf.fd.Sync()
+	s.mu.RUnlock()
+	if err != nil {
+		return fmt.Errorf("shadow sync: %w", err)
+	}
+	return nil
+}
+
 // Open opens the current shadow file for remotePath for streaming reads.
 // The caller owns the returned file descriptor.
 func (s *ShadowStore) Open(remotePath string) (*os.File, int64, error) {
@@ -930,6 +994,49 @@ func (s *ShadowStore) Open(remotePath string) (*os.File, int64, error) {
 		return nil, 0, fmt.Errorf("shadow stream stat: %w", err)
 	}
 	return fd, fi.Size(), nil
+}
+
+// OpenIfGeneration opens a streaming fd for the active shadow only if its
+// current content generation still matches expectedGen. The returned release
+// function must be called after the upload/streaming read is done. For a
+// nonzero generation it holds the path-local shadow lock for the caller, so the
+// opened fd cannot observe concurrent same-path shadow mutations while it is
+// being streamed to a remote commit.
+func (s *ShadowStore) OpenIfGeneration(remotePath string, expectedGen uint64) (*os.File, int64, func(), error) {
+	if expectedGen == 0 {
+		fd, size, err := s.Open(remotePath)
+		return fd, size, func() {}, err
+	}
+	if s == nil {
+		return nil, 0, func() {}, fmt.Errorf("nil shadow store")
+	}
+	pl := s.acquirePathLock(remotePath)
+	release := func() {
+		s.releasePathLock(remotePath, pl)
+	}
+
+	s.mu.RLock()
+	if s.writeGen[remotePath] != expectedGen {
+		s.mu.RUnlock()
+		release()
+		return nil, 0, func() {}, fmt.Errorf("%w: shadow %s generation changed", errCommitPayloadStale, remotePath)
+	}
+	sf, ok := s.files[remotePath]
+	if !ok {
+		s.mu.RUnlock()
+		release()
+		return nil, 0, func() {}, fmt.Errorf("%w: shadow %s generation not active", errCommitPayloadStale, remotePath)
+	}
+	size := sf.size
+	sp := s.shadowPath(remotePath)
+	s.mu.RUnlock()
+
+	fd, err := os.Open(sp)
+	if err != nil {
+		release()
+		return nil, 0, func() {}, fmt.Errorf("shadow open stream: %w", err)
+	}
+	return fd, size, release, nil
 }
 
 // Size returns the size of a shadow file, or -1 if not found.
@@ -1196,6 +1303,54 @@ func (s *ShadowStore) ActiveGeneration(remotePath string) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.writeGen[remotePath]
+}
+
+// EnsureActiveGeneration loads the active shadow for remotePath, including a
+// hash-keyed shadow recovered from disk, and returns a nonzero content
+// generation for it. Recovered shadows start without memory-only writeGen
+// state; CommitQueue must mint one before binding a recovered CommitEntry so
+// later uploads and cleanup remain generation-scoped instead of path-wide.
+func (s *ShadowStore) EnsureActiveGeneration(remotePath string, baseRev int64) uint64 {
+	if s == nil || remotePath == "" {
+		return 0
+	}
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sf, ok := s.files[remotePath]
+	if !ok {
+		hashKey := "__hash:" + hashPath(remotePath)
+		if recovered, recoveredOK := s.files[hashKey]; recoveredOK {
+			sf = recovered
+			delete(s.files, hashKey)
+			s.files[remotePath] = sf
+		} else {
+			fd, err := os.OpenFile(s.shadowPath(remotePath), os.O_RDWR, 0o644)
+			if err != nil {
+				return 0
+			}
+			fi, err := fd.Stat()
+			if err != nil {
+				_ = fd.Close()
+				return 0
+			}
+			sf = &ShadowFile{fd: fd, size: fi.Size()}
+			s.files[remotePath] = sf
+		}
+	}
+	if sf == nil {
+		return 0
+	}
+	if gen := s.writeGen[remotePath]; gen != 0 {
+		return gen
+	}
+	if baseRev != 0 {
+		sf.baseRev = baseRev
+	}
+	return s.bumpWriteGenLocked(remotePath)
 }
 
 // bumpWriteGenLocked increments the content generation for remotePath. Called

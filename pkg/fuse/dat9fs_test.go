@@ -3268,7 +3268,7 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 	}
 }
 
-func TestFlushSmallNewFileRefreshesSiblingHandleRevision(t *testing.T) {
+func TestFlushSmallNewSQLiteJournalDirtySiblingKeepsOriginalBaseRev(t *testing.T) {
 	const filePath = "/sqlite/workload.db-journal"
 
 	var (
@@ -3353,15 +3353,21 @@ func TestFlushSmallNewFileRefreshesSiblingHandleRevision(t *testing.T) {
 	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fh1ID}); st != gofuse.OK {
 		t.Fatalf("first Flush status = %v, want OK", st)
 	}
-	if fh2.IsNew {
-		t.Fatal("second handle should no longer be create-if-absent after sibling commit")
+	if !fh2.IsNew {
+		t.Fatal("dirty sibling handle adopted committed revision before its remote-sync boundary")
 	}
-	if fh2.BaseRev != 1 {
-		t.Fatalf("second handle BaseRev = %d, want 1", fh2.BaseRev)
+	if fh2.BaseRev != 0 {
+		t.Fatalf("second handle BaseRev before flush = %d, want 0", fh2.BaseRev)
 	}
 
-	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fh2ID}); st != gofuse.OK {
-		t.Fatalf("second Flush status = %v, want OK", st)
+	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fh2ID}); st == gofuse.OK {
+		t.Fatal("second Flush status = OK, want CAS conflict for stale dirty journal payload")
+	}
+	if !fh2.IsNew {
+		t.Fatal("second dirty sibling handle adopted committed revision after failed stale flush")
+	}
+	if fh2.BaseRev != 0 {
+		t.Fatalf("second handle BaseRev after failed flush = %d, want 0", fh2.BaseRev)
 	}
 
 	mu.Lock()
@@ -3369,14 +3375,14 @@ func TestFlushSmallNewFileRefreshesSiblingHandleRevision(t *testing.T) {
 	if serverErr != nil {
 		t.Fatal(serverErr)
 	}
-	if !reflect.DeepEqual(expected, []int64{0, 1}) {
-		t.Fatalf("expected revisions = %v, want [0 1]", expected)
+	if !reflect.DeepEqual(expected, []int64{0, 0}) {
+		t.Fatalf("expected revisions = %v, want [0 0]", expected)
 	}
-	if revision != 2 {
-		t.Fatalf("server revision = %d, want 2", revision)
+	if revision != 1 {
+		t.Fatalf("server revision = %d, want 1", revision)
 	}
-	if string(content) != "second" {
-		t.Fatalf("server content = %q, want second", content)
+	if string(content) != "first" {
+		t.Fatalf("server content = %q, want first", content)
 	}
 }
 
@@ -5972,6 +5978,7 @@ func TestLookupUsesDirCacheNegativeEntryWithoutRemoteStat(t *testing.T) {
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	fs.dirCache.Put("/", []CachedFileInfo{{Name: "other.txt", Size: 1}})
+	fs.recordCommittedRevision("/missing.txt", 7)
 
 	var out gofuse.EntryOut
 	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "missing.txt", &out)
@@ -5983,6 +5990,9 @@ func TestLookupUsesDirCacheNegativeEntryWithoutRemoteStat(t *testing.T) {
 	}
 	if out.NodeId != 0 {
 		t.Fatalf("negative lookup NodeId = %d, want 0", out.NodeId)
+	}
+	if got := fs.latestCommittedRevision("/missing.txt"); got != 0 {
+		t.Fatalf("committed revision after cached ENOENT = %d, want 0", got)
 	}
 }
 
@@ -6044,6 +6054,222 @@ func TestLookupStatNotFoundSeedsShortNegativeNamespaceCache(t *testing.T) {
 	}
 }
 
+func TestLookupRemoteNotFoundClearsCommittedRevisionForPendingNewRecreate(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		filePath          string
+		wantNegativeCache bool
+	}{
+		{name: "regular-file", filePath: "/recreate.txt", wantNegativeCache: true},
+		{name: "lock-file", filePath: "/config.lock", wantNegativeCache: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testRemoteNotFoundClearsCommittedRevisionForPendingNewRecreate(t, tc.filePath, tc.wantNegativeCache)
+		})
+	}
+}
+
+func testRemoteNotFoundClearsCommittedRevisionForPendingNewRecreate(t *testing.T, filePath string, wantNegativeCache bool) {
+	t.Helper()
+	newData := []byte("new incarnation")
+	staleData := []byte("old payload")
+	lookupName := path.Base(filePath)
+
+	var (
+		mu          sync.Mutex
+		rec         testErrorRecorder
+		putBodies   [][]byte
+		putExpected []string
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			if r.URL.Path != "/v1/fs"+filePath {
+				rec.Recordf("HEAD path = %s, want /v1/fs%s", r.URL.Path, filePath)
+				http.Error(w, "bad path", http.StatusBadRequest)
+				return
+			}
+			// Simulate another client deleting a file this mount previously knew
+			// at rev 7. Lookup has now authoritatively observed a new empty
+			// incarnation slot for this path. Lock files must clear the watermark
+			// too even though they intentionally skip negative dir-cache entries.
+			http.Error(w, "not found", http.StatusNotFound)
+		case http.MethodPut:
+			if r.URL.Path != "/v1/fs"+filePath {
+				rec.Recordf("PUT path = %s, want /v1/fs%s", r.URL.Path, filePath)
+				http.Error(w, "bad path", http.StatusBadRequest)
+				return
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				rec.Recordf("read PUT body: %v", err)
+				http.Error(w, "read body", http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			putBodies = append(putBodies, append([]byte(nil), body...))
+			putExpected = append(putExpected, r.Header.Get("X-Dat9-Expected-Revision"))
+			mu.Unlock()
+			if r.Header.Get("X-Dat9-Expected-Revision") != "0" {
+				http.Error(w, "revision conflict", http.StatusConflict)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(8)})
+		default:
+			rec.Recordf("unexpected method %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+	defer rec.Check(t)
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.PathLock = fs.lockRemoteCommitPath
+	cq.DurableWatermark = fs.latestCommittedRevision
+	cq.OnSuccess = fs.onCommitQueueSuccess
+	cq.OnCleanup = fs.onCommitQueueCleanup
+	fs.commitQueue = cq
+	defer cq.DrainAll()
+
+	fs.recordCommittedRevision(filePath, 7)
+	var lookupOut gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, lookupName, &lookupOut)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
+	}
+	if got := fs.latestCommittedRevision(filePath); got != 0 {
+		t.Fatalf("committed revision after remote ENOENT = %d, want 0", got)
+	}
+	if got := fs.hasNegativePathCache(filePath); got != wantNegativeCache {
+		t.Fatalf("negative cache after remote ENOENT = %v, want %v", got, wantNegativeCache)
+	}
+
+	if err := shadow.WriteFull(filePath, newData, 0); err != nil {
+		t.Fatal(err)
+	}
+	pendingGen, err := pending.PutWithBaseRev(filePath, int64(len(newData)), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino := fs.inodes.Lookup(filePath, false, int64(len(newData)), time.Now())
+	entry := &CommitEntry{
+		Path:            filePath,
+		Inode:           ino,
+		BaseRev:         0,
+		Size:            int64(len(newData)),
+		Kind:            PendingNew,
+		PendingIndexGen: pendingGen,
+	}
+	fs.bindCommitEntryToPath(entry, filePath, 0)
+	if entry.DurableWatermarkRev != 0 {
+		t.Fatalf("recreate entry durable watermark = %d, want 0 after remote ENOENT", entry.DurableWatermarkRev)
+	}
+	if err := cq.CommitNow(context.Background(), entry); err != nil {
+		t.Fatalf("PendingNew recreate commit: %v", err)
+	}
+
+	mu.Lock()
+	gotExpected := append([]string(nil), putExpected...)
+	gotBodies := append([][]byte(nil), putBodies...)
+	mu.Unlock()
+	if len(gotExpected) != 1 || gotExpected[0] != "0" {
+		t.Fatalf("PUT expected revisions = %v, want [0]", gotExpected)
+	}
+	if len(gotBodies) != 1 || !bytes.Equal(gotBodies[0], newData) {
+		t.Fatalf("PUT bodies = %q, want %q", gotBodies, newData)
+	}
+	if got := fs.latestCommittedRevision(filePath); got != 8 {
+		t.Fatalf("committed revision after recreate = %d, want 8", got)
+	}
+
+	// The new-incarnation fix must not relax the old-payload fence: once the
+	// recreate is durable at rev 8, rev-0 payload cannot be paired with a newer
+	// BaseRev and overwrite it as another revision.
+	if err := shadow.WriteFull(filePath, staleData, 0); err != nil {
+		t.Fatal(err)
+	}
+	stalePendingGen, err := pending.PutWithBaseRev(filePath, int64(len(staleData)), PendingOverwrite, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleEntry := &CommitEntry{
+		Path:            filePath,
+		Inode:           ino,
+		BaseRev:         8,
+		Size:            int64(len(staleData)),
+		Kind:            PendingOverwrite,
+		PendingIndexGen: stalePendingGen,
+	}
+	fs.bindCommitEntryToPath(staleEntry, filePath, 0)
+	if staleEntry.DurableWatermarkRev != 8 {
+		t.Fatalf("stale entry durable watermark = %d, want 8", staleEntry.DurableWatermarkRev)
+	}
+	if err := cq.CommitNow(context.Background(), staleEntry); !errors.Is(err, errCommitPayloadStale) {
+		t.Fatalf("stale payload commit error = %v, want errCommitPayloadStale", err)
+	}
+	mu.Lock()
+	gotPutCount := len(putExpected)
+	mu.Unlock()
+	if gotPutCount != 1 {
+		t.Fatalf("PUT calls after stale payload = %d, want 1", gotPutCount)
+	}
+}
+
+func TestLookupRemoteDirectoryNotFoundClearsCommittedRevisionPrefix(t *testing.T) {
+	const dirPath = "/gone-dir"
+	var rec testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			rec.Recordf("method = %s, want HEAD", r.Method)
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.URL.Path != "/v1/fs"+dirPath {
+			rec.Recordf("HEAD path = %s, want /v1/fs%s", r.URL.Path, dirPath)
+			http.Error(w, "bad path", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer ts.Close()
+	defer rec.Check(t)
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.recordCommittedRevision(dirPath, 7)
+	fs.recordCommittedRevision(dirPath+"/file.txt", 8)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, path.Base(dirPath), &out)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
+	}
+	if got := fs.latestCommittedRevision(dirPath); got != 0 {
+		t.Fatalf("directory committed revision after remote ENOENT = %d, want 0", got)
+	}
+	if got := fs.latestCommittedRevision(dirPath + "/file.txt"); got != 0 {
+		t.Fatalf("child committed revision after remote directory ENOENT = %d, want 0", got)
+	}
+}
+
 func TestLookupLockFileStatNotFoundDoesNotSeedNamespaceNegative(t *testing.T) {
 	var headCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -6058,6 +6284,7 @@ func TestLookupLockFileStatNotFoundDoesNotSeedNamespaceNegative(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.recordCommittedRevision("/config.lock", 7)
 
 	for range 2 {
 		var out gofuse.EntryOut
@@ -6068,6 +6295,9 @@ func TestLookupLockFileStatNotFoundDoesNotSeedNamespaceNegative(t *testing.T) {
 	}
 	if got := headCalls.Load(); got != 2 {
 		t.Fatalf("HEAD calls = %d, want 2", got)
+	}
+	if got := fs.latestCommittedRevision("/config.lock"); got != 0 {
+		t.Fatalf("lock committed revision after remote ENOENT = %d, want 0", got)
 	}
 }
 
@@ -8077,6 +8307,170 @@ func TestOpenWritableSQLiteUsesDirectIO(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlySyncDurabilityKeepsCacheWithoutBypassMarker(t *testing.T) {
+	for _, policy := range []WritePolicy{WritePolicyCloseSync, WritePolicyWriteSync} {
+		t.Run(string(policy), func(t *testing.T) {
+			opts := &MountOptions{}
+			opts.setDefaults()
+			opts.WritePolicy = policy
+			fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+			ino := fs.inodes.Lookup("/sync-visible.txt", false, 17, time.Now())
+
+			var out gofuse.OpenOut
+			st := fs.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Flags:    uint32(syscall.O_RDONLY),
+			}, &out)
+			if st != gofuse.OK {
+				t.Fatalf("Open status = %v, want OK", st)
+			}
+			if out.OpenFlags != gofuse.FOPEN_KEEP_CACHE {
+				t.Fatalf("open flags = %d, want FOPEN_KEEP_CACHE for clean %s reader", out.OpenFlags, policy)
+			}
+		})
+	}
+}
+
+func TestOpenReadOnlySyncDurabilityBypassMarkerUsesDirectIO(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	markedIno := fs.inodes.Lookup("/sync-visible.txt", false, 17, time.Now())
+	fs.inodes.UpdateRevision(markedIno, 7)
+	otherIno := fs.inodes.Lookup("/other.txt", false, 11, time.Now())
+	fs.inodes.UpdateRevision(otherIno, 3)
+
+	fs.armKernelCacheBypass(markedIno, "/sync-visible.txt", 7, 17, "test")
+
+	var markedOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: markedIno},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &markedOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open marked status = %v, want OK", st)
+	}
+	if markedOut.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("marked open flags = %d, want FOPEN_DIRECT_IO", markedOut.OpenFlags)
+	}
+
+	var otherOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: otherIno},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &otherOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open other status = %v, want OK", st)
+	}
+	if otherOut.OpenFlags != gofuse.FOPEN_KEEP_CACHE {
+		t.Fatalf("other open flags = %d, want FOPEN_KEEP_CACHE", otherOut.OpenFlags)
+	}
+}
+
+func TestKernelCacheBypassMarkerIsInodeScopedAcrossRecreate(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	oldIno := fs.inodes.Lookup("/recreate.txt", false, 0, time.Now())
+	fs.armKernelCacheBypass(oldIno, "/recreate.txt", 1, 0, "test")
+	fs.inodes.Remove("/recreate.txt")
+
+	newIno := fs.inodes.Lookup("/recreate.txt", false, 19, time.Now())
+	if newIno == oldIno {
+		t.Fatalf("recreated inode = %d, want a different inode", newIno)
+	}
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: newIno},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open recreated status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_KEEP_CACHE {
+		t.Fatalf("recreated open flags = %d, want FOPEN_KEEP_CACHE", out.OpenFlags)
+	}
+}
+
+func TestKernelCacheBypassMarkerFollowsRenamedInode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	ino := fs.inodes.Lookup("/old.txt", false, 5, time.Now())
+	fs.armKernelCacheBypass(ino, "/old.txt", 2, 5, "test")
+	fs.inodes.Rename("/old.txt", "/new.txt")
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open renamed status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("renamed open flags = %d, want FOPEN_DIRECT_IO for same inode marker", out.OpenFlags)
+	}
+}
+
+func TestSyncCommitNotifyFailureLeavesPerInodeBypass(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	ino := fs.inodes.Lookup("/notify-fallback.txt", false, 21, time.Now())
+	fs.inodes.UpdateRevision(ino, 9)
+	fs.finishSyncCommitKernelCacheBoundary(ino, "/notify-fallback.txt", 9, 21)
+
+	if !fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/notify-fallback.txt"}) {
+		t.Fatal("notify failure did not leave per-inode bypass marker active")
+	}
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("open flags = %d, want FOPEN_DIRECT_IO while notify fallback is active", out.OpenFlags)
+	}
+}
+
+func TestKernelCacheBypassMarkerExpiresAndClearsByGeneration(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	ino := fs.inodes.Lookup("/short-window.txt", false, 8, time.Now())
+	oldGen := fs.armKernelCacheBypass(ino, "/short-window.txt", 1, 8, "old")
+	newGen := fs.armKernelCacheBypass(ino, "/short-window.txt", 2, 8, "new")
+	fs.clearKernelCacheBypassGeneration(ino, oldGen)
+	if !fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/short-window.txt"}) {
+		t.Fatal("clearing an older generation removed the active marker")
+	}
+
+	fs.kernelCacheBypassMu.Lock()
+	marker := fs.kernelCacheBypass[ino]
+	marker.expiresAt = time.Now().Add(-time.Second)
+	fs.kernelCacheBypass[ino] = marker
+	fs.kernelCacheBypassMu.Unlock()
+
+	if fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/short-window.txt"}) {
+		t.Fatal("expired marker stayed active")
+	}
+	fs.clearKernelCacheBypassGeneration(ino, newGen)
+}
+
 func TestOpenReadOnlyCacheableFileSkipsPrefetcher(t *testing.T) {
 	size := int64(defaultReadCacheMaxFileSize)
 	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {
@@ -9892,6 +10286,132 @@ func TestOpenWritablePreloadChoosesNewestOpenHandle(t *testing.T) {
 	}
 	if target.OrigSize != 0 {
 		t.Fatalf("target OrigSize = %d, want 0 for pending new file", target.OrigSize)
+	}
+}
+
+func TestLoadWritableHandleFromShadowBindsStagingGenerations(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const filePath = "/shadow-adopt.txt"
+	data := []byte("pending shadow bytes")
+	if err := shadow.WriteFull(filePath, data, 7); err != nil {
+		t.Fatal(err)
+	}
+	shadowGen := shadow.ActiveGeneration(filePath)
+	pendingGen, err := pending.PutWithBaseRev(filePath, int64(len(data)), PendingOverwrite, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := pending.GetMeta(filePath)
+	if !ok {
+		t.Fatal("pending metadata missing")
+	}
+
+	ino := fs.inodes.Lookup(filePath, false, int64(len(data)), time.Now())
+	target := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if err := fs.loadWritableHandleFromShadowLocked(target, meta); err != nil {
+		t.Fatalf("loadWritableHandleFromShadowLocked: %v", err)
+	}
+	if got := target.ShadowStageGen; got != shadowGen {
+		t.Fatalf("ShadowStageGen = %d, want %d", got, shadowGen)
+	}
+	if got := target.PendingIndexGen; got != pendingGen {
+		t.Fatalf("PendingIndexGen = %d, want %d", got, pendingGen)
+	}
+	if got := target.BaseRev; got != 7 {
+		t.Fatalf("BaseRev = %d, want 7", got)
+	}
+	if got := target.Dirty.Bytes(); !bytes.Equal(got, data) {
+		t.Fatalf("dirty bytes = %q, want %q", got, data)
+	}
+}
+
+func TestLoadWritableHandleFromOpenHandleCopiesStagingGenerations(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const filePath = "/open-shadow-adopt.txt"
+	data := []byte("source shadow bytes")
+	if err := shadow.WriteFull(filePath, data, 3); err != nil {
+		t.Fatal(err)
+	}
+	shadowGen := shadow.ActiveGeneration(filePath)
+	pendingGen, err := pending.PutWithBaseRev(filePath, int64(len(data)), PendingOverwrite, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ino := fs.inodes.Lookup(filePath, false, int64(len(data)), time.Now())
+	source := &FileHandle{
+		Ino:             ino,
+		Path:            filePath,
+		Dirty:           fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		BaseRev:         3,
+		OrigSize:        int64(len(data)),
+		ShadowReady:     true,
+		ShadowStageGen:  shadowGen,
+		PendingIndexGen: pendingGen,
+		WriteBackGen:    44,
+	}
+	if _, err := source.Dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	source.DirtySeq = fs.markDirtySize(ino, source.Dirty.Size())
+	fs.openHandles.Add(source)
+
+	target := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if !fs.loadWritableHandleFromOpenHandleLocked(target) {
+		t.Fatal("loadWritableHandleFromOpenHandleLocked returned false")
+	}
+	if !target.ShadowReady {
+		t.Fatal("target did not preserve shadow-backed source state")
+	}
+	if got := target.ShadowStageGen; got != shadowGen {
+		t.Fatalf("ShadowStageGen = %d, want %d", got, shadowGen)
+	}
+	if got := target.PendingIndexGen; got != pendingGen {
+		t.Fatalf("PendingIndexGen = %d, want %d", got, pendingGen)
+	}
+	if got := target.WriteBackGen; got != uint64(44) {
+		t.Fatalf("WriteBackGen = %d, want 44", got)
+	}
+	if got := target.Dirty.Bytes(); !bytes.Equal(got, data) {
+		t.Fatalf("dirty bytes = %q, want %q", got, data)
 	}
 }
 
@@ -12177,6 +12697,430 @@ func TestReadSQLiteSamePathDirtyHandleSkipsIncompleteCandidate(t *testing.T) {
 	}
 }
 
+func TestReadCloseSyncSamePathDirtyWriterUsesDirtyBuffer(t *testing.T) {
+	var remoteReads atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteReads.Add(1)
+		http.Error(w, "remote should not be consulted while a same-path close-sync writer is dirty", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/supervise-probe.txt"
+	want := []byte("before-crash")
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		WritePolicy: WritePolicyCloseSync,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(writer)
+
+	reader := &FileHandle{Ino: ino, Path: filePath, WritePolicy: WritePolicyCloseSync}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	got, st, err := readDat9FSTestRange(fs, ino, readerID, 0, len(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes = %q, want %q", got, want)
+	}
+	if gotRemote := remoteReads.Load(); gotRemote != 0 {
+		t.Fatalf("remote reads = %d, want 0", gotRemote)
+	}
+}
+
+func TestReadCloseSyncSamePathDirtyWriterWaitsForLockedHandle(t *testing.T) {
+	var remoteReads atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteReads.Add(1)
+		http.Error(w, "remote should not be consulted while waiting for same-path dirty writer", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/supervise-probe.txt"
+	want := []byte("after-heal")
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		WritePolicy: WritePolicyCloseSync,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(writer)
+	writer.Lock()
+
+	reader := &FileHandle{Ino: ino, Path: filePath, WritePolicy: WritePolicyCloseSync}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	type readResult struct {
+		data []byte
+		st   gofuse.Status
+		err  error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		got, st, err := readDat9FSTestRange(fs, ino, readerID, 0, len(want))
+		done <- readResult{data: got, st: st, err: err}
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	writer.Unlock()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		if res.st != gofuse.OK {
+			t.Fatalf("Read status = %v, want OK", res.st)
+		}
+		if !bytes.Equal(res.data, want) {
+			t.Fatalf("read bytes = %q, want %q", res.data, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for close-sync same-path dirty read")
+	}
+	if gotRemote := remoteReads.Load(); gotRemote != 0 {
+		t.Fatalf("remote reads = %d, want 0", gotRemote)
+	}
+}
+
+func TestReadCloseSyncSamePathDirtyWriterWaitsForCandidateLoopLockedHandle(t *testing.T) {
+	var remoteReads atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteReads.Add(1)
+		http.Error(w, "remote should not be consulted while a scanned same-path dirty writer is locked", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/supervise-probe.txt"
+	want := []byte("after-heal-candidate-loop")
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		WritePolicy: WritePolicyCloseSync,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(writer)
+
+	lockedInCandidateWindow := make(chan struct{})
+	releaseLockedWriter := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWriter := func() {
+		releaseOnce.Do(func() {
+			close(releaseLockedWriter)
+		})
+	}
+	t.Cleanup(func() {
+		testHookAfterSamePathDirtyHandleScan = nil
+		releaseWriter()
+	})
+
+	var hookOnce sync.Once
+	testHookAfterSamePathDirtyHandleScan = func(path string) {
+		if path != filePath {
+			return
+		}
+		hookOnce.Do(func() {
+			writer.Lock()
+			close(lockedInCandidateWindow)
+			go func() {
+				<-releaseLockedWriter
+				writer.Unlock()
+			}()
+		})
+	}
+
+	reader := &FileHandle{Ino: ino, Path: filePath, WritePolicy: WritePolicyCloseSync}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	type readResult struct {
+		data []byte
+		st   gofuse.Status
+		err  error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		got, st, err := readDat9FSTestRange(fs, ino, readerID, 0, len(want))
+		done <- readResult{data: got, st: st, err: err}
+	}()
+
+	select {
+	case <-lockedInCandidateWindow:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for same-path dirty candidate-loop lock window")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if gotRemote := remoteReads.Load(); gotRemote != 0 {
+		t.Fatalf("remote reads while candidate lock was pending = %d, want 0", gotRemote)
+	}
+	releaseWriter()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		if res.st != gofuse.OK {
+			t.Fatalf("Read status = %v, want OK", res.st)
+		}
+		if !bytes.Equal(res.data, want) {
+			t.Fatalf("read bytes = %q, want %q", res.data, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for close-sync same-path dirty read")
+	}
+	if gotRemote := remoteReads.Load(); gotRemote != 0 {
+		t.Fatalf("remote reads = %d, want 0", gotRemote)
+	}
+}
+
+func TestReadCloseSyncSamePathNewestLockedCandidateBlocksOlderDirtySibling(t *testing.T) {
+	var remoteReads atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteReads.Add(1)
+		http.Error(w, "remote should not be consulted while newest same-path dirty writer is locked", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/supervise-probe.txt"
+	olderData := []byte("older-dirty-candidate")
+	newestData := []byte("newest-dirty-candidate")
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	older := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		WritePolicy: WritePolicyCloseSync,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := older.Dirty.Write(0, olderData); err != nil {
+		t.Fatal(err)
+	}
+	older.DirtySeq = fs.markDirtySize(ino, int64(len(olderData)))
+	fs.openHandles.Add(older)
+
+	newest := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		WritePolicy: WritePolicyCloseSync,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := newest.Dirty.Write(0, newestData); err != nil {
+		t.Fatal(err)
+	}
+	newest.DirtySeq = fs.markDirtySize(ino, int64(len(newestData)))
+	fs.openHandles.Add(newest)
+
+	lockedInCandidateWindow := make(chan struct{})
+	releaseLockedWriter := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWriter := func() {
+		releaseOnce.Do(func() {
+			close(releaseLockedWriter)
+		})
+	}
+	t.Cleanup(func() {
+		testHookAfterSamePathDirtyHandleScan = nil
+		releaseWriter()
+	})
+
+	var hookOnce sync.Once
+	testHookAfterSamePathDirtyHandleScan = func(path string) {
+		if path != filePath {
+			return
+		}
+		hookOnce.Do(func() {
+			newest.Lock()
+			close(lockedInCandidateWindow)
+			go func() {
+				<-releaseLockedWriter
+				newest.Unlock()
+			}()
+		})
+	}
+
+	reader := &FileHandle{Ino: ino, Path: filePath, WritePolicy: WritePolicyCloseSync}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	type readResult struct {
+		data []byte
+		st   gofuse.Status
+		err  error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		got, st, err := readDat9FSTestRange(fs, ino, readerID, 0, len(newestData))
+		done <- readResult{data: got, st: st, err: err}
+	}()
+
+	select {
+	case <-lockedInCandidateWindow:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for newest same-path dirty candidate lock window")
+	}
+	select {
+	case res := <-done:
+		t.Fatalf("read completed while newest dirty candidate was locked: data=%q status=%v err=%v", res.data, res.st, res.err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	if gotRemote := remoteReads.Load(); gotRemote != 0 {
+		t.Fatalf("remote reads while newest candidate lock was pending = %d, want 0", gotRemote)
+	}
+	releaseWriter()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		if res.st != gofuse.OK {
+			t.Fatalf("Read status = %v, want OK", res.st)
+		}
+		if !bytes.Equal(res.data, newestData) {
+			t.Fatalf("read bytes = %q, want newest %q", res.data, newestData)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for close-sync same-path dirty read")
+	}
+}
+
+func TestReadSQLiteSidecarNewestLockedCandidateBlocksOlderDirtySibling(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	const filePath = "/app.db-wal"
+	olderData := []byte("older-wal-frame")
+	newestData := []byte("newest-wal-data")
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	older := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := older.Dirty.Write(0, olderData); err != nil {
+		t.Fatal(err)
+	}
+	older.DirtySeq = fs.markDirtySize(ino, int64(len(olderData)))
+	fs.openHandles.Add(older)
+
+	newest := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := newest.Dirty.Write(0, newestData); err != nil {
+		t.Fatal(err)
+	}
+	newest.DirtySeq = fs.markDirtySize(ino, int64(len(newestData)))
+	fs.openHandles.Add(newest)
+
+	lockedInCandidateWindow := make(chan struct{})
+	releaseLockedWriter := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWriter := func() {
+		releaseOnce.Do(func() {
+			close(releaseLockedWriter)
+		})
+	}
+	t.Cleanup(func() {
+		testHookAfterSamePathDirtyHandleScan = nil
+		releaseWriter()
+	})
+
+	var hookOnce sync.Once
+	testHookAfterSamePathDirtyHandleScan = func(path string) {
+		if path != filePath {
+			return
+		}
+		hookOnce.Do(func() {
+			newest.Lock()
+			close(lockedInCandidateWindow)
+			go func() {
+				<-releaseLockedWriter
+				newest.Unlock()
+			}()
+		})
+	}
+
+	type readResult struct {
+		data []byte
+		n    int
+		ok   bool
+		st   gofuse.Status
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		got, n, ok, st, _ := fs.readSQLitePersistentJournalVisibleRange(filePath, nil, 0, 0, uint32(len(newestData)))
+		done <- readResult{data: got, n: n, ok: ok, st: st}
+	}()
+
+	select {
+	case <-lockedInCandidateWindow:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for newest sqlite sidecar dirty candidate lock window")
+	}
+	select {
+	case res := <-done:
+		t.Fatalf("sqlite sidecar read completed while newest dirty candidate was locked: data=%q n=%d ok=%t status=%v", res.data, res.n, res.ok, res.st)
+	case <-time.After(10 * time.Millisecond):
+	}
+	releaseWriter()
+
+	select {
+	case res := <-done:
+		if res.st != gofuse.OK {
+			t.Fatalf("Read status = %v, want OK", res.st)
+		}
+		if !res.ok {
+			t.Fatal("sqlite sidecar dirty reader should return newest bytes after lock releases")
+		}
+		if !bytes.Equal(res.data, newestData) {
+			t.Fatalf("read bytes = %q, want newest %q", res.data, newestData)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for sqlite sidecar dirty read")
+	}
+}
+
 func TestReadSQLiteSamePathDirtyShadowEOFIsShortRead(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "remote should not be consulted for same-mount sqlite shadow data", http.StatusInternalServerError)
@@ -12754,6 +13698,9 @@ func TestSetAttr_MtimeUpdate(t *testing.T) {
 	if out.Mtime != uint64(mtime.Unix()) {
 		t.Fatalf("out.Mtime = %d, want %d", out.Mtime, mtime.Unix())
 	}
+	if got := out.Timeout(); got != fs.opts.AttrTTL {
+		t.Fatalf("attr timeout = %v, want %v", got, fs.opts.AttrTTL)
+	}
 }
 
 func TestSetAttr_MtimeNow(t *testing.T) {
@@ -13103,6 +14050,78 @@ func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 	}
 	if fh.BaseRev != 2 {
 		t.Fatalf("open base revision = %d, want 2", fh.BaseRev)
+	}
+}
+
+func TestSetAttr_SizeChangeDisablesAttrCache(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		revision int64 = 1
+		content        = bytes.Repeat([]byte{0x41}, 42)
+		recorder testErrorRecorder
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(content)), 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				recorder.Recordf("read truncate body: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if len(body) != 0 {
+				recorder.Recordf("truncate body len = %d, want 0", len(body))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			content = append(content[:0], body...)
+			revision = 2
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			http.NotFound(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{AttrTTL: time.Minute}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, 42, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	recorder.Check(t)
+	if got := out.Timeout(); got != 0 {
+		t.Fatalf("attr timeout after size change = %v, want 0", got)
+	}
+	if out.Size != 0 {
+		t.Fatalf("out.Size = %d, want 0", out.Size)
 	}
 }
 
@@ -13948,6 +14967,77 @@ func TestSetAttr_WriteBackStrictPathTruncateStagesAndReturnsBeforeRemoteCommit(t
 	cq.DrainAll()
 }
 
+func TestSetAttr_WriteBackPathTruncateSyncFallbackMarksStaleConflict(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	c := newTestClient("http://127.0.0.1")
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:       0,
+		client:           c,
+		shadows:          shadow,
+		index:            pending,
+		queue:            []*CommitEntry{},
+		queuedByPath:     map[string]map[*CommitEntry]struct{}{},
+		inFlight:         map[string]*CommitEntry{},
+		delayed:          map[*CommitEntry]*time.Timer{},
+		workCh:           make(chan *CommitEntry, 1),
+		DurableWatermark: fs.latestCommittedRevision,
+	}
+
+	const filePath = "/stale-truncate.txt"
+	ino := fs.inodes.Lookup(filePath, false, 4096, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.recordCommittedRevision(filePath, 2)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	entry.Revision = 1
+
+	unlockRemoteCommit := fs.lockRemoteCommitPath(filePath)
+	st := fs.stagePathTruncateToZeroLocked(context.Background(), entry, ino)
+	unlockRemoteCommit()
+	if st == gofuse.OK {
+		t.Fatal("stale path truncate fallback unexpectedly succeeded")
+	}
+	meta, ok := pending.GetMeta(filePath)
+	if !ok {
+		t.Fatal("stale truncate pending metadata should be preserved as a conflict")
+	}
+	if meta.Kind != PendingConflict {
+		t.Fatalf("pending kind = %v, want PendingConflict", meta.Kind)
+	}
+	if meta.BaseRev != 1 {
+		t.Fatalf("pending base revision = %d, want 1", meta.BaseRev)
+	}
+	if meta.Size != 0 {
+		t.Fatalf("pending size = %d, want 0", meta.Size)
+	}
+	if !shadow.Has(filePath) {
+		t.Fatal("stale truncate shadow should be preserved for manual recovery")
+	}
+	data, err := shadow.ReadAll(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("stale truncate shadow length = %d, want 0", len(data))
+	}
+}
+
 func TestOpenTruncateCancelsQueuedPathTruncateWithoutCancelingInFlight(t *testing.T) {
 	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
 	opts.setDefaults()
@@ -14462,6 +15552,9 @@ func TestStageShadowReadyNonSpillRewritesShadowWithDirtyBuffer(t *testing.T) {
 	if err := fs.stageShadowForQueuedCommitLocked(fh, true); err != nil {
 		t.Fatal(err)
 	}
+	if fh.ShadowStageGen == 0 {
+		t.Fatal("staged shadow rewrite lost shadow staging generation")
+	}
 	defer fs.releaseHandleRemoteCommitPathLocked(fh)
 
 	got, err := shadow.ReadAll(path)
@@ -14520,6 +15613,9 @@ func TestOpenTruncateResetShadowStagesDirtyBuffer(t *testing.T) {
 	if !fh.ShadowReady {
 		t.Fatal("truncate-open did not reset shadow")
 	}
+	if fh.ShadowStageGen == 0 {
+		t.Fatal("truncate-open reset shadow did not record staging generation")
+	}
 	if fh.ShadowSpill {
 		t.Fatal("truncate-open shadow must stay dirty-buffer backed, not ShadowSpill")
 	}
@@ -14534,6 +15630,9 @@ func TestOpenTruncateResetShadowStagesDirtyBuffer(t *testing.T) {
 	}
 	if err := fs.stageShadowForQueuedCommitLocked(fh, true); err != nil {
 		t.Fatal(err)
+	}
+	if fh.ShadowStageGen == 0 {
+		t.Fatal("staged truncate-open rewrite lost shadow staging generation")
 	}
 	defer fs.releaseHandleRemoteCommitPathLocked(fh)
 
@@ -14635,7 +15734,7 @@ func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 	}
 }
 
-func TestFlushHandle_AdoptsSameMountCommittedRevision(t *testing.T) {
+func TestFlushHandle_RejectsStaleSQLiteJournalDirtyPayloadAfterSameMountCommit(t *testing.T) {
 	var gotExpected string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -14674,35 +15773,74 @@ func TestFlushHandle_AdoptsSameMountCommittedRevision(t *testing.T) {
 	fh.Lock()
 	st := fs.flushHandle(context.Background(), fh)
 	fh.Unlock()
-	if st != gofuse.OK {
-		t.Fatalf("flushHandle status = %v, want OK", st)
+	if st == gofuse.OK {
+		t.Fatal("flushHandle status = OK, want CAS conflict for stale dirty journal payload")
 	}
-	if gotExpected != "8" {
-		t.Fatalf("X-Dat9-Expected-Revision = %q, want 8", gotExpected)
+	if gotExpected != "7" {
+		t.Fatalf("X-Dat9-Expected-Revision = %q, want 7", gotExpected)
 	}
-	if fh.BaseRev != 9 {
-		t.Fatalf("fh.BaseRev = %d, want 9", fh.BaseRev)
+	if fh.BaseRev != 7 {
+		t.Fatalf("fh.BaseRev = %d, want 7", fh.BaseRev)
 	}
 }
 
-func TestFlushHandle_RefreshesStartedStreamerRevision(t *testing.T) {
+func TestFlushHandle_StartedSQLiteJournalStreamerKeepsStaleBaseRev(t *testing.T) {
 	data := bytes.Repeat([]byte("x"), s3client.PartSize+32)
-	expectedRevision := int64(8)
-	rec := newMultipartUploadRecorder(t, "/stream.db-wal", int64(len(data)), &expectedRevision)
+	var gotExpected atomic.Int64
+	gotExpected.Store(-999)
+	var initiateCalls atomic.Int32
+	var handlerErrors testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v2/uploads/initiate" {
+			http.NotFound(w, r)
+			return
+		}
+		initiateCalls.Add(1)
+		var req struct {
+			Path             string `json:"path"`
+			TotalSize        int64  `json:"total_size"`
+			ExpectedRevision *int64 `json:"expected_revision"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			handlerErrors.Recordf("decode initiate request: %v", err)
+			http.Error(w, "bad initiate request", http.StatusBadRequest)
+			return
+		}
+		if req.Path != "/stream.db-wal" {
+			handlerErrors.Recordf("initiate path = %q, want /stream.db-wal", req.Path)
+			http.Error(w, "unexpected initiate path", http.StatusInternalServerError)
+			return
+		}
+		if req.TotalSize != int64(len(data)) {
+			handlerErrors.Recordf("initiate total size = %d, want %d", req.TotalSize, len(data))
+			http.Error(w, "unexpected initiate size", http.StatusInternalServerError)
+			return
+		}
+		if req.ExpectedRevision != nil {
+			gotExpected.Store(*req.ExpectedRevision)
+		}
+		if req.ExpectedRevision == nil || *req.ExpectedRevision != 8 {
+			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+			return
+		}
+		handlerErrors.Recordf("stale SQLite journal streamer unexpectedly adopted rev8")
+		http.Error(w, "stale SQLite journal streamer unexpectedly adopted latest revision", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(rec.client(), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/stream.db-wal", false, int64(len(data)), time.Now())
 	fs.inodes.UpdateRevision(ino, 7)
-	fs.recordCommittedRevision("/stream.db-wal", expectedRevision)
+	fs.recordCommittedRevision("/stream.db-wal", 8)
 
 	fh := &FileHandle{
 		Ino:      ino,
 		Path:     "/stream.db-wal",
 		Dirty:    NewWriteBuffer("/stream.db-wal", maxPreloadSize, 0),
 		BaseRev:  7,
-		Streamer: NewStreamUploader(rec.client(), "/stream.db-wal", 7),
+		Streamer: NewStreamUploader(newTestClient(ts.URL), "/stream.db-wal", 7),
 	}
 	if _, err := fh.Dirty.Write(0, data); err != nil {
 		t.Fatal(err)
@@ -14715,15 +15853,19 @@ func TestFlushHandle_RefreshesStartedStreamerRevision(t *testing.T) {
 	fh.Lock()
 	st := fs.flushHandle(context.Background(), fh)
 	fh.Unlock()
-	if st != gofuse.OK {
-		t.Fatalf("flushHandle status = %v, want OK", st)
+	if st == gofuse.OK {
+		t.Fatal("flushHandle status = OK, want CAS conflict for stale SQLite journal streamer payload")
 	}
-	if got := rec.initiateCalls.Load(); got != 1 {
+	if got := initiateCalls.Load(); got != 1 {
 		t.Fatalf("initiate calls = %d, want 1", got)
 	}
-	if fh.BaseRev != expectedRevision+1 {
-		t.Fatalf("fh.BaseRev = %d, want %d", fh.BaseRev, expectedRevision+1)
+	if got := gotExpected.Load(); got != 7 {
+		t.Fatalf("initiate expected revision = %d, want 7", got)
 	}
+	if fh.BaseRev != 7 {
+		t.Fatalf("fh.BaseRev = %d, want 7", fh.BaseRev)
+	}
+	handlerErrors.Check(t)
 }
 
 func TestTruncateWritableHandleLockedZeroResetsStreamingStateBeforeContinuedWrite(t *testing.T) {
@@ -14927,13 +16069,15 @@ func TestAdoptPathTruncateZeroResetsStartedStreamerBeforeFlush(t *testing.T) {
 	}
 }
 
-func TestFlushHandle_SerializesSamePathRemoteCommits(t *testing.T) {
+func TestFlushHandle_SerializesSamePathSQLiteJournalCommitsWithoutAdoptingStalePayload(t *testing.T) {
 	var (
 		mu         sync.Mutex
 		revision   int64 = 7
 		handlerErr error
 		putCalls   atomic.Int32
 		inFlight   atomic.Int32
+		okFlushes  atomic.Int32
+		badFlushes atomic.Int32
 		gotHeaders []string
 	)
 	recordHandlerErr := func(err error) {
@@ -14998,9 +16142,10 @@ func TestFlushHandle_SerializesSamePathRemoteCommits(t *testing.T) {
 			fh.Lock()
 			st := fs.flushHandle(context.Background(), fh)
 			fh.Unlock()
-			if st != gofuse.OK {
-				errCh <- fmt.Errorf("flushHandle status = %v, want OK", st)
-				return
+			if st == gofuse.OK {
+				okFlushes.Add(1)
+			} else {
+				badFlushes.Add(1)
 			}
 			errCh <- nil
 		}(fh)
@@ -15014,6 +16159,12 @@ func TestFlushHandle_SerializesSamePathRemoteCommits(t *testing.T) {
 	if got := putCalls.Load(); got != 2 {
 		t.Fatalf("PUT calls = %d, want 2", got)
 	}
+	if got := okFlushes.Load(); got != 1 {
+		t.Fatalf("successful flushes = %d, want 1", got)
+	}
+	if got := badFlushes.Load(); got != 1 {
+		t.Fatalf("failed stale flushes = %d, want 1", got)
+	}
 	mu.Lock()
 	err := handlerErr
 	headers := append([]string(nil), gotHeaders...)
@@ -15022,14 +16173,14 @@ func TestFlushHandle_SerializesSamePathRemoteCommits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(headers) != 2 || headers[0] != "7" || headers[1] != "8" {
-		t.Fatalf("expected revision headers = %v, want [7 8]", headers)
+	if len(headers) != 2 || headers[0] != "7" || headers[1] != "7" {
+		t.Fatalf("expected revision headers = %v, want [7 7]", headers)
 	}
-	if finalRevision != 9 {
-		t.Fatalf("server revision = %d, want 9", finalRevision)
+	if finalRevision != 8 {
+		t.Fatalf("server revision = %d, want 8", finalRevision)
 	}
-	if got := fs.latestCommittedRevision("/wal.db-wal"); got != 9 {
-		t.Fatalf("latest committed revision = %d, want 9", got)
+	if got := fs.latestCommittedRevision("/wal.db-wal"); got != 8 {
+		t.Fatalf("latest committed revision = %d, want 8", got)
 	}
 }
 
@@ -20042,12 +21193,12 @@ func TestRenamePendingNewCommitSyncCommitsGitLooseObjectFinalPath(t *testing.T) 
 	oldIno := fs.inodes.Lookup(oldP, false, int64(len(data)), time.Now())
 	dirIno := fs.inodes.Lookup("/repo/.git/objects/70", true, 0, time.Now())
 
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:  oldP,
 		Inode: oldIno,
 		Size:  int64(len(data)),
 		Kind:  PendingNew,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("enqueue old temp upload: %v", err)
 	}
 	select {
@@ -20294,12 +21445,12 @@ func TestRenamePendingNewCommitFallsBackWhenFinalTargetExists(t *testing.T) {
 	dirIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
 	fs.inodes.Lookup(newP, false, 36, time.Now())
 
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:  oldP,
 		Inode: oldIno,
 		Size:  int64(len(data)),
 		Kind:  PendingNew,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("enqueue old temp upload: %v", err)
 	}
 
@@ -20429,12 +21580,12 @@ func TestRenamePendingNewCommitUsesRemoteRenameWhenCanceledUploadBecameVisible(t
 	oldIno := fs.inodes.Lookup(oldP, false, int64(len(data)), time.Now())
 	dirIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
 
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:  oldP,
 		Inode: oldIno,
 		Size:  int64(len(data)),
 		Kind:  PendingNew,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("enqueue old temp upload: %v", err)
 	}
 
@@ -25088,6 +26239,9 @@ func TestSetAttr_NoKernelNotify(t *testing.T) {
 	if delta := after - before; delta != 0 {
 		t.Fatalf("SetAttr produced %d kernel notify calls, want 0", delta)
 	}
+	if !fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/trunc.txt"}) {
+		t.Fatal("SetAttr size change did not arm per-inode cache bypass marker")
+	}
 }
 
 // TestLookupParsesModeHeader verifies that Lookup reads the X-Dat9-Mode header
@@ -25346,6 +26500,20 @@ func TestDebouncedFlushRemovesPendingIndexAfterUpload(t *testing.T) {
 	// The shadowStore entry should be removed.
 	if shadow.Has(filePath) {
 		t.Fatal("shadowStore should be removed after debounced upload")
+	}
+	fh.Lock()
+	dirtySeq := fh.DirtySeq
+	writeBackSeq := fh.WriteBackSeq
+	dirtyParts := fh.Dirty != nil && fh.Dirty.HasDirtyParts()
+	fh.Unlock()
+	if dirtySeq != 0 {
+		t.Fatalf("DirtySeq after debounced upload = %d, want 0", dirtySeq)
+	}
+	if writeBackSeq != 0 {
+		t.Fatalf("WriteBackSeq after debounced upload = %d, want 0", writeBackSeq)
+	}
+	if dirtyParts {
+		t.Fatal("dirty parts should be clear after debounced upload")
 	}
 }
 

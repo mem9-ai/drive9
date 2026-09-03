@@ -1276,6 +1276,316 @@ func TestFlush_CloseSyncUploadsBeforeReturning(t *testing.T) {
 	}
 }
 
+func TestCloseSyncOpenTruncateOverwriteReadSeesLatestBytes(t *testing.T) {
+	const path = "/supervise-probe.txt"
+	initial := []byte("ready\n")
+	updated := []byte("before-crash\n")
+
+	var (
+		mu      sync.Mutex
+		content       = append([]byte(nil), initial...)
+		rev     int64 = 1
+		puts    int
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			_, _ = w.Write(content)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "1" {
+				t.Errorf("expected revision header = %q, want 1", got)
+			}
+			puts++
+			rev++
+			content = append(content[:0], body...)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": rev})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict, WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	ino := fs.inodes.Lookup(path, false, int64(len(initial)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.inodes.UpdateSize(ino, int64(len(initial)))
+
+	var writeOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &writeOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open truncate status = %v, want OK", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       writeOut.Fh,
+		Offset:   0,
+	}, updated); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	beforeFlushNotify := fs.notifyCount.Load()
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       writeOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+	if got := fs.notifyCount.Load() - beforeFlushNotify; got != 1 {
+		t.Fatalf("close-sync truncate overwrite flush sent %d inode invalidations, want 1", got)
+	}
+	if shadow.Has(path) {
+		t.Fatal("close-sync truncate overwrite flush left stale 0-byte shadow active")
+	}
+
+	// FUSE Release is best-effort/asynchronous from the kernel's perspective.
+	// close-sync visibility must therefore be satisfied by Flush itself: an
+	// immediate close-to-open reader must not pin the writer's O_TRUNC shadow
+	// and observe EOF before Release runs.
+	var readBeforeReleaseOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &readBeforeReleaseOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open read before writer Release status = %v, want OK", st)
+	}
+	if readBeforeReleaseOut.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("Open read before writer Release flags = %d, want FOPEN_DIRECT_IO while per-inode bypass fallback is active", readBeforeReleaseOut.OpenFlags)
+	}
+	bufBeforeRelease := make([]byte, 64)
+	resultBeforeRelease, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readBeforeReleaseOut.Fh,
+		Offset:   0,
+		Size:     uint32(len(bufBeforeRelease)),
+	}, bufBeforeRelease)
+	if st != gofuse.OK {
+		t.Fatalf("Read before writer Release status = %v, want OK", st)
+	}
+	gotBeforeRelease, _ := resultBeforeRelease.Bytes(bufBeforeRelease)
+	if !bytes.Equal(gotBeforeRelease, updated) {
+		t.Fatalf("Read before writer Release = %q, want %q", gotBeforeRelease, updated)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readBeforeReleaseOut.Fh,
+	})
+
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       writeOut.Fh,
+	})
+
+	var readOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &readOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open read status = %v, want OK", st)
+	}
+	if readOut.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("Open read flags = %d, want FOPEN_DIRECT_IO while per-inode bypass fallback is active", readOut.OpenFlags)
+	}
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readOut.Fh,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, _ := result.Bytes(buf)
+	if !bytes.Equal(got, updated) {
+		t.Fatalf("Read = %q, want %q", got, updated)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if puts != 1 {
+		t.Fatalf("PUT calls = %d, want 1", puts)
+	}
+	if !bytes.Equal(content, updated) || rev != 2 {
+		t.Fatalf("server content/rev = %q/%d, want %q/2", content, rev, updated)
+	}
+}
+
+func TestCloseSyncFlushSupersedesPathZeroShadowBeforeRelease(t *testing.T) {
+	const path = "/supervise-probe.txt"
+	initial := []byte("ready\n")
+	updated := []byte("after-heal\n")
+
+	var (
+		mu      sync.Mutex
+		content       = append([]byte(nil), initial...)
+		rev     int64 = 1
+		puts    int
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			_, _ = w.Write(content)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "1" {
+				t.Errorf("expected revision header = %q, want 1", got)
+			}
+			puts++
+			rev++
+			content = append(content[:0], body...)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": rev})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict, WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	// Model a path-based truncate-to-zero staging record that is not owned by
+	// this writer handle (ShadowStageGen remains 0 on the handle). This is the
+	// FUSE supervision shape behind `printf > file`: a later close-sync write
+	// publishes final bytes directly, and the immediate reader must not pin the
+	// stale zero-byte shadow and observe EOF.
+	if err := shadow.WriteFull(path, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := shadow.Size(path); got != 0 {
+		t.Fatalf("seeded shadow size = %d, want 0", got)
+	}
+
+	ino := fs.inodes.Lookup(path, false, int64(len(initial)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.inodes.UpdateSize(ino, int64(len(initial)))
+
+	var writeOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &writeOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open write status = %v, want OK", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       writeOut.Fh,
+		Offset:   0,
+	}, updated); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       writeOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+	if shadow.Has(path) {
+		t.Fatal("close-sync flush left stale path-level zero-byte shadow active")
+	}
+
+	var readOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &readOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open read status = %v, want OK", st)
+	}
+	if readOut.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("Open read flags = %d, want FOPEN_DIRECT_IO while per-inode bypass fallback is active", readOut.OpenFlags)
+	}
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readOut.Fh,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, _ := result.Bytes(buf)
+	if !bytes.Equal(got, updated) {
+		t.Fatalf("Read = %q, want %q", got, updated)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readOut.Fh,
+	})
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       writeOut.Fh,
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if puts != 1 {
+		t.Fatalf("PUT calls = %d, want 1", puts)
+	}
+	if !bytes.Equal(content, updated) || rev != 2 {
+		t.Fatalf("server content/rev = %q/%d, want %q/2", content, rev, updated)
+	}
+}
+
 func TestWriteSyncUploadsBeforeWriteReturns(t *testing.T) {
 	var putCalls atomic.Int32
 	var uploaded []byte
@@ -4764,13 +5074,13 @@ func TestUnlink_PendingNewCommitQueueUploadedDeletesRemote(t *testing.T) {
 	fs.commitQueue = cq
 	fs.inodes.Lookup(p, false, int64(len(data)), time.Now())
 
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:    p,
 		Inode:   2,
 		Size:    int64(len(data)),
 		Kind:    PendingNew,
 		BaseRev: 0,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 
